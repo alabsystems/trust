@@ -6,6 +6,15 @@
 // stand-alone `trust.toml` remains readable for one release so existing
 // checkouts keep verifying while they migrate.
 //
+// One workspace, one policy (plan §3.6; T7c): the workspace root's table
+// governs every member, whichever member a run starts in or selects, and a
+// member's own `[trust]` table (or `trust.toml`) is refused, naming its keys
+// and the root to move them to. targo's `Workspace` refuses a member's table
+// and a `trust.toml` beside a member on every command that loads the
+// workspace, whichever package it selects; this loader refuses the table and
+// the file of the member a run starts in (doctor, standalone and proof-cert
+// read the policy without a sibling targo).
+//
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
@@ -15,6 +24,7 @@ use serde::{Deserialize, Deserializer, de};
 
 use crate::input_limits::{MAX_RELEASE_METADATA_BYTES, read_bounded_utf8_file};
 use crate::intent::contained_manifest_relative_path;
+use crate::project_root::lexically_normalized;
 
 pub(crate) const DEFAULT_CODEGEN_BACKEND: &str = "llvm";
 pub(crate) const DEFAULT_TRUST_PROFILE: &str = "unix_hardened";
@@ -112,8 +122,8 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
     &[
         "enabled",
         "level",
-        "timeout_ms",
-        "function_budget_ms",
+        "effort",
+        "backstop",
         "skip_functions",
         "codegen_backend",
         "hardened",
@@ -123,13 +133,29 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
     ]
 }
 
+/// `[trust]` keys this toolchain no longer reads, each with the setting that
+/// replaced it. A table that still names one is refused with that replacement
+/// rather than as an unknown key, so a project learns where its setting went
+/// instead of only that it is wrong.
+///
+/// `compiler_timeout_secs` was the absolute wall-clock ceiling on one verified
+/// compiler process (default 28,800 s), a second backstop beside `backstop`.
+/// T7 folds it into `backstop` (plan §3.2, §3.6; DECISION_QUEUE "T7b"): the
+/// one per-mille multiplier now scales that ceiling with every other clock, so
+/// a run has one backstop, and its firing is COULD NOT RUN (exit 3).
+pub(crate) const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[(
+    "compiler_timeout_secs",
+    "retired on 2026-10-11: `[trust] backstop` in the workspace root's table is the one \
+     wall-clock backstop, and it scales the compiler-process ceiling (8 hours at the builtin \
+     1000 per mille) with the per-query and per-function clocks. Delete this key, and raise \
+     `backstop` in the workspace root's [trust] table if a run needs a longer ceiling",
+)];
+
 /// The wire form of a `[trust]` table.
 ///
 /// Every key is optional because "the project wrote this" and "the project
-/// accepted our default" have to stay distinguishable: workspace-wide policy
-/// may only fill keys a member left unwritten, never overwrite one the member
-/// spelled out. Resolving defaults happens after that merge, in
-/// [`ResolvedTrustConfig::into_config`].
+/// accepted our default" stay distinguishable (a level the table declares is
+/// recorded as declared). Defaults are applied in `into_config`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TrustConfigFile {
@@ -137,10 +163,16 @@ pub(crate) struct TrustConfigFile {
     pub(crate) enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_level")]
     pub(crate) level: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_positive_timeout")]
-    pub(crate) timeout_ms: Option<u64>,
-    #[serde(default, deserialize_with = "deserialize_positive_function_budget_ms")]
-    pub(crate) function_budget_ms: Option<u64>,
+    /// The one solver-effort count's scale `k`, SAT conflicts per distinct
+    /// query term ([`trust_types::determinism::EffortScale`]; plan §3.2a).
+    #[serde(default, deserialize_with = "deserialize_effort")]
+    pub(crate) effort: Option<trust_types::determinism::EffortScale>,
+    /// The wall-clock backstop, per mille of the reference clocks
+    /// ([`trust_types::determinism::Backstop`]; plan §3.6): the per-query and
+    /// per-function clocks targo passes the compiler, and the bounds targo
+    /// holds each verified compiler process to.
+    #[serde(default, deserialize_with = "deserialize_backstop")]
+    pub(crate) backstop: Option<trust_types::determinism::Backstop>,
     #[serde(default)]
     pub(crate) skip_functions: Option<Vec<String>>,
     #[serde(default)]
@@ -153,44 +185,6 @@ pub(crate) struct TrustConfigFile {
     pub(crate) intent: Option<String>,
     #[serde(default)]
     pub(crate) require_dep_evidence: Option<String>,
-}
-
-impl TrustConfigFile {
-    /// Fill keys this table left unwritten from a workspace-wide table.
-    ///
-    /// This is the member-beats-workspace precedence gate. It is soundness
-    /// relevant in one direction: a workspace default must never displace a
-    /// member's own declaration, because that would let a permissive workspace
-    /// root quietly lower a member crate's verification level. Filling only
-    /// unwritten keys makes that impossible by construction.
-    fn fill_unset_from(&mut self, workspace: &TrustConfigFile) {
-        let TrustConfigFile {
-            enabled,
-            level,
-            timeout_ms,
-            function_budget_ms,
-            skip_functions,
-            codegen_backend,
-            hardened,
-            trust_profile,
-            intent,
-            require_dep_evidence,
-        } = workspace;
-        self.enabled = self.enabled.or(*enabled);
-        self.level = self.level.take().or_else(|| level.clone());
-        self.timeout_ms = self.timeout_ms.or(*timeout_ms);
-        self.function_budget_ms = self.function_budget_ms.or(*function_budget_ms);
-        self.skip_functions = self.skip_functions.take().or_else(|| skip_functions.clone());
-        self.codegen_backend = self.codegen_backend.take().or_else(|| codegen_backend.clone());
-        self.hardened = self.hardened.or(*hardened);
-        self.trust_profile = self.trust_profile.take().or_else(|| trust_profile.clone());
-        self.require_dep_evidence =
-            self.require_dep_evidence.take().or_else(|| require_dep_evidence.clone());
-        // `intent` deliberately does not inherit: it names a document beneath
-        // the declaring manifest's own directory, so a workspace-root value
-        // would resolve against the wrong directory for every member.
-        let _ = intent;
-    }
 }
 
 /// An intent document named by configuration, already checked for containment
@@ -235,8 +229,32 @@ impl TrustConfigSource {
 pub(crate) struct TrustConfig {
     pub(crate) enabled: bool,
     pub(crate) level: String,
-    pub(crate) timeout_ms: u64,
-    pub(crate) function_budget_ms: u64,
+    /// Distinguishes a manifest assertion from the implicit L2 default.
+    pub(crate) level_declared: bool,
+    /// Checked Cargo requirements, resolved before lane/session construction.
+    pub(crate) project_policy: Option<crate::pipeline::project_policy::ProjectTrustPolicy>,
+    /// The one solver-effort count's scale `k` (`-Ztrust-verify-effort`), the
+    /// workspace root's `[trust] effort`.
+    pub(crate) effort: trust_types::determinism::EffortScale,
+    /// The wall-clock backstop (`[trust] backstop`), from which targo derives
+    /// `-Ztrust-verify-timeout-ms`, `-Ztrust-verify-function-budget-ms` and
+    /// the bounds of each verified compiler process
+    /// (`pipeline::run::CompilerProcessBounds::from_backstop`).
+    pub(crate) backstop: trust_types::determinism::Backstop,
+    /// `--worker-threads`: the verifier worker-thread cap this run passes the
+    /// compiler (`-Ztrust-verify-worker-threads`); 0, the default, passes
+    /// nothing and caps nothing. A per-run scheduling choice from the command
+    /// line, never a manifest key (DECISION_QUEUE T7a): the budget profile
+    /// records it, and it is not in the profile id (plan §3.6).
+    pub(crate) worker_threads: u64,
+    /// `--no-proc-macro-isolation` clears this. Set, the default, the sibling
+    /// Targo passes `-Ztrust-proc-macro-isolation` to every unit whose
+    /// proc-macro TCB is in scope on a host with the worker sandbox (D21).
+    /// Cleared, the lane carries `-Ztrust-proc-macro-isolation=no` and a
+    /// verified unit with an unaudited proc-macro dependency is refused as it
+    /// was before the worker existed. A per-run choice from the command line,
+    /// never a manifest key, and one that can only refuse more.
+    pub(crate) proc_macro_isolation: bool,
     pub(crate) skip_functions: Vec<String>,
     pub(crate) codegen_backend: Option<String>,
     pub(crate) hardened: Option<bool>,
@@ -250,8 +268,9 @@ pub(crate) struct TrustConfig {
 pub(crate) struct ResolvedTrustConfig {
     pub(crate) config: TrustConfig,
     pub(crate) source: TrustConfigSource,
-    /// The workspace-root manifest that supplied defaults, when one did.
-    pub(crate) workspace_defaults_from: Option<PathBuf>,
+    /// The manifest of the workspace member the run started in, when it is
+    /// one: its policy is then its workspace root's (`source`).
+    pub(crate) member_manifest: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,14 +295,6 @@ pub(crate) fn default_level() -> String {
     // dial down via `[trust] level = "L0"|"L1"` for triage.
     "L2".to_string()
 }
-pub(crate) fn default_timeout() -> u64 {
-    5000
-}
-
-pub(crate) fn default_function_budget_ms() -> u64 {
-    120_000
-}
-
 fn deserialize_level<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -295,26 +306,28 @@ where
     })
 }
 
-fn deserialize_positive_timeout<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+fn deserialize_effort<'de, D>(
+    deserializer: D,
+) -> Result<Option<trust_types::determinism::EffortScale>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let timeout_ms = u64::deserialize(deserializer)?;
-    if timeout_ms == 0 {
-        return Err(de::Error::custom("timeout_ms must be greater than zero"));
-    }
-    Ok(Some(timeout_ms))
+    let k = u64::deserialize(deserializer)?;
+    trust_types::determinism::EffortScale::parse(&k.to_string())
+        .map(Some)
+        .map_err(|error| de::Error::custom(format!("effort: {error}")))
 }
 
-fn deserialize_positive_function_budget_ms<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+fn deserialize_backstop<'de, D>(
+    deserializer: D,
+) -> Result<Option<trust_types::determinism::Backstop>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let function_budget_ms = u64::deserialize(deserializer)?;
-    if function_budget_ms == 0 {
-        return Err(de::Error::custom("function_budget_ms must be greater than zero"));
-    }
-    Ok(Some(function_budget_ms))
+    let per_mille = u64::deserialize(deserializer)?;
+    trust_types::determinism::Backstop::parse(&per_mille.to_string())
+        .map(Some)
+        .map_err(|error| de::Error::custom(format!("backstop: {error}")))
 }
 
 impl Default for TrustConfig {
@@ -322,8 +335,12 @@ impl Default for TrustConfig {
         Self {
             enabled: true,
             level: default_level(),
-            timeout_ms: default_timeout(),
-            function_budget_ms: default_function_budget_ms(),
+            level_declared: false,
+            project_policy: None,
+            effort: trust_types::determinism::EffortScale::BUILTIN,
+            backstop: trust_types::determinism::Backstop::BUILTIN,
+            worker_threads: 0,
+            proc_macro_isolation: true,
             skip_functions: vec![],
             codegen_backend: None,
             hardened: None,
@@ -353,10 +370,11 @@ impl TrustConfig {
         if !matches!(resolved.source, TrustConfigSource::Defaults) {
             eprintln!("targo trust: loaded config from {}", resolved.source.describe());
         }
-        if let Some(workspace) = &resolved.workspace_defaults_from {
+        if let Some(member) = &resolved.member_manifest {
             eprintln!(
-                "targo trust: unset keys inherited from [{TRUST_TABLE}] in {}",
-                workspace.display()
+                "targo trust: {} is a workspace member; its policy is the workspace root's ({})",
+                member.display(),
+                resolved.source.describe()
             );
         }
         Ok(resolved.config)
@@ -380,6 +398,10 @@ pub(crate) fn legacy_config_deprecation_notice() -> String {
 /// pins the file the `[trust]` table is read from; otherwise the native
 /// `Targo.toml` is preferred over the compatibility `Cargo.toml`, matching
 /// targo's own manifest discovery.
+///
+/// A workspace member's policy is its workspace root's, read as the root reads
+/// its own; a member that declares a `[trust]` table or a `trust.toml` of its
+/// own is refused, naming its keys and the root's manifest (plan §3.6).
 pub(crate) fn resolve_trust_config(
     dir: &Path,
     manifest_path: Option<&Path>,
@@ -388,7 +410,82 @@ pub(crate) fn resolve_trust_config(
         Some(path) if path.is_file() => Some(path.to_path_buf()),
         _ => discover_manifest(dir),
     };
+    // The workspace root's table is policy for every member, so the root is
+    // the one targo builds against: Cargo's own search, never "the nearest
+    // ancestor that declares [workspace]".
+    let root = match manifest.as_deref() {
+        Some(member) => member_workspace_root(member, cargo_home().as_deref())?,
+        None => None,
+    };
+    let Some(root) = root else {
+        return resolve_own_trust_config(dir, manifest);
+    };
+    let member = manifest.expect("a workspace root was found for a manifest");
+    refuse_member_policy(&member, &dir.join(LEGACY_CONFIG_FILE), &root)?;
+    let root_dir = root.parent().map(Path::to_path_buf).unwrap_or_default();
+    let resolved = resolve_own_trust_config(&root_dir, Some(root))?;
+    Ok(ResolvedTrustConfig { member_manifest: Some(member), ..resolved })
+}
 
+/// Refuse a workspace member's own policy: a `[trust]` table in its manifest
+/// or a deprecated `trust.toml` beside it. One run uses one policy, the
+/// workspace root's, whichever member it starts in or selects, so a member
+/// table could only be ignored (a policy its author believes is in force) or
+/// be obeyed in some runs and not others. The refusal names the keys as they
+/// are written, before they are read as policy.
+fn refuse_member_policy(
+    member: &Path,
+    legacy_file: &Path,
+    root: &Path,
+) -> Result<(), TrustConfigLoadError> {
+    let refusal = |path: &Path, what: String| TrustConfigLoadError {
+        path: path.to_path_buf(),
+        action: "validate",
+        detail: format!(
+            "{what}, but [{TRUST_TABLE}] is workspace policy: one workspace has one policy, the \
+             workspace root's, whichever member a run starts in or selects. Move it to \
+             [{TRUST_TABLE}] in {} (the workspace root), or make this package a workspace of \
+             its own",
+            root.display()
+        ),
+    };
+    let named = |table: Option<&toml::Value>| -> String {
+        let keys: Vec<String> = table
+            .and_then(toml::Value::as_table)
+            .map(|entries| entries.keys().map(|key| format!("`{key}`")).collect())
+            .unwrap_or_default();
+        if keys.is_empty() { "no keys".to_string() } else { keys.join(", ") }
+    };
+    if let Some(document) = read_manifest_document(member)? {
+        if let Some(table) = document.get(TRUST_TABLE) {
+            return Err(refusal(
+                member,
+                format!(
+                    "this workspace member declares a [{TRUST_TABLE}] table ({})",
+                    named(Some(table))
+                ),
+            ));
+        }
+    }
+    if let Some(content) = read_config_source(legacy_file)? {
+        let table = content.parse::<toml::Value>().ok();
+        return Err(refusal(
+            legacy_file,
+            format!(
+                "this workspace member has a deprecated `{LEGACY_CONFIG_FILE}` ({})",
+                named(table.as_ref())
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The policy of a project that is its own workspace root, or of no
+/// workspace: its manifest's `[trust]` table or its deprecated `trust.toml`.
+fn resolve_own_trust_config(
+    dir: &Path,
+    manifest: Option<PathBuf>,
+) -> Result<ResolvedTrustConfig, TrustConfigLoadError> {
     let declared_in_manifest = match &manifest {
         Some(path) => read_trust_table(path)?.map(|file| (path.clone(), file)),
         None => None,
@@ -397,7 +494,7 @@ pub(crate) fn resolve_trust_config(
     let declared_in_legacy_file =
         read_config_file(&legacy_path)?.map(|file| (legacy_path.clone(), file));
 
-    let (source, mut file) = match (declared_in_manifest, declared_in_legacy_file) {
+    let (source, file) = match (declared_in_manifest, declared_in_legacy_file) {
         (Some((manifest_path, _)), Some((legacy_path, _))) => {
             // Two live policy surfaces cannot both be authoritative, and a
             // proof command must not pick one by accident.
@@ -416,25 +513,37 @@ pub(crate) fn resolve_trust_config(
         (None, None) => (TrustConfigSource::Defaults, TrustConfigFile::default()),
     };
 
-    let workspace = workspace_trust_table(dir, manifest.as_deref())?;
-    let workspace_defaults_from = match &workspace {
-        Some((path, table)) => {
-            file.fill_unset_from(table);
-            Some(path.clone())
+    // The deprecated file sets no budget. The workspace root's [trust] table is
+    // the one spelling of `effort` and `backstop` (plan §3.6; DECISION_QUEUE
+    // BUDGET-1), and the file, read for one more release for the keys it has
+    // always carried, is not a second one.
+    if let TrustConfigSource::LegacyFile(legacy) = &source {
+        if file.effort.is_some() || file.backstop.is_some() {
+            let root = manifest
+                .as_ref()
+                .map_or_else(|| "Cargo.toml".to_string(), |root| root.display().to_string());
+            return Err(TrustConfigLoadError {
+                path: legacy.clone(),
+                action: "validate",
+                detail: format!(
+                    "the deprecated `{LEGACY_CONFIG_FILE}` cannot set effort or backstop: a budget \
+                     is set only in the workspace root's [{TRUST_TABLE}] table; move them to \
+                     [{TRUST_TABLE}] in {root}"
+                ),
+            });
         }
-        None => None,
-    };
+    }
 
     let declaring_file = match &source {
         TrustConfigSource::Manifest(path) | TrustConfigSource::LegacyFile(path) => Some(path),
         TrustConfigSource::Defaults => None,
     };
     let config = into_config(file, dir, declaring_file)?;
-    Ok(ResolvedTrustConfig { config, source, workspace_defaults_from })
+    Ok(ResolvedTrustConfig { config, source, member_manifest: None })
 }
 
-/// Apply defaults and validate the values that only make sense once the merge
-/// is complete.
+/// Apply defaults and validate the values that only make sense once the whole
+/// table is read.
 fn into_config(
     file: TrustConfigFile,
     dir: &Path,
@@ -472,6 +581,48 @@ fn into_config(
         _ => None,
     };
 
+    // A profile label selects the obligation set, and nothing else in the
+    // toolchain reads it. `-Ztrust-verify-profile` has exactly one consumer in
+    // the compiler, so a label the registry does not know generates the
+    // obligations of no profile at all — while `apply_configured_trust_profile`
+    // still turns hardened mode ON for it, `targo trust` still prints
+    // "hardened profile `<name>` enabled", and `report.rs` still copies that
+    // banner into `hardened.profile.name` in the proof record. A typo was
+    // therefore a silent downgrade that the evidence actively denied.
+    //
+    // REFUSED, not repaired to the nearest registered profile: a fallback
+    // would verify something other than what this project committed, and would
+    // record a profile name the project never wrote — the same surprise in the
+    // opposite direction. A committed label naming a profile that does not
+    // exist is a configuration error, so it fails the load exactly like an
+    // unknown `codegen_backend` or an invalid `level`, and exactly like the
+    // typo'd KEY that `deny_unknown_fields` already refuses. Turning hardened
+    // obligations off remains `hardened = false`: a typed boolean, resolved
+    // before any label is consulted, that no misspelling can produce by
+    // accident.
+    let trust_profile = match file.trust_profile {
+        // Stored in the registry's spelling, like `codegen_backend` above: the
+        // banner, the `-Ztrust-verify-profile` value and the proof record then
+        // all name the profile the way the registry names it.
+        Some(raw) => match trust_vcgen::canonical_profile(&raw) {
+            Some(canonical) => Some(canonical.to_string()),
+            None => {
+                let known = trust_vcgen::known_hardened_profiles().join(", ");
+                return Err(TrustConfigLoadError {
+                    path: declaring_file.cloned().unwrap_or_else(|| dir.to_path_buf()),
+                    action: "validate",
+                    detail: format!(
+                        "unknown trust profile `{raw}` (expected one of: {known}); \
+                         a profile label selects the hardened obligation set, so an unregistered \
+                         one would verify strictly less than this table asks for — write \
+                         `hardened = false` to turn hardened obligations off deliberately"
+                    ),
+                });
+            }
+        },
+        None => None,
+    };
+
     let require_dep_evidence = match file.require_dep_evidence {
         Some(raw) => match normalize_dep_evidence(&raw) {
             Some(policy) => policy,
@@ -491,16 +642,44 @@ fn into_config(
 
     Ok(TrustConfig {
         enabled: file.enabled.unwrap_or(true),
+        level_declared: file.level.is_some(),
+        project_policy: None,
         level: file.level.unwrap_or_else(default_level),
-        timeout_ms: file.timeout_ms.unwrap_or_else(default_timeout),
-        function_budget_ms: file.function_budget_ms.unwrap_or_else(default_function_budget_ms),
+        effort: file.effort.unwrap_or(trust_types::determinism::EffortScale::BUILTIN),
+        backstop: file.backstop.unwrap_or(trust_types::determinism::Backstop::BUILTIN),
+        worker_threads: 0,
+        proc_macro_isolation: true,
         skip_functions: file.skip_functions.unwrap_or_default(),
         codegen_backend,
         hardened: file.hardened,
-        trust_profile: file.trust_profile,
+        trust_profile,
         intent,
         require_dep_evidence,
     })
+}
+
+/// The manifest whose `[trust]` table is the policy of the project at `dir`:
+/// its workspace root's when the project is a workspace member (one workspace,
+/// one policy), else its own. `None` when `dir` has no manifest.
+pub(crate) fn policy_manifest(dir: &Path) -> Result<Option<PathBuf>, TrustConfigLoadError> {
+    let Some(manifest) = discover_manifest(dir) else {
+        return Ok(None);
+    };
+    Ok(Some(member_workspace_root(&manifest, cargo_home().as_deref())?.unwrap_or(manifest)))
+}
+
+/// The directory of the workspace root that governs `dir`: the nearest
+/// manifest at or above `dir` (native spelling first), then that package's
+/// workspace root by Cargo's own search ([`policy_manifest`]). It is the
+/// directory whose `target/` Cargo uses when no target directory is
+/// configured. `None` when no manifest is at or above `dir`.
+pub(crate) fn workspace_root_dir(dir: &Path) -> Result<Option<PathBuf>, TrustConfigLoadError> {
+    let Some(manifest) = dir.ancestors().find_map(discover_manifest) else {
+        return Ok(None);
+    };
+    let package_dir = manifest.parent().unwrap_or(dir);
+    let root_manifest = policy_manifest(package_dir)?.unwrap_or(manifest.clone());
+    Ok(Some(root_manifest.parent().unwrap_or(package_dir).to_path_buf()))
 }
 
 /// The manifest that governs `dir`, native spelling preferred.
@@ -524,9 +703,7 @@ pub(crate) fn read_trust_table(
     let Some(table) = document.get(TRUST_TABLE) else {
         return Ok(None);
     };
-    TrustConfigFile::deserialize(table.clone())
-        .map(Some)
-        .map_err(|error| unknown_key_error(manifest_path, error.to_string()))
+    trust_table_policy(manifest_path, table).map(Some)
 }
 
 /// Read a whole file as a `[trust]`-shaped table. Used only by the deprecated
@@ -535,8 +712,32 @@ fn read_config_file(path: &Path) -> Result<Option<TrustConfigFile>, TrustConfigL
     let Some(content) = read_config_source(path)? else {
         return Ok(None);
     };
-    toml::from_str::<TrustConfigFile>(&content)
-        .map(Some)
+    let table = content.parse::<toml::Value>().map_err(|error| TrustConfigLoadError {
+        path: path.to_path_buf(),
+        action: "parse",
+        detail: error.to_string(),
+    })?;
+    trust_table_policy(path, &table).map(Some)
+}
+
+/// Read one `[trust]`-shaped table, declared in `path`, as policy. A retired
+/// key is refused with the setting that replaced it ([`RETIRED_CONFIG_KEYS`]);
+/// any other key the table does not accept is refused by name.
+fn trust_table_policy(
+    path: &Path,
+    table: &toml::Value,
+) -> Result<TrustConfigFile, TrustConfigLoadError> {
+    let retired = table
+        .as_table()
+        .and_then(|entries| RETIRED_CONFIG_KEYS.iter().find(|(key, _)| entries.contains_key(*key)));
+    if let Some((key, replacement)) = retired {
+        return Err(TrustConfigLoadError {
+            path: path.to_path_buf(),
+            action: "validate",
+            detail: format!("[{TRUST_TABLE}] `{key}` was {replacement}"),
+        });
+    }
+    TrustConfigFile::deserialize(table.clone())
         .map_err(|error| unknown_key_error(path, error.to_string()))
 }
 
@@ -573,44 +774,239 @@ fn read_config_source(path: &Path) -> Result<Option<String>, TrustConfigLoadErro
     })
 }
 
-/// The nearest ancestor manifest that declares a `[workspace]`, together with
-/// its `[trust]` table. Only ancestors are considered: when `dir` is itself the
-/// workspace root its own table is already the member table.
+/// Read and parse one manifest of the workspace-root search. An absent file is
+/// `None`; one that cannot be read or parsed is an error, as it is to Cargo.
+fn read_manifest_document(path: &Path) -> Result<Option<toml::Value>, TrustConfigLoadError> {
+    let Some(content) = read_config_source(path)? else {
+        return Ok(None);
+    };
+    content.parse::<toml::Value>().map(Some).map_err(|error| TrustConfigLoadError {
+        path: path.to_path_buf(),
+        action: "parse",
+        detail: error.to_string(),
+    })
+}
+
+/// What Cargo's workspace-root search reads from one manifest
+/// (`to_workspace_config` in the fork's `util/toml/mod.rs`): a `[workspace]`
+/// table, with the `members` and `exclude` lists that decide whom it governs,
+/// or a member, with or without a `package.workspace` pointer to its root.
+#[derive(Debug)]
+enum WorkspaceRole {
+    Root { root_dir: PathBuf, members: Option<Vec<String>>, exclude: Vec<String> },
+    Member { pointer: Option<String> },
+}
+
+/// The manifest keys a [`WorkspaceRole`] is read from. Every other key is left
+/// alone here; Cargo reads, and refuses, the rest on its own.
+#[derive(Deserialize)]
+struct WorkspaceKeys {
+    #[serde(default)]
+    workspace: Option<WorkspaceTableKeys>,
+    #[serde(default)]
+    package: Option<PackageWorkspaceKey>,
+    /// Cargo's legacy spelling of `[package]`.
+    #[serde(default)]
+    project: Option<PackageWorkspaceKey>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceTableKeys {
+    #[serde(default)]
+    members: Option<Vec<String>>,
+    #[serde(default)]
+    exclude: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct PackageWorkspaceKey {
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+impl WorkspaceRole {
+    fn read(path: &Path, document: &toml::Value) -> Result<Self, TrustConfigLoadError> {
+        let keys =
+            WorkspaceKeys::deserialize(document.clone()).map_err(|error| TrustConfigLoadError {
+                path: path.to_path_buf(),
+                action: "parse",
+                detail: error.to_string(),
+            })?;
+        let pointer = keys.package.or(keys.project).and_then(|package| package.workspace);
+        match (keys.workspace, pointer) {
+            (Some(workspace), None) => Ok(WorkspaceRole::Root {
+                root_dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+                members: workspace.members,
+                exclude: workspace.exclude.unwrap_or_default(),
+            }),
+            (None, pointer) => Ok(WorkspaceRole::Member { pointer }),
+            (Some(_), Some(_)) => Err(TrustConfigLoadError {
+                path: path.to_path_buf(),
+                action: "validate",
+                detail: "cannot configure both `package.workspace` and `[workspace]`, only one \
+                         can be specified"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Cargo's `WorkspaceConfig::get_ws_root`: the root manifest that this
+    /// manifest, at `self_path`, names for the package at `look_from`.
+    fn root_for(&self, self_path: &Path, look_from: &Path) -> Option<PathBuf> {
+        match self {
+            WorkspaceRole::Root { .. } if self.excludes(look_from) => None,
+            WorkspaceRole::Root { .. } => Some(self_path.to_path_buf()),
+            // `read_root_pointer`: the named directory's `Cargo.toml`, always.
+            WorkspaceRole::Member { pointer: Some(pointer) } => Some(lexically_normalized(
+                &self_path.parent().unwrap_or(Path::new("")).join(pointer).join("Cargo.toml"),
+            )),
+            WorkspaceRole::Member { pointer: None } => None,
+        }
+    }
+
+    /// Cargo's `WorkspaceRootConfig::is_excluded`: beneath an `exclude` entry
+    /// and beneath no `members` entry, each compared as a path prefix as it is
+    /// written (a glob is not expanded).
+    fn excludes(&self, manifest: &Path) -> bool {
+        let WorkspaceRole::Root { root_dir, members, exclude } = self else {
+            return false;
+        };
+        let beneath = |entry: &String| manifest.starts_with(root_dir.join(entry));
+        exclude.iter().any(beneath) && !members.iter().flatten().any(beneath)
+    }
+}
+
+/// Cargo's home as the `targo` this run starts resolves it
+/// (`home::cargo_home_with_cwd`): `CARGO_HOME`, against the working directory
+/// when it is relative, else `.cargo` in the user's home directory.
+pub(crate) fn cargo_home() -> Option<PathBuf> {
+    match std::env::var_os("CARGO_HOME").filter(|home| !home.is_empty()) {
+        Some(home) => {
+            let home = PathBuf::from(home);
+            if home.is_absolute() {
+                Some(home)
+            } else {
+                std::env::current_dir().ok().map(|cwd| cwd.join(home))
+            }
+        }
+        None => std::env::home_dir().map(|home| home.join(".cargo")),
+    }
+}
+
+/// The manifest targo takes as the workspace root of the package whose
+/// manifest is `member_manifest` (`member` is what that manifest declares).
+/// `None` means the package is its own root.
 ///
-/// An ancestor manifest that cannot be read or parsed is passed over rather
-/// than failed on. Those files govern nothing here unless they turn out to be
-/// the workspace root, and cargo rejects a broken workspace root on its own;
-/// failing on every unrelated ancestor would turn any stray file above the
-/// project into a verification outage. Passing one over can only fall back to
-/// the built-in defaults, which are the strict end of every key.
-fn workspace_trust_table(
-    dir: &Path,
-    member_manifest: Option<&Path>,
-) -> Result<Option<(PathBuf, TrustConfigFile)>, TrustConfigLoadError> {
-    for ancestor in dir.ancestors().skip(1) {
-        for name in MANIFEST_NAMES {
-            let candidate = ancestor.join(name);
-            if Some(candidate.as_path()) == member_manifest || !candidate.is_file() {
-                continue;
-            }
-            let Ok(Some(content)) = read_config_source(&candidate) else {
-                continue;
-            };
-            let Ok(document) = content.parse::<toml::Value>() else {
-                continue;
-            };
-            if document.get("workspace").is_none() {
-                continue;
-            }
-            let table = match document.get(TRUST_TABLE) {
-                Some(table) => TrustConfigFile::deserialize(table.clone())
-                    .map_err(|error| unknown_key_error(&candidate, error.to_string()))?,
-                None => return Ok(None),
-            };
-            return Ok(Some((candidate, table)));
+/// This is Cargo's search, `Workspace::find_root` and `find_root_iter` in the
+/// fork's `core/workspace.rs`, over the keys it reads:
+/// - the package's own `[workspace]` makes it the root, unless that table
+///   excludes the package itself;
+/// - its `package.workspace` names the root;
+/// - otherwise the `Cargo.toml` of each ancestor directory is asked in turn,
+///   nearest first and starting above the package's own directory. The first
+///   that names a root for the package names it: a `[workspace]` that does not
+///   exclude the package, or a member's pointer. A `[workspace]` that excludes
+///   it is passed by, so a workspace further out may still be its root. The
+///   walk stops at a `target/package` directory and after `cargo_home`, and
+///   reads `Cargo.toml` only: targo's ancestor search has no `Targo.toml`.
+///
+/// A manifest on that walk that cannot be read or parsed is an error, as it is
+/// to Cargo ("failed searching for potential workspace"), and so is a
+/// symlinked one, which could otherwise redirect the search. Whether the
+/// package really is a member of the root found is not judged here: Cargo
+/// refuses a package that believes it is in a workspace when it is not, before
+/// anything compiles.
+fn cargo_workspace_root(
+    member_manifest: &Path,
+    member: &WorkspaceRole,
+    cargo_home: Option<&Path>,
+) -> Result<Option<PathBuf>, TrustConfigLoadError> {
+    if let Some(root) = member.root_for(member_manifest, member_manifest) {
+        return Ok(Some(root));
+    }
+    let mut last: Option<&Path> = None;
+    for dir in member_manifest.ancestors().skip(2) {
+        if dir.ends_with("target/package") || (last.is_some() && last == cargo_home) {
+            break;
+        }
+        last = Some(dir);
+        let candidate = dir.join("Cargo.toml");
+        if !candidate.exists() {
+            continue;
+        }
+        let searching = |mut error: TrustConfigLoadError| {
+            error.detail = format!(
+                "{}; it is on the workspace-root search of {}, so the workspace that governs \
+                 that package cannot be determined",
+                error.detail,
+                member_manifest.display()
+            );
+            error
+        };
+        let Some(document) = read_manifest_document(&candidate).map_err(searching)? else {
+            continue;
+        };
+        let role = WorkspaceRole::read(&candidate, &document).map_err(searching)?;
+        if let Some(root) = role.root_for(&candidate, member_manifest) {
+            return Ok(Some(root));
         }
     }
     Ok(None)
+}
+
+/// The workspace root targo builds the package at `member_manifest` against,
+/// when that is another manifest. `None` when the package is its own root (or
+/// in no workspace): its own table is then the root table.
+///
+/// The root is [`cargo_workspace_root`]'s, so a `[workspace]` that excludes the
+/// package, or that the package's `package.workspace` does not name, governs
+/// nothing here, and a `[trust]` table outside the workspace being built is
+/// never read. The root found must declare `[workspace]`; a pointer to
+/// anything else is refused, as Cargo refuses it.
+fn member_workspace_root(
+    member_manifest: &Path,
+    cargo_home: Option<&Path>,
+) -> Result<Option<PathBuf>, TrustConfigLoadError> {
+    // Cargo's `root_manifest`: against the working directory, then normalized.
+    let member_manifest = match std::env::current_dir() {
+        Ok(cwd) if member_manifest.is_relative() => {
+            lexically_normalized(&cwd.join(member_manifest))
+        }
+        _ => lexically_normalized(member_manifest),
+    };
+    let Some(member_document) = read_manifest_document(&member_manifest)? else {
+        return Ok(None);
+    };
+    let member = WorkspaceRole::read(&member_manifest, &member_document)?;
+    let Some(root) = cargo_workspace_root(&member_manifest, &member, cargo_home)? else {
+        return Ok(None);
+    };
+    let document = if root == member_manifest {
+        member_document
+    } else {
+        let Some(document) = read_manifest_document(&root)? else {
+            return Err(TrustConfigLoadError {
+                path: root,
+                action: "inspect",
+                detail: format!(
+                    "no such file: it is the workspace root that {} names",
+                    member_manifest.display()
+                ),
+            });
+        };
+        document
+    };
+    if !matches!(WorkspaceRole::read(&root, &document)?, WorkspaceRole::Root { .. }) {
+        return Err(TrustConfigLoadError {
+            path: root,
+            action: "validate",
+            detail: format!(
+                "the workspace root of {} declares no [workspace]",
+                member_manifest.display()
+            ),
+        });
+    }
+    Ok((root != member_manifest).then_some(root))
 }
 
 #[cfg(test)]
@@ -629,13 +1025,16 @@ mod tests {
         let root = tempfile::tempdir().expect("config fixture");
         write(
             &root.path().join("Cargo.toml"),
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[trust]\nlevel = \"L1\"\ntimeout_ms = 9000\n",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[trust]\nlevel = \"L1\"\nbackstop = 2000\n",
         );
 
         let resolved = resolve_trust_config(root.path(), None).expect("load");
         assert_eq!(resolved.config.level, "L1");
-        assert_eq!(resolved.config.timeout_ms, 9000);
-        assert_eq!(resolved.config.function_budget_ms, default_function_budget_ms());
+        assert_eq!(
+            resolved.config.backstop,
+            trust_types::determinism::Backstop { per_mille: 2000 }
+        );
+        assert_eq!(resolved.config.effort, trust_types::determinism::EffortScale::BUILTIN);
         assert_eq!(resolved.source, TrustConfigSource::Manifest(root.path().join("Cargo.toml")));
     }
 
@@ -694,7 +1093,62 @@ mod tests {
         let error = resolve_trust_config(root.path(), None).expect_err("a typo must fail the load");
         assert_eq!(error.action, "validate");
         assert!(error.detail.contains("unknown field"), "{error}");
-        assert!(error.detail.contains("function_budget_ms"), "{error}");
+        assert!(error.detail.contains("backstop"), "{error}");
+    }
+
+    /// One run uses one budget profile: a member table naming `effort` or
+    /// `backstop` is refused, and the workspace root's values govern every
+    /// member.
+    #[test]
+    fn the_budgets_are_the_workspace_roots_alone() {
+        let root = tempfile::tempdir().expect("config fixture");
+        write(
+            &root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n\n[trust]\neffort = 7\nbackstop = 3000\n",
+        );
+        let member = root.path().join("member");
+        write(&member.join("Cargo.toml"), "[package]\nname = \"member\"\n");
+        let resolved = resolve_trust_config(&member, None).expect("load");
+        assert_eq!(
+            resolved.config.effort,
+            trust_types::determinism::EffortScale { conflicts_per_node: 7 }
+        );
+        assert_eq!(
+            resolved.config.backstop,
+            trust_types::determinism::Backstop { per_mille: 3000 }
+        );
+
+        for key in ["effort = 5", "backstop = 500"] {
+            write(
+                &member.join("Cargo.toml"),
+                &format!("[package]\nname = \"member\"\n\n[trust]\n{key}\n"),
+            );
+            let error = resolve_trust_config(&member, None).expect_err(key);
+            assert_eq!(error.action, "validate", "{key}");
+            assert!(error.detail.contains("workspace policy"), "{key}: {error}");
+        }
+
+        // A manifest that is its own workspace root sets its own budgets, even
+        // inside another workspace's directory tree.
+        let nested = member.join("nested");
+        write(
+            &nested.join("Cargo.toml"),
+            "[package]\nname = \"nested\"\n\n[workspace]\n\n[trust]\neffort = 5\n",
+        );
+        let resolved = resolve_trust_config(&nested, None).expect("its own root");
+        assert_eq!(
+            resolved.config.effort,
+            trust_types::determinism::EffortScale { conflicts_per_node: 5 }
+        );
+
+        // A workspace root with no [trust] table still owns the budgets.
+        write(&root.path().join("Cargo.toml"), "[workspace]\nmembers = [\"member\"]\n");
+        let error = resolve_trust_config(&member, None).expect_err("member budget");
+        assert!(error.detail.contains("workspace policy"), "{error}");
+        write(&member.join("Cargo.toml"), "[package]\nname = \"member\"\n");
+        let resolved = resolve_trust_config(&member, None).expect("load");
+        assert_eq!(resolved.config.effort, trust_types::determinism::EffortScale::BUILTIN);
+        assert_eq!(resolved.config.backstop, trust_types::determinism::Backstop::BUILTIN);
     }
 
     #[test]
@@ -707,27 +1161,121 @@ mod tests {
         assert!(error.detail.contains("unknown field"), "{error}");
     }
 
+    /// One workspace, one policy (plan §3.6; DECISION_QUEUE T7c-4): a member's
+    /// own `[trust]` table, of any keys or none, and a `trust.toml` beside it
+    /// are refused, naming what they declare and the root to move it to.
     #[test]
-    fn a_member_level_survives_a_weaker_workspace_default() {
+    fn a_members_own_policy_is_refused_naming_its_keys_and_the_root() {
         let root = tempfile::tempdir().expect("config fixture");
+        let root_manifest = root.path().join("Cargo.toml");
         write(
-            &root.path().join("Cargo.toml"),
-            "[workspace]\nmembers = [\"member\"]\n\n[trust]\nlevel = \"L0\"\ntimeout_ms = 1000\n",
+            &root_manifest,
+            "[workspace]\nmembers = [\"member\"]\n\n[trust]\nlevel = \"L0\"\nskip_functions = [\"helper\"]\n",
         );
         let member = root.path().join("member");
-        write(
-            &member.join("Cargo.toml"),
-            "[package]\nname = \"member\"\n\n[trust]\nlevel = \"L1\"\n",
-        );
+        let member_manifest = member.join("Cargo.toml");
+        for (table, named) in [
+            ("level = \"L1\"\nskip_functions = []\n", "`level`, `skip_functions`"),
+            ("", "no keys"),
+            ("levl = \"L1\"\n", "`levl`"),
+        ] {
+            write(&member_manifest, &format!("[package]\nname = \"member\"\n\n[trust]\n{table}"));
+            let error = resolve_trust_config(&member, None).expect_err("a member's table");
+            assert_eq!(error.action, "validate", "{error}");
+            assert_eq!(error.path, member_manifest, "{error}");
+            assert!(error.detail.contains(named), "{named}: {error}");
+            assert!(error.detail.contains("workspace policy"), "{error}");
+            assert!(error.detail.contains(&root_manifest.display().to_string()), "{error}");
+        }
 
-        let resolved = resolve_trust_config(&member, None).expect("load");
-        assert_eq!(resolved.config.level, "L1", "a workspace default must not weaken a member");
-        assert_eq!(resolved.config.timeout_ms, 1000, "unwritten keys still inherit");
-        assert_eq!(resolved.workspace_defaults_from, Some(root.path().join("Cargo.toml")));
+        write(&member_manifest, "[package]\nname = \"member\"\n");
+        let legacy = member.join(LEGACY_CONFIG_FILE);
+        write(&legacy, "level = \"L1\"\n");
+        let error = resolve_trust_config(&member, None).expect_err("a member's trust.toml");
+        assert_eq!(error.path, legacy, "{error}");
+        assert!(error.detail.contains("`level`"), "{error}");
+        assert!(error.detail.contains(&root_manifest.display().to_string()), "{error}");
+
+        std::fs::remove_file(&legacy).expect("remove the member's trust.toml");
+        let resolved = resolve_trust_config(&member, None).expect("the root's policy");
+        assert_eq!(resolved.config.level, "L0");
+        assert_eq!(resolved.config.skip_functions, ["helper"]);
+        assert_eq!(resolved.source, TrustConfigSource::Manifest(root_manifest));
+        assert_eq!(resolved.member_manifest, Some(member_manifest));
+    }
+
+    /// A member reads the policy its root reads, the root's deprecated
+    /// `trust.toml` included: where a run starts never changes the policy.
+    #[test]
+    fn a_member_reads_the_policy_its_root_reads() {
+        let root = tempfile::tempdir().expect("config fixture");
+        write(&root.path().join("Cargo.toml"), "[workspace]\nmembers = [\"member\"]\n");
+        write(&root.path().join(LEGACY_CONFIG_FILE), "level = \"L1\"\n");
+        let member = root.path().join("member");
+        write(&member.join("Cargo.toml"), "[package]\nname = \"member\"\n");
+
+        let from_root = resolve_trust_config(root.path(), None).expect("the root");
+        let from_member = resolve_trust_config(&member, None).expect("the member");
+        assert_eq!(from_root.config.level, "L1");
+        assert_eq!(from_member.config.level, from_root.config.level);
+        assert_eq!(from_member.source, from_root.source);
+        assert_eq!(from_root.member_manifest, None);
+        assert_eq!(from_member.member_manifest, Some(member.join("Cargo.toml")));
+        // `targo trust init` scaffolds the table where the policy lives.
+        assert_eq!(policy_manifest(&member).expect("search"), Some(root.path().join("Cargo.toml")));
+        assert_eq!(
+            policy_manifest(root.path()).expect("search"),
+            Some(root.path().join("Cargo.toml"))
+        );
+    }
+
+    /// T7b: `compiler_timeout_secs` is retired into `backstop`. Wherever a
+    /// table is policy — a package's own table, its workspace root's, the
+    /// deprecated stand-alone file — naming it is refused, and the refusal
+    /// names `backstop` and where to set it rather than only "unknown field".
+    #[test]
+    fn the_retired_compiler_timeout_is_refused_naming_the_backstop() {
+        let assert_names_the_replacement = |error: TrustConfigLoadError, declared_in: &Path| {
+            assert_eq!(error.action, "validate", "{error}");
+            assert_eq!(error.path, declared_in, "{error}");
+            assert!(error.detail.contains("`compiler_timeout_secs` was retired"), "{error}");
+            assert!(error.detail.contains("`backstop`"), "{error}");
+            assert!(error.detail.contains("workspace root"), "{error}");
+            assert!(!error.detail.contains("unknown field"), "{error}");
+        };
+
+        let root = tempfile::tempdir().expect("config fixture");
+        let package = root.path().join("Cargo.toml");
+        write(&package, "[package]\nname = \"demo\"\n\n[trust]\ncompiler_timeout_secs = 72000\n");
+        let error = resolve_trust_config(root.path(), None).expect_err("a package's own table");
+        assert_names_the_replacement(error, &package);
+
+        let workspace = tempfile::tempdir().expect("config fixture");
+        let root_manifest = workspace.path().join("Cargo.toml");
+        write(
+            &root_manifest,
+            "[workspace]\nmembers = [\"member\"]\n\n[trust]\ncompiler_timeout_secs = 43200\n",
+        );
+        let member = workspace.path().join("member");
+        write(&member.join("Cargo.toml"), "[package]\nname = \"member\"\n");
+        let error = resolve_trust_config(&member, None).expect_err("the workspace root's table");
+        assert_names_the_replacement(error, &root_manifest);
+
+        let legacy = tempfile::tempdir().expect("config fixture");
+        let legacy_file = legacy.path().join("trust.toml");
+        write(&legacy_file, "compiler_timeout_secs = 1000\n");
+        let error = resolve_trust_config(legacy.path(), None).expect_err("the deprecated file");
+        assert_names_the_replacement(error, &legacy_file);
+
+        // Control: the replacement itself loads, and scales the ceiling.
+        write(&package, "[package]\nname = \"demo\"\n\n[trust]\nbackstop = 2500\n");
+        let resolved = resolve_trust_config(root.path(), None).expect("backstop loads");
+        assert_eq!(resolved.config.backstop.per_mille, 2500);
+        assert!(!known_config_keys().contains(&"compiler_timeout_secs"));
     }
 
     #[test]
-    fn a_member_without_a_table_inherits_the_workspace_default() {
+    fn a_member_without_a_table_runs_at_the_roots_policy() {
         let root = tempfile::tempdir().expect("config fixture");
         write(
             &root.path().join("Cargo.toml"),
@@ -750,7 +1298,7 @@ mod tests {
 
         let resolved = resolve_trust_config(root.path(), None).expect("load");
         assert_eq!(resolved.config.level, "L0");
-        assert_eq!(resolved.workspace_defaults_from, None);
+        assert_eq!(resolved.member_manifest, None);
     }
 
     #[test]
@@ -765,7 +1313,140 @@ mod tests {
 
         let resolved = resolve_trust_config(&inner, None).expect("load");
         assert_eq!(resolved.config.level, default_level());
-        assert_eq!(resolved.workspace_defaults_from, None);
+        assert_eq!(resolved.member_manifest, None);
+    }
+
+    /// A `[workspace]` that excludes a package is not that package's
+    /// workspace (Cargo's `is_excluded`), so its `[trust]` table is neither
+    /// policy for the package nor validated on the package's behalf; the search
+    /// passes it by, and a workspace further out may still be the root.
+    #[test]
+    fn an_excluded_package_is_not_governed_by_the_workspace_that_excludes_it() {
+        let root = tempfile::tempdir().expect("config fixture");
+        let outer = root.path().join("W");
+        let package = outer.join("p");
+        write(
+            &outer.join("Cargo.toml"),
+            "[workspace]\nmembers = []\nexclude = [\"p\"]\n\n[trust]\nlevel = \"L0\"\n\
+             enabled = false\nskip_functions = [\"f\"]\n",
+        );
+        write(&package.join("Cargo.toml"), "[package]\nname = \"p\"\n");
+        let resolved = resolve_trust_config(&package, None).expect("p is its own root");
+        assert_eq!(resolved.config.level, default_level(), "no downgrade from W");
+        assert!(resolved.config.enabled);
+        assert!(resolved.config.skip_functions.is_empty());
+        assert_eq!(resolved.member_manifest, None);
+
+        // W's retired key is W's to fix; p's own table is its root table.
+        write(
+            &outer.join("Cargo.toml"),
+            "[workspace]\nexclude = [\"p\"]\n\n[trust]\nfunction_budget_ms = 100\n",
+        );
+        write(&package.join("Cargo.toml"), "[package]\nname = \"p\"\n\n[trust]\neffort = 5\n");
+        let resolved = resolve_trust_config(&package, None).expect("W's table is not read");
+        assert_eq!(
+            resolved.config.effort,
+            trust_types::determinism::EffortScale { conflicts_per_node: 5 }
+        );
+
+        // Listed in `members` as well, p is a member after all.
+        write(
+            &outer.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"p\"]\nexclude = [\"p\"]\n\n[trust]\nlevel = \"L1\"\n",
+        );
+        write(&package.join("Cargo.toml"), "[package]\nname = \"p\"\n");
+        let resolved = resolve_trust_config(&package, None).expect("member");
+        assert_eq!(resolved.config.level, "L1");
+        assert_eq!(resolved.source, TrustConfigSource::Manifest(outer.join("Cargo.toml")));
+        assert_eq!(resolved.member_manifest, Some(package.join("Cargo.toml")));
+
+        // Excluded from W, p is still a member of the workspace above W.
+        write(
+            &outer.join("Cargo.toml"),
+            "[workspace]\nexclude = [\"p\"]\n\n[trust]\nlevel = \"L0\"\n",
+        );
+        write(
+            &root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"W/p\"]\n\n[trust]\nlevel = \"L1\"\n",
+        );
+        let resolved = resolve_trust_config(&package, None).expect("outer root");
+        assert_eq!(resolved.config.level, "L1");
+        assert_eq!(resolved.source, TrustConfigSource::Manifest(root.path().join("Cargo.toml")));
+    }
+
+    /// `package.workspace` names the root (Cargo's `read_root_pointer`), wherever
+    /// it is: the root's table is the member's workspace policy, its budgets are
+    /// the run's, and the member's own budgets are refused.
+    #[test]
+    fn a_package_workspace_pointer_names_the_root() {
+        let root = tempfile::tempdir().expect("config fixture");
+        let workspace = root.path().join("R");
+        let member = root.path().join("m");
+        write(
+            &workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"../m\"]\n\n[trust]\nlevel = \"L1\"\neffort = 7\n",
+        );
+        write(&member.join("Cargo.toml"), "[package]\nname = \"m\"\nworkspace = \"../R\"\n");
+        let resolved = resolve_trust_config(&member, None).expect("load");
+        assert_eq!(resolved.config.level, "L1");
+        assert_eq!(
+            resolved.config.effort,
+            trust_types::determinism::EffortScale { conflicts_per_node: 7 }
+        );
+        assert_eq!(resolved.source, TrustConfigSource::Manifest(workspace.join("Cargo.toml")));
+
+        // A package beneath a pointer member is pointed at the same root.
+        let nested = member.join("inner");
+        write(&nested.join("Cargo.toml"), "[package]\nname = \"inner\"\n");
+        let resolved = resolve_trust_config(&nested, None).expect("load");
+        assert_eq!(resolved.source, TrustConfigSource::Manifest(workspace.join("Cargo.toml")));
+        assert_eq!(resolved.member_manifest, Some(nested.join("Cargo.toml")));
+
+        write(
+            &member.join("Cargo.toml"),
+            "[package]\nname = \"m\"\nworkspace = \"../R\"\n\n[trust]\neffort = 5\nbackstop = 2000\n",
+        );
+        let error = resolve_trust_config(&member, None).expect_err("member budget");
+        assert!(error.detail.contains("workspace policy"), "{error}");
+
+        // A pointer to a manifest that is not a workspace root, or to none.
+        write(&member.join("Cargo.toml"), "[package]\nname = \"m\"\nworkspace = \"../R\"\n");
+        write(&workspace.join("Cargo.toml"), "[package]\nname = \"r\"\n");
+        let error = resolve_trust_config(&member, None).expect_err("not a root");
+        assert_eq!(error.path, workspace.join("Cargo.toml"));
+        assert!(error.detail.contains("declares no [workspace]"), "{error}");
+        write(&member.join("Cargo.toml"), "[package]\nname = \"m\"\nworkspace = \"../gone\"\n");
+        let error = resolve_trust_config(&member, None).expect_err("no root");
+        assert_eq!(error.path, root.path().join("gone/Cargo.toml"));
+    }
+
+    /// The search stops where Cargo's does, after `CARGO_HOME` and at a
+    /// `target/package` directory, and an ancestor manifest it cannot read is
+    /// an error rather than a manifest passed over.
+    #[test]
+    fn the_root_search_stops_where_cargos_does() {
+        let root = tempfile::tempdir().expect("config fixture");
+        let root_manifest = root.path().join("Cargo.toml");
+        write(&root_manifest, "[workspace]\n\n[trust]\nlevel = \"L1\"\n");
+        let home = root.path().join("home");
+        let dependency = home.join("registry/src/index/dep/Cargo.toml");
+        write(&dependency, "[package]\nname = \"dep\"\n");
+        let found = member_workspace_root(&dependency, None).expect("search");
+        assert_eq!(found, Some(root_manifest.clone()));
+        let found = member_workspace_root(&dependency, Some(&home)).expect("search");
+        assert!(found.is_none(), "the search does not cross CARGO_HOME");
+
+        let packaged = root.path().join("target/package/p-0.1.0/Cargo.toml");
+        write(&packaged, "[package]\nname = \"p\"\n");
+        let found = member_workspace_root(&packaged, None).expect("search");
+        assert!(found.is_none(), "the search stops at target/package");
+
+        write(&root.path().join("mid/Cargo.toml"), "[package\n");
+        let package = root.path().join("mid/x/p/Cargo.toml");
+        write(&package, "[package]\nname = \"p\"\n");
+        let error = member_workspace_root(&package, None).expect_err("broken ancestor");
+        assert_eq!(error.path, root.path().join("mid/Cargo.toml"));
+        assert!(error.detail.contains("workspace-root search"), "{error}");
     }
 
     #[test]
@@ -809,15 +1490,20 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_budget_is_rejected() {
-        let root = tempfile::tempdir().expect("config fixture");
-        write(
-            &root.path().join("Cargo.toml"),
-            "[package]\nname=\"d\"\n\n[trust]\nfunction_budget_ms = 0\n",
-        );
-
-        let error = resolve_trust_config(root.path(), None).expect_err("zero budget must fail");
-        assert!(error.detail.contains("greater than zero"), "{error}");
+    fn an_out_of_domain_budget_is_rejected() {
+        for (key, needle) in [
+            ("effort = 0", "outside 1..="),
+            ("effort = 400001", "outside 1..="),
+            ("backstop = 0", "at least 1 per mille"),
+        ] {
+            let root = tempfile::tempdir().expect("config fixture");
+            write(
+                &root.path().join("Cargo.toml"),
+                &format!("[package]\nname=\"d\"\n\n[trust]\n{key}\n"),
+            );
+            let error = resolve_trust_config(root.path(), None).expect_err(key);
+            assert!(error.detail.contains(needle), "{key}: {error}");
+        }
     }
 
     #[test]
@@ -831,6 +1517,103 @@ mod tests {
         let error = resolve_trust_config(root.path(), None).expect_err("bad backend must fail");
         assert_eq!(error.action, "validate");
         assert!(error.detail.contains("unknown codegen backend"), "{error}");
+    }
+
+    #[test]
+    fn an_unregistered_trust_profile_is_rejected() {
+        // The silent-profile-downgrade case, at the config surface: the label
+        // was accepted, hardened mode was switched ON for it, the banner
+        // announced it by name, and the compiler generated zero hardened
+        // obligations because the registry does not know it.
+        // NOT in this list: `" unix-hardened "`. Separator, case and
+        // surrounding whitespace are spelling, and the registry canonicalizes
+        // them — see `every_registered_trust_profile_loads_in_the_registry_spelling`.
+        for label in ["unix_hardened_v2", "unix_hardend", "unix", "release", "hardenedness"] {
+            let root = tempfile::tempdir().expect("config fixture");
+            write(
+                &root.path().join("Cargo.toml"),
+                &format!("[package]\nname=\"d\"\n\n[trust]\ntrust_profile = \"{label}\"\n"),
+            );
+
+            let Err(error) = resolve_trust_config(root.path(), None) else {
+                panic!("unregistered profile `{label}` must fail the load");
+            };
+            assert_eq!(error.action, "validate", "{label}");
+            assert!(error.detail.contains("unknown trust profile"), "{label}: {error}");
+            assert!(error.detail.contains("unix_hardened"), "{label}: {error}");
+            assert!(error.detail.contains("hardened = false"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn every_registered_trust_profile_loads_in_the_registry_spelling() {
+        for registered in trust_vcgen::known_hardened_profiles() {
+            for spelling in
+                [registered.to_string(), registered.to_uppercase(), registered.replace('_', "-")]
+            {
+                let root = tempfile::tempdir().expect("config fixture");
+                write(
+                    &root.path().join("Cargo.toml"),
+                    &format!("[package]\nname=\"d\"\n\n[trust]\ntrust_profile = \"{spelling}\"\n"),
+                );
+
+                let resolved = resolve_trust_config(root.path(), None)
+                    .unwrap_or_else(|error| panic!("{spelling} must load: {error}"));
+                assert_eq!(resolved.config.trust_profile.as_deref(), Some(*registered));
+            }
+        }
+    }
+
+    #[test]
+    fn hardened_false_is_still_the_documented_opt_out() {
+        // `hardened = false` is an explicit choice, not a typo, and refusing
+        // unregistered LABELS must not have touched it. It is also accepted
+        // beside a registered label, which is the shape the opt-out actually
+        // takes in a project that has one committed.
+        let root = tempfile::tempdir().expect("config fixture");
+        write(
+            &root.path().join("Cargo.toml"),
+            "[package]\nname=\"d\"\n\n[trust]\nhardened = false\ntrust_profile = \"coreutils_hardened\"\n",
+        );
+
+        let resolved = resolve_trust_config(root.path(), None).expect("opt-out must load");
+        assert_eq!(resolved.config.hardened, Some(false));
+        assert_eq!(resolved.config.trust_profile.as_deref(), Some("coreutils_hardened"));
+    }
+
+    /// S9: the trust-mc engine is never a targo-selectable codegen backend. It
+    /// reaches trustc only as an explicitly selected external backend in its
+    /// own session, never through `[trust] codegen_backend` or
+    /// `--codegen-backend`.
+    #[test]
+    fn the_trust_mc_engine_backend_is_not_a_selectable_codegen_backend() {
+        for name in [
+            "trust-mc",
+            "trust_mc",
+            "TRUST_MC",
+            " trust_mc ",
+            "trust_mc-ay",
+            "librustc_codegen_trust_mc.dylib",
+            "/abs/librustc_codegen_trust_mc.dylib",
+        ] {
+            assert_eq!(normalize_codegen_backend(name), None, "{name:?} was accepted");
+            assert!(
+                !known_codegen_backend_names()
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(name.trim())),
+                "{name:?} is listed as a known backend"
+            );
+        }
+        for name in ["trust_mc", "/abs/librustc_codegen_trust_mc.dylib"] {
+            let root = tempfile::tempdir().expect("config fixture");
+            write(
+                &root.path().join("Cargo.toml"),
+                &format!("[package]\nname=\"d\"\n\n[trust]\ncodegen_backend = \"{name}\"\n"),
+            );
+            let error = resolve_trust_config(root.path(), None)
+                .expect_err("a trust-mc backend in [trust] must fail");
+            assert!(error.detail.contains("unknown codegen backend"), "{error}");
+        }
     }
 
     #[test]
@@ -887,5 +1670,64 @@ mod tests {
         let error = resolve_trust_config(root.path(), None)
             .expect_err("symlinked manifest must fail closed");
         assert_eq!(error.action, "read");
+    }
+
+    /// Trust (platform protocols, plan L1a; FC-7 for `[trust]` keys), adversarial: L1a adds the
+    /// `-Ztrust-platform-*` compiler options and the TRUSTFLAGS route, but no `[trust]` key (plan
+    /// L5b adds `platform_properties`, `platform_premises` and `platform_unanalysed`). Until then
+    /// a project that writes a platform policy into its manifest must be told it does nothing,
+    /// on every surface the table is read from: the member manifest, `Targo.toml`, the
+    /// workspace root a member inherits from, and the deprecated stand-alone file. Snake and
+    /// kebab spellings alike, and the design's names that no landing has scheduled as keys.
+    #[test]
+    fn platform_policy_keys_are_refused_until_targo_transports_them() {
+        const KEYS: &[(&str, &str)] = &[
+            ("platform_properties", "[\"fd-inherit\"]"),
+            ("platform-properties", "[\"fd-inherit\"]"),
+            ("platform_properties", "\"fd-inherit\""),
+            ("platform_unanalysed", "\"deny\""),
+            ("platform_unanalyzed", "\"deny\""),
+            ("platform_budget", "1000000"),
+            ("platform_report", "\"verbose\""),
+            ("platform_premises", "[\"fd-bound\"]"),
+            ("platform_dump_facts", "\"facts.sidecar\""),
+            ("platform", "{ properties = [\"fd-inherit\"] }"),
+        ];
+        for (key, value) in KEYS {
+            let entry = format!("{key} = {value}\n");
+            let refused = |error: TrustConfigLoadError, surface: &str| {
+                assert_eq!(error.action, "validate", "{surface} `{entry}`: {error}");
+                assert!(error.detail.contains("unknown field"), "{surface} `{entry}`: {error}");
+                assert!(error.detail.contains(&format!("`{key}`")), "{surface} `{entry}`: {error}");
+            };
+
+            for manifest in MANIFEST_NAMES {
+                let root = tempfile::tempdir().expect("config fixture");
+                write(
+                    &root.path().join(manifest),
+                    &format!("[package]\nname = \"d\"\n\n[trust]\nlevel = \"L1\"\n{entry}"),
+                );
+                let error = resolve_trust_config(root.path(), None)
+                    .expect_err("a platform key in the member manifest must fail the load");
+                refused(error, manifest);
+            }
+
+            let root = tempfile::tempdir().expect("config fixture");
+            write(
+                &root.path().join("Cargo.toml"),
+                &format!("[workspace]\nmembers = [\"member\"]\n\n[trust]\n{entry}"),
+            );
+            let member = root.path().join("member");
+            write(&member.join("Cargo.toml"), "[package]\nname = \"member\"\n");
+            let error = resolve_trust_config(&member, None)
+                .expect_err("a platform key in the workspace root must fail the member's load");
+            refused(error, "workspace root");
+
+            let root = tempfile::tempdir().expect("config fixture");
+            write(&root.path().join(LEGACY_CONFIG_FILE), &entry);
+            let error = resolve_trust_config(root.path(), None)
+                .expect_err("a platform key in the deprecated file must fail the load");
+            refused(error, LEGACY_CONFIG_FILE);
+        }
     }
 }

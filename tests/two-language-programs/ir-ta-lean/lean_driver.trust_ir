@@ -1,0 +1,44 @@
+; TrustIr text format v1
+; Part A hand-written DRIVER for the standalone-Lean module: `trust-ir run` executes only a
+; NULLARY entry (and on d75f13f97 the standalone Lean lane admits no Lean-to-Lean call), so the emitted
+; non-nullary bodies (addmul, pick, lit8) are reachable only from a driver linked in BY SYMBOL.
+; It evaluates exactly what lean_oracle.rs `program()` evaluates NATIVELY over the same defs:
+;   addmul(6,7) + pick(5,9) + zext(lit8(100)) + program
+; analyze.py compares the two numbers (no constant is typed into the judge).
+module "parta-lean-driver"
+
+functy.0 = (u64, u64) -> (u64)
+
+functy.1 = () -> (u64)
+
+functy.2 = (u8) -> (u8)
+
+rustcc fn @addmul(functy.0) {
+}
+
+rustcc fn @pick(functy.0) {
+}
+
+rustcc fn @lit8(functy.2) {
+}
+
+rustcc fn @program(functy.1) {
+}
+
+rustcc fn @drive(functy.1) {
+bb0:
+    %0 = const u64 6
+    %1 = const u64 7
+    %2 = call @func.0(%0, %1)
+    %3 = const u64 5
+    %4 = const u64 9
+    %5 = call @func.1(%3, %4)
+    %6 = add u64 %2, %5
+    %7 = const u8 100
+    %8 = call @func.2(%7)
+    %9 = zext u8 %8 to u64
+    %10 = add u64 %6, %9
+    %11 = call @func.3()
+    %12 = add u64 %10, %11
+    ret %12
+}

@@ -1,5 +1,5 @@
 //@ needs-trust-verify
-//@ compile-flags: -Ztrust-verify=on
+//@ compile-flags: -Ztrust-verify=on -Ztrust-verify-timeout-ms=2000
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: ERROR
 //@ dont-require-annotations: NOTE
@@ -7,6 +7,11 @@
 //@ check-fail
 //~? RAW Trust
 //@ forbid-output: memory copy side effects require explicit memory-model lowering
+// The 2 s per-obligation budget (default 20 s) removes most of this file's
+// cost, because some engine runs out the budget on an obligation it cannot
+// decide. It is safe: every per-function verdict was measured identical at
+// 0.5 s, 2 s and 20 s (2026-09-23, 96f2019566), and the `Trust verification:`
+// NOTE pins fail if the smaller budget ever changes one.
 //! `copy_nonoverlapping` must reach the native lane as a MODELED memory effect,
 //! never as a whole-function lowering abort.
 //!
@@ -40,11 +45,13 @@
 
 /// The pervasive `count == 1` shape — this is what `ptr::read` compiles to.
 pub unsafe fn read_one(src: *const u32, dst: *mut u32) {
+    //~^ NOTE Trust verification: 0 proved, 10 failed, 2 unknown
     unsafe { core::intrinsics::copy_nonoverlapping(src, dst, 1) }
 }
 
 /// A small constant count, unrolled element-wise.
 pub unsafe fn copy_four(src: *const u8, dst: *mut u8) {
+    //~^ NOTE Trust verification: 0 proved, 10 failed, 2 unknown
     unsafe { core::intrinsics::copy_nonoverlapping(src, dst, 4) }
 }
 
@@ -52,5 +59,6 @@ pub unsafe fn copy_four(src: *const u8, dst: *mut u8) {
 /// region-havoc primitive, and modeling fewer elements than are written would
 /// let a later read of the destination return a stale value.
 pub unsafe fn copy_n(src: *const u8, dst: *mut u8, n: usize) {
+    //~^ NOTE Trust verification: 0 proved, 10 failed, 2 unknown
     unsafe { core::intrinsics::copy_nonoverlapping(src, dst, n) }
 }

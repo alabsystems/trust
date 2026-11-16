@@ -1,0 +1,323 @@
+{
+  "name": "div_cast_divisor",
+  "def_path": "literal_operand_arms::div_cast_divisor",
+  "span": {
+    "file": "literal_operand_arms.rs",
+    "line_start": 31,
+    "col_start": 0,
+    "line_end": 33,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": "Bool",
+        "name": "b"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 16,
+                      "signed": true
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_operand_arms.rs",
+                "line_start": 32,
+                "col_start": 11,
+                "line_end": 32,
+                "col_end": 11
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_operand_arms.rs",
+                "line_start": 32,
+                "col_start": 4,
+                "line_end": 32,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 1,
+            "span": {
+              "file": "literal_operand_arms.rs",
+              "line_start": 32,
+              "col_start": 4,
+              "line_end": 32,
+              "col_end": 4
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -1
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_operand_arms.rs",
+                "line_start": 32,
+                "col_start": 4,
+                "line_end": 32,
+                "col_end": 4
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Int": 7
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -32768
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_operand_arms.rs",
+                "line_start": 32,
+                "col_start": 4,
+                "line_end": 32,
+                "col_end": 4
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Move": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_operand_arms.rs",
+                "line_start": 32,
+                "col_start": 4,
+                "line_end": 32,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Div"
+            },
+            "target": 2,
+            "span": {
+              "file": "literal_operand_arms.rs",
+              "line_start": 32,
+              "col_start": 4,
+              "line_end": 32,
+              "col_end": 4
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Constant": {
+                      "Int": 7
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_operand_arms.rs",
+                "line_start": 32,
+                "col_start": 4,
+                "line_end": 32,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 16,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -55,7 +55,7 @@ fn collision_dylib() {
     p.cargo("build -j=1")
         .with_stderr_data(&format!("\
 ...
-[WARNING] output filename collision at [ROOT]/foo/target/debug/deps/{}a{}
+[WARNING] output filename collision at [ROOT]/foo/target/debug/{}a{}
   |
   = [NOTE] the lib target `a` in package `b v1.0.0 ([ROOT]/foo/b)` has the same output filename as the lib target `a` in package `a v1.0.0 ([ROOT]/foo/a)`
   = [NOTE] this may become a hard error in the future; see <https://github.com/rust-lang/cargo/issues/6313>
@@ -114,7 +114,8 @@ fn collision_export() {
 
     // -j1 to avoid issues with two processes writing to the same file at the
     // same time.
-    p.cargo("build -j1 --artifact-dir=out -Z unstable-options --bins --examples")
+    p.cargo("build -j1 --artifact-dir=out --bins --examples")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["artifact-dir"])
         .with_stderr_data(str![[r#"
 [WARNING] `--artifact-dir` filename collision at [ROOT]/foo/out/foo[EXE]
@@ -202,7 +203,7 @@ fn collision_doc_multiple_versions() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [ADDING] bar v1.0.0 (available: v2.0.0)
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v2.0.0 (registry `dummy-registry`)
@@ -352,6 +353,9 @@ fn collision_doc_profile_split() {
 
                 [profile.dev]
                 opt-level = 2
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -368,6 +372,9 @@ fn collision_doc_profile_split() {
 
                 [lib]
                 proc-macro = true
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("pm/src/lib.rs", "")
@@ -380,7 +387,10 @@ fn collision_doc_profile_split() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ * [new ref]         HEAD       -> origin/HEAD
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] common v1.0.0 (registry `dummy-registry`)
 [COMPILING] common v1.0.0
@@ -441,7 +451,7 @@ fn collision_doc_sources() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
 [WARNING] output filename collision at [ROOT]/foo/target/doc/bar/index.html
@@ -496,7 +506,7 @@ fn collision_doc_target() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [ADDING] bar v1.0.0 (available: v2.0.0)
 [DOWNLOADING] crates ...
 [DOWNLOADED] orphaned v1.0.0 (registry `dummy-registry`)
@@ -566,7 +576,7 @@ fn collision_with_root() {
     p.cargo("doc -j=1")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] foo-macro v1.0.0 (registry `dummy-registry`)
 [WARNING] output filename collision at [ROOT]/foo/target/doc/foo_macro/index.html

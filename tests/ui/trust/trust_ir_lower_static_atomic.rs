@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-SI): a local static with INTERIOR mutability (`AtomicUsize`,
 //! `AtomicBool`) is the mutable module global wave-SM gives a `static mut`:
 //! its address is the `GlobalAddr`, every mutation is a call to the type's

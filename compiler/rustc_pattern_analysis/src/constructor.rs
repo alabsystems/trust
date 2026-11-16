@@ -94,7 +94,6 @@
 //! constructors of a type. For example, all the following is ok:
 //!
 //! ```rust,ignore(example)
-//! # #![feature(never_type)]
 //! # #![feature(exhaustive_patterns)]
 //! fn foo(x: Option<!>) {
 //!   match x {
@@ -114,7 +113,6 @@
 //! Moreover, take the following:
 //!
 //! ```rust
-//! # #![feature(never_type)]
 //! # #![feature(exhaustive_patterns)]
 //! # let x = None::<!>;
 //! match x {
@@ -375,7 +373,7 @@ impl IntRange {
         // We do parenthesis matching for input ranges. A boundary counts as +1 if it starts
         // a range and -1 if it ends it. When the count is > 0 between two boundaries, we
         // are within an input range.
-        let mut boundaries: Vec<(MaybeInfiniteInt, isize)> = column_ranges
+        let mut boundaries: SmallVec<[(MaybeInfiniteInt, isize); 8]> = column_ranges
             .filter_map(|r| self.intersection(&r))
             .flat_map(|r| [(r.lo, 1), (r.hi, -1)])
             .collect();
@@ -672,7 +670,7 @@ impl OpaqueId {
     pub fn new() -> Self {
         use std::sync::atomic::{AtomicU32, Ordering};
         static OPAQUE_ID: AtomicU32 = AtomicU32::new(0);
-        OpaqueId(OPAQUE_ID.fetch_add(1, Ordering::SeqCst))
+        OpaqueId(OPAQUE_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -881,7 +879,7 @@ impl<Cx: PatCx> Constructor<Cx> {
             (Opaque(..), _) | (_, Opaque(..)) => false,
 
             _ => {
-                return Err(cx.bug(format_args!(
+                return Err(cx.delayed_bug(format_args!(
                     "trying to compare incompatible constructors {self:?} and {other:?}"
                 )));
             }
@@ -1033,7 +1031,7 @@ pub enum ConstructorSet<Cx: PatCx> {
 /// ignoring any row with `Opaque`s in the algorithm. Hence the importance of point 4.
 #[derive(Debug)]
 pub struct SplitConstructorSet<Cx: PatCx> {
-    pub present: SmallVec<[Constructor<Cx>; 1]>,
+    pub present: SmallVec<[Constructor<Cx>; 2]>,
     pub missing: Vec<Constructor<Cx>>,
     pub missing_empty: Vec<Constructor<Cx>>,
 }
@@ -1050,27 +1048,27 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
     where
         Cx: 'a,
     {
-        let mut present: SmallVec<[_; 1]> = SmallVec::new();
+        let mut present: SmallVec<[_; 2]> = SmallVec::new();
         // Empty constructors found missing.
         let mut missing_empty = Vec::new();
         // Nonempty constructors found missing.
         let mut missing = Vec::new();
-        // Constructors in `ctors`, except wildcards and opaques.
-        let mut seen = Vec::new();
+        // Whether `ctors` contains any non-wildcard, non-opaque, non-deref constructor.
+        let mut has_seen = false;
         // If we see a deref pattern, it must be the only non-wildcard non-opaque constructor; we
         // ensure this prior to analysis.
         let mut deref_pat_present = false;
-        for ctor in ctors.cloned() {
+        for ctor in ctors.clone() {
             match ctor {
                 DerefPattern(..) => {
                     if !deref_pat_present {
                         deref_pat_present = true;
-                        present.push(ctor);
+                        present.push(ctor.clone());
                     }
                 }
-                Opaque(..) => present.push(ctor),
+                Opaque(..) => present.push(ctor.clone()),
                 Wildcard => {} // discard wildcards
-                _ => seen.push(ctor),
+                _ => has_seen = true,
             }
         }
 
@@ -1079,7 +1077,7 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
                 // Deref patterns are the only constructor; nothing is missing.
             }
             ConstructorSet::Struct { empty } => {
-                if !seen.is_empty() {
+                if has_seen {
                     present.push(Struct);
                 } else if *empty {
                     missing_empty.push(Struct);
@@ -1088,14 +1086,14 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
                 }
             }
             ConstructorSet::Ref => {
-                if !seen.is_empty() {
+                if has_seen {
                     present.push(Ref);
                 } else {
                     missing.push(Ref);
                 }
             }
             ConstructorSet::Union => {
-                if !seen.is_empty() {
+                if has_seen {
                     present.push(UnionField);
                 } else {
                     missing.push(UnionField);
@@ -1103,7 +1101,7 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
             }
             ConstructorSet::Variants { variants, non_exhaustive } => {
                 let mut seen_set = DenseBitSet::new_empty(variants.len());
-                for idx in seen.iter().filter_map(|c| c.as_variant()) {
+                for idx in ctors.filter_map(|c| c.as_variant()) {
                     seen_set.insert(idx);
                 }
                 let mut skipped_a_hidden_variant = false;
@@ -1132,7 +1130,7 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
             ConstructorSet::Bool => {
                 let mut seen_false = false;
                 let mut seen_true = false;
-                for b in seen.iter().filter_map(|ctor| ctor.as_bool()) {
+                for b in ctors.filter_map(|ctor| ctor.as_bool()) {
                     if b {
                         seen_true = true;
                     } else {
@@ -1151,16 +1149,15 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
                 }
             }
             ConstructorSet::Integers { range_1, range_2 } => {
-                let seen_ranges: Vec<_> =
-                    seen.iter().filter_map(|ctor| ctor.as_int_range()).copied().collect();
-                for (seen, splitted_range) in range_1.split(seen_ranges.iter().cloned()) {
+                let seen_ranges = ctors.filter_map(|ctor| ctor.as_int_range()).copied();
+                for (seen, splitted_range) in range_1.split(seen_ranges.clone()) {
                     match seen {
                         Presence::Unseen => missing.push(IntRange(splitted_range)),
                         Presence::Seen => present.push(IntRange(splitted_range)),
                     }
                 }
                 if let Some(range_2) = range_2 {
-                    for (seen, splitted_range) in range_2.split(seen_ranges.into_iter()) {
+                    for (seen, splitted_range) in range_2.split(seen_ranges) {
                         match seen {
                             Presence::Unseen => missing.push(IntRange(splitted_range)),
                             Presence::Seen => present.push(IntRange(splitted_range)),
@@ -1169,7 +1166,7 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
                 }
             }
             ConstructorSet::Slice { array_len, subtype_is_empty } => {
-                let seen_slices = seen.iter().filter_map(|c| c.as_slice());
+                let seen_slices = ctors.filter_map(|c| c.as_slice());
                 let base_slice = Slice::new(*array_len, VarLen(0, 0));
                 for (seen, splitted_slice) in base_slice.split(seen_slices) {
                     let ctor = Slice(splitted_slice);
@@ -1190,7 +1187,11 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
             ConstructorSet::Unlistable => {
                 // Since we can't list constructors, we take the ones in the column. This might list
                 // some constructors several times but there's not much we can do.
-                present.extend(seen);
+                present.extend(
+                    ctors
+                        .filter(|c| !matches!(c, DerefPattern(..) | Opaque(..) | Wildcard))
+                        .cloned(),
+                );
                 missing.push(NonExhaustive);
             }
             ConstructorSet::NoConstructors => {

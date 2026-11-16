@@ -36,8 +36,10 @@ cd "$(dirname "$0")/.."
 
 REPO="$(pwd -P)"
 LOGS="${REPO}/build-logs"
-PY=/opt/homebrew/opt/python@3.14/bin/python3.14
-HOST="aarch64-apple-darwin"
+PY="${TRUST_SEED_PYTHON:-$(command -v python3.14 || command -v python3)}"
+[[ -x "$PY" ]] || { echo "ERROR: no python3 found (set TRUST_SEED_PYTHON)"; exit 1; }
+HOST="${TRUST_HOST:-$("${REPO}"/build/*/stage2/bin/trustc -vV 2>/dev/null | sed -n 's/^host: //p' | head -1)}"
+HOST="${HOST:-aarch64-apple-darwin}"
 STAGE2_BIN="${REPO}/build/${HOST}/stage2/bin"
 DIST_DIR="${REPO}/build/dist"
 
@@ -107,7 +109,7 @@ if ! "${PY}" "${REPO}/x.py" build src/tools/build-manifest --stage 2 -j "${TRUST
     tail -20 "${BM_LOG}" | sed 's/^/  /'
     exit 2
 fi
-BUILD_MANIFEST=$(find "${REPO}/build" -type f -name build-manifest -path '*stage2-tools*' 2>/dev/null | head -1)
+BUILD_MANIFEST=$(find -H "${REPO}/build" -type f -name build-manifest -path '*stage2-tools*' 2>/dev/null | head -1)
 if [[ -z "${BUILD_MANIFEST}" ]] || [[ ! -x "${BUILD_MANIFEST}" ]]; then
     echo "ERROR: build-manifest binary not found under ${REPO}/build after build"
     exit 2

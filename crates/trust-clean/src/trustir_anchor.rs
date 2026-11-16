@@ -30,7 +30,7 @@
 //   2. A Clean denotation `Trust.TrustIr.evalBin : Env → BinOp → Nat → Nat → Int`
 //      reflecting a binary op over two PARAMETER operands (the `Var i`/`Var j`
 //      slots), folding each `BinOp` constructor to the prelude's reducible
-//      `Int.add`/`Int.sub`/`Int.mul` (and the opaque `Int.div` for `SDiv`).
+//      `Int.add`/`Int.sub`/`Int.mul` (and the reducible `Int.div` for `SDiv`).
 //   3. The REFINEMENT theorem, kernel-checked modulo 3:
 //
 //        ∀ (a b : Int), Trust.TrustIr.evalBin E OP 0 1 = ground_int(<a OP b>)
@@ -132,11 +132,11 @@ pub const TRUSTIR_BINOP: &str = "Trust.TrustIr.BinOp";
 pub const TRUSTIR_BINOP_ADD: &str = "Trust.TrustIr.BinOp.Add";
 pub const TRUSTIR_BINOP_SUB: &str = "Trust.TrustIr.BinOp.Sub";
 pub const TRUSTIR_BINOP_MUL: &str = "Trust.TrustIr.BinOp.Mul";
-/// `SDiv : BinOp` — trust-ir's signed division; grounds to the prelude's opaque
-/// (non-axiom) `Int.div`, matching `ground_int`'s `F::Div` arm.
+/// `SDiv : BinOp` — trust-ir's signed division; grounds to the prelude's
+/// (non-axiom) `Int.div` definition, matching `ground_int`'s `F::Div` arm.
 pub const TRUSTIR_BINOP_SDIV: &str = "Trust.TrustIr.BinOp.SDiv";
 /// `SRem : BinOp` — Trust: witness-tier Rem arm — trust-ir's signed (TRUNCATED)
-/// remainder; grounds to the prelude's opaque (non-axiom) `Int.mod`, matching
+/// remainder; grounds to the prelude's (non-axiom) `Int.mod` definition, matching
 /// `ground_int`'s `F::Rem` arm and trust-ir's `semIntBinOp .SRem` (Arith.lean's
 /// `Int.mod sl sr` — the T-rounding rustc's `%` uses; the M3 differential pinned
 /// this three-way at the value tier). MIR `Rem` translates onto `SRem`: for
@@ -1010,7 +1010,7 @@ pub enum TrustIrBinOp {
     /// `trust_ir::BinOp::SDiv` (signed division).
     SDiv,
     /// `trust_ir::BinOp::SRem` (signed TRUNCATED remainder — Trust: witness-tier
-    /// Rem arm). Grounds to the prelude's opaque `Int.mod` (`ground_int`'s
+    /// Rem arm). Grounds to the prelude's `Int.mod` definition (`ground_int`'s
     /// `F::Rem` arm), the SAME truncated semantics as trust-ir's
     /// `semIntBinOp .SRem`. MIR `Rem` maps here for signed operands BY DEFINITION
     /// and for unsigned operands BY COINCIDENCE ON THE NONNEGATIVE FRAGMENT
@@ -2993,8 +2993,9 @@ fn register_binop_inductive(env: &mut Environment) -> Result<(), String> {
 
 /// Register the Opaque `Int.shiftRight : Int → Int → Int` constant (idempotent) — the
 /// SAME "opaque, total, asserts nothing about the value" honesty tier `Int.div`/
-/// `Int.mod` already establish in the shared prelude, and BYTE-IDENTICAL in name/type/
-/// placeholder-body discipline to `mirsem::register_int_bitwise`'s `Int.shiftRight` arm
+/// `Int.mod` held in the shared prelude until Clean made them Lean 4.8.0's
+/// T-rounding definitions (2026-09-30), and BYTE-IDENTICAL in name/type/placeholder-body
+/// discipline to `mirsem::register_int_bitwise`'s `Int.shiftRight` arm
 /// (this anchor's OWN environment is built fresh from `Environment::with_prelude()`, so
 /// it does not inherit MirSem's registration — this is the trust-ir anchor's own copy of
 /// the SAME carrier, not a second DIFFERENT opaque). Must run before
@@ -3097,17 +3098,18 @@ fn register_int_shl(env: &mut Environment) -> Result<(), String> {
 ///     (Int.add (e i) (e j))   -- Add
 ///     (Int.sub (e i) (e j))   -- Sub
 ///     (Int.mul (e i) (e j))   -- Mul
-///     (Int.div (e i) (e j))   -- SDiv  (opaque Int.div; matches ground_int F::Div)
-///     (Int.mod (e i) (e j))   -- SRem  (opaque Int.mod; matches ground_int F::Rem)
+///     (Int.div (e i) (e j))   -- SDiv  (prelude Int.div; matches ground_int F::Div)
+///     (Int.mod (e i) (e j))   -- SRem  (prelude Int.mod; matches ground_int F::Rem)
 ///     (Int.shiftRight (e i) (e j))   -- LShr  (opaque Int.shiftRight; matches
 ///                                        ground_int's Pred("Int.shiftRight",_) arm)
 ///     op
 /// ```
 ///
-/// `Int.add`/`sub`/`mul` are the prelude's reducible `Int.rec` definitions;
-/// `Int.div`/`Int.mod`/`Int.shiftRight` are opaque (native-reduced/placeholder)
-/// constants. NONE is an `Axiom`, so `evalBin` carries no non-foundational axiom. The
-/// `Int.<op>` head and `(e i) (e j)` argument order are BYTE-IDENTICAL to what
+/// `Int.add`/`sub`/`mul`/`div`/`mod` are the prelude's reducible `Int.rec`
+/// definitions (`div`/`mod` are Lean 4.8.0's T-rounding ones); `Int.shiftRight` is
+/// an opaque (native-reduced/placeholder) constant. NONE is an `Axiom`, so `evalBin`
+/// carries no non-foundational axiom. The `Int.<op>` head and `(e i) (e j)`
+/// argument order are BYTE-IDENTICAL to what
 /// `clean_ground::ground_int` emits for `Formula::{Add,Sub,Mul,Div,Rem}` / the BITWISE
 /// SHAPE LANE's `Pred("Int.shiftRight",_)` arm — the `SRem` minor (Trust: witness-tier
 /// Rem arm) denotes the SAME truncated `Int.mod` trust-ir's `semIntBinOp .SRem`
@@ -11143,7 +11145,7 @@ pub(crate) fn branch_model_refinement_proof(cfg: &IrCfg) -> Option<Expr> {
 }
 
 /// Trust: B3 — check the MODEL-ONLY BRANCH refinement, modulo 3: the branch-lane
-/// sibling of [`check_body_refinement_model_chain`], and the owner-ruled closure of
+/// sibling of [`check_body_refinement_model_chain`], and the ruled closure of
 /// the asymmetry that shaped this campaign (the chain lane had a model variant, the
 /// branch lane did not, so a MODEL-ONLY carrier — `Discr` — could close there but
 /// never here).
@@ -11426,6 +11428,14 @@ mod exact_cast_tests {
         let dest = IntCastDest::new(8, false).expect("u8");
         for source in [-1_i128, 256, 300, i128::from(i32::MIN)] {
             let actual = exact_int_cast_expr(int_lit(source), dest);
+            // A stuck Int.mod term is not definitionally equal to the source
+            // either. Require the concrete wrapped value first, so a failure
+            // to compute cannot make the non-identity check pass vacuously.
+            assert!(
+                tc.is_def_eq(&actual, &int_lit(source.rem_euclid(256))),
+                "cast {source} -> u8 must reduce to {}",
+                source.rem_euclid(256)
+            );
             assert!(
                 !tc.is_def_eq(&actual, &int_lit(source)),
                 "cast {source} -> u8 must NOT be the identity"
@@ -11528,6 +11538,7 @@ mod exact_cast_tests {
                 preconditions: Vec::new(),
                 postconditions: Vec::new(),
                 spec: trust_types::FunctionSpec::default(),
+                tuple_layouts: Default::default(),
             }
         };
 
@@ -11668,6 +11679,7 @@ mod exact_cast_tests {
                 preconditions: Vec::new(),
                 postconditions: Vec::new(),
                 spec: trust_types::FunctionSpec::default(),
+                tuple_layouts: Default::default(),
             }
         };
 
@@ -11907,6 +11919,7 @@ mod exact_cast_tests {
                 preconditions: Vec::new(),
                 postconditions: Vec::new(),
                 spec: trust_types::FunctionSpec::default(),
+                tuple_layouts: Default::default(),
             }
         };
 
@@ -12113,6 +12126,7 @@ mod exact_cast_tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
 
         let ir = crate::prove::straight_line_ir_body_chain(&func)

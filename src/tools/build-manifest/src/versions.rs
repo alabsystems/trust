@@ -85,6 +85,7 @@ pkg_type! {
     JsonDocs = "trust-docs-json"; preview = true,
     LlvmBitcodeLinker = "llvm-bitcode-linker"; preview = true,
     Enzyme = "enzyme"; preview = true,
+    Offload = "offload"; preview = true,
 }
 
 impl PkgType {
@@ -122,6 +123,7 @@ impl PkgType {
             PkgType::LlvmBitcodeLinker => true,
             PkgType::TCargoTrust => true,
             PkgType::Enzyme => true,
+            PkgType::Offload => true,
         }
     }
 
@@ -151,6 +153,7 @@ impl PkgType {
             LlvmTools => TARGETS,
             LlvmBitcodeLinker => HOSTS,
             Enzyme => HOSTS,
+            Offload => HOSTS,
         }
     }
 
@@ -350,8 +353,8 @@ impl Versions {
     }
 
     /// Trust: the product version that names dist archives — Trust's own
-    /// `major.minor.dev` line, not the Rust release the toolchain is compatible
-    /// with. A `trust-0.1.0` tarball is named after Trust.
+    /// `MAJOR.MINOR.0` line, not the Rust release the toolchain is compatible
+    /// with. A `trust-<version>` tarball is named after Trust.
     pub(crate) fn trust_version(&self) -> &str {
         const TRUST_VERSION: &str = include_str!("../../../version");
         TRUST_VERSION.trim()

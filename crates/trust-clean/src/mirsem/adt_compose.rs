@@ -2106,7 +2106,7 @@ pub(super) fn goto_chain_reaches(
 /// `&mut` alias anywhere could invisibly clobber the value), so those two clauses
 /// stay whole-body, fail-closed.
 pub(super) fn chain_local_not_aliased(body: &trust_types::VerifiableBody, local: usize) -> bool {
-    use trust_types::{Rvalue, Statement, Terminator};
+    use trust_types::Terminator;
     let call_dest_written = body.blocks.iter().any(|b| {
         matches!(&b.terminator,
             Terminator::Call { dest, .. } if dest.local == local)
@@ -2114,11 +2114,10 @@ pub(super) fn chain_local_not_aliased(body: &trust_types::VerifiableBody, local:
     if call_dest_written {
         return false;
     }
+    // `&raw const` counts (INT-RAWCONST-HAVOC-1): see `param_reassigned_by_stmt`.
     let mutably_aliased = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
-        matches!(s,
-            Statement::Assign { rvalue: Rvalue::Ref { mutable: true, place }, .. }
-                | Statement::Assign { rvalue: Rvalue::AddressOf(true, place), .. }
-            if place.local == local)
+        trust_vcgen::place_write::write_capable_borrow(body, s, |place| place.local == local)
+            .is_some()
     });
     !mutably_aliased
 }

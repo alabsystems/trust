@@ -244,6 +244,7 @@ fn emitted_general_diamond(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -417,11 +418,7 @@ fn comparison_spine(env: &Environment, name: &str) -> Vec<Expr> {
         cursor = &**inner;
     }
     let (head, args) = uncurry(cursor);
-    assert_eq!(
-        const_name(head).as_deref(),
-        Some("ite"),
-        "`{name}`'s body must still be an `ite`"
-    );
+    assert_eq!(const_name(head).as_deref(), Some("ite"), "`{name}`'s body must still be an `ite`");
     assert_eq!(args.len(), 5, "`ite` is `{{C}} prop inst then else`");
     let (cmp_head, cmp_args) = uncurry(args[1]);
     assert_eq!(

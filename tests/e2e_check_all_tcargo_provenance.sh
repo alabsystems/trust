@@ -34,11 +34,10 @@ write_fixture_repo() {
     chmod +x "$repo/scripts/check_all.sh"
     write_python_script "$repo/scripts/check_cargo_manifest_alignment.py"
     write_python_script "$repo/scripts/check_ledger_expirations.py"
-    printf '[workspace]\n' >"$repo/crates/Cargo.toml"
-    printf '# lock\n' >"$repo/crates/Cargo.lock"
+    printf '[workspace]\n' >"$repo/Cargo.toml"
+    printf '# lock\n' >"$repo/Cargo.lock"
     printf '[package]\nname = "fixture"\nversion = "0.0.0"\nedition = "2021"\n' \
         >"$repo/targo-trust/Cargo.toml"
-    printf '# lock\n' >"$repo/targo-trust/Cargo.lock"
     write_exe "$repo/build/host/stage2/bin/trustc" '#!/usr/bin/env sh
 exit 0'
 }
@@ -123,7 +122,7 @@ if grep -q -- "--host-diagnostics" "$TARGO_LOG"; then
 fi
 [ ! -e "$AMBIENT_MARKER" ] || fail "poisoned ambient cargo must not run"
 
-echo "--- host diagnostics are optional and explicitly requested"
+echo "--- the retired host diagnostic refuses and never runs ambient cargo"
 REPO="$TMP_DIR/host-diagnostic"
 OUT="$REPO/output.log"
 TARGO_LOG="$REPO/targo.log"
@@ -131,27 +130,16 @@ AMBIENT_MARKER="$REPO/host-cargo-used"
 write_fixture_repo "$REPO"
 write_fake_targo "$REPO/build/host/stage2/bin/targo" "$TARGO_LOG"
 mkdir -p "$REPO/fake-bin"
-write_fake_cargo "$REPO/fake-bin/cargo" "$AMBIENT_MARKER" 99
-CARGO="$REPO/fake-bin/cargo" PYTHON="$PYTHON_BIN" TRUST_CHECK_ALL_RUN_HOST_DIAGNOSTICS=1 \
-    bash "$REPO/scripts/check_all.sh" >"$OUT" 2>&1 \
-    || fail "host diagnostic request should not fail golden checks"
-grep -q "trust gate check-all" "$TARGO_LOG" \
-    || fail "stage2 targo should run the Rust-native check-all gate"
-grep -q -- "--host-diagnostics" "$TARGO_LOG" \
-    || fail "explicitly enabled host diagnostics should be forwarded to the gate"
-[ ! -e "$AMBIENT_MARKER" ] || fail "the wrapper itself must never invoke ambient cargo"
-
-echo "--- host diagnostics cannot satisfy missing golden targo"
-REPO="$TMP_DIR/host-diagnostic-missing-targo"
-OUT="$REPO/output.log"
-AMBIENT_MARKER="$REPO/host-cargo-used"
-write_fixture_repo "$REPO"
-mkdir -p "$REPO/fake-bin"
 write_fake_cargo "$REPO/fake-bin/cargo" "$AMBIENT_MARKER" 0
-if CARGO="$REPO/fake-bin/cargo" PYTHON="$PYTHON_BIN" TRUST_CHECK_ALL_RUN_HOST_DIAGNOSTICS=1 \
-    bash "$REPO/scripts/check_all.sh" >"$OUT" 2>&1; then
-    fail "host diagnostics must not satisfy missing stage2 targo"
-fi
-[ ! -e "$AMBIENT_MARKER" ] || fail "host diagnostic cargo must not run before golden targo check"
+set +e
+CARGO="$REPO/fake-bin/cargo" PYTHON="$PYTHON_BIN" TRUST_CHECK_ALL_RUN_HOST_DIAGNOSTICS=1 \
+    bash "$REPO/scripts/check_all.sh" >"$OUT" 2>&1
+status=$?
+set -e
+[ "$status" -eq 2 ] || { cat "$OUT" >&2; fail "retired host diagnostic should exit 2, got $status"; }
+grep -q "TRUST_CHECK_ALL_RUN_HOST_DIAGNOSTICS was retired" "$OUT" \
+    || fail "retired host diagnostic refusal should name the retired switch"
+[ ! -e "$TARGO_LOG" ] || fail "retired host diagnostic must refuse before any gate runs"
+[ ! -e "$AMBIENT_MARKER" ] || fail "the wrapper itself must never invoke ambient cargo"
 
 echo "check_all stage2 targo provenance regressions passed"

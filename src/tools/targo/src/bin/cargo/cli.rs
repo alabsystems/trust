@@ -1,14 +1,14 @@
+use crate::util::data_structures::{HashMap, HashSet};
 use anyhow::{Context as _, anyhow};
-use cargo::core::{CliUnstable, features};
-use cargo::util::context::TermConfig;
-use cargo::{CargoResult, drop_print, drop_println};
 use cargo_util_terminal::report::Level;
 use clap::builder::UnknownArgumentValueParser;
 use itertools::Itertools;
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt::Write;
+use targo::context::TermConfig;
+use targo::workspace::{CliUnstable, features};
+use targo::{CargoResult, drop_print, drop_println};
 
 use super::commands;
 use super::list_commands;
@@ -16,18 +16,142 @@ use super::third_party_subcommands;
 use super::user_defined_aliases;
 use crate::command_prelude::*;
 use crate::util::is_rustup;
-use cargo::util::style;
 use cargo_util_terminal::ColorChoice;
+use targo::util::style;
 
 const UNBOUND_TRUST_REPO_COMMIT: &str = "unbound";
 
 #[tracing::instrument(skip_all)]
 pub fn main(gctx: &mut GlobalContext) -> CliResult {
+    run(gctx, std::env::args_os().collect(), RunPurpose::Execute)
+}
+
+pub(super) fn native_capability(gctx: &mut GlobalContext, args: &[OsString]) -> CliResult {
+    let mut argv = vec![OsString::from("targo")];
+    argv.extend_from_slice(args);
+    run(gctx, argv, RunPurpose::NativeCapability)
+}
+
+/// Trust: the actual original Full owner supplies this library context. No
+/// native startup, scheduler, environment import or process is created here.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn original_full(
+    gctx: &mut GlobalContext,
+    args: &[OsString],
+    owner: std::sync::Arc<targo::context::bootstrap_full::BootstrapFull>,
+) -> CliResult {
+    owner.check_current()?;
+    if !owner.owns_context(gctx) {
+        return Err(anyhow!("Full parser has a different original context").into());
+    }
+    let mut argv = vec![owner.original().control_targo()?.into_os_string()];
+    argv.extend_from_slice(args);
+    let result = run(gctx, argv, RunPurpose::OriginalFull(owner.clone()));
+    owner.check_current()?;
+    result
+}
+
+enum RunPurpose {
+    Execute,
+    NativeCapability,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    OriginalFull(std::sync::Arc<targo::context::bootstrap_full::BootstrapFull>),
+}
+impl RunPurpose {
+    fn is_original_full(&self) -> bool {
+        match self {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::OriginalFull(_) => true,
+            _ => false,
+        }
+    }
+    fn reload_directory(
+        &self,
+        gctx: &mut GlobalContext,
+        directory: &std::path::Path,
+    ) -> CargoResult<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Self::OriginalFull(owner) = self {
+            return owner.reload_context_directory(gctx, directory);
+        }
+        std::env::set_current_dir(directory).context("could not change to requested directory")?;
+        gctx.reload_cwd()
+    }
+    fn configure_policy(
+        &self,
+        gctx: &GlobalContext,
+        command: &str,
+        manifest: bool,
+        explicit_unverified: bool,
+    ) -> CargoResult<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Self::OriginalFull(owner) = self {
+            owner.check_current()?;
+            anyhow::ensure!(
+                owner.owns_context(gctx),
+                "Full policy has a different original context"
+            );
+            // The actual original entry already initialized its disclosed
+            // unverified policy. Parsing another command cannot renew the
+            // broker, mutate global flags, or select a different proof lane.
+            anyhow::ensure!(
+                targo::trust_no_verify_fast() && !targo::trust_verified_targo(),
+                "Full library commands require the original entry's existing unverified policy"
+            );
+            let authorization = super::authorize_trust_execution(
+                true,
+                command,
+                manifest,
+                explicit_unverified,
+                false,
+                gctx.get_env_os("TRUST_TARGO_VERIFY") == Some(OsStr::new("1")),
+                gctx.get_env_os("TRUST_BOOTSTRAP_NO_VERIFY").is_some()
+                    || gctx
+                        .get_env_os("TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY")
+                        .is_some(),
+            )?;
+            anyhow::ensure!(
+                matches!(
+                    authorization,
+                    super::TrustExecutionAuthorization::NotApplicable
+                        | super::TrustExecutionAuthorization::ExplicitUnverified
+                ),
+                "Full command cannot change the original proof lane"
+            );
+            return Ok(());
+        }
+        let _ = gctx;
+        super::configure_trust_execution_policy(command, manifest, explicit_unverified)
+    }
+}
+
+fn run(gctx: &mut GlobalContext, argv: Vec<OsString>, purpose: RunPurpose) -> CliResult {
     // CAUTION: Be careful with using `config` until it is configured below.
     // In general, try to avoid loading config values unless necessary (like
     // the [alias] table).
 
-    let args = cli(gctx).try_get_matches()?;
+    let native_shape =
+        super::resource_capabilities::invocation_supported(argv.get(1..).unwrap_or_default());
+    // Trust: a library call's actual argv is independent of the Root process
+    // prelude. Capture consent before this canonical parser consumes it.
+    let original_tail_unverified = argv_has_unverified_before_delimiter(&argv);
+    let mut command = cli(gctx);
+    let args = command.try_get_matches_from_mut(argv)?;
+    if args.flag("resource-worker-v2") && !native_shape {
+        return Err(anyhow::anyhow!(
+            "native worker invocation is outside the supported command profile"
+        )
+        .into());
+    }
+    if purpose.is_original_full() {
+        require_no_native_startup(&args)?;
+    } else {
+        targo::set_resource_worker_v2(args.flag("resource-worker-v2"))?;
+        targo::set_resource_worker_v3(
+            args.flag("resource-worker-v3"),
+            args.flag("resource-subgroups-v3"),
+        )?;
+    }
     // Trust: lane consent is an authorization input, so capture its origin
     // before config-backed alias expansion reparses any arguments — after
     // expansion, a flag from `[alias]` is indistinguishable from one the human
@@ -39,23 +163,25 @@ pub fn main(gctx: &mut GlobalContext) -> CliResult {
     let original_is_manifest_command = args
         .subcommand_name()
         .is_some_and(commands::run::is_manifest_command);
-    let original_explicit_unverified = args.flag("unverified")
-        || (!original_is_manifest_command && original_argv_has_unverified_before_delimiter());
+    let original_explicit_unverified =
+        args.flag("unverified") || (!original_is_manifest_command && original_tail_unverified);
+    // Trust: collect only parser-owned options, before aliases replace a frame.
+    // Opaque program/manifest/external arguments grant no frontend options.
+    let append_args = AppendArgs::from_matches(&command, &args);
 
     // Update the process-level notion of cwd
     if let Some(new_cwd) = args.get_one::<std::path::PathBuf>("directory") {
         // This is a temporary hack.
         // This cannot access `GlobalContext`, so this is a bit messy.
-        // This does not properly parse `-Z` flags that appear after the subcommand.
         // The error message is not as helpful as the standard one.
         let nightly_features_allowed =
             features::nightly_features_allowed_on_channel(&features::channel());
         if !nightly_features_allowed
             || (nightly_features_allowed
-                && !args
-                    .get_many("unstable-features")
-                    .map(|mut z| z.any(|value: &String| value == "unstable-options"))
-                    .unwrap_or(false))
+                && !append_args
+                    .unstable_flags
+                    .iter()
+                    .any(|value| value == "unstable-options"))
         {
             return Err(anyhow::format_err!(
                 "the `-C` flag is unstable, \
@@ -63,15 +189,17 @@ pub fn main(gctx: &mut GlobalContext) -> CliResult {
             )
             .into());
         }
-        std::env::set_current_dir(&new_cwd).context("could not change to requested directory")?;
-        gctx.reload_cwd()?;
+        purpose.reload_directory(gctx, new_cwd)?;
     }
 
-    let (expanded_args, global_args) = expand_aliases(gctx, args, vec![])?;
+    let (expanded_args, global_args) = expand_aliases(gctx, args, append_args, vec![])?;
+    if purpose.is_original_full() {
+        require_no_native_startup(&expanded_args)?;
+    }
 
     // Trust: the pre-expansion capture above is what makes this detectable —
     // configuration is not a party that can consent to dropping verification.
-    if cargo::is_targo_invocation()
+    if targo::is_targo_invocation()
         && expanded_args.flag("unverified")
         && !original_explicit_unverified
     {
@@ -83,8 +211,27 @@ pub fn main(gctx: &mut GlobalContext) -> CliResult {
 
     let is_verbose = expanded_args.verbose() > 0;
 
-    if expanded_args
-        .get_one::<String>("unstable-features")
+    if matches!(purpose, RunPurpose::NativeCapability) || targo::resource_worker_v2() {
+        if expanded_args.flag("version")
+            || expanded_args.flag("list")
+            || expanded_args.get_one::<String>("explain").is_some()
+            || global_args
+                .append_args
+                .unstable_flags
+                .first()
+                .is_some_and(|flag| flag == "help")
+        {
+            return Err(anyhow::anyhow!(
+                "native worker discovery/dispatch does not accept early informational modes"
+            )
+            .into());
+        }
+    }
+
+    if global_args
+        .append_args
+        .unstable_flags
+        .first()
         .map(String::as_str)
         == Some("help")
     {
@@ -110,21 +257,56 @@ pub fn main(gctx: &mut GlobalContext) -> CliResult {
             Some((cmd, args)) => (cmd, args),
             _ => {
                 // No subcommand provided.
-                cli(gctx).print_help()?;
+                if purpose.is_original_full() {
+                    let mut command = cli(gctx);
+                    drop_print!(gctx, "{}", command.render_help());
+                } else {
+                    cli(gctx).print_help()?;
+                }
                 return Ok(());
             }
         };
         let exec = Exec::infer(cmd)?;
+        if purpose.is_original_full() {
+            if !matches!(&exec, Exec::Builtin(_))
+                || !matches!(
+                    cmd,
+                    "build" | "check" | "rustc" | "rustdoc" | "doc" | "test" | "metadata" | "fetch"
+                )
+            {
+                return Err(anyhow!(
+                    "Full library command has no supported original native execution role"
+                )
+                .into());
+            }
+        }
         // Trust: a branded Targo compile, including the implicit `-Zscript`
         // manifest command, must select an authenticated verified lane or an
         // explicit unverified lane before Cargo configuration can create any
         // build units — once a Unit exists its rustflags are already fixed.
         // Plain Cargo retains upstream-compatible semantics.
-        super::configure_trust_execution_policy(
+        purpose.configure_policy(
+            gctx,
             cmd,
             exec.is_manifest_command(),
             original_explicit_unverified,
         )?;
+        // Original endpoint custody selects no lane and cannot authenticate a
+        // command. The one existing policy initializer above owns the verified
+        // runtime-library closure; bind its result before configuration/exec.
+        super::validate_retained_test_dispatch(
+            gctx.has_retained_test(),
+            targo::is_targo_invocation() && targo::trust_verified_targo(),
+            cmd,
+            cmd == "test"
+                && !exec.is_manifest_command()
+                && subcommand_args.flag("no-run")
+                && subcommand_args.flag("__retained-test-session"),
+            original_explicit_unverified,
+        )?;
+        if matches!(purpose, RunPurpose::Execute) {
+            targo::initialize_resource_worker_v3(gctx, cmd)?;
+        }
         super::maybe_warn_trust_compiler();
         configure_gctx(
             gctx,
@@ -133,26 +315,88 @@ pub fn main(gctx: &mut GlobalContext) -> CliResult {
             global_args,
             Some(&exec),
         )?;
-        super::init_git(gctx);
+        if matches!(purpose, RunPurpose::NativeCapability) {
+            super::resource_capabilities::configured(gctx, || {
+                if cmd == "test" && !subcommand_args.flag("no-run") {
+                    match commands::test::native_budget_check(gctx, subcommand_args)? {
+                        commands::test::NativeBudgetCheck::Allowed => {}
+                        commands::test::NativeBudgetCheck::ExistingBoundary => {
+                            anyhow::bail!(
+                                "test arguments require their existing execution boundary"
+                            )
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok(());
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let _paired_compiler_inputs = if purpose.is_original_full() {
+            // Full already holds and bookends its original compiler/context.
+            // A library command must not rediscover a second ambient pair.
+            None
+        } else if targo::resource_worker_v2() {
+            Some(super::resource_capabilities::require_paired_compiler(gctx)?)
+        } else if matches!(cmd, "build" | "check" | "test") {
+            super::resource_capabilities::optional_paired_compiler(gctx)?
+        } else {
+            None
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if cmd == "test"
+            && !subcommand_args.flag("no-run")
+            && (purpose.is_original_full() || _paired_compiler_inputs.is_some())
+        {
+            // Older admission clients may not understand a fatal discovery
+            // field. Actual selected execution enforces the same restriction.
+            let _ = commands::test::native_budget_check(gctx, subcommand_args)?;
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        if targo::resource_worker_v2() {
+            return Err(
+                anyhow::anyhow!("native compiler pairing is unsupported on this host").into(),
+            );
+        }
+        super::init_git();
 
         exec.exec(gctx, subcommand_args)?;
     }
     Ok(())
 }
 
+// Trust: marker rejection is a restriction. Only the typed actual owner above
+// may select Full dispatch; these arguments cannot issue another native Root.
+fn require_no_native_startup(args: &ArgMatches) -> CargoResult<()> {
+    anyhow::ensure!(
+        !args.flag("resource-worker-v2")
+            && !args.flag("resource-worker-v3")
+            && !args.flag("resource-subgroups-v3"),
+        "Full library commands and aliases cannot create a second native startup"
+    );
+    Ok(())
+}
+
 /// Trust: `--` ends Targo's own arguments; anything after it belongs to the
 /// program being run and must never be read as consent.
-fn original_argv_has_unverified_before_delimiter() -> bool {
-    std::env::args_os()
+fn argv_has_unverified_before_delimiter(argv: &[OsString]) -> bool {
+    argv.iter()
         .skip(1)
-        .take_while(|argument| argument != OsStr::new("--"))
-        .any(|argument| argument == OsStr::new("--unverified"))
+        .take_while(|argument| argument.as_os_str() != OsStr::new("--"))
+        .any(|argument| argument.as_os_str() == OsStr::new("--unverified"))
 }
 
 fn print_zhelp(gctx: &GlobalContext) {
     let header = style::HEADER;
     let literal = style::LITERAL;
     let placeholder = style::PLACEHOLDER;
+    // Trust: keep the authenticated Cargo alias's original help and links.
+    let is_targo = targo::is_targo_invocation();
+    let title = if is_targo {
+        "Available Trust unstable flags:"
+    } else {
+        "Available unstable (nightly-only) flags:"
+    };
 
     let options = CliUnstable::help();
     let max_length = options
@@ -173,7 +417,7 @@ fn print_zhelp(gctx: &GlobalContext) {
     drop_println!(
         gctx,
         "\
-	{header}Available Trust unstable flags:{header:#}
+	{header}{title}{header:#}
 
 {z_flags}
 
@@ -183,17 +427,23 @@ Run with `{literal}{} -Z{literal:#} {placeholder}[FLAG] [COMMAND]{placeholder:#}
     if !gctx.nightly_features_allowed {
         drop_println!(
             gctx,
-            "\nUnstable flags are only available on Trust/nightly-capable Cargo \
-                 channels, but this is the `{}` channel.\n\
+            "\nUnstable flags are only available on {}, but this is the `{}` channel.\n\
                  {}",
+            features::unstable_channels(),
             features::channel(),
-            features::SEE_CHANNELS
+            features::see_channels()
         );
     }
     drop_println!(
         gctx,
-        "\nSee the Trust Cargo unstable-features documentation shipped with this toolchain \
+        "\n{}",
+        if is_targo {
+            "See the Trust Cargo unstable-features documentation shipped with this toolchain \
              for more information about these flags."
+        } else {
+            "See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html \
+             for more information about these flags."
+        }
     );
 }
 
@@ -241,8 +491,18 @@ fn print_list(gctx: &GlobalContext, is_verbose: bool) {
     // a binary this toolchain's installer deletes; it runs `targo-fmt`.
     // The mapping each name resolves to is
     // `main.rs::protected_trust_subcommand_binary`.
-    let known_external_command_descriptions: HashMap<&str, &str> =
-        KNOWN_EXTERNAL_COMMAND_DESCRIPTIONS.iter().copied().collect();
+    let mut known_external_command_descriptions: HashMap<&str, &str> =
+        KNOWN_EXTERNAL_COMMAND_DESCRIPTIONS
+            .iter()
+            .copied()
+            .collect();
+    // Trust: the compatibility frontend retains the upstream tool description.
+    if !targo::is_targo_invocation() {
+        known_external_command_descriptions.insert(
+            "fmt",
+            "Formats all bin and lib files of the current crate using rustfmt.",
+        );
+    }
     drop_println!(
         gctx,
         color_print::cstr!("<bright-green,bold>Installed Commands:</>")
@@ -285,7 +545,7 @@ fn print_list(gctx: &GlobalContext, is_verbose: bool) {
 }
 
 pub fn get_version_string(is_verbose: bool) -> String {
-    let version = cargo::version();
+    let version = targo::version();
     // Trust: brand by the INVOKED name, exactly as `rustc_driver_impl` does for
     // `trustc`. `version` here is the Rust COMPAT line (CFG_RELEASE — "which Rust is
     // this compatible with"), NOT Trust's own version, and it must keep leading:
@@ -305,6 +565,28 @@ pub fn get_version_string(is_verbose: bool) -> String {
     };
     let mut version_string = format!("{} {}{}\n", cargo_binary_name(), version, brand);
     if is_verbose {
+        // Trust: both frontends write/read this internal cache policy. This
+        // describes compatibility only, independently of content mode or proof.
+        version_string.push_str(&format!(
+            "encoded-dep-info-version: {}\n",
+            targo::encoded_dep_info_version()
+        ));
+        // Trust: software capability only. Consumers must select content mode;
+        // this reports neither a proof grade nor hermetic undeclared inputs.
+        if cargo_binary_name() != "cargo" {
+            version_string.push_str("freshness: rust-and-build-input-content-v1\n");
+            // Trust: native content reuse refuses incomplete filename inventories.
+            version_string.push_str("freshness: compiler-filename-inventory-v1\n");
+            // Trust: cached build-script directives are checked independently
+            // of input freshness. This line carries software metadata only.
+            version_string.push_str("cache-integrity: build-script-control-output-v1\n");
+            // Trust: this covers the compiled executable, separately from
+            // control output; neither line inventories generated OUT_DIR data.
+            version_string.push_str("cache-integrity: compiled-build-script-executable-v1\n");
+            version_string.push_str("cache-integrity: build-script-generated-tree-v1\n");
+            // Trust: exact original-stdout analysis identity, not log freshness.
+            version_string.push_str("analysis-session: build-json-v1\n");
+        }
         version_string.push_str(&format!("release: {}\n", version.version));
         // Trust: the product version, beside the compat `release:` above and never in
         // place of it — the two answer different questions and a consumer must not have
@@ -405,55 +687,59 @@ fn add_ssl(version_string: &mut String) {
     }
 }
 
-/// Expands aliases recursively to collect all the command line arguments.
+/// Expands aliases iteratively to collect all the command line arguments.
 ///
-/// [`GlobalArgs`] need to be extracted before expanding aliases because the
-/// clap code for extracting a subcommand discards global options
-/// (appearing before the subcommand).
+/// Preserve scalar global options and each parser-local accumulating frame
+/// before replacing an alias with its expansion.
 #[tracing::instrument(skip_all)]
 fn expand_aliases(
     gctx: &mut GlobalContext,
-    args: ArgMatches,
+    mut args: ArgMatches,
+    mut append_args: AppendArgs,
     mut already_expanded: Vec<String>,
 ) -> Result<(ArgMatches, GlobalArgs), CliError> {
-    if let Some((cmd, sub_args)) = args.subcommand() {
-        let exec = commands::builtin_exec(cmd);
-        let aliased_cmd = super::aliased_command(gctx, cmd);
+    let mut global_args = GlobalArgs::default();
+    let mut expanded_names: HashSet<String> = already_expanded.iter().cloned().collect();
+    let mut alias_parser = None;
+    loop {
+        if let Some((cmd, sub_args)) = args.subcommand() {
+            let exec = commands::builtin_exec(cmd);
+            let aliased_cmd = super::aliased_command(gctx, cmd);
 
-        match (exec, aliased_cmd) {
-            (Some(_), Ok(Some(_))) => {
-                // User alias conflicts with a built-in subcommand
-                gctx.shell().warn(format!(
+            match (exec, aliased_cmd) {
+                (Some(_), Ok(Some(_))) => {
+                    // User alias conflicts with a built-in subcommand
+                    gctx.shell().warn(format!(
                     "user-defined alias `{}` is ignored, because it is shadowed by a built-in command",
                     cmd,
                 ))?;
-            }
-            (Some(_), Ok(None) | Err(_)) => {
-                // Here we ignore errors from aliasing as we already favor built-in command,
-                // and alias doesn't involve in this context.
+                }
+                (Some(_), Ok(None) | Err(_)) => {
+                    // Here we ignore errors from aliasing as we already favor built-in command,
+                    // and alias doesn't involve in this context.
 
-                if let Some(values) = sub_args.get_many::<OsString>("") {
-                    // Command is built-in and is not conflicting with alias, but contains ignored values.
-                    return Err(anyhow::format_err!(
-                        "\
+                    if let Some(values) = sub_args.get_many::<OsString>("") {
+                        // Command is built-in and is not conflicting with alias, but contains ignored values.
+                        return Err(anyhow::format_err!(
+                            "\
 trailing arguments after built-in command `{}` are unsupported: `{}`
 
 To pass the arguments to the subcommand, remove `--`",
-                        cmd,
-                        values.map(|s| s.to_string_lossy()).join(" "),
-                    )
-                    .into());
+                            cmd,
+                            values.map(|s| s.to_string_lossy()).join(" "),
+                        )
+                        .into());
+                    }
                 }
-            }
-            (None, Ok(None)) => {}
-            (None, Ok(Some(alias))) => {
-                // Check if a user-defined alias is shadowing an external subcommand
-                // (binary of the form `cargo-<subcommand>`)
-                // Currently this is only a warning, but after a transition period this will become
-                // a hard error.
-                if super::builtin_aliases_execs(cmd).is_none() {
-                    if let Some(path) = super::find_external_subcommand(gctx, cmd) {
-                        gctx.shell().print_report(
+                (None, Ok(None)) => {}
+                (None, Ok(Some(alias))) => {
+                    // Check if a user-defined alias is shadowing an external subcommand
+                    // (binary of the form `cargo-<subcommand>`)
+                    // Currently this is only a warning, but after a transition period this will become
+                    // a hard error.
+                    if super::builtin_aliases_execs(cmd).is_none() {
+                        if let Some(path) = super::find_external_subcommand(gctx, cmd) {
+                            gctx.shell().print_report(
                             &[
                                 Level::WARNING.secondary_title(format!(
                                     "user-defined alias `{}` is shadowing an external subcommand found at `{}`",
@@ -468,13 +754,14 @@ To pass the arguments to the subcommand, remove `--`",
                             ],
                             false,
                         )?;
+                        }
                     }
-                }
-                if commands::run::is_manifest_command(cmd) {
-                    if gctx.cli_unstable().script {
-                        return Ok((args, GlobalArgs::default()));
-                    } else {
-                        gctx.shell().print_report(
+                    if commands::run::is_manifest_command(cmd) {
+                        if gctx.cli_unstable().script {
+                            global_args.append_args = append_args;
+                            return Ok((args, global_args));
+                        } else {
+                            gctx.shell().print_report(
                             &[
                                 Level::WARNING.secondary_title(
                                     format!("user-defined alias `{cmd}` has the appearance of a manifest-command")
@@ -487,53 +774,76 @@ To pass the arguments to the subcommand, remove `--`",
                             ],
                             false
                         )?;
+                        }
                     }
-                }
 
-                let mut alias = alias
-                    .into_iter()
-                    .map(|s| OsString::from(s))
-                    .collect::<Vec<_>>();
-                alias.extend(
-                    sub_args
-                        .get_many::<OsString>("")
-                        .unwrap_or_default()
-                        .cloned(),
-                );
-                // new_args strips out everything before the subcommand, so
-                // capture those global options now.
-                // Note that an alias to an external command will not receive
-                // these arguments. That may be confusing, but such is life.
-                let global_args = GlobalArgs::new(sub_args);
-                let new_args = cli(gctx).no_binary_name(true).try_get_matches_from(alias)?;
+                    let mut alias = alias
+                        .into_iter()
+                        .map(|s| OsString::from(s))
+                        .collect::<Vec<_>>();
+                    alias.extend(
+                        sub_args
+                            .get_many::<OsString>("")
+                            .unwrap_or_default()
+                            .cloned(),
+                    );
+                    // new_args strips out everything before the subcommand, so
+                    // capture those global options now.
+                    // Note that an alias to an external command will not receive
+                    // these arguments. That may be confusing, but such is life.
+                    let frame_globals = GlobalArgs::new(sub_args);
+                    // Original directory handling has completed before expansion.
+                    // Reuse only this dedicated schema; every parse owns fresh matches.
+                    let alias_command =
+                        alias_parser.get_or_insert_with(|| cli(gctx).no_binary_name(true));
+                    let new_args = alias_command.try_get_matches_from_mut(alias)?;
+                    let alias_append_args = AppendArgs::from_matches(alias_command, &new_args);
 
-                let Some(new_cmd) = new_args.subcommand_name() else {
-                    return Err(anyhow!(
+                    let Some(new_cmd) = new_args.subcommand_name() else {
+                        return Err(anyhow!(
                         "subcommand is required, add a subcommand to the command alias `alias.{cmd}`"
                     )
                         .into());
-                };
+                    };
 
-                already_expanded.push(cmd.to_string());
-                if already_expanded.contains(&new_cmd.to_string()) {
-                    // Crash if the aliases are corecursive / unresolvable
-                    return Err(anyhow!(
-                        "alias {} has unresolvable recursive definition: {} -> {}",
-                        already_expanded[0],
-                        already_expanded.join(" -> "),
-                        new_cmd,
-                    )
-                    .into());
+                    already_expanded.push(cmd.to_string());
+                    expanded_names.insert(cmd.to_string());
+                    if expanded_names.contains(new_cmd) {
+                        // Refuse corecursive / unresolvable aliases with their path.
+                        return Err(anyhow!(
+                            "alias {} has unresolvable recursive definition: {} -> {}",
+                            already_expanded[0],
+                            already_expanded.join(" -> "),
+                            new_cmd,
+                        )
+                        .into());
+                    }
+
+                    // Retain only the accumulated values and current parsed frame.
+                    // Terminal scalars stay in args for configure_gctx to add once.
+                    append_args.extend(alias_append_args);
+                    // Trust: aliases may add restrictions, but no intermediate
+                    // frame can discard an already requested restriction.
+                    global_args.locked |= frame_globals.locked;
+                    global_args.offline |= frame_globals.offline;
+                    global_args.frozen |= frame_globals.frozen;
+                    // Trust: retain the same scalar composition as a single alias;
+                    // the final parser's explicit color still wins in configure.
+                    global_args.verbose += frame_globals.verbose;
+                    global_args.quiet |= frame_globals.quiet;
+                    global_args.color = frame_globals.color.or(global_args.color);
+                    args = new_args;
+                    // Drop previous matches before the next expansion. The one
+                    // retained parser caches schema, not prior argument values.
+                    continue;
                 }
-
-                let (expanded_args, _) = expand_aliases(gctx, new_args, already_expanded)?;
-                return Ok((expanded_args, global_args));
+                (None, Err(e)) => return Err(e.into()),
             }
-            (None, Err(e)) => return Err(e.into()),
-        }
-    };
+        };
 
-    Ok((args, GlobalArgs::default()))
+        global_args.append_args = append_args;
+        return Ok((args, global_args));
+    }
 }
 
 #[tracing::instrument(skip_all)]
@@ -572,14 +882,11 @@ fn configure_gctx(
     let frozen = args.flag("frozen") || global_args.frozen;
     let locked = args.flag("locked") || global_args.locked;
     let offline = args.flag("offline") || global_args.offline;
-    let mut unstable_flags = global_args.unstable_flags;
-    if let Some(values) = args.get_many::<String>("unstable-features") {
-        unstable_flags.extend(values.cloned());
-    }
-    let mut config_args = global_args.config_args;
-    if let Some(values) = args.get_many::<String>("config") {
-        config_args.extend(values.cloned());
-    }
+    // Trust: every recognized parser/alias frame was already collected once.
+    let AppendArgs {
+        unstable_flags,
+        config_args,
+    } = global_args.append_args;
     gctx.configure(
         verbose,
         quiet,
@@ -668,6 +975,62 @@ impl Exec {
     }
 }
 
+/// Trust: Clap's global propagation selects one command level's complete value
+/// list even for Append. These options instead belong to each parsed frame.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct AppendArgs {
+    unstable_flags: Vec<String>,
+    config_args: Vec<String>,
+}
+
+impl AppendArgs {
+    fn from_matches(mut command: &Command, mut args: &ArgMatches) -> Self {
+        let mut result = Self::default();
+        loop {
+            result.unstable_flags.extend(
+                args.get_many::<String>("unstable-features")
+                    .unwrap_or_default()
+                    .cloned(),
+            );
+            result.config_args.extend(
+                args.get_many::<String>("config")
+                    .unwrap_or_default()
+                    .cloned(),
+            );
+            let Some((name, sub_args)) = args.subcommand() else {
+                break;
+            };
+            // Unknown external commands and manifest/program tails remain
+            // opaque. Positional help targets are not a command spine either.
+            let Some(subcommand) = command.find_subcommand(name) else {
+                break;
+            };
+            command = subcommand;
+            args = sub_args;
+        }
+        result
+    }
+
+    fn extend(&mut self, mut other: Self) {
+        self.unstable_flags.append(&mut other.unstable_flags);
+        self.config_args.append(&mut other.config_args);
+    }
+}
+
+// Trust: mirror inherited option availability on declared builder descendants,
+// without giving Clap a global Append list to overwrite during propagation.
+fn inherit_append_args(mut command: Command, append_args: &[Arg]) -> Command {
+    for arg in append_args {
+        if !command
+            .get_arguments()
+            .any(|existing| existing.get_id() == arg.get_id())
+        {
+            command = command.arg(arg.clone());
+        }
+    }
+    command.mut_subcommands(|subcommand| inherit_append_args(subcommand, append_args))
+}
+
 #[derive(Default)]
 struct GlobalArgs {
     verbose: u32,
@@ -676,8 +1039,7 @@ struct GlobalArgs {
     frozen: bool,
     locked: bool,
     offline: bool,
-    unstable_flags: Vec<String>,
-    config_args: Vec<String>,
+    append_args: AppendArgs,
 }
 
 impl GlobalArgs {
@@ -689,24 +1051,21 @@ impl GlobalArgs {
             frozen: args.flag("frozen"),
             locked: args.flag("locked"),
             offline: args.flag("offline"),
-            unstable_flags: args
-                .get_many::<String>("unstable-features")
-                .unwrap_or_default()
-                .cloned()
-                .collect(),
-            config_args: args
-                .get_many::<String>("config")
-                .unwrap_or_default()
-                .cloned()
-                .collect(),
+            append_args: AppendArgs::default(),
         }
     }
 }
 
 #[tracing::instrument(skip_all)]
 pub fn cli(gctx: &GlobalContext) -> Command {
+    cli_for_frontend(gctx, targo::is_targo_invocation())
+}
+
+// Trust: parser surface DATA only. Actual dispatch/admission still authenticates
+// the frontend and its original owner; this flag constructs no native startup.
+fn cli_for_frontend(gctx: &GlobalContext, is_targo: bool) -> Command {
     // Don't let config errors get in the way of parsing arguments
-    let term = gctx.get::<TermConfig>("term").unwrap_or_default();
+    let term = gctx.get::<TermConfig>(["term"]).unwrap_or_default();
     let color = term
         .color
         .and_then(|c| c.parse().ok())
@@ -721,7 +1080,6 @@ pub fn cli(gctx: &GlobalContext) -> Command {
     // about line, help template, and the `--unverified` flag below only exist
     // for `targo`. `color_print::cstr!` needs literals, so the branded usage is
     // a match over pre-expanded arms rather than a format at runtime.
-    let is_targo = cargo::is_targo_invocation();
     let usage = match (is_targo, is_rustup()) {
         (true, true) => color_print::cstr!(
             "<bright-cyan,bold>targo</> <cyan>[+toolchain] [OPTIONS] [COMMAND]</>\n       <bright-cyan,bold>targo</> <cyan>[+toolchain] [OPTIONS]</> <bright-cyan,bold>-Zscript</> <cyan><<MANIFEST_RS>> [ARGS]...</>"
@@ -859,7 +1217,7 @@ See '<bright-cyan,bold>{name} help</> <cyan><<command>></>' for more information
         .arg(multi_opt("config", "KEY=VALUE|PATH", "Override a configuration value").add(clap_complete::engine::ArgValueCompleter::new(
                     clap_complete::engine::PathCompleter::any()
                         .filter(|path| path.is_file() && path.extension() == Some(OsStr::new("toml"))),
-                )).global(true))
+                )))
         // Better suggestion for the unsupported lowercase unstable feature flag.
         .arg( Arg::new("unsupported-lowercase-unstable-feature-flag")
             .help("")
@@ -881,7 +1239,6 @@ See '<bright-cyan,bold>{name} help</> <cyan><<command>></>' for more information
             .short('Z')
             .value_name("FLAG")
             .action(ArgAction::Append)
-            .global(true)
         .add(clap_complete::ArgValueCandidates::new(|| {
             let flags = CliUnstable::help();
             flags.into_iter().map(|flag| {
@@ -905,8 +1262,11 @@ See '<bright-cyan,bold>{name} help</> <cyan><<command>></>' for more information
     // Trust: the compat `cargo` name must not even accept `--unverified` — it
     // makes no verification claim to waive, and accepting it would make the two
     // frontends' argument surfaces indistinguishable to a script.
-    if is_targo {
-        command.arg(
+    let command = if is_targo {
+        command.arg(flag("resource-worker-v2", "Native CPU worker protocol").hide(true).global(true))
+            .arg(flag("resource-worker-v3", "Host-owned worker protocol").hide(true).global(true).requires("resource-subgroups-v3").conflicts_with("resource-worker-v2"))
+            .arg(flag("resource-subgroups-v3", "Host-owned subgroup protocol").hide(true).global(true).requires("resource-worker-v3").conflicts_with("resource-worker-v2"))
+            .arg(
             flag(
                 "unverified",
                 "Explicitly authorize a native build with Trust verification disabled (for -Zscript, place this before the script path)",
@@ -916,22 +1276,32 @@ See '<bright-cyan,bold>{name} help</> <cyan><<command>></>' for more information
         )
     } else {
         command
-    }
+    };
+    let append_args = command
+        .get_arguments()
+        .filter(|arg| matches!(arg.get_id().as_str(), "unstable-features" | "config"))
+        .cloned()
+        .collect::<Vec<_>>();
+    command.mut_subcommands(|subcommand| inherit_append_args(subcommand, &append_args))
 }
 
 fn get_toolchains_from_rustup() -> Vec<String> {
-    let output = std::process::Command::new("rustup")
+    let Ok(output) = std::process::Command::new("rustup")
         .arg("toolchain")
         .arg("list")
         .arg("-q")
         .output()
-        .unwrap();
+    else {
+        return vec![];
+    };
 
     if !output.status.success() {
         return vec![];
     }
 
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return vec![];
+    };
 
     stdout.lines().map(|line| format!("+{}", line)).collect()
 }
@@ -1038,12 +1408,23 @@ fn verbose_version_reports_compat_and_product_versions_as_separate_fields() {
             .filter_map(|l| l.strip_prefix(k))
             .collect::<Vec<_>>()
     };
-    assert_eq!(field("release: ").len(), 1, "exactly one compat line:\n{verbose}");
-    assert_eq!(field("trust: ").len(), 1, "exactly one product line:\n{verbose}");
+    assert_eq!(
+        field("release: ").len(),
+        1,
+        "exactly one compat line:\n{verbose}"
+    );
+    assert_eq!(
+        field("trust: ").len(),
+        1,
+        "exactly one product line:\n{verbose}"
+    );
     // `trust-repo-commit-hash:` also starts with "trust" — the product line must not
     // be that one misread by a sloppier prefix test.
     assert_ne!(field("trust: ")[0], "");
-    assert!(!get_version_string(false).contains("trust: "), "terse banner stays terse");
+    assert!(
+        !get_version_string(false).contains("trust: "),
+        "terse banner stays terse"
+    );
 }
 
 /// The parenthetical brand is owed to the INVOKED NAME, not to the binary.
@@ -1063,7 +1444,10 @@ fn the_version_banner_is_branded_only_for_the_non_cargo_frontend() {
         .unwrap_or_default()
         .to_string();
     let name = cargo_binary_name();
-    assert!(first.starts_with(name), "banner must lead with the invoked name: {first}");
+    assert!(
+        first.starts_with(name),
+        "banner must lead with the invoked name: {first}"
+    );
     if name == "cargo" {
         // Cargo's native banner can itself contain a parenthesized commit hash
         // and date, for example `cargo 1.99.0-nightly (abc123 2026-08-20)`.
@@ -1133,5 +1517,1094 @@ fn no_description_names_a_deleted_binary() {
                  does not ship"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod append_transport_tests {
+    use super::*;
+
+    fn parse(gctx: &GlobalContext, values: &[&str]) -> (ArgMatches, AppendArgs) {
+        let mut command = cli(gctx);
+        let args = command
+            .try_get_matches_from_mut(values.iter().copied())
+            .unwrap();
+        let append = AppendArgs::from_matches(&command, &args);
+        (args, append)
+    }
+
+    #[test]
+    fn local_append_options_cover_every_declared_command() {
+        fn check(command: &Command) {
+            for id in ["unstable-features", "config"] {
+                let args = command
+                    .get_arguments()
+                    .filter(|arg| arg.get_id() == id)
+                    .collect::<Vec<_>>();
+                assert_eq!(args.len(), 1, "{}: {id}", command.get_name());
+                assert!(!args[0].is_global_set());
+                assert!(matches!(args[0].get_action(), ArgAction::Append));
+            }
+            for subcommand in command.get_subcommands() {
+                check(subcommand);
+            }
+        }
+        check(&cli(&GlobalContext::default().unwrap()));
+    }
+
+    #[test]
+    fn local_append_values_keep_order_duplicates_and_operands() {
+        let gctx = GlobalContext::default().unwrap();
+        let (_, append) = parse(
+            &gctx,
+            &[
+                "targo",
+                "-Zroot",
+                "--config",
+                "order=['A']",
+                "build",
+                "-Zleaf",
+                "-Zroot",
+                "--config",
+                "order=['B']",
+                "--config",
+                "build.rustflags=['-Zoperand']",
+            ],
+        );
+        assert_eq!(append.unstable_flags, ["root", "leaf", "root"]);
+        assert_eq!(
+            append.config_args,
+            [
+                "order=['A']",
+                "order=['B']",
+                "build.rustflags=['-Zoperand']"
+            ]
+        );
+    }
+
+    #[test]
+    fn local_append_values_follow_nested_commands_and_clap_aliases() {
+        let gctx = GlobalContext::default().unwrap();
+        let (args, append) = parse(
+            &gctx,
+            &[
+                "targo",
+                "-Zroot",
+                "--config",
+                "order='A'",
+                "report",
+                "-Zmiddle",
+                "--config",
+                "order='B'",
+                "future-incompat",
+                "-Zleaf",
+                "--config",
+                "order='C'",
+            ],
+        );
+        assert_eq!(
+            args.subcommand().unwrap().1.subcommand_name(),
+            Some("future-incompatibilities")
+        );
+        assert_eq!(append.unstable_flags, ["root", "middle", "leaf"]);
+        assert_eq!(append.config_args, ["order='A'", "order='B'", "order='C'"]);
+    }
+
+    #[test]
+    fn local_append_values_stop_at_opaque_or_positional_tails() {
+        let gctx = GlobalContext::default().unwrap();
+        for tail in [
+            vec![
+                "external-append-test",
+                "-Zprogram",
+                "--config",
+                "program='X'",
+            ],
+            vec!["entry.rs", "-Zprogram", "--config", "program='X'"],
+            vec!["run", "--", "-Zprogram", "--config", "program='X'"],
+            vec![
+                "run",
+                "first-program-arg",
+                "-Zprogram",
+                "--config",
+                "program='X'",
+            ],
+            vec!["rustc", "--", "-Zprogram", "--config", "program='X'"],
+            vec!["help", "report", "rebuilds"],
+        ] {
+            let mut values = vec!["targo", "-Zroot", "--config", "root='A'"];
+            values.extend(tail);
+            let (_, append) = parse(&gctx, &values);
+            assert_eq!(append.unstable_flags, ["root"], "{values:?}");
+            assert_eq!(append.config_args, ["root='A'"], "{values:?}");
+        }
+    }
+
+    #[test]
+    fn early_controls_use_only_recognized_spine_values() {
+        let gctx = GlobalContext::default().unwrap();
+        let (_, append) = parse(
+            &gctx,
+            &["targo", "-C", "directory", "build", "-Zunstable-options"],
+        );
+        assert!(
+            append
+                .unstable_flags
+                .iter()
+                .any(|value| value == "unstable-options")
+        );
+        let (_, append) = parse(
+            &gctx,
+            &["targo", "-C", "directory", "entry.rs", "-Zunstable-options"],
+        );
+        assert!(
+            !append
+                .unstable_flags
+                .iter()
+                .any(|value| value == "unstable-options")
+        );
+        let (_, append) = parse(&gctx, &["targo", "report", "rebuilds", "-Zhelp"]);
+        assert_eq!(
+            append.unstable_flags.first().map(String::as_str),
+            Some("help")
+        );
+        let (_, append) = parse(&gctx, &["targo", "-Zfirst", "build", "-Zhelp"]);
+        assert_eq!(
+            append.unstable_flags.first().map(String::as_str),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn scalar_global_propagation_is_unchanged() {
+        let gctx = GlobalContext::default().unwrap();
+        let (args, append) = parse(
+            &gctx,
+            &[
+                "targo",
+                "-v",
+                "--color=always",
+                "--locked",
+                "-Zroot",
+                "build",
+                "-vv",
+                "--color=never",
+                "--offline",
+                "-Zleaf",
+            ],
+        );
+        assert_eq!(args.verbose(), 2);
+        assert_eq!(
+            args.get_one::<String>("color").map(String::as_str),
+            Some("never")
+        );
+        assert!(args.flag("locked") && args.flag("offline"));
+        assert_eq!(append.unstable_flags, ["root", "leaf"]);
+    }
+
+    fn alias_context(source: &str) -> (tempfile::TempDir, GlobalContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("project");
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(cwd.join(".cargo")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(cwd.join(".cargo/config.toml"), source).unwrap();
+        let gctx = GlobalContext::new(cargo_util_terminal::Shell::new(), cwd, home);
+        (directory, gctx)
+    }
+
+    #[test]
+    fn nested_alias_frames_keep_expanded_order_exactly_once() {
+        let (_directory, mut gctx) = alias_context(
+            r#"
+[alias]
+append-outer-test = ["-Zouter", "--config", "order='B'", "append-inner-test", "-Zouter-tail", "--config", "order='C'"]
+append-inner-test = ["build", "-Zinner", "--config", "order='D'"]
+"#,
+        );
+        let (args, append) = parse(
+            &gctx,
+            &[
+                "targo",
+                "-Zcaller",
+                "--config",
+                "order='A'",
+                "append-outer-test",
+                "-Zcaller-tail",
+                "--config",
+                "order='E'",
+            ],
+        );
+        let (expanded, globals) = expand_aliases(&mut gctx, args, append, vec![]).unwrap();
+        assert_eq!(expanded.subcommand_name(), Some("build"));
+        assert_eq!(
+            globals.append_args.unstable_flags,
+            ["caller", "outer", "inner", "outer-tail", "caller-tail"]
+        );
+        assert_eq!(
+            globals.append_args.config_args,
+            [
+                "order='A'",
+                "order='B'",
+                "order='D'",
+                "order='C'",
+                "order='E'"
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_alias_cycles_remain_refused() {
+        let (_directory, mut gctx) = alias_context(
+            r#"
+[alias]
+append-cycle-a = ["-Zouter", "append-cycle-b"]
+append-cycle-b = ["-Zinner", "append-cycle-a"]
+"#,
+        );
+        let (args, append) = parse(&gctx, &["targo", "append-cycle-a"]);
+        let result = expand_aliases(&mut gctx, args, append, vec![]);
+        let error = match result {
+            Ok(_) => panic!("recursive alias accepted"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:?}").contains("unresolvable recursive definition"));
+    }
+
+    #[test]
+    fn intermediate_alias_restrictions_are_monotone() {
+        for (flag, locked, network_restricted) in [
+            ("--locked", Some("--locked"), false),
+            ("--offline", None, true),
+            ("--frozen", Some("--frozen"), true),
+        ] {
+            let source = format!(
+                "[alias]\nbool-outer = [\"{flag}\", \"bool-inner\"]\nbool-inner = [\"build\"]\n"
+            );
+            let (_directory, mut gctx) = alias_context(&source);
+            let (args, append) = parse(&gctx, &["targo", "bool-outer"]);
+            let (expanded, globals) = expand_aliases(&mut gctx, args, append, vec![]).unwrap();
+            assert_eq!(globals.locked, flag == "--locked");
+            assert_eq!(globals.offline, flag == "--offline");
+            assert_eq!(globals.frozen, flag == "--frozen");
+            configure_gctx(
+                &mut gctx,
+                &expanded,
+                expanded.subcommand().map(|(_, args)| args),
+                globals,
+                None,
+            )
+            .unwrap();
+            assert_eq!(gctx.locked_flag(), locked);
+            if network_restricted {
+                assert!(!gctx.network_allowed());
+            }
+        }
+    }
+
+    #[test]
+    fn restrictions_combine_across_alias_frames() {
+        let (_directory, mut gctx) = alias_context(
+            r#"
+[alias]
+bool-outer = ["--offline", "bool-middle"]
+bool-middle = ["--frozen", "bool-inner"]
+bool-inner = ["build"]
+"#,
+        );
+        let (args, append) = parse(&gctx, &["targo", "--locked", "bool-outer"]);
+        let (expanded, globals) = expand_aliases(&mut gctx, args, append, vec![]).unwrap();
+        assert!(globals.locked && globals.offline && globals.frozen);
+        configure_gctx(
+            &mut gctx,
+            &expanded,
+            expanded.subcommand().map(|(_, args)| args),
+            globals,
+            None,
+        )
+        .unwrap();
+        assert_eq!(gctx.locked_flag(), Some("--frozen"));
+        assert!(!gctx.network_allowed());
+    }
+
+    #[test]
+    fn program_arguments_cannot_add_alias_restrictions() {
+        let (_directory, mut gctx) = alias_context(
+            r#"
+[alias]
+bool-outer = ["bool-inner"]
+bool-inner = ["run"]
+"#,
+        );
+        let (args, append) = parse(
+            &gctx,
+            &[
+                "targo",
+                "bool-outer",
+                "--",
+                "--locked",
+                "--offline",
+                "--frozen",
+            ],
+        );
+        let (expanded, globals) = expand_aliases(&mut gctx, args, append, vec![]).unwrap();
+        assert!(!globals.locked && !globals.offline && !globals.frozen);
+        assert!(!expanded.flag("locked") && !expanded.flag("offline") && !expanded.flag("frozen"));
+        let tail = expanded
+            .subcommand()
+            .unwrap()
+            .1
+            .get_many::<OsString>("args")
+            .unwrap()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tail, ["--locked", "--offline", "--frozen"]);
+    }
+
+    fn configure_alias(gctx: &mut GlobalContext, values: &[&str]) -> CliResult {
+        let (args, append) = parse(gctx, values);
+        let (expanded, globals) = expand_aliases(gctx, args, append, vec![])?;
+        configure_gctx(
+            gctx,
+            &expanded,
+            expanded.subcommand().map(|(_, args)| args),
+            globals,
+            None,
+        )
+    }
+
+    #[test]
+    fn nested_scalar_flags_override_term_configuration() {
+        for flag in ["--quiet", "--verbose", "--color=never"] {
+            let term = if flag == "--color=never" {
+                "[term]\ncolor='invalid-color-for-test'\n"
+            } else {
+                "[term]\nverbose=true\nquiet=true\n"
+            };
+            let source = format!(
+                "{term}[alias]\nscalar-outer=[\"{flag}\",\"scalar-inner\"]\nscalar-inner=['locate-project']\n"
+            );
+            let (_directory, mut gctx) = alias_context(&source);
+            configure_alias(&mut gctx, &["targo", "scalar-outer"]).unwrap();
+            match flag {
+                "--quiet" => assert!(matches!(
+                    gctx.shell().verbosity(),
+                    cargo_util_terminal::Verbosity::Quiet
+                )),
+                "--verbose" => {
+                    assert!(matches!(
+                        gctx.shell().verbosity(),
+                        cargo_util_terminal::Verbosity::Verbose
+                    ));
+                    assert!(!gctx.extra_verbose());
+                }
+                "--color=never" => {
+                    assert!(matches!(gctx.shell().color_choice(), ColorChoice::Never))
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn single_and_nested_scalar_composition_match() {
+        let source = r#"
+[alias]
+scalar-single=['locate-project','-v','--color=never']
+scalar-outer=['-v','--color=never','scalar-inner']
+scalar-inner=['locate-project']
+scalar-color-outer=['--color=never','scalar-color-inner']
+scalar-color-inner=['locate-project','--color=always']
+"#;
+        for route in ["scalar-single", "scalar-outer"] {
+            let (_directory, mut gctx) = alias_context(source);
+            configure_alias(&mut gctx, &["targo", "-v", "--color=always", route]).unwrap();
+            assert!(matches!(
+                gctx.shell().verbosity(),
+                cargo_util_terminal::Verbosity::Verbose
+            ));
+            assert!(gctx.extra_verbose());
+            assert!(matches!(gctx.shell().color_choice(), ColorChoice::Never));
+        }
+        let (_directory, mut gctx) = alias_context(source);
+        configure_alias(&mut gctx, &["targo", "--color=never", "scalar-color-outer"]).unwrap();
+        assert!(matches!(gctx.shell().color_choice(), ColorChoice::Always));
+    }
+
+    #[test]
+    fn nested_alias_scalar_conflicts_remain_errors() {
+        for (caller, middle) in [("--verbose", "--quiet"), ("--quiet", "--verbose")] {
+            let source = format!(
+                "[alias]\nscalar-outer=[\"{middle}\",\"scalar-inner\"]\nscalar-inner=['locate-project']\n"
+            );
+            let (_directory, mut gctx) = alias_context(&source);
+            let error = configure_alias(&mut gctx, &["targo", caller, "scalar-outer"]).unwrap_err();
+            assert!(format!("{error:?}").contains("cannot set both --verbose and --quiet"));
+        }
+    }
+
+    #[test]
+    fn program_scalars_remain_opaque_after_alias_expansion() {
+        let (_directory, mut gctx) = alias_context(
+            r#"
+[alias]
+scalar-outer=['scalar-inner']
+scalar-inner=['run']
+"#,
+        );
+        let (args, append) = parse(
+            &gctx,
+            &[
+                "targo",
+                "scalar-outer",
+                "--",
+                "--quiet",
+                "--verbose",
+                "--color=never",
+            ],
+        );
+        let (expanded, globals) = expand_aliases(&mut gctx, args, append, vec![]).unwrap();
+        assert!(!globals.quiet && globals.verbose == 0 && globals.color.is_none());
+        assert!(
+            !expanded.flag("quiet")
+                && expanded.verbose() == 0
+                && expanded.get_one::<String>("color").is_none()
+        );
+        let tail = expanded
+            .subcommand()
+            .unwrap()
+            .1
+            .get_many::<OsString>("args")
+            .unwrap()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tail, ["--quiet", "--verbose", "--color=never"]);
+    }
+
+    #[test]
+    fn alias_cycles_keep_exact_ordered_diagnostics() {
+        for (start, expected) in [
+            (
+                "self-cycle",
+                "alias self-cycle has unresolvable recursive definition: self-cycle -> self-cycle",
+            ),
+            (
+                "cycle-prefix",
+                "alias cycle-prefix has unresolvable recursive definition: cycle-prefix -> cycle-a -> cycle-b -> cycle-a",
+            ),
+        ] {
+            let (_directory, mut gctx) = alias_context(
+                r#"
+[alias]
+self-cycle=['self-cycle']
+cycle-prefix=['cycle-a']
+cycle-a=['cycle-b']
+cycle-b=['cycle-a']
+"#,
+            );
+            let (args, append) = parse(&gctx, &["targo", start]);
+            let error = expand_aliases(&mut gctx, args, append, vec![])
+                .err()
+                .expect("recursive alias accepted");
+            assert_eq!(error.exit_code, 101);
+            assert_eq!(error.error.unwrap().to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn conflicting_builtin_alias_stops_before_expansion() {
+        let (_directory, mut gctx) = alias_context(
+            r#"
+[alias]
+builtin-outer=['--offline','-Zouter','build']
+build=['build']
+"#,
+        );
+        let (args, append) = parse(&gctx, &["targo", "--locked", "-Zcaller", "builtin-outer"]);
+        let (expanded, globals) = expand_aliases(&mut gctx, args, append, vec![]).unwrap();
+        assert_eq!(expanded.subcommand_name(), Some("build"));
+        assert!(globals.locked && expanded.flag("offline"));
+        assert_eq!(globals.append_args.unstable_flags, ["caller", "outer"]);
+    }
+
+    #[test]
+    fn malformed_builtin_alias_does_not_override_builtin() {
+        let (_directory, mut gctx) = alias_context(
+            r#"
+[alias]
+builtin-outer=['--offline','build']
+build=17
+"#,
+        );
+        let (args, append) = parse(&gctx, &["targo", "--locked", "builtin-outer"]);
+        let (expanded, globals) = expand_aliases(&mut gctx, args, append, vec![]).unwrap();
+        assert_eq!(expanded.subcommand_name(), Some("build"));
+        assert!(globals.locked && expanded.flag("offline"));
+    }
+
+    #[test]
+    fn external_alias_tail_stays_opaque_with_prior_flags_retained() {
+        let (_directory, mut gctx) = alias_context(
+            r#"
+[alias]
+external-outer=['--locked','-v','--color=never','-Zouter','--config',"order='B'",'external-inner']
+external-inner=['external-preservation-test','--opaque']
+"#,
+        );
+        let (args, append) = parse(
+            &gctx,
+            &[
+                "targo",
+                "--offline",
+                "-Zcaller",
+                "--config",
+                "order='A'",
+                "external-outer",
+                "--config",
+                "program='opaque'",
+                "-Zprogram",
+            ],
+        );
+        let (expanded, globals) = expand_aliases(&mut gctx, args, append, vec![]).unwrap();
+        assert_eq!(
+            expanded.subcommand_name(),
+            Some("external-preservation-test")
+        );
+        assert!(globals.locked && globals.offline);
+        assert_eq!(globals.verbose, 1);
+        assert_eq!(globals.color.as_deref(), Some("never"));
+        assert_eq!(globals.append_args.unstable_flags, ["caller", "outer"]);
+        assert_eq!(globals.append_args.config_args, ["order='A'", "order='B'"]);
+        let tail = expanded
+            .subcommand()
+            .unwrap()
+            .1
+            .get_many::<OsString>("")
+            .unwrap()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tail,
+            ["--opaque", "--config", "program='opaque'", "-Zprogram"]
+        );
+    }
+
+    #[test]
+    fn manifest_alias_expands_until_script_is_already_enabled() {
+        for script in [false, true] {
+            let (_directory, mut gctx) = alias_context(
+                r#"
+[alias]
+manifest-outer=['--offline','-Zouter','--config',"order='B'",'entry.rs']
+'entry.rs'=['-Zmanifest','locate-project']
+"#,
+            );
+            if script {
+                // Use the public per-context test hook, not process environment.
+                gctx.nightly_features_allowed = true;
+                gctx.configure(
+                    0,
+                    false,
+                    None,
+                    false,
+                    false,
+                    false,
+                    &None,
+                    &["script".to_owned()],
+                    &[],
+                )
+                .unwrap();
+                assert!(gctx.cli_unstable().script);
+            }
+            let (args, append) = parse(
+                &gctx,
+                &[
+                    "targo",
+                    "--locked",
+                    "-Zcaller",
+                    "--config",
+                    "order='A'",
+                    "manifest-outer",
+                ],
+            );
+            let (expanded, globals) = expand_aliases(&mut gctx, args, append, vec![]).unwrap();
+            assert!(globals.locked);
+            assert_eq!(globals.append_args.config_args, ["order='A'", "order='B'"]);
+            if script {
+                assert_eq!(expanded.subcommand_name(), Some("entry.rs"));
+                assert!(expanded.flag("offline") && !globals.offline);
+                assert_eq!(globals.append_args.unstable_flags, ["caller", "outer"]);
+            } else {
+                assert_eq!(expanded.subcommand_name(), Some("locate-project"));
+                assert!(globals.offline);
+                assert_eq!(
+                    globals.append_args.unstable_flags,
+                    ["caller", "outer", "manifest"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alias_missing_command_and_parse_errors_remain_errors() {
+        let source = r#"
+[alias]
+empty-command=[]
+flag-only=['--locked']
+invalid-option=['locate-project','--not-a-real-option']
+"#;
+        for (name, expected) in [
+            (
+                "empty-command",
+                "subcommand is required, but `alias.empty-command` is empty",
+            ),
+            (
+                "flag-only",
+                "subcommand is required, add a subcommand to the command alias `alias.flag-only`",
+            ),
+        ] {
+            let (_directory, mut gctx) = alias_context(source);
+            let (args, append) = parse(&gctx, &["targo", name]);
+            let error = expand_aliases(&mut gctx, args, append, vec![])
+                .err()
+                .expect("missing alias command accepted");
+            assert_eq!(error.exit_code, 101);
+            assert_eq!(error.error.unwrap().to_string(), expected);
+        }
+        let (_directory, mut gctx) = alias_context(source);
+        let (args, append) = parse(&gctx, &["targo", "invalid-option"]);
+        let error = expand_aliases(&mut gctx, args, append, vec![])
+            .err()
+            .expect("invalid alias option accepted");
+        assert_eq!(error.exit_code, 1);
+        assert_eq!(
+            error
+                .error
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<clap::Error>()
+                .unwrap()
+                .kind(),
+            clap::error::ErrorKind::UnknownArgument
+        );
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ReparsedFlags {
+        verbose: u32,
+        quiet: bool,
+        unverified: bool,
+        color: Option<String>,
+        frozen: bool,
+        offline: bool,
+        locked: bool,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ReparsedCommand {
+        frames: Vec<ReparsedFlags>,
+        unstable: Vec<String>,
+        config: Vec<String>,
+        commands: Vec<String>,
+        opaque: Vec<OsString>,
+    }
+
+    fn observe_reparse(
+        command: &mut Command,
+        values: &[OsString],
+    ) -> Result<ReparsedCommand, (clap::error::ErrorKind, bool, i32, String)> {
+        let args = command
+            .try_get_matches_from_mut(values.iter().cloned())
+            .map_err(|error| {
+                (
+                    error.kind(),
+                    error.use_stderr(),
+                    error.exit_code(),
+                    error.render().to_string(),
+                )
+            })?;
+        let append = AppendArgs::from_matches(command, &args);
+        let mut observed = ReparsedCommand {
+            frames: Vec::new(),
+            unstable: append.unstable_flags,
+            config: append.config_args,
+            commands: Vec::new(),
+            opaque: Vec::new(),
+        };
+        let mut declared = &*command;
+        let mut matches = &args;
+        loop {
+            observed.frames.push(ReparsedFlags {
+                verbose: matches.verbose(),
+                quiet: matches.flag("quiet"),
+                unverified: matches
+                    .try_get_one::<bool>("unverified")
+                    .ok()
+                    .flatten()
+                    .copied()
+                    .unwrap_or(false),
+                color: matches.get_one::<String>("color").cloned(),
+                frozen: matches.flag("frozen"),
+                offline: matches.flag("offline"),
+                locked: matches.flag("locked"),
+            });
+            if let Ok(Some(tail)) = matches.try_get_many::<OsString>("args") {
+                observed.opaque.extend(tail.cloned());
+            }
+            let Some((name, sub_args)) = matches.subcommand() else {
+                break;
+            };
+            observed.commands.push(name.to_owned());
+            let Some(subcommand) = declared.find_subcommand(name) else {
+                observed.opaque.extend(
+                    sub_args
+                        .get_many::<OsString>("")
+                        .unwrap_or_default()
+                        .cloned(),
+                );
+                break;
+            };
+            declared = subcommand;
+            matches = sub_args;
+        }
+        Ok(observed)
+    }
+
+    #[test]
+    fn mutable_alias_parser_matches_fresh_parser_after_success_help_and_errors() {
+        let (_directory, gctx) = alias_context("[term]\ncolor='never'\n");
+        // Alias frames have no executable operand. Keep that policy identical
+        // on reused/fresh builders, rather than changing sticky bin_name state.
+        let mut reused = cli(&gctx).no_binary_name(true);
+        let native_consent = reused
+            .get_arguments()
+            .any(|argument| argument.get_id() == "unverified");
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "rich",
+                &[
+                    "-vv",
+                    "--quiet",
+                    "--color=always",
+                    "--frozen",
+                    "--offline",
+                    "--locked",
+                    "-Zone",
+                    "--config",
+                    "order=['A']",
+                    "build",
+                    "-v",
+                    "--color=never",
+                    "-Zone",
+                    "--config",
+                    "order=['B']",
+                ],
+            ),
+            ("consent", &["--unverified", "build"]),
+            ("reset", &["locate-project", "--message-format=plain"]),
+            (
+                "nested",
+                &[
+                    "-Zroot",
+                    "--config",
+                    "order='A'",
+                    "report",
+                    "-Zmiddle",
+                    "--config",
+                    "order='B'",
+                    "future-incompat",
+                    "-Zleaf",
+                    "--config",
+                    "order='C'",
+                ],
+            ),
+            (
+                "external",
+                &[
+                    "-v",
+                    "--offline",
+                    "-Zfrontend",
+                    "--config",
+                    "order='front'",
+                    "external-parser-test",
+                    "-Zprogram",
+                    "--config",
+                    "program='opaque'",
+                    "--locked",
+                ],
+            ),
+            (
+                "run-tail",
+                &[
+                    "--locked",
+                    "-Zfrontend",
+                    "run",
+                    "--",
+                    "--offline",
+                    "-Zprogram",
+                    "--config",
+                    "program='opaque'",
+                    "--quiet",
+                    "--color=always",
+                ],
+            ),
+            ("help", &["--help"]),
+            ("after-help", &["locate-project"]),
+            ("unknown", &["--not-a-real-parser-option"]),
+            (
+                "after-unknown",
+                &["-q", "--color=auto", "--offline", "locate-project"],
+            ),
+            ("nested-help", &["report", "rebuilds", "--help"]),
+            ("after-nested-help", &["locate-project"]),
+            ("invalid-color", &["--color=invalid", "locate-project"]),
+            ("after-invalid-color", &["locate-project"]),
+            ("identical-retry", &["locate-project"]),
+        ];
+        for (name, values) in cases {
+            let values = values
+                .iter()
+                .map(|value| OsString::from(*value))
+                .collect::<Vec<_>>();
+            let expected = observe_reparse(&mut cli(&gctx).no_binary_name(true), &values);
+            let actual = observe_reparse(&mut reused, &values);
+            assert_eq!(actual, expected, "case={name}");
+            if let Ok(observed) = &actual {
+                assert!(
+                    observed
+                        .frames
+                        .iter()
+                        .all(|frame| frame.unverified == (*name == "consent" && native_consent)),
+                    "consent leaked or disappeared: case={name} observed={observed:?}"
+                );
+            }
+            match *name {
+                "consent" if !native_consent => assert_eq!(
+                    actual.unwrap_err().0,
+                    clap::error::ErrorKind::UnknownArgument,
+                    "Cargo compatibility must keep refusing native consent"
+                ),
+                "rich" => {
+                    let actual = actual.unwrap();
+                    assert_eq!(actual.frames[0].verbose, 1);
+                    assert!(actual.frames[0].quiet);
+                    assert_eq!(actual.frames[0].color.as_deref(), Some("never"));
+                    assert!(
+                        actual.frames[0].frozen
+                            && actual.frames[0].offline
+                            && actual.frames[0].locked
+                    );
+                    assert_eq!(actual.unstable, ["one", "one"]);
+                    assert_eq!(actual.config, ["order=['A']", "order=['B']"]);
+                }
+                "reset" => {
+                    let actual = actual.unwrap();
+                    assert_eq!(
+                        actual.frames[0],
+                        ReparsedFlags {
+                            verbose: 0,
+                            quiet: false,
+                            unverified: false,
+                            color: None,
+                            frozen: false,
+                            offline: false,
+                            locked: false,
+                        }
+                    );
+                    assert!(
+                        actual.unstable.is_empty()
+                            && actual.config.is_empty()
+                            && actual.opaque.is_empty()
+                    );
+                }
+                "nested" => {
+                    let actual = actual.unwrap();
+                    assert_eq!(actual.commands, ["report", "future-incompatibilities"]);
+                    assert_eq!(actual.unstable, ["root", "middle", "leaf"]);
+                    assert_eq!(actual.config, ["order='A'", "order='B'", "order='C'"]);
+                }
+                "external" | "run-tail" => {
+                    let actual = actual.unwrap();
+                    assert_eq!(actual.unstable, ["frontend"]);
+                    assert!(
+                        actual
+                            .opaque
+                            .iter()
+                            .any(|arg| arg == OsStr::new("-Zprogram"))
+                    );
+                    assert!(
+                        actual
+                            .opaque
+                            .iter()
+                            .any(|arg| arg == OsStr::new("program='opaque'"))
+                    );
+                    if *name == "external" {
+                        assert_eq!(actual.config, ["order='front'"]);
+                        assert!(!actual.frames[0].locked);
+                    } else {
+                        assert!(actual.config.is_empty());
+                        assert!(
+                            actual.frames[0].locked
+                                && !actual.frames[0].offline
+                                && !actual.frames[0].quiet
+                        );
+                        assert!(actual.frames[0].color.is_none());
+                    }
+                }
+                "help" | "nested-help" => {
+                    assert_eq!(actual.unwrap_err().0, clap::error::ErrorKind::DisplayHelp)
+                }
+                "unknown" => assert_eq!(
+                    actual.unwrap_err().0,
+                    clap::error::ErrorKind::UnknownArgument
+                ),
+                "invalid-color" => {
+                    assert_eq!(actual.unwrap_err().0, clap::error::ErrorKind::InvalidValue)
+                }
+                _ => assert!(actual.is_ok()),
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let opaque = OsString::from_vec(b"opaque-\xff".to_vec());
+            for values in [
+                vec![OsString::from("external-parser-test"), opaque.clone()],
+                vec![OsString::from("run"), OsString::from("--"), opaque.clone()],
+            ] {
+                let expected = observe_reparse(&mut cli(&gctx).no_binary_name(true), &values);
+                let actual = observe_reparse(&mut reused, &values);
+                assert_eq!(actual, expected);
+                assert!(
+                    actual
+                        .as_ref()
+                        .unwrap()
+                        .frames
+                        .iter()
+                        .all(|frame| !frame.unverified)
+                );
+                assert_eq!(
+                    actual.unwrap().opaque.as_slice(),
+                    std::slice::from_ref(&opaque)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mutable_alias_parser_is_built_after_rooted_term_reload() {
+        let (directory, mut gctx) = alias_context("[term]\ncolor='always'\n");
+        let new_root = directory.path().join("selected-root");
+        std::fs::create_dir_all(new_root.join(".cargo")).unwrap();
+        std::fs::write(
+            new_root.join(".cargo/config.toml"),
+            "[term]\ncolor='never'\n",
+        )
+        .unwrap();
+        let mut original = cli(&gctx);
+        assert_eq!(original.get_color(), clap::ColorChoice::Always);
+        let args = original
+            .try_get_matches_from_mut([
+                OsString::from("targo"),
+                OsString::from("-Zunstable-options"),
+                OsString::from("-C"),
+                new_root.clone().into_os_string(),
+            ])
+            .unwrap();
+        assert_eq!(
+            args.get_one::<std::path::PathBuf>("directory"),
+            Some(&new_root)
+        );
+        // Exercise only the public config-root reload, without changing the
+        // process cwd/HOME. This is not an actual main() -C execution.
+        gctx.reload_rooted_at(&new_root).unwrap();
+        let mut reused = cli(&gctx).no_binary_name(true);
+        assert_eq!(reused.get_color(), clap::ColorChoice::Never);
+        for values in [
+            ["--help"],
+            ["--not-a-real-parser-option"],
+            ["locate-project"],
+        ] {
+            let values = values.into_iter().map(OsString::from).collect::<Vec<_>>();
+            assert_eq!(
+                observe_reparse(&mut reused, &values),
+                observe_reparse(&mut cli(&gctx).no_binary_name(true), &values),
+            );
+        }
+    }
+
+    #[test]
+    fn context_directory_reload_preserves_process_cwd_and_selected_home() {
+        let (directory, mut gctx) = alias_context("[term]\ncolor='always'\n");
+        let process_cwd = std::env::current_dir().unwrap();
+        let selected_home = gctx.home().as_path_unlocked().to_owned();
+        let selected = directory.path().join("library-directory");
+        std::fs::create_dir_all(selected.join(".cargo")).unwrap();
+        std::fs::write(
+            selected.join(".cargo/config.toml"),
+            "[term]\ncolor='never'\n",
+        )
+        .unwrap();
+        gctx.reload_directory(selected.clone()).unwrap();
+        assert_eq!(gctx.cwd(), selected);
+        assert_eq!(gctx.home().as_path_unlocked(), selected_home);
+        assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+        assert_eq!(cli(&gctx).get_color(), clap::ColorChoice::Never);
+        assert!(gctx.reload_directory("relative-directory".into()).is_err());
+        assert_eq!(gctx.cwd(), selected);
+    }
+
+    #[test]
+    fn consent_comes_from_each_actual_argv_before_its_delimiter() {
+        let words = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(argv_has_unverified_before_delimiter(&words(&[
+            "targo",
+            "--unverified",
+            "build",
+        ])));
+        assert!(argv_has_unverified_before_delimiter(&words(&[
+            "targo",
+            "external",
+            "--unverified",
+        ])));
+        assert!(!argv_has_unverified_before_delimiter(&words(&[
+            "targo", "build",
+        ])));
+        assert!(!argv_has_unverified_before_delimiter(&words(&[
+            "targo",
+            "run",
+            "--",
+            "--unverified",
+        ])));
+        assert!(!argv_has_unverified_before_delimiter(&words(&[
+            "targo",
+            "--",
+            "--unverified",
+            "build",
+        ])));
+    }
+
+    #[test]
+    fn full_library_marker_guard_uses_the_canonical_parser() {
+        let (_directory, gctx) = alias_context("");
+        let mut parser = cli_for_frontend(&gctx, true);
+        let ordinary = parser.try_get_matches_from_mut(["targo", "build"]).unwrap();
+        require_no_native_startup(&ordinary).unwrap();
+        for flags in [
+            vec!["targo", "--resource-worker-v2", "build"],
+            vec![
+                "targo",
+                "--resource-worker-v3",
+                "--resource-subgroups-v3",
+                "build",
+            ],
+        ] {
+            let parsed = parser.try_get_matches_from_mut(flags).unwrap();
+            assert!(require_no_native_startup(&parsed).is_err());
+        }
+        let error = cli_for_frontend(&gctx, false)
+            .try_get_matches_from(["cargo", "--resource-worker-v2", "build"])
+            .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }

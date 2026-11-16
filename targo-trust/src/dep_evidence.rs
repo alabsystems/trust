@@ -11,7 +11,8 @@
 //
 //   1. It is not a proof. It is a RECORD of a proof run — the counts, the
 //      report digest, and the toolchain identity. `AUTHORITY` says so in the
-//      file itself, and every consumer prints it.
+//      file itself; `proof-cert record` and `show` print it, while `proof-cert
+//      check` and `targo tree --proof` print the counts only.
 //   2. It is not independently verifiable by the packaging step. `targo
 //      package` is a courier: it copies bytes it cannot judge, exactly as it
 //      does for `.cargo_vcs_info.json`. Judging happens on the targo-trust
@@ -168,7 +169,10 @@ impl PackageProofCert {
         Ok(cert)
     }
 
-    /// The one-line summary `targo tree --proof` prints per node.
+    /// The one-line count summary `proof-cert record|show|check` print per
+    /// dependency (and `evaluate` embeds in a finding). `targo tree --proof`
+    /// renders its own shape from the same totals (`describe_proof_cert` in the
+    /// targo crate, without the runtime-checked field); it cannot call this.
     pub(crate) fn describe(&self) -> String {
         let t = &self.totals;
         format!(

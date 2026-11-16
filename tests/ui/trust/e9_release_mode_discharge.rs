@@ -1,8 +1,12 @@
 //@ needs-trust-verify
+//@ revisions: release
 //@ compile-flags: -Ztrust-verify=on -O
 //@ check-pass
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
+// -O parity (2026-09-25): `release` is a plain `-O` verifying session, which runs
+// the `-O0` MIR pipeline; since T6 a proof session refuses the options that would
+// add the MIR inliner or GVN, so this is the one release session there is.
 //! RELEASE-MODE discharge: the same min2 case-split citation as
 //! `e9_min2_case_split_discharge`, plus an S4 wrapping-call composition,
 //! compiled under `-O`. The optimizer reshapes the select lowering, while

@@ -130,6 +130,7 @@ fn emitted_select(cmp: BinOp, then_src: usize, else_src: usize) -> VerifiableFun
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

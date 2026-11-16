@@ -1,0 +1,31 @@
+{
+  "id": "clean-q04-push-pop",
+  "class": "Clean/Carcara reader, fix 37 (Q04)",
+  "title": "push/pop were ignored, so a popped assertion stayed a premise",
+  "origin": [
+    "clean 4993e9d5c (carcara fix 36/37), third-party/carcara/carcara/tests/problem_reading.rs Q04"
+  ],
+  "lang": "smt",
+  "source": "repro.json",
+  "reproducer": {
+    "cert": "repro.json",
+    "claim": "the problem is unsatisfiable (the certificate refutes it)"
+  },
+  "twin": {
+    "cert": "twin.json",
+    "claim": "unsatisfiable, with a correct refutation, and it contains the reproducer's construct: a scope pushed, given an assertion and popped, then p and (not p) asserted at the base level: the refutation uses only the base assertions"
+  },
+  "witness": {
+    "solver": "ay",
+    "expect": "sat",
+    "input": "the reproducer's problem script, with (get-model) after every check-sat",
+    "observed": "sat at every check, with a model under which an independent evaluator (smt_model_check in the runner) finds every assertion and assumption in scope true"
+  },
+  "construct": "(push 1)",
+  "no_control": "Clean main refuses any problem with push or pop ('push' is not supported: a problem must be a single query), the twin included; clean-external is the only verifier of an SMT entry",
+  "expect": {
+    "clean-external": {
+      "twin": "not-in-fragment"
+    }
+  }
+}

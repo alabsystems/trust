@@ -113,7 +113,7 @@ impl FileLoader for RealFileLoader {
                 SourceFile::MAX_FILE_SIZE
             )));
         }
-        let mut contents = String::new();
+        let mut contents = String::with_capacity(size as usize);
         file.read_to_string(&mut contents)?;
         Ok(contents)
     }
@@ -174,6 +174,18 @@ struct SourceMapFiles {
     stable_id_to_source_file: UnhashMap<StableSourceFileId, Arc<SourceFile>>,
 }
 
+impl std::fmt::Debug for SourceMapFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let SourceMapFiles { source_files, stable_id_to_source_file: _ } = self;
+
+        f.debug_list()
+            .entries(
+                source_files.iter().map(|f| f.name.prefer_remapped_unconditionally().to_string()),
+            )
+            .finish()
+    }
+}
+
 /// Used to construct a `SourceMap` with `SourceMap::with_inputs`.
 pub struct SourceMapInputs {
     pub file_loader: Box<dyn FileLoader + Send + Sync>,
@@ -201,6 +213,28 @@ pub struct SourceMap {
     ///
     /// If this is equal to `hash_kind` then the checksum won't be computed twice.
     checksum_hash_kind: Option<SourceFileHashAlgorithm>,
+}
+
+impl std::fmt::Debug for SourceMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let SourceMap {
+            files,
+            file_loader,
+            path_mapping,
+            working_dir,
+            hash_kind,
+            checksum_hash_kind,
+        } = self;
+
+        f.debug_struct("SourceMap")
+            .field("files", files)
+            .field("file_loader", &format_args!("<file_loader@{file_loader:p}>"))
+            .field("path_mapping", path_mapping)
+            .field("working_dir", working_dir)
+            .field("hash_kind", hash_kind)
+            .field("checksum_hash_kind", checksum_hash_kind)
+            .finish()
+    }
 }
 
 impl SourceMap {
@@ -246,7 +280,56 @@ impl SourceMap {
     pub fn load_file(&self, path: &Path) -> io::Result<Arc<SourceFile>> {
         let src = self.file_loader.read_file(path)?;
         let filename = FileName::Real(self.path_mapping.to_real_filename(&self.working_dir, path));
+        self.refuse_remap_collision(&filename, &src)?;
         Ok(self.new_source_file(filename, src))
+    }
+
+    /// Trust (WS8.9, F-117): refuse a NON-INJECTIVE `--remap-path-prefix` instead of
+    /// compiling the wrong source.
+    ///
+    /// `RealFileName`'s `Hash` deliberately ignores the local path once a file is fully
+    /// remapped (#70924: a sysroot file must keep one stable id across checkouts), so two
+    /// DISTINCT on-disk files that remap to one virtual name — `--remap-path-prefix=<A>/x=/src
+    /// --remap-path-prefix=<A>/y=/src` with `x/m.rs` and `y/m.rs` — share a
+    /// `StableSourceFileId`. `new_source_file` then returns the file loaded FIRST for both,
+    /// and the second file's bytes, already read from disk, are dropped: `y::m` is parsed,
+    /// type-checked and compiled from `x/m.rs`'s text. Measured 2026-09-21 on this compiler
+    /// (`y/m.rs` = `a + 2` compiled as `a + 1`; the trust-ir module, the diagnostics and the
+    /// verification verdict all agree with the WRONG source). That is a silent source
+    /// substitution, so it fails closed here — at the only point that can still see both
+    /// files — with the remap named, before the substitution happens.
+    ///
+    /// Refused only when the contents differ: the same file reached twice through one
+    /// spelling is the ordinary `include!`/`#[path]` case and keeps returning the cached
+    /// entry, and two byte-identical files that render alike are indistinguishable by
+    /// construction (every span of either names the same virtual file and the same text),
+    /// so admitting them loses nothing a consumer could check. The comparison is the
+    /// pre-normalization `src_hash` `SourceFile::new` would compute, so a BOM or CRLF
+    /// difference is a real content difference, never a false refusal.
+    ///
+    /// Path-loaded files only (`load_file`, `load_binary_file`): a synthetic name
+    /// (`<anon>`, a macro expansion, a doctest) has no on-disk twin to collide with, and
+    /// the imported-crate path (`new_imported_source_file`) carries its own stable id.
+    fn refuse_remap_collision(&self, filename: &FileName, src: &str) -> io::Result<()> {
+        let stable_id = StableSourceFileId::from_filename_in_current_crate(filename);
+        let Some(existing) = self.source_file_by_stable_id(stable_id) else { return Ok(()) };
+        if existing.name == *filename {
+            return Ok(());
+        }
+        let hash = SourceFileHash::new_in_memory(self.hash_kind, src.as_bytes());
+        if existing.src_hash == hash {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "non-injective --remap-path-prefix: `{}` and `{}` both render as `{}` and \
+                 their contents differ; the second would be compiled from the first's text",
+                existing.name.prefer_local_unconditionally(),
+                filename.prefer_local_unconditionally(),
+                filename.prefer_remapped_unconditionally(),
+            ),
+        ))
     }
 
     /// Loads source file as a binary blob.
@@ -263,6 +346,7 @@ impl SourceMap {
         // empty string.
         let text = std::str::from_utf8(&bytes).unwrap_or("").to_string();
         let filename = FileName::Real(self.path_mapping.to_real_filename(&self.working_dir, path));
+        self.refuse_remap_collision(&filename, &text)?;
         let file = self.new_source_file(filename, text);
         Ok((
             bytes,
@@ -518,10 +602,13 @@ impl SourceMap {
     }
 
     pub fn is_line_before_span_empty(&self, sp: Span) -> bool {
-        match self.span_to_prev_source(sp) {
-            Ok(s) => s.rsplit_once('\n').unwrap_or(("", &s)).1.trim_start().is_empty(),
-            Err(_) => false,
-        }
+        self.span_to_source(sp, |src, start_index, _| {
+            let Some(s) = src.get(..start_index) else {
+                return Err(SpanSnippetError::IllFormedSpan(sp));
+            };
+            Ok(s.rsplit_once('\n').unwrap_or(("", s)).1.trim_start().is_empty())
+        })
+        .unwrap_or(false)
     }
 
     pub fn span_to_lines(&self, sp: Span) -> FileLinesResult {
@@ -562,9 +649,13 @@ impl SourceMap {
     /// Extracts the source surrounding the given `Span` using the `extract_source` function. The
     /// extract function takes three arguments: a string slice containing the source, an index in
     /// the slice for the beginning of the span and an index in the slice for the end of the span.
-    pub fn span_to_source<F, T>(&self, sp: Span, extract_source: F) -> Result<T, SpanSnippetError>
+    pub fn span_to_source<F, T>(
+        &self,
+        sp: Span,
+        mut extract_source: F,
+    ) -> Result<T, SpanSnippetError>
     where
-        F: Fn(&str, usize, usize) -> Result<T, SpanSnippetError>,
+        F: FnMut(&str, usize, usize) -> Result<T, SpanSnippetError>,
     {
         let local_begin = self.lookup_byte_offset(sp.lo());
         let local_end = self.lookup_byte_offset(sp.hi());
@@ -617,7 +708,15 @@ impl SourceMap {
     }
 
     pub fn span_to_margin(&self, sp: Span) -> Option<usize> {
-        Some(self.indentation_before(sp)?.len())
+        self.span_to_source(sp, |src, start_index, _| {
+            let before = &src[..start_index];
+            let last_line = before.rsplit_once('\n').map_or(before, |(_, last)| last);
+            Ok(last_line
+                .split_once(|c: char| !c.is_whitespace())
+                .map_or(last_line, |(indent, _)| indent)
+                .len())
+        })
+        .ok()
     }
 
     pub fn indentation_before(&self, sp: Span) -> Option<String> {
@@ -642,14 +741,17 @@ impl SourceMap {
     /// Extends the given `Span` to just after the previous occurrence of `c`. Return the same span
     /// if no character could be found or if an error occurred while retrieving the code snippet.
     pub fn span_extend_to_prev_char(&self, sp: Span, c: char, accept_newlines: bool) -> Span {
-        if let Ok(prev_source) = self.span_to_prev_source(sp) {
+        self.span_to_source(sp, |src, start_index, _| {
+            let prev_source =
+                src.get(..start_index).ok_or(SpanSnippetError::IllFormedSpan(sp))?;
             let prev_source = prev_source.rsplit(c).next().unwrap_or("");
             if !prev_source.is_empty() && (accept_newlines || !prev_source.contains('\n')) {
-                return sp.with_lo(BytePos(sp.lo().0 - prev_source.len() as u32));
+                Ok(sp.with_lo(BytePos(sp.lo().0 - prev_source.len() as u32)))
+            } else {
+                Ok(sp)
             }
-        }
-
-        sp
+        })
+        .unwrap_or(sp)
     }
 
     /// Extends the given `Span` to just before the previous occurrence of `c`. Return the same span
@@ -660,14 +762,17 @@ impl SourceMap {
         c: char,
         accept_newlines: bool,
     ) -> Span {
-        if let Ok(prev_source) = self.span_to_prev_source(sp) {
+        self.span_to_source(sp, |src, start_index, _| {
+            let prev_source =
+                src.get(..start_index).ok_or(SpanSnippetError::IllFormedSpan(sp))?;
             let prev_source = prev_source.rsplit(c).next().unwrap_or("");
             if accept_newlines || !prev_source.contains('\n') {
-                return sp.with_lo(BytePos(sp.lo().0 - prev_source.len() as u32 - 1_u32));
+                Ok(sp.with_lo(BytePos(sp.lo().0 - prev_source.len() as u32 - 1_u32)))
+            } else {
+                Ok(sp)
             }
-        }
-
-        sp
+        })
+        .unwrap_or(sp)
     }
 
     /// Extends the given `Span` to just after the previous occurrence of `pat` when surrounded by
@@ -684,28 +789,32 @@ impl SourceMap {
         //     fn my_fn()
         //           ^^^^ returned span without the check
         //     ---------- correct span
-        let prev_source = self.span_to_prev_source(sp).ok()?;
-        for ws in &[" ", "\t", "\n"] {
-            let pat = pat.to_owned() + ws;
-            if let Some(pat_pos) = prev_source.rfind(&pat) {
-                let just_after_pat_pos = pat_pos + pat.len() - 1;
-                let just_after_pat_plus_ws = if include_whitespace {
-                    just_after_pat_pos
-                        + prev_source[just_after_pat_pos..]
-                            .find(|c: char| !c.is_whitespace())
-                            .unwrap_or(0)
-                } else {
-                    just_after_pat_pos
-                };
-                let len = prev_source.len() - just_after_pat_plus_ws;
-                let prev_source = &prev_source[just_after_pat_plus_ws..];
-                if accept_newlines || !prev_source.trim_start().contains('\n') {
-                    return Some(sp.with_lo(BytePos(sp.lo().0 - len as u32)));
+        self.span_to_source(sp, |src, start_index, _| {
+            let prev_source =
+                src.get(..start_index).ok_or(SpanSnippetError::IllFormedSpan(sp))?;
+            for ws in &[" ", "\t", "\n"] {
+                let pat = pat.to_owned() + ws;
+                if let Some(pat_pos) = prev_source.rfind(&pat) {
+                    let just_after_pat_pos = pat_pos + pat.len() - 1;
+                    let just_after_pat_plus_ws = if include_whitespace {
+                        just_after_pat_pos
+                            + prev_source[just_after_pat_pos..]
+                                .find(|c: char| !c.is_whitespace())
+                                .unwrap_or(0)
+                    } else {
+                        just_after_pat_pos
+                    };
+                    let len = prev_source.len() - just_after_pat_plus_ws;
+                    let prev_source = &prev_source[just_after_pat_plus_ws..];
+                    if accept_newlines || !prev_source.trim_start().contains('\n') {
+                        return Ok(Some(sp.with_lo(BytePos(sp.lo().0 - len as u32))));
+                    }
                 }
             }
-        }
-
-        None
+            Ok(None)
+        })
+        .ok()
+        .flatten()
     }
 
     /// Returns the source snippet as `String` after the given `Span`.
@@ -719,7 +828,7 @@ impl SourceMap {
     pub fn span_extend_while(
         &self,
         span: Span,
-        f: impl Fn(char) -> bool,
+        mut f: impl FnMut(char) -> bool,
     ) -> Result<Span, SpanSnippetError> {
         self.span_to_source(span, |s, _start, end| {
             let n = s[end..].char_indices().find(|&(_, c)| !f(c)).map_or(s.len() - end, |(i, _)| i);
@@ -750,14 +859,17 @@ impl SourceMap {
 
     /// Extends the given `Span` to just before the next occurrence of `c`.
     pub fn span_extend_to_next_char(&self, sp: Span, c: char, accept_newlines: bool) -> Span {
-        if let Ok(next_source) = self.span_to_next_source(sp) {
+        self.span_to_source(sp, |src, _, end_index| {
+            let next_source =
+                src.get(end_index..).ok_or(SpanSnippetError::IllFormedSpan(sp))?;
             let next_source = next_source.split(c).next().unwrap_or("");
             if !next_source.is_empty() && (accept_newlines || !next_source.contains('\n')) {
-                return sp.with_hi(BytePos(sp.hi().0 + next_source.len() as u32));
+                Ok(sp.with_hi(BytePos(sp.hi().0 + next_source.len() as u32)))
+            } else {
+                Ok(sp)
             }
-        }
-
-        sp
+        })
+        .unwrap_or(sp)
     }
 
     /// Extends the given `Span` to contain the entire line it is on.
@@ -768,17 +880,17 @@ impl SourceMap {
     /// Given a `Span`, tries to get a shorter span ending before the first occurrence of `char`
     /// `c`.
     pub fn span_until_char(&self, sp: Span, c: char) -> Span {
-        match self.span_to_snippet(sp) {
-            Ok(snippet) => {
-                let snippet = snippet.split(c).next().unwrap_or("").trim_end();
-                if !snippet.is_empty() && !snippet.contains('\n') {
-                    sp.with_hi(BytePos(sp.lo().0 + snippet.len() as u32))
-                } else {
-                    sp
-                }
+        self.span_to_source(sp, |src, start_index, end_index| {
+            let snippet =
+                src.get(start_index..end_index).ok_or(SpanSnippetError::IllFormedSpan(sp))?;
+            let snippet = snippet.split(c).next().unwrap_or("").trim_end();
+            if !snippet.is_empty() && !snippet.contains('\n') {
+                Ok(sp.with_hi(BytePos(sp.lo().0 + snippet.len() as u32)))
+            } else {
+                Ok(sp)
             }
-            _ => sp,
-        }
+        })
+        .unwrap_or(sp)
     }
 
     /// Given a 'Span', tries to tell if it's wrapped by "<>" or "()"
@@ -845,12 +957,16 @@ impl SourceMap {
     /// Given a `Span`, tries to get a shorter span ending just after the first occurrence of `char`
     /// `c`.
     pub fn span_through_char(&self, sp: Span, c: char) -> Span {
-        if let Ok(snippet) = self.span_to_snippet(sp)
-            && let Some(offset) = snippet.find(c)
-        {
-            return sp.with_hi(BytePos(sp.lo().0 + (offset + c.len_utf8()) as u32));
-        }
-        sp
+        self.span_to_source(sp, |src, start_index, end_index| {
+            let snippet =
+                src.get(start_index..end_index).ok_or(SpanSnippetError::IllFormedSpan(sp))?;
+            if let Some(offset) = snippet.find(c) {
+                Ok(sp.with_hi(BytePos(sp.lo().0 + (offset + c.len_utf8()) as u32)))
+            } else {
+                Ok(sp)
+            }
+        })
+        .unwrap_or(sp)
     }
 
     /// Given a `Span`, gets a new `Span` covering the first token and all its trailing whitespace
@@ -878,17 +994,18 @@ impl SourceMap {
     }
 
     /// Given a `Span`, gets a shorter one until `predicate` yields `false`.
-    pub fn span_take_while<P>(&self, sp: Span, predicate: P) -> Span
+    pub fn span_take_while<P>(&self, sp: Span, mut predicate: P) -> Span
     where
         P: for<'r> FnMut(&'r char) -> bool,
     {
-        if let Ok(snippet) = self.span_to_snippet(sp) {
-            let offset = snippet.chars().take_while(predicate).map(|c| c.len_utf8()).sum::<usize>();
-
-            sp.with_hi(BytePos(sp.lo().0 + (offset as u32)))
-        } else {
-            sp
-        }
+        self.span_to_source(sp, |src, start_index, end_index| {
+            let snippet =
+                src.get(start_index..end_index).ok_or(SpanSnippetError::IllFormedSpan(sp))?;
+            let offset =
+                snippet.chars().take_while(&mut predicate).map(|c| c.len_utf8()).sum::<usize>();
+            Ok(sp.with_hi(BytePos(sp.lo().0 + (offset as u32))))
+        })
+        .unwrap_or(sp)
     }
 
     /// Given a `Span`, return a span ending in the closest `{`. This is useful when you have a
@@ -905,8 +1022,7 @@ impl SourceMap {
     /// Returns a new span representing just the first character of the given span.
     pub fn start_point(&self, sp: Span) -> Span {
         let width = {
-            let sp = sp.data();
-            let local_begin = self.lookup_byte_offset(sp.lo);
+            let local_begin = self.lookup_byte_offset(sp.lo());
             let start_index = local_begin.pos.to_usize();
             let src = local_begin.sf.external_src.read();
 
@@ -968,7 +1084,14 @@ impl SourceMap {
     /// *Only suitable for diagnostics.*
     pub fn span_followed_by(&self, span: Span, target: &str) -> Option<Span> {
         let span = self.span_extend_while_whitespace(span);
-        self.span_to_next_source(span).ok()?.strip_prefix(target).map(|_| {
+        let starts_with_target = self
+            .span_to_source(span, |src, _, end_index| {
+                let next_src =
+                    src.get(end_index..).ok_or(SpanSnippetError::IllFormedSpan(span))?;
+                Ok(next_src.starts_with(target))
+            })
+            .ok()?;
+        starts_with_target.then(|| {
             Span::new(span.hi(), span.hi() + BytePos(target.len() as u32), span.ctxt(), None)
         })
     }
@@ -1117,7 +1240,7 @@ pub fn get_source_map() -> Option<Arc<SourceMap>> {
     with_session_globals(|session_globals| session_globals.source_map.clone())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FilePathMapping {
     mapping: Vec<(PathBuf, PathBuf)>,
     filename_remapping_scopes: RemapPathScopeComponents,

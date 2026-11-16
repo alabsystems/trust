@@ -18,6 +18,9 @@ fn make_lib(lib_src: &str) {
                 version = "0.0.1"
                 edition = "2015"
                 build = "build.rs"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -52,6 +55,9 @@ fn make_upstream(main_src: &str) -> Project {
 
                 [dependencies]
                 bar = "*"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", &format!("fn main() {{ {} }}", main_src))
@@ -66,7 +72,7 @@ fn no_warning_on_success() {
         .cargo("build")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `dummy-registry`)
 [COMPILING] bar v0.0.1
@@ -87,7 +93,7 @@ fn no_warning_on_bin_failure() {
         .with_stdout_does_not_contain("hidden stdout")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `dummy-registry`)
 [COMPILING] bar v0.0.1
@@ -110,7 +116,7 @@ fn warning_on_lib_failure() {
         .with_stdout_does_not_contain("hidden stdout")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `dummy-registry`)
 [COMPILING] bar v0.0.1

@@ -214,7 +214,6 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                                     span,
                                 );
                                 let args = GenericArgs::new_from_iter(
-                                    self.ctx.interner,
                                     trait_ref
                                         .args
                                         .iter()
@@ -334,7 +333,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
 
     #[tracing::instrument(skip(self), ret)]
     pub(crate) fn resolve_path_in_type_ns(&mut self) -> Option<(TypeNs, Option<usize>)> {
-        let (resolution, remaining_index, _, prefix_info) =
+        let (resolution, remaining_index, _, prefix_info, _) =
             self.ctx.resolver.resolve_path_in_type_ns_with_prefix_info(self.ctx.db, self.path)?;
 
         let segments = self.segments;
@@ -385,7 +384,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         &mut self,
         hygiene_id: HygieneId,
     ) -> Option<ResolveValueResult> {
-        let (res, prefix_info) = self.ctx.resolver.resolve_path_in_value_ns_with_prefix_info(
+        let (res, prefix_info, _) = self.ctx.resolver.resolve_path_in_value_ns_with_prefix_info(
             self.ctx.db,
             self.path,
             hygiene_id,
@@ -544,7 +543,6 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         let substs = self.substs_from_path_segment(assoc_type.into(), infer_args, None, true, span);
 
         let substs = GenericArgs::new_from_iter(
-            interner,
             trait_args.iter().chain(substs.iter().skip(trait_args.len())),
         );
 
@@ -576,7 +574,6 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         lowering_assoc_type_generics: bool,
         span: Span,
     ) -> GenericArgs<'db> {
-        let interner = self.ctx.interner;
         let prev_current_segment_idx = self.current_segment_idx;
         let prev_current_segment = self.current_or_prev_segment;
 
@@ -586,7 +583,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             ValueTyDefId::UnionId(it) => it.into(),
             ValueTyDefId::ConstId(it) => it.into(),
             ValueTyDefId::StaticId(_) => {
-                return GenericArgs::empty(interner);
+                return GenericArgs::empty();
             }
             ValueTyDefId::EnumVariantId(var) => {
                 // the generic args for an enum variant may be either specified
@@ -746,7 +743,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         };
                         self.ctx
                             .ctx
-                            .lower_const(konst, const_param_ty(self.ctx.ctx.db, const_id))
+                            .lower_const(konst, const_param_ty(self.ctx.ctx.db, const_id), false)
                             .into()
                     }
                     _ => unreachable!("unmatching param kinds were passed to `provided_kind()`"),
@@ -890,11 +887,11 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         )
     }
 
-    pub(super) fn assoc_type_bindings_from_type_bound<'c>(
+    pub(super) fn assoc_type_bindings_from_type_bound(
         mut self,
         trait_ref: TraitRef<'db>,
         span: Span,
-    ) -> Option<impl Iterator<Item = (Clause<'db>, GenericPredicateSource)> + use<'a, 'b, 'c, 'db>>
+    ) -> Option<impl Iterator<Item = (Clause<'db>, GenericPredicateSource)> + use<'a, 'b, 'db>>
     {
         let interner = self.ctx.interner;
         self.current_or_prev_segment.args_and_bindings.map(|args_and_bindings| {
@@ -929,7 +926,6 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         )
                     });
                 let args = GenericArgs::new_from_iter(
-                    interner,
                     super_trait_args.iter().chain(args.iter().skip(super_trait_args.len())),
                 );
                 let projection_term = AliasTerm::new_from_args(
@@ -956,16 +952,20 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                                 ImplTraitLoweringMode::Disallowed | ImplTraitLoweringMode::Opaque,
                             ) => {
                                 let ty = this.ctx.lower_ty(type_ref);
+                                let bound_vars = this.ctx.peek_bound_vars();
                                 let pred = Clause(Predicate::new(
                                     interner,
-                                    Binder::dummy(rustc_type_ir::PredicateKind::Clause(
-                                        rustc_type_ir::ClauseKind::Projection(
-                                            ProjectionPredicate {
-                                                projection_term,
-                                                term: ty.into(),
-                                            },
+                                    Binder::bind_with_vars(
+                                        rustc_type_ir::PredicateKind::Clause(
+                                            rustc_type_ir::ClauseKind::Projection(
+                                                ProjectionPredicate {
+                                                    projection_term,
+                                                    term: ty.into(),
+                                                },
+                                            ),
                                         ),
-                                    )),
+                                        bound_vars,
+                                    ),
                                 ));
                                 predicates.push((pred, GenericPredicateSource::SelfOnly));
                             }
@@ -1187,7 +1187,7 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
         ctx,
     );
 
-    let mut substs = Vec::with_capacity(def_generics.len());
+    let mut substs = Vec::with_capacity(def_generics.len(true));
 
     substs.extend(
         def_generics.iter_parent_id().enumerate().map(|(idx, id)| ctx.parent_arg(idx as u32, id)),
@@ -1230,6 +1230,12 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
         };
         params.next();
         substs.push(self_ty);
+    } else if has_self_arg {
+        // A qualified path `<T as Trait>::Assoc` where `Trait` resolved to something without a
+        // `Self` parameter, e.g. a struct. `check_generic_args_len()` skips the self type
+        // unconditionally, so drop it here too instead of matching it against a real parameter.
+        // FIXME: Report a diagnostic here, rustc emits `E0404: expected trait, found struct`.
+        args.next();
     }
 
     loop {

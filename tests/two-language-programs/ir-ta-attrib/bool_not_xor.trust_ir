@@ -1,0 +1,53 @@
+; TrustIr text format v1
+; Part A attribution module (reviewer): Lean `def neg (b : Bool) : Bool := not b` spelled the way the
+; trust-ir validator ACCEPTS -- `xor bool %b, true` -- next to `conj`/`disj` exactly as the from-source
+; compiler emits them (`and bool`, `or bool`). `program` = neg(false) + 2*conj(true,true) + 4*disj(false,false)
+; is the p12b probe's expression; the native value of that probe is the oracle.
+module "parta-bool-not-xor"
+
+functy.0 = (bool) -> (bool)
+
+functy.1 = (bool, bool) -> (bool)
+
+functy.2 = () -> (u64)
+
+rustcc fn @neg(functy.0) {
+    ; #producer: clean
+bb0(%0: bool):
+    %1 = const bool true
+    %2 = xor bool %0, %1
+    ret %2
+}
+
+rustcc fn @conj(functy.1) {
+    ; #producer: clean
+bb0(%0: bool, %1: bool):
+    %2 = and bool %0, %1
+    ret %2
+}
+
+rustcc fn @disj(functy.1) {
+    ; #producer: clean
+bb0(%0: bool, %1: bool):
+    %2 = or bool %0, %1
+    ret %2
+}
+
+rustcc fn @program(functy.2) {
+bb0:
+    %0 = const bool false
+    %1 = const bool true
+    %2 = call @func.0(%0)
+    %3 = call @func.1(%1, %1)
+    %4 = call @func.2(%0, %0)
+    %5 = zext bool %2 to u64
+    %6 = zext bool %3 to u64
+    %7 = zext bool %4 to u64
+    %8 = const u64 2
+    %9 = mul u64 %6, %8
+    %10 = const u64 4
+    %11 = mul u64 %7, %10
+    %12 = add u64 %5, %9
+    %13 = add u64 %12, %11
+    ret %13
+}

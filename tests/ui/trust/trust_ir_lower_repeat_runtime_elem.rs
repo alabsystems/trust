@@ -1,20 +1,16 @@
 //@ run-pass
 //@ dont-check-compiler-stderr
 //@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
-//! Trust (wave-RRE): a large repeat with a RUNTIME element falls back to the
-//! ordinary first-class build.
+//! Trust: a repeat with a RUNTIME element lowers at every count, as ONE `Inst::ArraySplat`
+//! (trust-ir v50) — the element register repeated, constant size in N.
 //!
-//! The compact form ENCODES its constant N times in one instruction, so it
-//! needs a right-here-known constant; a parameter read or a binop result is
-//! neither. But the same expression already takes the first-class N-element
-//! build below `REPEAT_COMPACT_MIN`, so the only thing missing was the
-//! fallback — placed INSIDE the compact helper, because the element has
-//! already been lowered and re-lowering would duplicate its side effects.
-//!
-//! `over_budget_declines` pins the budget: 2N+1 instructions are invisible to
-//! the THIR-expr cap (a repeat is three THIR exprs however large N is), so the
-//! cap has to be stated separately and must not be raised silently. That body
-//! keeps its refusal and must still compute correctly.
+//! History (wave-RRE): the compact form encoded a CONSTANT N times in one instruction, so a
+//! runtime element (a parameter read, a binop result) fell back to the first-class N-element
+//! build — 2N+1 instructions — behind an instruction budget (`REPEAT_RUNTIME_ELEM_MAX`, 2048)
+//! that `over_budget_declines` below used to pin as a refusal. The uniform-array value makes
+//! the budget's reason disappear, and the budget with it: that body lowers now, and all three
+//! must still compute correctly. (Under `-Ztrust-verify=off` a refusal is a silent coverage
+//! skip; `trust_ir_uniform_array_strict.rs` pins the no-refusal half under `strict`.)
 
 pub fn runtime_elem(x: u64) -> u64 {
     let a = [x; 1024];
@@ -26,7 +22,7 @@ pub fn binop_elem() -> u64 {
     a[0] + a[1199]
 }
 
-/// Above the budget: refuses, and is still right.
+/// Past the retired budget: lowers, and is still right.
 pub fn over_budget_declines(x: u64) -> u64 {
     let a = [x; 4096];
     a[0] + a[4095]

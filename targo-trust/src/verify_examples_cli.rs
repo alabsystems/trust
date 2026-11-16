@@ -10,7 +10,8 @@ use std::{env, fs};
 use sha2::{Digest, Sha256};
 
 use crate::stage2_tools::{
-    discover_unique_repo_stage2_tool, host_executable_name, validate_repo_stage2_tool,
+    discover_unique_repo_stage2_tool, host_executable_name, is_repo_build_component,
+    validate_repo_stage2_tool,
 };
 use crate::{bounded_process, durable_io};
 
@@ -153,18 +154,18 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
 
     if args.metadata_only {
-        if let Err(error) = emit_report(
-            &args,
-            &root,
-            "metadata-regression-diagnostic",
-            parsed.len(),
-            &parsed,
-            &[],
-            &failures,
-            0,
-            0,
-            None,
-        ) {
+        if let Err(error) = emit_report(ExamplesReportInput {
+            args: &args,
+            root: &root,
+            mode: "metadata-regression-diagnostic",
+            checked: parsed.len(),
+            parsed: &parsed,
+            trustc_exits: &[],
+            failures: &failures,
+            trustc_attempts: 0,
+            trustc_completed_runs: 0,
+            trustc: None,
+        }) {
             eprintln!("targo trust verify examples: {error}");
             return ExitCode::from(2);
         }
@@ -270,18 +271,18 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             false
         }
     };
-    if let Err(error) = emit_report(
-        &args,
-        &root,
-        "compiler-regression-diagnostic",
-        parsed.len(),
-        &parsed,
-        &trustc_exits,
-        &failures,
+    if let Err(error) = emit_report(ExamplesReportInput {
+        args: &args,
+        root: &root,
+        mode: "compiler-regression-diagnostic",
+        checked: parsed.len(),
+        parsed: &parsed,
+        trustc_exits: &trustc_exits,
+        failures: &failures,
         trustc_attempts,
         trustc_completed_runs,
-        Some((&trustc, trustc_unchanged)),
-    ) {
+        trustc: Some((&trustc, trustc_unchanged)),
+    }) {
         eprintln!("targo trust verify examples: {error}");
         return ExitCode::from(2);
     }
@@ -402,18 +403,32 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     Ok(parsed)
 }
 
-fn emit_report(
-    args: &Args,
-    root: &Path,
-    mode: &str,
+struct ExamplesReportInput<'a> {
+    args: &'a Args,
+    root: &'a Path,
+    mode: &'a str,
     checked: usize,
-    parsed: &[(PathBuf, String, Vec<ExpectedMatch>)],
-    trustc_exits: &[(PathBuf, i32)],
-    failures: &[String],
+    parsed: &'a [(PathBuf, String, Vec<ExpectedMatch>)],
+    trustc_exits: &'a [(PathBuf, i32)],
+    failures: &'a [String],
     trustc_attempts: usize,
     trustc_completed_runs: usize,
-    trustc: Option<(&TrustcIdentity, bool)>,
-) -> Result<(), String> {
+    trustc: Option<(&'a TrustcIdentity, bool)>,
+}
+
+fn emit_report(input: ExamplesReportInput<'_>) -> Result<(), String> {
+    let ExamplesReportInput {
+        args,
+        root,
+        mode,
+        checked,
+        parsed,
+        trustc_exits,
+        failures,
+        trustc_attempts,
+        trustc_completed_runs,
+        trustc,
+    } = input;
     let metadata_only = mode == "metadata-regression-diagnostic";
     if args.json || args.json_output.is_some() {
         let status = if failures.is_empty() { "diagnostic_passed" } else { "diagnostic_failed" };
@@ -848,12 +863,17 @@ fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.is_file() && right.is_file() && left.len() == right.len()
 }
 
+/// Classifies a trustc path, which `find_trustc` has already canonicalized.
+/// Under the sanctioned `build -> build.noindex` link
+/// (docs/BUILD_AND_INSTALL.md) that canonical path starts with
+/// `build.noindex`, so the first component is checked with the predicate the
+/// stage2 identity guards share; every other link stays external.
 fn trustc_stage(root: &Path, path: &Path) -> &'static str {
     let rel = path.strip_prefix(root).unwrap_or(path);
     let components =
         rel.components().filter_map(|component| component.as_os_str().to_str()).collect::<Vec<_>>();
     if components.len() == 5
-        && components[0] == "build"
+        && is_repo_build_component(root, components[0])
         && !components[1].is_empty()
         && components[3] == "bin"
         && components[4] == host_executable_name("trustc")
@@ -893,9 +913,16 @@ fn run_example(
         .args(["-Z", "trust-verify-output=json"])
         .args(["-Z", &format!("trust-verify-session={verification_session}")])
         // Proof budgets affect verdicts and therefore must enter rustc's
-        // tracked option set. The retired environment input is intentionally
-        // not forwarded to the compiler.
-        .args(["-Z", "trust-verify-timeout-ms=5000"])
+        // tracked option set: the built-in budget profile's per-query clock
+        // (the compiler's own default effort scale is the built-in one). The
+        // retired environment input is intentionally not forwarded.
+        .args([
+            "-Z".to_string(),
+            format!(
+                "trust-verify-timeout-ms={}",
+                trust_types::determinism::Backstop::BUILTIN.vc_clock_ms()
+            ),
+        ])
         .args(&advisory_lane)
         .args(["--crate-name", crate_name.as_str()])
         .arg(source)
@@ -1355,6 +1382,90 @@ TRUST_JSON:{"type":"function_result","function":"mixed","results":[{"kind":"over
         assert_eq!(trustc_stage(root, &exact), "stage2");
         let nested = root.join("build/host/stage2/bin/nested").join(host_executable_name("trustc"));
         assert_eq!(trustc_stage(root, &nested), "explicit-external");
+    }
+
+    /// Under the sanctioned `build -> build.noindex` layout
+    /// (docs/BUILD_AND_INSTALL.md) `find_trustc` classifies the CANONICAL
+    /// candidate, which starts with `build.noindex`. The repo's own stage2 and
+    /// stage1 trustc must keep their stage; any other link or a bare
+    /// `build.noindex` directory stays external.
+    #[cfg(unix)]
+    #[test]
+    fn repo_trustc_behind_the_build_noindex_link_keeps_its_stage() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let make = |path: &Path| {
+            fs::create_dir_all(path.parent().expect("tool parent")).expect("tool dir");
+            fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write trustc");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod trustc");
+        };
+        let temp = tempfile::tempdir().expect("build.noindex fixture");
+        // `run` canonicalizes the repo root before it calls `find_trustc`.
+        let root = temp.path().canonicalize().expect("canonical root");
+        let name = host_executable_name("trustc");
+        let stage2 = root.join("build.noindex/actual-host/stage2/bin").join(&name);
+        make(&stage2);
+        symlink("build.noindex", root.join("build")).expect("link build");
+        let canonical_stage2 = stage2.canonicalize().expect("canonical stage2");
+
+        // `--trustc` (and `TRUSTC_BIN`) in the spelling the refusal asks for.
+        for explicit in [
+            PathBuf::from("build/actual-host/stage2/bin").join(&name),
+            root.join("build/actual-host/stage2/bin").join(&name),
+            stage2.clone(),
+        ] {
+            let identity = find_trustc(&root, Some(&explicit), false)
+                .unwrap_or_else(|error| panic!("{}: {error}", explicit.display()));
+            assert_eq!(identity.path, canonical_stage2);
+            assert_eq!(trustc_stage(&root, &identity.path), "stage2");
+        }
+        // Implicit discovery: the report's `stage` field for the found tool.
+        let discovered = discover_unique_repo_stage2_tool(&root, "trustc")
+            .expect("discovery through the link")
+            .expect("stage2 trustc discovered");
+        assert_eq!(trustc_stage(&root, &discovered), "stage2");
+
+        // Stage1 developer fallback.
+        fs::remove_file(&stage2).expect("remove stage2");
+        let stage1 = root.join("build.noindex/actual-host/stage1/bin").join(&name);
+        make(&stage1);
+        let canonical_stage1 = stage1.canonicalize().expect("canonical stage1");
+        let explicit_stage1 = PathBuf::from("build/actual-host/stage1/bin").join(&name);
+        assert_eq!(
+            find_trustc(&root, Some(&explicit_stage1), true).expect("explicit stage1").path,
+            canonical_stage1
+        );
+        let refused = find_trustc(&root, Some(&explicit_stage1), false)
+            .expect_err("stage1 still needs --allow-stage1-developer");
+        assert!(refused.contains("requires --allow-stage1-developer"), "{refused}");
+        // The discovery loop reads `TRUSTC_BIN` when no `--trustc` is given; only
+        // exercise it when the test environment does not set one.
+        if env::var_os("TRUSTC_BIN").is_none() {
+            assert_eq!(
+                find_trustc(&root, None, true).expect("stage1 discovery").path,
+                canonical_stage1
+            );
+            let error = find_trustc(&root, None, false).expect_err("stage1 needs the flag");
+            assert!(error.contains("requires --allow-stage1-developer"), "{error}");
+        }
+
+        // Negative controls. A `build` link to any other directory is external.
+        let other = root.join("other/actual-host/stage2/bin").join(&name);
+        make(&other);
+        fs::remove_file(root.join("build")).expect("remove build link");
+        symlink("other", root.join("build")).expect("relink build");
+        let canonical_other = other.canonicalize().expect("canonical other");
+        assert_eq!(trustc_stage(&root, &canonical_other), "explicit-external");
+        let error = find_trustc(
+            &root,
+            Some(&PathBuf::from("build/actual-host/stage2/bin").join(&name)),
+            false,
+        )
+        .expect_err("an unsanctioned build link is external");
+        assert!(error.contains("external trustc is not accepted"), "{error}");
+        // A real `build.noindex` without the `build` link sanctions nothing.
+        fs::remove_file(root.join("build")).expect("remove build link");
+        assert_eq!(trustc_stage(&root, &canonical_stage1), "explicit-external");
     }
 
     #[cfg(unix)]

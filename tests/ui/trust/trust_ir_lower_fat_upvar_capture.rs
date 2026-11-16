@@ -1,19 +1,23 @@
 //@ run-pass
 //@ dont-check-compiler-stderr
 //@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
-//! Trust (wave-FUC): a SINGLETON `&str` upvar capture.
+//! A `&str` variable captured WHOLE (`|| s`) — the thin `s[]` capture.
 //!
-//! rustc TRUNCATES the capture of a variable that is itself a shared reference
-//! to `v[Deref]` — a non-empty projection whose value is nonetheless the WHOLE
-//! variable. The wave-UD sub-lane exists for exactly that, and its G5/G6 gates
-//! already establish the truncation; only the THINNESS gates stood in the way,
-//! and they were written for a lane that hands out an ADDRESS.
-//!
-//! Here the env field IS the value handed out, so no address is synthesised and
-//! no pointee is read — this is exactly as much a by-REF capture as its thin
-//! twin. `upvar_is_thin` is deliberately NOT widened: it is also read by
-//! `closure_first_class_ty` and by the caller's whole-variable gate, where a
-//! change would move shapes this lane has not analysed.
+//! CORRECTED 2026-09-07. This file was written as the pin of wave-FUC's
+//! "singleton `&str` capture" lane (the `s[Deref]` shape), and it never pinned
+//! it: `|| s` returns the variable itself, so rustc captures `s[]` — an upvar of
+//! type `&&str`, THIN — and the ordinary thin lane lowers it. Measured with
+//! `#[rustc_capture_analysis]` on the sealed toolchain: `|| s` -> "Min Capture
+//! s[] -> Immutable"; `|| s.len()` -> "Min Capture s[Deref] -> Immutable". The
+//! lane this file claimed to pin was the one that produced
+//! `OperandTypeMismatch { op: "extract_field", expected: "fatptr<str>", actual:
+//! "ptr" }` on every real repo (`ny-claims`, `ny-cert`, `ay-param`,
+//! `clap_builder`), and it was REMOVED that day — see
+//! `trust_ir_lower_fat_str_upvar_extract_field.rs`, which pins both faces and
+//! the refusal. What THIS file still pins, and keeps pinning: a whole-variable
+//! `&str` capture lowers through the thin lane and runs. A test that cannot
+//! fail is not a test; a test that pins something other than its header says
+//! is worse, because the header is what the next reader trusts.
 
 pub fn capture_str(s: &str) -> usize {
     let c = || s;

@@ -12,7 +12,7 @@ durable regression. As with every precise-lane root, the candidate is NEVER trus
 precise-mode output is byte-identical to a no-flag build.
 
 Run after `x.py build --stage 2`:
-    TRUST_SEED_STAIRCASE=1 python3 tests/trust-witness/generics_parity_smoke.py
+    python3 tests/trust-witness/generics_parity_smoke.py
 """
 import subprocess, os, sys, glob, hashlib, tempfile
 
@@ -32,7 +32,7 @@ CASES = {
 
 def run(src, extra, outdir, stats=False):
     os.makedirs(outdir, exist_ok=True)
-    env = dict(os.environ); env["TRUST_SEED_STAIRCASE"] = "1"
+    env = dict(os.environ)
     if stats:
         env["TRUST_WITNESS_STATS"] = "1"
     return subprocess.run([TRUSTC] + BASE + extra + ["--out-dir", outdir, src],

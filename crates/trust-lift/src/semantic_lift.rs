@@ -64,7 +64,8 @@ impl MemoryRegionHints {
 /// to get the correct register file mapping.
 #[derive(Debug, Clone)]
 pub struct LocalLayout {
-    /// _0: return place
+    /// _0: return place, typed `()` (see `to_local_decls`); the ABI result
+    /// lives in the return-register GPR local, not here.
     pub return_local: usize,
     /// Base index of GPR locals (`GPR[i] = gpr_base + i`).
     pub gpr_base: usize,
@@ -165,12 +166,18 @@ impl LocalLayout {
     pub(crate) fn to_local_decls(&self) -> Vec<LocalDecl> {
         let mut decls = Vec::with_capacity(self.total);
 
-        // _0: return (u64)
-        decls.push(LocalDecl {
-            index: 0,
-            ty: Ty::Int { width: 64, signed: false },
-            name: Some("_lifted_result".to_string()),
-        });
+        // _0: the TrustIr return place, typed `()` to match the body's
+        // `return_ty: Ty::Unit` (`Lifter::lift_function`). A lifted function is
+        // a machine-state transformer: `arg_count` is 0 and it returns nothing
+        // typed, because a binary carries no source types. The ABI result is
+        // NOT this local — it is the final value of the return-register local
+        // (X0 on AArch64, RAX on x86-64), which the lift already writes as
+        // ordinary machine state, and which `summarize_function_signature`
+        // records only as ABI-default metadata. Declaring `_0` as `u64` here
+        // made every lifted body self-contradictory (return place `u64`,
+        // return type `()`), so `trust_vcgen::validate_function` refused each
+        // one as `MalformedTrustIr` before any other VC was generated.
+        decls.push(LocalDecl { index: 0, ty: Ty::Unit, name: Some("_lifted_result".to_string()) });
 
         // GPRs
         for i in 0..self.gpr_count {
@@ -252,8 +259,17 @@ fn unsupported_effect_error(message: impl Into<String>) -> LiftError {
 }
 
 fn instruction_bytes_display(bytes: &[u8]) -> String {
-    let bytes = bytes.iter().map(|byte| format!("0x{byte:02x}")).collect::<Vec<_>>().join(", ");
-    format!("[{bytes}]")
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(2 + bytes.len().saturating_mul(6));
+    out.push('[');
+    for (idx, byte) in bytes.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "0x{byte:02x}");
+    }
+    out.push(']');
+    out
 }
 
 fn instruction_provenance_detail(insn: &Instruction) -> String {

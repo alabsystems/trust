@@ -2,14 +2,16 @@
 # seal_driver.sh — THE sealing helper. One implementation, in scripts/, for
 # every lane that needs a compiler CONTROL that stays a control.
 #
-# Consolidates three scratchpad copies that had drifted apart:
-#   scratchpad/laneP/seal.sh          (the seal: unique dylib leaf + LC_ID_DYLIB)
-#   scratchpad/wave-tr-ledger/tc      (the active dyld anti-contamination guard)
-#   lane K's reseal.sh                (same seal, written independently)
-# Those now call this file or point at it. Do not fork a fourth.
+# It is the SOLE seal and the SOLE dyld anti-contamination guard (`guard`).
+# It consolidated three scratchpad copies that had drifted apart — laneP's
+# seal.sh, wave-tr-ledger's `tc` guard wrapper and lane K's reseal.sh — and
+# those copies no longer exist: scratchpad/ was deleted in 6ba5324748. Nothing
+# else implements the seal or the guard; do not fork a second one.
 #
-#   scripts/seal_driver.sh seal <tag> [--from DIR] [--out DIR] [--worktree DIR]
+#   scripts/seal_driver.sh seal <tag> --from DIR [--out DIR] [--worktree DIR]
 #                                     [--sysroot DIR]
+#     --from is REQUIRED: the old default (build/<host>/stage1-rustc) was purged
+#     2026-09-14 without archiving. See the GONE SINCE 2026-09-14 block below.
 #   scripts/seal_driver.sh guard <binary> [--dyld PATH] [--dyld-fallback PATH]
 #                                         [--snapshot-root DIR] [--verbose]
 #   scripts/seal_driver.sh classes <trustc>
@@ -45,11 +47,22 @@
 # WHICH SYSROOT A SEAL COMPILES AGAINST -- AND WHY `seal` NOW CHOOSES IT
 # (the 2026-08-24 promotion, and the trap it left behind)
 # ===========================================================================
+# GONE SINCE 2026-09-14 -- READ THIS FIRST. `build/<host>/stage1-rustc` and
+# `stage1-tools` were purged to reclaim disk space WITHOUT archiving. The
+# METADATA_VERSION-11 control driver described below, and the 17 unique
+# librustc_driver builds that tree held, no longer exist and were preserved
+# nowhere. Consequences: there is no default `--from`; nothing on this machine
+# can be sealed as the v11 control; the v11 rows in `sysroot_registry` have no
+# driver to pair with; and `sysroottest` needs an explicit SYSROOTTEST_DRIVER.
+# A v11 seal is possible again only by rebuilding a driver from a v11 tree --
+# and a rebuild is a NEW driver, not the old control. The history below is kept
+# because it explains why auto-selection exists at all.
+#
 # On 2026-08-24 the SHARED stage1 was promoted to trust 9f07573349, taking it
-# from METADATA_VERSION 11 to 13. `build/<host>/stage1-rustc/` -- the DEFAULT
-# `--from` of this script, and the driver most measurement lanes seal as their
-# CONTROL -- was deliberately NOT touched, because replacing a control turns it
-# into a subject. Correct, and it left a trap:
+# from METADATA_VERSION 11 to 13. `build/<host>/stage1-rustc/` -- then the
+# DEFAULT `--from` of this script, and the driver most measurement lanes sealed
+# as their CONTROL -- was deliberately NOT touched, because replacing a control
+# turns it into a subject. Correct, and it left a trap:
 #
 #     seal from the default source  ->  driver=11 against sysroot=13
 #                                   ->  SYSROOT_COMPAT = FAIL
@@ -100,6 +113,12 @@
 # the no-match refusal turns into a selection; neuter the 4-fact verification
 # and a deliberately-broken same-version sysroot gets selected. A mechanism
 # whose removal changes nothing was never doing the work.
+#   UNRUNNABLE BY DEFAULT SINCE 2026-09-14: `sysroottest` takes its subject
+#   driver from the default source, which was purged, so it refuses before it
+#   proves anything. Pass SYSROOTTEST_DRIVER=/path/to/rustc-main to run it. The
+#   mutation proof above stands as a recorded past result, not a re-runnable
+#   check. (`guardtest` is unaffected -- it builds its own fixtures and touches
+#   no build tree.)
 #
 # ESCAPES, for a lane that wants the old behaviour:
 #   --sysroot DIR                   pin this seal's compile sysroot
@@ -196,8 +215,13 @@
 #   build/<host>/stage1/bin/trustc  and  build/<host>/stage2/bin/trustc
 #       register 6 -- they do NOT know marker-order, marker-drop,
 #       agg-field-order, marker-arm.
-# So `marker-order` discriminates that pair today, and `selftest` finds such a
-# class by itself rather than being told one.
+# So `marker-order` discriminated that pair AS MEASURED, and `selftest` finds
+# such a class by itself rather than being told one.
+#   THE 10-CLASS DRIVER NO LONGER EXISTS -- build/<host>/stage1-rustc was purged
+#   2026-09-14 -- so the pair above can no longer be formed and this is a
+#   record, not a check you can re-run. The 6-class stage1/stage2 `trustc` sides
+#   are still present. These numbers are the only surviving evidence of what
+#   that driver registered: do not delete them.
 #
 # ===========================================================================
 # IF THE SEALED DRIVER CANNOT FIND `std` (E0463), STOP -- IT IS NOT THE SEAL
@@ -235,10 +259,49 @@ STAGE1_SYSROOT="$ROOT/build/$HOST/stage1"
 #   TRUST_SEAL_COMPILE_SYSROOT=DIR   pin the compile sysroot for a whole lane
 #   TRUST_SEAL_NO_AUTO_SYSROOT=1     never auto-select; fail closed instead
 #   TRUST_SEAL_SYSROOT_REGISTRY=A:B  replace the registry (tests; colon-separated)
-DEFAULT_FROM="$ROOT/build/$HOST/stage1-rustc/release"
+# THERE IS NO DEFAULT SEAL SOURCE ON THIS MACHINE (2026-09-14).
+# `build/<host>/stage1-rustc` and `stage1-tools` were purged to reclaim disk
+# space WITHOUT archiving. That took the frozen METADATA_VERSION-11 CONTROL
+# driver -- and the 17 unique librustc_driver builds the tree held -- with it.
+# Nothing here can be sealed as the v11 control any more, and the v11 rows in
+# `sysroot_registry` have no driver left to pair with.
+#
+# Two layouts are probed, x.py's first. bootstrap.toml names two Apple targets,
+# so cargo writes rustc-main under <target-dir>/$HOST/release/ and leaves only
+# host build-script output in <target-dir>/release/. The old default named ONLY
+# the flat path, so it silently missed an x.py-built driver even BEFORE the
+# purge -- it resolved only for a lane build run with no --target.
+#
+# DEFAULT_FROM is empty when neither layout holds a rustc-main. Consumers call
+# no_default_from() rather than resolving a path that is not there. Do NOT add a
+# fallback that searches for some other driver: that is exactly how a subject
+# gets sealed as a control.
+DEFAULT_FROM_XPY="$ROOT/build/$HOST/stage1-rustc/$HOST/release"
+DEFAULT_FROM_FLAT="$ROOT/build/$HOST/stage1-rustc/release"
+DEFAULT_FROM=""
+for _seal_cand in "$DEFAULT_FROM_XPY" "$DEFAULT_FROM_FLAT"; do
+  if [ -x "$_seal_cand/rustc-main" ]; then DEFAULT_FROM="$_seal_cand"; break; fi
+done
+unset _seal_cand
 
 die()  { echo "seal_driver: $*" >&2; exit 1; }
 note() { echo "seal_driver: $*" >&2; }
+
+# The shared refusal, so the cause is stated once and every entry point agrees.
+no_default_from() {
+  die "$1: no default seal source, and none can be inferred.
+seal_driver:   probed $DEFAULT_FROM_XPY   (x.py layout)
+seal_driver:   probed $DEFAULT_FROM_FLAT  (lane build, no --target)
+seal_driver: build/<host>/stage1-rustc was purged 2026-09-14 WITHOUT archiving, taking
+seal_driver: the frozen METADATA_VERSION-11 control driver with it. Options:
+seal_driver:   --from DIR                      seal a driver you name
+seal_driver:   --sysroot DIR                   pin this seal's compile sysroot
+seal_driver:   TRUST_SEAL_COMPILE_SYSROOT=DIR  the same, for a whole lane
+seal_driver:   rebuild stage1-rustc            -- but a rebuild is a NEW driver, so seal
+seal_driver:                                      it under a NEW tag, never as 'the v11
+seal_driver:                                      control'. Replacing a control turns it
+seal_driver:                                      into a subject."
+}
 
 # ONE script-global scratch dir with ONE trap. Not a `local` + RETURN trap:
 # bash traps are not function-scoped without `functrace`, so such a trap fires
@@ -683,6 +746,40 @@ sysroot_meta_version() {
   return 1
 }
 
+# The verification-OFF spelling THIS driver accepts, printed on stdout.
+#
+# The probes below must compile with verification off, and the flag has two
+# spellings that different drivers accept differently. `-Ztrust-verify=off` is the
+# one flag surface since 576db732cd; `-Zno-trust-verify` survives ONLY as a
+# `#[cfg(bootstrap)]` alias (rustc_session options.rs), i.e. in stage1 drivers
+# and in the pre-rename seed. A SHIPPING driver (stage2, the atpkg `trust`
+# channel) rejects it: "unknown unstable option: `no-trust-verify`".
+#
+# The probes used to hard-code the old spelling, so against every shipping
+# driver fact 2 read `driver=unknown` and facts 3/4 REFUSED — for a flag error,
+# not a metadata one. That turned the one gate that catches the
+# equal-METADATA_VERSION encoding skew (the class that produced
+# "range end index 20 out of range for slice of length 8" in
+# rustc_metadata decoder.rs `decode_span`, clean reports/ice
+# trustc-ice-2026-08-21T05_21_11-38057.txt) into a gate that could never pass
+# on the toolchain users actually run, which is the same as having no gate.
+#
+# `--print sysroot` validates every `-Z` option (an unknown one exits 1) and
+# reads nothing else, so it asks the question without compiling. A driver that
+# accepts neither falls through to the current spelling, and the probe's own
+# error then names the real cause. Not cached: callers run it in `$(...)`, so
+# a cache would live and die in one subshell; the cost is one or two
+# `--print sysroot` spawns per probe.
+verify_off_flag() {
+  local drv="$1" f
+  for f in -Ztrust-verify=off -Zno-trust-verify; do
+    if "$drv" "$f" --print sysroot >/dev/null 2>&1; then
+      printf '%s\n' "$f"; return 0
+    fi
+  done
+  printf '%s\n' -Ztrust-verify=off
+}
+
 driver_meta_version() {
   # A `#![no_core]` rlib: no sysroot crate is read, so this answers even when
   # every crate in the sysroot is unreadable. If the lang-item set this needs
@@ -702,7 +799,8 @@ driver_meta_version() {
 pub struct Probe;
 RS
   rm -f "$tmp/mv.rlib"
-  "$drv" --edition 2021 -Zno-trust-verify --crate-type rlib \
+  local off; off=$(verify_off_flag "$drv")  # asked of the driver, never assumed
+  "$drv" --edition 2021 "$off" --crate-type rlib \
          -o "$tmp/mv.rlib" "$tmp/mv.rs" >/dev/null 2>&1 || true
   [ -f "$tmp/mv.rlib" ] || return 1
   meta_version_of_file "$tmp/mv.rlib"
@@ -728,17 +826,20 @@ RS
 # ---------------------------------------------------------------------------
 S34_OUT=""; S34_DOUT=""
 sysroot_facts_34() { # <drv-abs> <sysroot-abs-or-empty> <pass_sysroot 0|1>
-  local drv="$1" sysroot="$2" pass="$3" tmp rc=0 drc=0
+  local drv="$1" sysroot="$2" pass="$3" tmp rc=0 drc=0 off
   tmp=$(scratch)
+  # The spelling is asked of the driver, never assumed: see `verify_off_flag`.
+  # A wrapper that sets its own --sysroot still answers `--print sysroot`.
+  off=$(verify_off_flag "$drv")
   S34_OUT=""; S34_DOUT=""
   printf 'fn main() {}\n' > "$tmp/hello.rs"
   rm -f "$tmp/hello.rmeta"
   if [ "$pass" = 1 ]; then
-    S34_OUT=$("$drv" --sysroot "$sysroot" --edition 2021 -Zno-trust-verify \
+    S34_OUT=$("$drv" --sysroot "$sysroot" --edition 2021 "$off" \
                      --emit=metadata --crate-type bin \
                      -o "$tmp/hello.rmeta" "$tmp/hello.rs" 2>&1) || rc=$?
   else
-    S34_OUT=$("$drv" --edition 2021 -Zno-trust-verify \
+    S34_OUT=$("$drv" --edition 2021 "$off" \
                      --emit=metadata --crate-type bin \
                      -o "$tmp/hello.rmeta" "$tmp/hello.rs" 2>&1) || rc=$?
   fi
@@ -764,11 +865,11 @@ fn main() {
 RS
   rm -f "$tmp/mirprobe.o"
   if [ "$pass" = 1 ]; then
-    S34_DOUT=$(cd "$tmp" && "$drv" --sysroot "$sysroot" --edition 2021 -Zno-trust-verify \
+    S34_DOUT=$(cd "$tmp" && "$drv" --sysroot "$sysroot" --edition 2021 "$off" \
                      -Copt-level=0 --emit=obj --crate-type bin \
                      -o "$tmp/mirprobe.o" "$tmp/mirprobe.rs" 2>&1) || drc=$?
   else
-    S34_DOUT=$(cd "$tmp" && "$drv" --edition 2021 -Zno-trust-verify \
+    S34_DOUT=$(cd "$tmp" && "$drv" --edition 2021 "$off" \
                      -Copt-level=0 --emit=obj --crate-type bin \
                      -o "$tmp/mirprobe.o" "$tmp/mirprobe.rs" 2>&1) || drc=$?
   fi
@@ -995,7 +1096,10 @@ cmd_sysrootcheck() {
       *) die "sysrootcheck: unknown argument $1" ;;
     esac
   done
-  [ -n "$target" ] || target="$DEFAULT_FROM/rustc-main"
+  [ -n "$target" ] || {
+    [ -n "$DEFAULT_FROM" ] || no_default_from sysrootcheck
+    target="$DEFAULT_FROM/rustc-main"
+  }
 
   # A wrapper script supplies its OWN --sysroot; passing a second one makes
   # rustc refuse with "Option 'sysroot' given more than once". So: only add the
@@ -1059,7 +1163,11 @@ sysrootcheck:   sufficiency check. The sysroot must be rebuilt by THIS driver �
 sysrootcheck:   without x.py: see reports/metadata-v12-sysroot.md (dispatch route).
 sysrootcheck:   first errors from the decode probe:
 EOF
-    echo "$S34_DOUT" | grep -E 'internal compiler error|invalid enum variant|error\[|^error' | head -6 | sed 's/^/sysrootcheck:     /' >&2
+    # `panicked at` / `out of range for slice`: a skew does not always surface
+    # as a bad enum tag. The 2026-08-21 dump surfaced it as a slice-bounds panic
+    # in `decode_span` (a garbage byte read as an Indirect span tag of length
+    # 20), and a refusal that quotes nothing of the cause is half a refusal.
+    echo "$S34_DOUT" | grep -E 'internal compiler error|invalid enum variant|panicked at|out of range for slice|error\[|^error' | head -8 | sed 's/^/sysrootcheck:     /' >&2
     sysrootcheck_remedy "$drv" "$dv" "$sysroot" >&2
     return 96
   fi
@@ -1171,7 +1279,13 @@ cmd_sysroots() {
   [ -n "$drv" ] || {
     echo
     echo "Pass a driver to see which of these could pair with it:"
-    echo "  scripts/seal_driver.sh sysroots $DEFAULT_FROM/rustc-main"
+    if [ -n "$DEFAULT_FROM" ]; then
+      echo "  scripts/seal_driver.sh sysroots $DEFAULT_FROM/rustc-main"
+    else
+      echo "  scripts/seal_driver.sh sysroots <path-to-rustc-main>"
+      echo "  (no default since build/<host>/stage1-rustc was purged 2026-09-14;"
+      echo "   a sealed dir's rustc-main under build/sealed/ is the usual answer)"
+    fi
     return 0
   }
   drv=$(realpath_f "$drv")
@@ -1214,7 +1328,8 @@ cmd_seal() {
       *) die "seal: unknown argument $1" ;;
     esac
   done
-  [ -n "$tag" ] || die "usage: seal_driver.sh seal <tag> [--from DIR] [--out DIR] [--worktree DIR] [--sysroot DIR]"
+  [ -n "$tag" ] || die "usage: seal_driver.sh seal <tag> --from DIR [--out DIR] [--worktree DIR] [--sysroot DIR]"
+  [ -n "$from" ] || no_default_from seal
   case "$tag" in
     *[!A-Za-z0-9_-]*) die "seal: tag must be [A-Za-z0-9_-]+ (it becomes a dylib leaf name)" ;;
   esac
@@ -1373,6 +1488,28 @@ EOF
   echo "  sysroot compat $(head -1 "$out/SYSROOT_COMPAT")"
   echo "  perturb classes $(tr '\n' ' ' < "$out/PERTURB_CLASSES")"
   otool -L "$out/rustc-main" | sed -n '2p'
+
+  # A SEAL IS LOCAL UNTIL IT IS PUBLISHED. On 2026-09-09 a seal minted here
+  # (trust-d3866677) was linked as this machine's `trust` channel, a repo's
+  # manifest was committed against a policy key only its targo knew, and no
+  # atpkg build of it was ever published — so every atpkg-managed machine,
+  # correctly "up to date" at trust 6808, could no longer open that repo with
+  # targo at all. Say so here, where the seal is minted, and name the route.
+  # THIS directory is never that route: it is a driver snapshot (rustc-main,
+  # the driver dylib, tc), with no bin/trustc, bin/targo or lib/, so aterm's
+  # publisher (`atpkg-publish publish-group rustc`, which replaced
+  # tools/atpkg-publish-rustc-group.sh) refuses it in preflight. A toolchain
+  # reaches the atpkg index by docs/CUTTING-A-TOOLCHAIN.md §3.9: promote it
+  # (scripts/promote-toolchain.sh), stage the pack, pass §3.9's gates, release
+  # its seed (scripts/publish_seed_cut.sh), then publish-group --seal <staged
+  # pack> in the aterm checkout. The plan is printed only: a dry run against this
+  # directory would build the publisher in that checkout to be refused.
+  local aterm="${ATERM_ROOT:-$HOME/aterm}"
+  echo "  published      NO — this seal is LOCAL ONLY. A driver seal is never published itself; a toolchain"
+  echo "                 reaches atpkg by docs/CUTTING-A-TOOLCHAIN.md §3.9: scripts/promote-toolchain.sh <stage2>,"
+  echo "                 stage the pack, pass §3.9's gates on it, run scripts/publish_seed_cut.sh --pack <staged pack> …, then"
+  echo "                 (cd $aterm && targo --unverified run -q -p atpkg-publish -- \\"
+  echo "                    publish-group rustc --seal <staged pack> --trust-repo $ROOT --dry-run)    (then --upload)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1671,8 +1808,17 @@ cmd_sysroottest() {
   export DYLD_LIBRARY_PATH="$STAGE1_SYSROOT/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
   # ---- material, or refuse ------------------------------------------------
-  local drv; drv="$DEFAULT_FROM/rustc-main"
-  [ -x "$drv" ] || die "sysroottest: no driver at $drv — cannot prove anything here."
+  # UNRUNNABLE SINCE 2026-09-14 unless given a driver: this test takes its
+  # subject from the default source, and build/<host>/stage1-rustc was purged.
+  local drv; drv="${SYSROOTTEST_DRIVER:-${DEFAULT_FROM:+$DEFAULT_FROM/rustc-main}}"
+  [ -n "$drv" ] || no_default_from sysroottest
+  [ -x "$drv" ] || die "sysroottest: no driver at $drv.
+seal_driver: build/<host>/stage1-rustc was purged 2026-09-14 without archiving, so there
+seal_driver: is no default driver here. Point this test at one explicitly with
+seal_driver: SYSROOTTEST_DRIVER=/path/to/rustc-main. A rebuilt tree puts rustc-main under
+seal_driver: stage1-rustc/$HOST/release (x.py) or stage1-rustc/release (lane build, no
+seal_driver: --target). Until then the recorded mutation proof stands as a past result,
+seal_driver: not a check you can re-run."
   drv=$(realpath_f "$drv")
   local dv; dv=$(driver_meta_version "$drv" || true); [ -n "$dv" ] || dv=unknown
   sysroot_key_usable "$dv" \

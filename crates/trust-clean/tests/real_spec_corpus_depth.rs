@@ -5,7 +5,7 @@
 // it does not touch prove.rs / mirsem.rs / any prover logic.
 //
 // Run with:
-//   RUSTC_BOOTSTRAP=1 cargo test -p trust-clean --manifest-path crates/Cargo.toml \
+//   targo --unverified test -p trust-clean --manifest-path crates/Cargo.toml \
 //       --test real_spec_corpus_depth -- --nocapture
 //
 // Author: Andrew Yates | Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
@@ -24,13 +24,24 @@ use trust_types::VerifiableFunction;
 #[test]
 fn real_spec_corpus_per_function_breakdown() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join("real-spec-corpus");
+    // NO-VACUOUS-CORPUS-TEST: the corpus is checked in, so an unreadable
+    // directory or entry, an undecodable row, or an empty corpus FAILS naming
+    // the path instead of silently shrinking the breakdown.
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
-        .expect("read dir")
-        .filter_map(Result::ok)
-        .map(|e| e.path())
+        .unwrap_or_else(|error| {
+            panic!("read required fixture directory {}: {error}", dir.display())
+        })
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| {
+                    panic!("read entry in required fixture directory {}: {error}", dir.display())
+                })
+                .path()
+        })
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
         .collect();
     entries.sort();
+    assert!(!entries.is_empty(), "required fixture corpus {} is empty", dir.display());
 
     println!("\n========== PER-FUNCTION SAFETY/POSTCOND DISCHARGE BREAKDOWN ==========");
     println!(
@@ -38,8 +49,10 @@ fn real_spec_corpus_per_function_breakdown() {
         "function", "safe", "sDis", "sSMT", "post", "pDis", "pSMT"
     );
     for path in entries {
-        let bytes = std::fs::read(&path).unwrap();
-        let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&bytes) else { continue };
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("read required fixture {}: {error}", path.display()));
+        let func = serde_json::from_slice::<VerifiableFunction>(&bytes)
+            .unwrap_or_else(|error| panic!("decode required fixture {}: {error}", path.display()));
         // Re-create the same registry/struct-param context prove_dump_dir uses, so
         // the discharge verdict matches the scorecard exactly.
         let carriers = trust_clean::clean_ground::reachable_adt_carriers(&func);

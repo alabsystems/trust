@@ -24,11 +24,19 @@
 //! * The channel is string-typed (`SpecInvariant.formula` is an opaque string
 //!   by design), so this is a STRING-RENDERED disclosure: the typed
 //!   `TrustContractProposition` tree is rendered by exactly ONE
-//!   compiler-authoritative renderer (below), deterministic and
-//!   schema-tagged (`trust.contract-disclosure.v1`), on the v6/D1 discipline —
-//!   the compiler renders, consumers decode the versioned schema, nothing
-//!   offline re-elaborates. The typed-slot wire property is reserved for the
-//!   `contract-bound-v2` capability tier.
+//!   compiler-authoritative renderer (`crate::contract_render`, moved there
+//!   unchanged by WS5.5 step 1), deterministic and schema-tagged
+//!   (`trust.contract-disclosure.v1`), on the v6/D1 discipline — the compiler
+//!   renders, consumers decode the versioned schema, nothing offline
+//!   re-elaborates. The typed-slot wire property is reserved for the
+//!   contract-bound capability tier: design name `contract-bound-v2` (08-27
+//!   §5) = coverage marker `contract-bound-v3` (shipped markers carry the rung
+//!   ORDINAL; ordinal 2 is `obligation-bearing-pending-v2`, and under D36/D37
+//!   the Clean carrier is a codegen-license authority, not a rung). It is
+//!   built STAGED in `crate::contract_carry` (WS5.5); the owner-signed flip
+//!   (DG-60) that installs it deletes this module's install call, so zero
+//!   `DesignOnly` contract rows remain (G6). The disclosure NAME stays
+//!   reserved so an old artifact is never reinterpreted.
 //! * `Opaque`/`Unsupported`/`MirLocal` clauses are carried AS SUCH — disclosed,
 //!   never invented, never silently dropped.
 //! * The `FuncId` binding is serialized in every row (not only the def-path
@@ -36,14 +44,15 @@
 //! * Loop contracts stay in their own lane (E4/E5 owns them); this module
 //!   reads only the dense function-contract table.
 
-use rustc_middle::mir::trust_contract::{
-    TrustContract, TrustContractBundle, TrustContractPredicateKind, TrustContractProposition,
-};
+use rustc_middle::mir::trust_contract::{TrustContract, TrustContractBundle};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::{DefId, DefIndex, LocalDefId};
-use trust_ir::Module;
-use trust_ir::{SpecInvariant, SpecModule};
 use trust_ir::value::FuncId;
+use trust_ir::{Module, SpecInvariant, SpecModule};
+
+// WS5.5 step 1: the renderer moved, unchanged, to `crate::contract_render` so
+// the staged contract carry (`crate::contract_carry`) renders the SAME bytes.
+use crate::contract_render::{esc, kind_tag, render_predicate};
 
 /// The disclosure SpecModule name. Reserved.
 pub const CONTRACT_DISCLOSURE_NAME: &str = "@trust-internal::contract-disclosure-v1";
@@ -74,7 +83,29 @@ pub fn install_contract_disclosure(
             continue;
         }
         let bundle = tcx.trust_contracts(def_id);
-        let def_path = tcx.def_path_str(def_id);
+        // `with_no_trimmed_paths!` for two independent reasons — the first is the
+        // one `crate_module::record` and `instance_flip.rs` document for their own
+        // `def_path_str`:
+        //
+        // 1. TERMINATION. A bare `def_path_str` runs the `trimmed_def_paths`
+        //    query, which arms rustc's `must_produce_diag`; `DiagCtxtInner::drop`
+        //    then ICEs if the compilation emits no diagnostic. This row is
+        //    artifact text, not a diagnostic, and it runs for EVERY
+        //    contract-bearing body. Under `-Ztrust-verify-output=json` with a
+        //    human `--error-format` (the raw-trustc wire) a fully proved,
+        //    island-free crate prints no diagnostic at all, so every such crate
+        //    exited 101 AFTER its proved rows were written
+        //    (`tests/ui/trust/json_output_contract_only_no_ice.rs`). Text mode
+        //    and island crates escaped only because a verification/kernel
+        //    `note:` happened to satisfy the assertion.
+        // 2. DETERMINISM. A trimmed path is the shortest spelling that is
+        //    unambiguous IN THIS COMPILATION'S import context — `keep` today,
+        //    `m::keep` once a dependency exports another `keep`. The module
+        //    header promises "one deterministic rendering"; a disclosure row
+        //    whose `def_path` varies with unrelated crates is not one. It is also
+        //    the spelling the coverage rows carry, so the disclosure row and the
+        //    coverage row stay directly comparable.
+        let def_path = rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id));
         for (i, contract) in bundle.contracts.iter().enumerate() {
             disclosure.invariants.push(SpecInvariant::new(
                 format!("fn:{}:{}:{i}", func_id.index(), kind_tag(contract)),
@@ -94,44 +125,11 @@ fn may_have_contracts(tcx: TyCtxt<'_>, local: LocalDefId) -> bool {
     TrustContractBundle::def_may_have_contracts(tcx, local)
 }
 
-fn kind_tag(contract: &TrustContract<'_>) -> &'static str {
-    use rustc_middle::mir::trust_contract::TrustContractKind as K;
-    match contract.kind {
-        K::Requires => "requires",
-        K::Ensures => "ensures",
-        K::Invariant => "invariant",
-        K::LoopInvariant => "loop-invariant",
-        K::Decreases => "decreases",
-        K::Assumes => "assumes",
-        K::Asserts => "asserts",
-        K::Refinement => "refinement",
-        K::Temporal => "temporal",
-    }
-}
-
 /// THE compiler-authoritative renderer (design §5): one deterministic JSON
 /// rendering of a contract row, schema-tagged. Consumers decode this schema;
 /// nothing re-parses authored text.
 fn render_row(func_id: FuncId, def_path: &str, contract: &TrustContract<'_>) -> String {
-    let predicate = match &contract.predicate.kind {
-        TrustContractPredicateKind::Typed { text, proposition } => format!(
-            "{{\"typed\":{{\"text\":\"{}\",\"proposition\":{}}}}}",
-            esc(text.as_str()),
-            render_proposition(proposition),
-        ),
-        TrustContractPredicateKind::Opaque { text } => {
-            format!("{{\"opaque\":{{\"text\":\"{}\"}}}}", esc(text.as_str()))
-        }
-        TrustContractPredicateKind::MirLocal { local } => {
-            format!("{{\"mir_local\":{{\"local\":{}}}}}", local.as_u32())
-        }
-        TrustContractPredicateKind::BoolLiteral { value } => {
-            format!("{{\"bool\":{value}}}")
-        }
-        TrustContractPredicateKind::Unsupported { reason } => {
-            format!("{{\"unsupported\":{{\"reason\":\"{}\"}}}}", esc(reason.as_str()))
-        }
-    };
+    let predicate = render_predicate(&contract.predicate.kind);
     format!(
         "{{\"schema\":\"trust.contract-disclosure.v1\",\"func_id\":{},\"def_path\":\"{}\",\
          \"kind\":\"{}\",\"non_claim\":\"DesignOnly disclosure: these are the AUTHORED \
@@ -142,44 +140,5 @@ fn render_row(func_id: FuncId, def_path: &str, contract: &TrustContract<'_>) -> 
     )
 }
 
-/// Deterministic recursive JSON rendering of the closed proposition
-/// vocabulary. A new variant is a compile error here — a forced decision about
-/// its disclosure spelling.
-fn render_proposition(p: &TrustContractProposition) -> String {
-    use TrustContractProposition as P;
-    match p {
-        P::Bool(b) => format!("{{\"bool\":{b}}}"),
-        P::Int(i) => format!("{{\"int\":\"{i}\"}}"),
-        P::UInt(u) => format!("{{\"uint\":\"{u}\"}}"),
-        P::Var { name, domain } => {
-            format!("{{\"var\":{{\"name\":\"{}\",\"domain\":\"{domain:?}\"}}}}", esc(name.as_str()))
-        }
-        P::Not(a) => format!("{{\"not\":{}}}", render_proposition(a)),
-        P::And(xs) => format!("{{\"and\":[{}]}}", render_list(xs)),
-        P::Or(xs) => format!("{{\"or\":[{}]}}", render_list(xs)),
-        P::Implies(a, b) => render_binary("implies", a, b),
-        P::Eq(a, b) => render_binary("eq", a, b),
-        P::Lt(a, b) => render_binary("lt", a, b),
-        P::Le(a, b) => render_binary("le", a, b),
-        P::Gt(a, b) => render_binary("gt", a, b),
-        P::Ge(a, b) => render_binary("ge", a, b),
-        P::Add(a, b) => render_binary("add", a, b),
-        P::Sub(a, b) => render_binary("sub", a, b),
-        P::Mul(a, b) => render_binary("mul", a, b),
-        P::Div(a, b) => render_binary("div", a, b),
-        P::Rem(a, b) => render_binary("rem", a, b),
-        P::Neg(a) => format!("{{\"neg\":{}}}", render_proposition(a)),
-    }
-}
-
-fn render_binary(tag: &str, a: &TrustContractProposition, b: &TrustContractProposition) -> String {
-    format!("{{\"{tag}\":[{},{}]}}", render_proposition(a), render_proposition(b))
-}
-
-fn render_list(xs: &[TrustContractProposition]) -> String {
-    xs.iter().map(render_proposition).collect::<Vec<_>>().join(",")
-}
-
-fn esc(s: &str) -> String {
-    crate::clean_origin_join::json_escape_min(s)
-}
+#[cfg(test)]
+mod tests;

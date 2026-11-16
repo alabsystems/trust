@@ -22,6 +22,8 @@
 #   tools/preflight.sh --for-build     # what the x.py hook runs
 #   tools/preflight.sh --deep          # + authoritative `metadata --locked`
 #   tools/preflight.sh --only tools --bootstrap-toml /path/to/candidate.toml
+# Pin checks here audit the build's own ancestry. Publication is separately
+# checked against the destination by scripts/check_pin_regression.sh --stdin.
 #
 # Exit: 0 = cleared, 1 = blocking problem found, 2 = preflight itself broke.
 
@@ -53,8 +55,8 @@ for c in $candidates; do
     else
         continue
     fi
-    if "$py" -c 'import tomllib' >/dev/null 2>&1; then
-        exec "$py" "$checker" "$@"
+    if "$py" -I -S -c 'import tomllib' >/dev/null 2>&1; then
+        exec "$py" -I -S "$checker" "$@"
     fi
 done
 

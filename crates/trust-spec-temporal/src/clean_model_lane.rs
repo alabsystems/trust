@@ -1,6 +1,6 @@
 //! Kernel-elaborated Clean finite-model definitions routed to ty.
 //!
-//! This lane replaced the owner-ratified operational domain of the retired
+//! This lane replaced the ratified operational domain of the retired
 //! scalar macro DSL without introducing a second, hand-maintained semantic
 //! object. `R5_TEMPORAL_PARITY_BLOCKERS` is empty. Mechanically, the
 //! model-item cap survives only as a 65_536-element
@@ -12,10 +12,10 @@
 //! feeds `certify_model` an owned `String`-named [`Model`] directly — nothing
 //! is leaked and no process-wide budget can decline an otherwise valid model.
 //! The legacy automatic link-time model inventory
-//! was deleted as extraneous — owner ruling 2026-07-20 — so callers own the
+//! was deleted as extraneous (2026-07-20), so callers own the
 //! explicit definition list they certify.
 //! Identifier grammar is shared with the legacy certification preflight and is
-//! the ratified parity target, not a gap (owner ruling 2026-07-20). The user authors one
+//! the ratified parity target, not a gap (2026-07-20). The user authors one
 //! [`ScalarModel`](CleanScalarModel) value in Clean. We fresh-elaborate it
 //! with the canonical
 //! [`FINITE_MODEL_PRELUDE`], read the registered definition body, and decode only
@@ -34,7 +34,6 @@
 //! theorem from the ty certificate.
 
 use std::collections::BTreeSet;
-use std::sync::OnceLock;
 
 use clean_elab::FileContext;
 use clean_kernel::env::Environment;
@@ -120,11 +119,18 @@ pub(crate) const MAX_NAME_BYTES: usize = 128;
 ///
 /// The source-coupling test below derives this set from all three local lexer
 /// token groups, so a ty lexer update cannot silently make this mirror stale.
+///
+/// The Sequences module's operator names (`Append`, `Head`, `Tail`, `Len`,
+/// `Seq`, `SubSeq`, `SelectSeq`) are not here: since ty db6133b11e (in the ty
+/// pin 63a1f216b3) they lex as `Ident`, as SANY reads them, and the modules this
+/// crate emits EXTEND only Naturals or Integers, so they are ordinary names. As
+/// a state variable, like every builtin-spelled name this list never held
+/// (`Cardinality`, `Max`), ty's certificate lane declines them, fail-closed
+/// (`sequences_operator_names_certify_as_ordinary_identifiers`).
 pub(crate) const TLA_RESERVED_IDENTIFIER_TOKENS: &[&str] = &[
     "ASSUME",
     "ASSUMPTION",
     "AXIOM",
-    "Append",
     "BOOLEAN",
     "BY",
     "CASE",
@@ -143,7 +149,6 @@ pub(crate) const TLA_RESERVED_IDENTIFIER_TOKENS: &[&str] = &[
     "FALSE",
     "HAVE",
     "HIDE",
-    "Head",
     "IF",
     "IN",
     "INSTANCE",
@@ -152,7 +157,6 @@ pub(crate) const TLA_RESERVED_IDENTIFIER_TOKENS: &[&str] = &[
     "LEMMA",
     "LET",
     "LOCAL",
-    "Len",
     "MODULE",
     "NEW",
     "OBVIOUS",
@@ -167,14 +171,10 @@ pub(crate) const TLA_RESERVED_IDENTIFIER_TOKENS: &[&str] = &[
     "SF_",
     "SUBSET",
     "SUFFICES",
-    "SelectSeq",
-    "Seq",
-    "SubSeq",
     "TAKE",
     "THEN",
     "THEOREM",
     "TRUE",
-    "Tail",
     "UNCHANGED",
     "UNION",
     "USE",
@@ -184,6 +184,12 @@ pub(crate) const TLA_RESERVED_IDENTIFIER_TOKENS: &[&str] = &[
     "WITH",
     "WITNESS",
 ];
+
+/// Ordinary Sequences identifiers whose use as state or binder names remains
+/// outside the temporal certificate producer's supported name-resolution lane.
+/// This is a semantic binding restriction, not a set of lexer keywords.
+pub(crate) const TLA_CERTIFICATE_BUILTIN_BINDINGS: &[&str] =
+    &["Append", "Head", "Tail", "Len", "Seq", "SubSeq", "SelectSeq"];
 
 /// Owned mirror of the scalar expression union decoded from Clean.
 ///
@@ -472,25 +478,26 @@ impl From<TyCertifyError> for CleanScalarModelError {
     }
 }
 
-fn on_finite_kernel_stack<T: Send>(
-    operation: impl FnOnce() -> Result<T, CleanScalarModelError> + Send,
+fn on_finite_kernel_stack<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, CleanScalarModelError> + Send + 'static,
 ) -> Result<T, CleanScalarModelError> {
-    std::thread::scope(|scope| {
-        let worker = std::thread::Builder::new()
-            .name("trust-clean-finite-model".to_owned())
-            .stack_size(FINITE_KERNEL_STACK_BYTES)
-            .spawn_scoped(scope, operation)
-            .map_err(|error| {
-                CleanScalarModelError::ArtifactMismatch(format!(
-                    "could not start isolated Clean finite-model worker: {error}"
-                ))
-            })?;
-        worker.join().map_err(|_| {
+    // A persistent worker, not a thread per call: `fresh_finite_model_context`
+    // caches the finite-model prelude per thread, and a thread that dies with
+    // the call would rebuild it every time (see `crate::kernel_worker`).
+    const _: () =
+        assert!(FINITE_KERNEL_STACK_BYTES <= crate::kernel_worker::KERNEL_WORKER_STACK_BYTES);
+    crate::kernel_worker::run_on_kernel_worker(operation).map_err(|error| match error {
+        crate::kernel_worker::KernelWorkerError::Spawn(error) => {
+            CleanScalarModelError::ArtifactMismatch(format!(
+                "could not start isolated Clean finite-model worker: {error}"
+            ))
+        }
+        crate::kernel_worker::KernelWorkerError::Panicked => {
             CleanScalarModelError::ArtifactMismatch(
                 "isolated Clean finite-model worker panicked".to_owned(),
             )
-        })?
-    })
+        }
+    })?
 }
 
 fn encoded(expression: &KernelExpr) -> Result<Vec<u8>, CleanScalarModelError> {
@@ -499,21 +506,40 @@ fn encoded(expression: &KernelExpr) -> Result<Vec<u8>, CleanScalarModelError> {
 }
 
 fn fresh_finite_model_context() -> Result<(Environment, FileContext), CleanScalarModelError> {
-    static FINITE_PRELUDE: OnceLock<
-        Result<(Environment, FileContext), CleanTemporalCertificateError>,
-    > = OnceLock::new();
-    let cached = FINITE_PRELUDE.get_or_init(|| {
-        let (mut environment, mut context) = fresh_temporal_prelude_context()?;
-        elaborate_suffix_with_parser_prelude(
-            &mut environment,
-            &mut context,
-            crate::clean_surface::CLEAN_TEMPORAL_PRELUDE,
-            FINITE_MODEL_PRELUDE,
-            "finite-model prelude",
-        )?;
-        Ok((environment, context))
+    // Keep the current worker-local cache policy. Pinned Clean's FileContext
+    // and Environment are Send + Sync; global sharing is a separate change.
+    // This build uses only compile-time temporal/finite-model sources with
+    // external import search disabled. Each worker builds the same frontier
+    // and callers receive owned, isolated run forks.
+    //
+    // Trust (Clean R80 item 2; `docs/DECISION_QUEUE.md` R80-CONSUMERS-1): the
+    // context goes out as a `FileContext::fork_run` copy, a new elaboration run
+    // to which both preludes' declarations are imported, so an authored
+    // `attribute [implemented_by]` / `[extern]` command cannot bind one (Lean
+    // refuses it as imported). A plain clone would keep the preludes' run.
+    thread_local! {
+        static FINITE_PRELUDE: std::cell::OnceCell<
+            Result<(Environment, FileContext), CleanTemporalCertificateError>,
+        > = const { std::cell::OnceCell::new() };
+    }
+    let cached = FINITE_PRELUDE.with(|cache| {
+        cache
+            .get_or_init(|| {
+                let (mut environment, mut context) = fresh_temporal_prelude_context()?;
+                elaborate_suffix_with_parser_prelude(
+                    &mut environment,
+                    &mut context,
+                    crate::clean_surface::CLEAN_TEMPORAL_PRELUDE,
+                    FINITE_MODEL_PRELUDE,
+                    "finite-model prelude",
+                )?;
+                Ok((environment, context))
+            })
+            .as_ref()
+            .map(|(environment, context)| (environment.clone(), context.fork_run()))
+            .map_err(Clone::clone)
     });
-    Ok(cached.clone()?)
+    Ok(cached?)
 }
 
 fn finite_environment(source: &str) -> Result<Environment, CleanScalarModelError> {
@@ -1549,8 +1575,9 @@ pub fn extract_clean_scalar_model(
     clean_source: &str,
     model_definition: &str,
 ) -> Result<(CleanScalarModelArtifact, CleanScalarModel), CleanScalarModelError> {
-    on_finite_kernel_stack(|| {
-        extract_clean_scalar_model_on_kernel_stack(clean_source, model_definition)
+    let (clean_source, model_definition) = (clean_source.to_owned(), model_definition.to_owned());
+    on_finite_kernel_stack(move || {
+        extract_clean_scalar_model_on_kernel_stack(&clean_source, &model_definition)
     })
 }
 
@@ -1625,8 +1652,9 @@ pub fn extract_clean_finite_model(
     clean_source: &str,
     model_definition: &str,
 ) -> Result<(CleanFiniteModelArtifact, CleanFiniteModel), CleanScalarModelError> {
-    on_finite_kernel_stack(|| {
-        extract_clean_finite_model_on_kernel_stack(clean_source, model_definition)
+    let (clean_source, model_definition) = (clean_source.to_owned(), model_definition.to_owned());
+    on_finite_kernel_stack(move || {
+        extract_clean_finite_model_on_kernel_stack(&clean_source, &model_definition)
     })
 }
 
@@ -1991,11 +2019,13 @@ fn applied_model_binding(
     claim_definition: &str,
     kind: AppliedModelKind,
 ) -> Result<CleanAppliedModelBinding, CleanScalarModelError> {
-    on_finite_kernel_stack(|| {
+    let (clean_source, model_definition, claim_definition) =
+        (clean_source.to_owned(), model_definition.to_owned(), claim_definition.to_owned());
+    on_finite_kernel_stack(move || {
         applied_model_binding_on_kernel_stack(
-            clean_source,
-            model_definition,
-            claim_definition,
+            &clean_source,
+            &model_definition,
+            &claim_definition,
             kind,
         )
     })
@@ -2194,7 +2224,15 @@ fn applied_model_proof(
     proof_definition: &str,
     kind: AppliedModelKind,
 ) -> Result<CleanAppliedModelProof, CleanScalarModelError> {
-    on_finite_kernel_stack(|| {
+    let owned = (
+        clean_source.to_owned(),
+        model_definition.to_owned(),
+        claim_definition.to_owned(),
+        proof_definition.to_owned(),
+    );
+    on_finite_kernel_stack(move || {
+        let (clean_source, model_definition, claim_definition, proof_definition) =
+            (owned.0.as_str(), owned.1.as_str(), owned.2.as_str(), owned.3.as_str());
         let environment = finite_environment(clean_source)?;
         let binding = applied_model_binding_in_environment(
             &environment,
@@ -2590,6 +2628,57 @@ end R5EvalProbe
             Ok(())
         })
         .expect("the isolated inversion probe must complete");
+    }
+
+    /// Trust (Clean R80 item 2; Clean R151 consumer (2); `docs/DECISION_QUEUE.md`
+    /// R80-CONSUMERS-1): an authored finite-model source is a NEW elaboration
+    /// run over the cached finite-model context, so neither prelude's
+    /// declarations may be rebound by its `attribute [implemented_by]`
+    /// command; Lean refuses both as imported. Before the fix the cache handed
+    /// out a plain `FileContext` clone, which stays in the preludes' run.
+    #[test]
+    fn finite_model_consumer_cannot_rebind_a_prelude_declaration() {
+        const FINITE: &str = "def myProjection (value : Trust.Temporal.FiniteModel.Value) : \
+                              Nat := 0\n\
+                              attribute [implemented_by myProjection] \
+                              Trust.Temporal.FiniteModel.valueNatProjection\n";
+        const TEMPORAL: &str = "def myDrop {State : Type} (b : Trust.Temporal.Behavior State) \
+                                (n : Nat) : Trust.Temporal.Behavior State := b\n\
+                                attribute [implemented_by myDrop] Trust.Temporal.drop\n";
+        let refusals = on_finite_kernel_stack(|| {
+            Ok([FINITE, TEMPORAL].map(|source| finite_environment(source).map(|_| ())))
+        })
+        .expect("the isolated finite-model worker must complete");
+        let refused = |declaration: &str| {
+            Err(CleanScalarModelError::Clean(CleanTemporalCertificateError::Elaborate {
+                unit: "authored source",
+                detail: format!(
+                    "Cannot add attribute `[implemented_by]` to declaration `{declaration}` \
+                     because it is in an imported module"
+                ),
+            }))
+        };
+        assert_eq!(
+            refusals,
+            [
+                refused("Trust.Temporal.FiniteModel.valueNatProjection"),
+                refused("Trust.Temporal.drop"),
+            ]
+        );
+    }
+
+    /// The control: the authored source's own declarations are its run's.
+    #[test]
+    fn finite_model_consumer_may_bind_its_own_declaration() {
+        const SOURCE: &str = "def mySlow (n : Nat) : Nat := n + 2\n\
+                              def myFast (n : Nat) : Nat := n + 1\n\
+                              attribute [implemented_by myFast] mySlow\n";
+        let bound = on_finite_kernel_stack(|| {
+            let environment = finite_environment(SOURCE)?;
+            Ok(environment.get_implemented_by(&Name::from_string("mySlow")).cloned())
+        })
+        .expect("a consumer may bind its own declaration");
+        assert_eq!(bound, Some(Name::from_string("myFast")));
     }
 
     // This pair is intentionally redundant test input: one explicit Rust model
@@ -3865,6 +3954,96 @@ end InhabitedFunctionExample
     }
 
     #[test]
+    fn sequence_operator_names_remain_valid_model_identifiers() {
+        assert_eq!(
+            TLA_CERTIFICATE_BUILTIN_BINDINGS,
+            &["Append", "Head", "Tail", "Len", "Seq", "SubSeq", "SelectSeq"]
+        );
+        for name in TLA_CERTIFICATE_BUILTIN_BINDINGS {
+            assert!(!TLA_RESERVED_IDENTIFIER_TOKENS.contains(name));
+            let mut clean = valid_clean_fixture("CleanSequenceIdentifier");
+            clean.variables[0].name = (*name).to_owned();
+            clean.actions[0].updates[0].var = (*name).to_owned();
+            assert_definition_error(clean, "temporal certificate builtin");
+        }
+    }
+
+    #[test]
+    fn sequence_module_actions_resolve_certify_and_freshly_replay() {
+        for name in TLA_CERTIFICATE_BUILTIN_BINDINGS {
+            let mut clean = valid_clean_fixture("CleanSequenceAction");
+            clean.actions[0].name = (*name).to_owned();
+            clean.to_model().expect("Sequences names are ordinary action identifiers");
+
+            let mut model = complete_authority_model();
+            model.actions[0].name = name;
+            let outcome = certify_model(&model);
+            assert_eq!(outcome.verdict, ModelVerdict::Proved, "action {name}");
+            let mut bound = outcome.bound.expect("renamed action must carry replayable evidence");
+            recheck_bound_clean_kernel(&mut bound).expect("renamed action must replay exactly");
+            let buggy = buggy_envelope(&model)
+                .expect("renamed action must retain a replayable Buggy=1 violation");
+            assert_eq!(buggy.violated.as_deref(), Some("Safe"));
+        }
+    }
+
+    #[test]
+    fn sequence_module_state_bindings_keep_certificate_refusal() {
+        for name in TLA_CERTIFICATE_BUILTIN_BINDINGS {
+            assert!(!TLA_RESERVED_IDENTIFIER_TOKENS.contains(name));
+            for role in ["variable", "function variable", "quantifier index", "comprehension index"]
+            {
+                let error = crate::validate_temporal_identifier(name, role)
+                    .expect_err("unsupported builtin bindings must remain refused");
+                assert!(error.contains("temporal certificate builtin"), "{error}");
+            }
+            let mut clean = valid_clean_fixture("CleanSequenceBinding");
+            clean.variables[0].name = (*name).to_owned();
+            assert_definition_error(clean, "temporal certificate builtin");
+
+            let model = Model {
+                name: "SequenceStateBinding",
+                consts: vec![("Buggy", 0)],
+                vars: vec![StateVar { name: *name, init: 0 }],
+                fn_vars: vec![],
+                actions: vec![Action {
+                    name: "Step",
+                    guard: Some(crate::le(crate::var(name), crate::int(2))),
+                    updates: vec![Update {
+                        var: *name,
+                        expr: crate::add(crate::var(name), crate::int(1)),
+                    }],
+                }],
+                invariants: vec![Invariant {
+                    name: "Safe",
+                    expr: crate::le(crate::cst("Buggy"), crate::var(name)),
+                }],
+            };
+            // Their syntax and ordinary TY resolution are valid. Certification
+            // still refuses the unsupported state binding before producing proof.
+            {
+                let _transaction = crate::in_process_ty_transaction_lock();
+                let source = model.to_tla();
+                assert!(source.contains("EXTENDS Naturals\n"));
+                assert!(!source.contains("EXTENDS Sequences"));
+                let tree = tla_core::parse_to_syntax_tree(&source);
+                let lowered = tla_core::lower(tla_core::FileId(0), &tree);
+                assert!(lowered.errors.is_empty(), "{name}: {:?}", lowered.errors);
+                let module = lowered.module.expect("the generated module must lower");
+                let resolved = tla_core::resolve(&module);
+                assert!(resolved.errors.is_empty(), "{name}: {:?}", resolved.errors);
+            }
+            let outcome = certify_model(&model);
+            assert!(matches!(
+                outcome.verdict,
+                ModelVerdict::Unknown(ref detail) if detail.contains("temporal certificate builtin")
+            ));
+            assert!(outcome.bound.is_err());
+            assert_eq!(outcome.non_vacuity, None);
+        }
+    }
+
+    #[test]
     fn reserved_identifier_mirror_tracks_the_local_ty_lexer_sources() {
         fn fixed_identifier_tokens(source: &str) -> BTreeSet<&str> {
             source
@@ -3895,6 +4074,129 @@ end InhabitedFunctionExample
         }
         let mirrored = TLA_RESERVED_IDENTIFIER_TOKENS.iter().copied().collect::<BTreeSet<_>>();
         assert_eq!(mirrored, lexer_tokens, "reserved-name validation must track ty's lexer");
+    }
+
+    /// ty db6133b11e lexes the Sequences module's operator names as `Ident`,
+    /// so the mirror no longer reserves them and a model may use them as names.
+    /// Named as the module, a constant, an action (`Next == <it>`: a
+    /// single-action spec) or an invariant of a module that EXTENDS only
+    /// Naturals, each one certifies end to end: Proved, the `Buggy = 1` mutant
+    /// caught, the kernel recheck done, the configuration bound. Named as the
+    /// state variable, each one remains outside the certificate binding lane:
+    /// decoded input validation refuses it, and a direct Model carrier receives
+    /// `Unknown` with no bound evidence or non-vacuity credit. This is independent
+    /// of the lexer accepting the spelling as an ordinary identifier.
+    #[test]
+    fn sequences_operator_names_certify_as_ordinary_identifiers() {
+        const SEQUENCES_NAMES: [&str; 7] =
+            ["Append", "Head", "Tail", "Len", "Seq", "SubSeq", "SelectSeq"];
+        const NEUTRAL: [&str; 5] = ["SequencesNames", "Limit", "x", "Step", "Safe"];
+        const VARIABLE_ROLE: usize = 2;
+
+        // [module, guard bound constant, variable, action, invariant]
+        fn fixture([module, bound, variable, action, invariant]: [&str; 5]) -> CleanScalarModel {
+            let var = || Box::new(CleanScalarExpr::Var(variable.to_owned()));
+            CleanScalarModel {
+                name: module.to_owned(),
+                constants: vec![
+                    CleanScalarConstant { name: "Buggy".to_owned(), value: 0 },
+                    CleanScalarConstant { name: bound.to_owned(), value: 2 },
+                ],
+                variables: vec![CleanScalarStateVar { name: variable.to_owned(), init: 0 }],
+                actions: vec![CleanScalarAction {
+                    name: action.to_owned(),
+                    guard: Some(CleanScalarExpr::Le(
+                        var(),
+                        Box::new(CleanScalarExpr::ConstRef(bound.to_owned())),
+                    )),
+                    updates: vec![CleanScalarUpdate {
+                        var: variable.to_owned(),
+                        value: CleanScalarExpr::Add(var(), Box::new(CleanScalarExpr::Int(1))),
+                    }],
+                }],
+                invariants: vec![CleanScalarInvariant {
+                    name: invariant.to_owned(),
+                    value: CleanScalarExpr::Le(
+                        Box::new(CleanScalarExpr::ConstRef("Buggy".to_owned())),
+                        var(),
+                    ),
+                }],
+            }
+        }
+
+        fn assert_fully_certified(
+            names: [&str; 5],
+            clean: &Model<String>,
+            outcome: crate::CertifyOutcome,
+        ) {
+            assert_eq!(outcome.verdict, ModelVerdict::Proved, "{names:?}: {:?}", outcome.bound);
+            assert_eq!(outcome.non_vacuity, Some(ModelVerdict::Proved), "{names:?}");
+            let bound = outcome
+                .bound
+                .unwrap_or_else(|error| panic!("{names:?}: no bound evidence: {error}"));
+            assert!(bound.kernel_rechecked, "{names:?}: positive evidence is kernel-rechecked");
+            bind_model_configuration(&bound, clean)
+                .unwrap_or_else(|error| panic!("{names:?}: the configuration must bind: {error}"));
+        }
+
+        // The shape itself certifies under neutral names.
+        let control = fixture(NEUTRAL).to_model().expect("the neutral fixture validates");
+        assert_fully_certified(NEUTRAL, &control, certify_model(&control));
+
+        for name in SEQUENCES_NAMES {
+            assert!(!TLA_RESERVED_IDENTIFIER_TOKENS.contains(&name), "{name}");
+            for role in 0..NEUTRAL.len() {
+                let mut names = NEUTRAL;
+                names[role] = name;
+                let [module, bound, variable, action, invariant] = names;
+                if role == VARIABLE_ROLE {
+                    let error = fixture(names)
+                        .to_model()
+                        .expect_err("builtin-spelled state bindings remain unsupported");
+                    assert!(error.to_string().contains("temporal certificate builtin"));
+                    // The public carrier is constructible without the decoded-model
+                    // adapter. It must independently preserve the same refusal.
+                    let direct = Model {
+                        name: module,
+                        consts: vec![("Buggy", 0), (bound, 2)],
+                        vars: vec![StateVar { name: variable, init: 0 }],
+                        fn_vars: vec![],
+                        actions: vec![Action {
+                            name: action,
+                            guard: Some(crate::le(crate::var(variable), crate::cst(bound))),
+                            updates: vec![Update {
+                                var: variable,
+                                expr: crate::add(crate::var(variable), crate::int(1)),
+                            }],
+                        }],
+                        invariants: vec![Invariant {
+                            name: invariant,
+                            expr: crate::le(crate::cst("Buggy"), crate::var(variable)),
+                        }],
+                    };
+                    let outcome = certify_model(&direct);
+                    assert!(
+                        matches!(outcome.verdict,
+                        ModelVerdict::Unknown(ref detail)
+                            if detail.contains("temporal certificate builtin")),
+                        "{names:?}: {:?}",
+                        outcome.verdict
+                    );
+                    assert!(outcome.bound.is_err(), "{names:?}");
+                    assert_eq!(outcome.non_vacuity, None, "{names:?}");
+                    continue;
+                }
+                let clean = fixture(names)
+                    .to_model()
+                    .unwrap_or_else(|error| panic!("{names:?}: the names must validate: {error}"));
+                let tla = clean.to_tla();
+                assert!(tla.contains(&format!("---- MODULE {module} ----\nEXTENDS Naturals\n")));
+                assert!(tla.contains(&format!("\nVARIABLES {variable}\n")));
+                assert!(tla.contains(&format!("\nNext == {action}\n")));
+                let outcome = certify_model(&clean);
+                assert_fully_certified(names, &clean, outcome);
+            }
+        }
     }
 
     #[test]
@@ -4575,5 +4877,105 @@ end InhabitedFunctionExample
         let different = model_with_deep_update(8);
         assert!(clean_finite_models_equal_stack_safe(&left, &same));
         assert!(!clean_finite_models_equal_stack_safe(&left, &different));
+    }
+
+    /// Mutation control for the per-thread cache: the finite lane must run on
+    /// persistent workers, or every call rebuilds `FiniteModel.lean`.
+    #[test]
+    fn finite_lane_runs_on_reused_workers() {
+        assert!(crate::kernel_worker::lane_reuses_a_worker(|| on_finite_kernel_stack(|| Ok(
+            crate::kernel_worker::probe_ran_on_this_thread_before()
+        ))));
+    }
+
+    /// The finite-model prelude (`clean/Trust/FiniteModel.lean`) is cached per
+    /// thread under the current worker-local policy. Pinned Clean contexts
+    /// are now Send + Sync; global sharing remains a separate optimization.
+    /// A per-thread cache must still provide the
+    /// same kernel frontier on every thread, handed out as owned clones that
+    /// authored elaboration cannot write back into. This also measures that
+    /// `FiniteModel.lean` elaborates at all, and kernel-re-checks the theorems
+    /// whose binders were renamed off the Lean keyword `local`.
+    #[test]
+    fn finite_prelude_is_per_thread_identical_and_handed_out_as_isolated_clones() {
+        const RENAMED_BINDER_SITES: [&str; 5] = [
+            "MacroEvaluationView",
+            "macroEvaluationViewOfEvaluates",
+            "FunctionEvaluationView",
+            "functionEvaluationViewOfEvaluates",
+            "exactScalarVar",
+        ];
+        const RENAMED_BINDER_THEOREMS: [&str; 3] = [
+            "macroEvaluationViewOfEvaluates",
+            "functionEvaluationViewOfEvaluates",
+            "exactScalarVar",
+        ];
+        const PROBE: &str = "ThreadLocalFinitePreludeIsolationProbe";
+
+        type Fingerprint = Vec<(String, Vec<u8>, Vec<u8>)>;
+        fn fingerprint(environment: &Environment) -> Result<Fingerprint, CleanScalarModelError> {
+            RENAMED_BINDER_SITES
+                .iter()
+                .map(|short| {
+                    let name = format!("Trust.Temporal.FiniteModel.{short}");
+                    let declaration =
+                        environment.get_const(&Name::from_string(&name)).ok_or_else(|| {
+                            CleanScalarModelError::Definition(format!("prelude lacks `{name}`"))
+                        })?;
+                    let value = declaration.value.as_ref().ok_or_else(|| {
+                        CleanScalarModelError::Definition(format!("`{name}` has no value"))
+                    })?;
+                    Ok((name, encoded(&declaration.type_)?, encoded(value)?))
+                })
+                .collect()
+        }
+
+        let probe = || {
+            on_finite_kernel_stack(|| {
+                let cold = std::time::Instant::now();
+                let (first, _) = fresh_finite_model_context()?;
+                let cold = cold.elapsed();
+                for theorem in RENAMED_BINDER_THEOREMS {
+                    crate::clean_surface::checked_theorem(
+                        &first,
+                        &format!("Trust.Temporal.FiniteModel.{theorem}"),
+                    )?;
+                }
+                let first_print = fingerprint(&first)?;
+
+                // Elaborate an authored declaration into this thread's clone...
+                let authored = finite_environment(&format!("def {PROBE} : Nat := 7\n"))?;
+                if authored.get_const(&Name::from_string(PROBE)).is_none() {
+                    return Err(CleanScalarModelError::Definition("probe not elaborated".into()));
+                }
+                // ...and the next hand-out on the same thread must not see it.
+                let warm = std::time::Instant::now();
+                let (second, _) = fresh_finite_model_context()?;
+                let warm = warm.elapsed();
+                if second.get_const(&Name::from_string(PROBE)).is_some() {
+                    return Err(CleanScalarModelError::Definition(
+                        "authored declaration leaked into the per-thread prelude cache".into(),
+                    ));
+                }
+                if fingerprint(&second)? != first_print {
+                    return Err(CleanScalarModelError::Definition(
+                        "cache hit differs from the cold build on the same thread".into(),
+                    ));
+                }
+                eprintln!("finite prelude: cold build {cold:?}, warm clone {warm:?}");
+                Ok(first_print)
+            })
+        };
+
+        // Two concurrently running threads each build their own cache.
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(probe);
+            let right = scope.spawn(probe);
+            (left.join().expect("left probe panicked"), right.join().expect("right probe panicked"))
+        });
+        let left = left.expect("finite prelude must elaborate and re-check on the left thread");
+        let right = right.expect("finite prelude must elaborate and re-check on the right thread");
+        assert_eq!(left.len(), RENAMED_BINDER_SITES.len());
+        assert_eq!(left, right, "per-thread finite preludes must be the identical frontier");
     }
 }

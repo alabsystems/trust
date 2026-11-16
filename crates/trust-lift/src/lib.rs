@@ -21,6 +21,7 @@ pub(crate) mod error;
 pub(crate) mod lifter;
 pub mod semantic_lift;
 pub(crate) mod ssa;
+pub mod stack_pointer;
 #[cfg(feature = "ay-verify")]
 pub mod validation;
 
@@ -40,3 +41,8 @@ pub use lifter::{
     entry_register_binding_prefix, summarize_function_signature,
 };
 pub use semantic_lift::LocalLayout;
+pub use stack_pointer::{
+    FramePointer, StackPointerFlow, function_entry_sp_offset, function_entry_stack_pointer,
+    lifted_entry_block, stack_pointer_after_write, stack_pointer_flow,
+    stack_pointer_flow_with_frame_pointer,
+};

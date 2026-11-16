@@ -2,8 +2,8 @@ use clippy_config::Conf;
 use clippy_utils::consts::{ConstEvalCtxt, Constant};
 use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::res::MaybeResPath;
-use clippy_utils::source::{SpanExt, snippet, snippet_with_applicability};
+use clippy_utils::res::MaybeResPath as _;
+use clippy_utils::source::{SpanExt as _, snippet, snippet_with_applicability};
 use clippy_utils::sugg::Sugg;
 use clippy_utils::ty::implements_trait;
 use clippy_utils::{
@@ -11,11 +11,11 @@ use clippy_utils::{
 };
 use rustc_ast::Mutability;
 use rustc_ast::ast::RangeLimits;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_errors::Applicability;
-use rustc_hir::{BinOpKind, Expr, ExprKind, HirId, LangItem, Node};
-use rustc_lint::{LateContext, LateLintPass, Lint};
-use rustc_middle::ty::{self, ClauseKind, GenericArgKind, PredicatePolarity, Ty};
-use rustc_session::impl_lint_pass;
+use rustc_hir::{BinOpKind, Expr, ExprKind, HirId, Node};
+use rustc_lint::{LateContext, LateLintPass, Lint, impl_lint_pass};
+use rustc_middle::ty::{self, ClauseKind, ClausePolarity, GenericArgKind, Ty};
 use rustc_span::{DesugaringKind, Span, Spanned, SyntaxContext};
 use std::cmp::Ordering;
 
@@ -149,21 +149,17 @@ declare_clippy_lint! {
     ///
     /// ### Example
     /// ```rust,no_run
-    /// fn main() {
-    ///     (10..=0).for_each(|x| println!("{}", x));
+    /// (10..=0).for_each(|x| println!("{}", x));
     ///
-    ///     let arr = [1, 2, 3, 4, 5];
-    ///     let sub = &arr[3..1];
-    /// }
+    /// let arr = [1, 2, 3, 4, 5];
+    /// let sub = &arr[3..1];
     /// ```
     /// Use instead:
     /// ```no_run
-    /// fn main() {
-    ///     (0..=10).rev().for_each(|x| println!("{}", x));
+    /// (0..=10).rev().for_each(|x| println!("{}", x));
     ///
-    ///     let arr = [1, 2, 3, 4, 5];
-    ///     let sub = &arr[1..3];
-    /// }
+    /// let arr = [1, 2, 3, 4, 5];
+    /// let sub = &arr[1..3];
     /// ```
     #[clippy::version = "1.45.0"]
     pub REVERSED_EMPTY_RANGES,
@@ -184,7 +180,7 @@ pub struct Ranges {
 
 impl Ranges {
     pub fn new(conf: &'static Conf) -> Self {
-        Self { msrv: conf.msrv }
+        Self { msrv: conf.msrv.into() }
     }
 }
 
@@ -435,7 +431,7 @@ fn can_switch_ranges<'tcx>(
                 .into_iter()
                 .any(|c| {
                     if let ClauseKind::Trait(t) = c.kind().skip_binder()
-                        && t.polarity == PredicatePolarity::Positive
+                        && t.polarity == ClausePolarity::Positive
                         && matches!(
                             cx.tcx.get_diagnostic_name(t.trait_ref.def_id),
                             Some(sym::Iterator | sym::IntoIterator | sym::RangeBounds)
@@ -523,11 +519,11 @@ fn check_range_switch<'tcx>(
     if let higher::Range {
         start,
         end: Some(end),
-        limits,
+        ty,
         span,
     } = *range
         && span.can_be_used_for_suggestions()
-        && limits == kind
+        && ty.limits() == kind
         && let Some(y) = predicate(end)
         && can_switch_ranges(cx, span.ctxt(), expr, kind, cx.typeck_results().expr_ty(y))
     {
@@ -590,7 +586,7 @@ fn check_reversed_empty_range(cx: &LateContext<'_>, expr: &Expr<'_>, range: &hig
     if let higher::Range {
         start: Some(start),
         end: Some(end),
-        limits,
+        ty: range_ty,
         span,
     } = *range
         && let ty = cx.typeck_results().expr_ty(start)
@@ -599,7 +595,7 @@ fn check_reversed_empty_range(cx: &LateContext<'_>, expr: &Expr<'_>, range: &hig
         && let Some(start_idx) = ecx.eval(start)
         && let Some(end_idx) = ecx.eval(end)
         && let Some(ordering) = Constant::partial_cmp(cx.tcx, ty, &start_idx, &end_idx)
-        && is_empty_range(limits, ordering)
+        && is_empty_range(range_ty.limits(), ordering)
     {
         if inside_indexing_expr(cx, expr) {
             // Avoid linting `N..N` as it has proven to be useful, see #5689 and #5628 ...
@@ -622,7 +618,7 @@ fn check_reversed_empty_range(cx: &LateContext<'_>, expr: &Expr<'_>, range: &hig
                     if ordering != Ordering::Equal {
                         let start_snippet = snippet(cx, start.span, "_");
                         let end_snippet = snippet(cx, end.span, "_");
-                        let dots = match limits {
+                        let dots = match range_ty.limits() {
                             RangeLimits::HalfOpen => "..",
                             RangeLimits::Closed => "..=",
                         };

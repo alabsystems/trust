@@ -4,20 +4,26 @@
 #![feature(once_cell_get_mut)]
 // tidy-alphabetical-end
 
-use rustc_hir::lang_items::LangItem;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_middle::query::TyCtxtAt;
+use rustc_middle::traits;
 use rustc_middle::ty::adjustment::CustomCoerceUnsized;
 use rustc_middle::ty::{self, Ty};
 use rustc_middle::util::Providers;
-use rustc_middle::{bug, traits};
-use rustc_span::ErrorGuaranteed;
+use rustc_span::{ErrorGuaranteed, bug};
 
 mod collector;
 mod diagnostics;
 mod graph_checks;
 mod mono_checks;
+mod offload;
 mod partitioning;
+pub mod trust_instance_census;
 mod util;
+
+// Exposed so `rustc_codegen_ssa::base::codegen_crate` can trigger the
+// host-metadata manifest write.
+pub use offload::manifest::write_host_metadata_offload_manifest;
 
 fn custom_coerce_unsize_info<'tcx>(
     tcx: TyCtxtAt<'tcx>,
@@ -49,4 +55,7 @@ fn custom_coerce_unsize_info<'tcx>(
 pub fn provide(providers: &mut Providers) {
     partitioning::provide(providers);
     mono_checks::provide(&mut providers.queries);
+    // Trust (plan step 3.3): the collector walks every item's MIR unless the trust-cg backend's
+    // F1 lane overrides this (`rustc_codegen_trust_cg::provide`).
+    providers.hooks.trust_f1_clean_origin_neighbours = |_, _| None;
 }

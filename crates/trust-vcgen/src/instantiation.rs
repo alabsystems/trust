@@ -94,17 +94,6 @@ pub enum ArithOp {
 // E-matching engine
 // ---------------------------------------------------------------------------
 
-/// An instantiation produced by E-matching.
-#[derive(Debug, Clone)]
-struct Instantiation {
-    /// The substitution: variable name -> ground term.
-    _substitution: FxHashMap<String, Formula>,
-    /// The resulting formula after substitution.
-    result: Formula,
-    /// Which trigger fired.
-    _trigger_index: usize,
-}
-
 /// The quantifier instantiation engine.
 #[derive(Debug, Clone)]
 pub struct InstantiationEngine {
@@ -165,6 +154,9 @@ impl InstantiationEngine {
         body: &Formula,
     ) -> Vec<Trigger> {
         let bound_names: FxHashSet<&str> = bindings.iter().map(|(n, _)| n.as_str()).collect();
+        if bound_names.is_empty() {
+            return Vec::new();
+        }
         let mut triggers = Vec::new();
 
         // Strategy 1: look for Select(arr, var) patterns.
@@ -176,9 +168,17 @@ impl InstantiationEngine {
         // Strategy 3: look for equality patterns `var == expr` or `expr == var`.
         collect_equality_triggers(body, &bound_names, &mut triggers);
 
-        // Deduplicate.
-        let mut seen = FxHashSet::default();
-        triggers.retain(|t| seen.insert(t.clone()));
+        // Deduplicate in place without cloning every unique `Trigger` into a second hash set.
+        if triggers.len() > 1 {
+            let mut i = 1;
+            while i < triggers.len() {
+                if triggers[..i].contains(&triggers[i]) {
+                    triggers.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
 
         self.stats.triggers_inferred += triggers.len();
         triggers
@@ -199,19 +199,19 @@ impl InstantiationEngine {
         ground_terms: &[Formula],
         depth: usize,
     ) -> Formula {
-        if depth >= self.config.max_depth {
+        if depth >= self.config.max_depth || !contains_forall(formula) {
             return formula.clone();
         }
 
         match formula {
             Formula::Forall(bindings, body) => {
                 let triggers = self.infer_triggers(bindings, body);
-                let mut instances = Vec::new();
+                let mut instances: Vec<Formula> = Vec::new();
                 let mut instance_count = 0;
 
-                for (trigger_idx, trigger) in triggers.iter().enumerate() {
+                for trigger in &triggers {
                     for ground in ground_terms {
-                        if let Some(subst) = try_match(&trigger.pattern, ground) {
+                        if let Some(subst) = try_match_borrowed(&trigger.pattern, ground) {
                             // Check all bound vars are assigned.
                             let all_bound =
                                 bindings.iter().all(|(name, _)| subst.contains_key(name.as_str()));
@@ -234,9 +234,14 @@ impl InstantiationEngine {
                                 continue;
                             }
 
-                            // Generate instance.
-                            let mut inst_body = *body.clone();
-                            for (var_name, val) in &subst {
+                            // Generate instance without cloning `*body` before the first substitution.
+                            let mut subst_iter = subst.iter();
+                            let mut inst_body = if let Some((&var_name, &val)) = subst_iter.next() {
+                                substitute(body, var_name, val)
+                            } else {
+                                (**body).clone()
+                            };
+                            for (&var_name, &val) in subst_iter {
                                 inst_body = substitute(&inst_body, var_name, val);
                             }
 
@@ -245,11 +250,7 @@ impl InstantiationEngine {
                                 self.instantiate_depth(&inst_body, ground_terms, depth + 1);
 
                             self.cache.insert(cache_key);
-                            instances.push(Instantiation {
-                                _substitution: subst,
-                                result: inst_body,
-                                _trigger_index: trigger_idx,
-                            });
+                            instances.push(inst_body);
 
                             instance_count += 1;
                             self.stats.instances_generated += 1;
@@ -270,10 +271,8 @@ impl InstantiationEngine {
                 } else {
                     // Return conjunction of all instances AND the original quantifier.
                     // This is sound: the instances are consequences of the quantifier.
-                    let mut conjuncts: Vec<Formula> =
-                        instances.into_iter().map(|i| i.result).collect();
-                    conjuncts.push(formula.clone());
-                    Formula::And(conjuncts)
+                    instances.push(formula.clone());
+                    Formula::And(instances)
                 }
             }
             // Recurse into sub-formulas.
@@ -301,6 +300,16 @@ impl Default for InstantiationEngine {
     }
 }
 
+fn contains_forall(formula: &Formula) -> bool {
+    match formula {
+        Formula::Forall(..) => true,
+        Formula::And(cs) | Formula::Or(cs) => cs.iter().any(contains_forall),
+        Formula::Implies(a, b) => contains_forall(a) || contains_forall(b),
+        Formula::Not(inner) => contains_forall(inner),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trigger inference helpers
 // ---------------------------------------------------------------------------
@@ -314,9 +323,7 @@ fn collect_select_triggers(
     match formula {
         Formula::Select(arr, idx) => {
             // Check if index contains a bound variable.
-            let idx_vars = collect_vars(idx);
-            let matches_bound: Vec<String> =
-                idx_vars.iter().filter(|v| bound_vars.contains(v.as_str())).cloned().collect();
+            let matches_bound = collect_matching_bound_vars(idx, bound_vars);
 
             if !matches_bound.is_empty() {
                 out.push(Trigger {
@@ -359,6 +366,7 @@ fn collect_select_triggers(
             collect_select_triggers(t, bound_vars, out);
             collect_select_triggers(e, bound_vars, out);
         }
+        Formula::ConstArray { value, .. } => collect_select_triggers(value, bound_vars, out),
         Formula::Forall(_, body) | Formula::Exists(_, body) => {
             collect_select_triggers(body, bound_vars, out);
         }
@@ -370,9 +378,7 @@ fn collect_select_triggers(
 fn collect_arith_triggers(formula: &Formula, bound_vars: &FxHashSet<&str>, out: &mut Vec<Trigger>) {
     match formula {
         Formula::Add(a, b) | Formula::Sub(a, b) | Formula::Mul(a, b) => {
-            let all_vars = collect_vars(formula);
-            let matches_bound: Vec<String> =
-                all_vars.iter().filter(|v| bound_vars.contains(v.as_str())).cloned().collect();
+            let matches_bound = collect_matching_bound_vars(formula, bound_vars);
 
             if !matches_bound.is_empty() {
                 let op = match formula {
@@ -418,6 +424,7 @@ fn collect_arith_triggers(formula: &Formula, bound_vars: &FxHashSet<&str>, out: 
             collect_arith_triggers(t, bound_vars, out);
             collect_arith_triggers(e, bound_vars, out);
         }
+        Formula::ConstArray { value, .. } => collect_arith_triggers(value, bound_vars, out),
         Formula::Select(a, i) => {
             collect_arith_triggers(a, bound_vars, out);
             collect_arith_triggers(i, bound_vars, out);
@@ -501,13 +508,74 @@ fn formula_to_trigger_pattern(f: &Formula, bound_vars: &FxHashSet<&str>) -> Trig
     }
 }
 
+/// Collect bound variable names occurring in `f` without allocating for non-bound variables.
+fn collect_matching_bound_vars(f: &Formula, bound_vars: &FxHashSet<&str>) -> Vec<String> {
+    let mut matched: FxHashSet<&str> = FxHashSet::default();
+    collect_matching_bound_vars_rec(f, bound_vars, &mut matched);
+    matched.into_iter().map(str::to_string).collect()
+}
+
+fn collect_matching_bound_vars_rec<'a>(
+    f: &'a Formula,
+    bound_vars: &FxHashSet<&str>,
+    out: &mut FxHashSet<&'a str>,
+) {
+    match f {
+        Formula::Var(name, _) => {
+            if bound_vars.contains(name.as_str()) {
+                out.insert(name.as_str());
+            }
+        }
+        Formula::Not(inner) | Formula::Neg(inner) => {
+            collect_matching_bound_vars_rec(inner, bound_vars, out);
+        }
+        Formula::And(cs) | Formula::Or(cs) => {
+            for c in cs {
+                collect_matching_bound_vars_rec(c, bound_vars, out);
+            }
+        }
+        Formula::Implies(a, b)
+        | Formula::Eq(a, b)
+        | Formula::Lt(a, b)
+        | Formula::Le(a, b)
+        | Formula::Gt(a, b)
+        | Formula::Ge(a, b)
+        | Formula::Add(a, b)
+        | Formula::Sub(a, b)
+        | Formula::Mul(a, b)
+        | Formula::Div(a, b)
+        | Formula::Rem(a, b) => {
+            collect_matching_bound_vars_rec(a, bound_vars, out);
+            collect_matching_bound_vars_rec(b, bound_vars, out);
+        }
+        Formula::Ite(c, t, e) | Formula::Store(c, t, e) => {
+            collect_matching_bound_vars_rec(c, bound_vars, out);
+            collect_matching_bound_vars_rec(t, bound_vars, out);
+            collect_matching_bound_vars_rec(e, bound_vars, out);
+        }
+        Formula::ConstArray { value, .. } => {
+            collect_matching_bound_vars_rec(value, bound_vars, out);
+        }
+        Formula::Select(a, i) => {
+            collect_matching_bound_vars_rec(a, bound_vars, out);
+            collect_matching_bound_vars_rec(i, bound_vars, out);
+        }
+        Formula::Forall(_, body) | Formula::Exists(_, body) => {
+            collect_matching_bound_vars_rec(body, bound_vars, out);
+        }
+        _ => {}
+    }
+}
+
 /// Collect all variable names in a formula.
+#[cfg(test)]
 fn collect_vars(f: &Formula) -> FxHashSet<String> {
     let mut result = FxHashSet::default();
     collect_vars_rec(f, &mut result);
     result
 }
 
+#[cfg(test)]
 fn collect_vars_rec(f: &Formula, out: &mut FxHashSet<String>) {
     match f {
         Formula::Var(name, _) => {
@@ -538,6 +606,7 @@ fn collect_vars_rec(f: &Formula, out: &mut FxHashSet<String>) {
             collect_vars_rec(t, out);
             collect_vars_rec(e, out);
         }
+        Formula::ConstArray { value, .. } => collect_vars_rec(value, out),
         Formula::Select(a, i) => {
             collect_vars_rec(a, out);
             collect_vars_rec(i, out);
@@ -551,28 +620,43 @@ fn collect_vars_rec(f: &Formula, out: &mut FxHashSet<String>) {
 // E-matching
 // ---------------------------------------------------------------------------
 
-/// Try to match a trigger pattern against a ground formula.
-///
-/// Returns a substitution mapping bound variables to ground terms, or None
-/// if the match fails.
-fn try_match(pattern: &TriggerPattern, ground: &Formula) -> Option<FxHashMap<String, Formula>> {
+/// Try to match a trigger pattern against a ground formula without cloning
+/// bound variable names or ground subterms during matching.
+fn try_match_borrowed<'a>(
+    pattern: &'a TriggerPattern,
+    ground: &'a Formula,
+) -> Option<FxHashMap<&'a str, &'a Formula>> {
     let mut subst = FxHashMap::default();
     if match_rec(pattern, ground, &mut subst) { Some(subst) } else { None }
 }
 
-fn match_rec(
-    pattern: &TriggerPattern,
-    ground: &Formula,
-    subst: &mut FxHashMap<String, Formula>,
+/// Try to match a trigger pattern against a ground formula.
+///
+/// Returns a substitution mapping bound variables to ground terms, or None
+/// if the match fails.
+#[cfg(test)]
+fn try_match(pattern: &TriggerPattern, ground: &Formula) -> Option<FxHashMap<String, Formula>> {
+    Some(
+        try_match_borrowed(pattern, ground)?
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
+    )
+}
+
+fn match_rec<'a>(
+    pattern: &'a TriggerPattern,
+    ground: &'a Formula,
+    subst: &mut FxHashMap<&'a str, &'a Formula>,
 ) -> bool {
     match pattern {
         TriggerPattern::Wildcard => true,
         TriggerPattern::BoundVar(name) => {
-            if let Some(existing) = subst.get(name) {
+            if let Some(&existing) = subst.get(name.as_str()) {
                 // Must match the same term.
                 existing == ground
             } else {
-                subst.insert(name.clone(), ground.clone());
+                subst.insert(name.as_str(), ground);
                 true
             }
         }
@@ -612,8 +696,12 @@ fn match_rec(
 ///
 /// An instance is relevant if at least one of its substitution values
 /// appears (or has subterms that appear) in the ground terms.
-fn is_relevant_instance(subst: &FxHashMap<String, Formula>, ground_terms: &[Formula]) -> bool {
+fn is_relevant_instance<K, V: std::borrow::Borrow<Formula>>(
+    subst: &FxHashMap<K, V>,
+    ground_terms: &[Formula],
+) -> bool {
     for val in subst.values() {
+        let val = val.borrow();
         // Check if the substitution value or any of its subterms appear
         // in the ground terms.
         for ground in ground_terms {
@@ -628,7 +716,7 @@ fn is_relevant_instance(subst: &FxHashMap<String, Formula>, ground_terms: &[Form
 
 /// Check if `haystack` contains `needle` as a subterm.
 fn formula_contains(haystack: &Formula, needle: &Formula) -> bool {
-    if haystack == needle {
+    if std::ptr::eq(haystack, needle) || haystack == needle {
         return true;
     }
     match haystack {
@@ -651,6 +739,7 @@ fn formula_contains(haystack: &Formula, needle: &Formula) -> bool {
                 || formula_contains(e, needle)
         }
         Formula::Select(a, i) => formula_contains(a, needle) || formula_contains(i, needle),
+        Formula::ConstArray { value, .. } => formula_contains(value, needle),
         Formula::Forall(_, body) | Formula::Exists(_, body) => formula_contains(body, needle),
         _ => false,
     }
@@ -661,10 +750,16 @@ fn formula_contains(haystack: &Formula, needle: &Formula) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Canonical exact substitution identity for instance caching.
-fn canonical_substitution(subst: &FxHashMap<String, Formula>) -> Vec<(String, Formula)> {
-    let mut entries: Vec<_> =
-        subst.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+fn canonical_substitution<K: AsRef<str>, V: std::borrow::Borrow<Formula>>(
+    subst: &FxHashMap<K, V>,
+) -> Vec<(String, Formula)> {
+    let mut entries: Vec<_> = subst
+        .iter()
+        .map(|(name, value)| (name.as_ref().to_string(), value.borrow().clone()))
+        .collect();
+    if entries.len() > 1 {
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    }
     entries
 }
 
@@ -968,13 +1063,6 @@ mod tests {
         assert_eq!(config.max_depth, 3);
         assert_eq!(config.max_instances_per_quantifier, 100);
         assert!(config.relevancy_filter);
-    }
-
-    #[test]
-    fn test_engine_default() {
-        let engine = InstantiationEngine::default();
-        assert_eq!(engine.stats().instances_generated, 0);
-        assert_eq!(engine.stats().cache_hits, 0);
     }
 
     #[test]

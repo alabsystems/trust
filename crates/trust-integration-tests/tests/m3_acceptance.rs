@@ -138,6 +138,7 @@ fn make_checked_binop(name: &str, def_path: &str, op: BinOp) -> VerifiableFuncti
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -181,6 +182,7 @@ fn make_division(name: &str, def_path: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -227,6 +229,7 @@ fn make_array_index(name: &str, def_path: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -288,6 +291,7 @@ fn make_with_contract(name: &str, def_path: &str) -> VerifiableFunction {
             Box::new(Formula::Int(4_294_967_295)),
         )],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -311,6 +315,7 @@ fn make_noop(name: &str, def_path: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -586,6 +591,7 @@ fn test_m3_cross_function_contracts() {
             Box::new(Formula::Var("a".into(), Sort::Int)),
         )],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // Function B: double_safe that calls safe_add (with its own contract)
@@ -655,6 +661,7 @@ fn test_m3_cross_function_contracts() {
             Box::new(Formula::Var("x".into(), Sort::Int)),
         )],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // Generate VCs for both functions.
@@ -815,45 +822,35 @@ fn fixtures_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures").join("real_mir")
 }
 
-/// Load all real MIR fixtures from the fixtures directory.
-///
-/// Returns an empty vec if fixtures have not been generated yet.
+/// Load every checked-in `test_functions__*.json` real MIR fixture (this
+/// excludes `coverage_manifest.json`). The corpus is REQUIRED
+/// (NO-VACUOUS-CORPUS-TEST): an unreadable directory or entry, an unparseable
+/// fixture, or an empty result panics naming the path — never a silent skip.
 fn load_all_real_mir_fixtures() -> Vec<(String, VerifiableFunction)> {
     let dir = fixtures_dir();
-    if !dir.exists() {
-        return vec![];
-    }
     let mut fixtures = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("read fixtures dir") {
-        let entry = entry.expect("read dir entry");
+    for entry in std::fs::read_dir(&dir).unwrap_or_else(|error| {
+        panic!("read required fixture directory {}: {error}", dir.display())
+    }) {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!("read entry in required fixture directory {}: {error}", dir.display())
+        });
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
         let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        if !name.starts_with("test_functions__") {
+            continue;
+        }
         let json = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-        match serde_json::from_str::<VerifiableFunction>(&json) {
-            Ok(func) => fixtures.push((name, func)),
-            Err(e) => {
-                eprintln!("WARNING: skipping invalid fixture {}: {e}", path.display());
-            }
-        }
+        let func = serde_json::from_str::<VerifiableFunction>(&json)
+            .unwrap_or_else(|error| panic!("failed to parse fixture {}: {error}", path.display()));
+        fixtures.push((name, func));
     }
+    assert!(!fixtures.is_empty(), "no required real MIR fixtures found in {}", dir.display());
     fixtures
-}
-
-/// Skip a test if no real MIR fixtures are available.
-macro_rules! require_real_fixtures {
-    ($fixtures:expr) => {
-        if $fixtures.is_empty() {
-            eprintln!(
-                "SKIPPING: No real MIR fixtures found. Generate with:\n  \
-                 ./scripts/generate_mir_fixtures.sh"
-            );
-            return;
-        }
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -863,7 +860,6 @@ macro_rules! require_real_fixtures {
 #[test]
 fn test_m3_real_mir_pipeline_at_scale() {
     let fixtures = load_all_real_mir_fixtures();
-    require_real_fixtures!(fixtures);
 
     let router = trust_router::Router::new();
 
@@ -917,7 +913,6 @@ fn test_m3_real_mir_pipeline_at_scale() {
 #[test]
 fn test_m3_real_mir_mixed_synthetic_and_real() {
     let real_fixtures = load_all_real_mir_fixtures();
-    require_real_fixtures!(real_fixtures);
 
     // Combine 120 synthetic functions with all real MIR fixtures.
     let synthetic = generate_synthetic_crate(120);
@@ -976,7 +971,6 @@ fn test_m3_real_mir_mixed_synthetic_and_real() {
 #[test]
 fn test_m3_real_mir_vc_categories() {
     let fixtures = load_all_real_mir_fixtures();
-    require_real_fixtures!(fixtures);
 
     let mut vc_counts_by_kind: FxHashMap<String, usize> = FxHashMap::default();
     let mut total_vcs = 0usize;

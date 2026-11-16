@@ -10,7 +10,46 @@ cargo-report --- Generate and display various kinds of reports
 
 ## DESCRIPTION
 
-Displays a report of the given _type_ --- currently, only `future-incompat` is supported
+Displays a report of the given _type_: `future-incompat`, or the unstable
+`timings`, `sessions`, `rebuilds`, `cache-work`, and `execution` reports.
+
+### Native rebuild classifications (unstable)
+
+`targo -Zbuild-analysis report rebuilds --id RUN --json` prints one
+`targo-rebuilds-v1` JSON object. Sessions are produced with `-Zbuild-analysis`
+and `build.analysis.enabled = true`. Omit `--id` to select the latest matching
+workspace session. Without `--json`, the human report keeps its existing format.
+Expanded impact traversal is bounded and excessive expansion is an error before
+report output. Use `--json` to inspect the compact dependency graph in that case.
+
+The JSON scope is `observed-fingerprint-classifications`. It records
+`registered_units`, `classified_units`, `unclassified_units`, and
+`observed_counts` (`cached`, `dirty`, `new`). These are fingerprint observations,
+not compiler process counts or proof grades. A `new` classification does not
+establish that the cache has never contained that unit.
+
+`stream_completeness` is `complete` only for a validated closed stream, otherwise
+`unavailable` for legacy logs. `input_accounting` is `finalized` only when the
+input-finalization record was observed, otherwise `unavailable`. Neither a closed
+stream nor finalized accounting establishes complete unit classification.
+
+`units` are sorted by their session-local numeric `index`. Each row keeps its
+`package_id`, `target` (`name` and `kind`), `mode`, `platform`, sorted `features`,
+`requested`, and sorted `dependencies`. The index is not a cross-run cache
+identity. A missing classification is `fingerprint: null`; an observed one has
+`status` (`new`, `dirty`, or `fresh`), a payload-free `reason` category or `null`,
+and `rechecked`. A marked post-lock recheck replaces the classification without
+adding a unit to the counts. Reason categories reuse the existing typed producer
+projection; paths, flags, environment names and values, and other diagnostic
+payloads are not exported. `rustc-changed` reports that classification, without
+claiming that a physical compiler file changed.
+
+`non_cached_dependency_frontier_roots` contains sorted indices from the existing
+rebuild topology, including both new and dirty units without a non-cached
+dependency. Exact edges remain in each unit's `dependencies`. JSON does not
+compute or export transitive impact lists. These relations do not establish
+causal CPU costs, actual compiler execution, cache validity, or proof authority.
+Malformed or incomplete current log protocols remain errors before JSON output.
 
 ## OPTIONS
 

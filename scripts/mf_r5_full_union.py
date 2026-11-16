@@ -14,7 +14,11 @@ no ambient evidence:
   recorded in the receipt as ``tracked_but_unpinned`` and are not asserted on;
   a pinned probe that goes missing, or whose bytes move, still fails closed;
 * the selected stage-1 ``trustc`` must identify the root HEAD exactly, and every
-  entry in its complete stage1 tree is hashed before and after the sweep;
+  entry in its complete stage1 tree is hashed before and after the sweep.  A dev
+  stage-1 build names its sources rather than HEAD (bootstrap's
+  ``src/bootstrap/src/utils/trust_source_identity.rs``); its build directory's
+  ``trust-source-identity`` record must then digest to that name, have been taken
+  at the root HEAD, and name no uncommitted change;
 * every probe is freshly compiled at O0 and O3 into a nonexistent destination;
 * every run must publish exactly one v2 coverage document, and the independent
   consumer-side lineage gate must validate set integrity, coverage, presence,
@@ -951,8 +955,9 @@ def trustc_identity(root: Path, trustc: Path, expected_head: str) -> dict[str, A
     if fields.get("binary") != "trustc":
         raise GateError("stage1 compiler does not identify as canonical binary `trustc`")
     commit = fields.get("commit-hash", "")
-    if COMMIT_HASH.fullmatch(commit) is None or commit != expected_head:
-        raise GateError(f"stage1 trustc commit {commit!r} does not equal root HEAD {expected_head}")
+    if COMMIT_HASH.fullmatch(commit) is None:
+        raise GateError(f"stage1 trustc commit {commit!r} is not a 40-hex identity")
+    sources = None if commit == expected_head else source_identity(trustc, commit, expected_head)
     return {
         "path": str(trustc.relative_to(root)),
         "sha256": sha256_file(trustc),
@@ -961,7 +966,55 @@ def trustc_identity(root: Path, trustc: Path, expected_head: str) -> dict[str, A
         "verbose": verbose,
         "verbose_sha256": sha256_bytes(result.stdout),
         "commit_hash": commit,
+        "source_identity": sources,
     }
+
+
+# v2 (EW-9) digests the configuration with the checkout root written as a token; a
+# build directory last built before it still holds a v1 record of the same shape.
+SOURCE_IDENTITY_SCHEMAS = (
+    b"trust-dev-source-identity/v1\n",
+    b"trust-dev-source-identity/v2\n",
+)
+
+
+def source_identity(trustc: Path, commit: str, expected_head: str) -> dict[str, Any]:
+    """Bind a dev stage-1 ``trustc``'s source identity to the root HEAD.
+
+    The build directory (``<out>/<host>/stage1/bin/trustc``) holds the record that
+    bootstrap digested into ``commit-hash``: ``head``, ``identity`` and ``date``
+    lines, then the record itself.
+    """
+    record_file = trustc.parents[3] / "trust-source-identity"
+    try:
+        data = record_file.read_bytes()
+    except OSError as error:
+        raise GateError(
+            f"stage1 trustc commit {commit} is not root HEAD {expected_head}, and its build "
+            f"directory holds no source-identity record ({record_file}): {error}"
+        ) from error
+    parts = data.split(b"\n", 3)
+    if len(parts) != 4 or not parts[3].startswith(SOURCE_IDENTITY_SCHEMAS):
+        raise GateError(f"{record_file} is not a source-identity record")
+    head, identity, _date, record = parts
+    if identity != f"identity {commit}".encode() or sha256_bytes(record)[:40] != commit:
+        raise GateError(
+            f"{record_file} names another build than stage1 trustc {commit}; "
+            "rebuild stage 1"
+        )
+    if head != f"head {expected_head}".encode():
+        raise GateError(
+            f"stage1 trustc's sources were named at {head[5:].decode(errors='replace')}, "
+            f"not root HEAD {expected_head}; `x.py build --stage 1` names them again "
+            "(it rebuilds nothing when the commits since changed only docs/, reports/, "
+            "scripts/, tests/ or top-level Markdown)"
+        )
+    # A departure from HEAD is a `path`, `submodule` or `repo` line (an edit, a
+    # submodule's own commit or edit, an untracked repository).
+    departures = (b"path ", b"submodule ", b"repo ")
+    if any(line.startswith(departures) for line in record.split(b"\n")):
+        raise GateError("stage1 trustc was built from a worktree with uncommitted changes")
+    return {"record": str(record_file), "record_sha256": sha256_bytes(data)}
 
 
 def clean_environment(home: Path, temporary: Path) -> dict[str, str]:

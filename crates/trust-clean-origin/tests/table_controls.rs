@@ -31,9 +31,10 @@ use std::collections::BTreeSet;
 
 use trust_clean_origin::CleanOriginShape;
 use trust_clean_origin::table::{
-    CalleeSelector, CarrierClass, DEMANDS, DemandStatus, MirAliasing, MirShape, ROWS, ReflectSpec,
-    RowContext, SelectionRow, TotalityDemand, UnwindDiscipline, coverage_basis_points,
-    covered_demands, ladder_row, missing_demands, no_selection_row, row,
+    AnchoredCarriers, CalleeSelector, CarrierAnchor, CarrierClass, DEMANDS, DemandStatus,
+    MirAliasing, MirShape, ROWS, ReflectSpec, RowContext, SelectionRow, TotalityDemand,
+    UnwindDiscipline, coverage_basis_points, covered_demands, ladder_row, missing_demands,
+    no_selection_row, row, rows_selecting_head, whole_body_refusal,
 };
 use trust_types::admissible_body::{
     ArithBinOp, ArithExpr, ArithOperand, PrimitiveCallee, RawBinOpKind, RecBodyExpr, SelectCmp,
@@ -109,7 +110,8 @@ use trust_types::admissible_body::{
 ///   soundness boundary rather than a capability one.
 /// * `^^^` / `<<<` / `>>>` — blocked in `first-party/clean`'s PRELUDE (no
 ///   `HXor`/`HShiftLeft`/`HShiftRight` instance at a `UInt{N}` carrier), with
-///   side B already able to elaborate all three.
+///   side B already able to elaborate all three. (True at landing 7; the clean
+///   pin `bf31976f48` lifted it — see the 2026-09-23 paragraph below.)
 /// * a NESTED raw-binop tree — measured GREEN at the kernel, blocked on the
 ///   emitted realization, because the wrapping family composes as a call chain
 ///   and this family as a single statement.
@@ -234,7 +236,40 @@ use trust_types::admissible_body::{
 /// `table.rs`, because one of its three stated blockers was not retired but
 /// WRONG: it claimed `gcd` sat behind the variable-divisor soundness boundary,
 /// which is a `MachineUInt` entry. That entry is unmoved and still refuses.
-const PINNED_COVERAGE_BASIS_POINTS: usize = 6_829;
+///
+/// **W6, 2026-09-13 — Rust calls a Clean comparison returned as `Bool`.** Three
+/// rows (`comparison.{lt,le,eq}`) flip three demands from absent to SERVED, and
+/// ONE newly measured absence enters the denominator in the same commit: a
+/// comparison against a NUMERAL operand (`a < 10 : Bool`), whose Nat-reduced
+/// Decidable instance is not definitionally equal to the frozen
+/// `admit_comparison_function`'s carrier-instance mint (refused fail-closed by
+/// the gate, measured). So 29/42 becomes 32/46, and `32 * 10_000 / 46 = 6_956`
+/// under the ledger's integer division.
+///
+/// **W6, 2026-09-13 (second increment) — Rust calls a Clean boolean connective.**
+/// Three rows (`bool.{not,and,or}`) flip three demands from absent to SERVED —
+/// `not b`, `a && b`, `a || b` over `Bool` parameters, minted by the AUTHORED
+/// `admit_bool_value_function` as `Bool.not`/`Bool.and`/`Bool.or` (def-eq to the
+/// island's `not`/`and`/`or`). No new absence enters the denominator. So 32/46
+/// becomes 35/49, and `35 * 10_000 / 49 = 7_142`.
+///
+/// **2026-09-23 — `^^^` and `>>>`, two rows at once, and the number went DOWN
+/// for the fourth time with the same cause.** The clean pin `bf31976f48` gave
+/// the prelude `HXor`/`HShiftLeft`/`HShiftRight` and `landing7_selection_
+/// probes::l7_p7`'s tripwire fired. The ONE entry it guarded (`^^^` / `<<<` /
+/// `>>>`, Missing) is SPLIT into four, because the three operators went three
+/// ways: `^^^` SERVED (`uint.xor`); `>>>` at a numeral amount below the width
+/// SERVED (`uint.shr`); `>>>` at a variable or out-of-range amount MISSING — a
+/// side-B capability boundary, not a soundness one, since Lean and MIR both
+/// reduce the amount modulo the width (l7_p14); and `<<<` MISSING — it
+/// elaborates, and swept over every amount the gate admits the frozen
+/// producer's `UInt{N}.mul` reading at exactly `k = 1` (the function `uint.mul`
+/// already serves as `a * 2`) and refuses every other amount below the width
+/// (l7_p7), so no row. So one Missing entry leaves and two
+/// Covered plus two Missing arrive: 35/49 becomes 37/52, and
+/// `37 * 10_000 / 52 = 7_115` under the ledger's integer division — a smaller
+/// fraction over a strictly larger served surface.
+const PINNED_COVERAGE_BASIS_POINTS: usize = 7_115;
 
 /// The row set the table ships. Named here so that ADDING a row is a visible
 /// edit to a control, never an invisible widening.
@@ -266,7 +301,13 @@ const PINNED_COVERAGE_BASIS_POINTS: usize = 6_829;
 /// `nat.sub` — because `Rem` names a different kernel constant (`Nat.mod`)
 /// through a different runtime callee (`Nat::rem`), so sharing would be the
 /// MIR aliasing H-C forbids.
-const PINNED_ROW_COUNT: usize = 22;
+/// 2026-09-23: 31. `uint.xor` and `uint.shr` — each a `MirShape::RawBinOp`
+/// value no other row realizes, measured first (`landing7_selection_probes`
+/// l7_p11..l7_p15 put side A, the frozen side B and the gate to the kernel at
+/// every width), then witnessed from real sources (`control_14`'s `bitxor`,
+/// `bitxor-u32` and `shr-literal`). There is no `uint.shl`, by measurement
+/// (l7_p7).
+const PINNED_ROW_COUNT: usize = 31;
 
 // ── well-formedness ────────────────────────────────────────────────────────
 
@@ -527,7 +568,10 @@ fn h_d_every_non_frozen_reflection_names_its_tcb_row() {
             ReflectSpec::KernelConst(_)
             | ReflectSpec::KernelNatLiteral
             | ReflectSpec::BinderSite
-            | ReflectSpec::SchemeScaffold => assert!(
+            | ReflectSpec::SchemeScaffold
+            // W5: the Rust-callee application is a Trust-authored producer
+            // (`reflect_rust_call`), so it too must name its TCB row.
+            | ReflectSpec::RustCalleeConst => assert!(
                 candidate.tcb_row.is_some(),
                 "row `{}` reflects through a Trust-authored producer, which CANNOT ride the \
                  frozen-R/E6 pedigree, and names no `docs/TCB.md` row. §6f: a new trusted \
@@ -555,6 +599,19 @@ fn h_f_only_scheme_rows_demand_termination() {
                 "scheme row `{}` demands no termination evidence. A recursion the kernel does \
                  not certify total is not callable, and omitting the field is exactly how \
                  that boundary erodes.",
+                candidate.name
+            ),
+            // W5 (Lean-calls-Rust): the ONE body row whose totality is not
+            // the kernel's. It cannot recur, but the binary computes its
+            // total Clean term only if every Rust callee RETURNS, and that
+            // evidence is the callee's E6 facets, charged outside the kernel.
+            // The demand is named rather than defaulted to `None` precisely
+            // so this control has to see it.
+            RowContext::Body if candidate.mir == MirShape::RustCallChain => assert_eq!(
+                candidate.totality,
+                TotalityDemand::RustCalleeFacets,
+                "row `{}` calls user Rust code; its totality rests on the callee's facets, \
+                 and the row must say so",
                 candidate.name
             ),
             RowContext::Body | RowContext::RecursionArm => assert_eq!(
@@ -597,6 +654,13 @@ fn h_g_the_unwind_discipline_matches_the_realization() {
             MirShape::OperandCopy
             | MirShape::InlineScalar
             | MirShape::ComparisonBranch(_)
+            // W6 (Rust-calls-Clean): a comparison returned as a `Bool` value is
+            // one `Rvalue::BinaryOp` instruction and no call — no unwind edge.
+            | MirShape::ComparisonValue(_)
+            // W6: a boolean connective/negation is one bare `BinaryOp`/`UnaryOp`
+            // and no call — no unwind edge.
+            | MirShape::BoolConnValue(_)
+            | MirShape::BoolNotValue
             // §6f landing 6: the two-step `==` diamond is two comparisons and a
             // switch — one more instruction than the one-step diamond and still
             // not a call, so still no unwind edge.
@@ -615,7 +679,11 @@ fn h_g_the_unwind_discipline_matches_the_realization() {
             }
             MirShape::Call(CalleeSelector::Fixed(_))
             | MirShape::ZeroTestBranch
-            | MirShape::SelfCall => UnwindDiscipline::Continue,
+            | MirShape::SelfCall
+            // W5 (Lean-calls-Rust): a call into USER code, which may panic
+            // and may unwind. `Continue` is the honest edge; the callee's
+            // panic-freedom is an ordinary obligation of that `fn`.
+            | MirShape::RustCallChain => UnwindDiscipline::Continue,
         };
         assert_eq!(
             candidate.unwind, expected,
@@ -624,11 +692,15 @@ fn h_g_the_unwind_discipline_matches_the_realization() {
             candidate.name, candidate.unwind, candidate.mir
         );
         if candidate.unwind == UnwindDiscipline::Continue {
-            assert_eq!(
-                candidate.carrier,
-                CarrierClass::BignumNat,
-                "row `{}` carries an unwind edge but is not at the carrier whose runtime can \
-                 abort. `Continue` is a statement about the callee, not a default.",
+            // `Continue` is a statement about the CALLEE: the bignum runtime
+            // can abort on allocation, and (W5) a user `fn` can do anything.
+            // No other realization may claim it.
+            let callee_can_unwind = candidate.carrier == CarrierClass::BignumNat
+                || candidate.mir == MirShape::RustCallChain;
+            assert!(
+                callee_can_unwind,
+                "row `{}` carries an unwind edge but calls neither the bignum runtime nor user \
+                 code. `Continue` is a statement about the callee, not a default.",
                 candidate.name
             );
         }
@@ -723,6 +795,19 @@ fn h_h_every_ladder_rung_maps_onto_a_row() {
             left: ArithOperand::Param(0),
             right: ArithOperand::Const(3),
         },
+        // 2026-09-23: the two rungs clean `bf31976f48` unlocked. The shift
+        // carries a numeral amount below the width because that is the only
+        // amount this shape plans (`landing7_selection_probes::l7_p14`).
+        CleanOriginShape::RawBinOp {
+            op: RawBinOpKind::BitXor,
+            left: ArithOperand::Param(0),
+            right: ArithOperand::Param(1),
+        },
+        CleanOriginShape::RawBinOp {
+            op: RawBinOpKind::Shr,
+            left: ArithOperand::Param(0),
+            right: ArithOperand::Const(3),
+        },
         CleanOriginShape::StructuralNatRec {
             base: RecBodyExpr::NatConst(0),
             step: RecBodyExpr::Rec,
@@ -734,6 +819,21 @@ fn h_h_every_ladder_rung_maps_onto_a_row() {
             rec_args: vec![RecBodyExpr::Pred],
             measure_index: 0,
             lowering: trust_clean_origin::WfLowering::OnParameter,
+        },
+        // W5 (Lean-calls-Rust): the Rust-call chain rung, `inc (inc x)`.
+        CleanOriginShape::RustCallChain {
+            nodes: vec![
+                trust_clean_origin::RustCallNode {
+                    callee: 0,
+                    args: vec![trust_clean_origin::RustCallArg::Param(0)],
+                    let_binding: None,
+                },
+                trust_clean_origin::RustCallNode {
+                    callee: 0,
+                    args: vec![trust_clean_origin::RustCallArg::Node(0)],
+                    let_binding: None,
+                },
+            ],
         },
     ];
     for rung in &rungs {
@@ -851,6 +951,300 @@ fn a_row_miss_is_a_named_refusal_with_options() {
             note.contains(candidate.name),
             "row `{}` is missing from the row-derived enumeration",
             candidate.name
+        );
+    }
+}
+
+/// **A head a row selects is never cited as a row miss — and a row is asked at
+/// ITS OWN position.**
+///
+/// `rows_selecting_head` is the table's answer to the question
+/// `no_selection_row`'s text used to answer "none" to unconditionally. This
+/// control asks it with head spellings written HERE, independently of
+/// `KernelSelector::selects_head` — one per constant-keyed side-A selector of
+/// every row — each in a body whose positions are the ones that row family is
+/// stated over, and requires the selecting rows AND the carrier they are cited
+/// at to be exactly the expected ones. It also requires every row of the table
+/// to be accounted for, either in the spelling list or in the list of rows
+/// keyed on no constant name, so a new row fails this control until someone
+/// says which head selects it.
+///
+/// The second half is the refutation of 2026-09-23 made permanent: a row is
+/// matched at the carrier of the position IT is stated over, never at one
+/// carrier assumed for the whole body. `ite` in a `Bool`-VALUED body selects no
+/// `select.*` row; `decide` selects the `comparison.*` rows only at a compared
+/// width (not at the result, not at the parameters); `and`/`or`/`Bool.not` are
+/// cited at their `Bool` operands' class and never at a machine width; and
+/// every such miss keeps `no_selection_row` at the RESULT's class,
+/// byte-for-byte.
+#[test]
+fn a_selected_head_is_not_cited_as_a_row_miss() {
+    use CarrierClass::{AnyExact, BignumNat, MachineUInt};
+    // The positions of a body, written out per family.
+    let result = AnchoredCarriers::result_only;
+    // A `Bool`-valued comparison: result `Bool`, compared at `class`.
+    let compared = |class| AnchoredCarriers {
+        result: AnyExact,
+        compared_operands: Some(class),
+        head_operands: None,
+    };
+    // A `Bool` connective: result `Bool`, operands `Bool`.
+    let connective = AnchoredCarriers {
+        result: AnyExact,
+        compared_operands: None,
+        head_operands: Some(AnyExact),
+    };
+    // (head label, the body's positions, the carrier the citation must name,
+    // the rows that must — and alone may — select it). Carrier-spelled
+    // selectors are sampled at a width other than u64 on purpose: `{C}` ranges
+    // over the class, not over one width.
+    let spellings: &[(&str, AnchoredCarriers, CarrierClass, &[&str])] = &[
+        ("HAdd.hAdd", result(MachineUInt), MachineUInt, &["uint.add"]),
+        ("UInt64.add", result(MachineUInt), MachineUInt, &["uint.add"]),
+        ("HSub.hSub", result(MachineUInt), MachineUInt, &["uint.sub"]),
+        ("UInt8.sub", result(MachineUInt), MachineUInt, &["uint.sub"]),
+        ("HMul.hMul", result(MachineUInt), MachineUInt, &["uint.mul"]),
+        ("UInt16.mul", result(MachineUInt), MachineUInt, &["uint.mul"]),
+        ("OfNat.ofNat", result(MachineUInt), MachineUInt, &["uint.lit"]),
+        ("UInt32.ofNat", result(MachineUInt), MachineUInt, &["uint.lit"]),
+        (
+            "ite",
+            result(MachineUInt),
+            MachineUInt,
+            &["select.lt", "select.le", "select.eq", "select.beq"],
+        ),
+        (
+            "decide",
+            compared(MachineUInt),
+            MachineUInt,
+            &["comparison.lt", "comparison.le", "comparison.eq"],
+        ),
+        (
+            "Decidable.decide",
+            compared(MachineUInt),
+            MachineUInt,
+            &["comparison.lt", "comparison.le", "comparison.eq"],
+        ),
+        ("BEq.beq", compared(MachineUInt), MachineUInt, &["comparison.eq"]),
+        ("Bool.not", connective, AnyExact, &["bool.not"]),
+        ("and", connective, AnyExact, &["bool.and"]),
+        ("or", connective, AnyExact, &["bool.or"]),
+        ("HAnd.hAnd", result(MachineUInt), MachineUInt, &["uint.and"]),
+        ("HOr.hOr", result(MachineUInt), MachineUInt, &["uint.or"]),
+        ("HDiv.hDiv", result(MachineUInt), MachineUInt, &["uint.div"]),
+        ("HMod.hMod", result(MachineUInt), MachineUInt, &["uint.mod"]),
+        ("HXor.hXor", result(MachineUInt), MachineUInt, &["uint.xor"]),
+        ("HShiftRight.hShiftRight", result(MachineUInt), MachineUInt, &["uint.shr"]),
+        ("Nat.rec", result(BignumNat), BignumNat, &["nat.rec.structural"]),
+        ("WellFounded.fix", result(BignumNat), BignumNat, &["nat.wf.fix"]),
+        ("Nat.sub", result(BignumNat), BignumNat, &["nat.sub"]),
+        ("HSub.hSub", result(BignumNat), BignumNat, &["nat.sub"]),
+        ("Nat.mod", result(BignumNat), BignumNat, &["nat.mod"]),
+        ("HMod.hMod", result(BignumNat), BignumNat, &["nat.mod"]),
+        ("Nat.add", result(BignumNat), BignumNat, &["nat.add"]),
+        ("HAdd.hAdd", result(BignumNat), BignumNat, &["nat.add"]),
+        ("Nat.mul", result(BignumNat), BignumNat, &["nat.mul"]),
+        ("HMul.hMul", result(BignumNat), BignumNat, &["nat.mul"]),
+        // `nat.lit`'s arm readers take the kernel literal (no constant), these
+        // two constant spellings, and — on the well-founded lane — a
+        // `Nat.succ` tower over one of them.
+        ("OfNat.ofNat", result(BignumNat), BignumNat, &["nat.lit"]),
+        ("Nat.zero", result(BignumNat), BignumNat, &["nat.lit"]),
+        // `Nat.succ` is read by TWO arm readers: the structural lane's case
+        // value reads `Nat.succ k` as the parameter (`nat.param`), the
+        // well-founded lane's numeral reader unwinds a tower (`nat.lit`).
+        ("Nat.succ", result(BignumNat), BignumNat, &["nat.param", "nat.lit"]),
+    ];
+    // Keyed on no constant NAME: a whole-body variable, the recursive
+    // occurrence, and the compiler-declared callee (which never reaches the
+    // generic site).
+    let unnamed = ["param", "nat.self", "rust.call"];
+
+    let mut accounted: BTreeSet<&str> = unnamed.into_iter().collect();
+    for (head, at, label, expected) in spellings {
+        let selections = rows_selecting_head(head, *at);
+        let selecting: Vec<&str> = selections.iter().map(|(selected, _)| selected.name).collect();
+        assert_eq!(
+            selecting, *expected,
+            "`{head}` at {at:?} must be selected by exactly {expected:?}"
+        );
+        accounted.extend(expected.iter().copied());
+        for (selected, position) in &selections {
+            assert_eq!(
+                *position,
+                *label,
+                "`{head}`: row `{}` must be matched at {}, the class of the position it is \
+                 stated over",
+                selected.name,
+                label.label()
+            );
+        }
+        // One head, one position: the rows a head selects share one anchor,
+        // which is what lets the refusal name ONE carrier for all of them.
+        let anchors: BTreeSet<String> =
+            selections.iter().map(|(selected, _)| format!("{:?}", selected.anchor)).collect();
+        assert_eq!(anchors.len(), 1, "`{head}`: the rows selecting it sit at {anchors:?}");
+        // …and the whole-body refusal for it is NOT the row-miss text, and
+        // names the carrier the rows were matched at.
+        let refusal = whole_body_refusal(head, *at);
+        assert_ne!(
+            refusal,
+            no_selection_row(head, at.result),
+            "`{head}` is selected by {expected:?}, so the row-miss text would be false"
+        );
+        let whole =
+            selections.iter().any(|(selected, _)| selected.context != RowContext::RecursionArm);
+        let cited = if whole {
+            format!("`{head}` at {} IS selected — by ", label.label())
+        } else {
+            format!("no selection row for `{head}` as a WHOLE body at {} — ", label.label())
+        };
+        assert!(refusal.starts_with(&cited), "`{head}`: must open with {cited:?}: {refusal}");
+        for name in *expected {
+            assert!(
+                refusal.contains(&format!("`{name}`")),
+                "the refusal for `{head}` must cite `{name}`: {refusal}"
+            );
+        }
+    }
+    for candidate in ROWS {
+        assert!(
+            accounted.contains(candidate.name),
+            "row `{}` is in neither the spelling list nor the unnamed list: say which head \
+             selects it, or why none does",
+            candidate.name
+        );
+    }
+    for name in unnamed {
+        for (head, at, _, _) in spellings {
+            assert!(
+                rows_selecting_head(head, *at).iter().all(|(selected, _)| selected.name != name),
+                "row `{name}` is keyed on no constant, yet `{head}` selected it"
+            );
+        }
+    }
+
+    // TRUE misses. The coordinate is (head, the position each row is stated
+    // over): the SAME head at another class, a carrier spelling a row
+    // deliberately does not carry, a category — and the four measured
+    // refutations of reading every row at one body carrier. Each selects
+    // nothing, and the refusal is `no_selection_row` at the RESULT's class,
+    // BYTE-IDENTICAL.
+    let misses: &[(&str, AnchoredCarriers, &str)] = &[
+        ("HDiv.hDiv", result(BignumNat), "no `Nat` division row"),
+        ("HOr.hOr", result(BignumNat), "`uint.or` is a machine-width row"),
+        ("UInt64.mod", result(MachineUInt), "the raw-binop rows carry no carrier method"),
+        ("UInt64.add", result(BignumNat), "a machine carrier method at a `Nat` result"),
+        ("Nat.add", result(MachineUInt), "`nat.add` is a bignum row"),
+        ("Nat.succ", result(MachineUInt), "the `Nat.succ` readers are bignum rows"),
+        ("Bool.casesOn", result(BignumNat), "no `match` row"),
+        ("a projection out of a structure", result(MachineUInt), "a category, not a constant"),
+        ("a bound variable", result(AnyExact), "a category, not a constant"),
+        // `if a < b then true else false : Bool` — the `select.*` rows are
+        // stated over a machine-width RESULT, and this result is `Bool`.
+        ("ite", result(AnyExact), "a `Bool`-valued `ite`"),
+        // `if h : a < b then true else false : Bool`.
+        ("Decidable.casesOn", result(AnyExact), "a dependent `if`"),
+        // The comparison rows are stated over the COMPARED width: not over
+        // the result, not over the parameters, not over a `Nat` comparison,
+        // and not when the proposition compares nothing at a carrier.
+        ("decide", result(MachineUInt), "no compared position"),
+        ("decide", result(AnyExact), "`decide (a ≠ b)`: an arrow, no compared carrier"),
+        ("decide", compared(BignumNat), "a `Nat` comparison"),
+        ("BEq.beq", compared(AnyExact), "`Bool == Bool`"),
+        // The `bool.*` rows are stated over `Bool` OPERANDS: a body that has
+        // no such position selects none of them, whatever its result.
+        ("and", result(MachineUInt), "no `Bool`-operand position"),
+        ("Bool.not", result(AnyExact), "no `Bool`-operand position"),
+    ];
+    for (head, at, why) in misses {
+        assert!(
+            rows_selecting_head(head, *at).is_empty(),
+            "`{head}` at {at:?} must select no row ({why})"
+        );
+        assert_eq!(
+            whole_body_refusal(head, *at),
+            no_selection_row(head, at.result),
+            "`{head}` ({why}): a TRUE row miss keeps the v7/D3 text byte-identical, named at \
+             the RESULT's class"
+        );
+    }
+}
+
+/// **Every row declares the position its carrier class is stated over, and
+/// the declaration agrees with the realization.**
+///
+/// `SelectionRow::anchor` has no default, so a row cannot omit it; this
+/// control makes the VALUE a checked statement twice over. First, an
+/// exhaustive list written HERE, by row name — a new row fails until someone
+/// says which position its class is a claim about. Second, the position
+/// follows from what the row's MIR computes, stated as an exhaustive match
+/// over `MirShape` with no wildcard: a row returning a `bool` computed FROM a
+/// comparison of carrier values (`ComparisonValue`) is stated over the compared
+/// width, a `bool` connective (`BoolNotValue`, `BoolConnValue`) over its
+/// `Bool` operands, the Rust-call chain over its callees' own carriers, and
+/// every other realization writes a value AT the carrier its row is stated
+/// over — the result.
+#[test]
+fn every_row_declares_the_position_it_is_stated_over() {
+    use CarrierAnchor::{CalleeSignature, ComparedOperands, HeadOperands, Result};
+    let declared: &[(&str, CarrierAnchor)] = &[
+        ("param", Result),
+        ("uint.add", Result),
+        ("uint.sub", Result),
+        ("uint.mul", Result),
+        ("uint.lit", Result),
+        ("select.lt", Result),
+        ("select.le", Result),
+        ("select.eq", Result),
+        ("select.beq", Result),
+        ("comparison.lt", ComparedOperands),
+        ("comparison.le", ComparedOperands),
+        ("comparison.eq", ComparedOperands),
+        ("bool.not", HeadOperands),
+        ("bool.and", HeadOperands),
+        ("bool.or", HeadOperands),
+        ("uint.and", Result),
+        ("uint.or", Result),
+        ("uint.div", Result),
+        ("uint.mod", Result),
+        ("uint.xor", Result),
+        ("uint.shr", Result),
+        ("nat.rec.structural", Result),
+        ("nat.wf.fix", Result),
+        ("nat.param", Result),
+        ("nat.sub", Result),
+        ("nat.mod", Result),
+        ("nat.self", Result),
+        ("nat.lit", Result),
+        ("nat.add", Result),
+        ("nat.mul", Result),
+        ("rust.call", CalleeSignature),
+    ];
+    let listed: BTreeSet<&str> = declared.iter().map(|(name, _)| *name).collect();
+    let rows: BTreeSet<&str> = ROWS.iter().map(|candidate| candidate.name).collect();
+    assert_eq!(listed, rows, "every row, and only rows, must be listed with its anchor");
+    for (name, anchor) in declared {
+        let candidate = row(name).expect("listed rows exist");
+        assert_eq!(candidate.anchor, *anchor, "row `{name}` is stated over the wrong position");
+        let from_realization = match candidate.mir {
+            MirShape::ComparisonValue(_) => ComparedOperands,
+            MirShape::BoolNotValue | MirShape::BoolConnValue(_) => HeadOperands,
+            MirShape::RustCallChain => CalleeSignature,
+            MirShape::OperandCopy
+            | MirShape::InlineScalar
+            | MirShape::Call(_)
+            | MirShape::ComparisonBranch(_)
+            | MirShape::BoolDecisionBranch
+            | MirShape::RawBinOp(_)
+            | MirShape::ZeroTestBranch
+            | MirShape::SelfCall => Result,
+        };
+        assert_eq!(
+            candidate.anchor, from_realization,
+            "row `{name}`: its realization {:?} writes a value whose carrier is the {:?} \
+             position, but the row declares {:?}",
+            candidate.mir, from_realization, candidate.anchor
         );
     }
 }
@@ -997,9 +1391,11 @@ fn a_row_cannot_smuggle_a_runtime_constant_name() {
         if let ReflectSpec::KernelConst(constant) = candidate.reflect {
             is_static(constant);
             assert!(
-                !constant.is_empty() && constant.starts_with("Nat."),
+                !constant.is_empty()
+                    && (constant.starts_with("Nat.") || constant.starts_with("Bool.")),
                 "row `{}` names the kernel constant `{constant}`, which is outside the `Nat` \
-                 prelude this fragment is stated over",
+                 recursion prelude and the `Bool` connective prelude (W6) this fragment is \
+                 stated over",
                 candidate.name
             );
         }

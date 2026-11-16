@@ -132,7 +132,7 @@ use crate::gate::{ReflectedCase, ReflectedStructuralRec};
 use crate::reflect::{RecCall, RecFamily, Site, render_rec_node};
 
 fn nat() -> Expr {
-    Expr::const_(Name::from_string("Nat"), vec![])
+    Expr::const_(Name::interned("Nat"), vec![])
 }
 
 /// R1's half of the shared descent: render one recognized node at one of R1's
@@ -251,7 +251,7 @@ pub fn reflect_structural_rec(
     // that lacks something this body does not use (`Nat.add`, for a body with
     // no `Add` node).
     for &constant in &named {
-        if env.get_const(&Name::from_string(constant)).is_none() {
+        if env.get_const(&Name::interned(constant)).is_none() {
             return Err(format!(
                 "cannot reflect the structural recursion emitted for `{name}`: the kernel \
                  environment has no `{constant}`, which the rendering names. This is a \

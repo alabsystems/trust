@@ -1,0 +1,18 @@
+[package]
+name = "trust-test-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Native prepared test-execution wire shared by Targo and its verifier"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+getrandom = "0.4"
+libc = { workspace = true }
+
+[lints]
+workspace = true

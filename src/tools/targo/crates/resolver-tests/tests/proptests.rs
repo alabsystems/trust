@@ -1,7 +1,7 @@
 use std::io::IsTerminal;
 
-use cargo::util::GlobalContext;
 use cargo_util::is_ci;
+use targo::util::GlobalContext;
 
 use resolver_tests::{
     PrettyPrintRegistry,

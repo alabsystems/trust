@@ -23,12 +23,13 @@ fn cargo_process(s: &str) -> cargo_test_support::Execs {
 
 #[cargo_test]
 fn gated() {
+    // Trust: retain the channel refusal and exact current Trust guidance.
     cargo_process("config get")
         .masquerade_as_nightly_cargo(&["cargo-config"])
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] the `cargo config` command is unstable, pass `-Z unstable-options` to enable it
-See https://github.com/rust-lang/cargo/issues/9301 for more information about the `cargo config` command.
+See https://github.com/alabsystems/Trust/issues for more information about the `cargo config` command.
 
 "#]])
         .run();
@@ -108,6 +109,52 @@ fn array_setup() -> PathBuf {
         "#,
     );
     home
+}
+
+// Trust: ambient native configuration is isolated just like CARGO_*, while
+// fixture-authored overrides after test_env retain their production precedence.
+#[cargo_test]
+fn native_environment_overrides_are_later_wins() {
+    let sub_folder = common_setup();
+    for (native, compatibility, remove_native, expected) in [
+        (None, None, false, 99),
+        (Some("2"), None, false, 2),
+        (Some("2"), Some("3"), false, 3),
+        (Some("2"), None, true, 99),
+    ] {
+        let mut command = cargo_process("config get build.jobs -Zunstable-options");
+        command
+            .cwd(sub_folder.parent().unwrap())
+            .masquerade_as_nightly_cargo(&["cargo-config"]);
+        if let Some(value) = native {
+            command.env("TARGO_BUILD_JOBS", value);
+        }
+        if let Some(value) = compatibility {
+            command.env("CARGO_BUILD_JOBS", value);
+        }
+        if remove_native {
+            command.env_remove("TARGO_BUILD_JOBS");
+        }
+        command
+            .with_stdout_data(format!("build.jobs = {expected}\n"))
+            .with_stderr_data(str![[r#""#]])
+            .run();
+    }
+
+    // An explicitly authored malformed native override must still reach the
+    // production parser and refuse, rather than being cleared at spawn time.
+    let p = cargo_test_support::project()
+        .at("invalid-native-jobs")
+        .file("src/lib.rs", "")
+        .build();
+    p.cargo("check")
+        .env("TARGO_BUILD_JOBS", "not-a-job-count")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[ERROR] could not parse `not-a-job-count`. Number of parallel jobs should be `default` or a number.
+
+"#]])
+        .run();
 }
 
 #[cargo_test]

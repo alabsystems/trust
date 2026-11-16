@@ -1,0 +1,101 @@
+[
+  {
+    "case": "zero",
+    "source_name": "scalar",
+    "type": "bits(64)",
+    "expect_accept": true,
+    "reference_value": "0"
+  },
+  {
+    "case": "eight",
+    "source_name": "scalar",
+    "type": "bits(64)",
+    "expect_accept": true,
+    "reference_value": "8"
+  },
+  {
+    "case": "max",
+    "source_name": "scalar",
+    "type": "bits(64)",
+    "expect_accept": true,
+    "reference_value": "18446744073709551615"
+  },
+  {
+    "case": "frame_offset",
+    "source_name": "stackScalar",
+    "type": "bits(64)",
+    "expect_accept": true,
+    "reference_value": "4096"
+  },
+  {
+    "case": "renamed",
+    "source_name": "renamedScalar",
+    "type": "bits(64)",
+    "expect_accept": true,
+    "reference_value": "8"
+  },
+  {
+    "case": "integer",
+    "source_name": "integerScalar",
+    "type": "integer",
+    "expect_accept": true,
+    "reference_value": "41"
+  },
+  {
+    "case": "bad_width",
+    "source_name": "scalar",
+    "type": "bits(64)",
+    "expect_accept": false,
+    "refusal": "BadTypesForBinop",
+    "phase": "typecheck",
+    "kind": "asl_error"
+  },
+  {
+    "case": "bad_type",
+    "source_name": "scalar",
+    "type": "integer",
+    "expect_accept": false,
+    "refusal": "BadTypesForBinop",
+    "phase": "typecheck",
+    "kind": "asl_error"
+  },
+  {
+    "case": "unsupported_mul",
+    "source_name": "scalar",
+    "type": "integer",
+    "expect_accept": false,
+    "refusal": "profile_refusal",
+    "phase": "export",
+    "kind": "profile_refusal"
+  },
+  {
+    "case": "unsupported_neg",
+    "source_name": "scalar",
+    "type": "integer",
+    "expect_accept": false,
+    "refusal": "profile_refusal",
+    "phase": "export",
+    "kind": "profile_refusal"
+  },
+  {
+    "case": "extra_function",
+    "expect_accept": false,
+    "refusal": "profile_refusal",
+    "phase": "parsed_profile",
+    "kind": "profile_refusal"
+  },
+  {
+    "case": "syntax",
+    "expect_accept": false,
+    "refusal": "CannotParse",
+    "phase": "parse",
+    "kind": "asl_error"
+  },
+  {
+    "case": "extra_statement",
+    "expect_accept": false,
+    "refusal": "profile_refusal",
+    "phase": "parsed_profile",
+    "kind": "profile_refusal"
+  }
+]

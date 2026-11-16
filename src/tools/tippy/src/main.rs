@@ -8,9 +8,14 @@ extern crate rustc_driver;
 extern crate rustc_session;
 
 mod arg_protocol;
+#[path = "../../targo/crates/targo-core/src/util/lint_frontend/compiler_identity.rs"]
 mod compiler_identity;
 mod frontend_args;
+#[path = "../../targo/crates/targo-core/src/util/tippy_frontend_args.rs"]
+mod native_frontend_args;
+#[path = "../../targo/crates/targo-core/src/util/lint_frontend/path_identity.rs"]
 mod path_identity;
+#[path = "../../targo/crates/targo-core/src/util/lint_frontend/overlay.rs"]
 mod rustc_private_overlay;
 
 use std::ffi::OsString;
@@ -19,17 +24,26 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus, exit};
 use std::{env, fs};
 
+#[cfg(test)]
+use arg_protocol as tippy_arg_protocol;
 use arg_protocol::{
     CLIPPY_ARGS_ENV, TIPPY_ENCODED_ARGS_ENV, encode_args, executable_path_matches_with_windows_semantics,
 };
+#[cfg(test)]
+use native_frontend_args::FrontendArgs;
+#[cfg(test)]
+#[path = "../../targo/crates/targo-core/src/util/lint_frontend/channels.rs"]
+mod native_channels;
 use compiler_identity::AuthenticatedCompiler;
 use frontend_args::split_legacy_no_deps;
+// Trust: explicit same-pool transport, independent of executable/proof authority.
+use jobserver_utils::InheritedJobserver;
 use path_identity::{AuthenticatedExecutable, metadata_is_plain_file};
 use rustc_private_overlay::{
     ConfiguredOverlay, OverlayEnvironment, clear_overlay_command_environment, query_compiler_commit_hash,
 };
 
-fn show_help() {
+fn print_help() {
     if writeln!(&mut anstream::stdout().lock(), "{}", help_message_for_display()).is_err() {
         exit(rustc_driver::EXIT_FAILURE);
     }
@@ -98,6 +112,11 @@ fn clippy_version_info_for_display() -> String {
 }
 
 pub fn main() {
+    // Trust: capture before executable, loader or overlay checks open files and
+    // can reuse advertised descriptor numbers. Preserve help/version behavior
+    // with a saved result; never retry an invalid import after those checks.
+    // SAFETY: this is the first operation in the frontend's process entrypoint.
+    let jobserver = unsafe { InheritedJobserver::from_env() };
     let raw_args = unicode_args(env::args_os()).unwrap_or_else(|error| {
         report_setup_error(&error);
         process::exit(rustc_driver::EXIT_FAILURE);
@@ -116,7 +135,7 @@ pub fn main() {
     // consume arguments after `--`: those belong byte-for-byte to the lint /
     // compiler driver.
     if control_args.iter().any(|a| a == "--help" || a == "-h") {
-        show_help();
+        print_help();
         return;
     }
 
@@ -132,14 +151,22 @@ pub fn main() {
                 &lint.strip_prefix("clippy::").unwrap_or(&lint).replace('-', "_"),
             ));
         } else {
-            show_help();
+            print_help();
         }
         return;
     }
 
+    // Trust: an invalid advertised pool refuses a Cargo launch, never falls
+    // back to a private scheduler. Metadata-only frontend controls above do
+    // not launch Cargo and retain their existing behavior.
+    let jobserver = jobserver.unwrap_or_else(|error| {
+        report_setup_error(&format!("cannot inherit Tippy jobserver: {error}"));
+        process::exit(rustc_driver::EXIT_FAILURE);
+    });
     if let Err(code) = process(
         tippy_command_args(raw_args.into_iter(), current_exe.as_deref()),
         current_exe.as_deref(),
+        &jobserver,
     ) {
         process::exit(code);
     }
@@ -260,34 +287,13 @@ impl TippyCmd {
     where
         I: Iterator<Item = String>,
     {
-        let mut cargo_subcommand = "check";
-        let mut args = vec![];
-        let mut no_deps = false;
-
-        for arg in old_args.by_ref() {
-            match arg.as_str() {
-                "--fix" => {
-                    cargo_subcommand = "fix";
-                    continue;
-                },
-                "--no-deps" => {
-                    no_deps = true;
-                    continue;
-                },
-                "--" => break,
-                _ => {},
-            }
-
-            args.push(arg);
-        }
-
-        let (trailing_no_deps, clippy_args) = split_legacy_no_deps(old_args.collect())?;
-        no_deps |= trailing_no_deps || cargo_subcommand == "fix";
+        let parsed = native_frontend_args::FrontendArgs::parse(old_args.by_ref());
+        let (trailing_no_deps, clippy_args) = split_legacy_no_deps(parsed.compiler_args)?;
 
         Ok(Self {
-            cargo_subcommand,
-            args,
-            no_deps,
+            cargo_subcommand: parsed.verb,
+            args: parsed.args,
+            no_deps: parsed.no_deps || trailing_no_deps,
             clippy_args,
         })
     }
@@ -325,7 +331,8 @@ impl TippyCmd {
         let compiler_path = authenticated_toolchain
             .as_ref()
             .map(|toolchain| toolchain.compiler_path().to_owned());
-        let overlay_environment = OverlayEnvironment::capture();
+        let overlay_environment = OverlayEnvironment::capture_with(|name| env::var_os(name))
+            .with_compiler_host(std::ffi::OsStr::new(rustc_session::config::host_tuple()));
         let compiler_commit_hash = if overlay_environment.is_configured() {
             authenticated_toolchain
                 .as_ref()
@@ -381,19 +388,17 @@ impl TippyCmd {
         }
         let tippy_encoded_args = encode_args(self.no_deps, &self.clippy_args);
 
-        // Currently, `CLIPPY_TERMINAL_WIDTH` is used only to format "unknown field" error messages.
-        let terminal_width = termize::dimensions().map_or(0, |(w, _)| w);
-
         cmd.env("RUSTC_WORKSPACE_WRAPPER", driver)
             .env(CLIPPY_ARGS_ENV, clippy_args)
             .env(TIPPY_ENCODED_ARGS_ENV, tippy_encoded_args)
-            .env("CLIPPY_TERMINAL_WIDTH", terminal_width.to_string())
             // Tippy is a lint frontend, not a proof supervisor. Never inherit
             // an enclosing verifier invocation's private Targo marker: doing
             // so suppresses the native off-switch and can turn a lint run into
             // an unexpectedly expensive evidence-grade build. The selected
             // child Targo will establish its own native lane.
             .env_remove("TRUST_TARGO_VERIFY")
+            // Nor its lane (T14a): only `targo trust` hands Cargo one.
+            .env_remove("TRUST_TARGO_LANE_RUSTFLAGS")
             // Tippy intentionally uses Targo's native check/fix transport;
             // the public frontend authorizes that unverified lint lane
             // explicitly below.
@@ -446,23 +451,11 @@ fn selected_toolchain_compiler(current_exe: Option<&Path>) -> Result<Authenticat
     let trustc = sibling_tool_path(current_exe, "trustc").ok_or_else(|| {
         "cannot locate required sibling `trustc` because the current Tippy executable path is unavailable; repair or reinstall the selected Trust toolchain".to_string()
     })?;
-    // Prefer the rustc-compatible sibling: build scripts commonly require a
-    // `rustc ...` version banner. The compatibility name is authoritative only
-    // when its complete bytes equal the selected `trustc`; a stale or ambient
-    // executable merely occupying that sibling path must not splice a second
-    // compiler into the branded toolchain.
-    if let Some(rustc) = sibling_tool_path(current_exe, "rustc") {
-        match fs::symlink_metadata(&rustc) {
-            Ok(_) => return AuthenticatedCompiler::alias(trustc, rustc),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect rustc-compatible sibling `{}`: {error}; repair or reinstall the selected Trust toolchain",
-                    rustc.display()
-                ));
-            },
-        }
-    }
+    // Tippy runs the Trust compiler under its own name. A `rustc`-named
+    // sibling, if the distribution still ships one for rustup's sake, is not
+    // consulted and cannot be lent Trust's authority: see the design note at
+    // the head of `compiler_identity.rs`. `trustc --version` begins
+    // `rustc 1.99.0-dev …`, which is all a build script's banner check reads.
     AuthenticatedCompiler::selected_trustc(trustc)
 }
 
@@ -577,7 +570,9 @@ fn driver_path_for_invocation(
     }
 }
 
-fn process<I>(old_args: I, current_exe: Option<&Path>) -> Result<(), i32>
+// Trust: carry main's early owned capture; never re-import ambient fd numbers
+// after authenticated tool/loader preparation has opened additional files.
+fn process<I>(old_args: I, current_exe: Option<&Path>, jobserver: &InheritedJobserver) -> Result<(), i32>
 where
     I: Iterator<Item = String>,
 {
@@ -597,16 +592,31 @@ where
         },
     };
 
-    run_frontend_command(&mut prepared.command, prepared.authenticated_toolchain.as_ref())
+    run_frontend_command(
+        &mut prepared.command,
+        prepared.authenticated_toolchain.as_ref(),
+        Some(jobserver),
+    )
 }
 
 fn run_frontend_command(
     cmd: &mut Command,
     authenticated_toolchain: Option<&AuthenticatedTippyToolchain>,
+    jobserver: Option<&InheritedJobserver>,
 ) -> Result<(), i32> {
     let program = cmd.get_program().to_string_lossy().into_owned();
+    // Trust: configure the final command after every argument/environment
+    // overlay, inside the unchanged authenticated toolchain guard. Borrow the
+    // early owned capture through the actual synchronous child wait, including
+    // a failed spawn. No pool or implicit token is created or acquired here.
+    let mut run_child = || {
+        if let Some(jobserver) = jobserver {
+            jobserver.configure(cmd);
+        }
+        cmd.status()
+    };
     let child_status = if let Some(authenticated_toolchain) = authenticated_toolchain {
-        match authenticated_toolchain.run_guarded(|| cmd.status()) {
+        match authenticated_toolchain.run_guarded(run_child) {
             Ok(status) => status,
             Err(error) => {
                 report_setup_error(&format!(
@@ -616,7 +626,7 @@ fn run_frontend_command(
             },
         }
     } else {
-        cmd.status()
+        run_child()
     };
     let exit_status = match child_status {
         Ok(status) => status,
@@ -664,14 +674,14 @@ fn report_setup_error(error: &str) {
 #[must_use]
 pub fn help_message() -> &'static str {
     color_print::cstr!(
-"Checks a package to catch common mistakes and improve your Rust code.
+        "Checks a package to catch common mistakes and improve your Rust code.
 
 <green,bold>Usage</>:
     <cyan,bold>cargo clippy</> <cyan>[OPTIONS] [--] [<<ARGS>>...]</>
 
 <green,bold>Common options:</>
     <cyan,bold>--no-deps</>                Run Tippy only on the given crate, without linting the dependencies
-    <cyan,bold>--fix</>                    Automatically apply lint suggestions. This flag implies <cyan>--no-deps</> and <cyan>--all-targets</>
+    <cyan,bold>--fix</>                    Automatically apply lint suggestions. This flag implies <cyan>--no-deps</>
     <cyan,bold>-h</>, <cyan,bold>--help</>               Print this message
     <cyan,bold>-V</>, <cyan,bold>--version</>            Print version info and exit
     <cyan,bold>--explain [LINT]</>         Print the documentation for a given lint
@@ -696,7 +706,8 @@ You can use tool lints to allow or deny lints from your code, e.g.:
     <cyan,bold>--frozen</>                Require Cargo.lock and cache are up to date
     <cyan,bold>--locked</>                Require Cargo.lock is up to date
     <cyan,bold>--offline</>               Run without accessing the network
-    ")
+    "
+    )
 }
 
 fn help_message_for_display() -> String {
@@ -1223,7 +1234,7 @@ mod tests {
         let path = nonexistent_temp_path("missing-targo-launch");
         let mut command = Command::new(&path);
         assert_eq!(
-            run_frontend_command(&mut command, None),
+            run_frontend_command(&mut command, None, None),
             Err(rustc_driver::EXIT_FAILURE)
         );
     }
@@ -1233,7 +1244,7 @@ mod tests {
     fn frontend_preserves_the_child_signal_as_conventional_shell_status() {
         let mut command = Command::new("sh");
         command.args(["-c", "kill -TERM $$"]);
-        assert_eq!(run_frontend_command(&mut command, None), Err(128 + 15));
+        assert_eq!(run_frontend_command(&mut command, None, None), Err(128 + 15));
     }
 
     #[test]
@@ -1373,5 +1384,41 @@ mod tests {
         let args = "cargo clippy".split_whitespace().map(ToString::to_string);
         let cmd = TippyCmd::new(args).unwrap();
         assert_eq!("check", cmd.cargo_subcommand);
+    }
+
+    #[test]
+    fn native_planner_transport_matches_the_public_frontend_compiler_grammar() {
+        use super::arg_protocol::{NoDepsFlag, decode_args};
+        use super::frontend_args::split_legacy_no_deps;
+        use super::native_frontend_args::FrontendArgs;
+        for input in [
+            vec!["--no-deps", "--", "-D", "warnings"],
+            vec!["--fix", "--", "--cfg", "--no-deps"],
+            vec!["--", "--cfg", "--no-deps", "--no-deps"],
+            vec!["--", "--", "--no-deps"],
+            vec!["--", "-W", "--no-deps"],
+        ] {
+            let input: Vec<_> = input.into_iter().map(str::to_owned).collect();
+            let public = TippyCmd::new(input.clone().into_iter()).unwrap();
+            let native = FrontendArgs::parse(input);
+            let decoded = decode_args(&native.channels()[1].1).unwrap();
+            let actual = match decoded.no_deps {
+                NoDepsFlag::Explicit(no_deps) => (no_deps, decoded.compiler_args),
+                NoDepsFlag::LegacyInBand => split_legacy_no_deps(decoded.compiler_args).unwrap(),
+            };
+            assert_eq!(actual, (public.no_deps, public.clippy_args));
+        }
+    }
+
+    #[test]
+    fn malformed_legacy_input_is_refused_by_the_same_driver_parser() {
+        use super::arg_protocol::decode_args;
+        let input = ["--", "--not-a-compiler-option", "--no-deps"]
+            .map(str::to_owned)
+            .to_vec();
+        assert!(TippyCmd::new(input.clone().into_iter()).is_err());
+        let native = super::native_frontend_args::FrontendArgs::parse(input);
+        let decoded = decode_args(&native.channels()[1].1).unwrap();
+        assert!(super::frontend_args::split_legacy_no_deps(decoded.compiler_args).is_err());
     }
 }

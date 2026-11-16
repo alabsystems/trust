@@ -86,6 +86,7 @@ fn guarded_index_bounds_vc_formula_carries_dominating_guard() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = generate_vcs(&func);
     let vc = vcs

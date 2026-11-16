@@ -1,0 +1,22 @@
+error: finite model `Queue.Fifo` is unsafe: the reachable state { received = 0, handled = 1 } breaks invariant `NeverAhead`. Trust checks every `ScalarModel` an island declares; the kernel evaluates the invariant false in that state and replayed the run to it (below). Fix the model or the system it describes. A model that is unsafe on purpose takes a parameter (`def M (buggy : Nat) : ScalarModel`): a function is not checked until applied.
+  --> $DIR/clean_island_declared_model_truncating_subtraction.rs:21:5
+   |
+LL |     def Fifo : Trust.Temporal.FiniteModel.ScalarModel :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: finite model `Queue.Fifo`: a subtraction evaluates `0 - 1` in the guard of `Handle`, in the reachable state { received = 0, handled = 0 }. The model language is over the natural numbers, so that is 0, not -1; a guard written `a <= b - 1` for `a < b` is TRUE at `a = b = 0`. Move the subtrahend across the comparison (`a + 1 <= b`, or `gt b a`)
+  --> $DIR/clean_island_declared_model_truncating_subtraction.rs:21:5
+   |
+LL |     def Fifo : Trust.Temporal.FiniteModel.ScalarModel :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: a shortest run of `Queue.Fifo` to the state that breaks `NeverAhead` (1 step); the kernel replayed each step:
+        0: (initial)  received = 0, handled = 0
+        1: Handle     handled = 1
+  --> $DIR/clean_island_declared_model_truncating_subtraction.rs:21:5
+   |
+LL |     def Fifo : Trust.Temporal.FiniteModel.ScalarModel :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error; 1 warning emitted
+

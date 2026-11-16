@@ -1,8 +1,8 @@
 
 === Trust Verification Report (postcondition_composition_at_call_site) ===
 
-note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 3 obligation(s)
-  --> $DIR/postcondition_composition_at_call_site.rs:20:1
+note: Trust verification: 4 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 4 obligation(s)
+  --> $DIR/postcondition_composition_at_call_site.rs:85:1
    |
 LL | / pub fn clamp_low(x: i32) -> i32
 LL | |     ensures result >= 0 && result <= 1000000
@@ -12,10 +12,10 @@ LL | |     if x < 0 {
 LL | | }
    | |_^
    |
-   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+   = note: of which 3 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
 
 note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
-  --> $DIR/postcondition_composition_at_call_site.rs:32:1
+  --> $DIR/postcondition_composition_at_call_site.rs:97:1
    |
 LL | / pub fn triple(x: i32) -> i32 {
 LL | |     let y = clamp_low(x);

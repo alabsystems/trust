@@ -1,0 +1,153 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+;
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+; RUN: %tpde_test --run-until=analyzer --print-rpo %s | FileCheck %s --dump-input always
+
+; CHECK: RPO for func single
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: End RPO
+single() {
+entry:
+  terminate
+}
+
+
+; COM: Here we test that the original block order is respected for the ordering
+; COM: of successors
+
+; CHECK: RPO for func loop1
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop_head
+; CHECK-NEXT: 2: loop_body
+; CHECK-NEXT: 3: cont
+; CHECK-NEXT: End RPO
+loop1() {
+entry:
+  jump ^loop_head
+loop_head:
+  jump ^loop_body, ^cont
+loop_body:
+  jump ^loop_head
+cont:
+  terminate
+}
+
+; CHECK: RPO for func loop2
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop_head
+; CHECK-NEXT: 2: cont
+; CHECK-NEXT: 3: loop_body
+; CHECK-NEXT: End RPO
+loop2() {
+entry:
+  jump ^loop_head
+cont:
+  terminate
+loop_head:
+  jump ^loop_body, ^cont
+loop_body:
+  jump ^loop_head
+}
+
+; CHECK: RPO for func loop3
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop_head
+; COM: cont put before loop_body since it comes before it in the IR
+; CHECK-NEXT: 2: cont
+; CHECK-NEXT: 3: loop_body
+; CHECK-NEXT: End RPO
+loop3() {
+entry:
+  jump ^loop_head, ^cont
+cont:
+  terminate
+loop_head:
+  jump ^loop_body, ^cont
+loop_body:
+  jump ^loop_head
+}
+
+; CHECK: RPO for func loop4
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop_head
+; CHECK-NEXT: 2: cont
+; CHECK-NEXT: 3: loop_body
+; CHECK-NEXT: End RPO
+loop4() {
+entry:
+  jump ^loop_head
+loop_head:
+  jump ^loop_body, ^cont
+cont:
+  terminate
+loop_body:
+  jump ^loop_head
+}
+
+; CHECK: RPO for func if1
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: true_block
+; CHECK-NEXT: 2: false_block
+; CHECK-NEXT: 3: end_block
+; CHECK-NEXT: End RPO
+if1() {
+entry:
+  jump ^true_block, ^false_block
+true_block:
+  jump ^end_block
+false_block:
+  jump ^end_block
+end_block:
+  terminate
+}
+
+; CHECK: RPO for func if2
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: true_block
+; CHECK-NEXT: 2: false_block
+; CHECK-NEXT: 3: end_block
+; CHECK-NEXT: End RPO
+if2() {
+entry:
+  jump ^true_block, ^false_block
+true_block:
+  jump ^end_block
+end_block:
+  terminate
+false_block:
+  jump ^end_block
+}
+
+; CHECK: RPO for func irreducible_loop
+; CHECK-NEXT: 0: entry
+; COM: the post-order traversal visits ret first
+; CHECK-NEXT: 1: ret
+; CHECK-NEXT: 2: loop1_body
+; CHECK-NEXT: 3: loop1_head
+; CHECK-NEXT: End RPO
+irreducible_loop() {
+entry:
+  jump ^loop1_head, ^ret
+loop1_head:
+  jump ^ret, ^loop1_body
+loop1_body:
+  jump ^loop1_head
+ret:
+  jump ^loop1_body
+}
+
+; CHECK: RPO for func unreachable_block
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: ret
+; CHECK-NEXT: End RPO
+unreachable_block() {
+entry:
+  jump ^ret
+ret:
+  terminate
+unreachable:
+  terminate
+}
+
+; TODO(ts): more advanced tests for larger funcs

@@ -54,6 +54,12 @@ pub(crate) struct Cursor<'h> {
 /// byte, and no lower bound.
 #[inline]
 pub(crate) fn cursor_size_hint(start: usize, end: usize) -> (usize, Option<usize>) {
+    #[expect(
+        clippy::implicit_saturating_sub,
+        reason = "the subtraction stays in this body, where trust check certifies it cannot \
+                  overflow; end.saturating_sub(start) moves it into a trusted core call and \
+                  leaves this function with no obligations (measured 2026-11-14)"
+    )]
     let remaining = if end > start { end - start } else { 0 };
     (0, Some(remaining))
 }

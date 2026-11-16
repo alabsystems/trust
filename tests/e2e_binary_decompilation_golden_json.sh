@@ -235,7 +235,7 @@ PY
             run_targo_trust_test "${manifest_gate_selection#targo-trust:}"
             ;;
         trust-proof-cert:*)
-            trust_cargo test --manifest-path "$TRUST_ROOT/crates/Cargo.toml" -p trust-proof-cert \
+            trust_cargo test --manifest-path "$TRUST_ROOT/Cargo.toml" -p trust-proof-cert \
                 --test checked_binary_certificate "${manifest_gate_selection#trust-proof-cert:}"
             ;;
         *)
@@ -289,10 +289,10 @@ do
 done
 
 echo "--- symbolic formula TrustIr lowering unit gates"
-trust_cargo test --manifest-path "$TRUST_ROOT/crates/Cargo.toml" -p trust-ir-bridge symbolic
+trust_cargo test --manifest-path "$TRUST_ROOT/Cargo.toml" -p trust-ir-bridge symbolic
 
 echo "--- trust-proof-cert checked binary certificate gates"
-trust_cargo test --manifest-path "$TRUST_ROOT/crates/Cargo.toml" -p trust-proof-cert \
+trust_cargo test --manifest-path "$TRUST_ROOT/Cargo.toml" -p trust-proof-cert \
     --test checked_binary_certificate \
     --test binary_decomp_certificate_gate
 

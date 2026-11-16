@@ -1,0 +1,24 @@
+error: the initializer of `C` can wait on `C` itself: a `std::sync::OnceLock` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/generic_intermediate_reentrant.rs:31:8
+   |
+LL |     *C.get_or_init(|| 7)
+   |        ^^^^^^^^^^^^^^^^^ the initializer of `C` reaches this call, which waits on `C` again
+...
+LL |     let _ = C.get_or_init(|| helper(0u8) + 1);
+   |               -------------------------------
+   |               |              |
+   |               |              the initializer reaches the re-entrant wait through this call
+   |               this call starts the initializer of `C`
+   |
+   = note: call path: `main::{closure#0}` -> `helper` -> `C.get_or_init(..)`
+   = help: compute the value inside the initializer without calling `helper` — read the input it needs directly instead of asking `C` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `C.get_or_init(|| v)` (or `C.set(v)` before any reader)
+   = help: or, if the initializer can legitimately observe an uninitialized `C`, read `C.get()` there — it never waits
+note: `C` is declared here
+  --> $DIR/generic_intermediate_reentrant.rs:28:1
+   |
+LL | static C: OnceLock<u32> = OnceLock::new();
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+

@@ -64,9 +64,19 @@
 //!     different function.
 //!   * **`Shl`/`LShr`/`AShr`** — TrustIR poisons on a shift amount at or above the
 //!     width; `UIntN.shiftLeft`/`shiftRight` are total there. Same defect.
-//!   * **`Xor`** — the prelude measured here has no `UInt8.xor`, and `a ^^^ b` does
-//!     not even elaborate (`HXor UInt8 UInt8 UInt8` is unsynthesized). There is
-//!     nothing to spell it as.
+//!   * **`Xor`** — refused as UNEXERCISED, no longer as unspellable. This file was
+//!     written against a prelude with no `UInt8.xor`, where `a ^^^ b` did not even
+//!     elaborate; since the Clean pin `bf31976f48` both exist — `UIntN.xor` is
+//!     declared and `a ^^^ b = UIntN.xor a b` is `rfl` at every width
+//!     (`trust-clean-origin`'s `landing7_selection_probes::l7_p11`). Reflecting it
+//!     soundly would need two things this file does not have: a table row
+//!     `BinOp Xor` -> `UIntN.xor`, justified in
+//!     `clean_primitives_have_the_semantics_this_reflector_assumes` against the
+//!     IR's `lhs ^ rhs` on the raw payload (a ground value AND a refuted one, as
+//!     `land`/`lor` are); and an EMITTED `Xor` to reflect — `trust-clean-ir`
+//!     refuses the `uint.xor` plan today (`ShapeNotYetSpelled`), so the agreement
+//!     could not be demonstrated end to end, and a spelling nothing exercises is a
+//!     guess.
 //!   * **signed carriers, `U128`, `Usize`, `Char`, `Bool`, floats, pointers** — no
 //!     fixed-width `UIntN` in the Clean prelude denotes them. `Usize` in particular
 //!     is target-width; guessing 64 would be a claim about the target that this
@@ -76,21 +86,26 @@
 //!     comparison in a `Select` condition is exactly the place a wrong reflection
 //!     would be invisible.
 //!
-//! # Two things a defeq-judged round trip cannot decide (both measured here)
+//! # Two places the IR does not record what the source wrote (both measured here)
 //!
-//! 1. **`Select` does not record which `Decidable` witness the source used.**
-//!    Clean's elaborator picks `instDecidableUIntNLt` for `if a < b` but
-//!    `instDecidableNatLt` on the `Nat` projections for `if a < 10`, and the two are
-//!    NOT definitionally equal under an open operand. TrustIR carries the
-//!    proposition and nothing about the witness.
-//!    `a_numeral_on_the_right_of_a_comparison_changes_the_decidable_witness_only`
-//!    isolates this to the witness alone: the reflected PROPOSITION is accepted, and
-//!    substituting the declaration's own witness into the otherwise-identical
-//!    reflection makes the kernel accept. Consequence: a kernel REJECTION of a
-//!    `Select` reflection is not by itself evidence of a wrong body. An ACCEPTANCE
-//!    still is evidence of a right one, since definitional equality implies equal
-//!    values — which is why the numeral-comparison shape is deliberately left out of
-//!    the must-agree battery rather than papered over.
+//! 1. **`Select` does not record which `Decidable` witness the source used — and,
+//!    since Clean `c91fa93f5`, a numeral operand no longer makes that matter.**
+//!    Clean's elaborator picks `instDecidableUIntNLt a b` for `if a < b`. For
+//!    `if a < 10` it used to pick `instDecidableNatLt` on the `Nat` projections,
+//!    which was NOT definitionally equal to this reflector's `UIntN.decLt` under an
+//!    open operand, so the numeral-comparison shape was rejected although only the
+//!    witness differed. `c91fa93f5` ("kernel(uint): the BitVec-carrier decLe/decLt
+//!    ARE Nat.decLe/decLt") made the carrier's decisions BE the `Nat` ones on the
+//!    projections, so every witness the elaborator can pick there is one term to
+//!    the kernel. TrustIR still carries the proposition and nothing about the
+//!    witness; it no longer needs to.
+//!    `a_numeral_on_the_right_of_a_comparison_no_longer_changes_the_decidable_witness`
+//!    pins the agreement: the reflection is accepted, the witnesses are
+//!    definitionally equal, and the pre-`c91fa93f5` `Nat`-reduced witness is
+//!    identified with this reflector's — so a Clean pin that separates them again
+//!    fails there, by name. An ACCEPTANCE is evidence of a right body, since
+//!    definitional equality implies equal values; a REJECTION of a `Select`
+//!    reflection is still not by itself evidence of a wrong one (see 2).
 //!
 //! 2. **The emission is not injective on `Select` conditions.** `if a = b` and
 //!    `if a == b` produce byte-identical TrustIR while their declarations are
@@ -245,17 +260,12 @@ enum Reflected {
 ///
 /// [`ReflectRefusal`], by name, for every construct outside the table in the module
 /// docs. A refusal is always preferred to a spelling this reflector cannot justify.
-pub fn reflect_straight_line_function(
-    func: &trust_ir::Function,
-) -> Result<Expr, ReflectRefusal> {
+pub fn reflect_straight_line_function(func: &trust_ir::Function) -> Result<Expr, ReflectRefusal> {
     if func.blocks.len() != 1 {
         return Err(ReflectRefusal::NotStraightLine { blocks: func.blocks.len() });
     }
-    let block: &Block = func
-        .blocks
-        .iter()
-        .find(|b| b.id == func.entry)
-        .ok_or(ReflectRefusal::EntryBlockMissing)?;
+    let block: &Block =
+        func.blocks.iter().find(|b| b.id == func.entry).ok_or(ReflectRefusal::EntryBlockMissing)?;
 
     let mut r = Reflector { carrier: None, values: HashMap::new() };
 
@@ -355,10 +365,9 @@ impl Reflector {
     fn decision(&self, id: ValueId) -> Result<(Expr, Expr), ReflectRefusal> {
         match self.get(id)? {
             Reflected::Decision { prop, decidable } => Ok((prop.clone(), decidable.clone())),
-            Reflected::Term(_) => Err(ReflectRefusal::WrongValueSort {
-                value: id,
-                wanted: "a decidable comparison",
-            }),
+            Reflected::Term(_) => {
+                Err(ReflectRefusal::WrongValueSort { value: id, wanted: "a decidable comparison" })
+            }
         }
     }
 
@@ -394,7 +403,9 @@ impl Reflector {
                     BinOp::Mul => "mul",
                     BinOp::And => "land",
                     BinOp::Or => "lor",
-                    other => return Err(ReflectRefusal::UnsupportedBinOp { op: binop_name(*other) }),
+                    other => {
+                        return Err(ReflectRefusal::UnsupportedBinOp { op: binop_name(*other) });
+                    }
                 };
                 let (a, b) = (self.term(*lhs)?, self.term(*rhs)?);
                 Ok(Reflected::Term(Expr::apps(c.member(suffix), [a, b])))
@@ -438,14 +449,8 @@ impl Reflector {
                 let else_e = self.term(*else_val)?;
                 // `@ite.{u} (α : Sort u) (c : Prop) [Decidable c] (t e : α) : α`.
                 // `UIntN : Type = Sort 1`, so `u = 1`.
-                let ite = Expr::const_(
-                    Name::from_string("ite"),
-                    vec![Level::succ(Level::zero())],
-                );
-                Ok(Reflected::Term(Expr::apps(
-                    ite,
-                    [c.ty_expr(), prop, decidable, then_e, else_e],
-                )))
+                let ite = Expr::const_(Name::from_string("ite"), vec![Level::succ(Level::zero())]);
+                Ok(Reflected::Term(Expr::apps(ite, [c.ty_expr(), prop, decidable, then_e, else_e])))
             }
 
             // ── moves ─────────────────────────────────────────────────────
@@ -486,6 +491,9 @@ fn binop_name(op: BinOp) -> &'static str {
         BinOp::BAnd => "BAnd",
         BinOp::BOr => "BOr",
         BinOp::BXor => "BXor",
+        BinOp::RotL => "RotL",
+        BinOp::RotR => "RotR",
+        BinOp::FCopySign => "FCopySign",
     }
 }
 
@@ -591,7 +599,10 @@ const PROGRAM: &[(&str, &str)] = &[
     // nesting — the operand order that a commutative-only battery cannot see
     ("nest_mul_add", "def nest_mul_add (a : UInt8) (b : UInt8) (c : UInt8) : UInt8 := (a + b) * c"),
     ("nest_sub_sub", "def nest_sub_sub (a : UInt8) (b : UInt8) (c : UInt8) : UInt8 := (a - b) - c"),
-    ("nest_deep", "def nest_deep (a : UInt32) (b : UInt32) (c : UInt32) : UInt32 := (a * b) - (a + c)"),
+    (
+        "nest_deep",
+        "def nest_deep (a : UInt32) (b : UInt32) (c : UInt32) : UInt32 := (a * b) - (a + c)",
+    ),
     // Select over `<` and `<=`
     ("min8", "def min8 (a : UInt8) (b : UInt8) : UInt8 := if a < b then a else b"),
     ("max8", "def max8 (a : UInt8) (b : UInt8) : UInt8 := if a < b then b else a"),
@@ -601,6 +612,44 @@ const PROGRAM: &[(&str, &str)] = &[
     ("le8", "def le8 (a : UInt8) (b : UInt8) : UInt8 := if a <= b then a else b"),
     ("eq8", "def eq8 (a : UInt8) (b : UInt8) : UInt8 := if a = b then a else b"),
     ("eq32", "def eq32 (a : UInt32) (b : UInt32) : UInt32 := if a = b then a else b"),
+    // Nested pure decisions use the same independent instruction reflector;
+    // its reader and kernel-term construction remain unchanged.
+    (
+        "nested8",
+        "def nested8 (reg : UInt8) : UInt8 := if reg < 19 then 0 else if reg < 30 then 1 else 0",
+    ),
+    (
+        "nested16",
+        "def nested16 (reg : UInt16) : UInt16 := if reg < 19 then 0 else if reg < 30 then 1 else 0",
+    ),
+    (
+        "nested32",
+        "def nested32 (reg : UInt32) : UInt32 := if reg < 19 then 0 else if reg < 30 then 1 else 0",
+    ),
+    (
+        "nested64",
+        "def nested64 (reg : UInt64) : UInt64 := if reg < 19 then 0 else if reg < 30 then 1 else 0",
+    ),
+    (
+        "literal_nested8",
+        "def literal_nested8 (a : UInt8) : UInt8 := if a <= 10 then (if a = 7 then 1 else 2) else 3",
+    ),
+    (
+        "literal_nested16",
+        "def literal_nested16 (a : UInt16) : UInt16 := if a <= 10 then (if a = 7 then 1 else 2) else 3",
+    ),
+    (
+        "literal_nested32",
+        "def literal_nested32 (a : UInt32) : UInt32 := if a <= 10 then (if a = 7 then 1 else 2) else 3",
+    ),
+    (
+        "literal_nested64",
+        "def literal_nested64 (a : UInt64) : UInt64 := if a <= 10 then (if a = 7 then 1 else 2) else 3",
+    ),
+    (
+        "forked8",
+        "def forked8 (a b : UInt8) : UInt8 := if a < b then (if b < 30 then a else b) else if a < 19 then b else a",
+    ),
     // bitwise
     ("and8", "def and8 (a : UInt8) (b : UInt8) : UInt8 := a &&& b"),
     ("or8", "def or8 (a : UInt8) (b : UInt8) : UInt8 := a ||| b"),
@@ -660,6 +709,78 @@ fn kernel_accepts_the_independent_reflection_of_every_covered_shape() {
     }
     assert_eq!(agreed, PROGRAM.len());
     println!("kernel agreements: {agreed}");
+}
+
+#[test]
+fn independent_reflection_detects_corruptions_at_each_unsigned_decision() {
+    let env = program_environment();
+    for occurrence in 0..2 {
+        let comparison = |function: &trust_ir::Function| {
+            let mut changed = function.clone();
+            let node = changed.blocks[0]
+                .body
+                .iter_mut()
+                .filter(|node| matches!(&node.inst, Inst::ICmp { .. }))
+                .nth(occurrence)
+                .expect("two actual emitted comparisons");
+            let Inst::ICmp { op, .. } = &mut node.inst else { unreachable!() };
+            assert_eq!(*op, ICmpOp::Ult);
+            *op = ICmpOp::Ule;
+            changed
+        };
+        assert!(!matches!(mutation_trial(&env, "nested8", &comparison), MutationOutcome::Survived));
+        let arms = |function: &trust_ir::Function| {
+            let mut changed = function.clone();
+            let node = changed.blocks[0]
+                .body
+                .iter_mut()
+                .filter(|node| matches!(&node.inst, Inst::Select { .. }))
+                .nth(occurrence)
+                .expect("two actual emitted selects");
+            let Inst::Select { then_val, else_val, .. } = &mut node.inst else { unreachable!() };
+            core::mem::swap(then_val, else_val);
+            changed
+        };
+        assert!(!matches!(mutation_trial(&env, "nested8", &arms), MutationOutcome::Survived));
+    }
+
+    for (occurrence, expected, replacement) in
+        [(0, ICmpOp::Ule, ICmpOp::Ult), (1, ICmpOp::Eq, ICmpOp::Ult)]
+    {
+        let comparison = |function: &trust_ir::Function| {
+            let mut changed = function.clone();
+            let node = changed.blocks[0]
+                .body
+                .iter_mut()
+                .filter(|node| matches!(&node.inst, Inst::ICmp { .. }))
+                .nth(occurrence)
+                .expect("two actual emitted literal comparisons");
+            let Inst::ICmp { op, .. } = &mut node.inst else { unreachable!() };
+            assert_eq!(*op, expected);
+            *op = replacement;
+            changed
+        };
+        assert!(!matches!(
+            mutation_trial(&env, "literal_nested8", &comparison),
+            MutationOutcome::Survived
+        ));
+        let arms = |function: &trust_ir::Function| {
+            let mut changed = function.clone();
+            let node = changed.blocks[0]
+                .body
+                .iter_mut()
+                .filter(|node| matches!(&node.inst, Inst::Select { .. }))
+                .nth(occurrence)
+                .expect("two actual emitted literal selects");
+            let Inst::Select { then_val, else_val, .. } = &mut node.inst else { unreachable!() };
+            core::mem::swap(then_val, else_val);
+            changed
+        };
+        assert!(!matches!(
+            mutation_trial(&env, "literal_nested8", &arms),
+            MutationOutcome::Survived
+        ));
+    }
 }
 
 /// Coverage bookkeeping, asserted rather than asserted-in-prose: every admitted
@@ -818,8 +939,9 @@ fn kernel_rejects_a_deliberately_wrong_reflection() {
     ];
 
     for (declaration, wrong, what) in cases {
-        let reflected = reflect_straight_line_function(&wrong)
-            .unwrap_or_else(|e| panic!("the wrong function for `{declaration}` did not even reflect: {e}"));
+        let reflected = reflect_straight_line_function(&wrong).unwrap_or_else(|e| {
+            panic!("the wrong function for `{declaration}` did not even reflect: {e}")
+        });
         let declared = declared_value(&env, declaration);
         assert!(
             !tc.is_def_eq(&reflected, &declared),
@@ -853,9 +975,11 @@ fn distinct_declarations_do_not_collapse_onto_one_another() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Two places where the IR does not determine the Clean term up to DEFINITIONAL
-// equality. Neither is a defect in the emitted body — both are limits on what a
-// defeq-judged round trip can conclude, and both are measured rather than argued.
+// Two places where the IR does not record what the Clean source wrote. Neither is
+// a defect in the emitted body. The first (the `Decidable` witness of a numeral
+// comparison) stopped costing definitional equality at Clean `c91fa93f5` and is
+// now pinned as an agreement; the second is still a limit on what a defeq-judged
+// round trip can conclude. Both are measured rather than argued.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Wrap `body` in `n` `UIntN` binders, so an open subterm can be compared as a
@@ -894,24 +1018,34 @@ fn strip_lams(e: &Expr, n: usize) -> Expr {
     cur
 }
 
-/// **Finding 1.** When the right operand of a `<` is a numeral, Clean's elaborator
-/// synthesizes a DIFFERENT `Decidable` witness (`instDecidableNatLt` on the
-/// `Nat` projections) than the carrier's registered one (`instDecidableUIntNLt`,
-/// i.e. `UIntN.decLt`) — and the two are not definitionally equal under an open
-/// operand. TrustIR's `ICmp` + `Select` records the PROPOSITION and nothing about
-/// the witness, so no reflector can recover which one the source used.
+/// **Finding 1, resolved upstream.** When the right operand of a `<` is a numeral,
+/// Clean's elaborator does not spell the witness this reflector spells
+/// (`UInt8.decLt a (UInt8.ofNat 10)`). On every Clean pin before `c91fa93f5` it
+/// synthesized `instDecidableNatLt a.toBitVec.toFin.val 10` — the `Nat` decision
+/// on the projections — and that was NOT definitionally equal to the carrier's
+/// under an open operand: the kernel rejected this reflection although its
+/// proposition was the declaration's own and patching in the declaration's
+/// witness made it accept. TrustIR's `ICmp` + `Select` records the PROPOSITION and
+/// nothing about the witness, so no reflector could recover which one was used.
 ///
-/// This test pins the gap precisely: the proposition this reflector emits IS
-/// definitionally the declaration's, and substituting the declaration's own
-/// witness into this reflector's term makes the kernel accept. So the only
-/// difference is the decision procedure, which does not change the function's
-/// value — `Decidable` instances of one proposition are propositionally unique.
+/// Clean `c91fa93f5` ("kernel(uint): the BitVec-carrier decLe/decLt ARE
+/// Nat.decLe/decLt, so `decide (d < 21)` is the carrier's decision") made the
+/// question moot. Measured with `clean check` at the superproject pin `dca882b5f`:
+/// the elaborator now picks the CARRIER instance over the numeral unfolded one
+/// δβ step, `instDecidableUInt8Lt a (UInt8.ofBitVec (BitVec.ofFin 8 (Fin.ofNat
+/// 255 10)))`, and the kernel identifies it — and the old `Nat`-reduced witness —
+/// with `UInt8.decLt a (UInt8.ofNat 10)`. On the previous pin (`faf434b73`) the
+/// reflection and the `Nat`-reduced comparison are rejected, as this test used to
+/// assert. The IR still records no witness; it no longer needs to.
 ///
-/// Consequence to carry: a kernel REJECTION of a `Select` reflection is not by
-/// itself evidence of a wrong body. An ACCEPTANCE still is evidence of a right
-/// one, since definitional equality implies equal values.
+/// So the four steps that used to isolate the gap now pin the agreement: the whole
+/// reflection is accepted, the propositions agree, the witnesses agree, and the
+/// declaration's own witness patched into this reflector's term is still accepted.
+/// Step 3 also names the pre-`c91fa93f5` witness explicitly, so a Clean pin that
+/// separates the two decisions again fails HERE, with this finding's name on it,
+/// rather than as an unexplained rejection.
 #[test]
-fn a_numeral_on_the_right_of_a_comparison_changes_the_decidable_witness_only() {
+fn a_numeral_on_the_right_of_a_comparison_no_longer_changes_the_decidable_witness() {
     let mut session = CleanIslandSession::new();
     let src = "def lt_lit (a : UInt8) (b : UInt8) : UInt8 := if a < 10 then a else b";
     assert!(!session.check(src).is_rejected());
@@ -923,13 +1057,15 @@ fn a_numeral_on_the_right_of_a_comparison_changes_the_decidable_witness_only() {
     let mine = reflect_straight_line_function(&func).expect("reflects");
     let declared = declared_value(&env, "lt_lit");
 
-    // 1. The kernel rejects the reflection outright.
+    // 1. The kernel accepts the reflection outright.
     assert!(
-        !tc.is_def_eq(&mine, &declared),
-        "expected the numeral-comparison shape to be a measured defeq gap"
+        tc.is_def_eq(&mine, &declared),
+        "the numeral-comparison shape must round-trip on a Clean pin carrying c91fa93f5 \
+         (step 3 below says whether the two decisions have come apart again)\n  \
+         reflected = {mine:?}\n  declared  = {declared:?}"
     );
 
-    // 2. But the PROPOSITIONS agree.
+    // 2. The PROPOSITIONS agree.
     let [_, my_prop, my_dec, ..] = split_ite(&strip_lams(&mine, 2)).expect("an ite");
     let [_, their_prop, their_dec, ..] = split_ite(&strip_lams(&declared, 2)).expect("an ite");
     assert!(
@@ -940,17 +1076,36 @@ fn a_numeral_on_the_right_of_a_comparison_changes_the_decidable_witness_only() {
         "the reflected comparison must be the declaration's own proposition"
     );
 
-    // 3. And the WITNESSES do not.
+    // 3. And so do the WITNESSES — the declaration's own, and the `Nat`-reduced
+    //    `instDecidableNatLt a.toBitVec.toFin.val 10` every pre-`c91fa93f5` pin
+    //    elaborated, built here with the same projection chain it carried.
     assert!(
-        !tc.is_def_eq(
+        tc.is_def_eq(
             &under_binders(u8, 2, my_dec.clone()),
             &under_binders(u8, 2, their_dec.clone())
         ),
-        "the two Decidable witnesses were expected to be definitionally distinct"
+        "this reflector's `UInt8.decLt` and the declaration's Decidable witness must be \
+         definitionally equal on a Clean pin carrying c91fa93f5"
+    );
+    let to_nat = Expr::proj(
+        Name::from_string("Fin"),
+        0,
+        Expr::proj(
+            Name::from_string("BitVec"),
+            0,
+            Expr::proj(Name::from_string("UInt8"), 0, Expr::bvar(1)),
+        ),
+    );
+    let nat_reduced = Expr::apps(konst("instDecidableNatLt"), [to_nat, Expr::nat_lit(10)]);
+    assert!(
+        tc.is_def_eq(&under_binders(u8, 2, my_dec), &under_binders(u8, 2, nat_reduced)),
+        "the carrier decision and the `Nat` decision on its projections have come apart \
+         again: Finding 1 is back, and this test must go back to pinning the gap"
     );
 
-    // 4. Swap in the declaration's witness and the kernel accepts — so the
-    //    witness is the whole of the difference.
+    // 4. The declaration's own witness patched into this reflector's term is
+    //    accepted too — the step that used to show the witness was the whole of
+    //    the difference, kept as the control that the split above is faithful.
     let patched = under_binders(
         u8,
         2,
@@ -1129,12 +1284,13 @@ fn clean_primitives_have_the_semantics_this_reflector_assumes() {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Build a one-block function: `params`, then `body`, then `Return [ret]`.
-fn hand_built(
-    params: &[Ty],
-    body: Vec<Inst>,
-    ret: ValueId,
-) -> trust_ir::Function {
-    let mut f = trust_ir::Function::new(FuncId::new(0), "hand", FuncTyId::new(0), trust_ir::BlockId::new(0));
+fn hand_built(params: &[Ty], body: Vec<Inst>, ret: ValueId) -> trust_ir::Function {
+    let mut f = trust_ir::Function::new(
+        FuncId::new(0),
+        "hand",
+        FuncTyId::new(0),
+        trust_ir::BlockId::new(0),
+    );
     let mut block = Block::new(trust_ir::BlockId::new(0));
     for (i, ty) in params.iter().enumerate() {
         block.params.push((ValueId::new(i as u32), ty.clone()));
@@ -1156,7 +1312,12 @@ fn every_shape_outside_the_vocabulary_is_refused_by_name() {
     // Signed carrier — no fixed-width `IntN` spelling was justified.
     let signed = hand_built(
         &[Ty::I32, Ty::I32],
-        vec![Inst::BinOp { op: BinOp::Add, ty: Ty::I32, lhs: ValueId::new(0), rhs: ValueId::new(1) }],
+        vec![Inst::BinOp {
+            op: BinOp::Add,
+            ty: Ty::I32,
+            lhs: ValueId::new(0),
+            rhs: ValueId::new(1),
+        }],
         ValueId::new(2),
     );
     assert_eq!(
@@ -1181,14 +1342,24 @@ fn every_shape_outside_the_vocabulary_is_refused_by_name() {
     // Division: Clean's `.div` is total (`x / 0 = 0`), TrustIR's `UDiv` traps.
     let udiv = hand_built(
         &[Ty::U8, Ty::U8],
-        vec![Inst::BinOp { op: BinOp::UDiv, ty: Ty::U8, lhs: ValueId::new(0), rhs: ValueId::new(1) }],
+        vec![Inst::BinOp {
+            op: BinOp::UDiv,
+            ty: Ty::U8,
+            lhs: ValueId::new(0),
+            rhs: ValueId::new(1),
+        }],
         ValueId::new(2),
     );
     assert_eq!(reflect_straight_line_function(&udiv), Err(R::UnsupportedBinOp { op: "UDiv" }));
 
     let urem = hand_built(
         &[Ty::U8, Ty::U8],
-        vec![Inst::BinOp { op: BinOp::URem, ty: Ty::U8, lhs: ValueId::new(0), rhs: ValueId::new(1) }],
+        vec![Inst::BinOp {
+            op: BinOp::URem,
+            ty: Ty::U8,
+            lhs: ValueId::new(0),
+            rhs: ValueId::new(1),
+        }],
         ValueId::new(2),
     );
     assert_eq!(reflect_straight_line_function(&urem), Err(R::UnsupportedBinOp { op: "URem" }));
@@ -1203,10 +1374,17 @@ fn every_shape_outside_the_vocabulary_is_refused_by_name() {
         assert_eq!(reflect_straight_line_function(&f), Err(R::UnsupportedBinOp { op: name }));
     }
 
-    // `Xor`: the measured prelude has no `UInt8.xor` at all.
+    // `Xor`: spellable since Clean `bf31976f48` (`UInt8.xor`), and still refused —
+    // this reflector has no measured row for it and nothing emits one to exercise
+    // (see the header's refusal list for what reflecting it would need).
     let xor = hand_built(
         &[Ty::U8, Ty::U8],
-        vec![Inst::BinOp { op: BinOp::Xor, ty: Ty::U8, lhs: ValueId::new(0), rhs: ValueId::new(1) }],
+        vec![Inst::BinOp {
+            op: BinOp::Xor,
+            ty: Ty::U8,
+            lhs: ValueId::new(0),
+            rhs: ValueId::new(1),
+        }],
         ValueId::new(2),
     );
     assert_eq!(reflect_straight_line_function(&xor), Err(R::UnsupportedBinOp { op: "Xor" }));
@@ -1256,7 +1434,12 @@ fn every_shape_outside_the_vocabulary_is_refused_by_name() {
     // A comparison used where a carrier term is required.
     let cmp_as_term = hand_built(
         &[Ty::U8, Ty::U8],
-        vec![Inst::ICmp { op: ICmpOp::Ult, ty: Ty::U8, lhs: ValueId::new(0), rhs: ValueId::new(1) }],
+        vec![Inst::ICmp {
+            op: ICmpOp::Ult,
+            ty: Ty::U8,
+            lhs: ValueId::new(0),
+            rhs: ValueId::new(1),
+        }],
         ValueId::new(2),
     );
     assert_eq!(
@@ -1265,18 +1448,29 @@ fn every_shape_outside_the_vocabulary_is_refused_by_name() {
     );
 
     // Constants outside the carrier, and non-integer constants.
-    let oob = hand_built(&[], vec![Inst::Const { ty: Ty::U8, value: Constant::Int(256) }], ValueId::new(0));
+    let oob = hand_built(
+        &[],
+        vec![Inst::Const { ty: Ty::U8, value: Constant::Int(256) }],
+        ValueId::new(0),
+    );
     assert_eq!(
         reflect_straight_line_function(&oob),
         Err(R::ConstantOutOfCarrier { value: 256, carrier: "UInt8" })
     );
-    let neg = hand_built(&[], vec![Inst::Const { ty: Ty::U8, value: Constant::Int(-1) }], ValueId::new(0));
+    let neg = hand_built(
+        &[],
+        vec![Inst::Const { ty: Ty::U8, value: Constant::Int(-1) }],
+        ValueId::new(0),
+    );
     assert_eq!(
         reflect_straight_line_function(&neg),
         Err(R::ConstantOutOfCarrier { value: -1, carrier: "UInt8" })
     );
-    let boolean =
-        hand_built(&[], vec![Inst::Const { ty: Ty::U8, value: Constant::Bool(true) }], ValueId::new(0));
+    let boolean = hand_built(
+        &[],
+        vec![Inst::Const { ty: Ty::U8, value: Constant::Bool(true) }],
+        ValueId::new(0),
+    );
     assert_eq!(
         reflect_straight_line_function(&boolean),
         Err(R::UnsupportedConstant { detail: "Bool".to_owned() })
@@ -1321,10 +1515,7 @@ fn every_shape_outside_the_vocabulary_is_refused_by_name() {
     // No `Return`.
     let mut no_ret = hand_built(&[Ty::U8], vec![], ValueId::new(0));
     no_ret.blocks[0].body.clear();
-    assert!(matches!(
-        reflect_straight_line_function(&no_ret),
-        Err(R::MalformedTerminator { .. })
-    ));
+    assert!(matches!(reflect_straight_line_function(&no_ret), Err(R::MalformedTerminator { .. })));
 
     // A dangling reference.
     let dangling = hand_built(&[Ty::U8], vec![], ValueId::new(9));
@@ -1336,10 +1527,7 @@ fn every_shape_outside_the_vocabulary_is_refused_by_name() {
     // A `Return` of no value at all.
     let mut unit = hand_built(&[Ty::U8], vec![], ValueId::new(0));
     unit.blocks[0].body = vec![trust_ir::InstrNode::new(Inst::Return { values: vec![] })];
-    assert_eq!(
-        reflect_straight_line_function(&unit),
-        Err(R::UnsupportedReturnArity { values: 0 })
-    );
+    assert_eq!(reflect_straight_line_function(&unit), Err(R::UnsupportedReturnArity { values: 0 }));
 }
 
 /// A refusal must be a refusal, not a silent success — the `Copy` spelling is the
@@ -1410,8 +1598,14 @@ fn copy_is_a_move_and_still_carries_its_type() {
 /// supposed to have BECOME, used by
 /// [`each_mutant_denotes_exactly_the_declaration_it_was_corrupted_into`].
 const MUTATION_EXTRAS: &[(&str, &str)] = &[
-    ("lt_pick", "def lt_pick (a : UInt8) (b : UInt8) (c : UInt8) : UInt8 := if a < b then a else c"),
-    ("le_pick", "def le_pick (a : UInt8) (b : UInt8) (c : UInt8) : UInt8 := if a <= b then a else c"),
+    (
+        "lt_pick",
+        "def lt_pick (a : UInt8) (b : UInt8) (c : UInt8) : UInt8 := if a < b then a else c",
+    ),
+    (
+        "le_pick",
+        "def le_pick (a : UInt8) (b : UInt8) (c : UInt8) : UInt8 := if a <= b then a else c",
+    ),
     ("k_eight", "def k_eight : UInt8 := 8"),
     ("lit_add8", "def lit_add8 (a : UInt8) : UInt8 := a + 8"),
     ("s8_flip", "def s8_flip (a : UInt8) (b : UInt8) : UInt8 := b - a"),
@@ -1724,6 +1918,7 @@ fn mutation_constant_shifted_by_one() {
             trial("lit_add", "a + 7 -> a + 8", true, up()),
             trial("lit_sub", "a - 1 -> a - 2", true, up()),
             trial("lit_mul64", "a * 1000000 -> a * 1000001", true, up()),
+            trial("literal_nested8", "literal threshold 10 -> 11", true, up()),
         ],
     );
 }

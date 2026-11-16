@@ -17,6 +17,13 @@ both. These four are it — each was picked as the *smallest* bundle in a
 | `dab8f0a0f42ec297-ecc64d9c2a9c897b` | `serde_core::de::value::<impl IntoDeserializer for f32>::into_deserializer` | declines at `signature_param_ty_unsupported` |
 | `a2773eecdb558e6a-b9b73e924c71e025` | `serde_core::ser::impls::<impl Serialize for OsStr>::serialize` | declines at `signature_return_ty_unsupported` |
 
+The third column records the outcome each bundle was picked for. The
+interpreter has moved since then. Measured 2026-10-02 at trust-mc `af6a183d3`
+(Trust's pin): `mixed_site` now summarizes, and the `OsStr` bundle declines at
+`unmodeled_instruction` (GEP). The corpus therefore no longer exercises
+`signature_return_ty_unsupported`, but it still holds two summaries and two
+declines, so both controls fire.
+
 They are ordinary dependency bodies, not hand-written fixtures: the census is a
 statement about real code, and a control built only from synthetic IR would not
 be evidence that the interpreter behaves this way on any.

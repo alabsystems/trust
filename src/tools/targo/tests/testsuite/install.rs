@@ -19,7 +19,7 @@ use cargo_util::{ProcessBuilder, ProcessError};
 
 use crate::utils::cross_compile::disabled as cross_compile_disabled;
 use cargo_test_support::install::{assert_has_installed_exe, assert_has_not_installed_exe, exe};
-use cargo_test_support::paths::{self, cargo_home};
+use cargo_test_support::paths::{self, ReadOnly, cargo_home};
 
 fn pkg(name: &str, vers: &str) {
     Package::new(name, vers)
@@ -265,7 +265,14 @@ fn multiple_pkgs() {
 }
 
 fn path() -> Vec<PathBuf> {
-    env::split_paths(&env::var_os("PATH").unwrap_or_default()).collect()
+    // Extend the fixture's compiler PATH, including bootstrap's isolated
+    // rustc/rustdoc shims, rather than restoring the outer build environment.
+    let command = cargo_test_support::process("cargo");
+    let path = command
+        .get_env("PATH")
+        .or_else(|| env::var_os("PATH"))
+        .unwrap_or_default();
+    env::split_paths(&path).collect()
 }
 
 #[cargo_test]
@@ -1447,9 +1454,6 @@ fn uninstall_cwd_no_project() {
         .with_stderr_data(str![[r#"
 [ERROR] failed to read `[ROOT]/Cargo.toml`
 
-Caused by:
-  [NOT_FOUND]
-
 "#]])
         .run();
 }
@@ -1550,9 +1554,7 @@ fn readonly_dir() {
     let root = paths::root();
     let dir = &root.join("readonly");
     fs::create_dir(root.join("readonly")).unwrap();
-    let mut perms = fs::metadata(dir).unwrap().permissions();
-    perms.set_readonly(true);
-    fs::set_permissions(dir, perms).unwrap();
+    let _readonly = ReadOnly::new(&dir);
 
     cargo_process("install foo").cwd(dir).run();
     assert_has_installed_exe(paths::cargo_home(), "foo");
@@ -1957,7 +1959,7 @@ fn custom_target_dir_for_git_source() {
 
 #[cargo_test]
 fn install_respects_lock_file() {
-    // `cargo install` now requires --locked to use a Cargo.lock.
+    // Verify `cargo install` uses the packaged Cargo.lock by default.
     Package::new("bar", "0.1.0").publish();
     Package::new("bar", "0.1.1")
         .file("src/lib.rs", "not rust")
@@ -1990,18 +1992,15 @@ dependencies = [
     cargo_process("install foo")
         .with_stderr_data(str![[r#"
 ...
-[..]not rust[..]
+[COMPILING] bar v0.1.0
 ...
 "#]])
-        .with_status(101)
         .run();
-    cargo_process("install --locked foo").run();
 }
 
 #[cargo_test]
 fn install_path_respects_lock_file() {
-    // --path version of install_path_respects_lock_file, --locked is required
-    // to use Cargo.lock.
+    // Verify `cargo install --path` uses Cargo.lock by default.
     Package::new("bar", "0.1.0").publish();
     Package::new("bar", "0.1.1")
         .file("src/lib.rs", "not rust")
@@ -2040,12 +2039,98 @@ dependencies = [
     p.cargo("install --path .")
         .with_stderr_data(str![[r#"
 ...
-[..]not rust[..]
+[COMPILING] bar v0.1.0
 ...
 "#]])
-        .with_status(101)
         .run();
-    p.cargo("install --path . --locked").run();
+}
+
+#[cargo_test]
+fn locked_install_honors_lock_file() {
+    // Verify `--locked` uses the packaged lock file.
+    Package::new("bar", "0.1.0").publish();
+    Package::new("bar", "0.1.1")
+        .file("src/lib.rs", "not rust")
+        .publish();
+    Package::new("foo", "0.1.0")
+        .dep("bar", "0.1")
+        .file("src/lib.rs", "")
+        .file(
+            "src/main.rs",
+            "extern crate foo; extern crate bar; fn main() {}",
+        )
+        .file(
+            "Cargo.lock",
+            r#"
+[[package]]
+name = "bar"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "foo"
+version = "0.1.0"
+dependencies = [
+ "bar 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+"#,
+        )
+        .publish();
+
+    cargo_process("install --locked foo")
+        .with_stderr_data(str![[r#"
+...
+[COMPILING] bar v0.1.0
+...
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn locked_install_path_honors_lock_file() {
+    // Verify `--locked` uses Cargo.lock when installing from a path.
+    Package::new("bar", "0.1.0").publish();
+    Package::new("bar", "0.1.1")
+        .file("src/lib.rs", "not rust")
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+             [package]
+             name = "foo"
+             version = "0.1.0"
+
+             [dependencies]
+             bar = "0.1"
+             "#,
+        )
+        .file("src/main.rs", "extern crate bar; fn main() {}")
+        .file(
+            "Cargo.lock",
+            r#"
+ [[package]]
+ name = "bar"
+ version = "0.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+
+ [[package]]
+ name = "foo"
+ version = "0.1.0"
+ dependencies = [
+  "bar 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ ]
+ "#,
+        )
+        .build();
+
+    p.cargo("install --path . --locked")
+        .with_stderr_data(str![[r#"
+...
+[COMPILING] bar v0.1.0
+...
+"#]])
+        .run();
 }
 
 #[cargo_test]
@@ -2473,6 +2558,26 @@ workspace: [ROOT]/foo/Cargo.toml
 }
 
 #[cargo_test]
+fn install_without_published_lockfile() {
+    Package::new("foo", "0.1.0")
+        .file("src/main.rs", "//! Some docs\nfn main() {}")
+        .publish();
+
+    cargo_process("install foo").with_stderr_data(str![[r#"
+[UPDATING] `dummy-registry` index
+[DOWNLOADING] crates ...
+[DOWNLOADED] foo v0.1.0 (registry `dummy-registry`)
+[INSTALLING] foo v0.1.0
+[COMPILING] foo v0.1.0
+[FINISHED] `release` profile [optimized] target(s) in [ELAPSED]s
+[INSTALLING] [ROOT]/home/.cargo/bin/foo[EXE]
+[INSTALLED] package `foo v0.1.0` (executable `foo[EXE]`)
+[WARNING] be sure to add `[ROOT]/home/.cargo/bin` to your PATH to be able to run the installed binaries
+
+"#]]).run();
+}
+
+#[cargo_test]
 fn locked_install_without_published_lockfile() {
     Package::new("foo", "0.1.0")
         .file("src/main.rs", "//! Some docs\nfn main() {}")
@@ -2617,7 +2722,7 @@ To reuse those artifacts with a future compilation, set the environment variable
     let end = stderr.find('.').unwrap() - 1;
     let path = Path::new(&stderr[..end]);
     assert!(path.exists());
-    assert!(path.join("release/deps").exists());
+    assert!(path.join("release/build/foo").exists());
 }
 
 #[cargo_test]
@@ -2752,8 +2857,6 @@ fn self_referential() {
 [DOWNLOADING] crates ...
 [DOWNLOADED] foo v0.0.2 (registry `dummy-registry`)
 [INSTALLING] foo v0.0.2
-[LOCKING] 1 package to latest compatible version
-[ADDING] foo v0.0.1 (available: v0.0.2)
 [DOWNLOADING] crates ...
 [DOWNLOADED] foo v0.0.1 (registry `dummy-registry`)
 [COMPILING] foo v0.0.1
@@ -2788,6 +2891,9 @@ fn ambiguous_registry_vs_local_package() {
 
         [dependencies]
         foo = "0.0.1"
+
+        [lints.cargo]
+        default = "allow"
     "#,
         )
         .build();
@@ -2797,7 +2903,6 @@ fn ambiguous_registry_vs_local_package() {
         .with_stderr_data(str![[r#"
 [INSTALLING] foo v0.1.0 ([ROOT]/foo)
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] foo v0.0.1 (registry `dummy-registry`)
 [COMPILING] foo v0.0.1
@@ -2813,7 +2918,7 @@ fn ambiguous_registry_vs_local_package() {
 }
 
 #[cargo_test]
-fn install_with_redundant_default_mode() {
+fn install_with_redundant_default_profile() {
     pkg("foo", "0.0.1");
 
     cargo_process("install foo --release")
@@ -2828,6 +2933,26 @@ For more information, try '--help'.
 
 "#]])
         .with_status(1)
+        .run();
+}
+
+#[cargo_test]
+fn install_with_debug_profile() {
+    pkg("foo", "0.0.1");
+
+    cargo_process("install foo --debug")
+        .with_stderr_data(str![[r#"
+[UPDATING] `dummy-registry` index
+[DOWNLOADING] crates ...
+[DOWNLOADED] foo v0.0.1 (registry `dummy-registry`)
+[INSTALLING] foo v0.0.1
+[COMPILING] foo v0.0.1
+[FINISHED] `debug` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[INSTALLING] [ROOT]/home/.cargo/bin/foo[EXE]
+[INSTALLED] package `foo v0.0.1` (executable `foo[EXE]`)
+[WARNING] be sure to add `[ROOT]/home/.cargo/bin` to your PATH to be able to run the installed binaries
+
+"#]])
         .run();
 }
 
@@ -3051,7 +3176,6 @@ fn dry_run_incompatible_package_dependency() {
 [INSTALLING] foo v0.1.0 ([ROOT]/foo)
 [WARNING] Cargo.toml: `package.edition` is unspecified, defaulting to `2015` while the latest is `2024`
 [WARNING] `foo` (manifest) generated 1 warning
-[LOCKING] 1 package to latest compatible version
 [ERROR] failed to compile `foo v0.1.0 ([ROOT]/foo)`, intermediate artifacts can be found at `[ROOT]/foo/target`.
 To reuse those artifacts with a future compilation, set the environment variable `CARGO_BUILD_BUILD_DIR` to that path.
 
@@ -3211,8 +3335,8 @@ im_a_teapot = "warn"
         )
         .file("src/main.rs", "fn main() { let unused = 10; }")
         .build();
-    p.cargo("install --path . -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints", "test-dummy-unstable"])
+    p.cargo("install --path .")
+        .masquerade_as_nightly_cargo(&["test-dummy-unstable"])
         .with_stdout_data(str![])
         .with_stderr_data(str![[r#"
 [INSTALLING] foo v0.0.1 ([ROOT]/foo)
@@ -3253,14 +3377,14 @@ authors = []
 im-a-teapot = true
 
 [lints.cargo]
-im-a-teapot = "deny"
+im_a_teapot = "deny"
             "#,
         )
         .file("src/main.rs", "fn main() { let unused = 10; }")
         .publish();
 
-    cargo_process("install foo -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints", "test-dummy-unstable"])
+    cargo_process("install foo")
+        .masquerade_as_nightly_cargo(&["test-dummy-unstable"])
         .with_stdout_data(str![])
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index

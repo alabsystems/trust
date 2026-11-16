@@ -16,6 +16,9 @@ The lists extracted, and where they live:
   4. the four drop-glue allowlists (is_total_drop_std_leaf,
      is_audited_panic_free_std_drop, is_never_drops_contents_wrapper,
      is_std_owning_or_scaffold)   — crates/trust-ir-bridge/src/lower.rs
+  5. the `@trust-total-to-string::` stamp's admitted `Self` set
+     (to_string_self_ty_is_foundational, TO_STRING_STR_MAX_REF_DEPTH)
+                                  — crates/trust-mir-extract/src/convert.rs
 
 Design rules this file obeys (same contract as tools/preflight.py):
 
@@ -50,6 +53,35 @@ from pathlib import Path
 
 LOWER_RS = "crates/trust-ir-bridge/src/lower.rs"
 TRUST_VERIFY_RS = "compiler/rustc_mir_transform/src/trust_verify.rs"
+CONVERT_RS = "crates/trust-mir-extract/src/convert.rs"
+PANIC_FREE_INTRINSIC_RS = "crates/trust-types/src/panic_free_intrinsic.rs"
+
+# Lang item -> the sysroot crate that DEFINES it. `crate_is_authentic_foundational`
+# decides "foundational" by which crate OWNS one of these; a disjunct naming any
+# other lang item (or any other shape) is anchor drift, because this table is
+# what the published text says each crate is recognised by.
+FOUNDATIONAL_LANG_ITEM_OWNER = {
+    "sized_trait": "core",
+    "owned_box": "alloc",
+    "string": "alloc",
+    "panic_impl": "std",
+}
+
+# The `TyKind` arms of `to_string_self_ty_is_foundational`, and what each one
+# admits. A new arm is anchor drift until it is described here: the published
+# set must say what the code accepts, not merely how many arms it has.
+TO_STRING_SELF_ARMS = {
+    "Bool": "bare `bool`",
+    "Char": "bare `char`",
+    "Int": "every bare signed integer (`i8` … `i128`, `isize`)",
+    "Uint": "every bare unsigned integer (`u8` … `u128`, `usize`)",
+    "Str": "`str`",
+    "Ref": "a chain of 1 to {depth} SHARED references ending at `str` "
+    "(`to_string_str_ref_chain_depth`); no other reference",
+    "Adt": "bare `alloc::string::String`: the `String` lang item AND the "
+    "compiler's own `alloc` by artifact residency (`is_real_alloc_crate`), "
+    "no generic arguments",
+}
 TCB_MD = "docs/TCB.md"
 
 BEGIN_MARKER = "<!-- BEGIN GENERATED tcb-std-name-lists"
@@ -227,7 +259,21 @@ def extract_exact_total(lower: str) -> list[str]:
             "`contains` on the normalized path — the published list would no "
             "longer mean what this section claims"
         )
-    return const_str_array(lower, "const EXACT_TOTAL: &[&str] = &[", LOWER_RS)
+    entries = const_str_array(lower, "const EXACT_TOTAL: &[&str] = &[", LOWER_RS)
+    # A repeated entry is inert for the membership test, but the published
+    # "N entries" would count it twice and over-state the trusted surface (five
+    # repeats were found and removed 2026-10-15: 240 listed, 235 distinct).
+    # Refuse it, so the list stays a set and the count is the count of distinct
+    # names.
+    seen: set[str] = set()
+    repeated = [e for e in entries if e in seen or seen.add(e)]
+    if repeated:
+        die(
+            f"`EXACT_TOTAL` in {LOWER_RS} lists {len(set(repeated))} name(s) more than "
+            f"once ({', '.join(sorted(set(repeated)))}); delete the later copies "
+            "so the published count is the count of distinct names"
+        )
+    return entries
 
 
 def extract_intrinsics(lower: str) -> list[str]:
@@ -254,6 +300,45 @@ def extract_intrinsics(lower: str) -> list[str]:
     return names
 
 
+PANIC_FREE_ANCHOR = "pub const PANIC_FREE_RUSTC_INTRINSICS: &[PanicFreeIntrinsicEntry] = &["
+PANIC_FREE_ENTRY = re.compile(
+    r'^entry\("(\w+)", (16|32|64|128), (Unary|Binary|PowI), (true|false)\),$'
+)
+
+
+def extract_panic_free_intrinsics(src: str) -> list[tuple[str, str, str, str]]:
+    """The std-call-summaries P2 panic-freedom-only intrinsic list, entry by entry.
+
+    Anchored on the const declaration, its `];` terminator, and the classifier
+    that consumes it; every non-comment line in between must be one `entry(...)`
+    call, so an entry spelled another way is a hard failure, never uncounted.
+    """
+    start = src.find(PANIC_FREE_ANCHOR)
+    if start < 0:
+        die(f"anchor drift: `{PANIC_FREE_ANCHOR}` not found in {PANIC_FREE_INTRINSIC_RS}")
+    end = src.find("\n];", start)
+    if end < 0:
+        die("anchor drift: PANIC_FREE_RUSTC_INTRINSICS has no `];` terminator")
+    if "panic_free_intrinsic_entry(name)" not in src:
+        die(
+            "anchor drift: `classify_panic_free_intrinsic` no longer resolves names "
+            "through `panic_free_intrinsic_entry` — the published list would no "
+            "longer be the classifier's whole domain"
+        )
+    out = []
+    for raw in src[start + len(PANIC_FREE_ANCHOR) : end].splitlines():
+        line = strip_line_comment(raw).strip()
+        if not line:
+            continue
+        m = PANIC_FREE_ENTRY.match(line)
+        if not m:
+            die(f"anchor drift: unparseable PANIC_FREE_RUSTC_INTRINSICS line: {raw!r}")
+        out.append(m.groups())
+    if not out:
+        die("anchor drift: PANIC_FREE_RUSTC_INTRINSICS parsed to zero entries")
+    return out
+
+
 def extract_iterator_arms(verify: str) -> list[dict]:
     body = fn_body(verify, "total_std_iterator_ty", TRUST_VERIFY_RS)
     # Fail-closed anchors: the local-DefId rejection, the real-crate gate, and
@@ -264,9 +349,16 @@ def extract_iterator_arms(verify: str) -> list[dict]:
     crate_gate = re.search(
         r'crate_name\(did\.krate\)\.as_str\(\),\s*((?:"\w+"\s*\|\s*)*"\w+")', body
     )
-    if not crate_gate:
+    if crate_gate:
+        gate = {"kind": "crate-name", "crates": re.findall(r'"(\w+)"', crate_gate.group(1))}
+    elif "if !crate_is_authentic_foundational(tcx, did.krate) {" in body:
+        # The gate is LANG-ITEM OWNERSHIP compared by `CrateNum`, not the
+        # `--crate-name` string. Its disjuncts are PARSED, not assumed: a
+        # widened body (`true || …`, a new lang item, a name test) fails here
+        # instead of re-certifying the published sentence.
+        gate = {"kind": "lang-item", "anchors": foundational_lang_item_anchors(verify)}
+    else:
         die("anchor drift: `total_std_iterator_ty` crate-identity gate not found")
-    crates = re.findall(r'"(\w+)"', crate_gate.group(1))
     if "_ => false" not in body:
         die("anchor drift: `total_std_iterator_ty` lost its `_ => false` fallback")
     mt = re.search(r"match tcx\.item_name\(did\)\.as_str\(\) \{", body)
@@ -287,7 +379,12 @@ def extract_iterator_arms(verify: str) -> list[dict]:
             die("anchor drift: iterator match arm with no head-type literal")
         anchors = re.findall(r'def_path_has_module_segment\(tcx, did, "(\w+)"\)', arm_text)
         recursive = "total_std_iterator_ty(" in arm_text
+        # DC-1 (2026-10-04): an arm that ALSO requires the inner iterator to
+        # yield at most `usize::MAX` items (`Enumerate`, whose counter is
+        # overflow-checked in the caller's profile).
+        len_bounded = "total_std_iterator_len_fits_usize(" in arm_text
         int_only = "ty::Int(_)" in arm_text and "ty::Uint(_)" in arm_text
+        pattern_gated = "str_pattern_ty_is_core(" in arm_text
         both_sides = bool(re.search(r"&&\s*\n?\s*total_std_iterator_ty\(", arm_text)) or (
             arm_text.count("total_std_iterator_ty(") >= 2
         )
@@ -297,11 +394,204 @@ def extract_iterator_arms(verify: str) -> list[dict]:
                     "head": h,
                     "anchors": anchors,
                     "recursive": recursive,
+                    "len_bounded": len_bounded and recursive,
                     "int_only": int_only,
+                    "pattern_gated": pattern_gated,
                     "both_sides": both_sides and recursive,
                 }
             )
-    return [{"crates": crates}] + arms
+    return [gate] + arms
+
+
+LANG_ITEM_OWNERSHIP = re.compile(
+    r"^tcx\.lang_items\(\)\.(\w+)\(\)\.is_some_and\(\|d\|d\.krate==krate\)$"
+)
+
+# The `owns` shorthand `crate_is_authentic_foundational` binds before its
+# disjunction (whitespace removed). A disjunct may spell `owns(lang_items.X())`
+# only when the body opens with exactly this prelude, so the shorthand cannot
+# be rebound to something that is not an ownership test.
+OWNS_PRELUDE = (
+    "letlang_items=tcx.lang_items();"
+    "letowns=|item:Option<DefId>|item.is_some_and(|d|d.krate==krate);"
+)
+OWNS_CALL = re.compile(r"^owns\(lang_items\.(\w+)\(\)\)$")
+
+# ARTIFACT RESIDENCY (R2, 2026-09-28). Every predicate of the family must END
+# with this conjunct, and its helper's body must be exactly the extractor's rule.
+# Lang-item ownership is a source attribute that a `#![no_std]` graph leaves
+# uncontested, so a body without the conjunct is anchor drift: the published
+# text would describe an identity test the code no longer makes.
+RESIDENCY_CONJUNCT = "&&crate_is_compiler_resident_sysroot(tcx,krate)"
+RESIDENCY_FN = "crate_is_compiler_resident_sysroot"
+RESIDENCY_BODY = "{trust_mir_extract::is_real_sysroot_crate(tcx,krate)}"
+
+# The two single-anchor members of the family, and the ONE lang item each may
+# test. Validated on every run, not only when the foundational body calls them.
+AUTHENTIC_MEMBER_ANCHOR = {
+    "crate_is_authentic_core": "sized_trait",
+    "crate_is_authentic_std": "panic_impl",
+}
+
+
+def outer_parens_enclose_all(expr: str) -> bool:
+    """True iff `expr` is `( … )` with the first `(` matching the last `)`."""
+    if not (expr.startswith("(") and expr.endswith(")")):
+        return False
+    depth = 0
+    for i, c in enumerate(expr):
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0 and i != len(expr) - 1:
+                return False
+    return depth == 0
+
+
+def residency_helper_is_the_sysroot_rule(verify: str) -> None:
+    code = re.sub(r"\s+", "", fn_body(verify, RESIDENCY_FN, TRUST_VERIFY_RS))
+    if code != RESIDENCY_BODY:
+        die(
+            f"anchor drift: `{RESIDENCY_FN}` is no longer exactly "
+            f"`trust_mir_extract::is_real_sysroot_crate(tcx, krate)` (found `{code}`); "
+            "the published residency text would be wrong"
+        )
+
+
+def lang_item_disjuncts(verify: str, fn_name: str) -> list[str]:
+    """The lang items `fn_name`'s body tests ownership of, one per `||` disjunct.
+
+    The body must be `OWNERSHIP && crate_is_compiler_resident_sysroot(tcx,
+    krate)`, where OWNERSHIP is a single disjunct or a parenthesized `||` chain
+    (optionally after the `owns` prelude). Every disjunct must be exactly
+    `tcx.lang_items().<item>().is_some_and(|d| d.krate == krate)`,
+    `owns(lang_items.<item>())` under the prelude, or a call to one of the two
+    sibling helpers, which are parsed the same way. Anything else — a constant,
+    a name comparison, a missing or moved residency conjunct — is anchor drift.
+    """
+    body = fn_body(verify, fn_name, TRUST_VERIFY_RS)
+    code = re.sub(r"\s+", "", body)
+    if not (code.startswith("{") and code.endswith("}")):
+        die(f"anchor drift: `{fn_name}` body is not a single expression block")
+    expr = code[1:-1]
+    owns_bound = expr.startswith(OWNS_PRELUDE)
+    if owns_bound:
+        expr = expr[len(OWNS_PRELUDE) :]
+    if not expr.endswith(RESIDENCY_CONJUNCT):
+        die(
+            f"anchor drift: `{fn_name}` does not end with the residency conjunct "
+            f"`&& {RESIDENCY_FN}(tcx, krate)` (lang-item ownership alone is not "
+            "sysroot identity; the published gate text would be wrong)"
+        )
+    ownership = expr[: -len(RESIDENCY_CONJUNCT)]
+    if outer_parens_enclose_all(ownership):
+        ownership = ownership[1:-1]
+    elif "||" in ownership or "&&" in ownership:
+        # `A || B && R` is `A || (B && R)`: the conjunct would not cover A.
+        die(
+            f"anchor drift: `{fn_name}`'s ownership test is not parenthesized, so "
+            "the residency conjunct does not cover every disjunct"
+        )
+    items: list[str] = []
+    for disjunct in ownership.split("||"):
+        m = LANG_ITEM_OWNERSHIP.match(disjunct) or (owns_bound and OWNS_CALL.match(disjunct))
+        if m:
+            items.append(m.group(1))
+        elif disjunct in ("crate_is_authentic_core(tcx,krate)", "crate_is_authentic_std(tcx,krate)"):
+            if fn_name != "crate_is_authentic_foundational":
+                die(f"anchor drift: `{fn_name}` recurses into `{disjunct}`")
+            items.extend(lang_item_disjuncts(verify, disjunct.split("(")[0]))
+        else:
+            die(
+                f"anchor drift: `{fn_name}` has a disjunct this generator does not "
+                f"describe: `{disjunct}` (the published gate text would be wrong)"
+            )
+    if not items:
+        die(f"anchor drift: `{fn_name}` parsed to zero lang-item anchors")
+    return items
+
+
+def foundational_lang_item_anchors(verify: str) -> list[tuple[str, str]]:
+    """`(crate, lang item)` for every ownership test `crate_is_authentic_foundational` makes.
+
+    Also validates, on every run, the residency helper and the two
+    single-anchor members of the family, whose bodies the published text
+    describes whether or not the foundational body calls them.
+    """
+    residency_helper_is_the_sysroot_rule(verify)
+    for member, item in AUTHENTIC_MEMBER_ANCHOR.items():
+        found = lang_item_disjuncts(verify, member)
+        if found != [item]:
+            die(f"anchor drift: `{member}` tests ownership of {found}, expected exactly [`{item}`]")
+    anchors: list[tuple[str, str]] = []
+    for item in lang_item_disjuncts(verify, "crate_is_authentic_foundational"):
+        owner = FOUNDATIONAL_LANG_ITEM_OWNER.get(item)
+        if owner is None:
+            die(
+                f"anchor drift: `crate_is_authentic_foundational` tests ownership of "
+                f"lang item `{item}`, which FOUNDATIONAL_LANG_ITEM_OWNER does not map"
+            )
+        anchors.append((owner, item))
+    if sorted({c for c, _ in anchors}) != ["alloc", "core", "std"]:
+        die(f"anchor drift: `crate_is_authentic_foundational` anchors {anchors} do not cover core/alloc/std")
+    return anchors
+
+
+def extract_to_string_self(convert: str) -> dict:
+    """The `@trust-total-to-string::` stamp's admitted `Self` arms, and their anchors."""
+    body = fn_body(convert, "to_string_self_ty_is_foundational", CONVERT_RS)
+    if "_ => false" not in body:
+        die("anchor drift: `to_string_self_ty_is_foundational` lost its `_ => false` fallback")
+    kinds: list[str] = []
+    for k in re.findall(r"rustc_middle::ty::TyKind::(\w+)", body):
+        if k not in kinds:
+            kinds.append(k)
+    unknown = [k for k in kinds if k not in TO_STRING_SELF_ARMS]
+    if unknown:
+        die(
+            f"anchor drift: `to_string_self_ty_is_foundational` admits {unknown}, "
+            "which TO_STRING_SELF_ARMS does not describe"
+        )
+    if not kinds:
+        die("anchor drift: `to_string_self_ty_is_foundational` parsed to zero arms")
+    required = {
+        "Ref": "to_string_str_ref_chain_depth(ty).is_some()",
+        "Adt": "tcx.lang_items().string() == Some(adt.did())",
+    }
+    for kind, anchor in required.items():
+        if kind in kinds and anchor not in body:
+            die(f"anchor drift: `to_string_self_ty_is_foundational`'s `{kind}` arm lost `{anchor}`")
+    if "Adt" in kinds and not ("args.is_empty()" in body and "is_real_alloc_crate(tcx, adt.did().krate)" in body):
+        die("anchor drift: the `String` arm lost its residency or no-generic-arguments test")
+    depth = re.search(r"const TO_STRING_STR_MAX_REF_DEPTH: usize = (\d+);", convert)
+    if not depth:
+        die("anchor drift: `TO_STRING_STR_MAX_REF_DEPTH` not found")
+    chain = fn_body(convert, "to_string_str_ref_chain_depth", CONVERT_RS)
+    for anchor in ("TO_STRING_STR_MAX_REF_DEPTH", "Mutability::Not", "TyKind::Str"):
+        if anchor not in chain:
+            die(f"anchor drift: `to_string_str_ref_chain_depth` lost `{anchor}`")
+    # The stamp mints only behind the authenticated admission, and never on a
+    # second path of its own: its body must BE that one fallible call.
+    stamp = fn_body(convert, "tcx_marked_total_to_string_path", CONVERT_RS)
+    if "authenticated_total_to_string_self_ty(tcx, def_id, generic_args)?;" not in stamp:
+        die("anchor drift: `tcx_marked_total_to_string_path` no longer mints only behind "
+            "`authenticated_total_to_string_self_ty(..)?`")
+    admit = fn_body(convert, "authenticated_total_to_string_self_ty", CONVERT_RS)
+    for anchor in (
+        "is_real_alloc_crate(tcx, to_string_method.krate)",
+        "to_string_self_ty_is_foundational(tcx, self_ty)",
+    ):
+        if anchor not in admit:
+            die(f"anchor drift: `authenticated_total_to_string_self_ty` lost `{anchor}`")
+    selfty = fn_body(convert, "to_string_instantiated_self_ty", CONVERT_RS)
+    for anchor in ("is_real_alloc_crate(tcx, alloc_krate)", "TyKind::Param(_)"):
+        if anchor not in selfty:
+            die(f"anchor drift: `to_string_instantiated_self_ty` lost `{anchor}`")
+    alloc = fn_body(convert, "is_real_alloc_crate", CONVERT_RS)
+    if 'as_str() == "alloc"' not in alloc or "is_real_sysroot_crate(tcx, krate)" not in alloc:
+        die("anchor drift: `is_real_alloc_crate` is no longer name AND residency")
+    return {"kinds": kinds, "depth": int(depth.group(1))}
 
 
 def extract_drop_glue(lower: str) -> dict[str, dict[str, list[str]]]:
@@ -380,8 +670,10 @@ def emit(root: Path) -> str:
     exact_total = extract_exact_total(lower)
     intrinsics = extract_intrinsics(lower)
     iter_info = extract_iterator_arms(verify)
-    iter_crates, iter_arms = iter_info[0]["crates"], iter_info[1:]
+    iter_gate, iter_arms = iter_info[0], iter_info[1:]
+    to_string_self = extract_to_string_self(read(root, CONVERT_RS))
     drop_glue = extract_drop_glue(lower)
+    panic_free = extract_panic_free_intrinsics(read(root, PANIC_FREE_INTRINSIC_RS))
 
     o: list[str] = []
     w = o.append
@@ -415,9 +707,46 @@ def emit(root: Path) -> str:
     w(f"### `total_std_iterator_ty` — {len(iter_arms)} accepted head types")
     w("")
     w(f"`{TRUST_VERIFY_RS}`, `fn total_std_iterator_ty`. A typed-receiver gate:")
-    w("the receiver's ADT must carry a real non-local `DefId` whose crate is one")
-    w(f"of {{{', '.join('`' + c + '`' for c in iter_crates)}}} (rendered paths are")
-    w("never consulted), and anything unmatched falls to `_ => false`.")
+    if iter_gate["kind"] == "crate-name":
+        w("the receiver's ADT must carry a real non-local `DefId` whose crate is one")
+        w(f"of {{{', '.join('`' + c + '`' for c in iter_gate['crates'])}}} (rendered paths are")
+        w("never consulted), and anything unmatched falls to `_ => false`.")
+    else:
+        owners = "; ".join(
+            f"`{crate}` = owner of `{item}`" for crate, item in iter_gate["anchors"]
+        )
+        w("the receiver's ADT must carry a real non-local `DefId`, and its crate must")
+        w("pass `crate_is_authentic_foundational`: LANG-ITEM OWNERSHIP, compared by")
+        w(f"`CrateNum` ({owners}), AND ARTIFACT RESIDENCY")
+        w(f"(`{RESIDENCY_FN}`, which is exactly")
+        w("`trust_mir_extract::is_real_sysroot_crate`). Rendered paths and the")
+        w("`--crate-name` string are never consulted as evidence, and anything")
+        w("unmatched falls to `_ => false`. `crate_is_authentic_core`")
+        w("(`sized_trait`) and `crate_is_authentic_std` (`panic_impl`) carry the")
+        w("same residency conjunct.")
+        w("")
+        w("Ownership says WHICH sysroot crate a crate is; residency says that it IS")
+        w("one. rustc rejects a second owner of a lang item (E0152) only when both")
+        w("owners are loaded, so in a `#![no_std]` graph that never loads `alloc` or")
+        w("`std`, a dependency may own `owned_box`/`string` (`#![feature(lang_items)]`)")
+        w("or `panic_impl` (any `#[panic_handler]`). Ownership alone graded such a")
+        w("dependency foundational until 2026-09-28; the residency conjunct refuses")
+        w("it, because `is_real_sysroot_crate` admits only a crate named")
+        w("`core`/`alloc`/`std`, and only when the loader opened it from this")
+        w("compiler's own target library directory or the command line declares a")
+        w("sysroot build (`-Zforce-unstable-if-unmarked`). Pins:")
+        w("`tests/ui/trust/total_std_iterator_lang_item_foundational_impostor_refuted.rs`,")
+        w("`tests/ui/trust/total_std_iterator_panic_handler_foundational_impostor_refuted.rs`.")
+        w("")
+        w("Residency is fail-closed OVER-DECLINE in three honest shapes, each read by")
+        w("every consumer as mask/refuse: the genuine `core`/`alloc`/`std` loaded from")
+        w("outside the target library directory without that declaration (the user")
+        w("crate under `cargo -Zbuild-std`, an `--extern core=` sysroot), and a LOCAL")
+        w("crate that owns an anchor (a `#![no_std]` crate's own `#[panic_handler]`).")
+        w("A non-sysroot `panic_impl` owner (a panic-handler dependency) is likewise")
+        w("no longer graded `std`; `core`'s own credits are unaffected. The extractor")
+        w("discloses the same over-decline for its path stamp at")
+        w("`invocation_is_building_the_sysroot` (`crates/trust-mir-extract/src/convert.rs`).")
     w("")
     w("| Head type | Def-path module anchor | Admission rule |")
     w("|---|---|---|")
@@ -425,10 +754,17 @@ def emit(root: Path) -> str:
         anchor = ", ".join(f"`{x}`" for x in a["anchors"]) or "—"
         if a["both_sides"]:
             rule = "recurses; BOTH inner iterators must be total"
+        elif a["len_bounded"]:
+            rule = (
+                "recurses; the inner iterator must also yield at most `usize::MAX` items "
+                "(`total_std_iterator_len_fits_usize`)"
+            )
         elif a["recursive"]:
             rule = "recurses into the inner iterator type"
         elif a["int_only"]:
             rule = "integer element types only"
+        elif a.get("pattern_gated"):
+            rule = "only when its pattern type is one of core's (`str_pattern_ty_is_core`)"
         else:
             rule = "accepted at the anchored module"
         w(f"| `{a['head']}` | {anchor} | {rule} |")
@@ -457,6 +793,22 @@ def emit(root: Path) -> str:
                 w(f"- {label}: `{x}`")
         w("")
 
+    ts_kinds = to_string_self["kinds"]
+    w(f"### `to_string_self_ty_is_foundational` — {len(ts_kinds)} admitted Self arms")
+    w("")
+    w(f"`{CONVERT_RS}`. The `@trust-total-to-string::` stamp")
+    w("(`tcx_marked_total_to_string_path`) marks a `ToString::to_string` call panic-free")
+    w("when the callee is the compiler's own `alloc` item by artifact residency, the")
+    w("selected impl is alloc's blanket `impl<T: Display + ?Sized> ToString for T`,")
+    w("and the INSTANTIATED `Self` (read from `TyCtxt`, never from path text) matches")
+    w("one of these arms, each audited against its `SpecToString` specialization in")
+    w("`library/alloc/src/string.rs`. Anything unmatched falls to `_ => false`. In")
+    w("source order:")
+    w("")
+    for k in ts_kinds:
+        w(f"- `TyKind::{k}`: " + TO_STRING_SELF_ARMS[k].format(depth=to_string_self["depth"]))
+    w("")
+
     w(f"### `is_total_rustc_intrinsic` — {len(intrinsics)} intrinsic names")
     w("")
     w(f"`{LOWER_RS}`, `fn is_total_rustc_intrinsic`. Body-less rustc intrinsics")
@@ -467,6 +819,25 @@ def emit(root: Path) -> str:
     w("```text")
     for n in intrinsics:
         w(n)
+    w("```")
+    w("")
+
+    w(
+        f"### `PANIC_FREE_RUSTC_INTRINSICS` — {len(panic_free)} intrinsic names "
+        "(panic-freedom only)"
+    )
+    w("")
+    w(f"`{PANIC_FREE_INTRINSIC_RS}`, `const PANIC_FREE_RUSTC_INTRINSICS`. `core`")
+    w("intrinsics stamped `@trust-rustc-panic-free-intrinsic::…` by")
+    w("`tcx_marked_panic_free_intrinsic_path` (real `core`, `#[rustc_nounwind]`, safe,")
+    w("fallback body pinned panic-free when it has one) and lowered with NO panic row")
+    w("and an UNCONSTRAINED result. Panic-freedom only: the facet and determinism")
+    w("gates never read this stamp, and no value fact is exported. Columns: name,")
+    w("width, operand shape, fallback-bodied. In source order:")
+    w("")
+    w("```text")
+    for name, width, shape, fallback in panic_free:
+        w(f"{name} f{width} {shape} {'fallback' if fallback == 'true' else 'body-less'}")
     w("```")
     w("")
     w(END_MARKER)
@@ -505,17 +876,21 @@ def selftest(repo: Path) -> int:
         ).returncode
 
     failures: list[str] = []
+    labels: list[str] = []
     with tempfile.TemporaryDirectory(prefix="gen_tcb_selftest.") as td:
         scratch = Path(td)
-        for rel in (LOWER_RS, TRUST_VERIFY_RS, TCB_MD):
+        for rel in (LOWER_RS, TRUST_VERIFY_RS, CONVERT_RS, PANIC_FREE_INTRINSIC_RS, TCB_MD):
             dst = scratch / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(repo / rel, dst)
 
         lower = scratch / LOWER_RS
         verify = scratch / TRUST_VERIFY_RS
+        convert = scratch / CONVERT_RS
+        panic_free = scratch / PANIC_FREE_INTRINSIC_RS
 
         def perturbed(path: Path, old: str, new: str, label: str, *extra: str) -> None:
+            labels.append(label)
             original = path.read_text(encoding="utf-8")
             if old not in original:
                 failures.append(f"{label}: perturbation anchor `{old}` not found")
@@ -560,6 +935,91 @@ def selftest(repo: Path) -> int:
             "source list grew but the doc was not regenerated",
             "--check",
         )
+        perturbed(
+            lower,
+            '"core::mem::size_of",',
+            '"core::mem::size_of",\n        "core::mem::size_of",',
+            "EXACT_TOTAL lists one name twice (count would over-state the surface)",
+        )
+        perturbed(
+            verify,
+            "    (owns(lang_items.sized_trait())\n",
+            "    (true || owns(lang_items.sized_trait())\n",
+            "iterator crate gate's ownership test widened to accept every crate",
+        )
+        foundational_body = (
+            "    (owns(lang_items.sized_trait())\n"
+            "        || owns(lang_items.owned_box())\n"
+            "        || owns(lang_items.string())\n"
+            "        || owns(lang_items.panic_impl()))\n"
+            "        && crate_is_compiler_resident_sysroot(tcx, krate)\n"
+        )
+        perturbed(
+            verify,
+            foundational_body,
+            foundational_body.replace("\n        && crate_is_compiler_resident_sysroot(tcx, krate)", ""),
+            "iterator crate gate lost its residency conjunct (ownership alone again)",
+        )
+        perturbed(
+            verify,
+            foundational_body,
+            foundational_body.replace("    (owns(lang_items.sized_trait())", "    owns(lang_items.sized_trait())")
+            .replace("panic_impl()))\n", "panic_impl())\n"),
+            "residency conjunct binds only the last ownership disjunct (precedence)",
+        )
+        perturbed(
+            verify,
+            "tcx.lang_items().sized_trait().is_some_and(|d| d.krate == krate)\n"
+            "        && crate_is_compiler_resident_sysroot(tcx, krate)",
+            "tcx.lang_items().sized_trait().is_some_and(|d| d.krate == krate)",
+            "authentic-core lost its residency conjunct",
+        )
+        perturbed(
+            verify,
+            "-> bool {\n    trust_mir_extract::is_real_sysroot_crate(tcx, krate)\n}",
+            "-> bool {\n    true || trust_mir_extract::is_real_sysroot_crate(tcx, krate)\n}",
+            "residency helper widened to accept every crate",
+        )
+        perturbed(
+            verify,
+            "tcx.lang_items().panic_impl().is_some_and(|d| d.krate == krate)",
+            "tcx.lang_items().panic_impl().is_some_and(|d| d.krate == krate)\n"
+            '        || tcx.crate_name(krate).as_str() == "std"',
+            "authentic-std regained a spoofable crate-name disjunct",
+        )
+        perturbed(
+            convert,
+            "rustc_middle::ty::TyKind::Ref(..) => to_string_str_ref_chain_depth(ty).is_some(),",
+            "rustc_middle::ty::TyKind::Ref(..) => true,",
+            "to_string stamp reference peel widened to any reference",
+        )
+        perturbed(
+            convert,
+            "rustc_middle::ty::TyKind::Str => true,",
+            "rustc_middle::ty::TyKind::Str => true,\n"
+            "        rustc_middle::ty::TyKind::Float(_) => true,",
+            "to_string stamp admits a Self arm the generator does not describe",
+        )
+        perturbed(
+            convert,
+            "const TO_STRING_STR_MAX_REF_DEPTH: usize = 12;",
+            "const TO_STRING_STR_MAX_REF_DEPTH: usize = 13;",
+            "to_string str-chain depth grew but the doc was not regenerated",
+            "--check",
+        )
+        perturbed(
+            panic_free,
+            '    entry("powif64", 64, PowI, false),\n',
+            '    entry("powif64", 64, PowI, false),\n    entry("fmuladdf64", 64, Binary, false),\n',
+            "panic-free intrinsic list grew but the doc was not regenerated",
+            "--check",
+        )
+        perturbed(
+            panic_free,
+            '    entry("powif64", 64, PowI, false),\n',
+            '    entry("powif64", 64, PowI, false),\n    ENTRY_MACRO!("fmuladdf64"),\n',
+            "panic-free intrinsic list gained an entry the parser cannot read",
+        )
         if run(scratch, "--check") != 0:
             failures.append("scratch copy did not restore to green after perturbations")
 
@@ -567,7 +1027,7 @@ def selftest(repo: Path) -> int:
         sys.stderr.write(f"gen_tcb_std_lists: SELFTEST FAIL: {f}\n")
     if failures:
         return 1
-    sys.stderr.write("gen_tcb_std_lists: selftest passed (4 perturbations, all red)\n")
+    sys.stderr.write(f"gen_tcb_std_lists: selftest passed ({len(labels)} perturbations, all red)\n")
     return 0
 
 

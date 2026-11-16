@@ -48,12 +48,15 @@
 //! the built body carries. Instead of gating the whole session to `-O0`,
 //! [`record_green`] takes the derived-MIR differential's EXACT marker-channel verdict
 //! (`DerivedReport::markers_exact`) and records a body at `-O` only when the marker
-//! sequences were proven line-identical. When
-//! `!sess.emit_lifetime_markers()` (`-O0`, no sanitizers) marker divergence is
-//! codegen-immaterial — `RemoveStorageMarkers` (enabled exactly then, `mir_opt_level > 0`)
-//! deletes markers+Nops from every body before codegen and codegen only emits
-//! `llvm.lifetime` intrinsics under `emit_lifetime_markers()` — so `markers_exact` is not
-//! required. The flip therefore flips what it can PROVE at each opt level, per body.
+//! sequences were proven line-identical. An unproven sequence is exempted only where its
+//! markers cannot reach any codegen or interpreter, which [`marker_gate_allows_flip`] decides:
+//! the session emits no `llvm.lifetime` intrinsics, `RemoveStorageMarkers` provably runs on
+//! `optimized_mir` (its own `is_enabled`, `mir_opt_level > 0`, under the
+//! `-Zmir-enable-passes` override), no `-Zmir-opt-bisect-limit` is set (it can skip that pass
+//! on any body), and the body is not one the CTFE seam installs (`mir_for_ctfe`, which that
+//! pass never touches and the const-eval interpreter runs WITH its markers: a const or static
+//! initializer, or a `#[rustc_comptime]` fn). Everywhere else `markers_exact` is required.
+//! The flip therefore flips what it can PROVE at each opt level, per body.
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com> | Copyright 2026 | License: Apache-2.0
 
@@ -103,6 +106,108 @@ pub struct GreenBody {
     pub(crate) source_header_correspondence: crate::mir_differential::SourceHeaderCorrespondence,
 }
 
+/// Trust: the WITNESS that [`body_lane_gates_allow_flip`] was READ, as a refusal, for THE BODY
+/// ABOUT TO BE RECORDED — half TYPE FACT, half consumption-site check; see (1) and (2) below.
+///
+/// "A gate nothing reads is not a gate" used to be enforced by a test that
+/// `include_str!`ed this very file and counted occurrences of the aggregate's own
+/// name (`test_the_lane_gate_aggregate_is_read_by_record_green`, deleted with the
+/// first cut of this type). TWO DIFFERENT PROPERTIES live in that sentence, and
+/// they are carried by two different mechanisms. Conflating them is what the first
+/// cut of this docblock got wrong — it claimed both as a type fact when only one is
+/// — so they are spelled apart:
+///
+/// 1. THAT THE GATE IS READ AT ALL — a TYPE FACT, checked by rustc. The fields are
+///    private; there is no `Default`, no `Clone`, no `Copy`, no `From` and no
+///    constructor anywhere but the `Some` arm of [`body_lane_gates_allow_flip`];
+///    and [`green_body`] — the SINGLE place a [`GreenBody`] comes into existence —
+///    takes one BY VALUE. So a `record_green` that does not read the aggregate
+///    cannot name the argument `green_body` demands, and "evaluated without acting
+///    on the result" is unspellable, because outside that `Some` arm there is no
+///    value to act on.
+///
+/// 2. THAT IT WAS READ FOR *THIS* BODY — NOT a type fact, and no longer claimed as
+///    one. rustc only proves that SOME `Lowered` cleared the gates. So the token
+///    BORROWS the `(module, callee ledger)` the gates actually ran over, and
+///    [`green_body`] REFUSES unless the pair it was handed is that same pair BY
+///    ADDRESS ([`LaneGatesPassed::witnesses`]). A token minted over body A cannot
+///    license recording body B: `green_body` returns `None`, nothing is registered,
+///    and the body stays on built MIR. The BORROW is what makes an address check
+///    sound here — a token cannot outlive the `Lowered` it read, so a later body
+///    cannot be allocated at a dead one's address and inherit its verdict.
+///
+/// (2) was, in the first cut, prose with a LIVE COUNTEREXAMPLE in this very module:
+/// the test helper minted one token from a fixed fixture and handed it to
+/// `green_body` for unrelated modules. The helpers now mint per body, and
+/// `test_a_lane_gate_token_cannot_license_a_different_body` pins the refusal with a
+/// fixture whose every other ingredient is valid.
+///
+/// MEASURED 2026-09-21, by deleting `record_green`'s refusal and nothing else and
+/// reading what the compiler said. The lane was
+/// `RUSTC_BOOTSTRAP=1 CFG_RELEASE=1.99.0-dev CFG_RELEASE_NUM=1.99.0
+/// CFG_RELEASE_CHANNEL=dev CFG_VERSION=1.99.0-dev
+/// CFG_COMPILER_HOST_TRIPLE=aarch64-apple-darwin targo --unverified check
+/// -p trust-thir-lower --tests` — Targo's NO-PROOF-CLAIM lane, so nothing here is
+/// a verification result:
+///
+/// ```text
+/// error[E0425]: cannot find value `lane_gates` in this scope
+///    --> crates/trust-thir-lower/src/flip_registry.rs:863:9
+///     |
+/// 863 |         lane_gates,
+///     |         ^^^^^^^^^^ not found in this scope
+/// ```
+///
+/// Before this type the same deletion COMPILED and the suite stayed green — 262/262
+/// when wave-TR measured it on the tree of that day. NO pre-change run was ever
+/// completed on this tree, so no before/after count is claimed for the conversion
+/// itself, and none could be equal: deleting the self-parsing test moved this
+/// file's count of `#[test]` ATTRIBUTES 17 -> 16 (this mention is not one).
+///
+/// WHAT THIS STILL DOES NOT GIVE, stated so the next reader does not over-trust it.
+///
+/// * IN-MODULE FORGERY, unchanged. `LaneGatesPassed`, its fields and `witnesses` are
+///   private to THIS MODULE, and `record_green` lives in this module, so
+///   `let lane_gates = LaneGatesPassed { module: &lowered.module, callees: &lowered.callees };`
+///   — the aggregate not called at all — compiles, and because it names the right
+///   pair it satisfies (2) as well. MEASURED 2026-09-21, that exact line substituted
+///   for the refusal in the lane above: rc=0, 0 errors, and not even a warning.
+///   What the type kills is the ONE-LINE mistake this file has paid for twice:
+///   dropping the refusal and leaving everything else alone. Closing forgery means
+///   moving the mint out of reach — this type, `body_lane_gates_allow_flip` and
+///   `witnesses` in a sibling submodule re-exported by name only, so `record_green`
+///   cannot name the constructor at all. That move is not made here.
+/// * READER COUNT. Nothing bounds how many callers read the aggregate, and after (2)
+///   nothing needs to: a second reader can only mint a token bound to its own body.
+///   The deleted self-parsing test asserted "exactly two occurrences" in this file;
+///   that count was a PROXY for (2), and (2) is now checked directly.
+/// * AN EMPTY CALLEE LEDGER ALIASES. Two distinct empty `Vec<CalleeRef>`s share one
+///   dangling `as_ptr()`, so for a body with no callees the ledger half of
+///   `witnesses` is vacuous and only the module address discriminates. Fail-closed
+///   either way: the ledger half can never admit a pair the module half rejects.
+#[must_use]
+struct LaneGatesPassed<'a> {
+    /// The module the aggregate READ — borrowed, so the token cannot outlive it.
+    module: &'a Module,
+    /// The callee ledger the aggregate READ. The `thin_reborrows` conjunct consults
+    /// it, so it is half of what the verdict is ABOUT and half of what is bound.
+    callees: &'a [CalleeRef],
+}
+
+impl LaneGatesPassed<'_> {
+    /// Whether this token was minted over EXACTLY the pair now being recorded.
+    ///
+    /// ADDRESS identity, not value equality. The question is not "is there a module
+    /// that looks like this one" but "is this the very object the gates were read
+    /// over"; value equality would re-admit what this exists to refuse — a clone, or
+    /// a second body that happens to lower identically.
+    fn witnesses(&self, module: &Module, callees: &[CalleeRef]) -> bool {
+        std::ptr::eq(self.module, module)
+            && self.callees.as_ptr() == callees.as_ptr()
+            && self.callees.len() == callees.len()
+    }
+}
+
 /// Trust (L1): mint the registry entry for one green body — the SINGLE place a
 /// [`GreenBody`] comes into existence, and therefore the single place the
 /// "no digest, no green" rule can be enforced.
@@ -114,12 +219,30 @@ pub struct GreenBody {
 ///
 /// Split out of `record_green` — which needs a `TyCtxt` and so cannot be unit
 /// tested — precisely so this rule is a test obligation and not a comment.
+///
+/// `lane_gates` carries TWO checks, one made by rustc and one made below. Only
+/// [`body_lane_gates_allow_flip`] can mint a [`LaneGatesPassed`], so demanding one
+/// BY VALUE turns "every per-body placeholder/provenance lane gate was read, as a
+/// refusal" into a precondition rustc checks at the call rather than a sentence in a
+/// comment. WHICH body they were read for is not something a type can say, so it is
+/// checked here: [`LaneGatesPassed::witnesses`] compares the `(module, callee
+/// ledger)` the gates actually ran over — borrowed by the token — against the pair
+/// this call was handed, by address, and a mismatch refuses the body. See
+/// [`LaneGatesPassed`] for both halves and for what neither of them closes.
 fn green_body(
     definition: crate::lineage::DefinitionIdentity,
     module: &Module,
     callees: &[CalleeRef],
     source_header_correspondence: crate::mir_differential::SourceHeaderCorrespondence,
+    lane_gates: LaneGatesPassed<'_>,
 ) -> Option<GreenBody> {
+    // Trust: the lane gates were read for THIS body, not merely for SOME body — the
+    // half rustc cannot state, checked by address against what the aggregate actually
+    // ran over. Fail-closed: a mismatch registers nothing and the body stays on built
+    // MIR. See `LaneGatesPassed`.
+    if !lane_gates.witnesses(module, callees) {
+        return None;
+    }
     let lineage = crate::lineage::body_lineage_digest(definition, module, callees).ok()?;
     if !source_header_correspondence.authenticates(lineage) {
         return None;
@@ -542,9 +665,18 @@ fn call_result_reborrow_is_confined(
 /// `&Lowered`-taking conjunction moves the wiring into a pure function, where
 /// `test_every_body_lane_gate_is_wired_into_the_flip_decision` pins each lane by fixture.
 ///
+/// AND WHY IT RETURNS A TOKEN RATHER THAN A `bool`. The aggregation fixed the LANE half and
+/// MOVED the CALL-SITE half: deleting `record_green`'s one-line refusal still left the suite
+/// green, and the compensation was a test that read this file's own source text. The `Some`
+/// arm's [`LaneGatesPassed`] retires that test. It is the only way to obtain the token
+/// [`green_body`] takes by value, so a `record_green` that does not read this function as a
+/// refusal does not COMPILE — and the token is minted BOUND to this `Lowered`'s own
+/// `(module, callee ledger)`, so one read cannot license a different body either. The exact
+/// error, and the residue neither half closes, are quoted on [`LaneGatesPassed`].
+///
 /// Order is irrelevant — every conjunct is a pure `!flag` on an independent field — so this is a
 /// conjunction, not a sequence, and nothing here may acquire a side effect.
-fn body_lane_gates_allow_flip(lowered: &Lowered) -> bool {
+fn body_lane_gates_allow_flip(lowered: &Lowered) -> Option<LaneGatesPassed<'_>> {
     // Trust (union lane): a body whose module registered a UNION PLACEHOLDER LANE never flips.
     // The lane spells `Ty::Unit` for a struct field that holds real `union` bytes, and `to_mir`'s
     // param/return gates cannot catch it: both admit any concrete `ty::Adt(struct)` with
@@ -554,7 +686,8 @@ fn body_lane_gates_allow_flip(lowered: &Lowered) -> bool {
     // concrete, i.e. past the layout pre-gate. Flipping it would emit a copy that silently drops
     // the union's contents. Load-bearing, not defensive, and keyed on the producer's ledger
     // (`Lowered::union_lane`), never on the `()` spelling.
-    union_lane_allows_flip(lowered.union_lane)
+    let every_lane_clear = !lowered.unsubstituted_opaque_return
+        && union_lane_allows_flip(lowered.union_lane)
         // Trust (enum param lane): a body whose module registered an ENUM PARAM PLACEHOLDER LANE
         // never flips — see `enum_param_lane_allows_flip`. Load-bearing as a DECISION, not as a
         // consequence of `to_mir`'s generic-param gates happening to refuse the class today.
@@ -576,7 +709,17 @@ fn body_lane_gates_allow_flip(lowered: &Lowered) -> bool {
         // Trust (wave-MR): the `&mut` twin, refused as a whole class — see
         // `mut_reborrows_allow_flip` for why the shared side's confinement certificate does not
         // transfer to a value someone may write through.
-        && mut_reborrows_allow_flip(&lowered.mut_reborrows)
+        && mut_reborrows_allow_flip(&lowered.mut_reborrows);
+    // The ONLY mint. The token cannot exist outside this arm, so a caller cannot hold
+    // one without having asked — and cannot ask without acting on the answer. It is
+    // minted BOUND to the very `(module, callee ledger)` the conjunction above just
+    // read, which is what lets `green_body` refuse a token borrowed for another body;
+    // `record_green` passes `&lowered.module` / `&lowered.callees` on, so the
+    // production path binds by construction.
+    every_lane_clear.then(|| LaneGatesPassed {
+        module: &lowered.module,
+        callees: &lowered.callees,
+    })
 }
 
 /// Whether this definition's TrustIR module carries a complete source-loop and
@@ -632,6 +775,47 @@ fn loop_bindings_allow_flip(provenance: &trust_ir::SourceProvenance) -> bool {
     })
 }
 
+/// Trust (F4, 2026-09-29; reworked after the review): the per-body marker gate with the
+/// `TyCtxt` lifted out. A body whose marker sequence was not proven exact may flip only when
+/// its markers cannot reach ANY codegen or interpreter:
+///   * this session emits no lifetime intrinsics;
+///   * `RemoveStorageMarkers` deletes every marker from `optimized_mir` before anything reads
+///     it — its own `is_enabled` (`mir_opt_level > 0 && !emit_lifetime_markers`) under
+///     `pass_manager::should_run_pass`'s `-Zmir-enable-passes` override (last matching entry
+///     wins; the pass `is_required`, so `#[optimize(none)]` never suppresses it) — and NO
+///     `-Zmir-opt-bisect-limit` is set: the bisect counter is global across passes and bodies,
+///     so whether it skips this pass on this body cannot be decided here, and the answer is
+///     no exemption rather than a prediction;
+///   * the body is not one the CTFE seam installs (`ctfe_body`: a const or static initializer,
+///     or a `#[rustc_comptime]` fn — `try_flip_ctfe`'s own admission set): its flip installs
+///     `mir_for_ctfe`, which `RemoveStorageMarkers` never touches, which is encoded for other
+///     crates as-is, and which the const-eval interpreter runs WITH its markers — a use of a
+///     storage-dead local is an interpreter error, i.e. a different const-eval result. No
+///     exemption there.
+/// The encoded cross-crate copy of a codegen-seam FN body IS its post-pass `optimized_mir`
+/// (`rustc_metadata` records `tcx.optimized_mir(def_id)`), so a stripped body carries no marker
+/// to another crate either.
+pub const fn marker_gate_allows_flip(
+    markers_exact: bool,
+    emit_lifetime_markers: bool,
+    mir_opt_level: usize,
+    remove_storage_markers_override: Option<bool>,
+    opt_bisect_limited: bool,
+    ctfe_body: bool,
+) -> bool {
+    if markers_exact {
+        return true;
+    }
+    if ctfe_body || opt_bisect_limited {
+        return false;
+    }
+    let stripped = match remove_storage_markers_override {
+        Some(on) => on,
+        None => mir_opt_level > 0,
+    };
+    !emit_lifetime_markers && stripped
+}
+
 /// Trust: called from the `mir_built` hook for bodies whose derived-MIR differential verdict is
 /// `DerivedAgreed` (the caller checks the verdict; `unsupported` is re-checked here defensively).
 /// `markers_exact` is the differential's EXACT marker-channel verdict for THIS body; when the
@@ -662,7 +846,37 @@ pub fn record_green(
     };
     // Trust: per-body marker gate (module docs). Fail-closed: an unproven marker sequence
     // must never reach codegen where markers are material.
-    if tcx.sess.emit_lifetime_markers() && !markers_exact {
+    //
+    // Trust (F4, 2026-09-29): "not material" used to be decided by `!emit_lifetime_markers()`
+    // alone, i.e. by THIS session's codegen. At `-Zmir-opt-level=0`, or with
+    // `-Zmir-enable-passes=-RemoveStorageMarkers`, the unproven markers survive into
+    // `optimized_mir`, which is what metadata encodes for an `#[inline]`/generic body, and a
+    // downstream `-O` crate codegens them with lifetime intrinsics. REFUSES MORE: the
+    // exemption now also requires that `RemoveStorageMarkers` runs in this session.
+    let remove_storage_markers_override = tcx
+        .sess
+        .opts
+        .unstable_opts
+        .mir_enable_passes
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "RemoveStorageMarkers")
+        .map(|&(_, on)| on);
+    if !marker_gate_allows_flip(
+        markers_exact,
+        tcx.sess.emit_lifetime_markers(),
+        tcx.sess.mir_opt_level(),
+        remove_storage_markers_override,
+        tcx.sess.opts.unstable_opts.mir_opt_bisect_limit.is_some(),
+        // Trust (F4, round 4): a body the CTFE seam installs. `try_flip_ctfe` admits exactly
+        // `hir_body_const_context` = `Const { .. } | Static(_)`, and that includes a
+        // `#[rustc_comptime]` fn, whose `BodyKind` is `Fn`: the kind alone undercounts.
+        matches!(lowered.body_kind, crate::BodyKind::ConstInit)
+            || matches!(
+                tcx.hir_body_const_context(def),
+                Some(rustc_hir::ConstContext::Const { .. } | rustc_hir::ConstContext::Static(_))
+            ),
+    ) {
         return;
     }
     // Defensive: a green verdict implies a clean lowering, but never trust the caller.
@@ -676,16 +890,22 @@ pub fn record_green(
     // inline, dropping one from the list was a silent widening that every existing test still
     // passed (measured, wave-TR mutation C).
     //
-    // TWO tests, and both are needed — the aggregation moves the hole, it does not close it.
-    // `test_every_body_lane_gate_is_wired_into_the_flip_decision` executes the aggregate against a
-    // real `Lowered` fixture and goes red if any lane leaves THE FUNCTION. It says nothing about
-    // THIS LINE: delete the `if` below and that test stays green, which is mutation C one level up.
-    // `test_the_lane_gate_aggregate_is_read_by_record_green` pins this call site by source text —
-    // that the aggregate is read here, exactly once, as a REFUSAL (`if !… { return; }`).
-    // Neither test may be dropped because the other exists.
-    if !body_lane_gates_allow_flip(lowered) {
+    // THIS LINE IS NOT PINNED BY A TEST ANY MORE — it is enforced by rustc. `lane_gates` is the
+    // only `LaneGatesPassed` this function can obtain, nothing else in the crate can mint one,
+    // and `green_body` below takes one BY VALUE. Delete this `let … else` and the `green_body`
+    // call FAILS TO COMPILE instead of recording a lane-carrying body; the exact error, and the
+    // forgery the type does NOT close, are quoted on `LaneGatesPassed`. That is wave-TR mutation
+    // C, one level up, closed rather than moved — and it retires
+    // `test_the_lane_gate_aggregate_is_read_by_record_green`, which enforced the same property by
+    // `include_str!`ing this file and counting occurrences of the aggregate's own name.
+    // Two halves stay OUTSIDE what rustc can see, and each has its own pin:
+    // `test_every_body_lane_gate_is_wired_into_the_flip_decision` owns WHICH lanes the
+    // aggregate consults, and `test_a_lane_gate_token_cannot_license_a_different_body` owns
+    // that a token read over one body cannot record another — enforced at run time, by
+    // address, inside `green_body`.
+    let Some(lane_gates) = body_lane_gates_allow_flip(lowered) else {
         return;
-    }
+    };
     // Trust (CTFE flip lane): FN bodies flip on the CODEGEN seam (`optimized_mir` → `try_flip`);
     // const/associated-const INITIALIZER bodies (`BodyKind::ConstInit`) flip on the CTFE seam
     // (`inner_mir_for_ctfe` → `try_flip_ctfe`), where the const-eval interpreter consumes MIR
@@ -713,9 +933,13 @@ pub fn record_green(
     // name, by digest, exactly which body it selected, or the whole attestation chain has a
     // hole at its first link.
     let definition = crate::lineage::DefinitionIdentity::from_def_id(tcx, def.to_def_id());
-    let Some(mut entry) =
-        green_body(definition, &lowered.module, &lowered.callees, source_header_correspondence)
-    else {
+    let Some(mut entry) = green_body(
+        definition,
+        &lowered.module,
+        &lowered.callees,
+        source_header_correspondence,
+        lane_gates,
+    ) else {
         return;
     };
     // Trust (enum-switch provenance): carry the hook-time set forward for the flip's re-derivation.
@@ -825,25 +1049,63 @@ mod tests {
 
     fn probe_module(fn_name: &str) -> Module {
         let mut module = Module::new("flip_registry_probe");
-        let ty = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
-        module.add_function(Function::new(FuncId::new(0), fn_name, ty, BlockId::new(0)));
+        let ty = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         module
+            .try_add_function(Function::new(FuncId::new(0), fn_name, ty, BlockId::new(0)))
+            .expect("Module::try_add_function: test fixture");
+        module
+    }
+
+    /// A real [`super::LaneGatesPassed`] FOR `lowered`, minted the only way anything
+    /// can: by running the aggregate and taking its `Some`.
+    ///
+    /// Deliberately NOT a `#[cfg(test)]` constructor on the token. A test-only back
+    /// door into the one type that carries "the gate is read" would be that
+    /// invariant's own escape hatch, and it would be in scope for `record_green`
+    /// in exactly the configuration the suite runs in.
+    ///
+    /// It takes the caller's `&Lowered` rather than fabricating one, because the token
+    /// is BOUND to the body the gates were read over. The first cut of this helper took
+    /// no argument and minted from a fixed fixture, which made it a live counterexample
+    /// to the per-body claim on [`super::LaneGatesPassed`]: it handed out a witness for
+    /// a body the caller never recorded.
+    fn lane_gates_for(lowered: &Lowered) -> super::LaneGatesPassed<'_> {
+        body_lane_gates_allow_flip(lowered)
+            .expect("the all-clear lane fixture must pass every per-body lane gate")
+    }
+
+    /// The [`lane_probe_lowered`] posture, carrying THIS module — so a
+    /// [`super::LaneGatesPassed`] minted from it is bound to the body the caller is
+    /// about to record.
+    ///
+    /// `green_body` compares the token's borrowed `(module, callee ledger)` against its
+    /// own arguments BY ADDRESS, so a caller must pass `&lowered.module` and
+    /// `&lowered.callees` — never a separate copy of the same bytes.
+    fn lane_probe_carrying(module: Module) -> Lowered {
+        let mut lowered = lane_probe_lowered();
+        lowered.module = module;
+        lowered
     }
 
     fn green_body_for_test(
         definition: crate::lineage::DefinitionIdentity,
         module: &Module,
     ) -> Option<GreenBody> {
-        let lineage = body_lineage_digest(definition, module, &[]).ok()?;
+        let lowered = lane_probe_carrying(module.clone());
+        let lineage = body_lineage_digest(definition, &lowered.module, &lowered.callees).ok()?;
         green_body(
             definition,
-            module,
-            &[],
+            &lowered.module,
+            &lowered.callees,
             crate::mir_differential::SourceHeaderCorrespondence::test_only(lineage),
+            lane_gates_for(&lowered),
         )
     }
 
@@ -870,12 +1132,13 @@ mod tests {
         );
         let mut two = probe_module("probe");
         let ty = two.functions[0].ty;
-        two.add_function(Function::new(
+        two.try_add_function(Function::new(
             FuncId::new(crate::ADAPTER_FUNC_ID_BASE),
             "probe::{fnptr-adapter}",
             ty,
             BlockId::new(0),
-        ));
+        ))
+        .expect("Module::try_add_function: test fixture");
         assert!(
             green_body_for_test(probe_definition(3), &two).is_none(),
             "a mini-module carrying a producer-synthesized adapter names two program objects; \
@@ -890,21 +1153,97 @@ mod tests {
     #[test]
     fn source_header_correspondence_witness_is_bound_to_exact_body_lineage() {
         let definition = probe_definition(3);
-        let module = probe_module("first");
-        let lineage = body_lineage_digest(definition, &module, &[]).expect("probe lineage");
+        // Each case owns the `Lowered` its token is minted over, so the only thing
+        // varying between them is the witness/lineage pair this test is about. Minting
+        // once and reusing the token would make the `is_none()` cases pass for the
+        // WRONG reason — `LaneGatesPassed`'s own per-body refusal — and the test would
+        // stop saying anything about the correspondence witness.
+        let first = lane_probe_carrying(probe_module("first"));
+        let lineage = body_lineage_digest(definition, &first.module, &first.callees)
+            .expect("probe lineage");
         let witness = crate::mir_differential::SourceHeaderCorrespondence::test_only(lineage);
 
+        // One `LaneGatesPassed` per call: the token is deliberately not `Clone`, so
+        // each `green_body` here re-runs the aggregate for its own body.
         assert!(
-            green_body(definition, &module, &[], witness).is_some(),
+            green_body(
+                definition,
+                &first.module,
+                &first.callees,
+                witness,
+                lane_gates_for(&first)
+            )
+            .is_some(),
             "the witness must admit exactly the body lineage it seals"
         );
+        let changed = lane_probe_carrying(probe_module("changed"));
         assert!(
-            green_body(definition, &probe_module("changed"), &[], witness).is_none(),
+            green_body(
+                definition,
+                &changed.module,
+                &changed.callees,
+                witness,
+                lane_gates_for(&changed)
+            )
+            .is_none(),
             "a module mutation cannot reuse an earlier built/derived correspondence witness"
         );
         assert!(
-            green_body(probe_definition(4), &module, &[], witness).is_none(),
+            green_body(
+                probe_definition(4),
+                &first.module,
+                &first.callees,
+                witness,
+                lane_gates_for(&first)
+            )
+            .is_none(),
             "a different stable definition identity cannot reuse the witness"
+        );
+    }
+
+    /// **THE PER-BODY PIN.** A [`super::LaneGatesPassed`] read over one body must not
+    /// license recording another.
+    ///
+    /// This is the half rustc cannot state — it only proves that SOME `Lowered` cleared
+    /// the gates — and in the first cut of that type it was claimed in prose while this
+    /// module's own test helper did exactly the thing the prose called impossible. The
+    /// shapes that matter in production are a mint hoisted out of a loop, and a second
+    /// `flip_registry` helper that mints once and records twice: both compile with 0
+    /// errors, and both are refused here, fail-closed.
+    ///
+    /// EVERY OTHER INGREDIENT OF THE REFUSED CALL IS VALID — the witness authenticates
+    /// the recorded body's own lineage, and the second assertion records that same body
+    /// with its own token, so the refusal cannot be passing vacuously.
+    #[test]
+    fn test_a_lane_gate_token_cannot_license_a_different_body() {
+        let definition = probe_definition(3);
+        let read_over = lane_probe_carrying(probe_module("the_body_the_gates_read"));
+        let recorded = lane_probe_carrying(probe_module("a_different_body"));
+        let lineage = body_lineage_digest(definition, &recorded.module, &recorded.callees)
+            .expect("probe lineage");
+        let witness = crate::mir_differential::SourceHeaderCorrespondence::test_only(lineage);
+        assert!(
+            green_body(
+                definition,
+                &recorded.module,
+                &recorded.callees,
+                witness,
+                lane_gates_for(&read_over)
+            )
+            .is_none(),
+            "a lane-gate token read over one body must not record a different one"
+        );
+        assert!(
+            green_body(
+                definition,
+                &recorded.module,
+                &recorded.callees,
+                witness,
+                lane_gates_for(&recorded)
+            )
+            .is_some(),
+            "the same call with the recorded body's OWN token must be admitted, or the \
+             refusal above proves nothing"
         );
     }
 
@@ -955,13 +1294,17 @@ mod tests {
                 crate::lineage::ConcreteInstanceKind::Item,
                 Vec::new(),
             )),
+            instance_args: Some(Vec::new()),
             def_path: "thin_reborrow_probe::callee".to_string(),
             force_havoc: false,
             site_def_id: def_id,
             site_args: Some(Vec::new()),
             ret_ty: None,
             ret_ty_conflict: false,
-            is_rust_abi: false,
+            abi: crate::calling_convention::FunctionAbi::C,
+            // No contributing body withdrew this callee's signature, and none signed
+            // it — the producer's own default at `admit_callee`'s push site.
+            params: crate::ParamSignature::Unsigned,
         }
     }
 
@@ -970,17 +1313,20 @@ mod tests {
     /// the check is reacting to is never in doubt.
     fn reborrow_probe_module(body: Vec<InstrNode>) -> Module {
         let mut module = Module::new("thin_reborrow_probe");
-        let ty = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
+        let ty = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function =
             Function::new(FuncId::new(0), "thin_reborrow_probe_body", ty, BlockId::new(0));
         let mut entry = Block::new(BlockId::new(0));
         entry.body = body;
         function.blocks.push(entry);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -1190,7 +1536,9 @@ mod tests {
         //     SSA space; scanning several could match a different function's value of that number.
         let mut two_functions = reborrow_probe_module(vec![call_defining_forwarded()]);
         let ty = two_functions.functions[0].ty;
-        two_functions.add_function(Function::new(FuncId::new(3), "second", ty, BlockId::new(0)));
+        two_functions
+            .try_add_function(Function::new(FuncId::new(3), "second", ty, BlockId::new(0)))
+            .expect("Module::try_add_function: test fixture");
         assert!(
             !call_result_reborrow_is_confined(&two_functions, &ledgered, FORWARDED),
             "the confinement check states the single-function obligation itself rather than \
@@ -1208,11 +1556,23 @@ mod tests {
         );
     }
 
+    /// Declared provenance independently refuses a stale green report without a fake call.
+    #[test]
+    fn an_unsubstituted_opaque_return_cannot_enter_the_flip_registry() {
+        let mut lowered = lane_probe_lowered();
+        assert!(body_lane_gates_allow_flip(&lowered).is_some());
+        lowered.unsubstituted_opaque_return = true;
+        assert!(!lowered.symbolic);
+        assert!(!lowered.contains_call);
+        assert!(body_lane_gates_allow_flip(&lowered).is_none());
+    }
+
     /// A `Lowered` in the posture a body reaches `record_green` in: CLEAN, no pending consts, and
     /// every lane flag clear. The four lane flags are the ONLY thing the callers below vary.
     fn lane_probe_lowered() -> Lowered {
         Lowered {
             coroutine_frame_ptr: false,
+            global_origins: Vec::new(),
             mut_reborrows: Vec::new(),
             module: probe_module("lane_gate_probe"),
             // Synthetic probe; see the note in `Lowered::enum_fold_switch_blocks`. Empty
@@ -1222,8 +1582,10 @@ mod tests {
             opaque_collapse: false,
             enum_declines: Vec::new(),
             union_lane: false,
+            layout_withheld_structs: Vec::new(),
             enum_param_lane: false,
             symbolic: false,
+            unsubstituted_opaque_return: false,
             unsupported: Vec::new(),
             contains_call: false,
             place_path_carrier: false,
@@ -1246,12 +1608,21 @@ mod tests {
     /// test drives it with a real `Lowered`: set exactly one lane flag, and the flip must be
     /// refused. Drop any lane from the conjunction and the corresponding case goes red.
     ///
+    /// ONE OF THREE HALVES — this one owns WHICH FIELDS. Whether `record_green` READS the
+    /// aggregate at all stopped being a test's business: the function returns a
+    /// [`super::LaneGatesPassed`] that only its own `Some` arm can mint and that `green_body`
+    /// demands by value, so a `record_green` which skips it does not compile. Whether the read
+    /// was for the body being recorded is `green_body`'s own address check, pinned by
+    /// `test_a_lane_gate_token_cannot_license_a_different_body`. What neither rustc nor that
+    /// check can see is which FIELDS of `Lowered` the conjunction consults — so that is pinned
+    /// here, by fixture, one lane at a time.
+    ///
     /// The all-clear case is asserted first: a gate list that refuses everything would satisfy the
     /// four refusals vacuously.
     #[test]
     fn test_every_body_lane_gate_is_wired_into_the_flip_decision() {
         assert!(
-            body_lane_gates_allow_flip(&lane_probe_lowered()),
+            body_lane_gates_allow_flip(&lane_probe_lowered()).is_some(),
             "a body with every lane flag clear must still be allowed to flip — otherwise the four \
              refusals below are vacuous"
         );
@@ -1274,76 +1645,11 @@ mod tests {
             let mut probe = lane_probe_lowered();
             set(&mut probe);
             assert!(
-                !body_lane_gates_allow_flip(&probe),
+                body_lane_gates_allow_flip(&probe).is_none(),
                 "lane `{name}` is declared to refuse the flip but is NOT WIRED INTO the decision — \
                  its predicate being correct proves nothing if nothing calls it"
             );
         }
-    }
-
-    /// **THE WIRE ABOVE THE WIRE.** The test above proves each lane is read by
-    /// `body_lane_gates_allow_flip`. It proves NOTHING about whether `record_green` reads that
-    /// aggregate: `record_green` takes a `TyCtxt`, no unit test can call it, and deleting its
-    /// one-line refusal gate leaves the whole suite green. That is wave-TR mutation C displaced
-    /// one level up, and an adversarial review caught the refactor claiming to have fixed the hole
-    /// when it had only moved it.
-    ///
-    /// So the call site is pinned by SOURCE TEXT, in the `lib.rs` wave-DP idiom (see
-    /// `the_projected_pointee_lane_is_actually_wired`). Crude, and the honest tool for a property
-    /// about the shape of a call inside a function no test can reach. This test goes RED if the
-    /// gate is deleted, duplicated, evaluated without acting on the result, or turned into
-    /// anything other than a refusal.
-    #[test]
-    fn test_the_lane_gate_aggregate_is_read_by_record_green() {
-        // Needles are ASSEMBLED at run time: this test's own source is inside
-        // `include_str!("flip_registry.rs")`, so a literal needle would match itself and the guard
-        // would pass with the production call site deleted.
-        let producer = include_str!("flip_registry.rs");
-
-        // Read as a REFUSAL — `!aggregate(...)`. Exactly two occurrences in the file: this one's
-        // `record_green` gate, and the fixture-driven wiring test above. A third means some other
-        // caller now decides the same question; a first-and-only means the production gate is gone.
-        let refusal = format!("!{}(", "body_lane_gates_allow_flip");
-        assert_eq!(
-            producer.matches(refusal.as_str()).count(),
-            2,
-            "the lane aggregate must be READ as a refusal in exactly two places — the \
-             `record_green` gate and the wiring test — and this count is what makes deleting the \
-             gate visible at all",
-        );
-
-        // …and one of those two must be INSIDE `record_green`.
-        let fn_at = producer
-            .find(&format!("pub fn {}(", "record_green"))
-            .expect("`record_green` must exist");
-        let fn_end = fn_at
-            + producer[fn_at..]
-                .find("\npub fn ")
-                .expect("`record_green` must be followed by another item");
-        let body = &producer[fn_at..fn_end];
-        assert_eq!(
-            body.matches(refusal.as_str()).count(),
-            1,
-            "`record_green` must read the lane aggregate — a gate nothing calls is not a gate, \
-             and this is the exact hole (mutation C) this branch has now paid for twice",
-        );
-
-        // And it must REFUSE on it, not merely evaluate it: `if !… { return; }`.
-        let at = body.find(refusal.as_str()).expect("the gate is inside `record_green`");
-        assert!(
-            body[..at].ends_with("if "),
-            "the aggregate must be the CONDITION of an `if !…`, not a bound value some later line \
-             may or may not consult",
-        );
-        let tail = &body[at..];
-        let open = tail.find('{').expect("the gate must open a block");
-        let close = tail.find('}').expect("the gate must close it");
-        assert!(open < close, "the gate's block must be well-formed");
-        assert!(
-            tail[open..close].contains(&format!("{};", "return")),
-            "the gate's block must RETURN — refusing the flip. Any other body (a log, a counter) \
-             would let a lane-carrying body reach the registry",
-        );
     }
 
     /// Trust (L1): the record→take round-trip carries the lineage digest — the flip

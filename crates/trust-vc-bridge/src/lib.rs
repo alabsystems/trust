@@ -286,14 +286,15 @@ pub const TRUST_VC_TYPED_EXPR_EVIDENCE_REQUIRED: &str = concat!(
 
 /// Obligation metadata key binding public evidence to a native Tmir proof obligation.
 pub const TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY: &str =
-    "trust.trust_ir.native.proof_obligation_id";
+    trust_verifier_api::native_routing_identity::PROOF_KEY;
 
 /// Obligation metadata key binding public evidence to a native Tmir request.
-pub const TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY: &str = "trust.trust_ir.native.request_id";
+pub const TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY: &str =
+    trust_verifier_api::native_routing_identity::REQUEST_KEY;
 
 /// Obligation metadata key binding public evidence to its native verifier suite.
 pub const TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY: &str =
-    "trust.trust_ir.native.verifier_suite";
+    trust_verifier_api::native_routing_identity::SUITE_KEY;
 
 /// Optional native Tmir assertion identity emitted by compiler/sample metadata.
 pub const TRUST_TRUST_IR_NATIVE_ASSERTION_ID_METADATA_KEY: &str =
@@ -644,8 +645,8 @@ impl TrustVcVerificationEngine {
         validate_native_trust_ir_import_field(
             obligation,
             "public_obligation_id",
-            obligation.obligation_id.clone(),
-            source.public_obligation_id.clone(),
+            &obligation.obligation_id,
+            &source.public_obligation_id,
         )?;
         let native_obligation =
             index.proof_obligations.get(&identity.proof_obligation_id).copied().ok_or_else(
@@ -676,8 +677,8 @@ impl TrustVcVerificationEngine {
         validate_native_trust_ir_import_field(
             obligation,
             "request_digest",
-            request_digest.to_string(),
-            imported.request_digest.clone(),
+            &request_digest.to_string(),
+            &imported.request_digest,
         )?;
         validate_trust_vc_public_obligation_semantic_binding(
             bundle,
@@ -2760,13 +2761,20 @@ fn normalized_direct_mir_memory_public_predicate(
                 reason: format!("invalid public typed formula payload: {error}"),
             }
         })?;
-    let canonical_payload = serde_json::to_string(&predicate).map_err(|error| {
-        TrustVcDirectMirMemoryError::InvalidProofUnitPayload {
-            origin: "obligation metadata".to_string(),
-            reason: format!("could not canonicalize public typed formula payload: {error}"),
-        }
+    // Trust: the producer (`trust-source-contract`, 143f77647b7) emits the
+    // predicate's canonical JSON bytes (sorted keys, `canonical_json_bytes`), the
+    // same under either serde_json map feature. Compare against exactly that form,
+    // not serde's struct field order, encoded on the deep stack like the parse.
+    let canonical_payload = trust_types::json_depth::encode_owned_on_deep_stack(
+        &predicate,
+        |predicate| trust_types::canonical_json_bytes(predicate),
+        |_| {},
+    )
+    .map_err(|error| TrustVcDirectMirMemoryError::InvalidProofUnitPayload {
+        origin: "obligation metadata".to_string(),
+        reason: format!("could not canonicalize public typed formula payload: {error}"),
     })?;
-    if canonical_payload != payload {
+    if canonical_payload != payload.as_bytes() {
         return Err(TrustVcDirectMirMemoryError::InvalidProofUnitPayload {
             origin: "obligation metadata".to_string(),
             reason: "public typed formula payload is not in its canonical serialized form"
@@ -3450,15 +3458,16 @@ fn has_non_empty_mir_ownership_context(ownership: &JsonValue) -> bool {
 
 #[cfg(feature = "trust-build")]
 fn unsupported_mir_memory_payload_detail(value: &JsonValue) -> Option<String> {
-    fn visit(value: &JsonValue, path: &str) -> Option<String> {
+    fn visit(value: &JsonValue, normalized: &mut String) -> Option<String> {
         match value {
             JsonValue::Object(map) => {
                 for (key, nested) in map {
-                    let normalized = key
-                        .chars()
-                        .filter(|ch| ch.is_ascii_alphanumeric())
-                        .collect::<String>()
-                        .to_ascii_lowercase();
+                    normalized.clear();
+                    normalized.extend(
+                        key.chars()
+                            .filter(|ch| ch.is_ascii_alphanumeric())
+                            .map(|ch| ch.to_ascii_lowercase()),
+                    );
                     if normalized.contains("heap")
                         || normalized.contains("rawptr")
                         || normalized.contains("pointer")
@@ -3466,20 +3475,18 @@ fn unsupported_mir_memory_payload_detail(value: &JsonValue) -> Option<String> {
                         || normalized.contains("alloc")
                         || normalized.contains("deref")
                     {
-                        return Some(format!("{path}.{key}"));
+                        return Some(format!(".{key}"));
                     }
-                    let nested_path = format!("{path}.{key}");
-                    if let Some(detail) = visit(nested, &nested_path) {
-                        return Some(detail);
+                    if let Some(tail) = visit(nested, normalized) {
+                        return Some(format!(".{key}{tail}"));
                     }
                 }
                 None
             }
             JsonValue::Array(items) => {
                 for (index, nested) in items.iter().enumerate() {
-                    let nested_path = format!("{path}[{index}]");
-                    if let Some(detail) = visit(nested, &nested_path) {
-                        return Some(detail);
+                    if let Some(tail) = visit(nested, normalized) {
+                        return Some(format!("[{index}]{tail}"));
                     }
                 }
                 None
@@ -3490,7 +3497,8 @@ fn unsupported_mir_memory_payload_detail(value: &JsonValue) -> Option<String> {
         }
     }
 
-    visit(value, "$")
+    let mut normalized = String::with_capacity(32);
+    visit(value, &mut normalized).map(|tail| format!("${tail}"))
 }
 
 #[cfg(feature = "trust-build")]
@@ -4215,6 +4223,10 @@ pub enum TrustVcNativeReportConversionError {
         metadata_key: &'static str,
         value: String,
     },
+    NativeTmirObligationIdentityConflict {
+        obligation_id: String,
+        reason: String,
+    },
     NativeTmirObligationSuiteMismatch {
         obligation_id: String,
         suite: String,
@@ -4425,6 +4437,9 @@ impl std::fmt::Display for TrustVcNativeReportConversionError {
                     "trust-vc native Tmir evidence for {obligation_id} has invalid `{metadata_key}` value `{value}`"
                 )
             }
+            Self::NativeTmirObligationIdentityConflict { obligation_id, reason } => write!(
+                f, "trust-vc native Tmir evidence for {obligation_id} has conflicting routing identity: {reason}"
+            ),
             Self::NativeTmirObligationSuiteMismatch { obligation_id, suite } => write!(
                 f,
                 "trust-vc native Tmir evidence for {obligation_id} is bound to verifier suite `{suite}`, not trust-vc"
@@ -4782,11 +4797,11 @@ fn validate_trust_vc_public_obligation_semantic_binding(
                 kind: obligation.kind.clone(),
             }
         })?;
-    validate_native_trust_ir_import_field(
+    validate_native_trust_ir_import_field_eq(
         obligation,
         "obligation_kind",
-        expected_kind.to_string(),
-        native_obligation.kind.to_string(),
+        &expected_kind,
+        &native_obligation.kind,
     )?;
 
     let formula = native_obligation.formula.as_ref().ok_or_else(|| {
@@ -4803,46 +4818,54 @@ fn validate_trust_vc_public_obligation_semantic_binding(
         });
     }
     validate_kernel_contract_formula_binding(bundle, obligation, formula)?;
-    let source = native_obligation.source.as_ref().ok_or_else(|| {
-        TrustVcNativeReportConversionError::NativeTmirImportInvalidIdentity {
-            trust_ir_obligation_id: native_obligation.id.index(),
-            field: "source",
-        }
-    })?;
-    let public = source.public.as_ref().ok_or_else(|| {
-        TrustVcNativeReportConversionError::NativeTmirImportInvalidIdentity {
-            trust_ir_obligation_id: native_obligation.id.index(),
-            field: "source.public",
-        }
-    })?;
-    validate_native_trust_ir_import_field(
-        obligation,
-        "source.public.obligation_id",
-        obligation.obligation_id.clone(),
-        public.obligation_id.clone(),
-    )?;
     let expected_label = semantic_digests.get(&obligation.obligation_id).ok_or_else(|| {
         TrustVcNativeReportConversionError::InvalidPublicObligationSemanticBinding {
             obligation_id: obligation.obligation_id.clone(),
             reason: "validated semantic digest index omitted the requested obligation".to_string(),
         }
     })?;
-    let expected =
-        trust_vc_proof_digest_from_canonical_sha256_hex(expected_label).ok_or_else(|| {
+    use trust_verifier_api::native_contract_claim::NativePublicIdentityError;
+    trust_verifier_api::native_contract_claim::validate_native_public_obligation_identity(
+        native_obligation,
+        &obligation.obligation_id,
+        expected_label,
+    )
+    .map_err(|error| match error {
+        NativePublicIdentityError::MissingSource
+        | NativePublicIdentityError::MissingPublicIdentity => {
+            TrustVcNativeReportConversionError::NativeTmirImportInvalidIdentity {
+                trust_ir_obligation_id: native_obligation.id.index(),
+                field: if error == NativePublicIdentityError::MissingSource {
+                    "source"
+                } else {
+                    "source.public"
+                },
+            }
+        }
+        NativePublicIdentityError::InvalidExpectedSemanticDigest => {
             TrustVcNativeReportConversionError::InvalidPublicObligationSemanticBinding {
                 obligation_id: obligation.obligation_id.clone(),
                 reason: "validated semantic digest index returned a non-canonical SHA-256 digest"
                     .to_string(),
             }
-        })?;
-    if public.semantic_digest != expected {
-        return Err(TrustVcNativeReportConversionError::NativeTmirImportBindingMismatch {
-            obligation_id: obligation.obligation_id.clone(),
-            field: "source.public.semantic_digest",
-            expected: expected.to_string(),
-            actual: public.semantic_digest.to_string(),
-        });
-    }
+        }
+        NativePublicIdentityError::ObligationIdMismatch { actual } => {
+            TrustVcNativeReportConversionError::NativeTmirImportBindingMismatch {
+                obligation_id: obligation.obligation_id.clone(),
+                field: "source.public.obligation_id",
+                expected: obligation.obligation_id.clone(),
+                actual,
+            }
+        }
+        NativePublicIdentityError::SemanticDigestMismatch { actual } => {
+            TrustVcNativeReportConversionError::NativeTmirImportBindingMismatch {
+                obligation_id: obligation.obligation_id.clone(),
+                field: "source.public.semantic_digest",
+                expected: format!("sha256:{expected_label}"),
+                actual,
+            }
+        }
+    })?;
     Ok(())
 }
 
@@ -4900,14 +4923,19 @@ fn validate_kernel_contract_formula_binding(
             ),
         });
     }
-    let public_formula: trust_ir::ProofFormula = serde_json::from_value(value.clone()).map_err(
-        |error| TrustVcNativeReportConversionError::InvalidPublicObligationSemanticBinding {
-            obligation_id: obligation.obligation_id.clone(),
-            reason: format!(
-                "kernel-certified contract predicate is not a canonical TrustIr ProofFormula: {error}"
-            ),
-        },
-    )?;
+    // Trust (T3 L4, C09d; L4-C09d-2): a contract predicate is validated to
+    // `json_depth::MAX_DEEP_NESTING`, not 128, so it is read to that bound as every other
+    // contract-predicate reader reads it. A `ProofFormula` is a flat record, so a deep value is
+    // refused by its shape; the deep read keeps the clone and its drop off this stack.
+    let public_formula: trust_ir::ProofFormula =
+        trust_types::json_depth::from_value_deep(value).map_err(|error| {
+            TrustVcNativeReportConversionError::InvalidPublicObligationSemanticBinding {
+                obligation_id: obligation.obligation_id.clone(),
+                reason: format!(
+                    "kernel-certified contract predicate is not a canonical TrustIr ProofFormula: {error}"
+                ),
+            }
+        })?;
     if &public_formula != native_formula {
         return Err(TrustVcNativeReportConversionError::InvalidPublicObligationSemanticBinding {
             obligation_id: obligation.obligation_id.clone(),
@@ -4918,7 +4946,7 @@ fn validate_kernel_contract_formula_binding(
     Ok(())
 }
 
-#[cfg(feature = "trust-build")]
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_vc_proof_digest_from_canonical_sha256_hex(value: &str) -> Option<trust_ir::ProofDigest> {
     if value.len() != 64
         || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -4996,17 +5024,17 @@ fn validate_trust_vc_native_trust_ir_import_matches_obligation(
         TRUST_VC_ENGINE_NAME,
         "verifier_suite",
     )?;
-    validate_native_trust_ir_import_field(
+    validate_native_trust_ir_import_field_eq(
         obligation,
         "request_id",
-        identity.request_id.to_string(),
-        imported.request_id.to_string(),
+        &identity.request_id,
+        &imported.request_id,
     )?;
-    validate_native_trust_ir_import_field(
+    validate_native_trust_ir_import_field_eq(
         obligation,
         "proof_obligation_id",
-        identity.proof_obligation_id.to_string(),
-        imported.trust_ir_obligation_id.to_string(),
+        &identity.proof_obligation_id,
+        &imported.trust_ir_obligation_id,
     )?;
     validate_required_native_trust_ir_u32_metadata(
         obligation,
@@ -5080,8 +5108,8 @@ fn validate_trust_vc_native_trust_ir_import_matches_obligation(
 fn validate_native_trust_ir_import_field(
     obligation: &TrustObligation,
     field: &'static str,
-    expected: String,
-    actual: String,
+    expected: &str,
+    actual: &str,
 ) -> Result<(), TrustVcNativeReportConversionError> {
     if expected == actual {
         Ok(())
@@ -5089,8 +5117,26 @@ fn validate_native_trust_ir_import_field(
         Err(TrustVcNativeReportConversionError::NativeTmirImportBindingMismatch {
             obligation_id: obligation.obligation_id.clone(),
             field,
-            expected,
-            actual,
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        })
+    }
+}
+
+fn validate_native_trust_ir_import_field_eq<T: PartialEq + std::fmt::Display>(
+    obligation: &TrustObligation,
+    field: &'static str,
+    expected: &T,
+    actual: &T,
+) -> Result<(), TrustVcNativeReportConversionError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(TrustVcNativeReportConversionError::NativeTmirImportBindingMismatch {
+            obligation_id: obligation.obligation_id.clone(),
+            field,
+            expected: expected.to_string(),
+            actual: actual.to_string(),
         })
     }
 }
@@ -5156,12 +5202,7 @@ fn validate_optional_native_trust_ir_u32_metadata(
             value: actual.to_string(),
         }
     })?;
-    validate_native_trust_ir_import_field(
-        obligation,
-        field,
-        expected.to_string(),
-        actual.to_string(),
-    )
+    validate_native_trust_ir_import_field_eq(obligation, field, &expected, &actual)
 }
 
 fn validate_optional_native_trust_ir_string_metadata(
@@ -5180,12 +5221,7 @@ fn validate_optional_native_trust_ir_string_metadata(
             value: actual.to_string(),
         });
     }
-    validate_native_trust_ir_import_field(
-        obligation,
-        field,
-        expected.trim().to_string(),
-        actual.trim().to_string(),
-    )
+    validate_native_trust_ir_import_field(obligation, field, expected.trim(), actual.trim())
 }
 
 fn validate_optional_native_trust_ir_digest_metadata(
@@ -5197,20 +5233,29 @@ fn validate_optional_native_trust_ir_digest_metadata(
     let Some(actual) = obligation_metadata_value(obligation, metadata_key) else {
         return Ok(());
     };
-    let Some(expected) = canonical_sha256_digest_label(expected) else {
+    let Some(expected_hex) = normalized_sha256_hex(expected) else {
         return Err(TrustVcNativeReportConversionError::NativeTmirImportInvalidIdentity {
             trust_ir_obligation_id: 0,
             field,
         });
     };
-    let actual = canonical_sha256_digest_label(actual).ok_or_else(|| {
+    let actual_hex = normalized_sha256_hex(actual).ok_or_else(|| {
         TrustVcNativeReportConversionError::NativeTmirObligationIdentityInvalid {
             obligation_id: obligation.obligation_id.clone(),
             metadata_key,
             value: actual.to_string(),
         }
     })?;
-    validate_native_trust_ir_import_field(obligation, field, expected, actual)
+    if expected_hex.eq_ignore_ascii_case(actual_hex) {
+        Ok(())
+    } else {
+        Err(TrustVcNativeReportConversionError::NativeTmirImportBindingMismatch {
+            obligation_id: obligation.obligation_id.clone(),
+            field,
+            expected: format!("sha256:{}", expected_hex.to_ascii_lowercase()),
+            actual: format!("sha256:{}", actual_hex.to_ascii_lowercase()),
+        })
+    }
 }
 
 fn trust_vc_native_static_proof_strength(
@@ -5684,50 +5729,50 @@ struct TrustVcNativeTmirObligationIdentity {
 fn trust_vc_native_tmir_obligation_identity(
     obligation: &TrustObligation,
 ) -> Result<TrustVcNativeTmirObligationIdentity, TrustVcNativeReportConversionError> {
+    use trust_verifier_api::native_routing_identity::{
+        NativeRoutingIdentityError, NativeRoutingIdentityPolicy, SuiteComparison,
+        parse_native_routing_identity,
+    };
+    let identity = parse_native_routing_identity(
+        obligation,
+        NativeRoutingIdentityPolicy {
+            canonical_id_fallback: false,
+            canonical_metadata_numbers: false,
+            suite_comparison: SuiteComparison::VerifierAliases,
+        },
+    )
+    .map_err(|error| match error {
+        NativeRoutingIdentityError::InvalidNumber { key, value } => {
+            TrustVcNativeReportConversionError::NativeTmirObligationIdentityInvalid {
+                obligation_id: obligation.obligation_id.clone(),
+                metadata_key: key,
+                value,
+            }
+        }
+        other => TrustVcNativeReportConversionError::NativeTmirObligationIdentityConflict {
+            obligation_id: obligation.obligation_id.clone(),
+            reason: other.to_string(),
+        },
+    })?;
+    let missing =
+        |metadata_key| TrustVcNativeReportConversionError::NativeTmirObligationIdentityMissing {
+            obligation_id: obligation.obligation_id.clone(),
+            metadata_key,
+        };
     let suite =
-        obligation_metadata_value(obligation, TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY)
-            .ok_or_else(|| {
-                TrustVcNativeReportConversionError::NativeTmirObligationIdentityMissing {
-                    obligation_id: obligation.obligation_id.clone(),
-                    metadata_key: TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY,
-                }
-            })?;
+        identity.suite.ok_or_else(|| missing(TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY))?;
     if !suite.eq_ignore_ascii_case(TRUST_VC_ENGINE_NAME) {
         return Err(TrustVcNativeReportConversionError::NativeTmirObligationSuiteMismatch {
-            obligation_id: obligation.obligation_id.clone(),
-            suite: suite.to_string(),
+            obligation_id: obligation.obligation_id.clone(), suite,
         });
     }
-
-    let request_id = required_native_trust_ir_u32_metadata(
-        obligation,
-        TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY,
-    )?;
-    let proof_obligation_id = required_native_trust_ir_u32_metadata(
-        obligation,
-        TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY,
-    )?;
-
+    let request_id = identity
+        .request_id
+        .ok_or_else(|| missing(TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY))?;
+    let proof_obligation_id = identity
+        .proof_obligation_id
+        .ok_or_else(|| missing(TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY))?;
     Ok(TrustVcNativeTmirObligationIdentity { request_id, proof_obligation_id })
-}
-
-fn required_native_trust_ir_u32_metadata(
-    obligation: &TrustObligation,
-    metadata_key: &'static str,
-) -> Result<u32, TrustVcNativeReportConversionError> {
-    let value = obligation_metadata_value(obligation, metadata_key).ok_or_else(|| {
-        TrustVcNativeReportConversionError::NativeTmirObligationIdentityMissing {
-            obligation_id: obligation.obligation_id.clone(),
-            metadata_key,
-        }
-    })?;
-    value.parse::<u32>().map_err(|_| {
-        TrustVcNativeReportConversionError::NativeTmirObligationIdentityInvalid {
-            obligation_id: obligation.obligation_id.clone(),
-            metadata_key,
-            value: value.to_string(),
-        }
-    })
 }
 
 fn obligation_metadata_value<'a>(obligation: &'a TrustObligation, key: &str) -> Option<&'a str> {
@@ -6207,11 +6252,20 @@ mod tests {
             "evidence_kind": "lean_proof",
             "trusted": false
         });
+        // trust-vc 8bbef1af: `verdict` is REQUIRED on the wire at both levels and
+        // RE-DERIVED on decode. A decoded certificate's admission is never
+        // admissible (coverage is judged only against the bundle a certificate
+        // cites, which a report does not carry), so the only verdict a decoded
+        // import request can wear is `certificates_rejected`. trust-vc 2f792110:
+        // a request report also names the obligations it answers (here the one
+        // obligation its evidence carries).
         let request = json!({
             "request_id": 7,
             "mode": "import_proof_certificates",
             "lineage_roots": [3],
-            "proof_evidence": [proof_evidence]
+            "obligations": [0],
+            "proof_evidence": [proof_evidence],
+            "verdict": "certificates_rejected"
         });
         serde_json::from_value(json!({
             "producer": "Trust",
@@ -6220,9 +6274,61 @@ mod tests {
             "trust_ir_module_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "compiler_facts_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "module_name": "demo",
-            "requests": [request]
+            "requests": [request],
+            "verdict": "certificates_rejected"
         }))
         .expect("native Tmir report JSON matches trust_vc schema")
+    }
+
+    /// The digest-bound import `native_trust_ir_report(true)` used to admit, stated
+    /// directly.
+    ///
+    /// Since trust-vc 8bbef1af a DECODED report admits nothing: every decoded
+    /// certificate reads `CertificateCoverageNotJudged`, because coverage is judged
+    /// only against the bundle a certificate cites. The binding checks downstream
+    /// of an admitted import are still Trust's to keep, so the tests that exercise
+    /// them start from this value — field for field what the report's evidence
+    /// carries — instead of from an admission the engine no longer grants.
+    #[cfg(feature = "trust-build")]
+    fn native_trust_ir_import_fixture() -> TrustVcNativeTrustIrImportedProofArtifact {
+        TrustVcNativeTrustIrImportedProofArtifact {
+            request_id: 7,
+            assertion_id: "6".to_string(),
+            trust_ir_module_digest:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    .to_string(),
+            request_digest:
+                "sha256:abababababababababababababababababababababababababababababababab"
+                    .to_string(),
+            trust_ir_obligation_id: 0,
+            evidence_digest:
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            certificate_digest:
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            compiler_facts_digest:
+                "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    .to_string(),
+            obligation_source_digest:
+                "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+                    .to_string(),
+            compiler_fact_obligation_id: 0,
+            compiler_fact_assertion_id: Some(6),
+            compiler_fact_refs: vec![TrustVcNativeCompilerFactBindingRef {
+                kind: "Monomorphization".to_string(),
+                id: 0,
+            }],
+            replay_engine: "trust-vc".to_string(),
+            replay_invocation: "trust-vc import --native-bundle".to_string(),
+            replay_transcript_digest:
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            artifact_fingerprint:
+                "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+                    .to_string(),
+            certificate_materialization: None,
+        }
     }
 
     fn native_trust_ir_bundle_metadata(
@@ -6349,12 +6455,16 @@ mod tests {
                 .expect("fixture public kind maps to trust-vc native TrustIr");
 
         let mut module = trust_ir::Module::new("compiler_raw_trust_vc_native_trust_ir_bridge");
-        let source_file = module.intern_file("src/lib.rs");
-        let func_ty = module.add_func_type(trust_ir::FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
+        let source_file =
+            module.intern_file("src/lib.rs").expect("Module::intern_file: test fixture");
+        let func_ty = module
+            .add_func_type(trust_ir::FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let entry = trust_ir::BlockId::new(0);
         let mut function =
             trust_ir::Function::new(function_id, "compiler_owned_value", func_ty, entry)
@@ -6365,7 +6475,7 @@ mod tests {
                 .with_span(trust_ir::SourceSpan { file: 0, line: 12, col: 9 }),
         );
         function.blocks.push(block);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module.proof_obligations.push(
             trust_ir::ProofObligation::new(
                 proof_id,
@@ -6379,6 +6489,8 @@ mod tests {
                 payload: json!({ "memory_safe": true }).to_string(),
                 smtlib: None,
                 sort: None,
+                // v41: no clause bindings — an empty table reads as UNBINDABLE, never as a wildcard.
+                bindings: Vec::new(),
             })
             .with_source(
                 trust_ir::ProofObligationSourceIdentity::new(
@@ -6404,6 +6516,8 @@ mod tests {
             evidence: trust_ir::ProofEvidence::LeanProof(
                 "exact trust_vc.NativeTmir.compiler_owned_value_memory".to_string(),
             ),
+            // v41: no native evidence bundle to project a coverage assurance from.
+            assurance: None,
         });
 
         trust_ir_bridge::native_verification_bundle_from_module(module, source_digest, function_id)
@@ -6540,8 +6654,11 @@ mod tests {
             },
             MetadataEntry {
                 key: TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY.to_string(),
-                value: serde_json::to_string(&predicate)
-                    .expect("direct public formula canonicalizes"),
+                value: String::from_utf8(
+                    trust_types::canonical_json_bytes(&predicate)
+                        .expect("direct public formula canonicalizes"),
+                )
+                .expect("canonical JSON is UTF-8"),
             },
             MetadataEntry {
                 key: TRUST_VC_DIGEST_METADATA_KEY.to_string(),
@@ -6599,8 +6716,11 @@ mod tests {
             },
             MetadataEntry {
                 key: TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY.to_string(),
-                value: serde_json::to_string(&predicate)
-                    .expect("release-admissible public formula canonicalizes"),
+                value: String::from_utf8(
+                    trust_types::canonical_json_bytes(&predicate)
+                        .expect("release-admissible public formula canonicalizes"),
+                )
+                .expect("canonical JSON is UTF-8"),
             },
             MetadataEntry {
                 key: TRUST_VC_DIGEST_METADATA_KEY.to_string(),
@@ -6971,48 +7091,40 @@ mod tests {
 
     #[cfg(feature = "trust-build")]
     #[test]
-    fn native_trust_ir_import_report_preserves_digest_bound_artifact_identity() {
+    fn native_trust_ir_import_report_admits_nothing_once_decoded() {
+        // Re-pinned for trust-vc 8bbef1af. This test used to assert that a
+        // decoded report admits its certificate and preserves its digest-bound
+        // identity. The engine now re-derives admission on decode and never reads
+        // the wire's verdict: a report does not carry the bundle a certificate's
+        // coverage is judged against, so a decoded certificate is refused
+        // `CertificateCoverageNotJudged`, deterministically. The identity checks
+        // an admitted import must pass are pinned directly on
+        // `native_trust_ir_import_fixture()` below.
         let report = native_trust_ir_report(true);
 
-        let artifacts = trust_vc_native_trust_ir_imported_proof_artifacts_from_report(&report)
-            .expect("native Tmir import report admits proof artifacts");
+        let err = trust_vc_native_trust_ir_imported_proof_artifacts_from_report(&report)
+            .expect_err("a decoded native Tmir report admits no proof artifact");
         let again = trust_vc_native_trust_ir_imported_proof_artifacts_from_report(&report)
-            .expect("native Tmir import identity is deterministic");
+            .expect_err("the refusal is deterministic");
 
-        assert_eq!(artifacts, again);
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].request_id, 7);
-        assert_eq!(artifacts[0].assertion_id, "6");
-        assert_eq!(artifacts[0].trust_ir_obligation_id, 0);
-        assert_eq!(
-            artifacts[0].evidence_digest,
-            "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-        );
-        assert_eq!(
-            artifacts[0].certificate_digest,
-            "sha256:2222222222222222222222222222222222222222222222222222222222222222"
-        );
-        assert_eq!(artifacts[0].compiler_fact_obligation_id, 0);
-        assert_eq!(artifacts[0].compiler_fact_assertion_id, Some(6));
-        assert_eq!(artifacts[0].replay_engine, "trust-vc");
-        assert_eq!(
-            artifacts[0].replay_transcript_digest,
-            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-        );
+        assert_eq!(err, again);
+        let TrustVcNativeReportConversionError::NativeTmirImportRejected {
+            trust_ir_obligation_id,
+            status,
+            reasons,
+            ..
+        } = &err
+        else {
+            panic!("expected NativeTmirImportRejected, got {err:?}");
+        };
+        assert_eq!(*trust_ir_obligation_id, 0);
+        assert_eq!(status, "Rejected");
         assert!(
-            artifacts[0]
-                .compiler_fact_refs
-                .iter()
-                .any(|fact| fact.kind == "Monomorphization" && fact.id == 0),
-            "compiler fact refs were not preserved: {:?}",
-            artifacts[0].compiler_fact_refs
+            reasons.iter().any(|reason| reason == "CertificateCoverageNotJudged"),
+            "a decoded certificate's coverage is never judged: {reasons:?}"
         );
-        assert_eq!(
-            normalized_sha256_hex(&artifacts[0].artifact_fingerprint)
-                .expect("hash-addressed fingerprint")
-                .len(),
-            64
-        );
+        validate_trust_vc_native_trust_ir_import_binding(&native_trust_ir_import_fixture())
+            .expect("the stated import fixture is a well-formed digest-bound binding");
     }
 
     #[cfg(feature = "trust-build")]
@@ -7025,7 +7137,17 @@ mod tests {
         let report = serde_json::from_value(report)
             .expect("legacy report DTO remains readable for compatibility diagnostics");
 
+        // trust-vc 8bbef1af refuses every decoded certificate at admission
+        // (`CertificateCoverageNotJudged`), before Trust's own identity check runs.
         let err = trust_vc_native_trust_ir_imported_proof_artifacts_from_report(&report)
+            .expect_err("legacy digest labels cannot cross the proof-import authority boundary");
+        assert!(matches!(err, TrustVcNativeReportConversionError::NativeTmirImportRejected { .. }));
+
+        // Trust's own check still refuses the legacy label on an import that
+        // got past admission.
+        let mut import = native_trust_ir_import_fixture();
+        import.request_digest = format!("trust_ir-stable-v1:{}", "a".repeat(64));
+        let err = validate_trust_vc_native_trust_ir_import_binding(&import)
             .expect_err("legacy digest labels cannot cross the proof-import authority boundary");
 
         assert!(matches!(
@@ -7054,11 +7176,9 @@ mod tests {
     #[test]
     fn legacy_native_report_cannot_authorize_even_with_import_identity() {
         let engine = TrustVcVerificationEngine::new();
-        let native_import = trust_vc_native_trust_ir_imported_proof_artifacts_from_report(
-            &native_trust_ir_report(true),
-        )
-        .expect("native Tmir import admits")
-        .remove(0);
+        // An admitted import stated directly: a decoded report no longer
+        // admits one (trust-vc 8bbef1af); see `native_trust_ir_import_fixture`.
+        let native_import = native_trust_ir_import_fixture();
         let mut obligation =
             typed_trust_vc_contract_obligation(ObligationKind::Postcondition, "post");
         set_native_trust_ir_bundle_metadata(
@@ -7102,11 +7222,9 @@ mod tests {
         clear_native_trust_ir_bundle_metadata(&mut obligation);
         let bundle = bundle_with(vec![obligation.clone()]);
         let artifact = native_trust_vc_artifact();
-        let native_import = trust_vc_native_trust_ir_imported_proof_artifacts_from_report(
-            &native_trust_ir_report(true),
-        )
-        .expect("native Tmir import admits")
-        .remove(0);
+        // An admitted import stated directly: a decoded report no longer
+        // admits one (trust-vc 8bbef1af); see `native_trust_ir_import_fixture`.
+        let native_import = native_trust_ir_import_fixture();
         let native_evidence = native_contract_frame_evidence("post", &artifact)
             .with_native_trust_ir_import(native_import);
 
@@ -7131,11 +7249,9 @@ mod tests {
     #[test]
     fn native_trust_vc_report_rejects_mismatched_native_trust_ir_fact_metadata() {
         let engine = TrustVcVerificationEngine::new();
-        let native_import = trust_vc_native_trust_ir_imported_proof_artifacts_from_report(
-            &native_trust_ir_report(true),
-        )
-        .expect("native Tmir import admits")
-        .remove(0);
+        // An admitted import stated directly: a decoded report no longer
+        // admits one (trust-vc 8bbef1af); see `native_trust_ir_import_fixture`.
+        let native_import = native_trust_ir_import_fixture();
         let mut obligation =
             typed_trust_vc_contract_obligation(ObligationKind::Postcondition, "post");
         set_native_trust_ir_bundle_metadata(
@@ -7233,6 +7349,8 @@ mod tests {
             payload: json!({ "memory_safe": true }).to_string(),
             smtlib: None,
             sort: None,
+            // v41: no clause bindings — an empty table reads as UNBINDABLE, never as a wildcard.
+            bindings: Vec::new(),
         };
         let native = trust_ir::ProofObligation::new(
             trust_ir::ProofId::new(0),
@@ -7268,6 +7386,35 @@ mod tests {
             &formula,
         )
         .expect("typed embedded public identity and exact replay claim are authoritative");
+    }
+
+    #[cfg(feature = "trust-build")]
+    #[test]
+    fn native_trust_ir_semantic_binding_preserves_missing_identity_refusals() {
+        let (bundle, obligation, digests, formula, original) =
+            native_trust_ir_semantic_binding_fixture("memory.missing-identity");
+        for field in ["source", "source.public"] {
+            let mut native = original.clone();
+            if field == "source" {
+                native.source = None;
+            } else {
+                native.source.as_mut().unwrap().public = None;
+            }
+            let error = validate_trust_vc_public_obligation_semantic_binding(
+                &bundle,
+                &obligation,
+                &digests,
+                &native,
+                &formula,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error,
+                TrustVcNativeReportConversionError::NativeTmirImportInvalidIdentity { field: actual, .. }
+                if actual == field),
+                "{field}: {error}"
+            );
+        }
     }
 
     #[cfg(feature = "trust-build")]
@@ -9681,5 +9828,114 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.contains("not ArithmeticSafety"))
         );
+    }
+
+    // Trust: the public payload is checked against the PRODUCER's canonical bytes
+    // (`trust_types::canonical_json_bytes`, 143f77647b7), not serde's struct field
+    // order; any other encoding of the same predicate is still refused.
+    #[cfg(feature = "trust-build")]
+    #[test]
+    fn direct_mir_memory_public_payload_must_be_the_producers_canonical_bytes() {
+        let mut obligation =
+            typed_trust_vc_obligation(ObligationKind::MemorySafety, "memory.canonical_payload");
+        obligation.required_strength = None;
+        obligation.contract_id = None;
+        attach_release_admissible_direct_mir_memory_carrier(&mut obligation);
+        normalized_direct_mir_memory_public_predicate(&obligation)
+            .expect("the producer's canonical bytes are accepted");
+
+        let payload_index = obligation
+            .metadata
+            .iter()
+            .position(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
+            .expect("fixture carries the public payload");
+        let canonical = obligation.metadata[payload_index].value.clone();
+        let predicate: TrustSpecPredicate =
+            serde_json::from_str(&canonical).expect("fixture payload parses");
+        let struct_order = serde_json::to_string(&predicate).expect("predicate serializes");
+        let pretty = serde_json::to_string_pretty(&predicate).expect("predicate serializes");
+        assert_ne!(struct_order, canonical, "the two encodings must differ for this control");
+        for noncanonical in [struct_order, pretty] {
+            obligation.metadata[payload_index].value = noncanonical;
+            let error = normalized_direct_mir_memory_public_predicate(&obligation)
+                .expect_err("a non-canonical encoding of the same predicate is refused");
+            assert!(
+                format!("{error:?}").contains("canonical serialized form"),
+                "unexpected refusal: {error:?}"
+            );
+        }
+    }
+    #[test]
+    fn native_routing_identity_preserves_vc_requirements_and_rejects_ambiguity() {
+        let mut row = obligation(ObligationKind::Assertion, "public");
+        set_native_trust_ir_bundle_metadata(&mut row, "TRUST-VC", 7, 2);
+        row.metadata
+            .iter_mut()
+            .find(|entry| entry.key == TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY)
+            .unwrap()
+            .value = "+07".into();
+        let identity = trust_vc_native_tmir_obligation_identity(&row).unwrap();
+        assert_eq!((identity.request_id, identity.proof_obligation_id), (7, 2));
+        row.obligation_id = "trust_ir-native-trust-vc-request-7-proof-2".into();
+        assert_eq!(trust_vc_native_tmir_obligation_identity(&row).unwrap(), identity);
+        let mut wrong_suite = row.clone();
+        wrong_suite
+            .metadata
+            .iter_mut()
+            .find(|entry| entry.key == TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY)
+            .unwrap()
+            .value = "trust_vc".into();
+        assert!(matches!(
+            trust_vc_native_tmir_obligation_identity(&wrong_suite),
+            Err(TrustVcNativeReportConversionError::NativeTmirObligationSuiteMismatch { .. })
+        ));
+        for key in [
+            TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY,
+            TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY,
+            TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY,
+        ] {
+            let mut duplicate = row.clone();
+            duplicate
+                .metadata
+                .push(duplicate.metadata.iter().find(|entry| entry.key == key).unwrap().clone());
+            assert!(matches!(
+                trust_vc_native_tmir_obligation_identity(&duplicate),
+                Err(
+                    TrustVcNativeReportConversionError::NativeTmirObligationIdentityConflict { .. }
+                )
+            ));
+            let mut missing = row.clone();
+            missing.metadata.retain(|entry| entry.key != key);
+            assert!(matches!(
+                trust_vc_native_tmir_obligation_identity(&missing),
+                Err(TrustVcNativeReportConversionError::NativeTmirObligationIdentityMissing { .. })
+            ));
+        }
+        for changed in [
+            "trust_ir-native-trust-vc-request-8-proof-2",
+            "trust_ir-native-trust-vc-request-7-proof-3",
+            "trust_ir-native-trust-mc-request-7-proof-2",
+        ] {
+            row.obligation_id = changed.into();
+            assert!(
+                matches!(
+                    trust_vc_native_tmir_obligation_identity(&row),
+                    Err(
+                        TrustVcNativeReportConversionError::NativeTmirObligationIdentityConflict { .. }
+                    )
+                ),
+                "{changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_routing_regression_vc_suite_alias() {
+        let mut row =
+            obligation(ObligationKind::Assertion, "trust_ir-native-trust_vc-request-7-proof-2");
+        set_native_trust_ir_bundle_metadata(&mut row, "TRUST-VC", 7, 2);
+        let identity = trust_vc_native_tmir_obligation_identity(&row)
+            .expect("the native suite token and admitted metadata name denote the same engine");
+        assert_eq!((identity.request_id, identity.proof_obligation_id), (7, 2));
     }
 }

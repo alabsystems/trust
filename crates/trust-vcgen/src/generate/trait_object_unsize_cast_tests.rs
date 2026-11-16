@@ -30,14 +30,15 @@ fn cast_fn(target: Ty) -> VerifiableFunction {
         mutable: false,
         inner: Box::new(Ty::Adt {
             name: "test::S".to_string(),
-            fields: vec![],
-            variants: vec![],
+            fields: vec![].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             adt_kind: Some(trust_types::AdtKind::Struct),
             arbitrary_precision: None,
+            validity_wrapper: None,
         }),
     };
     VerifiableFunction {
@@ -66,6 +67,7 @@ fn cast_fn(target: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

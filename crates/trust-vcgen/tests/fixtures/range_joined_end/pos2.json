@@ -1,0 +1,1190 @@
+{
+  "name": "f",
+  "def_path": "pos2::f",
+  "span": {
+    "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 1,
+    "col_end": 151
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "k"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "iter"
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::ops::range::Range",
+                "fields": [
+                  [
+                    "start",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "end",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 54,
+                "line_end": 1,
+                "col_end": 61
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 50,
+                "line_end": 1,
+                "col_end": 61
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+              "line_start": 1,
+              "col_start": 50,
+              "line_end": 1,
+              "col_end": 61
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 64,
+                "line_end": 1,
+                "col_end": 71
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 81,
+                "line_end": 1,
+                "col_end": 82
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      32
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 98,
+                "line_end": 1,
+                "col_end": 102
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 116,
+                "line_end": 1,
+                "col_end": 117
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          64
+                        ]
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 9,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 113,
+                "line_end": 1,
+                "col_end": 117
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 8,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 7,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+              "line_start": 1,
+              "col_start": 113,
+              "line_end": 1,
+              "col_end": 117
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 10349,
+              "substs_digest": [
+                4510617746543345897,
+                8802476808072790987
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 7,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 113,
+                "line_end": 1,
+                "col_end": 117
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 10,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 113,
+                "line_end": 1,
+                "col_end": 117
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Copy": {
+                  "local": 12,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 11,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+              "line_start": 1,
+              "col_start": 113,
+              "line_end": 1,
+              "col_end": 117
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 10530,
+              "substs_digest": [
+                4510617746543345897,
+                8802476808072790987
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 11,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 113,
+                "line_end": 1,
+                "col_end": 117
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                9
+              ],
+              [
+                1,
+                8
+              ]
+            ],
+            "otherwise": 7,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+              "line_start": 1,
+              "col_start": 113,
+              "line_end": 1,
+              "col_end": 117
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 11,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 108,
+                "line_end": 1,
+                "col_end": 109
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 124,
+                "line_end": 1,
+                "col_end": 125
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 139,
+                "line_end": 1,
+                "col_end": 143
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 18,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 139,
+                "line_end": 1,
+                "col_end": 143
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 19,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 10,
+            "span": {
+              "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+              "line_start": 1,
+              "col_start": 139,
+              "line_end": 1,
+              "col_end": 143
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 148,
+                "line_end": 1,
+                "col_end": 149
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 14
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 139,
+                "line_end": 1,
+                "col_end": 143
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u32>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 16,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 17,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 15,
+              "projections": []
+            },
+            "target": 11,
+            "span": {
+              "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+              "line_start": 1,
+              "col_start": 124,
+              "line_end": 1,
+              "col_end": 144
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 27674,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 15,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/build/tmp/p50/pr/pos2.rs",
+                "line_start": 1,
+                "col_start": 120,
+                "line_end": 1,
+                "col_end": 144
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_13",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_13",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Ge": [
+        {
+          "Var": [
+            "v__slice_len",
+            "Int"
+          ]
+        },
+        {
+          "Int": 0
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

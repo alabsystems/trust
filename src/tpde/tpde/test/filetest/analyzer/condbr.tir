@@ -1,0 +1,17 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+;
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+; RUN: %tpde_test --run-until=analyzer --print-liveness %s | FileCheck %s --dump-input always
+
+; CHECK: Liveness for condbr1
+; CHECK-NEXT: 0: 2 refs, 0->0 (entry->entry), lf: false
+; CHECK-NEXT: 1: ignored
+; CHECK-NEXT: 2: ignored
+; CHECK-NEXT: End Liveness
+condbr1(%a) {
+entry:
+  condbr %a, ^ret, ^ret
+ret:
+  terminate
+}

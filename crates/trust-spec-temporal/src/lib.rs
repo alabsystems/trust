@@ -31,7 +31,10 @@ mod clean_model_lane;
 mod clean_surface;
 mod clean_ty_lane;
 mod dependency_coherence;
+mod kernel_worker;
 pub mod literal_refinement;
+pub mod literal_property;
+pub mod model_prelude;
 pub mod model_program_refinement;
 mod r5_parity;
 
@@ -126,9 +129,13 @@ mod in_process_ty_transaction_tests {
             .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
             .output()
             .expect("isolated transaction-guard worker must launch");
+            // A clean exit alone proves nothing: if TEST_NAME drifts from this
+            // function's path, `--exact` selects no test and the worker exits 0.
             assert!(
-                output.status.success(),
-                "isolated transaction-guard worker failed\nstdout:\n{}\nstderr:\n{}",
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("test result: ok. 1 passed;"),
+                "isolated transaction-guard worker failed or did not run\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
@@ -219,8 +226,13 @@ pub use clean_ty_lane::{
     certify_clean_countdown_with_ty, recheck_clean_countdown_with_ty,
 };
 pub use model_program_refinement::{
+    INVARIANT_MODEL_PROGRAM_PROPERTY_SCHEMA_V1, InvariantModelProgramPropertyCertificate,
+    certify_invariant_model_program_property, recheck_invariant_model_program_property,
+    INVARIANT_MODEL_PROGRAM_REFINEMENT_SCHEMA_V1,
     MODEL_PROGRAM_REFINEMENT_SCHEMA_V1, MODEL_PROGRAM_REFINEMENT_SCHEMA_V2,
+    InvariantModelProgramRefinementCertificate,
     ModelProgramRefinementCertificate, ModelProgramRefinementError, ModelProgramRefinementTheorem,
+    certify_invariant_model_program_refinement, recheck_invariant_model_program_refinement,
     certify_model_program_refinement, recheck_model_program_refinement,
 };
 pub use r5_parity::{
@@ -926,7 +938,7 @@ impl Model {
 /// `seq` and evicts the oldest live event (`lo`) exactly when the live window
 /// would exceed `Cap`. `MaxSeq` bounds the state space so `ty check` is
 /// exhaustive + terminating; `Cap` is the ring capacity. Action name is `Push`
-/// (not `Append`, which clashes with ty's Sequences builtin).
+/// (not `Append`, which ty's lexer made a keyword until ty db6133b11e).
 pub fn ring_model() -> Model {
     Model {
         name: "Ring",
@@ -1147,8 +1159,8 @@ pub fn kernel_model() -> Model {
         name: "Kernel",
         consts: vec![("MaxSeq", 5), ("Buggy", 0)],
         vars: vec![StateVar { name: "seq", init: 0 }, StateVar { name: "count", init: 0 }],
-        // Action `Emit` (not `Append`, which clashes with ty's Sequences builtin in
-        // a single-action spec — see the ring's `Push`).
+        // Action `Emit` (not `Append`, which ty's lexer made a keyword until ty
+        // db6133b11e — see the ring's `Push`).
         fn_vars: vec![],
         actions: vec![Action {
             name: "Emit",
@@ -2937,6 +2949,14 @@ pub(crate) fn validate_temporal_identifier(name: &str, role: &str) -> Result<(),
     if clean_model_lane::TLA_RESERVED_IDENTIFIER_TOKENS.contains(&name) {
         return Err(format!("{role} `{name}` is a reserved TLA+ lexer token"));
     }
+    // These are ordinary identifiers, but the certificate producer still
+    // declines their use as state bindings. Keep the prior binding restriction
+    // separate from the lexer mirror; named declarations resolve normally.
+    if clean_model_lane::TLA_CERTIFICATE_BUILTIN_BINDINGS.contains(&name)
+        && !matches!(role, "model" | "constant" | "action" | "invariant")
+    {
+        return Err(format!("{role} `{name}` conflicts with a temporal certificate builtin"));
+    }
     Ok(())
 }
 
@@ -3028,7 +3048,7 @@ fn valid_temporal_capability(capability: &str) -> bool {
 // The former "deprecated M3 compatibility registry" (link-time model
 // inventory: `pub use inventory`, `RegisteredModel`, `registered_models*`, and
 // the `check_registered_models*_or_exit` helpers) was deleted as extraneous
-// (owner ruling 2026-07-20, "no deprecation limbo"): the live Targo
+// (no deprecation limbo: a retired route is deleted, not kept as a fallback): the live Targo
 // temporal/build gates never trusted the process-owned registry as program
 // evidence and unconditionally reject the automatic route with
 // unbound-evidence exit 2. Callers own their explicit model list and use

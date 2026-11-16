@@ -29,14 +29,15 @@
 pub mod float;
 pub mod int;
 
-use crate::error::{Error, Result};
-use crate::map::Map;
-use crate::number::N;
-use crate::value::Value;
 use std::io;
 
 use float::FloatBuffer;
 use int::IntBuffer;
+
+use crate::error::{Error, Result};
+use crate::map::Map;
+use crate::number::N;
+use crate::value::Value;
 
 /// Represents a character escape code in a type-safe manner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,11 +81,7 @@ pub trait Formatter {
     where
         W: ?Sized + io::Write,
     {
-        let s = if value {
-            b"true".as_slice()
-        } else {
-            b"false".as_slice()
-        };
+        let s = if value { b"true".as_slice() } else { b"false".as_slice() };
         writer.write_all(s)
     }
 
@@ -234,11 +231,7 @@ pub trait Formatter {
     where
         W: ?Sized + io::Write,
     {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b",")
-        }
+        if first { Ok(()) } else { writer.write_all(b",") }
     }
 
     #[inline]
@@ -270,11 +263,7 @@ pub trait Formatter {
     where
         W: ?Sized + io::Write,
     {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b",")
-        }
+        if first { Ok(()) } else { writer.write_all(b",") }
     }
 
     #[inline]
@@ -334,11 +323,7 @@ impl<'a> PrettyFormatter<'a> {
 
     #[must_use]
     pub fn with_indent(indent: &'a [u8]) -> Self {
-        PrettyFormatter {
-            current_indent: 0,
-            has_value: false,
-            indent,
-        }
+        PrettyFormatter { current_indent: 0, has_value: false, indent }
     }
 }
 
@@ -596,7 +581,11 @@ where
 }
 
 /// Serializes a [`Value`] into an [`io::Write`] with an explicit formatter.
-pub fn to_writer_with_formatter<W, F>(writer: &mut W, formatter: &mut F, value: &Value) -> Result<()>
+pub fn to_writer_with_formatter<W, F>(
+    writer: &mut W,
+    formatter: &mut F,
+    value: &Value,
+) -> Result<()>
 where
     W: ?Sized + io::Write,
     F: ?Sized + Formatter,

@@ -7,7 +7,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Abstract value in a lattice for fixpoint computation.
 ///
@@ -196,13 +196,14 @@ impl FixpointComputer {
             // to guarantee convergence on infinite ascending chains.
             if i >= self.config.widening_delay {
                 let mut widened_values = BTreeMap::new();
-                // Collect all variable names from both states
-                let all_keys: BTreeSet<String> =
-                    current.values.keys().chain(next.values.keys()).cloned().collect();
-                for key in all_keys {
-                    let cur_val = current.values.get(&key).unwrap_or(&AbstractValue::Bottom);
+                for (key, cur_val) in current.values {
                     let next_val = next.values.get(&key).unwrap_or(&AbstractValue::Bottom);
-                    widened_values.insert(key, widen(cur_val, next_val));
+                    widened_values.insert(key, widen(&cur_val, next_val));
+                }
+                for (key, next_val) in next.values {
+                    if !widened_values.contains_key(&key) {
+                        widened_values.insert(key, widen(&AbstractValue::Bottom, &next_val));
+                    }
                 }
                 current = FixpointState { values: widened_values, iteration: i.saturating_add(1) };
             } else {
@@ -291,9 +292,13 @@ pub(crate) fn join(a: &AbstractValue, b: &AbstractValue) -> AbstractValue {
         }
         (AbstractValue::Set(s), AbstractValue::Interval(lo, hi))
         | (AbstractValue::Interval(lo, hi), AbstractValue::Set(s)) => {
-            let set_min = s.iter().copied().min().unwrap_or(*lo);
-            let set_max = s.iter().copied().max().unwrap_or(*hi);
-            AbstractValue::Interval((*lo).min(set_min), (*hi).max(set_max))
+            let mut min_val = *lo;
+            let mut max_val = *hi;
+            for &v in s {
+                min_val = min_val.min(v);
+                max_val = max_val.max(v);
+            }
+            AbstractValue::Interval(min_val, max_val)
         }
     }
 }
@@ -453,16 +458,16 @@ fn bounds_of(v: &AbstractValue) -> (i64, i64) {
         AbstractValue::Constant(c) => (*c, *c),
         AbstractValue::Interval(lo, hi) => (*lo, *hi),
         AbstractValue::Set(s) => {
-            if s.is_empty() {
-                (1, 0)
-            } else {
-                // SAFETY: The else-branch only runs when s is non-empty.
-                let lo =
-                    s.iter().copied().min().unwrap_or_else(|| unreachable!("min on non-empty set"));
-                let hi =
-                    s.iter().copied().max().unwrap_or_else(|| unreachable!("max on non-empty set"));
-                (lo, hi)
+            let Some(&first) = s.first() else {
+                return (1, 0);
+            };
+            let mut lo = first;
+            let mut hi = first;
+            for &v in &s[1..] {
+                lo = lo.min(v);
+                hi = hi.max(v);
             }
+            (lo, hi)
         }
     }
 }
@@ -926,19 +931,6 @@ mod tests {
         assert_eq!(config.max_iterations, 100);
         assert_eq!(config.widening_delay, 3);
         assert!(config.use_narrowing);
-    }
-
-    #[test]
-    fn test_fixpoint_result_fields() {
-        let result = FixpointResult {
-            value: AbstractValue::Interval(0, 10),
-            iterations: 7,
-            converged: true,
-            widening_applied: 2,
-        };
-        assert_eq!(result.iterations, 7);
-        assert!(result.converged);
-        assert_eq!(result.widening_applied, 2);
     }
 
     #[test]

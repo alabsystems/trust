@@ -37,7 +37,8 @@ toolchain distribution. To see live data:
 4. Choose **Retry Now** if needed. The menu should show the compatible
    coordinator within the next poll interval.
 
-`trustd` shuts itself down after about five minutes with no worker activity.
+`trustd` shuts itself down about five minutes after the last build holding it
+ends and its workers go quiet; a running build holds it however long it runs.
 An offline shield between builds is therefore expected; starting the next
 crate-mode build and choosing **Retry** reconnects the observer. The app never
 starts, stops, installs, or upgrades the daemon itself. **Copy Diagnostics**

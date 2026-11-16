@@ -1,0 +1,40 @@
+[package]
+name = "trust-build-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Native per-unit CPU leases shared by Trust builds and aterm"
+
+[features]
+observations = ["dep:serde", "dep:serde_json"]
+jobserver = ["dep:jobserver"]
+member = ["dep:jobserver_utils"]
+native-host = ["observations", "dep:trust-resource-controller"]
+
+[dependencies]
+# Keep derive separate in Bootstrap consumers; inherited root serde enables it.
+serde = { version = "1", optional = true }
+serde_json = { workspace = true, optional = true }
+jobserver = { version = "0.1.35", optional = true }
+jobserver_utils = { path = "../../src/jobserver_utils", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+sha2 = { workspace = true, default-features = false }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+trust-resource-controller = { path = "../trust-resource-controller", features = ["client"], optional = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+jobserver = "0.1.35"
+jobserver_utils = { path = "../../src/jobserver_utils" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "recovery_material"
+path = "src/recovery_material/tests.rs"

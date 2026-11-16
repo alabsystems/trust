@@ -1,0 +1,16 @@
+# Identities for aterm_pty.trust_ir (the measurement's dump of aterm-pty at
+# aterm 4ba80b2b6, stage1 trustc 771983b92). Name-only identities except the
+# local bodies the producer refused (bodyless declarations; the dump's own
+# coverage.json rows say lowered=false). No host facts: no HIR effect lists,
+# typeck drop facts or HIR site census (the host is PR 9).
+refused unix::process_birth_platform
+refused "unix::<impl ShellIdentity>::verify"
+refused unix::reap_shell_scheduled
+refused unix::Straggler::settled
+refused unix::poll_writable
+refused unix::resize_with_cell_px
+# The HIR sites of the product spawn body, read from aterm-pty's
+# src/unix.rs at 4ba80b2b6 (the producer refused the body). Not a full HIR
+# site census: the descriptor-number sites of the spliced bodies are not
+# listed, so they read PC-CENSUS-SKEW.
+site unix::spawn_shell_with_pid_cell_px 1791:23=fork 1977:12=execve

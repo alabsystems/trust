@@ -1,0 +1,110 @@
+{
+  "name": "ok_h7_u128_param_lo",
+  "def_path": "probes_128::ok_h7_u128_param_lo",
+  "span": {
+    "file": "src/probes_128.rs",
+    "line_start": 7,
+    "col_start": 0,
+    "line_end": 7,
+    "col_end": 77
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": "x"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ge",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        128
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "src/probes_128.rs",
+                "line_start": 7,
+                "col_start": 69,
+                "line_end": 7,
+                "col_end": 69
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Bool"
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "src/probes_128.rs",
+        "line_start": 7,
+        "col_start": 52,
+        "line_end": 7,
+        "col_end": 66
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) == (true)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Eq": [
+        {
+          "Var": [
+            "_0",
+            "Bool"
+          ]
+        },
+        {
+          "Bool": true
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) == (true)"
+    ],
+    "invariants": []
+  }
+}

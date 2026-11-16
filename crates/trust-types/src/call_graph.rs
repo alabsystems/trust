@@ -61,8 +61,45 @@ fn top_level_sep(s: &str, sep: &str) -> Option<usize> {
 /// cross-match, nor do `for u32` vs `for u64` (different SELF). The containing
 /// module path (before the impl-block `<`) is intentionally dropped — trait
 /// coherence makes `(trait, args, self, method)` a unique identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CanonicalTraitKey<'a>(&'a str, &'a str, &'a str, &'a str);
+
+trait CanonicalTraitLookup {
+    fn as_tuple(&self) -> (&str, &str, &str, &str);
+}
+
+impl CanonicalTraitLookup for CanonicalTraitKey<'_> {
+    #[inline]
+    fn as_tuple(&self) -> (&str, &str, &str, &str) {
+        (self.0, self.1, self.2, self.3)
+    }
+}
+
+impl PartialEq for dyn CanonicalTraitLookup + '_ {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_tuple() == other.as_tuple()
+    }
+}
+
+impl Eq for dyn CanonicalTraitLookup + '_ {}
+
+impl std::hash::Hash for dyn CanonicalTraitLookup + '_ {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_tuple().hash(state);
+    }
+}
+
+impl<'a, 'b: 'a> std::borrow::Borrow<dyn CanonicalTraitLookup + 'a> for CanonicalTraitKey<'b> {
+    #[inline]
+    fn borrow(&self) -> &(dyn CanonicalTraitLookup + 'a) {
+        self
+    }
+}
+
 #[must_use]
-pub fn canonical_trait_method(def_path: &str) -> Option<(String, String, String, String)> {
+fn canonical_trait_method_borrowed(def_path: &str) -> Option<CanonicalTraitKey<'_>> {
     let open = def_path.find('<')?;
     let bytes = def_path.as_bytes();
     let mut depth = 0usize;
@@ -108,7 +145,14 @@ pub fn canonical_trait_method(def_path: &str) -> Option<(String, String, String,
     if trait_path.is_empty() || self_ty.is_empty() {
         return None;
     }
-    Some((trait_path.to_string(), trait_args.to_string(), self_ty.to_string(), method.to_string()))
+    Some(CanonicalTraitKey(trait_path, trait_args, self_ty, method))
+}
+
+#[must_use]
+pub fn canonical_trait_method(def_path: &str) -> Option<(String, String, String, String)> {
+    canonical_trait_method_borrowed(def_path).map(|CanonicalTraitKey(tr, args, self_ty, method)| {
+        (tr.to_string(), args.to_string(), self_ty.to_string(), method.to_string())
+    })
 }
 
 /// Reusable exact/name/suffix index for deterministic callee resolution.
@@ -125,7 +169,7 @@ pub struct CalleeResolver<'a> {
     // so a call spelled `<SELF as TRAIT>::M` resolves to the `<impl TRAIT for
     // SELF>::M` dump def_path (and vice-versa) without an exact/suffix bridge.
     // Ambiguity (two def_paths canonicalizing to the same tuple) fails closed.
-    canonical: FxHashMap<(String, String, String, String), Resolution<'a>>,
+    canonical: FxHashMap<CanonicalTraitKey<'a>, Resolution<'a>>,
 }
 
 impl<'a> CalleeResolver<'a> {
@@ -150,7 +194,7 @@ impl<'a> CalleeResolver<'a> {
 
             // Trust: index the trait-impl canonical tuple (if `def_path` is a
             // trait method), so the qualified/impl-block spelling gap is bridged.
-            if let Some(key) = canonical_trait_method(def_path) {
+            if let Some(key) = canonical_trait_method_borrowed(def_path) {
                 resolver.record_canonical(key, def_path);
             }
         }
@@ -174,37 +218,33 @@ impl<'a> CalleeResolver<'a> {
 
         // Trust: TRAIT-IMPL CANONICAL-TUPLE match (only when `callee` parses as a
         // trait method). EXACT tuple equality; ambiguity fails closed.
-        let key = canonical_trait_method(callee)?;
-        match self.canonical.get(&key) {
+        let key = canonical_trait_method_borrowed(callee)?;
+        match self.canonical.get(&key as &dyn CanonicalTraitLookup) {
             Some(Resolution::Unique(def_path)) => Some(*def_path),
             Some(Resolution::Ambiguous) | None => None,
         }
     }
 
     fn record_shorthand(&mut self, shorthand: &'a str, def_path: &'a str) {
-        match self.shorthand.get_mut(shorthand) {
-            None => {
-                self.shorthand.insert(shorthand, Resolution::Unique(def_path));
-            }
-            Some(existing) => {
+        self.shorthand
+            .entry(shorthand)
+            .and_modify(|existing| {
                 if matches!(*existing, Resolution::Unique(previous) if previous != def_path) {
                     *existing = Resolution::Ambiguous;
                 }
-            }
-        }
+            })
+            .or_insert(Resolution::Unique(def_path));
     }
 
-    fn record_canonical(&mut self, key: (String, String, String, String), def_path: &'a str) {
-        match self.canonical.get_mut(&key) {
-            None => {
-                self.canonical.insert(key, Resolution::Unique(def_path));
-            }
-            Some(existing) => {
+    fn record_canonical(&mut self, key: CanonicalTraitKey<'a>, def_path: &'a str) {
+        self.canonical
+            .entry(key)
+            .and_modify(|existing| {
                 if matches!(*existing, Resolution::Unique(previous) if previous != def_path) {
                     *existing = Resolution::Ambiguous;
                 }
-            }
-        }
+            })
+            .or_insert(Resolution::Unique(def_path));
     }
 }
 
@@ -323,15 +363,18 @@ impl CallGraph {
         }
         // Iterative three-colour DFS from every node; a grey→grey edge is a cycle.
         let mut colour = vec![0u8; self.nodes.len()]; // 0 white, 1 grey, 2 black
+        let mut stack = Vec::new();
         for start in 0..self.nodes.len() {
             if colour[start] != 0 {
                 continue;
             }
             colour[start] = 1;
-            let mut stack = vec![(start, 0usize)];
-            while let Some(&(node, k)) = stack.last() {
+            stack.clear();
+            stack.push((start, 0usize));
+            while let Some(top) = stack.last_mut() {
+                let (node, k) = *top;
                 if k < adj[node].len() {
-                    stack.last_mut().unwrap().1 += 1;
+                    top.1 += 1;
                     let next = adj[node][k];
                     match colour[next] {
                         1 => return false,

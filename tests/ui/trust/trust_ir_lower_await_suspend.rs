@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 //@ edition: 2021
 // B5 stage 4, increment 1 (wave-FS4): the first async bodies with a real
 // `.await` lower end to end. Two halves, each with its own argument:

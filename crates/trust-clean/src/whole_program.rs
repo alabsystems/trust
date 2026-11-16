@@ -150,6 +150,7 @@ pub fn helper_callee() -> VerifiableFunction {
             Formula::Le(Box::new(ret_var()), Box::new(Formula::Int(100))),
         ],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -185,6 +186,7 @@ pub fn main_like_caller() -> VerifiableFunction {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     unwind: trust_types::UnwindEdge::Unreachable,
                 },
@@ -216,6 +218,7 @@ pub fn main_like_caller() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -265,7 +268,9 @@ pub struct CalleeSummary {
 ///
 /// Returns the summary plus the (mutated) registry entry. On any kernel failure
 /// the callee is recorded as `Trusted` (NOT assumable) — fail-closed: an
-/// unproven callee contributes no hypothesis to its callers.
+/// unproven callee contributes no hypothesis to its callers. A body that calls,
+/// tail-calls or drops anything is recorded `Trusted` too. A summary has no
+/// graph in which to certify what that code does (see `first_unresolved_effect`).
 #[must_use]
 pub fn certify_callee_summary(
     callee: &VerifiableFunction,
@@ -293,6 +298,16 @@ pub fn certify_callee_summary(
             .collect(),
         params: param_names(callee),
         proved,
+        // v41, pre-v41 meanings. This lane carries no `decreases` measure: it
+        // certifies postconditions modulo 3 and makes no termination claim, and
+        // an invented measure would be a claim nothing here discharges.
+        // `backed_by: None` is NOT RECORDED — never "backed locally" and never
+        // "trust the bit". It names a CROSS-CRATE authority, and `proved` here
+        // is earned in this very module, where the obligations and certificates
+        // sit beside it for any consumer to re-check.
+        decreases: Vec::new(),
+        backed_by: None,
+        effects: None,
     };
 
     // Record the kernel-lane proof status. `Certified` ⇒ assumable; anything else
@@ -317,6 +332,54 @@ pub fn certify_callee_summary(
     }
 }
 
+/// CALLEE CREDIT: the first terminator of `func` that runs code this certification
+/// tier has not certified for that call site, described for an `open_reason`, or
+/// `None` when there is no such terminator.
+///
+/// Both certification gates, [`ensures_certified_modulo_3`] and
+/// [`certify_function_in_graph`], claim WHOLE-BODY panic-freedom plus assumption
+/// authority for every caller. Both read only `trust_vcgen::generate_vcs(func)`, and
+/// that row set is per-function by design. A callee's panics are the callee's own
+/// obligations, discharged when the callee is verified, so vcgen raises no row for
+/// what a `Call` or `TailCall` runs, or for the drop glue a `Drop` runs. A gate that
+/// reads only the row set therefore charges those panics to nobody: the obligation
+/// set is emptied by an absence and then read as discharged.
+///
+/// MEASURED on 521477a0d2 (`callee_credit_gate_tests` against the unfixed gates):
+/// with a trivially true `ensures`, a body whose only call is a KEYED call (an
+/// untagged user [`trust_types::CalleeKey`]) to a panicking callee raised no L0 row,
+/// and `certify_callee_summary` reported `proved` and `is_assumable`. So did a keyed
+/// tail call and a `Drop`; 68160b1461 had already closed the keyless call and tail
+/// call. The graph tier certified a caller of an in-graph callee it had just
+/// refused, a caller that never establishes a certified callee's `requires`, tail
+/// calls, and drops. A key identifies a callee; it says nothing about whether the
+/// callee panics.
+///
+/// `resolved(callee, args)` decides one direct `Call`/`TailCall`: whether the gate
+/// itself certified the callee's panic-freedom and the call site establishes the
+/// callee's `requires` (a certified callee is panic-free only on inputs that satisfy
+/// them). The summary gate has no graph and resolves nothing. Neither gate
+/// certifies drop glue, which is not a function either one examines, so every
+/// `Drop` refuses.
+fn first_unresolved_effect(
+    func: &VerifiableFunction,
+    resolved: impl Fn(&str, &[Operand]) -> bool,
+) -> Option<String> {
+    func.body.blocks.iter().find_map(|block| match &block.terminator {
+        Terminator::Call { func: callee, args, .. } => (!resolved(callee, args)).then(|| {
+            format!("the call to `{callee}` reaches a callee not certified for this call site")
+        }),
+        Terminator::TailCall { func: callee, args, .. } => (!resolved(callee, args)).then(|| {
+            format!("the tail call to `{callee}` reaches a callee not certified for this call site")
+        }),
+        Terminator::Drop { place, .. } => Some(format!(
+            "the drop of local _{} runs drop glue that no certification tier examines",
+            place.local
+        )),
+        _ => None,
+    })
+}
+
 /// Whether EVERY L0-safety VC and postcondition VC of `callee` is kernel-checked modulo 3 by the
 /// EXISTING per-function kernel path — the SAME discharge `prove_dump_dir` applies
 /// (`prove.rs:3724` postcond-via-vc). We generate the required VCs with
@@ -330,10 +393,16 @@ pub fn certify_callee_summary(
 /// Fail-closed: a single undischarged (or kernel-rejected) postcondition VC, or a
 /// callee with NO postcondition VC at all, ⇒ NOT certified (not assumable). This
 /// is the `Certified`/`CleanCic` tier gate: only a callee whose ensures the kernel
-/// CHECKS modulo 3 may be assumed by a caller.
+/// CHECKS modulo 3 may be assumed by a caller. A callee that calls, tail-calls or
+/// drops anything is refused too; see [`first_unresolved_effect`].
 fn ensures_certified_modulo_3(callee: &VerifiableFunction) -> bool {
     if callee.postconditions.is_empty() {
         return false; // no contract ⇒ nothing to certify ⇒ not assumable
+    }
+    // CALLEE CREDIT, see `first_unresolved_effect`. A summary has no graph, so it
+    // certifies no callee. A call, tail call or drop refuses, keyed or keyless.
+    if first_unresolved_effect(callee, |_, _| false).is_some() {
+        return false;
     }
     let mut saw_postcondition_vc = false;
     let vcs = trust_vcgen::generate_vcs(callee);
@@ -360,9 +429,11 @@ fn ensures_certified_modulo_3(callee: &VerifiableFunction) -> bool {
     //     (`fixtures/decline-handling-2026-08-25/sources/oracle_d1.rs`), yet with the row
     //     skipped it reached `proved` here and `ProofStatus::Certified` in
     //     `certify_function_in_graph`, on an offset that discharges perfectly.
-    //   * the SAME offset written as the `ptr::add` intrinsic keeps a real
-    //     `Assertion { "[unsafe:sep:offset] …" }` row that does NOT refute, so the
-    //     intrinsic spelling is refused. Crediting the compensation here made the
+    //   * the SAME offset written as the `ptr::add` intrinsic — keyed, as the extractor
+    //     keys it — keeps a real `Assertion { "[unsafe:sep:offset] …" }` row that does NOT
+    //     refute, so the intrinsic spelling is refused. (Keyless, the mint raises no row
+    //     at all; the callee-credit clause above refuses that input, as it refuses every
+    //     call here.) Crediting the compensation here made the
     //     `Rvalue::PtrOffset` spelling STRICTLY MORE authoritative than the intrinsic;
     //     refusing every decline is what makes the two spellings agree at this tier.
     // The hand-off keeps its full effect where it is earned — `mirsem::function_has_open_declined_vc`
@@ -376,6 +447,9 @@ fn ensures_certified_modulo_3(callee: &VerifiableFunction) -> bool {
     if vcs.iter().any(|vc| crate::mirsem::is_declined_vc_kind_pub(&vc.kind)) {
         return false;
     }
+    // KEYLESS IS NOT OBLIGATION-FREE (`keyless_call_outside_graph`) needs no clause of
+    // its own here: the callee-credit clause above already refuses every call, keyed
+    // or keyless.
     // Safety first documents and enforces the dependency of the checked
     // postcondition return relation on panic/overflow freedom. Do not pull L1/L2
     // domain obligations into this lane: its contract is exactly L0 safety plus
@@ -395,6 +469,58 @@ fn ensures_certified_modulo_3(callee: &VerifiableFunction) -> bool {
         }
     }
     saw_postcondition_vc
+}
+
+/// KEYLESS IS NOT OBLIGATION-FREE — the first direct call in `func` that carries no
+/// [`trust_types::CalleeKey`] and whose callee this tier does not resolve itself
+/// (`resolved_in_graph`), or `None` when there is no such call.
+///
+/// The graph tier applies it. The summary tier resolves no callee at all, keyed or
+/// keyless, so its callee-credit clause ([`first_unresolved_effect`]) already refuses
+/// every call there. Being in the graph is necessary here but not sufficient: the
+/// graph tier's callee-credit clause still refuses an in-graph callee that the graph
+/// did not certify for the call site.
+///
+/// `callee_key` is what the vcgen unsafe mint DECIDES on. Every contract-minting
+/// recognizer — `ptr::add`'s in-bounds `[unsafe:sep:offset]` row, `from_raw_parts`,
+/// `get_unchecked`, `ptr::read`/`write`, … — answers FALSE on a missing key and emits
+/// nothing. The fail-closed stand-in that answers a missing key
+/// (`[unsafe:unmodeled-call]`) is minted by the COMPILER, not by
+/// `trust_vcgen::generate_vcs`, so this tier — which reads `generate_vcs` and nothing
+/// else — never sees it. The carrier's own contract (`Terminator::Call::callee_key` in
+/// `trust-types`) is that `None` "MUST fail closed at every consumer". Reading a keyless
+/// call as "nothing to prove" instead is Channel 2's shape again: an obligation set
+/// emptied by an ABSENCE, then read as vacuously discharged.
+///
+/// MEASURED (`decline_gate_tests::ptr_offset_decline_earns_no_certification_tier`):
+/// `fixtures/ptr-spine-corpus/count.json` predates the carrier. Once the mint became
+/// key-only, its keyless `ptr::add(start, len)` raised NO row — the whole L0 set was
+/// EMPTY — and `certify_callee_summary` reported `proved` and `is_assumable` for it.
+/// The same body with the keys today's extractor mints raises the
+/// `[unsafe:sep:offset]` row, which does not refute, and is refused on that row.
+///
+/// `resolved_in_graph` is the one exemption, and it is the graph tier's own mechanism,
+/// not a key substitute: `verify_call_graph` consumes an in-graph callee through the
+/// summary it certified itself (`gather_callee_hypotheses`), which is how its synthetic
+/// programs — keyless by construction, and admitted only in that shape by
+/// `global_callee_hypotheses_have_supported_scope` — compose. A callee outside the graph
+/// is resolved by nothing, so its keyless call refuses. The extractor keys every call
+/// whose `func` operand is a `FnDef` constant (`trust_mir_extract::func_operand_callee_key`),
+/// so on a current dump this refuses the calls it documents as unkeyable — indirect
+/// calls — plus any artifact serialized before the carrier existed.
+fn keyless_call_outside_graph(
+    func: &VerifiableFunction,
+    resolved_in_graph: impl Fn(&str) -> bool,
+) -> Option<String> {
+    func.body.blocks.iter().find_map(|block| match &block.terminator {
+        Terminator::Call { func: callee, callee_key: None, .. }
+        | Terminator::TailCall { func: callee, callee_key: None, .. }
+            if !resolved_in_graph(callee) =>
+        {
+            Some(callee.clone())
+        }
+        _ => None,
+    })
 }
 
 // ===========================================================================
@@ -631,6 +757,10 @@ pub fn trust_ir_record_for_proven(callee: &CalleeSummary) -> TrustIrCompositionR
         inherited_evidence: ProofEvidence::InheritedFromCallee {
             callee: callee.func_id,
             obligation: callee.ensures_obligation,
+            // v41. `None` is the pre-v41 meaning, byte-identical on the wire:
+            // this is the two-function whole-program POC, so caller and callee
+            // are in one module and there is no cross-crate authority to name.
+            external: None,
         },
         // The kernel-checked-modulo-3 discharge is the de Bruijn `Certified` tier
         // (backed by `CleanCic` in a full module).
@@ -833,15 +963,9 @@ fn establishes_rebound_clause(caller: &VerifiableFunction, clause: &Formula) -> 
 /// Whether a formula mentions the callee result symbol (`_0` / `ret` / `result`)
 /// — the same result spellings `rebind_rec` rebinds.
 fn formula_mentions_result(f: &Formula) -> bool {
-    let mut found = false;
-    f.visit(&mut |g| {
-        if let Formula::Var(name, _) = g
-            && (name == "_0" || name == "ret" || name == "result")
-        {
-            found = true;
-        }
-    });
-    found
+    trust_types::any_formula_node(f, &mut |g| {
+        matches!(g, Formula::Var(name, _) if name == "_0" || name == "ret" || name == "result")
+    })
 }
 
 /// Negate an atomic comparison to its VIOLATION (the SAT-iff-violation encoding).
@@ -1133,6 +1257,7 @@ fn global_callee_hypotheses_have_supported_scope(func: &VerifiableFunction) -> b
                 target: Some(target),
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 is_foreign: false,
                 ..
             } if calls_may_continue
@@ -1170,6 +1295,9 @@ fn global_callee_hypotheses_have_supported_scope(func: &VerifiableFunction) -> b
 /// fail-closed, like a leaf without a contract). Because the current bridge carries
 /// one conjunction of callee facts rather than per-VC establish points, functions
 /// with calls are admitted only by [`global_callee_hypotheses_have_supported_scope`].
+/// A function is `Certified` only if every callee it calls or tail-calls is one
+/// this graph certified, called with its `requires` established, and it drops
+/// nothing ([`first_unresolved_effect`], [`callee_certified_for_call_site`]).
 #[must_use]
 fn certify_function_in_graph(
     func: &VerifiableFunction,
@@ -1231,6 +1359,22 @@ fn certify_function_in_graph(
             )),
         };
     }
+    // KEYLESS IS NOT OBLIGATION-FREE — a keyless call leaving the graph (see
+    // `keyless_call_outside_graph`). After the decline clause, so a body refused on both
+    // grounds reports its declined row first. The callee-credit clause after the VC loop
+    // refuses the rest, keyed or keyless.
+    if let Some(callee) = keyless_call_outside_graph(func, |p| by_path.contains_key(p)) {
+        return FunctionVerdict {
+            def_path: func.def_path.clone(),
+            status: ProofStatus::Trusted,
+            assumed_callees,
+            open_reason: Some(format!(
+                "a call to `{callee}` carries no callee key and is outside this graph — the \
+                 unsafe mint cannot identify it, so its contract obligations are absent from \
+                 the row set and the certification tier refuses it"
+            )),
+        };
+    }
     for vc in vcs
         .iter()
         .filter(|vc| vc.kind.proof_level() == ProofLevel::L0Safety)
@@ -1280,6 +1424,25 @@ fn certify_function_in_graph(
         }
     }
 
+    // CALLEE CREDIT, see `first_unresolved_effect`. The rows above belong to this
+    // body only. A panic in what it calls, tail-calls or drops is excluded only when
+    // this graph certified the callee and the call site establishes its `requires`.
+    // This runs after the VC loop, so a body refused on both grounds reports its
+    // undischarged row, and that reason names the blocked callee when there is one.
+    if let Some(effect) = first_unresolved_effect(func, |callee, args| {
+        callee_certified_for_call_site(func, callee, args, by_path, registry)
+    }) {
+        return FunctionVerdict {
+            def_path: func.def_path.clone(),
+            status: ProofStatus::Trusted,
+            assumed_callees,
+            open_reason: Some(format!(
+                "{effect}, so whole-body panic-freedom is not established at the \
+                 certification tier"
+            )),
+        };
+    }
+
     if !saw_postcondition_vc {
         return FunctionVerdict {
             def_path: func.def_path.clone(),
@@ -1297,6 +1460,59 @@ fn certify_function_in_graph(
         assumed_callees,
         open_reason: None,
     }
+}
+
+/// Whether this graph certified the panic-freedom of `callee_path` for THIS call site
+/// of `caller`. That requires four things:
+///
+///  * the callee is in the graph,
+///  * it is already `Certified` in the shared registry,
+///  * the call passes exactly as many arguments as the callee takes, and
+///  * the caller ESTABLISHES every `requires` clause of the callee, rebound onto the
+///    call's licensed actual spellings (the same establishment
+///    [`gather_callee_hypotheses`] demands before transferring an `ensures`).
+///
+/// Order is callee-first, so a certified callee was examined before its callers. A
+/// self call or a member of a recursive SCC is not yet `Certified` when its caller
+/// is checked, so it stays unresolved. Establishment matters because a certified
+/// callee is panic-free only on inputs that satisfy its `requires`: `any_arg(a)`
+/// calling `bump(a)` (`requires a < 100`, `a + 1` inside) with `a` unconstrained
+/// overflows inside `bump` at `a = i32::MAX`.
+fn callee_certified_for_call_site(
+    caller: &VerifiableFunction,
+    callee_path: &str,
+    args: &[Operand],
+    by_path: &FxHashMap<&str, &VerifiableFunction>,
+    registry: &ProofStatusRegistry,
+) -> bool {
+    let Some(callee_fn) = by_path.get(callee_path).copied() else {
+        return false; // outside the graph: nothing here examined its body
+    };
+    if !registry.is_assumable(callee_path) || args.len() != callee_fn.body.arg_count {
+        return false;
+    }
+    let formal_to_actual = licensed_formal_to_actual(caller, callee_fn, args);
+    caller_establishes_requires(caller, &callee_fn.preconditions, &formal_to_actual)
+}
+
+/// Each callee formal name (its locals `1..=arg_count`) mapped to the LICENSED
+/// at-call spelling of its actual in `caller`, from `trust_vcgen::call_arg_fact_token`.
+/// An actual without a licensed spelling leaves its formal unmapped, so every clause
+/// that mentions that formal fails closed downstream (see [`gather_callee_hypotheses`]).
+fn licensed_formal_to_actual(
+    caller: &VerifiableFunction,
+    callee_fn: &VerifiableFunction,
+    args: &[Operand],
+) -> FxHashMap<String, String> {
+    let mut formal_to_actual: FxHashMap<String, String> = FxHashMap::default();
+    for (i, actual) in args.iter().enumerate() {
+        if let Some(formal) = local_name(callee_fn, i + 1)
+            && let Some(actual_tok) = trust_vcgen::call_arg_fact_token(caller, actual)
+        {
+            formal_to_actual.insert(formal, actual_tok);
+        }
+    }
+    formal_to_actual
 }
 
 /// For each `Call h = callee(args)` in `func`'s body, if `callee` is `Certified` in
@@ -1377,14 +1593,7 @@ fn gather_callee_hypotheses(
         // the REASSIGNED-ACTUAL FALSE-CERTIFICATION bug this file's probe pins:
         // `a = 0; h = pass(a)` under `requires(a >= 100)` minted the hypothesis
         // `a >= 100` about the entry version and certified a false `ret >= 100`.
-        let mut formal_to_actual: FxHashMap<String, String> = FxHashMap::default();
-        for (i, actual) in args.iter().enumerate() {
-            if let Some(formal) = local_name(callee_fn, i + 1)
-                && let Some(actual_tok) = trust_vcgen::call_arg_fact_token(func, actual)
-            {
-                formal_to_actual.insert(formal, actual_tok);
-            }
-        }
+        let formal_to_actual = licensed_formal_to_actual(func, callee_fn, args);
 
         // FAIL-CLOSED gate (the `ProofContext.establishes` half): a callee's
         // ensures holds ONLY for calls that satisfy its requires. Kernel-check
@@ -1491,6 +1700,7 @@ pub fn diamond_leaf() -> VerifiableFunction {
             Formula::Le(Box::new(ret_var()), Box::new(Formula::Int(10))),
         ],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1538,6 +1748,7 @@ fn diamond_intermediate(
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         unwind: trust_types::UnwindEdge::Unreachable,
                     },
@@ -1583,6 +1794,7 @@ fn diamond_intermediate(
             Formula::Le(Box::new(ret_var()), Box::new(Formula::Int(ensures_bound))),
         ],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1632,6 +1844,7 @@ pub fn diamond_top() -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         unwind: trust_types::UnwindEdge::Unreachable,
                     },
@@ -1648,6 +1861,7 @@ pub fn diamond_top() -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         unwind: trust_types::UnwindEdge::Unreachable,
                     },
@@ -1690,6 +1904,7 @@ pub fn diamond_top() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![Formula::Le(Box::new(ret_var()), Box::new(Formula::Int(32)))],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1908,6 +2123,7 @@ pub fn sum_to_n_recursive() -> RecursiveFunction {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     unwind: trust_types::UnwindEdge::Unreachable,
                 },
@@ -1941,6 +2157,7 @@ pub fn sum_to_n_recursive() -> RecursiveFunction {
         // #[ensures(ret >= 0)]
         postconditions: vec![Formula::Ge(Box::new(ret_var()), Box::new(Formula::Int(0)))],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     RecursiveFunction {
         func,
@@ -2454,6 +2671,7 @@ fn mutual_member(name: &str, def_path: &str, other_path: &str) -> RecursiveFunct
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     unwind: trust_types::UnwindEdge::Unreachable,
                 },
@@ -2483,6 +2701,7 @@ fn mutual_member(name: &str, def_path: &str, other_path: &str) -> RecursiveFunct
             preconditions: vec![],
             postconditions: vec![Formula::Ge(Box::new(ret_var()), Box::new(Formula::Int(0)))],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         },
         measure: Some(Formula::Var("n".into(), Sort::Int)),
     }
@@ -2743,9 +2962,14 @@ mod tests {
         assert_eq!(rec.proof_context.establishes.len(), 1, "establishes the callee requires");
         // InheritedFromCallee over FuncId(0)'s ensures obligation.
         match rec.inherited_evidence {
-            ProofEvidence::InheritedFromCallee { callee, obligation } => {
+            ProofEvidence::InheritedFromCallee { callee, obligation, external } => {
                 assert_eq!(callee, FuncId::new(0));
                 assert_eq!(obligation, rec.proof_context.assumes[0]);
+                // v41. This POC is one module, so the inheritance must claim no
+                // cross-crate authority. Asserted rather than ignored: a `Some`
+                // here would mean the discharge rests on an imported module's
+                // digest, which this lane never establishes.
+                assert!(external.is_none(), "same-module inheritance names no ExternRef");
             }
             other => panic!("expected InheritedFromCallee, got {other:?}"),
         }
@@ -3485,6 +3709,7 @@ mod tests {
                 ),
             ],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3523,6 +3748,7 @@ mod tests {
                             atomic: None,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: None,
                             is_foreign: false,
                         },
                     },
@@ -3548,6 +3774,7 @@ mod tests {
             )],
             postconditions: vec![Formula::Ge(Box::new(ret_var()), Box::new(Formula::Int(100)))],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

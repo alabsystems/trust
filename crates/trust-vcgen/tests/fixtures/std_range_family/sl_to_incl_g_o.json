@@ -1,0 +1,465 @@
+{
+  "name": "sl_to_incl_g_o",
+  "def_path": "q::sl_to_incl_g_o",
+  "span": {
+    "file": "q.rs",
+    "line_start": 4,
+    "col_start": 0,
+    "line_end": 4,
+    "col_end": 98
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeInclusive",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "exhausted",
+                "Bool"
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "q.rs",
+                "line_start": 4,
+                "col_start": 60,
+                "line_end": 4,
+                "col_end": 67
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "q.rs",
+                "line_start": 4,
+                "col_start": 56,
+                "line_end": 4,
+                "col_end": 67
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "q.rs",
+              "line_start": 4,
+              "col_start": 56,
+              "line_end": 4,
+              "col_end": 67
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeInclusive",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeInclusive<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          64
+                        ]
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "Bool": false
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "library/core/src/ops/range.rs",
+                "line_start": 391,
+                "col_start": 8,
+                "line_end": 391,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::RangeInclusive<usize> as core::slice::index::SliceIndex<[u8]>>::index",
+            "args": [
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "library/core/src/slice/index.rs",
+              "line_start": 780,
+              "col_start": 8,
+              "line_end": 780,
+              "col_end": 35
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 16393065086629420908,
+              "def_index": 14303,
+              "substs_digest": [
+                16247732868473285809,
+                16626215588312124441
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 16393065086629420908,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageDead": 4
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "q.rs",
+                "line_start": 4,
+                "col_start": 93,
+                "line_end": 4,
+                "col_end": 94
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "StorageDead": 3
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "StorageDead": 6
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "q.rs",
+                "line_start": 4,
+                "col_start": 70,
+                "line_end": 4,
+                "col_end": 83
+              }
+            }
+          },
+          {
+            "StorageDead": 5
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "b",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "b",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

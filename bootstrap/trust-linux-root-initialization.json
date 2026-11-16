@@ -1,0 +1,40 @@
+{
+  "schema": "trust.linux-root-initialization-policy.v1",
+  "source_commit": "629729f69eefb1cfe6ed766c6c01ee38aa7b0484",
+  "source_date": "2026-07-13",
+  "source_version": "1.99.0",
+  "std_source_archive_sha256": "d5c82aee2b2fe233aa0ec8178a8f0eb8fe0f0a1d8b78302ce5ad31294e56ed48",
+  "providers": {
+    "first-party/ay": "3f36de347152a341126511fea8d2908e2f7aad4d",
+    "first-party/clean": "8f440038ef507a1ec6fae94fc20e4ee8259071dd",
+    "first-party/ny": "342ab02d39093142bbd7a8eed2303a14da5c34b2",
+    "first-party/trust-cg": "ad5b248a583db3851598ce7912e9c27db33932d2",
+    "first-party/trust-ir": "509e1b5dc9f43210e591f8209175fe2c76e30cb2",
+    "first-party/trust-mc": "51c0029fd933094b3ce7ec90f3f267a7489e7f18",
+    "first-party/trust-vc": "2b34fd902d702b881fb017fbf2b1957ca7775396",
+    "first-party/trust-wp": "1245bfe8d5b00806081db7298504c6e7af492db2",
+    "first-party/ty": "e50f79dacb5d143c0c10adcb79db1f809addfb8e"
+  },
+  "legacy_admission": {
+    "commit": "1e7694b9f673af4db8a9b55509020f43a2568689",
+    "host": "aarch64-apple-darwin",
+    "stage0_sha256": "01ecb73dd2a5235fc30483e699e287f3bdff422ce75f28a6d15a911fcef8d05f",
+    "ledger_sha256": "60b7ae4b994d445f6ac0e70680f8df3902485e41a249cdf7b1ab0b776f148aa6"
+  },
+  "external_roots": {
+    "genesis": {
+      "manifest_url": "https://static.rust-lang.org/dist/2026-07-09/channel-rust-nightly.toml",
+      "manifest_sha256": "5578b498ab4fcdf48aeb6205fef695c4aa8ba1d373fc720cee983fed1ebe53b7",
+      "commit": "14cae681329a63c622a6e1fbe1d30f9374bc51d8",
+      "date": "2026-07-08",
+      "release": "1.99.0-nightly"
+    },
+    "ddc": {
+      "manifest_url": "https://static.rust-lang.org/dist/channel-rust-1.97.1.toml",
+      "manifest_sha256": "03569b1886ceb5c05276b50c8431ab111de944cd6140fe1fa7d821dd8e0f29cf",
+      "commit": "8bab26f4f68e0e26f0bb7960be334d5b520ea452",
+      "date": "2026-07-14",
+      "release": "1.97.1"
+    }
+  }
+}

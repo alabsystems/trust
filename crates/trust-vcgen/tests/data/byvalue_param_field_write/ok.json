@@ -1,0 +1,141 @@
+{
+  "name": "ok",
+  "def_path": "byvalue_param_field_write::ok",
+  "span": {
+    "file": "byvalue_param_field_write.rs",
+    "line_start": 62,
+    "col_start": 0,
+    "line_end": 66,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "byvalue_param_field_write::S",
+            "fields": [
+              [
+                "a",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "b",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "s"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "byvalue_param_field_write.rs",
+                "line_start": 66,
+                "col_start": 1,
+                "line_end": 66,
+                "col_end": 1
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "byvalue_param_field_write.rs",
+        "line_start": 63,
+        "col_start": 12,
+        "line_end": 63,
+        "col_end": 25
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) == (s.0)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Eq": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Var": [
+            "s.0",
+            "Int"
+          ]
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) == (s.0)"
+    ],
+    "invariants": []
+  }
+}

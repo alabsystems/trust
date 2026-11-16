@@ -17,6 +17,82 @@ const FIXTURE_VERSION_HOST: &str = "test-host";
 const FIXTURE_VERSION_RELEASE: &str = "1.99.0-test";
 
 #[test]
+fn verify_self_comparison_revalidates_saved_bundle_before_tool_or_output_side_effects() {
+    let baseline = Fixture::new("self-verify-retained-baseline");
+    baseline.install_stage2_targo();
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "verify",
+            "self",
+            "--repo-root",
+            baseline.repo_str(),
+            "--report-dir",
+            baseline.report_str(),
+            "--full-verifier",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    let baseline_path = baseline.report_dir.join("self-verify-harness.report.json");
+    assert!(baseline.report_dir.join("self-verify.evidence-bundle.json").is_file());
+
+    let current = Fixture::new("self-verify-retained-current");
+    current.install_stage2_targo();
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "verify",
+            "self",
+            "--repo-root",
+            current.repo_str(),
+            "--report-dir",
+            current.report_str(),
+            "--full-verifier",
+            "--dry-run",
+            "--compare-report",
+        ])
+        .arg(&baseline_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    let report = current.report();
+    assert_eq!(report["performance"]["comparison"]["retained_evidence"]["complete"], true);
+    assert_eq!(
+        report["performance"]["comparison"]["retained_evidence"]["observational_only"],
+        true
+    );
+    assert_eq!(report["proof"]["complete"], false);
+
+    // A syntactically valid edit must fail the exact-byte sidecar binding.
+    let mut bytes = fs::read(&baseline_path).unwrap();
+    bytes.push(b' ');
+    fs::write(&baseline_path, bytes).unwrap();
+    let refused = Fixture::new("self-verify-retained-corrupt");
+    // No stage2 tools are installed: comparison must refuse first.
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "verify",
+            "self",
+            "--repo-root",
+            refused.repo_str(),
+            "--report-dir",
+            refused.report_str(),
+            "--full-verifier",
+            "--dry-run",
+            "--compare-report",
+        ])
+        .arg(&baseline_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exact report bytes"));
+    assert!(!refused.report_dir.exists());
+}
+
+#[test]
 fn verify_self_help_lists_rust_routed_command() {
     let output = Command::new(targo_trust_binary())
         .args(["trust", "verify", "--help"])
@@ -185,11 +261,11 @@ fn verify_self_full_verifier_default_stage_is_rust_native() {
         "default full-verifier argv must use repo-local stage2 Targo: {argv:?}"
     );
     assert!(
-        argv.iter().any(|arg| *arg == "build"),
+        argv.contains(&"build"),
         "argv should invoke Targo's Cargo-compatible build command: {argv:?}"
     );
     assert!(
-        argv.iter().any(|arg| *arg == "--message-format=json"),
+        argv.contains(&"--message-format=json"),
         "argv should request canonical Cargo JSON evidence: {argv:?}"
     );
     assert!(
@@ -280,7 +356,7 @@ fn verify_self_full_verifier_default_stage_is_rust_native() {
         stage2_identity["trustdoc"]["path"],
         stage2_targo.with_file_name(stage2_file_name("trustdoc")).display().to_string()
     );
-    assert_eq!(stage2_identity["trustdoc"]["size_bytes"].as_u64().unwrap_or(0) > 0, true);
+    assert!(stage2_identity["trustdoc"]["size_bytes"].as_u64().unwrap_or(0) > 0);
     assert_eq!(stage2_identity["trustdoc"]["sha256"], trustdoc_tool["sha256"]);
     assert_eq!(stage2_identity["trustdoc_commit"], stage2_identity["trustc_commit"]);
     assert_eq!(stage2_identity["trustd_commit"], stage2_identity["trustc_commit"]);
@@ -465,6 +541,116 @@ fn verify_self_dry_run_executes_only_documented_identity_probes() {
     assert_eq!(report["configuration"]["dry_run"], true);
     assert_eq!(report["configuration"]["dry_run_identity_probes_executed"], true);
     assert_eq!(report["stages"][0]["identity_probes"]["executed_during_planning"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_self_dry_run_accepts_long_configured_temp_directory() {
+    let fixture = Fixture::new("targo-trust-verify-self-long-tmp");
+    fixture.install_stage2_targo();
+    let configured_temp = fixture.temp.path().join("configured-temp-directory-".repeat(6));
+    fs::create_dir(&configured_temp).expect("create long configured temp directory");
+    assert!(configured_temp.as_os_str().len() > 128);
+    let stage_marker = fixture.temp.path().join("stage-executed");
+
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "verify",
+            "self",
+            "--repo-root",
+            fixture.repo_str(),
+            "--report-dir",
+            fixture.report_str(),
+            "--full-verifier",
+            "--dry-run",
+        ])
+        .env("TMPDIR", &configured_temp)
+        .env("SELF_VERIFY_EXECUTION_MARKER", &stage_marker)
+        .output()
+        .expect("run native dry-run with long TMPDIR");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "long TMPDIR must not prevent the private coordinator smoke\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let report = fixture.report();
+    assert_eq!(report["status"], "planned");
+    assert_eq!(report["proof"]["status"], "not_run");
+    assert_eq!(report["proof"]["complete"], false);
+    assert_eq!(
+        report["stages"][0]["stage2_toolchain_identity"]["trustd_protocol_smoke_completed"],
+        true,
+    );
+    assert!(!stage_marker.exists(), "dry run executed the planned compiler stage");
+}
+
+// A stage2 tool that answers its version flag late is still bound. Both probe
+// paths wait: trustc's `-Vv` (the verbose-version probe Targo and trustdoc share)
+// and trustd's `--version`. Each stand-in answers after 15 s, past the old 10 s
+// bound on any host, so the result does not depend on the host's load; it is far
+// inside the hang guard.
+#[cfg(unix)]
+#[test]
+fn verify_self_dry_run_binds_stage2_tools_whose_version_answer_comes_after_ten_seconds() {
+    let fixture = Fixture::new("targo-trust-verify-self-late-version-answer");
+    fixture.install_stage2_targo();
+    install_stage2_file(
+        &fixture.repo_root,
+        "trustc",
+        &fake_compiler_version_script("trustc", FIXTURE_VERSION_COMMIT).replacen(
+            "\n[ ",
+            "\nsleep 15\n[ ",
+            1,
+        ),
+        true,
+    );
+    let trustd =
+        fake_trustd_version_and_server_script(FIXTURE_VERSION_COMMIT, FIXTURE_VERSION_RELEASE);
+    let late_trustd = trustd.replacen(
+        "if sys.argv[1:] == [\"--version\"]:\n",
+        "if sys.argv[1:] == [\"--version\"]:\n    time.sleep(15)\n",
+        1,
+    );
+    assert_ne!(late_trustd, trustd, "the trustd stand-in's --version branch moved");
+    install_stage2_file(&fixture.repo_root, "trustd", &late_trustd, true);
+    write_publication_grade_fixture_evidence(&fixture.repo_root);
+
+    let started = std::time::Instant::now();
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "verify",
+            "self",
+            "--repo-root",
+            fixture.repo_str(),
+            "--report-dir",
+            fixture.report_str(),
+            "--full-verifier",
+            "--dry-run",
+        ])
+        .output()
+        .expect("run late-answer dry-run fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(30),
+        "both late stand-ins were probed (elapsed {:?})",
+        started.elapsed()
+    );
+    let report = fixture.report();
+    assert_eq!(report["configuration"]["dry_run_identity_probes_executed"], true);
+    let stage2_identity = &report["stages"][0]["stage2_toolchain_identity"];
+    assert_eq!(stage2_identity["trustc_verbose_version_identity"]["binary"], "trustc");
+    assert_eq!(stage2_identity["trustd_version_identity"]["binary"], "trustd");
 }
 
 #[test]
@@ -1881,7 +2067,7 @@ fn verify_self_strips_disable_flags_and_preserves_encoded_rustflags() {
     let fixture = Fixture::new("targo-trust-verify-self-env");
     fixture.install_stage2_targo();
     let capture = fixture.temp.path().join("env.txt");
-    let encoded_disable = ["-Clink-arg=-z", "-Ztrust-verify=off"].join("\x1f");
+    let encoded_disable = ["-Clink-arg=-z", "-Ztrust-verify=off", "-Clink-arg=now"].join("\x1f");
     let output = Command::new(targo_trust_binary())
         .args([
             "trust",
@@ -1933,11 +2119,25 @@ fn verify_self_strips_disable_flags_and_preserves_encoded_rustflags() {
         }),
         "{captured}"
     );
-    assert!(captured.contains("-Z trust-verify-output=json"), "{captured}");
-    assert!(captured.contains("-Z trust-verify-level=1"), "{captured}");
-    assert!(captured.contains("-Z trust-verify-session=self-verify-"), "{captured}");
+    // T14a: the Targo route hands the stage2 Targo its lane in
+    // TRUST_TARGO_LANE_RUSTFLAGS; the caller's flags keep only their
+    // non-verifier words.
+    let lane =
+        captured.lines().find_map(|line| line.strip_prefix("lane=")).expect("the stage saw a lane");
+    assert!(lane.contains("-Z trust-verify-output=json"), "{captured}");
+    assert!(lane.contains("-Z trust-verify-level=1"), "{captured}");
+    assert!(lane.contains("-Z trust-verify-session=self-verify-"), "{captured}");
+    assert!(
+        !captured
+            .lines()
+            .any(|line| line != format!("lane={lane}") && line.contains("trust-verify-session=")),
+        "the session travels in the lane alone: {captured}"
+    );
     assert!(captured.contains("-Clink-arg=-z"), "{captured}");
-    assert!(captured.contains('\x1f'), "encoded rustflags should remain encoded");
+    assert!(
+        captured.contains("-Clink-arg=-z\x1f-Clink-arg=now"),
+        "encoded rustflags should remain encoded, minus the verifier word: {captured}"
+    );
     for key in
         ["ld_preload", "DyLd_Insert_Libraries", "libpath", "shlib_path", "ldr_preload", "_rld_list"]
     {
@@ -2703,8 +2903,9 @@ diagnostic_code="trust_verification_transport_v1"
 unit_semantics='{"schema":"targo.trust-unit-semantics.v1","features":[],"target_cfg":["unix"],"cfg_test":false,"target_edition":"2024","target_crate_types":["rlib"],"target_harness":false,"target_proc_macro":false,"profile":{"opt_level":"0","requested_lto":"false","effective_lto":"only-object","debuginfo":"0","debug_assertions":false,"overflow_checks":false,"rpath":false,"incremental":false,"panic":"unwind","strip":"none","rustflags":[]},"compiler":{"frontend":"rustc","codegen_backend":"trust-cg","rustc_release":"1.99.0-nightly","rustc_host":"test-host","rustc_verbose_version_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"unit_rustflags":["-Zcodegen-backend=trust-cg"],"manifest_lint_rustflags":[],"extra_compiler_args":[]}'
 semantics_sha256="67fbdb2e7e098b6c27117b599ec42fc343d9b18b8a040b3f570e03e6da417f94"
 proof_unit="{\"schema\":\"targo.trust-proof-unit.v2\",\"index\":0,\"mode\":\"build\",\"role\":\"primary\",\"package_name\":\"rustc_middle\",\"semantics_sha256\":\"$semantics_sha256\"}"
-session="$(printf '%s\n' "$RUSTFLAGS" | sed -n 's/.*trust-verify-session=\([^ ]*\).*/\1/p' | tail -n 1)"
-proof_root="$(printf '%s\n' "$RUSTFLAGS" | sed -n 's/.*trust-proof-artifact-root=\([^ ]*\).*/\1/p' | tail -n 1)"
+lane="$(printf '%s' "${TRUST_TARGO_LANE_RUSTFLAGS-}" | tr '\037' ' ')"
+session="$(printf '%s\n%s\n' "$RUSTFLAGS" "$lane" | sed -n 's/.*trust-verify-session=\([^ ]*\).*/\1/p' | tail -n 1)"
+proof_root="$(printf '%s\n%s\n' "$RUSTFLAGS" "$lane" | sed -n 's/.*trust-proof-artifact-root=\([^ ]*\).*/\1/p' | tail -n 1)"
 function_session="$session"
 coverage_session="$session"
 terminal_session="$session"
@@ -2740,6 +2941,7 @@ if [ "$mode" = "env" ]; then
   {
     printf '%s\n' "$RUSTFLAGS"
     printf '%s\n' "$CARGO_ENCODED_RUSTFLAGS"
+    printf 'lane=%s\n' "$lane"
     printf 'ld_preload=%s\n' "${ld_preload-<unset>}"
     printf 'DyLd_Insert_Libraries=%s\n' "${DyLd_Insert_Libraries-<unset>}"
     printf 'libpath=%s\n' "${libpath-<unset>}"
@@ -2925,7 +3127,7 @@ fi
 if [ "$coverage_processed" -eq 1 ]; then
   coverage_processed_functions='["rustc_middle::fixture::ok"]'
 fi
-coverage_summary="$(printf '%s' "{\"type\":\"coverage_summary\",\"crate_name\":\"rustc_middle\",\"package_name\":\"rustc_middle\",\"primary_package\":true,\"verification_session\":\"$coverage_session\",\"eligible\":$coverage_eligible,\"processed\":$coverage_processed,\"function_identities\":{\"schema\":\"trustc.coverage-function-identities.v1\",\"eligible_functions\":$coverage_eligible_functions,\"processed_functions\":$coverage_processed_functions}}")"
+coverage_summary="$(printf '%s' "{\"type\":\"coverage_summary\",\"crate_name\":\"rustc_middle\",\"package_name\":\"rustc_middle\",\"primary_package\":true,\"verification_session\":\"$coverage_session\",\"eligible\":$coverage_eligible,\"processed\":$coverage_processed,\"function_identities\":{\"schema\":\"trustc.coverage-function-identities.v1\",\"eligible_functions\":$coverage_eligible_functions,\"processed_functions\":$coverage_processed_functions},\"memory\":{\"schema\":\"trust-memory-summary/v1\",\"counters\":{}}}")"
 crate_summary="$(printf '%s' "{\"type\":\"crate_summary\",\"crate_name\":\"rustc_middle\",\"package_name\":\"rustc_middle\",\"primary_package\":true,\"verification_session\":\"$terminal_session\",\"functions_analyzed\":1,\"functions_verified\":$functions_verified,\"total_proved\":$proved,\"total_failed\":$failed,\"total_unknown\":$unknown,\"total_timed_out\":$timed_out,\"total_skipped\":$skipped,\"total_runtime_checked\":$runtime_checked,\"total_obligations\":1}")"
 
 emit_compiler_message "$function_result"

@@ -16,10 +16,24 @@ use std::str;
 
 use cargo_metadata::Edition;
 use clap::{CommandFactory, Parser};
+use jobserver_utils::InheritedJobserver;
 
 #[path = "test/mod.rs"]
 #[cfg(test)]
 mod cargo_fmt_tests;
+
+const fn is_nightly() -> bool {
+    match option_env!("CFG_RELEASE_CHANNEL") {
+        None => true,
+        Some(c) => matches!(c.as_bytes(), b"nightly" | b"dev"),
+    }
+}
+
+const MESSAGE_FORMATS: &str = if is_nightly() {
+    "short|json|human"
+} else {
+    "short|human"
+};
 
 #[derive(Parser)]
 #[command(
@@ -55,8 +69,11 @@ pub struct Opts {
     #[arg(long = "manifest-path", value_name = "manifest-path")]
     manifest_path: Option<String>,
 
-    /// Specify message-format: short|json|human
-    #[arg(long = "message-format", value_name = "message-format")]
+    #[arg(
+        long = "message-format",
+        value_name = "message-format",
+        help = format!("Specify message-format: {MESSAGE_FORMATS}")
+    )]
     message_format: Option<String>,
 
     /// Options passed to trustfmt
@@ -74,7 +91,11 @@ pub struct Opts {
 }
 
 fn main() {
-    let mut exit_status = execute();
+    // Trust: capture before argument/executable lookup can reuse advertised
+    // descriptors. Retain this same owner through every synchronous child wait.
+    // SAFETY: this is the first operation in the process entrypoint.
+    let jobserver = unsafe { InheritedJobserver::from_env() };
+    let mut exit_status = execute(jobserver);
     if std::io::stdout().flush().is_err() {
         exit_status = FAILURE;
     }
@@ -84,7 +105,7 @@ fn main() {
 const SUCCESS: i32 = 0;
 const FAILURE: i32 = 1;
 
-fn execute() -> i32 {
+fn execute(jobserver: io::Result<InheritedJobserver>) -> i32 {
     let current_exe = env::current_exe().ok();
     let args = formatter_command_args(env::args_os(), current_exe.as_deref());
     let opts = Opts::parse_from(args);
@@ -99,15 +120,24 @@ fn execute() -> i32 {
         }
     };
 
+    let jobserver = match jobserver {
+        Ok(server) => server,
+        Err(error) => {
+            eprintln!("cannot inherit formatter jobserver: {error}");
+            return FAILURE;
+        }
+    };
+    let jobserver = Some(&jobserver);
+
     if opts.version {
-        return handle_command_status(get_rustfmt_info(&[String::from("--version")]));
+        return handle_command_status(get_rustfmt_info(&[String::from("--version")], jobserver));
     }
     if opts.rustfmt_options.iter().any(|s| {
         ["--print-config", "-h", "--help", "-V", "--version"].contains(&s.as_str())
             || s.starts_with("--help=")
             || s.starts_with("--print-config=")
     }) {
-        return handle_command_status(get_rustfmt_info(&opts.rustfmt_options));
+        return handle_command_status(get_rustfmt_info(&opts.rustfmt_options, jobserver));
     }
 
     let strategy = CargoFmtStrategy::from_opts(&opts);
@@ -137,9 +167,16 @@ fn execute() -> i32 {
             &strategy,
             rustfmt_args,
             Some(&manifest_path),
+            jobserver,
         ))
     } else {
-        handle_command_status(format_crate(verbosity, &strategy, rustfmt_args, None))
+        handle_command_status(format_crate(
+            verbosity,
+            &strategy,
+            rustfmt_args,
+            None,
+            jobserver,
+        ))
     }
 }
 
@@ -215,6 +252,11 @@ fn convert_message_format_to_rustfmt_args(
             Ok(())
         }
         "json" => {
+            if !is_nightly() {
+                return Err(String::from(
+                    "--message-format json is only supported in nightly builds",
+                ));
+            }
             if contains_emit_mode {
                 return Err(String::from(
                     "cannot include --emit arg when --message-format is set to json",
@@ -231,7 +273,8 @@ fn convert_message_format_to_rustfmt_args(
         }
         "human" => Ok(()),
         _ => Err(format!(
-            "invalid --message-format value: {message_format}. Allowed values are: short|json|human"
+            "invalid --message-format value: {message_format}. Allowed values are: \
+                {MESSAGE_FORMATS}"
         )),
     }
 }
@@ -270,13 +313,23 @@ fn child_exit_code(status: &ExitStatus) -> i32 {
     }
 }
 
-fn get_rustfmt_info(args: &[String]) -> Result<i32, io::Error> {
+fn get_rustfmt_info(
+    args: &[String],
+    jobserver: Option<&InheritedJobserver>,
+) -> Result<i32, io::Error> {
     let mut command = rustfmt_command();
     command.stdout(std::process::Stdio::inherit()).args(args);
-    wait_for_formatter(&mut command)
+    wait_for_formatter(&mut command, jobserver)
 }
 
-fn wait_for_formatter(command: &mut Command) -> Result<i32, io::Error> {
+fn wait_for_formatter(
+    command: &mut Command,
+    jobserver: Option<&InheritedJobserver>,
+) -> Result<i32, io::Error> {
+    // Trust: configure after all command overlays; never re-import a later fd.
+    if let Some(jobserver) = jobserver {
+        jobserver.configure(command);
+    }
     let mut child = command.spawn().map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => io::Error::new(
             io::ErrorKind::Other,
@@ -293,11 +346,12 @@ fn format_crate(
     strategy: &CargoFmtStrategy,
     rustfmt_args: Vec<String>,
     manifest_path: Option<&Path>,
+    jobserver: Option<&InheritedJobserver>,
 ) -> Result<i32, io::Error> {
-    let targets = get_targets(strategy, manifest_path)?;
+    let targets = get_targets(strategy, manifest_path, jobserver)?;
 
     // Currently only bin and lib files get formatted.
-    run_rustfmt(&targets, &rustfmt_args, verbosity)
+    run_rustfmt(&targets, &rustfmt_args, verbosity, jobserver)
 }
 
 /// Target uses a `path` field for equality and hashing.
@@ -318,7 +372,7 @@ impl Target {
 
         Target {
             path: canonicalized,
-            kind: target.kind[0].clone(),
+            kind: target.kind[0].to_string(),
             edition: target.edition,
         }
     }
@@ -374,16 +428,17 @@ impl CargoFmtStrategy {
 fn get_targets(
     strategy: &CargoFmtStrategy,
     manifest_path: Option<&Path>,
+    jobserver: Option<&InheritedJobserver>,
 ) -> Result<BTreeSet<Target>, io::Error> {
     let mut targets = BTreeSet::new();
 
     match *strategy {
-        CargoFmtStrategy::Root => get_targets_root_only(manifest_path, &mut targets)?,
+        CargoFmtStrategy::Root => get_targets_root_only(manifest_path, &mut targets, jobserver)?,
         CargoFmtStrategy::All => {
-            get_targets_recursive(manifest_path, &mut targets, &mut BTreeSet::new())?
+            get_targets_recursive(manifest_path, &mut targets, &mut BTreeSet::new(), jobserver)?
         }
         CargoFmtStrategy::Some(ref hitlist) => {
-            get_targets_with_hitlist(manifest_path, hitlist, &mut targets)?
+            get_targets_with_hitlist(manifest_path, hitlist, &mut targets, jobserver)?
         }
     }
 
@@ -400,13 +455,19 @@ fn get_targets(
 fn get_targets_root_only(
     manifest_path: Option<&Path>,
     targets: &mut BTreeSet<Target>,
+    jobserver: Option<&InheritedJobserver>,
 ) -> Result<(), io::Error> {
-    let metadata = get_cargo_metadata(manifest_path)?;
+    let metadata = get_cargo_metadata(manifest_path, jobserver)?;
+    // `workspace_root_path` is the path to the workspace's root directory
     let workspace_root_path = PathBuf::from(&metadata.workspace_root).canonicalize()?;
     let (in_workspace_root, current_dir_manifest) = if let Some(target_manifest) = manifest_path {
+        // `target_manifest` is the canonicalized path to a `Cargo.toml` file
+        let target_manifest = target_manifest.canonicalize()?;
         (
-            workspace_root_path == target_manifest,
-            target_manifest.canonicalize()?,
+            target_manifest
+                .parent()
+                .is_some_and(|manifest_dir| workspace_root_path == manifest_dir),
+            target_manifest,
         )
     } else {
         let current_dir = env::current_dir()?.canonicalize()?;
@@ -443,13 +504,14 @@ fn get_targets_recursive(
     manifest_path: Option<&Path>,
     targets: &mut BTreeSet<Target>,
     visited: &mut BTreeSet<PathBuf>,
+    jobserver: Option<&InheritedJobserver>,
 ) -> Result<(), io::Error> {
     if let Some(manifest_path) = manifest_path {
         let manifest_path =
             fs::canonicalize(manifest_path).unwrap_or_else(|_| manifest_path.to_path_buf());
         visited.insert(manifest_path);
     }
-    let metadata = get_cargo_metadata(manifest_path)?;
+    let metadata = get_cargo_metadata(manifest_path, jobserver)?;
 
     // Record every package Cargo loaded before following any path dependency.
     // Dependency names are not identities: two packages can use the same name
@@ -482,10 +544,10 @@ fn get_targets_recursive(
                 continue;
             }
             let package_manifest = fs::canonicalize(&manifest_path).unwrap_or(manifest_path);
-            let traversal_manifest = cargo_workspace_manifest(&package_manifest)
+            let traversal_manifest = cargo_workspace_manifest(&package_manifest, jobserver)
                 .unwrap_or_else(|| package_manifest.clone());
             if visited.insert(traversal_manifest.clone()) {
-                get_targets_recursive(Some(&traversal_manifest), targets, visited)?;
+                get_targets_recursive(Some(&traversal_manifest), targets, visited, jobserver)?;
             }
         }
     }
@@ -502,9 +564,13 @@ fn get_targets_recursive(
 /// ownership lookup without loading the workspace graph. Recursing through the
 /// returned root both avoids that ambiguity and lets one metadata call cover
 /// all of the workspace's packages.
-fn cargo_workspace_manifest(package_manifest: &Path) -> Option<PathBuf> {
+fn cargo_workspace_manifest(
+    package_manifest: &Path,
+    jobserver: Option<&InheritedJobserver>,
+) -> Option<PathBuf> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let output = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    command
         .args([
             "locate-project",
             "--workspace",
@@ -513,9 +579,11 @@ fn cargo_workspace_manifest(package_manifest: &Path) -> Option<PathBuf> {
             "--offline",
             "--manifest-path",
         ])
-        .arg(package_manifest)
-        .output()
-        .ok()?;
+        .arg(package_manifest);
+    if let Some(jobserver) = jobserver {
+        jobserver.configure(&mut command);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -531,12 +599,14 @@ fn get_targets_with_hitlist(
     manifest_path: Option<&Path>,
     hitlist: &[String],
     targets: &mut BTreeSet<Target>,
+    jobserver: Option<&InheritedJobserver>,
 ) -> Result<(), io::Error> {
-    let metadata = get_cargo_metadata(manifest_path)?;
-    let mut workspace_hitlist: BTreeSet<&String> = BTreeSet::from_iter(hitlist);
+    let metadata = get_cargo_metadata(manifest_path, jobserver)?;
+    let mut workspace_hitlist: BTreeSet<&str> =
+        BTreeSet::from_iter(hitlist.into_iter().map(|s| s.as_str()));
 
     for package in metadata.packages {
-        if workspace_hitlist.remove(&package.name) {
+        if workspace_hitlist.remove(package.name.as_ref()) {
             for target in package.targets {
                 targets.insert(Target::from_target(&target));
             }
@@ -564,6 +634,7 @@ fn run_rustfmt(
     targets: &BTreeSet<Target>,
     fmt_args: &[String],
     verbosity: Verbosity,
+    jobserver: Option<&InheritedJobserver>,
 ) -> Result<i32, io::Error> {
     let by_edition = targets
         .iter()
@@ -600,7 +671,7 @@ fn run_rustfmt(
             .args(["--edition", edition.as_str()])
             .args(fmt_args);
 
-        status.push(wait_for_formatter(&mut command)?);
+        status.push(wait_for_formatter(&mut command, jobserver)?);
     }
 
     Ok(status
@@ -609,7 +680,10 @@ fn run_rustfmt(
         .unwrap_or(SUCCESS))
 }
 
-fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<cargo_metadata::Metadata, io::Error> {
+fn get_cargo_metadata(
+    manifest_path: Option<&Path>,
+    jobserver: Option<&InheritedJobserver>,
+) -> Result<cargo_metadata::Metadata, io::Error> {
     let mut cmd = cargo_metadata::MetadataCommand::new();
     cmd.no_deps();
     if let Some(manifest_path) = manifest_path {
@@ -617,14 +691,37 @@ fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<cargo_metadata::Me
     }
     cmd.other_options(vec![String::from("--offline")]);
 
-    match cmd.exec() {
+    match execute_metadata(&cmd, jobserver) {
         Ok(metadata) => Ok(metadata),
         Err(_) => {
             cmd.other_options(vec![]);
-            match cmd.exec() {
+            match execute_metadata(&cmd, jobserver) {
                 Ok(metadata) => Ok(metadata),
                 Err(error) => Err(io::Error::new(io::ErrorKind::Other, error.to_string())),
             }
         }
     }
+}
+
+fn execute_metadata(
+    metadata: &cargo_metadata::MetadataCommand,
+    jobserver: Option<&InheritedJobserver>,
+) -> Result<cargo_metadata::Metadata, cargo_metadata::Error> {
+    // Trust: use the library's command builder and parser, retaining its exit,
+    // UTF-8 and first-JSON-line behavior while handing over the owned scheduler.
+    let mut command = metadata.cargo_command();
+    if let Some(jobserver) = jobserver {
+        jobserver.configure(&mut command);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(cargo_metadata::Error::CargoMetadata {
+            stderr: String::from_utf8(output.stderr)?,
+        });
+    }
+    let stdout = str::from_utf8(&output.stdout)?
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .ok_or(cargo_metadata::Error::NoJson)?;
+    cargo_metadata::MetadataCommand::parse(stdout)
 }

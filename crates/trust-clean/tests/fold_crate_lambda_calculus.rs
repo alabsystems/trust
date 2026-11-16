@@ -28,7 +28,7 @@
 //     KernelReject — the premise quarantine is load-bearing.
 //
 // Run with:
-//   RUSTC_BOOTSTRAP=1 cargo test -p trust-clean --manifest-path crates/Cargo.toml \
+//   targo --unverified test -p trust-clean --manifest-path crates/Cargo.toml \
 //       --test fold_crate_lambda_calculus -- --nocapture
 //
 // Author: Andrew Yates | Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
@@ -56,8 +56,13 @@ fn load_all() -> Vec<VerifiableFunction> {
     let mut out = Vec::new();
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
-        .filter_map(Result::ok)
-        .map(|e| e.path())
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| {
+                    panic!("read entry in required fixture directory {}: {error}", dir.display())
+                })
+                .path()
+        })
         .collect();
     entries.sort();
     for path in entries {
@@ -69,6 +74,9 @@ fn load_all() -> Vec<VerifiableFunction> {
             .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
         out.push(f);
     }
+    // NO-VACUOUS-CORPUS-TEST: an empty corpus would let every `load_one` caller
+    // fail with a misleading "missing" message; name the directory instead.
+    assert!(!out.is_empty(), "required fixture corpus {} is empty", dir.display());
     out
 }
 

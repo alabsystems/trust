@@ -7,23 +7,59 @@ use std::{env, fs};
 use build_helper::ci::CiEnv;
 use build_helper::git::PathFreshness;
 use clap::CommandFactory;
-use serde::Deserialize;
 
 use super::flags::Flags;
 use super::toml::change_id::ChangeIdWrapper;
-use super::toml::rust::parse_codegen_backends;
+use super::toml::rust::{BUILTIN_CODEGEN_BACKENDS, parse_codegen_backends};
 use super::{
-    Config, RUSTC_IF_UNCHANGED_ALLOWED_PATHS, default_initial_cargo_path,
+    Config, DebuggerPath, LlvmCiMode, RUSTC_IF_UNCHANGED_ALLOWED_PATHS, default_initial_cargo_path,
     default_initial_rustdoc_path,
 };
-use crate::ChangeId;
+use crate::core::backend::CodegenBackendKind;
 use crate::core::build_steps::clippy::{LintConfig, get_clippy_rules_in_order};
-use crate::core::build_steps::llvm::LLVM_INVALIDATION_PATHS;
-use crate::core::build_steps::{llvm, test};
-use crate::core::config::toml::TomlConfig;
+use crate::core::build_steps::llvm::{LLVM_INVALIDATION_PATHS, LlvmKind, get_llvm_build_status};
+use crate::core::builder::Builder;
+
+#[test]
+fn compiler_profile_keeps_paired_lld_with_selected_external_llvm() {
+    let context = crate::utils::tests::TestCtx::new();
+    let host = crate::utils::helpers::get_host_target();
+    let provider = context.dir().join("selected-provider/bin/llvm-config");
+    let config = context
+        .config("build")
+        .stage(1)
+        .path("src/llvm-project/lld")
+        .with_default_toml_config(&format!(
+            "profile = 'compiler'\n[target.'{host}']\nllvm-config = '{}'\n",
+            provider.display(),
+        ))
+        .create_config();
+    assert!(config.lld_enabled);
+    assert_eq!(config.target_config.get(&host).unwrap().llvm_config.as_ref(), Some(&provider));
+}
+#[test]
+fn llvm_zstd_metadata_directory_is_an_explicit_target_input() {
+    let context = crate::utils::tests::TestCtx::new();
+    let host = crate::utils::helpers::get_host_target();
+    let directory = context.dir().join("native package with spaces/lib/pkgconfig");
+    let config = context
+        .config("check")
+        .with_default_toml_config(&format!(
+            "[target.'{host}']\nllvm-zstd-pkg-config-dir = '{}'\n",
+            directory.display(),
+        ))
+        .create_config();
+    assert_eq!(
+        config.target_config.get(&host).unwrap().llvm_zstd_pkg_config_dir.as_ref(),
+        Some(&directory)
+    );
+}
+
+use crate::core::config::flags::Subcommand;
 use crate::core::config::{
-    BootstrapOverrideLld, CompilerBuiltins, StringOrBool, Target, TargetSelection,
+    BootstrapOverrideLld, ChangeId, CompilerBuiltins, Target, TargetSelection,
 };
+use crate::core::session::Session;
 use crate::utils::tests::TestCtx;
 use crate::utils::tests::git::git_test;
 
@@ -31,9 +67,29 @@ pub(crate) fn parse(config: &str) -> Config {
     TestCtx::new().config("check").with_default_toml_config(config).create_config()
 }
 
-fn get_toml(file: &Path) -> Result<TomlConfig, toml::de::Error> {
-    let contents = std::fs::read_to_string(file).unwrap();
-    toml::from_str(&contents).and_then(|table: toml::Value| TomlConfig::deserialize(table))
+// Trust: AY is also linked into the compiler and other batteries, where its
+// own workspace release profile cannot protect it from a consumer's settings.
+#[test]
+fn verifier_arithmetic_is_checked_independently_of_debug_mode() {
+    for (toml, std_checks) in [
+        ("", false),
+        ("[rust]\ndebug = false\n", false),
+        ("[rust]\ndebug = true\n", true),
+        ("[rust]\noverflow-checks = true\n", true),
+        ("[rust]\noverflow-checks = true\noverflow-checks-std = false\n", false),
+        ("[rust]\noverflow-checks-std = true\n", true),
+    ] {
+        let config = parse(toml);
+        assert!(config.rust_overflow_checks, "{toml}");
+        assert_eq!(config.rust_overflow_checks_std, std_checks, "{toml}");
+    }
+}
+
+// Trust: a configuration override must not reintroduce silent solver overflow.
+#[test]
+#[should_panic(expected = "Trust requires rust.overflow-checks = true")]
+fn verifier_arithmetic_cannot_disable_overflow_checks() {
+    parse("[rust]\noverflow-checks = false\n");
 }
 
 #[test]
@@ -48,7 +104,7 @@ fn default_stage0_rustdoc_matches_the_seed_compiler_identity() {
 
     File::create(&trustdoc).unwrap();
     assert_eq!(
-        default_initial_rustdoc_path(&stock_rustc, target),
+        default_initial_rustdoc_path(&stock_rustc, target, false),
         stock_rustdoc,
         "a neighboring trustdoc must not override stock rustc's matching rustdoc"
     );
@@ -57,10 +113,89 @@ fn default_stage0_rustdoc_matches_the_seed_compiler_identity() {
     let trustc = temp.path().join("trustc");
     File::create(&trustc).unwrap();
     assert_eq!(
-        default_initial_rustdoc_path(&trustc, target),
+        default_initial_rustdoc_path(&trustc, target, false),
         trustdoc,
         "a Trust stage0 must retain its branded rustdoc path"
     );
+}
+
+// Trust: Config unit tests normally override stage0 with their build compiler,
+// which hid a migration regression in the real Session default branch. Execute
+// that branch against private compiler fixtures with BOTH names present.
+#[cfg(unix)]
+#[test]
+fn session_uses_the_declared_seed_compiler_and_matching_documentation_driver() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (configured_name, explicit_tools) in
+        [(None, false), (Some("rustc"), false), (Some("trustc"), false), (Some("trustc"), true)]
+    {
+        let context = TestCtx::new();
+        let mut config = context.config("setup").create_config();
+        let host = config.host_target;
+        let seed = config.out.join(host).join("stage0");
+        let bin = seed.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = context.dir().join("compiler-probes");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> '{log}'\n\
+             case \"$*\" in\n\
+             '--print sysroot --print target-libdir') printf '%s\\n' '{seed}' '{seed}/lib/rustlib/{host}/lib' ;;\n\
+             '--version --verbose') printf '%s\\n' 'release: 1.99.0-dev' 'host: {host}' ;;\n\
+             *) exit 79 ;;\nesac\n",
+            seed = seed.display(),
+            log = log.display(),
+        );
+        for name in ["rustc", "trustc"] {
+            let path = bin.join(name);
+            std::fs::write(&path, &script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        config.external_rustc = configured_name.map(|name| bin.join(name));
+        config.external_rustdoc = explicit_tools.then(|| bin.join("selected-doc"));
+        config.external_cargo = explicit_tools.then(|| bin.join("selected-cargo"));
+        let session = Session::new(config);
+        let expected_compiler = bin.join(configured_name.unwrap_or("trustc"));
+        assert_eq!(session.initial_rustc, expected_compiler);
+        assert_eq!(
+            session.initial_rustdoc,
+            bin.join(if explicit_tools {
+                "selected-doc"
+            } else if configured_name == Some("rustc") {
+                "rustdoc"
+            } else {
+                "trustdoc"
+            })
+        );
+        assert_eq!(
+            session.initial_cargo,
+            bin.join(if explicit_tools { "selected-cargo" } else { "cargo" })
+        );
+        let probes = std::fs::read_to_string(log).unwrap();
+        assert!(
+            probes
+                .lines()
+                .all(|line| line.starts_with(&format!("{} ", expected_compiler.display()))),
+            "a neighboring compiler must not be probed: {probes}"
+        );
+    }
+}
+
+#[test]
+fn downloaded_stage0_rustdoc_uses_the_pinned_trust_seed_identity() {
+    for (triple, compiler_name, rustdoc_name) in [
+        ("aarch64-apple-darwin", "rustc", "trustdoc"),
+        ("x86_64-unknown-linux-gnu", "rustc", "trustdoc"),
+        ("x86_64-pc-windows-msvc", "rustc.exe", "trustdoc.exe"),
+    ] {
+        let target = TargetSelection::from_user(triple);
+        let compiler = Path::new("/pinned/stage0/bin").join(compiler_name);
+        assert_eq!(
+            default_initial_rustdoc_path(&compiler, target, true),
+            compiler.with_file_name(rustdoc_name),
+            "the downloaded Trust seed owns its branded rustdoc on {triple}",
+        );
+    }
 }
 
 #[test]
@@ -95,26 +230,79 @@ fn modified(upstream: impl Into<String>, changes: &[&str]) -> PathFreshness {
 #[test]
 fn download_ci_llvm() {
     let config = TestCtx::new().config("check").create_config();
-    assert!(!config.llvm_from_ci);
+    assert_eq!(config.llvm_ci_mode, LlvmCiMode::BuildLocally);
 
     // this doesn't make sense, as we are overriding it later.
     let if_unchanged_config = TestCtx::new()
         .config("check")
         .with_default_toml_config("llvm.download-ci-llvm = \"if-unchanged\"")
         .create_config();
-    if if_unchanged_config.llvm_from_ci && if_unchanged_config.is_running_on_ci() {
-        let has_changes = if_unchanged_config.has_changes_from_upstream(LLVM_INVALIDATION_PATHS);
+    if if_unchanged_config.is_running_on_ci() {
+        let build = Session::new(config.clone());
+        let builder = Builder::new(&build);
 
-        assert!(
-            !has_changes,
-            "CI LLVM can't be enabled with 'if-unchanged' while there are changes in LLVM submodule."
-        );
+        let llvm = get_llvm_build_status(&builder, builder.config.host_target);
+        let llvm = llvm.llvm_output();
+        if llvm.kind() == LlvmKind::DownloadedFromCi {
+            let has_changes =
+                if_unchanged_config.has_changes_from_upstream(LLVM_INVALIDATION_PATHS);
+
+            assert!(
+                !has_changes,
+                "CI LLVM can't be enabled with 'if-unchanged' while there are changes in LLVM submodule."
+            );
+        }
     }
 }
 
 #[test]
 fn clap_verify() {
     Flags::command().debug_assert();
+}
+
+// Trust: native reuse binds actual parser inputs, including includes/profiles.
+#[test]
+fn native_config_retains_exact_loaded_include_and_profile_bytes() {
+    let context = TestCtx::new();
+    let included = context.dir().join("extra.toml");
+    fs::write(&included, "[rust]\ndeny-warnings = false\n").unwrap();
+    let config = context
+        .config("test")
+        .arg("--trust-repo-check")
+        .stage(1)
+        .with_default_toml_config("include = ['extra.toml']\nprofile = 'compiler'\n")
+        .create_config();
+    assert!(config.native_repo_config_inputs.len() >= 3);
+    for (path, digest) in &config.native_repo_config_inputs {
+        assert_eq!(*digest, crate::utils::trust_repo_cache::file_digest(path).unwrap());
+    }
+    assert!(config.native_repo_config_inputs.iter().any(|(path, _)| path == &included));
+    assert!(
+        config
+            .native_repo_config_inputs
+            .iter()
+            .any(|(path, _)| path.ends_with("bootstrap.compiler.toml"))
+    );
+}
+
+#[test]
+fn native_mode_refuses_test_controls_that_can_skip_or_change_the_selection() {
+    for flag in [
+        "--bless",
+        "--only-modified",
+        "--no-fail-fast",
+        "--no-capture",
+        "--rerun",
+        "--doc",
+        "--trust-verified",
+    ] {
+        assert!(
+            Flags::command()
+                .try_get_matches_from(["bootstrap", "test", "--trust-repo-check", flag])
+                .is_err(),
+            "{flag}"
+        );
+    }
 }
 
 #[test]
@@ -208,7 +396,11 @@ fn override_toml() {
         crate::core::config::RustcLto::Fat,
         "setting string value without quotes"
     );
-    assert_eq!(config.gdb, Some("bar".into()), "setting string value with quotes");
+    assert_eq!(
+        config.gdb,
+        Some(DebuggerPath::Path("bar".into())),
+        "setting string value with quotes"
+    );
     assert!(!config.deny_warnings, "setting boolean value");
     assert_eq!(
         config.optimized_compiler_builtins,
@@ -253,7 +445,7 @@ fn override_toml() {
             .collect(),
         "setting dictionary value"
     );
-    assert!(!config.llvm_from_ci);
+    std::assert_matches!(config.llvm_ci_mode, LlvmCiMode::BuildLocally);
     assert!(!config.download_rustc());
 }
 
@@ -292,6 +484,24 @@ fn rust_optimize() {
     assert!(parse("rust.optimize = \"s\"").rust_optimize.is_release());
     assert_eq!(parse("rust.optimize = 1").rust_optimize.get_opt_level(), Some("1".to_string()));
     assert_eq!(parse("rust.optimize = \"s\"").rust_optimize.get_opt_level(), Some("s".to_string()));
+}
+
+#[test]
+fn parses_the_trust_backends_by_name() {
+    // Trust: both trust-cg products are first-class kinds, never `Custom`:
+    // the builtin adapter and the trust-ir → trust-cg self-host plugin.
+    let parsed = parse_codegen_backends(
+        vec!["llvm", "trust-cg", "trust-ir-cg"].into_iter().map(str::to_owned).collect(),
+        "rust",
+    );
+    assert_eq!(
+        parsed,
+        vec![CodegenBackendKind::Llvm, CodegenBackendKind::TrustCg, CodegenBackendKind::TrustIrCg]
+    );
+    assert!(parsed[2].is_trust_ir_cg());
+    assert!(!parsed[2].is_trust_cg());
+    assert_eq!(parsed[2].name(), "trust-ir-cg");
+    assert!(BUILTIN_CODEGEN_BACKENDS.contains(&"trust-ir-cg"));
 }
 
 #[test]
@@ -345,16 +555,6 @@ fn rust_lld() {
         parse("rust.bootstrap-override-lld = false").bootstrap_override_lld,
         BootstrapOverrideLld::None
     ));
-
-    // Also check the legacy options
-    assert!(matches!(
-        parse("rust.use-lld = true").bootstrap_override_lld,
-        BootstrapOverrideLld::External
-    ));
-    assert!(matches!(
-        parse("rust.use-lld = false").bootstrap_override_lld,
-        BootstrapOverrideLld::None
-    ));
 }
 
 #[test]
@@ -389,7 +589,7 @@ fn order_of_clippy_rules() {
     let config = TestCtx::new().config(&args[0]).args(&args[1..]).create_config();
 
     let actual = match config.cmd.clone() {
-        crate::Subcommand::Clippy { allow, deny, warn, forbid, .. } => {
+        Subcommand::Clippy { allow, deny, warn, forbid, .. } => {
             let cfg = LintConfig { allow, deny, warn, forbid };
             let args_vec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             get_clippy_rules_in_order(&args_vec, &cfg)
@@ -413,7 +613,7 @@ fn clippy_rule_separate_prefix() {
     let config = TestCtx::new().config(&args[0]).args(&args[1..]).create_config();
 
     let actual = match config.cmd.clone() {
-        crate::Subcommand::Clippy { allow, deny, warn, forbid, .. } => {
+        Subcommand::Clippy { allow, deny, warn, forbid, .. } => {
             let cfg = LintConfig { allow, deny, warn, forbid };
             let args_vec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             get_clippy_rules_in_order(&args_vec, &cfg)
@@ -513,6 +713,99 @@ fn jobs_precedence() {
         )
         .create_config();
     assert_eq!(config.jobs, Some(123));
+}
+
+// Trust: exercise the real flag/TOML parser with isolated admission variables.
+#[test]
+fn build_slot_caps_resolved_jobs_without_expanding_smaller_requests() {
+    let host_jobs = super::threads_from_config(0);
+    for (args, toml, expected) in [
+        (vec![], "", host_jobs.min(7)),
+        (vec!["--jobs=32"], "", 7),
+        (vec!["-j32"], "", 7),
+        (vec![], "build.jobs = 32", 7),
+        (vec!["--set=build.jobs=32"], "build.jobs = 2", 7),
+        (vec!["--jobs=2"], "build.jobs = 32", 2),
+        (vec![], "build.jobs = 2", 2),
+        (vec!["--jobs=0"], "build.jobs = 32", host_jobs.min(7)),
+        (vec![], "build.jobs = 0", host_jobs.min(7)),
+    ] {
+        let config = TestCtx::new()
+            .config("check")
+            .args(&args)
+            .with_default_toml_config(toml)
+            .env("BUILD_SLOT_HELD", "1")
+            .env("CARGO_BUILD_JOBS", "7")
+            .create_config();
+        assert_eq!(config.jobs, Some(expected), "{args:?}, {toml}");
+    }
+}
+
+#[test]
+fn build_slot_variables_do_not_change_jobs_outside_admission() {
+    for marker in [None, Some("0"), Some("true")] {
+        let ctx = TestCtx::new();
+        let mut config = ctx.config("check").arg("--jobs=32").env("CARGO_BUILD_JOBS", "invalid");
+        if let Some(marker) = marker {
+            config = config.env("BUILD_SLOT_HELD", marker);
+        }
+        assert_eq!(config.create_config().jobs, Some(32));
+    }
+}
+
+#[test]
+fn checked_original_fixed_budget_caps_explicit_and_configured_bootstrap_jobs() {
+    for (args, toml, ceiling, expected) in [
+        (vec!["--jobs=32"], "", 1, 1),
+        (vec![], "build.jobs=32", 1, 1),
+        (vec!["--set=build.jobs=32"], "", 1, 1),
+        (vec!["--jobs=2"], "build.jobs=32", 7, 2),
+        (vec![], "build.jobs=2", 7, 2),
+    ] {
+        let actual = TestCtx::new()
+            .config("check")
+            .args(&args)
+            .with_default_toml_config(toml)
+            .create_config_with_fixed_budget(Some(ceiling));
+        assert_eq!(actual.jobs, Some(expected));
+    }
+}
+
+#[test]
+fn build_slot_requires_a_valid_positive_share_even_with_explicit_jobs() {
+    for share in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("-1"),
+        Some("+7"),
+        Some("7.0"),
+        Some(" 7"),
+        Some("７"),
+        Some("4294967296"),
+    ] {
+        let result = std::panic::catch_unwind(|| {
+            let ctx = TestCtx::new();
+            let mut config = ctx.config("check").arg("--jobs=1").env("BUILD_SLOT_HELD", "1");
+            if let Some(share) = share {
+                config = config.env("CARGO_BUILD_JOBS", share);
+            }
+            config.create_config()
+        });
+        assert!(result.is_err(), "invalid advertised share accepted: {share:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "requires a positive u32 CARGO_BUILD_JOBS share")]
+fn build_slot_rejects_non_utf8_share() {
+    use std::os::unix::ffi::OsStringExt;
+    TestCtx::new()
+        .config("check")
+        .env("BUILD_SLOT_HELD", "1")
+        .env("CARGO_BUILD_JOBS", std::ffi::OsString::from_vec(vec![0xff]))
+        .create_config();
 }
 
 #[test]
@@ -1008,4 +1301,206 @@ fn test_local_changes_subtree_that_used_bors() {
             PathFreshness::LastModifiedUpstream { upstream: upstream_2 }
         );
     });
+}
+
+/// Trust: the verified compiletest lane is OPT-IN, and the default is untouched.
+///
+/// `--trust-verified` absent must leave `trust_verified()` false for every other
+/// spelling of `x.py test`, because bootstrap forwards `--trust-verified` to
+/// compiletest on exactly that predicate — and compiletest turns it into a
+/// different rustc flag vector (`-Ztrust-verify=on -Ztrust-policy=strict`
+/// instead of `-Ztrust-verify=off`). Silently flipping the default would turn
+/// every existing green run into an unwitnessed one.
+#[test]
+fn trust_verified_is_opt_in_and_excludes_vanilla() {
+    fn flags(args: &[&str]) -> Flags {
+        Flags::parse(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    let plain = flags(&["test", "--stage", "2", "tests/ui"]);
+    assert!(!plain.cmd.trust_verified(), "default lane must not claim the verified lane");
+    assert!(!plain.cmd.trust_vanilla());
+
+    let vanilla = flags(&["test", "--stage", "2", "--trust-vanilla", "tests/ui"]);
+    assert!(vanilla.cmd.trust_vanilla());
+    assert!(!vanilla.cmd.trust_verified());
+
+    let verified = flags(&["test", "--stage", "2", "--trust-verified", "tests/ui"]);
+    assert!(verified.cmd.trust_verified());
+    assert!(!verified.cmd.trust_vanilla(), "the verified lane is not the vanilla lane");
+
+    // A non-`test` subcommand never claims a lane.
+    assert!(!flags(&["build", "--stage", "2"]).cmd.trust_verified());
+}
+
+/// Trust: asking for both lanes is refused at argument parse, not resolved.
+///
+/// The two lanes assert opposite verification states for the same run; a run
+/// that quietly picked one would mislabel every exception row it fed into
+/// `tests/upstream-rust/test-exception-lanes.toml`.
+#[test]
+fn trust_vanilla_and_trust_verified_conflict() {
+    let args = ["x.py", "test", "--stage", "2", "--trust-vanilla", "--trust-verified"]
+        .iter()
+        .map(|a| a.to_string());
+    let err = <Flags as clap::Parser>::try_parse_from(args)
+        .expect_err("--trust-vanilla --trust-verified must be refused");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{err}");
+}
+
+/// Trust: cleanup scope conflicts belong to the native parser, before any
+/// default or selected crate step can assemble a compiler or delete output.
+#[test]
+fn clean_all_conflicts_with_stage_before_step_selection() {
+    for paths in [&[][..], &["compiler/rustc"][..], &["library/core"][..]] {
+        for stage in ["0", "1"] {
+            for options in [
+                vec!["clean", "--all", "--stage", stage],
+                vec!["clean", "--stage", stage, "--all"],
+                vec!["--stage", stage, "clean", "--all"],
+            ] {
+                let args = options
+                    .into_iter()
+                    .chain(paths.iter().copied())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let err = Flags::try_parse(&args)
+                    .expect_err("--all and --stage must conflict even with explicit crate paths");
+                assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{args:?}: {err}");
+            }
+        }
+    }
+}
+
+#[test]
+fn nonconflicting_clean_scopes_and_explicit_paths_remain_accepted() {
+    for paths in [&[][..], &["compiler/rustc"][..], &["library/core"][..]] {
+        for (options, expected_all, expected_stage) in [
+            (vec!["clean"], false, None),
+            (vec!["clean", "--all"], true, None),
+            (vec!["clean", "--stage", "0"], false, Some(0)),
+            (vec!["clean", "--stage", "1"], false, Some(1)),
+            (vec!["--stage", "1", "clean"], false, Some(1)),
+        ] {
+            let args = options
+                .into_iter()
+                .chain(paths.iter().copied())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let flags = Flags::try_parse(&args)
+                .unwrap_or_else(|error| panic!("nonconflicting cleanup request {args:?}: {error}"));
+            assert!(
+                matches!(flags.cmd, Subcommand::Clean { all, stage }
+                    if all == expected_all && stage == expected_stage),
+                "{args:?}: {:?}",
+                flags.cmd
+            );
+            assert_eq!(
+                flags.paths,
+                paths.iter().copied().map(PathBuf::from).collect::<Vec<_>>(),
+                "{args:?}"
+            );
+        }
+    }
+}
+
+/// Trust: a direct `cargo test` of bootstrap's lib (RUSTC unset) needs a stage0
+/// compiler for its dry-run configs. The checkout's `build/<host>/stage0` wins; a
+/// checkout without one (a git worktree) falls back to the compiler that built the
+/// tests, instead of a `<tmp>/build/<host>/stage0/bin/trustc` that never exists.
+#[test]
+fn direct_test_run_rustc_prefers_checkout_stage0_then_the_build_compiler() {
+    use super::direct_test_run_rustc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("build/host/stage0/bin/trustc");
+    assert_eq!(
+        direct_test_run_rustc(missing.clone(), Some("/toolchain/bin/trustc")),
+        PathBuf::from("/toolchain/bin/trustc")
+    );
+    fs::create_dir_all(missing.parent().unwrap()).unwrap();
+    File::create(&missing).unwrap();
+    assert_eq!(direct_test_run_rustc(missing.clone(), Some("/toolchain/bin/trustc")), missing);
+
+    let absent = dir.path().join("elsewhere/trustc");
+    for build_compiler in [None, Some("")] {
+        let panic =
+            std::panic::catch_unwind(|| direct_test_run_rustc(absent.clone(), build_compiler))
+                .expect_err("no stage0 and no build compiler must stop the run");
+        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(message.contains("set RUSTC (and CARGO)"), "{message}");
+    }
+}
+
+/// Trust: whatever launched this test binary, the config it parses must name a
+/// stage0 compiler that exists. Before `direct_test_run_rustc`, a direct run with
+/// `CARGO_TARGET_DIR` set and no `build/<host>/stage0` resolved
+/// `<tmp>/build/<host>/stage0/bin/trustc` and died in `detail_exit`.
+#[test]
+fn test_configs_resolve_an_existing_initial_rustc() {
+    let config = TestCtx::new().config("check").create_config();
+    // Trust: `initial_rustc` moved from Config to Session upstream; the
+    // resolved stage0 compiler a direct test run picks is `external_rustc`.
+    let rustc =
+        config.external_rustc.clone().expect("a direct test run resolves an external stage0 rustc");
+    let rustc = &rustc;
+    let resolvable = rustc.exists()
+        || (rustc.components().count() == 1
+            && env::split_paths(&env::var_os("PATH").unwrap_or_default())
+                .any(|dir| dir.join(rustc).is_file()));
+    assert!(resolvable, "initial rustc does not exist: {}", rustc.display());
+}
+
+#[test]
+fn dry_download_plans_ignore_and_do_not_populate_real_download_cache() {
+    use std::sync::OnceLock;
+
+    let context = crate::utils::tests::TestCtx::new();
+    let mut requested = context.config("build").stage(1).create_config();
+    requested.download_rustc_commit = Some("requested-commit".into());
+    let mut local = context.config("build").stage(1).create_config();
+    local.download_rustc_commit = None;
+    assert!(requested.dry_run() && local.dry_run());
+
+    let absent = OnceLock::from(None);
+    let other = OnceLock::from(Some("another-real-session".into()));
+    let fresh = OnceLock::new();
+    for cache in [&absent, &other, &fresh] {
+        assert_eq!(requested.download_rustc_commit_cached(cache), Some("requested-commit"));
+        assert_eq!(local.download_rustc_commit_cached(cache), None);
+        assert_eq!(requested.download_rustc_commit_cached(cache), Some("requested-commit"));
+    }
+    assert_eq!(absent.get(), Some(&None));
+    assert_eq!(other.get().and_then(Option::as_deref), Some("another-real-session"));
+    assert!(fresh.get().is_none());
+}
+
+// Trust: these are actual TOML parser inputs, not a second paired-input parser.
+#[test]
+fn vf5_resource_config_keeps_absence_and_source_relative_pair() {
+    assert!(parse("").vf5_base.is_none());
+    let digest = "12".repeat(32);
+    let config = parse(&format!("[build]\nvf5-base = 'mathematics/base'\nvf5-base-sha256 = '{digest}'\n"));
+    let input = config.vf5_base.as_ref().unwrap();
+    assert_eq!(input.package, config.src.join("mathematics/base"));
+    assert_eq!(input.manifest_sha256, digest);
+}
+
+#[test]
+fn vf5_resource_config_refuses_each_missing_half() {
+    for value in ["vf5-base = 'base'".to_owned(), format!("vf5-base-sha256 = '{}'", "12".repeat(32))] {
+        assert!(std::panic::catch_unwind(|| parse(&format!("[build]\n{value}\n"))).is_err());
+    }
+}
+
+#[test]
+fn vf5_resource_config_refuses_malformed_digest_and_empty_package() {
+    for digest in [String::new(), "12".to_owned(), "A0".repeat(32), "g0".repeat(32)] {
+        assert!(std::panic::catch_unwind(|| parse(&format!(
+            "[build]\nvf5-base = 'base'\nvf5-base-sha256 = '{digest}'\n"
+        ))).is_err());
+    }
+    assert!(std::panic::catch_unwind(|| parse(&format!(
+        "[build]\nvf5-base = ''\nvf5-base-sha256 = '{}'\n", "12".repeat(32)
+    ))).is_err());
 }

@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 //! Recognition of the simplest E6 kernel-import body SHAPES from an extracted
 //! [`VerifiableFunction`] — the soundness-critical trust boundary of the
 //! compiler-side minting hook.
@@ -19,7 +20,7 @@
 
 use crate::{
     BasicBlock, BinOp, BlockId, ConstValue, Operand, Projection, Rvalue, Statement, Terminator, Ty,
-    VerifiableFunction,
+    UnOp, VerifiableFunction,
 };
 
 /// A body shape the kernel-import elaborator can turn into a defining equation.
@@ -468,6 +469,41 @@ pub enum BoolBinOp {
     Or,
 }
 
+/// **W6 (Rust-calls-Clean)** — a boolean NEGATION or strict connective over
+/// `Bool` PARAMETERS returned as `Bool`, read back from a one-block emitted
+/// body by [`recognize_bool_value`]. The compiler-side twin of
+/// `trust_spec_elab::BoolValueKind`.
+///
+/// Distinct from [`AdmissibleBody::BoolBinary`], whose leaves are COMPARISONS
+/// (`LO <= x && x <= HI`): here the leaves are bare boolean parameters
+/// (`def f (a b : Bool) : Bool := a && b`). It is a SEPARATE ENTRY POINT
+/// (`recognize_bool_value`), NOT part of `recognize_admissible_body`'s chain,
+/// so the gate-free E6 kernel-import direction — which consumes only
+/// `AdmissibleBody` — cannot reach it; the CALL lane routes through
+/// `admit_bool_value_lowering` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolValueBody {
+    /// `_0 = UnaryOp(Not, param)` — `not b`.
+    Not {
+        /// 0-based source parameter negated.
+        param: usize,
+    },
+    /// `_0 = BinaryOp(BitAnd, left, right)` — `a && b`.
+    And {
+        /// 0-based source parameter on the left.
+        left: usize,
+        /// 0-based source parameter on the right.
+        right: usize,
+    },
+    /// `_0 = BinaryOp(BitOr, left, right)` — `a || b`.
+    Or {
+        /// 0-based source parameter on the left.
+        left: usize,
+        /// 0-based source parameter on the right.
+        right: usize,
+    },
+}
+
 /// One comparison LEAF of an [`AdmissibleBody::BoolBinary`] — structurally the
 /// same as an [`AdmissibleBody::ComparisonBool`] body, reused as a sub-term.
 /// `>`/`>=` are already normalized to `<`/`<=` by operand swap (see
@@ -794,6 +830,38 @@ impl PrimitiveCallee {
 /// parameter local; a non-`Adt` or ENUM-typed parameter (an enum field is
 /// variant-relative and reached through a `Downcast`); an out-of-range field
 /// index; and a field whose declared type differs from the return type.
+#[inline]
+fn local_decl(func: &VerifiableFunction, index: usize) -> Option<&crate::LocalDecl> {
+    if let Some(decl) = func.body.locals.get(index)
+        && decl.index == index
+    {
+        return Some(decl);
+    }
+    func.body.locals.iter().find(|l| l.index == index)
+}
+
+#[inline]
+fn block_by_id(blocks: &[BasicBlock], id: BlockId) -> Option<&BasicBlock> {
+    let idx = id.0 as usize;
+    if let Some(block) = blocks.get(idx)
+        && block.id == id
+    {
+        return Some(block);
+    }
+    blocks.iter().find(|b| b.id == id)
+}
+
+#[inline]
+fn block_index_by_id(blocks: &[BasicBlock], id: BlockId) -> Option<usize> {
+    let idx = id.0 as usize;
+    if let Some(block) = blocks.get(idx)
+        && block.id == id
+    {
+        return Some(idx);
+    }
+    blocks.iter().position(|b| b.id == id)
+}
+
 fn param_struct_field(func: &VerifiableFunction, place: &crate::Place) -> Option<(usize, usize)> {
     let [Projection::Field(field)] = place.projections.as_slice() else {
         return None;
@@ -801,7 +869,7 @@ fn param_struct_field(func: &VerifiableFunction, place: &crate::Place) -> Option
     if place.local < 1 || place.local > func.body.arg_count {
         return None;
     }
-    let local = func.body.locals.iter().find(|l| l.index == place.local)?;
+    let local = local_decl(func, place.local)?;
     let Ty::Adt { fields, variants, .. } = &local.ty else {
         return None;
     };
@@ -815,7 +883,10 @@ fn param_struct_field(func: &VerifiableFunction, place: &crate::Place) -> Option
     Some((place.local - 1, *field))
 }
 
-fn is_value_neutral(stmt: &Statement) -> bool {
+// Trust (E6 expansion I1′): `pub(crate)` so the E6-only reader
+// (`e6_expr::read_e6_body`) skips exactly this whitelist; the recognizer is
+// not otherwise touched.
+pub(crate) fn is_value_neutral(stmt: &Statement) -> bool {
     matches!(
         stmt,
         Statement::StorageLive(_)
@@ -884,9 +955,9 @@ fn recognize_call_chain(func: &VerifiableFunction) -> Option<AdmissibleBody> {
     if call_blks.len() < 2 {
         return None;
     }
-    let mut env: std::collections::BTreeMap<usize, ArithExpr> = (1..=func.body.arg_count)
-        .map(|i| (i, ArithExpr::Operand(ArithOperand::Param(i - 1))))
-        .collect();
+    let arg_count = func.body.arg_count;
+    let mut env: rustc_hash::FxHashMap<usize, ArithExpr> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(call_blks.len(), Default::default());
     let mut result: Option<ArithExpr> = None;
     let mut chain_width: Option<u32> = None;
     for (index, blk) in call_blks.iter().enumerate() {
@@ -921,7 +992,11 @@ fn recognize_call_chain(func: &VerifiableFunction) -> Option<AdmissibleBody> {
                     {
                         return None;
                     }
-                    env.get(&p.local).cloned()
+                    if (1..=arg_count).contains(&p.local) {
+                        Some(ArithExpr::Operand(ArithOperand::Param(p.local - 1)))
+                    } else {
+                        env.get(&p.local).cloned()
+                    }
                 }
                 _ => None,
             }
@@ -937,7 +1012,7 @@ fn recognize_call_chain(func: &VerifiableFunction) -> Option<AdmissibleBody> {
             }
             result = Some(node);
         } else {
-            if is_last {
+            if is_last || dest.local <= arg_count {
                 return None; // the last call must produce the return value
             }
             if env.insert(dest.local, node).is_some() {
@@ -977,8 +1052,8 @@ fn recognize_use_chain(func: &VerifiableFunction) -> Option<AdmissibleBody> {
         Const { value: u128, width_bits: u32 },
         Param(usize),
     }
-    let mut env: std::collections::BTreeMap<usize, Resolved> =
-        (1..=func.body.arg_count).map(|i| (i, Resolved::Param(i - 1))).collect();
+    let arg_count = func.body.arg_count;
+    let mut env: rustc_hash::FxHashMap<usize, Resolved> = rustc_hash::FxHashMap::default();
     let mut ret: Option<Resolved> = None;
     let mut value_stmts = 0usize;
     for stmt in &block.stmts {
@@ -993,6 +1068,19 @@ fn recognize_use_chain(func: &VerifiableFunction) -> Option<AdmissibleBody> {
             return None;
         }
         let value = match rvalue {
+            // `width_bits` here is the CONSTANT'S OWN ENCODING, not a typing fact about
+            // the function: `fn k64(_a: u32) -> u64 { 0 }` recognizes as
+            // `ConstantUint { value: 0, width_bits: 64 }` while its parameter is `u32`
+            // (measured 2026-09-25 with `TRUST_E6_DEBUG=1`). A consumer that read this
+            // as "the signature's carrier is 64 bits" would be wrong.
+            //
+            // CHECKED, so this is a note and not a defect: the E6 mint does its own
+            // carrier check before building a defining equation from it —
+            // `trust_certify::clean_island` requires every parameter domain, the return
+            // domain, and `Machine(width)` to coincide, and refuses otherwise ("a
+            // constant of a different width than the signature's carrier is a shape this
+            // routing must not launder"). `k64` is refused there. Any NEW consumer of
+            // this variant owes the same check; it is not supplied here.
             Rvalue::Use(Operand::Constant(ConstValue::Uint(value, width_bits))) => {
                 Resolved::Const { value: *value, width_bits: *width_bits }
             }
@@ -1000,7 +1088,9 @@ fn recognize_use_chain(func: &VerifiableFunction) -> Option<AdmissibleBody> {
                 if !p.projections.is_empty() {
                     return None;
                 }
-                *env.get(&p.local)?
+                env.get(&p.local).copied().or_else(|| {
+                    (1..=arg_count).contains(&p.local).then(|| Resolved::Param(p.local - 1))
+                })?
             }
             _ => return None,
         };
@@ -1356,17 +1446,47 @@ pub fn recognize_select_general(func: &VerifiableFunction) -> Option<GeneralSele
     select_diamond(expanded.as_ref())
 }
 
+/// Read a same-width unsigned select with all five total-order comparisons.
+///
+/// The existing E6/general entry points retain their historical vocabulary.
+/// Here `a > b` is `!(a <= b)` and `a >= b` is `!(a < b)`: complementing the
+/// condition must also swap BOTH arms. These equalities require a total order,
+/// so every argument and the return slot must have the same unsigned machine
+/// width. Floating-point, signed and mixed-width carriers refuse. This layer
+/// reads typed carriers; nominal Rust aliases are not retained here.
+/// The block/operand reading remains the one shared `select_diamond` below.
+#[must_use]
+pub fn recognize_unsigned_ordered_select(func: &VerifiableFunction) -> Option<GeneralSelectBody> {
+    let Ty::Int { width, signed: false } = func.body.return_ty else { return None };
+    if !matches!(width, 8 | 16 | 32 | 64)
+        || !function_returns_unsigned_width(func, width)
+        || func.body.locals.iter().filter(|decl| decl.index > 0 && decl.index <= func.body.arg_count)
+            .any(|decl| decl.ty != func.body.return_ty)
+    {
+        return None;
+    }
+    let expanded = func.with_tail_calls_expanded();
+    select_diamond_with_unsigned_order(expanded.as_ref(), true)
+}
+
 /// The ONE reading of the select diamond. Both [`recognize_select`] (narrow,
 /// in the E6 chain) and [`recognize_select_general`] (wide, outside it) are
 /// views of this function's result; there is no second descent over these
 /// blocks.
 fn select_diamond(func: &VerifiableFunction) -> Option<GeneralSelectBody> {
+    select_diamond_with_unsigned_order(func, false)
+}
+
+fn select_diamond_with_unsigned_order(
+    func: &VerifiableFunction,
+    complement_order: bool,
+) -> Option<GeneralSelectBody> {
     let blocks = &func.body.blocks;
     if blocks.len() != 4 {
         return None;
     }
     let n = func.body.arg_count;
-    let by_id = |id: BlockId| blocks.iter().find(|b| b.id == id);
+    let by_id = |id: BlockId| block_by_id(blocks, id);
 
     // Entry: one comparison of two parameters, then a two-way switch on it.
     let entry = &blocks[0];
@@ -1379,7 +1499,11 @@ fn select_diamond(func: &VerifiableFunction) -> Option<GeneralSelectBody> {
     if !cmp_place.projections.is_empty() {
         return None;
     }
-    let cmp = select_cmp(binop)?;
+    let (cmp, swap_arms) = match binop {
+        BinOp::Gt if complement_order => (SelectCmp::Le, true),
+        BinOp::Ge if complement_order => (SelectCmp::Lt, true),
+        _ => (select_cmp(binop)?, false),
+    };
     let cmp_left = param_of_operand(opl, n)?;
     // R2/C9: the comparison's RIGHT operand is a parameter (the original
     // param-vs-param select, unchanged) or a width-anchored machine-integer
@@ -1412,6 +1536,7 @@ fn select_diamond(func: &VerifiableFunction) -> Option<GeneralSelectBody> {
         matches!(opl, Operand::Copy(_)) && matches!(opr, Operand::Copy(_)),
     )?;
 
+    let (then_arm, else_arm) = if swap_arms { (else_arm, then_arm) } else { (then_arm, else_arm) };
     Some(GeneralSelectBody {
         cmp,
         cmp_left,
@@ -1449,7 +1574,7 @@ fn select_arms_and_join(
     coalesced_arm_admissible: bool,
 ) -> Option<(ArithOperand, ArithOperand)> {
     let n = func.body.arg_count;
-    let by_id = |id: BlockId| func.body.blocks.iter().find(|b| b.id == id);
+    let by_id = |id: BlockId| block_by_id(&func.body.blocks, id);
 
     // Each branch either assigns one temp from a parameter OR AN IN-RANGE
     // NUMERAL (§6f landing 3) and jumps to the join, or (arm-coalesced -O
@@ -1587,10 +1712,11 @@ pub fn recognize_select_beq(func: &VerifiableFunction) -> Option<BeqSelectBody> 
 
 /// **§6f LANDING 7 — the RAW-BINOP operator vocabulary.**
 ///
-/// The four unsigned machine operators whose realization is a bare
+/// The unsigned machine operators whose realization is a bare
 /// `Rvalue::BinaryOp` rather than a call to a marker-authenticated
-/// `core::num` primitive. They are a separate enum from [`ArithBinOp`] on
-/// purpose, and the purpose is not taste:
+/// `core::num` primitive — four at landing 7 (`&`, `|`, `/`, `%`), six since
+/// clean pin `bf31976f48` (`^`, `>>`). They are a separate enum from
+/// [`ArithBinOp`] on purpose, and the purpose is not taste:
 ///
 /// * `ArithBinOp` is the operand of `AdmissibleBody::Arithmetic`, which feeds
 ///   the **gate-free E6 kernel-import direction**. A variant added there
@@ -1598,17 +1724,25 @@ pub fn recognize_select_beq(func: &VerifiableFunction) -> Option<BeqSelectBody> 
 ///   kernel gate — see [`recognize_raw_binop`] for the mechanical statement.
 /// * every `ArithBinOp` maps to a [`PrimitiveCallee::Wrapping*`] identity
 ///   (the emit lane's callee selector is a closed match over exactly those
-///   three, at a width). `&`/`|` live on the `BitAnd`/`BitOr` trait
-///   impls and `/`/`%` on `Div`/`Rem`, none of them in `core::num`, so a
-///   fourth variant there would demand a callee that does not exist —
-///   a widening of the authenticated marker set in `library/core`, which is a
-///   different change with a different review.
+///   three, at a width). `&`/`|`/`^` live on the `BitAnd`/`BitOr`/`BitXor`
+///   trait impls, `/`/`%` on `Div`/`Rem` and `>>` on `Shr`, none of them in
+///   `core::num`, so a fourth variant there would demand a callee that does
+///   not exist — a widening of the authenticated marker set in `library/core`,
+///   which is a different change with a different review.
 ///
-/// **There is no `BitXor`, `Shl` or `Shr`, and that is measured rather than
-/// cautious**: `a ^^^ b`, `a <<< 3` and `a >>> 3` do not ELABORATE at a
-/// `UInt{N}` carrier — the Clean prelude has no `HXor`/`HShiftLeft`/
-/// `HShiftRight` instance at those widths, so instance synthesis fails before
-/// a term exists (`landing7_selection_probes::l7_p7`).
+/// **`BitXor` and `Shr` joined at clean pin `bf31976f48`; there is still no
+/// `Shl`, and all three are measured rather than cautious.** The prelude gained
+/// `HXor`/`HShiftLeft`/`HShiftRight` at every `UInt{N}`, so all three surface
+/// operators ELABORATE now. `^^^` and `>>>` (at a numeral amount below the
+/// width) are identified by the kernel with the frozen producer's reading of
+/// the raw operator. `<<<` is identified at exactly ONE amount: that producer
+/// spells `a << k` as one multiplication by `2^k`, Clean's `Nat.shiftLeft`
+/// unfolds one doubling at a time, and the two coincide at an open operand
+/// only for `k = 1` (`x * 2`) — swept over every amount at every width, every
+/// other amount below the width is a completed gate `Disagreement`
+/// (`landing7_selection_probes::l7_p7`). A `Shl` serving that one amount would
+/// need a one-amount rule of its own for a function the wrapping `*` row
+/// already serves as `a * 2`, so there is no `Shl`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RawBinOpKind {
     /// `&` — the bitwise conjunction. `MirShape` realization
@@ -1616,12 +1750,20 @@ pub enum RawBinOpKind {
     BitAnd,
     /// `|` — the bitwise disjunction.
     BitOr,
+    /// `^` — the bitwise exclusive-or. Total, like [`Self::BitAnd`].
+    BitXor,
     /// `/` — TRUNCATED unsigned division. **Total only at a nonzero divisor**;
     /// see [`RawBinOpBody`] for the total-vs-panicking boundary that constrains
     /// where this may be emitted.
     Div,
     /// `%` — the unsigned remainder. Same divisor boundary as [`Self::Div`].
     Rem,
+    /// `>>` — the LOGICAL right shift of an unsigned value. The right operand
+    /// is a shift AMOUNT, and MIR's `BinOp::Shr` takes it as
+    /// `RHS.rem_euclid(LHS::BITS)` — the same reduction modulo the width that
+    /// Lean's `UInt{N}.shiftRight` applies. See
+    /// [`Self::right_operand_is_a_shift_amount`].
+    Shr,
 }
 
 impl RawBinOpKind {
@@ -1638,8 +1780,10 @@ impl RawBinOpKind {
         match self {
             Self::BitAnd => BinOp::BitAnd,
             Self::BitOr => BinOp::BitOr,
+            Self::BitXor => BinOp::BitXor,
             Self::Div => BinOp::Div,
             Self::Rem => BinOp::Rem,
+            Self::Shr => BinOp::Shr,
         }
     }
 
@@ -1650,14 +1794,18 @@ impl RawBinOpKind {
     /// them, because their emitted realization is the marker-authenticated
     /// call and admitting the raw spelling for them would flip the third pin
     /// of `binop_provenance_pins_never_admit` — a soundness incident, not a
-    /// widening.
+    /// widening. `Shl` is not read either: it has no row, because the
+    /// kernel identifies the frozen producer's left shift with Lean's at only
+    /// one amount (see this enum's header).
     #[must_use]
     pub fn from_mir_binop(op: BinOp) -> Option<Self> {
         match op {
             BinOp::BitAnd => Some(Self::BitAnd),
             BinOp::BitOr => Some(Self::BitOr),
+            BinOp::BitXor => Some(Self::BitXor),
             BinOp::Div => Some(Self::Div),
             BinOp::Rem => Some(Self::Rem),
+            BinOp::Shr => Some(Self::Shr),
             _ => None,
         }
     }
@@ -1675,6 +1823,19 @@ impl RawBinOpKind {
     #[must_use]
     pub fn panics_at_zero_right_operand(self) -> bool {
         matches!(self, Self::Div | Self::Rem)
+    }
+
+    /// Whether this operator's right operand is a shift AMOUNT.
+    ///
+    /// Unlike the divisor, the amount is NOT a soundness boundary: MIR's
+    /// `BinOp::Shr` reduces it as `RHS.rem_euclid(LHS::BITS)` and Lean's
+    /// `UInt{N}.shiftRight` as `Nat.mod b.toNat N`, so the two agree at every
+    /// amount. What restricts it is SIDE B: the frozen producer mints a shift
+    /// only at a literal amount strictly below the width, so any other amount
+    /// has nothing for the kernel to compare against.
+    #[must_use]
+    pub fn right_operand_is_a_shift_amount(self) -> bool {
+        matches!(self, Self::Shr)
     }
 }
 
@@ -1736,7 +1897,7 @@ pub struct RawBinOpBody {
 /// The shape, and nothing wider:
 ///
 /// ```text
-/// bb0: _0 = <BitAnd|BitOr|Div|Rem>(<operand>, <operand>)
+/// bb0: _0 = <BitAnd|BitOr|BitXor|Div|Rem|Shr>(<operand>, <operand>)
 ///      return
 /// ```
 ///
@@ -1805,6 +1966,191 @@ fn raw_binop_body(func: &VerifiableFunction) -> Option<RawBinOpBody> {
     })
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// W5 (Lean-calls-Rust, `docs/design/2026-09-13-lean-calls-rust-lane.md`) —
+// THE RUST-CALL CHAIN READER, a SEPARATE ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One argument of a call in a [`RustCallChainBody`], as the emitted bytes
+/// carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustCallChainArg {
+    /// A 0-based source parameter, read as a bare `Copy`/`Move` of the
+    /// parameter local.
+    Param(usize),
+    /// The result of an EARLIER call in the chain (by node index), read as a
+    /// bare `Copy`/`Move` of the temporary that call wrote.
+    Node(usize),
+    /// An inline unsigned scalar, with its ENCODED width — the reflection
+    /// spells it at that width (`UInt{w}.ofNat v`) and the kernel decides
+    /// whether the callee accepts it there.
+    UInt {
+        /// The value.
+        value: u128,
+        /// The encoded width in bits.
+        width_bits: u32,
+    },
+    /// An inline `bool` scalar.
+    Bool(bool),
+}
+
+/// One call in a [`RustCallChainBody`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustCallChainNode {
+    /// The callee, EXACTLY as the extractor rendered it (`safe_def_path_str`
+    /// through `func_operand_name`). Never a bare name: the consumer matches
+    /// it against the rendering of a registered `DefId`, and both are
+    /// renderings of the same identity.
+    pub callee: String,
+    /// The arguments, in call order.
+    pub args: Vec<RustCallChainArg>,
+}
+
+/// A linear chain of calls to USER Rust functions, read back out of emitted
+/// MIR — the body the Lean-calls-Rust lane emits for
+/// `def twice_inc (x : UInt64) : UInt64 := inc (inc x)`:
+///
+/// ```text
+/// bb0: _2 = Call(main::inc, [copy _1]) -> bb1
+/// bb1: _0 = Call(main::inc, [copy _2]) -> bb2
+/// bb2: return
+/// ```
+///
+/// Nodes are in POST-ORDER (each call's operands are parameters, scalars, or
+/// EARLIER nodes; the last node writes the return place). What it says is
+/// exactly the body's dataflow: single assignment, linear control flow,
+/// value-neutral statements only, and every callee a member of the caller's
+/// ALLOWED set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustCallChainBody {
+    /// The calls, post-order, root last.
+    pub nodes: Vec<RustCallChainNode>,
+}
+
+/// **Read a Rust-call chain back out of emitted MIR** (W5 increment 2).
+///
+/// # A SEPARATE ENTRY POINT, and why that is the whole point
+///
+/// This function is NOT in [`recognize_admissible_body`]'s chain and must
+/// never be added to it — the same standing prohibition
+/// [`recognize_select_general`], [`recognize_raw_binop`] and the recursive
+/// readers live under, and it binds HARDEST here. That chain also feeds
+/// `trust_certify::clean_island::admit_function_into`, the gate-free E6
+/// kernel-import direction, where a recognized body becomes a DEFINING
+/// EQUATION with no side A and no kernel gate. A reader that admitted "a call
+/// to an arbitrary user `fn`" there would let E6 import `fn f(x) { g(x) }` as
+/// `f = g` with `g` opaque — a false definitional import, strictly worse than
+/// a wrong binary. `control_23_rust_call_emitter_mutation::half_7` pins that
+/// the chain still reads this body back as `None`.
+///
+/// # What is authenticated here, and what is deliberately NOT
+///
+/// The reader authenticates DATAFLOW and MEMBERSHIP: every callee string must
+/// be in `allowed`, which the consumer builds from the renderings of the
+/// `DefId`s it registered. It does NOT authenticate the callee's signature —
+/// there is no marker for a user `fn` — and it does not pretend to: the
+/// reflected term applies the callee's kernel constant to the read operands,
+/// and the KERNEL's typing of that application is what decides whether an
+/// operand is at the carrier the callee takes. A scalar therefore carries its
+/// encoded width verbatim; a mismatch is a kernel refusal, never a coercion
+/// here.
+///
+/// Fail-closed on: fewer than one call, any non-`Call` terminator before the
+/// final `Return`, a target that is not the next block, a projected
+/// destination or operand, a callee outside `allowed`, a temporary rewrite,
+/// a read of a local that is neither a parameter nor an earlier node, the
+/// return place written by any call but the last, and any non-value-neutral
+/// statement anywhere.
+#[must_use]
+pub fn recognize_rust_call_chain(
+    func: &VerifiableFunction,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Option<RustCallChainBody> {
+    // The same canonical view every other entry point takes.
+    let expanded = func.with_tail_calls_expanded();
+    rust_call_chain_body(expanded.as_ref(), allowed)
+}
+
+/// The reading behind [`recognize_rust_call_chain`]. Every deviation fails
+/// closed.
+fn rust_call_chain_body(
+    func: &VerifiableFunction,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Option<RustCallChainBody> {
+    let blocks = &func.body.blocks;
+    let (ret_blk, call_blks) = blocks.split_last()?;
+    if !matches!(ret_blk.terminator, Terminator::Return)
+        || ret_blk.stmts.iter().any(|s| !is_value_neutral(s))
+        || call_blks.is_empty()
+    {
+        return None;
+    }
+    // Which local carries what: parameters `1..=arg_count`, then the
+    // temporaries the chain writes. `_0` is deliberately untracked, so a read
+    // of the return place fails closed.
+    let arg_count = func.body.arg_count;
+    let mut env: rustc_hash::FxHashMap<usize, RustCallChainArg> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(call_blks.len(), Default::default());
+    let mut nodes: Vec<RustCallChainNode> = Vec::with_capacity(call_blks.len());
+    let mut wrote_return = false;
+    for (index, blk) in call_blks.iter().enumerate() {
+        if blk.stmts.iter().any(|s| !is_value_neutral(s)) {
+            return None;
+        }
+        let Terminator::Call { func: callee, args, dest, target, .. } = &blk.terminator else {
+            return None;
+        };
+        let next = blocks.get(index + 1)?;
+        if *target != Some(next.id) || !dest.projections.is_empty() {
+            return None;
+        }
+        if !allowed.contains(callee) {
+            return None;
+        }
+        let mut read_args = Vec::with_capacity(args.len());
+        for operand in args {
+            let arg = match operand {
+                Operand::Constant(ConstValue::Uint(value, width_bits)) => {
+                    if !uint_fits_width(*value, *width_bits) {
+                        return None;
+                    }
+                    RustCallChainArg::UInt { value: *value, width_bits: *width_bits }
+                }
+                Operand::Constant(ConstValue::Bool(value)) => RustCallChainArg::Bool(*value),
+                Operand::Copy(place) | Operand::Move(place) => {
+                    if !place.projections.is_empty() {
+                        return None;
+                    }
+                    if (1..=arg_count).contains(&place.local) {
+                        RustCallChainArg::Param(place.local - 1)
+                    } else {
+                        env.get(&place.local)?.clone()
+                    }
+                }
+                _ => return None,
+            };
+            read_args.push(arg);
+        }
+        let is_last = index == call_blks.len() - 1;
+        let node_index = nodes.len();
+        nodes.push(RustCallChainNode { callee: callee.clone(), args: read_args });
+        if dest.local == 0 {
+            if !is_last {
+                return None; // the return place is written only by the LAST call
+            }
+            wrote_return = true;
+        } else {
+            if is_last || dest.local <= arg_count {
+                return None; // the last call must produce the return value; params are immutable
+            }
+            if env.insert(dest.local, RustCallChainArg::Node(node_index)).is_some() {
+                return None; // temporary rewrite — single assignment only
+            }
+        }
+    }
+    wrote_return.then_some(RustCallChainBody { nodes })
+}
+
 /// The reading behind [`recognize_select_beq`]. Every deviation fails closed.
 fn beq_diamond(func: &VerifiableFunction) -> Option<BeqSelectBody> {
     let blocks = &func.body.blocks;
@@ -1812,7 +2158,7 @@ fn beq_diamond(func: &VerifiableFunction) -> Option<BeqSelectBody> {
         return None;
     }
     let n = func.body.arg_count;
-    let by_id = |id: BlockId| blocks.iter().find(|b| b.id == id);
+    let by_id = |id: BlockId| block_by_id(blocks, id);
 
     // The entry block carries EXACTLY TWO effectful statements, in this order.
     // Requiring the count is what makes a body with a third statement — an
@@ -1951,7 +2297,7 @@ pub enum BeqOperand {
 /// fixed now READ OUT OF THE BYTES:
 ///
 /// ```text
-/// bb0: [_t = <&|/%>(<leaf>, <leaf>)]{0,2}   // the computed decision operands
+/// bb0: [_t = <rawop>(<leaf>, <leaf>)]{0,2}  // the computed decision operands
 ///      _d  = Eq(<operand>, <operand>)       // the bool DECISION
 ///      _c  = Eq(copy _d, const <true|false>)// the LIFT, at EITHER polarity
 ///      switchInt(copy _c) -> [0: bb_false, otherwise: bb_true]
@@ -2028,6 +2374,72 @@ pub fn recognize_select_beq_general(func: &VerifiableFunction) -> Option<General
     general_beq_diamond(expanded.as_ref())
 }
 
+/// **W6 (Rust-calls-Clean) — recognise a boolean negation or connective over
+/// `Bool` parameters returned as `Bool`.**
+///
+/// A SEPARATE ENTRY POINT, deliberately NOT part of
+/// [`recognize_admissible_body`]'s chain, so the gate-free E6 kernel-import
+/// direction cannot reach it — the CALL lane consumes this directly through
+/// `admit_bool_value_lowering`. The emitted body is one block, one effectful
+/// statement into `_0`, a `Return`, and a declared `bool` result:
+///
+/// * `_0 = UnaryOp(Not, param)` — `not b`;
+/// * `_0 = BinaryOp(BitAnd, param, param)` — `a && b`;
+/// * `_0 = BinaryOp(BitOr, param, param)` — `a || b`.
+///
+/// Every operand is a bare parameter local (no projection, no literal — a
+/// literal operand would make the value a constant, a different shape). Every
+/// deviation fails closed. Faithfulness is decided downstream by the kernel
+/// gate against the island's `not`/`and`/`or` term (measured def-eq to
+/// `Bool.not`/`Bool.and`/`Bool.or`).
+pub fn recognize_bool_value(func: &VerifiableFunction) -> Option<BoolValueBody> {
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
+    if func.body.return_ty != Ty::Bool {
+        return None;
+    }
+    let [block] = &func.body.blocks[..] else {
+        return None;
+    };
+    if !matches!(block.terminator, Terminator::Return) {
+        return None;
+    }
+    let mut effectful = block.stmts.iter().filter(|s| !is_value_neutral(s));
+    let assign = effectful.next()?;
+    if effectful.next().is_some() {
+        return None;
+    }
+    let Statement::Assign { place, rvalue, .. } = assign else {
+        return None;
+    };
+    if place.local != 0 || !place.projections.is_empty() {
+        return None;
+    }
+    // A bare parameter local, 0-based (`_0` is the return place, parameters are
+    // `1..=arg_count`).
+    let bare_param = |op: &Operand| -> Option<usize> {
+        let p = match op {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            _ => return None,
+        };
+        if p.projections.is_empty() && p.local >= 1 && p.local <= func.body.arg_count {
+            Some(p.local - 1)
+        } else {
+            None
+        }
+    };
+    match rvalue {
+        Rvalue::UnaryOp(UnOp::Not, op) => Some(BoolValueBody::Not { param: bare_param(op)? }),
+        Rvalue::BinaryOp(BinOp::BitAnd, l, r) => {
+            Some(BoolValueBody::And { left: bare_param(l)?, right: bare_param(r)? })
+        }
+        Rvalue::BinaryOp(BinOp::BitOr, l, r) => {
+            Some(BoolValueBody::Or { left: bare_param(l)?, right: bare_param(r)? })
+        }
+        _ => None,
+    }
+}
+
 /// The reading behind [`recognize_select_beq_general`]. Every deviation fails
 /// closed.
 fn general_beq_diamond(func: &VerifiableFunction) -> Option<GeneralBeqSelectBody> {
@@ -2036,7 +2448,7 @@ fn general_beq_diamond(func: &VerifiableFunction) -> Option<GeneralBeqSelectBody
         return None;
     }
     let n = func.body.arg_count;
-    let by_id = |id: BlockId| blocks.iter().find(|b| b.id == id);
+    let by_id = |id: BlockId| block_by_id(blocks, id);
 
     // The single-width anchor, taken before anything else so a width-skewed
     // body cannot recognize: identical to every other machine reading.
@@ -2052,13 +2464,21 @@ fn general_beq_diamond(func: &VerifiableFunction) -> Option<GeneralBeqSelectBody
     // count is what makes a body with one statement too many fail closed rather
     // than be skipped over.
     let entry = &blocks[0];
-    let effectful: Vec<&Statement> = entry.stmts.iter().filter(|s| !is_value_neutral(s)).collect();
-    if effectful.len() < 2 || effectful.len() > 4 {
+    let mut effectful_buf: [Option<&Statement>; 4] = [None; 4];
+    let mut effectful_len = 0usize;
+    for stmt in entry.stmts.iter().filter(|s| !is_value_neutral(s)) {
+        if effectful_len >= 4 {
+            return None;
+        }
+        effectful_buf[effectful_len] = Some(stmt);
+        effectful_len += 1;
+    }
+    if effectful_len < 2 {
         return None;
     }
-    let lift_stmt = effectful[effectful.len() - 1];
-    let decision_stmt = effectful[effectful.len() - 2];
-    let prefix = &effectful[..effectful.len() - 2];
+    let lift_stmt = effectful_buf[effectful_len - 1]?;
+    let decision_stmt = effectful_buf[effectful_len - 2]?;
+    let prefix = &effectful_buf[..effectful_len - 2];
 
     // 1. THE LIFT: `_c = Eq(copy _d, const <bool>)`, at `bool`. Read first
     //    because its `bool` constant is the polarity, and reading it rather
@@ -2108,9 +2528,10 @@ fn general_beq_diamond(func: &VerifiableFunction) -> Option<GeneralBeqSelectBody
     //    a dead prefix statement, a repeated temp, or a temp the decision never
     //    reads all fail closed, because a statement whose value nothing uses is
     //    not part of the term this body denotes.
-    let mut computed: Vec<(usize, BeqOperand)> = Vec::with_capacity(prefix.len());
+    let mut computed_buf: [(usize, BeqOperand); 2] = [(0, BeqOperand::Param(0)); 2];
+    let mut computed_len = 0usize;
     for stmt in prefix {
-        let Statement::Assign { place, rvalue: Rvalue::BinaryOp(op, left, right), .. } = stmt
+        let Statement::Assign { place, rvalue: Rvalue::BinaryOp(op, left, right), .. } = (*stmt)?
         else {
             return None;
         };
@@ -2118,21 +2539,23 @@ fn general_beq_diamond(func: &VerifiableFunction) -> Option<GeneralBeqSelectBody
             || place.local <= n
             || place.local == decision_place.local
             || place.local == lift_place.local
-            || computed.iter().any(|(temp, _)| *temp == place.local)
+            || computed_buf[..computed_len].iter().any(|(temp, _)| *temp == place.local)
             || !bare_local_has_unsigned_width(func, place.local, width)
         {
             return None;
         }
         let op = RawBinOpKind::from_mir_binop(*op)?;
-        computed.push((
+        computed_buf[computed_len] = (
             place.local,
             BeqOperand::RawBin {
                 op,
                 left: arith_operand(left, func, width)?,
                 right: arith_operand(right, func, width)?,
             },
-        ));
+        );
+        computed_len += 1;
     }
+    let computed = &computed_buf[..computed_len];
     let resolve = |operand: &Operand| -> Option<BeqOperand> {
         if let Some(local) = bare_local(operand) {
             if let Some((_, computed)) = computed.iter().find(|(temp, _)| *temp == local) {
@@ -2149,9 +2572,9 @@ fn general_beq_diamond(func: &VerifiableFunction) -> Option<GeneralBeqSelectBody
     // Every computed temp must be consumed, and each exactly once: two reads of
     // one temp would be one statement standing for two operands, which is not
     // the shape the emitter builds.
-    let consumed: Vec<usize> = [opl, opr].iter().filter_map(|op| bare_local(op)).collect();
-    for (temp, _) in &computed {
-        if consumed.iter().filter(|local| *local == temp).count() != 1 {
+    let consumed = [bare_local(opl), bare_local(opr)];
+    for (temp, _) in computed {
+        if usize::from(consumed[0] == Some(*temp)) + usize::from(consumed[1] == Some(*temp)) != 1 {
             return None;
         }
     }
@@ -2292,12 +2715,21 @@ enum ArmValue {
 }
 
 /// The bool-binary shape — `A && B` / `A || B` over two comparison leaves — as
-/// rustc lowers a SHORT-CIRCUIT `&&`/`||` and leaves it through the full
-/// optimization pipeline (see [`AdmissibleBody::BoolBinary`]): a four-block
-/// diamond whose entry computes the LHS comparison `A` into a bare local and
-/// two-way `switchInt`es on it, whose two arms assign the SAME place — one the
-/// short-circuit constant, the other the RHS comparison `B` — and jump to a
-/// shared `return` join.
+/// rustc lowers a SHORT-CIRCUIT `&&`/`||` (see [`AdmissibleBody::BoolBinary`]):
+/// a four-block diamond whose entry computes the LHS comparison `A` into a bare
+/// local and two-way `switchInt`es on it, whose two arms assign the SAME place
+/// — one the short-circuit constant, the other the RHS comparison `B` — and
+/// jump to a shared `return` join.
+///
+/// Both points of the pipeline are recognized, and the recognized BODY is the
+/// same either way: `DestinationPropagation` (`mir-opt-level >= 2`, i.e. any
+/// `-O`/`-C opt-level` build) coalesces the RHS arm's comparison straight into
+/// the shared place, and without it the arm forwards through a temp. See
+/// [`bool_binary_arm`] for the measured MIR of each. Before 2026-09-20 only the
+/// coalesced spelling recognized, which made this shape — and it alone among
+/// the E6 shapes a3d-kernel's conversion uses — unreachable through the
+/// single-file lane `targo trust check FILE.rs`: measured on `379912412`, that
+/// lane answered `Gate: FAIL [strict lane, exit 1]` on the body below.
 ///
 /// `&&` and `||` differ only in which arm holds the constant and its value:
 /// `&&` short-circuits to `false` on the `0` edge; `||` short-circuits to
@@ -2314,7 +2746,7 @@ fn recognize_bool_binary(func: &VerifiableFunction) -> Option<AdmissibleBody> {
         return None;
     }
     let n = func.body.arg_count;
-    let by_id = |id: BlockId| blocks.iter().find(|b| b.id == id);
+    let by_id = |id: BlockId| block_by_id(blocks, id);
 
     // Entry: one comparison of admissible operands into a bare local, then a
     // two-way switch on exactly that local.
@@ -2482,10 +2914,20 @@ fn is_option_aggregate(kind: &crate::AggregateKind, expected_variant: usize, wid
     let crate::AggregateKind::Adt { name, variant, active_field, args } = kind else {
         return false;
     };
-    name == "core::option::Option"
-        && *variant == expected_variant
-        && active_field.is_none()
-        && args.as_deref() == Some(option_args_rendering(width).as_str())
+    if name != "core::option::Option" || *variant != expected_variant || active_field.is_some() {
+        return false;
+    }
+    let Some(args) = args.as_deref() else {
+        return false;
+    };
+    match width {
+        8 => args == "core::option::Option<i8>",
+        16 => args == "core::option::Option<i16>",
+        32 => args == "core::option::Option<i32>",
+        64 => args == "core::option::Option<i64>",
+        128 => args == "core::option::Option<i128>",
+        _ => args == option_args_rendering(width),
+    }
 }
 
 /// Recognize the overflow-checked signed arithmetic shapes (see
@@ -2513,7 +2955,7 @@ fn recognize_checked_arithmetic(func: &VerifiableFunction) -> Option<AdmissibleB
     // The declared return type (and the return slot's declared type) must be
     // the pinned std Option-of-signed shape.
     let width = crate::facet_inference::ty_is_std_option_of_signed(&func.body.return_ty)?;
-    let ret_local = func.body.locals.iter().find(|l| l.index == 0)?;
+    let ret_local = local_decl(func, 0)?;
     if ret_local.ty != func.body.return_ty {
         return None;
     }
@@ -2580,7 +3022,7 @@ fn recognize_checked_diamond(func: &VerifiableFunction, width: u32) -> Option<Ad
     if blocks.len() != 4 && blocks.len() != 5 {
         return None;
     }
-    let by_id = |id: BlockId| blocks.iter().find(|b| b.id == id);
+    let by_id = |id: BlockId| block_by_id(blocks, id);
     let n = func.body.arg_count;
 
     // ENTRY: exactly three value-carrying statements, in order — the checked
@@ -2600,7 +3042,10 @@ fn recognize_checked_diamond(func: &VerifiableFunction, width: u32) -> Option<Ad
     let right = checked_operand(b, func, width)?;
     let t = bare_nonreturn_temp(func, t_place)?;
     // The tuple temp's declared type is the checked pair `(iN, bool)`.
-    if declared_ty(func, t)? != &Ty::Tuple(vec![Ty::Int { width, signed: true }, Ty::Bool]) {
+    let Some(Ty::Tuple(tuple_elems)) = declared_ty(func, t) else {
+        return None;
+    };
+    if tuple_elems.as_slice() != [Ty::Int { width, signed: true }, Ty::Bool] {
         return None;
     }
     let (r, r_src) = field_read_of(func, s2)?;
@@ -2730,13 +3175,11 @@ fn recognize_checked_diamond(func: &VerifiableFunction, width: u32) -> Option<Ad
         return None;
     }
     // Every block is accounted for: entry, some, none, join (+ cold).
-    let mut named: Vec<BlockId> = vec![entry.id, some_blk.id, none_blk.id, join.id];
-    if used_cold {
-        named.push(*otherwise);
-    }
-    named.sort_by_key(|b| b.0);
-    named.dedup();
-    if named.len() != blocks.len() {
+    let mut named_buf = [entry.id, some_blk.id, none_blk.id, join.id, *otherwise];
+    let named_len = if used_cold { 5 } else { 4 };
+    let named = &mut named_buf[..named_len];
+    named.sort_unstable_by_key(|b| b.0);
+    if named.windows(2).any(|w| w[0] == w[1]) || named_len != blocks.len() {
         return None;
     }
 
@@ -2765,18 +3208,20 @@ const NARROW_TRAMPOLINE_LIMIT: usize = 2;
 fn chase_goto_trampolines<'a>(
     blocks: &'a [BasicBlock],
     start: BlockId,
-    walked: &mut Vec<BlockId>,
+    walked: &mut [BlockId],
+    walked_len: &mut usize,
 ) -> Option<&'a BasicBlock> {
     let mut id = start;
     for _ in 0..=NARROW_TRAMPOLINE_LIMIT {
-        let blk = blocks.iter().find(|b| b.id == id)?;
+        let blk = block_by_id(blocks, id)?;
         let Terminator::Goto(next) = &blk.terminator else {
             return Some(blk);
         };
         if blk.stmts.iter().any(|s| !is_value_neutral(s)) {
             return Some(blk);
         }
-        walked.push(blk.id);
+        walked[*walked_len] = blk.id;
+        *walked_len += 1;
         id = *next;
     }
     None
@@ -2895,7 +3340,7 @@ fn recognize_guarded_narrow(func: &VerifiableFunction) -> Option<AdmissibleBody>
     // The pinned std Option-of-signed return shape, agreeing with the return
     // slot's own declared type.
     let to_bits = crate::facet_inference::ty_is_std_option_of_signed(&func.body.return_ty)?;
-    let ret_local = func.body.locals.iter().find(|l| l.index == 0)?;
+    let ret_local = local_decl(func, 0)?;
     if ret_local.ty != func.body.return_ty {
         return None;
     }
@@ -2911,7 +3356,7 @@ fn recognize_guarded_narrow(func: &VerifiableFunction) -> Option<AdmissibleBody>
     if n == 0 {
         return None;
     }
-    let by_id = |id: BlockId| blocks.iter().find(|b| b.id == id);
+    let by_id = |id: BlockId| block_by_id(blocks, id);
 
     // ── the conjunction guard: two comparison blocks, reached by EDGE ────────
     let entry = blocks.first()?;
@@ -2938,9 +3383,12 @@ fn recognize_guarded_narrow(func: &VerifiableFunction) -> Option<AdmissibleBody>
     // BOTH false edges must land on the SAME `None` block (possibly through a
     // measured bookkeeping trampoline). This is rule 5: it is what forbids the
     // arms-swapped body structurally.
-    let mut trampolines: Vec<BlockId> = Vec::new();
-    let none_blk = chase_goto_trampolines(blocks, lo_false, &mut trampolines)?;
-    let none_from_hi = chase_goto_trampolines(blocks, hi_false, &mut trampolines)?;
+    let mut named_buf = [BlockId(0); 5 + 2 * NARROW_TRAMPOLINE_LIMIT];
+    let mut named_len = 5usize;
+    let none_blk =
+        chase_goto_trampolines(blocks, lo_false, &mut named_buf, &mut named_len)?;
+    let none_from_hi =
+        chase_goto_trampolines(blocks, hi_false, &mut named_buf, &mut named_len)?;
     if none_blk.id != none_from_hi.id {
         return None;
     }
@@ -3020,11 +3468,16 @@ fn recognize_guarded_narrow(func: &VerifiableFunction) -> Option<AdmissibleBody>
     // Census: every block is one of the five named ones or a trampoline the
     // chaser walked. Any other block — a second cast, a `cold_path` hint, an
     // unreached arm — fails the recognition closed.
-    let mut named: Vec<BlockId> = vec![entry.id, second.id, some_blk.id, none_blk.id, join.id];
-    named.extend(trampolines);
-    named.sort_by_key(|b| b.0);
-    named.dedup();
-    if named.len() != blocks.len() {
+    named_buf[0] = entry.id;
+    named_buf[1] = second.id;
+    named_buf[2] = some_blk.id;
+    named_buf[3] = none_blk.id;
+    named_buf[4] = join.id;
+    let named = &mut named_buf[..named_len];
+    named.sort_unstable_by_key(|b| b.0);
+    let unique_count =
+        named.windows(2).filter(|w| w[0] != w[1]).count() + usize::from(!named.is_empty());
+    if unique_count != blocks.len() {
         return None;
     }
 
@@ -3211,13 +3664,50 @@ fn local_is_read_anywhere(func: &VerifiableFunction, l: usize) -> bool {
     })
 }
 
-/// One arm of a [`recognize_bool_binary`] diamond: `_place = <const bool | cmp>;
-/// goto <join>`. Returns `(value, place_local, join_block)`, else `None`.
+/// One arm of a [`recognize_bool_binary`] diamond. Returns
+/// `(value, place_local, join_block)`, else `None`. Two spellings, and they are
+/// the same arm at two points of the pipeline:
+///
+/// * **COALESCED** — `_place = <const bool | cmp>; goto <join>`, one effectful
+///   statement. This is what `DestinationPropagation` leaves behind, and
+///   therefore what every `mir-opt-level >= 2` build sees.
+/// * **FORWARDED** — `_t = <cmp>; _place = copy _t; goto <join>`, two effectful
+///   statements. This is what MIR BUILDING emits for the second-evaluated
+///   operand of a short-circuit `&&`/`||`, and it survives untouched whenever
+///   `DestinationPropagation` does not run — i.e. at `mir-opt-level < 2`, which
+///   is every build without `-O`/`-C opt-level`, and (measured, not inferred
+///   from its source) the single-file lane `targo trust check FILE.rs`.
+///
+/// Measured 2026-09-20 on `trustc 1.99.0-dev (379912412)`, the un-coalesced
+/// `TrustVerify`-input MIR of `fn axis_contains(p: i64, lo: i64, hi: i64) ->
+/// bool { p >= lo && p <= hi }`:
+///
+/// ```text
+/// bb0: { _5 = Ge(copy _1, copy _2); switchInt(move _5) -> [0: bb2, otherwise: bb1]; }
+/// bb1: { _6 = Le(copy _1, copy _3); _4 = copy _6; goto -> bb3; }
+/// bb2: { _4 = const false;                        goto -> bb3; }
+/// bb3: { _0 = copy _4; return; }
+/// ```
+///
+/// Only the COMPARISON arm ever takes the forwarded spelling: the
+/// short-circuit constant is built straight into the shared place by MIR
+/// building (`bb2` above, and symmetrically `_4 = const true` for `||`), so a
+/// two-statement CONSTANT arm is not a shape this lowering produces and stays
+/// refused.
+///
+/// FAITHFULNESS of the forwarded spelling: the arm's only effects are "write
+/// the comparison's value to `_t`" then "write `_t` to `_place`", so `_place`
+/// ends the arm holding exactly the comparison's value — the same value the
+/// coalesced spelling assigns it, and the value [`recognize_bool_binary`]
+/// already reflects. The copy is pinned to the EXACT local the comparison
+/// wrote, with no projection on either side, so an arm that forwards some
+/// OTHER local (whose value this recognizer has not read) fails closed.
 fn bool_binary_arm(block: &BasicBlock, arg_count: usize) -> Option<(ArmValue, usize, BlockId)> {
     let Terminator::Goto(join) = &block.terminator else {
         return None;
     };
-    let Statement::Assign { place, rvalue, .. } = sole_effectful(&block.stmts)? else {
+    let mut effectful = block.stmts.iter().filter(|s| !is_value_neutral(s));
+    let Statement::Assign { place, rvalue, .. } = effectful.next()? else {
         return None;
     };
     if !place.projections.is_empty() {
@@ -3230,7 +3720,22 @@ fn bool_binary_arm(block: &BasicBlock, arg_count: usize) -> Option<(ArmValue, us
         }
         _ => return None,
     };
-    Some((value, place.local, *join))
+    let Some(forward) = effectful.next() else {
+        return Some((value, place.local, *join));
+    };
+    // FORWARDED: exactly one further statement, and it must be the copy of the
+    // comparison temp into the shared place. A constant arm never takes this
+    // spelling (see above), and a third statement is outside the shape.
+    if effectful.next().is_some() || !matches!(value, ArmValue::Cmp(_)) {
+        return None;
+    }
+    let Statement::Assign { place: dest, rvalue: Rvalue::Use(op), .. } = forward else {
+        return None;
+    };
+    if !dest.projections.is_empty() || bare_local(op)? != place.local {
+        return None;
+    }
+    Some((value, dest.local, *join))
 }
 
 /// The [`ComparisonLeaf`] a MIR comparison `BinaryOp(binop, opl, opr)` denotes:
@@ -3354,20 +3859,19 @@ fn recognize_aggregate_fields(func: &VerifiableFunction) -> Option<AdmissibleBod
     let blocks = &func.body.blocks;
     let n = func.body.arg_count;
 
-    let returns: Vec<usize> = blocks
+    let mut ret_iter = blocks
         .iter()
         .enumerate()
-        .filter(|(_, b)| matches!(b.terminator, Terminator::Return))
-        .map(|(i, _)| i)
-        .collect();
+        .filter_map(|(i, b)| matches!(b.terminator, Terminator::Return).then_some(i));
+    let first_ret = ret_iter.next()?;
 
-    match returns.as_slice() {
+    match (first_ret, ret_iter.next(), ret_iter.next()) {
         // ONE return: the aggregate is stored once, and a field may be fed by
         // the select diamond that joins into this block.
-        [only] => {
-            let ops = aggregate_store_after_pure(&blocks[*only], n)?.1;
-            let select = ((blocks.len() == 4 && *only == 3)
-                || (blocks.len() == 3 && *only == 2))
+        (only, None, None) => {
+            let ops = aggregate_store_after_pure(&blocks[only], n)?.1;
+            let select = ((blocks.len() == 4 && only == 3)
+                || (blocks.len() == 3 && only == 2))
                 .then(|| recognize_select_into_temp(func))
                 .flatten();
             let select_dest = select.as_ref().map(|(local, _)| *local);
@@ -3410,13 +3914,11 @@ fn recognize_aggregate_fields(func: &VerifiableFunction) -> Option<AdmissibleBod
                 // The arm blocks are exactly the interior Goto blocks: [1, 2]
                 // in the four-block diamond, [1] in the coalesced three-block
                 // form. Deriving them keeps the check exact in both shapes.
-                let arms: Vec<usize> = blocks
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, b)| *i != 0 && matches!(b.terminator, Terminator::Goto(_)))
-                    .map(|(i, _)| i)
-                    .collect();
-                if writes.iter().any(|(block_index, w)| *w == dest && !arms.contains(block_index)) {
+                if writes.iter().any(|&(block_index, w)| {
+                    w == dest
+                        && (block_index == 0
+                            || !matches!(blocks[block_index].terminator, Terminator::Goto(_)))
+                }) {
                     return None;
                 }
             }
@@ -3455,7 +3957,7 @@ fn recognize_aggregate_fields(func: &VerifiableFunction) -> Option<AdmissibleBod
         }
         // TWO returns: `-O` if-converted the select, so EACH ARM builds its own
         // aggregate and returns it. See `recognize_two_arm_aggregate`.
-        [a, b] if blocks.len() == 3 => recognize_two_arm_aggregate(func, *a, *b),
+        (a, Some(b), None) if blocks.len() == 3 => recognize_two_arm_aggregate(func, a, b),
         _ => None,
     }
 }
@@ -3555,11 +4057,13 @@ fn aggregate_store_after_pure(
     block: &BasicBlock,
     arg_count: usize,
 ) -> Option<(&crate::AggregateKind, &Vec<Operand>)> {
-    let effectful: Vec<&Statement> =
-        block.stmts.iter().filter(|s| !is_value_neutral(s)).collect();
-    let (last, before) = effectful.split_last()?;
-    if !before.iter().all(|st| is_pure_precursor(st, arg_count)) {
-        return None;
+    let mut effectful = block.stmts.iter().filter(|s| !is_value_neutral(s));
+    let mut last = effectful.next()?;
+    for next in effectful {
+        if !is_pure_precursor(last, arg_count) {
+            return None;
+        }
+        last = next;
     }
     let Statement::Assign { place, rvalue: Rvalue::Aggregate(kind, ops), .. } = last else {
         return None;
@@ -3598,7 +4102,7 @@ fn recognize_two_arm_aggregate(
 ) -> Option<AdmissibleBody> {
     let blocks = &func.body.blocks;
     let n = func.body.arg_count;
-    let by_id = |id: BlockId| blocks.iter().position(|b| b.id == id);
+    let by_id = |id: BlockId| block_index_by_id(blocks, id);
 
     let entry = &blocks[0];
     if arm_a == 0 || arm_b == 0 {
@@ -3672,7 +4176,7 @@ fn recognize_two_arm_aggregate(
 fn recognize_select_into_temp(func: &VerifiableFunction) -> Option<(usize, AdmissibleBody)> {
     let blocks = &func.body.blocks;
     let n = func.body.arg_count;
-    let by_id = |id: BlockId| blocks.iter().find(|b| b.id == id);
+    let by_id = |id: BlockId| block_by_id(blocks, id);
 
     let entry = &blocks[0];
     let Statement::Assign { place: cmp_place, rvalue: Rvalue::BinaryOp(binop, opl, opr), .. } =
@@ -4303,7 +4807,7 @@ fn recognize_zero_test_rec(
     if !dest.projections.is_empty() || bare_local_ty(func, dest.local)? != &Ty::Bool {
         return None;
     }
-    let switch_blk = blocks.iter().find(|b| Some(b.id) == *target)?;
+    let switch_blk = block_by_id(blocks, (*target)?)?;
 
     // ── the case split: `switchInt(_b) [(0, succ)] otherwise zero` ─────────
     if switch_blk.stmts.iter().any(|s| !is_value_neutral(s)) {
@@ -4361,16 +4865,16 @@ fn recognize_zero_test_rec(
 
     // Coverage: every block is exactly one of entry, switch, ret, or a member
     // of exactly one arm region.
-    let mut seen: Vec<BlockId> = vec![entry.id, switch_blk.id, ret_id];
-    seen.extend(zero_visited.iter().copied());
-    seen.extend(succ_visited.iter().copied());
+    let mut seen: Vec<BlockId> = Vec::with_capacity(3 + zero_visited.len() + succ_visited.len());
+    seen.extend([entry.id, switch_blk.id, ret_id]);
+    seen.extend_from_slice(&zero_visited);
+    seen.extend_from_slice(&succ_visited);
     if seen.len() != blocks.len() {
         return None;
     }
-    let mut deduped = seen.clone();
-    deduped.sort_by_key(|id| id.0);
-    deduped.dedup();
-    if deduped.len() != seen.len() {
+    seen.sort_unstable_by_key(|id| id.0);
+    seen.dedup();
+    if seen.len() != blocks.len() {
         return None;
     }
 
@@ -4570,18 +5074,18 @@ fn walk_structural_arm(
     arm: Arm,
     layout: ArmLayout,
 ) -> Option<(RecBodyExpr, Option<Vec<RecBodyExpr>>, Vec<BlockId>)> {
-    use std::collections::BTreeMap;
     let blocks = &func.body.blocks;
-    let by_id = |id: BlockId| blocks.iter().find(|b| b.id == id);
+    let by_id = |id: BlockId| block_by_id(blocks, id);
 
     // Dataflow: `vals` maps a Nat local to its value; `refs` maps a `&Nat`
     // local to the Nat local it borrows. EVERY parameter seeds the walk — the
     // measure as `Decreasing`, the rest by source index.
-    let mut vals: BTreeMap<usize, RecBodyExpr> = BTreeMap::new();
+    let mut vals: rustc_hash::FxHashMap<usize, RecBodyExpr> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(layout.arity + 8, Default::default());
     for source_index in 0..layout.arity {
         vals.insert(source_index + 1, layout.seed(source_index));
     }
-    let mut refs: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut refs: rustc_hash::FxHashMap<usize, usize> = rustc_hash::FxHashMap::default();
     let mut root: Option<RecBodyExpr> = None;
     let mut rec_arg: Option<Vec<RecBodyExpr>> = None;
     let mut visited: Vec<BlockId> = Vec::new();
@@ -4805,6 +5309,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -5231,6 +5736,7 @@ mod tests {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         unwind: crate::UnwindEdge::Unreachable,
                     },
                 },
@@ -5329,6 +5835,7 @@ mod tests {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         unwind: crate::UnwindEdge::Unreachable,
                     },
                 },
@@ -5348,6 +5855,7 @@ mod tests {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         unwind: crate::UnwindEdge::Unreachable,
                     },
                 },
@@ -5387,6 +5895,7 @@ mod tests {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 unwind: crate::UnwindEdge::Unreachable,
             }
         };
@@ -6017,6 +6526,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind: crate::UnwindEdge::Unreachable,
         };
         let winc = |t: Terminator, argc: usize| {
@@ -6114,6 +6624,7 @@ mod tests {
                     is_foreign: false,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                 },
             )
         };
@@ -6253,6 +6764,7 @@ mod tests {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         unwind: crate::UnwindEdge::Unreachable,
                     },
                 },
@@ -6272,6 +6784,7 @@ mod tests {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         unwind: crate::UnwindEdge::Unreachable,
                     },
                 },
@@ -6436,6 +6949,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind: crate::UnwindEdge::Unreachable,
         }
     }
@@ -7397,6 +7911,259 @@ mod tests {
         assert_eq!(recognize_admissible_body(&bad_switch), None);
     }
 
+    /// The UN-COALESCED (`mir-opt-level < 2`) bool-binary arm — the spelling
+    /// `DestinationPropagation` has not run over, where the RHS comparison
+    /// lands in a temp and is forwarded into the shared place.
+    ///
+    /// Measured 2026-09-20 on `trustc 1.99.0-dev (379912412)`: this is the
+    /// `TrustVerify`-input MIR of a3d-kernel's `axis_contains`, and before this
+    /// widening it was the ONLY converted contract in that crate that a build
+    /// without `-O` refused (15 of its 16 `ensures` clauses discharged at
+    /// `-Zmir-opt-level=1`; `axis_contains` was the sixteenth).
+    ///
+    /// The positives pin that the forwarded spelling reads back as EXACTLY the
+    /// body the coalesced one does, for `&&` and for `||`. The negatives pin
+    /// the forwarding copy itself: a copy of some OTHER local (the mutation
+    /// control — accepting it would mint a defining equation for a value this
+    /// recognizer never read), a projection on either side, a constant arm in
+    /// the forwarded spelling (a shape this lowering does not produce), a third
+    /// statement, a non-`Use` rvalue, and arms whose forwarded destinations are
+    /// DIFFERENT places.
+    #[test]
+    fn bool_binary_forwarded_arm_recognizes_and_forgeries_fail_closed() {
+        use crate::BinOp;
+        let c = |v: u128| Operand::Constant(ConstValue::Uint(v, 64));
+        let x = || Operand::Copy(Place::local(1));
+        let btrue = || Rvalue::Use(Operand::Constant(ConstValue::Bool(true)));
+        let bfalse = || Rvalue::Use(Operand::Constant(ConstValue::Bool(false)));
+        // `_shared = copy _temp` — the forwarding statement.
+        let fwd = |shared: usize, temp: usize| {
+            assign(Place::local(shared), Rvalue::Use(Operand::Copy(Place::local(temp))))
+        };
+
+        // POSITIVE `&&`: the coalesced reference body, then the same diamond
+        // with the comparison arm forwarded through `_6`. `arm_place = 4` is
+        // the measured shared temp; the join copies it to `_0`.
+        let and = bool_diamond(
+            (BinOp::Ge, x(), c(5)),
+            bfalse(),
+            Rvalue::BinaryOp(BinOp::Le, x(), c(10)),
+            Ty::Bool,
+            4,
+        );
+        let mut and_fwd = and.clone();
+        and_fwd.body.blocks[1].stmts =
+            vec![assign(Place::local(6), Rvalue::BinaryOp(BinOp::Le, x(), c(10))), fwd(4, 6)];
+        assert_eq!(recognize_admissible_body(&and_fwd), recognize_admissible_body(&and));
+        assert_eq!(
+            recognize_admissible_body(&and_fwd),
+            Some(AdmissibleBody::BoolBinary {
+                op: BoolBinOp::And,
+                left: ComparisonLeaf {
+                    cmp: SelectCmp::Le,
+                    left: CmpOperand::Const(5),
+                    right: CmpOperand::Param(0),
+                },
+                right: ComparisonLeaf {
+                    cmp: SelectCmp::Le,
+                    left: CmpOperand::Param(0),
+                    right: CmpOperand::Const(10),
+                },
+            })
+        );
+
+        // POSITIVE `||`: for a disjunction the comparison sits on the `0` arm
+        // (block 2) and the short-circuit `true` on `otherwise`; only the
+        // comparison arm forwards, exactly as measured.
+        let or = bool_diamond(
+            (BinOp::Lt, x(), c(5)),
+            Rvalue::BinaryOp(BinOp::Gt, x(), c(10)),
+            btrue(),
+            Ty::Bool,
+            4,
+        );
+        let mut or_fwd = or.clone();
+        or_fwd.body.blocks[2].stmts =
+            vec![assign(Place::local(6), Rvalue::BinaryOp(BinOp::Gt, x(), c(10))), fwd(4, 6)];
+        assert_eq!(recognize_admissible_body(&or_fwd), recognize_admissible_body(&or));
+        assert!(matches!(
+            recognize_admissible_body(&or_fwd),
+            Some(AdmissibleBody::BoolBinary { op: BoolBinOp::Or, .. })
+        ));
+
+        // POSITIVE: a3d-kernel's `axis_contains` VERBATIM — the three-parameter
+        // `p >= lo && p <= hi` as `TrustVerify` receives it without `-O`. `>=`
+        // normalizes by operand SWAP, so the left leaf is `lo <= p`.
+        let axis = func_blocks(
+            3,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![assign(
+                        Place::local(5),
+                        Rvalue::BinaryOp(
+                            BinOp::Ge,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                        ),
+                    )],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Move(Place::local(5)),
+                        targets: vec![(0, BlockId(2))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![
+                        assign(
+                            Place::local(6),
+                            Rvalue::BinaryOp(
+                                BinOp::Le,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Copy(Place::local(3)),
+                            ),
+                        ),
+                        fwd(4, 6),
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![assign(Place::local(4), bfalse())],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![assign(
+                        Place::local(0),
+                        Rvalue::Use(Operand::Copy(Place::local(4))),
+                    )],
+                    terminator: Terminator::Return,
+                },
+            ],
+        );
+        let mut axis = axis;
+        axis.body.return_ty = Ty::Bool;
+        assert_eq!(
+            recognize_admissible_body(&axis),
+            Some(AdmissibleBody::BoolBinary {
+                op: BoolBinOp::And,
+                left: ComparisonLeaf {
+                    cmp: SelectCmp::Le,
+                    left: CmpOperand::Param(1),
+                    right: CmpOperand::Param(0),
+                },
+                right: ComparisonLeaf {
+                    cmp: SelectCmp::Le,
+                    left: CmpOperand::Param(0),
+                    right: CmpOperand::Param(2),
+                },
+            })
+        );
+
+        // NEG (THE MUTATION CONTROL): the arm forwards a DIFFERENT local than
+        // the one its comparison wrote. `_4` then holds a value this recognizer
+        // has not read, and admitting it would mint a defining equation
+        // asserting the comparison. Fail closed.
+        let mut wrong_source = and_fwd.clone();
+        wrong_source.body.blocks[1].stmts = vec![
+            assign(Place::local(6), Rvalue::BinaryOp(BinOp::Le, x(), c(10))),
+            fwd(4, 7), // not `_6`
+        ];
+        assert_eq!(recognize_admissible_body(&wrong_source), None);
+
+        // NEG: the two arms forward to DIFFERENT shared places, so the join
+        // returns one of them and the other arm's value never reaches `_0`.
+        let mut split_dest = and_fwd.clone();
+        split_dest.body.blocks[1].stmts =
+            vec![assign(Place::local(6), Rvalue::BinaryOp(BinOp::Le, x(), c(10))), fwd(5, 6)];
+        assert_eq!(recognize_admissible_body(&split_dest), None);
+
+        // NEG: a projection on the forwarding DESTINATION.
+        let mut proj_dest = and_fwd.clone();
+        proj_dest.body.blocks[1].stmts = vec![
+            assign(Place::local(6), Rvalue::BinaryOp(BinOp::Le, x(), c(10))),
+            assign(
+                Place { local: 4, projections: vec![Projection::Field(0)] },
+                Rvalue::Use(Operand::Copy(Place::local(6))),
+            ),
+        ];
+        assert_eq!(recognize_admissible_body(&proj_dest), None);
+
+        // NEG: a projection on the forwarded SOURCE — not the bare comparison
+        // temp.
+        let mut proj_src = and_fwd.clone();
+        proj_src.body.blocks[1].stmts = vec![
+            assign(Place::local(6), Rvalue::BinaryOp(BinOp::Le, x(), c(10))),
+            assign(
+                Place::local(4),
+                Rvalue::Use(Operand::Copy(Place {
+                    local: 6,
+                    projections: vec![Projection::Field(0)],
+                })),
+            ),
+        ];
+        assert_eq!(recognize_admissible_body(&proj_src), None);
+
+        // NEG: a CONSTANT arm in the forwarded spelling. MIR building writes
+        // the short-circuit constant straight into the shared place, so this is
+        // not a shape the lowering produces and it stays refused.
+        let mut const_fwd = and.clone();
+        const_fwd.body.blocks[2].stmts = vec![assign(Place::local(6), bfalse()), fwd(4, 6)];
+        assert_eq!(recognize_admissible_body(&const_fwd), None);
+
+        // NEG: a THIRD effectful statement in the arm is outside the shape.
+        let mut three_stmts = and_fwd.clone();
+        three_stmts.body.blocks[1].stmts.push(assign(Place::local(4), btrue()));
+        assert_eq!(recognize_admissible_body(&three_stmts), None);
+
+        // NEG: the second statement is not a `Use` — a recomputation, not a
+        // forward of the value already read.
+        let mut not_a_use = and_fwd.clone();
+        not_a_use.body.blocks[1].stmts = vec![
+            assign(Place::local(6), Rvalue::BinaryOp(BinOp::Le, x(), c(10))),
+            assign(Place::local(4), Rvalue::BinaryOp(BinOp::Le, x(), c(11))),
+        ];
+        assert_eq!(recognize_admissible_body(&not_a_use), None);
+
+        // NEG: the OPERANDS SWAPPED in the forwarded leaf recognize to a
+        // DIFFERENT body — `hi <= p`, not `p <= hi` — so the island model that
+        // f95 discharges against cannot close this one by defeq. Widening the
+        // arm spelling must not blur which comparison the arm holds.
+        let mut swapped = axis.clone();
+        swapped.body.blocks[1].stmts = vec![
+            assign(
+                Place::local(6),
+                Rvalue::BinaryOp(
+                    BinOp::Le,
+                    Operand::Copy(Place::local(3)),
+                    Operand::Copy(Place::local(1)),
+                ),
+            ),
+            fwd(4, 6),
+        ];
+        assert_eq!(
+            recognize_admissible_body(&swapped),
+            Some(AdmissibleBody::BoolBinary {
+                op: BoolBinOp::And,
+                left: ComparisonLeaf {
+                    cmp: SelectCmp::Le,
+                    left: CmpOperand::Param(1),
+                    right: CmpOperand::Param(0),
+                },
+                right: ComparisonLeaf {
+                    cmp: SelectCmp::Le,
+                    left: CmpOperand::Param(2),
+                    right: CmpOperand::Param(0),
+                },
+            })
+        );
+        assert_ne!(recognize_admissible_body(&swapped), recognize_admissible_body(&axis));
+    }
+
     /// The pinned std `Option<iN>` return type exactly as the layout-aware
     /// extractor lowers it (Direct tag encoding ⇒ `disc_index_safe`).
     fn option_of_signed(width: u32) -> Ty {
@@ -7475,6 +8242,7 @@ mod tests {
             terminator: Terminator::Call {
                 func: "core::intrinsics::cold_path".into(),
                 callee_identity: None,
+                callee_key: None,
                 args: vec![],
                 dest: Place::local(6),
                 target: Some(BlockId(3)),
@@ -7633,7 +8401,7 @@ mod tests {
         let mut unsigned = base();
         let make_unsigned = |ty: &mut Ty| {
             let Ty::Adt { variants, .. } = ty else { unreachable!() };
-            variants[1].fields[0].1 = Ty::Int { width: 64, signed: false };
+            variants.make_mut()[1].fields[0].1 = Ty::Int { width: 64, signed: false };
         };
         make_unsigned(&mut unsigned.body.return_ty);
         unsigned.body.locals[0].ty = unsigned.body.return_ty.clone();
@@ -8420,6 +9188,7 @@ mod tests {
             terminator: Terminator::Call {
                 func: "core::intrinsics::cold_path".into(),
                 callee_identity: None,
+                callee_key: None,
                 args: vec![],
                 dest: Place::local(5),
                 target: Some(BlockId(3)),

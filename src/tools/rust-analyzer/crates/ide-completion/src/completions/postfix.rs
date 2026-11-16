@@ -8,6 +8,7 @@ use ide_db::{
     RootDatabase, SnippetCap,
     documentation::{Documentation, HasDocs},
     imports::insert_use::ImportScope,
+    source_change::SnippetEdit,
     syntax_helpers::suggest_name::NameGenerator,
     text_edit::TextEdit,
     ty_filter::TryEnum,
@@ -16,7 +17,7 @@ use itertools::{Either, Itertools};
 use stdx::never;
 use syntax::{
     SmolStr,
-    SyntaxKind::{CLOSURE_EXPR, EXPR_STMT, MATCH_ARM, STMT_LIST},
+    SyntaxKind::{CLOSURE_EXPR, MATCH_ARM},
     T, TextRange, TextSize, ToSmolStr,
     ast::{self, AstNode, AstToken},
     format_smolstr, match_ast,
@@ -117,7 +118,7 @@ pub(crate) fn complete_postfix(
     postfix_snippet("call", "function(expr)", format!("${{1}}({receiver_text})"))
         .add_to(acc, ctx.db);
 
-    if let Some(expected_ty) = ctx.expected_type.as_ref()
+    if let Some(expected_ty) = ctx.expected.ty.as_ref()
         && let Some(adt) = expected_ty.as_adt()
     {
         let is_valid_new = expected_ty
@@ -188,7 +189,7 @@ pub(crate) fn complete_postfix(
                 postfix_snippet("let", "let", format!("let $1 = {receiver_text}"))
                     .add_to(acc, ctx.db);
             }
-            _ if matches!(parent.kind(), STMT_LIST | EXPR_STMT) => {
+            _ if expr_ctx.in_block_expr => {
                 postfix_snippet("let", "let", format!("let $0 = {receiver_text}{semi}"))
                     .add_to(acc, ctx.db);
                 postfix_snippet("letm", "let mut", format!("let mut $0 = {receiver_text}{semi}"))
@@ -364,7 +365,7 @@ fn suggest_receiver_name(
     match receiver {
         ast::Expr::PathExpr(path) => {
             if let Some(name) = path.path().and_then(|it| it.as_single_name_ref()) {
-                return placeholder(name.text().as_str());
+                return placeholder(name.text());
             }
         }
         ast::Expr::RefExpr(it) => {
@@ -401,7 +402,7 @@ fn get_receiver_text(
 
     // The receiver texts should be interpreted as-is, as they are expected to be
     // normal Rust expressions.
-    escape_snippet_bits(&mut text);
+    SnippetEdit::escape_snippet_bits(&mut text);
     return text;
 
     fn indent_of_tail_line(text: &str) -> usize {
@@ -409,15 +410,6 @@ fn get_receiver_text(
         let trimmed = tail_line.trim_start_matches(' ');
         tail_line.len() - trimmed.len()
     }
-}
-
-/// Escapes `\` and `$` so that they don't get interpreted as snippet-specific constructs.
-///
-/// Note that we don't need to escape the other characters that can be escaped,
-/// because they wouldn't be treated as snippet-specific constructs without '$'.
-fn escape_snippet_bits(text: &mut String) {
-    stdx::replace(text, '\\', "\\\\");
-    stdx::replace(text, '$', "\\$");
 }
 
 fn receiver_accessor(receiver: &ast::Expr) -> ast::Expr {
@@ -779,6 +771,38 @@ fn main() {
                 sn unsafe    unsafe {}
                 sn while while expr {}
             "#]],
+        );
+
+        check_edit(
+            "let",
+            r#"
+fn foo() -> (i32, i32) {
+    "a".let$0
+    (2, 3).clone()
+}
+"#,
+            r#"
+fn foo() -> (i32, i32) {
+    let $0 = "a";
+    (2, 3).clone()
+}
+"#,
+        );
+
+        check_edit(
+            "let",
+            r#"
+fn foo() -> (i32, i32) {
+    "a".l$0
+    (2, 3).clone()
+}
+"#,
+            r#"
+fn foo() -> (i32, i32) {
+    let $0 = "a";
+    (2, 3).clone()
+}
+"#,
         );
     }
 

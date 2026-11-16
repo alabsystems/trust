@@ -225,7 +225,7 @@ pub fn forest_const_walk_set(
     }
     let mut set = vec![root];
     for child in tcx.nested_bodies_within(root).iter() {
-        let admissible = tcx.def_kind(child) == DefKind::InlineConst
+        let admissible = tcx.def_kind(child) == DefKind::AnonConst
             // Scope widening (precise/parity lane ONLY): also admit CLOSURE
             // children. Capture-less closures pass mintable (empty
             // closure_min_captures); the parity gate never trusts the result, so
@@ -237,6 +237,75 @@ pub fn forest_const_walk_set(
         set.push(child);
     }
     Some(set)
+}
+
+/// Establish absence of unencoded deferred offload checks from compiler-owned
+/// source, before consulting a candidate witness. An empty decoded list alone
+/// proves nothing: payloads and their FNV integrity digests can be rekeyed.
+///
+/// `hir_typeck::expr::check_expr_path` records these checks when an instantiated
+/// path has the genuine offload intrinsic's FnDef type and offloading is active.
+/// Check the originating resolved path, including imports/renames and a function
+/// item first assigned to a local. Other item bodies are separate typeck roots;
+/// the admitted forest enumerates every shared const body and is checked here
+/// just as it is by the replay THIR validator. No candidate types/resolutions or
+/// `typeck` query participate. Type-relative paths need typeck to resolve, so
+/// conservatively refuse them while offloading is active rather than trusting a
+/// candidate's answer. This is an optimization miss, not a language refusal.
+pub fn offload_source_is_absent(tcx: TyCtxt<'_>, walked: &[LocalDefId]) -> bool {
+    use rustc_data_structures::fx::FxHashSet;
+    use rustc_hir::intravisit::{self, Visitor};
+    use rustc_hir::{Body, BodyId, Expr, ExprKind, QPath};
+    use rustc_span::sym;
+
+    if tcx.sess.opts.unstable_opts.offload.is_empty() {
+        return true;
+    }
+    struct SourceCheck<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        absent: bool,
+        visited: FxHashSet<BodyId>,
+    }
+    impl<'tcx> Visitor<'tcx> for SourceCheck<'tcx> {
+        // Also follow nested const bodies at their source origin; a const block
+        // can supply an intrinsic function item to a local in its parent body.
+        // Nested items have independent typeck roots and independent preflights.
+        type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+        fn maybe_tcx(&mut self) -> TyCtxt<'tcx> {
+            self.tcx
+        }
+
+        fn visit_body(&mut self, body: &Body<'tcx>) {
+            if self.visited.insert(body.id()) {
+                intravisit::walk_body(self, body);
+            }
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(qpath) = &expr.kind {
+                self.absent &= match qpath {
+                    QPath::Resolved(_, path) => path
+                        .res
+                        .opt_def_id()
+                        .is_none_or(|did| !self.tcx.is_intrinsic(did, sym::offload)),
+                    QPath::TypeRelative(..) => false,
+                };
+            }
+            if self.absent {
+                intravisit::walk_expr(self, expr);
+            }
+        }
+    }
+    let mut check = SourceCheck { tcx, absent: true, visited: FxHashSet::default() };
+    for &owner in walked {
+        let Some(body) = tcx.hir_maybe_body_owned_by(owner) else { return false };
+        check.visit_body(body);
+        if !check.absent {
+            return false;
+        }
+    }
+    true
 }
 
 /// As `local_id_is_in_root_body`, but accepts membership in ANY walked forest body
@@ -285,7 +354,9 @@ pub fn picks_all_in_walked_bodies<'tcx>(
 /// Encode + write the packed store for every minted root of an error-free
 /// crate. Roots whose types fall outside the re-internable grammar are silently
 /// skipped (they are simply not minted). Returns the number of witnesses
-/// written, or `None` if the store could not be written.
+/// written, or `None` if the store could not be written. An empty AUTO collection
+/// is a successful no-op: it leaves any prior store intact. Explicit minting
+/// still writes an empty store so callers can observe that measurement.
 pub fn commit<'tcx>(
     tcx: TyCtxt<'tcx>,
     dir: &Path,
@@ -301,14 +372,22 @@ pub fn commit<'tcx>(
         // closures pass mintable, and the parity gate never trusts the result, so
         // this only widens what the shadow-mint measures (scope widening).
         let Some(walk) = forest_const_walk_set(tcx, root, precise) else {
+            tracing::debug!(?root, precise, "trust-witness: mint declined body forest");
             continue;
         };
+        if !precise && !offload_source_is_absent(tcx, &walk) {
+            tracing::debug!(?root, "trust-witness: mint declined source offload checks");
+            continue;
+        }
         let tr = tcx.typeck(root);
         if !mintable(tr, precise) {
+            tracing::debug!(?root, precise, "trust-witness: mint declined enabled set");
+            tracing::trace!(?root, ?tr, "trust-witness: declined typeck results");
             continue;
         }
         // Coverage: don't mint a witness with a pick keyed outside the walked forest.
         if !picks_all_in_walked_bodies(tcx, tr, &walk) {
+            tracing::debug!(?root, "trust-witness: mint declined pick coverage");
             continue;
         }
         // Mint under the effective key: the whole-SVH `witness_key` by default, or
@@ -316,12 +395,24 @@ pub fn commit<'tcx>(
         let Some(key) =
             (if precise { precise_witness_key(tcx, root, tr) } else { witness_key(tcx, root) })
         else {
+            tracing::debug!(?root, precise, "trust-witness: mint declined key");
             continue;
         };
-        let Some(bytes) = encode_root(tcx, tr) else { continue };
+        let Some(bytes) = encode_root(tcx, tr) else {
+            tracing::debug!(?root, "trust-witness: mint declined encoding");
+            tracing::trace!(?root, ?tr, "trust-witness: unencodable typeck results");
+            continue;
+        };
         entries.insert(key, bytes);
     }
     let n = entries.len();
+    if n == 0 && tcx.sess.opts.unstable_opts.trust_witness.is_auto() {
+        // The router may admit no roots, or a warm compile may replay every
+        // root before minting. Neither case has new entries to publish. In
+        // particular, do not replace a populated warm store with an empty one.
+        tracing::debug!(dir = %dir.display(), "trust-witness: empty auto collection leaves store unchanged");
+        return Some(0);
+    }
     match store::write(dir, &store_stem(tcx), &entries) {
         Ok(()) => {
             tracing::debug!(dir = %dir.display(), witnesses = n, "trust-witness: crate store committed");

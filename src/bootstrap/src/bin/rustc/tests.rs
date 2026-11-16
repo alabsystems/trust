@@ -1,21 +1,81 @@
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
-use super::shared_helpers::{
-    canonicalize_trust_no_verify, canonicalize_trust_verify_on, finalize_trust_no_verify,
-    finalize_trust_no_verify_snapshot, strip_trust_no_verify,
-    trust_bootstrap_verify_unit_argv_refusal, trust_bootstrap_verify_unit_requested,
+use shim_utils::{
+    canonicalize_trust_no_verify, canonicalize_trust_verify_on, cargo_test_no_verify_requested,
+    finalize_trust_no_verify, finalize_trust_no_verify_snapshot, is_cargo_target_info_probe,
+    strip_trust_no_verify, trust_bootstrap_verify_unit_argv_refusal,
+    trust_bootstrap_verify_unit_requested,
 };
+
 use super::{
     ArgFileCommand, TrustVerifyEnvAction, enforce_trust_no_verify_capability,
-    finalize_trust_verify_control, is_lint_driver_arg, rustc_driver_supports_trust_no_verify,
-    should_apply_compiler_lint_flags, should_strip_cargo_rustc_arg,
-    targeted_rustc_is_stage0_snapshot, targeted_rustc_supports_trust_no_verify,
-    trust_bootstrap_no_verify_applies, trust_bootstrap_verify_unit_applies,
+    finalize_trust_verify_control, is_lint_driver_arg, is_version_query,
+    rustc_driver_supports_trust_no_verify, should_apply_compiler_lint_flags,
+    should_strip_cargo_rustc_arg, targeted_rustc_is_built_stage, targeted_rustc_is_stage0_snapshot,
+    targeted_rustc_supports_trust_no_verify, trust_bootstrap_no_verify_applies,
+    trust_bootstrap_off_switch_applies, trust_bootstrap_verify_unit_applies,
 };
 
 fn rustc_args(args: &[&str]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
+}
+
+// Trust: capability checks inspect the seed payload, so positive snapshot
+// fixtures must carry the actual sibling names rather than only a stage0 path.
+fn trust_seed_snapshot_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempfile::tempdir().expect("seed fixture directory");
+    let bin = directory.path().join("build/host/stage0/bin");
+    std::fs::create_dir_all(&bin).expect("seed fixture bin directory");
+    for name in ["rustc", "trustc"] {
+        std::fs::write(bin.join(name), []).expect("seed fixture driver name");
+    }
+    (directory, bin)
+}
+
+// Trust: a positive seed-layout control must materialize the sibling that
+// distinguishes a Trust snapshot from a stock driver parked under stage0.
+fn seed_snapshot_drivers() -> (tempfile::TempDir, [OsString; 2]) {
+    let payload = tempfile::tempdir().unwrap();
+    let bin = payload.path().join("stage0/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let drivers = [bin.join("rustc"), bin.join("trustc")];
+    for driver in &drivers {
+        std::fs::write(driver, b"seed-layout test fixture; never executed").unwrap();
+    }
+    (payload, drivers.map(|driver| driver.into_os_string()))
+}
+
+#[test]
+fn version_query_requires_an_exact_argument_vector() {
+    for args in [
+        vec!["-V"],
+        vec!["--version"],
+        vec!["-vV"],
+        vec!["-Vv"],
+        vec!["--version", "--verbose"],
+        vec!["--verbose", "--version"],
+    ] {
+        assert!(is_version_query(&rustc_args(&args)), "{args:?}");
+    }
+    for args in [
+        vec![],
+        vec!["--version", "input.rs"],
+        vec!["--version", "--emit=metadata"],
+        vec!["@version.args"],
+        vec!["--version", "@extra.args"],
+    ] {
+        assert!(!is_version_query(&rustc_args(&args)), "{args:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn version_query_never_discards_non_utf8_arguments() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let args = [OsString::from("--version"), OsString::from_vec(vec![0xff])];
+    assert!(!is_version_query(&args));
 }
 
 #[test]
@@ -130,11 +190,47 @@ fn trust_bootstrap_no_verify_applies_to_target_compiles_with_trust_native_driver
 fn trust_bootstrap_no_verify_skips_target_compiles_on_stock_stage0() {
     // A bring-your-own stage0 (stock upstream rustc) does not understand the
     // flag, so a targeted stage0 compile must not receive it. With an
-    // unsupported driver both `targeted_*` and `no_target_*` support are false
-    // (driver support is a strict subset of targeted support).
+    // unsupported driver both `targeted_*` and `no_target_*` support are false.
     let args = rustc_args(&["rustc", "lib.rs", "--crate-name", "core", "--crate-type", "lib"]);
 
     assert!(!trust_bootstrap_no_verify_applies(true, true, false, false, &args, Some("core")));
+}
+
+/// Trust: a snapshot `rustc` leaf with no `trustc` sibling beside it is
+/// indistinguishable from a bring-your-own stock stage0 and stays out of
+/// both driver arms. The positive seed cases carry the companion file in an
+/// isolated payload directory.
+#[test]
+fn snapshot_without_trustc_sibling_stays_out_of_the_driver_arm() {
+    let snapshot = OsString::from("/checkout/build/aarch64-apple-darwin/stage0/bin/rustc");
+    assert!(!rustc_driver_supports_trust_no_verify(&snapshot));
+    assert!(!targeted_rustc_supports_trust_no_verify(&snapshot));
+
+    let stock = OsString::from("/opt/homebrew/bin/rustc");
+    assert!(!rustc_driver_supports_trust_no_verify(&stock));
+    assert!(!targeted_rustc_supports_trust_no_verify(&stock));
+
+    // Trust: without an incoming off-request, that missing sibling must also
+    // prevent injection through the composed untargeted-host dispatch.
+    let original = rustc_args(&["--crate-name", "host_dependency", "host.rs", "--crate-type=lib"]);
+    let supports = targeted_rustc_supports_trust_no_verify(&snapshot);
+    let applies = trust_bootstrap_off_switch_applies(
+        false,
+        true,
+        supports,
+        rustc_driver_supports_trust_no_verify(&snapshot),
+        false,
+        &original,
+        Some("host_dependency"),
+    );
+    assert!(!applies);
+    let mut args = original.clone();
+    enforce_trust_no_verify_capability(&snapshot, &mut args);
+    assert_eq!(
+        finalize_trust_verify_control(&mut args, false, true, supports, applies),
+        TrustVerifyEnvAction::Preserve
+    );
+    assert_eq!(args, original);
 }
 
 #[test]
@@ -164,6 +260,132 @@ fn trust_bootstrap_no_verify_applies_to_no_target_host_libraries() {
         &args,
         Some("rustc_version")
     ));
+}
+
+#[test]
+fn seed_snapshot_host_units_use_the_version_invariant_transport() {
+    let (_payload, drivers) = seed_snapshot_drivers();
+    for driver in drivers {
+        let driver_name = Path::new(&driver).file_name().unwrap().to_string_lossy();
+        assert!(rustc_driver_supports_trust_no_verify(&driver));
+        for (name, crate_type) in [
+            ("build_script_build", "bin"),
+            ("host_dependency", "lib"),
+            ("host_proc_macro", "proc-macro"),
+        ] {
+            let mut args =
+                rustc_args(&["--crate-name", name, "host.rs", "--crate-type", crate_type]);
+            let applies = trust_bootstrap_off_switch_applies(
+                false,
+                true,
+                targeted_rustc_supports_trust_no_verify(&driver),
+                rustc_driver_supports_trust_no_verify(&driver),
+                false,
+                &args,
+                Some(name),
+            );
+            assert!(applies, "{driver_name} {name}");
+            assert_eq!(
+                finalize_trust_verify_control(&mut args, false, true, true, applies),
+                TrustVerifyEnvAction::SetOff,
+                "a snapshot must not receive a version-dependent argv off-switch"
+            );
+            assert!(!args.iter().any(|arg| arg.to_string_lossy().contains("trust-verify")));
+        }
+    }
+}
+
+#[test]
+fn authenticated_seed_snapshot_is_not_isolated_by_bootstrap() {
+    let (_payload, drivers) = seed_snapshot_drivers();
+    for driver in drivers {
+        let driver_name = Path::new(&driver).file_name().unwrap().to_string_lossy();
+        let args = rustc_args(&[
+            "--crate-name",
+            "host_dependency",
+            "host.rs",
+            "--crate-type=lib",
+            "-Ztrust-verify=on",
+        ]);
+        let supports = targeted_rustc_supports_trust_no_verify(&driver);
+        let snapshot = targeted_rustc_is_stage0_snapshot(&driver);
+        assert!(supports && snapshot);
+        // Compose the same authentication, capability, compile and finalizer
+        // predicates as main: a present bootstrap marker cannot downgrade a
+        // verified frontend, even though this seed can honor an off-request.
+        let requested = cargo_test_no_verify_requested(true, true);
+        let applies = trust_bootstrap_off_switch_applies(
+            false,
+            requested,
+            supports,
+            rustc_driver_supports_trust_no_verify(&driver),
+            targeted_rustc_is_built_stage(&driver),
+            &args,
+            Some("host_dependency"),
+        );
+        assert!(!applies, "{driver_name}: authenticated frontend was isolated");
+        let mut forwarded = args.clone();
+        enforce_trust_no_verify_capability(&driver, &mut forwarded);
+        assert_eq!(
+            finalize_trust_verify_control(&mut forwarded, false, snapshot, supports, applies),
+            TrustVerifyEnvAction::Preserve,
+            "{driver_name}: snapshot finalization must not set TRUST_NO_VERIFY"
+        );
+        // Snapshot finalization removes the versioned spelling, leaving the
+        // frontend's existing environment untouched, without adding an off-switch.
+        assert_eq!(
+            forwarded,
+            rustc_args(&["--crate-name", "host_dependency", "host.rs", "--crate-type=lib",])
+        );
+    }
+}
+
+#[test]
+fn stock_and_snapshot_host_dispatch_never_forward_trust_verification_flags() {
+    let (_payload, [snapshot_rustc, snapshot_trustc]) = seed_snapshot_drivers();
+    for (driver, expected_action) in [
+        (OsString::from("/opt/homebrew/bin/rustc"), TrustVerifyEnvAction::Preserve),
+        // A stage0-shaped path alone is not evidence of a Trust payload.
+        // Keep a stock driver's environment while stripping Trust-only argv.
+        (OsString::from("/checkout/build/native/stage0/bin/rustc"), TrustVerifyEnvAction::Preserve),
+        (snapshot_rustc, TrustVerifyEnvAction::SetOff),
+        (snapshot_trustc, TrustVerifyEnvAction::SetOff),
+    ] {
+        let mut args = rustc_args(&[
+            "--crate-name",
+            "host_dependency",
+            "host.rs",
+            "--crate-type=lib",
+            "-Ztrust-verify=off",
+            "-Z",
+            "no-trust-verify=yes",
+        ]);
+        let original = args.clone();
+        let supports = targeted_rustc_supports_trust_no_verify(&driver);
+        let snapshot = targeted_rustc_is_stage0_snapshot(&driver);
+        enforce_trust_no_verify_capability(&driver, &mut args);
+        let applies = trust_bootstrap_off_switch_applies(
+            false,
+            cargo_test_no_verify_requested(true, false),
+            supports,
+            rustc_driver_supports_trust_no_verify(&driver),
+            targeted_rustc_is_built_stage(&driver),
+            &original,
+            Some("host_dependency"),
+        );
+        assert_eq!(
+            finalize_trust_verify_control(&mut args, false, snapshot, supports, applies),
+            expected_action,
+            "{driver:?}"
+        );
+        assert_eq!(
+            args,
+            rustc_args(&["--crate-name", "host_dependency", "host.rs", "--crate-type=lib",]),
+            "{driver:?}: versioned Trust options reached the driver"
+        );
+        // Every snapshot strips versioned argv. An explicit incoming request
+        // remains environment-only; a stock snapshot ignores that transport.
+    }
 }
 
 #[test]
@@ -215,6 +437,317 @@ fn trust_bootstrap_no_verify_skips_no_target_cargo_probes() {
         &joined_print_args,
         Some("___")
     ));
+}
+
+/// Trust: Cargo's TARGETED target-information probe of a stage-1 std build — the
+/// argv measured 2026-10-13 with Targo as bootstrap's Cargo, which strips every
+/// `-Ztrust_*` token (the off-switch included) from the probe — gets bootstrap's
+/// off-switch back, exactly once, and keeps std's own flags. Without it the
+/// stage-1 `trustc` answers the probe at its verifying default and, since T6,
+/// refuses std's `-Zinline-mir`: the std build aborted before compiling anything.
+#[test]
+fn targeted_probe_on_a_built_stage_gets_one_off_switch() {
+    let built = OsString::from("/checkout/build/aarch64-apple-darwin/stage1/bin/rustc");
+    let probe = rustc_args(&[
+        "-",
+        "--crate-name",
+        "___",
+        "--print=file-names",
+        "-Zannotate-moves",
+        "-Zinline-mir",
+        "-Zinline-mir-preserve-debug",
+        "--target",
+        "aarch64-apple-darwin",
+        "--crate-type",
+        "bin",
+        "--crate-type",
+        "rlib",
+        "--print=sysroot",
+        "--print=cfg",
+    ]);
+    assert!(is_cargo_target_info_probe(&probe));
+    // The compile-only predicate gives a probe nothing (unchanged, and pinned by
+    // `trust_bootstrap_no_verify_skips_no_target_cargo_probes`): that was the gap.
+    assert!(!trust_bootstrap_no_verify_applies(true, true, true, true, &probe, Some("___")));
+
+    let applies = trust_bootstrap_off_switch_applies(
+        true,
+        true,
+        targeted_rustc_supports_trust_no_verify(&built),
+        rustc_driver_supports_trust_no_verify(&built),
+        targeted_rustc_is_built_stage(&built),
+        &probe,
+        Some("___"),
+    );
+    assert!(applies, "the stage-1 std probe must carry the units' off-switch");
+    let mut args = probe.clone();
+    assert_eq!(
+        finalize_trust_verify_control(
+            &mut args,
+            false,
+            targeted_rustc_is_stage0_snapshot(&built),
+            targeted_rustc_supports_trust_no_verify(&built),
+            applies,
+        ),
+        TrustVerifyEnvAction::Preserve
+    );
+    assert_eq!(args.iter().filter(|arg| *arg == "-Ztrust-verify=off").count(), 1, "{args:?}");
+    assert!(args.iter().any(|arg| arg == "-Zinline-mir"), "std's flags stay: {args:?}");
+    assert!(args.iter().any(|arg| arg == "--print=cfg"));
+}
+
+/// Trust: the probe half of the off-switch is scoped — requested by bootstrap,
+/// TARGETED, on a driver this tree built, and a real probe — and changes
+/// nothing else: a seed's probe and a host probe keep today's answer, version
+/// and help queries are not probes, and a real compile still goes through the
+/// compile predicate.
+#[test]
+fn probe_off_switch_is_scoped_to_requested_targeted_probes_of_built_stages() {
+    let probe = rustc_args(&["-", "--crate-name", "___", "--print=file-names", "--target", "t"]);
+    let host_probe = rustc_args(&["-", "--crate-name", "___", "--print=file-names"]);
+    let built = OsString::from("/checkout/build/host/stage2/bin/rustc");
+    assert!(targeted_rustc_is_built_stage(&built));
+
+    // Not requested by bootstrap.
+    assert!(!trust_bootstrap_off_switch_applies(true, false, true, true, true, &probe, None));
+    // A host probe (no `--target`): std's rustflags never reach it.
+    assert!(!trust_bootstrap_off_switch_applies(false, true, true, true, true, &host_probe, None));
+    // Seeds: bootstrap's stage0 snapshot and an installed `trustc` named as
+    // `build.rustc` both support the switch, and neither is a built stage.
+    let (_fixture, bin) = trust_seed_snapshot_fixture();
+    for seed in [
+        bin.join("rustc").into_os_string(),
+        bin.join("trustc").into_os_string(),
+        OsString::from("/opt/pkg/store/trust/9192/bin/trustc"),
+    ] {
+        assert!(targeted_rustc_supports_trust_no_verify(&seed));
+        assert!(!targeted_rustc_is_built_stage(&seed), "{seed:?}");
+        assert!(!trust_bootstrap_off_switch_applies(
+            true,
+            true,
+            true,
+            rustc_driver_supports_trust_no_verify(&seed),
+            targeted_rustc_is_built_stage(&seed),
+            &probe,
+            None,
+        ));
+    }
+    // Queries that print nothing for Cargo are not probes; `--print` after `--`
+    // is positional, so that argv is a compile.
+    for query in [
+        &["-vV"][..],
+        &["--version"],
+        &["-Z", "help"],
+        &["--explain", "E0001"],
+        &["-", "--print=cfg", "--help"],
+        &["src/lib.rs", "--", "--print=cfg"],
+        &[],
+        // Not Cargo's shape since the review follow-up: no `--crate-name ___`.
+        &["-", "--print", "cfg"],
+    ] {
+        assert!(!is_cargo_target_info_probe(&rustc_args(query)), "{query:?}");
+    }
+    assert!(is_cargo_target_info_probe(&rustc_args(&[
+        "-",
+        "--crate-name",
+        "___",
+        "--print",
+        "cfg"
+    ])));
+    // A real targeted compile still gets the switch, through the compile predicate.
+    let compile =
+        rustc_args(&["--crate-name", "core", "src/lib.rs", "--crate-type", "lib", "--target", "t"]);
+    assert!(trust_bootstrap_off_switch_applies(true, true, true, true, true, &compile, None));
+    assert!(trust_bootstrap_off_switch_applies(true, true, true, true, false, &compile, None));
+}
+
+/// Trust: Cargo's target-information probe exactly as the installed pack's Targo
+/// (`321aaeda7`, the `build.cargo` of a `bootstrap.toml` in atpkg mode) sends it
+/// (argv logged 2026-10-13 through a `RUSTC_WRAPPER` on `targo --unverified build
+/// --target aarch64-apple-darwin` with `RUSTFLAGS=-Zinline-mir`; Targo had
+/// already dropped its own `-Ztrust-verify=off`), with and without the leading
+/// compiler path the shim sees when it runs as `RUSTC_WRAPPER`, as bootstrap
+/// runs it; the host probe; and the one-crate-type re-probe Cargo makes from the
+/// same prefix (`crate_type_process`). All are probes.
+#[test]
+fn cargo_target_info_probe_argv_is_a_probe() {
+    let targeted = [
+        "-",
+        "--crate-name",
+        "___",
+        "--print=file-names",
+        "-Zinline-mir",
+        "--target",
+        "aarch64-apple-darwin",
+        "--crate-type",
+        "bin",
+        "--crate-type",
+        "rlib",
+        "--crate-type",
+        "dylib",
+        "--crate-type",
+        "cdylib",
+        "--crate-type",
+        "staticlib",
+        "--crate-type",
+        "proc-macro",
+        "--print=sysroot",
+        "--print=split-debuginfo",
+        "--print=crate-name",
+        "--print=cfg",
+        "-Wwarnings",
+    ];
+    let host = targeted
+        .iter()
+        .copied()
+        .filter(|arg| !matches!(*arg, "--target" | "aarch64-apple-darwin" | "-Zinline-mir"))
+        .collect::<Vec<_>>();
+    let re_probe =
+        ["-", "--crate-name", "___", "--print=file-names", "--target", "t", "--crate-type", "x"];
+    for probe in [&targeted[..], &host[..], &re_probe[..]] {
+        assert!(is_cargo_target_info_probe(&rustc_args(probe)), "{probe:?}");
+        for compiler in ["/checkout/build/bootstrap/debug/rustc", "/opt/trust/bin/trustc"] {
+            let wrapped =
+                std::iter::once(compiler).chain(probe.iter().copied()).collect::<Vec<_>>();
+            assert!(is_cargo_target_info_probe(&rustc_args(&wrapped)), "{wrapped:?}");
+        }
+    }
+    // Both `--print` spellings, repeated, and the split `-W warnings`.
+    assert!(is_cargo_target_info_probe(&rustc_args(&[
+        "-",
+        "--crate-name=___",
+        "--print",
+        "file-names",
+        "--print=cfg",
+        "--print",
+        "sysroot",
+        "-W",
+        "warnings",
+    ])));
+}
+
+/// Trust: rustc keeps COMPILING when every print request is `native-static-libs`
+/// or `link-args` (`rustc_driver_impl::print_crate_info`), so such an invocation
+/// is a real compile, never a probe, in either `--print` spelling and alone or
+/// together. Before the review follow-up any `--print` made a probe, so under
+/// the Cargo-test shim a `--target` staticlib fixture compile with
+/// `--print=native-static-libs` that verified would silently have been switched
+/// off. Each argv here was a probe to the old predicate.
+#[test]
+fn print_requests_that_keep_compiling_are_not_probes() {
+    let compile =
+        ["--crate-name", "foo", "src/lib.rs", "--crate-type", "staticlib", "--target", "t"];
+    let probe_shape = ["-", "--crate-name", "___", "--target", "t"];
+    let mut misread = Vec::new();
+    for prints in [
+        &["--print=native-static-libs"][..],
+        &["--print", "native-static-libs"],
+        &["--print=link-args"],
+        &["--print", "link-args"],
+        &["--print=native-static-libs", "--print=link-args"],
+        &["--print", "link-args", "--print", "native-static-libs"],
+    ] {
+        for base in [&compile[..], &probe_shape[..]] {
+            let args = [base, prints].concat();
+            // Only the probe predicate is pinned here. What the compile
+            // predicate answers for such a compile is a separate, pre-existing
+            // gap (DECISION_QUEUE BOOTSTRAP-PROBE-OFF-1, "Unchanged and noted"),
+            // left free to be fixed without flipping this test.
+            if is_cargo_target_info_probe(&rustc_args(&args)) {
+                misread.push(args);
+            }
+        }
+    }
+    assert!(misread.is_empty(), "real compiles read as probes: {misread:#?}");
+}
+
+/// Trust: the probe predicate admits Cargo's probe SHAPE and nothing wider (the
+/// narrower, fail-closed rule taken in the review follow-up of
+/// BOOTSTRAP-PROBE-OFF-1): a print kind Cargo does not send, even one that stops
+/// compilation; a print to a file; a source-file input; another crate name; a
+/// `--` boundary; a `--print=…` token that is another option's value; and a
+/// `--print` with no kind. Each argv here was a probe to the old predicate.
+#[test]
+fn only_cargo_probe_shape_is_a_probe() {
+    let misread = [
+        // A stop-compilation kind outside Cargo's five, alone or beside them.
+        &["-", "--crate-name", "___", "--print=target-libdir"][..],
+        &["-", "--crate-name", "___", "--print=cfg", "--print", "target-list"],
+        // A kind Cargo sends, but to a file.
+        &["-", "--crate-name", "___", "--print=cfg=out.txt"],
+        &["-", "--crate-name", "___", "--print", "cfg=out.txt"],
+        // A source file, not stdin; `-o -` names an output, not an input.
+        &["src/lib.rs", "--crate-name", "___", "--print=cfg"],
+        &["src/lib.rs", "--crate-name", "___", "--print=cfg", "-o", "-"],
+        // Another crate name, or none.
+        &["-", "--crate-name", "core", "--print=cfg"],
+        &["-", "--print=cfg"],
+        // A positional boundary, even after the probe's own tokens.
+        &["-", "--crate-name", "___", "--print=cfg", "--"],
+        // `--cfg`'s value, not a print request: nothing here prints.
+        &["-", "--crate-name", "___", "--cfg", "--print=cfg"],
+        // A `--print` with no kind.
+        &["-", "--crate-name", "___", "--print=cfg", "--print"],
+        &["-", "--crate-name", "___", "--print="],
+    ]
+    .into_iter()
+    .filter(|args| is_cargo_target_info_probe(&rustc_args(args)))
+    .collect::<Vec<_>>();
+    assert!(misread.is_empty(), "not Cargo's probe shape, read as probes: {misread:#?}");
+}
+
+/// Trust: the probe predicate reads the argv as rustc's getopts does, and
+/// refuses what it cannot read as Cargo's shape (the second review of
+/// BOOTSTRAP-PROBE-OFF-1). A short-option CLUSTER: getopts reads `-gL` as `-g
+/// -L`, and that `-L` takes the next argument, so `-gL --print=cfg` prints
+/// nothing and compiles a crate (measured with the installed `trustc`
+/// `321aaeda7`: exit 0, `lib___.rlib` written). A help query in any spelling,
+/// short or long, joined or split. A free argument after the input or after an
+/// option, and an input after an option. Each argv here was a probe to the
+/// predicate of `b4420ca8e7`.
+#[test]
+fn short_option_clusters_help_queries_and_late_inputs_are_not_probes() {
+    let probe = ["-", "--crate-name", "___"];
+    let misread = [
+        // Clusters: the value-taking `-L` at the end takes `--print=cfg`.
+        &["--crate-type", "rlib", "-gL", "--print=cfg"][..],
+        &["-OL", "--print=cfg"],
+        &["--print=cfg", "-vL", "--print=cfg"],
+        // A cluster of flags only, and one with a value glued on: never Cargo's.
+        &["--print=cfg", "-gO"],
+        &["--print=cfg", "-gLnative=/x"],
+        // Help queries, every level and spelling.
+        &["--print=cfg", "--codegen", "help"],
+        &["--print=cfg", "--codegen=help"],
+        &["--print=cfg", "--warn", "help"],
+        &["--print=cfg", "-A", "help"],
+        &["--print=cfg", "--allow=help"],
+        &["--print=cfg", "--force-warn", "help"],
+        &["--print=cfg", "-Dhelp"],
+        &["--print=cfg", "--deny", "help"],
+        &["--print=cfg", "-F", "help"],
+        &["--print=cfg", "--forbid=help"],
+        // A second input after the options, or a second `-`.
+        &["--print=cfg", "src/lib.rs"],
+        &["--print=cfg", "-"],
+    ]
+    .into_iter()
+    .map(|tail| [&probe[..], tail].concat())
+    .chain([
+        // The input after an option.
+        vec!["--crate-name", "___", "-", "--print=cfg"],
+        // A free argument between the input and the options.
+        vec!["-", "src/lib.rs", "--crate-name", "___", "--print=cfg"],
+    ])
+    .filter(|args| is_cargo_target_info_probe(&rustc_args(args)))
+    .collect::<Vec<_>>();
+    assert!(misread.is_empty(), "not Cargo's probe shape, read as probes: {misread:#?}");
+    // The shape Cargo sends behind one or two wrapper paths (bootstrap's tippy
+    // runs `<shim> <tippy-driver> <rustc> - …`) is still a probe.
+    for wrappers in [&[][..], &["/x/rustc"], &["/x/tippy-driver", "/x/rustc"]] {
+        let args = [wrappers, &probe[..], &["--print=cfg", "-Wwarnings", "-Zinline-mir"]].concat();
+        assert!(is_cargo_target_info_probe(&rustc_args(&args)), "{args:?}");
+    }
 }
 
 #[test]
@@ -330,19 +863,19 @@ fn detects_stage_rustc_drivers_that_support_trust_no_verify() {
     assert!(rustc_driver_supports_trust_no_verify(&OsString::from(
         "/checkout/build/aarch64-unknown-linux-gnu/stage0/bin/trustc"
     )));
-    // A stock-compatible rustc leaf in a stage0 directory remains excluded.
-    assert!(!rustc_driver_supports_trust_no_verify(&OsString::from(
-        "/checkout/build/aarch64-unknown-linux-gnu/stage0/bin/rustc"
-    )));
+    // A real Trust snapshot's compatibility alias uses the same
+    // version-invariant transport; its adjacent Trust driver must exist.
+    let (_payload, [snapshot_rustc, _]) = seed_snapshot_drivers();
+    assert!(rustc_driver_supports_trust_no_verify(&snapshot_rustc));
     assert!(!rustc_driver_supports_trust_no_verify(&OsString::from("/opt/homebrew/bin/rustc")));
     assert!(!rustc_driver_supports_trust_no_verify(&OsString::from("/tmp/trustc-wrapper")));
 }
 
 #[test]
 fn detects_targeted_drivers_that_support_trust_no_verify() {
-    // Any bootstrap-managed stage snapshot understands the flag — including
-    // stage0, which is a Trust `trustc` payload by default.
-    for stage in ["stage0", "stage1", "stage2", "stage3"] {
+    // Built stages understand the switch. Snapshot capability additionally
+    // requires the Trust companion payload exercised below.
+    for stage in ["stage1", "stage2", "stage3"] {
         assert!(targeted_rustc_supports_trust_no_verify(&OsString::from(format!(
             "/checkout/build/aarch64-unknown-linux-gnu/{stage}/bin/rustc"
         ))));
@@ -357,8 +890,8 @@ fn detects_targeted_drivers_that_support_trust_no_verify() {
     // Invariant the strip site relies on, in the contrapositive form it uses:
     // when `!targeted_rustc_supports` we strip, and that guarantees
     // `!rustc_driver_supports`, so the later add-path can never re-add the flag.
-    // It holds because driver support is a subset of targeted support:
-    // {trustc} ∪ {stage1,2,3} ⊂ {trustc} ∪ {stage0,1,2,3}.
+    // Every host-supported driver is target-supported; an unidentified
+    // stage0 snapshot retains only the target environment transport.
     let unsupported = OsString::from("/opt/homebrew/bin/rustc");
     assert!(!targeted_rustc_supports_trust_no_verify(&unsupported));
     assert!(!rustc_driver_supports_trust_no_verify(&unsupported));
@@ -366,14 +899,90 @@ fn detects_targeted_drivers_that_support_trust_no_verify() {
     // A canonical Trust-named stage0 is supported in both lanes. This matters
     // when local-rebuild auto-detection classifies the seed as stage1-capable:
     // build scripts and proc macros still run without an explicit --target.
-    let stage0 = OsString::from("/checkout/build/aarch64-unknown-linux-gnu/stage0/bin/rustc");
+    let (_payload, [stage0, trust_stage0]) = seed_snapshot_drivers();
     assert!(targeted_rustc_supports_trust_no_verify(&stage0));
-    assert!(!rustc_driver_supports_trust_no_verify(&stage0));
+    assert!(rustc_driver_supports_trust_no_verify(&stage0));
 
-    let trust_stage0 =
-        OsString::from("/checkout/build/aarch64-unknown-linux-gnu/stage0/bin/trustc");
     assert!(targeted_rustc_supports_trust_no_verify(&trust_stage0));
     assert!(rustc_driver_supports_trust_no_verify(&trust_stage0));
+}
+
+#[test]
+fn stage0_host_units_honor_bootstrap_marker_without_target_rustflags() {
+    // Trust: builder::cargo always exports this marker, even at stage0. With
+    // --target set on Cargo itself, none of RUSTFLAGS_BOOTSTRAP reaches these
+    // host units. Exercise actual capability -> compile policy -> snapshot
+    // finalization, starting with NO explicit verifier flag to rescue it.
+    let marker = shim_utils::trust_bootstrap_shim_marker_enabled(Some(OsStr::new("1")));
+    let (_fixture, bin) = trust_seed_snapshot_fixture();
+    for spelling in ["rustc", "trustc"] {
+        let driver = bin.join(spelling).into_os_string();
+        for authored in [
+            rustc_args(&["--crate-name", "build_script_build", "build.rs", "--crate-type=bin"]),
+            rustc_args(&["--crate-name", "shlex", "src/lib.rs", "--crate-type=lib"]),
+            rustc_args(&[
+                "--crate-name",
+                "fixture_macros",
+                "src/lib.rs",
+                "--crate-type=proc-macro",
+            ]),
+        ] {
+            for authenticated_frontend in [false, true] {
+                let requested =
+                    shim_utils::cargo_test_no_verify_requested(marker, authenticated_frontend);
+                let applies = trust_bootstrap_off_switch_applies(
+                    false,
+                    requested,
+                    targeted_rustc_supports_trust_no_verify(&driver),
+                    rustc_driver_supports_trust_no_verify(&driver),
+                    targeted_rustc_is_built_stage(&driver),
+                    &authored,
+                    None,
+                );
+                assert_eq!(applies, !authenticated_frontend, "{driver:?}: {authored:?}");
+                let mut args = authored.clone();
+                let action = finalize_trust_verify_control(
+                    &mut args,
+                    false,
+                    targeted_rustc_is_stage0_snapshot(&driver),
+                    targeted_rustc_supports_trust_no_verify(&driver),
+                    applies,
+                );
+                assert_eq!(
+                    action,
+                    if authenticated_frontend {
+                        TrustVerifyEnvAction::Preserve
+                    } else {
+                        TrustVerifyEnvAction::SetOff
+                    },
+                    "{driver:?}: {args:?}",
+                );
+                assert_eq!(args, authored, "a snapshot must receive no vintage-specific argv flag");
+            }
+        }
+    }
+    // Stock driver and host query scope remain unchanged.
+    let stock = OsString::from("/opt/homebrew/bin/rustc");
+    let compile = rustc_args(&["--crate-name", "shlex", "src/lib.rs"]);
+    assert!(!trust_bootstrap_off_switch_applies(
+        false,
+        true,
+        targeted_rustc_supports_trust_no_verify(&stock),
+        rustc_driver_supports_trust_no_verify(&stock),
+        targeted_rustc_is_built_stage(&stock),
+        &compile,
+        None,
+    ));
+    let query = rustc_args(&["-", "--crate-name", "___", "--print=cfg"]);
+    assert!(!trust_bootstrap_off_switch_applies(
+        false,
+        true,
+        true,
+        true,
+        false,
+        &query,
+        Some("___")
+    ));
 }
 
 #[test]
@@ -420,11 +1029,9 @@ fn stage0_snapshot_discrimination_and_env_transport() {
         "no argv spelling may survive for a snapshot driver: {args:?}"
     );
 
-    // THE HOSTFLAGS LANE — the build-script case that walled every fresh
-    // build. `trust_bootstrap_no_verify_applies` answers false for a seed on
-    // a host unit (its driver gate deliberately excludes stage0), but the
-    // builder already materialized the off-switch in the args via
-    // RUSTC_HOST_FLAGS. Stripping it without honoring it re-enables
+    // THE HOSTFLAGS LANE — an explicit off-request still needs transport when
+    // the shim's own add-path was not requested. The assembled args may carry
+    // it through RUSTC_HOST_FLAGS. Stripping it without honoring it re-enables
     // batteries-on verification of the dep tree (the memchr wall), so the
     // stripped off-request must ride the env transport.
     let mut args = vec![OsString::from("-Ztrust-verify=off")];
@@ -450,9 +1057,9 @@ fn stage0_snapshot_discrimination_and_env_transport() {
     let mut args = vec![OsString::from("--"), OsString::from("-Ztrust-verify=off")];
     assert!(!finalize_trust_no_verify_snapshot(&mut args, true, false));
 
-    // Unsupported (stock upstream parked in a stage0-named dir) => stripped,
-    // no env transport. Stock ignores the env anyway; not setting it keeps
-    // the invariant clean.
+    // The helper's unsupported-driver contract: strip the option without
+    // requesting environment transport. The composed dispatch control covers
+    // actual paths, including a snapshot-named stock driver (which ignores env).
     let mut args = vec![OsString::from("-Ztrust-verify=off")];
     assert!(!finalize_trust_no_verify_snapshot(&mut args, false, true));
     assert!(args.is_empty());
@@ -607,6 +1214,58 @@ fn the_retired_spelling_is_parsed_exactly_as_its_own_parse_bool() {
     }
 }
 
+// Trust: the canonical Session's Trust-named seed reaches host libraries,
+// build scripts and proc macros without target rustflags. The marker uses the
+// vintage-independent transport, while stock/verified/query controls stay out.
+#[test]
+fn stage0_host_native_policy_preserves_queries_frontends_and_stock_drivers() {
+    let seed = OsString::from("/checkout/build/host/stage0/bin/trustc");
+    let stock = OsString::from("/external/bin/rustc");
+    for driver in [&seed, &stock] {
+        for (args, compile) in [
+            (rustc_args(&["--crate-name", "dep", "dep.rs", "--crate-type=lib"]), true),
+            (rustc_args(&["--crate-name", "build_script_build", "build.rs"]), true),
+            (rustc_args(&["--crate-name", "derive", "lib.rs", "--crate-type=proc-macro"]), true),
+            (rustc_args(&["--print=cfg"]), false),
+            (rustc_args(&["-vV"]), false),
+        ] {
+            for frontend in [false, true] {
+                let supports = rustc_driver_supports_trust_no_verify(driver);
+                let requested = shim_utils::cargo_test_no_verify_requested(true, frontend);
+                let applies = trust_bootstrap_off_switch_applies(
+                    false,
+                    requested,
+                    targeted_rustc_supports_trust_no_verify(driver),
+                    supports,
+                    targeted_rustc_is_built_stage(driver),
+                    &args,
+                    None,
+                );
+                let mut forwarded = args.clone();
+                let action = finalize_trust_verify_control(
+                    &mut forwarded,
+                    false,
+                    targeted_rustc_is_stage0_snapshot(driver),
+                    targeted_rustc_supports_trust_no_verify(driver),
+                    applies,
+                );
+                assert_eq!(
+                    action,
+                    if driver == &seed && compile && !frontend {
+                        TrustVerifyEnvAction::SetOff
+                    } else {
+                        TrustVerifyEnvAction::Preserve
+                    }
+                );
+                assert_eq!(
+                    forwarded, args,
+                    "a snapshot must not receive either vintage's argv flag"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn enforce_capability_strips_flag_for_byo_stock_stage0() {
     // The reachable leak: a bring-your-own stage0 (`build.rustc` = stock upstream
@@ -627,9 +1286,9 @@ fn enforce_capability_strips_flag_for_byo_stock_stage0() {
 
 #[test]
 fn enforce_capability_keeps_flag_for_trust_native_driver() {
-    // A Trust-native driver (any stageN snapshot, including the stage0 `trustc`
-    // payload, or a `trustc`-stemmed binary) understands the flag, so an injected
-    // copy is preserved untouched.
+    // The preliminary capability filter preserves this request for a known
+    // Trust-native driver. Snapshot finalization subsequently strips the argv
+    // spelling and transports the request through the environment instead.
     for driver in [
         "/checkout/build/aarch64-unknown-linux-gnu/stage1/bin/rustc",
         "/checkout/build/aarch64-unknown-linux-gnu/stage0/bin/trustc",
@@ -1003,4 +1662,61 @@ fn finalize_refuses_a_lane_unit_that_carries_a_session_identity() {
         "src/lib.rs",
     ]);
     finalize_trust_verify_control(&mut args, true, false, true, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_signal_guard_preserves_ordinary_bootstrap_policy() {
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        super::cargo_fixture_termination_signal(
+            false,
+            std::process::ExitStatus::from_raw(libc::SIGTERM)
+        ),
+        None
+    );
+    assert_eq!(
+        super::cargo_fixture_termination_signal(true, std::process::ExitStatus::from_raw(7 << 8)),
+        None
+    );
+    assert_eq!(
+        super::cargo_fixture_termination_signal(
+            true,
+            std::process::ExitStatus::from_raw(libc::SIGTERM)
+        ),
+        Some(libc::SIGTERM)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_signal_child() {
+    let Ok(mode) = std::env::var("TRUST_TEST_FIXTURE_SIGNAL_MODE") else { return };
+    // SAFETY: this is an isolated child which deliberately terminates below.
+    unsafe {
+        if mode == "ignored" {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+        if mode == "blocked" {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGTERM);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+        }
+    }
+    super::forward_cargo_fixture_signal(libc::SIGTERM);
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_signal_forwarding_resets_and_unblocks_on_the_terminating_thread() {
+    use std::os::unix::process::ExitStatusExt;
+    for mode in ["plain", "ignored", "blocked"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::fixture_signal_child", "--nocapture"])
+            .env("TRUST_TEST_FIXTURE_SIGNAL_MODE", mode)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{mode}: {output:?}");
+    }
 }

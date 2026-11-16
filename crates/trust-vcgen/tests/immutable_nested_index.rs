@@ -5,15 +5,31 @@
 // (`build_immutable_index_len_tie_facts`): for a SHARED-ref base (immutable BY TYPE — no
 // resize is formable) with a pure-input index, tie `coll_len(dest_a)==coll_len(dest_b)`.
 // SOUND BY CONSTRUCTION (static `Ty::Ref{mutable:false}` gate, not mut-borrow analysis).
+//
+// Trust (2026-10-04, IDX-TIE-1): the tie now requires std's own scalar
+// `<S as Index<usize>>::index` on a std container (`is_std_scalar_index_call` and a
+// slice/array/`Seq`/std-`Vec` root), because a method merely NAMED `index` gave a
+// false `slice proved`. These three fixtures spelled every index call as the bare
+// `std::ops::Index::index`, which the extractor never emits and which names no
+// impl; they now carry the extractor's spelling (measured on the stage 1 of
+// `936573497e`: `<alloc::vec::Vec<alloc::vec::Vec<u32>> as
+// core::ops::index::Index<usize>>::index` for `v[i]`, `<alloc::vec::Vec<u32> as
+// core::ops::index::Index<usize>>::index` for `v[i][j]`). The bare spelling is kept
+// as a negative (`a_bare_index_spelling_does_not_tie`).
 use trust_types::*;
 use trust_vcgen::generate_vcs;
 
+fn load(name: &str) -> VerifiableFunction {
+    serde_json::from_str(&std::fs::read_to_string(format!("tests/fixtures/{name}.json")).unwrap())
+        .unwrap()
+}
+
 fn has_len_tie(name: &str) -> bool {
-    let f: VerifiableFunction = serde_json::from_str(
-        &std::fs::read_to_string(format!("tests/fixtures/{name}.json")).unwrap(),
-    )
-    .unwrap();
-    generate_vcs(&f).iter().any(|vc| {
+    func_has_len_tie(&load(name))
+}
+
+fn func_has_len_tie(f: &VerifiableFunction) -> bool {
+    generate_vcs(f).iter().any(|vc| {
         let d = format!("{:?}", vc.formula);
         d.contains("Eq(Var(\"_8\", Int), Var(\"_10\", Int))")
             || d.contains("Eq(Var(\"_10\", Int), Var(\"_8\", Int))")
@@ -48,4 +64,20 @@ fn wrong_index_stays_refutable() {
             && format!("{:?}", vc.formula).contains("Ge(Var(\"k\"")
     });
     assert!(inner, "the `v[i][k]` access keeps a refutable bounds obligation on `k`");
+}
+
+#[test]
+fn a_bare_index_spelling_does_not_tie() {
+    // The SAME shared `&Vec<Vec>` body, with the index calls spelled the old bare
+    // way: `std::ops::Index::index` names no impl (a user `Index` impl renders
+    // under that trait too), so the tie declines.
+    let mut f = load("nest2_shared");
+    for block in &mut f.body.blocks {
+        if let Terminator::Call { func, .. } = &mut block.terminator
+            && func.ends_with("as core::ops::index::Index<usize>>::index")
+        {
+            *func = "std::ops::Index::index".to_string();
+        }
+    }
+    assert!(!func_has_len_tie(&f), "a bare `Index::index` must not tie the two v[i] lengths");
 }

@@ -4,7 +4,7 @@ error: file not found for out-of-line Clean unit `clean_unit_missing_helper`
 LL | clean mod clean_unit_missing_helper;
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
-   = note: `clean mod clean_unit_missing_helper;` loads Clean (Lean) source from `$DIR/clean_unit_missing_helper.clean`, which does not exist
+   = note: `clean mod clean_unit_missing_helper;` loads Clean (Lean) source from `$DIR/clean_unit_missing_helper.clean` (or the same path spelled `.lean`), which does not exist
    = help: options: create the file at that path; name a different file with `#[path = "…"]` on this item; or write the declarations inline as `clean { … }`
 
 error: aborting due to 1 previous error

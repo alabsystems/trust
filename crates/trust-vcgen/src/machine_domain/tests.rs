@@ -10,8 +10,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use super::*;
 use trust_types::Sort;
+
+use super::*;
 
 // ---------------------------------------------------------------------------
 // A concrete two's-complement evaluator over the bit-vector fragment this
@@ -90,8 +91,7 @@ fn eval(formula: &Formula, env: &[(&str, Bits)]) -> Bits {
             let (a, b) = (eval(a, env), eval(b, env));
             assert_eq!((a.width, b.width), (*width, *width));
             // SMT-LIB bvshl: a shift of `width` or more yields zero.
-            let shifted =
-                if b.pattern >= u128::from(*width) { 0 } else { a.pattern << b.pattern };
+            let shifted = if b.pattern >= u128::from(*width) { 0 } else { a.pattern << b.pattern };
             Bits::new(shifted, *width)
         }
         other => panic!("outside the evaluated fragment: {other:?}"),
@@ -138,10 +138,7 @@ fn every_admitted_conversion_preserves_the_mathematical_value() {
                     admitted += 1;
                     for pattern in witnesses(src_width) {
                         let before = Bits::new(pattern, src_width);
-                        let after = eval(
-                            &conversion.apply(var("x", src_width)),
-                            &[("x", before)],
-                        );
+                        let after = eval(&conversion.apply(var("x", src_width)), &[("x", before)]);
                         assert_eq!(
                             after.width, dst_width,
                             "{src:?} -> {dst:?} must land at the target width",
@@ -286,7 +283,10 @@ fn a_shift_amount_at_the_width_is_masked_exactly_as_rustc_masks_it() {
 
     let unmasked = Formula::BvShl(Box::new(var("x", 8)), Box::new(var("k", 8)), 8);
     let without_mask = eval(&unmasked, &[("x", Bits::new(1, 8)), ("k", Bits::new(8, 8))]);
-    assert_eq!(without_mask.pattern, 0, "an unmasked bvshl by the width is zero — the wrong answer");
+    assert_eq!(
+        without_mask.pattern, 0,
+        "an unmasked bvshl by the width is zero — the wrong answer"
+    );
     assert_ne!(with_mask, without_mask, "the mask is what makes this exact");
 
     // Beyond the width, and from a WIDER count than the shifted value: rustc
@@ -304,8 +304,9 @@ fn a_shift_amount_at_the_width_is_masked_exactly_as_rustc_masks_it() {
 fn the_shift_count_resize_matches_rustcs_mask_then_resize_order() {
     for count_width in WIDTHS {
         for value_width in WIDTHS {
-            let ours = shift_amount_resize_and_mask(var("k", count_width), count_width, value_width)
-                .expect("supported widths");
+            let ours =
+                shift_amount_resize_and_mask(var("k", count_width), count_width, value_width)
+                    .expect("supported widths");
             for pattern in witnesses(count_width) {
                 let bound = Bits::new(pattern, count_width);
                 let ours_count = eval(&ours, &[("k", bound)]);
@@ -336,18 +337,16 @@ fn the_shift_count_resize_matches_rustcs_mask_then_resize_order() {
 #[test]
 fn the_join_widens_exactly_and_refuses_every_inexact_meeting() {
     let (joined, from_left, from_right) = join(dom(32, false), dom(64, false)).expect("u32, u64");
-    assert_eq!((joined, from_left, from_right), (
-        dom(64, false),
-        ValueConversion::ZeroExtend(32),
-        ValueConversion::Identity,
-    ));
+    assert_eq!(
+        (joined, from_left, from_right),
+        (dom(64, false), ValueConversion::ZeroExtend(32), ValueConversion::Identity,)
+    );
 
     let (joined, from_left, from_right) = join(dom(32, true), dom(64, true)).expect("i32, i64");
-    assert_eq!((joined, from_left, from_right), (
-        dom(64, true),
-        ValueConversion::SignExtend(32),
-        ValueConversion::Identity,
-    ));
+    assert_eq!(
+        (joined, from_left, from_right),
+        (dom(64, true), ValueConversion::SignExtend(32), ValueConversion::Identity,)
+    );
 
     let (joined, from_left, _) = join(dom(32, false), dom(64, true)).expect("u32, i64");
     assert_eq!((joined, from_left), (dom(64, true), ValueConversion::ZeroExtend(32)));
@@ -375,10 +374,7 @@ fn widening_under_wrapping_arithmetic_would_flip_the_answer() {
         "on the machine `x + 1 > x` is false at u32::MAX",
     );
 
-    let widened = eval(
-        &ValueConversion::ZeroExtend(32).apply(var("x", 32)),
-        &[("x", at_u32_max)],
-    );
+    let widened = eval(&ValueConversion::ZeroExtend(32).apply(var("x", 32)), &[("x", at_u32_max)]);
     let sum_at_64 = Bits::new(widened.pattern + 1, 64);
     assert!(
         sum_at_64.value(false) > widened.value(false),

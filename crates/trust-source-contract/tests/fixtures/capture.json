@@ -1,0 +1,37 @@
+{
+  "schema": "trust-source-contract.actual-function-fixtures.v1",
+  "source": "actual compiler source257b4a678b, identity9794a1ff4346; original immutable13-row selfuse",
+  "compiler_contract_fixture": "Tests reconstruct a typed query fixture with the existing typed-contract converter; these bytes are not an actual exported query capture.",
+  "files": [
+    {
+      "function": "call_vc_laws::correct_true",
+      "file": "correct_true.json",
+      "sha256": "0b81fdb7d26e3d0415b9b15d59c74e4749f33b38ef9a8c77733a81ba9ef2d2b1",
+      "origin": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-WP-FRESH-DRIVER/attempt-20261103T212256574577Z/verifier inputs:actual/units/84b76cd860c7e90096e46292cb31719e38b983f25583e02a811ad364fca3bf33/mir/trust-mir-22b9419694171b92-12f629ce3f903b8d.json"
+    },
+    {
+      "function": "call_vc_laws::parameter_forward",
+      "file": "parameter_forward.json",
+      "sha256": "dbb918000a71971396da9cb7cb9e000b504f57d14dcae5689fd1c2bc08eb8c70",
+      "origin": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-WP-FRESH-DRIVER/attempt-20261103T212256574577Z/verifier inputs:actual/units/84b76cd860c7e90096e46292cb31719e38b983f25583e02a811ad364fca3bf33/mir/trust-mir-1857ebc6abcccd03-5f23ee8fb1251268.json"
+    },
+    {
+      "function": "call_vc_laws::correct",
+      "file": "correct.json",
+      "sha256": "56f2fa641977eee10f202ea8f2d05c36f855cd2dfd7b1d18eaa3bf647b514343",
+      "origin": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-WP-FRESH-DRIVER/attempt-20261103T212256574577Z/verifier inputs:actual/units/84b76cd860c7e90096e46292cb31719e38b983f25583e02a811ad364fca3bf33/mir/trust-mir-e6849a15edd89454-701f70ed15be925f.json"
+    },
+    {
+      "function": "call_vc_laws::wrong",
+      "file": "wrong.json",
+      "sha256": "90a269cfdf423b7d66f7a39e13b2f9d67f3aefe79756ee189def752e3d47d9f2",
+      "origin": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-WP-FRESH-DRIVER/attempt-20261103T212256574577Z/verifier inputs:actual/units/84b76cd860c7e90096e46292cb31719e38b983f25583e02a811ad364fca3bf33/mir/trust-mir-82193f99854e1489-5f7d5f6915174830.json"
+    },
+    {
+      "function": "call_vc_laws::forwarded_correct",
+      "file": "forwarded_correct.json",
+      "sha256": "fa1dcddde7b828e2c508a8b5838bcc652984b8fe91eb79e72166403989ed0b5a",
+      "origin": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-WP-FRESH-DRIVER/attempt-20261103T212256574577Z/verifier inputs:actual/units/84b76cd860c7e90096e46292cb31719e38b983f25583e02a811ad364fca3bf33/mir/trust-mir-3540ca9c389aa0a0-f2e8147180a1e33f.json"
+    }
+  ]
+}

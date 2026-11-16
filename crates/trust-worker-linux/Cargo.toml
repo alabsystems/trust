@@ -1,0 +1,37 @@
+[package]
+name = "trust-worker-linux"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Fail-closed Linux restrictions for an owned untrusted worker"
+
+[workspace]
+
+[dependencies]
+libc = "=0.2.191"
+sha2 = "=0.10.9"
+trust-process-isolation = { path = "../trust-process-isolation" }
+
+[[bin]]
+name = "restriction-fixture"
+path = "src/bin/restriction_fixture.rs"
+
+[features]
+static-fixture = []
+
+[[bin]]
+name = "static-launch-fixture"
+path = "src/bin/static_launch_fixture.rs"
+required-features = ["static-fixture"]
+
+[[bin]]
+name = "native-entry-fixture"
+path = "src/bin/native_entry_fixture.rs"
+required-features = ["static-fixture"]
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "checker-threads-fixture"
+path = "src/bin/checker_threads_fixture.rs"

@@ -1,4 +1,4 @@
-// ignore-tidy-tab
+// ignore-tidy-file-tab
 //@ run-rustfix
 
 #![warn(unused_mut, unused_parens)] // UI tests pass `-A unused`—see Issue #43896
@@ -10,7 +10,7 @@
 #[no_mangle]
 //~^ HELP remove this attribute
 pub fn defiant<T>(_t: T) {}
-//~^ WARN functions generic over types or consts must be mangled
+//~^ ERROR functions generic over types or consts must be mangled
 
 #[no_mangle]
 fn rio_grande() {}
@@ -24,7 +24,7 @@ mod badlands {
     //~| HELP try a static value
     #[allow(dead_code)] // for rustfix
     #[no_mangle] pub fn val_jean<T>() {}
-    //~^ WARN functions generic over types or consts must be mangled
+    //~^ ERROR functions generic over types or consts must be mangled
     //~| HELP remove this attribute
 
     // ... but we can suggest just-`pub` instead of restricted
@@ -33,7 +33,7 @@ mod badlands {
     //~| HELP try a static value
     #[allow(dead_code)] // for rustfix
     #[no_mangle] pub(crate) fn crossfield<T>() {}
-    //~^ WARN functions generic over types or consts must be mangled
+    //~^ ERROR functions generic over types or consts must be mangled
     //~| HELP remove this attribute
 }
 
@@ -51,10 +51,8 @@ fn main() {
         //~| WARN unnecessary parentheses
         //~| HELP remove these parentheses
         // the line after `mut` has a `\t` at the beginning, this is on purpose
-        let mut
-	        b = 1;
-        //~^^ WARN does not need to be mutable
-        //~| HELP remove this `mut`
+        let mut //~ HELP remove this `mut`
+	        b = 1; //~| WARN does not need to be mutable
         let d = Equinox { warp_factor: 9.975 };
         match d {
             #[allow(unused_variables)] // for rustfix

@@ -13,6 +13,31 @@ use crate::range::{signed_max, signed_min, unsigned_max};
 // Individual checks
 // ---------------------------------------------------------------------------
 
+pub(crate) fn collect_known_local_names(func: &VerifiableFunction) -> FxHashSet<&str> {
+    func.body.locals.iter().filter_map(|decl| decl.name.as_deref()).collect()
+}
+
+fn is_known_or_fallback_local(
+    name: &str,
+    known_names: &FxHashSet<&str>,
+    func: &VerifiableFunction,
+) -> bool {
+    if known_names.contains(name) {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix('_') else {
+        return false;
+    };
+    if rest != "0" && (rest.starts_with('0') || !rest.bytes().all(|b| b.is_ascii_digit())) {
+        return false;
+    }
+    let Ok(idx) = rest.parse::<usize>() else {
+        return false;
+    };
+    func.body.locals.get(idx).is_some_and(|decl| decl.index == idx)
+        || func.body.locals.iter().any(|decl| decl.index == idx)
+}
+
 /// Check that all free variables in the formula correspond to function locals.
 ///
 /// The VC generator converts MIR locals to formula variables using their
@@ -23,22 +48,24 @@ pub(crate) fn check_variable_scope(
     func: &VerifiableFunction,
     warnings: &mut Vec<CrossCheckWarning>,
 ) {
-    let free_vars = vc.formula.free_variables();
-    let known_names: FxHashSet<String> = func
-        .body
-        .locals
-        .iter()
-        .map(|decl| decl.name.as_deref().unwrap_or(&format!("_{}", decl.index)).to_string())
-        .collect();
+    let known_names = collect_known_local_names(func);
+    check_variable_scope_with_known(vc, func, &known_names, warnings);
+}
 
-    // Also accept `_N` fallback names and `__slice_len` suffixed names.
-    let fallback_names: FxHashSet<String> =
-        func.body.locals.iter().map(|decl| format!("_{}", decl.index)).collect();
+pub(crate) fn check_variable_scope_with_known(
+    vc: &VerificationCondition,
+    func: &VerifiableFunction,
+    known_names: &FxHashSet<&str>,
+    warnings: &mut Vec<CrossCheckWarning>,
+) {
+    let mut free_vars: FxHashSet<&str> = FxHashSet::default();
+    trust_types::for_each_free_variable_name(&vc.formula, &mut |name| {
+        free_vars.insert(name);
+    });
 
-    for var in &free_vars {
+    for &var in &free_vars {
         // Accept known names, fallback _N names, and slice-len auxiliary vars
-        if known_names.contains(var)
-            || fallback_names.contains(var)
+        if is_known_or_fallback_local(var, known_names, func)
             || var.ends_with("__slice_len")
             || var.starts_with("float_")
         {
@@ -47,19 +74,19 @@ pub(crate) fn check_variable_scope(
 
         // Also accept field-projected names like "_3.0" or "x.1"
         let base = var.split('.').next().unwrap_or(var);
-        if known_names.contains(base) || fallback_names.contains(base) {
+        if is_known_or_fallback_local(base, known_names, func) {
             continue;
         }
 
         // Also accept deref/index projected names like "*x" or "arr[_2]"
         let deref_stripped = var.strip_prefix('*').unwrap_or(var);
         let bracket_base = deref_stripped.split('[').next().unwrap_or(deref_stripped);
-        if known_names.contains(bracket_base) || fallback_names.contains(bracket_base) {
+        if is_known_or_fallback_local(bracket_base, known_names, func) {
             continue;
         }
 
         warnings.push(CrossCheckWarning::UnknownVariable {
-            var_name: var.clone(),
+            var_name: var.to_string(),
             function: vc.function.as_str().to_string(),
         });
     }
@@ -75,7 +102,7 @@ pub(crate) fn check_overflow_bounds(
     warnings: &mut Vec<CrossCheckWarning>,
 ) {
     let (op, (lhs_ty, rhs_ty)) = match &vc.kind {
-        VcKind::ArithmeticOverflow { op, operand_tys } => (*op, operand_tys.clone()),
+        VcKind::ArithmeticOverflow { op, operand_tys } => (*op, operand_tys),
         _ => return,
     };
 
@@ -99,8 +126,9 @@ pub(crate) fn check_overflow_bounds(
     // Scan the formula for Int/UInt literals that should be the bounds.
     let mut found_min = false;
     let mut found_max = false;
+    let unsigned_max_bound = (!signed).then(|| unsigned_max(width));
 
-    vc.formula.visit(&mut |f| {
+    let _ = trust_types::any_formula_node(&vc.formula, &mut |f| {
         match f {
             Formula::Int(n) => {
                 if *n == expected_min {
@@ -110,13 +138,14 @@ pub(crate) fn check_overflow_bounds(
                     found_max = true;
                 }
             }
-            Formula::UInt(n) if !signed && *n == unsigned_max(width) => {
+            Formula::UInt(n) if unsigned_max_bound == Some(*n) => {
                 // Handle u128::MAX case.
                 found_max = true;
             }
             Formula::UInt(_) => {}
             _ => {}
         }
+        found_min && found_max
     });
 
     if !found_min || !found_max {
@@ -145,20 +174,16 @@ pub(crate) fn check_divzero_structure(
         _ => return,
     }
 
-    let mut found_eq_zero = false;
-    vc.formula.visit(&mut |f| {
-        if found_eq_zero {
-            return;
-        }
+    let found_eq_zero = trust_types::any_formula_node(&vc.formula, &mut |f| {
         if let Formula::Eq(lhs, rhs) = f {
             // Check for `var == 0` or `0 == var`.
             let has_zero =
                 matches!(lhs.as_ref(), Formula::Int(0)) || matches!(rhs.as_ref(), Formula::Int(0));
             let has_var = matches!(lhs.as_ref(), Formula::Var(..))
                 || matches!(rhs.as_ref(), Formula::Var(..));
-            if has_zero && has_var {
-                found_eq_zero = true;
-            }
+            has_zero && has_var
+        } else {
+            false
         }
     });
 
@@ -175,7 +200,7 @@ pub(crate) fn check_divzero_structure(
 /// We classify each sub-formula into a SortClass and check that binary
 /// arithmetic and comparison operators have matching operand sorts.
 pub(crate) fn check_sort_consistency(formula: &Formula, warnings: &mut Vec<CrossCheckWarning>) {
-    formula.visit(&mut |f| {
+    trust_types::visit_formula_nodes(formula, &mut |f| {
         match f {
             // Integer arithmetic — both sides should be Int-domain.
             Formula::Add(a, b)
@@ -235,7 +260,7 @@ pub(crate) fn check_degenerate_connectives(
     formula: &Formula,
     warnings: &mut Vec<CrossCheckWarning>,
 ) {
-    formula.visit(&mut |f| match f {
+    trust_types::visit_formula_nodes(formula, &mut |f| match f {
         Formula::And(terms) if terms.len() < 2 => {
             warnings.push(CrossCheckWarning::DegenerateConnective {
                 connective: "And".to_string(),

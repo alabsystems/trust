@@ -2,6 +2,12 @@
 //@ needs-trust-verify
 //@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=on -Cdebuginfo=0
 //@ dont-check-compiler-stderr
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
+// (RE-PINNED 2026-09-14: main's whole-function panic-freedom aggregate is
+// runtime-checked — trust-mc's CHC/PDR transport "solved obligation … without a
+// proof" — and ruling B reports it as an advisory WARN pair. That row is not what
+// this file pins; the annotations above/below are.)
 //! Proof-side companion to the public flip witness. The source precondition,
 //! loop initiation, consecution, and decrease rows must all discharge after the
 //! authenticated mutable loop local and bound parameter are each reconstructed

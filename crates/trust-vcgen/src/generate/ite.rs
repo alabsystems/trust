@@ -31,6 +31,39 @@ pub(super) fn ite_free_equality(var: &Formula, value: &Formula) -> Formula {
     }
 }
 
+/// Count the leaves of a Boolean decision tree without materializing
+/// all accumulated path guards. Refuse at the same case cap as the ordinary
+/// lifting path; conditions with their own Ite use that existing path instead.
+fn boolean_ite_leaves(value: &Formula, cap: usize) -> Option<usize> {
+    if cap == 0 {
+        return None;
+    }
+    match value {
+        Formula::Ite(condition, yes, no) if !formula_contains_ite(condition) => {
+            let yes = boolean_ite_leaves(yes, cap)?;
+            let no = boolean_ite_leaves(no, cap.checked_sub(yes)?)?;
+            yes.checked_add(no)
+        }
+        Formula::Bool(_)
+        | Formula::Var(_, Sort::Bool)
+        | Formula::SymVar(_, Sort::Bool)
+        | Formula::Eq(..)
+        | Formula::Lt(..)
+        | Formula::Le(..)
+        | Formula::Gt(..)
+        | Formula::Ge(..)
+        | Formula::Not(_)
+        | Formula::And(_)
+        | Formula::Or(_)
+        | Formula::Implies(..)
+            if !formula_contains_ite(value) =>
+        {
+            Some(1)
+        }
+        _ => None,
+    }
+}
+
 /// Conjoin two guards, dropping a trivially-true operand.
 pub(super) fn and_guard(a: Formula, b: Formula) -> Formula {
     match (a, b) {
@@ -54,6 +87,9 @@ pub(super) fn guarded(guard: Formula, conclusion: Formula) -> Formula {
 /// unchanged (fail-open). A leaf / opaque term (Var, Int, a BV/Fp node, …) is a
 /// single guardless case.
 pub(super) fn term_ite_cases(term: &Formula, cap: usize) -> Option<Vec<(Formula, Formula)>> {
+    if cap >= 1 && !formula_contains_ite(term) {
+        return Some(vec![(Formula::Bool(true), term.clone())]);
+    }
     match term {
         Formula::Ite(cond, then_v, else_v) => {
             let cond_free = eliminate_term_ites(cond, cap);
@@ -126,6 +162,9 @@ pub(super) fn lift_relation_ites(
     cap: usize,
     mk: impl Fn(Formula, Formula) -> Formula,
 ) -> Formula {
+    if !formula_contains_ite(a) && !formula_contains_ite(b) {
+        return mk(a.clone(), b.clone());
+    }
     let (Some(a_cases), Some(b_cases)) = (term_ite_cases(a, cap), term_ite_cases(b, cap)) else {
         // Too many cases — leave the relation (with its Ite) unchanged (fail-open).
         return mk(a.clone(), b.clone());
@@ -143,12 +182,36 @@ pub(super) fn lift_relation_ites(
     Formula::And(conj)
 }
 
+fn lift_relation_ites_owned(
+    a: Formula,
+    b: Formula,
+    cap: usize,
+    mk: impl Fn(Formula, Formula) -> Formula,
+) -> Formula {
+    if !formula_contains_ite(&a) && !formula_contains_ite(&b) {
+        return mk(a, b);
+    }
+    let (Some(a_cases), Some(b_cases)) = (term_ite_cases(&a, cap), term_ite_cases(&b, cap)) else {
+        return mk(a, b);
+    };
+    if a_cases.len() == 1 && b_cases.len() == 1 {
+        return mk(a, b);
+    }
+    let mut conj = Vec::with_capacity(a_cases.len() * b_cases.len());
+    for (ga, va) in &a_cases {
+        for (gb, vb) in &b_cases {
+            let guard = and_guard(ga.clone(), gb.clone());
+            conj.push(guarded(guard, mk(va.clone(), vb.clone())));
+        }
+    }
+    Formula::And(conj)
+}
+
 /// Cheap check: does `formula` contain an `Ite` anywhere (any position)? Used to
 /// skip `eliminate_term_ites` (which rebuilds the tree) for the common `Ite`-free
-/// VC. Robust across every variant via `Formula::children`.
+/// VC. Robust across every variant via `any_formula_node`.
 pub(super) fn formula_contains_ite(formula: &Formula) -> bool {
-    matches!(formula, Formula::Ite(..))
-        || formula.children().iter().any(|c| formula_contains_ite(c))
+    trust_types::any_formula_node(formula, &mut |node| matches!(node, Formula::Ite(..)))
 }
 
 /// GENERAL term-`Ite` elimination: rewrite a formula so no `Ite` appears in TERM
@@ -162,6 +225,9 @@ pub(super) fn formula_contains_ite(formula: &Formula) -> bool {
 /// `Ite` is its guarded case-split), so verdict-preserving and sound; fail-open
 /// past `ITE_ELIM_CASE_CAP` (leaves the `Ite`, exactly today's behavior).
 pub(super) fn eliminate_term_ites(formula: &Formula, cap: usize) -> Formula {
+    if !formula_contains_ite(formula) {
+        return formula.clone();
+    }
     match formula {
         Formula::Not(a) => Formula::Not(Box::new(eliminate_term_ites(a, cap))),
         Formula::And(xs) => Formula::And(xs.iter().map(|x| eliminate_term_ites(x, cap)).collect()),
@@ -185,6 +251,19 @@ pub(super) fn eliminate_term_ites(formula: &Formula, cap: usize) -> Formula {
             ])
         }
         Formula::Eq(a, b) => {
+            // Keep a Boolean decision tree nested. Flattening its
+            // cases repeats every prefix guard, making a linear switch chain
+            // quadratic in the number of labels. The existing nested encoding
+            // is the same equality, with each condition represented once per
+            // decision; the original case cap still applies.
+            for (variable, value) in [(a.as_ref(), b.as_ref()), (b.as_ref(), a.as_ref())] {
+                if matches!(variable, Formula::Var(_, Sort::Bool) | Formula::SymVar(_, Sort::Bool))
+                    && matches!(value, Formula::Ite(..))
+                    && boolean_ite_leaves(value, cap).is_some()
+                {
+                    return ite_free_equality(variable, value);
+                }
+            }
             lift_relation_ites(a, b, cap, |x, y| Formula::Eq(Box::new(x), Box::new(y)))
         }
         Formula::Lt(a, b) => {
@@ -203,5 +282,64 @@ pub(super) fn eliminate_term_ites(formula: &Formula, cap: usize) -> Formula {
         // returned unchanged (fail-open — never introduces a term-Ite, never
         // changes meaning).
         _ => formula.clone(),
+    }
+}
+
+/// Owned counterpart to [`eliminate_term_ites`]: moves `Ite`-free sibling
+/// subtrees in place without cloning AST nodes when only a small portion of a
+/// conjunction/disjunction contains `Formula::Ite`.
+pub(super) fn eliminate_term_ites_owned(formula: Formula, cap: usize) -> Formula {
+    if !formula_contains_ite(&formula) {
+        return formula;
+    }
+    match formula {
+        Formula::Not(a) => Formula::Not(Box::new(eliminate_term_ites_owned(*a, cap))),
+        Formula::And(xs) => {
+            Formula::And(xs.into_iter().map(|x| eliminate_term_ites_owned(x, cap)).collect())
+        }
+        Formula::Or(xs) => {
+            Formula::Or(xs.into_iter().map(|x| eliminate_term_ites_owned(x, cap)).collect())
+        }
+        Formula::Implies(a, b) => Formula::Implies(
+            Box::new(eliminate_term_ites_owned(*a, cap)),
+            Box::new(eliminate_term_ites_owned(*b, cap)),
+        ),
+        Formula::Forall(vars, body) => {
+            Formula::Forall(vars, Box::new(eliminate_term_ites_owned(*body, cap)))
+        }
+        Formula::Exists(vars, body) => {
+            Formula::Exists(vars, Box::new(eliminate_term_ites_owned(*body, cap)))
+        }
+        Formula::Ite(cond, then_f, else_f) => {
+            let cond_free = eliminate_term_ites_owned(*cond, cap);
+            Formula::And(vec![
+                guarded(cond_free.clone(), eliminate_term_ites_owned(*then_f, cap)),
+                guarded(Formula::Not(Box::new(cond_free)), eliminate_term_ites_owned(*else_f, cap)),
+            ])
+        }
+        Formula::Eq(a, b) => {
+            for (variable, value) in [(a.as_ref(), b.as_ref()), (b.as_ref(), a.as_ref())] {
+                if matches!(variable, Formula::Var(_, Sort::Bool) | Formula::SymVar(_, Sort::Bool))
+                    && matches!(value, Formula::Ite(..))
+                    && boolean_ite_leaves(value, cap).is_some()
+                {
+                    return ite_free_equality(variable, value);
+                }
+            }
+            lift_relation_ites_owned(*a, *b, cap, |x, y| Formula::Eq(Box::new(x), Box::new(y)))
+        }
+        Formula::Lt(a, b) => {
+            lift_relation_ites_owned(*a, *b, cap, |x, y| Formula::Lt(Box::new(x), Box::new(y)))
+        }
+        Formula::Le(a, b) => {
+            lift_relation_ites_owned(*a, *b, cap, |x, y| Formula::Le(Box::new(x), Box::new(y)))
+        }
+        Formula::Gt(a, b) => {
+            lift_relation_ites_owned(*a, *b, cap, |x, y| Formula::Gt(Box::new(x), Box::new(y)))
+        }
+        Formula::Ge(a, b) => {
+            lift_relation_ites_owned(*a, *b, cap, |x, y| Formula::Ge(Box::new(x), Box::new(y)))
+        }
+        other => other,
     }
 }

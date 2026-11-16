@@ -207,42 +207,31 @@ impl SpecMiner {
     pub fn extract_preconditions(&self, test: &TestCase) -> Vec<String> {
         let mut preconds = Vec::new();
 
-        // Check for panic-expecting assertions => negated panic is a precondition
+        // Check for panic-expecting or error assertions in a single pass
+        let mut has_error_assertion = false;
         for assertion in &test.assertions {
-            if assertion.kind == AssertionKind::Panics && !assertion.expression.is_empty() {
-                preconds.push(format!("!({})", assertion.expression));
+            if assertion.kind == AssertionKind::Panics {
+                has_error_assertion = true;
+                if !assertion.expression.is_empty() {
+                    preconds.push(format!("!({})", assertion.expression));
+                }
+            } else if assertion.kind == AssertionKind::IsErr {
+                has_error_assertion = true;
             }
         }
 
-        // Infer non-zero preconditions from inputs when test expects errors
-        let has_error_assertion = test
-            .assertions
-            .iter()
-            .any(|a| a.kind == AssertionKind::Panics || a.kind == AssertionKind::IsErr);
-
-        if has_error_assertion {
-            for (idx, input) in test.inputs.iter().enumerate() {
+        // Infer non-zero, positivity, and non-empty list preconditions from inputs in one pass
+        for (idx, input) in test.inputs.iter().enumerate() {
+            if has_error_assertion {
                 if input.is_zero() {
                     preconds.push(format!("param_{idx} != 0"));
                 }
-            }
-        }
-
-        // Infer positivity from input values
-        for (idx, input) in test.inputs.iter().enumerate() {
-            if let Some(val) = input.as_i64()
-                && val > 0
-                && !has_error_assertion
-            {
-                preconds.push(format!("param_{idx} > 0"));
-            }
-        }
-
-        // Non-empty list preconditions
-        for (idx, input) in test.inputs.iter().enumerate() {
-            if let TestValue::List(items) = input
+            } else if let Some(val) = input.as_i64() {
+                if val > 0 {
+                    preconds.push(format!("param_{idx} > 0"));
+                }
+            } else if let TestValue::List(items) = input
                 && !items.is_empty()
-                && !has_error_assertion
             {
                 preconds.push(format!("param_{idx}.len() > 0"));
             }

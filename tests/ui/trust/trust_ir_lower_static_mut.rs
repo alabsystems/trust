@@ -1,6 +1,14 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory -Ztrust-verify-timeout-ms=2000
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
+// The 2 s per-obligation budget (default 20 s) removes most of this file's
+// cost, because some engine runs out the budget on an obligation it cannot
+// decide. It is safe: every per-function verdict was measured identical at
+// 0.5 s, 2 s and 20 s (2026-09-23, 96f2019566). No verdict annotations here: this file
+// is in the scorecard's frozen [in-pool] sample, which admits no annotated file.
 //! Trust (wave-SM): a LOCAL `static mut` is a MUTABLE module global — the same
 //! `GlobalAddr` an immutable static gets, with `mutable: true` and its address
 //! in the `&mut` ledger — so a read is a `Load`, `C = v` / `C += v` are

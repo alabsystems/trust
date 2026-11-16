@@ -29,6 +29,7 @@ fn two_recursive_calls_with_decreases() -> VerifiableFunction {
             span: call_span(line),
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("test::two_calls"),
             is_foreign: false,
             atomic: None,
         },
@@ -59,6 +60,7 @@ fn two_recursive_calls_with_decreases() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

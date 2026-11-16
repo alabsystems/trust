@@ -7,6 +7,12 @@
 // point of the ratification.  Compile a second, test-only instance instead: the assertions below
 // exercise the exact frozen implementation, including its private canonicalizer, evaluator,
 // marker walk, and local-write helper, without changing the production blob.
+//
+// `allow(dead_code)`: this instance exists only for the tests below, so the production entry
+// points (`compare_derived` and everything only it reaches) are never called HERE, by
+// construction. Dead code in the real module is still reported, by the `lib` build of
+// `mir_differential.rs`, which carries no such allow.
+#[allow(dead_code)]
 mod frozen_oracle {
     // `include!` cannot accept another module's leading `//!` comments.  The build script changes
     // only that contiguous comment prefix to ordinary `//` comments in OUT_DIR; every production
@@ -41,6 +47,7 @@ mod frozen_oracle {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
         })
     }
 

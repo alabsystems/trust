@@ -226,6 +226,8 @@ pub struct Cache {
 #[cfg(test)]
 #[derive(Debug)]
 pub struct ExecutedStep {
+    // Trust: actual completed key, including steps without graph metadata.
+    pub step: Box<dyn Any>,
     pub metadata: Option<crate::core::builder::StepMetadata>,
 }
 
@@ -249,7 +251,9 @@ impl Cache {
         #[cfg(test)]
         {
             let metadata = step.metadata();
-            self.executed_steps.borrow_mut().push(ExecutedStep { metadata });
+            self.executed_steps
+                .borrow_mut()
+                .push(ExecutedStep { step: Box::new(step.clone()), metadata });
         }
 
         stepcache.insert(step, value);
@@ -270,6 +274,11 @@ impl Cache {
 
 #[cfg(test)]
 impl Cache {
+    // Trust: expose execution order to tests without consuming or mutating the cache.
+    pub(crate) fn executed_steps(&self) -> std::cell::Ref<'_, [ExecutedStep]> {
+        std::cell::Ref::map(self.executed_steps.borrow(), |steps| steps.as_slice())
+    }
+
     pub(crate) fn inspect_all_steps_of_type<S: Step, T: Ord>(
         &self,
         map_fn: impl Fn(&S, &S::Output) -> T,
@@ -289,7 +298,7 @@ impl Cache {
     }
 
     #[cfg(test)]
-    pub fn into_executed_steps(mut self) -> Vec<ExecutedStep> {
+    pub fn into_executed_steps(self) -> Vec<ExecutedStep> {
         mem::take(&mut self.executed_steps.borrow_mut())
     }
 }

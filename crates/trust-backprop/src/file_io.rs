@@ -796,17 +796,4 @@ mod tests {
             other => panic!("expected UnsafePath for symbolic pseudo-path, got {other:?}"),
         }
     }
-
-    #[test]
-    fn test_file_rewrite_result_fields() {
-        let result = FileRewriteResult {
-            path: "test.rs".into(),
-            original: "fn foo() {}".into(),
-            modified: "#[requires(\"true\")]\nfn foo() {}".into(),
-            rewrite_count: 1,
-        };
-        assert_eq!(result.path, "test.rs");
-        assert_ne!(result.original, result.modified);
-        assert_eq!(result.rewrite_count, 1);
-    }
 }

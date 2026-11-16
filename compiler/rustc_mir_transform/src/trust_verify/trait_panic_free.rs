@@ -21,6 +21,9 @@
 //! * **(c) reliance** — see `generic_call_relies_on_panic_free_contract`. Only
 //!   sound when the impl set that can reach the call is closed; the gate is
 //!   local trait + whole-program artifact, the `dyn_trait_sealedness` precedent.
+//!   A FOREIGN trait (D4 increment B) is closed by enumeration instead:
+//!   `foreign_trait_closure` re-derives every foreign impl in a whole-program
+//!   artifact, generic call shape only.
 //!
 //! **Safety only, deliberately.** Φ must NOT include termination. Soundness of
 //! (c) given (a)+(b) is the innermost-frame argument: a panic is raised by an
@@ -38,7 +41,8 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use rustc_data_structures::fx::FxHashMap;
+use rustc_ast::attr::AttributeExt;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
 use rustc_middle::mir::trust_proof::{TrustObligationKind, TrustProofStrength, TrustStatus};
 use rustc_middle::ty::{self, TyCtxt};
@@ -46,9 +50,8 @@ use rustc_span::Span;
 use rustc_span::def_id::DefId;
 
 use super::{
-    artifacts_have_unproved_assumption_panic, artifacts_spend_a_user_assumed_total_axiom,
-    collect_verification_artifacts_cached_after_decision, crate_types_are_whole_program,
-    item_has_trust_attr, item_has_trust_skip_attr, verdict_rests_on_user_axiom,
+    PremiseArtifacts, collect_premise_artifacts_cached, crate_types_are_whole_program,
+    item_has_trust_attr, item_has_trust_skip_attr, transport_rows_have_unproved_assumption_panic,
 };
 
 /// The tool-attribute spelling of Φ. `#[trust::panic_free]`.
@@ -138,6 +141,11 @@ fn item_span(tcx: TyCtxt<'_>, def_id: DefId) -> Span {
 /// diverge, and its own termination verdict is reported by its own lane —
 /// unchanged, unsuppressed, and still fatal under strict policy.
 fn obligation_is_safety(kind: TrustObligationKind) -> bool {
+    // Trust (TINV, 2026-10-05): `TypeInvariant` deliberately stays on the safety side,
+    // fail-closed: an undischarged TINV row withholds D(i). Step 7 decided that a dropped
+    // Houdini conjunct is a note, never a row (TINV-9(c)), and since step 7.7 the kernel
+    // kind gate admits a situated TINV row; no TINV row reaches this pass until step 9
+    // wires the pre-pass into the compiler.
     !matches!(kind, TrustObligationKind::NonTermination | TrustObligationKind::Liveness)
 }
 
@@ -213,6 +221,171 @@ pub(crate) fn instance_discharges_panic_freedom<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::InstanceKind<'tcx>,
 ) -> Result<(), String> {
+    instance_discharges_panic_freedom_modulo(tcx, instance, &NoExcuse)
+}
+
+/// Trust (D1 increment 1, 2026-09-25): which unproved rows a caller of the evidence
+/// bar may EXCUSE. The absolute bar passes [`NoExcuse`] and is byte-for-byte the
+/// bar it always was; the writer-relative bar (`fmt_writer_relative`) passes an
+/// excuse for its formatter's writer edges and nothing else.
+///
+/// ONE implementation of the bar, with the excuse plugged in — never a copy. A
+/// hand-copied ledger is exactly how a conjunct gets silently dropped, and the
+/// writer-relative bar must keep every conjunct but the one it relaxes.
+///
+/// An excuse may only EXCUSE rows; it cannot grant anything else. Every other
+/// conjunct (results present, arrays aligned, summary derived, no-row vacuity,
+/// the assumption-root gate) is evaluated identically under every excuse.
+pub(crate) trait RowExcuse {
+    /// Conjunct 3: is every unproved assumption-panic row of this body's transport
+    /// rows excused? The implementation decides how folded sites are judged;
+    /// [`NoExcuse`] answers exactly `!transport_rows_have_unproved_assumption_panic`.
+    fn assumption_panic_rows_excused(
+        &self,
+        transport_results: &[trust_types::TransportObligationResult],
+    ) -> bool;
+    /// Conjunct 4: may this UNPROVED safety disposition be excused? `vc_kind` is
+    /// the kind of its row-aligned verification condition, or `None` when the
+    /// disposition array is not aligned with the artifact rows (an excuse must
+    /// then refuse). The kind, not the VC: an already-verified body's artifact
+    /// slot keeps no VC formulas (`super::CachedArtifacts`).
+    fn disposition_excused(
+        &self,
+        vc_kind: Option<&trust_types::VcKind>,
+        disposition: &rustc_middle::mir::trust_proof::TrustDisposition,
+    ) -> bool;
+    /// Trust (OD-1, 2026-10-04, open shapes): conjunct 5 — may the verdict be one
+    /// that is CONDITIONAL on this body's own instance hypotheses
+    /// (`instance_hypothesis_verdicts`)? Only the instance-RELATIVE bar
+    /// ([`InstanceRelative`]) answers yes; every other excuse keeps the default, so
+    /// no absolute premise lane can ever spend a hypothesis-carrying verdict. The
+    /// user-axiom census and the runtime-checked std member decline are NOT relaxed
+    /// by this answer.
+    fn admits_instance_hypothesis_verdict(&self) -> bool {
+        false
+    }
+}
+
+/// Trust (OD-1, 2026-10-04, open shapes): the instance-RELATIVE bar. Every row
+/// conjunct is [`NoExcuse`]'s; only conjunct 5's instance-hypothesis decline is
+/// relaxed, because the one consumer (`instance_hypothesis::record_root_hypotheses`,
+/// admitting a still-generic call to a hypothesis-carrying local body) publishes
+/// that body's hypotheses, substituted, as its OWN `assumption:instance-hypothesis`
+/// rows: the premise is spent only as a named premise of a body that is itself
+/// conditional (design §2.2, "still generic → the substituted hypothesis joins
+/// H_g"), never as a panic-freedom fact.
+pub(crate) struct InstanceRelative;
+
+impl RowExcuse for InstanceRelative {
+    fn assumption_panic_rows_excused(
+        &self,
+        transport_results: &[trust_types::TransportObligationResult],
+    ) -> bool {
+        NoExcuse.assumption_panic_rows_excused(transport_results)
+    }
+
+    fn disposition_excused(
+        &self,
+        vc_kind: Option<&trust_types::VcKind>,
+        disposition: &rustc_middle::mir::trust_proof::TrustDisposition,
+    ) -> bool {
+        NoExcuse.disposition_excused(vc_kind, disposition)
+    }
+
+    fn admits_instance_hypothesis_verdict(&self) -> bool {
+        true
+    }
+}
+
+/// The absolute bar: nothing is excused.
+pub(crate) struct NoExcuse;
+
+impl RowExcuse for NoExcuse {
+    fn assumption_panic_rows_excused(
+        &self,
+        transport_results: &[trust_types::TransportObligationResult],
+    ) -> bool {
+        !transport_rows_have_unproved_assumption_panic(transport_results)
+    }
+
+    fn disposition_excused(
+        &self,
+        _vc_kind: Option<&trust_types::VcKind>,
+        _disposition: &rustc_middle::mir::trust_proof::TrustDisposition,
+    ) -> bool {
+        false
+    }
+}
+
+/// [`instance_discharges_panic_freedom`] with `excuse` plugged into conjuncts 3
+/// and 4. See [`RowExcuse`].
+pub(crate) fn instance_discharges_panic_freedom_modulo<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::InstanceKind<'tcx>,
+    excuse: &dyn RowExcuse,
+) -> Result<(), String> {
+    // Trust (2026-09-08, MEASURED on first-party/ty's vendored `rowan`): this
+    // premise is asked from INSIDE a body's own verification — the structural-drop
+    // lane asks it for every `Drop` terminator — and a `Drop` edge is invisible to
+    // the Call-only callgraph that `trust_mir_mutually_recursive_functions` walks.
+    // rowan's `impl Drop for ThinArc { fn drop { let _ = Arc::from_thin(ThinArc{..}) } }`
+    // is the shape: `drop`'s pass asks for `from_thin`'s optimized MIR (a callee
+    // summary; no Call-graph cycle, so allowed), `from_thin`'s cleanup path DROPS a
+    // `ThinArc`, this lane asked `trust_proof_results(Item(drop))` while `drop`'s
+    // `optimized_mir` was still on the query stack, and rustc answered with
+    // `error[E0391]: cycle detected` — a hard error under every policy, in a
+    // dependency crate the user does not own. The in-progress ancestor set already
+    // knows `drop` is live; consult it BEFORE the query, exactly as the callee-summary
+    // lanes do, and DECLINE: the drop keeps its obligation (a completeness cost),
+    // the crate compiles. Pinned by
+    // `tests/ui/trust/drop_reenters_its_own_conversion_no_query_cycle.rs`.
+    if let ty::InstanceKind::Item(def_id) = instance {
+        if super::optimized_mir_query_would_cycle(tcx, def_id) {
+            return Err("the body's optimized MIR is being computed up this very stack (its own \
+                 verification reached a callee whose drop re-enters it); asking for its proof \
+                 results here would be an E0391 query cycle, so the premise is declined and \
+                 the drop keeps its obligation"
+                .to_string());
+        }
+    }
+    // The same protection for every other `InstanceKind` (drop glue and the other
+    // shims carry no `DefId` the ancestor set could hold): this lane never asks for
+    // an instance it is already asking about further up the stack.
+    let key = format!("{instance:?}");
+    let reentrant = PANIC_FREEDOM_PREMISE_IN_PROGRESS.with(|s| !s.borrow_mut().insert(key.clone()));
+    if reentrant {
+        return Err(
+            "the premise for this instance is already being evaluated up this stack (its own \
+             verification reached a drop of the same type); a re-entrant answer would be a \
+             query cycle, so the premise is declined"
+                .to_string(),
+        );
+    }
+    let out = instance_discharges_panic_freedom_inner(tcx, instance, excuse);
+    if let Err(reason) = &out
+        && std::env::var_os("TRUST_PF_BAR_TRACE").is_some()
+    {
+        eprintln!("[PF_BAR] declined instance={instance:?}: {reason}");
+    }
+    PANIC_FREEDOM_PREMISE_IN_PROGRESS.with(|s| {
+        s.borrow_mut().remove(&key);
+    });
+    out
+}
+
+thread_local! {
+    /// `InstanceKind`s whose panic-freedom premise is being evaluated up this
+    /// thread's stack, keyed by their `Debug` rendering (an `InstanceKind<'tcx>`
+    /// cannot live in a `'static` cell). See `instance_discharges_panic_freedom`.
+    static PANIC_FREEDOM_PREMISE_IN_PROGRESS: std::cell::RefCell<FxHashSet<String>> =
+        std::cell::RefCell::new(FxHashSet::default());
+}
+
+fn instance_discharges_panic_freedom_inner<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::InstanceKind<'tcx>,
+    excuse: &dyn RowExcuse,
+) -> Result<(), String> {
     let Some(results) = tcx.trust_proof_results(instance) else {
         return Err(
             "the verifier produced no proof results for this body (it was skipped, cycled, or \
@@ -228,17 +401,36 @@ pub(crate) fn instance_discharges_panic_freedom<'tcx>(
         );
     }
     let body = tcx.instance_mir(instance);
-    let Some(artifacts) = collect_verification_artifacts_cached_after_decision(tcx, body) else {
+    // The premise view, not the full artifact: an already-verified callee answers
+    // from its compact slot instead of re-running its whole verification.
+    let Some(artifacts): Option<PremiseArtifacts> = collect_premise_artifacts_cached(tcx, body)
+    else {
         return Err(
             "the body produced no verification artifacts, so its obligation ledger could not be \
              inspected"
                 .to_string(),
         );
     };
-    if artifacts_have_unproved_assumption_panic(&artifacts) {
+    // Trust (D1 increment 1): conjunct 3 through the excuse. `NoExcuse` answers
+    // exactly `!transport_rows_have_unproved_assumption_panic(..)`.
+    if !excuse.assumption_panic_rows_excused(artifacts.transport_results()) {
         return Err(
             "the body carries an unproved absent-callee/drop-glue panic obligation; a call it \
              cannot prove panic-free keeps the whole body unable to discharge the contract"
+                .to_string(),
+        );
+    }
+    // Trust (2026-09-29): NOT excusable by any `RowExcuse`. A body whose native
+    // bundle kept a bundled std member under the runtime-checked disposition owes a
+    // `runtime_checked` row for that member's internal Asserts — rows that live in
+    // the published transport set, not in `dispositions`, so the row loop below
+    // cannot see them. Read off the artifacts directly (conjunct 5's census says
+    // the same thing keyed by `DefId`; this also covers a non-`Item` instance).
+    if artifacts.has_runtime_checked_std_member() {
+        return Err(
+            "the body's verdict is conditional on a bundled std/core/alloc member's own runtime \
+             check (a member Assert no row discharged, published as `runtime_checked`), so it \
+             is not panic-free on its own"
                 .to_string(),
         );
     }
@@ -251,13 +443,21 @@ pub(crate) fn instance_discharges_panic_freedom<'tcx>(
     // only view a caller gets of a body it does not own — for a dependency body it
     // is never surfaced as its own diagnostic.
     let mut blockers: Vec<String> = Vec::new();
-    for disposition in results.dispositions.iter() {
+    // Trust (D1 increment 1): the dispositions are built one per `artifacts.results`
+    // row (`build_proof_results`); an excuse is offered the row's VC kind only when the
+    // two arrays are the same length, and must refuse otherwise.
+    let rows_aligned = results.dispositions.len() == artifacts.row_count();
+    for (index, disposition) in results.dispositions.iter().enumerate() {
         if !obligation_is_safety(disposition.kind) {
             continue;
         }
         safety_rows += 1;
         let proved = matches!(disposition.status, TrustStatus::Trusted | TrustStatus::Certified)
             && disposition.strength != TrustProofStrength::None;
+        let row_kind = if rows_aligned { artifacts.row_kind(index) } else { None };
+        if !proved && excuse.disposition_excused(row_kind, disposition) {
+            continue;
+        }
         if !proved {
             undischarged += 1;
             // `TrustDisposition` carries kind/status/strength only — no description
@@ -280,13 +480,13 @@ pub(crate) fn instance_discharges_panic_freedom<'tcx>(
         // such a body is verified as a premise query and never surfaces its own
         // diagnostic, so this string is the only channel out.
         let mut detail: Vec<String> = Vec::new();
-        for (vc, _) in artifacts.results.iter() {
+        for kind in (0..artifacts.row_count()).filter_map(|index| artifacts.row_kind(index)) {
             if matches!(
-                vc.kind,
+                kind,
                 trust_types::VcKind::HardenedBoundary { .. }
                     | trust_types::VcKind::UnsupportedMir { .. }
             ) {
-                let d: String = format!("{:?}", vc.kind).chars().take(120).collect();
+                let d: String = format!("{kind:?}").chars().take(120).collect();
                 if !detail.contains(&d) {
                     detail.push(d);
                 }
@@ -303,9 +503,30 @@ pub(crate) fn instance_discharges_panic_freedom<'tcx>(
             }
         ));
     }
+    if std::env::var_os("TRUST_PF_BAR_TRACE").is_some() {
+        eprintln!(
+            "[PF_BAR] instance={instance:?} safety_rows={safety_rows} dispositions={:?} \
+             transport_rows={} native_vacuously_clean={}",
+            results.dispositions.iter().map(|d| (d.kind, d.status, d.strength)).collect::<Vec<_>>(),
+            artifacts.transport_results().len(),
+            artifacts.native_run_is_vacuously_clean(),
+        );
+    }
+    // Trust (2026-10-09, review round 93): an unresolved INDIRECT call (a `fn`
+    // pointer or other open dispatch) has no transport row and no disposition, so
+    // no conjunct above sees it, while strict verification refuses the body for it
+    // (`function_has_unresolved_indirect_call`, the same test the reporter uses).
+    // Measured: the closure `|c: char| p(c)` over `p: fn(char) -> bool` has an
+    // empty ledger and a vacuously clean native run, and this bar credited it, so
+    // three compiler-total grants treated the call that runs it as total.
+    if super::function_has_unresolved_indirect_call(tcx, body) {
+        return Err(
+            "the body makes an unresolved indirect call, whose callee nothing verified".to_string()
+        );
+    }
     if safety_rows == 0
         && results.dispositions.is_empty()
-        && !artifacts.full_verification.as_ref().is_some_and(super::native_run_is_vacuously_clean)
+        && !artifacts.native_run_is_vacuously_clean()
     {
         return Err(
             "the body produced no obligation rows at all and the native run did not independently \
@@ -332,10 +553,15 @@ pub(crate) fn instance_discharges_panic_freedom<'tcx>(
     // `InstanceKind::def_id()` is the one accessor every variant carries, so the
     // structural-drop lane's resolved destructor keys the census exactly as an
     // ordinary `Item` does.
-    let axiom_reason = verdict_rests_on_user_axiom(tcx.sess, instance.def_id()).or_else(|| {
+    let axiom_reason = super::verdict_rests_on_user_axiom_for(
+        tcx.sess,
+        instance.def_id(),
+        excuse.admits_instance_hypothesis_verdict(),
+    )
+    .or_else(|| {
         // The IN-BAND witness of the same fact: an axiom that did leave a row is
         // refused from this body's own ledger, without relying on the census.
-        artifacts_spend_a_user_assumed_total_axiom(&artifacts).then_some(
+        artifacts.spends_a_user_assumed_total_axiom().then_some(
             "its own ledger records a `#[trust::assume_total]` axiom being spent, so the verdict \
              is conditional on a declaration nobody proved",
         )
@@ -347,7 +573,160 @@ pub(crate) fn instance_discharges_panic_freedom<'tcx>(
              from an axiom and the caller would end up carrying no obligation at all"
         ));
     }
+    // (6) Trust (OD-1 open-shapes adversarial review, 2026-10-05): THE BODY TRIPS NO
+    // INDIRECT-CALL GATE. That gate (`function_has_unresolved_indirect_call`) is a
+    // refusal, not a row: a body calling through a fn pointer to code nobody here
+    // verified publishes only a `native-verification-gap` `unknown` row, which is not
+    // a safety disposition, so conjuncts 1-4 read its ledger as clean. MEASURED on
+    // stage 1 of 1177c327fa (probe p5): `impl Tr for Boom { fn m(&self) -> u32 { let
+    // p: fn(u32, u32) -> u32 = u32::div_euclid; p(100, self.0) } }` was refused by
+    // strict as its own root, yet `helper::<Boom>`'s instance-discharge row for it
+    // read `proved`; a closure of that shape discharged `apply::<{closure}>` the
+    // same way. Every premise lane ends here, so the conjunct is stated once, for
+    // every excuse: a body its own gate refuses is not panic-free on its own.
+    if super::function_has_unresolved_indirect_call(tcx, body) {
+        return Err("the body calls through a fn pointer or callable whose target nobody in \
+             this compilation verified (it trips the indirect-call gate), so its own \
+             verification is refused and its ledger cannot stand for the call"
+            .to_string());
+    }
     Ok(())
+}
+
+/// Trust (2026-10-19, DISCHARGE-NO-EVIDENCE-1): after [`instance_discharges_panic_freedom`]
+/// REFUSED `instance`, does that refusal rest on nothing but what this compilation did
+/// not model? `true` only when the body's own ledger holds no evidence that it can
+/// panic: no refuted safety row, no unproved safety row of a kind that could hide a
+/// violation (an assertion, overflow, bounds or panic-freedom VC left undecided, a
+/// held refutation included), no Level-0 refutation class by kind
+/// (`L0RefutationClass::of_kind`), no recorded open-dispatch refutation, no drop-glue,
+/// expected-absent or extern-call assumption-panic row, no conditional verdict (a user
+/// axiom, an argument premise, a type-invariant premise, an instance hypothesis, a
+/// `requires` the body is verified under: `row_kind_carries_no_violation_evidence`)
+/// and no runtime-checked std member. What is left is the honest "not proved": generic absent
+/// callees and unsupported MIR, an unsafe block declared sound on its `// SAFETY:`
+/// comment (its own `assumption:safety-comment` row discloses it), and the gates that
+/// refuse a body for what nobody verified (an unresolved indirect call, an empty
+/// ledger).
+///
+/// WHY. The instance discharge (`instance_hypothesis::discharge_instance`) published
+/// every refusal of a LOCAL callee as `failed`, with the bare `trust-classifier`
+/// solver, so `FailureBasis` read it `refuted` — a found violation — and the advisory
+/// `--allow-l0-gaps` gate failed on it, although the callee's own rows were
+/// `unknown`/`runtime_checked` gaps the same gate tolerates. MEASURED on the aterm
+/// consumer check of the Trust 0.11.0 cut (`20565c3255a`, 2026-10-19, `targo trust
+/// build --allow-l0-gaps -p aterm`): `Gate: FAIL` on two such rows, the closures
+/// `|| { unsafe { adopt_startup_bridge_lanes() }? .. }` and `|why| aterm_log::info!("{why}")`,
+/// whose own Level 0 summaries read `0 failed, 1 unknown, 1 runtime-checked` and
+/// `0 failed, 3 unknown, 1 runtime-checked`. The design (docs/design/
+/// 2026-10-03-open-generic-dispatch-obligations.md §2.2) says the discharge row takes
+/// the callee instance's existing verdict, `unknown` included.
+///
+/// DIRECTION. This only lets the caller publish `unknown` (not established) in place
+/// of `failed` for such a refusal; every fail-closed lane errors on both
+/// (`report_unestablished_discharges`), no row gains credit, and every answer this
+/// function cannot give with certainty is `false` (the refusal stays `failed`). It
+/// never re-enters: the bar's own guards are asked first. It is not a second copy of
+/// the bar: whether a premise is credited is still decided only by
+/// [`instance_discharges_panic_freedom`].
+pub(crate) fn refusal_carries_no_violation_evidence<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::InstanceKind<'tcx>,
+) -> bool {
+    if let ty::InstanceKind::Item(def_id) = instance
+        && super::optimized_mir_query_would_cycle(tcx, def_id)
+    {
+        return false;
+    }
+    let key = format!("{instance:?}");
+    if PANIC_FREEDOM_PREMISE_IN_PROGRESS.with(|s| s.borrow().contains(&key)) {
+        return false;
+    }
+    let Some(results) = tcx.trust_proof_results(instance) else {
+        return false;
+    };
+    if !results.has_aligned_obligation_arrays() || results.recompute_summary() != results.summary {
+        return false;
+    }
+    let body = tcx.instance_mir(instance);
+    let Some(artifacts): Option<PremiseArtifacts> = collect_premise_artifacts_cached(tcx, body)
+    else {
+        return false;
+    };
+    if artifacts.has_runtime_checked_std_member() || artifacts.spends_a_user_assumed_total_axiom() {
+        return false;
+    }
+    // Every conditional verdict but a `// SAFETY:` declaration keeps `failed`. A declared
+    // block's premise is disclosed by the body's own `assumption:safety-comment` row
+    // (SAFETY-ASSUME-1), which the gate counts `assumed`; its unmodeled operations
+    // published no row an engine could refute.
+    let conditional =
+        super::verdict_rests_on_user_axiom_admitting(tcx.sess, instance.def_id(), false, true);
+    if conditional.is_some() {
+        return false;
+    }
+    // A class (c) row (open, uncontracted dispatch) is an absent-callee row by its text;
+    // the body's recorded refutations are what tell it apart.
+    let def_id = instance.def_id();
+    let refuted_open_dispatch = super::with_crate_verification_state(tcx.sess, |state| {
+        state.open_dispatch_refuted_callees.get(&def_id).is_some_and(|set| !set.is_empty())
+    });
+    if refuted_open_dispatch {
+        return false;
+    }
+    if artifacts.transport_results().iter().any(|row| {
+        super::transport_row_is_unproved_assumption_panic(row)
+            && !super::transport_row_is_unproved_absent_callee(row)
+    }) {
+        return false;
+    }
+    if results.dispositions.len() != artifacts.row_count() {
+        return false;
+    }
+    results.dispositions.iter().enumerate().all(|(index, disposition)| {
+        if !obligation_is_safety(disposition.kind) {
+            return true;
+        }
+        let proved = matches!(disposition.status, TrustStatus::Trusted | TrustStatus::Certified)
+            && disposition.strength != TrustProofStrength::None;
+        proved
+            || (!matches!(disposition.status, TrustStatus::Failed)
+                && artifacts.row_kind(index).is_some_and(row_kind_carries_no_violation_evidence))
+    })
+}
+
+/// An unproved row of this kind says only that something was not modeled: a generic
+/// absent callee (`[trust-absent-callee-assumption]`, either spelling), or an
+/// `UnsupportedMir` row that is no Level-0 refutation class and no round-tripped
+/// full-verification obligation. Every other kind is a formula some engine could refute,
+/// so leaving it unproved is not evidence-free.
+///
+/// A `FullVerification::<ApiKind>` row (`VcKind::FULL_VERIFICATION_KIND_PREFIX`, minted
+/// by `legacy_unsupported_kind_detail`) is the native lane's own obligation carried as
+/// `UnsupportedMir` only because the legacy lane has no kind for it: an assertion, a
+/// postcondition, a temporal claim, or the `requires` the body is verified under
+/// (`FullVerification::Precondition` with a `contract_id`, the `assumption:requires`
+/// entry row). That is a claim or a premise, not unmodeled MIR. A callee proved only
+/// under its own `requires` is conditional on a clause the instance's caller never
+/// established: `f<T: Td>(t: &T) { t.m(0) }` at `<Bad as Td>::m`, `requires x != 0 {
+/// 100 / x }`, divides by zero, and that discharge is the only `failed` row on the
+/// `f::<Bad>` path (`instance_hypothesis/trait_impl_requires_reached_through_instance.rs`,
+/// ADVISORY-REQUIRES-INSTANCE), so it stays `failed`. Only the lane's own unmodeled-MIR
+/// kind, `FullVerification::trust.vc::unsupported_mir`, says nothing was modeled.
+fn row_kind_carries_no_violation_evidence(kind: &trust_types::VcKind) -> bool {
+    if trust_types::l0_refutation::L0RefutationClass::of_kind(kind, |_| false).is_some() {
+        return false;
+    }
+    if trust_types::l0_refutation::absent_callee_name(kind).is_some() {
+        return true;
+    }
+    match kind {
+        trust_types::VcKind::UnsupportedMir { kind: api_kind, .. } => {
+            !api_kind.starts_with(trust_types::VcKind::FULL_VERIFICATION_KIND_PREFIX)
+                || api_kind == "FullVerification::trust.vc::unsupported_mir"
+        }
+        _ => false,
+    }
 }
 
 /// One impl (or default) body that inherited Φ. Emits the failure AT THE IMPL.
@@ -606,11 +985,57 @@ pub(crate) fn discharge_trait_panic_free_contracts(tcx: TyCtxt<'_>) {
 /// closing that needs the per-crate discharge seal plus the deferred
 /// link-closure obligation, which is not built here and must not be assumed.
 ///
+/// Trust (2026-10-04): the WHOLE-PROGRAM bullet is one route of three since
+/// 2026-09-20 (`local_trait_certificate`); an rlib passes when `T` is not
+/// exported or `super::private_supertrait_seals` holds (DEP-SEAL-1 narrowed
+/// the latter to supertraits no downstream type can satisfy), and neither route
+/// is taken in a crate that defines a def-site-hygienic macro
+/// (`super::crate_defines_def_site_macro`, 2026-10-05).
+///
 /// UNLIKE rung 2 this does NOT enumerate the impls at the call site, and it
 /// therefore accepts blanket and generic impls — each of those discharged
 /// polymorphically at its own definition, which is exactly what makes the
 /// forwarding impl `impl<S: T> T for W<S>` provable at all.
+///
+/// Trust (D4 increment B, 2026-09-25): a FOREIGN trait is served by a different
+/// argument — `foreign_trait_closure`, which DOES enumerate: in a whole-program
+/// artifact, at a generic call whose `Self` is `Sized`, it re-derives every
+/// foreign dispatch target in this compilation and relies on this crate's own
+/// discharge for its local impls. `shape` is what that arm reads; the
+/// local-trait certificate below ignores it and is byte-for-byte unchanged.
 pub(crate) fn generic_call_relies_on_panic_free_contract(
+    tcx: TyCtxt<'_>,
+    callee_def_id: DefId,
+    shape: super::foreign_trait_closure::RelianceShape,
+) -> bool {
+    if !trait_method_declares_panic_free(tcx, callee_def_id) {
+        return false;
+    }
+    let Some(trait_def_id) = tcx.trait_of_assoc(callee_def_id) else {
+        return false;
+    };
+    // Completeness: only a locally-declared trait has had EVERY impl that can
+    // exist checked by this compilation. A foreign one must have them ENUMERATED
+    // and re-derived instead (D4 increment B) — never taken on the dependency's
+    // word, which rmeta does not carry and this compilation would not believe.
+    if !trait_def_id.is_local() {
+        return super::foreign_trait_closure::foreign_impl_set_rederived_panic_free(
+            tcx,
+            trait_def_id,
+            callee_def_id,
+            shape,
+            super::foreign_trait_closure::ClosureRung::PanicFreeContract,
+        );
+    }
+    local_trait_certificate(tcx, callee_def_id, trait_def_id)
+}
+
+/// The LOCAL-trait half of [`generic_call_relies_on_panic_free_contract`], for a
+/// caller that must not enumerate or force anything: the adversarial-refutation
+/// LABEL (`adversarially_refutable_open_dispatch_callees`) reads it. `false` for
+/// every foreign trait — exactly the answer the whole predicate gave one before
+/// D4 increment B.
+pub(crate) fn local_trait_relies_on_panic_free_contract(
     tcx: TyCtxt<'_>,
     callee_def_id: DefId,
 ) -> bool {
@@ -620,12 +1045,50 @@ pub(crate) fn generic_call_relies_on_panic_free_contract(
     let Some(trait_def_id) = tcx.trait_of_assoc(callee_def_id) else {
         return false;
     };
-    // Completeness: only a locally-declared trait has had EVERY impl that can
-    // exist checked by this compilation.
-    if !trait_def_id.is_local() {
+    trait_def_id.is_local() && local_trait_certificate(tcx, callee_def_id, trait_def_id)
+}
+
+/// The local-trait certificate: closed world, no specializing override. The body
+/// of [`generic_call_relies_on_panic_free_contract`] before D4 increment B, moved
+/// verbatim; its callers have already established that `callee_def_id` declares
+/// Φ and belongs to `trait_def_id`.
+fn local_trait_certificate(tcx: TyCtxt<'_>, callee_def_id: DefId, trait_def_id: DefId) -> bool {
+    // Trust (2026-09-20): the CLOSED-WORLD question, all three routes.
+    //
+    // This gated on `crate_types_are_whole_program` alone while the doc above
+    // said it reuses `dyn_trait_sealedness`'s route "verbatim rather than
+    // reinvented". It is not verbatim: that is a three-way disjunction
+    // (`whole_program || not_exported || private_supertrait_seals`) and two
+    // routes were dropped in the reuse. Both dropped routes are closed-world by
+    // LANGUAGE VISIBILITY — a downstream crate cannot name a non-exported trait
+    // to implement it, nor satisfy a CLOSED private supertrait — so they hold in
+    // an rlib exactly as in an executable, and `w8` already rails the
+    // non-exported route green for the `dyn` lane in a library.
+    //
+    // Trust (2026-10-04, DEP-SEAL-1): "cannot satisfy a private supertrait" was
+    // false as the third disjunct asked it (`has_private_supertrait`: the
+    // supertrait is merely not exported). A private `Sealed` with
+    // `impl<X: ?Sized> Sealed for X` (or `for Box<X>`, `for &X`), a private
+    // trait alias or auto trait, or a generic `T<P>` (`impl a::T<Local> for
+    // a::Good`) all let a downstream crate implement `T`, and this rung
+    // certified `f<K: T>` over Φ in an rlib whose downstream impl panicked. The
+    // shared helper now asks `private_supertrait_seals`, rules (a)–(d), so this
+    // rung inherits the fix; `tests/open-dispatch-ladder/w14_*_phi_*` rail it.
+    //
+    // Trust (2026-10-05, DEP-SEAL-1 macro-2.0 residual): "cannot name" is false too
+    // when the crate defines a def-site-hygienic macro (`pub macro seal($t:ty) {
+    // impl private::Sealed for $t {} }`): a downstream invocation resolves the
+    // macro's paths here, with this crate's privacy. The shared helper drops both
+    // language-visibility routes then (`crate_defines_def_site_macro`), so this rung
+    // inherits that as well; `tests/open-dispatch-ladder/w14_macro2_*` rail it.
+    //
+    // The blanket-impl refusal stays OUT of the shared helper on purpose: it is
+    // rung 2's enumerability premise, and this rung does not enumerate (see the
+    // doc above), which is exactly what lets it accept the forwarding impl.
+    let Some(trait_local) = trait_def_id.as_local() else {
         return false;
-    }
-    if !crate_types_are_whole_program(tcx) {
+    };
+    if !super::trait_impl_set_is_closed_world(tcx, trait_def_id, trait_local) {
         return false;
     }
     // Completeness, specialization: with a specializing `default fn` in an IMPL

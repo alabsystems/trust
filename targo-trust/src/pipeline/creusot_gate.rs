@@ -57,15 +57,23 @@
 //! Fail-closed is preserved where it still means something: a manifest that
 //! cannot be inspected is a setup error, not a pass.
 //!
-//! This is the same boundary shape as the Kani gate (`kani_gate::gate_build`),
-//! applied to the Creusot dependency family.
+//! This is the same boundary shape as the Kani gate
+//! (`kani_gate::disclose_after_compile`), applied to the Creusot dependency
+//! family. Both `check` and `build` run it, through
+//! `pipeline::disclose_zero_authority_ingestion_lanes` (TRUST-26).
 
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const UNVERIFIED_CREUSOT_SPECS: &str = "its Creusot/pearlite specs were NOT examined and carry NO proof authority. Creusot is a zero-authority ingestion lane (two-language design v5, §3.2): outside the Creusot toolchain the attribute surface (`#[requires]` / `#[ensures]` / `#[logic]`) expands to no-ops and trustc does not import it. A reader now exists for the supported subset: run tippy — lint `trust_creusot_spec_sugar` — for machine-applicable rewrites of boolean/comparison/machine-arithmetic clauses (plus `old()` on immutable by-value parameters and `result`) into native `requires`/`ensures` signature clauses; every unsupported attribute is disclosed per attribute with its blocker (Int-relaxed quantifiers stay DEFERRED per the R4 §2 doctrine). Do not read a successful build as a discharged Creusot proof; run `targo trust check` for the verdicts Trust actually stands behind";
+const UNVERIFIED_CREUSOT_SPECS: &str = "its Creusot/pearlite specs were NOT examined and carry NO proof authority. Creusot is a zero-authority ingestion lane (two-language design v5, §3.2): outside the Creusot toolchain the attribute surface (`#[requires]` / `#[ensures]` / `#[logic]`) expands to no-ops and trustc does not import it. A reader now exists for the supported subset: run tippy — lint `trust_creusot_spec_sugar` — for machine-applicable rewrites of boolean/comparison/machine-arithmetic clauses (plus `old()` on immutable by-value parameters and `result`) into native `requires`/`ensures` signature clauses; every unsupported attribute is disclosed per attribute with its blocker (Int-relaxed quantifiers stay DEFERRED per the R4 §2 doctrine).";
+
+/// What `build` adds after [`UNVERIFIED_CREUSOT_SPECS`].
+const UNVERIFIED_CREUSOT_SPECS_BUILD_TAIL: &str = "Do not read a successful build as a discharged Creusot proof; run `targo trust check` for the verdicts Trust actually stands behind";
+
+/// What `check` adds after [`UNVERIFIED_CREUSOT_SPECS`].
+const UNVERIFIED_CREUSOT_SPECS_CHECK_TAIL: &str = "A PASS from this check covers only the obligations trustc itself verified; it is not a Creusot verdict";
 
 /// Cargo package names that constitute the Creusot spec-surface opt-in. A
 /// dependency on any of them (directly, renamed via `package = "..."`, in a
@@ -78,10 +86,11 @@ fn is_creusot_family_package(name: &str) -> bool {
     CREUSOT_FAMILY.contains(&name)
 }
 
-/// Post-build disclosure gate folded into `targo trust build`.
+/// Post-compile disclosure gate run by both `targo trust check` and
+/// `targo trust build` (via `pipeline::disclose_zero_authority_ingestion_lanes`).
 ///
-/// A failed build is returned immediately without resolving packages. On a
-/// successful build, every selected package manifest is inspected; a package
+/// A failed run is returned immediately without resolving packages. On a
+/// successful run, every selected package manifest is inspected; a package
 /// that declares a Creusot-family dependency (directly, renamed via
 /// `package = "creusot-contracts"`, in a target-specific section, or through a
 /// workspace-inherited alias) gets a prominent disclosure on stderr — naming
@@ -93,51 +102,64 @@ fn is_creusot_family_package(name: &str) -> bool {
 /// authority, so there is no verdict to soften. What changed is that the
 /// operator is now told, rather than the build being refused for spelling its
 /// sugar (the module docs carry the verified three-point inertness argument).
-pub(crate) fn gate_build(build_result: ExitCode, args: &[String]) -> ExitCode {
-    if build_result != ExitCode::SUCCESS {
-        return build_result;
+pub(crate) fn disclose_after_compile(
+    verb: super::CompileVerb,
+    result: ExitCode,
+    args: &[String],
+) -> ExitCode {
+    if result != ExitCode::SUCCESS {
+        return result;
     }
+    let verb_name = verb.as_str();
 
     let package_roots = match super::resolve_cargo_gate_package_roots(args) {
         Ok(Some(roots)) => roots,
-        Ok(None) => return build_result,
+        Ok(None) => return result,
         Err(error) => {
             eprintln!(
-                "targo trust build: Creusot gate could not resolve selected packages: {error}"
+                "targo trust {verb_name}: Creusot gate could not resolve selected packages: {error}"
             );
             return ExitCode::from(2);
         }
     };
 
     for root in package_roots {
-        match boundary_disclosure_for(&root) {
+        match boundary_disclosure_for(verb, &root) {
             Ok(None) => {}
             Ok(Some(disclosure)) => {
                 eprintln!("{disclosure}");
             }
             Err(error) => {
                 eprintln!(
-                    "targo trust build: Creusot gate could not inspect {} before applying the \
-                     unverified-spec boundary: {error}",
+                    "targo trust {verb_name}: Creusot gate could not inspect {} before applying \
+                     the unverified-spec boundary: {error}",
                     root.display()
                 );
                 return ExitCode::from(2);
             }
         }
     }
-    build_result
+    result
 }
 
 /// The per-package boundary outcome: detection DISCLOSES (returns the line to
 /// print) rather than rejecting; an uninspectable manifest is still an error
-/// (fail-closed where it still means something). Extracted from `gate_build`
+/// (fail-closed where it still means something). Extracted from `disclose_after_compile`
 /// so the disclose-not-reject flip is pinnable by test.
-fn boundary_disclosure_for(root: &Path) -> Result<Option<String>, String> {
+fn boundary_disclosure_for(
+    verb: super::CompileVerb,
+    root: &Path,
+) -> Result<Option<String>, String> {
+    let tail = match verb {
+        super::CompileVerb::Check => UNVERIFIED_CREUSOT_SPECS_CHECK_TAIL,
+        super::CompileVerb::Build => UNVERIFIED_CREUSOT_SPECS_BUILD_TAIL,
+    };
     match manifest_declares_creusot_dependency(root) {
         Ok(false) => Ok(None),
         Ok(true) => Ok(Some(format!(
-            "targo trust build: warning: {} declares a Creusot-family dependency — \
-             {UNVERIFIED_CREUSOT_SPECS}",
+            "targo trust {}: warning: {} declares a Creusot-family dependency — \
+             {UNVERIFIED_CREUSOT_SPECS} {tail}",
+            verb.as_str(),
             root.display()
         ))),
         Err(error) => Err(error),
@@ -350,7 +372,11 @@ mod tests {
     #[test]
     fn creusot_gate_preserves_a_failed_build_without_resolving_packages() {
         assert_eq!(
-            gate_build(ExitCode::from(9), &["-p".to_string(), "missing".to_string()]),
+            disclose_after_compile(
+                super::super::CompileVerb::Build,
+                ExitCode::from(9),
+                &["-p".to_string(), "missing".to_string()]
+            ),
             ExitCode::from(9)
         );
     }
@@ -375,14 +401,23 @@ mod tests {
             "[package]\nname='p'\nversion='0.1.0'\n[dependencies]\ncreusot-contracts='0.4'\n",
         )
         .expect("write manifest");
-        let disclosure = boundary_disclosure_for(temp.path())
-            .expect("inspect manifest")
-            .expect("detection must survive the amendment — the disclosure depends on it");
-        assert!(disclosure.contains("warning"), "a disclosure, not a rejection: {disclosure}");
-        assert!(
-            !disclosure.contains("rejected"),
-            "the reject wording must not survive the flip: {disclosure}"
-        );
+        for verb in [super::super::CompileVerb::Check, super::super::CompileVerb::Build] {
+            let disclosure = boundary_disclosure_for(verb, temp.path())
+                .expect("inspect manifest")
+                .expect("detection must survive the amendment — the disclosure depends on it");
+            assert!(disclosure.contains("warning"), "a disclosure, not a rejection: {disclosure}");
+            assert!(
+                !disclosure.contains("rejected"),
+                "the reject wording must not survive the flip: {disclosure}"
+            );
+            // TRUST-26: the disclosure names the verb that actually ran and
+            // carries the shared lane statement either way.
+            assert!(
+                disclosure.starts_with(&format!("targo trust {}: warning:", verb.as_str())),
+                "{disclosure}"
+            );
+            assert!(disclosure.contains(UNVERIFIED_CREUSOT_SPECS), "{disclosure}");
+        }
     }
 
     /// v7/D3: the disclosure must carry the fix. A reader now exists, so the
@@ -404,8 +439,9 @@ mod tests {
              {UNVERIFIED_CREUSOT_SPECS}"
         );
         assert!(
-            UNVERIFIED_CREUSOT_SPECS.contains("targo trust check"),
-            "the disclosure must point at the verified lane: {UNVERIFIED_CREUSOT_SPECS}"
+            UNVERIFIED_CREUSOT_SPECS_BUILD_TAIL.contains("targo trust check"),
+            "the build disclosure must point at the verified lane: \
+             {UNVERIFIED_CREUSOT_SPECS_BUILD_TAIL}"
         );
     }
 
@@ -415,7 +451,7 @@ mod tests {
     fn an_uninspectable_manifest_still_fails_closed() {
         let temp = tempfile::tempdir().expect("empty dir");
         assert!(
-            boundary_disclosure_for(temp.path()).is_err(),
+            boundary_disclosure_for(super::super::CompileVerb::Check, temp.path()).is_err(),
             "a missing manifest must be an error, not a silent pass"
         );
     }

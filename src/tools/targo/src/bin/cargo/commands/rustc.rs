@@ -1,5 +1,5 @@
 use crate::command_prelude::*;
-use cargo::ops;
+use targo::ops;
 
 const PRINT_ARG_NAME: &str = "print";
 const CRATE_TYPE_ARG_NAME: &str = "crate-type";
@@ -46,7 +46,7 @@ pub fn cli() -> Command {
         .arg_parallel()
         .arg_release("Build artifacts in release mode, with optimizations")
         .arg_profile("Build artifacts with the specified profile")
-        .arg_target_triple("Target triple which compiles will be for")
+        .arg_target_tuple("Target tuple which compiles will be for")
         .arg_target_dir()
         .arg_unit_graph()
         .arg_timings()
@@ -91,7 +91,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
     }
 
     let crate_types = {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::util::data_structures::HashSet::default();
         args.get_many::<String>(CRATE_TYPE_ARG_NAME)
             .into_iter()
             .flatten()

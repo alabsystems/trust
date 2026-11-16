@@ -1,0 +1,12 @@
+note: Clean island kernel-checked: 13 declaration(s) registered (min2, le_self, ge_self, ne_zero, all_refl, imp_self', conj, or_left, not_false', iff_self', pair, id', id'_eq)
+  --> $DIR/clean_island_lexical_unicode.rs:17:9
+   |
+LL | /         def min2 (a : UInt64) (b : UInt64) : UInt64 := if a < b then a else b
+LL | |         theorem le_self (n : Nat) : n ≤ n := Nat.le_refl n
+LL | |         theorem ge_self (n : Nat) : n ≥ n := Nat.le_refl n
+LL | |         theorem ne_zero : (1 : Nat) ≠ 0 := by decide
+...  |
+LL | |         def id' (a : UInt64) : UInt64 := a
+LL | |         theorem id'_eq (h' : 0 = 0) (a : UInt64) : id' a = a := rfl
+   | |___________________________________________________________________^
+

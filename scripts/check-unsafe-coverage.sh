@@ -30,7 +30,8 @@ HOST="$("$REPO"/build/*/stage2/bin/trustc -vV 2>/dev/null | sed -n 's/^host: //p
 HOST="${HOST:-aarch64-apple-darwin}"
 T="$REPO/build/$HOST/stage2/bin/trustc"
 DEMOS="$REPO/examples/unsafe-coverage"
-export DYLD_LIBRARY_PATH="/opt/homebrew/opt/llvm/lib:/opt/homebrew/opt/z3/lib:/opt/homebrew/opt/zstd/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+BREW_PREFIX="${TRUST_BREW_PREFIX:-$(brew --prefix 2>/dev/null || echo /opt/homebrew)}"
+export DYLD_LIBRARY_PATH="$BREW_PREFIX/opt/llvm/lib:$BREW_PREFIX/opt/z3/lib:$BREW_PREFIX/opt/zstd/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
 [ -x "$T" ] || { echo "no stage2 trustc at $T — run ./x.py build --stage 2"; exit 1; }
 
@@ -79,12 +80,22 @@ expect_caught target_feature_call_caught.rs   "--edition 2021" "unsafe:unmodeled
 
 echo "== discriminating controls (must NOT be flagged) =="
 expect_clean  target_feature_call_caught.rs   "--edition 2021" "unsafe:unmodeled-call"        "caller_with_feature"
-# aterm's real mmap.rs: HIGH-2 proved, and NO spurious unsafe-call/union/static flags
+# aterm's real mmap.rs as a false-positive control: NO spurious union/static/
+# layout flags. (Whether HIGH-2 is *proved* here is NOT asserted — see
+# docs/high2-obligation-demo.md for the layered blockers.)
 run aterm_mmap_real_source.rs "--edition 2021"
-for tag in "unsafe:union-field" "unsafe:mutable-static" "unsafe:layout-constrained-field"; do
-  if echo "$OUT" | grep -q "$tag"; then echo "  FAIL  aterm real mmap: spurious $tag"; fail=1
-  else echo "  PASS  aterm real mmap: no spurious $tag"; fi
-done
+ROWS="$(echo "$OUT" | grep -c '"type":"function_result"')"
+case "$ROWS" in ''|*[!0-9]*) ROWS=0 ;; esac
+if [ "$ROWS" -eq 0 ]; then
+  # no rows => fixture did not compile or emitted nothing; a control that never
+  # ran proves nothing (same guard as expect_clean above)
+  echo "  FAIL  aterm real mmap: no function_result rows in aterm_mmap_real_source.rs"; fail=1
+else
+  for tag in "unsafe:union-field" "unsafe:mutable-static" "unsafe:layout-constrained-field"; do
+    if echo "$OUT" | grep -q "$tag"; then echo "  FAIL  aterm real mmap: spurious $tag"; fail=1
+    else echo "  PASS  aterm real mmap: no spurious $tag"; fi
+  done
+fi
 
 [ "$fail" = 0 ] && echo "ALL UNSAFE-COVERAGE CHECKS PASSED" || echo "SOME CHECKS FAILED"
 exit "$fail"

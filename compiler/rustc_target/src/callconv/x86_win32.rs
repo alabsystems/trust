@@ -1,4 +1,4 @@
-use rustc_abi::{Align, HasDataLayout, Reg, TyAbiInterface};
+use rustc_abi::{Align, Float, HasDataLayout, Primitive, Reg, RegKind, TyAbiInterface};
 
 use crate::callconv::FnAbi;
 use crate::spec::HasTargetSpec;
@@ -25,7 +25,11 @@ pub(crate) fn compute_abi_info<'a, Ty, C>(
             // GCC used to apply the SysV rule here, breaking windows-gnu's ABI, but was fixed:
             // - reported in https://gcc.gnu.org/bugzilla/show_bug.cgi?id=82028
             // - fixed in https://gcc.gnu.org/bugzilla/show_bug.cgi?id=85667
-            if t.abi_return_struct_as_int || opts.reg_struct_return {
+            if let Some(Float::F16) = fn_abi.ret.layout.complex_float(cx) {
+                // `_Complex _Float16` is returned as `<2 x half>`.
+                let kind = RegKind::Vector { hint_vector_elem: Primitive::Float(Float::F16) };
+                fn_abi.ret.cast_to(Reg { kind, size: fn_abi.ret.layout.size });
+            } else if t.abi_return_struct_as_int || opts.reg_struct_return {
                 match fn_abi.ret.layout.size.bytes() {
                     1 => fn_abi.ret.cast_to(Reg::i8()),
                     2 => fn_abi.ret.cast_to(Reg::i16()),
@@ -67,9 +71,9 @@ pub(crate) fn compute_abi_info<'a, Ty, C>(
             //   on stack (via `byval`). For example, this includes `double`, `int64_t`,
             //   and structs containing them, provided they lack an explicit alignment attribute.
             assert!(
-                arg.layout.align.abi >= max_repr_align,
+                arg.layout.align >= max_repr_align,
                 "abi alignment {:?} less than requested alignment {max_repr_align:?}",
-                arg.layout.align.abi,
+                arg.layout.align,
             );
             arg.make_indirect();
         } else if arg.layout.is_aggregate() {

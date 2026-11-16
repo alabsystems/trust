@@ -19,10 +19,8 @@
 //! unsupported statement, yields `false`. It never reports an impure function as
 //! pure.
 
-use std::collections::HashSet;
-
-use crate::structural_termination::terminator_successors;
-use crate::{BasicBlock, BlockId, Place, Projection, Statement, Terminator, VerifiableFunction};
+use crate::structural_termination::all_reachable_blocks;
+use crate::{BasicBlock, Place, Projection, Statement, Terminator, VerifiableFunction};
 
 /// Whether a written place reaches memory OUTSIDE the current stack frame — i.e.
 /// through a `Deref` projection (a `&mut`, a raw pointer, or a `static`'s
@@ -76,7 +74,7 @@ fn is_pure_intrinsic(name: &str) -> bool {
     PURE_INTRINSICS.iter().any(|p| name.contains(p))
 }
 
-fn statement_is_effectful(stmt: &Statement) -> bool {
+pub(crate) fn statement_is_effectful(stmt: &Statement) -> bool {
     match stmt {
         Statement::Assign { place, .. }
         | Statement::SetDiscriminant { place, .. }
@@ -98,7 +96,7 @@ fn statement_is_effectful(stmt: &Statement) -> bool {
 /// memory clobber), so it fails closed. Ordinary `Call` effects are the
 /// all-callees composition and `Drop`'s destructor effect defers to it / a
 /// deeper lane, so neither is an OWN effect here.
-fn terminator_is_effectful(t: &Terminator) -> bool {
+pub(crate) fn terminator_is_effectful(t: &Terminator) -> bool {
     matches!(t, Terminator::Opaque { .. })
 }
 
@@ -106,31 +104,10 @@ fn terminator_is_effectful(t: &Terminator) -> bool {
 /// effect (see the module docs). An empty block list fails closed.
 #[must_use]
 pub fn blocks_have_no_reachable_own_effect(blocks: &[BasicBlock]) -> bool {
-    let Some(entry) = blocks.first().map(|b| b.id) else {
-        return false;
-    };
-    let by_id: std::collections::HashMap<BlockId, &BasicBlock> =
-        blocks.iter().map(|b| (b.id, b)).collect();
-
-    let mut seen: HashSet<BlockId> = HashSet::new();
-    seen.insert(entry);
-    let mut stack = vec![entry];
-    while let Some(bid) = stack.pop() {
-        let Some(block) = by_id.get(&bid) else {
-            continue;
-        };
-        if block.stmts.iter().any(statement_is_effectful)
-            || terminator_is_effectful(&block.terminator)
-        {
-            return false;
-        }
-        for s in terminator_successors(&block.terminator) {
-            if seen.insert(s) {
-                stack.push(s);
-            }
-        }
-    }
-    true
+    all_reachable_blocks(blocks, |block| {
+        !block.stmts.iter().any(statement_is_effectful)
+            && !terminator_is_effectful(&block.terminator)
+    })
 }
 
 /// [`blocks_have_no_reachable_own_effect`] over a whole function body — one sound
@@ -144,7 +121,7 @@ pub fn is_structurally_pure(func: &VerifiableFunction) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Operand, Rvalue, SourceSpan, Terminator};
+    use crate::{BlockId, Operand, Rvalue, SourceSpan, Terminator};
 
     fn block(id: usize, stmts: Vec<Statement>, t: Terminator) -> BasicBlock {
         BasicBlock { id: BlockId(id), stmts, terminator: t }

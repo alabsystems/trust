@@ -97,6 +97,7 @@ fn zero_await_resume_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

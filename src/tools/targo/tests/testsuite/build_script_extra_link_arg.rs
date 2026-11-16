@@ -219,7 +219,7 @@ fn cdylib_link_arg_transitive() {
 ...
 [COMPILING] bar v1.0.0 ([ROOT]/foo/bar)
 [RUNNING] `rustc --crate-name build_script_build --edition=2015 bar/build.rs [..]
-[RUNNING] `[ROOT]/foo/target/debug/build/bar-[HASH]/build-script-build`
+[RUNNING] `[ROOT]/foo/target/debug/build/bar/[HASH]/out/build_script_build`
 [WARNING] bar@1.0.0: cargo::rustc-link-arg-cdylib was specified in the build script of bar v1.0.0 \
 ([ROOT]/foo/bar), but that package does not contain a cdylib target
 
@@ -266,6 +266,9 @@ fn link_arg_transitive_not_allowed() {
 
                 [dependencies]
                 bar = "1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -274,12 +277,15 @@ fn link_arg_transitive_not_allowed() {
     p.cargo("build -v")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ * [new ref]         HEAD       -> origin/HEAD
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
 [COMPILING] bar v1.0.0
 [RUNNING] `rustc --crate-name build_script_build [..]
-[RUNNING] `[ROOT]/foo/target/debug/build/bar-[HASH]/build-script-build`
+[RUNNING] `[ROOT]/foo/target/debug/build/bar/[HASH]/out/build_script_build`
 [RUNNING] `rustc --crate-name bar [..]
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [RUNNING] `rustc --crate-name foo --edition=2015 src/lib.rs [..]
@@ -437,7 +443,7 @@ fn cdylib_both_forms() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [RUNNING] `rustc --crate-name build_script_build [..]
-[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
+[RUNNING] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/build_script_build`
 [RUNNING] `rustc --crate-name foo [..]--crate-type cdylib [..]-C link-arg=--bogus-flag-one -C link-arg=--bogus-flag-two[..]
 ...
 "#]])

@@ -200,3 +200,41 @@ Its safe twin `proved/grid_unmerged_loopvar_index.rs` — same nested loops, sam
 `y * 3 + x`, no merge — must stay green throughout, so a fix can be told apart
 from a blanket refusal. The fixture's own header records the near-neighbour
 shapes that do NOT reproduce it, which is the search space a fix has to explain.
+
+## Two gated mutants that score `incomplete` by design (OD-1)
+
+`mutant/absent_callee_call_only_generic.rs` and
+`mutant/trait_default_body_generic_caller.rs` print **UNCAUGHT MUTANT:
+verification was incomplete** since OD-1 phase 1 (`c77d7678cf`, 2026-10-04).
+Their calls are admitted open generic dispatch, so each site mints an
+`assumption:instance-hypothesis` row, and certify refuses with `Trust certify
+verification failed … 1 instance hypothesis row(s) — … assumed, not proved`.
+That header is an INCOMPLETENESS refusal: nothing was refuted, and with no
+concrete instance in the crate there is no counterexample to exhibit. The default
+and strict policies exit 0 with a warning (the crate's result is CONDITIONAL).
+
+Until 2026-10-06 the classifier did not know the `certify` word and scored both
+rows `tool-error`. It now scores them `incomplete`. The word is in the
+incompleteness predicate only: adding it to the counterexample predicate would
+pass the mutant lane on an assumption refusal, which is the laundering the
+2026-07-30 `refuted`/`incomplete` split exists to prevent
+(`classify_verdict_test.sh` pins both halves). The rows stay in the gated lane
+and keep the gate red. Moving them out would shrink the mutation denominator to
+turn the gate green (docs/DECISION_QUEUE.md FALSIF-OD1-VOCAB).
+
+## The static-accept armor reads whole summary lines
+
+An exit-0 compile is `proved` only if every `Trust verification:` line is exactly
+`note: Trust verification: P proved, 0 failed, 0 unknown, 0 timed out, 0
+runtime-checked[, A assumed (requires)] out of N obligation(s)` with `P + A == N`,
+and no `warning: Trust verification advisory for …` or `warning: Trust Level 0
+safety verification incomplete for …` line was printed. `assumed (requires)` is
+static: it is a definition-entry contract premise that certify charges at every
+in-crate call site and itself accepts (docs/DECISION_QUEUE.md
+FALSIF-ARMOR-ASSUMED). Every other shape fails closed: `, N skipped`, `, N assumed
+(instance discharge)`, the coroutine label `conditionally discharged (NOT proved)`,
+another severity, trailing text, counts that fall short of the total, and any
+column added later. A proved lane in which no fixture printed a summary at all is
+a FAIL row of its own, so a renamed summary cannot turn every fixture into a
+zero-obligation acceptance. `scripts/tests/trust_falsification_gate_main_test.sh`
+drives the gate's `main()` against a fake compiler to pin these rows.

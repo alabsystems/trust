@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-EMO: a `match` over an OPAQUE-LANE enum (one `register_enum` declined
 // end-to-end — a param-instantiated enum in a generic body, a fat/dyn
 // payload) lowers as an N-WAY NONDETERMINISTIC SPLIT: an `Undef Bool`

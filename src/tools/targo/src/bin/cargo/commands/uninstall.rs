@@ -1,7 +1,7 @@
 use crate::command_prelude::*;
 
-use cargo::{CargoResult, core::PackageId, ops};
 use clap_complete::ArgValueCandidates;
+use targo::{CargoResult, ops, workspace::PackageId};
 
 use std::collections::BTreeSet;
 

@@ -29,10 +29,13 @@
 use trust_types::*;
 use trust_vcgen::generate_vcs;
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 const UMAX: i128 = u64::MAX as i128;
 
 fn router() -> trust_router::Router {
-    trust_router::Router::deterministic_in_process_ay(30_000)
+    test_router::deterministic_test_router()
 }
 
 fn verdict(router: &trust_router::Router, vc: &VerificationCondition) -> VerificationResult {
@@ -61,17 +64,9 @@ fn rooted_precheck_func(name: &str, count: u128, size: u128) -> VerifiableFuncti
                 LocalDecl { index: 1, ty: arr_ty, name: Some("arr".into()) },
                 LocalDecl { index: 2, ty: ptr_ty, name: Some("p".into()) },
                 LocalDecl { index: 3, ty: Ty::usize(), name: Some("addr".into()) },
-                LocalDecl {
-                    index: 4,
-                    ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]),
-                    name: None,
-                },
+                LocalDecl { index: 4, ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]), name: None },
                 LocalDecl { index: 5, ty: Ty::usize(), name: Some("byte_off".into()) },
-                LocalDecl {
-                    index: 6,
-                    ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]),
-                    name: None,
-                },
+                LocalDecl { index: 6, ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]), name: None },
             ],
             blocks: vec![
                 BasicBlock {
@@ -79,10 +74,7 @@ fn rooted_precheck_func(name: &str, count: u128, size: u128) -> VerifiableFuncti
                     stmts: vec![
                         Statement::Assign {
                             place: Place::local(1),
-                            rvalue: Rvalue::Repeat(
-                                Operand::Constant(ConstValue::Uint(0, 32)),
-                                2,
-                            ),
+                            rvalue: Rvalue::Repeat(Operand::Constant(ConstValue::Uint(0, 32)), 2),
                             span: span.clone(),
                         },
                         Statement::Assign {
@@ -151,15 +143,14 @@ fn rooted_precheck_func(name: &str, count: u128, size: u128) -> VerifiableFuncti
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
 fn add_overflow_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
     generate_vcs(func)
         .into_iter()
-        .filter(|vc| {
-            matches!(&vc.kind, VcKind::ArithmeticOverflow { op, .. } if *op == BinOp::Add)
-        })
+        .filter(|vc| matches!(&vc.kind, VcKind::ArithmeticOverflow { op, .. } if *op == BinOp::Add))
         .collect()
 }
 
@@ -227,11 +218,7 @@ fn unrooted_pointer_add_leg_stays_unproven() {
                 LocalDecl { index: 0, ty: Ty::Unit, name: None },
                 LocalDecl { index: 1, ty: ptr_ty, name: Some("p".into()) },
                 LocalDecl { index: 2, ty: Ty::usize(), name: Some("addr".into()) },
-                LocalDecl {
-                    index: 3,
-                    ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]),
-                    name: None,
-                },
+                LocalDecl { index: 3, ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]), name: None },
             ],
             blocks: vec![
                 BasicBlock {
@@ -271,6 +258,7 @@ fn unrooted_pointer_add_leg_stays_unproven() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = add_overflow_vcs(&func);
     assert_eq!(vcs.len(), 1, "exactly one checked-add overflow leg expected");
@@ -381,6 +369,7 @@ fn cross_allocation_compare_stays_unproven_both_directions() {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     };
     let router = router();

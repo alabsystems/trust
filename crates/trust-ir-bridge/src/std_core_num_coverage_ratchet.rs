@@ -166,10 +166,11 @@ pub(crate) fn parse_floor(text: &str) -> Result<CoverageFloor, String> {
     }
 }
 
-fn usize_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<usize, String> {
-    let v = obj
-        .get(key)
-        .ok_or_else(|| format!("snapshot is missing required key `{key}`"))?;
+fn usize_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<usize, String> {
+    let v = obj.get(key).ok_or_else(|| format!("snapshot is missing required key `{key}`"))?;
     let n = v
         .as_u64()
         .ok_or_else(|| format!("snapshot key `{key}` must be a non-negative integer, got {v}"))?;
@@ -255,9 +256,7 @@ pub(crate) fn parse_snapshot(text: &str) -> Result<CoverageSnapshot, String> {
             );
         }
         None => {
-            return Err(
-                "snapshot key `assumption_records_excluded` must be a boolean".to_string()
-            );
+            return Err("snapshot key `assumption_records_excluded` must be a boolean".to_string());
         }
     }
 
@@ -281,8 +280,8 @@ pub(crate) fn parse_snapshot(text: &str) -> Result<CoverageSnapshot, String> {
                 ));
             }
         }
-        let def_path = str_field(row, "def_path")
-            .map_err(|e| format!("verified_functions[{idx}]: {e}"))?;
+        let def_path =
+            str_field(row, "def_path").map_err(|e| format!("verified_functions[{idx}]: {e}"))?;
         if def_path.trim().is_empty() {
             return Err(format!("verified_functions[{idx}] has an empty def_path"));
         }
@@ -306,7 +305,10 @@ pub(crate) fn parse_snapshot(text: &str) -> Result<CoverageSnapshot, String> {
         sum = sum.checked_add(discharged).ok_or_else(|| {
             format!("verified_functions[{idx}]: obligation total overflows usize")
         })?;
-        rows.push(SnapshotRow { def_path: def_path.to_string(), discharged_l0_obligations: discharged });
+        rows.push(SnapshotRow {
+            def_path: def_path.to_string(),
+            discharged_l0_obligations: discharged,
+        });
     }
 
     let verified_function_count = usize_field(obj, "verified_function_count")?;
@@ -369,12 +371,12 @@ pub(crate) fn evaluate_ratchet(floor: &CoverageFloor, snap: &CoverageSnapshot) -
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::Path;
 
+    use super::*;
+
     fn committed(file: &str) -> String {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/std-coverage").join(file);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/std-coverage").join(file);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read committed ratchet input {path:?}: {e}"))
     }
@@ -447,9 +449,7 @@ mod controls {
     fn snapshot_json(rows: &[(&str, usize)], count: usize, total: usize) -> String {
         let rendered: Vec<String> = rows
             .iter()
-            .map(|(p, n)| {
-                format!("{{\"def_path\": \"{p}\", \"discharged_l0_obligations\": {n}}}")
-            })
+            .map(|(p, n)| format!("{{\"def_path\": \"{p}\", \"discharged_l0_obligations\": {n}}}"))
             .collect();
         format!(
             "{{\"schema\": \"trust-std-coverage-v1\", \"lane\": \"std-core-num-l0\", \
@@ -468,8 +468,7 @@ mod controls {
     /// BELOW the floor must fail the ratchet. Both metrics, independently.
     #[test]
     fn snapshot_below_function_floor_is_red() {
-        let snap =
-            parsed_snapshot(&[("core::num::<impl u32>::checked_add", 3)], 1, 3);
+        let snap = parsed_snapshot(&[("core::num::<impl u32>::checked_add", 3)], 1, 3);
         let findings = evaluate_ratchet(&floor(2, 3), &snap);
         assert_eq!(findings.len(), 1, "exactly the function-count regression: {findings:?}");
         assert!(
@@ -480,8 +479,7 @@ mod controls {
 
     #[test]
     fn snapshot_below_obligation_floor_is_red() {
-        let snap =
-            parsed_snapshot(&[("core::num::<impl u32>::checked_add", 3)], 1, 3);
+        let snap = parsed_snapshot(&[("core::num::<impl u32>::checked_add", 3)], 1, 3);
         let findings = evaluate_ratchet(&floor(1, 5), &snap);
         assert_eq!(findings.len(), 1, "exactly the obligation-count regression: {findings:?}");
         assert!(
@@ -506,10 +504,7 @@ mod controls {
     #[test]
     fn unbanked_gain_is_red() {
         let snap = parsed_snapshot(
-            &[
-                ("core::num::<impl u32>::checked_add", 3),
-                ("core::num::<impl u8>::count_ones", 1),
-            ],
+            &[("core::num::<impl u32>::checked_add", 3), ("core::num::<impl u8>::count_ones", 1)],
             2,
             4,
         );
@@ -523,8 +518,7 @@ mod controls {
 
     #[test]
     fn exact_agreement_is_green() {
-        let snap =
-            parsed_snapshot(&[("num::<impl i32>::wrapping_mul", 2)], 1, 2);
+        let snap = parsed_snapshot(&[("num::<impl i32>::wrapping_mul", 2)], 1, 2);
         assert!(evaluate_ratchet(&floor(1, 2), &snap).is_empty());
     }
 
@@ -597,8 +591,10 @@ mod controls {
     /// coverage.
     #[test]
     fn snapshot_without_discharge_attestation_is_refused() {
-        let text = snapshot_json(&[], 0, 0)
-            .replace("\"assumption_records_excluded\": true", "\"assumption_records_excluded\": false");
+        let text = snapshot_json(&[], 0, 0).replace(
+            "\"assumption_records_excluded\": true",
+            "\"assumption_records_excluded\": false",
+        );
         let err = parse_snapshot(&text).unwrap_err();
         assert!(err.contains("assumption record is still an assumption"), "{err}");
     }
@@ -611,12 +607,9 @@ mod controls {
 
     #[test]
     fn snapshot_total_not_backed_by_rows_is_refused() {
-        let err = parse_snapshot(&snapshot_json(
-            &[("core::num::<impl u32>::checked_add", 3)],
-            1,
-            9,
-        ))
-        .unwrap_err();
+        let err =
+            parse_snapshot(&snapshot_json(&[("core::num::<impl u32>::checked_add", 3)], 1, 9))
+                .unwrap_err();
         assert!(err.contains("total its own rows do not back"), "{err}");
     }
 
@@ -634,10 +627,7 @@ mod controls {
     #[test]
     fn snapshot_duplicate_def_path_is_refused() {
         let err = parse_snapshot(&snapshot_json(
-            &[
-                ("core::num::<impl u32>::checked_add", 1),
-                ("core::num::<impl u32>::checked_add", 1),
-            ],
+            &[("core::num::<impl u32>::checked_add", 1), ("core::num::<impl u32>::checked_add", 1)],
             2,
             2,
         ))
@@ -647,8 +637,7 @@ mod controls {
 
     #[test]
     fn snapshot_unknown_top_level_key_is_refused() {
-        let text = snapshot_json(&[], 0, 0)
-            .replace("\"lane\":", "\"self_proof\": true, \"lane\":");
+        let text = snapshot_json(&[], 0, 0).replace("\"lane\":", "\"self_proof\": true, \"lane\":");
         let err = parse_snapshot(&text).unwrap_err();
         assert!(err.contains("unknown top-level key `self_proof`"), "{err}");
     }
@@ -674,10 +663,7 @@ mod controls {
     #[test]
     fn both_scope_spellings_are_accepted() {
         let snap = parsed_snapshot(
-            &[
-                ("core::num::<impl u32>::leading_zeros", 0),
-                ("num::<impl i64>::saturating_sub", 1),
-            ],
+            &[("core::num::<impl u32>::leading_zeros", 0), ("num::<impl i64>::saturating_sub", 1)],
             2,
             1,
         );

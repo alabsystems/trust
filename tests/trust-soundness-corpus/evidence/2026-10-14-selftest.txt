@@ -1,0 +1,225 @@
+# python3 scripts/trust-soundness-corpus.py --self-test, 2026-10-14, on trust origin/main e2d1fdfe1c plus this change (exit 0). Anchor liveness ran against the store trustc 9192.
+entry checks: 35 entries pass
+classification:
+  ok   known-open proved: classified KNOWN-FALSE-PROVED (want KNOWN-FALSE-PROVED)
+  ok   known-open refused: classified XFIXED (want XFIXED)
+  ok   known-open error: classified ERROR(known-open) (want ERROR(known-open))
+  ok   known-open skipped: classified SKIPPED (want SKIPPED)
+  ok   plain reproducer error: classified ERROR (want ERROR)
+  ok   plain reproducer refused: classified ok (want ok)
+  ok   plain twin refused: classified TWIN-LOST (want TWIN-LOST)
+  ok   plain twin error: classified ERROR (want ERROR)
+  ok   build-accepted exit 1: error (want error)
+  ok   build-accepted exit 1: refused (want refused)
+  ok   build-accepted exit 0: proved (want proved)
+  ok   build-accepted exit 101: error (want error)
+  ok   build-accepted exit None: error (want error)
+  ok   assumption-kept, empty result: error (want error)
+family trustc (trustc-default, trustc-advisory, trustc-certify):
+  ok   trustc-missing: 54 applicable cell(s)
+  ok   trustc-missing: --strict exit 1 (want 1)
+  ok   trustc-missing: no cell passes (none)
+  ok   trustc-false: 54 applicable cell(s)
+  ok   trustc-false: --strict exit 1 (want 1)
+  ok   trustc-false: no cell passes (none)
+  ok   trustc-crash: 54 applicable cell(s)
+  ok   trustc-crash: --strict exit 1 (want 1)
+  ok   trustc-crash: no cell passes (none)
+  ok   trustc-late-crash: 54 applicable cell(s)
+  ok   trustc-late-crash: --strict exit 1 (want 1)
+  ok   trustc-late-crash: no cell passes (none)
+  ok   trustc-hang: 54 applicable cell(s)
+  ok   trustc-hang: --strict exit 1 (want 1)
+  ok   trustc-hang: no cell passes (none)
+  ok   trustc-anchor-miss: 54 applicable cell(s)
+  ok   trustc-anchor-miss: --strict exit 1 (want 1)
+  ok   trustc-anchor-miss: no cell passes (none)
+  ok   trustc-proved: 54 applicable cell(s)
+  ok   trustc-proved: --strict exit 1 (want 1)
+  ok   trustc-proved: every reproducer red (all)
+  ok   trustc-refused: 54 applicable cell(s)
+  ok   trustc-refused: --strict exit 1 (want 1)
+  ok   trustc-refused: every twin expected proved is TWIN-LOST (all)
+  ok   trustc-oracle: 54 applicable cell(s)
+  ok   trustc-oracle: --strict exit 0 (want 0: the oracle answers what every entry expects)
+  ok   trustc-oracle: every cell passes or is a recorded open bug (all)
+family trust-vc-syn (trust-vc-syn):
+  ok   trust-vc-syn-missing: 18 applicable cell(s)
+  ok   trust-vc-syn-missing: --strict exit 1 (want 1)
+  ok   trust-vc-syn-missing: no cell passes (none)
+  ok   trust-vc-syn-false: 17 applicable cell(s)
+  ok   trust-vc-syn-false: --strict exit 1 (want 1)
+  ok   trust-vc-syn-false: no cell passes (none)
+  ok   trust-vc-syn-crash: 17 applicable cell(s)
+  ok   trust-vc-syn-crash: --strict exit 1 (want 1)
+  ok   trust-vc-syn-crash: no cell passes (none)
+  ok   trust-vc-syn-late-crash: 17 applicable cell(s)
+  ok   trust-vc-syn-late-crash: --strict exit 1 (want 1)
+  ok   trust-vc-syn-late-crash: no cell passes (none)
+  ok   trust-vc-syn-hang: 17 applicable cell(s)
+  ok   trust-vc-syn-hang: --strict exit 1 (want 1)
+  ok   trust-vc-syn-hang: no cell passes (none)
+  ok   trust-vc-syn-proved: 17 applicable cell(s)
+  ok   trust-vc-syn-proved: --strict exit 1 (want 1)
+  ok   trust-vc-syn-proved: every reproducer red (all)
+  ok   trust-vc-syn-refused: 17 applicable cell(s)
+  ok   trust-vc-syn-refused: --strict exit 1 (want 1)
+  ok   trust-vc-syn-refused: every twin expected proved is TWIN-LOST (all)
+  ok   trust-vc-syn-oracle: 17 applicable cell(s)
+  ok   trust-vc-syn-oracle: --strict exit 0 (want 0: the oracle answers what every entry expects)
+  ok   trust-vc-syn-oracle: every cell passes or is a recorded open bug (all)
+family trust-vc-mir (trust-vc-mir):
+  ok   trust-vc-mir-missing: 1 applicable cell(s)
+  ok   trust-vc-mir-missing: --strict exit 1 (want 1)
+  ok   trust-vc-mir-missing: no cell passes (none)
+  ok   trust-vc-mir-false: 1 applicable cell(s)
+  ok   trust-vc-mir-false: --strict exit 1 (want 1)
+  ok   trust-vc-mir-false: no cell passes (none)
+  ok   trust-vc-mir-crash: 1 applicable cell(s)
+  ok   trust-vc-mir-crash: --strict exit 1 (want 1)
+  ok   trust-vc-mir-crash: no cell passes (none)
+  ok   trust-vc-mir-late-crash: 1 applicable cell(s)
+  ok   trust-vc-mir-late-crash: --strict exit 1 (want 1)
+  ok   trust-vc-mir-late-crash: no cell passes (none)
+  ok   trust-vc-mir-hang: 1 applicable cell(s)
+  ok   trust-vc-mir-hang: --strict exit 1 (want 1)
+  ok   trust-vc-mir-hang: no cell passes (none)
+  ok   trust-vc-mir-proved: 1 applicable cell(s)
+  ok   trust-vc-mir-proved: --strict exit 1 (want 1)
+  ok   trust-vc-mir-proved: every reproducer red (all)
+  ok   trust-vc-mir-refused: 1 applicable cell(s)
+  ok   trust-vc-mir-refused: --strict exit 1 (want 1)
+  ok   trust-vc-mir-refused: every twin expected proved is TWIN-LOST (all)
+  ok   trust-vc-mir-oracle: 1 applicable cell(s)
+  ok   trust-vc-mir-oracle: --strict exit 0 (want 0: the oracle answers what every entry expects)
+  ok   trust-vc-mir-oracle: every cell passes or is a recorded open bug (all)
+family clean (clean-external):
+  ok   clean-missing: 8 applicable cell(s)
+  ok   clean-missing: --strict exit 1 (want 1)
+  ok   clean-missing: no cell passes (none)
+  ok   clean-false: 8 applicable cell(s)
+  ok   clean-false: --strict exit 1 (want 1)
+  ok   clean-false: no cell passes (none)
+  ok   clean-crash: 8 applicable cell(s)
+  ok   clean-crash: --strict exit 1 (want 1)
+  ok   clean-crash: no cell passes (none)
+  ok   clean-late-crash: 8 applicable cell(s)
+  ok   clean-late-crash: --strict exit 1 (want 1)
+  ok   clean-late-crash: no cell passes (none)
+  ok   clean-hang: 8 applicable cell(s)
+  ok   clean-hang: --strict exit 1 (want 1)
+  ok   clean-hang: no cell passes (none)
+  ok   clean-proved: 8 applicable cell(s)
+  ok   clean-proved: --strict exit 1 (want 1)
+  ok   clean-proved: every reproducer red (all)
+  ok   clean-refused: 8 applicable cell(s)
+  ok   clean-refused: --strict exit 1 (want 1)
+  ok   clean-refused: every twin expected proved is TWIN-LOST (all)
+  ok   clean-oracle: 8 applicable cell(s)
+  ok   clean-oracle: --strict exit 0 (want 0: the oracle answers what every entry expects)
+  ok   clean-oracle: every cell passes or is a recorded open bug (all)
+family trust-wp (trust-wp):
+  ok   trust-wp-missing: 8 applicable cell(s)
+  ok   trust-wp-missing: --strict exit 1 (want 1)
+  ok   trust-wp-missing: no cell passes (none)
+  ok   trust-wp-false: 8 applicable cell(s)
+  ok   trust-wp-false: --strict exit 1 (want 1)
+  ok   trust-wp-false: no cell passes (none)
+  ok   trust-wp-crash: 8 applicable cell(s)
+  ok   trust-wp-crash: --strict exit 1 (want 1)
+  ok   trust-wp-crash: no cell passes (none)
+  ok   trust-wp-late-crash: 8 applicable cell(s)
+  ok   trust-wp-late-crash: --strict exit 1 (want 1)
+  ok   trust-wp-late-crash: no cell passes (none)
+  ok   trust-wp-hang: 8 applicable cell(s)
+  ok   trust-wp-hang: --strict exit 1 (want 1)
+  ok   trust-wp-hang: no cell passes (none)
+  ok   trust-wp-proved: 8 applicable cell(s)
+  ok   trust-wp-proved: --strict exit 1 (want 1)
+  ok   trust-wp-proved: every reproducer red (all)
+  ok   trust-wp-refused: 8 applicable cell(s)
+  ok   trust-wp-refused: --strict exit 1 (want 1)
+  ok   trust-wp-refused: every twin expected proved is TWIN-LOST (all)
+  ok   trust-wp-oracle: 8 applicable cell(s)
+  ok   trust-wp-oracle: --strict exit 0 (want 0: the oracle answers what every entry expects)
+  ok   trust-wp-oracle: every cell passes or is a recorded open bug (all)
+controls:
+  ok   control al02-laundered-alias-store: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control al07-laundered-alias-elide: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  --   control ay-mirror-and-overload: no-control (Clean main refuses any problem that declares `and` ('and' is a built-in operator and cannot be declared or defined), so no certificate ov...)
+  --   control ay-mirror-false-quoted: no-control (Clean main refuses any problem that declares |false| ('false' is a built-in operator and cannot be declared or defined), the twin include...)
+  --   control ay-mirror-ite-overload: no-control (Clean main refuses any problem that declares `ite` ('ite' is a built-in operator and cannot be declared or defined), the twin included; c...)
+  ok   control cast-signed-clamp-ub: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify, trust-vc-syn
+  ok   control clean-b03-macro-capture: an always-refused verifier loses its twin in clean-external
+  ok   control clean-b09-check-sat-assuming: an always-refused verifier loses its twin in clean-external
+  ok   control clean-l01-cr-comment: an always-refused verifier loses its twin in clean-external
+  --   control clean-q04-push-pop: no-control (Clean main refuses any problem with push or pop ('push' is not supported: a problem must be a single query), the twin included; clean-ext...)
+  ok   control clean-r1-named-reuses-declared: an always-refused verifier loses its twin in clean-external
+  ok   control contract-foreign-tool-ns: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify, trust-vc-syn
+  ok   control h1-stale-bound-call-rename: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control h2-raw-const-store: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control h3-asm-output: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control instance-walk-generic-edge: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control opaque-scalar-identity: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control path-guard-value: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control path-guard-value-range: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control trip-driver: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control trip-init-cycle: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control trip-mid-test: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control trip-zero-product: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control tvc-mut-alias-field-method: an always-refused verifier loses its twin in trust-vc-syn, trust-vc-mir
+  ok   control tvc-untyped-literal-call-arg: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify, trust-vc-syn
+  ok   control union-sibling-write: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control vac-field-read-before-write: an always-refused verifier loses its twin in trustc-default, trustc-advisory, trustc-certify
+  ok   control wp-d237-shadowed-namesake: an always-refused verifier loses its twin in trust-wp
+  ok   control wp-d237-shadowed-param-copy: an always-refused verifier loses its twin in trust-wp
+  ok   control wp-open-closure-contract-cc1: an always-refused verifier loses its twin in trust-wp
+  ok   control wp-open-closure-contract-cs1: an always-refused verifier loses its twin in trust-wp
+  ok   control wp-open-macro-hygiene-mh1: an always-refused verifier loses its twin in trust-wp
+  ok   control wp-open-macro-hygiene-mh2: an always-refused verifier loses its twin in trust-wp
+  ok   control wp-open-macro-hygiene-mh4: an always-refused verifier loses its twin in trust-wp
+  ok   control wp-open-macro-hygiene-mh5: an always-refused verifier loses its twin in trust-wp
+vacuous:
+  ok   vacuous: --strict exit 1 (want 1), VACUOUS reported: True
+witnesses:
+  ok   witness-wrong: --strict exit 1 (want 1)
+  ok   witness-wrong: no witness confirmed (none)
+  ok   ay-unsat: exit 1; an ay answering unsat confirms nothing (none)
+anchor liveness against <home>/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc:
+  ok   liveness-flip al02-laundered-alias-store: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip al07-laundered-alias-elide: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip cast-signed-clamp-ub: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST(known)
+  ok   liveness-flip contract-foreign-tool-ns: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip h1-stale-bound-call-rename: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip h2-raw-const-store: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip h3-asm-output: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip opaque-scalar-identity: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip path-guard-value: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip path-guard-value-range: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip trip-driver: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip trip-init-cycle: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip trip-mid-test: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip trip-zero-product: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip tvc-untyped-literal-call-arg: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip union-sibling-write: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-flip vac-field-read-before-write: anchored rows flipped: reproducer FALSE-PROVED, twin TWIN-LOST
+  ok   liveness-anchor-only al02-laundered-alias-store: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only al07-laundered-alias-elide: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only cast-signed-clamp-ub: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only contract-foreign-tool-ns: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only h1-stale-bound-call-rename: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only h2-raw-const-store: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only h3-asm-output: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only opaque-scalar-identity: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only path-guard-value: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only path-guard-value-range: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only trip-driver: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only trip-init-cycle: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only trip-mid-test: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only trip-zero-product: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only tvc-untyped-literal-call-arg: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only union-sibling-write: only the anchored row decides: reproducer ok, twin ok
+  ok   liveness-anchor-only vac-field-read-before-write: only the anchored row decides: reproducer ok, twin ok
+
+SELF-TEST PASSED
+rc=0

@@ -93,6 +93,7 @@ fn caller_with_two_colliding_calls(
         unwind: UnwindEdge::Unreachable,
         is_unsafe_sig: false,
         callee_identity: identity,
+        callee_key: crate::sep_engine::tests::fixture_key(&SHARED_KEY.to_string()),
         is_foreign: false,
         func: SHARED_KEY.to_string(),
         args: vec![Operand::Copy(Place::local(1))],
@@ -154,6 +155,7 @@ fn caller_with_two_colliding_calls(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -248,11 +250,7 @@ fn callee_identity_on_the_terminator_does_not_discriminate() {
     let mut db = SummaryDatabase::new();
     db.insert(definitional_summary_of_a());
 
-    let shapes = [
-        (None, None),
-        (Some(IDENT_A), Some(IDENT_A)),
-        (Some(IDENT_A), Some(IDENT_B)),
-    ];
+    let shapes = [(None, None), (Some(IDENT_A), Some(IDENT_A)), (Some(IDENT_A), Some(IDENT_B))];
     let mut seen: Vec<usize> = Vec::new();
     for (a, b) in shapes {
         let caller = caller_with_two_colliding_calls(a, b);

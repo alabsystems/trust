@@ -1,0 +1,2 @@
+error: unstable option `trust-platform-unanalysed` requires one of `warn` or `deny` (`-Z trust-platform-unanalysed=<value>`)
+

@@ -187,38 +187,49 @@ pub(super) fn local_operand_use_count(func: &VerifiableFunction, local: usize) -
 pub(super) fn local_value_is_stable(func: &VerifiableFunction, local: usize) -> bool {
     let is_param = (1..=func.body.arg_count).contains(&local);
     let mut defs = if is_param { 1u32 } else { 0u32 };
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, rvalue, .. } = stmt {
-                if let Rvalue::Ref { mutable: true, place: borrowed }
-                | Rvalue::AddressOf(_, borrowed) = rvalue
-                    && borrowed.local == local
+    let invalid =
+        crate::any_local_write_candidate(func, &func.body.blocks, local, |block, item| match item {
+            Some(stmt) => {
+                if let Statement::Assign { place, rvalue, .. } = stmt {
+                    if let Rvalue::Ref { mutable: true, place: borrowed }
+                    | Rvalue::AddressOf(_, borrowed) = rvalue
+                        && borrowed.local == local
+                    {
+                        return true;
+                    }
+                    if place.local != local {
+                        return false;
+                    }
+                    // A store through `Deref` writes the POINTEE, not this local.
+                    if place.projections.first() == Some(&trust_types::Projection::Deref) {
+                        return false;
+                    }
+                    if !place.projections.is_empty() {
+                        return true;
+                    }
+                    defs += 1;
+                    if defs > 1 {
+                        return true;
+                    }
+                }
+                false
+            }
+            None => {
+                if let Terminator::Call { dest, .. } = &block.terminator
+                    && dest.local == local
                 {
-                    return false;
+                    if !dest.projections.is_empty() {
+                        return true;
+                    }
+                    defs += 1;
+                    if defs > 1 {
+                        return true;
+                    }
                 }
-                if place.local != local {
-                    continue;
-                }
-                // A store through `Deref` writes the POINTEE, not this local.
-                if place.projections.first() == Some(&trust_types::Projection::Deref) {
-                    continue;
-                }
-                if !place.projections.is_empty() {
-                    return false;
-                }
-                defs += 1;
+                false
             }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.local == local
-        {
-            if !dest.projections.is_empty() {
-                return false;
-            }
-            defs += 1;
-        }
-    }
-    defs <= 1
+        });
+    !invalid && defs <= 1
 }
 
 /// Resolve `local` — the receiver of a std `unwrap_or` call — to the unique std
@@ -238,37 +249,54 @@ pub(super) fn int_try_from_def(
     if fuel == 0 {
         return None;
     }
-    if !is_single_static_assignment(func, local) || local_operand_use_count(func, local) != 1 {
+    if !is_single_static_assignment(func, local) {
         return None;
     }
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            let Statement::Assign { place, rvalue, .. } = stmt else { continue };
-            if place.local != local || !place.projections.is_empty() {
-                continue;
+    let mut hop_local: Option<usize> = None;
+    let mut found_call: Option<(&Operand, usize)> = None;
+    let _ = crate::find_local_write_candidate(func, &func.body.blocks, local, |block, item| {
+        match item {
+            Some(stmt) => {
+                let Statement::Assign { place, rvalue, .. } = stmt else { return None };
+                if place.local != local || !place.projections.is_empty() {
+                    return None;
+                }
+                // THE unique whole-local def (uniqueness guaranteed by the SSA gate
+                // above): a whole-local copy/move hop is followed; anything else is
+                // not the composed idiom.
+                let Rvalue::Use(Operand::Copy(hop) | Operand::Move(hop)) = rvalue else {
+                    return Some(());
+                };
+                if !hop.projections.is_empty() {
+                    return Some(());
+                }
+                hop_local = Some(hop.local);
+                Some(())
             }
-            // THE unique whole-local def (uniqueness guaranteed by the SSA gate
-            // above): a whole-local copy/move hop is followed; anything else is
-            // not the composed idiom.
-            let Rvalue::Use(Operand::Copy(hop) | Operand::Move(hop)) = rvalue else {
-                return None;
-            };
-            if !hop.projections.is_empty() {
-                return None;
+            None => {
+                if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
+                    && dest.local == local
+                    && dest.projections.is_empty()
+                {
+                    if is_int_try_from_callee(callee) && args.len() == 1 {
+                        found_call = Some((&args[0], local));
+                    }
+                    return Some(());
+                }
+                None
             }
-            return int_try_from_def(func, hop.local, fuel - 1);
         }
-        if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
-            && dest.local == local
-            && dest.projections.is_empty()
-        {
-            if is_int_try_from_callee(callee) && args.len() == 1 {
-                return Some((&args[0], local));
-            }
-            return None;
-        }
+    });
+    if hop_local.is_none() && found_call.is_none() {
+        return None;
     }
-    None
+    if local_operand_use_count(func, local) != 1 {
+        return None;
+    }
+    if let Some(hop) = hop_local {
+        return int_try_from_def(func, hop, fuel - 1);
+    }
+    found_call
 }
 
 /// The try_from SOURCE operand as a formula: an integer constant, or a bare,
@@ -288,8 +316,8 @@ pub(super) fn int_try_from_source_formula(
             Some(crate::operand_to_formula(func, src))
         }
         Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
-            let decl = func.body.locals.iter().find(|d| d.index == p.local)?;
-            if !decl.ty.is_integer() || !local_value_is_stable(func, p.local) {
+            let ty = crate::local_ty_ref(func, p.local)?;
+            if !ty.is_integer() || !local_value_is_stable(func, p.local) {
                 return None;
             }
             Some(crate::operand_to_formula(func, src))
@@ -346,8 +374,7 @@ pub(super) fn expect_infallible_const_int_conversion(
     if !dest.projections.is_empty() {
         return None;
     }
-    let Some(Ty::Int { width, signed }) = func.body.locals.get(dest.local).map(|d| &d.ty).cloned()
-    else {
+    let Some(&Ty::Int { width, signed }) = func.body.locals.get(dest.local).map(|d| &d.ty) else {
         return None;
     };
     // Receiver: bare local conduit to the unique std try_from/try_into Call.
@@ -382,10 +409,14 @@ pub(super) fn expect_infallible_const_int_conversion(
 /// guard constants and divisors through the `try_into().expect()` idiom.
 pub(super) fn expect_infallible_const_map(func: &VerifiableFunction) -> FxHashMap<usize, i128> {
     let mut map = FxHashMap::default();
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return map;
+    }
     for block in &func.body.blocks {
         if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
-            && let Some(v) = expect_infallible_const_int_conversion(func, callee, args, dest)
+            && dest.projections.is_empty()
             && is_single_static_assignment(func, dest.local)
+            && let Some(v) = expect_infallible_const_int_conversion(func, callee, args, dest)
         {
             map.insert(dest.local, v);
         }
@@ -450,8 +481,8 @@ pub(super) fn int_try_from_unwrap_or_facts(
         return None;
     }
     let (src, result_local) = int_try_from_def(func, recv_place.local, 4)?;
-    let result_decl = func.body.locals.iter().find(|d| d.index == result_local)?;
-    if !is_int_try_from_result_ty(&result_decl.ty) {
+    let result_ty = crate::local_ty_ref(func, result_local)?;
+    if !is_int_try_from_result_ty(result_ty) {
         return None;
     }
     let src_f = int_try_from_source_formula(func, src)?;

@@ -98,6 +98,71 @@ EOF
 )"
 assert_eq "$expected_capture" "$(<"$CAPTURE")" "canonical Cargo job arguments"
 
+# A leading Targo lane stays in front of the subcommand, and the job cap still
+# applies behind it (`targo --unverified build` / `targo trust check`).
+CARGO_CAP_TEST_CAPTURE="$CAPTURE" \
+TRUST_REAL_CARGO="$FAKE_CARGO" \
+TRUST_LOCK_DIR="$LOCK_DIR" \
+TRUST_MAX_CONCURRENT=1 \
+TRUST_CARGO_JOBS=2 \
+TRUST_RSS_MONITOR=0 \
+bash "$CARGO_CAP" --unverified build -p demo -j 3 >/dev/null 2>&1
+expected_capture="$(cat <<'EOF'
+jobs=3
+arg=--unverified
+arg=build
+arg=--jobs
+arg=3
+arg=-p
+arg=demo
+EOF
+)"
+assert_eq "$expected_capture" "$(<"$CAPTURE")" "Targo lane kept ahead of capped subcommand"
+
+# With no TRUST_REAL_CARGO the driver is the `targo` on PATH that accepts
+# --unverified, never a stock cargo; with no targo it refuses outright.
+FAKE_BIN="$TMP_ROOT/fake-bin"
+mkdir -p "$FAKE_BIN"
+cat >"$FAKE_BIN/targo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--unverified" && "${2:-}" == "--version" ]]; then echo "targo 0.0.0 (fake)"; exit 0; fi
+printf 'driver=targo\n' >"$CARGO_CAP_TEST_CAPTURE"
+for arg in "$@"; do printf 'arg=%s\n' "$arg" >>"$CARGO_CAP_TEST_CAPTURE"; done
+EOF
+chmod +x "$FAKE_BIN/targo"
+CARGO_CAP_TEST_CAPTURE="$CAPTURE" \
+PATH="$FAKE_BIN:/usr/bin:/bin" \
+TRUST_LOCK_DIR="$LOCK_DIR" \
+TRUST_MAX_CONCURRENT=1 \
+TRUST_CARGO_JOBS=1 \
+TRUST_RSS_MONITOR=0 \
+bash "$CARGO_CAP" --unverified check >/dev/null 2>&1
+assert_eq "driver=targo" "$(head -1 "$CAPTURE")" "default driver is targo"
+
+# No targo on PATH: refuse, even with a stock cargo in ~/.cargo/bin and the
+# retired ATERM_STOCK_REASON escape set (regression, 2026-09-28: that
+# combination used to select the stock cargo).
+STOCK_HOME="$TMP_ROOT/stock-home"
+STOCK_MARKER="$TMP_ROOT/stock-cargo-ran"
+mkdir -p "$STOCK_HOME/.cargo/bin"
+cat >"$STOCK_HOME/.cargo/bin/cargo" <<EOF
+#!/usr/bin/env bash
+touch "$STOCK_MARKER"
+EOF
+chmod +x "$STOCK_HOME/.cargo/bin/cargo"
+set +e
+refusal="$(HOME="$STOCK_HOME" PATH="/usr/bin:/bin" ATERM_STOCK_REASON="legacy escape" \
+    TRUST_LOCK_DIR="$LOCK_DIR" TRUST_MAX_CONCURRENT=1 TRUST_CARGO_JOBS=1 TRUST_RSS_MONITOR=0 \
+    bash "$CARGO_CAP" --unverified check 2>&1)"
+refusal_status=$?
+set -e
+assert_eq 1 "$refusal_status" "no targo refuses even with a stock cargo and ATERM_STOCK_REASON"
+case "$refusal" in
+    *"no targo accepting --unverified"*) ;;
+    *) fail "refusal did not name targo: $refusal" ;;
+esac
+[[ ! -e "$STOCK_MARKER" ]] || fail "a stock cargo ran although no targo was found"
+
 # A failing Cargo must keep its status and release the semaphore slot.
 set +e
 CARGO_CAP_TEST_CAPTURE="$CAPTURE" \

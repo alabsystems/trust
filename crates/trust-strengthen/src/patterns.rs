@@ -12,7 +12,7 @@ use trust_types::VcKind;
 use crate::proposer::{Proposal, ProposalKind};
 
 /// A recognized code pattern with associated spec knowledge.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CodePattern {
     /// Binary search over a sorted collection.
@@ -73,24 +73,24 @@ pub struct PatternMatch {
 
 /// A library of recognizable patterns with their expected specs.
 pub struct PatternLibrary {
-    entries: Vec<PatternEntry>,
+    entries: &'static [PatternEntry],
 }
 
 /// Internal: a pattern with its recognition criteria and specs.
 struct PatternEntry {
     pattern: CodePattern,
     /// Substrings in function name that suggest this pattern.
-    name_keywords: Vec<&'static str>,
+    name_keywords: &'static [&'static str],
     /// VC kinds that are typical for this pattern.
-    typical_vc_kinds: Vec<VcKindClass>,
+    typical_vc_kinds: &'static [VcKindClass],
     /// Base confidence when name matches.
     name_confidence: f64,
     /// Confidence boost when VC kinds also match.
     vc_boost: f64,
     /// Spec templates for this pattern.
-    preconditions: Vec<&'static str>,
-    postconditions: Vec<&'static str>,
-    invariants: Vec<&'static str>,
+    preconditions: &'static [&'static str],
+    postconditions: &'static [&'static str],
+    invariants: &'static [&'static str],
 }
 
 /// Broad classification of VcKind for pattern matching (avoids matching on inner data).
@@ -106,235 +106,192 @@ enum VcKindClass {
     NonTermination,
 }
 
+const DEFAULT_PATTERN_ENTRIES: &[PatternEntry] = &[
+    // Binary search pattern with formal spec text for
+    // is_sorted precondition inference.
+    PatternEntry {
+        pattern: CodePattern::BinarySearch,
+        name_keywords: &["binary_search", "bsearch", "bisect", "lower_bound", "upper_bound"],
+        typical_vc_kinds: &[VcKindClass::ArithmeticOverflow, VcKindClass::IndexOutOfBounds],
+        name_confidence: 0.85,
+        vc_boost: 0.10,
+        preconditions: &["slice.is_sorted()", "!slice.is_empty()"],
+        postconditions: &[
+            "result.is_some() ==> slice[result.unwrap()] == target",
+            "result.is_none() ==> forall i: usize, i < slice.len() ==> slice[i] != target",
+        ],
+        invariants: &[
+            "0 <= low && low <= high + 1 && high < slice.len()",
+            "forall i: usize, i < low ==> slice[i] < target",
+            "forall i: usize, high < i && i < slice.len() ==> slice[i] > target",
+        ],
+    },
+    PatternEntry {
+        pattern: CodePattern::Sort,
+        name_keywords: &[
+            "sort",
+            "quicksort",
+            "mergesort",
+            "heapsort",
+            "insertion_sort",
+            "bubble_sort",
+        ],
+        typical_vc_kinds: &[VcKindClass::IndexOutOfBounds, VcKindClass::ArithmeticOverflow],
+        name_confidence: 0.80,
+        vc_boost: 0.10,
+        preconditions: &[],
+        postconditions: &[
+            "result is a permutation of input",
+            "result is sorted: forall i < result.len()-1, result[i] <= result[i+1]",
+        ],
+        invariants: &["0 <= i && i <= slice.len()", "slice[..i] is sorted"],
+    },
+    PatternEntry {
+        pattern: CodePattern::BoundedLoop,
+        name_keywords: &["bounded", "count", "iterate", "scan", "walk", "traverse"],
+        typical_vc_kinds: &[
+            VcKindClass::ArithmeticOverflow,
+            VcKindClass::IndexOutOfBounds,
+            VcKindClass::NonTermination,
+        ],
+        name_confidence: 0.60,
+        vc_boost: 0.15,
+        preconditions: &["n >= 0 (loop bound is non-negative)"],
+        postconditions: &["loop executed exactly n iterations"],
+        invariants: &["0 <= i && i <= n", "loop variant: n - i decreases each iteration"],
+    },
+    PatternEntry {
+        pattern: CodePattern::Iterator,
+        name_keywords: &["iter", "map", "filter", "fold", "reduce", "collect", "enumerate", "zip"],
+        typical_vc_kinds: &[VcKindClass::ArithmeticOverflow],
+        name_confidence: 0.65,
+        vc_boost: 0.10,
+        preconditions: &[],
+        postconditions: &["result.len() <= input.len()"],
+        invariants: &[],
+    },
+    PatternEntry {
+        pattern: CodePattern::ErrorHandling,
+        name_keywords: &["try_", "parse", "validate", "check", "handle_error", "from_str"],
+        typical_vc_kinds: &[
+            VcKindClass::Assertion,
+            VcKindClass::Postcondition,
+            VcKindClass::Unreachable,
+        ],
+        name_confidence: 0.60,
+        vc_boost: 0.15,
+        preconditions: &[],
+        postconditions: &[
+            "result.is_ok() ==> output satisfies validation",
+            "result.is_err() ==> input was malformed",
+        ],
+        invariants: &[],
+    },
+    PatternEntry {
+        pattern: CodePattern::VecPush,
+        name_keywords: &["push", "append", "extend", "add_to", "vec_insert"],
+        typical_vc_kinds: &[VcKindClass::ArithmeticOverflow, VcKindClass::IndexOutOfBounds],
+        name_confidence: 0.60,
+        vc_boost: 0.10,
+        preconditions: &["vec.len() < usize::MAX"],
+        postconditions: &["vec'.len() == vec.len() + 1", "vec'.last() == Some(&item)"],
+        invariants: &[],
+    },
+    PatternEntry {
+        pattern: CodePattern::HashLookup,
+        name_keywords: &["lookup", "get_entry", "find_key", "contains_key", "hash_get"],
+        typical_vc_kinds: &[VcKindClass::Assertion, VcKindClass::Postcondition],
+        name_confidence: 0.55,
+        vc_boost: 0.10,
+        preconditions: &[],
+        postconditions: &[
+            "result.is_some() ==> map.contains_key(&key)",
+            "result.is_none() ==> !map.contains_key(&key)",
+        ],
+        invariants: &[],
+    },
+    PatternEntry {
+        pattern: CodePattern::MathOp,
+        name_keywords: &[
+            "add",
+            "sub",
+            "mul",
+            "div",
+            "rem",
+            "pow",
+            "sqrt",
+            "abs",
+            "midpoint",
+            "average",
+            "mean",
+            "clamp",
+            "saturating",
+        ],
+        typical_vc_kinds: &[
+            VcKindClass::ArithmeticOverflow,
+            VcKindClass::DivisionByZero,
+            VcKindClass::CastOverflow,
+        ],
+        name_confidence: 0.70,
+        vc_boost: 0.15,
+        preconditions: &[
+            "operands do not overflow result type",
+            "divisor != 0 (if division involved)",
+        ],
+        postconditions: &["result is within bounds of result type"],
+        invariants: &[],
+    },
+    PatternEntry {
+        pattern: CodePattern::StringParse,
+        name_keywords: &[
+            "parse",
+            "from_str",
+            "to_string",
+            "format",
+            "encode",
+            "decode",
+            "serialize",
+            "deserialize",
+        ],
+        typical_vc_kinds: &[
+            VcKindClass::Assertion,
+            VcKindClass::Postcondition,
+            VcKindClass::Unreachable,
+        ],
+        name_confidence: 0.60,
+        vc_boost: 0.10,
+        preconditions: &["input is valid UTF-8"],
+        postconditions: &["parse(format(x)) == x (roundtrip)"],
+        invariants: &[],
+    },
+    PatternEntry {
+        pattern: CodePattern::FileIO,
+        name_keywords: &[
+            "read_file",
+            "write_file",
+            "open_file",
+            "read_from",
+            "write_to",
+            "flush",
+            "close_file",
+            "connect",
+            "send_data",
+            "recv_data",
+        ],
+        typical_vc_kinds: &[VcKindClass::Assertion, VcKindClass::Postcondition],
+        name_confidence: 0.55,
+        vc_boost: 0.10,
+        preconditions: &["file path exists and is readable (for read operations)"],
+        postconditions: &["result.is_ok() ==> operation completed successfully"],
+        invariants: &[],
+    },
+];
+
 impl PatternLibrary {
     /// Build the default pattern library with all known patterns.
     #[must_use]
-    pub fn new() -> Self {
-        Self {
-            entries: vec![
-                // Binary search pattern with formal spec text for
-                // is_sorted precondition inference.
-                PatternEntry {
-                    pattern: CodePattern::BinarySearch,
-                    name_keywords: vec![
-                        "binary_search",
-                        "bsearch",
-                        "bisect",
-                        "lower_bound",
-                        "upper_bound",
-                    ],
-                    typical_vc_kinds: vec![
-                        VcKindClass::ArithmeticOverflow,
-                        VcKindClass::IndexOutOfBounds,
-                    ],
-                    name_confidence: 0.85,
-                    vc_boost: 0.10,
-                    preconditions: vec!["slice.is_sorted()", "!slice.is_empty()"],
-                    postconditions: vec![
-                        "result.is_some() ==> slice[result.unwrap()] == target",
-                        "result.is_none() ==> forall i: usize, i < slice.len() ==> slice[i] != target",
-                    ],
-                    invariants: vec![
-                        "0 <= low && low <= high + 1 && high < slice.len()",
-                        "forall i: usize, i < low ==> slice[i] < target",
-                        "forall i: usize, high < i && i < slice.len() ==> slice[i] > target",
-                    ],
-                },
-                PatternEntry {
-                    pattern: CodePattern::Sort,
-                    name_keywords: vec![
-                        "sort",
-                        "quicksort",
-                        "mergesort",
-                        "heapsort",
-                        "insertion_sort",
-                        "bubble_sort",
-                    ],
-                    typical_vc_kinds: vec![
-                        VcKindClass::IndexOutOfBounds,
-                        VcKindClass::ArithmeticOverflow,
-                    ],
-                    name_confidence: 0.80,
-                    vc_boost: 0.10,
-                    preconditions: vec![],
-                    postconditions: vec![
-                        "result is a permutation of input",
-                        "result is sorted: forall i < result.len()-1, result[i] <= result[i+1]",
-                    ],
-                    invariants: vec!["0 <= i && i <= slice.len()", "slice[..i] is sorted"],
-                },
-                PatternEntry {
-                    pattern: CodePattern::BoundedLoop,
-                    name_keywords: vec!["bounded", "count", "iterate", "scan", "walk", "traverse"],
-                    typical_vc_kinds: vec![
-                        VcKindClass::ArithmeticOverflow,
-                        VcKindClass::IndexOutOfBounds,
-                        VcKindClass::NonTermination,
-                    ],
-                    name_confidence: 0.60,
-                    vc_boost: 0.15,
-                    preconditions: vec!["n >= 0 (loop bound is non-negative)"],
-                    postconditions: vec!["loop executed exactly n iterations"],
-                    invariants: vec![
-                        "0 <= i && i <= n",
-                        "loop variant: n - i decreases each iteration",
-                    ],
-                },
-                PatternEntry {
-                    pattern: CodePattern::Iterator,
-                    name_keywords: vec![
-                        "iter",
-                        "map",
-                        "filter",
-                        "fold",
-                        "reduce",
-                        "collect",
-                        "enumerate",
-                        "zip",
-                    ],
-                    typical_vc_kinds: vec![VcKindClass::ArithmeticOverflow],
-                    name_confidence: 0.65,
-                    vc_boost: 0.10,
-                    preconditions: vec![],
-                    postconditions: vec!["result.len() <= input.len()"],
-                    invariants: vec![],
-                },
-                PatternEntry {
-                    pattern: CodePattern::ErrorHandling,
-                    name_keywords: vec![
-                        "try_",
-                        "parse",
-                        "validate",
-                        "check",
-                        "handle_error",
-                        "from_str",
-                    ],
-                    typical_vc_kinds: vec![
-                        VcKindClass::Assertion,
-                        VcKindClass::Postcondition,
-                        VcKindClass::Unreachable,
-                    ],
-                    name_confidence: 0.60,
-                    vc_boost: 0.15,
-                    preconditions: vec![],
-                    postconditions: vec![
-                        "result.is_ok() ==> output satisfies validation",
-                        "result.is_err() ==> input was malformed",
-                    ],
-                    invariants: vec![],
-                },
-                PatternEntry {
-                    pattern: CodePattern::VecPush,
-                    name_keywords: vec!["push", "append", "extend", "add_to", "vec_insert"],
-                    typical_vc_kinds: vec![
-                        VcKindClass::ArithmeticOverflow,
-                        VcKindClass::IndexOutOfBounds,
-                    ],
-                    name_confidence: 0.60,
-                    vc_boost: 0.10,
-                    preconditions: vec!["vec.len() < usize::MAX"],
-                    postconditions: vec![
-                        "vec'.len() == vec.len() + 1",
-                        "vec'.last() == Some(&item)",
-                    ],
-                    invariants: vec![],
-                },
-                PatternEntry {
-                    pattern: CodePattern::HashLookup,
-                    name_keywords: vec![
-                        "lookup",
-                        "get_entry",
-                        "find_key",
-                        "contains_key",
-                        "hash_get",
-                    ],
-                    typical_vc_kinds: vec![VcKindClass::Assertion, VcKindClass::Postcondition],
-                    name_confidence: 0.55,
-                    vc_boost: 0.10,
-                    preconditions: vec![],
-                    postconditions: vec![
-                        "result.is_some() ==> map.contains_key(&key)",
-                        "result.is_none() ==> !map.contains_key(&key)",
-                    ],
-                    invariants: vec![],
-                },
-                PatternEntry {
-                    pattern: CodePattern::MathOp,
-                    name_keywords: vec![
-                        "add",
-                        "sub",
-                        "mul",
-                        "div",
-                        "rem",
-                        "pow",
-                        "sqrt",
-                        "abs",
-                        "midpoint",
-                        "average",
-                        "mean",
-                        "clamp",
-                        "saturating",
-                    ],
-                    typical_vc_kinds: vec![
-                        VcKindClass::ArithmeticOverflow,
-                        VcKindClass::DivisionByZero,
-                        VcKindClass::CastOverflow,
-                    ],
-                    name_confidence: 0.70,
-                    vc_boost: 0.15,
-                    preconditions: vec![
-                        "operands do not overflow result type",
-                        "divisor != 0 (if division involved)",
-                    ],
-                    postconditions: vec!["result is within bounds of result type"],
-                    invariants: vec![],
-                },
-                PatternEntry {
-                    pattern: CodePattern::StringParse,
-                    name_keywords: vec![
-                        "parse",
-                        "from_str",
-                        "to_string",
-                        "format",
-                        "encode",
-                        "decode",
-                        "serialize",
-                        "deserialize",
-                    ],
-                    typical_vc_kinds: vec![
-                        VcKindClass::Assertion,
-                        VcKindClass::Postcondition,
-                        VcKindClass::Unreachable,
-                    ],
-                    name_confidence: 0.60,
-                    vc_boost: 0.10,
-                    preconditions: vec!["input is valid UTF-8"],
-                    postconditions: vec!["parse(format(x)) == x (roundtrip)"],
-                    invariants: vec![],
-                },
-                PatternEntry {
-                    pattern: CodePattern::FileIO,
-                    name_keywords: vec![
-                        "read_file",
-                        "write_file",
-                        "open_file",
-                        "read_from",
-                        "write_to",
-                        "flush",
-                        "close_file",
-                        "connect",
-                        "send_data",
-                        "recv_data",
-                    ],
-                    typical_vc_kinds: vec![VcKindClass::Assertion, VcKindClass::Postcondition],
-                    name_confidence: 0.55,
-                    vc_boost: 0.10,
-                    preconditions: vec!["file path exists and is readable (for read operations)"],
-                    postconditions: vec!["result.is_ok() ==> operation completed successfully"],
-                    invariants: vec![],
-                },
-            ],
-        }
+    pub const fn new() -> Self {
+        Self { entries: DEFAULT_PATTERN_ENTRIES }
     }
 }
 

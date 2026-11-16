@@ -1,7 +1,9 @@
 //! The PLANTED-VIOLATION guards on the entry-sentinel tie.
 //!
 //! An in-place update whose read renders BARE is pinned to an explicit pre-write
-//! token (`stamp_entry_valued_recurrent_read`). Since the 2026-08-29 mint gate,
+//! token (`stamp_entry_valued_recurrent_read`; since 2026-09-30 the stale-read
+//! seal `seal_bare_reads` mints the same two spellings behind the same gate for
+//! every point-stamped fact). Since the 2026-08-29 mint gate,
 //! that token is the entry sentinel `n#e` ONLY where
 //! `full_graph_union_is_entry_only` proves the pre-write value IS the
 //! function-entry value on every path into the minting block — normal or unwind —
@@ -28,10 +30,19 @@
 //!    consumer holding a threaded `#e` fact is downstream of the mint block's
 //!    own write, so it versions the base and the clause ADMITS — the tie at a
 //!    cleanup consumer is now the TRUE identity `entry == entry` (see
-//!    `the_tie_at_a_cleanup_consumer_is_sound_and_the_stale_sibling_degrades`).
+//!    `the_tie_at_a_cleanup_consumer_is_sound_and_no_stale_sibling_is_minted`).
 //!    The clause is retained fail-closed for empty-map/step-cap corners; the
 //!    fixture that used to isolate it (`cleanup_consumer` with an EMPTY v2
 //!    entry map) was retired with the unwind-blind map itself.
+//!    WIDENED 2026-09-30 (vac Phase 1.1): a consumer with NO token for the base
+//!    admits too, when `full_graph_union_is_entry_only` holds at the consumer
+//!    block — no token at the point and an exactly-`{e}` unwind-inclusive union
+//!    means every bare base there IS the entry value. Needed because the Phase 0
+//!    stale-read seal (`seal_bare_reads`, now a SECOND `#e` mint site behind the
+//!    same mint gate) spells entry reads `#e` inside point-stamped facts while a
+//!    consumer that never writes the base spells it bare. The clause still
+//!    refuses wherever that oracle fails closed (unreachable block, trip-built
+//!    index, any non-`e` token in the union).
 //!  * COLLISION. Delete the collision check in `entry_sentinel_ties` and
 //!    `no_tie_onto_a_local_…` fails with the same conjunct; delete the mint-site
 //!    `#pre` collision refusal and
@@ -50,6 +61,9 @@
 //! and the consumer-side clause — once documented dead — is now load-bearing.
 
 use trust_types::*;
+
+#[path = "support/test_router.rs"]
+mod test_router;
 
 /// Every `Eq(Var(x), Var(y))` where `x` is literally `y#e` — the tie's shape.
 fn ties(vcs: &[VerificationCondition]) -> Vec<String> {
@@ -114,7 +128,7 @@ fn verdicts_of_kind(
     func: &VerifiableFunction,
     want: fn(&VcKind) -> bool,
 ) -> Vec<VerificationResult> {
-    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+    let router = test_router::deterministic_test_router();
     trust_vcgen::generate_vcs(func)
         .into_iter()
         .filter(|vc| want(&vc.kind))
@@ -145,6 +159,7 @@ fn func(name: &str, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> Verifiab
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -312,11 +327,8 @@ fn colliding_local() -> VerifiableFunction {
 /// `VerifiableFunction` JSON and `validate_function` checks no CFG/cleanup
 /// invariant — asserted valid below so the front door stays the front door.
 fn mixed_unwind_mint() -> VerifiableFunction {
-    let u32_local = |index: usize, name: &str| LocalDecl {
-        index,
-        ty: Ty::u32(),
-        name: Some(name.into()),
-    };
+    let u32_local =
+        |index: usize, name: &str| LocalDecl { index, ty: Ty::u32(), name: Some(name.into()) };
     let int_var = |name: &str| Box::new(Formula::Var(name.into(), Sort::Int));
     VerifiableFunction {
         name: "mixed_unwind_mint".into(),
@@ -357,7 +369,11 @@ fn mixed_unwind_mint() -> VerifiableFunction {
                         span: SourceSpan::default(),
                     },
                 },
-                BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Goto(BlockId(3)) },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
                 BasicBlock {
                     id: BlockId(3),
                     stmts: vec![Statement::Assign {
@@ -396,6 +412,7 @@ fn mixed_unwind_mint() -> VerifiableFunction {
         ],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -470,10 +487,8 @@ fn cleanup_mint() -> VerifiableFunction {
             },
         ],
     );
-    f.preconditions = vec![Formula::Ge(
-        Box::new(Formula::Var("n".into(), Sort::Int)),
-        Box::new(Formula::Int(3)),
-    )];
+    f.preconditions =
+        vec![Formula::Ge(Box::new(Formula::Var("n".into(), Sort::Int)), Box::new(Formula::Int(3)))];
     f
 }
 
@@ -486,11 +501,7 @@ fn cleanup_mint() -> VerifiableFunction {
 fn pre_token_colliding_local() -> VerifiableFunction {
     let mut f = cleanup_mint();
     f.name = "pre_token_colliding_local".into();
-    f.body.locals.push(LocalDecl {
-        index: 4,
-        ty: Ty::u32(),
-        name: Some("n#pre_s2_0".into()),
-    });
+    f.body.locals.push(LocalDecl { index: 4, ty: Ty::u32(), name: Some("n#pre_s2_0".into()) });
     f
 }
 
@@ -529,11 +540,8 @@ fn pre_token_colliding_local() -> VerifiableFunction {
 /// the rebind point, so the gen-key refusal in `version_block_def_at_establish`
 /// is fixture-isolated again — see the test below.
 fn split_subject_escape() -> VerifiableFunction {
-    let u32_local = |index: usize, name: &str| LocalDecl {
-        index,
-        ty: Ty::u32(),
-        name: Some(name.into()),
-    };
+    let u32_local =
+        |index: usize, name: &str| LocalDecl { index, ty: Ty::u32(), name: Some(name.into()) };
     VerifiableFunction {
         name: "split_subject_escape".into(),
         def_path: "tie_guard::split_subject_escape".into(),
@@ -612,6 +620,7 @@ fn split_subject_escape() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -709,9 +718,7 @@ fn no_entry_sentinel_when_an_unwind_path_can_deliver_a_write() {
     // Not to silence, and not to the bare def: the post-write read must ship
     // under the mixed-join spelling the unwind-inclusive map mints for it.
     assert!(
-        vcs.iter().any(|vc| {
-            vc.formula.free_variables().iter().any(|v| v == "n#e_s1_0")
-        }),
+        vcs.iter().any(|vc| { vc.formula.free_variables().iter().any(|v| v == "n#e_s1_0") }),
         "bb3's read of `n` must carry the mixed-join spelling `n#e_s1_0` \
          (partially entry, partially bb1's write) — bare would re-admit the \
          cross-path unification, `#e` would assert entry-hood falsely"
@@ -760,9 +767,7 @@ fn a_cleanup_block_mint_is_stamped_pre_not_entry() {
         entry_sentinel_spellings(&vcs)
     );
     assert!(
-        vcs.iter().any(|vc| {
-            vc.formula.free_variables().iter().any(|v| v == "n#s0_0")
-        }),
+        vcs.iter().any(|vc| { vc.formula.free_variables().iter().any(|v| v == "n#s0_0") }),
         "bb2's pre-update read must carry bb0's write token `n#s0_0` across the \
          cleanup edge — bare would re-admit the entry unification, and the \
          historical `n#pre_s2_0` havoc would leave the write disconnected"
@@ -804,18 +809,14 @@ fn no_pin_onto_a_local_that_is_literally_named_with_the_pre_token() {
     let f = pre_token_colliding_local();
     let vcs = trust_vcgen::generate_vcs(&f);
     assert!(
-        !vcs.iter().any(|vc| {
-            vc.formula.free_variables().iter().any(|v| v == "n#pre_s2_0")
-        }),
+        !vcs.iter().any(|vc| { vc.formula.free_variables().iter().any(|v| v == "n#pre_s2_0") }),
         "`n#pre_s2_0` here is a REAL local, not the pin's fallback token; \
          stamping it aliases an unrelated place"
     );
     assert!(ties(&vcs).is_empty(), "{:?}", ties(&vcs));
     assert!(
-        vcs.iter().any(|vc| matches!(
-            vc.kind,
-            VcKind::DivisionByZero | VcKind::UnsupportedMir { .. }
-        )),
+        vcs.iter()
+            .any(|vc| matches!(vc.kind, VcKind::DivisionByZero | VcKind::UnsupportedMir { .. })),
         "the refusal must cost a hypothesis, never the obligation; got {:?}",
         vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
     );
@@ -830,24 +831,24 @@ fn no_pin_onto_a_local_that_is_literally_named_with_the_pre_token() {
 ///  * bb2 versions the pinned def's subject to `n#s0_0`, so the tie's bare
 ///    side meets ONLY the `Fact::entry` bucket, where bare means entry — the
 ///    tie `Eq(n#e, n)` is the TRUE identity `entry == entry` and may ship.
-///  * The stale establish-stamped sibling (`n#s0_0 == n / 3`, bare read)
-///    re-stamps at bb2 into the recurrence `n#s0_0 == n#s0_0 / 3` — a FALSE
-///    hypothesis — and the `self_referential_definition` scanner catches it
-///    and DEGRADES that row (fail-closed, `Unknown`), instead of shipping it.
+///  * The establish-stamped definition reads the entry sentinel
+///    (`n#s0_0 == n#e / 3`), so the stale bare-read sibling that once re-stamped
+///    into the recurrence `n#s0_0 == n#s0_0 / 3` is never minted (2026-09-30;
+///    it used to be degraded by the `self_referential_definition` scanner).
+///    (Local, 2026-09-29: the same-block lanes also spell a read taken before a
+///    same-block write as its pre-write symbol, `n#pre_s0_*`; either spelling is
+///    sound, a bare or post-write read is not.)
 ///  * The DivisionByZero obligation survives and stays refutable — no
 ///    hypothesis reaches the cleanup read that masks it.
 #[test]
-fn the_tie_at_a_cleanup_consumer_is_sound_and_the_stale_sibling_degrades() {
+fn the_tie_at_a_cleanup_consumer_is_sound_and_no_stale_sibling_is_minted() {
     let f = cleanup_consumer();
     trust_vcgen::validate_function(&f).expect("the fixture must be VALID TrustIR");
     let vcs = trust_vcgen::generate_vcs(&f);
     // Any tie that ships must be the exact sound spelling `Eq(n#e, n)` — the
     // identity between two entry-denoting spellings — never anything else.
     for tie in ties(&vcs) {
-        assert!(
-            tie.contains("n#e"),
-            "only the entry identity may ship as a tie here: {tie}"
-        );
+        assert!(tie.contains("n#e"), "only the entry identity may ship as a tie here: {tie}");
     }
     // No recurrence may SHIP: the stale sibling's recurrence is degraded, not
     // conjoined (the degraded row's formula carries no variables).
@@ -857,15 +858,35 @@ fn the_tie_at_a_cleanup_consumer_is_sound_and_the_stale_sibling_degrades() {
         "an in-place update reaching a cleanup block must not ship a recurrence:\n  {}",
         split.join("\n  ")
     );
-    // The fail-closed route, watched: the stale sibling is DEGRADED by the
-    // recurrence scanner rather than silently dropped or shipped.
-    assert!(
-        vcs.iter().any(|vc| matches!(
+    // RE-ADJUDICATED 2026-09-30 (vac Phase 0 sealed bare entry reads): the
+    // stale sibling is no longer MINTED, so there is nothing left to degrade.
+    // The establish now stamps its read with the entry sentinel —
+    // `n#s0_0 == n#e / 3` — and the cleanup division carries that true
+    // definition, never the bare-read spelling that re-stamped into a cycle.
+    // Merge 2026-10-14: the local same-block lane
+    // (`block_defs::pin_bare_reads_rewritten_before`) may spell the same read as its
+    // pre-write symbol `n#pre_s0_*`, and a degraded row is also sound; what must
+    // never happen is a definition reading `n` bare across the write.
+    let div = vcs
+        .iter()
+        .find(|vc| matches!(vc.kind, VcKind::DivisionByZero))
+        .expect("bb2's `100 / n` must raise an obligation");
+    let text = format!("{:?}", div.formula);
+    let degraded = vcs.iter().any(|vc| {
+        matches!(
             &vc.kind,
             VcKind::UnsupportedMir { kind, .. } if kind == "SelfReferentialDefinition"
-        )),
-        "the stale establish-stamped sibling must degrade fail-closed; kinds: {:?}",
-        vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+        )
+    });
+    let pre_write_read =
+        div.formula.free_variables().iter().any(|v| v == "n#e" || v.starts_with("n#pre_s0_"));
+    assert!(
+        degraded || pre_write_read,
+        "the in-place update must degrade or read the pre-write value: {text}"
+    );
+    assert!(
+        !text.contains(r#"Div(Var("n", Int)"#),
+        "no definition may read `n` bare across the write: {text}"
     );
     // Laundering control: the cleanup division's obligation survives and no
     // hypothesis (tie included) masks it.
@@ -894,6 +915,88 @@ fn no_tie_onto_a_local_that_is_literally_named_with_the_entry_sentinel() {
          asserts an equality the program never establishes:\n  {}",
         emitted.join("\n  ")
     );
+}
+
+/// `*x = *x / 3` through a `&mut u32` PARAMETER, then a division by `*x`: an
+/// in-place update whose subject is a POINTEE.
+///
+/// THE DECISION THIS PINS (2026-09-30). `block_defs::def_subject_establish_stmt` finds
+/// the store through `x` as the establish point of the def `x* == x* / 3` (the threading
+/// lane's fix for a store through a pointer). `path_defs::pin_in_place_update_reads`
+/// deliberately does NOT ask it: it keeps the base-keyed search, finds no establishing
+/// write of the parameter `x`, and ships the def unpinned. Asking it would mint the
+/// entry sentinel `x*#e` for a pointee read and widen the audited tie to pointees,
+/// which docs/KNOWN_HAZARDS.md (the OPEN entry on a field read before a write) files
+/// for decision. Unpinned, the def renders as the recurrence `x*#t == x*#t / 3`, which
+/// `entry.rs`'s scanner degrades: fail-closed, never a proof.
+fn pointee_in_place_update() -> VerifiableFunction {
+    let deref = |l: usize| Place { local: l, projections: vec![Projection::Deref] };
+    func(
+        "pointee_in_place_update",
+        vec![
+            LocalDecl { index: 0, ty: Ty::u32(), name: Some("__ret".into()) },
+            LocalDecl {
+                index: 1,
+                ty: Ty::Ref { mutable: true, inner: Box::new(Ty::u32()) },
+                name: Some("x".into()),
+            },
+        ],
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: deref(1),
+                    rvalue: Rvalue::BinaryOp(
+                        BinOp::Div,
+                        Operand::Copy(deref(1)),
+                        Operand::Constant(ConstValue::Uint(3, 32)),
+                    ),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Goto(BlockId(1)),
+            },
+            BasicBlock {
+                id: BlockId(1),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::BinaryOp(
+                        BinOp::Div,
+                        Operand::Constant(ConstValue::Uint(100, 32)),
+                        Operand::Copy(deref(1)),
+                    ),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            },
+        ],
+    )
+}
+
+#[test]
+fn a_pointee_in_place_update_mints_no_entry_sentinel() {
+    let f = pointee_in_place_update();
+    trust_vcgen::validate_function(&f).expect("the fixture must be VALID TrustIR");
+    let vcs = trust_vcgen::generate_vcs(&f);
+    assert!(
+        entry_sentinel_spellings(&vcs).is_empty(),
+        "an in-place update through a pointer must not mint `#e` for the pointee (an owner \
+         decision, docs/KNOWN_HAZARDS.md): {:?}",
+        entry_sentinel_spellings(&vcs)
+    );
+    assert!(ties(&vcs).is_empty(), "{:?}", ties(&vcs));
+    // Fail-closed, not vacuous: the division still raises a row, and no row proves.
+    assert!(
+        vcs.iter()
+            .any(|vc| matches!(vc.kind, VcKind::DivisionByZero | VcKind::UnsupportedMir { .. })),
+        "the division by `*x` must still raise an obligation; got {:?}",
+        vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+    );
+    for r in verdicts_of_kind(&f, |k| matches!(k, VcKind::DivisionByZero)) {
+        assert!(
+            !matches!(r, VerificationResult::Proved { .. }),
+            "`100 / *x` after `*x = *x / 3` can divide by zero: {r:?}"
+        );
+    }
 }
 
 /// Every real-MIR body in `tests/data`, the corpus the subsumption claim was
@@ -939,6 +1042,7 @@ fn the_tied_population_is_exactly_the_gate_admitted_corpus() {
         ("mixed_unwind_mint".to_string(), mixed_unwind_mint()),
         ("cleanup_mint".to_string(), cleanup_mint()),
         ("pre_token_colliding_local".to_string(), pre_token_colliding_local()),
+        ("pointee_in_place_update".to_string(), pointee_in_place_update()),
     ]) {
         if !ties(&trust_vcgen::generate_vcs(&func)).is_empty() {
             tied.push(label);
@@ -952,9 +1056,19 @@ fn the_tied_population_is_exactly_the_gate_admitted_corpus() {
     // inclusive entry map), so the consumer-side clause of
     // `entry_sentinel_tie_is_sound` legitimately ADMITS — the tie is the true
     // identity `entry == entry` there (see
-    // `the_tie_at_a_cleanup_consumer_is_sound_and_the_stale_sibling_degrades`,
+    // `the_tie_at_a_cleanup_consumer_is_sound_and_no_stale_sibling_is_minted`,
     // which also pins that the row stays unmasked). No guard fixture joined;
     // no admission dropped out.
+    //
+    // Re-anchored 2026-09-30 (vac Phase 0 seal + the exempt-fact tie):
+    // `selfadd_guarded_index` JOINED. Derivation: its `i + 100` overflow assert's
+    // semantic guard reads `i` at its own statement, where it is the entry value,
+    // so the stale-read seal spells it `i#e`; the guard is conjoined after the
+    // row's rename, and `entry_sentinel_ties_for_exempt_facts` ties it at the
+    // bounds consumer, which VERSIONS `i` (`i#s2_0`) — the existing consumer
+    // clause, the true identity `entry == entry`. Verdicts unchanged: the
+    // overflow row proves and the `a[i]` row is refuted at `i = 0 -> 100`. No
+    // guard fixture joined; no admission dropped out.
     assert_eq!(
         tied,
         vec![
@@ -964,6 +1078,7 @@ fn the_tied_population_is_exactly_the_gate_admitted_corpus() {
             "entry_sentinel_unranged_overflow",
             "entry_sentinel_unranged_overflow_tied_control",
             "join_weakened_entry_sentinel",
+            "selfadd_guarded_index",
         ],
         "the tie population moved; re-derive which admissions/refusals changed \
          before re-anchoring this list"
@@ -975,9 +1090,7 @@ fn the_tied_population_is_exactly_the_gate_admitted_corpus() {
 /// pass vacuously.
 #[test]
 fn both_guard_fixtures_still_raise_their_arithmetic_obligation() {
-    for (label, f) in
-        [("cleanup", cleanup_consumer()), ("collision", colliding_local())]
-    {
+    for (label, f) in [("cleanup", cleanup_consumer()), ("collision", colliding_local())] {
         let vcs = trust_vcgen::generate_vcs(&f);
         assert!(
             vcs.iter().any(|vc| matches!(

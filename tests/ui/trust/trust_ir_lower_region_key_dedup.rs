@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // The enum-id-collision root-fix (the last of the six full-population
 // divergences, wave-full-0831): ADT registration keys erase REGIONS
 // unconditionally (`canonical_adt_args`). Two region spellings of ONE

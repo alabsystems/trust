@@ -1,0 +1,79 @@
+#![feature(prelude_import)]
+//@ only-apple
+//@ edition: 2021
+//@ proc-macro: thiserror_shaped.rs
+//@ revisions: in_process isolated
+//@ compile-flags: -Zunpretty=expanded
+//@[isolated] compile-flags: -Ztrust-proc-macro-isolation
+//@ check-pass
+//! Trust (D21): a thiserror-shaped derive (a format string per variant, positional
+//! and captured fields, a `#[from]` conversion, mixed-site hygiene) expands to the
+//! same program in rustc (`in_process`) and in the sandboxed worker (`isolated`).
+//! `expansions_are_identical.rs` requires the two expected files to be
+//! byte-identical.
+extern crate std;
+#[prelude_import]
+use std::prelude::rust_2021::*;
+
+#[macro_use]
+extern crate thiserror_shaped;
+
+pub enum LoadFailure {
+
+    #[error("the file is empty")]
+    Empty,
+
+    #[error("line {line}: {reason}")]
+    Parse {
+        line: usize,
+        reason: String,
+    },
+
+    #[error("expected {0} fields, found {1}")]
+    Arity(usize, usize),
+
+    #[error("i/o: {0}")]
+    Io(
+        #[from]
+        std::io::Error),
+}
+#[automatically_derived]
+impl ::core::fmt::Debug for LoadFailure {
+    #[inline]
+    fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+        match self {
+            Self::Empty => ::core::fmt::Formatter::write_str(f, "Empty"),
+            Self::Parse { line: __self_0, reason: __self_1 } =>
+                ::core::fmt::Formatter::debug_struct_field2_finish(f,
+                    "Parse line reason", __self_0, &__self_1),
+            Self::Arity(__self_0, __self_1) =>
+                ::core::fmt::Formatter::debug_struct_field2_finish(f, "Arity",
+                    __self_0, &__self_1),
+            Self::Io(__self_0) =>
+                ::core::fmt::Formatter::debug_struct_field1_finish(f, "Io",
+                    &__self_0),
+        }
+    }
+}
+impl ::core::fmt::Display for LoadFailure {
+    fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>)
+        -> ::core::fmt::Result {
+        match self {
+            Self::Empty =>
+
+                formatter.write_fmt(format_args!("the file is empty")),
+            Self::Parse { line, reason } =>
+                formatter.write_fmt(format_args!("line {0}: {1}", line,
+                        reason)),
+            Self::Arity(_0, _1) =>
+                formatter.write_fmt(format_args!("expected {0} fields, found {1}",
+                        _0, _1)),
+            Self::Io(_0) => formatter.write_fmt(format_args!("i/o: {0}", _0)),
+        }
+    }
+}
+impl ::std::error::Error for LoadFailure {}
+impl ::core::convert::From<std::io::Error> for LoadFailure {
+    fn from(source: std::io::Error) -> Self { LoadFailure::Io(source) }
+}
+fn main() {}

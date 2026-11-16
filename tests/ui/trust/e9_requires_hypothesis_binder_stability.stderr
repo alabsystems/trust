@@ -1,0 +1,134 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (rmax_le_left)
+  --> $DIR/e9_requires_hypothesis_binder_stability.rs:43:5
+   |
+LL | /     theorem rmax_le_left : forall (a : UInt64) (b : UInt64),
+LL | |         Nat.le (UInt64.toNat b) (UInt64.toNat a) ->
+LL | |         Nat.le (UInt64.toNat (if a < b then b else a)) (UInt64.toNat a) :=
+LL | |         fun a b h => Decidable.casesOn
+...  |
+LL | |             (fun _ => Nat.le.refl (UInt64.toNat a))
+LL | |             (fun _ => h)
+   | |________________________^
+
+
+=== Trust Verification Report (e9_requires_hypothesis_binder_stability) ===
+
+note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked, 1 assumed (requires) out of 4 obligation(s)
+  --> $DIR/e9_requires_hypothesis_binder_stability.rs:57:1
+   |
+LL | / pub fn rmax_plain(a: u64, b: u64) -> u64
+LL | |     requires b <= a
+LL | |     ensures result <= a by rmax_le_left
+...  |
+LL | |     if a < b { b } else { a }
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+   = note: [unknown] conditional definition-entry assumption; every caller must establish the requires contract
+
+note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked, 1 assumed (requires) out of 4 obligation(s)
+  --> $DIR/e9_requires_hypothesis_binder_stability.rs:69:1
+   |
+LL | / pub fn rmax_mut(mut a: u64, b: u64) -> u64
+LL | |     requires b <= a
+LL | |     ensures result <= a by rmax_le_left
+...  |
+LL | |     a
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+   = note: [unknown] conditional definition-entry assumption; every caller must establish the requires contract
+
+note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked, 1 assumed (requires) out of 4 obligation(s)
+  --> $DIR/e9_requires_hypothesis_binder_stability.rs:80:1
+   |
+LL | / pub fn rmax_shadow(a: u64, b: u64) -> u64
+LL | |     requires b <= a
+LL | |     ensures result <= a by rmax_le_left
+...  |
+LL | |     if a < b { b } else { a }
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+   = note: [unknown] conditional definition-entry assumption; every caller must establish the requires contract
+
+note: Trust verification: 1 proved, 1 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_requires_hypothesis_binder_stability.rs:93:1
+   |
+LL | / pub fn violate() -> u64 {
+LL | |
+LL | |     rmax_plain(0, 5)
+LL | | }
+   | |_^
+   |
+   = note: [precond] FAILED (ay-in-process); counterexample: 
+
+error: Trust strict verification failed for `e9_requires_hypothesis_binder_stability::violate`: 1 obligation(s) were not fully verified
+  --> $DIR/e9_requires_hypothesis_binder_stability.rs:93:1
+   |
+LL | / pub fn violate() -> u64 {
+LL | |
+LL | |     rmax_plain(0, 5)
+LL | | }
+   | |_^
+   |
+   = note: summary: 1 trusted, 0 certified, 1 failed, 0 unknown, 0 runtime-checked, 0 skipped out of 2
+   = note: failed obligations, including declared contract panics, are refutations and are not permitted under strict verification; select -Ztrust-policy=advisory to record contract-panic conditional evidence
+   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because an obligation row carries a refuted verdict (even if the aggregate summary reports it differently)
+   = note: --- native verifier detail (15 line(s) below; engine internals, not required to act on this error) ---
+   = note: native full verifier status: Inconclusive; requested=2, proved=1, failed=0, unknown=1, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=8 bundle_digest=sha256:$DIGEST requests=3
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=1 proof_obligations=[1] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=2 proof_obligations=[2] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=3 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier evidence `vc:e9_requires_hypothesis_binder_stability__violate:precondition:0`: constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-0-proof-0, function=violate, kind=Assertion, relations=1, clauses=1
+   = note: native full verifier evidence `vc:e9_requires_hypothesis_binder_stability__violate:precondition:0`: native trust_mc typed CHC/PDR full-verification runner selected PdrProof for obligation trust_ir-native-trust_mc-request-0-proof-0
+   = note: native full verifier evidence `vc:e9_requires_hypothesis_binder_stability__violate:precondition:0`: native trust_mc typed CHC/PDR full-verification runner refuted obligation trust_ir-native-trust_mc-request-0-proof-0; refusing to emit proof evidence
+   = note: native full verifier evidence `vc:e9_requires_hypothesis_binder_stability__violate:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
+   = note: native full verifier evidence `vc:e9_requires_hypothesis_binder_stability__violate:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
+   = note: native full verifier evidence `vc:e9_requires_hypothesis_binder_stability__violate:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
+   = note: native full verifier evidence `vc:e9_requires_hypothesis_binder_stability__violate:assertion:panic-freedom:0`: native trust_mc typed CHC/PDR proof accepted from a live opaque native-bundle authority, with exact typed-CHC/request binding and digest-backed artifacts; the serialized transport remains diagnostic-only
+   = note: native full verifier evidence `vc:e9_requires_hypothesis_binder_stability__violate:assertion:panic-freedom:0`: native typed CHC/PDR proof transport: schema=1, suite=trust_ir, backend=trust_mc::typed-chc-pdr::chc::trivial-safe, request_id=2, proof_id=Some(2), native_id=trust_ir-native-trust_mc-request-2-proof-2, status=Proved, strength=ChcValidity, solver_artifacts=1, replay_artifacts=1, check_artifacts=1
+   = note: native full verifier evidence `vc:e9_requires_hypothesis_binder_stability__violate:assertion:panic-freedom:0`: private structural derivation found no Horn rule for typed CHC query target `error`; public evidence remains a candidate
+
+note: citation `rmax_le_left` kernel-discharges this postcondition UNDER this function's `requires`, but not unconditionally (requires-link: kernel-canonical)
+  --> $DIR/e9_requires_hypothesis_binder_stability.rs:59:28
+   |
+LL |     ensures result <= a by rmax_le_left
+   |                            ^^^^^^^^^^^^
+   |
+   = note: the cited theorem proves the clause with `result` bound to the imported definition of `rmax_plain` and these preconditions assumed: h0 = `b <= a` (`requires` #0)
+   = note: it therefore says NOTHING about an input that violates them; a caller assumes this `ensures` only as `requires → ensures` at a statically resolved call, so it obtains the postcondition only where it establishes these preconditions there
+   = note: requires-link: kernel-canonical — each hypothesis the theorem consumes was judged by the kernel against the LIFTED reading (`x as nat` / `x as int`) of the precondition callers are charged; that reading is built by the compiler through the nat-lift table
+   = note: this conditional discharge is creditable to the postcondition obligation at `Trusted`, never `Certified` (owner ruling OR-A1, 2026-09-27): a row already proved by another lane keeps that proof, and a row the discharge lane does credit carries the requires-link marker, ships no kernel proof evidence, and is withheld by the authenticated `targo trust` lane; the per-function report names the rows that were credited, if any
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows, and never over a row another lane already proved
+
+error: citation `rmax_le_left` failed the strict Clean statement/certification audit against this postcondition with `result` bound to the imported definition of `rmax_mut`: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), App(App(Const(Name { depth: 2, suffix: [\"Nat\", \"le\"], lean4_hash: 959676cc24c7aac2 }, []), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), App(App(Const(Name { depth: 1, suffix: [\"trust_import_e9_requires_hypothe\"…], lean4_hash: f194a3f7d0660cda }, []), BVar(1)), BVar(0)))), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), BVar(1))))), inferred: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), Pi(BinderData { info: Default, mult: Many }, App(App(Const(Name { depth: 2, suffix: [\"Nat\", \"le\"], lean4_hash: 959676cc24c7aac2 }, []), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), BVar(0))), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), BVar(1))), App(Lam(BinderData { info: Default, mult: Many }, App(Const(Name { depth: 1, suffix: [\"Decidable\"], lean4_hash: 3c44dadad7cdbb57 }, []), App(App(App(App(Const(Name { depth: 2, suffix: [\"LT\", \"lt\"], lean4_hash: a4394a0409fbeb36 }, [Zero]), Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, [])), Const(Name { depth: 1, suffix: [\"instLTUInt64\"], lean4_hash: 34f54cc7048668b7 }, [])), BVar(2)), BVar(1))), App(App(Const(Name { depth: 2, suffix: [\"Nat\", \"le\"], lean4_hash: 959676cc24c7aac2 }, []), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), App(App(App(App(App(Const(Name { depth: 2, suffix: [\"Decidable\", \"casesOn\"], lean4_hash: 0e7f0c8e7d884112 }, [Succ(Zero)]), App(App(App(App(Const(Name { depth: 2, suffix: [\"LT\", \"lt\"], lean4_hash: a4394a0409fbeb36 }, [Zero]), Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, [])), Const(Name { depth: 1, suffix: [\"instLTUInt64\"], lean4_hash: 34f54cc7048668b7 }, [])), BVar(3)), BVar(2))), Lam(BinderData { info: Default, mult: Many }, App(Const(Name { depth: 1, suffix: [\"Decidable\"], lean4_hash: 3c44dadad7cdbb57 }, []), App(App(App(App(Const(Name { depth: 2, suffix: [\"LT\", \"lt\"], lean4_hash: a4394a0409fbeb36 }, [Zero]), Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, [])), Const(Name { depth: 1, suffix: [\"instLTUInt64\"], lean4_hash: 34f54cc7048668b7 }, [])), BVar(3)), BVar(2))), Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []))), BVar(0)), Lam(BinderData { info: Default, mult: Many }, Pi(BinderData { info: Default, mult: Many }, App(App(App(App(Const(Name { depth: 2, suffix: [\"LT\", \"lt\"], lean4_hash: a4394a0409fbeb36 }, [Zero]), Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, [])), Const(Name { depth: 1, suffix: [\"instLTUInt64\"], lean4_hash: 34f54cc7048668b7 }, [])), BVar(3)), BVar(2)), Const(Name { depth: 1, suffix: [\"False\"], lean4_hash: 0c98af32b1b07ae3 }, [])), BVar(4))), Lam(BinderData { info: Default, mult: Many }, App(App(App(App(Const(Name { depth: 2, suffix: [\"LT\", \"lt\"], lean4_hash: a4394a0409fbeb36 }, [Zero]), Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, [])), Const(Name { depth: 1, suffix: [\"instLTUInt64\"], lean4_hash: 34f54cc7048668b7 }, [])), BVar(3)), BVar(2)), BVar(3))))), App(Const(Name { depth: 2, suffix: [\"UInt64\", \"toNat\"], lean4_hash: 697aada3e4885f80 }, []), BVar(3)))), App(App(Const(Name { depth: 1, suffix: [\"instDecidableUInt64Lt\"], lean4_hash: 4c1d7873358a22d6 }, []), BVar(2)), BVar(1)))))), location: None }" }]
+  --> $DIR/e9_requires_hypothesis_binder_stability.rs:71:28
+   |
+LL |     ensures result <= a by rmax_le_left
+   |                            ^^^^^^^^^^^^
+   |
+   = note: statement drift and authority/provenance failures are hard citation errors; there is no router fallback (E9)
+   = note: the clause was also graded with `result` universally quantified (the reading used when no function body is imported), and the cited theorem does not prove that reading either
+   = help: options: (1) if the theorem states the intended rule, the body of `rmax_mut` disagrees with it: fix the body; (2) if the body is intended, restate the theorem so it proves the clause with `result` replaced by `rmax_mut`'s imported definition; (3) drop the `by` citation and let the solver lanes prove the clause; `TRUST_E9_DEBUG=1` prints the goal verbatim
+
+note: citation `rmax_le_left` kernel-discharges this postcondition UNDER this function's `requires`, but not unconditionally (requires-link: kernel-canonical)
+  --> $DIR/e9_requires_hypothesis_binder_stability.rs:82:28
+   |
+LL |     ensures result <= a by rmax_le_left
+   |                            ^^^^^^^^^^^^
+   |
+   = note: the cited theorem proves the clause with `result` bound to the imported definition of `rmax_shadow` and these preconditions assumed: h0 = `b <= a` (`requires` #0)
+   = note: it therefore says NOTHING about an input that violates them; a caller assumes this `ensures` only as `requires → ensures` at a statically resolved call, so it obtains the postcondition only where it establishes these preconditions there
+   = note: requires-link: kernel-canonical — each hypothesis the theorem consumes was judged by the kernel against the LIFTED reading (`x as nat` / `x as int`) of the precondition callers are charged; that reading is built by the compiler through the nat-lift table
+   = note: this conditional discharge is creditable to the postcondition obligation at `Trusted`, never `Certified` (owner ruling OR-A1, 2026-09-27): a row already proved by another lane keeps that proof, and a row the discharge lane does credit carries the requires-link marker, ships no kernel proof evidence, and is withheld by the authenticated `targo trust` lane; the per-function report names the rows that were credited, if any
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows, and never over a row another lane already proved
+
+error: aborting due to 2 previous errors
+

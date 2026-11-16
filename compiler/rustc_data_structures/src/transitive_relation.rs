@@ -335,11 +335,10 @@ impl<T: Eq + Hash + Copy> TransitiveRelation<T> {
         // with a slight tweak. In the case where `a R a`, we remove
         // that from the set of candidates.
         let ancestors = self.with_closure(|closure| {
-            let mut ancestors = closure.intersect_rows(a.0, a.0);
-
-            // Remove anything that can reach `a`. If this is a
-            // reflexive relation, this will include `a` itself.
-            ancestors.retain(|&e| !closure.contains(e, a.0));
+            // Collect anything reachable from `a` that cannot reach `a`. If this is a
+            // reflexive relation, this excludes `a` itself.
+            let mut ancestors: Vec<usize> =
+                closure.iter(a.0).filter(|&e| !closure.contains(e, a.0)).collect();
 
             pare_down(&mut ancestors, closure); // (2)
             ancestors.reverse(); // (3a)
@@ -397,6 +396,9 @@ impl<T: Eq + Hash + Copy> TransitiveRelation<T> {
 /// - Input: `[b, a, x]`. Output: `[b, a, x]`.
 /// - Input: `[a, x, b, y]`. Output: `[a, x]`.
 fn pare_down(candidates: &mut Vec<usize>, closure: &BitMatrix<usize, usize>) {
+    if candidates.len() <= 1 {
+        return;
+    }
     let mut i = 0;
     while let Some(&candidate_i) = candidates.get(i) {
         i += 1;
@@ -409,11 +411,13 @@ fn pare_down(candidates: &mut Vec<usize>, closure: &BitMatrix<usize, usize>) {
                 // mark it as dead and move on; subsequent indices will be
                 // shifted into its place.
                 dead += 1;
-            } else {
+            } else if dead > 0 {
                 candidates[j - dead] = candidate_j;
             }
             j += 1;
         }
-        candidates.truncate(j - dead);
+        if dead > 0 {
+            candidates.truncate(j - dead);
+        }
     }
 }

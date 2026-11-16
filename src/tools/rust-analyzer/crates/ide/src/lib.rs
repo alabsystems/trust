@@ -65,17 +65,17 @@ use std::time::Duration;
 use cfg::CfgOptions;
 use fetch_crates::CrateInfo;
 use hir::{ChangeWithProcMacros, EditionedFileId, crate_def_map, sym};
-use ide_db::base_db::relevant_crates;
-use ide_db::base_db::salsa::Durability;
-use ide_db::line_index;
-use ide_db::ra_fixture::RaFixtureAnalysis;
+use ide_db::base_db::TargetKind;
 use ide_db::{
     FxHashMap, FxIndexSet,
     base_db::{
         AbsPathBuf, CrateOrigin, CrateWorkspaceData, Env, FileSet, SourceDatabase, VfsPath,
-        salsa::{Cancelled, Database},
+        relevant_crates,
+        salsa::{Cancelled, Database, Durability},
     },
-    prime_caches, symbol_index,
+    line_index, prime_caches,
+    ra_fixture::RaFixtureAnalysis,
+    symbol_index,
 };
 use macros::UpmapFromRaFixture;
 use syntax::{AstNode, SourceFile, ast};
@@ -281,7 +281,7 @@ impl Analysis {
             Env::default(),
             CrateOrigin::Local { repo: None, name: None },
             crate_attrs,
-            false,
+            TargetKind::Lib { is_proc_macro: false },
             proc_macro_cwd,
             Arc::new(CrateWorkspaceData {
                 target: Err("fixture has no layout".into()),
@@ -333,11 +333,21 @@ impl Analysis {
         })
     }
 
-    pub fn parallel_prime_caches<F>(&self, num_worker_threads: usize, cb: F) -> Cancellable<()>
+    /// Warm caches for the given `scope`. `scope` must be closed under
+    /// transitive dependencies; callers that want to prime everything pass
+    /// `&base_db::all_crates(db)`.
+    pub fn parallel_prime_caches<F>(
+        &self,
+        scope: &[Crate],
+        num_worker_threads: usize,
+        cb: F,
+    ) -> Cancellable<()>
     where
         F: Fn(ParallelPrimeCachesProgress) + Sync + std::panic::UnwindSafe,
     {
-        self.with_db(move |db| prime_caches::parallel_prime_caches(db, num_worker_threads, &cb))
+        self.with_db(move |db| {
+            prime_caches::parallel_prime_caches(db, scope, num_worker_threads, &cb)
+        })
     }
 
     /// Gets the text of the source file.
@@ -685,7 +695,7 @@ impl Analysis {
 
     /// Returns whether the given crate is a proc macro.
     pub fn is_proc_macro_crate(&self, crate_id: Crate) -> Cancellable<bool> {
-        self.with_db(|db| crate_id.data(db).is_proc_macro)
+        self.with_db(|db| crate_id.data(db).target_kind.is_proc_macro())
     }
 
     /// Returns true if this crate has `no_std` or `no_core` specified.

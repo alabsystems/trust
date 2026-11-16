@@ -1,0 +1,335 @@
+{
+  "name": "bug_r9_neg",
+  "def_path": "probes_wrap::bug_r9_neg",
+  "span": {
+    "file": "src/probes_wrap.rs",
+    "line_start": 12,
+    "col_start": 0,
+    "line_end": 12,
+    "col_end": 68
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "y"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Never",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Neg",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "src/probes_wrap.rs",
+                "line_start": 12,
+                "col_start": 36,
+                "line_end": 12,
+                "col_end": 38
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "src/probes_wrap.rs",
+                "line_start": 12,
+                "col_start": 48,
+                "line_end": 12,
+                "col_end": 54
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "src/probes_wrap.rs",
+              "line_start": 12,
+              "col_start": 48,
+              "line_end": 12,
+              "col_end": 54
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "src/probes_wrap.rs",
+                "line_start": 12,
+                "col_start": 58,
+                "line_end": 12,
+                "col_end": 64
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "src/probes_wrap.rs",
+              "line_start": 12,
+              "col_start": 58,
+              "line_end": 12,
+              "col_end": 64
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::panicking::panic",
+            "args": [
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      97,
+                      115,
+                      115,
+                      101,
+                      114,
+                      116,
+                      105,
+                      111,
+                      110,
+                      32,
+                      102,
+                      97,
+                      105,
+                      108,
+                      101,
+                      100,
+                      58,
+                      32,
+                      120,
+                      32,
+                      61,
+                      61,
+                      32,
+                      48,
+                      32,
+                      124,
+                      124,
+                      32,
+                      121,
+                      32,
+                      33,
+                      61,
+                      32,
+                      120
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": null,
+            "span": {
+              "file": "src/probes_wrap.rs",
+              "line_start": 12,
+              "col_start": 40,
+              "line_end": 12,
+              "col_end": 65
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 6692626837626329215,
+              "def_index": 11823,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 6692626837626329215,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": -2147483648
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2147483647
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

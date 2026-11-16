@@ -17,12 +17,63 @@ use trust_verifier_api::{
     EngineManifest, EvidenceStatus, MetadataEntry, ObligationEvidence, TrustContractBundle,
     TrustObligation, VerificationRunResult, VerifierExecutionContext,
 };
-#[cfg(feature = "trust-build")]
-use trust_wp::TrustWpVerificationEngine;
 
+#[cfg(feature = "trust-build")]
+use super::super::engines::NativeTrustWpTrustIrEngine;
 use super::super::routing::PrimaryEngine;
 #[cfg(feature = "trust-build")]
 use super::index::NativeTrustIrObligationIdentity;
+
+mod whole_function_receipt;
+/// Trust (C1, 2026-11-06): trust-mc's live source reference facts (initialized
+/// `bool`/integer pointees of genuine source references), reached through
+/// trust-bmc's existing edge. Non-cloneable and borrowed from one exact live
+/// native bundle and its `SourceGenerationAuthority`.
+#[cfg(feature = "trust-build")]
+pub use trust_bmc::{
+    SourceReferenceFacts as NativeSourceReferenceFacts,
+    SourceReferenceFactsError as NativeSourceReferenceFactsError,
+    SourceReferenceLoadFact as NativeSourceReferenceLoadFact,
+    SourceReferenceParameterFact as NativeSourceReferenceParameterFact,
+    SourceReferenceValueFact as NativeSourceReferenceValueFact,
+};
+pub use whole_function_receipt::FreshWholeFunctionChcPdrReceipt;
+
+/// Without `trust-build` no trust-mc engine exists, so no facts can exist: the
+/// type is uninhabited and every signature that names it still compiles.
+#[cfg(not(feature = "trust-build"))]
+pub enum NativeSourceReferenceFacts<'a> {
+    #[doc(hidden)]
+    Uninhabited(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
+}
+
+/// The live source context of one dispatch: the borrowed authority, plus the
+/// compiler's source reference facts for the same bundle when it issued any.
+/// Facts without an authority are unrepresentable on every router hop.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeLiveSource<'a> {
+    pub(crate) authority: &'a SourceGenerationAuthority,
+    // Without `trust-build` the facts type is uninhabited, so this is always
+    // `None` and its only reader (the trust-mc arm) is compiled out.
+    #[cfg_attr(not(feature = "trust-build"), allow(dead_code))]
+    pub(crate) reference_facts: Option<&'a NativeSourceReferenceFacts<'a>>,
+}
+
+impl<'a> NativeLiveSource<'a> {
+    pub(crate) fn authority_only(authority: &'a SourceGenerationAuthority) -> Self {
+        Self { authority, reference_facts: None }
+    }
+}
+
+// The parallel batch executor (`execute_engine_batches_parallel`, rayon) hands
+// the live source to worker threads, so the facts must be `Sync`. A compile-time
+// assertion, so a non-`Sync` field added to trust-mc's facts fails here, at the
+// boundary that needs it, rather than as an opaque rayon bound error.
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<NativeLiveSource<'static>>;
+    let _ = assert_send_sync::<&'static NativeSourceReferenceFacts<'static>>;
+};
 
 #[derive(Debug)]
 struct LiveVerificationPublishedRun {
@@ -128,6 +179,8 @@ pub(crate) struct NativeTrustIrBundleEvidence {
     // values; they are moved through the full-verifier and exposed only by its
     // explicit live-dispatch API.
     pub(crate) fresh_exact_direct_chc_pdr_receipts: BTreeMap<String, FreshExactDirectChcPdrReceipt>,
+    pub(crate) fresh_whole_function_chc_pdr_receipts:
+        BTreeMap<String, FreshWholeFunctionChcPdrReceipt>,
 }
 
 impl NativeTrustIrBundleEvidence {
@@ -136,6 +189,7 @@ impl NativeTrustIrBundleEvidence {
             evidence,
             direct_trust_vc_receipts: BTreeMap::new(),
             fresh_exact_direct_chc_pdr_receipts: BTreeMap::new(),
+            fresh_whole_function_chc_pdr_receipts: BTreeMap::new(),
         }
     }
 }
@@ -533,15 +587,25 @@ pub(crate) fn native_trust_ir_bundle_evidence(
     bundle: &TrustContractBundle,
     obligations: &[TrustObligation],
     native_bundle: Option<&NativeVerificationBundle>,
-    source_generation_authority: Option<&SourceGenerationAuthority>,
+    live_source: Option<NativeLiveSource<'_>>,
+    // The dispatch deadline: what every live receipt minted below is bound to.
     deadline: Option<Instant>,
+    // Trust (2026-10-17, gate-rca deadline): the native lane's share of the function
+    // clock. No lane STARTS a solve after it, and a running solve is clamped to it; no
+    // receipt carries it (`VerifierExecutionContext::native_solve_cutoff`).
+    native_solve_cutoff: Option<Instant>,
+    // The session's `-Z trust-verify-timeout-ms` bounds both MC and WP;
+    // certificate-import VC work additionally follows the dispatch deadline.
+    per_obligation_timeout_ms: u64,
 ) -> Option<NativeTrustIrBundleEvidence> {
+    let solve_deadline = earliest_instant(deadline, native_solve_cutoff);
     if is_native_trust_wp_trust_ir_engine(manifest) {
         return trust_wp_native_trust_ir_bundle_evidence(
             bundle,
             obligations,
             native_bundle,
-            deadline,
+            solve_deadline,
+            per_obligation_timeout_ms,
         )
         .map(NativeTrustIrBundleEvidence::ordinary);
     }
@@ -551,6 +615,7 @@ pub(crate) fn native_trust_ir_bundle_evidence(
             obligations,
             native_bundle,
             deadline,
+            solve_deadline,
         );
     }
     if is_native_trust_mc_trust_bmc_engine(manifest) {
@@ -558,11 +623,21 @@ pub(crate) fn native_trust_ir_bundle_evidence(
             bundle,
             obligations,
             native_bundle,
-            source_generation_authority,
+            live_source,
             deadline,
+            native_solve_cutoff,
+            per_obligation_timeout_ms,
         );
     }
     None
+}
+
+/// The earlier of two optional instants (`None` = no bound).
+fn earliest_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Trust: true once the optional per-function wall-clock deadline has
@@ -597,9 +672,10 @@ fn trust_wp_native_trust_ir_bundle_evidence(
     obligations: &[TrustObligation],
     native_bundle: Option<&NativeVerificationBundle>,
     deadline: Option<Instant>,
+    timeout_ms: u64,
 ) -> Option<Vec<ObligationEvidence>> {
     let native_bundle = native_bundle?;
-    let adapter = TrustWpVerificationEngine::new();
+    let adapter = NativeTrustWpTrustIrEngine::with_timeout_ms(timeout_ms);
     if let Err(errors) = native_bundle.validate() {
         let reason = format!(
             "typed TrustIr NativeVerificationBundle validation failed: {}",
@@ -657,6 +733,7 @@ fn trust_wp_native_trust_ir_bundle_evidence(
     _obligations: &[TrustObligation],
     _native_bundle: Option<&NativeVerificationBundle>,
     _deadline: Option<Instant>,
+    _timeout_ms: u64,
 ) -> Option<Vec<ObligationEvidence>> {
     None
 }
@@ -666,21 +743,39 @@ fn trust_wp_native_trust_ir_request_for_obligation<'a>(
     native_bundle: &'a NativeVerificationBundle,
     obligation: &TrustObligation,
 ) -> Result<(&'a trust_ir::TrustWpNativeRequest, trust_ir::ProofId), String> {
-    let identity =
-        NativeTrustIrObligationIdentity::from_obligation(obligation, PrimaryEngine::TrustWp)?;
+    let identity = match NativeTrustIrObligationIdentity::from_obligation(
+        obligation,
+        PrimaryEngine::TrustWp,
+    ) {
+        Ok(identity) => identity,
+        Err(error)
+            if matches!(obligation.kind, trust_verifier_api::ObligationKind::Postcondition) =>
+        {
+            let mut identity = NativeTrustIrObligationIdentity::from_obligation(
+                obligation,
+                PrimaryEngine::TrustMc,
+            )
+            .map_err(|_| error)?;
+            // Its primary request id is not the id of the designated WP request.
+            // The index separately checks both exact public/native bindings.
+            identity.request_id = None;
+            identity
+        }
+        Err(error) => return Err(error),
+    };
     let proof_obligation_id = trust_ir::ProofId::new(identity.proof_obligation_id);
-    let request = native_bundle
+    let mut requests = native_bundle
         .requests
         .iter()
         .filter_map(|request| match request {
             NativeVerificationRequest::TrustWp(request) => Some(request),
             _ => None,
         })
-        .find(|request| {
+        .filter(|request| {
             identity.request_id.is_none_or(|request_id| request.id.index() == request_id)
                 && request.obligations.contains(&proof_obligation_id)
-        })
-        .ok_or_else(|| {
+        });
+    let request = requests.next().ok_or_else(|| {
             format!(
                 "missing matching trust_wp native TrustIr request for request_id={} proof_obligation_id={}",
                 identity
@@ -689,6 +784,9 @@ fn trust_wp_native_trust_ir_request_for_obligation<'a>(
                 identity.proof_obligation_id
             )
         })?;
+    if requests.next().is_some() {
+        return Err("ambiguous native WP request for the original obligation".into());
+    }
 
     Ok((request, proof_obligation_id))
 }
@@ -703,7 +801,11 @@ fn trust_vc_native_trust_ir_bundle_evidence(
     bundle: &TrustContractBundle,
     obligations: &[TrustObligation],
     native_bundle: Option<&NativeVerificationBundle>,
+    // The dispatch deadline, frozen into every direct receipt minted below.
     deadline: Option<Instant>,
+    // What the solves below are bounded by: the earlier of `deadline` and the native
+    // solve cutoff.
+    solve_deadline: Option<Instant>,
 ) -> Option<NativeTrustIrBundleEvidence> {
     let adapter = TrustVcVerificationEngine::new();
 
@@ -718,7 +820,7 @@ fn trust_vc_native_trust_ir_bundle_evidence(
                 bundle,
                 obligations,
                 native_bundle,
-                deadline,
+                solve_deadline,
             ),
         ));
     }
@@ -783,7 +885,7 @@ fn trust_vc_native_trust_ir_bundle_evidence(
                     bundle,
                     std::slice::from_ref(obligation),
                     native_bundle,
-                    deadline,
+                    solve_deadline,
                 ));
             }
         } else if direct_eligible {
@@ -791,7 +893,7 @@ fn trust_vc_native_trust_ir_bundle_evidence(
                 .evidence_from_release_admitted_direct_mir_memory_with_deadline(
                     bundle,
                     std::slice::from_ref(obligation),
-                    deadline,
+                    solve_deadline,
                 );
             if let [proved] = direct.as_slice()
                 && let Some(receipt) = DirectTrustVcProofReceipt::mint(
@@ -809,7 +911,7 @@ fn trust_vc_native_trust_ir_bundle_evidence(
                 bundle,
                 std::slice::from_ref(obligation),
                 native_bundle,
-                deadline,
+                solve_deadline,
             ));
         } else if direct_candidate {
             evidence.push(unsupported_direct_trust_vc_router_evidence(
@@ -830,6 +932,7 @@ fn trust_vc_native_trust_ir_bundle_evidence(
         evidence,
         direct_trust_vc_receipts,
         fresh_exact_direct_chc_pdr_receipts: BTreeMap::new(),
+        fresh_whole_function_chc_pdr_receipts: BTreeMap::new(),
     })
 }
 
@@ -876,6 +979,7 @@ fn trust_vc_native_trust_ir_bundle_evidence(
     _obligations: &[TrustObligation],
     _native_bundle: Option<&NativeVerificationBundle>,
     _deadline: Option<Instant>,
+    _solve_deadline: Option<Instant>,
 ) -> Option<NativeTrustIrBundleEvidence> {
     None
 }
@@ -923,11 +1027,22 @@ pub fn trust_wp_native_replay_metadata_entries_for_request(
 }
 
 #[cfg(feature = "trust-build")]
-fn production_trust_mc_native_trust_ir_adapter() -> TrustMcVerifierApiAdapter {
+/// Trust (2026-09-18): `timeout_ms` is the SESSION's `-Z trust-verify-timeout-ms`, not a
+/// mirror of its default. It used to be a literal `5_000`, which made the flag inert on this
+/// route — `NativeTrustMcTrustIrEngine::with_timeout_ms` documents exactly that hazard, and
+/// this was the same bug in a second place. Measured before the fix: the ceiling stayed
+/// `7s` (= 5s + the driver's 2s watchdog margin) at every flag value tried (1ms, 1s, 9s,
+/// 20s, 60s — byte-identical message).
+///
+/// The 5s INTENT is unchanged and still right — cap each solve at the per-obligation budget
+/// rather than the adapter's loose 30s default, so a grinding obligation bails to Unknown
+/// promptly instead of starving the crate's remaining verification time — it is simply read
+/// from the session now instead of being duplicated here.
+fn production_trust_mc_native_trust_ir_adapter(timeout_ms: u64) -> TrustMcVerifierApiAdapter {
     TrustMcVerifierApiAdapter::new(
         trust_bmc::TrustMcConfig::new()
             .with_proof_mode(trust_bmc::TrustMcProofMode::PdrIc3)
-            .with_timeout(5_000),
+            .with_timeout(timeout_ms),
     )
 }
 
@@ -936,8 +1051,10 @@ fn trust_mc_native_trust_ir_bundle_evidence(
     bundle: &TrustContractBundle,
     obligations: &[TrustObligation],
     native_bundle: Option<&NativeVerificationBundle>,
-    source_generation_authority: Option<&SourceGenerationAuthority>,
+    live_source: Option<NativeLiveSource<'_>>,
     deadline: Option<Instant>,
+    native_solve_cutoff: Option<Instant>,
+    per_obligation_timeout_ms: u64,
 ) -> Option<NativeTrustIrBundleEvidence> {
     let native_bundle = native_bundle?;
     // Cap each solve at the intended per-obligation SMT budget (5s), not the
@@ -961,8 +1078,12 @@ fn trust_mc_native_trust_ir_bundle_evidence(
     // solve to run; a Proved verdict still requires the solver to genuinely
     // discharge the typed CHC — an unsolved obligation stays Unknown/Unsupported
     // (never Proved).
-    let adapter = production_trust_mc_native_trust_ir_adapter();
-    if std::env::var("TRUST_NATIVE_DEBUG").is_ok() {
+    // Trust (2026-10-17, gate-rca deadline): solves stop at the cutoff; receipts keep
+    // `deadline` (`TrustMcVerifierApiAdapter::with_solve_cutoff`).
+    let adapter = production_trust_mc_native_trust_ir_adapter(per_obligation_timeout_ms)
+        .with_solve_cutoff(native_solve_cutoff);
+    static TRUST_NATIVE_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TRUST_NATIVE_DEBUG.get_or_init(|| std::env::var("TRUST_NATIVE_DEBUG").is_ok()) {
         eprintln!(
             "[NATIVE_TRUSTMC_ENGINE_SELECT] native trust-mc CHC/PDR bundle consumer entered with proof_mode=PdrIc3 (was Bmc-default: fail-closed before the structural solve) for {} obligation(s): {:?}",
             obligations.len(),
@@ -972,13 +1093,25 @@ fn trust_mc_native_trust_ir_bundle_evidence(
                 .collect::<Vec<_>>(),
         );
     }
-    let outcome = match source_generation_authority {
-        Some(source_generation_authority) => adapter
+    let outcome = match live_source {
+        // Trust (C1, 2026-11-06): with the compiler's live source reference facts,
+        // the adapter's facts entry runs BOTH the pre-solve translation and the
+        // solve through trust-mc's `_with_source_reference_facts` entries.
+        Some(NativeLiveSource { authority, reference_facts: Some(facts) }) => adapter
+            .evidence_from_native_trust_ir_bundle_with_source_reference_facts_and_deadline_and_fresh_receipts(
+                bundle,
+                obligations,
+                native_bundle,
+                authority,
+                facts,
+                deadline,
+            ),
+        Some(NativeLiveSource { authority, reference_facts: None }) => adapter
             .evidence_from_native_trust_ir_bundle_with_source_authority_and_deadline_and_fresh_receipts(
                 bundle,
                 obligations,
                 native_bundle,
-                source_generation_authority,
+                authority,
                 deadline,
             ),
         None => adapter.evidence_from_native_trust_ir_bundle_with_deadline_and_fresh_receipts(
@@ -1001,6 +1134,14 @@ fn trust_mc_native_trust_ir_bundle_evidence(
                     .then(|| (obligation_id, FreshExactDirectChcPdrReceipt::from_native(receipt)))
             })
             .collect(),
+        fresh_whole_function_chc_pdr_receipts: outcome
+            .fresh_whole_function_receipts
+            .into_iter()
+            .filter_map(|(id, receipt)| {
+                (receipt.public_obligation_id() == id)
+                    .then(|| (id, FreshWholeFunctionChcPdrReceipt::from_native(receipt)))
+            })
+            .collect(),
     })
 }
 
@@ -1009,8 +1150,10 @@ fn trust_mc_native_trust_ir_bundle_evidence(
     _bundle: &TrustContractBundle,
     _obligations: &[TrustObligation],
     _native_bundle: Option<&NativeVerificationBundle>,
-    _source_generation_authority: Option<&SourceGenerationAuthority>,
+    _live_source: Option<NativeLiveSource<'_>>,
     _deadline: Option<Instant>,
+    _native_solve_cutoff: Option<Instant>,
+    _per_obligation_timeout_ms: u64,
 ) -> Option<NativeTrustIrBundleEvidence> {
     None
 }
@@ -1022,10 +1165,23 @@ mod fresh_receipt_binding_tests {
     #[cfg(feature = "trust-build")]
     #[test]
     fn production_bundle_adapter_uses_receipt_capable_pdr_mode() {
-        let adapter = production_trust_mc_native_trust_ir_adapter();
+        let adapter = production_trust_mc_native_trust_ir_adapter(
+            crate::full_verification::engines::DEFAULT_PER_OBLIGATION_TIMEOUT_MS,
+        );
 
         assert_eq!(adapter.config().proof_mode, trust_bmc::TrustMcProofMode::PdrIc3);
-        assert_eq!(adapter.config().timeout_ms, 5_000);
+        // The CONSTANT, not a literal — the adapter must carry whatever default the
+        // compiler chose, and this pin broke when that default was raised.
+        assert_eq!(
+            adapter.config().timeout_ms,
+            crate::full_verification::engines::DEFAULT_PER_OBLIGATION_TIMEOUT_MS
+        );
+
+        // Trust (2026-09-18): and it is no longer a LITERAL — the session's value reaches
+        // the adapter. Before the fix this route ignored `-Z trust-verify-timeout-ms`
+        // entirely, so the pin above passed while the flag was inert.
+        let raised = production_trust_mc_native_trust_ir_adapter(45_000);
+        assert_eq!(raised.config().timeout_ms, 45_000);
     }
 
     #[test]

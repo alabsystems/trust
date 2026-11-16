@@ -262,6 +262,36 @@ pub const COROUTINE_RESUME_CONTRACT_ROW_KIND: &str = "contract:coroutine-resume-
 /// The `solver` label stamped on the published contract row.
 pub const COROUTINE_RESUME_CONTRACT_ROW_SOLVER: &str = "trust-classifier";
 
+/// Row kind for the compiler-published `GlobalAlloc::dealloc` panic-freedom
+/// contract in its DISCHARGED state: every allocation-owning drop in the body
+/// rests on `dealloc` never panicking, and the compiler established that no
+/// `#[global_allocator]` is registered in the crate graph, so every dealloc is
+/// `Global`'s std chain, which has no panic path. Like the coroutine contract
+/// row it rides `Outcome::Skipped` on the wire — a published contract is
+/// conditional evidence (on the final link registering no other allocator),
+/// never solver proof credit — and like it, a well-formed row shares targo's
+/// `assumed` bucket (2026-09-16: before that it was counted a genuine unknown,
+/// which made every program that drops a `String`/`Vec` INCONCLUSIVE under
+/// `targo trust build` while the compiler itself had tolerated it).
+pub const GLOBAL_ALLOC_DEALLOC_CONTRACT_ROW_KIND: &str = "contract:global-alloc-dealloc-panic-free";
+
+/// The REFUSED spelling of the same contract: a user `#[global_allocator]` is
+/// registered and no lane verifies its `dealloc` panic-free yet. A distinct
+/// kind (not a reason-text convention) so every consumer distinguishes the two
+/// states structurally; it is an unproved premise and counts as unknown.
+pub const GLOBAL_ALLOC_DEALLOC_CONTRACT_REFUSED_ROW_KIND: &str =
+    "contract:global-alloc-dealloc-panic-free:refused";
+
+/// The `solver` label stamped on both global-alloc contract rows.
+pub const GLOBAL_ALLOC_DEALLOC_CONTRACT_ROW_SOLVER: &str = "trust-classifier";
+
+/// The exact `reason` the compiler stamps on the DISCHARGED row; targo admits
+/// the row to the `assumed` bucket only when the kind, solver and this reason
+/// all match (the coroutine row's rule: no consumer may guess a discharge from
+/// looser text).
+pub const GLOBAL_ALLOC_DEALLOC_CONTRACT_DISCHARGED_REASON: &str = "global-alloc dealloc contract discharged (vacuous, `Global`): the proof remains \
+     conditional on the final link registering no other allocator";
+
 /// Exact `reason` stamped on the published contract row. Consumers (targo's
 /// partition) require this exact string as part of the row-shape check, so a
 /// hand-built row that merely claims the kind cannot green.
@@ -416,6 +446,282 @@ pub fn parse_coroutine_resume_contract_row_description(desc: &str) -> Option<Vec
     coroutine_resume_contract_states_are_valid(&states).then_some(states)
 }
 
+// ---------------------------------------------------------------------------
+// Trust (strict-lane provenance, 2026-09-24): the `assumption:*` rows the
+// compiler's STRICT policy publishes as tolerated conditional evidence.
+//
+// Since 2026-09-16 (f2a47900ec) the default `targo trust` gate grades an
+// `assumption:*` row a CONDITIONAL pass. The argument recorded there is that
+// "under the compiler's strict policy the `assumed` bucket can only hold rows
+// the compiler itself published as conditional evidence (the discharged
+// contracts, a `#[trust::assume_total]` axiom, the b59 `fmt::format` leg);
+// unaudited assumptions become `assumption:*` rows only under
+// advisory/memory-safe, which keep their gates". Nothing checked the premise.
+// `TRUSTFLAGS` could set `-Ztrust-policy` for one run, while the gate lane
+// followed the CLI flags, so `TRUSTFLAGS=-Ztrust-policy=advisory targo trust
+// check` compiled under advisory policy and graded advisory-only rows (a
+// `#[trust::skip]` opt-out, a classifier gap) on the strict lane. (That route
+// was refused from 2026-09-27 and TRUSTFLAGS is not read since T7a; the shapes
+// stay the strict gate's second layer for any other route.)
+//
+// The shapes below are that premise written down: the strict gate admits these
+// and counts every other `assumption:*` row as a genuine unknown, as the
+// memory-safe gate admits only rows stamped `MEMORY_SAFE_ASSUMPTION_ROW_SOURCE`.
+// Each constant names the compiler site that mints it in
+// `compiler/rustc_mir_transform/src/trust_verify.rs`, and
+// `tests/strict_policy_assumption_rows_parity.rs` pins that the compiler still
+// spells them this way. Drift in either direction is fail-closed: a strict row
+// the table does not list is counted unknown, never assumed.
+// ---------------------------------------------------------------------------
+
+/// Tag of a definition-entry `#[requires]` premise, whose obligation moves to
+/// every caller. The wire kind is `assumption:requires`
+/// (`TRUST_ENTRY_ASSUMPTION_TRANSPORT_KIND`). Published in every mode.
+pub const ENTRY_REQUIRES_ASSUMPTION_TAG: &str = "requires";
+
+/// Solver label on the definition-entry row (`TRUST_ENTRY_ASSUMPTION_SOLVER`).
+pub const ENTRY_REQUIRES_ASSUMPTION_ROW_SOLVER: &str = "trust-entry-assumption";
+
+/// Tag of the row that `#[trust::assume_total]` on the function ITSELF records
+/// (`skip_assumption_tag(TrustVerifySkipReason::AssumedTotal)`). The skip is not a
+/// full-verification failure, so it is recorded in every mode.
+pub const ASSUMED_TOTAL_ASSUMPTION_TAG: &str = "assumed-total";
+
+/// Solver label `record_skip_assumption` stamps on that row outside a
+/// memory-safe demotion.
+pub const ASSUMED_TOTAL_ASSUMPTION_ROW_SOLVER: &str = "trust-policy";
+
+/// Solver label on an `assumption:assumed-total-callee` row minted by the full
+/// verification lane (`TRUST_ASSUMED_TOTAL_SOLVER`).
+pub const ASSUMED_TOTAL_CALLEE_FULL_VERIFICATION_ROW_SOLVER: &str = "trust-assumed-total";
+
+/// Solver label on an `assumption:assumed-total-callee` row minted by the bridge
+/// demotion (`demote_assumed_total_callee_transport_rows`).
+pub const ASSUMED_TOTAL_CALLEE_BRIDGE_ROW_SOLVER: &str = "trust-bridge";
+
+/// Trust (D9, ruled 2026-09-27; docs/DECISION_QUEUE.md "D9"): tag of the row
+/// charged at every direct self call whose termination no `decreases` measure
+/// establishes — the inferred direct-self lane found no bindable integer measure
+/// and minted nothing, so without this row the function's termination would be
+/// a silent green. The wire kind is `assumption:termination-unmeasured`, outcome
+/// `skipped`. Minted ONLY by the compiler seam
+/// `compiler/rustc_mir_transform/src/trust_verify/termination_unmeasured.rs`, in
+/// every policy: the default (strict) lane passes it CONDITIONALLY, memory-safe
+/// admits it, and `certify` refuses the function with a compile error.
+pub const TERMINATION_UNMEASURED_ASSUMPTION_TAG: &str = "termination-unmeasured";
+
+/// Solver label on the `assumption:termination-unmeasured` row. Its own label, so
+/// no consumer has to recognize the row by its text: the strict table below and
+/// [`is_termination_unmeasured_assumption_row`] read the (kind, solver) pair.
+pub const TERMINATION_UNMEASURED_ROW_SOLVER: &str = "trust-termination-charge";
+
+/// Whether a row with this `kind` and `solver` is the compiler's D9
+/// `assumption:termination-unmeasured` charge. Shared by the compiler's
+/// memory-safe admission (`memory_safe_artifacts_have_non_demotable_failure`)
+/// and targo's memory-safe gate (`memory_safe_gate_counts`), so the two cannot
+/// drift. The OUTCOME is the caller's check: a row of this shape
+/// that claims `proved` or `runtime-checked` is a transport defect, never an
+/// admitted assumption.
+#[must_use]
+pub fn is_termination_unmeasured_assumption_row(kind: &str, solver: &str) -> bool {
+    kind.strip_prefix("assumption:") == Some(TERMINATION_UNMEASURED_ASSUMPTION_TAG)
+        && solver == TERMINATION_UNMEASURED_ROW_SOLVER
+}
+
+/// Trust (SAFETY-ASSUME-1, ruled 2026-10-17; docs/DECISION_QUEUE.md
+/// "SAFETY-ASSUME-1"): tag of the row charged for a user-written `unsafe { }`
+/// block whose `// SAFETY:` comment sits where `clippy::undocumented_unsafe_blocks`
+/// accepts one. The block's UNMODELED unsafe-operation rows (the `[unsafe] missing
+/// SAFETY comment` stand-in, `[unsafe:reborrow]`, `[unsafe:unmodeled-call]`,
+/// `[unsafe:union-field]`, `[unsafe:mutable-static]`,
+/// `[unsafe:layout-constrained-field]`) are withheld and this ONE row per block
+/// declares them as an assumption, naming the comment's location. The wire kind
+/// is `assumption:safety-comment`, outcome `skipped`: never proved, never refuted.
+/// Minted ONLY by the compiler seam
+/// `compiler/rustc_mir_transform/src/trust_verify/safety_comment_assumption.rs`,
+/// in every policy: advisory counts it `assumed`, the default (strict) lane and
+/// memory-safe pass it CONDITIONALLY, and `certify` refuses the function with a
+/// compile error. A block with no such comment keeps its rows `failed`.
+pub const SAFETY_COMMENT_ASSUMPTION_TAG: &str = "safety-comment";
+
+/// Solver label on the `assumption:safety-comment` row. Its own label, so no
+/// consumer recognizes the row by its text: the strict table below and
+/// [`is_safety_comment_assumption_row`] read the (kind, solver) pair.
+pub const SAFETY_COMMENT_ROW_SOLVER: &str = "trust-safety-comment";
+
+/// Whether a row with this `kind` and `solver` is the compiler's SAFETY-ASSUME-1
+/// `assumption:safety-comment` charge. Shared by the strict table below and
+/// targo's memory-safe gate (`memory_safe_gate_counts`), so the two cannot drift.
+/// The OUTCOME is the caller's check: a row of this shape that claims `proved`
+/// or `runtime-checked` is a transport defect, never an admitted assumption.
+#[must_use]
+pub fn is_safety_comment_assumption_row(kind: &str, solver: &str) -> bool {
+    kind.strip_prefix("assumption:") == Some(SAFETY_COMMENT_ASSUMPTION_TAG)
+        && solver == SAFETY_COMMENT_ROW_SOLVER
+}
+
+/// Trust (OD-1 phase 1, ruled 2026-10-03; docs/DECISION_QUEUE.md "OD-1",
+/// docs/design/2026-10-03-open-generic-dispatch-obligations.md §2.2): the prefix of
+/// the description of an INSTANCE-HYPOTHESIS row. At an admitted call
+/// `<P as Tr>::m` on a body's own type parameter (open, uncontracted, unresolved;
+/// the admission predicate is the compiler's
+/// `trust_verify/instance_hypothesis.rs`) the body no longer claims panic-freedom
+/// for every instantiation: the call's panic-freedom becomes a named premise
+/// `H_f(site)` and the claim becomes `H_f(τ) ⇒ panic-free(f<τ>)`. One row per
+/// admitted SITE, never one per body. Mutually non-substring with
+/// [`ABSENT_CALLEE_ASSUMPTION_PREFIX`] and [`EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX`]
+/// (pinned by `extern_call_prefix_is_marker_free`), so no absent-callee recognizer
+/// (`l0_refutation::absent_callee_name`, the fold markers) ever reads this row.
+pub const INSTANCE_HYPOTHESIS_ASSUMPTION_PREFIX: &str = "[trust-instance-hypothesis] ";
+
+/// Tag of the per-site definition row: wire kind `assumption:instance-hypothesis`,
+/// outcome `skipped`, solver [`INSTANCE_HYPOTHESIS_ROW_SOLVER`]. Advisory counts it
+/// `assumed`; the strict (default) lane passes it CONDITIONALLY
+/// ([`strict_policy_publishes_assumption_row`]); `certify` refuses the function.
+/// It stays in the denominator, grants no credit, is never `proved`, and never
+/// enters Φ, the panic-free registries or `compiler_total`. Phase 1 never retires it.
+pub const INSTANCE_HYPOTHESIS_ASSUMPTION_TAG: &str = "instance-hypothesis";
+
+/// Tag of the per-crate INVENTORY row (`assumption:instance-hypothesis:inventory-
+/// incomplete`): the instance inventory the discharge rows were drawn from is not
+/// the codegen mono collector's (phase 1 never consults it), so instances created
+/// inside upstream generic code, by unsizing to a vtable, by drop glue or by a
+/// body the compiler did not walk have no discharge row. Nothing is retired on the
+/// inventory's strength; this row only says so.
+pub const INSTANCE_HYPOTHESIS_INVENTORY_INCOMPLETE_TAG: &str =
+    "instance-hypothesis:inventory-incomplete";
+
+/// Solver label of both instance-hypothesis assumption rows and of the discharge
+/// rows (the design's `trust-classifier`). The (kind, solver) PAIR is the identity
+/// every reader checks; the label alone admits nothing (the coroutine and
+/// global-alloc rows carry it too, under their own kinds).
+pub const INSTANCE_HYPOTHESIS_ROW_SOLVER: &str = "trust-classifier";
+
+/// Wire kind of an instance DISCHARGE row: one per (admitted site, concrete
+/// instance of the definition) in this compilation's inventory, carrying the
+/// RESOLVED callee's own verdict (`proved` when the callee's body discharges
+/// panic-freedom on the shared evidence bar, `failed` when it does not and its own
+/// ledger carries evidence it can panic, or the site does not resolve, `unknown`
+/// when the callee's only non-proofs are absent callees, unmodeled MIR and unsafe
+/// blocks declared on their `// SAFETY:` comment, or its body is outside the crate).
+/// NOT an `assumption:*` row: it reports a verdict, and a `failed` one fails the gate.
+/// Its `proved` outcome carries no credit of its own (the callee's own rows carry
+/// it), so targo counts a well-formed `proved` discharge as conditional evidence,
+/// never as proof.
+pub const INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND: &str = "instance-hypothesis:discharge";
+
+/// Whether a row with this `kind` and `solver` is one of the compiler's two
+/// instance-hypothesis ASSUMPTION shapes (the per-site definition row or the
+/// per-crate inventory row). The OUTCOME is the caller's check: such a row
+/// claiming `proved` or `runtime_checked` is a transport defect.
+#[must_use]
+pub fn is_instance_hypothesis_assumption_row(kind: &str, solver: &str) -> bool {
+    matches!(
+        kind.strip_prefix("assumption:"),
+        Some(INSTANCE_HYPOTHESIS_ASSUMPTION_TAG | INSTANCE_HYPOTHESIS_INVENTORY_INCOMPLETE_TAG)
+    ) && solver == INSTANCE_HYPOTHESIS_ROW_SOLVER
+}
+
+/// Whether a row with this `kind` and `solver` is the compiler's instance
+/// DISCHARGE row shape.
+#[must_use]
+pub fn is_instance_hypothesis_discharge_row(kind: &str, solver: &str) -> bool {
+    kind == INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND && solver == INSTANCE_HYPOTHESIS_ROW_SOLVER
+}
+
+/// The dispatch callee between the first pair of backticks of an extern
+/// print/format/write dispatch row. The bridge writes
+/// "extern print/format/write dispatch `{callee}` runs a user Display/Debug impl
+/// that may panic", and the demoted `assumption:extern-call` row keeps that text
+/// after "unverified assumption: ". Neither lead-in contains a backtick. This is
+/// the extraction the compiler's `extern_call_row_callee` performs.
+#[must_use]
+pub fn extern_call_dispatch_callee(description: &str) -> Option<&str> {
+    let (_, after) = description.split_once('`')?;
+    let (callee, _) = after.split_once('`')?;
+    Some(callee)
+}
+
+/// Whether `callee` is the `format!` backend (`alloc::fmt::format`). That leg
+/// builds a `String` and has no stdout sink, so it is the one extern-call leg the
+/// strict policy may demote to a recorded assumption (FIX b59; the compiler's
+/// `transport_row_is_unproved_fmt_format_extern_call`). The `_print`/`_eprint`
+/// and writer legs are demoted only under the memory-safe policy.
+#[must_use]
+pub fn is_fmt_format_dispatch_callee(callee: &str) -> bool {
+    callee.ends_with("::fmt::format")
+}
+
+/// Whether an `assumption:*` row with this `kind`, `solver` and `description` is
+/// one the compiler's STRICT policy (the default, and `certify`) publishes as
+/// tolerated conditional evidence:
+///
+/// * `assumption:requires` / `trust-entry-assumption`: a definition-entry premise;
+/// * `assumption:assumed-total` / `trust-policy`: `#[trust::assume_total]` on the
+///   function itself;
+/// * `assumption:assumed-total-callee` / `trust-assumed-total` or `trust-bridge`:
+///   a call to a `#[trust::assume_total]` wrapper;
+/// * `assumption:extern-call` / `trust-memory-safe` naming a `…::fmt::format`
+///   dispatch: the b59 `format!` leg;
+/// * `assumption:termination-unmeasured` / `trust-termination-charge`: a direct
+///   self call no `decreases` measure covers (D9, ruled 2026-09-27: "the default
+///   lane passes it as CONDITIONAL, disclosed on the Gate line like every
+///   recorded `assumption:*` row; `--certify` refuses it"). The strict compiler
+///   publishes it and does not abort; under `certify` it publishes it and aborts.
+/// * `assumption:instance-hypothesis` and
+///   `assumption:instance-hypothesis:inventory-incomplete` /
+///   `trust-classifier`: an admitted open generic dispatch site's premise and the
+///   crate's instance-inventory disclosure (OD-1 phase 1, ruled 2026-10-03: "advisory
+///   `assumed`, strict CONDITIONAL, `--certify` refuses"). Same publication rule as D9.
+/// * `assumption:safety-comment` / `trust-safety-comment`: a user `unsafe { }` block
+///   whose clippy-placed `// SAFETY:` comment declares its unmodeled unsafe
+///   operations (SAFETY-ASSUME-1, ruled 2026-10-17: reported as assumed, "never
+///   counted proved and never refuted"; strict CONDITIONAL, `--certify` refuses).
+///   Same publication rule as D9.
+///
+/// Every other `assumption:*` row is one the strict policy does not TOLERATE.
+/// Advisory records `#[trust::skip]`, classifier gaps, unreachable starts,
+/// expected-absent callees and the coroutine protocol premise, and continues.
+/// Memory-safe records its no-unsafe demotions. Strict (and certify) aborts the
+/// build on those skips; since the skip taxonomy (RECORD-THEN-RULE, 2026-09-27)
+/// it also records the refused skip's row (`user-opt-out`, a classifier tag,
+/// `unreachable-start`) beside the build-failing error, so a strict row of one of
+/// those kinds always accompanies a non-zero compiler exit. None of them is
+/// admitted here. Anything that is not an `assumption:*` row answers `false`.
+#[must_use]
+pub fn strict_policy_publishes_assumption_row(kind: &str, solver: &str, description: &str) -> bool {
+    let Some(tag) = kind.strip_prefix("assumption:") else {
+        return false;
+    };
+    match tag {
+        ENTRY_REQUIRES_ASSUMPTION_TAG => solver == ENTRY_REQUIRES_ASSUMPTION_ROW_SOLVER,
+        ASSUMED_TOTAL_ASSUMPTION_TAG => solver == ASSUMED_TOTAL_ASSUMPTION_ROW_SOLVER,
+        ASSUMED_TOTAL_CALLEE_ASSUMPTION_TAG => {
+            solver == ASSUMED_TOTAL_CALLEE_FULL_VERIFICATION_ROW_SOLVER
+                || solver == ASSUMED_TOTAL_CALLEE_BRIDGE_ROW_SOLVER
+        }
+        EXTERN_CALL_ASSUMPTION_TAG => {
+            solver == MEMORY_SAFE_ASSUMPTION_ROW_SOURCE
+                && extern_call_dispatch_callee(description)
+                    .is_some_and(is_fmt_format_dispatch_callee)
+        }
+        TERMINATION_UNMEASURED_ASSUMPTION_TAG => {
+            is_termination_unmeasured_assumption_row(kind, solver)
+        }
+        // OD-1 phase 1: the per-site instance hypothesis and the per-crate
+        // inventory row. The strict compiler publishes both and does not abort;
+        // `certify` publishes them and refuses.
+        INSTANCE_HYPOTHESIS_ASSUMPTION_TAG | INSTANCE_HYPOTHESIS_INVENTORY_INCOMPLETE_TAG => {
+            is_instance_hypothesis_assumption_row(kind, solver)
+        }
+        // SAFETY-ASSUME-1: a clippy-placed `// SAFETY:` comment's declared block.
+        // The strict compiler publishes it and does not abort; `certify` publishes
+        // it and refuses.
+        SAFETY_COMMENT_ASSUMPTION_TAG => is_safety_comment_assumption_row(kind, solver),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +746,7 @@ mod tests {
             DROP_GLUE_ASSUMPTION_PREFIX,
             COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX,
             COROUTINE_RESUME_PRECONDITION_PREFIX,
+            INSTANCE_HYPOTHESIS_ASSUMPTION_PREFIX,
         ] {
             let lower = prefix.to_ascii_lowercase();
             for marker in FULL_VERIFIER_MARKERS {
@@ -463,7 +770,20 @@ mod tests {
                     && !ASSUMED_TOTAL_CALLEE_ASSUMPTION_PREFIX.contains(other),
                 "assumed-total and `{other}` prefixes must be mutually non-substring"
             );
+            // OD-1 phase 1: an instance-hypothesis row must never be read as an
+            // absent-callee row (fatal or expected), nor the reverse.
+            assert!(
+                !other.contains(INSTANCE_HYPOTHESIS_ASSUMPTION_PREFIX)
+                    && !INSTANCE_HYPOTHESIS_ASSUMPTION_PREFIX.contains(other),
+                "instance-hypothesis and `{other}` prefixes must be mutually non-substring"
+            );
         }
+        // Nor may it carry the fatal absent-callee row's callee lead-in, which is
+        // what `l0_refutation::absent_callee_name` splits on.
+        assert!(
+            !INSTANCE_HYPOTHESIS_ASSUMPTION_PREFIX
+                .contains(crate::l0_refutation::ABSENT_CALLEE_ASSUMPTION_CALLEE_PREFIX)
+        );
     }
 
     #[test]
@@ -478,6 +798,21 @@ mod tests {
         assert_eq!(DROP_GLUE_ASSUMPTION_TAG, "drop-glue");
         assert_eq!(MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, "trust-memory-safe");
         assert_eq!(MEMORY_SAFE_PANIC_ASSUMPTION_TAG, "memory-safe-panic");
+        // D9 (2026-09-27): the unmeasured-self-recursion charge.
+        assert_eq!(TERMINATION_UNMEASURED_ASSUMPTION_TAG, "termination-unmeasured");
+        assert_eq!(TERMINATION_UNMEASURED_ROW_SOLVER, "trust-termination-charge");
+        // OD-1 phase 1 (2026-10-04).
+        assert_eq!(INSTANCE_HYPOTHESIS_ASSUMPTION_PREFIX, "[trust-instance-hypothesis] ");
+        assert_eq!(INSTANCE_HYPOTHESIS_ASSUMPTION_TAG, "instance-hypothesis");
+        assert_eq!(
+            INSTANCE_HYPOTHESIS_INVENTORY_INCOMPLETE_TAG,
+            "instance-hypothesis:inventory-incomplete"
+        );
+        assert_eq!(INSTANCE_HYPOTHESIS_ROW_SOLVER, "trust-classifier");
+        assert_eq!(INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND, "instance-hypothesis:discharge");
+        // SAFETY-ASSUME-1 (2026-10-17).
+        assert_eq!(SAFETY_COMMENT_ASSUMPTION_TAG, "safety-comment");
+        assert_eq!(SAFETY_COMMENT_ROW_SOLVER, "trust-safety-comment");
     }
 
     #[test]
@@ -490,6 +825,13 @@ mod tests {
             DROP_GLUE_ASSUMPTION_TAG,
             MEMORY_SAFE_ASSUMPTION_ROW_SOURCE,
             MEMORY_SAFE_PANIC_ASSUMPTION_TAG,
+            TERMINATION_UNMEASURED_ASSUMPTION_TAG,
+            TERMINATION_UNMEASURED_ROW_SOLVER,
+            INSTANCE_HYPOTHESIS_ASSUMPTION_TAG,
+            INSTANCE_HYPOTHESIS_INVENTORY_INCOMPLETE_TAG,
+            INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND,
+            SAFETY_COMMENT_ASSUMPTION_TAG,
+            SAFETY_COMMENT_ROW_SOLVER,
         ] {
             let lower = tag.to_ascii_lowercase();
             for marker in FULL_VERIFIER_MARKERS {
@@ -684,5 +1026,208 @@ mod tests {
             .is_none()
         );
         assert!(parse_coroutine_resume_contract_row_description("junk").is_none());
+    }
+
+    /// The strict-policy table admits exactly the shapes the strict compiler
+    /// publishes, and nothing a nonfatal policy records. The rows are written the
+    /// way `trust_verify.rs` mints them, `transport_assumption_row`'s
+    /// "unverified assumption: " prefix included.
+    #[test]
+    fn strict_policy_publishes_exactly_the_strict_assumption_rows() {
+        let fmt_format = "unverified assumption: extern print/format/write dispatch \
+                          `alloc::fmt::format` runs a user Display/Debug impl that may panic";
+        let print = "unverified assumption: extern print/format/write dispatch \
+                     `std::io::_print` runs a user Display/Debug impl that may panic";
+        let admitted = [
+            ("assumption:requires", "trust-entry-assumption", "requires x > 0"),
+            ("assumption:assumed-total", "trust-policy", "unverified assumption: f"),
+            ("assumption:assumed-total-callee", "trust-assumed-total", "call w"),
+            ("assumption:assumed-total-callee", "trust-bridge", "unverified assumption: w"),
+            ("assumption:extern-call", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, fmt_format),
+            // D9: published by the strict compiler, which does not abort on it.
+            (
+                "assumption:termination-unmeasured",
+                TERMINATION_UNMEASURED_ROW_SOLVER,
+                "unverified assumption: termination of `c::f`",
+            ),
+            // OD-1 phase 1: published by the strict compiler, which does not abort.
+            (
+                "assumption:instance-hypothesis",
+                INSTANCE_HYPOTHESIS_ROW_SOLVER,
+                "unverified assumption: [trust-instance-hypothesis] `<T as c::Tr>::m`",
+            ),
+            (
+                "assumption:instance-hypothesis:inventory-incomplete",
+                INSTANCE_HYPOTHESIS_ROW_SOLVER,
+                "unverified assumption: instance inventory",
+            ),
+            // SAFETY-ASSUME-1: published by the strict compiler, which does not abort.
+            (
+                "assumption:safety-comment",
+                SAFETY_COMMENT_ROW_SOLVER,
+                "unverified assumption: the unsafe block at f.rs:3:5 in `c::f` is declared sound",
+            ),
+        ];
+        for (kind, solver, description) in admitted {
+            assert!(
+                strict_policy_publishes_assumption_row(kind, solver, description),
+                "the strict policy publishes `{kind}` from `{solver}`"
+            );
+        }
+        let refused = [
+            // Advisory (survey) records these; strict aborts the build instead.
+            ("assumption:user-opt-out", "trust-policy", "unverified assumption: f"),
+            ("assumption:unreachable-start", "trust-policy", "unverified assumption: f"),
+            ("assumption:unsupported-inline-asm", "trust-classifier", "unverified assumption: f"),
+            ("assumption:expected-absent-callee", "trust-bridge", "unverified assumption: f"),
+            ("assumption:coroutine", "trust-classifier", "unverified assumption: f"),
+            // Memory-safe demotions.
+            ("assumption:memory-safe-panic", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, "f"),
+            ("assumption:native-lowering", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, "f"),
+            ("assumption:drop-glue", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, "f"),
+            ("assumption:absent-callee", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, "f"),
+            ("assumption:extern-call", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, print),
+            ("assumption:extern-call", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, "no callee named"),
+            // A strict tag with a source the strict compiler never stamps on it.
+            ("assumption:requires", "trust-policy", "requires x > 0"),
+            ("assumption:assumed-total", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, "f"),
+            ("assumption:assumed-total-callee", "test", "w"),
+            ("assumption:extern-call", "trust-bridge", fmt_format),
+            ("assumption:termination-unmeasured", "trust-classifier", "f"),
+            ("assumption:termination-unmeasured", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, "f"),
+            // The D9 solver on another tag admits nothing.
+            ("assumption:coroutine", TERMINATION_UNMEASURED_ROW_SOLVER, "f"),
+            // OD-1: the instance-hypothesis tags from any other solver, a near-miss
+            // tag, and the discharge row (a verdict, not an assumption) are refused.
+            ("assumption:instance-hypothesis", "trust-bridge", "f"),
+            ("assumption:instance-hypothesis", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, "f"),
+            ("assumption:instance-hypothesis", TERMINATION_UNMEASURED_ROW_SOLVER, "f"),
+            ("assumption:instance-hypothesis:inventory-incomplete", "trust-policy", "f"),
+            ("assumption:instance-hypotheses", INSTANCE_HYPOTHESIS_ROW_SOLVER, "f"),
+            ("assumption:instance-hypothesis:discharge", INSTANCE_HYPOTHESIS_ROW_SOLVER, "f"),
+            (INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND, INSTANCE_HYPOTHESIS_ROW_SOLVER, "f"),
+            // SAFETY-ASSUME-1: the tag from any other solver, and the solver on any
+            // other tag, are refused.
+            ("assumption:safety-comment", "trust-classifier", "f"),
+            ("assumption:safety-comment", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE, "f"),
+            ("assumption:safety-comment", TERMINATION_UNMEASURED_ROW_SOLVER, "f"),
+            ("assumption:user-opt-out", SAFETY_COMMENT_ROW_SOLVER, "f"),
+            ("assumption:memory-safe-panic", SAFETY_COMMENT_ROW_SOLVER, "f"),
+            // An invented tag, and rows that are not assumption rows at all.
+            ("assumption:test", "test", "test"),
+            (COROUTINE_RESUME_CONTRACT_ROW_KIND, COROUTINE_RESUME_CONTRACT_ROW_SOLVER, "f"),
+            ("requires", "trust-entry-assumption", "requires x > 0"),
+        ];
+        for (kind, solver, description) in refused {
+            assert!(
+                !strict_policy_publishes_assumption_row(kind, solver, description),
+                "the strict policy never publishes `{kind}` from `{solver}` ({description})"
+            );
+        }
+    }
+
+    /// D9: the (kind, solver) pair the compiler's memory-safe admission and the
+    /// strict table both read. Every near miss is refused.
+    #[test]
+    fn termination_unmeasured_row_shape_is_exact() {
+        assert!(is_termination_unmeasured_assumption_row(
+            "assumption:termination-unmeasured",
+            TERMINATION_UNMEASURED_ROW_SOLVER,
+        ));
+        for (kind, solver) in [
+            ("assumption:termination-unmeasured", "trust-classifier"),
+            ("assumption:termination-unmeasured", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE),
+            ("assumption:termination-unmeasured ", TERMINATION_UNMEASURED_ROW_SOLVER),
+            ("termination-unmeasured", TERMINATION_UNMEASURED_ROW_SOLVER),
+            ("assumption:termination", TERMINATION_UNMEASURED_ROW_SOLVER),
+            ("termination", TERMINATION_UNMEASURED_ROW_SOLVER),
+            ("assumption:memory-safe-panic", TERMINATION_UNMEASURED_ROW_SOLVER),
+        ] {
+            assert!(
+                !is_termination_unmeasured_assumption_row(kind, solver),
+                "`{kind}` from `{solver}` is not the D9 row"
+            );
+        }
+    }
+
+    /// SAFETY-ASSUME-1: the (kind, solver) pair targo's memory-safe gate and the
+    /// strict table both read. Every near miss is refused.
+    #[test]
+    fn safety_comment_row_shape_is_exact() {
+        assert!(is_safety_comment_assumption_row(
+            "assumption:safety-comment",
+            SAFETY_COMMENT_ROW_SOLVER,
+        ));
+        for (kind, solver) in [
+            ("assumption:safety-comment", "trust-classifier"),
+            ("assumption:safety-comment", MEMORY_SAFE_ASSUMPTION_ROW_SOURCE),
+            ("assumption:safety-comment", TERMINATION_UNMEASURED_ROW_SOLVER),
+            ("assumption:safety-comment ", SAFETY_COMMENT_ROW_SOLVER),
+            ("safety-comment", SAFETY_COMMENT_ROW_SOLVER),
+            ("assumption:safety", SAFETY_COMMENT_ROW_SOLVER),
+            ("assumption:termination-unmeasured", SAFETY_COMMENT_ROW_SOLVER),
+            ("hardened_unsafe_operation", SAFETY_COMMENT_ROW_SOLVER),
+        ] {
+            assert!(
+                !is_safety_comment_assumption_row(kind, solver),
+                "`{kind}` from `{solver}` is not the SAFETY-ASSUME-1 row"
+            );
+        }
+    }
+
+    /// OD-1 phase 1: the (kind, solver) pairs of the instance-hypothesis rows.
+    /// Every near miss is refused, and the discharge shape is distinct from both
+    /// assumption shapes.
+    #[test]
+    fn instance_hypothesis_row_shapes_are_exact() {
+        for kind in [
+            "assumption:instance-hypothesis",
+            "assumption:instance-hypothesis:inventory-incomplete",
+        ] {
+            assert!(is_instance_hypothesis_assumption_row(kind, INSTANCE_HYPOTHESIS_ROW_SOLVER));
+            assert!(!is_instance_hypothesis_discharge_row(kind, INSTANCE_HYPOTHESIS_ROW_SOLVER));
+        }
+        assert!(is_instance_hypothesis_discharge_row(
+            INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND,
+            INSTANCE_HYPOTHESIS_ROW_SOLVER
+        ));
+        assert!(!is_instance_hypothesis_assumption_row(
+            INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND,
+            INSTANCE_HYPOTHESIS_ROW_SOLVER
+        ));
+        for (kind, solver) in [
+            ("assumption:instance-hypothesis", "trust-bridge"),
+            ("assumption:instance-hypothesis", TERMINATION_UNMEASURED_ROW_SOLVER),
+            ("assumption:instance-hypothesis ", INSTANCE_HYPOTHESIS_ROW_SOLVER),
+            ("instance-hypothesis", INSTANCE_HYPOTHESIS_ROW_SOLVER),
+            ("assumption:instance", INSTANCE_HYPOTHESIS_ROW_SOLVER),
+            ("assumption:instance-hypothesis:discharge", INSTANCE_HYPOTHESIS_ROW_SOLVER),
+        ] {
+            assert!(
+                !is_instance_hypothesis_assumption_row(kind, solver),
+                "`{kind}` from `{solver}` is not an instance-hypothesis assumption row"
+            );
+        }
+        assert!(!is_instance_hypothesis_discharge_row(
+            INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND,
+            "trust-bridge"
+        ));
+        assert!(!is_instance_hypothesis_discharge_row(
+            "assumption:instance-hypothesis:discharge",
+            INSTANCE_HYPOTHESIS_ROW_SOLVER
+        ));
+    }
+
+    #[test]
+    fn extern_call_dispatch_callee_reads_the_first_backtick_pair() {
+        assert_eq!(
+            extern_call_dispatch_callee("dispatch `alloc::fmt::format` runs `x`"),
+            Some("alloc::fmt::format")
+        );
+        assert_eq!(extern_call_dispatch_callee("no callee"), None);
+        assert_eq!(extern_call_dispatch_callee("unterminated `alloc::fmt::format"), None);
+        assert!(is_fmt_format_dispatch_callee("alloc::fmt::format"));
+        assert!(!is_fmt_format_dispatch_callee("std::io::_print"));
+        assert!(!is_fmt_format_dispatch_callee("alloc::fmt::format_inner"));
     }
 }

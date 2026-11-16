@@ -4,19 +4,20 @@ use std::path::{Path, PathBuf};
 
 use rustc_ast::ast;
 use rustc_ast::visit::Visitor;
+use rustc_data_structures::thin_vec::ThinVec; // Trust: the one linked thin_vec
 use rustc_span::Span;
 use rustc_span::symbol::{self, Symbol, sym};
-use thin_vec::ThinVec;
 use thiserror::Error;
 
 use crate::attr::MetaVisitor;
 use crate::config::FileName;
 use crate::items::is_mod_decl;
+use crate::parse::macros::include::parse_include_path;
 use crate::parse::parser::{
     Directory, DirectoryOwnership, ModError, ModulePathSuccess, Parser, ParserError,
 };
 use crate::parse::session::ParseSess;
-use crate::utils::{contains_skip, mk_sp};
+use crate::utils::{contains_custom_attributes, contains_skip, mk_sp};
 
 mod visitor;
 
@@ -62,6 +63,25 @@ pub(crate) struct ModResolver<'ast, 'psess> {
     directory: Directory,
     file_map: FileModMap<'ast>,
     recursive: bool,
+    // Trust (T14d): the `include!`s this resolver did not follow.
+    unfollowed_includes: Vec<UnfollowedInclude>,
+    // Trust (T14d): the directory of the package that owns the crate root
+    // (`None` for a file no package owns), and how many leading lines of an
+    // included file may carry the `@generated` marker.
+    root_package: Option<PathBuf>,
+    generated_marker_line_search_limit: usize,
+}
+
+/// Trust (T14d, DECISION_QUEUE T14-FMT-1): an `include!` the resolver did not
+/// follow, so the file it names was not formatted: its path is no string
+/// literal; it sits in expression, statement or associated-item position,
+/// where the included text is not a list of module items; or the file it
+/// names is missing, does not parse as items, or belongs to another package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnfollowedInclude {
+    /// `<file>:<line>` of the `include!`.
+    pub(crate) location: String,
+    pub(crate) reason: &'static str,
 }
 
 /// Represents errors while trying to resolve modules.
@@ -114,19 +134,33 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
             file_map: BTreeMap::new(),
             psess,
             recursive,
+            unfollowed_includes: Vec::new(),
+            root_package: None,
+            generated_marker_line_search_limit: 5,
         }
     }
 
-    /// Creates a map that maps a file name to the module in AST.
+    /// Trust (T14d): how many leading lines of an included file are searched
+    /// for the `@generated` marker (`generated_marker_line_search_limit`).
+    pub(crate) fn generated_marker_line_search_limit(mut self, limit: usize) -> Self {
+        self.generated_marker_line_search_limit = limit;
+        self
+    }
+
+    /// Creates a map that maps a file name to the module in AST, and names the
+    /// `include!`s it did not follow.
     pub(crate) fn visit_crate(
         mut self,
         krate: &'ast ast::Crate,
-    ) -> Result<FileModMap<'ast>, ModuleResolutionError> {
+    ) -> Result<(FileModMap<'ast>, Vec<UnfollowedInclude>), ModuleResolutionError> {
         let root_filename = self.psess.span_to_filename(krate.spans.inner_span);
         self.directory.path = match root_filename {
             FileName::Real(ref p) => p.parent().unwrap_or(Path::new("")).to_path_buf(),
             _ => PathBuf::new(),
         };
+        if let FileName::Real(ref root) = root_filename {
+            self.root_package = owning_package_dir(root);
+        }
 
         // Skip visiting sub modules when the input is from stdin.
         if self.recursive {
@@ -144,7 +178,116 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
                 Cow::Borrowed(&krate.attrs),
             ),
         );
-        Ok(self.file_map)
+        // Trust (T14d): name every `include!` outside module-item position.
+        if self.recursive {
+            let mut nested = NestedIncludeVisitor {
+                psess: self.psess,
+                found: Vec::new(),
+            };
+            for module in self.file_map.values() {
+                for item in module.items.iter() {
+                    nested.visit_module_item(item);
+                }
+            }
+            self.unfollowed_includes.extend(nested.found);
+        }
+        Ok((self.file_map, self.unfollowed_includes))
+    }
+
+    /// Trust (T14d): follow an item-position `include!("<literal>")` as an
+    /// out-of-line module: the named file, resolved against the directory of
+    /// the file that holds the macro (as rustc resolves it), is parsed as a
+    /// list of items and formatted like any other module file. Its items join
+    /// the including module, so its own `mod` declarations and `include!`s
+    /// resolve from that module's directory.
+    ///
+    /// Not followed, and never failing the run:
+    /// * a file marked `@generated` (in its first
+    ///   `generated_marker_line_search_limit` lines) or an `include!` marked
+    ///   `#[rustfmt::skip]`, silently, as a skipped module is: `include!`ing
+    ///   generated text so the formatter leaves it to its generator is a
+    ///   common idiom, and the generator's drift test owns its layout;
+    /// * a file that is missing (generated at build time, or behind a `cfg`),
+    ///   that does not parse as a list of items, or that belongs to another
+    ///   package than the crate root (that package formats it, at its own
+    ///   edition): each is named as not formatted.
+    fn visit_include(&mut self, item: &ast::Item) -> Result<(), ModuleResolutionError> {
+        let ast::ItemKind::MacCall(ref mac) = item.kind else {
+            return Ok(());
+        };
+        if contains_skip(&item.attrs) {
+            return Ok(());
+        }
+        let Some(literal) = parse_include_path(self.psess, mac) else {
+            self.unfollow(item.span, "its path is not a string literal");
+            return Ok(());
+        };
+        let base = match self.psess.span_to_filename(item.span) {
+            FileName::Real(file) => file.parent().unwrap_or(Path::new("")).to_path_buf(),
+            FileName::Stdin => return Ok(()),
+        };
+        let path = base.join(literal);
+        if self.psess.is_file_parsed(&path) {
+            return Ok(());
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.unfollow(
+                item.span,
+                "the file it names does not exist or cannot be read: generated at build time, \
+                 or behind a `cfg`",
+            );
+            return Ok(());
+        };
+        if crate::formatting::generated::has_generated_marker(
+            &text,
+            self.generated_marker_line_search_limit,
+        ) {
+            return Ok(());
+        }
+        if owning_package_dir(&path) != self.root_package {
+            self.unfollow(
+                item.span,
+                "the file it names belongs to another package, which formats it at its own \
+                 edition",
+            );
+            return Ok(());
+        }
+        match Parser::parse_included_file_as_module(self.psess, &path, item.span) {
+            Some((ref attrs, _, _)) if contains_skip(attrs) => Ok(()),
+            Some((attrs, items, span)) => {
+                let nested = items.clone();
+                self.file_map
+                    .entry(FileName::Real(path))
+                    .or_insert(Module::new(
+                        span,
+                        Some(Cow::Owned(ast::ModKind::Unloaded)),
+                        Cow::Owned(items),
+                        Cow::Owned(attrs),
+                    ));
+                self.visit_mod_outside_ast(nested)
+            }
+            None => {
+                self.unfollow(
+                    item.span,
+                    "the file it names does not parse as a list of items",
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn unfollow(&mut self, span: Span, reason: &'static str) {
+        let location = self.location(span);
+        self.unfollowed_includes
+            .push(UnfollowedInclude { location, reason });
+    }
+
+    fn location(&self, span: Span) -> String {
+        format!(
+            "{}:{}",
+            self.psess.span_to_filename(span),
+            self.psess.line_of_byte_pos(span.lo())
+        )
     }
 
     /// Visit `cfg_if` macro and look for module declarations.
@@ -167,8 +310,11 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
         Ok(())
     }
 
-    fn visit_cfg_match(&mut self, item: Cow<'ast, ast::Item>) -> Result<(), ModuleResolutionError> {
-        let mut visitor = visitor::CfgMatchVisitor::new(self.psess);
+    fn visit_cfg_select(
+        &mut self,
+        item: Cow<'ast, ast::Item>,
+    ) -> Result<(), ModuleResolutionError> {
+        let mut visitor = visitor::CfgSelectVisitor::new(self.psess);
         visitor.visit_item(&item);
         for module_item in visitor.mods() {
             if let ast::ItemKind::Mod(_, _, ref sub_mod_kind) = module_item.item.kind {
@@ -197,8 +343,14 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
                 continue;
             }
 
-            if is_cfg_match(&item) {
-                self.visit_cfg_match(Cow::Owned(*item))?;
+            if is_cfg_select(&item) {
+                self.visit_cfg_select(Cow::Owned(*item))?;
+                continue;
+            }
+
+            // Trust (T14d): a literal `include!` is an out-of-line module.
+            if is_include(&item) {
+                self.visit_include(&item)?;
                 continue;
             }
 
@@ -228,8 +380,13 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
                 self.visit_cfg_if(Cow::Borrowed(item))?;
             }
 
-            if is_cfg_match(item) {
-                self.visit_cfg_match(Cow::Borrowed(item))?;
+            if is_cfg_select(item) {
+                self.visit_cfg_select(Cow::Borrowed(item))?;
+            }
+
+            // Trust (T14d): a literal `include!` is an out-of-line module.
+            if is_include(item) {
+                self.visit_include(item)?;
             }
 
             if let ast::ItemKind::Mod(_, _, ref sub_mod_kind) = item.kind {
@@ -472,6 +629,16 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
             }
             Err(e) => match e {
                 ModError::FileNotFound(_, default_path, _secondary_path) => {
+                    if contains_custom_attributes(attrs) {
+                        // It's possible that at least one of the attributes is a custom proc macro
+                        // that takes the module tokens as an input. It's hard to know for sure
+                        // since rustfmt only operates on the AST pre-expansion. In this case we'll
+                        // be overly permissive and just ignore the file not found error so rustfmt
+                        // can still try formatting the input.
+                        tracing::warn!("Couldn't find file for mod {};`", mod_name.to_string());
+                        return Ok(None);
+                    }
+
                     Err(ModuleResolutionError {
                         module: mod_name.to_string(),
                         kind: ModuleResolutionErrorKind::NotFound { file: default_path },
@@ -605,11 +772,78 @@ fn is_cfg_if(item: &ast::Item) -> bool {
     }
 }
 
-fn is_cfg_match(item: &ast::Item) -> bool {
+/// Trust (T14d): the directory of the nearest manifest with a `[package]`
+/// table at or above `path`'s directory: the package that compiles it.
+fn owning_package_dir(path: &Path) -> Option<PathBuf> {
+    let path = path.canonicalize().ok()?;
+    let mut directory = path.parent();
+    while let Some(dir) = directory {
+        let owns = std::fs::read_to_string(dir.join("Cargo.toml"))
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .is_some_and(|manifest| manifest.contains_key("package"));
+        if owns {
+            return Some(dir.to_path_buf());
+        }
+        directory = dir.parent();
+    }
+    None
+}
+
+// Trust (T14d): `include!` or a path ending in it (`std::include!`).
+fn is_include_path(path: &ast::Path) -> bool {
+    path.segments
+        .last()
+        .is_some_and(|segment| segment.ident.name == sym::include)
+}
+
+fn is_include(item: &ast::Item) -> bool {
+    matches!(item.kind, ast::ItemKind::MacCall(ref mac) if is_include_path(&mac.path))
+}
+
+/// Trust (T14d): every `include!` that is not a module item: in a function
+/// body, an expression, a statement or an associated-item list. Module items
+/// (at file level or in an inline `mod`) are the resolver's.
+struct NestedIncludeVisitor<'a> {
+    psess: &'a ParseSess,
+    found: Vec<UnfollowedInclude>,
+}
+
+impl<'a> NestedIncludeVisitor<'a> {
+    fn visit_module_item(&mut self, item: &ast::Item) {
+        match item.kind {
+            ast::ItemKind::MacCall(ref mac) if is_include_path(&mac.path) => {}
+            ast::ItemKind::Mod(_, _, ast::ModKind::Loaded(ref items, ast::Inline::Yes, ..)) => {
+                for item in items.iter() {
+                    self.visit_module_item(item);
+                }
+            }
+            _ => self.visit_item(item),
+        }
+    }
+}
+
+impl<'a, 'ast> Visitor<'ast> for NestedIncludeVisitor<'a> {
+    fn visit_mac_call(&mut self, mac: &'ast ast::MacCall) {
+        if is_include_path(&mac.path) {
+            self.found.push(UnfollowedInclude {
+                location: format!(
+                    "{}:{}",
+                    self.psess.span_to_filename(mac.span()),
+                    self.psess.line_of_byte_pos(mac.span().lo())
+                ),
+                reason: "it is not in module-item position",
+            });
+        }
+        rustc_ast::visit::walk_mac(self, mac);
+    }
+}
+
+fn is_cfg_select(item: &ast::Item) -> bool {
     match item.kind {
         ast::ItemKind::MacCall(ref mac) => {
             if let Some(last_segment) = mac.path.segments.last() {
-                if last_segment.ident.name == Symbol::intern("cfg_match") {
+                if last_segment.ident.name == Symbol::intern("cfg_select") {
                     return true;
                 }
             }

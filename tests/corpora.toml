@@ -1,0 +1,74 @@
+# The daily-driver corpora, as data (schema trust.corpora.v1).
+#
+# Read by `targo trust gate corpus-delta` (targo-trust/src/corpus_delta/), which
+# compiles every case once with each of two compilers and prints each case whose
+# verdict moved against its pin (docs/PLAN.md PKG-S1 SE16). The table is read
+# whole and refused whole: an unknown key, a glob that matches no file, a case
+# declared twice, or a pin for a case that is not there is an error.
+#
+# [[corpus]]
+#   id     the corpus's name in `--corpora` and in every report line
+#   glob   case files, relative to the checkout; a case's id is its file stem
+#   args   the compiler's arguments; the verb adds `--out-dir <scratch> <file>`
+#   pin    what every case must do, `verifies` or `refuses`; absent: nothing is
+#          pinned, and `verifies` is the best outcome
+#   pins   { case = pin } for the cases whose pin differs from `pin`
+#   [[corpus.case]]  a case named one at a time, with or without a glob:
+#     id, file, and optionally its own `args` (in place of the corpus's) and `pin`
+#
+# [[not_on_yet]] names a daily-driver corpus that is still a script and has no
+# row here: id, script, why. Every run of the verb that has read this table and
+# its `--corpora` prints these as not compared, whatever its exit, and
+# `--corpora <id>` for one is refused. Delete the entry in the change that adds
+# the corpus's row.
+#
+# Until a sealed toolchain carries the verb, each corpus below is also the script
+# its `slow.*` harness row runs (scripts/ordinary_rust_sweep.sh,
+# scripts/panicking_std_battery.sh, scripts/idiomatic_rust_sample.sh). The glob,
+# arguments and pins here are those scripts' own, and a targo-trust unit test
+# (corpus_delta::tests::the_table_matches_the_corpus_scripts) fails when they
+# part. The battery script also requires `runtime-checked` in p07's output; that
+# is the script's own check and is not part of a verdict here.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
+
+schema = "trust.corpora.v1"
+
+# Programs nobody aimed at a known boundary. Nothing is pinned.
+[[corpus]]
+id = "sweep"
+glob = "tests/ordinary-rust-sweep/*.rs"
+args = ["--crate-type=lib", "--edition", "2021"]
+
+# Programs that can panic at run time: the falsification gate for the
+# absent-callee tolerance. Each must be refused; p07 is the one documented
+# conditional pass (tests/panicking-std-battery/README.md).
+[[corpus]]
+id = "battery"
+glob = "tests/panicking-std-battery/*.rs"
+args = ["--crate-type=lib", "--edition", "2021"]
+pin = "refuses"
+pins = { p07 = "verifies" }
+
+# Programs written from a list of tasks, not from the failure list. Nothing is
+# pinned.
+[[corpus]]
+id = "idiomatic"
+glob = "tests/idiomatic-rust-sample/*.rs"
+args = ["-Ztrust-verify=on", "--crate-type=lib", "--edition", "2021", "--emit=metadata"]
+
+[[not_on_yet]]
+id = "bench"
+script = "scripts/daily_driver_bench.sh"
+why = "its 71 sources are written inline in the script"
+
+[[not_on_yet]]
+id = "probes"
+script = "scripts/daily_driver_probes.sh"
+why = "its rows carry their own edition and flags, and a `conditional` row adds a certify build"
+
+[[not_on_yet]]
+id = "ladder"
+script = "scripts/open_dispatch_ladder.sh"
+why = "its rows are read from file headers, and its cross-crate rows build dependencies first"

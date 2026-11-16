@@ -74,8 +74,7 @@ impl<'tcx> Visitor<'tcx> for DeduceParamAttrs {
                   MutatingUseContext::Store
                 | MutatingUseContext::SetDiscriminant
                 | MutatingUseContext::AsmOutput
-                | MutatingUseContext::Projection
-                | MutatingUseContext::Retag) => {
+                | MutatingUseContext::Projection) => {
                 self.usage[i] |= UsageSummary::MUTATE;
             }
             | PlaceContext::NonMutatingUse(NonMutatingUseContext::RawBorrow) => {
@@ -136,7 +135,7 @@ impl<'tcx> Visitor<'tcx> for DeduceParamAttrs {
             }
 
             // Like a call, but more conservative because the backend may introduce writes to an
-            // argument if the argument is passed as `PassMode::Indirect { on_stack: false, ... }`.
+            // argument if the argument is passed as `PassMode::Indirect { mode: IndirectMode::Pointer, ... }`.
             TerminatorKind::TailCall { .. } => {
                 for usage in self.usage.iter_mut() {
                     *usage |= UsageSummary::MUTATE;
@@ -150,19 +149,22 @@ impl<'tcx> Visitor<'tcx> for DeduceParamAttrs {
     }
 }
 
-/// Returns true if values of a given type will never be passed indirectly, regardless of ABI.
-fn type_will_always_be_passed_directly(ty: Ty<'_>) -> bool {
-    matches!(
-        ty.kind(),
+/// Returns true if a type could potentially benefit from deduction when passed at ABI level.
+fn type_could_benefit_from_deduction(ty: Ty<'_>) -> bool {
+    match ty.kind() {
+        // Passed directly
         ty::Bool
-            | ty::Char
-            | ty::Float(..)
-            | ty::Int(..)
-            | ty::RawPtr(..)
-            | ty::Ref(..)
-            | ty::Slice(..)
-            | ty::Uint(..)
-    )
+        | ty::Char
+        | ty::Float(..)
+        | ty::Int(..)
+        | ty::RawPtr(..)
+        | ty::Ref(..)
+        | ty::Slice(..)
+        | ty::Uint(..) => false,
+        // Ignored / ZST.
+        ty::Tuple(tys) if tys.is_empty() => false,
+        _ => true,
+    }
 }
 
 /// Trust (wall A, instance flip seam): the SAME deduction the query performs, run on an
@@ -202,16 +204,16 @@ pub(super) fn deduced_param_attrs<'tcx>(
         return &[];
     }
 
-    // Codegen won't use this information for anything if all the function parameters are passed
-    // directly. Detect that and bail, for compilation speed.
+    // Based on a type of inputs and output, we can sometimes quickly identify that deduction
+    // will offers no benefit. Detect that and bail, for compilation speed.
     let fn_ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
     if matches!(fn_ty.kind(), ty::FnDef(..))
-        && fn_ty
+        && !fn_ty
             .fn_sig(tcx)
             .inputs_and_output()
             .skip_binder()
             .iter()
-            .all(type_will_always_be_passed_directly)
+            .any(type_could_benefit_from_deduction)
     {
         return &[];
     }
@@ -238,18 +240,18 @@ pub(super) fn deduced_param_attrs<'tcx>(
     deduce.visit_body(body);
     tracing::trace!(?deduce.usage);
 
-    let mut deduced_param_attrs: &[_] = tcx
-        .arena
-        .alloc_from_iter(deduce.usage.into_iter().map(|usage| DeducedParamAttrs { usage }));
-
     // Trailing parameters past the size of the `deduced_param_attrs` array are assumed to have the
-    // default set of attributes, so we don't have to store them explicitly. Pop them off to save a
-    // few bytes in metadata.
-    while let Some((last, rest)) = deduced_param_attrs.split_last()
-        && last.is_default()
+    // default set of attributes, so we don't have to store them explicitly. Pop them off before
+    // arena allocation to save both metadata bytes and arena capacity.
+    while let Some(&usage) = deduce.usage.raw.last()
+        && (DeducedParamAttrs { usage }).is_default()
     {
-        deduced_param_attrs = rest;
+        deduce.usage.pop();
     }
 
-    deduced_param_attrs
+    if deduce.usage.is_empty() {
+        return &[];
+    }
+
+    tcx.arena.alloc_from_iter(deduce.usage.into_iter().map(|usage| DeducedParamAttrs { usage }))
 }

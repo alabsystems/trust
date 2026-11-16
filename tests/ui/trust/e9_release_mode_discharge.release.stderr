@@ -1,0 +1,51 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (composed_isl, min2_le_left)
+  --> $DIR/e9_release_mode_discharge.rs:19:5
+   |
+LL | /     def composed_isl (x : UInt64) : UInt64 := (x + 1) * 2
+LL | |
+LL | |     theorem min2_le_left : forall (x : UInt64) (y : UInt64),
+LL | |         Nat.le (UInt64.toNat (if x < y then x else y)) (UInt64.toNat x) :=
+...  |
+LL | |             (fun h => Iff.mp (Nat.not_lt (UInt64.toNat x) (UInt64.toNat y)) h)
+LL | |             (fun h => Nat.le.refl (UInt64.toNat x))
+   | |___________________________________________________^
+
+
+=== Trust Verification Report (e9_release_mode_discharge) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_release_mode_discharge.rs:34:1
+   |
+LL | pub fn caller(x: u64, y: u64) -> u64 ensures min2(x, y) <= x by min2_le_left { x }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `composed_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_release_mode_discharge::composed`
+  --> $DIR/e9_release_mode_discharge.rs:37:13
+   |
+LL |     ensures result == composed_isl(x)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_release_mode_discharge.rs:36:1
+   |
+LL | / pub fn composed(x: u64) -> u64
+LL | |     ensures result == composed_isl(x)
+LL | | {
+LL | |     x.wrapping_add(1).wrapping_mul(2)
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: citation `min2_le_left` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `caller`, with a clean certification audit
+  --> $DIR/e9_release_mode_discharge.rs:34:65
+   |
+LL | pub fn caller(x: u64, y: u64) -> u64 ensures min2(x, y) <= x by min2_le_left { x }
+   |                                                                 ^^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
+

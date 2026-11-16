@@ -25,6 +25,7 @@ use clean_kernel::expr::ExprKind;
 use clean_kernel::level::Level as LeanLevel;
 use clean_kernel::name::Name as LeanName;
 use clean_kernel::{BinderInfo, Expr as LeanExpr, TypeChecker};
+use trust_types::fx::FxHashSet;
 use trust_types::{Formula, Sort, VcKind};
 
 use crate::error::CertificateError;
@@ -42,14 +43,14 @@ static CERT_ENV: OnceLock<Option<Environment>> = OnceLock::new();
 /// declaration kernel-type-checked by `add_decl`; none is an axiom).
 ///
 /// `None` (fail-closed: nothing certifies) if registration ever fails.
-fn certification_env() -> Option<Environment> {
+fn certification_env() -> Option<&'static Environment> {
     CERT_ENV
         .get_or_init(|| {
             let mut env = Environment::try_with_prelude().ok()?;
             register_trust_vc_signature(&mut env).ok()?;
             Some(env)
         })
-        .clone()
+        .as_ref()
 }
 
 /// Register the `Trust.*` signature that makes canonical VC theorems
@@ -296,27 +297,38 @@ fn register_trust_vc_signature(env: &mut Environment) -> Result<(), EnvError> {
 // Strict axiom-closure gate
 // ---------------------------------------------------------------------------
 
-/// Collect every `Const` name in `e`. Returns `false` (caller must FAIL
-/// CLOSED) on any expression node outside the core fragment (free variables,
-/// SProp/Squash/Cubical/ZFC mode extensions) — a closed core proof never
-/// contains them, and auditing what they can smuggle is not this gate's job.
-fn collect_core_consts(e: &LeanExpr, out: &mut Vec<LeanName>) -> bool {
+/// Collect every `Const` name in `e` that is not already in `seen`. Returns
+/// `false` (caller must FAIL CLOSED) on any expression node outside the core
+/// fragment (free variables, SProp/Squash/Cubical/ZFC mode extensions) — a
+/// closed core proof never contains them, and auditing what they can smuggle
+/// is not this gate's job.
+fn collect_core_consts_unseen(
+    e: &LeanExpr,
+    seen: &FxHashSet<LeanName>,
+    out: &mut Vec<LeanName>,
+) -> bool {
     match e.kind() {
         ExprKind::BVar(_) | ExprKind::Sort(_) | ExprKind::Lit(_) => true,
         ExprKind::Const(n, _) => {
-            out.push(n.clone());
+            if !seen.contains(n) {
+                out.push(n.clone());
+            }
             true
         }
-        ExprKind::App(f, a) => collect_core_consts(f, out) && collect_core_consts(a, out),
+        ExprKind::App(f, a) => {
+            collect_core_consts_unseen(f, seen, out) && collect_core_consts_unseen(a, seen, out)
+        }
         ExprKind::Lam(_, t, b) | ExprKind::Pi(_, t, b) => {
-            collect_core_consts(t, out) && collect_core_consts(b, out)
+            collect_core_consts_unseen(t, seen, out) && collect_core_consts_unseen(b, seen, out)
         }
         ExprKind::Let(_, t, v, b, _) => {
-            collect_core_consts(t, out)
-                && collect_core_consts(v, out)
-                && collect_core_consts(b, out)
+            collect_core_consts_unseen(t, seen, out)
+                && collect_core_consts_unseen(v, seen, out)
+                && collect_core_consts_unseen(b, seen, out)
         }
-        ExprKind::Proj(_, _, inner) | ExprKind::MData(_, inner) => collect_core_consts(inner, out),
+        ExprKind::Proj(_, _, inner) | ExprKind::MData(_, inner) => {
+            collect_core_consts_unseen(inner, seen, out)
+        }
         _ => false,
     }
 }
@@ -334,13 +346,13 @@ fn collect_core_consts(e: &LeanExpr, out: &mut Vec<LeanName>) -> bool {
 /// satisfiable disequality patterns. A `Certified` verdict must carry a
 /// ZERO-axiom kernel proof — no exceptions, no whitelist.
 fn proof_is_axiom_free(env: &Environment, root: &LeanExpr) -> bool {
-    let mut work: Vec<LeanName> = Vec::new();
-    if !collect_core_consts(root, &mut work) {
+    let mut seen: FxHashSet<LeanName> = FxHashSet::with_capacity_and_hasher(32, Default::default());
+    let mut work: Vec<LeanName> = Vec::with_capacity(32);
+    if !collect_core_consts_unseen(root, &seen, &mut work) {
         return false;
     }
-    let mut seen: std::collections::HashSet<LeanName> = std::collections::HashSet::new();
     while let Some(n) = work.pop() {
-        if !seen.insert(n.clone()) {
+        if seen.contains(&n) {
             continue;
         }
         let Some(info) = env.get_const(&n) else {
@@ -349,11 +361,12 @@ fn proof_is_axiom_free(env: &Environment, root: &LeanExpr) -> bool {
         if info.kind == ConstantKind::Axiom {
             return false;
         }
-        if !collect_core_consts(&info.type_, &mut work) {
+        seen.insert(n);
+        if !collect_core_consts_unseen(&info.type_, &seen, &mut work) {
             return false;
         }
         if let Some(value) = &info.value {
-            if !collect_core_consts(value, &mut work) {
+            if !collect_core_consts_unseen(value, &seen, &mut work) {
                 return false;
             }
         }
@@ -505,11 +518,14 @@ pub(crate) fn kernel_certify_direct_contradiction(
     let (hx, hnx) = if x_first { (left, right) } else { (right, left) };
     let absurd0 = LeanExpr::const_(name("absurd"), vec![LeanLevel::zero()]);
     let body = LeanExpr::apps(absurd0, [tx, const_expr("False"), hx, hnx]);
+    let theorem = LeanExpr::apps(
+        const_expr("Trust.VC.holds"),
+        vec![translate_vc_kind(kind), tf.clone()],
+    );
     let proof = LeanExpr::lam(BinderInfo::Default, tf, body);
 
-    let theorem = translate_vc_to_clean_theorem(kind, formula);
     let env = certification_env()?;
-    kernel_gate_and_serialize(&env, &proof, &theorem)
+    kernel_gate_and_serialize(env, &proof, &theorem)
 }
 
 // ---------------------------------------------------------------------------
@@ -850,10 +866,12 @@ pub(crate) fn kernel_certify_propositional(kind: &VcKind, formula: &Formula) -> 
     let (hn, ht) = builder.fresh();
     let body = builder.split(0, &root, &ht)?;
     let proof = mk_lam(&hn, root.prop.clone(), body);
-
-    let theorem = translate_vc_to_clean_theorem(kind, formula);
+    let theorem = LeanExpr::apps(
+        const_expr("Trust.VC.holds"),
+        vec![translate_vc_kind(kind), root.prop],
+    );
     let env = certification_env()?;
-    kernel_gate_and_serialize(&env, &proof, &theorem)
+    kernel_gate_and_serialize(env, &proof, &theorem)
 }
 
 // ---------------------------------------------------------------------------
@@ -993,42 +1011,43 @@ fn euf_infer_sort(t: &Formula) -> Option<Sort> {
 /// functions) is the only unsound move, so every distinguishing attribute is
 /// folded in; over-keying merely loses completeness.
 fn euf_fsym_key(t: &Formula) -> Option<String> {
-    let arity = t.children().len();
-    if arity == 0 {
-        return None;
-    }
-    let op = match t {
-        Formula::Neg(_) => "neg".to_string(),
-        Formula::Add(..) => "add".to_string(),
-        Formula::Sub(..) => "sub".to_string(),
-        Formula::Mul(..) => "mul".to_string(),
-        Formula::Div(..) => "div".to_string(),
-        Formula::Rem(..) => "rem".to_string(),
-        Formula::Select(..) => "select".to_string(),
-        Formula::Store(..) => "store".to_string(),
-        Formula::Ite(..) => "ite".to_string(),
-        Formula::BvConcat(..) => "bvconcat".to_string(),
-        Formula::BvAdd(_, _, w) => format!("bvadd:{w}"),
-        Formula::BvSub(_, _, w) => format!("bvsub:{w}"),
-        Formula::BvMul(_, _, w) => format!("bvmul:{w}"),
-        Formula::BvUDiv(_, _, w) => format!("bvudiv:{w}"),
-        Formula::BvSDiv(_, _, w) => format!("bvsdiv:{w}"),
-        Formula::BvURem(_, _, w) => format!("bvurem:{w}"),
-        Formula::BvSRem(_, _, w) => format!("bvsrem:{w}"),
-        Formula::BvAnd(_, _, w) => format!("bvand:{w}"),
-        Formula::BvOr(_, _, w) => format!("bvor:{w}"),
-        Formula::BvXor(_, _, w) => format!("bvxor:{w}"),
-        Formula::BvShl(_, _, w) => format!("bvshl:{w}"),
-        Formula::BvLShr(_, _, w) => format!("bvlshr:{w}"),
-        Formula::BvAShr(_, _, w) => format!("bvashr:{w}"),
-        Formula::BvNot(_, w) => format!("bvnot:{w}"),
-        Formula::BvZeroExt(_, w) => format!("bvzext:{w}"),
-        Formula::BvSignExt(_, w) => format!("bvsext:{w}"),
-        Formula::BvExtract { high, low, .. } => format!("bvextract:{high}:{low}"),
-        Formula::BvToInt(_, w, signed) => format!("bvtoint:{w}:{signed}"),
-        Formula::IntToBv(_, w) => format!("inttobv:{w}"),
-        Formula::Pred(sym, args) => format!("pred:{sym:?}:{}", args.len()),
-        // Bool-/Prop-valued or unmodeled operators → opaque leaf.
+    use std::borrow::Cow;
+    let (op, arity): (Cow<'static, str>, usize) = match t {
+        Formula::Neg(_) => (Cow::Borrowed("neg"), 1),
+        Formula::Add(..) => (Cow::Borrowed("add"), 2),
+        Formula::Sub(..) => (Cow::Borrowed("sub"), 2),
+        Formula::Mul(..) => (Cow::Borrowed("mul"), 2),
+        Formula::Div(..) => (Cow::Borrowed("div"), 2),
+        Formula::Rem(..) => (Cow::Borrowed("rem"), 2),
+        Formula::Select(..) => (Cow::Borrowed("select"), 2),
+        Formula::Store(..) => (Cow::Borrowed("store"), 3),
+        Formula::Ite(..) => (Cow::Borrowed("ite"), 3),
+        Formula::BvConcat(..) => (Cow::Borrowed("bvconcat"), 2),
+        Formula::BvAdd(_, _, w) => (Cow::Owned(format!("bvadd:{w}")), 2),
+        Formula::BvSub(_, _, w) => (Cow::Owned(format!("bvsub:{w}")), 2),
+        Formula::BvMul(_, _, w) => (Cow::Owned(format!("bvmul:{w}")), 2),
+        Formula::BvUDiv(_, _, w) => (Cow::Owned(format!("bvudiv:{w}")), 2),
+        Formula::BvSDiv(_, _, w) => (Cow::Owned(format!("bvsdiv:{w}")), 2),
+        Formula::BvURem(_, _, w) => (Cow::Owned(format!("bvurem:{w}")), 2),
+        Formula::BvSRem(_, _, w) => (Cow::Owned(format!("bvsrem:{w}")), 2),
+        Formula::BvAnd(_, _, w) => (Cow::Owned(format!("bvand:{w}")), 2),
+        Formula::BvOr(_, _, w) => (Cow::Owned(format!("bvor:{w}")), 2),
+        Formula::BvXor(_, _, w) => (Cow::Owned(format!("bvxor:{w}")), 2),
+        Formula::BvShl(_, _, w) => (Cow::Owned(format!("bvshl:{w}")), 2),
+        Formula::BvLShr(_, _, w) => (Cow::Owned(format!("bvlshr:{w}")), 2),
+        Formula::BvAShr(_, _, w) => (Cow::Owned(format!("bvashr:{w}")), 2),
+        Formula::BvNot(_, w) => (Cow::Owned(format!("bvnot:{w}")), 1),
+        Formula::BvZeroExt(_, w) => (Cow::Owned(format!("bvzext:{w}")), 1),
+        Formula::BvSignExt(_, w) => (Cow::Owned(format!("bvsext:{w}")), 1),
+        Formula::BvExtract { high, low, .. } => {
+            (Cow::Owned(format!("bvextract:{high}:{low}")), 1)
+        }
+        Formula::BvToInt(_, w, signed) => (Cow::Owned(format!("bvtoint:{w}:{signed}")), 1),
+        Formula::IntToBv(_, w) => (Cow::Owned(format!("inttobv:{w}")), 1),
+        Formula::Pred(sym, args) if !args.is_empty() => {
+            (Cow::Owned(format!("pred:{sym:?}:{}", args.len())), args.len())
+        }
+        // Bool-/Prop-valued, zero-arity Pred, or unmodeled operators → opaque leaf.
         _ => return None,
     };
     Some(format!("{op}|a{arity}|{:?}", euf_infer_sort(t)))
@@ -1196,17 +1215,29 @@ impl Euf {
             let mut changed = false;
             let n = self.nodes.len();
             for a in 0..n {
-                let EufNode::App(fa, args_a) = self.nodes[a].clone() else { continue };
+                let EufNode::App(fa, ref args_a) = self.nodes[a] else { continue };
+                let args_a_len = args_a.len();
                 for b in (a + 1)..n {
-                    let EufNode::App(fb, args_b) = self.nodes[b].clone() else { continue };
-                    if fa != fb || args_a.len() != args_b.len() {
+                    let EufNode::App(fb, ref args_b) = self.nodes[b] else { continue };
+                    if fa != fb || args_a_len != args_b.len() {
                         continue;
                     }
                     if self.find(a) == self.find(b) {
                         continue;
                     }
-                    let all_eq =
-                        args_a.iter().zip(&args_b).all(|(&x, &y)| self.find(x) == self.find(y));
+                    let mut all_eq = true;
+                    for i in 0..args_a_len {
+                        let (EufNode::App(_, aa), EufNode::App(_, ab)) =
+                            (&self.nodes[a], &self.nodes[b])
+                        else {
+                            unreachable!()
+                        };
+                        let (xa, xb) = (aa[i], ab[i]);
+                        if self.find(xa) != self.find(xb) {
+                            all_eq = false;
+                            break;
+                        }
+                    }
                     if all_eq {
                         self.merge(a, b, EufJustif::Cong);
                         changed = true;
@@ -1525,40 +1556,44 @@ fn euf_fsym_lambda(rep: &Formula) -> Option<LeanExpr> {
     }
 }
 
-/// Left-fold conjunction translation of `cs` (non-empty) — the exact shape
-/// `translate_formula` gives `Formula::And(cs)`.
-fn euf_fold_translation(cs: &[Formula]) -> LeanExpr {
-    let mut r = translate_formula(&cs[0]);
-    for c in &cs[1..] {
-        r = LeanExpr::apps(const_expr("And"), [r, translate_formula(c)]);
-    }
-    r
-}
-
 /// Collect the conjunct literals of `g` in `flatten` order, TOGETHER with a
 /// kernel proof term for each, extracted from `h : ⟦g⟧` by `And.left`/
 /// `And.right` chains that mirror the left-fold translation exactly.
 fn euf_collect_conjuncts<'f>(g: &'f Formula, h: LeanExpr, out: &mut Vec<(&'f Formula, LeanExpr)>) {
-    fn peel<'f>(cs: &'f [Formula], h: LeanExpr, out: &mut Vec<(&'f Formula, LeanExpr)>) {
+    fn peel<'f>(
+        cs: &'f [Formula],
+        elem_ts: &[LeanExpr],
+        prefixes: &[LeanExpr],
+        h: LeanExpr,
+        out: &mut Vec<(&'f Formula, LeanExpr)>,
+    ) {
         let m = cs.len();
         if m == 1 {
             euf_collect_conjuncts(&cs[0], h, out);
             return;
         }
         // ⟦cs⟧ = And ⟦cs[..m-1]⟧ ⟦cs[m-1]⟧
-        let left_t = euf_fold_translation(&cs[..m - 1]);
-        let right_t = translate_formula(&cs[m - 1]);
+        let left_t = prefixes[m - 2].clone();
+        let right_t = elem_ts[m - 1].clone();
         let hl =
             LeanExpr::apps(const_expr("And.left"), [left_t.clone(), right_t.clone(), h.clone()]);
         let hr = LeanExpr::apps(const_expr("And.right"), [left_t, right_t, h]);
-        peel(&cs[..m - 1], hl, out);
+        peel(&cs[..m - 1], &elem_ts[..m - 1], &prefixes[..m - 1], hl, out);
         euf_collect_conjuncts(&cs[m - 1], hr, out);
     }
     if let Formula::And(cs) = g {
         if cs.is_empty() {
             return;
         }
-        peel(cs, h, out);
+        let elem_ts: Vec<LeanExpr> = cs.iter().map(translate_formula).collect();
+        let mut prefixes: Vec<LeanExpr> = Vec::with_capacity(cs.len());
+        let mut r = elem_ts[0].clone();
+        prefixes.push(r.clone());
+        for t in &elem_ts[1..] {
+            r = LeanExpr::apps(const_expr("And"), [r, t.clone()]);
+            prefixes.push(r.clone());
+        }
+        peel(cs, &elem_ts, &prefixes, h, out);
     } else {
         out.push((g, h));
     }
@@ -1631,31 +1666,37 @@ pub(crate) fn kernel_certify_euf(kind: &VcKind, formula: &Formula) -> Option<Vec
     let fsym_lams: Vec<LeanExpr> =
         euf.fsym_rep.iter().map(euf_fsym_lambda).collect::<Option<Vec<_>>>()?;
     let tf = translate_formula(formula);
-    let theorem = translate_vc_to_clean_theorem(kind, formula);
+    let theorem = LeanExpr::apps(
+        const_expr("Trust.VC.holds"),
+        vec![translate_vc_kind(kind), tf.clone()],
+    );
     let env = certification_env()?;
+    let mut leaf_terms: Option<Vec<LeanExpr>> = None;
 
     for (p, q, hneg) in &negs {
         let Some((abstract_proof, _abstract_theorem)) = euf.build_refutation(*p, *q) else {
             continue;
         };
-        let leaf_terms: Vec<LeanExpr> = (0..euf.nodes.len())
-            .filter(|&i| matches!(euf.nodes[i], EufNode::Leaf))
-            .map(|i| translate_formula(&euf.formulas[i]))
-            .collect();
+        let leaves = leaf_terms.get_or_insert_with(|| {
+            (0..euf.nodes.len())
+                .filter(|&i| matches!(euf.nodes[i], EufNode::Leaf))
+                .map(|i| translate_formula(&euf.formulas[i]))
+                .collect()
+        });
         // Application order mirrors build_refutation's binder order:
         // carrier, fsyms, leaves, eq-hyps, diseq.
         let mut args: Vec<LeanExpr> =
-            Vec::with_capacity(1 + fsym_lams.len() + leaf_terms.len() + pos_proofs.len() + 1);
+            Vec::with_capacity(1 + fsym_lams.len() + leaves.len() + pos_proofs.len() + 1);
         args.push(LeanExpr::prop());
         args.extend(fsym_lams.iter().cloned());
-        args.extend(leaf_terms);
+        args.extend(leaves.iter().cloned());
         args.extend(pos_proofs.iter().cloned());
         args.push(hneg.clone());
         let body = LeanExpr::apps(abstract_proof, args);
         let proof = mk_lam(&h_name, tf.clone(), body);
 
         // THE kernel gate — the sole authority — against the CANONICAL theorem.
-        if let Some(bytes) = kernel_gate_and_serialize(&env, &proof, &theorem) {
+        if let Some(bytes) = kernel_gate_and_serialize(env, &proof, &theorem) {
             return Some(bytes);
         }
     }
@@ -2036,7 +2077,7 @@ pub fn verify_proof_cert(
             reason: "clean certification environment failed to initialize".to_string(),
         });
     };
-    let mut verifier = CertVerifier::new(&env);
+    let mut verifier = CertVerifier::new(env);
 
     let (proof_expr, proven_type) =
         verifier.replay_and_verify(proof_cert).map_err(|e| CertificateError::KernelRejected {
@@ -2047,7 +2088,7 @@ pub fn verify_proof_cert(
     // zero-axiom kernel proof. No whitelist: `sorry (Trust.VC.holds k f)`
     // type-checks, and propext(+choice) degenerates `@Eq Prop`; both must be
     // rejected HERE, before the def-eq identity can be claimed.
-    if !proof_is_axiom_free(&env, &proof_expr) {
+    if !proof_is_axiom_free(env, &proof_expr) {
         return Err(CertificateError::KernelRejected {
             reason: "clean certificate depends on axiom-kind constants (e.g. sorry/trustedAy/\
                      propext) — refusing to certify"
@@ -2055,7 +2096,7 @@ pub fn verify_proof_cert(
         });
     }
 
-    let tc = TypeChecker::new(&env);
+    let tc = TypeChecker::new(env);
     if !tc.is_def_eq(&proven_type, theorem_expr) {
         return Err(CertificateError::KernelRejected {
             reason: "clean certificate proves a different theorem than requested".to_string(),
@@ -2530,10 +2571,10 @@ mod tests {
             register_trust_vc_signature(&mut env).expect("Trust.* signature registers");
             env
         };
-        let memo = certification_env().expect("memoized env builds"); // memoized clone
+        let memo = certification_env().expect("memoized env builds");
 
         let tc_fresh = TypeChecker::new(&fresh);
-        let tc_memo = TypeChecker::new(&memo);
+        let tc_memo = TypeChecker::new(memo);
 
         assert!(
             tc_fresh.check_type(&proof, &theorem).is_ok(),
@@ -2598,7 +2639,7 @@ mod tests {
         )));
         let theorem = translate_vc_to_clean_theorem(&kind, &formula);
         let env = certification_env().expect("certification env builds");
-        let tc = TypeChecker::new(&env);
+        let tc = TypeChecker::new(env);
 
         let sorry0 = LeanExpr::const_(name("sorry"), vec![LeanLevel::zero()]);
         let forged = LeanExpr::app(sorry0, theorem.clone());

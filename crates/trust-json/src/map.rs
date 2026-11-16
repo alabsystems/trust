@@ -7,10 +7,10 @@
 //!
 //! The incumbent has two backings selected by the `preserve_order` feature:
 //! `BTreeMap` (key-sorted iteration) without it, `IndexMap` (insertion order)
-//! with it. `crates/Cargo.toml` enables it nowhere, but the ROOT workspace does
-//! — `first-party/trust-mc/trust-mc-driver/Cargo.toml` asks for it, and Cargo
-//! unifies features across a workspace — so the same crates genuinely build
-//! both ways, and `crates/trust-types/src/digest.rs:11-25` documents that a
+//! with it. `first-party/trust-mc/trust-mc-driver` (linked by the compiler) and
+//! `crates/trust-certify` ask for it, and Cargo unifies features over the
+//! packages one invocation selects, so the same crates genuinely build both
+//! ways, and `crates/trust-types/src/digest.rs:11-25` documents that a
 //! `Value`-derived digest would otherwise differ between the two lockfiles.
 //!
 //! The defence already in the tree is
@@ -23,10 +23,11 @@
 //! A `BTreeMap` satisfies it unconditionally, which is why that is the backing
 //! chosen here, and why there is no `preserve_order` switch to get wrong.
 
-use crate::value::Value;
 use core::fmt::{self, Debug};
 use core::ops::{Index, IndexMut};
 use std::collections::{BTreeMap, btree_map};
+
+use crate::value::Value;
 
 /// Represents a JSON key/value map.
 #[derive(Clone, PartialEq, Eq, Default)]
@@ -37,9 +38,7 @@ pub struct Map<K, V> {
 impl Map<String, Value> {
     #[must_use]
     pub fn new() -> Self {
-        Map {
-            map: BTreeMap::new(),
-        }
+        Map { map: BTreeMap::new() }
     }
 
     /// Provided for source compatibility with the incumbent. A `BTreeMap` has
@@ -167,9 +166,7 @@ where
 {
     type Output = Value;
     fn index(&self, index: &Q) -> &Value {
-        self.map
-            .get(index)
-            .unwrap_or_else(|| panic!("no entry found for key {index}"))
+        self.map.get(index).unwrap_or_else(|| panic!("no entry found for key {index}"))
     }
 }
 
@@ -179,9 +176,7 @@ where
     Q: ?Sized + Ord + fmt::Display,
 {
     fn index_mut(&mut self, index: &Q) -> &mut Value {
-        self.map
-            .get_mut(index)
-            .unwrap_or_else(|| panic!("no entry found for key {index}"))
+        self.map.get_mut(index).unwrap_or_else(|| panic!("no entry found for key {index}"))
     }
 }
 
@@ -211,9 +206,7 @@ impl IntoIterator for Map<String, Value> {
 
 impl FromIterator<(String, Value)> for Map<String, Value> {
     fn from_iter<T: IntoIterator<Item = (String, Value)>>(iter: T) -> Self {
-        Map {
-            map: BTreeMap::from_iter(iter),
-        }
+        Map { map: BTreeMap::from_iter(iter) }
     }
 }
 

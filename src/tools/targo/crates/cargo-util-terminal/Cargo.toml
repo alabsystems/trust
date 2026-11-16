@@ -1,7 +1,7 @@
 [package]
 name = "cargo-util-terminal"
-version = "0.1.1"
-rust-version = "1.96"  # MSRV:1
+version = "0.1.4"
+rust-version = "1.99"  # MSRV:1
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,6 +14,7 @@ anstyle.workspace = true
 anstyle-hyperlink = { workspace = true, features = ["file"] }
 anstyle-progress.workspace = true
 anyhow.workspace = true
+cargo-util.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 supports-hyperlinks.workspace = true

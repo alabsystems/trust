@@ -1,0 +1,438 @@
+{
+  "name": "ci_vec_zst_counted",
+  "def_path": "zst_receiver_growth::ci_vec_zst_counted",
+  "span": {
+    "file": "zst_receiver_growth.rs",
+    "line_start": 15,
+    "col_start": 0,
+    "line_end": 19,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Seq": {
+                "elem": "Unit"
+              }
+            }
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Seq": {
+                "elem": "Unit"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "core::iter::adapters::map::Map",
+            "fields": [
+              [
+                "iter",
+                {
+                  "Adt": {
+                    "name": "core::ops::range::Range",
+                    "fields": [
+                      [
+                        "start",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      ],
+                      [
+                        "end",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "f",
+                {
+                  "Closure": {
+                    "name": "zst_receiver_growth::ci_vec_zst_counted::{closure#0}",
+                    "upvars": [],
+                    "call": {
+                      "kind": "FnMut",
+                      "params": [
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      ],
+                      "ret": null
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        100,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "zst_receiver_growth.rs",
+                "line_start": 16,
+                "col_start": 7,
+                "line_end": 16,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "zst_receiver_growth.rs",
+              "line_start": 16,
+              "col_start": 7,
+              "line_end": 16,
+              "col_end": 14
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          64
+                        ]
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "zst_receiver_growth.rs",
+                "line_start": 17,
+                "col_start": 8,
+                "line_end": 17,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::map::<(), {closure@zst_receiver_growth.rs:17:20: 17:23}>",
+            "args": [
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "CallableItem": {
+                    "def_path": "zst_receiver_growth::ci_vec_zst_counted::{closure#0}",
+                    "kind": "closure",
+                    "def_path_hash": {
+                      "stable_crate_id": "e9db86b5e9ae1d52",
+                      "local_hash": "cdfa701cefbce4d7"
+                    }
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "zst_receiver_growth.rs",
+              "line_start": 17,
+              "col_start": 8,
+              "line_end": 17,
+              "col_end": 26
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 10559,
+              "substs_digest": [
+                7527357647370868161,
+                9227363751501049337
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<core::iter::adapters::map::Map<core::ops::range::Range<usize>, {closure@zst_receiver_growth.rs:17:20: 17:23}> as core::iter::traits::iterator::Iterator>::collect_into::<alloc::vec::Vec<()>>::<__trust_elem_bytes@0>",
+            "args": [
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "zst_receiver_growth.rs",
+              "line_start": 17,
+              "col_start": 8,
+              "line_end": 17,
+              "col_end": 42
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 10607,
+              "substs_digest": [
+                15869412716267338529,
+                12894264830642001064
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

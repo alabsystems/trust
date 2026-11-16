@@ -1,11 +1,13 @@
 //! Built-in verifier engines used by the full verifier.
 
 mod native_trust_mc;
+mod native_trust_wp;
 mod native_ty;
 
 pub use native_trust_mc::{DEFAULT_PER_OBLIGATION_TIMEOUT_MS, NativeTrustMcTrustIrEngine};
+pub use native_trust_wp::NativeTrustWpTrustIrEngine;
 // Trust (b62 timeout-tuning regression): the one shared budgeted+proof-capable
-pub use native_ty::NativeTyEngine;
+pub use native_ty::{NativeTyEngine, RefutationCompleteness, RefutationOnlyVerdict};
 use trust_vc_bridge::TrustVcVerificationEngine;
 use trust_verifier_api::VerificationEngine;
 
@@ -23,6 +25,7 @@ pub fn required_native_engines_with_timeout_ms(
         Box::new(TrustVcVerificationEngine::new()),
         Box::new(NativeTrustMcTrustIrEngine::with_timeout_ms(timeout_ms)),
         Box::new(NativeTyEngine::new()),
+        Box::new(NativeTrustWpTrustIrEngine::with_timeout_ms(timeout_ms)),
     ]
 }
 

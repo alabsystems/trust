@@ -1,0 +1,44 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta-f1",
+ "measured_on": {
+  "trustc": "rustc 1.101.0-dev (c1d39075a 2026-11-12) (trustc 0.13.0+gc1d39075a)",
+  "trust-ir": "first-party/trust-ir@ee54e1f9c6ed sha256:ddc9b3e7654a9d47",
+  "clean": "first-party/clean@6521fcc4d7cf sha256:30a29621a9c54c81",
+  "trust-cg": "first-party/trust-cg@79d77180ac8f sha256:cdfef2238a864ed6"
+ },
+ "ratchets": {
+  "a.f1.codegen": {
+   "verdict": "GAP",
+   "class": "consumer-gap",
+   "signature": "f1:no-trust-cg-backend",
+   "audit": null,
+   "measured_only_when": "this build does NOT ship the opt-in trust-cg codegen backend; where it IS shipped the F1 hook emits the four downstream `a.f1.codegen.*` rows instead and this collapsed parent is never measured. `codegen-backends` lives in the gitignored `bootstrap.toml`, so which side a machine measures is LOCAL BUILD CONFIGURATION, not a property of the tree — which is why both sides are pinned",
+   "moved": "The audit corpus has NO row for `a.f1.codegen`: it was measured on a build that shipped the trust-cg codegen backend, so it recorded the four DOWNSTREAM rows (`.backend`, `.rust_control`, `.rust_control.strict_gate`, `.two_language`) and never the collapsed parent. This build ships no such backend — `trust-cg` is feature-gated and not in a default build (CLAUDE.md, Backends) — so the F1 backend probe answers `absent` and `f1_rows` records exactly one ratchet: this GAP, named `f1:no-trust-cg-backend`. MEASURED, not assumed: the probe compiles a one-line crate with `-Zcodegen-backend=trust-cg -Ztrust-cg-frontend=trust-ir` and the pin is taken only when that failure names the missing backend (codegen-backends / unknown codegen / failed to find); any other probe failure is an unnamed FAIL and is never pinnable. The F1 EXIT ITSELF IS NOT CLAIMED: this row asserts that the exit is not exercisable here and says why, which is the honest reading of a capability the default toolchain does not ship. The four downstream rows are covered by CONDITIONAL rather than pinned or NOT_PORTED — enable the backend and the judge emits them and they must be pinned."
+  },
+  "a.f1.codegen.backend": {
+   "verdict": "PASS",
+   "audit": "PASS",
+   "measured_only_when": "this build SHIPS the opt-in trust-cg codegen backend; on a default build the F1 hook's backend probe answers `absent` and `f1_rows` returns after the single collapsed `a.f1.codegen` GAP, so this row is never emitted (judge CONDITIONAL table, `^a\\\\.f1\\\\.codegen\\\\.`)"
+  },
+  "a.f1.codegen.rust_control": {
+   "verdict": "PASS",
+   "audit": "PASS",
+   "measured_only_when": "this build SHIPS the opt-in trust-cg codegen backend; on a default build the F1 hook's backend probe answers `absent` and `f1_rows` returns after the single collapsed `a.f1.codegen` GAP, so this row is never emitted (judge CONDITIONAL table, `^a\\\\.f1\\\\.codegen\\\\.`)"
+  },
+  "a.f1.codegen.rust_control.strict_gate": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "REAL GAIN in trust-cg, first measured here 2026-09-26. The audit recorded GAP `f1:strict-gate:could not be proven output-preserving`: under the DEFAULT (strict proven-output) gate the Rust-only C-ABI control crate was REFUSED fail-closed, and only `-Ztrust-cg-output-gate=allow-unknown` got an object out of it. That gate now ADMITS the same crate — measured `prints 87 == native`, the same 87 its allow-unknown sibling `a.f1.codegen.rust_control` produces from the identical trust-ir spelling (2/2 reachable functions, no MIR fallback). So the control is no longer merely EXECUTABLE from trust-ir, it is executable WITHOUT waiving the output-preservation proof, which is the whole point of the strict gate. NOT a widened gate: its stablemate `a.f1.codegen.two_language` still GAPs fail-closed (`Producer::Clean` refused for 3 of 4 reachable bodies), so the refusal path is intact and this row moved on its own evidence. The trust-cg pin advanced to 69ba15740afd with the gitlink; the audit value was recorded on an older one. Re-measure on YOUR build before quoting it — the strict gate is a measurement, not a property.",
+   "measured_only_when": "this build SHIPS the opt-in trust-cg codegen backend; on a default build the F1 hook's backend probe answers `absent` and `f1_rows` returns after the single collapsed `a.f1.codegen` GAP, so this row is never emitted (judge CONDITIONAL table, `^a\\\\.f1\\\\.codegen\\\\.`)"
+  },
+  "a.f1.codegen.two_language": {
+   "verdict": "GAP",
+   "class": "consumer-gap",
+   "signature": "f1:two-language:Producer::Clean not admitted to codegen:license=no-producer-refusal-text",
+   "audit": "GAP",
+   "measured_only_when": "this build SHIPS the opt-in trust-cg codegen backend; on a default build the F1 hook's backend probe answers `absent` and `f1_rows` returns after the single collapsed `a.f1.codegen` GAP, so this row is never emitted (judge CONDITIONAL table, `^a\\\\.f1\\\\.codegen\\\\.`)",
+   "moved": "The GAP stays a GAP; its class and the license half of its signature moved, measured 2026-11-12 on a stage 1 of c1d39075a2 built with the trust-cg backend (the four `a.f1.codegen.*` rows; the collapsed `a.f1.codegen` pin above is the other side and was not measured on this build). Pinned before: `license=producer-refused` [producer-gap], from the trustc 0.10.0 measurement, where `-Ztrust-ir-crate-module=on` made the PRODUCER refuse the codegen license for a crate holding a Clean row. Since plan step 3.4 (80f835d585, 2026-10-08) `prepare_crate_module` turns every `Producer::Clean` body into a bodyless declaration in the consumer's clone, so a Clean row no longer withdraws the crate's license: the license lane now completes 1/3 functions and the CONSUMER refuses the other two as `[clean-below-gate]` (the Clean def `m::f1_wsum`, tier `gate`, as `[producer-declined]`; its Rust caller because the callee `is not admitted to codegen`). Hence [consumer-gap] and `license=no-producer-refusal-text`. Nothing was gained or lost in what F1 emits: the two-language crate still cannot take the F1 exit, and the retiring step is still plan step 3.6 (the `Compiler::compile` lane). Two harness defects hid the move: the lane passed the retired `-Ztrust-ir-upstream-mir=on` until 3918bc14d3, and the judge matched `Producer::Clean` in a 420-character excerpt of each refusal line, which the `[clean-below-gate]` wording pushed past, so the row read `unnamed outcome` (fixed in the commit that wrote this)."
+  }
+ }
+}

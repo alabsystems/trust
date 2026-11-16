@@ -410,6 +410,32 @@ pub(super) struct AuthenticatedOutcome {
     pub(super) outcome: trust_types::Outcome,
     pub(super) has_obligation_id: bool,
     pub(super) has_location: bool,
+    /// Trust (OD-1 phase 1): a `proved` instance-discharge row
+    /// ([`compiler_tallies_row_as_assumed_discharge`]). It restates the resolved
+    /// callee's verdict and carries no proof of its own, so the row is
+    /// authenticated and earns nothing.
+    pub(super) assumed_discharge: bool,
+}
+
+impl AuthenticatedOutcome {
+    /// The outcome this row is credited with: for a `proved` instance-discharge
+    /// row, the compiler's own tally of it (`skipped`, "assumed (instance
+    /// discharge)"), never `proved`; for every other row, its outcome. Every
+    /// consumer that reads a row as proof reads this.
+    pub(super) fn credited_outcome(&self) -> trust_types::Outcome {
+        if self.assumed_discharge { trust_types::Outcome::Skipped } else { self.outcome }
+    }
+}
+
+/// Trust (OD-1 phase 1): the row the compiler's tally (`PublishedRowTally::of`,
+/// `json_counts` in compiler/rustc_mir_transform/src/trust_verify.rs) files under
+/// `assumed_discharge` — the envelope's `skipped`, and so `unknown`, never
+/// `proved` — although the row travels with outcome `proved`: outcome `proved`
+/// and the shared instance-discharge predicate. The same test as
+/// `pipeline/transport.rs`'s reconciler (2d4323e3d6); nothing else is admitted.
+fn compiler_tallies_row_as_assumed_discharge(row: &trust_types::TransportObligationResult) -> bool {
+    row.outcome.is_proved()
+        && trust_types::assumption::is_instance_hypothesis_discharge_row(&row.kind, &row.solver)
 }
 
 pub(super) fn authenticated_outcomes(
@@ -457,6 +483,12 @@ fn authenticated_transport(
                     || result.function.is_empty()
                     || crate_name.is_empty()
                     || result.total != result.results.len()
+                    // Trust (TRANSPORT-LINE-BUDGET-1): a budget disclosure that
+                    // disagrees with its rows makes the envelope malformed.
+                    || result
+                        .transport_budget
+                        .as_ref()
+                        .is_some_and(|disclosure| disclosure.defect(&result.results).is_some())
                     || !functions.insert(result.function)
                     // The envelope is only authentic if every row carries an
                     // outcome the MIR transport lane actually emits. The wider
@@ -483,14 +515,26 @@ fn authenticated_transport(
                 {
                     return None;
                 }
-                let row_proved =
-                    result.results.iter().filter(|row| row.outcome.is_proved()).count();
+                // A `proved` instance-discharge row is counted where the
+                // compiler counts it: `skipped` (and so `unknown`), not `proved`.
+                let row_proved = result
+                    .results
+                    .iter()
+                    .filter(|row| {
+                        row.outcome.is_proved() && !compiler_tallies_row_as_assumed_discharge(row)
+                    })
+                    .count();
                 let row_failed =
                     result.results.iter().filter(|row| row.outcome.is_failed()).count();
                 let row_timed_out =
                     result.results.iter().filter(|row| row.outcome.is_timeout()).count();
-                let row_skipped =
-                    result.results.iter().filter(|row| row.outcome.is_skipped()).count();
+                let row_skipped = result
+                    .results
+                    .iter()
+                    .filter(|row| {
+                        row.outcome.is_skipped() || compiler_tallies_row_as_assumed_discharge(row)
+                    })
+                    .count();
                 let row_runtime =
                     result.results.iter().filter(|row| row.outcome.is_runtime_checked()).count();
                 let row_plain_unknown = result
@@ -516,6 +560,7 @@ fn authenticated_transport(
                     has_obligation_id:
                         row.obligation_id.as_deref().is_some_and(|id| !id.is_empty()),
                     has_location: row.location.is_some(),
+                    assumed_discharge: compiler_tallies_row_as_assumed_discharge(row),
                 }));
                 let counts = [
                     result.proved,
@@ -886,6 +931,126 @@ fn reports_verification_outcome(text: &str) -> bool {
     contains(text, "eligible function bodies verified (complete)")
 }
 
+/// A copy of `tests/fixtures/obligation-ids` at `dir`, its `src/lib.rs` passed
+/// through `edit`, so the run's target directory stays out of the tree. Returns
+/// the copy's manifest path.
+fn obligation_ids_crate(
+    root: &Path,
+    dir: &Path,
+    edit: impl FnOnce(String) -> String,
+) -> Result<PathBuf> {
+    let fixture = root.join("tests/fixtures/obligation-ids");
+    fs::create_dir_all(dir.join("src"))?;
+    fs::copy(fixture.join("Cargo.toml"), dir.join("Cargo.toml"))?;
+    let source = fs::read_to_string(fixture.join("src/lib.rs"))
+        .with_context(|| format!("reading {}", fixture.join("src/lib.rs").display()))?;
+    fs::write(dir.join("src/lib.rs"), edit(source))?;
+    Ok(dir.join("Cargo.toml"))
+}
+
+/// The committed obligation baseline, end to end (work item T9; the same cases
+/// as tests/e2e_targo_trust_cli.sh): `check --save-baseline` twice writes the
+/// same bytes; `diff --baseline` exits 0 on the unchanged source, 1 naming the
+/// key when `checked_div` loses its `requires`, and 0 listing the gain when a
+/// proved function is added.
+fn committed_baseline_round_trip(
+    root: &Path,
+    targo: &Path,
+    tmp: &Path,
+    policy: GatePolicy,
+) -> Result<()> {
+    println!("--- committed obligation baseline (T9)");
+    let manifest = obligation_ids_crate(root, &tmp.join("obligation-ids"), |source| source)?;
+    let manifest_arg = manifest.to_str().context("UTF-8 manifest path")?;
+    let saves = [tmp.join("trust.baseline.1"), tmp.join("trust.baseline.2")];
+    for save in &saves {
+        let save_arg = save.to_str().context("UTF-8 baseline path")?;
+        let run = capture(public_cli_command(
+            targo,
+            tmp,
+            &["check", "--manifest-path", manifest_arg, "--lib", "--save-baseline", save_arg],
+        )?)?;
+        if !accepts_developer_failure(&run, policy) || !save.is_file() {
+            bail!(
+                "check --save-baseline exited {} or wrote no baseline:\n{}",
+                run.exit,
+                run.stderr
+            );
+        }
+    }
+    let first = fs::read_to_string(&saves[0])?;
+    if first != fs::read_to_string(&saves[1])? {
+        bail!("two --save-baseline runs of one source wrote different bytes");
+    }
+    if !first.starts_with("trust-baseline v1\n")
+        || !contains(&first, "trust_obligation_ids_fixture::checked_div")
+    {
+        bail!("the baseline is not a trust-baseline v1 file naming checked_div:\n{first}");
+    }
+    let baseline_arg = saves[0].to_str().context("UTF-8 baseline path")?;
+    let diff = |manifest: &Path| -> Result<Captured> {
+        let manifest = manifest.to_str().context("UTF-8 manifest path")?;
+        capture(public_cli_command(
+            targo,
+            tmp,
+            &["diff", "--baseline", baseline_arg, "--manifest-path", manifest],
+        )?)
+    };
+    let same = diff(&manifest)?;
+    if !same.exited_with(0) {
+        bail!(
+            "diff --baseline on the unchanged source exited {}, not 0:\n{}{}",
+            same.exit,
+            same.stdout,
+            same.stderr
+        );
+    }
+    // The planted loss: without its `requires`, `checked_div`'s division is no
+    // longer proved, under the same key.
+    let lost_manifest = obligation_ids_crate(root, &tmp.join("obligation-ids-lost"), |source| {
+        source
+            .lines()
+            .filter(|line| !line.contains("requires d > 0"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+    let lost = diff(&lost_manifest)?;
+    if !lost.exited_with(1)
+        || !lost
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("LOST ") && line.contains("checked_div #"))
+    {
+        bail!(
+            "a lost proof must exit 1 and name its key (exit {}):\n{}{}",
+            lost.exit,
+            lost.stdout,
+            lost.stderr
+        );
+    }
+    // New code only: a proved function added is a gain, not a failure.
+    let gain_manifest = obligation_ids_crate(root, &tmp.join("obligation-ids-gain"), |source| {
+        format!(
+            "{source}\n/// Added: proves, like `midpoint`.\npub fn halves(a: u32, b: u32) -> u32 {{\n    a / 2 + b / 2\n}}\n"
+        )
+    })?;
+    let gain = diff(&gain_manifest)?;
+    if !gain.exited_with(0)
+        || !gain.stdout.lines().any(|line| line.starts_with("GAINED ") && line.contains("halves#"))
+    {
+        bail!(
+            "added proved code must exit 0 and list its gains (exit {}):\n{}{}",
+            gain.exit,
+            gain.stdout,
+            gain.stderr
+        );
+    }
+    println!(
+        "  PASS: the committed baseline is byte-deterministic and diff fails only on a lost proof"
+    );
+    Ok(())
+}
+
 pub(super) fn public_cli(root: &Path, policy: GatePolicy) -> Result<()> {
     println!();
     println!("=== tRust E2E Test: targo trust public CLI ===");
@@ -950,16 +1115,6 @@ pub(super) fn public_cli(root: &Path, policy: GatePolicy) -> Result<()> {
     fs::write(&init_input, "pub fn increment(x: i32) -> i32 {\n    x + 1\n}\n")?;
     let build_input = tmp.join("build_ok.rs");
     fs::write(&build_input, "fn main() {\n}\n")?;
-    let baseline_json = tmp.join("baseline.json");
-    fs::write(
-        &baseline_json,
-        "{\"results\":[{\"kind\":\"overflow\",\"message\":\"surface\",\"outcome\":\"Failed\",\"backend\":\"trust\",\"time_ms\":1}]}\n",
-    )?;
-    let current_json = tmp.join("current.json");
-    fs::write(
-        &current_json,
-        "{\"results\":[{\"kind\":\"overflow\",\"message\":\"surface\",\"outcome\":\"Proved\",\"backend\":\"trust\",\"time_ms\":1}]}\n",
-    )?;
 
     let help_full = capture(public_cli_command(&targo, tmp, &["help"])?)?;
     if !help_full.exited_with(0) {
@@ -1032,47 +1187,7 @@ pub(super) fn public_cli(root: &Path, policy: GatePolicy) -> Result<()> {
     }
     assert_source_audit_report(&json_object(&report, "source-audit report json")?)?;
 
-    // The saved-report evidence gate now refuses a bare `Proved` outcome
-    // without publication-grade structured proof/transport evidence, so the
-    // shell-era synthetic improvement fixture is (correctly) rejected. Pin
-    // that fail-closed behavior instead; improvement counting is covered by
-    // diff's own unit tests against evidenced reports.
-    let diff = capture(public_cli_command(
-        &targo,
-        tmp,
-        &[
-            "diff",
-            "--baseline",
-            baseline_json.to_str().unwrap(),
-            "--current",
-            current_json.to_str().unwrap(),
-            "--format",
-            "json",
-        ],
-    )?)?;
-    // Trust: `diff` fails closed on an unreplayed serialized `Proved` by
-    // SANITIZING it — the row is loaded as `unknown` because live verifier
-    // authority was not replayed, which surfaces as a non-authoritative saved
-    // claim and yields the comparison-failure exit code 1. A 0 exit here would
-    // mean the synthetic bare-Proved report was ACCEPTED at face value, which
-    // must never happen. (Sanitization, not a hard load-time rejection, is the
-    // current sound design: the report still parses, but no unreplayed Proved
-    // is ever credited.)
-    if !diff.exited_with(1) {
-        bail!(
-            "diff did not fail closed on a synthetic bare-Proved report (expected the sanitized-claim exit 1, got exit {})",
-            diff.exit
-        );
-    }
-    // The sanitization diagnostic was reworded "live verifier authority was
-    // not replayed" -> "live verifier/compiler authority was not replayed";
-    // match the stable "authority was not replayed" fragment.
-    if !contains(&diff.stderr, "authority was not replayed") {
-        bail!(
-            "diff did not cite the unreplayed-authority sanitization for the bare-Proved report:\n{}",
-            diff.stderr
-        );
-    }
+    committed_baseline_round_trip(root, &targo, tmp, policy)?;
 
     let init = capture(public_cli_command(&targo, tmp, &["init", init_input.to_str().unwrap()])?)?;
     if !init.exited_with(0) || !contains(&init.stdout, "increment") {
@@ -1737,7 +1852,8 @@ mod tests {
                 "primary_package": false,
                 "verification_session": session,
                 "eligible": 1,
-                "processed": 1
+                "processed": 1,
+                "memory": { "schema": "trust-memory-summary/v1", "counters": {} }
             }),
         ]
         .into_iter()
@@ -1844,6 +1960,101 @@ mod tests {
         assert!(!authenticated_probe_transport(&captured(-1, true, "", &valid), "session-a"));
     }
 
+    /// Trust (OD-1 phase 1): the compiler's own transport of
+    /// tests/fixtures/instance-discharge, the bytes `pipeline/transport.rs`
+    /// pins, with `session` stamped on every line and `edit` applied to each
+    /// line's JSON. `use_good` carries an `assert` row and a `proved`
+    /// instance-discharge row and declares proved 1 / unknown 1 / skipped 1 /
+    /// total 2; the crate summary proved 2 / unknown 4 / skipped 4 / total 6.
+    fn instance_discharge_transport(session: &str, edit: impl Fn(&mut Value)) -> String {
+        include_str!("../fixtures/instance_discharge_proved_transport.jsonl")
+            .lines()
+            .map(|line| {
+                let payload = line.strip_prefix("TRUST_JSON:").expect("a pinned transport line");
+                let mut value: Value =
+                    serde_json::from_str(payload).expect("the pinned transport line parses");
+                value["verification_session"] = Value::from(session);
+                edit(&mut value);
+                format!("TRUST_JSON:{value}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn is_discharge_row(row: &Value) -> bool {
+        row["kind"] == trust_types::assumption::INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND
+    }
+
+    #[test]
+    fn transport_tallies_a_proved_instance_discharge_row_as_the_compiler_does() {
+        let authenticate =
+            |stderr: &str| authenticated_outcomes(&captured(0, false, "", stderr), "session-a");
+
+        let outcomes = authenticate(&instance_discharge_transport("session-a", |_| {}))
+            .expect("the compiler's own transcript, discharge row and all, authenticates");
+        let discharge = outcomes.iter().filter(|row| row.assumed_discharge).collect::<Vec<_>>();
+        assert_eq!(discharge.len(), 1, "one instance, so one discharge row");
+        assert_eq!(
+            discharge[0].kind,
+            trust_types::assumption::INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND
+        );
+        assert_eq!(discharge[0].outcome, trust_types::Outcome::Proved);
+        assert_eq!(
+            discharge[0].credited_outcome(),
+            trust_types::Outcome::Skipped,
+            "authenticated, and still earns nothing"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .filter(|row| !row.assumed_discharge)
+                .all(|row| row.credited_outcome() == row.outcome)
+        );
+
+        // The tally of before 79212a4c78 (the row counted as a proof), with a
+        // crate summary that agrees with it, is now the defect.
+        let old_tally = instance_discharge_transport("session-a", |value| {
+            if value["function"] == "trust_instance_discharge_fixture::use_good" {
+                value["proved"] = 2.into();
+                value["unknown"] = 0.into();
+                value["skipped"] = 0.into();
+            }
+            if value["type"] == "crate_summary" {
+                value["functions_verified"] = 2.into();
+                value["total_proved"] = 3.into();
+                value["total_unknown"] = 3.into();
+                value["total_skipped"] = 3.into();
+            }
+        });
+        assert!(
+            authenticate(&old_tally).is_none(),
+            "a proved discharge row is never tallied proved"
+        );
+
+        // Lookalikes keep the compiler's discharge tally and are counted by their
+        // own outcome, as the compiler counts them: each is refused.
+        type DischargeMutation = fn(&mut Value);
+        let lookalikes: [(&str, DischargeMutation); 4] = [
+            ("another solver", |row| row["solver"] = "trust-full-verifier".into()),
+            ("another kind", |row| row["kind"] = "assumption:instance-hypothesis".into()),
+            ("failed", |row| row["outcome"] = "failed".into()),
+            ("runtime-checked", |row| row["outcome"] = "runtime_checked".into()),
+        ];
+        for (name, mutate) in lookalikes {
+            let transcript = instance_discharge_transport("session-a", |value| {
+                // `get_mut`, not `value["results"]`: IndexMut would insert a null
+                // `results` into the two summary lines.
+                if let Some(rows) = value.get_mut("results").and_then(Value::as_array_mut) {
+                    rows.iter_mut().filter(|row| is_discharge_row(row)).for_each(mutate);
+                }
+            });
+            assert!(
+                authenticate(&transcript).is_none(),
+                "{name}: must not be tallied as a proved discharge"
+            );
+        }
+    }
+
     #[test]
     fn terminal_controls_cannot_conceal_skip_markers() {
         assert!(line_has_unexpected_skip("Sx\u{8}KIP: hidden with backspace"));
@@ -1853,7 +2064,12 @@ mod tests {
         assert!(line_has_unexpected_skip("\u{1b}[32mSKIP\u{1b}[0m: colored"));
     }
 
+    /// Child process body for `capture_enforces_timeout_and_output_bound`
+    /// (through `capture_fixture`, which re-executes it with `--ignored
+    /// --exact`). A no-op without its environment, and `#[ignore]`d so a plain
+    /// run does not count that no-op as a pass.
     #[test]
+    #[ignore = "subprocess child: re-executed by capture_enforces_timeout_and_output_bound"]
     fn capture_subprocess_fixture() {
         match env::var("TRUST_CAPTURE_TEST_FIXTURE").as_deref() {
             Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
@@ -1865,7 +2081,9 @@ mod tests {
     fn capture_fixture(mode: &str, timeout: Duration, max_bytes: usize) -> Result<Captured> {
         let mut command = Command::new(env::current_exe()?);
         command
+            // The child is `#[ignore]`d: `--ignored` selects it, `--exact` only it.
             .args([
+                "--ignored",
                 "--exact",
                 "trust_added::trustc_native::tests::capture_subprocess_fixture",
                 "--nocapture",
@@ -1876,6 +2094,17 @@ mod tests {
 
     #[test]
     fn capture_enforces_timeout_and_output_bound() {
+        // Control first: with room to finish, the filter selects exactly the
+        // child and the child runs its body. Without this, a filter that selects
+        // no test (a renamed child, a moved module) is caught only by libtest's
+        // own banner overflowing the 128-byte cap below, and by its startup
+        // outlasting the 50 ms timeout: margins, not checks.
+        let control = capture_fixture("output", Duration::from_secs(60), 64 * 1024)
+            .expect("the child, given room, must finish");
+        assert_eq!(control.exit, 0, "{}\n{}", control.stdout, control.stderr);
+        assert!(control.stdout.contains("running 1 test"), "{}", control.stdout);
+        assert!(control.stdout.contains(&"x".repeat(4096)), "{}", control.stdout);
+
         let timeout = capture_fixture("sleep", Duration::from_millis(50), 1024)
             .expect_err("sleeping child must time out");
         assert!(timeout.to_string().contains("timeout"), "{timeout:#}");

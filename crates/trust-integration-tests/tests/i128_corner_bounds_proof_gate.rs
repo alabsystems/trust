@@ -28,42 +28,31 @@
 //! in `structured_multiplier_proof_gate.rs` is why wide `Mul` stays [VALIDATED].
 //! What this file buys is that the interval argument is no longer Rust-only.
 //!
-//! Opt-in: skips with a notice when no `clean` checker is discoverable.
+//! This is the BINARY half. The same theorems
+//! (`clean_proof_obligations::CORNER_BOUNDS_THEOREMS`) are required IN PROCESS
+//! by `trust_integration_tests::clean_proof_obligations`, as real theorems of
+//! the file with a certified (foundational-only) closure, through the Clean
+//! kernel linked into this crate; nothing there is discovered and nothing
+//! skips. This file checks that a `clean` built from the pinned
+//! `first-party/clean` agrees. It is `#[ignore]`d and runs only under
+//! `slow.clean-binary-proof-gates`, which builds that `clean` and names it in
+//! `TRUST_CLEAN_BIN`; selected without it, it panics with the build recipe.
 
-use std::path::Path;
 use std::process::Command;
 
-use trust_integration_tests::clean_test_support::clean_checker_path;
-
-/// The theorems that MUST be present, real Theorems, and axiom-free.
-///
-/// The two `mul_box_*` entries are the law the suppression rests on. The
-/// witnesses are included deliberately: without them the development could
-/// degenerate into statements about a multiplication that computes to nothing,
-/// and the gate would still pass.
-const REQUIRED_FOUNDATIONAL_THEOREMS: &[&str] = &[
-    "CornerBox.mul_box_upper",
-    "CornerBox.mul_box_lower",
-    "CornerBox.imul_comm",
-    "CornerBox.corner_witness_products",
-    "CornerBox.corner_witness_negative",
-];
+use trust_integration_tests::clean_proof_obligations::{
+    CORNER_BOUNDS_PROOF, CORNER_BOUNDS_THEOREMS, repo_path,
+};
+use trust_integration_tests::clean_test_support::require_clean_bin;
 
 #[test]
+#[ignore = "needs TRUST_CLEAN_BIN (slow.clean-binary-proof-gates)"]
 fn i128_corner_bounds_proof_gate() {
-    let proof = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../proofs/trust-soundness/i128_mul_corner_bounds.lean")
+    let proof = repo_path(CORNER_BOUNDS_PROOF)
         .canonicalize()
         .expect("i128_mul_corner_bounds.lean must exist");
 
-    let Some(bin) = clean_checker_path() else {
-        eprintln!(
-            "NOTICE: no `clean` checker discoverable — skipping the bounded-corner-multiply \
-             proof gate. Proof at {}.",
-            proof.display()
-        );
-        return;
-    };
+    let bin = require_clean_bin();
 
     // (1) The whole file kernel-checks with ZERO sorry-axioms.
     let check = Command::new(&bin)
@@ -137,7 +126,7 @@ fn i128_corner_bounds_proof_gate() {
             })
         })
         .collect();
-    for required in REQUIRED_FOUNDATIONAL_THEOREMS {
+    for required in CORNER_BOUNDS_THEOREMS {
         assert!(
             exported.iter().any(|t| t == required || t.ends_with(required)),
             "{required} must be an EXPORTED, axiom-free Theorem (a `def`, an `axiom`, or a \

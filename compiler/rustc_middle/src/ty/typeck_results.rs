@@ -8,14 +8,14 @@ use rustc_data_structures::unord::{ExtendUnord, UnordItems, UnordSet};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdMap};
-use rustc_hir::hir_id::OwnerId;
 use rustc_hir::{
     self as hir, BindingMode, ByRef, HirId, ItemLocalId, ItemLocalMap, ItemLocalSet, Mutability,
+    OwnerId,
 };
 use rustc_index::IndexVec;
-use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_macros::{Lift, StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_session::Session;
-use rustc_span::Span;
+use rustc_span::{Span, bug};
 
 use crate::hir::place::Place as HirPlace;
 use crate::infer::canonical::Canonical;
@@ -23,8 +23,8 @@ use crate::mir::FakeReadCause;
 use crate::thir::DerefPatBorrowMode;
 use crate::traits::ObligationCause;
 use crate::ty::{
-    self, BoundVar, CanonicalPolyFnSig, ClosureSizeProfileData, GenericArgKind, GenericArgs,
-    GenericArgsRef, Ty, UserArgs, tls,
+    self, BoundVar, CanonicalPolyFnSig, ClosureSizeProfileData, GenericArgKind, GenericArgs, Ty,
+    UserArgs, tls,
 };
 
 #[derive(TyEncodable, TyDecodable, Debug, StableHash)]
@@ -37,7 +37,7 @@ pub struct TypeckResults<'tcx> {
     type_dependent_defs: ItemLocalMap<Result<(DefKind, DefId), ErrorGuaranteed>>,
 
     /// Resolved definitions for splatted function calls.
-    splatted_defs: ItemLocalMap<Result<SplattedDef, ErrorGuaranteed>>,
+    splatted_defs: ItemLocalMap<Result<SplattedDef<'tcx>, ErrorGuaranteed>>,
 
     /// Resolved field indices for field accesses in expressions (`S { field }`, `obj.field`)
     /// or patterns (`S { field }`). The index is often useful by itself, but to learn more
@@ -54,7 +54,7 @@ pub struct TypeckResults<'tcx> {
     /// of this node. This only applies to nodes that refer to entities
     /// parameterized by type parameters, such as generic fns, types, or
     /// other items.
-    node_args: ItemLocalMap<GenericArgsRef<'tcx>>,
+    node_args: ItemLocalMap<GenericArgs<'tcx>>,
 
     /// This will either store the canonicalized types provided by the user
     /// or the generic parameters that the user explicitly gave (if any) attached
@@ -101,7 +101,7 @@ pub struct TypeckResults<'tcx> {
     /// leads to a `vec![&Box<Option<i32>>, Box<Option<i32>>]`. Empty vectors are not stored.
     ///
     /// See:
-    /// <https://github.com/rust-lang/rfcs/blob/master/text/2005-match-ergonomics.md#definitions>
+    /// <https://rust-lang.github.io/rfcs/2005-match-ergonomics.html#definitions>
     pat_adjustments: ItemLocalMap<Vec<ty::adjustment::PatAdjustment<'tcx>>>,
 
     /// Set of reference patterns that match against a match-ergonomics inserted reference
@@ -223,6 +223,9 @@ pub struct TypeckResults<'tcx> {
     /// computation.
     pub transmutes_to_check: Vec<(Ty<'tcx>, Ty<'tcx>, HirId)>,
 
+    /// Stores the types involved in calls to `offload` intrinsic.
+    pub offloads_to_check: Vec<(Ty<'tcx>, Ty<'tcx>, Ty<'tcx>, HirId)>,
+
     /// Container types and field indices of `offset_of!` expressions
     offset_of_data: ItemLocalMap<Vec<(Ty<'tcx>, VariantIdx, FieldIdx)>>,
 }
@@ -256,12 +259,13 @@ impl<'tcx> TypeckResults<'tcx> {
             potentially_region_dependent_goals: Default::default(),
             closure_size_eval: Default::default(),
             transmutes_to_check: Default::default(),
+            offloads_to_check: Default::default(),
             offset_of_data: Default::default(),
         }
     }
 
     /// Whether every TypeckResults surface omitted by the v4 Trust witness
-    /// grammar is empty. This lives beside the private fields deliberately:
+    /// grammar, but one (below), is empty. This lives beside the private fields deliberately:
     /// checking only the public/accessor subset in `trust-witness::mintable`
     /// silently dropped state consumed by MIR, borrowck, and diagnostics (most
     /// critically `transmutes_to_check` and region-dependent goals).
@@ -269,29 +273,88 @@ impl<'tcx> TypeckResults<'tcx> {
     /// The witness decoder reconstructs all of these as their empty defaults,
     /// so a nonempty cold value must make the root non-mintable until that
     /// field is encoded and independently checked.
+    ///
+    /// One unencoded field is NOT gated: `potentially_region_dependent_goals`.
+    /// Its one reader is `check_potentially_region_dependent_goals`, which
+    /// borrowck's type ops ask only after an operation FAILED, to report the
+    /// error instead of a delayed bug (`type_op::custom`); nothing reads it
+    /// on a compile that borrow-checks. A witness exists only for a crate
+    /// whose cold compile finished analysis, borrowck included, with no error
+    /// and no delayed bug (the commit gate in `rustc_interface::passes`), under
+    /// a key over the whole crate, its flags and its upstream crates, and an
+    /// accepted replay installs the fields MIR building reads as the cold
+    /// compile had them, so the warm borrowck is the cold one and never asks.
+    /// Were it asked, the empty set would turn the error into that delayed
+    /// bug (an ICE), never into an acceptance. Under the next trait solver
+    /// (the `trust` channel's default since PERF-SEP26-DEFAULTS) the set is
+    /// nonempty for nearly every body: a parameter's `Sized` goal is recorded
+    /// because the pattern's type was an inference variable when it was
+    /// proved (`fn h(x: i64)` records `i64: Sized`), so gating it minted no
+    /// root of any function with a parameter (measured 2026-10-20).
     pub fn trust_witness_unencoded_fields_are_empty(&self) -> bool {
-        self.splatted_defs.is_empty()
-            && self.user_provided_types.is_empty()
-            && self.user_provided_sigs.is_empty()
-            && self.rust_2024_migration_desugared_pats.is_empty()
-            && self.skipped_ref_pats.is_empty()
-            && self.closure_kind_origins.is_empty()
-            && self.hidden_types.is_empty()
-            && self.closure_min_captures.is_empty()
-            && self.closure_fake_reads.is_empty()
-            && self.coroutine_stalled_predicates.is_empty()
-            && self.potentially_region_dependent_goals.is_empty()
-            && self.closure_size_eval.is_empty()
-            && self.transmutes_to_check.is_empty()
-            && self.offset_of_data.is_empty()
+        // Trust: exhaustive field census, deliberately without `..`. An upstream
+        // addition must be classified before a witness can silently omit it.
+        let Self {
+            // Identity/error state: decode binds the owner to the requested root;
+            // mintable rejects taint, and crate commitment rejects delayed bugs too.
+            hir_owner: _,
+            tainted_by_errors: _,
+            // Serialized surfaces; mintable also gates their lossy/default-only
+            // subcases. The args-only-key completeness check remains below.
+            type_dependent_defs: _,
+            field_indices: _,
+            node_types,
+            node_args,
+            adjustments: _,
+            pat_binding_modes: _,
+            pat_adjustments: _,
+            liberated_fn_sigs: _,
+            fru_field_types: _,
+            coercion_casts: _,
+            used_trait_imports: _,
+            // Diagnostic-only exclusion, justified above. Both callers in
+            // type_op/custom.rs remain Err even when this list is empty: they
+            // produce a delayed bug instead of recovering a diagnostic. This
+            // cannot turn a failed type operation into successful codegen.
+            potentially_region_dependent_goals: _,
+            // Unencoded semantic/diagnostic state: every field must be empty.
+            splatted_defs,
+            user_provided_types,
+            user_provided_sigs,
+            rust_2024_migration_desugared_pats,
+            skipped_ref_pats,
+            closure_kind_origins,
+            hidden_types,
+            closure_min_captures,
+            closure_fake_reads,
+            coroutine_stalled_predicates,
+            closure_size_eval,
+            transmutes_to_check,
+            offloads_to_check,
+            offset_of_data,
+        } = self;
+        splatted_defs.is_empty()
+            && user_provided_types.is_empty()
+            && user_provided_sigs.is_empty()
+            && rust_2024_migration_desugared_pats.is_empty()
+            && skipped_ref_pats.is_empty()
+            && closure_kind_origins.is_empty()
+            && hidden_types.is_empty()
+            && closure_min_captures.is_empty()
+            && closure_fake_reads.is_empty()
+            && coroutine_stalled_predicates.is_empty()
+            && closure_size_eval.is_empty()
+            && transmutes_to_check.is_empty()
+            // Trust: like transmutes, these are semantic checks deferred until
+            // after typeck (hir_typeck::intrinsicck::check_offloads), not error-only
+            // diagnostic recovery. Installing an empty default would drop them.
+            && offloads_to_check.is_empty()
+            && offset_of_data.is_empty()
             // The v4 encoder discovers node-args by probing node-type keys
             // because TypeckResults intentionally has no public node-args
             // table accessor. Refuse a result with an args-only key: silently
             // omitting it would make an "encoded" field lossy.
-            && self
-                .node_args
-                .items()
-                .all(|(id, _)| self.node_types.contains_key(id))
+            && node_args.items().all(|(id, _)| node_types.contains_key(id))
     }
 
     /// Returns the final resolution of a `QPath` in an `Expr` or `Pat` node.
@@ -325,18 +388,20 @@ impl<'tcx> TypeckResults<'tcx> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.type_dependent_defs }
     }
 
-    pub fn splatted_defs(&self) -> LocalTableInContext<'_, Result<SplattedDef, ErrorGuaranteed>> {
+    pub fn splatted_defs(
+        &self,
+    ) -> LocalTableInContext<'_, Result<SplattedDef<'tcx>, ErrorGuaranteed>> {
         LocalTableInContext { hir_owner: self.hir_owner, data: &self.splatted_defs }
     }
 
-    pub fn splatted_def(&self, id: HirId) -> Option<SplattedDef> {
+    pub fn splatted_def(&self, id: HirId) -> Option<SplattedDef<'tcx>> {
         validate_hir_id_for_typeck_results(self.hir_owner, id);
         self.splatted_defs.get(&id.local_id).cloned().and_then(|r| r.ok())
     }
 
     pub fn splatted_defs_mut(
         &mut self,
-    ) -> LocalTableInContextMut<'_, Result<SplattedDef, ErrorGuaranteed>> {
+    ) -> LocalTableInContextMut<'_, Result<SplattedDef<'tcx>, ErrorGuaranteed>> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.splatted_defs }
     }
 
@@ -385,16 +450,16 @@ impl<'tcx> TypeckResults<'tcx> {
         self.node_types.get(&id.local_id).cloned()
     }
 
-    pub fn node_args_mut(&mut self) -> LocalTableInContextMut<'_, GenericArgsRef<'tcx>> {
+    pub fn node_args_mut(&mut self) -> LocalTableInContextMut<'_, GenericArgs<'tcx>> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.node_args }
     }
 
-    pub fn node_args(&self, id: HirId) -> GenericArgsRef<'tcx> {
+    pub fn node_args(&self, id: HirId) -> GenericArgs<'tcx> {
         validate_hir_id_for_typeck_results(self.hir_owner, id);
         self.node_args.get(&id.local_id).cloned().unwrap_or_else(|| GenericArgs::empty())
     }
 
-    pub fn node_args_opt(&self, id: HirId) -> Option<GenericArgsRef<'tcx>> {
+    pub fn node_args_opt(&self, id: HirId) -> Option<GenericArgs<'tcx>> {
         validate_hir_id_for_typeck_results(self.hir_owner, id);
         self.node_args.get(&id.local_id).cloned()
     }
@@ -461,7 +526,7 @@ impl<'tcx> TypeckResults<'tcx> {
     }
 
     pub fn is_splatted_call(&self, expr: &hir::Expr<'_>) -> bool {
-        matches!(self.splatted_defs().get(expr.hir_id), Some(Ok(SplattedDef { .. })))
+        matches!(self.splatted_defs().get(expr.hir_id), Some(Ok(_)))
     }
 
     /// Returns the computed binding mode for a `PatKind::Binding` pattern
@@ -628,14 +693,62 @@ impl<'tcx> TypeckResults<'tcx> {
 
 /// A resolved splatted function call.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, StableHash, TyEncodable, TyDecodable)]
-pub struct SplattedDef {
-    /// The function DefId, if available (FnPtrs don't have DefIds)
-    pub def_id: Option<DefId>,
-    /// The index of the first argument in the callee's splatted tuple, and the index of the
-    /// splatted tuple argument in the caller.
-    pub arg_index: u16,
-    /// The number of arguments in the splatted tuple.
-    pub arg_count: u16,
+pub enum SplattedDef<'tcx> {
+    /// A resolved FnDef call.
+    FnDef {
+        /// The DefId of the FnDef (used to look up its type).
+        def_id: DefId,
+
+        /// The index of the first argument in the callee's splatted tuple, and the index of the
+        /// splatted tuple argument in the caller.
+        arg_index: u16,
+
+        /// The number of arguments in the splatted tuple.
+        arg_count: u16,
+    },
+
+    /// A resolved FnPtr Call.
+    FnPtr {
+        /// The resolved type of the FnPtr.
+        fn_ptr_type: Ty<'tcx>,
+
+        /// The index of the first argument in the callee's splatted tuple, and the index of the
+        /// splatted tuple argument in the caller.
+        arg_index: u16,
+
+        /// The number of arguments in the splatted tuple.
+        arg_count: u16,
+    },
+}
+
+impl<'tcx> SplattedDef<'tcx> {
+    pub fn def_id(&self) -> Option<DefId> {
+        match self {
+            SplattedDef::FnDef { def_id, .. } => Some(*def_id),
+            SplattedDef::FnPtr { .. } => None,
+        }
+    }
+
+    pub fn fn_ptr_type(&self) -> Option<Ty<'tcx>> {
+        match self {
+            SplattedDef::FnDef { .. } => None,
+            SplattedDef::FnPtr { fn_ptr_type, .. } => Some(*fn_ptr_type),
+        }
+    }
+
+    pub fn arg_index(&self) -> u16 {
+        match self {
+            SplattedDef::FnDef { arg_index, .. } => *arg_index,
+            SplattedDef::FnPtr { arg_index, .. } => *arg_index,
+        }
+    }
+
+    pub fn arg_count(&self) -> u16 {
+        match self {
+            SplattedDef::FnDef { arg_count, .. } => *arg_count,
+            SplattedDef::FnPtr { arg_count, .. } => *arg_count,
+        }
+    }
 }
 
 /// Validate that the given HirId (respectively its `local_id` part) can be
@@ -832,7 +945,7 @@ impl<'tcx> UserType<'tcx> {
 /// from constants that are named via paths, like `Foo::<A>::new` and
 /// so forth.
 #[derive(Copy, Clone, Debug, PartialEq, TyEncodable, TyDecodable)]
-#[derive(Eq, Hash, StableHash, TypeFoldable, TypeVisitable)]
+#[derive(Eq, Hash, StableHash, TypeFoldable, TypeVisitable, Lift)]
 pub enum UserTypeKind<'tcx> {
     Ty(Ty<'tcx>),
 
@@ -860,7 +973,7 @@ impl<'tcx> IsIdentity for CanonicalUserType<'tcx> {
                     return false;
                 }
 
-                iter::zip(user_args.args, BoundVar::ZERO..).all(|(arg, cvar)| {
+                iter::zip(user_args.args.as_slice(), BoundVar::ZERO..).all(|(arg, cvar)| {
                     match arg.kind() {
                         GenericArgKind::Type(ty) => match ty.kind() {
                             ty::Bound(debruijn, b) => {
@@ -897,24 +1010,12 @@ impl<'tcx> IsIdentity for CanonicalUserType<'tcx> {
 
 impl<'tcx> std::fmt::Display for UserType<'tcx> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.bounds.is_empty() {
-            self.kind.fmt(f)
-        } else {
-            self.kind.fmt(f)?;
+        self.kind.fmt(f)?;
+        for b in self.bounds {
             write!(f, " + ")?;
-            std::fmt::Debug::fmt(&self.bounds, f)
+            b.fmt(f)?;
         }
-    }
-}
-
-impl<'tcx> std::fmt::Display for UserTypeKind<'tcx> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Ty(arg0) => {
-                ty::print::with_no_trimmed_paths!(write!(f, "Ty({})", arg0))
-            }
-            Self::TypeOf(arg0, arg1) => write!(f, "TypeOf({:?}, {:?})", arg0, arg1),
-        }
+        Ok(())
     }
 }
 

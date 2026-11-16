@@ -1,0 +1,1 @@
+{"type": "alethe_certificate", "version": "1.0", "problem": "(declare-fun p () Bool)\n(assert p)\n(check-sat-assuming ((not p)))\n", "proof": "(assume a0 p)\n(assume a1 (not p))\n(step t1 (cl) :rule resolution :premises (a0 a1))\n"}

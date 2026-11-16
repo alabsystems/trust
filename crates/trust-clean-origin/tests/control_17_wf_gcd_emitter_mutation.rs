@@ -186,6 +186,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Termina
         is_unsafe_sig: false,
         unwind: UnwindEdge::Continue,
         callee_identity: None,
+        callee_key: None,
     }
 }
 
@@ -288,6 +289,7 @@ fn emitted_gcdf() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -310,8 +312,13 @@ fn with_args(mut body: VerifiableFunction, block: usize, args: Vec<Operand>) -> 
 /// The KERNEL half, with the MIR recognizer removed from the loop: reflect a
 /// (possibly mutated) reading straight to side B and ask the gate.
 fn gate_side_b(env: &Environment, body: &WfRecBody) -> Result<(), String> {
-    let reflected = trust_clean_origin::reflect_wf::reflect_wf_functional(env, "gcdF", body, trust_clean_origin::WfLowering::OnParameter)
-        .map_err(|detail| format!("reflection refused: {detail}"))?;
+    let reflected = trust_clean_origin::reflect_wf::reflect_wf_functional(
+        env,
+        "gcdF",
+        body,
+        trust_clean_origin::WfLowering::OnParameter,
+    )
+    .map_err(|detail| format!("reflection refused: {detail}"))?;
     let plan = plan_clean_origin_body(env, "gcdF").expect("gcdF plans");
     trust_clean_origin::gate::check_faithful_wf_functional(
         env,
@@ -476,11 +483,8 @@ fn control_17_b_swapped_subtraction_operands_are_refused_at_both_layers() {
 
     // …and the NESTED one, `a - (a - b)` mutated to `(a - b) - a`, which is the
     // transposition a reader that pre-reduced `min` in Rust would hide.
-    let nested = with_rec_args(vec![
-        RecBodyExpr::Pred,
-        abs_diff(),
-        sub(sub(param(1), param(2)), param(1)),
-    ]);
+    let nested =
+        with_rec_args(vec![RecBodyExpr::Pred, abs_diff(), sub(sub(param(1), param(2)), param(1))]);
     assert!(
         gate_side_b(&env, &nested).is_err(),
         "the NESTED subtraction's operand order must be decided too — `(a-b)-a` is 0, not \
@@ -564,7 +568,9 @@ fn control_17_d_swapped_self_call_operands_are_refused() {
         ),
         "the swapped self-call must not emit"
     );
-    eprintln!("CONTROL-17 (d) swapped self-call operands | REFUSED (threaded: gate; measure: reader)");
+    eprintln!(
+        "CONTROL-17 (d) swapped self-call operands | REFUSED (threaded: gate; measure: reader)"
+    );
 }
 
 /// (e) **THE GUARD ON THE WRONG PARAMETER.** The emitted zero test decides `a`
@@ -630,7 +636,11 @@ fn control_17_f_forged_callees_are_refused() {
         admit_lowering(
             &env,
             &plan,
-            &with_callee(emitted_gcdf(), 5, "trust_bignum::arith::<impl trust_bignum::Nat>::saturating_sub"),
+            &with_callee(
+                emitted_gcdf(),
+                5,
+                "trust_bignum::arith::<impl trust_bignum::Nat>::saturating_sub"
+            ),
         )
         .is_ok(),
         "`saturating_sub` is a documented alias of `sub` in trust-bignum and must keep \
@@ -678,9 +688,10 @@ fn control_17_g_a_moved_parameter_used_twice_is_still_refused() {
     )
     .expect("`scale` must elaborate — the refusal has to be THIS compiler's, not clean's");
 
-    let refusal = plan_clean_origin_body(&env, "scale")
-        .expect_err("a parameter that is both moved into the self-call and borrowed after it \
-                     has no emission");
+    let refusal = plan_clean_origin_body(&env, "scale").expect_err(
+        "a parameter that is both moved into the self-call and borrowed after it \
+                     has no emission",
+    );
     assert!(!refusal.is_compiler_defect(), "a fragment boundary is a capability refusal");
     assert!(
         refusal.note().contains("BY ITSELF"),

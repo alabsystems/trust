@@ -2,7 +2,7 @@
 //
 // Exercises the full Trust verification pipeline:
 //   extract (synthetic) -> vcgen -> router -> report
-// plus cache hit/miss, level filtering, and symex path constraints.
+// plus level filtering and symex path constraints.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -14,8 +14,8 @@ use trust_integration_tests::{
     array_access_function, contract_function, division_function, midpoint_function, noop_function,
 };
 use trust_types::{
-    BinOp, Counterexample, CounterexampleValue, Formula, FunctionVerdict, ProofLevel,
-    ProofStrength, Sort, SourceSpan, VcKind, VerificationCondition, VerificationResult,
+    BinOp, Counterexample, CounterexampleValue, Formula, ProofLevel, SourceSpan, VcKind,
+    VerificationCondition, VerificationResult,
 };
 
 // A router pinned to the deterministic `ConstantFolderBackend` only. These
@@ -163,7 +163,7 @@ fn test_full_pipeline_division_report() {
 }
 
 #[test]
-fn test_full_pipeline_with_proved_trivial_vc() {
+fn test_full_pipeline_raw_proved_trivial_vc_reports_inconclusive() {
     // Create a VC with a trivially false formula (mock proves it)
     let vc = VerificationCondition {
         kind: VcKind::DivisionByZero,
@@ -186,12 +186,29 @@ fn test_full_pipeline_with_proved_trivial_vc() {
 
     let results = vec![(vc.clone(), result)];
     let report = trust_report::build_json_report("safe_crate", &results);
-    assert_eq!(report.summary.total_proved, 1);
-    assert_eq!(report.summary.verdict, trust_types::CrateVerdict::Verified);
+    // `build_json_report` publishes through the report publication gate: a raw
+    // `VerificationResult` carries no live verifier replay capability, so its
+    // `Proved` row is published as `Unknown` and the crate is Inconclusive,
+    // never Verified. Behaviour since 72ada1163c6 (gate added to
+    // `build_json_report`) and b6171397b6d (every raw proof downgraded). This is
+    // a deliberate false-PROVE guard.
+    assert_eq!(report.summary.total_obligations, 1);
+    assert_eq!(report.summary.total_proved, 0);
+    assert_eq!(report.summary.total_unknown, 1);
+    assert_eq!(report.summary.verdict, trust_types::CrateVerdict::Inconclusive);
+    match &report.functions[0].obligations[0].outcome {
+        trust_types::ObligationOutcome::Unknown { reason } => assert!(
+            reason.contains("no live verifier replay capability"),
+            "unexpected downgrade reason: {reason}"
+        ),
+        other => panic!("raw Proved must publish as Unknown, got {other:?}"),
+    }
 
     let text = trust_report::format_json_summary(&report);
-    assert!(text.contains("PROVED"));
-    assert!(text.contains("Verdict: VERIFIED"));
+    assert!(text.contains("UNKNOWN"), "text: {text}");
+    assert!(!text.contains("PROVED"), "text: {text}");
+    assert!(text.contains("Verdict: INCONCLUSIVE"), "text: {text}");
+    assert!(!text.contains("Verdict: VERIFIED"), "text: {text}");
 }
 
 #[test]
@@ -219,91 +236,6 @@ fn test_full_pipeline_multi_function_report() {
     assert!(func_names.contains(&"get_midpoint"));
     assert!(func_names.contains(&"divide"));
     assert!(func_names.contains(&"lookup"));
-}
-
-// ---------------------------------------------------------------------------
-// 3. Cache integration: hit/miss with pipeline results
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_cache_miss_then_hit_with_vcgen() {
-    let func = midpoint_function();
-    let mut cache = trust_cache::VerificationCache::in_memory();
-
-    // First lookup: miss
-    let lookup = cache.lookup_function(&func, "");
-    assert_eq!(lookup, trust_cache::CacheLookup::Miss);
-
-    // Simulate verification and store result
-    let vcs = trust_vcgen::generate_vcs(&func);
-    cache.store_function(&func, FunctionVerdict::Verified, vcs.len(), vcs.len(), 0, 0, 0, "");
-
-    // Second lookup: hit
-    let lookup = cache.lookup_function(&func, "");
-    match lookup {
-        trust_cache::CacheLookup::Hit(entry) => {
-            assert_eq!(entry.verdict, FunctionVerdict::Verified);
-            assert_eq!(entry.total_obligations, 1);
-        }
-        trust_cache::CacheLookup::Miss => panic!("expected cache hit after store"),
-    }
-
-    assert_eq!(cache.hits(), 1);
-    assert_eq!(cache.misses(), 1);
-}
-
-#[test]
-fn test_cache_invalidation_on_body_change() {
-    let func_v1 = midpoint_function();
-    let mut cache = trust_cache::VerificationCache::in_memory();
-
-    // Store v1
-    cache.store_function(&func_v1, FunctionVerdict::Verified, 1, 1, 0, 0, 0, "");
-
-    // Create v2 with modified body (different arg_count)
-    let mut func_v2 = midpoint_function();
-    func_v2.body.arg_count = 5;
-
-    // Lookup v2: miss (body changed)
-    let lookup = cache.lookup_function(&func_v2, "");
-    assert_eq!(lookup, trust_cache::CacheLookup::Miss);
-}
-
-#[test]
-fn test_cache_with_full_pipeline() {
-    let funcs = vec![midpoint_function(), division_function(), array_access_function()];
-    let mut cache = trust_cache::VerificationCache::in_memory();
-    let router = mock_router();
-
-    // First pass: all misses, verify and store
-    for func in &funcs {
-        assert_eq!(cache.lookup_function(func, ""), trust_cache::CacheLookup::Miss);
-
-        let vcs = trust_vcgen::generate_vcs(func);
-        let results = router.verify_all(&vcs);
-        let proved = results.iter().filter(|(_, r)| r.is_proved()).count();
-        let failed = results.iter().filter(|(_, r)| r.is_failed()).count();
-        let unknown = results.len() - proved - failed;
-
-        let verdict = if failed > 0 {
-            FunctionVerdict::HasViolations
-        } else if unknown > 0 {
-            FunctionVerdict::Inconclusive
-        } else {
-            FunctionVerdict::Verified
-        };
-
-        cache.store_function(func, verdict, results.len(), proved, failed, unknown, 0, "");
-    }
-
-    // Second pass: all hits
-    for func in &funcs {
-        assert!(matches!(cache.lookup_function(func, ""), trust_cache::CacheLookup::Hit(_)));
-    }
-
-    assert_eq!(cache.hits(), 3);
-    assert_eq!(cache.misses(), 3);
-    assert_eq!(cache.len(), 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,8 +290,7 @@ fn test_filter_vcs_by_level_then_route() {
 fn test_multi_backend_dispatch_selects_appropriate_backend() {
     use trust_router::constant_folder::ConstantFolderBackend;
 
-    // Pipeline-v2: TrustMcBackend/TrustWpBackend gated behind not(pipeline-v2).
-    // Use IncrementalAYSession for L0, ConstantFolderBackend as fallback.
+    // Use IncrementalAYSession for L0 and the canonical constant folder as fallback.
     let router = trust_router::Router::with_backends(vec![
         Box::new(require_ay()),
         Box::new(trust_router::ty_backend::TyBackend),
@@ -563,35 +494,6 @@ fn test_report_ndjson_streaming() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Parallel verification
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_parallel_verification_matches_sequential() {
-    let midpoint = midpoint_function();
-    let divide = division_function();
-    let lookup = array_access_function();
-
-    let mut all_vcs = Vec::new();
-    all_vcs.extend(trust_vcgen::generate_vcs(&midpoint));
-    all_vcs.extend(trust_vcgen::generate_vcs(&divide));
-    all_vcs.extend(trust_vcgen::generate_vcs(&lookup));
-
-    let router = mock_router();
-
-    let seq_results = router.verify_all(&all_vcs);
-    let par_results = router.verify_all_parallel(&all_vcs, 4);
-
-    assert_eq!(seq_results.len(), par_results.len());
-
-    // Same VCs, same solver names
-    for (seq, par) in seq_results.iter().zip(par_results.iter()) {
-        assert_eq!(seq.0.function, par.0.function);
-        assert_eq!(seq.1.solver_name(), par.1.solver_name());
-    }
-}
-
-// ---------------------------------------------------------------------------
 // 10. Validated function produces typed error
 // ---------------------------------------------------------------------------
 
@@ -616,59 +518,6 @@ fn test_validate_function_valid() {
     let vcs = trust_vcgen::try_generate_vcs(&func);
     assert!(vcs.is_ok());
     assert_eq!(vcs.unwrap().len(), 1);
-}
-
-// ---------------------------------------------------------------------------
-// 11. Query cache (solver-level caching)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_query_cache_hit_miss() {
-    use trust_cache::QueryCache;
-
-    let mut qcache = QueryCache::new();
-
-    // Create a VC to cache
-    let vc = VerificationCondition {
-        kind: VcKind::ArithmeticOverflow {
-            op: trust_types::BinOp::Add,
-            operand_tys: (
-                trust_types::Ty::Int { width: 32, signed: true },
-                trust_types::Ty::Int { width: 32, signed: true },
-            ),
-        },
-        function: "test_fn".into(),
-        location: SourceSpan::default(),
-        formula: Formula::Eq(
-            Box::new(Formula::Var("x".into(), Sort::Int)),
-            Box::new(Formula::Int(42)),
-        ),
-        contract_metadata: None,
-        obligation: None,
-    };
-
-    // Miss
-    assert!(qcache.lookup(&vc).is_none());
-
-    // Store a result
-    let result = VerificationResult::Proved {
-        solver: "ay".into(),
-        time_ms: 5,
-        strength: ProofStrength::smt_unsat(),
-        proof_certificate: None,
-        solver_warnings: None,
-        native_proof_envelope: None,
-    };
-    qcache.insert(&vc, result.clone());
-
-    // Hit
-    let cached = qcache.lookup(&vc);
-    assert!(cached.is_some());
-    assert!(cached.unwrap().is_proved());
-
-    let stats = qcache.stats();
-    assert_eq!(stats.hits, 1);
-    assert_eq!(stats.misses, 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -72,6 +72,7 @@
 //! | `a % 7` via the island-writable `UInt64.ofNat (a.toNat % 7)` round trip | yes (`p0 % 7` literal-divisor mint) | ADMIT (probe_i2, 2026-08-21) | refused: no Rem shape reads THIS spelling |
 //! | `if a < b then a else b` | yes (admit_select) | ADMIT; arm/instance mutants refused | `Select` (flipped 2026-08-20, C5a) |
 //! | `if a < 10 then a else b` (both numeral spellings) | phase 1: NO producer ("no reflection path", 2026-08-21); phase 2: yes, via the NEW `admit_select_literal_function` | ADMIT both spellings; off-by-one/arm/instance mutants refused | `SelectLiteral` (flipped 2026-08-21, C9) |
+//! | `if a <= 10 then a else b` / `if a = 10 then a else b` | yes, via that same unchanged literal-select producer | ADMIT from the real island spelling at UInt8/16/32/64; wrong comparison/literal/arms refused (probe_i5) | `SelectLiteral` |
 //! | `if 10 < a then a else b` (left literal) | NO — unrepresentable in the producer's vocabulary | unreachable | refused (probe_i2) |
 //!
 //! The constant rows locate the corpus's finding 3 (`f04`–`f09`, every
@@ -258,6 +259,7 @@ fn vf(arg_count: usize, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> Veri
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -272,6 +274,7 @@ fn prim_call(callee: &str, args: Vec<Operand>, dest: Place, target: BlockId) -> 
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         unwind: UnwindEdge::Unreachable,
     }
 }
@@ -1740,6 +1743,12 @@ fn ite_lt_literal_body(rhs: Expr) -> Expr {
     // the bare Nat literal. The carrier-instance spelling this helper used
     // to hand-build was a fiction no elaborator emits; defeq is intensional
     // on the stuck ite, so the fiction admitted only against itself.
+    //
+    // 2026-09-23: that held for every Clean pin before `c91fa93f5`. From it
+    // on, the island mints the CARRIER instance again (over an unfolded
+    // numeral) and the kernel identifies the two decisions; that spelling is
+    // `probe_i4`'s. This helper keeps the Nat-reduced one, because the
+    // recognizer still reads it and a Clean pin can move back.
     let _ = rhs;
     let dec_inst = Expr::apps(
         Expr::const_(Name::from_string("instDecidableNatLt"), vec![]),
@@ -1863,6 +1872,7 @@ fn emitted_select_diamond() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -2106,6 +2116,14 @@ fn probe_i2_select_literal_on_the_left_refuses_today() {
 /// planner refused — so every crate suite was green while the driver-level
 /// fixture died at the mint with E0425. A shape is only measured when its
 /// side A comes from the producer that will really run.
+///
+/// 2026-09-23 — the same gap, the other way round: the Clean pin move to
+/// `dca882b5f` (carrying Clean `c91fa93f5`, the BitVec-carrier `decLt` that
+/// IS `Nat.decLt`) put the CARRIER instance back into the real tree, the
+/// planner refused it, and this probe went red with the three driver
+/// fixtures. Because side A here is whatever the pinned elaborator mints,
+/// the probe itself did not change: the recognizer now reads both spellings,
+/// and `probe_i4` pins the new one by hand.
 #[test]
 fn probe_i3_select_literal_real_elaboration_admits() {
     let mut session = trust_certify::clean_island::CleanIslandSession::new();
@@ -2162,6 +2180,410 @@ fn probe_i3_select_literal_real_elaboration_admits() {
     let refusal = check_faithful(env, "clamp10", &wrong, &u64_carrier())
         .expect_err("a drifted literal must be refused against the real tree");
     assert!(matches!(refusal, GateRefusal::Disagreement { .. }), "got {refusal:?}");
+}
+
+/// `UInt64.ofNat LIT` unfolded one δβ step — the value `clean-kernel`'s
+/// `init_uint_type` gives `UInt64.ofNat`, applied to the literal:
+/// `UInt64.ofBitVec (BitVec.ofFin (OfNat.ofNat.{0} Nat 64 (instOfNatNat 64))
+/// (Fin.ofNat (2^64 - 1) LIT))`. This is the spelling the carrier instance's
+/// right operand arrives in from the real island (measured 2026-09-23).
+fn unfolded_u64_numeral(lit: u64) -> Expr {
+    let width = Expr::apps(
+        Expr::const_(Name::from_string("OfNat.ofNat"), vec![Level::zero()]),
+        [
+            Expr::const_(Name::from_string("Nat"), vec![]),
+            Expr::nat_lit(64),
+            Expr::app(Expr::const_(Name::from_string("instOfNatNat"), vec![]), Expr::nat_lit(64)),
+        ],
+    );
+    let fin = Expr::apps(
+        Expr::const_(Name::from_string("Fin.ofNat"), vec![]),
+        [Expr::nat_lit(u64::MAX), Expr::nat_lit(lit)],
+    );
+    Expr::app(
+        Expr::const_(Name::from_string("UInt64.ofBitVec"), vec![]),
+        Expr::apps(Expr::const_(Name::from_string("BitVec.ofFin"), vec![]), [width, fin]),
+    )
+}
+
+/// Side A for `if a ⊲ 10 then a else b` in the CARRIER-INSTANCE spelling the
+/// island mints for `<`, `<=` and propositional `=`. The decision is
+/// `<inst> <inst_lhs> <inst_rhs>`; the faithful less-than tree, for example,
+/// is `("instDecidableUInt64Lt", bvar 1, unfolded_u64_numeral(10))`.
+/// The other arguments build the instance mutants. Under two binders:
+/// a = bvar 1, b = bvar 0.
+fn carrier_instance_select_literal(
+    cmp: SelectCmp,
+    inst: &str,
+    inst_lhs: Expr,
+    inst_rhs: Expr,
+) -> Expr {
+    let prop = match cmp {
+        SelectCmp::Lt => Expr::apps(
+            Expr::const_(Name::from_string("LT.lt"), vec![Level::zero()]),
+            [
+                uint64(),
+                Expr::const_(Name::from_string("instLTUInt64"), vec![]),
+                Expr::bvar(1),
+                carrier_lit(10),
+            ],
+        ),
+        SelectCmp::Le => Expr::apps(
+            Expr::const_(Name::from_string("LE.le"), vec![Level::zero()]),
+            [
+                uint64(),
+                Expr::const_(Name::from_string("instLEUInt64"), vec![]),
+                Expr::bvar(1),
+                carrier_lit(10),
+            ],
+        ),
+        SelectCmp::Eq => Expr::apps(
+            Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
+            [uint64(), Expr::bvar(1), carrier_lit(10)],
+        ),
+    };
+    let dec_inst = Expr::apps(Expr::const_(Name::from_string(inst), vec![]), [inst_lhs, inst_rhs]);
+    let ite_body = Expr::apps(
+        Expr::const_(Name::from_string("ite"), vec![Level::succ(Level::zero())]),
+        [uint64(), prop, dec_inst, Expr::bvar(1), Expr::bvar(0)],
+    );
+    Expr::lam(BinderInfo::Default, uint64(), Expr::lam(BinderInfo::Default, uint64(), ite_body))
+}
+
+/// **R2/C9 — THE CARRIER-INSTANCE SPELLING (2026-09-23).**
+///
+/// The superproject's Clean pin moved to `dca882b5f`, which carries Clean
+/// `c91fa93f5` (*"the BitVec-carrier decLe/decLt ARE Nat.decLe/decLt"*). The
+/// same island source `if a < 10 then a else b` now elaborates its decision
+/// through the CARRIER instance again — measured through the real pipeline,
+/// at UInt8/16/32/64 alike:
+///
+/// ```text
+/// before:  instDecidableNatLt (Proj Fin 0 (Proj BitVec 0 (Proj UInt64 0 a))) 10
+/// after:   instDecidableUInt64Lt a (UInt64.ofBitVec (BitVec.ofFin (OfNat.ofNat Nat 64 _)
+///                                                     (Fin.ofNat 18446744073709551615 10)))
+/// ```
+///
+/// The planner read only the first, so every driver-level `if a < 10`
+/// fixture died at the mint with E0425. This probe pins the second by hand,
+/// in four parts:
+///
+/// 1. the recognizer reads it as EXACTLY the `SelectLiteral` the Nat-reduced
+///    spelling reads as (`<`, parameter 0, literal 10, arms 0/1);
+/// 2. the gate ADMITS the UNCHANGED side B producer (which still mints the
+///    Nat-reduced decision) against it — a kernel identification that exists
+///    only since `c91fa93f5` — and REFUSES the three one-construct-wrong side
+///    B's `probe_i` refuses;
+/// 3. a MUTATED carrier instance — `Le` for `Lt`, the operands exchanged,
+///    another parameter, another value — cannot even enter the environment:
+///    side A is full-kernel-checked, so its instance must decide exactly its
+///    proposition, and the recognizer's operand match only restates that;
+/// 4. every machine width plans from a REAL island session (the recognizer
+///    reads the width and the `2^w - 1` modulus per carrier).
+#[test]
+fn probe_i4_select_literal_carrier_instance_spelling() {
+    let mut env = Environment::with_prelude();
+    define(
+        &mut env,
+        "min10_carrier",
+        u64_arrows(2),
+        carrier_instance_select_literal(
+            SelectCmp::Lt,
+            "instDecidableUInt64Lt",
+            Expr::bvar(1),
+            unfolded_u64_numeral(10),
+        ),
+    );
+
+    // (1) The SAME reading as the Nat-reduced spelling.
+    assert_plan_shape(
+        &env,
+        "min10_carrier",
+        CleanOriginShape::SelectLiteral {
+            cmp: SelectCmp::Lt,
+            cmp_param: 0,
+            literal: 10,
+            then_param: 0,
+            else_param: 1,
+        },
+    );
+
+    // (2) The gate, against the UNCHANGED side B producer.
+    let side_b = reflect(&env, |scratch, name| {
+        trust_spec_elab::admit_select_literal_function(
+            scratch,
+            name,
+            &[Domain::Machine(MachineUIntWidth::U64), Domain::Machine(MachineUIntWidth::U64)],
+            trust_spec_elab::SelectCmp::Lt,
+            0,
+            10,
+            0,
+            1,
+        )
+    })
+    .expect("the select-literal side B reflects");
+    check_faithful(&env, "min10_carrier", &side_b, &u64_carrier()).unwrap_or_else(|refusal| {
+        panic!(
+            "MEASURED ADMIT expected: the Nat-reduced side B must identify with the \
+             carrier-instance side A at a Clean pin carrying `c91fa93f5`: {refusal:?}"
+        )
+    });
+    let mutants: [(&str, trust_spec_elab::SelectCmp, u128, usize, usize); 3] = [
+        ("literal off by one", trust_spec_elab::SelectCmp::Lt, 11, 0, 1),
+        ("swapped arms", trust_spec_elab::SelectCmp::Lt, 10, 1, 0),
+        ("Le for Lt", trust_spec_elab::SelectCmp::Le, 10, 0, 1),
+    ];
+    for (what, cmp, literal, then_param, else_param) in mutants {
+        let wrong = reflect(&env, |scratch, name| {
+            trust_spec_elab::admit_select_literal_function(
+                scratch,
+                name,
+                &[Domain::Machine(MachineUIntWidth::U64), Domain::Machine(MachineUIntWidth::U64)],
+                cmp,
+                0,
+                literal,
+                then_param,
+                else_param,
+            )
+        })
+        .expect("the wrong body still reflects");
+        let refusal = check_faithful(&env, "min10_carrier", &wrong, &u64_carrier())
+            .unwrap_err_or_panic(what, "min10_carrier");
+        assert!(
+            matches!(refusal, GateRefusal::Disagreement { .. }),
+            "{what} vs `min10_carrier`: got {refusal:?}"
+        );
+    }
+
+    // (3) A mutated carrier instance does not TYPE against the proposition.
+    let mutated: [(&str, &str, Expr, Expr); 4] = [
+        ("Le for Lt", "instDecidableUInt64Le", Expr::bvar(1), unfolded_u64_numeral(10)),
+        ("operands exchanged", "instDecidableUInt64Lt", unfolded_u64_numeral(10), Expr::bvar(1)),
+        ("another parameter", "instDecidableUInt64Lt", Expr::bvar(0), unfolded_u64_numeral(10)),
+        ("another value", "instDecidableUInt64Lt", Expr::bvar(1), unfolded_u64_numeral(11)),
+    ];
+    for (index, (what, inst, inst_lhs, inst_rhs)) in mutated.into_iter().enumerate() {
+        let entered = try_define(
+            &mut env,
+            &format!("min10_carrier_mutant_{index}"),
+            u64_arrows(2),
+            carrier_instance_select_literal(SelectCmp::Lt, inst, inst_lhs, inst_rhs),
+        );
+        assert!(
+            entered.is_err(),
+            "a carrier instance with {what} was ACCEPTED by the kernel under an `a < 10` \
+             proposition; the recognizer's operand match would then be the only thing \
+             between it and a plan, and this probe's soundness note is false"
+        );
+    }
+
+    // (4) Every machine width, from the REAL island session.
+    for bits in [8u32, 16, 32, 64] {
+        let def = format!("capped{bits}");
+        let source = format!(
+            "def {def} (a : UInt{bits}) (b : UInt{bits}) : UInt{bits} := if a < 10 then a else b"
+        );
+        let mut session = trust_certify::clean_island::CleanIslandSession::new();
+        let batch = session.check_all(&[source.as_str()]);
+        assert!(!batch.is_rejected(), "u{bits}: the island must kernel-check: {batch:?}");
+        let real = session.environment().expect("an untainted session has an environment");
+        assert_plan_shape(
+            real,
+            &def,
+            CleanOriginShape::SelectLiteral {
+                cmp: SelectCmp::Lt,
+                cmp_param: 0,
+                literal: 10,
+                then_param: 0,
+                else_param: 1,
+            },
+        );
+    }
+
+    eprintln!(
+        "PROBE-ROW | if a < 10 then a else b  | side A: CARRIER instance (clean c91fa93f5+) | \
+         plan: SelectLiteral at u8/u16/u32/u64 | kernel: ADMIT vs the Nat-reduced side B | \
+         mutated instances: do not type"
+    );
+}
+
+/// Literal right operands at `<=` and propositional `=` through the REAL
+/// island elaborator. The exact current terms use the carrier instances
+/// `instDecidableUIntNLe` / `instDecidableEqUIntN`, applied to the same
+/// parameter and `{C}.ofNat 10` named by the proposition, at every machine
+/// width. The producer was already able to mint both comparisons; this probe
+/// measures the recognizer widening and keeps the kernel faithfulness gate as
+/// the authority.
+#[test]
+fn probe_i5_select_literal_le_and_propositional_eq_real_elaboration_admit() {
+    for bits in [8u32, 16, 32, 64] {
+        let source = format!(
+            "def le10 (a b : UInt{bits}) : UInt{bits} := if a <= 10 then a else b\n\
+             def eq10 (a b : UInt{bits}) : UInt{bits} := if a = 10 then a else b"
+        );
+        let mut session = trust_certify::clean_island::CleanIslandSession::new();
+        let batch = session.check_all(&[source.as_str()]);
+        assert!(!batch.is_rejected(), "u{bits}: the island must kernel-check: {batch:?}");
+        let env = session.environment().expect("an untainted session has an environment");
+        for (name, cmp) in [("le10", SelectCmp::Le), ("eq10", SelectCmp::Eq)] {
+            assert_plan_shape(
+                env,
+                name,
+                CleanOriginShape::SelectLiteral {
+                    cmp,
+                    cmp_param: 0,
+                    literal: 10,
+                    then_param: 0,
+                    else_param: 1,
+                },
+            );
+        }
+    }
+
+    let mut session = trust_certify::clean_island::CleanIslandSession::new();
+    let batch = session
+        .check_all(&["def le10_gate (a b : UInt64) : UInt64 := if a <= 10 then a else b\n\
+         def eq10_gate (a b : UInt64) : UInt64 := if a = 10 then a else b"]);
+    assert!(!batch.is_rejected(), "the gate island must kernel-check: {batch:?}");
+    let env = session.environment().expect("an untainted session has an environment");
+    let domains = [Domain::Machine(MachineUIntWidth::U64), Domain::Machine(MachineUIntWidth::U64)];
+    for (side_a, cmp, wrong_cmp) in [
+        ("le10_gate", trust_spec_elab::SelectCmp::Le, trust_spec_elab::SelectCmp::Lt),
+        ("eq10_gate", trust_spec_elab::SelectCmp::Eq, trust_spec_elab::SelectCmp::Le),
+    ] {
+        let side_b = reflect(env, |scratch, name| {
+            trust_spec_elab::admit_select_literal_function(
+                scratch, name, &domains, cmp, 0, 10, 0, 1,
+            )
+        })
+        .expect("the literal select side B reflects");
+        check_faithful(env, side_a, &side_b, &u64_carrier()).unwrap_or_else(|refusal| {
+            panic!("MEASURED ADMIT expected against real `{side_a}`: {refusal:?}")
+        });
+
+        for (what, mutant_cmp, literal, then_param, else_param) in [
+            ("wrong comparison", wrong_cmp, 10, 0, 1),
+            ("literal off by one", cmp, 11, 0, 1),
+            ("swapped arms", cmp, 10, 1, 0),
+        ] {
+            let wrong = reflect(env, |scratch, name| {
+                trust_spec_elab::admit_select_literal_function(
+                    scratch, name, &domains, mutant_cmp, 0, literal, then_param, else_param,
+                )
+            })
+            .expect("the wrong body still reflects");
+            let refusal = check_faithful(env, side_a, &wrong, &u64_carrier())
+                .unwrap_err_or_panic(what, side_a);
+            assert!(
+                matches!(refusal, GateRefusal::Disagreement { .. }),
+                "{what} vs `{side_a}`: got {refusal:?}"
+            );
+        }
+    }
+
+    // The instance itself is authenticated, not just the proposition and
+    // emitted comparison. First prove the hand-built carrier spellings are
+    // well typed and plan; then require one-field instance corruptions to be
+    // rejected by the kernel before the recognizer can see them.
+    let mut manual = Environment::with_prelude();
+    for (name, cmp, inst) in [
+        ("le10_carrier_manual", SelectCmp::Le, "instDecidableUInt64Le"),
+        ("eq10_carrier_manual", SelectCmp::Eq, "instDecidableEqUInt64"),
+    ] {
+        define(
+            &mut manual,
+            name,
+            u64_arrows(2),
+            carrier_instance_select_literal(cmp, inst, Expr::bvar(1), unfolded_u64_numeral(10)),
+        );
+        assert_plan_shape(
+            &manual,
+            name,
+            CleanOriginShape::SelectLiteral {
+                cmp,
+                cmp_param: 0,
+                literal: 10,
+                then_param: 0,
+                else_param: 1,
+            },
+        );
+    }
+    let malformed = [
+        (
+            "Le decided by Eq",
+            SelectCmp::Le,
+            "instDecidableEqUInt64",
+            Expr::bvar(1),
+            unfolded_u64_numeral(10),
+        ),
+        (
+            "Le operands exchanged",
+            SelectCmp::Le,
+            "instDecidableUInt64Le",
+            unfolded_u64_numeral(10),
+            Expr::bvar(1),
+        ),
+        (
+            "Le another parameter",
+            SelectCmp::Le,
+            "instDecidableUInt64Le",
+            Expr::bvar(0),
+            unfolded_u64_numeral(10),
+        ),
+        (
+            "Le another value",
+            SelectCmp::Le,
+            "instDecidableUInt64Le",
+            Expr::bvar(1),
+            unfolded_u64_numeral(11),
+        ),
+        (
+            "Eq decided by Le",
+            SelectCmp::Eq,
+            "instDecidableUInt64Le",
+            Expr::bvar(1),
+            unfolded_u64_numeral(10),
+        ),
+        (
+            "Eq operands exchanged",
+            SelectCmp::Eq,
+            "instDecidableEqUInt64",
+            unfolded_u64_numeral(10),
+            Expr::bvar(1),
+        ),
+        (
+            "Eq another parameter",
+            SelectCmp::Eq,
+            "instDecidableEqUInt64",
+            Expr::bvar(0),
+            unfolded_u64_numeral(10),
+        ),
+        (
+            "Eq another value",
+            SelectCmp::Eq,
+            "instDecidableEqUInt64",
+            Expr::bvar(1),
+            unfolded_u64_numeral(11),
+        ),
+    ];
+    for (index, (what, cmp, inst, inst_lhs, inst_rhs)) in malformed.into_iter().enumerate() {
+        let entered = try_define(
+            &mut manual,
+            &format!("literal_instance_mutant_{index}"),
+            u64_arrows(2),
+            carrier_instance_select_literal(cmp, inst, inst_lhs, inst_rhs),
+        );
+        assert!(
+            entered.is_err(),
+            "a carrier instance with {what} was accepted for the proposition"
+        );
+    }
+
+    eprintln!(
+        "PROBE-ROW | if a <=/= 10 then a else b | side A: real carrier instances at \
+         u8/u16/u32/u64 | plan: SelectLiteral | kernel: ADMIT | side-B and instance \
+         mutants: REFUSE"
+    );
 }
 
 // ════════════ (j) Rem at UInt64 — the C8 blocker, RE-MEASURED ════════════
@@ -2296,10 +2718,7 @@ fn probe_j1_rem_literal_divisor_both_spellings_admit() {
     );
     let carrier_plan = plan_clean_origin_body(&env, "rem7_c")
         .expect_err("the carrier spelling has no selection row and must refuse");
-    assert!(
-        matches!(carrier_plan, EmitRefusal::NotEmittable { .. }),
-        "got {carrier_plan:?}"
-    );
+    assert!(matches!(carrier_plan, EmitRefusal::NotEmittable { .. }), "got {carrier_plan:?}");
     assert!(!carrier_plan.is_compiler_defect(), "a missing row is not a compiler defect");
 
     eprintln!(
@@ -2412,10 +2831,8 @@ fn probe_j3_rem_zero_divisor_is_total_in_clean_and_panicking_in_rust() {
     // GROUND: the total semantics are really there.
     define(&mut env, "rem_ground", uint64(), rem_surface(surface_lit(13), surface_lit(0)));
     define(&mut env, "thirteen", uint64(), carrier_lit(13));
-    let thirteen = env
-        .get_const(&Name::from_string("thirteen"))
-        .and_then(|c| c.value.clone())
-        .expect("value");
+    let thirteen =
+        env.get_const(&Name::from_string("thirteen")).and_then(|c| c.value.clone()).expect("value");
     check_faithful(&env, "rem_ground", &thirteen, &u64_carrier()).unwrap_or_else(|refusal| {
         panic!(
             "MEASURED ADMIT expected: Lean's total `Nat.mod` makes `13 % 0` the VALUE 13 at \

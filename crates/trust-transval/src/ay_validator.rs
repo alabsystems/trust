@@ -164,6 +164,7 @@ impl TranslationValidator {
         func: &VerifiableFunction,
         property: &Formula,
     ) -> Result<SmtPropertyResult, TransvalError> {
+        crate::vc_core::reject_memory_images(func)?;
         let mut prepared = PreparedVc::new(VerificationCondition {
             kind: VcKind::TranslationValidation {
                 pass: "user-property".to_string(),
@@ -345,8 +346,7 @@ fn normalize_block_pair_vcs(
 }
 
 fn normalize_property_vc(prepared: &mut PreparedVc) {
-    prepared.vc.formula = simplify_formula(prepared.vc.formula.clone());
-
+    // `PreparedVc::new` already simplified `prepared.vc.formula` via `simplify_formula`.
     if matches!(prepared.vc.formula, Formula::Bool(true)) {
         prepared.synthetic_counterexample = Some(Counterexample::new(Vec::new()));
         return;
@@ -595,9 +595,11 @@ fn find_counterexample_for_formula(formula: &Formula) -> Option<Counterexample> 
 
 fn collect_variables(formula: &Formula) -> Vec<(String, Sort)> {
     let mut vars = BTreeMap::new();
-    formula.visit(&mut |term| {
-        if let Formula::Var(name, sort) = term {
-            vars.entry(name.clone()).or_insert_with(|| sort.clone());
+    trust_types::visit_formula_nodes(formula, &mut |term| {
+        if let Formula::Var(name, sort) = term
+            && !vars.contains_key(name.as_str())
+        {
+            vars.insert(name.clone(), sort.clone());
         }
     });
     vars.into_iter().collect()
@@ -804,6 +806,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -930,6 +933,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

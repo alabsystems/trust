@@ -1,0 +1,36 @@
+{
+  "id": "trip-driver",
+  "class": "TRIP-DRIVER-1",
+  "title": "an Iterator::next call on a loop's cycle was taken as the loop's driver although it never exits the loop",
+  "origin": [
+    "DQ:10131 (TRIP-DRIVER-1)",
+    "tests/ui/trust/loop_driver_must_exit_on_none{,_run}.rs"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "stray_on_cycle",
+    "obligation": {
+      "kind": "overflow",
+      "at": "c += 1"
+    }
+  },
+  "twin": {
+    "function": "plain_for",
+    "obligation": {
+      "kind": "overflow",
+      "at": "c += 1"
+    }
+  },
+  "witness": {
+    "input": "limit = 0 (the 256th c += 1)",
+    "observed": "attempt to add with overflow",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  }
+}

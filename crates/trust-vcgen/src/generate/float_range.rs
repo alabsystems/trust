@@ -47,12 +47,18 @@ pub(super) fn v2_float_result_only_feeds_int_cast(func: &VerifiableFunction, des
                 | Rvalue::CopyForDeref(p) => uses += usize::from(p.local == dest),
                 _ => {}
             }
+            if uses > 1 || uses != int_cast_uses {
+                return false;
+            }
         }
         if let Terminator::Call { args, .. } = &block.terminator {
             uses += args.iter().filter(|op| is_dest(op, dest)).count();
         }
         if let Terminator::SwitchInt { discr, .. } = &block.terminator {
             uses += usize::from(is_dest(discr, dest));
+        }
+        if uses > 1 || uses != int_cast_uses {
+            return false;
         }
     }
     uses == 1 && int_cast_uses == 1
@@ -90,17 +96,27 @@ pub(super) fn float_exp_bound(
 /// former `::cos_unchecked`/`::sin_unchecked` suffixes are DROPPED: they are
 /// not std names at all, so matching them hardcoded trust in arbitrary
 /// downstream crates by suffix.
-pub(super) fn is_unit_bounded_float_call(callee: &str) -> bool {
-    matches!(f64_std_method_name(callee), Some("cos" | "sin" | "tanh"))
+pub(super) fn is_unit_bounded_float_call(
+    callee: &str,
+    callee_key: Option<&trust_types::CalleeKey>,
+) -> bool {
+    matches!(f64_std_method_name(callee, callee_key), Some("cos" | "sin" | "tanh"))
 }
 
-/// The f64 value of a literal float constant, or `None` for every other constant.
-/// A `width: 32` `FloatBits` is deliberately NOT converted: the callers reason at
-/// f64 sort, and an f32-typed constant cannot be the operand of an f64 op anyway.
+/// The exact f64 representation of a binary32 or binary64 literal value.
+/// Arithmetic consumers must separately enclose rounding at the operation width.
 pub(super) fn f64_const_value(c: &ConstValue) -> Option<f64> {
     match c {
         ConstValue::Float(v) => Some(*v),
         ConstValue::FloatBits { bits, width: 64 } => u64::try_from(*bits).ok().map(f64::from_bits),
+        // binary32 widens to f64 EXACTLY (every binary32 value is a binary64
+        // value). Admitted since 2026-09-17, when the discharge that consumes
+        // these intervals became width-aware; before that, an f32 bound was
+        // measured against f64-scaled thresholds and discharged an add that
+        // overflowed. See `v2_float_binop_cannot_overflow_at`.
+        ConstValue::FloatBits { bits, width: 32 } => {
+            u32::try_from(*bits).ok().map(|b| f64::from(f32::from_bits(b)))
+        }
         _ => None,
     }
 }
@@ -120,20 +136,95 @@ pub(super) fn f64_finite_biased_exp(v: f64) -> Option<u32> {
     Some(((v.to_bits() >> 52) & 0x7ff) as u32)
 }
 
-/// The `::f64::` std-origin method name (`clamp`, `sqrt`, `abs`, `min`, `max`,
-/// …) of `callee`, or `None` for anything not anchored in core/std/alloc's f64
-/// impl. A user-defined `mymod::sqrt`/`mymod::clamp` has arbitrary semantics
-/// and must NEVER match (a false-PROVE channel); `Ord::clamp` spellings never
-/// carry a `::f64::` segment and are excluded with it. This is the exact
-/// crate-origin gate the old `fp_clamp_call_exp_bound` recognizer used, hoisted
-/// so every std-f64 arm of [`float_call_range`] shares it.
-pub(super) fn f64_std_method_name(callee: &str) -> Option<&str> {
-    let last = callee.rsplit("::").next()?;
-    let method = last.split('<').next().unwrap_or(last).trim();
-    let std_origin = callee.starts_with("core::")
-        || callee.starts_with("std::")
-        || callee.starts_with("alloc::");
-    (std_origin && callee.contains("::f64::")).then_some(method)
+/// Every inherent `f64` method [`float_call_range`] models, by the exact path the
+/// extractor renders: `(path, method)`. Measured on `scratchpad/stage1-w11fix`
+/// (2026-10-04): `abs`, `min`, `max`, `clamp` are `core::f64::<impl f64>::{m}`;
+/// `sin`, `cos`, `tanh`, `sqrt` are `std::f64::<impl f64>::{m}`. Both roots are
+/// listed for each, so a method moving between `core` and `std` keeps its arm.
+/// The owner `<impl f64>` has no generic parameter, which is what lets an exact
+/// path name the item (the `sysroot_exact_path` doc rule).
+const F64_STD_METHOD_PATHS: &[(&str, &str)] = &[
+    ("core::f64::<impl f64>::sqrt", "sqrt"),
+    ("std::f64::<impl f64>::sqrt", "sqrt"),
+    ("core::f64::<impl f64>::abs", "abs"),
+    ("std::f64::<impl f64>::abs", "abs"),
+    ("core::f64::<impl f64>::min", "min"),
+    ("std::f64::<impl f64>::min", "min"),
+    ("core::f64::<impl f64>::max", "max"),
+    ("std::f64::<impl f64>::max", "max"),
+    ("core::f64::<impl f64>::clamp", "clamp"),
+    ("std::f64::<impl f64>::clamp", "clamp"),
+    ("core::f64::<impl f64>::sin", "sin"),
+    ("std::f64::<impl f64>::sin", "sin"),
+    ("core::f64::<impl f64>::cos", "cos"),
+    ("std::f64::<impl f64>::cos", "cos"),
+    ("core::f64::<impl f64>::tanh", "tanh"),
+    ("std::f64::<impl f64>::tanh", "tanh"),
+];
+
+/// The std `f64` method (`clamp`, `sqrt`, `abs`, `min`, `max`, `sin`, `cos`,
+/// `tanh`) that `callee` IS, or `None`. A user-defined `mymod::sqrt` /
+/// `mymod::clamp` has arbitrary semantics and must NEVER match (a false-PROVE
+/// channel); `Ord::clamp` is not an `<impl f64>` item and is excluded with it.
+///
+/// Trust (2026-10-04, NUM-METHOD-ANCHOR-1): the callee must be DEFINED in a real
+/// sysroot crate (its compiler-minted `callee_key`) and its rendering must be
+/// EXACTLY one of [`F64_STD_METHOD_PATHS`], one trailing turbofish allowed
+/// (`trust_types::callee_key::sysroot_exact_path`). The test this replaces wanted a
+/// `core`/`std`/`alloc` root and `::f64::` ANYWHERE, then took the method from the
+/// LAST segment with its `<…>` cut off. `core::cmp::max_by_key::<f64, {closure},
+/// PhantomData<m::f64::cos<1>>>` — a real core callee whose generic argument names a
+/// user type `m::f64::cos<1>` — passed both halves and came out as `cos`, so its
+/// unbounded result got the `[-1, 1]` interval and `v * 4.0` lost its
+/// `float_overflow_to_infinity (Mul)` row (measured on `scratchpad/stage1-w11fix`;
+/// `lie1(0.5, 1e308)` returns `inf`).
+pub(super) fn f64_std_method_name(
+    callee: &str,
+    callee_key: Option<&trust_types::CalleeKey>,
+) -> Option<&'static str> {
+    if !callee_key.is_some_and(|k| k.krate_is_real_sysroot) {
+        return None;
+    }
+    F64_STD_METHOD_PATHS
+        .iter()
+        .find(|(path, _)| {
+            trust_types::callee_key::sysroot_exact_path(callee_key, callee, &[*path]).is_some()
+        })
+        .map(|(_, method)| *method)
+}
+
+/// `core::time::Duration::as_secs_f64` / `as_secs_f32` (and the `std::time`
+/// re-export spelling), by exact path (NUM-METHOD-ANCHOR-1). `Duration` has no
+/// generic parameter. Measured: `d.as_secs_f64()` renders
+/// `core::time::Duration::as_secs_f64`, keyed to `core`.
+const DURATION_AS_SECS_PATHS: &[&str] = &[
+    "core::time::Duration::as_secs_f64",
+    "core::time::Duration::as_secs_f32",
+    "std::time::Duration::as_secs_f64",
+    "std::time::Duration::as_secs_f32",
+];
+
+/// The compiler-minted key of the call that terminates `block`, and whether that
+/// call's destination is a float-typed place — what [`float_call_range`] needs to
+/// name a recognized std callee (NUM-METHOD-ANCHOR-1). `(None, false)` when the
+/// block does not end in a call.
+fn float_call_site_key(
+    func: &VerifiableFunction,
+    block: BlockId,
+) -> (Option<&trust_types::CalleeKey>, bool) {
+    let Some(Terminator::Call { callee_key, dest, .. }) = func
+        .body
+        .blocks
+        .get(block.0)
+        .filter(|b| b.id == block)
+        .or_else(|| func.body.blocks.iter().find(|b| b.id == block))
+        .map(|b| &b.terminator)
+    else {
+        return (None, false);
+    };
+    let dest_is_float =
+        crate::place_ty_cow(func, dest).is_some_and(|ty| matches!(ty.as_ref(), Ty::Float { .. }));
+    (callee_key.as_ref(), dest_is_float)
 }
 
 /// A signed two-sided contract interval `[l, u]` for a PARAMETER-rooted f64
@@ -202,7 +293,7 @@ pub(super) fn contract_range(func: &VerifiableFunction, place: &Place) -> Option
     // (`self.0 <= 1000000000000000000`) or an f64 FLOAT literal
     // (`self.0 <= 1.0e30`, the natural spelling for an f64 field); both are
     // read as finite f64 values.
-    let name = canonicalize_contract_index_segments(&crate::place_to_var_name(func, place));
+    let name = canonicalize_contract_index_segments_owned(crate::place_to_var_name(func, place));
     if let Some(range) = contract_two_sided_range(func, &name) {
         return Some(range);
     }
@@ -249,7 +340,17 @@ pub(super) fn contract_two_sided_range(
 /// change. Every other bracket segment (`[_5]` runtime, `[-1;min=4]` from-end,
 /// `[0;slice]`, `[2..4]` subslices) is left verbatim — an unrewritten segment
 /// simply never matches a contract var (fail-closed).
+pub(super) fn canonicalize_contract_index_segments_owned(name: String) -> String {
+    if !name.contains(";min=") {
+        return name;
+    }
+    canonicalize_contract_index_segments(&name)
+}
+
 pub(super) fn canonicalize_contract_index_segments(name: &str) -> String {
+    if !name.contains(";min=") {
+        return name.to_string();
+    }
     let is_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let mut out = String::with_capacity(name.len());
     let mut rest = name;
@@ -286,7 +387,7 @@ pub(super) fn contract_uniform_index_range(
     name: &str,
 ) -> Option<(f64, f64)> {
     // Exactly ONE distinct runtime-index token `[_N]` in the render.
-    let mut token: Option<String> = None;
+    let mut token: Option<&str> = None;
     let mut search = name;
     while let Some(pos) = search.find("[_") {
         let rest = &search[pos + 2..];
@@ -295,9 +396,9 @@ pub(super) fn contract_uniform_index_range(
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        let this = format!("[_{digits}]");
-        match &token {
-            Some(existing) if *existing != this => return None,
+        let this = &search[pos..pos + 3 + end];
+        match token {
+            Some(existing) if existing != this => return None,
             _ => token = Some(this),
         }
         search = &rest[end + 1..];
@@ -312,124 +413,353 @@ pub(super) fn contract_uniform_index_range(
         if *i != index_local {
             continue;
         }
-        let prefix = Place { local: place.local, projections: place.projections[..pos].to_vec() };
-        match crate::place_ty_cow(func, &prefix)?.as_ref() {
+        match crate::place_prefix_ty_cow(func, place.local, &place.projections[..pos])?.as_ref() {
             Ty::Array { len: l, .. } => len = Some(len.map_or(*l, |cur| cur.min(*l))),
             _ => return None, // slice: no static length — fail closed
         }
     }
     let len = len?;
-    // Per-element lookups: 64 covers any honest fixed-size math type; a huge
-    // synthetic array is declined rather than scanned.
-    if len == 0 || len > 64 {
+    if len == 0 {
+        return None;
+    }
+    // ONE pass over the contract, not one lookup per lane: every bound whose
+    // variable is this read's name with the runtime index replaced by a lane
+    // literal `[k]` (`k < len`, at EVERY position the token occupies) is
+    // accumulated under `k`. A lane with no mention has no bound, so fewer
+    // mentioned lanes than `len` declines at once. Cost is linear in the
+    // contract's text and never depends on `len`, which is a value (the
+    // per-lane scan it replaces was capped at 64 lanes for that reason).
+    let segments: Vec<&str> = name.split(token).collect();
+    let lane_of = |var: &str| lane_of_element_name(var, &segments).filter(|lane| *lane < len);
+    let mut lanes: FxHashMap<u64, (Option<f64>, Option<f64>)> = FxHashMap::default();
+    for pre in &func.preconditions {
+        collect_lane_magnitude_bounds(pre, &lane_of, &mut lanes);
+    }
+    if u64::try_from(lanes.len()).map_or(true, |mentioned| mentioned < len) {
         return None;
     }
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
-    for k in 0..len {
-        let element = name.replace(&token, &format!("[{k}]"));
-        let (l, u) = contract_two_sided_range(func, &element)?;
+    for (upper, lower) in lanes.values() {
+        // `contract_two_sided_range`'s acceptance, lane by lane.
+        let (u, l) = ((*upper)?, (*lower)?);
+        if !(l.is_finite() && u.is_finite() && l <= u) {
+            return None;
+        }
         lo = lo.min(l);
         hi = hi.max(u);
     }
     Some((lo, hi))
 }
 
-/// Whether formal-parameter local `base` keeps its ENTRY value at every read in
-/// the body — i.e. it is never (whole-or-projected) written and never mutably
-/// borrowed. Conservative twin of `contract_assumption_gate::slice_param_length_is_stable`
-/// / the BV-mul lane's `v2_local_assigned_anywhere`, but covering FIELD writes and
-/// `&mut` aliasing so a `contract_exp_bound` magnitude claim over `self.x` cannot
-/// be defeated by a body mutation of `self` (any field) between entry and use.
-/// Any write/mut-borrow channel returns false (no discharge; fail-closed).
-pub(super) fn param_place_is_entry_stable(func: &VerifiableFunction, base: usize) -> bool {
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            match stmt {
-                Statement::Assign { place: dest, rvalue, .. } => {
-                    if dest.local == base {
-                        return false; // whole or field write of the parameter
-                    }
-                    if let Rvalue::Ref { mutable: true, place: borrowed }
-                    | Rvalue::AddressOf(true, borrowed) = rvalue
-                        && borrowed.local == base
-                    {
-                        return false; // `&mut self` / `&mut self.x` aliasing channel
-                    }
-                }
-                Statement::SetDiscriminant { place: dest, .. }
-                | Statement::Deinit { place: dest } => {
-                    if dest.local == base {
-                        return false;
-                    }
-                }
-                _ => {}
-            }
+/// The lane `k` for which `name` (a contract variable's name) is
+/// `segments.join("[k]")`, i.e. the read's name with every occurrence of its
+/// runtime-index token replaced by the literal `[k]` (the contract-side
+/// spelling of `arr[k]`, decimal, no leading zero); `None` if `name` is not
+/// such a name. Exactly the names `name.replace(token, &format!("[{k}]"))`
+/// produces, found by one scan of `name` instead of by generating a name per
+/// lane.
+fn lane_of_element_name(name: &str, segments: &[&str]) -> Option<u64> {
+    let (first, rest) = segments.split_first()?;
+    let mut tail = name.strip_prefix(first)?;
+    let mut lane: Option<&str> = None;
+    for segment in rest {
+        let inner = tail.strip_prefix('[')?;
+        let end = inner.find(']')?;
+        let digits = &inner[..end];
+        let canonical = !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && (digits == "0" || !digits.starts_with('0'));
+        if !canonical || lane.is_some_and(|seen| seen != digits) {
+            return None;
         }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.local == base
-        {
-            return false; // call-destination store to the parameter
-        }
-        // An Opaque terminator (inline `asm!` with out/inout operands) may write
-        // ANY local invisibly — its out-operand places are not modeled here — so
-        // a contract magnitude bound (and the round-13 BV witness hypothesis it
-        // feeds) over `base` cannot be assumed stable across it. `float_whole_
-        // local_defs` already poisons on the same channel; this is its
-        // conservative twin, previously missing the arm (fail-closed).
-        if matches!(&block.terminator, Terminator::Opaque { .. }) {
-            return false;
-        }
+        lane = Some(digits);
+        tail = inner[end + 1..].strip_prefix(segment)?;
     }
-    true
+    if !tail.is_empty() {
+        return None;
+    }
+    lane?.parse().ok()
 }
 
-/// The projection chains to every SCALAR f64 leaf reachable from `ty` through
-/// STRUCT fields (`.i`, positional — the `place_to_var_name` / contract
-/// spelling), tuple fields, and fixed-length array elements (`ConstantIndex`).
-/// Enums are not walked (variant-dependent field view — a chain name would be
-/// ambiguous); references/raw-pointers/symbolic arrays stop the walk (a raw-ptr
-/// leaf is not a stable value anyway — see `place_reads_through_raw_ptr`).
-pub(super) fn float_scalar_leaf_suffixes(ty: &Ty, depth: u32) -> Vec<Vec<Projection>> {
-    fn walk(ty: &Ty, depth: u32, prefix: &mut Vec<Projection>, out: &mut Vec<Vec<Projection>>) {
-        if out.len() >= 256 {
-            return;
-        }
-        match ty {
-            Ty::Float { width: 64 } => out.push(prefix.clone()),
-            _ if depth == 0 => {}
-            Ty::Adt { fields, variants, .. } if variants.is_empty() => {
-                for (i, (_, fty)) in fields.iter().enumerate() {
-                    prefix.push(Projection::Field(i));
-                    walk(fty, depth - 1, prefix, out);
-                    prefix.pop();
-                }
-            }
-            Ty::Tuple(items) => {
-                for (i, ity) in items.iter().enumerate() {
-                    prefix.push(Projection::Field(i));
-                    walk(ity, depth - 1, prefix, out);
-                    prefix.pop();
-                }
-            }
-            Ty::Array { elem, len } if *len <= FLOAT_STRUCT_LEAF_ARRAY_LIMIT => {
-                let Ok(min_length) = usize::try_from(*len) else { return };
-                for k in 0..min_length {
-                    prefix.push(Projection::ConstantIndex {
-                        offset: k,
-                        min_length,
-                        from_end: false,
-                    });
-                    walk(elem, depth - 1, prefix, out);
-                    prefix.pop();
-                }
-            }
-            _ => {}
+/// [`collect_magnitude_bounds`] for every lane at once: the same clauses, the
+/// same side-of-the-comparison reading and the same tightening, keyed by the
+/// lane `lane_of` reads off the bounded variable's name instead of by one fixed
+/// name. For each lane `k` the accumulated pair is exactly what
+/// `collect_magnitude_bounds(formula, name_of(k), ..)` accumulates, because a
+/// clause's bounded side is a variable, whose numeric value is `None`, so a
+/// clause never bounds two lanes.
+fn collect_lane_magnitude_bounds(
+    formula: &Formula,
+    lane_of: &impl Fn(&str) -> Option<u64>,
+    lanes: &mut FxHashMap<u64, (Option<f64>, Option<f64>)>,
+) {
+    fn named_lane(formula: &Formula, lane_of: &impl Fn(&str) -> Option<u64>) -> Option<u64> {
+        match formula {
+            Formula::Var(n, _) => lane_of(n),
+            Formula::SymVar(sym, _) => lane_of(sym.as_str()),
+            Formula::FpFromBits { bits, .. } => named_lane(bits, lane_of),
+            _ => None,
         }
     }
-    let mut out = Vec::new();
-    walk(ty, depth, &mut Vec::new(), &mut out);
-    out
+    fn tighten(
+        lanes: &mut FxHashMap<u64, (Option<f64>, Option<f64>)>,
+        lane: u64,
+        k: f64,
+        is_upper: bool,
+    ) {
+        let (upper, lower) = lanes.entry(lane).or_insert((None, None));
+        if is_upper {
+            *upper = Some(upper.map_or(k, |cur| cur.min(k)));
+        } else {
+            *lower = Some(lower.map_or(k, |cur| cur.max(k)));
+        }
+    }
+    match formula {
+        Formula::And(items) => {
+            for item in items {
+                collect_lane_magnitude_bounds(item, lane_of, lanes);
+            }
+        }
+        Formula::FpLe(a, b) | Formula::FpLt(a, b) | Formula::Le(a, b) | Formula::Lt(a, b) => {
+            if let Some(lane) = named_lane(a, lane_of) {
+                if let Some(k) = formula_numeric_value(b) {
+                    tighten(lanes, lane, k, true);
+                }
+            } else if let Some(lane) = named_lane(b, lane_of)
+                && let Some(k) = formula_numeric_value(a)
+            {
+                tighten(lanes, lane, k, false);
+            }
+        }
+        Formula::FpGe(a, b) | Formula::FpGt(a, b) | Formula::Ge(a, b) | Formula::Gt(a, b) => {
+            if let Some(lane) = named_lane(a, lane_of) {
+                if let Some(k) = formula_numeric_value(b) {
+                    tighten(lanes, lane, k, false);
+                }
+            } else if let Some(lane) = named_lane(b, lane_of)
+                && let Some(k) = formula_numeric_value(a)
+            {
+                tighten(lanes, lane, k, true);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether formal-parameter local `base` keeps its ENTRY value at every read in
+/// the body — i.e. it is never (whole-or-projected) written and no pointer that
+/// can write it or what it points to is taken. Conservative twin of
+/// `contract_assumption_gate::slice_param_length_is_stable` / the BV-mul lane's
+/// `v2_local_assigned_anywhere`, but covering FIELD writes and pointer aliasing so
+/// a `contract_exp_bound` magnitude claim over `self.x` cannot be defeated by a
+/// body mutation of `self` (any field) between entry and use. Any write channel
+/// returns false (no discharge; fail-closed).
+///
+/// The channel test is the POINTER rule (`path_defs::borrow_write_target`):
+/// `&mut`, `&raw mut` and `&raw const` of ANY place rooted at `base`, a `Deref`
+/// included, because the places this guards are what `base` POINTS TO
+/// (`(*self).x`). Until 2026-09-30 it counted `&mut` / `&raw mut` only, and a
+/// write through `&raw const (*s).x as *mut f64` — defined under Tree Borrows for
+/// `s: &mut _` — left the entry contract bound on `s.x` in force, so
+/// `s.x * 4.0` had its `FloatOverflowToInfinity` row removed on a body that
+/// returns `inf` (tests/raw_const_float_scans.rs).
+pub(super) fn param_place_is_entry_stable(func: &VerifiableFunction, base: usize) -> bool {
+    !crate::any_local_write_candidate(func, &func.body.blocks, base, |block, item| match item {
+        Some(stmt) => match stmt {
+            Statement::Assign { place: dest, rvalue, .. } => {
+                // `&raw const (*self).x` cast to `*mut` writes too (2026-10-08 H2:
+                // `path_defs::borrow_write_target`).
+                dest.local == base
+                    || super::borrow_write_target(func, rvalue)
+                        .is_some_and(|borrowed| borrowed.local == base)
+            }
+            Statement::SetDiscriminant { place: dest, .. } | Statement::Deinit { place: dest } => {
+                dest.local == base
+            }
+            _ => false,
+        },
+        None => {
+            // An Opaque terminator (inline `asm!` with out/inout operands) may write
+            // ANY local invisibly — its out-operand places are not modeled here — so
+            // a contract magnitude bound (and the round-13 BV witness hypothesis it
+            // feeds) over `base` cannot be assumed stable across it. `float_whole_
+            // local_defs` already poisons on the same channel; this is its
+            // conservative twin, previously missing the arm (fail-closed).
+            matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == base)
+                || matches!(&block.terminator, Terminator::Opaque { .. })
+        }
+    })
+}
+
+/// The canonical projection chain of `projections` as a SCALAR f64 leaf of
+/// `ty`, or `None` when it is not one. A leaf is reached through STRUCT fields
+/// (`.i`, positional — the `place_to_var_name` / contract spelling), tuple
+/// fields and fixed-length array elements, in at most `depth` steps. Enums are
+/// not walked (variant-dependent field view — a chain name would be
+/// ambiguous); references, raw pointers, runtime indices and from-end indices
+/// are not leaf steps (a raw-ptr leaf is not a stable value anyway — see
+/// `place_reads_through_raw_ptr`).
+///
+/// An array element step is returned in the ONE spelling the chain's contract
+/// name uses, `ConstantIndex { offset: k, min_length: len, from_end: false }`,
+/// whether the read spelled it as a constant index (any `min_length`) or as an
+/// `Index` of a const-resolved local: all of them render `[k]` once
+/// canonicalized (`canonicalize_contract_index_segments`).
+///
+/// This walks the ONE chain a read names, so its cost is the chain's length.
+/// It replaces enumerating every leaf of the type up front, which was sized by
+/// the type's array LENGTHS (values: a `[f64; 1 << 20]` field is 2^20 leaves)
+/// and so was capped at 16 lanes per array and 256 leaves per formal.
+pub(super) fn float_leaf_chain(
+    func: &VerifiableFunction,
+    ty: &Ty,
+    projections: &[Projection],
+    depth: u32,
+) -> Option<Vec<Projection>> {
+    let mut ty = ty;
+    let mut depth = depth;
+    let mut chain = Vec::with_capacity(projections.len());
+    for projection in projections {
+        if depth == 0 {
+            return None;
+        }
+        depth -= 1;
+        match (ty, projection) {
+            (Ty::Adt { fields, variants, .. }, Projection::Field(i)) if variants.is_empty() => {
+                ty = &fields.get(*i)?.1;
+                chain.push(Projection::Field(*i));
+            }
+            (Ty::Tuple(items), Projection::Field(i)) => {
+                ty = items.get(*i)?;
+                chain.push(Projection::Field(*i));
+            }
+            (Ty::Array { elem, len }, step) => {
+                let lane = match step {
+                    Projection::ConstantIndex { offset, from_end: false, .. } => *offset,
+                    Projection::Index(local) => crate::index_local_const(func, *local)?,
+                    _ => return None,
+                };
+                if u64::try_from(lane).ok()? >= *len {
+                    return None;
+                }
+                let min_length = usize::try_from(*len).ok()?;
+                ty = elem;
+                chain.push(Projection::ConstantIndex { offset: lane, min_length, from_end: false });
+            }
+            _ => return None,
+        }
+    }
+    matches!(ty, Ty::Float { width: 64 }).then_some(chain)
+}
+
+/// F6b (STRUCT-argument tracing): the CALLER side of one callee trace's
+/// struct-formal leaf overrides, resolved when the callee trace READS a leaf.
+///
+/// A formal leaf's override is the caller's `Forbid`-mode interval of the
+/// ACTUAL's corresponding leaf at the call block. It used to be computed for
+/// every leaf of every struct formal before the trace began; it is now computed
+/// for the leaves the trace actually reads, once each, in exactly the caller
+/// context the eager binder used: the parent context, the call block, the
+/// caller's `visiting` set and callee stack as they stood at the call, and
+/// `fuel - 1`. A leaf the trace never reads costs nothing, so no trace is sized
+/// by an array's length.
+pub(super) struct FieldOverrideSource<'a> {
+    parent: &'a FloatRangeCtx<'a>,
+    call_block: BlockId,
+    /// Formal local -> the caller's actual place (struct/vector formals only).
+    actuals: FxHashMap<usize, Place>,
+    /// The caller's `visiting` locals at the call.
+    visiting: Vec<usize>,
+    /// The shared callee stack at the call (before this callee was pushed).
+    callee_stack: Vec<String>,
+    fuel: u32,
+    /// Resolved leaves, keyed by the callee-side canonical place name.
+    resolved: std::cell::RefCell<FxHashMap<String, Option<(f64, f64)>>>,
+}
+
+impl<'a> FieldOverrideSource<'a> {
+    /// A source binding `actuals` at `call_block` of `parent`'s function, with
+    /// an empty `visiting` set and callee stack. Unit tests use it to reach
+    /// `FloatRangeCtx::param_field_override` without the binder in
+    /// `float_callee_trace_range`.
+    #[cfg(test)]
+    pub(super) fn for_test(
+        parent: &'a FloatRangeCtx<'a>,
+        call_block: BlockId,
+        actuals: FxHashMap<usize, Place>,
+    ) -> Self {
+        Self {
+            parent,
+            call_block,
+            actuals,
+            visiting: Vec::new(),
+            callee_stack: Vec::new(),
+            fuel: FLOAT_EXP_BOUND_FUEL,
+            resolved: std::cell::RefCell::new(FxHashMap::default()),
+        }
+    }
+
+    pub(super) fn has_actual(&self, local: usize) -> bool {
+        self.actuals.contains_key(&local)
+    }
+
+    /// The caller-proved interval of the formal leaf `place` (a place of the
+    /// callee `callee`, rooted at a formal), under the callee-side name `key`.
+    pub(super) fn resolve(
+        &self,
+        callee: &VerifiableFunction,
+        place: &Place,
+        key: String,
+    ) -> Option<(f64, f64)> {
+        if let Some(hit) = self.resolved.borrow().get(key.as_str()) {
+            return *hit;
+        }
+        let range = self.resolve_uncached(callee, place, &key);
+        self.resolved.borrow_mut().insert(key, range);
+        range
+    }
+
+    fn resolve_uncached(
+        &self,
+        callee: &VerifiableFunction,
+        place: &Place,
+        key: &str,
+    ) -> Option<(f64, f64)> {
+        let actual = self.actuals.get(&place.local)?;
+        let formal_ty = crate::local_ty_ref(callee, place.local)?;
+        let leaf =
+            float_leaf_chain(callee, formal_ty, &place.projections, FLOAT_STRUCT_LEAF_DEPTH)?;
+        // The read must name exactly the leaf the chain spells — the eager
+        // binder's key equality, kept as the gate.
+        let leaf_place = Place { local: place.local, projections: leaf };
+        if canonicalize_contract_index_segments_owned(crate::place_to_var_name(
+            callee,
+            &leaf_place,
+        )) != key
+        {
+            return None;
+        }
+        let mut caller_place = actual.clone();
+        caller_place.projections.extend(leaf_place.projections);
+        // Evaluate at the call, as the eager binder did: the callee stack as it
+        // stood before this callee was pushed, restored afterwards.
+        let during = std::mem::replace(
+            &mut *self.parent.visiting_callees.borrow_mut(),
+            self.callee_stack.clone(),
+        );
+        let mut visiting = self.visiting.clone();
+        let range = float_range(
+            self.parent,
+            FloatNanMode::Forbid,
+            Some(self.call_block),
+            &Operand::Copy(caller_place),
+            &mut visiting,
+            self.fuel,
+        );
+        *self.parent.visiting_callees.borrow_mut() = during;
+        range
+    }
 }
 
 /// Whether reading `place` POSITIVELY dereferences a RAW POINTER at some
@@ -448,21 +778,21 @@ pub(super) fn float_scalar_leaf_suffixes(ty: &Ty, depth: u32) -> Vec<Vec<Project
 /// pointees stay stable (the existing `<p>*` discipline); only raw pointers
 /// alias without a visible borrow.
 pub(super) fn place_reads_through_raw_ptr(func: &VerifiableFunction, place: &Place) -> bool {
-    let Some(mut ty) = func.body.locals.get(place.local).map(|d| d.ty.clone()) else {
+    let Some(mut ty) = func.body.locals.get(place.local).map(|d| std::borrow::Cow::Borrowed(&d.ty))
+    else {
         return false;
     };
     for proj in &place.projections {
         match proj {
-            Projection::Deref => match ty {
+            Projection::Deref => match ty.as_ref() {
                 Ty::RawPtr { .. } => return true,
-                Ty::Ref { inner, .. } => ty = *inner,
-                _ => match crate::step_place_ty_cow(std::borrow::Cow::Owned(ty), proj) {
-                    Some(next) => ty = next.into_owned(),
+                _ => match crate::step_place_ty_cow(ty, proj) {
+                    Some(next) => ty = next,
                     None => return false, // untypable deref: fail-OPEN
                 },
             },
-            _ => match crate::step_place_ty_cow(std::borrow::Cow::Owned(ty), proj) {
-                Some(next) => ty = next.into_owned(),
+            _ => match crate::step_place_ty_cow(ty, proj) {
+                Some(next) => ty = next,
                 None => return false, // untypable step: fail-OPEN (other checks apply)
             },
         }
@@ -501,7 +831,12 @@ pub(super) fn collect_magnitude_bounds(
         }
         // `a <= b` / `a < b`: an upper bound when the var is on the left, a lower
         // bound when it is on the right.
-        Formula::Le(a, b) | Formula::Lt(a, b) => {
+        // The IEEE comparisons an authored float bound lowers to. Same reading as
+        // the arms below, and the NaN case needs no special handling: an IEEE
+        // comparison against NaN is false, so a clause that establishes both
+        // sides has already established the value is ordered — which is exactly
+        // the `FloatNanMode::Forbid` reading this function's caller documents.
+        Formula::FpLe(a, b) | Formula::FpLt(a, b) | Formula::Le(a, b) | Formula::Lt(a, b) => {
             if formula_is_named_var(a, name) {
                 if let Some(k) = formula_numeric_value(b) {
                     tighten_upper(upper, k);
@@ -513,7 +848,7 @@ pub(super) fn collect_magnitude_bounds(
             }
         }
         // `a >= b` / `a > b`: mirror image of the above.
-        Formula::Ge(a, b) | Formula::Gt(a, b) => {
+        Formula::FpGe(a, b) | Formula::FpGt(a, b) | Formula::Ge(a, b) | Formula::Gt(a, b) => {
             if formula_is_named_var(a, name) {
                 if let Some(k) = formula_numeric_value(b) {
                     tighten_lower(lower, k);
@@ -534,6 +869,12 @@ pub(super) fn formula_is_named_var(formula: &Formula, name: &str) -> bool {
     match formula {
         Formula::Var(n, _) => n == name,
         Formula::SymVar(sym, _) => sym.as_str() == name,
+        // An authored float bound reads its variable through the IEEE lift: the
+        // body spells a float place as its bit vector, so the contract's `x`
+        // arrives as `FpFromBits { bits: Var("x") }`. The lift is injective and
+        // names the same place, so seeing through it recognizes the SAME
+        // variable rather than widening what counts as one.
+        Formula::FpFromBits { bits, .. } => formula_is_named_var(bits, name),
         _ => false,
     }
 }
@@ -550,19 +891,44 @@ pub(super) fn formula_int_value(formula: &Formula) -> Option<i128> {
     }
 }
 
-/// The FINITE f64 value of a binary64 float literal term. A spec float literal
-/// lowers to `FpConst { eb: 11, sb: 53 }` (the parser folds a leading `-` into the
+/// The FINITE f64 value of a binary64 or binary32 float literal term. A spec
+/// float literal lowers to `FpConst` (the parser folds a leading `-` into the
 /// sign bit, so `-1.0e30` arrives as a single signed const, not a `Neg`). A
 /// defensive `Neg(FpConst)` wrapper is honoured too. Non-finite literals (`inf`
-/// from an over-large decimal, `NaN`) and any non-f64 format return `None`
+/// from an over-large decimal, `NaN`) and any unmodelled format return `None`
 /// (fail-closed — a non-finite bound never yields a magnitude exponent).
+///
+/// The value is returned as `f64` for both widths because widening binary32 is
+/// exact; the CONSUMER is responsible for measuring it against thresholds for
+/// the operation's own width.
 pub(super) fn formula_float_value(formula: &Formula) -> Option<f64> {
     match formula {
         Formula::FpConst { bits, eb: 11, sb: 53 } => {
             let v = f64::from_bits(*bits as u64);
             v.is_finite().then_some(v)
         }
+        // binary32, admitted 2026-09-17. Widening an `f32` bound to `f64` is
+        // EXACT, and the thresholds this interval is measured against are now
+        // chosen per operation width (`float_overflow_discharge_margin`,
+        // `float_add_tiny_operand_bound`), so a binary32 bound is compared
+        // against a binary32 margin.
+        //
+        // This arm was added once before and REVERTED as a measured false
+        // proof: against the then-f64-scaled thresholds, two `f32` operands
+        // around 3e38 read as "tiny" (2^970) and a bounded `f32` add verified
+        // when its true result is infinity. The width-aware discharge is what
+        // makes the arm sound; do not reinstate one without the other.
+        Formula::FpConst { bits, eb: 8, sb: 24 } => {
+            let v = f64::from(f32::from_bits(u32::try_from(*bits).ok()?));
+            v.is_finite().then_some(v)
+        }
         Formula::Neg(inner) => {
+            let v = -formula_float_value(inner)?;
+            v.is_finite().then_some(v)
+        }
+        // A negated authored literal (`-1.0`) lowers to the IEEE negation, which
+        // is exact on a finite value — it flips the sign bit and nothing else.
+        Formula::FpNeg(inner) => {
             let v = -formula_float_value(inner)?;
             v.is_finite().then_some(v)
         }
@@ -586,56 +952,64 @@ pub(super) fn formula_numeric_value(formula: &Formula) -> Option<f64> {
 
 /// EVERY whole-local def of `local`, or `None` when some write channel makes
 /// the def set an unsound value model: a PROJECTED store (`t.0 = …`, incl. a
-/// projected Call dest), `SetDiscriminant`/`Deinit`, or a `&mut`/`&raw mut`
-/// borrow (writes through the alias are invisible to any def scan). These are
+/// projected Call dest), `SetDiscriminant`/`Deinit`, or a borrow that hands out
+/// write permission (`&mut`, `&raw mut`, `&raw const` — `path_defs::borrow_write_target`;
+/// writes through the alias are invisible to any def scan). These are
 /// `param_place_is_entry_stable`'s channels; whole-local stores are the defs
 /// being collected, so they are allowed here.
+///
+/// The POINTER rule, not the slot rule, because callers also read this as the
+/// stability of a place BEHIND `local` (`float_abs_guard_magnitude_bounds`'
+/// `stable_base` on `(*self).2`). Until 2026-09-30 it counted `&mut` / `&raw mut`
+/// only: `let mut v = 2.0; poke(&raw const v as *mut f64); v * 4.0` kept `v`'s
+/// def set `{2.0}`, bounded the product by `8.0` and removed its
+/// `FloatOverflowToInfinity` row, while the body returns `inf`
+/// (tests/raw_const_float_scans.rs).
 pub(super) fn float_whole_local_defs(
     func: &VerifiableFunction,
     local: usize,
 ) -> Option<Vec<FloatLocalDef<'_>>> {
     let mut defs = Vec::new();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            match stmt {
-                Statement::Assign { place: dest, rvalue, .. } => {
-                    if dest.local == local {
-                        if dest.projections.is_empty() {
-                            defs.push(FloatLocalDef::Rvalue { block: block.id, rvalue });
-                        } else {
-                            return None; // projected store: hull-of-defs model breaks
-                        }
-                    }
-                    if let Rvalue::Ref { mutable: true, place: borrowed }
-                    | Rvalue::AddressOf(true, borrowed) = rvalue
-                        && borrowed.local == local
-                    {
-                        return None; // `&mut` / `&raw mut` aliasing channel
+    if crate::any_local_write_candidate(func, &func.body.blocks, local, |block, item| match item {
+        Some(stmt) => match stmt {
+            Statement::Assign { place: dest, rvalue, .. } => {
+                if dest.local == local {
+                    if dest.projections.is_empty() {
+                        defs.push(FloatLocalDef::Rvalue { block: block.id, rvalue });
+                    } else {
+                        return true; // projected store: hull-of-defs model breaks
                     }
                 }
-                Statement::SetDiscriminant { place: dest, .. }
-                | Statement::Deinit { place: dest } => {
-                    if dest.local == local {
-                        return None;
-                    }
-                }
-                _ => {}
+                // `&mut` / `&raw (const|mut)` aliasing channel (H2)
+                super::borrow_write_target(func, rvalue)
+                    .is_some_and(|borrowed| borrowed.local == local)
             }
-        }
-        match &block.terminator {
+            Statement::SetDiscriminant { place: dest, .. } | Statement::Deinit { place: dest } => {
+                dest.local == local
+            }
+            _ => false,
+        },
+        None => match &block.terminator {
             Terminator::Call { func: callee, args, dest, .. } if dest.local == local => {
                 if !dest.projections.is_empty() {
-                    return None;
+                    return true;
                 }
-                defs.push(FloatLocalDef::Call { block: block.id, callee, args: args.as_slice() });
+                defs.push(FloatLocalDef::Call {
+                    block: block.id,
+                    callee,
+                    args: args.as_slice(),
+                });
+                false
             }
             // An `Opaque` terminator (inline asm, …) carries NO operand model
             // — it may write ANY local invisibly. One anywhere poisons every
             // def set (fail-closed; such a function already carries an
             // UnsupportedMir obligation, but this lane must not even trace).
-            Terminator::Opaque { .. } => return None,
-            _ => {}
-        }
+            Terminator::Opaque { .. } => true,
+            _ => false,
+        },
+    }) {
+        return None;
     }
     Some(defs)
 }
@@ -697,7 +1071,10 @@ pub(super) fn float_range(
         // callsite-specific interval of the actual's corresponding field — at
         // least as tight as, and consulted BEFORE, the callee's own contract
         // (which is the callee-GLOBAL bound and too loose for a chain to
-        // satisfy a downstream callee precondition). Empty off the callee trace.
+        // satisfy a downstream callee precondition). Empty off the callee trace,
+        // and refused for a formal the body writes or lends write-capably, or a
+        // read through a raw pointer — `contract_range`'s gate, applied inside
+        // `param_field_override` (F6B-FIELD-OVERRIDE-UNSTABLE-1).
         if let Some(range) = ctx.param_field_override(place) {
             return Some(range);
         }
@@ -858,6 +1235,34 @@ pub(super) fn finite_outward(lo: f64, hi: f64) -> Option<(f64, f64)> {
     (lo.is_finite() && hi.is_finite() && lo <= hi).then_some((lo, hi))
 }
 
+/// Enclose an already outward-rounded f64 interval at the operation's IEEE
+/// width. Binary32 arithmetic rounds before later operations consume its value:
+/// an f64-only enclosure can otherwise miss a midpoint that rounds upward.
+/// Directed endpoint conversion also encloses subnormal underflow. An infinite
+/// endpoint refuses rather than presenting an overflowing result as finite.
+pub(super) fn float_interval_in_width((lo, hi): (f64, f64), width: u32) -> Option<(f64, f64)> {
+    if !(lo.is_finite() && hi.is_finite() && lo <= hi) {
+        return None;
+    }
+    match width {
+        64 => Some((lo, hi)),
+        32 => {
+            let (mut lower, mut upper) = (lo as f32, hi as f32);
+            if !lower.is_finite() || !upper.is_finite() {
+                return None;
+            }
+            if f64::from(lower) > lo {
+                lower = lower.next_down();
+            }
+            if f64::from(upper) < hi {
+                upper = upper.next_up();
+            }
+            (lower.is_finite() && upper.is_finite()).then_some((f64::from(lower), f64::from(upper)))
+        }
+        _ => None,
+    }
+}
+
 /// Interval of one whole-local `Assign` def. Each operand of the def is read
 /// AT THE DEF'S BLOCK, so recursion threads that block for guard facts.
 pub(super) fn float_rvalue_range(
@@ -900,9 +1305,11 @@ pub(super) fn float_rvalue_range(
             }
         }
         Rvalue::BinaryOp(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div), a, b) => {
+            let width = v2_float_binop_width(ctx.func, a, b)?;
             let ra = float_range(ctx, mode, Some(def_block), a, visiting, fuel - 1)?;
             if let Some(rb) = float_range(ctx, mode, Some(def_block), b, visiting, fuel - 1)
                 && let Some(full) = float_interval_binop(*op, ra, rb)
+                    .and_then(|range| float_interval_in_width(range, width))
             {
                 return Some(full);
             }
@@ -927,7 +1334,8 @@ pub(super) fn float_rvalue_range(
                     fuel - 1,
                 )?;
                 let q = ra.0.abs().max(ra.1.abs()) / m;
-                return finite_outward(-q, q);
+                return finite_outward(-q, q)
+                    .and_then(|range| float_interval_in_width(range, width));
             }
             None
         }
@@ -954,14 +1362,18 @@ pub(super) fn float_call_range(
     if fuel == 0 {
         return None;
     }
+    // NUM-METHOD-ANCHOR-1: every std arm below names its callee by the call's
+    // compiler-minted key plus an exact path, and wants a float destination (each
+    // modeled method returns `f64`/`f32`; an extraction that disagrees is refused).
+    let (callee_key, dest_is_float) = float_call_site_key(ctx.func, def_block);
     // `Duration::as_secs_f64`/`as_secs_f32`: `[0, u64::MAX + 1) ⊂ [0, 2^65]`,
-    // always finite, never NaN — sound in both modes. CRATE-ORIGIN anchored
-    // (`core::time::Duration::as_secs_f64` / the std re-export): a bare suffix
-    // match let any `mymod::as_secs_f64` inject the bound (round-13, same
-    // false-proof channel as the un-gated `::cos` suffix).
-    if (callee.ends_with("::as_secs_f64") || callee.ends_with("::as_secs_f32"))
-        && (callee.starts_with("core::") || callee.starts_with("std::"))
-        && callee.contains("::time::")
+    // always finite, never NaN — sound in both modes. Exact `Duration` path: a bare
+    // suffix match let any `mymod::as_secs_f64` inject the bound (round-13, same
+    // false-proof channel as the un-gated `::cos` suffix), and a root-plus-substring
+    // test admits a generic argument spelling `::time::`.
+    if dest_is_float
+        && trust_types::callee_key::sysroot_exact_path(callee_key, callee, DURATION_AS_SECS_PATHS)
+            .is_some()
     {
         return Some((0.0, exp2i(65)?));
     }
@@ -969,7 +1381,7 @@ pub(super) fn float_call_range(
     // input. The NaN-tolerant mode takes the unconditional bound (a NaN is
     // inside its contract — never a fresh ±inf); the strict mode must first
     // prove the ARGUMENT finite and NaN-free.
-    if is_unit_bounded_float_call(callee) {
+    if dest_is_float && is_unit_bounded_float_call(callee, callee_key) {
         if mode == FloatNanMode::Forbid {
             float_range(
                 ctx,
@@ -982,7 +1394,8 @@ pub(super) fn float_call_range(
         }
         return Some((-1.0, 1.0));
     }
-    if let Some(method) = f64_std_method_name(callee)
+    if dest_is_float
+        && let Some(method) = f64_std_method_name(callee, callee_key)
         && let Some(range) =
             float_std_call_range(ctx, mode, def_block, method, args, visiting, fuel)
     {
@@ -997,8 +1410,8 @@ pub(super) fn float_call_range(
     float_callee_trace_range(ctx, def_block, callee, args, &[], visiting, fuel)
 }
 
-/// The recognized `::f64::` std-method arms of [`float_call_range`] (origin
-/// already gated by `f64_std_method_name`).
+/// The recognized std `f64` method arms of [`float_call_range`] (identity
+/// already gated by `f64_std_method_name`: key plus exact path).
 pub(super) fn float_std_call_range(
     ctx: &FloatRangeCtx<'_>,
     mode: FloatNanMode,
@@ -1140,9 +1553,11 @@ pub(super) fn float_summary_result_range(
 ///      exactly the claim strength `contract_range` supplies for a gated
 ///      precondition (which is how the callee-side reads consume them, under
 ///      the same defless entry-stability discipline; see
-///      `FloatRangeCtx::param_overrides`). Only f64-typed formals are bound;
-///      an unbindable actual simply leaves its formal unboundable inside the
-///      callee (fail-closed, never wrong).
+///      `FloatRangeCtx::param_overrides`). Only f64-typed formals are bound,
+///      plus the f64 leaves of a struct/tuple formal the body never writes or
+///      lends write-capably (`param_place_is_entry_stable`); an unbindable
+///      actual simply leaves its formal unboundable inside the callee
+///      (fail-closed, never wrong).
 ///   3. The callee-side trace ALSO consumes the body's own gated
 ///      preconditions (`contract_range` reads `body.preconditions`), so every
 ///      one of them — and every summary-declared precondition — is
@@ -1168,6 +1583,18 @@ pub(super) fn float_callee_trace_range(
     if fuel == 0 {
         return None;
     }
+    let summary = ctx.summaries?.get(callee)?;
+    let body = summary.extracted_body.as_deref()?;
+    // Positional formal binding requires the extracted arity to match the call.
+    if body.body.arg_count != args.len() {
+        return None;
+    }
+    // (3) Precondition arity gate before suffix resolution or memo-key formatting.
+    if (!body.preconditions.is_empty() || !summary.preconditions.is_empty())
+        && summary.param_names.len() != args.len()
+    {
+        return None;
+    }
     // SOUNDNESS (round-14 false-proof): the `suffix` is the CALLER's projection
     // chain, but it is about to be resolved inside the CALLEE's body/namespace.
     // A `Projection::Index(local)` names a caller-runtime index LOCAL — inside
@@ -1180,7 +1607,7 @@ pub(super) fn float_callee_trace_range(
     // any non-const / conflicting / `&mut`-borrowed index), so the fixed element
     // read can reattach to the callee's return aggregate. The resulting suffix
     // carries only namespace-INDEPENDENT tokens. A runtime index still refuses.
-    let resolved_suffix: Vec<Projection> =
+    let resolved_suffix: std::borrow::Cow<'_, [Projection]> =
         if suffix.iter().any(|p| matches!(p, Projection::Index(_))) {
             let mut out = Vec::with_capacity(suffix.len());
             for proj in suffix {
@@ -1196,21 +1623,22 @@ pub(super) fn float_callee_trace_range(
                     other => out.push(other.clone()),
                 }
             }
-            out
+            std::borrow::Cow::Owned(out)
         } else {
-            suffix.to_vec()
+            std::borrow::Cow::Borrowed(suffix)
         };
     let suffix: &[Projection] = &resolved_suffix;
-    let summary = ctx.summaries?.get(callee)?;
-    let body = summary.extracted_body.as_deref()?;
-    // Positional formal binding requires the extracted arity to match the call.
-    if body.body.arg_count != args.len() {
-        return None;
-    }
-    // Trace memo (successful results only — see the field doc).
-    let memo_key = (call_block, callee.to_string(), format!("{args:?}"), format!("{suffix:?}"));
-    if let Some(hit) = ctx.trace_memo.borrow().get(&memo_key) {
-        return Some(*hit);
+    // Trace memo of THIS context (successful results only). The key is in this
+    // context's local names, so the memo is never shared with another context
+    // (F6B-TRACE-MEMO-KEY-1; see the field doc). A hit skips the cuts and the
+    // precondition re-establishment below: it was made under the same facts.
+    let mut memo_key: Option<(BlockId, String, String, String)> = None;
+    if !ctx.trace_memo.borrow().is_empty() {
+        let key = (call_block, callee.to_string(), format!("{args:?}"), format!("{suffix:?}"));
+        if let Some(hit) = ctx.trace_memo.borrow().get(&key) {
+            return Some(*hit);
+        }
+        memo_key = Some(key);
     }
     // Depth + recursion cut (shared across nesting levels).
     {
@@ -1223,12 +1651,7 @@ pub(super) fn float_callee_trace_range(
     // own gated set (what `contract_range` reads during the re-trace) and the
     // summary's declared set (the interface this interval claim is conditional
     // on). The σ mapping needs the summary's formal names.
-    let assumed: Vec<&Formula> =
-        body.preconditions.iter().chain(summary.preconditions.iter()).collect();
-    if !assumed.is_empty() && summary.param_names.len() != args.len() {
-        return None;
-    }
-    for pre in assumed {
+    for pre in body.preconditions.iter().chain(summary.preconditions.iter()) {
         if !precondition_interval_dominance(
             ctx,
             call_block,
@@ -1244,12 +1667,12 @@ pub(super) fn float_callee_trace_range(
     // (2) Bind each f64 FORMAL's override from the caller-proved interval of
     // its actual, in strict Forbid mode at the call block. Failures bind
     // nothing (the formal stays unboundable inside the callee).
+    let _callee_scope = super::FuncAnalysisScope::enter(body);
     let mut overrides: FxHashMap<usize, (f64, f64)> = FxHashMap::default();
-    let mut field_overrides: FxHashMap<String, (f64, f64)> = FxHashMap::default();
+    let mut field_actuals: FxHashMap<usize, Place> = FxHashMap::default();
     for (position, actual) in args.iter().enumerate() {
         let formal = position + 1;
-        let Some(formal_ty) = body.body.locals.iter().find(|d| d.index == formal).map(|d| &d.ty)
-        else {
+        let Some(formal_ty) = crate::local_ty_ref(body, formal) else {
             continue;
         };
         if matches!(formal_ty, Ty::Float { width: 64 }) {
@@ -1261,41 +1684,43 @@ pub(super) fn float_callee_trace_range(
             }
             continue;
         }
-        // STRUCT/vector formal: bind each scalar-f64 LEAF from the caller's
-        // interval of the actual's corresponding field. The actual must be a
-        // place (a constructed struct literal is handled by the general
-        // aggregate lane, not here); its type is walked for f64 leaves and the
-        // key is the CALLEE-side name so the in-callee projected read finds it.
+        // STRUCT/vector formal: each scalar-f64 LEAF the trace reads is bound to
+        // the caller's interval of the actual's corresponding field, resolved
+        // on demand (`FieldOverrideSource`). The actual must be a place (a
+        // constructed struct literal is handled by the general aggregate lane,
+        // not here); the key is the CALLEE-side name so the in-callee projected
+        // read finds it.
         let (Operand::Copy(actual_place) | Operand::Move(actual_place)) = actual else {
             continue;
         };
-        for leaf in float_scalar_leaf_suffixes(formal_ty, FLOAT_STRUCT_LEAF_DEPTH) {
-            let mut caller_place = actual_place.clone();
-            caller_place.projections.extend_from_slice(&leaf);
-            let Some(range) = float_range(
-                ctx,
-                FloatNanMode::Forbid,
-                Some(call_block),
-                &Operand::Copy(caller_place),
-                visiting,
-                fuel - 1,
-            ) else {
-                continue;
-            };
-            let callee_place = Place { local: formal, projections: leaf };
-            let key = canonicalize_contract_index_segments(&crate::place_to_var_name(
-                body,
-                &callee_place,
-            ));
-            field_overrides.insert(key, range);
+        // ENTRY-fact license (F6B-FIELD-OVERRIDE-UNSTABLE-1): a leaf override is
+        // the caller's value of the actual, which a callee read sees only while
+        // the formal still holds its entry value. A formal the body writes or
+        // lends write-capably ANYWHERE (`p.a = 1e300`, `&mut p.0` handed to a
+        // call) binds nothing, so every leaf read of it falls through to the
+        // callee's own facts. Base-local granularity, as `contract_range`: a
+        // write to `p.b` also refuses `p.a` (a completeness cost, fail-closed;
+        // DECISION_QUEUE F6B-FIELD-OVERRIDE-UNSTABLE-1).
+        if !param_place_is_entry_stable(body, formal) {
+            continue;
         }
+        field_actuals.insert(formal, actual_place.clone());
     }
+    let field_source = FieldOverrideSource {
+        parent: ctx,
+        call_block,
+        actuals: field_actuals,
+        visiting: visiting.clone(),
+        callee_stack: ctx.visiting_callees.borrow().clone(),
+        fuel: fuel - 1,
+        resolved: std::cell::RefCell::new(FxHashMap::default()),
+    };
     // (4)(5) Trace `_0.<suffix>` inside the callee: fresh per-function context
     // (fresh LOCAL visiting namespace), shared work budget + callee stack, no
     // top-level flow context (each `_0` def is still evaluated under ITS OWN
     // block's dominating guards, exactly like `derive_float_result_range`).
     ctx.visiting_callees.borrow_mut().push(callee.to_string());
-    let callee_ctx = FloatRangeCtx::for_callee(ctx, body, overrides, field_overrides);
+    let callee_ctx = FloatRangeCtx::for_callee(ctx, body, overrides, Some(&field_source));
     let place = Place { local: 0, projections: suffix.to_vec() };
     let range = float_range(
         &callee_ctx,
@@ -1307,7 +1732,9 @@ pub(super) fn float_callee_trace_range(
     );
     ctx.visiting_callees.borrow_mut().pop();
     if let Some(hit) = range {
-        ctx.trace_memo.borrow_mut().insert(memo_key, hit);
+        let key = memo_key
+            .unwrap_or_else(|| (call_block, callee.to_string(), format!("{args:?}"), format!("{suffix:?}")));
+        ctx.trace_memo.borrow_mut().insert(key, hit);
     }
     range
 }
@@ -1362,8 +1789,9 @@ pub(super) fn projections_provably_disjoint(
 /// SOUNDNESS obligations, all fail-closed:
 ///   * `m` has EXACTLY ONE whole-local def and it is a `Call` (the init); a
 ///     whole reseat, a second init, or a projected-dest call refuses.
-///   * NO `&mut m.*` / `&raw mut m.*`, `SetDiscriminant m`, `Deinit m`, or any
-///     `Opaque` terminator anywhere (invisible write channels).
+///   * NO pointer that can write under `m` (`&mut m.*`, `&raw mut m.*`, `&raw
+///     const m.*` — `path_defs::borrow_write_target`), `SetDiscriminant m`,
+///     `Deinit m`, or any `Opaque` terminator anywhere (invisible write channels).
 ///   * EVERY store whose place is not PROVABLY DISJOINT from the read place
 ///     (`projections_provably_disjoint` — a symbolic index is treated as
 ///     aliasing) must be UNABLE to reach the read block (`reachable_avoiding`);
@@ -1392,21 +1820,30 @@ pub(super) fn float_masked_init_call_element_range<'a>(
         return None;
     }
     let func = ctx.func;
+    let summaries = ctx.summaries?;
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return None;
+    }
     let mut init: Option<(BlockId, &'a str, &'a [Operand])> = None;
     let mut stores: Vec<(BlockId, &'a [Projection])> = Vec::new();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            match stmt {
+    let mut valid = true;
+    crate::visit_local_write_candidates(func, &func.body.blocks, m, |block, item| {
+        if !valid {
+            return;
+        }
+        match item {
+            Some(stmt) => match stmt {
                 Statement::Assign { place: dest, rvalue, .. } => {
-                    if let Rvalue::Ref { mutable: true, place: b } | Rvalue::AddressOf(true, b) =
-                        rvalue
+                    if let Some(b) = super::borrow_write_target(func, rvalue)
                         && b.local == m
                     {
-                        return None; // `&mut m.*` — an invisible write channel
+                        valid = false; // `&mut m.*` / `&raw const m.*` — an invisible write channel
+                        return;
                     }
                     if dest.local == m {
                         if dest.projections.is_empty() {
-                            return None; // a whole reseat: not the single-init shape
+                            valid = false; // a whole reseat: not the single-init shape
+                            return;
                         }
                         stores.push((block.id, dest.projections.as_slice()));
                     }
@@ -1414,23 +1851,34 @@ pub(super) fn float_masked_init_call_element_range<'a>(
                 Statement::SetDiscriminant { place: d, .. } | Statement::Deinit { place: d }
                     if d.local == m =>
                 {
-                    return None;
+                    valid = false;
                 }
                 _ => {}
-            }
-        }
-        match &block.terminator {
-            Terminator::Call { func: callee, args, dest, .. } if dest.local == m => {
-                if !dest.projections.is_empty() || init.is_some() {
-                    return None; // projected-dest call, or a SECOND whole def
+            },
+            None => match &block.terminator {
+                Terminator::Call { func: callee, args, dest, .. } if dest.local == m => {
+                    if !dest.projections.is_empty() || init.is_some() {
+                        valid = false; // projected-dest call, or a SECOND whole def
+                        return;
+                    }
+                    init = Some((block.id, callee.as_str(), args.as_slice()));
                 }
-                init = Some((block.id, callee.as_str(), args.as_slice()));
-            }
-            Terminator::Opaque { .. } => return None,
-            _ => {}
+                Terminator::Opaque { .. } => valid = false,
+                _ => {}
+            },
         }
+    });
+    if !valid {
+        return None;
     }
     let (init_block, callee, args) = init?;
+    if !summaries
+        .get(callee)
+        .and_then(|s| s.extracted_body.as_deref())
+        .is_some_and(|b| b.body.arg_count == args.len())
+    {
+        return None;
+    }
     // Every non-disjoint store must be unreachable from the read block. Two
     // projection chains rooted at `m` are PROVABLY DISJOINT when they differ at
     // some position that is CONSTANT on both sides (a `Field`, or a
@@ -1439,17 +1887,16 @@ pub(super) fn float_masked_init_call_element_range<'a>(
     // `Index(_k)` locals to their constants (which `place_to_var_name` renders
     // as symbolic `[_..]`, over-aliasing every column), so a store to a
     // DIFFERENT column no longer blocks this column's read.
-    let empty = FxHashSet::default();
     for (sblock, sproj) in &stores {
         if projections_provably_disjoint(func, sproj, &place.projections) {
             continue; // provably a different element: cannot affect the read
         }
-        if reachable_avoiding(func, sblock.0, &empty).contains(&read_block.0) {
+        if reachable_avoiding_one_contains(func, sblock.0, None, read_block.0) {
             return None; // an aliasing store can reach the read — could clobber
         }
     }
     // Init-before-use well-formedness: the init must reach the read.
-    if !reachable_avoiding(func, init_block.0, &empty).contains(&read_block.0) {
+    if !reachable_avoiding_one_contains(func, init_block.0, None, read_block.0) {
         return None;
     }
     // Safe: the read sees the init Call's element. Trace it (Forbid mode — the
@@ -1784,15 +2231,16 @@ pub(super) fn float_enum_payload_range(
     let mut construction_defs: Vec<(BlockId, usize, &[Operand])> = Vec::new();
     let mut seen: Vec<usize> = Vec::new();
     collect_adt_construction_defs(ctx.func, place.local, &mut seen, fuel, &mut construction_defs)?;
-    let selected: Vec<&(BlockId, usize, &[Operand])> =
-        construction_defs.iter().filter(|(_, w, _)| *w == variant).collect();
-    if selected.is_empty() {
+    if !construction_defs.iter().any(|(_, w, _)| *w == variant) {
         return None;
     }
     visiting.push(place.local);
     let mut hull: Option<(f64, f64)> = None;
     let mut every_def_bounded = true;
-    for (def_block, _, ops) in selected {
+    for (def_block, w, ops) in &construction_defs {
+        if *w != variant {
+            continue;
+        }
         let range = ops.get(*k).and_then(|element| {
             float_element_range(ctx, mode, *def_block, element, rest, visiting, fuel)
         });
@@ -1888,9 +2336,6 @@ pub(super) fn float_guard_bounds(
     if !place.projections.is_empty() {
         return none;
     }
-    if guards::value_local_is_unstable(ctx.func, place.local) {
-        return none;
-    }
     let Some(block) = ctx.func.body.blocks.get(block_id.0) else { return none };
     if block.id != block_id {
         return none;
@@ -1903,7 +2348,7 @@ pub(super) fn float_guard_bounds(
         return none;
     }
     let facts = ctx.dominating_facts(block_id);
-    if facts.is_empty() {
+    if facts.is_empty() || guards::value_local_is_unstable(ctx.func, place.local) {
         return none;
     }
     let names = ctx.guard_alias_names(place);
@@ -2056,6 +2501,11 @@ pub(super) fn float_abs_guard_magnitude_bounds(
     block_id: BlockId,
     place: &Place,
 ) -> (Option<f64>, Option<f64>) {
+    if !super::terminator_presence_for(ctx.func).has_bare_dest_call
+        || ctx.dominating_facts(block_id).is_empty()
+    {
+        return (None, None);
+    }
     // Value stability between the abs read and the consuming op: a PARAMETER
     // base must have NO whole-local def at all (any reseat can interleave), a
     // non-parameter temp must be SINGLE-assignment (its one def precedes every
@@ -2071,14 +2521,11 @@ pub(super) fn float_abs_guard_magnitude_bounds(
         let base_is_param = place.local >= 1 && place.local <= ctx.func.body.arg_count;
         if base_is_param { defs.is_empty() } else { defs.len() == 1 }
     };
-    if !stable_base(place) {
-        return (None, None);
-    }
     // The consuming op often reads a COPY TEMP of the guarded value (`_t =
     // copy (*self).2; _q = 1.0 / _t`) while the abs call read the source place
     // directly — resolve the place through its single `Use(Copy|Move)` def so
     // both spell the same place. Sound: the temp is single-assignment (checked
-    // above) and the RESOLVED source must pass the same stability discipline,
+    // below) and the RESOLVED source must pass the same stability discipline,
     // so temp and source provably hold the same value at every read.
     let resolve_to_source = |p: &Place| -> Option<Place> {
         if !p.projections.is_empty() {
@@ -2108,22 +2555,26 @@ pub(super) fn float_abs_guard_magnitude_bounds(
             None
         }
     };
-    let mut candidates: Vec<Place> = vec![place.clone()];
-    if let Some(src) = resolve_to_source(place) {
-        candidates.push(src);
-    }
+    let mut place_is_stable: Option<bool> = None;
+    let mut place_source: Option<Option<Place>> = None;
     let mut floor: Option<f64> = None;
     let mut cap: Option<f64> = None;
     for block in &ctx.func.body.blocks {
         let Terminator::Call { func: callee, args, dest, .. } = &block.terminator else {
             continue;
         };
-        if fp_abs_call_width(callee) != Some(64) || !dest.projections.is_empty() {
+        if !dest.projections.is_empty() {
             continue;
         }
         let [Operand::Copy(arg) | Operand::Move(arg)] = args.as_slice() else {
             continue;
         };
+        if fp_abs_call_width(callee) != Some(64) {
+            continue;
+        }
+        if !*place_is_stable.get_or_insert_with(|| stable_base(place)) {
+            return (None, None);
+        }
         // Match the abs ARG against a candidate DIRECTLY, or through its OWN
         // single stable copy-def source: the abs (`_6 = copy (*self).2`) and the
         // divide (`_7 = copy (*self).2`) frequently read the guarded field
@@ -2132,13 +2583,24 @@ pub(super) fn float_abs_guard_magnitude_bounds(
         // `1.0 / self.scale` under `self.scale.abs() > 1e-20`). Sound by the same
         // single-assignment + `stable_base` discipline that admits the divisor's
         // own source into `candidates`.
-        let arg_matches = candidates.iter().any(|candidate| arg == candidate)
-            || resolve_to_source(arg).is_some_and(|src| candidates.iter().any(|c| src == *c));
+        let arg_matches = if arg == place {
+            true
+        } else {
+            let resolved_place_src =
+                place_source.get_or_insert_with(|| resolve_to_source(place));
+            let matches_candidate =
+                |p: &Place| p == place || resolved_place_src.as_ref().is_some_and(|src| p == src);
+            resolved_place_src.as_ref().is_some_and(|src| arg == src)
+                || resolve_to_source(arg).is_some_and(|src| matches_candidate(&src))
+        };
         if !arg_matches {
             continue;
         }
         // The abs temp must have NO other def than this call (a reseated temp
         // would stale the guard fact).
+        if crate::local_defs::is_parameter(ctx.func, dest.local) {
+            continue;
+        }
         match float_whole_local_defs(ctx.func, dest.local) {
             Some(defs) if defs.len() == 1 => {}
             _ => continue,
@@ -2361,7 +2823,19 @@ pub fn all_callsites_precondition_dominated(
     summaries: &crate::modular::SummaryDatabase,
     callee: &str,
 ) -> bool {
-    let float_ctx = FloatRangeCtx::new(func, Some(summaries));
+    let Some(summary) = summaries.get(callee) else {
+        return false;
+    };
+    if super::cached_terminator_presence_for_body(&func.body)
+        .is_some_and(|tp| !tp.has_call && !tp.has_tail_call)
+    {
+        return false;
+    }
+    if super::body_contains_memory_image_for(func) {
+        return false;
+    }
+    let mut memo_scopes = None;
+    let float_ctx: std::cell::OnceCell<FloatRangeCtx<'_>> = std::cell::OnceCell::new();
     let mut saw_site = false;
     for block in &func.body.blocks {
         let (callee_name, args) = match &block.terminator {
@@ -2373,15 +2847,21 @@ pub fn all_callsites_precondition_dominated(
         if callee_name != callee {
             continue;
         }
-        let Some(summary) = summaries.get(callee_name) else {
-            return false;
-        };
         if summary.param_names.len() != args.len() {
             return false;
         }
         for precondition in &summary.preconditions {
-            if !precondition_interval_dominance(
-                &float_ctx,
+            if !precondition_interval_dominance_lazy(
+                func,
+                || {
+                    memo_scopes.get_or_insert_with(|| {
+                        (
+                            crate::gen_work_memo_scope_if_unscoped(),
+                            super::FuncAnalysisScope::enter(func),
+                        )
+                    });
+                    float_ctx.get_or_init(|| FloatRangeCtx::new(func, Some(summaries)))
+                },
                 block.id,
                 precondition,
                 &summary.param_names,
@@ -2406,17 +2886,63 @@ pub(super) fn precondition_interval_dominance(
     visiting: &mut Vec<usize>,
     fuel: u32,
 ) -> bool {
-    if fuel == 0 || param_names.len() != args.len() {
-        return false;
-    }
-    let conjuncts = v2_flatten_guard_conjuncts(precondition);
-    if conjuncts.is_empty() {
-        return false;
-    }
-    let mut ranges: FxHashMap<String, (f64, f64)> = FxHashMap::default();
-    let mut lower_seen: FxHashSet<String> = FxHashSet::default();
-    let mut upper_seen: FxHashSet<String> = FxHashSet::default();
-    for conjunct in conjuncts {
+    precondition_interval_dominance_lazy(
+        ctx.func,
+        || ctx,
+        call_block,
+        precondition,
+        param_names,
+        args,
+        visiting,
+        fuel,
+    )
+}
+
+pub(super) fn precondition_interval_dominance_lazy<'a>(
+    func: &'a VerifiableFunction,
+    mut get_ctx: impl FnMut() -> &'a FloatRangeCtx<'a>,
+    call_block: BlockId,
+    precondition: &Formula,
+    param_names: &[String],
+    args: &[Operand],
+    visiting: &mut Vec<usize>,
+    fuel: u32,
+) -> bool {
+    const LOWER_SEEN: u8 = 1;
+    const UPPER_SEEN: u8 = 2;
+
+    fn check_conjuncts<'a, 'f>(
+        func: &'a VerifiableFunction,
+        get_ctx: &mut impl FnMut() -> &'a FloatRangeCtx<'a>,
+        call_block: BlockId,
+        fact: &'f Formula,
+        param_names: &[String],
+        args: &[Operand],
+        visiting: &mut Vec<usize>,
+        fuel: u32,
+        saw_conjunct: &mut bool,
+        ranges: &mut FxHashMap<&'f str, (f64, f64, u8)>,
+    ) -> bool {
+        if let Formula::And(conjuncts) = fact {
+            for c in conjuncts {
+                if !check_conjuncts(
+                    func,
+                    get_ctx,
+                    call_block,
+                    c,
+                    param_names,
+                    args,
+                    visiting,
+                    fuel,
+                    saw_conjunct,
+                    ranges,
+                ) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        *saw_conjunct = true;
         // INT lane (the contracts machinery's auto type-range requires,
         // `0 <= r <= <uN>::MAX` on an integer formal): dischargeable when the
         // σ-mapped actual is a CONSTANT satisfying the bound literally, or a
@@ -2426,48 +2952,62 @@ pub(super) fn precondition_interval_dominance(
         // per-conjunct with no two-sidedness demand: an int conjunct proven
         // this way holds on its own, unlike the float lane whose interval
         // tracer requires two-sided NaN-excluding bounds.
-        if let Some(holds) = int_pre_conjunct_holds(ctx.func, param_names, args, conjunct) {
-            if holds {
-                continue;
-            }
-            return false;
+        if let Some(holds) = int_pre_conjunct_holds(func, param_names, args, fact) {
+            return holds;
         }
-        let Some((var, cmp, c)) = float_pre_var_const(conjunct) else { return false };
-        let (lo, hi) = match ranges.get(var) {
-            Some(range) => *range,
+        let Some((var, cmp, c)) = float_pre_var_const(fact) else { return false };
+        let side_bit = match cmp {
+            BvGuardCmp::Le | BvGuardCmp::Lt => UPPER_SEEN,
+            BvGuardCmp::Ge | BvGuardCmp::Gt => LOWER_SEEN,
+            BvGuardCmp::Eq => 0,
+        };
+        let (lo, hi) = match ranges.get_mut(var) {
+            Some((lo, hi, sides)) => {
+                *sides |= side_bit;
+                (*lo, *hi)
+            }
             None => {
-                let Some(range) =
+                let ctx = get_ctx();
+                let Some((lo, hi)) =
                     dominance_actual_range(ctx, call_block, var, param_names, args, visiting, fuel)
                 else {
                     return false;
                 };
-                ranges.insert(var.to_string(), range);
-                range
+                ranges.insert(var, (lo, hi, side_bit));
+                (lo, hi)
             }
         };
-        let holds = match cmp {
+        match cmp {
             BvGuardCmp::Le => hi <= c,
             BvGuardCmp::Lt => hi < c,
             BvGuardCmp::Ge => lo >= c,
             BvGuardCmp::Gt => lo > c,
             BvGuardCmp::Eq => false, // not produced by float_pre_var_const
-        };
-        if !holds {
-            return false;
         }
-        match cmp {
-            BvGuardCmp::Le | BvGuardCmp::Lt => {
-                upper_seen.insert(var.to_string());
-            }
-            BvGuardCmp::Ge | BvGuardCmp::Gt => {
-                lower_seen.insert(var.to_string());
-            }
-            BvGuardCmp::Eq => {}
-        }
+    }
+
+    if fuel == 0 || param_names.len() != args.len() {
+        return false;
+    }
+    let mut saw_conjunct = false;
+    let mut ranges: FxHashMap<&str, (f64, f64, u8)> = FxHashMap::default();
+    if !check_conjuncts(
+        func,
+        &mut get_ctx,
+        call_block,
+        precondition,
+        param_names,
+        args,
+        visiting,
+        fuel,
+        &mut saw_conjunct,
+        &mut ranges,
+    ) {
+        return false;
     }
     // BOTH sides required per var: this lane is deliberately restricted to the
     // audited two-sided magnitude-bound contract shape.
-    ranges.keys().all(|var| lower_seen.contains(var) && upper_seen.contains(var))
+    saw_conjunct && ranges.values().all(|&(_, _, sides)| sides == (LOWER_SEEN | UPPER_SEEN))
 }
 
 /// Resolve one F5 precondition var to the ACTUAL's proven interval at the call
@@ -2503,8 +3043,9 @@ pub(super) fn dominance_actual_range(
     let (Operand::Copy(base_place) | Operand::Move(base_place)) = actual else {
         return None;
     };
+    let suffix_projections = parse_projection_suffix(suffix)?;
     let mut place = base_place.clone();
-    place.projections.extend(parse_projection_suffix(suffix)?);
+    place.projections.extend(suffix_projections);
     float_range(
         ctx,
         FloatNanMode::Forbid,
@@ -2524,15 +3065,20 @@ pub(super) fn dominance_actual_range(
 /// evaluated under ITS OWN block's dominating guards. Recursion is the
 /// CALLER's concern (`compute_summary` passes `is_recursive` and skips this).
 pub fn derive_float_result_range(func: &VerifiableFunction) -> Option<(f64, f64)> {
+    if !matches!(func.body.return_ty, Ty::Float { width: 64 }) {
+        return None;
+    }
+    if super::body_contains_memory_image_for(func) {
+        return None;
+    }
     // This public summary producer is also invoked directly by the compiler.
     // A TailCall overwrites the implicit return place; project it before the
     // return-def trace so an earlier `_0` assignment cannot masquerade as the
     // function's returned range.
     let tail_call_expanded = func.with_tail_calls_expanded();
     let func = tail_call_expanded.as_ref();
-    if !matches!(func.body.return_ty, Ty::Float { width: 64 }) {
-        return None;
-    }
+    let _gen_work_memo = crate::gen_work_memo_scope_if_unscoped();
+    let _analysis_scope = super::FuncAnalysisScope::enter(func);
     let ctx = FloatRangeCtx::new(func, None);
     float_range(
         &ctx,
@@ -2543,3 +3089,10 @@ pub fn derive_float_result_range(func: &VerifiableFunction) -> Option<(f64, f64)
         FLOAT_EXP_BOUND_FUEL,
     )
 }
+
+// Trust (2026-10-04, wave 13): test modules sit at the END of the file, so the
+// `local_defs_seam_lint` test-module mask (which runs from a braceless `mod x;` to
+// the next closing brace) cannot swallow a production function.
+#[cfg(test)]
+#[path = "f64_method_anchor_tests.rs"]
+mod f64_method_anchor_tests;

@@ -1,8 +1,8 @@
 use crate::command_prelude::*;
 
 use anyhow::Context;
-use cargo::ops;
 use cargo_credential::Secret;
+use targo::ops;
 
 pub fn cli() -> Command {
     subcommand("yank")

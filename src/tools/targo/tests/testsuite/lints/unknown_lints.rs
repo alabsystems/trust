@@ -17,19 +17,18 @@ authors = []
 [lints.cargo]
 default = { level = "allow", priority = -1 }
 unknown_lints = "warn"
-this-lint-does-not-exist = "warn"
+this_lint_does_not_exist = "warn"
 "#,
         )
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("fetch")
         .with_stderr_data(str![[r#"
-[WARNING] unknown lint: `this-lint-does-not-exist`
+[WARNING] unknown lint: `this_lint_does_not_exist`
   --> Cargo.toml:11:1
    |
-11 | this-lint-does-not-exist = "warn"
+11 | this_lint_does_not_exist = "warn"
    | ^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = [NOTE] `cargo::unknown_lints` is set to `warn` in `[lints]`
@@ -51,7 +50,7 @@ members = ["foo"]
 [workspace.lints.cargo]
 default = { level = "allow", priority = -1 }
 unknown_lints = "warn"
-this-lint-does-not-exist = "warn"
+this_lint_does_not_exist = "warn"
 "#,
         )
         .file(
@@ -70,13 +69,12 @@ workspace = true
         .file("foo/src/lib.rs", "")
         .build();
 
-    p.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("fetch")
         .with_stderr_data(str![[r#"
-[WARNING] unknown lint: `this-lint-does-not-exist`
+[WARNING] unknown lint: `this_lint_does_not_exist`
  --> Cargo.toml:8:1
   |
-8 | this-lint-does-not-exist = "warn"
+8 | this_lint_does_not_exist = "warn"
   | ^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unknown_lints` is set to `warn` in `[lints]`
@@ -98,7 +96,7 @@ members = ["foo"]
 [workspace.lints.cargo]
 default = { level = "allow", priority = -1 }
 unknown_lints = "warn"
-this-lint-does-not-exist = "warn"
+this_lint_does_not_exist = "warn"
 "#,
         )
         .file(
@@ -114,13 +112,12 @@ authors = []
         .file("foo/src/lib.rs", "")
         .build();
 
-    p.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("fetch")
         .with_stderr_data(str![[r#"
-[WARNING] unknown lint: `this-lint-does-not-exist`
+[WARNING] unknown lint: `this_lint_does_not_exist`
  --> Cargo.toml:8:1
   |
-8 | this-lint-does-not-exist = "warn"
+8 | this_lint_does_not_exist = "warn"
   | ^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unknown_lints` is set to `warn` in `[lints]`

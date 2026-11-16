@@ -22,7 +22,21 @@
 // Instruction classes newly exercised here (vs the ALU baseline): ICmp (Subs+Csinc),
 // Select / conditional-move (Csinc/Csel pattern from `if`), CondBr (BCond), Switch
 // (multi-target), bounded loop (backward Branch / backedge), Store (Str) + Load (Ldr)
-// + stack frame (Stp/Ldp). HONEST scope notes are in the final `coverage_report` test.
+// + stack frame (Stp/Ldp).
+//
+// Scope. VALIDATED-BY-EXECUTION (route-a ISA model == route-b real CPU, same bytes):
+//   ICmp           : cfg_max(Ge) cfg_min(Le) cfg_abs(Lt) cfg_clamp(Lt,Gt) cfg_sum_loop(Lt)
+//   CondBr (BCond) : every if/loop-guard above; the negative control inverts it -> detected
+//   Select         : if/else materialization (Csinc + branch merge) in max/min/abs/clamp
+//   Switch (multi) : cfg_dispatch (3 cases + default), in+out-of-range tags
+//   Loop backedge  : cfg_sum_loop (backward Branch), bounds 0/1/.../2000
+//   Store (Str)    : mem_ptr_rw (*p = v), confirmed landed in memory both routes
+//   Load  (Ldr)    : mem_ptr_rw (return *p), confirmed read-back both routes
+//   Frame (Stp/Ldp): mem_ptr_rw prologue/epilogue + local spills
+// STILL AUDITED-ONLY (not reached here): GEP/array-Load over a runtime index via a
+// slice/raw fat pointer. It is blocked by the route-(b) fat-pointer calling convention
+// (C FFI), NOT an ISA-model gap: the function lowers cleanly (Madd GEP + Ldr in a loop)
+// and the opcodes ARE modeled; only the silicon-side FFI handshake is unresolved here.
 
 use std::fs;
 use std::process::Command;
@@ -390,6 +404,7 @@ fn wrap(name: &str, body: VerifiableBody) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -778,13 +793,8 @@ fn cfg_max_min_clamp_abs_dispatch_loop_match_real_cpu() {
         1000,
     );
     differential_cfg(&author_clamp(), 3, &triples(0x4444), 1000);
-    // dispatch: tags 0..=8 (in + out of range) exhaustively, repeated for >= 400.
-    let mut tags: Vec<Vec<i32>> = Vec::new();
-    for rep in 0..50 {
-        for t in -1..=8 {
-            tags.push(vec![t + (rep % 1) /* keep value */]);
-        }
-    }
+    // dispatch: tags -1..=8 (in + out of range) exhaustively, repeated for >= 400.
+    let tags: Vec<Vec<i32>> = (0..50).flat_map(|_| (-1..=8).map(|t| vec![t])).collect();
     differential_cfg(&author_dispatch(), 1, &tags, 1000);
     // sum_loop: max bound 2000 -> ~ a few thousand model steps; cap generously.
     differential_cfg(&author_sum_loop(), 1, &loop_bounds(0x6666), 200_000);
@@ -1017,30 +1027,4 @@ fn negative_control_inverted_condbr_is_detected() {
         disagreements,
         inputs.len()
     );
-}
-
-#[test]
-fn coverage_report() {
-    // HONEST record of what this rung newly validates-by-execution vs leaves audited.
-    println!("=== G13-FULL CFG/compare/select/loop/memory differential coverage ===");
-    println!("VALIDATED-BY-EXECUTION (route-a ISA model == route-b real CPU, same bytes):");
-    println!(
-        "  ICmp           : cfg_max(Ge) cfg_min(Le) cfg_abs(Lt) cfg_clamp(Lt,Gt) cfg_sum_loop(Lt)"
-    );
-    println!(
-        "  CondBr (BCond) : every if/loop-guard above; negative control inverts it -> detected"
-    );
-    println!(
-        "  Select         : if/else materialization (Csinc + branch merge) in max/min/abs/clamp"
-    );
-    println!("  Switch (multi) : cfg_dispatch (3 cases + default), in+out-of-range tags");
-    println!("  Loop backedge  : cfg_sum_loop (backward Branch), bounds 0/1/.../2000");
-    println!("  Store (Str)    : mem_ptr_rw  (*p = v), confirmed landed in memory both routes");
-    println!("  Load  (Ldr)    : mem_ptr_rw  (return *p), confirmed read-back both routes");
-    println!("  Frame (Stp/Ldp): mem_ptr_rw prologue/epilogue + local spills");
-    println!("STILL AUDITED-ONLY (not reached by this rung):");
-    println!("  GEP/array-Load over a runtime index via slice/raw fat-pointer: blocked by the");
-    println!("  route-(b) FAT-POINTER CALLING CONVENTION (C FFI), NOT an ISA-model gap. The");
-    println!("  function lowers cleanly (Madd GEP + Ldr in a loop) and the opcodes ARE modeled;");
-    println!("  only the silicon-side FFI handshake for fat pointers is unresolved here.");
 }

@@ -34,17 +34,27 @@ impl TransitionSystem for StateMachineAdapter {
     type State = usize;
     type Action = String;
     type Fingerprint = usize;
+    // Trust: `StateMachine::outgoing` is total over an in-memory machine, so
+    // this producer cannot fail — `Infallible` states that, rather than
+    // inventing an error the adapter would never construct (ty d95ea44a9,
+    // `f5cebd821`, made both batches `Result` so a generator failure is no
+    // longer replaceable by an empty or truncated batch).
+    type Error = std::convert::Infallible;
 
-    fn initial_states(&self) -> Vec<Self::State> {
-        vec![self.machine.initial.0]
+    fn initial_states(&self) -> Result<Vec<Self::State>, Self::Error> {
+        Ok(vec![self.machine.initial.0])
     }
 
-    fn successors(&self, state: &Self::State) -> Vec<(Self::Action, Self::State)> {
-        self.machine
+    fn successors(
+        &self,
+        state: &Self::State,
+    ) -> Result<Vec<(Self::Action, Self::State)>, Self::Error> {
+        Ok(self
+            .machine
             .outgoing(StateId(*state))
             .into_iter()
             .map(|t| (t.event.clone(), t.to.0))
-            .collect()
+            .collect())
     }
 
     fn fingerprint(&self, state: &Self::State) -> Self::Fingerprint {
@@ -103,7 +113,7 @@ mod tests {
         let machine =
             StateMachineBuilder::new(StateId(0)).add_state(State::new(StateId(0), "Start")).build();
         let adapter = StateMachineAdapter::new(machine);
-        assert_eq!(adapter.initial_states(), vec![0]);
+        assert_eq!(adapter.initial_states().expect("infallible"), vec![0]);
     }
 
     #[test]
@@ -114,8 +124,8 @@ mod tests {
             .add_transition(Transition::new(StateId(0), StateId(1), "go"))
             .build();
         let adapter = StateMachineAdapter::new(machine);
-        assert_eq!(adapter.successors(&0), vec![("go".to_string(), 1)]);
-        assert!(adapter.successors(&1).is_empty());
+        assert_eq!(adapter.successors(&0).expect("infallible"), vec![("go".to_string(), 1)]);
+        assert!(adapter.successors(&1).expect("infallible").is_empty());
     }
 
     #[test]

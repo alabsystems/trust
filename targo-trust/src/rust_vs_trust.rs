@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Rust-vs-Trust comparison gate for hostile public review.
 //
 // This module deliberately treats superiority as a proof obligation, not a
@@ -24,6 +24,7 @@ use crate::types::OutputFormat;
 const SUITE_SCHEMA_VERSION: &str = "targo-trust.rust-vs-trust-suite.v1";
 const REPORT_SCHEMA_VERSION: &str = "targo-trust.rust-vs-trust-report.v1";
 const PROGRAM_INDEX_REPORT_SCHEMA: &str = "trust.compile-verify-program-index.report.v1";
+const PROGRAM_INDEX_DOMINATION_AUTHENTICATION_BLOCKER: &str = "program-index domination requires independently authenticated canonical HEAD roster, exact measurements, and sealed source execution; report-authored claims are not authority";
 const PROOF_DESIGN_VERIFIER_EVIDENCE_SCHEMA: &str =
     "trust.compile-verify-program-index.proof-design-verifier-evidence.v1";
 const PROGRAM_INDEX_RUNTIME_PARITY_SCHEMA: &str = "trust.program-index.runtime-output-parity.v1";
@@ -58,10 +59,12 @@ const PROGRAM_INDEX_BENCHMARK_REPORT_FLAG: &str = "--program-index-benchmark-rep
 const PRODUCT_PROOF_RELEASE_REPORT_FLAG: &str = "--product-proof-release-report";
 const PROOF_FUNCTIONAL_SUITE: &str = "proof-design";
 const PROOF_FUNCTIONAL_SLOT: &str = "trust-verify";
+const PROOF_FUNCTIONAL_V1_ADMISSION_BLOCKER: &str = "program-index report v1 cannot score proof.functional-best-existing-tools until the consumer independently binds the canonical candidate-commit roster and source bytes, reconciles unique result rows, and authenticates verifier captures";
 const PROGRAM_INDEX_RUNTIME_BASELINE_SLOT: &str = "upstream-rustc";
 const PROGRAM_INDEX_RUNTIME_TRUST_SLOT: &str = "trust-noverify";
 const PRODUCT_PROOF_BINARY_ROUNDTRIP_DIMENSION_ID: &str = "proof.binary-source-roundtrip";
 const PRODUCT_PROOF_BINARY_DECOMP_COMPONENT: &str = "binary/decomp gates";
+const PRODUCT_PROOF_RELEASE_V1_REPLAY_BLOCKER: &str = "release report v1 cannot satisfy proof.binary-source-roundtrip until a candidate-bound independent replay verifier checks solver evidence; authored pass status, proof totals, and hashes are diagnostic only";
 const PRODUCT_PROOF_EVIDENCE_SCHEMA: &str = "trust.product-proof.v1";
 const UPSTREAM_COMPAT_MANIFEST: &str = "crates/trust-upstream-compat/Cargo.toml";
 const IDENTITY_PROBE_MAX_STREAM_BYTES: usize = 64 * 1024;
@@ -670,6 +673,7 @@ enum CompatibilityOutcomeInput {
 struct ProofUnsafeMemoryReportInput {
     schema: String,
     candidate_commit: String,
+    candidate_tree: String,
     repo_dirty: bool,
     producer: ProofUnsafeMemoryProducerInput,
     proof_report_path: String,
@@ -834,6 +838,36 @@ fn upstream_tests_requires_trust_cargo(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--release")
 }
 
+fn upstream_tests_scoped_args(args: &[String]) -> Result<Vec<String>> {
+    let mut explicit = None;
+    let mut index = 0;
+    while index < args.len() {
+        let value = if args[index] == "--proof-scope" {
+            index += 1;
+            let next =
+                args.get(index).ok_or_else(|| anyhow::anyhow!("--proof-scope needs a value"))?;
+            Some(next.clone())
+        } else {
+            args[index].strip_prefix("--proof-scope=").map(str::to_string)
+        };
+        if let Some(value) = value {
+            if explicit.replace(value).is_some() {
+                bail!("duplicate --proof-scope in upstream-tests command");
+            }
+        }
+        index += 1;
+    }
+    match explicit.as_deref() {
+        None => {
+            let mut scoped = vec!["--proof-scope".to_string(), "upstream-rust".to_string()];
+            scoped.extend_from_slice(args);
+            Ok(scoped)
+        }
+        Some("upstream-rust") => Ok(args.to_vec()),
+        Some(other) => bail!("upstream-tests requires --proof-scope upstream-rust, got `{other}`"),
+    }
+}
+
 fn run_upstream_tests_subcommand(args: &[String]) -> ExitCode {
     let help_requested = args.iter().any(|arg| arg == "--help" || arg == "-h");
     if args.len() == 1 && help_requested {
@@ -844,16 +878,25 @@ fn run_upstream_tests_subcommand(args: &[String]) -> ExitCode {
         eprintln!("targo trust domination upstream-tests: `--help` must be used by itself");
         return ExitCode::from(2);
     }
+    let scoped_args = match upstream_tests_scoped_args(args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("targo trust domination upstream-tests: {error:#}");
+            return ExitCode::from(2);
+        }
+    };
 
     let root = repo_root_for_upstream_tests();
-    let cargo_driver =
-        match resolve_upstream_compat_cargo(&root, upstream_tests_requires_trust_cargo(args)) {
-            Ok(driver) => driver,
-            Err(error) => {
-                eprintln!("targo trust: {error}");
-                return ExitCode::from(2);
-            }
-        };
+    let cargo_driver = match resolve_upstream_compat_cargo(
+        &root,
+        upstream_tests_requires_trust_cargo(&scoped_args),
+    ) {
+        Ok(driver) => driver,
+        Err(error) => {
+            eprintln!("targo trust: {error}");
+            return ExitCode::from(2);
+        }
+    };
     eprintln!(
         "targo trust domination upstream-tests: validating trust-upstream-compat manifest/lockfile with --locked"
     );
@@ -862,7 +905,7 @@ fn run_upstream_tests_subcommand(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let upstream_compat_cargo_env = upstream_compat_child_cargo_env(&cargo_driver);
-    let command = build_upstream_tests_command(cargo_driver, &root, args);
+    let command = build_upstream_tests_command(cargo_driver, &root, &scoped_args);
 
     eprintln!("targo trust domination upstream-tests: dispatching Rust upstream porting CLI");
     let Some(program) = command.first() else {
@@ -876,9 +919,16 @@ fn run_upstream_tests_subcommand(args: &[String]) -> ExitCode {
         child.env("TRUST_TARGO_BIN", value);
     }
     // This is the interactive, potentially long-running porting engine. It
-    // deliberately inherits the user's terminal and lifetime; metadata and
-    // identity probes around it use bounded capture instead.
-    let status = child.status();
+    // deliberately inherits the user's terminal, and so stays in targo-trust's
+    // own process group (a group of its own would be a background job that
+    // cannot read the terminal); metadata and identity probes around it use
+    // bounded capture instead. It is OWNED all the same, so a signal to
+    // targo-trust, or the end of targo-trust or of its parent, stops it with
+    // its tree instead of leaving it running (T5a).
+    let status = child.spawn().and_then(|mut child| {
+        let _ownership = crate::process_lifecycle::Ownership::of(child.id());
+        child.wait()
+    });
     match status {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(error) => {
@@ -999,7 +1049,7 @@ fn upstream_tests_usage_text() -> String {
         "",
         "Usage:",
         "  targo trust domination upstream-tests [--no-execute] [--no-apply] [--release]",
-        "  targo trust domination upstream-tests --release --proof-mode full --execute --no-apply --summary-out reports/strict-superiority/<run-id>/upstream-rust/<arch>/compat-summary.json --out-dir reports/strict-superiority/<run-id>/upstream-rust/<arch>/porting",
+        "  targo trust domination upstream-tests --release --proof-scope upstream-rust --proof-mode full --execute --no-apply --summary-out reports/strict-superiority/<run-id>/upstream-rust/<arch>/compat-summary.json --out-dir reports/strict-superiority/<run-id>/upstream-rust/<arch>/porting",
         "",
         "Common options:",
         "  --baseline <path>             Upstream compatibility baseline (default tests/upstream-rust/baseline.toml)",
@@ -1017,13 +1067,16 @@ fn upstream_tests_usage_text() -> String {
         "  --out-dir <path>              Porting artifact directory",
         "  --execute                     Run the proof suite after import/adaptation (default)",
         "  --no-execute                  Re-import/adapt only or parse --scorecard-log",
-        "  --apply                       Apply ported upstream overlay to tests/ (default)",
+        "  --apply                       Apply ported upstream overlay to tests/ (the default unless",
+        "                                --scorecard-log or --max-files is given; --max-files rejects it)",
         "  --no-apply                    Leave tests/ untouched and write artifacts only",
         "  --no-fetch                    Resolve only exact/local refs; rejects symbolic remote refs",
         "  --scorecard-log <path>        Parse an existing log instead of executing",
         "  --bootstrap-args <args>       Extra direct Rust bootstrap args for execution",
         "  --max-files <n>               Bounded import for smoke/debug runs",
         "  --release                     Require Trust-owned targo for release evidence",
+        "  --proof-scope upstream-rust   Proof population: upstream-only (the default; the only",
+        "                                accepted value, `combined` is refused)",
         "  --proof-mode auto|smoke|full  Full proof is required for unbounded auto runs",
         "",
         "Dispatch:",
@@ -1457,7 +1510,7 @@ fn is_repo_stage2_tool(root: &Path, path: &Path, expected_name: &str) -> bool {
         })
         .collect::<Vec<_>>();
     components.len() == 5
-        && components[0] == "build"
+        && crate::stage2_tools::is_repo_build_component(&canonical_root, components[0])
         && components[2] == "stage2"
         && components[3] == "bin"
         && components[4] == expected_name
@@ -1477,11 +1530,15 @@ fn current_git_head(root: &Path) -> Result<String> {
 fn trustc_commit_hash(trustc: &Path) -> Result<String> {
     let mut command = Command::new(trustc);
     command.arg("-Vv");
+    // A stage2 trustc a build has just written: its first exec waits behind
+    // syspolicyd's machine-wide scan (docs/KNOWN_HAZARDS.md
+    // EXEC-ASSESS-STALL-1), so it gets the release identity probes' hang
+    // guard; IDENTITY_PROBE_TIMEOUT's 10 s stays for the git probes.
     let output = crate::bounded_process::output(
         &mut command,
         "stage2 trustc identity probe",
         IDENTITY_PROBE_MAX_STREAM_BYTES,
-        IDENTITY_PROBE_TIMEOUT,
+        crate::release_cli::TOOL_IDENTITY_PROBE_HANG_GUARD,
     )
     .map_err(anyhow::Error::msg)
     .with_context(|| format!("failed to run {} -Vv", trustc.display()))?;
@@ -1888,6 +1945,14 @@ fn build_report(args: &RustVsTrustArgs) -> Result<RustVsTrustReport> {
 
     let mut extra_blockers = evidence_commit_consistency_blockers(&evidence_commit_bindings);
     extra_blockers.extend(compat_summary_arch_coverage_blockers(&compat_arch_claims));
+    withhold_release_compatibility_dimensions(&mut dimensions);
+    extra_blockers.push(Blocker {
+        severity: Severity::P0,
+        kind: BlockerKind::CompatibilityNotProven,
+        dimension_id: None,
+        message: "release-grade Rust compatibility lacks independent execution and complete-denominator attestation".to_string(),
+        action: "Keep upstream-compat summaries diagnostic until a Rust-owned, independently checked full-suite execution and denominator attestation is bound to the reviewed commit and both native targets.".to_string(),
+    });
 
     Ok(evaluate_suite_with_extra_blockers(
         suite_id,
@@ -1896,6 +1961,28 @@ fn build_report(args: &RustVsTrustArgs) -> Result<RustVsTrustReport> {
         compat_ingest,
         extra_blockers,
     ))
+}
+
+fn withhold_release_compatibility_dimensions(dimensions: &mut [DimensionInput]) {
+    for dimension in dimensions {
+        if dimension.category != DimensionCategory::Compatibility
+            && !dimension.id.starts_with("compat.")
+            && !dimension.id.ends_with(".compatibility")
+        {
+            continue;
+        }
+        dimension.category = DimensionCategory::Compatibility;
+        dimension.required = true;
+        dimension.rust_value = None;
+        dimension.trust_value = None;
+        if dimension.status != Some(DeclaredStatus::Fail) {
+            dimension.status = Some(DeclaredStatus::Unknown);
+            dimension.ai_hint = Some(
+                "Bind independent Rust-owned full-suite execution and a complete pinned denominator before claiming this compatibility dimension."
+                    .to_string(),
+            );
+        }
+    }
 }
 
 fn read_suite(path: &Path) -> Result<SuiteInput> {
@@ -2013,9 +2100,9 @@ fn read_compat_summary(
             CompatibilityOutcomeInput::Compatible => {
                 compatible += 1;
                 (
-                    DeclaredStatus::Pass,
+                    DeclaredStatus::Unknown,
                     format!("{} compatibility", row.baseline_entry_id),
-                    "Keep this compatibility row green on every reviewed commit.".to_string(),
+                    "Authored compatible rows are diagnostic until independent full-suite execution and denominator attestation is checked.".to_string(),
                 )
             }
             CompatibilityOutcomeInput::Unknown => {
@@ -2030,9 +2117,9 @@ fn read_compat_summary(
             CompatibilityOutcomeInput::Excepted if allow_exceptions => {
                 non_compatible += 1;
                 (
-                    DeclaredStatus::Pass,
+                    DeclaredStatus::Unknown,
                     format!("{} compatibility excepted", row.baseline_entry_id),
-                    "Draft mode accepted this exception; remove it before public superiority claims."
+                    "Draft mode records this exception; it cannot establish release compatibility."
                         .to_string(),
                 )
             }
@@ -2303,9 +2390,10 @@ fn validate_compat_summary_provenance(
         Some(runner)
             if compatibility_runner_is_trust_owned(runner)
                 && compatibility_runner_declares_release_argv(runner)
-                && compatibility_runner_release_contract_satisfied(runner) => {}
+                && compatibility_runner_release_contract_satisfied(runner)
+                && compatibility_runner_has_upstream_scope(runner) => {}
         Some(_) => blockers.push(
-            "runner must declare python_used=false, a Rust-owned trust-upstream-compat entrypoint, release argv with --release --proof-mode full --execute --summary-out, and release_evidence_contract.satisfied=true"
+            "runner must declare python_used=false, a Rust-owned trust-upstream-compat entrypoint, release argv with --release --proof-scope upstream-rust --proof-mode full --execute --summary-out, release_evidence_contract.satisfied=true, and upstream-only proof totals"
                 .to_string(),
         ),
         None => blockers.push("runner must be present".to_string()),
@@ -2337,6 +2425,7 @@ fn compatibility_runner_declares_release_argv(runner: &Value) -> bool {
         return false;
     }
     tokens_contain_sequence(&tokens, &["--release"])
+        && tokens_contain_sequence(&tokens, &["--proof-scope", "upstream-rust"])
         && tokens_contain_sequence(&tokens, &["--proof-mode", "full"])
         && tokens_contain_sequence(&tokens, &["--execute"])
         && tokens_contain_sequence(&tokens, &["--summary-out"])
@@ -2355,6 +2444,17 @@ fn compatibility_runner_release_contract_satisfied(runner: &Value) -> bool {
         && contract.get("execute").and_then(Value::as_bool) == Some(true)
         && value_at(contract, "proof_mode") == Some("full")
         && value_at(contract, "summary_out").is_some_and(|value| !value.trim().is_empty())
+}
+
+fn compatibility_runner_has_upstream_scope(runner: &Value) -> bool {
+    let totals = runner.get("proof_totals").unwrap_or(&Value::Null);
+    let upstream = totals.get("upstream").and_then(Value::as_u64).unwrap_or(0);
+    value_at(runner, "proof_scope") == Some("upstream_rust")
+        && value_at(runner.get("release_evidence_contract").unwrap_or(&Value::Null), "proof_scope")
+            == Some("upstream_rust")
+        && upstream > 0
+        && totals.get("total").and_then(Value::as_u64) == Some(upstream)
+        && totals.get("trust_added").and_then(Value::as_u64) == Some(0)
 }
 
 #[derive(Clone, Copy)]
@@ -2510,7 +2610,7 @@ fn trim_runner_quotes(value: &str) -> &str {
 }
 
 fn runner_path_basename(value: &str) -> &str {
-    value.rsplit(|ch| matches!(ch, '/' | ':')).next().unwrap_or(value)
+    value.rsplit(['/', ':']).next().unwrap_or(value)
 }
 
 fn is_python_command_name(command: &str) -> bool {
@@ -2675,26 +2775,22 @@ fn compatibility_aggregate_dimension(
     unknown: u64,
 ) -> DimensionInput {
     let rows = passed + failed + unknown;
-    let status = if rows == 0 || unknown > 0 {
-        DeclaredStatus::Unknown
-    } else if failed > 0 {
-        DeclaredStatus::Fail
+    let (status, ai_hint) = if failed > 0 {
+        (
+            DeclaredStatus::Fail,
+            format!(
+                "Fix {} upstream-compat failures before claiming Rust compatibility.",
+                arch.label()
+            ),
+        )
     } else {
-        DeclaredStatus::Pass
-    };
-    let ai_hint = match status {
-        DeclaredStatus::Pass => format!(
-            "Keep the {} upstream-compat summary green for every reviewed commit.",
-            arch.label()
-        ),
-        DeclaredStatus::Fail => format!(
-            "Fix {} upstream-compat failures before claiming Rust compatibility.",
-            arch.label()
-        ),
-        DeclaredStatus::Unknown => format!(
-            "Rerun the {} upstream-compat gate until every row is classified.",
-            arch.label()
-        ),
+        (
+            DeclaredStatus::Unknown,
+            format!(
+                "Bind independent execution and complete-denominator attestation for {} compatibility.",
+                arch.label()
+            ),
+        )
     };
     DimensionInput {
         id: arch.compat_dimension_id().to_string(),
@@ -2810,9 +2906,8 @@ fn read_proof_functional_program_index_report(path: &Path) -> Result<DimensionIn
     validate_frontend_lowering_rows(&report, &proof_rows, &mut blockers);
     let observed = summarize_proof_functional_rows(&proof_rows, corpus_proof_design, &mut blockers);
 
-    let status = if blockers.is_empty() {
-        DeclaredStatus::Pass
-    } else if observed.rows == 0 || observed.good_rows == 0 || observed.flawed_rows == 0 {
+    blockers.push(PROOF_FUNCTIONAL_V1_ADMISSION_BLOCKER.to_string());
+    let status = if observed.rows == 0 || observed.good_rows == 0 || observed.flawed_rows == 0 {
         DeclaredStatus::Unknown
     } else {
         DeclaredStatus::Fail
@@ -2832,14 +2927,10 @@ fn read_proof_functional_program_index_report(path: &Path) -> Result<DimensionIn
         observed.runtime_checked_obligations,
         blockers.len()
     )];
-    let ai_hint = if blockers.is_empty() {
-        "Keep this proof-design program-index report fresh for the reviewed commit.".to_string()
-    } else {
-        format!(
-            "Rerun `{PROOF_FUNCTIONAL_EVIDENCE_COMMAND}` and provide a report with clean proof-design trust-verify observations. Blockers: {}",
-            blockers.join("; ")
-        )
-    };
+    let ai_hint = format!(
+        "Rerun `{PROOF_FUNCTIONAL_EVIDENCE_COMMAND}` and provide a report with clean proof-design trust-verify observations. Blockers: {}",
+        blockers.join("; ")
+    );
 
     Ok(DimensionInput {
         id: PROOF_FUNCTIONAL_DIMENSION_ID.to_string(),
@@ -2851,12 +2942,8 @@ fn read_proof_functional_program_index_report(path: &Path) -> Result<DimensionIn
                 .to_string(),
         ),
         required: true,
-        rust_value: if status == DeclaredStatus::Pass { Some(0.0) } else { None },
-        trust_value: if status == DeclaredStatus::Pass {
-            Some(observed.passed_observations as f64)
-        } else {
-            None
-        },
+        rust_value: None,
+        trust_value: None,
         higher_is_better: Some(true),
         min_trust_delta_pct: None,
         max_trust_regression_pct: None,
@@ -2896,9 +2983,14 @@ fn read_proof_unsafe_memory_report(path: &Path) -> Result<DimensionInput> {
     if report.repo_dirty {
         blockers.push("repo_dirty must be false".to_string());
     }
+    validate_proof_unsafe_memory_tree_binding(path, &report, &mut blockers);
     validate_proof_unsafe_memory_producer(&report.producer, &mut blockers);
     validate_proof_unsafe_memory_artifact_binding(path, &report, &mut blockers);
     validate_proof_unsafe_memory_coverage(&report.coverage, &mut blockers);
+    blockers.push(
+        "unsafe-memory source-policy census and source-operation-to-obligation reconciliation are not authenticated by this report schema"
+            .to_string(),
+    );
     if !report.unsupported.is_empty() {
         blockers.push(format!(
             "unsupported must be empty, got {} entr{}",
@@ -2928,7 +3020,7 @@ fn read_proof_unsafe_memory_report(path: &Path) -> Result<DimensionInput> {
         "Keep the unsafe-memory proof report fresh for the reviewed commit.".to_string()
     } else {
         format!(
-            "Rerun `{PROOF_UNSAFE_MEMORY_EVIDENCE_COMMAND}` and regenerate {PROOF_UNSAFE_MEMORY_REPORT_SCHEMA}. Blockers: {}",
+            "Bind a compiler-owned unsafe source census and source-operation-to-obligation reconciliation, then regenerate {PROOF_UNSAFE_MEMORY_REPORT_SCHEMA}. Blockers: {}",
             blockers.join("; ")
         )
     };
@@ -2960,6 +3052,77 @@ fn read_proof_unsafe_memory_report(path: &Path) -> Result<DimensionInput> {
         owner: None,
         evidence_source: DimensionEvidenceSource::ProofUnsafeMemoryReport,
     })
+}
+
+fn validate_proof_unsafe_memory_tree_binding(
+    report_path: &Path,
+    report: &ProofUnsafeMemoryReportInput,
+    blockers: &mut Vec<String>,
+) {
+    if !is_full_git_sha(&report.candidate_tree) {
+        blockers.push(format!(
+            "candidate_tree must be a full git SHA, got `{}`",
+            report.candidate_tree
+        ));
+        return;
+    }
+    if !is_full_git_sha(&report.candidate_commit) {
+        return;
+    }
+
+    let report_dir = report_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let repo_root = match crate::controlled_git::resolve_repo_root(report_dir) {
+        Ok(root) => root,
+        Err(error) => {
+            blockers.push(format!("candidate_tree repository could not be resolved: {error}"));
+            return;
+        }
+    };
+    let candidate_commit = report.candidate_commit.to_ascii_lowercase();
+    match crate::controlled_git::text(
+        &repo_root,
+        &["cat-file", "-t", &candidate_commit],
+        "unsafe-memory candidate commit type probe",
+        IDENTITY_PROBE_MAX_STREAM_BYTES,
+        IDENTITY_PROBE_TIMEOUT,
+    ) {
+        Ok(kind) if kind == "commit" => {}
+        Ok(kind) => {
+            blockers.push(format!("candidate_commit must name a commit object, got `{kind}`"));
+            return;
+        }
+        Err(error) => {
+            blockers.push(format!("candidate_commit object could not be resolved: {error}"));
+            return;
+        }
+    }
+    let revision = format!("{candidate_commit}^{{tree}}");
+    let expected_tree = match crate::controlled_git::text(
+        &repo_root,
+        &["rev-parse", "--verify", &revision],
+        "unsafe-memory candidate tree probe",
+        IDENTITY_PROBE_MAX_STREAM_BYTES,
+        IDENTITY_PROBE_TIMEOUT,
+    ) {
+        Ok(tree) if is_full_git_sha(&tree) => tree,
+        Ok(tree) => {
+            blockers.push(format!("candidate_commit resolved to an invalid tree `{tree}`"));
+            return;
+        }
+        Err(error) => {
+            blockers.push(format!("candidate_commit tree could not be resolved: {error}"));
+            return;
+        }
+    };
+    if !report.candidate_tree.eq_ignore_ascii_case(&expected_tree) {
+        blockers.push(format!(
+            "candidate_tree `{}` does not match candidate_commit tree `{expected_tree}`",
+            report.candidate_tree
+        ));
+    }
 }
 
 fn validate_proof_unsafe_memory_producer(
@@ -3233,6 +3396,7 @@ fn validate_frontend_lowering_rows(report: &Value, rows: &[&Value], blockers: &m
 }
 
 fn validate_program_index_domination_evidence(report: &Value, blockers: &mut Vec<String>) {
+    blockers.push(PROGRAM_INDEX_DOMINATION_AUTHENTICATION_BLOCKER.to_string());
     let evidence = report.get("program_index_evidence").unwrap_or(&Value::Null);
     if !evidence.is_object() {
         blockers.push(
@@ -3273,6 +3437,15 @@ fn validate_program_index_domination_evidence(report: &Value, blockers: &mut Vec
     if proof_design_count == 0 {
         blockers.push(format!(
             "program_index_evidence.selected_suite_counts.{PROOF_FUNCTIONAL_SUITE} must be positive"
+        ));
+    }
+    let declared_proof_design_rows = json_u64(evidence, "declared_proof_design_rows");
+    if evidence.get("proof_design_corpus_complete").and_then(Value::as_bool) != Some(true)
+        || declared_proof_design_rows == 0
+        || declared_proof_design_rows != proof_design_count
+    {
+        blockers.push(format!(
+            "program_index_evidence must bind the complete declared proof-design corpus (declared={declared_proof_design_rows}, selected={proof_design_count})"
         ));
     }
 
@@ -4366,6 +4539,11 @@ fn read_program_index_runtime_binary_report(path: &Path) -> Result<Vec<Dimension
     }
 
     let mut summary = summarize_program_index_runtime_binary_report(&report);
+    // Report fields can describe measurements, but cannot authenticate their source or execution.
+    push_all_strict_performance_blockers(
+        &mut summary,
+        PROGRAM_INDEX_DOMINATION_AUTHENTICATION_BLOCKER.to_string(),
+    );
     summary.runtime_blockers.extend(target_blockers.iter().cloned());
     summary.binary_blockers.extend(target_blockers.iter().cloned());
     summary.clean_compile.blockers.extend(target_blockers.iter().cloned());
@@ -4563,6 +4741,12 @@ fn strict_performance_common_blockers(
         );
     }
     let candidate_rejection = evidence.get("candidate_rejection").unwrap_or(&Value::Null);
+    if value_at(candidate_rejection, "status") != Some("admissible") {
+        blockers.push(
+            "strict_superiority_performance_evidence.candidate_rejection.status must be admissible"
+                .to_string(),
+        );
+    }
     if candidate_rejection.get("rejected").and_then(Value::as_bool) != Some(false) {
         blockers.push(
             "strict_superiority_performance_evidence.candidate_rejection.rejected must be false"
@@ -4874,10 +5058,10 @@ fn summarize_program_index_runtime_binary_report(
                         .push(format!("{key}: duplicate baseline runtime row"));
                 }
             }
-            Some(PROGRAM_INDEX_RUNTIME_TRUST_SLOT) => {
-                if trust_rows.insert(key.clone(), row).is_some() {
-                    observed.runtime_blockers.push(format!("{key}: duplicate Trust runtime row"));
-                }
+            Some(PROGRAM_INDEX_RUNTIME_TRUST_SLOT)
+                if trust_rows.insert(key.clone(), row).is_some() =>
+            {
+                observed.runtime_blockers.push(format!("{key}: duplicate Trust runtime row"));
             }
             _ => {}
         }
@@ -6542,9 +6726,8 @@ fn read_product_proof_release_report(path: &Path) -> Result<DimensionInput> {
         }
     }
 
-    let status = if blockers.is_empty() {
-        DeclaredStatus::Pass
-    } else if product_proof_gate.is_none() || binary_decomp_component.is_none() {
+    blockers.push(PRODUCT_PROOF_RELEASE_V1_REPLAY_BLOCKER.to_string());
+    let status = if product_proof_gate.is_none() || binary_decomp_component.is_none() {
         DeclaredStatus::Unknown
     } else {
         DeclaredStatus::Fail
@@ -6559,8 +6742,8 @@ fn read_product_proof_release_report(path: &Path) -> Result<DimensionInput> {
                 .to_string(),
         ),
         required: true,
-        rust_value: if status == DeclaredStatus::Pass { Some(0.0) } else { None },
-        trust_value: if status == DeclaredStatus::Pass { Some(1.0) } else { None },
+        rust_value: None,
+        trust_value: None,
         higher_is_better: Some(true),
         min_trust_delta_pct: None,
         max_trust_regression_pct: None,
@@ -6575,14 +6758,10 @@ fn read_product_proof_release_report(path: &Path) -> Result<DimensionInput> {
             COMPILE_BACK_REQUIRED_EVIDENCE.len(),
             blockers.len()
         )],
-        ai_hint: Some(if blockers.is_empty() {
-            "Keep the product-proof release report fresh for the reviewed commit.".to_string()
-        } else {
-            format!(
-                "Rerun `targo trust release check --profile product-proof --visibility public --json` with accepted binary/decomp compile-back evidence. Blockers: {}",
-                blockers.join("; ")
-            )
-        }),
+        ai_hint: Some(format!(
+            "The v1 release report is diagnostic only. Blockers: {}",
+            blockers.join("; ")
+        )),
         owner: None,
         evidence_source: DimensionEvidenceSource::ProductProofReleaseReport,
     })
@@ -7684,6 +7863,8 @@ fn evidence_requirements() -> EvidenceRequirements {
                 "dry-run report",
                 "missing proof-design trust-verify rows",
                 "program_index_evidence missing or not admissible_for_domination",
+                "proof-design selection does not match the complete declared corpus",
+                "canonical candidate-commit roster, source bytes, unique results, and verifier captures are not independently authenticated",
                 "candidate or non-gating program-index rows selected",
                 "summary failed/skipped/planned/excepted rows",
                 "zero transport obligations",
@@ -7717,12 +7898,14 @@ fn evidence_requirements() -> EvidenceRequirements {
                 "manual or stale dimension without current unsafe-memory proof report JSON",
                 "wrong schema",
                 "candidate_commit missing or not a full SHA",
+                "candidate_tree missing or not bound to candidate_commit",
                 "repo_dirty not false",
                 "producer.native not true",
                 "producer.command not exactly targo trust report --unsafe-memory",
                 "proof_report_path unsafe, missing, or not hash-bound",
                 "proof_report_hash mismatch",
                 "coverage totals missing, zero, or not fully proved",
+                "authenticated unsafe source census and operation-to-obligation reconciliation unavailable",
                 "unsupported not empty",
                 "reviewed-commit mismatch with other supplied evidence reports",
             ],
@@ -7788,6 +7971,15 @@ fn evidence_requirements() -> EvidenceRequirements {
     }
 }
 
+fn is_program_index_performance_dimension(id: &str) -> bool {
+    [LaunchArch::Aarch64, LaunchArch::X86_64].into_iter().any(|arch| {
+        id == arch.runtime_dimension_id()
+            || id == arch.binary_size_dimension_id()
+            || id == arch.clean_compile_dimension_id()
+            || id == arch.incremental_compile_dimension_id()
+    })
+}
+
 fn evaluate_dimension(input: &DimensionInput, policy: &EffectivePolicy) -> DimensionReport {
     let mut blockers = Vec::new();
     let evidence_missing = input.required
@@ -7795,6 +7987,9 @@ fn evaluate_dimension(input: &DimensionInput, policy: &EffectivePolicy) -> Dimen
         && input.evidence.iter().all(|item| item.trim().is_empty());
     let proof_functional_without_program_index_evidence = input.id == PROOF_FUNCTIONAL_DIMENSION_ID
         && input.evidence_source != DimensionEvidenceSource::ProgramIndexProofReport;
+    let performance_without_program_index_report =
+        is_program_index_performance_dimension(&input.id)
+            && input.evidence_source != DimensionEvidenceSource::ProgramIndexRuntimeBinaryReport;
     let proof_unsafe_memory_without_report_evidence = input.id == PROOF_UNSAFE_MEMORY_DIMENSION_ID
         && input.evidence_source != DimensionEvidenceSource::ProofUnsafeMemoryReport;
     let proof_concurrency_without_report_evidence = input.id == PROOF_CONCURRENCY_DIMENSION_ID
@@ -7802,7 +7997,9 @@ fn evaluate_dimension(input: &DimensionInput, policy: &EffectivePolicy) -> Dimen
     let product_proof_without_release_report_evidence = input.id
         == PRODUCT_PROOF_BINARY_ROUNDTRIP_DIMENSION_ID
         && input.evidence_source != DimensionEvidenceSource::ProductProofReleaseReport;
+    let manual_evidence_source = input.evidence_source == DimensionEvidenceSource::Manual;
     let requires_structured_proof_evidence = proof_functional_without_program_index_evidence
+        || performance_without_program_index_report
         || proof_unsafe_memory_without_report_evidence
         || proof_concurrency_without_report_evidence
         || product_proof_without_release_report_evidence;
@@ -7831,6 +8028,18 @@ fn evaluate_dimension(input: &DimensionInput, policy: &EffectivePolicy) -> Dimen
             action: format!(
                 "Run `{PROOF_FUNCTIONAL_EVIDENCE_COMMAND}` and pass its JSON report with {PROOF_FUNCTIONAL_REPORT_FLAG}."
             ),
+        });
+    }
+    if performance_without_program_index_report {
+        blockers.push(Blocker {
+            severity: Severity::P1,
+            kind: BlockerKind::UnknownResult,
+            dimension_id: Some(input.id.clone()),
+            message: format!(
+                "required dimension `{}` needs authenticated program-index benchmark evidence",
+                input.id
+            ),
+            action: PROGRAM_INDEX_DOMINATION_AUTHENTICATION_BLOCKER.to_string(),
         });
     }
     if proof_unsafe_memory_without_report_evidence {
@@ -7875,7 +8084,6 @@ fn evaluate_dimension(input: &DimensionInput, policy: &EffectivePolicy) -> Dimen
             ),
         });
     }
-
     let higher_is_better = input.higher_is_better.unwrap_or(match input.metric {
         Some(MetricKind::LatencyMs | MetricKind::BinarySizeBytes | MetricKind::MemoryBytes) => {
             false
@@ -7892,18 +8100,6 @@ fn evaluate_dimension(input: &DimensionInput, policy: &EffectivePolicy) -> Dimen
     let mut status = DimensionStatus::Unknown;
 
     match input.status {
-        Some(DeclaredStatus::Pass) => {
-            status =
-                if evidence_missing { DimensionStatus::Unknown } else { DimensionStatus::Pass };
-            if let (Some(rust), Some(trust)) = (input.rust_value, input.trust_value) {
-                if rust.is_finite() && trust.is_finite() {
-                    let comparison = compare_values(rust, trust, higher_is_better);
-                    delta_pct = comparison.delta_pct;
-                    trust_is_better = comparison.trust_is_better;
-                    trust_is_worse = comparison.trust_is_worse;
-                }
-            }
-        }
         Some(DeclaredStatus::Fail) => {
             status = DimensionStatus::Fail;
             blockers.push(Blocker {
@@ -7938,7 +8134,7 @@ fn evaluate_dimension(input: &DimensionInput, policy: &EffectivePolicy) -> Dimen
                 });
             }
         }
-        None => match (input.rust_value, input.trust_value) {
+        Some(DeclaredStatus::Pass) | None => match (input.rust_value, input.trust_value) {
             (Some(rust), Some(trust)) if rust.is_finite() && trust.is_finite() => {
                 let comparison = compare_values(rust, trust, higher_is_better);
                 delta_pct = comparison.delta_pct;
@@ -8003,6 +8199,23 @@ fn evaluate_dimension(input: &DimensionInput, policy: &EffectivePolicy) -> Dimen
                         .to_string(),
                 });
             }
+            (None, None) if input.status == Some(DeclaredStatus::Pass) => {
+                status =
+                    if evidence_missing { DimensionStatus::Unknown } else { DimensionStatus::Pass };
+            }
+            (Some(_), None) | (None, Some(_)) if input.status == Some(DeclaredStatus::Pass) => {
+                blockers.push(Blocker {
+                    severity: Severity::P1,
+                    kind: BlockerKind::InconsistentEvidence,
+                    dimension_id: Some(input.id.clone()),
+                    message: format!(
+                        "declared-pass dimension `{}` has only one numeric comparison value",
+                        input.id
+                    ),
+                    action: "Provide both rust_value and trust_value, or omit both for a status-only result."
+                        .to_string(),
+                });
+            }
             _ => {
                 blockers.push(Blocker {
                     severity: Severity::P1,
@@ -8021,8 +8234,23 @@ fn evaluate_dimension(input: &DimensionInput, policy: &EffectivePolicy) -> Dimen
         },
     }
 
+    if manual_evidence_source && status == DimensionStatus::Pass {
+        if !requires_structured_proof_evidence {
+            blockers.push(Blocker {
+                severity: Severity::P1,
+                kind: BlockerKind::UnknownResult,
+                dimension_id: Some(input.id.clone()),
+                message: format!("dimension `{}` has only manual suite evidence", input.id),
+                action: "Provide a Trust-owned authenticated structured report; authored statuses, scores, and command lists remain diagnostic only."
+                    .to_string(),
+            });
+        }
+        status = DimensionStatus::Unknown;
+    }
     if requires_structured_proof_evidence && status == DimensionStatus::Pass {
         status = DimensionStatus::Unknown;
+    }
+    if status == DimensionStatus::Unknown {
         delta_pct = None;
         trust_is_better = false;
         trust_is_worse = false;
@@ -8182,7 +8410,10 @@ fn summarize(reports: &[DimensionReport]) -> RustVsTrustSummary {
             DimensionStatus::Fail => summary.failed += 1,
             DimensionStatus::Unknown => summary.unknown += 1,
         }
-        if report.trust_is_better {
+        if report.status == DimensionStatus::Pass
+            && report.blockers.is_empty()
+            && report.trust_is_better
+        {
             summary.trust_advantage_dimensions += 1;
         }
         if report.blockers.iter().any(|blocker| blocker.kind == BlockerKind::MissingEvidence) {
@@ -8205,6 +8436,9 @@ fn summarize(reports: &[DimensionReport]) -> RustVsTrustSummary {
 }
 
 fn relative_dimension_value(report: &DimensionReport) -> f64 {
+    if report.status != DimensionStatus::Pass || !report.blockers.is_empty() {
+        return 0.0;
+    }
     match (report.rust_value, report.trust_value) {
         (Some(rust), Some(trust)) => {
             if report.trust_is_better {
@@ -8628,6 +8862,8 @@ mod tests {
             "program_index_evidence": {
                 "model_source": "index.suite_evidence_model",
                 "status": "admissible",
+                "declared_proof_design_rows": rows.len(),
+                "proof_design_corpus_complete": true,
                 "selected_programs": rows.len(),
                 "selected_pairs": 1,
                 "selected_candidate_rows": 0,
@@ -8761,16 +8997,28 @@ mod tests {
         })
     }
 
-    fn proof_row(
-        program_id: &str,
-        variant: &str,
-        observed: &str,
+    struct ProofRowInput<'a> {
+        program_id: &'a str,
+        variant: &'a str,
+        observed: &'a str,
         total: u64,
         proved: u64,
         failed: u64,
         unknown: u64,
         runtime_checked: u64,
-    ) -> Value {
+    }
+
+    fn proof_row(input: ProofRowInput<'_>) -> Value {
+        let ProofRowInput {
+            program_id,
+            variant,
+            observed,
+            total,
+            proved,
+            failed,
+            unknown,
+            runtime_checked,
+        } = input;
         serde_json::json!({
             "program_id": program_id,
             "pair_id": "proof_div_zero",
@@ -9322,17 +9570,17 @@ mod tests {
         let rows = report["results"].as_array().cloned().unwrap_or_default();
         let rust = strict_compile_slot_fixture(&rows, PROGRAM_INDEX_RUNTIME_BASELINE_SLOT, mode);
         let trust = strict_compile_slot_fixture(&rows, PROGRAM_INDEX_RUNTIME_TRUST_SLOT, mode);
-        strict_lane_fixture(
+        strict_lane_fixture(StrictLaneFixtureInput {
             lane_id,
             description,
-            mode.required_build_profile_fixture(),
-            Some(mode.expected_profile_mode()),
-            "duration_seconds",
+            required_build_profile: mode.required_build_profile_fixture(),
+            required_compile_measurement_mode: Some(mode.expected_profile_mode()),
+            metric: "duration_seconds",
             target_arch,
             target_triple,
             rust,
-            trust,
-        )
+            trust_slot: trust,
+        })
     }
 
     fn strict_runtime_lane_fixture(
@@ -9346,30 +9594,43 @@ mod tests {
         let rows = report["runtime_parity"]["rows"].as_array().cloned().unwrap_or_default();
         let rust = strict_runtime_slot_fixture(&rows, PROGRAM_INDEX_RUNTIME_BASELINE_SLOT, metric);
         let trust = strict_runtime_slot_fixture(&rows, PROGRAM_INDEX_RUNTIME_TRUST_SLOT, metric);
-        strict_lane_fixture(
+        strict_lane_fixture(StrictLaneFixtureInput {
             lane_id,
             description,
-            "release",
-            None,
+            required_build_profile: "release",
+            required_compile_measurement_mode: None,
             metric,
             target_arch,
             target_triple,
             rust,
-            trust,
-        )
+            trust_slot: trust,
+        })
     }
 
-    fn strict_lane_fixture(
-        lane_id: &str,
-        description: &str,
-        required_build_profile: &str,
-        required_compile_measurement_mode: Option<&str>,
-        metric: &str,
-        target_arch: &str,
-        target_triple: Option<&str>,
+    struct StrictLaneFixtureInput<'a> {
+        lane_id: &'a str,
+        description: &'a str,
+        required_build_profile: &'a str,
+        required_compile_measurement_mode: Option<&'a str>,
+        metric: &'a str,
+        target_arch: &'a str,
+        target_triple: Option<&'a str>,
         rust: Value,
         trust_slot: Value,
-    ) -> Value {
+    }
+
+    fn strict_lane_fixture(input: StrictLaneFixtureInput<'_>) -> Value {
+        let StrictLaneFixtureInput {
+            lane_id,
+            description,
+            required_build_profile,
+            required_compile_measurement_mode,
+            metric,
+            target_arch,
+            target_triple,
+            rust,
+            trust_slot,
+        } = input;
         let rust_value = positive_number_value(&rust["value"]);
         let trust_value = positive_number_value(&trust_slot["value"]);
         let measured = rust_value.is_some() && trust_value.is_some();
@@ -9552,12 +9813,16 @@ mod tests {
         serde_json::json!({
             "implementation": "rust",
             "entrypoint": "targo trust domination upstream-tests",
+            "proof_scope": "upstream_rust",
+            "proof_totals": { "total": 2, "upstream": 2, "trust_added": 0 },
             "argv": [
                 "targo",
                 "trust",
                 "domination",
                 "upstream-tests",
                 "--release",
+                "--proof-scope",
+                "upstream-rust",
                 "--proof-mode",
                 "full",
                 "--execute",
@@ -9569,6 +9834,7 @@ mod tests {
                 "release": true,
                 "execute": true,
                 "proof_mode": "full",
+                "proof_scope": "upstream_rust",
                 "summary_out": "reports/upstream-rust/summary.json",
                 "requires_release": true,
                 "requires_execute": true,
@@ -9579,6 +9845,46 @@ mod tests {
             "python_used": false,
             "tool": "trust-upstream-compat"
         })
+    }
+
+    #[test]
+    fn compat_summary_rejects_wrong_upstream_proof_scope_or_totals() {
+        let root = temp_repo_root("compat-summary-wrong-proof-scope");
+        let path = root.join("summary.json");
+        for mutation in ["runner", "contract", "argv", "totals"] {
+            let mut runner = rust_upstream_compat_runner();
+            match mutation {
+                "runner" => runner["proof_scope"] = serde_json::json!("combined"),
+                "contract" => {
+                    runner["release_evidence_contract"]["proof_scope"] =
+                        serde_json::json!("combined")
+                }
+                "argv" => {
+                    runner["argv"] = serde_json::json!([
+                        "targo",
+                        "trust",
+                        "domination",
+                        "upstream-tests",
+                        "--release",
+                        "--proof-mode",
+                        "full",
+                        "--execute",
+                        "--summary-out",
+                        "reports/upstream-rust/summary.json"
+                    ])
+                }
+                "totals" => runner["proof_totals"]["trust_added"] = serde_json::json!(1),
+                _ => unreachable!(),
+            }
+            write_json(&path, &compatibility_summary_report_with_runner(runner));
+            let error = read_compat_summary(&path, false)
+                .expect_err("scope or total mismatch must block upstream compatibility evidence");
+            assert!(
+                error.to_string().contains("upstream-only proof totals"),
+                "{mutation}: {error}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     fn rust_vs_trust_args_with_compat_summaries(compat_summary: Vec<PathBuf>) -> RustVsTrustArgs {
@@ -9651,7 +9957,7 @@ mod tests {
     }
 
     #[test]
-    fn domination_accepts_multiple_arch_compatibility_summaries() {
+    fn domination_withholds_authored_multi_arch_compatibility_summaries() {
         let root = temp_repo_root("domination-multiple-compat-summaries");
         let aarch64_path = root.join("compat-aarch64.json");
         let x86_path = root.join("compat-x86.json");
@@ -9674,13 +9980,111 @@ mod tests {
             blocker.kind == BlockerKind::CompatibilityNotProven
                 && blocker.message.contains("release-grade upstream compatibility")
         }));
-        assert!(report.dimensions.iter().any(|dimension| {
-            dimension.id == "compat.aarch64.toolchain" && dimension.status == DimensionStatus::Pass
+        for id in ["compat.aarch64.toolchain", "compat.x86_64.toolchain"] {
+            assert!(report.dimensions.iter().any(|dimension| {
+                dimension.id == id && dimension.status == DimensionStatus::Unknown
+            }));
+        }
+        assert!(report.blockers.iter().any(|blocker| {
+            blocker.kind == BlockerKind::CompatibilityNotProven
+                && blocker.message.contains("independent execution and complete-denominator")
         }));
-        assert!(report.dimensions.iter().any(|dimension| {
-            dimension.id == "compat.x86_64.toolchain" && dimension.status == DimensionStatus::Pass
-        }));
+        assert_ne!(report.verdict, Verdict::Superior);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn domination_withholds_authored_compatibility_suite_with_relaxed_policy() {
+        let root = temp_repo_root("domination-authored-compat-suite");
+        let suite = root.join("suite.json");
+        write_json(
+            &suite,
+            &serde_json::json!({
+                "schema_version": SUITE_SCHEMA_VERSION,
+                "policy": {
+                    "require_no_unknowns": false,
+                    "require_compatibility_floor": false,
+                    "require_evidence_for_required": false,
+                    "require_trust_advantage": false
+                },
+                "dimensions": [
+                    {
+                        "id": "compat.x86_64.toolchain",
+                        "title": "spoofed x86 compatibility",
+                        "category": "feature",
+                        "required": false,
+                        "status": "pass",
+                        "evidence": ["hand-authored pass"]
+                    },
+                    {
+                        "id": "toolchain.rustc.compatibility",
+                        "title": "spoofed built-in compatibility id",
+                        "category": "feature",
+                        "required": false,
+                        "status": "pass",
+                        "evidence": ["hand-authored pass"]
+                    },
+                    {
+                        "id": "suite.parity",
+                        "title": "compatibility category with arbitrary id",
+                        "category": "compatibility",
+                        "required": false,
+                        "status": "pass",
+                        "evidence": ["hand-authored pass"]
+                    }
+                ]
+            }),
+        );
+        let mut args = rust_vs_trust_args_with_compat_summaries(Vec::new());
+        args.suite = Some(suite);
+        args.allow_missing_evidence = true;
+        let report = build_report(&args).expect("authored suite should yield a refused report");
+        for id in ["compat.x86_64.toolchain", "toolchain.rustc.compatibility", "suite.parity"] {
+            let dimension = report.dimensions.iter().find(|dimension| dimension.id == id).unwrap();
+            assert_eq!(dimension.category, DimensionCategory::Compatibility);
+            assert!(dimension.required);
+            assert_eq!(dimension.status, DimensionStatus::Unknown);
+        }
+        assert!(report.blockers.iter().any(|blocker| {
+            blocker.kind == BlockerKind::CompatibilityNotProven
+                && blocker.message.contains("independent execution and complete-denominator")
+        }));
+        assert_ne!(report.verdict, Verdict::Superior);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn domination_blocks_suite_that_omits_compatibility() {
+        let root = temp_repo_root("domination-omitted-compat-suite");
+        let suite = root.join("suite.json");
+        write_json(
+            &suite,
+            &serde_json::json!({
+                "schema_version": SUITE_SCHEMA_VERSION,
+                "policy": {
+                    "require_no_unknowns": false,
+                    "require_compatibility_floor": false,
+                    "require_trust_advantage": false
+                },
+                "dimensions": [{
+                    "id": "feature.only",
+                    "title": "feature only",
+                    "category": "feature",
+                    "status": "pass",
+                    "evidence": ["hand-authored pass"]
+                }]
+            }),
+        );
+        let mut args = rust_vs_trust_args_with_compat_summaries(Vec::new());
+        args.suite = Some(suite);
+        let report =
+            build_report(&args).expect("omitted compatibility should yield a refused report");
+        assert!(report.blockers.iter().any(|blocker| {
+            blocker.kind == BlockerKind::CompatibilityNotProven
+                && blocker.message.contains("independent execution and complete-denominator")
+        }));
+        assert_ne!(report.verdict, Verdict::Superior);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9874,6 +10278,20 @@ mod tests {
         }
     }
 
+    fn assert_product_proof_v1_replay_only_block(dimension: &DimensionInput) {
+        assert_eq!(dimension.status, Some(DeclaredStatus::Fail));
+        assert_eq!(dimension.rust_value, None);
+        assert_eq!(dimension.trust_value, None);
+        assert_eq!(
+            dimension.ai_hint.as_deref(),
+            Some(format!(
+                "The v1 release report is diagnostic only. Blockers: {PRODUCT_PROOF_RELEASE_V1_REPLAY_BLOCKER}"
+            ))
+            .as_deref()
+        );
+        assert!(dimension.evidence.iter().any(|item| item.ends_with("blockers=1")));
+    }
+
     fn product_proof_compile_back_evidence(root: &Path, required: &str) -> Value {
         let digest = materialize_compile_back_artifact(root);
         serde_json::json!({
@@ -9952,10 +10370,12 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     fn proof_unsafe_memory_proof_report_path_text() -> &'static str {
-        "proof/full-verifier-report.json"
+        "report.json"
     }
 
+    #[cfg(unix)]
     fn materialize_proof_unsafe_memory_proof_report(root: &Path) -> String {
         let proof_report_path = root.join(proof_unsafe_memory_proof_report_path_text());
         fs::create_dir_all(proof_report_path.parent().expect("proof report parent"))
@@ -9966,18 +10386,29 @@ mod tests {
                 "schema": "trust.full-verifier-report.fixture.v1",
                 "status": "pass",
                 "unsafe_memory": {
-                    "memory_obligations_proved": 3
+                    "memory_obligations_proved": 1
                 }
             }),
         );
         file_sha256_hex(&proof_report_path).expect("hash unsafe-memory proof report")
     }
 
+    #[cfg(unix)]
     fn proof_unsafe_memory_report(root: &Path) -> Value {
+        let candidate_commit = init_git_head(root);
+        let candidate_tree = crate::controlled_git::text(
+            root,
+            &["rev-parse", "--verify", "HEAD^{tree}"],
+            "unsafe-memory fixture tree probe",
+            IDENTITY_PROBE_MAX_STREAM_BYTES,
+            IDENTITY_PROBE_TIMEOUT,
+        )
+        .expect("fixture candidate tree");
         let proof_report_hash = materialize_proof_unsafe_memory_proof_report(root);
         serde_json::json!({
             "schema": PROOF_UNSAFE_MEMORY_REPORT_SCHEMA,
-            "candidate_commit": "0123456789abcdef0123456789abcdef01234567",
+            "candidate_commit": candidate_commit,
+            "candidate_tree": candidate_tree,
             "repo_dirty": false,
             "producer": {
                 "command": PROOF_UNSAFE_MEMORY_EVIDENCE_COMMAND,
@@ -9988,17 +10419,18 @@ mod tests {
             "coverage": {
                 "unsafe_blocks_total": 1,
                 "unsafe_blocks_proved": 1,
-                "unsafe_operations_total": 2,
-                "unsafe_operations_proved": 2,
-                "memory_obligations_total": 3,
-                "memory_obligations_proved": 3
+                "unsafe_operations_total": 1,
+                "unsafe_operations_proved": 1,
+                "memory_obligations_total": 1,
+                "memory_obligations_proved": 1
             },
             "unsupported": []
         })
     }
 
+    #[cfg(unix)]
     #[test]
-    fn proof_unsafe_memory_report_ingests_clean_report() {
+    fn proof_unsafe_memory_report_blocks_without_source_census() {
         let root = temp_repo_root("proof-unsafe-memory-clean");
         let path = root.join("unsafe-memory.json");
         write_json(&path, &proof_unsafe_memory_report(&root));
@@ -10006,10 +10438,34 @@ mod tests {
         let dimension =
             read_proof_unsafe_memory_report(&path).expect("unsafe-memory report should ingest");
 
-        assert_eq!(dimension.status, Some(DeclaredStatus::Pass));
+        assert_eq!(dimension.status, Some(DeclaredStatus::Fail));
         assert_eq!(dimension.id, PROOF_UNSAFE_MEMORY_DIMENSION_ID);
-        assert_eq!(dimension.trust_value, Some(3.0));
+        assert_eq!(dimension.trust_value, None);
         assert_eq!(dimension.evidence_source, DimensionEvidenceSource::ProofUnsafeMemoryReport);
+        assert!(dimension.ai_hint.as_deref().is_some_and(|hint| {
+            hint.contains("source-policy census")
+                && hint.contains("source-operation-to-obligation reconciliation")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proof_unsafe_memory_report_rejects_tampered_candidate_tree() {
+        let root = temp_repo_root("proof-unsafe-memory-tree-tamper");
+        let path = root.join("unsafe-memory.json");
+        let mut report = proof_unsafe_memory_report(&root);
+        report["candidate_tree"] = serde_json::json!("ffffffffffffffffffffffffffffffffffffffff");
+        write_json(&path, &report);
+
+        let dimension = read_proof_unsafe_memory_report(&path)
+            .expect("tampered tree report should parse but fail validation");
+
+        assert_eq!(dimension.status, Some(DeclaredStatus::Fail));
+        assert!(dimension.ai_hint.as_deref().is_some_and(|hint| {
+            hint.contains("candidate_tree") && hint.contains("does not match candidate_commit tree")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -10039,6 +10495,7 @@ mod tests {
         }));
     }
 
+    #[cfg(unix)]
     #[test]
     fn proof_unsafe_memory_report_rejects_dirty_repo() {
         let root = temp_repo_root("proof-unsafe-memory-dirty");
@@ -10060,6 +10517,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn proof_unsafe_memory_report_rejects_non_native_producer() {
         let root = temp_repo_root("proof-unsafe-memory-producer");
@@ -10082,6 +10540,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn proof_unsafe_memory_report_rejects_bad_hash_and_unsupported() {
         let root = temp_repo_root("proof-unsafe-memory-bad");
@@ -10104,27 +10563,116 @@ mod tests {
     }
 
     #[test]
-    fn superior_requires_compatibility_and_advantage() {
-        let report = suite_with(vec![
-            numeric_dimension("compat.rustc", DimensionCategory::Compatibility, 1.0, 1.0),
-            numeric_dimension("proof.overflow", DimensionCategory::Verification, 0.0, 1.0),
-        ]);
+    fn manual_compatibility_and_feature_rows_cannot_establish_superiority() {
+        for declared_status in [None, Some(DeclaredStatus::Pass)] {
+            let mut compatibility =
+                numeric_dimension("compat.rustc", DimensionCategory::Compatibility, 1.0, 1.0);
+            let mut feature =
+                numeric_dimension("feature.frontdoor-cli", DimensionCategory::Feature, 0.0, 1.0);
+            compatibility.status = declared_status;
+            feature.status = declared_status;
+            let report = suite_with(vec![compatibility, feature]);
 
-        assert_eq!(report.verdict, Verdict::Superior);
-        assert_eq!(report.summary.trust_advantage_dimensions, 1);
+            assert_eq!(report.verdict, Verdict::NotSuperior);
+            assert_eq!(report.summary.trust_advantage_dimensions, 0);
+            assert_eq!(report.summary.trust_relative_index, 0.0);
+            assert!(report.dimensions.iter().all(|dimension| {
+                dimension.status == DimensionStatus::Unknown && !dimension.trust_is_better
+            }));
+        }
     }
 
     #[test]
-    fn status_pass_dimension_with_values_counts_trust_advantage() {
+    fn manual_status_only_pass_dimension_is_diagnostic_only() {
         let mut dimension =
             numeric_dimension("feature.frontdoor-cli", DimensionCategory::Feature, 0.0, 1.0);
         dimension.status = Some(DeclaredStatus::Pass);
+        dimension.rust_value = None;
+        dimension.trust_value = None;
 
         let report = suite_with(vec![dimension]);
 
-        assert_eq!(report.summary.passed, 1);
-        assert_eq!(report.summary.trust_advantage_dimensions, 1);
-        assert!(report.dimensions[0].trust_is_better);
+        assert_eq!(report.verdict, Verdict::Unproven);
+        assert_eq!(report.dimensions[0].status, DimensionStatus::Unknown);
+        assert_eq!(report.summary.trust_advantage_dimensions, 0);
+        assert!(!report.dimensions[0].trust_is_better);
+        assert!(!report.dimensions[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn internally_sourced_dimension_is_not_withheld_as_manual() {
+        let mut dimension =
+            numeric_dimension("compat.rustc", DimensionCategory::Compatibility, 1.0, 1.0);
+        dimension.evidence_source = DimensionEvidenceSource::CompatibilitySummaryAggregate;
+        let report = suite_with(vec![dimension]);
+
+        assert_eq!(report.dimensions[0].status, DimensionStatus::Pass);
+        assert!(report.dimensions[0].blockers.is_empty());
+    }
+
+    #[test]
+    fn manual_proof_and_safety_scores_cannot_supply_advantage() {
+        for (id, category, metric, status) in [
+            (
+                "proof.functional-best-existing-tools-alias",
+                DimensionCategory::Verification,
+                MetricKind::Score,
+                Some(DeclaredStatus::Pass),
+            ),
+            ("proof.unsafe-memory-alias", DimensionCategory::Safety, MetricKind::PassRate, None),
+            (
+                "proof.concurrency-alias",
+                DimensionCategory::Feature,
+                MetricKind::Score,
+                Some(DeclaredStatus::Pass),
+            ),
+            (
+                "safety.custom-coverage",
+                DimensionCategory::Safety,
+                MetricKind::PassRate,
+                Some(DeclaredStatus::Pass),
+            ),
+        ] {
+            let mut claimed = numeric_dimension(id, category, 0.0, 1.0);
+            claimed.metric = Some(metric);
+            claimed.status = status;
+            claimed.required = false;
+            let report = suite_with(vec![claimed]);
+
+            assert_eq!(report.verdict, Verdict::Unproven, "{id}");
+            assert_eq!(report.dimensions[0].status, DimensionStatus::Unknown, "{id}");
+            assert!(!report.dimensions[0].trust_is_better, "{id}");
+            assert_eq!(report.summary.trust_advantage_dimensions, 0, "{id}");
+            assert!(
+                report.dimensions[0].blockers.iter().any(|blocker| {
+                    blocker.kind == BlockerKind::UnknownResult
+                        && blocker.action.contains("authenticated")
+                }),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_pass_cannot_hide_numeric_regression() {
+        let mut regressed =
+            numeric_dimension("feature.regressed", DimensionCategory::Feature, 1.0, 0.0);
+        regressed.status = Some(DeclaredStatus::Pass);
+        let report = suite_with(vec![
+            numeric_dimension("compat.rustc", DimensionCategory::Compatibility, 1.0, 1.0),
+            numeric_dimension("feature.improved", DimensionCategory::Feature, 0.0, 1.0),
+            regressed,
+        ]);
+
+        assert_eq!(report.verdict, Verdict::NotSuperior);
+        assert_eq!(report.dimensions[2].status, DimensionStatus::Fail);
+        assert_eq!(report.summary.regressions, 1);
+        assert!(
+            report.dimensions[2]
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.kind == BlockerKind::Regression })
+        );
     }
 
     #[test]
@@ -10447,6 +10995,14 @@ mod tests {
                 .iter()
                 .any(|condition| condition == "missing or dirty reviewed-commit provenance")
         );
+        assert!(
+            requirement["fail_closed_conditions"]
+                .as_array()
+                .expect("fail-closed conditions")
+                .iter()
+                .any(|condition| condition
+                    == "canonical candidate-commit roster, source bytes, unique results, and verifier captures are not independently authenticated")
+        );
 
         let proof_blocker = value["blockers"]
             .as_array()
@@ -10604,36 +11160,129 @@ mod tests {
     }
 
     #[test]
-    fn proof_functional_ingests_clean_program_index_proof_design_report() {
-        let root = temp_repo_root("proof-functional-clean");
+    fn proof_functional_rejects_authored_partial_program_index_report() {
+        let root = temp_repo_root("proof-functional-authored-partial");
         let path = root.join("program-index-report.json");
-        write_json(
-            &path,
-            &proof_program_index_report(
-                vec![
-                    proof_row("proof_div_zero.good", "good", "verify_pass", 1, 1, 0, 0, 0),
-                    proof_row("proof_div_zero.flawed", "flawed", "verify_fail", 1, 0, 1, 0, 0),
-                ],
-                2,
-            ),
+        let mut authored = proof_program_index_report(
+            vec![
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.good",
+                    variant: "good",
+                    observed: "verify_pass",
+                    total: 1,
+                    proved: 1,
+                    failed: 0,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.flawed",
+                    variant: "flawed",
+                    observed: "verify_fail",
+                    total: 1,
+                    proved: 0,
+                    failed: 1,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
+            ],
+            2,
         );
 
-        let dimension =
-            read_proof_functional_program_index_report(&path).expect("clean report should ingest");
-        assert_eq!(dimension.id, PROOF_FUNCTIONAL_DIMENSION_ID);
-        assert_eq!(dimension.status, Some(DeclaredStatus::Pass));
-        assert_eq!(dimension.rust_value, Some(0.0));
-        assert_eq!(dimension.trust_value, Some(2.0));
-        assert!(dimension.evidence.iter().any(|item| {
-            item.contains(PROGRAM_INDEX_REPORT_SCHEMA)
-                && item.contains("proof_design_rows=2")
-                && item.contains("obligations=2")
-        }));
+        for forged_binding in [false, true] {
+            if forged_binding {
+                authored["repo_head_after"] = authored["repo_head"].clone();
+                authored["repo_head_matches_at_finish"] = serde_json::json!(true);
+                authored["program_index_evidence"]["canonical_proof_design_status"] =
+                    serde_json::json!("source_tree_matches_head");
+                authored["program_index_evidence"]["canonical_proof_design_head"] =
+                    authored["repo_head"].clone();
+                authored["program_index_evidence"]["canonical_proof_design_index_sha256"] =
+                    serde_json::json!("0".repeat(64));
+                authored["program_index_evidence"]["source_execution_binding"] =
+                    serde_json::json!("sealed_source_snapshot");
+            }
+            write_json(&path, &authored);
+            let dimension = read_proof_functional_program_index_report(&path)
+                .expect("authored report should parse for diagnostics");
+            assert_eq!(dimension.id, PROOF_FUNCTIONAL_DIMENSION_ID);
+            assert_eq!(dimension.status, Some(DeclaredStatus::Fail), "forged={forged_binding}");
+            assert_eq!(dimension.rust_value, None);
+            assert_eq!(dimension.trust_value, None);
+            assert!(dimension.evidence.iter().any(|item| {
+                item.contains(PROGRAM_INDEX_REPORT_SCHEMA)
+                    && item.contains("proof_design_rows=2")
+                    && item.contains("obligations=2")
+            }));
+            assert!(dimension.ai_hint.as_deref().is_some_and(|hint| {
+                hint.contains(PROGRAM_INDEX_DOMINATION_AUTHENTICATION_BLOCKER)
+            }));
 
-        let report = suite_with(vec![dimension]);
-        assert_eq!(report.dimensions[0].status, DimensionStatus::Pass);
-        assert!(report.dimensions[0].trust_is_better);
+            let report = suite_with(vec![dimension]);
+            assert_eq!(report.dimensions[0].status, DimensionStatus::Fail);
+            assert!(!report.dimensions[0].trust_is_better);
+            assert!(report.blockers.iter().any(|blocker| {
+                blocker.dimension_id.as_deref() == Some(PROOF_FUNCTIONAL_DIMENSION_ID)
+                    && blocker.kind == BlockerKind::DeclaredFailure
+            }));
+        }
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proof_functional_rejects_incomplete_declared_corpus_receipt() {
+        let root = temp_repo_root("proof-functional-incomplete-corpus");
+        let path = root.join("program-index-report.json");
+        let original = proof_program_index_report(
+            vec![
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.good",
+                    variant: "good",
+                    observed: "verify_pass",
+                    total: 1,
+                    proved: 1,
+                    failed: 0,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.flawed",
+                    variant: "flawed",
+                    observed: "verify_fail",
+                    total: 1,
+                    proved: 0,
+                    failed: 1,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
+            ],
+            2,
+        );
+        for mutation in ["flag", "denominator"] {
+            let mut report = original.clone();
+            match mutation {
+                "flag" => {
+                    report["program_index_evidence"]["proof_design_corpus_complete"] =
+                        serde_json::json!(false)
+                }
+                "denominator" => {
+                    report["program_index_evidence"]["declared_proof_design_rows"] =
+                        serde_json::json!(1)
+                }
+                _ => unreachable!(),
+            }
+            write_json(&path, &report);
+            let dimension = read_proof_functional_program_index_report(&path)
+                .expect("incomplete corpus receipt should parse");
+            assert_eq!(dimension.status, Some(DeclaredStatus::Fail), "{mutation}");
+            assert!(
+                dimension
+                    .ai_hint
+                    .as_deref()
+                    .is_some_and(|hint| { hint.contains("complete declared proof-design corpus") })
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -10643,8 +11292,26 @@ mod tests {
         let path = root.join("program-index-report.json");
         let mut report = proof_program_index_report(
             vec![
-                proof_row("proof_div_zero.good", "good", "verify_pass", 1, 1, 0, 0, 0),
-                proof_row("proof_div_zero.flawed", "flawed", "verify_fail", 1, 0, 1, 0, 0),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.good",
+                    variant: "good",
+                    observed: "verify_pass",
+                    total: 1,
+                    proved: 1,
+                    failed: 0,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.flawed",
+                    variant: "flawed",
+                    observed: "verify_fail",
+                    total: 1,
+                    proved: 0,
+                    failed: 1,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
             ],
             2,
         );
@@ -10680,8 +11347,26 @@ mod tests {
         let path = root.join("program-index-report.json");
         let mut report = proof_program_index_report(
             vec![
-                proof_row("proof_div_zero.good", "good", "verify_pass", 1, 1, 0, 0, 0),
-                proof_row("proof_div_zero.flawed", "flawed", "verify_fail", 1, 0, 1, 0, 0),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.good",
+                    variant: "good",
+                    observed: "verify_pass",
+                    total: 1,
+                    proved: 1,
+                    failed: 0,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.flawed",
+                    variant: "flawed",
+                    observed: "verify_fail",
+                    total: 1,
+                    proved: 0,
+                    failed: 1,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
             ],
             2,
         );
@@ -10713,8 +11398,26 @@ mod tests {
         let path = root.join("program-index-report.json");
         let mut report = proof_program_index_report(
             vec![
-                proof_row("proof_div_zero.good", "good", "verify_pass", 1, 1, 0, 0, 0),
-                proof_row("proof_div_zero.flawed", "flawed", "verify_fail", 1, 0, 1, 0, 0),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.good",
+                    variant: "good",
+                    observed: "verify_pass",
+                    total: 1,
+                    proved: 1,
+                    failed: 0,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.flawed",
+                    variant: "flawed",
+                    observed: "verify_fail",
+                    total: 1,
+                    proved: 0,
+                    failed: 1,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
             ],
             2,
         );
@@ -10742,8 +11445,26 @@ mod tests {
             &path,
             &proof_program_index_report(
                 vec![
-                    proof_row("proof_div_zero.good", "good", "verify_pass", 0, 0, 0, 0, 0),
-                    proof_row("proof_div_zero.flawed", "flawed", "verify_fail", 1, 0, 1, 0, 0),
+                    proof_row(ProofRowInput {
+                        program_id: "proof_div_zero.good",
+                        variant: "good",
+                        observed: "verify_pass",
+                        total: 0,
+                        proved: 0,
+                        failed: 0,
+                        unknown: 0,
+                        runtime_checked: 0,
+                    }),
+                    proof_row(ProofRowInput {
+                        program_id: "proof_div_zero.flawed",
+                        variant: "flawed",
+                        observed: "verify_fail",
+                        total: 1,
+                        proved: 0,
+                        failed: 1,
+                        unknown: 0,
+                        runtime_checked: 0,
+                    }),
                 ],
                 2,
             ),
@@ -10775,8 +11496,26 @@ mod tests {
             &path,
             &proof_program_index_report(
                 vec![
-                    proof_row("proof_div_zero.good", "good", "verify_pass", 2, 1, 0, 0, 0),
-                    proof_row("proof_div_zero.flawed", "flawed", "verify_fail", 1, 0, 1, 0, 0),
+                    proof_row(ProofRowInput {
+                        program_id: "proof_div_zero.good",
+                        variant: "good",
+                        observed: "verify_pass",
+                        total: 2,
+                        proved: 1,
+                        failed: 0,
+                        unknown: 0,
+                        runtime_checked: 0,
+                    }),
+                    proof_row(ProofRowInput {
+                        program_id: "proof_div_zero.flawed",
+                        variant: "flawed",
+                        observed: "verify_fail",
+                        total: 1,
+                        proved: 0,
+                        failed: 1,
+                        unknown: 0,
+                        runtime_checked: 0,
+                    }),
                 ],
                 2,
             ),
@@ -10800,8 +11539,26 @@ mod tests {
         let path = root.join("program-index-report.json");
         let mut report = proof_program_index_report(
             vec![
-                proof_row("proof_div_zero.good", "good", "verify_pass", 1, 1, 0, 0, 0),
-                proof_row("proof_div_zero.flawed", "flawed", "verify_fail", 1, 0, 1, 0, 0),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.good",
+                    variant: "good",
+                    observed: "verify_pass",
+                    total: 1,
+                    proved: 1,
+                    failed: 0,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.flawed",
+                    variant: "flawed",
+                    observed: "verify_fail",
+                    total: 1,
+                    proved: 0,
+                    failed: 1,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
             ],
             2,
         );
@@ -10828,8 +11585,26 @@ mod tests {
         let path = root.join("program-index-report.json");
         let mut report = proof_program_index_report(
             vec![
-                proof_row("proof_div_zero.good", "good", "verify_pass", 1, 1, 0, 0, 0),
-                proof_row("proof_div_zero.flawed", "flawed", "verify_fail", 1, 0, 1, 0, 0),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.good",
+                    variant: "good",
+                    observed: "verify_pass",
+                    total: 1,
+                    proved: 1,
+                    failed: 0,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.flawed",
+                    variant: "flawed",
+                    observed: "verify_fail",
+                    total: 1,
+                    proved: 0,
+                    failed: 1,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
             ],
             2,
         );
@@ -10855,8 +11630,26 @@ mod tests {
         let path = root.join("program-index-report.json");
         let mut report = proof_program_index_report(
             vec![
-                proof_row("proof_div_zero.good", "good", "verify_pass", 1, 1, 0, 0, 0),
-                proof_row("proof_div_zero.flawed", "flawed", "verify_fail", 1, 0, 1, 0, 0),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.good",
+                    variant: "good",
+                    observed: "verify_pass",
+                    total: 1,
+                    proved: 1,
+                    failed: 0,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
+                proof_row(ProofRowInput {
+                    program_id: "proof_div_zero.flawed",
+                    variant: "flawed",
+                    observed: "verify_fail",
+                    total: 1,
+                    proved: 0,
+                    failed: 1,
+                    unknown: 0,
+                    runtime_checked: 0,
+                }),
             ],
             2,
         );
@@ -10901,7 +11694,7 @@ mod tests {
     }
 
     #[test]
-    fn program_index_runtime_binary_report_classifies_target_arch_dimensions() {
+    fn program_index_runtime_binary_report_retains_diagnostics_without_domination() {
         let root = temp_repo_root("program-index-runtime-binary");
         let path = root.join("program-index-report.json");
         write_json(
@@ -10925,12 +11718,23 @@ mod tests {
             .iter()
             .find(|dimension| dimension.id == "efficiency.x86_64.binary-size")
             .expect("x86 binary-size dimension");
-        assert_eq!(runtime.status, None);
-        assert_eq!(runtime.rust_value, Some(1.0));
-        assert!(runtime.trust_value.is_some_and(|value| value > 1.9));
-        assert_eq!(binary.status, None);
-        assert!(binary.rust_value.is_some_and(|value| (value - 100.0).abs() < 0.000001));
-        assert!(binary.trust_value.is_some_and(|value| (value - 80.0).abs() < 0.000001));
+        assert_eq!(runtime.status, Some(DeclaredStatus::Fail));
+        assert_eq!(runtime.rust_value, None);
+        assert_eq!(runtime.trust_value, None);
+        assert!(runtime.evidence.iter().any(|item| item.contains("geomean_speedup=2.000000")));
+        assert_eq!(binary.status, Some(DeclaredStatus::Fail));
+        assert_eq!(binary.rust_value, None);
+        assert_eq!(binary.trust_value, None);
+        assert!(binary.evidence.iter().any(|item| {
+            item.contains("rust_binary_size_geomean=100.000")
+                && item.contains("trust_binary_size_geomean=80.000")
+        }));
+        for dimension in [runtime, binary] {
+            assert_dimension_hint_contains(
+                dimension,
+                &[PROGRAM_INDEX_DOMINATION_AUTHENTICATION_BLOCKER],
+            );
+        }
 
         let report = suite_with(dimensions);
         assert!(
@@ -10941,11 +11745,158 @@ mod tests {
                     dimension.id.as_str(),
                     "runtime.x86_64.geomean" | "efficiency.x86_64.binary-size"
                 ))
-                .all(|dimension| dimension.status == DimensionStatus::Pass
-                    && dimension.trust_is_better)
+                .all(|dimension| dimension.status == DimensionStatus::Fail
+                    && !dimension.trust_is_better)
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn authored_program_index_reports_cannot_admit_any_performance_dimension() {
+        let root = temp_repo_root("program-index-authored-performance");
+        let path = root.join("program-index-report.json");
+        let mut seen = [BTreeSet::new(), BTreeSet::new()];
+
+        for triple in ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"] {
+            let runtime = runtime_program_index_report(
+                vec![
+                    runtime_row(PROGRAM_INDEX_RUNTIME_BASELINE_SLOT, 2.0, 100),
+                    runtime_row(PROGRAM_INDEX_RUNTIME_TRUST_SLOT, 1.0, 80),
+                ],
+                Some(triple),
+            );
+            let clean = compile_program_index_report(
+                vec![
+                    compile_row(
+                        PROGRAM_INDEX_RUNTIME_BASELINE_SLOT,
+                        CompileEvidenceMode::CleanRelease,
+                        2.0,
+                        1.2,
+                        0.3,
+                        2_000_000,
+                    ),
+                    compile_row(
+                        PROGRAM_INDEX_RUNTIME_TRUST_SLOT,
+                        CompileEvidenceMode::CleanRelease,
+                        1.0,
+                        0.7,
+                        0.2,
+                        1_000_000,
+                    ),
+                ],
+                triple,
+            );
+            let incremental = compile_program_index_report(
+                vec![
+                    compile_row(
+                        PROGRAM_INDEX_RUNTIME_BASELINE_SLOT,
+                        CompileEvidenceMode::IncrementalDebug,
+                        1.5,
+                        0.8,
+                        0.2,
+                        1_500_000,
+                    ),
+                    compile_row(
+                        PROGRAM_INDEX_RUNTIME_TRUST_SLOT,
+                        CompileEvidenceMode::IncrementalDebug,
+                        0.75,
+                        0.5,
+                        0.1,
+                        900_000,
+                    ),
+                ],
+                triple,
+            );
+
+            for mut authored in [runtime, clean, incremental] {
+                assert!(authored.get("program_index_evidence").is_none());
+                for forged_binding in [false, true] {
+                    if forged_binding {
+                        authored["program_index_evidence"] = serde_json::json!({
+                            "status": "admissible",
+                            "admissible_for_domination": true,
+                            "canonical_proof_design_status": "source_tree_matches_head",
+                            "source_execution_binding": "sealed_source_snapshot",
+                            "measurement_binding": "exact",
+                        });
+                    }
+                    write_json(&path, &authored);
+                    let dimensions = read_program_index_runtime_binary_report(&path)
+                        .expect("authored report should parse for diagnostics");
+                    for dimension in dimensions {
+                        assert_eq!(
+                            dimension.status,
+                            Some(DeclaredStatus::Fail),
+                            "{} forged={forged_binding}",
+                            dimension.id
+                        );
+                        assert_eq!(dimension.rust_value, None);
+                        assert_eq!(dimension.trust_value, None);
+                        assert_dimension_hint_contains(
+                            &dimension,
+                            &[PROGRAM_INDEX_DOMINATION_AUTHENTICATION_BLOCKER],
+                        );
+                        seen[forged_binding as usize].insert(dimension.id.clone());
+                        let report = suite_with(vec![dimension]);
+                        assert_eq!(report.dimensions[0].status, DimensionStatus::Fail);
+                        assert!(!report.dimensions[0].trust_is_better);
+                        assert_ne!(report.verdict, Verdict::Superior);
+                    }
+                }
+            }
+        }
+
+        let expected = [LaunchArch::X86_64, LaunchArch::Aarch64]
+            .into_iter()
+            .flat_map(|arch| {
+                [
+                    arch.runtime_dimension_id(),
+                    arch.binary_size_dimension_id(),
+                    arch.clean_compile_dimension_id(),
+                    arch.incremental_compile_dimension_id(),
+                ]
+            })
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        for (forged_binding, observed) in seen.into_iter().enumerate() {
+            assert_eq!(
+                observed, expected,
+                "each program-index performance dimension must be tested with forged={forged_binding}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manual_program_index_performance_dimensions_cannot_claim_pass() {
+        for arch in [LaunchArch::X86_64, LaunchArch::Aarch64] {
+            for id in [
+                arch.runtime_dimension_id(),
+                arch.binary_size_dimension_id(),
+                arch.clean_compile_dimension_id(),
+                arch.incremental_compile_dimension_id(),
+            ] {
+                for declared_pass in [false, true] {
+                    let mut dimension =
+                        numeric_dimension(id, DimensionCategory::Performance, 1.0, 2.0);
+                    if declared_pass {
+                        dimension.status = Some(DeclaredStatus::Pass);
+                    }
+                    let report = suite_with(vec![dimension]);
+                    assert_eq!(report.dimensions[0].status, DimensionStatus::Unknown, "{id}");
+                    assert!(!report.dimensions[0].trust_is_better, "{id}");
+                    assert_ne!(report.verdict, Verdict::Superior, "{id}");
+                    assert!(report.blockers.iter().any(|blocker| {
+                        blocker.dimension_id.as_deref() == Some(id)
+                            && blocker
+                                .message
+                                .contains("authenticated program-index benchmark evidence")
+                    }));
+                }
+            }
+        }
     }
 
     #[test]
@@ -11072,7 +12023,7 @@ mod tests {
     }
 
     #[test]
-    fn program_index_compile_report_classifies_clean_compile_dimension() {
+    fn program_index_compile_report_retains_clean_compile_diagnostics_without_domination() {
         let root = temp_repo_root("program-index-clean-compile-pass");
         let path = root.join("program-index-report.json");
         write_json(
@@ -11106,13 +12057,14 @@ mod tests {
             .iter()
             .find(|dimension| dimension.id == "compile.x86_64.clean-release")
             .expect("x86 clean compile dimension");
-        assert_eq!(clean.status, None);
-        assert!(clean.rust_value.is_some_and(|value| (value - 2000.0).abs() < 0.000001));
-        assert!(clean.trust_value.is_some_and(|value| (value - 1000.0).abs() < 0.000001));
+        assert_eq!(clean.status, Some(DeclaredStatus::Fail));
+        assert_eq!(clean.rust_value, None);
+        assert_eq!(clean.trust_value, None);
         assert!(clean.evidence.iter().any(|item| {
             item.contains("rust_cpu_seconds_geomean=1.500000")
                 && item.contains("trust_peak_rss_geomean=1000000")
         }));
+        assert_dimension_hint_contains(clean, &[PROGRAM_INDEX_DOMINATION_AUTHENTICATION_BLOCKER]);
 
         let report = suite_with(dimensions);
         let clean = report
@@ -11120,8 +12072,8 @@ mod tests {
             .iter()
             .find(|dimension| dimension.id == "compile.x86_64.clean-release")
             .expect("x86 clean compile report row");
-        assert_eq!(clean.status, DimensionStatus::Pass);
-        assert!(clean.trust_is_better);
+        assert_eq!(clean.status, DimensionStatus::Fail);
+        assert!(!clean.trust_is_better);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -11151,6 +12103,28 @@ mod tests {
     }
 
     #[test]
+    fn program_index_compile_report_rejects_informational_performance_source() {
+        let mut report = clean_compile_program_index_report();
+        report["strict_superiority_performance_evidence"]["candidate_rejection"]["status"] =
+            serde_json::json!("informational");
+
+        let (root, clean) = read_x86_clean_compile_dimension(
+            "program-index-compile-informational-performance",
+            &report,
+        );
+
+        assert_eq!(clean.status, Some(DeclaredStatus::Fail));
+        assert_dimension_hint_contains(
+            &clean,
+            &[
+                "strict_superiority_performance_evidence.candidate_rejection.status must be admissible",
+            ],
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn program_index_compile_report_rejects_non_strict_performance_lane_comparison() {
         let mut report = clean_compile_program_index_report();
         report["strict_superiority_performance_evidence"]["lanes"]["clean_release_compile"]["comparisons"]
@@ -11173,7 +12147,7 @@ mod tests {
     }
 
     #[test]
-    fn program_index_compile_report_classifies_incremental_compile_dimension() {
+    fn program_index_compile_report_retains_incremental_diagnostics_without_domination() {
         let root = temp_repo_root("program-index-incremental-compile-pass");
         let path = root.join("program-index-report.json");
         write_json(
@@ -11207,8 +12181,12 @@ mod tests {
             .iter()
             .find(|dimension| dimension.id == "compile.aarch64.incremental-debug")
             .expect("aarch64 incremental compile dimension");
-        assert_eq!(incremental.status, None);
+        assert_eq!(incremental.status, Some(DeclaredStatus::Fail));
         assert!(incremental.evidence.iter().any(|item| item.contains("mode=warm-incremental")));
+        assert_dimension_hint_contains(
+            incremental,
+            &[PROGRAM_INDEX_DOMINATION_AUTHENTICATION_BLOCKER],
+        );
 
         let report = suite_with(dimensions);
         let incremental = report
@@ -11216,14 +12194,14 @@ mod tests {
             .iter()
             .find(|dimension| dimension.id == "compile.aarch64.incremental-debug")
             .expect("aarch64 incremental compile report row");
-        assert_eq!(incremental.status, DimensionStatus::Pass);
-        assert!(incremental.trust_is_better);
+        assert_eq!(incremental.status, DimensionStatus::Fail);
+        assert!(!incremental.trust_is_better);
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn domination_ingests_strict_runtime_binary_reports_for_both_launch_arches() {
+    fn domination_refuses_authored_runtime_binary_reports_for_both_launch_arches() {
         let root = temp_repo_root("domination-strict-runtime-binary-arches");
         let x86_path = root.join("program-index-runtime-x86.json");
         let aarch64_path = root.join("program-index-runtime-aarch64.json");
@@ -11273,9 +12251,9 @@ mod tests {
         ] {
             assert!(
                 report.dimensions.iter().any(
-                    |dimension| dimension.id == id && dimension.status == DimensionStatus::Pass
+                    |dimension| dimension.id == id && dimension.status == DimensionStatus::Fail
                 ),
-                "{id} should pass with strict performance evidence"
+                "{id} must not pass from an authored report"
             );
         }
 
@@ -11283,7 +12261,7 @@ mod tests {
     }
 
     #[test]
-    fn domination_combines_cold_and_warm_program_index_reports() {
+    fn domination_refuses_authored_cold_and_warm_program_index_reports() {
         let root = temp_repo_root("domination-program-index-cold-warm");
         let cold_path = root.join("program-index-cold.json");
         let warm_path = root.join("program-index-warm.json");
@@ -11332,11 +12310,11 @@ mod tests {
 
         assert!(report.dimensions.iter().any(|dimension| {
             dimension.id == "compile.x86_64.clean-release"
-                && dimension.status == DimensionStatus::Pass
+                && dimension.status == DimensionStatus::Fail
         }));
         assert!(report.dimensions.iter().any(|dimension| {
             dimension.id == "compile.x86_64.incremental-debug"
-                && dimension.status == DimensionStatus::Pass
+                && dimension.status == DimensionStatus::Fail
         }));
 
         let _ = fs::remove_dir_all(root);
@@ -11839,7 +12817,7 @@ mod tests {
             .iter()
             .find(|dimension| dimension.id == "efficiency.x86_64.binary-size")
             .expect("x86 binary-size dimension");
-        assert_eq!(runtime.status, None);
+        assert_eq!(runtime.status, Some(DeclaredStatus::Fail));
         assert_eq!(binary.status, Some(DeclaredStatus::Fail));
         assert_dimension_hint_contains(
             binary,
@@ -11944,7 +12922,7 @@ mod tests {
             .iter()
             .find(|dimension| dimension.id == "efficiency.x86_64.binary-size")
             .expect("x86 binary-size dimension");
-        assert_eq!(runtime.status, None);
+        assert_eq!(runtime.status, Some(DeclaredStatus::Fail));
         assert_eq!(binary.status, Some(DeclaredStatus::Fail));
         assert!(binary.ai_hint.as_deref().is_some_and(|hint| {
             hint.contains("executable_sha256 must be a canonical SHA-256 hash")
@@ -12052,12 +13030,33 @@ mod tests {
     #[test]
     fn missing_required_evidence_is_unproven() {
         let mut dimension =
-            numeric_dimension("proof.overflow", DimensionCategory::Verification, 0.0, 1.0);
+            numeric_dimension("feature.frontdoor-cli", DimensionCategory::Feature, 0.0, 1.0);
         dimension.evidence.clear();
         let report = suite_with(vec![dimension]);
 
         assert_eq!(report.verdict, Verdict::Unproven);
+        assert!(!report.dimensions[0].trust_is_better);
+        assert_eq!(report.summary.trust_advantage_dimensions, 0);
+        assert_eq!(report.summary.trust_relative_index, 0.0);
         assert!(report.blockers.iter().any(|blocker| blocker.kind == BlockerKind::MissingEvidence));
+    }
+
+    #[test]
+    fn declared_pass_with_partial_numeric_pair_is_unproven() {
+        let mut dimension =
+            numeric_dimension("feature.partial", DimensionCategory::Feature, 0.0, 1.0);
+        dimension.status = Some(DeclaredStatus::Pass);
+        dimension.trust_value = None;
+        let report = suite_with(vec![dimension]);
+
+        assert_eq!(report.verdict, Verdict::Unproven);
+        assert_eq!(report.dimensions[0].status, DimensionStatus::Unknown);
+        assert!(
+            report.dimensions[0]
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.kind == BlockerKind::InconsistentEvidence })
+        );
     }
 
     #[test]
@@ -12149,12 +13148,15 @@ mod tests {
   "runner": {
     "implementation": "rust",
     "entrypoint": "targo trust domination upstream-tests",
-    "argv": ["targo", "trust", "domination", "upstream-tests", "--release", "--proof-mode", "full", "--execute", "--summary-out", "reports/upstream-rust/summary.json"],
+    "proof_scope": "upstream_rust",
+    "proof_totals": { "total": 2, "upstream": 2, "trust_added": 0 },
+    "argv": ["targo", "trust", "domination", "upstream-tests", "--release", "--proof-scope", "upstream-rust", "--proof-mode", "full", "--execute", "--summary-out", "reports/upstream-rust/summary.json"],
     "release_evidence_contract": {
       "entrypoint": "targo trust domination upstream-tests",
       "release": true,
       "execute": true,
       "proof_mode": "full",
+      "proof_scope": "upstream_rust",
       "summary_out": "reports/upstream-rust/summary.json",
       "requires_release": true,
       "requires_execute": true,
@@ -12407,7 +13409,9 @@ mod tests {
             read_compat_summary(&path, false).expect_err("weak release argv should fail closed");
         let message = error.to_string();
         assert!(message.contains("release argv"));
-        assert!(message.contains("--release --proof-mode full --execute --summary-out"));
+        assert!(message.contains(
+            "--release --proof-scope upstream-rust --proof-mode full --execute --summary-out"
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -12448,12 +13452,15 @@ mod tests {
   "runner": {
     "implementation": "rust",
     "entrypoint": "targo trust domination upstream-tests",
-    "argv": ["targo", "trust", "domination", "upstream-tests", "--release", "--proof-mode", "full", "--execute", "--summary-out", "reports/upstream-rust/summary.json"],
+    "proof_scope": "upstream_rust",
+    "proof_totals": { "total": 2, "upstream": 2, "trust_added": 0 },
+    "argv": ["targo", "trust", "domination", "upstream-tests", "--release", "--proof-scope", "upstream-rust", "--proof-mode", "full", "--execute", "--summary-out", "reports/upstream-rust/summary.json"],
     "release_evidence_contract": {
       "entrypoint": "targo trust domination upstream-tests",
       "release": true,
       "execute": true,
       "proof_mode": "full",
+      "proof_scope": "upstream_rust",
       "summary_out": "reports/upstream-rust/summary.json",
       "requires_release": true,
       "requires_execute": true,
@@ -12509,12 +13516,15 @@ mod tests {
   "runner": {
     "implementation": "rust",
     "entrypoint": "targo trust domination upstream-tests",
-    "argv": ["targo", "trust", "domination", "upstream-tests", "--release", "--proof-mode", "full", "--execute", "--summary-out", "reports/upstream-rust/summary.json"],
+    "proof_scope": "upstream_rust",
+    "proof_totals": { "total": 2, "upstream": 2, "trust_added": 0 },
+    "argv": ["targo", "trust", "domination", "upstream-tests", "--release", "--proof-scope", "upstream-rust", "--proof-mode", "full", "--execute", "--summary-out", "reports/upstream-rust/summary.json"],
     "release_evidence_contract": {
       "entrypoint": "targo trust domination upstream-tests",
       "release": true,
       "execute": true,
       "proof_mode": "full",
+      "proof_scope": "upstream_rust",
       "summary_out": "reports/upstream-rust/summary.json",
       "requires_release": true,
       "requires_execute": true,
@@ -12570,12 +13580,15 @@ mod tests {
   "runner": {
     "implementation": "rust",
     "entrypoint": "targo trust domination upstream-tests",
-    "argv": ["targo", "trust", "domination", "upstream-tests", "--release", "--proof-mode", "full", "--execute", "--summary-out", "reports/upstream-rust/summary.json"],
+    "proof_scope": "upstream_rust",
+    "proof_totals": { "total": 2, "upstream": 2, "trust_added": 0 },
+    "argv": ["targo", "trust", "domination", "upstream-tests", "--release", "--proof-scope", "upstream-rust", "--proof-mode", "full", "--execute", "--summary-out", "reports/upstream-rust/summary.json"],
     "release_evidence_contract": {
       "entrypoint": "targo trust domination upstream-tests",
       "release": true,
       "execute": true,
       "proof_mode": "full",
+      "proof_scope": "upstream_rust",
       "summary_out": "reports/upstream-rust/summary.json",
       "requires_release": true,
       "requires_execute": true,
@@ -12616,7 +13629,7 @@ mod tests {
         assert_eq!(ingest.compatible, 2);
         assert!(compat_dimensions.iter().any(|dimension| {
             dimension.id == "compat.x86_64.toolchain"
-                && dimension.status == Some(DeclaredStatus::Pass)
+                && dimension.status == Some(DeclaredStatus::Unknown)
                 && dimension.evidence.iter().any(|item| item.contains("target_arch=x86_64"))
         }));
 
@@ -12635,7 +13648,7 @@ mod tests {
             .iter()
             .find(|dimension| dimension.id == "compat.x86_64.toolchain")
             .expect("x86 compat aggregate");
-        assert_eq!(x86.status, DimensionStatus::Pass);
+        assert_eq!(x86.status, DimensionStatus::Unknown);
         assert_eq!(
             report
                 .dimensions
@@ -12649,7 +13662,7 @@ mod tests {
     }
 
     #[test]
-    fn product_proof_release_report_classifies_binary_roundtrip_dimension() {
+    fn product_proof_release_report_blocks_v1_binary_roundtrip_dimension() {
         let root = temp_repo_root("product-proof-release-pass");
         let path = root.join("release-report.json");
         let evidence_refs = write_product_proof_compile_back_evidence(&root);
@@ -12658,13 +13671,36 @@ mod tests {
         let dimension =
             read_product_proof_release_report(&path).expect("product-proof report should ingest");
         assert_eq!(dimension.id, PRODUCT_PROOF_BINARY_ROUNDTRIP_DIMENSION_ID);
-        assert_eq!(dimension.status, Some(DeclaredStatus::Pass));
-        assert_eq!(dimension.rust_value, Some(0.0));
-        assert_eq!(dimension.trust_value, Some(1.0));
+        assert_product_proof_v1_replay_only_block(&dimension);
 
         let report = suite_with(vec![dimension]);
-        assert_eq!(report.dimensions[0].status, DimensionStatus::Pass);
-        assert!(report.dimensions[0].trust_is_better);
+        assert_eq!(report.dimensions[0].status, DimensionStatus::Fail);
+        assert!(!report.dimensions[0].trust_is_better);
+        assert!(report.blockers.iter().any(|blocker| {
+            blocker.dimension_id.as_deref() == Some(PRODUCT_PROOF_BINARY_ROUNDTRIP_DIMENSION_ID)
+                && blocker.action.contains(PRODUCT_PROOF_RELEASE_V1_REPLAY_BLOCKER)
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn product_proof_release_report_rejects_forged_pass_with_authored_solver_hashes() {
+        let root = temp_repo_root("product-proof-release-forged-pass");
+        let path = root.join("release-report.json");
+        let evidence_refs = write_product_proof_compile_back_evidence(&root);
+        for required in COMPILE_BACK_REQUIRED_EVIDENCE {
+            let mut evidence = product_proof_compile_back_evidence(&root, required);
+            evidence["proof_results"]["by_solver"] = serde_json::json!(["claimed-solver"]);
+            evidence["proof_transcript_hash"] =
+                serde_json::json!(format!("sha256:{}", "f".repeat(64)));
+            write_json(&root.join(compile_back_evidence_path_text(required)), &evidence);
+        }
+        write_json(&path, &product_proof_release_report(evidence_refs));
+
+        let dimension =
+            read_product_proof_release_report(&path).expect("forged report should parse");
+        assert_product_proof_v1_replay_only_block(&dimension);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -12682,7 +13718,7 @@ mod tests {
         let dimension =
             read_product_proof_release_report(&path).expect("product-proof report should ingest");
 
-        assert_eq!(dimension.status, Some(DeclaredStatus::Pass));
+        assert_product_proof_v1_replay_only_block(&dimension);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -13067,12 +14103,10 @@ mod tests {
             read_product_proof_release_report(&path).expect("product-proof report should parse");
 
         assert_eq!(dimension.status, Some(DeclaredStatus::Fail));
-        assert!(
-            dimension
-                .ai_hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("proof_results.total must be declared"))
-        );
+        assert!(dimension.ai_hint.as_deref().is_some_and(|hint| {
+            hint.contains("proof_results.total must be declared")
+                && hint.contains(PRODUCT_PROOF_RELEASE_V1_REPLAY_BLOCKER)
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -13139,7 +14173,7 @@ mod tests {
         let dimension =
             read_product_proof_release_report(&path).expect("product-proof report should parse");
 
-        assert_eq!(dimension.status, Some(DeclaredStatus::Pass));
+        assert_product_proof_v1_replay_only_block(&dimension);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -13341,7 +14375,9 @@ mod tests {
 
         assert_eq!(dimension.status, Some(DeclaredStatus::Fail));
         assert!(dimension.ai_hint.as_deref().is_some_and(|hint| {
-            hint.contains("candidate_commit") && hint.contains("compile-back-rust-source-sha256")
+            hint.contains("candidate_commit")
+                && hint.contains("compile-back-rust-source-sha256")
+                && hint.contains(PRODUCT_PROOF_RELEASE_V1_REPLAY_BLOCKER)
         }));
 
         let _ = fs::remove_dir_all(root);
@@ -13412,7 +14448,7 @@ mod tests {
         let dimension =
             read_product_proof_release_report(&path).expect("product-proof report should parse");
 
-        assert_eq!(dimension.status, Some(DeclaredStatus::Pass));
+        assert_product_proof_v1_replay_only_block(&dimension);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -13537,6 +14573,7 @@ mod tests {
         let port_args =
             vec!["--execute".to_string(), "--max-files=1".to_string(), "--release".to_string()];
         assert!(upstream_tests_requires_trust_cargo(&port_args));
+        let scoped_args = upstream_tests_scoped_args(&port_args).expect("canonical upstream scope");
 
         let preflight = build_upstream_compat_lockfile_preflight_command(
             vec!["targo".to_string()],
@@ -13551,8 +14588,11 @@ mod tests {
         assert_eq!(preflight[6], "1");
         assert_eq!(preflight[7], "--no-deps");
 
-        let command =
-            build_upstream_tests_command(vec!["targo".to_string()], Path::new("/repo"), &port_args);
+        let command = build_upstream_tests_command(
+            vec!["targo".to_string()],
+            Path::new("/repo"),
+            &scoped_args,
+        );
 
         assert_eq!(command[0], "targo");
         // Trust: a targo driver gets the explicit `--unverified` lane injected
@@ -13565,9 +14605,50 @@ mod tests {
         assert_eq!(command[5], "--locked");
         assert_eq!(command[6], "--");
         assert_eq!(command[7], "port");
-        assert_eq!(&command[8..], port_args.as_slice());
+        assert_eq!(&command[8..], scoped_args.as_slice());
+        assert_eq!(&command[8..10], ["--proof-scope", "upstream-rust"]);
         assert!(command.iter().all(|part| !part.to_ascii_lowercase().contains("python")));
         assert!(preflight.iter().all(|part| !part.to_ascii_lowercase().contains("python")));
+    }
+
+    /// The help line must offer exactly the scopes the parser accepts. It used to
+    /// advertise `combined|upstream-rust` while `upstream_tests_scoped_args` refuses
+    /// `combined` (read against the handler 2026-09-24).
+    #[test]
+    fn upstream_tests_help_offers_only_the_accepted_proof_scope() {
+        let help = upstream_tests_usage_text();
+        let line = help
+            .lines()
+            .find(|line| line.trim_start().starts_with("--proof-scope"))
+            .expect("the upstream-tests help documents --proof-scope");
+        for scope in ["upstream-rust", "combined"] {
+            let advertised = line.split_whitespace().nth(1) == Some(scope);
+            let accepted = upstream_tests_scoped_args(&[format!("--proof-scope={scope}")]).is_ok();
+            assert_eq!(advertised, accepted, "help and parser disagree on `{scope}`: {line}");
+        }
+    }
+
+    #[test]
+    fn rust_vs_trust_upstream_tests_scope_is_exact_and_not_duplicated() {
+        let default = upstream_tests_scoped_args(&["--release".to_string()])
+            .expect("default upstream-only scope");
+        assert_eq!(default, vec!["--proof-scope", "upstream-rust", "--release"]);
+        for explicit in [
+            vec!["--proof-scope".to_string(), "upstream-rust".to_string()],
+            vec!["--proof-scope=upstream-rust".to_string()],
+        ] {
+            assert_eq!(upstream_tests_scoped_args(&explicit).expect("explicit scope"), explicit);
+        }
+        for invalid in [
+            vec!["--proof-scope".to_string(), "combined".to_string()],
+            vec!["--proof-scope".to_string()],
+            vec![
+                "--proof-scope=upstream-rust".to_string(),
+                "--proof-scope=upstream-rust".to_string(),
+            ],
+        ] {
+            assert!(upstream_tests_scoped_args(&invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]
@@ -13701,15 +14782,62 @@ mod tests {
 
         let exported_cargo = upstream_compat_child_cargo_env(&driver);
         let port_args = vec!["--release".to_string()];
-        let command = build_upstream_tests_command(driver, &root, &port_args);
+        let scoped_args = upstream_tests_scoped_args(&port_args).expect("canonical upstream scope");
+        let command = build_upstream_tests_command(driver, &root, &scoped_args);
 
         assert_eq!(command[0], stage2_targo.to_string_lossy().into_owned());
         assert_eq!(command.last().map(String::as_str), Some("--release"));
+        assert!(command.windows(2).any(|pair| pair == ["--proof-scope", "upstream-rust"]));
         assert_eq!(
             exported_cargo.as_deref(),
             Some(stage2_targo.to_string_lossy().as_ref()),
             "outer targo driver must be exported so trust-upstream-compat does not fall back to ambient Cargo"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// After `mv build build.noindex && ln -s build.noindex build` (the
+    /// Spotlight layout, docs/BUILD_AND_INSTALL.md) the canonical stage2 targo
+    /// path names `build.noindex`; release porting must still accept it, and
+    /// must still refuse any other `build` link.
+    #[test]
+    #[cfg(unix)]
+    fn rust_vs_trust_upstream_tests_release_accepts_stage2_targo_behind_build_noindex() {
+        let root = temp_repo_root("release-stage2-targo-noindex");
+        let head = init_git_head(&root);
+        let stage2_targo = write_fake_stage2_targo(&root, "host", &head);
+        fs::rename(root.join("build"), root.join("build.noindex")).expect("move build");
+        std::os::unix::fs::symlink("build.noindex", root.join("build")).expect("link build");
+
+        for spelling in [
+            stage2_targo.clone(),
+            root.join("build.noindex/host/stage2/bin").join(targo_binary_name()),
+        ] {
+            resolve_upstream_compat_cargo_from_probe(
+                &root,
+                true,
+                UpstreamCompatCargoProbe {
+                    repo_stage2_targo: Some(spelling.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("{}: {error:#}", spelling.display()));
+        }
+
+        fs::remove_file(root.join("build")).expect("remove build link");
+        fs::rename(root.join("build.noindex"), root.join("elsewhere")).expect("move tree");
+        std::os::unix::fs::symlink("elsewhere", root.join("build")).expect("relink build");
+        let error = resolve_upstream_compat_cargo_from_probe(
+            &root,
+            true,
+            UpstreamCompatCargoProbe {
+                repo_stage2_targo: Some(stage2_targo),
+                ..Default::default()
+            },
+        )
+        .expect_err("an unsanctioned build link must not satisfy release porting");
+        assert!(format!("{error:#}").contains("repo-local stage2 targo"), "{error:#}");
 
         let _ = fs::remove_dir_all(root);
     }

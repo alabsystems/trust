@@ -25,13 +25,9 @@
 //! negation, `result < min OR result > max`) as a [`trust_types::Formula`] in
 //! the **exact** shape `trust-vcgen`'s `range.rs` emits for an overflow VC, so
 //! the kernel definition and the SMT obligation denote the same arithmetic
-//! fact. The two min/max helpers here are byte-for-byte copies of range.rs's
-//! `type_min_formula` / `type_max_formula`. The copy is locked from the OTHER
-//! side: `trust-vcgen`'s `range.rs` takes this crate as a dev-dependency and
-//! compares both the helpers and the emitted violation term against its own
-//! definitions. It has to be that direction — `range.rs` is `pub(crate)`, and a
-//! comparison written here could only restate the encoding rather than read
-//! it.
+//! fact. This crate owns the integer-bound functions; `trust-vcgen` imports
+//! them directly. Its tests compare the emitted violation term with this
+//! kernel-facing model and check bounds against independent arithmetic.
 //!
 //! ## Honesty / scope
 //!
@@ -156,21 +152,15 @@ use clean_kernel::{BinderInfo, Declaration, Environment, Expr, Level};
 use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
-// Integer type bounds — byte-identical to trust-vcgen/src/range.rs.
-//
-// CARDINAL: these MUST agree with range.rs exactly so the violation formula
-// this crate emits matches the overflow VC the generator emits. The two
-// functions are copied verbatim (not re-implemented); the tests that hold them
-// equal live in trust-vcgen's `range.rs`, where the authoritative definitions
-// are in scope. The tests below pin values only, and cannot detect a change
-// range.rs makes to its encoding.
+// Canonical integer type bounds, imported by trust-vcgen/src/range.rs.
+// The existing contracts and total out-of-domain behavior are preserved.
 // ---------------------------------------------------------------------------
 
 /// Maximum value for an integer type, as a [`Formula`].
 ///
 /// For unsigned 128-bit this is [`Formula::UInt`] (`u128::MAX > i128::MAX`,
 /// so it cannot be a [`Formula::Int`]); everything else is [`Formula::Int`].
-/// Mirrors `trust_vcgen::range::type_max_formula`.
+/// Shared directly with the VC generator.
 ///
 /// TOTAL (panic-free for every `u32` width) without changing the result for any
 /// in-domain unsigned width (`8/16/32/64/128`): the historical `(1i128 << width)
@@ -196,7 +186,7 @@ pub fn type_max_formula(width: u32, signed: bool) -> Formula {
 }
 
 /// Minimum value for an integer type, as a [`Formula`].
-/// Mirrors `trust_vcgen::range::type_min_formula`.
+/// Shared directly with the VC generator.
 #[must_use]
 #[cfg_attr(trust_contracts, requires(1 <= width && width <= 128))]
 pub fn type_min_formula(width: u32, signed: bool) -> Formula {
@@ -204,7 +194,7 @@ pub fn type_min_formula(width: u32, signed: bool) -> Formula {
 }
 
 /// Minimum value for a signed integer of the given bit width.
-/// Mirrors `trust_vcgen::range::signed_min`.
+/// Shared directly with the VC generator.
 ///
 /// # Trust contract (precondition)
 ///
@@ -256,7 +246,7 @@ pub fn signed_min(width: u32) -> i128 {
 }
 
 /// Maximum value for a signed integer of the given bit width.
-/// Mirrors `trust_vcgen::range::signed_max`.
+/// Shared directly with the VC generator.
 ///
 /// # Trust contract (precondition)
 ///

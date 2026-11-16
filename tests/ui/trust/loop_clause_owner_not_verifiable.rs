@@ -1,5 +1,11 @@
 //@ dont-check-compiler-stderr
 //@ compile-flags: -Ztrust-verify=on -Ztrust-policy=advisory
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
+// (RE-PINNED 2026-09-14: in_a_closure's whole-function panic-freedom aggregate is
+// runtime-checked — trust-mc's CHC/PDR transport "solved obligation … without a
+// proof" — and ruling B reports it as an advisory WARN pair. That row is not what
+// this file pins; the annotations above/below are.)
 //! Trust: a loop clause in a body the verifier's contract inventory cannot
 //! reach is a HARD ERROR, on BOTH surfaces.
 //!

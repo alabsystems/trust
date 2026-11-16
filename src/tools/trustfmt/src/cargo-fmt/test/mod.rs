@@ -81,7 +81,7 @@ fn formatter_that_aborts_during_process_launch_fails_closed() {
     formatter.args(["-c", "kill -ABRT $$"]);
 
     assert_eq!(
-        wait_for_formatter(&mut formatter).expect("run aborting formatter fixture"),
+        wait_for_formatter(&mut formatter, None).expect("run aborting formatter fixture"),
         FAILURE
     );
 }

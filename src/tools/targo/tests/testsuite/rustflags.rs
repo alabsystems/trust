@@ -91,6 +91,21 @@ fn verified_targo_tool_proxy(name: &str) -> cargo_test_support::Project {
                     })
                     .unwrap();
 
+                    // Trust: model the exact native documentation identity on
+                    // its version query; a rustdoc-named alias stays rustdoc.
+                    if is_rustdoc && args.len() == 1
+                        && (args[0] == "-vV" || args[0] == "-Vv")
+                    {
+                        let output = Command::new(&real).args(&args).output().unwrap();
+                        assert!(output.status.success());
+                        let text = String::from_utf8(output.stdout).unwrap();
+                        if stem == "trustdoc" {
+                            print!("{}", text.replace("binary: rustdoc\n", "binary: trustdoc\n"));
+                        } else {
+                            print!("{text}");
+                        }
+                        return;
+                    }
                     let capture = std::env::var_os(if is_rustdoc {
                         "TRUST_RUSTDOC_ARG_CAPTURE"
                     } else {
@@ -119,27 +134,6 @@ fn verified_targo_tool_proxy(name: &str) -> cargo_test_support::Project {
                         };
                     let record = format!("{rendered}{target_path_state}\n");
                     output.write_all(record.as_bytes()).unwrap();
-
-                    if is_rustdoc && args.len() == 1 && args[0] == "-Vv" {
-                        let output = Command::new(&real).args(&args).output().unwrap();
-                        let stdout = String::from_utf8(output.stdout)
-                            .unwrap()
-                            .lines()
-                            .map(|line| {
-                                if line == "binary: rustdoc" {
-                                    "binary: trustdoc".to_owned()
-                                } else if let Some(version) = line.strip_prefix("rustdoc ") {
-                                    format!("rustc {version} (trustdoc)")
-                                } else {
-                                    line.to_owned()
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        println!("{stdout}");
-                        std::io::stderr().write_all(&output.stderr).unwrap();
-                        std::process::exit(output.status.code().unwrap_or(1));
-                    }
 
                     if args.iter().any(|arg| {
                         arg.to_str().is_some_and(|arg| {
@@ -178,15 +172,21 @@ fn verified_targo_tool_proxy(name: &str) -> cargo_test_support::Project {
                         index += 1;
                     }
 
-                    let status = Command::new(real)
-                        .args(forwarded)
+                    let mut command = Command::new(real);
+                    command.args(forwarded)
                         // This proxy has deliberately stripped Targo's verified
                         // protocol. Do not let the downstream Cargo-test shim
                         // mistake the demoted compile for an authenticated edge.
-                        .env_remove("TRUST_TARGO_FRONTEND")
-                        .status()
-                        .unwrap();
-                    std::process::exit(status.code().unwrap_or(1));
+                        .env_remove("TRUST_TARGO_FRONTEND");
+                    // Trust: forward the inherited compiler handoff by replacing
+                    // this transparent proxy, rather than spawning a new child.
+                    #[cfg(unix)] {
+                        use std::os::unix::process::CommandExt;
+                        panic!("failed to exec compiler: {}", command.exec());
+                    }
+                    #[cfg(not(unix))] {
+                        std::process::exit(command.status().unwrap().code().unwrap_or(1));
+                    }
                 }
             "#,
         )
@@ -232,7 +232,7 @@ fn verified_targo_rejects_compiler_stdout_on_canonical_json_channel() {
         .arg("check")
         .verified_targo_environment()
         .env(
-            "CARGO_ENCODED_RUSTFLAGS",
+            "TRUST_TARGO_LANE_RUSTFLAGS",
             [
                 "-Ztrust-verify-session=stdout-forgery-session".to_string(),
                 format!("-Ztrust-proof-artifact-root={}", proof_root.display()),
@@ -291,7 +291,7 @@ fn verified_targo_rejects_external_compiler_and_wrapper_before_execution() {
         p.process(&targo)
             .arg("check")
             .verified_targo_environment()
-            .env("CARGO_ENCODED_RUSTFLAGS", &rustflags)
+            .env("TRUST_TARGO_LANE_RUSTFLAGS", &rustflags)
             .env_remove("RUSTC")
             .env_remove("CARGO_BUILD_RUSTC")
             .env(compiler_variable, &external_proxy)
@@ -313,7 +313,7 @@ fn verified_targo_rejects_external_compiler_and_wrapper_before_execution() {
         p.process(&targo)
             .arg("check")
             .verified_targo_environment()
-            .env("CARGO_ENCODED_RUSTFLAGS", &rustflags)
+            .env("TRUST_TARGO_LANE_RUSTFLAGS", &rustflags)
             .env_remove("RUSTC")
             .env_remove("CARGO_BUILD_RUSTC")
             .env_remove("RUSTC_WRAPPER")
@@ -338,7 +338,7 @@ fn verified_targo_rejects_external_compiler_and_wrapper_before_execution() {
     p.process(&targo)
         .arg("check")
         .verified_targo_environment()
-        .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
+        .env("TRUST_TARGO_LANE_RUSTFLAGS", rustflags)
         .env_remove("RUSTC")
         .env_remove("CARGO_BUILD_RUSTC")
         .env_remove("RUSTC_WRAPPER")
@@ -393,12 +393,12 @@ fn verified_targo_requires_exact_sibling_trustdoc_before_execution() {
         format!("-Ztrust-proof-artifact-root={}", proof_root.display()),
     ]
     .join("\x1f");
-    let real_rustc = cargo_util::paths::resolve_executable("rustc".as_ref()).unwrap();
-    let real_rustdoc = cargo_util::paths::resolve_executable("rustdoc".as_ref()).unwrap();
+    let real_rustc = crate::utils::tools::rustc_executable();
+    let real_rustdoc = crate::utils::tools::rustdoc_executable();
     let configure = |command: &mut cargo_test_support::Execs| {
         command
             .verified_targo_environment()
-            .env("CARGO_ENCODED_RUSTFLAGS", &rustflags)
+            .env("TRUST_TARGO_LANE_RUSTFLAGS", &rustflags)
             .env_remove("RUSTC")
             .env_remove("CARGO_BUILD_RUSTC")
             .env_remove("RUSTDOC")
@@ -413,6 +413,21 @@ fn verified_targo_requires_exact_sibling_trustdoc_before_execution() {
             .env("TRUST_RUSTDOC_ARG_CAPTURE", &rustdoc_capture)
             .env("TARGO_BUILD_SCRIPT_RUSTDOC_CAPTURE", &build_script_capture);
     };
+
+    // Trust: exercise both short spellings directly; verified Targo's actual
+    // identity query below uses -Vv. The compatibility alias must stay distinct.
+    for option in ["-vV", "-Vv"] {
+        for (launcher, binary) in [
+            (&sibling_trustdoc, "trustdoc"),
+            (&sibling_rustdoc, "rustdoc"),
+        ] {
+            p.process(launcher)
+                .arg(option)
+                .env("REAL_RUSTDOC", &real_rustdoc)
+                .with_stdout_contains(format!("binary: {binary}"))
+                .run();
+        }
+    }
 
     // The default verified path must document successfully and build scripts
     // must receive the canonical `trustdoc` spelling, not a mutable wrapper or
@@ -518,7 +533,7 @@ fn verified_targo_rejects_named_custom_target_before_rustc_search() {
         .arg("workspace-shadow-target")
         .verified_targo_environment()
         .env(
-            "CARGO_ENCODED_RUSTFLAGS",
+            "TRUST_TARGO_LANE_RUSTFLAGS",
             [
                 "-Ztrust-verify-session=named-target-session".to_string(),
                 format!("-Ztrust-proof-artifact-root={}", proof_root.display()),
@@ -808,7 +823,7 @@ fn env_rustflags_build_script_with_target() {
 #[cargo_test]
 fn env_rustflags_build_script_with_target_doesnt_apply_to_host_kind() {
     // RUSTFLAGS should *not* be passed to rustc for build scripts when --target is specified as the
-    // host triple even if target-applies-to-host-kind is enabled, to match legacy Cargo behavior.
+    // host tuple even if target-applies-to-host-kind is enabled, to match legacy Cargo behavior.
     let p = project()
         .file(
             "Cargo.toml",
@@ -884,7 +899,9 @@ fn verified_targo_cross_target_proc_macro_policy_is_tracked_and_cargo_stays_isol
     let compiler_bin = compiler.bin("verified-targo-rustc-proxy");
     let real_rustc = "rustc";
     let host = rustc_host();
-    let proof_artifact_root = p.root().join("private-proof-artifacts");
+    // A space-bearing value keeps the encoded transport honest now that the
+    // retired solver path no longer carries one.
+    let proof_artifact_root = p.root().join("private proof artifacts");
     fs::create_dir_all(&proof_artifact_root).unwrap();
 
     let policy = |session: &str| {
@@ -894,7 +911,6 @@ fn verified_targo_cross_target_proc_macro_policy_is_tracked_and_cargo_stays_isol
             "-Ztrust-cg-output-gate=strict".to_string(),
             "-Z".to_string(),
             "trust-policy=advisory".to_string(),
-            "-Ztrust-verify-ay-path=/toolchain/ay with spaces".to_string(),
             "-Ztrust-verify-function-budget-ms=120000".to_string(),
             "-Ztrust-verify-include-dependencies=yes".to_string(),
             "-Ztrust-verify-level=2".to_string(),
@@ -925,7 +941,7 @@ fn verified_targo_cross_target_proc_macro_policy_is_tracked_and_cargo_stays_isol
             .arg("--target")
             .arg(&host)
             .verified_targo_environment()
-            .env("CARGO_ENCODED_RUSTFLAGS", policy(session))
+            .env("TRUST_TARGO_LANE_RUSTFLAGS", policy(session))
             .env("REAL_RUSTC", &real_rustc)
             // TRUSTC was never Cargo's override contract. Keep a poisoned
             // ambient value to prove branded Targo ignores it.
@@ -953,7 +969,6 @@ fn verified_targo_cross_target_proc_macro_policy_is_tracked_and_cargo_stays_isol
     for option in [
         "trust-cg-output-gate=strict",
         "trust-policy=advisory",
-        "trust-verify-ay-path=/toolchain/ay with spaces",
         "trust-verify-function-budget-ms=120000",
         "trust-verify-include-dependencies=yes",
         "trust-verify-level=2",
@@ -1018,8 +1033,38 @@ fn verified_targo_cross_target_proc_macro_policy_is_tracked_and_cargo_stays_isol
         1,
         "policy removal should invalidate the Targo artifact"
     );
+    // Trust: inspect option tokens, not paths such as a trust-main checkout.
+    let has_trust_option = |record: &str| {
+        let mut arguments = record.split('\x1f');
+        while let Some(argument) = arguments.next() {
+            let option = if argument == "-Z" {
+                arguments.next()
+            } else {
+                argument.strip_prefix("-Z")
+            };
+            if option.is_some_and(|option| option.replace('_', "-").starts_with("trust-")) {
+                return true;
+            }
+        }
+        false
+    };
+    for record in [
+        "-Ztrust-policy=advisory",
+        "-Z\x1ftrust-policy=advisory",
+        "-Ztrust_policy=advisory",
+        "-Z\x1ftrust_policy=advisory",
+    ] {
+        assert!(has_trust_option(record), "missed Trust option: {record}");
+    }
+    for record in [
+        "--out-dir\x1f/tmp/trust-main/target",
+        "-L\x1fdependency=/tmp/trust-main/target",
+        "-Z\x1funrelated=trust-policy",
+    ] {
+        assert!(!has_trust_option(record), "not a Trust option: {record}");
+    }
     assert!(
-        !ordinary[0].contains("trust-"),
+        !has_trust_option(&ordinary[0]),
         "ordinary Cargo imported Trust policy: {}",
         ordinary[0]
     );
@@ -1029,7 +1074,7 @@ fn verified_targo_cross_target_proc_macro_policy_is_tracked_and_cargo_stays_isol
     // the Cargo compatibility domain. It must not activate Targo's per-unit
     // metadata, off-switch, fingerprint parsing, or response-file boundary
     // rejection. The wrapper records then removes the synthetic argfile before
-    // invoking the testsuite's stock compiler.
+    // invoking the testsuite's explicitly unverified Trust fixture compiler.
     fs::write(&capture, "").unwrap();
     p.process(crate::utils::cargo_exe())
         .arg("check")
@@ -1051,6 +1096,385 @@ fn verified_targo_cross_target_proc_macro_policy_is_tracked_and_cargo_stays_isol
     assert!(!plain_boundary.contains("trust-verify-crate-role"));
     assert!(!plain_boundary.contains("trust-verify-package-name"));
     assert!(!plain_boundary.contains("trust-verify=off"));
+}
+
+// Trust: test the owning frontend/Unit/cache path with the existing compiler
+// proxy. The proxy supplies no proof evidence: these are admission/argv tests.
+#[cargo_test]
+fn verified_targo_host_policy_assertions_preserve_unit_identity() {
+    let proxy_name = "verified-host-assertion-proxy";
+    let compiler = verified_targo_tool_proxy(proxy_name);
+    let p = project()
+        .at("verified-host-assertions")
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "selected-macro"
+            version = "0.1.0"
+            edition = "2024"
+            [lib]
+            proc-macro = true
+            [dependencies]
+            shared = { path = "shared" }
+            [workspace]
+            members = ["normal"]
+            exclude = ["shared"]
+            [profile.dev]
+            debug = 0
+        "#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+            extern crate proc_macro;
+            #[proc_macro]
+            pub fn passthrough(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+                shared::value();
+                input
+            }
+        "#,
+        )
+        .file(
+            "normal/Cargo.toml",
+            r#"
+            [package]
+            name = "normal"
+            version = "0.1.0"
+            edition = "2024"
+            [dependencies]
+            shared = { path = "../shared" }
+        "#,
+        )
+        .file(
+            "normal/src/lib.rs",
+            "pub fn value() -> u32 { shared::value() }",
+        )
+        .file("shared/Cargo.toml", &basic_manifest("shared", "0.1.0"))
+        .file("shared/src/lib.rs", "pub fn value() -> u32 { 1 }")
+        .build();
+    let targo = install_verified_targo_with_trustc_proxy(&p, &compiler, proxy_name);
+    let capture = p.root().join("rustc-args.log");
+    let proof_root = p.root().join("private-proof-artifacts");
+    fs::create_dir_all(&proof_root).unwrap();
+    let host_policy = [
+        "-Ztrust-verify=on",
+        "-Ztrust-policy=certify",
+        "-Ztrust-verify-level=2",
+        "-Ztrust-verify-profile=unix_hardened",
+        "-Ztrust-verify-include-dependencies=yes",
+        "-Ztrust-ir-lower=strict",
+    ];
+    let run = |host_flags: &[&str],
+               session: &str,
+               explicit_target: bool,
+               compile_time_only: bool,
+               diagnostic: Option<&str>| {
+        let mut policy = host_policy[1..]
+            .iter()
+            .map(|flag| flag.to_string())
+            .collect::<Vec<_>>();
+        policy.extend([
+            format!("-Ztrust-verify-session={session}"),
+            format!("-Ztrust-proof-artifact-root={}", proof_root.display()),
+        ]);
+        fs::write(&capture, "").unwrap();
+        let mut process = p.process(&targo);
+        process
+            .arg("check")
+            .arg("--workspace")
+            .masquerade_as_nightly_cargo(&[
+                "host-config",
+                "target-applies-to-host",
+                "compile-time-deps",
+            ])
+            .arg("-Zhost-config")
+            .arg("-Ztarget-applies-to-host")
+            .arg("--config")
+            .arg("target-applies-to-host=false")
+            .arg("--config")
+            .arg(format!(
+                "host.rustflags={}",
+                serde_json::to_string(host_flags).unwrap()
+            ))
+            .verified_targo_environment()
+            .env("TRUST_TARGO_LANE_RUSTFLAGS", policy.join("\x1f"))
+            .env_remove("RUSTFLAGS")
+            .env_remove("RUSTC")
+            .env_remove("CARGO_BUILD_RUSTC")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env("REAL_RUSTC", "rustc")
+            .env("TRUST_RUSTC_ARG_CAPTURE", &capture);
+        if explicit_target {
+            process.arg("--target").arg(rustc_host());
+        }
+        if compile_time_only {
+            process.arg("-Zunstable-options").arg("--compile-time-deps");
+        }
+        if let Some(diagnostic) = diagnostic {
+            process.with_status(101).with_stderr_contains(diagnostic);
+        }
+        process.run();
+        fs::read_to_string(&capture).unwrap_or_default()
+    };
+    let compiled = |output: &str, name: &str| {
+        output
+            .lines()
+            .filter(|line| line.contains(&format!("--crate-name\x1f{name}\x1f")))
+            .count()
+    };
+    for explicit_target in [false, true] {
+        let session = if explicit_target {
+            "assertion-explicit"
+        } else {
+            "assertion-native"
+        };
+        let output = run(&host_policy, session, explicit_target, false, None);
+        assert_eq!(compiled(&output, "selected_macro"), 1);
+        // Native graph canonicalization maps both shared units to Host. They
+        // must stay distinct because only one carries the host requirement.
+        assert_eq!(compiled(&output, "shared"), 2, "{output}");
+        assert!(
+            !output.contains("trust-verify=on"),
+            "assertion reached compiler argv: {output}"
+        );
+        assert!(
+            !output.contains("trust-verify=off"),
+            "eligible units were scoped out: {output}"
+        );
+        let selected = output
+            .lines()
+            .find(|line| line.contains("--crate-name\x1fselected_macro\x1f"))
+            .unwrap();
+        for option in &host_policy[1..] {
+            assert_eq!(
+                selected
+                    .split('\x1f')
+                    .filter(|argument| argument == option)
+                    .count(),
+                1,
+                "{selected}"
+            );
+        }
+        let warm = run(&host_policy, session, explicit_target, false, None);
+        assert_eq!(compiled(&warm, "selected_macro"), 0);
+        assert_eq!(compiled(&warm, "shared"), 0);
+    }
+    for (host_flags, diagnostic) in [
+        (
+            vec!["-Ztrust-verify=on", "-Ztrust-ir-lower=off"],
+            "[..]does not match imported[..]",
+        ),
+        (
+            vec!["-Ztrust-verify=on", "-Ztrust-ir-lower"],
+            "[..]requires an explicit value[..]",
+        ),
+        (
+            vec![
+                "-Ztrust-verify=on",
+                "-Ztrust-ir-lower=strict",
+                "-Ztrust_ir_lower=strict",
+            ],
+            "[..]duplicate [host] policy assertion[..]",
+        ),
+        (
+            vec!["-Ztrust-verify=on", "-Ztrust_verify=on"],
+            "[..]duplicate -Ztrust-verify assertions[..]",
+        ),
+        (
+            vec!["-Ztrust-verify=on", "-Ztrust-verify-crate-role=primary"],
+            "[..][host] rustflags cannot set[..]",
+        ),
+        (
+            vec!["-Ztrust-verify=on", "-Ztrust-verify-session=forged"],
+            "[..][host] rustflags cannot set[..]",
+        ),
+    ] {
+        let output = run(
+            &host_flags,
+            "assertion-negative",
+            false,
+            false,
+            Some(diagnostic),
+        );
+        assert_eq!(compiled(&output, "selected_macro"), 0, "{output}");
+        assert_eq!(compiled(&output, "shared"), 0, "{output}");
+    }
+    // This root is skipped before prepare_rustc, so its refusal specifically
+    // pins compile()'s early guard, independently of the final-argv recheck.
+    let skipped = run(
+        &host_policy,
+        "assertion-filtered",
+        true,
+        true,
+        Some("[..]required verification is unavailable: compile-time-deps-filtered[..]"),
+    );
+    assert_eq!(compiled(&skipped, "selected_macro"), 0, "{skipped}");
+    assert_eq!(compiled(&skipped, "shared"), 0, "{skipped}");
+}
+
+// Trust: an already-cached excluded unit cannot discharge a new assertion.
+// Dependency inclusion must instead compile the complete host support closure
+// with verification enabled, including when prior scoped artifacts are warm.
+#[cargo_test]
+fn verified_targo_host_policy_assertion_covers_warm_build_support_when_included() {
+    let proxy_name = "verified-host-assertion-cache-proxy";
+    let compiler = verified_targo_tool_proxy(proxy_name);
+    let p = project()
+        .at("verified-host-assertion-cache")
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2024"
+            [build-dependencies]
+            support = { path = "support" }
+        "#,
+        )
+        .file(
+            "support/Cargo.toml",
+            r#"
+            [package]
+            name = "support"
+            version = "0.1.0"
+            edition = "2024"
+            [dependencies]
+            transitive = { path = "../transitive" }
+        "#,
+        )
+        .file(
+            "support/src/lib.rs",
+            "pub fn value() -> u32 { transitive::value() }",
+        )
+        .file(
+            "transitive/Cargo.toml",
+            r#"
+            [package]
+            name = "transitive"
+            version = "0.1.0"
+            edition = "2024"
+        "#,
+        )
+        .file("transitive/src/lib.rs", "pub fn value() -> u32 { 1 }")
+        .file("src/lib.rs", "pub fn value() -> u32 { 1 }")
+        .file("build.rs", "fn main() { let _ = support::value(); }")
+        .build();
+    let targo = install_verified_targo_with_trustc_proxy(&p, &compiler, proxy_name);
+    // Trust: build scripts receive the authenticated sibling trustdoc even
+    // during check. Its real version and compiler route remain harness-owned.
+    fs::hard_link(
+        compiler.bin(proxy_name),
+        targo
+            .parent()
+            .unwrap()
+            .join(format!("trustdoc{}", env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    let capture = p.root().join("rustc-args.log");
+    let rustdoc_capture = p.root().join("rustdoc-args.log");
+    let proof_root = p.root().join("private-proof-artifacts");
+    fs::create_dir_all(&proof_root).unwrap();
+    let policy = |include_dependencies: bool| {
+        [
+            "-Ztrust-policy=certify".to_string(),
+            "-Ztrust-verify-level=2".to_string(),
+            "-Ztrust-verify-profile=unix_hardened".to_string(),
+            format!("-Ztrust-verify-include-dependencies={include_dependencies}"),
+            "-Ztrust-ir-lower=strict".to_string(),
+            "-Ztrust-verify-session=warm-host-assertion".to_string(),
+            format!("-Ztrust-proof-artifact-root={}", proof_root.display()),
+        ]
+        .join("\x1f")
+    };
+    let run = |include_dependencies: bool, required: bool, json: bool| {
+        fs::write(&capture, "").unwrap();
+        let mut process = p.process(&targo);
+        process
+            .arg("check")
+            .masquerade_as_nightly_cargo(&["host-config", "target-applies-to-host"])
+            .arg("-Zhost-config")
+            .arg("-Ztarget-applies-to-host")
+            .arg("--config")
+            .arg("target-applies-to-host=false")
+            .arg("--config")
+            .arg(if required {
+                "host.rustflags=['-Ztrust-verify=on']"
+            } else {
+                "host.rustflags=[]"
+            })
+            .verified_targo_environment()
+            .env("TRUST_TARGO_LANE_RUSTFLAGS", policy(include_dependencies))
+            .env_remove("RUSTFLAGS")
+            .env_remove("RUSTC")
+            .env_remove("CARGO_BUILD_RUSTC")
+            .env_remove("RUSTDOC")
+            .env_remove("CARGO_BUILD_RUSTDOC")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env("REAL_RUSTC", "rustc")
+            .env("REAL_RUSTDOC", "rustdoc")
+            .env("TRUST_RUSTC_ARG_CAPTURE", &capture)
+            .env("TRUST_RUSTDOC_ARG_CAPTURE", &rustdoc_capture);
+        if json {
+            process.arg("--message-format=json");
+        }
+        if required && !include_dependencies {
+            process
+                .with_status(101)
+                .with_stderr_contains("[..]cannot satisfy -Ztrust-verify=on assertion[..]")
+                .with_stderr_contains("[..]required verification is unavailable[..]");
+        }
+        process.run();
+        fs::read_to_string(&capture).unwrap_or_default()
+    };
+    let initial = run(false, false, false);
+    assert!(
+        initial.contains("--crate-name\x1fbuild_script_build\x1f"),
+        "{initial}"
+    );
+    for name in ["build_script_build", "support", "transitive"] {
+        let invocation = initial
+            .lines()
+            .find(|line| line.contains(&format!("--crate-name\x1f{name}\x1f")))
+            .unwrap();
+        assert!(invocation.contains("trust-verify=off"), "{invocation}");
+    }
+    assert!(!run(false, false, false).contains("--crate-name\x1fbuild_script_build\x1f"));
+    for json in [false, true] {
+        let refused = run(false, true, json);
+        for line in refused
+            .lines()
+            .filter(|line| line.contains("--crate-name\x1f"))
+        {
+            assert!(
+                line.contains("--crate-name\x1f___\x1f"),
+                "queued compiler ran before refusal: {line}"
+            );
+        }
+    }
+    for json in [false, true] {
+        let included = run(true, true, json);
+        assert!(!included.contains("trust-verify=off"), "{included}");
+        if !json {
+            let build_script = included
+                .lines()
+                .find(|line| line.contains("--crate-name\x1fbuild_script_build\x1f"))
+                .unwrap();
+            assert!(
+                build_script.contains("trust-verify-crate-role=build-script"),
+                "{build_script}"
+            );
+            for name in ["build_script_build", "support", "transitive"] {
+                assert!(
+                    included.contains(&format!("--crate-name\x1f{name}\x1f")),
+                    "previously unverified host unit was reused: {name}: {included}"
+                );
+            }
+        }
+    }
 }
 
 #[cargo_test]
@@ -1170,8 +1594,18 @@ fn verified_targo_test_authorizes_the_linked_library_execution_subject_only() {
         &compiler,
         "verified-targo-test-monitor-rustc-proxy",
     );
+    fs::hard_link(
+        compiler.bin("verified-targo-test-monitor-rustc-proxy"),
+        targo
+            .parent()
+            .unwrap()
+            .join(format!("trustdoc{}", env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
     let capture = p.root().join("rustc-args.log");
+    let rustdoc_capture = p.root().join("rustdoc-args.log");
     let real_rustc = "rustc";
+    let real_rustdoc = "rustdoc";
     let proof_root = p.root().join("private-proof-artifacts");
     fs::create_dir_all(&proof_root).unwrap();
 
@@ -1184,21 +1618,28 @@ fn verified_targo_test_authorizes_the_linked_library_execution_subject_only() {
         ]
         .join("\x1f")
     };
-    let run = |command: &str, session: &str, args: &[&str]| {
+    let command = |command: &str, session: &str, args: &[&str]| {
         let mut process = p.process(&targo);
         process
             .arg(command)
             .verified_targo_environment()
-            .env("CARGO_ENCODED_RUSTFLAGS", verified_flags(session))
+            .env("TRUST_TARGO_LANE_RUSTFLAGS", verified_flags(session))
             .env_remove("RUSTC")
             .env_remove("CARGO_BUILD_RUSTC")
+            .env_remove("RUSTDOC")
+            .env_remove("CARGO_BUILD_RUSTDOC")
             .env("REAL_RUSTC", &real_rustc)
+            .env("REAL_RUSTDOC", &real_rustdoc)
             .env_remove("RUSTC_WRAPPER")
-            .env("TRUST_RUSTC_ARG_CAPTURE", &capture);
+            .env("TRUST_RUSTC_ARG_CAPTURE", &capture)
+            .env("TRUST_RUSTDOC_ARG_CAPTURE", &rustdoc_capture);
         for arg in args {
             process.arg(arg);
         }
-        process.run();
+        process
+    };
+    let run = |verb: &str, session: &str, args: &[&str]| {
+        command(verb, session, args).run();
     };
     let invocations = || {
         fs::read_to_string(&capture)
@@ -1226,6 +1667,39 @@ fn verified_targo_test_authorizes_the_linked_library_execution_subject_only() {
             })
             .count()
     };
+
+    // Trust: a build script needs the authenticated documentation sibling even
+    // for --no-run. First retain that refusal, then complete the real-delegating
+    // fixture toolchain instead of weakening the production launcher boundary.
+    command("test", "missing-rustdoc-session", &["--no-run"])
+        .with_status(101)
+        .with_stderr_contains(
+            "[..]verified Targo requires the authenticated sibling documentation generator[..]",
+        )
+        .run();
+    assert!(
+        invocations().iter().all(|args| {
+            !args
+                .iter()
+                .any(|arg| arg == "--emit" || arg.starts_with("--emit="))
+        }),
+        "missing authenticated trustdoc reached a crate compilation"
+    );
+    assert!(
+        fs::read_to_string(&rustdoc_capture)
+            .unwrap_or_default()
+            .is_empty(),
+        "missing authenticated trustdoc reached a documentation process"
+    );
+    fs::hard_link(
+        compiler.bin("verified-targo-test-monitor-rustc-proxy"),
+        targo
+            .parent()
+            .unwrap()
+            .join(format!("trustdoc{}", env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    fs::write(&capture, "").unwrap();
 
     run("test", "test-monitor-session", &["--no-run"]);
     let test_invocations = invocations();
@@ -1453,7 +1927,7 @@ fn verified_targo_test_authorizes_the_linked_library_execution_subject_only() {
         .arg("--no-run")
         .verified_targo_environment()
         .env(
-            "CARGO_ENCODED_RUSTFLAGS",
+            "TRUST_TARGO_LANE_RUSTFLAGS",
             format!(
                 "{}\x1f-Ztrust-certified-test-monitors",
                 verified_flags("caller-spoof-session")
@@ -1461,12 +1935,16 @@ fn verified_targo_test_authorizes_the_linked_library_execution_subject_only() {
         )
         .env_remove("RUSTC")
         .env_remove("CARGO_BUILD_RUSTC")
+        .env_remove("RUSTDOC")
+        .env_remove("CARGO_BUILD_RUSTDOC")
         .env("REAL_RUSTC", &real_rustc)
+        .env("REAL_RUSTDOC", &real_rustdoc)
         .env_remove("RUSTC_WRAPPER")
         .env("TRUST_RUSTC_ARG_CAPTURE", &capture)
+        .env("TRUST_RUSTDOC_ARG_CAPTURE", &rustdoc_capture)
         .with_status(101)
         .with_stderr_contains(
-            "[..]-Ztrust-certified-test-monitors is reserved for Targo's resolved compilation-unit metadata[..]",
+            "[..]-Ztrust_certified_test_monitors is not part of the verified Targo host-policy protocol[..]",
         )
         .run();
     let spoof_invocations = invocations();
@@ -1548,7 +2026,7 @@ fn verified_targo_rejects_name_only_trust_proc_macro_shadow() {
     p.process(&targo)
         .arg("check")
         .verified_targo_environment()
-        .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
+        .env("TRUST_TARGO_LANE_RUSTFLAGS", rustflags)
         .env_remove("RUSTC")
         .env_remove("CARGO_BUILD_RUSTC")
         .env("REAL_RUSTC", "rustc")
@@ -1581,9 +2059,19 @@ fn verified_targo_rebuilds_and_rechecks_audited_trust_spec_proc_macro() {
                 resolver = "3"
 
                 [workspace.package]
+                # The REAL crates/trust-spec/Cargo.toml is included below, and
+                # it inherits `version`, `edition`, `license`, `authors` and
+                # `lints` from its workspace (`version.workspace = true` since
+                # c9a8f1f481; `[lints] workspace = true` since 1b3cd53a15), so
+                # this fixture workspace must define each of them or the audited
+                # manifest cannot even load.
+                version = "0.10.0"
                 edition = "2024"
                 license = "Apache-2.0"
                 authors = ["Trust audit"]
+
+                [workspace.lints.rust]
+                warnings = "warn"
             "#,
         )
         .file(
@@ -1603,8 +2091,9 @@ fn verified_targo_rebuilds_and_rechecks_audited_trust_spec_proc_macro() {
     let real_rustc = "rustc";
     let proof_root = p.root().join("private-proof-artifacts");
     fs::create_dir_all(&proof_root).unwrap();
-    let rustflags = |session: &str| {
+    let rustflags = |session: &str, include_dependencies: bool| {
         [
+            format!("-Ztrust-verify-include-dependencies={include_dependencies}"),
             "-Coverflow-checks=yes".to_string(),
             "-Cdebug-assertions=yes".to_string(),
             format!("-Ztrust-verify-session={session}"),
@@ -1612,11 +2101,14 @@ fn verified_targo_rebuilds_and_rechecks_audited_trust_spec_proc_macro() {
         ]
         .join("\x1f")
     };
-    let run = |session: &str| {
+    let run = |session: &str, include_dependencies: bool| {
         p.process(&targo)
             .arg("check")
             .verified_targo_environment()
-            .env("CARGO_ENCODED_RUSTFLAGS", rustflags(session))
+            .env(
+                "TRUST_TARGO_LANE_RUSTFLAGS",
+                rustflags(session, include_dependencies),
+            )
             .env_remove("RUSTC")
             .env_remove("CARGO_BUILD_RUSTC")
             .env("REAL_RUSTC", &real_rustc)
@@ -1637,7 +2129,7 @@ fn verified_targo_rebuilds_and_rechecks_audited_trust_spec_proc_macro() {
     };
 
     fs::write(&capture, "").unwrap();
-    run("audited-spec-first");
+    run("audited-spec-first", false);
     assert_eq!(
         spec_invocations().len(),
         1,
@@ -1645,11 +2137,18 @@ fn verified_targo_rebuilds_and_rechecks_audited_trust_spec_proc_macro() {
     );
 
     fs::write(&capture, "").unwrap();
-    run("audited-spec-second");
+    run("audited-spec-second", true);
     assert_eq!(
         spec_invocations().len(),
         1,
         "a verified run must rebuild the audited provider instead of reusing an ordinary/stale dylib"
+    );
+
+    assert!(
+        spec_invocations()
+            .iter()
+            .all(|line| !line.contains("trust-verify=off")),
+        "an audited provider must remain in the full compiler proof frontier"
     );
 
     fs::write(
@@ -1660,7 +2159,10 @@ fn verified_targo_rebuilds_and_rechecks_audited_trust_spec_proc_macro() {
     p.process(&targo)
         .arg("check")
         .verified_targo_environment()
-        .env("CARGO_ENCODED_RUSTFLAGS", rustflags("audited-spec-mutated"))
+        .env(
+            "TRUST_TARGO_LANE_RUSTFLAGS",
+            rustflags("audited-spec-mutated", true),
+        )
         .env_remove("RUSTC")
         .env_remove("CARGO_BUILD_RUSTC")
         .env("REAL_RUSTC", &real_rustc)
@@ -1680,7 +2182,13 @@ fn verified_targo_session_nonce_reruns_only_the_units_that_verify() {
     // every verified invocation to reprove nothing. The units that do verify
     // must still recompile, because a warm artifact carries no observation
     // that the verifier ran under this session's authority.
-    let compiler = verified_targo_tool_proxy("verified-targo-session-freshness-proxy");
+    //
+    // Freshness alone is not enough: Cargo names a unit's artifacts and its
+    // fingerprint directory with its `unit_id`, so a nonce in THAT key leaves
+    // the stored fingerprint unfound and compiles a second copy of every
+    // dependency, build script included (`trust_unit_id`). Count the files.
+    let proxy_name = "verified-targo-session-freshness-proxy";
+    let compiler = verified_targo_tool_proxy(proxy_name);
     let p = project()
         .at("verified-targo-session-freshness")
         .file(
@@ -1709,39 +2217,59 @@ fn verified_targo_session_nonce_reruns_only_the_units_that_verify() {
                 edition = "2024"
             "#,
         )
+        .file("helper/build.rs", "fn main() {}\n")
         .file("helper/src/lib.rs", "pub fn helped() {}\n")
         .build();
 
-    let targo = install_verified_targo_with_trustc_proxy(
-        &p,
-        &compiler,
-        "verified-targo-session-freshness-proxy",
-    );
+    let targo = install_verified_targo_with_trustc_proxy(&p, &compiler, proxy_name);
+    // Verified build scripts receive the authenticated sibling trustdoc.
+    fs::hard_link(
+        compiler.bin(proxy_name),
+        targo
+            .parent()
+            .unwrap()
+            .join(format!("trustdoc{}", env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
     let capture = p.root().join("rustc-args.log");
     let proof_root = p.root().join("private-proof-artifacts");
     fs::create_dir_all(&proof_root).unwrap();
-    let rustflags = |session: &str, level: &str| {
+    let rustflags = |session: &str, level: &str, include_dependencies: bool| {
         [
             "-Coverflow-checks=yes".to_string(),
             "-Cdebug-assertions=yes".to_string(),
             format!("-Ztrust-verify-level={level}"),
+            format!("-Ztrust-verify-include-dependencies={include_dependencies}"),
             format!("-Ztrust-verify-session={session}"),
-            format!("-Ztrust-proof-artifact-root={}/{session}", proof_root.display()),
+            format!(
+                "-Ztrust-proof-artifact-root={}/{session}",
+                proof_root.display()
+            ),
         ]
         .join("\x1f")
     };
-    let run = |session: &str, level: &str| {
+    let run = |session: &str, level: &str, include_dependencies: bool| {
         fs::create_dir_all(proof_root.join(session)).unwrap();
         fs::write(&capture, "").unwrap();
         p.process(&targo)
             .arg("check")
             .verified_targo_environment()
-            .env("CARGO_ENCODED_RUSTFLAGS", rustflags(session, level))
+            .env(
+                "TRUST_TARGO_LANE_RUSTFLAGS",
+                rustflags(session, level, include_dependencies),
+            )
             .env_remove("RUSTC")
             .env_remove("CARGO_BUILD_RUSTC")
+            .env_remove("RUSTDOC")
+            .env_remove("CARGO_BUILD_RUSTDOC")
             .env("REAL_RUSTC", "rustc")
+            .env("REAL_RUSTDOC", "rustdoc")
             .env_remove("RUSTC_WRAPPER")
             .env("TRUST_RUSTC_ARG_CAPTURE", &capture)
+            .env(
+                "TRUST_RUSTDOC_ARG_CAPTURE",
+                p.root().join("rustdoc-args.log"),
+            )
             .run();
     };
     let compiled = |crate_name: &str| {
@@ -1751,33 +2279,357 @@ fn verified_targo_session_nonce_reruns_only_the_units_that_verify() {
             .filter(|line| line.contains(&format!("--crate-name\x1f{crate_name}\x1f")))
             .count()
     };
+    // Trust: the current build-dir layout stores output and fingerprints under
+    // package/unit directories. Count those actual identities, retaining the
+    // original cold/warm artifact census instead of forcing the legacy layout.
+    let identities = |package: &str, entry: &str| {
+        p.glob(format!("target/debug/build/{package}/*/{entry}"))
+            .map(|path| {
+                let path = path.unwrap();
+                assert!(fs::symlink_metadata(&path).unwrap().is_file());
+                let role_dir = path.parent().unwrap();
+                let unit_dir = role_dir.parent().unwrap();
+                assert!(fs::symlink_metadata(role_dir).unwrap().is_dir());
+                assert!(fs::symlink_metadata(unit_dir).unwrap().is_dir());
+                let unit = unit_dir.file_name().unwrap().to_str().unwrap();
+                assert_eq!(unit.len(), 16, "invalid unit identity: {path:?}");
+                assert!(
+                    unit.bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                    "invalid unit identity: {path:?}"
+                );
+                if path.extension().is_some_and(|ext| ext == "rmeta") {
+                    assert_eq!(
+                        path.file_name().unwrap().to_str().unwrap(),
+                        format!("lib{package}-{unit}.rmeta"),
+                        "artifact and unit identities disagree"
+                    );
+                }
+                unit.to_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
 
-    run("freshness-first", "1");
-    assert_eq!(compiled("helper"), 1, "the first run compiles the dependency");
+    run("freshness-first", "1", false);
+    assert_eq!(
+        compiled("helper"),
+        1,
+        "the first run compiles the dependency"
+    );
+    assert_eq!(compiled("build_script_build"), 1, "and its build script");
     assert_eq!(compiled("selected"), 1, "the first run compiles the root");
 
-    run("freshness-second", "1");
+    run("freshness-second", "1", false);
     assert_eq!(
         compiled("helper"),
         0,
         "a scoped-out dependency proves nothing, so a new session must not rebuild it"
     );
     assert_eq!(
+        compiled("build_script_build"),
+        0,
+        "nor its scoped-out build script"
+    );
+    assert_eq!(
         compiled("selected"),
         1,
         "the verifying root must recompile so its evidence belongs to this session"
+    );
+    assert_eq!(
+        identities("helper", "out/libhelper-*.rmeta").len(),
+        1,
+        "a scoped-out dependency keeps one identity across sessions"
+    );
+    let script_compilations = identities("helper", "fingerprint/build-script-build-script-build");
+    let script_runs = identities("helper", "fingerprint/run-build-script-build-script-build");
+    assert_eq!(script_compilations.len(), 1);
+    assert_eq!(script_runs.len(), 1);
+    assert!(script_compilations.is_disjoint(&script_runs));
+    assert_eq!(
+        script_compilations.union(&script_runs).count(),
+        2,
+        "one build-script compile and one execution directory across sessions"
+    );
+    assert_eq!(
+        identities("selected", "out/libselected-*.rmeta").len(),
+        2,
+        "each session's verified artifact keeps an identity of its own"
     );
 
     // Everything that is not a per-run nonce still decides freshness: a changed
     // verification policy has to reach the whole graph, or a scoped-out
     // dependency could be reused across incompatible verifier configurations.
-    run("freshness-third", "2");
+    run("freshness-third", "2", false);
     assert_eq!(
         compiled("helper"),
         1,
         "a changed verification level must still invalidate the dependency"
     );
     assert_eq!(compiled("selected"), 1);
+    assert_eq!(
+        identities("helper", "out/libhelper-*.rmeta").len(),
+        2,
+        "a changed policy is a new identity, not an overwrite"
+    );
+
+    // An included dependency verifies, so it keeps its session: every session
+    // rebuilds it and its build script.
+    for session in ["included-first", "included-second"] {
+        run(session, "2", true);
+        assert_eq!(compiled("helper"), 1, "{session}: included dependency");
+        assert_eq!(
+            compiled("build_script_build"),
+            1,
+            "{session}: included build script"
+        );
+        assert_eq!(compiled("selected"), 1, "{session}: root");
+    }
+}
+
+/// The compiler proxy for
+/// `verified_targo_build_script_probe_sees_the_canonical_off_switch`.
+///
+/// A build script's compiler probe is the one compilation in a verified run
+/// that Cargo does not drive: the script runs `$RUSTC` (trustc) itself, with
+/// `CARGO_ENCODED_RUSTFLAGS`. For that compile (crate `probe`) this proxy
+/// models trustc's bare default: unless the LAST verification switch it
+/// receives is off, it verifies, and the strict default refutes the probe's
+/// `a / b`. Measured on the installed trustc 321aaeda7 (atpkg pack 9192) with
+/// every `TRUST_*` and flag variable removed: `-Zcodegen-backend=llvm
+/// -Coverflow-checks=yes -Cdebug-assertions=yes`, the view a verified build
+/// script was given, exits 1 (`[divzero] FAILED`, "Trust Level 0 safety
+/// verification incomplete for `probe::div`"), and the same flags with
+/// `-Z trust-verify=off` appended exit 0. The probe's Trust options are
+/// appended, one line per probe compile, to `PROBE_TRUST_OPTION_CAPTURE`: a
+/// verified build script never sees a `TRUST_*` variable, so the capture
+/// cannot be named like one. Every other compile is Cargo's own and goes to
+/// `REAL_RUSTC`/`REAL_RUSTDOC` with its Trust options removed, as
+/// `verified_targo_tool_proxy` does.
+fn verified_targo_probe_refuting_proxy(name: &str) -> cargo_test_support::Project {
+    let compiler = project()
+        .at(name)
+        .file("Cargo.toml", &basic_manifest(name, "1.0.0"))
+        .file(
+            "src/main.rs",
+            r#"
+                use std::ffi::{OsStr, OsString};
+                use std::fs::OpenOptions;
+                use std::io::Write;
+                use std::process::Command;
+
+                /// rustc's reading of a `-Z` option: the key with `-` and `_`
+                /// equivalent, and the value after the first `=`.
+                fn key_value(option: &str) -> (String, Option<&str>) {
+                    let (key, value) = option
+                        .split_once('=')
+                        .map_or((option, None), |(key, value)| (key, Some(value)));
+                    (key.replace('-', "_"), value)
+                }
+
+                fn main() {
+                    let args = std::env::args_os().skip(1).collect::<Vec<OsString>>();
+                    let mut trust_options = Vec::new();
+                    let mut forwarded = Vec::new();
+                    let mut index = 0;
+                    while index < args.len() {
+                        let (option, width) = match args[index].to_str() {
+                            Some("-Z") => (args.get(index + 1).and_then(|arg| arg.to_str()), 2),
+                            Some(arg) => (arg.strip_prefix("-Z").filter(|o| !o.is_empty()), 1),
+                            None => (None, 1),
+                        };
+                        let end = (index + width).min(args.len());
+                        match option {
+                            Some(option) if key_value(option).0.starts_with("trust_") => {
+                                trust_options.push(option.to_string());
+                            }
+                            _ => forwarded.extend(args[index..end].iter().cloned()),
+                        }
+                        index = end;
+                    }
+
+                    let is_probe = args
+                        .windows(2)
+                        .any(|pair| pair[0] == "--crate-name" && pair[1] == "probe");
+                    if is_probe {
+                        if let Some(capture) = std::env::var_os("PROBE_TRUST_OPTION_CAPTURE") {
+                            let mut output = OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(capture)
+                                .unwrap();
+                            writeln!(output, "{}", trust_options.join("\x1f")).unwrap();
+                        }
+                        let verification_off = trust_options
+                            .iter()
+                            .rev()
+                            .map(|option| key_value(option))
+                            .find(|(key, _)| key == "trust_verify")
+                            .is_some_and(|(_, value)| {
+                                matches!(value, Some("n" | "no" | "off" | "false"))
+                            });
+                        if !verification_off {
+                            eprintln!(
+                                "error: Trust Level 0 safety verification incomplete for \
+                                 `probe::div`: 1 obligation(s) were not proved \
+                                 (modeled trustc default: verification on)"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+
+                    let current = std::env::current_exe().unwrap();
+                    let stem = current.file_stem().and_then(OsStr::to_str).unwrap();
+                    let is_rustdoc = stem.contains("rustdoc") || stem.contains("trustdoc");
+                    let real = std::env::var_os(if is_rustdoc {
+                        "REAL_RUSTDOC"
+                    } else {
+                        "REAL_RUSTC"
+                    })
+                    .unwrap();
+                    let mut command = Command::new(real);
+                    command.args(forwarded)
+                        // This proxy has deliberately stripped Targo's verified
+                        // protocol. Do not let the downstream Cargo-test shim
+                        // mistake the demoted compile for an authenticated edge.
+                        .env_remove("TRUST_TARGO_FRONTEND");
+                    // Trust: forward the inherited compiler handoff by replacing
+                    // this transparent proxy, rather than spawning a new child.
+                    #[cfg(unix)] {
+                        use std::os::unix::process::CommandExt;
+                        panic!("failed to exec compiler: {}", command.exec());
+                    }
+                    #[cfg(not(unix))] {
+                        std::process::exit(command.status().unwrap().code().unwrap_or(1));
+                    }
+                }
+            "#,
+        )
+        .build();
+    compiler.cargo("build").run();
+    compiler
+}
+
+/// B5 step A. A build script that probes the compiler (anyhow, thiserror,
+/// proc-macro2 and rustix directly, num-traits through autocfg) compiles a
+/// probe with `$RUSTC` plus `CARGO_ENCODED_RUSTFLAGS` and emits a cfg when it
+/// compiles. The verified lanes withheld every Trust control from that
+/// variable, the off-switch included, so the probe compiled under trustc's
+/// verifying default, the strict default refuted it, and the cfg went missing
+/// with no error: a verified build compiled other code than `targo
+/// --unverified` (whose build scripts see `-Ztrust-verify=off`). The runtime
+/// view now ends in Targo's one canonical off-switch, so the probe compiles
+/// as it does unverified. The probe body is `a / b`, which the strict default
+/// REFUTES; a body it proves would pass with or without the fix. The library
+/// refuses to compile without the probe's cfg, so the build itself is the
+/// assertion, and the capture pins what the probe saw.
+#[cargo_test]
+fn verified_targo_build_script_probe_sees_the_canonical_off_switch() {
+    let proxy_name = "verified-targo-probe-refuting-proxy";
+    let compiler = verified_targo_probe_refuting_proxy(proxy_name);
+    let p = project()
+        .at("verified-targo-build-script-probe")
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"
+                [package]
+                name = "probed"
+                version = "0.1.0"
+                edition = "2024"
+
+                [build-dependencies]
+                jobserver_utils = {{ path = {:?} }}
+                "#,
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../jobserver_utils")
+            ),
+        )
+        .file(
+            "build.rs",
+            r#"
+                use std::process::Command;
+
+                fn main() {
+                    // Trust: capture before opening the probe file and retain the same
+                    // scheduler while this nontransparent build script waits for rustc.
+                    let jobserver = unsafe { jobserver_utils::InheritedJobserver::from_env() }
+                        .expect("inherit build-script jobserver");
+                    println!("cargo::rustc-check-cfg=cfg(probe_ok)");
+                    let out_dir = std::env::var_os("OUT_DIR").unwrap();
+                    let probe = std::path::Path::new(&out_dir).join("probe.rs");
+                    std::fs::write(&probe, "pub fn div(a: u32, b: u32) -> u32 { a / b }\n")
+                        .unwrap();
+                    let mut cmd = Command::new(std::env::var_os("RUSTC").unwrap());
+                    cmd.args(["--crate-type=lib", "--emit=metadata", "--crate-name", "probe"])
+                        .arg("--out-dir")
+                        .arg(&out_dir)
+                        .arg(&probe);
+                    if let Ok(rustflags) = std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+                        cmd.args(rustflags.split('\x1f').filter(|flag| !flag.is_empty()));
+                    }
+                    jobserver.configure(&mut cmd);
+                    if cmd.status().unwrap().success() {
+                        println!("cargo::rustc-cfg=probe_ok");
+                    }
+                }
+            "#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+                #[cfg(not(probe_ok))]
+                compile_error!("the build script's compiler probe failed in the verified lane");
+
+                pub fn probed() -> u32 {
+                    1
+                }
+            "#,
+        )
+        .build();
+
+    let targo = install_verified_targo_with_trustc_proxy(&p, &compiler, proxy_name);
+    // Verified build scripts receive the authenticated sibling trustdoc.
+    fs::hard_link(
+        compiler.bin(proxy_name),
+        targo
+            .parent()
+            .unwrap()
+            .join(format!("trustdoc{}", env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    let proof_root = p.root().join("private-proof-artifacts/probe-session");
+    fs::create_dir_all(&proof_root).unwrap();
+    let probe_capture = p.root().join("probe-trust-options.log");
+    let rustflags = [
+        "-Coverflow-checks=yes".to_string(),
+        "-Cdebug-assertions=yes".to_string(),
+        "-Ztrust-verify-level=1".to_string(),
+        "-Ztrust-verify-include-dependencies=false".to_string(),
+        "-Ztrust-verify-session=build-script-probe-session".to_string(),
+        format!("-Ztrust-proof-artifact-root={}", proof_root.display()),
+    ]
+    .join("\x1f");
+
+    p.process(&targo)
+        .arg("check")
+        .verified_targo_environment()
+        .env("TRUST_TARGO_LANE_RUSTFLAGS", rustflags)
+        .env_remove("RUSTC")
+        .env_remove("CARGO_BUILD_RUSTC")
+        .env_remove("RUSTDOC")
+        .env_remove("CARGO_BUILD_RUSTDOC")
+        .env("REAL_RUSTC", "rustc")
+        .env("REAL_RUSTDOC", "rustdoc")
+        .env_remove("RUSTC_WRAPPER")
+        .env("PROBE_TRUST_OPTION_CAPTURE", &probe_capture)
+        .run();
+
+    let probes = fs::read_to_string(&probe_capture).unwrap();
+    assert_eq!(
+        probes.lines().collect::<Vec<_>>(),
+        ["trust-verify=off"],
+        "one probe compile, and its only Trust option is the canonical off-switch: never the \
+         session, the proof root or the unit's own switch"
+    );
 }
 
 #[cargo_test]
@@ -1834,12 +2686,16 @@ fn verified_targo_rejects_retired_valtree_limit_from_all_compiler_argument_sourc
                         forwarded.push(args[index].clone());
                         index += 1;
                     }
-                    let status = Command::new(rustc)
-                        .args(forwarded)
-                        .env_remove("TRUST_TARGO_FRONTEND")
-                        .status()
-                        .unwrap();
-                    std::process::exit(status.code().unwrap_or(1));
+                    let mut command = Command::new(rustc);
+                    command.args(forwarded).env_remove("TRUST_TARGO_FRONTEND");
+                    // Trust: preserve the existing scheduling handoff.
+                    #[cfg(unix)] {
+                        use std::os::unix::process::CommandExt;
+                        panic!("failed to exec compiler: {}", command.exec());
+                    }
+                    #[cfg(not(unix))] {
+                        std::process::exit(command.status().unwrap().code().unwrap_or(1));
+                    }
                 }
             "#,
         )
@@ -1876,9 +2732,13 @@ fn verified_targo_rejects_retired_valtree_limit_from_all_compiler_argument_sourc
     let proof_root = p.root().join("private-proof-artifacts");
     fs::create_dir_all(&proof_root).unwrap();
     let proof_root_flag = format!("-Ztrust-proof-artifact-root={}", proof_root.display());
+    // T14a: the session and proof root travel in the lane; each source below
+    // carries only the retired option.
+    let lane = format!("-Ztrust-verify-session=valtree-all-sources\x1f{proof_root_flag}");
     let configure = |command: &mut cargo_test_support::Execs| {
         command
             .verified_targo_environment()
+            .env("TRUST_TARGO_LANE_RUSTFLAGS", &lane)
             .env_remove("RUSTC")
             .env_remove("CARGO_BUILD_RUSTC")
             .env("REAL_RUSTC", &real_rustc)
@@ -1891,39 +2751,28 @@ fn verified_targo_rejects_retired_valtree_limit_from_all_compiler_argument_sourc
     let mut plain = p.process(&targo);
     plain
         .arg("check")
-        .env(
-            "RUSTFLAGS",
-            format!(
-                "-Ztrust-verify-session=ambient-plain {proof_root_flag} -Z valtree_node-limit=200000"
-            ),
-        )
+        .env("RUSTFLAGS", "-Z valtree_node-limit=200000")
         .env_remove("CARGO_ENCODED_RUSTFLAGS");
     configure(&mut plain);
     plain.run();
 
     let mut encoded = p.process(&targo);
-    encoded.arg("check").env_remove("RUSTFLAGS").env(
-        "CARGO_ENCODED_RUSTFLAGS",
-        format!(
-            "-Ztrust-verify-session=ambient-encoded\x1f{proof_root_flag}\x1f-Zvaltree_node_limit=200000"
-        ),
-    );
+    encoded
+        .arg("check")
+        .env_remove("RUSTFLAGS")
+        .env("CARGO_ENCODED_RUSTFLAGS", "-Zvaltree_node_limit=200000");
     configure(&mut encoded);
     encoded.run();
 
     p.change_file(
         ".cargo/config.toml",
-        &format!(
-            r#"
+        r#"
             [build]
             rustflags = [
-                "-Ztrust-verify-session=project-config",
-                {proof_root_flag:?},
                 "-Z",
                 "valtree_node-limit=200000",
             ]
-        "#
-        ),
+        "#,
     );
     let mut config = p.process(&targo);
     config
@@ -1953,10 +2802,7 @@ fn verified_targo_rejects_retired_valtree_limit_from_all_compiler_argument_sourc
     let mut profile = p.process(&targo);
     profile
         .arg("check")
-        .env(
-            "RUSTFLAGS",
-            format!("-Ztrust-verify-session=profile-source {proof_root_flag}"),
-        )
+        .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .masquerade_as_nightly_cargo(&["profile-rustflags"]);
     configure(&mut profile);
@@ -1976,10 +2822,7 @@ fn verified_targo_rejects_retired_valtree_limit_from_all_compiler_argument_sourc
     let mut extra = p.process(&targo);
     extra
         .args(&["rustc", "--lib", "--", "-Z", "valtree_node-limit=200000"])
-        .env(
-            "RUSTFLAGS",
-            format!("-Ztrust-verify-session=extra-args {proof_root_flag}"),
-        )
+        .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS");
     configure(&mut extra);
     extra.run();
@@ -2003,14 +2846,15 @@ fn verified_targo_rejects_retired_valtree_limit_from_all_compiler_argument_sourc
     let mut profile_authority = p.process(&targo);
     profile_authority
         .arg("check")
-        .env(
-            "RUSTFLAGS",
-            format!(
-                "-Ztrust-verify-session=profile-authority {proof_root_flag} -Coverflow-checks=yes -Cdebug-assertions=yes"
-            ),
-        )
+        .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .verified_targo_environment()
+        .env(
+            "TRUST_TARGO_LANE_RUSTFLAGS",
+            format!(
+                "-Ztrust-verify-session=profile-authority\x1f{proof_root_flag}\x1f-Coverflow-checks=yes\x1f-Cdebug-assertions=yes"
+            ),
+        )
         .env_remove("RUSTC")
         .env_remove("CARGO_BUILD_RUSTC")
         .env("REAL_RUSTC", &real_rustc)
@@ -2036,14 +2880,15 @@ fn verified_targo_rejects_retired_valtree_limit_from_all_compiler_argument_sourc
     let mut extra_authority = p.process(&targo);
     extra_authority
         .args(&["rustc", "--lib", "--", "--codegen", "overflow_checks=no"])
-        .env(
-            "RUSTFLAGS",
-            format!(
-                "-Ztrust-verify-session=extra-authority {proof_root_flag} -Coverflow-checks=yes -Cdebug-assertions=yes"
-            ),
-        )
+        .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .verified_targo_environment()
+        .env(
+            "TRUST_TARGO_LANE_RUSTFLAGS",
+            format!(
+                "-Ztrust-verify-session=extra-authority\x1f{proof_root_flag}\x1f-Coverflow-checks=yes\x1f-Cdebug-assertions=yes"
+            ),
+        )
         .env_remove("RUSTC")
         .env_remove("CARGO_BUILD_RUSTC")
         .env("REAL_RUSTC", &real_rustc)
@@ -2955,9 +3800,9 @@ fn cfg_rustflags_normal_source() {
 [RUNNING] `rustc [..] --cfg bar[..]`
 [RUNNING] `rustc [..] --cfg bar[..]`
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[EXECUTABLE] `[ROOT]/foo/target/debug/deps/foo-[HASH][EXE]`
-[EXECUTABLE] `[ROOT]/foo/target/debug/deps/a-[HASH][EXE]`
-[EXECUTABLE] `[ROOT]/foo/target/debug/deps/c-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/foo-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/a-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/c-[HASH][EXE]`
 
 "#]])
         .run();
@@ -2969,8 +3814,8 @@ fn cfg_rustflags_normal_source() {
 [RUNNING] `rustc [..] --cfg bar[..]`
 [RUNNING] `rustc [..] --cfg bar[..]`
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
-[EXECUTABLE] `[ROOT]/foo/target/release/deps/foo-[HASH][EXE]`
-[EXECUTABLE] `[ROOT]/foo/target/release/deps/a-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/release/build/foo/[HASH]/out/foo-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/release/build/foo/[HASH]/out/a-[HASH][EXE]`
 
 "#]])
         .run();
@@ -3037,9 +3882,9 @@ fn cfg_rustflags_precedence() {
 [RUNNING] `rustc [..] --cfg bar[..]`
 [RUNNING] `rustc [..] --cfg bar[..]`
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[EXECUTABLE] `[ROOT]/foo/target/debug/deps/foo-[HASH][EXE]`
-[EXECUTABLE] `[ROOT]/foo/target/debug/deps/a-[HASH][EXE]`
-[EXECUTABLE] `[ROOT]/foo/target/debug/deps/c-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/foo-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/a-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/c-[HASH][EXE]`
 
 "#]])
         .run();
@@ -3051,8 +3896,8 @@ fn cfg_rustflags_precedence() {
 [RUNNING] `rustc [..] --cfg bar[..]`
 [RUNNING] `rustc [..] --cfg bar[..]`
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
-[EXECUTABLE] `[ROOT]/foo/target/release/deps/foo-[HASH][EXE]`
-[EXECUTABLE] `[ROOT]/foo/target/release/deps/a-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/release/build/foo/[HASH]/out/foo-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/release/build/foo/[HASH]/out/a-[HASH][EXE]`
 
 "#]])
         .run();
@@ -3508,6 +4353,9 @@ fn host_config_shared_build_dep() {
 
             [profile.dev]
             debug = 0
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -3533,7 +4381,10 @@ fn host_config_shared_build_dep() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ * [new ref]         HEAD       -> origin/HEAD
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] cc v1.0.0 (registry `dummy-registry`)
 [COMPILING] cc v1.0.0
@@ -3541,7 +4392,7 @@ fn host_config_shared_build_dep() {
 [RUNNING] `rustc --crate-name cc [..]--cfg from_target[..]`
 [COMPILING] bootstrap v0.0.0 ([ROOT]/foo)
 [RUNNING] `rustc --crate-name build_script_build [..]--cfg from_host[..]`
-[RUNNING] `[ROOT]/foo/target/debug/build/bootstrap-[HASH]/build-script-build`
+[RUNNING] `[ROOT]/foo/target/debug/build/bootstrap/[HASH]/out/build_script_build`
 [RUNNING] `rustc --crate-name bootstrap[..]--cfg from_target[..]`
 [FINISHED] `dev` profile [unoptimized] target(s) in [ELAPSED]s
 

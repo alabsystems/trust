@@ -9,6 +9,8 @@ use std::path::Path;
 mod build_commit_info;
 
 fn main() {
+    trust_std();
+    paired_compiler_input();
     commit_info();
     compress_man();
     windows_manifest();
@@ -18,6 +20,49 @@ fn main() {
     )]
     let target = std::env::var("TARGET").unwrap();
     println!("cargo:rustc-env=RUST_HOST_TARGET={target}");
+}
+
+// Trust: build-script cfg values belong to this package; the controller dependency's
+// compiler probe cannot select the native example's descriptor-inheritance API.
+fn trust_std() {
+    println!("cargo::rerun-if-env-changed=RUSTC");
+    println!("cargo::rustc-check-cfg=cfg(trust_std)");
+    let compiler = build_rs::input::rustc();
+    let output = std::process::Command::new(compiler)
+        .arg("-vV")
+        .output()
+        .expect("read compiler identity");
+    assert!(output.status.success(), "compiler identity probe failed");
+    if output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.starts_with(b"trust:"))
+    {
+        println!("cargo::rustc-cfg=trust_std");
+    }
+}
+
+fn paired_compiler_input() {
+    const KEY: &str = "TRUST_TARGO_PAIRED_COMPILER_PROFILE";
+    println!("cargo:rerun-if-env-changed={KEY}");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "private canonical producer build input"
+    )]
+    if let Some(value) = std::env::var_os(KEY) {
+        let value = value
+            .into_string()
+            .expect("paired compiler producer input must be Unicode");
+        assert!(
+            value.len() <= 64 * 1024 && !value.chars().any(|ch| matches!(ch, '\n' | '\r' | '\0')),
+            "invalid paired compiler producer input"
+        );
+        // The canonical producer supplies this input to the frontend compiler
+        // directly. `option_env!` records its actual value in the compiler's
+        // environment dependencies. Replaying it through build-script output
+        // would cross the authenticated executor's authority boundary: build
+        // scripts may not install or replace a compiler pairing profile.
+    }
 }
 
 fn compress_man() {
@@ -49,8 +94,8 @@ fn compress_man() {
         }
     };
 
-    add_files(Path::new("src/etc/man"), OsStr::new("1"));
-    add_files(Path::new("src/doc/man/generated_txt"), OsStr::new("txt"));
+    add_files(Path::new("etc/man"), OsStr::new("1"));
+    add_files(Path::new("doc/man/generated_txt"), OsStr::new("txt"));
     let encoder = ar.into_inner().unwrap();
     encoder.finish().unwrap();
 }
@@ -73,10 +118,14 @@ fn commit_info() {
     // a source tarball; here the bootstrap-supplied tuple is the primary input,
     // so its absence means the build was not driven the way it must be.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let git = build_commit_info::discover(manifest_dir, omit_git_hash).unwrap_or_else(|error| {
-        panic!("failed to determine validated Targo commit metadata: {error}")
-    });
-    let Some(git) = git else {
+    let discovery =
+        build_commit_info::discover(manifest_dir, omit_git_hash).unwrap_or_else(|error| {
+            panic!("failed to determine validated Targo commit metadata: {error}")
+        });
+    for path in discovery.rerun_if_changed {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    let Some(git) = discovery.info else {
         return;
     };
 

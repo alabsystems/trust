@@ -321,8 +321,13 @@ fn main() {
                 "elab_error",
                 "authority",
                 "verdict",
+                // Trust (ref-self I1): this zero-authority population discloses
+                // a borrow-erased parameter view too — `null` unless the
+                // clause's binders name a frozen shared pointee's field values.
+                "view",
             ],
         );
+        assert!(row["view"].is_null(), "no denotation here rests on a parameter view: {row}");
         assert_eq!(row["authority"], "none", "a denotation minted authority: {row}");
         assert_eq!(row["verdict"], "ungraded", "a denotation minted a grade: {row}");
         assert_eq!(row["source"], "native", "fixture clauses must retain native origin: {row}");
@@ -418,8 +423,25 @@ fn main() {
                 "elab_error",
                 "verdict",
                 "detail",
+                // Trust (ref-self I1): written on EVERY goal row, `null` unless
+                // the goal's binders name a frozen shared pointee's field
+                // values through the borrow-erased E6 parameter view. Its
+                // PRESENCE is what distinguishes a post-increment artifact from
+                // one written before it; the schema version does not move.
+                "view",
+                // Trust (OR-A1): the rung `goal_clean` was graded on, the
+                // requires-link of a conditional credit, and its hypotheses —
+                // written on every goal row, like `view`.
+                "rung",
+                "requires_link",
+                "hypotheses",
             ],
         );
+        assert!(goal["view"].is_null(), "no goal here rests on a parameter view: {goal}");
+        // Trust (OR-A1): these cited clauses certified UNCONDITIONALLY.
+        assert_eq!(goal["rung"], "unconditional", "{goal}");
+        assert!(goal["requires_link"].is_null(), "{goal}");
+        assert!(goal["hypotheses"].is_null(), "{goal}");
         assert_eq!(goal["def_path"], mixed_path);
         assert_eq!(goal["origin"], "ensures-citation-deferred");
         assert_eq!(goal["verdict"], "certified");
@@ -554,11 +576,16 @@ fn main() {
     assert_eq!(feedback_sessions[0]["goals"], 1);
     assert_eq!(feedback_sessions[0]["denotations"], 1);
 
-    // A later rejected deferred island taints the whole session after the
-    // valid theorem has entered the partial environment. The citation must not
-    // consult that partial environment, but its obligation must still be
-    // disclosed exactly once with the fail-closed verdict before the terminal
-    // seal. This catches row loss at the post-walk quarantine seam.
+    // A later rejected deferred island. Until f563f55d64e (TG14) it tainted the
+    // whole session, and the citation of the earlier theorem was quarantined as
+    // `session-tainted`. TG14 isolates an ORDINARY deferred-island failure: the
+    // refused unit is removed, every survivor is rechecked together from the
+    // restored checkpoint, and only whole-index/environment failures keep the
+    // global taint (DECISION_QUEUE "TG14 forward-reference repair"). So the
+    // compile still fails and names the rejection, but `u64_ge_refl`, checked in
+    // its own earlier batch, keeps its meaning and the citation is graded against
+    // it. Its obligation must still be disclosed exactly once before the terminal
+    // seal. This catches row loss at the post-walk seam.
     rfs::write("deferred_tainted.rs", TAINTED_DEFERRED_SOURCE);
     let tainted_failure = rustc()
         .input("deferred_tainted.rs")
@@ -572,16 +599,14 @@ fn main() {
         .env_remove(TRUST_NO_VERIFY_ENV)
         .run_fail();
     let tainted_stderr = tainted_failure.stderr_utf8();
+    // Trust: TG14 reports the refused deferred unit through Clean's batch renderer.
     assert_expected_clean_rejection(
         &tainted_stderr,
-        "Clean island declaration rejected: UnknownIdent(\"this_constant_does_not_exist\")",
+        "`broken_thm` did not elaborate: Unknown identifier: this_constant_does_not_exist",
     );
     assert!(
-        tainted_stderr.contains(
-            "citation `u64_ge_refl` cannot be validated because an earlier Clean island was \
-             rejected"
-        ),
-        "late-taint run failed without quarantining its citation:\n{tainted_stderr}"
+        !tainted_stderr.contains("cannot be validated because an earlier Clean island was rejected"),
+        "an ordinary deferred-island failure no longer taints the session (TG14):\n{tainted_stderr}"
     );
 
     let tainted_rows = read_artifact(Path::new(TAINTED_DUMP_DIRECTORY));
@@ -612,8 +637,19 @@ fn main() {
             "elab_error",
             "verdict",
             "detail",
+            // Trust (ref-self I1): see the deferred-goal rows above.
+            "view",
+            // Trust (OR-A1): see the deferred-goal rows above.
+            "rung",
+            "requires_link",
+            "hypotheses",
         ],
     );
+    assert!(tainted_goal["view"].is_null(), "an uncited-view-free citation row rests on no view");
+    // Trust (OR-A1): the grade is recorded against the unconditional goal, and
+    // this session climbs no conditional rung.
+    assert_eq!(tainted_goal["rung"], "unconditional", "{tainted_goal}");
+    assert!(tainted_goal["requires_link"].is_null(), "{tainted_goal}");
     assert_eq!(tainted_goal["row"], "goal");
     assert_eq!(tainted_goal["crate"], TAINTED_CRATE_NAME);
     assert_eq!(tainted_goal["session"], TAINTED_SESSION);
@@ -622,7 +658,9 @@ fn main() {
     assert_eq!(tainted_goal["origin"], "ensures-citation-deferred");
     assert_eq!(tainted_goal["clause"], "x >= x");
     assert_eq!(tainted_goal["theorem"], "u64_ge_refl");
-    assert_eq!(tainted_goal["verdict"], "session-tainted");
+    // Trust (TG14): graded against the surviving, independently checked theorem.
+    assert_eq!(tainted_goal["verdict"], "certified");
+    assert_eq!(tainted_goal["goal_clean"], "(u : UInt64) -> Nat.le (UInt64.toNat u) (UInt64.toNat u)");
     assert!(tainted_goal["clause"].as_str().is_some_and(|value| !value.is_empty()));
     assert!(tainted_goal["goal_clean"].as_str().is_some_and(|value| !value.is_empty()));
     assert!(tainted_goal["elab_error"].is_null());
@@ -638,10 +676,25 @@ fn main() {
     assert_eq!(tainted_seal["goals"], 1);
     assert_eq!(tainted_seal["denotations"], 0);
 
-    // A session can also be tainted before the MIR walk. The cited body then
-    // never has an island environment to grade against, but its query identity
-    // must still survive as one explicit refusal row. This pins the early-return
-    // path that previously sealed an empty cited-goal inventory.
+    // A session can also be tainted before the MIR walk. Until ab2e44cf84 the
+    // verify pass still ran over such a unit: it quarantined the cited body
+    // ("citation `u64_ge_refl` cannot be validated because an earlier Clean
+    // island was rejected"), published its query identity as one explicit
+    // `session-tainted` goal row, and sealed the session — and this block
+    // pinned exactly that. ab2e44cf84 ("a rejected batch is reported at the
+    // seam instead of vanishing") renders the rejection as a RESOLVE-TIME hard
+    // error, so rustc aborts before the MIR walk and the spec-clean writer —
+    // which lives in the verify pass — never runs. Measured on both drivers:
+    // the pre-change toolchain prints the quarantine note and writes two rows;
+    // this one prints only the rejection and writes nothing. The contract this
+    // block now pins is the stricter one: a unit whose island batch is
+    // rejected fails, names the rejection without an ICE, publishes NO
+    // spec-clean artifact (a rejected compile must leave nothing a downstream
+    // consumer could mistake for a graded artifact — `targo trust spec` drives
+    // a fresh emission dir and refuses a missing artifact fail-closed, v6/D1),
+    // and carries no positive citation evidence anywhere. If island rejection
+    // ever becomes non-fatal at resolve time again, the taint rows must return
+    // with it, and this block must be re-pinned to them deliberately.
     rfs::write("pre_tainted.rs", PRE_TAINTED_DEFERRED_SOURCE);
     let pre_tainted_failure = rustc()
         .input("pre_tainted.rs")
@@ -659,65 +712,28 @@ fn main() {
         &pre_tainted_stderr,
         "`broken_early` did not elaborate: Unknown identifier: this_constant_does_not_exist",
     );
+    // No positive citation evidence may survive a rejected batch, in any form.
     assert!(
-        pre_tainted_stderr.contains(
-            "citation `u64_ge_refl` cannot be validated because an earlier Clean island was \
-             rejected"
-        ),
-        "pre-walk-taint run failed without quarantining its citation:\n{pre_tainted_stderr}"
+        !pre_tainted_stderr.contains("citation `u64_ge_refl` kernel-discharges"),
+        "a rejected batch must not leave positive citation evidence for `u64_ge_refl`:\n\
+         {pre_tainted_stderr}"
     );
-
-    let pre_tainted_rows = read_artifact(Path::new(PRE_TAINTED_DUMP_DIRECTORY));
-    assert_eq!(
-        pre_tainted_rows.len(),
-        2,
-        "pre-walk-tainted cited crate must publish one goal and one terminal seal: \
-         {pre_tainted_rows:#?}"
+    // And no artifact: the writer never ran, so the dump directory is absent or
+    // holds no `.spec-clean.jsonl` — never a partial or stale one.
+    let pre_tainted_dir = Path::new(PRE_TAINTED_DUMP_DIRECTORY);
+    let stray = if pre_tainted_dir.exists() {
+        rfs::read_dir(pre_tainted_dir)
+            .map(|entry| entry.expect("read pre-tainted dump directory entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".spec-clean.jsonl"))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    assert!(
+        stray.is_empty(),
+        "a unit rejected at the resolve seam must publish no spec-clean artifact: {stray:?}"
     );
-    for row in &pre_tainted_rows {
-        assert_eq!(row["format"], "trust-spec-clean", "wrong pre-tainted-row format: {row}");
-        assert_eq!(row["v"], 2, "pre-tainted row escaped schema v2: {row}");
-    }
-    let pre_tainted_goal = &pre_tainted_rows[0];
-    assert_exact_keys(
-        pre_tainted_goal,
-        &[
-            "format",
-            "v",
-            "row",
-            "crate",
-            "session",
-            "def_path",
-            "contract_index",
-            "origin",
-            "clause",
-            "theorem",
-            "goal_clean",
-            "elab_error",
-            "verdict",
-            "detail",
-        ],
-    );
-    assert_eq!(pre_tainted_goal["row"], "goal");
-    assert_eq!(pre_tainted_goal["crate"], PRE_TAINTED_CRATE_NAME);
-    assert_eq!(pre_tainted_goal["session"], PRE_TAINTED_SESSION);
-    assert_eq!(pre_tainted_goal["def_path"], format!("{PRE_TAINTED_CRATE_NAME}::caller"));
-    assert_eq!(pre_tainted_goal["contract_index"], 0);
-    assert_eq!(pre_tainted_goal["origin"], "ensures-citation-deferred");
-    assert_eq!(pre_tainted_goal["clause"], "x >= x");
-    assert_eq!(pre_tainted_goal["theorem"], "u64_ge_refl");
-    assert_eq!(pre_tainted_goal["verdict"], "session-tainted");
-    assert!(pre_tainted_goal["goal_clean"].as_str().is_some_and(|value| !value.is_empty()));
-    assert!(pre_tainted_goal["elab_error"].is_null());
-
-    let pre_tainted_seal = &pre_tainted_rows[1];
-    assert_exact_keys(
-        pre_tainted_seal,
-        &["format", "v", "row", "crate", "session", "goals", "denotations"],
-    );
-    assert_eq!(pre_tainted_seal["row"], "session");
-    assert_eq!(pre_tainted_seal["crate"], PRE_TAINTED_CRATE_NAME);
-    assert_eq!(pre_tainted_seal["session"], PRE_TAINTED_SESSION);
-    assert_eq!(pre_tainted_seal["goals"], 1);
-    assert_eq!(pre_tainted_seal["denotations"], 0);
 }

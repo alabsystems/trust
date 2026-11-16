@@ -83,12 +83,6 @@ pub enum OperationError {
     /// An unknown help topic was requested.
     #[error("Unknown help topic: `{0}`.")]
     UnknownHelpTopic(String),
-    /// An unknown print-config option was requested.
-    #[error("Unknown print-config option: `{0}`.")]
-    UnknownPrintConfigTopic(String),
-    /// Attempt to generate a minimal config from standard input.
-    #[error("The `--print-config=minimal` option doesn't work with standard input.")]
-    MinimalPathWithStdin,
     /// An io error during reading or writing.
     #[error("{0}")]
     IoError(IoError),
@@ -96,6 +90,21 @@ pub enum OperationError {
     /// supported with standard input.
     #[error("Emit mode {0} not supported with standard output.")]
     StdinBadEmit(EmitMode),
+    #[error(transparent)]
+    PrintConfig(PrintConfigError),
+}
+
+// Errors related to the '--print-config' option.
+#[derive(Error, Debug)]
+pub enum PrintConfigError {
+    /// An unknown print-config option was requested.
+    #[error("Unknown print-config option: `{0}`.")]
+    UnknownOption(String),
+    #[error("The `--print-config=minimal` option requires an output path to write to")]
+    MinimalPathNoPath,
+    /// Attempt to generate a minimal config from standard input.
+    #[error("The `--print-config=minimal` option doesn't work with standard input.")]
+    MinimalPathWithStdin,
 }
 
 impl From<IoError> for OperationError {
@@ -366,6 +375,25 @@ fn format(
             eprintln!("Error: `{}` is a directory", file.display());
             session.add_operational_error();
         } else {
+            // Trust (T14d, DECISION_QUEUE T14-FMT-1): with no `--edition`, a
+            // file is formatted at the edition its package compiles it at.
+            let file_options =
+                match manifest_edition_options(&file, config_path.as_deref(), options) {
+                    Ok(file_options) => file_options,
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        session.add_operational_error();
+                        continue;
+                    }
+                };
+            if let Some(file_options) = file_options {
+                let search = config_path.is_none().then(|| file.parent().unwrap());
+                let (local_config, _) = load_config(search, Some(file_options))?;
+                session.override_config(local_config, |sess| {
+                    format_and_emit_report(sess, Input::File(file))
+                });
+                continue;
+            }
             // Check the file directory if the config-path could not be read or not provided
             if config_path.is_none() {
                 let (local_config, config_path) =
@@ -406,6 +434,127 @@ fn format(
         0
     };
     Ok(exit_code)
+}
+
+/// Trust (T14d, DECISION_QUEUE T14-FMT-1): the options to format `file` with
+/// when its edition comes from its package, or `None` when the caller chose
+/// the edition (`--edition`, `--config edition=`) or no package owns `file`.
+/// A `rustfmt.toml` that sets another edition than the owning manifest is
+/// refused, naming both files: formatting at an edition other than the one
+/// compiled can change how the file parses. `targo fmt` passes each target's
+/// edition itself, so this governs a hand-run `trustfmt <file>`.
+fn manifest_edition_options(
+    file: &Path,
+    explicit_config: Option<&Path>,
+    options: &GetOptsOptions,
+) -> Result<Option<GetOptsOptions>> {
+    if options.edition().is_some() {
+        return Ok(None);
+    }
+    let Some((edition, manifest)) = owning_manifest_edition(file)? else {
+        return Ok(None);
+    };
+    let search = explicit_config.is_none().then(|| file.parent().unwrap());
+    let (configured, config_file) = load_config(search, Some(options.clone()))?;
+    if configured.was_set().edition() && configured.edition() != edition {
+        return Err(format_err!(
+            "`{}` sets edition {} for `{}`, but `{}` compiles it at edition {}; remove the \
+             `edition` key or pass `--edition`",
+            config_file.as_deref().or(explicit_config).map_or_else(
+                || "the configuration".to_string(),
+                |p| p.display().to_string()
+            ),
+            configured.edition(),
+            file.display(),
+            manifest.display(),
+            edition,
+        ));
+    }
+    let mut file_options = options.clone();
+    file_options.edition = Some(edition);
+    Ok(Some(file_options))
+}
+
+/// The edition the package that owns `file` compiles it at: the nearest
+/// `Cargo.toml` with a `[package]` above it, `edition.workspace = true`
+/// resolved through the workspace root, and Cargo's own default (2015) when
+/// the manifest names none.
+fn owning_manifest_edition(file: &Path) -> Result<Option<(Edition, PathBuf)>> {
+    let file = file.canonicalize()?;
+    let mut directory = file.parent();
+    while let Some(dir) = directory {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.is_file() {
+            let table = read_manifest(&manifest)?;
+            if let Some(package) = table.get("package").and_then(toml::Value::as_table) {
+                let edition = match package.get("edition") {
+                    None => "2015".to_string(),
+                    Some(toml::Value::String(edition)) => edition.clone(),
+                    Some(toml::Value::Table(inherit))
+                        if inherit.get("workspace").and_then(toml::Value::as_bool)
+                            == Some(true) =>
+                    {
+                        workspace_package_edition(dir, package)?
+                    }
+                    Some(_) => {
+                        return Err(format_err!(
+                            "`{}` has a malformed `package.edition`",
+                            manifest.display()
+                        ));
+                    }
+                };
+                let edition = edition_from_edition_str(&edition).map_err(|_| {
+                    format_err!("`{}` names edition `{edition}`", manifest.display())
+                })?;
+                return Ok(Some((edition, manifest)));
+            }
+        }
+        directory = dir.parent();
+    }
+    Ok(None)
+}
+
+fn read_manifest(manifest: &Path) -> Result<toml::Table> {
+    std::fs::read_to_string(manifest)?
+        .parse::<toml::Table>()
+        .map_err(|error| format_err!("cannot parse `{}`: {error}", manifest.display()))
+}
+
+/// `workspace.package.edition` of the workspace that `package` (in
+/// `package_dir`) belongs to: `package.workspace` names its root, else the
+/// nearest manifest with `[workspace]` at or above the package.
+fn workspace_package_edition(package_dir: &Path, package: &toml::Table) -> Result<String> {
+    let start = match package.get("workspace").and_then(toml::Value::as_str) {
+        Some(root) => package_dir.join(root),
+        None => package_dir.to_path_buf(),
+    };
+    let mut directory = Some(start.as_path());
+    while let Some(dir) = directory {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.is_file() {
+            let table = read_manifest(&manifest)?;
+            if let Some(workspace) = table.get("workspace").and_then(toml::Value::as_table) {
+                return workspace
+                    .get("package")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|package| package.get("edition"))
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        format_err!(
+                            "`{}` sets no `workspace.package.edition` for \
+                             `edition.workspace = true`",
+                            manifest.display()
+                        )
+                    });
+            }
+        }
+        directory = dir.parent();
+    }
+    Err(format_err!(
+        "no workspace root above `{}` for `edition.workspace = true`",
+        package_dir.display()
+    ))
 }
 
 fn format_and_emit_report<T: Write>(session: &mut Session<'_, T>, input: Input) {
@@ -496,23 +645,24 @@ fn determine_operation(matches: &Matches) -> Result<Operation, OperationError> {
     }
     let mut free_matches = matches.free.iter();
 
-    let mut minimal_config_path = None;
-    if let Some(kind) = matches.opt_str("print-config") {
-        let path = free_matches.next().cloned();
-        match kind.as_str() {
-            "default" => return Ok(Operation::ConfigOutputDefault { path }),
-            "current" => return Ok(Operation::ConfigOutputCurrent { path }),
-            "minimal" => {
-                minimal_config_path = path;
-                if minimal_config_path.is_none() {
-                    eprintln!("WARNING: PATH required for `--print-config minimal`.");
+    let minimal_config_path = match matches.opt_str("print-config") {
+        None => None,
+        Some(kind) => {
+            let path = free_matches.next().cloned();
+            match kind.as_str() {
+                "default" => return Ok(Operation::ConfigOutputDefault { path }),
+                "current" => return Ok(Operation::ConfigOutputCurrent { path }),
+                "minimal" => Some(path.ok_or(OperationError::PrintConfig(
+                    PrintConfigError::MinimalPathNoPath,
+                ))?),
+                _ => {
+                    return Err(OperationError::PrintConfig(
+                        PrintConfigError::UnknownOption(kind),
+                    ));
                 }
             }
-            _ => {
-                return Err(OperationError::UnknownPrintConfigTopic(kind));
-            }
         }
-    }
+    };
 
     if matches.opt_present("version") {
         return Ok(Operation::Version);
@@ -530,7 +680,9 @@ fn determine_operation(matches: &Matches) -> Result<Operation, OperationError> {
     // if no file argument is supplied, read from stdin
     if files.is_empty() {
         if minimal_config_path.is_some() {
-            return Err(OperationError::MinimalPathWithStdin);
+            return Err(OperationError::PrintConfig(
+                PrintConfigError::MinimalPathWithStdin,
+            ));
         }
         let mut buffer = String::new();
         io::stdin().read_to_string(&mut buffer)?;
@@ -644,6 +796,19 @@ impl GetOptsOptions {
             }
 
             options.emit_mode = Some(emit_mode_from_emit_str(emit_str)?);
+        }
+
+        if options.inline_config.contains_key("emit_mode") {
+            if options.check {
+                return Err(format_err!(
+                    "Invalid to use `--config=emit_mode=<mode>` and `--check`"
+                ));
+            }
+            if options.emit_mode.is_some() {
+                return Err(format_err!(
+                    "Invalid to use `--config=emit_mode=<mode>` and `--emit`"
+                ));
+            }
         }
 
         if let Some(ref edition_str) = matches.opt_str("edition") {
@@ -855,6 +1020,37 @@ mod test {
         options.inline_config = HashMap::from([("version".to_owned(), "Two".to_owned())]);
         let config = get_config(None, Some(options));
         assert_eq!(config.style_edition(), StyleEdition::Edition2024);
+    }
+
+    #[test]
+    fn emit_mode_from_inline_config_is_rejected() {
+        // Regression for #6999.
+        let emit_modes = [
+            "Files",
+            "Stdout",
+            "Coverage",
+            "Checkstyle",
+            "Json",
+            "ModifiedLines",
+            "Diff",
+        ];
+        for mode in emit_modes {
+            let config = format!("emit_mode={mode}");
+
+            let matches = make_opts().parse(["--check", "--config", &config]).unwrap();
+            assert!(
+                GetOptsOptions::from_matches(&matches).is_err(),
+                "`--check` with `--config={config}` should be rejected"
+            );
+
+            let matches = make_opts()
+                .parse(["--emit", "stdout", "--config", &config])
+                .unwrap();
+            assert!(
+                GetOptsOptions::from_matches(&matches).is_err(),
+                "`--emit` with `--config={config}` should be rejected"
+            );
+        }
     }
 
     #[nightly_only_test]

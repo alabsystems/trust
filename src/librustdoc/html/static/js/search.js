@@ -1,4 +1,4 @@
-// ignore-tidy-filelength
+// ignore-tidy-file-filelength
 /* global addClass, getNakedUrl, getVar, getSettingValue, hasClass, nonnull */
 /* global onEachLazy, removeClass, searchState, browserSupportsHistoryApi */
 
@@ -2884,6 +2884,13 @@ class DocSearch {
                         return a - b;
                     }
 
+                    // sort re-exports lower
+                    a = Number(aai.ty === itemTypes.import);
+                    b = Number(bbi.ty === itemTypes.import);
+                    if (a !== b) {
+                        return a - b;
+                    }
+
                     // sort deprecated items later
                     a = Number(aai.deprecated);
                     b = Number(bbi.deprecated);
@@ -5290,7 +5297,7 @@ async function showResults(docSearch, results, goToFirst, filterCrates) {
     }
     const crateSearch = document.getElementById("crate-search");
     if (crateSearch) {
-        // #crate-search is an input element
+        // #crate-search is a `<select>` element.
         // @ts-expect-error
         crateSearch.addEventListener("input", updateCrate);
     }

@@ -1,0 +1,29 @@
+error: this `as_slice` is unnecessary because the following method (`len`) can be called on `Vec` directly
+  --> tests/ui/unnecessary_as_slice_const.rs:8:21
+   |
+LL |     let len = values.as_slice().len();
+   |                     ^^^^^^^^^^^ help: remove `as_slice`
+   |
+   = note: `-D clippy::unnecessary-as-slice` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::unnecessary_as_slice)]`
+
+error: this `as_mut_slice` is unnecessary because the following method (`is_empty`) can be called on `Vec` directly
+  --> tests/ui/unnecessary_as_slice_const.rs:10:23
+   |
+LL |     let empty = values.as_mut_slice().is_empty();
+   |                       ^^^^^^^^^^^^^^^ help: remove `as_mut_slice`
+
+error: this `as_slice` is unnecessary because the following method (`last`) can be called on `Vec` directly
+  --> tests/ui/unnecessary_as_slice_const.rs:30:19
+   |
+LL |     let _ = values.as_slice().last();
+   |                   ^^^^^^^^^^^ help: remove `as_slice`
+
+error: this `as_mut_slice` is unnecessary because the following method (`split_at_mut`) can be called on `Vec` directly
+  --> tests/ui/unnecessary_as_slice_const.rs:32:19
+   |
+LL |     let _ = values.as_mut_slice().split_at_mut(0);
+   |                   ^^^^^^^^^^^^^^^ help: remove `as_mut_slice`
+
+error: aborting due to 4 previous errors
+

@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -76,14 +76,12 @@ use super::{
 use crate::cli::{parse_subcommand_args, usage_text};
 use crate::config::{DEFAULT_CODEGEN_BACKEND, DEFAULT_TRUST_PROFILE, TrustConfig};
 use crate::pipeline::{
-    CargoRustflags, LinkedTrustCargoSurfaceKind, LinkedTrustSurfaceToolStatus,
-    LinkedTrustSurfaceToolStatusKind, LinkedTrustToolchainStatus, LinkedTrustToolchainStatusKind,
-    NativeRustcDiscovery, NativeRustcDiscoverySource, build_native_command,
-    build_native_command_with_json_transport, compiler_help_supports_option,
-    find_trust_verify_disable_arg, find_trust_verify_disable_in_rustflags, has_output_path_flag,
-    is_cargo_program, level_to_num, merged_cargo_rustflags_with_options, merged_rustflags,
-    merged_rustflags_with_backend, merged_rustflags_with_json_transport,
-    merged_rustflags_with_options, parse_compiler_stderr, select_native_rustc_discovery,
+    LinkedTrustCargoSurfaceKind, LinkedTrustSurfaceToolStatus, LinkedTrustSurfaceToolStatusKind,
+    LinkedTrustToolchainStatus, LinkedTrustToolchainStatusKind, NativeRustcDiscovery,
+    NativeRustcDiscoverySource, build_native_command, build_native_command_with_json_transport,
+    compiler_help_supports_option, find_trust_verify_disable_arg,
+    find_trust_verify_disable_in_rustflags, has_output_path_flag, is_cargo_program, lane_rustflags,
+    level_to_num, parse_compiler_stderr, select_native_rustc_discovery,
     trust_verify_disable_diagnostic,
 };
 use crate::project_root::resolve_project_root_from;
@@ -115,21 +113,21 @@ use crate::verify_binary_evidence::{
     persist_normalized_solver_proof_export_artifact,
 };
 
-struct TestEnvVar {
+pub(crate) struct TestEnvVar {
     key: &'static str,
     old: Option<std::ffi::OsString>,
 }
 
 impl TestEnvVar {
     #[allow(unknown_lints, env_mutation)] // lock-serialized env helper (see the acquired *_ENV_LOCK); the single audited boundary.
-    fn set(key: &'static str, value: &str) -> Self {
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
         let old = std::env::var_os(key);
         std::env::set_var(key, value);
         Self { key, old }
     }
 
     #[allow(unknown_lints, env_mutation)] // lock-serialized env helper (see the acquired *_ENV_LOCK); the single audited boundary.
-    fn unset(key: &'static str) -> Self {
+    pub(crate) fn unset(key: &'static str) -> Self {
         let old = std::env::var_os(key);
         std::env::remove_var(key);
         Self { key, old }
@@ -145,6 +143,20 @@ impl Drop for TestEnvVar {
             std::env::remove_var(self.key);
         }
     }
+}
+
+// Call only while holding TEST_ENV_LOCK; keep the guards until before unlocking.
+// Bootstrap's compiler selection must not shadow this fixture's sibling trustc.
+pub(crate) fn unset_compiler_overrides_for_command_fixture() -> [TestEnvVar; 6] {
+    [
+        "RUSTC",
+        "CARGO_BUILD_RUSTC",
+        "RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    ]
+    .map(TestEnvVar::unset)
 }
 
 fn verify_binary_evidence_for_vcs(required_vcs: usize) -> VerifyBinaryEvidence {
@@ -196,12 +208,114 @@ fn canonical_sha_checked_binary_dispatch(id: &str, function: &str) -> SolverDisp
     record
 }
 
+/// Fixture realism: a `Proved` attributed to `ay-incremental` or `ay-smtlib`
+/// carries the strength those producers actually stamp. Both answer a bare
+/// `unsat` with no proof request and stamp it
+/// `ProofStrength::smt_unsat_unvalidated()` (`AssuranceLevel::Unchecked`):
+/// trust-router `incremental_ay::proved_from_bare_unsat` and
+/// `smtlib_backend::parse_solver_output`. Nine fixtures here stamped them
+/// `smt_unsat()` (`Sound`) instead, a shape production never emits and one that
+/// clears the reporting floor on its own, so a test built on it could not see a
+/// consumer that trusted a raw solver `unsat` (TRUST-02's verify-binary defect
+/// went unnoticed that way). A fixture that needs a VC to READ proved now
+/// names the producer that really emits a proved-grade unsat with proof bytes:
+/// `ay-in-process`, whose strict-checked lane stamps
+/// `smt_unsat_strict_checked()` (`SmtBacked`) and carries its LRAT bytes. This
+/// scans this file so an Unchecked producer cannot be stamped otherwise again.
+#[test]
+fn ay_solver_fixtures_carry_the_strength_their_producers_stamp() {
+    let unrealistic = unrealistic_ay_proved_fixture_lines(include_str!("tests.rs"));
+    assert!(
+        unrealistic.is_empty(),
+        "targo-trust/src/tests.rs lines {unrealistic:?} give an ay-incremental/ay-smtlib \
+         Proved a strength those producers never stamp; they emit \
+         smt_unsat_unvalidated() (Unchecked)"
+    );
+}
+
+/// The 1-based line of every `Proved` struct literal in `source` that names an
+/// `ay-incremental`/`ay-smtlib` solver and carries any strength but
+/// `smt_unsat_unvalidated()`. A literal is read to its matching brace, so the
+/// distance between its `solver:` and `strength:` fields does not matter. The
+/// needles are assembled at run time so that this scanner does not match itself.
+fn unrealistic_ay_proved_fixture_lines(source: &str) -> Vec<usize> {
+    let opening = ["Proved", " {"].concat();
+    let strength_prefix = ["ProofStrength", "::"].concat();
+    let unchecked = [strength_prefix.as_str(), "smt_unsat_unvalidated()"].concat();
+    let producers =
+        [["solver: \"", "ay-incremental\""].concat(), ["solver: \"", "ay-smtlib\""].concat()];
+    let mut unrealistic = Vec::new();
+    for (start, _) in source.match_indices(opening.as_str()) {
+        let body_start = start + opening.len();
+        let mut depth = 1usize;
+        let mut body_end = source.len();
+        for (offset, ch) in source[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = body_start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &source[body_start..body_end];
+        if !producers.iter().any(|producer| body.contains(producer.as_str())) {
+            continue;
+        }
+        let stamped = body.match_indices(strength_prefix.as_str()).count();
+        let unchecked_stamps = body.matches(unchecked.as_str()).count();
+        if stamped != unchecked_stamps {
+            unrealistic.push(source[..start].matches('\n').count() + 1);
+        }
+    }
+    unrealistic
+}
+
+/// The scanner above reads a whole `Proved` literal: a `solver:` five lines
+/// above its `strength:` is still paired with it, and a realistic stamp there is
+/// not flagged.
+#[test]
+fn unrealistic_ay_proved_fixture_scan_pairs_fields_at_any_distance() {
+    let far = [
+        "Verification",
+        "Result::",
+        "Proved",
+        " {\n",
+        "    solver: \"",
+        "ay-incremental\".into(),\n",
+        "    // one\n    // two\n    // three\n    time_ms: 4,\n",
+        "    strength: trust_types::",
+        "ProofStrength::",
+        "smt_unsat(),\n}\n",
+    ]
+    .concat();
+    assert_eq!(unrealistic_ay_proved_fixture_lines(&far), vec![1]);
+    let realistic = far.replace(
+        &["ProofStrength::", "smt_unsat()"].concat(),
+        &["ProofStrength::", "smt_unsat_unvalidated()"].concat(),
+    );
+    assert_eq!(unrealistic_ay_proved_fixture_lines(&realistic), Vec::<usize>::new());
+    let other_producer = far.replace("ay-incremental", "ay-in-process");
+    assert_eq!(unrealistic_ay_proved_fixture_lines(&other_producer), Vec::<usize>::new());
+}
+
+/// A VC that READS proved, for tests of what the gates do with one. It names
+/// the in-process strict-checked lane (`ay-in-process`,
+/// `smt_unsat_strict_checked()`) because that lane is the producer whose unsat
+/// is proved-grade. `verify-binary` does not route there today (its route is
+/// `ay-incremental`, whose bare unsat is Unchecked and reads `unknown`), so this
+/// is the gate's input shape on a proved VC, not a recording of a
+/// `verify-binary` run.
 fn raw_solver_binary_dispatch(id: &str, function: &str) -> SolverDispatchRecord {
     let mut record = SolverDispatchRecord {
         id: id.to_string(),
         function: Some(function.to_string()),
-        solver: "ay-incremental".to_string(),
-        backend: Some("ay-incremental".to_string()),
+        solver: "ay-in-process".to_string(),
+        backend: Some("ay-in-process".to_string()),
         status: SolverDispatchStatus::Unsat,
         query_semantics: SolverQuerySemantics::SatIsCounterexample,
         replay: ReplayStatus::NotAttempted,
@@ -211,9 +325,9 @@ fn raw_solver_binary_dispatch(id: &str, function: &str) -> SolverDispatchRecord 
             artifact_path: None,
         },
         result: Some(trust_types::VerificationResult::Proved {
-            solver: "ay-incremental".into(),
+            solver: "ay-in-process".into(),
             time_ms: 4,
-            strength: trust_types::ProofStrength::smt_unsat(),
+            strength: trust_types::ProofStrength::smt_unsat_strict_checked(),
             proof_certificate: Some(vec![1, 2, 3, 4]),
             solver_warnings: None,
             native_proof_envelope: None,
@@ -1566,6 +1680,13 @@ fn importable_binary_dispatch(id: &str) -> (SolverDispatchRecord, Vec<u8>) {
     importable_binary_dispatch_with_kind(id, VcKind::DivisionByZero, 0x401010, 0x90)
 }
 
+/// A VC that READS proved, for tests of what the gates do with one. It names
+/// the in-process strict-checked lane (`ay-in-process`,
+/// `smt_unsat_strict_checked()`) because that lane is the producer whose unsat
+/// is proved-grade. `verify-binary` does not route there today (its route is
+/// `ay-incremental`, whose bare unsat is Unchecked and reads `unknown`), so this
+/// is the gate's input shape on a proved VC, not a recording of a
+/// `verify-binary` run.
 fn importable_binary_dispatch_with_kind(
     id: &str,
     kind: VcKind,
@@ -1590,14 +1711,14 @@ fn importable_binary_dispatch_with_kind(
         }),
         vc_kind: Some(vc.kind.clone()),
         vc: Some(serializable_vc),
-        solver: "ay-incremental".to_string(),
+        solver: "ay-in-process".to_string(),
         backend: Some("ay-lrat".to_string()),
         status: SolverDispatchStatus::Unsat,
         query_semantics: SolverQuerySemantics::SatIsCounterexample,
         result: Some(trust_types::VerificationResult::Proved {
-            solver: "ay-incremental".into(),
+            solver: "ay-in-process".into(),
             time_ms: 4,
-            strength: trust_types::ProofStrength::smt_unsat(),
+            strength: trust_types::ProofStrength::smt_unsat_strict_checked(),
             proof_certificate: None,
             solver_warnings: None,
             native_proof_envelope: None,
@@ -4769,9 +4890,9 @@ fn test_verify_binary_raw_solver_proof_bytes_do_not_satisfy_proof_grade_gate() {
         "division_by_zero".into(),
         Some("0x401010".into()),
         &trust_types::VerificationResult::Proved {
-            solver: "ay-incremental".into(),
+            solver: "ay-in-process".into(),
             time_ms: 4,
-            strength: trust_types::ProofStrength::smt_unsat(),
+            strength: trust_types::ProofStrength::smt_unsat_strict_checked(),
             proof_certificate: Some(vec![1, 2, 3, 4]),
             solver_warnings: None,
             native_proof_envelope: None,
@@ -5047,7 +5168,7 @@ fn test_verify_binary_dispatch_records_include_vc_origin_and_stable_canonical_by
     );
 
     let record_vc = record.vc.as_ref().expect("serialized VC");
-    assert_eq!(format!("{:?}", &record_vc.kind), format!("{:?}", &vc.kind));
+    assert_eq!(format!("{:?}", record_vc.kind), format!("{:?}", &vc.kind));
     assert_eq!(record_vc.function, vc.function);
     assert_eq!(record_vc.location, vc.location);
     assert_eq!(record_vc.formula, vc.formula);
@@ -5830,7 +5951,7 @@ fn test_verify_binary_checked_certificate_export_request_blocks_without_producti
         &trust_types::VerificationResult::Proved {
             solver: "ay-incremental".into(),
             time_ms: 4,
-            strength: trust_types::ProofStrength::smt_unsat(),
+            strength: trust_types::ProofStrength::smt_unsat_unvalidated(),
             proof_certificate: None,
             solver_warnings: None,
             native_proof_envelope: None,
@@ -7019,9 +7140,9 @@ fn test_verify_binary_imports_produced_checked_certificate_and_matches_refutatio
         "division_by_zero".into(),
         Some("0x401010".into()),
         &trust_types::VerificationResult::Proved {
-            solver: "ay-incremental".into(),
+            solver: "ay-in-process".into(),
             time_ms: 4,
-            strength: trust_types::ProofStrength::smt_unsat(),
+            strength: trust_types::ProofStrength::smt_unsat_strict_checked(),
             proof_certificate: None,
             solver_warnings: None,
             native_proof_envelope: None,
@@ -7158,7 +7279,7 @@ fn test_verify_binary_evidence_rejects_import_when_raw_proof_bytes_are_present()
     current_dispatch.result = Some(trust_types::VerificationResult::Proved {
         solver: "ay-incremental".into(),
         time_ms: 4,
-        strength: trust_types::ProofStrength::smt_unsat(),
+        strength: trust_types::ProofStrength::smt_unsat_unvalidated(),
         proof_certificate: Some(b"raw solver proof bytes".to_vec()),
         solver_warnings: None,
         native_proof_envelope: None,
@@ -7187,7 +7308,7 @@ fn test_verify_binary_checked_certificate_import_rejection_stays_fail_closed_in_
     current_dispatch.result = Some(trust_types::VerificationResult::Proved {
         solver: "ay-incremental".into(),
         time_ms: 4,
-        strength: trust_types::ProofStrength::smt_unsat(),
+        strength: trust_types::ProofStrength::smt_unsat_unvalidated(),
         proof_certificate: Some(b"raw solver proof bytes".to_vec()),
         solver_warnings: None,
         native_proof_envelope: None,
@@ -12914,9 +13035,9 @@ fn test_exploit_find_checked_unsat_certificate_without_claim_does_not_satisfy_re
         "division_by_zero".into(),
         Some("0x401010".into()),
         &trust_types::VerificationResult::Proved {
-            solver: "ay-smtlib".into(),
+            solver: "ay-in-process".into(),
             time_ms: 3,
-            strength: trust_types::ProofStrength::smt_unsat(),
+            strength: trust_types::ProofStrength::smt_unsat_strict_checked(),
             proof_certificate: None,
             solver_warnings: None,
             native_proof_envelope: None,
@@ -13369,9 +13490,9 @@ fn test_exploit_find_fails_even_when_binary_vcs_are_proved() {
         "division_by_zero".into(),
         Some("0x401010".into()),
         &trust_types::VerificationResult::Proved {
-            solver: "ay-smtlib".into(),
+            solver: "ay-in-process".into(),
             time_ms: 3,
-            strength: trust_types::ProofStrength::smt_unsat(),
+            strength: trust_types::ProofStrength::smt_unsat_strict_checked(),
             proof_certificate: None,
             solver_warnings: None,
             native_proof_envelope: None,
@@ -13563,48 +13684,26 @@ edition = "2021"
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// -- Current flag parsing tests --
+// -- Baseline flag parsing tests (T9) --
 
 #[test]
-fn test_parse_args_current_flag() {
-    let args: Vec<String> = vec!["--current".into(), "current.json".into()];
-    let result = parse_subcommand_args(&args).expect("should parse --current");
-    assert_eq!(result.current.as_deref(), Some("current.json"));
+fn test_parse_args_save_baseline_flag() {
+    let args: Vec<String> = vec!["--save-baseline".into(), "trust.baseline".into()];
+    let result = parse_subcommand_args(&args).expect("should parse --save-baseline");
+    assert_eq!(result.save_baseline.as_deref(), Some("trust.baseline"));
+    let args: Vec<String> = vec!["--save-baseline=/tmp/b".into()];
+    let result = parse_subcommand_args(&args).expect("should parse --save-baseline=path");
+    assert_eq!(result.save_baseline.as_deref(), Some("/tmp/b"));
+    assert!(parse_subcommand_args(&["--save-baseline".to_string()]).is_err());
 }
 
 #[test]
-fn test_parse_args_current_equals() {
-    let args: Vec<String> = vec!["--current=/tmp/cur.json".into()];
-    let result = parse_subcommand_args(&args).expect("should parse --current=path");
-    assert_eq!(result.current.as_deref(), Some("/tmp/cur.json"));
-}
-
-#[test]
-fn test_parse_args_current_missing_value() {
-    let args: Vec<String> = vec!["--current".into()];
-    assert!(parse_subcommand_args(&args).is_err());
-}
-
-#[test]
-fn test_parse_args_no_current_by_default() {
-    let args: Vec<String> = vec!["test.rs".into()];
-    let result = parse_subcommand_args(&args).expect("should parse without --current");
-    assert!(result.current.is_none());
-}
-
-#[test]
-fn test_parse_args_baseline_and_current() {
-    let args: Vec<String> = vec![
-        "--baseline".into(),
-        "base.json".into(),
-        "--current".into(),
-        "cur.json".into(),
-        "--format".into(),
-        "json".into(),
-    ];
+fn test_parse_args_baseline_and_format() {
+    let args: Vec<String> =
+        vec!["--baseline".into(), "trust.baseline".into(), "--format".into(), "json".into()];
     let result = parse_subcommand_args(&args).expect("should parse combined args");
-    assert_eq!(result.baseline.as_deref(), Some("base.json"));
-    assert_eq!(result.current.as_deref(), Some("cur.json"));
+    assert_eq!(result.baseline.as_deref(), Some("trust.baseline"));
+    assert!(result.save_baseline.is_none());
     assert_eq!(result.format, OutputFormat::Json);
 }
 
@@ -13680,9 +13779,12 @@ fn test_transport_to_verification_result_preserves_structure() {
         trust_types::CounterexampleValue::Int(0),
     )]);
     let transport = trust_types::TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         obligation_id: None,
         claim_digest_sha256: None,
         kind: "div_by_zero".into(),
+        original_vc_snapshot: None,
         typed_kind: None,
         description: "division by zero".into(),
         location: Some(span.clone()),
@@ -13696,9 +13798,10 @@ fn test_transport_to_verification_result_preserves_structure() {
         native_trust_ir: None,
         proof_evidence: None,
         monitor: None,
+        grade: None,
     };
 
-    let result = transport_to_verification_result("crate::math::divide", &transport);
+    let result = transport_to_verification_result("crate::math::divide", &transport, None, None);
     assert_eq!(result.function, "crate::math::divide");
     assert_eq!(result.location, Some(span));
     assert_eq!(
@@ -13717,9 +13820,12 @@ fn test_transport_to_verification_result_preserves_monitor_only_evidence() {
         predicate_digest: format!("sha256:{}", "d".repeat(64)),
     };
     let transport = trust_types::TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         obligation_id: None,
         claim_digest_sha256: None,
         kind: "postcondition".into(),
+        original_vc_snapshot: None,
         typed_kind: None,
         description: "quantified postcondition".into(),
         location: None,
@@ -13733,9 +13839,10 @@ fn test_transport_to_verification_result_preserves_monitor_only_evidence() {
         native_trust_ir: None,
         proof_evidence: None,
         monitor: Some(monitor.clone()),
+        grade: None,
     };
 
-    let result = transport_to_verification_result("crate::quantified", &transport);
+    let result = transport_to_verification_result("crate::quantified", &transport, None, None);
     assert!(!result.raw_line.is_empty(), "monitor-only evidence needs a structured envelope");
     let structured = crate::types::structured_transport_evidence(&result)
         .expect("monitor-only structured transport evidence");
@@ -13748,9 +13855,12 @@ fn test_transport_to_verification_result_preserves_monitor_only_evidence() {
 #[test]
 fn test_transport_to_verification_result_rejects_nested_proved_when_top_level_unknown() {
     let transport = trust_types::TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         obligation_id: Some("obl-cache".into()),
         claim_digest_sha256: None,
         kind: "postcondition".into(),
+        original_vc_snapshot: None,
         typed_kind: None,
         description: "cached proof-looking row".into(),
         location: None,
@@ -13777,9 +13887,10 @@ fn test_transport_to_verification_result_rejects_nested_proved_when_top_level_un
             diagnostics: Vec::new(),
         }),
         monitor: None,
+        grade: None,
     };
 
-    let result = transport_to_verification_result("crate::math::cached", &transport);
+    let result = transport_to_verification_result("crate::math::cached", &transport, None, None);
 
     assert_eq!(result.outcome, VerificationOutcome::Unknown);
     assert_eq!(result.reason.as_deref(), Some("cache replay row"));
@@ -13793,8 +13904,15 @@ fn test_trust_config_default() {
     assert!(config.enabled);
     // Strict-by-default doctrine: default level is L2 (dial down via [trust]).
     assert_eq!(config.level, "L2");
-    assert_eq!(config.timeout_ms, 5000);
-    assert_eq!(config.function_budget_ms, 120_000);
+    // Determinism plan §3.2a/§3.6: the defaults are the built-in budget
+    // profile — the one size-scaled effort count and the backstop whose
+    // built-in multiplier reproduces exactly the clocks targo always passed
+    // (no clock moves before T2).
+    let profile = trust_types::determinism::BudgetProfile::builtin();
+    assert_eq!(config.effort, profile.effort);
+    assert_eq!(config.backstop, profile.backstop);
+    assert_eq!(config.backstop.vc_clock_ms(), 5000, "the per-VC clock is unchanged");
+    assert_eq!(config.backstop.function_clock_ms(), 120_000, "the function deadline is unchanged");
     assert!(config.codegen_backend.is_none());
     assert_eq!(config.hardened, None);
     assert!(config.trust_profile.is_none());
@@ -13844,41 +13962,49 @@ fn test_trust_config_rejects_removed_solver_memory_limit_key() {
     std::fs::remove_dir_all(&root).expect("should remove temp dir");
 }
 
+/// T7b: the compiler-process ceiling is `backstop`'s, so the retired
+/// `compiler_timeout_secs` fails the load at any value — first-party/ty's
+/// twelve-hour bound and the zero the old key refused alike — and the refusal
+/// names its replacement.
 #[test]
-fn test_trust_config_rejects_zero_timeout() {
-    let root = temp_test_dir("zero-timeout-config");
-    write_trust_table(&root, "timeout_ms = 0\n");
+fn test_trust_config_refuses_the_retired_compiler_timeout() {
+    let root = temp_test_dir("compiler-timeout-config");
+    for retired in ["compiler_timeout_secs = 43200\n", "compiler_timeout_secs = 0\n"] {
+        write_trust_table(&root, retired);
+        let error = TrustConfig::load_for_verification(&root, None)
+            .expect_err("the retired compiler timeout must fail closed");
+        assert_eq!(error.action, "validate", "{retired}");
+        assert!(
+            error.detail.contains("`compiler_timeout_secs` was retired")
+                && error.detail.contains("`backstop`"),
+            "the refusal must name the replacement: {error}"
+        );
+    }
 
-    let error = TrustConfig::load_for_verification(&root, None)
-        .expect_err("a zero verifier timeout must fail closed");
-
-    assert_eq!(error.action, "parse");
-    assert!(
-        error.detail.contains("timeout_ms must be greater than zero"),
-        "unexpected parse error: {error}"
-    );
+    write_trust_table(&root, "level = \"L1\"\n");
+    TrustConfig::load_for_verification(&root, None).expect("a table without the key must load");
 
     std::fs::remove_dir_all(&root).expect("should remove temp dir");
 }
 
+/// Determinism plan §3.2a/§3.6: `effort` and `backstop` are the only budget
+/// keys, each inside its domain.
 #[test]
-fn test_trust_config_loads_and_validates_function_budget() {
-    let root = temp_test_dir("function-budget-config");
-    write_trust_table(&root, "function_budget_ms = 45000\n");
+fn test_trust_config_loads_and_validates_effort_and_backstop() {
+    let root = temp_test_dir("effort-backstop-config");
+    write_trust_table(&root, "effort = 12\nbackstop = 250\n");
+    let config = TrustConfig::load_for_verification(&root, None).expect("in-domain budgets load");
+    assert_eq!(config.effort, trust_types::determinism::EffortScale { conflicts_per_node: 12 });
+    assert_eq!(config.backstop, trust_types::determinism::Backstop { per_mille: 250 });
+    assert_eq!(config.backstop.vc_clock_ms(), 1250);
+    assert_eq!(config.backstop.function_clock_ms(), 30_000);
 
-    let config = TrustConfig::load_for_verification(&root, None)
-        .expect("a positive tracked function budget must load");
-    assert_eq!(config.function_budget_ms, 45_000);
-
-    write_trust_table(&root, "function_budget_ms = 0\n");
-    let error = TrustConfig::load_for_verification(&root, None)
-        .expect_err("a zero whole-function budget must fail closed");
-    assert_eq!(error.action, "parse");
-    assert!(
-        error.detail.contains("function_budget_ms must be greater than zero"),
-        "unexpected parse error: {error}"
-    );
-
+    for rejected in ["effort = 0\n", "effort = 400001\n", "backstop = 0\n"] {
+        write_trust_table(&root, rejected);
+        let error = TrustConfig::load_for_verification(&root, None)
+            .expect_err("an out-of-domain budget must fail closed");
+        assert_eq!(error.action, "parse", "{rejected}");
+    }
     std::fs::remove_dir_all(&root).expect("should remove temp dir");
 }
 
@@ -13915,7 +14041,18 @@ fn test_level_to_num() {
     assert_eq!(level_to_num("L0"), 0);
     assert_eq!(level_to_num("L1"), 1);
     assert_eq!(level_to_num("L2"), 2);
-    assert_eq!(level_to_num("unknown"), 0);
+    // Spelling is normalized by the same function the config loader uses, so
+    // the flag cannot disagree with the table about what `l2` meant.
+    assert_eq!(level_to_num(" l2 "), 2);
+}
+
+#[test]
+#[should_panic(expected = "never passed config validation")]
+fn test_level_to_num_refuses_an_unvalidated_level() {
+    // Was `assert_eq!(level_to_num("unknown"), 0)`: an unrecognised level
+    // silently selected L0, the weakest, and the test pinned it. Refusing is
+    // the point — an unvalidated level must not become "verify the least".
+    let _ = level_to_num("unknown");
 }
 
 fn args_include_z_flag(args: &[String], flag: &str) -> bool {
@@ -14322,276 +14459,73 @@ fn test_full_verifier_flag_is_rejected_batteries_on() {
     );
 }
 
+/// T14a: the lane `targo trust` hands the sibling Targo is the tracked policy
+/// alone; the caller's rustflags never enter it (the sibling Targo resolves
+/// them, drops their `-Ztrust-*` tokens and what the lane owns, and appends
+/// the lane: `src/tools/targo`'s `lane_inheritance_tests`).
 #[test]
-fn test_merged_rustflags_empty_env() {
-    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _rustflags = TestEnvVar::unset("RUSTFLAGS");
-    let flags = merged_rustflags("L1");
-    assert!(!args_include_z_flag(
-        &flags.split_whitespace().map(str::to_string).collect::<Vec<_>>(),
-        "trust-verify"
-    ));
-    assert!(flags.contains("trust-verify-level=1"));
-    assert!(flags.contains("trust-verify-output=json"));
-    assert!(flags.contains("codegen-backend=llvm"));
-}
-
-#[test]
-fn test_default_backend_is_pinned_against_plain_and_encoded_ambient_aliases() {
-    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-
-    {
-        let _encoded = TestEnvVar::unset("CARGO_ENCODED_RUSTFLAGS");
-        let _plain = TestEnvVar::set(
-            "RUSTFLAGS",
-            "-Zcodegen_backend=trust_cg -Zllvm_plugins=/tmp/forged.dylib --codegen=llvm_args=-load=/tmp/forged.dylib",
-        );
-        let CargoRustflags::Plain(flags) =
-            merged_cargo_rustflags_with_options("L1", None, true, true, false)
-        else {
-            panic!("plain ambient flags should remain plain");
-        };
-        assert!(flags.contains("codegen-backend=llvm"), "{flags}");
-        assert!(!flags.contains("codegen_backend=trust_cg"), "{flags}");
-        assert!(!flags.contains("forged.dylib"), "{flags}");
-        assert!(!flags.contains("llvm_args"), "{flags}");
-    }
-
-    {
-        let _plain = TestEnvVar::set("RUSTFLAGS", "-C opt-level=2");
-        let _encoded = TestEnvVar::set(
-            "CARGO_ENCODED_RUSTFLAGS",
-            "-Zcodegen-backend=trust_cg\x1f-Zllvm-plugins=/tmp/forged.dylib\x1f--codegen\x1fllvm-args=-load=/tmp/forged.dylib",
-        );
-        let CargoRustflags::Encoded(flags) =
-            merged_cargo_rustflags_with_options("L1", None, true, true, false)
-        else {
-            panic!("encoded ambient flags should remain encoded");
-        };
-        assert!(flags.contains("codegen-backend=llvm"), "{flags}");
-        assert!(!flags.contains("codegen-backend=trust_cg"), "{flags}");
-        assert!(!flags.contains("forged.dylib"), "{flags}");
-        assert!(!flags.contains("llvm-args"), "{flags}");
-    }
-}
-
-#[test]
-fn test_merged_rustflags_without_json_transport() {
-    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _rustflags = TestEnvVar::unset("RUSTFLAGS");
-    let flags = merged_rustflags_with_json_transport("L1", None, false);
-    assert!(!args_include_z_flag(
-        &flags.split_whitespace().map(str::to_string).collect::<Vec<_>>(),
-        "trust-verify"
-    ));
-    assert!(flags.contains("trust-verify-level=1"));
-    assert!(!flags.contains("trust-verify-output=json"));
-}
-
-#[test]
-fn test_merged_rustflags_with_explicit_codegen_backend() {
-    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _rustflags = TestEnvVar::unset("RUSTFLAGS");
-    let flags = merged_rustflags_with_backend("L1", Some("trust-cg"));
-    assert!(flags.contains("codegen-backend=trust-cg"));
-    assert!(flags.contains("trust-cg-output-gate=strict"));
-}
-
-#[test]
-fn test_trust_cg_output_gate_tracks_plain_and_encoded_verifier_lanes() {
-    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _plain = TestEnvVar::unset("RUSTFLAGS");
-    let _encoded = TestEnvVar::unset("CARGO_ENCODED_RUSTFLAGS");
-
-    let strict = merged_rustflags_with_options("L2", Some("trust-cg"), true, true, false);
-    assert!(strict.contains("trust-cg-output-gate=strict"));
-    assert!(!strict.contains("trust-cg-output-gate=allow-unknown"));
-    let strict_args = strict.split_whitespace().map(str::to_string).collect::<Vec<_>>();
-    assert_eq!(codegen_option_values(&strict_args, "overflow-checks"), ["yes"]);
-    assert_eq!(codegen_option_values(&strict_args, "debug-assertions"), ["yes"]);
-
-    let advisory = merged_rustflags_with_options("L2", Some("trust-cg"), true, false, true);
-    assert!(advisory.contains("trust-cg-output-gate=allow-unknown"));
-    assert!(!advisory.contains("trust-cg-output-gate=strict"));
-    let advisory_args = advisory.split_whitespace().map(str::to_string).collect::<Vec<_>>();
-    assert!(codegen_option_values(&advisory_args, "overflow-checks").is_empty());
-    assert!(codegen_option_values(&advisory_args, "debug-assertions").is_empty());
-
-    let _encoded = TestEnvVar::set(
-        "CARGO_ENCODED_RUSTFLAGS",
-        "--codegen=incremental=/tmp/hostile-cache\x1f--codegen\x1fcodegen_units=8\x1f-C\x1fdebuginfo=1",
-    );
-    let CargoRustflags::Encoded(encoded) =
-        merged_cargo_rustflags_with_options("L2", Some("trust-cg"), true, true, false)
-    else {
-        panic!("encoded Cargo flags must remain encoded");
-    };
-    assert!(encoded.contains("\x1ftrust-cg-output-gate=strict"));
-    assert!(!encoded.contains("trust-cg-output-gate=allow-unknown"));
-    assert!(!encoded.contains("hostile-cache"));
-    assert!(!encoded.contains("codegen_units=8"));
-}
-
-#[test]
-fn test_merged_full_rustflags_replace_ambient_safety_check_bypasses() {
-    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _encoded = TestEnvVar::unset("CARGO_ENCODED_RUSTFLAGS");
-    let _plain = TestEnvVar::set(
-        "RUSTFLAGS",
-        "--codegen=overflow_checks=no --codegen debug_assertions=off -C opt-level=2",
-    );
-
-    let flags = merged_rustflags_with_options("L2", None, true, true, false);
-    let args = flags.split_whitespace().map(str::to_string).collect::<Vec<_>>();
-    assert_eq!(codegen_option_values(&args, "overflow-checks"), ["yes"]);
-    assert_eq!(codegen_option_values(&args, "debug-assertions"), ["yes"]);
-    assert!(args.windows(2).any(|pair| pair[0] == "-C" && pair[1] == "opt-level=2"));
-}
-
-#[test]
-fn test_merged_rustflags_stale_full_verifier_disable_cannot_suppress_verification() {
-    // Batteries-on: `-Z trust-verify-full` was DELETED from the compiler (strict is
-    // the crate-under-check default; there is no enable flag), so a stale
-    // `-Z trust-verify-full=false` inherited via RUSTFLAGS must neither suppress
-    // targo's verification configuration nor trick targo into appending the deleted
-    // positive flag. (This replaces the old assertion that targo re-appends a bare
-    // `-Z trust-verify-full` — nothing emits that flag anymore and the compiler no
-    // longer parses it.)
-    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _rustflags = TestEnvVar::set("RUSTFLAGS", "-C debuginfo=1 -Z trust-verify-full=false");
-    let flags = merged_rustflags_with_options("L1", None, true, true, false);
-
-    assert!(
-        flags.contains("trust-verify-level="),
-        "a stale inherited full-verifier disable flag must not suppress targo's \
-         verification configuration: {flags}"
-    );
-    assert!(
-        !args_include_z_flag(
-            &flags.split_whitespace().map(str::to_string).collect::<Vec<_>>(),
-            "trust-verify-full"
-        ),
-        "targo must never emit the deleted bare `-Z trust-verify-full`: {flags}"
-    );
-}
-
-#[test]
-fn test_merged_rustflags_strips_retired_and_cargo_owned_scope_metadata() {
+fn test_lane_rustflags_default_lane() {
     let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _rustflags = TestEnvVar::set(
         "RUSTFLAGS",
-        "-Ztrust-verify-target=forged -Ztrust-verify-crate-role=primary \
-         -Ztrust-verify-package-name=forged",
+        "-C debuginfo=1 -Z trust-verify-full=false -Zcodegen_backend=trust_cg \
+         -Zllvm_plugins=/tmp/forged.dylib --codegen=llvm_args=-load=/tmp/forged.dylib",
     );
-
-    let flags = merged_rustflags_with_options("L1", None, true, true, false);
-    for reserved in ["trust-verify-target", "trust-verify-crate-role", "trust-verify-package-name"]
-    {
-        assert!(!flags.contains(reserved), "reserved scope metadata survived: {flags}");
+    let _encoded = TestEnvVar::set("CARGO_ENCODED_RUSTFLAGS", "-Zvaltree-node-limit=300000");
+    let lane = lane_rustflags("L1", None, true, true, false);
+    assert!(!args_include_z_flag(&lane, "trust-verify"), "{lane:?}");
+    assert!(!args_include_z_flag(&lane, "trust-verify-full"), "{lane:?}");
+    assert_eq!(
+        lane,
+        [
+            "-Z",
+            "trust-verify-level=1",
+            "-Z",
+            "trust-verify-output=json",
+            "-Z",
+            "codegen-backend=llvm",
+            "-C",
+            "overflow-checks=yes",
+            "-C",
+            "debug-assertions=yes",
+        ]
+    );
+    let joined = lane.join(" ");
+    for ambient in ["forged.dylib", "llvm_args", "trust_cg", "debuginfo=1", "valtree"] {
+        assert!(!joined.contains(ambient), "{ambient} entered the lane: {lane:?}");
     }
 }
 
 #[test]
-fn test_merged_rustflags_preserves_retired_valtree_limit_for_targo_rejection() {
-    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-
-    {
-        let _encoded = TestEnvVar::unset("CARGO_ENCODED_RUSTFLAGS");
-        let _plain = TestEnvVar::set("RUSTFLAGS", "-Z valtree-node-limit=200000");
-        let CargoRustflags::Plain(plain) =
-            merged_cargo_rustflags_with_options("L1", None, true, true, false)
-        else {
-            panic!("plain ambient rustflags must remain plain");
-        };
-        let args = plain.split_whitespace().collect::<Vec<_>>();
-        assert!(
-            args.windows(2).any(|pair| pair == ["-Z", "valtree-node-limit=200000"]),
-            "targo-trust silently removed the retired option before Targo could reject it: {args:?}"
-        );
-    }
-
-    {
-        let _plain = TestEnvVar::set("RUSTFLAGS", "-C opt-level=0");
-        let _encoded = TestEnvVar::set("CARGO_ENCODED_RUSTFLAGS", "-Zvaltree-node-limit=300000");
-        let CargoRustflags::Encoded(encoded) =
-            merged_cargo_rustflags_with_options("L1", None, true, true, false)
-        else {
-            panic!("encoded ambient rustflags must remain encoded");
-        };
-        let args = encoded.split('\x1f').collect::<Vec<_>>();
-        assert!(
-            args.contains(&"-Zvaltree-node-limit=300000"),
-            "targo-trust silently removed the retired encoded option before Targo could reject it: {args:?}"
-        );
-    }
+fn test_lane_rustflags_without_json_transport() {
+    let lane = lane_rustflags("L1", None, false, false, false);
+    assert!(!args_include_z_flag(&lane, "trust-verify"));
+    assert!(lane.iter().any(|arg| arg == "trust-verify-level=1"));
+    assert!(!lane.iter().any(|arg| arg == "trust-verify-output=json"));
 }
 
 #[test]
-fn test_merged_rustflags_replaces_ambient_targo_owned_policy() {
-    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _rustflags = TestEnvVar::set(
-        "RUSTFLAGS",
-        "-C opt-level=2 -Ztrust-verify-level=0 -Z trust-verify-output=human \
-         -Ztrust-verify-target=wrong -Ztrust-policy=advisory -Zcodegen-backend=llvm \
-         -Ztrust-cg-output-gate=allow-unknown \
-         -Ztrust-proof-artifact-root=/tmp/forged",
-    );
+fn test_trust_cg_output_gate_and_contract_track_the_verifier_lane() {
+    let strict = lane_rustflags("L2", Some("trust-cg"), true, true, false);
+    assert!(strict.iter().any(|arg| arg == "codegen-backend=trust-cg"));
+    assert!(strict.iter().any(|arg| arg == "trust-cg-output-gate=strict"));
+    assert!(!strict.iter().any(|arg| arg == "trust-cg-output-gate=allow-unknown"));
+    assert_eq!(codegen_option_values(&strict, "overflow-checks"), ["yes"]);
+    assert_eq!(codegen_option_values(&strict, "debug-assertions"), ["yes"]);
+    assert_eq!(codegen_option_values(&strict, "panic"), ["abort"]);
+    assert_eq!(codegen_option_values(&strict, "debuginfo"), ["0"]);
+    assert_eq!(codegen_option_values(&strict, "codegen-units"), ["1"]);
 
-    let flags = merged_rustflags_with_options("L2", Some("trust-cg"), true, true, false);
-    assert!(flags.contains("-C opt-level=2"));
-    assert!(flags.contains("trust-verify-level=2"));
-    assert!(flags.contains("trust-verify-output=json"));
-    assert!(!flags.contains("trust-verify-target"));
-    assert!(flags.contains("codegen-backend=trust-cg"));
-    assert!(flags.contains("trust-cg-output-gate=strict"));
-    for stale in [
-        "trust-verify-level=0",
-        "trust-verify-output=human",
-        "trust-verify-target=wrong",
-        "trust-policy=advisory",
-        "codegen-backend=llvm",
-        "trust-cg-output-gate=allow-unknown",
-        "trust-proof-artifact-root=/tmp/forged",
-    ] {
-        assert!(!flags.contains(stale), "stale ambient policy survived: {flags}");
-    }
-}
+    let advisory = lane_rustflags("L2", Some("trust-cg"), true, false, true);
+    assert!(advisory.iter().any(|arg| arg == "trust-cg-output-gate=allow-unknown"));
+    assert!(!advisory.iter().any(|arg| arg == "trust-cg-output-gate=strict"));
+    assert!(advisory.iter().any(|arg| arg == "trust-policy=advisory"));
+    assert!(codegen_option_values(&advisory, "overflow-checks").is_empty());
+    assert!(codegen_option_values(&advisory, "debug-assertions").is_empty());
 
-#[test]
-fn test_merged_cargo_rustflags_prefers_encoded_env_and_adds_full_verifier() {
-    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _encoded = TestEnvVar::set(
-        "CARGO_ENCODED_RUSTFLAGS",
-        "-C\x1fdebuginfo=1\x1f-Coverflow-checks=no\x1f-C\x1fdebug-assertions=false",
-    );
-    let _plain = TestEnvVar::set("RUSTFLAGS", "-C opt-level=0");
-
-    let flags = merged_cargo_rustflags_with_options("L1", Some("trust-cg"), true, true, false);
-    let CargoRustflags::Encoded(encoded) = flags else {
-        panic!("encoded Cargo flags must stay encoded when inherited encoded flags are present");
-    };
-    let args = encoded.split('\x1f').map(str::to_string).collect::<Vec<_>>();
-
-    assert!(args.windows(2).any(|pair| pair[0] == "-C" && pair[1] == "debuginfo=0"));
-    assert!(
-        !args.windows(2).any(|pair| pair[0] == "-C" && pair[1] == "debuginfo=1"),
-        "Trust-CG must replace inherited debuginfo with its supported disabled policy: {args:?}"
-    );
-    assert!(
-        !args.windows(2).any(|pair| pair[0] == "-C" && pair[1] == "opt-level=0"),
-        "encoded Cargo rustflags must take precedence over plain RUSTFLAGS: {args:?}"
-    );
-    assert!(
-        !args_include_z_flag(&args, "trust-verify"),
-        "full verifier mode activates verification without the advisory flag: {args:?}"
-    );
-    // Strict verification is batteries-on; no positive activation flag is emitted.
-    assert!(!args_include_z_flag(&args, "trust-verify-full"));
-    assert!(args.windows(2).any(|pair| pair[0] == "-Z" && pair[1] == "trust-verify-level=1"));
-    assert!(args.windows(2).any(|pair| pair[0] == "-Z" && pair[1] == "trust-verify-output=json"));
-    assert!(args.windows(2).any(|pair| pair[0] == "-Z" && pair[1] == "codegen-backend=trust-cg"));
-    assert_eq!(codegen_option_values(&args, "overflow-checks"), ["yes"]);
-    assert_eq!(codegen_option_values(&args, "debug-assertions"), ["yes"]);
+    let llvm = lane_rustflags("L2", Some("llvm"), true, true, false);
+    assert!(!llvm.iter().any(|arg| arg.starts_with("trust-cg-output-gate")));
+    assert!(codegen_option_values(&llvm, "panic").is_empty());
 }
 
 #[test]
@@ -14619,6 +14553,24 @@ fn test_rejects_passthrough_trust_verify_disable_flags() {
         find_trust_verify_disable_arg(&full_off).as_deref(),
         Some("-Z trust-verify-full=false")
     );
+
+    // The retired `-Zno-trust-verify` alias is still honoured by the compiler
+    // (bare / true-ish = verification OFF) and rewritten to `trust-verify`
+    // before the driver can tell them apart, so it is the same off-switch.
+    for alias in [
+        vec!["-Zno-trust-verify".into()],
+        vec!["-Z".into(), "no_trust-verify=on".into()],
+        vec!["-Zno_trust_verify=yes".into()],
+    ] {
+        assert_eq!(
+            find_trust_verify_disable_arg(&alias).as_deref(),
+            Some("-Z no-trust-verify"),
+            "{alias:?}"
+        );
+    }
+    // `=off` / `=false` on the alias means verification ON: not a disable.
+    let alias_on = vec!["-Zno-trust-verify=off".into()];
+    assert_eq!(find_trust_verify_disable_arg(&alias_on), None);
 
     for retired in [
         vec!["-Zcontract-checks".into()],
@@ -14686,7 +14638,7 @@ fn test_rejects_retired_ambient_function_budget() {
 
     let diagnostic = trust_verify_disable_diagnostic(&[], true)
         .expect("retired ambient budget must be rejected before compiler dispatch");
-    assert!(diagnostic.contains("function_budget_ms"));
+    assert!(diagnostic.contains("backstop"));
     assert!(diagnostic.contains("[trust]"));
 }
 
@@ -14968,6 +14920,10 @@ fn test_linked_trust_toolchain_status_visibility_depends_on_status_kind() {
 
 #[test]
 fn test_build_native_command_uses_sibling_targo_for_crates() {
+    // Crate mode reads RUSTC and the other compiler-override variables, which
+    // env-locked tests set (S9 selection-probe pinning): serialize with them.
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _compiler_env = unset_compiler_overrides_for_command_fixture();
     let root = temp_test_dir("sibling-targo");
     let bin_dir = root.join("stage1").join("bin");
     std::fs::create_dir_all(&bin_dir).expect("should create bin dir");
@@ -14990,8 +14946,105 @@ fn test_build_native_command_uses_sibling_targo_for_crates() {
     std::fs::remove_dir_all(&root).expect("should remove temp dir");
 }
 
+/// The verified crate-mode pipeline must hand Cargo a bounded job count.
+/// Without this the fleet gate ran at Cargo's default `-j ncpu` — 18 on the
+/// host that produced the SIGKILL, and a width this tree has already recorded
+/// as fatal on 24 GB and 48 GB hosts.
+///
+/// This assertion is necessarily conditional on the tree the tests run in.
+/// Whether an operator has already selected a job count is a property of the
+/// process environment — cwd-relative Cargo config files and
+/// `CARGO_BUILD_JOBS` — which a parallel unit test must not mutate. In THIS
+/// repository the condition is live, not hypothetical: `.cargo/config.toml`
+/// sets `[build] jobs = 4`, so the suppressed branch is the one that runs
+/// here, and it is exactly the behaviour the override promise requires. The
+/// unconditional coverage of both branches is
+/// `pipeline::run::…::memory_aware_job_bound_is_injected_only_when_the_operator_chose_nothing`.
+#[test]
+fn test_crate_mode_command_bounds_cargo_parallelism() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _compiler_env = unset_compiler_overrides_for_command_fixture();
+    let root = temp_test_dir("crate-mode-memory-aware-jobs");
+    let bin_dir = root.join("stage1").join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("should create bin dir");
+    let rustc = bin_dir.join(if cfg!(windows) { "trustc.exe" } else { "trustc" });
+    let targo = bin_dir.join(if cfg!(windows) { "targo.exe" } else { "targo" });
+    write_executable_marker(&rustc);
+    write_executable_marker(&targo);
+
+    let passthrough = vec!["--workspace".to_string(), "--all-targets".to_string()];
+    let sub_args = parse_subcommand_args(&passthrough).expect("should parse workspace passthrough");
+    let cmd_args =
+        build_native_command(&rustc, Subcommand::Check, &sub_args, &TrustConfig::default());
+
+    let injected = cmd_args.iter().filter(|arg| arg.as_str() == "-j").count();
+    if crate::pipeline::run::cargo_jobs_explicitly_selected(&passthrough) {
+        assert_eq!(
+            injected, 0,
+            "an ambient operator job selection must suppress the clamp, not be outranked by it: {cmd_args:?}"
+        );
+    } else {
+        let jobs_index = cmd_args
+            .iter()
+            .position(|arg| arg == "-j")
+            .expect("the verified crate-mode fan-out must carry an explicit job count");
+        let jobs: usize =
+            cmd_args[jobs_index + 1].parse().expect("the injected job count must be a number");
+        assert_eq!(
+            jobs,
+            crate::trust_added::memory_aware_jobs(),
+            "the pipeline must use the same memory-aware policy as the dev diagnostics"
+        );
+        assert!(jobs >= 1, "a clamp that reaches zero would stall Cargo");
+        assert_eq!(injected, 1, "exactly one job count may reach Cargo");
+    }
+
+    std::fs::remove_dir_all(&root).expect("should remove temp dir");
+}
+
+/// An operator's `-j` is authority. Injecting a second one after it would win
+/// Cargo's last-wins parse and make the gate run at a width nobody asked for.
+/// This holds whatever the ambient configuration says, so it is unconditional.
+#[test]
+fn test_crate_mode_command_keeps_an_operator_supplied_job_count() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _compiler_env = unset_compiler_overrides_for_command_fixture();
+    let root = temp_test_dir("crate-mode-operator-jobs");
+    let bin_dir = root.join("stage1").join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("should create bin dir");
+    let rustc = bin_dir.join(if cfg!(windows) { "trustc.exe" } else { "trustc" });
+    let targo = bin_dir.join(if cfg!(windows) { "targo.exe" } else { "targo" });
+    write_executable_marker(&rustc);
+    write_executable_marker(&targo);
+
+    for operator in [vec!["-j".to_string(), "2".to_string()], vec!["-j2".to_string()]] {
+        let mut passthrough = vec!["--workspace".to_string()];
+        passthrough.extend(operator.clone());
+        let sub_args = parse_subcommand_args(&passthrough).expect("should parse operator jobs");
+        let cmd_args =
+            build_native_command(&rustc, Subcommand::Check, &sub_args, &TrustConfig::default());
+
+        let injected = cmd_args.iter().filter(|arg| arg.starts_with("-j")).count();
+        assert_eq!(
+            injected, 1,
+            "an operator job count must survive alone, got {cmd_args:?} for {operator:?}"
+        );
+        assert!(
+            cmd_args.iter().any(|arg| arg == "-j2")
+                || cmd_args.windows(2).any(|pair| pair[0] == "-j" && pair[1] == "2"),
+            "the operator's own value must be the one Cargo sees: {cmd_args:?}"
+        );
+    }
+
+    std::fs::remove_dir_all(&root).expect("should remove temp dir");
+}
+
 #[test]
 fn test_build_native_command_uses_test_mode_for_crate_tests() {
+    // Crate mode reads RUSTC and the other compiler-override variables, which
+    // env-locked tests set (S9 selection-probe pinning): serialize with them.
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _compiler_env = unset_compiler_overrides_for_command_fixture();
     let root = temp_test_dir("sibling-targo-test");
     let bin_dir = root.join("stage1").join("bin");
     std::fs::create_dir_all(&bin_dir).expect("should create bin dir");
@@ -15020,10 +15073,24 @@ fn test_rewrite_mode_rejects_test_before_execution() {
     );
     assert_eq!(rewrite_request_error(Subcommand::Check, &sub_args), None);
     assert_eq!(rewrite_request_error(Subcommand::Build, &sub_args), None);
+    assert_eq!(rewrite_request_error(Subcommand::Loop, &sub_args), None);
+    // The help line must name every subcommand the handler admits `--rewrite`
+    // on. It said "check/build" while the refusal above names `loop` too.
+    let help = usage_text();
+    let line = help
+        .lines()
+        .find(|line| line.trim_start().starts_with("--rewrite "))
+        .expect("the usage documents --rewrite");
+    for admitted in ["check", "build", "`loop`"] {
+        assert!(line.contains(admitted), "--rewrite help omits {admitted}: {line}");
+    }
 }
 
 #[test]
 fn test_build_native_command_rejects_path_targo_fallback_when_sibling_missing() {
+    // Crate mode reads RUSTC and the other compiler-override variables, which
+    // env-locked tests set (S9 selection-probe pinning): serialize with them.
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let root = temp_test_dir("path-targo-rejected");
     let bin_dir = root.join("stage1").join("bin");
     std::fs::create_dir_all(&bin_dir).expect("should create bin dir");
@@ -15050,6 +15117,10 @@ fn test_build_native_command_rejects_path_targo_fallback_when_sibling_missing() 
 
 #[test]
 fn test_crate_mode_configures_verification_by_default_no_enable_flag() {
+    // Crate mode reads RUSTC and the other compiler-override variables, which
+    // env-locked tests set (S9 selection-probe pinning): serialize with them.
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _compiler_env = unset_compiler_overrides_for_command_fixture();
     // Batteries-on: with NO flags, crate-mode verification is fully configured (the
     // level flags are broadcast; verification is on by default). `--full-verifier`
     // is REJECTED — there is no enable flag. Replaces the old test that parsed
@@ -15071,7 +15142,7 @@ fn test_crate_mode_configures_verification_by_default_no_enable_flag() {
     let sub_args = parse_subcommand_args(&[]).expect("should parse empty args");
     let cmd_args =
         build_native_command(&rustc, Subcommand::Check, &sub_args, &TrustConfig::default());
-    let flags = merged_rustflags_with_options(
+    let lane = lane_rustflags(
         "L1",
         None,
         true,
@@ -15081,16 +15152,26 @@ fn test_crate_mode_configures_verification_by_default_no_enable_flag() {
 
     assert_eq!(cmd_args[0], targo.to_string_lossy().to_string());
     assert!(
-        flags.contains("trust-verify-level="),
-        "crate mode must configure the verification level by default: {flags}"
+        lane.iter().any(|arg| arg.starts_with("trust-verify-level=")),
+        "crate mode must configure the verification level by default: {lane:?}"
     );
 
     std::fs::remove_dir_all(&root).expect("should remove temp dir");
 }
 
+/// Pins the crate-mode Cargo verb per subcommand. `check`, `report`, and
+/// `loop` must run Cargo `check`: trustc's whole-crate verification walk runs
+/// from `analysis` under `--emit=metadata`, so `build` only added LLVM codegen —
+/// measured 7.47 GiB / 241 s against 4.58 GiB / 41 s on the `ay_dpll` test
+/// unit, memory the verifier's ceiling cannot bound. `build` and `test` keep
+/// their verbs: they are the lanes that produce and run artifacts.
 #[test]
-fn test_build_native_command_uses_build_mode_for_crate_check_and_report() {
-    let root = temp_test_dir("crate-mode-build-command");
+fn test_build_native_command_uses_check_mode_for_crate_check_report_and_loop() {
+    // Crate mode reads RUSTC and the other compiler-override variables, which
+    // env-locked tests set (S9 selection-probe pinning): serialize with them.
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _compiler_env = unset_compiler_overrides_for_command_fixture();
+    let root = temp_test_dir("crate-mode-check-command");
     let bin_dir = root.join("stage1").join("bin");
     std::fs::create_dir_all(&bin_dir).expect("should create bin dir");
     let rustc = bin_dir.join(if cfg!(windows) { "trustc.exe" } else { "trustc" });
@@ -15100,13 +15181,23 @@ fn test_build_native_command_uses_build_mode_for_crate_check_and_report() {
 
     let sub_args = parse_subcommand_args(&[]).expect("should parse empty passthrough");
 
-    let check_cmd =
-        build_native_command(&rustc, Subcommand::Check, &sub_args, &TrustConfig::default());
-    let report_cmd =
-        build_native_command(&rustc, Subcommand::Report, &sub_args, &TrustConfig::default());
-
-    assert_eq!(check_cmd[1], "build");
-    assert_eq!(report_cmd[1], "build");
+    for (subcommand, expected_verb) in [
+        (Subcommand::Check, "check"),
+        (Subcommand::Report, "check"),
+        (Subcommand::Loop, "check"),
+        (Subcommand::Build, "build"),
+        (Subcommand::Test, "test"),
+    ] {
+        let cmd = build_native_command(&rustc, subcommand, &sub_args, &TrustConfig::default());
+        assert_eq!(
+            cmd[1], expected_verb,
+            "{subcommand:?} must drive Cargo `{expected_verb}`; argv was {cmd:?}"
+        );
+        assert!(
+            !cmd.iter().any(|arg| arg.starts_with("--emit")),
+            "the crate-mode argv must leave emit selection to Cargo's verb: {cmd:?}"
+        );
+    }
 
     std::fs::remove_dir_all(&root).expect("should remove temp dir");
 }
@@ -15179,6 +15270,7 @@ fn write_trust_cg_preflight_toolchain(
 #[test]
 fn test_trust_cg_crate_preflight_admits_minimal_rlib_in_dev_and_release() {
     let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _compiler_env = unset_compiler_overrides_for_command_fixture();
     let _target = TestEnvVar::unset("CARGO_BUILD_TARGET");
     let root = temp_test_dir("trust-cg-rlib-preflight");
     let (rustc, _) = write_trust_cg_preflight_toolchain(&root, "lib", "lib");
@@ -15210,6 +15302,7 @@ fn test_trust_cg_crate_preflight_admits_minimal_rlib_in_dev_and_release() {
 #[test]
 fn test_trust_cg_crate_preflight_rejects_binary_before_returning_build_command() {
     let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _compiler_env = unset_compiler_overrides_for_command_fixture();
     let _target = TestEnvVar::unset("CARGO_BUILD_TARGET");
     let root = temp_test_dir("trust-cg-bin-preflight");
     let (rustc, _) = write_trust_cg_preflight_toolchain(&root, "bin", "bin");
@@ -15228,13 +15321,200 @@ fn test_trust_cg_crate_preflight_rejects_binary_before_returning_build_command()
     std::fs::remove_dir_all(root).expect("remove trust-cg binary fixture");
 }
 
+/// A fake canonical Targo that records, per selection-only probe, the rustflags
+/// and wrapper environment Cargo's rustc target-info query would inherit.
+#[cfg(unix)]
+fn write_env_logging_selection_targo(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let bin_dir = root.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create fake Trust toolchain");
+    let rustc = bin_dir.join("trustc");
+    write_executable_marker(&rustc);
+    let log = root.join("probe-env.log");
+    let package_id = format!("path+file://{}#fixture@0.1.0", root.display());
+    let metadata_path = root.join("metadata.json");
+    std::fs::write(
+        &metadata_path,
+        serde_json::to_vec(&serde_json::json!({
+            "packages": [{
+                "id": package_id,
+                "name": "fixture",
+                "version": "0.1.0",
+                "manifest_path": root.join("Cargo.toml"),
+            }],
+            "workspace_members": [package_id],
+            "workspace_default_members": [package_id],
+            "target_directory": root.join("target"),
+        }))
+        .expect("serialize fake metadata"),
+    )
+    .expect("write fake metadata");
+    let unit_graph_path = root.join("unit-graph.json");
+    std::fs::write(
+        &unit_graph_path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "units": [{
+                "pkg_id": package_id,
+                "target": { "name": "fixture", "kind": ["lib"], "crate_types": ["lib"] },
+                "mode": "build",
+                "platform": "x86_64-unknown-linux-gnu"
+            }],
+            "roots": [0]
+        }))
+        .expect("serialize fake unit graph"),
+    )
+    .expect("write fake unit graph");
+    let script = r#"#!/bin/sh
+probe=other
+case "$*" in
+  *"config get build.target"*) probe=config-get ;;
+  *"--unit-graph"*) probe=unit-graph ;;
+  *" pkgid "*) probe=pkgid ;;
+  *"metadata --format-version 1"*"--filter-platform"*) probe=temporal-metadata ;;
+  *"metadata --format-version 1"*) probe=metadata ;;
+esac
+encoded=$(printf '%s' "${CARGO_ENCODED_RUSTFLAGS-}" | /usr/bin/tr '\037' '|')
+lane=$(printf '%s' "${TRUST_TARGO_LANE_RUSTFLAGS-}" | /usr/bin/tr '\037' '|')
+printf '%s LANE_SET=%s LANE=[%s] ENCODED_SET=%s ENCODED=[%s] RUSTFLAGS=[%s] WRAPPER_SET=%s WRAPPER=[%s] RUSTC=[%s] BUILD_RUSTC=[%s]\n' "$probe" "${TRUST_TARGO_LANE_RUSTFLAGS+set}" "$lane" "${CARGO_ENCODED_RUSTFLAGS+set}" "$encoded" "${RUSTFLAGS-}" "${RUSTC_WRAPPER+set}" "${RUSTC_WRAPPER-}" "${RUSTC-}" "${CARGO_BUILD_RUSTC-}" >> '@LOG@'
+case "$probe" in
+  config-get) printf '%s\n' 'error: config value `build.target` is not set' >&2; exit 101 ;;
+  unit-graph) exec /bin/cat '@UNIT_GRAPH@' ;;
+  pkgid) printf '%s\n' '@PKGID@'; exit 0 ;;
+  metadata|temporal-metadata) exec /bin/cat '@METADATA@' ;;
+esac
+exit 98
+"#
+    .replace("@LOG@", &log.display().to_string())
+    .replace("@UNIT_GRAPH@", &unit_graph_path.display().to_string())
+    .replace("@PKGID@", &package_id)
+    .replace("@METADATA@", &metadata_path.display().to_string());
+    let targo = write_checker_fixture_script(&bin_dir, "targo", &script);
+    (rustc, targo, log)
+}
+
+/// S9, revised for T14a: every selection-only Targo probe resolves the
+/// project's flags as the build does, and carries a lane in
+/// `TRUST_TARGO_LANE_RUSTFLAGS`, so the sibling Targo drops an inherited or
+/// configured external `-Zcodegen-backend` (the trust-mc dylib, which once
+/// loaded into trustc's target-info query inside `targo metadata`, measured on
+/// targo 45dc60873, 2026-09-12) before it can reach the probe's compiler
+/// (that drop is `src/tools/targo`'s `lane_inheritance_tests`). The caller's
+/// RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS are left as they are, no rustc
+/// wrapper runs (the empty wrapper variables show as `WRAPPER_SET=set` even
+/// though this process sets none), and the authenticated compiler is pinned,
+/// so a config-file `build.rustc` never runs either.
+///
+/// Probes that evaluate target cfgs and see the build's lane (the trust-cg
+/// unit graph) carry trust-cg's codegen contract and the strict safety checks
+/// in that lane; the others carry an empty one.
+#[cfg(unix)]
+#[test]
+fn selection_probes_carry_a_lane_and_pin_the_authenticated_compiler() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let backend = "/abs/librustc_codegen_trust_mc.dylib";
+    let plain = format!("-Zcodegen-backend={backend}");
+    let encoded = format!("-Z\x1fcodegen-backend={backend}\x1f--cfg\x1fprobe_cfg");
+    let _target = TestEnvVar::unset("CARGO_BUILD_TARGET");
+    let _plain = TestEnvVar::set("RUSTFLAGS", &plain);
+    let _encoded = TestEnvVar::set("CARGO_ENCODED_RUSTFLAGS", &encoded);
+    let _rustc = TestEnvVar::set("RUSTC", "/abs/ambient-rustc");
+    let _build_rustc = TestEnvVar::set("CARGO_BUILD_RUSTC", "/abs/ambient-rustc");
+    let root = temp_test_dir("selection-probe-rustflags");
+    let (rustc, targo, log) = write_env_logging_selection_targo(&root);
+    let configured = format!("build.rustflags=['-Zcodegen-backend={backend}']");
+
+    let selection = crate::pipeline::cargo_selection::resolve_cargo_selection_with_targo(
+        &["--config".to_string(), configured.clone(), "-p".to_string(), "fixture".to_string()],
+        &targo,
+        &rustc,
+    )
+    .expect("fixture package selection resolves");
+    assert_eq!(selection.packages.len(), 1, "{selection:?}");
+    assert_eq!(
+        crate::pipeline::cargo_selection::effective_cargo_target_with_targo(
+            &["--config".to_string(), configured.clone()],
+            &targo,
+            &rustc,
+        )
+        .expect("build.target probe"),
+        None
+    );
+    crate::pipeline::cargo_selection::preflight_trust_cg_cargo_targets_with_targo(
+        &[
+            "--config".to_string(),
+            configured.clone(),
+            "--target".to_string(),
+            "x86_64-unknown-linux-gnu".to_string(),
+        ],
+        &targo,
+        &rustc,
+        true,
+    )
+    .expect("fixture rlib passes the unit-graph preflight");
+    let temporal = crate::temporal_cli::temporal_metadata_command(
+        &targo,
+        &rustc,
+        &root,
+        &[
+            "--config".to_string(),
+            configured,
+            "--filter-platform".to_string(),
+            "x86_64-unknown-linux-gnu".to_string(),
+        ],
+    )
+    .expect("temporal metadata probe command")
+    .output()
+    .expect("run temporal metadata probe");
+    assert!(temporal.status.success(), "{temporal:?}");
+    assert_eq!(
+        crate::pipeline::configured_cargo_build_target_with_targo(&targo, &rustc)
+            .expect("post-build build.target probe"),
+        None
+    );
+
+    let logged = std::fs::read_to_string(&log).expect("probe environment log");
+    let mut probes =
+        logged.lines().map(|line| line.split(' ').next().unwrap_or("")).collect::<Vec<_>>();
+    probes.sort_unstable();
+    assert_eq!(
+        probes,
+        ["config-get", "config-get", "metadata", "pkgid", "temporal-metadata", "unit-graph"],
+        "{logged}"
+    );
+    let rustc = rustc.display();
+    let caller_encoded = encoded.replace('\x1f', "|");
+    for line in logged.lines() {
+        let probe = line.split(' ').next().unwrap_or("");
+        let lane = match probe {
+            // trust-cg's codegen contract and strict safety checks change
+            // target cfgs (`panic`, `debug_assertions`), so they are part of
+            // the graph the build resolves.
+            "unit-graph" => {
+                "-C|panic=abort|-C|debuginfo=0|-C|codegen-units=1|-C|overflow-checks=yes|-C|debug-assertions=yes"
+            }
+            _ => "",
+        };
+        assert_eq!(
+            line,
+            format!(
+                "{probe} LANE_SET=set LANE=[{lane}] ENCODED_SET=set ENCODED=[{caller_encoded}] RUSTFLAGS=[{plain}] WRAPPER_SET=set WRAPPER=[] RUSTC=[{rustc}] BUILD_RUSTC=[{rustc}]"
+            ),
+            "selection probe `{probe}` carried no lane, rewrote the caller's flags, ran a wrapper \
+             or an unpinned compiler: {logged}"
+        );
+    }
+    assert!(!logged.contains("ambient-rustc"), "{logged}");
+
+    std::fs::remove_dir_all(root).expect("remove selection probe fixture");
+}
+
 #[cfg(unix)]
 fn copied_real_targo_for_contract_e2e(root: &Path) -> PathBuf {
     let source = std::env::var_os("TRUST_REAL_TARGO_E2E").map(PathBuf::from).unwrap_or_else(|| {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("repository root")
-            .join("src/tools/targo/target/debug/cargo")
+            .join("src/tools/targo/target/debug/targo")
     });
     assert!(
         source.is_file(),
@@ -15614,7 +15894,7 @@ fn violated_usize_tailcall_aborts_before_return() {{
 }
 
 /// Positive companion to the violated-monitor fixture above.  This proves
-/// that authenticated phase-A transport reaches the fresh-only phase-B replay
+/// that authenticated phase-A transport reaches its original qualified queue
 /// and that the exact authorized integration-test executable is actually run;
 /// the negative fixture separately proves that its linked library is
 /// instrumented.
@@ -15652,9 +15932,11 @@ fn real_targo_test_executes_authorized_satisfying_integration_test() {
         format!(
             r#"#[test]
 fn satisfying_library_clause_returns() {{
-    std::fs::write({started:?}, b"started").unwrap();
-    assert_eq!(certified_monitor_success_fixture::identity(7), 7);
-    std::fs::write({returned:?}, b"returned").unwrap();
+    let _ = std::fs::write({started:?}, b"started");
+    let observed = certified_monitor_success_fixture::identity(7);
+    if observed == 7 {{
+        let _ = std::fs::write({returned:?}, b"returned");
+    }}
 }}
 "#
         ),
@@ -15686,7 +15968,7 @@ fn satisfying_library_clause_returns() {{
     assert!(subject.contains("compile_mode=\"test\""), "cfg(test) library view missing: {subject}");
     let execution = &report["verification_gate"]["test_execution"];
     assert_eq!(execution["schema"], trust_types::CERTIFIED_TEST_EXECUTION_SCHEMA_VERSION);
-    assert_eq!(execution["completion_scope"], "top-level-cargo-child-exit-only-v1");
+    assert_eq!(execution["completion_scope"], "retained-compile-checkpoint-and-child-exit-v1");
     assert_eq!(execution["phase_b_state"], "cargo-invocation-exited");
     assert_eq!(execution["phase_b_exit"], 0);
     assert_eq!(execution["requested"], true);
@@ -15724,7 +16006,7 @@ fn satisfying_library_clause_returns() {{
     );
     assert_eq!(
         execution["scope"],
-        trust_types::CERTIFIED_TEST_EXECUTION_SCOPE,
+        trust_types::CERTIFIED_RETAINED_TEST_EXECUTION_SCOPE,
         "report must state the exact limited completion claim: {execution}"
     );
 
@@ -15733,6 +16015,12 @@ fn satisfying_library_clause_returns() {{
 
 /// `harness = false` replaces libtest with an arbitrary target `main`, so it
 /// cannot claim the evidence-grade phase-B test-harness boundary.
+///
+/// Require the exact native graph refusal, rather than an arbitrary nonzero
+/// exit and absent marker. The retained graph validates its complete execution
+/// population before dispatching compiler jobs, so an unharnessed target is
+/// neither compiled nor authorized. The separate compile-only controls below
+/// exercise the sealed compiler and documentation/provider edges.
 #[cfg(any(
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
     all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
@@ -15754,6 +16042,438 @@ fn real_targo_test_rejects_unharnessed_test_target_before_execution() {
         format!("fn main() {{ std::fs::write({executed:?}, b\"executed\").unwrap(); }}\n"),
     )
     .expect("write arbitrary test main");
+    let report_dir = root.join("report");
+
+    let (status, stderr) = run_subcommand_capturing_stderr(
+        Subcommand::Test,
+        &[
+            "--allow-l0-gaps".to_string(),
+            "--manifest-path".to_string(),
+            root.join("Cargo.toml").display().to_string(),
+            "--target-dir".to_string(),
+            root.join("target").display().to_string(),
+            "--report-dir".to_string(),
+            report_dir.display().to_string(),
+        ],
+        &root.join("targo-trust.stderr"),
+    );
+    assert_ne!(status, ExitCode::SUCCESS, "harness=false must fail closed");
+    assert!(!executed.exists(), "arbitrary target main ran outside the certified libtest boundary");
+    assert!(
+        stderr.contains("build.test-jobs requires native Rust harnesses without custom runners"),
+        "the native queue must refuse the unharnessed execution population before compilation; an unrelated startup/compiler failure is not this control: {stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(report_dir.join("report.json")).unwrap_or_else(|error| {
+            panic!(
+                "no report.json ({error}): `targo trust test` never reached Cargo, so the nonzero exit is not the harness refusal"
+            )
+        }),
+    )
+    .expect("parse unharnessed test report");
+    let execution = &report["verification_gate"]["test_execution"];
+    assert_eq!(execution["requested"], true, "{execution}");
+    assert_eq!(execution["compile_only"], false, "{execution}");
+    assert_eq!(
+        execution["phase_a_status"], 101,
+        "the actual native child must return its graph refusal: {execution}"
+    );
+    assert_eq!(execution["phase_a_success"], false, "{execution}");
+    assert!(
+        execution["authorized_executables"].is_null()
+            || execution["authorized_executables"].as_array().is_some_and(Vec::is_empty),
+        "a refused execution population must authorize no executable: {execution}"
+    );
+    assert!(execution["authorized_inventory_sha256"].is_null(), "{execution}");
+    assert_eq!(execution["phase_b_state"], "blocked", "{execution}");
+    assert!(execution["phase_b_exit"].is_null(), "no qualified execution occurred: {execution}");
+    assert!(compiled_fixture_images(&root, "arbitrary-main", "").is_empty());
+
+    std::fs::remove_dir_all(root).expect("remove unharnessed monitor fixture");
+}
+
+/// Observe native fixture executables and libraries across Cargo's default and
+/// granular artifact layouts, within the owned target tree and without symlinks.
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+fn compiled_fixture_images(root: &Path, target: &str, suffix: &str) -> Vec<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let target_root = root.join("target");
+    let normalized = target.replace('-', "_");
+    let prefixes = [format!("{target}-"), format!("{normalized}-")];
+    let mut pending = vec![target_root.clone()];
+    let mut images = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && directory == target_root =>
+            {
+                continue;
+            }
+            Err(error) => panic!("cannot observe fixture output {}: {error}", directory.display()),
+        };
+        for entry in entries {
+            let entry = entry.expect("read fixture output entry");
+            let kind = entry.file_type().expect("read fixture output kind");
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(stem) = name.strip_suffix(suffix) else { continue };
+                if (suffix.is_empty() && path.extension().is_some())
+                    || !(stem == target
+                        || stem == normalized
+                        || prefixes.iter().any(|prefix| stem.starts_with(prefix)))
+                {
+                    continue;
+                }
+                let metadata = entry.metadata().expect("read compiled fixture image metadata");
+                if metadata.len() > 0
+                    && (!suffix.is_empty() || metadata.permissions().mode() & 0o111 != 0)
+                {
+                    images.push(path);
+                }
+            }
+        }
+    }
+    images.sort();
+    images
+}
+
+/// D2 (2026-09-28): the strict lane's sealed compile and doctest census edge.
+/// This compile-only request keeps the compiler seal and emits no test grant.
+/// Under the seal every rustc Unit used to fail with "verified Targo command is
+/// missing its authenticated `DYLD_FALLBACK_LIBRARY_PATH` runtime-library
+/// closure" and phase A exited 101: the seal deleted the one loader value the
+/// exec-edge validator requires. A `harness = false` target has no synthesized
+/// harness items, so its compile edge
+/// is exactly the part under test; its `main` is kept strictly verifiable (no
+/// `unwrap`). Explicit `--no-run` selects compile-only custody and publishes no
+/// execution authority; the retained executable-population refusal is separate.
+///
+/// Review 2026-09-28: the library keeps Cargo's default Doctest Unit, so the
+/// same sealed phase A also runs the D2d doctest census, whose trustdoc must be
+/// sealed like rustc. Its only documentation is read (under `cfg(doc)`, which
+/// rustc never sees) from a path spelled with trustdoc's own `PATH`: the seal
+/// pins that to `/usr/bin:/bin`, and this test runs with an unsealed marker
+/// appended to `PATH`, so the file exists only for a SEALED census. An unsealed
+/// census cannot read it, reports nothing, and the Unit stays
+/// `deferred-doctest-execution` instead of `empty-doctest-unit`.
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[test]
+#[ignore = "requires a freshly built in-tree trustc and Targo"]
+fn real_targo_test_strict_lane_compiles_under_the_sealed_loader_closure() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_test_dir("certified-monitor-strict-sealed-compile");
+    std::fs::create_dir_all(root.join("src")).expect("create library source directory");
+    std::fs::create_dir_all(root.join("tests")).expect("create test source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='certified-monitor-strict-fixture'\nversion='0.1.0'\nedition='2021'\n\n[lib]\ncrate-type=['rlib']\ntest=false\n\n[[test]]\nname='sealed-main'\npath='tests/sealed_main.rs'\nharness=false\n",
+    )
+    .expect("write strict sealed-compile fixture manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "#![cfg_attr(doc, doc = include_str!(concat!(\"../sealed-census\", env!(\"PATH\"), \"/probe.md\")))]\npub fn identity(x: u64) -> u64 {\n    x\n}\n",
+    )
+    .expect("write strict sealed-compile library");
+    let sealed_census_probe = root.join("sealed-census/usr/bin:/bin");
+    std::fs::create_dir_all(&sealed_census_probe).expect("create sealed-census probe directory");
+    std::fs::write(
+        sealed_census_probe.join("probe.md"),
+        "Readable only by a census trustdoc sealed to `PATH=/usr/bin:/bin`; no doctest here.\n",
+    )
+    .expect("write sealed-census probe documentation");
+    let unsealed_path = format!(
+        "{}:/nonexistent-unsealed-census-marker",
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string())
+    );
+    let _path = TestEnvVar::set("PATH", &unsealed_path);
+    std::fs::write(
+        root.join("tests/sealed_main.rs"),
+        "fn main() {\n    let _ = certified_monitor_strict_fixture::identity(5);\n}\n",
+    )
+    .expect("write harnessless test main");
+    let report_dir = root.join("report");
+
+    // Compile-only avoids the retained graph's intentional harness=false
+    // execution refusal. It still runs the real sealed compiler and census.
+    // No `--allow-l0-gaps`: this is the evidence-grade lane with the seal on.
+    let status = run_subcommand(
+        Subcommand::Test,
+        &[
+            "--no-run".to_string(),
+            "--manifest-path".to_string(),
+            root.join("Cargo.toml").display().to_string(),
+            "--target-dir".to_string(),
+            root.join("target").display().to_string(),
+            "--report-dir".to_string(),
+            report_dir.display().to_string(),
+        ],
+    );
+    assert_eq!(status, ExitCode::SUCCESS, "the sealed compile-only fixture must pass");
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(report_dir.join("report.json")).expect("read strict test report"),
+    )
+    .expect("parse strict test report");
+    let execution = &report["verification_gate"]["test_execution"];
+    assert_eq!(
+        execution["phase_a_status"], 0,
+        "the sealed strict-lane compile phase must succeed (pre-D2: 101, loader closure refused): {execution}"
+    );
+    assert_eq!(execution["phase_a_success"], true, "{execution}");
+    assert_eq!(execution["requested"], true, "{execution}");
+    assert_eq!(execution["compile_only"], true, "{execution}");
+    assert_eq!(execution["phase_b_state"], "not-requested", "{execution}");
+    assert!(execution["phase_b_exit"].is_null(), "{execution}");
+    assert!(execution["authorized_inventory_sha256"].is_null(), "{execution}");
+    assert!(
+        !compiled_fixture_images(&root, "sealed-main", "").is_empty(),
+        "compile-only must produce the actual selected test executable"
+    );
+    let report_text = report.to_string();
+    assert!(
+        report_text.contains("empty-doctest-unit")
+            && !report_text.contains("deferred-doctest-execution"),
+        "the sealed doctest census must count the library's zero doctests (an unsealed census cannot read its documentation and leaves the Unit deferred): {report_text}"
+    );
+
+    std::fs::remove_dir_all(root).expect("remove strict sealed-compile fixture");
+}
+
+/// Run `targo trust <subcommand>` in-process with this process's fd 2
+/// redirected to `log`, and return the exit code and everything written there.
+/// The Cargo child's stderr is piped into `targo trust`, which echoes each line
+/// with `eprintln!`; under libtest's default output capture that echo goes to
+/// libtest's buffer instead of fd 2, so a caller that asserts on the text must
+/// first prove it saw Cargo's stderr at all (the release gate runs every E2E
+/// with `--nocapture`).
+#[cfg(unix)]
+fn run_subcommand_capturing_stderr(
+    subcommand: Subcommand,
+    args: &[String],
+    log: &Path,
+) -> (ExitCode, String) {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+
+    let file = std::fs::File::create(log).expect("create stderr capture file");
+    std::io::stderr().flush().expect("flush stderr before redirecting it");
+    // SAFETY: fd 2 is open for the whole process; `dup` only adds a
+    // descriptor that is restored and closed below.
+    let saved = unsafe { libc::dup(2) };
+    assert!(saved >= 0, "dup(2) failed: {}", std::io::Error::last_os_error());
+    // SAFETY: both descriptors are open; the caller holds `TEST_ENV_LOCK`
+    // and the release gate runs one test thread, so no other test writes fd 2.
+    assert_eq!(unsafe { libc::dup2(file.as_raw_fd(), 2) }, 2, "redirect fd 2");
+    let status = run_subcommand(subcommand, args);
+    std::io::stderr().flush().expect("flush redirected stderr");
+    // SAFETY: `saved` is the descriptor duplicated above.
+    let restored = unsafe { libc::dup2(saved, 2) };
+    // SAFETY: `saved` is owned here and no longer used after this call.
+    unsafe { libc::close(saved) };
+    assert_eq!(restored, 2, "restore fd 2");
+    drop(file);
+    (status, std::fs::read_to_string(log).expect("read stderr capture"))
+}
+
+/// CB5 (2026-09-28): the STRICT lane with the audited `trust-spec` provider
+/// in the graph. Cargo adds `-C prefer-dynamic` to every host unit that is not
+/// a build script, so every proc-macro unit, the audited provider included,
+/// reached the sealed argv check carrying a flag that check refuses: phase A
+/// exited 101 with "-Cprefer_dynamic is unavailable" and the audited
+/// proc-macro admission behind it was unreachable. Verified lanes no longer
+/// emit the flag for a proc-macro unit (`cargo_prefers_dynamic_rust_linkage`
+/// in Targo's `core/compiler/mod.rs`).
+///
+/// The provider is the repository's own `crates/trust-spec`, whose manifest and
+/// library bytes the audited allowlist pins, as a path dependency; its
+/// `workspace = true` fields resolve from root `Cargo.toml`, which is only
+/// read. The fixture's harnessless target keeps phase A to the compile edge
+/// under test, using explicit compile-only custody and no execution grant. The
+/// stderr assertions need libtest's `--nocapture`, which the release gate
+/// passes; without it this test fails instead of passing vacuously.
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[test]
+#[ignore = "requires a freshly built in-tree trustc and Targo"]
+fn real_targo_test_strict_lane_compiles_audited_proc_macro_provider() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_test_dir("certified-monitor-audited-spec-provider");
+    std::fs::create_dir_all(root.join("src")).expect("create library source directory");
+    std::fs::create_dir_all(root.join("tests")).expect("create test source directory");
+    let provider = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repository root")
+        .join("crates/trust-spec");
+    assert!(provider.join("src/lib.rs").is_file(), "missing {}", provider.display());
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[package]\nname='certified-monitor-audited-spec-fixture'\nversion='0.1.0'\nedition='2021'\n\n[lib]\ncrate-type=['rlib']\ntest=false\ndoctest=false\n\n[dependencies]\ntrust-spec = {{ path = {:?} }}\n\n[[test]]\nname='sealed-main'\npath='tests/sealed_main.rs'\nharness=false\n",
+            provider.display().to_string()
+        ),
+    )
+    .expect("write audited-provider fixture manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "#[trust::requires(x < 100)]\n#[trust::ensures(result == x + 1)]\npub fn add1(x: u32) -> u32 {\n    x + 1\n}\n",
+    )
+    .expect("write audited-provider fixture library");
+    std::fs::write(root.join("tests/sealed_main.rs"), "fn main() {}\n")
+        .expect("write harnessless test main");
+    let report_dir = root.join("report");
+
+    // No `--allow-l0-gaps`: the evidence-grade lane with the seal on.
+    let (status, stderr) = run_subcommand_capturing_stderr(
+        Subcommand::Test,
+        &[
+            "--no-run".to_string(),
+            "--manifest-path".to_string(),
+            root.join("Cargo.toml").display().to_string(),
+            "--target-dir".to_string(),
+            root.join("target").display().to_string(),
+            "--report-dir".to_string(),
+            report_dir.display().to_string(),
+        ],
+        &root.join("targo-trust.stderr"),
+    );
+    assert_eq!(status, ExitCode::SUCCESS, "the audited-provider compile-only fixture must pass");
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(report_dir.join("report.json")).expect("read audited-provider report"),
+    )
+    .expect("parse audited-provider report");
+    let execution = &report["verification_gate"]["test_execution"];
+    assert_eq!(
+        execution["phase_a_status"], 0,
+        "the strict compile phase must admit the audited proc-macro provider (pre-CB5: 101, -Cprefer_dynamic is unavailable): {execution}"
+    );
+    assert_eq!(execution["phase_a_success"], true, "{execution}");
+    assert_eq!(execution["requested"], true, "{execution}");
+    assert_eq!(execution["compile_only"], true, "{execution}");
+    assert_eq!(execution["phase_b_state"], "not-requested", "{execution}");
+    assert!(execution["phase_b_exit"].is_null(), "{execution}");
+    assert!(execution["authorized_inventory_sha256"].is_null(), "{execution}");
+    assert!(
+        !compiled_fixture_images(&root, "sealed-main", "").is_empty(),
+        "compile-only must produce the actual selected test executable"
+    );
+
+    for flag in ["prefer_dynamic", "prefer-dynamic"] {
+        assert!(!stderr.contains(flag), "`{flag}` reached the strict lane: {stderr}");
+    }
+    // The capture saw Cargo's own stderr for the provider unit, so the absence
+    // above is an observation, not an empty file.
+    assert!(
+        stderr.contains("Compiling trust-spec"),
+        "Cargo's stderr was not captured (run with `--nocapture`, as the release gate does): {stderr}"
+    );
+
+    // The audited provider was compiled in this lane, not merely listed.
+    let provider_dylibs = compiled_fixture_images(
+        &root,
+        &format!("{}trust", std::env::consts::DLL_PREFIX),
+        std::env::consts::DLL_SUFFIX,
+    );
+    assert_eq!(
+        provider_dylibs.len(),
+        1,
+        "the audited provider dylib was not built: {provider_dylibs:?}"
+    );
+    let inventory = &report["cargo_proof_inventory"]["excluded_active_units"];
+    assert!(
+        inventory.as_array().is_some_and(|units| units.iter().any(|unit| {
+            unit["package_name"] == "trust-spec"
+                && unit["target_kinds"] == serde_json::json!(["proc-macro"])
+        })),
+        "the audited provider is not an active proc-macro unit of this session: {inventory}"
+    );
+
+    // Its `requires`/`ensures` expansions reached the compiler, which reported
+    // both clauses of `add1` as carrying a certified runtime monitor.
+    let monitored = report["functions"]
+        .as_array()
+        .expect("report functions")
+        .iter()
+        .filter(|function| {
+            function["function"].as_str().is_some_and(|name| name.ends_with("::add1"))
+        })
+        .flat_map(|function| function["obligations"].as_array().cloned().unwrap_or_default())
+        .filter(|obligation| obligation["transport_evidence"]["monitor"]["status"] == "monitored")
+        .filter_map(|obligation| obligation["obligation_id"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    for clause in [":precondition:", ":postcondition:"] {
+        assert!(
+            monitored.iter().any(|id| id.contains(clause)),
+            "no monitored `{clause}` obligation for `add1` ({monitored:?}): {}",
+            report["functions"]
+        );
+    }
+    assert!(
+        stderr.contains("contract clause #0 (Requires) is monitored")
+            && stderr.contains("contract clause #1 (Ensures) is monitored"),
+        "the compiler's monitored-contract notes are missing: {stderr}"
+    );
+
+    std::fs::remove_dir_all(root).expect("remove audited-provider fixture");
+}
+
+/// CB5 (2026-09-28): a proc-macro crate's OWN lib test. That unit is an
+/// executable selected for the certified monitor, and Cargo's `-C
+/// prefer-dynamic` linked it against `@rpath/libstd-*` with no rpath, so
+/// rustc's `-Ztrust-targo-test-monitor` check refused it in every monitor lane
+/// ("-Cprefer-dynamic is unavailable", phase A 101), advisory included. With
+/// the flag gone the test executable links std statically and runs.
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[test]
+#[ignore = "requires a freshly built in-tree trustc and Targo"]
+fn real_targo_test_advisory_lane_runs_proc_macro_crate_tests_with_static_std() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_test_dir("certified-monitor-proc-macro-crate-test");
+    std::fs::create_dir_all(root.join("src")).expect("create proc-macro source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='certified-monitor-proc-macro-fixture'\nversion='0.1.0'\nedition='2021'\n\n[lib]\nproc-macro=true\ndoctest=false\n",
+    )
+    .expect("write proc-macro fixture manifest");
+    let executed = root.join("proc-macro-test-executed");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        format!(
+            r#"extern crate proc_macro;
+use proc_macro::TokenStream;
+
+#[proc_macro_derive(Nothing)]
+pub fn derive_nothing(_input: TokenStream) -> TokenStream {{
+    TokenStream::new()
+}}
+
+#[cfg(test)]
+mod tests {{
+    #[test]
+    fn proc_macro_crate_test_runs() {{
+        std::fs::write({executed:?}, b"executed").unwrap();
+    }}
+}}
+"#
+        ),
+    )
+    .expect("write proc-macro fixture library");
+    let report_dir = root.join("report");
 
     let status = run_subcommand(
         Subcommand::Test,
@@ -15763,12 +16483,278 @@ fn real_targo_test_rejects_unharnessed_test_target_before_execution() {
             root.join("Cargo.toml").display().to_string(),
             "--target-dir".to_string(),
             root.join("target").display().to_string(),
+            "--report-dir".to_string(),
+            report_dir.display().to_string(),
         ],
     );
-    assert_ne!(status, ExitCode::SUCCESS, "harness=false must fail closed");
-    assert!(!executed.exists(), "arbitrary target main ran outside the certified libtest boundary");
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(report_dir.join("report.json")).expect("read proc-macro test report"),
+    )
+    .expect("parse proc-macro test report");
+    let execution = &report["verification_gate"]["test_execution"];
+    assert_eq!(
+        execution["phase_a_status"], 0,
+        "the proc-macro crate's lib test must compile (pre-CB5: 101, rustc refused -Cprefer-dynamic): {execution}"
+    );
+    assert_eq!(execution["phase_b_state"], "cargo-invocation-exited", "{execution}");
+    assert_eq!(execution["phase_b_exit"], 0, "the proc-macro crate's test must pass: {execution}");
+    assert_eq!(status, ExitCode::SUCCESS, "{execution}");
+    assert!(executed.is_file(), "the proc-macro crate's test body never ran");
+    let authorized = execution["authorized_executables"]
+        .as_array()
+        .unwrap_or_else(|| panic!("phase A authorized no executable: {execution}"));
+    assert_eq!(authorized.len(), 1, "exactly the lib test is authorized: {execution}");
+    let executable = authorized[0]["path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("authorized executable has no path: {execution}"));
 
-    std::fs::remove_dir_all(root).expect("remove unharnessed monitor fixture");
+    // Its dynamic imports carry no Rust std: the certified test-execution edge
+    // strips every `DYLD_*`/`LD_*` search path, so an `@rpath/libstd-*`
+    // import could not even load there.
+    #[cfg(target_os = "macos")]
+    let (tool, flag, import_marker) = ("/usr/bin/otool", "-L", ".dylib");
+    #[cfg(target_os = "linux")]
+    let (tool, flag, import_marker) = ("/usr/bin/readelf", "-d", "(NEEDED)");
+    let imports = Command::new(tool)
+        .arg(flag)
+        .arg(executable)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap_or_else(|error| panic!("run {tool}: {error}"));
+    assert!(imports.status.success(), "{tool} failed: {imports:?}");
+    let imports = String::from_utf8_lossy(&imports.stdout);
+    assert!(
+        imports.lines().any(|line| line.contains(import_marker)),
+        "{tool} listed no dynamic imports at all, so the check below would be vacuous: {imports}"
+    );
+    assert!(
+        !imports.contains("libstd-"),
+        "the proc-macro test executable links Rust std dynamically: {imports}"
+    );
+
+    std::fs::remove_dir_all(root).expect("remove proc-macro crate-test fixture");
+}
+
+/// Trust (CB4): write a Cargo fixture for the libtest-harness exclusion E2Es.
+/// `doctest = false` keeps the doctest lanes (D2d/D2e/CB5) out of the run, so
+/// the only harness code in play is what `#[test]` and the harness pass make.
+#[cfg(unix)]
+fn write_cb4_harness_fixture(root: &Path, lib: &str, integration_test: Option<&str>) {
+    std::fs::create_dir_all(root.join("src")).expect("create CB4 fixture source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='cb4-fixture'\nversion='0.1.0'\nedition='2021'\n\n[lib]\ndoctest=false\n",
+    )
+    .expect("write CB4 fixture manifest");
+    std::fs::write(root.join("src/lib.rs"), lib).expect("write CB4 fixture library");
+    if let Some(integration_test) = integration_test {
+        std::fs::create_dir_all(root.join("tests")).expect("create CB4 integration-test directory");
+        std::fs::write(root.join("tests/it.rs"), integration_test)
+            .expect("write CB4 integration test");
+    }
+}
+
+/// Trust (CB4): read `report.json` and return (gate, exclusions, function names).
+#[cfg(unix)]
+fn read_cb4_report(report_dir: &Path) -> (serde_json::Value, Vec<serde_json::Value>, Vec<String>) {
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(report_dir.join("report.json")).expect("read CB4 report"),
+    )
+    .expect("parse CB4 report");
+    let gate = report["verification_gate"].clone();
+    let exclusions = gate["exclusions"].as_array().cloned().unwrap_or_default();
+    let functions = report["functions"]
+        .as_array()
+        .map(|functions| {
+            functions
+                .iter()
+                .filter_map(|function| function["function"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    (gate, exclusions, functions)
+}
+
+/// Trust (CB4): every exclusion is a libtest harness body of a known item, and
+/// none of them appears among the report's functions — an excluded body carries
+/// no obligation row, so it cannot carry a proved one.
+#[cfg(unix)]
+fn assert_cb4_exclusions_are_harness_only(exclusions: &[serde_json::Value], functions: &[String]) {
+    for exclusion in exclusions {
+        assert_eq!(exclusion["reason"], "test-harness-synthesized", "{exclusion}");
+        let item = exclusion["item"].as_str().expect("exclusion item");
+        assert!(matches!(item, "harness-main" | "test-runner-closure"), "{exclusion}");
+        let function = exclusion["function"].as_str().expect("excluded function");
+        if item == "harness-main" {
+            assert!(function.ends_with("::main"), "{exclusion}");
+            assert!(exclusion.get("test_function").is_none(), "{exclusion}");
+        } else {
+            assert!(function.ends_with("::{closure#0}"), "{exclusion}");
+            assert!(exclusion["test_function"].as_str().is_some(), "{exclusion}");
+        }
+        assert!(
+            !functions.iter().any(|name| name == function),
+            "an excluded body must not carry obligation rows: {function}"
+        );
+    }
+}
+
+/// Trust (CB4): strict `targo trust test` PASSES a crate whose user bodies are
+/// proved, with the libtest harness bodies excluded and disclosed. MEASURED
+/// before CB4 on the same shape: exit 1, `Gate: FAIL`, the four harness bodies
+/// the only errors (every user body, `it::it#1` included, PROVED).
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[test]
+#[ignore = "requires a freshly built in-tree trustc and Targo"]
+fn real_targo_test_strict_lane_passes_a_proved_harness_test() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_test_dir("cb4-strict-harness-pass");
+    write_cb4_harness_fixture(
+        &root,
+        "pub fn add1(x: u8) -> u8 {\n    if x < 255 { x + 1 } else { x }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn calls_add1() {\n        let _ = super::add1(3);\n    }\n}\n",
+        Some("#[test]\nfn it() {\n    let _ = cb4_fixture::add1(5);\n}\n"),
+    );
+    let report_dir = root.join("report");
+    // No `--allow-l0-gaps`: the default strict lane.
+    let status = run_subcommand(
+        Subcommand::Test,
+        &[
+            "--manifest-path".to_string(),
+            root.join("Cargo.toml").display().to_string(),
+            "--target-dir".to_string(),
+            root.join("target").display().to_string(),
+            "--report-dir".to_string(),
+            report_dir.display().to_string(),
+        ],
+    );
+    assert_eq!(status, ExitCode::SUCCESS, "strict test lane must pass a proved harness test");
+    let (gate, exclusions, functions) = read_cb4_report(&report_dir);
+    assert_eq!(gate["lane"], "strict", "{gate}");
+    assert_eq!(gate["decision"], "pass", "{gate}");
+    assert_eq!(gate["test_execution"]["phase_a_status"], 0, "{gate}");
+    assert_eq!(gate["test_execution"]["phase_b_exit"], 0, "{gate}");
+    assert!(gate["counts"]["proved"].as_u64().is_some_and(|proved| proved >= 2), "{gate}");
+    // Two runner closures (the unit test, the integration test) and two
+    // harness mains (the lib's test unit, the integration test binary).
+    assert_eq!(gate["counts"]["excluded"], 4, "{gate}");
+    assert_eq!(exclusions.len(), 4, "{gate}");
+    assert_eq!(gate["coverage"]["excluded"], 4, "{gate}");
+    assert_eq!(gate["coverage"]["coverage_complete"], true, "{gate}");
+    assert_cb4_exclusions_are_harness_only(&exclusions, &functions);
+    // The user test functions are verified as their own bodies.
+    assert!(functions.iter().any(|name| name.contains("calls_add1")), "{functions:?}");
+    assert!(functions.iter().any(|name| name.contains("it::it")), "{functions:?}");
+
+    std::fs::remove_dir_all(root).expect("remove CB4 strict pass fixture");
+}
+
+/// Trust (CB4): excluding the harness never excuses the test body. A test whose
+/// own body overflows is REFUTED as user code, phase A fails, and phase B never
+/// runs — while the harness bodies are still excluded, not verified.
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[test]
+#[ignore = "requires a freshly built in-tree trustc and Targo"]
+fn real_targo_test_strict_lane_refuses_an_unproved_test_body() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_test_dir("cb4-strict-harness-refuted");
+    let ran = root.join("test-body-ran");
+    write_cb4_harness_fixture(
+        &root,
+        &format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn overflows() {{\n        std::fs::write({ran:?}, b\"ran\").unwrap();\n        let x: u8 = core::hint::black_box(200);\n        let _y = x + 100;\n    }}\n}}\n"
+        ),
+        None,
+    );
+    let report_dir = root.join("report");
+    let status = run_subcommand(
+        Subcommand::Test,
+        &[
+            "--manifest-path".to_string(),
+            root.join("Cargo.toml").display().to_string(),
+            "--target-dir".to_string(),
+            root.join("target").display().to_string(),
+            "--report-dir".to_string(),
+            report_dir.display().to_string(),
+        ],
+    );
+    assert_ne!(status, ExitCode::SUCCESS, "an overflowing test body must fail the strict lane");
+    assert!(!ran.exists(), "phase B must not run after a phase-A refutation");
+    let (gate, exclusions, functions) = read_cb4_report(&report_dir);
+    assert_ne!(gate["decision"], "pass", "{gate}");
+    assert_ne!(gate["decision"], "conditional-pass", "{gate}");
+    assert_ne!(gate["test_execution"]["phase_a_status"], 0, "{gate}");
+    assert_ne!(gate["test_execution"]["phase_b_state"], "cargo-invocation-exited", "{gate}");
+    assert!(gate["counts"]["failed"].as_u64().is_some_and(|failed| failed >= 1), "{gate}");
+    assert!(functions.iter().any(|name| name.contains("overflows")), "{functions:?}");
+    // The runner closure and the harness main are excluded, not verified.
+    assert_eq!(gate["counts"]["excluded"], 2, "{gate}");
+    assert_cb4_exclusions_are_harness_only(&exclusions, &functions);
+
+    std::fs::remove_dir_all(root).expect("remove CB4 strict refutation fixture");
+}
+
+/// Trust (CB4, critique MUST-FIX 1 and 2): the MEASURED lead repro — a lib with
+/// `fn id` and `#[test] fn empty() {}`. Every user body has ZERO obligations, so
+/// the run's obligation vector is empty and it may pass only through the
+/// zero-obligation rule, which must count the excluded harness identities
+/// (`eligible == zero-obligation + excluded`). Before CB4 both lanes exited 1;
+/// with exclusions admitted for `test` units only, `check --tests` (whose units
+/// are `check-test`) would have stayed at exit 1.
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[test]
+#[ignore = "requires a freshly built in-tree trustc and Targo"]
+fn real_targo_test_check_tests_and_test_pass_a_zero_obligation_test_crate() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let root = temp_test_dir("cb4-zero-obligation-harness");
+    write_cb4_harness_fixture(
+        &root,
+        "pub fn id(x: u8) -> u8 {\n    x\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn empty() {}\n}\n",
+        None,
+    );
+    for (subcommand, extra, label) in
+        [(Subcommand::Check, Some("--tests"), "check --tests"), (Subcommand::Test, None, "test")]
+    {
+        let report_dir = root.join(format!("report-{}", label.replace(' ', "-")));
+        let mut args = vec![
+            "--manifest-path".to_string(),
+            root.join("Cargo.toml").display().to_string(),
+            "--target-dir".to_string(),
+            root.join("target").display().to_string(),
+            "--report-dir".to_string(),
+            report_dir.display().to_string(),
+        ];
+        args.extend(extra.map(str::to_string));
+        let status = run_subcommand(subcommand, &args);
+        assert_eq!(status, ExitCode::SUCCESS, "{label}: a zero-obligation test crate must pass");
+        let (gate, exclusions, functions) = read_cb4_report(&report_dir);
+        assert_eq!(gate["lane"], "strict", "{label}: {gate}");
+        assert_eq!(gate["decision"], "pass", "{label}: {gate}");
+        assert_eq!(gate["counts"]["total"], 0, "{label}: {gate}");
+        assert_eq!(gate["counts"]["excluded"], 2, "{label}: {gate}");
+        assert_eq!(gate["coverage"]["excluded"], 2, "{label}: {gate}");
+        assert_eq!(gate["coverage"]["coverage_complete"], true, "{label}: {gate}");
+        assert_cb4_exclusions_are_harness_only(&exclusions, &functions);
+        let mode = if subcommand == Subcommand::Check { "check-test" } else { "test" };
+        for exclusion in &exclusions {
+            let function = exclusion["function"].as_str().expect("excluded function");
+            assert!(
+                function.contains(&format!("proof_unit_mode=\"{mode}\"")),
+                "{label}: exclusion bound to the wrong unit mode: {function}"
+            );
+        }
+    }
+
+    std::fs::remove_dir_all(root).expect("remove CB4 zero-obligation fixture");
 }
 
 #[cfg(unix)]
@@ -15815,9 +16801,12 @@ fn logged_crate_invocation<'a>(invocations: &'a [Vec<String>], crate_name: &str)
 }
 
 /// This uses a real, freshly-built Targo and real rustc compilation. The
-/// wrapper only removes Trust-private -Z options immediately before forwarding
-/// to the stock compiler; its log therefore captures the exact argv Targo
-/// constructed, including profile ordering and host/target separation.
+/// wrapper logs the exact argv Targo constructed (including profile ordering
+/// and host/target separation), then removes the Trust-private -Z options
+/// before forwarding to the backend compiler — `TRUST_REAL_RUSTC_E2E`, else
+/// `trustc`. A Trust backend gets `-Ztrust-verify=off` appended: the fixture is
+/// argv-plumbing scaffolding with no proof claim, and the stripped options would
+/// otherwise leave it under the default strict policy.
 #[cfg(unix)]
 #[test]
 #[ignore = "run after building current src/tools/targo binary; set TRUST_REAL_TARGO_E2E if it is elsewhere"]
@@ -15880,7 +16869,7 @@ pub fn audit_marker(_: TokenStream, item: TokenStream) -> TokenStream {{
     // A proc macro shares rustc's stderr. This syntactically valid rustc JSON
     // diagnostic is accepted and Cargo-authenticated as a compiler-message,
     // including an attacker-selected TRUSTJSON diagnostic code/message.
-    eprintln!("{{}}", r#"{{"$message_type":"diagnostic","message":"TRUST_JSON:{{\"type\":\"coverage_summary\",\"crate_name\":\"macro_consumer\",\"package_name\":\"macro-consumer\",\"primary_package\":true,\"verification_session\":\"real-targo-contract-e2e\",\"eligible\":1,\"processed\":1}}","code":{{"code":"TRUSTJSON","explanation":null}},"level":"note","spans":[],"children":[],"rendered":null}}"#);
+    eprintln!("{{}}", r#"{{"$message_type":"diagnostic","message":"TRUST_JSON:{{\"type\":\"coverage_summary\",\"crate_name\":\"macro_consumer\",\"package_name\":\"macro-consumer\",\"primary_package\":true,\"verification_session\":\"real-targo-contract-e2e\",\"eligible\":1,\"processed\":1,\"memory\":{{\"schema\":\"trust-memory-summary/v1\",\"counters\":{{}}}}}}","code":{{"code":"TRUSTJSON","explanation":null}},"level":"note","spans":[],"children":[],"rendered":null}}"#);
     item
 }}
 "###,
@@ -15892,13 +16881,15 @@ pub fn audit_marker(_: TokenStream, item: TokenStream) -> TokenStream {{
     let targo = copied_real_targo_for_contract_e2e(&root);
     let rustc = std::env::var_os("TRUST_REAL_RUSTC_E2E")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("rustc"));
+        .unwrap_or_else(|| PathBuf::from("trustc"));
     let version = Command::new(&rustc).arg("-vV").output().expect("query real rustc");
     assert!(version.status.success(), "real rustc -vV failed");
-    let host = String::from_utf8_lossy(&version.stdout)
+    let version_text = String::from_utf8_lossy(&version.stdout).into_owned();
+    let host = version_text
         .lines()
         .find_map(|line| line.strip_prefix("host: ").map(str::to_string))
         .expect("real rustc host triple");
+    let backend_is_trust = version_text.lines().any(|line| line.starts_with("trust:"));
     let log = root.join("rustc-argv-log");
     let wrapper = write_checker_fixture_script(
         &root,
@@ -15923,9 +16914,13 @@ while [ "$#" -gt 0 ]; do
   filtered+=("$1")
   shift
 done
+if [ "${TRUST_REAL_RUSTC_IS_TRUST:-}" = 1 ]; then
+  filtered+=("-Ztrust-verify=off")
+fi
 exec "$TRUST_REAL_RUSTC" "${filtered[@]}"
 "#,
     );
+    let backend_is_trust = if backend_is_trust { "1" } else { "0" };
     let proof_artifact_root = root.join("proof-artifact-root");
     std::fs::create_dir(&proof_artifact_root).expect("create private proof artifact root");
     {
@@ -15988,10 +16983,14 @@ exec "$TRUST_REAL_RUSTC" "${filtered[@]}"
         let output = command
             .env("RUSTC", &wrapper)
             .env("TRUST_REAL_RUSTC", &rustc)
+            .env("TRUST_REAL_RUSTC_IS_TRUST", backend_is_trust)
             .env("TRUST_RUSTC_ARG_LOG", &log)
             .env("TRUST_BUILD_SCRIPT_ENV_LOG", &build_script_env_log)
             .env("TRUST_TARGO_VERIFY", "1")
-            .env("CARGO_ENCODED_RUSTFLAGS", &encoded_policy)
+            // T14a: the lane travels in Targo's private variable; the
+            // caller's rustflags are the project's (none here).
+            .env("TRUST_TARGO_LANE_RUSTFLAGS", &encoded_policy)
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
             // These alternate compiler-flag spellings are not consumed by
             // this `build` but would otherwise be inherited verbatim by the
             // untrusted build script and disclose the same private root.
@@ -16057,7 +17056,8 @@ exec "$TRUST_REAL_RUSTC" "${filtered[@]}"
             "{profile}: {target:?}"
         );
 
-        for host_crate in ["build_script_build"] {
+        {
+            let host_crate = "build_script_build";
             let host_args = logged_crate_invocation(&invocations, host_crate);
             assert_eq!(
                 rustc_option_values(host_args, "-Z", "codegen-backend").last().map(String::as_str),
@@ -16109,15 +17109,22 @@ exec "$TRUST_REAL_RUSTC" "${filtered[@]}"
     )
     .expect("write proc-macro consumer source");
 
+    // The refusal is of in-process expansion, so this leg carries the lane's
+    // `--no-proc-macro-isolation`: on a host with the isolated worker (D21)
+    // verified Targo otherwise expands the macro out of process and admits
+    // the unit (tests/run-make/trust-certify-isolated-derive).
+    let in_process_policy = format!("{encoded_policy}\x1f-Z\x1ftrust-proc-macro-isolation=no");
     let verified_macro_output = Command::new(&targo)
         .current_dir(&macro_consumer)
         .args(["build", "--lib", "--target", &host, "--target-dir"])
         .arg(root.join("target-verified-proc-macro"))
         .env("RUSTC", &wrapper)
         .env("TRUST_REAL_RUSTC", &rustc)
+        .env("TRUST_REAL_RUSTC_IS_TRUST", backend_is_trust)
         .env("TRUST_RUSTC_ARG_LOG", &log)
         .env("TRUST_TARGO_VERIFY", "1")
-        .env("CARGO_ENCODED_RUSTFLAGS", &encoded_policy)
+        .env("TRUST_TARGO_LANE_RUSTFLAGS", &in_process_policy)
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTFLAGS")
         .env("CARGO_INCREMENTAL", "0")
         .env("TRUST_NO_MIGRATE_WARN", "1")
@@ -16140,14 +17147,17 @@ exec "$TRUST_REAL_RUSTC" "${filtered[@]}"
         "verified Targo rejected only after executing attacker-controlled proc-macro code"
     );
 
-    // Demonstrate why the boundary is mandatory using ordinary Cargo: the
-    // same proc macro writes a rustc-shaped diagnostic directly to shared
-    // stderr, and Cargo authenticates it with the selected package/target
-    // compiler-message envelope and attacker-selected TRUSTJSON code.
-    let plain_cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // Demonstrate why the boundary is mandatory using ordinary Cargo
+    // behaviour: the same proc macro writes a rustc-shaped diagnostic directly
+    // to shared stderr, and Cargo authenticates it with the selected
+    // package/target compiler-message envelope and attacker-selected TRUSTJSON
+    // code. The driver is the Trust build tool in its explicit unverified lane
+    // (`$CARGO` is targo under `targo --unverified test`, else `targo`); a
+    // lane-less `targo check` is refused, and a bare `cargo` is never used.
+    let plain_cargo = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
     let plain_macro_output = Command::new(plain_cargo)
         .current_dir(&macro_consumer)
-        .args(["check", "--message-format=json", "--target-dir"])
+        .args(["--unverified", "check", "--message-format=json", "--target-dir"])
         .arg(root.join("target-ordinary-proc-macro"))
         .env("RUSTC", &rustc)
         .env_remove("RUSTC_WRAPPER")
@@ -16194,11 +17204,13 @@ exec "$TRUST_REAL_RUSTC" "${filtered[@]}"
     )
     .expect("write bin manifest");
     std::fs::write(bin_root.join("src/main.rs"), "fn main() {}\n").expect("write bin source");
-    // The fixture forwards to stock rustc, so retain its private-option
-    // stripping wrapper for Targo's explicit dry no-verification query too.
+    // The fixture forwards to the backend compiler with Trust-private options
+    // stripped, so retain that wrapper for Targo's explicit dry no-verification
+    // query too.
     let real_rustc = rustc.to_string_lossy().into_owned();
     let argv_log = log.to_string_lossy().into_owned();
     let _real_rustc = TestEnvVar::set("TRUST_REAL_RUSTC", &real_rustc);
+    let _real_rustc_is_trust = TestEnvVar::set("TRUST_REAL_RUSTC_IS_TRUST", backend_is_trust);
     let _argv_log = TestEnvVar::set("TRUST_RUSTC_ARG_LOG", &argv_log);
     let error = crate::pipeline::cargo_selection::preflight_trust_cg_cargo_targets_with_targo(
         &[
@@ -16209,6 +17221,7 @@ exec "$TRUST_REAL_RUSTC" "${filtered[@]}"
         ],
         &targo,
         &wrapper,
+        false,
     )
     .expect_err("real Targo-selected binary must be rejected by preflight");
     assert!(error.contains("kind=bin"), "{error}");
@@ -16508,25 +17521,31 @@ fn test_report_json_serialization() {
         duration_ms: 42,
         config: ReportConfig {
             level: "L0".into(),
-            timeout_ms: 5000,
-            function_budget_ms: 120_000,
+            budget_profile: crate::determinism_report::test_budget_profile(),
             enabled: true,
             hardened: false,
             trust_profile: None,
+            project_requirements: None,
         },
         dep_assumptions: Vec::new(),
         gate: None,
+        noted_stops: Vec::new(),
         coverage: None,
+        coverage_dropped: Vec::new(),
         test_execution: None,
         cargo_proof_inventory: None,
         proof_artifact_root: None,
         live_transport_authority: None,
+        test_harness_exclusions: Vec::new(),
     };
     let json = serde_json::to_string(&report).expect("should serialize report");
     assert!(json.contains("\"success\":true"));
     assert!(json.contains("\"proved\":1"));
     assert!(json.contains("overflow:add"));
-    assert!(json.contains("\"function_budget_ms\":120000"));
+    // The report config records the whole budget profile the run used.
+    assert!(json.contains("\"budget_profile\""), "{json}");
+    assert!(json.contains("\"backstop\":1000"), "{json}");
+    assert!(json.contains("\"schema\":4"), "{json}");
 }
 
 #[test]
@@ -16553,19 +17572,22 @@ fn test_report_success_logic() {
         duration_ms: 10,
         config: ReportConfig {
             level: "L0".into(),
-            timeout_ms: 5000,
-            function_budget_ms: 120_000,
+            budget_profile: crate::determinism_report::test_budget_profile(),
             enabled: true,
             hardened: false,
             trust_profile: None,
+            project_requirements: None,
         },
         dep_assumptions: Vec::new(),
         gate: None,
+        noted_stops: Vec::new(),
         coverage: None,
+        coverage_dropped: Vec::new(),
         test_execution: None,
         cargo_proof_inventory: None,
         proof_artifact_root: None,
         live_transport_authority: None,
+        test_harness_exclusions: Vec::new(),
     };
     assert!(report.success);
 
@@ -16591,19 +17613,22 @@ fn test_report_success_logic() {
         duration_ms: 10,
         config: ReportConfig {
             level: "L0".into(),
-            timeout_ms: 5000,
-            function_budget_ms: 120_000,
+            budget_profile: crate::determinism_report::test_budget_profile(),
             enabled: true,
             hardened: false,
             trust_profile: None,
+            project_requirements: None,
         },
         dep_assumptions: Vec::new(),
         gate: None,
+        noted_stops: Vec::new(),
         coverage: None,
+        coverage_dropped: Vec::new(),
         test_execution: None,
         cargo_proof_inventory: None,
         proof_artifact_root: None,
         live_transport_authority: None,
+        test_harness_exclusions: Vec::new(),
     };
     assert!(!report2.success);
 }
@@ -16704,7 +17729,10 @@ fn test_apply_configured_trust_profile_preserves_hardened_cli_default() {
 
 #[test]
 fn test_apply_configured_trust_profile_preserves_explicit_cli_profile() {
-    let mut args = parse_subcommand_args(&["--trust-profile=cli_hardened".into()])
+    // Both labels are REGISTERED: the point of this test is CLI-beats-config,
+    // and it used to make that point with `cli_hardened`, a label no registry
+    // knows — which is now refused at the flag.
+    let mut args = parse_subcommand_args(&["--trust-profile=hardened".into()])
         .expect("should parse trust profile args");
     let config =
         TrustConfig { trust_profile: Some("coreutils_hardened".into()), ..TrustConfig::default() };
@@ -16712,7 +17740,16 @@ fn test_apply_configured_trust_profile_preserves_explicit_cli_profile() {
     apply_configured_trust_profile(&mut args, &config);
 
     assert!(args.hardened);
-    assert_eq!(args.trust_profile.as_deref(), Some("cli_hardened"));
+    assert_eq!(args.trust_profile.as_deref(), Some("hardened"));
+}
+
+#[test]
+fn test_default_trust_profile_is_registered() {
+    // The default is applied in three places (`cli.rs` on `--hardened`,
+    // `apply_configured_trust_profile`, and the banner's `unwrap_or`). If the
+    // registry ever drops or renames this entry, the default has to move with
+    // it, or every default run announces a profile the verifier refuses.
+    assert_eq!(trust_vcgen::canonical_profile(DEFAULT_TRUST_PROFILE), Some(DEFAULT_TRUST_PROFILE));
 }
 
 #[test]
@@ -16723,9 +17760,15 @@ fn test_load_doctor_config_reports_an_undeclared_policy() {
     let (config, status) = load_doctor_config(&root);
 
     assert_eq!(config.level, TrustConfig::default().level);
-    assert_eq!(config.timeout_ms, TrustConfig::default().timeout_ms);
-    assert_eq!(config.function_budget_ms, TrustConfig::default().function_budget_ms);
-    assert_eq!(status.function_budget_ms, TrustConfig::default().function_budget_ms);
+    assert_eq!(config.effort, TrustConfig::default().effort);
+    assert_eq!(config.backstop, TrustConfig::default().backstop);
+    // Doctor reports the budget profile: its header line and both bounds.
+    assert_eq!(status.effort, TrustConfig::default().effort.conflicts_per_node);
+    assert_eq!(status.backstop, TrustConfig::default().backstop.per_mille);
+    assert_eq!(
+        status.budget_profile,
+        trust_types::determinism::BudgetProfile::builtin().header_line()
+    );
     assert_eq!(status.path, root);
     assert_eq!(status.source.label(), "defaults");
     assert_eq!(status.detail.as_deref(), Some("no [trust] table declared"));
@@ -16744,8 +17787,7 @@ fn test_load_doctor_config_normalizes_known_backend() {
         &root,
         r#"enabled = false
 level = "L2"
-timeout_ms = 42
-function_budget_ms = 45000
+backstop = 9
 codegen_backend = "trust-cg"
 hardened = false
 trust_profile = "coreutils_hardened"
@@ -16756,9 +17798,9 @@ trust_profile = "coreutils_hardened"
 
     assert!(!config.enabled);
     assert_eq!(config.level, "L2");
-    assert_eq!(config.timeout_ms, 42);
-    assert_eq!(config.function_budget_ms, 45_000);
-    assert_eq!(status.function_budget_ms, 45_000);
+    assert_eq!(config.backstop, trust_types::determinism::Backstop { per_mille: 9 });
+    assert_eq!(status.backstop, 9);
+    assert!(status.budget_profile.contains("backstop=9 "), "{}", status.budget_profile);
     assert_eq!(config.codegen_backend.as_deref(), Some("trust-cg"));
     assert_eq!(config.hardened, Some(false));
     assert_eq!(config.trust_profile.as_deref(), Some("coreutils_hardened"));
@@ -16813,8 +17855,7 @@ unexpected = "value"
     let (config, status) = load_doctor_config(&root);
 
     assert_eq!(config.level, TrustConfig::default().level);
-    assert_eq!(config.timeout_ms, TrustConfig::default().timeout_ms);
-    assert_eq!(config.function_budget_ms, TrustConfig::default().function_budget_ms);
+    assert_eq!(config.backstop, TrustConfig::default().backstop);
     assert_eq!(status.source.label(), "defaults (invalid configuration)");
     assert!(status.source.has_error());
     let detail = status.detail.clone().expect("should explain the unknown key");
@@ -16975,6 +18016,7 @@ fn test_doctor_report_json_exposes_native_reporting_contract() {
             trust_verify: Some(true),
             json_transport: Some(true),
             check_report_mode: DoctorCheckReportMode::NativeCompiler,
+            toolchain_age: None,
         },
         backend: DoctorBackendStatus {
             selected: DEFAULT_CODEGEN_BACKEND.to_string(),
@@ -16986,8 +18028,9 @@ fn test_doctor_report_json_exposes_native_reporting_contract() {
             detail: None,
             enabled: true,
             level: "L1".to_string(),
-            timeout_ms: 5_000,
-            function_budget_ms: 120_000,
+            effort: trust_types::determinism::EffortScale::BUILTIN.conflicts_per_node,
+            backstop: trust_types::determinism::Backstop::BUILTIN.per_mille,
+            budget_profile: trust_types::determinism::BudgetProfile::builtin().header_line(),
             configured_codegen_backend: None,
             configured_hardened: None,
             configured_trust_profile: None,
@@ -17138,6 +18181,7 @@ fn test_doctor_report_json_exposes_native_required_contract() {
             trust_verify: None,
             json_transport: None,
             check_report_mode: DoctorCheckReportMode::NativeRequired,
+            toolchain_age: None,
         },
         backend: DoctorBackendStatus {
             selected: DEFAULT_CODEGEN_BACKEND.to_string(),
@@ -17149,8 +18193,9 @@ fn test_doctor_report_json_exposes_native_required_contract() {
             detail: Some("no [trust] table declared".to_string()),
             enabled: true,
             level: "L1".to_string(),
-            timeout_ms: 5_000,
-            function_budget_ms: 120_000,
+            effort: trust_types::determinism::EffortScale::BUILTIN.conflicts_per_node,
+            backstop: trust_types::determinism::Backstop::BUILTIN.per_mille,
+            budget_profile: trust_types::determinism::BudgetProfile::builtin().header_line(),
             configured_codegen_backend: None,
             configured_hardened: None,
             configured_trust_profile: None,
@@ -17336,6 +18381,46 @@ fn test_parse_args_trust_profile_rejects_empty_or_flag_value() {
 }
 
 #[test]
+fn test_parse_args_trust_profile_rejects_an_unregistered_label() {
+    // The silent-profile-downgrade case: an unregistered label used to be
+    // accepted, turn hardened mode on, print the banner and generate zero
+    // hardened obligations.
+    for label in ["unix_hardened_v2", "unix_hardend", "cli_hardened", "unix", "hardenedness"] {
+        let args = vec![format!("--trust-profile={label}")];
+        let error = parse_subcommand_args(&args)
+            .expect_err("an unregistered profile must not be accepted: {label}");
+        let message = error.to_string();
+        assert!(message.contains("unknown trust profile"), "{label}: {message}");
+        assert!(message.contains("unix_hardened"), "{label}: {message}");
+        assert!(message.contains("--no-hardened"), "{label}: {message}");
+    }
+}
+
+#[test]
+fn test_parse_args_trust_profile_accepts_every_registered_label() {
+    for registered in trust_vcgen::known_hardened_profiles() {
+        let parsed = parse_subcommand_args(&[format!("--trust-profile={registered}")])
+            .unwrap_or_else(|error| panic!("registered profile {registered} must parse: {error}"));
+        assert!(parsed.hardened, "{registered}");
+        assert_eq!(parsed.trust_profile.as_deref(), Some(*registered));
+    }
+    // Separator and case are spelling, and what is recorded is the registry's.
+    let parsed =
+        parse_subcommand_args(&["--trust-profile=UNIX-HARDENED".into()]).expect("spelling variant");
+    assert_eq!(parsed.trust_profile.as_deref(), Some("unix_hardened"));
+}
+
+#[test]
+fn test_parse_args_no_hardened_is_still_the_way_to_turn_hardening_off() {
+    // The documented opt-out is a FLAG, not a label, so refusing unregistered
+    // labels cannot have taken it away.
+    let parsed = parse_subcommand_args(&["--no-hardened".into()]).expect("should parse");
+    assert!(!parsed.hardened);
+    assert_eq!(parsed.hardened_override, Some(false));
+    assert_eq!(parsed.trust_profile, None);
+}
+
+#[test]
 fn test_parse_args_hardened_profile_do_not_passthrough() {
     let args = vec![
         "--hardened".into(),
@@ -17506,4 +18591,138 @@ fn canonical_vc_digest_pins_the_preobligation_value_and_stays_sensitive_to_a_rea
         "two different obligation claims over the same formula must not share a canonical \
          VC digest — that is the certificate-forgery vector the record exists to close"
     );
+}
+
+/// NEW-VERIFYBIN-CERT-LANE: an imported checked certificate is counted as
+/// evidence, but it cannot lift a production `verify-binary` unsat to `proved`,
+/// so the checked-certificate lane cannot pass on the command's only solver
+/// route. That is fail-closed by design, and this test pins it.
+///
+/// Why the lane cannot pass. The route (`binary_vc_router_with_memory_limit`,
+/// `IncrementalAYSession`) sends no `:produce-proofs`, so every unsat it
+/// returns is `Unchecked`. It reads `unknown` below the reporting floor
+/// (TRUST-02). Both `verify_binary_should_fail` and exploit-find's
+/// `all_required_vcs_checked_unsat` need that reported status to be `proved`.
+/// Import (`validate_for_dispatch_by_canonical_digests`) re-binds an artifact's
+/// digests to the dispatch and never re-runs a checker. The structural checker
+/// that minted this artifact accepted an opaque payload as `lrat`. So the
+/// certificate is not evidence that the VC is unsat, and letting it lift the
+/// floor would mint a forgeable `proved`. The control shows the gates open
+/// exactly when the solver result carries validated (`SmtBacked`) assurance
+/// of its own.
+#[test]
+fn imported_checked_certificate_does_not_lift_an_unchecked_verify_binary_unsat() {
+    let root = temp_test_dir("checked-cert-unchecked-route");
+    let (producer_dispatch, canonical_vc_bytes) = importable_binary_dispatch("producer-run:vc0");
+    let export = SolverProofExport::new(
+        &producer_dispatch,
+        &canonical_vc_bytes,
+        "lrat",
+        b"normalized checked proof payload".to_vec(),
+        Some("4.13.0".to_string()),
+        1_777_070_400_000,
+    );
+    let checker = StructuralBinaryCertificateChecker::new(
+        "ay-lrat-binary-check",
+        "0.1.0",
+        vec!["lrat".to_string()],
+        1_777_070_401_000,
+    );
+    let artifact_ref = produce_checked_certificate_artifact(
+        &checker,
+        BinaryCertificateCheckRequest::from_export(
+            &producer_dispatch,
+            &canonical_vc_bytes,
+            &export,
+        ),
+        &root,
+    )
+    .expect("production helper should persist checked artifact");
+
+    let report_with = |result: trust_types::VerificationResult| {
+        let (mut dispatch, _) = importable_binary_dispatch("verify-run:vc0");
+        dispatch.solver = result.solver_name().to_string();
+        dispatch.result = Some(result.clone());
+        let mut proof_evidence =
+            VerifyBinaryEvidence::from_solver_dispatch_records(1, vec![dispatch]);
+        let import_report = proof_evidence
+            .load_and_import_checked_certificate_artifacts([artifact_ref.path.as_path()])
+            .expect("the checked artifact binds to the dispatch by its canonical digests");
+        assert_eq!(import_report.imported, 1, "{import_report:?}");
+        let item = binary_solver_result_report(
+            "main",
+            "division_by_zero".into(),
+            Some("0x401010".into()),
+            &result,
+        );
+        let mut report = build_verify_binary_report(
+            Path::new("fixtures/tiny.bin"),
+            Some(0x401000),
+            false,
+            true,
+            VerifyBinaryReportInput {
+                format: Some("ELF".into()),
+                architecture: Some("x86_64".into()),
+                binary_entry: Some(0x401000),
+                functions: vec![VerifiedBinaryFunctionSummary {
+                    name: "main".into(),
+                    entry: Some(0x401000),
+                    blocks: 1,
+                    statements: 1,
+                    vcs: 1,
+                    vc_counts: vec![BinaryVcKindCount {
+                        kind: "division_by_zero".into(),
+                        count: 1,
+                    }],
+                }],
+                solver_results: vec![item],
+                proof_evidence,
+                unsupported: Vec::new(),
+                failures: Vec::new(),
+            },
+        );
+        report.checked_certificate_import = Some(import_report);
+        report
+    };
+    let refutation_accounting = |report: &crate::BinaryVerifyReport| {
+        let exploit = build_exploit_find_report(ExploitFindTarget::Verifier, report.clone());
+        let json = serialize_exploit_find_json(&exploit).expect("serialize exploit-find JSON");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
+        value["checked_certificate_refutation_accounting"].clone()
+    };
+
+    // Production shape: what `IncrementalAYSession` returns for a bare unsat.
+    let unchecked = report_with(trust_types::VerificationResult::Proved {
+        solver: "ay-incremental".into(),
+        time_ms: 4,
+        strength: trust_types::ProofStrength::smt_unsat_unvalidated(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    });
+    assert_eq!(unchecked.proof_evidence.checked_certificates(), 1, "the certificate is counted");
+    assert_eq!(unchecked.solver_results.status, "unknown", "{:?}", unchecked.solver_results);
+    assert!(verify_binary_should_fail(&unchecked), "an imported certificate must not pass it");
+    let accounting = refutation_accounting(&unchecked);
+    assert_eq!(accounting["checked_unsat_refutations"], 1, "{accounting}");
+    assert_eq!(accounting["all_required_vcs_checked_unsat"], false, "{accounting}");
+    assert!(!build_binary_cli_proof_grade_gate(&unchecked).accepted);
+
+    // Control: a result with validated assurance of its own opens both gates.
+    let validated = report_with(trust_types::VerificationResult::Proved {
+        solver: "ay-in-process".into(),
+        time_ms: 4,
+        strength: trust_types::ProofStrength::smt_unsat_strict_checked(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    });
+    assert_eq!(validated.solver_results.status, "proved", "{:?}", validated.solver_results);
+    assert!(!verify_binary_should_fail(&validated));
+    assert_eq!(refutation_accounting(&validated)["all_required_vcs_checked_unsat"], true);
+    // The proof-grade gate stays shut on every route: verify-binary's report
+    // trust level is `partial` by construction (`binary_report_trust_level`).
+    assert!(!build_binary_cli_proof_grade_gate(&validated).accepted);
+
+    let _ = std::fs::remove_dir_all(root);
 }

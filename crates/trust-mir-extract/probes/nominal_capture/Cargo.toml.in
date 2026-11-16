@@ -1,0 +1,16 @@
+# OWN standalone workspace; replace @TRUST_ROOT@ with the source root.
+[workspace]
+[package]
+name = "nominal-capture-probe"
+version = "0.0.0"
+edition = "2021"
+[[bin]]
+name = "nominal-capture-probe"
+path = "@TRUST_ROOT@/crates/trust-mir-extract/probes/nominal_capture/observer.rs"
+[[bin]]
+name = "constructor_refusal"
+path = "@TRUST_ROOT@/crates/trust-mir-extract/probes/nominal_capture/constructor_refusal.rs"
+
+[[bin]]
+name = "original-helper"
+path = "@TRUST_ROOT@/crates/trust-mir-extract/probes/nominal_capture/original_helper.rs"

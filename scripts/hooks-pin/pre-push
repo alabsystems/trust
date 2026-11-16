@@ -29,20 +29,26 @@
 # moving two DIVERGENT submodule pointers that the standing safety rules forbid
 # anyone to move. That is how a gate teaches people `--no-verify`.
 #
-# This directory is the pin gate WITHOUT that blast radius. It runs eight
-# checkers and nothing else — `scripts/check_pin_coherence.sh` (0.49s measured),
+# This directory is the pin gate WITHOUT that blast radius. It runs ten checkers
+# and nothing else — `scripts/check_pin_coherence.sh` (0.49s measured),
 # `scripts/check_revert_rationale.sh` (0.49s measured over the whole
 # 7,089-commit history), `scripts/check_frozen_files.sh`,
 # `scripts/check_measurement_provenance.sh` (0.95s measured over 7,112 commits
 # in the wider --history mode), `scripts/check_bridge_pin.sh --check` (0.23s
 # measured), `scripts/check_ir_cohort.py` (0.84s measured, added 2026-08-27),
-# `scripts/check_submodule_remote_reachability.py`, and
-# `scripts/check_cfg_test_caller_skew.py` (added 2026-09-01, the only SOURCE
-# checker here) — for a combined budget of about four seconds. (This paragraph
-# said "six" and omitted the reachability lane until 2026-09-01;
-# `install-pin-hook.sh` said "check_pin_coherence.sh only", so three sources
-# carried three different counts — 1, 6 and 7 — and an agent debugging a red
-# `check_ir_cohort.py` could read that it does not run. If you add a ninth,
+# `scripts/check_submodule_remote_reachability.py`,
+# `scripts/check_cfg_test_caller_skew.py` (added 2026-09-01, the first SOURCE
+# checker here), `scripts/check_run_make_fixture_lex.py` (0.4s measured,
+# the second SOURCE checker), and `scripts/check_pin_regression.sh`
+# (added 2026-11-11, 1.2s measured on a two-commit range; a PIN checker
+# this pin-only set inexplicably lacked — PIN-REGRESSION-HOOKS-PIN-1) —
+# for a combined budget of about five seconds.
+# (This paragraph said "six" and omitted the reachability lane until
+# 2026-09-01; `install-pin-hook.sh` said "check_pin_coherence.sh only", so
+# three sources carried three different counts — 1, 6 and 7 — and an agent
+# debugging a red `check_ir_cohort.py` could read that it does not run. It then
+# said "eight" while the lex lane was already gated below, and "nine" until
+# the pin-regression lane below made it ten. If you add an eleventh,
 # change this number in the same edit.) No x.py, no build of any kind,
 # and NOT the gate manifest's `push` profile: this list is hand-maintained here
 # on purpose, because the point of this directory is a fixed small blast radius
@@ -87,6 +93,18 @@
 # worktree is a deliberate act (`scripts/submodule_sync.sh`), never a side
 # effect of a push.
 #
+# READS THE REMOTE IT JUDGES (2026-10-15). The reach and cohort lanes judge
+# "is this pin on what the remote publishes?". They used to answer from the
+# module stores' refs/remotes/* and refs/pins/*, which are as stale as the last
+# fetch, and four pushes from ~/trust-b1 went RED on 2026-10-14/15 while the
+# remote served every pin; the remedy was a fetch that writes refs in stores
+# several worktrees share. They now read each remote with one `git ls-remote`
+# and, where ancestry needs objects a store lacks, fetch those objects BY SHA
+# with no destination (scripts/lib/remote_tips.py). Objects may be added to a
+# module store; no ref and no FETCH_HEAD is ever written. So these two lanes
+# need the network: without it they exit 2, COULD NOT RUN, which refuses the
+# push and is never a pass (docs/DECISION_QUEUE.md "HOOKS-PIN-REMOTE-TIPS-1").
+#
 # Escape hatch is git's own: `git push --no-verify`, which shows up in the
 # reflog rather than in a habit. There is no environment variable.
 set -uo pipefail
@@ -118,9 +136,21 @@ cd "$REPO_ROOT" || exit 1
 # Judged on exactly the commits this push would introduce. Fails CLOSED: a
 # missing checker is a state in which a revert could land unexplained, which is
 # the whole failure this lane exists to end, so it is a refusal and not a shrug.
+#
+# The refs go in as a here-string, not `printf … | checker`. Under pipefail a
+# pipe's status is its writer's too: a checker that exits without reading
+# stdin (a usage error, or the stub scripts/tests/check_cfg_test_caller_skew_test.sh
+# plants) leaves printf to write into a closed pipe, and its EPIPE turned into
+# rc=1 whenever the checker won the race. That race decided this lane's verdict
+# on a loaded machine (2026-09-30: the cfg-test-caller-skew fixture went red
+# twice in a row at load ~100 and passed twice in isolation). A here-string
+# has no writer, so the status is the checker's alone. Its bytes are the same
+# ($PUSHED_REFS plus one newline).
 REVERT_CHECKER="scripts/check_revert_rationale.sh"
 if [ -f "$REVERT_CHECKER" ]; then
-  revert_out="$(printf '%s\n' "$PUSHED_REFS" | bash "$REVERT_CHECKER" --pre-push 2>&1)"
+  revert_args=(--pre-push)
+  if [ -n "${2:-}" ]; then revert_args+=(--remote "$2"); fi
+  revert_out="$(bash "$REVERT_CHECKER" "${revert_args[@]}" 2>&1 <<<"$PUSHED_REFS")"
   revert_rc=$?
 else
   revert_out="pin-hook: $REVERT_CHECKER is missing — a revert could land with no reason recorded"
@@ -148,7 +178,10 @@ fi
 # state in which an unfounded number could land, which is the whole failure.
 PROV_CHECKER="scripts/check_measurement_provenance.sh"
 if [ -f "$PROV_CHECKER" ]; then
-  prov_out="$(printf '%s\n' "$PUSHED_REFS" | bash "$PROV_CHECKER" --pre-push 2>&1)"
+  prov_args=(--pre-push)
+  if [ -n "${2:-}" ]; then prov_args+=(--remote "$2"); fi
+  # A here-string, for the reason the revert lane gives.
+  prov_out="$(bash "$PROV_CHECKER" "${prov_args[@]}" 2>&1 <<<"$PUSHED_REFS")"
   prov_rc=$?
 else
   prov_out="pin-hook: $PROV_CHECKER is missing — a measurement could land naming no tree"
@@ -306,9 +339,9 @@ if [ "${#BLOCKING[@]}" -gt 0 ]; then
   echo "                                           # whose every unique commit is"
   echo "                                           # held by a durable ref (ANCHORED)"
   echo
-  echo "Do NOT run a blanket 'git submodule update'. If the drift is someone"
-  echo "else's and genuinely not yours to resolve, add an owned, expiring row to"
-  echo "    $WAIVERS"
+  echo "Do NOT run a blanket 'git submodule update': it cannot tell BEHIND"
+  echo "from AHEAD, and a blind restore of an AHEAD worktree can lose its"
+  echo "commits."
 fi
 
 if [ "$PIN_RC" -ne 0 ]; then
@@ -344,7 +377,7 @@ FREEZE_CHECKER="scripts/check_frozen_files.sh"
 FREEZE_RC=0
 echo
 if [ -f "$FREEZE_CHECKER" ]; then
-  bash "$FREEZE_CHECKER" || FREEZE_RC=1
+  TRUST_PUSHED_REFS="$PUSHED_REFS" bash "$FREEZE_CHECKER" || FREEZE_RC=1
 else
   echo "freeze-gate: $FREEZE_CHECKER is missing — refusing to certify the oracle freeze." >&2
   FREEZE_RC=1
@@ -403,12 +436,16 @@ fi
 # the version number is a decoding floor, not an agreement about meaning.
 #
 # It belongs in THIS directory rather than the full gate for the same reason as
-# the rest: it is git plumbing only. Measured 0.84s wall, no build, no network.
+# the rest: git plumbing, no build. Since 2026-10-15 it judges containment
+# against each dependency's main as `ls-remote` reads it (the store's own
+# origin/main is not evidence), so it needs the network: exit 2 is COULD NOT
+# RUN, exit 1 a finding. Measured 0.84s wall before the remote reads.
 COHORT_CHECKER="scripts/check_ir_cohort.py"
 COHORT_RC=0
 echo
 if [ -f "$COHORT_CHECKER" ]; then
-  python3 "$COHORT_CHECKER" || COHORT_RC=1
+  python3 "$COHORT_CHECKER"
+  COHORT_RC=$?
 else
   echo "ir-cohort: $COHORT_CHECKER is missing — refusing to certify IR semantics." >&2
   COHORT_RC=1
@@ -431,12 +468,15 @@ fi
 # no build, no build-tree lock. Measured 2.2s wall on a 12-pin clone, inside the
 # directory's budget. It reads TRUST_PUSHED_REFS so it judges the revisions
 # actually being published rather than the index (a behind clone otherwise
-# audits an older, systematically safer pin set and prints PASS).
+# audits an older, systematically safer pin set and prints PASS). Since
+# 2026-10-15 it asks the REMOTE (one ls-remote per sibling), not the stores'
+# stale refs; exit 2 is COULD NOT RUN, exit 1 a finding.
 REACH_CHECKER="scripts/check_submodule_remote_reachability.py"
 REACH_RC=0
 echo
 if [ -f "$REACH_CHECKER" ]; then
-  TRUST_PUSHED_REFS="$PUSHED_REFS" python3 "$REACH_CHECKER" --push-context || REACH_RC=1
+  TRUST_PUSHED_REFS="$PUSHED_REFS" python3 "$REACH_CHECKER" --push-context
+  REACH_RC=$?
 else
   echo "pin-hook: $REACH_CHECKER is missing — a gitlink could land naming a commit no one else can fetch"
   REACH_RC=1
@@ -476,38 +516,132 @@ fi
 # It is NOT a type checker and does not retire `scoped.compiler-check`, which
 # remains the authority. It exists so that the authority is not the only thing
 # standing between this class and `main`.
+#
+# It is handed the DESTINATION, as the revert lane is, and judges only the files
+# the push introduces to it: a file the destination already carries byte for
+# byte is not this push's. Without that, an update that merges main re-read
+# every file main had changed — measured 2026-09-27, crystal/callee-sidecar
+# a573093063..d5e68f9812 was refused on 12 sites in four files identical to
+# origin/main, none of them a compile error. Exit 2 means the destination or
+# the range could not be read, never "skew found"; both refuse the push.
 SKEW_CHECKER="scripts/check_cfg_test_caller_skew.py"
 SKEW_RC=0
 echo
 if [ -f "$SKEW_CHECKER" ]; then
-  TRUST_PUSHED_REFS="$PUSHED_REFS" python3 "$SKEW_CHECKER" --push-context || SKEW_RC=1
+  skew_args=(--push-context)
+  if [ -n "${2:-}" ]; then skew_args+=(--remote "$2"); fi
+  TRUST_PUSHED_REFS="$PUSHED_REFS" python3 "$SKEW_CHECKER" "${skew_args[@]}"
+  SKEW_RC=$?
 else
   echo "cfg-test-skew: $SKEW_CHECKER is missing — a signature change could land"
   echo "               with its #[cfg(test)] construction sites behind it."
   SKEW_RC=1
 fi
 
-if [ "$PIN_RC" -eq 0 ] && [ "$FREEZE_RC" -eq 0 ] && [ "$revert_rc" -eq 0 ] && [ "$prov_rc" -eq 0 ] && [ "$BRIDGE_RC" -eq 0 ] && [ "$COHORT_RC" -eq 0 ] && [ "$REACH_RC" -eq 0 ] && [ "$SKEW_RC" -eq 0 ]; then
+
+# ------------------------------------------------- lane: run-make fixture lex
+# THE NINTH CHECKER, and the second one in this directory that is about SOURCE
+# rather than about gitlinks.
+#
+# run-make fixture LEX check.
+#
+# No push-profile lane runs run-make: `suite.run-make` needs a stage2, and in a
+# fresh tree there is no stage1 at all. `90fe4d2c62` landed a Clean-island
+# fixture carrying a grave accent in its Lean `--` comment; the island's
+# contents travel as Rust token trees, a grave accent starts no Rust token, and
+# the recipe died at its FIRST compilation without reaching one assertion. It
+# stayed broken six hours (`691169cd1b`).
+#
+# Seeing that needs no compiler — the fixture did not LEX. Measured 0.4s over
+# 83 sources (63 on-disk, 20 written inline by a recipe into a raw string, where
+# a file-level check cannot see them), no cargo, no x.py, no build tree, no
+# lock, no network. It is a LEXER: an unclosed `fn f(`, a wrong assertion or a
+# failed obligation all pass here. It does not retire `suite.run-make`.
+LEX_CHECKER="scripts/check_run_make_fixture_lex.py"
+LEX_RC=0
+echo
+if [ -f "$LEX_CHECKER" ]; then
+  python3 "$LEX_CHECKER" || LEX_RC=1
+else
+  echo "run-make-lex: $LEX_CHECKER is missing — a fixture that does not lex could land"
+  echo "              and kill its recipe before the first assertion."
+  LEX_RC=1
+fi
+
+# ------------------------------------------- lane: pin regression
+# THE TENTH CHECKER — a pin checker the pin-only set lacked
+# (PIN-REGRESSION-HOOKS-PIN-1, closed 2026-11-11).
+#
+# Lane 1 asks whether each pin RESOLVES and the worktree sits at it. A silent
+# BACKWARD pin move passes both on the authoring machine, where index and
+# worktree are consistently old (measured 2026-08-25, 3e9efe9aac: stale
+# gitlinks swept into an unrelated commit rolled three pins back and undid a
+# landed severance). Only a comparison BETWEEN the push's base and tip can
+# see it, which is what this checker is: net pin movement per gitlink over
+# exactly the refs being pushed, refused when strictly backward and not
+# disclosed by a `pin-rollback:` line in the range. Git plumbing only
+# (`ls-tree`, `merge-base`), no build, no network, never mutates; measured
+# 1.2s on a two-commit range, 0.06s standing. Exit 2 means the range could
+# not be computed in this clone (usually an unfetched remote tip), never a
+# finding; both refuse, distinguished in the diagnosis below like skew's.
+REGRESSION_CHECKER="scripts/check_pin_regression.sh"
+REGRESSION_RC=0
+echo
+if [ -f "$REGRESSION_CHECKER" ]; then
+  TRUST_PUSHED_REFS="$PUSHED_REFS" TRUST_PUSH_REMOTE="${2:-}" bash "$REGRESSION_CHECKER" --push-context
+  REGRESSION_RC=$?
+else
+  echo "pin-regression: $REGRESSION_CHECKER is missing — a silent backward pin"
+  echo "                move could land and undo someone else's pin advance."
+  REGRESSION_RC=1
+fi
+
+if [ "$PIN_RC" -eq 0 ] && [ "$FREEZE_RC" -eq 0 ] && [ "$revert_rc" -eq 0 ] && [ "$prov_rc" -eq 0 ] && [ "$BRIDGE_RC" -eq 0 ] && [ "$COHORT_RC" -eq 0 ] && [ "$REACH_RC" -eq 0 ] && [ "$SKEW_RC" -eq 0 ] && [ "$LEX_RC" -eq 0 ] && [ "$REGRESSION_RC" -eq 0 ]; then
   exit 0
 fi
 
 echo
-echo "PRE-PUSH: RED (pin=$PIN_RC freeze=$FREEZE_RC revert=$revert_rc provenance=$prov_rc bridge=$BRIDGE_RC cohort=$COHORT_RC reach=$REACH_RC skew=$SKEW_RC)."
-if [ "$SKEW_RC" -ne 0 ]; then
+echo "PRE-PUSH: RED (pin=$PIN_RC freeze=$FREEZE_RC revert=$revert_rc provenance=$prov_rc bridge=$BRIDGE_RC cohort=$COHORT_RC reach=$REACH_RC skew=$SKEW_RC lex=$LEX_RC regression=$REGRESSION_RC)."
+if [ "$LEX_RC" -ne 0 ]; then
+  echo "  lex: a run-make fixture above does not lex as Rust. It will die at the"
+  echo "       recipe's FIRST compilation, before a single assertion runs — which"
+  echo "       is how 90fe4d2c62 shipped a Clean-island fixture that never compiled."
+fi
+if [ "$REGRESSION_RC" -eq 2 ]; then
+  echo "  regression: the checker could NOT COMPUTE the range (see its message"
+  echo "        above). usually an unfetched remote tip: git fetch, retry."
+elif [ "$REGRESSION_RC" -ne 0 ]; then
+  echo "  regression: this push moves a first-party pin strictly backward on net"
+  echo "        and no commit in the range discloses it. A deliberate rollback"
+  echo "        says so: add 'pin-rollback: <path> <why>' to a commit message."
+fi
+if [ "$SKEW_RC" -eq 2 ]; then
+  echo "  skew: the checker could NOT READ the push destination or the range (see its"
+  echo "        message above). usually an unfetched remote sha: git fetch, retry."
+elif [ "$SKEW_RC" -ne 0 ]; then
   echo "  skew: a definition this push changes has a construction site that did not"
   echo "        follow it. Under #[cfg(test)] no lib build can see this — it is a"
   echo "        real compile error that lands green and is paid for by the next lane."
 fi
-if [ "$REACH_RC" -ne 0 ]; then
-  echo "  reach: a submodule pin above names a commit no remote can serve."
-  echo "         push the sibling repo first, or anchor it:"
-  echo "         scripts/audit_first_party_pins.py --anchor"
+if [ "$REACH_RC" -eq 2 ]; then
+  echo "  reach: COULD NOT RUN — a sibling's remote could not be read (see above),"
+  echo "         so its pins were not judged. Not a pass. Check the network and"
+  echo "         credentials (git -C first-party/<m> ls-remote origin), then push"
+  echo "         again. Fetching into the stores changes nothing: the remote is read."
+elif [ "$REACH_RC" -ne 0 ]; then
+  echo "  reach: a submodule pin above is on no branch or refs/pins anchor its"
+  echo "         remote publishes (read this run). push the sibling repo first,"
+  echo "         or anchor it: scripts/audit_first_party_pins.py --anchor"
 fi
-if [ "$COHORT_RC" -ne 0 ]; then
+if [ "$COHORT_RC" -eq 2 ]; then
+  echo "  cohort: COULD NOT RUN — a dependency's remote could not be read (see"
+  echo "          above), so containment was not judged. Not a pass. Check the"
+  echo "          network and credentials, then push again."
+elif [ "$COHORT_RC" -ne 0 ]; then
   echo "  cohort: consumers disagree about what a trust-ir module MEANS."
   echo "          inventory with: scripts/check_ir_cohort.py --report"
-  echo "          a divergence you do not own gets an expiring, owned row in"
-  echo "          scripts/hooks-pin/ir-cohort-waivers.txt — never a unilateral pin bump."
+  echo "          fix: move the lagging consumer onto the ratified schema"
+  echo "          (commit in the consumer first, then move its pin here)."
 fi
 if [ "$BRIDGE_RC" -ne 0 ]; then
   echo "  bridge: the olean manifest does not name the revision it replays."

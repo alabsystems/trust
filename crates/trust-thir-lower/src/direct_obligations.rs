@@ -843,20 +843,27 @@ pub fn inventory_errors_at_tier(module: &Module, tier: DirectObligationTier) -> 
 #[cfg(test)]
 pub(crate) fn module_with_conforming_pending_row_for_tests() -> Module {
     let mut module = Module::new("post_birth_pin");
-    let ty = module.add_func_type(trust_ir::FuncTy {
-        params: Vec::new(),
-        returns: Vec::new(),
-        is_vararg: false,
-    });
+    let ty = module
+        .add_func_type(trust_ir::FuncTy {
+            params: Vec::new(),
+            returns: Vec::new(),
+            is_vararg: false,
+            abi: None,
+        })
+        .expect("Module::add_func_type: test fixture");
     let fid = FuncId::new(0);
     let mut function = trust_ir::Function::new(fid, "post_birth_pin_fn", ty, BlockId::new(0));
     let mut block = trust_ir::Block::new(BlockId::new(0));
     block.body.push(
-        trust_ir::node::InstrNode::new(Inst::Assert { cond: trust_ir::ValueId::new(0) })
-            .with_proof(ProofAnnotation::DivNonZero),
+        trust_ir::node::InstrNode::new(Inst::Assert {
+            cond: trust_ir::ValueId::new(0),
+            kind: trust_ir::AssertKind::DivByZero,
+            site: None,
+        })
+        .with_proof(ProofAnnotation::DivNonZero),
     );
     function.blocks.push(block);
-    module.add_function(function);
+    module.try_add_function(function).expect("Module::try_add_function: test fixture");
     module.proof_obligations.push(
         ProofObligation::new(
             ProofId::new(0),
@@ -1063,11 +1070,14 @@ mod tests {
     fn fixture_module() -> (Module, DirectObligationRegistry, Vec<(u32, FuncId)>) {
         let mut module = Module::new(FIXTURE_CRATE);
         module.files.push("src/arith.rs".to_string());
-        let ty = module.add_func_type(FuncTy {
-            params: vec![Ty::I32],
-            returns: Vec::new(),
-            is_vararg: false,
-        });
+        let ty = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::I32],
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let fid = FuncId::new(0);
         let mut function =
             Function::new(fid, format!("{FIXTURE_CRATE}::{FIXTURE_PATH}"), ty, BlockId::new(0));
@@ -1093,14 +1103,18 @@ mod tests {
             ProofAnnotation::NoOverflow,
             ProofAnnotation::InBounds,
         ] {
-            let mut node =
-                InstrNode::new(Inst::Assert { cond: ValueId::new(2) }).with_proof(annotation);
+            let mut node = InstrNode::new(Inst::Assert {
+                cond: ValueId::new(2),
+                kind: trust_ir::AssertKind::Unspecified,
+                site: None,
+            })
+            .with_proof(annotation);
             node.span = Some(span);
             block.body.push(node);
         }
         block.body.push(InstrNode::new(Inst::Return { values: Vec::new() }));
         function.blocks.push(block);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
 
         let loc = Some(span);
         let range = Some(DirectSourceRange {
@@ -1255,15 +1269,18 @@ mod tests {
         assert!(inventory_errors_at_tier(&module, DirectObligationTier::StructuralParityOnly)
             .is_empty());
 
-        let ty = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
+        let ty = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function = Function::new(FuncId::new(0), "direct", ty, BlockId::new(0));
         function.proofs.push(ProofAnnotation::NoOverflow);
         function.summary = Some(trust_ir::FunctionSummary::new());
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module.spec_modules.push(trust_ir::SpecModule::linked("claimed_machine"));
 
         let errors =
@@ -1587,6 +1604,7 @@ mod tests {
             obligation: ProofId::new(0),
             prover: "manual".to_string(),
             evidence: trust_ir::ProofEvidence::Trusted("manual".to_string()),
+            assurance: None,
         });
         assert!(
             inventory_errors_at_tier(&poisoned, DirectObligationTier::ObligationBearingPending)
@@ -2319,11 +2337,14 @@ mod tests {
         let build = |len_const: i128, assert_index: u32| {
             let mut module = Module::new("cidx");
             module.files.push("src/cidx.rs".to_string());
-            let ty = module.add_func_type(FuncTy {
-                params: vec![],
-                returns: Vec::new(),
-                is_vararg: false,
-            });
+            let ty = module
+                .add_func_type(FuncTy {
+                    params: vec![],
+                    returns: Vec::new(),
+                    is_vararg: false,
+                    abi: None,
+                })
+                .expect("Module::add_func_type: test fixture");
             let fid = FuncId::new(0);
             let mut function = Function::new(fid, "cidx::read3".to_string(), ty, BlockId::new(0));
             let mut block = trust_ir::Block::new(BlockId::new(0));
@@ -2354,12 +2375,19 @@ mod tests {
             );
             push(
                 &mut block,
-                InstrNode::new(Inst::Assert { cond: ValueId::new(2) })
-                    .with_proof(ProofAnnotation::InBounds),
+                InstrNode::new(Inst::Assert {
+                    cond: ValueId::new(2),
+                    kind: trust_ir::AssertKind::BoundsCheck {
+                        index: ValueId::new(0),
+                        len: ValueId::new(1),
+                    },
+                    site: None,
+                })
+                .with_proof(ProofAnnotation::InBounds),
             );
             block.body.push(InstrNode::new(Inst::Return { values: Vec::new() }));
             function.blocks.push(block);
-            module.add_function(function);
+            module.try_add_function(function).expect("Module::try_add_function: test fixture");
 
             let mut registry = DirectObligationRegistry::default();
             registry.insert(DirectBodyObligations {
@@ -2390,7 +2418,7 @@ mod tests {
             let function = module.functions.first()?;
             let block = function.blocks.first()?;
             let assert_cond = block.body.iter().find_map(|node| match &node.inst {
-                Inst::Assert { cond } if node.proofs.contains(&ProofAnnotation::InBounds) => {
+                Inst::Assert { cond, .. } if node.proofs.contains(&ProofAnnotation::InBounds) => {
                     Some(*cond)
                 }
                 _ => None,

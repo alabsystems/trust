@@ -31,8 +31,18 @@ TOTAL=0
 PASSED=0
 FAILED_SCRIPTS=()
 
+# tests/e2e_two_language_programs.sh has a manifest row of its own
+# (`release.two-language-programs`, roadmap WS8.8) because it writes evidence
+# artifacts the corpus tally cannot carry; running it here as well would be the
+# same battery twice per release. It is skipped by NAME, and only that one.
+CORPUS_SKIP="tests/e2e_two_language_programs.sh"
+
 for script in tests/e2e_*.sh; do
   [ -f "$script" ] || continue
+  if [ "$script" = "$CORPUS_SKIP" ]; then
+    echo "=== $script === skipped: runs as its own manifest row (release.two-language-programs)"
+    continue
+  fi
   TOTAL=$((TOTAL + 1))
   echo "=== $script ==="
   if PATH="$STAGE2_BIN:$PATH" \

@@ -1,0 +1,177 @@
+note: Clean island kernel-checked: 8 declaration(s) registered (sel_const_isl, subr_bias_isl, pick_isl, max_isl, three_arm_isl, small_code_isl, edge_byte_isl, guard_isl)
+  --> $DIR/e6_select_match_defeq.rs:41:5
+   |
+LL | /     def sel_const_isl (a b : UInt64) : UInt64 := if a < b then 0 else 1
+LL | |     def subr_bias_isl (n : UInt32) : UInt32 := if n < 1240 then 107 else if n < 33900 then 1131 else 32768
+LL | |     def pick_isl (c : Bool) (a b : UInt64) : UInt64 := if c then a else b
+LL | |     def max_isl (a b : UInt8) : UInt8 := if a > b then a else b
+...  |
+LL | |     def edge_byte_isl (x : UInt8) : Bool := x == 0 || x == 255
+LL | |     def guard_isl (x : UInt8) : UInt8 := if x > 5 then 1 else 0
+   | |_______________________________________________________________^
+
+note: island definition `sel_const_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_select_match_defeq::select_const_arms`
+  --> $DIR/e6_select_match_defeq.rs:52:13
+   |
+LL |     ensures result == sel_const_isl(a, b)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+
+=== Trust Verification Report (e6_select_match_defeq) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_defeq.rs:51:1
+   |
+LL | / pub fn select_const_arms(a: u64, b: u64) -> u64
+LL | |     ensures result == sel_const_isl(a, b)
+LL | | {
+LL | |     if a < b { 0 } else { 1 }
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `subr_bias_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_select_match_defeq::subr_bias`
+  --> $DIR/e6_select_match_defeq.rs:58:13
+   |
+LL |     ensures result == subr_bias_isl(n)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_defeq.rs:57:1
+   |
+LL | / pub fn subr_bias(n: u32) -> u32
+LL | |     ensures result == subr_bias_isl(n)
+LL | | {
+LL | |     if n < 1240 {
+...  |
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `pick_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_select_match_defeq::pick`
+  --> $DIR/e6_select_match_defeq.rs:70:13
+   |
+LL |     ensures result == pick_isl(c, a, b)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_defeq.rs:69:1
+   |
+LL | / pub fn pick(c: bool, a: u64, b: u64) -> u64
+LL | |     ensures result == pick_isl(c, a, b)
+LL | | {
+LL | |     if c { a } else { b }
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `max_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_select_match_defeq::max_u8`
+  --> $DIR/e6_select_match_defeq.rs:76:13
+   |
+LL |     ensures result == max_isl(a, b)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_defeq.rs:75:1
+   |
+LL | / pub fn max_u8(a: u8, b: u8) -> u8
+LL | |     ensures result == max_isl(a, b)
+LL | | {
+LL | |     if a > b { a } else { b }
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `three_arm_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_select_match_defeq::three_arm`
+  --> $DIR/e6_select_match_defeq.rs:82:13
+   |
+LL |     ensures result == three_arm_isl(x)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_defeq.rs:81:1
+   |
+LL | / pub fn three_arm(x: u8) -> u8
+LL | |     ensures result == three_arm_isl(x)
+LL | | {
+LL | |     match x {
+...  |
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `small_code_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_select_match_defeq::small_code`
+  --> $DIR/e6_select_match_defeq.rs:93:13
+   |
+LL |     ensures result == small_code_isl(x)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_defeq.rs:92:1
+   |
+LL | / pub fn small_code(x: u8) -> bool
+LL | |     ensures result == small_code_isl(x)
+LL | | {
+LL | |     matches!(x, 1 | 2)
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `edge_byte_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_select_match_defeq::edge_byte`
+  --> $DIR/e6_select_match_defeq.rs:99:13
+   |
+LL |     ensures result == edge_byte_isl(x)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_defeq.rs:98:1
+   |
+LL | / pub fn edge_byte(x: u8) -> bool
+LL | |     ensures result == edge_byte_isl(x)
+LL | | {
+LL | |     match x {
+...  |
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `guard_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_select_match_defeq::guarded`
+  --> $DIR/e6_select_match_defeq.rs:108:13
+   |
+LL |     ensures result == guard_isl(x)
+   |             ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_defeq.rs:107:1
+   |
+LL | / pub fn guarded(x: u8) -> u8
+LL | |     ensures result == guard_isl(x)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+

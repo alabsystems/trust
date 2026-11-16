@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-FT): a TUPLE-typed field read — `(t.0).0`'s inner link and
 //! `s.pair` on a struct holding a tuple — is admitted by the `Field` arm
 //! exactly as a registered-struct link is; each element read that follows is

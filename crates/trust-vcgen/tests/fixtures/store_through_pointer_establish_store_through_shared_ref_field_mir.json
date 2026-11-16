@@ -1,0 +1,2066 @@
+{
+  "name": "store_through_shared_ref_field",
+  "def_path": "store_through_pointer_establish::store_through_shared_ref_field",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+    "line_start": 59,
+    "col_start": 0,
+    "line_end": 69,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "store_through_pointer_establish::PW",
+                "fields": [
+                  [
+                    "p",
+                    {
+                      "RawPtr": {
+                        "mutable": true,
+                        "pointee": {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "w"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 39,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 40,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 41,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 42,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 43,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 44,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 23,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 24,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 25,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 26,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "MisalignedPointerDereference",
+            "target": 7,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+              "line_start": 60,
+              "col_start": 21,
+              "line_end": 60,
+              "col_end": 25
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 17,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 18,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 19,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 20,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 21,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "MisalignedPointerDereference",
+            "target": 6,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+              "line_start": 63,
+              "col_start": 12,
+              "line_end": 63,
+              "col_end": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 6
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 8,
+                "line_end": 65,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 67,
+                "col_start": 8,
+                "line_end": 67,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 39,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 40,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 39,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 41,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 42,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 40,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 43,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 42,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 41,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 44,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Not",
+                  {
+                    "Copy": {
+                      "local": 43,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 44,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "NullPointerDereference",
+            "target": 10,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+              "line_start": 65,
+              "col_start": 19,
+              "line_end": 65,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 33,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 33,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 35,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 34,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 37,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 36,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 35,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 38,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Not",
+                  {
+                    "Copy": {
+                      "local": 37,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 38,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "NullPointerDereference",
+            "target": 9,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+              "line_start": 63,
+              "col_start": 12,
+              "line_end": 63,
+              "col_end": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 27,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 30,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 28,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 31,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 30,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 29,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Not",
+                  {
+                    "Copy": {
+                      "local": 31,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 32,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "NullPointerDereference",
+            "target": 8,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+              "line_start": 60,
+              "col_start": 21,
+              "line_end": 60,
+              "col_end": 25
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 60,
+                "col_start": 21,
+                "line_end": 60,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 61,
+                "col_start": 11,
+                "line_end": 61,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 61,
+                "col_start": 7,
+                "line_end": 61,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+              "line_start": 61,
+              "col_start": 7,
+              "line_end": 61,
+              "col_end": 18
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": [
+                  "Deref"
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      18446744073709551615,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 63,
+                "col_start": 12,
+                "line_end": 63,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 15,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 16,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "MisalignedPointerDereference",
+            "target": 5,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+              "line_start": 65,
+              "col_start": 19,
+              "line_end": 65,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 11,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 19,
+                "line_end": 65,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 8,
+                "line_end": 65,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+                "line_start": 65,
+                "col_start": 8,
+                "line_end": 65,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 8,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 2,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/store_through_pointer_establish.rs",
+              "line_start": 65,
+              "col_start": 8,
+              "line_end": 65,
+              "col_end": 26
+            },
+            "unwind": "Continue"
+          }
+        }
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

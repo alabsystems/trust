@@ -126,9 +126,34 @@ where
         // still opts into everything.
         _ => {
             let mut filter = EnvFilter::default().add_directive(Directive::from(LevelFilter::WARN));
-            for target in ["ay_chc", "ay_dpll", "ay_core", "ay_lia", "ay_lra", "ay_nia", "ay_proof"]
-            {
-                if let Ok(directive) = format!("{target}=error").parse() {
+            // Trust (2026-09-13): the same for the in-process Clean elaborator,
+            // whose tactic recovery lanes (`clean_elab::tactic::smt::decide`,
+            // "SMT returned Unverified … trying shared recovery lane") report
+            // at WARN. Those are engine internals; the user-facing verdict is
+            // the compiler diagnostic that follows them.
+            //
+            // Trust (2026-09-23): OFF, not ERROR. An in-process engine logs at ERROR
+            // for events that are not compiler errors — ay's proof checker reports a
+            // DEADLINE CANCELLATION as "internal proof checker rejected UNSAT proof"
+            // — and that line reached the user's stderr and every ui expectation
+            // whenever the machine was loaded (measured on
+            // `wrapping_refutation_release_identity.rs` and
+            // `postcondition_composition_at_call_site.rs`). Engine outcomes reach the
+            // user as the compiler's verdict diagnostics; the engines' own logs are
+            // for `RUSTC_LOG`.
+            for target in [
+                "ay_chc",
+                "ay_dpll",
+                "ay_core",
+                "ay_lia",
+                "ay_lra",
+                "ay_nia",
+                "ay_proof",
+                "clean_elab",
+                "clean_kernel",
+                "clean_auto",
+            ] {
+                if let Ok(directive) = format!("{target}=off").parse() {
                     filter = filter.add_directive(directive);
                 }
             }
@@ -147,25 +172,10 @@ where
         Err(VarError::NotUnicode(_value)) => return Err(Error::NonUnicodeColorValue),
     };
 
-    let verbose_entry_exit = match cfg.verbose_entry_exit {
-        Ok(v) => &v != "0",
-        Err(_) => false,
-    };
-
-    let verbose_thread_ids = match cfg.verbose_thread_ids {
-        Ok(v) => &v == "1",
-        Err(_) => false,
-    };
-
-    let lines = match cfg.lines {
-        Ok(v) => &v == "1",
-        Err(_) => false,
-    };
-
-    let json = match cfg.json {
-        Ok(v) => &v == "1",
-        Err(_) => false,
-    };
+    let verbose_entry_exit = cfg.verbose_entry_exit.is_ok_and(|v| v != "0");
+    let verbose_thread_ids = cfg.verbose_thread_ids.is_ok_and(|v| v == "1");
+    let lines = cfg.lines.is_ok_and(|v| v == "1");
+    let json = cfg.json.is_ok_and(|v| v == "1");
 
     let output_target: BoxMakeWriter = match cfg.output_target {
         Ok(v) => match File::options().create(true).write(true).truncate(true).open(&v) {

@@ -8,6 +8,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use trust_types::fx::FxHashSet;
 use trust_types::{Formula, Sort, VcKind, VerificationCondition};
 
 // Trust: The analysis result from examining a counterexample against a failing VC.
@@ -256,6 +257,8 @@ pub struct RefinementLoop {
     accumulated_preconditions: Vec<Formula>,
     /// History of witness values for cycle detection.
     witness_history: Vec<Vec<(String, i128)>>,
+    /// O(1) hash index over `witness_history` for fast cycle detection.
+    witness_set: FxHashSet<Vec<(String, i128)>>,
     /// Number of iterations completed so far.
     iterations_completed: usize,
 }
@@ -267,6 +270,7 @@ impl RefinementLoop {
             max_iterations,
             accumulated_preconditions: Vec::new(),
             witness_history: Vec::new(),
+            witness_set: FxHashSet::default(),
             iterations_completed: 0,
         }
     }
@@ -286,13 +290,16 @@ impl RefinementLoop {
         initial_witness: &[(String, i128)],
         verifier: &dyn RefineVerifier,
     ) -> IterationResult {
+        if self.witness_set.len() != self.witness_history.len() {
+            self.witness_set.extend(self.witness_history.iter().cloned());
+        }
         let mut current_witness = initial_witness.to_vec();
 
         for _iter in 0..self.max_iterations {
             self.iterations_completed += 1;
 
-            // Trust: Check for cycles in witness history
-            if self.is_cycle(&current_witness) {
+            // Trust: Check for cycles in witness history in O(W) expected time
+            if !self.witness_set.insert(current_witness.clone()) {
                 return IterationResult::MaxIterationsReached {
                     iterations: self.iterations_completed,
                     last_analysis: analyze_counterexample(vc, &current_witness),
@@ -357,14 +364,8 @@ impl RefinementLoop {
     pub fn reset(&mut self) {
         self.accumulated_preconditions.clear();
         self.witness_history.clear();
+        self.witness_set.clear();
         self.iterations_completed = 0;
-    }
-
-    // Trust: Cycle detection -- check if this witness has been seen before.
-    fn is_cycle(&self, witness: &[(String, i128)]) -> bool {
-        self.witness_history.iter().any(|prev| {
-            prev.len() == witness.len() && prev.iter().zip(witness.iter()).all(|(a, b)| a == b)
-        })
     }
 }
 
@@ -398,22 +399,21 @@ fn classify_variables(witness: &[(String, i128)]) -> (Vec<String>, Vec<String>) 
 /// Heuristic: names that look like function parameters.
 fn is_input_variable(name: &str) -> bool {
     // Trust: Single-letter variables, or common parameter names
-    let lower = name.to_lowercase();
     name.len() <= 2
-        || lower.starts_with("arg")
-        || lower.starts_with("param")
-        || lower == "n"
-        || lower == "x"
-        || lower == "y"
-        || lower == "a"
-        || lower == "b"
-        || lower == "divisor"
-        || lower == "index"
-        || lower == "len"
-        || lower == "size"
-        || lower == "shift"
-        || lower == "lhs"
-        || lower == "rhs"
+        || starts_with_ignore_ascii_case(name, "arg")
+        || starts_with_ignore_ascii_case(name, "param")
+        || name.eq_ignore_ascii_case("divisor")
+        || name.eq_ignore_ascii_case("index")
+        || name.eq_ignore_ascii_case("len")
+        || name.eq_ignore_ascii_case("size")
+        || name.eq_ignore_ascii_case("shift")
+        || name.eq_ignore_ascii_case("lhs")
+        || name.eq_ignore_ascii_case("rhs")
+}
+
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 /// Find a witness value by variable name.
@@ -503,22 +503,23 @@ fn build_exclusion_constraint(var: &str, value: i128, vc_kind: &VcKind) -> Formu
 
 /// Build a generic precondition excluding the exact witness point.
 fn build_generic_precondition(witness: &[(String, i128)]) -> Formula {
-    let exclusions: Vec<Formula> = witness
-        .iter()
-        .map(|(name, value)| {
-            Formula::Not(Box::new(Formula::Eq(
-                Box::new(Formula::Var(name.clone(), Sort::Int)),
-                Box::new(Formula::Int(*value)),
-            )))
-        })
-        .collect();
-
-    if exclusions.len() == 1 {
-        exclusions.into_iter().next().expect("invariant: len == 1")
-    } else if exclusions.is_empty() {
-        Formula::Bool(true)
-    } else {
-        Formula::And(exclusions)
+    match witness {
+        [] => Formula::Bool(true),
+        [(name, value)] => Formula::Not(Box::new(Formula::Eq(
+            Box::new(Formula::Var(name.clone(), Sort::Int)),
+            Box::new(Formula::Int(*value)),
+        ))),
+        _ => Formula::And(
+            witness
+                .iter()
+                .map(|(name, value)| {
+                    Formula::Not(Box::new(Formula::Eq(
+                        Box::new(Formula::Var(name.clone(), Sort::Int)),
+                        Box::new(Formula::Int(*value)),
+                    )))
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -569,22 +570,23 @@ fn build_guard_from_vc(vc_kind: &VcKind, witness: &[(String, i128)]) -> Formula 
 
 /// Build a formula representing the exact witness point.
 fn build_witness_condition(witness: &[(String, i128)]) -> Formula {
-    let equalities: Vec<Formula> = witness
-        .iter()
-        .map(|(name, value)| {
-            Formula::Eq(
-                Box::new(Formula::Var(name.clone(), Sort::Int)),
-                Box::new(Formula::Int(*value)),
-            )
-        })
-        .collect();
-
-    if equalities.len() == 1 {
-        equalities.into_iter().next().expect("invariant: len == 1")
-    } else if equalities.is_empty() {
-        Formula::Bool(false)
-    } else {
-        Formula::And(equalities)
+    match witness {
+        [] => Formula::Bool(false),
+        [(name, value)] => Formula::Eq(
+            Box::new(Formula::Var(name.clone(), Sort::Int)),
+            Box::new(Formula::Int(*value)),
+        ),
+        _ => Formula::And(
+            witness
+                .iter()
+                .map(|(name, value)| {
+                    Formula::Eq(
+                        Box::new(Formula::Var(name.clone(), Sort::Int)),
+                        Box::new(Formula::Int(*value)),
+                    )
+                })
+                .collect(),
+        ),
     }
 }
 

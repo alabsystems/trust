@@ -196,16 +196,21 @@ pub fn convergence_rate(snapshots: &[MetricSnapshot], target: f64) -> Convergenc
         };
     }
 
-    let improvements: Vec<f64> = snapshots.windows(2).map(|w| w[1].metric - w[0].metric).collect();
+    let imp_len = snapshots.len() - 1;
+    let mut sum = 0.0;
+    let mut accel_sum = 0.0;
+    let mut prev_imp: Option<f64> = None;
+    for w in snapshots.windows(2) {
+        let imp = w[1].metric - w[0].metric;
+        sum += imp;
+        if let Some(p) = prev_imp {
+            accel_sum += imp - p;
+        }
+        prev_imp = Some(imp);
+    }
 
-    let avg = improvements.iter().sum::<f64>() / improvements.len() as f64;
-
-    let acceleration = if improvements.len() >= 2 {
-        let accels: Vec<f64> = improvements.windows(2).map(|w| w[1] - w[0]).collect();
-        accels.iter().sum::<f64>() / accels.len() as f64
-    } else {
-        0.0
-    };
+    let avg = sum / imp_len as f64;
+    let acceleration = if imp_len >= 2 { accel_sum / (imp_len - 1) as f64 } else { 0.0 };
 
     let current = snapshots.last().expect("invariant: len >= 2 guarantees last()").metric;
     let estimated = if current >= target {
@@ -292,13 +297,16 @@ pub fn classify_loop(snapshots: &[MetricSnapshot]) -> LoopCharacteristic {
         Monotonicity::Decreasing | Monotonicity::NonIncreasing => LoopCharacteristic::Diverging,
         Monotonicity::None => {
             // Check for oscillation: alternating signs of change
-            let changes: Vec<f64> =
-                snapshots.windows(2).map(|w| w[1].metric - w[0].metric).collect();
-            let sign_changes = changes
-                .windows(2)
-                .filter(|w| (w[0] > 0.0 && w[1] < 0.0) || (w[0] < 0.0 && w[1] > 0.0))
+            let changes_len = snapshots.len() - 1;
+            let sign_changes = snapshots
+                .windows(3)
+                .filter(|w| {
+                    let c0 = w[1].metric - w[0].metric;
+                    let c1 = w[2].metric - w[1].metric;
+                    (c0 > 0.0 && c1 < 0.0) || (c0 < 0.0 && c1 > 0.0)
+                })
                 .count();
-            if sign_changes > changes.len() / 2 {
+            if sign_changes > changes_len / 2 {
                 LoopCharacteristic::Oscillating
             } else {
                 LoopCharacteristic::Unknown

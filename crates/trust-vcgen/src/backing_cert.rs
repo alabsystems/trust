@@ -48,11 +48,21 @@
 //! const-context bodies through `mir_for_ctfe` — and withholds the certificate
 //! entirely (fail closed) if any body cannot be inventoried, and only certifies
 //! private-field structs.
+//!
+//! A complete body set is necessary, not sufficient. This pass recognizes a
+//! constructor as a struct literal and a mutator as a store to (or `&mut` of) a
+//! backing field, in a body that has a local of the struct's type. In-crate code
+//! can reach the same bytes without either — a raw pointer cast, a transmute, a
+//! union, a foreign or unsafe callee, a generic body instantiated with the struct —
+//! and each of those certified the struct until 2026-09-30. The compiler's escape
+//! census (`backing_escape_census` in `rustc_mir_transform`'s `trust_verify.rs`)
+//! scans the same inventory on its rustc MIR and removes such a struct from this
+//! pass's result; see docs/TCB.md, "A `#[trust::backing]` certificate".
 
 use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{AggregateKind, Formula, Projection, Rvalue, Statement, VerifiableFunction};
 
-use crate::sep_engine::{detect_backing_struct, detect_backing_structs, establish_formulas};
+use crate::sep_engine::{detect_backing_struct, establish_formulas, mentions_backing_struct};
 
 /// Certify the backing invariants provable from `functions`, returning the set
 /// of struct names whose invariant is established by every constructor and
@@ -61,16 +71,10 @@ use crate::sep_engine::{detect_backing_struct, detect_backing_structs, establish
 /// access. See the module docs for the soundness contract on `functions`.
 #[must_use]
 pub fn certify_backing_invariants(functions: &[VerifiableFunction]) -> FxHashSet<String> {
-    // Constructor/mutator certification is authority-bearing.  Present every
-    // TailCall through the canonical call-plus-return projection so the
-    // separation engine and write-set scanners cannot silently skip it.
-    let expanded_functions = functions
-        .iter()
-        .map(|func| func.with_tail_calls_expanded().into_owned())
-        .collect::<Vec<_>>();
-    let functions = expanded_functions.as_slice();
-
     // Universe of backing structs referenced anywhere, as name -> (ptr, len).
+    // `detect_backing_struct` only inspects `func.body.locals`, which tail-call
+    // expansion does not modify, so we can check whether any backing struct
+    // exists before expanding tail calls.
     let mut shapes: std::collections::BTreeMap<String, (usize, usize)> =
         std::collections::BTreeMap::new();
     for func in functions {
@@ -78,6 +82,15 @@ pub fn certify_backing_invariants(functions: &[VerifiableFunction]) -> FxHashSet
             shapes.entry(name).or_insert((pf, lf));
         }
     }
+    if shapes.is_empty() || !functions.iter().any(constructs_struct) {
+        return FxHashSet::default();
+    }
+
+    // Constructor/mutator certification is authority-bearing.  Present every
+    // TailCall through the canonical call-plus-return projection so the
+    // separation engine and write-set scanners cannot silently skip it.
+    let expanded_functions: Vec<std::borrow::Cow<'_, VerifiableFunction>> =
+        functions.iter().map(VerifiableFunction::with_tail_calls_expanded).collect();
 
     let mut certified = FxHashSet::default();
     for (name, (pf, lf)) in shapes {
@@ -85,7 +98,11 @@ pub fn certify_backing_invariants(functions: &[VerifiableFunction]) -> FxHashSet
         let mut all_establish = true;
         let mut broken_by_mutation = false;
 
-        for func in functions {
+        for func in &expanded_functions {
+            if broken_by_mutation || !all_establish {
+                break;
+            }
+            let func: &VerifiableFunction = func;
             // Only functions that touch THIS struct shape/name are relevant.
             //
             // SOUNDNESS: this must consider EVERY backing-shaped struct the
@@ -98,12 +115,12 @@ pub fn certify_backing_invariants(functions: &[VerifiableFunction]) -> FxHashSet
             // another backing struct was therefore invisible, `name` certified,
             // and the use-site ASSUME `alloc_size >= self.len` was published on
             // a struct whose length could be changed after construction.
-            if !detect_backing_structs(func).iter().any(|(n, _, _)| *n == name) {
+            if !mentions_backing_struct(func, &name) {
                 continue;
             }
 
             if constructs_struct(func) {
-                let establishes = establish_formulas(func, pf, lf);
+                let establishes = establish_formulas(func, &name, pf, lf);
                 // A constructor with no establish obligation isn't really
                 // constructing the backing struct here (e.g. it only forwards a
                 // reference); ignore it. One that emits obligations must have
@@ -117,8 +134,13 @@ pub fn certify_backing_invariants(functions: &[VerifiableFunction]) -> FxHashSet
                     // this, a genuinely-establishing constructor reads as
                     // non-establishing and the struct fails to certify (sound but
                     // useless). The canonicalizer makes `_5`/`_6` resolve to `len`.
-                    let canon = build_copy_canon(func);
-                    if !establishes.iter().all(|f| lt_is_unsat_modulo_copies(f, func, &canon)) {
+                    let mut canon: Option<FxHashMap<usize, usize>> = None;
+                    if !establishes.iter().all(|f| {
+                        lt_is_unsat(f) || {
+                            let canon = canon.get_or_insert_with(|| build_copy_canon(func));
+                            lt_is_unsat_modulo_copies(f, func, canon)
+                        }
+                    }) {
                         all_establish = false;
                     }
                 }
@@ -127,6 +149,24 @@ pub fn certify_backing_invariants(functions: &[VerifiableFunction]) -> FxHashSet
             if writes_backing_field(func, pf, lf) {
                 broken_by_mutation = true;
             }
+        }
+
+        // TINV step 4c (2026-10-05): the KEYED scan, over EVERY function with no
+        // relevance gate. `writes_backing_field` above keys on a bare field index in
+        // relevant bodies only; `place_write` names the ADT each written field belongs
+        // to, so it also sees a store through `&mut Wrap`, a `*mut Buf` parameter, a
+        // Box-elaborated raw temp, a call destination, and a `&raw const` of the field
+        // (minus the extractor's fake-metadata borrow). The result is the UNION: this
+        // only adds denials. Unresolved and unlocatable writes and call arguments stay
+        // the rustc census's to deny.
+        if saw_constructor
+            && all_establish
+            && !broken_by_mutation
+            && expanded_functions
+                .iter()
+                .any(|func| crate::place_write::writes_fields_of_expanded(func, &name, &[pf, lf]))
+        {
+            broken_by_mutation = true;
         }
 
         if saw_constructor && all_establish && !broken_by_mutation {
@@ -176,12 +216,19 @@ fn writes_backing_field(func: &VerifiableFunction, ptr_field: usize, len_field: 
         // must deny certification exactly as a store does.
         //
         // Shared borrows are fine and deliberately not flagged: `&self.len`
-        // cannot mutate. Only `&mut` / `&raw mut` escapes count.
-        match rvalue {
-            Rvalue::Ref { mutable: true, place } => touches_backing(place),
-            Rvalue::AddressOf(true, place) => touches_backing(place),
-            _ => false,
-        }
+        // cannot mutate. This asks what `self` POINTS TO, so its channels are the
+        // write-channel rule's (`generate::borrow_write_target`) — except `&raw const`,
+        // which is DELEGATED, not dropped: a `&raw const` of a backing field used as a
+        // pointer (a valid `*const -> *mut` cast root, defined to write through under
+        // Tree Borrows when derived from `&mut self`) is denied by the ADT-keyed scan
+        // this one is unioned with over every function (`place_write::writes_fields_of`,
+        // TINV step 4c), which exempts the extractor's fake-metadata borrow (one
+        // `PtrMetadata` use). Counting it here as well would deny that borrow too.
+        // Pinned by `not_certified_when_a_backing_field_escapes_by_raw_const_pointer`
+        // and `a_raw_const_borrow_of_len_denies_unless_it_is_fake_metadata`.
+        crate::generate::borrow_write_target(func, rvalue).is_some_and(|place| {
+            touches_backing(place) && !matches!(rvalue, Rvalue::AddressOf(false, _))
+        })
     })
 }
 
@@ -215,7 +262,24 @@ fn lt_is_unsat_modulo_copies(
     }
     let Formula::Lt(a, b) = f else { return false };
     if let (Formula::Var(an, _), Formula::Var(bn, _)) = (a.as_ref(), b.as_ref()) {
-        return canon_var_name(an, func, copy) == canon_var_name(bn, func, copy);
+        let Some(la) = canon_var_local(func, an, copy) else { return false };
+        let Some(lb) = canon_var_local(func, bn, copy) else { return false };
+        if la == lb {
+            return true;
+        }
+        return match (
+            func.body.locals.get(la).and_then(|l| l.name.as_deref()),
+            func.body.locals.get(lb).and_then(|l| l.name.as_deref()),
+        ) {
+            (Some(na), Some(nb)) => na == nb,
+            (None, None) => false,
+            (Some(n), None) => {
+                n.strip_prefix('_').and_then(|r| r.parse::<usize>().ok()) == Some(lb)
+            }
+            (None, Some(n)) => {
+                n.strip_prefix('_').and_then(|r| r.parse::<usize>().ok()) == Some(la)
+            }
+        };
     }
     false
 }
@@ -234,8 +298,12 @@ fn build_copy_canon(func: &VerifiableFunction) -> FxHashMap<usize, usize> {
             let (trust_types::Operand::Copy(src) | trust_types::Operand::Move(src)) = op else {
                 continue;
             };
+            // PERF-COMPILER-VCGEN-587: parameters already have an entry value (1) plus
+            // this `Statement::Assign` (≥ 2), so `value_count(func, place.local).is_at_most(1)`
+            // is always false for parameters.
             if place.projections.is_empty()
                 && src.projections.is_empty()
+                && !crate::local_defs::is_parameter(func, place.local)
                 && crate::local_defs::value_count(func, place.local).is_at_most(1)
             {
                 canon.insert(place.local, src.local);
@@ -246,11 +314,13 @@ fn build_copy_canon(func: &VerifiableFunction) -> FxHashMap<usize, usize> {
 }
 
 /// Resolve a formula variable name (`_N`, or a named local's name) to the
-/// canonical name of the local it copy-chains to.
-fn canon_var_name(name: &str, func: &VerifiableFunction, copy: &FxHashMap<usize, usize>) -> String {
-    let Some(mut local) = var_name_to_local(name, func) else {
-        return name.to_string();
-    };
+/// canonical local index it copy-chains to.
+fn canon_var_local(
+    func: &VerifiableFunction,
+    name: &str,
+    copy: &FxHashMap<usize, usize>,
+) -> Option<usize> {
+    let mut local = var_name_to_local(name, func)?;
     // Follow the copy chain to its root (bounded by the map size; no cycles since
     // each entry is `dst -> src` with dst single-assigned).
     let mut seen = 0;
@@ -261,7 +331,7 @@ fn canon_var_name(name: &str, func: &VerifiableFunction, copy: &FxHashMap<usize,
         local = src;
         seen += 1;
     }
-    func.body.locals.get(local).and_then(|l| l.name.clone()).unwrap_or_else(|| format!("_{local}"))
+    Some(local)
 }
 
 /// The local a formula variable names: `_N` -> N, else the index of the local
@@ -292,14 +362,19 @@ mod tests {
         Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Buf".into(),
             fields: vec![
                 ("ptr".into(), Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) }),
                 ("len".into(), Ty::Int { width: 64, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        }
     }
 
     fn func(
@@ -323,6 +398,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -354,6 +430,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("libc::mmap"),
                         is_foreign: true,
                         func: "libc::mmap".into(),
                         args: vec![
@@ -441,8 +518,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "core::slice::from_raw_parts".into(),
+                        func: "core::slice::raw::from_raw_parts".into(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
@@ -503,6 +583,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("libc::mmap"),
                         is_foreign: true,
                         func: "libc::mmap".into(),
                         args: vec![
@@ -588,6 +669,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("libc::mmap"),
                         is_foreign: true,
                         func: "libc::mmap".into(),
                         args: vec![
@@ -612,6 +694,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::ptr::mut_ptr::<impl *mut T>::cast",
+                        ),
                         is_foreign: false,
                         func: "core::ptr::mut_ptr::<impl *mut T>::cast".into(),
                         args: vec![Operand::Move(Place::local(2))],
@@ -814,15 +899,18 @@ mod tests {
         let other_ty = || Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Other".into(),
             fields: vec![
                 ("p".into(), Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) }),
                 ("n".into(), Ty::Int { width: 64, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
-            enum_layout: None, arbitrary_precision: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
         };
         // Mutates `Buf::len`, but `Other` occupies an earlier local.
         let hidden_mutator = func(
@@ -859,6 +947,56 @@ mod tests {
         assert!(
             !certified.contains("Buf"),
             "a decoy backing struct in an earlier local must not hide a mutator of Buf"
+        );
+    }
+
+    /// Trust (2026-09-30): the same escape through `&raw const` —
+    /// `_0 = &raw const ((*_1).1)` with `self: &mut Buf`. A `*const` is a valid
+    /// `*const -> *mut` cast root (`trust_types::Statement::escapes_local` says so for
+    /// the local-keyed question), and a write through a raw pointer derived from a
+    /// `&mut` is not UB under Tree Borrows (raw pointers are not retagged), so a
+    /// caller holding it can set `len` exactly as through `&mut self.len`. The scan
+    /// listed `&mut` / `&raw mut` only.
+    #[test]
+    fn not_certified_when_a_backing_field_escapes_by_raw_const_pointer() {
+        let escaper = func(
+            "Buf::len_ptr",
+            1,
+            vec![
+                LocalDecl {
+                    index: 0,
+                    ty: Ty::RawPtr {
+                        mutable: false,
+                        pointee: Box::new(Ty::Int { width: 64, signed: false }),
+                    },
+                    name: None,
+                },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(buf_ty()) },
+                    name: Some("self".into()),
+                },
+            ],
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::AddressOf(
+                        false,
+                        Place {
+                            local: 1,
+                            projections: vec![Projection::Deref, Projection::Field(1)],
+                        },
+                    ),
+                    span: span(),
+                }],
+                terminator: Terminator::Return,
+            }],
+        );
+        let certified = certify_backing_invariants(&[establishing_ctor(), escaper, as_slice()]);
+        assert!(
+            !certified.contains("Buf"),
+            "a `&raw const` escape of a backing field ⇒ must NOT certify"
         );
     }
 
@@ -927,5 +1065,206 @@ mod tests {
             !lt_is_unsat(&Formula::Lt(Box::new(a), Box::new(b))),
             "a < b unknown ⇒ not established"
         );
+    }
+
+    // ---- TINV step 4c: the keyed scan (`place_write`) only adds denials ----------
+
+    fn wrap_ty() -> Ty {
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
+            name: "Wrap".into(),
+            fields: vec![("b".into(), buf_ty())].into(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        }
+    }
+
+    fn one_stmt_fn(
+        name: &str,
+        param: Ty,
+        extra: Vec<Ty>,
+        stmts: Vec<Statement>,
+    ) -> VerifiableFunction {
+        let mut locals = vec![
+            LocalDecl { index: 0, ty: Ty::Unit, name: None },
+            LocalDecl { index: 1, ty: param, name: Some("p".into()) },
+        ];
+        for (i, ty) in extra.into_iter().enumerate() {
+            locals.push(LocalDecl { index: 2 + i, ty, name: None });
+        }
+        func(
+            name,
+            1,
+            locals,
+            vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
+        )
+    }
+
+    fn store_zero(place: Place) -> Statement {
+        Statement::Assign {
+            place,
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(0))),
+            span: span(),
+        }
+    }
+
+    fn certifies_with(extra: VerifiableFunction) -> bool {
+        certify_backing_invariants(&[establishing_ctor(), extra, as_slice()]).contains("Buf")
+    }
+
+    /// The relevance gate skipped a body holding only `&mut Wrap`, so the index scan
+    /// never saw `(*w).b.len = 0`.
+    #[test]
+    fn not_certified_when_a_wrapper_writes_the_backing_field() {
+        let wrapper = one_stmt_fn(
+            "Wrap::clear",
+            Ty::Ref { mutable: true, inner: Box::new(wrap_ty()) },
+            vec![],
+            vec![store_zero(Place {
+                local: 1,
+                projections: vec![Projection::Deref, Projection::Field(0), Projection::Field(1)],
+            })],
+        );
+        assert!(!certifies_with(wrapper));
+    }
+
+    /// The relevance gate peels only references, so a `*mut Buf` parameter was skipped.
+    #[test]
+    fn not_certified_through_a_raw_ptr_param() {
+        let raw = one_stmt_fn(
+            "clear_raw",
+            Ty::RawPtr { mutable: true, pointee: Box::new(buf_ty()) },
+            vec![],
+            vec![store_zero(Place {
+                local: 1,
+                projections: vec![Projection::Deref, Projection::Field(1)],
+            })],
+        );
+        assert!(!certifies_with(raw));
+    }
+
+    /// A `&raw const` of the length field that is then used as a pointer is a write
+    /// channel; the extractor's fake-metadata borrow (one `PtrMetadata` use) is not.
+    #[test]
+    fn a_raw_const_borrow_of_len_denies_unless_it_is_fake_metadata() {
+        let raw_u64 =
+            Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Int { width: 64, signed: false }) };
+        let borrow = |extra_use: bool| {
+            let mut stmts = vec![
+                Statement::Assign {
+                    place: Place::local(2),
+                    rvalue: Rvalue::AddressOf(
+                        false,
+                        Place {
+                            local: 1,
+                            projections: vec![Projection::Deref, Projection::Field(1)],
+                        },
+                    ),
+                    span: span(),
+                },
+                Statement::Assign {
+                    place: Place::local(3),
+                    rvalue: Rvalue::UnaryOp(
+                        trust_types::UnOp::PtrMetadata,
+                        Operand::Copy(Place::local(2)),
+                    ),
+                    span: span(),
+                },
+            ];
+            if extra_use {
+                stmts.push(Statement::Assign {
+                    place: Place::local(4),
+                    rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                    span: span(),
+                });
+            }
+            one_stmt_fn(
+                "Buf::peek",
+                Ty::Ref { mutable: false, inner: Box::new(buf_ty()) },
+                vec![raw_u64.clone(), Ty::Unit, raw_u64.clone()],
+                stmts,
+            )
+        };
+        assert!(certifies_with(borrow(false)), "a fake-metadata borrow must not deny");
+        assert!(!certifies_with(borrow(true)), "an escaping `&raw const` of len must deny");
+        // INT-RAWCONST-HAVOC-1 (2026-10-06), restated at the wave-19 merge (2026-10-09):
+        // the index scan DELEGATES `&raw const` to the keyed `place_write` classifier it
+        // is unioned with (main's H2 design, above), so the pin is on the union. Through
+        // a `&mut Buf` receiver, too, an escaping `&raw const (*p).len` denies
+        // certification.
+        let mut through_mut = borrow(true);
+        through_mut.body.locals[1].ty = Ty::Ref { mutable: true, inner: Box::new(buf_ty()) };
+        assert!(!certifies_with(through_mut), "an escaping `&raw const` of len through `&mut Buf`");
+    }
+
+    /// A call's destination is a write the `Assign`-only scan never saw.
+    #[test]
+    fn not_certified_when_a_backing_field_is_a_call_destination() {
+        let mut caller = one_stmt_fn(
+            "Buf::reset",
+            Ty::Ref { mutable: true, inner: Box::new(buf_ty()) },
+            vec![],
+            vec![],
+        );
+        caller.body.blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::Call {
+                    func: "big".into(),
+                    args: vec![],
+                    dest: Place {
+                        local: 1,
+                        projections: vec![Projection::Deref, Projection::Field(1)],
+                    },
+                    target: Some(BlockId(1)),
+                    span: span(),
+                    atomic: None,
+                    is_foreign: false,
+                    is_unsafe_sig: false,
+                    unwind: UnwindEdge::Unreachable,
+                    callee_identity: None,
+                    callee_key: None,
+                },
+            },
+            BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+        ];
+        assert!(!certifies_with(caller));
+    }
+
+    /// The same write to a same-index field of ANOTHER struct does not deny.
+    #[test]
+    fn a_same_index_write_to_another_adt_does_not_deny() {
+        let other = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
+            name: "Other".into(),
+            fields: vec![
+                ("a".into(), Ty::Int { width: 64, signed: false }),
+                ("b".into(), Ty::Int { width: 64, signed: false }),
+            ]
+            .into(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
+        let unrelated = one_stmt_fn(
+            "Other::clear",
+            Ty::Ref { mutable: true, inner: Box::new(other) },
+            vec![],
+            vec![store_zero(Place {
+                local: 1,
+                projections: vec![Projection::Deref, Projection::Field(1)],
+            })],
+        );
+        assert!(certifies_with(unrelated));
     }
 }

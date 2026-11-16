@@ -6,7 +6,7 @@ use rustc_expand::base::{Annotatable, ExpandResult, ExtCtxt};
 use rustc_expand::expand::AstFragment;
 use rustc_lint_defs::builtin::DUPLICATE_MACRO_ATTRIBUTES;
 use rustc_parse::{exp, parser};
-use rustc_session::errors::report_lit_error;
+use rustc_session::diagnostics::report_lit_error;
 use rustc_span::{BytePos, Span, Symbol};
 
 use crate::diagnostics;
@@ -89,9 +89,13 @@ pub(crate) fn expr_to_spanned_string<'a>(
         return ExpandResult::Retry(());
     }
 
-    // Perform eager expansion on the expression.
-    // We want to be able to handle e.g., `concat!("foo", "bar")`.
-    let expr = cx.expander().fully_expand_fragment(AstFragment::Expr(expr)).make_expr();
+    // Perform eager expansion on the expression unless it is already a direct literal
+    // with no attributes. We want to be able to handle e.g., `concat!("foo", "bar")`.
+    let expr = if expr.attrs.is_empty() && matches!(expr.kind, ast::ExprKind::Lit(_)) {
+        expr
+    } else {
+        cx.expander().fully_expand_fragment(AstFragment::Expr(expr)).make_expr()
+    };
 
     ExpandResult::Ready(Err(match expr.kind {
         ast::ExprKind::Lit(token_lit) => match ast::LitKind::from_token_lit(token_lit) {
@@ -106,7 +110,7 @@ pub(crate) fn expr_to_spanned_string<'a>(
             Ok(ast::LitKind::ByteStr(..)) => {
                 let mut err = cx.dcx().struct_span_err(expr.span, err_msg);
                 let span = expr.span.shrink_to_lo();
-                err.span_suggestion(
+                err.span_suggestion_short(
                     span.with_hi(span.lo() + BytePos(1)),
                     "consider removing the leading `b`",
                     "",
@@ -136,7 +140,7 @@ pub(crate) fn expr_to_string(
 ) -> ExpandResult<Result<(Symbol, ast::StrStyle), ErrorGuaranteed>, ()> {
     expr_to_spanned_string(cx, expr, err_msg).map(|res| {
         res.map_err(|err| match err {
-            Ok((err, _)) => err.emit(),
+            Ok((err, _)) => err.emit_err(),
             Err(guar) => guar,
         })
         .map(|ExprToSpannedString { symbol, style, .. }| (symbol, style))
@@ -157,7 +161,7 @@ pub(crate) fn check_zero_tts(cx: &ExtCtxt<'_>, span: Span, tts: TokenStream, nam
 pub(crate) fn parse_expr(p: &mut parser::Parser<'_>) -> Result<Box<ast::Expr>, ErrorGuaranteed> {
     let guar = match p.parse_expr() {
         Ok(expr) => return Ok(expr),
-        Err(err) => err.emit(),
+        Err(err) => err.emit_err(),
     };
     while p.token != token::Eof {
         p.bump();
@@ -191,7 +195,7 @@ pub(crate) fn get_single_str_spanned_from_tts(
     };
     expr_to_spanned_string(cx, ret, "argument must be a string literal").map(|res| {
         res.map_err(|err| match err {
-            Ok((err, _)) => err.emit(),
+            Ok((err, _)) => err.emit_err(),
             Err(guar) => guar,
         })
         .map(|ExprToSpannedString { symbol, span, .. }| (symbol, span))

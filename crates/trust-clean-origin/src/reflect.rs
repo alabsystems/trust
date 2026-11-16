@@ -292,7 +292,7 @@ impl Site {
 /// reason: a row cannot smuggle a runtime name in.
 pub(crate) fn cnst(constant: &'static str, named: &mut BTreeSet<&'static str>) -> Expr {
     named.insert(constant);
-    Expr::const_(Name::from_string(constant), vec![])
+    Expr::const_(Name::interned(constant), vec![])
 }
 
 /// The row a recognized recursion-arm node selects, or a NAMED refusal.
@@ -683,6 +683,20 @@ pub(crate) enum ProducerCall {
         /// Parameter returned otherwise.
         else_param: usize,
     },
+    /// **W6 (Rust-calls-Clean)** — `trust_spec_elab::admit_comparison_function`,
+    /// the FROZEN E6 producer that mints `Decidable.decide <prop> <inst>` for a
+    /// comparison returned as `Bool`. Reached through the shared
+    /// [`producer_call_for`] chain (side B reads
+    /// [`AdmissibleBody::ComparisonBool`]), because that reading is ALREADY in
+    /// the E6 kernel-import direction — so serving it here exposes nothing new.
+    Comparison {
+        /// The comparison, in the elaborator's vocabulary.
+        cmp: trust_spec_elab::SelectCmp,
+        /// The comparison's left operand.
+        cmp_left: trust_spec_elab::CmpOperand,
+        /// The comparison's right operand.
+        cmp_right: trust_spec_elab::CmpOperand,
+    },
 }
 
 /// A recognized body the table has no row for. Carries the v7/D3 text.
@@ -779,14 +793,30 @@ pub(crate) fn producer_call_for(
             let rendering = render_arith_operand(ArithOperand::Const(value))?;
             Ok((selected, ProducerCall::ExprRendering(rendering)))
         }
+        // W6 (Rust-calls-Clean): the comparison-to-`Bool` value. Reflected
+        // through the FROZEN `admit_comparison_function` (E6's own producer),
+        // which mints `Decidable.decide <prop> <inst>` — definitionally equal to
+        // the `decide`/`BEq.beq` the island wrote. The row is
+        // `comparison.{lt,le,eq}`; the operands cross into the elaborator's
+        // vocabulary the same way a select's do.
+        AdmissibleBody::ComparisonBool { cmp, left, right } => {
+            let selected = comparison_row(*cmp)?;
+            Ok((
+                selected,
+                ProducerCall::Comparison {
+                    cmp: elaborator_cmp(*cmp),
+                    cmp_left: elaborator_cmp_operand(*left),
+                    cmp_right: elaborator_cmp_operand(*right),
+                },
+            ))
+        }
         // The E6 recognizer shapes the frozen-producer table has no row for
-        // yet (the per-field/comparison/checked-arith series). Fail closed by
+        // yet (the per-field/bool-binary/checked-arith series). Fail closed by
         // citing the missing row, exactly as every other unselected shape
         // does — recognition is not emission, and a shape this table cannot
         // emit must decline rather than guess.
         AdmissibleBody::ConstantInt { .. }
         | AdmissibleBody::FieldProjection { .. }
-        | AdmissibleBody::ComparisonBool { .. }
         | AdmissibleBody::BoolBinary { .. }
         | AdmissibleBody::CheckedArithmetic { .. }
         | AdmissibleBody::GuardedNarrow { .. }
@@ -936,9 +966,10 @@ fn elaborator_beq_operand(
 ///
 /// The producer is the FROZEN [`trust_spec_elab::admit_expr_function`] — the
 /// same one the arithmetic and numeral rows route to. Nothing new was written
-/// to serve these four operators, because `elab_term` has elaborated `&`/`|`
-/// through `Nat.land`/`Nat.lor` and `/`/`%` through the TOTAL
-/// `Nat.div`/`Nat.mod` since long before this lane existed. That is what lets
+/// to serve these operators, because `elab_term` has elaborated `&`/`|`/`^`
+/// through `Nat.land`/`Nat.lor`/`Nat.xor`, `/`/`%` through the TOTAL
+/// `Nat.div`/`Nat.mod`, and a literal `>>` through `Nat.div` by `2^k` since
+/// long before this lane existed. That is what lets
 /// these rows ride frozen-R's pedigree and carry no `docs/TCB.md` row of their
 /// own.
 pub(crate) fn producer_call_for_raw_binop(
@@ -971,8 +1002,10 @@ fn raw_binop_head_label(op: RawBinOpKind) -> &'static str {
     match op {
         RawBinOpKind::BitAnd => "a bitwise `&`",
         RawBinOpKind::BitOr => "a bitwise `|`",
+        RawBinOpKind::BitXor => "a bitwise `^`",
         RawBinOpKind::Div => "a division `/`",
         RawBinOpKind::Rem => "a remainder `%`",
+        RawBinOpKind::Shr => "a right shift `>>`",
     }
 }
 
@@ -984,8 +1017,13 @@ fn raw_operator_token(op: RawBinOpKind) -> Result<&'static str, RowMiss> {
     match selected.reflect {
         ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::BitAnd)) => Ok("&"),
         ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::BitOr)) => Ok("|"),
+        ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::BitXor)) => Ok("^"),
         ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::Div)) => Ok("/"),
         ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::Rem)) => Ok("%"),
+        // The frozen `elab_term` mints `>>` only at a literal amount below the
+        // width, as `{C}.ofNat (Nat.div ({C}.toNat x) 2^k)` — the reading the
+        // kernel identifies with Lean's `{C}.shiftRight` (`l7_p12`).
+        ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::Shr)) => Ok(">>"),
         _ => Err(RowMiss {
             note: format!(
                 "INTERNAL: selection row `{}` was selected for a raw binary operator but \
@@ -1054,6 +1092,39 @@ fn select_row(cmp: SelectCmp) -> Result<&'static SelectionRow, RowMiss> {
         })
 }
 
+/// **W6 (Rust-calls-Clean)** — the row a comparison-to-`Bool` selects, from the
+/// TABLE by its `ElabToken`, never from a literal here.
+fn comparison_row(cmp: SelectCmp) -> Result<&'static SelectionRow, RowMiss> {
+    crate::table::ROWS
+        .iter()
+        .find(|candidate| candidate.reflect == ReflectSpec::ElabSurface(ElabToken::Comparison(cmp)))
+        .ok_or_else(|| RowMiss {
+            note: no_selection_row(
+                &format!("a comparison to `Bool` at {}", cmp_label(cmp)),
+                CarrierClass::MachineUInt,
+            ),
+        })
+}
+
+/// One comparison-to-`Bool` operand, translated at the crate boundary into the
+/// ELABORATOR's `CmpOperand` vocabulary — the same translation a select
+/// operand takes, one shape simpler (a comparison operand is never computed).
+fn elaborator_cmp_operand(
+    operand: trust_types::admissible_body::CmpOperand,
+) -> trust_spec_elab::CmpOperand {
+    match operand {
+        trust_types::admissible_body::CmpOperand::Param(index) => {
+            trust_spec_elab::CmpOperand::Param(index)
+        }
+        trust_types::admissible_body::CmpOperand::Const(value) => {
+            trust_spec_elab::CmpOperand::Const(value)
+        }
+        trust_types::admissible_body::CmpOperand::NegConst(magnitude) => {
+            trust_spec_elab::CmpOperand::NegConst(magnitude)
+        }
+    }
+}
+
 fn arith_head_label(op: ArithBinOp) -> &'static str {
     match op {
         ArithBinOp::Add => "a wrapping `+`",
@@ -1091,19 +1162,28 @@ fn operator_token(op: ArithBinOp) -> Result<&'static str, RowMiss> {
 
 /// One LEAF of an arithmetic rendering, through its own row: `param` renders
 /// positionally, `uint.lit` renders the raw numeral.
-fn render_arith_operand(operand: ArithOperand) -> Result<String, RowMiss> {
+fn render_arith_operand_into(operand: ArithOperand, out: &mut String) -> Result<(), RowMiss> {
+    use std::fmt::Write as _;
     match operand {
         ArithOperand::Param(index) => {
             let selected = require_row("param", "a parameter", CarrierClass::AnyExact)?;
             expect_elab(selected, ElabToken::Projection)?;
-            Ok(format!("p{index}"))
+            let _ = write!(out, "p{index}");
+            Ok(())
         }
         ArithOperand::Const(value) => {
             let selected = require_row("uint.lit", "a numeral", CarrierClass::MachineUInt)?;
             expect_elab(selected, ElabToken::Numeral)?;
-            Ok(value.to_string())
+            let _ = write!(out, "{value}");
+            Ok(())
         }
     }
+}
+
+fn render_arith_operand(operand: ArithOperand) -> Result<String, RowMiss> {
+    let mut out = String::new();
+    render_arith_operand_into(operand, &mut out)?;
+    Ok(out)
 }
 
 /// The `clean_island::admit_function_into` rendering of a recognized single-op
@@ -1119,27 +1199,39 @@ pub(crate) fn render_arith_single_op(
     left: ArithOperand,
     right: ArithOperand,
 ) -> Result<String, RowMiss> {
-    Ok(format!(
-        "{} {} {}",
-        render_arith_operand(left)?,
-        operator_token(op)?,
-        render_arith_operand(right)?
-    ))
+    let mut out = String::new();
+    render_arith_operand_into(left, &mut out)?;
+    out.push(' ');
+    out.push_str(operator_token(op)?);
+    out.push(' ');
+    render_arith_operand_into(right, &mut out)?;
+    Ok(out)
+}
+
+fn render_arith_tree_into(expr: &ArithExpr, out: &mut String) -> Result<(), RowMiss> {
+    match expr {
+        ArithExpr::Operand(operand) => render_arith_operand_into(*operand, out),
+        ArithExpr::Bin { op, left, right } => {
+            out.push('(');
+            render_arith_tree_into(left, out)?;
+            out.push(' ');
+            let token = operator_token(*op)?;
+            out.push_str(token);
+            out.push(' ');
+            render_arith_tree_into(right, out)?;
+            out.push(')');
+            Ok(())
+        }
+    }
 }
 
 /// The `clean_island::admit_function_into` rendering of a recognized composed
 /// tree: FULLY PARENTHESIZED, one row selected per node. Recursion depth is the
 /// tree depth, bounded by `COMPOSED_MAX_OPS` through the structural plan match.
 pub(crate) fn render_arith_tree(expr: &ArithExpr) -> Result<String, RowMiss> {
-    match expr {
-        ArithExpr::Operand(operand) => render_arith_operand(*operand),
-        ArithExpr::Bin { op, left, right } => Ok(format!(
-            "({} {} {})",
-            render_arith_tree(left)?,
-            operator_token(*op)?,
-            render_arith_tree(right)?
-        )),
-    }
+    let mut out = String::new();
+    render_arith_tree_into(expr, &mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -51,17 +51,26 @@
 //       and the emitted __text carries a real conditional branch.
 //   (2) VALUE-DIFFERENTIAL (concrete bytes): e.g. 1<<4=16, -8>>1=-4 (arithmetic,
 //       sign-preserving), 8u32>>1=4 (logical).
-//   (3) PROVEN-OUTPUT (HALF-SYMBOLIC, INFINITE DOMAIN): the emitted bytes are
-//       decoded into machine effects (NOT reconstructed from the IR). The bounded
-//       path-merge executor explores the guard branch; the trapping arm diverges
-//       into the abort `Trap`, so it is the excluded path — the executor returns
-//       the LIVE (no-trap) arm's value and records the live-arm path condition as
-//       the NO-TRAP PRECONDITION. ay (QF_BV) proves `precondition =>
-//       (machine_out == a << c)` for ALL 2^32 values of the symbolic `a`, for a
-//       REPRESENTATIVE SET of fixed shift amounts `c` {0,1,7,31} (UNSAT of the
-//       negation).
+//   (3) PROVEN-OUTPUT (HALF-SYMBOLIC, ALL 2^32 SHIFTED VALUES): the emitted bytes
+//       are decoded into machine effects (NOT reconstructed from the IR). The
+//       NO-TRAP PRECONDITION is the independent SOURCE domain `b <u 32` (the
+//       `ShiftInRange` obligation), bound to the ORIGINAL amount register before
+//       any emitted instruction executes. The bounded return-path executor omits
+//       a guard arm only when ay proves its accumulated path condition UNSAT
+//       under that domain; it never decodes an omitted destination. (The trap
+//       block is a `BRK #1` since trust-cg b80b958f5 — no longer `call abort` —
+//       and a reachable BRK stays the machine-semantics refusal.) ay (QF_BV)
+//       proves `precondition => (machine_out == a << c)` for ALL 2^32 values of
+//       the symbolic `a`, for a REPRESENTATIVE SET of fixed shift amounts `c`
+//       {0,1,7,31} (UNSAT of the negation).
 //   (4) NEGATIVE CONTROL: the SAME bytes proven against `(a << c) + 1` (under the
 //       same precondition) MUST be SAT — otherwise the discharge is vacuous.
+//   (5) DOMAIN AND REFUSAL CONTROLS: the source domain has exact UNSIGNED
+//       boundaries; a FEASIBLE trap (an out-of-range amount, concretely or
+//       symbolically) and a call remain refusals, and an inverted guard branch
+//       cannot silently shrink the admitted input domain.
+//
+// These are bounded development solver checks, not kernel certificates.
 //
 // WHY HALF-SYMBOLIC. A fully-symbolic variable shift equivalence would require ay
 // to reason about the register-form mask `a << (b & 31)` against the guarded
@@ -75,11 +84,30 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#![cfg(feature = "ay-proofs")]
+// Trust (2026-09-30, plan §5 fail-open item 1): every shipping `module_to_lir`
+// entry point now refuses an `Assert`-bearing body as
+// `ModuleLirError::ImplicitPanicUnfaithful` — the `Brif`/`Trap` lowering this
+// file proves is a bare `brk`, not Rust's panic. The proofs stay under test
+// for plan §5 item P through the trap oracle, which exists only under the
+// non-default `test-hooks` feature (never enabled by the compiler); this file
+// moved from the `ay-proofs` lane to `test-hooks` with it (`test-hooks`
+// implies `ay-proofs`).
+#![cfg(feature = "test-hooks")]
 
-use ay::{BigInt, Logic, Solver, Term};
+use std::time::Duration;
+
+use ay::{BigInt, Logic, Solver, SolverConfig, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
-use trust_cg_bridge::lower_trust_ir_function_to_lir;
+use trust_cg_bridge::module_to_lir::lower_trust_ir_function_to_lir_trap_assert_oracle;
+
+/// The trap oracle under the name this file always used (see the note at the
+/// top): `Assert` lowers to `Brif`/`Trap` here and is refused everywhere else.
+fn lower_trust_ir_function_to_lir(
+    module: &trust_ir::Module,
+    function: &trust_ir::Function,
+) -> Result<trust_cg_lower::function::Function, trust_cg_bridge::ModuleLirError> {
+    lower_trust_ir_function_to_lir_trap_assert_oracle(module, function, false)
+}
 use trust_disasm::{Opcode, decode_aarch64};
 use trust_ir::Module;
 use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
@@ -142,9 +170,10 @@ fn make_bridge_shift_module(kind: ShiftKind) -> Module {
         //
         // The `_3` guard-flag DEFINITION (`Ge(b, 32)`) is what makes the assert's
         // condition a defined SSA value; the assert's `expected: false` means "trap
-        // iff `_3`", so the no-trap precondition the byte executor records is
-        // `!(b >= 32)` == `b < 32` — exactly the amount<width precondition under
-        // which the AArch64-masked register shift equals the guarded shift.
+        // iff `_3`", so the source no-trap domain is `!(b >= 32)` == `b <u 32` —
+        // exactly the amount<width precondition under which the AArch64-masked
+        // register shift equals the guarded shift. The byte executor is GIVEN that
+        // domain (`shift_amount_in_range`); it does not read it off the bytes.
         BasicBlock {
             id: BlockId(0),
             stmts: vec![
@@ -199,6 +228,7 @@ fn make_bridge_shift_module(kind: ShiftKind) -> Module {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     trust_ir_bridge::lower_to_trust_ir(&vf).expect("bridge lower_to_trust_ir failed for shift")
@@ -284,10 +314,27 @@ fn has_conditional_branch(code: &[u8], base: u64) -> bool {
     false
 }
 
+/// Decode all emitted words. Unknown words or a truncated instruction refuse
+/// the structural check rather than being omitted from the call/trap counts.
+fn count_opcode(code: &[u8], base: u64, wanted: &[Opcode]) -> usize {
+    assert_eq!(code.len() % 4, 0, "AArch64 text must contain complete instructions");
+    code.chunks_exact(4)
+        .enumerate()
+        .filter(|(index, bytes)| {
+            let bytes: [u8; 4] = (*bytes).try_into().unwrap();
+            let insn = decode_aarch64(&bytes, base + (*index * 4) as u64)
+                .expect("every emitted word must decode for structural accounting");
+            wanted.contains(&insn.opcode)
+        })
+        .count()
+}
+
 // ===========================================================================
-// BOUNDED SYMBOLIC PATH-MERGING EXECUTOR (mirrors the div/rem test): the
-// trapping guard arm (a `Trap`/abort) diverges that arm, accumulating the
-// no-trap precondition.
+// BOUNDED SYMBOLIC RETURN-PATH EXECUTOR (ported from the inline-multiblock
+// replay, 7a1034b5c1). The shift-amount input assumption is supplied
+// independently of emitted control flow. An arm is omitted only when AY
+// establishes that its accumulated path condition is UNSAT. Reachable BRK,
+// calls, and unknown feasibility remain refusals; no trap semantics is invented.
 // ===========================================================================
 
 const MAX_STEPS: u32 = 4096;
@@ -297,7 +344,6 @@ const MAX_DEPTH: u32 = 16;
 enum ExecError {
     Loop { at: u64 },
     BudgetExceeded,
-    Trapped,
     Unsupported(String),
     Decode(String),
 }
@@ -307,12 +353,11 @@ struct Executor<'a> {
     code: &'a [u8],
     base: u64,
     steps: u32,
-    precondition: Vec<Formula>,
 }
 
 impl<'a> Executor<'a> {
     fn new(code: &'a [u8], base: u64) -> Self {
-        Executor { sem: Aarch64Semantics, code, base, steps: 0, precondition: Vec::new() }
+        Executor { sem: Aarch64Semantics, code, base, steps: 0 }
     }
 
     fn decode_at(&self, pc: u64) -> Result<trust_disasm::Instruction, ExecError> {
@@ -333,6 +378,7 @@ impl<'a> Executor<'a> {
         mut state: MachineState,
         mut visited: Vec<u64>,
         depth: u32,
+        path_condition: Formula,
     ) -> Result<Formula, ExecError> {
         if depth > MAX_DEPTH {
             return Err(ExecError::BudgetExceeded);
@@ -370,11 +416,12 @@ impl<'a> Executor<'a> {
                     }
                     Effect::Branch { target } => uncond_target = Some(target.clone()),
                     Effect::PcUpdate { .. } => {}
-                    // The Assert trap block begins with `call abort`: the abort
-                    // call IS the trap/panic path, so this arm diverges — the
-                    // no-trap precondition excludes it.
+                    // The retired Assert trap block began with `call abort`, and
+                    // this arm used to classify any call as that trap. The trap
+                    // is now `BRK #1`; a call is not a proved divergence, so it
+                    // refuses the replay (see `arbitrary_call_is_not_treated_as_a_trap`).
                     Effect::Call { .. } => {
-                        return Err(ExecError::Trapped);
+                        return Err(ExecError::Unsupported(format!("call at {pc:#x}")));
                     }
                     Effect::Aarch64SyncBoundary { .. } | Effect::Aarch64AtomicAccess { .. } => {
                         return Err(ExecError::Unsupported(format!("atomic/sync at {pc:#x}")));
@@ -401,10 +448,30 @@ impl<'a> Executor<'a> {
                     return Err(ExecError::Loop { at: pc });
                 }
 
-                let taken = self.run(target_pc, state.clone(), visited.clone(), depth + 1);
-                let fall = self.run(fall_pc, state.clone(), visited.clone(), depth + 1);
-
-                return self.merge(path_cond, taken, fall);
+                let taken_path = Formula::And(vec![path_condition.clone(), path_cond.clone()]);
+                let fall_path = Formula::And(vec![
+                    path_condition.clone(),
+                    Formula::Not(Box::new(path_cond.clone())),
+                ]);
+                // Do not even decode an infeasible destination. In particular,
+                // a BRK may only be avoided by proving its path impossible;
+                // a feasible BRK still reaches the unchanged Semantics refusal.
+                return match (path_is_feasible(&taken_path)?, path_is_feasible(&fall_path)?) {
+                    (true, true) => {
+                        let taken = self.run(
+                            target_pc,
+                            state.clone(),
+                            visited.clone(),
+                            depth + 1,
+                            taken_path,
+                        )?;
+                        let fall = self.run(fall_pc, state, visited, depth + 1, fall_path)?;
+                        Ok(Formula::Ite(Box::new(path_cond), Box::new(taken), Box::new(fall)))
+                    }
+                    (true, false) => self.run(target_pc, state, visited, depth + 1, taken_path),
+                    (false, true) => self.run(fall_pc, state, visited, depth + 1, fall_path),
+                    (false, false) => Err(ExecError::Unsupported("no feasible return path".into())),
+                };
             }
 
             if let Some(target) = uncond_target {
@@ -420,26 +487,25 @@ impl<'a> Executor<'a> {
             pc += 4;
         }
     }
+}
 
-    fn merge(
-        &mut self,
-        path_cond: Formula,
-        taken: Result<Formula, ExecError>,
-        fall: Result<Formula, ExecError>,
-    ) -> Result<Formula, ExecError> {
-        match (taken, fall) {
-            (Ok(t), Ok(f)) => Ok(Formula::Ite(Box::new(path_cond), Box::new(t), Box::new(f))),
-            (Err(ExecError::Trapped), Ok(f)) => {
-                self.precondition.push(Formula::Not(Box::new(path_cond)));
-                Ok(f)
-            }
-            (Ok(t), Err(ExecError::Trapped)) => {
-                self.precondition.push(path_cond);
-                Ok(t)
-            }
-            (Err(ExecError::Trapped), Err(ExecError::Trapped)) => Err(ExecError::Trapped),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
+/// Unknown (including the finite solver deadline) is never an infeasibility
+/// certificate. This is a test oracle, not a kernel-certified proof artifact.
+fn path_is_feasible(path: &Formula) -> Result<bool, ExecError> {
+    let config = SolverConfig::default().with_timeout(Duration::from_secs(30));
+    let mut solver = Solver::try_new_with_config(Logic::QfAbv, config)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility solver: {e:?}")))?;
+    let condition = formula_to_term(&mut solver, path);
+    solver
+        .try_assert_term(condition)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility assertion: {e:?}")))?;
+    let result = solver.check_sat();
+    if result.is_unsat() {
+        Ok(false)
+    } else if result.is_sat() {
+        Ok(true)
+    } else {
+        Err(ExecError::Unsupported(format!("unknown branch feasibility: {result:?}")))
     }
 }
 
@@ -452,11 +518,15 @@ fn const_addr(f: &Formula) -> Option<u64> {
 
 /// Path-merge with the SECOND argument register (X1 == `b`, the shift AMOUNT)
 /// pinned to a concrete 32-bit literal `c`. X0 (== `a`, the shifted value) stays
-/// FULLY SYMBOLIC, so the resulting `(machine_out, precondition)` is an
-/// infinite-domain statement over ALL 2^32 values of `a` for that fixed amount
+/// FULLY SYMBOLIC, so the resulting `(machine_out, precondition)` is a
+/// full-domain statement over ALL 2^32 values of `a` for that fixed amount
 /// `c`. Pinning the amount turns the emitted `LSLV/LSRV/ASRV` into a
 /// shift-by-constant, which ay closes — while still proving the REAL emitted
 /// shift bytes over a full symbolic shifted value.
+///
+/// The precondition is the independent SOURCE domain `b <u 32` over the
+/// ORIGINAL amount register (here the literal `c`), not a condition read back
+/// from the emitted guard.
 fn symbolic_machine_output_amt_const(
     code: &[u8],
     base: u64,
@@ -464,24 +534,24 @@ fn symbolic_machine_output_amt_const(
 ) -> Result<(Formula, Formula), ExecError> {
     let mut state = MachineState::symbolic();
     state.gpr[1] = Formula::BitVec { value: i128::from(c) & 0xffff_ffff, width: 64 };
-    run_machine_output(code, base, state)
+    let pre = shift_amount_in_range(state.read_gpr(1, 32));
+    let out = run_machine_output(code, base, state, &pre)?;
+    Ok((out, pre))
 }
 
+/// Bind `pre` to the ORIGINAL argument registers before any emitted instruction
+/// executes; decoded branches cannot redefine this domain. An empty domain is a
+/// refusal, never a vacuous success.
 fn run_machine_output(
     code: &[u8],
     base: u64,
     state: MachineState,
-) -> Result<(Formula, Formula), ExecError> {
-    let mut exec = Executor::new(code, base);
-    let out = exec.run(base, state, Vec::new(), 0)?;
-    let pre = if exec.precondition.is_empty() {
-        Formula::Bool(true)
-    } else if exec.precondition.len() == 1 {
-        exec.precondition.pop().unwrap()
-    } else {
-        Formula::And(exec.precondition.clone())
-    };
-    Ok((out, pre))
+    pre: &Formula,
+) -> Result<Formula, ExecError> {
+    if !path_is_feasible(pre)? {
+        return Err(ExecError::Unsupported("empty input domain".into()));
+    }
+    Executor::new(code, base).run(base, state, Vec::new(), 0, pre.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +681,14 @@ fn bv32(value: i128) -> Formula {
     Formula::BitVec { value, width: 32 }
 }
 
+/// The source no-trap domain: the Rust shift AMOUNT `b: u32` is in range iff
+/// `b <u 32` (the `ShiftInRange` obligation; the fixture's trap flag is
+/// `Ge(b, 32)` on a u32). UNSIGNED: an amount with its top bit set (e.g.
+/// 0x8000_0000) is out of range, not a small negative.
+fn shift_amount_in_range(b: Formula) -> Formula {
+    Formula::BvULt(Box::new(b), Box::new(bv32(32)), 32)
+}
+
 /// `a <shift> c` spec for a fixed 32-bit shift amount `c` (used with X1 pinned to
 /// `c`): the 32-bit shift of the symbolic `a` by the concrete `c`.
 /// * Shl  -> `a << c`  (BvShl)
@@ -635,21 +713,15 @@ fn shift_by_const_plus_one_spec(kind: ShiftKind, c: u32) -> Formula {
 // Concrete byte-execution oracle.
 // ---------------------------------------------------------------------------
 
-enum ConcreteOutcome {
-    Trapped,
-    Value(Formula),
-}
-
-fn concrete_run(code: &[u8], base: u64, a: i32, b: u32) -> ConcreteOutcome {
+fn concrete_run(code: &[u8], base: u64, a: i32, b: u32) -> Result<Formula, ExecError> {
     let mut state = MachineState::symbolic();
     state.gpr[0] = Formula::BitVec { value: i128::from(a) & 0xffff_ffff, width: 64 };
     state.gpr[1] = Formula::BitVec { value: i128::from(b) & 0xffff_ffff, width: 64 };
-    let mut exec = Executor::new(code, base);
-    match exec.run(base, state, Vec::new(), 0) {
-        Ok(out) => ConcreteOutcome::Value(out),
-        Err(ExecError::Trapped) => ConcreteOutcome::Trapped,
-        Err(e) => panic!("concrete run failed: {e:?}"),
-    }
+    // The concrete inputs ARE the precondition: every guard condition over them
+    // is closed, so feasibility under `true` decides each arm exactly. Concrete
+    // runs are NOT restricted to in-range amounts: an actual out-of-range amount
+    // must reach the unchanged BRK refusal (`feasible_*_remain_refused` below).
+    Executor::new(code, base).run(base, state, Vec::new(), 0, Formula::Bool(true))
 }
 
 fn concrete_equals(out: &Formula, expected: i32) -> bool {
@@ -666,10 +738,9 @@ fn concrete_equals(out: &Formula, expected: i32) -> bool {
 }
 
 fn bytes_value_equals(code: &[u8], base: u64, a: i32, b: u32, expected: i32) -> bool {
-    match concrete_run(code, base, a, b) {
-        ConcreteOutcome::Value(out) => concrete_equals(&out, expected),
-        ConcreteOutcome::Trapped => false,
-    }
+    let out = concrete_run(code, base, a, b)
+        .unwrap_or_else(|e| panic!("concrete in-range execution must return ({a}, {b}): {e:?}"));
+    concrete_equals(&out, expected)
 }
 
 // ===========================================================================
@@ -788,10 +859,10 @@ fn shift_emitted_bytes_values_are_correct() {
 }
 
 // ===========================================================================
-// TEST 3 — PROVEN OUTPUT (HALF-SYMBOLIC, INFINITE DOMAIN): on the no-trap path
-// the emitted bytes compute `a <shift> c` for ALL 2^32 values of the symbolic
-// shifted value `a`, for a REPRESENTATIVE SET of fixed amounts `c` {0,1,7,31}.
-// UNSAT of the negation.
+// TEST 3 — PROVEN OUTPUT (HALF-SYMBOLIC, ALL 2^32 SHIFTED VALUES): on the
+// no-trap path the emitted bytes compute `a <shift> c` for ALL 2^32 values of
+// the symbolic shifted value `a`, for a REPRESENTATIVE SET of fixed amounts `c`
+// {0,1,7,31}. UNSAT of the negation.
 // ===========================================================================
 
 fn run_proven_output(kind: ShiftKind, cs: &[u32]) {
@@ -803,14 +874,18 @@ fn run_proven_output(kind: ShiftKind, cs: &[u32]) {
         let (machine_out, precondition) = symbolic_machine_output_amt_const(&code, base, c)
             .unwrap_or_else(|e| panic!("path-merge failed for c={c}: {e:?}"));
 
-        // The no-trap path must be GUARDED: a vacuously-true precondition would
-        // mean the shift-in-range guard was never explored. The trap arm is
-        // reachable only symbolically (`b`'s in-range check), so the executor
-        // records the live-arm path condition.
+        // The no-trap path must be GUARDED. This used to check the live-arm
+        // condition the executor recorded when the retired `call abort` trap arm
+        // classified as `Trapped`; the trap is now `BRK #1` and the precondition
+        // is the explicit independent source domain `b <u 32`, never a vacuous
+        // `true`. That the emitted guard really excludes exactly the out-of-range
+        // amounts is checked separately: `feasible_out_of_range_amount_...`,
+        // `symbolic_amount_domain_prunes_exactly_the_trap_side` and
+        // `corrupted_shift_guard_cannot_shrink_the_input_domain`.
         assert!(
             !matches!(precondition, Formula::Bool(true)),
-            "expected a non-trivial no-trap precondition for c={c}; got `true` \
-             (guard not explored — shift could mask differently than source traps)"
+            "expected the explicit independent source amount-in-range domain for c={c}; got \
+             `true` (guard not explored — shift could mask differently than source traps)"
         );
 
         let spec = shift_by_const_spec(kind, c);
@@ -846,7 +921,7 @@ fn logical_right_shift_bytes_compute_a_lshr_c_on_no_trap_path() {
 // ===========================================================================
 // TEST 4 — MANDATORY NEGATIVE CONTROL: the SAME bytes proven against
 // `(a <shift> c) + 1` (under the same precondition) MUST be SAT — a non-SAT
-// result would make the positive certificate vacuous.
+// result would make the positive check vacuous.
 // ===========================================================================
 
 fn run_negative_control(kind: ShiftKind, cs: &[u32]) {
@@ -880,4 +955,152 @@ fn negative_control_arithmetic_right_shift_vs_plus_one_is_sat() {
 #[test]
 fn negative_control_logical_right_shift_vs_plus_one_is_sat() {
     run_negative_control(ShiftKind::LShr, AMOUNTS);
+}
+
+// ===========================================================================
+// TEST 5 — DOMAIN AND REFUSAL CONTROLS (ported from the inline-multiblock
+// replay, 7a1034b5c1). The guard's trap arm is omitted above ONLY because ay
+// proves it infeasible under the independent source domain. These controls show
+// that a FEASIBLE trap still reaches the exact, unchanged BRK refusal (so the
+// pruning cannot silently swallow a reachable trap), that a call is not a trap,
+// that the domain is exact, and that an inverted guard cannot hide the trap.
+// ===========================================================================
+
+const KINDS: [ShiftKind; 3] = [ShiftKind::Shl, ShiftKind::AShr, ShiftKind::LShr];
+
+fn assert_brk_refused(result: Result<Formula, ExecError>, what: &str) {
+    assert!(
+        matches!(result, Err(ExecError::Decode(ref message))
+        if message.contains("effects Brk")
+        && message.contains("aarch64-brk-debug-trap-not-proof-consumed")),
+        "reachable BRK must remain the exact semantics refusal ({what}): {result:?}"
+    );
+}
+
+/// The shift-in-range trap is a `BRK #1` in the emitted bytes, and no call
+/// survives: the retired `call abort` trap block is gone, so a `Bl`/`Blr` here
+/// would be a real call edge the replay refuses, not a trap.
+#[test]
+fn shift_guard_trap_is_one_brk_and_no_call() {
+    for kind in KINDS {
+        let (code, base) = emit_text(&make_bridge_shift_module(kind));
+        assert_eq!(
+            count_opcode(&code, base, &[Opcode::Bl, Opcode::Blr]),
+            0,
+            "{kind:?} must have no emitted call edge"
+        );
+        assert_eq!(
+            count_opcode(&code, base, &[Opcode::Brk]),
+            1,
+            "{kind:?} must retain the shift-in-range BRK"
+        );
+    }
+}
+
+#[test]
+fn feasible_out_of_range_amount_and_entry_brk_remain_refused() {
+    for kind in KINDS {
+        let (code, base) = emit_text(&make_bridge_shift_module(kind));
+        for a in [1, -8] {
+            // 0x8000_0000 is out of range UNSIGNED; a signed guard would admit it.
+            for b in [32, 33, 0x8000_0000, u32::MAX] {
+                assert_brk_refused(
+                    concrete_run(&code, base, a, b),
+                    &format!("{kind:?} {a} by {b}"),
+                );
+            }
+        }
+    }
+    assert_brk_refused(concrete_run(&0xd4200020u32.to_le_bytes(), 0, 1, 4), "entry BRK #1");
+}
+
+#[test]
+fn arbitrary_call_is_not_treated_as_a_trap() {
+    let result = concrete_run(&0x94000000u32.to_le_bytes(), 0, 1, 4);
+    assert!(
+        matches!(result, Err(ExecError::Unsupported(ref message))
+        if message.starts_with("call at ")),
+        "a call is not a proved diverging branch: {result:?}"
+    );
+}
+
+#[test]
+fn independent_shift_amount_domain_has_exact_unsigned_boundaries() {
+    for (b, in_range) in [
+        (0u32, true),
+        (1, true),
+        (31, true),
+        (32, false),
+        (33, false),
+        (0x8000_0000, false),
+        (u32::MAX, false),
+    ] {
+        let predicate = shift_amount_in_range(bv32(i128::from(b)));
+        assert_eq!(path_is_feasible(&predicate).unwrap(), in_range, "domain for amount {b}");
+    }
+    // A pinned out-of-range amount leaves an EMPTY domain: a refusal, never a
+    // vacuously-true proof over no inputs.
+    let (code, base) = emit_text(&make_bridge_shift_module(ShiftKind::Shl));
+    let result = symbolic_machine_output_amt_const(&code, base, 32).map(|(out, _)| out);
+    assert!(
+        matches!(result, Err(ExecError::Unsupported(ref message)) if message == "empty input domain"),
+        "an out-of-range pinned amount must refuse: {result:?}"
+    );
+}
+
+/// With the amount FULLY SYMBOLIC, the source domain `b <u 32` makes the trap
+/// arm UNSAT for every in-range amount at once; admitting exactly one more
+/// amount (`b <u 33`, i.e. `b == 32`) makes it feasible, and that run must reach
+/// the BRK refusal rather than be pruned. The emitted guard therefore traps
+/// exactly at the source boundary.
+#[test]
+fn symbolic_amount_domain_prunes_exactly_the_trap_side() {
+    for kind in KINDS {
+        let (code, base) = emit_text(&make_bridge_shift_module(kind));
+        let amount = MachineState::symbolic().read_gpr(1, 32);
+        let domain = shift_amount_in_range(amount.clone());
+        run_machine_output(&code, base, MachineState::symbolic(), &domain)
+            .unwrap_or_else(|e| panic!("{kind:?}: in-range symbolic amount must return: {e:?}"));
+        let one_past = Formula::BvULt(Box::new(amount), Box::new(bv32(33)), 32);
+        assert_brk_refused(
+            run_machine_output(&code, base, MachineState::symbolic(), &one_past),
+            &format!("{kind:?} symbolic amount <u 33"),
+        );
+    }
+}
+
+#[test]
+fn corrupted_shift_guard_cannot_shrink_the_input_domain() {
+    for kind in KINDS {
+        let (mut code, base) = emit_text(&make_bridge_shift_module(kind));
+        assert_eq!(
+            count_opcode(
+                &code,
+                base,
+                &[Opcode::BCond, Opcode::Cbz, Opcode::Cbnz, Opcode::Tbz, Opcode::Tbnz]
+            ),
+            1,
+            "{kind:?} fixture must have exactly one conditional branch (the guard)"
+        );
+        let branches: Vec<_> = code
+            .chunks_exact(4)
+            .enumerate()
+            .filter_map(|(index, bytes)| {
+                let bytes: [u8; 4] = bytes.try_into().unwrap();
+                (decode_aarch64(&bytes, base + (index * 4) as u64).unwrap().opcode == Opcode::BCond)
+                    .then_some(index * 4)
+            })
+            .collect();
+        assert_eq!(branches.len(), 1, "{kind:?} guard must be a B.cond");
+        // Bit 0 of the B.cond condition field inverts it: in-range amounts now
+        // take the trap arm, which must be refused, not silently pruned.
+        let offset = branches[0];
+        let word = u32::from_le_bytes(code[offset..offset + 4].try_into().unwrap()) ^ 1;
+        code[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        assert_brk_refused(concrete_run(&code, base, 1, 4), &format!("{kind:?} inverted, 1 by 4"));
+        assert_brk_refused(
+            symbolic_machine_output_amt_const(&code, base, 4).map(|(out, _)| out),
+            &format!("{kind:?} inverted, symbolic a by 4"),
+        );
+    }
 }

@@ -51,6 +51,7 @@ trust-mc-native-solver = ["trust-mc-native-driver", "trust-mc-driver/native-type
 # Accepts typed TrustIr NativeVerificationBundle values from trust-ir-bridge and
 # solves trust-mc CHC/PDR requests through the native proof-grade transport path.
 trust-mc-native-trust-ir-bundle = [
+    "trust-verifier-api/native-trust-ir-claims",
     "trust-mc-core-types",
     "trust-mc-native-solver",
     "trust-mc-driver/native-trust-ir-bundle",

@@ -1,0 +1,722 @@
+{
+  "schema": "trust.source-clause-body-proof.v2",
+  "source": {
+    "function": {
+      "name": "generated",
+      "def_path": "expanded_fixture::generated",
+      "span": {
+        "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+        "line_start": 1,
+        "col_start": 41,
+        "line_end": 1,
+        "col_end": 101
+      },
+      "body": {
+        "locals": [
+          {
+            "index": 0,
+            "ty": "Bool",
+            "name": null
+          }
+        ],
+        "blocks": [
+          {
+            "id": 0,
+            "stmts": [
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Use": {
+                      "Constant": {
+                        "Bool": false
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+                    "line_start": 2,
+                    "col_start": 9,
+                    "line_end": 2,
+                    "col_end": 14
+                  }
+                }
+              }
+            ],
+            "terminator": "Return"
+          }
+        ],
+        "arg_count": 0,
+        "return_ty": "Bool"
+      },
+      "contracts": [
+        {
+          "kind": "Ensures",
+          "span": {
+            "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+            "line_start": 1,
+            "col_start": 76,
+            "line_end": 1,
+            "col_end": 91
+          },
+          "body": "__trust_lowered_compiler_contract__:(result) == (false)"
+        }
+      ],
+      "preconditions": [],
+      "postconditions": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_0",
+                "Bool"
+              ]
+            },
+            {
+              "Bool": false
+            }
+          ]
+        }
+      ],
+      "spec": {
+        "requires": [],
+        "ensures": [
+          "(result) == (false)"
+        ],
+        "invariants": []
+      }
+    },
+    "compiler_contracts": {
+      "contracts": [
+        {
+          "kind": "Ensures",
+          "span": {
+            "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+            "line_start": 1,
+            "col_start": 76,
+            "line_end": 1,
+            "col_end": 91
+          },
+          "body": "__trust_lowered_compiler_contract__:(result) == (false)"
+        }
+      ],
+      "typed_propositions": [
+        {
+          "source_contract_index": 0,
+          "kind": "Ensures",
+          "body": "__trust_lowered_compiler_contract__:(result) == (false)",
+          "formula": {
+            "Eq": [
+              {
+                "Var": [
+                  "_0",
+                  "Bool"
+                ]
+              },
+              {
+                "Bool": false
+              }
+            ]
+          },
+          "variable_domains": [
+            {
+              "name": "_0",
+              "domain": "Bool"
+            }
+          ]
+        }
+      ],
+      "loop_contracts": [],
+      "proof_items": [],
+      "loop_clause_source_locals": null
+    },
+    "public_bundle": {
+      "schema_version": "trust.verifier-api.v1",
+      "bundle_id": "trust-contracts:expanded_fixture__generated:rustc-crate:fe31f19f40d5a2d4",
+      "subject": {
+        "Function": {
+          "crate_name": "expanded_fixture",
+          "path": "expanded_fixture::generated"
+        }
+      },
+      "contracts": [
+        {
+          "contract_id": "trust-contract:expanded_fixture::generated:ensures:0",
+          "kind": "Ensures",
+          "predicate": {
+            "TrustIr": {
+              "schema": "trust.spec-predicate.v1",
+              "value": {
+                "schema_version": "trust.spec-predicate.v1",
+                "root": {
+                  "sort": "bool",
+                  "kind": {
+                    "node": "binary",
+                    "op": "eq",
+                    "lhs": {
+                      "sort": "bool",
+                      "kind": {
+                        "node": "variable",
+                        "name": "_0"
+                      }
+                    },
+                    "rhs": {
+                      "sort": "bool",
+                      "kind": {
+                        "node": "bool_literal",
+                        "value": false
+                      }
+                    }
+                  }
+                },
+                "root_sort": "bool",
+                "variables": [
+                  {
+                    "name": "_0",
+                    "sort": "bool",
+                    "origin": {
+                      "origin": "inferred"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "source": {
+            "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+            "line": 1,
+            "column": 76,
+            "end_line": 1,
+            "end_column": 91
+          },
+          "metadata": [
+            {
+              "key": "trust.contract.kind",
+              "value": "ensures"
+            },
+            {
+              "key": "trust.contract.lowering",
+              "value": "typed_proposition"
+            },
+            {
+              "key": "trust.contract.predicate.schema",
+              "value": "trust.spec-predicate.v1"
+            },
+            {
+              "key": "trust.mir-extract.source.digest.sha256",
+              "value": "498f1a589744e4c25e4ca53e6906507511497e3d9acd5938c4d347372daec870"
+            },
+            {
+              "key": "trust.contract.predicate.digest.sha256",
+              "value": "87a65635a85b12a59aeea323c2a97dabb6a4d972979f676af3952e0e2ebda65c"
+            },
+            {
+              "key": "trust.contract.typed_proposition.digest.sha256",
+              "value": "sha256:784e1eec1a55f6d6a10d68c6dd4b18fe6527bb90197ae1324d86e4469d408ed9"
+            }
+          ]
+        }
+      ],
+      "obligations": [
+        {
+          "obligation_id": "obligation:expanded_fixture__generated:postcondition:0",
+          "kind": "Postcondition",
+          "contract_id": "trust-contract:expanded_fixture::generated:ensures:0",
+          "source": {
+            "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+            "line": 1,
+            "column": 76,
+            "end_line": 1,
+            "end_column": 91
+          },
+          "description": "prove ensures contract",
+          "required_strength": {
+            "reasoning": "Deductive",
+            "assurance": "Sound"
+          },
+          "metadata": [
+            {
+              "key": "trust.obligation_context.v1",
+              "value": "{\"schema_version\":\"trust.obligation-context.v1\",\"producer\":\"compiler_mir_extract\",\"function\":{\"crate_name\":\"expanded_fixture\",\"path\":\"expanded_fixture::generated\"},\"origin\":{\"origin\":\"contract\",\"contract_id\":\"trust-contract:expanded_fixture::generated:ensures:0\",\"contract_kind\":\"Ensures\",\"contract_index\":0,\"predicate_schema\":\"trust.spec-predicate.v1\"}}"
+            },
+            {
+              "key": "trust.contract.lowering",
+              "value": "typed_proposition"
+            },
+            {
+              "key": "trust.mir-extract.source.digest.sha256",
+              "value": "498f1a589744e4c25e4ca53e6906507511497e3d9acd5938c4d347372daec870"
+            },
+            {
+              "key": "trust.contract.predicate.digest.sha256",
+              "value": "87a65635a85b12a59aeea323c2a97dabb6a4d972979f676af3952e0e2ebda65c"
+            },
+            {
+              "key": "trust.contract.typed_proposition.digest.sha256",
+              "value": "sha256:784e1eec1a55f6d6a10d68c6dd4b18fe6527bb90197ae1324d86e4469d408ed9"
+            }
+          ]
+        },
+        {
+          "obligation_id": "vc:expanded_fixture__generated:postcondition:0",
+          "kind": "Postcondition",
+          "contract_id": "trust-contract:expanded_fixture::generated:ensures:0",
+          "source": {
+            "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+            "line": 2,
+            "column": 9,
+            "end_line": 2,
+            "end_column": 14
+          },
+          "description": "postcondition",
+          "metadata": [
+            {
+              "key": "trust.obligation_context.v1",
+              "value": "{\"schema_version\":\"trust.obligation-context.v1\",\"producer\":\"compiler_mir_extract\",\"function\":{\"crate_name\":\"expanded_fixture\",\"path\":\"expanded_fixture::generated\"},\"origin\":{\"origin\":\"verification_condition\",\"vc_kind\":\"postcondition\",\"vc_index\":0,\"formula_schema\":\"trust.spec-predicate.v1\"}}"
+            },
+            {
+              "key": "trust.vc.kind",
+              "value": "postcondition"
+            },
+            {
+              "key": "trust.mir-extract.source.digest.sha256",
+              "value": "498f1a589744e4c25e4ca53e6906507511497e3d9acd5938c4d347372daec870"
+            },
+            {
+              "key": "trust.vc.digest.sha256",
+              "value": "b2d678fea1d56d9e796bb398cce91dbcbd31151d19ea7de5b9ac13f017e21e95"
+            },
+            {
+              "key": "trust.vc.engine.trust-mc.formula_schema",
+              "value": "trust.spec-predicate.v1"
+            },
+            {
+              "key": "trust.vc.engine.trust-wp.formula_schema",
+              "value": "trust.spec-predicate.v1"
+            },
+            {
+              "key": "trust.vc.formula.schema",
+              "value": "trust.spec-predicate.v1"
+            },
+            {
+              "key": "trust.vc.formula.sort",
+              "value": "Bool"
+            },
+            {
+              "key": "trust.vc.formula.smtlib2",
+              "value": "(and (= _0 false) (not (= _0 false)))"
+            },
+            {
+              "key": "trust.vc.formula.payload",
+              "value": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_0\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"unary\",\"op\":\"not\",\"expr\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_0\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}}}}}}}},\"root_sort\":\"bool\",\"variables\":[{\"name\":\"_0\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}}]}"
+            },
+            {
+              "key": "trust.vc.source_contract_index.v1",
+              "value": "0"
+            },
+            {
+              "key": "trust.contract.predicate.digest.sha256",
+              "value": "87a65635a85b12a59aeea323c2a97dabb6a4d972979f676af3952e0e2ebda65c"
+            },
+            {
+              "key": "trust.vc.source_contract_role.v1",
+              "value": "postcondition"
+            }
+          ]
+        }
+      ],
+      "publication": {},
+      "metadata": [
+        {
+          "key": "trust.full_verification.source",
+          "value": "compiler_contract_bundle"
+        },
+        {
+          "key": "trust.mir-extract.source.digest.sha256",
+          "value": "498f1a589744e4c25e4ca53e6906507511497e3d9acd5938c4d347372daec870"
+        },
+        {
+          "key": "trust.compiler.stable_crate_id.v1",
+          "value": "fe31f19f40d5a2d4"
+        }
+      ]
+    },
+    "obligation_id": "obligation:expanded_fixture__generated:postcondition:0",
+    "source_contract_index": 0,
+    "stable_crate_id": 18316686825782354644,
+    "crate_name": "expanded_fixture",
+    "target_pointer_width_bits": 64,
+    "expanded_function_identity": {
+      "schema": "trust.expanded-function-input.v1",
+      "function_path": "expanded_fixture::generated",
+      "function_def_path_hash": [
+        18316686825782354644,
+        13733490461302635779
+      ],
+      "macro_path": "expanded_fixture::make_fn",
+      "macro_def_path_hash": [
+        18316686825782354644,
+        6654776467106542981
+      ],
+      "definition": {
+        "span": {
+          "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+          "line_start": 1,
+          "col_start": 0,
+          "line_end": 1,
+          "col_end": 106
+        },
+        "byte_len": 106,
+        "sha256": "39864eee27f2567a71b53f1d5031d19dfdecb8fd1ccb220a918dde354add1bee"
+      },
+      "invocation": {
+        "span": {
+          "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+          "line_start": 2,
+          "col_start": 0,
+          "line_end": 2,
+          "col_end": 15
+        },
+        "byte_len": 15,
+        "sha256": "5d30a27ff084dea3650b43163cfaa61ed77e05a6f185060efc1c0259ccd8f73b"
+      },
+      "typed_input_sha256": "96d7cb2da9afca21133fa1a3fcd6c9c73f2cf644ad59b511d329761fd0090511"
+    },
+    "source_vc": {
+      "kind": "Postcondition",
+      "function": "expanded_fixture::generated",
+      "location": {
+        "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+        "line_start": 1,
+        "col_start": 76,
+        "line_end": 1,
+        "col_end": 91
+      },
+      "formula": {
+        "Bool": false
+      },
+      "contract_metadata": null,
+      "obligation": null
+    },
+    "verification_conditions": [
+      {
+        "kind": "Postcondition",
+        "function": "generated",
+        "location": {
+          "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+          "line_start": 2,
+          "col_start": 9,
+          "line_end": 2,
+          "col_end": 14
+        },
+        "formula": {
+          "And": [
+            {
+              "Eq": [
+                {
+                  "Var": [
+                    "_0",
+                    "Bool"
+                  ]
+                },
+                {
+                  "Bool": false
+                }
+              ]
+            },
+            {
+              "Not": {
+                "Eq": [
+                  {
+                    "Var": [
+                      "_0",
+                      "Bool"
+                    ]
+                  },
+                  {
+                    "Bool": false
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "contract_metadata": {
+          "has_requires": false,
+          "has_ensures": true,
+          "has_invariant": false,
+          "has_variant": false,
+          "has_loop_invariant": false,
+          "has_type_refinement": false,
+          "has_modifies": false,
+          "source_contract_index": 0
+        },
+        "obligation": null
+      }
+    ],
+    "overflow_checks": true,
+    "target": "aarch64-apple-darwin;ptr64"
+  },
+  "body_proofs": [
+    {
+      "vc_index": 0,
+      "public_obligation_id": "vc:expanded_fixture__generated:postcondition:0",
+      "claim_digest_sha256": "0e0b893b3a9d59b01d5cdccddad5e1aca8cba5fe30c8615c04ee09e0aadd0f90",
+      "vc": {
+        "kind": "Postcondition",
+        "function": "generated",
+        "location": {
+          "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-EXPANDED-FUNCTION-IDENTITY/cases/base/input.rs",
+          "line_start": 2,
+          "col_start": 9,
+          "line_end": 2,
+          "col_end": 14
+        },
+        "formula": {
+          "And": [
+            {
+              "Eq": [
+                {
+                  "Var": [
+                    "_0",
+                    "Bool"
+                  ]
+                },
+                {
+                  "Bool": false
+                }
+              ]
+            },
+            {
+              "Not": {
+                "Eq": [
+                  {
+                    "Var": [
+                      "_0",
+                      "Bool"
+                    ]
+                  },
+                  {
+                    "Bool": false
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "contract_metadata": {
+          "has_requires": false,
+          "has_ensures": true,
+          "has_invariant": false,
+          "has_variant": false,
+          "has_loop_invariant": false,
+          "has_type_refinement": false,
+          "has_modifies": false,
+          "source_contract_index": 0
+        },
+        "obligation": null
+      },
+      "evidence": {
+        "CleanCic": {
+          "term": [
+            4,
+            1,
+            101,
+            1,
+            100
+          ],
+          "context": [
+            2,
+            100,
+            1,
+            0,
+            3,
+            104,
+            95,
+            48,
+            4,
+            4,
+            4,
+            3,
+            1,
+            0,
+            2,
+            69,
+            113,
+            1,
+            1,
+            0,
+            3,
+            1,
+            0,
+            3,
+            73,
+            110,
+            116,
+            0,
+            3,
+            1,
+            0,
+            12,
+            116,
+            114,
+            117,
+            115,
+            116,
+            95,
+            112,
+            114,
+            111,
+            112,
+            95,
+            48,
+            0,
+            4,
+            3,
+            1,
+            1,
+            0,
+            3,
+            73,
+            110,
+            116,
+            5,
+            111,
+            102,
+            78,
+            97,
+            116,
+            0,
+            8,
+            0,
+            0,
+            1,
+            0,
+            0,
+            2,
+            101,
+            1,
+            0,
+            3,
+            104,
+            95,
+            49,
+            4,
+            3,
+            1,
+            0,
+            3,
+            78,
+            111,
+            116,
+            0,
+            4,
+            4,
+            4,
+            3,
+            1,
+            0,
+            2,
+            69,
+            113,
+            1,
+            1,
+            0,
+            3,
+            1,
+            0,
+            3,
+            73,
+            110,
+            116,
+            0,
+            3,
+            1,
+            0,
+            12,
+            116,
+            114,
+            117,
+            115,
+            116,
+            95,
+            112,
+            114,
+            111,
+            112,
+            95,
+            48,
+            0,
+            4,
+            3,
+            1,
+            1,
+            0,
+            3,
+            73,
+            110,
+            116,
+            5,
+            111,
+            102,
+            78,
+            97,
+            116,
+            0,
+            8,
+            0,
+            0,
+            1,
+            0,
+            0,
+            2
+          ],
+          "lineage": {
+            "algorithm": "Sha256",
+            "bytes": [
+              163,
+              10,
+              12,
+              204,
+              226,
+              98,
+              152,
+              80,
+              233,
+              33,
+              155,
+              239,
+              5,
+              78,
+              72,
+              70,
+              176,
+              187,
+              108,
+              126,
+              54,
+              197,
+              200,
+              234,
+              82,
+              147,
+              176,
+              212,
+              195,
+              223,
+              197,
+              19
+            ]
+          },
+          "kernel_recheck": null
+        }
+      }
+    }
+  ],
+  "inferred_returns": {
+    "nodes": []
+  }
+}

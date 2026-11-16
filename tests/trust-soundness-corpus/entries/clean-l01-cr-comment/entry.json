@@ -1,0 +1,25 @@
+{
+  "id": "clean-l01-cr-comment",
+  "class": "Clean/Carcara reader, fix 40 (L01)",
+  "title": "a ; comment ended at LF only, so a CR-terminated comment swallowed `b)) (assert (or b`",
+  "origin": [
+    "clean 21e4dce8a (carcara fixes 39, 40), problem_reading.rs L01"
+  ],
+  "lang": "smt",
+  "source": "repro.json",
+  "reproducer": {
+    "cert": "repro.json",
+    "claim": "the problem is unsatisfiable (the certificate refutes it)"
+  },
+  "twin": {
+    "cert": "twin.json",
+    "claim": "unsatisfiable, with a correct refutation, and it contains the reproducer's construct: the same CR-terminated comment inside an assertion: read with the comment ending at the CR, the assertions are (or a a) and (not a)"
+  },
+  "witness": {
+    "solver": "ay",
+    "expect": "sat",
+    "input": "the reproducer's problem script, with (get-model) after every check-sat",
+    "observed": "sat at every check, with a model under which an independent evaluator (smt_model_check in the runner) finds every assertion and assumption in scope true"
+  },
+  "construct": "; c\r"
+}

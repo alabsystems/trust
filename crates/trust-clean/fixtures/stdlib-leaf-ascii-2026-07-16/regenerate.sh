@@ -193,7 +193,8 @@ echo "sliced and hash-verified 24 ASCII-family dumps into dumps/"
 # `results.tsv`; it does not merely print suggested commands.
 CARGO_TARGET_DIR="$VALIDATION_TARGET_DIR" CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true} \
   RUSTC_BOOTSTRAP=1 \
-  cargo build --release --locked -p trust-clean --manifest-path "$REPO/crates/Cargo.toml" \
+  targo --unverified build --release --locked -p trust-clean \
+  --manifest-path "$REPO/crates/Cargo.toml" \
   --bin ff-gate-diagnose-2026-07-10 --bin census-2026-07-06
 TOOLS="$VALIDATION_TARGET_DIR/release"
 "$TOOLS/ff-gate-diagnose-2026-07-10" "$CANDIDATE_ROOT/dumps" \

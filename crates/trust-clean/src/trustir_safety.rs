@@ -45,6 +45,11 @@
 //   8. REMAINDER BY ZERO      (Lemma 9)  `remByZero b := @Eq Int b 0`
 //                                                             — core `Eq(b, 0)`
 //
+// Unsigned multiplication additionally has the existing #53 Int out-of-range
+// predicates `umulOverflowsU{8,16,32,64}`: `(a*b < 0) ∨ (2^W−1 < a*b)`.
+// Their constructor is shared with the imported-semantics bridge. The distinct
+// BV predicates remain separate; the bridge does not prove BV equivalence.
+//
 // SOUNDNESS DISCIPLINE (mirrors mirsem.rs / trustir_anchor.rs exactly).
 //   * Every registered spec + every adequacy theorem kernel-checks with
 //     `axiom_deps ⊆ {propext, Quot.sound, Classical.choice}` — modulo exactly 3
@@ -72,7 +77,8 @@
 use std::collections::HashMap;
 
 use clean_kernel::{
-    BinderData, BinderInfo, Declaration, Environment, Expr, Level, LevelVec, Name, TypeChecker,
+    BinderData, BinderInfo, ConstantKind, Declaration, Environment, Expr, Level, LevelVec, Name,
+    Reducibility, TypeChecker,
 };
 
 use crate::trustir_anchor::{AnchorVerdict, RefinementVerdict, trustir_env};
@@ -165,7 +171,7 @@ impl IrUWidth {
         }
     }
 
-    const ALL: [IrUWidth; 4] = [IrUWidth::W8, IrUWidth::W16, IrUWidth::W32, IrUWidth::W64];
+    pub(crate) const ALL: [IrUWidth; 4] = [IrUWidth::W8, IrUWidth::W16, IrUWidth::W32, IrUWidth::W64];
 }
 
 /// The signed integer widths the trust-ir safety tier pins specs for —
@@ -335,7 +341,7 @@ fn usub_underflows_ir_name(w: IrUWidth) -> String {
 /// predicate. Trust (#53): the unsigned twin of the signed family, NOT of
 /// `usubUnderflows` — an unsigned multiply can leave the range at BOTH ends in
 /// the emitted form (`Or([Lt(a*b,0), Gt(a*b,MAX)])`), exactly as a signed op does.
-fn umul_overflows_ir_name(w: IrUWidth) -> String {
+pub(crate) fn umul_overflows_ir_name(w: IrUWidth) -> String {
     format!("Trust.TrustIr.umulOverflowsU{}", w.bits())
 }
 
@@ -607,6 +613,58 @@ fn unsigned_mul_out_of_range_body(a_ref: &Expr, b_ref: &Expr, w: IrUWidth) -> Ex
     Expr::apps(cst("Or"), [underflow, overflow])
 }
 
+/// The ONE registered Int predicate constructor, shared by the production
+/// safety environment and the imported-semantics bridge. No BV predicate or
+/// equivalence is introduced here.
+pub(crate) fn unsigned_mul_predicate_components(w: IrUWidth) -> (Name, Expr, Expr) {
+    let bd = || BinderData::from(BinderInfo::Default);
+    let type_ = Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), Expr::prop()));
+    let value = Expr::lam(
+        bd(),
+        int_ty(),
+        Expr::lam(
+            bd(),
+            int_ty(),
+            unsigned_mul_out_of_range_body(&Expr::bvar(1), &Expr::bvar(0), w),
+        ),
+    );
+    (Name::from_string(&umul_overflows_ir_name(w)), type_, value)
+}
+
+/// Register or CHECK the exact production Int model. A pre-existing name is
+/// insufficient: wrong kind, universes, type, body or reducibility must refuse.
+/// This is structural constructor custody, not a proof of BV equivalence.
+pub(crate) fn register_unsigned_mul_predicate(
+    env: &mut Environment,
+    w: IrUWidth,
+) -> Result<String, String> {
+    let (name, type_, value) = unsigned_mul_predicate_components(w);
+    if let Some(existing) = env.get_const(&name) {
+        if existing.name != name
+            || existing.kind != ConstantKind::Definition
+            || !existing.level_params.is_empty()
+            || existing.type_ != type_
+            || existing.value.as_ref() != Some(&value)
+            || !existing.is_reducible
+            || existing.reducibility != Reducibility::Reducible
+        {
+            return Err(format!(
+                "{name}: existing unsigned-Mul Int predicate differs from the registered production constructor"
+            ));
+        }
+    } else {
+        env.add_decl(Declaration::Definition {
+            name: name.clone(),
+            level_params: vec![],
+            type_,
+            value,
+            is_reducible: true,
+        })
+        .map_err(|error| format!("add_decl({name}): {error:?}"))?;
+    }
+    Ok(name.to_string())
+}
+
 /// The width whose unsigned bounds are exactly `(min, max)` — the unsigned twin of
 /// `swidth_of_signed_bounds`. Requires `min == 0`, so an emitted pair that is not
 /// a genuine unsigned range matches NO width and declines.
@@ -658,9 +716,7 @@ fn trustir_safety_env_uncached() -> Result<Environment, String> {
         })?;
         // Trust (#53) — unsigned-mul OVERFLOW: the full out-of-range disjunction,
         // the same shape the signed family uses.
-        register_int2_prop(&mut env, &umul_overflows_ir_name(w), |a, b| {
-            unsigned_mul_out_of_range_body(a, b, w)
-        })?;
+        register_unsigned_mul_predicate(&mut env, w)?;
         // Trust (BV denotation, 2026-08-21) — the two bitvector OPERATION
         // denotations, then the BITVECTOR-FORM twin of the predicate above. The
         // operations must be registered FIRST: `umul_overflows_bv_body` applies
@@ -1219,8 +1275,8 @@ fn mir_assert_condition_core(
         }
         let Rvalue::BinaryOp(BinOp::Eq, a, b) = rvalue else { return None };
         found.push(F::Eq(
-            Box::new(trust_vcgen::operand_to_formula(func, a)),
-            Box::new(trust_vcgen::operand_to_formula(func, b)),
+            Box::new(trust_vcgen::try_operand_to_formula(func, a).ok()?),
+            Box::new(trust_vcgen::try_operand_to_formula(func, b).ok()?),
         ));
     }
     let first = found.first()?.clone();
@@ -1321,7 +1377,7 @@ fn negation_subjects(func: &trust_types::VerifiableFunction) -> Vec<(String, tru
             }
         }
         if let Terminator::Call { func: callee, args, .. } = &block.terminator
-            && is_signed_abs_callee(callee)
+            && trust_vcgen::is_signed_abs_call(callee)
             && let Some(arg) = args.first()
         {
             push(arg);
@@ -1330,55 +1386,15 @@ fn negation_subjects(func: &trust_types::VerifiableFunction) -> Vec<(String, tru
     out
 }
 
-/// Whether `callee` is the std signed `iN::abs` whose panic-at-`iN::MIN`
-/// `signed_abs_panic_body` models as a `NegationOverflow` — the consumer-side twin of
-/// `unwrap_panic::is_signed_abs_call` (unwrap_panic.rs:123-126), which is
-/// `pub(super)` inside `trust-vcgen` and so cannot be called from here. Kept a twin
-/// for the same reason [`base_var_name`] is one.
-///
-/// A DIVERGENCE FROM THE ORIGINAL IS NOT SYMMETRIC, so it is worth naming which way it
-/// cuts: this predicate only ADMITS a subject that the MIR itself passes to a call of
-/// this shape. Too NARROW and a legitimate `abs` row loses its certificate
-/// (over-rejection — 5 of the corpus's 12 certified negation rows are `abs` calls, so
-/// the corpus census would catch it immediately); too WIDE and the admissible set grows
-/// by the first argument of another `core::num`/`std::num` call in the SAME function —
-/// never by an arbitrary variable.
-fn is_signed_abs_callee(callee: &str) -> bool {
-    callee_method_tail(callee) == "abs"
-        && (callee.contains("core::num::") || callee.contains("std::num::"))
-}
-
-/// The method-name tail of a callee path, turbofishes stripped — a verbatim twin of
-/// `trust_vcgen::generate::alloc_bounds::method_tail` (alloc_bounds.rs:162-202), which
-/// is `pub(crate)` there. See [`is_signed_abs_callee`] for why an exact copy matters
-/// and which way a drift would cut.
-fn callee_method_tail(callee: &str) -> &str {
-    let mut base = callee.trim();
-    while base.ends_with('>') {
-        let bytes = base.as_bytes();
-        let mut depth = 0i32;
-        let mut open = None;
-        for (i, &b) in bytes.iter().enumerate().rev() {
-            match b {
-                b'>' => depth += 1,
-                b'<' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        open = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match open {
-            Some(i) => base = base[..i].trim_end_matches(':'),
-            None => break, // unbalanced `<…>` — avoid an infinite loop
-        }
-    }
-    let tail = base.rsplit("::").next().unwrap_or(base);
-    tail.split('<').next().unwrap_or(tail).trim()
-}
+// Trust (2026-10-06, ABS-NAME-1): the `abs` producer's identity is
+// `trust_vcgen::is_signed_abs_call`, called directly by `negation_subjects` above. This
+// file used to keep its own twin (`is_signed_abs_callee`, with a verbatim copy of
+// `method_tail`) because the original was `pub(super)`; both had the same
+// `core::num::` / `std::num::` SUBSTRING test, so a user `mycore::num::abs` or
+// `G::<core::num::Wrapping<i32>>::abs` was an `abs` call on both sides and the first
+// argument of such a call widened the admissible subject set. The emitter now takes
+// exactly the authenticated `core::num::<impl iN>::abs` and is exported, so the twin
+// and its drift analysis are gone: the admitted set equals the charged set.
 
 /// The SHAPE of a shift VC's emitted violation, destructured into
 /// `(amount, threshold W, is_signed_form)` — exactly the two forms
@@ -2013,7 +2029,7 @@ fn reconstruct_obligation(rec: &trust_types::ObligationRecord) -> trust_types::F
                 let terms: Vec<F> = paths
                     .iter()
                     .map(|p| match p {
-                        P::Raw => cur.clone(),
+                        P::Raw | P::Collapsed => cur.clone(),
                         P::Guarded { guards } => {
                             let mut c = guards.clone();
                             match cur.clone() {
@@ -3071,6 +3087,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3103,6 +3120,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3151,6 +3169,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3200,6 +3219,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3277,6 +3297,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3316,6 +3337,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3348,6 +3370,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4159,9 +4182,13 @@ mod bv_denotation_tests {
         // The GUARDED predicate at l = 0: the first conjunct is `Not(Eq(0, 0))`, which
         // is false, so the conjunction is false for EVERY rhs — matching the ground
         // truth that `0 * b` never overflows, whatever the division returns.
+        // The ground truth is Rust's own u8 multiplication (`checked_mul`), not a
+        // spelled-out `0 * b > 255`, which is constant and says nothing about Rust.
         let udiv8 = bv_udiv_ir_name(8);
-        for b in 0u32..256 {
-            assert!(!(0u32 * b > 255), "ground truth: 0 * {b} never overflows");
+        let lhs = 0u8;
+        for b in 0u8..=u8::MAX {
+            let overflows = lhs.checked_mul(b).is_none();
+            assert!(!overflows, "ground truth: {lhs} * {b} never overflows u8");
             // The division the guard masks, computed for real: bvudiv(bvmul(0,b), 0).
             let prod = nf(&tc, &apply2(&bv_mul_ir_name(8), &int_lit(0), &int_lit(i128::from(b))));
             assert_eq!(prod, int_lit(0));
@@ -4169,7 +4196,7 @@ mod bv_denotation_tests {
             assert_eq!(recovered, int_lit(255), "the masked division is all-ones, not 0");
             // Guarded: FALSE, i.e. exactly the ground truth.
             let guarded = false && recovered != int_lit(i128::from(b));
-            assert_eq!(guarded, 0u32 * b > 255);
+            assert_eq!(guarded, overflows);
         }
         // The UNGUARDED term, both conventions, at the one point that separates them.
         assert_ne!(
@@ -4354,6 +4381,7 @@ mod bv_denotation_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4528,6 +4556,7 @@ mod bv_denotation_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let vcs = trust_vcgen::generate_vcs(&f);
         for vc in vcs.iter().filter(|vc| is_safety_vc_kind(&vc.kind)) {

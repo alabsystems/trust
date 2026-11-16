@@ -1,0 +1,36 @@
+{
+  "id": "trip-zero-product",
+  "class": "TRIP-ZERO-PRODUCT-1",
+  "title": "a zero-trip warm-up loop made the whole body's trip count 0; c += 1 certified and its check elided",
+  "origin": [
+    "DQ:10125 (TRIP-ZERO-PRODUCT-1)",
+    "tests/ui/trust/loop_trip_zero_factor_is_not_a_bound{,_run}.rs"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "count_after_warmup",
+    "obligation": {
+      "kind": "overflow",
+      "at": "c += 1"
+    }
+  },
+  "twin": {
+    "function": "count_200",
+    "obligation": {
+      "kind": "overflow",
+      "at": "c += 1"
+    }
+  },
+  "witness": {
+    "input": "(none: the 256th add)",
+    "observed": "attempt to add with overflow",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  }
+}

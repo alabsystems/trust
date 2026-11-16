@@ -3,10 +3,14 @@
 use std::path::Path;
 
 use rustc_span::{Span, Symbol};
+use rustc_structures::CrateType;
 
 use crate::Session;
-use crate::config::{CrateType, OutFileName, OutputFilenames, OutputType};
-use crate::errors::{CrateNameEmpty, FileIsNotWriteable, InvalidCharacterInCrateName};
+use crate::config::{OutFileName, OutputFilenames, OutputType};
+use crate::diagnostics::{
+    CrateNameEmpty, FileIsNotWriteable, InvalidCharacterInCrateName,
+    InvalidCharacterInCrateNameSuggestion,
+};
 
 pub fn out_filename(
     sess: &Session,
@@ -14,13 +18,12 @@ pub fn out_filename(
     outputs: &OutputFilenames,
     crate_name: Symbol,
 ) -> OutFileName {
-    let default_filename = filename_for_input(sess, crate_type, crate_name, outputs);
     let out_filename = outputs
         .outputs
         .get(&OutputType::Exe)
         .and_then(|s| s.to_owned())
         .or_else(|| outputs.single_output_file.clone())
-        .unwrap_or(default_filename);
+        .unwrap_or_else(|| filename_for_input(sess, crate_type, crate_name, outputs));
 
     if let OutFileName::Real(ref path) = out_filename {
         check_file_is_writeable(path, sess);
@@ -65,6 +68,10 @@ pub fn validate_crate_name(sess: &Session, crate_name: Symbol, span: Option<Span
             span,
             character: c,
             crate_name,
+            suggestion: span.is_none().then(|| InvalidCharacterInCrateNameSuggestion {
+                suggested_name:
+                    crate_name.as_str().replace(|c: char| c != '_' && !c.is_alphanumeric(), "_"),
+            }),
         }));
     }
 
@@ -94,19 +101,23 @@ pub fn filename_for_input(
     crate_name: Symbol,
     outputs: &OutputFilenames,
 ) -> OutFileName {
-    let libname = format!("{}{}", crate_name, sess.opts.cg.extra_filename);
+    let extra = &sess.opts.cg.extra_filename;
 
     match crate_type {
         CrateType::Rlib => {
-            OutFileName::Real(outputs.out_directory.join(&format!("lib{libname}.rlib")))
+            OutFileName::Real(outputs.out_directory.join(format!("lib{crate_name}{extra}.rlib")))
         }
         CrateType::Cdylib | CrateType::ProcMacro | CrateType::Dylib | CrateType::Sdylib => {
             let (prefix, suffix) = (&sess.target.dll_prefix, &sess.target.dll_suffix);
-            OutFileName::Real(outputs.out_directory.join(&format!("{prefix}{libname}{suffix}")))
+            OutFileName::Real(
+                outputs.out_directory.join(format!("{prefix}{crate_name}{extra}{suffix}")),
+            )
         }
         CrateType::StaticLib => {
             let (prefix, suffix) = sess.staticlib_components(false);
-            OutFileName::Real(outputs.out_directory.join(&format!("{prefix}{libname}{suffix}")))
+            OutFileName::Real(
+                outputs.out_directory.join(format!("{prefix}{crate_name}{extra}{suffix}")),
+            )
         }
         CrateType::Executable => {
             let suffix = &sess.target.exe_suffix;
@@ -132,6 +143,13 @@ pub fn invalid_output_for_target(sess: &Session, crate_type: CrateType) -> bool 
         }
         if sess.crt_static(Some(crate_type)) && !sess.target.crt_static_allows_dylibs {
             return true;
+        }
+    }
+    if crate_type == CrateType::ProcMacro {
+        if sess.opts.target_triple == sess.wasm_proc_macro_tuple
+            && sess.opts.unstable_opts.wasm_proc_macros
+        {
+            return false;
         }
     }
     if let CrateType::ProcMacro | CrateType::Dylib = crate_type

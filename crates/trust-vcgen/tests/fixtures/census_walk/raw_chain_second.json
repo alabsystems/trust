@@ -1,0 +1,1167 @@
+{
+  "name": "raw_chain_second",
+  "def_path": "census_walk::raw_chain_second",
+  "span": {
+    "file": "<dump-root>/census_walk.rs",
+    "line_start": 103,
+    "col_start": 0,
+    "line_end": 111,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Datatype": {
+                "name": "census_walk::RawChain",
+                "variants": []
+              }
+            }
+          }
+        },
+        "name": "r"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Datatype": {
+                    "name": "census_walk::RawChain",
+                    "variants": []
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "next"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "RawPtr": {
+                "mutable": false,
+                "pointee": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "p"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Datatype": {
+                "name": "census_walk::RawChain",
+                "variants": []
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Datatype": {
+                "name": "census_walk::RawChain",
+                "variants": []
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": [
+                    "Deref"
+                  ]
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 104,
+                "col_start": 10,
+                "line_end": 104,
+                "col_end": 11
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ],
+              [
+                1,
+                3
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "<dump-root>/census_walk.rs",
+              "line_start": 104,
+              "col_start": 4,
+              "line_end": 104,
+              "col_end": 11
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      32
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 109,
+                "col_start": 29,
+                "line_end": 109,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 105,
+                "col_start": 23,
+                "line_end": 105,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 105,
+                "col_start": 38,
+                "line_end": 105,
+                "col_end": 42
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 6,
+                  "projections": [
+                    "Deref"
+                  ]
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 105,
+                "col_start": 38,
+                "line_end": 105,
+                "col_end": 42
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                5
+              ],
+              [
+                1,
+                4
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "<dump-root>/census_walk.rs",
+              "line_start": 105,
+              "col_start": 32,
+              "line_end": 105,
+              "col_end": 42
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      32
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 107,
+                "col_start": 33,
+                "line_end": 107,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 27,
+                "line_end": 106,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 7,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Downcast": 0
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 27,
+                "line_end": 106,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 5,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "MisalignedPointerDereference",
+            "target": 7,
+            "span": {
+              "file": "<dump-root>/census_walk.rs",
+              "line_start": 106,
+              "col_start": 42,
+              "line_end": 106,
+              "col_end": 45
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 15,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 17,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 16,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Not",
+                  {
+                    "Copy": {
+                      "local": 18,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 19,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "NullPointerDereference",
+            "target": 8,
+            "span": {
+              "file": "<dump-root>/census_walk.rs",
+              "line_start": 106,
+              "col_start": 42,
+              "line_end": 106,
+              "col_end": 45
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 8,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 106,
+                "col_start": 42,
+                "line_end": 106,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    },
+    "datatype_defs": {
+      "census_walk::RawChain": {
+        "Adt": {
+          "name": "census_walk::RawChain",
+          "fields": [
+            [
+              "__tag",
+              {
+                "Int": {
+                  "width": 64,
+                  "signed": true
+                }
+              }
+            ],
+            [
+              "__v0_0",
+              {
+                "RawPtr": {
+                  "mutable": false,
+                  "pointee": {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                }
+              }
+            ],
+            [
+              "__v1_0",
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Datatype": {
+                      "name": "census_walk::RawChain",
+                      "variants": []
+                    }
+                  }
+                }
+              }
+            ]
+          ],
+          "variants": [
+            {
+              "name": "Leaf",
+              "discriminant": 0,
+              "fields": [
+                [
+                  "0",
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            },
+            {
+              "name": "Link",
+              "discriminant": 1,
+              "fields": [
+                [
+                  "0",
+                  {
+                    "Ref": {
+                      "mutable": false,
+                      "inner": {
+                        "Datatype": {
+                          "name": "census_walk::RawChain",
+                          "variants": []
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          ],
+          "disc_index_safe": true,
+          "faithful_enum_repr": null,
+          "layout": null,
+          "enum_layout": null,
+          "adt_kind": "Enum"
+        }
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_4",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_4",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

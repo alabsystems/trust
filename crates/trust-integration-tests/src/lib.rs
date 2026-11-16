@@ -11,10 +11,12 @@
 // dead_code audit: crate-level suppression removed
 
 pub mod ay_test_support;
+pub mod clean_proof_obligations;
 pub mod clean_test_support;
 pub mod extracted;
 #[cfg(test)]
 pub mod framework;
+pub mod trust_rustc;
 
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Contract, ContractKind, Formula,
@@ -100,6 +102,7 @@ pub fn midpoint_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -163,6 +166,7 @@ pub fn division_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -217,6 +221,7 @@ pub fn array_access_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -283,6 +288,7 @@ pub fn contract_function() -> VerifiableFunction {
             Box::new(Formula::Int(4_294_967_295)),
         )],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -309,5 +315,6 @@ pub fn noop_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }

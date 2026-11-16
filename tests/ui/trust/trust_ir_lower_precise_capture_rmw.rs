@@ -1,6 +1,6 @@
 //@ run-pass
 //@ dont-check-compiler-stderr
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aunused_assignments
 //! Trust (wave-PCW): compound assignment to a precisely-captured projected
 //! place inside a closure.
 //!

@@ -1,0 +1,30 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (Flag, in_range_flag)
+  --> $DIR/e9_island_alias_bool_result_discharge.rs:16:5
+   |
+LL | /     abbrev Flag := Bool
+LL | |     def in_range_flag (a : BitVec 64) : Flag := Bool.true
+   | |_________________________________________________________^
+
+note: island definition `in_range_flag` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_island_alias_bool_result_discharge::prop_position_flag`
+  --> $DIR/e9_island_alias_bool_result_discharge.rs:21:13
+   |
+LL |     ensures in_range_flag(a)
+   |             ^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+
+=== Trust Verification Report (e9_island_alias_bool_result_discharge) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_island_alias_bool_result_discharge.rs:20:1
+   |
+LL | / pub fn prop_position_flag(a: i64) -> bool
+LL | |     ensures in_range_flag(a)
+LL | | {
+LL | |     true
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+

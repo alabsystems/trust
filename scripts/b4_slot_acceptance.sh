@@ -72,7 +72,7 @@ done
 if diff -q "$WORK/tail.semantic.txt" "$WORK/letted.semantic.txt" >/dev/null; then
     echo "B4 ACCEPTANCE: RED — \`tail\` and \`letted\` lower to SEMANTICALLY IDENTICAL Modules."
     echo "The \`let\` binding leaves no trace; there is no slot table yet. This is the"
-    echo "expected pre-B4 state (docs/TRUST_IR_V2.md §B4). Shared body:"
+    echo "expected pre-B4 state (trust-ir V2 item B4). Shared body:"
     sed -n '/^fn @probe/,/^}/p' "$WORK/tail.semantic.txt" | sed 's/^/    /'
     exit 1
 fi

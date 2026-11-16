@@ -44,9 +44,9 @@ where
     }
 }
 
-pub(crate) fn complete_expr_path(
+pub(crate) fn complete_expr_path<'db>(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_, '_>,
+    ctx: &CompletionContext<'_, 'db>,
     path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx<'_>,
     expr_ctx: &PathExprCtx<'_>,
 ) {
@@ -70,6 +70,7 @@ pub(crate) fn complete_expr_path(
         ref innermost_breakable_ty,
         ref impl_,
         in_match_guard,
+        at_optional_block,
         ..
     } = expr_ctx;
 
@@ -87,7 +88,7 @@ pub(crate) fn complete_expr_path(
         false
     };
 
-    let scope_def_applicable = |def| match def {
+    let scope_def_applicable = |def: ScopeDef<'db>| match def {
         ScopeDef::GenericParam(hir::GenericParam::LifetimeParam(_)) | ScopeDef::Label(_) => false,
         ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac)) => mac.is_fn_like(ctx.db),
         _ => true,
@@ -244,7 +245,7 @@ pub(crate) fn complete_expr_path(
         Qualified::No => {
             acc.add_nameref_keywords_with_colon(ctx);
             if let Some(adt) =
-                ctx.expected_type.as_ref().and_then(|ty| ty.strip_references().as_adt())
+                ctx.expected.ty.as_ref().and_then(|ty| ty.strip_references().as_adt())
             {
                 let self_ty = (|| ctx.sema.to_def(impl_.as_ref()?)?.self_ty(ctx.db).as_adt())();
                 let complete_self = self_ty == Some(adt);
@@ -383,9 +384,10 @@ pub(crate) fn complete_expr_path(
                     if in_condition {
                         add_keyword("letm", "let mut $1 = $0");
                         add_keyword("let", "let $1 = $0");
-                    }
-
-                    if in_block_expr {
+                    } else if at_optional_block {
+                        add_keyword("letm", "{\n    let mut $1 = $0;\n}");
+                        add_keyword("let", "{\n    let $1 = $0;\n}");
+                    } else if in_block_expr {
                         add_keyword("letm", "let mut $1 = $0;");
                         add_keyword("let", "let $1 = $0;");
                     }
@@ -473,7 +475,7 @@ pub(crate) fn complete_expr(
         return;
     }
 
-    if let Some(ty) = &ctx.expected_type {
+    if let Some(ty) = &ctx.expected.ty {
         // Ignore unit types as they are not very interesting
         if ty.is_unit() || ty.is_unknown() {
             return;
@@ -484,7 +486,6 @@ pub(crate) fn complete_expr(
             scope: &ctx.scope,
             goal: ty.clone(),
             config: hir::term_search::TermSearchConfig {
-                enable_borrowcheck: false,
                 many_alternatives_threshold: 1,
                 fuel: 200,
             },

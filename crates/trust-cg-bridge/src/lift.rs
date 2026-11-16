@@ -451,6 +451,7 @@ pub fn lift_from_lir(lir: &LirFunction) -> Result<VerifiableFunction, BridgeErro
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     })
 }
 

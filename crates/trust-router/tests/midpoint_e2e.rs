@@ -88,6 +88,7 @@ fn midpoint_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -150,6 +151,7 @@ fn test_identity_function_no_vcs() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = trust_vcgen::generate_vcs(&func);

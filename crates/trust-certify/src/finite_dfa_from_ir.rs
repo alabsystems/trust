@@ -99,7 +99,8 @@ const TABLE_STEP: &str = "table_step";
 /// the returned `ValueId` to its defining `Const`. A `default` block (required by
 /// `Inst::Switch`) is authored per switch; it is never reached for in-range
 /// inputs and the extractor never follows it. Returns `None` on an empty or
-/// ragged matrix.
+/// ragged matrix, and when the builder refuses (a fault recorded by any of its
+/// doors, which `ModuleBuilder::build` reports).
 pub fn author_table_step_module(cells: &[Vec<i128>]) -> Option<Module> {
     let n_states = cells.len();
     if n_states == 0 {
@@ -172,7 +173,9 @@ pub fn author_table_step_module(cells: &[Vec<i128>]) -> Option<Module> {
     fb.ret(vec![zero]);
 
     fb.build();
-    Some(mb.build())
+    // A builder fault (trust-ir D1b: an exhausted id space) is a refusal, like a
+    // ragged matrix: no module.
+    mb.build().ok()
 }
 
 // ──────────────────────────── extraction ────────────────────────────────────
@@ -703,7 +706,8 @@ pub(crate) fn kernel_checks_table_composition(
     }
 
     let proof = enum_cases_refl_proof_2d(st_dom, byte_dom, &full_cells)?;
-    if TypeChecker::with_context(&env, LocalContext::new()).check_type(&proof, &goal).is_ok() {
+    let checker = TypeChecker::with_context(&env, LocalContext::new());
+    if crate::kernel_stop::check_type(checker, &proof, &goal).is_ok() {
         Some(())
     } else {
         None

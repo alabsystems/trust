@@ -26,8 +26,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         let (ty, dyn_ty) = self.tcx.erase_and_anonymize_regions((ty, dyn_ty));
 
         // All vtables must be monomorphic, bail out otherwise.
-        ensure_monomorphic_enough(*self.tcx, ty)?;
-        ensure_monomorphic_enough(*self.tcx, dyn_ty)?;
+        ensure_monomorphic_enough(ty)?;
+        ensure_monomorphic_enough(dyn_ty)?;
 
         let salt = M::get_global_alloc_salt(self, None);
         let vtable_symbolic_allocation = self.tcx.reserve_and_set_vtable_alloc(ty, dyn_ty, salt);
@@ -43,7 +43,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         let ty = self.get_ptr_vtable_ty(vtable, expected_trait)?;
         let layout = self.layout_of(ty)?;
         assert!(layout.is_sized(), "there are no vtables for unsized types");
-        interp_ok((layout.size, layout.align.abi))
+        interp_ok((layout.size, layout.align))
     }
 
     pub(super) fn vtable_entries(
@@ -112,7 +112,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             matches!(mplace.layout.ty.kind(), ty::Dynamic(_, _)),
             "`unpack_dyn_trait` only makes sense on `dyn*` types"
         );
-        let vtable = mplace.meta().unwrap_meta().to_pointer(self)?;
+        let vtable = mplace.meta().unwrap_meta().to_pointer(self);
         let ty = self.get_ptr_vtable_ty(vtable, Some(expected_trait))?;
         // This is a kind of transmute, from a place with unsized type and metadata to
         // a place with sized type and no metadata.

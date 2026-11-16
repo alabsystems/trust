@@ -188,6 +188,76 @@ grep -q 'PROOF COMPLETE' "$TMP_ROOT/proofpath.out" \
 grep -q 'export PATH=' "$TMP_ROOT/proofpath.out" \
     || fail "the proof's PATH refusal does not carry the fix"
 
+# ...nor may step 1 read a FAILING pin reader as "no shim on PATH". A rustup
+# `rustc` shim whose link is stale prints nothing on stdout, exactly like aterm's
+# reroute stub; for a while the proof took any empty `rustc --print sysroot` as
+# "no shim" and printed PROOF COMPLETE — channel resolves, when the pin had not
+# resolved at all. Only the reroute stub, identified positively, may be skipped.
+# A hermetic Trust frontend: `trustc` and `rustup run trust` agree on a sysroot.
+pin_fx="$TMP_ROOT/pin-reader"
+mkdir -p "$pin_fx/sysroot/bin" "$pin_fx/sysroot/lib" "$pin_fx/rustup-bin" \
+    "$pin_fx/stale-shim" "$pin_fx/reroute" "$pin_fx/home"
+cat >"$pin_fx/sysroot/bin/trustc" <<SH
+#!/bin/sh
+[ "\$1" = --print ] && [ "\$2" = sysroot ] && { printf '%s\\n' "$pin_fx/sysroot"; exit 0; }
+exit 1
+SH
+printf 'fixture driver' >"$pin_fx/sysroot/lib/librustc_driver-fixture.dylib"
+cat >"$pin_fx/rustup-bin/rustup" <<'SH'
+#!/bin/sh
+case "$1" in
+    toolchain) printf 'trust\n' ;;
+    run) shift 2; exec "$@" ;;
+    *) exit 1 ;;
+esac
+SH
+cat >"$pin_fx/stale-shim/rustc" <<'SH'
+#!/bin/sh
+echo "error: 'rustc' is not installed for the custom toolchain 'trust'." >&2
+exit 1
+SH
+printf 'reroute dir\n' >"$pin_fx/reroute/.atpkg-reroute-dir"
+cat >"$pin_fx/reroute/rustc" <<'SH'
+#!/bin/sh
+# atpkg reroute stub v1
+echo "aterm: upstream 'rustc' is not on PATH; on Trust the tool is 'trustc'" >&2
+exit 127
+SH
+chmod +x "$pin_fx/sysroot/bin/trustc" "$pin_fx/rustup-bin/rustup" \
+    "$pin_fx/stale-shim/rustc" "$pin_fx/reroute/rustc"
+pin_path_tail="$pin_fx/sysroot/bin:$pin_fx/rustup-bin:/usr/bin:/bin:/usr/sbin:/sbin"
+run_pin_proof() {
+    env -i HOME="$pin_fx/home" PATH="$1" TMPDIR="$TMP_ROOT" \
+        sh "$ROOT/scripts/prove-trust-frontend-gate.sh" >"$2" 2>&1
+}
+
+# (a) the stale shim FIRST on PATH: the reviewer's measured mutant.
+if run_pin_proof "$pin_fx/stale-shim:$pin_path_tail" "$TMP_ROOT/pin-stale.out"; then
+    fail "the frontend-gate proof passed with a rustc shim that cannot resolve the pin"
+fi
+grep -q 'PROOF FAILED: .*stale-shim/rustc --print sysroot' "$TMP_ROOT/pin-stale.out" \
+    || fail "a failing pin reader was not the named cause of the proof's failure"
+grep -q 'PROOF COMPLETE' "$TMP_ROOT/pin-stale.out" \
+    && fail "the proof reported completion over a pin reader that resolves nothing"
+
+# (b) the stub first, the stale shim behind it: the stub execs that shim in
+# passthrough mode, so the shim is still the reader, and it still fails.
+if run_pin_proof "$pin_fx/reroute:$pin_fx/stale-shim:$pin_path_tail" "$TMP_ROOT/pin-behind.out"; then
+    fail "the proof passed with a failing rustc shim behind the reroute stub"
+fi
+grep -q 'PROOF FAILED: .*stale-shim/rustc --print sysroot' "$TMP_ROOT/pin-behind.out" \
+    || fail "a failing pin reader behind the reroute stub was not named"
+
+# (c) positive control: only the reroute stub. Step 1 passes and says the pin
+# was not read; the proof then stops at the fixture's missing targo (step 2).
+if run_pin_proof "$pin_fx/reroute:$pin_path_tail" "$TMP_ROOT/pin-stub.out"; then
+    fail "the proof passed on a fixture sysroot with no targo"
+fi
+grep -q "PROVED   no pin reader on PATH: the only \`rustc\` on PATH is aterm's reroute stub" \
+    "$TMP_ROOT/pin-stub.out" || fail "the proof did not identify the reroute stub positively"
+grep -q 'targo is missing' "$TMP_ROOT/pin-stub.out" \
+    || fail "with only the reroute stub, the proof did not get past step 1"
+
 # --- the generated config ---------------------------------------------------
 # Extracted from the dry-run's "would write" block, which is the same text the
 # non-dry run writes (one emit_bootstrap_toml, two consumers).

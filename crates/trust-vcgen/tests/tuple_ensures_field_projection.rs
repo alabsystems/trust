@@ -98,10 +98,10 @@ fn partially_lowerable_tuple_return_stays_fail_closed() {
             _ => None,
         })
         .expect("fixture must assign the tuple return slot");
-    operands[1] = Operand::Unsupported {
-        kind: "adversarial-missing-sibling".to_string(),
-        detail: "the second tuple projection cannot be lowered".to_string(),
-    };
+    operands[1] = Operand::unsupported(
+        "adversarial-missing-sibling",
+        "the second tuple projection cannot be lowered",
+    );
 
     let vcs = generate_vcs(&func);
     assert!(

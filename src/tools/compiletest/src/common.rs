@@ -2,13 +2,16 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::iter;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
 
 use build_helper::git::GitConfig;
 use camino::{Utf8Path, Utf8PathBuf};
 use semver::Version;
 
+use crate::debuggers::LldbVersion;
 use crate::edition::Edition;
+use crate::executor::TestVariant;
 use crate::fatal;
 use crate::util::{Utf8PathBufExt, add_dylib_path, string_enum};
 
@@ -19,6 +22,18 @@ pub(crate) const TRUST_VANILLA_RUSTC_FLAG: &str = "-Ztrust-verify=off";
 /// the note with `//@ unset-rustc-env:TRUST_VANILLA_ANNOUNCED`.
 pub(crate) const TRUST_VANILLA_ANNOUNCED_ENV: &str = "TRUST_VANILLA_ANNOUNCED";
 pub(crate) const TRUST_VANILLA_SENTINEL: &str = "--compiletest-trust-vanilla";
+
+/// Trust (verified lane): the SHIPPING default, stated explicitly in argv.
+///
+/// The verified lane names its own contract rather than inheriting a compiler
+/// default that can move under it. `-Ztrust-verify=on` is the batteries-on
+/// pipeline and `-Ztrust-policy=strict` is the rung where a refutation carrying
+/// a counterexample HARD-FAILS the build; both are the driver's current
+/// defaults, so a lane that inherited them silently would look identical today
+/// and diverge silently tomorrow.
+pub(crate) const TRUST_VERIFIED_RUSTC_FLAGS: [&str; 2] =
+    ["-Ztrust-verify=on", "-Ztrust-policy=strict"];
+pub(crate) const TRUST_VERIFIED_SENTINEL: &str = "--compiletest-trust-verified";
 
 string_enum! {
     #[derive(Clone, Copy, PartialEq, Debug)]
@@ -65,6 +80,7 @@ impl TestMode {
 string_enum! {
     #[derive(Clone, Copy, PartialEq, Debug)]
     pub(crate) enum TestSuite {
+        AssemblyGcc => "assembly-gcc",
         AssemblyLlvm => "assembly-llvm",
         CodegenLlvm => "codegen-llvm",
         CodegenUnits => "codegen-units",
@@ -177,7 +193,6 @@ string_enum! {
     pub(crate) enum CompareMode {
         Polonius => "polonius",
         NextSolver => "next-solver",
-        NextSolverCoherence => "next-solver-coherence",
         SplitDwarf => "split-dwarf",
         SplitDwarfSingle => "split-dwarf-single",
     }
@@ -244,10 +259,10 @@ pub(crate) enum CodegenBackend {
     TrustCg,
 }
 
-impl<'a> TryFrom<&'a str> for CodegenBackend {
-    type Error = &'static str;
+impl FromStr for CodegenBackend {
+    type Err = &'static str;
 
-    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_lowercase().as_str() {
             "cranelift" => Ok(Self::Cranelift),
             "gcc" => Ok(Self::Gcc),
@@ -257,7 +272,7 @@ impl<'a> TryFrom<&'a str> for CodegenBackend {
             // author who writes the underscore form must not hit the panic
             // paths in `ignore-backends` / `needs-backends`.
             "trust-cg" | "trust_cg" => Ok(Self::TrustCg),
-            _ => Err("unknown backend"),
+            _ => Err("unknown codegen backend"),
         }
     }
 }
@@ -302,6 +317,8 @@ impl CodegenBackend {
 /// (for changed test detection).
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
+    /// Trust: create-only passive harness observations, separate from test verdicts.
+    pub(crate) trust_invocation_census: Option<Arc<crate::census::Census>>,
     /// Some [`TestMode`]s support [snapshot testing], where a *reference snapshot* of outputs (of
     /// `stdout`, `stderr`, or other form of artifacts) can be compared to the *actual output*.
     ///
@@ -359,6 +376,12 @@ pub(crate) struct Config {
     /// For example:
     /// - `/home/ferris/rust/build/x86_64-unknown-linux-gnu/stage1-tools-bin/cargo`
     ///
+    /// Trust: the staged Cargo is the Trust Cargo, `targo`, installed into the
+    /// stage's sysroot by bootstrap's `tool::Cargo` step (for example
+    /// `build/x86_64-unknown-linux-gnu/stage1/bin/targo`). The Trust Cargo's
+    /// package, crate and tool artifact are all `targo`; a sysroot's `bin/cargo`
+    /// is that same executable under its compatibility name (docs/trust-naming.md).
+    ///
     /// FIXME: maybe rename this to reflect that this is a *staged* host cargo.
     pub(crate) cargo_path: Option<Utf8PathBuf>,
 
@@ -369,6 +392,12 @@ pub(crate) struct Config {
     /// - `/home/ferris/rust/build/x86_64-unknown-linux-gnu/stage0/bin/rustc`
     pub(crate) stage0_rustc_path: Option<Utf8PathBuf>,
 
+    /// Path to the run-make-support .rlib file, used to build `run-make` recipes.
+    pub(crate) run_make_support_rlib: Option<Utf8PathBuf>,
+
+    /// Path to the run-make-support .rmeta file, used to build `run-make` recipes.
+    pub(crate) run_make_support_rmeta: Option<Utf8PathBuf>,
+
     /// Path to the stage 1 or higher `rustc` used to obtain target information via
     /// `--print=all-target-specs-json` and similar queries.
     ///
@@ -377,6 +406,11 @@ pub(crate) struct Config {
     /// compiler, whereas target specs must be obtained from a stage 1+ compiler
     /// (in case the JSON format has changed since the last bootstrap bump).
     pub(crate) query_rustc_path: Option<Utf8PathBuf>,
+
+    /// Path to the libraries needed to run the compiler at [`Self::query_rustc_path`].
+    ///
+    /// If unset, [`Self::host_compile_lib_path`] will be used instead.
+    pub(crate) query_rustc_lib_path: Option<Utf8PathBuf>,
 
     /// Path to the `rustdoc`-under-test. Like [`Self::rustc_path`], this `rustdoc` is *staged*.
     pub(crate) rustdoc_path: Option<Utf8PathBuf>,
@@ -476,18 +510,6 @@ pub(crate) struct Config {
     /// [`TestMode::CoverageMap`].
     pub(crate) suite: TestSuite,
 
-    /// When specified, **only** the specified [`Debugger`] will be used to run against the
-    /// `tests/debuginfo` test suite. When unspecified, `compiletest` will attempt to find all three
-    /// of {`lldb`, `cdb`, `gdb`} implicitly, and then try to run the `debuginfo` test suite against
-    /// all three debuggers.
-    ///
-    /// FIXME: this implicit behavior is really nasty, in that it makes it hard for the user to
-    /// control *which* debugger(s) are available and used to run the debuginfo test suite. We
-    /// should have `bootstrap` allow the user to *explicitly* configure the debuggers, and *not*
-    /// try to implicitly discover some random debugger from the user environment. This makes the
-    /// debuginfo test suite particularly hard to work with.
-    pub(crate) debugger: Option<Debugger>,
-
     /// Run ignored tests *unconditionally*, overriding their ignore reason.
     ///
     /// FIXME: this is wired up through the test execution logic, but **not** accessible from
@@ -583,6 +605,11 @@ pub(crate) struct Config {
     /// *only* applied to the [`PassFailMode::RunPass`] test crate and not its auxiliaries.
     pub(crate) optimize_tests: bool,
 
+    /// Whether rustdoc should disable CSS/JS minification when generating docs for tests.
+    ///
+    /// Forwarded from bootstrap's `build.docs-minification = false`.
+    pub(crate) disable_minification: bool,
+
     /// Target platform tuple.
     pub(crate) target: String,
 
@@ -628,7 +655,7 @@ pub(crate) struct Config {
     /// Version of LLDB.
     ///
     /// FIXME: `lldb_version` is *derived* from lldb, but it's *not* technically a config!
-    pub(crate) lldb_version: Option<u32>,
+    pub(crate) lldb_version: Option<LldbVersion>,
 
     /// Version of LLVM.
     ///
@@ -804,6 +831,8 @@ pub(crate) struct Config {
     pub(crate) parallel_frontend_threads: u32,
     /// Number of times to execute each test.
     pub(crate) iteration_count: u32,
+
+    pub(crate) wasm_proc_macros: bool,
 }
 
 impl Config {
@@ -812,6 +841,39 @@ impl Config {
 
     pub(crate) fn trust_vanilla(&self) -> bool {
         self.target_rustcflags.iter().any(|flag| flag == TRUST_VANILLA_SENTINEL)
+    }
+
+    /// The opt-in VERIFIED lane (`--trust-verified`): run the inherited corpus
+    /// with verification ON at the shipping default.
+    ///
+    /// Mutually exclusive with [`Config::trust_vanilla`]; `parse_config` refuses
+    /// a run that asks for both, because the two lanes make contradictory claims
+    /// and a run that quietly picked one would mislabel every row it produced.
+    pub(crate) fn trust_verified(&self) -> bool {
+        self.target_rustcflags.iter().any(|flag| flag == TRUST_VERIFIED_SENTINEL)
+    }
+
+    /// Which of the three verification lanes this run is.
+    ///
+    /// This is the ONLY place the lane is decided, so that the default lane's
+    /// behaviour is provably unchanged: with `--trust-verified` absent this
+    /// reduces EXACTLY to the historical
+    /// `rustc_supports_trust_verification || trust_vanilla()` disjunction, and
+    /// [`TrustVerificationLane::IsolatedOff`] / [`TrustVerificationLane::Unsupported`]
+    /// do exactly what that disjunction's `true` / `false` arms used to do.
+    /// See `common/tests.rs::trust_verified_lane_is_opt_in_and_default_is_unchanged`.
+    pub(crate) fn trust_verification_lane(&self) -> TrustVerificationLane {
+        if self.trust_verified() {
+            // `--trust-verified` without a verification-capable driver is
+            // refused at `parse_config`, not downgraded here: a silent
+            // downgrade would produce vanilla evidence wearing a verified
+            // label, which is precisely what the lane split exists to prevent.
+            TrustVerificationLane::Verified
+        } else if self.rustc_supports_trust_verification || self.trust_vanilla() {
+            TrustVerificationLane::IsolatedOff
+        } else {
+            TrustVerificationLane::Unsupported
+        }
     }
 
     pub(crate) fn rustc_command(&self) -> Command {
@@ -844,14 +906,11 @@ impl Config {
     }
 
     pub(crate) fn is_internal_rustcflag(flag: &str) -> bool {
-        flag == TRUST_VANILLA_SENTINEL
+        flag == TRUST_VANILLA_SENTINEL || flag == TRUST_VERIFIED_SENTINEL
     }
 
     pub(crate) fn configure_compiletest_rustc(&self, command: &mut Command) {
-        configure_trust_verification_isolation(
-            command,
-            self.rustc_supports_trust_verification || self.trust_vanilla(),
-        );
+        configure_trust_verification_isolation(command, self.trust_verification_lane());
     }
 
     /// FIXME: this run scheme is... confusing.
@@ -925,6 +984,10 @@ impl Config {
         if self.target.starts_with("wasm") {
             return self.target.contains("threads");
         }
+        // UEFI targets don't have threads.
+        if self.target.contains("uefi") {
+            return false;
+        }
         true
     }
 
@@ -977,7 +1040,30 @@ impl Config {
     }
 }
 
-fn configure_trust_verification_isolation(command: &mut Command, supported: bool) {
+/// Which verification contract a compiletest-managed rustc invocation states.
+///
+/// Three states, not a boolean, because the historical boolean had no negative
+/// arm for "verify": `rustc_supports_trust_verification || trust_vanilla()` is
+/// true on every `x.py test --stage 2`, so there was no CLI way to reach a
+/// verification-ON test lane at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TrustVerificationLane {
+    /// The driver is stage 0 or `download-rustc`, so `-Ztrust-*` options may be
+    /// unknown flags: append nothing. A stage-0 driver can still be a Trust SEED,
+    /// which verifies by default and spells its switch from before the
+    /// flag-surface rename (`-Zno-trust-verify=yes`); the environment switch
+    /// (`TRUST_NO_VERIFY=1`, the one bootstrap itself plants for the seed) is
+    /// spelling-independent and inert on a non-Trust driver, so this lane sets it
+    /// (`configure_trust_verification_isolation`).
+    Unsupported,
+    /// The DEFAULT and `--trust-vanilla` lanes: isolate ordinary inherited-corpus
+    /// tests from the verifier with the tracked `-Ztrust-verify=off`.
+    IsolatedOff,
+    /// The opt-in `--trust-verified` lane: state the shipping default in argv.
+    Verified,
+}
+
+fn configure_trust_verification_isolation(command: &mut Command, lane: TrustVerificationLane) {
     // Trust: an INHERITED `TRUST_NO_VERIFY` must never reach a test compilation.
     // The driver applies that variable as a post-parse override
     // (`rustc_driver_impl::apply_trust_verify_override`, run AFTER
@@ -1001,25 +1087,65 @@ fn configure_trust_verification_isolation(command: &mut Command, supported: bool
     // argument below, and its separate `cmd.env("TRUST_NO_VERIFY", "1")` in
     // `runtest.rs` applies to the test binary's RUN environment (for nested
     // compilations with fixed argv), not to this compile command.
+    //
+    // The strip is UNCONDITIONAL across all three lanes, and on the VERIFIED
+    // lane it is load-bearing in the opposite direction: because the driver
+    // applies the variable as a post-parse override, an inherited
+    // `TRUST_NO_VERIFY` would beat this lane's own `-Ztrust-verify=on` and turn
+    // the whole verified run into a silent no-op that still reports green.
     command.env_remove("TRUST_NO_VERIFY");
-    if supported {
-        // Compiletest's inherited Rust corpus tests compiler behavior, not the
-        // batteries-on Trust verifier. Per-test compile flags are appended later,
-        // so Trust-specific tests can deliberately opt back in with
-        // `-Ztrust-verify=on` while auxiliary crates remain isolated by default.
-        command.arg(TRUST_VANILLA_RUSTC_FLAG);
-        // The isolation flag above is compiletest's own announced policy, not
-        // a user's silent vanilla build: quiet the compiler's once-per-crate
-        // vanilla note. A test re-exposes the note with
-        // `//@ unset-rustc-env:TRUST_VANILLA_ANNOUNCED` (applied after this
-        // env, so the per-test directive wins).
-        command.env(TRUST_VANILLA_ANNOUNCED_ENV, "1");
+    match lane {
+        TrustVerificationLane::Unsupported => {
+            // Trust (2026-10-10): the driver is stage 0 or `download-rustc`
+            // (bootstrap: `rustc_supports_trust_verification = stage > 0 &&
+            // !download_rustc`). When it is the Trust SEED, as for `ui-fulldeps`
+            // under `--stage 1` (the stage-0 driver compiles those host programs
+            // against stage 1's `rustc_private`), it verifies the test crate by
+            // default, and nothing here can say otherwise: the seed predates
+            // `-Ztrust-verify=off`. MEASURED: every `ui-fulldeps` crate whose
+            // driver types are recursive ADTs (`compiler-calls.rs`,
+            // `trust-frontend-thread-pin.rs`) failed at its own compile, "type
+            // lowering exceeded produced-node budget", so the lane tested the
+            // seed's verifier instead of the compiler. Set the seed's own
+            // spelling-independent off-switch; a non-Trust driver ignores it.
+            // A stage-1 Trust suite never reaches this lane, so no verifier test
+            // is made vacuous by it, and a test's `-Ztrust-verify=on` to a seed
+            // stays an unknown-flag error.
+            command.env("TRUST_NO_VERIFY", "1");
+        }
+        TrustVerificationLane::IsolatedOff => {
+            // Compiletest's inherited Rust corpus tests compiler behavior, not the
+            // batteries-on Trust verifier. Per-test compile flags are appended later,
+            // so Trust-specific tests can deliberately opt back in with
+            // `-Ztrust-verify=on` while auxiliary crates remain isolated by default.
+            command.arg(TRUST_VANILLA_RUSTC_FLAG);
+            // The isolation flag above is compiletest's own announced policy, not
+            // a user's silent vanilla build: quiet the compiler's once-per-crate
+            // vanilla note. A test re-exposes the note with
+            // `//@ unset-rustc-env:TRUST_VANILLA_ANNOUNCED` (applied after this
+            // env, so the per-test directive wins).
+            command.env(TRUST_VANILLA_ANNOUNCED_ENV, "1");
+        }
+        TrustVerificationLane::Verified => {
+            // The lane states its contract; per-test compile flags are still
+            // appended after this, so a test that must opt out does so visibly
+            // in its own directives rather than by inheriting a harness default.
+            // Re-applying this for an auxiliary compilation (as the vanilla lane
+            // does) keeps the aux boundary authoritative: an aux crate cannot
+            // inherit a primary test's `-Ztrust-verify=off`.
+            command.args(TRUST_VERIFIED_RUSTC_FLAGS);
+            // Deliberately NOT `TRUST_VANILLA_ANNOUNCED`: that variable exists
+            // only to quiet the compiler's once-per-crate "compiled WITHOUT
+            // Trust verification" note. On this lane that note firing is a
+            // FINDING -- some test or recipe turned verification off -- and it
+            // must stay loud.
+        }
     }
 }
 
 #[cfg(test)]
 #[path = "common/tests.rs"]
-mod trust_verification_isolation_tests;
+pub(crate) mod trust_verification_isolation_tests;
 
 /// Known widths of `target_has_atomic`.
 pub(crate) const KNOWN_TARGET_HAS_ATOMIC_WIDTHS: &[&str] = &["8", "16", "32", "64", "128", "ptr"];
@@ -1306,7 +1432,10 @@ fn supported_crate_types(config: &Config) -> HashSet<String> {
 
 fn rustc_query_command(config: &Config, args: &[&str], envs: HashMap<String, String>) -> Command {
     let mut command = config.query_rustc_command();
-    add_dylib_path(&mut command, iter::once(&config.host_compile_lib_path));
+    add_dylib_path(
+        &mut command,
+        iter::once(config.query_rustc_lib_path.as_deref().unwrap_or(&config.host_compile_lib_path)),
+    );
     config.add_rustcflags(&mut command, &config.target_rustcflags);
     command.args(args);
     command.env("RUSTC_BOOTSTRAP", "1");
@@ -1322,7 +1451,7 @@ fn rustc_query_command(config: &Config, args: &[&str], envs: HashMap<String, Str
 /// answer, and the only honest way to learn it is to ask the exact binary being
 /// tested rather than to infer it from the configuration that built it.
 pub(crate) fn rustc_query_succeeds(config: &Config, args: &[&str]) -> bool {
-    match rustc_query_command(config, args, Default::default()).output() {
+    match crate::query_output(&mut rustc_query_command(config, args, Default::default())) {
         Ok(output) => output.status.success(),
         Err(e) => {
             fatal!("failed to run rustc query {args:?}: {e}");
@@ -1337,7 +1466,7 @@ pub(crate) fn query_rustc_output(
 ) -> String {
     let mut command = rustc_query_command(config, args, envs);
 
-    let output = match command.output() {
+    let output = match crate::query_output(&mut command) {
         Ok(output) => output,
         Err(e) => {
             fatal!("failed to run {command:?}: {e}");
@@ -1345,7 +1474,8 @@ pub(crate) fn query_rustc_output(
     };
     if !output.status.success() {
         fatal!(
-            "failed to run {command:?}\n--- stdout\n{}\n--- stderr\n{}",
+            "failed to run {command:?}\n{}\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
             String::from_utf8(output.stdout).unwrap(),
             String::from_utf8(output.stderr).unwrap(),
         );
@@ -1445,13 +1575,13 @@ pub(crate) fn output_relative_path(config: &Config, relative_dir: &Utf8Path) -> 
 pub(crate) fn output_testname_unique(
     config: &Config,
     testpaths: &TestPaths,
-    revision: Option<&str>,
+    variant: &TestVariant,
 ) -> Utf8PathBuf {
     let mode = config.compare_mode.as_ref().map_or("", |m| m.to_str());
-    let debugger = config.debugger.as_ref().map_or("", |m| m.to_str());
+    let debugger = variant.debugger.as_ref().map_or("", |m| m.to_str());
     Utf8PathBuf::from(&testpaths.file.file_stem().unwrap())
         .with_extra_extension(config.mode.output_dir_disambiguator())
-        .with_extra_extension(revision.unwrap_or(""))
+        .with_extra_extension(variant.revision().unwrap_or(""))
         .with_extra_extension(mode)
         .with_extra_extension(debugger)
 }
@@ -1462,10 +1592,10 @@ pub(crate) fn output_testname_unique(
 pub(crate) fn output_base_dir(
     config: &Config,
     testpaths: &TestPaths,
-    revision: Option<&str>,
+    variant: &TestVariant,
 ) -> Utf8PathBuf {
     output_relative_path(config, &testpaths.relative_dir)
-        .join(output_testname_unique(config, testpaths, revision))
+        .join(output_testname_unique(config, testpaths, variant))
 }
 
 /// Absolute path to the base filename used as output for the given
@@ -1474,9 +1604,9 @@ pub(crate) fn output_base_dir(
 pub(crate) fn output_base_name(
     config: &Config,
     testpaths: &TestPaths,
-    revision: Option<&str>,
+    variant: &TestVariant,
 ) -> Utf8PathBuf {
-    output_base_dir(config, testpaths, revision).join(testpaths.file.file_stem().unwrap())
+    output_base_dir(config, testpaths, variant).join(testpaths.file.file_stem().unwrap())
 }
 
 /// Absolute path to the directory to use for incremental compilation. Example:
@@ -1484,7 +1614,7 @@ pub(crate) fn output_base_name(
 pub(crate) fn incremental_dir(
     config: &Config,
     testpaths: &TestPaths,
-    revision: Option<&str>,
+    variant: &TestVariant,
 ) -> Utf8PathBuf {
-    output_base_name(config, testpaths, revision).with_extension("inc")
+    output_base_name(config, testpaths, variant).with_extension("inc")
 }

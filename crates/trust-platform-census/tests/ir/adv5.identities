@@ -1,0 +1,10 @@
+# Identities for adv5.trust_ir: the review of census/c0's real stage1 dump
+# of adv5.rs. Conventions: census_shapes.identities.
+body adv_errpath_kqueue pub
+body adv_errpath_socket pub
+spawners
+product-census
+effects adv_errpath_kqueue 5:23=fork 7:26=kqueue 9:21=execv 9:46=_exit 12:39=fcntl 13:17=execv 13:42=_exit
+effects adv_errpath_socket 20:23=fork 22:25=socket 24:21=execv 24:46=_exit 27:39=fcntl 28:17=execv 28:42=_exit
+drops adv_errpath_kqueue
+drops adv_errpath_socket

@@ -1,0 +1,473 @@
+{
+  "name": "ffi_const",
+  "def_path": "raw_const_escape_ffi::ffi_const",
+  "span": {
+    "file": "raw_const_escape_ffi.rs",
+    "line_start": 5,
+    "col_start": 0,
+    "line_end": 11,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "k"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "p"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      5,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "raw_const_escape_ffi.rs",
+                "line_start": 6,
+                "col_start": 20,
+                "line_end": 6,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 2,
+                    "projections": []
+                  }
+                ]
+              },
+              "span": {
+                "file": "raw_const_escape_ffi.rs",
+                "line_start": 7,
+                "col_start": 12,
+                "line_end": 7,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": true,
+                      "pointee": {
+                        "Int": {
+                          "width": 8,
+                          "signed": false
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "raw_const_escape_ffi.rs",
+                "line_start": 9,
+                "col_start": 11,
+                "line_end": 9,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": true
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "raw_const_escape_ffi.rs",
+                "line_start": 9,
+                "col_start": 25,
+                "line_end": 9,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "raw_const_escape_ffi::{extern#0}::memset",
+            "args": [
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "raw_const_escape_ffi.rs",
+              "line_start": 9,
+              "col_start": 4,
+              "line_end": 9,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": true,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 6359032967494017375,
+              "def_index": 4,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 6359032967494017375,
+              "krate_name": "raw_const_escape_ffi",
+              "foreign_block_leaf": "memset"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "raw_const_escape_ffi.rs",
+                "line_start": 10,
+                "col_start": 4,
+                "line_end": 10,
+                "col_end": 5
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        8
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "raw_const_escape_ffi.rs",
+                "line_start": 10,
+                "col_start": 4,
+                "line_end": 10,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 8,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 2,
+            "span": {
+              "file": "raw_const_escape_ffi.rs",
+              "line_start": 10,
+              "col_start": 4,
+              "line_end": 10,
+              "col_end": 9
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 8,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "raw_const_escape_ffi.rs",
+                "line_start": 10,
+                "col_start": 4,
+                "line_end": 10,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "k",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "k",
+                "Int"
+              ]
+            },
+            {
+              "Int": 255
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

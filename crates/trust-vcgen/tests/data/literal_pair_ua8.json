@@ -1,0 +1,98 @@
+{
+  "name": "ua8",
+  "def_path": "literal_pair_width_arms::ua8",
+  "span": {
+    "file": "literal_pair_width_arms.rs",
+    "line_start": 91,
+    "col_start": 0,
+    "line_end": 93,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl i8>::unchecked_add",
+            "args": [
+              {
+                "Constant": {
+                  "Int": 127
+                }
+              },
+              {
+                "Constant": {
+                  "Int": 1
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "literal_pair_width_arms.rs",
+              "line_start": 92,
+              "col_start": 21,
+              "line_end": 92,
+              "col_end": 21
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": true,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4703791156326232143,
+              "def_index": 26194,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4703791156326232143,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

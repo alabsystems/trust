@@ -8859,6 +8859,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

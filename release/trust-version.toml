@@ -1,19 +1,26 @@
-# Trust product version — the one authoritative statement of what this
-# toolchain calls itself. `src/version` carries the same number for the
-# compiler's own `-V` output; `targo trust version` reads this file.
+# Trust product version, as `targo trust version` reports it.
 #
-# Trust versions are `major.minor.dev` (Andrew's constellation scheme):
-#   major  the top-level line
-#   minor  the release counter — a public release is always X.Y.0
-#   dev    the internal iteration counter — 0 is public, > 0 is internal-only
+# `trust_product_version` below is a MIRROR, not an authority. Trust's version
+# has ONE authority: the root `Cargo.toml` `[workspace.package] version`, the key
+# `pub bump` edits and `pub version` reads. Never edit the number here by hand:
 #
-# The channel is DERIVED from the dev counter, never authored, so a version and
-# its channel cannot disagree. There are no `-preview` / `-rc` suffixes: the dev
-# counter already says "not public".
+#   pub bump trust --write                          # moves the authority
+#   python3 scripts/trust_version_sync.py --write   # moves every mirror with it
+#
+# `scripts/trust_version_sync.py --check` names any mirror that disagrees,
+# bootstrap refuses to build while `src/version` (and the crate manifests)
+# disagree, and `crates/trust-version`'s
+# `every_version_mirror_agrees_with_the_authority` test fails.
+#
+# The scheme is `publication/VERSIONING.md`'s: a release is `MAJOR.MINOR.0` and
+# the patch slot is ALWAYS 0. A dev build is identified by build metadata
+# (`MAJOR.MINOR.0-dev.<count>+g<sha>`), computed when the build is cut and never
+# written here. The channel `targo trust version` reports is DERIVED from the
+# bootstrap channel (`src/ci/channel`), never authored.
 schema_version = "trust.version-source.v2"
 product = "Trust"
 toolchain_alias = "trust"
-trust_product_version = "0.1.0"
+trust_product_version = "0.14.0"
 release_report_schema = "trust.release-report.v1"
 
 # The upstream revision Trust last merged. This is a record for compatibility
@@ -22,12 +29,12 @@ release_report_schema = "trust.release-report.v1"
 # `tests/upstream-rust/baseline.toml#upstream.revision` — the compatibility
 # ledger diffs against exactly this revision.
 [rust_alignment]
-rustc_version = "1.99.0"
-revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
-merged_on = "2026-07-08"
+rustc_version = "1.101.0"
+revision = "rust-lang/rust:cabb1ea4ced589dfee40c08aeffff3cac78af43b"
+merged_on = "2026-10-19"
 
 [schemas]
-version = "trust.version.v3"
+version = "trust.version.v4"
 release_report = "trust.release-report.v1"
 verifier_api = "trust.verifier-api.v1"
 verifier_run_manifest = "trust.verifier-run-manifest.v1"

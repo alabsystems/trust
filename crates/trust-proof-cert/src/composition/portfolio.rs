@@ -103,12 +103,21 @@ pub fn compose_certificates(
     method: CompositionMethod,
 ) -> ComposedCertificate {
     let mut hasher = Sha256::new();
-    hasher.update(format!("method:{method}|").as_bytes());
+    let method_str = match method {
+        CompositionMethod::Conjunction => "conjunction",
+        CompositionMethod::Disjunction => "disjunction",
+        CompositionMethod::Sequential => "sequential",
+    };
+    hasher.update(b"method:");
+    hasher.update(method_str.as_bytes());
+    hasher.update(b"|");
     for component in &components {
-        hasher.update(
-            format!("{}:{}:{}|", component.solver, component.strategy, component.proof_hash,)
-                .as_bytes(),
-        );
+        hasher.update(component.solver.as_bytes());
+        hasher.update(b":");
+        hasher.update(component.strategy.as_bytes());
+        hasher.update(b":");
+        hasher.update(component.proof_hash.as_bytes());
+        hasher.update(b"|");
     }
     let composed_hash = format!("{:x}", hasher.finalize());
 

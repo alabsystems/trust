@@ -38,7 +38,7 @@
           "schema_version": "trust.checked-certificate-readback-digest-entry.v1",
           "artifact_kind": "checked-certificate-readback",
           "digest_algorithm": "sha256",
-          "digest": "sha256:fde7ff75bc69ed97ce75158a5b0757fe91805bacdbe3a6e9418cd27dba574687",
+          "digest": "sha256:6ebe0af81954917584a9af6e3c18bc6c869ad70c6f26a6c82abc09e6953d0031",
           "candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "binary_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
           "selected_image": {

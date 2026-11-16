@@ -1,0 +1,316 @@
+{
+  "name": "guarded_range_sum",
+  "def_path": "zz_guard_sum::guarded_range_sum",
+  "span": {
+    "file": "h/zz_guard_sum.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 1,
+    "col_end": 91
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Le",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1000,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "h/zz_guard_sum.rs",
+                "line_start": 1,
+                "col_start": 45,
+                "line_end": 1,
+                "col_end": 54
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "h/zz_guard_sum.rs",
+              "line_start": 1,
+              "col_start": 45,
+              "line_end": 1,
+              "col_end": 54
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<u64>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          64
+                        ]
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "h/zz_guard_sum.rs",
+                "line_start": 1,
+                "col_start": 57,
+                "line_end": 1,
+                "col_end": 63
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<u64> as core::iter::traits::iterator::Iterator>::sum::<u64>",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "h/zz_guard_sum.rs",
+              "line_start": 1,
+              "col_start": 57,
+              "line_end": 1,
+              "col_end": 76
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 2959423433945328612,
+              "def_index": 10771,
+              "substs_digest": [
+                1651651263412283251,
+                1419321680684348548
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 2959423433945328612,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "h/zz_guard_sum.rs",
+                "line_start": 1,
+                "col_start": 86,
+                "line_end": 1,
+                "col_end": 87
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

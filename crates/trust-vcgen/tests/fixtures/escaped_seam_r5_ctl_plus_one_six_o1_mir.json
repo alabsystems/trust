@@ -1,0 +1,839 @@
+{
+  "name": "ctl_plus_one_six",
+  "def_path": "r5_pins::ctl_plus_one_six",
+  "span": {
+    "file": "r5_pins.rs",
+    "line_start": 13,
+    "col_start": 0,
+    "line_end": 13,
+    "col_end": 129
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 6
+              }
+            }
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "iter"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::ops::range::Range",
+                "fields": [
+                  [
+                    "start",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "end",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r5_pins.rs",
+                "line_start": 13,
+                "col_start": 57,
+                "line_end": 13,
+                "col_end": 60
+              }
+            }
+          },
+          {
+            "StorageLive": 2
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Constant": "OpaqueConst"
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "r5_pins.rs",
+              "line_start": 13,
+              "col_start": 75,
+              "line_end": 13,
+              "col_end": 84
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 10353,
+              "substs_digest": [
+                5745722422160505471,
+                13244169602595488977
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r5_pins.rs",
+                "line_start": 13,
+                "col_start": 75,
+                "line_end": 13,
+                "col_end": 84
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 2
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageLive": 4
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r5_pins.rs",
+                "line_start": 13,
+                "col_start": 75,
+                "line_end": 13,
+                "col_end": 84
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "r5_pins.rs",
+              "line_start": 13,
+              "col_start": 75,
+              "line_end": 13,
+              "col_end": 84
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 10534,
+              "substs_digest": [
+                5745722422160505471,
+                13244169602595488977
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "r5_pins.rs",
+                "line_start": 13,
+                "col_start": 75,
+                "line_end": 13,
+                "col_end": 84
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ],
+              [
+                1,
+                5
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "r5_pins.rs",
+              "line_start": 13,
+              "col_start": 75,
+              "line_end": 13,
+              "col_end": 84
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r5_pins.rs",
+                "line_start": 13,
+                "col_start": 66,
+                "line_end": 13,
+                "col_end": 71
+              }
+            }
+          },
+          {
+            "StorageLive": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 7,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r5_pins.rs",
+                "line_start": 13,
+                "col_start": 91,
+                "line_end": 13,
+                "col_end": 92
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5_pins.rs",
+                "line_start": 13,
+                "col_start": 87,
+                "line_end": 13,
+                "col_end": 96
+              }
+            }
+          },
+          {
+            "StorageDead": 8
+          },
+          {
+            "StorageLive": 9
+          },
+          {
+            "StorageLive": 10
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        6,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5_pins.rs",
+                "line_start": 13,
+                "col_start": 117,
+                "line_end": 13,
+                "col_end": 121
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 7,
+            "span": {
+              "file": "r5_pins.rs",
+              "line_start": 13,
+              "col_start": 117,
+              "line_end": 13,
+              "col_end": 121
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageDead": 3
+          },
+          {
+            "StorageDead": 2
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 7
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r5_pins.rs",
+                "line_start": 13,
+                "col_start": 117,
+                "line_end": 13,
+                "col_end": 121
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 0,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 10,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 9,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "r5_pins.rs",
+              "line_start": 13,
+              "col_start": 102,
+              "line_end": 13,
+              "col_end": 122
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 27313,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "StorageDead": 10
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r5_pins.rs",
+                "line_start": 13,
+                "col_start": 98,
+                "line_end": 13,
+                "col_end": 122
+              }
+            }
+          },
+          {
+            "StorageDead": 9
+          },
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 4
+          }
+        ],
+        "terminator": {
+          "Goto": 2
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,0 +1,12 @@
+note: Clean island kernel-checked: 13 declaration(s) registered (P, origin, shifted, odd } name, brace_char, close_char, quote_char, s1, raw1, raw2, h', h'_eq, after)
+  --> $DIR/clean_island_lexical_lean_bytes.rs:15:5
+   |
+LL | /     -- a line comment: it's got a "quote and a } brace
+LL | |     /- a block comment " } /- nested } -/ still the outer one -/
+LL | |     /-- a doc comment with a } -/
+LL | |     structure P where
+...  |
+LL | |     theorem h'_eq (h' : 0 = 0) : 0 = 0 := h'
+LL | |     def after : Nat := 2
+   | |________________________^
+

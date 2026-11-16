@@ -138,11 +138,20 @@ pub fn analyze_functions(functions: &[VerifiableFunction]) -> AnalysisResult {
     // All legacy summary/effect consumers below already understand ordinary
     // Call + Return.  Feed them the canonical semantic projection so TailCall
     // edges, results, effects, and exits participate in the same fixpoints.
-    let expanded_functions = functions
-        .iter()
-        .map(|func| func.with_tail_calls_expanded().into_owned())
-        .collect::<Vec<_>>();
-    let functions = expanded_functions.as_slice();
+    // Avoid cloning all functions when none contain a TailCall terminator.
+    let has_any_tail_call = functions.iter().any(|func| {
+        func.body.blocks.iter().any(|bb| matches!(bb.terminator, Terminator::TailCall { .. }))
+    });
+    let expanded_functions: Vec<VerifiableFunction>;
+    let functions = if has_any_tail_call {
+        expanded_functions = functions
+            .iter()
+            .map(|func| func.with_tail_calls_expanded().into_owned())
+            .collect();
+        expanded_functions.as_slice()
+    } else {
+        functions
+    };
 
     // Build call graph and detect cycles
     let graph = build_call_graph(functions);
@@ -151,8 +160,11 @@ pub fn analyze_functions(functions: &[VerifiableFunction]) -> AnalysisResult {
     let resolver = graph.callee_resolver();
 
     // Build a lookup from def_path to function
-    let func_map: FxHashMap<&str, &VerifiableFunction> =
-        functions.iter().map(|f| (f.def_path.as_str(), f)).collect();
+    let mut func_map: FxHashMap<&str, &VerifiableFunction> =
+        FxHashMap::with_capacity_and_hasher(functions.len(), Default::default());
+    for f in functions {
+        func_map.insert(f.def_path.as_str(), f);
+    }
 
     let mut store = SummaryStore::new();
     let mut all_vcs = Vec::new();
@@ -169,27 +181,10 @@ pub fn analyze_functions(functions: &[VerifiableFunction]) -> AnalysisResult {
         // recursive_verify path was removed with the trust_wp migration.
         let summary = summaries::compute_summary(func, &store, &resolver, is_recursive);
 
-        // Generate VCs for this function
-        let mut func_vcs = crate::generate_vcs(func);
-
-        // Record call-site summaries without injecting callee postconditions as
-        // global assumptions. `substitute_callee_summary` remains conservative
-        // until it has precise call-site substitution and dominance semantics.
-        for block in &func.body.blocks {
-            let callee_name = match &block.terminator {
-                Terminator::Call { func, .. } | Terminator::TailCall { func, .. } => func,
-                _ => continue,
-            };
-            if let Some(callee_path) = resolver.resolve(callee_name)
-                && let Some(callee_summary) = store.get(callee_path)
-                && callee_summary.has_postconditions()
-            {
-                func_vcs = func_vcs
-                    .into_iter()
-                    .map(|vc| summaries::substitute_callee_summary(vc, callee_summary))
-                    .collect();
-            }
-        }
+        // Generate VCs for this function. Call-site postcondition assumptions
+        // are handled via the establish-point versioning lane in modular_vcgen;
+        // `summaries::substitute_callee_summary` is an intentional identity fn.
+        let func_vcs = crate::generate_vcs(func);
 
         all_vcs.extend(func_vcs);
         store.insert(summary);
@@ -208,51 +203,36 @@ pub fn analyze_functions(functions: &[VerifiableFunction]) -> AnalysisResult {
 /// together. Within an SCC, order is deterministic but arbitrary.
 #[must_use]
 pub fn compute_verification_order(graph: &CallGraph) -> Vec<String> {
+    let n_nodes = graph.nodes.len();
+    if n_nodes == 0 {
+        return Vec::new();
+    }
+    if n_nodes == 1 {
+        return vec![graph.nodes[0].def_path.clone()];
+    }
+
+    // Sort nodes for deterministic output
+    let mut sorted_nodes: Vec<&str> = Vec::with_capacity(n_nodes);
+    sorted_nodes.extend(graph.nodes.iter().map(|n| n.def_path.as_str()));
+    sorted_nodes.sort_unstable();
+
+    if graph.edges.is_empty() {
+        return sorted_nodes.into_iter().map(str::to_string).collect();
+    }
+
     // Build adjacency list: caller -> [callee def_paths]
     let resolver = graph.callee_resolver();
-    let mut adj: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
-    for node in &graph.nodes {
-        adj.entry(node.def_path.as_str()).or_default();
-    }
+    let mut adj: FxHashMap<&str, Vec<&str>> =
+        FxHashMap::with_capacity_and_hasher(n_nodes, Default::default());
     for edge in &graph.edges {
         if let Some(callee) = resolver.resolve(&edge.callee) {
             adj.entry(edge.caller.as_str()).or_default().push(callee);
         }
     }
 
-    // Kahn's algorithm for topological sort (reverse: callees first).
-    // Compute in-degree for each node.
-    let mut in_degree: FxHashMap<&str, usize> = FxHashMap::default();
-    for node in &graph.nodes {
-        in_degree.entry(node.def_path.as_str()).or_insert(0);
-    }
-    for edges in adj.values() {
-        for &callee in edges {
-            *in_degree.entry(callee).or_insert(0) += 1;
-        }
-    }
-
-    // Start with nodes that have no incoming edges (leaf functions / no callers).
-    // We want callees first, so we reverse the graph: start from functions
-    // nobody calls (leaves), then add their callers.
-
-    // Reverse adjacency: callee -> [callers]
-    let mut rev_adj: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
-    for node in &graph.nodes {
-        rev_adj.entry(node.def_path.as_str()).or_default();
-    }
-    for (caller, callees) in &adj {
-        for &callee in callees {
-            rev_adj.entry(callee).or_default().push(caller);
-        }
-    }
-
-    // out-degree in the original graph = in-degree in reversed graph
-    // We want callees first, so use the original graph's out-degree
-    // Actually, let's use a simpler post-order DFS approach.
-
-    let mut visited: FxHashSet<&str> = FxHashSet::default();
-    let mut result: Vec<String> = Vec::new();
+    let mut visited: FxHashSet<&str> =
+        FxHashSet::with_capacity_and_hasher(n_nodes, Default::default());
+    let mut result: Vec<String> = Vec::with_capacity(n_nodes);
 
     // Post-order DFS: visit callees before callers
     fn dfs<'a>(
@@ -272,10 +252,6 @@ pub fn compute_verification_order(graph: &CallGraph) -> Vec<String> {
         result.push(node.to_string());
     }
 
-    // Sort nodes for deterministic output
-    let mut sorted_nodes: Vec<&str> = graph.nodes.iter().map(|n| n.def_path.as_str()).collect();
-    sorted_nodes.sort();
-
     for &node in &sorted_nodes {
         dfs(node, &adj, &mut visited, &mut result);
     }
@@ -294,21 +270,15 @@ pub fn compute_verification_order(graph: &CallGraph) -> Vec<String> {
 pub fn compute_summary(func: &VerifiableFunction) -> InterproceduralSummary {
     let mut summary = InterproceduralSummary::new(&func.name);
 
-    // Extract preconditions from contracts
-    for pre in &func.preconditions {
-        summary.base.preconditions.push(pre.clone());
-    }
-
-    // Extract postconditions from contracts
-    for post in &func.postconditions {
-        summary.base.postconditions.push(post.clone());
-    }
+    // Extract preconditions and postconditions from contracts
+    summary.base.preconditions.clone_from(&func.preconditions);
+    summary.base.postconditions.clone_from(&func.postconditions);
 
     // Note: Contract structs carry string bodies, not parsed formulas.
     // The parsed formulas are in func.preconditions and func.postconditions.
 
     // Analyze side effects from the function body
-    let mut writes = Vec::new();
+    let mut writes_refs: Vec<&str> = Vec::new();
     let mut may_panic = false;
     let mut has_calls = false;
 
@@ -322,10 +292,11 @@ pub fn compute_summary(func: &VerifiableFunction) -> InterproceduralSummary {
                         .body
                         .locals
                         .get(place.local)
+                        .filter(|d| d.index == place.local)
+                        .or_else(|| func.body.locals.iter().find(|d| d.index == place.local))
                         .and_then(|d| d.name.as_deref())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    writes.push(name);
+                        .unwrap_or("unknown");
+                    writes_refs.push(name);
                 }
             }
         }
@@ -345,8 +316,9 @@ pub fn compute_summary(func: &VerifiableFunction) -> InterproceduralSummary {
         }
     }
 
-    writes.sort();
-    writes.dedup();
+    writes_refs.sort_unstable();
+    writes_refs.dedup();
+    let writes: Vec<String> = writes_refs.into_iter().map(str::to_string).collect();
 
     summary.side_effects = SideEffects { writes, may_panic, may_diverge: has_calls };
 
@@ -552,6 +524,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let summary = compute_summary(&func);
@@ -586,6 +559,7 @@ mod tests {
             preconditions: vec![pre.clone()],
             postconditions: vec![post.clone()],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let summary = compute_summary(&func);
@@ -613,6 +587,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("callee"),
                         is_foreign: false,
                         func: "callee".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -630,6 +605,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let summary = compute_summary(&func);
@@ -847,6 +823,7 @@ mod tests {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],
@@ -893,6 +870,7 @@ mod tests {
             preconditions: pre,
             postconditions: post,
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

@@ -5,109 +5,6 @@
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-[patch.crates-io]
-# See the root manifest: memchr is first-party (crates/trust-memchr).
-memchr = { path = "../crates/trust-memchr" }
-rustc-hash = { path = "../first-party/ty/crates/tla-hash-fx" }
-rustc_version = { path = "../vendor/rustc_version_0_4_1" }
-
-[patch."https://github.com/alabsystems/trust-ir"]
-trust-ir = { path = "../first-party/trust-ir/crates/trust-ir" }
-trust-ir-build = { path = "../first-party/trust-ir/crates/trust-ir-build" }
-
-[patch."https://github.com/alabsystems/trust-ir.git"]
-trust-ir = { path = "../first-party/trust-ir/crates/trust-ir" }
-trust-ir-build = { path = "../first-party/trust-ir/crates/trust-ir-build" }
-
-[patch."ssh://git@github.com/alabsystems/trust-ir.git"]
-trust-ir = { path = "../first-party/trust-ir/crates/trust-ir" }
-trust-ir-build = { path = "../first-party/trust-ir/crates/trust-ir-build" }
-
-[patch."ssh://git@github.com:22/alabsystems/trust-ir.git"]
-trust-ir = { path = "../first-party/trust-ir/crates/trust-ir" }
-trust-ir-build = { path = "../first-party/trust-ir/crates/trust-ir-build" }
-
-[patch."https://github.com/alabsystems/ay"]
-ay = { path = "../first-party/ay/crates/ay" }
-ay-allsat = { path = "../first-party/ay/crates/ay-allsat" }
-ay-bindings = { path = "../first-party/ay/crates/ay-bindings" }
-ay-chc = { path = "../first-party/ay/crates/ay-chc" }
-ay-core = { path = "../first-party/ay/crates/ay-core" }
-ay-dpll = { path = "../first-party/ay/crates/ay-dpll" }
-ay-encode = { path = "../first-party/ay/crates/ay-encode" }
-ay-frontend = { path = "../first-party/ay/crates/ay-frontend" }
-ay-proof = { path = "../first-party/ay/crates/ay-proof" }
-ay-sat = { path = "../first-party/ay/crates/ay-sat" }
-ay-sys = { path = "../first-party/ay/crates/ay-sys" }
-ay-translate = { path = "../first-party/ay/crates/ay-translate" }
-
-[patch."https://github.com/alabsystems/ay.git"]
-ay = { path = "../first-party/ay/crates/ay" }
-ay-bindings = { path = "../first-party/ay/crates/ay-bindings" }
-ay-chc = { path = "../first-party/ay/crates/ay-chc" }
-ay-core = { path = "../first-party/ay/crates/ay-core" }
-ay-dpll = { path = "../first-party/ay/crates/ay-dpll" }
-ay-encode = { path = "../first-party/ay/crates/ay-encode" }
-ay-frontend = { path = "../first-party/ay/crates/ay-frontend" }
-ay-proof = { path = "../first-party/ay/crates/ay-proof" }
-ay-sys = { path = "../first-party/ay/crates/ay-sys" }
-ay-translate = { path = "../first-party/ay/crates/ay-translate" }
-
-[patch."ssh://git@github.com/alabsystems/ay.git"]
-ay = { path = "../first-party/ay/crates/ay" }
-ay-chc = { path = "../first-party/ay/crates/ay-chc" }
-
-[patch."ssh://git@github.com/alabsystems/trust-cg.git"]
-trust-cg-codegen = { path = "../first-party/trust-cg/crates/trust-cg-codegen" }
-trust-cg-ir = { path = "../first-party/trust-cg/crates/trust-cg-ir" }
-trust-cg-lower = { path = "../first-party/trust-cg/crates/trust-cg-lower" }
-trust-cg-opt = { path = "../first-party/trust-cg/crates/trust-cg-opt" }
-
-[patch."ssh://git@github.com/alabsystems/trust-vc"]
-trust-vc-merge-contract = { path = "../first-party/trust-vc/crates/trust-vc-merge-contract" }
-
-# Redirect the active clean.git dependency to the local submodule so
-# clean-kernel is built once. Optional/default-off clean packages are not
-# patched because they only create unused-patch lock churn in this graph.
-[patch."https://github.com/alabsystems/clean.git"]
-clean-kernel = { path = "../first-party/clean/crates/clean-kernel" }
-
-# independent Alethe checker) as a *Git* dependency behind its default-off
-# `carcara-verify` feature. Nothing here activates that feature today, so the
-# entry buys nothing in the current lockfile; it exists so that the day
-# something does, the edge cannot resolve to a Git source. A Git source in
-# *any* lockfile makes cargo materialize checkout/db state that the cargo-cache
-# materialization gate rejects, and this manifest's patch table is required to
-# match the root's regardless. Same byte-identical vendored rev the other
-# workspaces pin (ufmg-smite/carcara fecb4224def3c26f93a5d4f1804ecf58eb979650,
-# v1.1.0).
-
-[workspace]
-
-# The lint policy Trust-owned members inherit with `[lints] workspace = true`.
-# It exists so tightening the policy reaches every member from one place; the
-# opt-in itself is enforced by tidy's `workspace_lints` ratchet. Keep it in
-# step with the root workspace's table.
-[workspace.lints.rust]
-warnings = "warn"
-
-
-[profile.dev]
-debug = "line-tables-only"
-incremental = true
-split-debuginfo = "unpacked"
-
-[profile.dev.package."*"]
-debug = false
-
-[profile.test]
-debug = "line-tables-only"
-incremental = true
-split-debuginfo = "unpacked"
-
-[profile.test.package."*"]
-debug = false
-
 [features]
 default = []
 native-in-process = ["trust-mc-in-process", "trust-wp-in-process", "trust-vc-in-process"]
@@ -125,7 +22,7 @@ ay-certify = ["ay-backend", "trust-router/ay-certify"]
 
 [package]
 name = "targo-trust"
-version = "0.1.0"
+version = "0.14.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -139,37 +36,50 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+build_helper = { path = "../src/build_helper", features = ["machine-admission"] }
 glob = "0.3.3"
 getrandom = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+# Keep the XZ reader inside the release executable's runtime closure.
+lzma-sys = { version = "0.1.20", features = ["static"] }
 sha2 = "0.10"
+tar = { version = "0.4.46", default-features = false }
 tempfile = "3"
 toml = "0.8"
+xz2 = "0.1.7"
 trust-backprop = { path = "../crates/trust-backprop" }
 trust-binary-parse = { path = "../crates/trust-binary-parse" }
-trust-buildcache = { path = "../crates/trust-buildcache" }
 trust-strengthen = { path = "../crates/trust-strengthen" }
 trust-report = { path = "../crates/trust-report" }
 trust-lift = { path = "../crates/trust-lift", features = ["elf", "macho"] }
 trust-decompile = { path = "../crates/trust-decompile", features = ["elf", "macho", "trust-cg"] }
-trust-deps = { path = "../crates/trust-deps" }
 trust-clean = { path = "../crates/trust-clean" }
 # The pure-Lean front door checks `.lean` operands with the linked Clean CIC
 # kernel rather than a discovered `clean` binary, so no PATH state can turn an
 # unchecked file into a pass. Already in this graph through trust-router.
 trust-certify = { path = "../crates/trust-certify" }
+clean-elab = { path = "../first-party/clean/crates/clean-elab" }
+clean-kernel = { path = "../first-party/clean/crates/clean-kernel" }
+# Explicit diagnostic file-to-runtime-IR lane; no gated-library admission token.
+clean-compiler = { path = "../first-party/clean/crates/clean-compiler", features = ["runtime-lcnf", "trust-ir-backend"] }
+clean-parser = { path = "../first-party/clean/crates/clean-parser" }
+clean-olean = { path = "../first-party/clean/crates/clean-olean" }
+trust-clean-origin = { path = "../crates/trust-clean-origin" }
+trust-clean-ir = { path = "../crates/trust-clean-ir" }
+trust-clean-ir-gate = { path = "../crates/trust-clean-ir-gate" }
 trust-proof-cert = { path = "../crates/trust-proof-cert" }
 trust-release = { path = "../crates/trust-release" }
 trust-router = { path = "../crates/trust-router" }
 trust-symex = { path = "../crates/trust-symex" }
+trust-test-execution = { path = "../crates/trust-test-execution" }
 trust-types = { path = "../crates/trust-types" }
 # trust: the rewrite loop's convergence rule — one definition of converged /
 # stalled / regressed, shared with the verification loop crates.
 trust-convergence = { path = "../crates/trust-convergence" }
-trust-ir = { path = "../first-party/trust-ir/crates/trust-ir", default-features = false, features = ["serde"] }
-trust-ir-contract = { path = "../first-party/trust-ir/crates/trust-ir-contract" }
+trust-ir = { path = "../first-party/trust-ir/crates/trust-ir", default-features = false, features = ["serde", "binary"] }
+trust-ir-build = { path = "../first-party/trust-ir/crates/trust-ir-build" }
 trust-vcgen = { path = "../crates/trust-vcgen" }
 trust-version = { path = "../crates/trust-version" }
 trust-vc-bridge = { path = "../crates/trust-vc-bridge" }
@@ -177,8 +87,14 @@ trust-wp = { path = "../crates/trust-wp" }
 trust-verifier-api = { path = "../crates/trust-verifier-api" }
 trust-bmc = { path = "../crates/trust-bmc" }
 
+[target.'cfg(unix)'.dependencies]
+trust-qualification = { path = "../crates/trust-qualification" }
+trust-resource-controller = { path = "../crates/trust-resource-controller", features = ["client", "probe-scheduler"] }
+trust-resource-provenance = { path = "../crates/trust-resource-provenance" }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"
+trust-source-contract = { path = "../crates/trust-source-contract" }

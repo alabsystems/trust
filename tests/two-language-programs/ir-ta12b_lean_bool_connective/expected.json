@@ -1,0 +1,56 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta12b_lean_bool_connective",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (f344fb244 2026-09-21) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@7b9146ba2ab5 sha256:c9692ee58d31e864",
+  "clean": "first-party/clean@faf434b73aac sha256:a9d64ad7f7b7ccde",
+  "trust-cg": "first-party/trust-cg@3f79b19a3d7f sha256:f24a73c879facca4"
+ },
+ "ratchets": {
+  "a.lean.bool_connective.carried": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was `carried:neg:skipped:per-function validation refused the emitted trust-ir spelling: BinOpRequiresInteger { block: 0, op: \"not\", ty: \"bool\" }` \u2014 the Clean-origin producer spelled `Bool.not b` as `UnOp::Not` at scalar `bool`, which the trust-ir validator's `not` rule does not admit (integer / integer-vector / bool-vector only), so the join seam's per-function validation refused the body and `neg` was SKIPPED to a body-less declaration. WS5.13 (F-033, producer half) respells it in trust-ir's one Bool vocabulary: `Bool.not b` -> `bxor %b, true`, `&&`/`||` -> `band`/`bor` (all present at the recorded trust-ir pin, no pin move). `neg`, `conj` and `disj` now arrive as validated `Producer::Clean` bodies; the kernel-TV companion stays not-attempted for these rows (the MINT's `clean_reflect` denotation has no `bool` carrier and no `B*` rule; trust-ir-build's `clean_backend_tv` re-checker admits `Bool` at the current trust-ir pin, so the mint is the blocker), so they are tier `structural`, never certified by assumption."
+  },
+  "a.lean.bool_connective.emit": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_connective.exec": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was `exec:bodyless:@m::neg:skipped-clean-def` \u2014 the reference interpreter trapped at `@m::neg`, the body-less declaration the SKIPPED row left behind. With WS5.13's respell (`bxor %b, true`) the body is carried, and `program()` = neg(false) + 2*conj(true,true) + 4*disj(false,false) interprets to the native value."
+  },
+  "a.lean.bool_connective.native": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_connective.roundtrip": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was a text-PARSE refusal (roundtrip:text-parse:fn-name): the producer's entity names leave the bare-identifier alphabet (`m::dep_clamp`, `m::Pt<u8>`), and text had no spelling for them, so the module did not survive `bin -> text -> bin` at all. trust-ir now prints `@\"escaped\"` and `Parser::read_name` decodes it (WS4.3 identifier half), which closes the PARSE half. Reaching PASS also needed the TRANSPORT to stop canonicalizing: `trust-ir convert --to text` encoded through `format::canonical_checked`, which renumbers SSA values densely and reorders blocks before printing \u2014 a DECLARED rewrite that `text_losses` deliberately does not report, so a non-canonical module came back re-numbered with an EMPTY loss list. trust-ir bef296c7 adds `format::text_checked` (same refusal, module printed AS STORED) and points `convert` at it. MEASURED on this tree, as a control over the 24 producer-emitted modules this lane compiles: 10 of the 24 are NOT canonical, and `bin -> text -> bin` is byte-identical for 24/24 with `text_checked` but only 14/24 with canonicalize-first. So both halves were required and neither alone would have flipped this pin."
+  },
+  "a.lean.bool_connective.twin.codec.trailing": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_connective.twin.exec.mutant": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "New with the exec flip: the twin runner builds its execution mutant only when `program` runs (rc 0), and before WS5.13 it trapped at the body-less `@m::neg`, so this ratchet was never measured and the audit corpus has no row for it. It is the negative twin of `.exec`: a mutated module must change the interpreter's result, so the PASS above is not an interpreter that ignores the body."
+  },
+  "a.lean.bool_connective.twin.validate.site": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_connective.twin.validate.vararg": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_connective.validate": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

@@ -14,10 +14,11 @@
 //! for them, matching the incumbent, and `Value::from(f64::NAN)` is therefore
 //! `Value::Null`.
 
-use crate::ser::float::FloatBuffer;
-use crate::ser::int::IntBuffer;
 use core::fmt::{self, Debug, Display};
 use core::hash::{Hash, Hasher};
+
+use crate::ser::float::FloatBuffer;
+use crate::ser::int::IntBuffer;
 
 /// Represents a JSON number, whether integer or floating point.
 #[derive(Clone, PartialEq, Eq)]
@@ -135,11 +136,7 @@ impl Number {
     /// `None` — a JSON document has no spelling for them.
     #[must_use]
     pub fn from_f64(f: f64) -> Option<Number> {
-        if f.is_finite() {
-            Some(Number { n: N::Float(f) })
-        } else {
-            None
-        }
+        if f.is_finite() { Some(Number { n: N::Float(f) }) } else { None }
     }
 }
 

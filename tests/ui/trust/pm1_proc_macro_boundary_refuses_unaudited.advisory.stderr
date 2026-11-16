@@ -1,0 +1,4 @@
+warning: advisory lane: this unit forfeits proof authority: rustc loaded unaudited proc-macro crate `pm1_boundary_derive` ($TEST_BUILD_DIR/auxiliary/libpm1_boundary_derive.DYLIB) inside the verifying compiler (no-proc-macro TCB boundary, PM-1)
+
+warning: 1 warning emitted
+

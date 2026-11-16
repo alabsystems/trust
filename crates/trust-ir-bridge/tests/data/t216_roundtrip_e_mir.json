@@ -1,0 +1,357 @@
+{
+  "name": "roundtrip_e",
+  "def_path": "fixture::roundtrip_e",
+  "span": {
+    "file": "fixture.rs",
+    "line_start": 56,
+    "col_start": 0,
+    "line_end": 62,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": "Bool",
+        "name": "pick"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "fixture::E",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "A",
+                "discriminant": 5,
+                "fields": []
+              },
+              {
+                "name": "B",
+                "discriminant": 9,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 1,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "fixture.rs",
+              "line_start": 57,
+              "col_start": 15,
+              "line_end": 57,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "fixture::E",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "fixture::E"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "fixture.rs",
+                "line_start": 57,
+                "col_start": 22,
+                "line_end": 57,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "fixture::E",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "fixture::E"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "fixture.rs",
+                "line_start": 57,
+                "col_start": 36,
+                "line_end": 57,
+                "col_end": 40
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "fixture.rs",
+                "line_start": 58,
+                "col_start": 10,
+                "line_end": 58,
+                "col_end": 11
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                5,
+                6
+              ],
+              [
+                9,
+                5
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "fixture.rs",
+              "line_start": 58,
+              "col_start": 4,
+              "line_end": 58,
+              "col_end": 11
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      200,
+                      32
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "fixture.rs",
+                "line_start": 60,
+                "col_start": 16,
+                "line_end": 60,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 7
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      100,
+                      32
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "fixture.rs",
+                "line_start": 59,
+                "col_start": 16,
+                "line_end": 59,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 7
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 5
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 9
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

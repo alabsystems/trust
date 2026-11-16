@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# cargo-concurrency-cap.sh - Concurrency limiter for host cargo builds
+# cargo-concurrency-cap.sh - Concurrency limiter for host Cargo-shaped builds
 #
-# Limits concurrent host cargo build/check/test processes using a mkdir-based
-# semaphore, and explicitly caps each Cargo invocation's rustc job fanout.
-# Automatically monitors aggregate RSS of the Cargo process tree.
+# Limits concurrent build/check/test processes using a mkdir-based
+# semaphore, and explicitly caps each invocation's rustc job fanout.
+# Automatically monitors aggregate RSS of the process tree.
 # Works on macOS and Linux (no flock dependency).
 #
+# The driver is the Trust toolchain's `targo` (CLAUDE.md "Build"): name the lane
+# first, exactly as you would to targo itself.
+#
 # Usage:
-#   ./scripts/cargo-concurrency-cap.sh build --release
-#   ./scripts/cargo-concurrency-cap.sh test -p trust-vcgen
-#   ./scripts/cargo-concurrency-cap.sh check --all
+#   ./scripts/cargo-concurrency-cap.sh --unverified build --release
+#   ./scripts/cargo-concurrency-cap.sh --unverified test -p trust-vcgen
+#   ./scripts/cargo-concurrency-cap.sh trust check -p trust-types
 #
 # Environment:
 #   TRUST_MAX_CONCURRENT - Max parallel host Cargo processes (default: derived
@@ -19,6 +22,9 @@
 #   TRUST_LOCK_DIR       - Directory for lock files (default: /tmp/trust-cargo-locks)
 #   TRUST_LOCK_TIMEOUT   - Seconds to wait for a lock slot (default: 600)
 #   TRUST_RSS_MONITOR    - Set to "0" to disable RSS monitoring (default: enabled)
+#   TRUST_REAL_CARGO     - Driver to run (default: `targo` on PATH that accepts
+#                          --unverified). With no targo it refuses; there is no
+#                          stock-cargo fallback.
 #
 # Andrew Yates <andrewyates.name@gmail.com>
 # Copyright 2026 Andrew Yates
@@ -63,6 +69,13 @@ fi
 # Cargo's CLI --jobs overrides CARGO_BUILD_JOBS. Canonicalize positive job
 # arguments for the documented build/check/test commands so the cap cannot be
 # silently bypassed. Arguments after `cargo test --` belong to the test binary.
+# A leading Targo lane (`--unverified` or `trust`) is kept in front of the
+# subcommand so the job cap still applies to `targo --unverified build …`.
+CARGO_LANE=""
+if [[ "$NO_CARGO_ARGS" -eq 0 ]] && [[ "${1:-}" == "--unverified" || "${1:-}" == "trust" ]]; then
+    CARGO_LANE="$1"
+    shift
+fi
 CARGO_SUBCOMMAND="${1:-}"
 CARGO_ARGS=()
 PASSTHROUGH_ARGS=()
@@ -162,6 +175,9 @@ if [[ "$NO_CARGO_ARGS" -eq 0 ]] && [[ "$CARGO_SUBCOMMAND" =~ ^(build|check|test)
     # but empty array as an unbound variable under `set -u`. Append only when
     # non-empty so `cargo check` is as valid as `cargo check -p crate`.
     CARGO_LAUNCH_ARGS=("$CARGO_SUBCOMMAND" --jobs "$CARGO_JOBS")
+    if [[ -n "$CARGO_LANE" ]]; then
+        CARGO_LAUNCH_ARGS=("$CARGO_LANE" "${CARGO_LAUNCH_ARGS[@]}")
+    fi
     if [[ "${#CARGO_ARGS[@]}" -gt 0 ]]; then
         CARGO_LAUNCH_ARGS+=("${CARGO_ARGS[@]}")
     fi
@@ -176,27 +192,31 @@ elif [[ "$NO_CARGO_ARGS" -eq 0 ]]; then
     # than the documented build/check/test lanes still receive the environment
     # cap, but their argument ordering is left untouched for compatibility.
     CARGO_LAUNCH_ARGS=("$@")
+    if [[ -n "$CARGO_LANE" ]]; then
+        CARGO_LAUNCH_ARGS=("$CARGO_LANE" "${CARGO_LAUNCH_ARGS[@]}")
+    fi
 fi
 
 # Resolve paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MONITOR_SCRIPT="$SCRIPT_DIR/monitor-build-memory.sh"
 
-# Find host cargo
+# Find the driver: the Trust toolchain's targo, never stock cargo by default.
+# `--unverified --version` is the only discriminator that tells a real targo
+# from upstream cargo shipped under that name (CLAUDE.md).
 REAL_CARGO=""
 if [[ -n "${TRUST_REAL_CARGO:-}" ]] && [[ -x "${TRUST_REAL_CARGO}" ]]; then
     REAL_CARGO="$TRUST_REAL_CARGO"
 fi
 if [[ -z "$REAL_CARGO" ]]; then
-    for loc in "$HOME/.cargo/bin/cargo" /opt/homebrew/bin/cargo /usr/local/bin/cargo /usr/bin/cargo; do
-        if [[ -x "$loc" ]]; then
-            REAL_CARGO="$loc"
-            break
-        fi
-    done
+    targo_candidate="$(command -v targo 2>/dev/null || true)"
+    if [[ -n "$targo_candidate" ]] && "$targo_candidate" --unverified --version >/dev/null 2>&1; then
+        REAL_CARGO="$targo_candidate"
+    fi
 fi
 if [[ -z "$REAL_CARGO" ]]; then
-    echo "[cargo-cap] ERROR: Cannot find host cargo binary" >&2
+    echo "[cargo-cap] ERROR: no targo accepting --unverified on PATH; install or repair the" >&2
+    echo "[cargo-cap]        Trust toolchain (aterm pkg doctor). Stock cargo is never used." >&2
     exit 1
 fi
 
@@ -261,8 +281,8 @@ release_slot() {
 # --- Main ---
 
 if [[ "$NO_CARGO_ARGS" -eq 1 ]]; then
-    echo "Usage: cargo-concurrency-cap.sh <cargo-args...>" >&2
-    echo "  e.g.: cargo-concurrency-cap.sh build --release" >&2
+    echo "Usage: cargo-concurrency-cap.sh [--unverified|trust] <targo-args...>" >&2
+    echo "  e.g.: cargo-concurrency-cap.sh --unverified build --release" >&2
     echo "" >&2
     echo "Environment:" >&2
     echo "  TRUST_MAX_CONCURRENT=$MAX_CONCURRENT (host job budget=$HOST_JOB_BUDGET)" >&2
@@ -274,7 +294,7 @@ fi
 
 echo "[cargo-cap] Acquiring build slot (max concurrent: $MAX_CONCURRENT, jobs each: $CARGO_JOBS, host budget: $HOST_JOB_BUDGET)..." >&2
 SLOT=$(acquire_slot)
-printf '[cargo-cap] Acquired slot %s. Running host cargo:' "$SLOT" >&2
+printf '[cargo-cap] Acquired slot %s. Running:' "$SLOT" >&2
 printf ' %q' "$REAL_CARGO" "${CARGO_LAUNCH_ARGS[@]}" >&2
 printf '\n' >&2
 

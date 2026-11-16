@@ -123,9 +123,13 @@ build/
       debuginfo/
       ...
 
-    # Host tools (which are always compiled with the stage0 compiler)
-    # are stored here.
+    # Stage0-compiler tools driven by the current source-built Cargo.
     bootstrap-tools/
+
+    # Seed-Cargo prerequisites and the native Cargo producer use a separate
+    # stable cache domain: the immutable seed can predate the current Cargo's
+    # persisted fingerprint encoding. Compiler/recipe selection is unchanged.
+    bootstrap-seed-tools/
 
     # Location where the stage0 Cargo and inherited Rust compiler are unpacked. This
     # directory is purely an extracted and overlaid tarball of these two (done
@@ -226,9 +230,7 @@ encounter Trust bugs, please file issues on the [Trust issue tracker][trust-issu
 ## Testing
 
 To run bootstrap tests, execute `x test bootstrap`.
-If you want to bless snapshot tests,
-then install `cargo-insta` (`cargo install cargo-insta`),
-and then run `cargo insta review --manifest-path src/bootstrap/Cargo.toml`.
+If you want to bless snapshot tests, use `x test bootstrap --bless`.
 
 ## Changelog
 

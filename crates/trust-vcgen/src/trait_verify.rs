@@ -73,6 +73,13 @@ pub struct ImplContract {
 /// argument a free variable denotes.
 #[must_use]
 pub fn verify_liskov(trait_c: &TraitContract, impl_c: &ImplContract) -> Vec<VerificationCondition> {
+    if trait_c.preconditions.is_empty()
+        && trait_c.postconditions.is_empty()
+        && impl_c.preconditions.is_empty()
+        && impl_c.postconditions.is_empty()
+    {
+        return Vec::new();
+    }
     // A free variable in a source contract is bound by the declaring method's
     // parameter environment, not by its spelling alone. Until the formulas
     // are capture-avoidably canonicalized to positional binders, accepting
@@ -83,37 +90,32 @@ pub fn verify_liskov(trait_c: &TraitContract, impl_c: &ImplContract) -> Vec<Veri
         || trait_c.parameter_names != impl_c.parameter_names
         || !contract_binding_environment_is_well_formed(
             &trait_c.parameter_names,
-            trait_c.preconditions.iter().chain(&trait_c.postconditions),
-        )
-        || !contract_binding_environment_is_well_formed(
-            &impl_c.parameter_names,
-            impl_c.preconditions.iter().chain(&impl_c.postconditions),
+            trait_c
+                .preconditions
+                .iter()
+                .chain(&trait_c.postconditions)
+                .chain(&impl_c.preconditions)
+                .chain(&impl_c.postconditions),
         )
     {
-        return if trait_c.preconditions.is_empty()
-            && trait_c.postconditions.is_empty()
-            && impl_c.preconditions.is_empty()
-            && impl_c.postconditions.is_empty()
-        {
-            Vec::new()
-        } else {
-            vec![VerificationCondition {
-                kind: VcKind::Postcondition,
-                function: format!(
-                    "<{} as {}>::{} [unaligned contract binders]",
-                    impl_c.impl_type, trait_c.trait_name, impl_c.method
-                )
-                .into(),
-                location: SourceSpan::default(),
-                formula: Formula::Bool(true),
-                contract_metadata: None,
-                obligation: None,
-            }]
-        };
+        return vec![VerificationCondition {
+            kind: VcKind::Postcondition,
+            function: format!(
+                "<{} as {}>::{} [unaligned contract binders]",
+                impl_c.impl_type, trait_c.trait_name, impl_c.method
+            )
+            .into(),
+            location: SourceSpan::default(),
+            formula: Formula::Bool(true),
+            contract_metadata: None,
+            obligation: None,
+        }];
     }
 
     let mut vcs = Vec::new();
     let location = SourceSpan::default();
+    let fn_name_str = format!("<{} as {}>::{}", impl_c.impl_type, trait_c.trait_name, impl_c.method);
+    let fn_name: trust_types::Symbol = fn_name_str.as_str().into();
 
     // Build conjunctions of both precondition sets. Liskov contravariance is
     // one implication over the complete predicates:
@@ -123,23 +125,13 @@ pub fn verify_liskov(trait_c: &TraitContract, impl_c: &ImplContract) -> Vec<Veri
     // Iterating individual trait clauses is too strong when there are several
     // clauses, and emits no check at all for the unsound case where the trait
     // has no requirement but the impl adds one.
-    let trait_pre_conj = conjunction(&trait_c.preconditions);
-    let impl_pre_conj = conjunction(&impl_c.preconditions);
-
     if !trait_c.preconditions.is_empty() || !impl_c.preconditions.is_empty() {
+        let trait_pre_conj = conjunction(&trait_c.preconditions);
+        let impl_pre_conj = conjunction(&impl_c.preconditions);
         let implication = Formula::Implies(Box::new(trait_pre_conj), Box::new(impl_pre_conj));
         vcs.push(VerificationCondition {
-            kind: VcKind::Precondition {
-                callee: format!(
-                    "<{} as {}>::{}",
-                    impl_c.impl_type, trait_c.trait_name, trait_c.method
-                ),
-            },
-            function: format!(
-                "<{} as {}>::{}",
-                impl_c.impl_type, trait_c.trait_name, impl_c.method
-            )
-            .into(),
+            kind: VcKind::Precondition { callee: fn_name_str },
+            function: fn_name,
             location: location.clone(),
             formula: Formula::Not(Box::new(implication)),
             contract_metadata: None,
@@ -147,23 +139,28 @@ pub fn verify_liskov(trait_c: &TraitContract, impl_c: &ImplContract) -> Vec<Veri
         });
     }
 
-    // Build conjunction of all impl postconditions.
-    let impl_post_conj = conjunction(&impl_c.postconditions);
-
     // Postcondition covariance: impl_post_conj => trait_post
     // The impl must guarantee at least everything the trait promises.
     // We negate the implication to find violations: NOT(impl_post => trait_post)
-    for trait_post in &trait_c.postconditions {
-        let implication =
-            Formula::Implies(Box::new(impl_post_conj.clone()), Box::new(trait_post.clone()));
+    if let Some((last_post, head_posts)) = trait_c.postconditions.split_last() {
+        let impl_post_conj = conjunction(&impl_c.postconditions);
+        for trait_post in head_posts {
+            let implication =
+                Formula::Implies(Box::new(impl_post_conj.clone()), Box::new(trait_post.clone()));
+            vcs.push(VerificationCondition {
+                kind: VcKind::Postcondition,
+                function: fn_name,
+                location: location.clone(),
+                formula: Formula::Not(Box::new(implication)),
+                contract_metadata: None,
+                obligation: None,
+            });
+        }
+        let implication = Formula::Implies(Box::new(impl_post_conj), Box::new(last_post.clone()));
         vcs.push(VerificationCondition {
             kind: VcKind::Postcondition,
-            function: format!(
-                "<{} as {}>::{}",
-                impl_c.impl_type, trait_c.trait_name, impl_c.method
-            )
-            .into(),
-            location: location.clone(),
+            function: fn_name,
+            location,
             formula: Formula::Not(Box::new(implication)),
             contract_metadata: None,
             obligation: None,
@@ -188,16 +185,12 @@ pub fn liskov_contracts_have_exact_identity(
 ) -> bool {
     trait_c.method == impl_c.method
         && trait_c.parameter_names == impl_c.parameter_names
+        && trait_c.preconditions == impl_c.preconditions
+        && trait_c.postconditions == impl_c.postconditions
         && contract_binding_environment_is_well_formed(
             &trait_c.parameter_names,
             trait_c.preconditions.iter().chain(&trait_c.postconditions),
         )
-        && contract_binding_environment_is_well_formed(
-            &impl_c.parameter_names,
-            impl_c.preconditions.iter().chain(&impl_c.postconditions),
-        )
-        && trait_c.preconditions == impl_c.preconditions
-        && trait_c.postconditions == impl_c.postconditions
 }
 
 /// Check the public binder carrier before any formulas from it are compared.
@@ -211,7 +204,10 @@ fn contract_binding_environment_is_well_formed<'a>(
     parameter_names: &[String],
     formulas: impl Iterator<Item = &'a Formula>,
 ) -> bool {
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen: trust_types::fx::FxHashSet<&str> = trust_types::fx::FxHashSet::with_capacity_and_hasher(
+        parameter_names.len(),
+        Default::default(),
+    );
     for name in parameter_names {
         if !source_parameter_name_is_well_formed(name) || !seen.insert(name.as_str()) {
             return false;
@@ -222,9 +218,14 @@ fn contract_binding_environment_is_well_formed<'a>(
         }
     }
 
-    formulas
-        .flat_map(Formula::free_variables)
-        .all(|name| contract_free_variable_is_bound(&name, &seen))
+    for formula in formulas {
+        if !trust_types::all_free_variable_names(formula, &mut |name| {
+            contract_free_variable_is_bound(name, &seen)
+        }) {
+            return false;
+        }
+    }
+    true
 }
 
 fn source_parameter_name_is_well_formed(name: &str) -> bool {
@@ -247,7 +248,7 @@ fn source_parameter_name_is_well_formed(name: &str) -> bool {
 
 fn contract_free_variable_is_bound(
     name: &str,
-    parameters: &std::collections::BTreeSet<&str>,
+    parameters: &trust_types::fx::FxHashSet<&str>,
 ) -> bool {
     if return_place_derived_leaf(name) || parameter_derived_leaf(name, parameters) {
         return true;
@@ -271,7 +272,7 @@ fn return_place_derived_leaf(name: &str) -> bool {
         .any(|suffix| name.strip_suffix(suffix).is_some_and(return_place_derived_leaf))
 }
 
-fn parameter_derived_leaf(name: &str, parameters: &std::collections::BTreeSet<&str>) -> bool {
+fn parameter_derived_leaf(name: &str, parameters: &trust_types::fx::FxHashSet<&str>) -> bool {
     if parameters.contains(name) {
         return true;
     }

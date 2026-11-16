@@ -406,11 +406,11 @@ pub(crate) fn status_porcelain_v1(
 }
 
 /// Compare every tracked worktree path with `HEAD` through a fresh temporary
-/// index and isolated temporary object database. `git add --update` must
-/// Git-canonicalize and hash each tracked path because the fresh index has no
+/// index and isolated temporary object database. `git update-index --info-only`
+/// must Git-canonicalize and hash each tracked path because the fresh index has no
 /// reusable worktree stat data. The resulting index is then compared with
-/// `HEAD` by blob ID and mode; newly hashed blobs never enter the repository's
-/// object database. Attributes are sourced explicitly from `HEAD`, while
+/// `HEAD` by blob ID and mode, without writing the computed blobs. Attributes
+/// are sourced explicitly from `HEAD`, while
 /// repository-local attributes and clean filters are rejected separately by
 /// [`validate_status_authority`].
 ///
@@ -489,7 +489,52 @@ pub(crate) fn tracked_content_status_porcelain_v1(
         }
         None => ("--literal-pathspecs", None),
     };
-    let mut reindex = command_with_pathspec_mode(&root, pathspec_mode)?;
+    // Enumerate the same tracked pathspec through the fresh private index.
+    // NUL separation preserves literal names, including embedded newlines.
+    let mut inventory = command_with_pathspec_mode(&root, pathspec_mode)?;
+    inventory
+        .env("GIT_INDEX_FILE", &temporary_index)
+        .env("GIT_OBJECT_DIRECTORY", &temporary_objects)
+        .args(["ls-files", "-z", "--", "."]);
+    if let Some(excluded_pathspec) = excluded_pathspec.as_deref() {
+        inventory.arg(excluded_pathspec);
+    }
+    let inventory = bounded_process::output(
+        &mut inventory,
+        &format!("{context} tracked-content path inventory"),
+        MAX_INDEX_INVENTORY_BYTES,
+        timeout,
+    )?;
+    if !inventory.status.success() || !inventory.stderr.is_empty() {
+        return Err(format!("{context} tracked-content path inventory failed"));
+    }
+    if !inventory.stdout.is_empty() && inventory.stdout.last() != Some(&0) {
+        return Err(format!("{context} tracked-content path inventory was not NUL-terminated"));
+    }
+    let mut path_count = 0;
+    for record in inventory.stdout.split_inclusive(|byte| *byte == 0) {
+        let path = &record[..record.len() - 1];
+        path_count += 1;
+        if path.is_empty() || path.len() > MAX_INDEX_RECORD_BYTES || path_count > MAX_INDEX_ENTRIES
+        {
+            return Err(format!(
+                "{context} tracked-content path inventory exceeded its record bounds"
+            ));
+        }
+    }
+    let inventory_path = temporary.path().join("tracked-paths");
+    fs::write(&inventory_path, &inventory.stdout).map_err(|error| {
+        format!("{context} could not write the private path inventory: {error}")
+    })?;
+    let inventory_input = fs::File::open(&inventory_path)
+        .map_err(|error| format!("{context} could not open the private path inventory: {error}"))?;
+
+    let empty_inventory = inventory.stdout.is_empty();
+    let mut reindex = if empty_inventory {
+        command_with_pathspec_mode(&root, pathspec_mode)?
+    } else {
+        command(&root)?
+    };
     reindex
         .env("GIT_INDEX_FILE", &temporary_index)
         .env("GIT_OBJECT_DIRECTORY", &temporary_objects)
@@ -497,15 +542,21 @@ pub(crate) fn tracked_content_status_porcelain_v1(
         // diagnostics lets the commit-bound `text`/`eol` attributes define
         // canonical blob identity without writing a checkout or real index.
         .args(["-c", "core.safecrlf=false"])
-        .arg("--attr-source=HEAD")
-        .args(["add", "--update"]);
-    if let Some(excluded_pathspec) = excluded_pathspec.as_deref() {
-        reindex.args(["--", ".", excluded_pathspec]);
+        .arg("--attr-source=HEAD");
+    if empty_inventory {
+        // An empty HEAD and a nonempty HEAD whose paths are all excluded have
+        // different add --update outcomes. Preserve the original pathspec
+        // validation, including the empty-tree refusal, without guessing it.
+        reindex.args(["add", "--update", "--", "."]);
+        if let Some(excluded_pathspec) = excluded_pathspec.as_deref() {
+            reindex.arg(excluded_pathspec);
+        }
     } else {
-        reindex.args(["--", "."]);
+        reindex.args(["update-index", "--info-only", "--remove", "-z", "--stdin"]);
     }
-    let reindexed = bounded_process::output(
+    let reindexed = bounded_process::output_with_input_file(
         &mut reindex,
+        inventory_input,
         &format!("{context} tracked-content canonical reindex"),
         64 * 1024,
         TRACKED_CONTENT_TIMEOUT,
@@ -814,7 +865,7 @@ fn validate_submodules_recursive(
         let submodule = fs::canonicalize(&candidate).map_err(|error| {
             format!("{context} could not canonicalize submodule {}: {error}", candidate.display())
         })?;
-        if submodule.parent().is_none() || !submodule.starts_with(&root) {
+        if submodule.parent().is_none() || !submodule.starts_with(root) {
             return Err(format!(
                 "{context} submodule escapes its parent worktree: {}",
                 submodule.display()
@@ -1470,6 +1521,108 @@ mod tests {
         )
         .expect("content-authoritative status with explicit exclusion");
         assert!(with_exclusion.is_empty());
+    }
+
+    #[test]
+    fn empty_tree_refusal_and_fully_excluded_selection_keep_original_results() {
+        let repository = fixture_repo("controlled-git-empty-selection-");
+        let excluded = tracked_content_status_porcelain_v1(
+            repository.path(),
+            "fully excluded content",
+            Some("tracked.txt"),
+            64 * 1024,
+            Duration::from_secs(30),
+        )
+        .expect("excluding the sole tracked path is a valid empty selection");
+        assert!(excluded.is_empty());
+        let mut remove = command(repository.path()).expect("controlled Git");
+        assert!(
+            remove
+                .args(["rm", "--quiet", "tracked.txt"])
+                .status()
+                .expect("remove fixture")
+                .success()
+        );
+        let mut commit = command(repository.path()).expect("controlled Git");
+        assert!(
+            commit
+                .args([
+                    "-c",
+                    "user.name=Trust Tests",
+                    "-c",
+                    "user.email=trust-tests@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "empty tree",
+                ])
+                .status()
+                .expect("commit empty tree")
+                .success()
+        );
+        let error = tracked_content_status_porcelain_v1(
+            repository.path(),
+            "empty tree content",
+            None,
+            64 * 1024,
+            Duration::from_secs(30),
+        )
+        .expect_err("the original empty-tree pathspec refusal remains required");
+        assert!(error.contains("tracked-content canonical reindex"), "{error}");
+    }
+
+    #[test]
+    fn tracked_content_preserves_literal_names_through_file_stdin() {
+        let repository = fixture_repo("controlled-git-literal-input-");
+        let names =
+            ["space name", "line\nbreak", "tab\tname", "-leading", ":(glob)literal", "quote\"name"];
+        for name in names {
+            fs::write(repository.path().join(name), b"before\n").expect("write literal fixture");
+        }
+        let mut add = command(repository.path()).expect("controlled Git");
+        assert!(add.args(["add", "--"]).args(names).status().expect("stage names").success());
+        let mut commit = command(repository.path()).expect("controlled Git");
+        assert!(
+            commit
+                .args([
+                    "-c",
+                    "user.name=Trust Tests",
+                    "-c",
+                    "user.email=trust-tests@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "literal names",
+                ])
+                .status()
+                .expect("commit names")
+                .success()
+        );
+        for name in names {
+            fs::write(repository.path().join(name), b"after!\n").expect("change literal bytes");
+        }
+        // The API reports names from diff-index, whose quoting differs from
+        // status porcelain for spaces. Independently ask diff-files for the
+        // changed names against the unchanged real index at HEAD.
+        let expected = text(
+            repository.path(),
+            &["diff-files", "--name-only", "--no-ext-diff", "--no-textconv"],
+            "literal status control",
+            64 * 1024,
+            Duration::from_secs(30),
+        )
+        .expect("independent literal name control");
+        let expected = expected.lines().map(|path| format!(" M {path}")).collect::<Vec<_>>();
+        assert_eq!(expected.len(), names.len());
+        let actual = tracked_content_status_porcelain_v1(
+            repository.path(),
+            "literal content status",
+            None,
+            64 * 1024,
+            Duration::from_secs(30),
+        )
+        .expect("full-byte literal status");
+        assert_eq!(actual, expected);
     }
 
     #[test]

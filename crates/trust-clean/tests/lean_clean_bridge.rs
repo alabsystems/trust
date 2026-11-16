@@ -39,6 +39,70 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+/// Remove every on-disk copy of one logical olean module, wherever the manifest
+/// happens to place it, and report how many were removed.
+///
+/// The negative control below used to hard-code the SHARED path
+/// (`<dir>/TrustIr/Semantics/Arith.olean`). Schema v2 lets a module live there
+/// OR at `<dir>/platform/<triple>/TrustIr/Semantics/Arith.olean`, and which one
+/// it is is not a constant: `regen-trustir-oleans.sh` MIGRATES a module from
+/// shared to per-platform the moment one platform's bytes stop matching the
+/// vendored ones — which a trust-ir pin bump routinely causes. Measured on the
+/// b094459 bump: eleven modules migrated, `Semantics/Arith.olean` among them,
+/// and the control died in its own SETUP (`remove vendored olean: NotFound`)
+/// rather than testing anything. Loudly, which is the good case; the bad case
+/// is a variant of this that removes nothing and still "passes".
+///
+/// So the control removes every copy and asserts it removed at least one, and
+/// is therefore indifferent to the partition.
+fn remove_olean_everywhere(dir: &Path, logical_rel: &Path) -> usize {
+    let mut removed = 0;
+    let shared = dir.join(logical_rel);
+    if shared.is_file() {
+        std::fs::remove_file(&shared).expect("remove shared vendored olean");
+        removed += 1;
+    }
+    let platform_root = dir.join("platform");
+    if let Ok(entries) = std::fs::read_dir(&platform_root) {
+        for entry in entries {
+            let triple_dir = entry.expect("platform dir entry").path();
+            let candidate = triple_dir.join(logical_rel);
+            if candidate.is_file() {
+                std::fs::remove_file(&candidate).expect("remove per-platform vendored olean");
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// Flip the last byte of every on-disk copy of one logical olean module —
+/// shared or per-platform — and report how many copies were tampered.
+///
+/// The partition-indifferent twin of [`remove_olean_everywhere`], for the same
+/// reason: the tamper control hard-coded the SHARED `TrustIr/BinOp.olean`, and
+/// the regen at trust-ir 29744d5f (db512ae26a) migrated that module to
+/// per-platform (this platform's rebuilt bytes stopped matching the carried-
+/// forward ones), so the control died in its own setup with
+/// `read vendored olean: NotFound`.
+fn tamper_olean_everywhere(dir: &Path, logical_rel: &Path) -> usize {
+    let mut candidates = vec![dir.join(logical_rel)];
+    if let Ok(entries) = std::fs::read_dir(dir.join("platform")) {
+        for entry in entries {
+            candidates.push(entry.expect("platform dir entry").path().join(logical_rel));
+        }
+    }
+    let mut tampered = 0;
+    for victim in candidates.into_iter().filter(|path| path.is_file()) {
+        let mut bytes = std::fs::read(&victim).expect("read vendored olean");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&victim, bytes).expect("write tampered olean");
+        tampered += 1;
+    }
+    tampered
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "lean-clean-bridge-{tag}-{}-{}",
@@ -74,6 +138,8 @@ fn bridge_gate_default_on() {
     let mode = BridgeGateMode::Full;
     let config = BridgeGateConfig::locate(mode);
     let summary = run_bridge_gate(&config).expect("bridge gate must pass on shipped artifacts");
+    // Preserve every family's diagnostic if an earlier assertion fails.
+    eprintln!("bridge gate summary: {summary:#?}");
 
     // Shared invariants (both modes).
     assert!(summary.manifest_ok, "manifests verified");
@@ -84,7 +150,13 @@ fn bridge_gate_default_on() {
          bump regressed the bridge",
         summary.ops_pinned, summary.pinned
     );
-    assert_eq!(summary.trustir_recheck_fail, 0, "imported TrustIr constants recheck clean");
+    assert_eq!(summary.trustir_recheck_fail, 0, "safe replay and complete census have no fatal failures");
+    assert_eq!(
+        summary.trustir_recheck_seen,
+        summary.trustir_recheck_pass + summary.trustir_runtime_refused,
+        "every original roster entry is admitted safe or explicitly refused runtime"
+    );
+    assert!(summary.trustir_recheck_pass > 0, "mathematical declarations actually checked");
     assert_eq!(
         summary.modules_loaded, summary.manifest_files,
         "loaded module set == manifested artifact set"
@@ -133,8 +205,8 @@ fn bridge_gate_default_on() {
             assert!(summary.unop_unbridged[0].starts_with("CtPop:"));
 
             // semOverflowOp extension: VALUE bridged for all 6 (op ×
-            // signedness) combos; FLAG bridged for 5 of 6 (unsigned-Mul's
-            // flag is honestly un-bridged — no Lemma models it).
+            // signedness) combos; all six Int FLAG statements plus four actual
+            // registered unsigned-Mul predicate links. No BV equivalence claim.
             assert_eq!(
                 summary.overflow_value_pinned, 0,
                 "REGRESSION: {} Overflow VALUE arm(s) lost their agreement theorem: {:?}",
@@ -161,14 +233,15 @@ fn bridge_gate_default_on() {
                 summary.overflow_flag_pinned, summary.overflow_flag_pinned_list
             );
             assert_eq!(
-                summary.overflow_flag_bridged, 5,
-                "5 of 6 FLAG combos bridged (unsigned-Mul excluded)"
+                summary.overflow_flag_bridged, 6,
+                "all six generic Int FLAG combinations bridged"
             );
             assert_eq!(
                 summary.overflow_flag_bridged_list,
                 vec![
                     "AddOverflow[u]:Lemma 2 (unsigned-add overflow)",
                     "SubOverflow[u]:Lemma 8 (unsigned-sub underflow)",
+                    "MulOverflow[u]:#53 (unsigned-mul Int out-of-range)",
                     "AddOverflow[s]:Lemma 5 (signed add/sub/mul overflow)",
                     "SubOverflow[s]:Lemma 5 (signed add/sub/mul overflow)",
                     "MulOverflow[s]:Lemma 5 (signed add/sub/mul overflow)",
@@ -183,15 +256,21 @@ fn bridge_gate_default_on() {
                 "the composed `bridge_semOverflowOp_agreement_all` conjunction kernel-checks"
             );
             assert_eq!(
-                summary.overflow_fail_closed_controls, 2,
-                "both Overflow forgery probes rejected"
+                summary.overflow_fail_closed_controls, 5,
+                "all five Overflow claims rejected as qualified semantic mismatches"
             );
-            assert_eq!(
-                summary.overflow_flag_unbridged.len(),
-                1,
-                "unsigned MulOverflow is the one honest residue"
-            );
-            assert!(summary.overflow_flag_unbridged[0].starts_with("MulOverflow[unsigned]:"));
+            assert!(summary.overflow_flag_unbridged.is_empty());
+            assert_eq!(summary.overflow_umul_predicates_bound, vec![
+                "Trust.TrustIr.umulOverflowsU8", "Trust.TrustIr.umulOverflowsU16",
+                "Trust.TrustIr.umulOverflowsU32", "Trust.TrustIr.umulOverflowsU64",
+            ]);
+            assert_eq!(summary.overflow_umul_predicate_bridged, vec![
+                "bridge_overflow_umul_predicate_u8", "bridge_overflow_umul_predicate_u16",
+                "bridge_overflow_umul_predicate_u32", "bridge_overflow_umul_predicate_u64",
+            ]);
+            assert!(summary.overflow_umul_predicate_pinned.is_empty());
+            assert_eq!(summary.overflow_umul_foundational_axioms, vec!["propext"]);
+            assert_eq!(summary.overflow_foundational_axioms, vec!["propext"]);
 
             // semICmp extension: all 10 comparison arms bridged (unconditional
             // rfl agreements) — no honest residue (signed arms agree at the
@@ -266,7 +345,8 @@ fn bridge_gate_default_on() {
             );
             assert!(
                 summary.cast_composed,
-                "the composed `bridge_semCast_agreement_all` conjunction kernel-checks"
+                "the composed `bridge_semCast_agreement_all` conjunction kernel-checks: {:?}",
+                summary.cast_pinned
             );
             assert_eq!(
                 summary.cast_fail_closed_controls, 3,
@@ -274,32 +354,29 @@ fn bridge_gate_default_on() {
             );
             assert_eq!(summary.cast_unbridged.len(), 14, "the 14 non-integer CastOp variants");
 
-            // stepInst .BinOp extension: the FIRST statement/instruction-level
-            // agreement — the monadic READ->COMPUTE->WRITE chain of stepInst
-            // dispatching a .BinOp instruction (Add/Sub/Mul), connected via
-            // Eq.trans/congrArg to the ALREADY-BRIDGED bridge_add/bridge_sub/
-            // bridge_mul (reused, not re-proven). The other 15 semIntBinOp ops
-            // reachable through this same stepInst arm, and the other 56 (of
-            // 57) Inst variant categories, are honestly un-chained.
+            // Seven integer arithmetic arms compose their original value proofs
+            // with the shared exact-state transport. Division/remainder retain
+            // nonzero and signed-overflow premises; the other 11 value-bridged
+            // BinOps remain uncomposed at the instruction boundary.
             assert_eq!(
                 summary.stepinst_binop_pinned, 0,
                 "REGRESSION: {} stepInst-BinOp arm(s) lost their agreement theorem: {:?}",
                 summary.stepinst_binop_pinned, summary.stepinst_binop_pinned_list
             );
-            assert_eq!(summary.stepinst_binop_bridged, 3, "all 3 stepInst-BinOp arms bridged");
-            assert_eq!(summary.stepinst_binop_bridged_list, vec!["Add", "Sub", "Mul"]);
+            assert_eq!(summary.stepinst_binop_bridged, 7, "all seven checked stepInst-BinOp arms bridged");
+            assert_eq!(summary.stepinst_binop_bridged_list, vec!["Add", "Sub", "Mul", "UDiv", "SDiv", "URem", "SRem"]);
             assert!(
                 summary.stepinst_binop_composed,
                 "the composed `bridge_stepInst_binop_agreement_all` conjunction kernel-checks"
             );
             assert_eq!(
-                summary.stepinst_binop_fail_closed_controls, 2,
-                "both stepInst-BinOp forgery probes rejected (wrong-op-agreement, swapped-operand)"
+                summary.stepinst_binop_fail_closed_controls, 13,
+                "all original and division/remainder state/guard/identity probes semantically rejected"
             );
             assert_eq!(
                 summary.stepinst_binop_unbridged.len(),
                 1,
-                "the other 15 semIntBinOp ops are grouped in one honest-residue entry"
+                "the other 11 semIntBinOp ops remain explicitly unbridged"
             );
             assert_eq!(
                 summary.stepinst_categories_unbridged.len(),
@@ -593,12 +670,17 @@ fn bridge_gate_default_on() {
             );
             assert!(
                 !summary.overflow_composed,
-                "composed Overflow theorem needs all 11 arms (Full only)"
+                "composed Overflow theorem needs all twelve statements and four predicate links (Full only)"
             );
             assert_eq!(
                 summary.overflow_fail_closed_controls, 1,
                 "one Overflow forgery probe rejected"
             );
+            assert!(summary.overflow_umul_predicates_bound.is_empty());
+            assert!(summary.overflow_umul_predicate_bridged.is_empty());
+            assert!(summary.overflow_umul_predicate_pinned.is_empty());
+            assert!(summary.overflow_umul_foundational_axioms.is_empty());
+            assert_eq!(summary.overflow_foundational_axioms, vec!["propext"]);
 
             assert_eq!(summary.icmp_ops_bridged, 3, "spot ICmp set: Ult[u], Eq[eq], Slt[s]");
             assert_eq!(summary.icmp_bridged, vec!["Eq[eq]", "Ult[u]", "Slt[s]"]);
@@ -934,12 +1016,10 @@ fn bridge_gate_tampered_olean_fails_closed() {
     let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
     let tampered = temp_dir("tampered");
     copy_dir(&config.trustir_olean_dir, &tampered);
-    // Flip bytes in one vendored artifact; its manifest sha no longer matches.
-    let victim = tampered.join("TrustIr").join("BinOp.olean");
-    let mut bytes = std::fs::read(&victim).expect("read vendored olean");
-    let last = bytes.len() - 1;
-    bytes[last] ^= 0xFF;
-    std::fs::write(&victim, bytes).expect("write tampered olean");
+    // Flip bytes in one vendored module, wherever the manifest partitions it;
+    // its manifest sha no longer matches on any platform.
+    let copies = tamper_olean_everywhere(&tampered, Path::new("TrustIr/BinOp.olean"));
+    assert!(copies >= 1, "the tamper control must tamper at least one vendored copy");
 
     let commit = manifest_commit(&config.trustir_olean_dir);
     let tampered_config = BridgeGateConfig {
@@ -1008,8 +1088,15 @@ fn bridge_gate_missing_olean_fails_closed() {
     let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
     let broken = temp_dir("missing");
     copy_dir(&config.trustir_olean_dir, &broken);
-    std::fs::remove_file(broken.join("TrustIr").join("Semantics").join("Arith.olean"))
-        .expect("remove vendored olean");
+    let removed = remove_olean_everywhere(
+        &broken,
+        &Path::new("TrustIr").join("Semantics").join("Arith.olean"),
+    );
+    assert!(
+        removed > 0,
+        "the control must actually remove the artifact it is about to miss; removing nothing \
+         would make this test pass for the wrong reason",
+    );
 
     let commit = manifest_commit(&config.trustir_olean_dir);
     let broken_config = BridgeGateConfig {
@@ -1030,9 +1117,19 @@ fn bridge_gate_missing_olean_fails_closed() {
 /// = stale semantics; the gate is meaningless against the wrong pin).
 #[test]
 fn bridge_gate_pin_drift_fails_closed() {
+    let base = BridgeGateConfig::locate(BridgeGateMode::Spot);
+    let legacy = temp_dir("legacy-pin-drift");
+    copy_dir(&base.trustir_olean_dir, &legacy);
+    // Preserve the original exact-pin refusal independently of the optional
+    // source-reuse lane now shipped by the real manifest.
+    let path = legacy.join("MANIFEST.toml");
+    let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    doc.as_table_mut().unwrap().remove("source_reuse");
+    std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
     let config = BridgeGateConfig {
+        trustir_olean_dir: legacy.clone(),
         expected_trustir_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
-        ..BridgeGateConfig::locate(BridgeGateMode::Spot)
+        ..base
     };
     let err = run_bridge_gate(&config).expect_err("pin drift must fail closed");
     match err {
@@ -1041,18 +1138,62 @@ fn bridge_gate_pin_drift_fails_closed() {
         }
         other => panic!("expected PinDrift, got: {other:?}"),
     }
+    std::fs::remove_dir_all(legacy).unwrap();
 }
 
-/// POSITIVE PIN CONTROL — the shipped manifest's commit IS the checked-out
-/// first-party/trust-ir submodule (resolved via git, no override): the same
-/// resolution path the default gate run uses.
+#[test]
+fn bridge_gate_expected_pin_cannot_authorize_source_reuse() {
+    let base = BridgeGateConfig::locate(BridgeGateMode::Spot);
+    let fixture = temp_dir("expected-pin-reuse");
+    copy_dir(&base.trustir_olean_dir, &fixture);
+    let path = fixture.join("MANIFEST.toml");
+    let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    let recorded = manifest_commit(&fixture);
+    let clean = doc["provenance"]["clean_commit"].as_str().unwrap();
+    let output = std::process::Command::new("git")
+        .args(["--no-replace-objects", "-C"]).arg(&base.repo_root)
+        .args(["rev-parse", "HEAD"]).output().unwrap();
+    assert!(output.status.success());
+    let anchor = String::from_utf8(output.stdout).unwrap();
+    let anchor = anchor.trim();
+    assert_eq!(anchor.len(), 40);
+    // A deliberately unauthenticated record exercises the override refusal
+    // with both freshly regenerated and reused shipped artifacts. This data
+    // cannot establish source equality and must be refused before any reuse.
+    let record: toml::Value = format!(
+        "schema = \"trust.bridge-source-reuse.v1\"\nanchor_commit = \"{anchor}\"\n\
+         selected_trustir_commit = \"{recorded}\"\nselected_clean_commit = \"{clean}\"\n"
+    ).parse().unwrap();
+    doc.as_table_mut().unwrap().insert("source_reuse".to_owned(), record);
+    std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+    let config = BridgeGateConfig {
+        trustir_olean_dir: fixture.clone(),
+        expected_trustir_commit: Some(recorded),
+        ..base
+    };
+    let error = run_bridge_gate(&config).expect_err("a pin string cannot establish source input equality");
+    assert!(matches!(error, BridgeGateError::PinUnresolvable { detail } if detail.contains("expected-pin override")));
+    std::fs::remove_dir_all(fixture).unwrap();
+}
+
+/// The selected context names the real checkout. Original producer stamps
+/// remain original when the complete source-reuse lane is used. The full
+/// default-on test independently checks that lane and all mathematical work.
 #[test]
 fn bridge_gate_manifest_commit_matches_checkout() {
     let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
     let recorded = manifest_commit(&config.trustir_olean_dir);
     assert_eq!(recorded.len(), 40, "manifest records a full commit sha");
-    // The default-on gate (bridge_gate_default_on, expected_trustir_commit =
-    // None) already fails on drift; here we assert the recorded value is a
-    // well-formed pin so the comparison is never vacuous.
     assert!(recorded.chars().all(|c| c.is_ascii_hexdigit()));
+    let doc: toml::Value = std::fs::read_to_string(config.trustir_olean_dir.join("MANIFEST.toml"))
+        .unwrap().parse().unwrap();
+    let selected = doc.get("source_reuse")
+        .and_then(|record| record.get("selected_trustir_commit"))
+        .and_then(toml::Value::as_str).unwrap_or(&recorded);
+    let output = std::process::Command::new("git")
+        .args(["--no-replace-objects", "-C"])
+        .arg(config.repo_root.join("first-party/trust-ir"))
+        .args(["rev-parse", "HEAD"]).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(selected, String::from_utf8(output.stdout).unwrap().trim());
 }

@@ -6,7 +6,7 @@ drives the stage2 `trustc` over a fixture per confirmed soundness/fail-safe bug
 family (2026-07-22 audit) plus a positive case, and asserts the same-answers +
 fail-safe contract. Run after `x.py build --stage 2`:
 
-    TRUST_SEED_STAIRCASE=1 python3 tests/trust-witness/replay_regression.py
+    python3 tests/trust-witness/replay_regression.py
 
 Contract per fixture:
   * same-answers: warm replay's emitted rmeta+obj are BYTE-IDENTICAL to a
@@ -28,10 +28,24 @@ Contract per fixture:
 import subprocess, os, sys, hashlib, glob, re, shutil
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-TRUSTC = os.environ.get(
-    "TRUST_WITNESS_TRUSTC",
-    os.path.join(REPO, "build", "host", "stage2", "bin", "trustc"),
-)
+def _resolve_trustc():
+    """TRUST_WITNESS_TRUSTC if set; else the stage2 build; else trustc on PATH; else refuse."""
+    override = os.environ.get("TRUST_WITNESS_TRUSTC")
+    if override:
+        return override
+    stage2 = os.path.join(REPO, "build", "host", "stage2", "bin", "trustc")
+    if os.path.exists(stage2):
+        return stage2
+    on_path = shutil.which("trustc")
+    if on_path:
+        return on_path
+    sys.exit(
+        "REFUSED: no trustc — set TRUST_WITNESS_TRUSTC or put the trust channel's "
+        "trustc on PATH; build/host/stage2/bin/trustc is absent"
+    )
+
+
+TRUSTC = _resolve_trustc()
 FIX = os.path.join(REPO, "tests", "trust-witness", "fixtures")
 WORK = os.path.join(REPO, "build", "trust-witness-regression")
 
@@ -61,7 +75,6 @@ def diagnostics_only(stderr):
 def run(args, outdir, store_flag=None, stats=False):
     os.makedirs(outdir, exist_ok=True)
     env = dict(os.environ)
-    env["TRUST_SEED_STAIRCASE"] = "1"
     if stats:
         env["TRUST_WITNESS_STATS"] = "1"
     cmd = [TRUSTC] + BASE + (["--out-dir", outdir])

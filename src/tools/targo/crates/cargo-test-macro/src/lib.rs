@@ -36,7 +36,8 @@ use std::sync::LazyLock;
 ///   A `reason` field is required to explain why it is nightly-only.
 /// * `requires = "<cmd>"` --- This indicates a command that is required to be installed to be run.
 ///   For example, `requires = "rustfmt"` means the test will only run if the executable `rustfmt` is installed.
-///   These tests are *always* run on CI.
+///   These tests are run in Cargo's CI when CARGO_TEST_REQUIRE_EXTERNAL_TOOLS is set.
+///   Other environments, including rust-lang/rust's CI, ignore the test when the command is unavailable.
 ///   This is mainly used to avoid requiring contributors from having every dependency installed.
 /// * `requires_host_split_debuginfo = "<value>"` --- This indicates a `-Csplit-debuginfo` value
 ///   that is required to be supported by the host `rustc`.
@@ -141,10 +142,7 @@ pub fn cargo_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     panic!("expect a string literal, found: {command}");
                 };
                 let literal = literal.to_string();
-                let Some(command) = literal
-                    .strip_prefix('"')
-                    .and_then(|lit| lit.strip_suffix('"'))
-                else {
+                let Some(command) = literal.strip_circumfix('"', '"') else {
                     panic!("expect a quoted string literal, found: {literal}");
                 };
                 set_ignore!(!has_command(command), "{command} not installed");
@@ -155,10 +153,7 @@ pub fn cargo_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     panic!("expect a string literal, found: {split_debuginfo}");
                 };
                 let literal = literal.to_string();
-                let Some(split_debuginfo) = literal
-                    .strip_prefix('"')
-                    .and_then(|lit| lit.strip_suffix('"'))
-                else {
+                let Some(split_debuginfo) = literal.strip_circumfix('"', '"') else {
                     panic!("expect a quoted string literal, found: {literal}");
                 };
                 set_ignore!(
@@ -293,8 +288,21 @@ fn to_token_stream(code: &str) -> TokenStream {
     code.parse().unwrap()
 }
 
+// Trust: capability probes use the same explicitly selected compiler as the
+// build. A malformed explicit selection must fail rather than fall back to PATH.
+fn compiler_command() -> Command {
+    // Trust: this test proc-macro runs inside the compiler, without Cargo's
+    // Config. Read the compiler's actual selection, as with the PATH probe below.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test compiler probe has no Cargo Config"
+    )]
+    let selected_compiler = std::env::var_os("RUSTC");
+    Command::new(selected_compiler.unwrap_or_else(|| "rustc".into()))
+}
+
 static VERSION: std::sync::LazyLock<(u32, bool)> = LazyLock::new(|| {
-    let output = Command::new("rustc")
+    let output = compiler_command()
         .arg("-V")
         .output()
         .expect("rustc should run");
@@ -342,7 +350,7 @@ fn version() -> (u32, bool) {
 
 fn host_supports_split_debuginfo(split_debuginfo: &str) -> bool {
     static SPLIT_DEBUGINFO: LazyLock<Vec<String>> = LazyLock::new(|| {
-        let output = Command::new("rustc")
+        let output = compiler_command()
             .arg("--print=split-debuginfo")
             .output()
             .expect("rustc should run");
@@ -374,11 +382,7 @@ fn check_command(command_path: &Path, args: &[&str]) -> bool {
     let output = match command.output() {
         Ok(output) => output,
         Err(e) => {
-            // * hg is not installed on GitHub macOS or certain constrained
-            //   environments like Docker. Consider installing it if Cargo
-            //   gains more hg support, but otherwise it isn't critical.
-            // * lldb is not pre-installed on Ubuntu and Windows, so skip.
-            if is_ci() && !matches!(command_name.as_str(), "hg" | "lldb") {
+            if is_ci() {
                 panic!("expected command `{command_name}` to be somewhere in PATH: {e}",);
             }
             return false;
@@ -404,7 +408,7 @@ fn has_command(command: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&paths)
+    let found = std::env::split_paths(&paths)
         .flat_map(|path| {
             let candidate = path.join(&command);
             let with_exe = if EXE_EXTENSION.is_empty() {
@@ -415,7 +419,14 @@ fn has_command(command: &str) -> bool {
             std::iter::once(candidate).chain(with_exe)
         })
         .find(|p| is_executable(p))
-        .is_some()
+        .is_some();
+    // * hg is not installed on GitHub macOS or certain constrained
+    //   environments like Docker. Consider installing it if Cargo
+    //   gains more hg support, but otherwise it isn't critical.
+    if !found && requires_external_tools() && command != "hg" {
+        panic!("expected command `{command}` to be somewhere in PATH");
+    }
+    found
 }
 
 #[cfg(unix)]
@@ -454,4 +465,48 @@ fn is_ci() -> bool {
     // `tracked_env` will handle changes, but not require rebuilding the macro
     // itself like option_env does.
     option_env!("CI").is_some() || option_env!("TF_BUILD").is_some()
+}
+
+/// Whether to enforce external tools (`requires=<tool>`) availability.
+fn requires_external_tools() -> bool {
+    option_env!("CARGO_TEST_REQUIRE_EXTERNAL_TOOLS").is_some()
+}
+
+// Trust: the actual selected compiler must work even when PATH has no rustc.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_compiler_probes_do_not_require_path_rustc() {
+        const ACTOR: &str = "TRUST_TEST_MACRO_COMPILER_ACTOR";
+        const MARKER: &str = "selected compiler probes completed";
+        if std::env::var_os(ACTOR).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            assert!(version().0 > 0);
+            assert!(host_supports_split_debuginfo("off"));
+            println!("{MARKER}");
+            return;
+        }
+        let compiler =
+            std::env::var_os("RUSTC").expect("test requires its actual selected compiler");
+        let executable = std::env::current_exe().unwrap();
+        let output = Command::new(&executable)
+            .args([
+                "--exact",
+                "tests::selected_compiler_probes_do_not_require_path_rustc",
+                "--nocapture",
+            ])
+            .env(ACTOR, "1")
+            .env("RUSTC", compiler)
+            .env("PATH", executable.join("no-path-compiler"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "compiler probe actor failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(MARKER));
+    }
 }

@@ -1,0 +1,426 @@
+{
+  "name": "bug_c9_mut_union",
+  "def_path": "probes::bug_c9_mut_union",
+  "span": {
+    "file": "src/probes.rs",
+    "line_start": 62,
+    "col_start": 0,
+    "line_end": 62,
+    "col_end": 118
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "y"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "probes::U32I32",
+            "fields": [
+              [
+                "a",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "b",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Union"
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": "Never",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "probes::U32I32",
+                      "variant": 0,
+                      "active_field": 1,
+                      "args": "probes::U32I32"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "src/probes.rs",
+                "line_start": 62,
+                "col_start": 61,
+                "line_end": 62,
+                "col_end": 76
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "src/probes.rs",
+                "line_start": 62,
+                "col_start": 91,
+                "line_end": 62,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "src/probes.rs",
+                "line_start": 62,
+                "col_start": 78,
+                "line_end": 62,
+                "col_end": 96
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ge",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "src/probes.rs",
+                "line_start": 62,
+                "col_start": 106,
+                "line_end": 62,
+                "col_end": 112
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "src/probes.rs",
+              "line_start": 62,
+              "col_start": 106,
+              "line_end": 62,
+              "col_end": 112
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "src/probes.rs",
+                "line_start": 62,
+                "col_start": 115,
+                "line_end": 62,
+                "col_end": 116
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::panicking::panic",
+            "args": [
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      97,
+                      115,
+                      115,
+                      101,
+                      114,
+                      116,
+                      105,
+                      111,
+                      110,
+                      32,
+                      102,
+                      97,
+                      105,
+                      108,
+                      101,
+                      100,
+                      58,
+                      32,
+                      121,
+                      32,
+                      62,
+                      61,
+                      32,
+                      48
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": null,
+            "span": {
+              "file": "src/probes.rs",
+              "line_start": 62,
+              "col_start": 98,
+              "line_end": 62,
+              "col_end": 113
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 6692626837626329215,
+              "def_index": 11823,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 6692626837626329215,
+              "krate_name": "core"
+            }
+          }
+        }
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "y",
+                "Int"
+              ]
+            },
+            {
+              "Int": -2147483648
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "y",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2147483647
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

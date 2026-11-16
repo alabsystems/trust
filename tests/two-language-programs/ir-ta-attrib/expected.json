@@ -1,0 +1,23 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta-attrib",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (f344fb244 2026-09-21) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@7b9146ba2ab5 sha256:c9692ee58d31e864",
+  "clean": "first-party/clean@faf434b73aac sha256:a9d64ad7f7b7ccde",
+  "trust-cg": "first-party/trust-cg@3f79b19a3d7f sha256:f24a73c879facca4"
+ },
+ "ratchets": {
+  "a.format.text_parser_utf8": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was `text_parser_utf8:exit=101:panic-in-parser.rs` \u2014 the text parser PANICKED (exit 101) on a multi-byte character inside a comment, which is a crash, not a refusal: it cannot be told apart from a tool that is simply broken, and a crash on attacker-shaped input is never an acceptable resting state for a parser. It now returns rc=0 on the same input. NOT attributed to a single trust-ir commit: this pin had not been ratcheted across a range of parser work, and what this tree measures is the flip."
+  },
+  "a.format.unop_not_bool": {
+   "verdict": "GAP",
+   "class": "format-gap",
+   "signature": "unop_not_bool:BinOpRequiresInteger:op=not",
+   "audit": "GAP"
+  }
+ }
+}

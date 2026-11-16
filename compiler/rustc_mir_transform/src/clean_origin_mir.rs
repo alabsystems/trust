@@ -86,14 +86,16 @@ use rustc_data_structures::thin_vec::ThinVec;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::IndexVec;
 use rustc_middle::mir::interpret::Scalar;
+use rustc_middle::mir::trust_purity::TrustPurityFact;
+use rustc_middle::mir::visit::{PlaceContext, Visitor};
 use rustc_middle::mir::{
     BasicBlock, BasicBlockData, BinOp, Body, BorrowKind, CallSource, ClearCrossCrate, Local,
-    LocalDecl, MirPhase, MirSource, Operand, Place, RuntimePhase, Rvalue, SourceInfo,
-    SourceScopeData, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind,
-    UnwindAction, WithRetag,
+    LocalDecl, Location, MirPhase, MirSource, Operand, Place, ProjectionElem, RuntimePhase, Rvalue,
+    SourceInfo, SourceScopeData, Statement, StatementKind, SwitchTargets, Terminator,
+    TerminatorKind, UnOp, UnwindAction, WithRetag,
 };
 use rustc_middle::ty::fast_reject::SimplifiedType;
-use rustc_middle::ty::{GenericArg, Ty, TyCtxt, UintTy};
+use rustc_middle::ty::{GenericArg, TrustCleanCarrier, Ty, TyCtxt, UintTy};
 // Trust (§6f landing 1): `sym` is gone from this import because the callee
 // method name now comes from the ONE authenticated identity
 // (`PrimitiveCallee::rust_method_name`) rather than from a preinterned symbol
@@ -158,7 +160,29 @@ pub(crate) fn clean_origin_defs(tcx: TyCtxt<'_>) -> impl Iterator<Item = LocalDe
 /// Derived from [`clean_origin_defs`], never from an independent test — see
 /// that function's second heading for why the direction matters.
 pub(crate) fn is_clean_origin(tcx: TyCtxt<'_>, def: LocalDefId) -> bool {
-    clean_origin_registry_entry(tcx, def).is_some()
+    let defs = &tcx.resolutions(()).clean_origin_defs;
+    match defs.len() {
+        0 => false,
+        1..=8 => defs.iter().any(|&(candidate, _, _)| candidate == def),
+        _ => {
+            #[derive(Default)]
+            struct CleanOriginDefSet(Option<rustc_data_structures::fx::FxHashSet<LocalDefId>>);
+            tcx.sess.with_trust_compiler_state::<CleanOriginDefSet, _>(|state| {
+                state
+                    .0
+                    .get_or_insert_with(|| defs.iter().map(|&(d, _, _)| d).collect())
+                    .contains(&def)
+            })
+        }
+    }
+}
+
+/// Trust: decode the parser's canonical source spelling with the actual Clean parser.
+/// A registry/AST identity that cannot be decoded is a compiler inconsistency.
+pub(crate) fn clean_source_name(tcx: TyCtxt<'_>, name: &str, span: Span) -> clean_kernel::Name {
+    trust_certify::clean_island::island_source_name(name).unwrap_or_else(|error| {
+        tcx.dcx().span_fatal(span, format!("internal: invalid Clean source identity: {error}"))
+    })
 }
 
 /// The registry row for `def`: the Clean declaration name and the span inside
@@ -177,41 +201,34 @@ pub(crate) fn clean_origin_registry_entry(
         .map(|&(_, name, span)| (name.to_string(), span))
 }
 
-/// The crate's Clean environment, re-checked at MIR time.
-///
-/// # Why this is checked AGAIN rather than carried from the mint
-///
-/// The mint decision runs in `rustc_resolve`, and its verdict is what makes the
-/// NAME exist. Carrying the `Environment` itself forward would put
-/// `clean-kernel` in `rustc_middle` (`ResolverGlobalCtxt` is where a resolver
-/// output has to live) for the benefit of one lane.
-///
-/// More to the point, a second run is the honest thing here rather than a
-/// weaker one. The gate's whole claim is about the environment the KERNEL
-/// registered, and this IS that pipeline — `CleanIslandSession::check_all` is
-/// the same authoritative whole-crate, header-first check `trust_verify.rs`
-/// runs, over the same island bytes (the parser captured them onto the HIR node
-/// under ruling v7/D1, so the elaborator sees the same bytes by construction).
-/// If the two runs ever disagreed, the mint would have created a name whose
-/// declaration this run cannot plan or admit, and the result is a FATAL refusal
-/// below — never an emitted body. Fail-closed in the direction that matters.
-///
-/// `None` means the session was tainted or an island's bytes could not be
-/// recovered. For a def that is in the registry, that is a hard failure, not a
-/// "carry on": see [`clean_origin_mir`].
-///
-/// COST, stated: this elaborates the crate's islands once per Clean-origin
-/// body. There is deliberately no cache — a cache keyed on nothing is a
-/// crate-global mutable, and the population is one entry per callable Clean
-/// declaration.
 /// Trust: (I7) — the crate's `clean { … }` island sources in authored order, or
 /// `None` when an island's bytes could not be recovered. Factored out of
 /// [`clean_crate_environment`] and shared with the `trust_clean_island_sources`
 /// query so the transported sources and the environment the gate ran over
-/// cannot disagree.
+/// cannot disagree: the gate's environment is the pre-admission prefix of
+/// exactly these sources (see [`clean_crate_environment`]).
 pub(crate) fn collect_island_sources(tcx: TyCtxt<'_>) -> Option<Vec<String>> {
-    let mut islands: Vec<(rustc_span::Span, String)> = Vec::new();
+    Some(authored_islands(tcx)?.into_iter().map(|island| island.text).collect())
+}
+
+/// Trust (CLEAN-GENERAL-DEFERRED-1): one `clean { … }` island, by its HIR owner, with the
+/// bytes [`collect_island_sources`] transports for it.
+struct AuthoredIsland {
+    owner: LocalDefId,
+    text: String,
+}
+
+/// Trust (CLEAN-GENERAL-DEFERRED-1): the crate's islands in authored order, or `None`
+/// when an island's bytes could not be recovered. The one walk behind
+/// [`collect_island_sources`] and [`deferred_suffix_islands`], so the sources
+/// the environment is checked over and the partition the general trust-ir lane
+/// reads are computed from the same bytes in the same order.
+fn authored_islands(tcx: TyCtxt<'_>) -> Option<Vec<AuthoredIsland>> {
+    let mut islands: Vec<(rustc_span::Span, AuthoredIsland)> = Vec::new();
     for item_id in tcx.hir_crate_items(()).free_items() {
+        if tcx.def_kind(item_id.owner_id) != rustc_hir::def::DefKind::GlobalAsm {
+            continue;
+        }
         let item = tcx.hir_item(item_id);
         let rustc_hir::ItemKind::CleanIsland { content_span, text, .. } = item.kind else {
             continue;
@@ -221,26 +238,701 @@ pub(crate) fn collect_island_sources(tcx: TyCtxt<'_>) -> Option<Vec<String>> {
         } else {
             text.to_string()
         };
-        islands.push((content_span, text));
+        islands.push((content_span, AuthoredIsland { owner: item_id.owner_id.def_id, text }));
     }
     // Authored source order: Clean file state (namespaces, `open`s, notation,
     // options) evolves across islands, and this is the same sort
     // `trust_check_clean_islands` and the resolve-time decision both apply.
     islands.sort_by_key(|(span, _)| (span.lo(), span.hi()));
-    Some(islands.into_iter().map(|(_, text)| text).collect())
+    Some(islands.into_iter().map(|(_, island)| island).collect())
 }
 
+/// Trust (CLEAN-GENERAL-DEFERRED-1): the islands of the DEFERRED suffix, by HIR owner:
+/// the first island that names `trust_import_*` and every island authored after
+/// it (`trust_certify::clean_island::pre_admission_island_count`). These are
+/// exactly the islands [`clean_crate_environment`] leaves out, so a declaration
+/// in one of them is never in the environment that function returns. `None`
+/// exactly when [`collect_island_sources`] is `None`, and then
+/// [`clean_crate_environment`] is `None` too.
+pub(crate) fn deferred_suffix_islands(
+    tcx: TyCtxt<'_>,
+) -> Option<rustc_data_structures::fx::FxHashSet<LocalDefId>> {
+    let islands = authored_islands(tcx)?;
+    let texts: Vec<&str> = islands.iter().map(|island| island.text.as_str()).collect();
+    let prefix = trust_certify::clean_island::pre_admission_island_count(texts.as_slice());
+    Some(islands[prefix..].iter().map(|island| island.owner).collect())
+}
+
+/// Trust (TG4): reuse this Session's immutable resolver environment only for
+/// the exact complete ordered source/callee inventory. Extra macro islands
+/// miss and use the existing fresh ordinary batch check.
+/// Subsequent MIR/export users share that same checked snapshot. HIR model
+/// checks, program admissions and per-body faithfulness checks remain separate.
+/// A rejected or incomplete environment is `None`, never a partial success.
+///
+/// Trust (E9-DEFERRED-SUFFIX-ENV-1): the inventory is the PRE-ADMISSION prefix,
+/// every island before the first that names `trust_import_*`
+/// (`trust_certify::clean_island::pre_admission_island_count`): the islands
+/// `trust_clean_mint::decide` mints from and `trust_check_clean_islands`
+/// checks before the body walk. The deferred suffix names E6 program
+/// admissions, which exist only in the session that minted them (the
+/// verification walk's, or TG3's kernel-only lane's). A fresh session cannot
+/// check it, so including it here rejected the environment of every crate with
+/// a minted def and a deferred island, and `clean_origin_mir` stopped with its
+/// internal error. Every minted declaration is in the prefix (the mint refuses
+/// the suffix's), and the suffix only extends that environment, so the prefix
+/// holds the same declaration terms. The suffix is still checked in every
+/// build, by `trust_check_deferred_island_suffix`; nothing here accepts it.
 pub(crate) fn clean_crate_environment(
     tcx: TyCtxt<'_>,
-) -> Option<trust_certify::clean_island::CleanIslandSession> {
-    let sources = collect_island_sources(tcx)?;
-    let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
-    let mut session = trust_certify::clean_island::CleanIslandSession::new();
-    let batch = session.check_all(&sources);
-    if batch.is_rejected() || session.is_tainted() {
-        return None;
+) -> Option<std::sync::Arc<trust_certify::clean_island::KernelEnvironment>> {
+    use trust_certify::clean_island_environment::CheckedIslandEnvironment;
+    let mut sources = collect_island_sources(tcx)?;
+    sources.truncate(trust_certify::clean_island::pre_admission_island_count(sources.as_slice()));
+    let callees = rust_callee_declarations(tcx);
+    if let Some(hit) = tcx.sess.with_trust_compiler_state::<CheckedIslandEnvironment, _>(|state| {
+        state.lookup(&sources, &callees)
+    }) {
+        return tcx.sess.time("trust_clean_environment_cache_hit", || hit);
     }
-    Some(session)
+    // Trust (W5, Lean-calls-Rust): the SAME Rust callees the mint declared,
+    // declared here the same way BEFORE `check_all` — read from the set the
+    // mint carried through `ResolverGlobalCtxt`, never re-derived. A refusal
+    // is a self-disagreement (the mint declared these on the same prelude)
+    // and is reported as one rather than surfacing as a rejected batch.
+    let (checked, _, _) = tcx
+        .sess
+        .time("trust_clean_environment_recheck", || {
+            CheckedIslandEnvironment::check(&sources, &callees, false, clean_facts(tcx.sess))
+        })
+        .unwrap_or_else(|refusal| {
+            tcx.dcx().fatal(format!(
+                "internal: the Clean environment refused a Rust callee the mint declared for this \
+             crate's islands ({refusal}). The mint and this session declare one set on one \
+             prelude, so this is a compiler defect. Please report it."
+            ));
+        });
+    let env = checked.lookup(&sources, &callees).expect("producer recorded its exact inputs");
+    tcx.sess.with_trust_compiler_state::<CheckedIslandEnvironment, _>(|state| {
+        *state = checked;
+    });
+    env
+}
+
+/// Trust (W5, Lean-calls-Rust): the `trust_types` carrier a transported
+/// callee position denotes. `Nat` is unreachable for a callee — the mint
+/// admits only the five machine carriers — and is refused rather than mapped.
+fn trust_ty_of_carrier(tcx: TyCtxt<'_>, carrier: TrustCleanCarrier, span: Span) -> trust_types::Ty {
+    match carrier {
+        TrustCleanCarrier::Bool => trust_types::Ty::Bool,
+        TrustCleanCarrier::U8 => trust_types::Ty::u8(),
+        TrustCleanCarrier::U16 => trust_types::Ty::u16(),
+        TrustCleanCarrier::U32 => trust_types::Ty::u32(),
+        TrustCleanCarrier::U64 => trust_types::Ty::u64(),
+        TrustCleanCarrier::Nat => tcx.dcx().span_fatal(
+            span,
+            "internal: a Rust callee admitted for Clean islands carries `Nat`, which the mint \
+             is required to refuse. Please report it.",
+        ),
+    }
+}
+
+/// Trust (W5): the crate's admitted Rust callees in the environment helper's
+/// spelling — THE ONE SET, from `ResolverGlobalCtxt::clean_rust_callees`.
+pub(crate) fn rust_callee_declarations(
+    tcx: TyCtxt<'_>,
+) -> Vec<trust_certify::clean_island::RustCallee> {
+    tcx.resolutions(())
+        .clean_rust_callees
+        .iter()
+        .map(|callee| trust_certify::clean_island::RustCallee {
+            clean_name: callee.clean_name.to_string(),
+            params: callee
+                .params
+                .iter()
+                .map(|&c| trust_ty_of_carrier(tcx, c, callee.span))
+                .collect(),
+            result: trust_ty_of_carrier(tcx, callee.result, callee.span),
+        })
+        .collect()
+}
+
+/// Trust (W5): the extractor's rendering of a callee `DefId` — EXACTLY the
+/// string `trust_mir_extract` puts in `Terminator::Call::func` when it reads
+/// the emitted call back, computed by the extractor's own renderer over the
+/// same `Operand::function_handle` the materializer emits. Side B's identity
+/// check compares this against what it read: two renderings of ONE `DefId`.
+fn rust_callee_rendering<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, span: Span) -> String {
+    let handle = Operand::function_handle(tcx, def_id, &[], span);
+    // Trust (GCKA-SELF-CALL-2, 2026-10-10): no caller. The handle carries no
+    // generic argument, so the caller-dependent self-call reading never applies.
+    trust_mir_extract::func_operand_name(tcx, None, &handle)
+}
+
+/// Trust (W5): the plan-side callee table for THIS session — the same set,
+/// with each callee's `DefId` rendering filled in so a plan built over it can
+/// be admitted. Order is the transported order, which is the mint's.
+pub(crate) fn rust_callee_table(tcx: TyCtxt<'_>) -> Vec<trust_clean_origin::RustCalleeRef> {
+    tcx.resolutions(())
+        .clean_rust_callees
+        .iter()
+        .map(|callee| trust_clean_origin::RustCalleeRef {
+            clean_name: callee.clean_name.to_string(),
+            def_path: rust_callee_rendering(tcx, callee.def_id.to_def_id(), callee.span),
+            params: callee
+                .params
+                .iter()
+                .map(|&c| trust_ty_of_carrier(tcx, c, callee.span))
+                .collect(),
+            result: trust_ty_of_carrier(tcx, callee.result, callee.span),
+        })
+        .collect()
+}
+
+/// Trust (2026-09-14, PURITY GUARD) — is `def_id` a provably PURE Rust callee?
+///
+/// A Clean `def` treats every Rust callee it names as a PURE kernel value: the
+/// faithfulness gate ([`trust_clean_origin::check_faithful`]) decides kernel
+/// definitional equality against the declaration term, and the kernel is a PURE
+/// calculus — `tick x` denotes ONE value however many times it is written. It
+/// therefore CANNOT see that the emitted Rust callee is effectful (reads/writes
+/// a `static`, an atomic, aliased memory). The lane is faithful ONLY when the
+/// callee is a pure function of its arguments: for an effectful callee the
+/// emitted binary's call COUNT / ORDER / SIDE EFFECTS diverge from the single
+/// pure value the kernel checked — the confirmed `dup_let` / `dup_let2` /
+/// `order_let` false verifies, all of which call an effectful `tick`. Per-shape
+/// single-evaluation cannot close this: the unsoundness is the effectful callee,
+/// not any one `let` shape.
+///
+/// This is a CONSERVATIVE, FAIL-CLOSED, transitive walk of the callee's MIR (and
+/// every callee it reaches) — a body of this crate as its pre-steal elaborated MIR
+/// (`trust_rust_purity_fact`), another crate's as its metadata MIR. A callee is
+/// IMPURE (`false`) if its MIR — or any it
+/// reaches — is unavailable/unanalyzable, or contains ANY of: a thread-local
+/// reference; a raw-pointer creation (`&raw` — a `static mut` read,
+/// `UnsafeCell::get`, an interior-mutability cell); a write through a
+/// reference / pointer / `static` (an INDIRECT destination place); a memory-copy
+/// intrinsic; inline asm; a `Drop` (destructor glue); an INDIRECT call (function
+/// pointer / dyn dispatch); or a call to a callee that is not itself pure. Only a
+/// body computing from its parameters/locals with arithmetic, moves and pure
+/// calls is admitted. An atomic/volatile operation is a call to a `core`
+/// intrinsic whose MIR is unavailable, so the transitive-call arm catches it.
+///
+/// Trust: an indirect read also needs a frame-local referent. Looking only for
+/// `RawPtr` creation misses reads through compiler-created constant pointers to
+/// a mutable static. This memory check does not establish panic freedom or
+/// termination; verification-on charges those separate callee obligations.
+///
+/// A cycle's back-edge is assumed pure — any real impurity in the cycle is caught
+/// when that body's own statements are walked, before the edge is taken — and the
+/// depth cap fails closed on anything deeper than the walk analyzes.
+thread_local! {
+    /// Clean-origin defs whose faithfulness gate is CURRENTLY RUNNING on this thread.
+    ///
+    /// Trust (cross-language cycle, 2026-09-25): [`rust_callee_is_pure`] reads each
+    /// callee's MIR and RECURSES through the callee's own calls; a Clean-origin
+    /// callee's MIR is its gated emission. For `fn inc` -> `def twice_inc` -> `inc`,
+    /// that recursion reaches `twice_inc` and demands its body while the very same
+    /// query is in flight, so the query system reports a raw cycle (measured when the
+    /// walk read `optimized_mir`):
+    ///
+    /// ```text
+    /// error[E0391]: cycle detected when optimizing MIR for `twice_inc`
+    /// note: ...which requires optimizing MIR for `inc`...
+    /// note: ...which again requires optimizing MIR for `twice_inc`, completing the cycle
+    /// ```
+    ///
+    /// Measured at BOTH `-Ztrust-verify=off` and `=on` before this guard existed. That
+    /// diagnostic names no cross-language cause and offers the author no option, while
+    /// every other unemittable shape in this lane gets a designed refusal.
+    ///
+    /// THE CHECK IS AT THE DEMAND SITE, and that is the whole reason it works. A
+    /// re-entry guard at the top of [`clean_origin_mir`] was measured and never fires:
+    /// the query system raises E0391 BEFORE control reaches the function body. Refusing
+    /// before the demand needs no such re-entry.
+    ///
+    /// The set is keyed on the def being GATED, so it fires only on a genuine cycle
+    /// back into that def. Acyclic nesting — `def a := f x` where `fn f` calls a
+    /// DIFFERENT `def b` — never re-enters one def and is untouched.
+    ///
+    /// Membership alone is only half the test; see
+    /// [`callee_reaches_a_gate_on_this_stack`] for the referenced-gate edge, which is
+    /// the one the `-Ztrust-verify=on` demand order needs.
+    static CLEAN_ORIGIN_GATE_IN_PROGRESS: std::cell::RefCell<
+        rustc_data_structures::fx::FxHashSet<LocalDefId>,
+    > = std::cell::RefCell::new(rustc_data_structures::fx::FxHashSet::default());
+
+    /// Set when [`rust_callee_is_pure`] declined because of a cross-language cycle
+    /// rather than an effect, so the caller can say which. The purity refusal text
+    /// blames global or aliased mutable state, which is false of a cycle and would
+    /// send the author hunting an effect that does not exist.
+    static CLEAN_ORIGIN_CYCLE_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Removes `def` from the in-progress set however the gate leaves, including the
+/// diverging `refuse` path.
+struct CleanOriginGateFrame(LocalDefId);
+
+impl Drop for CleanOriginGateFrame {
+    fn drop(&mut self) {
+        CLEAN_ORIGIN_GATE_IN_PROGRESS.with(|set| set.borrow_mut().remove(&self.0));
+    }
+}
+
+/// Would demanding this callee's MIR close a cross-language cycle — i.e. does the
+/// callee REACH a Clean-origin gate that is on this thread's stack right now?
+///
+/// The question has to be answered TRANSITIVELY, and before the demand. Three
+/// measured facts force that shape; each was a shipped guard that did not hold.
+///
+///  * **The direct edge is not enough.** The purity walk steps `def twice_inc` ->
+///    `fn inc`, and `inc` is not itself gated — the cycle is `inc`'s own call back
+///    to `twice_inc`. So the callee's REFERENCES must be consulted, not just its
+///    identity.
+///  * **One hop is not enough either, and only one lane shows it.** With
+///    `fn hop -> fn deep -> def twice_h -> hop`, the reference lives two hops out.
+///    At `-Ztrust-verify=off` the purity walk's own recursion reaches `deep` and a
+///    one-hop test fires there in time. At `-Ztrust-verify=on` it never gets the
+///    chance: demanding `optimized_mir(hop)` runs hop's verification, which bundles
+///    its callees and demands `optimized_mir(twice_h)` — the query already on the
+///    stack — so E0391 lands inside the FIRST demand. Measured 2026-09-25, both
+///    lanes, which is why a guard tested in one lane is not a guard.
+///  * **The walk may not use `optimized_mir`.** That is the demand being guarded;
+///    using it to decide would be the cycle. The two queries below are the cheap
+///    pre-steal levels: `trust_clean_origin_references` reads `mir_built`, and
+///    `trust_mir_direct_local_callees` reads elaborated MIR. Both are disk-cached,
+///    and the purity walk that follows reads `trust_rust_purity_fact`, the same
+///    pre-steal level, over this very subgraph, so nothing here is a new class of
+///    cost.
+///
+/// TWO EXCLUSIONS ARE LOAD-BEARING, not tidiness. Neither node is expanded:
+///
+///  * **A Clean-origin def.** It is a synthetic HIR owner; forcing its `mir_built`
+///    dead-ends in `typeck`'s `can't type-check body of DefId(..)` `span_bug!`. An
+///    earlier attempt asked unconditionally and ICEd legal acyclic nesting
+///    (`def a := f x` with a second `def b` calling `a`) — the measurement that
+///    reverted it. Reaching such a node still ANSWERS the question (`gates` is
+///    consulted first), so nothing is lost by not expanding it.
+///  * **A body with no `optimized_mir`** — a `#[rustc_comptime]` fn or any body
+///    whose `hir_body_const_context` is outside `None | Some(ConstFn)`.
+///    `inner_mir_for_ctfe` STEALS such a body's elaborated MIR, so
+///    `trust_mir_direct_local_callees` would borrow a consumed `Steal`. Its own
+///    doc comment states this precondition and forbids "hardening" it with
+///    `is_stolen()`; the caller applies the filter, exactly as the SCC builder in
+///    `trust_verify` does.
+///
+/// A node that fails a filter is not expanded, so a cycle closing ONLY through a
+/// const-context body is not caught here and still surfaces as E0391. That is a
+/// bounded, disclosed hole, not a claim of completeness.
+///
+/// The empty-set short circuit keeps all of this free outside a gate: no gate on
+/// the stack, no query, no walk.
+fn callee_reaches_a_gate_on_this_stack(tcx: TyCtxt<'_>, callee: LocalDefId) -> bool {
+    let gates: rustc_data_structures::fx::FxHashSet<LocalDefId> =
+        CLEAN_ORIGIN_GATE_IN_PROGRESS.with(|gates| gates.borrow().clone());
+    if gates.is_empty() {
+        return false;
+    }
+    callee_reaches_any(tcx, callee, &gates)
+}
+
+/// The walk of [`callee_reaches_a_gate_on_this_stack`] for an explicit set of Clean-origin
+/// `gates` (plan step 3.5: F1's backstop asks it about the one def whose callee it judges, with
+/// no gate on the stack). Same queries, same two load-bearing exclusions.
+fn callee_reaches_any(
+    tcx: TyCtxt<'_>,
+    callee: LocalDefId,
+    gates: &rustc_data_structures::fx::FxHashSet<LocalDefId>,
+) -> bool {
+    let mut seen = rustc_data_structures::fx::FxHashSet::default();
+    let mut worklist = vec![callee];
+    while let Some(node) = worklist.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        // Reaching a live gate answers the question whatever kind of body it is —
+        // asked BEFORE either filter, so an unexpandable node still decides.
+        if gates.contains(&node) {
+            return true;
+        }
+        if !node_is_safe_to_expand(tcx, node) {
+            continue;
+        }
+        if tcx
+            .trust_clean_origin_references(node)
+            .iter()
+            .any(|referenced| gates.contains(referenced))
+        {
+            return true;
+        }
+        worklist.extend(tcx.trust_mir_direct_local_callees(node).iter().copied());
+    }
+    false
+}
+
+/// The node filter [`callee_reaches_a_gate_on_this_stack`] applies before reading a
+/// body's pre-steal MIR. See the two exclusions documented there — this mirrors the
+/// filter `trust_verify`'s SCC builder applies to the same adjacency query.
+fn node_is_safe_to_expand(tcx: TyCtxt<'_>, node: LocalDefId) -> bool {
+    use rustc_hir::def::DefKind;
+    matches!(tcx.def_kind(node), DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
+        && matches!(tcx.hir_body_const_context(node), None | Some(rustc_hir::ConstContext::ConstFn))
+        && !is_clean_origin(tcx, node)
+}
+
+fn rust_callee_is_pure(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    visited: &mut std::collections::HashSet<DefId>,
+    depth: usize,
+) -> bool {
+    rust_callee_is_pure_walk(tcx, def_id, visited, depth, None)
+}
+
+/// Trust (plan step 3.5): what F1's backstop walk knows that the MIR lane's walk learns from its
+/// gate stack. On the MIR lane a Clean-origin def the walk reaches is read by building its
+/// `clean_origin_mir` body, whose own gate walks that def's Rust callees with the outer gate
+/// still on the stack, which is how a cycle through several defs is seen. F1 builds no such body
+/// (design §5.7), so the backstop is told each `RustCallChain` def's resolved Rust callees (the
+/// F1 recorder's plans) and the def it judges for.
+pub(crate) struct CleanOriginBackstop<'a> {
+    /// The Clean-origin def whose Rust callee is judged: reaching it again is a
+    /// cross-language cycle.
+    pub origin: LocalDefId,
+    /// Each `RustCallChain` def's resolved Rust callees, by def.
+    pub rust_callees: &'a rustc_data_structures::fx::FxHashMap<LocalDefId, Vec<DefId>>,
+    /// Set when the walk refused because of a cross-language cycle, not an effect.
+    pub cycle: std::cell::Cell<bool>,
+}
+
+/// Trust (plan step 3.5; docs/DECISION_QUEUE.md STEP3.5-PURITY-UNDECIDED): the MIR walk as F1's
+/// REFUSAL-ONLY backstop, for a Rust callee whose conserved trust-ir effect census cannot decide
+/// its purity (`clean_origin_ir::check_rust_callees_on_f1`). It is [`rust_callee_is_pure`] with
+/// two differences, both from the absence of a `clean_origin_mir` body on F1 (design §5.7): a
+/// Clean-origin def it reaches is NOT read but walked through its plan's Rust callees
+/// ([`CleanOriginBackstop`]), and the cross-language cycle is asked about `backstop.origin`
+/// (the MIR lane asks about the gates on its stack, of which there are none here). A cycle sets
+/// `backstop.cycle`. `false` refuses; `true` decides nothing (the census's UNDECIDED stands).
+pub(crate) fn rust_callee_is_pure_backstop(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    visited: &mut std::collections::HashSet<DefId>,
+    backstop: &CleanOriginBackstop<'_>,
+) -> bool {
+    rust_callee_is_pure_walk(tcx, def_id, visited, 0, Some(backstop))
+}
+
+fn rust_callee_is_pure_walk(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    visited: &mut std::collections::HashSet<DefId>,
+    depth: usize,
+    backstop: Option<&CleanOriginBackstop<'_>>,
+) -> bool {
+    const MAX_PURITY_DEPTH: usize = 64;
+    if depth > MAX_PURITY_DEPTH {
+        return false;
+    }
+    if !visited.insert(def_id) {
+        // Already on THIS walk — a cycle back-edge. Sound to assume pure: the
+        // body's own statements are (or were) walked before this edge is taken.
+        return true;
+    }
+    if let Some(backstop) = backstop
+        && let Some(local) = def_id.as_local()
+        && is_clean_origin(tcx, local)
+    {
+        if local == backstop.origin {
+            backstop.cycle.set(true);
+            return false;
+        }
+        // Another Clean-origin def: its body is never read; its Rust callees are walked, as its
+        // own gate would walk them on the MIR lane. A def with none (every other shape) calls
+        // no Rust code.
+        let callees = backstop.rust_callees.get(&local).map(Vec::as_slice).unwrap_or(&[]);
+        return callees.iter().all(|&callee| {
+            rust_callee_is_pure_walk(tcx, callee, visited, depth + 1, Some(backstop))
+        });
+    }
+    // Trust: `trust_local_def_has_mir` for a local def — `is_mir_available` reads
+    // `mir_keys`, which demands every async closure's by-move body, i.e. `mir_built` of
+    // bodies this walk may be running inside of.
+    let has_mir = match def_id.as_local() {
+        Some(local) => tcx.trust_local_def_has_mir(local),
+        None => tcx.is_mir_available(def_id),
+    };
+    if !has_mir {
+        // No body to inspect: a foreign fn, an intrinsic (atomics land here), a
+        // fn with no exported MIR. Fail closed.
+        return false;
+    }
+    // Trust (cross-language cycle): refuse BEFORE reading the callee, because a callee
+    // that leads back to a def whose own gate is on this stack has no value the kernel
+    // could have checked, and reading it would re-enter that gate.
+    if def_id.as_local().is_some_and(|local| callee_reaches_a_gate_on_this_stack(tcx, local)) {
+        CLEAN_ORIGIN_CYCLE_SEEN.with(|flag| flag.set(true));
+        return false;
+    }
+    // Trust (plan step 3.5): F1's backstop has no gate on the stack; it asks the same question
+    // about the def it judges for, before reading the callee, as the MIR lane does.
+    if let Some(backstop) = backstop
+        && let Some(local) = def_id.as_local()
+        && callee_reaches_any(
+            tcx,
+            local,
+            &std::iter::once(backstop.origin).collect::<rustc_data_structures::fx::FxHashSet<_>>(),
+        )
+    {
+        backstop.cycle.set(true);
+        return false;
+    }
+    // Trust: a local body is read through `trust_rust_purity_fact`, a fact of its
+    // PRE-STEAL elaborated MIR, never through `optimized_mir`: this walk runs inside
+    // `mir_for_ctfe` (const evaluation, which the type system reaches), and a local
+    // `optimized_mir` runs that body's whole pipeline — verification, its callee
+    // bundling and the crate call-graph oracles, which read every fn's MIR — from inside
+    // type computation (E0391). A foreign body's MIR is decoded from metadata.
+    let foreign;
+    let fact = match def_id.as_local() {
+        Some(local) => tcx.trust_rust_purity_fact(local),
+        None => {
+            foreign = purity_fact_of_body(tcx, tcx.optimized_mir(def_id));
+            &foreign
+        }
+    };
+    for &callee in &fact.callees {
+        if !rust_callee_is_pure_walk(tcx, callee, visited, depth + 1, backstop) {
+            return false;
+        }
+    }
+    !fact.impure
+}
+
+/// Provider of `trust_rust_purity_fact`: [`purity_fact_of_body`] over the def's
+/// pre-steal elaborated MIR. A Clean-origin def's elaborated MIR is its gated emission
+/// (`mir_drops_elaborated_and_const_checked`), read here as `optimized_mir` itself
+/// returns it, unoptimized; a constructor has no elaborated MIR, only its shim.
+pub(crate) fn rust_purity_fact(tcx: TyCtxt<'_>, def: LocalDefId) -> TrustPurityFact {
+    if is_clean_origin(tcx, def) {
+        return purity_fact_of_body(tcx, tcx.optimized_mir(def));
+    }
+    if tcx.is_constructor(def.to_def_id()) {
+        return purity_fact_of_body(tcx, tcx.mir_for_ctfe(def));
+    }
+    purity_fact_of_body(tcx, &tcx.mir_drops_elaborated_and_const_checked(def).borrow())
+}
+
+/// Whether `inner_optimized_mir` must produce `trust_rust_purity_fact` before it steals
+/// a body: only a crate with a Clean-origin def runs the purity guard, and the guard
+/// walks only this crate's bodies (another crate's are decoded from metadata).
+pub(crate) fn crate_needs_purity_facts(tcx: TyCtxt<'_>) -> bool {
+    !tcx.resolutions(()).clean_origin_defs.is_empty()
+}
+
+/// The purity guard's reading of one body, in the order it walks it: the frame-read
+/// check first, then each block's statements and terminator. The first refused element
+/// ends the fact with `impure`; the calls before it are the callees the walk recurses
+/// into, in order, so a callee met earlier is walked before the refusal is reached.
+fn purity_fact_of_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> TrustPurityFact {
+    let mut fact = TrustPurityFact::default();
+    if !rust_callee_reads_frame_only(body) {
+        fact.impure = true;
+        return fact;
+    }
+    let def_id = body.source.def_id();
+    for bb in body.basic_blocks.iter() {
+        for stmt in &bb.statements {
+            let refused = match &stmt.kind {
+                StatementKind::Assign(boxed) => {
+                    let (place, rvalue) = &**boxed;
+                    // A write through a reference / raw pointer / `static` reaches
+                    // memory outside the callee's own frame; a thread-local read or a
+                    // raw-pointer creation (`&raw`: `static mut`, `UnsafeCell::get`,
+                    // interior mutability) reaches shared state.
+                    place.is_indirect()
+                        || matches!(rvalue, Rvalue::ThreadLocalRef(_) | Rvalue::RawPtr(..))
+                }
+                // `Assume` is pure; a memory copy (`CopyNonOverlapping`) writes
+                // through a pointer. Fail closed on anything but `Assume`.
+                StatementKind::Intrinsic(boxed) => {
+                    !matches!(&**boxed, rustc_middle::mir::NonDivergingIntrinsic::Assume(_))
+                }
+                _ => false,
+            };
+            if refused {
+                fact.impure = true;
+                return fact;
+            }
+        }
+        match &bb.terminator().kind {
+            TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => {
+                // Trust (purity guard, trait-dispatch hole — 2026-09-15):
+                // `const_fn_def` names the TRAIT ITEM for a trait-method call, and the
+                // MIR of a trait item is its DEFAULT body — NOT the impl that will
+                // actually run. Walking the default laundered an impure impl behind a
+                // pure default (measured: `impl Tick for Impure { fn tick(_) { COUNTER
+                // .fetch_add(..) } }` reached through a pure default was admitted, and
+                // `let y := tick x; sub2 y y` then emitted TWO `tick` calls for a term
+                // the kernel denotes with ONE — `sub2 1 2 = u64::MAX` where the
+                // denotation is `0`), and it falsely REFUSED a pure impl behind an
+                // impure default.
+                //
+                // Resolve to the concrete instance and walk THAT body. Only
+                // `InstanceKind::Item` is a real fn item with inspectable MIR; every
+                // other kind (virtual dispatch, reify/clone/drop shims, intrinsics) and
+                // every unresolvable — still-generic or ambiguous — edge FAILS CLOSED,
+                // because a callee whose body this walk cannot see cannot be shown pure.
+                // A function-pointer or dyn call names no static callee at all.
+                let resolved = func.const_fn_def().and_then(|(callee, args)| {
+                    let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, def_id);
+                    match rustc_middle::ty::Instance::try_resolve(tcx, typing_env, callee, args) {
+                        Ok(Some(rustc_middle::ty::Instance {
+                            def: rustc_middle::ty::InstanceKind::Item(resolved),
+                            ..
+                        })) => Some(resolved),
+                        _ => None,
+                    }
+                });
+                match resolved {
+                    Some(resolved) => fact.callees.push(resolved),
+                    None => {
+                        fact.impure = true;
+                        return fact;
+                    }
+                }
+            }
+            TerminatorKind::InlineAsm { .. } | TerminatorKind::Drop { .. } => {
+                fact.impure = true;
+                return fact;
+            }
+            _ => {}
+        }
+    }
+    fact
+}
+
+// Trust: track only references whose complete assignment history proves a
+// referent inside this invocation's frame. Arguments, constants, call results,
+// casts, projected pointer loads and multiply-assigned locals remain unknown.
+// This is an observation used by the conservative purity guard, not an alias,
+// lifetime, panic-freedom or source-refinement certificate.
+#[derive(Clone, Copy)]
+enum FrameReferenceOrigin {
+    Unknown,
+    Frame,
+    Copy(Local),
+}
+
+fn rust_callee_reads_frame_only(body: &Body<'_>) -> bool {
+    let mut origins = IndexVec::from_elem_n(FrameReferenceOrigin::Unknown, body.local_decls.len());
+    let mut assigned = IndexVec::from_elem_n(false, body.local_decls.len());
+    for argument in body.args_iter() {
+        assigned[argument] = true;
+    }
+    let mut record = |local, origin| {
+        origins[local] = if assigned[local] { FrameReferenceOrigin::Unknown } else { origin };
+        assigned[local] = true;
+    };
+    for block in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let StatementKind::Assign(assignment) = &statement.kind {
+                let (destination, value) = &**assignment;
+                if destination.projection.is_empty() {
+                    let origin = match value {
+                        Rvalue::Ref(_, _, place)
+                            if place.projection.is_empty()
+                                || !place
+                                    .projection
+                                    .iter()
+                                    .any(|elem| matches!(elem, ProjectionElem::Deref)) =>
+                        {
+                            FrameReferenceOrigin::Frame
+                        }
+                        Rvalue::Ref(_, _, place)
+                            if place
+                                .projection
+                                .iter()
+                                .filter(|elem| matches!(elem, ProjectionElem::Deref))
+                                .count()
+                                == 1 =>
+                        {
+                            FrameReferenceOrigin::Copy(place.local)
+                        }
+                        Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _)
+                            if place.projection.is_empty() =>
+                        {
+                            FrameReferenceOrigin::Copy(place.local)
+                        }
+                        _ => FrameReferenceOrigin::Unknown,
+                    };
+                    record(destination.local, origin);
+                }
+            }
+        }
+        if let TerminatorKind::Call { destination, .. } = &block.terminator().kind
+            && destination.projection.is_empty()
+        {
+            record(destination.local, FrameReferenceOrigin::Unknown);
+        }
+    }
+
+    // Resolve single-definition copy chains once. A cycle cannot manufacture a
+    // frame origin; cache every visited local even on that refusal path.
+    let mut frame = IndexVec::from_elem_n(None, body.local_decls.len());
+    for start in body.local_decls.indices() {
+        let mut path = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut local = start;
+        let resolved = loop {
+            if let Some(known) = frame[local] {
+                break known;
+            }
+            if !visited.insert(local) {
+                break false;
+            }
+            path.push(local);
+            match origins[local] {
+                FrameReferenceOrigin::Unknown => break false,
+                FrameReferenceOrigin::Frame => break true,
+                FrameReferenceOrigin::Copy(source) => local = source,
+            }
+        };
+        for local in path {
+            frame[local] = Some(resolved);
+        }
+    }
+
+    struct FrameReads<'a> {
+        frame: &'a IndexVec<Local, Option<bool>>,
+        frame_only: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for FrameReads<'_> {
+        fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+            if context.is_use() {
+                let dereferences = place
+                    .projection
+                    .iter()
+                    .filter(|elem| matches!(elem, ProjectionElem::Deref))
+                    .count();
+                // A Call destination (or another indirect mutation) could
+                // overwrite a reference through a frame alias without an
+                // Assign to the reference local. Borrowing is not a write;
+                // every actual indirect mutation remains refused.
+                let writes_through_reference = context.is_mutating_use() && !context.is_borrow();
+                if dereferences != 0
+                    && (writes_through_reference
+                        || dereferences != 1
+                        || self.frame[place.local] != Some(true))
+                {
+                    self.frame_only = false;
+                }
+            }
+            self.super_place(place, context, location);
+        }
+    }
+    let mut reads = FrameReads { frame: &frame, frame_only: true };
+    reads.visit_body(body);
+    reads.frame_only
 }
 
 /// **The sole constructor of a Clean-origin `Body`.**
@@ -269,7 +961,7 @@ pub(crate) fn clean_origin_mir<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Opti
     // From here on there is no `None`. The def IS Clean-origin, so either a
     // gated body comes back or the compilation stops: there is no other body
     // to fall back to, and inventing one is the wrong-binary outcome.
-    let Some(session) = clean_crate_environment(tcx) else {
+    let Some(env) = clean_crate_environment(tcx) else {
         tcx.dcx().span_fatal(
             span,
             format!(
@@ -281,8 +973,13 @@ pub(crate) fn clean_origin_mir<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Opti
             ),
         );
     };
-    let env = session.environment().expect("an untainted session has an environment");
+    let env = &*env;
     let decl = CleanOriginDecl { name: &name, env, span };
+    // Trust (cross-language cycle): mark this def as being gated for the duration, so
+    // the purity walk below refuses a callee that leads back here instead of demanding
+    // its `optimized_mir` and tripping the query system's own cycle detector.
+    CLEAN_ORIGIN_GATE_IN_PROGRESS.with(|set| set.borrow_mut().insert(def));
+    let _gate_frame = CleanOriginGateFrame(def);
     Some(build_gated_body(tcx, def, &decl))
 }
 
@@ -304,10 +1001,118 @@ fn build_gated_body<'tcx>(
     // emitter. `plan_clean_origin_body` re-checks the declaration's provenance
     // (`FullKernelCheck`) and its total carrier signature, so the emitted
     // SIGNATURE rests on a kernel verdict, not only the emitted body.
-    let plan = match trust_clean_origin::plan_clean_origin_body(decl.env, decl.name) {
+    // Trust (W5): planned over the SAME callee table the mint planned over
+    // (plus the `DefId` renderings only this session can supply).
+    let declaration = clean_source_name(tcx, decl.name, decl.span);
+    let plan = match trust_clean_origin::plan_clean_origin_body_with_rust_callees_for_name(
+        decl.env,
+        &declaration,
+        &rust_callee_table(tcx),
+    ) {
         Ok(plan) => plan,
         Err(refusal) => refuse(tcx, decl, &refusal),
     };
+
+    // ── the PURITY GUARD (Trust, 2026-09-14) ───────────────────────────────
+    //
+    // The faithfulness gate below is kernel definitional equality against the
+    // declaration term, and the kernel is a PURE calculus — it treats a Rust
+    // callee as a pure value, so it cannot see that the emitted callee is
+    // effectful. A `RustCallChain` over an IMPURE callee is therefore a WRONG
+    // BINARY the gate cannot catch: the emitted call count / order / side effects
+    // diverge from the single pure value the kernel checked (the `dup_let` /
+    // `dup_let2` / `order_let` false verifies, all calling an effectful `tick`).
+    // This is the ROOT closure — per-shape single-evaluation cannot cover every
+    // effectful shape, so it is refused here, at the one point that has the
+    // callee's MIR. A PURE (arithmetic-only) callee is admitted unchanged, so a
+    // pure duplicated call is still faithful and r18/r21/r22/r23 stay green.
+    //
+    // Trust (W5 increment 7, 2026-09-16): a `let`-bound Rust call is now
+    // emitted as ONE value temporary (one `RustCallChain` node read any number
+    // of times), so the emitted count and order match Lean's strict `let`. That
+    // does not retire this guard — it is what makes the kernel's extensional
+    // callee model TRUE OF THE BINARY: for an effectful `tick`, the once-body
+    // and `sub2 (tick x) (tick x)` are still def-eq while this lane emits one
+    // call for the first and two for the second. The guard walks EVERY node of
+    // the plan, so a let-bound effectful callee is refused whether its binder is
+    // used 0, 1 or n times (`clean_origin_let_rust_call_unused_effectful_refused.rs`).
+    if let trust_clean_origin::CleanOriginShape::RustCallChain { nodes } = plan.shape() {
+        let callee_defs: std::collections::BTreeMap<String, DefId> = tcx
+            .resolutions(())
+            .clean_rust_callees
+            .iter()
+            .map(|c| {
+                (rust_callee_rendering(tcx, c.def_id.to_def_id(), c.span), c.def_id.to_def_id())
+            })
+            .collect();
+        for node in nodes {
+            let callee = &plan.callees()[node.callee];
+            let Some(&callee_def) = callee_defs.get(&callee.def_path) else {
+                refuse(
+                    tcx,
+                    decl,
+                    &EmitRefusal::NotEmittable {
+                        name: decl.name.to_owned(),
+                        reason: format!(
+                            "internal: its Rust callee `{}` has no resolvable `DefId` for the \
+                             purity check; the plan's callee table and the resolver disagree. \
+                             Please report it.",
+                            callee.clean_name
+                        ),
+                    },
+                )
+            };
+            let mut visited = std::collections::HashSet::new();
+            CLEAN_ORIGIN_CYCLE_SEEN.with(|flag| flag.set(false));
+            let callee_pure = rust_callee_is_pure(tcx, callee_def, &mut visited, 0);
+            if !callee_pure && CLEAN_ORIGIN_CYCLE_SEEN.with(|flag| flag.get()) {
+                // A CYCLE, not an effect. The purity text below blames global or
+                // aliased mutable state, which is false here and would send the author
+                // hunting something that does not exist.
+                refuse(
+                    tcx,
+                    decl,
+                    &EmitRefusal::NotEmittable {
+                        name: decl.name.to_owned(),
+                        reason: format!(
+                            "a Clean `def` may not take part in a CROSS-LANGUAGE CYCLE, but \
+                             `{}` calls Rust `fn {}`, which leads back to `{}`. The \
+                             faithfulness gate models a Rust callee as a pure value the \
+                             kernel already checked; a callee whose own body depends on this \
+                             declaration has no such value, and the emitted body would have \
+                             to be gated against itself. options: give the Rust side a base \
+                             case that does not call back into `{}`; or move the recursion \
+                             wholly into Clean, where it is checked as a well-founded \
+                             definition; or compute the recursive part in Rust and pass its \
+                             result into the `def` as an argument.",
+                            decl.name, callee.clean_name, decl.name, decl.name
+                        ),
+                    },
+                );
+            }
+            if !callee_pure {
+                refuse(
+                    tcx,
+                    decl,
+                    &EmitRefusal::NotEmittable {
+                        name: decl.name.to_owned(),
+                        reason: format!(
+                            "a Clean `def` may only call a PURE Rust fn, but `{}` is not \
+                             provably pure — it (or something it calls) accesses global or \
+                             aliased mutable state (a `static`, an atomic, a raw pointer, \
+                             interior mutability) or is otherwise unanalyzable. The \
+                             faithfulness gate treats a Rust callee as a pure value the kernel \
+                             checked, so it cannot model those effects, and duplicating or \
+                             reordering the call would change behaviour. options: make `{}` a \
+                             pure function of its arguments; or compute the effectful value in \
+                             Rust and pass it into the Clean `def` as an argument.",
+                            callee.clean_name, callee.clean_name
+                        ),
+                    },
+                );
+            }
+        }
+    }
 
     // ── the signature cross-check ──────────────────────────────────────────
     //
@@ -488,6 +1293,20 @@ fn build_gated_body<'tcx>(
     }
 }
 
+/// Trust (plan step 3.5): [`check_signature_agrees`] for the F1 recorder, which builds no MIR
+/// body and so never reaches [`build_gated_body`]: the fed `fn_sig` every Rust call was
+/// type-checked against must be the one the plan's carriers denote. Fatal on any disagreement.
+pub(crate) fn check_fed_signature(
+    tcx: TyCtxt<'_>,
+    def: LocalDefId,
+    plan: &CleanOriginPlan,
+    name: &str,
+    env: &clean_kernel::Environment,
+    span: Span,
+) {
+    check_signature_agrees(tcx, def, plan, &CleanOriginDecl { name, env, span });
+}
+
 /// Require `tcx.fn_sig(def)` — fed at the mint site — to be exactly the
 /// signature this plan's carriers denote. Fatal on any disagreement.
 ///
@@ -552,7 +1371,7 @@ fn refuse(tcx: TyCtxt<'_>, decl: &CleanOriginDecl<'_>, refusal: &EmitRefusal) ->
     } else {
         format!("Clean declaration `{}` cannot be called from Rust", decl.name)
     };
-    tcx.dcx().struct_span_fatal(decl.span, headline).with_note(refusal.note()).emit()
+    tcx.dcx().struct_span_fatal(decl.span, headline).with_note(refusal.note()).emit_fatal()
 }
 
 /// Trust (#65, C3; extended R2/C5a): the test-only mutation behind
@@ -584,7 +1403,114 @@ fn refuse(tcx: TyCtxt<'_>, decl: &CleanOriginDecl<'_>, refusal: &EmitRefusal) ->
 ///   route through a real compilation.
 fn mutate_emitted_body_for_gate_test(body: &mut Body<'_>) {
     let arg_count = body.arg_count;
+    // Trust (W5 increment 7): the let-temp mutation — DUPLICATE the evaluation
+    // of a let-bound Rust call. A `let y := dbl x; sub2 y y` body is emitted as
+    // ONE `Call(dbl)` into a temporary read twice; the divergence this lane
+    // exists to refuse is the same call emitted TWICE (what zeta-substitution
+    // would have produced). The kernel cannot see it (`sub2 (dbl x) (dbl x)` and
+    // the once-body are def-eq), so the refusal must come from the structural
+    // node-for-node comparison — `clean_origin_let_rust_call_divergence_fails_build.rs`
+    // observes it from the driver. Fires only when a temporary is read twice by
+    // one `Call`; the arms below are untouched for every other body, and this
+    // arm returns early so the fixture pins the duplication alone. The
+    // duplicate is INSERTED right after the writer (index order stays
+    // execution order): appended at the end, side B's "last block is `Return`"
+    // rule would refuse it as unrecognised before the node COUNT was ever
+    // compared, and the fixture would be green for the wrong reason. Generic
+    // over any `Call` reading one bare non-parameter local twice; no other
+    // Clean-origin template emits such a `Call` today.
+    let twice_read = body.basic_blocks.iter_enumerated().find_map(|(bb, data)| {
+        let term = data.terminator.as_ref()?;
+        let TerminatorKind::Call { args, .. } = &term.kind else { return None };
+        let mut seen: Vec<Local> = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            if let Operand::Copy(place) | Operand::Move(place) = &arg.node
+                && place.projection.is_empty()
+                && place.local.as_usize() > arg_count
+            {
+                if seen.contains(&place.local) {
+                    return Some((bb, i, place.local));
+                }
+                seen.push(place.local);
+            }
+        }
+        None
+    });
+    if let Some((reader_bb, second_arg, temp)) = twice_read {
+        let writer_bb = body.basic_blocks.iter_enumerated().find_map(|(bb, data)| {
+            let term = data.terminator.as_ref()?;
+            match &term.kind {
+                TerminatorKind::Call { destination, target: Some(_), .. }
+                    if destination.local == temp && destination.projection.is_empty() =>
+                {
+                    Some(bb)
+                }
+                _ => None,
+            }
+        });
+        if let Some(writer_bb) = writer_bb {
+            let decl = &body.local_decls[temp];
+            let fresh = body
+                .local_decls
+                .push(rustc_middle::mir::LocalDecl::new(decl.ty, decl.source_info.span));
+            let mut duplicate = body.basic_blocks[writer_bb].terminator().clone();
+            let TerminatorKind::Call { destination, target, .. } = &mut duplicate.kind else {
+                unreachable!("found above as a Call")
+            };
+            *destination = Place::from(fresh);
+            // The duplicate goes at writer+1 and keeps the writer's old
+            // successor (renumbered below); every successor at or past that
+            // index shifts by one; then the writer flows into the duplicate.
+            // Evaluation order: original, duplicate, reader.
+            let dup_bb = rustc_middle::mir::BasicBlock::from_usize(writer_bb.as_usize() + 1);
+            let shift = |s: &mut rustc_middle::mir::BasicBlock| {
+                if *s >= dup_bb {
+                    *s = rustc_middle::mir::BasicBlock::from_usize(s.as_usize() + 1);
+                }
+            };
+            duplicate.successors_mut(shift);
+            for data in body.basic_blocks_mut().iter_mut() {
+                if let Some(term) = &mut data.terminator {
+                    term.successors_mut(shift);
+                }
+            }
+            body.basic_blocks_mut().raw.insert(
+                dup_bb.as_usize(),
+                rustc_middle::mir::BasicBlockData::new(Some(duplicate), false),
+            );
+            let reader_bb = if reader_bb >= dup_bb {
+                rustc_middle::mir::BasicBlock::from_usize(reader_bb.as_usize() + 1)
+            } else {
+                reader_bb
+            };
+            if let TerminatorKind::Call { target, .. } =
+                &mut body.basic_blocks_mut()[writer_bb].terminator_mut().kind
+            {
+                *target = Some(dup_bb);
+            }
+            if let TerminatorKind::Call { args, .. } =
+                &mut body.basic_blocks_mut()[reader_bb].terminator_mut().kind
+            {
+                args[second_arg].node = Operand::Copy(Place::from(fresh));
+            }
+            return;
+        }
+    }
     for block in body.basic_blocks_mut() {
+        // Trust (W5): the Rust-call chain mutation — swap the two arguments of
+        // a two-argument `Call`, so `sub2 a b` is emitted as `sub2 b a`. The
+        // kernel separates the two applications by congruence on the stuck
+        // callee (`control_23::half_2` measures it), and
+        // `clean_origin_rust_call_divergence_fails_build.rs` observes the
+        // refusal from the driver. Stated rather than hidden: this arm also
+        // perturbs a two-argument wrapping-binop body, which no fixture points
+        // the knob at.
+        if let Some(terminator) = &mut block.terminator
+            && let TerminatorKind::Call { args, .. } = &mut terminator.kind
+            && args.len() == 2
+        {
+            args.swap(0, 1);
+        }
         if let Some(terminator) = &mut block.terminator
             && let TerminatorKind::SwitchInt { targets, .. } = &mut terminator.kind
             && targets.all_targets().len() == 2
@@ -697,6 +1623,17 @@ fn materialize<'tcx>(
                 TemplateTy::Param { index } => param_tys[index],
                 TemplateTy::Bool => tcx.types.bool,
                 TemplateTy::ResultRef => Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, return_ty),
+                // Trust (W5): a Rust-call chain temporary, at ITS callee's
+                // result carrier — the plan's table is the decision, and the
+                // same `carrier_to_rustc_ty` mapping every other position uses.
+                TemplateTy::RustCalleeResult { index } => match plan.callees().get(index) {
+                    Some(callee) => carrier_to_rustc_ty(tcx, &callee.result, span),
+                    None => tcx.dcx().span_fatal(
+                        span,
+                        "internal: a Rust-call chain template names a callee outside the plan's \
+                         table. Please report it.",
+                    ),
+                },
             };
             let decl = LocalDecl::new(ty, span);
             if local.immutable { decl.immutable() } else { decl }
@@ -739,6 +1676,32 @@ fn materialize<'tcx>(
             TemplateOperand::BoolScalar(value) => {
                 Operand::const_from_scalar(tcx, tcx.types.bool, Scalar::from_bool(value), span)
             }
+            // Trust (W5): a numeral argument to a Rust callee, at the width of
+            // the callee PARAMETER's carrier (re-checked on the sealed plan).
+            // Side B reads the encoded width back and the kernel decides
+            // whether the callee accepts a literal there.
+            TemplateOperand::UIntScalar { value, width } => {
+                let ty = match width {
+                    8 => tcx.types.u8,
+                    16 => tcx.types.u16,
+                    32 => tcx.types.u32,
+                    64 => tcx.types.u64,
+                    other => tcx.dcx().span_fatal(
+                        span,
+                        format!(
+                            "internal: a Rust-call chain literal reached the emitter at width \
+                             {other}, which the sealed plan is required to refuse. Please \
+                             report it."
+                        ),
+                    ),
+                };
+                Operand::const_from_scalar(
+                    tcx,
+                    ty,
+                    Scalar::from_uint(value, Size::from_bits(u64::from(width))),
+                    span,
+                )
+            }
         }
     };
 
@@ -761,7 +1724,9 @@ fn materialize<'tcx>(
                             Box::new((operand(left), operand(right))),
                         ),
                         // Trust (§6f landing 7): the RAW BINARY OPERATOR at the
-                        // result carrier — `&`, `|`, `/`, `%`. A NEW
+                        // result carrier — `&`, `|`, `/`, `%`, and since
+                        // 2026-09-23 `^` and `>>` (no `<<`: see the `HShiftLeft`
+                        // demand in `trust_clean_origin::table`). A NEW
                         // realization primitive, and landing 4 made a new
                         // primitive a compile error in this wildcard-free match
                         // DELIBERATELY; this is that cost paid, exactly as
@@ -800,19 +1765,29 @@ fn materialize<'tcx>(
                         //
                         // The match is over `RawBinOpKind` and is CLOSED with
                         // no wildcard, exactly as the `SelectCmp` arm above is,
-                        // and for the same reason: a fifth operator must be a
+                        // and for the same reason: a new operator must be a
                         // compile error here rather than a fall-through into
-                        // the wrong instruction. Side B reads the emitted body
-                        // back through `RawBinOpKind::from_mir_binop`, whose
-                        // match is closed over the same four values — so a new
+                        // the wrong instruction (`^` and `>>` paid it on
+                        // 2026-09-23). Side B reads the emitted body back
+                        // through `RawBinOpKind::from_mir_binop`, whose match
+                        // is closed over the same values — so a new
                         // variant breaks BOTH directions at once, which is the
                         // property that keeps them from drifting.
                         TemplateRvalue::RawBin { op, left, right } => Rvalue::BinaryOp(
                             match op {
                                 RawBinOpKind::BitAnd => BinOp::BitAnd,
                                 RawBinOpKind::BitOr => BinOp::BitOr,
+                                RawBinOpKind::BitXor => BinOp::BitXor,
                                 RawBinOpKind::Div => BinOp::Div,
                                 RawBinOpKind::Rem => BinOp::Rem,
+                                // `Shr`, never `ShrUnchecked`: MIR's `Shr`
+                                // takes the amount as `RHS.rem_euclid(LHS::BITS)`
+                                // — Lean's own modulo-the-width reduction — so
+                                // it has no overflow case and needs no
+                                // `Assert`. The planner only emits a numeral
+                                // amount below the width anyway, because that
+                                // is all side B can reflect.
+                                RawBinOpKind::Shr => BinOp::Shr,
                             },
                             Box::new((operand(left), operand(right))),
                         ),
@@ -821,6 +1796,12 @@ fn materialize<'tcx>(
                             BorrowKind::Shared,
                             Place::from(Local::from_usize(of)),
                         ),
+                        // W6 (Rust-calls-Clean): boolean negation. `UnOp::Not`
+                        // on a `bool` operand is logical negation, exactly what
+                        // `rustc_mir_build` emits for `!b`.
+                        TemplateRvalue::BoolNot(value) => {
+                            Rvalue::UnaryOp(UnOp::Not, operand(value))
+                        }
                     };
                     Statement::new(
                         source_info,
@@ -833,9 +1814,10 @@ fn materialize<'tcx>(
                 .collect();
             let kind = match &block.terminator {
                 TemplateTerminator::Return => TerminatorKind::Return,
-                TemplateTerminator::Goto(target) => {
-                    TerminatorKind::Goto { target: BasicBlock::from_usize(*target) }
-                }
+                TemplateTerminator::Goto(target) => TerminatorKind::Goto {
+                    target: BasicBlock::from_usize(*target),
+                    loop_hint_attrs: Default::default(),
+                },
                 // `SwitchTargets::static_if(v, v_target, otherwise)` puts `v`'s
                 // target FIRST — the polarity trap the template's own
                 // `SwitchIntZero` names, and the exact mutation the divergence
@@ -854,10 +1836,10 @@ fn materialize<'tcx>(
                     TerminatorKind::Call {
                         func: Operand::function_handle(
                             tcx,
-                            resolve_template_callee(tcx, def, *callee, span),
+                            resolve_template_callee(tcx, def, plan, *callee, span),
                             // No generics on an inherent uint or `Nat` method,
                             // and none on the self-call.
-                            std::iter::empty::<GenericArg<'tcx>>(),
+                            &[],
                             span,
                         ),
                         args: args
@@ -876,11 +1858,7 @@ fn materialize<'tcx>(
                     }
                 }
             };
-            BasicBlockData::new_stmts(
-                stmts,
-                Some(Terminator { source_info, kind, attributes: ThinVec::new() }),
-                false,
-            )
+            BasicBlockData::new_stmts(stmts, Some(Terminator { source_info, kind }), false)
         })
         .collect();
 
@@ -928,6 +1906,7 @@ fn materialize<'tcx>(
 fn resolve_template_callee<'tcx>(
     tcx: TyCtxt<'tcx>,
     def: LocalDefId,
+    plan: &CleanOriginPlan,
     callee: TemplateCallee,
     span: Span,
 ) -> DefId {
@@ -937,7 +1916,118 @@ fn resolve_template_callee<'tcx>(
             resolve_core_wrapping_method(tcx, identity, span)
         }
         TemplateCallee::Primitive(identity) => resolve_bignum_method(tcx, identity, span),
+        TemplateCallee::RustFn { index } => resolve_rust_callee(tcx, plan, index, span),
     }
+}
+
+/// Trust (W5, Lean-calls-Rust): the REGISTERED `DefId` a plan's Rust callee
+/// denotes, cross-checked against everything the compiler knows about it
+/// before a call is emitted. Fatal, with the design's texts, on any skew.
+///
+/// Resolution is by IDENTITY, never by name: the plan's table row carries the
+/// rendering of a registered `DefId` (`rust_callee_table`), and the row is
+/// matched back to the `ResolverGlobalCtxt` entry whose `DefId` renders the
+/// same — so the `DefId` the mint linked the bare name to is the one called.
+/// Three cross-checks then bind that `DefId` to what typeck and the kernel
+/// saw:
+///
+/// * `tcx.fn_sig` must be exactly the carriers the plan calls it at (a
+///   `type u64 = …` shadow passes the AST-level admission and reaches here);
+/// * `tcx.item_name` must be the Clean name the kernel applied — a `NodeId`
+///   mix-up at the mint would otherwise call one function under another's
+///   name, which the kernel gate is BLIND to (it sees only the constant);
+/// * the `DefId` must be a local `fn`.
+// Trust: the recording collector reuses this exact identity/signature check.
+pub(crate) fn resolve_rust_callee<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    plan: &CleanOriginPlan,
+    index: usize,
+    span: Span,
+) -> DefId {
+    let Some(row) = plan.callees().get(index) else {
+        tcx.dcx().span_fatal(
+            span,
+            "internal: a Rust-call chain template names a callee outside the plan's table. \
+             Please report it.",
+        );
+    };
+    let candidates: Vec<&rustc_middle::ty::CleanRustCallee> = tcx
+        .resolutions(())
+        .clean_rust_callees
+        .iter()
+        .filter(|callee| {
+            callee.clean_name.as_str() == row.clean_name
+                && rust_callee_rendering(tcx, callee.def_id.to_def_id(), callee.span)
+                    == row.def_path
+        })
+        .collect();
+    let callee = match candidates[..] {
+        [callee] => callee,
+        ref found => tcx.dcx().span_fatal(
+            span,
+            format!(
+                "internal: resolution of Rust callee `{}` (`{}`) for Clean declaration `{}` was \
+                 {} ({} registered candidate(s)); the compiler will not guess which function \
+                 to emit a call to. Please report it.",
+                row.clean_name,
+                row.def_path,
+                plan.name(),
+                if found.is_empty() { "absent" } else { "ambiguous" },
+                found.len(),
+            ),
+        ),
+    };
+    let def_id = callee.def_id.to_def_id();
+
+    // The signature typeck checked `inc` against, versus the carriers the
+    // island applies it at.
+    let fed = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
+    let expected_inputs: Vec<Ty<'tcx>> =
+        row.params.iter().map(|ty| carrier_to_rustc_ty(tcx, ty, span)).collect();
+    let expected_output = carrier_to_rustc_ty(tcx, &row.result, span);
+    if fed.inputs() != expected_inputs.as_slice() || fed.output() != expected_output {
+        tcx.dcx().span_fatal(
+            span,
+            format!(
+                "internal: the signature typeck checked `{}` against (`fn({:?}) -> {:?}`) differs \
+                 from the carriers `{}` calls it at (`fn({:?}) -> {:?}`). The mint admitted the \
+                 callee from its AST spelling and the kernel typed the island at those \
+                 carriers, so a divergence here means a type alias or shadow reached the \
+                 callee's signature after admission. Please report it.",
+                row.clean_name,
+                fed.inputs(),
+                fed.output(),
+                plan.name(),
+                expected_inputs,
+                expected_output,
+            ),
+        );
+    }
+    if tcx.item_name(def_id).as_str() != row.clean_name {
+        tcx.dcx().span_fatal(
+            span,
+            format!(
+                "internal: the Rust item registered for Clean callee `{}` is named `{}`; the \
+                 kernel applied `{}`, so the mint's identity link is wrong and a call would go \
+                 to another function under this name. Please report it.",
+                row.clean_name,
+                tcx.item_name(def_id),
+                row.clean_name,
+            ),
+        );
+    }
+    if !matches!(tcx.def_kind(def_id), rustc_hir::def::DefKind::Fn) {
+        tcx.dcx().span_fatal(
+            span,
+            format!(
+                "internal: the Rust item registered for Clean callee `{}` is not a free `fn` \
+                 ({:?}). Please report it.",
+                row.clean_name,
+                tcx.def_kind(def_id),
+            ),
+        );
+    }
+    def_id
 }
 
 /// The `DefId` of core's inherent `u{width}::wrapping_{op}`, resolved from
@@ -1160,7 +2250,7 @@ pub(crate) fn carrier_to_rustc_ty<'tcx>(
                      compiler defect and nothing you write will change it. Please report it.",
                 );
             };
-            Ty::new_adt(tcx, tcx.adt_def(nat), rustc_middle::ty::List::empty())
+            Ty::new_adt(tcx, tcx.adt_def(nat), rustc_middle::ty::GenericArgs::empty())
         }
         other => tcx.dcx().span_fatal(
             span,
@@ -1172,5 +2262,38 @@ pub(crate) fn carrier_to_rustc_ty<'tcx>(
                  report it."
             ),
         ),
+    }
+}
+
+/// Trust (TG6, `COMPILE-TIME-FACTS-1`): this compiler's LOCAL KERNEL FACTS, so
+/// an elaboration it already performed on the same content imports its fact
+/// instead of elaborating and checking again. No option turns it off
+/// (STORE-1); without a private store under the cargo home, or without the
+/// driver image this process runs to name the compiler by (its path must still
+/// name the file the kernel reports its code mapped from), it is `None` and
+/// every session checks afresh. The resolver's mint opens the same context
+/// (`rustc_resolve::trust_clean_mint`).
+pub(crate) fn clean_facts(
+    sess: &rustc_session::Session,
+) -> Option<std::sync::Arc<trust_certify::clean_fact::FactContext>> {
+    let image = rustc_session::filesearch::current_dll_mapping().ok();
+    trust_certify::clean_fact::FactContext::for_compiler(
+        u32::from(sess.target.pointer_width),
+        option_env!("CFG_VER_HASH").unwrap_or("unknown"),
+        image.as_ref().map(|(path, file)| {
+            let mapped =
+                trust_certify::clean_fact::MappedImage { device: file.device, inode: file.inode };
+            (path.as_path(), mapped)
+        }),
+    )
+}
+
+/// Trust (TG6): read and write [`clean_facts`] in `session`.
+pub(crate) fn enable_clean_facts(
+    sess: &rustc_session::Session,
+    session: &mut trust_certify::clean_island::CleanIslandSession,
+) {
+    if let Some(facts) = clean_facts(sess) {
+        session.enable_facts(facts);
     }
 }

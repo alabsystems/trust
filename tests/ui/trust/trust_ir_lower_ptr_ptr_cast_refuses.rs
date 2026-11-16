@@ -1,11 +1,14 @@
 //@ dont-check-compiler-stderr
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-CP): the REFUSAL half of `trust_ir_lower_ptr_ptr_cast.rs`.
 //!
 //! The thin raw-ptr -> raw-ptr lane is a GATE, and each conjunct of that gate
 //! is a soundness claim. Under `strict` a refusal is a compile error, so the
 //! refusals cannot share a file with the check-pass admissions — they are
-//! pinned here, one function per conjunct, and every `//~ ERROR` below must
+//! pinned here, one function per conjunct, and every error annotation below must
 //! survive every future widening of the lane.
 //!
 //! `frame_addr_launder` is the witness that matters. Its operand is a LEDGERED
@@ -30,15 +33,19 @@ pub fn frame_addr_launder() -> *const u8 {
     core::ptr::addr_of!(x) as *const u8
 }
 
-// `ptr -> int`: asserts an ADDRESS the model does not have.
+// RE-PINNED 2026-09-14: `ptr -> int` and `int -> ptr` are ADMITTED since wave-ITP
+// (fa3dc5cef0, 2026-09-02) — the producer was the only refuser of a cast its own oracle
+// already mints: trust-ir-bridge answers `CastOp::PtrToInt` / `CastOp::IntToPtr` for the
+// same MIR casts, the reference interpreter executes them as first-class no-provenance
+// values, and the result joins no ledger. Measured on the 4d972edcfd stage1: both bodies
+// lower under `strict`. The conjuncts below (frame-address launder, thin<->fat, a
+// `ty::Ref` root) are still refused and stay pinned. The mut->const coercion once pinned
+// here is admitted since 94502e4acc6 and moved to `trust_ir_lower_ptr_ptr_cast.rs`.
 pub fn ptr_to_int(p: *const u8) -> usize {
-    //~^ ERROR -Ztrust-ir-lower=strict: the direct trust-ir producer could not fully lower this body
     p as usize
 }
 
-// `int -> ptr`: FABRICATES provenance.
 pub fn int_to_ptr(a: usize) -> *const u8 {
-    //~^ ERROR -Ztrust-ir-lower=strict: the direct trust-ir producer could not fully lower this body
     a as *const u8
 }
 
@@ -62,12 +69,3 @@ pub fn ref_chain(r: &u32) -> *const u8 {
 }
 
 fn main() {}
-
-// Trust (wave-CP, measured 2026-08-31): the mut->const direction is a rustc
-// COERCION, not an `ExprKind::Cast`, so it never reaches the wave-CP arm and
-// keeps its own precise refusal. Pinned here so that a future coercion lane
-// has to move this line deliberately rather than discover it.
-pub fn constify(p: *mut u32) -> *const u32 {
-    p as *const u32
-    //~^ ERROR
-}

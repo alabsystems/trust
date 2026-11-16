@@ -4,6 +4,130 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn rust_vs_trust_cli_domination_withholds_manual_proof_score() {
+    let temp = TempDir::new("domination-manual-proof-score");
+    let suite = temp.path().join("suite.toml");
+    fs::write(
+        &suite,
+        r#"schema_version = "targo-trust.rust-vs-trust-suite.v1"
+
+[[dimensions]]
+id = "proof.functional-best-existing-tools-alias"
+title = "Authored functional proof claim"
+category = "verification"
+metric = "score"
+required = false
+rust_value = 0.0
+trust_value = 1.0
+status = "pass"
+evidence = ["authored claim"]
+"#,
+    )
+    .expect("write domination suite");
+
+    let output = Command::new(targo_trust_binary())
+        .args(["trust", "domination", "--suite"])
+        .arg(&suite)
+        .arg("--json")
+        .output()
+        .expect("run domination with authored proof score");
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse domination JSON report");
+    assert_eq!(report["summary"]["trust_advantage_dimensions"], 0);
+    assert_eq!(report["dimensions"][0]["status"], "unknown");
+    assert_eq!(report["dimensions"][0]["trust_is_better"], false);
+}
+
+#[test]
+fn rust_vs_trust_cli_domination_withholds_manual_compatibility_and_feature_rows() {
+    let temp = TempDir::new("domination-manual-compat-feature");
+    let suite = temp.path().join("suite.toml");
+    fs::write(
+        &suite,
+        r#"schema_version = "targo-trust.rust-vs-trust-suite.v1"
+
+[policy]
+require_no_unknowns = false
+require_evidence_for_required = false
+require_trust_advantage = false
+
+[[dimensions]]
+id = "compat.rustc"
+title = "Authored compatibility claim"
+category = "compatibility"
+metric = "pass_rate"
+rust_value = 1.0
+trust_value = 1.0
+status = "pass"
+evidence = ["authored compatible"]
+
+[[dimensions]]
+id = "feature.frontdoor-cli"
+title = "Authored feature claim"
+category = "feature"
+metric = "score"
+rust_value = 0.0
+trust_value = 1.0
+status = "pass"
+evidence = ["targo trust check"]
+"#,
+    )
+    .expect("write domination suite");
+
+    let output = Command::new(targo_trust_binary())
+        .args(["trust", "domination", "--suite"])
+        .arg(&suite)
+        .arg("--json")
+        .output()
+        .expect("run domination with authored rows");
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse domination JSON report");
+    assert_eq!(report["summary"]["total_dimensions"], 2);
+    assert_eq!(report["summary"]["trust_advantage_dimensions"], 0);
+    assert_eq!(report["summary"]["trust_relative_index"], 0.0);
+    assert!(
+        report["dimensions"]
+            .as_array()
+            .expect("dimensions array")
+            .iter()
+            .all(|dimension| dimension["status"] == "unknown"
+                && dimension["trust_is_better"] == false)
+    );
+    assert_eq!(report["dimensions"][1]["evidence"][0], "targo trust check");
+}
+
+#[test]
+fn rust_vs_trust_cli_domination_default_features_are_diagnostic_only() {
+    let output = Command::new(targo_trust_binary())
+        .args(["trust", "domination", "--json"])
+        .output()
+        .expect("run default domination report");
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse default domination JSON report");
+    assert_eq!(report["verdict"], "not_superior");
+    assert_eq!(report["summary"]["total_dimensions"], 17);
+    assert_eq!(report["summary"]["required_dimensions"], 17);
+    assert_eq!(report["summary"]["trust_advantage_dimensions"], 0);
+    let features = report["dimensions"]
+        .as_array()
+        .expect("dimensions array")
+        .iter()
+        .filter(|dimension| dimension["id"].as_str().is_some_and(|id| id.starts_with("feature.")))
+        .collect::<Vec<_>>();
+    assert_eq!(features.len(), 3);
+    for feature in features {
+        assert_eq!(feature["status"], "unknown");
+        assert_eq!(feature["trust_is_better"], false);
+        assert_eq!(feature["rust_value"], 0.0);
+        assert_eq!(feature["trust_value"], 1.0);
+        assert!(!feature["evidence"].as_array().expect("evidence array").is_empty());
+    }
+}
+
+#[test]
 fn rust_vs_trust_cli_domination_upstream_tests_is_first_class_targo_trust_command() {
     let output = Command::new(targo_trust_binary())
         .args(["trust", "domination", "upstream-tests", "--help"])
@@ -380,6 +504,8 @@ fn rust_vs_trust_cli_domination_upstream_tests_dispatches_to_rust_porting_front_
         "--locked",
         "--",
         "port",
+        "--proof-scope",
+        "upstream-rust",
         "--no-execute",
         "--no-apply",
         "--no-fetch",

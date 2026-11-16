@@ -10,6 +10,7 @@
 
 #include "HMCUtils.h"
 
+#include "Dialect/Impulse/Impulse.h"
 #include "Dialect/Ops.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -20,7 +21,7 @@
 
 using namespace mlir;
 using namespace mlir::enzyme;
-using namespace mlir::enzyme::MCMC;
+using namespace mlir::impulse;
 
 SmallVector<Value> NUTSTreeState::toValues() const {
   return {q_left,        p_left,        grad_left,
@@ -60,8 +61,8 @@ SmallVector<Type> NUTSTreeState::getTypes() const {
   return types;
 }
 
-Value MCMC::conditionalDump(OpBuilder &builder, Location loc, Value value,
-                            StringRef label, bool debugDump) {
+Value impulse::conditionalDump(OpBuilder &builder, Location loc, Value value,
+                               StringRef label, bool debugDump) {
   if (debugDump) {
     return enzyme::DumpOp::create(builder, loc, value.getType(), value,
                                   builder.getStringAttr(label))
@@ -123,21 +124,21 @@ static Value reverseRowsAndColumns(OpBuilder &builder, Location loc,
   auto P = createPermutationMatrix(builder, loc, matrixType);
 
   // PA = P @ A
-  auto PA = enzyme::DotOp::create(
+  auto PA = impulse::DotOp::create(
       builder, loc, matrixType, P, matrix, builder.getDenseI64ArrayAttr({}),
       builder.getDenseI64ArrayAttr({}), builder.getDenseI64ArrayAttr({1}),
       builder.getDenseI64ArrayAttr({0}));
 
   // PAP = PA @ P
-  return enzyme::DotOp::create(
+  return impulse::DotOp::create(
       builder, loc, matrixType, PA, P, builder.getDenseI64ArrayAttr({}),
       builder.getDenseI64ArrayAttr({}), builder.getDenseI64ArrayAttr({1}),
       builder.getDenseI64ArrayAttr({0}));
 }
 
-Value MCMC::applyInverseMassMatrix(OpBuilder &builder, Location loc,
-                                   Value invMass, Value momentum,
-                                   RankedTensorType positionType) {
+Value impulse::applyInverseMassMatrix(OpBuilder &builder, Location loc,
+                                      Value invMass, Value momentum,
+                                      RankedTensorType positionType) {
   if (!invMass) {
     return momentum;
   }
@@ -147,11 +148,11 @@ Value MCMC::applyInverseMassMatrix(OpBuilder &builder, Location loc,
   if (invMassType.getRank() == 1) {
     // Diagonal: element-wise
     auto diagMass =
-        enzyme::ReshapeOp::create(builder, loc, positionType, invMass);
+        impulse::ReshapeOp::create(builder, loc, positionType, invMass);
     return arith::MulFOp::create(builder, loc, diagMass, momentum);
   } else if (invMassType.getRank() == 2) {
     // Dense: v = invMass @ p
-    return enzyme::DotOp::create(
+    return impulse::DotOp::create(
         builder, loc, positionType, momentum, invMass,
         builder.getDenseI64ArrayAttr({}), builder.getDenseI64ArrayAttr({}),
         builder.getDenseI64ArrayAttr({1}), builder.getDenseI64ArrayAttr({0}));
@@ -162,9 +163,9 @@ Value MCMC::applyInverseMassMatrix(OpBuilder &builder, Location loc,
   return nullptr;
 }
 
-Value MCMC::computeKineticEnergy(OpBuilder &builder, Location loc,
-                                 Value momentum, Value invMass,
-                                 RankedTensorType positionType) {
+Value impulse::computeKineticEnergy(OpBuilder &builder, Location loc,
+                                    Value momentum, Value invMass,
+                                    RankedTensorType positionType) {
   auto elemType = positionType.getElementType();
   auto scalarType = RankedTensorType::get({}, elemType);
 
@@ -178,7 +179,7 @@ Value MCMC::computeKineticEnergy(OpBuilder &builder, Location loc,
 
   // K = 0.5 * p^T @ v
   // For 2D tensors [1, N], contract over both dimensions to get scalar
-  auto pDotV = enzyme::DotOp::create(
+  auto pDotV = impulse::DotOp::create(
       builder, loc, scalarType, momentum, v, builder.getDenseI64ArrayAttr({}),
       builder.getDenseI64ArrayAttr({}), builder.getDenseI64ArrayAttr({0, 1}),
       builder.getDenseI64ArrayAttr({0, 1}));
@@ -186,9 +187,9 @@ Value MCMC::computeKineticEnergy(OpBuilder &builder, Location loc,
   return arith::MulFOp::create(builder, loc, halfConst, pDotV);
 }
 
-Value MCMC::computeMassMatrixSqrt(OpBuilder &builder, Location loc,
-                                  Value invMass,
-                                  RankedTensorType positionType) {
+Value impulse::computeMassMatrixSqrt(OpBuilder &builder, Location loc,
+                                     Value invMass,
+                                     RankedTensorType positionType) {
   if (!invMass) {
     return Value();
   }
@@ -211,28 +212,27 @@ Value MCMC::computeMassMatrixSqrt(OpBuilder &builder, Location loc,
     // https://github.com/pyro-ppl/numpyro/blob/6a9cb9a530fe53897edb6c472368e58965b034e4/numpyro/infer/hmc_util.py#L499
     auto reversedInvMass = reverseRowsAndColumns(builder, loc, invMass);
     auto L_reversed =
-        enzyme::CholeskyOp::create(builder, loc, invMassType, reversedInvMass,
-                                   /*lower=*/builder.getBoolAttr(true));
+        impulse::CholeskyOp::create(builder, loc, invMassType, reversedInvMass,
+                                    /*lower=*/builder.getBoolAttr(true));
     auto massMatrixSqrtInvT = reverseRowsAndColumns(builder, loc, L_reversed);
     auto identityMatrix = createIdentityMatrix(builder, loc, invMassType);
-    auto massMatrixSqrt = enzyme::TriangularSolveOp::create(
+    auto massMatrixSqrt = impulse::TriangularSolveOp::create(
         builder, loc, invMassType, massMatrixSqrtInvT, identityMatrix,
         /*left_side=*/builder.getBoolAttr(true),
         /*lower=*/builder.getBoolAttr(false),
         /*unit_diagonal=*/builder.getBoolAttr(false),
         /*transpose_a=*/
-        enzyme::TransposeAttr::get(builder.getContext(),
-                                   enzyme::Transpose::TRANSPOSE));
+        impulse::TransposeAttr::get(builder.getContext(),
+                                    impulse::Transpose::TRANSPOSE));
 
     return massMatrixSqrt;
   }
 }
 
-std::pair<Value, Value> MCMC::sampleMomentum(OpBuilder &builder, Location loc,
-                                             Value rng, Value invMass,
-                                             Value massMatrixSqrt,
-                                             RankedTensorType positionType,
-                                             bool debugDump) {
+std::pair<Value, Value>
+impulse::sampleMomentum(OpBuilder &builder, Location loc, Value rng,
+                        Value invMass, Value massMatrixSqrt,
+                        RankedTensorType positionType, bool debugDump) {
   auto elemType = positionType.getElementType();
   auto scalarType = RankedTensorType::get({}, elemType);
 
@@ -247,11 +247,11 @@ std::pair<Value, Value> MCMC::sampleMomentum(OpBuilder &builder, Location loc,
                         debugDump);
 
   // Sample eps ~ N(0, I)
-  auto randomOp = enzyme::RandomOp::create(
+  auto randomOp = impulse::RandomOp::create(
       builder, loc, TypeRange{rng.getType(), positionType}, rng, zeroConst,
       oneConst,
-      enzyme::RngDistributionAttr::get(builder.getContext(),
-                                       enzyme::RngDistribution::NORMAL));
+      impulse::RngDistributionAttr::get(builder.getContext(),
+                                        impulse::RngDistribution::NORMAL));
 
   auto rngOut = randomOp.getOutputRngState();
   auto eps = randomOp.getResult();
@@ -265,12 +265,12 @@ std::pair<Value, Value> MCMC::sampleMomentum(OpBuilder &builder, Location loc,
   if (massMatrixSqrtType.getRank() == 1) {
     // Diagonal: p = massMatrixSqrt * eps (element-wise)
     auto diagSqrt =
-        enzyme::ReshapeOp::create(builder, loc, positionType, massMatrixSqrt);
+        impulse::ReshapeOp::create(builder, loc, positionType, massMatrixSqrt);
     auto p = arith::MulFOp::create(builder, loc, diagSqrt, eps);
     return {p, rngOut};
   } else {
     // Dense: p = massMatrixSqrt @ eps
-    auto p = enzyme::DotOp::create(
+    auto p = impulse::DotOp::create(
         builder, loc, positionType, eps, massMatrixSqrt,
         builder.getDenseI64ArrayAttr({}), builder.getDenseI64ArrayAttr({}),
         builder.getDenseI64ArrayAttr({1}), builder.getDenseI64ArrayAttr({1}));
@@ -297,7 +297,7 @@ static Value scatterPositionToTrace(OpBuilder &builder, Location loc,
         DenseElementsAttr::get(i64TensorType,
                                builder.getI64IntegerAttr(info.offset)));
     SmallVector<Value> extractIndices{c0, posOffset};
-    auto slice = enzyme::DynamicSliceOp::create(
+    auto slice = impulse::DynamicSliceOp::create(
         builder, loc, sliceType, position2d, extractIndices,
         builder.getDenseI64ArrayAttr({1, info.size}));
 
@@ -306,8 +306,8 @@ static Value scatterPositionToTrace(OpBuilder &builder, Location loc,
         DenseElementsAttr::get(i64TensorType,
                                builder.getI64IntegerAttr(info.traceOffset)));
     SmallVector<Value> updateIndices{c0, traceOffset};
-    result = enzyme::DynamicUpdateSliceOp::create(builder, loc, traceType,
-                                                  result, slice, updateIndices);
+    result = impulse::DynamicUpdateSliceOp::create(
+        builder, loc, traceType, result, slice, updateIndices);
   }
   return result;
 }
@@ -334,7 +334,7 @@ static Value gatherPositionFromTrace(OpBuilder &builder, Location loc,
         DenseElementsAttr::get(i64TensorType,
                                builder.getI64IntegerAttr(info.traceOffset)));
     SmallVector<Value> extractIndices{c0, traceOffset};
-    auto slice = enzyme::DynamicSliceOp::create(
+    auto slice = impulse::DynamicSliceOp::create(
         builder, loc, sliceType, fullTrace, extractIndices,
         builder.getDenseI64ArrayAttr({1, info.size}));
 
@@ -343,16 +343,16 @@ static Value gatherPositionFromTrace(OpBuilder &builder, Location loc,
         DenseElementsAttr::get(i64TensorType,
                                builder.getI64IntegerAttr(info.offset)));
     SmallVector<Value> updateIndices{c0, posOffset};
-    result = enzyme::DynamicUpdateSliceOp::create(builder, loc, positionType2d,
-                                                  result, slice, updateIndices);
+    result = impulse::DynamicUpdateSliceOp::create(
+        builder, loc, positionType2d, result, slice, updateIndices);
   }
   return result;
 }
 
-GradientResult MCMC::computePotentialAndGradient(OpBuilder &builder,
-                                                 Location loc, Value position,
-                                                 Value rng,
-                                                 const HMCContext &ctx) {
+GradientResult impulse::computePotentialAndGradient(OpBuilder &builder,
+                                                    Location loc,
+                                                    Value position, Value rng,
+                                                    const HMCContext &ctx) {
   auto positionType = ctx.getPositionType();
   auto scalarType = ctx.getScalarType();
   auto elemType = ctx.getElementType();
@@ -361,26 +361,47 @@ GradientResult MCMC::computePotentialAndGradient(OpBuilder &builder,
       builder, loc, scalarType,
       DenseElementsAttr::get(scalarType, builder.getFloatAttr(elemType, 1.0)));
 
-  SmallVector<Value> autodiffInputs{position, gradSeed};
+  bool isCustomLogpdf = ctx.hasCustomLogpdf();
+  auto flatType = RankedTensorType::get({ctx.positionSize}, elemType);
+  Value autodiffPosition = position;
+  auto autodiffPositionType = positionType;
+  auto autodiffGradType = positionType;
+  if (isCustomLogpdf) {
+    autodiffPosition =
+        impulse::ReshapeOp::create(builder, loc, flatType, position);
+    autodiffPositionType = flatType;
+    autodiffGradType = flatType;
+  }
+
+  SmallVector<Value> autodiffInputs{autodiffPosition, gradSeed};
+  SmallVector<NamedAttribute> adAttrs{
+      builder.getNamedAttr(
+          "activity",
+          builder.getArrayAttr({enzyme::ActivityAttr::get(
+              builder.getContext(), enzyme::Activity::enzyme_active)})),
+      builder.getNamedAttr(
+          "ret_activity",
+          builder.getArrayAttr(
+              {enzyme::ActivityAttr::get(builder.getContext(),
+                                         enzyme::Activity::enzyme_active),
+               enzyme::ActivityAttr::get(builder.getContext(),
+                                         enzyme::Activity::enzyme_const)})),
+  };
+  if (ctx.autodiffAttrs) {
+    for (auto attr : ctx.autodiffAttrs)
+      adAttrs.push_back(attr);
+  }
   auto autodiffOp = enzyme::AutoDiffRegionOp::create(
-      builder, loc, TypeRange{scalarType, rng.getType(), positionType},
-      autodiffInputs,
-      builder.getArrayAttr({enzyme::ActivityAttr::get(
-          builder.getContext(), enzyme::Activity::enzyme_active)}),
-      builder.getArrayAttr(
-          {enzyme::ActivityAttr::get(builder.getContext(),
-                                     enzyme::Activity::enzyme_active),
-           enzyme::ActivityAttr::get(builder.getContext(),
-                                     enzyme::Activity::enzyme_const)}),
-      builder.getI64IntegerAttr(1), builder.getBoolAttr(false), nullptr);
+      builder, loc, TypeRange{scalarType, rng.getType(), autodiffGradType},
+      autodiffInputs, adAttrs);
 
   Block *autodiffBlock = builder.createBlock(&autodiffOp.getBody());
-  autodiffBlock->addArgument(positionType, loc);
+  autodiffBlock->addArgument(autodiffPositionType, loc);
 
   builder.setInsertionPointToStart(autodiffBlock);
   Value qArg = autodiffBlock->getArgument(0);
 
-  if (ctx.hasCustomLogpdf()) {
+  if (isCustomLogpdf) {
     SmallVector<Value> callArgs;
     callArgs.push_back(qArg);
     callArgs.append(ctx.fnInputs.begin(), ctx.fnInputs.end());
@@ -407,7 +428,7 @@ GradientResult MCMC::computePotentialAndGradient(OpBuilder &builder,
     generateResultTypes.append(ctx.fnResultTypes.begin(),
                                ctx.fnResultTypes.end());
 
-    auto generateOp = enzyme::GenerateOp::create(
+    auto generateOp = impulse::GenerateOp::create(
         builder, loc, generateResultTypes, ctx.fn, generateInputs, fullTrace,
         ctx.allAddresses, ctx.allAddresses, builder.getStringAttr(""));
 
@@ -424,23 +445,29 @@ GradientResult MCMC::computePotentialAndGradient(OpBuilder &builder,
 
   builder.setInsertionPointAfter(autodiffOp);
 
+  Value grad = autodiffOp.getResult(2);
+  if (isCustomLogpdf) {
+    grad = impulse::ReshapeOp::create(builder, loc, positionType, grad);
+  }
+
   return {
       autodiffOp.getResult(0), // U
-      autodiffOp.getResult(2), // grad
+      grad,                    // grad
       autodiffOp.getResult(1)  // rng
   };
 }
 
-IntegrationResult MCMC::computeIntegrationStep(OpBuilder &builder, Location loc,
-                                               const IntegratorState &leaf,
-                                               Value rng, Value direction,
-                                               const HMCContext &ctx) {
+IntegrationResult impulse::computeIntegrationStep(OpBuilder &builder,
+                                                  Location loc,
+                                                  const IntegratorState &leaf,
+                                                  Value rng, Value direction,
+                                                  const HMCContext &ctx) {
   auto positionType = ctx.getPositionType();
   auto scalarType = ctx.getScalarType();
   auto elemType = ctx.getElementType();
 
   auto negStepSize = arith::NegFOp::create(builder, loc, ctx.stepSize);
-  Value signedStepSize = enzyme::SelectOp::create(
+  Value signedStepSize = impulse::SelectOp::create(
       builder, loc, scalarType, direction, ctx.stepSize, negStepSize);
 
   auto halfConst = arith::ConstantOp::create(
@@ -449,13 +476,13 @@ IntegrationResult MCMC::computeIntegrationStep(OpBuilder &builder, Location loc,
 
   ArrayRef<int64_t> shape = positionType.getShape();
   auto stepSizeBroadcast =
-      enzyme::BroadcastOp::create(builder, loc, positionType, signedStepSize,
-                                  builder.getDenseI64ArrayAttr(shape));
+      BroadcastOp::create(builder, loc, positionType, signedStepSize,
+                          builder.getDenseI64ArrayAttr(shape));
   auto halfStep =
       arith::MulFOp::create(builder, loc, halfConst, signedStepSize);
   auto halfStepBroadcast =
-      enzyme::BroadcastOp::create(builder, loc, positionType, halfStep,
-                                  builder.getDenseI64ArrayAttr(shape));
+      BroadcastOp::create(builder, loc, positionType, halfStep,
+                          builder.getDenseI64ArrayAttr(shape));
 
   // 1. Half step momentum: p_half = p - 0.5 * eps * grad
   auto deltaP1 =
@@ -479,8 +506,8 @@ IntegrationResult MCMC::computeIntegrationStep(OpBuilder &builder, Location loc,
   return {qNew, pNew, gradResult.grad, gradResult.U, gradResult.rng};
 }
 
-Value MCMC::checkTurning(OpBuilder &builder, Location loc, Value pLeft,
-                         Value pRight, Value pSum, const NUTSContext &ctx) {
+Value impulse::checkTurning(OpBuilder &builder, Location loc, Value pLeft,
+                            Value pRight, Value pSum, const NUTSContext &ctx) {
   auto positionType = ctx.getPositionType();
   auto scalarType = ctx.getScalarType();
   auto elemType = ctx.getElementType();
@@ -498,7 +525,7 @@ Value MCMC::checkTurning(OpBuilder &builder, Location loc, Value pLeft,
       applyInverseMassMatrix(builder, loc, ctx.invMass, pRight, positionType);
 
   // p_sum_centered = p_sum - (p_left + p_right) / 2
-  auto halfBroadcast = enzyme::BroadcastOp::create(
+  auto halfBroadcast = BroadcastOp::create(
       builder, loc, positionType, halfConst,
       builder.getDenseI64ArrayAttr(positionType.getShape()));
 
@@ -507,12 +534,12 @@ Value MCMC::checkTurning(OpBuilder &builder, Location loc, Value pLeft,
       arith::MulFOp::create(builder, loc, halfBroadcast, pLeftPlusPRight);
   Value pSumCentered = arith::SubFOp::create(builder, loc, pSum, halfSum);
 
-  auto leftAngle = enzyme::DotOp::create(
+  auto leftAngle = impulse::DotOp::create(
       builder, loc, scalarType, vLeft, pSumCentered,
       builder.getDenseI64ArrayAttr({}), builder.getDenseI64ArrayAttr({}),
       builder.getDenseI64ArrayAttr({0, 1}),
       builder.getDenseI64ArrayAttr({0, 1}));
-  auto rightAngle = enzyme::DotOp::create(
+  auto rightAngle = impulse::DotOp::create(
       builder, loc, scalarType, vRight, pSumCentered,
       builder.getDenseI64ArrayAttr({}), builder.getDenseI64ArrayAttr({}),
       builder.getDenseI64ArrayAttr({0, 1}),
@@ -527,17 +554,18 @@ Value MCMC::checkTurning(OpBuilder &builder, Location loc, Value pLeft,
   return arith::OrIOp::create(builder, loc, leftNeg, rightNeg);
 }
 
-Value MCMC::computeUniformTransitionProb(OpBuilder &builder, Location loc,
-                                         Value currentWeight, Value newWeight) {
+Value impulse::computeUniformTransitionProb(OpBuilder &builder, Location loc,
+                                            Value currentWeight,
+                                            Value newWeight) {
   Value weightDiff =
       arith::SubFOp::create(builder, loc, newWeight, currentWeight);
-  return enzyme::LogisticOp::create(builder, loc, weightDiff.getType(),
-                                    weightDiff);
+  return impulse::LogisticOp::create(builder, loc, weightDiff.getType(),
+                                     weightDiff);
 }
 
-Value MCMC::computeBiasedTransitionProb(OpBuilder &builder, Location loc,
-                                        Value currentWeight, Value newWeight,
-                                        Value turning, Value diverging) {
+Value impulse::computeBiasedTransitionProb(OpBuilder &builder, Location loc,
+                                           Value currentWeight, Value newWeight,
+                                           Value turning, Value diverging) {
   auto resultType = cast<RankedTensorType>(currentWeight.getType());
   auto elemType = resultType.getElementType();
 
@@ -559,11 +587,11 @@ Value MCMC::computeBiasedTransitionProb(OpBuilder &builder, Location loc,
                                  zeroConst, clippedProb);
 }
 
-NUTSTreeState MCMC::combineTrees(OpBuilder &builder, Location loc,
-                                 const NUTSTreeState &tree,
-                                 const NUTSTreeState &subTree, Value direction,
-                                 Value rng, bool biased,
-                                 const NUTSContext &ctx) {
+NUTSTreeState impulse::combineTrees(OpBuilder &builder, Location loc,
+                                    const NUTSTreeState &tree,
+                                    const NUTSTreeState &subTree,
+                                    Value direction, Value rng, bool biased,
+                                    const NUTSContext &ctx) {
   auto positionType = ctx.getPositionType();
   auto scalarType = ctx.getScalarType();
   auto elemType = ctx.getElementType();
@@ -576,21 +604,21 @@ NUTSTreeState MCMC::combineTrees(OpBuilder &builder, Location loc,
       builder, loc, scalarType,
       DenseElementsAttr::get(scalarType, builder.getFloatAttr(elemType, 1.0)));
 
-  auto qLeft = enzyme::SelectOp::create(builder, loc, positionType, direction,
-                                        tree.q_left, subTree.q_left);
-  auto pLeft = enzyme::SelectOp::create(builder, loc, positionType, direction,
-                                        tree.p_left, subTree.p_left);
-  auto gradLeft = enzyme::SelectOp::create(
+  auto qLeft = impulse::SelectOp::create(builder, loc, positionType, direction,
+                                         tree.q_left, subTree.q_left);
+  auto pLeft = impulse::SelectOp::create(builder, loc, positionType, direction,
+                                         tree.p_left, subTree.p_left);
+  auto gradLeft = impulse::SelectOp::create(
       builder, loc, positionType, direction, tree.grad_left, subTree.grad_left);
-  auto qRight = enzyme::SelectOp::create(builder, loc, positionType, direction,
-                                         subTree.q_right, tree.q_right);
-  auto pRight = enzyme::SelectOp::create(builder, loc, positionType, direction,
-                                         subTree.p_right, tree.p_right);
+  auto qRight = impulse::SelectOp::create(builder, loc, positionType, direction,
+                                          subTree.q_right, tree.q_right);
+  auto pRight = impulse::SelectOp::create(builder, loc, positionType, direction,
+                                          subTree.p_right, tree.p_right);
   auto gradRight =
-      enzyme::SelectOp::create(builder, loc, positionType, direction,
-                               subTree.grad_right, tree.grad_right);
+      impulse::SelectOp::create(builder, loc, positionType, direction,
+                                subTree.grad_right, tree.grad_right);
 
-  auto combinedWeight = enzyme::LogAddExpOp::create(
+  auto combinedWeight = impulse::LogAddExpOp::create(
       builder, loc, scalarType, tree.weight, subTree.weight);
 
   // Compute transition probability
@@ -604,11 +632,11 @@ NUTSTreeState MCMC::combineTrees(OpBuilder &builder, Location loc,
         computeUniformTransitionProb(builder, loc, tree.weight, subTree.weight);
   }
 
-  auto randomOp = enzyme::RandomOp::create(
+  auto randomOp = impulse::RandomOp::create(
       builder, loc, TypeRange{rng.getType(), scalarType}, rng, zeroConst,
       oneConst,
-      enzyme::RngDistributionAttr::get(builder.getContext(),
-                                       enzyme::RngDistribution::UNIFORM));
+      impulse::RngDistributionAttr::get(builder.getContext(),
+                                        impulse::RngDistribution::UNIFORM));
   auto rngOut = randomOp.getOutputRngState();
   auto uniformSample = randomOp.getResult();
 
@@ -616,14 +644,14 @@ NUTSTreeState MCMC::combineTrees(OpBuilder &builder, Location loc,
       builder, loc, arith::CmpFPredicate::OLT, uniformSample, transitionProb);
 
   auto qProposal =
-      enzyme::SelectOp::create(builder, loc, positionType, acceptNew,
-                               subTree.q_proposal, tree.q_proposal);
+      impulse::SelectOp::create(builder, loc, positionType, acceptNew,
+                                subTree.q_proposal, tree.q_proposal);
   auto gradProposal =
-      enzyme::SelectOp::create(builder, loc, positionType, acceptNew,
-                               subTree.grad_proposal, tree.grad_proposal);
-  auto UProposal = enzyme::SelectOp::create(
+      impulse::SelectOp::create(builder, loc, positionType, acceptNew,
+                                subTree.grad_proposal, tree.grad_proposal);
+  auto UProposal = impulse::SelectOp::create(
       builder, loc, scalarType, acceptNew, subTree.U_proposal, tree.U_proposal);
-  auto HProposal = enzyme::SelectOp::create(
+  auto HProposal = impulse::SelectOp::create(
       builder, loc, scalarType, acceptNew, subTree.H_proposal, tree.H_proposal);
 
   auto oneI64 = arith::ConstantOp::create(
@@ -670,16 +698,16 @@ NUTSTreeState MCMC::combineTrees(OpBuilder &builder, Location loc,
           .rng = rngOut};
 }
 
-InitialHMCState MCMC::InitHMC(OpBuilder &builder, Location loc, Value rng,
-                              const HMCContext &ctx, Value initialPosition,
-                              bool debugDump) {
+InitialHMCState impulse::InitHMC(OpBuilder &builder, Location loc, Value rng,
+                                 const HMCContext &ctx, Value initialPosition,
+                                 bool debugDump) {
   auto positionType = ctx.getPositionType();
   auto scalarType = ctx.getScalarType();
   auto elemType = ctx.getElementType();
 
-  auto initSplit = enzyme::RandomSplitOp::create(
+  auto initSplit = impulse::RandomSplitOp::create(
       builder, loc, TypeRange{rng.getType(), rng.getType()}, rng);
-  auto kernelSplit = enzyme::RandomSplitOp::create(
+  auto kernelSplit = impulse::RandomSplitOp::create(
       builder, loc, TypeRange{rng.getType(), rng.getType(), rng.getType()},
       initSplit.getResult(0));
   auto rngForSampleKernel = kernelSplit.getResult(0);
@@ -690,8 +718,10 @@ InitialHMCState MCMC::InitHMC(OpBuilder &builder, Location loc, Value rng,
 
   if (ctx.hasCustomLogpdf()) {
     q0 = initialPosition;
+    auto flatType = RankedTensorType::get({ctx.positionSize}, elemType);
+    auto q0Flat = impulse::ReshapeOp::create(builder, loc, flatType, q0);
     SmallVector<Value> callArgs;
-    callArgs.push_back(q0);
+    callArgs.push_back(q0Flat);
     callArgs.append(ctx.fnInputs.begin(), ctx.fnInputs.end());
     auto callOp = func::CallOp::create(builder, loc, ctx.logpdfFn,
                                        TypeRange{scalarType}, callArgs);
@@ -721,7 +751,7 @@ InitialHMCState MCMC::InitHMC(OpBuilder &builder, Location loc, Value rng,
     generateResultTypesInit.append(ctx.fnResultTypes.begin(),
                                    ctx.fnResultTypes.end());
 
-    auto generateOpInit = enzyme::GenerateOp::create(
+    auto generateOpInit = impulse::GenerateOp::create(
         builder, loc, generateResultTypesInit, ctx.fn, generateInputsInit,
         fullTraceInit, ctx.allAddresses, ctx.allAddresses,
         builder.getStringAttr(""));
@@ -734,30 +764,50 @@ InitialHMCState MCMC::InitHMC(OpBuilder &builder, Location loc, Value rng,
   }
 
   // 4. Compute initial gradient at q0
+  bool isCustomLogpdf = ctx.hasCustomLogpdf();
+  auto flatType = RankedTensorType::get({ctx.positionSize}, elemType);
+  Value autodiffQ0 = q0;
+  auto autodiffQ0Type = positionType;
+  auto autodiffGradType = positionType;
+  if (isCustomLogpdf) {
+    autodiffQ0 = impulse::ReshapeOp::create(builder, loc, flatType, q0);
+    autodiffQ0Type = flatType;
+    autodiffGradType = flatType;
+  }
+
   auto gradSeedInit = arith::ConstantOp::create(
       builder, loc, scalarType,
       DenseElementsAttr::get(scalarType, builder.getFloatAttr(elemType, 1.0)));
-  SmallVector<Value> autodiffInputs{q0, gradSeedInit};
+  SmallVector<Value> autodiffInputs{autodiffQ0, gradSeedInit};
+  SmallVector<NamedAttribute> adInitAttrs{
+      builder.getNamedAttr(
+          "activity",
+          builder.getArrayAttr({enzyme::ActivityAttr::get(
+              builder.getContext(), enzyme::Activity::enzyme_active)})),
+      builder.getNamedAttr(
+          "ret_activity",
+          builder.getArrayAttr(
+              {enzyme::ActivityAttr::get(builder.getContext(),
+                                         enzyme::Activity::enzyme_active),
+               enzyme::ActivityAttr::get(builder.getContext(),
+                                         enzyme::Activity::enzyme_const)})),
+  };
+  if (ctx.autodiffAttrs) {
+    for (auto attr : ctx.autodiffAttrs)
+      adInitAttrs.push_back(attr);
+  }
   auto autodiffInit = enzyme::AutoDiffRegionOp::create(
       builder, loc,
-      TypeRange{scalarType, rngForAutodiff.getType(), positionType},
-      autodiffInputs,
-      builder.getArrayAttr({enzyme::ActivityAttr::get(
-          builder.getContext(), enzyme::Activity::enzyme_active)}),
-      builder.getArrayAttr(
-          {enzyme::ActivityAttr::get(builder.getContext(),
-                                     enzyme::Activity::enzyme_active),
-           enzyme::ActivityAttr::get(builder.getContext(),
-                                     enzyme::Activity::enzyme_const)}),
-      builder.getI64IntegerAttr(1), builder.getBoolAttr(false), nullptr);
+      TypeRange{scalarType, rngForAutodiff.getType(), autodiffGradType},
+      autodiffInputs, adInitAttrs);
 
   Block *autodiffInitBlock = builder.createBlock(&autodiffInit.getBody());
-  autodiffInitBlock->addArgument(positionType, loc);
+  autodiffInitBlock->addArgument(autodiffQ0Type, loc);
 
   builder.setInsertionPointToStart(autodiffInitBlock);
   auto q0Arg = autodiffInitBlock->getArgument(0);
 
-  if (ctx.hasCustomLogpdf()) {
+  if (isCustomLogpdf) {
     SmallVector<Value> callArgs;
     callArgs.push_back(q0Arg);
     callArgs.append(ctx.fnInputs.begin(), ctx.fnInputs.end());
@@ -784,7 +834,7 @@ InitialHMCState MCMC::InitHMC(OpBuilder &builder, Location loc, Value rng,
     generateResultTypesInner.append(ctx.fnResultTypes.begin(),
                                     ctx.fnResultTypes.end());
 
-    auto generateOpInner = enzyme::GenerateOp::create(
+    auto generateOpInner = impulse::GenerateOp::create(
         builder, loc, generateResultTypesInner, ctx.fn, generateInputsInner,
         fullTraceInner, ctx.allAddresses, ctx.allAddresses,
         builder.getStringAttr(""));
@@ -801,15 +851,17 @@ InitialHMCState MCMC::InitHMC(OpBuilder &builder, Location loc, Value rng,
   }
   builder.setInsertionPointAfter(autodiffInit);
 
-  // (U, rng, grad)
-  auto grad0 = autodiffInit.getResult(2);
+  Value grad0 = autodiffInit.getResult(2);
+  if (isCustomLogpdf) {
+    grad0 = impulse::ReshapeOp::create(builder, loc, positionType, grad0);
+  }
 
   return {q0, U0, grad0, rngForSampleKernel};
 }
 
-MCMCKernelResult MCMC::SampleHMC(OpBuilder &builder, Location loc, Value q,
-                                 Value grad, Value U, Value rng,
-                                 const HMCContext &ctx, bool debugDump) {
+MCMCKernelResult impulse::SampleHMC(OpBuilder &builder, Location loc, Value q,
+                                    Value grad, Value U, Value rng,
+                                    const HMCContext &ctx, bool debugDump) {
   auto positionType = ctx.getPositionType();
   auto scalarType = ctx.getScalarType();
   auto elemType = ctx.getElementType();
@@ -830,7 +882,7 @@ MCMCKernelResult MCMC::SampleHMC(OpBuilder &builder, Location loc, Value q,
   auto adjustedCtx = ctx.withStepSize(adjustedStepSize);
 
   // 1. Split RNG: [rngNext, rngMomentum, rngTransition]
-  auto sampleKernelSplit = enzyme::RandomSplitOp::create(
+  auto sampleKernelSplit = impulse::RandomSplitOp::create(
       builder, loc, TypeRange{rng.getType(), rng.getType(), rng.getType()},
       rng);
   auto rngNext = sampleKernelSplit.getResult(0);
@@ -840,7 +892,7 @@ MCMCKernelResult MCMC::SampleHMC(OpBuilder &builder, Location loc, Value q,
   // 2. Sample fresh momentum p ~ N(0, M)
   Value rngForMomentum = rngMomentum;
   if (!ctx.hasCustomLogpdf()) {
-    auto momSplit = enzyme::RandomSplitOp::create(
+    auto momSplit = impulse::RandomSplitOp::create(
         builder, loc, TypeRange{rng.getType(), rng.getType()}, rngMomentum);
     rngForMomentum = momSplit.getResult(0);
   }
@@ -870,8 +922,8 @@ MCMCKernelResult MCMC::SampleHMC(OpBuilder &builder, Location loc, Value q,
   SmallVector<Type> loopResultTypes = {positionType, positionType, positionType,
                                        scalarType, rngTransition.getType()};
   auto forLoopOp =
-      enzyme::ForLoopOp::create(builder, loc, loopResultTypes, c0, numSteps, c1,
-                                ValueRange{q, p0, grad, U, rngTransition});
+      impulse::ForOp::create(builder, loc, loopResultTypes, c0, numSteps, c1,
+                             ValueRange{q, p0, grad, U, rngTransition});
 
   Block *loopBody = builder.createBlock(&forLoopOp.getRegion());
   loopBody->addArgument(i64TensorType, loc);           // iv
@@ -892,7 +944,7 @@ MCMCKernelResult MCMC::SampleHMC(OpBuilder &builder, Location loc, Value q,
                                      adjustedCtx);
 
   // Yield [q, p, grad, U, rng]
-  enzyme::YieldOp::create(
+  impulse::YieldOp::create(
       builder, loc, ValueRange{step.q, step.p, step.grad, step.U, step.rng});
 
   builder.setInsertionPointAfter(forLoopOp);
@@ -921,31 +973,37 @@ MCMCKernelResult MCMC::SampleHMC(OpBuilder &builder, Location loc, Value q,
   auto accProb = arith::MinimumFOp::create(builder, loc, oneConst, expDH);
 
   // u ~ Uniform(0, 1)
-  auto randomOp = enzyme::RandomOp::create(
+  auto randomOp = impulse::RandomOp::create(
       builder, loc, TypeRange{rngAfterLeapfrog.getType(), scalarType},
       rngAfterLeapfrog, zeroConst, oneConst,
-      enzyme::RngDistributionAttr::get(builder.getContext(),
-                                       enzyme::RngDistribution::UNIFORM));
+      impulse::RngDistributionAttr::get(builder.getContext(),
+                                        impulse::RngDistribution::UNIFORM));
   auto randUniform = randomOp.getResult();
 
   // accepted = u < α
   auto acceptedTensor = arith::CmpFOp::create(
       builder, loc, arith::CmpFPredicate::OLT, randUniform, accProb);
 
-  // 8. Select between original and proposal
-  auto qFinal = enzyme::SelectOp::create(builder, loc, positionType,
-                                         acceptedTensor, qProposal, q);
-  auto gradFinal = enzyme::SelectOp::create(builder, loc, positionType,
-                                            acceptedTensor, gradProposal, grad);
-  auto UFinal = enzyme::SelectOp::create(builder, loc, scalarType,
-                                         acceptedTensor, UProposal, U);
+  // HMC doesn't collect divergence information so set to false
+  auto falseConst = arith::ConstantOp::create(
+      builder, loc, i1TensorType,
+      DenseElementsAttr::get(i1TensorType, builder.getBoolAttr(false)));
 
-  return {qFinal, gradFinal, UFinal, acceptedTensor, accProb, rngNext};
+  // 8. Select between original and proposal
+  auto qFinal = impulse::SelectOp::create(builder, loc, positionType,
+                                          acceptedTensor, qProposal, q);
+  auto gradFinal = impulse::SelectOp::create(
+      builder, loc, positionType, acceptedTensor, gradProposal, grad);
+  auto UFinal = impulse::SelectOp::create(builder, loc, scalarType,
+                                          acceptedTensor, UProposal, U);
+
+  return {qFinal,     gradFinal, UFinal, acceptedTensor,
+          falseConst, accProb,   rngNext};
 }
 
-MCMCKernelResult MCMC::SampleNUTS(OpBuilder &builder, Location loc, Value q,
-                                  Value grad, Value U, Value rng,
-                                  const NUTSContext &ctx, bool debugDump) {
+MCMCKernelResult impulse::SampleNUTS(OpBuilder &builder, Location loc, Value q,
+                                     Value grad, Value U, Value rng,
+                                     const NUTSContext &ctx, bool debugDump) {
   auto positionType = ctx.getPositionType();
   auto scalarType = ctx.getScalarType();
   auto elemType = ctx.getElementType();
@@ -953,7 +1011,7 @@ MCMCKernelResult MCMC::SampleNUTS(OpBuilder &builder, Location loc, Value q,
   auto i1TensorType = RankedTensorType::get({}, builder.getI1Type());
 
   // 1. Split RNG: [rngNext, rngMomentum, rngTree]
-  auto sampleKernelSplit = enzyme::RandomSplitOp::create(
+  auto sampleKernelSplit = impulse::RandomSplitOp::create(
       builder, loc, TypeRange{rng.getType(), rng.getType(), rng.getType()},
       rng);
   auto rngNext = sampleKernelSplit.getResult(0);
@@ -963,7 +1021,7 @@ MCMCKernelResult MCMC::SampleNUTS(OpBuilder &builder, Location loc, Value q,
   // 2. Sample fresh momentum p ~ N(0, M)
   Value rngForMomentum = rngMomentum;
   if (!ctx.hasCustomLogpdf()) {
-    auto momSplit = enzyme::RandomSplitOp::create(
+    auto momSplit = impulse::RandomSplitOp::create(
         builder, loc, TypeRange{rng.getType(), rng.getType()}, rngMomentum);
     rngForMomentum = momSplit.getResult(0);
   }
@@ -1028,14 +1086,18 @@ MCMCKernelResult MCMC::SampleNUTS(OpBuilder &builder, Location loc, Value q,
   auto meanAcceptProb = arith::DivFOp::create(
       builder, loc, finalTree.sum_accept_probs, numProposalsFloat);
 
-  return {finalTree.q_proposal, finalTree.grad_proposal,
-          finalTree.U_proposal, trueConst,
-          meanAcceptProb,       rngNext};
+  return {finalTree.q_proposal,
+          finalTree.grad_proposal,
+          finalTree.U_proposal,
+          trueConst,
+          finalTree.diverging,
+          meanAcceptProb,
+          rngNext};
 }
 
-NUTSTreeState MCMC::buildBaseTree(OpBuilder &builder, Location loc,
-                                  const IntegratorState &leaf, Value rng,
-                                  Value direction, const NUTSContext &ctx) {
+NUTSTreeState impulse::buildBaseTree(OpBuilder &builder, Location loc,
+                                     const IntegratorState &leaf, Value rng,
+                                     Value direction, const NUTSContext &ctx) {
   auto positionType = ctx.getPositionType();
   auto scalarType = ctx.getScalarType();
   auto elemType = ctx.getElementType();
@@ -1111,26 +1173,26 @@ NUTSTreeState MCMC::buildBaseTree(OpBuilder &builder, Location loc,
           .rng = rngOut};
 }
 
-IntegratorState MCMC::getLeafFromTree(OpBuilder &builder, Location loc,
-                                      const NUTSTreeState &tree,
-                                      Value direction, const NUTSContext &ctx) {
+IntegratorState impulse::getLeafFromTree(OpBuilder &builder, Location loc,
+                                         const NUTSTreeState &tree,
+                                         Value direction,
+                                         const NUTSContext &ctx) {
   auto positionType = ctx.getPositionType();
 
-  auto leafQ = enzyme::SelectOp::create(builder, loc, positionType, direction,
-                                        tree.q_right, tree.q_left);
-  auto leafP = enzyme::SelectOp::create(builder, loc, positionType, direction,
-                                        tree.p_right, tree.p_left);
-  auto leafGrad = enzyme::SelectOp::create(
+  auto leafQ = impulse::SelectOp::create(builder, loc, positionType, direction,
+                                         tree.q_right, tree.q_left);
+  auto leafP = impulse::SelectOp::create(builder, loc, positionType, direction,
+                                         tree.p_right, tree.p_left);
+  auto leafGrad = impulse::SelectOp::create(
       builder, loc, positionType, direction, tree.grad_right, tree.grad_left);
   return {leafQ, leafP, leafGrad};
 }
 
-SubtreeBuildResult MCMC::buildIterativeSubtree(OpBuilder &builder, Location loc,
-                                               const NUTSTreeState &initialTree,
-                                               Value direction, Value pCkpts,
-                                               Value pSumCkpts,
-                                               const NUTSContext &ctx,
-                                               bool debugDump) {
+SubtreeBuildResult
+impulse::buildIterativeSubtree(OpBuilder &builder, Location loc,
+                               const NUTSTreeState &initialTree,
+                               Value direction, Value pCkpts, Value pSumCkpts,
+                               const NUTSContext &ctx, bool debugDump) {
   auto i1TensorType = RankedTensorType::get({}, builder.getI1Type());
   auto i64TensorType = RankedTensorType::get({}, builder.getI64Type());
   auto pCkptsType = cast<RankedTensorType>(pCkpts.getType());
@@ -1160,7 +1222,7 @@ SubtreeBuildResult MCMC::buildIterativeSubtree(OpBuilder &builder, Location loc,
   whileInitVals.push_back(zeroI64);
 
   auto whileOp =
-      enzyme::WhileLoopOp::create(builder, loc, whileTypes, whileInitVals);
+      impulse::WhileOp::create(builder, loc, whileTypes, whileInitVals);
 
   // Check: num_proposals < max_num_proposals && !turning && !diverging
   Block *condBlock = builder.createBlock(&whileOp.getConditionRegion());
@@ -1185,7 +1247,7 @@ SubtreeBuildResult MCMC::buildIterativeSubtree(OpBuilder &builder, Location loc,
       notDiverging);
 
   // Yield continue condition
-  enzyme::YieldOp::create(builder, loc, ValueRange{continueCond});
+  impulse::YieldOp::create(builder, loc, ValueRange{continueCond});
 
   Block *bodyBlock = builder.createBlock(&whileOp.getBodyRegion());
   for (auto type : whileTypes)
@@ -1204,7 +1266,7 @@ SubtreeBuildResult MCMC::buildIterativeSubtree(OpBuilder &builder, Location loc,
   IntegratorState leaf =
       getLeafFromTree(builder, loc, bodyTree, direction, ctx);
 
-  auto rngSplit2 = enzyme::RandomSplitOp::create(
+  auto rngSplit2 = impulse::RandomSplitOp::create(
       builder, loc, TypeRange{bodyTree.rng.getType(), bodyTree.rng.getType()},
       bodyTree.rng);
   auto rngNext = rngSplit2.getResult(0);
@@ -1219,11 +1281,11 @@ SubtreeBuildResult MCMC::buildIterativeSubtree(OpBuilder &builder, Location loc,
       builder, loc, arith::CmpIPredicate::eq, bodyTree.num_proposals, zeroI64);
 
   SmallVector<Type> treeTypes = newLeaf.getTypes();
-  auto ifOp = enzyme::IfOp::create(builder, loc, treeTypes, isFirstLeaf);
+  auto ifOp = impulse::IfOp::create(builder, loc, treeTypes, isFirstLeaf);
   {
     Block *trueBranch = builder.createBlock(&ifOp.getTrueBranch());
     builder.setInsertionPointToStart(trueBranch);
-    enzyme::YieldOp::create(builder, loc, newLeaf.toValues());
+    impulse::YieldOp::create(builder, loc, newLeaf.toValues());
   }
   {
     Block *falseBranch = builder.createBlock(&ifOp.getFalseBranch());
@@ -1231,7 +1293,7 @@ SubtreeBuildResult MCMC::buildIterativeSubtree(OpBuilder &builder, Location loc,
     NUTSTreeState combinedTree =
         combineTrees(builder, loc, bodyTree, newLeaf, direction, rngCombine,
                      /*biased=*/false, ctx);
-    enzyme::YieldOp::create(builder, loc, combinedTree.toValues());
+    impulse::YieldOp::create(builder, loc, combinedTree.toValues());
   }
 
   builder.setInsertionPointAfter(ifOp);
@@ -1250,8 +1312,8 @@ SubtreeBuildResult MCMC::buildIterativeSubtree(OpBuilder &builder, Location loc,
       updatedPSumCkpts, ckptIdxMin, ckptIdxMax, ctx, debugDump);
 
   updatedTree.turning =
-      enzyme::SelectOp::create(builder, loc, i1TensorType, isFirstLeaf,
-                               newLeaf.turning, iterativeTurning);
+      impulse::SelectOp::create(builder, loc, i1TensorType, isFirstLeaf,
+                                newLeaf.turning, iterativeTurning);
 
   auto nextLeafIdx = arith::AddIOp::create(builder, loc, bodyLeafIdx, oneI64);
 
@@ -1259,7 +1321,7 @@ SubtreeBuildResult MCMC::buildIterativeSubtree(OpBuilder &builder, Location loc,
   yieldVals.push_back(updatedPCkpts);
   yieldVals.push_back(updatedPSumCkpts);
   yieldVals.push_back(nextLeafIdx);
-  enzyme::YieldOp::create(builder, loc, yieldVals);
+  impulse::YieldOp::create(builder, loc, yieldVals);
 
   builder.setInsertionPointAfter(whileOp);
 
@@ -1276,11 +1338,12 @@ SubtreeBuildResult MCMC::buildIterativeSubtree(OpBuilder &builder, Location loc,
   return {resultTree, resultPCkpts, resultPSumCkpts};
 }
 
-SubtreeBuildResult MCMC::doubleTree(OpBuilder &builder, Location loc,
-                                    const NUTSTreeState &tree, Value direction,
-                                    Value pCkpts, Value pSumCkpts,
-                                    const NUTSContext &ctx, bool debugDump) {
-  auto rngSplit2 = enzyme::RandomSplitOp::create(
+SubtreeBuildResult impulse::doubleTree(OpBuilder &builder, Location loc,
+                                       const NUTSTreeState &tree,
+                                       Value direction, Value pCkpts,
+                                       Value pSumCkpts, const NUTSContext &ctx,
+                                       bool debugDump) {
+  auto rngSplit2 = impulse::RandomSplitOp::create(
       builder, loc, TypeRange{tree.rng.getType(), tree.rng.getType()},
       tree.rng);
   auto rngSubtree = rngSplit2.getResult(0);
@@ -1299,9 +1362,9 @@ SubtreeBuildResult MCMC::doubleTree(OpBuilder &builder, Location loc,
   return {combinedTree, subtreeResult.pCkpts, subtreeResult.pSumCkpts};
 }
 
-NUTSTreeState MCMC::buildTree(OpBuilder &builder, Location loc,
-                              const NUTSTreeState &initialTree,
-                              const NUTSContext &ctx, bool debugDump) {
+NUTSTreeState impulse::buildTree(OpBuilder &builder, Location loc,
+                                 const NUTSTreeState &initialTree,
+                                 const NUTSContext &ctx, bool debugDump) {
   auto elemType =
       cast<RankedTensorType>(ctx.stepSize.getType()).getElementType();
   auto F64TensorType = RankedTensorType::get({}, elemType);
@@ -1333,7 +1396,7 @@ NUTSTreeState MCMC::buildTree(OpBuilder &builder, Location loc,
   SmallVector<Value> whileInitVals = initialTree.toValues();
 
   auto whileOp =
-      enzyme::WhileLoopOp::create(builder, loc, whileTypes, whileInitVals);
+      impulse::WhileOp::create(builder, loc, whileTypes, whileInitVals);
 
   // Check: (depth < maxTreeDepth) && !turning && !diverging
   Block *condBlock = builder.createBlock(&whileOp.getConditionRegion());
@@ -1358,7 +1421,7 @@ NUTSTreeState MCMC::buildTree(OpBuilder &builder, Location loc,
       builder, loc, arith::AndIOp::create(builder, loc, depthCheck, notTurning),
       notDiverging);
 
-  enzyme::YieldOp::create(builder, loc, ValueRange{continueCond});
+  impulse::YieldOp::create(builder, loc, ValueRange{continueCond});
 
   Block *bodyBlock = builder.createBlock(&whileOp.getBodyRegion());
   for (auto type : whileTypes)
@@ -1377,7 +1440,7 @@ NUTSTreeState MCMC::buildTree(OpBuilder &builder, Location loc,
   Value bodyPCkpts = zeroCkpts;
   Value bodyPSumCkpts = zeroCkpts;
 
-  auto rngSplit3 = enzyme::RandomSplitOp::create(
+  auto rngSplit3 = impulse::RandomSplitOp::create(
       builder, loc,
       TypeRange{bodyTree.rng.getType(), bodyTree.rng.getType(),
                 bodyTree.rng.getType()},
@@ -1386,11 +1449,11 @@ NUTSTreeState MCMC::buildTree(OpBuilder &builder, Location loc,
   auto rngDir = rngSplit3.getResult(1);
   auto rngDbl = rngSplit3.getResult(2);
 
-  auto directionRandom = enzyme::RandomOp::create(
+  auto directionRandom = impulse::RandomOp::create(
       builder, loc, TypeRange{rngDir.getType(), F64TensorType}, rngDir,
       zeroConst, oneConst,
-      enzyme::RngDistributionAttr::get(builder.getContext(),
-                                       enzyme::RngDistribution::UNIFORM));
+      impulse::RngDistributionAttr::get(builder.getContext(),
+                                        impulse::RngDistribution::UNIFORM));
   auto direction =
       arith::CmpFOp::create(builder, loc, arith::CmpFPredicate::OLT,
                             directionRandom.getResult(), halfConst);
@@ -1403,7 +1466,7 @@ NUTSTreeState MCMC::buildTree(OpBuilder &builder, Location loc,
 
   NUTSTreeState treeToYield = doubleResult.tree;
   treeToYield.rng = rngNext;
-  enzyme::YieldOp::create(builder, loc, treeToYield.toValues());
+  impulse::YieldOp::create(builder, loc, treeToYield.toValues());
 
   builder.setInsertionPointAfter(whileOp);
 
@@ -1412,8 +1475,9 @@ NUTSTreeState MCMC::buildTree(OpBuilder &builder, Location loc,
   return NUTSTreeState::fromValues(results);
 }
 
-std::pair<Value, Value>
-MCMC::leafIdxToCheckpointIdxs(OpBuilder &builder, Location loc, Value leafIdx) {
+std::pair<Value, Value> impulse::leafIdxToCheckpointIdxs(OpBuilder &builder,
+                                                         Location loc,
+                                                         Value leafIdx) {
   auto i64TensorType = cast<RankedTensorType>(leafIdx.getType());
 
   auto oneConst = arith::ConstantOp::create(
@@ -1423,7 +1487,7 @@ MCMC::leafIdxToCheckpointIdxs(OpBuilder &builder, Location loc, Value leafIdx) {
   // idx_max = popcount(leafIdx >> 1)
   auto shiftedIdx = arith::ShRUIOp::create(builder, loc, leafIdx, oneConst);
   auto idxMax =
-      enzyme::PopcountOp::create(builder, loc, i64TensorType, shiftedIdx);
+      impulse::PopcountOp::create(builder, loc, i64TensorType, shiftedIdx);
 
   // num_subtrees = popcount((~leafIdx & (leafIdx + 1)) - 1)
   auto leafIdxPlusOne = arith::AddIOp::create(builder, loc, leafIdx, oneConst);
@@ -1437,7 +1501,7 @@ MCMC::leafIdxToCheckpointIdxs(OpBuilder &builder, Location loc, Value leafIdx) {
       arith::AndIOp::create(builder, loc, notLeafIdx, leafIdxPlusOne);
   Value andMinusOne = arith::SubIOp::create(builder, loc, andResult, oneConst);
   Value numSubtrees =
-      enzyme::PopcountOp::create(builder, loc, i64TensorType, andMinusOne);
+      impulse::PopcountOp::create(builder, loc, i64TensorType, andMinusOne);
 
   // idx_min = idx_max - num_subtrees + 1
   Value idxMaxMinusNumSubtrees =
@@ -1448,10 +1512,10 @@ MCMC::leafIdxToCheckpointIdxs(OpBuilder &builder, Location loc, Value leafIdx) {
   return {idxMin, idxMax};
 }
 
-Value MCMC::checkIterativeTurning(OpBuilder &builder, Location loc, Value p,
-                                  Value pSum, Value pCkpts, Value pSumCkpts,
-                                  Value idxMin, Value idxMax,
-                                  const NUTSContext &ctx, bool debugDump) {
+Value impulse::checkIterativeTurning(OpBuilder &builder, Location loc, Value p,
+                                     Value pSum, Value pCkpts, Value pSumCkpts,
+                                     Value idxMin, Value idxMax,
+                                     const NUTSContext &ctx, bool debugDump) {
   auto positionType = ctx.getPositionType();
   auto i64TensorType = RankedTensorType::get({}, builder.getI64Type());
   auto i1TensorType = RankedTensorType::get({}, builder.getI1Type());
@@ -1468,7 +1532,7 @@ Value MCMC::checkIterativeTurning(OpBuilder &builder, Location loc, Value p,
   SmallVector<Value> whileInitVals = {idxMax, falseConst};
 
   auto whileOp =
-      enzyme::WhileLoopOp::create(builder, loc, whileTypes, whileInitVals);
+      impulse::WhileOp::create(builder, loc, whileTypes, whileInitVals);
   Block *condBlock = builder.createBlock(&whileOp.getConditionRegion());
   condBlock->addArgument(i64TensorType, loc);
   condBlock->addArgument(i1TensorType, loc);
@@ -1485,7 +1549,7 @@ Value MCMC::checkIterativeTurning(OpBuilder &builder, Location loc, Value p,
   auto notTurning = arith::XOrIOp::create(builder, loc, turningCond, trueConst);
   auto continueLoop = arith::AndIOp::create(builder, loc, iGeMin, notTurning);
 
-  enzyme::YieldOp::create(builder, loc, ValueRange{continueLoop.getResult()});
+  impulse::YieldOp::create(builder, loc, ValueRange{continueLoop.getResult()});
 
   Block *bodyBlock = builder.createBlock(&whileOp.getBodyRegion());
   bodyBlock->addArgument(i64TensorType, loc);
@@ -1496,10 +1560,10 @@ Value MCMC::checkIterativeTurning(OpBuilder &builder, Location loc, Value p,
   auto zeroI64 = arith::ConstantOp::create(
       builder, loc, i64TensorType,
       DenseElementsAttr::get(i64TensorType, builder.getI64IntegerAttr(0)));
-  Value pLeft = enzyme::DynamicSliceOp::create(
+  Value pLeft = impulse::DynamicSliceOp::create(
       builder, loc, positionType, pCkpts, ValueRange{iBody, zeroI64},
       builder.getDenseI64ArrayAttr({1, ctx.positionSize}));
-  Value pSumCkptI = enzyme::DynamicSliceOp::create(
+  Value pSumCkptI = impulse::DynamicSliceOp::create(
       builder, loc, positionType, pSumCkpts, ValueRange{iBody, zeroI64},
       builder.getDenseI64ArrayAttr({1, ctx.positionSize}));
 
@@ -1511,17 +1575,17 @@ Value MCMC::checkIterativeTurning(OpBuilder &builder, Location loc, Value p,
   Value turningAtCkpt = checkTurning(builder, loc, pLeft, p, subtreePSum, ctx);
 
   Value iNext = arith::SubIOp::create(builder, loc, iBody, oneI64);
-  enzyme::YieldOp::create(builder, loc, ValueRange{iNext, turningAtCkpt});
+  impulse::YieldOp::create(builder, loc, ValueRange{iNext, turningAtCkpt});
 
   builder.setInsertionPointAfter(whileOp);
   return whileOp.getResult(1);
 }
 
 std::pair<Value, Value>
-MCMC::updateCheckpoints(OpBuilder &builder, Location loc, Value leafIdx,
-                        Value ckptIdxMax, Value p, Value pSum, Value pCkpts,
-                        Value pSumCkpts, const NUTSContext &ctx,
-                        bool debugDump) {
+impulse::updateCheckpoints(OpBuilder &builder, Location loc, Value leafIdx,
+                           Value ckptIdxMax, Value p, Value pSum, Value pCkpts,
+                           Value pSumCkpts, const NUTSContext &ctx,
+                           bool debugDump) {
   auto i64TensorType = RankedTensorType::get({}, builder.getI64Type());
   auto oneI64 = arith::ConstantOp::create(
       builder, loc, i64TensorType,
@@ -1538,25 +1602,25 @@ MCMC::updateCheckpoints(OpBuilder &builder, Location loc, Value leafIdx,
 
   // Compute updates only on even leafIdx
   SmallVector<Type> ifResultTypes = {pCkptsType, pCkptsType};
-  auto ifOp = enzyme::IfOp::create(builder, loc, ifResultTypes, isEven);
+  auto ifOp = impulse::IfOp::create(builder, loc, ifResultTypes, isEven);
   {
     Block *trueBranch = builder.createBlock(&ifOp.getTrueBranch());
     builder.setInsertionPointToStart(trueBranch);
 
-    auto updatedPCkpts = enzyme::DynamicUpdateSliceOp::create(
+    auto updatedPCkpts = impulse::DynamicUpdateSliceOp::create(
         builder, loc, pCkptsType, pCkpts, p, ValueRange{ckptIdxMax, zeroI64});
-    auto updatedPSumCkpts = enzyme::DynamicUpdateSliceOp::create(
+    auto updatedPSumCkpts = impulse::DynamicUpdateSliceOp::create(
         builder, loc, pCkptsType, pSumCkpts, pSum,
         ValueRange{ckptIdxMax, zeroI64});
 
-    enzyme::YieldOp::create(builder, loc,
-                            ValueRange{updatedPCkpts, updatedPSumCkpts});
+    impulse::YieldOp::create(builder, loc,
+                             ValueRange{updatedPCkpts, updatedPSumCkpts});
   }
   {
     Block *falseBranch = builder.createBlock(&ifOp.getFalseBranch());
     builder.setInsertionPointToStart(falseBranch);
 
-    enzyme::YieldOp::create(builder, loc, ValueRange{pCkpts, pSumCkpts});
+    impulse::YieldOp::create(builder, loc, ValueRange{pCkpts, pSumCkpts});
   }
 
   builder.setInsertionPointAfter(ifOp);
@@ -1567,21 +1631,32 @@ MCMC::updateCheckpoints(OpBuilder &builder, Location loc, Value leafIdx,
   return {finalPCkpts, finalPSumCkpts};
 }
 
-DualAveragingState MCMC::initDualAveraging(OpBuilder &builder, Location loc,
-                                           Value stepSize) {
+DualAveragingState impulse::initDualAveraging(OpBuilder &builder, Location loc,
+                                              Value stepSize,
+                                              bool logOfProduct) {
   auto stepSizeType = cast<RankedTensorType>(stepSize.getType());
   auto elemType = stepSizeType.getElementType();
   auto scalarType = RankedTensorType::get({}, elemType);
   auto i64TensorType = RankedTensorType::get({}, builder.getI64Type());
 
-  // prox_center = log(10) + log(step_size)
-  auto log10Const = arith::ConstantOp::create(
-      builder, loc, scalarType,
-      DenseElementsAttr::get(scalarType,
-                             builder.getFloatAttr(elemType, std::log(10.0))));
-  Value logStepSize = math::LogOp::create(builder, loc, stepSize);
-  Value proxCenter =
-      arith::AddFOp::create(builder, loc, log10Const, logStepSize);
+  // prox_center: log(10 * step_size) at warmup start, or log(10) +
+  // log(step_size) at window-end re-inits
+  Value proxCenter;
+  if (logOfProduct) {
+    auto tenConst = arith::ConstantOp::create(
+        builder, loc, scalarType,
+        DenseElementsAttr::get(scalarType,
+                               builder.getFloatAttr(elemType, 10.0)));
+    Value scaled = arith::MulFOp::create(builder, loc, tenConst, stepSize);
+    proxCenter = math::LogOp::create(builder, loc, scaled);
+  } else {
+    auto log10Const = arith::ConstantOp::create(
+        builder, loc, scalarType,
+        DenseElementsAttr::get(scalarType,
+                               builder.getFloatAttr(elemType, std::log(10.0))));
+    Value logStepSize = math::LogOp::create(builder, loc, stepSize);
+    proxCenter = arith::AddFOp::create(builder, loc, log10Const, logStepSize);
+  }
 
   auto zeroConst = arith::ConstantOp::create(
       builder, loc, scalarType,
@@ -1600,9 +1675,9 @@ DualAveragingState MCMC::initDualAveraging(OpBuilder &builder, Location loc,
 }
 
 DualAveragingState
-MCMC::updateDualAveraging(OpBuilder &builder, Location loc,
-                          const DualAveragingState &state, Value acceptProb,
-                          const DualAveragingConfig &config) {
+impulse::updateDualAveraging(OpBuilder &builder, Location loc,
+                             const DualAveragingState &state, Value acceptProb,
+                             const DualAveragingConfig &config) {
   // Dual Averaging update:
   //   g = target_accept_prob - accept_prob
   //   g_avg = (1 - 1/(t+t0)) * g_avg + g/(t+t0)
@@ -1692,15 +1767,15 @@ MCMC::updateDualAveraging(OpBuilder &builder, Location loc,
   };
 }
 
-Value MCMC::getStepSizeFromDualAveraging(OpBuilder &builder, Location loc,
-                                         const DualAveragingState &state,
-                                         bool final) {
+Value impulse::getStepSizeFromDualAveraging(OpBuilder &builder, Location loc,
+                                            const DualAveragingState &state,
+                                            bool final) {
   Value logStepSize = final ? state.log_step_size_avg : state.log_step_size;
   return math::ExpOp::create(builder, loc, logStepSize);
 }
 
-WelfordState MCMC::initWelford(OpBuilder &builder, Location loc,
-                               int64_t positionSize, bool diagonal) {
+WelfordState impulse::initWelford(OpBuilder &builder, Location loc,
+                                  int64_t positionSize, bool diagonal) {
   auto elemType = builder.getF64Type();
   auto i64TensorType = RankedTensorType::get({}, builder.getI64Type());
   auto meanType = RankedTensorType::get({positionSize}, elemType);
@@ -1730,9 +1805,9 @@ WelfordState MCMC::initWelford(OpBuilder &builder, Location loc,
   return {mean, m2, n};
 }
 
-WelfordState MCMC::updateWelford(OpBuilder &builder, Location loc,
-                                 const WelfordState &state, Value sample,
-                                 const WelfordConfig &config) {
+WelfordState impulse::updateWelford(OpBuilder &builder, Location loc,
+                                    const WelfordState &state, Value sample,
+                                    const WelfordConfig &config) {
   // Algorithm:
   //   n = n + 1
   //   delta_pre = sample - mean
@@ -1753,8 +1828,8 @@ WelfordState MCMC::updateWelford(OpBuilder &builder, Location loc,
   auto scalarType = RankedTensorType::get({}, elemType);
   Value nFloat = arith::SIToFPOp::create(builder, loc, scalarType, nNew);
 
-  Value nBroadcast = enzyme::BroadcastOp::create(builder, loc, sampleType,
-                                                 nFloat, sampleType.getShape());
+  Value nBroadcast = BroadcastOp::create(builder, loc, sampleType, nFloat,
+                                         sampleType.getShape());
 
   Value deltaPre = arith::SubFOp::create(builder, loc, sample, state.mean);
 
@@ -1771,7 +1846,7 @@ WelfordState MCMC::updateWelford(OpBuilder &builder, Location loc,
     m2New = arith::AddFOp::create(builder, loc, state.m2, product);
   } else { // Dense
     auto m2Type = cast<RankedTensorType>(state.m2.getType());
-    Value outerProduct = enzyme::DotOp::create(
+    Value outerProduct = impulse::DotOp::create(
         builder, loc, m2Type, deltaPost, deltaPre,
         /*lhs_batching_dimensions=*/builder.getDenseI64ArrayAttr({}),
         /*rhs_batching_dimensions=*/builder.getDenseI64ArrayAttr({}),
@@ -1783,9 +1858,9 @@ WelfordState MCMC::updateWelford(OpBuilder &builder, Location loc,
   return {meanNew, m2New, nNew};
 }
 
-Value MCMC::finalizeWelford(OpBuilder &builder, Location loc,
-                            const WelfordState &state,
-                            const WelfordConfig &config) {
+Value impulse::finalizeWelford(OpBuilder &builder, Location loc,
+                               const WelfordState &state,
+                               const WelfordConfig &config) {
   // Compute sample covariance: cov = m2 / (n - 1)
   auto m2Type = cast<RankedTensorType>(state.m2.getType());
   auto elemType = m2Type.getElementType();
@@ -1799,8 +1874,8 @@ Value MCMC::finalizeWelford(OpBuilder &builder, Location loc,
   Value nMinus1Float =
       arith::SIToFPOp::create(builder, loc, scalarType, nMinus1);
 
-  Value nMinus1Bcast = enzyme::BroadcastOp::create(
-      builder, loc, m2Type, nMinus1Float, m2Type.getShape());
+  Value nMinus1Bcast = BroadcastOp::create(builder, loc, m2Type, nMinus1Float,
+                                           m2Type.getShape());
 
   Value cov = arith::DivFOp::create(builder, loc, state.m2, nMinus1Bcast);
 
@@ -1819,8 +1894,8 @@ Value MCMC::finalizeWelford(OpBuilder &builder, Location loc,
     Value nPlusFive = arith::AddFOp::create(builder, loc, nFloat, fiveConst);
 
     Value scale = arith::DivFOp::create(builder, loc, nFloat, nPlusFive);
-    Value scaleBcast = enzyme::BroadcastOp::create(builder, loc, m2Type, scale,
-                                                   m2Type.getShape());
+    Value scaleBcast =
+        BroadcastOp::create(builder, loc, m2Type, scale, m2Type.getShape());
     Value scaledCov = arith::MulFOp::create(builder, loc, scaleBcast, cov);
 
     auto shrinkageBaseConst = arith::ConstantOp::create(
@@ -1831,13 +1906,13 @@ Value MCMC::finalizeWelford(OpBuilder &builder, Location loc,
         arith::DivFOp::create(builder, loc, shrinkageBaseConst, nPlusFive);
 
     if (config.diagonal) {
-      Value shrinkageBcast = enzyme::BroadcastOp::create(
-          builder, loc, m2Type, shrinkage, m2Type.getShape());
+      Value shrinkageBcast = BroadcastOp::create(builder, loc, m2Type,
+                                                 shrinkage, m2Type.getShape());
       cov = arith::AddFOp::create(builder, loc, scaledCov, shrinkageBcast);
     } else {
       Value identity = createIdentityMatrix(builder, loc, m2Type);
-      Value shrinkageBcast = enzyme::BroadcastOp::create(
-          builder, loc, m2Type, shrinkage, m2Type.getShape());
+      Value shrinkageBcast = BroadcastOp::create(builder, loc, m2Type,
+                                                 shrinkage, m2Type.getShape());
       Value shrinkageI =
           arith::MulFOp::create(builder, loc, shrinkageBcast, identity);
       cov = arith::AddFOp::create(builder, loc, scaledCov, shrinkageI);
@@ -1847,7 +1922,7 @@ Value MCMC::finalizeWelford(OpBuilder &builder, Location loc,
   return cov;
 }
 
-SmallVector<AdaptWindow> MCMC::buildAdaptationSchedule(int64_t numSteps) {
+SmallVector<AdaptWindow> impulse::buildAdaptationSchedule(int64_t numSteps) {
   // |<-- start buffer -->|<-- middle windows (doubling) -->|<-- end buffer -->|
   // |      (no mass)     |     (collect + adapt mass)      |    (no mass)     |
   // |   step size only   |   step size + mass matrix       |  step size only  |
@@ -1898,12 +1973,12 @@ SmallVector<AdaptWindow> MCMC::buildAdaptationSchedule(int64_t numSteps) {
   return schedule;
 }
 
-Value MCMC::unconstrainPosition(OpBuilder &builder, Location loc,
-                                Value constrained,
-                                ArrayRef<SupportInfo> supports) {
+Value impulse::unconstrainPosition(OpBuilder &builder, Location loc,
+                                   Value constrained,
+                                   ArrayRef<SupportInfo> supports) {
   bool hasConstraints = false;
   for (const auto &info : supports) {
-    if (info.support && info.support.getKind() != enzyme::SupportKind::REAL) {
+    if (info.support && info.support.getKind() != impulse::SupportKind::REAL) {
       hasConstraints = true;
       break;
     }
@@ -1917,18 +1992,18 @@ Value MCMC::unconstrainPosition(OpBuilder &builder, Location loc,
 
   auto positionType1D = RankedTensorType::get({positionSize}, elemType);
   Value constrained1D =
-      enzyme::ReshapeOp::create(builder, loc, positionType1D, constrained);
+      impulse::ReshapeOp::create(builder, loc, positionType1D, constrained);
 
   SmallVector<Value> slices;
   for (const auto &info : supports) {
     auto sliceType = RankedTensorType::get({info.size}, elemType);
-    auto slice = enzyme::SliceOp::create(
+    auto slice = impulse::SliceOp::create(
         builder, loc, sliceType, constrained1D,
         builder.getDenseI64ArrayAttr({info.offset}),
         builder.getDenseI64ArrayAttr({info.offset + info.size}),
         builder.getDenseI64ArrayAttr({1}));
     Value unconstrainedSlice;
-    if (info.support && info.support.getKind() != enzyme::SupportKind::REAL) {
+    if (info.support && info.support.getKind() != impulse::SupportKind::REAL) {
       unconstrainedSlice =
           transforms::unconstrain(builder, loc, slice, info.support);
     } else {
@@ -1966,15 +2041,15 @@ Value MCMC::unconstrainPosition(OpBuilder &builder, Location loc,
             DenseElementsAttr::get(i64ScalarType,
                                    builder.getI64IntegerAttr(offset + j)));
 
-        auto elemSliced = enzyme::DynamicSliceOp::create(
+        auto elemSliced = impulse::DynamicSliceOp::create(
             builder, loc, elemType1DSlice, slices[i], ValueRange{elemIdx},
             builder.getDenseI64ArrayAttr({1}));
         auto elem =
-            enzyme::ReshapeOp::create(builder, loc, elemType0D, elemSliced);
+            impulse::ReshapeOp::create(builder, loc, elemType0D, elemSliced);
 
-        auto resultSliced = enzyme::ReshapeOp::create(
+        auto resultSliced = impulse::ReshapeOp::create(
             builder, loc, RankedTensorType::get({1}, elemType), elem);
-        result1D = enzyme::DynamicUpdateSliceOp::create(
+        result1D = impulse::DynamicUpdateSliceOp::create(
             builder, loc, resultType1D, result1D, resultSliced,
             ValueRange{resultIdx});
       }
@@ -1984,15 +2059,15 @@ Value MCMC::unconstrainPosition(OpBuilder &builder, Location loc,
   }
 
   auto resultType2D = RankedTensorType::get({1, positionSize}, elemType);
-  return enzyme::ReshapeOp::create(builder, loc, resultType2D, result1D);
+  return impulse::ReshapeOp::create(builder, loc, resultType2D, result1D);
 }
 
-Value MCMC::constrainPosition(OpBuilder &builder, Location loc,
-                              Value unconstrained,
-                              ArrayRef<SupportInfo> supports) {
+Value impulse::constrainPosition(OpBuilder &builder, Location loc,
+                                 Value unconstrained,
+                                 ArrayRef<SupportInfo> supports) {
   bool hasConstraints = false;
   for (const auto &info : supports) {
-    if (info.support && info.support.getKind() != enzyme::SupportKind::REAL) {
+    if (info.support && info.support.getKind() != impulse::SupportKind::REAL) {
       hasConstraints = true;
       break;
     }
@@ -2006,19 +2081,19 @@ Value MCMC::constrainPosition(OpBuilder &builder, Location loc,
 
   auto positionType1D = RankedTensorType::get({positionSize}, elemType);
   Value unconstrained1D =
-      enzyme::ReshapeOp::create(builder, loc, positionType1D, unconstrained);
+      impulse::ReshapeOp::create(builder, loc, positionType1D, unconstrained);
 
   SmallVector<Value> slices;
   for (const auto &info : supports) {
     auto sliceType = RankedTensorType::get({info.size}, elemType);
-    auto slice = enzyme::SliceOp::create(
+    auto slice = impulse::SliceOp::create(
         builder, loc, sliceType, unconstrained1D,
         builder.getDenseI64ArrayAttr({info.offset}),
         builder.getDenseI64ArrayAttr({info.offset + info.size}),
         builder.getDenseI64ArrayAttr({1}));
 
     Value constrainedSlice;
-    if (info.support && info.support.getKind() != enzyme::SupportKind::REAL) {
+    if (info.support && info.support.getKind() != impulse::SupportKind::REAL) {
       constrainedSlice =
           transforms::constrain(builder, loc, slice, info.support);
     } else {
@@ -2056,15 +2131,15 @@ Value MCMC::constrainPosition(OpBuilder &builder, Location loc,
             DenseElementsAttr::get(i64ScalarType,
                                    builder.getI64IntegerAttr(offset + j)));
 
-        auto elemSliced = enzyme::DynamicSliceOp::create(
+        auto elemSliced = impulse::DynamicSliceOp::create(
             builder, loc, elemType1DSlice, slices[i], ValueRange{elemIdx},
             builder.getDenseI64ArrayAttr({1}));
         auto elem =
-            enzyme::ReshapeOp::create(builder, loc, elemType0D, elemSliced);
+            impulse::ReshapeOp::create(builder, loc, elemType0D, elemSliced);
 
         auto resultSliced =
-            enzyme::ReshapeOp::create(builder, loc, elemType1DSlice, elem);
-        result1D = enzyme::DynamicUpdateSliceOp::create(
+            impulse::ReshapeOp::create(builder, loc, elemType1DSlice, elem);
+        result1D = impulse::DynamicUpdateSliceOp::create(
             builder, loc, resultType1D, result1D, resultSliced,
             ValueRange{resultIdx});
       }
@@ -2074,12 +2149,12 @@ Value MCMC::constrainPosition(OpBuilder &builder, Location loc,
   }
 
   auto resultType2D = RankedTensorType::get({1, positionSize}, elemType);
-  return enzyme::ReshapeOp::create(builder, loc, resultType2D, result1D);
+  return impulse::ReshapeOp::create(builder, loc, resultType2D, result1D);
 }
 
-Value MCMC::computeTotalJacobianCorrection(OpBuilder &builder, Location loc,
-                                           Value unconstrained,
-                                           ArrayRef<SupportInfo> supports) {
+Value impulse::computeTotalJacobianCorrection(OpBuilder &builder, Location loc,
+                                              Value unconstrained,
+                                              ArrayRef<SupportInfo> supports) {
   auto inputType = cast<RankedTensorType>(unconstrained.getType());
   auto elemType = inputType.getElementType();
   auto scalarType = RankedTensorType::get({}, elemType);
@@ -2094,14 +2169,14 @@ Value MCMC::computeTotalJacobianCorrection(OpBuilder &builder, Location loc,
   int64_t positionSize = inputType.getShape()[1];
   auto positionType1D = RankedTensorType::get({positionSize}, elemType);
   Value unconstrained1D =
-      enzyme::ReshapeOp::create(builder, loc, positionType1D, unconstrained);
+      impulse::ReshapeOp::create(builder, loc, positionType1D, unconstrained);
 
   for (const auto &info : supports) {
-    if (!info.support || info.support.getKind() == enzyme::SupportKind::REAL)
+    if (!info.support || info.support.getKind() == impulse::SupportKind::REAL)
       continue;
 
     auto sliceType = RankedTensorType::get({info.size}, elemType);
-    auto slice = enzyme::SliceOp::create(
+    auto slice = impulse::SliceOp::create(
         builder, loc, sliceType, unconstrained1D,
         builder.getDenseI64ArrayAttr({info.offset}),
         builder.getDenseI64ArrayAttr({info.offset + info.size}),

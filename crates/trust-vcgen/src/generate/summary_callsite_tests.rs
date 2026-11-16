@@ -28,6 +28,7 @@ fn caller_to_reciprocal() -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("example::reciprocal"),
                         is_foreign: false,
                         func: "example::reciprocal".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -47,6 +48,7 @@ fn caller_to_reciprocal() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -62,6 +64,7 @@ fn tail_caller_to_reciprocal() -> VerifiableFunction {
         is_foreign,
         is_unsafe_sig,
         callee_identity,
+        callee_key,
         ..
     } = func.body.blocks[0].terminator.clone()
     else {
@@ -75,6 +78,7 @@ fn tail_caller_to_reciprocal() -> VerifiableFunction {
         is_foreign,
         is_unsafe_sig,
         callee_identity,
+        callee_key,
     };
     func.body.blocks.truncate(1);
     func
@@ -110,6 +114,7 @@ fn caller_to_slice_sink() -> VerifiableFunction {
                         unwind: trust_types::UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("example::slice_sink"),
                         is_foreign: false,
                         func: "example::slice_sink".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -129,6 +134,7 @@ fn caller_to_slice_sink() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -417,6 +423,7 @@ fn caller_passing_copy_of_param(mutate_source: bool) -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("example::reciprocal"),
                         is_foreign: false,
                         func: "example::reciprocal".to_string(),
                         args: vec![Operand::Move(Place::local(3))],
@@ -436,6 +443,7 @@ fn caller_passing_copy_of_param(mutate_source: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -449,6 +457,42 @@ fn sigma_folds_stable_copy_chain_to_source_name() {
     // And the resulting σ formula names it `x` (matching the guard's read).
     let sigma = super::sigma_actual_formula(&func, "n", &Operand::Move(Place::local(3)));
     assert_eq!(sigma, Formula::var("x", Sort::Int));
+}
+
+/// VCGEN-NINE-REDS-20261110: a PARAMETER root is judged by the one rule every root
+/// is — never written by a statement, by a call destination, or through a slot
+/// channel — not by a parameter arm kept beside it. Each channel alone declines the
+/// fold of the same copy chain the control folds; the call destination is the one
+/// `local_is_never_written` and `place_source_is_stable` both miss for a parameter.
+#[test]
+fn a_parameter_root_written_through_any_channel_declines_the_fold() {
+    use trust_types::{Rvalue, Statement};
+    let temp = Operand::Move(Place::local(3));
+    let control = caller_passing_copy_of_param(false);
+    assert_eq!(super::sigma_actual_stable_copy_root(&control, &temp), Some(Place::local(1)));
+
+    // `x = reciprocal(move _3)`: the call destination reseats the root.
+    let mut call_dest = control.clone();
+    let Terminator::Call { dest, .. } = &mut call_dest.body.blocks[0].terminator else {
+        unreachable!("the fixture's block 0 ends in the call")
+    };
+    *dest = Place::local(1);
+    assert_eq!(super::sigma_actual_stable_copy_root(&call_dest, &temp), None);
+
+    // `_4 = &mut x`: a write-capable alias of the root escapes.
+    let mut escaped = control.clone();
+    escaped.body.locals.push(LocalDecl {
+        index: 4,
+        ty: Ty::Ref { mutable: true, inner: Box::new(Ty::u32()) },
+        name: Some("_4".into()),
+    });
+    escaped.body.blocks[0].stmts.push(Statement::Assign {
+        place: Place::local(4),
+        rvalue: Rvalue::Ref { mutable: true, place: Place::local(1) },
+        span: SourceSpan::default(),
+    });
+    assert_eq!(super::sigma_actual_stable_copy_root(&escaped, &temp), None);
+    // The statement channel (`x = x + 0`) is `sigma_does_not_fold_when_source_is_reassigned`.
 }
 
 #[test]
@@ -529,6 +573,7 @@ fn caller_with_widening_casts(reassign_lo: bool) -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("example::range_i128"),
                         is_foreign: false,
                         func: "example::range_i128".to_string(),
                         args: vec![Operand::Move(Place::local(5)), Operand::Move(Place::local(6))],
@@ -548,6 +593,7 @@ fn caller_with_widening_casts(reassign_lo: bool) -> VerifiableFunction {
         preconditions: vec![lo_le_hi()],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -630,6 +676,7 @@ fn caller_casting_param(from_ty: Ty, to_ty: Ty) -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("example::sink"),
                         is_foreign: false,
                         func: "example::sink".to_string(),
                         args: vec![Operand::Move(Place::local(3))],
@@ -649,6 +696,7 @@ fn caller_casting_param(from_ty: Ty, to_ty: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -672,6 +720,7 @@ fn sigma_declines_root_reassigned_via_call_destination() {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("example::reseat"),
                 is_foreign: false,
                 func: "example::reseat".to_string(),
                 args: vec![],

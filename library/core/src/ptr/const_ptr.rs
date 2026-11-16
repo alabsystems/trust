@@ -57,8 +57,6 @@ impl<T: PointeeSized> *const T {
     /// # Examples
     ///
     /// ```rust
-    /// #![feature(pointer_try_cast_aligned)]
-    ///
     /// let x = 0u64;
     ///
     /// let aligned: *const u64 = &x;
@@ -67,7 +65,7 @@ impl<T: PointeeSized> *const T {
     /// assert!(aligned.try_cast_aligned::<u32>().is_some());
     /// assert!(unaligned.try_cast_aligned::<u32>().is_none());
     /// ```
-    #[unstable(feature = "pointer_try_cast_aligned", issue = "141221")]
+    #[stable(feature = "pointer_try_cast_aligned", since = "CURRENT_RUSTC_VERSION")]
     #[must_use = "this returns the result of the operation, \
                   without modifying the original"]
     #[inline]
@@ -149,6 +147,7 @@ impl<T: PointeeSized> *const T {
     #[doc = include_str!("./docs/addr.md")]
     #[must_use]
     #[inline(always)]
+    #[expect(clippy::transmutes_expressible_as_ptr_casts, reason = "implements pointer cast")]
     #[stable(feature = "strict_provenance", since = "1.84.0")]
     pub fn addr(self) -> usize {
         // A pointer-to-integer transmute currently has exactly the right semantics: it returns the
@@ -394,11 +393,14 @@ impl<T: PointeeSized> *const T {
     /// `count` is in units of **bytes**.
     ///
     /// This is purely a convenience for casting to a `u8` pointer and
-    /// using [offset][pointer::offset] on it. See that method for documentation
-    /// and safety requirements.
+    /// using [offset][pointer::offset] on it.
     ///
     /// For non-`Sized` pointees this operation changes only the data pointer,
     /// leaving the metadata untouched.
+    ///
+    /// # Safety
+    ///
+    /// See [offset][pointer::offset] for documentation and safety requirements.
     #[must_use]
     #[inline(always)]
     #[stable(feature = "pointer_byte_offsets", since = "1.75.0")]
@@ -567,9 +569,8 @@ impl<T: PointeeSized> *const T {
     /// needed for `const`-compatibility: the distance between pointers into *different* allocated
     /// objects is not known at compile-time. However, the requirement also exists at
     /// runtime and may be exploited by optimizations. If you wish to compute the difference between
-    /// pointers that are not guaranteed to be from the same allocation, use `(self as isize -
-    /// origin as isize) / size_of::<T>()`.
-    // FIXME: recommend `addr()` instead of `as usize` once that is stable.
+    /// pointers that are not guaranteed to be from the same allocation, use
+    /// `(self.addr() as isize - origin.addr() as isize) / size_of::<T>()`.
     ///
     /// [`add`]: #method.add
     /// [allocation]: crate::ptr#allocation
@@ -612,7 +613,7 @@ impl<T: PointeeSized> *const T {
     /// ```
     #[stable(feature = "ptr_offset_from", since = "1.47.0")]
     #[rustc_const_stable(feature = "const_ptr_offset_from", since = "1.65.0")]
-    #[inline]
+    #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub const unsafe fn offset_from(self, origin: *const T) -> isize
     where
@@ -628,11 +629,14 @@ impl<T: PointeeSized> *const T {
     /// units of **bytes**.
     ///
     /// This is purely a convenience for casting to a `u8` pointer and
-    /// using [`offset_from`][pointer::offset_from] on it. See that method for
-    /// documentation and safety requirements.
+    /// using [`offset_from`][pointer::offset_from] on it.
     ///
     /// For non-`Sized` pointees this operation considers only the data pointers,
     /// ignoring the metadata.
+    ///
+    /// # Safety
+    ///
+    /// See [`offset_from`][pointer::offset_from] for documentation and safety requirements.
     #[inline(always)]
     #[stable(feature = "pointer_byte_offsets", since = "1.75.0")]
     #[rustc_const_stable(feature = "const_pointer_byte_offsets", since = "1.75.0")]
@@ -740,10 +744,13 @@ impl<T: PointeeSized> *const T {
     ///
     /// This is purely a convenience for casting to a `u8` pointer and
     /// using [`offset_from_unsigned`][pointer::offset_from_unsigned] on it.
-    /// See that method for documentation and safety requirements.
     ///
     /// For non-`Sized` pointees this operation considers only the data pointers,
     /// ignoring the metadata.
+    ///
+    /// # Safety
+    ///
+    /// See [`offset_from_unsigned`][pointer::offset_from_unsigned] for documentation and safety requirements.
     #[stable(feature = "ptr_sub_ptr", since = "1.87.0")]
     #[rustc_const_stable(feature = "const_ptr_sub_ptr", since = "1.87.0")]
     #[inline]
@@ -877,11 +884,14 @@ impl<T: PointeeSized> *const T {
     /// `count` is in units of bytes.
     ///
     /// This is purely a convenience for casting to a `u8` pointer and
-    /// using [add][pointer::add] on it. See that method for documentation
-    /// and safety requirements.
+    /// using [add][pointer::add] on it.
     ///
     /// For non-`Sized` pointees this operation changes only the data pointer,
     /// leaving the metadata untouched.
+    ///
+    /// # Safety
+    ///
+    /// See [add][pointer::add] for documentation and safety requirements.
     #[must_use]
     #[inline(always)]
     #[stable(feature = "pointer_byte_offsets", since = "1.75.0")]
@@ -962,11 +972,14 @@ impl<T: PointeeSized> *const T {
     /// `count` is in units of bytes.
     ///
     /// This is purely a convenience for casting to a `u8` pointer and
-    /// using [sub][pointer::sub] on it. See that method for documentation
-    /// and safety requirements.
+    /// using [sub][pointer::sub] on it.
     ///
     /// For non-`Sized` pointees this operation changes only the data pointer,
     /// leaving the metadata untouched.
+    ///
+    /// # Safety
+    ///
+    /// See [sub][pointer::sub] for documentation and safety requirements.
     #[must_use]
     #[inline(always)]
     #[stable(feature = "pointer_byte_offsets", since = "1.75.0")]
@@ -1031,6 +1044,7 @@ impl<T: PointeeSized> *const T {
     #[stable(feature = "pointer_methods", since = "1.26.0")]
     #[must_use = "returns a new pointer rather than modifying its argument"]
     #[rustc_const_stable(feature = "const_ptr_offset", since = "1.61.0")]
+    #[allow(clippy::ptr_offset_with_cast)]
     #[inline(always)]
     pub const fn wrapping_add(self, count: usize) -> Self
     where
@@ -1138,12 +1152,14 @@ impl<T: PointeeSized> *const T {
     /// Reads the value from `self` without moving it. This leaves the
     /// memory in `self` unchanged.
     ///
+    /// # Safety
+    ///
     /// See [`ptr::read`] for safety concerns and examples.
     ///
     /// [`ptr::read`]: crate::ptr::read()
     #[stable(feature = "pointer_methods", since = "1.26.0")]
     #[rustc_const_stable(feature = "const_ptr_read", since = "1.71.0")]
-    #[inline]
+    #[inline(always)]
     #[track_caller]
     pub const unsafe fn read(self) -> T
     where
@@ -1160,13 +1176,16 @@ impl<T: PointeeSized> *const T {
     /// to not be elided or reordered by the compiler across other volatile
     /// operations.
     ///
+    /// # Safety
+    ///
     /// See [`ptr::read_volatile`] for safety concerns and examples.
     ///
     /// [`ptr::read_volatile`]: crate::ptr::read_volatile()
     #[stable(feature = "pointer_methods", since = "1.26.0")]
-    #[inline]
+    #[rustc_const_unstable(feature = "const_volatile", issue = "159094")]
+    #[inline(always)]
     #[track_caller]
-    pub unsafe fn read_volatile(self) -> T
+    pub const unsafe fn read_volatile(self) -> T
     where
         T: Sized,
     {
@@ -1179,12 +1198,14 @@ impl<T: PointeeSized> *const T {
     ///
     /// Unlike `read`, the pointer may be unaligned.
     ///
+    /// # Safety
+    ///
     /// See [`ptr::read_unaligned`] for safety concerns and examples.
     ///
     /// [`ptr::read_unaligned`]: crate::ptr::read_unaligned()
     #[stable(feature = "pointer_methods", since = "1.26.0")]
     #[rustc_const_stable(feature = "const_ptr_read", since = "1.71.0")]
-    #[inline]
+    #[inline(always)]
     #[track_caller]
     pub const unsafe fn read_unaligned(self) -> T
     where
@@ -1199,12 +1220,14 @@ impl<T: PointeeSized> *const T {
     ///
     /// NOTE: this has the *same* argument order as [`ptr::copy`].
     ///
+    /// # Safety
+    ///
     /// See [`ptr::copy`] for safety concerns and examples.
     ///
     /// [`ptr::copy`]: crate::ptr::copy()
     #[rustc_const_stable(feature = "const_intrinsic_copy", since = "1.83.0")]
     #[stable(feature = "pointer_methods", since = "1.26.0")]
-    #[inline]
+    #[inline(always)]
     #[track_caller]
     pub const unsafe fn copy_to(self, dest: *mut T, count: usize)
     where
@@ -1219,12 +1242,14 @@ impl<T: PointeeSized> *const T {
     ///
     /// NOTE: this has the *same* argument order as [`ptr::copy_nonoverlapping`].
     ///
+    /// # Safety
+    ///
     /// See [`ptr::copy_nonoverlapping`] for safety concerns and examples.
     ///
     /// [`ptr::copy_nonoverlapping`]: crate::ptr::copy_nonoverlapping()
     #[rustc_const_stable(feature = "const_intrinsic_copy", since = "1.83.0")]
     #[stable(feature = "pointer_methods", since = "1.26.0")]
-    #[inline]
+    #[inline(always)]
     #[track_caller]
     pub const unsafe fn copy_to_nonoverlapping(self, dest: *mut T, count: usize)
     where
@@ -1373,16 +1398,13 @@ impl<T> *const T {
     ///
     /// The `len` argument is the number of **elements**, not the number of bytes.
     ///
-    /// This function is safe, but actually using the return value is unsafe.
-    /// See the documentation of [`slice::from_raw_parts`] for slice safety requirements.
+    /// See [`ptr::slice_from_raw_parts`] for more information.
     ///
-    /// [`slice::from_raw_parts`]: crate::slice::from_raw_parts
+    /// [`ptr::slice_from_raw_parts`]: crate::ptr::slice_from_raw_parts
     ///
     /// # Examples
     ///
     /// ```rust
-    /// #![feature(ptr_cast_slice)]
-    ///
     /// // create a slice pointer when starting out with a pointer to the first element
     /// let x = [5, 6, 7];
     /// let raw_slice = x.as_ptr().cast_slice(3);
@@ -1393,7 +1415,6 @@ impl<T> *const T {
     /// the raw slice. A slice reference must never have a null pointer, even if it's empty.
     ///
     /// ```rust,should_panic
-    /// #![feature(ptr_cast_slice)]
     /// use std::ptr;
     /// let danger: *const [u8] = ptr::null::<u8>().cast_slice(0);
     /// unsafe {
@@ -1401,7 +1422,8 @@ impl<T> *const T {
     /// }
     /// ```
     #[inline]
-    #[unstable(feature = "ptr_cast_slice", issue = "149103")]
+    #[stable(feature = "ptr_cast_slice", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "ptr_cast_slice", since = "CURRENT_RUSTC_VERSION")]
     pub const fn cast_slice(self, len: usize) -> *const [T] {
         slice_from_raw_parts(self, len)
     }
@@ -1435,7 +1457,7 @@ impl<T> *const [T] {
     /// let slice: *const [i8] = ptr::slice_from_raw_parts(ptr::null(), 3);
     /// assert_eq!(slice.len(), 3);
     /// ```
-    #[inline]
+    #[inline(always)]
     #[stable(feature = "slice_ptr_len", since = "1.79.0")]
     #[rustc_const_stable(feature = "const_slice_ptr_len", since = "1.79.0")]
     pub const fn len(self) -> usize {
@@ -1472,7 +1494,7 @@ impl<T> *const [T] {
     /// let slice: *const [i8] = ptr::slice_from_raw_parts(ptr::null(), 3);
     /// assert_eq!(slice.as_ptr(), ptr::null());
     /// ```
-    #[inline]
+    #[inline(always)]
     #[unstable(feature = "slice_ptr_get", issue = "74265")]
     pub const fn as_ptr(self) -> *const T {
         self as *const T
@@ -1497,6 +1519,8 @@ impl<T> *const [T] {
     /// Returns a raw pointer to an element or subslice, without doing bounds
     /// checking.
     ///
+    /// # Safety
+    ///
     /// Calling this method with an [out-of-bounds index] or when `self` is not dereferenceable
     /// is *[undefined behavior]* even if the resulting pointer is not used.
     ///
@@ -1516,7 +1540,7 @@ impl<T> *const [T] {
     /// ```
     #[unstable(feature = "slice_ptr_get", issue = "74265")]
     #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-    #[inline]
+    #[inline(always)]
     pub const unsafe fn get_unchecked<I>(self, index: I) -> *const I::Output
     where
         I: [const] SliceIndex<[T]>,
@@ -1561,7 +1585,7 @@ impl<T, const N: usize> *const [T; N] {
     /// let arr: *const [i8; 3] = ptr::null();
     /// assert_eq!(arr.as_ptr(), ptr::null());
     /// ```
-    #[inline]
+    #[inline(always)]
     #[unstable(feature = "array_ptr_get", issue = "119834")]
     pub const fn as_ptr(self) -> *const T {
         self as *const T
@@ -1585,14 +1609,14 @@ impl<T, const N: usize> *const [T; N] {
     }
 }
 
-/// Pointer equality is by address, as produced by the [`<*const T>::addr`](pointer::addr) method.
+/// For thin pointers, equality is by address, as produced by the [`<*const T>::addr`](pointer::addr) method.
 #[stable(feature = "rust1", since = "1.0.0")]
 #[diagnostic::on_const(
     message = "pointers cannot be reliably compared during const eval",
     note = "see issue #53020 <https://github.com/rust-lang/rust/issues/53020> for more information"
 )]
 impl<T: PointeeSized> PartialEq for *const T {
-    #[inline]
+    #[inline(always)]
     #[allow(ambiguous_wide_pointer_comparisons)]
     fn eq(&self, other: &*const T) -> bool {
         *self == *other
@@ -1607,7 +1631,7 @@ impl<T: PointeeSized> PartialEq for *const T {
 )]
 impl<T: PointeeSized> Eq for *const T {}
 
-/// Pointer comparison is by address, as produced by the `[`<*const T>::addr`](pointer::addr)` method.
+/// For thin pointers, comparison is by address, as produced by the [`<*const T>::addr`](pointer::addr) method.
 #[stable(feature = "rust1", since = "1.0.0")]
 #[diagnostic::on_const(
     message = "pointers cannot be reliably compared during const eval",
@@ -1627,38 +1651,38 @@ impl<T: PointeeSized> Ord for *const T {
     }
 }
 
-/// Pointer comparison is by address, as produced by the `[`<*const T>::addr`](pointer::addr)` method.
+/// For thin pointers, comparison is by address, as produced by the [`<*const T>::addr`](pointer::addr) method.
 #[stable(feature = "rust1", since = "1.0.0")]
 #[diagnostic::on_const(
     message = "pointers cannot be reliably compared during const eval",
     note = "see issue #53020 <https://github.com/rust-lang/rust/issues/53020> for more information"
 )]
 impl<T: PointeeSized> PartialOrd for *const T {
-    #[inline]
+    #[inline(always)]
     #[allow(ambiguous_wide_pointer_comparisons)]
     fn partial_cmp(&self, other: &*const T) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 
-    #[inline]
+    #[inline(always)]
     #[allow(ambiguous_wide_pointer_comparisons)]
     fn lt(&self, other: &*const T) -> bool {
         *self < *other
     }
 
-    #[inline]
+    #[inline(always)]
     #[allow(ambiguous_wide_pointer_comparisons)]
     fn le(&self, other: &*const T) -> bool {
         *self <= *other
     }
 
-    #[inline]
+    #[inline(always)]
     #[allow(ambiguous_wide_pointer_comparisons)]
     fn gt(&self, other: &*const T) -> bool {
         *self > *other
     }
 
-    #[inline]
+    #[inline(always)]
     #[allow(ambiguous_wide_pointer_comparisons)]
     fn ge(&self, other: &*const T) -> bool {
         *self >= *other

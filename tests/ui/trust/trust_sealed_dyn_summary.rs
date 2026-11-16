@@ -5,6 +5,7 @@
 //@ dont-require-annotations: WARN
 //@ dont-require-annotations: NOTE
 //@ check-fail
+//@ forbid-output: this function has no obligation of its own
 
 // Discriminating test for the sealed-trait `dyn Trait` dispatch summary.
 //
@@ -14,6 +15,15 @@
 // reusable-postcondition consumer deliberately accepts only a private sealed
 // evidence carrier; production has no such minter yet. The call result is
 // therefore havoced and the strict lane must fail closed.
+//
+// 2026-09-19: the Level 0 SAFETY warning this file used to expect alongside the
+// error is gone, and its absence is the point. C-SEALED now discharges the
+// virtual call's panic-freedom row (local trait, whole-program artifact, impl
+// set `{Button}`, each member independently verified), so the only rows left are
+// the two POSTCONDITION ones — which is why the error survived unchanged. The
+// dyn certificates are safety-only by construction; `sealed_dyn_probe.rs` is
+// this file without the `ensures` and it now passes. That pair, not either file
+// alone, is the assertion.
 
 #![feature(contracts_internals)]
 
@@ -39,8 +49,7 @@ impl Widget for Button {
 }
 
 fn use_widget(w: &dyn Widget) -> i32
-//~^ WARN Trust Level 0 safety verification incomplete for `trust_sealed_dyn_summary::use_widget`
-//~| ERROR Trust strict verification failed for `trust_sealed_dyn_summary::use_widget`
+//~^ ERROR Trust strict verification failed for `trust_sealed_dyn_summary::use_widget`
 contract_ensures { move |result| *result >= 0 }
 {
     w.rank()
@@ -56,3 +65,7 @@ fn main() {
     let b = Button;
     let _ = use_widget(&b);
 }
+
+// ZERO-ROW-GATE (2026-10-10): this rail must refuse for its OWN reason; a refusal by the
+// zero-row gate (whose note is forbidden here) would mean the gate under test regressed
+// into discharging and the zero-row gate masked it.

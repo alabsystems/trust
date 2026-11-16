@@ -93,6 +93,7 @@ if [ \"\${1:-}\" = \"x.py\" ] \
         || [ -n \"\${TARGO_TRUST:-}\" ] \
         || [ -n \"\${TRUSTD:-}\" ] \
         || [ -n \"\${TRUST_MEMORY_JOBSERVER_SOCK:-}\" ] \
+        || [ -n \"\${TRUSTD_RUNTIME_DIR:-}\" ] \
         || [ -n \"\${TRUSTD_DISABLE:-}\" ]; then
         touch '$marker'
     fi
@@ -158,6 +159,7 @@ case \"\${1:-}\" in
             trustd)
                 [ -z \"\${TRUST_MEMORY_JOBSERVER_SOCK:-}\" ] || exit 97
                 [ -z \"\${TRUSTD_DISABLE:-}\" ] || exit 98
+                [ -z \"\${TRUSTD_RUNTIME_DIR:-}\" ] || exit 96
                 echo \"trustd 0.1.0-test\"
                 echo \"trust.identity=trustd\"
                 echo \"trust.protocol=trustd.status.v1\"
@@ -196,6 +198,7 @@ run_orchestrator() {
         TARGO_TRUST="$fake_bin/ambient-targo-trust" \
         TRUSTD="$fake_bin/ambient-trustd" \
         TRUST_MEMORY_JOBSERVER_SOCK="$repo/ambient-trustd.sock" \
+        TRUSTD_RUNTIME_DIR="$repo/ambient-trustd-domain" \
         TRUSTD_DISABLE=1 \
         PYTHON="$python_path" \
         CARGO="$fake_bin/cargo" \

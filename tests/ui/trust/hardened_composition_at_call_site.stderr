@@ -1,7 +1,7 @@
 
 === Trust Verification Report (hardened_composition_at_call_site) ===
 
-note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 3 obligation(s)
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked, 1 assumed (requires) out of 3 obligation(s)
   --> $DIR/hardened_composition_at_call_site.rs:50:1
    |
 LL | / pub fn positive_part(x: i32) -> i32
@@ -14,7 +14,7 @@ LL | | }
    = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
    = note: [unknown] conditional definition-entry assumption; every caller must establish the requires contract
 
-note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 3 obligation(s)
+note: Trust verification: 4 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 4 obligation(s)
   --> $DIR/hardened_composition_at_call_site.rs:57:1
    |
 LL | / pub fn use_gppre(x: i32) -> i32 {

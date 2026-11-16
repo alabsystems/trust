@@ -17,6 +17,7 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 #[cfg(test)]
@@ -27,6 +28,33 @@ use trust_ir::proof::ProofAnnotation;
 use trust_types::VerifiableFunction;
 
 use crate::lower::{BridgeError, lower_to_trust_ir};
+
+/// Canonical key for [`ObligationKind`], matching `ObligationKind`'s `Display`
+/// output without allocating a heap `String` for the 15 fixed variants.
+#[inline]
+fn obligation_kind_key(kind: &ObligationKind) -> Cow<'static, str> {
+    match kind {
+        ObligationKind::Precondition => Cow::Borrowed("precondition"),
+        ObligationKind::Postcondition => Cow::Borrowed("postcondition"),
+        ObligationKind::LoopInvariant => Cow::Borrowed("loop_invariant"),
+        ObligationKind::TypeInvariant => Cow::Borrowed("type_invariant"),
+        ObligationKind::RefinementType => Cow::Borrowed("refinement_type"),
+        ObligationKind::TranslationValidation => Cow::Borrowed("translation_validation"),
+        ObligationKind::MemorySafety => Cow::Borrowed("memory_safety"),
+        ObligationKind::PanicFreedom => Cow::Borrowed("panic_freedom"),
+        ObligationKind::TemporalSafety => Cow::Borrowed("temporal_safety"),
+        ObligationKind::Liveness => Cow::Borrowed("liveness"),
+        ObligationKind::ArithmeticSafety => Cow::Borrowed("arithmetic_safety"),
+        ObligationKind::BoundsCheck => Cow::Borrowed("bounds_check"),
+        ObligationKind::GiveBackRefinement => Cow::Borrowed("give_back_refinement"),
+        ObligationKind::Termination => Cow::Borrowed("termination"),
+        ObligationKind::Ownership => Cow::Borrowed("ownership"),
+        ObligationKind::Custom { namespace, name } => {
+            Cow::Owned(format!("custom:{namespace}/{name}"))
+        }
+        _ => Cow::Owned(kind.to_string()),
+    }
+}
 
 /// A deterministic, order-independent summary of the proof-obligation kinds
 /// present in a lowered [`trust_ir::Module`], keyed by the obligation kind's
@@ -48,7 +76,12 @@ pub type ObligationKindSummary = BTreeMap<String, usize>;
 pub fn obligation_kind_summary(module: &trust_ir::Module) -> ObligationKindSummary {
     let mut summary = ObligationKindSummary::new();
     for obligation in &module.proof_obligations {
-        *summary.entry(obligation.kind.to_string()).or_insert(0) += 1;
+        let key = obligation_kind_key(&obligation.kind);
+        if let Some(count) = summary.get_mut(key.as_ref()) {
+            *count += 1;
+        } else {
+            summary.insert(key.into_owned(), 1);
+        }
     }
     summary
 }
@@ -69,7 +102,8 @@ pub fn lowered_obligation_summary(
 ///
 /// Convenience for assertions; `0` when the kind is absent.
 pub fn obligation_count(summary: &ObligationKindSummary, kind: ObligationKind) -> usize {
-    summary.get(&kind.to_string()).copied().unwrap_or(0)
+    let key = obligation_kind_key(&kind);
+    summary.get(key.as_ref()).copied().unwrap_or(0)
 }
 
 /// A deterministic, order-independent tally of the [`ProofAnnotation`]s
@@ -331,6 +365,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -395,6 +430,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -452,6 +488,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -525,6 +562,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -677,6 +715,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -714,6 +753,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -754,6 +794,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -781,6 +822,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -836,6 +878,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -946,6 +989,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1015,6 +1059,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1084,6 +1129,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1144,6 +1190,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1286,6 +1333,7 @@ pub(crate) mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let summary = lowered_obligation_summary(&noop).expect("noop should lower");
         assert!(summary.is_empty(), "no asserts/contracts means no obligations: {summary:?}");
@@ -1917,5 +1965,50 @@ pub(crate) mod tests {
             !payload.contains("safety_formula_not_reconstructed"),
             "mul obligation must no longer record the fail-closed audit marker: {payload}"
         );
+    }
+
+    #[test]
+    fn wave490_obligation_kind_key_matches_display_across_all_variants() {
+        let kinds = [
+            ObligationKind::Precondition,
+            ObligationKind::Postcondition,
+            ObligationKind::LoopInvariant,
+            ObligationKind::TypeInvariant,
+            ObligationKind::RefinementType,
+            ObligationKind::TranslationValidation,
+            ObligationKind::MemorySafety,
+            ObligationKind::PanicFreedom,
+            ObligationKind::TemporalSafety,
+            ObligationKind::Liveness,
+            ObligationKind::ArithmeticSafety,
+            ObligationKind::BoundsCheck,
+            ObligationKind::GiveBackRefinement,
+            ObligationKind::Termination,
+            ObligationKind::Ownership,
+            ObligationKind::Custom {
+                namespace: "trust.concurrency".to_string(),
+                name: "send_sync".to_string(),
+            },
+        ];
+        let mut module = trust_ir::Module::new("wave490");
+        for (i, kind) in kinds.iter().enumerate() {
+            assert_eq!(obligation_kind_key(kind).as_ref(), kind.to_string());
+            module.proof_obligations.push(trust_ir::ProofObligation::new(
+                trust_ir::ProofId::new(i as u32),
+                kind.clone(),
+                trust_ir::ProofStatus::Pending,
+                format!("ob-{i}"),
+            ));
+            module.proof_obligations.push(trust_ir::ProofObligation::new(
+                trust_ir::ProofId::new((100 + i) as u32),
+                kind.clone(),
+                trust_ir::ProofStatus::Pending,
+                format!("ob-dup-{i}"),
+            ));
+        }
+        let summary = obligation_kind_summary(&module);
+        for kind in kinds {
+            assert_eq!(obligation_count(&summary, kind), 2);
+        }
     }
 }

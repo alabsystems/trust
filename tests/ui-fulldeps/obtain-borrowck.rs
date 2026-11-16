@@ -1,9 +1,9 @@
 //@ edition: 2021
 //@ run-pass
 //@ check-run-results
+// ignore-tidy-linelength
 //@ run-flags: --sysroot {{sysroot-base}} --edition=2021 {{src-base}}/auxiliary/obtain-borrowck-input.rs
 //@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
-// ignore-tidy-linelength
 
 #![feature(rustc_private)]
 
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
         rustc_args.push("-Zpolonius".to_owned());
         let mut callbacks = CompilerCalls::default();
         // Call the Rust compiler with our callbacks.
-        rustc_driver::run_compiler(&rustc_args, &mut callbacks);
+        rustc_driver::compiler_entrypoint(&rustc_args, &mut callbacks);
     })
 }
 

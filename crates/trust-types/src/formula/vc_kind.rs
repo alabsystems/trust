@@ -88,6 +88,46 @@ impl HardenedVcCategory {
     pub fn is_unknown(self) -> bool {
         matches!(self, HardenedVcCategory::Unknown(_))
     }
+
+    /// Whether a constant-`true` violation in this category is a DESIGN
+    /// MANDATE: a profile rule the program is told to follow (no raw path API,
+    /// no error discarded through `Result::ok`, an explicit process-signal
+    /// policy, …), reported and graded `mandated` instead of proved.
+    ///
+    /// `UnsafeOperation` and `FfiBoundary` are the two L0-safety categories
+    /// (`VcKind::proof_level`). Their constant-`true` violation is a vcgen
+    /// MODELLING-GAP fail-close, not a rule about the program: an FFI call with no
+    /// summary (`trust-vcgen` `ffi_vcgen::unmodeled_ffi_obligation`), a freed
+    /// pointer whose provenance is unmodelled, an `[unsafe:unmodeled-call]` or the
+    /// `[unsafe] missing SAFETY comment` stand-in minted for every undecided site.
+    /// Calling those mandates labelled possible UB as a design choice, let the
+    /// default policy's tolerance skip them, and let them stop blocking the
+    /// coroutine-contract upgrade and the extern-call demotion (G3 review,
+    /// 2026-10-27, docs/DECISION_QUEUE.md G3-MANDATE-L1-ONLY-1). Exhaustive, so a
+    /// new category must decide.
+    #[must_use]
+    pub fn admits_design_mandate(self) -> bool {
+        match self {
+            HardenedVcCategory::RawPathApi
+            | HardenedVcCategory::PathIdentity
+            | HardenedVcCategory::PermissionChange
+            | HardenedVcCategory::PermissionCreate
+            | HardenedVcCategory::PermissionWindow
+            | HardenedVcCategory::Utf8Reject
+            | HardenedVcCategory::ByteLoss
+            | HardenedVcCategory::ErrorDiscard
+            | HardenedVcCategory::PanicBoundary
+            | HardenedVcCategory::CompatObservable
+            | HardenedVcCategory::ProcessSemantics
+            | HardenedVcCategory::TrustDomain
+            | HardenedVcCategory::TrustDomainOrder
+            // An unrecognised profile tag (the `opaque-terminator` boundary, a
+            // legacy `hardened::<tag>` row) is an L1 rule like the named ones
+            // (`HardenedBoundary { .. }` is L1 in `proof_level`); kept as it was.
+            | HardenedVcCategory::Unknown(_) => true,
+            HardenedVcCategory::UnsafeOperation | HardenedVcCategory::FfiBoundary => false,
+        }
+    }
 }
 
 impl Serialize for HardenedVcCategory {
@@ -158,6 +198,188 @@ impl RuntimeCheckEnv {
     #[must_use]
     pub const fn overflow_checks_only(overflow_checks: bool) -> Self {
         Self { overflow_checks, ub_checks: false }
+    }
+}
+
+/// The rustc-inserted MIR `Assert` terminator a hardened `PanicBoundary`
+/// boundary stands over, and the check environment that terminator's survival
+/// depends on.
+///
+/// A hardened boundary is NOT itself a check — it is a hardening-profile
+/// PROOF REQUIREMENT. But the `mir_assert::*` subfamily of the panic-boundary
+/// lane is raised over a terminator rustc itself emitted, and that terminator is
+/// what the generated program actually executes. This enum names which of the
+/// two answers [`VcKind::site_retains_language_check_in`] must give for such a
+/// boundary; the boundaries that stand over nothing rustc checks (`unwrap`,
+/// `expect`, `std::fs::rename`, `chroot`, …) have no variant here at all and
+/// answer `false` there too.
+///
+/// It says NOTHING about [`VcKind::has_runtime_fallback_in`], which answers
+/// `false` for every hardened boundary: the terminator this enum describes is
+/// the panic the boundary objects to, so its survival cannot DISCHARGE the
+/// obligation. The two questions are kept apart on purpose — see
+/// `site_retains_language_check_in`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirAssertGuard {
+    /// rustc emits this `Assert` unconditionally: `panic_bounds_check` for an
+    /// index, and the zero-divisor asserts for `/` and `%`. Nothing in the
+    /// tracked check environment can remove it, so the answer is `true`.
+    Unconditional,
+    /// rustc emits this `Assert` only when `-C overflow-checks` is on — the
+    /// `Overflow(..)`/`OverflowNeg` family. The answer is `env.overflow_checks`,
+    /// which is EXACTLY what the primary `ArithmeticOverflow` / `ShiftOverflow`
+    /// / `NegationOverflow` arms answer for the same operation.
+    OverflowChecked,
+}
+
+/// The exact prefix [`crate::HardenedVcCategory::PanicBoundary`] boundaries
+/// carry in their `callee` when the boundary stands over a rustc-inserted MIR
+/// `Assert`.
+///
+/// ONE PRODUCER, tree-wide: `trust_vcgen::hardened`'s assert lane, which mints
+/// the field as `format!("mir_assert::{msg:?}")` over an `AssertMessage`. Every
+/// other hardened boundary is a CALL_RULE match and carries a real callee path
+/// (`std::option::Option::<T>::unwrap`, `std::fs::rename`, …); every
+/// RECONSTRUCTED hardened row (targo's `report_vc_kind` legacy and
+/// design-mandate branches) fills `callee` from the row's FUNCTION name, never
+/// from this marker. So the marker's presence in a typed payload is provenance,
+/// not a guess.
+const MIR_ASSERT_CALLEE_PREFIX: &str = "mir_assert::";
+
+/// The `{msg:?}` rendering of the [`crate::AssertMessage`] a hardened
+/// `PanicBoundary` `callee` stands over, or `None` when the callee is not a
+/// `mir_assert::` marker at all.
+///
+/// ANCHORED: a callee that merely CONTAINS the marker (`wrapper::mir_assert::…`)
+/// answers `None`. This is the one place the prefix is spelled, so
+/// [`VcKind::site_retains_language_check_in`] and any policy layer that wants to
+/// name individual families read the same string.
+#[must_use]
+pub fn hardened_mir_assert_message(callee: &str) -> Option<&str> {
+    callee.strip_prefix(MIR_ASSERT_CALLEE_PREFIX)
+}
+
+/// The `callee` a hardened `PanicBoundary` over a MIR `Assert` carries — the
+/// one producer `trust_vcgen::hardened` mints it with. The inverse of
+/// [`hardened_mir_assert_message`], so the marker is spelled once: here.
+#[must_use]
+pub fn hardened_mir_assert_callee(msg: &crate::model::AssertMessage) -> String {
+    format!("{MIR_ASSERT_CALLEE_PREFIX}{msg:?}")
+}
+
+/// Recover the rustc-inserted assert a hardened `PanicBoundary` `callee` stands
+/// over, or `None` when it stands over no rustc check at all.
+///
+/// ANCHORED and EXACT on the `{msg:?}` rendering of [`crate::AssertMessage`], so
+/// a callee that merely MENTIONS the marker does not match. The recognized set
+/// is deliberately the same five-variant set targo's own
+/// `PanicTwinFamily`/`subsume_hardened_panic_twins` models — described there as
+/// "the four `mir_assert` panic families the language inserts a runtime check
+/// for and that vcgen emits a per-statement sibling for" — so the authority and
+/// the subsumption pass cannot drift about which boundaries have a sibling
+/// check.
+///
+/// EVERY OTHER `AssertMessage` ANSWERS `None`, ON PURPOSE:
+///
+/// * `NullPointerDereference` / `MisalignedPointerDereference` /
+///   `InvalidEnumConstruction` — these are `ub_checks`-gated UB asserts, not
+///   panics. `None` is the over-reported-`Unknown` direction (a lost recovery,
+///   never a false safety claim), it costs nothing (`RuntimeCheckEnv.ub_checks`
+///   is `false` in every lane targo can establish), and the hardened lane
+///   already skips the trusted-std spans of the first two.
+/// * `ResumedAfterReturn` / `ResumedAfterPanic` / `ResumedAfterDrop` — the
+///   coroutine resume-state family, which this tree adjudicates through its own
+///   authenticated resume contract rather than through a runtime-fallback claim.
+/// * `Custom(..)` — an arbitrary message. The text is not evidence that rustc
+///   emitted anything.
+#[must_use]
+pub fn hardened_mir_assert_guard(callee: &str) -> Option<MirAssertGuard> {
+    match hardened_mir_assert_message(callee)? {
+        // `panic_bounds_check` and the two zero-divisor asserts are emitted by
+        // rustc whatever the check settings are — the same reason the primary
+        // `IndexOutOfBounds` / `SliceBoundsCheck` / `DivisionByZero` /
+        // `RemainderByZero` arms answer an unconditional `true`.
+        "BoundsCheck" | "DivisionByZero" | "RemainderByZero" => Some(MirAssertGuard::Unconditional),
+        // `OverflowNeg` is checked BEFORE `Overflow(` so the two cannot alias.
+        "OverflowNeg" => Some(MirAssertGuard::OverflowChecked),
+        // `Overflow(<BinOp>)` for every operation, including `Div`/`Rem`. Those
+        // two are in fact emitted unconditionally (they guard `INT_MIN / -1`,
+        // which is UB, not a wrap), so answering `env.overflow_checks` for them
+        // UNDER-reports when overflow checks are off. That is deliberate: it is
+        // the lost-recovery direction, and it keeps this arm byte-for-byte in
+        // lock-step with the primary `ArithmeticOverflow { op }` arm, which
+        // answers `env.overflow_checks` for every `op` as well. One rule, one
+        // answer, no second opinion about Div/Rem.
+        rest if rest.starts_with("Overflow(") && rest.ends_with(')') => {
+            Some(MirAssertGuard::OverflowChecked)
+        }
+        _ => None,
+    }
+}
+
+/// The program point at which a TINV type-invariant obligation is owed
+/// (design `docs/design/2026-10-04-type-invariant-tinv.md` §P4): establishment by a
+/// constructor, re-establishment before a call that receives a root, at return, on an
+/// unwind edge, at a move out, and before a `Drop`.
+///
+/// FROZEN ORDER, APPEND ONLY. [`TypeInvariantPoint::canonical_byte`] and bincode both
+/// encode the declaration index, and both enter certificate identity. Deliberately not
+/// `#[non_exhaustive]`: a downstream match must break when a point is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TypeInvariantPoint {
+    Establish,
+    Call,
+    Return,
+    Unwind,
+    Move,
+    Drop,
+}
+
+impl TypeInvariantPoint {
+    /// The stable wire spelling of the point.
+    #[must_use]
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            Self::Establish => "establish",
+            Self::Call => "call",
+            Self::Return => "return",
+            Self::Unwind => "unwind",
+            Self::Move => "move",
+            Self::Drop => "drop",
+        }
+    }
+
+    /// The byte the canonical certificate encoding uses. These values never change.
+    #[must_use]
+    pub const fn canonical_byte(self) -> u8 {
+        match self {
+            Self::Establish => 0,
+            Self::Call => 1,
+            Self::Return => 2,
+            Self::Unwind => 3,
+            Self::Move => 4,
+            Self::Drop => 5,
+        }
+    }
+}
+
+impl std::fmt::Display for TypeInvariantPoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_tag())
+    }
+}
+
+/// A MIR location of a TINV obligation: a terminator site has
+/// `statement_index == statements.len()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TypeInvariantSite {
+    pub block: usize,
+    pub statement_index: usize,
+}
+
+impl std::fmt::Display for TypeInvariantSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bb{}[{}]", self.block, self.statement_index)
     }
 }
 
@@ -596,9 +818,57 @@ pub enum VcKind {
         /// The function whose frame condition was violated.
         function: String,
     },
+    /// TINV (design `docs/design/2026-10-04-type-invariant-tinv.md`): an inferred
+    /// invariant of the struct `ty` is owed at `point`, at MIR location `site`.
+    ///
+    /// * The formula is SITUATED: `pc ∧ state-binding ⇒ I(σ)` at that program point
+    ///   (§P4), never the bare negated clause. The `ContractInvariant` doc above is
+    ///   the defect this kind must not repeat.
+    /// * Only the TINV pre-pass mints it (step 7). A failed or unknown row drops a
+    ///   Houdini candidate conjunct; it is not a refutation of the program.
+    /// * `ty` MUST be the crate-qualified def path (the crate name prefixed even for a
+    ///   local item): the string enters certificate identity and the dedup
+    ///   description, and a local `def_path_str` omits the crate.
+    ///
+    /// APPENDED LAST ON PURPOSE: `ObligationIdentity::from_vc` is bincode, which
+    /// encodes the declaration index, so a mid-enum insert re-keys every later
+    /// variant's certificate identity.
+    ///
+    /// ROW IDENTITY. `(ty, point, site, conjunct, ordinal, edge)` names the row exactly,
+    /// so a consumer (coverage match, cache, dedup, Houdini, the 7.7 authority flip)
+    /// can never pair or conflate two rows by emission order:
+    /// * `conjunct` is the candidate conjunct's id within `ty`;
+    /// * `ordinal` distinguishes two roots owing the same point at one site;
+    /// * `edge` is `Some(p)` for an EDGE PART of a point at a join block (TINV-9(a)):
+    ///   the part covers exactly the executions entering `site.block` from predecessor
+    ///   block `p`. A point with parts is discharged only when EVERY part is (and, since
+    ///   7.7, every part is kernel-certified); one proved part discharges nothing.
+    ///   `None` for an unsplit row.
+    TypeInvariant {
+        ty: String,
+        point: TypeInvariantPoint,
+        site: TypeInvariantSite,
+        conjunct: u32,
+        ordinal: u32,
+        edge: Option<usize>,
+    },
+    /// A body-lowering refusal retaining the authored source predicate. The
+    /// refusal query is not a proof or refutation of that predicate. Appended
+    /// to preserve existing bincode-backed obligation identities.
+    DeclinedContractBody(Box<super::ContractBodyDecline>),
 }
 
 impl VcKind {
+    /// Return a retained typed source question for a body-lowering decline.
+    /// This carries no proof or current-program authority by itself.
+    #[must_use]
+    pub fn declined_contract_body(&self) -> Option<&super::ContractBodyDecline> {
+        match self {
+            Self::DeclinedContractBody(decline) => Some(decline.as_ref()),
+            _ => None,
+        }
+    }
+
     /// Stable family tag for binary copy-sink length obligations.
     pub const BINARY_COPY_SINK_LENGTH_FAMILY: &'static str = "binary_copy_sink_length_violation";
     /// Stable prefix used for machine-readable hardened report tags.
@@ -613,6 +883,29 @@ impl VcKind {
     /// [`VcKind::Assertion`]. Rust inserts no check for any of them, so
     /// [`VcKind::has_runtime_fallback_in`] declines the whole family.
     pub const SEP_UNSAFE_ASSERTION_PREFIX: &'static str = "[unsafe:sep:";
+
+    /// The memory-provenance lane's assertion tag (`memory_provenance.rs` —
+    /// use-after-free / dangling / invalidated-pointer claims). Rust inserts NO
+    /// check for any of them; see [`VcKind::has_runtime_fallback_in`].
+    pub const PROVENANCE_ASSERTION_PREFIX: &'static str = "[provenance]";
+
+    /// `UnsupportedMir { kind }` tag the compiler mints when the configured
+    /// memory authority (trustd) could not admit a function BEFORE any solver
+    /// ran. It is not a modelling gap: nothing was attempted. targo recognises
+    /// this exact tag to turn an unreachable authority into a SETUP failure
+    /// instead of one `unknown` row per function — on 2026-09-19 a 4h44m gate
+    /// over ay reported 282,786 such rows in its last eight seconds after a
+    /// test stub unlinked the live daemon's socket, and the census read as a
+    /// verifier-completeness measurement for two days.
+    pub const MEMORY_ADMISSION_UNSUPPORTED_MIR_KIND: &'static str = "MemoryAdmission";
+
+    /// The rendered prefix such a row carries (the `Display` arm for
+    /// `UnsupportedMir`), so a consumer that only sees rendered rows can still
+    /// recognise the closed vocabulary without parsing free text.
+    #[must_use]
+    pub fn memory_admission_message_prefix() -> String {
+        format!("unsupported MIR `{}`: ", Self::MEMORY_ADMISSION_UNSUPPORTED_MIR_KIND)
+    }
 
     /// Why a kernel-checked UNSAT of this kind's violation formula is NOT a
     /// proof about the program — or `None` when it is.
@@ -672,10 +965,17 @@ impl VcKind {
     /// compile, which forces whoever adds a kind to state whether its formula
     /// binds its free names to program state before the kernel may certify it.
     /// That compile error is the point of this function.
+    ///
+    /// Crate-private since TINV step 7.2: every consumer asks the VC-level
+    /// [`crate::VerificationCondition::kernel_authority_refusal`], which applies this
+    /// gate and then the per-kind structural checks.
     #[must_use]
-    pub fn kernel_authority_refusal(&self) -> Option<&'static str> {
+    pub(crate) fn kind_authority_refusal(&self) -> Option<&'static str> {
         match self {
             // ---- REFUSED -------------------------------------------------
+            VcKind::DeclinedContractBody(_) => Some(
+                "body lowering declined this contract: its refusal query is not a program violation; the retained source predicate requires an independently checked monitor or body proof",
+            ),
             //
             // An item-position `#[invariant(..)]` names NO program point, so
             // there is nothing to bind its free names at. `trust-mir-extract`
@@ -703,6 +1003,17 @@ impl VcKind {
                 "a type-refinement row's violation formula is the bare negated predicate with \
                  the refined variable unbound to any program value; a kernel-checked UNSAT of \
                  it proves only that the predicate text is a tautology",
+            ),
+            // v6/D2: `ty` owns concurrency, and its obligations must be real.
+            // No producer builds either kind from a concurrency model today: the
+            // memory-ordering legality row is a lone free boolean emitted after
+            // Rust already decided the operation, and the data-race formula is
+            // decided before emission. The router refuses both before dispatch;
+            // this gate keeps the kernel lane from certifying them around it.
+            VcKind::DataRace { .. } | VcKind::InsufficientOrdering { .. } => Some(
+                "a concurrency obligation carries no concurrency model yet (v6/D2): its formula \
+                 was decided before emission, so a kernel-checked UNSAT of it is not a fact \
+                 about any interleaving",
             ),
 
             // ---- ADMITTED ------------------------------------------------
@@ -749,16 +1060,14 @@ impl VcKind {
             | VcKind::LoopInvariantConsecution { .. }
             | VcKind::LoopInvariantSufficiency { .. } => None,
 
-            // Memory, aliasing, concurrency and boundary obligations: all minted
-            // from MIR/analysis facts with their reaching conditions.
+            // Memory, aliasing and boundary obligations: all minted from
+            // MIR/analysis facts with their reaching conditions.
             VcKind::UseAfterFree { .. }
             | VcKind::DoubleFree { .. }
             | VcKind::AliasingViolation { .. }
             | VcKind::LifetimeViolation { .. }
             | VcKind::SendViolation
             | VcKind::SyncViolation
-            | VcKind::DataRace { .. }
-            | VcKind::InsufficientOrdering { .. }
             | VcKind::Deadlock
             | VcKind::UnboundedAllocation { .. }
             | VcKind::CopyBoundsViolation { .. }
@@ -789,6 +1098,22 @@ impl VcKind {
             // non-refutable wherever it is minted, so it cannot reach UNSAT; the
             // gate leaves it exactly as it was.
             VcKind::UnsupportedMir { .. } => None,
+
+            // TINV-8 / TINV step 7.7 (2026-10-05): ADMITTED BY KIND, CONDITIONALLY.
+            // The step-7 pre-pass (`trust_vcgen::type_invariant`) mints every row inside
+            // the ordinary safety walk with its path condition, its entry/post-call
+            // facts and an obligation record. Admission here is NOT admission of the
+            // row: `VerificationCondition::kernel_authority_refusal` then applies
+            // `type_invariant_situatedness_refusal` (TINV-9(j)) — a record that replays
+            // to the formula, a negated core conjoined last, at least one hypothesis,
+            // every core name bound by one, an edge part's guard never counted — and
+            // refuses every row that fails it. That check is a regression guard against
+            // record-less, bare and forged rows only; it says nothing about whether the
+            // hypotheses are true program facts, which is the producer's and Houdini's
+            // vacuity filter's job (TINV-9(h)). MUTATION: move this arm back under
+            // REFUSED and `trust-certify/tests/kernel_authority_kind_gate.rs`
+            // `a_recorded_situated_type_invariant_row_mints_and_replays` fails.
+            VcKind::TypeInvariant { .. } => None,
         }
     }
 
@@ -818,6 +1143,23 @@ impl VcKind {
         }
     }
 
+    /// Whether a VC of this kind with violation formula `formula` is a hardened
+    /// DESIGN MANDATE: a hardened category that admits one
+    /// ([`HardenedVcCategory::admits_design_mandate`]) and the closed tautology
+    /// `Bool(true)`, a violation no engine can ever prove UNSAT.
+    ///
+    /// THE one predicate behind the compiler's transport `design_mandate` bit and
+    /// the default policy's tolerance skip (`rustc_mir_transform::trust_verify`)
+    /// and the interval augmentation's leave-alone rule (`trust-vcgen`
+    /// `augment_vc_with_abstract_state`), so the three cannot drift. An L0
+    /// `UnsafeOperation`/`FfiBoundary` row with a `Bool(true)` violation is a
+    /// fail-closed modelling gap and answers `false`.
+    #[must_use]
+    pub fn is_hardened_design_mandate(&self, formula: &super::Formula) -> bool {
+        matches!(formula, super::Formula::Bool(true))
+            && self.hardened_category().is_some_and(HardenedVcCategory::admits_design_mandate)
+    }
+
     /// Stable hardened family tag for reports, including legacy rows.
     #[must_use]
     pub fn hardened_family_tag(&self) -> Option<String> {
@@ -835,6 +1177,9 @@ impl VcKind {
     pub fn transport_tag(&self) -> String {
         if let Some(category) = self.hardened_category() {
             return format!("hardened_{}", category.as_tag());
+        }
+        if let VcKind::TypeInvariant { point, .. } = self {
+            return format!("type_invariant:{}", point.as_tag());
         }
 
         let tag = match self {
@@ -958,6 +1303,12 @@ impl VcKind {
             VcKind::UnsupportedMir { kind, detail } => {
                 format!("unsupported MIR `{kind}`: {detail}")
             }
+            VcKind::DeclinedContractBody(decline) => match decline.cause {
+                super::ContractBodyDeclineCause::UnconstrainedReturnCall => format!(
+                    "postcondition body declined: unconstrained return call (source clause #{})",
+                    decline.source_contract_index,
+                ),
+            },
             VcKind::DeadState { state } => format!("dead state `{state}`"),
             VcKind::Deadlock => "deadlock".to_string(),
             VcKind::Temporal { property, .. } => format!("temporal: {property}"),
@@ -1089,6 +1440,19 @@ impl VcKind {
                     "frame condition violation: `{variable}` modified outside modifies clause of `{function}`"
                 )
             }
+            // Lossless over (ty, point, site, conjunct, ordinal, edge): `vc_dedup` and
+            // targo's typed-kind check compare descriptions, so two edge parts of one
+            // point (or two conjuncts of one row) must never describe alike.
+            VcKind::TypeInvariant { ty, point, site, conjunct, ordinal, edge } => {
+                let via = match edge {
+                    Some(p) => format!(" via edge bb{p}"),
+                    None => String::new(),
+                };
+                format!(
+                    "type invariant of `{ty}` conjunct {conjunct} at {point} ({site}) ordinal \
+                     {ordinal}{via}"
+                )
+            }
         }
     }
 
@@ -1131,7 +1495,9 @@ impl VcKind {
             // `Requires`/`Ensures` siblings: L1, not L0 safety.
             VcKind::Precondition { .. }
             | VcKind::Postcondition
-            | VcKind::ContractInvariant { .. } => ProofLevel::L1Functional,
+            | VcKind::DeclinedContractBody(_)
+            | VcKind::ContractInvariant { .. }
+            | VcKind::TypeInvariant { .. } => ProofLevel::L1Functional,
             VcKind::DeadState { .. }
             | VcKind::Deadlock
             | VcKind::Temporal { .. }
@@ -1321,6 +1687,28 @@ impl VcKind {
     /// indistinguishable downstream, so this arm cannot tell them apart and
     /// fails closed for all of them.
     ///
+    /// `VcKind::HardenedBoundary` answers `false` for the WHOLE family, including
+    /// the `mir_assert::*` panic subfamily raised over a rustc-inserted `Assert`.
+    /// That is not an under-report, because THIS predicate is not asking whether
+    /// a check exists at the site — it is asking whether THE PROPERTY THIS
+    /// OBLIGATION ASSERTS is enforced dynamically. A hardened panic boundary
+    /// asserts that the panic is UNREACHABLE, and `panic_bounds_check` does not
+    /// enforce unreachability: it IS the panic. The check surviving codegen is
+    /// exactly what the boundary is complaining about, so it can never discharge
+    /// it, and answering `true` here would make
+    /// [`crate::classify_runtime_disposition_in`] relabel an unproved hardened
+    /// row `RuntimeChecked` — "will be enforced dynamically at runtime" — about a
+    /// property nothing enforces.
+    ///
+    /// The DIFFERENT, narrower question — "does the operation this obligation
+    /// stands over still carry rustc's own dynamic check?" — is real, is MEASURED
+    /// (byte-identical LLVM IR with and without `-Ztrust-verify-profile=unix_hardened`),
+    /// and has its own name: [`VcKind::site_retains_language_check_in`]. Ask that
+    /// one when you want the fact; ask this one when you want to know whether the
+    /// obligation is covered. They are a strict superset / subset pair, and
+    /// keeping them apart is what stops a factual measurement from silently
+    /// becoming a safety claim in every report the tree prints.
+    ///
     /// FAIL-CLOSED ADAPTER. This spelling knows only `overflow_checks`, so it
     /// answers as if `ub_checks` were OFF — see
     /// [`RuntimeCheckEnv::overflow_checks_only`]. Every kind whose guard is
@@ -1370,6 +1758,25 @@ impl VcKind {
             // `UnsafeOperation`. Anchored at the start, matching the mint format.
             VcKind::Assertion { message }
                 if message.starts_with(Self::SEP_UNSAFE_ASSERTION_PREFIX) =>
+            {
+                false
+            }
+            // Trust (2026-09-16, refuted at targo's publication boundary): the
+            // carve-out above was the ONLY one, so every other lane-tagged
+            // synthetic assertion answered `true` — `[unsafe:deref]`, `[unsafe]`,
+            // `[unsafe:ffi]`, `[unsafe:sep]` (no trailing colon — the
+            // separation_logic mint), `[unsafe:asm]`, `[unsafe:unmodeled-call]`
+            // and `[provenance]` — although rustc emits no check for any of
+            // them: `hardened_category()` already classifies the whole
+            // `[unsafe…]` family as UnsafeOperation/FfiBoundary, and a
+            // provenance row is a use-after-free/dangling claim. A `true` here
+            // is what lets an UNPROVED such row be labelled runtime-checked (the
+            // compiler's wire arm and policy-B denier, and targo's policy-B
+            // relabel of an evidence-free `Proved`). Answer as the typed
+            // spellings of the same properties do.
+            VcKind::Assertion { message }
+                if self.hardened_category().is_some()
+                    || message.starts_with(Self::PROVENANCE_ASSERTION_PREFIX) =>
             {
                 false
             }
@@ -1484,13 +1891,98 @@ impl VcKind {
             | VcKind::SyncViolation
             // Functional correctness has no runtime fallback.
             | VcKind::FunctionalCorrectness { .. }
+            // A typed body decline has no language-inserted guard. Only an
+            // independently certified, source-bound monitor may enforce it.
+            | VcKind::DeclinedContractBody(_)
+            // EVERY hardened boundary, without exception. A hardening-profile
+            // boundary asserts that a panic is UNREACHABLE. For the `unwrap` /
+            // `expect` / `std::fs::rename` / `chroot` half the language inserts
+            // nothing at the site at all. For the `mir_assert::*` half the
+            // language DOES insert a check — and that check is the panic the
+            // boundary is objecting to, so it cannot discharge the obligation
+            // either. Both halves answer `false` HERE; the measured fact about
+            // the second half is served by
+            // [`VcKind::site_retains_language_check_in`], under its own name.
             | VcKind::HardenedBoundary { .. }
             // trust_wp contract VCs have no runtime fallback.
             | VcKind::LoopInvariantInitiation { .. }
             | VcKind::LoopInvariantConsecution { .. }
             | VcKind::LoopInvariantSufficiency { .. }
             | VcKind::TypeRefinementViolation { .. }
-            | VcKind::FrameConditionViolation { .. } => false,
+            | VcKind::FrameConditionViolation { .. }
+            // No rustc-inserted check enforces a struct invariant: an Unknown TINV row
+            // must never be relabelled RuntimeChecked.
+            | VcKind::TypeInvariant { .. } => false,
+        }
+    }
+
+    /// Does the generated program still execute a rustc-inserted dynamic check
+    /// AT THIS OBLIGATION'S SITE — whether or not that check DISCHARGES the
+    /// obligation?
+    ///
+    /// A DIFFERENT QUESTION FROM [`VcKind::has_runtime_fallback_in`], and the
+    /// distinction is the whole reason this method exists. `has_runtime_fallback_in`
+    /// asks whether THE PROPERTY THE OBLIGATION ASSERTS is enforced dynamically,
+    /// and its `true` is a POSITIVE SAFETY CLAIM that
+    /// [`crate::classify_runtime_disposition_in`] turns into a `RuntimeChecked`
+    /// label reading "will be enforced dynamically at runtime". This method asks
+    /// only whether rustc's own guard is still in the binary at that spot. For
+    /// every kind except one the two coincide. They come apart on
+    /// `HardenedBoundary { PanicBoundary, callee: "mir_assert::…" }`:
+    ///
+    /// * the `Assert` rustc emitted IS still in the program — MEASURED 2026-09-18
+    ///   with `trustc 1.99.0-dev (ba1b42178)`: `--emit=llvm-ir` over a fixture
+    ///   with an `a + b`, a `v[i]` and an `Option::unwrap` is BYTE-IDENTICAL with
+    ///   and without `-Ztrust-verify-profile=unix_hardened` (sha256
+    ///   9b196065a05bc5d4c66fb763d7ebbc217a89079657d4f43ebac0b39a43d2b198 for
+    ///   both), retaining `llvm.sadd.with.overflow.i32` +
+    ///   `panic_const_add_overflow`, `panic_bounds_check` and `unwrap_failed`.
+    ///   `-Ztrust-verify-profile` has exactly ONE consumer in the compiler
+    ///   (`hardened_verification_enabled`, rustc_mir_transform/src/trust_verify.rs)
+    ///   and it only decides whether vcgen EMITS obligations. So the answer HERE
+    ///   is `true`;
+    /// * but the obligation that boundary raises is "this panic is UNREACHABLE",
+    ///   and that surviving `Assert` is the panic itself. It cannot discharge the
+    ///   obligation, so `has_runtime_fallback_in` stays `false` — see its own
+    ///   contract.
+    ///
+    /// STRICT SUPERSET, pinned by a test over every variant and every
+    /// [`RuntimeCheckEnv`]: `has_runtime_fallback_in(env)` implies
+    /// `site_retains_language_check_in(env)`, and the only place the implication
+    /// is not an equality is that subfamily.
+    ///
+    /// WHO MAY ASK THIS. A caller that wants to know whether a REFUTED obligation
+    /// still has the language's guard behind it, and that carries its own reason
+    /// for treating the guard as sufficient. Today exactly one does: targo's
+    /// `--test-target-panics=runtime-checked`, an explicit flag with no default
+    /// and no environment variable, which applies only inside a cargo `["test"]`
+    /// target — where the panic is the test's INTENDED failure signal, so "the
+    /// panic still fires" is the answer it wants rather than the answer it
+    /// refuses. It layers a narrower policy on top
+    /// (`targo-trust/src/test_target_panics.rs`). Any new caller must state the
+    /// same kind of reason: this method reports a FACT and confers no coverage.
+    #[must_use]
+    pub fn site_retains_language_check_in(&self, env: RuntimeCheckEnv) -> bool {
+        if self.has_runtime_fallback_in(env) {
+            return true;
+        }
+        match self {
+            // The ONLY place the two questions come apart. Recovered through
+            // [`hardened_mir_assert_guard`], never guessed from the category, and
+            // the answer is EXACTLY what the underlying operation's own
+            // `has_runtime_fallback_in` arm answers: unconditional for
+            // `BoundsCheck` / `DivisionByZero` / `RemainderByZero`,
+            // `env.overflow_checks` for `Overflow(..)` / `OverflowNeg`.
+            VcKind::HardenedBoundary {
+                category: HardenedVcCategory::PanicBoundary,
+                callee,
+                ..
+            } => match hardened_mir_assert_guard(callee) {
+                Some(MirAssertGuard::Unconditional) => true,
+                Some(MirAssertGuard::OverflowChecked) => env.overflow_checks,
+                None => false,
+            },
+            _ => false,
         }
     }
 }
@@ -1505,6 +1997,458 @@ impl std::fmt::Display for VcKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::AssertMessage;
+
+    /// The operand type these tests use; `has_runtime_fallback_in` never reads
+    /// it, so one signed 32-bit integer stands for every arithmetic row.
+    const I32: Ty = Ty::Int { width: 32, signed: true };
+
+    /// Build the hardened boundary `trust_vcgen::hardened`'s assert lane mints
+    /// for `msg`, using the SAME `format!("mir_assert::{msg:?}")` spelling, so
+    /// these tests pin the recognizer to the real `Debug` rendering rather than
+    /// to a hand-typed copy of it. A rename of any `AssertMessage` variant
+    /// breaks these tests instead of silently retiring a subfamily.
+    fn hardened_assert_boundary(msg: &AssertMessage) -> VcKind {
+        VcKind::HardenedBoundary {
+            category: HardenedVcCategory::PanicBoundary,
+            callee: format!("mir_assert::{msg:?}"),
+            detail: "MIR assert can panic; hardened code needs a proved precondition".to_string(),
+        }
+    }
+
+    /// A hardened boundary raised over a CALL, which is what every CALL_RULE in
+    /// `trust_vcgen::hardened` produces.
+    fn hardened_call_boundary(category: HardenedVcCategory, callee: &str) -> VcKind {
+        VcKind::HardenedBoundary {
+            category,
+            callee: callee.to_string(),
+            detail: "hardened boundary".to_string(),
+        }
+    }
+
+    const ENVS: [RuntimeCheckEnv; 4] = [
+        RuntimeCheckEnv::new(false, false),
+        RuntimeCheckEnv::new(false, true),
+        RuntimeCheckEnv::new(true, false),
+        RuntimeCheckEnv::new(true, true),
+    ];
+
+    /// THE POSITIVE DIRECTION, family by family: for
+    /// [`VcKind::site_retains_language_check_in`] — "is rustc's own guard still
+    /// at this site" — a hardened panic boundary over a rustc-inserted assert
+    /// answers EXACTLY what the primary obligation over the same operation
+    /// answers, in every check environment.
+    ///
+    /// Stated as an equality against the primary arm rather than as a literal,
+    /// because the claim being pinned is lock-step — if someone ever changes
+    /// what `ArithmeticOverflow` answers, the twin must move with it.
+    ///
+    /// THE SAME LOOP PINS `has_runtime_fallback_in` AT `false` for every one of
+    /// these boundaries. That is the separation this test exists to hold: the
+    /// guard is there (so the flag may consult it) and the obligation is still
+    /// undischarged (so no report may call it covered). Collapsing the two is
+    /// the regression a reviewer MEASURED through `trust_report::build_json_report`
+    /// — a `Timeout` hardened row came back as `Unknown`, with no flag involved.
+    #[test]
+    fn hardened_mir_assert_boundary_answers_exactly_its_primary_sibling_arm() {
+        let pairs: Vec<(AssertMessage, VcKind)> = vec![
+            (AssertMessage::BoundsCheck, VcKind::IndexOutOfBounds),
+            (AssertMessage::BoundsCheck, VcKind::SliceBoundsCheck),
+            (AssertMessage::DivisionByZero, VcKind::DivisionByZero),
+            (AssertMessage::RemainderByZero, VcKind::RemainderByZero),
+            (
+                AssertMessage::Overflow(BinOp::Add),
+                VcKind::ArithmeticOverflow { op: BinOp::Add, operand_tys: (I32, I32) },
+            ),
+            (
+                AssertMessage::Overflow(BinOp::Sub),
+                VcKind::ArithmeticOverflow { op: BinOp::Sub, operand_tys: (I32, I32) },
+            ),
+            (
+                AssertMessage::Overflow(BinOp::Mul),
+                VcKind::ArithmeticOverflow { op: BinOp::Mul, operand_tys: (I32, I32) },
+            ),
+            (
+                AssertMessage::Overflow(BinOp::Shl),
+                VcKind::ShiftOverflow { op: BinOp::Shl, operand_ty: I32, shift_ty: I32 },
+            ),
+            (
+                AssertMessage::Overflow(BinOp::Shr),
+                VcKind::ShiftOverflow { op: BinOp::Shr, operand_ty: I32, shift_ty: I32 },
+            ),
+            (AssertMessage::OverflowNeg, VcKind::NegationOverflow { ty: I32 }),
+        ];
+        for (msg, primary) in pairs {
+            let boundary = hardened_assert_boundary(&msg);
+            for env in ENVS {
+                assert_eq!(
+                    boundary.site_retains_language_check_in(env),
+                    primary.site_retains_language_check_in(env),
+                    "hardened `mir_assert::{msg:?}` must answer exactly as {primary:?} in {env:?}"
+                );
+                assert!(
+                    !boundary.has_runtime_fallback_in(env),
+                    "`mir_assert::{msg:?}` keeps its guard, but the guard IS the panic it \
+                     objects to — it can never DISCHARGE the boundary ({env:?})"
+                );
+            }
+        }
+    }
+
+    /// The overflow subfamily is not unconditionally `true`: with
+    /// `-C overflow-checks=no` rustc emits NO overflow `Assert` (MEASURED
+    /// 2026-09-18: `trustc -C overflow-checks=no --emit=llvm-ir` over `a + b`
+    /// contains zero `llvm.sadd.with.overflow` / `panic_const_add_overflow`),
+    /// and the boundary must answer `false` there.
+    #[test]
+    fn hardened_mir_assert_overflow_boundary_declines_without_overflow_checks() {
+        for msg in [
+            AssertMessage::Overflow(BinOp::Add),
+            AssertMessage::Overflow(BinOp::Sub),
+            AssertMessage::Overflow(BinOp::Mul),
+            AssertMessage::Overflow(BinOp::Shl),
+            AssertMessage::Overflow(BinOp::Shr),
+            AssertMessage::Overflow(BinOp::Div),
+            AssertMessage::Overflow(BinOp::Rem),
+            AssertMessage::OverflowNeg,
+        ] {
+            let boundary = hardened_assert_boundary(&msg);
+            assert!(
+                boundary.site_retains_language_check_in(RuntimeCheckEnv::new(true, false)),
+                "`mir_assert::{msg:?}` keeps its guard under overflow checks"
+            );
+            assert!(
+                !boundary.site_retains_language_check_in(RuntimeCheckEnv::new(false, true)),
+                "`mir_assert::{msg:?}` has no guard with overflow checks off"
+            );
+        }
+    }
+
+    /// The bounds and zero-divisor asserts are emitted whatever the check
+    /// settings are, so their boundaries answer `true` in every environment.
+    #[test]
+    fn hardened_mir_assert_unconditional_boundaries_keep_their_guard_everywhere() {
+        for msg in [
+            AssertMessage::BoundsCheck,
+            AssertMessage::DivisionByZero,
+            AssertMessage::RemainderByZero,
+        ] {
+            let boundary = hardened_assert_boundary(&msg);
+            for env in ENVS {
+                assert!(
+                    boundary.site_retains_language_check_in(env),
+                    "`mir_assert::{msg:?}` keeps its guard in {env:?}"
+                );
+            }
+        }
+    }
+
+    /// THE NEGATIVE DIRECTION 1 — a panic boundary raised over a CALL. rustc
+    /// inserts no check for `unwrap`/`expect`: the panic lives in the callee,
+    /// which is why these are obligations at all. They must keep answering
+    /// `false`, or this change would have laundered the whole CALL_RULE lane
+    /// into a monitor claim.
+    #[test]
+    fn hardened_call_panic_boundaries_have_no_runtime_guard() {
+        for callee in [
+            "std::option::Option::<T>::unwrap",
+            "std::result::Result::<T, E>::unwrap",
+            "std::option::Option::<T>::expect",
+            "core::result::Result::ok",
+            "unwrap_or_default",
+        ] {
+            let boundary = hardened_call_boundary(HardenedVcCategory::PanicBoundary, callee);
+            for env in ENVS {
+                assert!(
+                    !boundary.site_retains_language_check_in(env),
+                    "`{callee}` is a call, not a rustc-inserted check ({env:?})"
+                );
+                assert!(
+                    !boundary.has_runtime_fallback_in(env),
+                    "`{callee}` discharges nothing either ({env:?})"
+                );
+            }
+        }
+    }
+
+    /// THE NEGATIVE DIRECTION 2 — the marker is ANCHORED and EXACT. A callee
+    /// that merely CONTAINS `mir_assert::`, or that names an `AssertMessage`
+    /// this arm does not model, claims nothing.
+    /// `hardened_mir_assert_callee` is the producer spelling (vcgen and the
+    /// compiler's elision seam both call it) and `hardened_mir_assert_message`
+    /// its exact inverse.
+    #[test]
+    fn hardened_mir_assert_callee_is_the_inverse_of_the_reader() {
+        use crate::model::BinOp;
+        for msg in [
+            AssertMessage::Overflow(BinOp::Add),
+            AssertMessage::Overflow(BinOp::Shr),
+            AssertMessage::OverflowNeg,
+            AssertMessage::BoundsCheck,
+            AssertMessage::DivisionByZero,
+            AssertMessage::RemainderByZero,
+        ] {
+            let callee = hardened_mir_assert_callee(&msg);
+            assert_eq!(callee, format!("mir_assert::{msg:?}"));
+            assert_eq!(hardened_mir_assert_message(&callee), Some(format!("{msg:?}").as_str()));
+            assert!(hardened_mir_assert_guard(&callee).is_some(), "{callee}");
+        }
+    }
+
+    #[test]
+    fn hardened_mir_assert_marker_is_anchored_and_closed() {
+        let refused = [
+            // Not anchored: a real callee path that happens to embed the marker.
+            "wrapper::mir_assert::Overflow(Add)",
+            " mir_assert::Overflow(Add)",
+            // Anchored but not a modeled message.
+            "mir_assert::",
+            "mir_assert::Overflow",
+            "mir_assert::Overflow(",
+            "mir_assert::OverflowSomething",
+            "mir_assert::BoundsCheckExtra",
+            // UB-class asserts: `ub_checks`-gated, not panics. Declined on
+            // purpose — the lost-recovery direction, never a safety claim.
+            "mir_assert::NullPointerDereference",
+            "mir_assert::MisalignedPointerDereference",
+            "mir_assert::InvalidEnumConstruction",
+            // Coroutine resume-state family: adjudicated by its own contract.
+            "mir_assert::ResumedAfterReturn",
+            "mir_assert::ResumedAfterPanic",
+            "mir_assert::ResumedAfterDrop",
+        ];
+        for callee in refused {
+            assert!(hardened_mir_assert_guard(callee).is_none(), "`{callee}` must not be claimed");
+            let boundary = hardened_call_boundary(HardenedVcCategory::PanicBoundary, callee);
+            for env in ENVS {
+                assert!(
+                    !boundary.site_retains_language_check_in(env),
+                    "`{callee}` must claim no guard in {env:?}"
+                );
+                assert!(!boundary.has_runtime_fallback_in(env));
+            }
+        }
+        // `Custom(..)` renders with the message in it and is never claimed.
+        let custom = hardened_assert_boundary(&AssertMessage::Custom("anything".to_string()));
+        for env in ENVS {
+            assert!(!custom.site_retains_language_check_in(env));
+            assert!(!custom.has_runtime_fallback_in(env));
+        }
+    }
+
+    /// THE NEGATIVE DIRECTION 3 — the CATEGORY gates the arm. The same
+    /// `mir_assert::Overflow(Add)` callee under any other hardened category
+    /// claims nothing, so a mis-categorized row cannot borrow the panic
+    /// boundary's answer. `UnsafeOperation` is called out because the
+    /// `--test-target-panics` policy layer refuses it by name as well.
+    #[test]
+    fn hardened_non_panic_categories_claim_no_guard_even_over_an_assert() {
+        for category in [
+            HardenedVcCategory::UnsafeOperation,
+            HardenedVcCategory::FfiBoundary,
+            HardenedVcCategory::RawPathApi,
+            HardenedVcCategory::PathIdentity,
+            HardenedVcCategory::ByteLoss,
+            HardenedVcCategory::Utf8Reject,
+            HardenedVcCategory::ErrorDiscard,
+            HardenedVcCategory::TrustDomain,
+            HardenedVcCategory::TrustDomainOrder,
+            HardenedVcCategory::PermissionChange,
+            HardenedVcCategory::PermissionCreate,
+            HardenedVcCategory::PermissionWindow,
+            HardenedVcCategory::CompatObservable,
+            HardenedVcCategory::ProcessSemantics,
+        ] {
+            let boundary = hardened_call_boundary(category, "mir_assert::Overflow(Add)");
+            for env in ENVS {
+                assert!(
+                    !boundary.site_retains_language_check_in(env),
+                    "{category:?} must not borrow the panic-boundary answer ({env:?})"
+                );
+                assert!(!boundary.has_runtime_fallback_in(env));
+            }
+        }
+    }
+
+    /// THE LOCK. `has_runtime_fallback_in` answers `false` for EVERY
+    /// `HardenedBoundary`, over the full cross product of every
+    /// [`HardenedVcCategory`], every `AssertMessage` marker, every call-shaped
+    /// callee and every [`RuntimeCheckEnv`].
+    ///
+    /// WHY THIS TEST EXISTS, from a real regression. Commit e4ae63e373 taught
+    /// this predicate to answer the `mir_assert::*` panic subfamily `true`, on
+    /// the measured and CORRECT ground that the hardening profile leaves rustc's
+    /// `Assert` in the program. But this predicate is not asking whether a check
+    /// exists — it is the sole gate on
+    /// [`crate::classify_runtime_disposition_in`]'s `RuntimeChecked` relabel, so
+    /// `true` here asserts that the OBLIGATION is dynamically enforced. A
+    /// hardened boundary's obligation is that the panic is UNREACHABLE, which
+    /// that surviving `Assert` does not enforce — it is the panic. A reviewer
+    /// MEASURED the consequence through `trust_report::build_json_report` with no
+    /// flag involved: a `HardenedBoundary { PanicBoundary,
+    /// "mir_assert::BoundsCheck" }` carrying `VerificationResult::Timeout` came
+    /// back as `ObligationOutcome::Unknown` instead of
+    /// `ObligationOutcome::Timeout` (the `RuntimeChecked` relabel fired, then
+    /// `sanitize_deserialized` scrubbed it to `Unknown` with a monitor-authority
+    /// reason), losing `timeout_ms` and moving the crate's `total_timeout` /
+    /// `total_unknown` counts.
+    ///
+    /// The fact is still available — under its own name,
+    /// [`VcKind::site_retains_language_check_in`], pinned by the tests above.
+    #[test]
+    fn no_hardened_boundary_ever_claims_a_runtime_fallback() {
+        let markers: Vec<String> = [
+            AssertMessage::BoundsCheck,
+            AssertMessage::Overflow(BinOp::Add),
+            AssertMessage::Overflow(BinOp::Sub),
+            AssertMessage::Overflow(BinOp::Mul),
+            AssertMessage::Overflow(BinOp::Div),
+            AssertMessage::Overflow(BinOp::Rem),
+            AssertMessage::Overflow(BinOp::Shl),
+            AssertMessage::Overflow(BinOp::Shr),
+            AssertMessage::OverflowNeg,
+            AssertMessage::DivisionByZero,
+            AssertMessage::RemainderByZero,
+            AssertMessage::ResumedAfterReturn,
+            AssertMessage::ResumedAfterPanic,
+            AssertMessage::ResumedAfterDrop,
+            AssertMessage::MisalignedPointerDereference,
+            AssertMessage::NullPointerDereference,
+            AssertMessage::InvalidEnumConstruction,
+            AssertMessage::Custom("anything".to_string()),
+        ]
+        .iter()
+        .map(|msg| format!("mir_assert::{msg:?}"))
+        .chain(
+            [
+                "std::option::Option::<T>::unwrap",
+                "std::result::Result::<T, E>::expect",
+                "std::fs::rename",
+                "chroot",
+                "wrapper::mir_assert::Overflow(Add)",
+            ]
+            .iter()
+            .map(|c| (*c).to_string()),
+        )
+        .collect();
+
+        let categories = [
+            HardenedVcCategory::RawPathApi,
+            HardenedVcCategory::PathIdentity,
+            HardenedVcCategory::PermissionChange,
+            HardenedVcCategory::PermissionCreate,
+            HardenedVcCategory::PermissionWindow,
+            HardenedVcCategory::Utf8Reject,
+            HardenedVcCategory::ByteLoss,
+            HardenedVcCategory::ErrorDiscard,
+            HardenedVcCategory::PanicBoundary,
+            HardenedVcCategory::CompatObservable,
+            HardenedVcCategory::ProcessSemantics,
+            HardenedVcCategory::TrustDomain,
+            HardenedVcCategory::TrustDomainOrder,
+            HardenedVcCategory::UnsafeOperation,
+            HardenedVcCategory::FfiBoundary,
+            HardenedVcCategory::Unknown(Symbol::from("something_new")),
+        ];
+
+        for category in categories {
+            for callee in &markers {
+                let boundary = hardened_call_boundary(category, callee);
+                for env in ENVS {
+                    assert!(
+                        !boundary.has_runtime_fallback_in(env),
+                        "a hardened boundary discharges nothing: {category:?} over `{callee}` \
+                         in {env:?}"
+                    );
+                }
+                // The fail-closed adapter must agree with the full-env spelling.
+                assert!(!boundary.has_runtime_fallback(true));
+                assert!(!boundary.has_runtime_fallback(false));
+            }
+        }
+    }
+
+    /// THE SUPERSET PROPERTY, and the exact place the two queries differ.
+    ///
+    /// `has_runtime_fallback_in(env)` implies `site_retains_language_check_in(env)`
+    /// for every kind and every environment — a discharge claim always entails
+    /// that the check is there. The converse fails on EXACTLY the
+    /// `HardenedBoundary { PanicBoundary, "mir_assert::<modeled>" }` subfamily,
+    /// and this test names that set so a future widening of either side has to
+    /// come here and say so.
+    #[test]
+    fn site_check_is_a_strict_superset_of_runtime_fallback() {
+        let mut kinds: Vec<VcKind> = vec![
+            VcKind::IndexOutOfBounds,
+            VcKind::SliceBoundsCheck,
+            VcKind::DivisionByZero,
+            VcKind::RemainderByZero,
+            VcKind::ArithmeticOverflow { op: BinOp::Add, operand_tys: (I32, I32) },
+            VcKind::ShiftOverflow { op: BinOp::Shl, operand_ty: I32, shift_ty: I32 },
+            VcKind::NegationOverflow { ty: I32 },
+            VcKind::Unreachable,
+            VcKind::Postcondition,
+            VcKind::Precondition { callee: "f".into() },
+            VcKind::UnsafeOperation { desc: "raw deref".into() },
+            VcKind::DoubleFree,
+            VcKind::UseAfterFree,
+            VcKind::FloatDivisionByZero,
+            VcKind::Deadlock,
+            VcKind::FunctionalCorrectness { property: "p".into(), context: "c".into() },
+            VcKind::Assertion { message: "assert!(x)".into() },
+            unchecked_add_kind(),
+            unchecked_index_kind(),
+            tinv_kind("crate::S", TypeInvariantPoint::Return, 3, 1),
+        ];
+        for msg in [
+            AssertMessage::BoundsCheck,
+            AssertMessage::DivisionByZero,
+            AssertMessage::RemainderByZero,
+            AssertMessage::Overflow(BinOp::Add),
+            AssertMessage::OverflowNeg,
+            AssertMessage::NullPointerDereference,
+            AssertMessage::ResumedAfterPanic,
+            AssertMessage::Custom("x".to_string()),
+        ] {
+            kinds.push(hardened_assert_boundary(&msg));
+        }
+        kinds.push(hardened_call_boundary(
+            HardenedVcCategory::PanicBoundary,
+            "std::option::Option::<T>::unwrap",
+        ));
+        kinds.push(hardened_call_boundary(
+            HardenedVcCategory::UnsafeOperation,
+            "mir_assert::Overflow(Add)",
+        ));
+
+        let mut differ: Vec<String> = Vec::new();
+        for kind in &kinds {
+            for env in ENVS {
+                let discharges = kind.has_runtime_fallback_in(env);
+                let site = kind.site_retains_language_check_in(env);
+                assert!(
+                    !discharges || site,
+                    "a discharge claim entails the check is there: {kind:?} in {env:?}"
+                );
+                if discharges != site {
+                    differ.push(format!("{kind:?}"));
+                }
+            }
+        }
+        differ.sort();
+        differ.dedup();
+        // Every entry — and ONLY these — is a hardened panic boundary over a
+        // modeled `mir_assert::` marker.
+        assert!(!differ.is_empty(), "the two queries must actually differ somewhere");
+        for row in &differ {
+            assert!(
+                row.contains("HardenedBoundary")
+                    && row.contains("PanicBoundary")
+                    && row.contains("mir_assert::"),
+                "only the hardened mir_assert panic subfamily may differ; got {row}"
+            );
+        }
+    }
 
     #[test]
     fn saved_return_address_overwrite_is_l0_without_runtime_fallback() {
@@ -1594,6 +2538,50 @@ mod tests {
         );
         assert!(!ordinary_ffi.is_binary_copy_sink_length_violation());
         assert_eq!(ordinary_ffi.binary_copy_sink_length_family_tag(), None);
+    }
+
+    /// Trust (2026-09-16): every lane-tagged synthetic assertion that encodes
+    /// UB — the whole `[unsafe…]` family `hardened_category()` classifies, plus
+    /// `[provenance]` — has NO runtime fallback at any setting; only a real
+    /// panic-class assertion (a user `assert!`, the whole-function
+    /// panic-freedom row) keeps one. Refuted at targo's publication boundary:
+    /// `[unsafe:deref] null check for *p` answered `true` and would have been
+    /// published runtime-checked under policy B.
+    #[test]
+    fn unsafe_tagged_synthetic_assertions_keep_no_runtime_fallback() {
+        let no_fallback = [
+            "[unsafe:deref] null check for *p",
+            "[unsafe] null pointer check for: p",
+            "[unsafe:ffi] null pointer argument check for getenv",
+            "[unsafe:sep] heap precondition for unsafe block in f",
+            "[unsafe:sep:double-free] x in f",
+            "[unsafe:asm] inline assembly is not modeled",
+            "[unsafe:unmodeled-call] callee not modeled",
+            "[unsafe:transmute] layout check",
+            "[provenance] use-after-free: x",
+        ];
+        for message in no_fallback {
+            let kind = VcKind::Assertion { message: message.to_string() };
+            for env in [
+                RuntimeCheckEnv { overflow_checks: false, ub_checks: false },
+                RuntimeCheckEnv { overflow_checks: true, ub_checks: true },
+            ] {
+                assert!(!kind.has_runtime_fallback_in(env), "{message} at {env:?}");
+            }
+        }
+        // Controls: a real panic-class assertion keeps its fallback at every
+        // setting, and a user message that merely CONTAINS a tag is untouched.
+        for message in [
+            "panic freedom: no assertion, `unreachable!`, or panic is reachable",
+            "x > 0",
+            "see [unsafe] docs",
+        ] {
+            let kind = VcKind::Assertion { message: message.to_string() };
+            assert!(kind.has_runtime_fallback_in(RuntimeCheckEnv {
+                overflow_checks: false,
+                ub_checks: false
+            }));
+        }
     }
 
     #[test]
@@ -1754,6 +2742,91 @@ mod tests {
             copy_sink.binary_copy_sink_length_family_tag(),
             Some(VcKind::BINARY_COPY_SINK_LENGTH_FAMILY)
         );
+    }
+
+    /// G3-MANDATE-L1-ONLY-1 (2026-10-27): only an L1 hardened PROFILE RULE with a
+    /// `Bool(true)` violation is a design mandate. Every L0 unsafe/FFI shape the
+    /// vcgen mints as a constant-`true` modelling-gap fail-close is not, in every
+    /// spelling `hardened_category` maps to those two categories (the native
+    /// kinds, the `[unsafe…]`/`[unsafe:ffi]` assertions, a reconstructed
+    /// `HardenedBoundary`, a legacy `hardened::` row).
+    #[test]
+    fn only_l1_hardened_rules_are_design_mandates_never_unsafe_or_ffi_gaps() {
+        use crate::Formula;
+        let truth = Formula::Bool(true);
+        let boundary = |category| VcKind::HardenedBoundary {
+            category,
+            callee: "callee".to_string(),
+            detail: "detail".to_string(),
+        };
+
+        // Positive: every L1 category, and the unrecognised-tag one, with `true`.
+        for category in [
+            HardenedVcCategory::RawPathApi,
+            HardenedVcCategory::PathIdentity,
+            HardenedVcCategory::PermissionChange,
+            HardenedVcCategory::PermissionCreate,
+            HardenedVcCategory::PermissionWindow,
+            HardenedVcCategory::Utf8Reject,
+            HardenedVcCategory::ByteLoss,
+            HardenedVcCategory::ErrorDiscard,
+            HardenedVcCategory::PanicBoundary,
+            HardenedVcCategory::CompatObservable,
+            HardenedVcCategory::ProcessSemantics,
+            HardenedVcCategory::TrustDomain,
+            HardenedVcCategory::TrustDomainOrder,
+            HardenedVcCategory::unknown_tag("opaque-terminator"),
+        ] {
+            let kind = boundary(category);
+            assert_eq!(kind.proof_level(), ProofLevel::L1Functional, "{category:?}");
+            assert!(kind.is_hardened_design_mandate(&truth), "{category:?} + true is a mandate");
+            assert!(
+                !kind.is_hardened_design_mandate(&Formula::Bool(false)),
+                "{category:?} + false is not"
+            );
+            assert!(
+                !kind.is_hardened_design_mandate(&Formula::Var("v".into(), crate::Sort::Bool)),
+                "{category:?} with a real formula is a discharge target"
+            );
+        }
+        let legacy = VcKind::FunctionalCorrectness {
+            property: "hardened::error_discard".to_string(),
+            context: "Result::ok".to_string(),
+        };
+        assert!(legacy.is_hardened_design_mandate(&truth));
+
+        // Negative: the L0 unsafe/FFI gaps, in every spelling.
+        for kind in [
+            boundary(HardenedVcCategory::UnsafeOperation),
+            boundary(HardenedVcCategory::FfiBoundary),
+            VcKind::UnsafeOperation { desc: "raw pointer deref".to_string() },
+            VcKind::Assertion { message: "[unsafe] missing SAFETY comment".to_string() },
+            VcKind::Assertion {
+                message: "[unsafe:unmodeled-call] call to `ext` is not covered".to_string(),
+            },
+            VcKind::Assertion { message: "[unsafe:ffi] precondition for getenv".to_string() },
+            VcKind::FfiBoundaryViolation {
+                callee: "getpgrp".to_string(),
+                desc: "no summary: behavior unmodeled, cannot prove safe".to_string(),
+            },
+            VcKind::FfiBoundaryViolation {
+                callee: "free".to_string(),
+                desc: "freed pointer must be valid allocation".to_string(),
+            },
+            VcKind::FunctionalCorrectness {
+                property: "hardened::ffi_boundary".to_string(),
+                context: "legacy".to_string(),
+            },
+        ] {
+            assert!(kind.hardened_category().is_some(), "{kind:?} is hardened");
+            assert!(
+                !kind.is_hardened_design_mandate(&truth),
+                "{kind:?} + true is a modelling gap, never a mandate"
+            );
+        }
+        // And no non-hardened kind is ever one.
+        assert!(!VcKind::DivisionByZero.is_hardened_design_mandate(&truth));
+        assert!(!VcKind::IndexOutOfBounds.is_hardened_design_mandate(&truth));
     }
 
     #[test]
@@ -1986,10 +3059,7 @@ mod tests {
     //    separation-engine unsafe assertions, and the authored invariant ──
 
     fn unchecked_add_kind() -> VcKind {
-        VcKind::UncheckedArithmeticOverflow {
-            op: BinOp::Add,
-            operand_tys: (Ty::u32(), Ty::u32()),
-        }
+        VcKind::UncheckedArithmeticOverflow { op: BinOp::Add, operand_tys: (Ty::u32(), Ty::u32()) }
     }
 
     fn unchecked_index_kind() -> VcKind {
@@ -2089,10 +3159,7 @@ mod tests {
     /// unchecked family is the only thing that reads the field.
     #[test]
     fn overflow_checks_only_adapter_resolves_ub_checks_to_off() {
-        assert_eq!(
-            RuntimeCheckEnv::overflow_checks_only(true),
-            RuntimeCheckEnv::new(true, false)
-        );
+        assert_eq!(RuntimeCheckEnv::overflow_checks_only(true), RuntimeCheckEnv::new(true, false));
         for kind in [unchecked_add_kind(), unchecked_index_kind()] {
             assert!(!kind.has_runtime_fallback(true), "{kind:?}");
             assert!(!kind.has_runtime_fallback(false), "{kind:?}");
@@ -2261,7 +3328,7 @@ mod tests {
     fn non_unsupported_mir_runtime_fallback_arms_are_stable() {
         // The effective-kind derivation touches ONLY `UnsupportedMir`; every
         // other family keeps its existing answer.
-        let cases: [(VcKind, bool, bool); 11] = [
+        let cases: [(VcKind, bool, bool); 12] = [
             (
                 VcKind::ArithmeticOverflow { op: BinOp::Add, operand_tys: (Ty::i32(), Ty::i32()) },
                 true,
@@ -2284,11 +3351,153 @@ mod tests {
             (unchecked_index_kind(), false, false),
             // A span-only attribute has no guard under any knob.
             (VcKind::ContractInvariant { expression: "x > 0".into() }, false, false),
+            // No rustc-inserted check enforces a struct invariant.
+            (tinv_kind("crate::S", TypeInvariantPoint::Call, 2, 0), false, false),
         ];
 
         for (vc_kind, with_oc, without_oc) in cases {
             assert_eq!(vc_kind.has_runtime_fallback(true), with_oc, "{vc_kind:?}");
             assert_eq!(vc_kind.has_runtime_fallback(false), without_oc, "{vc_kind:?}");
+        }
+    }
+
+    // ---- TINV step 2 (2026-10-05): `VcKind::TypeInvariant` -------------------
+
+    const TINV_POINTS: [TypeInvariantPoint; 6] = [
+        TypeInvariantPoint::Establish,
+        TypeInvariantPoint::Call,
+        TypeInvariantPoint::Return,
+        TypeInvariantPoint::Unwind,
+        TypeInvariantPoint::Move,
+        TypeInvariantPoint::Drop,
+    ];
+
+    fn tinv_kind(ty: &str, point: TypeInvariantPoint, block: usize, stmt: usize) -> VcKind {
+        VcKind::TypeInvariant {
+            ty: ty.into(),
+            point,
+            site: TypeInvariantSite { block, statement_index: stmt },
+            conjunct: 0,
+            ordinal: 0,
+            edge: None,
+        }
+    }
+
+    fn with_identity(k: VcKind, c: u32, o: u32, e: Option<usize>) -> VcKind {
+        match k {
+            VcKind::TypeInvariant { ty, point, site, .. } => {
+                VcKind::TypeInvariant { ty, point, site, conjunct: c, ordinal: o, edge: e }
+            }
+            other => other,
+        }
+    }
+
+    #[test]
+    fn type_invariant_is_l1_unrefutable_and_never_runtime_checked() {
+        for point in TINV_POINTS {
+            let k = tinv_kind("mycrate::Screen", point, 4, 2);
+            assert_eq!(k.proof_level(), ProofLevel::L1Functional);
+            for env in ENVS {
+                assert!(!k.has_runtime_fallback_in(env), "{point}: {env:?}");
+                assert!(!k.site_retains_language_check_in(env), "{point}: {env:?}");
+            }
+            assert!(!k.has_runtime_fallback(true) && !k.has_runtime_fallback(false));
+            assert!(k.hardened_category().is_none());
+            let tag = k.transport_tag();
+            assert_eq!(tag, format!("type_invariant:{}", point.as_tag()));
+            let d = k.description();
+            assert!(d.contains("mycrate::Screen") && d.contains(point.as_tag()), "{d}");
+            assert!(d.contains("bb4[2]"), "{d}");
+            for family in ["ArithmeticSafety", "IndexSafety", "Assertion", "Postcondition"] {
+                let kind = format!("{}{family}", VcKind::FULL_VERIFICATION_KIND_PREFIX);
+                assert_eq!(VcKind::recovered_full_lane_vc_tag(&kind, &d), None, "{family}");
+            }
+        }
+        // The description is lossless over (ty, point, site): dedup compares it.
+        let base = tinv_kind("a::S", TypeInvariantPoint::Call, 1, 0);
+        for other in [
+            tinv_kind("b::S", TypeInvariantPoint::Call, 1, 0),
+            tinv_kind("a::S", TypeInvariantPoint::Return, 1, 0),
+            tinv_kind("a::S", TypeInvariantPoint::Call, 2, 0),
+            tinv_kind("a::S", TypeInvariantPoint::Call, 1, 1),
+            with_identity(base.clone(), 1, 0, None),
+            with_identity(base.clone(), 0, 1, None),
+            with_identity(base.clone(), 0, 0, Some(0)),
+            with_identity(base.clone(), 0, 0, Some(1)),
+        ] {
+            assert_ne!(base.description(), other.description(), "{other:?}");
+        }
+        // Two edge parts of one point describe apart, and the transport tag (the
+        // per-point counting bucket) is unchanged by the identity fields.
+        let p0 = with_identity(base.clone(), 0, 0, Some(0));
+        let p2 = with_identity(base.clone(), 0, 0, Some(2));
+        assert_ne!(p0.description(), p2.description());
+        assert!(p2.description().contains("via edge bb2"), "{}", p2.description());
+        assert_eq!(p0.transport_tag(), base.transport_tag());
+        let json = serde_json::to_string(&p2).expect("serialize");
+        let back: VcKind = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, p2);
+    }
+
+    #[test]
+    fn type_invariant_point_bytes_and_tags_are_frozen() {
+        let tags = ["establish", "call", "return", "unwind", "move", "drop"];
+        for (i, point) in TINV_POINTS.into_iter().enumerate() {
+            assert_eq!(usize::from(point.canonical_byte()), i, "{point:?}");
+            assert_eq!(point.as_tag(), tags[i]);
+            assert_eq!(point.to_string(), tags[i]);
+            let json = serde_json::to_string(&point).expect("serialize");
+            let back: TypeInvariantPoint = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, point);
+        }
+        let site = TypeInvariantSite { block: 7, statement_index: 3 };
+        assert_eq!(site.to_string(), "bb7[3]");
+    }
+
+    /// TINV step 7.7 (TINV-8, 2026-10-05): the kind gate ADMITS every point, and the
+    /// VC-level gate decides the row: a record-less row and a bare (hypothesis-free)
+    /// recorded row of every point are refused; a recorded, replaying, bound row of every
+    /// point is admitted. MUTATION: move `TypeInvariant` back under REFUSED in
+    /// `kind_authority_refusal` and the first and last assertions fail.
+    #[test]
+    fn type_invariant_kind_is_admitted_and_the_row_gate_decides() {
+        use crate::{Formula, ObligationRecord, Sort, SourceSpan, VerificationCondition};
+        let var = |n: &str| Formula::Var(n.to_string(), Sort::Int);
+        let neg_core = Formula::Not(Box::new(Formula::Le(Box::new(var("i1")), Box::new(var("n")))));
+        // The 0(b)(c) linear preservation row: `i1 = i0 + 1 ∧ i0 < n ∧ ¬(i1 <= n)`.
+        let situated = Formula::And(vec![
+            Formula::Eq(
+                Box::new(var("i1")),
+                Box::new(Formula::Add(Box::new(var("i0")), Box::new(Formula::Int(1)))),
+            ),
+            Formula::Lt(Box::new(var("i0")), Box::new(var("n"))),
+            neg_core.clone(),
+        ]);
+        let row = |kind: VcKind, body: &Formula, recorded: bool| VerificationCondition {
+            kind,
+            function: "mycrate::S::bump".into(),
+            location: SourceSpan::default(),
+            formula: body.clone(),
+            contract_metadata: None,
+            obligation: recorded.then(|| ObligationRecord {
+                body: body.clone(),
+                wrappers: Vec::new(),
+                subject: None,
+                width: None,
+            }),
+        };
+        for point in TINV_POINTS {
+            let kind = tinv_kind("mycrate::S", point, 0, 0);
+            assert_eq!(kind.kind_authority_refusal(), None, "{point}: the kind is admitted");
+            let why = row(kind.clone(), &situated, false)
+                .kernel_authority_refusal()
+                .expect("a record-less TINV row is refused");
+            assert!(why.contains("type-invariant"), "{point}: {why}");
+            assert!(
+                row(kind.clone(), &neg_core, true).kernel_authority_refusal().is_some(),
+                "{point}: a bare negated core binds nothing"
+            );
+            assert_eq!(row(kind, &situated, true).kernel_authority_refusal(), None, "{point}");
         }
     }
 }

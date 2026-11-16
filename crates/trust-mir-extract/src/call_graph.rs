@@ -105,24 +105,44 @@ impl CallGraph {
 
     /// Register a function node (even if it has no calls).
     pub(crate) fn add_function(&mut self, name: &str) {
-        self.functions.insert(name.to_string());
+        if !self.functions.contains(name) {
+            self.functions.insert(name.to_string());
+        }
     }
 
     /// Add a call site to the graph. Both caller and callee are auto-registered.
     pub(crate) fn add_call(&mut self, site: CallSite) {
-        self.functions.insert(site.caller.clone());
-        self.functions.insert(site.callee.clone());
+        if !self.functions.contains(site.caller.as_str()) {
+            self.functions.insert(site.caller.clone());
+        }
+        if !self.functions.contains(site.callee.as_str()) {
+            self.functions.insert(site.callee.clone());
+        }
 
         // Update or insert forward edge.
-        let edges = self.forward.entry(site.caller.clone()).or_default();
-        if let Some(existing) = edges.iter_mut().find(|e| e.target == site.callee) {
-            existing.count += 1;
+        if let Some(edges) = self.forward.get_mut(site.caller.as_str()) {
+            if let Some(existing) = edges.iter_mut().find(|e| e.target == site.callee) {
+                existing.count += 1;
+            } else {
+                edges.push(EdgeInfo { target: site.callee.clone(), kind: site.kind, count: 1 });
+            }
         } else {
-            edges.push(EdgeInfo { target: site.callee.clone(), kind: site.kind, count: 1 });
+            self.forward.insert(
+                site.caller.clone(),
+                vec![EdgeInfo { target: site.callee.clone(), kind: site.kind, count: 1 }],
+            );
         }
 
         // Update reverse edge.
-        self.reverse.entry(site.callee).or_default().insert(site.caller);
+        if let Some(callers) = self.reverse.get_mut(site.callee.as_str()) {
+            if !callers.contains(site.caller.as_str()) {
+                callers.insert(site.caller);
+            }
+        } else {
+            let mut callers = FxHashSet::default();
+            callers.insert(site.caller);
+            self.reverse.insert(site.callee, callers);
+        }
     }
 
     /// Return all functions that call `function`.
@@ -147,29 +167,31 @@ impl CallGraph {
     /// unless it is in a cycle).
     #[must_use]
     pub(crate) fn reachable_from(&self, function: &str) -> Vec<String> {
-        let mut visited = FxHashSet::default();
-        let mut queue = VecDeque::new();
+        let mut visited: FxHashSet<&str> = FxHashSet::default();
+        let mut queue: VecDeque<&str> = VecDeque::new();
 
         // Seed with direct callees.
         if let Some(edges) = self.forward.get(function) {
             for edge in edges {
-                if visited.insert(edge.target.clone()) {
-                    queue.push_back(edge.target.clone());
+                let target = edge.target.as_str();
+                if visited.insert(target) {
+                    queue.push_back(target);
                 }
             }
         }
 
         while let Some(current) = queue.pop_front() {
-            if let Some(edges) = self.forward.get(&current) {
+            if let Some(edges) = self.forward.get(current) {
                 for edge in edges {
-                    if visited.insert(edge.target.clone()) {
-                        queue.push_back(edge.target.clone());
+                    let target = edge.target.as_str();
+                    if visited.insert(target) {
+                        queue.push_back(target);
                     }
                 }
             }
         }
 
-        let mut result: Vec<String> = visited.into_iter().collect();
+        let mut result: Vec<String> = visited.into_iter().map(str::to_string).collect();
         result.sort();
         result
     }
@@ -198,18 +220,18 @@ impl CallGraph {
     #[must_use]
     pub(crate) fn strongly_connected_components(&self) -> Vec<Vec<String>> {
         let mut index_counter: usize = 0;
-        let mut stack: Vec<String> = Vec::new();
-        let mut on_stack: FxHashSet<String> = FxHashSet::default();
-        let mut indices: FxHashMap<String, usize> = FxHashMap::default();
-        let mut lowlinks: FxHashMap<String, usize> = FxHashMap::default();
+        let mut stack: Vec<&str> = Vec::new();
+        let mut on_stack: FxHashSet<&str> = FxHashSet::default();
+        let mut indices: FxHashMap<&str, usize> = FxHashMap::default();
+        let mut lowlinks: FxHashMap<&str, usize> = FxHashMap::default();
         let mut result: Vec<Vec<String>> = Vec::new();
 
         // Collect all nodes in sorted order for determinism.
-        let mut nodes: Vec<&String> = self.functions.iter().collect();
-        nodes.sort();
+        let mut nodes: Vec<&str> = self.functions.iter().map(String::as_str).collect();
+        nodes.sort_unstable();
 
-        for node in &nodes {
-            if !indices.contains_key(*node) {
+        for &node in &nodes {
+            if !indices.contains_key(node) {
                 self.tarjan_strongconnect(
                     node,
                     &mut index_counter,
@@ -230,55 +252,54 @@ impl CallGraph {
     }
 
     /// Tarjan's DFS helper (iterative to avoid stack overflow on deep graphs).
-    fn tarjan_strongconnect(
-        &self,
-        start: &str,
+    fn tarjan_strongconnect<'a>(
+        &'a self,
+        start: &'a str,
         index_counter: &mut usize,
-        stack: &mut Vec<String>,
-        on_stack: &mut FxHashSet<String>,
-        indices: &mut FxHashMap<String, usize>,
-        lowlinks: &mut FxHashMap<String, usize>,
+        stack: &mut Vec<&'a str>,
+        on_stack: &mut FxHashSet<&'a str>,
+        indices: &mut FxHashMap<&'a str, usize>,
+        lowlinks: &mut FxHashMap<&'a str, usize>,
         result: &mut Vec<Vec<String>>,
     ) {
         // Use an explicit work stack to avoid recursion limits.
-        struct Frame {
-            node: String,
+        struct Frame<'a> {
+            node: &'a str,
             edge_idx: usize,
         }
 
-        let mut work: Vec<Frame> = Vec::new();
+        let mut work: Vec<Frame<'a>> = Vec::new();
 
         // Initialize start node.
-        indices.insert(start.to_string(), *index_counter);
-        lowlinks.insert(start.to_string(), *index_counter);
+        indices.insert(start, *index_counter);
+        lowlinks.insert(start, *index_counter);
         *index_counter += 1;
-        stack.push(start.to_string());
-        on_stack.insert(start.to_string());
-        work.push(Frame { node: start.to_string(), edge_idx: 0 });
+        stack.push(start);
+        on_stack.insert(start);
+        work.push(Frame { node: start, edge_idx: 0 });
 
         while let Some(frame) = work.last_mut() {
-            let successors: Vec<String> = self
+            let current_node = frame.node;
+            let next_edge = self
                 .forward
-                .get(&frame.node)
-                .map(|edges| edges.iter().map(|e| e.target.clone()).collect())
-                .unwrap_or_default();
+                .get(current_node)
+                .and_then(|edges| edges.get(frame.edge_idx));
 
-            if frame.edge_idx < successors.len() {
-                let successor = &successors[frame.edge_idx];
+            if let Some(edge) = next_edge {
+                let successor = edge.target.as_str();
                 frame.edge_idx += 1;
 
                 if !indices.contains_key(successor) {
                     // Tree edge: recurse.
-                    indices.insert(successor.clone(), *index_counter);
-                    lowlinks.insert(successor.clone(), *index_counter);
+                    indices.insert(successor, *index_counter);
+                    lowlinks.insert(successor, *index_counter);
                     *index_counter += 1;
-                    stack.push(successor.clone());
-                    on_stack.insert(successor.clone());
-                    work.push(Frame { node: successor.clone(), edge_idx: 0 });
+                    stack.push(successor);
+                    on_stack.insert(successor);
+                    work.push(Frame { node: successor, edge_idx: 0 });
                 } else if on_stack.contains(successor) {
                     // Back edge: update lowlink.
-                    let current_node = frame.node.clone();
-                    let current_low = lowlinks[&current_node];
+                    let current_low = lowlinks[current_node];
                     let successor_idx = indices[successor];
                     if successor_idx < current_low {
                         lowlinks.insert(current_node, successor_idx);
@@ -286,17 +307,16 @@ impl CallGraph {
                 }
             } else {
                 // All successors processed. Check if this is an SCC root.
-                let current_node = frame.node.clone();
-                let current_low = lowlinks[&current_node];
-                let current_idx = indices[&current_node];
+                let current_low = lowlinks[current_node];
+                let current_idx = indices[current_node];
 
                 if current_low == current_idx {
                     // Pop SCC from stack.
                     let mut scc = Vec::new();
                     while let Some(top) = stack.pop() {
-                        on_stack.remove(&top);
+                        on_stack.remove(top);
                         let is_root = top == current_node;
-                        scc.push(top);
+                        scc.push(top.to_string());
                         if is_root {
                             break;
                         }
@@ -308,8 +328,8 @@ impl CallGraph {
 
                 // Propagate lowlink to parent.
                 if let Some(parent) = work.last() {
-                    let parent_node = parent.node.clone();
-                    let parent_low = lowlinks[&parent_node];
+                    let parent_node = parent.node;
+                    let parent_low = lowlinks[parent_node];
                     if current_low < parent_low {
                         lowlinks.insert(parent_node, current_low);
                     }
@@ -333,29 +353,29 @@ impl CallGraph {
         }
 
         // Seed with zero in-degree nodes (sorted for determinism).
-        let mut queue: VecDeque<String> = {
-            let mut zeros: Vec<String> = in_degree
+        let mut queue: VecDeque<&str> = {
+            let mut zeros: Vec<&str> = in_degree
                 .iter()
                 .filter(|(_, deg)| **deg == 0)
-                .map(|(name, _)| name.to_string())
+                .map(|(name, _)| *name)
                 .collect();
-            zeros.sort();
+            zeros.sort_unstable();
             zeros.into_iter().collect()
         };
 
         let mut order = Vec::with_capacity(self.functions.len());
 
         while let Some(node) = queue.pop_front() {
-            order.push(node.clone());
-            if let Some(edges) = self.forward.get(&node) {
+            order.push(node.to_string());
+            if let Some(edges) = self.forward.get(node) {
                 // Process successors in sorted order for determinism.
                 let mut targets: Vec<&str> = edges.iter().map(|e| e.target.as_str()).collect();
-                targets.sort();
+                targets.sort_unstable();
                 for target in targets {
                     if let Some(deg) = in_degree.get_mut(target) {
                         *deg -= 1;
                         if *deg == 0 {
-                            queue.push_back(target.to_string());
+                            queue.push_back(target);
                         }
                     }
                 }
@@ -374,8 +394,25 @@ impl CallGraph {
     pub(crate) fn stats(&self) -> CallGraphStats {
         let total_edges = self.forward.values().map(|v| v.len()).sum();
 
-        // Count recursive functions.
-        let num_recursive = self.functions.iter().filter(|f| self.is_recursive(f)).count();
+        // Count recursive functions from a single SCC pass (O(V + E)) instead of
+        // re-running Tarjan's SCC per function in `self.functions` (O(V * (V + E))).
+        let num_recursive = self
+            .strongly_connected_components()
+            .into_iter()
+            .map(|scc| {
+                if scc.len() > 1 {
+                    scc.len()
+                } else if let Some(node) = scc.first() {
+                    usize::from(
+                        self.forward
+                            .get(node.as_str())
+                            .is_some_and(|edges| edges.iter().any(|e| e.target == *node)),
+                    )
+                } else {
+                    0
+                }
+            })
+            .sum();
 
         // Compute max depth via BFS from each root (node with in-degree 0).
         let roots: Vec<&str> = self
@@ -438,20 +475,21 @@ impl CallGraph {
 
     /// BFS depth from a start node (longest shortest path to any reachable node).
     fn bfs_depth(&self, start: &str) -> usize {
-        let mut visited = FxHashSet::default();
-        visited.insert(start.to_string());
-        let mut queue = VecDeque::new();
-        queue.push_back((start.to_string(), 0usize));
+        let mut visited: FxHashSet<&str> = FxHashSet::default();
+        visited.insert(start);
+        let mut queue: VecDeque<(&str, usize)> = VecDeque::new();
+        queue.push_back((start, 0usize));
         let mut max_d = 0;
 
         while let Some((node, depth)) = queue.pop_front() {
             if depth > max_d {
                 max_d = depth;
             }
-            if let Some(edges) = self.forward.get(&node) {
+            if let Some(edges) = self.forward.get(node) {
                 for edge in edges {
-                    if visited.insert(edge.target.clone()) {
-                        queue.push_back((edge.target.clone(), depth + 1));
+                    let target = edge.target.as_str();
+                    if visited.insert(target) {
+                        queue.push_back((target, depth + 1));
                     }
                 }
             }

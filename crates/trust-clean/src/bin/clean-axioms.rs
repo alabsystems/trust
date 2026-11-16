@@ -10,10 +10,18 @@
 // Input format (JSON):
 //   {
 //     "term": <ProofTerm>,
-//     "context": [ { "name": "propext", "entry": { "Axiom": { "ty": {"Sort":0} } } }, ... ]
+//     "context": [ { "name": "P", "entry": { "Axiom": { "ty": {"Sort":0} } } }, ... ]
 //   }
 // where <ProofTerm> uses serde's external tagging, e.g. {"Const":"propext"},
 // {"App":[<t>,<t>]}, {"Sort":0}, {"Pi":{"binder_name":"_","domain":<t>,"codomain":<t>}}.
+//
+// The context may NOT declare a kernel-owned name (2026-09-28): a foundation
+// (`propext`, `Quot.sound`, `Classical.choice`, the `Quot` primitives) or a
+// trust marker (`sorry`, `sorryAx`, `trustedArith`, `trustedAy`). Such a
+// context is REFUSED — exit 2, no report — because no declaration in this term
+// language can be the kernel's canonical one (see
+// `trust_clean::reserved_declaration_refusal`). A term that names one of the
+// three foundations needs no declaration: it means the kernel's own axiom.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -21,24 +29,9 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use serde::Deserialize;
-use trust_clean::axioms::{FOUNDATIONAL_AXIOMS, axiom_closure};
-use trust_clean::{ContextEntry, KernelContext, ProofTerm};
-
-/// One named entry of the kernel context, as supplied on the command line.
-#[derive(Deserialize)]
-struct CtxEntry {
-    name: String,
-    entry: ContextEntry,
-}
-
-/// A proof obligation to audit: a proof term plus the context it is checked in.
-#[derive(Deserialize)]
-struct Obligation {
-    term: ProofTerm,
-    #[serde(default)]
-    context: Vec<CtxEntry>,
-}
+use trust_clean::axioms::{
+    FOUNDATIONAL_AXIOMS, SuppliedObligation, axiom_closure, build_supplied_context,
+};
 
 struct Args {
     path: Option<String>,
@@ -62,7 +55,10 @@ OPTIONS:
     --json               Emit the report as JSON instead of human-readable text.
     -h, --help           Print this help.
 
-The foundational three: propext, Quot.sound, Classical.choice.";
+The foundational three: propext, Quot.sound, Classical.choice. They are the
+kernel's own axioms: reference them without declaring them. A context that
+declares any kernel-owned name (a foundation, a Quot primitive, or a trust
+marker such as sorryAx) is REFUSED with exit status 2.";
 
 fn parse_args() -> Result<Args, String> {
     let mut path = None;
@@ -108,24 +104,12 @@ fn read_input(path: &Option<String>) -> Result<String, String> {
     }
 }
 
-fn build_context(entries: Vec<CtxEntry>) -> Result<KernelContext, String> {
-    let mut ctx = KernelContext::new();
-    for e in entries {
-        let res = match e.entry {
-            ContextEntry::Axiom { ty } => ctx.add_axiom(&e.name, ty),
-            ContextEntry::Definition { ty, value } => ctx.add_definition(&e.name, ty, value),
-        };
-        res.map_err(|err| format!("context entry '{}': {err}", e.name))?;
-    }
-    Ok(ctx)
-}
-
 fn run() -> Result<bool, String> {
     let args = parse_args()?;
     let input = read_input(&args.path)?;
-    let obligation: Obligation =
+    let obligation: SuppliedObligation =
         serde_json::from_str(&input).map_err(|e| format!("parsing obligation JSON: {e}"))?;
-    let ctx = build_context(obligation.context)?;
+    let ctx = build_supplied_context(obligation.context)?;
     let report = axiom_closure(&obligation.term, &ctx);
     let clean = report.is_modulo_foundational();
 

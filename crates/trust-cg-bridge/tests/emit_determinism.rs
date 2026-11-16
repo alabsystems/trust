@@ -62,6 +62,7 @@ fn wrap(name: &str, body: VerifiableBody) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -443,11 +444,15 @@ fn from_hex(s: &str) -> Vec<u8> {
 }
 
 /// Child entry: emit the suite and print marker lines, then "exit" by returning.
-/// Guarded so it only does work when re-exec'd by the parent.
+/// Guarded so it only does work when re-exec'd by the parent, and `#[ignore]`d
+/// so a plain run does not count that no-op as a pass: `run_child` selects it
+/// with `--ignored --exact`.
 #[test]
+#[ignore = "subprocess child: re-executed by \
+            emit_determinism_cross_process_object_bytes_are_bit_identical"]
 fn emit_determinism_child_emitter() {
     if std::env::var(CHILD_ENV).is_err() {
-        // Not a child invocation; this is a no-op when run directly by `cargo test`.
+        // Not a child invocation: a no-op, even under `--ignored`.
         return;
     }
     let objs = emit_suite();
@@ -462,7 +467,8 @@ fn emit_determinism_child_emitter() {
 fn run_child(salt: &str) -> BTreeMap<String, Vec<u8>> {
     let exe = std::env::current_exe().expect("current_exe");
     let output = Command::new(&exe)
-        .args(["--exact", CHILD_TEST_NAME, "--nocapture", "--test-threads=1"])
+        // The child is `#[ignore]`d: `--ignored` selects it, `--exact` only it.
+        .args(["--ignored", "--exact", CHILD_TEST_NAME, "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, "1")
         // Perturb the per-process hasher seed further; std already randomizes per
         // process, but this makes the divergence pressure explicit and reproducible.

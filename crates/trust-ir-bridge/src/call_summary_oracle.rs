@@ -211,8 +211,8 @@ const ADVERSARIAL: &[&str] = &[
 /// its own crate. A printed GAP is a hypothesis to audit, never a decision.
 const SHOULD_BE_TOTAL: &[&str] = &[
     "alloc::vec::Vec::<u32>::new",
-    // MERGE (b62 <- origin/main): BOTH sides independently derived that `Vec::push`
-    // is not total. Upstream's eae43893f9 ("Vec::push is not total — it panics on
+    // MERGE (b62 <- origin/main; squash d24c671211): BOTH sides independently derived that
+    // `Vec::push` is not total. Upstream's eae43893f9 ("Vec::push is not total — it panics on
     // capacity overflow") deleted the entry; our FRONT B / R13 moved it to PANICKING
     // with an executed witness. The resulting TOTAL list is identical either way; only
     // this tombstone differs, and it is kept because it names where the entry went.
@@ -485,8 +485,11 @@ fn oracle_ground_truth_does_not_contradict_the_fail_closed_pins() {
     // (2) THE MIRROR IS LIVE. Every pinned identity must still fail closed in the
     // real predicate — otherwise `LOWER_RS_FAIL_CLOSED_PINS` has gone stale against
     // `lower.rs` and (1) is measuring a fossil.
-    let mirror_broken: Vec<&str> =
-        LOWER_RS_FAIL_CLOSED_PINS.iter().copied().filter(|c| total_no_panic_call_summary(c)).collect();
+    let mirror_broken: Vec<&str> = LOWER_RS_FAIL_CLOSED_PINS
+        .iter()
+        .copied()
+        .filter(|c| total_no_panic_call_summary(c))
+        .collect();
     assert!(
         mirror_broken.is_empty(),
         "these are mirrored from `lower.rs`'s fail-closed pin but are now classified \
@@ -560,8 +563,12 @@ const ELEMENT_FREE: &[&str] = &[
     "alloc::string::String",
     "std::string::String",
     "core::cmp::Ordering",
+    "std::cmp::Ordering",
     "core::time::Duration",
     "std::time::Duration",
+    "core::io::error::ErrorKind",
+    "std::io::ErrorKind",
+    "std::io::error::ErrorKind",
     "core::num::NonZeroU32",
     "core::num::NonZeroI64",
 ];

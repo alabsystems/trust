@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 
 
@@ -59,12 +61,13 @@ def write_manifest(root: Path, url: str, digest: str) -> None:
     )
 
 
-def run_helper(root: Path, *args: str) -> tuple[int, dict[str, object]]:
+def run_helper(root: Path, *args: str, env=None) -> tuple[int, dict[str, object]]:
     completed = subprocess.run(
         [sys.executable, str(HELPER), "--repo-root", str(root), "--json", *args],
         check=False,
         text=True,
         capture_output=True,
+        env=env,
     )
     if completed.stdout:
         payload = json.loads(completed.stdout)
@@ -133,11 +136,61 @@ def test_fetched_payload_must_match_stage0_checksum() -> None:
         assert not target.exists()
 
 
+def test_internal_release_uses_owner_routed_transport_and_installs_only_verified_bytes() -> None:
+    for payload, expected, transport_exit in (
+        (b"seeded", sha256(b"seeded"), 0),
+        (b"wrong", sha256(b"seeded"), 0),
+        (b"partial", sha256(b"seeded"), 2),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_stage0(root, expected)
+            seed = root / "bootstrap" / "trust-stage0"
+            seed.mkdir(parents=True)
+            (seed / "seed-ledger.toml").write_text(
+                'scope = "internal"\n[release]\nrepo = "example/trust"\ntag = "seed-tag"\n'
+            )
+            tools = root / "tools"
+            tools.mkdir()
+            agh = tools / "agh"
+            agh.write_text(
+                f"#!{sys.executable}\n"
+                "import sys\nfrom pathlib import Path\n"
+                "a = sys.argv[1:]\n"
+                "assert a[:4] == ['release', 'download', 'example/trust', 'seed-tag']\n"
+                f"Path(a[a.index('--dir')+1], a[a.index('--asset')+1]).write_bytes({payload!r})\n"
+                f"raise SystemExit({transport_exit})\n"
+            )
+            agh.chmod(0o755)
+            environment = dict(os.environ, PATH=str(tools))
+            target = seed / PAYLOAD_REL
+            code, report = run_helper(root, "--fetch", env=environment)
+            if payload == b"seeded" and transport_exit == 0:
+                assert code == 0, report
+                assert target.read_bytes() == payload
+            else:
+                assert code == 1, report
+                assert not target.exists(), report
+                status = report["payloads"][0]["status"]
+                assert status == ("fetch-failed" if transport_exit else "download-checksum-mismatch"), report
+            assert not list(target.parent.glob(".seed-fetch-*"))
+
+
+def load_tests(loader, tests, pattern):
+    """`land_gate.py validation-tests` loads this module with unittest (the
+    landing gate's selector names it, LAND-SELECT-VALIDATION-REACH-1): each
+    module-level test_* function is one case, as a direct run runs them."""
+    tests.addTests(unittest.FunctionTestCase(value) for name, value in sorted(globals().items())
+                   if name.startswith("test_") and callable(value))
+    return tests
+
+
 def main() -> int:
     tests = [
         test_declared_file_source_is_fetchable_and_only_writes_with_fetch,
         test_missing_repo_local_manifest_url_stays_blocked,
         test_fetched_payload_must_match_stage0_checksum,
+        test_internal_release_uses_owner_routed_transport_and_installs_only_verified_bytes,
     ]
     for test in tests:
         test()

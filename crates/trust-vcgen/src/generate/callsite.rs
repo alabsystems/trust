@@ -9,8 +9,54 @@ pub fn generate_callsite_precondition_vcs(
     func: &VerifiableFunction,
     summaries: &crate::modular::SummaryDatabase,
 ) -> Vec<VerificationCondition> {
+    generate_callsite_precondition_vcs_for_each(func, &[summaries]).pop().unwrap_or_default()
+}
+
+/// [`generate_callsite_precondition_vcs`] for SEVERAL summary databases over ONE caller:
+/// element `i` of the result is exactly `generate_callsite_precondition_vcs(func,
+/// summaries[i])`.
+///
+/// Trust: 2026-10-17 (gate-rca deadline, B class). The caller's whole-body analyses —
+/// the arithmetic-safe view, the path-guard map, the two-pass path-definition fixpoint,
+/// the statement-version oracle, the global invariant facts and the stable own
+/// preconditions — read the caller and never a summary, yet the compiler's constructor
+/// reconciliation (`step_by_constructor::reconcile_bundle`) asked this producer once
+/// PER constructor member, each time with a one-summary database, and so rebuilt the
+/// whole root's path-definition fixpoint once per member. Measured on the candidate
+/// gate's `aterm_conformance::measure::scan::scan_frames`: 99.8 % of the samples of a
+/// 2.5-minute native bundle construction were under this producer, in
+/// `v2_path_def_fixpoint`, and the per-function clock (checked only around the whole
+/// construction) declined the bundle after it had spent the function's 120 s. This
+/// entry computes those analyses once and runs only the summary-dependent half (the
+/// semantic guard map, the float context and the per-call loop) per database.
+///
+/// The output is the same as the single-database producer's by construction: the
+/// shared analyses are pure functions of `func` (each is already memoized per function
+/// inside a generation scope, `fn_memo` / `havoc_memo` / `place_memo`), and the
+/// per-database half is the unchanged loop.
+///
+/// The work runs inside a VC-generation scope with its memos live and its work meter
+/// OFF (`gen_work::enter_unmetered`) when no scope is active, i.e. on exactly the
+/// top-level calls that today run with memos and meter both inert (the compiler's
+/// constructor reconciliation, its Assert gate's regeneration and the caller
+/// precondition gate). Unmetered keeps their output what it is today; the live memos
+/// stop `stored_ref_pointee_names` and the shared-cell borrow map being rebuilt at every
+/// call terminator of every fixpoint step (59.8 % of the same samples). A call nested in
+/// a generation scope (the main lane's `discharge`) keeps that scope, metered or not.
+pub fn generate_callsite_precondition_vcs_for_each(
+    func: &VerifiableFunction,
+    summaries: &[&crate::modular::SummaryDatabase],
+) -> Vec<Vec<VerificationCondition>> {
+    if summaries.is_empty() {
+        return Vec::new();
+    }
+    let _input_analysis = super::EntryScope::enter_analysis_if_unbound(func);
+    if let Some(vc) = crate::memory_image_vc(func) {
+        return summaries.iter().map(|_| vec![vc.clone()]).collect();
+    }
     if let Err(error) = crate::validate_function(func) {
-        return vec![malformed_trust_ir_vc(func, &error)];
+        let vc = malformed_trust_ir_vc(func, &error);
+        return summaries.iter().map(|_| vec![vc.clone()]).collect();
     }
 
     // verifier-perf (whole-function gate): an over-budget recursive-datatype function
@@ -20,276 +66,300 @@ pub fn generate_callsite_precondition_vcs(
     // fail-closed to Unknown, so withholding its (extra) callsite obligations cannot
     // manufacture a PROVE; it can only leave the function Unknown, which it already is.
     if func_exceeds_vcgen_budget(func) {
-        return Vec::new();
+        return summaries.iter().map(|_| Vec::new()).collect();
     }
+    // `TRUST_PRECOND_DEBUG=1`: the PRODUCTION-lane twin of the attributed
+    // producer's per-callsite diagnostic (this producer is the one the
+    // compiler's whole-function VC pipeline drives). Diagnostic only.
+    static PRECOND_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let precond_debug =
+        *PRECOND_DEBUG.get_or_init(|| crate::trust_vcgen_env_var_present("TRUST_PRECOND_DEBUG"));
+    if if precond_debug {
+        let tp = super::terminator_presence_for_body(&func.body);
+        !tp.has_call && !tp.has_tail_call
+    } else {
+        !summaries.iter().any(|s| s.owes_caller_preconditions(func))
+    } {
+        return summaries.iter().map(|_| Vec::new()).collect();
+    }
+    let _analysis_memo = crate::gen_work_memo_scope_if_unscoped();
     // The caller's own Requires clauses become guards in this lane.  Use the
     // same sanitized view as body VC generation so mathematical-Int arithmetic
     // can never be admitted as a callsite premise.
     let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
     let func = arithmetic_safe_func.as_ref();
-    let guard_paths_map = super::guard_map_for(func);
-    let semantic_guards = build_semantic_guard_map(func);
-    // Cross-block PATH DEFINITIONS (`_7 == 4 * m` computed blocks before the
-    // call): without them a callee precondition over a value THREADED from an
-    // earlier block is refuted with the temp free (`_7 = 0` while `m = 2`).
-    // Same machinery as the postcondition lane; live-filtered per call block.
-    let path_definition_map = v2_build_path_definition_map(func);
-    // Trust (lane-A CSE): one statement-version oracle for the whole function.
-    let sv = super::stmt_versions_for(func);
-    // Function-wide invariant facts (min/max result bounds, cast bounds, …):
-    // unconditionally true, so sound in every callsite obligation. Without them
-    // `f(1, x.max(1))` cannot discharge a callee `requires(lo <= hi)` — the
-    // `max` result is an unmodeled call dest, free in ¬P[σ], and the VC is
-    // spuriously SAT (a false refutation minting a VIOLATION row).
-    let global_facts = build_global_invariant_facts(func);
-    // The caller's OWN `#[requires]` over never-reassigned formals — entry facts
-    // valid at every program point, so sound in every callsite obligation (see
-    // `stable_caller_preconditions`). Without them `#[requires(lo <= hi)]`
-    // cannot discharge a callee `requires(lo <= hi)` over σ-rooted `lo`/`hi`.
-    let own_preconditions = stable_caller_preconditions(func);
-    // F5: one shared float-tracer context for the structural interval-dominance
-    // skip below (the guard-map cache is per-function).
-    let float_ctx = FloatRangeCtx::new(func, Some(summaries));
+    // The memo scopes, on the view every analysis below reads (`EntryScope`: the R1
+    // harvest asks this producer per (callee, caller), outside any scope).
+    let _entry_scope = super::EntryScope::enter(func);
+    let guard_paths_map: std::cell::OnceCell<std::rc::Rc<PathGuardMap>> =
+        std::cell::OnceCell::new();
+    let path_definition_map: std::cell::OnceCell<std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>> =
+        std::cell::OnceCell::new();
+    let sv: std::cell::OnceCell<std::rc::Rc<StmtVersionCtx>> = std::cell::OnceCell::new();
+    let global_facts: std::cell::OnceCell<std::rc::Rc<RowGlobalFacts>> =
+        std::cell::OnceCell::new();
+    let own_preconditions: std::cell::OnceCell<Vec<Formula>> = std::cell::OnceCell::new();
+    let fn_sym: Symbol = func.name.as_str().into();
+    let multi_db = summaries.len() > 1;
 
-    // `TRUST_PRECOND_DEBUG=1`: the PRODUCTION-lane twin of the attributed
-    // producer's per-callsite diagnostic (this producer is the one the
-    // compiler's whole-function VC pipeline drives). Diagnostic only.
-    let precond_debug = std::env::var("TRUST_PRECOND_DEBUG").is_ok();
-
-    let mut vcs = Vec::new();
-    for block in &func.body.blocks {
-        let (callee_name, args, span) = match &block.terminator {
-            Terminator::Call { func, args, span, .. }
-            | Terminator::TailCall { func, args, span, .. } => (func, args, span),
-            _ => continue,
-        };
-        let Some(summary) = summaries.get(callee_name) else {
-            // Trust (I5 L0 lane — the fail-OPEN this arm used to be): a
-            // `None` here is not always "the callee has no contract". When the
-            // L0 definitional subset REFUSED a summary because it declares
-            // preconditions, the name is absent from the DB but the call site
-            // still owes the guard — and emitting nothing reported a caller
-            // that VIOLATES that precondition as CLEAN. Mint the fail-closed
-            // row instead. Ordinary absences are unaffected: only
-            // `definitional_precondition_free_subset` ever records a name.
-            if let Some(count) = summaries.l0_withheld_precondition_count(callee_name) {
-                vcs.push(crate::modular::l0_withheld_summary_vc(func, callee_name, span, count));
+    summaries
+        .iter()
+        .map(|summaries| {
+            if !precond_debug && multi_db && !summaries.owes_caller_preconditions(func) {
+                return Vec::new();
             }
-            if precond_debug {
-                eprintln!(
-                    "[PRECOND_DEBUG/prod] fn={} block={} callee={callee_name} NO-SUMMARY (keys: {:?})",
-                    func.name,
-                    block.id.0,
-                    summaries.names().collect::<Vec<_>>()
-                );
-            }
-            continue;
-        };
-        if precond_debug {
-            eprintln!(
-                "[PRECOND_DEBUG/prod] fn={} block={} callee={callee_name} summary: params={:?} preconds={} body={}",
-                func.name,
-                block.id.0,
-                summary.param_names,
-                summary.preconditions.len(),
-                summary.extracted_body.is_some()
-            );
-        }
+            let semantic_guards: std::cell::OnceCell<
+                std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>,
+            > = std::cell::OnceCell::new();
+            let float_ctx: std::cell::OnceCell<FloatRangeCtx<'_>> = std::cell::OnceCell::new();
 
-        if !summary.preconditions.is_empty() && summary.param_names.len() != args.len() {
-            vcs.push(VerificationCondition {
-                kind: VcKind::UnsupportedMir {
-                    kind: "SummaryArityMismatch".to_string(),
-                    detail: format!(
-                        "callee `{callee_name}` summary has {} formal parameter(s), call has {} argument(s)",
-                        summary.param_names.len(),
-                        args.len()
-                    ),
-                },
-                function: func.name.as_str().into(),
-                location: span.clone(),
-                formula: Formula::Bool(true),
-                contract_metadata: None,
-                obligation: None,
-            });
-            continue;
-        }
-
-        let mut replacements: Vec<(String, Formula)> = summary
-            .param_names
-            .iter()
-            .zip(args.iter())
-            .map(|(formal, actual)| (formal.clone(), sigma_actual_formula(func, formal, actual)))
-            .collect();
-        // Trust (piece #8): σ-render `<formal>__slice_len` for slice/array formals
-        // (parallel to the attributed producer, so both stay identical).
-        append_length_replacements(func, summary, args, &mut replacements);
-
-        for precondition in &summary.preconditions {
-            if contracts::formula_uses_unmodeled_machine_arithmetic(precondition) {
-                vcs.push(contracts::spec_unverifiable_vc(
-                    func,
-                    span.clone(),
-                    &format!(
-                        "callee `{callee_name}` requires uses unmodeled fixed-width machine arithmetic"
-                    ),
-                    &format!("{precondition:?}"),
-                    None,
-                ));
-                continue;
-            }
-            // F5 (structural caller-precondition discharge): when EVERY conjunct
-            // is a float literal bound and the σ-mapped actual's PROVEN interval
-            // sits inside the required one, the obligation provably cannot fire
-            // — it is not minted at all (the same principle as
-            // `v2_build_float_overflow_vc` returning `None` for a provably
-            // overflow-free op). Any failure falls through to the ordinary VC
-            // emission below (fail-closed). Kept IDENTICAL in the attributed
-            // twin.
-            if precondition_interval_dominance(
-                &float_ctx,
-                block.id,
-                precondition,
-                &summary.param_names,
-                args,
-                &mut Vec::new(),
-                FLOAT_EXP_BOUND_FUEL,
-            ) {
+            let mut vcs = Vec::new();
+            for block in &func.body.blocks {
+                let (callee_name, args, span) = match &block.terminator {
+                    Terminator::Call { func, args, span, .. }
+                    | Terminator::TailCall { func, args, span, .. } => (func, args, span),
+                    _ => continue,
+                };
+                let Some(summary) = summaries.get(callee_name) else {
+                    // Trust (I5 L0 lane — the fail-OPEN this arm used to be): a
+                    // `None` here is not always "the callee has no contract". When the
+                    // L0 definitional subset REFUSED a summary because it declares
+                    // preconditions, the name is absent from the DB but the call site
+                    // still owes the guard — and emitting nothing reported a caller
+                    // that VIOLATES that precondition as CLEAN. Mint the fail-closed
+                    // row instead. Ordinary absences are unaffected: only
+                    // `definitional_precondition_free_subset` ever records a name.
+                    if let Some(count) = summaries.l0_withheld_precondition_count(callee_name) {
+                        vcs.push(crate::modular::l0_withheld_summary_vc(
+                            func,
+                            callee_name,
+                            span,
+                            count,
+                        ));
+                    }
+                    if precond_debug {
+                        eprintln!(
+                            "[PRECOND_DEBUG/prod] fn={} block={} callee={callee_name} NO-SUMMARY (keys: {:?})",
+                            func.name,
+                            block.id.0,
+                            summaries.names().collect::<Vec<_>>()
+                        );
+                    }
+                    continue;
+                };
                 if precond_debug {
                     eprintln!(
-                        "[PRECOND_DEBUG/prod] fn={} block={} callee={callee_name} F5-SUPPRESSED",
-                        func.name, block.id.0
+                        "[PRECOND_DEBUG/prod] fn={} block={} callee={callee_name} summary: params={:?} preconds={} body={}",
+                        func.name,
+                        block.id.0,
+                        summary.param_names,
+                        summary.preconditions.len(),
+                        summary.extracted_body.is_some()
                     );
                 }
-                continue;
-            }
-            if precond_debug {
-                eprintln!(
-                    "[PRECOND_DEBUG/prod] fn={} block={} callee={callee_name} F5-MISS -> minting VC (precond: {precondition:?})",
-                    func.name, block.id.0
-                );
-            }
-            let substituted = substitute_summary_params(precondition, &replacements);
-            let mut formula = Formula::Not(Box::new(substituted));
 
-            // Same-block STATEMENT DEFS (`_7 = 4 * m`), conjoined exactly like
-            // the UnboundedAllocation lane does: without them a callee
-            // `requires(2m <= 4m)` at `f(2*m, 4*m)` is refuted with the mul
-            // temps FREE (`_7 = 0` while `m = 2`). Establish-versioned names
-            // are bridged to ¬P[σ]'s bare spellings by the SSA normalization
-            // at the end of this loop body.
-            formula = v2_formula_with_block_defs(func, block, formula);
-
-            // Cross-block path definitions, live-filtered against this block's
-            // own redefs and terminator kills (the postcondition lane's
-            // discipline). Spliced flat below by the sem-guard flatten.
-            if let Some(path_defs) = path_definition_map.get(&block.id)
-                && !path_defs.is_empty()
-            {
-                let mut live = v2_live_path_defs(func, block, path_defs);
-                let term_defs: FxHashSet<String> =
-                    terminator_def_names(func, block).into_iter().collect();
-                if !term_defs.is_empty() {
-                    live.retain(|f| formula_survives_redefs(f, &term_defs));
+                if summary.preconditions.is_empty() {
+                    continue;
                 }
-                if !live.is_empty() {
-                    // Trust: restore R1 recursion inductive-bound fact (regression from
-                    // 52b31a7d2a). `formula` is already the block-def-wrapped
-                    // `And([arg-defs…, ¬P[σ]])`; pushing it WHOLE nests `¬P[σ]` a level deep,
-                    // and when no later sem-guard flatten runs (a guarded recursive call has
-                    // path defs but no semantic guards) the nesting survives to the emitted VC
-                    // — so the R1 discharge gate's direct-conjunct check fails. Splice the
-                    // inner conjuncts flat instead (pure `∧` associativity, verdict-identical).
-                    match formula {
-                        Formula::And(inner) => live.extend(inner),
-                        other => live.push(other),
+                if summary.param_names.len() != args.len() {
+                    vcs.push(VerificationCondition {
+                        kind: VcKind::UnsupportedMir {
+                            kind: "SummaryArityMismatch".to_string(),
+                            detail: format!(
+                                "callee `{callee_name}` summary has {} formal parameter(s), call has {} argument(s)",
+                                summary.param_names.len(),
+                                args.len()
+                            ),
+                        },
+                        function: fn_sym,
+                        location: span.clone(),
+                        formula: Formula::Bool(true),
+                        contract_metadata: None,
+                        obligation: None,
+                    });
+                    continue;
+                }
+
+                let replacements: std::cell::OnceCell<Vec<(String, Formula)>> =
+                    std::cell::OnceCell::new();
+                let block_live_path_defs: std::cell::OnceCell<Vec<Formula>> =
+                    std::cell::OnceCell::new();
+                let block_sem_guards: std::cell::OnceCell<Vec<Formula>> =
+                    std::cell::OnceCell::new();
+
+                for precondition in &summary.preconditions {
+                    // Trust (CONSTPARAM-SIGMA-FRESHEN-1): a callee-side const-generic symbol
+                    // cannot be read as the caller's same-spelled param once the family is no
+                    // longer freshened below. Identity on every `P` produced today; kept
+                    // IDENTICAL in the attributed twin.
+                    let precondition = isolate_callee_const_param_symbols_cow(precondition);
+                    if contracts::formula_uses_unmodeled_machine_arithmetic(&precondition) {
+                        vcs.push(contracts::spec_unverifiable_vc(
+                            func,
+                            span.clone(),
+                            &format!(
+                                "callee `{callee_name}` requires uses unmodeled fixed-width machine arithmetic"
+                            ),
+                            &format!("{precondition:?}"),
+                            None,
+                        ));
+                        continue;
                     }
-                    formula = Formula::And(live);
+                    // F5 (structural caller-precondition discharge): when EVERY conjunct
+                    // is a float literal bound and the σ-mapped actual's PROVEN interval
+                    // sits inside the required one, the obligation provably cannot fire
+                    // — it is not minted at all (the same principle as
+                    // `v2_build_float_overflow_vc` returning `None` for a provably
+                    // overflow-free op). Any failure falls through to the ordinary VC
+                    // emission below (fail-closed). Kept IDENTICAL in the attributed
+                    // twin.
+                    if precondition_interval_dominance_lazy(
+                        func,
+                        || float_ctx.get_or_init(|| FloatRangeCtx::new(func, Some(summaries))),
+                        block.id,
+                        &precondition,
+                        &summary.param_names,
+                        args,
+                        &mut Vec::new(),
+                        FLOAT_EXP_BOUND_FUEL,
+                    ) {
+                        if precond_debug {
+                            eprintln!(
+                                "[PRECOND_DEBUG/prod] fn={} block={} callee={callee_name} F5-SUPPRESSED",
+                                func.name, block.id.0
+                            );
+                        }
+                        continue;
+                    }
+                    if precond_debug {
+                        eprintln!(
+                            "[PRECOND_DEBUG/prod] fn={} block={} callee={callee_name} F5-MISS -> minting VC (precond: {precondition:?})",
+                            func.name, block.id.0
+                        );
+                    }
+                    let replacements = replacements.get_or_init(|| {
+                        build_callsite_sigma_replacements(func, summary, args)
+                    });
+                    let substituted = substitute_summary_params_owned(
+                        precondition.into_owned(),
+                        replacements,
+                    );
+                    let mut formula = Formula::Not(Box::new(substituted));
+
+                    // Same-block STATEMENT DEFS (`_7 = 4 * m`), conjoined exactly like
+                    // the UnboundedAllocation lane does: without them a callee
+                    // `requires(2m <= 4m)` at `f(2*m, 4*m)` is refuted with the mul
+                    // temps FREE (`_7 = 0` while `m = 2`). Establish-versioned names
+                    // are bridged to ¬P[σ]'s bare spellings by the SSA normalization
+                    // at the end of this loop body.
+                    formula = v2_formula_with_block_defs(func, block, formula);
+
+                    let path_definition_map = path_definition_map
+                        .get_or_init(|| super::path_definition_map_for(func));
+                    let sv = sv.get_or_init(|| super::stmt_versions_for(func));
+                    let guard_paths_map =
+                        guard_paths_map.get_or_init(|| super::guard_map_for(func));
+                    let semantic_guards = semantic_guards
+                        .get_or_init(|| super::semantic_guard_map_for(func, Some(summaries)));
+                    let global_facts =
+                        global_facts.get_or_init(|| build_global_invariant_facts(func));
+                    let own_preconditions =
+                        own_preconditions.get_or_init(|| stable_caller_preconditions(func));
+
+                    // Cross-block path definitions, live-filtered against this block's
+                    // own redefs and terminator kills (the postcondition lane's
+                    // discipline). Spliced flat below by the sem-guard flatten.
+                    let live = block_live_path_defs.get_or_init(|| {
+                        block_live_callsite_path_defs(func, block, sv, path_definition_map)
+                    });
+                    if !live.is_empty() {
+                        // Trust: restore R1 recursion inductive-bound fact (regression from
+                        // 52b31a7d2a). `formula` is already the block-def-wrapped
+                        // `And([arg-defs…, ¬P[σ]])`; pushing it WHOLE nests `¬P[σ]` a level deep,
+                        // and when no later sem-guard flatten runs (a guarded recursive call has
+                        // path defs but no semantic guards) the nesting survives to the emitted VC
+                        // — so the R1 discharge gate's direct-conjunct check fails. Splice the
+                        // inner conjuncts flat instead (pure `∧` associativity, verdict-identical).
+                        formula = splice_flat_prefix(live, formula);
+                    }
+
+                    if let Some(block_guard_paths) = guard_paths_map.get(&block.id) {
+                        formula = v2_formula_with_path_guards(
+                            func,
+                            sv,
+                            block.id,
+                            block_guard_paths,
+                            formula,
+                        );
+                    }
+
+                    let sem_with_bare = block_sem_guards.get_or_init(|| {
+                        block_sem_guards_with_bare_variants(func, block.id, semantic_guards)
+                    });
+                    if !sem_with_bare.is_empty() {
+                        // Trust (R1 guarded-caller discharge): FLATTEN a path-guard `And` into
+                        // this semantic-guard `And` rather than nesting it. `v2_formula_with_path_guards`
+                        // returns `And([path_guard, ¬P[σ]])` on a single-path block; wrapping that in
+                        // another `And([sem…, And([path_guard, ¬P[σ]])])` buries `¬P[σ]` one level
+                        // deep, so the `guards` extraction (which requires `¬P[σ]` to be a DIRECT
+                        // conjunct of a flat `And`) yields `[]` and the obligation is rejected by
+                        // `is_admissible_caller_discharge` (CallerFormulaMismatch) — even for a
+                        // genuinely-guarded call. Splicing the inner conjuncts keeps `¬P[σ]` at the
+                        // top level so the guard and the semantic facts are flat siblings, exactly the
+                        // flat-`And` shape the discharge gate admits. Only a flat `And` is spliced; a
+                        // multi-path `Or` (or a bare `¬P[σ]`) is pushed whole — an `Or`-nested `¬P[σ]`
+                        // is genuinely non-flat, so `guards` stays `[]` and the gate still (soundly)
+                        // rejects it. Semantics are unchanged: `And([a, And([b, c])])` and
+                        // `And([a, b, c])` are the identical conjunction.
+                        formula = splice_flat_prefix(sem_with_bare, formula);
+                    }
+
+                    // Global invariant facts, spliced flat for the same reason as the
+                    // semantic guards above (¬P[σ] must stay a DIRECT conjunct).
+                    let row_facts = global_facts.for_row(&formula);
+                    if !row_facts.is_empty() {
+                        let mut conjuncts = row_facts;
+                        match formula {
+                            Formula::And(inner) => conjuncts.extend(inner),
+                            other => conjuncts.push(other),
+                        }
+                        formula = Formula::And(conjuncts);
+                    }
+
+                    // The caller's own STABLE preconditions, spliced flat exactly like the
+                    // global facts (¬P[σ] must stay a DIRECT conjunct; in the attributed
+                    // twin these surface in `guards` for the R1 discharge gate).
+                    if !own_preconditions.is_empty() {
+                        formula = splice_flat_prefix(own_preconditions, formula);
+                    }
+
+                    // COMPLETE alias post-pass (see `freshen_aliasing_opaque_occurrences`): per-occurrence
+                    // freshen every guard/semantic-fact opaque symbol the by-name interning collapsed, so
+                    // two distinct assoc-const / unevaluated-const reads can never alias into one SMT
+                    // symbol (which would fabricate an equality that spuriously discharges the VC). The σ
+                    // namespace (`__trust_sigma_*`) is disjoint and left intact, and so is the caller's
+                    // const-generic family: one symbol is one param of THIS caller, so the guard `n < K`
+                    // and σ's `buf__slice_len := K` must stay the same term (CONSTPARAM-SIGMA-FRESHEN-1).
+                    let occ = std::cell::Cell::new(0u32);
+                    let formula = freshen_aliasing_opaque_occurrences_owned(formula, &occ);
+                    // Collapse SSA version tokens so establish-versioned block defs
+                    // (`_7#s0_1 == 4 * m`) bind ¬P[σ]'s bare `_7`. ¬P[σ] itself uses
+                    // bare σ names (no `#`), so it is untouched.
+                    let formula = normalize_ssa_version_tokens_owned(func, formula);
+
+                    vcs.push(VerificationCondition {
+                        kind: VcKind::Precondition { callee: callee_name.clone() },
+                        function: fn_sym,
+                        location: span.clone(),
+                        formula,
+                        contract_metadata: None,
+                        obligation: None,
+                    });
                 }
             }
-
-            if let Some(block_guard_paths) = guard_paths_map.get(&block.id) {
-                formula = v2_formula_with_path_guards(func, &sv, block_guard_paths, formula);
-            }
-
-            if let Some(sem_guards) = semantic_guards.get(&block.id)
-                && !sem_guards.is_empty()
-            {
-                let mut conjuncts = sem_guards.clone();
-                // BARE-named variants for SSA call-dest facts: a
-                // `version_terminator_dest_fact` guard names its subject
-                // `_5#s0_t`, while ¬P[σ] renders the same SSA local bare
-                // (`_5`) — conjoin the identity-renamed copy so the fact
-                // actually constrains the obligation. See
-                // `bare_ssa_guard_variant` for the SSA soundness argument.
-                conjuncts.extend(sem_guards.iter().filter_map(|g| bare_ssa_guard_variant(func, g)));
-                // Trust (R1 guarded-caller discharge): FLATTEN a path-guard `And` into
-                // this semantic-guard `And` rather than nesting it. `v2_formula_with_path_guards`
-                // returns `And([path_guard, ¬P[σ]])` on a single-path block; wrapping that in
-                // another `And([sem…, And([path_guard, ¬P[σ]])])` buries `¬P[σ]` one level
-                // deep, so the `guards` extraction (which requires `¬P[σ]` to be a DIRECT
-                // conjunct of a flat `And`) yields `[]` and the obligation is rejected by
-                // `is_admissible_caller_discharge` (CallerFormulaMismatch) — even for a
-                // genuinely-guarded call. Splicing the inner conjuncts keeps `¬P[σ]` at the
-                // top level so the guard and the semantic facts are flat siblings, exactly the
-                // flat-`And` shape the discharge gate admits. Only a flat `And` is spliced; a
-                // multi-path `Or` (or a bare `¬P[σ]`) is pushed whole — an `Or`-nested `¬P[σ]`
-                // is genuinely non-flat, so `guards` stays `[]` and the gate still (soundly)
-                // rejects it. Semantics are unchanged: `And([a, And([b, c])])` and
-                // `And([a, b, c])` are the identical conjunction.
-                match formula {
-                    Formula::And(inner) => conjuncts.extend(inner),
-                    other => conjuncts.push(other),
-                }
-                formula = Formula::And(conjuncts);
-            }
-
-            // Global invariant facts, spliced flat for the same reason as the
-            // semantic guards above (¬P[σ] must stay a DIRECT conjunct).
-            if !global_facts.is_empty() {
-                let mut conjuncts = global_facts.clone();
-                match formula {
-                    Formula::And(inner) => conjuncts.extend(inner),
-                    other => conjuncts.push(other),
-                }
-                formula = Formula::And(conjuncts);
-            }
-
-            // The caller's own STABLE preconditions, spliced flat exactly like the
-            // global facts (¬P[σ] must stay a DIRECT conjunct; in the attributed
-            // twin these surface in `guards` for the R1 discharge gate).
-            if !own_preconditions.is_empty() {
-                let mut conjuncts = own_preconditions.clone();
-                match formula {
-                    Formula::And(inner) => conjuncts.extend(inner),
-                    other => conjuncts.push(other),
-                }
-                formula = Formula::And(conjuncts);
-            }
-
-            // COMPLETE alias post-pass (see `freshen_aliasing_opaque_occurrences`): per-occurrence
-            // freshen every guard/semantic-fact opaque symbol the by-name interning collapsed, so
-            // two distinct const-generic / unevaluated-const reads can never alias into one SMT
-            // symbol (which would fabricate an equality that spuriously discharges the VC). The σ
-            // namespace (`__trust_sigma_*`) is disjoint and left intact.
-            let occ = std::cell::Cell::new(0u32);
-            let formula = freshen_aliasing_opaque_occurrences(&formula, &occ);
-            // Collapse SSA version tokens so establish-versioned block defs
-            // (`_7#s0_1 == 4 * m`) bind ¬P[σ]'s bare `_7`. ¬P[σ] itself uses
-            // bare σ names (no `#`), so it is untouched.
-            let formula = normalize_ssa_version_tokens(func, &formula);
-
-            vcs.push(VerificationCondition {
-                kind: VcKind::Precondition { callee: callee_name.clone() },
-                function: func.name.as_str().into(),
-                location: span.clone(),
-                formula,
-                contract_metadata: None,
-                obligation: None,
-            });
-        }
-    }
-    vcs
+            vcs
+        })
+        .collect()
 }
 
 /// Trust #540 (R1 2b): the ATTRIBUTED twin of [`generate_callsite_precondition_vcs`].
@@ -310,6 +380,10 @@ pub fn generate_callsite_precondition_vcs_attributed(
     func: &VerifiableFunction,
     summaries: &crate::modular::SummaryDatabase,
 ) -> Vec<(VerificationCondition, Formula, Vec<Formula>)> {
+    let _input_analysis = super::EntryScope::enter_analysis_if_unbound(func);
+    if let Some(vc) = crate::memory_image_vc(func) {
+        return vec![(vc, Formula::Bool(true), Vec::new())];
+    }
     if let Err(error) = crate::validate_function(func) {
         return vec![(malformed_trust_ir_vc(func, &error), Formula::Bool(true), Vec::new())];
     }
@@ -317,29 +391,38 @@ pub fn generate_callsite_precondition_vcs_attributed(
     if func_exceeds_vcgen_budget(func) {
         return Vec::new();
     }
-    let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
-    let func = arithmetic_safe_func.as_ref();
-    let guard_paths_map = super::guard_map_for(func);
-    let semantic_guards = build_semantic_guard_map(func);
-    // Cross-block path definitions — identical to the non-attributed producer.
-    let path_definition_map = v2_build_path_definition_map(func);
-    let sv = super::stmt_versions_for(func);
-    // Same fact set the non-attributed producer conjoins — the two assemblies
-    // must stay IDENTICAL (see the doc above).
-    let global_facts = build_global_invariant_facts(func);
-    // Same stable own-precondition set the non-attributed producer conjoins
-    // (see `stable_caller_preconditions` for the gate and for why NOT
-    // `conjoin_preconditions_versioned` — its unconditional version-rename
-    // would rewrite ¬P[σ] and break the `not_p` structural match below).
-    let own_preconditions = stable_caller_preconditions(func);
-    // F5 skip context — identical to the non-attributed producer.
-    let float_ctx = FloatRangeCtx::new(func, Some(summaries));
-
     // `TRUST_PRECOND_DEBUG=1`: per-callsite diagnostic for the F5/F6b
     // suppression seam (which callee summaries the producer actually sees and
     // why a precondition VC was minted instead of suppressed). Diagnostic
     // only — no verdict change.
-    let precond_debug = std::env::var("TRUST_PRECOND_DEBUG").is_ok();
+    static PRECOND_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let precond_debug =
+        *PRECOND_DEBUG.get_or_init(|| crate::trust_vcgen_env_var_present("TRUST_PRECOND_DEBUG"));
+    if if precond_debug {
+        let tp = super::terminator_presence_for_body(&func.body);
+        !tp.has_call && !tp.has_tail_call
+    } else {
+        !summaries.owes_caller_preconditions(func)
+    } {
+        return Vec::new();
+    }
+    let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
+    let func = arithmetic_safe_func.as_ref();
+    // The memo scopes, on the view every analysis below reads (`EntryScope`: the R1
+    // harvest asks this producer per (callee, caller), outside any scope).
+    let _entry_scope = super::EntryScope::enter(func);
+    let guard_paths_map: std::cell::OnceCell<std::rc::Rc<PathGuardMap>> =
+        std::cell::OnceCell::new();
+    let semantic_guards: std::cell::OnceCell<std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>> =
+        std::cell::OnceCell::new();
+    let path_definition_map: std::cell::OnceCell<std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>> =
+        std::cell::OnceCell::new();
+    let sv: std::cell::OnceCell<std::rc::Rc<StmtVersionCtx>> = std::cell::OnceCell::new();
+    let global_facts: std::cell::OnceCell<std::rc::Rc<RowGlobalFacts>> =
+        std::cell::OnceCell::new();
+    let own_preconditions: std::cell::OnceCell<Vec<Formula>> = std::cell::OnceCell::new();
+    let float_ctx: std::cell::OnceCell<FloatRangeCtx<'_>> = std::cell::OnceCell::new();
+    let fn_sym: Symbol = func.name.as_str().into();
 
     let mut out = Vec::new();
     for block in &func.body.blocks {
@@ -381,7 +464,10 @@ pub fn generate_callsite_precondition_vcs_attributed(
             );
         }
 
-        if !summary.preconditions.is_empty() && summary.param_names.len() != args.len() {
+        if summary.preconditions.is_empty() {
+            continue;
+        }
+        if summary.param_names.len() != args.len() {
             out.push((
                 VerificationCondition {
                     kind: VcKind::UnsupportedMir {
@@ -392,7 +478,7 @@ pub fn generate_callsite_precondition_vcs_attributed(
                             args.len()
                         ),
                     },
-                    function: func.name.as_str().into(),
+                    function: fn_sym,
                     location: span.clone(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
@@ -404,19 +490,19 @@ pub fn generate_callsite_precondition_vcs_attributed(
             continue;
         }
 
-        let mut replacements: Vec<(String, Formula)> = summary
-            .param_names
-            .iter()
-            .zip(args.iter())
-            .map(|(formal, actual)| (formal.clone(), sigma_actual_formula(func, formal, actual)))
-            .collect();
-        // Trust (piece #8): render `<formal>__slice_len` for each slice/array formal
-        // from the ACTUAL argument's length, so a length-relationship precondition
-        // (`n <= arr__slice_len`) can discharge at this caller.
-        append_length_replacements(func, summary, args, &mut replacements);
+        let replacements: std::cell::OnceCell<Vec<(String, Formula)>> =
+            std::cell::OnceCell::new();
+        let block_live_path_defs: std::cell::OnceCell<Vec<Formula>> =
+            std::cell::OnceCell::new();
+        let block_sem_guards: std::cell::OnceCell<Vec<Formula>> =
+            std::cell::OnceCell::new();
 
         for precondition in &summary.preconditions {
-            if contracts::formula_uses_unmodeled_machine_arithmetic(precondition) {
+            // Trust (CONSTPARAM-SIGMA-FRESHEN-1): IDENTICAL to the non-attributed
+            // producer. `substituted` (the gate's anchor) is built from this isolated
+            // `P`, so `¬P[σ]` and the certified formula agree.
+            let precondition = isolate_callee_const_param_symbols_cow(precondition);
+            if contracts::formula_uses_unmodeled_machine_arithmetic(&precondition) {
                 out.push((
                     contracts::spec_unverifiable_vc(
                         func,
@@ -435,10 +521,11 @@ pub fn generate_callsite_precondition_vcs_attributed(
             // F5 structural interval-dominance skip — IDENTICAL to the
             // non-attributed producer (an unminted obligation has no
             // attribution row either).
-            if precondition_interval_dominance(
-                &float_ctx,
+            if precondition_interval_dominance_lazy(
+                func,
+                || float_ctx.get_or_init(|| FloatRangeCtx::new(func, Some(summaries))),
                 block.id,
-                precondition,
+                &precondition,
                 &summary.param_names,
                 args,
                 &mut Vec::new(),
@@ -458,58 +545,55 @@ pub fn generate_callsite_precondition_vcs_attributed(
                     func.name, block.id.0
                 );
             }
+            let replacements = replacements.get_or_init(|| {
+                build_callsite_sigma_replacements(func, summary, args)
+            });
             // The INDEPENDENT pre-image: same fn + same σ the obligation is built from.
-            let substituted = substitute_summary_params(precondition, &replacements);
-            let not_p = Formula::Not(Box::new(substituted.clone()));
-            let mut formula = not_p.clone();
+            let substituted =
+                substitute_summary_params_owned(precondition.into_owned(), replacements);
+            let mut formula = Formula::Not(Box::new(substituted.clone()));
 
             // Same-block STATEMENT DEFS — identical to the non-attributed
             // producer (they surface in `guards` for the R1 gate; the flatten
             // below keeps ¬P[σ] a direct conjunct).
             formula = v2_formula_with_block_defs(func, block, formula);
 
+            let path_definition_map =
+                path_definition_map.get_or_init(|| super::path_definition_map_for(func));
+            let sv = sv.get_or_init(|| super::stmt_versions_for(func));
+            let guard_paths_map = guard_paths_map.get_or_init(|| super::guard_map_for(func));
+            let semantic_guards = semantic_guards
+                .get_or_init(|| super::semantic_guard_map_for(func, Some(summaries)));
+            let global_facts = global_facts
+                .get_or_init(|| build_global_invariant_facts(func));
+            let own_preconditions =
+                own_preconditions.get_or_init(|| stable_caller_preconditions(func));
+
             // Cross-block path definitions, live-filtered against this block's
             // own redefs and terminator kills (the postcondition lane's
             // discipline). Spliced flat below by the sem-guard flatten.
-            if let Some(path_defs) = path_definition_map.get(&block.id)
-                && !path_defs.is_empty()
-            {
-                let mut live = v2_live_path_defs(func, block, path_defs);
-                let term_defs: FxHashSet<String> =
-                    terminator_def_names(func, block).into_iter().collect();
-                if !term_defs.is_empty() {
-                    live.retain(|f| formula_survives_redefs(f, &term_defs));
-                }
-                if !live.is_empty() {
-                    // Trust: restore R1 recursion inductive-bound fact (regression from
-                    // 52b31a7d2a). `formula` is already the block-def-wrapped
-                    // `And([arg-defs…, ¬P[σ]])`; pushing it WHOLE nests `¬P[σ]` a level deep,
-                    // and when no later sem-guard flatten runs (a guarded recursive call has
-                    // path defs but no semantic guards) the nesting survives to the emitted VC
-                    // — so the R1 discharge gate's direct-conjunct check fails. Splice the
-                    // inner conjuncts flat instead (pure `∧` associativity, verdict-identical).
-                    match formula {
-                        Formula::And(inner) => live.extend(inner),
-                        other => live.push(other),
-                    }
-                    formula = Formula::And(live);
-                }
+            let live = block_live_path_defs.get_or_init(|| {
+                block_live_callsite_path_defs(func, block, sv, path_definition_map)
+            });
+            if !live.is_empty() {
+                // Trust: restore R1 recursion inductive-bound fact (regression from
+                // 52b31a7d2a). `formula` is already the block-def-wrapped
+                // `And([arg-defs…, ¬P[σ]])`; pushing it WHOLE nests `¬P[σ]` a level deep,
+                // and when no later sem-guard flatten runs (a guarded recursive call has
+                // path defs but no semantic guards) the nesting survives to the emitted VC
+                // — so the R1 discharge gate's direct-conjunct check fails. Splice the
+                // inner conjuncts flat instead (pure `∧` associativity, verdict-identical).
+                formula = splice_flat_prefix(live, formula);
             }
 
             if let Some(block_guard_paths) = guard_paths_map.get(&block.id) {
-                formula = v2_formula_with_path_guards(func, &sv, block_guard_paths, formula);
+                formula =
+                    v2_formula_with_path_guards(func, sv, block.id, block_guard_paths, formula);
             }
-            if let Some(sem_guards) = semantic_guards.get(&block.id)
-                && !sem_guards.is_empty()
-            {
-                let mut conjuncts = sem_guards.clone();
-                // BARE-named variants for SSA call-dest facts: a
-                // `version_terminator_dest_fact` guard names its subject
-                // `_5#s0_t`, while ¬P[σ] renders the same SSA local bare
-                // (`_5`) — conjoin the identity-renamed copy so the fact
-                // actually constrains the obligation. See
-                // `bare_ssa_guard_variant` for the SSA soundness argument.
-                conjuncts.extend(sem_guards.iter().filter_map(|g| bare_ssa_guard_variant(func, g)));
+            let sem_with_bare = block_sem_guards.get_or_init(|| {
+                block_sem_guards_with_bare_variants(func, block.id, semantic_guards)
+            });
+            if !sem_with_bare.is_empty() {
                 // Trust (R1 guarded-caller discharge): FLATTEN a path-guard `And` into
                 // this semantic-guard `And` rather than nesting it. `v2_formula_with_path_guards`
                 // returns `And([path_guard, ¬P[σ]])` on a single-path block; wrapping that in
@@ -524,18 +608,15 @@ pub fn generate_callsite_precondition_vcs_attributed(
                 // is genuinely non-flat, so `guards` stays `[]` and the gate still (soundly)
                 // rejects it. Semantics are unchanged: `And([a, And([b, c])])` and
                 // `And([a, b, c])` are the identical conjunction.
-                match formula {
-                    Formula::And(inner) => conjuncts.extend(inner),
-                    other => conjuncts.push(other),
-                }
-                formula = Formula::And(conjuncts);
+                formula = splice_flat_prefix(sem_with_bare, formula);
             }
 
             // Global invariant facts, spliced flat — identical to the
             // non-attributed producer. They surface in `guards` below as
             // legitimate vcgen-emitted context for the discharge gate.
-            if !global_facts.is_empty() {
-                let mut conjuncts = global_facts.clone();
+            let row_facts = global_facts.for_row(&formula);
+            if !row_facts.is_empty() {
+                let mut conjuncts = row_facts;
                 match formula {
                     Formula::And(inner) => conjuncts.extend(inner),
                     other => conjuncts.push(other),
@@ -547,12 +628,7 @@ pub fn generate_callsite_precondition_vcs_attributed(
             // the non-attributed producer. They surface in `guards` below as
             // legitimate vcgen-emitted context for the discharge gate.
             if !own_preconditions.is_empty() {
-                let mut conjuncts = own_preconditions.clone();
-                match formula {
-                    Formula::And(inner) => conjuncts.extend(inner),
-                    other => conjuncts.push(other),
-                }
-                formula = Formula::And(conjuncts);
+                formula = splice_flat_prefix(own_preconditions, formula);
             }
 
             // COMPLETE alias post-pass (see `freshen_aliasing_opaque_occurrences`): freshen guard /
@@ -560,22 +636,26 @@ pub fn generate_callsite_precondition_vcs_attributed(
             // `allowed_guards` and the certified `vc.formula` agree and no aliased equality can
             // fabricate a discharge. `¬P[σ]` (== `not_p`, the gate's structural anchor) uses the
             // disjoint `__trust_sigma_*` namespace and is preserved exactly, so the membership
-            // check below still matches.
+            // check below still matches. The caller's const-generic symbols are not freshened
+            // either (CONSTPARAM-SIGMA-FRESHEN-1): σ renders a `[T; K]` actual's length as the
+            // caller's `K`, which `not_p` carries, so freshening it used to break that match too.
             let occ = std::cell::Cell::new(0u32);
-            let formula = freshen_aliasing_opaque_occurrences(&formula, &occ);
+            let formula = freshen_aliasing_opaque_occurrences_owned(formula, &occ);
             // Collapse SSA version tokens — identical to the non-attributed
             // producer; runs BEFORE the guards extraction, and never renames
             // `not_p` (bare σ names carry no `#`), so the membership check
             // below still matches.
-            let formula = normalize_ssa_version_tokens(func, &formula);
+            let formula = normalize_ssa_version_tokens_owned(func, formula);
 
             // Top-level guard conjuncts admissible for the gate: ONLY when `¬P[σ]` is a
             // DIRECT conjunct of a flat `And` (or the bare formula). Nested `And` / `Or`
             // ⇒ [] (the gate then rejects via its `not_p` membership check).
+            let is_not_p =
+                |f: &Formula| matches!(f, Formula::Not(inner) if inner.as_ref() == &substituted);
             let guards: Vec<Formula> = match &formula {
-                f if *f == not_p => Vec::new(),
-                Formula::And(cs) if cs.contains(&not_p) => {
-                    cs.iter().filter(|c| **c != not_p).cloned().collect()
+                f if is_not_p(f) => Vec::new(),
+                Formula::And(cs) if cs.iter().rev().any(&is_not_p) => {
+                    cs.iter().filter(|c| !is_not_p(c)).cloned().collect()
                 }
                 _ => Vec::new(),
             };
@@ -583,7 +663,7 @@ pub fn generate_callsite_precondition_vcs_attributed(
             out.push((
                 VerificationCondition {
                     kind: VcKind::Precondition { callee: callee_name.clone() },
-                    function: func.name.as_str().into(),
+                    function: fn_sym,
                     location: span.clone(),
                     formula,
                     contract_metadata: None,
@@ -594,10 +674,84 @@ pub fn generate_callsite_precondition_vcs_attributed(
             ));
         }
     }
-    for (vc, _, _) in &mut out {
-        vc.function = func.def_path.as_str().into();
+    if !out.is_empty() {
+        let def_path_sym: Symbol = func.def_path.as_str().into();
+        for (vc, _, _) in &mut out {
+            vc.function = def_path_sym;
+        }
     }
     out
+}
+
+pub(super) fn build_callsite_sigma_replacements(
+    func: &VerifiableFunction,
+    summary: &crate::modular::FunctionSummary,
+    args: &[Operand],
+) -> Vec<(String, Formula)> {
+    let mut replacements: Vec<(String, Formula)> = summary
+        .param_names
+        .iter()
+        .zip(args.iter())
+        .map(|(formal, actual)| (formal.clone(), sigma_actual_formula(func, formal, actual)))
+        .collect();
+    append_length_replacements(func, summary, args, &mut replacements);
+    replacements
+}
+
+pub(super) fn block_live_callsite_path_defs(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    sv: &StmtVersionCtx,
+    path_definition_map: &FxHashMap<BlockId, Vec<Formula>>,
+) -> Vec<Formula> {
+    let Some(path_defs) = path_definition_map.get(&block.id) else {
+        return Vec::new();
+    };
+    if path_defs.is_empty() {
+        return Vec::new();
+    }
+    let mut live = v2_live_path_defs(func, block, path_defs);
+    let kill = sv.terminator_kill(func, block);
+    if !kill.is_empty() {
+        live.retain(|f| kill.survives(f));
+    }
+    live
+}
+
+pub(super) fn block_sem_guards_with_bare_variants(
+    func: &VerifiableFunction,
+    block_id: BlockId,
+    semantic_guards: &FxHashMap<BlockId, Vec<Formula>>,
+) -> Vec<Formula> {
+    let Some(sem_guards) = semantic_guards.get(&block_id) else {
+        return Vec::new();
+    };
+    if sem_guards.is_empty() {
+        return Vec::new();
+    }
+    let mut conjuncts = sem_guards.clone();
+    // BARE-named variants for SSA call-dest facts: a
+    // `version_terminator_dest_fact` guard names its subject
+    // `_5#s0_t`, while ¬P[σ] renders the same SSA local bare
+    // (`_5`) — conjoin the identity-renamed copy so the fact
+    // actually constrains the obligation. See
+    // `bare_ssa_guard_variant` for the SSA soundness argument.
+    conjuncts.extend(sem_guards.iter().filter_map(|g| bare_ssa_guard_variant(func, g)));
+    conjuncts
+}
+
+pub(super) fn splice_flat_prefix(prefix: &[Formula], formula: Formula) -> Formula {
+    let extra_len = match &formula {
+        Formula::And(inner) => inner.len(),
+        _ => 1,
+    };
+    let mut conjuncts = Vec::with_capacity(prefix.len() + extra_len);
+    conjuncts.extend_from_slice(prefix);
+    match formula {
+        Formula::And(inner) => conjuncts.extend(inner),
+        other => conjuncts.push(other),
+    }
+    Formula::And(conjuncts)
 }
 
 /// Split a solver variable name into `(base, projection-suffix)` at the FIRST
@@ -606,7 +760,7 @@ pub fn generate_callsite_precondition_vcs_attributed(
 /// projection) — those are handled by the whole-name substitution path — and for
 /// a name that starts with a projection token (no base to substitute).
 pub(super) fn split_projection_base(name: &str) -> Option<(&str, &str)> {
-    let idx = name.find(|c: char| matches!(c, '.' | '*' | '[' | '@'))?;
+    let idx = name.bytes().position(|b| matches!(b, b'.' | b'*' | b'[' | b'@'))?;
     if idx == 0 {
         return None;
     }
@@ -654,10 +808,51 @@ pub(super) fn rebind_projected_actual(
     Formula::var_owned(format!("__trust_sigma_field__{formal_base}{suffix}"), sort)
 }
 
+fn formula_needs_summary_param_subst(
+    formula: &Formula,
+    replacements: &[(String, Formula)],
+) -> bool {
+    trust_types::any_formula_node(formula, &mut |node| match node {
+        Formula::Forall(..) | Formula::Exists(..) => true,
+        _ => node.var_name().is_some_and(|name| {
+            replacements.iter().any(|(formal, _)| formal == name)
+                || split_projection_base(name).is_some_and(|(base, _)| {
+                    replacements.iter().any(|(formal, _)| formal == base)
+                })
+        }),
+    })
+}
+
 pub(crate) fn substitute_summary_params(
     formula: &Formula,
     replacements: &[(String, Formula)],
 ) -> Formula {
+    if replacements.is_empty() || !formula_needs_summary_param_subst(formula, replacements) {
+        return formula.clone();
+    }
+    substitute_summary_params_rec(formula.clone(), replacements)
+}
+
+/// Owned counterpart of [`substitute_summary_params`] that returns `formula` untouched
+/// when no substitution or capture-avoiding binder rename applies and transforms in place
+/// otherwise.
+pub(crate) fn substitute_summary_params_owned(
+    formula: Formula,
+    replacements: &[(String, Formula)],
+) -> Formula {
+    if replacements.is_empty() || !formula_needs_summary_param_subst(&formula, replacements) {
+        return formula;
+    }
+    substitute_summary_params_rec(formula, replacements)
+}
+
+fn substitute_summary_params_rec(
+    formula: Formula,
+    replacements: &[(String, Formula)],
+) -> Formula {
+    if replacements.is_empty() {
+        return formula;
+    }
     if let Some(name) = formula.var_name() {
         // Whole-name match: a scalar formal (`lo`, `self`) → its actual value.
         if let Some((_, replacement)) = replacements.iter().find(|(formal, _)| formal == name) {
@@ -675,30 +870,31 @@ pub(crate) fn substitute_summary_params(
             let sort = formula.var_sort().cloned().unwrap_or(Sort::Int);
             return rebind_projected_actual(replacement, suffix, sort, base);
         }
+        return formula;
     }
 
     match formula {
         Formula::Forall(bindings, body) => {
             // Capture-avoiding: rename any binder that would capture a free var of
             // a replacement value before substituting (soundness, round-7).
-            let (bindings, body) = capture_avoiding_rebind(bindings, body, replacements);
             let scoped_replacements = replacements_without_bound_vars(replacements, &bindings);
+            let (bindings, body) = capture_avoiding_rebind(bindings, *body, &scoped_replacements);
             Formula::Forall(
                 bindings,
-                Box::new(substitute_summary_params(&body, &scoped_replacements)),
+                Box::new(substitute_summary_params_rec(body, &scoped_replacements)),
             )
         }
         Formula::Exists(bindings, body) => {
-            let (bindings, body) = capture_avoiding_rebind(bindings, body, replacements);
             let scoped_replacements = replacements_without_bound_vars(replacements, &bindings);
+            let (bindings, body) = capture_avoiding_rebind(bindings, *body, &scoped_replacements);
             Formula::Exists(
                 bindings,
-                Box::new(substitute_summary_params(&body, &scoped_replacements)),
+                Box::new(substitute_summary_params_rec(body, &scoped_replacements)),
             )
         }
-        _ => formula
-            .clone()
-            .map_children(&mut |child| substitute_summary_params(&child, replacements)),
+        other => {
+            other.map_children(&mut |child| substitute_summary_params_rec(child, replacements))
+        }
     }
 }
 
@@ -706,12 +902,13 @@ pub(crate) fn substitute_summary_params(
 /// descends into nested binders, but over-collection only triggers extra,
 /// always-sound alpha-renaming.
 pub(super) fn collect_var_names(formula: &Formula, out: &mut FxHashSet<String>) {
-    if let Some(name) = formula.var_name() {
-        out.insert(name.to_string());
-    }
-    for child in formula.children() {
-        collect_var_names(child, out);
-    }
+    trust_types::visit_formula_nodes(formula, &mut |node| {
+        if let Some(name) = node.var_name()
+            && !out.contains(name)
+        {
+            out.insert(name.to_string());
+        }
+    });
 }
 
 /// Capture-avoiding alpha-renaming for a quantifier about to be substituted by
@@ -725,29 +922,35 @@ pub(super) fn collect_var_names(formula: &Formula, out: &mut FxHashSet<String>) 
 /// quantified precondition discharge (and a false assumption for a postcondition).
 /// Rename every colliding binder to a fresh, alpha-equivalent name first.
 pub(super) fn capture_avoiding_rebind(
-    bindings: &[(Symbol, Sort)],
-    body: &Formula,
-    replacements: &[(String, Formula)],
+    bindings: Vec<(Symbol, Sort)>,
+    body: Formula,
+    active: &[(String, Formula)],
 ) -> (Vec<(Symbol, Sort)>, Formula) {
     // Only replacements that actually apply in this scope can cause capture.
-    let active = replacements_without_bound_vars(replacements, bindings);
-    let mut danger: FxHashSet<String> = FxHashSet::default();
-    for (_, value) in &active {
-        collect_var_names(value, &mut danger);
+    let has_collision = active.iter().any(|(_, value)| {
+        trust_types::any_formula_node(value, &mut |n| {
+            n.var_name()
+                .is_some_and(|v| bindings.iter().any(|(s, _)| s.as_str() == v))
+        })
+    });
+    if !has_collision {
+        return (bindings, body);
     }
-    if !bindings.iter().any(|(s, _)| danger.contains(s.as_str())) {
-        return (bindings.to_vec(), body.clone());
+
+    let mut danger: FxHashSet<String> = FxHashSet::default();
+    for (_, value) in active {
+        collect_var_names(value, &mut danger);
     }
 
     // Names to avoid when minting fresh binder names.
     let mut used: FxHashSet<String> = danger.clone();
-    collect_var_names(body, &mut used);
-    for (s, _) in bindings {
+    collect_var_names(&body, &mut used);
+    for (s, _) in &bindings {
         used.insert(s.as_str().to_string());
     }
 
     let mut new_bindings: Vec<(Symbol, Sort)> = Vec::with_capacity(bindings.len());
-    let mut renamed_body = body.clone();
+    let mut renamed_body = body;
     for (sym, sort) in bindings {
         if danger.contains(sym.as_str()) {
             let mut fresh = format!("{}__cap", sym.as_str());
@@ -759,13 +962,13 @@ pub(super) fn capture_avoiding_rebind(
             used.insert(fresh.clone());
             // Alpha-rename this binder's occurrences in the body. The replacement
             // value is a single fresh var (no free vars of its own to capture).
-            renamed_body = substitute_summary_params(
-                &renamed_body,
+            renamed_body = substitute_summary_params_owned(
+                renamed_body,
                 &[(sym.as_str().to_string(), Formula::var(&fresh, sort.clone()))],
             );
-            new_bindings.push((Symbol::intern(&fresh), sort.clone()));
+            new_bindings.push((Symbol::intern(&fresh), sort));
         } else {
-            new_bindings.push((sym.clone(), sort.clone()));
+            new_bindings.push((sym, sort));
         }
     }
     (new_bindings, renamed_body)
@@ -842,11 +1045,65 @@ pub(crate) fn callee_postcondition_is_injectable(
     summary: &crate::modular::FunctionSummary,
     args: &[Operand],
 ) -> bool {
-    summary.has_reusable_postcondition_evidence()
-        && dest.projections.is_empty()
+    dest.projections.is_empty()
         && summary.param_names.len() == args.len()
+        && !summary.postconditions.is_empty()
+        && summary.has_reusable_postcondition_evidence()
+        && callee_postcondition_site_admits(func, dest, summary.param_names.len(), args)
+        && summary_may_inject_postcondition(summary)
+        && summary.inferred_entry_bindings().is_none_or(|binding| {
+            binding.matches_summary(summary) && binding.replacements(func, args, dest).is_some()
+        })
+}
+
+/// The CALL-SITE half of [`callee_postcondition_is_injectable`]: everything it
+/// asks that depends on this site rather than on the summary — a projection-free
+/// destination, the formal/actual arity match, a version-pinnable destination,
+/// and the time axis (no actual reads the destination's name). See that
+/// function's doc for why each conjunct is required.
+///
+/// Split out (2026-09-28) so the D5-A call-destination screen can ask, AT EACH
+/// CALL SITE, whether the injector really emitted a clause there — holding only
+/// the callee's arity, not its summary. A callee whose clauses the injector
+/// refused at this site leaves the destination free, however its summary reads.
+pub(crate) fn callee_postcondition_site_admits(
+    func: &VerifiableFunction,
+    dest: &Place,
+    formal_count: usize,
+    args: &[Operand],
+) -> bool {
+    dest.projections.is_empty()
+        && formal_count == args.len()
         && crate::local_defs::dest_fact_is_version_pinnable(func, dest.local)
-        && !terminator_args_read_name(func, args, &place_to_var_name(func, dest))
+        && (args.is_empty() || !terminator_args_read_name(func, args, &place_to_var_name(func, dest)))
+}
+
+fn summary_injected_param_names(
+    summary: &crate::modular::FunctionSummary,
+) -> Option<std::borrow::Cow<'_, [String]>> {
+    match summary.inferred_entry_bindings() {
+        Some(binding) => binding
+            .matches_summary(summary)
+            .then(|| std::borrow::Cow::Owned(binding.names())),
+        None => Some(std::borrow::Cow::Borrowed(summary.param_names.as_slice())),
+    }
+}
+
+/// The call-site-INDEPENDENT half of [`callee_postcondition_is_injectable`]:
+/// whether `summary` carries any postcondition the injector could ever rebind
+/// into a caller. A `false` here means no call to this callee has a fact
+/// injected about its destination, whatever the site.
+///
+/// Split out so the D5-A call-destination screen
+/// ([`crate::SummaryDatabase::postcondition_injecting_names`]) asks EXACTLY the
+/// question the injector asks (ADMIT ≡ EMIT). A summary merely being present in
+/// the DB — measured 2026-09-24: every same-crate callee of an L1 body has an
+/// entry, most with no reusable postcondition — says nothing about the
+/// destination, and treating presence as "pinned" left the false refutation
+/// D5-A exists to hold standing.
+pub(crate) fn summary_may_inject_postcondition(summary: &crate::modular::FunctionSummary) -> bool {
+    !summary.postconditions.is_empty()
+        && summary.has_reusable_postcondition_evidence()
         // Trust (postcondition composition, slice 2): a PRECONDITIONED summary
         // is injectable only when its clauses can ride under their own guard —
         // `summary_postconditions_ride_with_their_guard` is the shared ADMIT/EMIT
@@ -859,20 +1116,130 @@ pub(crate) fn callee_postcondition_is_injectable(
             || summary_postconditions_ride_with_their_guard(summary))
         // At least one postcondition must be fully rebindable, else nothing is
         // injected (and `assumptions_injected` would over-count).
-        //
-        // The machine-arithmetic filter has ONE structural exemption: the exact
-        // single-`Ite` modular-reduction shape, whose mathematical-Int reading
-        // IS fixed-width evaluation (the Clean-origin `WrappingBinOp` summary;
-        // see `formula_is_exact_modular_wrapping_definition` for the soundness
-        // argument and what the recognizer does and does not guarantee).
-        && summary
-            .postconditions
-            .iter()
-            .any(|p| {
-                (!contracts::formula_uses_unmodeled_machine_arithmetic(p)
-                    || contracts::formula_is_exact_modular_wrapping_definition(p))
-                    && postcondition_rebindable(p, &summary.param_names)
+        && summary_injected_param_names(summary).is_some_and(|param_names| {
+            summary
+                .postconditions
+                .iter()
+                .any(|p| postcondition_clause_is_injected(p, &param_names))
+        })
+}
+
+/// Only a sealed body-derived clause may name its exact typed entry channels.
+/// The ordinary/authored free-variable predicate remains unchanged.
+#[cfg(test)]
+fn summary_postcondition_clause_is_injected(
+    post: &Formula,
+    summary: &crate::modular::FunctionSummary,
+) -> bool {
+    summary_injected_param_names(summary)
+        .is_some_and(|param_names| postcondition_clause_is_injected(post, &param_names))
+}
+
+/// Whether the injector emits `post` at all: the per-CLAUSE filter
+/// [`rebind_callee_postconditions`] applies, shared with
+/// [`summary_may_inject_postcondition`] and [`summary_pins_result`] so the
+/// three cannot drift (ADMIT ≡ EMIT).
+///
+/// The machine-arithmetic filter has ONE structural exemption: the exact
+/// single-`Ite` modular-reduction shape, whose mathematical-Int reading IS
+/// fixed-width evaluation (the Clean-origin `WrappingBinOp` summary; see
+/// `formula_is_exact_modular_wrapping_definition` for the soundness argument
+/// and what the recognizer does and does not guarantee). A clause with a
+/// non-rebindable free variable is dropped — see [`postcondition_rebindable`].
+pub(crate) fn postcondition_clause_is_injected(post: &Formula, param_names: &[String]) -> bool {
+    // Trust (2026-09-28, local; folded into the one predicate on merge 2026-10-14):
+    // division/remainder by a positive literal is exempt too, whose Int readings ARE
+    // the fixed-width evaluation (see `formula_is_exact_modular_wrapping_definition`).
+    (!contracts::formula_uses_unmodeled_machine_arithmetic(post)
+        || contracts::formula_is_exact_modular_wrapping_definition(post)
+        || contracts::formula_is_exact_division_by_positive_literal(post))
+        && postcondition_rebindable(post, param_names)
+}
+
+/// Trust (2026-09-28): whether `summary`'s injected postcondition PINS a call's
+/// destination — DETERMINES the value — rather than merely constraining it.
+/// This, not [`summary_may_inject_postcondition`], is the question the D5-A
+/// call-destination screen (`refutation_scope`) asks before it lets a solver
+/// model over the destination stand as a counterexample.
+///
+/// # Why "injected" is not "pinned"
+///
+/// A SAT model is an EXECUTION only if every value it picks is one the program
+/// can produce. For a call result that holds exactly when the injected clause
+/// fixes it as a function of the actuals. Two ways it does not; the first is
+/// MEASURED on `p_falsefail` (2026-09-28: `dead_else` FAILED on stage 1,
+/// `dead_else_s` FAILED on stage 1 and on the pack), the second follows from the
+/// injected shape:
+///
+/// ```text
+/// pub fn smax(a: u64, b: u64) -> u64 requires b <= a ensures result <= a { .. }
+/// pub fn dead_else_s(a: u64) -> u64 {
+///     if a > 3 { let r = smax(a, 3); if r == a { 0 } else { 3 - r } } else { 0 }
+/// }
+/// ```
+///
+/// * A BOUND. `result <= a` leaves every value up to `a` open: ay answered
+///   `a = 5, r = 4, r == a false` and reported `3 - r` overflowing. The model
+///   satisfies the contract; `smax(5, 3)` returns 5 and the else arm is dead.
+///   Note that the guard `3 <= a` HELD in that model — proving the guard at the
+///   site would not have saved it.
+/// * A GUARD. A clause injected as `pre(actuals) -> post` binds nothing in a
+///   model where `pre` is false, even when `post` is `result == E`. Whether the
+///   site's path entails `pre` is a solver question this negative-only screen
+///   cannot ask (it runs on the query alone, before and without the call's
+///   `Precondition` verdict), so a guarded summary never pins.
+///
+/// So a summary pins exactly when it injects (the ADMIT predicate), carries NO
+/// precondition — which also excludes the pre-slice-2 unguarded preconditioned
+/// shape, whose clause holds only where the unchecked `requires` did — and one
+/// of the clauses the injector emits has a top-level conjunct `_0 == E` (either
+/// orientation) with `E` free of `_0`: a D5-B body-inferred return, a
+/// Clean-origin definitional equation, an authored `ensures result == ..` on a
+/// callee without `requires`.
+///
+/// # The cost, and why it is the least lossy sound rule here
+///
+/// A refutation whose query reads a bounded or guarded callee's result is
+/// WITHHELD (a held `Unknown`, fail-closed, no runtime-check tolerance) instead
+/// of reported `Failed`. The build outcome is the same under strict policy; what
+/// changes is that Trust no longer calls a contract-level model a bug. The
+/// refute-only assert lane already refuses the SAT direction for the same reason
+/// (`assert_refutation`'s "exactly one `dest == rhs`" determination rule).
+pub(crate) fn summary_pins_result(summary: &crate::modular::FunctionSummary) -> bool {
+    !summary.postconditions.is_empty()
+        && summary.preconditions.is_empty()
+        && summary.has_reusable_postcondition_evidence()
+        && summary_injected_param_names(summary).is_some_and(|param_names| {
+            summary.postconditions.iter().any(|p| {
+                postcondition_determines_result(p)
+                    && postcondition_clause_is_injected(p, &param_names)
             })
+        })
+}
+
+/// Whether `post` has a top-level conjunct `_0 == E` or `E == _0` with `E` free
+/// of the result symbol `_0` — i.e. whether assuming it fixes the result as a
+/// function of the formals. Nested under anything but `And` (an `Or`, an `Ite`,
+/// an implication) it fixes nothing unconditionally, so only the conjunctive
+/// spine is searched.
+pub(crate) fn postcondition_determines_result(post: &Formula) -> bool {
+    fn is_result(f: &Formula) -> bool {
+        match f {
+            Formula::Var(name, _) => name == "_0",
+            Formula::SymVar(symbol, _) => symbol.as_str() == "_0",
+            _ => false,
+        }
+    }
+    fn mentions_result(f: &Formula) -> bool {
+        trust_types::any_free_variable_name(f, &mut |v| v == "_0")
+    }
+    match post {
+        Formula::And(conjuncts) => conjuncts.iter().any(postcondition_determines_result),
+        Formula::Eq(lhs, rhs) => {
+            (is_result(lhs) && !mentions_result(rhs)) || (is_result(rhs) && !mentions_result(lhs))
+        }
+        _ => false,
+    }
 }
 
 /// True iff every FREE variable of `post` can be rebound at a call site — it is
@@ -893,7 +1260,9 @@ pub(crate) fn callee_postcondition_is_injectable(
 /// `free_variables` covers every symbol channel (`Var`, `SymVar`) and excludes
 /// quantifier-bound names, so the guard stays sound while no longer over-rejecting.
 pub(super) fn postcondition_rebindable(post: &Formula, param_names: &[String]) -> bool {
-    post.free_variables().iter().all(|v| v == "_0" || param_names.iter().any(|p| p == v))
+    trust_types::all_free_variable_names(post, &mut |v| {
+        v == "_0" || param_names.iter().any(|p| p == v)
+    })
 }
 
 /// True iff every FREE variable of `pre` is one of the callee's FORMALS.
@@ -906,7 +1275,7 @@ pub(super) fn postcondition_rebindable(post: &Formula, param_names: &[String]) -
 /// discharged by facts about the post-state and release the postcondition on a
 /// call that was never in contract.
 pub(super) fn precondition_rebindable(pre: &Formula, param_names: &[String]) -> bool {
-    pre.free_variables().iter().all(|v| param_names.iter().any(|p| p == v))
+    trust_types::all_free_variable_names(pre, &mut |v| param_names.iter().any(|p| p == v))
 }
 
 /// Trust (postcondition composition, slice 2): whether `summary`'s
@@ -963,12 +1332,47 @@ pub(crate) fn rebind_callee_postconditions(
     dest: &Place,
     summary: &crate::modular::FunctionSummary,
 ) -> Vec<Formula> {
-    let mut replacements: Vec<(String, Formula)> = summary
-        .param_names
+    if summary.postconditions.is_empty() {
+        return Vec::new();
+    }
+    let Some(injected_param_names) = summary_injected_param_names(summary) else {
+        return Vec::new();
+    };
+    let injected_posts: Vec<&Formula> = summary
+        .postconditions
         .iter()
-        .zip(args.iter())
-        .map(|(formal, actual)| (formal.clone(), operand_to_formula(func, actual)))
+        .filter(|post| postcondition_clause_is_injected(post, &injected_param_names))
         .collect();
+    if injected_posts.is_empty() {
+        return Vec::new();
+    }
+    let needs_guard =
+        !summary.preconditions.is_empty() && summary.postconditions_guarded_by_own_preconditions();
+    if needs_guard
+        && (!summary_postconditions_ride_with_their_guard(summary)
+            || summary.param_names.len() != args.len())
+    {
+        return Vec::new();
+    }
+    let ordinary_replacements = || {
+        let mut out = Vec::with_capacity(summary.param_names.len().min(args.len()) + 1);
+        for (formal, actual) in summary.param_names.iter().zip(args.iter()) {
+            out.push((formal.clone(), operand_to_formula(func, actual)));
+        }
+        out
+    };
+    let mut replacements = match summary.inferred_entry_bindings() {
+        Some(binding) => {
+            if !binding.matches_summary(summary) {
+                return Vec::new();
+            }
+            let Some(replacements) = binding.replacements(func, args, dest) else {
+                return Vec::new();
+            };
+            replacements
+        }
+        None => ordinary_replacements(),
+    };
     // Map the callee return symbol `_0` to the caller's destination place.
     let dest_name = place_to_var_name(func, dest);
     let dest_sort = crate::place_sort(func, dest).unwrap_or(Sort::Int);
@@ -985,7 +1389,7 @@ pub(crate) fn rebind_callee_postconditions(
     // antecedent check below does.
     if replacements
         .iter()
-        .any(|(_, actual)| actual.free_variables().iter().any(|v| *v == dest_name))
+        .any(|(_, actual)| trust_types::any_free_variable_name(actual, &mut |v| v == dest_name))
     {
         return Vec::new();
     }
@@ -1011,23 +1415,19 @@ pub(crate) fn rebind_callee_postconditions(
     // `Vec::new()`, never a partially-guarded clause. A summary with no
     // preconditions, or a preconditioned one without the guard bit, is
     // untouched and rides the pre-existing path.
-    let guard: Option<Formula> = if summary.preconditions.is_empty()
-        || !summary.postconditions_guarded_by_own_preconditions()
-    {
+    let mut guard: Option<Formula> = if !needs_guard {
         None
     } else {
-        if !summary_postconditions_ride_with_their_guard(summary)
-            || summary.param_names.len() != args.len()
-        {
-            return Vec::new();
-        }
-        let mut conjuncts: Vec<Formula> = summary
-            .preconditions
-            .iter()
-            .map(|pre| substitute_summary_params(pre, &replacements))
-            .collect();
-        let antecedent =
-            if conjuncts.len() == 1 { conjuncts.remove(0) } else { Formula::And(conjuncts) };
+        let antecedent = if let [pre] = summary.preconditions.as_slice() {
+            substitute_summary_params(pre, &replacements)
+        } else {
+            let conjuncts: Vec<Formula> = summary
+                .preconditions
+                .iter()
+                .map(|pre| substitute_summary_params(pre, &replacements))
+                .collect();
+            Formula::And(conjuncts)
+        };
         // The whole implication is about to be handed to
         // `version_terminator_dest_fact`, which forces EVERY occurrence of the
         // dest's base name to the POST-call token `s{b}_t`. In the consequent
@@ -1045,49 +1445,77 @@ pub(crate) fn rebind_callee_postconditions(
         // discipline as every other superseded deny-list in this tree: it is the
         // check that NAMED the hazard, and the one a future widening of
         // `precondition_rebindable` would need.
-        if antecedent.free_variables().iter().any(|v| *v == dest_name) {
+        if trust_types::any_free_variable_name(&antecedent, &mut |v| v == dest_name) {
             return Vec::new();
         }
         Some(antecedent)
     };
 
-    replacements.push(("_0".to_string(), Formula::var(&dest_name, dest_sort)));
+    replacements.push(("_0".to_string(), Formula::var_owned(dest_name, dest_sort)));
 
-    summary
-        .postconditions
-        .iter()
-        // A proof produced for mathematical-Int arithmetic is not authority for
-        // a fixed-width Rust postcondition at the call site. Exemption: the
-        // exact modular-reduction shape, whose Int reading IS the fixed-width
-        // evaluation — kept in lockstep with the gate in
-        // `callee_postcondition_is_injectable` (see
-        // `formula_is_exact_modular_wrapping_definition`).
-        .filter(|post| {
-            !contracts::formula_uses_unmodeled_machine_arithmetic(post)
-                || contracts::formula_is_exact_modular_wrapping_definition(post)
-        })
-        // Drop any clause with a non-rebindable free var BEFORE substitution — see
-        // `postcondition_rebindable`. Without this filter a stray callee symbol
-        // captures a same-named caller local and can false-PROVE.
-        .filter(|post| postcondition_rebindable(post, &summary.param_names))
-        .map(|post| substitute_summary_params(post, &replacements))
-        // Slice 2: the clause leaves as the implication the callee proved.
-        .map(|post| match &guard {
-            Some(antecedent) => {
-                Formula::Implies(Box::new(antecedent.clone()), Box::new(post))
+    let last_idx = injected_posts.len() - 1;
+    // A proof produced for mathematical-Int arithmetic is not authority for
+    // a fixed-width Rust postcondition at the call site (exemption: the exact
+    // modular-reduction shape), and a clause with a non-rebindable free var
+    // is dropped BEFORE substitution — without that a stray callee symbol
+    // captures a same-named caller local and can false-PROVE. ONE predicate,
+    // shared with the ADMIT side (`summary_may_inject_postcondition`) and the
+    // D5-A pin test (`summary_pins_result`), so the three cannot drift.
+    injected_posts
+        .into_iter()
+        .enumerate()
+        .map(|(idx, post)| {
+            let post = substitute_summary_params(post, &replacements);
+            // Slice 2: the clause leaves as the implication the callee proved.
+            match if idx == last_idx { guard.take() } else { guard.clone() } {
+                Some(antecedent) => Formula::Implies(Box::new(antecedent), Box::new(post)),
+                None => post,
             }
-            None => post,
         })
         .collect()
 }
 
-pub(super) fn replacements_without_bound_vars(
-    replacements: &[(String, Formula)],
+pub(super) fn replacements_without_bound_vars<'a>(
+    replacements: &'a [(String, Formula)],
     bindings: &[(Symbol, Sort)],
-) -> Vec<(String, Formula)> {
-    replacements
+) -> std::borrow::Cow<'a, [(String, Formula)]> {
+    if !replacements
         .iter()
-        .filter(|(formal, _)| !bindings.iter().any(|(bound, _)| bound.as_str() == formal))
-        .cloned()
-        .collect()
+        .any(|(formal, _)| bindings.iter().any(|(bound, _)| bound.as_str() == formal))
+    {
+        return std::borrow::Cow::Borrowed(replacements);
+    }
+    std::borrow::Cow::Owned(
+        replacements
+            .iter()
+            .filter(|(formal, _)| !bindings.iter().any(|(bound, _)| bound.as_str() == formal))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// [`generate_callsite_precondition_vcs`] into the caller's context `rows` (T3 C07p, design
+/// D-VC-1): every row is interned through the row oracle and the rows are returned as
+/// generated.
+pub fn generate_callsite_precondition_vcs_rows(
+    func: &VerifiableFunction,
+    summaries: &crate::modular::SummaryDatabase,
+    rows: &mut trust_types::vc_context::VcContext,
+) -> Vec<VerificationCondition> {
+    let vcs = generate_callsite_precondition_vcs(func, summaries);
+    intern_eager_rows(rows, &vcs);
+    vcs
+}
+
+/// [`generate_callsite_precondition_vcs_attributed`] into the caller's context `rows` (T3
+/// C07p): each attributed row's VC is interned through the row oracle, and the attributed
+/// rows are returned as generated.
+pub fn generate_callsite_precondition_vcs_attributed_rows(
+    func: &VerifiableFunction,
+    summaries: &crate::modular::SummaryDatabase,
+    rows: &mut trust_types::vc_context::VcContext,
+) -> Vec<(VerificationCondition, Formula, Vec<Formula>)> {
+    let attributed = generate_callsite_precondition_vcs_attributed(func, summaries);
+    intern_eager_rows(rows, attributed.iter().map(|(vc, _, _)| vc));
+    attributed
 }

@@ -1,0 +1,311 @@
+{
+  "name": "f",
+  "def_path": "fold_map_ctl_filter::f",
+  "span": {
+    "file": "fold_map_ctl_filter.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 3,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "core::iter::adapters::filter::Filter",
+            "fields": [
+              [
+                "iter",
+                {
+                  "Adt": {
+                    "name": "core::ops::range::Range",
+                    "fields": [
+                      [
+                        "start",
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      ],
+                      [
+                        "end",
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "predicate",
+                {
+                  "Closure": {
+                    "name": "fold_map_ctl_filter::f::{closure#0}",
+                    "upvars": [],
+                    "call": {
+                      "kind": "FnMut",
+                      "params": [
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      "ret": "Bool"
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<u32>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          32
+                        ]
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "Uint": [
+                          4,
+                          32
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "fold_map_ctl_filter.rs",
+                "line_start": 2,
+                "col_start": 4,
+                "line_end": 2,
+                "col_end": 13
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<u32> as core::iter::traits::iterator::Iterator>::filter::<{closure@fold_map_ctl_filter.rs:2:22: 2:25}>",
+            "args": [
+              {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "CallableItem": {
+                    "def_path": "fold_map_ctl_filter::f::{closure#0}",
+                    "kind": "closure",
+                    "def_path_hash": {
+                      "stable_crate_id": "1f4e820c0314456b",
+                      "local_hash": "cdeeada8a0d720cc"
+                    }
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "fold_map_ctl_filter.rs",
+              "line_start": 2,
+              "col_start": 4,
+              "line_end": 2,
+              "col_end": 32
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4703791156326232143,
+              "def_index": 10569,
+              "substs_digest": [
+                8877335783453630218,
+                11112664149795821247
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4703791156326232143,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<core::iter::adapters::filter::Filter<core::ops::range::Range<u32>, {closure@fold_map_ctl_filter.rs:2:22: 2:25}> as core::iter::traits::iterator::Iterator>::sum::<u32>",
+            "args": [
+              {
+                "Move": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "fold_map_ctl_filter.rs",
+              "line_start": 2,
+              "col_start": 4,
+              "line_end": 2,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4703791156326232143,
+              "def_index": 10767,
+              "substs_digest": [
+                7567824322812349721,
+                10839945628801145215
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4703791156326232143,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

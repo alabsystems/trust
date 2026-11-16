@@ -61,6 +61,7 @@ fn wrapping_caller(callee: &str, args: Vec<Operand>) -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                         is_foreign: false,
                     },
                 },
@@ -74,6 +75,7 @@ fn wrapping_caller(callee: &str, args: Vec<Operand>) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -289,4 +291,79 @@ fn recognizer_rejects_near_miss_shapes() {
             big(),
         )),
     )));
+}
+
+/// CHARACTERIZATION of a real gap, not an endorsement of it.
+///
+/// `formula_is_exact_modular_wrapping_definition` takes ONE parameter — a `&Formula`.
+/// It has no `func`, no width and no signedness, so the property the exemption asserts
+/// ("this Int formula's reading IS the fixed-width evaluation") is not a property of the
+/// formula alone and the recognizer cannot decide it. Its own doc concedes the width
+/// half; it is silent on sign, and that half is the sharper one.
+///
+/// This test PINS the gap in both directions, so that a future reader who is tempted to
+/// reuse the recognizer somewhere new sees immediately what it does and does not answer:
+///
+///   * the unsigned single-`Ite` form is ACCEPTED even when the declared domain is
+///     SIGNED at the very same width. It is wrong there: the unsigned reduction lands in
+///     `[0, 2^w)` while a signed band is `[-2^(w-1), 2^(w-1))`. Concretely for `i8`,
+///     `100i8.wrapping_add(100) == -56`, while this clause reads `200`.
+///   * `machine_faithful_clause_admissible` — which DOES take `func`, resolves
+///     `(width, signed)` from the declared local types, and is constructor-verified
+///     against the shared `wrapping_binop_modular_ite` at that resolved domain — answers
+///     correctly on the same input.
+///
+/// The recognizer is therefore admissible ONLY behind a producer gate that establishes
+/// unsignedness and width externally, as `trust_verify.rs`'s Clean-origin
+/// `WrappingBinOp` arm does (unsigned only, width in {8,16,32,64}, uniform across the
+/// signature, literals in band). It is a shape assertion that one producer's gate happens
+/// to make true — not a check.
+#[test]
+fn the_modular_recognizer_is_sign_blind_and_the_func_aware_predicate_is_not() {
+    use crate::contracts::{
+        formula_is_exact_modular_wrapping_definition as shape_only,
+        machine_faithful_clause_admissible,
+    };
+
+    // A function whose declared domain is SIGNED i8, with the clause written in the
+    // unsigned single-`Ite` form at the matching width 2^8.
+    let mut func = wrapping_caller("core::num::<impl i8>::wrapping_add", vec![]);
+    func.body.locals = vec![
+        LocalDecl { index: 0, ty: Ty::Int { width: 8, signed: true }, name: Some("_0".into()) },
+        LocalDecl { index: 1, ty: Ty::Int { width: 8, signed: true }, name: Some("a".into()) },
+        LocalDecl { index: 2, ty: Ty::Int { width: 8, signed: true }, name: Some("b".into()) },
+    ];
+    func.body.arg_count = 2;
+    func.body.return_ty = Ty::Int { width: 8, signed: true };
+
+    let s = || {
+        Box::new(Formula::Add(
+            Box::new(Formula::var("a", Sort::Int)),
+            Box::new(Formula::var("b", Sort::Int)),
+        ))
+    };
+    let m = || Box::new(Formula::Int(1i128 << 8));
+    let clause = Formula::Eq(
+        Box::new(Formula::var("_0", Sort::Int)),
+        Box::new(Formula::Ite(
+            Box::new(Formula::Ge(s(), m())),
+            Box::new(Formula::Sub(s(), m())),
+            s(),
+        )),
+    );
+
+    // THE GAP. The shape-only recognizer says yes on a SIGNED domain, where the clause
+    // is false: at a = b = 100 it reads 200, and `100i8.wrapping_add(100)` is -56.
+    assert!(
+        shape_only(&clause),
+        "characterization: the shape-only recognizer is sign-blind and accepts this. If \
+         this assertion ever fails the recognizer has been strengthened — delete this \
+         test and the doc sentence it pins, do not weaken it."
+    );
+
+    // THE PREDICATE THAT DOES NOT HAVE THE GAP: it resolves the domain from `func`.
+    assert!(
+        !machine_faithful_clause_admissible(&func, &clause),
+        "the func-aware predicate must refuse the unsigned form on a signed domain"
+    );
 }

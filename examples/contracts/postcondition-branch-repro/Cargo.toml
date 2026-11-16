@@ -7,4 +7,3 @@ publish = false
 [workspace]
 
 [trust]
-timeout_ms = 5000

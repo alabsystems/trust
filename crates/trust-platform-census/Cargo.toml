@@ -1,0 +1,40 @@
+# trust-platform-census: design 2026-10-01 Part 2 (PR 7, "C0").
+#
+# A trust-ir crate module (what the THIR -> trust-ir producer publishes) plus
+# the identity facts a host supplies through `CensusContext` -> one
+# trust-platform-derive `EventProgram` per root, and a site census in which
+# every construct the census does not translate is a NAMED refusal (`PC-*`,
+# design §2.8 and the Critique's P0 codes), never a silent omission.
+#
+# rustc-free on purpose (design §1): tested on trust-ir TEXT from real stage1
+# dumps, parsed by trust-ir's own parser; every compiler fact (identity,
+# closures, HIR effects, typeck drop facts) enters through one trait.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-platform-census"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# No `parser` feature: the library reads a `trust_ir::Module` value and never text. The
+# compiler links this crate (plan L1a), and the lib building without the feature is what
+# proves the compiler does not need to link trust-ir's text parser.
+trust-ir = { workspace = true }
+trust-platform = { workspace = true }
+trust-platform-derive = { workspace = true }
+
+[dev-dependencies]
+# The tests (and `shape.rs`'s `#[cfg(test)]` unit test) parse real stage1 dumps.
+trust-ir = { workspace = true, features = ["parser"] }
+trust-router = { workspace = true }
+trust-types = { workspace = true }
+trust-verifier-api = { workspace = true }
+serde_json = { workspace = true }

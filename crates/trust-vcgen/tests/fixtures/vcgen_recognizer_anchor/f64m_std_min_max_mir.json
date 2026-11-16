@@ -1,0 +1,289 @@
+{
+ "name": "std_min_max",
+ "def_path": "f64m::std_min_max",
+ "span": {
+  "file": "f64m.rs",
+  "line_start": 64,
+  "col_start": 0,
+  "line_end": 66,
+  "col_end": 1
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Float": {
+      "width": 64
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Float": {
+      "width": 64
+     }
+    },
+    "name": "x"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Float": {
+      "width": 64
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 3,
+    "ty": {
+     "Float": {
+      "width": 64
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 4,
+    "ty": {
+     "Float": {
+      "width": 64
+     }
+    },
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "core::f64::<impl f64>::clamp",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       },
+       {
+        "Constant": {
+         "FloatBits": {
+          "bits": 13830554455654793216,
+          "width": 64
+         }
+        }
+       },
+       {
+        "Constant": {
+         "FloatBits": {
+          "bits": 4607182418800017408,
+          "width": 64
+         }
+        }
+       }
+      ],
+      "dest": {
+       "local": 2,
+       "projections": []
+      },
+      "target": 1,
+      "span": {
+       "file": "f64m.rs",
+       "line_start": 65,
+       "col_start": 6,
+       "line_end": 65,
+       "col_end": 6
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 4703791156326232143,
+       "def_index": 724,
+       "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 4703791156326232143,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "core::f64::<impl f64>::min",
+      "args": [
+       {
+        "Copy": {
+         "local": 2,
+         "projections": []
+        }
+       },
+       {
+        "Constant": {
+         "FloatBits": {
+          "bits": 4602678819172646912,
+          "width": 64
+         }
+        }
+       }
+      ],
+      "dest": {
+       "local": 3,
+       "projections": []
+      },
+      "target": 2,
+      "span": {
+       "file": "f64m.rs",
+       "line_start": 65,
+       "col_start": 23,
+       "line_end": 65,
+       "col_end": 23
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 4703791156326232143,
+       "def_index": 702,
+       "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 4703791156326232143,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 2,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "core::f64::<impl f64>::max",
+      "args": [
+       {
+        "Copy": {
+         "local": 3,
+         "projections": []
+        }
+       },
+       {
+        "Constant": {
+         "FloatBits": {
+          "bits": 13826050856027422720,
+          "width": 64
+         }
+        }
+       }
+      ],
+      "dest": {
+       "local": 4,
+       "projections": []
+      },
+      "target": 3,
+      "span": {
+       "file": "f64m.rs",
+       "line_start": 65,
+       "col_start": 32,
+       "line_end": 65,
+       "col_end": 32
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 4703791156326232143,
+       "def_index": 701,
+       "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 4703791156326232143,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 3,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 0,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Mul",
+         {
+          "Copy": {
+           "local": 4,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "FloatBits": {
+            "bits": 4616189618054758400,
+            "width": 64
+           }
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "f64m.rs",
+        "line_start": 65,
+        "col_start": 4,
+        "line_end": 65,
+        "col_end": 4
+       }
+      }
+     }
+    ],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 1,
+  "return_ty": {
+   "Float": {
+    "width": 64
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

@@ -19,6 +19,7 @@ use trust_types::{Terminator, VerifiableFunction};
 #[must_use]
 pub fn build_call_graph(functions: &[VerifiableFunction]) -> CallGraph {
     let mut graph = CallGraph::new();
+    graph.nodes.reserve(functions.len());
 
     // Add nodes for all functions
     for (i, func) in functions.iter().enumerate() {
@@ -91,26 +92,27 @@ fn fn_trait_closure_callee(
     body: &trust_types::VerifiableBody,
 ) -> Option<String> {
     use trust_types::{Operand, Ty};
-    let is_fn_trait = callee_name.contains("call_once")
-        || callee_name.contains("call_mut")
-        || (callee_name.contains(" as ")
-            && callee_name.contains("Fn")
-            && callee_name.ends_with("::call"));
-    if !is_fn_trait {
+    if !callee_name.contains("call") {
         return None;
     }
     let (Operand::Move(p) | Operand::Copy(p)) = args.first()? else { return None };
     if !p.projections.is_empty() {
         return None;
     }
-    match &body.locals.get(p.local)?.ty {
-        Ty::Closure { name, .. } => Some(name.clone()),
+    let closure_name = match &body.locals.get(p.local)?.ty {
+        Ty::Closure { name, .. } => name,
         Ty::Ref { inner, .. } => match &**inner {
-            Ty::Closure { name, .. } => Some(name.clone()),
-            _ => None,
+            Ty::Closure { name, .. } => name,
+            _ => return None,
         },
-        _ => None,
-    }
+        _ => return None,
+    };
+    let is_fn_trait = callee_name.contains("call_once")
+        || callee_name.contains("call_mut")
+        || (callee_name.ends_with("::call")
+            && callee_name.contains(" as ")
+            && callee_name.contains("Fn"));
+    is_fn_trait.then(|| closure_name.clone())
 }
 
 /// A strongly connected component (set of mutually recursive functions).
@@ -137,14 +139,29 @@ impl Scc {
 /// detected by checking if their def_path appears in their own call edges.
 #[must_use]
 pub fn detect_cycles(graph: &CallGraph) -> Vec<Scc> {
-    let nodes: Vec<&str> = graph.nodes.iter().map(|n| n.def_path.as_str()).collect();
-    let node_set: FxHashSet<&str> = nodes.iter().copied().collect();
-
-    // Build adjacency list
-    let mut adj: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
-    for node in &nodes {
-        adj.entry(node).or_default();
+    let n_nodes = graph.nodes.len();
+    if n_nodes == 0 {
+        return Vec::new();
     }
+    let mut sorted_nodes: Vec<&str> = Vec::with_capacity(n_nodes);
+    if graph.edges.is_empty() {
+        for n in &graph.nodes {
+            sorted_nodes.push(n.def_path.as_str());
+        }
+        sorted_nodes.sort_unstable();
+        return sorted_nodes.into_iter().map(|s| Scc { members: vec![s.to_string()] }).collect();
+    }
+    let mut node_set: FxHashSet<&str> =
+        FxHashSet::with_capacity_and_hasher(n_nodes, Default::default());
+    for n in &graph.nodes {
+        let s = n.def_path.as_str();
+        sorted_nodes.push(s);
+        node_set.insert(s);
+    }
+
+    // Build adjacency list (only for callers with in-graph outgoing edges)
+    let mut adj: FxHashMap<&str, Vec<&str>> =
+        FxHashMap::with_capacity_and_hasher(n_nodes, Default::default());
     for edge in &graph.edges {
         if node_set.contains(edge.callee.as_str()) {
             adj.entry(edge.caller.as_str()).or_default().push(&edge.callee);
@@ -153,11 +170,14 @@ pub fn detect_cycles(graph: &CallGraph) -> Vec<Scc> {
 
     // Tarjan's SCC algorithm
     let mut index_counter: usize = 0;
-    let mut stack: Vec<&str> = Vec::new();
-    let mut on_stack: FxHashSet<&str> = FxHashSet::default();
-    let mut indices: FxHashMap<&str, usize> = FxHashMap::default();
-    let mut lowlinks: FxHashMap<&str, usize> = FxHashMap::default();
-    let mut sccs: Vec<Scc> = Vec::new();
+    let mut stack: Vec<&str> = Vec::with_capacity(n_nodes);
+    let mut on_stack: FxHashSet<&str> =
+        FxHashSet::with_capacity_and_hasher(n_nodes, Default::default());
+    let mut indices: FxHashMap<&str, usize> =
+        FxHashMap::with_capacity_and_hasher(n_nodes, Default::default());
+    let mut lowlinks: FxHashMap<&str, usize> =
+        FxHashMap::with_capacity_and_hasher(n_nodes, Default::default());
+    let mut sccs: Vec<Scc> = Vec::with_capacity(n_nodes);
 
     #[allow(clippy::too_many_arguments)]
     fn strongconnect<'a>(
@@ -170,28 +190,32 @@ pub fn detect_cycles(graph: &CallGraph) -> Vec<Scc> {
         lowlinks: &mut FxHashMap<&'a str, usize>,
         sccs: &mut Vec<Scc>,
     ) {
-        indices.insert(v, *index_counter);
-        lowlinks.insert(v, *index_counter);
+        let v_idx = *index_counter;
+        indices.insert(v, v_idx);
+        lowlinks.insert(v, v_idx);
         *index_counter += 1;
         stack.push(v);
         on_stack.insert(v);
 
         if let Some(successors) = adj.get(v) {
             for &w in successors {
-                if !indices.contains_key(w) {
+                if let Some(&w_idx) = indices.get(w) {
+                    if on_stack.contains(w)
+                        && let Some(v_low) = lowlinks.get_mut(v)
+                    {
+                        *v_low = (*v_low).min(w_idx);
+                    }
+                } else {
                     strongconnect(w, adj, index_counter, stack, on_stack, indices, lowlinks, sccs);
                     let w_low = lowlinks[w];
-                    let v_low = lowlinks[v];
-                    lowlinks.insert(v, v_low.min(w_low));
-                } else if on_stack.contains(w) {
-                    let w_idx = indices[w];
-                    let v_low = lowlinks[v];
-                    lowlinks.insert(v, v_low.min(w_idx));
+                    if let Some(v_low) = lowlinks.get_mut(v) {
+                        *v_low = (*v_low).min(w_low);
+                    }
                 }
             }
         }
 
-        if lowlinks[v] == indices[v] {
+        if lowlinks[v] == v_idx {
             let mut scc_members = Vec::new();
             while let Some(w) = stack.pop() {
                 on_stack.remove(w);
@@ -200,14 +224,15 @@ pub fn detect_cycles(graph: &CallGraph) -> Vec<Scc> {
                     break;
                 }
             }
-            scc_members.sort(); // deterministic order
+            if scc_members.len() > 1 {
+                scc_members.sort_unstable(); // deterministic order
+            }
             sccs.push(Scc { members: scc_members });
         }
     }
 
     // Sort nodes for deterministic output
-    let mut sorted_nodes = nodes.clone();
-    sorted_nodes.sort();
+    sorted_nodes.sort_unstable();
 
     for &node in &sorted_nodes {
         if !indices.contains_key(node) {
@@ -236,21 +261,38 @@ pub fn is_self_recursive(graph: &CallGraph, def_path: &str) -> bool {
 /// Return the set of functions involved in any cycle (recursive functions).
 #[must_use]
 pub fn recursive_functions(graph: &CallGraph) -> FxHashSet<String> {
+    if graph.edges.is_empty() || graph.nodes.is_empty() {
+        return FxHashSet::default();
+    }
+    if graph.nodes.len() == 1 {
+        let mut result = FxHashSet::default();
+        let def_path = &graph.nodes[0].def_path;
+        if is_self_recursive(graph, def_path) {
+            result.insert(def_path.clone());
+        }
+        return result;
+    }
     let sccs = detect_cycles(graph);
     let mut result = FxHashSet::default();
 
-    for scc in &sccs {
+    for scc in sccs {
         if scc.is_recursive() {
-            for member in &scc.members {
-                result.insert(member.clone());
-            }
+            result.extend(scc.members);
         }
     }
 
-    // Also check self-recursion for single-member SCCs
-    for node in &graph.nodes {
-        if is_self_recursive(graph, &node.def_path) {
-            result.insert(node.def_path.clone());
+    // Check self-recursion in O(V + E) instead of O(V * E).
+    let mut node_set =
+        FxHashSet::with_capacity_and_hasher(graph.nodes.len(), Default::default());
+    for n in &graph.nodes {
+        node_set.insert(n.def_path.as_str());
+    }
+    for edge in &graph.edges {
+        if edge.caller == edge.callee
+            && !result.contains(edge.caller.as_str())
+            && node_set.contains(edge.caller.as_str())
+        {
+            result.insert(edge.caller.clone());
         }
     }
 
@@ -281,6 +323,7 @@ mod tests {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],
@@ -314,13 +357,15 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
     fn make_tail_func(name: &str, def_path: &str, callee: &str) -> VerifiableFunction {
         let mut func = make_func(name, def_path, &[callee]);
-        let Terminator::Call { func: callee, args, span, atomic, callee_identity, .. } =
-            func.body.blocks[0].terminator.clone()
+        let Terminator::Call {
+            func: callee, args, span, atomic, callee_identity, callee_key, ..
+        } = func.body.blocks[0].terminator.clone()
         else {
             unreachable!();
         };
@@ -332,6 +377,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity,
+            callee_key,
         };
         func.body.blocks.truncate(1);
         func

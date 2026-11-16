@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-BS): the SHARED-BORROW snapshot admits nested / float /
 //! array-field / opaque-lane aggregates — `snapshotable_borrow_pointee`, a
 //! predicate SEPARATE from the promotion lanes' narrow one. The measured
@@ -10,6 +13,16 @@
 //! itself, never inside the operand. Under `strict`; the promotion lanes
 //! are exercised by `p.x = 1.0` on a float-field struct, which must STAY on
 //! wave-AW's value surgery (no `&mut`, no slot).
+//!
+//! EFFECT CONSERVATION (D28, 2026-10-01): `owned_string` and `temp_string` drop `String`s. Until
+//! the step 2 increment 4b residuals the direct trust-ir did not carry those drops (the
+//! `assert_eq!` operands are borrowed temporaries), the effect-conservation gate tagged each body
+//! `Abstracted(drop, ..)` and strict refused it. The producer now places them — each temporary
+//! dropped at the end of its scope, through its object's proved home or, where the `assert_eq!`
+//! tuple takes the borrow's address, through the borrow's slot under 4b's root rule (a `String` is
+//! `Freeze` and its glue only frees memory: every copy is the same drop) — so both bodies are
+//! clean under strict; a producer tag would still be its own, unannotated, strict error, so this
+//! file keeps its mutation check.
 
 #[derive(PartialEq, Debug, Clone, Copy)]
 struct Pf {

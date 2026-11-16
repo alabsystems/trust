@@ -29,14 +29,8 @@ fi
 
 echo "building the executor + driver..."
 clang -arch x86_64 -O2 -o natsem86 natsem86.c || { echo "executor build failed" >&2; exit 2; }
-STAGE2="$(git rev-parse --show-toplevel 2>/dev/null)/build/host/stage2/bin/targo"
-if command -v targo >/dev/null 2>&1; then
-  targo --unverified build --release >/dev/null 2>&1 || { echo "driver build failed" >&2; exit 2; }
-elif [ -x "$STAGE2" ]; then
-  "$STAGE2" --unverified build --release >/dev/null 2>&1 || { echo "driver build failed" >&2; exit 2; }
-else
-  echo "no targo on PATH and no stage2 targo; build the driver first" >&2; exit 2
-fi
+. ../targo.sh
+"$TARGO" --unverified build --release >/dev/null 2>&1 || { echo "driver build failed" >&2; exit 2; }
 
 # One real execution proves Rosetta is available.
 if ! ./natsem86 --slotpc >/dev/null 2>&1; then

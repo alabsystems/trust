@@ -1,14 +1,12 @@
 # trust-thir-lower — Rust/THIR directly to TrustIR
 
-`trust-thir-lower` is the Rust structural frontend for the canonical typed
-TrustIR pipeline. It lowers rustc THIR directly into `trust_ir::Module`; it
-does not lower through MIR. Trust-CG consumes TrustIR for native codegen, and
-the TrustIR-to-MIR direction is only a secondary LLVM-compatibility path.
+`trust-thir-lower` is the Rust structural frontend for typed TrustIR, the
+target pipeline IR. It lowers rustc THIR directly into `trust_ir::Module`; it
+does not lower through MIR. Trust-CG consumes TrustIR for native codegen.
 
-Design context, in short: the P1 "IR inversion" makes typed TrustIR the
-canonical pipeline IR — Rust is lowered THIR-first into TrustIR, and the
-TrustIR-to-MIR direction survives only as an LLVM-compatibility path — and the
-fusion design folds the verifier and codegen onto that one IR spine.
+Today is not the target: the TrustIR-to-MIR path and LLVM are still on the
+production path, and LLVM is the default backend. The target makes TrustIR the
+only input to verification and codegen, with MIR and LLVM kept as test oracles.
 
 ## Current status and authority boundary
 

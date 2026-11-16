@@ -13,9 +13,12 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 use rustc_span::Span;
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
+use trust_types::live_source_bound::LiveSourceCount;
 use trust_types::*;
 
 use crate::ty_convert;
+
+pub(crate) mod faithful_atomic_xadd;
 
 /// Trust: M6 rung-7 sweep — convert a rustc `Ty` through `convert_ty_in_env`
 /// whenever a body `TypingEnv` is available, falling back to the plain
@@ -46,35 +49,257 @@ fn convert_ty_with_env<'tcx>(
     }
 }
 
+/// Trust (OVF-ASSERT-XCRATE-1, 2026-10-06): the `Operand::Unsupported` kind that
+/// stands for the condition of an optional overflow assert whose codegen session is
+/// not known here ([`OptionalOverflowAssertCodegen::ForeignUnknown`]).
+pub(crate) const OPTIONAL_OVERFLOW_ASSERT_CODEGEN_SESSION_UNKNOWN: &str =
+    "optional-overflow-assert-codegen-session";
+
+/// Trust (OVF-ASSERT-XCRATE-1, 2026-10-06): which compilation's codegen decides an
+/// OPTIONAL overflow assert (`OverflowNeg`, `Overflow(Add | Sub | Mul | Shl | Shr)`)
+/// of the body being extracted. [`convert_terminator`] reads it only when THIS
+/// session has overflow checks off; a checks-on session never consults it.
+///
+/// Codegen compiles such an assert as always succeeding exactly when the session
+/// that CODEGENS the body has overflow checks off (`rustc_codegen_ssa/src/mir/block.rs`,
+/// `codegen_assert_terminator`), and as a real check otherwise. OVF-ASSERT-ERASED-1
+/// erased it on the EXTRACTING session's setting, which is right only when the
+/// extracting session is the one that codegens the body. A bundled member of a
+/// declared dependency is extracted here and codegened there. MEASURED on the
+/// stage 1 of `4ccd862830`: a checks-off memory-safe (and advisory) consumer
+/// erased the live assert of a checks-on dependency's `#[inline(never)] pub fn
+/// inc(x: u32) -> u32 { x + 1 }`, published its caller's panic-freedom row
+/// `proved`, and the binary panicked in the dependency's code (exit 101). The same
+/// held one call deeper: the dependency's exported `outer` calling its own
+/// `#[inline] inner(x) = x + 1` runs the DEPENDENCY's copy of `inner`, while a
+/// call from this crate would run this crate's copy, and the bundle extracts one
+/// `inner` for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OptionalOverflowAssertCodegen {
+    /// This session codegens every copy of the body that runs: the assert is
+    /// extracted as the `Goto` this session's codegen emits (OVF-ASSERT-ERASED-1).
+    ThisSession,
+    /// A dependency codegens the body and the assert is live there: its MIR builder
+    /// emitted it (not the MIR inliner), and the body does not inherit its
+    /// caller's overflow checks, so it was emitted only because that dependency
+    /// compiled with checks ON. The assert is extracted unchanged, as before
+    /// OVF-ASSERT-ERASED-1.
+    ForeignKeep,
+    /// Whether the assert is live in the code that runs is not known here. The
+    /// assert keeps its panic edge and its condition becomes an
+    /// `Operand::Unsupported` ([`OPTIONAL_OVERFLOW_ASSERT_CODEGEN_SESSION_UNKNOWN`]):
+    /// no lane reads a success-edge fact from it (the `AssertHolds` guard, the
+    /// checked-op result definition, the interval narrowing), vcgen mints
+    /// `UnsupportedMir` for it, and the trust-ir bridge refuses to lower it.
+    ForeignUnknown,
+}
+
+/// Trust (OVF-ASSERT-XCRATE-1, 2026-10-06): who codegens the body being extracted,
+/// as far as this compilation can tell from the body's own identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OptionalOverflowAssertBodySession {
+    /// A local body, or a CODEGEN extraction (this session emits what it extracts).
+    /// A local `#[inline]` or generic body that a downstream crate also codegens is
+    /// the producer-side half of OVF-ASSERT-XCRATE-1 (direction 2), not decided here.
+    ThisSession,
+    /// A foreign, non-generic item that is not cross-crate-inlinable: no crate but
+    /// its own codegens it, and every call links that dependency's symbol.
+    DependencyExported {
+        /// Whether the body provably lacks `#[rustc_inherit_overflow_checks]`. Such
+        /// a body carries its optional asserts whatever its crate's setting, so only
+        /// their absence makes an assert's presence prove the dependency had
+        /// checks on.
+        inherit_overflow_checks_provably_absent: bool,
+    },
+    /// Any other foreign body: a cross-crate-inlinable or generic item, or a shim.
+    /// Every crate whose codegen references it may codegen its own copy under its
+    /// own overflow-checks setting, and a dependency's exported code runs the
+    /// dependency's copy, so one extracted body cannot say which copy runs.
+    Undetermined,
+}
+
+impl OptionalOverflowAssertBodySession {
+    /// Classify `body`. `codegen_extraction` is true when the caller extracts the
+    /// body to emit it in THIS session.
+    pub(crate) fn of<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        body: &mir::Body<'tcx>,
+        codegen_extraction: bool,
+    ) -> Self {
+        Self::of_instance(tcx, body.source.instance, codegen_extraction)
+    }
+
+    /// [`Self::of`] for the body of `instance`, which need not have MIR here.
+    pub(crate) fn of_instance<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        instance: ty::InstanceKind<'tcx>,
+        codegen_extraction: bool,
+    ) -> Self {
+        let def = instance.def_id();
+        if codegen_extraction || def.is_local() {
+            return Self::ThisSession;
+        }
+        if !matches!(instance, ty::InstanceKind::Item(_))
+            || tcx.generics_of(def).requires_monomorphization(tcx)
+            || tcx.cross_crate_inlinable(def)
+        {
+            return Self::Undetermined;
+        }
+        Self::DependencyExported {
+            // `#[rustc_inherit_overflow_checks]` is not encoded in crate metadata
+            // (`rustc_hir/src/attrs/encode_cross_crate.rs`: `RustcInheritOverflowChecks
+            // => No`), so its absence on a foreign def is never provable here, and
+            // `ForeignKeep` is unreachable from extraction until a metadata fact
+            // (the attribute, or the dependency's own `overflow_checks()`) is encoded.
+            inherit_overflow_checks_provably_absent: false,
+        }
+    }
+
+    /// The mode for one assert, from whether its source scope was MIR-inlined into
+    /// the body (an inlined assert's presence says nothing about the body's crate).
+    pub(crate) fn assert_codegen(
+        self,
+        assert_scope_is_inlined: bool,
+    ) -> OptionalOverflowAssertCodegen {
+        match self {
+            Self::ThisSession => OptionalOverflowAssertCodegen::ThisSession,
+            Self::DependencyExported { inherit_overflow_checks_provably_absent: true }
+                if !assert_scope_is_inlined =>
+            {
+                OptionalOverflowAssertCodegen::ForeignKeep
+            }
+            Self::DependencyExported { .. } | Self::Undetermined => {
+                OptionalOverflowAssertCodegen::ForeignUnknown
+            }
+        }
+    }
+
+    /// The mode for `terminator` of `body`.
+    pub(crate) fn for_terminator<'tcx>(
+        self,
+        body: &mir::Body<'tcx>,
+        terminator: &mir::Terminator<'tcx>,
+    ) -> OptionalOverflowAssertCodegen {
+        if self == Self::ThisSession {
+            return OptionalOverflowAssertCodegen::ThisSession;
+        }
+        self.assert_codegen(
+            terminator.source_info.scope.inlined_instance(&body.source_scopes).is_some(),
+        )
+    }
+}
+
+#[inline]
+fn convert_span_opt_cached(
+    tcx: TyCtxt<'_>,
+    raw_span: Span,
+    span_cache: &mut Option<&mut crate::FxHashMap<Span, SourceSpan>>,
+) -> SourceSpan {
+    if raw_span.is_dummy() {
+        return SourceSpan::default();
+    }
+    match span_cache.as_deref_mut() {
+        Some(cache) => {
+            if let Some(cached) = cache.get(&raw_span) {
+                return cached.clone();
+            }
+            let converted = convert_span(tcx, raw_span);
+            cache.insert(raw_span, converted.clone());
+            converted
+        }
+        None => convert_span(tcx, raw_span),
+    }
+}
+
 /// Convert a rustc BasicBlock to our BasicBlock.
 pub(crate) fn convert_basic_block<'tcx>(
     tcx: TyCtxt<'tcx>,
     bb: mir::BasicBlock,
     bb_data: &mir::BasicBlockData<'tcx>,
-    local_decls: Option<&mir::LocalDecls<'tcx>>,
+    body: Option<&mir::Body<'tcx>>,
     typing_env: Option<ty::TypingEnv<'tcx>>,
+    // Trust (GCKA-SELF-CALL-2, 2026-10-10): the item whose own MIR this block is,
+    // for `func_operand_name`; `None` when unknown.
+    caller: Option<DefId>,
+    // Trust (OVF-ASSERT-XCRATE-1, 2026-10-06): see `OptionalOverflowAssertCodegen`.
+    optional_overflow_assert_codegen: OptionalOverflowAssertCodegen,
 ) -> BasicBlock {
-    let stmts: Vec<Statement> = bb_data
-        .statements
-        .iter()
-        .map(|stmt| convert_statement(tcx, stmt, local_decls, typing_env))
-        .collect();
+    convert_basic_block_inner(
+        tcx,
+        bb,
+        bb_data,
+        body,
+        typing_env,
+        caller,
+        optional_overflow_assert_codegen,
+        None,
+    )
+}
+
+/// Convert a rustc BasicBlock while sharing a body-scoped `Span -> SourceSpan` memo.
+pub(crate) fn convert_basic_block_cached<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    bb: mir::BasicBlock,
+    bb_data: &mir::BasicBlockData<'tcx>,
+    body: Option<&mir::Body<'tcx>>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+    caller: Option<DefId>,
+    optional_overflow_assert_codegen: OptionalOverflowAssertCodegen,
+    span_cache: &mut crate::FxHashMap<Span, SourceSpan>,
+) -> BasicBlock {
+    convert_basic_block_inner(
+        tcx,
+        bb,
+        bb_data,
+        body,
+        typing_env,
+        caller,
+        optional_overflow_assert_codegen,
+        Some(span_cache),
+    )
+}
+
+fn convert_basic_block_inner<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    bb: mir::BasicBlock,
+    bb_data: &mir::BasicBlockData<'tcx>,
+    body: Option<&mir::Body<'tcx>>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+    caller: Option<DefId>,
+    optional_overflow_assert_codegen: OptionalOverflowAssertCodegen,
+    mut span_cache: Option<&mut crate::FxHashMap<Span, SourceSpan>>,
+) -> BasicBlock {
+    let local_decls = body.map(|body| body.local_decls.as_slice());
+    let mut stmts = Vec::with_capacity(bb_data.statements.len());
+    for stmt in &bb_data.statements {
+        stmts.push(convert_statement_inner(
+            tcx,
+            stmt,
+            local_decls,
+            typing_env,
+            &mut span_cache,
+        ));
+    }
 
     let terminator = {
-        let mut t = convert_terminator(tcx, bb_data.terminator(), local_decls, typing_env);
-        // DEBUG-FINISHER SENTINEL: rewrite a fixed-arity `debug_*_field*_finish` call to the
-        // total-havoc marker WHEN every field-value arg's erased `&dyn Debug` concrete type
-        // has a PROVABLY panic-free Debug. Needs the block statements + local_decls (the
-        // field types are erased at the terminator), so it lives here, not in
+        let mut t = convert_terminator_inner(
+            tcx,
+            bb_data.terminator(),
+            local_decls,
+            typing_env,
+            caller,
+            optional_overflow_assert_codegen,
+            &mut span_cache,
+        );
+        // DEBUG-FINISHER SENTINEL: rewrite a `debug_*_finish` call only when
+        // every erased field type has a provably panic-free Debug and the packed
+        // name supplies every field core unwraps. Field and name recovery need
+        // body-wide def/alias checks, so this is not in
         // `func_operand_name`. Fails closed → real finisher call → may-panic obligation.
-        if let (Some(ld), Terminator::Call { func, .. }) = (local_decls, &mut t) {
-            if debug_finisher_all_fields_total(tcx, bb_data.terminator(), &bb_data.statements, ld)
-                || debug_nary_finisher_all_fields_total(
-                    tcx,
-                    bb_data.terminator(),
-                    &bb_data.statements,
-                    ld,
-                )
+        if let (Some(body), Terminator::Call { func, .. }) = (body, &mut t) {
+            if !ty_convert::faithful_scalars()
+                && (debug_finisher_all_fields_total(tcx, bb_data.terminator(), body)
+                    || debug_nary_finisher_all_fields_total(tcx, bb_data.terminator(), body))
             {
                 *func = TRUST_TOTAL_CLONE_SENTINEL.to_string();
             }
@@ -86,20 +311,30 @@ pub(crate) fn convert_basic_block<'tcx>(
 }
 
 /// Convert a rustc Statement.
+#[cfg(test)]
 fn convert_statement<'tcx>(
     tcx: TyCtxt<'tcx>,
     stmt: &mir::Statement<'tcx>,
     local_decls: Option<&mir::LocalDecls<'tcx>>,
     typing_env: Option<ty::TypingEnv<'tcx>>,
 ) -> Statement {
-    let span = convert_span(tcx, stmt.source_info.span);
+    convert_statement_inner(tcx, stmt, local_decls, typing_env, &mut None)
+}
+
+fn convert_statement_inner<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    stmt: &mir::Statement<'tcx>,
+    local_decls: Option<&mir::LocalDecls<'tcx>>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+    span_cache: &mut Option<&mut crate::FxHashMap<Span, SourceSpan>>,
+) -> Statement {
     match &stmt.kind {
-        mir::StatementKind::Assign(box (place, rvalue)) => Statement::Assign {
+        mir::StatementKind::Assign((place, rvalue)) => Statement::Assign {
             place: convert_place(tcx, place, typing_env),
             rvalue: convert_rvalue(tcx, rvalue, local_decls, typing_env),
-            span, // Trust: per-statement source span
+            span: convert_span_opt_cached(tcx, stmt.source_info.span, span_cache), // Trust: per-statement source span
         },
-        mir::StatementKind::FakeRead(box (_, _)) => Statement::Nop,
+        mir::StatementKind::FakeRead((_, _)) => Statement::Nop,
         mir::StatementKind::SetDiscriminant { place, variant_index } => {
             Statement::SetDiscriminant {
                 place: convert_place(tcx, place, typing_env),
@@ -114,11 +349,16 @@ fn convert_statement<'tcx>(
         mir::StatementKind::PlaceMention(place) => {
             Statement::PlaceMention(convert_place(tcx, place, typing_env))
         }
-        mir::StatementKind::AscribeUserType(box (_, _), _) => Statement::Nop,
+        mir::StatementKind::AscribeUserType((_, _), _) => Statement::Nop,
         mir::StatementKind::Coverage(_) => Statement::Coverage,
-        mir::StatementKind::Intrinsic(box intrinsic) => {
-            convert_nondiverging_intrinsic(tcx, intrinsic, span, local_decls, typing_env)
-        }
+        mir::StatementKind::Intrinsic(intrinsic) => convert_nondiverging_intrinsic(
+            tcx,
+            intrinsic,
+            stmt.source_info.span,
+            local_decls,
+            typing_env,
+            span_cache,
+        ),
         mir::StatementKind::ConstEvalCounter => Statement::ConstEvalCounter,
         mir::StatementKind::Nop => Statement::Nop,
         mir::StatementKind::BackwardIncompatibleDropHint { .. } => Statement::Nop,
@@ -128,11 +368,12 @@ fn convert_statement<'tcx>(
 fn convert_nondiverging_intrinsic<'tcx>(
     tcx: TyCtxt<'tcx>,
     intrinsic: &mir::NonDivergingIntrinsic<'tcx>,
-    span: SourceSpan,
+    raw_span: Span,
     // Needed to type the copy's pointer operands: the element type is the
     // pointee of `src`, and without it the copy cannot be modeled.
     local_decls: Option<&mir::LocalDecls<'tcx>>,
     typing_env: Option<ty::TypingEnv<'tcx>>,
+    span_cache: &mut Option<&mut crate::FxHashMap<Span, SourceSpan>>,
 ) -> Statement {
     match intrinsic {
         mir::NonDivergingIntrinsic::Assume(operand) => Statement::Intrinsic {
@@ -140,6 +381,7 @@ fn convert_nondiverging_intrinsic<'tcx>(
             args: vec![convert_operand(tcx, operand, typing_env)],
         },
         mir::NonDivergingIntrinsic::CopyNonOverlapping(copy) => {
+            let span = convert_span_opt_cached(tcx, raw_span, span_cache);
             let src = convert_operand(tcx, &copy.src, typing_env);
             let dst = convert_operand(tcx, &copy.dst, typing_env);
             let count = convert_operand(tcx, &copy.count, typing_env);
@@ -262,7 +504,27 @@ pub(crate) use trust_types::total_call_summaries::TRUST_TOTAL_CLONE_SENTINEL;
 /// the delegation guard above also refuses ANY occurrence of that name, so a
 /// rewire that delegates one arm while keeping the anchor arm alive cannot pass.
 /// `trust_types`'s own module names it if you need to grep for the history.
-pub(crate) fn is_real_sysroot_crate(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> bool {
+#[derive(Clone, Copy)]
+struct CrateSysrootAuth {
+    is_real: bool,
+    impersonates: bool,
+}
+
+#[derive(Default)]
+struct SessionCrateSysrootAuth {
+    by_krate: crate::FxHashMap<rustc_span::def_id::CrateNum, CrateSysrootAuth>,
+    by_std_hash_table_impl: crate::FxHashMap<rustc_span::def_id::CrateNum, bool>,
+}
+
+fn crate_sysroot_auth(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> CrateSysrootAuth {
+    if let Some(cached) = tcx
+        .sess
+        .with_trust_compiler_state::<SessionCrateSysrootAuth, _>(|state| {
+            state.by_krate.get(&krate).copied()
+        })
+    {
+        return cached;
+    }
     // Every argument is evaluated eagerly, which is behaviour-identical to the
     // short-circuited spelling this replaced because both helpers are TOTAL:
     // `crate_is_sysroot_resident` answers `false` for `LOCAL_CRATE` before it
@@ -270,14 +532,100 @@ pub(crate) fn is_real_sysroot_crate(tcx: TyCtxt<'_>, krate: rustc_span::def_id::
     // and `invocation_is_building_the_sysroot` is a plain options read. Do not
     // re-introduce a guard like `wears_the_name && resident` to skip the query:
     // that is an arm of the rule spelled on this side again.
-    trust_types::crate_is_the_compilers_own_sysroot_crate(
-        trust_types::crate_name_wears_sysroot_spelling(tcx.crate_name(krate).as_str()),
+    let wears_sysroot_name =
+        trust_types::crate_name_wears_sysroot_spelling(tcx.crate_name(krate).as_str());
+    let is_real = trust_types::crate_is_the_compilers_own_sysroot_crate(
+        wears_sysroot_name,
         // `DefId::is_local()` at CrateNum granularity. SELECTS an arm; never a
         // grant — an exemption keyed on locality is exactly the R2 shape.
         krate == LOCAL_CRATE,
         crate_is_sysroot_resident(tcx, krate),
         invocation_is_building_the_sysroot(tcx),
-    )
+    );
+    let auth = CrateSysrootAuth { is_real, impersonates: wears_sysroot_name && !is_real };
+    tcx.sess.with_trust_compiler_state::<SessionCrateSysrootAuth, _>(|state| {
+        state.by_krate.insert(krate, auth);
+    });
+    auth
+}
+
+pub(crate) fn is_real_sysroot_crate(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> bool {
+    crate_sysroot_auth(tcx, krate).is_real
+}
+
+/// THE SESSION'S AUTHENTICATED SOURCE-FILE TABLE: for every
+/// `rustc_span::SourceFile` the source map holds, the rendering that
+/// `convert_span` would stamp onto a [`trust_types::SourceSpan`], paired with
+/// [`is_real_sysroot_crate`]'s ARTIFACT-RESIDENCY verdict for the crate that
+/// file came from.
+///
+/// # Why this function exists
+///
+/// `trust_vcgen`'s trusted-std exemption DELETES every `[unsafe:sep:*]` row for
+/// a span — and the stand-in the site would otherwise keep. Until 2026-09-20 it
+/// decided by INSPECTING `SourceSpan::file` for a `library/<std-crate>/src/`
+/// segment, which is the unremapped local path the USER compiled, so the user
+/// chose whether their own `unsafe { *p = 7 }` carried any obligation at all
+/// (MEASURED: `core/src/evil.rs` 3 rows vs `mycore/src/evil.rs` 13, byte-identical
+/// source, same `--crate-name evil`). `trust_vcgen` holds no `TyCtxt` and cannot
+/// ask the authenticated question itself; this is the producer that can, and the
+/// table is handed to it through `VcgenContext::with_trusted_std_source_files`.
+///
+/// # The two halves of the authentication
+///
+///  1. `SourceFile::cnum` — rustc's own record of which crate a source file was
+///     imported from, `LOCAL_CRATE` for the crate being compiled. It is set by
+///     the metadata decoder, never by anything in the file's contents or its
+///     name.
+///  2. [`is_real_sysroot_crate`] — residency of that crate's artifacts in this
+///     compiler's own `target_tlib_path`, plus the command-line sysroot-build
+///     carve-out. Not a crate NAME: a crate compiled `--crate-name core` out of
+///     the user's own tree answers `false`.
+///
+/// A file whose crate authenticates gets `true`; EVERY other file gets `false`,
+/// including one whose crate is simply unresolvable — the fail-closed direction
+/// is "not trusted std", i.e. keep the obligations.
+///
+/// # Why the rendering, and not the raw name
+///
+/// The consumer joins on `SourceSpan::file`, and that field is
+/// `stable_obligation_file(identity_file_rendering(local, remapped))` — see
+/// [`convert_span`], whose two byte-identical siblings stamp the same value.
+/// Rendering here with the SAME expression is what makes the join exact instead
+/// of a pattern match. If those converters ever change their rendering, this one
+/// must change with them, and `span_normalization_parity` is the pin that says so.
+///
+/// WS8.9 (F-117) moved that expression from `prefer_local_unconditionally()` to
+/// the remap-aware [`trust_types::identity_file_rendering`], so that a
+/// `--remap-path-prefix` takes the user's checkout out of every sealed
+/// obligation identity. This side moved with it IN THE SAME COMMIT, because the
+/// two renderings are ONE join key: had only the converters moved, every span of
+/// a remapped build would miss the table and answer `false` — fail-closed, but it
+/// would silently charge stdlib's own `unsafe` to the user. The table's VALUE is
+/// unaffected either way: it comes from `cnum` plus artifact residency, never
+/// from the string, so a remap can move the key but cannot mint the verdict.
+///
+/// Collisions are resolved by [`trust_types::TrustedStdSourceFiles`], which
+/// revokes any rendering claimed by both a sysroot and a non-sysroot file.
+///
+/// # Cost
+///
+/// One pass over `source_map().files()` and one `used_crate_source` query per
+/// distinct crate (rustc memoizes it). The caller is expected to memoize the
+/// table for the session; `rustc_mir_transform::trust_verify` keys its cache on
+/// `files().len()` so a file decoded later rebuilds it.
+pub fn trusted_std_source_files(tcx: TyCtxt<'_>) -> trust_types::TrustedStdSourceFiles {
+    let source_map = tcx.sess.source_map();
+    let files = source_map.files();
+    trust_types::TrustedStdSourceFiles::from_authenticated_files(files.iter().map(|file| {
+        (
+            trust_types::stable_obligation_file(trust_types::identity_file_rendering(
+                file.name.prefer_local_unconditionally().to_string(),
+                file.name.prefer_remapped_unconditionally().to_string(),
+            )),
+            is_real_sysroot_crate(tcx, file.cnum),
+        )
+    }))
 }
 
 /// Every artifact rustc loaded `krate` from sits DIRECTLY in this compiler's own
@@ -301,11 +649,14 @@ pub(crate) fn is_real_sysroot_crate(tcx: TyCtxt<'_>, krate: rustc_span::def_id::
 /// them. The local arm ignores this fact regardless — pinned on the rule's side
 /// by `the_local_arm_answers_from_the_command_line_alone`, which sweeps
 /// `resident` in both states rather than trusting this caller to pass `false`.
-fn crate_is_sysroot_resident(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> bool {
+pub(crate) fn crate_is_sysroot_resident(
+    tcx: TyCtxt<'_>,
+    krate: rustc_span::def_id::CrateNum,
+) -> bool {
     if krate == LOCAL_CRATE {
         return false;
     }
-    let sysroot_lib_dir = tcx.sess.target_tlib_path.dir.as_path();
+    let sysroot_lib_dir: &std::path::Path = &tcx.sess.target_tlib_path.dir;
     let source = tcx.used_crate_source(krate);
     let mut saw_one = false;
     for path in source.paths() {
@@ -315,6 +666,91 @@ fn crate_is_sysroot_resident(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNu
         }
     }
     saw_one
+}
+
+/// Trust (W4 HASHMAP redo, 2026-09-25): is `krate` the crate that implements the
+/// table behind THIS compiler's `std::collections::HashMap` / `HashSet`
+/// (`hashbrown`), identified STRUCTURALLY and never by a crate name?
+///
+/// # The identity
+///
+/// The crate is read off std's own declarations: resolve `HashMap` and `HashSet`
+/// by their diagnostic items, require the defining crate to be the real,
+/// artifact-authenticated `std` ([`is_real_sysroot_crate`]), and take the crate
+/// that defines the ADT each one's FIELD is declared as
+/// (`base: hashbrown::HashMap<K, V, S>`, `base: hashbrown::HashSet<T, S>`).
+/// Whatever that crate is called, it is the one std's table code runs. A crate
+/// that merely wears the name — a crates.io `hashbrown`, a dependency built
+/// `--crate-name hashbrown` — is never std's field type and is never credited.
+///
+/// # What else must hold
+///
+///  * RESIDENCY ([`crate_is_sysroot_resident`]): the crate's artifacts sit in this
+///    compiler's own target library directory, the same fact the rest of the
+///    sysroot's authentication stands on.
+///  * NOT NAMED DIRECTLY by the crate being compiled. Under
+///    `#![feature(rustc_private)] extern crate hashbrown;` the local crate reaches
+///    the whole of hashbrown's API (its `get_many_mut`, its `Index` impl, its raw
+///    tables), not just the calls std's table code makes, so the credit is
+///    withdrawn for the whole compilation (fail-closed: `HashMap` is then exactly
+///    as refused as it was before this predicate existed). The loader records a
+///    direct load as `ExternCrate::is_direct` and always prefers it
+///    (`ExternCrate::rank`), so a direct load cannot be hidden behind std's.
+///
+/// Only `std`'s two table types are read, and only their declared field types,
+/// so the class this feeds grows by exactly one crate. std's other dependencies
+/// (`libc`, `std_detect`, `memchr`, `object`, `gimli`, ...) are NOT reached: a
+/// `Mutex`, `Condvar`, stdio lock, `fs::Metadata` or `ReadDir` whose fields name
+/// `libc` types keeps exactly the verdict it had before.
+pub(crate) fn crate_is_std_hash_table_implementation(
+    tcx: TyCtxt<'_>,
+    krate: rustc_span::def_id::CrateNum,
+) -> bool {
+    if krate == LOCAL_CRATE {
+        return false;
+    }
+    if let Some(cached) = tcx
+        .sess
+        .with_trust_compiler_state::<SessionCrateSysrootAuth, _>(|state| {
+            state.by_std_hash_table_impl.get(&krate).copied()
+        })
+    {
+        return cached;
+    }
+    // The structural identity first: it is a few cached lookups and rejects every
+    // other crate before any residency query runs (this predicate is asked of
+    // every ADT a foundational-type walk visits).
+    let is_std_table_field_crate =
+        [rustc_span::sym::HashMap, rustc_span::sym::HashSet].into_iter().any(|table| {
+            let Some(table_did) = tcx.get_diagnostic_item(table) else { return false };
+            table_did.krate != krate
+                && matches!(tcx.def_kind(table_did), rustc_hir::def::DefKind::Struct)
+                && tcx.adt_def(table_did).all_fields().any(|field| {
+                    match tcx.type_of(field.did).instantiate_identity().skip_normalization().kind()
+                    {
+                        ty::Adt(field_adt, _) => field_adt.did().krate == krate,
+                        _ => false,
+                    }
+                })
+                && is_real_sysroot_crate(tcx, table_did.krate)
+        });
+    let result = is_std_table_field_crate
+        && !is_real_sysroot_crate(tcx, krate)
+        && crate_is_sysroot_resident(tcx, krate)
+        && !tcx.extern_crate(krate).is_some_and(|extern_crate| extern_crate.is_direct());
+    tcx.sess.with_trust_compiler_state::<SessionCrateSysrootAuth, _>(|state| {
+        state.by_std_hash_table_impl.insert(krate, result);
+    });
+    result
+    // Trust (upstream 1.101): deliberately NO name-uniqueness conjunct here.
+    // This predicate is the STRUCTURAL identity every foundational-type walk
+    // reads, and std's own `HashMap` stays foundational while a namesake
+    // `hashbrown` sits unused in the graph
+    // (`hashbrown_namesake_dep_not_vanilla.rs#namesake_loaded_std_map_ok`).
+    // The one consumer that keys on a rendered NAME — the vanilla ledger in
+    // `callee_is_vanilla_sysroot` — charges name uniqueness there, where the
+    // ambiguity actually lives
+    // (`vanilla_hashbrown_name_shadowed_stays_closed.rs`).
 }
 
 /// This INVOCATION declared that it is building a sysroot, so its
@@ -446,8 +882,7 @@ pub(crate) fn impersonates_sysroot_crate(
     tcx: TyCtxt<'_>,
     krate: rustc_span::def_id::CrateNum,
 ) -> bool {
-    trust_types::crate_name_wears_sysroot_spelling(tcx.crate_name(krate).as_str())
-        && !is_real_sysroot_crate(tcx, krate)
+    crate_sysroot_auth(tcx, krate).impersonates
 }
 
 /// Apply the SYSROOT-IMPERSONATION stamp (rule 2 only) to an already-rendered
@@ -476,11 +911,9 @@ pub(crate) fn sysroot_authenticated_path(
     // `trust_types::sysroot_identity_stamp_required(_, name, real, false)` is
     // pinned by `rule_two_alone_is_exactly_the_impersonation_predicate` there,
     // so these two producers cannot drift apart.
-    trust_types::stamp_unauthenticated_crate_path(
-        path,
-        tcx.stable_crate_id(krate).as_u64(),
-        impersonates_sysroot_crate(tcx, krate),
-    )
+    let impersonates = impersonates_sysroot_crate(tcx, krate);
+    let scid = if impersonates { tcx.stable_crate_id(krate).as_u64() } else { 0 };
+    trust_types::stamp_unauthenticated_crate_path(path, scid, impersonates)
 }
 
 /// Leaf-name set of std/alloc/core wrappers whose `Clone` DEEP-clones its contents
@@ -488,6 +921,32 @@ pub(crate) fn sysroot_authenticated_path(
 /// wrapper level — so the wrapper's clone is total IFF every element's clone is
 /// total. Conservative (omissions only lose precision → fail-closed).
 fn is_std_deep_clone_container(tcx: TyCtxt<'_>, did: rustc_span::def_id::DefId) -> bool {
+    // SOUNDNESS (crate-name forgery) + PERF: require the un-forgeable sysroot
+    // `StableCrateId` first before formatting `safe_def_path_str`; a `--crate-name alloc`
+    // dep can spell `alloc::vec::Vec`, and checking `did.krate` first also avoids
+    // formatting def-paths for every local/dependency ADT.
+    if !is_real_sysroot_crate(tcx, did.krate) {
+        return false;
+    }
+    if !matches!(
+        tcx.item_name(did).as_str(),
+        "Box"
+            | "Vec"
+            | "VecDeque"
+            | "Rc"
+            | "Arc"
+            | "Option"
+            | "Result"
+            | "BTreeMap"
+            | "BTreeSet"
+            | "BinaryHeap"
+            | "LinkedList"
+            | "Cow"
+            | "Wrapping"
+            | "Reverse"
+    ) {
+        return false;
+    }
     let path = crate::safe_def_path_str(tcx, did);
     let leaf = path.rsplit("::").next().unwrap_or(&path);
     let leaf = leaf.split('<').next().unwrap_or(leaf);
@@ -508,11 +967,38 @@ fn is_std_deep_clone_container(tcx: TyCtxt<'_>, did: rustc_span::def_id::DefId) 
             | "Wrapping"
             | "Reverse"
     ) && (path.starts_with("std::") || path.starts_with("alloc::") || path.starts_with("core::"))
-        // SOUNDNESS (crate-name forgery): the leaf-name/prefix pair above is a fast
-        // pre-filter only; a `--crate-name alloc` dep can spell `alloc::vec::Vec`.
-        // Require the un-forgeable sysroot `StableCrateId` before trusting the deep-
-        // clone dispatch (this fn feeds `tcx_clone_is_total`/`tcx_derived_trait_is_total`).
-        && is_real_sysroot_crate(tcx, did.krate)
+}
+
+/// `Cow<'_, B>` runs `<B as ToOwned>::Owned`'s `Borrow::borrow` in its `Deref`
+/// (hence in `eq`/`cmp`/`hash`) and `borrow().to_owned()` in `clone`. Those are
+/// user code when a user crate implements `ToOwned` for `B` (review round 23,
+/// 2026-10-01: a derived `PartialEq`/`Ord` over a `Cow<'_, L>` whose `Owned`'s
+/// `borrow` indexes out of bounds was rewritten to the total sentinel and the crate
+/// certified). The deep-container recursion into `B` sees none of it, so a `Cow` is
+/// a deep container only when every `ToOwned` impl that can apply to `B` is a
+/// sysroot impl: the blanket `T: Clone` impl (identity `Borrow`, `to_owned` is
+/// `B::clone`, which the recursion covers) or a std leaf (`str`, `[T]`, `Path`,
+/// ...). The orphan rule makes every user impl name a concrete local self type,
+/// which `for_each_relevant_impl` reports. Any other wrapper passes unchanged.
+fn cow_borrow_runs_no_user_code<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: rustc_span::def_id::DefId,
+    args: ty::GenericArgs<'tcx>,
+) -> bool {
+    if tcx.get_diagnostic_item(rustc_span::sym::Cow) != Some(did) {
+        return true;
+    }
+    let Some(to_owned) = tcx.get_diagnostic_item(rustc_span::Symbol::intern("ToOwned")) else {
+        return false;
+    };
+    let Some(borrowed) = args.types().next() else { return false };
+    let mut user_impl = false;
+    tcx.for_each_relevant_impl(to_owned, borrowed, |impl_did| {
+        if !is_real_sysroot_crate(tcx, impl_did.krate) {
+            user_impl = true;
+        }
+    });
+    !user_impl
 }
 
 /// Recover `T` from `Option<T>` via the un-forgeable `Option` diagnostic item.
@@ -552,7 +1038,7 @@ fn clone_is_total_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
         ty,
         clone_method,
         CLONE_TOTALITY_FUEL,
-        &mut std::collections::HashSet::new(),
+        &mut FxHashSet::default(),
     )
 }
 
@@ -561,7 +1047,9 @@ fn clone_is_total_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
 /// un-forgeable sysroot `StableCrateId`.
 fn is_std_total_deref_wrapper<'tcx>(tcx: TyCtxt<'tcx>, p: ty::Ty<'tcx>) -> bool {
     let ty::TyKind::Adt(def, _) = p.kind() else { return false };
-    if !is_real_sysroot_crate(tcx, def.did().krate) {
+    if !is_real_sysroot_crate(tcx, def.did().krate)
+        || !matches!(tcx.item_name(def.did()).as_str(), "Box" | "Arc" | "Rc" | "Vec" | "String")
+    {
         return false;
     }
     let path = crate::safe_def_path_str(tcx, def.did());
@@ -585,11 +1073,14 @@ fn is_std_total_deref_wrapper<'tcx>(tcx: TyCtxt<'tcx>, p: ty::Ty<'tcx>) -> bool 
 pub fn std_adapter_total_panic_free<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee: DefId,
-    gen_args: ty::GenericArgsRef<'tcx>,
+    gen_args: ty::GenericArgs<'tcx>,
 ) -> bool {
     // Un-forgeable provenance FIRST — a `--crate-name alloc` impostor with a panicking
     // impl is rejected here before any name prefilter is trusted.
     if !is_real_sysroot_crate(tcx, callee.krate) {
+        return false;
+    }
+    if !matches!(tcx.item_name(callee).as_str(), "to_vec" | "cloned" | "as_deref") {
         return false;
     }
     let path = crate::safe_def_path_str(tcx, callee);
@@ -621,7 +1112,6 @@ pub(crate) fn is_element_free_total_std_adt(
     tcx: TyCtxt<'_>,
     did: rustc_span::def_id::DefId,
 ) -> bool {
-    let path = crate::safe_def_path_str(tcx, did);
     // num-bigint arbitrary-precision integers are NON-generic (limbs are fixed
     // primitive `u32`/`u64`), so their hand-written `Clone` bottoms out in
     // primitives and runs NO user code (alloc-abort excluded, as everywhere in
@@ -639,18 +1129,28 @@ pub(crate) fn is_element_free_total_std_adt(
     // scid, fails here, and stays fail-closed. ZERO behavior change for the real
     // num_bigint (it authenticates); closes the crate-name spoof for the whole
     // eq/ord/clone/hash family this oracle serves.
+    let item_name = tcx.item_name(did);
+    let item = item_name.as_str();
     if crate::ty_convert::is_authenticated_bignum_crate(tcx, did.krate)
-        && matches!(tcx.item_name(did).as_str(), "BigInt" | "BigUint")
+        && matches!(item, "BigInt" | "BigUint")
     {
         return true;
     }
-    // Sysroot leaves. The `def_path_str` compares below are a NAME pre-filter only;
-    // rustc does not reserve `core`/`alloc`/`std`, so a `--crate-name alloc` dep can
-    // spell `alloc::string::String` with a panicking `Ord`/`Hash`/`Clone`/`Drop`.
-    // Require the un-forgeable sysroot `StableCrateId` before discharging: this fn is
-    // the element-free-total-std oracle shared by the clone/drop/derived-trait/
-    // total-map-key gates, so the provenance bind closes the forgery across all of them.
-    let name_matches = matches!(
+    // Sysroot leaves. Require the un-forgeable sysroot `StableCrateId` before
+    // formatting `safe_def_path_str`: rustc does not reserve `core`/`alloc`/`std`,
+    // so a `--crate-name alloc` dep can spell `alloc::string::String` with a
+    // panicking `Ord`/`Hash`/`Clone`/`Drop`, and checking `did.krate` first also
+    // avoids formatting def-paths for every non-sysroot ADT.
+    if !is_real_sysroot_crate(tcx, did.krate) {
+        return false;
+    }
+    if !matches!(item, "String" | "Ordering" | "Duration" | "ErrorKind")
+        && !item.starts_with("NonZero")
+    {
+        return false;
+    }
+    let path = crate::safe_def_path_str(tcx, did);
+    matches!(
         path.as_str(),
         "alloc::string::String"
             | "std::string::String"
@@ -658,9 +1158,11 @@ pub(crate) fn is_element_free_total_std_adt(
             | "std::cmp::Ordering"
             | "core::time::Duration"
             | "std::time::Duration"
+            | "core::io::error::ErrorKind"
+            | "std::io::ErrorKind"
+            | "std::io::error::ErrorKind"
     ) || path.starts_with("core::num::NonZero")
-        || path.starts_with("std::num::NonZero");
-    name_matches && is_real_sysroot_crate(tcx, did.krate)
+        || path.starts_with("std::num::NonZero")
 }
 
 /// True iff `<ty as Clone>::clone` is PROVABLY panic-free (total), WITHOUT an axiom.
@@ -680,7 +1182,7 @@ fn tcx_clone_is_total<'tcx>(
     ty: ty::Ty<'tcx>,
     clone_method: rustc_span::def_id::DefId,
     fuel: u32,
-    seen: &mut std::collections::HashSet<ty::Ty<'tcx>>,
+    seen: &mut FxHashSet<ty::Ty<'tcx>>,
 ) -> bool {
     use rustc_middle::ty::TyKind;
     if fuel == 0 {
@@ -724,7 +1226,7 @@ fn tcx_clone_is_total<'tcx>(
             //      `is_builtin_derived` (needs `as_local()`); REQUIRED because after the
             //      Edit-C swap a `Vec<Rat>` / `Ratio<BigInt>` element would otherwise fail
             //      closed. Empty/stale allowlist → None → fail-closed.
-            if crate::ty_convert::authenticate_arbitrary_precision(tcx, did, args).is_some() {
+            if crate::ty_convert::authenticate_arbitrary_precision(tcx, did, *args).is_some() {
                 return true;
             }
             // (a1) [C-zst] phantom / marker ZSTs surfaced by the deep-clone-container arm's
@@ -739,17 +1241,21 @@ fn tcx_clone_is_total<'tcx>(
             //      on leaf name AND std/alloc/core origin (a user type never matches); mirrors
             //      the audited carve-out in `tcx_derived_trait_is_total`. `PhantomData<T>`'s
             //      clone never touches T, so returning true without recursing T is sound.
+            let sysroot_adt = is_real_sysroot_crate(tcx, did.krate);
+            let mut sysroot_path: Option<String> = None;
+            if sysroot_adt
+                && matches!(
+                    tcx.item_name(did).as_str(),
+                    "Global" | "RandomState" | "PhantomData"
+                )
             {
-                let path = crate::safe_def_path_str(tcx, did);
-                let leaf = path.rsplit("::").next().unwrap_or(&path);
+                let path = sysroot_path.get_or_insert_with(|| crate::safe_def_path_str(tcx, did));
+                let leaf = path.rsplit("::").next().unwrap_or(path);
                 let leaf = leaf.split('<').next().unwrap_or(leaf);
                 if matches!(leaf, "Global" | "RandomState" | "PhantomData")
                     && (path.starts_with("std::")
                         || path.starts_with("alloc::")
                         || path.starts_with("core::"))
-                    // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance,
-                    // not the spoofable `std::`/`alloc::`/`core::` prefix.
-                    && is_real_sysroot_crate(tcx, did.krate)
                 {
                     return true;
                 }
@@ -757,28 +1263,31 @@ fn tcx_clone_is_total<'tcx>(
             // (a) a `#[derive(Clone)]` (`#[automatically_derived]`) impl dispatches Clone
             //     into the fields — total iff every field type is total. Resolve the
             //     concrete `<ty as Clone>::clone` to find and classify the impl.
-            let derived = ty::Instance::try_resolve(
-                tcx,
-                ty::TypingEnv::fully_monomorphized(),
-                clone_method,
-                tcx.mk_args(&[ty.into()]),
-            )
-            .ok()
-            .flatten()
-            .is_some_and(|inst| {
-                let impl_did = tcx.parent(inst.def_id());
-                matches!(tcx.def_kind(impl_did), rustc_hir::def::DefKind::Impl { .. })
-                    // `is_builtin_derived` (NOT `is_automatically_derived`) requires
-                    // UN-FORGEABLE `#[rustc_builtin_macro]` derive provenance PLUS
-                    // `as_local()`. A proc-macro-spelled `#[automatically_derived]`
-                    // on a hand-written panicking `clone` is thereby rejected.
-                    && tcx.is_builtin_derived(impl_did)
-            });
+            let clone_args = tcx.mk_args(&[ty.into()]);
+            let derived =
+                !crate::tuple_layouts::resolution_may_reenter(tcx, clone_method, clone_args)
+                    && ty::Instance::try_resolve(
+                        tcx,
+                        ty::TypingEnv::fully_monomorphized(),
+                        clone_method,
+                        clone_args,
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some_and(|inst| {
+                        let impl_did = tcx.parent(inst.def_id());
+                        matches!(tcx.def_kind(impl_did), rustc_hir::def::DefKind::Impl { .. })
+                        // `is_builtin_derived` (NOT `is_automatically_derived`) requires
+                        // UN-FORGEABLE `#[rustc_builtin_macro]` derive provenance PLUS
+                        // `as_local()`. A proc-macro-spelled `#[automatically_derived]`
+                        // on a hand-written panicking `clone` is thereby rejected.
+                        && tcx.is_builtin_derived(impl_did)
+                    });
             if derived {
                 return def.all_fields().all(|f| {
                     tcx_clone_is_total(
                         tcx,
-                        f.ty(tcx, args).skip_normalization(),
+                        f.ty(tcx, *args).skip_normalization(),
                         clone_method,
                         fuel - 1,
                         seen,
@@ -786,39 +1295,55 @@ fn tcx_clone_is_total<'tcx>(
                 });
             }
             // (b) a known std deep-clone container: total iff all type-arg elements are
-            //     total (the wrapper runs no user code; the `Global` allocator is total).
+            //     total and its allocator is `Global` (the wrapper runs no user code, and
+            //     a caller-supplied allocator's `allocate` is user code).
+            //
+            // Trust (2026-10-10, CALL-REACH-1 interim stopgap for design H2; superseded
+            // by CALL-REACH-1 phase 2): AND every allocator position is a sysroot
+            // allocator. Recursing the allocator under `Clone` asked "is your clone
+            // total?", not "does your `allocate` run your code?", and a `&A` passed
+            // outright (`Ref` above): `<Vec<u8, &'static dep::BombAlloc> as
+            // Clone>::clone` allocates through `<&A as Allocator>::allocate`, which
+            // calls `dep::BombAlloc::allocate`, inside the erased call. Read, not
+            // measured (`tests/ui/trust/sysroot_call_reach_type_arguments.rs`,
+            // `vec_clone_ref_bomb_alloc`). Both allocator gates must admit.
             if is_std_deep_clone_container(tcx, did) {
-                return args
-                    .types()
-                    .all(|t| tcx_clone_is_total(tcx, t, clone_method, fuel - 1, seen));
+                return std_container_allocators_are_global(tcx, did, *args)
+                    && audited_container_allocators_are_sysroot(tcx, did, *args)
+                    && cow_borrow_runs_no_user_code(tcx, did, *args)
+                    && args
+                        .types()
+                        .all(|t| tcx_clone_is_total(tcx, t, clone_method, fuel - 1, seen));
             }
-            let path = crate::safe_def_path_str(tcx, did);
-            // (b') HashMap/HashSet: `Clone` deep-clones the entries (K::clone + V::clone) and
-            //      copies the table structure WITHOUT re-hashing (no user `Hash` call), so it is
-            //      total iff every type arg's clone is total -- incl. the `RandomState` hasher /
-            //      `Global` allocator, whose clones are themselves total. (NOT added to the
-            //      shared `is_std_deep_clone_container`, which `tcx_derived_trait_is_total` also
-            //      uses: `eq` HASHES keys, so HashMap needs its key-Hash check there, not this.)
-            let leaf = path.rsplit("::").next().unwrap_or(&path);
-            let leaf = leaf.split('<').next().unwrap_or(leaf);
-            if matches!(leaf, "HashMap" | "HashSet")
-                && path.starts_with("std::")
-                && is_real_sysroot_crate(tcx, did.krate)
-            {
-                return args
-                    .types()
-                    .all(|t| tcx_clone_is_total(tcx, t, clone_method, fuel - 1, seen));
-            }
-            // (b'') niche int wrappers (`Nanoseconds`, ...) clone an inner primitive int -- total.
-            //       The std time types (`Instant`/`SystemTime`/`Duration`) derive Clone over such
-            //       a field, so without this their clone (and any holder's, e.g. a
-            //       `HashMap<_, TokenBucket{ last_refill: Option<Instant> }>`) fails.
-            if (path.starts_with("core::num::niche_types::")
-                || path.starts_with("std::num::niche_types::"))
-                // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
-                && is_real_sysroot_crate(tcx, did.krate)
-            {
-                return true;
+            if sysroot_adt {
+                let path = sysroot_path.get_or_insert_with(|| crate::safe_def_path_str(tcx, did));
+                // (b') HashMap/HashSet: `Clone` deep-clones the entries (K::clone + V::clone) and
+                //      copies the table structure WITHOUT re-hashing (no user `Hash` call), so it is
+                //      total iff every type arg's clone is total -- incl. the `RandomState` hasher /
+                //      `Global` allocator, whose clones are themselves total. (NOT added to the
+                //      shared `is_std_deep_clone_container`, which `tcx_derived_trait_is_total` also
+                //      uses: `eq` HASHES keys, so HashMap needs its key-Hash check there, not this.)
+                let leaf = path.rsplit("::").next().unwrap_or(path);
+                let leaf = leaf.split('<').next().unwrap_or(leaf);
+                //
+                //      Trust (2026-10-10, CALL-REACH-1 interim stopgap for design H2;
+                //      superseded by CALL-REACH-1 phase 2): AND the allocator is a sysroot
+                //      one, as in arm (b): the cloned table is allocated through it.
+                if matches!(leaf, "HashMap" | "HashSet") && path.starts_with("std::") {
+                    return audited_container_allocators_are_sysroot(tcx, did, *args)
+                        && args
+                            .types()
+                            .all(|t| tcx_clone_is_total(tcx, t, clone_method, fuel - 1, seen));
+                }
+                // (b'') niche int wrappers (`Nanoseconds`, ...) clone an inner primitive int -- total.
+                //       The std time types (`Instant`/`SystemTime`/`Duration`) derive Clone over such
+                //       a field, so without this their clone (and any holder's, e.g. a
+                //       `HashMap<_, TokenBucket{ last_refill: Option<Instant> }>`) fails.
+                if path.starts_with("core::num::niche_types::")
+                    || path.starts_with("std::num::niche_types::")
+                {
+                    return true;
+                }
             }
             // (c) element-free std leaf (`String`/`Ordering`/`Duration`/`NonZero`).
             is_element_free_total_std_adt(tcx, did)
@@ -830,6 +1355,252 @@ fn tcx_clone_is_total<'tcx>(
 /// Fuel for the structural drop-totality recursion (bounds recursive types); the
 /// drop twin of [`CLONE_TOTALITY_FUEL`].
 const DROP_TOTALITY_FUEL: u32 = 32;
+
+/// Trust (2026-09-28): the hasher type `hasher` (a `BuildHasher` such as `RandomState`, or a
+/// `Hasher`) is std code all the way down: every type it mentions is a real sysroot ADT, a
+/// reference, or a primitive. The hasher gates used to check only the OUTER type's crate, which
+/// admitted `BuildHasherDefault<UserHasher>` and `Box<UserHasher>` (std implements `Hasher` for
+/// `Box<H>`), whose `write`/`finish` is user code. Measured: `HashMap`/`HashSet` `==` over a
+/// user `BuildHasher`, a `contains_key` over `BuildHasherDefault<UserHasher>`, and
+/// `u32::hash` into a `Box<UserHasher>` each built `certify` rc=0 PROVED, and each certified
+/// artifact panicked in the user hasher.
+fn hasher_ty_is_std_closed<'tcx>(tcx: TyCtxt<'tcx>, hasher: ty::Ty<'tcx>) -> bool {
+    hasher.walk().all(|arg| match arg.kind() {
+        ty::GenericArgKind::Lifetime(_) => true,
+        ty::GenericArgKind::Const(_) => false,
+        ty::GenericArgKind::Type(t) => match t.kind() {
+            ty::TyKind::Adt(def, _) => is_real_sysroot_crate(tcx, def.did().krate),
+            ty::TyKind::Ref(..)
+            | ty::TyKind::Bool
+            | ty::TyKind::Char
+            | ty::TyKind::Int(_)
+            | ty::TyKind::Uint(_) => true,
+            _ => false,
+        },
+    })
+}
+
+/// Trust (2026-09-27): every ALLOCATOR type argument of the sysroot container `did` is
+/// `Global`. A container's drop frees through `A::deallocate` and its clone allocates
+/// through `A::allocate`. For a caller-supplied `A` both are user code that may panic,
+/// and recursing into `A`'s own drop or clone glue never sees them. Measured: `Box<u8, A>`
+/// and `VecDeque<u8, A>` whose `A::deallocate` panics were stamped drop-total, and
+/// `certify` proved a `drop` whose built artifact panicked. An allocator parameter is one
+/// the container's own definition bounds by the sysroot's `Allocator` trait, and `Global`
+/// is the `global_alloc_ty` lang item, so neither can be forged by a crate name.
+fn std_container_allocators_are_global<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: rustc_span::def_id::DefId,
+    args: ty::GenericArgs<'tcx>,
+) -> bool {
+    let global = tcx.lang_items().global_alloc_ty();
+    for (clause, _) in tcx.clauses_of(did).clauses.iter().copied() {
+        let ty::ClauseKind::Trait(pred) = clause.kind().skip_binder() else { continue };
+        let trait_did = pred.trait_ref.def_id;
+        if !is_real_sysroot_crate(tcx, trait_did.krate)
+            || tcx.item_name(trait_did).as_str() != "Allocator"
+            || !crate::safe_def_path_str(tcx, trait_did).ends_with("::alloc::Allocator")
+        {
+            continue;
+        }
+        let ty::TyKind::Param(param) = pred.self_ty().kind() else { return false };
+        let Some(arg) = args.get(param.index as usize).and_then(|arg| arg.as_type()) else {
+            return false;
+        };
+        let ty::TyKind::Adt(def, _) = arg.kind() else { return false };
+        if global != Some(def.did()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Trust (2026-10-07, review round 61): every sysroot container anywhere in `ty` (behind
+/// references, in tuples, in type arguments) uses the `Global` allocator. The total-call
+/// licences ERASE a collect/extend, and with it every `A::allocate`/`grow` of the
+/// destination and every `A::deallocate` of a consumed source; for a caller-supplied `A`
+/// those are user code that may panic. Measured: `d.extend(v)` with `d: &mut Vec<u64, Q>`
+/// or `v: Vec<u64, P>` was proved under `certify` and panicked in the allocator.
+fn ty_sysroot_allocators_are_global<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>, fuel: u32) -> bool {
+    if fuel == 0 {
+        return false;
+    }
+    match ty.kind() {
+        ty::Ref(_, inner, _) | ty::RawPtr(inner, _) | ty::Slice(inner) | ty::Array(inner, _) => {
+            ty_sysroot_allocators_are_global(tcx, *inner, fuel - 1)
+        }
+        ty::Tuple(elems) => {
+            elems.iter().all(|t| ty_sysroot_allocators_are_global(tcx, t, fuel - 1))
+        }
+        ty::Adt(def, args) => {
+            (!is_real_sysroot_crate(tcx, def.did().krate)
+                || std_container_allocators_are_global(tcx, def.did(), *args))
+                && args.types().all(|t| ty_sysroot_allocators_are_global(tcx, t, fuel - 1))
+        }
+        _ => true,
+    }
+}
+
+/// The impl the trait solver SELECTS for `ty: Trait` (every other type parameter of the
+/// trait, such as `PartialEq`'s `Rhs`, set to `ty`), or `None` when nothing user-defined
+/// applies (no impl, a builtin or ambiguous candidate, or an error). `ty` must be
+/// monomorphic.
+fn selected_impl_for<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_did: rustc_span::def_id::DefId,
+    ty: ty::Ty<'tcx>,
+) -> Option<rustc_span::def_id::DefId> {
+    if ty.has_non_region_param() || ty.has_escaping_bound_vars() {
+        return None;
+    }
+    let params = tcx.generics_of(trait_did).count();
+    if params == 0
+        || tcx
+            .generics_of(trait_did)
+            .own_params
+            .iter()
+            .any(|p| !matches!(p.kind, ty::GenericParamDefKind::Type { .. }))
+    {
+        return None;
+    }
+    let trait_ref =
+        ty::TraitRef::new(tcx, trait_did, std::iter::repeat_n(ty::GenericArg::from(ty), params));
+    match tcx
+        .codegen_select_candidate(ty::TypingEnv::fully_monomorphized().as_query_input(trait_ref))
+    {
+        Ok(rustc_middle::traits::ImplSource::UserDefined(data)) => Some(data.impl_def_id),
+        _ => None,
+    }
+}
+
+/// The trait solver says `ty` does NOT implement the trait (every other type parameter
+/// set to `ty`). Only this outcome licenses skipping a container element; ambiguity, an
+/// object or builtin candidate, or a non-monomorphic type all answer `false`.
+fn selection_is_unimplemented<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_did: rustc_span::def_id::DefId,
+    ty: ty::Ty<'tcx>,
+) -> bool {
+    if ty.has_non_region_param() || ty.has_escaping_bound_vars() {
+        return false;
+    }
+    let generics = tcx.generics_of(trait_did);
+    if generics.own_params.iter().any(|p| !matches!(p.kind, ty::GenericParamDefKind::Type { .. })) {
+        return false;
+    }
+    let trait_ref = ty::TraitRef::new(
+        tcx,
+        trait_did,
+        std::iter::repeat_n(ty::GenericArg::from(ty), generics.count()),
+    );
+    matches!(
+        tcx.codegen_select_candidate(
+            ty::TypingEnv::fully_monomorphized().as_query_input(trait_ref)
+        ),
+        Err(rustc_middle::traits::CodegenObligationError::Unimplemented)
+    )
+}
+
+/// The normalized `Iterator::Item` of `iter_ty`, when it resolves.
+fn iterator_item_ty_of<'tcx>(tcx: TyCtxt<'tcx>, iter_ty: ty::Ty<'tcx>) -> Option<ty::Ty<'tcx>> {
+    let iterator = tcx.get_diagnostic_item(rustc_span::sym::Iterator)?;
+    let item_assoc = tcx
+        .associated_items(iterator)
+        .find_by_ident_and_kind(
+            tcx,
+            rustc_span::Ident::with_dummy_span(rustc_span::sym::Item),
+            ty::AssocTag::Type,
+            iterator,
+        )?
+        .def_id;
+    let item = ty::Ty::new_projection(tcx, ty::IsRigid::No, item_assoc, [iter_ty]);
+    tcx.try_normalize_erasing_regions(
+        ty::TypingEnv::fully_monomorphized(),
+        ty::Unnormalized::new_wip(item),
+    )
+    .ok()
+}
+
+/// Trust (2026-10-07, review round 63): does the source iterator chain run only
+/// verified or total code PER ITEM? The total-call licences ERASE the whole
+/// collect/extend, so every call an adapter makes inside it is erased too:
+///  * a function parameter (`Map<I, F>`, `Filter<I, P>`, `Scan<I, St, F>`, …) must be a
+///    closure or a function item defined in THIS crate, whose body is verified as its
+///    own root; a function pointer, `&dyn Fn` or a foreign function item is unverified
+///    code (a `fn(&u8) -> u8` that panics was proved);
+///  * an adapter may DROP the items of its inner iterator (`Filter`, `Skip`, `StepBy`,
+///    `TakeWhile`, `Peekable`, …), and those items' type appears in neither the source
+///    nor the destination type, so the inner `Item` must be drop-total;
+///  * `Cloned` runs the inner item's `Clone`, which must be total;
+///  * the set operations (`Difference`, `Intersection`, `Union`,
+///    `SymmetricDifference`) run the SOURCE sets' `Ord`/`Hash`/`Eq` and hasher, which
+///    the licences never check, so they are refused.
+/// A leaf collection iterator yields stored elements and needs nothing beyond the
+/// source type's own drop totality, which the licences check separately.
+fn source_chain_per_item_is_total<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>, fuel: u32) -> bool {
+    if fuel == 0 || ty.has_non_region_param() {
+        return false;
+    }
+    let ty::Adt(def, args) = ty.peel_refs().kind() else { return true };
+    if !is_real_sysroot_crate(tcx, def.did().krate) {
+        return false;
+    }
+    let path = std::cell::OnceCell::new();
+    let in_module = |m: &str| {
+        path.get_or_init(|| tcx.def_path(def.did())).data.iter().any(|segment| {
+            matches!(segment.data, rustc_hir::definitions::DefPathData::TypeNs(n) if n.as_str() == m)
+        })
+    };
+    let name = tcx.item_name(def.did());
+    if matches!(name.as_str(), "Difference" | "Intersection" | "Union" | "SymmetricDifference") {
+        return false;
+    }
+    if !in_module("adapters") {
+        return true;
+    }
+    // Trust (2026-10-15): a `&mut F` / `&F` callable (`map(&mut c)`) runs `F`'s own body —
+    // `<&mut F as FnMut>::call_mut` and `<&F as FnMut>::call_mut` forward to it — so it is
+    // judged as `F`, one reference level only. The merge of 2026-10-14 conjoined this gate
+    // (040d3bce872) with main's SP-2 source check, which already admits a reference to a
+    // local closure (`collect_extend_source_runs_unverified_code.rs#local_closure_ref`,
+    // check-pass there, refused here for the bare reference). A reference to a fn
+    // pointer or `dyn` callable still answers `false` (`#ref_mut_fnptr`).
+    let callable_ok = |f: ty::Ty<'tcx>| {
+        let f = match f.kind() {
+            ty::Ref(_, inner, _) => *inner,
+            _ => f,
+        };
+        match f.kind() {
+            ty::Closure(did, _) | ty::FnDef(did, _) => did.is_local(),
+            _ => false,
+        }
+    };
+    let callable_at = match name.as_str() {
+        "Map" | "Filter" | "FilterMap" | "TakeWhile" | "SkipWhile" | "MapWhile" | "Inspect" => {
+            Some(1)
+        }
+        "Scan" => Some(2),
+        _ => None,
+    };
+    if let Some(index) = callable_at {
+        if !args.types().nth(index).is_some_and(callable_ok) {
+            return false;
+        }
+    }
+    let inner_ok = |inner: ty::Ty<'tcx>| {
+        source_chain_per_item_is_total(tcx, inner, fuel - 1)
+            && iterator_item_ty_of(tcx, inner).is_some_and(|item| tcx_drop_is_total(tcx, item))
+    };
+    match name.as_str() {
+        "Chain" | "Zip" => args.types().take(2).all(inner_ok),
+        "Cloned" => args.types().next().is_some_and(|inner| {
+            inner_ok(inner)
+                && iterator_item_ty_of(tcx, inner)
+                    .is_some_and(|item| clone_is_total_ty(tcx, item.peel_refs()))
+        }),
+        _ => args.types().next().is_some_and(inner_ok),
+    }
+}
 
 /// Std/alloc/core owning containers whose `Drop` impl is AUDITED panic-free MODULO
 /// its elements: the glue drops each element then deallocates (alloc-abort is out of
@@ -843,17 +1614,95 @@ const DROP_TOTALITY_FUEL: u32 = 32;
 /// `Rc`/`Arc` are OMITTED (shared ownership -- a conservative omission that fails
 /// closed).
 fn is_audited_total_drop_std_container(tcx: TyCtxt<'_>, did: rustc_span::def_id::DefId) -> bool {
+    // SOUNDNESS (crate-name forgery) + PERF: require the un-forgeable sysroot
+    // `StableCrateId` first before formatting `safe_def_path_str` — rustc does not
+    // reserve `alloc`/`std`/`core`, so a `--crate-name alloc` dep can spell
+    // `alloc::vec::Vec` with a PANICKING `Drop`, and checking `did.krate` first
+    // eliminates formatting def-paths on every local/dependency ADT in drop-totality walks.
+    if !is_real_sysroot_crate(tcx, did.krate) {
+        return false;
+    }
+    if !matches!(
+        tcx.item_name(did).as_str(),
+        "Vec"
+            | "VecDeque"
+            | "BTreeMap"
+            | "BTreeSet"
+            | "BinaryHeap"
+            | "LinkedList"
+            | "String"
+            | "HashMap"
+            | "HashSet"
+            | "Box"
+            | "IntoIter"
+            | "Drain"
+            | "IntoKeys"
+            | "IntoValues"
+    ) {
+        return false;
+    }
     let path = crate::safe_def_path_str(tcx, did);
     if !(path.starts_with("alloc::") || path.starts_with("std::") || path.starts_with("core::")) {
         return false;
     }
-    // SOUNDNESS (crate-name forgery): the reserved-root prefix above is a pre-filter
-    // only — rustc does not reserve `alloc`/`std`/`core`, so a `--crate-name alloc`
-    // dep can spell `alloc::vec::Vec` with a PANICKING `Drop`. This fn feeds the
-    // `TotalDrop` AdtAuth stamp; require the un-forgeable sysroot `StableCrateId` so a
-    // like-named impostor container never certifies its drop glue total.
-    if !is_real_sysroot_crate(tcx, did.krate) {
-        return false;
+    // The types a LISTED container's own `Drop` DELEGATES to, matched on the full path
+    // because their leaf names are not distinctive (every container has an `IntoIter`).
+    //
+    // These are NOT new premises. `BTreeMap`'s `Drop` is, verbatim
+    // (library/alloc/src/collections/btree/map.rs:206):
+    //
+    //     fn drop(&mut self) { drop(unsafe { ptr::read(self) }.into_iter()) }
+    //
+    // so the `BTreeMap` entry below ALREADY asserts that dropping the map's `IntoIter`
+    // is total for drop-total `K`/`V` — that IS the map's drop. Crediting the map while
+    // declining the iterator it drops through is not conservative, it is inconsistent:
+    // the map's own glue never appears, only the iterator's, so the credit was
+    // unreachable and the row failed closed with `drop glue for
+    // alloc::collections::btree::map::IntoIter has unproven panic-freedom`. Measured
+    // 2026-09-26: `BTreeMap::new()` + `drop` verifies (exit 0), and adding one
+    // `insert` — which is what puts a node in the tree for the iterator to walk —
+    // takes it to exit 1.
+    //
+    // A LEAF match would be wrong here. `"IntoIter"` as a leaf would credit
+    // `alloc::vec::IntoIter`, `core::array::IntoIter`, every hash-map iterator and
+    // anything else in the sysroot spelled that way, none of which has been argued.
+    // Each entry here must name a type some LISTED container's `Drop` delegates to,
+    // and must be justified by that container's own entry.
+    //
+    // The element types are still checked: this function only says "this ADT's own
+    // glue is dealloc plus its args' glue"; `tcx_drop_is_total_fueled` recurses into
+    // the concrete args and fails closed on any user `Drop` among them.
+    if matches!(path.as_str(), "alloc::collections::btree::map::IntoIter") {
+        return true;
+    }
+    // Trust (2026-10-08): the OWNING iterators of the listed containers, each argued
+    // from its own `Drop` the same way. `vec::IntoIter`'s `Drop` is `drop_in_place`
+    // of the remaining slice then `dealloc_only` (library/alloc/src/vec/into_iter.rs);
+    // `vec::Drain`'s drops the undrained items and memmoves the tail back
+    // (vec/drain.rs); `array::IntoIter`'s drops its alive range (core array/iter.rs);
+    // the `VecDeque` iterators wrap a `VecDeque` / do the same move-back; the btree set
+    // `IntoIter` wraps the map `IntoIter` above; the std hash iterators wrap hashbrown's
+    // `RawIntoIter`/`RawDrain`, which drop the remaining entries and free (or clear)
+    // the table. None runs anything but element drops and the allocator, and the
+    // caller still recurses the element and allocator ARGUMENTS, so a user `Drop`
+    // element or a user allocator fails closed. Review round 64 measured
+    // `d.extend(v.into_iter().map(..))` failing the default build without these.
+    if matches!(
+        path.as_str(),
+        "alloc::vec::into_iter::IntoIter"
+            | "alloc::vec::drain::Drain"
+            | "core::array::iter::IntoIter"
+            | "alloc::collections::vec_deque::into_iter::IntoIter"
+            | "alloc::collections::vec_deque::drain::Drain"
+            | "alloc::collections::btree::set::IntoIter"
+            | "std::collections::hash::map::IntoIter"
+            | "std::collections::hash::map::IntoKeys"
+            | "std::collections::hash::map::IntoValues"
+            | "std::collections::hash::map::Drain"
+            | "std::collections::hash::set::IntoIter"
+            | "std::collections::hash::set::Drain"
+    ) {
+        return true;
     }
     let leaf = path.rsplit("::").next().unwrap_or(&path);
     let leaf = leaf.split('<').next().unwrap_or(leaf);
@@ -872,27 +1721,107 @@ fn is_audited_total_drop_std_container(tcx: TyCtxt<'_>, did: rustc_span::def_id:
     )
 }
 
+/// Trust (2026-09-29): is every ALLOCATOR argument of the audited sysroot container
+/// `did` (at `args`) a SYSROOT allocator — `alloc::alloc::Global` (the
+/// `global_alloc_ty` lang item) or `std::alloc::System`, each in the real sysroot?
+///
+/// An allocator position is a type parameter that is bounded by
+/// `core::alloc::Allocator` in the container's own predicates, OR whose declared
+/// default is `Global`; either alone marks it, so a container spelling the bound in
+/// a `where` clause or omitting the default is still caught. Every other allocator
+/// — a dependency's or this crate's type, a `&A`, a `Box<A>` — is refused: its
+/// `deallocate` (and, for `BTreeMap`, its `clone`) is code the container's glue
+/// calls, and [`is_audited_total_drop_std_container`] audits the sysroot's code
+/// only. `Global`'s own `dealloc` still reaches the registered
+/// `#[global_allocator]`; that is the disclosed global-alloc contract row, not this
+/// stamp's claim.
+///
+/// MEASURED before this existed (stage 1 of origin/main `fbb9fa383d2` and of the
+/// sysroot-drop-reach fix, m3's debug std): `drop` of `Option<Box<u32,
+/// dep::DepAlloc>>`, `Result<Box<u32, DepAlloc>, u8>`, a struct holding a
+/// `Box<u32, DepAlloc>`, `HashMap<u8, Vec<u8, DepAlloc>>` and a dependency's
+/// `HBox(Box<u32, DepAlloc>)` built exit 0 under `-Ztrust-policy=certify` with
+/// `functions_verified` 1 of 1, and a verify-off `main` panicked in
+/// `DepAlloc::deallocate`: the enclosing node carried this stamp, and the bridge
+/// accepts a stamped node without visiting the `Box` beneath it.
+fn audited_container_allocators_are_sysroot<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: DefId,
+    args: ty::GenericArgs<'tcx>,
+) -> bool {
+    use rustc_middle::ty::TyKind;
+    let is_sysroot_allocator_trait = |trait_did: DefId| {
+        is_real_sysroot_crate(tcx, trait_did.krate)
+            && tcx.item_name(trait_did).as_str() == "Allocator"
+            && crate::safe_def_path_str(tcx, trait_did) == "core::alloc::Allocator"
+    };
+    let is_global = |ty: ty::Ty<'tcx>| {
+        ty.ty_adt_def().is_some_and(|adt| {
+            is_real_sysroot_crate(tcx, adt.did().krate)
+                && tcx.is_lang_item(adt.did(), rustc_attr_ir::lang_items::LangItem::GlobalAlloc)
+        })
+    };
+    let is_sysroot_allocator = |ty: ty::Ty<'tcx>| {
+        is_global(ty)
+            || ty.ty_adt_def().is_some_and(|adt| {
+                is_real_sysroot_crate(tcx, adt.did().krate)
+                    && tcx.item_name(adt.did()).as_str() == "System"
+                    && crate::safe_def_path_str(tcx, adt.did()) == "std::alloc::System"
+            })
+    };
+    let predicates = tcx.clauses_of(did).clauses;
+    for param in &tcx.generics_of(did).own_params {
+        if !matches!(param.kind, ty::GenericParamDefKind::Type { .. }) {
+            continue;
+        }
+        let bounded_by_allocator = predicates.iter().any(|(clause, _)| {
+            clause.as_trait_clause().is_some_and(|trait_pred| {
+                let trait_pred = trait_pred.skip_binder();
+                matches!(trait_pred.self_ty().kind(), TyKind::Param(p) if p.index == param.index)
+                    && is_sysroot_allocator_trait(trait_pred.def_id())
+            })
+        });
+        let defaults_to_global = param
+            .default_value(tcx)
+            .and_then(|default| default.skip_binder().as_type())
+            .is_some_and(is_global);
+        if !(bounded_by_allocator || defaults_to_global) {
+            continue;
+        }
+        // An allocator position the args do not carry (a malformed instantiation)
+        // fails closed.
+        let Some(arg) = args.get(param.index as usize).and_then(|a| a.as_type()) else {
+            return false;
+        };
+        if !is_sysroot_allocator(arg) {
+            return false;
+        }
+    }
+    true
+}
+
 /// True iff dropping a value of the CONCRETE monomorphized `ty` is PROVABLY
 /// panic-free -- its drop glue runs NO user code -- WITHOUT an axiom. The drop twin
 /// of [`tcx_clone_is_total`] and the extraction half of the `AdtAuth::TotalDrop`
 /// stamp. Running at the tcx level (CONCRETE generic args) it sees a container's real
 /// `K`/`V`, which the element-erased compatibility IR the bridge classifier walks
 /// cannot. True iff EVERY node in the owned tree is a primitive / non-owning
-/// reference / audited std owning container (dealloc only) / authenticated bignum,
+/// reference / audited std owning container (dealloc only) AT A SYSROOT ALLOCATOR
+/// ([`audited_container_allocators_are_sysroot`]) / authenticated bignum,
 /// and NO ADT in it carries a user `Drop` impl (rustc `has_dtor`) -- a user `Drop`
 /// runs arbitrary, possibly-panicking code and FAILS CLOSED. A non-monomorphic param
 /// also fails closed (its concrete `Drop` is unknown). SOUND: the stamp this feeds is
 /// `#[serde(skip)]`, so a decoded bundle reads `None` (never certified); any user
 /// `Drop`, unaudited container, or fuel-bail declines -- never a false PROVE.
 pub(crate) fn tcx_drop_is_total<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
-    tcx_drop_is_total_fueled(tcx, ty, DROP_TOTALITY_FUEL, &mut std::collections::HashSet::new())
+    tcx_drop_is_total_fueled(tcx, ty, DROP_TOTALITY_FUEL, &mut FxHashSet::default())
 }
 
 fn tcx_drop_is_total_fueled<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
     fuel: u32,
-    seen: &mut std::collections::HashSet<ty::Ty<'tcx>>,
+    seen: &mut FxHashSet<ty::Ty<'tcx>>,
 ) -> bool {
     use rustc_middle::ty::TyKind;
     if fuel == 0 {
@@ -933,7 +1862,7 @@ fn tcx_drop_is_total_fueled<'tcx>(
             // (a) authenticated arbitrary-precision leaf: drop bottoms out in a
             //     fixed-primitive `Vec<u64>`/`Sign` tree -- dealloc only, no user
             //     code. Same un-spoofable StableCrateId authority as the F6 stamp.
-            if crate::ty_convert::authenticate_arbitrary_precision(tcx, did, args).is_some() {
+            if crate::ty_convert::authenticate_arbitrary_precision(tcx, did, *args).is_some() {
                 return true;
             }
             // (b) an AUDITED std owning container (`Vec`/`BTreeMap`/`Box`/...): its
@@ -943,7 +1872,22 @@ fn tcx_drop_is_total_fueled<'tcx>(
             //     `Unique`/`RawVec`/hashbrown fields -- which would wrongly admit
             //     `Box<PanickyDrop>` through the non-owning pointer arm, or wrongly
             //     decline `HashMap` through hashbrown's own `Drop`.
+            //     Its allocator must be `Global`: the glue frees through `A::deallocate`.
             if is_audited_total_drop_std_container(tcx, did) {
+                // Trust (2026-09-29): the audit covers the SYSROOT's glue only. A
+                // container's glue also calls its ALLOCATOR (`A::deallocate`, and
+                // `A::clone` in `BTreeMap`'s `IntoIter`), so at a non-sysroot
+                // allocator it runs code the dropped value chose — which this arm's
+                // "dealloc + per-element drop, no user code" claim does not cover.
+                // Recursing the allocator argument as if it were an element only asked
+                // whether the allocator has a DESTRUCTOR, and a panicking
+                // `deallocate` on a destructor-free allocator passed.
+                // Both allocator gates must admit (ours: `Global` only).
+                if !audited_container_allocators_are_sysroot(tcx, did, *args)
+                    || !std_container_allocators_are_global(tcx, did, *args)
+                {
+                    return false;
+                }
                 return args.types().all(|t| tcx_drop_is_total_fueled(tcx, t, fuel - 1, seen));
             }
             // (c) any OTHER ADT carrying a user `Drop` impl runs arbitrary code.
@@ -953,12 +1897,7 @@ fn tcx_drop_is_total_fueled<'tcx>(
             // (d) no user `Drop` impl: the glue is EXACTLY the fields' glue (all
             //     variants for an enum) -- total iff every field's drop is.
             def.all_fields().all(|f| {
-                tcx_drop_is_total_fueled(
-                    tcx,
-                    f.ty(tcx, args).skip_normalization(),
-                    fuel - 1,
-                    seen,
-                )
+                tcx_drop_is_total_fueled(tcx, f.ty(tcx, *args).skip_normalization(), fuel - 1, seen)
             })
         }
         // A closure type cannot carry a user `Drop` impl (its anonymous type is
@@ -987,7 +1926,7 @@ fn tcx_derived_trait_is_total<'tcx>(
     ty: ty::Ty<'tcx>,
     trait_did: rustc_span::def_id::DefId,
     fuel: u32,
-    seen: &mut std::collections::HashSet<ty::Ty<'tcx>>,
+    seen: &mut FxHashSet<ty::Ty<'tcx>>,
 ) -> bool {
     use rustc_middle::ty::TyKind;
     if fuel == 0 {
@@ -1049,32 +1988,65 @@ fn tcx_derived_trait_is_total<'tcx>(
             // `ArbPrecKind::clears_total_derived_trait_family` (the same RC-C integer/
             // rational split `is_integer_arbitrary_precision_ty` applies on the bridge
             // side), so a rational receiver KEEPS its honest obligation.
-            if crate::ty_convert::authenticate_arbitrary_precision(tcx, def.did(), args)
+            if crate::ty_convert::authenticate_arbitrary_precision(tcx, def.did(), *args)
                 .is_some_and(ArbPrecKind::clears_total_derived_trait_family)
             {
                 return true;
             }
-            let mut derived = false;
-            tcx.for_each_relevant_impl(trait_did, ty, |impl_did| {
-                // `is_builtin_derived` (NOT `is_automatically_derived`): un-forgeable
-                // `#[rustc_builtin_macro]` provenance + `as_local()`. A proc-macro-spelled
-                // `#[automatically_derived]` over a hand-written panicking `fmt` is rejected
-                // (fails closed → the field Debug stays UNKNOWN). Mirrors the audited
-                // `tcx_clone_is_total` gate. REQUIRED because the Debug-finisher sentinel
-                // makes this fn LIVE via `debug_finisher_all_fields_total`.
-                if tcx.is_builtin_derived(impl_did) {
-                    derived = true;
+            // Review rounds 66-67: decide on the impl that ACTUALLY applies to `ty`, selected
+            // by the trait solver, not on the impls `for_each_relevant_impl` reports. That
+            // list includes impls that do not apply: a generic `#[derive(Ord)] K<T>` beside a
+            // hand-written `impl Ord for K<M>` (round 66), and core's blanket `impl<F: FnPtr>
+            // Ord for F`, which made "every relevant impl derived" refuse every ADT (round 67).
+            // `is_builtin_derived` (NOT `is_automatically_derived`): un-forgeable
+            // `#[rustc_builtin_macro]` provenance + `as_local()`, so a proc-macro-spelled
+            // `#[automatically_derived]` over a hand-written panicking body fails closed.
+            // Review round 68: under specialization a derived impl inherits every method
+            // it does not define (`ne`, `lt`, …) from a parent `default fn` impl, which is
+            // user code, so the derived-impl argument fails closed in a crate that enables
+            // it (a builtin-derived impl is always local, so the local features decide).
+            let specialization =
+                tcx.features().specialization() || tcx.features().min_specialization();
+            let derived = !specialization
+                && selected_impl_for(tcx, trait_did, ty)
+                    .is_some_and(|impl_did| tcx.is_builtin_derived(impl_did));
+            // Review round 69: `#[derive(PartialOrd)]` beside an `Ord` impl expands to
+            // `Some(Ord::cmp(self, other))` (`rustc_builtin_macros` `has_derive_ord`), so
+            // the code that runs is the type's `Ord`, not field-wise `PartialOrd`. When
+            // `ty` has an `Ord` impl, a `PartialOrd` answer also needs `Ord` total. A
+            // FRESH `seen` set: the one in hand is keyed by type alone and would answer a
+            // revisit of `ty` with `true`.
+            if derived && tcx.get_diagnostic_item(rustc_span::sym::PartialOrd) == Some(trait_did) {
+                if let Some(ord) = tcx.get_diagnostic_item(rustc_span::sym::Ord) {
+                    // Only a builtin `#[derive(Ord)]` triggers the delegation (a
+                    // hand-written `Ord` never coexists with it), so only then must
+                    // `Ord` be total (review round 70 measured the over-refusal).
+                    if selected_impl_for(tcx, ord, ty)
+                        .is_some_and(|impl_did| tcx.is_builtin_derived(impl_did))
+                        && !tcx_derived_trait_is_total(
+                            tcx,
+                            ty,
+                            ord,
+                            fuel - 1,
+                            &mut FxHashSet::default(),
+                        )
+                    {
+                        return false;
+                    }
                 }
-            });
+            }
             if derived {
+                // Review round 70: normalize each field type first, so a projection field
+                // (`Box<<u32 as Tr>::A>`) is judged as the type it names; a field that
+                // does not normalize fails closed.
                 return def.all_fields().all(|f| {
-                    tcx_derived_trait_is_total(
-                        tcx,
-                        f.ty(tcx, args).skip_normalization(),
-                        trait_did,
-                        fuel - 1,
-                        seen,
+                    tcx.try_normalize_erasing_regions(
+                        ty::TypingEnv::fully_monomorphized(),
+                        f.ty(tcx, *args),
                     )
+                    .is_ok_and(|field_ty| {
+                        tcx_derived_trait_is_total(tcx, field_ty, trait_did, fuel - 1, seen)
+                    })
                 });
             }
             if is_std_deep_clone_container(tcx, def.did()) {
@@ -1084,10 +2056,25 @@ fn tcx_derived_trait_is_total<'tcx>(
                 // relevant impl of `trait_did`. (A real element arg DOES impl the trait and is
                 // recursed; this matters because, unlike Clone, e.g. `Global` is `Clone` but not
                 // `PartialEq`, so the un-skipped recursion would wrongly fail on it.)
+                if !cow_borrow_runs_no_user_code(tcx, def.did(), *args) {
+                    return false;
+                }
+                // Review round 67: the impl that applies to the CONTAINER must be the
+                // sysroot's own. `Box` is `#[fundamental]`, so a crate may write `impl Ord
+                // for Box<K>` when `K: !Ord`; the element `K` then implements nothing, is
+                // skipped below, and the user's `cmp` would have been vouched for.
+                if !selected_impl_for(tcx, trait_did, ty)
+                    .is_some_and(|impl_did| is_real_sysroot_crate(tcx, impl_did.krate))
+                {
+                    return false;
+                }
+                // Review round 70: skip an element ONLY when the solver says it does not
+                // implement the trait at all. Anything else (an object candidate for
+                // `dyn Debug`, an unnormalized projection, ambiguity) is recursed into,
+                // where it fails closed: `None` from `selected_impl_for` is not "absent".
                 return args.types().all(|t| {
-                    let mut participates = false;
-                    tcx.for_each_relevant_impl(trait_did, t, |_| participates = true);
-                    !participates || tcx_derived_trait_is_total(tcx, t, trait_did, fuel - 1, seen)
+                    selection_is_unimplemented(tcx, trait_did, t)
+                        || tcx_derived_trait_is_total(tcx, t, trait_did, fuel - 1, seen)
                 });
             }
             // HashMap<K,V,_> / HashSet<K,_>: unlike BTreeMap (ordered, compares via `Ord`), the
@@ -1099,69 +2086,99 @@ fn tcx_derived_trait_is_total<'tcx>(
             // HashMap) recurse the value under PartialEq. Fail-closed for an exotic key or any
             // other trait (HashMap doesn't impl Hash; under Default it is trivially empty, not
             // modeled here).
-            let path = crate::safe_def_path_str(tcx, def.did());
-            let leaf = path.rsplit("::").next().unwrap_or(&path);
-            let leaf = leaf.split('<').next().unwrap_or(leaf);
-            // Phantom/marker ZSTs — the allocator (`Global`), hasher (`RandomState`), and
-            // `PhantomData` — carry no comparable/hashable data and are never touched by the
-            // `eq`/`hash`/`cmp`/`default` of the std type that holds them. Treat as total
-            // WHEREVER recursed (a derived type's internal `Vec<u8, Global>` / `RawVec` field
-            // reaches them DIRECTLY, not only via the container arm above). SOUND: none of them
-            // impls these traits in a value-bearing way; the holder skips them.
-            if matches!(leaf, "Global" | "RandomState" | "PhantomData")
-                && (path.starts_with("std::")
-                    || path.starts_with("alloc::")
-                    || path.starts_with("core::"))
-                // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
-                && is_real_sysroot_crate(tcx, def.did().krate)
-            {
-                return true;
-            }
-            // `core::num::niche_types::*` (`Nanoseconds`, `U32NotAllOnes`, ...) wrap a primitive
-            // int with a validity niche; their `eq`/`hash`/`cmp`/`default` are total int ops.
-            // (Std types like `Duration` derive `PartialEq`/`Hash` over such a field, so without
-            // this the derived `Duration` impl — and any type holding a `Duration` — fails.)
-            if (path.starts_with("core::num::niche_types::")
-                || path.starts_with("std::num::niche_types::"))
-                // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
-                && is_real_sysroot_crate(tcx, def.did().krate)
-            {
-                return true;
-            }
-            if (leaf == "HashMap" || leaf == "HashSet")
-                && path.starts_with("std::")
-                && is_real_sysroot_crate(tcx, def.did().krate)
-            {
-                match tcx.item_name(trait_did).as_str() {
-                    // `default()` builds an EMPTY map/set — total, no per-element work.
-                    "Default" => return true,
-                    // `eq` LOOKS UP keys: total iff K's Hash AND Eq are total (restrict K to a
-                    // primitive / `str` / element-free std leaf, whose Hash+Eq are both total)
-                    // and (HashMap) V's Eq is total.
-                    "PartialEq" => {
-                        let mut tys = args.types();
-                        let key_total_hash_and_eq = tys.next().is_some_and(|k| {
-                            matches!(
-                                k.kind(),
-                                TyKind::Bool
-                                    | TyKind::Char
-                                    | TyKind::Int(_)
-                                    | TyKind::Uint(_)
-                                    | TyKind::Str
-                            ) || matches!(k.kind(), TyKind::Adt(d, _)
-                                if is_element_free_total_std_adt(tcx, d.did()))
-                        });
-                        let value_total = if leaf == "HashMap" {
-                            tys.next().is_some_and(|v| {
-                                tcx_derived_trait_is_total(tcx, v, trait_did, fuel - 1, seen)
-                            })
-                        } else {
-                            true
-                        };
-                        return key_total_hash_and_eq && value_total;
+            //
+            // SOUNDNESS (crate-name forgery) + PERF: require `is_real_sysroot_crate`
+            // first before formatting `safe_def_path_str`, avoiding def-path formatting
+            // on every local/dependency ADT in derived-trait totality walks.
+            if is_real_sysroot_crate(tcx, def.did().krate) {
+                let path = crate::safe_def_path_str(tcx, def.did());
+                let leaf = path.rsplit("::").next().unwrap_or(&path);
+                let leaf = leaf.split('<').next().unwrap_or(leaf);
+                // Phantom/marker ZSTs — the allocator (`Global`), hasher (`RandomState`), and
+                // `PhantomData` — carry no comparable/hashable data and are never touched by the
+                // `eq`/`hash`/`cmp`/`default` of the std type that holds them. Treat as total
+                // WHEREVER recursed (a derived type's internal `Vec<u8, Global>` / `RawVec` field
+                // reaches them DIRECTLY, not only via the container arm above). SOUND: none of them
+                // impls these traits in a value-bearing way; the holder skips them.
+                if matches!(leaf, "Global" | "RandomState" | "PhantomData")
+                    && (path.starts_with("std::")
+                        || path.starts_with("alloc::")
+                        || path.starts_with("core::"))
+                {
+                    return true;
+                }
+                // `core::num::niche_types::*` (`Nanoseconds`, `U32NotAllOnes`, ...) wrap a primitive
+                // int with a validity niche; their `eq`/`hash`/`cmp`/`default` are total int ops.
+                // (Std types like `Duration` derive `PartialEq`/`Hash` over such a field, so without
+                // this the derived `Duration` impl — and any type holding a `Duration` — fails.)
+                if path.starts_with("core::num::niche_types::")
+                    || path.starts_with("std::num::niche_types::")
+                {
+                    return true;
+                }
+                if (leaf == "HashMap" || leaf == "HashSet") && path.starts_with("std::") {
+                    // Trust (2026-09-28): the hasher `S` is CALLED by both arms below
+                    // (`default()` runs `S::default()`, and `eq` hashes every key through `S`),
+                    // so it must be std code all the way down.
+                    let hasher_std = args
+                        .types()
+                        .nth(if leaf == "HashMap" { 2 } else { 1 })
+                        .is_some_and(|hasher| hasher_ty_is_std_closed(tcx, hasher));
+                    match tcx.item_name(trait_did).as_str() {
+                        // `default()` builds an EMPTY map/set: no per-element work, only `S::default()`.
+                        "Default" => return hasher_std,
+                        // `eq` LOOKS UP keys: total iff K's Hash AND Eq are total (restrict K to a
+                        // primitive / `str` / element-free std leaf, whose Hash+Eq are both total)
+                        // and (HashMap) V's Eq is total.
+                        "PartialEq" => {
+                            let mut tys = args.types();
+                            let key_total_hash_and_eq = tys.next().is_some_and(|k| {
+                                matches!(
+                                    k.kind(),
+                                    TyKind::Bool
+                                        | TyKind::Char
+                                        | TyKind::Int(_)
+                                        | TyKind::Uint(_)
+                                        | TyKind::Str
+                                ) || matches!(k.kind(), TyKind::Adt(d, _)
+                                    if is_element_free_total_std_adt(tcx, d.did()))
+                            });
+                            let value_total = if leaf == "HashMap" {
+                                tys.next().is_some_and(|v| {
+                                    tcx_derived_trait_is_total(tcx, v, trait_did, fuel - 1, seen)
+                                })
+                            } else {
+                                true
+                            };
+                            // Trust (2026-10-10, CALL-REACH-1 interim stopgap for design H1;
+                            // superseded by CALL-REACH-1 phase 2): AND the hasher `S` is
+                            // std's code all the way down and the allocator is a sysroot
+                            // one. `HashMap::eq` calls `other.get(k)` for every entry, so it
+                            // hashes through `S` (`BuildHasherDefault<dep::BadHasher>` runs
+                            // `BadHasher::write`), the gates the query and extend sentinels
+                            // already ask (`hasher_ty_is_sysroot_throughout`,
+                            // `audited_container_allocators_are_sysroot`). Read, not measured
+                            // (`tests/ui/trust/sysroot_call_reach_type_arguments.rs`,
+                            // `hashmap_eq_bad_hasher`, `hashset_eq_bad_hasher`).
+                            let hasher = if leaf == "HashMap" {
+                                args.types().nth(2)
+                            } else {
+                                args.types().nth(1)
+                            };
+                            let hasher_sysroot =
+                                hasher.is_some_and(|s| hasher_ty_is_sysroot_throughout(tcx, s));
+                            let allocator_sysroot =
+                                audited_container_allocators_are_sysroot(tcx, def.did(), *args);
+                            // Ours (`hasher_std`) is kept alongside: every gate must admit.
+                            return hasher_std
+                                && key_total_hash_and_eq
+                                && value_total
+                                && hasher_sysroot
+                                && allocator_sysroot;
+                        }
+                        // HashMap/HashSet impl neither `Hash` nor `Ord`; fail closed for anything else.
+                        _ => {}
                     }
-                    // HashMap/HashSet impl neither `Hash` nor `Ord`; fail closed for anything else.
-                    _ => {}
                 }
             }
             is_element_free_total_std_adt(tcx, def.did())
@@ -1176,9 +2193,50 @@ fn tcx_derived_trait_is_total<'tcx>(
 pub fn is_total_derived_trait_call<'tcx>(
     _tcx: TyCtxt<'tcx>,
     _callee_def_id: rustc_span::def_id::DefId,
-    _gen_args: ty::GenericArgsRef<'tcx>,
+    _gen_args: ty::GenericArgs<'tcx>,
 ) -> bool {
     false
+}
+
+/// Trust (SP-1 review, 2026-10-05): is the HASHER type `hasher_ty` — a hash
+/// collection's `S: BuildHasher`, or the `H: Hasher` of a primitive
+/// `<P as Hash>::hash::<H>` — std's code all the way down: the type itself and EVERY
+/// type argument at any depth an ADT defined in a REAL sysroot crate
+/// ([`is_real_sysroot_crate`])?
+///
+/// Binding only the OUTER ADT to the sysroot (what every hasher gate did before) is
+/// not enough: `BuildHasherDefault<H>` is a sysroot type whose `hash_one` runs
+/// `H::default()`, `H::write`/`H::finish` and `H`'s drop glue, and `Box<H>` is a
+/// sysroot `Hasher` whose `write_*` forwards to `H`. Each is code the erased call
+/// runs. MEASURED on stage 1 of `0a525e155ab` (`tests/ui/trust/
+/// keyed_collection_hasher_and_query_allocator.rs`), with a verify-off dependency's
+/// `DropHasher` (benign `write`/`finish`, a `Drop` that panics once armed) and
+/// `BadHasher` (a `write` that panics once armed): `HashMap::insert`/`get`/`extend`,
+/// a `HashMap` collect, `HashSet::insert`/`remove` at
+/// `BuildHasherDefault<dep::DropHasher>`, a `HashSet` collect/`extend`/`contains` at
+/// `BuildHasherDefault<dep::BadHasher>`, and `x.hash(s)` for a `u32` into a
+/// `&mut Box<dep::BadHasher>` built exit 0 with no Verification Report, under
+/// certify too; a certify rlib holding them, linked into a verify-off `main` that
+/// arms the dependency, panicked in `DropHasher::drop` < `BuildHasherDefault::hash_one`
+/// and in `BadHasher::write` (< `<Box<_> as Hasher>::write_u32` for the last), exit
+/// 101.
+///
+/// GRANTING (it licenses the sentinel): a type or const PARAMETER, a reference, a
+/// `dyn`, a fn pointer or any other non-ADT node answers `false`, and so does a LOCAL
+/// hasher type, though its `Hasher` impl is verified as its own root — this predicate
+/// does not argue that (the capability cost, docs/DECISION_QUEUE.md SP-1-DROPS).
+/// Regions and const arguments run no code and are not asked.
+fn hasher_ty_is_sysroot_throughout<'tcx>(tcx: TyCtxt<'tcx>, hasher_ty: ty::Ty<'tcx>) -> bool {
+    if hasher_ty.has_non_region_param() {
+        return false;
+    }
+    let is_sysroot_adt = |t: ty::Ty<'tcx>| matches!(t.kind(), ty::TyKind::Adt(def, _) if is_real_sysroot_crate(tcx, def.did().krate));
+    // The outer ADT (the old check), then every type the walk reaches beneath it.
+    is_sysroot_adt(hasher_ty)
+        && hasher_ty.walk().all(|arg| match arg.kind() {
+            ty::GenericArgKind::Type(t) => is_sysroot_adt(t),
+            ty::GenericArgKind::Lifetime(_) | ty::GenericArgKind::Const(_) => true,
+        })
 }
 
 /// True iff the call is an `Iterator::collect::<C>` into a KEYED std collection
@@ -1214,10 +2272,25 @@ pub fn is_total_derived_trait_call<'tcx>(
 ///     NAMES itself `BTreeMap` is not admitted (mirrors `total_sequence_collect_call`);
 ///   - the destination must be MONOMORPHIC (`has_non_region_param`), so we never resolve into a
 ///     param-env ICE (the `tcx_clone_is_total` precedent);
-///   - for the Hash family, the HASHER `S` must itself be a std type. `S` is a type parameter
+///   - for the Hash family, the HASHER `S` must itself be a std type, and so must every type
+///     argument it carries (SP-1 review, 2026-10-05: [`hasher_ty_is_sysroot_throughout`]; a
+///     `BuildHasherDefault<dep::H>` runs `H`'s code). `S` is a type parameter
 ///     defaulting to `RandomState`, so a caller CAN supply a hand-written `BuildHasher`/`Hasher`
 ///     whose `write`/`finish` is user code that can panic; only std's own hasher is inside the
 ///     trusted `Hasher` surface. A foreign hasher fails closed.
+///
+/// Trust (SP-2, 2026-10-04): and the SOURCE. `from_iter` drives the source iterator, so the
+/// insert path is not the only code the erased call runs: a `Map`'s callback, a `Filter`'s
+/// predicate, `Cloned`'s `T::clone` and a `str` pattern run inside it too. The key gates above
+/// never looked there, and a fn pointer handed in from outside (`Map<Copied<Iter<u32>>, fn(u32)
+/// -> u32>`) was credited with zero rows; [`into_iter_source_runs_only_verified_code`] now
+/// requires every such piece to be std's own code or verified as its own root.
+///
+/// Trust (SP-1, 2026-10-04): and the DROPS. `from_iter` drops the earlier of two equal keys
+/// (BTree, with its value) or the old value and the passed key (Hash, through `extend`), so
+/// the key, and a map's value, must drop with no user code ([`keyed_collection_drops_are_total`]).
+/// Trust (SOURCE-SIDE-DROP-CERTIFY-1, 2026-10-13): so must whatever it drops on the SOURCE
+/// side ([`source_side_drops_are_total`]).
 ///
 /// NOTE what is deliberately NOT claimed: this says nothing about ALLOCATION. A keyed collect can
 /// still abort on OOM, exactly as its sequence twin can, and that abort stays outside the modeled
@@ -1226,7 +2299,7 @@ pub fn is_total_derived_trait_call<'tcx>(
 fn is_total_keyed_collect_call<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee_def_id: rustc_span::def_id::DefId,
-    gen_args: ty::GenericArgsRef<'tcx>,
+    gen_args: ty::GenericArgs<'tcx>,
 ) -> bool {
     use rustc_span::sym;
 
@@ -1275,6 +2348,62 @@ fn is_total_keyed_collect_call<'tcx>(
     if !is_real_sysroot_crate(tcx, def.did().krate) {
         return false;
     }
+    // Review round 61: the erased call runs the destination's and the source's allocator.
+    // Review round 62: and it drops the duplicates `from_iter` discards after sorting
+    // and whatever the consumed source does not yield, so both types must be drop-total.
+    if !ty_sysroot_allocators_are_global(tcx, dest_ty, 8)
+        || !tcx_drop_is_total(tcx, dest_ty)
+        || !call_input_ty(tcx, callee_def_id, gen_args, 0).is_some_and(|src| {
+            ty_sysroot_allocators_are_global(tcx, src, 8)
+                && tcx_drop_is_total(tcx, src)
+                && source_chain_per_item_is_total(tcx, src, 8)
+        })
+    {
+        return false;
+    }
+
+    // Trust (2026-09-25, F1): the NOTE above says this discharge "says nothing about
+    // ALLOCATION" — but the rewrite ERASES the call, and vcgen's allocation lane finds a
+    // `collect` by its name, so the allocation obligation was erased with it. And the
+    // residual is not only an abort: `HashSet::from_iter` reserves `size_hint().0` and
+    // `BTreeSet::from_iter` collects into a `Vec` first, both of which PANIC "capacity
+    // overflow" on a huge count. The rewrite is therefore licensed only where the count
+    // is bounded by an existing, non-zero-sized collection; any other source keeps its
+    // real callee, so the allocation lane charges it exactly as it charges a `Vec`
+    // collect (and the insert's panic-freedom is then the ordinary absent-callee row).
+    //
+    // Trust (W4 HASHMAP r3, 2026-09-29): and only where the destination can hold
+    // that many items ([`bounded_source_fits_destination`]): a bounded count of a
+    // one-byte source is not a bounded allocation of a `2^35`-byte element.
+    // Trust (2026-10-06, D12 option (a)): and the destination's upfront reservation
+    // for that many items must fit ([`bounded_source_reservation_fits_for`]). Both
+    // checks must admit.
+    let source = call_input_ty(tcx, callee_def_id, gen_args, 0);
+    if !source.is_some_and(|src| {
+        into_iter_source_live_count(tcx, src, 8)
+            .is_some_and(|count| bounded_source_fits_destination(tcx, dest_ty, count, false))
+            && bounded_source_reservation_fits_for(tcx, src, dest_ty, false)
+    }) {
+        return false;
+    }
+    // Trust (SP-2, 2026-10-04): the rewrite erases every call `from_iter` makes into
+    // the SOURCE too — `Map`'s callback, `Cloned`'s `T::clone`, a `str` pattern — so
+    // it is licensed only where all of that is std's own code or verified as its own
+    // root ([`into_iter_source_runs_only_verified_code`]).
+    if !source.is_some_and(|src| into_iter_source_runs_only_verified_code(tcx, src, 8)) {
+        return false;
+    }
+    // Trust (SOURCE-SIDE-DROP-CERTIFY-1, 2026-10-13): and every DROP `from_iter`
+    // performs on the source side — the item a `Filter` passes over, a `Take`
+    // remainder, a by-move capture, the value `IntoKeys` discards — which the rewrite
+    // erases with the call ([`source_side_drops_are_total`]). MEASURED: `it.collect::<
+    // HashSet<u32>>()` from a `btree_map::IntoKeys<u32, dep::Bomb>` and a `Filter` with
+    // a by-move `dep::Bomb` capture collected into a `HashMap` built exit 0 under
+    // certify, and panicked in `Bomb::drop` inside `from_iter` once armed
+    // (`tests/ui/trust/collect_extend_source_side_drops.rs`).
+    if !source.is_some_and(|src| source_side_drops_are_total(tcx, src, 8)) {
+        return false;
+    }
 
     // In all four (`BTreeMap<K, V, A>`, `BTreeSet<T, A>`, `HashMap<K, V, S>`, `HashSet<T, S>`)
     // the KEY is the first type argument. The VALUE is never compared or hashed on insert, so
@@ -1282,6 +2411,13 @@ fn is_total_keyed_collect_call<'tcx>(
     let Some(key_ty) = args.types().next() else {
         return false;
     };
+    // Trust (SP-1, 2026-10-04): but the VALUE (and the KEY) is DROPPED inside the call:
+    // `BTreeMap`/`BTreeSet` `from_iter` drops the earlier of two equal keys with its
+    // value, and the hash family's `from_iter` is `extend`, which drops the old value
+    // and the passed key on a hit ([`keyed_collection_drops_are_total`]).
+    if !keyed_collection_drops_are_total(tcx, adt_name.as_str(), *args) {
+        return false;
+    }
 
     let total_for = |item: rustc_span::Symbol| {
         tcx.get_diagnostic_item(item).is_some_and(|trait_did| {
@@ -1290,14 +2426,17 @@ fn is_total_keyed_collect_call<'tcx>(
                 key_ty,
                 trait_did,
                 CLONE_TOTALITY_FUEL,
-                &mut std::collections::HashSet::new(),
+                &mut FxHashSet::default(),
             )
         })
     };
 
     if keyed_by_ord {
         // BTree descent compares keys via `Ord::cmp`.
-        return total_for(sym::Ord);
+        // Review round 65: `from_iter` also SORTS (`PartialOrd::lt`) and DEDUPS
+        // (`PartialEq::ne`), and a derived `Ord` may sit beside a hand-written
+        // `PartialOrd`/`PartialEq`, so all three must be total.
+        return total_for(sym::Ord) && total_for(sym::PartialOrd) && total_for(sym::PartialEq);
     }
 
     // Hash family. The bucket index comes from `Hash::hash` feeding the collection's HASHER `S`,
@@ -1311,17 +2450,20 @@ fn is_total_keyed_collect_call<'tcx>(
     let Some(hasher_ty) = hasher_ty else {
         return false;
     };
-    let ty::Adt(hasher_def, _) = hasher_ty.kind() else {
-        return false;
-    };
     // SOUNDNESS (crate-name forgery): the hasher must be a REAL sysroot type, bound by
     // scid (a `--crate-name std` dep could forge a printed "std" name with a panicking
-    // `write`/`finish`).
-    if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
+    // `write`/`finish`). Trust (SP-1 review, 2026-10-05): and so must every type
+    // argument it carries — `BuildHasherDefault<dep::H>` is a sysroot type that runs
+    // `H`'s `default`/`write`/`finish`/drop inside the call
+    // ([`hasher_ty_is_sysroot_throughout`]).
+    // Merge (2026-10-14): ours (`hasher_ty_is_std_closed`) must admit too.
+    if !hasher_ty_is_sysroot_throughout(tcx, hasher_ty) || !hasher_ty_is_std_closed(tcx, hasher_ty)
+    {
         return false;
     }
 
-    total_for(sym::Hash) && total_for(sym::Eq)
+    // Review round 65: `Eq` is a marker; a collision calls `PartialEq::eq`.
+    total_for(sym::Hash) && total_for(sym::Eq) && total_for(sym::PartialEq)
 }
 
 /// True iff the call is `<C as Extend<T>>::extend` (or the bare `Extend::extend`) whose RECEIVER
@@ -1330,15 +2472,22 @@ fn is_total_keyed_collect_call<'tcx>(
 /// `is_total_keyed_collect_call`, applied to `C` = Self instead of the collect destination), or a
 /// SEQUENCE collection (`Vec`/`VecDeque`/`String`) whose push runs no user comparison at all.
 ///
-/// The extend-twin of the collect/insert discharge: `extend` pulls items from the (separately-
-/// verified) source iterator and inserts each, so — given a total key and a std hasher for the
-/// Hash family — it runs no panicking user code and its only residual failure is allocation abort
-/// (outside the modeled panic set). A user key with a panicking `Ord`/`Hash`, a non-std hasher, or
-/// a non-std / non-monomorphic receiver fails the gate and KEEPS its obligation (no false-PROVE).
+/// The extend-twin of the collect/insert discharge: `extend` pulls items from the source iterator
+/// and inserts each, so — given a source whose iteration runs only std code and verified roots
+/// ([`into_iter_source_runs_only_verified_code`]; SP-2, 2026-10-04: this premise used to be
+/// assumed, as a "separately-verified" source, and was never checked), a total key and a std
+/// hasher for the Hash family — it runs no panicking user code and its only residual failure is
+/// allocation abort (outside the modeled panic set). A source that runs other code, a user key
+/// with a panicking `Ord`/`Hash`, a non-std hasher, a receiver at a non-sysroot allocator, a
+/// key, value or `String` item whose DROP is not total (SP-1, 2026-10-04: a keyed receiver drops
+/// the old value and the passed key on a hit, a `String` drops every owned item it appends), a
+/// source whose own drops inside the call are not total (SOURCE-SIDE-DROP-CERTIFY-1,
+/// 2026-10-13: [`source_side_drops_are_total`]), or a non-std / non-monomorphic receiver fails
+/// the gate and KEEPS its obligation (no false-PROVE).
 fn is_total_collection_extend_call<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee_def_id: rustc_span::def_id::DefId,
-    gen_args: ty::GenericArgsRef<'tcx>,
+    gen_args: ty::GenericArgs<'tcx>,
 ) -> bool {
     use rustc_span::sym;
     if tcx.item_name(callee_def_id).as_str() != "extend" {
@@ -1373,9 +2522,150 @@ fn is_total_collection_extend_call<'tcx>(
     if !is_real_sysroot_crate(tcx, def.did().krate) {
         return false;
     }
-    // Sequence collections: push runs no user comparison — total for any element.
-    if matches!(adt_name.as_str(), "Vec" | "VecDeque" | "String") {
+    // Review round 61: the erased call runs the receiver's and the source's allocator.
+    // Review round 62: and it DROPS: a `BTreeMap` drops the value a repeated key
+    // replaces, and a consumed source drops what it does not yield (`IntoKeys` drops the
+    // values). Every such drop is glue of the receiver's or the source's type, so both
+    // must be drop-total (`tcx_drop_is_total`, which also requires `Global` allocators
+    // and looks through user ADT fields): a body-level drop of those types is refused
+    // already, and erasing the call must not bypass that.
+    if !ty_sysroot_allocators_are_global(tcx, self_ty, 8)
+        || !tcx_drop_is_total(tcx, self_ty)
+        || !call_input_ty(tcx, callee_def_id, gen_args, 1).is_some_and(|src| {
+            ty_sysroot_allocators_are_global(tcx, src, 8)
+                && tcx_drop_is_total(tcx, src)
+                && source_chain_per_item_is_total(tcx, src, 8)
+        })
+    {
+        return false;
+    }
+    // Review round 64: an `Extend<&T>` impl clones each item itself (`Vec`'s
+    // `SpecExtend<&T, I>` runs `.cloned()`, as do `BTreeSet`/`HashSet`), and a `Copy`
+    // type may still carry a hand-written `Clone` that panics. The erased call runs it.
+    if let Some(item) = extend_item_ty(tcx, callee_def_id, gen_args) {
+        if let ty::Ref(_, pointee, _) = item.kind() {
+            if !clone_is_total_ty(tcx, *pointee) {
+                return false;
+            }
+        }
+    }
+    // Trust (SP-2 review, 2026-10-04): and its ALLOCATOR. `Vec<T, A>`/`VecDeque<T, A>`
+    // `extend` reserves through `A::allocate`/`A::grow`, a hash table's through
+    // hashbrown's `A`, and `BTreeMap<K, V, A>`/`BTreeSet<T, A>` `insert` clones `A`
+    // for every vacant entry; at a non-sysroot `A` that is code the erased call runs.
+    // MEASURED on stage 1 of `1181cb2edb3`: `v.extend(w.iter().copied())` into a
+    // `Vec<u32, dep::AllocBomb>` and `s.extend(..)` into a `BTreeSet<u32,
+    // dep::CloneBomb>` built exit 0 on the default policy (the `Vec` one under certify
+    // too), and a certify rlib holding both, linked into a verify-off `main`, panicked
+    // in `AllocBomb::allocate` (< `RawVecInner::finish_grow` < `Vec::reserve` <
+    // `Vec::extend`) and in `CloneBomb::clone` (< `BTreeMap::entry` < `insert` <
+    // `BTreeSet::extend`), exit 101. The keyed collect needs no twin: every std
+    // `FromIterator` impl of the four keyed collections is at `Global`.
+    if !audited_container_allocators_are_sysroot(tcx, def.did(), *args) {
+        return false;
+    }
+    // Trust (2026-09-25, F1/F2): "its only residual failure is allocation abort" is
+    // FALSE for the collections whose `extend` RESERVES from the source's `size_hint`
+    // — `Vec`, `VecDeque`, `String` and the hash tables — because `reserve` of a huge
+    // lower bound PANICS "capacity overflow" (measured: `v.extend(iter::repeat(x)
+    // .take(usize::MAX))` and `s.extend(0..n)` built exit 0 with zero rows and
+    // panicked). And the rewrite ERASES the call, so vcgen's allocation lane, which
+    // charges `extend` by name, never sees it. Licence the rewrite for those only when
+    // the source's count is bounded by an existing, non-zero-sized collection; any other
+    // source keeps its real callee and is charged. `BTreeMap`/`BTreeSet` `extend`
+    // inserts one item at a time and reserves nothing, so for them the concern is only
+    // the source's own `next`, which the same list answers (see below).
+    let reserves_from_size_hint =
+        matches!(adt_name.as_str(), "Vec" | "VecDeque" | "String" | "HashMap" | "HashSet");
+    //
+    // Trust (W4 HASHMAP r3, 2026-09-29): and only where the receiver can reserve
+    // that many MORE items than it may already hold
+    // ([`bounded_source_fits_destination`] with a live receiver).
+    // Trust (2026-10-06, D12 option (a)): and the reservation for that many items,
+    // on top of the receiver's own live bytes, must fit
+    // ([`bounded_source_reservation_fits_for`]). Both checks must admit.
+    let source = call_input_ty(tcx, callee_def_id, gen_args, 1);
+    if reserves_from_size_hint
+        && !source.is_some_and(|src| {
+            into_iter_source_live_count(tcx, src, 8)
+                .is_some_and(|count| bounded_source_fits_destination(tcx, self_ty, count, true))
+                && bounded_source_reservation_fits_for(tcx, src, self_ty, true)
+                && (adt_name.as_str() != "String"
+                    || string_extend_reserves_at_most_one_byte_per_item(
+                        tcx,
+                        callee_def_id,
+                        gen_args,
+                    ))
+        })
+    {
+        return false;
+    }
+    // Trust (2026-09-29): the other receivers still need a source whose `next` cannot
+    // panic. The rewrite erases the whole call, so the source's `next` calls go with it:
+    // `BTreeSet::extend(250u8..)` (and `(250u8..).take(10)`, `.skip(10).take(1)`) was
+    // proved with no row and panics on the range's overflow. `BTreeMap`/`BTreeSet`
+    // reserve nothing, which is why they had no source gate, but that argument is
+    // about capacity only (the round-2 precondition audit, `q15` k01-k04, k14).
+    if !source.is_some_and(|src| into_iter_source_next_cannot_panic(tcx, src, 8)) {
+        return false;
+    }
+    // Trust (SP-2, 2026-10-04): every receiver, `BTreeMap`/`BTreeSet` included —
+    // `extend` pulls the source's items, and the rewrite erases whatever that runs
+    // ([`into_iter_source_runs_only_verified_code`]). The "separately-verified source"
+    // the note above leans on was never checked: the count gate looks at an adapter's
+    // iterator and not its callback, and the BTree arm asked nothing of the source.
+    if !source.is_some_and(|src| into_iter_source_runs_only_verified_code(tcx, src, 8)) {
+        return false;
+    }
+    // Trust (SOURCE-SIDE-DROP-CERTIFY-1, 2026-10-13): and what `extend` DROPS on the
+    // source side: a by-value hash source's hasher, a `Result`'s `Err`, the items a
+    // `Skip`/`StepBy`/`Filter` passes over (through `&mut` too), a `Take`/`Zip`
+    // remainder ([`source_side_drops_are_total`]). MEASURED on stage 1
+    // `scratchpad/stage1-w25f`: `v.extend(m)` from a `HashMap<u32, u8, dep::DropBuild>`,
+    // `v.extend(r)` from a `Result<u32, dep::ErrBomb>` and `v.extend(src.into_iter()
+    // .take(1))` over `dep::Bomb` built exit 0 under certify, and panicked in the
+    // dependency's `Drop` inside `Vec::extend` once armed
+    // (`tests/ui/trust/collect_extend_source_side_drops.rs` and its `_run` twin).
+    if !source.is_some_and(|src| source_side_drops_are_total(tcx, src, 8)) {
+        return false;
+    }
+    // Trust (2026-09-29): a bounded SOURCE bounds only what is added. The receiver's
+    // own length must be bounded by memory too, and a `Vec`/`VecDeque` of a zero-sized
+    // element can already hold `usize::MAX` of them: `v.extend(Some(()))` on such a
+    // `Vec<()>` panics "capacity overflow", and this rewrite erased the call, so it
+    // built with exit 0 and no row (the zero-size rule's precondition audit, `p10`).
+    // The element's size is read from its layout; a generic or unknown one refuses.
+    // `String` holds bytes and a hash table spends a control byte per bucket, so their
+    // lengths are bounded whatever the element.
+    if matches!(adt_name.as_str(), "Vec" | "VecDeque") {
+        let element_is_nonzero_sized = args.types().next().is_some_and(|elem| {
+            !elem.has_non_region_param()
+                && tcx
+                    .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(elem))
+                    .is_ok_and(|layout| layout.size.bytes() > 0)
+        });
+        if !element_is_nonzero_sized {
+            return false;
+        }
+    }
+    // Sequence collections: push runs no user comparison — total for any element,
+    // and `Vec`/`VecDeque` move every item in and drop none of them.
+    if matches!(adt_name.as_str(), "Vec" | "VecDeque") {
         return true;
+    }
+    // Trust (SP-1, 2026-10-04): `String` DROPS every item it appends (`String`,
+    // `Box<str, A>`, `Cow<str>`: `push_str(&s)`, then `s` goes out of scope), so the
+    // item's drop runs inside the erased call. MEASURED on stage 1 of `bbe56348e46`
+    // (`tests/ui/trust/keyed_collect_extend_drops_inside_the_call.rs`):
+    // `s.extend(it)` from a `vec::IntoIter<Box<str, dep::DeallocBomb>>` built exit 0
+    // with no report, under certify too (the SP-2 review's residual), and its certify
+    // rlib, linked into a verify-off `main`, panicked in `DeallocBomb::deallocate`
+    // inside `<String as Extend<Box<str, A>>>::extend` (exit 101). `Vec`/`VecDeque`
+    // need no twin: they move every item in.
+    if adt_name.as_str() == "String" {
+        return source
+            .and_then(|src| into_iterator_item_ty(tcx, src))
+            .is_some_and(|item| tcx_drop_is_total(tcx, item));
     }
     let keyed_by_ord = matches!(adt_name.as_str(), "BTreeMap" | "BTreeSet");
     let keyed_by_hash = matches!(adt_name.as_str(), "HashMap" | "HashSet");
@@ -1385,6 +2675,12 @@ fn is_total_collection_extend_call<'tcx>(
     let Some(key_ty) = args.types().next() else {
         return false;
     };
+    // Trust (SP-1, 2026-10-04): a keyed `extend` that hits an existing key drops the
+    // old VALUE (a map's `insert` returns it, and `extend` discards it) and the passed
+    // KEY, inside the erased call ([`keyed_collection_drops_are_total`]).
+    if !keyed_collection_drops_are_total(tcx, adt_name.as_str(), *args) {
+        return false;
+    }
     let total_for = |item: rustc_span::Symbol| {
         tcx.get_diagnostic_item(item).is_some_and(|trait_did| {
             tcx_derived_trait_is_total(
@@ -1392,31 +2688,56 @@ fn is_total_collection_extend_call<'tcx>(
                 key_ty,
                 trait_did,
                 CLONE_TOTALITY_FUEL,
-                &mut std::collections::HashSet::new(),
+                &mut FxHashSet::default(),
             )
         })
     };
     if keyed_by_ord {
-        return total_for(sym::Ord);
+        // Review round 65: `from_iter` also SORTS (`PartialOrd::lt`) and DEDUPS
+        // (`PartialEq::ne`), and a derived `Ord` may sit beside a hand-written
+        // `PartialOrd`/`PartialEq`, so all three must be total.
+        return total_for(sym::Ord) && total_for(sym::PartialOrd) && total_for(sym::PartialEq);
     }
     // Hash family: gate on a std hasher `S`, exactly like the collect twin.
     let hasher_ty =
         if adt_name.as_str() == "HashMap" { args.types().nth(2) } else { args.types().nth(1) };
     let Some(hasher_ty) = hasher_ty else { return false };
-    let ty::Adt(hasher_def, _) = hasher_ty.kind() else { return false };
-    // SOUNDNESS (crate-name forgery): hasher must be a REAL sysroot type, bound by scid.
-    if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
+    // SOUNDNESS (crate-name forgery): hasher must be a REAL sysroot type, bound by scid,
+    // with every type argument too (SP-1 review: [`hasher_ty_is_sysroot_throughout`]).
+    // Merge (2026-10-14): ours (`hasher_ty_is_std_closed`) must admit too.
+    if !hasher_ty_is_sysroot_throughout(tcx, hasher_ty) || !hasher_ty_is_std_closed(tcx, hasher_ty)
+    {
         return false;
     }
-    total_for(sym::Hash) && total_for(sym::Eq)
+    // Review round 65: `Eq` is a marker; a collision calls `PartialEq::eq`.
+    total_for(sym::Hash) && total_for(sym::Eq) && total_for(sym::PartialEq)
 }
 
 /// True iff the call is an inherent `HashMap`/`HashSet` query method (`get`/`get_mut`/`remove`/
 /// `contains_key`/`contains`/`insert`/`take`/`get_key_value`/`remove_entry`) whose KEY is total
-/// (`Hash` + `Eq` derived over total fields) AND whose HASHER `S` is a std type — so the hash +
-/// bucket probe + collision `Eq` run no panicking user code (only allocation abort remains, out of
-/// the modeled panic set). The Hash-family twin of the BTreeMap-read discharge
-/// (`is_std_ord_key_map_insert_absent_callee`, which needs no hasher gate). SOUND: `S` is a type
+/// (`Hash` + `Eq` derived over total fields), whose HASHER `S` is std's code all the way down
+/// ([`hasher_ty_is_sysroot_throughout`]: the hasher instance it builds is written, finished and
+/// dropped inside every call) AND whose ALLOCATOR is a sysroot one (`insert` grows the table
+/// through it) — so the hash + bucket probe + collision `Eq` + growth run no panicking user code
+/// (only allocation abort remains, out of the modeled panic set). SP-1 review, 2026-10-05: the
+/// hasher used to be bound by its outer ADT only, and the allocator was not asked.
+///
+/// THERE IS NO ORD-FAMILY TWIN, AND MEASUREMENT SAYS ONE IS NOT NEEDED HERE. This comment used
+/// to call the function "the Hash-family twin of the BTreeMap-read discharge
+/// (`is_std_ord_key_map_insert_absent_callee`, which needs no hasher gate)". **That symbol never
+/// existed anywhere in the tree**, so the sentence described a sibling nobody had written and
+/// implied a `BTreeMap` gap. The twin was then written and MEASURED INERT (2026-09-26): an
+/// `is_ord_keyed` arm admitting `BTreeMap`/`BTreeSet` `insert` on a derived-total `Ord` key,
+/// receiver anchored by `is_real_sysroot_crate` exactly as the hash arm anchors its hasher,
+/// produced reports BYTE-IDENTICAL to a build with the arm neutered — for `BTreeMap<u8, u8>`, for
+/// a `#[derive(Ord)]` struct key, and for a hand-written panicking `cmp`. The reason is simple:
+/// `BTreeMap::insert` raises NO absent-callee obligation in those programs, so a total-sentinel
+/// rewrite has nothing to rewrite. `BTreeMap<u8,u8>` + `insert` + `drop` already reports exactly
+/// what the `HashMap` spelling reports. The arm was reverted rather than shipped, because inert
+/// code that looks like a capability is worse than no code. If a real `BTreeMap` gap is ever
+/// measured, the arm needs no hasher gate — but check first that an obligation exists to erase.
+///
+/// SOUND: `S` is a type
 /// parameter (`HashMap<K,V,S>` defaults to std `RandomState`), so a caller can supply a
 /// hand-written `BuildHasher`/`Hasher` whose `write`/`finish` panics — REQUIRE `S` from std; a
 /// user key with a panicking `Hash`/`Eq`, a non-std hasher, or a non-std/non-monomorphic receiver
@@ -1424,7 +2745,7 @@ fn is_total_collection_extend_call<'tcx>(
 fn is_total_hash_map_query_call<'tcx>(
     tcx: TyCtxt<'tcx>,
     method_def_id: rustc_span::def_id::DefId,
-    gen_args: ty::GenericArgsRef<'tcx>,
+    gen_args: ty::GenericArgs<'tcx>,
 ) -> bool {
     use rustc_hir::def::DefKind;
     use rustc_span::sym;
@@ -1462,6 +2783,21 @@ fn is_total_hash_map_query_call<'tcx>(
     if !is_real_sysroot_crate(tcx, def.did().krate) {
         return false;
     }
+    // Trust (SP-1 review, 2026-10-05): and its ALLOCATOR, as the extend gate asks.
+    // `insert` on a full table runs hashbrown's `reserve_rehash`, which allocates the
+    // new table through `A::allocate` and frees the old one through `A::deallocate`
+    // (a `prepare_resize` scope guard), inside the erased call. MEASURED on stage 1 of
+    // `0a525e155ab` (`tests/ui/trust/keyed_collection_hasher_and_query_allocator.rs`):
+    // `m.insert(k, 0)` on a `HashMap<u32, u8, RandomState, dep::DeallocBomb>` and
+    // `s.insert(k)` on a `HashSet<u32, RandomState, dep::DeallocBomb>` built exit 0 with
+    // no Verification Report, under certify too, and their certify rlib, linked into a
+    // verify-off `main` that fills three entries and arms the dependency, panicked in
+    // `DeallocBomb::deallocate` < the `prepare_resize` guard's `Drop` <
+    // `RawTable::reserve_rehash` < `HashMap::insert`/`HashSet::insert` (exit 101); at
+    // `dep::AllocBomb`, `insert` into an empty map panicked in `AllocBomb::allocate`.
+    if !audited_container_allocators_are_sysroot(tcx, def.did(), *args) {
+        return false;
+    }
     let Some(key_ty) = args.types().next() else {
         return false;
     };
@@ -1470,25 +2806,148 @@ fn is_total_hash_map_query_call<'tcx>(
     let Some(hasher_ty) = hasher_ty else {
         return false;
     };
-    let ty::TyKind::Adt(hasher_def, _) = hasher_ty.kind() else {
-        return false;
-    };
-    // SOUNDNESS (crate-name forgery): hasher must be a REAL sysroot type, bound by scid.
-    if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
+    // SOUNDNESS (crate-name forgery): hasher must be a REAL sysroot type, bound by scid,
+    // with every type argument too (SP-1 review: [`hasher_ty_is_sysroot_throughout`];
+    // `get` on a `BuildHasherDefault<dep::DropHasher>` map ran the dependency's `Drop`).
+    // Merge (2026-10-14): ours (`hasher_ty_is_std_closed`) must admit too.
+    if !hasher_ty_is_sysroot_throughout(tcx, hasher_ty) || !hasher_ty_is_std_closed(tcx, hasher_ty)
+    {
         return false;
     }
-    let total_for = |item: rustc_span::Symbol| {
+    // Trust (SP-1, 2026-10-04): `insert` drops the PASSED key on a hit (the map keeps
+    // the stored one; `HashSet::insert` likewise), and `remove` drops the STORED key
+    // (`HashMap::remove` returns only the value, `HashSet::remove` only a `bool`),
+    // inside the erased call; a VALUE is never dropped here (`insert` and `remove`
+    // return it, and the caller's own MIR drops it). (The hasher instance and the
+    // allocator do run inside the call, for every method: asked above.) No
+    // dependency-code witness was
+    // found for this arm: on stage 1 of `bbe56348e46` a dependency's derived key and a
+    // `Box<u32, dep::DeallocBomb>` key do not pass the key gate below (their real
+    // callee stays), while a local derived key with its own `Drop` does, and that
+    // `Drop` body is verified as its own root. Asked anyway, fail-closed, as in the
+    // collect and extend gates ([`keyed_collection_drops_are_total`]).
+    if matches!(tcx.item_name(method_def_id).as_str(), "insert" | "remove")
+        && !tcx_drop_is_total(tcx, key_ty)
+    {
+        return false;
+    }
+    // Trust (2026-10-10, CALL-REACH-1 interim stopgap for design H3; superseded by
+    // CALL-REACH-1 phase 2): the METHOD's own type argument `Q` (`get::<Q>`,
+    // `contains_key::<Q>`, `remove::<Q>`, ...). The lookup hashes and compares the
+    // QUERY through `Q::hash`/`Q::eq` and borrows each stored key through `<K as
+    // Borrow<Q>>::borrow`, and the orphan rules let a dependency write `impl
+    // Borrow<dep::Q> for u32`, so this gate read only the impl's `K`, `S` and `A`
+    // and credited code `Q` chose. `Q` must be `K` itself (core's blanket `Borrow<T>
+    // for T`, whose `hash`/`eq` are `K`'s, asked below) or a total std key
+    // (`ty_convert::tcx_key_is_std_total`, the C2 key gate: its `Borrow` impls are
+    // the sysroot's, since the orphan rules give a non-sysroot crate no impl between
+    // two sysroot types). Read, not measured
+    // (`tests/ui/trust/sysroot_call_reach_type_arguments.rs`, `hashmap_get_dep_query`).
+    let parent_count = tcx.generics_of(method_def_id).parent_count;
+    let query_is_total = |query: ty::Ty<'tcx>| {
+        query == key_ty || crate::ty_convert::tcx_key_is_std_total(tcx, query)
+    };
+    if !gen_args.iter().skip(parent_count).filter_map(|arg| arg.as_type()).all(query_is_total) {
+        return false;
+    }
+    let total_for_ty = |t: ty::Ty<'tcx>, item: rustc_span::Symbol| {
         tcx.get_diagnostic_item(item).is_some_and(|trait_did| {
             tcx_derived_trait_is_total(
                 tcx,
-                key_ty,
+                t,
                 trait_did,
                 CLONE_TOTALITY_FUEL,
-                &mut std::collections::HashSet::new(),
+                &mut FxHashSet::default(),
             )
         })
     };
-    total_for(sym::Hash) && total_for(sym::Eq)
+    // Review round 65: `Eq` is a marker; a collision calls `PartialEq::eq`.
+    let key_total = |t: ty::Ty<'tcx>| {
+        total_for_ty(t, sym::Hash) && total_for_ty(t, sym::Eq) && total_for_ty(t, sym::PartialEq)
+    };
+    // Review round 66: a query method hashes and compares its BORROWED query type `Q`
+    // (`K: Borrow<Q>`), not `K`, so every type argument the method itself takes must
+    // be as total as the key; and `insert` drops the new key when it replaces an
+    // entry, so the key must be drop-total.
+    let method_args = &gen_args.as_slice()[tcx.generics_of(impl_did).count()..];
+    // Review round 67: hashbrown reaches `Q` through `K: Borrow<Q>` on every probe, and a
+    // crate may write that impl itself; unless `Q` is `K`, the selected `Borrow` impl
+    // must be the sysroot's (`String: Borrow<str>`, `Vec<T>: Borrow<[T]>`).
+    // Review round 68: on the UNPEELED `Q`: `get::<&Key>` needs `Key: Borrow<&Key>`, a
+    // user impl, and peeling first made it look like `Q == K`.
+    let borrow_ok = |q: ty::Ty<'tcx>| {
+        q == key_ty
+            || tcx.get_diagnostic_item(sym::Borrow).is_some_and(|borrow| {
+                let trait_ref = ty::TraitRef::new(tcx, borrow, [key_ty, q]);
+                matches!(
+                    tcx.codegen_select_candidate(
+                        ty::TypingEnv::fully_monomorphized().as_query_input(trait_ref)
+                    ),
+                    Ok(rustc_middle::traits::ImplSource::UserDefined(data))
+                        if is_real_sysroot_crate(tcx, data.impl_def_id.krate)
+                )
+            })
+    };
+    key_total(key_ty)
+        && tcx_drop_is_total(tcx, key_ty)
+        && method_args
+            .iter()
+            .filter_map(|arg| arg.as_type())
+            .all(|q| key_total(q.peel_refs()) && borrow_ok(q))
+}
+
+/// Trust (SP-1, 2026-10-04): is DROPPING a key — and, for a map, a value — of the std
+/// keyed collection `adt_name` (`BTreeMap<K, V, A>`, `BTreeSet<T, A>`,
+/// `HashMap<K, V, S>`, `HashSet<T, S>`, instantiated at `args`) provably panic-free
+/// ([`tcx_drop_is_total`], the drop stamp's predicate)?
+///
+/// The keyed-collect / collection-extend TOTAL sentinel erases the call, and the
+/// std code it erases DROPS keys and values: a keyed `insert` (hence `extend`) that
+/// hits an existing key drops the passed key and the old value (`extend` discards the
+/// `Option<V>` that `insert` returns); `BTreeMap`/`BTreeSet` `from_iter` drops the
+/// earlier of two equal keys, with its value (`DedupSortedIter`); the hash family's
+/// `from_iter` is `extend`. The key gates asked only `Ord` or `Hash`/`Eq`, and the
+/// drop check on the caller's own MIR (`body_drops_foreign_adt_argument` in
+/// rustc_mir_transform's trust_verify) never sees a drop inside std. MEASURED on stage
+/// 1 `3fbce29e33a` (the SP-1 triage) and of `bbe56348e46`
+/// (`tests/ui/trust/keyed_collect_extend_drops_inside_the_call.rs`):
+/// `m.extend([(k, b)])` into a `BTreeMap<u32, dep::Bomb>` / `HashMap<u32, dep::Bomb>`
+/// (`Bomb`'s `Drop` panics) and `[(1, a), (1, b)].into_iter().collect()` into either
+/// built exit 0 with no Verification Report, strict and certify, and so did a value
+/// with no `Drop` of its own whose glue runs a dependency's allocator (`Box<u32,
+/// dep::DeallocBomb>`); a certify rlib holding them, linked into a verify-off `main`,
+/// panicked in `Bomb::drop` / `DeallocBomb::deallocate` inside `BTreeMap::extend`,
+/// hashbrown's `extend` and `DedupSortedIter::next` (exit 101). On the KEY side no
+/// dependency-code shape was found that passes the key gate (a dependency's derived
+/// key is not `is_builtin_derived`; a `Box<u32, dep::DeallocBomb>` key keeps its real
+/// callee); a local derived key with its own `Drop` passes it, and is asked all the
+/// same.
+///
+/// GRANTING (it licenses the sentinel): an unexpected shape answers `false`, and so
+/// does every user `Drop`, a local one included — a local `Drop` body is verified as
+/// its own root, but this predicate does not argue that, so such a key or value keeps
+/// the real callee (the capability cost, docs/DECISION_QUEUE.md SP-1-DROPS). The
+/// hasher and allocator positions are not asked here, but the call DOES run their
+/// code: a `BuildHasherDefault<H>` builds an `H` for every hash and drops it inside
+/// the call, and a hash table that grows frees its old table through `A` (SP-1
+/// review, 2026-10-05). The callers ask them: every hash arm requires the hasher to be
+/// std's code all the way down ([`hasher_ty_is_sysroot_throughout`]), the extend and
+/// hash query arms require a sysroot allocator
+/// ([`audited_container_allocators_are_sysroot`]), and every std `FromIterator` of the
+/// four keyed collections is at `Global`.
+fn keyed_collection_drops_are_total<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt_name: &str,
+    args: ty::GenericArgs<'tcx>,
+) -> bool {
+    let has_value = match adt_name {
+        "BTreeMap" | "HashMap" => true,
+        "BTreeSet" | "HashSet" => false,
+        _ => return false,
+    };
+    let mut tys = args.types();
+    let key_total = tys.next().is_some_and(|key| tcx_drop_is_total(tcx, key));
+    key_total && (!has_value || tys.next().is_some_and(|value| tcx_drop_is_total(tcx, value)))
 }
 
 /// Never replace a derived method body with synthetic zero-obligation evidence.
@@ -1541,17 +3000,135 @@ fn indirect_call_fn_ptr_sig<'tcx>(
     Some(tcx.instantiate_bound_regions_with_erased(sig))
 }
 
+/// Whether a DIRECT call's callee is typed `-> !` by rustc itself.
+///
+/// This is the NEVER-TYPE fact, read from `TyCtxt` at the call site: the callee
+/// is a `FnDef`, so the signature below is that callee's own, and its return
+/// type is the primitive never type. No well-typed callee with this signature
+/// can return normally to a successor block — which is exactly why rustc lowers
+/// the call with `target: None` in the first place.
+///
+/// WHY THIS IS NOT `is_total_noreturn_call`. That predicate is deliberately
+/// disabled ("no string-only diverging-call identity can authorize a path-ending
+/// rewrite") because it rewrites the call to `Terminator::Return`, ERASING the
+/// call and every obligation it carries; a user `my::process::exit -> !` would
+/// then have its body and effects excused by a forgeable display path. This
+/// predicate authorizes something strictly weaker in BOTH directions:
+///
+///   * weaker than that rewrite — the call is KEPT as a
+///     `Terminator::Call { target: None }`, so it still carries its
+///     panic-freedom charge (a bundled callee is verified on its own; an absent
+///     one takes the `[trust-absent-callee-assumption]` may-panic row, which is
+///     UNKNOWN, never Proved), and its unwind/cleanup edge stays a successor; and
+///   * stronger than the `Opaque` bail it replaces — `Opaque` has no destination
+///     `Place`, so `Terminator::local_write` answers `LocalWrite::Unlocatable`
+///     for EVERY local, which disqualifies every local in the body from
+///     `is_single_static_assignment`. See the soundness note at the call site
+///     for the measured consequence.
+///
+/// The identity here is NOT forgeable: a user function typed `-> !` genuinely
+/// cannot return, so admitting it is correct rather than excused.
+///
+/// FAIL CLOSED. No `local_decls` (synthetic/test bodies), a fn-POINTER or
+/// indirect callee, a signature with non-region bound vars, and any output that
+/// is not the LITERAL `TyKind::Never` all keep the historical `Opaque` bail. In
+/// particular no normalization is attempted: a projection that would reduce to
+/// `!` is declined, which is the conservative direction.
+fn direct_callee_returns_never<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+    local_decls: Option<&mir::LocalDecls<'tcx>>,
+) -> bool {
+    let Some(local_decls) = local_decls else { return false };
+    let ty = func.ty(local_decls, tcx);
+    if !matches!(ty.kind(), ty::TyKind::FnDef(..)) {
+        return false;
+    }
+    let sig = ty.fn_sig(tcx);
+    let Some(sig) = sig.no_bound_vars().or_else(|| {
+        sig.bound_vars()
+            .iter()
+            .all(|v| matches!(v, ty::BoundVariableKind::Region(_)))
+            .then(|| tcx.instantiate_bound_regions_with_erased(sig))
+    }) else {
+        return false;
+    };
+    sig.output().is_never()
+}
+
 /// Convert a rustc Terminator to our Terminator.
+#[cfg(test)]
 fn convert_terminator<'tcx>(
     tcx: TyCtxt<'tcx>,
     terminator: &mir::Terminator<'tcx>,
     local_decls: Option<&mir::LocalDecls<'tcx>>,
     typing_env: Option<ty::TypingEnv<'tcx>>,
+    caller: Option<DefId>,
+    optional_overflow_assert_codegen: OptionalOverflowAssertCodegen,
 ) -> Terminator {
-    // Trust: extract per-terminator source span for diagnostics
-    let span = convert_span(tcx, terminator.source_info.span);
+    convert_terminator_inner(
+        tcx,
+        terminator,
+        local_decls,
+        typing_env,
+        caller,
+        optional_overflow_assert_codegen,
+        &mut None,
+    )
+}
+
+fn convert_terminator_inner<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    terminator: &mir::Terminator<'tcx>,
+    local_decls: Option<&mir::LocalDecls<'tcx>>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+    // Trust (GCKA-SELF-CALL-2, 2026-10-10): the item whose own MIR `terminator`
+    // is in, read only by `func_operand_name`; `None` when unknown.
+    caller: Option<DefId>,
+    // Trust (OVF-ASSERT-XCRATE-1, 2026-10-06): read only by the `Assert` arm, only
+    // with this session's overflow checks off.
+    optional_overflow_assert_codegen: OptionalOverflowAssertCodegen,
+    span_cache: &mut Option<&mut crate::FxHashMap<Span, SourceSpan>>,
+) -> Terminator {
     match &terminator.kind {
-        mir::TerminatorKind::Goto { target } => Terminator::Goto(BlockId(target.as_usize())),
+        mir::TerminatorKind::Goto { target, .. } => {
+            return Terminator::Goto(BlockId(target.as_usize()));
+        }
+        mir::TerminatorKind::Return => return Terminator::Return,
+        mir::TerminatorKind::Unreachable => return Terminator::Unreachable,
+        mir::TerminatorKind::FalseEdge { real_target, .. } => {
+            return Terminator::Goto(BlockId(real_target.as_usize()));
+        }
+        mir::TerminatorKind::FalseUnwind { real_target, .. } => {
+            return Terminator::Goto(BlockId(real_target.as_usize()));
+        }
+        mir::TerminatorKind::CoroutineDrop => return Terminator::Return,
+        mir::TerminatorKind::UnwindResume => return Terminator::Resume,
+        mir::TerminatorKind::Drop { place, target, unwind, .. } => {
+            let no_drop_glue = !ty_convert::faithful_scalars()
+                && local_decls.is_some_and(|decls| {
+                    let ty = place.ty(decls, tcx).ty;
+                    !ty.has_non_region_param()
+                        && !ty.has_non_region_infer()
+                        && !ty.has_escaping_bound_vars()
+                        && !ty.needs_drop(tcx, ty::TypingEnv::fully_monomorphized())
+                });
+            if no_drop_glue {
+                return Terminator::Goto(BlockId(target.as_usize()));
+            }
+            return Terminator::Drop {
+                place: convert_place(tcx, place, typing_env),
+                target: BlockId(target.as_usize()),
+                span: convert_span_opt_cached(tcx, terminator.source_info.span, span_cache),
+                unwind: convert_unwind_action(*unwind),
+            };
+        }
+        _ => {}
+    }
+    let raw_span = terminator.source_info.span;
+    let mut lazy_span = || convert_span_opt_cached(tcx, raw_span, span_cache);
+    match &terminator.kind {
+        mir::TerminatorKind::Goto { target, .. } => Terminator::Goto(BlockId(target.as_usize())),
         mir::TerminatorKind::SwitchInt { discr, targets } => {
             let switch_targets: Vec<(u128, BlockId)> =
                 targets.iter().map(|(val, bb)| (val, BlockId(bb.as_usize()))).collect();
@@ -1566,20 +3143,17 @@ fn convert_terminator<'tcx>(
                 // that has the full `mir::Body` + lowered locals; this arm sees
                 // only `(tcx, &terminator)` and cannot decide it here.
                 exhaustive_enum_unreachable: false,
-                span, // Trust: per-terminator source span
+                span: lazy_span(), // Trust: per-terminator source span
             }
         }
         mir::TerminatorKind::Return => Terminator::Return,
         mir::TerminatorKind::Unreachable => Terminator::Unreachable,
         mir::TerminatorKind::Call { func, args, destination, target, unwind, .. } => {
             // Preserve the exact rendered call key used by both extraction and
-            // summary registration. The former Clone/derived sentinel rewrite is
-            // gone: a source-spellable attribute cannot mint totality.
-            let func_name = func_operand_name(tcx, func);
-            let successors: Vec<BlockId> =
-                terminator.kind.successors().map(|bb| BlockId(bb.as_usize())).collect();
-            let normal_targets: Vec<BlockId> =
-                target.iter().map(|bb| BlockId(bb.as_usize())).collect();
+            // summary registration (`func_operand_name`, which applies the
+            // authenticated totality sentinel). A source-spellable attribute
+            // cannot mint totality.
+            let func_name = func_operand_name(tcx, caller, func);
             // FAITHFUL UNWIND MODELING: record the Call's unwind/cleanup edge as a
             // real CFG successor (`unwind: convert_unwind_action(*unwind)` on the
             // constructed `Terminator::Call` below) and route the normal-return path
@@ -1621,14 +3195,40 @@ fn convert_terminator<'tcx>(
             // calls still stay opaque / fail-closed.
             // Same shape, same routing, for a diverging call that is UB-if-reached
             // (`unreachable_unchecked`): "this point must be proven unreachable" is
-            // exactly the obligation an explicit `panic!` gets. See
-            // `is_ub_if_reached_diverging_call` for why a string gate is sound here
-            // (it only ever ADDS an obligation) and why the `Opaque` bail it replaces
-            // was strictly worse (it dropped the whole function from the native lane).
+            // exactly the obligation an explicit `panic!` gets. The `Opaque` bail this
+            // replaces was strictly worse for a REAL panic site: it dropped the whole
+            // function from the native lane.
+            //
+            // Trust (DIVERGE-ANCHOR-1): the name is not the identity. The bridge's
+            // diverging-site arm SUPPRESSES the absent-callee may-panic marker in
+            // favour of the site charge, and under the default policy that charge is
+            // `runtime_checked` and ACCEPTED while an absent callee is refused. So a
+            // routing keyed on the name alone accepted a verify-off dependency's
+            // `pub mod panicking { pub fn x(p: *mut u32) -> Void { *p = 1; exit(0) } }`
+            // reached at `x == 5` (measured: default rc=0, the program SIGSEGVs), and
+            // `dep::intrinsics::unreachable -> Void` under certify (rc=0). The callee's
+            // DEFINING crate must be a real sysroot crate, the same artifact-residency
+            // verdict (`is_real_sysroot_crate`) the extracted `callee_key` carries and
+            // the bridge arm now requires. A non-sysroot match keeps the `Opaque` bail
+            // below (or, for a `-> !` callee, the never-typed admission, whose bridge
+            // lowering keeps the absent-callee row).
+            //
+            // Trust (DIVERGE-ENTRY-1): residency plus the RENDERED name was still not
+            // the identity. A call to a core TRAIT method carries the trait's DefId
+            // (residency `core`) while a dependency's impl runs, and its rendering
+            // carries the user's `Self`:
+            // `<dep::panicking::V as core::convert::From<*mut u32>>::from` contains
+            // `::panicking::`, so a verify-off dependency's segfaulting
+            // `impl From<*mut u32> for panicking::V` (and the `Default` and `Into`
+            // routes) was accepted under default (measured on the stage 1 of
+            // `4463aeeb6d`). The routing now asks `diverging_entry_of` — residency,
+            // not a trait item, and the name predicates on the GENERIC-FREE
+            // definition path — the same function that mints the `callee_key`'s
+            // `diverging_entry` stamp the bridge arm requires, so the two cannot
+            // disagree. `func_name` is not read.
             let is_diverging_panic = target.is_none()
                 && func_name != "<indirect>"
-                && (is_panic_diverging_call(&func_name)
-                    || is_ub_if_reached_diverging_call(&func_name));
+                && func.const_fn_def().is_some_and(|(d, _)| diverging_entry_of(tcx, d).is_some());
             // Trust: a DIRECT call to a recognized bulk-allocation / collect sink
             // (`with_capacity`/`reserve`/`resize`/`from_elem`/`collect`/`from_iter`)
             // whose post-inlining shape has NO normal-return target (`target ==
@@ -1652,6 +3252,7 @@ fn convert_terminator<'tcx>(
             if target.is_none() && func_name != "<indirect>" && is_total_noreturn_call(&func_name) {
                 return Terminator::Return;
             }
+            let span = lazy_span();
             // Trust (indirect-call fail-soft): an INDIRECT call — `func` is a
             // fn-POINTER VALUE, not a `FnDef`, so there is no `DefId` and no path
             // to render — that HAS a normal-return target and whose callee operand
@@ -1691,9 +3292,52 @@ fn convert_terminator<'tcx>(
             let indirect_fn_ptr_sig = (func_name == "<indirect>" && target.is_some())
                 .then(|| indirect_call_fn_ptr_sig(tcx, func, local_decls))
                 .flatten();
+            // Trust (never-typed divergence): a DIRECT call whose callee rustc
+            // types `-> !` (`direct_callee_returns_never`). rustc lowers it with
+            // `target: None` BECAUSE of that typing, so representing it as the
+            // no-normal-successor `Terminator::Call` the panic arm above already
+            // uses is the FAITHFUL shape; the `Opaque` bail below is not.
+            //
+            // MEASURED, not argued. `Terminator::Opaque` carries no destination
+            // `Place`, so `Terminator::local_write` answers
+            // `LocalWrite::Unlocatable` — "a write this seam cannot locate may
+            // have replaced it" — for EVERY local of the body. One such
+            // terminator therefore disqualifies every local in the function from
+            // `local_defs::is_single_static_assignment`, and with it the
+            // dest-keyed half of trust-vcgen's enum tag-range fact
+            // (`generate::value_facts::build_discriminant_variant_range_facts`
+            // emits `d in {tags}` over a `Discriminant` read's destination only
+            // when that destination is single-assignment). A `match` whose
+            // `SwitchInt` selectors have lost that fact leaves the shared
+            // `otherwise -> Unreachable` block satisfiable, and its
+            // `VcKind::Unreachable` row is REFUTED although the match is
+            // exhaustive. On the ay-dpll test graph at seal 30 that was 2962 of
+            // the 4734 refuted rows — every one of them a `#[ntest::timeout]`
+            // test whose expansion ends in `std::panic::resume_unwind(payload)`,
+            // a `-> !` callee that matches none of the panic/UB/bulk-alloc
+            // recognizers above and so became the one `Opaque` that poisoned the
+            // whole body.
+            //
+            // SOUNDNESS. The admission ADDS structure and removes no charge:
+            //  * the call keeps its panic-freedom obligation (bundled callee:
+            //    verified on its own; absent callee: the may-panic row, UNKNOWN);
+            //  * the unwind edge is still recorded as a successor below, so
+            //    cleanup blocks stay reachable and their drops stay checked;
+            //  * `target` stays `None`, so no continuation is invented — the
+            //    never-type IS the evidence that there is none; and
+            //  * the locals the body writes become locatable again, which only
+            //    lets TRUE type-level facts (an enum discriminant lies in its own
+            //    variant tag set) reach the solver. It grants no path-ending
+            //    rewrite, no totality, and no proof of its own.
+            // Indirect calls keep the `Opaque` bail: `func_name != "<indirect>"`
+            // is required so the callee identity below is a real `FnDef`.
+            let is_direct_never_typed_diverging_call = target.is_none()
+                && func_name != "<indirect>"
+                && direct_callee_returns_never(tcx, func, local_decls);
             if (func_name == "<indirect>" || target.is_none())
                 && !is_diverging_panic
                 && !is_direct_bulk_alloc_sink
+                && !is_direct_never_typed_diverging_call
                 && indirect_fn_ptr_sig.is_none()
             {
                 let opaque_kind = if func_name == "<indirect>" {
@@ -1701,6 +3345,8 @@ fn convert_terminator<'tcx>(
                 } else {
                     format!("Call::{func_name}")
                 };
+                let successors: Vec<BlockId> =
+                    terminator.kind.successors().map(|bb| BlockId(bb.as_usize())).collect();
                 return opaque_terminator(opaque_kind, successors, span);
             }
             if let Some(sig) = indirect_fn_ptr_sig {
@@ -1730,6 +3376,7 @@ fn convert_terminator<'tcx>(
                     // honest answer and the fail-closed one — this call already
                     // carries an unprovable panic-freedom marker on every path.
                     callee_identity: None,
+                    callee_key: None,
                     unwind: convert_unwind_action(*unwind),
                 };
             }
@@ -1744,18 +3391,26 @@ fn convert_terminator<'tcx>(
             // ordering metadata is missing or non-concrete, fail closed as an
             // opaque terminator; otherwise vcgen would see a plain call and
             // silently skip atomic legality coverage.
-            let atomic =
-                match parse_atomic_intrinsic_metadata(&func_name, &converted_args, &dest, &span) {
-                    AtomicIntrinsicMetadata::Parsed(op) => Some(op),
-                    AtomicIntrinsicMetadata::NotAtomic => None,
-                    AtomicIntrinsicMetadata::Malformed { detail } => {
-                        return opaque_terminator(
-                            format!("Call::{func_name}::UnsupportedAtomicMetadata({detail})"),
-                            normal_targets,
-                            span,
-                        );
-                    }
-                };
+            let atomic = match atomic_metadata_for_call(
+                tcx,
+                func,
+                &func_name,
+                &converted_args,
+                &dest,
+                &span,
+            ) {
+                AtomicIntrinsicMetadata::Parsed(op) => Some(op),
+                AtomicIntrinsicMetadata::NotAtomic => None,
+                AtomicIntrinsicMetadata::Malformed { detail } => {
+                    let normal_targets: Vec<BlockId> =
+                        target.iter().map(|bb| BlockId(bb.as_usize())).collect();
+                    return opaque_terminator(
+                        format!("Call::{func_name}::UnsupportedAtomicMetadata({detail})"),
+                        normal_targets,
+                        span,
+                    );
+                }
+            };
 
             // Trust: round-19 #3 — record AUTHORITATIVE foreign-ness here.
             // trust-vcgen's name-substring detection (`is_extern_call`) misses
@@ -1774,7 +3429,9 @@ fn convert_terminator<'tcx>(
             // body. Only the exact std/core path with ONE whole-place by-value
             // argument rewrites; every other shape keeps the plain Call
             // (fail-closed).
-            if matches!(func_name.as_str(), "std::mem::drop" | "core::mem::drop") {
+            if !ty_convert::faithful_scalars()
+                && matches!(func_name.as_str(), "std::mem::drop" | "core::mem::drop")
+            {
                 if let ([Operand::Move(p) | Operand::Copy(p)], Some(t)) =
                     (converted_args.as_slice(), target)
                 {
@@ -1813,6 +3470,16 @@ fn convert_terminator<'tcx>(
                 // `callee_identity_for` for the fail-closed admission rule and
                 // `trust_types::CalleeIdentity` for false proof #14.
                 callee_identity: func_operand_callee_identity(tcx, func),
+                // Trust (round 7): the callee's STRUCTURED, COMPILER-RESOLVED
+                // key — the closed-vocabulary sysroot-item tag plus the crate
+                // facts the rendered `__trust_crate@` stamp collapses into one
+                // bit. Taken from the SAME `func` operand and the SAME `TyCtxt`
+                // as `func_name` and `callee_identity`, so no consumer can be
+                // deciding about a different function than the one displayed.
+                // Unlike `callee_identity`, it does NOT read `generic_args`:
+                // see `callee_key_for` for why that absence IS the termination
+                // property.
+                callee_key: func_operand_callee_key(tcx, func),
                 // Faithfully record the cleanup/unwind successor (see comment
                 // above): a `Cleanup(bb)` edge keeps the cleanup block reachable so
                 // its live-local drops are verified; a sound over-approximation that
@@ -1825,10 +3492,11 @@ fn convert_terminator<'tcx>(
             // returned directly from the current function. Preserve its exact
             // direct callee and arguments so caller preconditions and direct-self
             // E5 cannot disappear behind `Opaque`.
-            let func_name = func_operand_name(tcx, func);
-            let successors: Vec<BlockId> =
-                terminator.kind.successors().map(|bb| BlockId(bb.as_usize())).collect();
+            let func_name = func_operand_name(tcx, caller, func);
+            let span = lazy_span();
             if func_name == "<indirect>" {
+                let successors: Vec<BlockId> =
+                    terminator.kind.successors().map(|bb| BlockId(bb.as_usize())).collect();
                 return opaque_terminator("TailCall(indirect)", successors, span);
             }
 
@@ -1837,7 +3505,9 @@ fn convert_terminator<'tcx>(
                 .map(|spanned| convert_operand(tcx, &spanned.node, typing_env))
                 .collect();
             let implicit_return = Place::local(0);
-            let atomic = match parse_atomic_intrinsic_metadata(
+            let atomic = match atomic_metadata_for_call(
+                tcx,
+                func,
                 &func_name,
                 &converted_args,
                 &implicit_return,
@@ -1846,6 +3516,8 @@ fn convert_terminator<'tcx>(
                 AtomicIntrinsicMetadata::Parsed(op) => Some(op),
                 AtomicIntrinsicMetadata::NotAtomic => None,
                 AtomicIntrinsicMetadata::Malformed { detail } => {
+                    let successors: Vec<BlockId> =
+                        terminator.kind.successors().map(|bb| BlockId(bb.as_usize())).collect();
                     return opaque_terminator(
                         format!("TailCall::{func_name}::{detail}"),
                         successors,
@@ -1862,6 +3534,10 @@ fn convert_terminator<'tcx>(
                 is_foreign: func_operand_is_foreign(tcx, func),
                 is_unsafe_sig: func_operand_is_unsafe_sig(tcx, func),
                 callee_identity: func_operand_callee_identity(tcx, func),
+                // A tail call is still a call: without this the unsafe mint
+                // falls back to display text exactly when MIR chooses the
+                // tail-call representation.
+                callee_key: func_operand_callee_key(tcx, func),
             }
         }
         // Trust: CRITICAL — Assert terminators encode rustc's overflow checks,
@@ -1880,6 +3556,47 @@ fn convert_terminator<'tcx>(
         // approximates (checks drops on more paths, never fewer) and never masks the
         // success-path obligation.
         mir::TerminatorKind::Assert { cond, expected, msg, target, unwind, .. } => {
+            // Trust (OVF-ASSERT-ERASED-1, 2026-10-06): with overflow checks OFF for
+            // this session, codegen compiles every OPTIONAL overflow assert
+            // (`OverflowNeg`, `Overflow(Add | Sub | Mul | Shl | Shr)`) as if it
+            // always succeeds, whichever crate its MIR came from
+            // (`rustc_codegen_ssa/src/mir/block.rs`, `codegen_assert_terminator`:
+            // `if !bx.sess().overflow_checks() && msg.is_optional_overflow_check()`).
+            // Such an assert reaches a checks-off body only from MIR built with checks
+            // on: a `#[rustc_inherit_overflow_checks]` body (core's `Add::add`,
+            // `Neg::neg`, `i32::abs`) or a callee the MIR inliner pulled in. The
+            // binary then WRAPS where the extracted model said the success edge
+            // guarantees "no overflow": every lane read that edge as a fact (the
+            // `AssertHolds` path guard, the checked-op result definition `_t.0 == a
+            // + b`, the interval narrowing past `OverflowNeg`, the trust-ir bundle).
+            // MEASURED on the stage 1 of `0ac7a96d9f` with `-Coverflow-checks=off`:
+            // `x.abs()` under `-Zinline-mir=yes` with `ensures result >= 0`
+            // (advisory), and a `#[rustc_inherit_overflow_checks]` `abs_like`
+            // (memory-safe), had every postcondition row PROVED while the binary
+            // returned `i32::MIN`. So the edge is extracted as what codegen emits: a
+            // plain `Goto(target)`. A checks-on session (every fail-closed policy
+            // canonicalizes checks on) is untouched, and so is every other assert
+            // kind (bounds, division, alignment, null), which codegen keeps.
+            //
+            // Trust (OVF-ASSERT-XCRATE-1, 2026-10-06): "this session" above must be
+            // the session that CODEGENS the body, which for a bundled foreign body
+            // is not the one extracting it (`OptionalOverflowAssertCodegen`). Only
+            // `ThisSession` erases. `ForeignKeep` extracts the assert unchanged.
+            // `ForeignUnknown` keeps the panic edge and replaces the condition with
+            // the unsupported sentinel, so nothing is read off the success edge.
+            let codegen_session_unknown =
+                if !tcx.sess.overflow_checks() && msg.is_optional_overflow_check() {
+                    match optional_overflow_assert_codegen {
+                        OptionalOverflowAssertCodegen::ThisSession => {
+                            return Terminator::Goto(BlockId(target.as_usize()));
+                        }
+                        OptionalOverflowAssertCodegen::ForeignKeep => false,
+                        OptionalOverflowAssertCodegen::ForeignUnknown => true,
+                    }
+                } else {
+                    false
+                };
+            let span = lazy_span();
             let msg = match convert_assert_message(msg) {
                 Ok(msg) => msg,
                 Err(detail) => {
@@ -1888,8 +3605,25 @@ fn convert_terminator<'tcx>(
                     return opaque_terminator(format!("Assert::{detail}"), successors, span);
                 }
             };
+            let cond = if codegen_session_unknown {
+                // The detail names the success target: vcgen spells an unsupported
+                // operand as one symbol per (kind, detail), and two asserts sharing a
+                // symbol would make the second's failure infeasible once the first
+                // held.
+                unsupported_operand(
+                    OPTIONAL_OVERFLOW_ASSERT_CODEGEN_SESSION_UNKNOWN,
+                    format!(
+                        "optional overflow assert before bb{} of a body another crate may \
+                         codegen: live only where the crate that codegens it has overflow \
+                         checks on",
+                        target.as_usize()
+                    ),
+                )
+            } else {
+                convert_operand(tcx, cond, typing_env)
+            };
             Terminator::Assert {
-                cond: convert_operand(tcx, cond, typing_env),
+                cond,
                 expected: *expected,
                 msg,
                 target: BlockId(target.as_usize()),
@@ -1915,12 +3649,37 @@ fn convert_terminator<'tcx>(
         // never fewer) and never lets a cleanup-path drop panic be reported as Proved
         // — an unproven cleanup drop stays an undischarged (unknown) obligation, just
         // like a normal-path drop.
-        mir::TerminatorKind::Drop { place, target, unwind, .. } => Terminator::Drop {
-            place: convert_place(tcx, place, typing_env),
-            target: BlockId(target.as_usize()),
-            span, // Trust: per-terminator source span
-            unwind: convert_unwind_action(*unwind),
-        },
+        // Trust (2026-09-29): a drop of a MONOMORPHIC type that has no drop glue runs
+        // no code at all — rustc's own `needs_drop` says so, and codegen emits
+        // nothing for it — so it is a plain edge. Drop elaboration already removes
+        // such drops from a monomorphic body, but a generic std body instantiated for
+        // a bundle keeps the `Drop` of its `Self`: `Iterator::max` over
+        // `v.windows(2).map(|w| w[0])` dropped a `Map<Windows<u8>, {closure}>`,
+        // whose glue the bridge cannot see into (`Ty::Adt` carries no drop bit), and
+        // the row "drop glue for `Map` has unproven panic-freedom" refused the
+        // program. A type with a parameter left in it keeps its `Drop`, and so does
+        // every type that needs drop. Proof-only, like the other normalizations here:
+        // the faithful (codegen) extraction keeps the MIR shape.
+        mir::TerminatorKind::Drop { place, target, unwind, .. } => {
+            let no_drop_glue = !ty_convert::faithful_scalars()
+                && local_decls.is_some_and(|decls| {
+                    let ty = place.ty(decls, tcx).ty;
+                    !ty.has_non_region_param()
+                        && !ty.has_non_region_infer()
+                        && !ty.has_escaping_bound_vars()
+                        && !ty.needs_drop(tcx, ty::TypingEnv::fully_monomorphized())
+                });
+            if no_drop_glue {
+                Terminator::Goto(BlockId(target.as_usize()))
+            } else {
+                Terminator::Drop {
+                    place: convert_place(tcx, place, typing_env),
+                    target: BlockId(target.as_usize()),
+                    span: lazy_span(), // Trust: per-terminator source span
+                    unwind: convert_unwind_action(*unwind),
+                }
+            }
+        }
         mir::TerminatorKind::FalseEdge { real_target, .. } => {
             Terminator::Goto(BlockId(real_target.as_usize()))
         }
@@ -1938,12 +3697,12 @@ fn convert_terminator<'tcx>(
         // to `Resume` loses that distinction and can hide a reachable panic at a
         // non-unwind boundary. TrustIr has no terminate sink yet, so fail closed.
         mir::TerminatorKind::UnwindTerminate(reason) => {
-            opaque_terminator(format!("UnwindTerminate::{reason:?}"), vec![], span)
+            opaque_terminator(format!("UnwindTerminate::{reason:?}"), vec![], lazy_span())
         }
         _ => opaque_terminator(
             terminator.kind.name(),
             terminator.kind.successors().map(|bb| BlockId(bb.as_usize())).collect(),
-            span,
+            lazy_span(),
         ),
     }
 }
@@ -1989,6 +3748,14 @@ fn opaque_terminator(
 /// matching that predicate, so a diverging call routed to `Call` here must be
 /// recognized there too — otherwise it would fail closed at the bridge instead
 /// of staying Opaque here.
+///
+/// A NAME test, and NOT an identity (DIVERGE-ANCHOR-1): a match says "spelled
+/// like a panic entry", never "is one". The routing in `convert_terminator`
+/// takes it only through [`diverging_entry_of`] (DIVERGE-ENTRY-1: a real sysroot
+/// crate, not a trait item, and applied to the GENERIC-FREE definition path, never
+/// to a call's rendering), and the bridge arm only through the `diverging_entry`
+/// stamp that function mints onto the call's `callee_key`. A match on its own must
+/// never select an encoding that REMOVES a row.
 fn is_panic_diverging_call(callee: &str) -> bool {
     callee.contains("::panicking::")
         || callee.contains("begin_panic")
@@ -2011,15 +3778,28 @@ fn is_panic_diverging_call(callee: &str) -> bool {
 /// plus the `__rust_alloc_error_handler`/`__rdl_oom` symbols its body reaches),
 /// and `process::abort`/`intrinsics::abort` (×2).
 ///
-/// SOUNDNESS: the same string-gate argument as `is_ub_if_reached_diverging_call`
-/// above. Every consumer of this predicate moves in the STRICT direction only:
+/// SOUNDNESS — CORRECTED 2026-10-04 (DIVERGE-ANCHOR-1). This doc used to say
+/// that every consumer of this predicate moves in the STRICT direction only, so
+/// that a user function sharing a tail is held to a stricter standard. That was
+/// false for the site encoding:
 /// * the extractor/bridge route a matching diverging call site to
-///   `assert(false)` under the path condition plus a `PanicFreedom` row, so a
-///   user function that merely shares a tail is held to a STRICTER standard,
-///   never a laxer one; and
+///   `assert(false)` under the path condition plus a `PanicFreedom` row, and
+///   that encoding REPLACES the absent-callee may-panic row the same call would
+///   otherwise carry. Under the default policy the site row is
+///   `runtime_checked` and ACCEPTED while the absent-callee row is refused, so a
+///   verify-off dependency's `pub fn unwrap_failed(p: *mut u32) -> !` that
+///   writes through `p` was ACCEPTED where the same body named `boom` was
+///   refused (measured on the stage 1 of `38e6c69b1c`: default rc=0, the linked
+///   program SIGSEGVs). The site encoding is now taken only for a callee that
+///   [`diverging_entry_of`] stamps (DIVERGE-ENTRY-1): its DefId is in a real
+///   sysroot crate, is not a trait item, and its GENERIC-FREE definition path
+///   matches; the bridge reads the stamp. Residency plus the call's rendering
+///   was not enough (a core trait method rendering a user `panicking::V`); this
+///   predicate is only the NAME half;
 /// * the bundling lane DECLINES to bundle a matching callee's body
-///   (`trust_verify`'s B-lane), returning its call sites to that charged arm —
-///   less bundling, never more credit.
+///   (`trust_verify`'s B-lane), returning its call sites to the charged arm —
+///   less bundling, never more credit. That consumer is a decline and may stay
+///   name-only.
 ///
 /// An ABORT terminal (`process::abort`, `handle_alloc_error`) does not unwind,
 /// so charging it as a must-be-unreachable panic point is a conservative
@@ -2068,14 +3848,20 @@ pub fn is_diverging_panic_or_abort_terminal(callee: &str) -> bool {
 /// point must be PROVEN unreachable — exactly the obligation shape
 /// `is_panic_diverging_call` already routes for an explicit `panic!`.
 ///
-/// SOUNDNESS OF A STRING GATE HERE. Unlike `is_total_noreturn_call` (which would ERASE the
-/// continuation, so a forged `my::process::exit -> !` that really panics would lose its panic),
-/// this predicate only ever ADDS an obligation: the call site gets `assert(false)` under the
-/// path condition plus a `PanicFreedom` row, and control ends in `Unreachable` — which the
-/// caller could not continue past in any case, since the callee diverges. A user function that
-/// merely SHARES the tail is therefore held to a STRICTER standard, never a laxer one. The
-/// previous behavior was a hard `Opaque` bail that dropped the WHOLE enclosing function from
-/// the native lane, so every one of its other obligations collapsed to Unsupported.
+/// A STRING GATE IS NOT ENOUGH HERE — CORRECTED 2026-10-04 (DIVERGE-ANCHOR-1). This doc
+/// used to argue that, unlike `is_total_noreturn_call` (which would ERASE the continuation),
+/// this predicate only ever ADDS an obligation, so a user function sharing the tail is held to
+/// a stricter standard. It does not only add: the site encoding (`assert(false)` under the
+/// path condition plus a `PanicFreedom` row, then `Unreachable`) REPLACES the absent-callee
+/// may-panic row, and the bridge mints no whole-function aggregate for a UB name. A verify-off
+/// dependency's `pub mod intrinsics { pub fn unreachable(p: *mut u32) -> ! }` that writes
+/// through `p` therefore passed `-Ztrust-policy=certify` (rc=0; the same body named `boom` is
+/// refused; the linked program SIGSEGVs). The routing in `convert_terminator` and the bridge arm
+/// now take it only through [`diverging_entry_of`]'s stamp (DIVERGE-ENTRY-1: a real sysroot
+/// crate, not a trait item, the GENERIC-FREE definition path). For a REAL sysroot callee the
+/// encoding is still the right one: the previous behavior was a hard `Opaque` bail that
+/// dropped the WHOLE enclosing function from the native lane, so every one of its other
+/// obligations collapsed to Unsupported.
 ///
 /// Kept in lockstep with `is_ub_if_reached_call` in `trust-ir-bridge/src/lower.rs`: a call
 /// routed to `Call` here must be recognized there, or it fails closed at the bridge instead.
@@ -2083,6 +3869,53 @@ fn is_ub_if_reached_diverging_call(callee: &str) -> bool {
     callee.ends_with("::unreachable_unchecked")
         || callee == "core::intrinsics::unreachable"
         || callee.ends_with("::intrinsics::unreachable")
+}
+
+/// The [`DivergingEntry`] class the NAME predicates give a GENERIC-FREE
+/// definition path: the panic family and the R177 terminals first (their pinned
+/// panic wording), then the UB family. Only [`diverging_entry_of`] may call this,
+/// with a path it rendered from the `DefId` alone; a call's rendering, generic
+/// arguments and all, must never reach it.
+fn diverging_entry_class(generic_free_def_path: &str) -> Option<DivergingEntry> {
+    if is_panic_diverging_call(generic_free_def_path) {
+        Some(DivergingEntry::PanicOrAbort)
+    } else if is_ub_if_reached_diverging_call(generic_free_def_path) {
+        Some(DivergingEntry::UbIfReached)
+    } else {
+        None
+    }
+}
+
+/// DIVERGE-ENTRY-1: is `def_id` one of the sysroot's OWN panic, abort or
+/// UB-if-reached entry points? The identity the diverging-site routing below and
+/// the bridge's diverging-site arm (through `CalleeKey::diverging_entry`, minted by
+/// [`callee_key_for`] from this function) both read.
+///
+/// A function of `(TyCtxt, DefId)` alone, like the rest of the key:
+///
+/// * the defining crate must be a real sysroot crate (`is_real_sysroot_crate`, the
+///   artifact-residency verdict; DIVERGE-ANCHOR-1);
+/// * the item must not belong to a TRAIT (`trait_of_assoc`). rustc names a trait
+///   method call by the TRAIT's `DefId` with `Self` in the generic arguments, so
+///   `<dep::panicking::V as core::convert::From<*mut u32>>::from` is keyed on core's
+///   `From::from` while a verify-off dependency's impl body runs. Residency alone
+///   passed it, and its RENDERING contains `::panicking::`: measured on the stage 1
+///   of `4463aeeb6d`, the `From`, `Default` and `Into` routes into such a dependency
+///   were accepted under the default policy and the linked program SIGSEGVs;
+/// * the name predicates read the GENERIC-FREE definition path
+///   (`safe_def_path_str`: no visible-path or trimmed-path rewriting, the item's
+///   own declared parameters, never the call's arguments). A user type in a
+///   generic argument of a real sysroot generic (`array::from_fn::<dep::panicking::V,
+///   …>`) therefore cannot spell an entry either.
+///
+/// Every real entry is a free function, a nested `fn` (`do_panic::runtime`), an
+/// intrinsic or a foreign `extern "Rust"` symbol of a sysroot crate, so the trait
+/// exclusion and the generic-free path lose none of them.
+pub(crate) fn diverging_entry_of(tcx: TyCtxt<'_>, def_id: DefId) -> Option<DivergingEntry> {
+    if !is_real_sysroot_crate(tcx, def_id.krate) || tcx.trait_of_assoc(def_id).is_some() {
+        return None;
+    }
+    diverging_entry_class(&crate::safe_def_path_str(tcx, def_id))
 }
 
 /// No string-only diverging-call identity can authorize a path-ending rewrite.
@@ -2152,6 +3985,23 @@ fn is_alloc_failure_abort_call(callee: &str) -> bool {
 // it is instead emitted as a real `Terminator::Call` whose size argument the
 // vcgen UnboundedAllocation recognizer can then see. Strip generic noise from
 // the method tail exactly as the recognizers do.
+//
+// Trust (W4 HASHMAP r2, 2026-09-27): `with_capacity_and_hasher` /
+// `with_capacity_and_hasher_in` (std `HashMap`/`HashSet`'s explicit-hasher
+// constructors, count at argument 0), nightly `Extend::extend_reserve` and nightly
+// `Iterator::collect_into` joined vcgen's recognizers, so they join here too: routed
+// like `with_capacity` and size-stamped (`with_bulk_alloc_element_size`). MEASURED
+// on the redo's r1 (`9eadf44e0`): `HashMap::with_capacity_and_hasher_in(usize::MAX,
+// RandomState::new(), Global)` built rc=0 and panicked "Hash table capacity
+// overflow" — neither this list nor vcgen's knew the name.
+//
+// Trust (W4 ITER-HOF landing round, 2026-10-03): the `Box`/`Rc`/`Arc` uninitialized
+// and zeroed SLICE constructors (`new_uninit_slice`, `new_zeroed_slice` and their
+// `allocator_api` `_in` twins, count at argument 0) joined vcgen's `bulk_alloc_call`,
+// so they join here: stamped with the element size of the `T` in `Box::<[T]>` (an
+// inherent method's first type argument, `bulk_alloc_elem_byte_size`) and routed like
+// `with_capacity`. MEASURED: `map(Box::<[u64]>::new_uninit_slice).collect()` and the
+// closure twin built rc=0 and panicked "capacity overflow" on `usize::MAX`.
 fn is_bulk_alloc_sink_call(callee: &str) -> bool {
     let tail = callee.rsplit("::").next().unwrap_or(callee);
     let tail = tail.split('<').next().unwrap_or(tail).trim();
@@ -2159,13 +4009,21 @@ fn is_bulk_alloc_sink_call(callee: &str) -> bool {
         tail,
         "with_capacity"
             | "with_capacity_in"
+            | "with_capacity_and_hasher"
+            | "with_capacity_and_hasher_in"
             | "reserve"
             | "reserve_exact"
+            | "extend_reserve"
             | "resize"
             | "resize_with"
             | "from_elem"
             | "collect"
+            | "collect_into"
             | "from_iter"
+            | "new_uninit_slice"
+            | "new_uninit_slice_in"
+            | "new_zeroed_slice"
+            | "new_zeroed_slice_in"
     )
 }
 
@@ -2195,6 +4053,12 @@ fn dedupe_block_ids(targets: Vec<BlockId>) -> Vec<BlockId> {
 ///
 /// Returns `Some(AtomicOperation)` if the call is a recognized atomic intrinsic,
 /// `None` otherwise.
+///
+/// TEST SEAM: the display-text forms (A and B) are exercised here as callees of
+/// an authenticated sysroot crate that is NOT `fence`/`compiler_fence`
+/// ([`AtomicCalleeIdentity::SYSROOT_OTHER`]). A fence is only ever recognized
+/// from [`AtomicCalleeIdentity::fence`], so a fence test must use
+/// [`parse_atomic_intrinsic_as`] and name the identity it stands for.
 #[cfg(test)]
 pub(crate) fn parse_atomic_intrinsic(
     func_name: &str,
@@ -2202,10 +4066,106 @@ pub(crate) fn parse_atomic_intrinsic(
     dest: &Place,
     span: &SourceSpan,
 ) -> Option<AtomicOperation> {
-    match parse_atomic_intrinsic_metadata(func_name, args, dest, span) {
+    parse_atomic_intrinsic_as(AtomicCalleeIdentity::SYSROOT_OTHER, func_name, args, dest, span)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_atomic_intrinsic_as(
+    callee: AtomicCalleeIdentity,
+    func_name: &str,
+    args: &[Operand],
+    dest: &Place,
+    span: &SourceSpan,
+) -> Option<AtomicOperation> {
+    match parse_atomic_intrinsic_metadata(func_name, callee, args, dest, span) {
         AtomicIntrinsicMetadata::Parsed(op) => Some(op),
         AtomicIntrinsicMetadata::Malformed { .. } | AtomicIntrinsicMetadata::NotAtomic => None,
     }
+}
+
+/// Which of the two standard fences a callee IS, by compiler identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SysrootFence {
+    /// `core::sync::atomic::fence` (diagnostic item `fence`).
+    Fence,
+    /// `core::sync::atomic::compiler_fence` (diagnostic item `compiler_fence`).
+    CompilerFence,
+}
+
+/// Trust (FENCE-IDENTITY-1, 2026-10-12): the COMPILER-RESOLVED facts about a
+/// direct callee that atomic-metadata recognition is allowed to key on.
+///
+/// Until this landed the bare fences were recognized by the RENDERED callee
+/// path: `func_name.ends_with("::fence") || func_name == "fence"` (and the same
+/// for `compiler_fence`). Every user function or method whose leaf is `fence`
+/// matched — `trust_ir_build::FunctionBuilder::fence`, `p2::B::fence` — and was
+/// then either refused as `UnsupportedAtomicMetadata` (its first argument is not
+/// an ordering constant: a FALSE FAILURE, measured on preview4 stage 1 as a
+/// reported "unreachable reached" in the caller) or, when its first argument
+/// happened to be an integer constant in `0..=4`, PARSED as a real fence: the
+/// call then carried `atomic: Some(Fence)`, which `trust-cg-bridge` lowers to a
+/// bare `Fence` instruction INSTEAD of calling the user's body.
+///
+/// Form B had the same defect in another spelling: `find("atomic::atomic_")`
+/// matched any user module path `…::atomic::atomic_load`.
+///
+/// Both are now decided by identity. `fence` is minted only for a callee in a
+/// REAL sysroot crate (artifact residency, [`is_real_sysroot_crate`]) that is
+/// also the lang-item-owning `core` and whose own diagnostic item is
+/// `fence`/`compiler_fence`; the display-text forms A and B are admitted only
+/// for a real-sysroot callee. A callee that fails these is a plain call — which
+/// is exactly its semantics, and keeps every callee obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtomicCalleeIdentity {
+    real_sysroot: bool,
+    fence: Option<SysrootFence>,
+}
+
+impl AtomicCalleeIdentity {
+    /// No direct `FnDef`, or a callee outside the compiler's own sysroot.
+    pub(crate) const NOT_SYSROOT: Self = Self { real_sysroot: false, fence: None };
+    /// A real-sysroot callee that is neither standard fence.
+    #[cfg(test)]
+    pub(crate) const SYSROOT_OTHER: Self = Self { real_sysroot: true, fence: None };
+
+    /// The authenticated standard fence `kind` (test seam; production mints
+    /// this only in [`atomic_callee_identity`]).
+    #[cfg(test)]
+    pub(crate) const fn sysroot_fence(kind: SysrootFence) -> Self {
+        Self { real_sysroot: true, fence: Some(kind) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fence(self) -> Option<SysrootFence> {
+        self.fence
+    }
+}
+
+/// Resolve [`AtomicCalleeIdentity`] from the call's own `func` operand — the
+/// same operand `func_name` was rendered from — never from display text.
+pub(crate) fn atomic_callee_identity<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+) -> AtomicCalleeIdentity {
+    let Some((did, _)) = func.const_fn_def() else {
+        return AtomicCalleeIdentity::NOT_SYSROOT;
+    };
+    if !is_real_sysroot_crate(tcx, did.krate) {
+        return AtomicCalleeIdentity::NOT_SYSROOT;
+    }
+    // The diagnostic item is an ATTRIBUTE; residency above is what rules out a
+    // crate that declares its own `#[rustc_diagnostic_item = "fence"]`, and the
+    // `Sized` lang-item anchor pins it to the one `core` this session uses (the
+    // same anchor `faithful_atomic_xadd` requires of its intrinsic).
+    let in_lang_core = tcx.lang_items().sized_trait().map(|anchor| anchor.krate) == Some(did.krate);
+    let fence = match tcx.get_diagnostic_name(did) {
+        Some(name) if in_lang_core && name == rustc_span::sym::fence => Some(SysrootFence::Fence),
+        Some(name) if in_lang_core && name == rustc_span::sym::compiler_fence => {
+            Some(SysrootFence::CompilerFence)
+        }
+        _ => None,
+    };
+    AtomicCalleeIdentity { real_sysroot: true, fence }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2215,12 +4175,66 @@ enum AtomicIntrinsicMetadata {
     NotAtomic,
 }
 
-fn parse_atomic_intrinsic_metadata(
+fn atomic_metadata_for_call<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
     func_name: &str,
     args: &[Operand],
     dest: &Place,
     span: &SourceSpan,
 ) -> AtomicIntrinsicMetadata {
+    match faithful_atomic_xadd::metadata(tcx, func, args, dest, span) {
+        Some(Ok(operation)) => AtomicIntrinsicMetadata::Parsed(operation),
+        Some(Err(detail)) => AtomicIntrinsicMetadata::Malformed { detail: detail.into() },
+        None => parse_atomic_intrinsic_metadata(
+            func_name,
+            atomic_callee_identity(tcx, func),
+            args,
+            dest,
+            span,
+        ),
+    }
+}
+
+fn parse_atomic_intrinsic_metadata(
+    func_name: &str,
+    callee: AtomicCalleeIdentity,
+    args: &[Operand],
+    dest: &Place,
+    span: &SourceSpan,
+) -> AtomicIntrinsicMetadata {
+    // FENCE-IDENTITY-1: the standard fences are recognized by compiler identity
+    // only (see `AtomicCalleeIdentity`); the rendered name plays no part.
+    if let Some(kind) = callee.fence {
+        let (op_kind, label) = match kind {
+            SysrootFence::Fence => (AtomicOpKind::Fence, "fence"),
+            SysrootFence::CompilerFence => (AtomicOpKind::CompilerFence, "compiler_fence"),
+        };
+        let Some(ordering) = ordering_from_args(args, 0) else {
+            return AtomicIntrinsicMetadata::Malformed {
+                detail: format!(
+                    "{label} ordering argument is missing or not a concrete Ordering discriminant"
+                ),
+            };
+        };
+        return AtomicIntrinsicMetadata::Parsed(AtomicOperation {
+            place: Place::local(0),
+            dest: None,
+            op_kind,
+            ordering,
+            failure_ordering: None,
+            span: span.clone(),
+        });
+    }
+
+    // Forms A and B below still read display text, so they are admitted only
+    // for a callee the compiler authenticated as its own sysroot: a user path
+    // `mycrate::atomic::atomic_load` (or a leaf spelled like an intrinsic) is a
+    // plain call.
+    if !callee.real_sysroot {
+        return AtomicIntrinsicMetadata::NotAtomic;
+    }
+
     // Form A: core::intrinsics::atomic_*
     if let Some(suffix) = func_name.strip_prefix("core::intrinsics::atomic_") {
         return parse_form_a(suffix, args, dest, span)
@@ -2236,42 +4250,6 @@ fn parse_atomic_intrinsic_metadata(
         // Strip generic suffix like "::<usize>"
         let op_name = after.split("::").next().unwrap_or(after);
         return parse_form_b(op_name, args, dest, span);
-    }
-
-    // Also handle bare "fence" or "atomic::fence" / "compiler_fence"
-    if func_name.ends_with("::fence") || func_name == "fence" {
-        let Some(ordering) = ordering_from_args(args, 0) else {
-            return AtomicIntrinsicMetadata::Malformed {
-                detail:
-                    "fence ordering argument is missing or not a concrete Ordering discriminant"
-                        .to_string(),
-            };
-        };
-        return AtomicIntrinsicMetadata::Parsed(AtomicOperation {
-            place: Place::local(0),
-            dest: None,
-            op_kind: AtomicOpKind::Fence,
-            ordering,
-            failure_ordering: None,
-            span: span.clone(),
-        });
-    }
-    if func_name.ends_with("::compiler_fence") || func_name == "compiler_fence" {
-        let Some(ordering) = ordering_from_args(args, 0) else {
-            return AtomicIntrinsicMetadata::Malformed {
-                detail:
-                    "compiler_fence ordering argument is missing or not a concrete Ordering discriminant"
-                        .to_string(),
-            };
-        };
-        return AtomicIntrinsicMetadata::Parsed(AtomicOperation {
-            place: Place::local(0),
-            dest: None,
-            op_kind: AtomicOpKind::CompilerFence,
-            ordering,
-            failure_ordering: None,
-            span: span.clone(),
-        });
     }
 
     AtomicIntrinsicMetadata::NotAtomic
@@ -2620,13 +4598,13 @@ fn convert_rvalue<'tcx>(
     typing_env: Option<ty::TypingEnv<'tcx>>,
 ) -> Rvalue {
     match rvalue {
-        mir::Rvalue::Use(mir::Operand::Constant(box const_op), _) => {
+        mir::Rvalue::Use(mir::Operand::Constant(const_op), _) => {
             convert_const_aggregate_rvalue(tcx, const_op)
-                .unwrap_or_else(|| Rvalue::Use(convert_const_operand(tcx, const_op)))
+                .unwrap_or_else(|| Rvalue::Use(convert_const_operand(tcx, const_op, typing_env)))
         }
         mir::Rvalue::Use(op, _) => Rvalue::Use(convert_operand(tcx, op, typing_env)),
 
-        mir::Rvalue::BinaryOp(bin_op, box (lhs, rhs)) => {
+        mir::Rvalue::BinaryOp(bin_op, (lhs, rhs)) => {
             let l = convert_operand(tcx, lhs, typing_env);
             let r = convert_operand(tcx, rhs, typing_env);
             // Trust: W2 inc-0 — `BinOp::Offset` is pointer arithmetic
@@ -2659,6 +4637,9 @@ fn convert_rvalue<'tcx>(
                 // collapsing it into `BinaryOp` would hand any binop-form
                 // definitional import UB arithmetic under the wrapping spelling.
                 BinopForm::Unchecked => Rvalue::UncheckedBinaryOp(our_op, l, r),
+                // Same variant, distinguished by `our_op` (`Shl`/`Shr`): the
+                // consumer charges the amount-range precondition, not overflow.
+                BinopForm::UncheckedShift => Rvalue::UncheckedBinaryOp(our_op, l, r),
             }
         }
 
@@ -2707,7 +4688,10 @@ fn convert_rvalue<'tcx>(
                     | PointerCoercion::ArrayToPointer,
                     _,
                 ) => Rvalue::Cast(operand, convert_ty_with_env(tcx, typing_env, *ty)),
-                mir::CastKind::Transmute => {
+                mir::CastKind::Transmute | mir::CastKind::BoxDerefTransmute => {
+                    static PEEL_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let peel_trace =
+                        *PEEL_TRACE.get_or_init(|| std::env::var_os("TRUST_PEEL_TRACE").is_some());
                     // A transmute whose TARGET is a thin pointer / box (the `vec!`/
                     // `Box` machinery's `*mut u8 -> Box<MaybeUninit<T>>` and
                     // `NonNull<_> -> *const MaybeUninit<T>`) preserves the address
@@ -2722,6 +4706,14 @@ fn convert_rvalue<'tcx>(
                     // SOURCE is a pointer (so a value transmute to an integer stays
                     // fail-closed). The bridge cast-op selector lowers a
                     // pointer-source->integer cast to `PtrToInt`.
+                    //
+                    // Fast path: when `TRUST_PEEL_TRACE` is off and the target is a
+                    // pointer or Box, every intermediate unwrap/pack/float/maybe_uninit
+                    // leg below is dead (their targets are integral or `MaybeUninit`),
+                    // and the admission below returns `Rvalue::Cast`.
+                    if !peel_trace && (ty.is_any_ptr() || ty.is_box()) {
+                        return Rvalue::Cast(operand, convert_ty_with_env(tcx, typing_env, *ty));
+                    }
                     // R119 — peel `repr(transparent)` wrappers off the SOURCE before the
                     // `ptr_to_int` test. `NonNull<u8> -> usize` (107 first_errors, the
                     // dominant residual Transmute once the R107 NonNull leg is on) is a
@@ -2745,83 +4737,87 @@ fn convert_rvalue<'tcx>(
                     // depth, and the field type NORMALIZED — an unnormalized projection
                     // alias (`NonZero`'s `<T as ZeroablePrimitive>::NonZeroInner`) never
                     // matches `TyKind::Adt` and would silently kill the chase.
-                    let peeled_src = (|| -> Option<ty::Ty<'tcx>> {
-                        let src = src_ty?;
-                        let te = typing_env?;
-                        if src.has_non_region_param()
-                            || src.has_non_region_infer()
-                            || src.has_opaque_types()
-                        {
-                            return None;
-                        }
-                        let mut cur = src;
-                        for _ in 0..8u32 {
-                            // PATTERN TYPES. `NonNull<T>`'s field is not `*const T` — it is
-                            // `pattern_type!(*const T is !null)`, rustc's representation of
-                            // the non-null niche. `is_any_ptr()` is FALSE on it
-                            // (`TyKind::Pat`, not `TyKind::RawPtr`), which is exactly why
-                            // R119/R121 measured inert twice: the chase reached the field
-                            // correctly and then failed the pointer test. Three rounds of
-                            // inference missed this; one `[PEEL]` trace line showed it.
-                            //
-                            // A pattern type is a VALIDITY RESTRICTION over an identical
-                            // layout. Unwrapping it DISCARDS the restriction — the same
-                            // unwrap direction this arm already blesses ("the source's
-                            // valid range is a subset of the target's — no obligation
-                            // exists"). Going `!null ptr -> usize` drops non-nullness, and
-                            // `usize` admits 0, so nothing is assumed and nothing is owed.
-                            if let ty::Pat(base, _) = cur.kind() {
-                                cur = *base;
-                                continue;
+                    let src_is_ptr = src_ty.as_ref().is_some_and(|t| t.is_any_ptr());
+                    let peeled_src = if peel_trace || (ty.is_integral() && !src_is_ptr) {
+                        (|| -> Option<ty::Ty<'tcx>> {
+                            let src = src_ty?;
+                            let te = typing_env?;
+                            if src.has_non_region_param()
+                                || src.has_non_region_infer()
+                                || src.has_opaque_types()
+                            {
+                                return None;
                             }
-                            let ty::Adt(def, args) = cur.kind() else { break };
-                            if !def.is_struct() || !def.repr().transparent() {
-                                break;
-                            }
-                            // UNIQUE NON-1-ZST field, exactly as the unwrap leg below
-                            // scans for it. An earlier version of this used
-                            // `fields.len() != 1`, which DECLINED any transparent struct
-                            // carrying a ZST marker beside its payload — measured inert
-                            // on `NonNull<u8> -> usize`, its motivating case. The ZST-skip
-                            // is what makes the chase actually reach the payload.
-                            let mut found = None;
-                            for field in def.non_enum_variant().fields.iter() {
-                                let fty = tcx
-                                    .try_normalize_erasing_regions(te, field.ty(tcx, args))
-                                    .ok()?;
-                                let is_1zst = tcx
-                                    .layout_of(te.as_query_input(fty))
-                                    .is_ok_and(|l| l.is_1zst());
-                                if !is_1zst {
-                                    if found.is_some() {
-                                        return None; // two payload fields — not transparent-shaped
+                            let mut cur = src;
+                            for _ in 0..8u32 {
+                                // PATTERN TYPES. `NonNull<T>`'s field is not `*const T` — it is
+                                // `pattern_type!(*const T is !null)`, rustc's representation of
+                                // the non-null niche. `is_any_ptr()` is FALSE on it
+                                // (`TyKind::Pat`, not `TyKind::RawPtr`), which is exactly why
+                                // R119/R121 measured inert twice: the chase reached the field
+                                // correctly and then failed the pointer test. Three rounds of
+                                // inference missed this; one `[PEEL]` trace line showed it.
+                                //
+                                // A pattern type is a VALIDITY RESTRICTION over an identical
+                                // layout. Unwrapping it DISCARDS the restriction — the same
+                                // unwrap direction this arm already blesses ("the source's
+                                // valid range is a subset of the target's — no obligation
+                                // exists"). Going `!null ptr -> usize` drops non-nullness, and
+                                // `usize` admits 0, so nothing is assumed and nothing is owed.
+                                if let ty::Pat(base, _) = cur.kind() {
+                                    cur = *base;
+                                    continue;
+                                }
+                                let ty::Adt(def, args) = cur.kind() else { break };
+                                if !def.is_struct() || !def.repr().transparent() {
+                                    break;
+                                }
+                                // UNIQUE NON-1-ZST field, exactly as the unwrap leg below
+                                // scans for it. An earlier version of this used
+                                // `fields.len() != 1`, which DECLINED any transparent struct
+                                // carrying a ZST marker beside its payload — measured inert
+                                // on `NonNull<u8> -> usize`, its motivating case. The ZST-skip
+                                // is what makes the chase actually reach the payload.
+                                let mut found = None;
+                                for field in def.non_enum_variant().fields.iter() {
+                                    let fty = tcx
+                                        .try_normalize_erasing_regions(te, field.ty(tcx, *args))
+                                        .ok()?;
+                                    let is_1zst =
+                                        crate::tuple_layouts::extractor_layout_of(tcx, te, fty)
+                                            .is_some_and(|l| l.is_1zst());
+                                    if !is_1zst {
+                                        if found.is_some() {
+                                            return None; // two payload fields — not transparent-shaped
+                                        }
+                                        found = Some(fty);
                                     }
-                                    found = Some(fty);
+                                }
+                                match found {
+                                    Some(fty) => cur = fty,
+                                    None => break, // all-ZST transparent: nothing to peel to
                                 }
                             }
-                            match found {
-                                Some(fty) => cur = fty,
-                                None => break, // all-ZST transparent: nothing to peel to
-                            }
-                        }
-                        Some(cur)
-                    })();
+                            Some(cur)
+                        })()
+                    } else {
+                        None
+                    };
                     let ptr_to_int = ty.is_integral()
-                        && (src_ty.as_ref().is_some_and(|t| t.is_any_ptr())
-                            || peeled_src.is_some_and(|t| t.is_any_ptr()));
+                        && (src_is_ptr || peeled_src.is_some_and(|t| t.is_any_ptr()));
                     // R123 (DIAGNOSTIC ONLY, gated, changes no verdict). R119/R121 measured
                     // BYTE-IDENTICAL twice — the peel never fires and three rounds of
                     // inference failed to say why. One line settles all four candidates at
                     // once: whether `src_ty` is present, whether the peel ADVANCED (peeled
                     // != src => the transparent chase ran), whether the peeled core is a
                     // pointer, and whether the target is integral.
-                    if std::env::var_os("TRUST_PEEL_TRACE").is_some() {
+                    if peel_trace {
                         eprintln!(
                             "[PEEL] src={:?} peeled={:?} target={:?} src_is_ptr={} peeled_is_ptr={} tgt_int={} ptr_to_int={}",
                             src_ty.map(|t| t.kind()),
                             peeled_src.map(|t| t.kind()),
                             ty.kind(),
-                            src_ty.as_ref().is_some_and(|t| t.is_any_ptr()),
+                            src_is_ptr,
                             peeled_src.is_some_and(|t| t.is_any_ptr()),
                             ty.is_integral(),
                             ptr_to_int,
@@ -2838,9 +4834,12 @@ fn convert_rvalue<'tcx>(
                     // transmute into NonNull admitted is the exact `usize -> NonNull<T>`
                     // thin-pointee bit identity below — `fmt::Arguments` packing;
                     // every other value->NonNull transmute stays fail-closed.)
-                    let ptr_to_nonnull = src_ty.as_ref().is_some_and(|t| t.is_any_ptr())
+                    let ptr_to_nonnull = src_is_ptr
                         && ty.ty_adt_def().is_some_and(|def| {
-                            tcx.is_diagnostic_item(rustc_span::sym::NonNull, def.did())
+                            tcx.is_lang_item(
+                                def.did(),
+                                rustc_attr_ir::lang_items::LangItem::NonNull,
+                            )
                         });
                     // Trust: TRANSPARENT-UNWRAP leg (2026-08-18) — the NonZero-class
                     // transmute OUT of a `#[repr(transparent)]` struct chain into the
@@ -2908,8 +4907,8 @@ fn convert_rvalue<'tcx>(
                                 if hops.is_empty() {
                                     return None; // an identity transmute — not this leg.
                                 }
-                                let ls = tcx.layout_of(te.as_query_input(src)).ok()?;
-                                let lt = tcx.layout_of(te.as_query_input(*ty)).ok()?;
+                                let ls = crate::tuple_layouts::extractor_layout_of(tcx, te, src)?;
+                                let lt = crate::tuple_layouts::extractor_layout_of(tcx, te, *ty)?;
                                 return match (ls.backend_repr, lt.backend_repr) {
                                     (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
                                         if a.primitive() == b.primitive() =>
@@ -2935,10 +4934,10 @@ fn convert_rvalue<'tcx>(
                                 // Concreteness was gated above, so normalization is
                                 // safe (the E0275 hazard is param-bearing input).
                                 let fty =
-                                    tcx.try_normalize_erasing_regions(te, f.ty(tcx, args)).ok()?;
-                                let is_1zst = tcx
-                                    .layout_of(te.as_query_input(fty))
-                                    .is_ok_and(|l| l.is_1zst());
+                                    tcx.try_normalize_erasing_regions(te, f.ty(tcx, *args)).ok()?;
+                                let is_1zst =
+                                    crate::tuple_layouts::extractor_layout_of(tcx, te, fty)
+                                        .is_some_and(|l| l.is_1zst());
                                 if !is_1zst {
                                     if found.is_some() {
                                         return None; // two payload fields — not transparent-shaped.
@@ -3015,10 +5014,15 @@ fn convert_rvalue<'tcx>(
                     // `OpaqueScalar` states exactly what is known — an unconstrained
                     // integer of the right sort. That is STRICTLY WEAKER than the truth:
                     // every value/arith/index/equality obligation over the result stays
-                    // `unknown`, each occurrence is an independent fresh symbol so two
-                    // reads are never asserted equal, and nothing can be falsely proved
-                    // from it. What it buys is not precision but LOWERING — the body
-                    // stops failing, so the bundle keeps its members.
+                    // `unknown`, and nothing can be falsely proved from it. Two
+                    // occurrences are never asserted equal: the body's placement pass
+                    // (`VerifiableBody::place_opaque_values`, run at the end of
+                    // extraction) gives each one its own MIR-site origin, and every
+                    // renderer names it by that origin (OPAQUE-SCALAR-ID-1). Before that
+                    // origin existed, every occurrence of a width rendered to ONE symbol,
+                    // and `if a as usize != b as usize { panic!() }` was PROVED. What it
+                    // buys is not precision but LOWERING — the body stops failing, so the
+                    // bundle keeps its members.
                     //
                     // Gates mirror the unwrap leg's audited discipline plus the enum's
                     // own:
@@ -3059,10 +5063,7 @@ fn convert_rvalue<'tcx>(
                             };
                             if def.is_enum() {
                                 if def.repr().int.is_none()
-                                    || !def
-                                        .variants()
-                                        .iter()
-                                        .all(|v| v.fields.is_empty())
+                                    || !def.variants().iter().all(|v| v.fields.is_empty())
                                 {
                                     return None;
                                 }
@@ -3074,12 +5075,11 @@ fn convert_rvalue<'tcx>(
                             }
                             let mut found = None;
                             for f in def.non_enum_variant().fields.iter() {
-                                let fty = tcx
-                                    .try_normalize_erasing_regions(te, f.ty(tcx, args))
-                                    .ok()?;
-                                let is_1zst = tcx
-                                    .layout_of(te.as_query_input(fty))
-                                    .is_ok_and(|l| l.is_1zst());
+                                let fty =
+                                    tcx.try_normalize_erasing_regions(te, f.ty(tcx, *args)).ok()?;
+                                let is_1zst =
+                                    crate::tuple_layouts::extractor_layout_of(tcx, te, fty)
+                                        .is_some_and(|l| l.is_1zst());
                                 if !is_1zst {
                                     if found.is_some() {
                                         return None; // two payload fields — not transparent-shaped.
@@ -3092,8 +5092,8 @@ fn convert_rvalue<'tcx>(
                         if !reached_fieldless_repr_int_enum {
                             return None;
                         }
-                        let ls = tcx.layout_of(te.as_query_input(src)).ok()?;
-                        let lt = tcx.layout_of(te.as_query_input(*ty)).ok()?;
+                        let ls = crate::tuple_layouts::extractor_layout_of(tcx, te, src)?;
+                        let lt = crate::tuple_layouts::extractor_layout_of(tcx, te, *ty)?;
                         match (ls.backend_repr, lt.backend_repr) {
                             (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
                                 if a.primitive() == b.primitive() => {}
@@ -3105,10 +5105,9 @@ fn convert_rvalue<'tcx>(
                         }
                     })();
                     if let Some((width, signed)) = transparent_enum_unwrap {
-                        return Rvalue::Use(Operand::Constant(ConstValue::OpaqueScalar {
-                            width,
-                            signed,
-                        }));
+                        return Rvalue::Use(Operand::Constant(ConstValue::opaque_scalar(
+                            width, signed,
+                        )));
                     }
 
                     // R181 leg 1 — BYTE-ARRAY PACK: `[u8; N]` → the unsigned int of
@@ -3117,9 +5116,10 @@ fn convert_rvalue<'tcx>(
                     // of the TARGET, so the source's valid range is a subset of the
                     // target's — the same "nothing is assumed, so nothing is owed"
                     // blessing as the R141 unwrap leg, hence default-ON like it.
-                    // The VALUE is OpaqueScalar (fresh unconstrained int): strictly
-                    // weaker than the true byte concatenation (endianness never
-                    // enters), nothing falsely provable, and it buys LOWERING.
+                    // The VALUE is OpaqueScalar (an unconstrained int with its own
+                    // site symbol, OPAQUE-SCALAR-ID-1): strictly weaker than the true
+                    // byte concatenation (endianness never enters), nothing falsely
+                    // provable, and it buys LOWERING.
                     let byte_array_pack = (|| -> Option<(u32, bool)> {
                         let src = src_ty?;
                         let ty::TyKind::Array(elem, len) = src.kind() else {
@@ -3139,17 +5139,16 @@ fn convert_rvalue<'tcx>(
                         }
                     })();
                     if let Some((width, signed)) = byte_array_pack {
-                        return Rvalue::Use(Operand::Constant(ConstValue::OpaqueScalar {
-                            width,
-                            signed,
-                        }));
+                        return Rvalue::Use(Operand::Constant(ConstValue::opaque_scalar(
+                            width, signed,
+                        )));
                     }
                     // R181 leg 2 — FLOAT-TO-BITS: `f32 → u32` / `f64 → u64` (×6/×9
                     // in R180). Every 32/64-bit pattern is a valid value of the
                     // unsigned target; the reinterpretation is total by definition
-                    // (`to_bits`). OpaqueScalar result — sound havoc today;
-                    // precision can later upgrade to the FloatBits identity model
-                    // without changing the admission.
+                    // (`to_bits`). OpaqueScalar result — a sound havoc with its own
+                    // site symbol (OPAQUE-SCALAR-ID-1); precision can later upgrade to
+                    // the FloatBits identity model without changing the admission.
                     let float_to_bits = matches!(
                         (src_ty.map(|t| *t.kind()), ty.kind()),
                         (
@@ -3163,10 +5162,9 @@ fn convert_rvalue<'tcx>(
                     if float_to_bits {
                         if let Ty::Int { width, signed } = convert_ty_with_env(tcx, typing_env, *ty)
                         {
-                            return Rvalue::Use(Operand::Constant(ConstValue::OpaqueScalar {
-                                width,
-                                signed,
-                            }));
+                            return Rvalue::Use(Operand::Constant(ConstValue::opaque_scalar(
+                                width, signed,
+                            )));
                         }
                     }
                     // R140 — MAYBEUNINIT-TO-INT: `MaybeUninit<uN/iN> -> uN/iN` (×21
@@ -3202,10 +5200,19 @@ fn convert_rvalue<'tcx>(
                         }
                     })();
                     if let Some((width, signed)) = maybe_uninit_to_int {
-                        return Rvalue::Use(Operand::Constant(ConstValue::OpaqueScalar {
-                            width,
-                            signed,
-                        }));
+                        return Rvalue::Use(Operand::Constant(ConstValue::opaque_scalar(
+                            width, signed,
+                        )));
+                    }
+                    // R140's CONVERSE — `T -> MaybeUninit<T>` at the very same `T`,
+                    // modelled as the IDENTITY (a value-preserving `Cast`), for every
+                    // `T`: pointers, arrays, structs, not only the integers the R146
+                    // total-niche leg below already takes by layout.
+                    // See `transmute_widens_to_maybe_uninit` for the soundness argument
+                    // (the direction only WIDENS validity) and for why the REVERSE
+                    // stays with R140's havoc instead of being made the identity too.
+                    if src_ty.is_some_and(|src| transmute_widens_to_maybe_uninit(tcx, src, *ty)) {
+                        return Rvalue::Cast(operand, convert_ty_with_env(tcx, typing_env, *ty));
                     }
                     // R146 — TOTAL NICHE-OPTION transmute (×5 in R143B: u128 ->
                     // Option<NonZero<u128>> inside checked_pow via NonZero::new,
@@ -3240,8 +5247,8 @@ fn convert_rvalue<'tcx>(
                         {
                             return Some(false);
                         }
-                        let ls = tcx.layout_of(te.as_query_input(src)).ok()?;
-                        let lt = tcx.layout_of(te.as_query_input(*ty)).ok()?;
+                        let ls = crate::tuple_layouts::extractor_layout_of(tcx, te, src)?;
+                        let lt = crate::tuple_layouts::extractor_layout_of(tcx, te, *ty)?;
                         match (ls.backend_repr, lt.backend_repr) {
                             (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
                                 if a.primitive() == b.primitive() && {
@@ -3273,6 +5280,11 @@ fn convert_rvalue<'tcx>(
                     // invariant is a real obligation". This admits it ONLY in the world
                     // where that obligation is actually CHARGED — the bridge's R107 leg
                     // emits `src != 0` and asserts it (lower.rs, `Rvalue::Cast` arm).
+                    // Trust (BMC-LANE-1): it charges it in every body except an
+                    // authenticated real-sysroot member, whose own transmutes are std's
+                    // obligation (the MIR `[unsafe:validity-transmute]` row's exemption,
+                    // docs/TCB.md), and it charges a raw-pointer, integer or fat-pointer
+                    // source only; lower.rs names the uncharged sources and why.
                     //
                     // GATED ON THE SAME ENV VAR AS THE BRIDGE HALF, deliberately: were
                     // this widening ever live while the assert was not, the transmute
@@ -3286,21 +5298,25 @@ fn convert_rvalue<'tcx>(
                     // forgeable spelling must not gate an ADMISSION (false proof #14).
                     // Note the asymmetry with the bridge half, where a forgeable name IS
                     // acceptable because it only ever ADDS an obligation.
-                    let asserted_wrap = ty.ty_adt_def().is_some_and(|def| {
+                    let asserted_wrap = || {
+                        ty.ty_adt_def().is_some_and(|def| {
                             def.repr().transparent()
-                                && tcx.is_diagnostic_item(rustc_span::sym::NonNull, def.did())
-                        });
+                                && tcx.is_lang_item(
+                                    def.did(),
+                                    rustc_attr_ir::lang_items::LangItem::NonNull,
+                                )
+                        })
+                    };
                     // R181 leg 3 — u32 → char wrap (×7 in R180): a REAL validity
                     // obligation (char's valid set is 0..=0xD7FF ∪ 0xE000..=0x10FFFF),
                     // charged by the bridge's char-wrap arm under the SAME flag
                     // (coupled halves, the R107 discipline). The target here is the
                     // STRUCTURAL PRIMITIVE `char` — no printed path, no forgeable
                     // name anywhere in the chain.
-                    let asserted_char_wrap = matches!(
-                            src_ty.map(|t| *t.kind()),
-                            Some(ty::TyKind::Uint(ty::UintTy::U32))
-                        )
-                        && matches!(ty.kind(), ty::TyKind::Char);
+                    let asserted_char_wrap = || {
+                        matches!(src_ty.map(|t| *t.kind()), Some(ty::TyKind::Uint(ty::UintTy::U32)))
+                            && matches!(ty.kind(), ty::TyKind::Char)
+                    };
                     // R139 — EXTRACTOR HALF of the asserted NICHE-WRAP leg. The
                     // WRAP direction into a `define_valid_range_type!` wrapper
                     // (`usize -> core::num::niche_types::UsizeNoHighBit`, the ×66
@@ -3327,74 +5343,119 @@ fn convert_rvalue<'tcx>(
                     //     niche layout still refuses; with the genuine layout the
                     //     charge is correct anyway);
                     //  4. src is the u64-primitive uint (usize here).
-                    let asserted_niche_wrap = (|| -> Option<bool> {
-                        use rustc_abi::{BackendRepr, WrappingRange};
-                        let src = src_ty?;
-                        let te = typing_env?;
-                        if !matches!(src.kind(), ty::TyKind::Uint(_)) {
-                            return Some(false);
-                        }
-                        if ty.has_non_region_param()
-                            || ty.has_non_region_infer()
-                            || ty.has_opaque_types()
-                        {
-                            return Some(false);
-                        }
-                        if !tcx
-                            .def_path_str(ty.ty_adt_def()?.did())
-                            .ends_with("num::niche_types::UsizeNoHighBit")
-                        {
-                            return Some(false);
-                        }
-                        let mut cur = *ty;
-                        for _ in 0..8usize {
-                            let ty::TyKind::Adt(def, args) = cur.kind() else {
-                                return Some(false);
-                            };
-                            if !def.is_struct() || !def.repr().transparent() {
+                    let asserted_niche_wrap = || {
+                        (|| -> Option<bool> {
+                            use rustc_abi::{BackendRepr, WrappingRange};
+                            let src = src_ty?;
+                            let te = typing_env?;
+                            if !matches!(src.kind(), ty::TyKind::Uint(_)) {
                                 return Some(false);
                             }
-                            let mut found = None;
-                            for f in def.non_enum_variant().fields.iter() {
-                                let fty = tcx
-                                    .try_normalize_erasing_regions(te, f.ty(tcx, args))
-                                    .ok()?;
-                                let is_1zst = tcx
-                                    .layout_of(te.as_query_input(fty))
-                                    .is_ok_and(|l| l.is_1zst());
-                                if !is_1zst {
-                                    if found.is_some() {
-                                        return Some(false);
-                                    }
-                                    found = Some(fty);
-                                }
+                            if ty.has_non_region_param()
+                                || ty.has_non_region_infer()
+                                || ty.has_opaque_types()
+                            {
+                                return Some(false);
                             }
-                            let fty = found?;
-                            if let ty::TyKind::Pat(base, _) = fty.kind() {
-                                if *base != src {
+                            // `crate::safe_def_path_str`, NEVER a bare
+                            // `tcx.def_path_str`. Two independent reasons, and the
+                            // first one is an ICE that reaches `fn main() {
+                            // println!("hello"); }`:
+                            //
+                            // 1. TERMINATION. A bare `def_path_str` runs
+                            //    `try_print_trimmed_def_path`, which invokes the
+                            //    `trimmed_def_paths` query, which ARMS
+                            //    `must_produce_diag` — rustc's assertion that path
+                            //    trimming is only ever computed while building a
+                            //    diagnostic. This call site builds no diagnostic: it
+                            //    is a pure control-flow test. Under the fail-closed
+                            //    default an error happens to follow and the
+                            //    assertion is satisfied by accident; under
+                            //    `-Ztrust-policy=advisory` the compile SUCCEEDS, no
+                            //    error is emitted, and `DiagCtxtInner::drop` fires
+                            //    `` `trimmed_def_paths` called, diagnostics were
+                            //    expected but none were emitted `` — an ICE naming
+                            //    nothing in this file. MEASURED 2026-09-07 on
+                            //    trustc 07f9466c4: `println!` ICEs the advisory lane
+                            //    while the identical source exits 1 (a normal
+                            //    refusal) under strict. The whole advisory lane —
+                            //    the rung every consuming repo's ratchet sits on —
+                            //    is unusable until this is wrapped.
+                            //
+                            // 2. CORRECTNESS. Trimming can only SHORTEN a path, and
+                            //    this test is an `ends_with` on a fully-qualified
+                            //    suffix. With trimming live the rendered path can be
+                            //    the bare `UsizeNoHighBit`, the test silently
+                            //    answers false, and the niche-wrap charge is dropped
+                            //    on a type that genuinely has it — a completeness
+                            //    loss whose trigger is whether some other crate
+                            //    happened to make the name ambiguous.
+                            //
+                            // `safe_def_path_str` is the single rendering seam this
+                            // extractor already uses for its other 70-odd path
+                            // comparisons (`with_no_trimmed_paths` +
+                            // `with_no_visible_paths` + resolved crate name +
+                            // disambiguators + canonical lifetimes), so this call
+                            // site simply stops being the one that opted out.
+                            let adt_did = ty.ty_adt_def()?.did();
+                            if tcx.item_name(adt_did).as_str() != "UsizeNoHighBit"
+                                || !crate::safe_def_path_str(tcx, adt_did)
+                                    .ends_with("num::niche_types::UsizeNoHighBit")
+                            {
+                                return Some(false);
+                            }
+                            let mut cur = *ty;
+                            for _ in 0..8usize {
+                                let ty::TyKind::Adt(def, args) = cur.kind() else {
+                                    return Some(false);
+                                };
+                                if !def.is_struct() || !def.repr().transparent() {
                                     return Some(false);
                                 }
-                                let ls = tcx.layout_of(te.as_query_input(src)).ok()?;
-                                let lt = tcx.layout_of(te.as_query_input(*ty)).ok()?;
-                                return match (ls.backend_repr, lt.backend_repr) {
-                                    (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
-                                        if a.primitive() == b.primitive()
-                                            && b.valid_range(&tcx)
-                                                == (WrappingRange {
-                                                    start: 0,
-                                                    end: i64::MAX as u128,
-                                                }) =>
-                                    {
-                                        Some(true)
+                                let mut found = None;
+                                for f in def.non_enum_variant().fields.iter() {
+                                    let fty = tcx
+                                        .try_normalize_erasing_regions(te, f.ty(tcx, *args))
+                                        .ok()?;
+                                    let is_1zst =
+                                        crate::tuple_layouts::extractor_layout_of(tcx, te, fty)
+                                            .is_some_and(|l| l.is_1zst());
+                                    if !is_1zst {
+                                        if found.is_some() {
+                                            return Some(false);
+                                        }
+                                        found = Some(fty);
                                     }
-                                    _ => Some(false),
-                                };
+                                }
+                                let fty = found?;
+                                if let ty::TyKind::Pat(base, _) = fty.kind() {
+                                    if *base != src {
+                                        return Some(false);
+                                    }
+                                    let ls =
+                                        crate::tuple_layouts::extractor_layout_of(tcx, te, src)?;
+                                    let lt =
+                                        crate::tuple_layouts::extractor_layout_of(tcx, te, *ty)?;
+                                    return match (ls.backend_repr, lt.backend_repr) {
+                                        (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
+                                            if a.primitive() == b.primitive()
+                                                && b.valid_range(&tcx)
+                                                    == (WrappingRange {
+                                                        start: 0,
+                                                        end: i64::MAX as u128,
+                                                    }) =>
+                                        {
+                                            Some(true)
+                                        }
+                                        _ => Some(false),
+                                    };
+                                }
+                                cur = fty;
                             }
-                            cur = fty;
-                        }
-                        Some(false)
-                    })()
-                    .unwrap_or(false);
+                            Some(false)
+                        })()
+                        .unwrap_or(false)
+                    };
                     // R128 — EXTRACTOR HALF of the asserted ENUM-WRAP leg (default
                     // OFF, SAME FLAG, same coupling rationale as R107b above: were
                     // this admission live while the bridge's membership assert was
@@ -3415,7 +5476,8 @@ fn convert_rvalue<'tcx>(
                     // user enum that satisfies it is charged ITS OWN valid set, so
                     // there is no under-charge to forge (the hole a name-keyed
                     // power-of-two formula would have opened).
-                    let asserted_enum_wrap = (|| -> Option<()> {
+                    let asserted_enum_wrap = || {
+                        (|| -> Option<()> {
                             use rustc_abi::BackendRepr;
                             let src = src_ty?;
                             if !src.is_integral() {
@@ -3439,10 +5501,7 @@ fn convert_rvalue<'tcx>(
                                 };
                                 if def.is_enum() {
                                     if def.repr().int.is_none()
-                                        || !def
-                                            .variants()
-                                            .iter()
-                                            .all(|v| v.fields.is_empty())
+                                        || !def.variants().iter().all(|v| v.fields.is_empty())
                                     {
                                         return None;
                                     }
@@ -3455,11 +5514,11 @@ fn convert_rvalue<'tcx>(
                                 let mut found = None;
                                 for f in def.non_enum_variant().fields.iter() {
                                     let fty = tcx
-                                        .try_normalize_erasing_regions(te, f.ty(tcx, args))
+                                        .try_normalize_erasing_regions(te, f.ty(tcx, *args))
                                         .ok()?;
-                                    let is_1zst = tcx
-                                        .layout_of(te.as_query_input(fty))
-                                        .is_ok_and(|l| l.is_1zst());
+                                    let is_1zst =
+                                        crate::tuple_layouts::extractor_layout_of(tcx, te, fty)
+                                            .is_some_and(|l| l.is_1zst());
                                     if !is_1zst {
                                         if found.is_some() {
                                             return None;
@@ -3472,8 +5531,8 @@ fn convert_rvalue<'tcx>(
                             if !reached_fieldless_repr_int_enum {
                                 return None;
                             }
-                            let ls = tcx.layout_of(te.as_query_input(src)).ok()?;
-                            let lt = tcx.layout_of(te.as_query_input(*ty)).ok()?;
+                            let ls = crate::tuple_layouts::extractor_layout_of(tcx, te, src)?;
+                            let lt = crate::tuple_layouts::extractor_layout_of(tcx, te, *ty)?;
                             match (ls.backend_repr, lt.backend_repr) {
                                 (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
                                     if a.primitive() == b.primitive() =>
@@ -3483,7 +5542,8 @@ fn convert_rvalue<'tcx>(
                                 _ => None,
                             }
                         })()
-                        .is_some();
+                        .is_some()
+                    };
                     // Trust (close-gap): the `fmt::Arguments` bit-packing
                     // (`from_str` packs `len << 1 | 1` into `NonNull<rt::Argument>`;
                     // `as_str` unpacks it) transmutes `usize <-> NonNull<T>`. At the
@@ -3500,7 +5560,10 @@ fn convert_rvalue<'tcx>(
                     // the pointer side (a fat `NonNull<[T]>` is a 128-bit value).
                     let nonnull_thin = |t: ty::Ty<'tcx>| {
                         t.ty_adt_def().is_some_and(|def| {
-                            tcx.is_diagnostic_item(rustc_span::sym::NonNull, def.did())
+                            tcx.is_lang_item(
+                                def.did(),
+                                rustc_attr_ir::lang_items::LangItem::NonNull,
+                            )
                         }) && match t.kind() {
                             ty::TyKind::Adt(_, args) => {
                                 typing_env.is_some_and(|env| args.type_at(0).is_sized(tcx, env))
@@ -3508,18 +5571,75 @@ fn convert_rvalue<'tcx>(
                             _ => false,
                         }
                     };
-                    let usize_to_nonnull = src_ty
-                        .as_ref()
-                        .is_some_and(|t| matches!(t.kind(), ty::TyKind::Uint(ty::UintTy::Usize)))
-                        && nonnull_thin(*ty);
-                    let nonnull_to_usize = src_ty.as_ref().is_some_and(|t| nonnull_thin(*t))
-                        && matches!(ty.kind(), ty::TyKind::Uint(ty::UintTy::Usize));
-                    if ty.is_any_ptr() || ty.is_box() || ptr_to_int || ptr_to_nonnull
-                        || asserted_wrap || asserted_enum_wrap || asserted_char_wrap
-                        || asserted_niche_wrap
-                        || usize_to_nonnull || nonnull_to_usize
+                    let usize_to_nonnull = || {
+                        src_ty.as_ref().is_some_and(|t| {
+                            matches!(t.kind(), ty::TyKind::Uint(ty::UintTy::Usize))
+                        }) && nonnull_thin(*ty)
+                    };
+                    let nonnull_to_usize = || {
+                        matches!(ty.kind(), ty::TyKind::Uint(ty::UintTy::Usize))
+                            && src_ty.as_ref().is_some_and(|t| nonnull_thin(*t))
+                    };
+                    // Trust: a transmute between two ZERO-SIZED, opsem-inhabited types
+                    // is value-exact as a cast. A 0-byte type has exactly one bit
+                    // pattern, so satisfiable validity (`is_opsem_inhabited`) makes
+                    // that pattern — the one the source value already is — valid at
+                    // the target; no bytes are reinterpreted and no further
+                    // invariant exists to discharge. Upstream's ZST-init MIR changes
+                    // stopped erasing this cast before extraction (the nested-ZST
+                    // arrays of tests/ui/trust/trust_ir_huge_array_types_first_class.rs
+                    // reached this refusal), so the admission is stated here rather
+                    // than inherited from MIR shape. Every query declines closed: no
+                    // typing env, no layout, a nonzero size, or an uninhabited side
+                    // keeps the refusal below.
+                    let zst_to_zst = || {
+                        (|| {
+                            let te = typing_env?;
+                            let src = src_ty?;
+                            let ls = crate::tuple_layouts::extractor_layout_of(tcx, te, src)?;
+                            let lt = crate::tuple_layouts::extractor_layout_of(tcx, te, *ty)?;
+                            (ls.size.bytes() == 0
+                                && lt.size.bytes() == 0
+                                && src.is_opsem_inhabited(tcx, te)
+                                && ty.is_opsem_inhabited(tcx, te))
+                            .then_some(())
+                        })()
+                        .is_some()
+                    };
+                    if ty.is_any_ptr()
+                        || ty.is_box()
+                        || ptr_to_int
+                        || ptr_to_nonnull
+                        || asserted_wrap()
+                        || asserted_enum_wrap()
+                        || asserted_char_wrap()
+                        || asserted_niche_wrap()
+                        || usize_to_nonnull()
+                        || nonnull_to_usize()
+                        || zst_to_zst()
                     {
                         Rvalue::Cast(operand, convert_ty_with_env(tcx, typing_env, *ty))
+                    } else if let Some((start, end)) =
+                        transmute_into_pattern_type_valid_range(tcx, typing_env, src_ty, *ty)
+                    {
+                        // A transmute INTO a pattern type over the source's own
+                        // integer type: the identity on the integer, UB unless the
+                        // value is in the layout's valid range. Recorded as the
+                        // sentinel whose consumer charges that range — never as a
+                        // bare `Cast`, which the pattern-erasing trust `Ty` would
+                        // make indistinguishable from an unconstrained identity.
+                        // Reached only when every leg above declined, so no
+                        // admitted transmute changes.
+                        unsupported_rvalue(
+                            trust_types::TRUST_TRANSMUTE_INTO_VALID_RANGE_KIND,
+                            format!(
+                                "transmute into pattern type {ty:?} is the identity on its \
+                                 base integer and UB unless the value lies in the valid range \
+                                 {start:?}..={end:?} (a wrapping range when start > end); only \
+                                 a consumer that charges that membership may lower it"
+                            ),
+                            vec![operand, Operand::Constant(start), Operand::Constant(end)],
+                        )
                     } else {
                         // R135 (DIAGNOSTIC ONLY, gated, changes no verdict). This refusal
                         // prints only the TARGET, so the SOURCE of every refused transmute
@@ -3534,7 +5654,7 @@ fn convert_rvalue<'tcx>(
                         //
                         // Append the source ONLY under the env var, so the DEFAULT message
                         // stays byte-identical and nothing matching on it can break.
-                        let src_suffix = if std::env::var_os("TRUST_PEEL_TRACE").is_some() {
+                        let src_suffix = if peel_trace {
                             format!(
                                 " [src={:?} peeled={:?}]",
                                 src_ty.map(|t| t.kind()),
@@ -3552,13 +5672,34 @@ fn convert_rvalue<'tcx>(
                         )
                     }
                 }
-                mir::CastKind::FnPtrToPtr => unsupported_rvalue(
-                    "CastKind::FnPtrToPtr",
-                    format!(
-                        "function pointer cast to {ty:?} requires callable address/provenance semantics"
-                    ),
-                    vec![operand],
-                ),
+                // Trust (G1, 2026-10-27): `f as *const ()` for a function pointer `f` (the
+                // `sighandler_t` idiom) to a THIN raw pointer is spelled as a cast, which
+                // trust-vcgen models as an OPAQUE CODE ADDRESS
+                // (`is_fn_pointer_to_code_address_cast`: a fresh value, never identity, no
+                // value fact), so a dereference of the result keeps every separation row.
+                // Any other target keeps the fail-closed refusal.
+                mir::CastKind::FnPtrToPtr => {
+                    let target = convert_ty_with_env(tcx, typing_env, *ty);
+                    let thin_raw_target = matches!(
+                        &target,
+                        Ty::RawPtr { pointee, .. } if !matches!(
+                            pointee.as_ref(),
+                            Ty::Slice { .. } | Ty::Str | Ty::Dynamic { .. } | Ty::Unsupported { .. }
+                        )
+                    );
+                    let fn_ptr_source = src_ty.is_some_and(|t| t.is_fn_ptr());
+                    if thin_raw_target && fn_ptr_source {
+                        Rvalue::Cast(operand, target)
+                    } else {
+                        unsupported_rvalue(
+                            "CastKind::FnPtrToPtr",
+                            format!(
+                                "function pointer cast to {ty:?} requires callable address/provenance semantics"
+                            ),
+                            vec![operand],
+                        )
+                    }
+                }
                 // `ptr as usize` (expose) / `usize as *T` (recover): the cast itself is TOTAL —
                 // no panic, no overflow, no alloc. The exposed ADDRESS value and the recovered
                 // PROVENANCE are the unsafe caller's SAFETY contract, not a verifier panic/UB
@@ -3574,19 +5715,25 @@ fn convert_rvalue<'tcx>(
                 // arithmetic/indexing", which is precisely what the idiom above needs.
                 // `OpaqueScalar` is the variant that exists for this: equally
                 // unconstrained (never falsely proved) but INTEGER-SORTED, so a consumer
-                // mints a fresh integer instead of an ill-sorted pointer.
+                // mints an integer instead of an ill-sorted pointer. Each exposed address
+                // gets the symbol of its own MIR site (OPAQUE-SCALAR-ID-1): two
+                // different pointers' addresses are never one solver term.
                 mir::CastKind::PointerExposeProvenance => {
                     match convert_ty_with_env(tcx, typing_env, *ty) {
-                        Ty::Int { width, signed } => Rvalue::Use(Operand::Constant(
-                            ConstValue::OpaqueScalar { width, signed },
-                        )),
+                        Ty::Int { width, signed } => {
+                            Rvalue::Use(Operand::Constant(ConstValue::opaque_scalar(width, signed)))
+                        }
                         // Anything else keeps the conservative lowering -- this arm may
                         // only ever REPLACE an opaque with a better-typed opaque.
-                        _ => Rvalue::Use(Operand::Constant(ConstValue::OpaqueConst)),
+                        _ => Rvalue::Use(Operand::Constant(ConstValue::opaque_const())),
                     }
                 }
+                // `usize as *T` (recover): an unmodeled POINTER value. Each recovered
+                // pointer is named by its own MIR site (OPAQUE-REF-ID-1): before that,
+                // every `OpaqueConst` was the one solver symbol `__unknown_const`, so
+                // `x as *const u8 != y as *const u8` was proved false and certified.
                 mir::CastKind::PointerWithExposedProvenance => {
-                    Rvalue::Use(Operand::Constant(ConstValue::OpaqueConst))
+                    Rvalue::Use(Operand::Constant(ConstValue::opaque_const()))
                 }
                 // `&[T; N] -> &[T]` (array→slice unsize): the bridge's
                 // array_to_slice_pointer_cast lowers this precisely — the slice
@@ -3649,7 +5796,7 @@ fn convert_rvalue<'tcx>(
                 mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _)
                     if unsize_target_is_trait_object_ref(*ty) =>
                 {
-                    Rvalue::Use(Operand::Constant(ConstValue::OpaqueConst))
+                    Rvalue::Use(Operand::Constant(ConstValue::opaque_const()))
                 }
                 mir::CastKind::PointerCoercion(coercion, source) => unsupported_rvalue(
                     format!("CastKind::PointerCoercion::{coercion:?}"),
@@ -3666,14 +5813,14 @@ fn convert_rvalue<'tcx>(
             }
         }
 
-        mir::Rvalue::Aggregate(box mir::AggregateKind::Tuple, operands) if operands.is_empty() => {
+        mir::Rvalue::Aggregate(mir::AggregateKind::Tuple, operands) if operands.is_empty() => {
             // Native MIR spells `()` as an empty tuple aggregate in some paths.
             // Canonicalize it to a unit constant so downstream lowering does not
             // materialize an uninitialized zero-field aggregate.
             Rvalue::Use(Operand::Constant(ConstValue::Unit))
         }
 
-        mir::Rvalue::Aggregate(box agg_kind, operands) => {
+        mir::Rvalue::Aggregate(agg_kind, operands) => {
             let kind = match agg_kind {
                 mir::AggregateKind::Tuple => AggregateKind::Tuple,
                 mir::AggregateKind::Array(_) => AggregateKind::Array,
@@ -3690,7 +5837,7 @@ fn convert_rvalue<'tcx>(
                         // comparison run through this converter, so carrying them makes a
                         // wrong-args reconstruction visible to the comparator for the first time.
                         args: Some(crate::sysroot_authenticated_def_path_str_with_args(
-                            tcx, *def_id, adt_args,
+                            tcx, *def_id, *adt_args,
                         )),
                     }
                 }
@@ -3783,7 +5930,7 @@ fn convert_rvalue<'tcx>(
                 // `[uninit; N]` backing) -> a sound opaque array: its length is unknown, so any
                 // index into it fails closed (the bounds obligation cannot be discharged) and the
                 // result value is unconstrained — never falsely proved.
-                None => Rvalue::Use(Operand::Constant(ConstValue::OpaqueConst)),
+                None => Rvalue::Use(Operand::Constant(ConstValue::opaque_const())),
             }
         }
 
@@ -3835,6 +5982,115 @@ fn convert_rvalue<'tcx>(
 
 fn unsupported_rvalue(kind: impl Into<String>, detail: String, operands: Vec<Operand>) -> Rvalue {
     Rvalue::Unsupported { kind: kind.into(), detail, operands }
+}
+
+/// Whether a transmute is `T -> MaybeUninit<T>` at the very same `T` — R140's
+/// converse, which `convert_rvalue`'s Transmute arm models as the identity.
+///
+/// SOUNDNESS. `MaybeUninit<T>` is GUARANTEED the same size, alignment and ABI as
+/// `T` (std's documented layout promise), and every valid `T` is a valid
+/// `MaybeUninit<T>`: this direction only WIDENS the validity invariant. Modelling
+/// it as the identity therefore asserts nothing the source did not already hold,
+/// and owes nothing — the same "the source's valid range is a subset of the
+/// target's" lemma the transparent-UNWRAP legs rest on.
+///
+/// The REVERSE (`MaybeUninit<T> -> T`) is deliberately NOT recognised here. It
+/// NARROWS validity: discharging it needs a proof that the source was
+/// initialised, and Trust IR has no uninit-tracking model to give one. For a
+/// full-range integer `T` R140 admits it as a fresh `OpaqueScalar` (a havoc, never
+/// the identity); every other `T` stays fail-closed.
+///
+/// Every conjunct is structural and unforgeable:
+///  * the target ADT is pinned by the `maybe_uninit` LANG ITEM, never a printed
+///    path (FP#14), so a same-shaped user union does not qualify;
+///  * its single type argument is EXACTLY the source type (optimized MIR has its
+///    regions erased, so this is plain type equality); `T -> MaybeUninit<U>` for
+///    any other `U` — a real reinterpretation — stays fail-closed.
+fn transmute_widens_to_maybe_uninit<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    src_ty: ty::Ty<'tcx>,
+    dst_ty: ty::Ty<'tcx>,
+) -> bool {
+    let ty::Adt(def, args) = dst_ty.kind() else {
+        return false;
+    };
+    if tcx.lang_items().maybe_uninit() != Some(def.did()) {
+        return false;
+    }
+    args.types().next().is_some_and(|inner| inner == src_ty)
+}
+
+/// The valid range of a transmute INTO a pattern type over the source's own
+/// integer type, as `(start, end)` constants in the source's signedness —
+/// `None` whenever any conjunct fails, which keeps the historical refusal.
+///
+/// `transmute::<i32, pattern_type!(i32 is ..-1 | 0..)>(v)` is how every
+/// `define_valid_range_type!` constructor in `core::num::niche_types` builds its
+/// value (`NonZero*Inner`, `I32NotAllOnes` — `OwnedFd`/`FileDesc::from_raw_fd`'s
+/// `ValidRawFd` — `Nanoseconds`, `UsizeNoHighBit`, …). A pattern type is a
+/// VALIDITY RESTRICTION over an identical layout, so the transmute is the
+/// identity on the integer, and it is UB unless the value lies in the
+/// pattern's range. That range is the whole obligation, so this reads it from
+/// the one authority rustc itself uses — the LAYOUT's scalar `valid_range`
+/// (`rustc_ty_utils::layout`, the `ty::Pat` arm), which is also what the
+/// compiler's niche optimisation trusts — rather than re-deriving it from the
+/// pattern's syntax (an or-pattern becomes one WRAPPING range there, and that
+/// conversion is the compiler's, not ours).
+///
+/// Every conjunct is structural; no printed path is read:
+///  * the destination is `TyKind::Pat(base, _)` and `base` is EXACTLY the
+///    source type, which is a primitive integer (`Int`/`Uint`; `char` and
+///    pointer bases stay refused);
+///  * both sides are concrete (the four-guard discipline the other layout
+///    queries in this file use: `layout_of` asserts no escaping bound vars);
+///  * both layouts are `BackendRepr::Scalar` of the same primitive and size.
+///
+/// The CHARGE lives with the consumer — `trust-ir-bridge` asserts membership
+/// (see `trust_types::TRUST_TRANSMUTE_INTO_VALID_RANGE_KIND`); any consumer that
+/// does not know the sentinel keeps the `Unsupported` row it is spelled as.
+fn transmute_into_pattern_type_valid_range<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+    src_ty: Option<ty::Ty<'tcx>>,
+    dst: ty::Ty<'tcx>,
+) -> Option<(ConstValue, ConstValue)> {
+    use rustc_abi::BackendRepr;
+    let te = typing_env?;
+    let src = src_ty?;
+    let ty::TyKind::Pat(base, _) = dst.kind() else {
+        return None;
+    };
+    if *base != src || !matches!(src.kind(), ty::TyKind::Int(_) | ty::TyKind::Uint(_)) {
+        return None;
+    }
+    for t in [src, dst] {
+        if t.has_non_region_param()
+            || t.has_non_region_infer()
+            || t.has_opaque_types()
+            || t.has_escaping_bound_vars()
+        {
+            return None;
+        }
+    }
+    let ls = crate::tuple_layouts::extractor_layout_of(tcx, te, src)?;
+    let ld = crate::tuple_layouts::extractor_layout_of(tcx, te, dst)?;
+    let (BackendRepr::Scalar(s), BackendRepr::Scalar(d)) = (ls.backend_repr, ld.backend_repr)
+    else {
+        return None;
+    };
+    if s.primitive() != d.primitive() || ls.size != ld.size {
+        return None;
+    }
+    let range = d.valid_range(&tcx);
+    let width = u32::try_from(ls.size.bits()).ok()?;
+    Some(if src.is_signed() {
+        (
+            ConstValue::Int(ls.size.sign_extend(range.start)),
+            ConstValue::Int(ls.size.sign_extend(range.end)),
+        )
+    } else {
+        (ConstValue::Uint(range.start, width), ConstValue::Uint(range.end, width))
+    })
 }
 
 /// True when an unsize-cast target is a reference to a slice/str (`&[T]`/`&str`),
@@ -3947,10 +6203,24 @@ enum BinopForm {
     Checked,
     /// `*Unchecked` — UB on overflow; never conflate with `Plain`.
     Unchecked,
+    /// `ShlUnchecked`/`ShrUnchecked` — UB when the shift AMOUNT is outside
+    /// `0..LHS::BITS` (rustc_middle `mir::BinOp`: "Like `Shl`, but is UB if the
+    /// RHS >= LHS::BITS or RHS < 0"). This is NOT [`BinopForm::Unchecked`]: the
+    /// arithmetic forms are UB when the RESULT overflows, and a shift has no
+    /// overflow flag at all — its precondition is a range fact about the second
+    /// operand, whose type may differ from the first (`u8 << u32`). Both spell
+    /// the same `Rvalue::UncheckedBinaryOp` variant; every consumer dispatches
+    /// on the `BinOp` (`Shl`/`Shr` → amount range, `Add`/`Sub`/`Mul` → overflow),
+    /// and a consumer that names neither keeps its fail-closed wildcard.
+    ///
+    /// MIR `Shl`/`Shr` (the `Plain` rows below) MASK the amount instead
+    /// (`RHS.rem_euclid(LHS::BITS)`), so collapsing the unchecked form into
+    /// them would erase exactly the UB the precondition exists to charge.
+    UncheckedShift,
 }
 
 fn convert_supported_binop(op: mir::BinOp) -> Option<(BinOp, BinopForm)> {
-    use BinopForm::{Checked, Plain, Unchecked};
+    use BinopForm::{Checked, Plain, Unchecked, UncheckedShift};
     match op {
         mir::BinOp::Add => Some((BinOp::Add, Plain)),
         // Trust: R2/C4 — arithmetic `*Unchecked` keeps its UB provenance.
@@ -3968,9 +6238,11 @@ fn convert_supported_binop(op: mir::BinOp) -> Option<(BinOp, BinopForm)> {
         mir::BinOp::BitAnd => Some((BinOp::BitAnd, Plain)),
         mir::BinOp::BitOr => Some((BinOp::BitOr, Plain)),
         mir::BinOp::Shl => Some((BinOp::Shl, Plain)),
-        mir::BinOp::ShlUnchecked => None,
+        // Trust: the unchecked shifts keep their UB provenance too (their own
+        // form, whose precondition is the AMOUNT range — see `UncheckedShift`).
+        mir::BinOp::ShlUnchecked => Some((BinOp::Shl, UncheckedShift)),
         mir::BinOp::Shr => Some((BinOp::Shr, Plain)),
-        mir::BinOp::ShrUnchecked => None,
+        mir::BinOp::ShrUnchecked => Some((BinOp::Shr, UncheckedShift)),
         mir::BinOp::Eq => Some((BinOp::Eq, Plain)),
         mir::BinOp::Lt => Some((BinOp::Lt, Plain)),
         mir::BinOp::Le => Some((BinOp::Le, Plain)),
@@ -3995,7 +6267,7 @@ fn convert_operand<'tcx>(
     match operand {
         mir::Operand::Copy(place) => Operand::Copy(convert_place(tcx, place, typing_env)),
         mir::Operand::Move(place) => Operand::Move(convert_place(tcx, place, typing_env)),
-        mir::Operand::Constant(box const_op) => convert_const_operand(tcx, const_op),
+        mir::Operand::Constant(const_op) => convert_const_operand(tcx, const_op, typing_env),
         mir::Operand::RuntimeChecks(check) => {
             Operand::Constant(ConstValue::Bool(check.value(tcx.sess)))
         }
@@ -4114,7 +6386,7 @@ fn frozen_ctfe_may_reach_local_body(uv: mir::UnevaluatedConst<'_>) -> bool {
 /// array lengths, tuple/ref/ptr/slice pointees, fn-ptr signatures, alias args, `dyn` predicate
 /// args and const-expr args); the two `*_names_local_def` helpers only inspect the node itself.
 /// Both are exhaustive matches whose unresolved/undecidable arms answer `true` — fail-closed.
-fn generic_arg_mentions_local_def(arg: ty::GenericArg<'_>) -> bool {
+pub(crate) fn generic_arg_mentions_local_def(arg: ty::GenericArg<'_>) -> bool {
     arg.walk().any(|inner| match inner.kind() {
         // A region can never drive dispatch: CTFE runs region-erased.
         ty::GenericArgKind::Lifetime(_) => false,
@@ -4125,12 +6397,26 @@ fn generic_arg_mentions_local_def(arg: ty::GenericArg<'_>) -> bool {
 
 /// SHALLOW: does this one type node name a local def? Children are the walker's job.
 fn ty_names_local_def(t: ty::Ty<'_>) -> bool {
-    // `impl Into<DefId>` so each arm stays correct whether rustc models these ids as plain
-    // `DefId` or as newtypes; a future newtype without the `From` impl is a COMPILE error here,
+    ty_node_names_def(t, &mut |d| d.is_local(), true)
+}
+
+/// SHALLOW: does this one type node name a def for which `names(def)` holds?
+/// Children are the walker's job. `param_answer` is the answer for a `ty::Param`
+/// (a caller-side generic parameter, which names no crate at all); every other
+/// undecidable node (bound/placeholder/inference/error) answers `true`.
+///
+/// Trust (ARGS-FINGERPRINT-READ-1 round 2, 2026-10-07): generalized from the
+/// local-def predicate so the duplicate-crate-name argument fingerprint
+/// ([`generic_args_name_an_unauthenticated_crate`]) reads the SAME exhaustive
+/// node table instead of a second copy of it.
+fn ty_node_names_def(
+    t: ty::Ty<'_>,
+    names: &mut impl FnMut(DefId) -> bool,
+    param_answer: bool,
+) -> bool {
+    // `.into()` so each arm stays correct whether rustc models these ids as plain `DefId`
+    // or as newtypes; a future newtype without the `From` impl is a COMPILE error here,
     // which is the safe way for this to break.
-    fn local(d: impl Into<DefId>) -> bool {
-        d.into().is_local()
-    }
     // `Ty::kind()` returns `&TyKind`, so bindings below are references; the `*d` derefs are load-
     // bearing, not noise.
     match t.kind() {
@@ -4148,13 +6434,13 @@ fn ty_names_local_def(t: ty::Ty<'_>) -> bool {
         | ty::Pat(..)
         | ty::UnsafeBinder(_) => false,
         // Def-carrying nodes.
-        ty::Adt(adt, _) => local(adt.did()),
-        ty::Foreign(d) => local(*d),
-        ty::FnDef(d, _) => local(*d),
-        ty::Closure(d, _) => local(*d),
-        ty::CoroutineClosure(d, _) => local(*d),
-        ty::Coroutine(d, _) => local(*d),
-        ty::CoroutineWitness(d, _) => local(*d),
+        ty::Adt(adt, _) => names(adt.did()),
+        ty::Foreign(d) => names((*d).into()),
+        ty::FnDef(d, _) => names((*d).into()),
+        ty::Closure(d, _) => names((*d).into()),
+        ty::CoroutineClosure(d, _) => names((*d).into()),
+        ty::Coroutine(d, _) => names((*d).into()),
+        ty::CoroutineWitness(d, _) => names((*d).into()),
         ty::Alias(_, alias) => {
             let def_id: DefId = match alias.kind {
                 ty::AliasTyKind::Projection { def_id } => def_id.into(),
@@ -4162,34 +6448,47 @@ fn ty_names_local_def(t: ty::Ty<'_>) -> bool {
                 ty::AliasTyKind::Opaque { def_id } => def_id.into(),
                 ty::AliasTyKind::Free { def_id } => def_id.into(),
             };
-            def_id.is_local()
+            names(def_id)
         }
         // `dyn Trait + Proj = T + Send`: the walker pushes each predicate's ARGS but never the
         // predicate's own def id, so `dyn LocalTrait` would otherwise be invisible here.
-        ty::Dynamic(preds, _) => preds.iter().any(|p| local(p.def_id())),
-        // FAIL CLOSED. A parameter/inference/placeholder/bound/error type is not a decidable
-        // answer to "which crate owns this", so treat it as possibly-local. This costs nothing
-        // at either call site: both already return `None` on `has_non_region_param()` before
-        // reaching this predicate, so a `Param` cannot arrive here in practice.
-        ty::Param(_) | ty::Bound(..) | ty::Placeholder(..) | ty::Infer(_) | ty::Error(_) => true,
+        ty::Dynamic(preds, _) => preds.iter().any(|p| names(p.def_id())),
+        // A caller-side generic parameter names no crate; the caller says what that means.
+        // (`ty_names_local_def`'s two call sites return `None` on `has_non_region_param()`
+        // before reaching it, so its `true` here costs nothing.)
+        ty::Param(_) => param_answer,
+        // FAIL CLOSED. An inference/placeholder/bound/error type is not a decidable
+        // answer to "which crate owns this".
+        ty::Bound(..) | ty::Placeholder(..) | ty::Infer(_) | ty::Error(_) => true,
     }
 }
 
 /// SHALLOW: does this one const node name a local def? Children are the walker's job.
 fn const_names_local_def(c: ty::Const<'_>) -> bool {
+    const_node_names_def(c, &mut |d| d.is_local(), true)
+}
+
+/// [`ty_node_names_def`] for a const node.
+fn const_node_names_def(
+    c: ty::Const<'_>,
+    names: &mut impl FnMut(DefId) -> bool,
+    param_answer: bool,
+) -> bool {
     match c.kind() {
         // A valtree is pure data; the walker pushes its type.
         ty::ConstKind::Value(_) => false,
         // A const expression's operands are its args, which the walker pushes.
         ty::ConstKind::Expr(_) => false,
-        ty::ConstKind::Alias(_, alias) => match alias.kind.opt_def_id() {
-            Some(def_id) => def_id.is_local(),
-            // FAIL CLOSED: an alias const we cannot name.
-            None => true,
-        },
+        ty::ConstKind::Alias(_, alias) => {
+            match crate::ctfe_reentrancy::alias_const_def_id(alias.kind) {
+                Some(def_id) => names(def_id.into()),
+                // FAIL CLOSED: an alias const we cannot name.
+                None => true,
+            }
+        }
+        ty::ConstKind::Param(_) => param_answer,
         // FAIL CLOSED, for the same reason as the type case above.
-        ty::ConstKind::Param(_)
-        | ty::ConstKind::Bound(..)
+        ty::ConstKind::Bound(..)
         | ty::ConstKind::Placeholder(_)
         | ty::ConstKind::Infer(_)
         | ty::ConstKind::Error(_) => true,
@@ -4204,9 +6503,6 @@ fn const_names_local_def(c: ty::Const<'_>) -> bool {
 // Fail-soft to None so the caller degrades to OpaqueScalar (sound: a generic
 // const has no single value). `try_eval_bits` derives its size internally.
 fn try_eval_bits_mono<'tcx>(c: mir::Const<'tcx>, tcx: TyCtxt<'tcx>) -> Option<u128> {
-    if c.has_non_region_param() {
-        return None;
-    }
     // Trust (LANE 1): inside `mir_built`, an UNEVALUATED const must not be forced — see
     // `crate::ctfe_reentrancy`. Only the unevaluated spelling can demand a query; a
     // `Const::Val`/`Const::Ty` already holds its value and is read without touching the
@@ -4220,6 +6516,27 @@ fn try_eval_bits_mono<'tcx>(c: mir::Const<'tcx>, tcx: TyCtxt<'tcx>) -> Option<u1
         && matches!(c, mir::Const::Unevaluated(uv, _) if frozen_ctfe_may_reach_local_body(uv))
     {
         return None;
+    }
+    if c.has_non_region_param() {
+        // An inherent associated constant on a generic impl (`impl<S> Client<S> { pub const
+        // ATTACH_WINDOW: usize = 16; }`) carries the impl's type parameters in `uv.args` even
+        // when the constant's own type and body are parameter-independent. `const_eval_poly`
+        // evaluates `uv.def` under its own identity parameters and returns `Err(TooGeneric)`
+        // without ICEing if a parameter is actually used.
+        let mir::Const::Unevaluated(uv, ty) = c else {
+            return None;
+        };
+        if uv.promoted.is_some()
+            || ty.has_non_region_param()
+            || tcx.trait_of_assoc(uv.def).is_some()
+            || tcx.trait_impl_of_assoc(uv.def).is_some()
+        {
+            return None;
+        }
+        let val = tcx.const_eval_poly(uv.def).ok()?;
+        let size =
+            tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty)).ok()?.size;
+        return val.try_to_bits(size);
     }
     c.try_eval_bits(tcx, ty::TypingEnv::fully_monomorphized())
 }
@@ -4243,7 +6560,8 @@ fn callable_def_path_hash(
 /// `Const::Val` pointer" is a measurement instead of a guess. No env var changes any
 /// verdict; unset, this is a single `env::var_os` miss.
 fn trust_const_trace(arm: &str, const_op: &mir::ConstOperand<'_>) {
-    if std::env::var_os("TRUST_CONST_TRACE").is_none() {
+    static CONST_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*CONST_TRACE.get_or_init(|| std::env::var_os("TRUST_CONST_TRACE").is_some()) {
         return;
     }
     let kind = match const_op.const_ {
@@ -4260,7 +6578,85 @@ fn trust_const_trace(arm: &str, const_op: &mir::ConstOperand<'_>) {
     );
 }
 
-fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'tcx>) -> Operand {
+/// Preserve storage observations only on the faithful lane. Logical extraction
+/// keeps its existing opaque abstraction; neither form grants execution or
+/// proof authority. A failed faithful observation remains an explicit refusal,
+/// never a partially populated image or guessed constant.
+fn unmodeled_const_operand<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    const_op: &mir::ConstOperand<'tcx>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+) -> Operand {
+    if !ty_convert::faithful_scalars() {
+        return Operand::Constant(ConstValue::opaque_const());
+    }
+    let Some(typing_env) = typing_env else {
+        return unsupported_operand(
+            "Const::MemoryImage",
+            "missing body typing environment".to_string(),
+        );
+    };
+    match crate::constant_image::extract_memory_image(tcx, const_op, typing_env) {
+        Ok(image) => Operand::Constant(ConstValue::MemoryImage(Box::new(image))),
+        Err(detail) => unsupported_operand("Const::MemoryImage", detail),
+    }
+}
+
+/// OPAQUE-SCALAR-ID-1: the identity key of an unevaluated integer constant, or
+/// `None` when it has no item to key on (a `Const::Ty` that is not a param, a
+/// `Const::Val`).
+///
+/// The key is the constant's item (its `DefPathHash`, collision-checked by rustc,
+/// plus its readable path), its generic arguments normalized in the body's typing
+/// environment with regions erased (folded into the same 128-bit fingerprint the
+/// callee keys use), and its promoted index. Equal keys are the same item applied
+/// to the same arguments, so they evaluate to the same value in any one instance of
+/// the body and may share one solver symbol; different keys never do. `None` is not
+/// a refusal: the occurrence then gets its own MIR-site symbol, which never shares.
+fn opaque_scalar_const_key<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    const_op: &mir::ConstOperand<'tcx>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+) -> Option<String> {
+    let mir::Const::Unevaluated(uv, _) = const_op.const_ else {
+        return None;
+    };
+    let args = typing_env
+        .and_then(|env| {
+            tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(uv.args)).ok()
+        })
+        .unwrap_or_else(|| tcx.erase_and_anonymize_regions(uv.args));
+    let (lo, hi) = tcx.def_path_hash(uv.def).0.combine(generic_args_fingerprint(tcx, args)).split();
+    let promoted = uv.promoted.map_or(String::new(), |p| format!("#promoted{}", p.as_usize()));
+    Some(format!(
+        "{}@{:016x}{:016x}{promoted}",
+        crate::safe_def_path_str(tcx, uv.def),
+        lo.as_u64(),
+        hi.as_u64()
+    ))
+}
+
+/// The `OpaqueScalar` for an unevaluated integer constant: keyed when
+/// [`opaque_scalar_const_key`] finds an item, otherwise left for the body's
+/// placement pass to give it its own MIR site (OPAQUE-SCALAR-ID-1).
+fn opaque_scalar_for_unevaluated<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    const_op: &mir::ConstOperand<'tcx>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+    width: u32,
+    signed: bool,
+) -> ConstValue {
+    match opaque_scalar_const_key(tcx, const_op, typing_env) {
+        Some(key) => ConstValue::opaque_scalar_const(width, signed, key),
+        None => ConstValue::opaque_scalar(width, signed),
+    }
+}
+
+fn convert_const_operand<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    const_op: &mir::ConstOperand<'tcx>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+) -> Operand {
     use rustc_middle::ty::TyKind;
 
     let c = const_op.const_;
@@ -4387,6 +6783,7 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
             // non-`&str` element table reaches an identical verdict by a longer
             // path. Nothing is guessed either way.
             // (edition 2021 — no let-chains: nested ifs, as elsewhere in this fn.)
+            let mut slice_val: Option<Option<ty::Value<'tcx>>> = None;
             if let TyKind::Array(elem, len) = inner.kind() {
                 if *elem == tcx.types.u8 {
                     // Optimized MIR commonly materializes a promoted byte string as
@@ -4404,7 +6801,9 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
                             }
                         }
                     }
-                    if let Some(value) = const_operand_value(tcx, const_op) {
+                    if let Some(value) =
+                        *slice_val.get_or_insert_with(|| const_operand_value(tcx, const_op))
+                    {
                         if let Some(bytes) = str_ref_bytes_from_value(tcx, value) {
                             return Operand::Constant(ConstValue::Str { bytes });
                         }
@@ -4421,12 +6820,46 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
             // PIECES array (not the `&[u8; N]` byte template above). Extract + concatenate its
             // literal pieces as an opaque `Str` so the contract-panic matcher can see a formatted
             // panic's message; any non-`&str` `&[T]` table (or a read miss) stays `OpaqueConst`.
-            if let Some(value) = const_operand_value(tcx, const_op) {
+            if let Some(value) =
+                *slice_val.get_or_insert_with(|| const_operand_value(tcx, const_op))
+            {
                 if let Some(bytes) = str_pieces_ref_bytes_from_value(tcx, value) {
                     return Operand::Constant(ConstValue::Str { bytes });
                 }
             }
-            return Operand::Constant(ConstValue::OpaqueConst);
+            return unmodeled_const_operand(tcx, const_op, typing_env);
+        }
+        // Trust (EMPTY-CLOSURE-REF-VALUE-1, 2026-11-10): the PROMOTED shared borrow
+        // of an upvar-free closure. `apply(&|x| x / 2, 7)` hands `apply` the
+        // constant `use_apply::promoted[0]` of type `&{closure}`. A closure type is
+        // not valtree-able, so `const_operand_value` never recovers it, and it used
+        // to fall to the `OpaqueConst` reference rescue below, the spelling the
+        // extractor ALSO uses for runtime pointer values it does not model (a
+        // `&T -> &dyn Trait` unsize). The dedicated carrier records the one fact
+        // this constant certifies and `OpaqueConst` cannot: a PROMOTED MIR constant
+        // of type `&C` passes rustc's const validation, so its bits are a valid
+        // (non-null, aligned) reference. That is the certificate trust-mc's
+        // `SourceReferenceValueFact` contract names ("the source compiler's
+        // promoted empty-closure shared-borrow certificate"). Nothing about the
+        // address or the pointee is carried; value-lowering stays the fresh
+        // symbolic reference `OpaqueConst` gets. Taken ONLY for the promoted form
+        // of a SHARED borrow of a closure with NO upvars; a `Const::Val` pointer, a
+        // `&mut`, or a capturing closure keeps today's spelling (no arm below
+        // matches a reference to a closure, so falling out of this arm is exactly
+        // the old path).
+        TyKind::Ref(_, inner, mutbl)
+            if !mutbl.is_mut()
+                && matches!(inner.kind(), TyKind::Closure(..))
+                && matches!(c, mir::Const::Unevaluated(uv, _) if uv.promoted.is_some()) =>
+        {
+            if let TyKind::Closure(def_id, args) = inner.kind() {
+                if args.as_closure().upvar_tys().is_empty() {
+                    trust_const_trace("promoted-empty-closure-ref", const_op);
+                    return Operand::Constant(ConstValue::empty_closure_ref(
+                        crate::sysroot_authenticated_def_path_str(tcx, *def_id),
+                    ));
+                }
+            }
         }
         // A non-capturing closure appears as a `Const` of `TyKind::Closure` —
         // e.g. the `|x| ...` handed to `Iterator::map`. Capturing closures are
@@ -4471,7 +6904,8 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
         _ => {}
     }
 
-    if let Some(value) = const_operand_value(tcx, const_op) {
+    let const_val = const_operand_value(tcx, const_op);
+    if let Some(value) = const_val {
         // Trust: nested string-ref consts — the `&&str` that `x == "lit"`
         // produces by auto-ref'ing the literal — carry the same bytes as a
         // plain `&str`. Peel the reference layers and reuse the injectively
@@ -4506,6 +6940,27 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
         return Operand::Constant(ConstValue::Unit);
     }
 
+    // Trust: a constant whose type is zero-sized and inhabited has exactly
+    // one value; spell it `ConstValue::Unit`, the spelling fieldless
+    // singleton consts already get above. Upstream's ZST const-prop
+    // materializes these as `Const::Val(ZeroSized)` aggregate operands (a
+    // `[[(); 8]; 9]` parameter read as its constant), which the
+    // `OpaqueConst` fallthrough below leaves type-less in every consumer
+    // lane ("source operand type is unavailable"). Declines closed
+    // without a typing env/layout, or for an uninhabited type, whose
+    // "constant" no execution produces. Identity-bearing ZST consts
+    // (fn items, closures) are claimed by earlier arms and never reach
+    // this one.
+    if (|| {
+        let te = typing_env?;
+        let l = crate::tuple_layouts::extractor_layout_of(tcx, te, ty)?;
+        (l.size.bytes() == 0 && ty.is_opsem_inhabited(tcx, te)).then_some(())
+    })()
+    .is_some()
+    {
+        return Operand::Constant(ConstValue::Unit);
+    }
+
     // Trust verifier-coverage: an aggregate/opaque constant we can't lower to a
     // precise scalar — an empty `Vec`/`VecDeque` (whose `RawVec::NEW` backing is
     // an ADT aggregate, cap 0), a `Cell::new(c)`, a thread-local `LocalKey`, an
@@ -4527,7 +6982,7 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
     // about shapes with no consumer type). OpaqueConst's own soundness
     // argument covers it verbatim: the value is unconstrained, so it "can
     // only ENLARGE the error set" — never falsely Proved.
-    if const_operand_value(tcx, const_op).is_some()
+    if const_val.is_some()
         || matches!(const_op.const_, mir::Const::Val(..))
         || (matches!(const_op.const_, mir::Const::Unevaluated(..))
             && matches!(const_op.const_.ty().kind(), ty::TyKind::Adt(..))
@@ -4543,7 +6998,7 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
                 trust_const_trace("opaque-valtree-unlowered", const_op);
             }
         }
-        return Operand::Constant(ConstValue::OpaqueConst);
+        return unmodeled_const_operand(tcx, const_op, typing_env);
     }
 
     // Any REFERENCE constant we could not lower precisely above — a promoted /
@@ -4556,7 +7011,7 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
     // `&dyn Trait` opaque arms above.
     if matches!(ty.kind(), TyKind::Ref(..)) {
         trust_const_trace("opaque-ref-no-value", const_op);
-        return Operand::Constant(ConstValue::OpaqueConst);
+        return unmodeled_const_operand(tcx, const_op, typing_env);
     }
 
     // A bare (non-reference) INTEGER constant we could not evaluate above — a
@@ -4567,11 +7022,15 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
     // WRONG SORT here (it lowers to a fat-pointer `Undef`, but this value must keep an
     // INTEGER sort to stay well-typed under arithmetic/indexing). Degrade to a typed
     // opaque scalar carrying the integer width/signedness instead of poisoning the
-    // whole function into Unsupported. Sound: every consumer lowers this to a FRESH
+    // whole function into Unsupported. Sound: every consumer lowers this to an
     // integer-sorted symbol that asserts no value, so value/div/index/equality
     // obligations over it stay `unknown`, never falsely proved (the div-zero and
     // const-eq folds in trust-vcgen treat it as unknown-valued, NOT known-nonzero or
-    // known-unequal). An associated-type-projection (`Alias`) const is deliberately
+    // known-unequal). IDENTITY (OPAQUE-SCALAR-ID-1): the symbol is keyed by the
+    // constant's item and normalized generic arguments
+    // (`opaque_scalar_const_key`), so `size_of::<T>()` read twice is one term while
+    // `size_of::<T>()` and `size_of::<U>()` are two; a constant with no item key gets
+    // its own MIR-site symbol, which never shares. An associated-type-projection (`Alias`) const is deliberately
     // NOT handled here and stays fail-closed below: see the refusal at the end of
     // this function for the precise reason (no resolvable sort, not merely no width).
     match ty.kind() {
@@ -4590,7 +7049,9 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
                     signed: true,
                 });
             }
-            return Operand::Constant(ConstValue::OpaqueScalar { width, signed: true });
+            return Operand::Constant(opaque_scalar_for_unevaluated(
+                tcx, const_op, typing_env, width, true,
+            ));
         }
         TyKind::Uint(uint_ty) => {
             let width = crate::ty_convert::uint_width_from_uint_ty(uint_ty, tcx);
@@ -4604,7 +7065,9 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
                     signed: false,
                 });
             }
-            return Operand::Constant(ConstValue::OpaqueScalar { width, signed: false });
+            return Operand::Constant(opaque_scalar_for_unevaluated(
+                tcx, const_op, typing_env, width, false,
+            ));
         }
         // A BOOL const-generic param (`const B: bool`, e.g. aterm-lz4's
         // `compress_internal::<_, USE_DICT, _>`). Encoded in-band as a
@@ -4619,19 +7082,20 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
         // proof holds for both instantiations or not at all. Non-param bool
         // consts (assoc consts etc.) keep the fail-closed refusal below.
         //
-        // A NON-param bool `OpaqueScalar` was tried here and REVERTED: unlike
-        // `ConstParam`, `OpaqueScalar` carries no identity, so trust-vcgen
-        // (`lib.rs`) and the CHC lane (`chc.rs`) both intern it to the ONE name
+        // A NON-param bool `OpaqueScalar` was tried here and REVERTED: at the time
+        // `OpaqueScalar` carried no identity, so trust-vcgen (`lib.rs`) and the CHC
+        // lane (`chc.rs`) both interned it to the ONE name
         // `__trust_opaque_scalar_u1`. Two DISTINCT assoc consts then collapse
         // onto one symbol, `if T::A { if !T::B { .. } }` becomes `S ∧ ¬S` =
         // false, the arm is pruned and its obligation discharged VACUOUSLY.
         // MEASURED: that shape verified PROVED and kernel-certified while the
         // single-const control correctly FAILED. Per-occurrence freshening does
         // not save it — `freshen_aliasing_opaque_occurrences` runs only on the
-        // σ-callsite path, not on the intra-function obligation. Re-land only
-        // once `OpaqueScalar` is identity-keyed the way `ConstParam` is. The
-        // same aliasing is live TODAY for two distinct INTEGER assoc consts via
-        // the `Int`/`Uint` arms above — pre-existing, tracked separately.
+        // σ-callsite path, not on the intra-function obligation. `OpaqueScalar`
+        // is identity-keyed since OPAQUE-SCALAR-ID-1 (2026-10-07), which closed
+        // the same aliasing for two distinct INTEGER assoc consts via the
+        // `Int`/`Uint` arms above; re-landing the bool arm is a separate change
+        // (its Bool sort and CHC refusal need their own measurement).
         TyKind::Bool => {
             if let Some((index, name)) = const_param_identity(tcx, const_op) {
                 return Operand::Constant(ConstValue::ConstParam {
@@ -4774,7 +7238,6 @@ fn std_enum_unit_variant_ref_const<'tcx>(
     if !adt_def.is_enum() {
         return None;
     }
-    let enum_name = crate::safe_def_path_str(tcx, adt_def.did());
     // Trust: EFHT-P (2026-08-30) — the Option/Result NAME allow-list is DELETED: every
     // fieldless-variant `&Enum::Variant` promoted constant now recovers its identity,
     // not only the std pair. The carrier still holds the variant INDEX exactly as it
@@ -4794,7 +7257,8 @@ fn std_enum_unit_variant_ref_const<'tcx>(
     if !adt_def.variant(destructured.variant).fields.is_empty() {
         return None;
     }
-    Some(ConstValue::UnitVariantRef { enum_name, variant })
+    let enum_name = crate::safe_def_path_str(tcx, adt_def.did());
+    Some(ConstValue::unit_variant_ref(enum_name, variant))
 }
 
 /// Trust: EFHT-P (2026-08-30) — recover a promoted/const `&S` whose pointee is an
@@ -4848,10 +7312,7 @@ fn struct_scalar_fields_ref_const<'tcx>(
         let field_ty = field_def.ty(tcx, *args).skip_normalization();
         fields.push(scalar_valtree_to_const_value(*field_const, field_ty, tcx)?);
     }
-    Some(ConstValue::StructScalarFieldsRef {
-        adt_name: crate::safe_def_path_str(tcx, adt_def.did()),
-        fields,
-    })
+    Some(ConstValue::struct_scalar_fields_ref(crate::safe_def_path_str(tcx, adt_def.did()), fields))
 }
 
 /// Read a `&[&str; N]` / `&[&str]` format-template PIECES array and concatenate its literal
@@ -4910,7 +7371,7 @@ fn array_ref_u8_const_bytes<'tcx>(tcx: TyCtxt<'tcx>, c: &mir::Const<'tcx>) -> Op
     }
     let len = len_const.try_to_target_usize(tcx)? as usize;
     let mir::ConstValue::Scalar(scalar) = val else { return None };
-    let ptr = scalar.to_pointer(&tcx).discard_err()?;
+    let ptr = scalar.to_pointer(&tcx);
     let (prov, offset) = ptr.into_pointer_or_addr().ok()?.prov_and_relative_offset();
     // `unwrap_memory()` `bug!`s on every non-`Memory` global: Function, VTable,
     // Static and TypeId. The type gates above constrain the POINTER TYPE
@@ -4944,7 +7405,7 @@ fn is_fieldless_singleton_struct_ty<'tcx>(ty: ty::Ty<'tcx>) -> bool {
 }
 
 fn unsupported_operand(kind: impl Into<String>, detail: String) -> Operand {
-    Operand::Unsupported { kind: kind.into(), detail }
+    Operand::unsupported(kind, detail)
 }
 
 /// Reconstruct aggregate constants that optimized MIR collapses into
@@ -5019,6 +7480,20 @@ fn convert_mir_const_value_aggregate_rvalue<'tcx>(
         return None;
     }
 
+    // Trust: only tuple/ADT reconstructions below consume the destructured
+    // fields, so destructuring any other type is pure waste — and for an
+    // array it is unbounded waste: `try_destructure_mir_constant_for_user_output`
+    // materializes one `(ConstValue, Ty)` pair PER ELEMENT, so the
+    // `const [(); 4_000_000_000]` that upstream's ZST const-prop substitutes
+    // for a by-value `[(); N]` parameter built a 4e9-pair Vec (13.8 GB and
+    // climbing when sampled) whose contents this function's own match then
+    // discarded via `_ => None`. Decline before destructuring; arrays keep
+    // reaching the valtree/`Use` lanes exactly as they did through the
+    // discarded result.
+    if !matches!(ty.kind(), ty::TyKind::Tuple(_) | ty::TyKind::Adt(..)) {
+        return None;
+    }
+
     let contents = tcx.try_destructure_mir_constant_for_user_output(value, ty)?;
     let ops = contents
         .fields
@@ -5044,7 +7519,7 @@ fn convert_mir_const_value_aggregate_rvalue<'tcx>(
                 args: Some(crate::sysroot_authenticated_def_path_str_with_args(
                     tcx,
                     adt_def.did(),
-                    adt_args,
+                    *adt_args,
                 )),
             },
             ops,
@@ -5100,28 +7575,64 @@ fn const_operand_value<'tcx>(
             if args.has_non_region_param() {
                 return None;
             }
+            if crate::tuple_layouts::resolution_may_reenter(tcx, unevaluated.def, args) {
+                return None;
+            }
             let instance =
                 ty::Instance::try_resolve(tcx, typing_env, unevaluated.def, args).ok().flatten()?;
-            let valtree = tcx
-                .const_eval_global_id_for_typeck(
-                    typing_env,
-                    rustc_middle::mir::interpret::GlobalId {
-                        instance,
-                        promoted: unevaluated.promoted,
-                    },
-                    const_op.span,
-                )
-                .ok()?
-                .ok()?;
+            let valtree = quiet_valtree_for_global_id(
+                tcx,
+                typing_env,
+                rustc_middle::mir::interpret::GlobalId { instance, promoted: unevaluated.promoted },
+                const_op.span,
+            )?;
             Some(ty::Value { ty, valtree })
         }
         mir::Const::Val(_, _) => None,
     }
 }
 
+/// The valtree of a resolved constant, asked QUIETLY.
+///
+/// `TyCtxt::const_eval_global_id_for_typeck` is the wrapper stock rustc uses for
+/// type-system constants, and on `ValTreeCreationError::NodesOverflow` (rustc's
+/// private `VALTREE_MAX_NODES`, 100_000 nodes) it EMITS `maximum number of nodes
+/// exceeded in constant …` as a hard error before returning `Err` — so the
+/// `.ok()?` this site used to hang on it was already too late. A `&str`
+/// valtree is one leaf per BYTE and a stock build never builds one, so a crate
+/// that compiles fine with rustc failed under Trust in EVERY policy, at the USE
+/// site of the constant. MEASURED 2026-09-08 on `first-party/ty` (seal
+/// trust-a1c7e89e, after the sibling fix in trust-thir-lower's named-const
+/// lane): `targo trust check -p tla-cli` walked all 316 dependency units and
+/// died on `serde_json::from_str(ENV_OPTIONS_JSON)` — a 149_839-byte
+/// `include_str!` — from THIS operand path.
+///
+/// The `eval_to_valtree` QUERY itself is silent (the emit lives in the
+/// wrapper), so ask it directly and treat overflow like every other
+/// non-valtree'able constant: `None`, and the operand stays opaque — a
+/// completeness cost, never a build error. Same shape as
+/// `trust_thir_lower::quiet_const_valtree`; pinned by
+/// `tests/ui/trust/large_str_const_does_not_hard_error.rs`.
+fn quiet_valtree_for_global_id<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    cid: rustc_middle::mir::interpret::GlobalId<'tcx>,
+    span: rustc_span::Span,
+) -> Option<ty::ValTree<'tcx>> {
+    let inputs = tcx.erase_and_anonymize_regions(
+        typing_env.with_post_analysis_normalized_invalidating_rigid_aliases(tcx, cid),
+    );
+    let res = if span.is_dummy() {
+        tcx.eval_to_valtree(inputs)
+    } else {
+        tcx.at(span).eval_to_valtree(inputs)
+    };
+    res.ok()
+}
+
 /// Read a scalar valtree leaf as a typed `ConstValue` (`idx_ty` gives the sign/width).
 /// Returns None for anything not a plain integer leaf — fail-closed (never a guessed
-/// bound), so the caller leaves the `contains` call opaque instead of a wrong bound.
+/// value), so the caller keeps the constant opaque instead of reading a wrong one.
 fn scalar_valtree_to_const_value<'tcx>(
     c: ty::Const<'tcx>,
     idx_ty: ty::Ty<'tcx>,
@@ -5144,33 +7655,6 @@ fn scalar_valtree_to_const_value<'tcx>(
     }
 }
 
-/// `(start, end)` const values of a `Range<Idx>` / `RangeInclusive<Idx>` compile-time
-/// constant, read from its valtree (`Branch([start, end, ..])`). None unless both are
-/// integer leaves of the recovered `Idx` type — fail-closed.
-fn range_const_bounds<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    const_op: &mir::ConstOperand<'tcx>,
-) -> Option<(ConstValue, ConstValue)> {
-    let value = const_operand_value(tcx, const_op)?;
-    // `contains` takes `&self`, so the const is `&Range<Idx>` — peel references
-    // (the valtree is transparent across `&`) to reach the Range adt and its `Idx`.
-    let mut adt_ty = value.ty;
-    while let ty::TyKind::Ref(_, inner, _) = adt_ty.kind() {
-        adt_ty = *inner;
-    }
-    let idx_ty = match adt_ty.kind() {
-        ty::TyKind::Adt(_, args) => args.type_at(0),
-        _ => return None,
-    };
-    let branch = value.valtree.try_to_branch()?;
-    if branch.len() < 2 {
-        return None;
-    }
-    let start = scalar_valtree_to_const_value(branch[0], idx_ty, tcx);
-    let end = scalar_valtree_to_const_value(branch[1], idx_ty, tcx);
-    Some((start?, end?))
-}
-
 /// The UNIQUE whole-local definition of `local`, or None if it has zero or multiple
 /// assignments (ambiguous — fail-closed, never a guessed value).
 ///
@@ -5190,7 +7674,7 @@ fn unique_whole_local_def<'a, 'tcx>(
     let mut found = None;
     for bb_data in mir_body.basic_blocks.iter() {
         for stmt in &bb_data.statements {
-            if let mir::StatementKind::Assign(box (lhs, rvalue)) = &stmt.kind {
+            if let mir::StatementKind::Assign((lhs, rvalue)) = &stmt.kind {
                 if lhs.local == local && lhs.projection.is_empty() {
                     if found.is_some() {
                         return None;
@@ -5203,25 +7687,6 @@ fn unique_whole_local_def<'a, 'tcx>(
     found
 }
 
-/// The whole-local of an operand, hopping through `Use(copy/move)` chains, or None.
-fn whole_local_through_copies<'a, 'tcx>(
-    mir_body: &'a mir::Body<'tcx>,
-    mut local: mir::Local,
-) -> Option<(mir::Local, &'a mir::Rvalue<'tcx>)> {
-    for _ in 0..16 {
-        let def = unique_whole_local_def(mir_body, local)?;
-        match def {
-            mir::Rvalue::Use(mir::Operand::Copy(p) | mir::Operand::Move(p), _)
-                if p.projection.is_empty() =>
-            {
-                local = p.local;
-            }
-            other => return Some((local, other)),
-        }
-    }
-    None
-}
-
 fn operand_whole_local(arg: &mir::Operand<'_>) -> Option<mir::Local> {
     match arg {
         mir::Operand::Copy(p) | mir::Operand::Move(p) if p.projection.is_empty() => Some(p.local),
@@ -5229,147 +7694,81 @@ fn operand_whole_local(arg: &mir::Operand<'_>) -> Option<mir::Local> {
     }
 }
 
-/// The range arg is a const, spelled `_t = const promoted[..]; contains(move _t, ..)`.
-/// Trace through copy chains to the constant. None unless it resolves to one.
-fn trace_operand_to_const<'a, 'tcx>(
-    mir_body: &'a mir::Body<'tcx>,
-    arg: &'a mir::Operand<'tcx>,
-) -> Option<&'a mir::ConstOperand<'tcx>> {
-    if let mir::Operand::Constant(box c) = arg {
-        return Some(c);
+// Trust (EXTRACT-REWRITE-1, 2026-10-04): `rewrite_range_contains_calls` is DELETED,
+// with the helpers only it used (`range_const_bounds`, `whole_local_through_copies`,
+// `trace_operand_to_const`, `contains_value_operand`). It rewrote
+// `r = <Range|RangeInclusive>::contains(const_range, &x)` into `r = (x >= lo) & (x <(=) hi)`
+// and identified the range by its RENDERED callee path: `ends_with("::contains")` plus
+// `contains("RangeInclusive")`, or `contains("ops::") && contains("Range")`.
+//  * For std the rewrite was DEAD: std's `contains` is generic over the item type, so its
+//    rendering always ends in a turbofish (`core::ops::range::RangeInclusive::<u32>::
+//    contains::<u32>`) and never ends with `::contains` (measured on the stage 1 of
+//    `38e6c69b1c`: `(0..=10u32).contains(&x)`, a `const` std `RangeInclusive` and a `const`
+//    std `Range` guarding `arr[x]` are all refused; `tests/faithful_call_shape.rs` already
+//    pins std's `contains` as preserved in both modes).
+//  * For a USER type it was LIVE: a non-generic inherent `contains` on a user
+//    `struct RangeInclusive<T>(T, T)` (or a user `ops::Range`) that answers `true` got the
+//    bound written into its guard, and `arr[x]` was Clean-kernel Certified in bounds for
+//    `x = 1001` (certify exit 0). The bounds check itself is kept (only overflow checks
+//    are elided), so the program panics: the lie is the verdict.
+// A DefId anchor (the `RangeInclusiveStruct`/`Range` lang items, a real-sysroot callee, a
+// primitive-integer item) would close the user hole but REVIVE the rewrite for std, a new
+// proof path that no stage 1 has measured and that would also need the `exhausted` flag of
+// a `const` `RangeInclusive` read as `false`. Deleting it changes nothing for std. A
+// revival is capability work: see DECISION_QUEUE EXTRACT-REWRITE-1.
+// Merge note (2026-10-14): local main had re-anchored this rewrite on exactly those
+// lang items (`range_lang_item_contains`, 587b080b351) with a stage-1 sweep; it did not
+// read the `exhausted` flag, so the deletion is kept here and that work stays the open
+// EXTRACT-REWRITE-1 revival (its `tests/ui/trust/range_contains_constant_guards.rs`
+// positive fixture records what the revival must win back).
+
+/// True when `func` is core's inherent `str::len`: an associated fn named `len` of an
+/// inherent impl whose self type is `str`, defined in a real sysroot crate. Only the
+/// crate that owns `str` may hold such an impl (E0390 everywhere else), and the
+/// sysroot check refuses a crate that declares itself `core`.
+fn callee_is_sysroot_str_len<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> bool {
+    let Some((def_id, _)) = func.const_fn_def() else { return false };
+    if tcx.item_name(def_id) != rustc_span::sym::len || !is_real_sysroot_crate(tcx, def_id.krate) {
+        return false;
     }
-    let (_, def) = whole_local_through_copies(mir_body, operand_whole_local(arg)?)?;
-    match def {
-        mir::Rvalue::Use(mir::Operand::Constant(box c), _) => Some(c),
-        _ => None,
-    }
+    tcx.inherent_impl_of_assoc(def_id).is_some_and(|impl_did| {
+        matches!(tcx.type_of(impl_did).instantiate_identity().skip_normalization().kind(), ty::Str)
+    })
 }
 
-/// `contains` takes `&x`; trace the reference (through copy chains) to its pointee `x`
-/// so the synthesized bound constrains the actual variable. None on any other shape.
-fn contains_value_operand<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    mir_body: &mir::Body<'tcx>,
-    arg: &mir::Operand<'tcx>,
-) -> Option<Operand> {
-    let (_, def) = whole_local_through_copies(mir_body, operand_whole_local(arg)?)?;
-    match def {
-        // Trust: M6 rung-7 sweep — `mir_body` is a real compiled body, so use its
-        // own `typing_env` for the pointee place's projection types, same as
-        // `extract_body`'s locals.
-        mir::Rvalue::Ref(_, _, pointee) => {
-            Some(Operand::Copy(convert_place(tcx, pointee, Some(mir_body.typing_env(tcx)))))
-        }
-        _ => None,
-    }
-}
-
-/// Rewrite `r = <Range|RangeInclusive>::contains(const_range, &x)` into native
-/// comparisons `r = (x >= start) & (x <(=) end)`, so a `(L..=U).contains(&x)` input-
-/// validation guard establishes `L <= x <= U` for the guarded arithmetic that follows.
-/// SOUND: exactly `contains`' semantics; bounds are read from the range's compile-time
-/// constant valtree (type-aware); any range/value we cannot read precisely is left as
-/// the original opaque call (fail-closed — never a wrong bound). Only const ranges are
-/// rewritten (the dominant idiom, e.g. `(0..=9999).contains(&year)`).
-pub(crate) fn rewrite_range_contains_calls<'tcx>(
+/// Rewrite `n = <str>::len(s)` into `n = PtrMetadata(s)`.
+///
+/// Trust (2026-09-29). A `&str` is extracted as `&[u8]`, and `str::len` is its byte
+/// length, which is the fat pointer's metadata — what a slice's `len()` already
+/// arrives as (rustc lowers `<[T]>::len` itself). Left a call, its result was tied
+/// to the owned-container length name `s` while `is_empty`, `as_bytes()[i]` and every
+/// range slice read `s__slice_len`, so `if i < s.len() { s.as_bytes()[i] }` over
+/// `s: &str` was refuted with `s = 1`, `s__slice_len = 0` (the `&String` twin
+/// proved). A proof-oriented normalization, like the other rewrites on this path.
+pub(crate) fn rewrite_str_len_calls<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
     vbody: &mut VerifiableBody,
 ) {
-    let mut next_local = vbody.locals.iter().map(|l| l.index).max().map_or(0, |m| m + 1);
-
-    // SOUNDNESS-CRITICAL precompute (verdict-identical to the former per-call scan):
-    // collect ONCE the set of every local that is mutably borrowed anywhere in the
-    // body — i.e. appears as `place.local` in a `Ref{mutable:true}` or any `AddressOf`
-    // (raw `&raw const`/`&raw mut`, matching the original `AddressOf(_, place)` which
-    // ignored the mutability bool). This MUST scan the SAME scope (all blocks, all
-    // stmts of `vbody`) with the SAME predicate as the staleness gate below, so the
-    // skip decision is byte-for-byte identical for every call: membership `vl ∈ set`
-    // ⟺ `∃ stmt` matching the predicate with `place.local == vl`. Replaces the
-    // O(calls × stmts) rescan with one O(stmts) pass + O(1) lookups; the gate that
-    // backs the range-contains &mut staleness fix is unchanged in semantics.
-    let mut_borrowed_locals: std::collections::HashSet<usize> = vbody
-        .blocks
-        .iter()
-        .flat_map(|b| &b.stmts)
-        .filter_map(|s| match s {
-            Statement::Assign { rvalue: Rvalue::Ref { mutable: true, place }, .. } => {
-                Some(place.local)
-            }
-            Statement::Assign { rvalue: Rvalue::AddressOf(_, place), .. } => Some(place.local),
-            _ => None,
-        })
-        .collect();
-
+    let typing_env = Some(mir_body.typing_env(tcx));
     for (bb, bb_data) in mir_body.basic_blocks.iter_enumerated() {
         let mir::TerminatorKind::Call { func, args, destination, target: Some(target), .. } =
             &bb_data.terminator().kind
         else {
             continue;
         };
-        if args.len() != 2 {
+        let [arg] = &args[..] else { continue };
+        if !callee_is_sysroot_str_len(tcx, func) {
             continue;
         }
-        let name = func_operand_name(tcx, func);
-        if !name.ends_with("::contains") {
+        let Some(block) = vbody.blocks.get_mut(bb.as_usize()) else { continue };
+        if !matches!(block.terminator, Terminator::Call { .. }) {
             continue;
         }
-        let inclusive = name.contains("RangeInclusive");
-        let exclusive = !inclusive && name.contains("ops::") && name.contains("Range");
-        if !(inclusive || exclusive) {
-            continue;
-        }
-        let Some(const_op) = trace_operand_to_const(mir_body, &args[0].node) else { continue };
-        let Some((start_cv, end_cv)) = range_const_bounds(tcx, const_op) else { continue };
-        let Some(value_op) = contains_value_operand(tcx, mir_body, &args[1].node) else { continue };
-
-        // SOUNDNESS (hunt-13): do NOT synthesize the range guard when the validated
-        // value's local is MUTABLY BORROWED anywhere in the body. Otherwise
-        // `(0..=4).contains(&x); let p = &mut x; *p = b; arr[x]` carries the STALE
-        // `x <= 4` range fact across the `*p = b` Deref-store (which is NOT a
-        // whole-local definition of `x`, so the single-definition gate that backs this
-        // rewrite never sees it) straight into a kernel-CERTIFIED out-of-bounds proof.
-        // Mirrors the `Ref{mutable}`/`AddressOf` staleness gate the comparison-guard
-        // lane already applies (hunt-5/7/8/9). Conservative: whole-body, on the base
-        // local; leaves the opaque `contains` call (fail-closed) for a mutated value.
-        if let Operand::Copy(p) | Operand::Move(p) = &value_op {
-            // O(1) lookup into the once-computed set; membership is identical to the
-            // former per-call `any(..)` scan (same scope, same predicate). See the
-            // precompute above for the soundness argument.
-            if mut_borrowed_locals.contains(&p.local) {
-                continue;
-            }
-        }
-
-        let block = &mut vbody.blocks[bb.as_usize()];
-        let span = SourceSpan::default();
-        let t1 = next_local;
-        let t2 = next_local + 1;
-        next_local += 2;
-        vbody.locals.push(LocalDecl { index: t1, ty: Ty::Bool, name: None });
-        vbody.locals.push(LocalDecl { index: t2, ty: Ty::Bool, name: None });
         block.stmts.push(Statement::Assign {
-            place: Place::local(t1),
-            rvalue: Rvalue::BinaryOp(BinOp::Ge, value_op.clone(), Operand::Constant(start_cv)),
-            span: span.clone(),
-        });
-        block.stmts.push(Statement::Assign {
-            place: Place::local(t2),
-            rvalue: Rvalue::BinaryOp(
-                if inclusive { BinOp::Le } else { BinOp::Lt },
-                value_op,
-                Operand::Constant(end_cv),
-            ),
-            span: span.clone(),
-        });
-        block.stmts.push(Statement::Assign {
-            place: convert_place(tcx, destination, Some(mir_body.typing_env(tcx))),
-            rvalue: Rvalue::BinaryOp(
-                BinOp::BitAnd,
-                Operand::Copy(Place::local(t1)),
-                Operand::Copy(Place::local(t2)),
-            ),
-            span,
+            place: convert_place(tcx, destination, typing_env),
+            rvalue: Rvalue::UnaryOp(UnOp::PtrMetadata, convert_operand(tcx, &arg.node, typing_env)),
+            span: convert_span(tcx, bb_data.terminator().source_info.span),
         });
         block.terminator = Terminator::Goto(BlockId(target.as_usize()));
     }
@@ -5497,6 +7896,9 @@ fn alloc_call_box_facts<'tcx>(
 ) -> Option<BoxAllocFacts> {
     let mut local = addr_local;
     for _ in 0..16 {
+        if pointer_local_storage_may_change(mir_body, local) {
+            return None;
+        }
         // Statement (`Assign`) def: value-preserving hops only.
         if let Some(def) = unique_whole_local_def(mir_body, local) {
             // SOUNDNESS (mixed-def guard — closes a verified pre-existing false PROVE):
@@ -5531,6 +7933,11 @@ fn alloc_call_box_facts<'tcx>(
             }
         }
 
+        // `None` also means multiple whole-local assignments, not just no
+        // assignment. An allocator call cannot rescue those competing values.
+        if local_has_whole_assign(mir_body, local) {
+            return None;
+        }
         // Otherwise the local must be defined by a `Call`; only an infallible box
         // allocator bottoms out the trace. The allocation alignment is read from the
         // ALLOCATOR CALL's own type argument — the TRUE allocated type — NOT from any
@@ -5542,7 +7949,7 @@ fn alloc_call_box_facts<'tcx>(
         if let Some(mir::TerminatorKind::Call { func, .. }) =
             unique_call_def_for_local(mir_body, local)
         {
-            let name = func_operand_name(tcx, func);
+            let name = func_operand_name_in_body(tcx, mir_body, func);
             // SOUNDNESS (crate-name forgery): authenticate the allocator by its RESOLVED
             // callee DefId (un-forgeable `owned_box` lang item / sysroot `StableCrateId`),
             // NEVER the printed `alloc::boxed::Box::new` path a `--crate-name alloc` dep can
@@ -5603,6 +8010,48 @@ fn local_has_terminator_def(mir_body: &mir::Body<'_>, local: mir::Local) -> bool
     })
 }
 
+/// A unique whole-local definition is not a reaching-value proof when the
+/// local's own storage escapes or a projected write changes part of it. In
+/// particular, `replace(&mut p, q)` may overwrite a raw-pointer temporary while
+/// its only `Assign` still says `p = &raw const *valid_reference`.
+///
+/// This denial-only guard is shared by reference and box pointer traces, not by
+/// unrelated constant extraction. Reject all actual borrows/address-taking of
+/// the local or its inline fields (raw const included), and all projected
+/// mutating contexts. A place containing Deref addresses the REFERENT, not the
+/// pointer local's storage: ordinary `&*reference` and pointee writes do not
+/// invalidate the pointer bits and remain eligible for the existing checks.
+///
+/// The MIR visitor covers Call/Yield/InlineAsm destinations and SetDiscriminant
+/// as well as Assign, so projected writes cannot hide in terminators. Whole
+/// Assign/Call definitions retain their existing uniqueness checks; whole
+/// Yield/InlineAsm/SetDiscriminant cannot belong to any supported pointer trace.
+fn pointer_local_storage_may_change(mir_body: &mir::Body<'_>, local: mir::Local) -> bool {
+    use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, VisitPlacesWith, Visitor};
+    let mut invalidated = false;
+    let mut visitor = VisitPlacesWith(|place: mir::Place<'_>, context: PlaceContext| {
+        let own_storage = place.local == local
+            && !place.projection.iter().any(|p| matches!(p, mir::PlaceElem::Deref));
+        if own_storage
+            && (context.is_borrow()
+                || context.is_address_of()
+                || (!place.projection.is_empty() && context.is_mutating_use())
+                || matches!(
+                    context,
+                    PlaceContext::MutatingUse(
+                        MutatingUseContext::Yield
+                            | MutatingUseContext::AsmOutput
+                            | MutatingUseContext::SetDiscriminant
+                    )
+                ))
+        {
+            invalidated = true;
+        }
+    });
+    visitor.visit_body(mir_body);
+    invalidated
+}
+
 /// Fallback for a box RECEIVED from the caller (no in-body allocator call). Walk the
 /// checked address backward through the SAME value-preserving hops as `alloc_call_box_facts`
 /// until we reach the `ElaborateBoxDerefs` box-deref source `<box>.0:Unique.0:NonNull`,
@@ -5619,7 +8068,9 @@ fn received_box_facts<'tcx>(
     for _ in 0..16 {
         // Mixed-def guard on every address-trace local (defense in depth; these are
         // normally single-def instrumentation temps).
-        if local_has_terminator_def(mir_body, local) {
+        if local_has_terminator_def(mir_body, local)
+            || pointer_local_storage_may_change(mir_body, local)
+        {
             return None;
         }
         let def = unique_whole_local_def(mir_body, local)?;
@@ -5629,7 +8080,7 @@ fn received_box_facts<'tcx>(
             // stop at the box base instead of hopping past it (its projection is all-`Field`
             // and NonNull is pointer-like, so the generic arms would otherwise consume it).
             mir::Rvalue::Cast(
-                mir::CastKind::Transmute,
+                mir::CastKind::Transmute | mir::CastKind::BoxDerefTransmute,
                 mir::Operand::Copy(p) | mir::Operand::Move(p),
                 _,
             )
@@ -5680,17 +8131,257 @@ fn synth_box_facts<'tcx>(
     src: &mir::Place<'tcx>,
 ) -> Option<BoxAllocFacts> {
     let n = src.projection.len();
-    let base_proj = &src.projection[..n - 2]; // n >= 2 guaranteed by synth_box_pointee
-    let pointee = synth_box_pointee(tcx, mir_body, src)?; // P = base.boxed_ty()
+    let (pointee, fields) = synth_box_pointee(tcx, mir_body, src)?; // P = base.boxed_ty()
+    let base_proj = &src.projection[..n - fields];
 
     let relabeled = received_box_origin(tcx, mir_body, src.local, base_proj, 16)?;
 
     let align = if !relabeled && !pointee.has_non_region_param() {
-        tcx.layout_of(typing_env.as_query_input(pointee)).ok().map(|l| l.align.abi.bytes())
+        crate::tuple_layouts::extractor_layout_of(tcx, typing_env, pointee).map(|l| l.align.bytes())
     } else {
         None
     };
     Some(BoxAllocFacts { align })
+}
+
+/// Trust (*"an alignment discharge may rest on reference
+/// validity"*, the owner, 2026-09-13: docs/OWNER_RULINGS.md OW-24): the alignment of a pointer whose ROOT is a valid `&T`/`&mut T` FORMAL,
+/// reached by an alignment-preserving access path, is known from that root's own validity
+/// obligation. The caller guarantees the referent is a live, properly aligned `T` — the same
+/// invariant rustc itself relies on when it emits no alignment check for a `&T` deref, and
+/// the invariant `&packed.field`'s E0793 exists to protect.
+///
+/// Returns the alignment (bytes) the addressed place provably has, or `None` (assert KEPT).
+///
+/// SOUNDNESS — a SEPARATE claim from the box lane, and deliberately NOT spliced into
+/// [`box_alloc_facts_for_addr`]: the `NullPointerDereference` arm discharges on that
+/// function's `.is_some()` with NO alignment comparison, so widening it would grant a NULL
+/// discharge resting on an argument this ruling does not make. This lane is reached only
+/// from the misalign arm.
+///
+/// THE FENCE — every clause must hold; anything unmatched yields `None` and KEEPS the assert:
+///   1. the address traces back, through address-preserving hops only, to the address OF A
+///      PLACE (`Rvalue::RawPtr` / `Rvalue::Ref`);
+///   2. that place's base local is a PRISTINE reference FORMAL. `is_ref()` ONLY — never a
+///      `Box` (a box root belongs to the box lane, whose `relabeled` discipline withholds
+///      exactly this discharge across a pointee-relabeling transmute) and never a raw-pointer
+///      formal (no validity guarantee at all);
+///   3. every projection step preserves alignment — [`box_place_safe_access_path`], which
+///      refuses a raw-pointer deref, a union field, AND a field of a `#[repr(packed)]` ADT;
+///   4. the projected place type has a concrete, non-generic layout.
+///
+/// `RawPtrKind::FakeForPtrMetadata` is excluded: it addresses metadata, not the data.
+fn ref_rooted_align_for_addr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    mir_body: &mir::Body<'tcx>,
+    addr_local: mir::Local,
+) -> Option<u64> {
+    let place = ref_rooted_addressed_place(tcx, mir_body, addr_local)?;
+    ref_rooted_place_align(tcx, typing_env, mir_body, place)
+}
+
+/// Trust (the 2026-09-13 reference-validity rule, SECOND application — the NULL twin): a pointer whose root
+/// is a pristine `&T`/`&mut T` FORMAL, reached by the same fence, is NON-NULL by the same
+/// caller validity obligation that makes it aligned. A reference is never null — the invariant
+/// the language guarantees and `NonNull`'s niche already encodes.
+///
+/// A SEPARATE and strictly weaker claim than the alignment one, given its own function rather
+/// than a flag so the two cannot be widened by accident. It shares clauses F1-F4 verbatim (the
+/// trace, the pristine reference root, the projection walk) and omits only the
+/// `align >= required` comparison — `NullPointerDereference` carries no `required` operand.
+///
+/// Inheriting F4's `#[repr(packed)]` refusal here is OVER-CONSERVATIVE on purpose: a packed
+/// field of a valid reference is still non-null, so this lane could admit it. One shared path
+/// predicate costs a little coverage and buys that nobody can loosen the ALIGNMENT lane by
+/// reasoning about "the null one, which does not care about packing".
+fn ref_rooted_nonnull_for_addr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir_body: &mir::Body<'tcx>,
+    addr_local: mir::Local,
+) -> bool {
+    ref_rooted_addressed_place(tcx, mir_body, addr_local)
+        .is_some_and(|place| ref_rooted_place_is_pristine_ref_rooted(tcx, mir_body, place))
+}
+
+/// Clauses F1-F2, shared by both reference-validity lanes: trace the checked address backward
+/// through address-preserving hops to the `Rvalue` that takes the ADDRESS OF A PLACE, and
+/// return that place. `None` for anything else, which KEEPS the assert.
+fn ref_rooted_addressed_place<'a, 'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir_body: &'a mir::Body<'tcx>,
+    addr_local: mir::Local,
+) -> Option<&'a mir::Place<'tcx>> {
+    let mut local = addr_local;
+    for _ in 0..16 {
+        // Mixed-def guard on every hop (same discipline as `received_box_facts`): a local
+        // that is ALSO terminator-defined is ambiguous, and must fail closed.
+        if local_has_terminator_def(mir_body, local)
+            || pointer_local_storage_may_change(mir_body, local)
+        {
+            return None;
+        }
+        match unique_whole_local_def(mir_body, local)? {
+            // Clause 1 TERMINATION: the address is the address OF A PLACE.
+            mir::Rvalue::RawPtr(mir::RawPtrKind::Const | mir::RawPtrKind::Mut, place)
+            | mir::Rvalue::Ref(_, _, place) => {
+                return Some(place);
+            }
+            // Whole-local copy hop.
+            mir::Rvalue::Use(mir::Operand::Copy(p) | mir::Operand::Move(p), _)
+                if p.projection.is_empty() =>
+            {
+                local = p.local;
+            }
+            // Address-preserving instrumentation cast hop — `CheckAlignment` emits
+            // `_t1 = ptr as *const ()` then `_t2 = _t1 as usize (Transmute)`, and GVN may
+            // fold the pair to the lone `Transmute`. UNPROJECTED sources only (stricter than
+            // the box lane's all-`Field` allowance: a field READ yields a different pointer).
+            //
+            // THE `is_empty()` IS LOAD-BEARING, NOT TIDINESS. The box lane's sibling hop
+            // permits an all-`Field` projection because for a box the alignment comes from
+            // the allocator, so the path taken to the pointer is irrelevant. Here the path
+            // IS the claim. Measured by an adversarial pass: a `Vec`'s interior `NonNull`
+            // field, reached through a multi-`Field` projection, is an address the receiver
+            // merely STORES rather than one the receiver IS — its value changes under any
+            // realloc, so no fact about the path constrains it. Copying the box lane's
+            // spelling here would be a live false PROVE.
+            mir::Rvalue::Cast(
+                kind,
+                operand @ (mir::Operand::Copy(p) | mir::Operand::Move(p)),
+                _,
+            ) if cast_is_address_preserving(*kind)
+                && p.projection.is_empty()
+                && source_is_pointer_like(tcx, operand.ty(&mir_body.local_decls, tcx)) =>
+            {
+                local = p.local;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Clause 3 of [`ref_rooted_align_for_addr`]'s fence, as an AFFIRMATIVE allow-list over the
+/// projection: every step must provably preserve alignment.
+///
+/// Split out from [`box_place_safe_access_path`] rather than sharing it. That helper is the
+/// box lane's, and its `Field` rule is a DENY-list (`!is_union()`, plus the packed refusal
+/// added with this lane). A deny-list answers "allowed" for a base kind nobody enumerated —
+/// measured: `base_ty.ty_adt_def().is_some_and(|a| a.repr().packed())` is VACUOUSLY false for
+/// a tuple, closure, or coroutine field base, because `ty_adt_def()` is `None` there. That is
+/// sound today (none of those can carry a `repr`, so none can be packed) but it is the
+/// CLAUDE.md `__tag` hazard exactly: a guard reading a field that does not VARY with the thing
+/// being tested. Here the base kinds are named affirmatively instead, so a new one refuses.
+fn ref_path_align_preserving<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir_body: &mir::Body<'tcx>,
+    base_local: mir::Local,
+    proj: &[mir::PlaceElem<'tcx>],
+) -> bool {
+    for (i, elem) in proj.iter().enumerate() {
+        let base_ty = mir::Place::ty_from(base_local, &proj[..i], &mir_body.local_decls, tcx).ty;
+        match elem {
+            // Only a REFERENCE may be dereferenced: a raw pointer carries no validity
+            // guarantee, and a `Box` deref belongs to the box lane.
+            mir::PlaceElem::Deref => {
+                if !base_ty.is_ref() {
+                    return false;
+                }
+            }
+            // A field is alignment-preserving iff its container's layout guarantees
+            // `align(container) >= align(field)` and `offset % align(field) == 0`. Rust
+            // guarantees both for a non-packed struct/enum and for a tuple; `#[repr(packed)]`
+            // (and `packed(N)` — `ReprOptions::packed()` is `pack.is_some()`) is the sole
+            // repr that breaks it, and a UNION field's bytes carry no validity at all.
+            mir::PlaceElem::Field(..) => match base_ty.kind() {
+                ty::Adt(def, _) => {
+                    if def.is_union() || def.repr().packed() {
+                        return false;
+                    }
+                }
+                ty::Tuple(..) => {}
+                _ => return false,
+            },
+            // Alignment-neutral: enum variant field offsets are alignment-computed
+            // independently of the actual discriminant, so even a mis-predicted variant is
+            // alignment-safe.
+            mir::PlaceElem::Downcast(..) => {}
+            // Index/ConstantIndex/Subslice/OpaqueCast/UnwrapUnsafeBinder — address arithmetic
+            // or an unmodelled reinterpretation. Fail closed.
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Clauses F3-F4, shared by the alignment and NULL lanes: the addressed place's base local is
+/// a PRISTINE reference formal whose slot cannot have been invalidated, and every projection
+/// step preserves the root's guarantees.
+///
+/// `pointer_local_storage_may_change` is part of this predicate and must stay: a root whose own
+/// slot is borrowed, address-taken, partially written, or written by yield/asm-output/
+/// set-discriminant is no longer the referent the caller vouched for (`77c58abe57`).
+fn ref_rooted_place_is_pristine_ref_rooted<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir_body: &mir::Body<'tcx>,
+    place: &mir::Place<'tcx>,
+) -> bool {
+    let root = place.local;
+    is_mir_parameter(mir_body, root)
+        && !local_has_whole_assign(mir_body, root)
+        && !local_has_terminator_def(mir_body, root)
+        && !pointer_local_storage_may_change(mir_body, root)
+        && mir_body.local_decls[root].ty.is_ref()
+        && ref_path_align_preserving(tcx, mir_body, root, place.projection)
+}
+
+/// Clauses 2-4 of [`ref_rooted_align_for_addr`]'s fence, applied to the addressed place.
+fn ref_rooted_place_align<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    mir_body: &mir::Body<'tcx>,
+    place: &mir::Place<'tcx>,
+) -> Option<u64> {
+    if !ref_rooted_place_is_pristine_ref_rooted(tcx, mir_body, place) {
+        return None;
+    }
+    let root = place.local;
+    // Clause 4: a concrete layout for the PROJECTED place type. A generic pointee declines
+    // (the discharge site's `>= req` comparison needs a real number, not a symbol).
+    //
+    // WHY READING ALIGNMENT OFF THE PROJECTED TYPE IS SOUND HERE — the induction, stated
+    // because an adversarial pass refuted the weaker claim it is easy to mistake this for.
+    // It is NOT "a valid `&T` implies its projected fields are aligned" (false: see the
+    // `#[repr(packed)]` counterexample in the report). It is:
+    //   BASE   the root `&T` formal guarantees its referent is `align_of::<T>()`-aligned;
+    //   STEP   for a NON-PACKED, NON-UNION ADT, Rust's layout rules guarantee both
+    //          `align(container) >= align(field)` and `offset(field) % align(field) == 0`,
+    //          so an `align(container)`-aligned base plus that offset is an
+    //          `align(field)`-aligned address;
+    //   HENCE  every prefix of the projection lands on an address aligned to its own place
+    //          type, and `align_of(final place type)` is a true lower bound.
+    // The STEP is exactly what `#[repr(packed)]` breaks, which is why the pack refusal in
+    // `box_place_safe_access_path` is LOAD-BEARING and per-element rather than cosmetic:
+    // delete it and this function starts over-claiming (measured: a nested `Outer{inner}`
+    // with only `Outer` packed defeats any check that looks solely at the final base).
+    //
+    // A `Downcast` needs no term: enum variant field offsets are alignment-computed
+    // independently of the actual discriminant, so even a mis-predicted variant is
+    // alignment-safe.
+    //
+    // SUBTLETY, recorded because a plausible "fix" would re-open it: `required` is NOT
+    // always `align_of` of the pointer's own pointee. `check_alignment.rs` passes
+    // `BorrowedFieldProjectionMode::FollowProjections`, so in borrow contexts
+    // `check_pointers` sets `pointee_ty` to the FIELD type while `found` stays the BASE
+    // local's address. The comparison below survives that (base-referent align >= field
+    // align in any unpacked layout, and packed is refused above) — but anyone rewriting it
+    // to compare against the deref pointee instead would break it.
+    let pty = mir::Place::ty_from(root, place.projection, &mir_body.local_decls, tcx).ty;
+    if pty.has_non_region_param() {
+        return None;
+    }
+    crate::tuple_layouts::extractor_layout_of(tcx, typing_env, pty).map(|l| l.align.bytes())
 }
 
 /// True iff `src` is the SOURCE of an `ElaborateBoxDerefs` box-deref
@@ -5704,17 +8395,20 @@ fn is_synth_box_deref_src<'tcx>(
 }
 
 /// The genuine box pointee `P` (`= base.boxed_ty()`) of an `ElaborateBoxDerefs` box-deref
-/// source `<owned_box_place>.0:Unique.0:NonNull`, or `None` if `src` is not that shape.
-/// Mirrors `is_synth_box_ptr` (rustc_mir_transform/src/trust_verify.rs, committed
-/// 885142823e): last two projections `Field(0): ptr::Unique<_>` then `Field(0):
-/// ptr::NonNull<_>` (adt-def identity resolved from the `owned_box` lang item — a user
-/// `myptr::Unique` cannot masquerade), base is an `owned_box`. `P` is read from the base,
-/// never a relabeled far end.
+/// source, and how many trailing projections are the box machinery's, or `None`
+/// if `src` is not that shape. Mirrors `is_synth_box_ptr`
+/// (rustc_mir_transform/src/trust_verify.rs, committed 885142823e): adt-def
+/// identity resolved from the `owned_box` lang item — a user `myptr::Unique`
+/// cannot masquerade — base is an `owned_box`. `P` is read from the base,
+/// never a relabeled far end. Two spellings: 1.99's
+/// `<owned_box_place>.0:Unique.0:NonNull` (two trailing `Field(0)`s) and
+/// 1.101's `<owned_box_place>.0:BoxRaw` (one; in the derivation below
+/// `unique_def` is Box's field-0 ADT either way).
 fn synth_box_pointee<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
     src: &mir::Place<'tcx>,
-) -> Option<ty::Ty<'tcx>> {
+) -> Option<(ty::Ty<'tcx>, usize)> {
     let owned_box_did = tcx.lang_items().owned_box()?;
     let unique_did = tcx.adt_def(owned_box_did).non_enum_variant().fields.iter().next()?.did;
     let unique_def =
@@ -5725,22 +8419,30 @@ fn synth_box_pointee<'tcx>(
 
     let proj = src.projection;
     let n = proj.len();
-    if n < 2 {
+    let fields = if n >= 2
+        && matches!(proj[n - 2], mir::PlaceElem::Field(idx, ty)
+            if idx.as_u32() == 0 && ty.ty_adt_def() == Some(unique_def))
+        && matches!(proj[n - 1], mir::PlaceElem::Field(idx, ty)
+            if idx.as_u32() == 0 && ty.ty_adt_def() == Some(nonnull_def))
+    {
+        2
+    } else if n >= 1
+        && matches!(proj[n - 1], mir::PlaceElem::Field(idx, ty)
+            if idx.as_u32() == 0 && ty.ty_adt_def() == Some(unique_def))
+    {
+        1
+    } else {
         return None;
-    }
-    let mir::PlaceElem::Field(uq_idx, uq_ty) = proj[n - 2] else { return None };
-    let mir::PlaceElem::Field(nn_idx, nn_ty) = proj[n - 1] else { return None };
-    if uq_idx.as_u32() != 0 || nn_idx.as_u32() != 0 {
-        return None;
-    }
-    if uq_ty.ty_adt_def() != Some(unique_def) || nn_ty.ty_adt_def() != Some(nonnull_def) {
-        return None;
-    }
-    mir::Place::ty_from(src.local, &proj[..n - 2], &mir_body.local_decls, tcx).ty.boxed_ty()
+    };
+    let pointee = mir::Place::ty_from(src.local, &proj[..n - fields], &mir_body.local_decls, tcx)
+        .ty
+        .boxed_ty()?;
+    Some((pointee, fields))
 }
 
 /// Does the box VALUE named by `Place { base_local, base_proj }` provably ROOT at a
-/// validity-guaranteed received input (a `Box`/`&` PARAMETER) reached by a safe access
+/// validity-guaranteed received input (a `Box`/`&` PARAMETER, or since D8 a `Box`
+/// RETURNED by a call `returned_box_root` admits) reached by a safe access
 /// path, crossing NO raw-pointer/union read and NO in-body allocation/`from_raw`?
 /// `Some(relabeled)`: `relabeled` iff an address-preserving (potentially align-changing)
 /// pointee cast was crossed; `None` if not so rooted (assert KEPT).
@@ -5748,7 +8450,14 @@ fn synth_box_pointee<'tcx>(
 /// SOUNDNESS: a `Box<T>`/`&T` parameter is non-null and points to an `align_of::<T>()`-
 /// aligned, live `T` by the caller's validity obligation — the SAME invariant rustc trusts
 /// (no null/align check for a `&T` deref) and trust's sep-engine already relies on for ref
-/// params (sep_engine.rs:957,967-988,2350-2366). A raw-pointer deref, a union field read,
+/// params (sep_engine.rs:957,967-988,2350-2366 — **CITATION STALE, verified 2026-09-13:
+/// those line numbers no longer resolve to ref-param reasoning. ~952 is
+/// `discharge_stack_good`, which grounds alignment in STACK PROVENANCE (a backing local's
+/// type gives its alignment), and ~2350 is `points_to_multi`, a `#[cfg(test)]` separation
+/// helper. A search of that file finds alignment reasoning keyed on ALLOCATIONS — boxed
+/// type, stack backing local — and no discharge resting on reference-parameter validity.
+/// The argument above may still hold; its POINTER does not. Re-cite or re-derive before
+/// relying on it.**). A raw-pointer deref, a union field read,
 /// or an in-body `from_raw`/alloc carries no such guarantee → `None`.
 fn received_box_origin<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -5769,7 +8478,28 @@ fn origin_of_box_local<'tcx>(
     local: mir::Local,
     fuel: u32,
 ) -> Option<bool> {
-    if fuel == 0 || local_has_terminator_def(mir_body, local) {
+    // Trust (D8, 2026-09-24): a `Box` RETURNED by a call the shared predicate
+    // admits (`returned_box_root`: a session with no value-changing MIR opts; a
+    // direct, safe, Rust-ABI, non-foreign callee that resolves to a plain item
+    // with no user axiom, no extern indicator, not naked, no target feature) is
+    // a validity root — parity with the parameter arm below. The local must hold
+    // that ONE value: no whole-local `Assign`, not a parameter, no
+    // escaped/borrowed slot or projected write, and the call is its only
+    // terminator def. Not a relabel: the alignment is read from the box's own
+    // pointee, which a valid `Box<P>` value is aligned for. The vcgen twin is
+    // `sep_engine::is_certified_returned_box_destination`.
+    if fuel > 0
+        && !pointer_local_storage_may_change(mir_body, local)
+        && !is_mir_parameter(mir_body, local)
+        && !local_has_whole_assign(mir_body, local)
+        && crate::returned_box_root::sole_call_def_is_returned_box_root(tcx, mir_body, local)
+    {
+        return Some(false);
+    }
+    if fuel == 0
+        || local_has_terminator_def(mir_body, local)
+        || pointer_local_storage_may_change(mir_body, local)
+    {
         return None;
     }
     match unique_whole_local_def(mir_body, local) {
@@ -5810,7 +8540,11 @@ fn origin_of_box_local<'tcx>(
 /// validity guarantee) or a box (that IS the deref we discharge); every `Field` must NOT
 /// read through a UNION (a union field carries no validity guarantee — its bytes could
 /// form a null/misaligned pointer); only `Field`/`Downcast` otherwise. `Downcast` is
-/// validity-safe: rustc emits it only discriminant-dominated, from match lowering.
+/// validity-safe: rustc emits it only discriminant-dominated, from match lowering. A `Field`
+/// of a `#[repr(packed)]` ADT is additionally refused: such a field is legitimately
+/// under-aligned, which matters to every caller that reads an alignment off the projected
+/// place (the reference-validity lane below) and is harmless belt-and-braces for the box lane,
+/// which reads its alignment from the box pointee instead.
 fn box_place_safe_access_path<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
@@ -5827,6 +8561,23 @@ fn box_place_safe_access_path<'tcx>(
             }
             mir::PlaceElem::Field(..) => {
                 if base_ty.is_union() {
+                    return false;
+                }
+                // Trust (the 2026-09-13 reference-validity alignment discharge):
+                // a field of a `#[repr(packed)]` ADT is NOT aligned to its own type's
+                // alignment, even behind a perfectly valid reference. `&packed.field` is
+                // rejected by rustc itself (E0793 — creating a misaligned reference is UB
+                // even if never dereferenced), so no REFERENCE can reach such a field; but
+                // `&raw const packed.field` IS accepted and its root can still be a valid
+                // reference FORMAL. So the exclusion must sit on the PROJECTION STEP, never
+                // on the root. Measured counterexample in
+                // `reports/2026-09-13-w1-alignment-obligation-sizing.md`: for
+                // `#[repr(packed)] struct P { a: u8, c: u32 }`, `*(&raw const p.c)` with
+                // `p: &P` lowers to MIR structurally IDENTICAL to the sound target shape.
+                // Conservative on purpose, mirroring `place_projects_through_packed`
+                // (crates/trust-thir-lower/src/lib.rs): any packed base refuses, without
+                // trying to prove this particular field is actually mis-aligned.
+                if base_ty.ty_adt_def().is_some_and(|adt| adt.repr().packed()) {
                     return false;
                 }
             }
@@ -5974,7 +8725,7 @@ fn is_mir_parameter(mir_body: &mir::Body<'_>, local: mir::Local) -> bool {
 fn local_has_whole_assign(mir_body: &mir::Body<'_>, local: mir::Local) -> bool {
     mir_body.basic_blocks.iter().any(|bb| {
         bb.statements.iter().any(|s| {
-            matches!(&s.kind, mir::StatementKind::Assign(box (lhs, _))
+            matches!(&s.kind, mir::StatementKind::Assign((lhs, _))
                 if lhs.local == local && lhs.projection.is_empty())
         })
     })
@@ -5993,18 +8744,18 @@ fn box_allocator_alignment<'tcx>(
     typing_env: ty::TypingEnv<'tcx>,
     func: &mir::Operand<'tcx>,
 ) -> Option<u64> {
-    let mir::Operand::Constant(box c) = func else {
+    let mir::Operand::Constant(c) = func else {
         return None;
     };
     let ty::FnDef(_, generic_args) = c.const_.ty().kind() else {
         return None;
     };
-    let elem = generic_args.types().next()?;
+    let elem = generic_args.skip_binder().types().next()?;
     if elem.has_non_region_param() {
         return None; // generic allocation — alignment is instantiation-dependent
     }
-    let layout = tcx.layout_of(typing_env.as_query_input(elem)).ok()?;
-    Some(layout.align.abi.bytes())
+    let layout = crate::tuple_layouts::extractor_layout_of(tcx, typing_env, elem)?;
+    Some(layout.align.bytes())
 }
 
 /// A cast SOURCE whose VALUE is a pointer/address, so an address-preserving cast off
@@ -6020,6 +8771,14 @@ fn source_is_pointer_like<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
         return true;
     }
     if let Some(adt) = ty.ty_adt_def() {
+        // FENCE-IDENTITY-1 survey: the name is rendered text with no impersonation
+        // stamp, so a `--crate-name core` dependency's `ptr::NonNull` value struct
+        // matched it. Require the ADT's crate to be the real sysroot.
+        if !is_real_sysroot_crate(tcx, adt.did().krate)
+            || !matches!(tcx.item_name(adt.did()).as_str(), "NonNull" | "Unique" | "BoxRaw")
+        {
+            return false;
+        }
         let path = crate::safe_def_path_str(tcx, adt.did());
         return is_core_ptr_wrapper_name(&path);
     }
@@ -6050,9 +8809,16 @@ fn source_is_pointer_like<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
 /// Gated on a `core::`/`std::`/`alloc::` origin and an `::ptr::` segment so a
 /// same-named USER type cannot match, mirroring `is_io_error_ty_name`'s discipline.
 fn is_core_ptr_wrapper_name(name: &str) -> bool {
+    // Trust (1.101): `alloc::boxed::BoxRaw` joins the wrappers — a `Box`'s
+    // field 0 is a BoxRaw since 1.101 (it was core's `Unique`), and the
+    // box-deref cast's source place is typed by it. Its definitional path
+    // renders `alloc::boxed::BoxRaw` (private `boxed` module, same trap as
+    // above), gated the same way: sysroot-crate origin plus the module
+    // segment, so a same-named user type cannot match.
     (name.starts_with("core::") || name.starts_with("std::") || name.starts_with("alloc::"))
-        && name.contains("::ptr::")
-        && (name.ends_with("::NonNull") || name.ends_with("::Unique"))
+        && ((name.contains("::ptr::")
+            && (name.ends_with("::NonNull") || name.ends_with("::Unique")))
+            || (name.contains("::boxed::") && name.ends_with("::BoxRaw")))
 }
 
 /// Address-preserving casts: the destination's address bits equal the source's.
@@ -6062,6 +8828,9 @@ fn cast_is_address_preserving(kind: mir::CastKind) -> bool {
         kind,
         mir::CastKind::PtrToPtr
             | mir::CastKind::Transmute
+            // Trust (1.101): the box-deref cast extracts the box's own pointer
+            // bits unchanged — address-preserving by construction.
+            | mir::CastKind::BoxDerefTransmute
             | mir::CastKind::PointerExposeProvenance
             | mir::CastKind::PointerWithExposedProvenance
             | mir::CastKind::PointerCoercion(
@@ -6109,14 +8878,14 @@ fn null_check_addr_rec<'tcx>(
         // `BitAnd(is_null, should_check)` — recurse into BOTH operands; only the
         // `is_null = Eq(addr, 0)` branch yields an address (the `should_check`
         // `Ne(SizeOf, 0)` branch has no address operand → `None`).
-        mir::Rvalue::BinaryOp(mir::BinOp::BitAnd, box (a, b)) => {
+        mir::Rvalue::BinaryOp(mir::BinOp::BitAnd, (a, b)) => {
             null_addr_from_operand(mir_body, a, fuel - 1)
                 .or_else(|| null_addr_from_operand(mir_body, b, fuel - 1))
         }
         // `is_null = Eq(addr, 0)`: the address is the non-zero operand. NOTE: only
         // `Eq` (not `Ne`) — `Eq(_, 0)` is rustc's null predicate; a `Ne(SizeOf, 0)` is
         // the size guard, never the address.
-        mir::Rvalue::BinaryOp(mir::BinOp::Eq, box (a, b)) => {
+        mir::Rvalue::BinaryOp(mir::BinOp::Eq, (a, b)) => {
             match (is_zero_const(a), is_zero_const(b)) {
                 (false, true) => operand_whole_local(a),
                 (true, false) => operand_whole_local(b),
@@ -6137,7 +8906,7 @@ fn null_addr_from_operand<'tcx>(
 
 /// Whether `op` is the integer constant `0` (the null sentinel of a null check).
 fn is_zero_const(op: &mir::Operand<'_>) -> bool {
-    matches!(op, mir::Operand::Constant(box c)
+    matches!(op, mir::Operand::Constant(c)
         if c.const_.try_to_scalar_int().is_some_and(|s| s.is_null()))
 }
 
@@ -6184,12 +8953,12 @@ pub(crate) fn discharge_provably_safe_pointer_asserts<'tcx>(
                     // declined const became an `Inst::Undef` the oracle reports as a live havoc);
                     // this one is a DISCHARGE, so relaxing it would remove obligations rather than
                     // recover rows. It is also unreachable from the producer: its sole caller in
-                    // `lib.rs`'s `extract_body` is gated on `purpose == ExtractionPurpose::
-                    // Verification`, while the MIR oracle arrives via `extract_function_faithful`
+                    // `lib.rs`'s `extract_body` is gated on Verification purpose AND
+                    // non-faithful mode, while the MIR oracle uses `extract_function_faithful`
                     // — and the verifier lane never enters the freeze in the first place. Leaving
                     // it at its strictest reading costs nothing measurable and
                     // keeps the relaxation confined to the operand path it was measured on.
-                    mir::Operand::Constant(box c)
+                    mir::Operand::Constant(c)
                         if !(matches!(c.const_, mir::Const::Unevaluated(..))
                             && crate::ctfe_reentrancy::frozen()) =>
                     {
@@ -6199,13 +8968,42 @@ pub(crate) fn discharge_provably_safe_pointer_asserts<'tcx>(
                 }) else {
                     continue;
                 };
-                operand_whole_local(found)
-                    .and_then(|addr| box_alloc_facts_for_addr(tcx, typing_env, mir_body, addr))
+                let addr = operand_whole_local(found);
+                // Box provenance (the original lane) OR reference validity (the
+                // 2026-09-13 rule). Two independent soundness arguments for the SAME conclusion;
+                // both compare against the assert's own `req`, so each is self-defending.
+                addr.and_then(|a| box_alloc_facts_for_addr(tcx, typing_env, mir_body, a))
                     .is_some_and(|facts| facts.align.is_some_and(|a| a >= req))
+                    || addr
+                        .and_then(|a| ref_rooted_align_for_addr(tcx, typing_env, mir_body, a))
+                        .is_some_and(|a| a >= req)
             }
-            mir::AssertKind::NullPointerDereference => null_check_addr_local(mir_body, cond)
-                .and_then(|addr| box_alloc_facts_for_addr(tcx, typing_env, mir_body, addr))
-                .is_some(),
+            // Trust (2026-09-30): rust 1.99's `NullReferenceConstructed` (`&*p` from a
+            // possibly-null `p`) is the same `!(addr == 0 & check)` condition with
+            // `check` the constant `true` (`check_null.rs`), and the same non-null proof
+            // discharges it. Without this arm every method called through a `&Box`
+            // kept an undischarged null-reference row (sweep `m19b`).
+            // Trust (ENC-DEFECTS 13c, 2026-09-26): `NullReferenceConstructed` joins
+            // this arm. rustc's `CheckNull` emits it for a BORROW of a raw deref
+            // (`&*p` — the `&**a` deref-coercion of a `Box` field) and
+            // `NullPointerDereference` for every other use, over the IDENTICAL
+            // `is_ok = !((p as *const () as usize == 0) & should_check)` condition
+            // (`check_null.rs::insert_null_check`; the borrow form's `should_check` is
+            // the literal `true`), so `null_check_addr_local` recovers the same
+            // pointer and both lanes below answer the same question — is that pointer
+            // provably non-null? Before this the borrow form fell to `_ => continue`
+            // and was KEPT on exactly the pointers the dereference form discharges:
+            // `eval(a)` on `Expr::Add(a, b)` through `e: &Expr` kept eight
+            // `[assert] null reference constructed` rows whose counterexample the
+            // generic bridge holds below proof authority, so the build failed.
+            mir::AssertKind::NullPointerDereference | mir::AssertKind::NullReferenceConstructed => {
+                let addr = null_check_addr_local(mir_body, cond);
+                // Box provenance OR reference validity. The second disjunct is the
+                // 2026-09-13 rule's argument applied to non-nullness. Attached HERE, never inside
+                // `box_alloc_facts_for_addr`, so the two lanes stay separable.
+                addr.and_then(|a| box_alloc_facts_for_addr(tcx, typing_env, mir_body, a)).is_some()
+                    || addr.is_some_and(|a| ref_rooted_nonnull_for_addr(tcx, mir_body, a))
+            }
             _ => continue,
         };
         if discharge {
@@ -6239,11 +9037,14 @@ pub(crate) fn stamp_errsource_devirt_total_calls<'tcx>(
 ) {
     use rustc_data_structures::fx::FxHashMap;
 
-    if std::env::var_os("TRUST_ERRSOURCE_DEVIRT").is_none() {
+    static ERRSOURCE_DEVIRT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ERRSOURCE_DEVIRT.get_or_init(|| std::env::var_os("TRUST_ERRSOURCE_DEVIRT").is_some()) {
         return;
     }
     let typing_env = ty::TypingEnv::post_analysis(tcx, mir_body.source.def_id());
-    let trace = std::env::var_os("TRUST_ERRSOURCE_DEVIRT_TRACE").is_some();
+    static ERRSOURCE_DEVIRT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trace = *ERRSOURCE_DEVIRT_TRACE
+        .get_or_init(|| std::env::var_os("TRUST_ERRSOURCE_DEVIRT_TRACE").is_some());
 
     // thiserror `AsDynError` StableCrateId (captured 2026-08-03; un-spoofable, mirrors
     // BIGNUM_TCB_ALLOWLIST). A thiserror bump changes it ⇒ fail-closes, never false-proves.
@@ -6270,7 +9071,14 @@ pub(crate) fn stamp_errsource_devirt_total_calls<'tcx>(
         let Some(trait_def_id) = tcx.trait_of_assoc(did) else {
             return false;
         };
-        if !tcx.def_path_str(trait_def_id).ends_with("AsDynError") {
+        // `with_no_trimmed_paths!` — the mirror of the same gate in
+        // `rustc_mir_transform::trust_verify`: a path a GATE reads is not diagnostic
+        // text. Bare, this runs the `trimmed_def_paths` query on every candidate body,
+        // arming rustc's `must_produce_diag`, so a crate that compiles without a
+        // diagnostic ICEs at `DiagCtxt` teardown with no bad code anywhere.
+        let trait_path =
+            rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(trait_def_id));
+        if !trait_path.ends_with("AsDynError") {
             return false;
         }
         THISERROR_TCB_SCIDS.contains(&tcx.stable_crate_id(trait_def_id.krate).as_u64())
@@ -6307,8 +9115,7 @@ pub(crate) fn stamp_errsource_devirt_total_calls<'tcx>(
                 }
             }
         }
-        if let mir::TerminatorKind::Call { func, args, destination, .. } =
-            &bbdata.terminator().kind
+        if let mir::TerminatorKind::Call { func, args, destination, .. } = &bbdata.terminator().kind
         {
             if destination.projection.is_empty() {
                 // An authenticated `as_dyn_error(&C)` pins the dest's runtime type to
@@ -6333,6 +9140,9 @@ pub(crate) fn stamp_errsource_devirt_total_calls<'tcx>(
         let Some((callee_def_id, gen_args)) = func.const_fn_def() else {
             continue;
         };
+        if crate::tuple_layouts::resolution_may_reenter(tcx, callee_def_id, gen_args) {
+            continue;
+        }
         let Ok(Some(instance)) =
             ty::Instance::try_resolve(tcx, typing_env, callee_def_id, gen_args)
         else {
@@ -6344,10 +9154,19 @@ pub(crate) fn stamp_errsource_devirt_total_calls<'tcx>(
         let Some(trait_def_id) = tcx.trait_of_assoc(method_def_id) else {
             continue;
         };
-        if !matches!(
-            tcx.def_path_str(trait_def_id).as_str(),
-            "core::error::Error" | "std::error::Error"
-        ) {
+        // ERRSOURCE-ANCHOR-1 (2026-10-03): the trait's IDENTITY — core's `Error`
+        // diagnostic item, defined in a real sysroot crate — not its printed path.
+        // `def_path_str` drops the LOCAL crate root, so a crate's own `mod core { mod
+        // error { trait Error } }` printed `core::error::Error`, passed the old
+        // string compare, and its panicking default `source` was rewritten to the total
+        // sentinel (measured on the stage 1 of main + wave 7 with the flag set). The
+        // diagnostic item alone is not authority either (an attribute a crate can
+        // declare), hence the residency check. The twin in
+        // `rustc_mir_transform::trust_verify::native_trust_ir_errsource_devirt_demotable_calls`
+        // takes the same anchor.
+        if !tcx.get_diagnostic_name(trait_def_id).is_some_and(|name| name.as_str() == "Error")
+            || !is_real_sysroot_crate(tcx, trait_def_id.krate)
+        {
             continue;
         }
         if tcx.item_name(method_def_id).as_str() != "source" {
@@ -6383,8 +9202,10 @@ pub(crate) fn stamp_errsource_devirt_total_calls<'tcx>(
                 break 'demote false;
             }
             let c_args = tcx.mk_args(&[concrete.into()]);
-            let Ok(Some(inst2)) =
-                ty::Instance::try_resolve(tcx, typing_env, method_def_id, c_args)
+            if crate::tuple_layouts::resolution_may_reenter(tcx, method_def_id, c_args) {
+                break 'demote false;
+            }
+            let Ok(Some(inst2)) = ty::Instance::try_resolve(tcx, typing_env, method_def_id, c_args)
             else {
                 break 'demote false;
             };
@@ -6393,7 +9214,7 @@ pub(crate) fn stamp_errsource_devirt_total_calls<'tcx>(
         if trace {
             eprintln!(
                 "[ERRSOURCE_DEVIRT] fn={} bb={} demotable={}",
-                tcx.def_path_str(mir_body.source.def_id()),
+                crate::safe_def_path_str(tcx, mir_body.source.def_id()),
                 bb.as_usize(),
                 demotable
             );
@@ -6446,7 +9267,7 @@ fn is_os_error_constructor(name: &str) -> bool {
 fn local_has_whole_local_assign_def(mir_body: &mir::Body<'_>, local: mir::Local) -> bool {
     mir_body.basic_blocks.iter().any(|bb| {
         bb.statements.iter().any(|stmt| {
-            matches!(&stmt.kind, mir::StatementKind::Assign(box (lhs, _))
+            matches!(&stmt.kind, mir::StatementKind::Assign((lhs, _))
                 if lhs.local == local && lhs.projection.is_empty())
         })
     })
@@ -6463,7 +9284,7 @@ fn local_has_whole_local_assign_def(mir_body: &mir::Body<'_>, local: mir::Local)
 /// FALSE PROVE (a Custom-variant `dyn Error::drop` can panic):
 ///  * a local in `aliased_locals` (`&mut`/raw-pointer aliased): a `Deref`-store through
 ///    the alias could reassign it to a Custom variant with NO whole-local def the trace
-///    can see (the SAME staleness gate `rewrite_range_contains_calls` uses);
+///    can see (the staleness gate the deleted `rewrite_range_contains_calls` used);
 ///  * a mixed `Assign` + terminator def (`local_has_terminator_def`): another CFG path
 ///    may define the local via a Custom-variant `Call`;
 ///  * >=2 whole-local `Assign` defs: `unique_whole_local_def` returns `None` (colliding
@@ -6479,7 +9300,7 @@ fn local_has_whole_local_assign_def(mir_body: &mir::Body<'_>, local: mir::Local)
 fn error_local_has_os_provenance<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
-    aliased_locals: &std::collections::HashSet<mir::Local>,
+    aliased_locals: &FxHashSet<mir::Local>,
     drop_local: mir::Local,
 ) -> bool {
     let mut local = drop_local;
@@ -6523,7 +9344,8 @@ fn error_local_has_os_provenance<'tcx>(
         {
             let sysroot_callee =
                 func.const_fn_def().is_some_and(|(did, _)| is_real_sysroot_crate(tcx, did.krate));
-            return sysroot_callee && is_os_error_constructor(&func_operand_name(tcx, func));
+            return sysroot_callee
+                && is_os_error_constructor(&func_operand_name_in_body(tcx, mir_body, func));
         }
         return false;
     }
@@ -6572,11 +9394,11 @@ fn error_local_has_os_provenance<'tcx>(
 /// `Deref`-store its whole-local def can't see, so a def-based value claim is STALE.
 fn mut_borrowed_or_address_taken_locals(
     mir_body: &mir::Body<'_>,
-) -> std::collections::HashSet<mir::Local> {
-    let mut set = std::collections::HashSet::new();
+) -> FxHashSet<mir::Local> {
+    let mut set = FxHashSet::default();
     for bb_data in mir_body.basic_blocks.iter() {
         for stmt in &bb_data.statements {
-            if let mir::StatementKind::Assign(box (_, rvalue)) = &stmt.kind {
+            if let mir::StatementKind::Assign((_, rvalue)) = &stmt.kind {
                 match rvalue {
                     mir::Rvalue::Ref(_, mir::BorrowKind::Mut { .. }, place)
                     | mir::Rvalue::RawPtr(_, place) => {
@@ -6597,7 +9419,7 @@ fn mut_borrowed_or_address_taken_locals(
 fn local_has_projected_write(mir_body: &mir::Body<'_>, local: mir::Local) -> bool {
     mir_body.basic_blocks.iter().any(|bb_data| {
         bb_data.statements.iter().any(|stmt| {
-            matches!(&stmt.kind, mir::StatementKind::Assign(box (lhs, _))
+            matches!(&stmt.kind, mir::StatementKind::Assign((lhs, _))
                 if lhs.local == local && !lhs.projection.is_empty())
         }) || matches!(&bb_data.terminator().kind, mir::TerminatorKind::Call { destination, .. }
             if destination.local == local && !destination.projection.is_empty())
@@ -6614,7 +9436,7 @@ fn unique_whole_local_assign_with_loc<'a, 'tcx>(
     let mut found = None;
     for (bb, bb_data) in mir_body.basic_blocks.iter_enumerated() {
         for (i, stmt) in bb_data.statements.iter().enumerate() {
-            if let mir::StatementKind::Assign(box (lhs, rvalue)) = &stmt.kind {
+            if let mir::StatementKind::Assign((lhs, rvalue)) = &stmt.kind {
                 if lhs.local == local && lhs.projection.is_empty() {
                     if found.is_some() {
                         return None;
@@ -6664,7 +9486,7 @@ enum SpawnUniqueDef<'a, 'tcx> {
 fn unique_unaliased_whole_def<'a, 'tcx>(
     mir_body: &'a mir::Body<'tcx>,
     local: mir::Local,
-    aliased: &std::collections::HashSet<mir::Local>,
+    aliased: &FxHashSet<mir::Local>,
 ) -> Option<SpawnUniqueDef<'a, 'tcx>> {
     if aliased.contains(&local) || local_has_projected_write(mir_body, local) {
         return None;
@@ -6747,7 +9569,7 @@ fn mentions_are_recognized_or_pointer_free_reads<'tcx>(
         let Some(stmt) = bb_data.statements.get(loc.statement_index) else {
             return false; // an unrecognized TERMINATOR use (call arg / drop / switch)
         };
-        let mir::StatementKind::Assign(box (lhs, rvalue)) = &stmt.kind else {
+        let mir::StatementKind::Assign((lhs, rvalue)) = &stmt.kind else {
             return false;
         };
         if lhs.local == local {
@@ -6778,14 +9600,16 @@ fn ty_is_pointer_free_scalar<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool 
     }
     match ty.ty_adt_def() {
         Some(adt) => {
+            if !is_real_sysroot_crate(tcx, adt.did().krate) {
+                return false;
+            }
             let path = crate::safe_def_path_str(tcx, adt.did());
-            let name_matches = path.starts_with("core::num::niche_types::")
+            path.starts_with("core::num::niche_types::")
                 || path.starts_with("std::num::niche_types::")
                 || matches!(
                     path.as_str(),
                     "alloc::collections::TryReserveError" | "std::collections::TryReserveError"
-                );
-            name_matches && is_real_sysroot_crate(tcx, adt.did().krate)
+                )
         }
         None => false,
     }
@@ -6800,7 +9624,7 @@ fn ty_is_pointer_free_scalar<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool 
 fn local_storage_directly_aliased(mir_body: &mir::Body<'_>, local: mir::Local) -> bool {
     mir_body.basic_blocks.iter().any(|bb_data| {
         bb_data.statements.iter().any(|stmt| {
-            let mir::StatementKind::Assign(box (_, rvalue)) = &stmt.kind else {
+            let mir::StatementKind::Assign((_, rvalue)) = &stmt.kind else {
                 return false;
             };
             let place = match rvalue {
@@ -6821,7 +9645,7 @@ fn local_storage_directly_aliased(mir_body: &mir::Body<'_>, local: mir::Local) -
 fn body_has_deref_store(mir_body: &mir::Body<'_>) -> bool {
     mir_body.basic_blocks.iter().any(|bb_data| {
         bb_data.statements.iter().any(|stmt| {
-            matches!(&stmt.kind, mir::StatementKind::Assign(box (lhs, _))
+            matches!(&stmt.kind, mir::StatementKind::Assign((lhs, _))
                 if lhs.projection.iter().any(|e| matches!(e, mir::PlaceElem::Deref)))
         }) || matches!(&bb_data.terminator().kind, mir::TerminatorKind::Call { destination, .. }
             if destination.projection.iter().any(|e| matches!(e, mir::PlaceElem::Deref)))
@@ -6836,9 +9660,9 @@ fn copy_nonoverlapping_intrinsics<'a, 'tcx>(
     let mut out = Vec::new();
     for (bb, bb_data) in mir_body.basic_blocks.iter_enumerated() {
         for (i, stmt) in bb_data.statements.iter().enumerate() {
-            if let mir::StatementKind::Intrinsic(
-                box mir::NonDivergingIntrinsic::CopyNonOverlapping(cno),
-            ) = &stmt.kind
+            if let mir::StatementKind::Intrinsic(mir::NonDivergingIntrinsic::CopyNonOverlapping(
+                cno,
+            )) = &stmt.kind
             {
                 out.push((mir::Location { block: bb, statement_index: i }, cno));
             }
@@ -6898,39 +9722,36 @@ fn is_builder_spawn_callee(name: &str) -> bool {
 /// nul-free `String`. The CALLER additionally type-gates the destination
 /// (`std String`) and the source (a compile-time nul-free `&str` literal).
 fn is_std_str_to_string_callee(name: &str) -> bool {
-    const STRING: [&str; 2] = ["std::string::String", "alloc::string::String"];
-    const CONVERT: [&str; 2] = ["std::convert", "core::convert"];
-    const TO_OWNED: [&str; 3] = [
-        "<str as std::borrow::ToOwned>::to_owned",
-        "<str as core::borrow::ToOwned>::to_owned",
-        "<str as alloc::borrow::ToOwned>::to_owned",
-    ];
-    const TO_STRING: [&str; 2] = [
-        "<str as std::string::ToString>::to_string",
-        "<str as alloc::string::ToString>::to_string",
-    ];
-    for convert in CONVERT {
-        for string in STRING {
-            if name == format!("<&str as {convert}::Into<{string}>>::into")
-                || name == format!("<{string} as {convert}::From<&str>>::from")
-            {
-                return true;
-            }
-        }
-    }
-    TO_OWNED.contains(&name) || TO_STRING.contains(&name)
+    matches!(
+        name,
+        "<&str as std::convert::Into<std::string::String>>::into"
+            | "<std::string::String as std::convert::From<&str>>::from"
+            | "<&str as std::convert::Into<alloc::string::String>>::into"
+            | "<alloc::string::String as std::convert::From<&str>>::from"
+            | "<&str as core::convert::Into<std::string::String>>::into"
+            | "<std::string::String as core::convert::From<&str>>::from"
+            | "<&str as core::convert::Into<alloc::string::String>>::into"
+            | "<alloc::string::String as core::convert::From<&str>>::from"
+            | "<str as std::borrow::ToOwned>::to_owned"
+            | "<str as core::borrow::ToOwned>::to_owned"
+            | "<str as alloc::borrow::ToOwned>::to_owned"
+            | "<str as std::string::ToString>::to_string"
+            | "<str as alloc::string::ToString>::to_string"
+    )
 }
 
 /// `true` IFF `ty` is the std `String` ADT.
 fn ty_is_std_string<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
     matches!(ty.ty_adt_def(), Some(adt) if !adt.did().is_local()
+        && tcx.item_name(adt.did()).as_str() == "String"
         && matches!(crate::safe_def_path_str(tcx, adt.did()).as_str(),
             "alloc::string::String" | "std::string::String"))
 }
 
 /// SOUNDNESS-CRITICAL (SPAWN-NAMESAFE). `true` IFF `arg` resolves to a compile-time
 /// `&str` constant whose bytes contain NO 0x00 — via a SPAWN-GRADE chain walk, NOT
-/// the ungated `trace_operand_to_const`. That helper's `unique_whole_local_def`
+/// the ungated `trace_operand_to_const` (deleted with the range-contains rewrite,
+/// EXTRACT-REWRITE-1). That helper's `unique_whole_local_def`
 /// counts ONLY `Assign`-statement defs and is BLIND to `Call`-destination defs, so a
 /// `&str` local with one `_s = const "good"` Assign on one branch PLUS a
 /// `_s = pick()` Call def on another (`let s = if c { "good" } else { pick() };`)
@@ -6947,9 +9768,9 @@ fn str_operand_is_nul_free<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
     arg: &mir::Operand<'tcx>,
-    aliased: &std::collections::HashSet<mir::Local>,
+    aliased: &FxHashSet<mir::Local>,
 ) -> bool {
-    if let mir::Operand::Constant(box c) = arg {
+    if let mir::Operand::Constant(c) = arg {
         return str_const_is_nul_free(tcx, c.const_);
     }
     let Some(mut local) = operand_whole_local(arg) else {
@@ -6967,7 +9788,7 @@ fn str_operand_is_nul_free<'tcx>(
             {
                 local = p.local;
             }
-            mir::Rvalue::Use(mir::Operand::Constant(box c), _) => {
+            mir::Rvalue::Use(mir::Operand::Constant(c), _) => {
                 return str_const_is_nul_free(tcx, c.const_);
             }
             _ => return false,
@@ -7010,7 +9831,7 @@ fn peel_ptr_chain<'a, 'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &'a mir::Body<'tcx>,
     op: &mir::Operand<'tcx>,
-    aliased: &std::collections::HashSet<mir::Local>,
+    aliased: &FxHashSet<mir::Local>,
 ) -> Option<PtrChain<'a, 'tcx>> {
     let mut local = operand_whole_local(op)?;
     let mut hops = Vec::new();
@@ -7056,7 +9877,7 @@ fn buf_operand_is_fresh_raw_vec<'tcx>(
     mir_body: &mir::Body<'tcx>,
     buf_op: &mir::Operand<'tcx>,
     vec_agg_loc: mir::Location,
-    aliased: &std::collections::HashSet<mir::Local>,
+    aliased: &FxHashSet<mir::Local>,
 ) -> bool {
     // `buf: move _rv` — the `RawVec { inner, _marker }` aggregate local.
     let Some(raw_vec_local) = operand_whole_local(buf_op) else {
@@ -7070,11 +9891,12 @@ fn buf_operand_is_fresh_raw_vec<'tcx>(
     if !local_mentions_match(mir_body, raw_vec_local, &[raw_vec_loc, vec_agg_loc]) {
         return false;
     }
-    let mir::Rvalue::Aggregate(box mir::AggregateKind::Adt(did, vidx, _, _, _), ops) = raw_vec_rv
+    let mir::Rvalue::Aggregate(mir::AggregateKind::Adt(did, vidx, _, _, _), ops) = raw_vec_rv
     else {
         return false;
     };
     if did.is_local()
+        || tcx.item_name(*did).as_str() != "RawVec"
         || !matches!(
             crate::safe_def_path_str(tcx, *did).as_str(),
             "alloc::raw_vec::RawVec" | "std::raw_vec::RawVec"
@@ -7125,7 +9947,7 @@ fn buf_operand_is_fresh_raw_vec<'tcx>(
     else {
         return false;
     };
-    let name = func_operand_name(tcx, func);
+    let name = func_operand_name_in_body(tcx, mir_body, func);
     let alloc_ok = [
         "alloc::raw_vec::RawVecInner::try_allocate_in",
         "std::raw_vec::RawVecInner::try_allocate_in",
@@ -7163,7 +9985,7 @@ fn inlined_string_vec_is_nul_free_literal<'tcx>(
     mir_body: &mir::Body<'tcx>,
     string_agg_loc: mir::Location,
     vec_operand: &mir::Operand<'tcx>,
-    aliased: &std::collections::HashSet<mir::Local>,
+    aliased: &FxHashSet<mir::Local>,
 ) -> bool {
     // NO copy-peel for the Vec local: the mention multiset below must see every use,
     // so the String aggregate's operand must BE the Vec local.
@@ -7179,12 +10001,13 @@ fn inlined_string_vec_is_nul_free_literal<'tcx>(
     else {
         return false;
     };
-    let mir::Rvalue::Aggregate(box mir::AggregateKind::Adt(vec_did, vec_vidx, _, _, _), vec_ops) =
+    let mir::Rvalue::Aggregate(mir::AggregateKind::Adt(vec_did, vec_vidx, _, _, _), vec_ops) =
         vec_rv
     else {
         return false;
     };
     if vec_did.is_local()
+        || tcx.item_name(*vec_did).as_str() != "Vec"
         || !matches!(
             crate::safe_def_path_str(tcx, *vec_did).as_str(),
             "alloc::vec::Vec" | "std::vec::Vec"
@@ -7212,7 +10035,7 @@ fn inlined_string_vec_is_nul_free_literal<'tcx>(
     let mut len_store: Option<(mir::Location, mir::Local)> = None;
     for (bb, bb_data) in mir_body.basic_blocks.iter_enumerated() {
         for (i, stmt) in bb_data.statements.iter().enumerate() {
-            let mir::StatementKind::Assign(box (lhs, rv)) = &stmt.kind else {
+            let mir::StatementKind::Assign((lhs, rv)) = &stmt.kind else {
                 continue;
             };
             if lhs.local != vec_local || lhs.projection.is_empty() {
@@ -7274,8 +10097,7 @@ fn inlined_string_vec_is_nul_free_literal<'tcx>(
     let Some((_, lit_rv)) = unique_whole_local_assign_with_loc(mir_body, lit_local) else {
         return false;
     };
-    let mir::Rvalue::Cast(mir::CastKind::Transmute, mir::Operand::Constant(box lit_const), _) =
-        lit_rv
+    let mir::Rvalue::Cast(mir::CastKind::Transmute, mir::Operand::Constant(lit_const), _) = lit_rv
     else {
         return false;
     };
@@ -7380,7 +10202,7 @@ fn name_string_operand_is_nul_free<'tcx>(
     mir_body: &mir::Body<'tcx>,
     op: &mir::Operand<'tcx>,
     use_loc: mir::Location,
-    aliased: &std::collections::HashSet<mir::Local>,
+    aliased: &FxHashSet<mir::Local>,
 ) -> bool {
     let Some(string_local) = operand_whole_local(op) else {
         return false;
@@ -7392,7 +10214,7 @@ fn name_string_operand_is_nul_free<'tcx>(
         )) => {
             local_mentions_match(mir_body, string_local, &[def_loc, use_loc])
                 && ty_is_std_string(tcx, destination.ty(&mir_body.local_decls, tcx).ty)
-                && is_std_str_to_string_callee(&func_operand_name(tcx, func))
+                && is_std_str_to_string_callee(&func_operand_name_in_body(tcx, mir_body, func))
                 && args
                     .first()
                     .is_some_and(|a| str_operand_is_nul_free(tcx, mir_body, &a.node, aliased))
@@ -7401,11 +10223,11 @@ fn name_string_operand_is_nul_free<'tcx>(
             if !local_mentions_match(mir_body, string_local, &[def_loc, use_loc]) {
                 return false;
             }
-            let mir::Rvalue::Aggregate(box mir::AggregateKind::Adt(did, _, _, _, _), ops) = rv
-            else {
+            let mir::Rvalue::Aggregate(mir::AggregateKind::Adt(did, _, _, _, _), ops) = rv else {
                 return false;
             };
             if did.is_local()
+                || tcx.item_name(*did).as_str() != "String"
                 || !matches!(
                     crate::safe_def_path_str(tcx, *did).as_str(),
                     "alloc::string::String" | "std::string::String"
@@ -7437,7 +10259,7 @@ fn option_string_operand_is_namesafe<'tcx>(
     mir_body: &mir::Body<'tcx>,
     op: &mir::Operand<'tcx>,
     use_loc: mir::Location,
-    aliased: &std::collections::HashSet<mir::Local>,
+    aliased: &FxHashSet<mir::Local>,
 ) -> bool {
     let Some(option_local) = operand_whole_local(op) else {
         return false;
@@ -7450,10 +10272,11 @@ fn option_string_operand_is_namesafe<'tcx>(
     if !local_mentions_match(mir_body, option_local, &[def_loc, use_loc]) {
         return false;
     }
-    let mir::Rvalue::Aggregate(box mir::AggregateKind::Adt(did, vidx, _, _, _), ops) = rv else {
+    let mir::Rvalue::Aggregate(mir::AggregateKind::Adt(did, vidx, _, _, _), ops) = rv else {
         return false;
     };
     if did.is_local()
+        || tcx.item_name(*did).as_str() != "Option"
         || !matches!(
             crate::safe_def_path_str(tcx, *did).as_str(),
             "core::option::Option" | "std::option::Option"
@@ -7491,7 +10314,7 @@ fn spawn_receiver_is_namesafe<'tcx>(
     mir_body: &mir::Body<'tcx>,
     receiver: &mir::Operand<'tcx>,
     spawn_loc: mir::Location,
-    aliased: &std::collections::HashSet<mir::Local>,
+    aliased: &FxHashSet<mir::Local>,
 ) -> bool {
     let Some(builder_local) = operand_whole_local(receiver) else {
         return false;
@@ -7501,7 +10324,7 @@ fn spawn_receiver_is_namesafe<'tcx>(
             if !local_mentions_match(mir_body, builder_local, &[def_loc, spawn_loc]) {
                 return false;
             }
-            let name = func_operand_name(tcx, func);
+            let name = func_operand_name_in_body(tcx, mir_body, func);
             if name == "std::thread::Builder::new" {
                 return true; // `Builder { name: None, … }` by construction
             }
@@ -7517,11 +10340,12 @@ fn spawn_receiver_is_namesafe<'tcx>(
             if !local_mentions_match(mir_body, builder_local, &[def_loc, spawn_loc]) {
                 return false;
             }
-            let mir::Rvalue::Aggregate(box mir::AggregateKind::Adt(did, vidx, _, _, _), ops) = rv
+            let mir::Rvalue::Aggregate(mir::AggregateKind::Adt(did, vidx, _, _, _), ops) = rv
             else {
                 return false;
             };
             if did.is_local()
+                || tcx.item_name(*did).as_str() != "Builder"
                 || crate::safe_def_path_str(tcx, *did).as_str() != "std::thread::Builder"
             {
                 return false;
@@ -7563,12 +10387,20 @@ pub(crate) fn mark_spawn_namesafe_calls<'tcx>(
     mir_body: &mir::Body<'tcx>,
     vbody: &mut VerifiableBody,
 ) {
-    let aliased = mut_borrowed_or_address_taken_locals(mir_body);
+    let mut aliased: Option<FxHashSet<mir::Local>> = None;
     for (bb, bb_data) in mir_body.basic_blocks.iter_enumerated() {
         let mir::TerminatorKind::Call { func, args, .. } = &bb_data.terminator().kind else {
             continue;
         };
-        let name = func_operand_name(tcx, func);
+        if !vbody.blocks.get(bb.as_usize()).is_some_and(|block| {
+            matches!(
+                &block.terminator,
+                Terminator::Call { func: lowered, .. } if is_builder_spawn_callee(lowered)
+            )
+        }) {
+            continue;
+        }
+        let name = func_operand_name_in_body(tcx, mir_body, func);
         if !is_builder_spawn_callee(&name) {
             continue;
         }
@@ -7577,7 +10409,8 @@ pub(crate) fn mark_spawn_namesafe_calls<'tcx>(
             continue;
         };
         let spawn_loc = mir::Location { block: bb, statement_index: bb_data.statements.len() };
-        if !spawn_receiver_is_namesafe(tcx, mir_body, &receiver.node, spawn_loc, &aliased) {
+        let aliased = aliased.get_or_insert_with(|| mut_borrowed_or_address_taken_locals(mir_body));
+        if !spawn_receiver_is_namesafe(tcx, mir_body, &receiver.node, spawn_loc, aliased) {
             continue; // fail closed — keep the absent-callee panic obligation
         }
         // Stamp the marker onto the LOWERED call. The exact-name re-check keeps the
@@ -7663,6 +10496,79 @@ impl CertifiedPairedCondvarWaitCallSite {
     }
 }
 
+/// The EXACT callee predicate by which the paired-condvar collector recognizes
+/// a candidate wait site, shared by its pre-scan and its site loop so the two
+/// cannot drift.
+///
+/// Answers the callee `DefId` iff `kind` is a `Call` whose callee operand is a
+/// constant `FnDef` that (1) is NOT local, (2) the certificate's pre-transform
+/// sweep inventoried (`_wait_callee_defs`, written only by
+/// `record_paired_body_inventory` for a genuine non-local wait it licensed),
+/// and (3) renders as exactly `std::sync::Condvar::wait` (never
+/// `wait_timeout`/`wait_while`). These are the collector's original first four
+/// conjuncts, unchanged; every conjunct is pure, so the cheap DefId-key probe
+/// runs before the path rendering and a body of ordinary calls costs one hash
+/// probe per call. An indirect call (`Operand::Copy`/`Move` of a fn pointer)
+/// has no `FnDef` constant and is declined here exactly as the loop declined
+/// it: the certificate licenses direct calls only.
+fn certified_std_condvar_wait_callee<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    certificate: &crate::PairedCondvarCrateCertificate,
+    kind: &mir::TerminatorKind<'tcx>,
+) -> Option<DefId> {
+    let mir::TerminatorKind::Call { func, .. } = kind else {
+        return None;
+    };
+    // Callee identity by DefId, never by rendered name: exactly the
+    // non-local `std::sync::Condvar::wait` (NOT wait_timeout/wait_while).
+    let mir::Operand::Constant(const_op) = func else {
+        return None;
+    };
+    let rustc_middle::ty::TyKind::FnDef(callee_def_id, _) = const_op.const_.ty().kind() else {
+        return None;
+    };
+    if callee_def_id.is_local()
+        || !certificate._wait_callee_defs.contains(&crate::paired_def_key(tcx, *callee_def_id))
+        || crate::safe_def_path_str(tcx, *callee_def_id) != "std::sync::Condvar::wait"
+    {
+        return None;
+    }
+    Some(*callee_def_id)
+}
+
+/// PRE-SCAN for `collect_certified_paired_condvar_wait_calls`: `true` iff at
+/// least one terminator of `mir_body` passes `certified_std_condvar_wait_callee`.
+///
+/// EXACT, not heuristic. The collector's site loop iterates precisely
+/// `mir_body.basic_blocks` — the same rustc MIR this walks, never a closure,
+/// promoted or callee body (a promoted is excluded outright by its
+/// `_promoted.is_none()` owner check) — and a terminator that fails the shared
+/// predicate is `continue`d before any further test. The extraction the
+/// collector performs afterwards is consulted only to VETO a candidate (the
+/// lowered block at the same index must carry the same callee string) and to
+/// digest the body; it can never add a candidate the rustc MIR lacks. So a
+/// body this declines yields the empty site list from the full path, and the
+/// collector may skip that path's extraction and digest outright.
+///
+/// MEASURED 2026-09-17 (ay 0.27.0 gate, `ay_core` lib-test, macOS `sample`,
+/// 3146 samples): 23% of the unit's verify time was this collector
+/// re-extracting every bundled member (`extract_function_with_purpose` ->
+/// `convert_ty_in_env`, 354 samples) and JSON-serialising + SHA-256'ing each
+/// one (`paired_condvar_body_digest`, 271 samples) for a crate with no
+/// `Condvar::wait` call at all. An empty inventory can satisfy no `contains`,
+/// so that case skips even the block walk.
+pub(crate) fn mir_body_calls_certified_std_condvar_wait<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir_body: &mir::Body<'tcx>,
+    certificate: &crate::PairedCondvarCrateCertificate,
+) -> bool {
+    !certificate._wait_callee_defs.is_empty()
+        && mir_body.basic_blocks.iter().any(|bb_data| {
+            certified_std_condvar_wait_callee(tcx, certificate, &bb_data.terminator().kind)
+                .is_some()
+        })
+}
+
 /// SOUNDNESS-CRITICAL post-pass (PAIRED-CONDVAR). Collect every lowered
 /// `std::sync::Condvar::wait` call whose receiver is a shared borrow `&(*B).c`
 /// of a field `c` carrying a whole-crate PAIRING
@@ -7703,17 +10609,21 @@ impl CertifiedPairedCondvarWaitCallSite {
 /// driver, which owns the crate certificate state. It deliberately does not
 /// mutate `function.body`: suffix markers are source-forgeable and have no
 /// authority.
+///
+/// COST. Every gate that decides the empty result WITHOUT the extraction — the
+/// certificate/session checks and the exact MIR pre-scan
+/// (`mir_body_calls_certified_std_condvar_wait`) — runs before it, and the
+/// extracted body's digest is computed on the first minted site only. A body
+/// with no candidate wait call therefore costs one hash probe per call
+/// terminator. The site set, each site's block/callee/digest, and every early
+/// answer are byte-identical to the eager form: each gate is a conjunct the
+/// eager form also tested, the reordered work is pure, and the digest is a
+/// function of the immutable extraction alone.
 pub fn collect_certified_paired_condvar_wait_calls<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
     certificate: &crate::PairedCondvarCrateCertificate,
 ) -> Vec<CertifiedPairedCondvarWaitCallSite> {
-    // Never accept a caller-supplied public IR view. Freshly extract the entire
-    // current rustc body and bind every capability to its exact digest.
-    let function = crate::extract_function_with_contract_bundle(tcx, mir_body, None);
-    let Some(body_digest) = crate::paired_condvar_body_digest(&function.body) else {
-        return Vec::new();
-    };
     // A token from another compiler Session confers nothing. The private
     // session/certificate Arc identities already bind this non-serializable
     // capability to the current immutable TyCtxt invocation; querying the
@@ -7725,7 +10635,6 @@ pub fn collect_certified_paired_condvar_wait_calls<'tcx>(
     if !std::sync::Arc::ptr_eq(&certificate.session_seal, &current_session_seal)
         || certificate.stable_crate_id != tcx.stable_crate_id(LOCAL_CRATE).as_u64()
         || certificate.pairs.is_empty()
-        || function.def_path != crate::safe_def_path_str(tcx, owner)
         || !certificate
             ._inspected_bodies
             .iter()
@@ -7733,24 +10642,36 @@ pub fn collect_certified_paired_condvar_wait_calls<'tcx>(
     {
         return Vec::new();
     }
+    // Exact pre-scan of the same rustc MIR the loop below walks: no candidate
+    // terminator, no site — and no extraction or digest to pay for.
+    if !mir_body_calls_certified_std_condvar_wait(tcx, mir_body, certificate) {
+        return Vec::new();
+    }
+    // Never accept a caller-supplied public IR view. Freshly extract the entire
+    // current rustc body and bind every capability to its exact digest.
+    let function = crate::extract_function_with_contract_bundle(tcx, mir_body, None);
+    if function.def_path != crate::safe_def_path_str(tcx, owner) {
+        return Vec::new();
+    }
+    // Digest of that extraction, computed on the FIRST minted site only. It is
+    // a pure function of `function.body`, which nothing below mutates, so a
+    // body that mints no site never needed it; a body whose digest cannot be
+    // computed mints nothing, exactly as the eager form answered empty.
+    let mut body_digest: Option<String> = None;
     let mut sites = Vec::new();
     let aliased = mut_borrowed_or_address_taken_locals(mir_body);
     for (bb, bb_data) in mir_body.basic_blocks.iter_enumerated() {
-        let mir::TerminatorKind::Call { func, args, .. } = &bb_data.terminator().kind else {
+        let terminator = bb_data.terminator();
+        let mir::TerminatorKind::Call { func, args, .. } = &terminator.kind else {
             continue;
         };
-        // Callee identity by DefId, never by rendered name: exactly the
-        // non-local `std::sync::Condvar::wait` (NOT wait_timeout/wait_while).
-        let mir::Operand::Constant(box const_op) = func else { continue };
-        let rustc_middle::ty::TyKind::FnDef(callee_def_id, _) = const_op.const_.ty().kind() else {
+        // The SAME callee predicate the pre-scan applied: the non-local,
+        // inventoried `std::sync::Condvar::wait`, by DefId.
+        let Some(callee_def_id) =
+            certified_std_condvar_wait_callee(tcx, certificate, &terminator.kind)
+        else {
             continue;
         };
-        if callee_def_id.is_local()
-            || crate::safe_def_path_str(tcx, *callee_def_id) != "std::sync::Condvar::wait"
-            || !certificate._wait_callee_defs.contains(&crate::paired_def_key(tcx, *callee_def_id))
-        {
-            continue;
-        }
         if args.len() != 2 {
             continue;
         }
@@ -7813,7 +10734,7 @@ pub fn collect_certified_paired_condvar_wait_calls<'tcx>(
             else {
                 return false;
             };
-            let field_ty = field.ty(tcx, adt_args).skip_normalization();
+            let field_ty = field.ty(tcx, *adt_args).skip_normalization();
             let rustc_middle::ty::TyKind::Adt(field_adt, _) = field_ty.kind() else {
                 return false;
             };
@@ -7831,7 +10752,7 @@ pub fn collect_certified_paired_condvar_wait_calls<'tcx>(
         // `skip_normalization` matches the candidate computation's field-type
         // vetting (`compute_sealed_backing_structs` idiom): S is a local
         // concrete struct, so its condvar field type needs no normalization.
-        let field_ty = field.ty(tcx, adt_args).skip_normalization();
+        let field_ty = field.ty(tcx, *adt_args).skip_normalization();
         let rustc_middle::ty::TyKind::Adt(field_adt, _) = field_ty.kind() else {
             continue;
         };
@@ -7846,7 +10767,7 @@ pub fn collect_certified_paired_condvar_wait_calls<'tcx>(
         // Bind the TyCtxt-authenticated call to the exact lowered block and
         // callee spelling. A stale/reordered or independently fabricated
         // VerifiableBody cannot acquire a sidecar entry.
-        let name = func_operand_name(tcx, func);
+        let name = func_operand_name_in_body(tcx, mir_body, func);
         let Some(block) = function.body.blocks.get(bb.as_usize()) else {
             continue;
         };
@@ -7861,7 +10782,7 @@ pub fn collect_certified_paired_condvar_wait_calls<'tcx>(
         }
         let receiver_place = format!("{:?}", args[0].node);
         let guard_place = format!("{:?}", args[1].node);
-        let callee_key = crate::paired_def_key(tcx, *callee_def_id);
+        let callee_key = crate::paired_def_key(tcx, callee_def_id);
         let mut licenses = certificate._licensed_wait_sites.iter().filter(|license| {
             license.matches_current_identity(
                 owner_key,
@@ -7884,12 +10805,21 @@ pub fn collect_certified_paired_condvar_wait_calls<'tcx>(
         if licenses.next().is_some() {
             continue;
         }
+        let site_body_digest = if let Some(digest) = &body_digest {
+            digest.clone()
+        } else {
+            let Some(digest) = crate::paired_condvar_body_digest(&function.body) else {
+                return Vec::new();
+            };
+            body_digest = Some(digest.clone());
+            digest
+        };
         sites.push(CertifiedPairedCondvarWaitCallSite {
             session_seal: std::sync::Arc::clone(&certificate.session_seal),
             certificate_seal: std::sync::Arc::clone(&certificate.certificate_seal),
             stable_crate_id: certificate.stable_crate_id,
             function_def_path: function.def_path.clone(),
-            body_digest: body_digest.clone(),
+            body_digest: site_body_digest,
             block: block.id,
             callee: name,
             receiver_place,
@@ -7914,7 +10844,7 @@ pub fn collect_certified_paired_condvar_wait_calls<'tcx>(
 /// Blessing a Custom-variant drop here would be a FALSE PROVE (its boxed
 /// `dyn Error::drop` can panic). Mirrors `discharge_provably_safe_pointer_asserts`'
 /// post-pass terminator rewrite; the value-preserving trace + `&mut`/RawPtr staleness
-/// gate mirror `alloc_call_box_facts` / `rewrite_range_contains_calls`.
+/// gate mirror `alloc_call_box_facts` (and the deleted `rewrite_range_contains_calls`).
 pub(crate) fn discharge_os_provenance_error_drops<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
@@ -7922,13 +10852,13 @@ pub(crate) fn discharge_os_provenance_error_drops<'tcx>(
 ) {
     let typing_env = mir_body.typing_env(tcx);
 
-    // &mut/RawPtr staleness precompute (mirrors `rewrite_range_contains_calls`): every
+    // &mut/RawPtr staleness precompute (as the deleted `rewrite_range_contains_calls` had): every
     // local mutably borrowed (`Ref{mutable}`) or address-taken (`RawPtr`, const OR mut)
     // ANYWHERE in the body. Such a local can be mutated in place via a `Deref`-store the
     // whole-local-def trace cannot see, so its provenance is not fixed by its def.
     // Factored into `mut_borrowed_or_address_taken_locals` — the SAME predicate now also
     // backs the SPAWN-NAMESAFE trace, so the two gates can never drift.
-    let aliased_locals = mut_borrowed_or_address_taken_locals(mir_body);
+    let mut aliased_locals: Option<FxHashSet<mir::Local>> = None;
 
     for (bb, bb_data) in mir_body.basic_blocks.iter_enumerated() {
         let mir::TerminatorKind::Drop { place, target, .. } = &bb_data.terminator().kind else {
@@ -7945,12 +10875,15 @@ pub(crate) fn discharge_os_provenance_error_drops<'tcx>(
         // SOUNDNESS (crate-name forgery): `is_io_error_ty_name` matches a `std::…::io::…::Error`
         // NAME; bind the type's defining crate scid to the real sysroot so a forged
         // `std::io::Error` (with an arbitrary panicking `Drop`) is not a discharge candidate.
-        if !is_io_error_ty_name(&crate::safe_def_path_str(tcx, adt_def.did()))
-            || !is_real_sysroot_crate(tcx, adt_def.did().krate)
+        if !is_real_sysroot_crate(tcx, adt_def.did().krate)
+            || tcx.item_name(adt_def.did()).as_str() != "Error"
+            || !is_io_error_ty_name(&crate::safe_def_path_str(tcx, adt_def.did()))
         {
             continue;
         }
-        if !error_local_has_os_provenance(tcx, mir_body, &aliased_locals, place.local) {
+        let aliased_locals =
+            aliased_locals.get_or_insert_with(|| mut_borrowed_or_address_taken_locals(mir_body));
+        if !error_local_has_os_provenance(tcx, mir_body, aliased_locals, place.local) {
             continue;
         }
         // PROVEN Os-provenance: the drop glue is total. Replace the `Drop` with the plain
@@ -8066,6 +10999,9 @@ fn convert_place<'tcx>(
     place: &mir::Place<'tcx>,
     typing_env: Option<ty::TypingEnv<'tcx>>,
 ) -> Place {
+    if place.projection.is_empty() {
+        return Place { local: place.local.as_usize(), projections: Vec::new() };
+    }
     let projections: Vec<Projection> = place
         .projection
         .iter()
@@ -8073,6 +11009,9 @@ fn convert_place<'tcx>(
             mir::PlaceElem::Field(field, _) => Projection::Field(field.as_usize()),
             mir::PlaceElem::Index(local) => Projection::Index(local.as_usize()),
             mir::PlaceElem::Deref => Projection::Deref,
+            // Upstream 1.101: a borrowck phantom dereference is an indirect
+            // access of the same type; model it as a deref (conservative).
+            mir::PlaceElem::PhantomDeref => Projection::Deref,
             mir::PlaceElem::Downcast(_, variant) => Projection::Downcast(variant.as_usize()),
             // Trust: M6 rung-7 sweep — `OpaqueCast`/`UnwrapUnsafeBinder` exist
             // specifically to reveal a place's type through an alias/opaque
@@ -8147,43 +11086,2014 @@ fn convert_assert_message<'tcx>(
 /// for a still-generic element (a generic fn the verifier checks polymorphically) or a
 /// layout error — the caller then carries no size token and vcgen falls back to the
 /// turbofish parse / count-only ceiling.
+///
+/// Trust (2026-09-25): `Iterator::collect::<B>` is the EXCEPTION to "the first type
+/// argument is the element". Its arguments are `[Self = I, B]`, so the first one is
+/// the ITERATOR, and the token carried the iterator's size — measured `@16` for
+/// `slice::Iter<'_, ()>` collected into `Vec<()>`, whose element is zero bytes. An
+/// iterator smaller than its item under-states the stride: `(0..n.min(1 << 23))
+/// .map(|_| [0u8; 1 << 40]).collect::<Vec<_>>()` was charged `16 * n` bytes while it
+/// asks for `2^63`, and panics "capacity overflow". The element of a collect is the
+/// DESTINATION's element ([`collect_destination_element_ty`]); a destination this
+/// cannot read carries no token (count ceiling only), never the iterator's size.
+///
+/// Trust (W4 HASHMAP r2, 2026-09-27): the same exception, and for the same reason,
+/// for the other TRAIT-method sinks whose first type argument is not the element:
+/// nightly `Iterator::collect_into::<E>` (`[Self = I, E]`: the destination is `E`),
+/// and `FromIterator::from_iter` / `Extend::extend_reserve` (`[Self = the collection,
+/// ..]`: the element is the collection's). `<Vec<[u8; 1 << 45]> as FromIterator<_>>
+/// ::from_iter(..)` was stamped with `layout_of(Vec<_>)` = 24 bytes. Which of the
+/// three a callee is comes from its TRAIT's identity ([`bulk_alloc_trait_role`]),
+/// never from the rendered name.
 fn bulk_alloc_elem_byte_size<'tcx>(
     tcx: TyCtxt<'tcx>,
-    generic_args: ty::GenericArgsRef<'tcx>,
+    def_id: DefId,
+    generic_args: ty::GenericArgs<'tcx>,
 ) -> Option<u64> {
-    let elem_ty = generic_args.types().next()?;
-    if elem_ty.has_non_region_param() {
-        return None; // generic element — size is instantiation-dependent
+    let elem_ty = match bulk_alloc_trait_role(tcx, def_id) {
+        Some(BulkAllocTraitRole::IteratorDestination) => {
+            collect_destination_element_ty(tcx, generic_args.types().nth(1)?, 4)?
+        }
+        Some(BulkAllocTraitRole::SelfCollection) => {
+            collect_destination_element_ty(tcx, generic_args.types().next()?, 4)?
+        }
+        // `unzip` fills TWO collections; it is sized only when one is a hash table
+        // (`std_hash_table_sink_element_bytes`), exactly as before otherwise.
+        Some(BulkAllocTraitRole::UnzipHalves) => return None,
+        None if tcx.item_name(def_id).as_str() == "from_iter" => {
+            // Trust (2026-10-06, review round 53): an IMPL's `from_iter` (the role
+            // above reads only the trait item) builds `Self`, and its first type
+            // argument is the impl's first parameter (`K` of `HashMap<K, V, S>`), not
+            // the element. The token read `size_of::<Vec<T>>()` = 24 for every `Vec`,
+            // so the bounded-source grant compared the wrong size. Read `Self`'s
+            // element as `collect` does; any other spelling declines (no token, so
+            // the sink keeps its charge).
+            let impl_did = tcx.trait_impl_of_assoc(def_id)?;
+            let trait_did =
+                tcx.impl_trait_ref(impl_did).instantiate_identity().skip_normalization().def_id;
+            if !tcx.is_diagnostic_item(rustc_span::sym::FromIterator, trait_did) {
+                return None;
+            }
+            let impl_args = generic_args.truncate_to(tcx, tcx.generics_of(impl_did));
+            let self_ty = tcx.type_of(impl_did).instantiate(tcx, impl_args).skip_normalization();
+            collect_destination_element_ty(tcx, self_ty, 4)?
+        }
+        None => generic_args.types().next()?,
+    };
+    exact_layout_bytes(tcx, elem_ty)
+}
+
+/// The exact `tcx.layout_of` size of a concrete type; `None` for a still-generic
+/// type (its size is instantiation-dependent) or a layout error.
+fn exact_layout_bytes<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<u64> {
+    if ty.has_non_region_param() {
+        return None;
     }
+    let ty = tcx.erase_and_anonymize_regions(ty);
     let typing_env = ty::TypingEnv::fully_monomorphized();
-    tcx.layout_of(typing_env.as_query_input(elem_ty)).ok().map(|l| l.size.bytes())
+    crate::tuple_layouts::extractor_layout_of(tcx, typing_env, ty).map(|l| l.size.bytes())
+}
+
+/// Trust (W4 HASHMAP r2, 2026-09-27): which of its generic arguments a TRAIT-method
+/// bulk-allocation sink allocates for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BulkAllocTraitRole {
+    /// `Iterator::collect::<B>` / `Iterator::collect_into::<E>`: the destination is
+    /// the second type argument.
+    IteratorDestination,
+    /// `FromIterator::from_iter` / `Extend::extend` / `Extend::extend_reserve`: the
+    /// destination is `Self`, the first type argument.
+    SelfCollection,
+    /// `Iterator::unzip::<A, B, FromA, FromB>`: `FromA` and `FromB` (core's tuple
+    /// `Extend` reserves `size_hint().0` in both).
+    UnzipHalves,
+}
+
+/// Classify a bulk-allocation TRAIT method by its trait's IDENTITY: `Iterator` and
+/// `FromIterator` by their diagnostic items, `Extend` (which has none) as the trait
+/// of that name declared in the same module as `FromIterator`, all in an
+/// artifact-authenticated sysroot crate. `None` for anything else, including every
+/// inherent method and every user trait.
+fn bulk_alloc_trait_role(tcx: TyCtxt<'_>, def_id: DefId) -> Option<BulkAllocTraitRole> {
+    // Cheapest test first: this runs for every direct call the extractor names.
+    let item = tcx.opt_item_name(def_id)?;
+    if !matches!(
+        item.as_str(),
+        "collect" | "collect_into" | "unzip" | "from_iter" | "extend" | "extend_reserve"
+    ) {
+        return None;
+    }
+    let trait_did = tcx.trait_of_assoc(def_id)?;
+    if !is_real_sysroot_crate(tcx, trait_did.krate) {
+        return None;
+    }
+    if tcx.is_diagnostic_item(rustc_span::sym::Iterator, trait_did) {
+        return match item.as_str() {
+            "collect" | "collect_into" => Some(BulkAllocTraitRole::IteratorDestination),
+            "unzip" => Some(BulkAllocTraitRole::UnzipHalves),
+            _ => None,
+        };
+    }
+    if tcx.is_diagnostic_item(rustc_span::sym::FromIterator, trait_did) {
+        return (item.as_str() == "from_iter").then_some(BulkAllocTraitRole::SelfCollection);
+    }
+    let is_std_extend = tcx.item_name(trait_did).as_str() == "Extend"
+        && tcx
+            .get_diagnostic_item(rustc_span::sym::FromIterator)
+            .is_some_and(|from_iter| tcx.opt_parent(from_iter) == tcx.opt_parent(trait_did));
+    (is_std_extend && matches!(item.as_str(), "extend" | "extend_reserve"))
+        .then_some(BulkAllocTraitRole::SelfCollection)
+}
+
+/// Trust (W4 HASHMAP r2, 2026-09-27): `Some(element bytes)` iff this bulk-allocation
+/// call allocates a STD HASH TABLE (`std::collections::HashMap`/`HashSet`, by their
+/// diagnostic items in the artifact-authenticated `std`) — `Some(None)` when it does
+/// but the element layout is unknown (a still-generic element, a layout error).
+///
+/// hashbrown does not allocate `count * size_of::<T>()`: it rounds the requested
+/// capacity up to a power-of-two BUCKET count (about `count * 8 / 7`; at least 4, 8
+/// or 16) and adds a control byte per bucket, and panics "Hash table capacity
+/// overflow" when that layout passes `isize::MAX`. The call is stamped with the
+/// hash-table token ([`trust_types::render_trailing_table_elem_bytes_token`]) so vcgen
+/// charges the bucket layout, and an unknown element fails closed there. MEASURED on
+/// the redo's r1 (`9eadf44e0`): `HashSet::<[u8; 1 << 50]>::with_capacity(4097)` —
+/// `4097 * 2^50 < isize::MAX`, so the constant skip fired, but 8192 buckets are
+/// `2^63` bytes — and `HashMap::<u8, [u8; 1 << 50]>::with_capacity(n)`, stamped
+/// `@1` from `K` alone, both built rc=0 and panicked.
+///
+/// Recognized, each by identity (the callee's own DefId, its trait, and the
+/// monomorphized types — never a rendering):
+///  * an INHERENT allocating method of std's `HashMap`/`HashSet`
+///    (`with_capacity`, `with_capacity_in`, `with_capacity_and_hasher`,
+///    `with_capacity_and_hasher_in`, `reserve`): the element is that table's
+///    (`(K, V)` / `T`), NEVER the first type argument (`K`);
+///  * a trait sink ([`bulk_alloc_trait_role`]) whose destination — through
+///    `Option`/`Result` and tuples — holds a std hash table: `collect`,
+///    `collect_into`, `from_iter`, `extend`, `extend_reserve`, `unzip`. A tuple
+///    destination is charged at the LARGEST element of the std collections it
+///    holds (the hash-table bound at the largest stride fires no later than any
+///    component's own bound).
+///
+/// Every other call answers `None` and keeps exactly its pre-existing stamping.
+fn std_hash_table_sink_element_bytes<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    generic_args: ty::GenericArgs<'tcx>,
+) -> Option<Option<u64>> {
+    let destinations: Vec<ty::Ty<'tcx>> = match bulk_alloc_trait_role(tcx, def_id) {
+        Some(role) => {
+            let types: Vec<ty::Ty<'tcx>> = generic_args.types().collect();
+            match role {
+                BulkAllocTraitRole::IteratorDestination => vec![*types.get(1)?],
+                BulkAllocTraitRole::SelfCollection => vec![*types.first()?],
+                BulkAllocTraitRole::UnzipHalves => vec![*types.get(3)?, *types.get(4)?],
+            }
+        }
+        None => vec![std_hash_table_inherent_alloc_self_ty(tcx, def_id, generic_args)?],
+    };
+    let stride = combine_alloc_destinations(
+        destinations.into_iter().filter_map(|dest| alloc_destination_stride(tcx, dest, 4)),
+    )?;
+    stride.hash_table.then_some(stride.bytes)
+}
+
+/// The `Self` type of an inherent ALLOCATING method of std's `HashMap`/`HashSet`
+/// (`HashMap::<K, V, S>::with_capacity_and_hasher`, ...), instantiated at the call's
+/// arguments; `None` for every other callee.
+fn std_hash_table_inherent_alloc_self_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    generic_args: ty::GenericArgs<'tcx>,
+) -> Option<ty::Ty<'tcx>> {
+    // Cheapest test first: this runs for every direct call the extractor names.
+    if !tcx.opt_item_name(def_id).is_some_and(|item| {
+        matches!(
+            item.as_str(),
+            "with_capacity"
+                | "with_capacity_in"
+                | "with_capacity_and_hasher"
+                | "with_capacity_and_hasher_in"
+                | "reserve"
+                | "reserve_exact"
+        )
+    }) || !is_real_sysroot_crate(tcx, def_id.krate)
+    {
+        return None;
+    }
+    let impl_did = tcx.inherent_impl_of_assoc(def_id)?;
+    let self_ty = tcx.type_of(impl_did).instantiate(tcx, generic_args).skip_normalization();
+    let ty::Adt(def, _) = self_ty.kind() else { return None };
+    std_hash_table_adt(tcx, def.did()).then_some(self_ty)
+}
+
+/// Is `did` std's `HashMap` or `HashSet` (its diagnostic item, in an
+/// artifact-authenticated sysroot crate)?
+fn std_hash_table_adt(tcx: TyCtxt<'_>, did: DefId) -> bool {
+    is_real_sysroot_crate(tcx, did.krate)
+        && (tcx.is_diagnostic_item(rustc_span::sym::HashMap, did)
+            || tcx.is_diagnostic_item(rustc_span::sym::HashSet, did))
+}
+
+/// What a bulk-allocation destination reserves PER REQUESTED ELEMENT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AllocDestinationStride {
+    /// The element's exact size; `None` when it is unknown.
+    bytes: Option<u64>,
+    /// The storage is a std hash table (hashbrown's bucket layout).
+    hash_table: bool,
+}
+
+/// The per-element allocation of a std collection DESTINATION `dest`: a std hash
+/// table (its `(K, V)` / `T` element), any other std collection
+/// [`collect_destination_element_ty`] knows (a contiguous buffer), through
+/// `Option`/`Result`, and a TUPLE of them ([`combine_alloc_destinations`]). `None`
+/// for anything else (a user collection, `()`, a generic parameter).
+fn alloc_destination_stride<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    dest: ty::Ty<'tcx>,
+    fuel: u32,
+) -> Option<AllocDestinationStride> {
+    if fuel == 0 {
+        return None;
+    }
+    match dest.kind() {
+        ty::Adt(def, args) if std_hash_table_adt(tcx, def.did()) => {
+            let mut types = args.types();
+            let element = if tcx.is_diagnostic_item(rustc_span::sym::HashMap, def.did()) {
+                let (key, value) = (types.next(), types.next());
+                key.zip(value).map(|(key, value)| ty::Ty::new_tup(tcx, &[key, value]))
+            } else {
+                types.next()
+            };
+            Some(AllocDestinationStride {
+                bytes: element.and_then(|element| exact_layout_bytes(tcx, element)),
+                hash_table: true,
+            })
+        }
+        ty::Adt(def, args)
+            if is_real_sysroot_crate(tcx, def.did().krate)
+                && matches!(tcx.item_name(def.did()).as_str(), "Option" | "Result") =>
+        {
+            alloc_destination_stride(tcx, args.types().next()?, fuel - 1)
+        }
+        ty::Tuple(components) => combine_alloc_destinations(
+            components
+                .iter()
+                .filter_map(|component| alloc_destination_stride(tcx, component, fuel - 1)),
+        ),
+        _ => collect_destination_element_ty(tcx, dest, fuel).map(|element| {
+            AllocDestinationStride { bytes: exact_layout_bytes(tcx, element), hash_table: false }
+        }),
+    }
+}
+
+/// Combine the strides of several destinations filled from ONE count (an `unzip`'s
+/// two halves, a tuple's components): a hash table if any is one, at the LARGEST
+/// element size, unknown if any size is. `None` when there are none.
+fn combine_alloc_destinations(
+    strides: impl Iterator<Item = AllocDestinationStride>,
+) -> Option<AllocDestinationStride> {
+    strides.reduce(|a, b| AllocDestinationStride {
+        bytes: a.bytes.zip(b.bytes).map(|(a, b)| a.max(b)),
+        hash_table: a.hash_table || b.hash_table,
+    })
+}
+
+/// The element a `collect::<B>` into the std collection `B` stores one of per item:
+/// `Vec`/`VecDeque`/`BinaryHeap`/`LinkedList`/`HashSet`/`BTreeSet` — the first type
+/// argument; `HashMap`/`BTreeMap` — the `(K, V)` pair; `String` — its `u8` byte;
+/// `Box<[T]>` — `T`; and through `Option<B>` / `Result<B, E>` (the short-circuiting
+/// collects). `None` for anything else, including a non-sysroot `B`.
+fn collect_destination_element_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    dest: ty::Ty<'tcx>,
+    fuel: u32,
+) -> Option<ty::Ty<'tcx>> {
+    if fuel == 0 {
+        return None;
+    }
+    let ty::Adt(def, args) = dest.kind() else { return None };
+    if !is_real_sysroot_crate(tcx, def.did().krate) {
+        return None;
+    }
+    match tcx.item_name(def.did()).as_str() {
+        "Vec" | "VecDeque" | "BinaryHeap" | "LinkedList" | "HashSet" | "BTreeSet" => {
+            args.types().next()
+        }
+        "HashMap" | "BTreeMap" => {
+            let mut kv = args.types();
+            let (k, v) = (kv.next()?, kv.next()?);
+            Some(ty::Ty::new_tup(tcx, &[k, v]))
+        }
+        "String" => Some(tcx.types.u8),
+        "Box" => match args.types().next()?.kind() {
+            ty::Slice(elem) => Some(*elem),
+            _ => None,
+        },
+        "Option" | "Result" => collect_destination_element_ty(tcx, args.types().next()?, fuel - 1),
+        _ => None,
+    }
+}
+
+/// Trust (2026-09-29): can a `next` of an `IntoIterator` value of type `ty` PANIC?
+/// The question the total-call rewrite needs for a receiver that reserves nothing
+/// (`BTreeMap`/`BTreeSet`), where the count does not matter but the erased `next` calls
+/// do.
+///
+/// GRANTING, a closed list: every source
+/// [`into_iter_source_live_count`] counts (a collection's
+/// iterators never panic in `next`), and an exclusive or inclusive `core::ops` range of
+/// an integer or `char`, whose `next` checks before it steps (`RangeFrom` steps first
+/// and overflows, so it is not listed), through the same count-preserving adapters.
+fn into_iter_source_next_cannot_panic<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    fuel: u32,
+) -> bool {
+    if fuel == 0 || ty.has_non_region_param() {
+        return false;
+    }
+    if into_iter_source_live_count(tcx, ty, fuel).is_some() {
+        return true;
+    }
+    let ty::Adt(def, args) = ty.kind() else { return false };
+    if !is_real_sysroot_crate(tcx, def.did().krate) {
+        return false;
+    }
+    let path = std::cell::OnceCell::new();
+    let in_module = |m: &str| {
+        path.get_or_init(|| tcx.def_path(def.did())).data.iter().any(|segment| {
+            matches!(segment.data, rustc_hir::definitions::DefPathData::TypeNs(n) if n.as_str() == m)
+        })
+    };
+    let next_cannot_panic = |t: Option<ty::Ty<'tcx>>| {
+        t.is_some_and(|t| into_iter_source_next_cannot_panic(tcx, t, fuel - 1))
+    };
+    match tcx.item_name(def.did()).as_str() {
+        "Range" | "RangeInclusive" if in_module("ops") && in_module("range") => args
+            .types()
+            .next()
+            .is_some_and(|elem| matches!(elem.kind(), ty::Int(_) | ty::Uint(_) | ty::Char)),
+        "Map" | "Filter" | "FilterMap" | "Copied" | "Cloned" | "Enumerate" | "Rev" | "Take"
+        | "Skip" | "StepBy" | "TakeWhile" | "SkipWhile" | "MapWhile" | "Peekable" | "Fuse"
+        | "Inspect" | "Scan"
+            if in_module("adapters") =>
+        {
+            next_cannot_panic(args.types().next())
+        }
+        "Chain" | "Zip" if in_module("adapters") => {
+            let mut ab = args.types();
+            next_cannot_panic(ab.next()) && next_cannot_panic(ab.next())
+        }
+        _ => false,
+    }
+}
+
+/// Trust (2026-09-25, F1/F2): is the number of items an `IntoIterator` value of
+/// type `ty` yields BOUNDED BY AN EXISTING, NON-ZERO-SIZED COLLECTION — and if so,
+/// by how many ([`trust_types::live_source_bound::LiveSourceCount`])?
+///
+/// This is the premise the keyed-collect / collection-extend TOTAL sentinel
+/// silently relied on. The sentinel rewrites the call to
+/// `TRUST_TOTAL_CLONE_SENTINEL`, and that deletes more than the panic-freedom
+/// row it was written for: vcgen's allocation lane recognizes a collect/extend
+/// by its callee NAME, so the capacity charge vanished with it. Measured:
+/// `(0..n).collect::<HashSet<usize>>()`, `.collect::<BTreeSet<usize>>()` (whose
+/// `FromIterator` collects into a `Vec` first), `s.extend(0..n)` and
+/// `v.extend(iter::repeat(x).take(n))` all built exit 0 with ZERO rows and
+/// panicked "capacity overflow" at `n = usize::MAX`. The rewrite is now applied
+/// only where this answers `Some` AND the destination can hold that many items
+/// ([`bounded_source_fits_destination`]); every other source keeps its real
+/// callee and the allocation lane charges it like any `collect`.
+///
+/// Trust (W4 HASHMAP r3, 2026-09-29): a bound, not a yes. "The source already
+/// holds its elements" bounds the COUNT; it bounds the destination's allocation
+/// only when the destination spends no more per item than the source. MEASURED on
+/// the redo's r2 (`b9288112d`): a 2^28-byte `&[u8]` mapped to `(u8,
+/// MaybeUninit<[u8; 1 << 35]>)` and collected into a `HashMap` (or a `Vec`, or
+/// `extend`ed into either) was rewritten to the sentinel, built rc=0 and panicked
+/// "capacity overflow" — 2^28 items of 2^35 bytes. Each leaf now reports the live
+/// bytes its items occupy (the exact element layout of a sequence, element + 1
+/// control byte for a hash table, at least one byte for a node-based collection,
+/// one byte for a `str` view), and the count is what the process's address space
+/// can hold of them (`MAX_LIVE_USER_ADDRESS_SPACE_BYTES`, a TCB.md modeled fact).
+///
+/// GRANTING, so it is a closed list and every unlisted shape answers `None`:
+///  * a std collection by value or behind `&`/`&mut` (`Vec`/`VecDeque`/
+///    `BinaryHeap`/arrays/slices need a non-zero-sized element — `vec![(); 1 <<
+///    61]` exists and costs nothing; `HashMap`/`HashSet`/`BTreeMap`/`BTreeSet`/
+///    `LinkedList` store each distinct key once or heap-allocate a node per item;
+///    `Option`/`Result` yield at most one);
+///  * a std collection ITERATOR (`slice`, `vec`, `vec_deque`, `binary_heap`,
+///    `array` element iterators, with the same element rule; the keyed and
+///    list iterators; `option`/`result` iterators; the `str` views, which walk a
+///    byte buffer);
+///  * a std ADAPTOR that yields at most as many items as its source (`Map`,
+///    `Filter`, `Take`, …) over a bounded source; `Chain` over two, `Zip` over
+///    two (each side's `next` is erased with the call).
+/// Ranges, `repeat`, `repeat_n`, `cycle`, `flat_map`, `from_fn`, and every
+/// user iterator are not listed: their counts are what the allocation lane is
+/// for.
+fn into_iter_source_live_count<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    fuel: u32,
+) -> Option<LiveSourceCount> {
+    // Trust (2026-09-27): the licence rests on 64-bit address-space facts. On any
+    // other pointer width, element growth, `Chain`/`Zip`, `extend`'s own length,
+    // amortized doubling and hash-table overhead each make the capacity-overflow
+    // panic reachable from an ordinary input, so nothing is licensed there and
+    // the call keeps its real callee for the allocation lane to charge. See
+    // trust-vcgen `bounded_source_grant_applies_at_width`.
+    if tcx.data_layout.pointer_size().bits() != 64 {
+        return None;
+    }
+    if fuel == 0 || ty.has_non_region_param() {
+        return None;
+    }
+    // One live slot per item: bounded only for a NON-zero-sized element, and then
+    // by that element's exact size.
+    let sequence_leaf = |elem: ty::Ty<'tcx>| {
+        exact_layout_bytes(tcx, elem)
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| LiveSourceCount::memory_backed(u128::from(bytes)))
+    };
+    // A keyed or node-based collection holds every item at least once — a hash
+    // table also a control byte per bucket — and at least one byte per item
+    // whatever the element (a bucket's control byte, a node's header).
+    let keyed_leaf = |elem: Option<ty::Ty<'tcx>>, hash_table: bool| {
+        let bytes = elem.and_then(|elem| exact_layout_bytes(tcx, elem)).map_or(0, u128::from);
+        LiveSourceCount::memory_backed(if hash_table { bytes.saturating_add(1) } else { bytes })
+    };
+    match ty.kind() {
+        ty::Ref(_, inner, _) => match inner.kind() {
+            ty::Slice(elem) | ty::Array(elem, _) => sequence_leaf(*elem),
+            _ => into_iter_source_live_count(tcx, *inner, fuel - 1),
+        },
+        ty::Array(elem, _) => sequence_leaf(*elem),
+        ty::Adt(def, args) => {
+            if !is_real_sysroot_crate(tcx, def.did().krate) {
+                return None;
+            }
+            let name = tcx.item_name(def.did());
+            let path = std::cell::OnceCell::new();
+            let in_module = |m: &str| {
+                path.get_or_init(|| tcx.def_path(def.did())).data.iter().any(|segment| {
+                    matches!(segment.data, rustc_hir::definitions::DefPathData::TypeNs(n) if n.as_str() == m)
+                })
+            };
+            let first = || args.types().next();
+            let key_value = || {
+                let mut kv = args.types();
+                let (key, value) = (kv.next()?, kv.next()?);
+                Some(ty::Ty::new_tup(tcx, &[key, value]))
+            };
+            let inner = |t: Option<ty::Ty<'tcx>>| {
+                t.and_then(|t| into_iter_source_live_count(tcx, t, fuel - 1))
+            };
+            match name.as_str() {
+                // Collections, by value.
+                "Vec" | "VecDeque" | "BinaryHeap" if !in_module("iter") => {
+                    first().and_then(sequence_leaf)
+                }
+                "HashMap" => Some(keyed_leaf(key_value(), true)),
+                "HashSet" => Some(keyed_leaf(first(), true)),
+                "BTreeMap" => Some(keyed_leaf(key_value(), false)),
+                "BTreeSet" | "LinkedList" => Some(keyed_leaf(first(), false)),
+                "Option" | "Result" => Some(LiveSourceCount::at_most(1)),
+                // Adaptors whose item count never exceeds their source's.
+                "Map" | "Filter" | "FilterMap" | "Copied" | "Cloned" | "Enumerate" | "Rev"
+                | "Take" | "Skip" | "StepBy" | "TakeWhile" | "SkipWhile" | "MapWhile"
+                | "Peekable" | "Fuse" | "Inspect" | "Scan"
+                    if in_module("adapters") =>
+                {
+                    inner(first())
+                }
+                "Chain" if in_module("adapters") => {
+                    let mut ab = args.types();
+                    Some(inner(ab.next())?.chain(inner(ab.next())?))
+                }
+                // BOTH sides, although `Zip` yields as many items as the shorter one: the
+                // rewrite these licences serve ERASES the call, and with it every `next`
+                // of the source, so each side must be one whose `next` cannot panic, and
+                // the unlisted ones (ranges above all) can. `(250u8..).zip(s)` collected
+                // or extended into a keyed collection or a `Vec` was proved with no row,
+                // and `RangeFrom::next` panics "attempt to add with overflow" on its
+                // seventh item (the round-2 precondition audit, `q15`/`q16`).
+                "Zip" if in_module("adapters") => {
+                    let mut ab = args.types();
+                    // Merge (2026-10-14): upstream's count is the shorter side's, but
+                    // only when BOTH sides are counted (ours, the comment above): one
+                    // uncounted side answers `None`.
+                    Some(inner(ab.next())?.shorter(inner(ab.next())?))
+                }
+                // Element iterators over a sequence: one item per stored slot.
+                "Iter" | "IterMut" | "IntoIter" | "Drain" | "Chunks" | "ChunksMut"
+                | "ChunksExact" | "ChunksExactMut" | "RChunks" | "RChunksMut" | "Windows"
+                    if in_module("slice")
+                        || in_module("vec")
+                        || in_module("vec_deque")
+                        || in_module("binary_heap")
+                        || in_module("array") =>
+                {
+                    first().and_then(sequence_leaf)
+                }
+                // Keyed/list/option iterators: bounded by distinct keys, heap
+                // nodes, or one item.
+                "Iter"
+                | "IterMut"
+                | "IntoIter"
+                | "Drain"
+                | "Keys"
+                | "Values"
+                | "ValuesMut"
+                | "IntoKeys"
+                | "IntoValues"
+                | "Range"
+                | "RangeMut"
+                | "Difference"
+                | "Intersection"
+                | "Union"
+                | "SymmetricDifference"
+                    if in_module("option") || in_module("result") =>
+                {
+                    Some(LiveSourceCount::at_most(1))
+                }
+                "Iter"
+                | "IterMut"
+                | "IntoIter"
+                | "Drain"
+                | "Keys"
+                | "Values"
+                | "ValuesMut"
+                | "IntoKeys"
+                | "IntoValues"
+                | "Range"
+                | "RangeMut"
+                | "Difference"
+                | "Intersection"
+                | "Union"
+                | "SymmetricDifference"
+                    if in_module("hash") || in_module("btree") || in_module("linked_list") =>
+                {
+                    Some(LiveSourceCount::memory_backed(1))
+                }
+                // `str` views walk a byte buffer.
+                "Chars"
+                | "CharIndices"
+                | "Bytes"
+                | "Split"
+                | "RSplit"
+                | "SplitN"
+                | "RSplitN"
+                | "SplitTerminator"
+                | "RSplitTerminator"
+                | "SplitInclusive"
+                | "SplitWhitespace"
+                | "SplitAsciiWhitespace"
+                | "Lines"
+                | "EncodeUtf16"
+                | "Matches"
+                | "MatchIndices"
+                    if in_module("str") =>
+                {
+                    Some(LiveSourceCount::str_view())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Trust (SP-2, 2026-10-04): does pulling every item out of the `IntoIterator`
+/// value of type `ty` run only std's own code and code verified as its own root in
+/// this compilation?
+///
+/// The keyed-collect / collection-extend TOTAL sentinel rewrites the call to
+/// `TRUST_TOTAL_CLONE_SENTINEL`, which the bridge models as total with no callback
+/// (`total_call_is_zero_callback`), so the rewrite erases every call the std
+/// `from_iter`/`extend` makes into its SOURCE as well: a `Map`'s closure, a
+/// `Filter`'s predicate, `Cloned`'s `T::clone`, a `str` `Split`'s pattern, a set
+/// operation's `Ord`/`Hash`, a user iterator's `next`. Both gates leaned on a
+/// "separately-verified source" that nothing checked: [`into_iter_source_live_count`]
+/// bounds the source's COUNT, reads an adapter's iterator argument and never its
+/// callback, and the `BTreeMap`/`BTreeSet` `extend` arm asked nothing of the source at
+/// all. MEASURED on stage 1 `3fbce29e3` (`tests/ui/trust/collect_extend_source_runs_unverified_code.rs`):
+/// `fn f(it: Map<Copied<Iter<'_, u32>>, fn(u32) -> u32>) -> HashSet<u32> { it.collect() }`
+/// and `v.extend(it)` built exit 0 with zero rows under strict and certify, and so did
+/// the `Filter`/`FilterMap`/`Inspect`/`Scan`/`TakeWhile`/`SkipWhile`/`MapWhile`,
+/// `Chain`/`Zip`/`Rev`/`Peekable`/`Fuse`/`Take`, `BTreeSet` collect, `HashSet` and
+/// `String` extend twins, `Cloned<Iter<dep::K>>` (a hand-written `Clone`), a
+/// `BTreeSet`/`HashSet` `Difference` over a dependency key (hand-written `Ord`/`Hash`),
+/// `str::Split`/`Matches` over a `fn(char) -> bool`, and `BTreeSet::extend` from a
+/// dependency's iterator; the certify library linked into a verify-off `main` panicked
+/// inside the call (exit 101) for each kind witnessed.
+///
+/// GRANTING (it licenses the sentinel), so it is a closed list and every unlisted
+/// shape answers `false`: the call then keeps its real callee and is charged like any
+/// `collect`/`extend`.
+///
+/// EVERY listed std type must have a sysroot allocator (`Global` or `System`) at each
+/// of its allocator positions ([`audited_container_allocators_are_sysroot`], the rule
+/// the drop stamp applies), whether the source holds it by value or behind a
+/// reference. A collection's ALLOCATOR is code its iteration calls: `BTreeMap`'s and
+/// `BTreeSet`'s owning iterators run `self.alloc.clone()` inside every `next`
+/// (`btree::map::IntoIter::dying_next`), and `linked_list::IntoIter::next` is
+/// `pop_front`, which frees the node through `A::deallocate`. MEASURED on stage 1 of
+/// `1181cb2edb3` (SP-2 review; `tests/ui/trust/collect_extend_source_allocator_and_counter.rs`):
+/// `s.extend(src)` from a `BTreeSet<u32, dep::CloneBomb>`, `v.extend(l)` from a
+/// `LinkedList<u32, dep::DeallocBomb>` and their `IntoIter`/`IntoKeys`/`IntoValues`
+/// twins built exit 0 with no Verification Report, under certify too, and a certify
+/// rlib holding three of them, linked into a verify-off `main`, panicked in
+/// `CloneBomb::clone` inside `dying_next` and in `DeallocBomb::deallocate` inside
+/// `pop_front` (exit 101). A
+/// borrowed collection's iterator never touches its allocator; it is refused all the
+/// same, so the rule has no borrowed carve-out to get wrong (the cost is recorded,
+/// docs/DECISION_QUEUE.md SP-2).
+///  * a std collection by value, a slice or array, any of them behind `&`/`&mut`, and
+///    the std element, keyed-collection, list, `Option` and `Result` iterators: at a
+///    sysroot allocator they move or borrow stored items and run no user code;
+///  * the `str` views; a `Split`-family view only when its pattern is a `char`, a
+///    `&str`/`&&str`/`&String`, a `char` array or slice (core's searchers), or a
+///    callback [`source_callback_is_verified`] accepts;
+///  * `Range`/`RangeInclusive` over an integer or `char` (`next` is guarded by `end`
+///    and never reaches `Step::forward`'s overflow check), `Once`, `Empty`, and
+///    `Repeat`/`RepeatN` whose element's `clone` is total ([`clone_is_total_ty`]);
+///  * over a source that qualifies, the adapters `Copied`, `Rev`, `Take`, `Skip`,
+///    `StepBy`, `Peekable`, `Fuse`, and `Chain`/`Zip` over two (both sides: `Zip`
+///    pulls both); `Enumerate` when its inner also yields at most `usize::MAX` items
+///    ([`source_len_fits_usize`]); `Cloned` when the element's `clone` is total; and
+///    `Map`, `Filter`, `FilterMap`, `TakeWhile`, `SkipWhile`, `MapWhile`, `Inspect` and
+///    `Scan` when the callback qualifies.
+/// Not listed, so refused: a user or dependency iterator; the set operations
+/// (`Difference`, `Intersection`, `Union`, `SymmetricDifference`), which run the keys'
+/// `Ord` or `Hash`/`Eq` and the hasher; `RangeFrom`, whose `next` is
+/// `Step::forward`, a `#[rustc_inherit_overflow_checks]` add; `Cycle`, `FlatMap`,
+/// `Flatten`, `from_fn`, `successors` and every other source.
+///
+/// `Enumerate` COUNTS: `next` and `fold` run `count += 1` (and `nth`
+/// `count = (count + n) + 1`) under `#[rustc_inherit_overflow_checks]`, the reason
+/// `RangeFrom` is refused, and DC-1 (`b79833747f5`) credits it elsewhere only over an
+/// inner of at most `usize::MAX` items. It used to sit with the adapters that run no
+/// code of their own; MEASURED on stage 1 of `1181cb2edb3`:
+/// `v.extend(it)` into a `BTreeSet<(usize, u128)>` from an `Enumerate<Range<u128>>`
+/// (the `BTreeMap`/`BTreeSet` `extend` arm has no count gate) built exit 0 with no
+/// Verification Report under strict and certify, while DC-1's `it.next()` on the same
+/// iterator is refused under certify. (Reaching the overflow takes `2^64` items on a
+/// 64-bit target, so there is no run witness.)
+///
+/// This predicate asks what CODE the source's iteration runs, not what it DROPS. The
+/// drops the call performs on the SOURCE side (a hash source's hasher, a `Result`'s
+/// `Err` payload, an item a `Skip`/`Filter` passes over, a `Take`/`Zip` remainder, a
+/// by-move capture, a `Scan` state) are asked by its sibling
+/// [`source_side_drops_are_total`], which both sentinel gates require beside it
+/// (SOURCE-SIDE-DROP-CERTIFY-1, 2026-10-13). The RECEIVER's drops (a keyed
+/// collection's collided key and value, a `String`'s appended items) are asked by the
+/// gates themselves (SP-1, [`keyed_collection_drops_are_total`]). Both are interim
+/// stopgaps over this closed list; CALL-REACH-1 phase 2 owns the general rule (the
+/// call's own body walked with its instance type arguments).
+fn into_iter_source_runs_only_verified_code<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    fuel: u32,
+) -> bool {
+    if fuel == 0 || ty.has_non_region_param() {
+        return false;
+    }
+    let source = |t: Option<ty::Ty<'tcx>>| {
+        t.is_some_and(|t| into_iter_source_runs_only_verified_code(tcx, t, fuel - 1))
+    };
+    let callback =
+        |f: Option<ty::Ty<'tcx>>| f.is_some_and(|f| source_callback_is_verified(tcx, f, fuel - 1));
+    match ty.kind() {
+        ty::Ref(_, inner, _) => match inner.kind() {
+            ty::Slice(_) | ty::Array(..) => true,
+            _ => source(Some(*inner)),
+        },
+        ty::Array(..) => true,
+        ty::Adt(def, args) => {
+            if !is_real_sysroot_crate(tcx, def.did().krate) {
+                return false;
+            }
+            // Trust (SP-2 review, 2026-10-04): every allocator position at a sysroot
+            // allocator (see the doc comment): `BTreeMap`/`BTreeSet` owning iterators
+            // clone theirs inside `next`, `LinkedList`'s frees through it.
+            if !audited_container_allocators_are_sysroot(tcx, def.did(), *args) {
+                return false;
+            }
+            let path = std::cell::OnceCell::new();
+            let in_module = |m: &str| {
+                path.get_or_init(|| tcx.def_path(def.did())).data.iter().any(|segment| {
+                    matches!(segment.data, rustc_hir::definitions::DefPathData::TypeNs(n) if n.as_str() == m)
+                })
+            };
+            let mut tys = args.types();
+            match tcx.item_name(def.did()).as_str() {
+                // Collections, by value.
+                "Vec" | "VecDeque" | "BinaryHeap" if !in_module("iter") => true,
+                "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet" | "LinkedList" | "Option"
+                | "Result" => true,
+                // Sources that run no user code, or only a total `clone`.
+                "Range" | "RangeInclusive" if in_module("ops") => tys
+                    .next()
+                    .is_some_and(|t| matches!(t.kind(), ty::Int(_) | ty::Uint(_) | ty::Char)),
+                "Once" | "Empty" if in_module("sources") => true,
+                "Repeat" | "RepeatN" if in_module("sources") => {
+                    tys.next().is_some_and(|t| clone_is_total_ty(tcx, t))
+                }
+                // Adapters that run no code of their own.
+                "Copied" | "Rev" | "Take" | "Skip" | "StepBy" | "Peekable" | "Fuse"
+                    if in_module("adapters") =>
+                {
+                    source(tys.next())
+                }
+                // `Enumerate<I>` runs an overflow-checked `count += 1` per item: only
+                // over an inner that cannot yield more than `usize::MAX` items.
+                "Enumerate" if in_module("adapters") => {
+                    let inner = tys.next();
+                    source(inner) && inner.is_some_and(|i| source_len_fits_usize(tcx, i, fuel - 1))
+                }
+                "Chain" | "Zip" if in_module("adapters") => {
+                    source(tys.next()) && source(tys.next())
+                }
+                // `Cloned<I>` runs `T::clone` on each `&T` item of `I`.
+                "Cloned" if in_module("adapters") => {
+                    let inner = tys.next();
+                    source(inner)
+                        && inner.and_then(|i| iterator_item_ty(tcx, i)).is_some_and(|item| {
+                            matches!(item.kind(), ty::Ref(_, elem, _) if clone_is_total_ty(tcx, *elem))
+                        })
+                }
+                // Adapters that run a CALLBACK per item: `Adapter<I, F>`.
+                "Map" | "Filter" | "FilterMap" | "TakeWhile" | "SkipWhile" | "MapWhile"
+                | "Inspect"
+                    if in_module("adapters") =>
+                {
+                    source(tys.next()) && callback(tys.next())
+                }
+                // `Scan<I, St, F>`: the state is moved in and lent to `F`.
+                "Scan" if in_module("adapters") => source(tys.next()) && callback(tys.nth(1)),
+                // Element iterators over a sequence.
+                "Iter" | "IterMut" | "IntoIter" | "Drain" | "Chunks" | "ChunksMut"
+                | "ChunksExact" | "ChunksExactMut" | "RChunks" | "RChunksMut" | "Windows"
+                    if in_module("slice")
+                        || in_module("vec")
+                        || in_module("vec_deque")
+                        || in_module("binary_heap")
+                        || in_module("array") =>
+                {
+                    true
+                }
+                "Iter" | "IterMut" | "IntoIter" if in_module("option") || in_module("result") => {
+                    true
+                }
+                // Keyed-collection and list iterators walk the stored items; the set
+                // operations, which compare or hash keys, are deliberately absent.
+                "Iter" | "IterMut" | "IntoIter" | "Drain" | "Keys" | "Values" | "ValuesMut"
+                | "IntoKeys" | "IntoValues" | "Range" | "RangeMut"
+                    if in_module("hash") || in_module("btree") || in_module("linked_list") =>
+                {
+                    true
+                }
+                // `str` views with no pattern.
+                "Chars"
+                | "CharIndices"
+                | "Bytes"
+                | "SplitWhitespace"
+                | "SplitAsciiWhitespace"
+                | "Lines"
+                | "EncodeUtf16"
+                    if in_module("str") =>
+                {
+                    true
+                }
+                // `str` views that run a `Pattern` per step: `View<'a, P>`.
+                "Split" | "RSplit" | "SplitN" | "RSplitN" | "SplitTerminator"
+                | "RSplitTerminator" | "SplitInclusive" | "Matches" | "MatchIndices"
+                    if in_module("str") =>
+                {
+                    tys.next()
+                        .is_some_and(|p| str_pattern_runs_only_verified_code(tcx, p, fuel - 1))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Trust (SOURCE-SIDE-DROP-CERTIFY-1, 2026-10-13): does everything a sentineled
+/// `collect`/`extend` DROPS on its SOURCE side — given the `IntoIterator` value of type
+/// `src` the call consumes — drop with no user `Drop` and no dependency code?
+///
+/// [`into_iter_source_runs_only_verified_code`] asks what code pulling the items runs;
+/// nothing asked what the call drops, and a drop is code. MEASURED on stage 1
+/// `scratchpad/stage1-w25f` (tree of `a971311ee2`;
+/// `tests/ui/trust/collect_extend_source_side_drops.rs`), with a verify-off
+/// dependency's `DropBuild` hasher, `ErrBomb` and `Bomb` (each `Drop` panics on `7`):
+/// `v.extend(m)` from a `HashMap`/`HashSet` at `DropBuild`, `v.extend(r)` from a
+/// `Result<u32, ErrBomb>`, `v.extend(src.into_iter().take(1))`, `.skip(1)`,
+/// `.filter(..)`, `v.extend(it)` from a `&mut Skip`/`&mut StepBy` over
+/// `vec::IntoIter<Bomb>`, from a `Zip` with a shorter `Range`, from a `&mut Chain`
+/// whose first half is a `Take`, from a `btree_map::IntoKeys<u32, Bomb>` and from a
+/// `Scan` with a `Bomb` state, and the keyed collects `IntoKeys::collect::<HashSet<_>>()`
+/// and a `Filter` with a by-move `Bomb` capture `collect::<HashMap<_, _>>()`, each
+/// built exit 0 with no unproved row, under the default policy and under certify; the
+/// same shapes built verify-off and run armed panic inside std's `extend`/`from_iter`
+/// (exit 101, `tests/ui/trust/collect_extend_source_side_drops_run.rs`).
+///
+/// GRANTING (it licenses the sentinel), so it walks the SAME closed list as
+/// [`into_iter_source_runs_only_verified_code`] and every unlisted shape answers
+/// `false`: the call then keeps its real callee and is charged.
+///  * BY VALUE, the root may drop on its own. A `HashMap<K, V, S>`/`HashSet<T, S>`
+///    drops its hasher `S` in `into_iter`, so `S` must be std's all the way down
+///    ([`hasher_ty_is_sysroot_throughout`], the rule every destination hash arm
+///    applies) and drop totally ([`tcx_drop_is_total`]). A `Result<T, E>`'s
+///    `into_iter` is `self.ok()`, which drops the `Err`, so `E` must drop totally.
+///    Every other listed collection, an array and an `Option` is drained to the end
+///    and drops no element (this predicate credits a `Vec<dep::Bomb>`; the merged
+///    collect/extend gates still refuse it on the receiver's and the source's own drop
+///    totality, docs/DECISION_QUEUE.md SENTINEL-MERGE-CONJUNCTS-1).
+///  * BEHIND `&`/`&mut`, a collection, slice or array is iterated by reference and the
+///    call drops nothing of it. A borrowed ITERATOR gets no carve-out: a discarding
+///    adapter drops what it passes over through the borrow (`&mut Skip`), and `Chain`
+///    and `Fuse` drop an inner they have run dry (`&mut Chain<Take<..>, _>` drops the
+///    `Take`'s remainder inside the call).
+///  * a LOSSY adapter, one that passes items over or can stop with items left (`Take`,
+///    `Skip`, `StepBy`, `Filter`, `FilterMap`, `TakeWhile`, `SkipWhile`, `MapWhile`,
+///    `Scan`, and `Zip` on both sides), requires its inner's ITEM type to drop totally
+///    (what it discards, a `Map`'s output included) and everything beneath it to be
+///    droppable part-way: every owning leaf's type arguments (the `vec`, `vec_deque`,
+///    `binary_heap` and `array` `IntoIter` and `Drain`, the hash, BTree and list
+///    `IntoIter` and `Drain`, the `Option`/`Result` `IntoIter`, `Once`) and every
+///    `Peekable`'s peeked item. No `&`/`&mut` above or below it exempts it.
+///  * `IntoKeys`/`IntoValues` drop the other half of each entry they yield, and
+///    `Repeat`/`RepeatN` hold their element to the end: each requires every type
+///    argument to drop totally wherever it sits.
+///  * every callback adapter (`Map`, `Inspect` and the lossy ones) requires its
+///    callback type to drop totally (a by-move capture), `Scan` its state as well, and
+///    a `str` pattern view its pattern: each is dropped with the adapter.
+///  * an adapter that neither discards nor stops (`Copied`, `Cloned`, `Rev`, `Fuse`,
+///    `Enumerate`, `Peekable`, `Chain`) asks only its inner(s); a borrowing leaf (a
+///    slice, `VecDeque`, `BinaryHeap`, hash, BTree, list, `Option` or `Result` `Iter`,
+///    a `str` view with no pattern, an integer `Range`, `Empty`) holds nothing to drop.
+/// It never asks [`tcx_drop_is_total`] of a whole iterator: `vec::IntoIter` is outside
+/// the drop stamp's audited list, so `Take<vec::IntoIter<u32>>` would be refused for
+/// nothing. The element types are asked instead.
+///
+/// NOT CLAIMED: a general rule. This is a stopgap over std's adapters as written today
+/// (a `Chain` that clears its exhausted half, an `IntoKeys` that drops the value);
+/// CALL-REACH-1 phase 2, which walks the call's own body at its instance type
+/// arguments, supersedes it (docs/DECISION_QUEUE.md SOURCE-SIDE-DROP-CERTIFY-1).
+fn source_side_drops_are_total<'tcx>(tcx: TyCtxt<'tcx>, src: ty::Ty<'tcx>, fuel: u32) -> bool {
+    if fuel == 0 || src.has_non_region_param() {
+        return false;
+    }
+    match src.kind() {
+        // A collection, slice or array behind a reference is iterated by reference; a
+        // borrowed ITERATOR is walked like an owned one (see the doc comment).
+        ty::Ref(_, inner, _) => {
+            let iterated_by_reference = match inner.kind() {
+                ty::Slice(_) | ty::Array(..) => true,
+                ty::Adt(def, _) => {
+                    is_real_sysroot_crate(tcx, def.did().krate)
+                        && std_source_collection_name(tcx, def.did()).is_some()
+                }
+                _ => false,
+            };
+            iterated_by_reference || source_iterator_drops_are_total(tcx, *inner, false, fuel - 1)
+        }
+        // `[T; N]` by value: `array::IntoIter`, drained to the end.
+        ty::Array(..) => true,
+        ty::Adt(def, args) => {
+            if !is_real_sysroot_crate(tcx, def.did().krate) {
+                return false;
+            }
+            // The hasher a by-value hash collection drops in `into_iter`.
+            let hasher_drop_is_std = |s: ty::Ty<'tcx>| {
+                hasher_ty_is_sysroot_throughout(tcx, s) && tcx_drop_is_total(tcx, s)
+            };
+            match std_source_collection_name(tcx, def.did()) {
+                Some("HashMap") => args.types().nth(2).is_some_and(hasher_drop_is_std),
+                Some("HashSet") => args.types().nth(1).is_some_and(hasher_drop_is_std),
+                // `Result::into_iter` is `self.ok()`: it drops the `Err`.
+                Some("Result") => args.types().nth(1).is_some_and(|e| tcx_drop_is_total(tcx, e)),
+                // Drained to the end: nothing of the source is left to drop.
+                Some(_) => true,
+                // An iterator, by value.
+                None => source_iterator_drops_are_total(tcx, src, false, fuel),
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The std collection the SYSROOT ADT `did` is, among those
+/// [`into_iter_source_runs_only_verified_code`] lists by value, spelled as it does
+/// (`None` for anything else, iterators included). The caller checks the sysroot.
+fn std_source_collection_name(tcx: TyCtxt<'_>, did: DefId) -> Option<&'static str> {
+    use rustc_hir::definitions::DefPathData;
+    let in_iter_module = || {
+        tcx.def_path(did)
+            .data
+            .iter()
+            .any(|segment| matches!(segment.data, DefPathData::TypeNs(n) if n.as_str() == "iter"))
+    };
+    match tcx.item_name(did).as_str() {
+        "Vec" if !in_iter_module() => Some("Vec"),
+        "VecDeque" if !in_iter_module() => Some("VecDeque"),
+        "BinaryHeap" if !in_iter_module() => Some("BinaryHeap"),
+        "HashMap" => Some("HashMap"),
+        "HashSet" => Some("HashSet"),
+        "BTreeMap" => Some("BTreeMap"),
+        "BTreeSet" => Some("BTreeSet"),
+        "LinkedList" => Some("LinkedList"),
+        "Option" => Some("Option"),
+        "Result" => Some("Result"),
+        _ => None,
+    }
+}
+
+/// The iterator half of [`source_side_drops_are_total`]: can the call drop, inside
+/// itself, any part of the iterator `it` whose drop is not total? `lossy_above` says
+/// a lossy adapter sits above `it`, so `it` may be left holding items, or have items
+/// pulled out of it and discarded, inside the call. A closed list mirroring
+/// [`into_iter_source_runs_only_verified_code`]; anything else answers `false`.
+fn source_iterator_drops_are_total<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    it: ty::Ty<'tcx>,
+    lossy_above: bool,
+    fuel: u32,
+) -> bool {
+    use rustc_hir::definitions::DefPathData;
+    if fuel == 0 || it.has_non_region_param() {
+        return false;
+    }
+    let drops_total = |t: Option<ty::Ty<'tcx>>| t.is_some_and(|t| tcx_drop_is_total(tcx, t));
+    // Under an adapter that neither discards nor stops: the same `lossy_above`.
+    let inner = |t: Option<ty::Ty<'tcx>>| {
+        t.is_some_and(|t| source_iterator_drops_are_total(tcx, t, lossy_above, fuel - 1))
+    };
+    // Under a lossy adapter: the item it may discard, and everything beneath it.
+    let lossy_over = |t: Option<ty::Ty<'tcx>>| {
+        t.is_some_and(|t| {
+            iterator_item_ty(tcx, t).is_some_and(|item| tcx_drop_is_total(tcx, item))
+                && source_iterator_drops_are_total(tcx, t, true, fuel - 1)
+        })
+    };
+    match it.kind() {
+        // `&mut I` drives `I`: whatever `I` discards is dropped through the borrow.
+        ty::Ref(_, referent, _) => {
+            source_iterator_drops_are_total(tcx, *referent, lossy_above, fuel - 1)
+        }
+        ty::Adt(def, args) => {
+            if !is_real_sysroot_crate(tcx, def.did().krate) {
+                return false;
+            }
+            let path = std::cell::OnceCell::new();
+            let in_module = |m: &str| {
+                path.get_or_init(|| tcx.def_path(def.did())).data.iter().any(
+                    |segment| matches!(segment.data, DefPathData::TypeNs(n) if n.as_str() == m),
+                )
+            };
+            // Every type argument: an owning leaf's elements (keys and values) and its
+            // sysroot allocator, a `Repeat`'s element, a `str` view's pattern, a
+            // `Range`'s integer.
+            let every_arg_drops_total = || args.types().all(|t| tcx_drop_is_total(tcx, t));
+            let mut tys = args.types();
+            match tcx.item_name(def.did()).as_str() {
+                // Owning leaves: each holds what it has not yielded yet, which a lossy
+                // adapter above can leave behind or pull out and discard.
+                "IntoIter" | "Drain"
+                    if in_module("vec")
+                        || in_module("vec_deque")
+                        || in_module("binary_heap")
+                        || in_module("array")
+                        || in_module("hash")
+                        || in_module("btree")
+                        || in_module("linked_list") =>
+                {
+                    !lossy_above || every_arg_drops_total()
+                }
+                "IntoIter" if in_module("option") || in_module("result") => {
+                    !lossy_above || every_arg_drops_total()
+                }
+                "Once" if in_module("sources") => !lossy_above || every_arg_drops_total(),
+                // Each yielded entry's other half is dropped, lossy or not.
+                "IntoKeys" | "IntoValues" if in_module("hash") || in_module("btree") => {
+                    every_arg_drops_total()
+                }
+                // The element is held to the end (`Repeat` never yields it up).
+                "Repeat" | "RepeatN" if in_module("sources") => every_arg_drops_total(),
+                // Borrowing leaves: their items are references or copies.
+                "Iter" | "IterMut" | "Chunks" | "ChunksMut" | "ChunksExact" | "ChunksExactMut"
+                | "RChunks" | "RChunksMut" | "Windows"
+                    if in_module("slice")
+                        || in_module("vec")
+                        || in_module("vec_deque")
+                        || in_module("binary_heap")
+                        || in_module("array") =>
+                {
+                    true
+                }
+                "Iter" | "IterMut" if in_module("option") || in_module("result") => true,
+                "Iter" | "IterMut" | "Keys" | "Values" | "ValuesMut" | "Range" | "RangeMut"
+                    if in_module("hash") || in_module("btree") || in_module("linked_list") =>
+                {
+                    true
+                }
+                "Range" | "RangeInclusive" if in_module("ops") => every_arg_drops_total(),
+                "Empty" if in_module("sources") => true,
+                "Chars"
+                | "CharIndices"
+                | "Bytes"
+                | "SplitWhitespace"
+                | "SplitAsciiWhitespace"
+                | "Lines"
+                | "EncodeUtf16"
+                    if in_module("str") =>
+                {
+                    true
+                }
+                // `View<'a, P>`: the pattern is dropped with the view.
+                "Split" | "RSplit" | "SplitN" | "RSplitN" | "SplitTerminator"
+                | "RSplitTerminator" | "SplitInclusive" | "Matches" | "MatchIndices"
+                    if in_module("str") =>
+                {
+                    every_arg_drops_total()
+                }
+                // Adapters that neither discard nor stop.
+                "Copied" | "Cloned" | "Rev" | "Fuse" | "Enumerate" if in_module("adapters") => {
+                    inner(tys.next())
+                }
+                // `Peekable` holds the item it peeked, which is left if a lossy
+                // adapter above stops.
+                "Peekable" if in_module("adapters") => {
+                    let i = tys.next();
+                    inner(i)
+                        && (!lossy_above || drops_total(i.and_then(|i| iterator_item_ty(tcx, i))))
+                }
+                "Chain" if in_module("adapters") => inner(tys.next()) && inner(tys.next()),
+                // `Adapter<I, F>`: the callback (and a by-move capture) is dropped with it.
+                "Map" | "Inspect" if in_module("adapters") => {
+                    inner(tys.next()) && drops_total(tys.next())
+                }
+                // Lossy adapters.
+                "Take" | "Skip" | "StepBy" if in_module("adapters") => lossy_over(tys.next()),
+                "Filter" | "FilterMap" | "TakeWhile" | "SkipWhile" | "MapWhile"
+                    if in_module("adapters") =>
+                {
+                    lossy_over(tys.next()) && drops_total(tys.next())
+                }
+                // `Scan<I, St, F>`: the state and the callback are dropped with it.
+                "Scan" if in_module("adapters") => {
+                    lossy_over(tys.next()) && drops_total(tys.next()) && drops_total(tys.next())
+                }
+                // `Zip` drops an item of the first side when the second runs dry, and
+                // leaves either side's remainder.
+                "Zip" if in_module("adapters") => lossy_over(tys.next()) && lossy_over(tys.next()),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Trust (SP-2 review, 2026-10-04): can the `IntoIterator` value of type `ty` yield
+/// AT MOST `usize::MAX` items over its whole life? Asked only of an `Enumerate`'s
+/// inner, beside [`into_iter_source_runs_only_verified_code`], so it can only NARROW
+/// what that predicate admits. `Enumerate`'s `count` (and `count + n` for an `nth`
+/// that returns `Some`) is the index of an item the inner really yielded, so neither
+/// overflows when the inner yields at most `usize::MAX` items — the bound DC-1's
+/// `total_std_iterator_len_fits_usize` (rustc_mir_transform's trust_verify) and
+/// ITER-RECV-1's `YieldBound` (trust-ir-bridge) ask, re-derived here over this
+/// file's source list.
+///
+/// GRANTING, so a closed list; anything else is `false`:
+///  * the live-memory count gives a bound ([`into_iter_source_live_count`], the
+///    count gate's own axiom-backed bound) no larger than the target's `usize::MAX`
+///    — the only arm that admits a `Chain`, which SUMS its sides;
+///  * a slice or array, and a std collection, by value or behind `&`/`&mut`: its
+///    length is a `usize` (`Option`/`Result`: at most one item);
+///  * the std element (`slice`, `vec`, `vec_deque`, `binary_heap`, `array`),
+///    keyed-collection, list, `Option` and `Result` iterators: at most one item per
+///    stored element;
+///  * the `str` views: at most `len + 2` items over a `len <= isize::MAX` byte string;
+///  * `Range` over an integer no wider than the target's pointer (`2^bits - 1` items),
+///    `RangeInclusive` over one strictly narrower (`2^bits`), either over `char`
+///    (fewer than `2^21`), `Once`, `Empty`, `RepeatN` (a `usize` count), `Take`;
+///  * an adapter that yields at most what its inner does (`Copied`, `Cloned`, `Map`,
+///    `Filter`, `FilterMap`, `TakeWhile`, `SkipWhile`, `MapWhile`, `Inspect`, `Scan`,
+///    `Enumerate`, `Rev`, `Skip`, `StepBy`, `Peekable`, `Fuse`) over a fitting inner,
+///    and `Zip`, which yields at most the shorter side, with one fitting side.
+/// `Repeat` (endless), `RangeFrom`, `Chain` (outside the count arm) and every other
+/// source are refused.
+fn source_len_fits_usize<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>, fuel: u32) -> bool {
+    if fuel == 0 || ty.has_non_region_param() {
+        return false;
+    }
+    let ptr_bits = tcx.data_layout.pointer_size().bits();
+    let Some(usize_max) = u32::try_from(ptr_bits)
+        .ok()
+        .filter(|&bits| (1..=64).contains(&bits))
+        .map(|bits| u128::from(u64::MAX >> (64 - bits)))
+    else {
+        return false;
+    };
+    if into_iter_source_live_count(tcx, ty, fuel).is_some_and(|c| c.max_items() <= usize_max) {
+        return true;
+    }
+    let fits = |t: Option<ty::Ty<'tcx>>| t.is_some_and(|t| source_len_fits_usize(tcx, t, fuel - 1));
+    match ty.kind() {
+        ty::Ref(_, inner, _) => match inner.kind() {
+            ty::Slice(_) | ty::Array(..) => true,
+            _ => fits(Some(*inner)),
+        },
+        ty::Array(..) => true,
+        ty::Adt(def, args) => {
+            if !is_real_sysroot_crate(tcx, def.did().krate) {
+                return false;
+            }
+            let path = std::cell::OnceCell::new();
+            let in_module = |m: &str| {
+                path.get_or_init(|| tcx.def_path(def.did())).data.iter().any(|segment| {
+                    matches!(segment.data, rustc_hir::definitions::DefPathData::TypeNs(n) if n.as_str() == m)
+                })
+            };
+            // `Some(bits)` for an integer (`None`-width `usize`/`isize` are the
+            // pointer's), `None` for anything else.
+            let int_bits = |t: ty::Ty<'tcx>| match t.kind() {
+                ty::Int(i) => Some(i.bit_width().unwrap_or(ptr_bits)),
+                ty::Uint(u) => Some(u.bit_width().unwrap_or(ptr_bits)),
+                _ => None,
+            };
+            let mut tys = args.types();
+            match tcx.item_name(def.did()).as_str() {
+                "Vec" | "VecDeque" | "BinaryHeap" if !in_module("iter") => true,
+                "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet" | "LinkedList" | "Option"
+                | "Result" => true,
+                "Range" if in_module("ops") => tys.next().is_some_and(|t| {
+                    (t.is_char() && ptr_bits >= 32) || int_bits(t).is_some_and(|b| b <= ptr_bits)
+                }),
+                "RangeInclusive" if in_module("ops") => tys.next().is_some_and(|t| {
+                    (t.is_char() && ptr_bits >= 32) || int_bits(t).is_some_and(|b| b < ptr_bits)
+                }),
+                "Once" | "Empty" | "RepeatN" if in_module("sources") => true,
+                "Take" if in_module("adapters") => true,
+                "Copied" | "Cloned" | "Map" | "Filter" | "FilterMap" | "TakeWhile"
+                | "SkipWhile" | "MapWhile" | "Inspect" | "Scan" | "Enumerate" | "Rev" | "Skip"
+                | "StepBy" | "Peekable" | "Fuse"
+                    if in_module("adapters") =>
+                {
+                    fits(tys.next())
+                }
+                "Zip" if in_module("adapters") => {
+                    let (a, b) = (tys.next(), tys.next());
+                    fits(a) || fits(b)
+                }
+                "Iter" | "IterMut" | "IntoIter" | "Drain" | "Chunks" | "ChunksMut"
+                | "ChunksExact" | "ChunksExactMut" | "RChunks" | "RChunksMut" | "Windows"
+                    if in_module("slice")
+                        || in_module("vec")
+                        || in_module("vec_deque")
+                        || in_module("binary_heap")
+                        || in_module("array") =>
+                {
+                    true
+                }
+                "Iter" | "IterMut" | "IntoIter" if in_module("option") || in_module("result") => {
+                    true
+                }
+                "Iter" | "IterMut" | "IntoIter" | "Drain" | "Keys" | "Values" | "ValuesMut"
+                | "IntoKeys" | "IntoValues" | "Range" | "RangeMut"
+                    if in_module("hash") || in_module("btree") || in_module("linked_list") =>
+                {
+                    true
+                }
+                "Chars"
+                | "CharIndices"
+                | "Bytes"
+                | "SplitWhitespace"
+                | "SplitAsciiWhitespace"
+                | "Lines"
+                | "EncodeUtf16"
+                | "Split"
+                | "RSplit"
+                | "SplitN"
+                | "RSplitN"
+                | "SplitTerminator"
+                | "RSplitTerminator"
+                | "SplitInclusive"
+                | "Matches"
+                | "MatchIndices"
+                    if in_module("str") =>
+                {
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The exact byte size of `t` from its layout; `None` for a generic or unsized type.
+fn layout_bytes<'tcx>(tcx: TyCtxt<'tcx>, t: ty::Ty<'tcx>) -> Option<u128> {
+    if t.has_non_region_param() {
+        return None;
+    }
+    tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(t))
+        .ok()
+        .map(|l| u128::from(l.size.bytes()))
+}
+
+/// Trust (2026-10-06, `docs/DECISION_QUEUE.md` D12 option (a)): the most items a
+/// source admitted by [`into_iter_source_live_count`] can
+/// yield, on the `MAX_LIVE_ALLOC_BYTES` axiom (`docs/TCB.md`). A sequence of `T`
+/// holds `MAX_LIVE / size_of::<T>()`; a hash table keeps a control byte per bucket,
+/// so at most `MAX_LIVE`; a str view at most one item per byte, the split family
+/// two more; `Option`/`Result` one. `None` for a collection held in MANY
+/// allocations (`BTreeMap`/`BTreeSet`/`LinkedList` and their iterators), which a
+/// per-allocation axiom bounds nothing about, and for every shape the boolean walk
+/// refuses. The licences compare it with the destination's bytes per item: a
+/// bounded source alone never bounded what an upfront reservation requests (review
+/// round 52: a `[u8; 1 << 40]` destination element over an 8 MiB slice).
+fn into_iter_source_max_items<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    fuel: u32,
+) -> Option<u128> {
+    use trust_types::alloc_model::max_items_of_live_sequence;
+    // Merge (2026-10-14): upstream replaced the boolean walk with
+    // [`into_iter_source_live_count`]; a source it does not count is not bounded.
+    into_iter_source_live_count(tcx, ty, fuel)?;
+    let sequence = |t: Option<ty::Ty<'tcx>>| max_items_of_live_sequence(layout_bytes(tcx, t?)?);
+    match ty.kind() {
+        ty::Ref(_, inner, _) => match inner.kind() {
+            ty::Slice(elem) | ty::Array(elem, _) => sequence(Some(*elem)),
+            _ => into_iter_source_max_items(tcx, *inner, fuel - 1),
+        },
+        ty::Array(elem, _) => sequence(Some(*elem)),
+        ty::Adt(def, args) => {
+            let name = tcx.item_name(def.did());
+            let path = std::cell::OnceCell::new();
+            let in_module = |m: &str| {
+                path.get_or_init(|| tcx.def_path(def.did())).data.iter().any(|segment| {
+                    matches!(segment.data, rustc_hir::definitions::DefPathData::TypeNs(n) if n.as_str() == m)
+                })
+            };
+            let first = args.types().next();
+            let inner = |t: Option<ty::Ty<'tcx>>| into_iter_source_max_items(tcx, t?, fuel - 1);
+            // A hash table stores each entry beside a control byte in ONE allocation, so
+            // it holds at most `MAX_LIVE / (entry + 1)`. The entry is at least the sum of
+            // the leading `stored` type arguments: the key for a set, key and value for a
+            // map. The hasher and allocator that follow are not stored per entry. Review
+            // round 55: `MAX_LIVE` alone refused every copy out of a `HashSet<u64>`.
+            let hash_table_max_items = |args: ty::GenericArgs<'tcx>, stored: usize| {
+                let entry = args
+                    .types()
+                    .take(stored)
+                    .filter(|t| !t.has_non_region_param())
+                    .filter_map(|t| layout_bytes(tcx, t))
+                    .fold(0u128, u128::saturating_add);
+                max_items_of_live_sequence(entry.checked_add(1)?)
+            };
+            match name.as_str() {
+                "Vec" | "VecDeque" | "BinaryHeap" if !in_module("iter") => sequence(first),
+                "HashMap" => hash_table_max_items(*args, 2),
+                "HashSet" => hash_table_max_items(*args, 1),
+                "Option" | "Result" => Some(1),
+                "Map" | "Filter" | "FilterMap" | "Copied" | "Cloned" | "Enumerate" | "Rev"
+                | "Take" | "Skip" | "StepBy" | "TakeWhile" | "SkipWhile" | "MapWhile"
+                | "Peekable" | "Fuse" | "Inspect" | "Scan"
+                    if in_module("adapters") =>
+                {
+                    inner(first)
+                }
+                "Chain" if in_module("adapters") => {
+                    let mut ab = args.types();
+                    inner(ab.next())?.checked_add(inner(ab.next())?)
+                }
+                "Zip" if in_module("adapters") => {
+                    let mut ab = args.types();
+                    Some(inner(ab.next())?.min(inner(ab.next())?))
+                }
+                "Iter" | "IterMut" | "IntoIter" | "Drain" | "Chunks" | "ChunksMut"
+                | "ChunksExact" | "ChunksExactMut" | "RChunks" | "RChunksMut" | "Windows"
+                    if in_module("slice")
+                        || in_module("vec")
+                        || in_module("vec_deque")
+                        || in_module("binary_heap")
+                        || in_module("array") =>
+                {
+                    sequence(first)
+                }
+                _ if in_module("hash") => {
+                    hash_table_max_items(*args, if in_module("set") { 1 } else { 2 })
+                }
+                _ if in_module("option") || in_module("result") => Some(1),
+                // A str view's upfront reservation is its `size_hint().0` (see
+                // `trust_types::alloc_model::str_view_max_reserved_items`).
+                "Chars" | "CharIndices" if in_module("str") => {
+                    Some(trust_types::alloc_model::str_view_max_reserved_items("chars"))
+                }
+                "EncodeUtf16" if in_module("str") => {
+                    Some(trust_types::alloc_model::str_view_max_reserved_items("utf16"))
+                }
+                "Bytes" if in_module("str") => {
+                    Some(trust_types::alloc_model::str_view_max_reserved_items("bytes"))
+                }
+                _ if in_module("str") => {
+                    Some(trust_types::alloc_model::str_view_max_reserved_items("split"))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The bytes a std collection of type `dest` reserves UPFRONT per item it receives
+/// from a `collect` (`into_live_receiver == false`) or an `extend`: a `Vec`/
+/// `VecDeque`/`BinaryHeap` its element; a `String` one byte (`Extend<char>`
+/// reserves the lower bound in bytes); a hash table its
+/// [`trust_types::alloc_model::hash_table_reserved_bytes_per_item`]; a `BTreeSet`/
+/// `BTreeMap` `collect` its entry, because `from_iter` first collects into a `Vec`.
+/// `None` for anything else.
+use trust_types::alloc_model::hash_table_reserved_bytes_per_item;
+
+fn std_collection_reserved_bytes_per_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    dest: ty::Ty<'tcx>,
+) -> Option<u128> {
+    let ty::Adt(def, args) = dest.kind() else { return None };
+    if !is_real_sysroot_crate(tcx, def.did().krate) {
+        return None;
+    }
+    let mut types = args.types();
+    let entry = |types: &mut dyn Iterator<Item = ty::Ty<'tcx>>, pair: bool| {
+        let k = types.next()?;
+        let t = if pair { ty::Ty::new_tup(tcx, &[k, types.next()?]) } else { k };
+        layout_bytes(tcx, t)
+    };
+    match tcx.item_name(def.did()).as_str() {
+        "Vec" | "VecDeque" | "BinaryHeap" | "BTreeSet" => entry(&mut types, false),
+        "BTreeMap" => entry(&mut types, true),
+        "String" => Some(1),
+        "HashSet" => hash_table_reserved_bytes_per_item(entry(&mut types, false)?),
+        "HashMap" => hash_table_reserved_bytes_per_item(entry(&mut types, true)?),
+        _ => None,
+    }
+}
+
+/// Review round 55: a `String` `extend` reserves upfront at most one byte per item
+/// for `char`/`&char` items (`size_hint().0` bytes), and nothing at all for the
+/// string-item impls (`&str`, `String`, `Box<str>`, `Cow<str>` push in turn), EXCEPT
+/// `Extend<&str>` over a by-value array, whose `SpecExtendStr` reserves the SUM of the
+/// lengths (review round 54). The source `I` is the call's last type argument.
+fn string_extend_reserves_at_most_one_byte_per_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    callee_def_id: DefId,
+    gen_args: ty::GenericArgs<'tcx>,
+) -> bool {
+    let Some(item) = extend_item_ty(tcx, callee_def_id, gen_args) else {
+        return false;
+    };
+    let item = item.peel_refs();
+    if item.is_char() {
+        return true;
+    }
+    let string_like = item.is_str()
+        || matches!(item.kind(), ty::Adt(def, _)
+            if is_real_sysroot_crate(tcx, def.did().krate)
+                && matches!(tcx.item_name(def.did()).as_str(), "String" | "Box" | "Cow"));
+    let Some(source) = gen_args.types().last() else {
+        return false;
+    };
+    string_like && !matches!(source.peel_refs().kind(), ty::Array(..) | ty::Slice(..))
+}
+
+/// The item type `A` of an `Extend<A>::extend` call, from the trait item's generics
+/// (`[Self, A, I]`) or the impl's trait reference. Review round 54: a `String`'s
+/// reservation is one byte per item only for `char`/`&char`; its `&str` impls
+/// (`SpecExtendStr`) reserve the SUM of the strings' lengths.
+fn extend_item_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    callee_def_id: DefId,
+    gen_args: ty::GenericArgs<'tcx>,
+) -> Option<ty::Ty<'tcx>> {
+    if tcx.trait_of_assoc(callee_def_id).is_some() {
+        return gen_args.types().nth(1);
+    }
+    let impl_did = tcx.trait_impl_of_assoc(callee_def_id)?;
+    let impl_args = gen_args.truncate_to(tcx, tcx.generics_of(impl_did));
+    let trait_ref = tcx.impl_trait_ref(impl_did).instantiate(tcx, impl_args).skip_normalization();
+    // Bind before the tail: the `types()` iterator borrows `trait_ref.args`
+    // under 2024 capture rules and must drop before the block ends.
+    let nth = trait_ref.args.types().nth(1);
+    nth
+}
+
+/// D12 option (a), the extractor half: the licence may erase a reserving
+/// `collect`/`extend` only when the largest reservation the bounded source can
+/// cause fits (`trust_types::alloc_model::bounded_source_reservation_fits`).
+fn bounded_source_reservation_fits_for<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    source: ty::Ty<'tcx>,
+    dest: ty::Ty<'tcx>,
+    into_live_receiver: bool,
+) -> bool {
+    // An `extend` into a LIVE hash table re-lays-out every existing entry as well, so
+    // the receiver's bytes do not add at factor one: never granted.
+    if into_live_receiver {
+        if let ty::Adt(def, _) = dest.kind() {
+            if matches!(tcx.item_name(def.did()).as_str(), "HashMap" | "HashSet") {
+                return false;
+            }
+        }
+    }
+    let Some(items) = into_iter_source_max_items(tcx, source, 8) else { return false };
+    let Some(per_item) = std_collection_reserved_bytes_per_item(tcx, dest) else { return false };
+    let (items, fixed) = match dest.kind() {
+        ty::Adt(def, _) => match tcx.item_name(def.did()).as_str() {
+            "HashMap" | "HashSet" => (items, trust_types::alloc_model::HASH_TABLE_FIXED_BYTES),
+            // Review round 55: `from_iter` sorts with a scratch of at least 48 elements.
+            "BTreeSet" | "BTreeMap" => {
+                (items.max(trust_types::alloc_model::BTREE_FROM_ITER_MIN_RESERVED_ITEMS), 0)
+            }
+            _ => (items, 0),
+        },
+        _ => (items, 0),
+    };
+    trust_types::alloc_model::bounded_source_reservation_fits(
+        items,
+        per_item,
+        fixed,
+        into_live_receiver,
+    )
+}
+
+/// Trust (SP-2, 2026-10-04): is the callable `f` — an adapter's callback or a `str`
+/// pattern's predicate, run INSIDE a sentineled `collect`/`extend` — code verified as
+/// its own root in this compilation? A LOCAL closure or a LOCAL function item with a
+/// body is: the premise `ty_names_unverified_code` (rustc_mir_transform's trust_verify)
+/// states for the consumer-edge gate — a call through a capture is charged in the
+/// closure's own body, and a local item that owes its callers a `requires` is refused
+/// at the hand-over by the callable type-argument gate, which reads this call's type
+/// arguments on the rustc MIR whatever this rewrite does (the `requires_local` control
+/// of the SP-2 fixture). A constructor builds a value and runs no code. `&F`/`&mut F`
+/// call `F`. Everything else is code nothing here verifies: a fn pointer, a `dyn Fn*`,
+/// a `Box`, a dependency's or sysroot's item or closure, a local `extern` item, a
+/// parameter.
+fn source_callback_is_verified<'tcx>(tcx: TyCtxt<'tcx>, f: ty::Ty<'tcx>, fuel: u32) -> bool {
+    use rustc_hir::def::DefKind;
+    if fuel == 0 {
+        return false;
+    }
+    match f.kind() {
+        ty::Closure(did, _) => did.is_local(),
+        ty::FnDef(did, _) => match tcx.def_kind(*did) {
+            DefKind::Ctor(..) => true,
+            DefKind::Fn | DefKind::AssocFn => did.is_local() && !tcx.is_foreign_item(*did),
+            _ => false,
+        },
+        ty::Ref(_, inner, _) => source_callback_is_verified(tcx, *inner, fuel - 1),
+        _ => false,
+    }
+}
+
+/// Trust (SP-2, 2026-10-04): does the `str::pattern::Pattern` type `p` search with
+/// core's own searchers (a `char`, `&str`, `&&str`, `&String`, or a `char` array or
+/// slice), or call a callback [`source_callback_is_verified`] accepts?
+fn str_pattern_runs_only_verified_code<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    p: ty::Ty<'tcx>,
+    fuel: u32,
+) -> bool {
+    match p.kind() {
+        ty::Char => true,
+        ty::Array(elem, _) => elem.is_char(),
+        ty::Ref(_, inner, _) => match inner.kind() {
+            ty::Str => true,
+            ty::Slice(elem) | ty::Array(elem, _) => elem.is_char(),
+            ty::Ref(_, s, _) => s.is_str(),
+            ty::Adt(def, _)
+                if is_real_sysroot_crate(tcx, def.did().krate)
+                    && tcx.item_name(def.did()).as_str() == "String" =>
+            {
+                true
+            }
+            _ => source_callback_is_verified(tcx, p, fuel),
+        },
+        _ => source_callback_is_verified(tcx, p, fuel),
+    }
+}
+
+/// `<iter as Iterator>::Item`, normalized. `None` when it does not normalize to a
+/// non-alias type, or when normalizing could re-enter `mir_built` (the guard every
+/// fully-monomorphized resolution in this file takes).
+fn iterator_item_ty<'tcx>(tcx: TyCtxt<'tcx>, iter: ty::Ty<'tcx>) -> Option<ty::Ty<'tcx>> {
+    normalized_item_projection(tcx, rustc_span::sym::IteratorItem, iter)
+}
+
+/// `<source as IntoIterator>::Item`, normalized, under the same guard and with the
+/// same `None` cases as [`iterator_item_ty`]. Trust (SP-1, 2026-10-04): the item a
+/// `String` `extend` drops.
+fn into_iterator_item_ty<'tcx>(tcx: TyCtxt<'tcx>, source: ty::Ty<'tcx>) -> Option<ty::Ty<'tcx>> {
+    normalized_item_projection(tcx, rustc_span::sym::IntoIteratorItem, source)
+}
+
+/// The associated type `item_sym` (a diagnostic item: `Iterator::Item` or
+/// `IntoIterator::Item`) of `self_ty`, normalized; `None` when it does not normalize to
+/// a non-alias type or when normalizing could re-enter `mir_built`.
+fn normalized_item_projection<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    item_sym: rustc_span::Symbol,
+    self_ty: ty::Ty<'tcx>,
+) -> Option<ty::Ty<'tcx>> {
+    let item = tcx.get_diagnostic_item(item_sym)?;
+    if crate::tuple_layouts::resolution_may_reenter(tcx, item, tcx.mk_args(&[self_ty.into()])) {
+        return None;
+    }
+    let projection = ty::Ty::new_projection(tcx, ty::IsRigid::No, item, [self_ty]);
+    let item_ty = tcx
+        .try_normalize_erasing_regions(
+            ty::TypingEnv::fully_monomorphized(),
+            ty::Unnormalized::new(projection),
+        )
+        .ok()?;
+    (!matches!(item_ty.kind(), ty::Alias(..))).then_some(item_ty)
+}
+
+/// Trust (W4 HASHMAP r3, 2026-09-29): can the std collection `dest` — a keyed
+/// `collect`'s destination, or (`receiver_is_live`) an `extend` receiver that may
+/// already hold items — reserve the `count` items of a bounded source without a
+/// "capacity overflow" / "Hash table capacity overflow" panic?
+///
+/// The per-item allocation is [`alloc_destination_stride`]'s: a hash table's
+/// element under hashbrown's bucket layout, any other std collection's element as a
+/// contiguous buffer (a `BTreeMap`/`BTreeSet` `from_iter` sorts in a `Vec` first).
+/// An unknown element size answers `false`, so the call keeps its real callee and
+/// the allocation lane charges it. GRANTING (it licenses the TOTAL sentinel), so
+/// only a proof of fit answers `true`.
+fn bounded_source_fits_destination<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    dest: ty::Ty<'tcx>,
+    count: LiveSourceCount,
+    receiver_is_live: bool,
+) -> bool {
+    use trust_types::live_source_bound::{
+        contiguous_capacity_fits, hash_table_capacity_fits, live_receiver_items,
+    };
+    // Trust (ALLOC-WIDTH-1, 2026-10-08): the count bound (`LiveSourceCount`, the
+    // `MAX_LIVE_USER_ADDRESS_SPACE_BYTES` axiom) and the `isize::MAX` both fit checks
+    // use are 64-bit facts. On a narrower target nothing bounds a live source below
+    // the object limit, so no destination is shown to fit and the call keeps its
+    // real callee — the allocation lane, which reads the same width from
+    // `VcgenContext::with_target_pointer_bits`, then charges it.
+    if tcx.data_layout.pointer_size().bits() != 64 {
+        return false;
+    }
+    let Some(AllocDestinationStride { bytes: Some(elem_bytes), hash_table }) =
+        alloc_destination_stride(tcx, dest, 4)
+    else {
+        return false;
+    };
+    let elem_bytes = u128::from(elem_bytes);
+    let mut items = count.max_items();
+    if receiver_is_live {
+        items = items.saturating_add(live_receiver_items(elem_bytes, hash_table));
+    }
+    if hash_table {
+        hash_table_capacity_fits(elem_bytes, items)
+    } else {
+        contiguous_capacity_fits(elem_bytes, items)
+    }
+}
+
+/// The `IntoIterator` source of a keyed `collect` (`self`, argument 0) or a
+/// collection `extend` (`iter`, argument 1), read from the instantiated
+/// signature so the impl-vs-trait generic layout never matters.
+fn call_input_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    callee_def_id: rustc_span::def_id::DefId,
+    gen_args: ty::GenericArgs<'tcx>,
+    index: usize,
+) -> Option<ty::Ty<'tcx>> {
+    tcx.fn_sig(callee_def_id).instantiate(tcx, gen_args).skip_binder().inputs().get(index).copied()
+}
+
+/// Keep the allocation annotation identical at the call and bundled-body ends.
+/// The byte count comes from this instance's layout, never from a parsed name.
+/// Faithful extraction retains ordinary executable names without VC annotations.
+pub(crate) fn with_bulk_alloc_element_size<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    generic_args: ty::GenericArgs<'tcx>,
+    name: String,
+) -> String {
+    if ty_convert::faithful_scalars() {
+        return name;
+    }
+    // Trust (W4 HASHMAP r2, 2026-09-27): a sink that allocates a std HASH TABLE
+    // carries the hash-table token instead — including `extend`/`unzip` into one,
+    // which the plain token never sized — so vcgen charges hashbrown's bucket layout
+    // and fails closed on an unknown element. Every other call is stamped exactly as
+    // before. See `std_hash_table_sink_element_bytes`.
+    if let Some(table_elem_bytes) = std_hash_table_sink_element_bytes(tcx, def_id, generic_args) {
+        return format!(
+            "{name}{}",
+            trust_types::render_trailing_table_elem_bytes_token(table_elem_bytes)
+        );
+    }
+    if tcx.opt_item_name(def_id).is_none_or(|sym| is_bulk_alloc_sink_call(sym.as_str()))
+        && is_bulk_alloc_sink_call(&crate::safe_def_path_str(tcx, def_id))
+    {
+        if let Some(size) = bulk_alloc_elem_byte_size(tcx, def_id, generic_args) {
+            return format!("{name}{}", trust_types::render_trailing_elem_bytes_token(size));
+        }
+    }
+    // Trust (W4 HASHMAP r3, 2026-09-29): `extend` into a contiguous std collection
+    // that reserves from `size_hint`, and `unzip` into contiguous halves, carry the
+    // plain token too. They were the two trait sinks vcgen charged without an element
+    // size, so its bounded-source skip could not tell a `Vec<u8>` destination from a
+    // `Vec<[u8; 1 << 35]>` one. See `contiguous_extend_or_unzip_elem_bytes`.
+    if let Some(size) = contiguous_extend_or_unzip_elem_bytes(tcx, def_id, generic_args) {
+        return format!("{name}{}", trust_types::render_trailing_elem_bytes_token(size));
+    }
+    name
+}
+
+/// Trust (W4 HASHMAP r3, 2026-09-29): the element size of a CONTIGUOUS destination
+/// of the two trait sinks the plain token did not size — `Extend::extend` whose
+/// receiver is std's `Vec`/`VecDeque`/`String`/`BinaryHeap` (the collections whose
+/// `extend` reserves `size_hint().0`; a hash-table receiver carries the hash-table
+/// token already, and `BTreeMap`/`BTreeSet`/`LinkedList` reserve nothing) or a
+/// tuple of std collections (the largest component element), and
+/// `Iterator::unzip` into halves none of which is a hash table (the LARGEST half's
+/// element: both reserve from one count). By identity — the trait
+/// ([`bulk_alloc_trait_role`]), the receiver's sysroot ADT, the exact layout — never
+/// by the rendered name. `None` for an unknown layout, which leaves the call
+/// unstamped exactly as before.
+fn contiguous_extend_or_unzip_elem_bytes<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    generic_args: ty::GenericArgs<'tcx>,
+) -> Option<u64> {
+    match bulk_alloc_trait_role(tcx, def_id)? {
+        BulkAllocTraitRole::UnzipHalves => {
+            let types: Vec<ty::Ty<'tcx>> = generic_args.types().collect();
+            let stride = combine_alloc_destinations(
+                [types.get(3), types.get(4)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|half| alloc_destination_stride(tcx, *half, 4)),
+            )?;
+            if stride.hash_table { None } else { stride.bytes }
+        }
+        BulkAllocTraitRole::SelfCollection if tcx.item_name(def_id).as_str() == "extend" => {
+            let receiver = generic_args.types().next()?;
+            let reserving = match receiver.kind() {
+                ty::Adt(def, _) => {
+                    is_real_sysroot_crate(tcx, def.did().krate)
+                        && matches!(
+                            tcx.item_name(def.did()).as_str(),
+                            "Vec" | "VecDeque" | "String" | "BinaryHeap"
+                        )
+                }
+                // core's tuple `Extend` reserves in every component (the largest
+                // component element is charged, as for `unzip`).
+                ty::Tuple(_) => true,
+                _ => false,
+            };
+            if !reserving {
+                return None;
+            }
+            let stride = alloc_destination_stride(tcx, receiver, 4)?;
+            if stride.hash_table { None } else { stride.bytes }
+        }
+        _ => None,
+    }
 }
 
 /// The authoritative call-site name a `Terminator::Call` carries for `func` — the
-/// `safe_def_path_str` of the callee, EXCEPT for the totality-rewrite classes
-/// (`?`-total, bulk-alloc element-byte sink) which append a recognizable token.
+/// compiler-resolved concrete path, with collision defenses and guarded local
+/// devirtualization. Authenticated primitive markers identify exact operations;
+/// verifier-only totality rewrites and obligation suffixes are non-faithful only.
 ///
 /// `pub` so the verifier driver can key callee-contract summaries by the SAME name
 /// the extracted call carries: keying by the bare `safe_def_path_str` left a
 /// rewritten-name callee's `#[requires]` unfindable at the call site — a fail-open
-/// (audit R2 #10). (The total-`Clone` / derived-trait sentinel override is applied
-/// at the call-conversion site, not here, and only to contract-free calls.)
-pub fn func_operand_name<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> String {
+/// (audit R2 #10). Total-call sentinel rewrites live here too; the debug-finisher
+/// rewrite additionally needs block statements in `convert_basic_block`.
+///
+/// Trust (2026-10-05, SUMMARY-NAME-COLLIDE-1, the call-site half): a name this
+/// returns that EQUALS a local function's definition key names that function;
+/// see [`tag_local_definition_key_alias`].
+///
+/// Trust (GCKA-SELF-CALL-2, 2026-10-10): `caller` is the item whose OWN MIR `func`
+/// is an operand of — `body.source.def_id()` for a body that is that item's
+/// `mir_built`/`optimized_mir`/promoted MIR, or MIR inlined into it, or such a body
+/// instantiated at CONCRETE arguments only (see [`func_operand_name_in_body`]).
+/// Never pass the item of a body instantiated at another item's parameters: the
+/// call's parameters would then be compared with the wrong item's. `None` when
+/// the site does not know it. The only name `caller` changes is a generic trait
+/// impl item's direct call to ITSELF, which `None` tags like any unresolvable
+/// call (fail-closed). Every site that compares names for one body passes that
+/// body's item, so the call carries ONE name in every lane.
+pub fn func_operand_name<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: Option<DefId>,
+    func: &mir::Operand<'tcx>,
+) -> String {
+    let name = func_operand_name_before_alias_tag(tcx, func);
     match func {
-        mir::Operand::Constant(box const_op) => {
+        mir::Operand::Constant(const_op) => match const_op.const_.ty().kind() {
+            rustc_middle::ty::TyKind::FnDef(def_id, generic_args) => {
+                tag_local_definition_key_alias(
+                    tcx,
+                    caller,
+                    *def_id,
+                    generic_args.skip_binder(),
+                    name,
+                )
+            }
+            _ => name,
+        },
+        _ => name,
+    }
+}
+
+/// [`func_operand_name`] for a call operand of `body`, whose item is the caller.
+/// `body` must be its item's own MIR (or that MIR instantiated at concrete
+/// arguments only); see [`func_operand_name`].
+pub fn func_operand_name_in_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mir::Body<'tcx>,
+    func: &mir::Operand<'tcx>,
+) -> String {
+    func_operand_name(tcx, Some(body.source.def_id()), func)
+}
+
+/// Trust (2026-10-05, SUMMARY-NAME-COLLIDE-1, the call-site half): keep a call
+/// from wearing a local function's DEFINITION key unless the call runs that
+/// function.
+///
+/// Every lane that matches a call to a body BY NAME relies on one property: a
+/// call whose name is the definition key `K` of a local function `D`
+/// (`safe_def_path_str(D)`) runs `D`. The body-derived summary lanes key a
+/// summary on `K` and hand it to every call named `K`; the bridge binds a call
+/// to the bundled body of that name. The render does not give that property. It
+/// prints a call from its instantiated arguments and canonicalizes lifetimes to
+/// `'_`, so a call that runs ONE body can print as ANOTHER body's key:
+///
+/// ```text
+/// impl Marker for V<for<'a> fn(&'a u8) -> &'a u8> {}
+/// impl<T: Marker> W<T> { pub fn get(x: u32) -> u32 { x } }
+/// impl W<V<for<'a> fn(&'a u8) -> &'static u8>> { pub fn get(_x: u32) -> u32 { 1 } }
+/// pub fn f(x: u32) -> u32 { W::<V<for<'a> fn(&'a u8) -> &'a u8>>::get(x) + 1 }
+/// ```
+///
+/// `f`'s call runs the generic `get` (it returns `x`), but prints
+/// `k::W::<k::V<for<'_> fn(&'_ u8) -> &'_ u8>>::get`, the concrete sibling's
+/// definition key. Only one DEFINITION renders that key, so the definition-side
+/// refusal (`trust_verify::body_summary_key_collisions`) saw nothing, the call was
+/// handed the sibling's const set `{1}`, and `f`'s `+ 1` was kernel-certified
+/// overflow-free under certify while `f(u32::MAX)` panics (MEASURED on the stage 1
+/// of `dc15b882f6`; `tests/ui/trust/summary_generic_impl_call_key_alias.rs`). The
+/// trait form (`impl<T: Marker> Tr for W<T>` beside a concrete sibling impl)
+/// prints the same way, because a call that resolves to a GENERIC impl keeps the
+/// trait spelling (`devirtualized_callee_name` declines it).
+///
+/// So when the name is some local function's definition key, the call's target is
+/// asked: for a free or inherent function it is the `FnDef` itself; for a trait
+/// method it is `Instance::try_resolve` (concrete arguments only). If the target
+/// is not a function that renders that key, the name is tagged with a
+/// non-source-spellable `::<__trust_alias@…>` (a fingerprint of the callee's
+/// `DefPathHash` and arguments), which no definition key can equal, so no lane
+/// matches the call to the other body. Unresolvable (`Ok(None)`, an error, or a
+/// declined re-entrant resolution) counts as not reaching: the tag only ever
+/// separates a call from a body.
+///
+/// A TRAIT call whose arguments still mention a type or const parameter (a call
+/// from a generic body) is tagged WITHOUT being asked. Its target depends on the
+/// caller's instantiation, and this function is not given the caller, so it is
+/// unresolvable here and falls under the rule above.
+///
+/// Trust (2026-10-06, GENERIC-CALL-KEY-ALIAS-1): that branch used to return the
+/// name unchanged, which was `direct_call_def_path` residual 1. In
+/// `fn f<T: Tr>(x: &T) -> u32 { x.m() + 1 }` the open dispatch prints
+/// `<T as k::Tr>::m`, and so does the definition key of a local blanket
+/// `impl<T: Marker> Tr for T`. Every by-name lane took the blanket body for the
+/// call. The return-summary lane lent its bound `m() == 1`, so certify
+/// kernel-certified `f`'s `[overflow:add]`, while `f::<Foo>` with
+/// `impl Tr for Foo { fn m(&self) -> u32 { u32::MAX } }` panics. BEFORE measured on
+/// the stage 1 of `4ccd862830`; the AFTER is predicted from the `U`-renamed twin,
+/// which prints no definition key
+/// (`tests/ui/trust/generic_call_key_alias_blanket_impl.rs`).
+///
+/// The cost is fail-closed. The SOUND twin `fn f<T: Marker>`, where the blanket
+/// really is every instantiation's target, prints byte-identically, so it loses the
+/// by-name bind and summary too. So does a generic impl's call to its own sibling
+/// trait method (`self.b()` inside `impl<T: Marker> Tr for T`). Each is decided like
+/// any open dispatch: Φ, the instance-hypothesis lane, or an absent-callee row.
+/// Recovering them needs `Instance::try_resolve` under the CALLER's
+/// `TypingEnv::post_analysis`, and that needs the caller plumbed into every
+/// `func_operand_name` site (DECISION_QUEUE GENERIC-CALL-KEY-ALIAS-1). A free or
+/// inherent function is unaffected, because its `FnDef` is its target whatever the
+/// caller.
+///
+/// Trust (GCKA-SELF-CALL-2, 2026-10-10): the costs above included a generic trait
+/// impl's direct call to ITSELF, which nothing recorded. `self.depth(n - 1)` inside
+/// `impl<T> Depth for W<T>` prints `<W<T> as Depth>::depth`, the body's own key,
+/// and was tagged, so the bridge stopped binding the call to its own body: it
+/// became a generic absent callee, a fatal row under the default policy. A
+/// terminating, panic-free recursive method of a generic trait impl or a blanket
+/// impl went from accepted (rc 0 on main `912bbdf300`) to refused (rc 1 on the
+/// wave-20 stage 1 `8f3584d2fe`); MEASURED,
+/// `tests/ui/trust/generic_call_key_alias_self_call.rs`. Every site now passes
+/// the call's caller (`caller`, see [`func_operand_name`]), and a call whose
+/// arguments are the caller's own identity arguments for the trait item the
+/// caller implements keeps its name ([`identity_self_call_of_caller`], which also
+/// says why such a call can only run the caller). The alias the tag closes is
+/// untouched: `fn f<T: Tr>` implements no trait item, so its call is still
+/// tagged. So are the sound twin and the sibling call; their target is not the
+/// caller, and recovering them is still the recorded follow-up.
+fn tag_local_definition_key_alias<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: Option<DefId>,
+    def_id: DefId,
+    generic_args: ty::GenericArgs<'tcx>,
+    name: String,
+) -> String {
+    let keys = local_fn_definition_keys(tcx);
+    let Some(owners) = keys.get(name.as_str()) else {
+        return name;
+    };
+    let target = if tcx.trait_of_assoc(def_id).is_none() {
+        Some(def_id)
+    } else if generic_args.has_non_region_param()
+        || generic_args.has_non_region_infer()
+        || generic_args.has_non_region_placeholders()
+    {
+        // GENERIC-CALL-KEY-ALIAS-1 (see the doc above): the target depends on the
+        // caller's instantiation, so a call that does not resolve under the
+        // caller's own environment to the caller itself counts as not reaching.
+        // It used to keep the name. GCKA-SELF-CALL-2: a direct self call does.
+        identity_self_call_of_caller(tcx, caller, owners, def_id, generic_args)
+    } else if crate::tuple_layouts::resolution_may_reenter(tcx, def_id, generic_args) {
+        None
+    } else {
+        ty::Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), def_id, generic_args)
+            .ok()
+            .flatten()
+            .and_then(|instance| {
+                matches!(instance.def, ty::InstanceKind::Item(_)).then(|| instance.def_id())
+            })
+    };
+    if target.is_some_and(|target| owners.contains(&target)) {
+        return name;
+    }
+    let (lo, hi) =
+        tcx.def_path_hash(def_id).0.combine(generic_args_fingerprint(tcx, generic_args)).split();
+    let (lo, hi) = (lo.as_u64(), hi.as_u64());
+    format!("{name}::<__trust_alias@{lo:016x}{hi:016x}>")
+}
+
+/// Trust (GCKA-SELF-CALL-2, 2026-10-10): `Some(caller)` exactly when the trait
+/// call `def_id::<generic_args>` is `caller`'s direct call to ITSELF, decided from
+/// `DefId`s and types, never from the rendering:
+///
+/// * `caller` is an item of a trait impl `I`, and `def_id` is the trait item it
+///   implements (`trait_item_of`);
+/// * the call's arguments ARE `caller`'s identity arguments translated to that
+///   trait item: `I`'s own trait reference at `I`'s own parameters, then
+///   `caller`'s own (method) parameters, regions erased on both sides;
+/// * `caller` alone renders the call's key (`owners == [caller]`; a key two
+///   functions render is no identity, `local_fn_definition_key_is_shared`).
+///
+/// WHY THAT IS A SELF CALL. A generic impl item runs only as an instance rustc
+/// selected for a trait reference: a trait call, a vtable slot and a reified
+/// `<T as Tr>::m` are all resolved from `<T0 as Tr>`. So when `caller` runs at
+/// arguments `s`, selection already chose `caller` for `I`'s trait reference at
+/// `s`, and the call, which is that trait reference at `s`, selects it again.
+/// This holds where `Instance::try_resolve` declines: a where-clause candidate,
+/// and a specializable `default fn` (a specializing impl that does not override
+/// it inherits this very body; one that does override it is selected before
+/// `caller` ever runs at those arguments).
+///
+/// SOUND ONLY FOR THE RIGHT CALLER. The arguments are compared by structure, and
+/// a parameter is its index and name, so the call must be an operand of
+/// `caller`'s own MIR (the contract of [`func_operand_name`]'s `caller`). The
+/// one call this can be confused with is the alias the tag exists for, a
+/// generic FREE caller (`fn f<T: Tr>(x: &T) { x.m() }`), and that caller is no
+/// trait impl item, so it never passes the first condition.
+fn identity_self_call_of_caller<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: Option<DefId>,
+    owners: &[DefId],
+    def_id: DefId,
+    generic_args: ty::GenericArgs<'tcx>,
+) -> Option<DefId> {
+    let caller = caller?;
+    if !matches!(owners, [only] if *only == caller) || tcx.trait_item_of(caller) != Some(def_id) {
+        return None;
+    }
+    let (impl_def_id, rustc_hir::def::DefKind::Impl { of_trait: true }) =
+        tcx.assoc_parent(caller)?
+    else {
+        return None;
+    };
+    let trait_args =
+        tcx.impl_opt_trait_ref(impl_def_id)?.instantiate_identity().skip_normalization().args;
+    let identity =
+        ty::GenericArgs::identity_for_item(tcx, caller).rebase_onto(tcx, impl_def_id, trait_args);
+    (tcx.erase_and_anonymize_regions(identity) == tcx.erase_and_anonymize_regions(generic_args))
+        .then_some(caller)
+}
+
+/// Trust (ARGS-FINGERPRINT-READ-1 round 3, 2026-10-07): does some OTHER local
+/// function render `def_id`'s definition key (`safe_def_path_str`)? The key is
+/// not an identity: `impl Tr for W<dup_a::T>` and `impl Tr for W<dup_b::T>` (or
+/// `W<other::T>` and `W<T>` in a Cargo bin+lib pair, where both crates are named
+/// alike) render one `<W<dupty::T> as Tr>::f`, because the printer stamps no
+/// crate identity inside a self type. Read from the same HIR-only table
+/// [`tag_local_definition_key_alias`] uses. A non-local `def_id` answers `false`
+/// (its own key is the callee-root `__trust_crate@` rule's business).
+pub fn local_fn_definition_key_is_shared(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if !def_id.is_local() {
+        return false;
+    }
+    let keys = local_fn_definition_keys(tcx);
+    keys.get(crate::safe_def_path_str(tcx, def_id).as_str())
+        .is_some_and(|owners| owners.iter().any(|owner| *owner != def_id))
+}
+
+/// Session-scoped cache for [`local_fn_definition_keys`].
+#[derive(Default)]
+struct SessionLocalFnDefinitionKeys(
+    Option<std::sync::Arc<rustc_data_structures::fx::FxHashMap<String, Vec<DefId>>>>,
+);
+
+/// Every local function's definition key (`safe_def_path_str`, the key the
+/// body-derived summary lanes and the bundle name a body by), with the functions
+/// that render it. Read from HIR only (`hir_crate_items`), never `mir_keys`:
+/// this runs inside `mir_built`, where `mir_keys` can demand the body under
+/// construction (E0391; see `devirtualized_callee_name`). Built once per
+/// session, outside the session lock, because rendering runs queries.
+fn local_fn_definition_keys(
+    tcx: TyCtxt<'_>,
+) -> std::sync::Arc<rustc_data_structures::fx::FxHashMap<String, Vec<DefId>>> {
+    if let Some(keys) = tcx
+        .sess
+        .with_trust_compiler_state::<SessionLocalFnDefinitionKeys, _>(|state| state.0.clone())
+    {
+        return keys;
+    }
+    let mut keys: rustc_data_structures::fx::FxHashMap<String, Vec<DefId>> = Default::default();
+    for local in tcx.hir_crate_items(()).definitions() {
+        if !matches!(
+            tcx.def_kind(local),
+            rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
+        ) {
+            continue;
+        }
+        let def_id = local.to_def_id();
+        keys.entry(crate::safe_def_path_str(tcx, def_id)).or_default().push(def_id);
+    }
+    let keys = std::sync::Arc::new(keys);
+    tcx.sess.with_trust_compiler_state::<SessionLocalFnDefinitionKeys, _>(|state| {
+        state.0.get_or_insert(keys).clone()
+    })
+}
+
+fn func_operand_name_before_alias_tag<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+) -> String {
+    match func {
+        mir::Operand::Constant(const_op) => {
             let ty = const_op.const_.ty();
             match ty.kind() {
                 rustc_middle::ty::TyKind::FnDef(def_id, generic_args) => {
-                    let diagnostic_path = crate::safe_def_path_str(tcx, *def_id);
                     // Contract-summary identity must include the exact call-site
                     // instantiation.  A bare DefId path aliases `f::<bool>` and
                     // `f::<i32>`, allowing the first summary inserted to type and
                     // discharge the second call.  Use rustc's canonical concrete
                     // path for every call; downstream `method_tail` deliberately
                     // strips trailing turbofish arguments for semantic classifiers.
-                    let concrete_path =
-                        crate::safe_def_path_str_with_args(tcx, *def_id, generic_args);
-                    let generic = direct_call_def_path(tcx, *def_id, generic_args, concrete_path);
+                    let concrete_path = crate::safe_def_path_str_with_args(
+                        tcx,
+                        *def_id,
+                        generic_args.skip_binder(),
+                    );
+                    let generic = direct_call_def_path(
+                        tcx,
+                        *def_id,
+                        generic_args.skip_binder(),
+                        concrete_path,
+                    );
                     // W-BITINTRIN collision defense: diagnostic paths are
                     // source-spellable, so a user can otherwise declare
                     // `mod intrinsics { fn ctpop(..) }` and impersonate a body-less
@@ -8195,6 +13105,18 @@ pub fn func_operand_name<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> 
                     if let Some(marked) =
                         tcx_marked_pure_total_intrinsic_path(tcx, *def_id, &generic)
                     {
+                        return marked;
+                    }
+                    // Trust (std-call-summaries P2): the PANIC-FREEDOM-ONLY intrinsic
+                    // stamp, for intrinsics that are panic-free but nondeterministic or
+                    // fallback-bodied. A distinct namespace the facet and determinism
+                    // gates never read; see `tcx_marked_panic_free_intrinsic_path`.
+                    if let Some(marked) = tcx_marked_panic_free_intrinsic_path(
+                        tcx,
+                        *def_id,
+                        &generic,
+                        generic_args.skip_binder(),
+                    ) {
                         return marked;
                     }
                     if let Some(marked) =
@@ -8212,6 +13134,23 @@ pub fn func_operand_name<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> 
                     {
                         return marked;
                     }
+                    // A panic-free callee is not an arbitrary return value in
+                    // an executable/refinement model. Keep the real call and
+                    // exact generic/crate identity in the faithful lane. The
+                    // guarded devirtualization is the same body resolution used
+                    // below; original FnDef keys/identities are recorded separately.
+                    if ty_convert::faithful_scalars() {
+                        return devirtualized_callee_name(tcx, *def_id, generic_args.skip_binder())
+                            .unwrap_or(generic);
+                    }
+                    if let Some(marked) = tcx_marked_total_to_string_path(
+                        tcx,
+                        *def_id,
+                        generic_args.skip_binder(),
+                        &generic,
+                    ) {
+                        return marked;
+                    }
                     // Trust (#84): the `?` operator desugars to a `Try::branch` call and
                     // (on the early-return arm) a `FromResidual::from_residual` call. For
                     // the std `Result`/`Option`/`ControlFlow` carriers — when no error
@@ -8227,45 +13166,19 @@ pub fn func_operand_name<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> 
                     // when that From impl's CONCRETE MIR is proven structurally panic-free
                     // (`converting_from_is_structurally_total`); otherwise it stays
                     // fail-closed. See `trust_try_total_marker`.
-                    if trust_try_total_marker(tcx, *def_id, generic_args) {
+                    if trust_try_total_marker(tcx, *def_id, generic_args.skip_binder()) {
                         return format!("{generic}::<__trust_try_total>");
                     }
-                    // For a bulk-allocation sink, re-render WITH concrete generic
-                    // arguments so the element type (and `size_of::<T>()`) survives
-                    // to trust-vcgen's capacity-overflow obligation. `def_path_str`
-                    // alone renders the GENERIC definition (`Vec::<T>`), erasing the
-                    // concrete element so a multi-byte `Vec::<[u8; N]>::with_capacity`
-                    // was byte-size-blind (SOUNDNESS, hunt-11). Localized to sinks so
-                    // no other callee string changes. The concrete `Vec::<…>` turbofish
-                    // is a MIDDLE turbofish, so `method_tail`/`is_bulk_alloc_sink_call`
-                    // (which `rsplit("::")`) still recover the same `with_capacity` tail.
-                    let name = if is_bulk_alloc_sink_call(&diagnostic_path) {
-                        let concrete = direct_call_def_path(
-                            tcx,
-                            *def_id,
-                            generic_args,
-                            crate::safe_def_path_str_with_args(tcx, *def_id, generic_args),
-                        );
-                        // Carry the AUTHORITATIVE element byte size (tcx.layout_of) as the
-                        // trailing `::<__trust_elem_bytes@N>` token — the shared
-                        // `trust_types` spelling: `@` is not identifier-spellable and the
-                        // consumers admit ONLY the trailing-position grammar, so a user
-                        // type/param named after the token can never impersonate it
-                        // (batch-6 review D1; the old `_N` spelling was a legal
-                        // identifier). vcgen thus sizes EVERY concrete element —
-                        // including a named struct/enum whose spelling does not reveal
-                        // its size. A trailing turbofish, so `method_tail` strips it and
-                        // the `with_capacity` tail recognizers are unaffected.
-                        match bulk_alloc_elem_byte_size(tcx, generic_args) {
-                            Some(sz) => format!(
-                                "{concrete}{}",
-                                trust_types::render_trailing_elem_bytes_token(sz)
-                            ),
-                            None => concrete,
-                        }
-                    } else {
-                        generic
-                    };
+                    // Preserve the exact element layout on allocation calls and
+                    // their bundled bodies. A named type's path alone cannot size
+                    // it. The trailing, non-source-spellable @ token remains part
+                    // of the full identity and of vcgen's byte-capacity obligation.
+                    let name = with_bulk_alloc_element_size(
+                        tcx,
+                        *def_id,
+                        generic_args.skip_binder(),
+                        generic,
+                    );
                     // Apply the compiler-authenticated primitive-comparison
                     // sentinel rewrite HERE so the IR
                     // `Terminator::Call.func` string and the verifier's summary-registration
@@ -8278,47 +13191,52 @@ pub fn func_operand_name<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> 
                     // spelling. The
                     // devirtualization rename below must never pre-empt it — doing so
                     // would discard the authenticated total-call identity.
-                    let sentineled = apply_total_clone_sentinel(tcx, func, name.clone());
-                    if sentineled != name {
-                        return sentineled;
+                    let semantic_path = call_path_without_trailing_turbofish(&name);
+                    if apply_total_clone_sentinel(tcx, func, &name, semantic_path) {
+                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
                     }
                     // FIX 2: the analogous rewrite for a provably-total DERIVED
                     // `PartialEq::eq` — same sentinel, same fail-closed discipline,
                     // same placement BEFORE devirtualization (a derived impl call
                     // belongs to the sentinel lane, not the devirt rename, which
                     // itself excludes `#[automatically_derived]` impls).
-                    let eq_sentineled = apply_total_partial_eq_sentinel(tcx, func, name.clone());
-                    if eq_sentineled != name {
-                        return eq_sentineled;
+                    if apply_total_partial_eq_sentinel(tcx, func, semantic_path) {
+                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
                     }
                     // Build D: the analogous rewrite for a provably-total DERIVED
                     // `PartialOrd`/`Ord` comparison — same sentinel, same fail-closed
                     // discipline, same placement BEFORE devirtualization.
-                    let ord_sentineled = apply_total_partial_ord_sentinel(tcx, func, name.clone());
-                    if ord_sentineled != name {
-                        return ord_sentineled;
+                    if apply_total_partial_ord_sentinel(tcx, func, semantic_path) {
+                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
                     }
                     // Batch-1 L3: a primitive `<P as Hash>::hash::<H>` fed by a real-
                     // sysroot hasher is panic-free — same sentinel, same fail-closed
                     // discipline, same placement BEFORE devirtualization.
-                    let hash_sentineled =
-                        apply_total_primitive_hash_sentinel(tcx, func, name.clone());
-                    if hash_sentineled != name {
-                        return hash_sentineled;
+                    if apply_total_primitive_hash_sentinel(tcx, func, semantic_path) {
+                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
                     }
                     // Devirtualization rename (see `devirtualized_callee_name`): a call
                     // that resolves to a LOCAL impl with available MIR takes the IMPL's
                     // name so the bridge matches its bundled, verified body. Fail-closed
                     // `None` keeps the trait spelling and falls through to the marker.
-                    if let Some(devirt) = devirtualized_callee_name(tcx, *def_id, generic_args) {
+                    if let Some(devirt) =
+                        devirtualized_callee_name(tcx, *def_id, generic_args.skip_binder())
+                    {
                         return devirt;
                     }
                     // Trust (str char-boundary soundness): mark a `str` range-index
                     // callee so trust-vcgen can mint the extra UTF-8 char-boundary
                     // obligation. See `apply_str_index_marker`.
-                    apply_str_index_marker(tcx, func, name)
+                    apply_str_index_marker(tcx, func, semantic_path.ends_with("::index") || semantic_path.ends_with("::index_mut"), name)
                 }
-                _ => format!("{ty}"),
+                // A constant callee that is not an `FnDef` — e.g. `const F: fn(Foo) = f;`
+                // then `F(x)`. Its name is the rendered TYPE, and displaying a type that
+                // mentions an ADT consults the `trimmed_def_paths` query exactly as a bare
+                // `def_path_str` does: it arms rustc's `must_produce_diag` (an ICE at
+                // `DiagCtxt` teardown on a compile that emits no diagnostic) and yields a
+                // context-dependent spelling. A call NAME is an identity string, so it is
+                // rendered untrimmed like every other one this function returns.
+                _ => rustc_middle::ty::print::with_no_trimmed_paths!(format!("{ty}")),
             }
         }
         _ => "<indirect>".to_string(),
@@ -8342,6 +13260,328 @@ fn tcx_marked_pure_total_intrinsic_path(
     Some(format!("{}{}", trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX, path))
 }
 
+/// How many call levels below a fallback body the panic-freedom pin follows.
+/// `minimum_number_nsz_f64` needs 1 (`f64::is_nan`); `minimumf64` needs 2
+/// (`is_sign_negative` -> `to_bits`). A deeper chain fails closed.
+const PANIC_FREE_FALLBACK_PIN_DEPTH: u32 = 3;
+
+/// Trust (std-call-summaries P2): mark a direct call to one of the PANIC-FREE but
+/// nondeterministic or fallback-bodied `core` intrinsics
+/// ([`trust_types::PANIC_FREE_RUSTC_INTRINSICS`]) with
+/// [`trust_types::TRUST_RUSTC_PANIC_FREE_INTRINSIC_PATH_PREFIX`].
+///
+/// The stamp means PANIC-FREEDOM ONLY. It is a different namespace from the
+/// deterministic marker minted just above, so the facet and determinism gates,
+/// which read only that one, never see these callees as deterministic: a
+/// facet-gated function that calls `f64::max` is still refused.
+///
+/// Every gate is a `TyCtxt` fact, and every miss returns `None` (the call keeps
+/// its absent-callee row):
+/// 1. `TyCtxt::intrinsic` authenticates the `FnDef` as a `#[rustc_intrinsic]`
+///    item, and the item lives in the compiler's own `core` (name + artifact
+///    residency, [`is_real_core_crate`]). A local `fn maximum_number_nsz_f64` is
+///    no intrinsic and is never stamped;
+/// 2. the intrinsic NAME is an exact list entry, and the entry's declared body
+///    shape agrees with `must_be_overridden`;
+/// 3. `#[rustc_nounwind]` (`NEVER_UNWIND`) and a SAFE signature;
+/// 4. a fallback-bodied intrinsic's fallback body is pinned panic-free
+///    ([`sysroot_fallback_body_is_pinned_panic_free`]): the backend may run its
+///    own lowering (the nounwind premise) OR the fallback body, so both must be.
+fn tcx_marked_panic_free_intrinsic_path<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    path: &str,
+    generic_args: ty::GenericArgs<'tcx>,
+) -> Option<String> {
+    let intrinsic = tcx.intrinsic(def_id)?;
+    let base_name = intrinsic.name.as_str();
+    // Upstream 1.101: the transcendental families are ONE generic item each
+    // (`sin<T: FloatPrimitive>`), so the exact-name gate falls back to the
+    // generic gate keyed on the call's float width. Both gates admit only
+    // exact entries of the counted list.
+    let entry = trust_types::panic_free_intrinsic_entry(base_name).or_else(|| {
+        let width = match generic_args.types().next().map(|t| *t.kind()) {
+            Some(ty::TyKind::Float(rustc_ast_ir::FloatTy::F16)) => 16,
+            Some(ty::TyKind::Float(rustc_ast_ir::FloatTy::F32)) => 32,
+            Some(ty::TyKind::Float(rustc_ast_ir::FloatTy::F64)) => 64,
+            Some(ty::TyKind::Float(rustc_ast_ir::FloatTy::F128)) => 128,
+            _ => return None,
+        };
+        trust_types::panic_free_intrinsic_entry_for_generic(base_name, width)
+    })?;
+    if !panic_free_intrinsic_mint_admits(tcx, def_id, entry) {
+        return None;
+    }
+    // The stamped grammar names the ENTRY (the per-width spelling), never the
+    // rendered call path: a generic call renders `core::intrinsics::sin` (or
+    // with a turbofish), which no consumer classifies. The rendered path must
+    // still name this very item under `core::intrinsics`; anything else fails
+    // closed.
+    let Some(rest) =
+        path.strip_prefix("core::intrinsics::").and_then(|s| s.strip_prefix(base_name))
+    else {
+        return None;
+    };
+    if !rest.is_empty() && !rest.starts_with("::<") {
+        return None;
+    }
+    let marked = format!(
+        "{}core::intrinsics::{}",
+        trust_types::TRUST_RUSTC_PANIC_FREE_INTRINSIC_PATH_PREFIX,
+        entry.name
+    );
+    (trust_types::classify_panic_free_intrinsic(&marked) == Some(entry)).then_some(marked)
+}
+
+/// The mint's `TyCtxt` gates for one list entry, factored out so the self-test
+/// ([`panic_free_intrinsic_mint_selftest`]) can drive each gate in isolation with an
+/// entry the list does not hold. Gates 1, 3 and 4 of
+/// [`tcx_marked_panic_free_intrinsic_path`]; the name gate is the caller's.
+fn panic_free_intrinsic_mint_admits(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    entry: trust_types::PanicFreeIntrinsicEntry,
+) -> bool {
+    use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+    let Some(intrinsic) = tcx.intrinsic(def_id) else {
+        return false;
+    };
+    if def_id.is_local() || !is_real_core_crate(tcx, def_id.krate) {
+        return false;
+    }
+    if entry.fallback_bodied == intrinsic.must_be_overridden {
+        return false;
+    }
+    if !tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::NEVER_UNWIND) {
+        return false;
+    }
+    if !tcx.fn_sig(def_id).skip_binder().safety().is_safe() {
+        return false;
+    }
+    intrinsic.must_be_overridden
+        || sysroot_fallback_body_is_pinned_panic_free(tcx, def_id, PANIC_FREE_FALLBACK_PIN_DEPTH)
+}
+
+/// Trust (std-call-summaries P2 review, item 5): the NEGATIVE coverage of the mint's
+/// gates and of the fallback walker, which no real `core` list entry can provide
+/// (every listed entry passes every gate). Each case below feeds ONE gate an item that
+/// passes the others and must fail that one, so deleting that gate (or making the
+/// walker answer `true`) turns exactly that case red. Returns the failing cases;
+/// empty is green. Driven by the compiler under `TRUST_PANIC_FREE_MINT_SELFTEST=1`
+/// (`trust_verify/vec_grow_pins.rs`), pinned by
+/// `tests/ui/trust/panic_free_intrinsic_mint_selftest.rs`.
+///
+/// The probes are real `core` items found by name in the real `core`'s
+/// `intrinsics` module (a missing probe is itself a failure, never a pass):
+/// * `minimum_number_nsz_f64`, `needs_drop` — the positive controls (upstream
+///   1.101 made every listed family a generic dispatch item with a fallback
+///   body, so no listed name is a body-less control any more; the generic
+///   `sin`/`powi`/`powf` are NEGATIVE controls for both mint gates);
+/// * `rotate_left` — fallback-bodied and nounwind, its fallback calls the unchecked
+///   `unchecked_funnel_shl`: the WALKER must refuse it;
+/// * `minimum_number_nsz_f64` under an entry that claims no fallback: the SHAPE gate;
+/// * `ub_checks` — safe, fallback-bodied, panic-free body, NOT `#[rustc_nounwind]`:
+///   the NEVER_UNWIND gate;
+/// * `unchecked_add` — nounwind and body-less but `unsafe`: the SAFETY gate;
+/// * a LOCAL `#[rustc_intrinsic]` of the crate under compilation named
+///   `maximum_number_nsz_f64`, if it declares one: the RESIDENCY gate.
+pub fn panic_free_intrinsic_mint_selftest(tcx: TyCtxt<'_>) -> Vec<String> {
+    use trust_types::PanicFreeIntrinsicShape::{Binary, Unary};
+    let entry = |name, shape, fallback_bodied| trust_types::PanicFreeIntrinsicEntry {
+        name,
+        width: 64,
+        shape,
+        fallback_bodied,
+    };
+    let mut failures = Vec::new();
+    let core = tcx.crates(()).iter().copied().find(|&krate| is_real_core_crate(tcx, krate));
+    let Some(core) = core else {
+        failures.push("no real `core` crate in the graph".to_string());
+        return failures;
+    };
+    let module = tcx
+        .module_children(core.as_def_id())
+        .iter()
+        .find(|child| child.ident.as_str() == "intrinsics")
+        .and_then(|child| child.res.opt_def_id());
+    let Some(module) = module else {
+        failures.push("real `core` has no `intrinsics` module".to_string());
+        return failures;
+    };
+    let probe = |name: &str| {
+        tcx.module_children(module)
+            .iter()
+            .find(|child| child.ident.as_str() == name)
+            .and_then(|child| child.res.opt_def_id())
+    };
+    let mut expect = |label: &str, name: &str, got: Option<bool>, want: bool| match got {
+        Some(got) if got == want => {}
+        Some(got) => failures.push(format!("{label}: `{name}` answered {got}, expected {want}")),
+        None => failures.push(format!("{label}: probe `{name}` not found in real `core`")),
+    };
+    let admits = |name: &str, e| probe(name).map(|d| panic_free_intrinsic_mint_admits(tcx, d, e));
+    let walker = |name: &str| {
+        probe(name).map(|d| {
+            sysroot_fallback_body_is_pinned_panic_free(tcx, d, PANIC_FREE_FALLBACK_PIN_DEPTH)
+        })
+    };
+    expect(
+        "positive control (fallback-bodied)",
+        "minimum_number_nsz_f64",
+        admits("minimum_number_nsz_f64", entry("minimum_number_nsz_f64", Binary, true)),
+        true,
+    );
+    // Upstream 1.101: the per-width `sinf64`/`powif64` items no longer
+    // exist, and their generic replacements carry dispatch fallback bodies,
+    // so no listed name is a body-less control. `needs_drop` is: a safe,
+    // `#[rustc_nounwind]`, `must_be_overridden` intrinsic of real `core`.
+    expect(
+        "positive control (body-less)",
+        "needs_drop",
+        admits("needs_drop", entry("needs_drop", Unary, false)),
+        true,
+    );
+    // Upstream 1.101: and the generic transcendental under a body-less claim
+    // must be REFUSED by the shape gate (its fallback body exists), just as
+    // it is refused under a fallback claim by the walker pin (trait dispatch
+    // into `libm`) — both directions fail closed.
+    expect(
+        "generic transcendental is fallback-bodied (shape gate)",
+        "sin",
+        admits("sin", entry("sinf64", Unary, false)),
+        false,
+    );
+    expect("generic transcendental fallback is not pinnable (walker)", "sin", walker("sin"), false);
+    // The same two directions for the generic power families.
+    expect(
+        "generic powi is fallback-bodied (shape gate)",
+        "powi",
+        admits("powi", entry("powif64", trust_types::PanicFreeIntrinsicShape::PowI, false)),
+        false,
+    );
+    expect("generic powi fallback is not pinnable (walker)", "powi", walker("powi"), false);
+    expect(
+        "generic powf is fallback-bodied (shape gate)",
+        "powf",
+        admits("powf", entry("powf64", Binary, false)),
+        false,
+    );
+    expect("generic powf fallback is not pinnable (walker)", "powf", walker("powf"), false);
+    expect(
+        "walker refuses an unchecked-intrinsic fallback",
+        "rotate_left",
+        walker("rotate_left"),
+        false,
+    );
+    expect(
+        "walker gate in the mint",
+        "rotate_left",
+        admits("rotate_left", entry("rotate_left", Binary, true)),
+        false,
+    );
+    expect(
+        "body-shape gate",
+        "minimum_number_nsz_f64",
+        admits("minimum_number_nsz_f64", entry("minimum_number_nsz_f64", Binary, false)),
+        false,
+    );
+    // Isolation control: `ub_checks`'s fallback (`cfg!(ub_checks)`) passes the walker,
+    // so in the next case only the NEVER_UNWIND gate can refuse it.
+    expect("isolation control (walker admits)", "ub_checks", walker("ub_checks"), true);
+    expect(
+        "NEVER_UNWIND gate",
+        "ub_checks",
+        admits("ub_checks", entry("ub_checks", Unary, true)),
+        false,
+    );
+    expect(
+        "safety gate",
+        "unchecked_add",
+        admits("unchecked_add", entry("unchecked_add", Binary, false)),
+        false,
+    );
+    let local =
+        tcx.hir_crate_items(()).definitions().map(|d| d.to_def_id()).find(|&d| {
+            tcx.intrinsic(d).is_some_and(|i| i.name.as_str() == "maximum_number_nsz_f64")
+        });
+    if let Some(local) = local {
+        let must_be_overridden = tcx.intrinsic(local).is_some_and(|i| i.must_be_overridden);
+        let got = panic_free_intrinsic_mint_admits(
+            tcx,
+            local,
+            entry("maximum_number_nsz_f64", Binary, !must_be_overridden),
+        );
+        expect(
+            "residency gate (local lookalike intrinsic)",
+            "maximum_number_nsz_f64",
+            Some(got),
+            false,
+        );
+    }
+    failures
+}
+
+/// Trust (std-call-summaries P2): the PIN of a `core` intrinsic's fallback body.
+///
+/// `true` iff `def_id`'s own optimized MIR (decoded from `core`'s metadata) ends
+/// every block in a terminator that cannot panic: the allowlist of
+/// [`body_is_structurally_panic_free`], plus a RETURNING `Call` to a function that
+/// is itself pinned the same way one level down. Such a callee must be:
+/// non-generic at the call (no generic arguments at all), not a trait item, not an
+/// intrinsic, safe, in the compiler's own `core`, and with MIR available. So
+/// `minimum_number_nsz_f64`'s `x.is_nan() || y <= x` passes (`is_nan` is
+/// `self != self`), while a fallback that calls an unchecked intrinsic
+/// (`rotate_left` -> `unchecked_funnel_shl`), a generic helper, a trait method, an
+/// `Assert`, a `Drop` or a diverging call fails closed.
+///
+/// A missed terminator here would forge panic-freedom, so this is an allowlist and
+/// the depth is bounded ([`PANIC_FREE_FALLBACK_PIN_DEPTH`]); a deeper chain, or any
+/// unrecognized shape, only loses the stamp.
+fn sysroot_fallback_body_is_pinned_panic_free(tcx: TyCtxt<'_>, def_id: DefId, depth: u32) -> bool {
+    if depth == 0
+        || def_id.is_local()
+        || !is_real_core_crate(tcx, def_id.krate)
+        || !tcx.is_mir_available(def_id)
+    {
+        return false;
+    }
+    let body = tcx.optimized_mir(def_id);
+    for bb_data in body.basic_blocks.iter() {
+        let Some(term) = &bb_data.terminator else {
+            return false;
+        };
+        match &term.kind {
+            mir::TerminatorKind::Goto { .. }
+            | mir::TerminatorKind::SwitchInt { .. }
+            | mir::TerminatorKind::Return
+            | mir::TerminatorKind::Unreachable
+            | mir::TerminatorKind::UnwindResume
+            | mir::TerminatorKind::FalseEdge { .. }
+            | mir::TerminatorKind::FalseUnwind { .. } => {}
+            mir::TerminatorKind::Call { func, target: Some(_), .. } => {
+                let Some((callee, args)) = func.const_fn_def() else {
+                    return false;
+                };
+                if !args.is_empty()
+                    || !matches!(
+                        tcx.def_kind(callee),
+                        rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
+                    )
+                    || tcx.intrinsic(callee).is_some()
+                    || tcx.trait_of_assoc(callee).is_some()
+                    || tcx.trait_impl_of_assoc(callee).is_some()
+                    || !tcx.fn_sig(callee).skip_binder().safety().is_safe()
+                    || !sysroot_fallback_body_is_pinned_panic_free(tcx, callee, depth - 1)
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Return the primitive self type when `def_id` is an exact inherent
 /// `core` integer `wrapping_*` method.
 ///
@@ -8362,9 +13602,14 @@ fn tcx_authenticated_core_integer_wrapping_self_ty<'tcx>(
     }
     let impl_did = tcx.impl_of_assoc(def_id)?;
     let core_lang_item_crate = tcx.lang_items().sized_trait()?.krate;
+    // Trust (L2a review): the crate supplying `Sized` is any `#![lang = "sized"]`
+    // crate, which a nightly `#![no_core]` graph can author. Also require that
+    // it is the compiler's OWN `core` by artifact residency, as the alloc stamp
+    // already does (`is_real_alloc_crate`).
     if def_id.is_local()
         || def_id.krate != core_lang_item_crate
         || impl_did.krate != core_lang_item_crate
+        || !is_real_core_crate(tcx, core_lang_item_crate)
     {
         return None;
     }
@@ -8398,8 +13643,31 @@ pub fn tcx_is_authenticated_core_integer_wrapping_method(tcx: TyCtxt<'_>, def_id
     tcx_authenticated_core_integer_wrapping_self_ty(tcx, def_id).is_some()
 }
 
-/// Mark the exact inherent unsigned-primitive wrapping methods modeled by the
-/// E6 arithmetic and composed-expression lanes.
+/// Trust (TG14): preserve exact modeled arithmetic calls in every build.
+/// E6 obligations run with verification off too; MIR inlining must not erase
+/// their authenticated operation identity. This grants no admission authority.
+#[must_use]
+pub fn tcx_is_authenticated_e6_arithmetic_method(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if !matches!(
+        tcx.item_name(def_id).as_str(),
+        "wrapping_add"
+            | "wrapping_sub"
+            | "wrapping_mul"
+            | "checked_add"
+            | "checked_sub"
+            | "checked_mul"
+    ) {
+        return false;
+    }
+    let path = rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id));
+    tcx_marked_unsigned_wrapping_primitive_path(tcx, def_id, &path).is_some()
+        || tcx_marked_signed_checked_primitive_path(tcx, def_id, &path).is_some()
+}
+
+/// Mark the exact inherent primitive wrapping methods modeled by the E6
+/// arithmetic and composed-expression lanes. Trust (TG14): the separate tree
+/// lane additionally consumes signed 8–64-bit methods; the frozen reader's
+/// unsigned classifier is unchanged.
 ///
 /// These calls name library methods rather than rustc intrinsics, so
 /// [`TyCtxt::intrinsic`] cannot authenticate them and their `core` bodies are
@@ -8411,7 +13679,7 @@ pub fn tcx_is_authenticated_core_integer_wrapping_method(tcx: TyCtxt<'_>, def_id
 /// that supplies the `Sized` lang item, plus an inherent primitive impl and the
 /// exact safe Rust `(U, U) -> U` signature.
 ///
-/// Only u8/u16/u32/u64 match the current E6 machine-domain boundary. `u128` and
+/// Only u8/u16/u32/u64 and i8/i16/i32/i64 match this E6 boundary. `u128` and
 /// `usize` stay excluded until their corresponding domain/target-width
 /// authority is carried end to end. The accepted operations are total,
 /// deterministic, panic-free, and pure.
@@ -8420,11 +13688,15 @@ fn tcx_marked_unsigned_wrapping_primitive_path(
     def_id: DefId,
     path: &str,
 ) -> Option<String> {
+    // Trust (TG14): signed wrapping operations share the exact authenticated
+    // primitive identity and modular arithmetic model of the E6 tree lane.
     let self_ty = tcx_authenticated_core_integer_wrapping_self_ty(tcx, def_id)?;
     if !matches!(
         self_ty.kind(),
         rustc_middle::ty::TyKind::Uint(
             ty::UintTy::U8 | ty::UintTy::U16 | ty::UintTy::U32 | ty::UintTy::U64
+        ) | rustc_middle::ty::TyKind::Int(
+            ty::IntTy::I8 | ty::IntTy::I16 | ty::IntTy::I32 | ty::IntTy::I64
         )
     ) {
         return None;
@@ -8441,7 +13713,430 @@ fn tcx_marked_unsigned_wrapping_primitive_path(
         return None;
     }
     let marked = format!("{}{}", trust_types::TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX, path);
-    trust_types::RustcTotalPrimitiveMethod::classify(&marked).map(|_| marked)
+    trust_types::e6_expr::tree::wrapping_primitive(&marked).map(|_| marked)
+}
+
+/// Mark `<Self as ToString>::to_string` when `TyCtxt` confirms BOTH that the
+/// impl the call selects is the standard library's BLANKET `ToString` impl, and
+/// that the INSTANTIATED `Self` is one of the foundational types whose
+/// `SpecToString` specialization runs NO user code and has NO panic path.
+///
+/// # The hazard, and why the check is a `TyKind` check
+///
+/// `ToString` is NOT sealed, but the impl the standard library provides is the
+/// blanket `impl<T: fmt::Display + ?Sized> ToString for T`
+/// (library/alloc/src/string.rs), whose body is
+/// `<Self as SpecToString>::spec_to_string(self)` and whose `SpecToString`
+/// DEFAULT ends in
+/// `.expect("a Display implementation returned an error unexpectedly")`. So the
+/// callee PANICS for every `Self` that has no `SpecToString` specialization.
+/// Totality is a fact about the SPECIALIZATION selected for a particular `Self`,
+/// never about the trait, the method name, or the impl.
+///
+/// The rendered callee cannot decide it. `str` is a legal generic-parameter
+/// name and `Ty::Param("str")` prints bare, identically to `TyKind::Str`; a
+/// path-text version of this rule was refuted by
+/// `pub fn attack<str: Display + ?Sized>(t: &str) -> String { t.to_string() }`,
+/// whose MIR emits `<str as ToString>::to_string` while `Self` is the caller's
+/// choice. Here the self type comes from `TyCtxt`, where a parameter is
+/// `TyKind::Param` and can never be confused with `TyKind::Str`.
+///
+/// # BOUNDARY HOLE 1 (closed here): the peel is the `str` CHAIN ONLY
+///
+/// The first revision of this stamp peeled `TyKind::Ref` off ANY base and then
+/// accepted `Bool`/`Char`/`Int`/`Uint`/`String` underneath, so `&u32`, `&&bool`
+/// and `&String` were admitted. NONE of those is in `SpecToString`: the
+/// `to_string_str!` list carries `Cow<'_, str>`, `String` and `str` with zero
+/// through twelve references, and the standalone impls for `bool`, `char` and
+/// the integers are for the BARE primitive. `&u32` therefore selects the
+/// blanket default and its `.expect` — precisely the panic this model claimed
+/// could not happen. The peel is now confined to the `str` chain and every
+/// other admitted `Self` must be bare.
+///
+/// # BOUNDARY HOLE 2 (closed here): the `String` arm keyed on a MINTABLE NAME
+///
+/// This is the one that manufactured a proof where a refutation belonged, and it
+/// sits in the same `match` as the peel. The first revision admitted `Self` =
+/// `String` by asking `tcx.is_diagnostic_item(sym::String, adt.did())`. The
+/// deciding code is
+///
+/// ```text
+/// pub fn is_diagnostic_item(self, name: Symbol, did: DefId) -> bool {
+///     self.diagnostic_items(did.krate).name_to_id.get(&name) == Some(&did)
+/// }
+/// ```
+///
+/// The table it consults belongs to the CANDIDATE'S OWN crate, and a local
+/// crate's table is built by walking that crate's own items
+/// (`rustc_passes::diagnostic_items`). So the predicate does not ask "is this
+/// std's `String`"; it asks "did this type's own crate claim the name
+/// `String`", and one `#[rustc_diagnostic_item = "String"]` under
+/// `#![feature(rustc_attrs)]` answers yes for any local struct.
+///
+/// Two consequences, both measured:
+///
+/// 1. Nothing in `library/` carries that attribute — `String` is declared
+///    `#[lang = "String"]` — so the arm never matched the REAL `String`. The
+///    only `Self` it could ever match was an impersonator.
+/// 2. A `Display` impl returning `Err` is ordinary safe stable Rust, and it
+///    makes the blanket default's `.expect` FIRE. So the impersonator's
+///    `to_string()` genuinely panics, and the stamp called it total:
+///
+/// ```text
+/// thread 'main' panicked at library/alloc/src/string.rs:2943:14:
+/// a Display implementation returned an error unexpectedly: Error
+/// ```
+///
+/// `tests/ui/trust/to_string_stamp_impersonated_string_refuted.rs` is that
+/// program, and it must fail the build.
+///
+/// The arm now keys on the LANG item (`tcx.lang_items().string()`) AND on the
+/// defining crate being the compiler's own `alloc` by ARTIFACT RESIDENCY
+/// ([`is_real_sysroot_crate`]). The lang item alone is not enough: it too is an
+/// attribute, and rustc's E0152 `found duplicate lang item` only fires when the
+/// real owner is in the graph — see BOUNDARY HOLE 3.
+///
+/// # BOUNDARY HOLE 3 (closed in the integration port, 2026-09-27): EVERY anchor
+/// # was an attribute, and `#![no_std]` removes the only contest
+///
+/// The salvaged lane (2026-09-16) identified the TRAIT ITEM — the spelling
+/// source-built MIR actually records for `x.to_string()` — by
+/// `get_diagnostic_item("to_string_method")` alone, and the impl-item and
+/// `String` arms by `lang_items().owned_box()`/`string()`. All three are
+/// attributes a crate may write under `#![feature(rustc_attrs)]` /
+/// `#![feature(lang_items)]`, resolved through ONE graph-wide table, and rustc
+/// rejects a duplicate only when BOTH owners are loaded. A `#![no_std]` graph
+/// that never loads `alloc` leaves the name uncontested, so a dependency can
+/// declare its OWN `trait ToString { #[rustc_diagnostic_item = "to_string_method"]
+/// fn to_string(&self) -> .. }` with a panicking `impl ToString for u32`, and the
+/// victim's `x.to_string()` would be stamped total. This is residual R2
+/// (documented at [`is_real_sysroot_crate`]) in a new costume, and it gets the
+/// same cure: the trait item, the impl item and the `String` ADT must all live
+/// in the crate that is the compiler's own `alloc` by artifact residency, which
+/// no source attribute can claim.
+/// `tests/ui/trust/to_string_stamp_no_std_diagnostic_item_impostor_refuted.rs`
+/// is that program, and it must fail the build.
+///
+/// # BOUNDARY HOLE 2b (closed in the same pass): `args[0]` is NOT `Self`
+///
+/// The first revision read the self type as `generic_args.types().next()` — the
+/// first type in the callee's `GenericArgs`. For a TRAIT ITEM that is `Self` by
+/// construction, and for the blanket impl it coincides, because that impl's
+/// only parameter IS its self type. For any OTHER `ToString` impl it is simply
+/// the impl's first generic parameter, which has nothing to do with `Self`.
+///
+/// `ToString` is not sealed, and coherence admits a user impl for a local type
+/// that does not implement `Display` (measured: this compiles):
+///
+/// ```text
+/// struct Wrapper<T>(T);
+/// impl<T> ToString for Wrapper<T> {
+///     fn to_string(&self) -> String { panic!("refutation") }
+/// }
+/// ```
+///
+/// At the impl-item spelling `Wrapper::<u32>::to_string` carries
+/// `GenericArgs = [u32]`, so the old rule would read `u32`, call it
+/// foundational, and stamp a body that is a bare `panic!` as total. Source-built
+/// MIR records the TRAIT item for a trait-method call (`probe::TraitPick` in
+/// `rustc_hir_typeck::method::confirm`), so this spelling is not reachable from
+/// ordinary source today — it is a latent hole, not a live one, which is why the
+/// planted refutation is HOLE 2 and not this. It is closed anyway: the self type
+/// is now derived from the impl's own trait reference instantiated at these
+/// arguments, and the impl must additionally be alloc's blanket one — identified
+/// by crate (the compiler's own `alloc`, by residency), by trait (the parent
+/// of the authenticated `to_string_method` diagnostic item), and by its
+/// uninstantiated self type being a bare `TyKind::Param`, which the orphan rule
+/// lets no other crate author.
+///
+/// # ADMITTED `Self`, and the specialization each one selects
+///
+/// Every admitted arm is a `SpecToString` impl in `library/alloc/src/string.rs`
+/// read in THIS tree (self-hosted, so the audited bytes are the compiled bytes):
+///
+/// * `str`, and `&str` … `&&&&&&&&&&&&str` (the twelve-reference
+///   `to_string_str!` list), and bare `String`:
+///   `{ let s: &str = self; String::from(s) }` — a byte copy into a fresh
+///   buffer.
+/// * bare `bool`: `String::from(if *self { "true" } else { "false" })` — a copy
+///   of a 'static constant.
+/// * bare `char`: `String::from(self.encode_utf8(&mut [0; char::MAX_LEN_UTF8]))`
+///   — the buffer is `char::MAX_LEN_UTF8` bytes, exactly the encoder's worst
+///   case, so its "destination too small" panic is unreachable.
+/// * every bare primitive integer (`i8`…`i128`, `u8`…`u128`, `isize`, `usize`,
+///   via `impl_to_string!`): a digit formatter into a fixed
+///   `[MaybeUninit<u8>; T::MAX.ilog10() + 1]` stack buffer, whose size is by
+///   construction the maximum digit count, plus `String::with_capacity(SIZE)` /
+///   `with_capacity(SIZE + 1)` for the sign — constants far below the
+///   capacity-overflow bound. (Under `feature = "optimize_for_size"`, which
+///   this toolchain's std is not built with, only `u8`/`i8` keep a
+///   specialization — digits pushed into `String::with_capacity(3)`/`(4)` — and
+///   every other integer falls to the blanket default. Its `.expect` is still
+///   unreachable there, but for a DIFFERENT reason: core's integer `Display`
+///   returns `Err` only when its writer does, and `String`'s `fmt::Write` never
+///   does. That configuration rests on this second argument, not on the
+///   specialization list.)
+///
+/// NONE of these reaches `Display::fmt` of a caller-chosen type, none can
+/// return `Err`, and the DEFAULT body's `.expect` is on no path through them.
+/// Allocation ABORT stays outside the modeled panic set, the standing
+/// convention for `String::from`/`String::push_str` in this pipeline.
+///
+/// # DELIBERATELY EXCLUDED
+///
+/// `f32`/`f64` (total in fact, but the float formatter was not audited here),
+/// `Cow<'_, str>` and `core::ascii::Char` (both have total specializations, but
+/// admitting an ADT other than `String` widens the ADT arm and neither appears
+/// in the corpus), and `fmt::Arguments` (routes to `alloc::fmt::format`, a
+/// separate fail-closed surface). Anything else — every other ADT, every `dyn
+/// Trait`, every reference that is not a `str` chain, and every generic
+/// parameter — fails closed and keeps its honest may-panic obligation.
+fn tcx_marked_total_to_string_path<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    generic_args: ty::GenericArgs<'tcx>,
+    path: &str,
+) -> Option<String> {
+    authenticated_total_to_string_self_ty(tcx, def_id, generic_args)?;
+    Some(format!("{}{}", trust_types::TRUST_TOTAL_TO_STRING_PATH_PREFIX, path))
+}
+
+/// The same identity, signature, selected-impl/coherence and normalized-Self
+/// admission used by the totality marker, exposed to compiler-owned numeric
+/// contracts without parsing a rendered path or reimplementing the identity gate.
+pub(crate) fn authenticated_total_to_string_self_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    generic_args: ty::GenericArgs<'tcx>,
+) -> Option<ty::Ty<'tcx>> {
+    // Cheap name pre-filter: this runs on EVERY call terminator, and interning a
+    // symbol + a diagnostic-item lookup per call is not free. It is a filter, not
+    // an identity — everything below still has to hold. `opt_item_name`, not
+    // `item_name`: this sees EVERY `FnDef` callee, and a nameless one must answer
+    // "not this call" rather than ICE.
+    if tcx.opt_item_name(def_id).is_none_or(|name| name.as_str() != "to_string") {
+        return None;
+    }
+    // IDENTITY (1/3): the callee must be the `ToString::to_string` the standard
+    // library declares, established through its diagnostic item rather than
+    // through path text. A same-named user trait method is not this item.
+    let to_string_method =
+        tcx.get_diagnostic_item(rustc_span::Symbol::intern("to_string_method"))?;
+    // ...and the diagnostic item must belong to the compiler's OWN `alloc`, by
+    // artifact residency. The diagnostic item is an ATTRIBUTE: in a `#![no_std]`
+    // graph that never loads `alloc`, any crate may claim `to_string_method`
+    // uncontested (BOUNDARY HOLE 3). Residency is not source-declarable.
+    if !is_real_alloc_crate(tcx, to_string_method.krate) {
+        return None;
+    }
+    let trait_item = if def_id == to_string_method {
+        true
+    } else {
+        // A resolved impl item: its trait-item parent must be the same
+        // diagnostic item. `trait_item_of` is the generic-MIR/monomorphized
+        // spelling difference, not a second identity. It does NOT say which
+        // impl was selected — that is IDENTITY (3/3) below.
+        tcx.trait_item_of(def_id) == Some(to_string_method)
+    };
+    if !trait_item {
+        return None;
+    }
+    // IDENTITY (2/3): a safe, non-variadic, Rust-ABI function of ONE argument.
+    // The return type is not re-checked here: the callee is already the
+    // residency-authenticated `alloc` item (IDENTITY 1/3), whose signature is
+    // `fn(&self) -> String` by definition, and in a graph without the real
+    // `alloc` no `String` exists to return. (That is also why
+    // `to_string_stamp_no_std_diagnostic_item_impostor_refuted.rs` can pin the
+    // residency anchor on its own: its impostor returns `u8`.)
+    let sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
+    if sig.safety() != rustc_hir::Safety::Safe
+        || sig.abi() != rustc_abi::ExternAbi::Rust
+        || sig.c_variadic()
+        || sig.inputs().len() != 1
+    {
+        return None;
+    }
+    // IDENTITY (3/3) + the instantiated `Self`, both read from `TyCtxt` and
+    // never from the path or from an argument POSITION. See BOUNDARY HOLE 2.
+    let self_ty = to_string_instantiated_self_ty(tcx, def_id, to_string_method, generic_args)?;
+    if !to_string_self_ty_is_foundational(tcx, self_ty) {
+        return None;
+    }
+    Some(self_ty)
+}
+
+/// The `Self` a `ToString::to_string` call is actually instantiated at, plus the
+/// proof that the impl it selects is alloc's blanket one.
+///
+/// Returning `Some` is the claim "this call enters
+/// `impl<T: Display + ?Sized> ToString for T`'s body with `Self` = the returned
+/// type"; the caller then decides whether that `Self`'s `SpecToString`
+/// specialization is total. Both halves are needed: the type alone says nothing
+/// if a different impl's body runs, and the impl alone says nothing if `Self` is
+/// caller-chosen.
+///
+/// Every failure is a `None`, i.e. an honest may-panic obligation.
+fn to_string_instantiated_self_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    to_string_method: DefId,
+    generic_args: ty::GenericArgs<'tcx>,
+) -> Option<ty::Ty<'tcx>> {
+    if def_id == to_string_method {
+        // THE TRAIT-ITEM SPELLING (the pre-monomorphization call). A trait
+        // item's `GenericArgs` are the trait's own parameters followed by the
+        // method's, and `Self` is parameter 0 by construction — `ToString` has
+        // no other parameter and `to_string` has none, so the whole list is
+        // `[Self]`. This is the ONE place where position 0 really is `Self`, and
+        // the length check keeps it that way if the trait ever grows a
+        // parameter.
+        //
+        // The impl is not yet selected here, so no impl check is possible or
+        // needed: `to_string_method` was authenticated as the real `alloc`'s
+        // item by residency (the caller refuses anything else), and for the
+        // `Self` types this model admits — all of them foundational std types —
+        // the orphan rule then leaves alloc's blanket impl as the only impl that
+        // can apply.
+        if generic_args.len() != 1 {
+            return None;
+        }
+        return generic_args[0].as_type();
+    }
+    // THE IMPL-ITEM SPELLING. `generic_args` are now the IMPL's parameters, and
+    // position 0 is the impl's first generic parameter — NOT `Self`, except by
+    // coincidence for a blanket impl. Resolve `Self` through the impl's own
+    // trait reference instead.
+    let impl_did = tcx.trait_impl_of_assoc(def_id)?;
+    // CRATE IDENTITY: the item and its impl must both live in the crate that
+    // declares the residency-authenticated `to_string_method` — the compiler's
+    // own `alloc`. A crate that merely calls itself `alloc`, one that claims the
+    // `Box` lang item in a graph without the real `alloc`, or a local
+    // re-declaration, cannot reach here.
+    let alloc_krate = to_string_method.krate;
+    if def_id.is_local()
+        || def_id.krate != alloc_krate
+        || impl_did.krate != alloc_krate
+        || !is_real_alloc_crate(tcx, alloc_krate)
+    {
+        return None;
+    }
+    let trait_ref = tcx.impl_trait_ref(impl_did);
+    // TRAIT IDENTITY: the impl must implement the very trait that declares the
+    // authenticated `to_string_method`.
+    if trait_ref.skip_binder().def_id != tcx.parent(to_string_method) {
+        return None;
+    }
+    // BLANKET IDENTITY: the impl's UNINSTANTIATED self type must be a bare
+    // generic parameter. That is true of exactly one `ToString` impl — alloc's
+    // `impl<T: fmt::Display + ?Sized> ToString for T` — because the orphan rule
+    // forbids any other crate writing a blanket impl of a foreign trait over a
+    // bare parameter. Any inherent, concrete or partially-applied `ToString`
+    // impl (including every user impl, whose body this model has NOT audited)
+    // fails here even when its arguments would look foundational.
+    if !matches!(trait_ref.skip_binder().self_ty().kind(), rustc_middle::ty::TyKind::Param(_)) {
+        return None;
+    }
+    Some(trait_ref.instantiate(tcx, generic_args).skip_norm_wip().self_ty())
+}
+
+/// The maximum reference depth carried by `to_string_str!` in
+/// `library/alloc/src/string.rs`. That list ends at `&&&&&&&&&&&&str` — twelve
+/// references. A THIRTEENTH reference has no `SpecToString` impl and falls
+/// through to the panicking blanket default, so this is a hard edge of the
+/// audited set, not a traversal budget.
+const TO_STRING_STR_MAX_REF_DEPTH: usize = 12;
+
+/// The `Self` types admitted by [`tcx_marked_total_to_string_path`]. See that
+/// function's doc for the per-arm audit and for BOUNDARY HOLE 1, which this
+/// shape closes: references are peeled ONLY down a `str` chain, and every other
+/// admitted type must be BARE.
+fn to_string_self_ty_is_foundational<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    match ty.kind() {
+        // BARE ONLY. `&bool`, `&u32`, `&&char` have NO `SpecToString` impl —
+        // the standalone impls are written for the primitive itself — so they
+        // select the blanket default and its
+        // `.expect("a Display implementation returned an error unexpectedly")`.
+        rustc_middle::ty::TyKind::Bool
+        | rustc_middle::ty::TyKind::Char
+        | rustc_middle::ty::TyKind::Int(_)
+        | rustc_middle::ty::TyKind::Uint(_) => true,
+        // The `str` chain: `str` itself, and `&str` … `&&&&&&&&&&&&str`.
+        rustc_middle::ty::TyKind::Str => true,
+        rustc_middle::ty::TyKind::Ref(..) => to_string_str_ref_chain_depth(ty).is_some(),
+        // BARE `String`, and only the REAL one.
+        //
+        // `&String` is not in `to_string_str!` either, so no peel reaches here.
+        // The emptiness check on the ADT's arguments keeps this closed if
+        // `String` ever grows an allocator parameter whose `SpecToString` has
+        // not been read.
+        //
+        // THE IDENTITY IS THE LANG ITEM, NOT THE DIAGNOSTIC ITEM. The previous
+        // revision asked `tcx.is_diagnostic_item(sym::String, adt.did())`, and
+        // the deciding code is
+        //
+        // ```text
+        // self.diagnostic_items(did.krate).name_to_id.get(&name) == Some(&did)
+        // ```
+        //
+        // — the table consulted is the CANDIDATE'S OWN crate's, and a local
+        // crate's table is collected by walking that crate's own items. So the
+        // question it answers is "did this type's crate claim the name
+        // `String`?", which any crate can answer yes to with one
+        // `#[rustc_diagnostic_item = "String"]` under `#![feature(rustc_attrs)]`.
+        // Worse, nothing in `library/` carries that attribute — `String` is
+        // declared `#[lang = "String"]` — so the arm never matched the real
+        // `String` at all and matched ONLY an impersonator.
+        // `tests/ui/trust/to_string_stamp_impersonated_string_refuted.rs` is
+        // that program, and it panics.
+        //
+        // The lang item is unique across the compilation only when the real
+        // owner is loaded to contest a second claim (E0152), so it is paired
+        // with the residency anchor: the ADT must live in the compiler's own
+        // `alloc` (BOUNDARY HOLE 3), which no source attribute can claim.
+        rustc_middle::ty::TyKind::Adt(adt, args) => {
+            args.is_empty()
+                && tcx.lang_items().string() == Some(adt.did())
+                && is_real_alloc_crate(tcx, adt.did().krate)
+        }
+        _ => false,
+    }
+}
+
+/// Is `krate` the compiler's OWN `alloc` — by name AND by artifact residency?
+///
+/// The residency half is [`is_real_sysroot_crate`], the R2 discipline: no input
+/// may be a function of which crates the graph contains, so no lang item or
+/// diagnostic item (both source-declarable) is consulted. The name half narrows
+/// the three sysroot crates to the one that defines `ToString` and `String`.
+/// The compiler's own `core`: the name AND sysroot artifact residency
+/// ([`is_real_sysroot_crate`]), never a lang item alone.
+fn is_real_core_crate(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> bool {
+    tcx.crate_name(krate).as_str() == "core" && is_real_sysroot_crate(tcx, krate)
+}
+
+fn is_real_alloc_crate(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> bool {
+    tcx.crate_name(krate).as_str() == "alloc" && is_real_sysroot_crate(tcx, krate)
+}
+
+/// The number of SHARED references standing between `ty` and a `str`, or `None`
+/// when `ty` is not a `str` chain at all or the chain is deeper than
+/// [`TO_STRING_STR_MAX_REF_DEPTH`].
+///
+/// `&mut str` is not peeled: `to_string_str!` lists no `&mut` form, so a mutable
+/// reference stops the walk and the chain fails to terminate at `Str`.
+fn to_string_str_ref_chain_depth(ty: ty::Ty<'_>) -> Option<usize> {
+    let mut cur = ty;
+    let mut depth = 0usize;
+    while let rustc_middle::ty::TyKind::Ref(_, inner, rustc_middle::mir::Mutability::Not) =
+        cur.kind()
+    {
+        depth += 1;
+        if depth > TO_STRING_STR_MAX_REF_DEPTH {
+            return None;
+        }
+        cur = *inner;
+    }
+    matches!(cur.kind(), rustc_middle::ty::TyKind::Str).then_some(depth)
 }
 
 /// Mark the exact inherent SIGNED-primitive overflow-checked methods modeled
@@ -8454,9 +14149,9 @@ fn tcx_marked_unsigned_wrapping_primitive_path(
 /// exact crate that supplies the `Sized` lang item, on a PRIMITIVE SIGNED
 /// integer self type, with the exact safe Rust `(I, I) -> Option<I>`
 /// signature (the `Option` checked through its diagnostic-item identity, not
-/// a name). SIGNED only — unsigned checked methods have different underflow
-/// semantics and a different kernel model, so they stay unmarked (checked-
-/// arith spec §5.5) and fail closed downstream.
+/// a name). Trust (TG14): the frozen return-Option recognizer remains signed;
+/// the separate matched-Option tree reader handles unsigned 8–64-bit methods
+/// with its distinct exact unsigned overflow predicate.
 fn tcx_marked_signed_checked_primitive_path(
     tcx: TyCtxt<'_>,
     def_id: DefId,
@@ -8467,14 +14162,22 @@ fn tcx_marked_signed_checked_primitive_path(
     }
     let impl_did = tcx.impl_of_assoc(def_id)?;
     let core_lang_item_crate = tcx.lang_items().sized_trait()?.krate;
+    // Trust (L2a review): the crate supplying `Sized` is any `#![lang = "sized"]`
+    // crate, which a nightly `#![no_core]` graph can author. Also require that
+    // it is the compiler's OWN `core` by artifact residency, as the alloc stamp
+    // already does (`is_real_alloc_crate`).
     if def_id.is_local()
         || def_id.krate != core_lang_item_crate
         || impl_did.krate != core_lang_item_crate
+        || !is_real_core_crate(tcx, core_lang_item_crate)
     {
         return None;
     }
     let self_ty = tcx.type_of(impl_did).skip_binder();
-    if !matches!(self_ty.kind(), rustc_middle::ty::TyKind::Int(_)) {
+    if !matches!(
+        self_ty.kind(),
+        rustc_middle::ty::TyKind::Int(_) | rustc_middle::ty::TyKind::Uint(_)
+    ) {
         return None;
     }
     if !matches!(tcx.item_name(def_id).as_str(), "checked_add" | "checked_sub" | "checked_mul") {
@@ -8502,16 +14205,19 @@ fn tcx_marked_signed_checked_primitive_path(
     }
     let marked =
         format!("{}{}", trust_types::TRUST_RUSTC_CHECKED_PRIMITIVE_METHOD_PATH_PREFIX, path);
-    trust_types::RustcCheckedPrimitiveMethod::classify(&marked).map(|_| marked)
+    // Trust (TG14): the matched-Option E6 tree lane also models unsigned
+    // overflow, without changing the frozen signed-return recognizer.
+    (trust_types::RustcCheckedPrimitiveMethod::classify(&marked).is_some()
+        || trust_types::e6_expr::tree::checked_primitive(&marked).is_some())
+    .then_some(marked)
 }
-
 
 /// Mark an exact inherent `core` integer wrapping add/sub/mul method for the
 /// refutation-only modular call model.
 ///
-/// The E6 marker above intentionally excludes signed, pointer-sized, and
-/// 128-bit carriers. Full-mode assertion refutation already models a subset of
-/// those carriers, but recovering identity from a source-spellable
+/// The E6 marker above intentionally excludes pointer-sized and 128-bit
+/// carriers. Trust (TG14): signed 8–64-bit carriers now use the E6 tree marker.
+/// Full-mode assertion refutation already models a subset of those carriers, but recovering identity from a source-spellable
 /// `wrapping_add` suffix lets a user lookalike manufacture a false
 /// counterexample. This second closed marker preserves that existing
 /// refutation precision without widening E6 proof authority.
@@ -8530,10 +14236,7 @@ fn tcx_marked_wrapping_refutation_path(
     path: &str,
 ) -> Option<String> {
     let self_ty = tcx_authenticated_core_integer_wrapping_self_ty(tcx, def_id)?;
-    if !matches!(
-        tcx.item_name(def_id).as_str(),
-        "wrapping_add" | "wrapping_sub" | "wrapping_mul"
-    ) {
+    if !matches!(tcx.item_name(def_id).as_str(), "wrapping_add" | "wrapping_sub" | "wrapping_mul") {
         return None;
     }
     let sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
@@ -8562,17 +14265,86 @@ fn pure_total_intrinsic_marker_allowed(name: &str, must_be_overridden: bool) -> 
     if name == "cold_path" {
         return true;
     }
+    // Trust 2026-09-18 — THE EXACT IEEE-754 OPERATIONS.
+    //
+    // Measured gap: trust-ir-bridge's `is_total_rustc_intrinsic` has listed the
+    // float intrinsic family as total since it was written, and EVERY ONE of
+    // those entries was dead, because that predicate only ever sees a path this
+    // function stamped and this function stamped eight integer names. So
+    // `pub fn f(x: f64) -> f64 { x.abs() }` — whose core body is the single call
+    // `intrinsics::fabs(self)` — lowered to the fail-soft absent-callee
+    // encoding: `Assert(false)` plus a havoc result, one unprovable
+    // panic-freedom row, and a strict-lane build error on correct code.
+    //
+    // WHY THESE ARE SAFE TO MARK. Each is a total function of its operand bit
+    // patterns: NaN and the infinities are ordinary values with defined results,
+    // not error cases, so there is no panic path. `TyCtxt::intrinsic` has
+    // already authenticated the definition as a genuine `#[rustc_intrinsic]`
+    // item, so the name cannot be forged, and `must_be_overridden` means the
+    // compiler provides the operation with no fallback body to disagree with.
+    // As with ctpop/bswap the mark grants TOTALITY ONLY — the destination keeps
+    // its havoc, because `classify_value_modeled_intrinsic` fails closed on
+    // every name it does not model.
+    //
+    // WHY THE TRANSCENDENTALS ARE EXCLUDED, AND IT IS NOT ABOUT PANICS. The
+    // marker is also read by the facet gates (`trust-vcgen`'s `facets.rs`,
+    // `trust-types`' `facet_inference.rs`), which treat a marked callee as pure,
+    // total, DETERMINISTIC and panic-free. Determinism is the binding
+    // requirement, and `library/std/src/num/f64.rs` documents these as failing
+    // it in its own words: "The precision of this function is non-deterministic.
+    // This means it varies by platform, Rust version, and can even differ within
+    // the same execution from one invocation to the next." That caveat covers
+    // sin, cos, tan and their inverses and hyperbolics, exp, exp2, exp_m1, ln,
+    // ln_1p, log, log2, log10, powf, POWI, cbrt, hypot, atan2, gamma and erf.
+    // `sqrt` and `mul_add` are pointedly NOT in that list — IEEE-754 requires
+    // both to be correctly rounded — and the rounding, sign and min/max
+    // operations are exact. So the deterministic subset is marked and the rest
+    // keeps its honest obligation.
+    //
+    // `fmuladdf*` is excluded for the same reason by construction: it is
+    // *permitted* to contract the multiply-add into a single fused step or not,
+    // so two runs may round differently.
+    //
+    // NOT a suffix rule. `f16`/`f32`/`f64`/`f128` widths are spelled out, as the
+    // integer list above spells out its names, because a `starts_with("sqrt")`
+    // or `ends_with("f64")` rule is exactly how a non-deterministic sibling gets
+    // admitted the next time this family grows.
+    let exact_ieee754 = matches!(
+        name,
+        // Sign and magnitude — bit operations, exact.
+        "fabs"
+            | "copysignf16" | "copysignf32" | "copysignf64" | "copysignf128"
+            // Rounding to integral values — exact.
+            | "floorf16" | "floorf32" | "floorf64" | "floorf128"
+            | "ceilf16" | "ceilf32" | "ceilf64" | "ceilf128"
+            | "truncf16" | "truncf32" | "truncf64" | "truncf128"
+            | "roundf16" | "roundf32" | "roundf64" | "roundf128"
+            | "round_ties_even_f16" | "round_ties_even_f32"
+            | "round_ties_even_f64" | "round_ties_even_f128"
+            // IEEE-754 requires both of these to be correctly rounded.
+            | "sqrtf16" | "sqrtf32" | "sqrtf64" | "sqrtf128"
+            | "fmaf16" | "fmaf32" | "fmaf64" | "fmaf128" // Trust (std-call-summaries P2): the selections are NOT here any more.
+                                                         // `minimumf*`/`maximumf*` and the `*_number_nsz_*` pair carry a
+                                                         // FALLBACK body (never `must_be_overridden`), so this marker never
+                                                         // admitted them: they were dead entries. The `nsz` pair is also
+                                                         // NONDETERMINISTIC ("either input may be returned
+                                                         // non-deterministically" for `+0.0`/`-0.0`), which this marker's
+                                                         // determinism reading would get wrong. All of them now take the
+                                                         // panic-freedom-only stamp (`tcx_marked_panic_free_intrinsic_path`),
+                                                         // which pins the fallback body.
+    );
     must_be_overridden
-        && matches!(
-            name,
-            "ctpop"
-                | "cttz"
-                | "ctlz"
-                | "bswap"
-                | "bitreverse"
-                | "saturating_add"
-                | "saturating_sub"
-        )
+        && (exact_ieee754
+            || matches!(
+                name,
+                "ctpop"
+                    | "cttz"
+                    | "ctlz"
+                    | "bswap"
+                    | "bitreverse"
+                    | "saturating_add"
+                    | "saturating_sub"
+            ))
 }
 
 /// Return the identity-bearing key used for a direct call and its modular
@@ -8651,16 +14423,18 @@ fn pure_total_intrinsic_marker_allowed(name: &str, must_be_overridden: bool) -> 
 /// the output of both seam renderers.
 ///
 /// One thing this function's own `@`-stamp is NOT: an authenticator.
-/// `ambiguous_callee` below is `local_has_same_name || another_external_has_same
-/// _name` — a DUPLICATE-NAME detector.  A crate that is the ONLY one of its name
-/// in the graph is emitted UNSTAMPED whatever it calls itself, so the absence of
-/// a stamp is not evidence that a `core::`/`alloc::`/`std::` root is the real
-/// sysroot crate.  Do not build a trust decision on that absence.
+/// `ambiguous_callee` below is [`crate_name_is_shared`] for a foreign callee (the
+/// local crate, or another extern, has its name) — a DUPLICATE-NAME detector.  A
+/// crate that is the ONLY one of its name in the graph is emitted UNSTAMPED
+/// whatever it calls itself, so the absence of a stamp is not evidence that a
+/// `core::`/`alloc::`/`std::` root is the real sysroot crate.  Do not build a
+/// trust decision on that absence.
 ///
 /// # RESIDUAL — the key is NOT injective.  Do not assume it is.
 ///
 /// 1. **A GENERIC CALL's key is indistinguishable from a GENERIC DEFINITION's
-///    path — MEASURED OPEN, a live false proof.**  `safe_def_path_str_with_args`
+///    path.  The RENDER stays open; the CALL-SITE NAME is closed fail-closed
+///    (GENERIC-CALL-KEY-ALIAS-1, 2026-10-06).**  `safe_def_path_str_with_args`
 ///    renders a CALL from the caller's `args`; when those args contain a
 ///    `ty::Param`, the result is spelled exactly like the DEFINITION path of a
 ///    generic body, because `ty::ParamTy` is `{index, name}` with no owner
@@ -8668,22 +14442,39 @@ fn pure_total_intrinsic_marker_allowed(name: &str, must_be_overridden: bool) -> 
 ///    `rustc_middle/src/ty/print/pretty.rs` `ty::ParamTy`).  A blanket
 ///    `impl<T: Marker> Tr for T` has def path `<T as krate::Tr>::m`; the
 ///    unresolvable dispatch in `fn f<T: Tr>(x: &T) { x.m() }` renders the SAME
-///    string, and `trust_ir_bridge::lower.rs` `resolve_call_target`'s
-///    `known_functions.get(callee)` binds the call to that proved body — no
-///    obligation, no assumption row.  Reproducer:
-///    `probe/blanket2.rs` in the round-2 evidence dir; `f` verifies clean while
-///    a downstream `impl Tr for Foo` may panic.
+///    string.  Until 2026-10-06 `func_operand_name` handed that string on, and
+///    every by-name lane took the blanket body for the call:
+///    `trust_ir_bridge::lower.rs` `resolve_call_target` bound the call to it
+///    (no obligation, no assumption row), and the return-summary lane lent its
+///    bound.  `fn f<T: Tr>(x: &T) -> u32 { x.m() + 1 }` beside a blanket returning
+///    `1` and an `impl Tr for Foo` returning `u32::MAX` was kernel-certified under
+///    certify, and `f::<Foo>` panics (MEASURED on the stage 1 of `4ccd862830`).
 ///
 ///    This CANNOT be fixed by rendering.  The SOUND case (`fn f<T: Marker>`,
 ///    where the blanket really is every instantiation's target) and the UNSOUND
 ///    case (`fn f<T: Tr>`) produce byte-identical strings; the only discriminator
 ///    is `ty::Instance::try_resolve` under the CALLER's
 ///    `TypingEnv::post_analysis(caller_def_id)`, and `func_operand_name` is not
-///    given a caller.  Closing it needs a call-site identity that carries the
-///    caller's instantiation environment — not a def-path string.
-///    `trust_verify::collect_expected_absent_callees` DOES have that env and
-///    already classifies the call correctly (`Ok(None)` ⇒ fatal-absent); the
-///    bridge's by-name bind is what overrides it.
+///    given a caller.  So the call-site seam now treats every such call as
+///    unresolvable: when a TRAIT call's `args` mention a type or const parameter
+///    and its name equals a local function's definition key,
+///    [`tag_local_definition_key_alias`] tags it `::<__trust_alias@…>`, and no lane
+///    can match it to the body.  The SOUND case pays the cost: it loses the by-name
+///    bind and summary and is decided like any open dispatch.  Recovering it needs a
+///    call-site identity that carries the caller's instantiation environment
+///    (DECISION_QUEUE GENERIC-CALL-KEY-ALIAS-1).
+///    `trust_verify::collect_expected_absent_callees` has that env and classifies
+///    the unsound call as fatal-absent (`Ok(None)`); the by-name bind no longer
+///    overrides it.  A consumer that renders a call key with
+///    `safe_def_path_str_with_args` directly, instead of `func_operand_name`, still
+///    gets the aliasing string.
+///
+///    Trust (GCKA-SELF-CALL-2, 2026-10-10): `func_operand_name` is now given the
+///    caller, and keeps the name of exactly one sound shape, a generic trait impl
+///    item's direct call to ITSELF at its own identity arguments
+///    ([`identity_self_call_of_caller`]). The tag had cost that call its bind to
+///    its own body, and every recursive method of a generic or blanket trait impl
+///    its acceptance under the default policy.
 ///
 /// 2. **An `{{impl}}` segment's own disambiguator is still dropped**
 ///    (`print_impl_path` renders `<Self as Trait>`), so two impls that
@@ -8817,19 +14608,16 @@ fn pure_total_intrinsic_marker_allowed(name: &str, must_be_overridden: bool) -> 
 pub(crate) fn direct_call_def_path<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    generic_args: ty::GenericArgsRef<'tcx>,
+    generic_args: ty::GenericArgs<'tcx>,
     path: String,
 ) -> String {
     let callee_crate_name = tcx.crate_name(def_id.krate);
-    let local_has_same_name =
-        !def_id.is_local() && tcx.crate_name(rustc_span::def_id::LOCAL_CRATE) == callee_crate_name;
-    let another_external_has_same_name = !def_id.is_local()
-        && tcx
-            .crates(())
-            .iter()
-            .copied()
-            .any(|krate| krate != def_id.krate && tcx.crate_name(krate) == callee_crate_name);
-    let ambiguous_callee = local_has_same_name || another_external_has_same_name;
+    // DROP-NAME-COLLIDE-1 (2026-10-03): the duplicate-name rule is
+    // [`crate_name_is_shared`], shared with the structural drop-credit collection
+    // and the X1 destructor-admission shadow check so the three cannot drift. A
+    // LOCAL callee is never ambiguous HERE (the local path keeps its spelling and
+    // the foreign namesake is the one stamped), so the `!is_local()` guard stays.
+    let ambiguous_callee = !def_id.is_local() && crate_name_is_shared(tcx, def_id.krate, |_| false);
     let path = disambiguate_direct_call_path(
         path,
         def_id.is_local(),
@@ -8841,28 +14629,151 @@ pub(crate) fn direct_call_def_path<'tcx>(
 
     // A concrete diagnostic path is still not an identity when one of its
     // generic arguments names either member of `shared_v1`/`shared_v2`: both
-    // render `shared::T`. In the rare compilation containing any duplicate
-    // crate-name group, bind every non-empty argument vector to rustc's stable
+    // render `shared::T`. Bind such an argument vector to rustc's stable
     // full-argument hash. Stable hashing lowers DefIds through
     // DefPathHash/StableCrateId, so nested type and const arguments retain the
     // dependency instance that display text erases. Ordinary crate graphs and
     // nongeneric calls remain byte-identical.
-    let args_fingerprint = (!generic_args.is_empty() && has_duplicate_crate_names(tcx))
-        .then(|| generic_args_fingerprint(tcx, generic_args));
+    //
+    // Trust (ARGS-FINGERPRINT-READ-1 round 2, 2026-10-07): the tag is written
+    // exactly when the argument DISPLAY is not a crate identity — some def it
+    // names lives in a crate the callee-root stamp rule would stamp
+    // ([`generic_args_name_an_unauthenticated_crate`]) — and no longer on every
+    // generic call of a graph that merely CONTAINS a duplicate name. That makes
+    // the tag mean one thing a reader can act on: "a type path in these
+    // arguments may come from a same-named crate". MEASURED reason (review of
+    // round 1): a crate built `--crate-name core` exporting
+    // `ops::range::RangeFull` renders
+    // `alloc::vec::Vec::<u32>::drain::<core::ops::range::RangeFull>::<__trust_args@…>`,
+    // byte-identical to the real `RangeFull` except for the tag, so a reader that
+    // stripped the tag granted the cannot-panic carve-out to a `RangeBounds`
+    // impl whose `start_bound` is `Included(&1000)`. Readers of a tagged call's
+    // TYPE paths must now decline; an untagged call's argument display is as
+    // faithful as in an ordinary graph (the same rule renders the callee root).
+    let args_fingerprint = (!generic_args.is_empty()
+        && generic_args_name_an_unauthenticated_crate(tcx, generic_args))
+    .then(|| generic_args_fingerprint(tcx, generic_args));
     disambiguate_generic_call_path(path, args_fingerprint)
 }
 
-fn has_duplicate_crate_names(tcx: TyCtxt<'_>) -> bool {
-    let mut seen = FxHashSet::default();
-    if !seen.insert(tcx.crate_name(rustc_span::def_id::LOCAL_CRATE)) {
-        return true;
-    }
-    tcx.crates(()).iter().copied().any(|krate| !seen.insert(tcx.crate_name(krate)))
+/// Trust (ARGS-FINGERPRINT-READ-1 round 2, 2026-10-07): does any def named
+/// ANYWHERE in `generic_args` (ADT, foreign type, fn item, closure, coroutine,
+/// alias, `dyn` predicate, alias const) live in a crate whose rendered NAME does
+/// not identify it? That is exactly [`trust_types::sysroot_identity_stamp_required`]
+/// — the rule that stamps a callee ROOT `__trust_crate@…` — applied to every
+/// crate the arguments mention: a crate whose name another crate of this graph
+/// shares (rule 1, [`crate_name_is_shared`]; since round 3 the LOCAL crate too,
+/// which the root rule exempts), or a crate that wears a sysroot name without
+/// being the compiler's own (rule 2). The display printer
+/// does not stamp types INSIDE the generic arguments, so this is the only place
+/// that crate identity can be recovered for them.
+///
+/// FAIL CLOSED: a bound/placeholder/inference/error node, or an alias const that
+/// names no def, answers `true` (tag). A `ty::Param` / const param answers
+/// `false`: it is the caller's own parameter, names no crate, and renders the
+/// same in every graph (`fn down<T>`'s self call `down::<T>` keeps its ordinary
+/// spelling, so the termination lane sees it as in an ordinary graph).
+fn generic_args_name_an_unauthenticated_crate<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    generic_args: ty::GenericArgs<'tcx>,
+) -> bool {
+    let mut verdicts: rustc_data_structures::fx::FxHashMap<rustc_span::def_id::CrateNum, bool> =
+        Default::default();
+    let mut unauthenticated = |def_id: DefId| {
+        let krate = def_id.krate;
+        *verdicts.entry(krate).or_insert_with(|| {
+            let is_local = krate == LOCAL_CRATE;
+            let name_is_shared = crate_name_is_shared(tcx, krate, |_| false);
+            // Trust (ARGS-FINGERPRINT-READ-1 round 3, 2026-10-07): the LOCAL crate
+            // counts too when an extern shares its name (Cargo's bin+lib layout). The
+            // root stamp exempts a local callee because the local PATH is the one
+            // left unstamped; inside generic arguments NOTHING is stamped, so a local
+            // `dupty::T` and the lib's `dupty::T` print alike, and a call naming
+            // either one is not identified by its display. Round 2 masked the local
+            // crate out (`!is_local`); MEASURED (`r3/binlib.rs`, round-2 stage 1):
+            // `<W<T> as Tr>::f::<G>` from inside `impl Tr for W<other::T>` stayed
+            // untagged and read as a self call, minting a PROVED "recursion measure
+            // `n` may not decrease" row on a caller whose callee loops forever.
+            trust_types::sysroot_identity_stamp_required(
+                is_local,
+                trust_types::crate_name_wears_sysroot_spelling(tcx.crate_name(krate).as_str()),
+                is_real_sysroot_crate(tcx, krate),
+                !is_local && name_is_shared,
+            ) || (is_local && name_is_shared)
+        })
+    };
+    generic_args.iter().any(|arg| {
+        arg.walk().any(|inner| match inner.kind() {
+            // A region names no crate; the renderer canonicalizes lifetimes.
+            ty::GenericArgKind::Lifetime(_) => false,
+            ty::GenericArgKind::Type(t) => ty_node_names_def(t, &mut unauthenticated, false),
+            ty::GenericArgKind::Const(c) => const_node_names_def(c, &mut unauthenticated, false),
+        })
+    })
+}
+
+/// DROP-NAME-COLLIDE-1 (2026-10-03): does some OTHER crate of this compilation
+/// carry `krate`'s crate NAME? THE one duplicate-crate-name rule for every
+/// consumer whose key is a rendered path (`safe_def_path_str` spells the crate
+/// NAME, never its `CrateNum` or `StableCrateId`), so two same-named crates
+/// render their same-path items to one string:
+///
+///  * `krate` is foreign and the LOCAL crate has its name (Cargo's bin+lib
+///    layout: the bin and its own lib are both `foo`);
+///  * `krate` is the local crate and some extern crate has its name (the same
+///    pair, seen from the other side);
+///  * some extern crate other than `krate` has its name (two semver versions of
+///    one crates.io crate; a dependency named like a sysroot-internal crate).
+///
+/// `exempt(other)` withdraws an EXTERN crate other than `krate` from the third
+/// arm; it is never consulted about the local crate. Pass `|_| false` unless the
+/// caller holds a TCB argument for the exemption: the only one today is X1's
+/// (`foreign_destructor_admission`), where two sysroot-credited crates sharing a
+/// name are both believed.
+///
+/// Consumers, which must not grow a private copy: [`direct_call_def_path`]'s
+/// `ambiguous_callee`, [`callee_key_for`]'s `krate_name_is_ambiguous` and
+/// `ty_convert::crate_name_is_ambiguous` (by-name marker stamping) — all three
+/// guard the local crate out themselves; the compiler's structural drop-credit
+/// collection (`collect_structural_drop_adts`, which withdraws every ADT path of a
+/// shared-name crate); and the X1 shadow check (`foreign_destructor_may_be_credited`).
+pub fn crate_name_is_shared(
+    tcx: TyCtxt<'_>,
+    krate: rustc_span::def_id::CrateNum,
+    exempt: impl Fn(rustc_span::def_id::CrateNum) -> bool,
+) -> bool {
+    crate_name_shared_among(
+        krate,
+        krate == LOCAL_CRATE,
+        tcx.crate_name(krate),
+        tcx.crate_name(LOCAL_CRATE),
+        tcx.crates(()).iter().map(|&other| (other, tcx.crate_name(other))),
+        exempt,
+    )
+}
+
+/// The `TyCtxt`-free decision behind [`crate_name_is_shared`], so its arms can be
+/// pinned by unit tests. `externs` is every EXTERN crate (never the local one)
+/// with its name; `exempt` is consulted only for a same-named extern other than
+/// `krate`, which keeps the X1 caller's evaluation order (its exemption runs a
+/// residency query) exactly what it was.
+fn crate_name_shared_among<C: Copy + PartialEq, N: PartialEq>(
+    krate: C,
+    krate_is_local: bool,
+    krate_name: N,
+    local_name: N,
+    externs: impl IntoIterator<Item = (C, N)>,
+    exempt: impl Fn(C) -> bool,
+) -> bool {
+    (!krate_is_local && local_name == krate_name)
+        || externs
+            .into_iter()
+            .any(|(other, other_name)| other != krate && other_name == krate_name && !exempt(other))
 }
 
 fn generic_args_fingerprint<'tcx>(
     tcx: TyCtxt<'tcx>,
-    generic_args: ty::GenericArgsRef<'tcx>,
+    generic_args: ty::GenericArgs<'tcx>,
 ) -> Fingerprint {
     tcx.with_stable_hashing_context(|mut hcx| {
         let mut hasher = StableHasher::new();
@@ -8919,10 +14830,10 @@ fn generic_args_fingerprint<'tcx>(
 ///
 /// An absent identity must NEVER be answered by comparing the rendered path;
 /// that is precisely the decision procedure this exists to retire.
-pub(crate) fn callee_identity_for<'tcx>(
+pub fn callee_identity_for<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    generic_args: ty::GenericArgsRef<'tcx>,
+    generic_args: ty::GenericArgs<'tcx>,
 ) -> Option<trust_types::CalleeIdentity> {
     if generic_args.has_non_region_param()
         || generic_args.has_non_region_infer()
@@ -8943,6 +14854,322 @@ pub(crate) fn callee_identity_for<'tcx>(
     })
 }
 
+/// ── THE MINT, ROUND 7: identity resolved HERE, where `TyCtxt` is ─────────────
+///
+/// The head of `ty`, in [`trust_types::SelfTyHead`]'s closed vocabulary.
+///
+/// This is the whole of what the unsafe mint needs to know about an impl's self
+/// type, and deliberately nothing more: an `Adt` yields its OWN item name
+/// (`tcx.item_name`), never a rendering, so `Vec<Tok<'>', '<'>>` and `Vec<u8>`
+/// both answer `Adt("Vec")`. The generic argument is not an input.
+///
+/// EXHAUSTIVE on purpose (no `_` arm over the interesting cases): a `TyKind`
+/// this does not name lands on `Other`, which matches no declaration and
+/// therefore fails closed.
+#[derive(Default)]
+struct CalleeOwnerScratch {
+    adt_sym: Option<rustc_span::Symbol>,
+    trait_sym: Option<rustc_span::Symbol>,
+    path: String,
+}
+
+fn self_ty_head_of<'a, 'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    adt_sym: &'a mut Option<rustc_span::Symbol>,
+) -> trust_types::SelfTyHead<'a> {
+    use trust_types::SelfTyHead;
+    match ty.kind() {
+        ty::Adt(def, _) => {
+            // `Symbol::as_str()` borrows from the interner, which outlives the
+            // extraction; holding the `Symbol` in caller-owned stack scratch
+            // avoids heap-allocating and leaking a `String` on every call.
+            let sym = adt_sym.insert(tcx.item_name(def.did()));
+            SelfTyHead::Adt(sym.as_str())
+        }
+        ty::Slice(_) | ty::Array(_, _) => SelfTyHead::Slice,
+        ty::Str => SelfTyHead::Str,
+        ty::Char => SelfTyHead::Char,
+        ty::RawPtr(_, rustc_middle::mir::Mutability::Not) => SelfTyHead::ConstPtr,
+        ty::RawPtr(_, rustc_middle::mir::Mutability::Mut) => SelfTyHead::MutPtr,
+        _ => SelfTyHead::Other,
+    }
+}
+
+/// WHO owns `def_id`, as typed facts read off `tcx` — never off a rendering.
+///
+/// Three shapes, matching [`trust_types::CalleeOwner`]:
+///
+///  * an INHERENT impl — `tcx.inherent_impl_of_assoc` then the impl's self type.
+///    This is the component a `DefPath` segment list cannot supply: `Vec::set_len`
+///    is `[Mod("vec"), Impl(#N), ValueNs("set_len")]` and `Vec` appears only
+///    because the PRINTER resolves the impl's self type; the `Impl`
+///    disambiguator is not stable across sysroot builds.
+///  * a TRAIT impl — the trait's own item name plus the self-type head. This is
+///    the structured form of the UFCS qualifier `<Global as Allocator>::allocate`,
+///    and it is what makes the round-5 UFCS refusal structural: a user trait on a
+///    sysroot type differs in `trait_name`, a user type under a sysroot trait
+///    differs in `self_ty`, and neither is reachable by any rendering.
+///  * a FREE function — its immediate parent module's own item name.
+///
+/// Anything else (a trait DECLARATION's method, a closure, a constructor) is
+/// `Other`, which matches no declaration.
+fn callee_owner_of<'a>(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    scratch: &'a mut CalleeOwnerScratch,
+) -> trust_types::CalleeOwner<'a> {
+    use trust_types::CalleeOwner;
+    if let Some(impl_did) = tcx.inherent_impl_of_assoc(def_id) {
+        let self_ty = tcx.type_of(impl_did).instantiate_identity().skip_normalization();
+        return CalleeOwner::Inherent(self_ty_head_of(tcx, self_ty, &mut scratch.adt_sym));
+    }
+    if let Some(impl_did) = tcx.trait_impl_of_assoc(def_id) {
+        let trait_ref = tcx.impl_trait_ref(impl_did).instantiate_identity().skip_normalization();
+        let self_ty = tcx.type_of(impl_did).instantiate_identity().skip_normalization();
+        let trait_sym = scratch.trait_sym.insert(tcx.item_name(trait_ref.def_id));
+        let self_ty = self_ty_head_of(tcx, self_ty, &mut scratch.adt_sym);
+        return CalleeOwner::TraitImpl {
+            trait_name: trait_sym.as_str(),
+            self_ty,
+        };
+    }
+    // A method declared on the TRAIT itself (not an impl) names no concrete
+    // implementation, so it is keyed on the trait's WHOLE path and nothing else
+    // (W4, 2026-09-25): `CalleeOwner::TraitDecl` documents what a tag minted
+    // through it does not establish. A trait whose ancestry is not a plain chain
+    // of modules stays `Other`.
+    if let Some(trait_did) = tcx.trait_of_assoc(def_id) {
+        return match module_owner_path(tcx, trait_did) {
+            Some(mut path) => {
+                let trait_name = tcx.item_name(trait_did);
+                if !path.is_empty() {
+                    path.push_str("::");
+                }
+                path.push_str(trait_name.as_str());
+                scratch.path = path;
+                CalleeOwner::TraitDecl(&scratch.path)
+            }
+            None => CalleeOwner::Other,
+        };
+    }
+    // A free function: its FULL OWNER PATH.
+    match module_owner_path(tcx, def_id) {
+        Some(path) => {
+            scratch.path = path;
+            CalleeOwner::Module(&scratch.path)
+        }
+        None => CalleeOwner::Other,
+    }
+}
+
+/// Every module from the defining crate's ROOT down to `def_id`'s immediate
+/// parent, joined with `::` — `"ptr"` for `core::ptr::read`, `"slice::raw"` for
+/// `core::slice::raw::from_raw_parts`. The crate root is NOT a segment: the
+/// crate is matched separately, as [`trust_types::CalleeKey::krate_name`].
+///
+/// # Why the whole path, and not the parent's name
+///
+/// [`trust_types::CalleeOwner::Module`] carried only the IMMEDIATE parent's
+/// item name until 2026-09-20, and a declaration written as
+/// `(core, Module("ptr"), "read")` therefore meant "a fn named `read` whose
+/// parent module is named `ptr`, ANYWHERE in `core`" — strictly WEAKER than the
+/// three-segment string `core::ptr::read` it replaced. A structured key may be
+/// as specific as the spelling it retires or more so; it may never be less.
+///
+/// # Fail-closed
+///
+/// `None` — which the caller answers with [`trust_types::CalleeOwner::Other`],
+/// matching no declaration — for anything whose ancestry is not a plain chain of
+/// modules: an item in a `fn`, in an `extern` block (that shape has its own
+/// structured carrier, `foreign_block_leaf`), or in an `impl` the two arms above
+/// did not already claim. The walk is bounded by the def path's depth and every
+/// segment is a `Symbol` the compiler enumerated.
+fn module_owner_path(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+    let mut segments: Vec<rustc_span::Symbol> = Vec::new();
+    // `DefId::index == CRATE_DEF_INDEX` has no parent, and `tcx.opt_parent`
+    // answers `None` there rather than panicking.
+    let mut current = tcx.opt_parent(def_id)?;
+    // The loop ENDS at the crate root, which is the one module with no parent,
+    // and so never contributes a segment.
+    while let Some(parent) = tcx.opt_parent(current) {
+        if !matches!(tcx.def_kind(current), rustc_hir::def::DefKind::Mod) {
+            return None;
+        }
+        segments.push(tcx.item_name(current));
+        current = parent;
+    }
+    if !matches!(tcx.def_kind(current), rustc_hir::def::DefKind::Mod) {
+        return None;
+    }
+    let mut out = String::new();
+    for (idx, sym) in segments.iter().rev().enumerate() {
+        if idx > 0 {
+            out.push_str("::");
+        }
+        out.push_str(sym.as_str());
+    }
+    Some(out)
+}
+
+/// `Some(leaf)` iff `def_id`'s `DefPath` parent is a `DefPathData::ForeignMod` —
+/// the STRUCTURED form of the `{extern#N}` text test that the external-map
+/// recognizer performs on a rendered path today.
+///
+/// `{extern#N}` is rustc's rendering of an `extern { … }` block and is
+/// unspellable in source, which is what made the text test worth anything; this
+/// asks the same question of the def path itself, where no rendering can put
+/// those bytes.
+fn foreign_block_leaf_of(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+    let parent = tcx.opt_parent(def_id)?;
+    if tcx.def_key(parent).disambiguated_data.data
+        != rustc_hir::definitions::DefPathData::ForeignMod
+    {
+        return None;
+    }
+    Some(tcx.item_name(def_id).as_str().to_string())
+}
+
+/// `Some(symbol)` iff `def_id` is a foreign FUNCTION declared by a crate other than
+/// the local one: the symbol the linker resolves for it, as codegen names it
+/// (`tcx.symbol_name`, which answers the `#[link_name]` value when one is written and
+/// the item's own name otherwise). See [`trust_types::CalleeKey::upstream_foreign_link_symbol`].
+///
+/// The LOCAL crate's own `extern` declarations are left out on purpose: the
+/// documented-contract consumer believes only a dependency's declaration of a C
+/// symbol, under the dependency-soundness premise every dependency API rests on, and
+/// the program under verification never lends itself a contract.
+fn upstream_foreign_link_symbol_of(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+    if def_id.is_local()
+        || !tcx.is_foreign_item(def_id)
+        || !matches!(tcx.def_kind(def_id), rustc_hir::def::DefKind::Fn)
+    {
+        return None;
+    }
+    // A foreign fn has no generic parameters, so its mono instance is its only one.
+    let instance = ty::Instance::mono(tcx, def_id);
+    Some(tcx.symbol_name(instance).name.to_string())
+}
+
+/// Mint the [`trust_types::CalleeKey`] for a direct callee `def_id`.
+///
+/// # THE TERMINATION PROPERTY
+///
+/// `generic_args` IS NOT AN ARGUMENT OF THIS FUNCTION, and that is the whole
+/// point. Every field is a function of `(TyCtxt, DefId)` alone:
+///
+///  * `sysroot_item` — `(crate_name, owner, leaf)`, four `Symbol`s the compiler
+///    enumerated, gated on `is_real_sysroot_crate`;
+///  * `krate_is_real_sysroot` / `krate_name_is_ambiguous` / `stable_crate_id` /
+///    `krate_name` — functions of the `CrateNum`;
+///  * `foreign_block_leaf` — a `DefPathData` variant plus a leaf `Symbol`;
+///  * `diverging_entry` — [`diverging_entry_of`]: residency, `trait_of_assoc`, and
+///    the GENERIC-FREE definition path (`safe_def_path_str`), never the call's.
+///
+/// So for a fixed `def_id` the key is byte-identical for `f::<u8>`,
+/// `f::<fn() -> u8>`, `f::<Tok<'>', '<'>>`, and for any instantiation written in
+/// any Rust that does not yet exist. An arrow cannot affect it; a `char` const
+/// generic whose value is `'>'`, `'<'`, `'\''`, `'@'` or `'\0'` cannot affect
+/// it; a future `&'static str` const generic containing `"::"`, `" as "` or
+/// `"__trust_crate@"` cannot affect it. There is no scanner to desynchronize
+/// because there is no scan.
+///
+/// # THE IDENTITY GATE
+///
+/// `sysroot_item` is minted ONLY when `is_real_sysroot_crate(tcx, krate)` holds
+/// — the ARTIFACT-RESIDENCY verdict (`sess.target_tlib_path.dir`, or
+/// `-Zforce-unstable-if-unmarked`), not the crate-NAME gate. A crate compiled
+/// `--crate-name core` therefore mints `sysroot_item: None`, and every MINTING
+/// recognizer downstream answers false on it — the same verdict the
+/// `__trust_crate@` stamp produced, now from the identity fact instead of from a
+/// prefix that ALSO means "duplicate crate name". The two producer rules the
+/// stamp collapsed into one bit are carried as two separate fields here.
+pub fn callee_key_for(tcx: TyCtxt<'_>, def_id: DefId) -> trust_types::CalleeKey {
+    let krate = def_id.krate;
+    let krate_name = tcx.crate_name(krate);
+    let krate_is_real_sysroot = is_real_sysroot_crate(tcx, krate);
+
+    // Rule 1, UNIQUENESS — exactly the computation `direct_call_def_path`
+    // performs before it stamps, kept here as its own bit instead of being
+    // merged into the stamp with rule 2. DROP-NAME-COLLIDE-1 (2026-10-03): read
+    // from the shared [`crate_name_is_shared`], never a private copy.
+    let krate_name_is_ambiguous = !def_id.is_local() && crate_name_is_shared(tcx, krate, |_| false);
+
+    // Trust (W11): a std thread-creation entry point takes its tag from the SAME
+    // diagnostic-item classifier the compiler's spawn census uses, never from a
+    // structural or printed path, so `mir_router`'s refusal and the census agree
+    // on which calls spawn (`Scope::spawn` / `Builder::spawn_scoped` print their
+    // impl's generic arguments and matched no spelled row). The classifier gates
+    // on the real sysroot `std`, which implies `krate_is_real_sysroot`.
+    let spawn_item = krate_is_real_sysroot
+        .then(|| crate::concurrency_effects::is_std_thread_spawn(tcx, def_id))
+        .filter(|&is_spawn| is_spawn)
+        .and_then(|_| tcx.get_diagnostic_name(def_id))
+        .and_then(|name| {
+            trust_types::callee_key::std_thread_spawn_item_for_diagnostic_name(name.as_str())
+        });
+    let sysroot_item = if spawn_item.is_some() {
+        spawn_item
+    } else if krate_is_real_sysroot {
+        let mut scratch = CalleeOwnerScratch::default();
+        trust_types::callee_key::sysroot_item_for(
+            krate_name.as_str(),
+            callee_owner_of(tcx, def_id, &mut scratch),
+            tcx.item_name(def_id).as_str(),
+        )
+    } else {
+        None
+    };
+
+    trust_types::CalleeKey {
+        sysroot_item,
+        krate_is_real_sysroot,
+        krate_name_is_ambiguous,
+        stable_crate_id: tcx.stable_crate_id(krate).as_u64(),
+        krate_name: krate_name.as_str().to_string(),
+        foreign_block_leaf: foreign_block_leaf_of(tcx, def_id),
+        // G1 review (2026-10-27): the LINK symbol of an upstream crate's foreign fn,
+        // from the DefId alone like every field above.
+        upstream_foreign_link_symbol: upstream_foreign_link_symbol_of(tcx, def_id),
+        // DIVERGE-ENTRY-1: from the DefId alone, like every field above.
+        diverging_entry: krate_is_real_sysroot
+            .then(|| diverging_entry_of(tcx, def_id))
+            .flatten(),
+    }
+}
+
+/// The [`trust_types::CalleeKey`] of the function a call's `func` operand names,
+/// when that operand is a direct `FnDef` constant.
+///
+/// UNLIKE [`func_operand_callee_identity`], this does NOT refuse a
+/// non-concrete instantiation: the key does not read `generic_args` at all, so
+/// there is nothing about `f::<T>` from inside a generic body that could make
+/// the key wrong. That is exactly the round-5 defect closed at its root — the
+/// old path lost every unsafe sysroot row in generic code because an
+/// associated-type ARGUMENT made the rendered path unparseable, and here the
+/// argument is not in the domain.
+///
+/// Every other operand shape — an indirect `fn`-pointer call, a `dyn` dispatch,
+/// a call through a local — yields `None`, which is the honest answer and which
+/// every consumer must treat as "keep the fail-closed stand-in".
+fn func_operand_callee_key<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+) -> Option<trust_types::CalleeKey> {
+    match func {
+        mir::Operand::Constant(const_op) => match const_op.const_.ty().kind() {
+            rustc_middle::ty::TyKind::FnDef(def_id, _generic_args) => {
+                Some(callee_key_for(tcx, *def_id))
+            }
+            _ => None,
+        },
+        // EXHAUSTIVE on purpose (no wildcard), the same rule as
+        // `func_operand_callee_identity`: a new `mir::Operand` variant must fail
+        // to compile here rather than silently acquire the `None` default.
+        mir::Operand::Copy(_) | mir::Operand::Move(_) | mir::Operand::RuntimeChecks(_) => None,
+    }
+}
+
 /// The [`trust_types::CalleeIdentity`] of the function a call's `func` operand
 /// names, when that operand is a direct `FnDef` constant.
 ///
@@ -8956,9 +15183,9 @@ fn func_operand_callee_identity<'tcx>(
     func: &mir::Operand<'tcx>,
 ) -> Option<trust_types::CalleeIdentity> {
     match func {
-        mir::Operand::Constant(box const_op) => match const_op.const_.ty().kind() {
+        mir::Operand::Constant(const_op) => match const_op.const_.ty().kind() {
             rustc_middle::ty::TyKind::FnDef(def_id, generic_args) => {
-                callee_identity_for(tcx, *def_id, generic_args)
+                callee_identity_for(tcx, *def_id, generic_args.skip_binder())
             }
             _ => None,
         },
@@ -9069,9 +15296,12 @@ fn call_path_without_trailing_turbofish(mut path: &str) -> &str {
 fn devirtualized_callee_name<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: rustc_span::def_id::DefId,
-    generic_args: ty::GenericArgsRef<'tcx>,
+    generic_args: ty::GenericArgs<'tcx>,
 ) -> Option<String> {
-    if tcx.trait_of_assoc(def_id).is_none() || generic_args.has_non_region_param() {
+    if tcx.trait_of_assoc(def_id).is_none()
+        || generic_args.has_non_region_param()
+        || crate::tuple_layouts::resolution_may_reenter(tcx, def_id, generic_args)
+    {
         return None;
     }
     let instance =
@@ -9079,7 +15309,12 @@ fn devirtualized_callee_name<'tcx>(
             .ok()
             .flatten()?;
     let resolved = instance.def_id();
-    if resolved == def_id || !resolved.is_local() || !tcx.is_mir_available(resolved) {
+    // `trust_local_def_has_mir`, not `is_mir_available`: this runs inside `mir_built`
+    // (the trust-ir producer's oracle), where `is_mir_available`'s `mir_keys` demands
+    // every async closure's by-move body — the `mir_built` of a coroutine that can be
+    // the very body under construction (E0391).
+    let Some(local) = resolved.as_local() else { return None };
+    if resolved == def_id || !tcx.trust_local_def_has_mir(local) {
         return None;
     }
     // A `Fn`/`FnMut`/`FnOnce::call*` invocation resolves to the CLOSURE BODY. Do NOT
@@ -9099,31 +15334,81 @@ fn devirtualized_callee_name<'tcx>(
             return None;
         }
     }
-    Some(crate::safe_def_path_str(tcx, resolved))
+    // Trust (generics, 2026-09-13): a resolved impl that REQUIRES MONOMORPHIZATION must
+    // not be renamed. `safe_def_path_str` renders the DEFINITION's parameters, so every
+    // instantiation of one impl collapses onto one string. Measured on the stage2:
+    // `Gen<u8>` and `Gen<u16>` both rendered `<Gen<T> as Tg>::n`, while the un-renamed
+    // branch renders `<Gen<u8> as Tg>::n` / `<Gen<u16> as Tg>::n` — i.e. the rename is
+    // MANY-TO-ONE across instantiations, the same aliasing the DefId lane's generic
+    // decline exists to refuse.
+    //
+    // Declining leaves `func_operand_name` on its ordinary
+    // `exact_def_path_str_with_args(def_id, generic_args)` branch — the SAME function on
+    // the SAME inputs the B-lane uses for its `bundled_name`, so an identity comparison
+    // is one producer against itself rather than two reconstructions of one string.
+    //
+    // Do NOT "fix" this instead by re-rendering the impl WITH args
+    // (`safe_def_path_str_with_args(resolved, instance.args)`): that puts
+    // `(impl_def_id, impl_args)` on one side and `(trait_def_id, trait_args)` on the
+    // other — different DefIds, different arg vectors, two printer paths asked to agree —
+    // which is the R150 defect class restated.
+    //
+    // PREDICATE NOTE. An adversarial review proposed `generics_of(resolved).count() > 0`
+    // here. That is the spelling that had just been removed from the DefId lane for being
+    // wrong: `count()` is `parent_count + own_params.len()`, so it is true for a
+    // LIFETIME-only impl whose name is already injective across instantiations (lifetimes
+    // are erased in both spellings), and declining there would rename existing members
+    // for no gain. `requires_monomorphization` skips lifetimes and walks the parent chain,
+    // which is exactly the question being asked.
+    if tcx.generics_of(resolved).requires_monomorphization(tcx) {
+        return None;
+    }
+    // Trust (2026-09-29): STAMPED exactly as `direct_call_def_path` stamps a direct call
+    // to the same item. The rename used to return the bare `safe_def_path_str`, so in a
+    // local crate NAMED like a sysroot crate the devirtualized spelling was the one
+    // unstamped path: `<alloc::string::String as std::MySplit>::split` from a crate built
+    // `--crate-name std`, whose trait root reads as the real `std`. vcgen's str-view
+    // producer then took that user `split` for `str::split`, bounded a counter over its
+    // 300 items by the receiver's length, and proved an add that overflows; a `collect`
+    // over a `usize::MAX`-item user iterator lost its allocation obligation the same way
+    // (trip-count lane precondition audit, `review6/auth` `e5_std`, `e9_std`). A direct
+    // call into such a crate is already stamped, so it already fails to meet its
+    // unstamped bundled body and is refused; the devirtualized call now fails the same
+    // way instead of reading as sysroot. Every other crate is unchanged: the stamp is
+    // required only for a crate that wears a sysroot name without being the sysroot.
+    Some(disambiguate_direct_call_path(
+        crate::safe_def_path_str(tcx, resolved),
+        resolved.is_local(),
+        tcx.stable_crate_id(resolved.krate).as_u64(),
+        false,
+        trust_types::crate_name_wears_sysroot_spelling(tcx.crate_name(resolved.krate).as_str()),
+        is_real_sysroot_crate(tcx, resolved.krate),
+    ))
 }
 
 /// Rewrite a callee to `TRUST_TOTAL_CLONE_SENTINEL` when it is a PINNED-TOTAL std
 /// primitive-comparison method (see [`is_pinned_total_std_primitive_cmp_call`]),
 /// so the bridge models it as a total (havoc) call.
 ///
-/// The old derived-totality lane is DEAD: a source/proc-macro-spellable
-/// `#[automatically_derived]` attribute cannot authenticate rustc's builtin
-/// expansion, so `is_automatically_derived` could not authorize an
-/// obligation-free sentinel rewrite. The ONLY sentinel channel that survives is the
-/// def-path-PINNED primitive-comparison table, whose authority is the resolved
-/// callee's defining crate + a compiler-registered diagnostic trait + a builtin
-/// primitive Self type — none of which is forgeable from source.
+/// The old ATTRIBUTE-keyed derived-totality lane is DEAD: a source/proc-macro-
+/// spellable `#[automatically_derived]` attribute cannot authenticate rustc's
+/// builtin expansion, so `is_automatically_derived` could not authorize an
+/// obligation-free sentinel rewrite. Every arm below keys on facts that are not
+/// forgeable from source: the def-path-PINNED primitive-comparison table (defining
+/// crate + compiler-registered diagnostic trait + builtin primitive Self type), the
+/// resolved-DefId collection arms, real-sysroot ADT anchors, and the Clone arm
+/// (`Clone` lang item + `is_builtin_derived` + `tcx_clone_is_total`).
 ///
-/// MEASURED 2026-08-16 (FRONT B, item 2) — FOUR of the `name`-gated arms below are
-/// DEAD: they decline every call by construction, because their prefilters predate the
-/// switch to rustc's fully-qualified `<SelfTy as Trait>::method` rendering (and, for two
-/// of them, a std module-path move). Each row is the callee string this toolchain's own
-/// `-Z trust-dump=mir` prints, next to the spelling the arm demands:
+/// MEASURED 2026-08-16 (FRONT B, item 2) — FOUR of the `name`-gated arms below were
+/// DEAD for std: they decline every std call by construction, because their prefilters
+/// predate the switch to rustc's fully-qualified `<SelfTy as Trait>::method` rendering
+/// (and, for two of them, a std module-path move). Each row is the callee string this
+/// toolchain's own `-Z trust-dump=mir` prints, next to the spelling the arm demands:
 ///
-///   arm                 | demanded (never matches)          | ACTUAL live spelling
+///   arm                 | demanded (never matches std)      | ACTUAL live spelling
 ///   --------------------+-----------------------------------+---------------------------
 ///   Option::as_deref    | `…::Option::<T>::as_deref` /      | `core::option::Option::
-///                       | `…::Option::as_deref`             |   <alloc::string::String>::as_deref`
+///   (DELETED 2026-10-04)| `…::Option::as_deref`             |   <alloc::string::String>::as_deref`
 ///   Default::default    | `core::default::Default::default` | `<core::option::Option<u32>
 ///                       |                                   |   as core::default::Default>::default`
 ///   AsRawFd::as_raw_fd  | `std::os::fd::AsRawFd::as_raw_fd` | `<std::fs::File as
@@ -9142,6 +15427,18 @@ fn devirtualized_callee_name<'tcx>(
 ///     weaker path to the same conclusion. The campaign memory calling `Option::as_deref`
 ///     a certify-family blocker is STALE: a probe of `Option::<String>::as_deref` /
 ///     `Option::<Box<u32>>::as_deref` PROVES today under the strict default.
+///     DELETED 2026-10-04 (EXTRACT-REWRITE-1): dead for std, the arm was LIVE for a user
+///     type. A user `pub struct Option<T = Box<u8>>(pub T)` renders its method WITHOUT
+///     the defaulted argument, `dep::Option::as_deref`, which the `::Option::as_deref`
+///     suffix accepted; its payload `Box<u8>` passed the real-sysroot payload gate, and
+///     the user's panicking `as_deref` became the obligation-free sentinel (certify exit
+///     0, `no_obligations`; the program panics). Anchoring it on `Option`'s DefId instead
+///     would REVIVE it for std, turning every std `as_deref` on those payloads into a
+///     trusted havoc in place of the call's own verification; deleting it changes
+///     nothing for std. (The "PROVES today" line above is the 2026-08-16 measurement;
+///     on the stage 1 of `38e6c69b1c`, `fn f(o: &Option<Box<u8>>) -> Option<&u8> {
+///     o.as_deref() }` reads `runtime_checked`, not proved, under default, certify and
+///     memory-safe. The arm never matched that call either way.)
 ///   * `<Box<T> as Deref>::deref` / `deref_mut` likewise prove today with no obligation
 ///     and no absent-callee census row. Rewriting them to the sentinel would REPLACE a
 ///     real discharge with a trusted havoc — a TCB regression for zero count movement.
@@ -9152,20 +15449,21 @@ fn devirtualized_callee_name<'tcx>(
 fn apply_total_clone_sentinel<'tcx>(
     tcx: TyCtxt<'tcx>,
     func: &mir::Operand<'tcx>,
-    name: String,
-) -> String {
+    name: &str,
+    default_call_path: &str,
+) -> bool {
     if let Some((method_def_id, gen_args)) = func.const_fn_def() {
         if is_pinned_total_std_primitive_cmp_call(tcx, method_def_id, gen_args) {
-            return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+            return true;
         }
         if is_total_keyed_collect_call(tcx, method_def_id, gen_args) {
-            return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+            return true;
         }
         if is_total_collection_extend_call(tcx, method_def_id, gen_args) {
-            return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+            return true;
         }
         if is_total_hash_map_query_call(tcx, method_def_id, gen_args) {
-            return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+            return true;
         }
     }
     // Std LOCK-GUARD deref: `<std::sync::{MutexGuard, RwLockReadGuard,
@@ -9184,78 +15482,76 @@ fn apply_total_clone_sentinel<'tcx>(
     // so the derived-trait totality gate never fires for it; anchored on the
     // canonical trait path AND the std `Option` self-ADT (a user `Default`
     // impl never matches).
-    if matches!(
-        name.as_str(),
-        "std::default::Default::default" | "core::default::Default::default"
-    ) {
-        if let Some((_, gen_args)) = func.const_fn_def() {
-            if let Some(self_ty) = gen_args.types().next() {
-                if let Some(adt) = self_ty.ty_adt_def() {
-                    let path = crate::safe_def_path_str(tcx, adt.did());
-                    let leaf = path.rsplit("::").next().unwrap_or(&path);
-                    let leaf = leaf.split('<').next().unwrap_or(leaf);
-                    if leaf == "Option"
-                        && (path.starts_with("core::") || path.starts_with("std::"))
-                        // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
-                        && is_real_sysroot_crate(tcx, adt.did().krate)
-                    {
-                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+    if default_call_path.ends_with("::Default::default")
+        || default_call_path.ends_with("Default>::default")
+    {
+        if let Some((default_method, gen_args)) = func.const_fn_def() {
+            let Some(default_item) = tcx.opt_associated_item(default_method) else {
+                return false;
+            };
+            let default_method = default_item.trait_item_def_id().unwrap_or(default_method);
+            let is_core_default = tcx.trait_of_assoc(default_method).is_some_and(|tr| {
+                is_real_sysroot_crate(tcx, tr.krate)
+                    && (tcx.get_diagnostic_item(rustc_span::sym::Default) == Some(tr)
+                        || crate::safe_def_path_str(tcx, tr) == "core::default::Default")
+            });
+            if is_core_default {
+                if let Some(self_ty) = gen_args.types().next() {
+                    if let Some(adt) = self_ty.ty_adt_def() {
+                        if is_real_sysroot_crate(tcx, adt.did().krate) {
+                            let path = crate::safe_def_path_str(tcx, adt.did());
+                            if matches!(
+                                path.as_str(),
+                                "core::option::Option"
+                                    | "std::option::Option"
+                                    | "alloc::vec::Vec"
+                                    | "std::vec::Vec"
+                                    | "alloc::collections::btree::map::BTreeMap"
+                                    | "std::collections::BTreeMap"
+                                    | "alloc::collections::btree::set::BTreeSet"
+                                    | "std::collections::BTreeSet"
+                                    | "alloc::collections::vec_deque::VecDeque"
+                                    | "std::collections::VecDeque"
+                            ) {
+                                return true;
+                            }
+                        }
                     }
                 }
             }
         }
     }
-    // `Option::<T>::as_deref` — a structural match plus ONE `Deref::deref` on
-    // the payload: total exactly when the payload's `Deref` impl is a std
-    // raw-pointer projection. Gated on the payload leaf being a std owning
-    // wrapper (`Box`/`Arc`/`Rc`/`String`/`Vec`), std/alloc/core-anchored — a
-    // payload with a USER `Deref` impl (which may panic) never matches.
-    if name.ends_with("::Option::<T>::as_deref") || name.ends_with("::Option::as_deref") {
-        if let Some((_, gen_args)) = func.const_fn_def() {
-            if let Some(payload_ty) = gen_args.types().next() {
-                if let Some(adt) = payload_ty.ty_adt_def() {
-                    let path = crate::safe_def_path_str(tcx, adt.did());
-                    let leaf = path.rsplit("::").next().unwrap_or(&path);
-                    let leaf = leaf.split('<').next().unwrap_or(leaf);
-                    let std_deref_wrapper =
-                        matches!(leaf, "Box" | "Arc" | "Rc" | "String" | "Vec")
-                            && (path.starts_with("std::")
-                                || path.starts_with("alloc::")
-                                || path.starts_with("core::"))
-                            // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
-                            && is_real_sysroot_crate(tcx, adt.did().krate);
-                    if std_deref_wrapper {
-                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
-                    }
-                }
-            }
-        }
-    }
+    // Trust (EXTRACT-REWRITE-1): no `Option::as_deref` arm. The name-suffix arm that
+    // stood here authenticated the PAYLOAD (`Box`/`Arc`/`Rc`/`String`/`Vec`, real
+    // sysroot) but not the `Option`: it never matched std's rendering and it did match
+    // a user `Option<T = Box<u8>>`'s `dep::Option::as_deref`. See the doc table above.
+    // Std's `as_deref` keeps the route it always had.
     // Std FD-accessor: `<OwnedFd/BorrowedFd/File as AsRawFd>::as_raw_fd` is a
     // plain field read (through the File→FileDesc→OwnedFd chain) — no panic
     // path, no user code. Same double-anchor discipline as the guard-deref
     // arm below: canonical trait path AND a std self-ADT, so a user `AsRawFd`
     // impl never matches.
-    if name.as_str() == "std::os::fd::AsRawFd::as_raw_fd" {
+    if name == "std::os::fd::AsRawFd::as_raw_fd" {
         if let Some((_, gen_args)) = func.const_fn_def() {
             if let Some(self_ty) = gen_args.types().next() {
                 if let Some(adt) = self_ty.ty_adt_def() {
-                    let path = crate::safe_def_path_str(tcx, adt.did());
-                    if path.starts_with("std::")
-                        && (path.ends_with("::OwnedFd")
-                            || path.ends_with("::BorrowedFd")
-                            || path.ends_with("::File"))
-                        // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
-                        && is_real_sysroot_crate(tcx, adt.did().krate)
-                    {
-                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+                    // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
+                    if is_real_sysroot_crate(tcx, adt.did().krate) {
+                        let path = crate::safe_def_path_str(tcx, adt.did());
+                        if path.starts_with("std::")
+                            && (path.ends_with("::OwnedFd")
+                                || path.ends_with("::BorrowedFd")
+                                || path.ends_with("::File"))
+                        {
+                            return true;
+                        }
                     }
                 }
             }
         }
     }
     if matches!(
-        name.as_str(),
+        name,
         "std::ops::Deref::deref"
             | "core::ops::Deref::deref"
             | "std::ops::DerefMut::deref_mut"
@@ -9264,24 +15560,25 @@ fn apply_total_clone_sentinel<'tcx>(
         if let Some((_, gen_args)) = func.const_fn_def() {
             if let Some(self_ty) = gen_args.types().next() {
                 if let Some(adt) = self_ty.ty_adt_def() {
-                    let path = crate::safe_def_path_str(tcx, adt.did());
-                    let leaf = path.rsplit("::").next().unwrap_or(&path);
-                    let leaf = leaf.split('<').next().unwrap_or(leaf);
-                    // `Box` joins the guard set for PANIC-freedom only: its
-                    // deref is an unchecked raw-pointer projection — no code
-                    // path can panic regardless of how the Box was produced
-                    // (a forged label is the UNSAFE lane's alignment/validity
-                    // problem, tracked by its own obligations, never a panic).
-                    let is_std_guard = matches!(
-                        leaf,
-                        "MutexGuard" | "RwLockReadGuard" | "RwLockWriteGuard" | "Box"
-                    ) && (path.starts_with("std::")
-                        || path.starts_with("alloc::")
-                        || path.starts_with("core::"))
-                        // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
-                        && is_real_sysroot_crate(tcx, adt.did().krate);
-                    if is_std_guard {
-                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+                    // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
+                    if is_real_sysroot_crate(tcx, adt.did().krate) {
+                        let path = crate::safe_def_path_str(tcx, adt.did());
+                        let leaf = path.rsplit("::").next().unwrap_or(&path);
+                        let leaf = leaf.split('<').next().unwrap_or(leaf);
+                        // `Box` joins the guard set for PANIC-freedom only: its
+                        // deref is an unchecked raw-pointer projection — no code
+                        // path can panic regardless of how the Box was produced
+                        // (a forged label is the UNSAFE lane's alignment/validity
+                        // problem, tracked by its own obligations, never a panic).
+                        let is_std_guard = matches!(
+                            leaf,
+                            "MutexGuard" | "RwLockReadGuard" | "RwLockWriteGuard" | "Box"
+                        ) && (path.starts_with("std::")
+                            || path.starts_with("alloc::")
+                            || path.starts_with("core::"));
+                        if is_std_guard {
+                            return true;
+                        }
                     }
                 }
             }
@@ -9290,7 +15587,7 @@ fn apply_total_clone_sentinel<'tcx>(
     // Chain to the audited Clone-arm sentinel (lang-item + tcx_clone_is_total
     // gated); it returns `name` unchanged when the callee is not a provably-total
     // `Clone::clone` (fail-closed, byte-identical for every other callee).
-    apply_total_clone_sentinel_clone_arm(tcx, func, name)
+    apply_total_clone_sentinel_clone_arm(tcx, func, default_call_path)
 }
 
 /// Rewrite a provably-total `Clone::clone` callee to `TRUST_TOTAL_CLONE_SENTINEL`
@@ -9304,13 +15601,11 @@ fn apply_total_clone_sentinel<'tcx>(
 ///   (3) `tcx_clone_is_total` proves the CONCRETE receiver clone panic-free (a
 ///       hand-written / foreign / non-builtin-derived element fails closed).
 /// Fails CLOSED on every miss (the call keeps its real name → may-panic obligation).
-/// ONLY the Clone arm is live; the derived-trait / keyed-collect / extend / hashmap
-/// arms stay quarantined in the `#[cfg(any())]` twin.
 fn apply_total_clone_sentinel_clone_arm<'tcx>(
     tcx: TyCtxt<'tcx>,
     func: &mir::Operand<'tcx>,
-    name: String,
-) -> String {
+    clone_call_path: &str,
+) -> bool {
     // Accept BOTH renderings of the clone callee: the generic-path form
     // `...::Clone::clone` AND the fully-qualified form `<T as core::clone::Clone>::clone`
     // (which ends in `Clone>::clone` — the `>` before `::clone`). The old gate only
@@ -9319,14 +15614,11 @@ fn apply_total_clone_sentinel_clone_arm<'tcx>(
     // soundness boundary is the `clone_trait()` lang-item gate + `tcx_clone_is_total`
     // below (a user trait named `*Clone` with a `clone` method passes this string test
     // but is rejected by the lang-item check).
-    let clone_call_path = call_path_without_trailing_turbofish(&name);
     if clone_call_path.ends_with("::Clone::clone") || clone_call_path.ends_with("Clone>::clone") {
         if let Some((clone_method, gen_args)) = func.const_fn_def() {
             if let Some(self_ty) = gen_args.types().next() {
-                let clone_method = tcx
-                    .associated_item(clone_method)
-                    .trait_item_def_id()
-                    .unwrap_or(clone_method);
+                let clone_method =
+                    tcx.associated_item(clone_method).trait_item_def_id().unwrap_or(clone_method);
                 // LANG-ITEM GATE (vector #2): the resolved method's trait must be the
                 // un-spoofable `Clone` lang item. Binding `Some(clone_trait)` also rules
                 // out a `None == None` match if no Clone lang item existed.
@@ -9337,16 +15629,16 @@ fn apply_total_clone_sentinel_clone_arm<'tcx>(
                             self_ty,
                             clone_method,
                             CLONE_TOTALITY_FUEL,
-                            &mut std::collections::HashSet::new(),
+                            &mut FxHashSet::default(),
                         )
                     {
-                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+                        return true;
                     }
                 }
             }
         }
     }
-    name
+    false
 }
 
 /// P-PRIM-CMP — the pinned-total std primitive-comparison premise.
@@ -9396,7 +15688,7 @@ fn apply_total_clone_sentinel_clone_arm<'tcx>(
 fn is_pinned_total_std_primitive_cmp_call<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee_def_id: rustc_span::def_id::DefId,
-    gen_args: ty::GenericArgsRef<'tcx>,
+    gen_args: ty::GenericArgs<'tcx>,
 ) -> bool {
     use rustc_hir::def::DefKind;
     use rustc_span::sym;
@@ -9410,6 +15702,9 @@ fn is_pinned_total_std_primitive_cmp_call<'tcx>(
     }
 
     // (1) Resolve to the concrete impl method — the only authenticatable identity.
+    if crate::tuple_layouts::resolution_may_reenter(tcx, callee_def_id, gen_args) {
+        return false;
+    }
     let Some(instance) = ty::Instance::try_resolve(
         tcx,
         ty::TypingEnv::fully_monomorphized(),
@@ -9489,41 +15784,73 @@ fn is_pinned_total_std_primitive_cmp_call<'tcx>(
 /// A `PartialEq::eq` on a std `Option`/`Result` receiver is DELIBERATELY EXCLUDED
 /// (kept as its real callee name): the eq-guard verify channel models `o == None` as
 /// a pure discriminant test, and the opaque total sentinel would ERASE that (a
-/// precision loss, not a soundness gap — the bridge's trusted-total allowlist still
-/// models these calls total). Mirrors the same carve-out in the quarantined
-/// `is_total_derived_trait_call`.
+/// precision loss, not a soundness gap — the bridge still models such a call total
+/// when one side is payload-less or the payload's own `eq` is core's and total, and
+/// otherwise keeps its may-panic charge). Mirrors the same carve-out in the
+/// quarantined `is_total_derived_trait_call`.
 fn apply_total_partial_eq_sentinel<'tcx>(
     tcx: TyCtxt<'tcx>,
     func: &mir::Operand<'tcx>,
-    name: String,
-) -> String {
-    let eq_call_path = call_path_without_trailing_turbofish(&name);
-    if !(eq_call_path.ends_with("::PartialEq::eq")
+    eq_call_path: &str,
+) -> bool {
+    let is_homogeneous_path = eq_call_path.ends_with("::PartialEq::eq")
         || eq_call_path.ends_with("PartialEq>::eq")
         || eq_call_path.ends_with("::PartialEq::ne")
-        || eq_call_path.ends_with("PartialEq>::ne"))
+        || eq_call_path.ends_with("PartialEq>::ne");
+    if !(is_homogeneous_path || eq_call_path.ends_with(">::eq") || eq_call_path.ends_with(">::ne"))
     {
-        return name;
+        return false;
     }
     let Some((eq_method, gen_args)) = func.const_fn_def() else {
-        return name;
+        return false;
     };
     let Some(self_ty) = gen_args.types().next() else {
-        return name;
+        return false;
     };
-    let eq_method = tcx.associated_item(eq_method).trait_item_def_id().unwrap_or(eq_method);
+    let Some(eq_item) = tcx.opt_associated_item(eq_method) else {
+        return false;
+    };
+    let eq_method = eq_item.trait_item_def_id().unwrap_or(eq_method);
     let Some(eq_trait) = tcx.trait_of_assoc(eq_method) else {
-        return name;
+        return false;
     };
     // TRAIT GATE (vector #2): the resolved trait must be the REAL
     // `core::cmp::PartialEq`. `PartialEq` has no lang item, so anchor on its
     // un-spoofable diagnostic item, with an exact-def-path fallback in case the
     // diagnostic item is unavailable. A user trait named `PartialEq` (whose
     // def-path is NOT `core::cmp::PartialEq`) is rejected here.
-    let is_core_partial_eq = tcx.get_diagnostic_item(rustc_span::sym::PartialEq) == Some(eq_trait)
-        || crate::safe_def_path_str(tcx, eq_trait) == "core::cmp::PartialEq";
+    //
+    // Trust (FENCE-IDENTITY-1 survey, 2026-10-12): the def-path fallback is
+    // RENDERED TEXT, and `safe_def_path_str` carries no impersonation stamp: a
+    // crate compiled `--crate-name core` with its own `pub mod cmp { pub trait
+    // PartialEq }` renders that trait as exactly `core::cmp::PartialEq`, and
+    // `tcx_derived_trait_is_total` answers `true` for every primitive `Self`
+    // whatever the trait — so its panicking `impl PartialEq for u32` call was
+    // rewritten to the total sentinel. The fallback now also requires the trait
+    // to live in a REAL sysroot crate (artifact residency).
+    let is_core_partial_eq = is_real_sysroot_crate(tcx, eq_trait.krate)
+        && (tcx.get_diagnostic_item(rustc_span::sym::PartialEq) == Some(eq_trait)
+            || crate::safe_def_path_str(tcx, eq_trait) == "core::cmp::PartialEq");
     if !is_core_partial_eq {
-        return name;
+        return false;
+    }
+    let rhs_ty = gen_args.types().nth(1).unwrap_or(self_ty);
+    if !is_homogeneous_path || self_ty != rhs_ty {
+        let is_sysroot_str_or_string = |mut ty: ty::Ty<'tcx>| -> bool {
+            while let ty::TyKind::Ref(_, inner, _) = ty.kind() {
+                ty = *inner;
+            }
+            match ty.kind() {
+                ty::TyKind::Str => true,
+                ty::TyKind::Adt(adt, args) => {
+                    args.is_empty()
+                        && tcx.lang_items().string() == Some(adt.did())
+                        && is_real_alloc_crate(tcx, adt.did().krate)
+                }
+                _ => false,
+            }
+        };
+        return is_sysroot_str_or_string(self_ty) && is_sysroot_str_or_string(rhs_ty);
     }
     // Precision carve-out (see doc): a std `Option`/`Result` `eq` keeps its real
     // name so the eq-guard channel can still recover the discriminant test.
@@ -9533,27 +15860,26 @@ fn apply_total_partial_eq_sentinel<'tcx>(
             st = *inner;
         }
         if let ty::TyKind::Adt(adt, _) = st.kind() {
-            if matches!(
-                crate::safe_def_path_str(tcx, adt.did()).as_str(),
-                "core::option::Option"
-                    | "std::option::Option"
-                    | "core::result::Result"
-                    | "std::result::Result"
-            ) {
-                return name;
+            if matches!(tcx.item_name(adt.did()).as_str(), "Option" | "Result")
+                && matches!(
+                    crate::safe_def_path_str(tcx, adt.did()).as_str(),
+                    "core::option::Option"
+                        | "std::option::Option"
+                        | "core::result::Result"
+                        | "std::result::Result"
+                )
+            {
+                return false;
             }
         }
     }
-    if tcx_derived_trait_is_total(
+    tcx_derived_trait_is_total(
         tcx,
         self_ty,
         eq_trait,
         CLONE_TOTALITY_FUEL,
-        &mut std::collections::HashSet::new(),
-    ) {
-        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
-    }
-    name
+        &mut FxHashSet::default(),
+    )
 }
 
 /// Build D: rewrite a provably-total DERIVED `PartialOrd`/`Ord` comparison callee to
@@ -9584,65 +15910,67 @@ fn apply_total_partial_eq_sentinel<'tcx>(
 fn apply_total_partial_ord_sentinel<'tcx>(
     tcx: TyCtxt<'tcx>,
     func: &mir::Operand<'tcx>,
-    name: String,
-) -> String {
+    p: &str,
+) -> bool {
     use rustc_span::sym;
-    let p = call_path_without_trailing_turbofish(&name);
-    let is_partial_ord_tail = ["lt", "le", "gt", "ge", "partial_cmp"].iter().any(|m| {
-        p.ends_with(&format!("::PartialOrd::{m}")) || p.ends_with(&format!("PartialOrd>::{m}"))
-    });
+    let is_partial_ord_tail = [
+        "::PartialOrd::lt",
+        "PartialOrd>::lt",
+        "::PartialOrd::le",
+        "PartialOrd>::le",
+        "::PartialOrd::gt",
+        "PartialOrd>::gt",
+        "::PartialOrd::ge",
+        "PartialOrd>::ge",
+        "::PartialOrd::partial_cmp",
+        "PartialOrd>::partial_cmp",
+    ]
+    .iter()
+    .any(|suffix| p.ends_with(suffix));
     let is_ord_tail = p.ends_with("::Ord::cmp") || p.ends_with("Ord>::cmp");
     if !(is_partial_ord_tail || is_ord_tail) {
-        return name;
+        return false;
     }
     let Some((method, gen_args)) = func.const_fn_def() else {
-        return name;
+        return false;
     };
     let Some(self_ty) = gen_args.types().next() else {
-        return name;
+        return false;
     };
     let method = tcx.associated_item(method).trait_item_def_id().unwrap_or(method);
     let Some(cmp_trait) = tcx.trait_of_assoc(method) else {
-        return name;
+        return false;
     };
+    // FENCE-IDENTITY-1 survey: the rendered-path fallbacks are admitted only for a
+    // trait in a REAL sysroot crate — see `apply_total_partial_eq_sentinel`.
+    let in_real_sysroot = is_real_sysroot_crate(tcx, cmp_trait.krate);
     let is_core_partial_ord = tcx.lang_items().partial_ord_trait() == Some(cmp_trait)
-        || crate::safe_def_path_str(tcx, cmp_trait) == "core::cmp::PartialOrd";
+        || (in_real_sysroot && crate::safe_def_path_str(tcx, cmp_trait) == "core::cmp::PartialOrd");
     let is_core_ord = tcx.get_diagnostic_item(sym::Ord) == Some(cmp_trait)
-        || crate::safe_def_path_str(tcx, cmp_trait) == "core::cmp::Ord";
+        || (in_real_sysroot && crate::safe_def_path_str(tcx, cmp_trait) == "core::cmp::Ord");
     // Trait identity must AGREE with the method tail (a PartialOrd tail must resolve
     // to the PartialOrd trait, an Ord tail to Ord) so a spoofed spelling cannot cross
     // tiers.
     if !((is_partial_ord_tail && is_core_partial_ord) || (is_ord_tail && is_core_ord)) {
-        return name;
+        return false;
     }
-    if tcx_derived_trait_is_total(
+    tcx_derived_trait_is_total(
         tcx,
         self_ty,
         cmp_trait,
         CLONE_TOTALITY_FUEL,
-        &mut std::collections::HashSet::new(),
-    ) {
-        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
-    }
-    name
+        &mut FxHashSet::default(),
+    )
 }
 
-/// Fixed-arity derived-`Debug` finishers on `core::fmt::Formatter`, whose value args are
-/// INDIVIDUAL `&dyn Debug` operands. The N-ary `debug_{struct,tuple}_fields_finish`
-/// variants are DELIBERATELY EXCLUDED — they take a `&[&dyn Debug]` slice whose elements
-/// are not individual args, so a >5-field derived Debug stays UNKNOWN (sound, less
-/// complete) rather than being under-checked.
+/// Current fixed-arity `Debug` finishers on `core::fmt::Formatter`. Tuple and
+/// named derives share these packed-name helpers; larger derives use the n-ary helper.
 const DEBUG_FIXED_FINISHERS: &[&str] = &[
     "debug_struct_field1_finish",
     "debug_struct_field2_finish",
     "debug_struct_field3_finish",
     "debug_struct_field4_finish",
     "debug_struct_field5_finish",
-    "debug_tuple_field1_finish",
-    "debug_tuple_field2_finish",
-    "debug_tuple_field3_finish",
-    "debug_tuple_field4_finish",
-    "debug_tuple_field5_finish",
 ];
 
 /// Batch-1 L3: rewrite a `<P as core::hash::Hash>::hash::<H>` call — for a language
@@ -9659,30 +15987,32 @@ const DEBUG_FIXED_FINISHERS: &[&str] = &[
 ///       forbids a user crate writing `impl Hash for u32`, so a primitive `Self` provably
 ///       resolves to the std impl (whose `hash` writes a fixed byte count, runs NO user
 ///       comparison, cannot panic);
-///   (3) the hasher `H` is a REAL-sysroot, fully-monomorphized ADT — a user `impl Hasher`
-///       whose `write_*` runs panicking user code is rejected, and a still-generic `H`
-///       (an unmonomorphized derived body) fails closed via `has_non_region_param`.
+///   (3) the hasher `H` is a REAL-sysroot, fully-monomorphized ADT, and so is every type
+///       argument it carries at any depth (SP-1 review, 2026-10-05:
+///       [`hasher_ty_is_sysroot_throughout`]; `Box<dep::H>` forwards `write_*` to `H`) — a
+///       user `impl Hasher` whose `write_*` runs panicking user code is rejected, and a
+///       still-generic `H` (an unmonomorphized derived body) fails closed via
+///       `has_non_region_param`.
 /// The `()` return means modeling the call total introduces no value axiom — only the
 /// (correct) fact that the primitive hash cannot panic. NOT reused for the ARENA
 /// `thread_local` closures (they are not `Hash` impls).
 fn apply_total_primitive_hash_sentinel<'tcx>(
     tcx: TyCtxt<'tcx>,
     func: &mir::Operand<'tcx>,
-    name: String,
-) -> String {
+    hash_call_path: &str,
+) -> bool {
     // Cheap prefilter on BOTH renderings: the generic-path `...::Hash::hash` and the
     // fully-qualified `<T as core::hash::Hash>::hash` (ends in `Hash>::hash`). Only a
     // prefilter — the soundness boundary is the diagnostic-item + primitive-Self +
     // sysroot-hasher gates below.
-    let hash_call_path = call_path_without_trailing_turbofish(&name);
     if !(hash_call_path.ends_with("::Hash::hash") || hash_call_path.ends_with("Hash>::hash")) {
-        return name;
+        return false;
     }
     let Some((method_def_id, gen_args)) = func.const_fn_def() else {
-        return name;
+        return false;
     };
     if tcx.item_name(method_def_id).as_str() != "hash" {
-        return name;
+        return false;
     }
     // Map a resolved impl method to its trait method, then gate on the un-spoofable
     // `Hash` diagnostic item (mirrors the `clone_trait()` lang-item gate in
@@ -9690,81 +16020,87 @@ fn apply_total_primitive_hash_sentinel<'tcx>(
     let method_def_id =
         tcx.associated_item(method_def_id).trait_item_def_id().unwrap_or(method_def_id);
     let Some(trait_def_id) = tcx.trait_of_assoc(method_def_id) else {
-        return name;
+        return false;
     };
     if tcx.get_diagnostic_item(rustc_span::sym::Hash) != Some(trait_def_id) {
-        return name;
+        return false;
     }
     // `<Self as Hash>::hash::<H>` monomorph args are `[Self, H]` (type args only).
     let mut type_args = gen_args.types();
     let Some(self_ty) = type_args.next() else {
-        return name;
+        return false;
     };
     if !matches!(
         self_ty.kind(),
         ty::TyKind::Int(_) | ty::TyKind::Uint(_) | ty::TyKind::Bool | ty::TyKind::Char
     ) {
-        return name;
+        return false;
     }
     let Some(hasher_ty) = type_args.next() else {
-        return name;
+        return false;
     };
     // A still-generic hasher (unmonomorphized) or any type/const param → fail closed.
     if hasher_ty.has_non_region_param() {
-        return name;
+        return false;
     }
-    let ty::TyKind::Adt(hasher_def, _) = hasher_ty.kind() else {
-        return name;
-    };
-    if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
-        return name;
-    }
-    TRUST_TOTAL_CLONE_SENTINEL.to_string()
+    // Trust (SP-1 review, 2026-10-05): the WHOLE hasher type, not its outer ADT:
+    // `<u32 as Hash>::hash::<Box<dep::BadHasher>>` passed the old outer-ADT check
+    // (`Box` is a sysroot type) and ran `BadHasher::write` through `Box`'s forwarding
+    // `Hasher` impl ([`hasher_ty_is_sysroot_throughout`]).
+    // Merge (2026-10-14): ours (`hasher_ty_is_std_closed`) must admit too.
+    hasher_ty_is_sysroot_throughout(tcx, hasher_ty) && hasher_ty_is_std_closed(tcx, hasher_ty)
 }
 
-/// Un-spoofable: an inherent method on the foreign `Formatter` type can be defined ONLY in
-/// Formatter's home crate (core) — coherence forbids a user crate adding an inherent
-/// `debug_*_finish` to `core::fmt::Formatter`, and a user crate cannot be named `core`/`std`.
-fn is_std_debug_fixed_finisher<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> bool {
+/// A crate may be named `core` or `std`, so a rendered path is not authority.
+/// Require the loaded sysroot artifact, the inherent owner, and the genuine
+/// Formatter diagnostic type before an exact member name can select a helper.
+fn is_std_debug_finisher<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+    members: &[&str],
+) -> bool {
     let Some((def_id, _)) = func.const_fn_def() else { return false };
-    if def_id.is_local() {
+    if def_id.is_local() || !is_real_sysroot_crate(tcx, def_id.krate) {
         return false;
     }
-    let name = tcx.item_name(def_id);
-    if !DEBUG_FIXED_FINISHERS.iter().any(|n| name.as_str() == *n) {
+    if !members.iter().any(|name| tcx.item_name(def_id).as_str() == *name) {
         return false;
     }
-    let path = crate::safe_def_path_str(tcx, def_id);
-    path.starts_with("core::fmt::Formatter") || path.starts_with("std::fmt::Formatter")
+    let Some(impl_id) = tcx.inherent_impl_of_assoc(def_id) else { return false };
+    let self_ty = tcx.type_of(impl_id).instantiate_identity().skip_normalization();
+    matches!(self_ty.kind(), ty::TyKind::Adt(adt, _)
+        if adt.did().krate == def_id.krate
+            && tcx.is_diagnostic_item(rustc_span::sym::Formatter, adt.did()))
 }
 
-/// Follow `arg` (a `move/copy _L`) back to the `_L = <src> as &dyn Debug (Unsize)` cast in
-/// this block and return the ERASED concrete type = pointee of `<src>`'s reference type.
-/// Bounded copy-follow; None (→ caller fails closed) on any deviation.
+fn is_std_debug_fixed_finisher<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> bool {
+    is_std_debug_finisher(tcx, func, DEBUG_FIXED_FINISHERS)
+}
+
+/// Recover the erased concrete type behind an `&dyn Debug` unsize. Every
+/// reference slot must have one immutable whole-body definition; a last local
+/// assignment alone cannot rule out a later raw write changing its vtable.
 fn unsize_cast_source_pointee<'tcx>(
     tcx: TyCtxt<'tcx>,
     arg: &mir::Operand<'tcx>,
-    stmts: &[mir::Statement<'tcx>],
-    local_decls: &mir::LocalDecls<'tcx>,
+    body: &mir::Body<'tcx>,
 ) -> Option<ty::Ty<'tcx>> {
     let mut local = operand_whole_local(arg)?;
     for _ in 0..8 {
-        // bounded
-        let def = stmts.iter().rev().find_map(|s| match &s.kind {
-            mir::StatementKind::Assign(box (lhs, rv))
-                if lhs.projection.is_empty() && lhs.local == local =>
-            {
-                Some(rv)
-            }
-            _ => None,
-        })?;
+        if is_mir_parameter(body, local)
+            || local_has_terminator_def(body, local)
+            || pointer_local_storage_may_change(body, local)
+        {
+            return None;
+        }
+        let (_, def) = unique_whole_local_assign_with_loc(body, local)?;
         match def {
             mir::Rvalue::Cast(
                 mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _),
                 src,
                 _,
             ) => {
-                let src_ty = src.ty(local_decls, tcx);
+                let src_ty = src.ty(&body.local_decls, tcx);
                 return match src_ty.kind() {
                     ty::TyKind::Ref(_, pointee, _) | ty::TyKind::RawPtr(pointee, _) => {
                         Some(*pointee)
@@ -9786,6 +16122,266 @@ fn unsize_cast_source_pointee<'tcx>(
     None
 }
 
+/// Trust (DEBUG-PACKED-NAMES): core splits a named helper's packed `&str` on
+/// ASCII spaces and unwraps one field name per value. A tuple has no spaces and
+/// takes the separate, non-unwrapping branch. Count the actual constant bytes;
+/// the fact that the callee is in core does not make a handwritten call total.
+fn debug_packed_name_bytes_have_fields(names: &[u8], fields: usize) -> bool {
+    let separators = names.iter().filter(|&&byte| byte == b' ').count();
+    separators == 0 || separators >= fields
+}
+
+/// Read an operand's literal constant only through immutable whole-body copy
+/// definitions. Shared `&str` reborrows preserve the same slice value; no other
+/// reference construction is followed. Parameters retain their implicit incoming
+/// definition; aliases, projected writes, terminator definitions and multiple stores refuse.
+/// No evaluation or value/identity authority is supplied by this helper.
+#[must_use]
+pub fn immutable_operand_const<'tcx>(
+    body: &mir::Body<'tcx>,
+    operand: &mir::Operand<'tcx>,
+) -> Option<mir::Const<'tcx>> {
+    let mut operand = operand.clone();
+    for _ in 0..16 {
+        if let mir::Operand::Constant(constant) = &operand {
+            return Some(constant.const_);
+        }
+        let local = operand_whole_local(&operand)?;
+        if is_mir_parameter(body, local)
+            || local_has_terminator_def(body, local)
+            || pointer_local_storage_may_change(body, local)
+        {
+            return None;
+        }
+        let (_, value) = unique_whole_local_assign_with_loc(body, local)?;
+        match value {
+            mir::Rvalue::Use(source, _) => operand = source.clone(),
+            // The current derive expansion emits `_a = &(*_b)` for packed
+            // names. Both slots must be shared str slices, and the next loop
+            // iteration checks _b's full-body custody before trusting it.
+            mir::Rvalue::Ref(_, mir::BorrowKind::Shared, place)
+                if place.projection.len() == 1
+                    && matches!(place.projection[0], mir::ProjectionElem::Deref)
+                    && matches!(body.local_decls[local].ty.kind(),
+                        ty::Ref(_, inner, mir::Mutability::Not) if inner.is_str())
+                    && matches!(body.local_decls[place.local].ty.kind(),
+                        ty::Ref(_, inner, mir::Mutability::Not) if inner.is_str()) =>
+            {
+                operand = mir::Operand::Copy(mir::Place::from(place.local));
+            }
+            _ => return None,
+        };
+    }
+    None
+}
+
+/// Recover only a compile-time `&str`, including derive's n-ary `names` local.
+/// The constant reader enforces body-wide custody. This validates the operand
+/// only; callers must separately authenticate the finisher and its required
+/// arity. Shared by logical extraction and P-SPLIT.
+#[must_use]
+pub fn debug_finisher_names_have_fields<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mir::Body<'tcx>,
+    names: &mir::Operand<'tcx>,
+    fields: usize,
+) -> bool {
+    let Some(constant) = immutable_operand_const(body, names) else { return false };
+    let ty::TyKind::Ref(_, inner, _) = constant.ty().kind() else { return false };
+    if !matches!(inner.kind(), ty::TyKind::Str) {
+        return false;
+    }
+    let mir::Const::Val(value, _) = constant else { return false };
+    value
+        .try_get_slice_bytes_for_diagnostics(tcx)
+        .is_some_and(|bytes| debug_packed_name_bytes_have_fields(bytes, fields))
+}
+
+/// Structural evidence for an authenticated fixed Debug wrapper's delegation.
+/// This does not authenticate either function or grant totality: the compiler
+/// must separately establish the exact core Formatter caller/callee identities
+/// and every incoming fixed-wrapper names obligation. In particular, ordinary
+/// caller parameters remain unknown to `immutable_operand_const`.
+#[must_use]
+pub fn debug_fixed_finisher_forwards_inputs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mir::Body<'tcx>,
+    call_block: mir::BasicBlock,
+    fields: usize,
+) -> bool {
+    if !(1..=5).contains(&fields)
+        || body.arg_count != fields + 2
+        || body.basic_blocks.len() > 8
+        || body.local_decls.len() > 32
+        || call_block.as_usize() >= body.basic_blocks.len()
+    {
+        return false;
+    }
+    let mir::TerminatorKind::Call { args, target: Some(_), .. } =
+        &body.basic_blocks[call_block].terminator().kind
+    else {
+        return false;
+    };
+    if args.len() != 3 {
+        return false;
+    }
+    let Some(debug_trait) = tcx.get_diagnostic_item(rustc_span::sym::Debug) else {
+        return false;
+    };
+    let receiver_ty = body.local_decls[mir::Local::from_usize(1)].ty;
+    if !matches!(receiver_ty.kind(),
+        ty::Ref(_, inner, mir::Mutability::Mut)
+            if matches!(inner.kind(), ty::Adt(adt, _)
+                if tcx.is_diagnostic_item(rustc_span::sym::Formatter, adt.did())))
+        || !matches!(body.local_decls[mir::Local::from_usize(2)].ty.kind(),
+            ty::Ref(_, inner, mir::Mutability::Not) if inner.is_str())
+        || (3..fields + 3).any(|index| {
+            !matches!(body.local_decls[mir::Local::from_usize(index)].ty.kind(),
+                ty::Ref(_, inner, mir::Mutability::Not)
+                    if matches!(inner.kind(), ty::Dynamic(predicates, _)
+                        if predicates.principal_def_id() == Some(debug_trait)))
+        })
+    {
+        return false;
+    }
+
+    // Accept only a straight-line relay with this one call. An assertion,
+    // hidden call, store through a reference, raw address, branch or cleanup
+    // cannot borrow the wrapper's incoming invariant.
+    let mut visited = FxHashSet::default();
+    let mut cursor = mir::START_BLOCK;
+    loop {
+        if !visited.insert(cursor) {
+            return false;
+        }
+        let block = &body.basic_blocks[cursor];
+        for statement in &block.statements {
+            match &statement.kind {
+                mir::StatementKind::StorageLive(_)
+                | mir::StatementKind::StorageDead(_)
+                | mir::StatementKind::Nop => {}
+                mir::StatementKind::Assign((place, value))
+                    if place.projection.is_empty() && !is_mir_parameter(body, place.local) =>
+                {
+                    match value {
+                        mir::Rvalue::Use(operand, _) if operand_whole_local(operand).is_some() => {}
+                        mir::Rvalue::Ref(_, mir::BorrowKind::Shared, _) => {}
+                        mir::Rvalue::Ref(_, mir::BorrowKind::Mut { .. }, place)
+                            if place.projection.len() == 1
+                                && matches!(place.projection[0], mir::PlaceElem::Deref) => {}
+                        mir::Rvalue::Cast(
+                            mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _),
+                            operand,
+                            _,
+                        ) if operand_whole_local(operand).is_some() => {}
+                        mir::Rvalue::Aggregate(mir::AggregateKind::Array(_), operands)
+                            if operands
+                                .iter()
+                                .all(|operand| operand_whole_local(operand).is_some()) => {}
+                        _ => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        match &block.terminator().kind {
+            mir::TerminatorKind::Goto { target, .. } => cursor = *target,
+            mir::TerminatorKind::Call { target: Some(target), .. } if cursor == call_block => {
+                cursor = *target;
+            }
+            mir::TerminatorKind::Return => break,
+            _ => return false,
+        }
+    }
+    if visited.len() != body.basic_blocks.len() || !visited.contains(&call_block) {
+        return false;
+    }
+
+    // A parameter has an incoming definition. It may be read or reborrowed,
+    // but never assigned or have its pointer storage aliased. Copy hops must
+    // have exactly one definition, not one convenient reaching assignment.
+    let forwarded = |operand: &mir::Operand<'tcx>, expected: usize, reborrow: bool| {
+        let Some(mut local) = operand_whole_local(operand) else { return false };
+        for _ in 0..16 {
+            if local_has_terminator_def(body, local)
+                || pointer_local_storage_may_change(body, local)
+            {
+                return false;
+            }
+            if is_mir_parameter(body, local) {
+                return local.as_usize() == expected && !local_has_whole_assign(body, local);
+            }
+            let Some((_, value)) = unique_whole_local_assign_with_loc(body, local) else {
+                return false;
+            };
+            match value {
+                mir::Rvalue::Use(source, _) => {
+                    let Some(source) = operand_whole_local(source) else { return false };
+                    if tcx.erase_and_anonymize_regions(body.local_decls[local].ty)
+                        != tcx.erase_and_anonymize_regions(body.local_decls[source].ty)
+                    {
+                        return false;
+                    }
+                    local = source;
+                }
+                // The current MIR carries names and Debug values through
+                // shared reborrows and identity unsize coercions. They preserve
+                // the original reference only when the full types agree after
+                // region erasure; a real coercion supplies no forwarding proof.
+                mir::Rvalue::Cast(
+                    mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _),
+                    source,
+                    _,
+                ) if !reborrow => {
+                    let Some(source) = operand_whole_local(source) else { return false };
+                    if tcx.erase_and_anonymize_regions(body.local_decls[local].ty)
+                        != tcx.erase_and_anonymize_regions(body.local_decls[source].ty)
+                    {
+                        return false;
+                    }
+                    local = source;
+                }
+                mir::Rvalue::Ref(_, mir::BorrowKind::Shared, place)
+                    if !reborrow
+                        && place.projection.len() == 1
+                        && matches!(place.projection[0], mir::PlaceElem::Deref)
+                        && matches!(
+                            body.local_decls[local].ty.kind(),
+                            ty::Ref(_, _, mir::Mutability::Not)
+                        ) =>
+                {
+                    if tcx.erase_and_anonymize_regions(body.local_decls[local].ty)
+                        != tcx.erase_and_anonymize_regions(body.local_decls[place.local].ty)
+                    {
+                        return false;
+                    }
+                    local = place.local;
+                }
+                mir::Rvalue::Ref(_, mir::BorrowKind::Mut { .. }, place)
+                    if reborrow
+                        && place.projection.len() == 1
+                        && matches!(place.projection[0], mir::PlaceElem::Deref) =>
+                {
+                    if tcx.erase_and_anonymize_regions(body.local_decls[local].ty)
+                        != tcx.erase_and_anonymize_regions(body.local_decls[place.local].ty)
+                    {
+                        return false;
+                    }
+                    local = place.local;
+                }
+                _ => return false,
+            }
+        }
+        false
+    };
+    if !forwarded(&args[0].node, 1, true) || !forwarded(&args[1].node, 2, false) {
+        return false;
+    }
+    let Some(values) = debug_values_slice_elements(&args[2].node, body) else { return false };
+    values.len() == fields
+        && values.iter().enumerate().all(|(i, value)| forwarded(value, i + 3, false))
+}
+
 /// True iff `term` is a fixed-arity derived-`Debug` finisher call EVERY of whose `&dyn Debug`
 /// field-value args has a PROVABLY panic-free Debug (`tcx_derived_trait_is_total`,
 /// `is_builtin_derived`-gated). Fails CLOSED on any arg it cannot recover or prove — so the
@@ -9793,9 +16389,9 @@ fn unsize_cast_source_pointee<'tcx>(
 fn debug_finisher_all_fields_total<'tcx>(
     tcx: TyCtxt<'tcx>,
     term: &mir::Terminator<'tcx>,
-    stmts: &[mir::Statement<'tcx>],
-    local_decls: &mir::LocalDecls<'tcx>,
+    body: &mir::Body<'tcx>,
 ) -> bool {
+    let local_decls = &body.local_decls;
     let mir::TerminatorKind::Call { func, args, .. } = &term.kind else { return false };
     if !is_std_debug_fixed_finisher(tcx, func) {
         return false;
@@ -9804,7 +16400,7 @@ fn debug_finisher_all_fields_total<'tcx>(
         return false;
     };
 
-    let mut proved_a_field = false;
+    let mut proved_fields = 0;
     for a in args.iter() {
         let arg_ty = a.node.ty(local_decls, tcx);
         let pointee = match arg_ty.kind() {
@@ -9813,13 +16409,9 @@ fn debug_finisher_all_fields_total<'tcx>(
         };
         match pointee.kind() {
             // `&dyn Debug` field-value arg: recover the erased type and prove it total.
-            ty::TyKind::Dynamic(preds, _)
-                if preds.principal_def_id() == Some(debug_trait) =>
-            {
-                proved_a_field = true;
-                let Some(concrete) =
-                    unsize_cast_source_pointee(tcx, &a.node, stmts, local_decls)
-                else {
+            ty::TyKind::Dynamic(preds, _) if preds.principal_def_id() == Some(debug_trait) => {
+                proved_fields += 1;
+                let Some(concrete) = unsize_cast_source_pointee(tcx, &a.node, body) else {
                     return false;
                 };
                 if !tcx_derived_trait_is_total(
@@ -9827,7 +16419,7 @@ fn debug_finisher_all_fields_total<'tcx>(
                     concrete,
                     debug_trait,
                     CLONE_TOTALITY_FUEL,
-                    &mut std::collections::HashSet::new(),
+                    &mut FxHashSet::default(),
                 ) {
                     return false;
                 }
@@ -9841,30 +16433,19 @@ fn debug_finisher_all_fields_total<'tcx>(
             _ => {}
         }
     }
-    proved_a_field
+    proved_fields > 0
+        && args.get(1).is_some_and(|names| {
+            debug_finisher_names_have_fields(tcx, body, &names.node, proved_fields)
+        })
 }
 
-/// N-ary derived-`Debug` finishers on `core::fmt::Formatter`: `debug_struct_fields_finish`
-/// (`name: &str, names: &[&str], values: &[&dyn Debug]`) and `debug_tuple_fields_finish`
-/// (`name: &str, values: &[&dyn Debug]`) — emitted by `#[derive(Debug)]` for a struct/tuple/
-/// enum-variant with MORE than 5 fields (≤5 uses the fixed-arity `debug_*_fieldN_finish`).
-/// The per-field `&dyn Debug` values are elements of a FIXED array aggregate, not individual
-/// args, so they need aggregate recovery. Same un-spoofable inherent-`Formatter` basis as
-/// `is_std_debug_fixed_finisher`.
-const DEBUG_NARY_FINISHERS: &[&str] =
-    &["debug_struct_fields_finish", "debug_tuple_fields_finish"];
+/// The n-ary packed-name helper handles named and tuple derives with more than
+/// five fields. Its `&dyn Debug` values live in a fixed array aggregate and need
+/// aggregate recovery; its packed name needs the same arity guard as fixed helpers.
+const DEBUG_NARY_FINISHERS: &[&str] = &["debug_struct_fields_finish"];
 
 fn is_std_debug_nary_finisher<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> bool {
-    let Some((def_id, _)) = func.const_fn_def() else { return false };
-    if def_id.is_local() {
-        return false;
-    }
-    let name = tcx.item_name(def_id);
-    if !DEBUG_NARY_FINISHERS.iter().any(|n| name.as_str() == *n) {
-        return false;
-    }
-    let path = crate::safe_def_path_str(tcx, def_id);
-    path.starts_with("core::fmt::Formatter") || path.starts_with("std::fmt::Formatter")
+    is_std_debug_finisher(tcx, func, DEBUG_NARY_FINISHERS)
 }
 
 /// Recover the FIXED array-aggregate element operands behind an N-ary Debug finisher's
@@ -9872,22 +16453,21 @@ fn is_std_debug_nary_finisher<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>
 /// cast / reborrows to `_arr = [e0, e1, ...]` and return its element operands. None (→ caller
 /// fails closed) if the slice is not a statically-fixed array aggregate (runtime-built slice,
 /// `[x; N]` repeat, or a promoted/const array whose pre-erasure operands are unavailable).
+/// Every reference hop and the array must retain one immutable body-wide definition.
 fn debug_values_slice_elements<'tcx>(
     values: &mir::Operand<'tcx>,
-    stmts: &[mir::Statement<'tcx>],
+    body: &mir::Body<'tcx>,
 ) -> Option<Vec<mir::Operand<'tcx>>> {
     let mut local = operand_whole_local(values)?;
     let mut arr_local: Option<mir::Local> = None;
     for _ in 0..8 {
-        // bounded
-        let def = stmts.iter().rev().find_map(|s| match &s.kind {
-            mir::StatementKind::Assign(box (lhs, rv))
-                if lhs.projection.is_empty() && lhs.local == local =>
-            {
-                Some(rv)
-            }
-            _ => None,
-        })?;
+        if is_mir_parameter(body, local)
+            || local_has_terminator_def(body, local)
+            || pointer_local_storage_may_change(body, local)
+        {
+            return None;
+        }
+        let (_, def) = unique_whole_local_assign_with_loc(body, local)?;
         match def {
             // `&[T; N] -> &[T]` unsize: continue from the ref-to-array source operand.
             mir::Rvalue::Cast(
@@ -9913,85 +16493,50 @@ fn debug_values_slice_elements<'tcx>(
         }
     }
     let arr_local = arr_local?;
-    let agg = stmts.iter().rev().find_map(|s| match &s.kind {
-        mir::StatementKind::Assign(box (lhs, rv))
-            if lhs.projection.is_empty() && lhs.local == arr_local =>
+    // An argument's implicit incoming definition cannot be replaced by one
+    // conditional Store when proving the whole array constant.
+    if is_mir_parameter(body, arr_local) {
+        return None;
+    }
+    // The required shared borrow of the array is safe: its elements are
+    // immutable reference slots. Mutable/raw aliases and every non-initializing
+    // write invalidate the aggregate. Visit all MIR places so projected writes
+    // through calls or inline assembly cannot hide from a statement-only scan.
+    use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, VisitPlacesWith, Visitor};
+    let mut changed = false;
+    let mut visitor = VisitPlacesWith(|place: mir::Place<'_>, context: PlaceContext| {
+        if place.local == arr_local
+            && !place.projection.iter().any(|p| matches!(p, mir::PlaceElem::Deref))
+            && (context.is_address_of()
+                || (context.is_mutating_use()
+                    && !(place.projection.is_empty()
+                        && context == PlaceContext::MutatingUse(MutatingUseContext::Store))))
         {
-            Some(rv)
+            changed = true;
         }
-        _ => None,
-    })?;
+    });
+    visitor.visit_body(body);
+    if changed {
+        return None;
+    }
+    let (_, agg) = unique_whole_local_assign_with_loc(body, arr_local)?;
     match agg {
-        mir::Rvalue::Aggregate(box mir::AggregateKind::Array(_), operands) => {
+        mir::Rvalue::Aggregate(mir::AggregateKind::Array(_), operands) => {
             Some(operands.iter().cloned().collect())
         }
         _ => None,
     }
 }
 
-/// Read the compile-time length `N` of the `[T; N]` array behind a `&[T]` slice operand
-/// produced by an `&[T; N] -> &[T]` Unsize cast (the `names`/`values` slice of an N-ary Debug
-/// finisher). None (→ caller fails closed) if the slice is not a fixed-size-array unsize (so a
-/// runtime `&[T]` cannot masquerade as a length-checked one).
-fn slice_unsize_source_array_len<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    slice: &mir::Operand<'tcx>,
-    stmts: &[mir::Statement<'tcx>],
-    local_decls: &mir::LocalDecls<'tcx>,
-) -> Option<u64> {
-    let mut local = operand_whole_local(slice)?;
-    for _ in 0..8 {
-        let def = stmts.iter().rev().find_map(|s| match &s.kind {
-            mir::StatementKind::Assign(box (lhs, rv))
-                if lhs.projection.is_empty() && lhs.local == local =>
-            {
-                Some(rv)
-            }
-            _ => None,
-        })?;
-        match def {
-            mir::Rvalue::Cast(
-                mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _),
-                src,
-                _,
-            ) => {
-                let src_ty = src.ty(local_decls, tcx);
-                let pointee = match src_ty.kind() {
-                    ty::TyKind::Ref(_, p, _) | ty::TyKind::RawPtr(p, _) => *p,
-                    _ => return None,
-                };
-                return match pointee.kind() {
-                    ty::TyKind::Array(_, len) => len.try_to_target_usize(tcx),
-                    _ => None,
-                };
-            }
-            mir::Rvalue::Use(op, _) => local = operand_whole_local(op)?,
-            mir::Rvalue::Ref(_, _, place)
-                if place.projection.len() == 1
-                    && matches!(place.projection[0], mir::ProjectionElem::Deref) =>
-            {
-                local = place.local
-            }
-            _ => return None,
-        }
-    }
-    None
-}
-
-/// True iff `term` is an N-ary derived-`Debug` finisher call whose `values: &[&dyn Debug]`
-/// slice is a FIXED array aggregate EVERY of whose erased element types has a PROVABLY
-/// panic-free Debug (`tcx_derived_trait_is_total`, `is_builtin_derived`-gated — the SAME
-/// classifier the fixed-arity sentinel uses). For the `debug_struct_fields_finish` variant it
-/// ALSO discharges the std-internal `assert_eq!(names.len(), values.len())` by requiring the
-/// recovered `names` and `values` array lengths to be equal. Fails CLOSED on any slice it
-/// cannot resolve to a fixed element set, any element it cannot recover/prove, or a length it
-/// cannot equate — so the real finisher call (and its may-panic obligation) survives.
+/// True iff every recovered field has a provably panic-free `Debug` and the
+/// actual packed name has enough fields for core's unwraps. Unknown names,
+/// runtime-built value slices, and unrecoverable element types fail closed.
 fn debug_nary_finisher_all_fields_total<'tcx>(
     tcx: TyCtxt<'tcx>,
     term: &mir::Terminator<'tcx>,
-    stmts: &[mir::Statement<'tcx>],
-    local_decls: &mir::LocalDecls<'tcx>,
+    body: &mir::Body<'tcx>,
 ) -> bool {
+    let local_decls = &body.local_decls;
     let mir::TerminatorKind::Call { func, args, .. } = &term.kind else { return false };
     if !is_std_debug_nary_finisher(tcx, func) {
         return false;
@@ -10000,36 +16545,33 @@ fn debug_nary_finisher_all_fields_total<'tcx>(
         return false;
     };
 
-    let mut names_len: Option<u64> = None;
-    let mut values_len: Option<u64> = None;
+    let mut values_len: Option<usize> = None;
     let mut proved_values = false;
     for a in args.iter() {
         let arg_ty = a.node.ty(local_decls, tcx);
-        // Only the two slice args matter; `&mut Formatter` receiver and `&str` name have a
-        // non-`Slice` pointee and are skipped.
+        // Field values are the only slice argument; check the packed `&str`
+        // separately against their recovered count.
         let pointee = match arg_ty.kind() {
             ty::TyKind::Ref(_, inner, _) | ty::TyKind::RawPtr(inner, _) => *inner,
             _ => continue,
         };
         let ty::TyKind::Slice(elem) = pointee.kind() else { continue };
-        // The slice element is itself a reference: `&dyn Debug` (values) or `&str` (names).
+        // The value-slice element must itself be a reference to `dyn Debug`.
         let elem_pointee = match elem.kind() {
             ty::TyKind::Ref(_, inner, _) | ty::TyKind::RawPtr(inner, _) => *inner,
-            // A non-reference slice element is neither `names` nor `values`; no finisher sig has
-            // one — fail closed rather than skip-as-trusted.
+            // No current finisher has a non-reference slice element.
             _ => return false,
         };
         match elem_pointee.kind() {
             // `values: &[&dyn Debug]` — recover the field operands and prove each total.
             ty::TyKind::Dynamic(preds, _) if preds.principal_def_id() == Some(debug_trait) => {
                 proved_values = true;
-                let Some(elems) = debug_values_slice_elements(&a.node, stmts) else {
+                let Some(elems) = debug_values_slice_elements(&a.node, body) else {
                     return false;
                 };
-                values_len = Some(elems.len() as u64);
+                values_len = Some(elems.len());
                 for e in &elems {
-                    let Some(concrete) = unsize_cast_source_pointee(tcx, e, stmts, local_decls)
-                    else {
+                    let Some(concrete) = unsize_cast_source_pointee(tcx, e, body) else {
                         return false;
                     };
                     if !tcx_derived_trait_is_total(
@@ -10037,35 +16579,23 @@ fn debug_nary_finisher_all_fields_total<'tcx>(
                         concrete,
                         debug_trait,
                         CLONE_TOTALITY_FUEL,
-                        &mut std::collections::HashSet::new(),
+                        &mut FxHashSet::default(),
                     ) {
                         return false;
                     }
                 }
-            }
-            // `names: &[&str]` — recover its fixed length to discharge the length assert.
-            ty::TyKind::Str => {
-                let Some(n) = slice_unsize_source_array_len(tcx, &a.node, stmts, local_decls)
-                else {
-                    return false;
-                };
-                names_len = Some(n);
             }
             // Any OTHER `&dyn Trait` value slice, or an unexpected ref-slice arg, is not a
             // recognizable finisher slice → fail closed.
             _ => return false,
         }
     }
-    // SOUNDNESS: `debug_struct_fields_finish` runs `assert_eq!(names.len(), values.len())`.
-    // Require the recovered lengths to match so a (hand-written) mismatched-length call is NOT
-    // falsely proved. `debug_tuple_fields_finish` carries no `names` arg and no such assert, so
-    // `names_len` stays None there and no equality is imposed.
-    if let Some(n) = names_len {
-        if Some(n) != values_len {
-            return false;
-        }
-    }
     proved_values
+        && values_len.is_some_and(|fields| {
+            args.get(1).is_some_and(|names| {
+                debug_finisher_names_have_fields(tcx, body, &names.node, fields)
+            })
+        })
 }
 
 /// Trust (str char-boundary SOUNDNESS): a `str` range-index — `<str as
@@ -10094,10 +16624,10 @@ fn debug_nary_finisher_all_fields_total<'tcx>(
 fn apply_str_index_marker<'tcx>(
     _tcx: TyCtxt<'tcx>,
     func: &mir::Operand<'tcx>,
+    is_index_tail: bool,
     name: String,
 ) -> String {
-    let semantic_path = call_path_without_trailing_turbofish(&name);
-    if !semantic_path.ends_with("::index") && !semantic_path.ends_with("::index_mut") {
+    if !is_index_tail {
         return name;
     }
     // Trust (staircase shim, 1d1d11bed9 pattern): nested `if` instead of a
@@ -10134,15 +16664,37 @@ fn apply_str_index_marker<'tcx>(
 /// Public so the COMPILER can compute the same totality decision at
 /// `collect_expected_absent_callees` time and carry it on the authenticated
 /// set channel instead of a forgeable name suffix.
+///
+/// IDENTITY (TRY-TOTAL-ANCHOR-1, 2026-10-03). The method must BE core's `branch` /
+/// `from_residual`: the `TryTraitBranch` / `TryTraitFromResidual` lang item, defined
+/// in a real sysroot crate. A lang-item attribute alone is not authority (a
+/// `#![no_core]` crate can declare one), hence the residency check too. This used to
+/// be a TEXT test, `ends_with("Try::branch")` / `ends_with("FromResidual::from_residual")`,
+/// which a user trait named `Try` or `FromResidual` passes; with the std carrier
+/// `Option<u32>` as its receiver or target, a panicking user method was marked total
+/// in both consumers. Measured on the stage 1 of main + wave 7: certify accepted a
+/// caller of such a method, and the binary panicked.
+///
+/// RESIDUAL (same id). For `from_residual` the residual (input 0) must be the SAME
+/// std carrier as the target. The orphan rule lets a crate implement core's real
+/// `FromResidual<Local>` for `Option<T>` with a body of its own; the old `Option =>
+/// true` arm never looked at the residual and marked that impl total. Orphan and
+/// overlap rules forbid any `FromResidual<Option<_>>` impl for `Option` but core's
+/// (`impl<T> FromResidual<Option<Infallible>> for Option<T>`, `None => None`), so a
+/// std-`Option` residual pins core's body. The `Result` arm already required a std
+/// `Result` residual through `result_err_ty`.
 pub fn trust_try_total_marker<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: rustc_span::def_id::DefId,
-    generic_args: ty::GenericArgsRef<'tcx>,
+    generic_args: ty::GenericArgs<'tcx>,
 ) -> bool {
-    let path = crate::safe_def_path_str(tcx, def_id);
-    let is_branch = path.ends_with("Try::branch");
-    let is_from_residual = path.ends_with("FromResidual::from_residual");
+    let lang_items = tcx.lang_items();
+    let is_branch = lang_items.branch_fn() == Some(def_id);
+    let is_from_residual = lang_items.from_residual_fn() == Some(def_id);
     if !is_branch && !is_from_residual {
+        return false;
+    }
+    if !is_real_sysroot_crate(tcx, def_id.krate) {
         return false;
     }
     // The monomorphized signature: input 0 and the output carry the concrete
@@ -10164,7 +16716,13 @@ pub fn trust_try_total_marker<'tcx>(
     // Err(e)`, no user code) or, when it DIFFERS (a CONVERTING `?`), whose
     // `<target_err as From<residual_err>>::from` impl body is PROVABLY structurally
     // panic-free — verified against the CONCRETE From impl's real MIR, never a name.
-    match std_try_carrier_kind(tcx, output) {
+    // TRY-TOTAL-ANCHOR-1: in every arm the residual is the target's own std carrier,
+    // which is what pins core's impl (see the doc above).
+    let target = std_try_carrier_kind(tcx, output);
+    if target.is_none() || target != std_try_carrier_kind(tcx, input0) {
+        return false;
+    }
+    match target {
         Some(StdCarrier::Option) => true,
         Some(StdCarrier::Result) => {
             match (result_err_ty(tcx, output), result_err_ty(tcx, input0)) {
@@ -10238,6 +16796,9 @@ fn converting_from_is_structurally_total<'tcx>(
     // Trait-method instantiation args are [Self = target_err (`F`), trait param =
     // residual_err (`E`)]; `from` binds no method generics, so this is complete.
     let args = tcx.mk_args(&[target_err.into(), residual_err.into()]);
+    if crate::tuple_layouts::resolution_may_reenter(tcx, from_method, args) {
+        return false;
+    }
     let Some(instance) =
         ty::Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), from_method, args)
             .ok()
@@ -10249,11 +16810,20 @@ fn converting_from_is_structurally_total<'tcx>(
     // trait method) and left NO residual param — otherwise we have not identified
     // the real code that runs. Fail closed unless its MIR is available to scan.
     let resolved = instance.def_id();
-    if resolved == from_method
-        || instance.args.has_non_region_param()
-        || !tcx.is_mir_available(resolved)
-    {
+    if resolved == from_method || instance.args.has_non_region_param() {
         return false;
+    }
+    // Inside `mir_built` (the trust-ir producer's oracle) a LOCAL impl's MIR may not be
+    // read: its `optimized_mir` runs that body's whole pipeline, verification included,
+    // from inside a query the type system reaches, and can demand the body under
+    // construction (E0391). Fail closed there; the verifier, which runs outside every
+    // type-system query, reads it. A foreign impl's MIR is decoded from metadata.
+    match resolved.as_local() {
+        Some(_) if crate::ctfe_reentrancy::frozen() => return false,
+        Some(local) if !tcx.trust_local_def_has_mir(local) => return false,
+        Some(_) => {}
+        None if !tcx.is_mir_available(resolved) => return false,
+        None => {}
     }
     // Read the CONCRETE From impl's real MIR and require it structurally panic-free.
     body_is_structurally_panic_free(tcx.optimized_mir(resolved))
@@ -10300,7 +16870,9 @@ fn body_is_structurally_panic_free(body: &mir::Body<'_>) -> bool {
     true
 }
 
-#[derive(Clone, Copy)]
+// Trust (TRY-TOTAL-ANCHOR-1): `PartialEq` so `trust_try_total_marker` can require a
+// `from_residual` residual to be the target's own carrier.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum StdCarrier {
     Result,
     Option,
@@ -10312,14 +16884,17 @@ enum StdCarrier {
 /// type named `Result`/`Option` in another crate is NOT matched.
 fn std_try_carrier_kind<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<StdCarrier> {
     let ty::TyKind::Adt(def, _) = ty.kind() else { return None };
-    let path = crate::safe_def_path_str(tcx, def.did());
-    let std_path =
-        path.starts_with("core::") || path.starts_with("std::") || path.starts_with("alloc::");
     // SOUNDNESS (crate-name forgery): the `?`-desugar Try/FromResidual totalization
     // trusts the compiler-total `Try` impls of the std carriers; a `--crate-name core`
     // dep could spell `core::result::Result` with a PANICKING `Try::branch`. Bind the
     // carrier's defining crate scid to the real sysroot (name-prefix is a pre-filter).
-    if !std_path || !is_real_sysroot_crate(tcx, def.did().krate) {
+    if !is_real_sysroot_crate(tcx, def.did().krate) {
+        return None;
+    }
+    let path = crate::safe_def_path_str(tcx, def.did());
+    let std_path =
+        path.starts_with("core::") || path.starts_with("std::") || path.starts_with("alloc::");
+    if !std_path {
         return None;
     }
     match path.rsplit("::").next().unwrap_or(&path) {
@@ -10352,7 +16927,7 @@ fn result_err_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<ty::Ty<'tc
 /// and non-`FnDef` operands are not foreign here.
 fn func_operand_is_foreign<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> bool {
     match func {
-        mir::Operand::Constant(box const_op) => match const_op.const_.ty().kind() {
+        mir::Operand::Constant(const_op) => match const_op.const_.ty().kind() {
             rustc_middle::ty::TyKind::FnDef(def_id, _) => tcx.is_foreign_item(*def_id),
             _ => false,
         },
@@ -10378,10 +16953,10 @@ fn func_operand_is_foreign<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -
 /// create a false proof (indirect calls stay opaque / fail-closed upstream).
 fn func_operand_is_unsafe_sig<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> bool {
     match func {
-        mir::Operand::Constant(box const_op) => match const_op.const_.ty().kind() {
-            rustc_middle::ty::TyKind::FnDef(def_id, args) => {
+        mir::Operand::Constant(const_op) => match const_op.const_.ty().kind() {
+            rustc_middle::ty::TyKind::FnDef(def_id, _args) => {
                 let unsafe_sig = matches!(
-                    tcx.fn_sig(*def_id).instantiate(tcx, args).skip_binder().safety(),
+                    tcx.fn_sig(*def_id).skip_binder().safety(),
                     rustc_hir::Safety::Unsafe
                 );
                 unsafe_sig && !tcx.codegen_fn_attrs(*def_id).safe_target_features
@@ -10436,8 +17011,7 @@ pub(crate) fn refine_bignum_receiver_stamps<'tcx>(
 
         // 1. Resolve the callee to a concrete FnDef instance. Fail-closed unless
         //    the CALL itself is fully monomorphized (no non-region param).
-        let ty::TyKind::FnDef(callee_did, gen_args) = func.ty(&body.local_decls, tcx).kind()
-        else {
+        let ty::TyKind::FnDef(callee_did, gen_args) = func.ty(&body.local_decls, tcx).kind() else {
             continue;
         };
         if gen_args.has_non_region_param() {
@@ -10450,7 +17024,7 @@ pub(crate) fn refine_bignum_receiver_stamps<'tcx>(
         //    bignum — stamping its local asserts a TRUE fact. Generalizes the
         //    receiver (arg0) case to EVERY arg (e.g. `Vec::push(v)` — arg1 `v` — so
         //    the interned value's OWN decl gets stamped and its drop-glue discharges).
-        let sig = tcx.fn_sig(*callee_did).instantiate(tcx, *gen_args).skip_binder();
+        let sig = tcx.fn_sig(*callee_did).instantiate(tcx, gen_args.skip_binder()).skip_binder();
         for (i, arg) in args.iter().enumerate() {
             let Some(param_ty) = sig.inputs().get(i) else { break };
             let ty::TyKind::Adt(adt_def, adt_args) = peel_ref_rawptr(*param_ty).kind() else {
@@ -10459,7 +17033,7 @@ pub(crate) fn refine_bignum_receiver_stamps<'tcx>(
             // 3. Authenticate the CONCRETE param with the SOLE stamp writer
             //    (StableCrateId-gated). `None` ⇒ do nothing (fail-closed).
             let Some(kind) =
-                ty_convert::authenticate_arbitrary_precision(tcx, adt_def.did(), adt_args)
+                ty_convert::authenticate_arbitrary_precision(tcx, adt_def.did(), *adt_args)
             else {
                 continue;
             };
@@ -10550,9 +17124,10 @@ pub(crate) fn convert_span(tcx: TyCtxt<'_>, span: Span) -> SourceSpan {
     let hi = source_map.lookup_char_pos(span.hi());
 
     SourceSpan {
-        file: trust_types::stable_obligation_file(
+        file: trust_types::stable_obligation_file(trust_types::identity_file_rendering(
             lo.file.name.prefer_local_unconditionally().to_string(),
-        ),
+            lo.file.name.prefer_remapped_unconditionally().to_string(),
+        )),
         line_start: lo.line as u32,
         col_start: lo.col.0 as u32,
         line_end: hi.line as u32,
@@ -10583,7 +17158,7 @@ mod tests {
         // the one this lane most needs pinned: every const in the recovered population
         // (`i8::MAX`, `u8::MIN`, `std::mem::Assume::SAFETY`) is a NON-GENERIC assoc const whose
         // args really are empty.
-        mir::UnevaluatedConst { def, args: ty::List::empty(), promoted }
+        mir::UnevaluatedConst { def, args: ty::GenericArgs::empty(), promoted }
     }
 
     /// The regression this predicate exists for, at predicate level.
@@ -10735,6 +17310,126 @@ mod tests {
     }
 
     #[test]
+    fn exact_ieee754_intrinsics_are_marked_and_the_inexact_siblings_are_not() {
+        use super::pure_total_intrinsic_marker_allowed as allowed;
+
+        // The EXACT operations. Each is a total function of its operand bit
+        // patterns AND is correctly rounded, so it satisfies the determinism the
+        // facet gates read the marker for, not only panic-freedom.
+        for name in [
+            "fabs",
+            "copysignf16",
+            "copysignf32",
+            "copysignf64",
+            "copysignf128",
+            "floorf32",
+            "floorf64",
+            "ceilf32",
+            "ceilf64",
+            "truncf32",
+            "truncf64",
+            "roundf32",
+            "roundf64",
+            "round_ties_even_f32",
+            "round_ties_even_f64",
+            "sqrtf32",
+            "sqrtf64",
+            "fmaf32",
+            "fmaf64",
+        ] {
+            assert!(allowed(name, true), "exact IEEE-754 intrinsic must be marked: {name}");
+            assert!(
+                !allowed(name, false),
+                "an intrinsic with a fallback body is not backend authority: {name}"
+            );
+        }
+
+        // PLANTED VIOLATIONS. Every name below is a real float intrinsic that
+        // `library/std/src/num/f64.rs` documents as having non-deterministic
+        // precision — "it varies by platform, Rust version, and can even differ
+        // within the same execution from one invocation to the next". They are
+        // panic-free, but the marker is also read by the facet gates as a
+        // DETERMINISM claim, so marking them would be false there. Several share
+        // a prefix or a width suffix with an admitted sibling, which is what
+        // makes this the test that fails the moment someone replaces the
+        // explicit list with a `ends_with("f64")` or `starts_with("sqrt")` rule.
+        for name in [
+            "sinf32",
+            "sinf64",
+            "cosf32",
+            "cosf64",
+            "expf32",
+            "expf64",
+            "exp2f32",
+            "exp2f64",
+            "logf32",
+            "logf64",
+            "log2f32",
+            "log2f64",
+            "log10f32",
+            "log10f64",
+            "powf32",
+            "powf64",
+            "powif32",
+            "powif64",
+            // Permitted to contract the multiply-add into one fused step or not,
+            // so two runs may round differently. `fmaf*` above always fuses.
+            "fmuladdf32",
+            "fmuladdf64",
+        ] {
+            assert!(
+                !allowed(name, true),
+                "an inexactly-rounded float intrinsic must stay unmarked: {name}"
+            );
+        }
+
+        // Near-miss spellings: a real width that does not exist for that op, and
+        // a name that merely shares a prefix.
+        for name in ["sqrtf8", "floorf", "fabsf64", "roundf", "minimum_nsz_f64", "copysign"] {
+            assert!(!allowed(name, true), "near-miss spelling must stay unmarked: {name}");
+        }
+
+        // Trust (std-call-summaries P2): the selections carry a fallback body and
+        // the `nsz` pair is nondeterministic on signed zero, so the DETERMINISTIC
+        // marker admits none of them under either body shape. They are the
+        // panic-freedom-only stamp's (`tcx_marked_panic_free_intrinsic_path`).
+        for name in [
+            "minimumf32",
+            "minimumf64",
+            "maximumf32",
+            "maximumf64",
+            "minimum_number_nsz_f32",
+            "minimum_number_nsz_f64",
+            "maximum_number_nsz_f32",
+            "maximum_number_nsz_f64",
+        ] {
+            assert!(
+                !allowed(name, true),
+                "selection must not take the deterministic marker: {name}"
+            );
+            assert!(
+                !allowed(name, false),
+                "selection must not take the deterministic marker: {name}"
+            );
+            assert!(
+                trust_types::panic_free_intrinsic_entry(name).is_some(),
+                "selection must be on the panic-freedom-only list: {name}"
+            );
+        }
+        // The whole panic-freedom-only list, under either body shape.
+        for entry in trust_types::PANIC_FREE_RUSTC_INTRINSICS {
+            assert!(!allowed(entry.name, true), "{}", entry.name);
+            assert!(!allowed(entry.name, false), "{}", entry.name);
+        }
+        // And no deterministic-marker name is on the panic-freedom-only list, so the
+        // two stamps never compete for one intrinsic.
+        for name in ["fabs", "ctpop", "sqrtf64", "fmaf64", "floorf64", "copysignf64", "cold_path"] {
+            assert!(allowed(name, true), "{name}");
+            assert!(trust_types::panic_free_intrinsic_entry(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
     fn is_panic_diverging_call_matches_assert_panic_family() {
         use super::is_panic_diverging_call as p;
         // Recognized panic sites (lockstep with trust-ir-bridge is_panic_call):
@@ -10791,10 +17486,24 @@ mod tests {
         assert!(s("alloc::vec::from_elem"));
         assert!(s("core::iter::Iterator::collect"));
         assert!(s("core::iter::FromIterator::from_iter"));
+        // W4 HASHMAP r2: the explicit-hasher hash-table constructors, nightly
+        // `extend_reserve` and `collect_into`, mirroring vcgen.
+        assert!(s("std::collections::hash::map::HashMap::<K, V, S>::with_capacity_and_hasher"));
+        assert!(s("std::collections::hash::set::HashSet::<T, S, A>::with_capacity_and_hasher_in"));
+        assert!(s("core::iter::Extend::extend_reserve"));
+        assert!(s("core::iter::Iterator::collect_into"));
+        // W4 ITER-HOF landing round: the uninit/zeroed slice constructors.
+        assert!(s("alloc::boxed::Box::<[u64]>::new_uninit_slice"));
+        assert!(s("alloc::boxed::Box::<[u64], A>::new_uninit_slice_in"));
+        assert!(s("alloc::rc::Rc::<[u64]>::new_zeroed_slice"));
+        assert!(s("alloc::sync::Arc::<[u8], A>::new_zeroed_slice_in"));
         // Non-sink calls must NOT be re-routed (stay opaque / fail-closed).
         assert!(!s("my_crate::helper::compute"));
         assert!(!s("core::mem::drop"));
         assert!(!s("std::process::exit"));
+        // the fallible twins return the layout error instead of panicking
+        assert!(!s("alloc::boxed::Box::<[u64]>::try_new_uninit_slice"));
+        assert!(!s("alloc::rc::Rc::<[u64]>::try_new_zeroed_slice"));
     }
 
     // Trust-Std: reaching `unreachable_unchecked` IS the violation, so the call is
@@ -10818,6 +17527,44 @@ mod tests {
         assert!(!u("core::slice::<impl [T]>::get_unchecked"));
         // A panic keeps its own classifier and its own wording.
         assert!(!u("core::panicking::panic"));
+    }
+
+    /// DIVERGE-ENTRY-1: the class `diverging_entry_of` stamps, read off a GENERIC-FREE
+    /// definition path. The panic family and the R177 terminals take the panic class
+    /// (the pinned panic wording), the UB family the UB class, anything else none.
+    /// The residency and trait-item halves need a `TyCtxt`; the ui fixture
+    /// `diverging_site_requires_entry_identity.rs` pins them end to end.
+    #[test]
+    fn diverging_entry_class_reads_the_generic_free_path() {
+        use super::diverging_entry_class as c;
+        for panic in [
+            "core::panicking::panic",
+            "core::panicking::panic_fmt",
+            "core::panicking::panic_const::panic_const_add_overflow",
+            "core::panicking::assert_failed",
+            "std::panicking::begin_panic",
+            "core::option::unwrap_failed",
+            "alloc::raw_vec::handle_error",
+            "std::process::abort",
+            "core::intrinsics::abort",
+        ] {
+            assert_eq!(c(panic), Some(trust_types::DivergingEntry::PanicOrAbort), "{panic}");
+        }
+        for ub in ["core::hint::unreachable_unchecked", "core::intrinsics::unreachable"] {
+            assert_eq!(c(ub), Some(trust_types::DivergingEntry::UbIfReached), "{ub}");
+        }
+        // The generic-free paths of the trait methods and generic free functions the
+        // measured spoofs went through: no class, whatever their call rendered.
+        for none in [
+            "core::convert::From::from",
+            "core::default::Default::default",
+            "core::convert::Into::into",
+            "core::array::from_fn",
+            "core::intrinsics::transmute",
+            "std::process::exit",
+        ] {
+            assert_eq!(c(none), None, "{none}");
+        }
     }
 
     /// Rule 2 (sysroot identity) at the callee renderer, BOTH states. The
@@ -10882,6 +17629,61 @@ mod tests {
             first.contains('@'),
             "the reserved marker must be impossible to forge as a Rust def path"
         );
+    }
+
+    /// DROP-NAME-COLLIDE-1 (2026-10-03): every arm of the ONE duplicate-crate-name
+    /// rule, on the measured graphs. `safe_def_path_str` spells a crate's NAME, so
+    /// whenever this answers `true` two crates can render one ADT path and a
+    /// name-keyed credit for one of them reaches the other.
+    #[test]
+    fn crate_name_is_shared_covers_bin_lib_two_versions_and_the_local_side() {
+        use super::crate_name_shared_among as shared;
+        let ext = CrateNum::from_u32;
+        let none = |_: CrateNum| false;
+
+        // Cargo's bin+lib layout: the bin `foo` links its own lib `foo`.
+        let bin_lib = [(ext(1), "foo"), (ext(2), "core")];
+        assert!(shared(ext(1), false, "foo", "foo", bin_lib, none), "the lib, seen from the bin");
+        assert!(
+            shared(LOCAL_CRATE, true, "foo", "foo", bin_lib, none),
+            "the bin's OWN crate is shared too: its `foo::Conn` renders like the lib's"
+        );
+        assert!(!shared(ext(2), false, "core", "foo", bin_lib, none), "an unrelated crate");
+
+        // Two semver versions of one crate, neither of them local.
+        let two_versions = [(ext(1), "foo"), (ext(2), "foo"), (ext(3), "core")];
+        assert!(shared(ext(1), false, "foo", "app", two_versions, none));
+        assert!(shared(ext(2), false, "foo", "app", two_versions, none));
+        assert!(!shared(ext(3), false, "core", "app", two_versions, none));
+        assert!(!shared(LOCAL_CRATE, true, "app", "app", two_versions, none));
+
+        // A crate never shares a name with ITSELF: a unique graph shares nothing.
+        let unique = [(ext(1), "foo"), (ext(2), "core")];
+        assert!(!shared(ext(1), false, "foo", "app", unique, none));
+        assert!(!shared(LOCAL_CRATE, true, "app", "app", unique, none));
+    }
+
+    /// The exemption is X1's and nothing wider: it removes a same-named EXTERN
+    /// other than `krate` from the third arm, never the local crate, and it is
+    /// asked only about such a crate (its real caller runs a residency query).
+    #[test]
+    fn crate_name_is_shared_exemption_never_covers_the_local_crate() {
+        use super::crate_name_shared_among as shared;
+        let ext = CrateNum::from_u32;
+        // Two sysroot-credited `hashbrown`s, both exempt: not shadowed.
+        let sysroot_pair = [(ext(1), "hashbrown"), (ext(2), "hashbrown"), (ext(3), "core")];
+        let exempt_sysroot = |c: CrateNum| {
+            assert!(c == ext(2), "exemption asked about {c:?}, which does not share the name");
+            true
+        };
+        assert!(!shared(ext(1), false, "hashbrown", "app", sysroot_pair, exempt_sysroot));
+        // The LOCAL crate named `hashbrown` shadows whatever the exemption says.
+        assert!(shared(ext(1), false, "hashbrown", "hashbrown", sysroot_pair, |_| true));
+        // A non-exempt namesake (a crates.io `hashbrown`) shadows.
+        let with_dep = [(ext(1), "hashbrown"), (ext(4), "hashbrown")];
+        assert!(shared(ext(1), false, "hashbrown", "app", with_dep, |c| c != ext(4)));
+        // `|_| false`: every namesake counts.
+        assert!(shared(ext(1), false, "hashbrown", "app", sysroot_pair, |_| false));
     }
 
     #[test]
@@ -11242,6 +18044,37 @@ pub fn closure_to_fn_pointer() -> fn(i32) -> i32 { |x| x }
 pub unsafe fn transmute_u32_bytes(x: u32) -> [u8; 4] {
     unsafe { transmute::<u32, [u8; 4]>(x) }
 }
+
+impl<T: PointeeSized> Clone for *const T {}
+impl<T: PointeeSized> Copy for *const T {}
+
+#[allow(dead_code)]
+#[lang = "maybe_uninit"]
+pub union MaybeUninit<T: Copy> { value: T }
+
+#[allow(dead_code)]
+pub union LookAlikeMaybeUninit<T: Copy> { value: T }
+
+#[allow(dead_code)]
+pub struct PtrPair { a: *const u8, b: *const u8 }
+impl Clone for PtrPair {}
+impl Copy for PtrPair {}
+
+pub unsafe fn transmute_ptr_into_maybe_uninit(p: *const u8) -> MaybeUninit<*const u8> {
+    unsafe { transmute::<*const u8, MaybeUninit<*const u8>>(p) }
+}
+
+pub unsafe fn transmute_pair_into_maybe_uninit(p: PtrPair) -> MaybeUninit<PtrPair> {
+    unsafe { transmute::<PtrPair, MaybeUninit<PtrPair>>(p) }
+}
+
+pub unsafe fn transmute_ptr_into_maybe_uninit_of_other(p: *const u8) -> MaybeUninit<*const u32> {
+    unsafe { transmute::<*const u8, MaybeUninit<*const u32>>(p) }
+}
+
+pub unsafe fn transmute_ptr_into_look_alike_union(p: *const u8) -> LookAlikeMaybeUninit<*const u8> {
+    unsafe { transmute::<*const u8, LookAlikeMaybeUninit<*const u8>>(p) }
+}
 "#;
     const CAST_TEST_CRATE_PATH: &str = "casts.rs";
 
@@ -11478,9 +18311,17 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             }
 
             for (name, terminator) in synthetic_metadata_terminators() {
-                self.results
-                    .terminators
-                    .insert(name, convert_terminator(tcx, &terminator, None, None));
+                self.results.terminators.insert(
+                    name,
+                    convert_terminator(
+                        tcx,
+                        &terminator,
+                        None,
+                        None,
+                        None,
+                        OptionalOverflowAssertCodegen::ThisSession,
+                    ),
+                );
             }
 
             for item_id in tcx.hir_free_items() {
@@ -11510,7 +18351,7 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
                                 .iter()
                                 .filter_map(|block| match &block.terminator().kind {
                                     mir::TerminatorKind::Call { func, .. } => {
-                                        Some(func_operand_name(tcx, func))
+                                        Some(func_operand_name_in_body(tcx, &body, func))
                                     }
                                     _ => None,
                                 })
@@ -11571,6 +18412,10 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
                             | "function_item_to_fn_pointer"
                             | "function_pointer_to_unsafe"
                             | "transmute_u32_bytes"
+                            | "transmute_ptr_into_maybe_uninit"
+                            | "transmute_pair_into_maybe_uninit"
+                            | "transmute_ptr_into_maybe_uninit_of_other"
+                            | "transmute_ptr_into_look_alike_union"
                     ) {
                         continue;
                     }
@@ -11702,7 +18547,7 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
 
     impl<'tcx> mir::visit::Visitor<'tcx> for ClosureConstFinder<'tcx> {
         fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: mir::Location) {
-            if let mir::Rvalue::Aggregate(box mir::AggregateKind::Closure(def_id, args), operands) =
+            if let mir::Rvalue::Aggregate(mir::AggregateKind::Closure(def_id, args), operands) =
                 rvalue
             {
                 let closure_args = args.as_closure();
@@ -11727,7 +18572,8 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
                         let mir::Operand::Constant(constant) = operand else {
                             unreachable!("zero_sized_constant always yields Operand::Constant")
                         };
-                        self.found = Some(convert_const_operand(self.tcx, &constant));
+                        self.found =
+                            Some(convert_const_operand(self.tcx, &constant, Some(self.typing_env)));
                     }
                 }
             }
@@ -11745,7 +18591,7 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
                 // correctly lower to Unsupported and are not the source
                 // upvar-free callback this fixture is testing. Keep walking
                 // until conversion yields an identity-bearing closure value.
-                let converted = convert_const_operand(self.tcx, constant);
+                let converted = convert_const_operand(self.tcx, constant, Some(self.typing_env));
                 if matches!(
                     &converted,
                     Operand::Constant(ConstValue::CallableItem { kind: CallableKind::Closure, .. })
@@ -11842,9 +18688,28 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             build_roots.push(repo_root.join("build").join(host));
         }
 
+        // Trust (2026-09-13): stage1 BEFORE stage2, and the order is load-bearing.
+        // `is_local_trust_sysroot` only checks that `bin/trustc` and a host std EXIST — it
+        // cannot tell whether that std is readable by the `librustc_driver` THIS test binary
+        // links. Preferring a stale stage2 kills every compiler-driven fixture test in this
+        // crate, and the harness reports only "failed to compile ... fixture" while the real
+        // cause sits unread in the log.
+        //
+        // MEASURED 2026-09-13, and quoted from the diagnostic rather than inferred: with
+        // stage1 and its std both at `1ce236b89`, the fixture compile still failed, and the
+        // E0514 note named
+        //     crate `std` compiled by <unknown rustc version>:
+        //       build/aarch64-apple-darwin/stage2/.../libstd-65d90f8a341318da.rlib
+        //     help: please recompile that crate using this compiler (rustc ... (1ce236b89 ...))
+        // — i.e. it had resolved to stage2, whose std on this machine dates from 2026-08-11
+        // and is too old for the driver to even parse a version out of. Pointing the same
+        // binary at stage1 (`TRUST_TEST_SYSROOT`) gave E0514=0 and 526/527 passing, twice.
+        //
+        // A test binary is built by the stage under test, so that stage's std is the one it
+        // can read; stage2 stays as a fallback for a tree where only it is built.
         let candidates = build_roots
             .into_iter()
-            .flat_map(|root| ["stage2", "stage1"].map(move |stage| root.join(stage)));
+            .flat_map(|root| ["stage1", "stage2"].map(move |stage| root.join(stage)));
 
         candidates
             .into_iter()
@@ -12096,9 +18961,7 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             .iter()
             .flat_map(|bb| bb.statements.iter())
             .filter_map(|stmt| match &stmt.kind {
-                mir::StatementKind::Assign(box (place, rvalue))
-                    if place.local == mir::RETURN_PLACE =>
-                {
+                mir::StatementKind::Assign((place, rvalue)) if place.local == mir::RETURN_PLACE => {
                     Some(convert_rvalue(
                         tcx,
                         rvalue,
@@ -12149,7 +19012,14 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             .to_string();
             Some((
                 unwind_name,
-                convert_terminator(tcx, term, Some(&body.local_decls), Some(body.typing_env(tcx))),
+                convert_terminator(
+                    tcx,
+                    term,
+                    Some(&body.local_decls),
+                    Some(body.typing_env(tcx)),
+                    Some(body.source.def_id()),
+                    OptionalOverflowAssertCodegen::ThisSession,
+                ),
             ))
         })
     }
@@ -12165,6 +19035,8 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
                 terminator,
                 Some(&body.local_decls),
                 Some(body.typing_env(tcx)),
+                Some(body.source.def_id()),
+                OptionalOverflowAssertCodegen::ThisSession,
             ) else {
                 return None;
             };
@@ -12207,7 +19079,6 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             kind,
             // 1.99 migration: terminators grew MIR-level attributes; synthetic
             // test terminators carry none.
-            attributes: Default::default(),
         }
     }
 
@@ -12422,8 +19293,13 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
     }
 
     fn assert_malformed_atomic_metadata(func_name: &str, args: &[Operand], expected_detail: &str) {
-        let parsed =
-            parse_atomic_intrinsic_metadata(func_name, args, &default_dest(), &default_span());
+        let parsed = parse_atomic_intrinsic_metadata(
+            func_name,
+            AtomicCalleeIdentity::SYSROOT_OTHER,
+            args,
+            &default_dest(),
+            &default_span(),
+        );
         assert!(
             matches!(
                 parsed,
@@ -12914,6 +19790,7 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
     fn form_b_atomic_load_missing_ordering_is_malformed() {
         let parsed = parse_atomic_intrinsic_metadata(
             "std::sync::atomic::atomic::atomic_load",
+            AtomicCalleeIdentity::SYSROOT_OTHER,
             &ptr_args(),
             &default_dest(),
             &default_span(),
@@ -12929,6 +19806,7 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
     fn form_b_atomic_compare_exchange_missing_failure_ordering_is_malformed() {
         let parsed = parse_atomic_intrinsic_metadata(
             "core::sync::atomic::atomic::atomic_compare_exchange",
+            AtomicCalleeIdentity::SYSROOT_OTHER,
             &cas_order_args(AtomicOrdering::SeqCst, AtomicOrdering::Relaxed)[..4],
             &default_dest(),
             &default_span(),
@@ -13021,11 +19899,12 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
         assert_eq!(op.place, Place::local(0));
     }
 
-    // --- Bare fence/compiler_fence paths ---
+    // --- Bare fence/compiler_fence: recognized by identity, never by name ---
 
     #[test]
     fn bare_fence_path() {
-        let op = parse_atomic_intrinsic(
+        let op = parse_atomic_intrinsic_as(
+            AtomicCalleeIdentity::sysroot_fence(SysrootFence::Fence),
             "std::sync::atomic::fence",
             &fence_order_args(AtomicOrdering::Acquire),
             &default_dest(),
@@ -13038,7 +19917,8 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
 
     #[test]
     fn bare_compiler_fence_path() {
-        let op = parse_atomic_intrinsic(
+        let op = parse_atomic_intrinsic_as(
+            AtomicCalleeIdentity::sysroot_fence(SysrootFence::CompilerFence),
             "std::sync::atomic::compiler_fence",
             &fence_order_args(AtomicOrdering::Release),
             &default_dest(),
@@ -13051,17 +19931,95 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
 
     #[test]
     fn bare_fence_missing_ordering_is_malformed() {
-        let parsed = parse_atomic_intrinsic_metadata(
+        for (kind, label) in [
+            (SysrootFence::Fence, "fence ordering argument"),
+            (SysrootFence::CompilerFence, "compiler_fence ordering argument"),
+        ] {
+            let parsed = parse_atomic_intrinsic_metadata(
+                "std::sync::atomic::fence",
+                AtomicCalleeIdentity::sysroot_fence(kind),
+                &[],
+                &default_dest(),
+                &default_span(),
+            );
+            assert!(matches!(
+                parsed,
+                AtomicIntrinsicMetadata::Malformed { ref detail } if detail.contains(label)
+            ));
+        }
+    }
+
+    /// FENCE-IDENTITY-1 regression: a callee whose RENDERED path ends in
+    /// `::fence`/`::compiler_fence` (or is exactly that word) but whose identity
+    /// is not the standard fence is a plain call — even with an argument that is
+    /// a perfectly good ordering discriminant, which used to be PARSED as a real
+    /// fence and lowered by `trust-cg-bridge` in place of the user's body.
+    #[test]
+    fn name_alone_never_makes_a_fence() {
+        for name in [
+            "trust_ir_build::FunctionBuilder::fence",
+            "p2::B::fence",
+            "mycrate::fence",
+            "fence",
+            "mycrate::compiler_fence",
+            "compiler_fence",
+            // A display path that LOOKS like the real one is still not identity.
             "std::sync::atomic::fence",
-            &[],
-            &default_dest(),
-            &default_span(),
+            "core::sync::atomic::compiler_fence",
+        ] {
+            for callee in [AtomicCalleeIdentity::NOT_SYSROOT, AtomicCalleeIdentity::SYSROOT_OTHER] {
+                for args in [fence_order_args(AtomicOrdering::SeqCst), vec![], ptr_args()] {
+                    assert_eq!(
+                        parse_atomic_intrinsic_metadata(
+                            name,
+                            callee,
+                            &args,
+                            &default_dest(),
+                            &default_span(),
+                        ),
+                        AtomicIntrinsicMetadata::NotAtomic,
+                        "{name} under {callee:?} must not be read as a fence"
+                    );
+                }
+            }
+        }
+    }
+
+    /// FENCE-IDENTITY-1, Form B: the `atomic::atomic_` substring is display
+    /// text; outside the authenticated sysroot it names a user function.
+    #[test]
+    fn display_forms_require_a_real_sysroot_callee() {
+        for (name, args) in [
+            (
+                "mycrate::atomic::atomic_load",
+                vec![ptr_args()[0].clone(), ordering_arg(AtomicOrdering::SeqCst)],
+            ),
+            ("mycrate::atomic::atomic_fence", fence_order_args(AtomicOrdering::SeqCst)),
+            ("core::intrinsics::atomic_load_seqcst", ptr_args()),
+        ] {
+            assert_eq!(
+                parse_atomic_intrinsic_metadata(
+                    name,
+                    AtomicCalleeIdentity::NOT_SYSROOT,
+                    &args,
+                    &default_dest(),
+                    &default_span(),
+                ),
+                AtomicIntrinsicMetadata::NotAtomic,
+                "{name}"
+            );
+        }
+        // Control: the same display text from an authenticated sysroot callee
+        // keeps its existing reading.
+        assert!(
+            parse_atomic_intrinsic(
+                "core::intrinsics::atomic_load_seqcst",
+                &ptr_args(),
+                &default_dest(),
+                &default_span()
+            )
+            .is_some()
         );
-        assert!(matches!(
-            parsed,
-            AtomicIntrinsicMetadata::Malformed { detail }
-                if detail.contains("fence ordering argument")
-        ));
     }
 
     // --- All five orderings on a single operation ---
@@ -13486,6 +20444,26 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             }
         }
 
+        // Trust (TG14): the E6-only tree lane gains signed arithmetic;
+        // the frozen unsigned recognizer must still decline these markers.
+        for caller in [
+            "excluded_wrapping_i8_add",
+            "excluded_wrapping_i16_sub",
+            "excluded_wrapping_i32_mul",
+            "excluded_wrapping_i64_add",
+        ] {
+            let extracted = callees.get(caller).expect("signed wrapping caller extracted");
+            assert_eq!(extracted.len(), 1);
+            assert!(
+                trust_types::e6_expr::tree::wrapping_primitive(&extracted[0]).is_some(),
+                "signed arithmetic requires authenticated E6 identity: {caller}: {extracted:?}"
+            );
+            assert!(
+                trust_types::RustcTotalPrimitiveMethod::classify(&extracted[0]).is_none(),
+                "the frozen unsigned recognizer must remain unchanged"
+            );
+        }
+
         let composed = callees
             .get("compiler_wrapping_composed_u64")
             .expect("composed unsigned wrapping caller extracted");
@@ -13501,12 +20479,8 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
         for caller in [
             "excluded_wrapping_u128_add",
             "excluded_wrapping_usize_add",
-            "excluded_wrapping_i8_add",
-            "excluded_wrapping_i16_sub",
-            "excluded_wrapping_i32_mul",
             "excluded_wrapping_usize_mul",
             "excluded_wrapping_u128_mul",
-            "excluded_wrapping_i64_add",
             "excluded_wrapping_i128_add",
             "excluded_wrapping_ptr_add",
             "excluded_wrapping_add_signed",
@@ -13529,12 +20503,8 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
         for caller in [
             "excluded_wrapping_u128_add",
             "excluded_wrapping_usize_add",
-            "excluded_wrapping_i8_add",
-            "excluded_wrapping_i16_sub",
-            "excluded_wrapping_i32_mul",
             "excluded_wrapping_usize_mul",
             "excluded_wrapping_u128_mul",
-            "excluded_wrapping_i64_add",
             "excluded_wrapping_i128_add",
         ] {
             let extracted = callees.get(caller).expect("refutation wrapping caller extracted");
@@ -13920,7 +20890,7 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             .capturing
             .get("closure_map_sum")
             .expect("optimized iterator MIR should retain a capturing adapter closure control");
-        let Operand::Unsupported { kind, detail } = operand else {
+        let Operand::Unsupported { kind, detail, .. } = operand else {
             panic!("capturing closure must remain fail-closed, got {operand:?}");
         };
         assert_eq!(kind, "Const::Closure");
@@ -13991,7 +20961,7 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
         let args = call_args.get("pass_enum_zst").expect("missing call args for pass_enum_zst");
         assert_eq!(args.len(), 1, "expected one call arg for pass_enum_zst, got {args:?}");
         assert!(
-            matches!(args[0], Operand::Constant(ConstValue::OpaqueConst)),
+            matches!(args[0], Operand::Constant(ConstValue::OpaqueConst(_))),
             "a fieldless multi-variant enum must retain an unconstrained discriminant, got {:?}",
             args[0]
         );
@@ -14289,6 +21259,65 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
         assert!(matches!(operands.as_slice(), [Operand::Copy(place)] if place.local == 1));
     }
 
+    /// R140's converse: `T -> MaybeUninit<T>` only WIDENS validity — every valid
+    /// `T` is a valid `MaybeUninit<T>` — so it lowers as the identity (a
+    /// value-preserving `Cast` of the untouched operand to the `MaybeUninit` type).
+    /// A thin pointer and a two-pointer struct, deliberately: neither is an
+    /// integer, so neither is reachable through the R146 total-niche leg, which
+    /// only ever took an integral source.
+    #[test]
+    fn transmute_widening_into_maybe_uninit_lowers_as_identity_cast() {
+        let is_payload = |name: &str, ty: &Ty| match name {
+            "transmute_ptr_into_maybe_uninit" => {
+                matches!(ty, Ty::RawPtr { mutable: false, pointee } if **pointee == Ty::u8())
+            }
+            _ => matches!(ty, Ty::Adt { name, .. } if name == "trust_mir_extract_casts::PtrPair"),
+        };
+        for name in ["transmute_ptr_into_maybe_uninit", "transmute_pair_into_maybe_uninit"] {
+            let rvalue = cast_test_rvalues().get(name).unwrap();
+            let Rvalue::Cast(Operand::Copy(place) | Operand::Move(place), target_ty) = rvalue
+            else {
+                panic!("{name}: expected T -> MaybeUninit<T> to lower as a cast, got {rvalue:?}");
+            };
+            assert_eq!(place.local, 1, "{name}: the cast must carry the argument unchanged");
+            assert!(place.projections.is_empty(), "{name}: no projection may be invented");
+            let Ty::Adt { name: adt_name, fields, .. } = target_ty else {
+                panic!("{name}: expected the MaybeUninit ADT as the target, got {target_ty:?}");
+            };
+            // The ADT name carries no generic arguments; the instantiated union
+            // field is what says it is `MaybeUninit<T>` at the SOURCE's `T`.
+            assert_eq!(adt_name, "trust_mir_extract_casts::MaybeUninit", "{name}");
+            assert!(
+                matches!(fields.as_slice(), [(field, ty)] if field == "value" && is_payload(name, ty)),
+                "{name}: target must be MaybeUninit at the source type, got fields {fields:?}",
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROLS for the leg above: two transmutes it must NOT swallow,
+    /// each still the fail-closed Transmute marker.
+    ///   * `*const u8 -> MaybeUninit<*const u32>` — a MaybeUninit of a DIFFERENT
+    ///     type is a genuine reinterpretation, not the widening.
+    ///   * `*const u8 -> LookAlikeMaybeUninit<*const u8>` — a user union with the
+    ///     same shape but not the `maybe_uninit` lang item; the leg keys on the
+    ///     lang item, never on the shape or the name.
+    #[test]
+    fn transmute_into_other_maybe_uninit_or_look_alike_union_fails_closed() {
+        for name in
+            ["transmute_ptr_into_maybe_uninit_of_other", "transmute_ptr_into_look_alike_union"]
+        {
+            let rvalue = cast_test_rvalues().get(name).unwrap();
+            let Rvalue::Unsupported { kind, operands, .. } = rvalue else {
+                panic!("{name}: expected the fail-closed Transmute marker, got {rvalue:?}");
+            };
+            assert_eq!(kind, "CastKind::Transmute", "{name}");
+            let [Operand::Copy(place) | Operand::Move(place)] = operands.as_slice() else {
+                panic!("{name}: expected the one argument operand, got {operands:?}");
+            };
+            assert_eq!(place.local, 1, "{name}: operand not preserved");
+        }
+    }
+
     // ========================================================================
     // Trust (goal item 2c regression, fix commit 2238fbfa9f):
     // `discharge_provably_safe_pointer_asserts` must ELIDE the null/misalign
@@ -14567,5 +21596,1970 @@ pub fn recv_mixed(a: Box<u128>, p: *mut u128, c: bool) -> u128 {
         // b = received Box<u128> in one arm, Box::from_raw(p) in the other: the
         // primary adversary counterexample -> both KEPT.
         check_box_assert_discharge("recv_mixed", true, true);
+    }
+
+    // ========================================================================
+    // Trust ("an alignment discharge may rest on
+    // reference validity", the owner, 2026-09-13: docs/OWNER_RULINGS.md OW-24): `ref_rooted_align_for_addr` must ELIDE a
+    // MisalignedPointerDereference whose pointer roots at a PRISTINE `&T` FORMAL
+    // reached by an alignment-preserving path, and KEEP it on every shape outside
+    // that affirmative allow-list.
+    //
+    // OPT-LEVEL ASYMMETRY IS THE ORACLE, not an accident. `UnsafeCell::get` is
+    // `#[inline(always)]` but `CheckAlignment` runs BEFORE `Inline`, so at
+    // mir-opt-level 3 the root is `&raw const ((*_1).0)` (an `Rvalue::RawPtr` the
+    // lane recognizes) while at level 1 it is still a `Call` destination, which
+    // `local_has_terminator_def` refuses. So the SAME positive fixture must read
+    // DISCHARGED at 3 and KEPT at 1 — a fixture that discharged at both would mean
+    // the terminator guard had stopped working.
+    //
+    // VACUITY GUARD: `ref_fabricated` (KEPT at both levels) is this family's canary.
+    // A 0 there means `-Zub-checks=yes` stopped taking effect and every DISCHARGED
+    // expectation below is vacuously true.
+    // ========================================================================
+
+    const REF_ASSERT_FIXTURE_PATH: &str = "ref_asserts.rs";
+
+    const REF_ASSERT_SOURCE: &str = r#"
+use core::cell::UnsafeCell;
+
+pub struct C { pub c: UnsafeCell<u32> }
+
+#[repr(packed)]
+pub struct P { pub a: u8, pub c: u32 }
+
+pub fn ref_cell_field(s: &C) -> u32 { unsafe { *s.c.get() } }
+
+pub fn ref_packed_field(p: &P) -> u32 { unsafe { *(&raw const p.c) } }
+
+pub unsafe fn ref_raw_base(p: *const C) -> u32 { unsafe { *(*p).c.get() } }
+
+pub unsafe fn ref_raw_root(p: *const u32) -> u32 { unsafe { *p } }
+
+pub fn ref_fabricated(a: usize) -> u32 { unsafe { *(a as *const u32) } }
+
+pub fn ref_root_rewritten<'a>(mut s: &'a C, t: &'a C) -> u32 { s = t; unsafe { *s.c.get() } }
+
+pub unsafe fn ref_generic_pointee<T: Copy>(s: &UnsafeCell<T>) -> T { unsafe { *s.get() } }
+
+#[repr(C)]
+pub struct Direct { pub pad: u8, pub value: u64 }
+
+#[inline(never)]
+fn replace_pointer(slot: &mut *const u64, value: *const u64) { *slot = value; }
+
+#[inline(never)]
+unsafe fn replace_raw_pointer(slot: *mut *const u64, value: *const u64) {
+    unsafe { *slot = value; }
+}
+
+pub fn ref_direct_field(s: &Direct) -> u64 { unsafe { *(&raw const s.value) } }
+
+pub fn ref_borrowed_referent(s: &mut Direct) -> u64 {
+    let referent = &mut *s;
+    referent.value = referent.value.wrapping_add(1);
+    unsafe { *(&raw const s.value) }
+}
+
+pub unsafe fn ref_alias_call(s: &Direct, value: *const u64) -> u64 {
+    let mut pointer = &raw const s.value;
+    replace_pointer(&mut pointer, value);
+    unsafe { *pointer }
+}
+
+pub unsafe fn ref_raw_const_alias_call(s: &Direct, value: *const u64) -> u64 {
+    let mut pointer = &raw const s.value;
+    let alias = &raw const pointer;
+    unsafe { replace_raw_pointer(alias.cast_mut(), value); *pointer }
+}
+
+pub unsafe fn box_alias_call(value: Box<u64>, replacement: *const u64) -> u64 {
+    let mut pointer = &raw const *value;
+    replace_pointer(&mut pointer, replacement);
+    unsafe { *pointer }
+}
+"#;
+
+    struct InMemoryRefAssertFileLoader;
+
+    impl rustc_span::source_map::FileLoader for InMemoryRefAssertFileLoader {
+        fn file_exists(&self, path: &Path) -> bool {
+            path == Path::new(REF_ASSERT_FIXTURE_PATH)
+        }
+
+        fn read_file(&self, path: &Path) -> io::Result<String> {
+            if self.file_exists(path) {
+                Ok(REF_ASSERT_SOURCE.to_string())
+            } else {
+                Err(io::Error::other("unexpected ref-assert fixture path"))
+            }
+        }
+
+        fn read_binary_file(&self, _path: &Path) -> io::Result<Arc<[u8]>> {
+            Err(io::Error::other("binary reads are not supported in ref-assert tests"))
+        }
+
+        fn current_directory(&self) -> io::Result<PathBuf> {
+            std::env::current_dir()
+        }
+    }
+
+    /// Captures the POST-DISCHARGE `VerifiableFunction` for every free fn AND
+    /// inherent/assoc method. Iterates `hir_body_owners` (NOT `hir_free_items`,
+    /// which would MISS the inherent `Expr::eval`), filters to `Fn`/`AssocFn`,
+    /// and keys by extract_function's derived name (`opt_item_name` → "eval").
+    struct RefAssertCallbacks {
+        functions: BTreeMap<String, VerifiableFunction>,
+        before: BTreeMap<String, (rustc_span::def_id::DefId, usize, usize)>,
+    }
+
+    impl rustc_driver::Callbacks for RefAssertCallbacks {
+        fn config(&mut self, config: &mut Config) {
+            config.file_loader = Some(Box::new(InMemoryRefAssertFileLoader));
+        }
+
+        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+            use rustc_hir::def::DefKind;
+            tcx.sess.dcx().abort_if_errors();
+
+            for local_def_id in tcx.hir_body_owners() {
+                let def_id = local_def_id.to_def_id();
+                if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
+                    continue;
+                }
+                // optimized_mir → run_optimization_passes → CheckAlignment +
+                // CheckNull INSERT the asserts; crate::extract_function →
+                // extract_body → discharge_provably_safe_pointer_asserts then
+                // rewrites the discharged ones to `Goto`, so `vf` is post-discharge.
+                let body = tcx.optimized_mir(def_id);
+                let mut mis = 0usize;
+                let mut null = 0usize;
+                for block in body.basic_blocks.iter() {
+                    if let mir::TerminatorKind::Assert { msg, .. } = &block.terminator().kind {
+                        match &**msg {
+                            mir::AssertMessage::MisalignedPointerDereference { .. } => mis += 1,
+                            mir::AssertMessage::NullPointerDereference => null += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                let vf = crate::extract_function(tcx, body);
+                // Both populations are captured from this exact queried DefId's
+                // same optimized body, not a second compile or a name-only join.
+                // Refuse duplicate fixture names instead of overwriting a row.
+                let name = vf.name.clone();
+                assert!(self.before.insert(name.clone(), (def_id, mis, null)).is_none());
+                assert!(self.functions.insert(name, vf).is_none());
+            }
+
+            Compilation::Stop
+        }
+    }
+
+    /// Compile the fixture at a PARAMETERIZED mir-opt-level with UB-checks forced
+    /// ON, retaining the exact pre/post-discharge populations by definition.
+    fn compile_ref_assert_fixture(opt_level: usize) -> RefAssertCallbacks {
+        let mut callbacks =
+            RefAssertCallbacks { functions: BTreeMap::new(), before: BTreeMap::new() };
+        let mut args = vec![
+            "rustc".to_string(),
+            REF_ASSERT_FIXTURE_PATH.to_string(),
+            "--crate-name".to_string(),
+            "trust_mir_extract_ref_asserts".to_string(),
+            "--crate-type=lib".to_string(),
+            "--edition=2021".to_string(),
+            format!("-Zmir-opt-level={opt_level}"),
+            // Force `sess.ub_checks() == true` independent of -C opt-level so the
+            // CheckAlignment/CheckNull passes insert the Mis/Null asserts. Without
+            // this the test is vacuous (all counts 0). parse_opt_bool accepts "yes".
+            "-Zub-checks=yes".to_string(),
+            "-Zno-codegen".to_string(),
+            // Trust is on-by-default in this rustc_private compiler; without this the
+            // inner fixture compile is REFUTED (box/raw derefs) and aborts before we
+            // count asserts. Disables ONLY the fixture-compile verifier (empirically
+            // required — verified 6/6 pass with it, 6/6 fail without).
+            "-Ztrust-verify=off".to_string(),
+            // Defensive: silence the (non-firing) transmute lint; warnings never
+            // abort (abort_if_errors only aborts on errors) so this is optional.
+            "-Aunnecessary_transmutes".to_string(),
+        ];
+        args.push("--sysroot".to_string());
+        args.push(compiler_sysroot());
+        // Trust: PIN the dummy backend, as every sibling fixture in this file does
+        // (`-Zcodegen-backend=dummy`, e.g. convert.rs:8830). This was the only
+        // fixture that instead added a backend flag ONLY when
+        // `RUSTC_CODEGEN_BACKEND` happened to be set in the environment, so with
+        // that variable unset it asked for the default LLVM backend.
+        //
+        // That fails here and nowhere else because this test runs INSIDE the
+        // rustc_private test binary: the `librustc_driver` it links carries ZERO
+        // `rustc_codegen_llvm` symbols (the stage1 sysroot driver has 461), so
+        // `builtin_codegen_backend("llvm")` returns None and the loader falls
+        // through to `find_codegen_backend_in_sysroot`, which finds no
+        // `codegen-backends` folder under `build/` at all. All six
+        // `convert::tests::box_assert_*` then die on
+        // "failed to find a `codegen-backends` folder in the sysroot candidates"
+        // before reaching any assertion — the assert message they print is a red
+        // herring. Six occurrences in every extract log going back.
+        //
+        // `-Zno-codegen` above means no backend is ever invoked; the pin only has
+        // to name one that LOADS.
+        args.push("-Zcodegen-backend=dummy".to_string());
+
+        let result =
+            rustc_driver::catch_fatal_errors(|| -> rustc_interface::interface::Result<()> {
+                rustc_driver::run_compiler(&args, &mut callbacks);
+                Ok(())
+            });
+        assert!(
+            result.is_ok(),
+            "failed to compile ref-assert fixture at -Zmir-opt-level={opt_level}"
+        );
+
+        callbacks
+    }
+
+    /// Memoized per opt level — each `compile_ref_assert_fixture` spins a full
+    /// rustc_driver invocation.
+    fn ref_assert_probe(opt_level: usize) -> &'static RefAssertCallbacks {
+        static OPT1: OnceLock<RefAssertCallbacks> = OnceLock::new();
+        static OPT3: OnceLock<RefAssertCallbacks> = OnceLock::new();
+        match opt_level {
+            1 => OPT1.get_or_init(|| compile_ref_assert_fixture(1)),
+            3 => OPT3.get_or_init(|| compile_ref_assert_fixture(3)),
+            n => panic!("unsupported ref-assert opt level {n}"),
+        }
+    }
+
+    fn ref_assert_fixture(opt_level: usize) -> &'static BTreeMap<String, VerifiableFunction> {
+        &ref_assert_probe(opt_level).functions
+    }
+
+    /// A genuine discharge needs an actual pre-extraction assertion in the same
+    /// body. Optimizer removal before extraction is not evidence for this gate.
+    fn check_observed_ref_alignment_discharge(name: &str) {
+        for opt in [1usize, 3usize] {
+            let probe = ref_assert_probe(opt);
+            let (def_id, mis, _null) = probe.before.get(name).expect("missing pre-extraction row");
+            assert!(
+                *mis >= 1,
+                "{name}@opt{opt} ({def_id:?}): no actual pre-extraction alignment assertion"
+            );
+        }
+        check_ref_assert_misalign(name, false, false);
+    }
+
+    /// `(misalign asserts surviving, null asserts surviving)` in `name`.
+    /// Uses `matches!` because `AssertMessage` derives NO `PartialEq`
+    /// (model.rs:5680 = Debug, Clone, Serialize, Deserialize only).
+    fn ref_assert_counts(
+        functions: &BTreeMap<String, VerifiableFunction>,
+        name: &str,
+    ) -> (usize, usize) {
+        let vf = functions
+            .get(name)
+            .unwrap_or_else(|| panic!("ref-assert fixture fn `{name}` was not extracted"));
+        let mut mis = 0usize;
+        let mut null = 0usize;
+        for block in &vf.body.blocks {
+            match &block.terminator {
+                Terminator::Assert { msg: AssertMessage::MisalignedPointerDereference, .. } => {
+                    mis += 1;
+                }
+                Terminator::Assert { msg: AssertMessage::NullPointerDereference, .. } => {
+                    null += 1;
+                }
+                _ => {}
+            }
+        }
+        (mis, null)
+    }
+
+    /// Assert the post-discharge Misalign outcome for `name` at BOTH opt levels.
+    /// Separate expectations per level because the lane is reachable only once
+    /// `UnsafeCell::get` has been inlined (level 3), by design.
+    fn check_ref_assert_misalign(name: &str, kept_at_1: bool, kept_at_3: bool) {
+        for (opt, kept) in [(1usize, kept_at_1), (3usize, kept_at_3)] {
+            let (mis, _null) = ref_assert_counts(ref_assert_fixture(opt), name);
+            if kept {
+                assert!(mis >= 1, "{name}@opt{opt}: expected Misalign KEPT, got {mis}");
+            } else {
+                assert_eq!(mis, 0, "{name}@opt{opt}: expected Misalign DISCHARGED, got {mis}");
+            }
+        }
+    }
+
+    #[test]
+    fn ref_assert_cell_field_discharges_once_inlined() {
+        // THE TARGET SHAPE (std's `ReentrantLock::increment_lock_count` reduced):
+        // `&self` -> field -> `UnsafeCell::get()` -> deref. Discharged at opt 3 on
+        // reference validity; KEPT at opt 1 where the root is still a Call.
+        check_ref_assert_misalign("ref_cell_field", true, false);
+    }
+
+    #[test]
+    fn ref_assert_packed_field_keeps_at_every_level() {
+        // THE CRITICAL CONTROL. Structurally IDENTICAL to `ref_cell_field` at opt 3 —
+        // same pristine `&`-formal root, same single Deref-through-reference, same
+        // single Field, same `Rvalue::RawPtr`, same `required = 4` — but `P` is
+        // `#[repr(packed)]`, so `p.c` sits at offset 1 and is genuinely under-aligned.
+        // A DISCHARGE here is a false PROVE on real UB, not a coverage win.
+        check_ref_assert_misalign("ref_packed_field", true, true);
+    }
+
+    #[test]
+    fn ref_assert_raw_root_keeps_at_every_level() {
+        // A raw-pointer FORMAL carries no validity guarantee. NOTE: measured, this one
+        // is Call-rooted at BOTH opt levels, so it declines at clause 1 (no
+        // address-of-place termination) and never reaches the root-type test. It is a
+        // real negative but NOT a control for clause 2 — `ref_raw_base` is that.
+        check_ref_assert_misalign("ref_raw_root", true, true);
+    }
+
+    #[test]
+    fn ref_assert_fabricated_keeps_at_every_level() {
+        // An integer-cast address has no root at all. Also the ub-checks canary: a
+        // DISCHARGED reading here means the asserts were never inserted and every
+        // other expectation in this family is vacuous.
+        check_ref_assert_misalign("ref_fabricated", true, true);
+    }
+
+    #[test]
+    fn ref_assert_raw_base_keeps_at_every_level() {
+        // The addressed PLACE is `(*p).c` with `p: *const C` — a raw-pointer base.
+        // RawPtr-rooted at opt 3, so it genuinely reaches the lane and is refused by
+        // two independent clauses: the root is not `is_ref()`, and the projection
+        // Derefs a raw pointer. Measured pre-change: 2 misalign asserts, both KEPT.
+        check_ref_assert_misalign("ref_raw_base", true, true);
+    }
+
+    #[test]
+    fn ref_assert_generic_pointee_keeps_at_every_level() {
+        // `&UnsafeCell<T>` root: pristine and reference-typed, path alignment-preserving
+        // — refused ONLY by fence clause 4, because a generic pointee has no concrete
+        // layout and the discharge site's `>= req` needs a real number. Deleting that
+        // clause would green this and nothing else, which is what makes it a real control.
+        check_ref_assert_misalign("ref_generic_pointee", true, true);
+    }
+
+    #[test]
+    fn ref_assert_rewritten_root_keeps_at_every_level() {
+        // The root formal is whole-assigned before the deref, so it is not the
+        // referent the caller vouched for (fence clause 2, `local_has_whole_assign`).
+        check_ref_assert_misalign("ref_root_rewritten", true, true);
+    }
+
+    /// Assert the post-discharge NULL outcome for `name` at BOTH opt levels.
+    fn check_ref_assert_null(name: &str, kept_at_1: bool, kept_at_3: bool) {
+        for (opt, kept) in [(1usize, kept_at_1), (3usize, kept_at_3)] {
+            let (_mis, null) = ref_assert_counts(ref_assert_fixture(opt), name);
+            if kept {
+                assert!(null >= 1, "{name}@opt{opt}: expected Null KEPT, got {null}");
+            } else {
+                assert_eq!(null, 0, "{name}@opt{opt}: expected Null DISCHARGED, got {null}");
+            }
+        }
+    }
+
+    #[test]
+    fn ref_assert_null_lane_discharges_the_target_once_inlined() {
+        // The NULL twin of `ref_cell_field`: a pristine `&C` formal is non-null by the same
+        // caller obligation that makes it aligned. Same opt-level oracle as the misalign
+        // lane -- KEPT at 1 where the root is still a Call, DISCHARGED at 3.
+        check_ref_assert_null("ref_cell_field", true, false);
+    }
+
+    #[test]
+    fn ref_assert_null_lane_holds_every_negative() {
+        // Every shape the fence refuses must keep its NULL assert too. `ref_packed_field` is
+        // over-conservative here on purpose: a packed field of a valid reference IS non-null,
+        // but the null lane reuses the shared path predicate rather than a laxer one.
+        for name in [
+            "ref_packed_field",
+            "ref_raw_base",
+            "ref_raw_root",
+            "ref_fabricated",
+            "ref_root_rewritten",
+        ] {
+            check_ref_assert_null(name, true, true);
+        }
+    }
+
+    #[test]
+    fn ref_assert_null_lane_diverges_from_alignment_on_a_generic_pointee() {
+        // THE ONE SHAPE WHERE THE TWO LANES LEGITIMATELY DIVERGE. `&UnsafeCell<T>` is a
+        // pristine reference formal on an alignment-preserving path, but clause F5 needs a
+        // CONCRETE layout for the `>= required` comparison, so the ALIGNMENT lane declines a
+        // generic pointee. Non-nullness needs no layout at all, so the NULL lane discharges
+        // it. Pinned separately because a reader will doubt exactly this divergence, and a
+        // coverage grep once reported it tested when it was not.
+        check_ref_assert_misalign("ref_generic_pointee", true, true);
+        check_ref_assert_null("ref_generic_pointee", true, false);
+    }
+
+    #[test]
+    fn ref_assert_alignment_lane_does_not_widen_the_null_arm() {
+        // The ruling covers ALIGNMENT. The NullPointerDereference arm discharges on
+        // `box_alloc_facts_for_addr(..).is_some()` with NO alignment comparison, so the
+        // reference lane is deliberately attached at the misalign arm only and must
+        // leave every null assert standing. This test is what makes that deliberate
+        // rather than incidental.
+        // The two lanes are attached at SEPARATE arms and share only the trace and the root
+        // predicate. This pins that the misalign lane cannot discharge a null assert on its
+        // own: a shape the null lane refuses keeps its null assert even where misalign is
+        // discharged.
+        for name in ["ref_packed_field", "ref_fabricated"] {
+            for &opt in &[1usize, 3usize] {
+                let (_mis, null) = ref_assert_counts(ref_assert_fixture(opt), name);
+                assert!(null >= 1, "{name}@opt{opt}: null assert must be KEPT, got {null}");
+            }
+        }
+    }
+
+    #[test]
+    fn ref_assert_direct_field_remains_aligned() {
+        // A nonzero-offset field behind a valid reference. Taking the address
+        // of its REFERENT must not be confused with exposing the reference
+        // formal's own stack slot.
+        check_observed_ref_alignment_discharge("ref_direct_field");
+    }
+
+    #[test]
+    fn ref_assert_mutably_borrowed_referent_remains_aligned() {
+        // Mutating the valid referent's contents does not replace the formal
+        // reference value or the derived field address.
+        check_observed_ref_alignment_discharge("ref_borrowed_referent");
+    }
+
+    #[test]
+    fn ref_assert_mutable_pointer_slot_call_keeps_alignment_check() {
+        // The reference formal stays pristine; a non-inlined call overwrites
+        // the intermediate raw pointer through &mut. Its sole Assign is NOT
+        // its reaching value at the dereference.
+        check_ref_assert_misalign("ref_alias_call", true, true);
+    }
+
+    #[test]
+    fn ref_assert_raw_const_pointer_slot_alias_keeps_alignment_check() {
+        // Even a raw CONST address may be converted to mut and used to write
+        // the pointer's stack slot. This introduces no invalid reference; the
+        // replacement raw pointer may genuinely require the alignment check.
+        check_ref_assert_misalign("ref_raw_const_alias_call", true, true);
+    }
+
+    #[test]
+    fn box_assert_mutable_pointer_slot_call_keeps_both_checks() {
+        // The inherited box trace has the same whole-local-definition gap.
+        // The original allocation cannot certify a replacement pointer.
+        for opt in [1usize, 3usize] {
+            let (mis, null) = ref_assert_counts(ref_assert_fixture(opt), "box_alias_call");
+            assert!(mis >= 1, "box_alias_call@opt{opt}: alignment must remain, got {mis}");
+            assert!(null >= 1, "box_alias_call@opt{opt}: null check must remain, got {null}");
+        }
+    }
+
+    // ---- NEVER-TYPED DIVERGENCE: the `Call` vs `Opaque` decision ---------------
+    //
+    // A real-TyCtxt exercise of `direct_callee_returns_never` and the admission
+    // it gates. rustc lowers a call with `target: None` when the callee cannot
+    // return; when the callee's signature output is the primitive never type
+    // that is a fact `TyCtxt` can state, and it makes the no-normal-successor
+    // `Terminator::Call` the faithful shape rather than the `Opaque` bail.
+    //
+    // The DECLINE rows are the load-bearing ones: an INDIRECT diverging call has
+    // no `FnDef` to read a signature from, and a call returning an UNINHABITED
+    // type that is not `!` is not the fact this gate states. Both keep `Opaque`.
+    const NEVER_DIVERGENCE_SOURCE: &str = r#"
+pub enum Void {}
+
+#[inline(never)]
+pub fn user_never() -> ! {
+    loop {
+        std::hint::spin_loop();
+    }
+}
+
+#[inline(never)]
+pub fn returns_void() -> Void {
+    user_never()
+}
+
+#[inline(never)]
+pub fn plain_returning(x: u32) -> u32 {
+    x.wrapping_add(1)
+}
+
+// The measured shape: `std::panic::resume_unwind` is typed `-> !`.
+#[inline(never)]
+pub fn std_resume_unwind(p: std::boxed::Box<dyn std::any::Any + Send>, c: bool) -> u8 {
+    if c {
+        std::panic::resume_unwind(p)
+    } else {
+        1
+    }
+}
+
+// A USER `-> !` callee: the gate reads rustc's typing, not a std path.
+#[inline(never)]
+pub fn user_divergence(c: bool) -> u8 {
+    if c { user_never() } else { 2 }
+}
+
+// DECLINE: the callee returns an uninhabited ADT, NOT the never type. rustc
+// still gives the call `target: None`; this gate does not state that fact.
+#[inline(never)]
+pub fn uninhabited_but_not_never(c: bool) -> u8 {
+    if c {
+        match returns_void() {}
+    } else {
+        3
+    }
+}
+
+// DECLINE: an INDIRECT diverging call carries no `FnDef` and no readable
+// signature, whatever the fn-pointer's own type says.
+#[inline(never)]
+pub fn indirect_divergence(f: fn(u8) -> !, c: bool) -> u8 {
+    if c { f(4) } else { 5 }
+}
+
+// CONTROL: an ordinary returning call is untouched by any of this.
+#[inline(never)]
+pub fn returning_call(x: u32) -> u32 {
+    plain_returning(x)
+}
+"#;
+    const NEVER_DIVERGENCE_FIXTURE_PATH: &str = "never_typed_divergence.rs";
+
+    struct InMemoryNeverDivergenceFileLoader;
+
+    impl rustc_span::source_map::FileLoader for InMemoryNeverDivergenceFileLoader {
+        fn file_exists(&self, path: &Path) -> bool {
+            path == Path::new(NEVER_DIVERGENCE_FIXTURE_PATH)
+        }
+
+        fn read_file(&self, path: &Path) -> io::Result<String> {
+            if self.file_exists(path) {
+                Ok(NEVER_DIVERGENCE_SOURCE.to_string())
+            } else {
+                Err(io::Error::other("unexpected never-divergence fixture path"))
+            }
+        }
+
+        fn read_binary_file(&self, _path: &Path) -> io::Result<Arc<[u8]>> {
+            Err(io::Error::other("binary reads are not supported in never-divergence tests"))
+        }
+
+        fn current_directory(&self) -> io::Result<PathBuf> {
+            std::env::current_dir()
+        }
+    }
+
+    /// One MIR `Call` terminator of a fixture body, as rustc spelled it and as
+    /// `convert_terminator` lowered it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct NeverDivergenceCallRow {
+        /// The rendered callee path (`<indirect>` for a fn-pointer call).
+        callee: String,
+        /// Whether rustc gave the call a NORMAL-return target.
+        mir_has_target: bool,
+        /// Whether `direct_callee_returns_never` states the never-type fact here.
+        gate_says_never: bool,
+        /// `"Call(target=None)"`, `"Call(target=Some)"`, `"Opaque"`, or another
+        /// terminator name — what extraction actually produced.
+        lowered: String,
+    }
+
+    #[derive(Default)]
+    struct NeverDivergenceCallbacks {
+        rows: BTreeMap<String, Vec<NeverDivergenceCallRow>>,
+    }
+
+    impl rustc_driver::Callbacks for NeverDivergenceCallbacks {
+        fn config(&mut self, config: &mut Config) {
+            config.file_loader = Some(Box::new(InMemoryNeverDivergenceFileLoader));
+        }
+
+        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+            tcx.sess.dcx().abort_if_errors();
+            for item_id in tcx.hir_free_items() {
+                let item = tcx.hir_item(item_id);
+                let rustc_hir::ItemKind::Fn { ident, .. } = item.kind else { continue };
+                let body = tcx.optimized_mir(item.owner_id.def_id.to_def_id());
+                let mut rows = Vec::new();
+                for bb in body.basic_blocks.iter() {
+                    let term = bb.terminator();
+                    let mir::TerminatorKind::Call { func, target, .. } = &term.kind else {
+                        continue;
+                    };
+                    let lowered = convert_terminator(
+                        tcx,
+                        term,
+                        Some(&body.local_decls),
+                        Some(body.typing_env(tcx)),
+                        Some(body.source.def_id()),
+                        OptionalOverflowAssertCodegen::ThisSession,
+                    );
+                    rows.push(NeverDivergenceCallRow {
+                        callee: func_operand_name_in_body(tcx, body, func),
+                        mir_has_target: target.is_some(),
+                        gate_says_never: direct_callee_returns_never(
+                            tcx,
+                            func,
+                            Some(&body.local_decls),
+                        ),
+                        lowered: match &lowered {
+                            Terminator::Call { target: None, .. } => {
+                                "Call(target=None)".to_string()
+                            }
+                            Terminator::Call { target: Some(_), .. } => {
+                                "Call(target=Some)".to_string()
+                            }
+                            Terminator::Opaque { .. } => "Opaque".to_string(),
+                            other => codegen_terminator_name_for_test(other).to_string(),
+                        },
+                    });
+                }
+                self.rows.insert(ident.name.to_string(), rows);
+            }
+            Compilation::Stop
+        }
+    }
+
+    fn codegen_terminator_name_for_test(terminator: &Terminator) -> &'static str {
+        match terminator {
+            Terminator::Goto(_) => "Goto",
+            Terminator::SwitchInt { .. } => "SwitchInt",
+            Terminator::Return => "Return",
+            Terminator::TailCall { .. } => "TailCall",
+            Terminator::Assert { .. } => "Assert",
+            Terminator::Drop { .. } => "Drop",
+            Terminator::Unreachable => "Unreachable",
+            Terminator::Resume => "Resume",
+            _ => "<other>",
+        }
+    }
+
+    fn compile_never_divergence_fixture() -> NeverDivergenceCallbacks {
+        let mut callbacks = NeverDivergenceCallbacks::default();
+        let mut args = vec![
+            "rustc".to_string(),
+            NEVER_DIVERGENCE_FIXTURE_PATH.to_string(),
+            "--crate-name".to_string(),
+            "trust_mir_extract_never_divergence".to_string(),
+            "--crate-type=lib".to_string(),
+            "--edition=2021".to_string(),
+            "-Zmir-opt-level=1".to_string(),
+            // Keep every call a `Call` terminator the gate can be asked about.
+            "-Zinline-mir=no".to_string(),
+            "-Zno-codegen".to_string(),
+            "-Zcodegen-backend=dummy".to_string(),
+            "-Ztrust-verify=off".to_string(),
+        ];
+        args.push("--sysroot".to_string());
+        args.push(compiler_sysroot());
+        let result =
+            rustc_driver::catch_fatal_errors(|| -> rustc_interface::interface::Result<()> {
+                rustc_driver::run_compiler(&args, &mut callbacks);
+                Ok(())
+            });
+        assert!(result.is_ok(), "failed to compile the never-divergence fixture");
+        callbacks
+    }
+
+    fn never_divergence_fixture() -> &'static NeverDivergenceCallbacks {
+        static RESULTS: OnceLock<NeverDivergenceCallbacks> = OnceLock::new();
+        RESULTS.get_or_init(compile_never_divergence_fixture)
+    }
+
+    /// The row for the one call in `body` whose callee path CONTAINS `needle`.
+    fn never_divergence_row(body: &str, needle: &str) -> NeverDivergenceCallRow {
+        let fixture = never_divergence_fixture();
+        let rows = fixture
+            .rows
+            .get(body)
+            .unwrap_or_else(|| panic!("fixture body `{body}` missing: {:?}", fixture.rows.keys()));
+        let matches: Vec<_> = rows.iter().filter(|r| r.callee.contains(needle)).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "`{body}` must hold exactly one call whose callee contains `{needle}`; rows: {rows:?}"
+        );
+        matches[0].clone()
+    }
+
+    /// THE FIX. A DIRECT diverging call whose callee rustc types `-> !` lowers to
+    /// the faithful no-normal-successor `Call`, not the `Opaque` bail — for a std
+    /// callee and for a USER one alike, because the gate reads rustc's typing and
+    /// not a display path.
+    #[test]
+    fn a_never_typed_diverging_call_lowers_to_a_call_not_an_opaque() {
+        for (body, needle) in
+            [("std_resume_unwind", "resume_unwind"), ("user_divergence", "user_never")]
+        {
+            let row = never_divergence_row(body, needle);
+            assert!(
+                !row.mir_has_target,
+                "the fixture must keep this call DIVERGING; rustc gave it a target: {row:?}"
+            );
+            assert!(
+                row.gate_says_never,
+                "`direct_callee_returns_never` must state the never-type fact here: {row:?}"
+            );
+            assert_eq!(
+                row.lowered, "Call(target=None)",
+                "a never-typed diverging call must keep its call — and with it its \
+                 panic-freedom charge and its unwind edge — instead of becoming the \
+                 `Opaque` sentinel that answers `LocalWrite::Unlocatable` for every \
+                 local in the body: {row:?}"
+            );
+        }
+    }
+
+    /// THE DECLINE, and the reason the gate is a TYPE query rather than "rustc gave
+    /// this call no target". A callee returning an UNINHABITED ADT also diverges and
+    /// also gets `target: None`, but its output is not `TyKind::Never`; this gate
+    /// does not state that fact, so the historical `Opaque` bail stands. No
+    /// normalization is attempted either — declining is the conservative direction.
+    #[test]
+    fn an_uninhabited_but_not_never_return_keeps_the_opaque_bail() {
+        let row = never_divergence_row("uninhabited_but_not_never", "returns_void");
+        assert!(!row.mir_has_target, "the fixture must keep this call diverging: {row:?}");
+        assert!(
+            !row.gate_says_never,
+            "`Void` is uninhabited but is not the never type; the gate must not claim \
+             otherwise: {row:?}"
+        );
+        assert_eq!(row.lowered, "Opaque", "{row:?}");
+    }
+
+    /// THE DECLINE at the gate's other boundary: an INDIRECT call has no `FnDef`,
+    /// so no callee signature is readable and nothing may be admitted off the
+    /// fn-pointer's erased shape — even though that pointer's own type says `-> !`.
+    #[test]
+    fn an_indirect_diverging_call_keeps_the_opaque_bail() {
+        let row = never_divergence_row("indirect_divergence", "<indirect>");
+        assert!(!row.mir_has_target, "the fixture must keep this call diverging: {row:?}");
+        assert!(!row.gate_says_never, "no `FnDef`, no signature, no fact: {row:?}");
+        assert_eq!(row.lowered, "Opaque", "{row:?}");
+    }
+
+    /// THE CONTROL: an ordinary RETURNING call is untouched. The gate requires
+    /// `target.is_none()` at its call site, so a returning callee — never-typed or
+    /// not — cannot have its continuation erased by this admission.
+    #[test]
+    fn a_returning_call_is_unchanged_by_the_never_type_gate() {
+        let row = never_divergence_row("returning_call", "plain_returning");
+        assert!(row.mir_has_target, "{row:?}");
+        assert!(!row.gate_says_never, "{row:?}");
+        assert_eq!(row.lowered, "Call(target=Some)", "{row:?}");
+    }
+
+    // ---- PAIRED-CONDVAR pre-scan / lazy digest ---------------------------------
+    //
+    // A real-TyCtxt exercise of the collector's cost gate. `waits` holds the one
+    // genuine `std::sync::Condvar::wait` call; `only_locks` and `plain_arith`
+    // hold none. `-Zinline-mir=no` keeps the wait a `Call` terminator that the
+    // collector's DefId predicate can see.
+    const PAIRED_CONDVAR_PRESCAN_SOURCE: &str = r#"
+use std::sync::{Condvar, Mutex};
+
+pub struct Gate {
+    m: Mutex<bool>,
+    c: Condvar,
+}
+
+impl Gate {
+    #[inline(never)]
+    pub fn waits(&self) {
+        let mut ready = self.m.lock().unwrap();
+        while !*ready {
+            ready = self.c.wait(ready).unwrap();
+        }
+    }
+
+    #[inline(never)]
+    pub fn only_locks(&self) -> bool {
+        *self.m.lock().unwrap()
+    }
+}
+
+#[inline(never)]
+pub fn plain_arith(x: u32, y: u32) -> u32 {
+    x.wrapping_add(y)
+}
+"#;
+    const PAIRED_CONDVAR_PRESCAN_FIXTURE_PATH: &str = "paired_condvar_prescan.rs";
+
+    struct InMemoryPairedCondvarPrescanFileLoader;
+
+    impl rustc_span::source_map::FileLoader for InMemoryPairedCondvarPrescanFileLoader {
+        fn file_exists(&self, path: &Path) -> bool {
+            path == Path::new(PAIRED_CONDVAR_PRESCAN_FIXTURE_PATH)
+        }
+
+        fn read_file(&self, path: &Path) -> io::Result<String> {
+            if self.file_exists(path) {
+                Ok(PAIRED_CONDVAR_PRESCAN_SOURCE.to_string())
+            } else {
+                Err(io::Error::other("unexpected paired-condvar pre-scan fixture path"))
+            }
+        }
+
+        fn read_binary_file(&self, _path: &Path) -> io::Result<Arc<[u8]>> {
+            Err(io::Error::other("binary reads are not supported in paired-condvar tests"))
+        }
+
+        fn current_directory(&self) -> io::Result<PathBuf> {
+            std::env::current_dir()
+        }
+    }
+
+    /// What the pre-scan, the shared predicate and the full collector answered
+    /// for one fixture body.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct PairedCondvarPrescanVerdict {
+        /// Pre-scan against the certificate whose sweep inventoried every fixture body.
+        prescan_inventoried: bool,
+        /// Pre-scan against a blank certificate (empty inventory).
+        prescan_blank: bool,
+        /// Terminators the shared predicate accepts (inventoried certificate).
+        predicate_hits: usize,
+        /// Terminators an INDEPENDENT spelling of the collector's original
+        /// four-conjunct callee test accepts — the drift guard.
+        direct_hits: usize,
+        /// Rendered def paths of every non-local callee named `wait`: the
+        /// measured spelling, printed when an expectation fails.
+        wait_callee_spellings: Vec<String>,
+        /// Sites the full collector minted against the inventoried certificate.
+        /// Its `pairs` stay empty (the production authority is dark), so the
+        /// collector must answer empty for every body, wait or not.
+        sites_dark: usize,
+    }
+
+    #[derive(Default)]
+    struct PairedCondvarPrescanCallbacks {
+        verdicts: BTreeMap<String, PairedCondvarPrescanVerdict>,
+        inventoried_wait_callees: usize,
+    }
+
+    impl rustc_driver::Callbacks for PairedCondvarPrescanCallbacks {
+        fn config(&mut self, config: &mut Config) {
+            config.file_loader = Some(Box::new(InMemoryPairedCondvarPrescanFileLoader));
+        }
+
+        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+            use rustc_hir::def::DefKind;
+            tcx.sess.dcx().abort_if_errors();
+
+            let mut bodies = Vec::new();
+            for local_def_id in tcx.hir_body_owners() {
+                let def_id = local_def_id.to_def_id();
+                if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
+                    continue;
+                }
+                let name = tcx.opt_item_name(def_id).map(|s| s.to_string()).unwrap_or_default();
+                bodies.push((name, tcx.optimized_mir(def_id)));
+            }
+            // The sweep's OWN inventory routine records the wait callee DefId —
+            // a recognizer independent of the collector's predicate.
+            let blank = crate::empty_paired_condvar_crate_certificate(tcx);
+            let mut inventoried = crate::empty_paired_condvar_crate_certificate(tcx);
+            for (name, body) in &bodies {
+                let function = crate::extract_function_with_contract_bundle(tcx, body, None);
+                assert!(
+                    crate::record_paired_body_inventory(
+                        tcx,
+                        body,
+                        &function,
+                        None,
+                        &mut inventoried
+                    ),
+                    "the sweep must inventory fixture body `{name}`"
+                );
+            }
+            self.inventoried_wait_callees = inventoried._wait_callee_defs.len();
+            let direct_callee = |kind: &mir::TerminatorKind<'tcx>| -> Option<DefId> {
+                let mir::TerminatorKind::Call { func, .. } = kind else { return None };
+                let mir::Operand::Constant(constant) = func else { return None };
+                let rustc_middle::ty::TyKind::FnDef(def_id, _) = constant.const_.ty().kind() else {
+                    return None;
+                };
+                Some(*def_id)
+            };
+            for (name, body) in &bodies {
+                let direct_hits = body
+                    .basic_blocks
+                    .iter()
+                    .filter_map(|bb| direct_callee(&bb.terminator().kind))
+                    .filter(|def_id| {
+                        !def_id.is_local()
+                            && crate::safe_def_path_str(tcx, *def_id) == "std::sync::Condvar::wait"
+                            && inventoried
+                                ._wait_callee_defs
+                                .contains(&crate::paired_def_key(tcx, *def_id))
+                    })
+                    .count();
+                let wait_callee_spellings = body
+                    .basic_blocks
+                    .iter()
+                    .filter_map(|bb| direct_callee(&bb.terminator().kind))
+                    .filter(|def_id| {
+                        !def_id.is_local()
+                            && tcx.opt_item_name(*def_id).is_some_and(|n| n.as_str() == "wait")
+                    })
+                    .map(|def_id| crate::safe_def_path_str(tcx, def_id))
+                    .collect();
+                let predicate_hits = body
+                    .basic_blocks
+                    .iter()
+                    .filter(|bb| {
+                        certified_std_condvar_wait_callee(tcx, &inventoried, &bb.terminator().kind)
+                            .is_some()
+                    })
+                    .count();
+                self.verdicts.insert(
+                    name.clone(),
+                    PairedCondvarPrescanVerdict {
+                        prescan_inventoried: mir_body_calls_certified_std_condvar_wait(
+                            tcx,
+                            body,
+                            &inventoried,
+                        ),
+                        prescan_blank: mir_body_calls_certified_std_condvar_wait(tcx, body, &blank),
+                        predicate_hits,
+                        direct_hits,
+                        wait_callee_spellings,
+                        sites_dark: collect_certified_paired_condvar_wait_calls(
+                            tcx,
+                            body,
+                            &inventoried,
+                        )
+                        .len(),
+                    },
+                );
+            }
+            Compilation::Stop
+        }
+    }
+
+    fn compile_paired_condvar_prescan_fixture() -> PairedCondvarPrescanCallbacks {
+        let mut callbacks = PairedCondvarPrescanCallbacks::default();
+        let mut args = vec![
+            "rustc".to_string(),
+            PAIRED_CONDVAR_PRESCAN_FIXTURE_PATH.to_string(),
+            "--crate-name".to_string(),
+            "trust_mir_extract_paired_condvar_prescan".to_string(),
+            "--crate-type=lib".to_string(),
+            "--edition=2021".to_string(),
+            "-Zmir-opt-level=1".to_string(),
+            // Keep `Condvar::wait` a Call terminator in `waits`: the collector
+            // (and its pre-scan) recognise DIRECT calls by DefId only.
+            "-Zinline-mir=no".to_string(),
+            "-Zno-codegen".to_string(),
+            "-Zcodegen-backend=dummy".to_string(),
+            "-Ztrust-verify=off".to_string(),
+        ];
+        args.push("--sysroot".to_string());
+        args.push(compiler_sysroot());
+        let result =
+            rustc_driver::catch_fatal_errors(|| -> rustc_interface::interface::Result<()> {
+                rustc_driver::run_compiler(&args, &mut callbacks);
+                Ok(())
+            });
+        assert!(result.is_ok(), "failed to compile the paired-condvar pre-scan fixture");
+        callbacks
+    }
+
+    fn paired_condvar_prescan_fixture() -> &'static PairedCondvarPrescanCallbacks {
+        static RESULTS: OnceLock<PairedCondvarPrescanCallbacks> = OnceLock::new();
+        RESULTS.get_or_init(compile_paired_condvar_prescan_fixture)
+    }
+
+    /// The pre-scan agrees with the collector's own callee test on every fixture
+    /// body, answers `false` against an empty inventory, and the collector's
+    /// answer (empty: the authority is dark, `pairs` is empty) is unchanged by
+    /// the reordering — for the body WITH a wait as much as for those without.
+    #[test]
+    fn paired_condvar_prescan_matches_the_collector_predicate_exactly() {
+        let fixture = paired_condvar_prescan_fixture();
+        for name in ["waits", "only_locks", "plain_arith"] {
+            assert!(
+                fixture.verdicts.contains_key(name),
+                "fixture body `{name}` missing: {:?}",
+                fixture.verdicts.keys()
+            );
+        }
+        for (name, verdict) in &fixture.verdicts {
+            assert_eq!(
+                verdict.predicate_hits, verdict.direct_hits,
+                "`{name}`: shared predicate drifted from the collector's original callee test: {verdict:?}"
+            );
+            assert_eq!(
+                verdict.prescan_inventoried,
+                verdict.direct_hits > 0,
+                "`{name}`: pre-scan must answer exactly `some terminator passes the predicate`: {verdict:?}"
+            );
+            assert!(
+                !verdict.prescan_blank,
+                "`{name}`: an empty inventory can license nothing: {verdict:?}"
+            );
+            assert_eq!(
+                verdict.sites_dark, 0,
+                "`{name}`: dark authority mints no site: {verdict:?}"
+            );
+        }
+        let waits = &fixture.verdicts["waits"];
+        let only_locks = &fixture.verdicts["only_locks"];
+        let plain = &fixture.verdicts["plain_arith"];
+        assert_eq!(only_locks.direct_hits, 0, "{only_locks:?}");
+        assert_eq!(plain.direct_hits, 0, "{plain:?}");
+        assert_eq!(
+            waits.wait_callee_spellings.len(),
+            1,
+            "`waits` must call exactly one non-local `wait`: {waits:?}"
+        );
+        // The literal the collector and the sweep compare against. On a std
+        // whose definition path renders differently the lane is dark end to
+        // end — the sweep inventories nothing and the pre-scan answers `false`
+        // — and this pins that the two stay in agreement either way.
+        let spelled_as_collector_expects =
+            waits.wait_callee_spellings[0] == "std::sync::Condvar::wait";
+        assert_eq!(
+            fixture.inventoried_wait_callees,
+            usize::from(spelled_as_collector_expects),
+            "sweep inventory disagrees with the rendered callee spelling: {waits:?}"
+        );
+        assert_eq!(waits.prescan_inventoried, spelled_as_collector_expects, "{waits:?}");
+        assert_eq!(waits.direct_hits, usize::from(spelled_as_collector_expects), "{waits:?}");
+    }
+
+    // ========================================================================
+    // SP-1 (2026-10-04): the keyed-collect / collection-extend / hash-map query
+    // TOTAL sentinel asks about the values std DROPS inside the call it erases.
+    // A real-compiler fixture, checked at `apply_total_clone_sentinel` (the
+    // rewrite's single entry point), so the predicate is pinned without the
+    // verifier. The executable twin is
+    // `tests/ui/trust/keyed_collect_extend_drops_inside_the_call.rs`.
+    // ========================================================================
+
+    const SP1_DROPS_FIXTURE_PATH: &str = "sp1_drops_inside_the_call.rs";
+
+    const SP1_DROPS_SOURCE: &str = r#"
+#![feature(allocator_api)]
+use std::alloc::{AllocError, Allocator, Global, Layout};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher, RandomState};
+use std::ptr::NonNull;
+
+pub struct Bomb(pub u8);
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("bomb")
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct LocalAlloc;
+unsafe impl Allocator for LocalAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        Global.allocate(layout)
+    }
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe { Global.deallocate(ptr, layout) }
+    }
+}
+
+pub type LBox = Box<u32, LocalAlloc>;
+
+/// Derived (builtin, total) `Ord`/`Hash`/`Eq`, and a `Drop` that panics.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DropKey(pub u32);
+impl Drop for DropKey {
+    fn drop(&mut self) {
+        panic!("drop key")
+    }
+}
+
+// The old value / duplicate pair is dropped inside the call.
+pub fn extend_btreemap_bomb(m: &mut BTreeMap<u32, Bomb>, k: u32, b: Bomb) { m.extend([(k, b)]); }
+pub fn extend_hashmap_bomb(m: &mut HashMap<u32, Bomb>, k: u32, b: Bomb) { m.extend([(k, b)]); }
+pub fn collect_btreemap_bomb(a: Bomb, b: Bomb) -> BTreeMap<u32, Bomb> {
+    [(1u32, a), (1u32, b)].into_iter().collect()
+}
+pub fn collect_hashmap_bomb(a: Bomb, b: Bomb) -> HashMap<u32, Bomb> {
+    [(1u32, a), (1u32, b)].into_iter().collect()
+}
+pub fn extend_btreemap_box_value(m: &mut BTreeMap<u32, LBox>, k: u32, b: LBox) {
+    m.extend([(k, b)]);
+}
+// The passed / stored key is dropped inside the call.
+pub fn extend_btreeset_drop_key(s: &mut BTreeSet<DropKey>, k: DropKey) { s.extend([k]); }
+pub fn collect_hashset_drop_key(a: DropKey, b: DropKey) -> HashSet<DropKey> {
+    [a, b].into_iter().collect()
+}
+pub fn insert_hashset_drop_key(s: &mut HashSet<DropKey>, k: DropKey) -> bool { s.insert(k) }
+pub fn remove_hashmap_drop_key(m: &mut HashMap<DropKey, u8>, k: &DropKey) -> Option<u8> {
+    m.remove(k)
+}
+// `String` drops every owned item it appends.
+pub fn extend_string_box_str(s: &mut String, it: std::vec::IntoIter<Box<str, LocalAlloc>>) {
+    s.extend(it);
+}
+
+// Controls: the sentinel still fires (save the three the merged gate withholds; see
+// `sp1_total_sentinel_asks_the_drops_inside_the_call`).
+pub fn extend_btreemap_u8(m: &mut BTreeMap<u32, u8>, k: u32, b: u8) { m.extend([(k, b)]); }
+pub fn extend_hashmap_string(m: &mut HashMap<u32, String>, k: u32, b: String) {
+    m.extend([(k, b)]);
+}
+pub fn collect_btreemap_u8(a: u8, b: u8) -> BTreeMap<u32, u8> {
+    [(1u32, a), (1u32, b)].into_iter().collect()
+}
+pub fn insert_hashset_u32(s: &mut HashSet<u32>, k: u32) -> bool { s.insert(k) }
+pub fn remove_hashmap_u32(m: &mut HashMap<u32, u8>, k: &u32) -> Option<u8> { m.remove(k) }
+// `get` drops nothing, so SP-1's query rule does not ask the key's drop (the merged gate's
+// round-66 conjunct still does: withheld).
+pub fn get_hashmap_drop_key(m: &HashMap<DropKey, u8>, k: &DropKey) -> Option<u8> {
+    m.get(k).copied()
+}
+pub fn extend_string_strings(s: &mut String, it: std::vec::IntoIter<String>) { s.extend(it); }
+pub fn extend_vec_bomb(v: &mut Vec<Bomb>, b: Bomb) { v.extend([b]); }
+
+// SP-1 review (2026-10-05): a `BuildHasherDefault<H>` builds, writes and DROPS an `H`
+// inside every hash, and `Box<H>` forwards `write_*` to `H`, so a hasher type is asked
+// all the way down; a growing hash table frees its old table through `A`.
+#[derive(Default)]
+pub struct DropHasher(u64);
+impl Hasher for DropHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = self.0.wrapping_add(*b as u64);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+impl Drop for DropHasher {
+    fn drop(&mut self) {
+        panic!("drop hasher")
+    }
+}
+pub type DropBuild = BuildHasherDefault<DropHasher>;
+
+pub fn insert_hashmap_drop_hasher(m: &mut HashMap<u32, u8, DropBuild>, k: u32) -> Option<u8> {
+    m.insert(k, 0)
+}
+pub fn get_hashmap_drop_hasher(m: &HashMap<u32, u8, DropBuild>, k: &u32) -> Option<u8> {
+    m.get(k).copied()
+}
+pub fn remove_hashset_drop_hasher(s: &mut HashSet<u32, DropBuild>, k: &u32) -> bool { s.remove(k) }
+pub fn extend_hashmap_drop_hasher(m: &mut HashMap<u32, u8, DropBuild>, k: u32) {
+    m.extend([(k, 0u8)]);
+}
+pub fn collect_hashset_drop_hasher(a: u32, b: u32) -> HashSet<u32, DropBuild> {
+    [a, b].into_iter().collect()
+}
+pub fn hash_u32_box_drop_hasher(x: &u32, s: &mut Box<DropHasher>) { x.hash(s) }
+pub fn insert_hashmap_local_alloc(
+    m: &mut HashMap<u32, u8, RandomState, LocalAlloc>,
+    k: u32,
+) -> Option<u8> {
+    m.insert(k, 0)
+}
+pub fn insert_hashset_local_alloc(s: &mut HashSet<u32, RandomState, LocalAlloc>, k: u32) -> bool {
+    s.insert(k)
+}
+// Controls: std's hashers, all the way down.
+pub fn get_hashmap_default_hasher(
+    m: &HashMap<u32, u8, BuildHasherDefault<DefaultHasher>>,
+    k: &u32,
+) -> Option<u8> {
+    m.get(k).copied()
+}
+pub fn hash_u32_default_hasher(x: &u32, s: &mut DefaultHasher) { x.hash(s) }
+pub fn hash_u32_box_default_hasher(x: &u32, s: &mut Box<DefaultHasher>) { x.hash(s) }
+"#;
+
+    /// Diagnosis for the sentinel tests' `withheld` lists (docs/DECISION_QUEUE.md
+    /// SENTINEL-MERGE-CONJUNCTS-1): every conjunct of the merged keyed-collect,
+    /// collection-extend and hash-query gates that REFUSES this call, named by the line it
+    /// came from (`main:` or `bridge:`, merge `98b7fad77d`). It re-asks the gates' own
+    /// predicates in their order and is printed, never asserted: the gates, not this list,
+    /// decide.
+    fn merged_gate_refusals<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        callee: DefId,
+        gen_args: ty::GenericArgs<'tcx>,
+    ) -> Vec<&'static str> {
+        let mut no = Vec::new();
+        let mut ask = |ok: bool, label: &'static str| {
+            if !ok {
+                no.push(label);
+            }
+        };
+        let name = tcx.item_name(callee);
+        let (dest, src, live) = match name.as_str() {
+            "extend" => (gen_args.types().next(), call_input_ty(tcx, callee, gen_args, 1), true),
+            "collect" => (gen_args.types().nth(1), call_input_ty(tcx, callee, gen_args, 0), false),
+            _ => {
+                // An inherent hash-table query: the key is the impl's first argument.
+                let impl_did = tcx.parent(callee);
+                if !matches!(
+                    tcx.def_kind(impl_did),
+                    rustc_hir::def::DefKind::Impl { of_trait: false }
+                ) {
+                    return no;
+                }
+                let self_ty = tcx.type_of(impl_did).instantiate(tcx, gen_args).skip_normalization();
+                if let ty::Adt(_, args) = self_ty.kind() {
+                    if let Some(key) = args.types().next() {
+                        ask(tcx_drop_is_total(tcx, key), "bridge: r66 key drop (every method)");
+                    }
+                }
+                return no;
+            }
+        };
+        let (Some(dest), Some(src)) = (dest, src) else { return vec!["(no dest/source)"] };
+        let ty::Adt(def, args) = dest.kind() else { return vec!["(dest not an ADT)"] };
+        let adt = tcx.item_name(def.did());
+        ask(ty_sysroot_allocators_are_global(tcx, dest, 8), "bridge: r61 dest allocators");
+        ask(tcx_drop_is_total(tcx, dest), "bridge: r62 dest drop");
+        ask(ty_sysroot_allocators_are_global(tcx, src, 8), "bridge: r61 source allocators");
+        ask(tcx_drop_is_total(tcx, src), "bridge: r62 source drop");
+        ask(source_chain_per_item_is_total(tcx, src, 8), "bridge: r63 per-item");
+        ask(
+            audited_container_allocators_are_sysroot(tcx, def.did(), *args),
+            "main: SP-2 allocators",
+        );
+        let reserves =
+            !live || matches!(adt.as_str(), "Vec" | "VecDeque" | "String" | "HashMap" | "HashSet");
+        if reserves {
+            ask(
+                into_iter_source_live_count(tcx, src, 8)
+                    .is_some_and(|count| bounded_source_fits_destination(tcx, dest, count, live)),
+                "main: W4 live-count fit",
+            );
+            ask(
+                bounded_source_reservation_fits_for(tcx, src, dest, live),
+                "bridge: D12 reservation fit",
+            );
+        }
+        if live {
+            ask(into_iter_source_next_cannot_panic(tcx, src, 8), "main: next cannot panic");
+        }
+        ask(into_iter_source_runs_only_verified_code(tcx, src, 8), "main: SP-2 verified code");
+        ask(source_side_drops_are_total(tcx, src, 8), "main: source-side drops");
+        if matches!(adt.as_str(), "BTreeMap" | "BTreeSet" | "HashMap" | "HashSet") {
+            ask(
+                keyed_collection_drops_are_total(tcx, adt.as_str(), *args),
+                "main: SP-1 keyed drops",
+            );
+        }
+        if matches!(adt.as_str(), "HashMap" | "HashSet") {
+            let hasher =
+                if adt.as_str() == "HashMap" { args.types().nth(2) } else { args.types().nth(1) };
+            if let Some(hasher) = hasher {
+                ask(hasher_ty_is_sysroot_throughout(tcx, hasher), "main: hasher sysroot");
+                ask(hasher_ty_is_std_closed(tcx, hasher), "bridge: hasher std-closed");
+            }
+        }
+        no
+    }
+
+    struct InMemorySp1DropsFileLoader;
+
+    impl rustc_span::source_map::FileLoader for InMemorySp1DropsFileLoader {
+        fn file_exists(&self, path: &Path) -> bool {
+            path == Path::new(SP1_DROPS_FIXTURE_PATH)
+        }
+
+        fn read_file(&self, path: &Path) -> io::Result<String> {
+            if self.file_exists(path) {
+                Ok(SP1_DROPS_SOURCE.to_string())
+            } else {
+                Err(io::Error::other("unexpected SP-1 fixture path"))
+            }
+        }
+
+        fn read_binary_file(&self, _path: &Path) -> io::Result<Arc<[u8]>> {
+            Err(io::Error::other("binary reads are not supported in SP-1 tests"))
+        }
+
+        fn current_directory(&self) -> io::Result<PathBuf> {
+            std::env::current_dir()
+        }
+    }
+
+    /// Per fixture function, its callees named `extend`/`collect`/`insert`/`remove`/
+    /// `get`/`hash`: those `apply_total_clone_sentinel` (for `hash`,
+    /// `apply_total_primitive_hash_sentinel`) rewrote to the sentinel, and those it kept.
+    #[derive(Default)]
+    struct Sp1DropsCallbacks {
+        sentineled: BTreeMap<String, Vec<String>>,
+        kept: BTreeMap<String, Vec<String>>,
+        /// Per function, [`merged_gate_refusals`] of each kept call.
+        refusals: BTreeMap<String, Vec<Vec<&'static str>>>,
+    }
+
+    impl rustc_driver::Callbacks for Sp1DropsCallbacks {
+        fn config(&mut self, config: &mut Config) {
+            config.file_loader = Some(Box::new(InMemorySp1DropsFileLoader));
+        }
+
+        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+            use rustc_hir::def::DefKind;
+            tcx.sess.dcx().abort_if_errors();
+            for local_def_id in tcx.hir_body_owners() {
+                let def_id = local_def_id.to_def_id();
+                if !matches!(tcx.def_kind(def_id), DefKind::Fn) {
+                    continue;
+                }
+                let name = tcx.item_name(def_id).to_string();
+                let body = tcx.optimized_mir(def_id);
+                let (mut sentineled, mut kept) = (Vec::new(), Vec::new());
+                let mut refusals = Vec::new();
+                for bb in body.basic_blocks.iter() {
+                    let mir::TerminatorKind::Call { func, .. } = &bb.terminator().kind else {
+                        continue;
+                    };
+                    let Some((callee, gen_args)) = func.const_fn_def() else { continue };
+                    let callee_name = tcx.item_name(callee);
+                    if !matches!(
+                        callee_name.as_str(),
+                        "extend" | "collect" | "insert" | "remove" | "get" | "hash"
+                    ) {
+                        continue;
+                    }
+                    if callee_name.as_str() != "hash" {
+                        refusals.push(merged_gate_refusals(tcx, callee, gen_args));
+                    }
+                    let rendered = crate::safe_def_path_str(tcx, callee);
+                    let semantic_path = call_path_without_trailing_turbofish(&rendered);
+                    // `<u32 as Hash>::hash::<H>` has its own entry point (SP-1 review).
+                    let is_sentineled = if callee_name.as_str() == "hash" {
+                        apply_total_primitive_hash_sentinel(tcx, func, semantic_path)
+                    } else {
+                        apply_total_clone_sentinel(tcx, func, &rendered, semantic_path)
+                    };
+                    if is_sentineled {
+                        sentineled.push(rendered);
+                    } else {
+                        kept.push(rendered);
+                    }
+                }
+                self.sentineled.insert(name.clone(), sentineled);
+                self.refusals.insert(name.clone(), refusals);
+                self.kept.insert(name, kept);
+            }
+            Compilation::Stop
+        }
+    }
+
+    fn sp1_drops_fixture() -> &'static Sp1DropsCallbacks {
+        static RESULTS: OnceLock<Sp1DropsCallbacks> = OnceLock::new();
+        RESULTS.get_or_init(|| {
+            let mut callbacks = Sp1DropsCallbacks::default();
+            let args = vec![
+                "rustc".to_string(),
+                SP1_DROPS_FIXTURE_PATH.to_string(),
+                "--crate-name".to_string(),
+                "trust_mir_extract_sp1_drops".to_string(),
+                "--crate-type=lib".to_string(),
+                "--edition=2021".to_string(),
+                "-Zmir-opt-level=1".to_string(),
+                // Keep each std call a Call terminator: the sentinel rewrites calls.
+                "-Zinline-mir=no".to_string(),
+                "-Zno-codegen".to_string(),
+                "-Zcodegen-backend=dummy".to_string(),
+                "-Ztrust-verify=off".to_string(),
+                "--sysroot".to_string(),
+                compiler_sysroot(),
+            ];
+            let result =
+                rustc_driver::catch_fatal_errors(|| -> rustc_interface::interface::Result<()> {
+                    rustc_driver::run_compiler(&args, &mut callbacks);
+                    Ok(())
+                });
+            assert!(result.is_ok(), "failed to compile the SP-1 drops fixture");
+            callbacks
+        })
+    }
+
+    /// SP-1: a keyed `extend`/`collect` whose key or value drop is not total, a hash
+    /// `insert`/`remove` whose key drop is not total, and a `String` `extend` whose
+    /// item drop is not total keep their real callee; the controls (total drops) are still
+    /// rewritten. Three shapes SP-1's own rules credit — `get`, which drops nothing,
+    /// `Vec::extend`, which drops no item, and a `HashMap<u32, String>` extend — are
+    /// withheld by the gates as merged (`withheld` below). `DropKey` stands for any key
+    /// whose derived comparisons pass the key gate while its drop runs code: a local
+    /// `Drop` is also verified as its own root, but the gate does not argue that (the
+    /// cost, DECISION_QUEUE SP-1-DROPS).
+    ///
+    /// SP-1 review (2026-10-05): every hash arm also asks the WHOLE hasher type
+    /// (`BuildHasherDefault<DropHasher>` builds and drops a `DropHasher` in every hash,
+    /// and `Box<DropHasher>` forwards `write_*` to it), and the hash query arm asks the
+    /// allocator (`insert` grows the table through it); std's hashers all the way
+    /// down (`BuildHasherDefault<DefaultHasher>`, `DefaultHasher`, `Box<DefaultHasher>`)
+    /// are still rewritten.
+    #[test]
+    fn sp1_total_sentinel_asks_the_drops_inside_the_call() {
+        let fixture = sp1_drops_fixture();
+        let refused = [
+            "extend_btreemap_bomb",
+            "extend_hashmap_bomb",
+            "collect_btreemap_bomb",
+            "collect_hashmap_bomb",
+            "extend_btreemap_box_value",
+            "extend_btreeset_drop_key",
+            "collect_hashset_drop_key",
+            "insert_hashset_drop_key",
+            "remove_hashmap_drop_key",
+            "extend_string_box_str",
+            "insert_hashmap_drop_hasher",
+            "get_hashmap_drop_hasher",
+            "remove_hashset_drop_hasher",
+            "extend_hashmap_drop_hasher",
+            "collect_hashset_drop_hasher",
+            "hash_u32_box_drop_hasher",
+            "insert_hashmap_local_alloc",
+            "insert_hashset_local_alloc",
+        ];
+        let credited = [
+            "extend_btreemap_u8",
+            "collect_btreemap_u8",
+            "insert_hashset_u32",
+            "remove_hashmap_u32",
+            "extend_string_strings",
+            "get_hashmap_default_hasher",
+            "hash_u32_default_hasher",
+            "hash_u32_box_default_hasher",
+        ];
+        // SP-1's own rules credit these three; the gates as merged by `98b7fad77d` refuse
+        // them, and the test pins the merged answer (docs/DECISION_QUEUE.md
+        // SENTINEL-MERGE-CONJUNCTS-1). That merge made each collect/extend/query gate admit
+        // only what BOTH lines admit, and the bridge line's review rounds (`040d3bce87`, D12)
+        // ask more: `extend_vec_bomb` fails its round-62 drop totality of the RECEIVER
+        // (`Vec<Bomb>`), `extend_hashmap_string` its D12 rule that an `extend` into a live hash
+        // table is never granted, and `get_hashmap_drop_key` its round-66 key drop totality,
+        // asked of every query method. Each is a refusal (the call keeps its real callee and
+        // is charged), never a false credit; restoring the credit is a gate change for review.
+        let withheld = ["extend_vec_bomb", "extend_hashmap_string", "get_hashmap_drop_key"];
+        for name in withheld {
+            println!("withheld `{name}`: refused by {:?}", fixture.refusals[name]);
+        }
+        // Every mismatch is collected before failing, so one run names every shape
+        // whose verdict moved.
+        let mut wrong = Vec::new();
+        for name in refused.into_iter().chain(withheld) {
+            let sentineled = &fixture.sentineled[name];
+            let kept = &fixture.kept[name];
+            if !(sentineled.is_empty() && kept.len() == 1) {
+                wrong.push(format!(
+                    "`{name}`: must keep its real callee (sentineled {sentineled:?}, kept {kept:?})"
+                ));
+            }
+        }
+        for name in credited {
+            let sentineled = &fixture.sentineled[name];
+            let kept = &fixture.kept[name];
+            if !(sentineled.len() == 1 && kept.is_empty()) {
+                wrong.push(format!(
+                    "`{name}`: must stay rewritten (sentineled {sentineled:?}, kept {kept:?})"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{} SP-1 verdict(s) wrong:\n{}", wrong.len(), wrong.join("\n"));
+    }
+
+    // ========================================================================
+    // SOURCE-SIDE-DROP-CERTIFY-1 (2026-10-13): the keyed-collect / collection-extend
+    // TOTAL sentinel asks what the call DROPS on its SOURCE side. One real-compiler
+    // fixture, read two ways: at `apply_total_clone_sentinel` (the `extend_*` and
+    // `collect_*` functions: both gates ask the predicate), and on
+    // `source_side_drops_are_total` itself, over the first argument's type of each
+    // `p_*` function (the closed list, unlisted shapes included). The executable twins
+    // are `tests/ui/trust/collect_extend_source_side_drops.rs` and its `_run` file.
+    // ========================================================================
+
+    const SRC_DROPS_FIXTURE_PATH: &str = "source_side_drops.rs";
+
+    const SRC_DROPS_SOURCE: &str = r#"
+#![allow(unused_imports, dead_code)]
+use std::collections::{btree_map, hash_map, BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{LinkedList, VecDeque};
+use std::hash::{BuildHasher, DefaultHasher};
+use std::iter::{Chain, Cycle, Enumerate, Filter, Fuse, Map, Peekable, RepeatWith, Rev};
+use std::iter::{Repeat, Scan, Skip, StepBy, Take, Zip};
+use std::ops::Range;
+use std::vec::IntoIter;
+
+pub struct Bomb(pub u8);
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        if self.0 == 7 {
+            panic!("item drop bomb")
+        }
+    }
+}
+pub struct ErrBomb(pub u8);
+impl Drop for ErrBomb {
+    fn drop(&mut self) {
+        if self.0 == 7 {
+            panic!("err drop bomb")
+        }
+    }
+}
+#[derive(Default)]
+pub struct DropBuild(pub u8);
+impl Drop for DropBuild {
+    fn drop(&mut self) {
+        if self.0 == 7 {
+            panic!("hasher drop bomb")
+        }
+    }
+}
+impl BuildHasher for DropBuild {
+    type Hasher = DefaultHasher;
+    fn build_hasher(&self) -> DefaultHasher {
+        DefaultHasher::new()
+    }
+}
+/// A local iterator: outside the closed list.
+pub struct Countdown(pub u32);
+impl Iterator for Countdown {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        self.0 = self.0.checked_sub(1)?;
+        Some(self.0)
+    }
+}
+
+// ---- the sentinel: refused ----
+// (a) a by-value hash source drops its hasher.
+pub fn extend_hashmap_drop_build(v: &mut Vec<(u32, u8)>, m: HashMap<u32, u8, DropBuild>) {
+    v.extend(m)
+}
+pub fn extend_hashset_drop_build(v: &mut Vec<u32>, s: HashSet<u32, DropBuild>) { v.extend(s) }
+// (b) a by-value `Result` drops its `Err`.
+pub fn extend_result_err_bomb(v: &mut Vec<u32>, r: Result<u32, ErrBomb>) { v.extend(r) }
+// (c) discards, with no borrow carve-out.
+pub fn extend_skip_bomb(v: &mut Vec<Bomb>, src: Vec<Bomb>) { v.extend(src.into_iter().skip(1)) }
+pub fn extend_filter_bomb(v: &mut Vec<Bomb>, src: Vec<Bomb>) {
+    v.extend(src.into_iter().filter(|b| b.0 != 7))
+}
+pub fn extend_skip_ref_bomb(v: &mut Vec<Bomb>, it: &mut Skip<IntoIter<Bomb>>) { v.extend(it) }
+pub fn extend_stepby_ref_bomb(v: &mut Vec<Bomb>, it: &mut StepBy<IntoIter<Bomb>>) { v.extend(it) }
+pub fn extend_into_keys_bomb(v: &mut Vec<u32>, it: btree_map::IntoKeys<u32, Bomb>) { v.extend(it) }
+// (d) remainders, captures and states.
+pub fn extend_take_bomb(v: &mut Vec<Bomb>, src: Vec<Bomb>) { v.extend(src.into_iter().take(1)) }
+pub fn extend_zip_bomb(v: &mut Vec<(Bomb, u32)>, it: Zip<IntoIter<Bomb>, Range<u32>>) {
+    v.extend(it)
+}
+pub fn extend_chain_ref_take_bomb(
+    v: &mut Vec<Bomb>,
+    it: &mut Chain<Take<IntoIter<Bomb>>, IntoIter<Bomb>>,
+) {
+    v.extend(it)
+}
+pub fn extend_take_peekable_bomb(v: &mut Vec<Bomb>, it: Take<Peekable<IntoIter<Bomb>>>) {
+    v.extend(it)
+}
+pub fn extend_map_capture_bomb(v: &mut Vec<u32>, w: &[u32], cap: Bomb) {
+    v.extend(w.iter().map(move |x| {
+        let _c = &cap;
+        *x
+    }))
+}
+pub fn extend_scan_state_bomb(v: &mut Vec<u32>, it: IntoIter<u32>, st: Bomb) {
+    v.extend(it.scan(st, |_, x| Some(x)))
+}
+// The other receivers ask it too.
+pub fn extend_vecdeque_take_bomb(v: &mut VecDeque<Bomb>, src: Vec<Bomb>) {
+    v.extend(src.into_iter().take(1))
+}
+pub fn extend_hashset_into_keys_bomb(s: &mut HashSet<u32>, it: btree_map::IntoKeys<u32, Bomb>) {
+    s.extend(it)
+}
+pub fn extend_btreeset_into_keys_bomb(s: &mut BTreeSet<u32>, it: btree_map::IntoKeys<u32, Bomb>) {
+    s.extend(it)
+}
+// The keyed collect asks it.
+pub fn collect_into_keys_bomb(it: btree_map::IntoKeys<u32, Bomb>) -> HashSet<u32> { it.collect() }
+pub fn collect_filter_capture_bomb(it: IntoIter<(u32, u8)>, cap: Bomb) -> HashMap<u32, u8> {
+    it.filter(move |p| {
+        let _c = &cap;
+        p.0 != 7
+    })
+    .collect()
+}
+
+// ---- the sentinel: still rewritten (on main's rules; the merged gates withhold some of
+// these, the test's `withheld` list) ----
+pub fn extend_hashmap_random_state(v: &mut Vec<(u32, u8)>, m: HashMap<u32, u8>) { v.extend(m) }
+pub fn extend_hashmap_drop_build_ref<'a>(
+    v: &mut Vec<(&'a u32, &'a u8)>,
+    m: &'a HashMap<u32, u8, DropBuild>,
+) {
+    v.extend(m)
+}
+pub fn extend_result_u32(v: &mut Vec<u32>, r: Result<u32, u32>) { v.extend(r) }
+pub fn extend_result_string(v: &mut Vec<u32>, r: Result<u32, String>) { v.extend(r) }
+pub fn extend_skip_u32(v: &mut Vec<u32>, src: Vec<u32>) { v.extend(src.into_iter().skip(1)) }
+pub fn extend_skip_ref_u32(v: &mut Vec<u32>, it: &mut Skip<IntoIter<u32>>) { v.extend(it) }
+pub fn extend_skip_slice_bomb<'a>(v: &mut Vec<&'a Bomb>, w: &'a [Bomb]) {
+    v.extend(w.iter().skip(1))
+}
+pub fn extend_into_keys_u8(v: &mut Vec<u32>, it: btree_map::IntoKeys<u32, u8>) { v.extend(it) }
+pub fn extend_take_u32(v: &mut Vec<u32>, src: Vec<u32>) { v.extend(src.into_iter().take(1)) }
+pub fn extend_scan_state_u32(v: &mut Vec<u32>, it: IntoIter<u32>) {
+    v.extend(it.scan(0u32, |s, x| {
+        *s = x;
+        Some(x)
+    }))
+}
+pub fn extend_map_capture_string(v: &mut Vec<u32>, w: &[u32], cap: String) {
+    v.extend(w.iter().map(move |x| if cap.is_empty() { *x } else { 0 }))
+}
+pub fn collect_filter_u32(it: IntoIter<(u32, u8)>) -> HashMap<u32, u8> {
+    it.filter(|p| p.0 != 7).collect()
+}
+// (e) drained to the end by value: nothing of the source is left to drop.
+pub fn extend_vec_bomb(v: &mut Vec<Bomb>, src: Vec<Bomb>) { v.extend(src) }
+pub fn extend_vecdeque_bomb(v: &mut Vec<Bomb>, src: VecDeque<Bomb>) { v.extend(src) }
+pub fn extend_option_bomb(v: &mut Vec<Bomb>, o: Option<Bomb>) { v.extend(o) }
+pub fn extend_array_bomb(v: &mut Vec<Bomb>, a: [Bomb; 2]) { v.extend(a) }
+pub fn extend_btreemap_bomb(v: &mut Vec<(u32, Bomb)>, m: BTreeMap<u32, Bomb>) { v.extend(m) }
+pub fn extend_list_bomb(v: &mut Vec<Bomb>, l: LinkedList<Bomb>) { v.extend(l) }
+pub fn extend_chain_bomb(v: &mut Vec<Bomb>, it: Chain<IntoIter<Bomb>, IntoIter<Bomb>>) {
+    v.extend(it)
+}
+pub fn extend_rev_fuse_peekable_bomb(v: &mut Vec<Bomb>, it: Peekable<Fuse<Rev<IntoIter<Bomb>>>>) {
+    v.extend(it)
+}
+pub fn extend_enumerate_bomb(v: &mut Vec<(usize, Bomb)>, it: Enumerate<IntoIter<Bomb>>) {
+    v.extend(it)
+}
+
+// ---- the predicate itself, on the first argument's type ----
+pub type SliceIter = std::slice::Iter<'static, u8>;
+// true
+pub fn p_vec_bomb(_: Vec<Bomb>) {}
+pub fn p_vecdeque_bomb(_: VecDeque<Bomb>) {}
+pub fn p_option_bomb(_: Option<Bomb>) {}
+pub fn p_array_bomb(_: [Bomb; 2]) {}
+pub fn p_btreemap_bomb(_: BTreeMap<u32, Bomb>) {}
+pub fn p_list_bomb(_: LinkedList<Bomb>) {}
+pub fn p_into_iter_bomb(_: IntoIter<Bomb>) {}
+pub fn p_chain_bomb(_: Chain<IntoIter<Bomb>, IntoIter<Bomb>>) {}
+pub fn p_enumerate_peekable_fuse_rev_bomb(_: Enumerate<Peekable<Fuse<Rev<IntoIter<Bomb>>>>>) {}
+pub fn p_hashmap_random_state_bomb(_: HashMap<u32, Bomb>) {}
+pub fn p_hashmap_drop_build_ref(_: &'static HashMap<u32, u8, DropBuild>) {}
+pub fn p_vec_bomb_ref(_: &'static mut Vec<Bomb>) {}
+pub fn p_result_string(_: Result<u32, String>) {}
+pub fn p_skip_u32(_: Skip<IntoIter<u32>>) {}
+pub fn p_skip_ref_u32(_: &'static mut Skip<IntoIter<u32>>) {}
+pub fn p_skip_slice_bomb(_: Skip<std::slice::Iter<'static, Bomb>>) {}
+pub fn p_into_keys_u8(_: btree_map::IntoKeys<u32, u8>) {}
+pub fn p_take_u32(_: Take<IntoIter<u32>>) {}
+pub fn p_zip_u32(_: Zip<IntoIter<u32>, Range<u32>>) {}
+pub fn p_take_repeat_u64(_: Take<Repeat<u64>>) {}
+pub fn p_scan_fn_u32(_: Scan<IntoIter<u32>, u32, fn(&mut u32, u32) -> Option<u32>>) {}
+pub fn p_map_fn_bomb(_: Map<IntoIter<Bomb>, fn(Bomb) -> u32>) {}
+// false
+pub fn p_hashmap_drop_build(_: HashMap<u32, u8, DropBuild>) {}
+pub fn p_hashset_drop_build(_: HashSet<u32, DropBuild>) {}
+pub fn p_result_err_bomb(_: Result<u32, ErrBomb>) {}
+pub fn p_skip_bomb(_: Skip<IntoIter<Bomb>>) {}
+pub fn p_filter_bomb(_: Filter<IntoIter<Bomb>, fn(&Bomb) -> bool>) {}
+pub fn p_skip_ref_bomb(_: &'static mut Skip<IntoIter<Bomb>>) {}
+pub fn p_stepby_ref_bomb(_: &'static mut StepBy<IntoIter<Bomb>>) {}
+pub fn p_into_keys_bomb(_: btree_map::IntoKeys<u32, Bomb>) {}
+pub fn p_into_values_bomb(_: hash_map::IntoValues<Bomb, u32>) {}
+pub fn p_skip_map_output_bomb(_: Skip<Map<SliceIter, fn(&u8) -> Bomb>>) {}
+pub fn p_take_bomb(_: Take<IntoIter<Bomb>>) {}
+pub fn p_ref_take_bomb(_: &'static mut Take<IntoIter<Bomb>>) {}
+pub fn p_zip_bomb(_: Zip<IntoIter<Bomb>, Range<u32>>) {}
+pub fn p_zip_second_bomb(_: Zip<Range<u32>, IntoIter<Bomb>>) {}
+pub fn p_chain_ref_take_bomb(_: &'static mut Chain<Take<IntoIter<Bomb>>, IntoIter<Bomb>>) {}
+pub fn p_take_peekable_bomb(_: Take<Peekable<IntoIter<Bomb>>>) {}
+pub fn p_scan_state_bomb(_: Scan<IntoIter<u32>, Bomb, fn(&mut Bomb, u32) -> Option<u32>>) {}
+// (f) unlisted
+pub fn p_countdown(_: Countdown) {}
+pub fn p_countdown_ref(_: &'static mut Countdown) {}
+pub fn p_repeat_with(_: RepeatWith<fn() -> u32>) {}
+pub fn p_box_dyn(_: Box<dyn Iterator<Item = u32>>) {}
+pub fn p_cycle(_: Cycle<Range<u32>>) {}
+"#;
+
+    struct InMemorySrcDropsFileLoader;
+
+    impl rustc_span::source_map::FileLoader for InMemorySrcDropsFileLoader {
+        fn file_exists(&self, path: &Path) -> bool {
+            path == Path::new(SRC_DROPS_FIXTURE_PATH)
+        }
+
+        fn read_file(&self, path: &Path) -> io::Result<String> {
+            if self.file_exists(path) {
+                Ok(SRC_DROPS_SOURCE.to_string())
+            } else {
+                Err(io::Error::other("unexpected source-side-drops fixture path"))
+            }
+        }
+
+        fn read_binary_file(&self, _path: &Path) -> io::Result<Arc<[u8]>> {
+            Err(io::Error::other("binary reads are not supported in source-side-drops tests"))
+        }
+
+        fn current_directory(&self) -> io::Result<PathBuf> {
+            std::env::current_dir()
+        }
+    }
+
+    /// Per `extend_*`/`collect_*` function, its `extend`/`collect` callees the sentinel
+    /// rewrote and those it kept; per `p_*` function, the predicate's answer on its
+    /// first argument's type.
+    #[derive(Default)]
+    struct SrcDropsCallbacks {
+        sentineled: BTreeMap<String, Vec<String>>,
+        kept: BTreeMap<String, Vec<String>>,
+        predicate: BTreeMap<String, bool>,
+        /// Per function, [`merged_gate_refusals`] of each `extend`/`collect` call.
+        refusals: BTreeMap<String, Vec<Vec<&'static str>>>,
+    }
+
+    impl rustc_driver::Callbacks for SrcDropsCallbacks {
+        fn config(&mut self, config: &mut Config) {
+            config.file_loader = Some(Box::new(InMemorySrcDropsFileLoader));
+        }
+
+        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+            use rustc_hir::def::DefKind;
+            tcx.sess.dcx().abort_if_errors();
+            for local_def_id in tcx.hir_body_owners() {
+                let def_id = local_def_id.to_def_id();
+                if !matches!(tcx.def_kind(def_id), DefKind::Fn) {
+                    continue;
+                }
+                let name = tcx.item_name(def_id).to_string();
+                let body = tcx.optimized_mir(def_id);
+                if name.starts_with("p_") {
+                    let Some(arg) = body.args_iter().next() else { continue };
+                    let ty = body.local_decls[arg].ty;
+                    self.predicate.insert(name, source_side_drops_are_total(tcx, ty, 8));
+                    continue;
+                }
+                let (mut sentineled, mut kept) = (Vec::new(), Vec::new());
+                let mut refusals = Vec::new();
+                for bb in body.basic_blocks.iter() {
+                    let mir::TerminatorKind::Call { func, .. } = &bb.terminator().kind else {
+                        continue;
+                    };
+                    let Some((callee, gen_args)) = func.const_fn_def() else { continue };
+                    if !matches!(tcx.item_name(callee).as_str(), "extend" | "collect") {
+                        continue;
+                    }
+                    refusals.push(merged_gate_refusals(tcx, callee, gen_args));
+                    let rendered = crate::safe_def_path_str(tcx, callee);
+                    let semantic_path = call_path_without_trailing_turbofish(&rendered);
+                    if apply_total_clone_sentinel(tcx, func, &rendered, semantic_path) {
+                        sentineled.push(rendered);
+                    } else {
+                        kept.push(rendered);
+                    }
+                }
+                self.sentineled.insert(name.clone(), sentineled);
+                self.refusals.insert(name.clone(), refusals);
+                self.kept.insert(name, kept);
+            }
+            Compilation::Stop
+        }
+    }
+
+    fn src_drops_fixture() -> &'static SrcDropsCallbacks {
+        static RESULTS: OnceLock<SrcDropsCallbacks> = OnceLock::new();
+        RESULTS.get_or_init(|| {
+            let mut callbacks = SrcDropsCallbacks::default();
+            let args = vec![
+                "rustc".to_string(),
+                SRC_DROPS_FIXTURE_PATH.to_string(),
+                "--crate-name".to_string(),
+                "trust_mir_extract_source_side_drops".to_string(),
+                "--crate-type=lib".to_string(),
+                "--edition=2021".to_string(),
+                "-Zmir-opt-level=1".to_string(),
+                // Keep each std call a Call terminator: the sentinel rewrites calls.
+                "-Zinline-mir=no".to_string(),
+                "-Zno-codegen".to_string(),
+                "-Zcodegen-backend=dummy".to_string(),
+                "-Ztrust-verify=off".to_string(),
+                "--sysroot".to_string(),
+                compiler_sysroot(),
+            ];
+            let result =
+                rustc_driver::catch_fatal_errors(|| -> rustc_interface::interface::Result<()> {
+                    rustc_driver::run_compiler(&args, &mut callbacks);
+                    Ok(())
+                });
+            assert!(result.is_ok(), "failed to compile the source-side-drops fixture");
+            callbacks
+        })
+    }
+
+    /// SOURCE-SIDE-DROP-CERTIFY-1, rules (a)-(f) of `source_side_drops_are_total`,
+    /// each with arms that must answer `true` and arms that must answer `false`:
+    /// (a) a by-value hash source's hasher; (b) a by-value `Result`'s `Err`; (c) what
+    /// a discarding adapter or `IntoKeys` drops, through `&mut` too; (d) a remainder,
+    /// a by-move capture, a `Scan` state; (e) a by-value source drained to the end,
+    /// which drops nothing however its elements drop; (f) an unlisted shape. The
+    /// sentinel half pins that the `Vec`, `VecDeque`, `HashSet` and `BTreeSet`
+    /// `extend` arms and the keyed `collect` all ask it.
+    #[test]
+    fn source_side_drops_sentinel_asks_what_the_source_drops() {
+        let fixture = src_drops_fixture();
+        let refused = [
+            "extend_hashmap_drop_build",
+            "extend_hashset_drop_build",
+            "extend_result_err_bomb",
+            "extend_skip_bomb",
+            "extend_filter_bomb",
+            "extend_skip_ref_bomb",
+            "extend_stepby_ref_bomb",
+            "extend_into_keys_bomb",
+            "extend_take_bomb",
+            "extend_zip_bomb",
+            "extend_chain_ref_take_bomb",
+            "extend_take_peekable_bomb",
+            "extend_map_capture_bomb",
+            "extend_scan_state_bomb",
+            "extend_vecdeque_take_bomb",
+            "extend_hashset_into_keys_bomb",
+            "extend_btreeset_into_keys_bomb",
+            "collect_into_keys_bomb",
+            "collect_filter_capture_bomb",
+        ];
+        let credited = [
+            "extend_result_u32",
+            "extend_result_string",
+            "extend_skip_u32",
+            "extend_skip_ref_u32",
+            "extend_take_u32",
+            "extend_scan_state_u32",
+            "extend_map_capture_string",
+        ];
+        // `source_side_drops_are_total` answers `true` for every one of these (the `p_*`
+        // half below pins rule (e) on the predicate itself), and main's gates credited them;
+        // the gates as merged by `98b7fad77d` refuse them, and the test pins the merged
+        // answer (docs/DECISION_QUEUE.md SENTINEL-MERGE-CONJUNCTS-1). That merge made each
+        // gate admit only what BOTH lines admit, and the bridge line's review rounds
+        // (`040d3bce87`) ask more. Rule (e)'s drained sources of `Bomb` fail its round-62
+        // drop totality of the receiver (`Vec<Bomb>`, `Vec<(u32, Bomb)>`, ...) and of the
+        // source; the others fail its D12 reservation fit (a hash-table source, a slice of
+        // one-byte `Bomb` into eight-byte references, an `IntoKeys` it has no item bound
+        // for, a collect into a hash table). Each is a refusal, never a false credit;
+        // restoring a credit is a gate change for review.
+        let withheld = [
+            "extend_hashmap_random_state",
+            "extend_hashmap_drop_build_ref",
+            "extend_skip_slice_bomb",
+            "extend_into_keys_u8",
+            "collect_filter_u32",
+            "extend_vec_bomb",
+            "extend_vecdeque_bomb",
+            "extend_option_bomb",
+            "extend_array_bomb",
+            "extend_btreemap_bomb",
+            "extend_list_bomb",
+            "extend_chain_bomb",
+            "extend_rev_fuse_peekable_bomb",
+            "extend_enumerate_bomb",
+        ];
+        let predicate_true = [
+            "p_vec_bomb",
+            "p_vecdeque_bomb",
+            "p_option_bomb",
+            "p_array_bomb",
+            "p_btreemap_bomb",
+            "p_list_bomb",
+            "p_into_iter_bomb",
+            "p_chain_bomb",
+            "p_enumerate_peekable_fuse_rev_bomb",
+            "p_hashmap_random_state_bomb",
+            "p_hashmap_drop_build_ref",
+            "p_vec_bomb_ref",
+            "p_result_string",
+            "p_skip_u32",
+            "p_skip_ref_u32",
+            "p_skip_slice_bomb",
+            "p_into_keys_u8",
+            "p_take_u32",
+            "p_zip_u32",
+            "p_take_repeat_u64",
+            "p_scan_fn_u32",
+            "p_map_fn_bomb",
+        ];
+        let predicate_false = [
+            "p_hashmap_drop_build",
+            "p_hashset_drop_build",
+            "p_result_err_bomb",
+            "p_skip_bomb",
+            "p_filter_bomb",
+            "p_skip_ref_bomb",
+            "p_stepby_ref_bomb",
+            "p_into_keys_bomb",
+            "p_into_values_bomb",
+            "p_skip_map_output_bomb",
+            "p_take_bomb",
+            "p_ref_take_bomb",
+            "p_zip_bomb",
+            "p_zip_second_bomb",
+            "p_chain_ref_take_bomb",
+            "p_take_peekable_bomb",
+            "p_scan_state_bomb",
+            "p_countdown",
+            "p_countdown_ref",
+            "p_repeat_with",
+            "p_box_dyn",
+            "p_cycle",
+        ];
+        for name in withheld {
+            println!("withheld `{name}`: refused by {:?}", fixture.refusals[name]);
+        }
+        // Every mismatch is collected before failing, so one run names every shape
+        // whose verdict moved.
+        let mut wrong = Vec::new();
+        for name in refused.into_iter().chain(withheld) {
+            let (sentineled, kept) = (&fixture.sentineled[name], &fixture.kept[name]);
+            if !(sentineled.is_empty() && kept.len() == 1) {
+                wrong.push(format!(
+                    "`{name}`: must keep its real callee (sentineled {sentineled:?}, kept {kept:?})"
+                ));
+            }
+        }
+        for name in credited {
+            let (sentineled, kept) = (&fixture.sentineled[name], &fixture.kept[name]);
+            if !(sentineled.len() == 1 && kept.is_empty()) {
+                wrong.push(format!(
+                    "`{name}`: must stay rewritten (sentineled {sentineled:?}, kept {kept:?})"
+                ));
+            }
+        }
+        for (names, expected) in [(&predicate_true[..], true), (&predicate_false[..], false)] {
+            for name in names {
+                let answer = fixture.predicate.get(*name).copied();
+                if answer != Some(expected) {
+                    wrong.push(format!(
+                        "`{name}`: the predicate must answer {expected}, got {answer:?}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} source-side-drop verdict(s) wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
     }
 }

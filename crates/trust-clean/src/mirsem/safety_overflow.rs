@@ -490,6 +490,12 @@ pub(super) fn function_uadd_overflow_widths(func: &trust_types::VerifiableFuncti
 pub fn function_safety_vc_faithful(
     func: &trust_types::VerifiableFunction,
 ) -> Option<Vec<OverflowAdequacyCertificate>> {
+    // This legacy width-only hook does not run VC generation or body validation.
+    // A destination width cannot give unsupported allocation observations value
+    // semantics, even when the image is in an otherwise ignored/dead statement.
+    if func.body.contains_memory_image() {
+        return None;
+    }
     let widths = function_uadd_overflow_widths(func);
     if widths.is_empty() {
         return None; // no modeled overflow obligation ⇒ not in the fragment

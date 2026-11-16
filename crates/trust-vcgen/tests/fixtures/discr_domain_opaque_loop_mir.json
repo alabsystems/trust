@@ -1,0 +1,568 @@
+{
+  "name": "wait_loop",
+  "def_path": "m_dyn::wait_loop",
+  "span": {
+    "file": "m_dyn.rs",
+    "line_start": 11,
+    "col_start": 0,
+    "line_end": 19,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Dynamic": {
+                "trait_name": "m_dyn::Waiter",
+                "principal_key": "m_dyn::Waiter"
+              }
+            }
+          }
+        },
+        "name": "w"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "FnPtr": {
+            "sig": {
+              "params": [],
+              "ret": "Never"
+            }
+          }
+        },
+        "name": "on_signal"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::result::Result",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v0_0",
+                {
+                  "Adt": {
+                    "name": "m_dyn::Signal",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "SIGHUP",
+                        "discriminant": 1,
+                        "fields": []
+                      },
+                      {
+                        "name": "SIGTERM",
+                        "discriminant": 15,
+                        "fields": []
+                      }
+                    ],
+                    "disc_index_safe": true,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Enum"
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Adt": {
+                    "name": "m_dyn::Errno",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "Unknown",
+                        "discriminant": 0,
+                        "fields": []
+                      },
+                      {
+                        "name": "EPERM",
+                        "discriminant": 1,
+                        "fields": []
+                      },
+                      {
+                        "name": "EINTR",
+                        "discriminant": 4,
+                        "fields": []
+                      },
+                      {
+                        "name": "EAGAIN",
+                        "discriminant": 35,
+                        "fields": []
+                      }
+                    ],
+                    "disc_index_safe": true,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Enum"
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Ok",
+                "discriminant": 0,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "m_dyn::Signal",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "SIGHUP",
+                            "discriminant": 1,
+                            "fields": []
+                          },
+                          {
+                            "name": "SIGTERM",
+                            "discriminant": 15,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": true,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "Err",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "m_dyn::Errno",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "Unknown",
+                            "discriminant": 0,
+                            "fields": []
+                          },
+                          {
+                            "name": "EPERM",
+                            "discriminant": 1,
+                            "fields": []
+                          },
+                          {
+                            "name": "EINTR",
+                            "discriminant": 4,
+                            "fields": []
+                          },
+                          {
+                            "name": "EAGAIN",
+                            "discriminant": 35,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": true,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": "Never",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Goto": 1
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<dyn m_dyn::Waiter as m_dyn::Waiter>::wait",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "m_dyn.rs",
+              "line_start": 13,
+              "col_start": 14,
+              "line_end": 13,
+              "col_end": 22
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 978773299774297825,
+              "def_index": 4,
+              "substs_digest": [
+                2133738337607754830,
+                7331666935537876190
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 978773299774297825,
+              "krate_name": "m_dyn"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "m_dyn.rs",
+                "line_start": 13,
+                "col_start": 14,
+                "line_end": 13,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ],
+              [
+                1,
+                4
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "m_dyn.rs",
+              "line_start": 13,
+              "col_start": 8,
+              "line_end": 13,
+              "col_end": 22
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 3,
+                  "projections": [
+                    {
+                      "Downcast": 1
+                    },
+                    {
+                      "Field": 0
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "m_dyn.rs",
+                "line_start": 13,
+                "col_start": 14,
+                "line_end": 13,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                4,
+                1
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "m_dyn.rs",
+              "line_start": 13,
+              "col_start": 8,
+              "line_end": 13,
+              "col_end": 22
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": {
+          "Opaque": {
+            "kind": "Call(indirect)",
+            "targets": [],
+            "span": {
+              "file": "m_dyn.rs",
+              "line_start": 14,
+              "col_start": 21,
+              "line_end": 14,
+              "col_end": 32
+            }
+          }
+        }
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_4",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_4",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_4",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_4",
+                "Int"
+              ]
+            },
+            {
+              "Int": 35
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_5",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_5",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -960,8 +960,9 @@ pub fn iter_loop_partial_witness(
         None => return None,
     };
     // TERMINATION — the mandatory gate. Only when the caller certifies (via
-    // `function_safety_vcs_all_discharged`) that NO undischarged panic exit remains. Never
-    // reached for sum_loop/count_pos (their accumulator-overflow VCs are open).
+    // `function_safety_vcs_all_discharged`) that NO undischarged panic exit remains. Reached
+    // for count_pos (its bounded-counter overflow VC refutes since vcgen's slice trip-count
+    // bound, `371552d454`); never for sum_loop (a reachable signed overflow).
     let termination = if total_available {
         Some(match loop_total_correct_witness(&ilf.projected) {
             Some(cert) => cert.verdict,

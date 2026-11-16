@@ -1,0 +1,50 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (six_isl, six_of_word)
+  --> $DIR/e9_constant_uint_mixed_carrier_discharge.rs:14:5
+   |
+LL | /     def six_isl (flag : Bool) : UInt8 := 6
+LL | |     def six_of_word (w : UInt32) : UInt64 := 6
+   | |______________________________________________^
+
+note: island definition `six_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_constant_uint_mixed_carrier_discharge::six`
+  --> $DIR/e9_constant_uint_mixed_carrier_discharge.rs:19:13
+   |
+LL |     ensures result == six_isl(flag)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+
+=== Trust Verification Report (e9_constant_uint_mixed_carrier_discharge) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_constant_uint_mixed_carrier_discharge.rs:18:1
+   |
+LL | / pub fn six(flag: bool) -> u8
+LL | |     ensures result == six_isl(flag)
+LL | | {
+LL | |     6
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `six_of_word` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_constant_uint_mixed_carrier_discharge::six_wide`
+  --> $DIR/e9_constant_uint_mixed_carrier_discharge.rs:25:13
+   |
+LL |     ensures result == six_of_word(w)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_constant_uint_mixed_carrier_discharge.rs:24:1
+   |
+LL | / pub fn six_wide(w: u32) -> u64
+LL | |     ensures result == six_of_word(w)
+LL | | {
+LL | |     6
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+

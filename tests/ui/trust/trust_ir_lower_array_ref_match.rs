@@ -25,10 +25,10 @@
 //! snapshot: a WRONG VALUE, not a coverage gap. The gate is on the POINTEE and not on the guard,
 //! because a guard mutating an unrelated `Cell` is fine.
 //!
-//! BOTH mapped array spellings are admitted, and that is load-bearing: an in-file comment
-//! asserts `map_ty` gives `[T; N>0]` a `Ty::Tuple`, but read at the source it is `Ty::Array` for
-//! a scalar element and `Ty::Tuple` only for an aggregate element. Every measured body is `u8`,
-//! i.e. the `Ty::Array` half, so admitting one spelling would have dropped the whole class.
+//! Every `[T; N]` maps to first-class `Ty::Array` (since 2026-09-23 aggregate elements too), and
+//! the lane has NO length cap: the `Load` is one instruction and the destructure reads only the
+//! positions the arms name. `classify_ref` in `trust_ir_huge_array_patterns_strict.rs` pins it
+//! LOWERING at N = 4e9 under `strict` (it refused every N above 256).
 //!
 //! Not under `=strict`: the negative pins below must keep their tags.
 

@@ -12,7 +12,7 @@
 //! "these still compile clean under the flag" (the sweep measured their differential rows the
 //! day this landed — see TRUST_IR_V2.md's slice-16 section for the numbers).
 
-#![feature(never_type)]
+// Upstream 1.100: `never_type` is stable; the feature attribute now warns.
 #![allow(dead_code)]
 #![allow(non_upper_case_globals)]
 

@@ -1,5 +1,5 @@
-use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{Body, ConstOperand, Location, traversal};
+use rustc_middle::mir::visit::{PlaceContext, Visitor};
+use rustc_middle::mir::{Body, ConstOperand, Location, Place, SourceInfo, traversal};
 
 pub(super) struct RequiredConstsVisitor<'tcx> {
     required_consts: Vec<ConstOperand<'tcx>>,
@@ -21,4 +21,8 @@ impl<'tcx> Visitor<'tcx> for RequiredConstsVisitor<'tcx> {
             self.required_consts.push(*constant);
         }
     }
+
+    fn visit_place(&mut self, _: &Place<'tcx>, _: PlaceContext, _: Location) {}
+
+    fn visit_source_info(&mut self, _: &SourceInfo) {}
 }

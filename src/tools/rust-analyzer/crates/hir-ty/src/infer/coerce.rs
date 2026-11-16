@@ -39,6 +39,7 @@ use std::ops::ControlFlow;
 
 use hir_def::{
     CallableDefId, TraitId, attrs::AttrFlags, hir::ExprId, signatures::FunctionSignature,
+    upvars::upvars_mentioned,
 };
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{
@@ -70,7 +71,6 @@ use crate::{
         inspect::{InspectGoal, ProofTreeVisitor},
         obligation_ctxt::ObligationCtxt,
     },
-    upvars::upvars_mentioned,
     utils::TargetFeatureIsSafeInTarget,
 };
 
@@ -793,7 +793,7 @@ where
     fn coerce_closure_to_fn(
         &mut self,
         a: Ty<'db>,
-        closure_def_id_a: InternedClosureId,
+        closure_def_id_a: InternedClosureId<'db>,
         args_a: GenericArgs<'db>,
         b: Ty<'db>,
     ) -> CoerceResult<'db> {
@@ -856,9 +856,9 @@ where
     }
 }
 
-struct InferenceCoercionDelegate<'a, 'b, 'db>(&'a mut InferenceContext<'b, 'db>);
+struct InferenceCoercionDelegate<'a, 'db>(&'a mut InferenceContext<'db>);
 
-impl<'db> CoerceDelegate<'db> for InferenceCoercionDelegate<'_, '_, 'db> {
+impl<'db> CoerceDelegate<'db> for InferenceCoercionDelegate<'_, 'db> {
     #[inline]
     fn infcx(&self) -> &InferCtxt<'db> {
         &self.0.table.infer_ctxt
@@ -884,7 +884,7 @@ impl<'db> CoerceDelegate<'db> for InferenceCoercionDelegate<'_, '_, 'db> {
     }
 }
 
-impl<'db> InferenceContext<'_, 'db> {
+impl<'db> InferenceContext<'db> {
     /// Attempt to coerce an expression to a type, and return the
     /// adjusted type of the expression, if successful.
     /// Adjustments are only recorded if the coercion succeeded.
@@ -1024,7 +1024,14 @@ impl<'db> InferenceContext<'_, 'db> {
                 }
             }
         };
-        if let (Some(a_sig), Some(b_sig)) = (a_sig, b_sig) {
+        if let (Some(mut a_sig), Some(mut b_sig)) = (a_sig, b_sig) {
+            // Allow coercing safe sigs to unsafe sigs
+            if a_sig.safety().is_safe() && !b_sig.safety().is_safe() {
+                a_sig = a_sig.map_bound(|sig| sig.set_safety(Safety::Unsafe));
+            } else if b_sig.safety().is_safe() && !a_sig.safety().is_safe() {
+                b_sig = b_sig.map_bound(|sig| sig.set_safety(Safety::Unsafe));
+            }
+
             // The signature must match.
             let sig = self
                 .table
@@ -1242,7 +1249,7 @@ impl<'db, 'exprs> CoerceMany<'db, 'exprs> {
     /// if necessary.
     pub(crate) fn coerce(
         &mut self,
-        icx: &mut InferenceContext<'_, 'db>,
+        icx: &mut InferenceContext<'db>,
         cause: &ObligationCause,
         expression: ExprId,
         expression_ty: Ty<'db>,
@@ -1265,7 +1272,7 @@ impl<'db, 'exprs> CoerceMany<'db, 'exprs> {
     /// removing a `;`).
     pub(crate) fn coerce_forced_unit(
         &mut self,
-        icx: &mut InferenceContext<'_, 'db>,
+        icx: &mut InferenceContext<'db>,
         expr: ExprId,
         cause: &ObligationCause,
         label_unit_as_expected: bool,
@@ -1287,7 +1294,7 @@ impl<'db, 'exprs> CoerceMany<'db, 'exprs> {
     /// `Nil`.
     pub(crate) fn coerce_inner(
         &mut self,
-        icx: &mut InferenceContext<'_, 'db>,
+        icx: &mut InferenceContext<'db>,
         cause: &ObligationCause,
         expression: ExprId,
         mut expression_ty: Ty<'db>,
@@ -1392,6 +1399,7 @@ impl<'db, 'exprs> CoerceMany<'db, 'exprs> {
 
                 self.final_ty = Some(icx.types.types.error);
 
+                let expression = icx.innermost_tail_expr(expression);
                 if label_expression_as_expected {
                     icx.emit_type_mismatch(expression.into(), found, expected);
                 } else {
@@ -1403,7 +1411,7 @@ impl<'db, 'exprs> CoerceMany<'db, 'exprs> {
         self.pushed += 1;
     }
 
-    pub(crate) fn complete(self, icx: &mut InferenceContext<'_, 'db>) -> Ty<'db> {
+    pub(crate) fn complete(self, icx: &mut InferenceContext<'db>) -> Ty<'db> {
         if let Some(final_ty) = self.final_ty {
             final_ty
         } else {
@@ -1597,10 +1605,11 @@ fn coerce<'db>(
     Ok((adjustments, ty))
 }
 
-fn is_capturing_closure(db: &dyn HirDatabase, closure: InternedClosureId) -> bool {
+fn is_capturing_closure(db: &dyn HirDatabase, closure: InternedClosureId<'_>) -> bool {
     let InternedClosure { owner, expr, .. } = closure.loc(db);
     upvars_mentioned(db, owner.expression_store_owner(db))
-        .is_some_and(|upvars| upvars.get(&expr).is_some_and(|upvars| !upvars.is_empty()))
+        .get(&expr)
+        .is_some_and(|upvars| !upvars.is_empty())
 }
 
 /// Recursively visit goals to decide whether an unsizing is possible.

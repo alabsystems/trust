@@ -1,3 +1,4 @@
+warning: UNVERIFIED: `targo check` inherited live broker-authenticated explicit-unverified authority from its Targo ancestor; this run emits no proof claim
 error: `proofs/ay` holds a hand-encoded solver query that nothing in this build reads
   |
   = note: `proofs/ay/kt1_clamp_bound.smt2` is a self-contained query: an `(assert ...)` and a `(check-sat)`, and 2 more like it sit here

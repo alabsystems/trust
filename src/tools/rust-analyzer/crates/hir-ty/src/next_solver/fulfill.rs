@@ -93,7 +93,6 @@ impl<'db> ObligationStorage<'db> {
             // we get all obligations involved in the overflow. We pretty much check: if
             // we were to do another step of `try_evaluate_obligations`, which goals would
             // change.
-            // FIXME: <https://github.com/Gankra/thin-vec/pull/66> is merged, this can be removed.
             self.overflowed.extend(
                 self.pending
                     .extract_if(.., |(o, stalled_on)| {
@@ -287,7 +286,7 @@ impl<'db> FulfillmentCtxt<'db> {
 /// This function can be also return false positives, which will lead to poor diagnostics
 /// so we want to keep this visitor *precise* too.
 pub struct StalledOnCoroutines<'a, 'db> {
-    pub stalled_coroutines: &'a [SolverDefId],
+    pub stalled_coroutines: &'a [SolverDefId<'db>],
     pub span: Span,
     pub cache: FxHashSet<Ty<'db>>,
 }

@@ -95,6 +95,7 @@ fn max_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -214,6 +215,7 @@ fn sum_1_to_n_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -325,6 +327,7 @@ fn clamp_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -368,6 +371,7 @@ fn call_chain_function() -> VerifiableFunction {
                         atomic: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 // bb1: call clamp(max_result, lo, hi)
@@ -389,6 +393,7 @@ fn call_chain_function() -> VerifiableFunction {
                         atomic: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 // bb2: return
@@ -402,6 +407,7 @@ fn call_chain_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

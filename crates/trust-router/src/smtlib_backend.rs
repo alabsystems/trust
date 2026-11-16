@@ -11,7 +11,6 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
-use trust_types::fx::FxHashSet;
 use trust_types::*;
 
 use crate::smt2_export;
@@ -55,21 +54,51 @@ pub(crate) fn stderr_indicates_unreliable(stderr: &str) -> bool {
 
 /// Generate a complete SMT-LIB2 script for a verification condition.
 ///
-/// The script declares variables, asserts the formula, calls check-sat,
-/// and if sat, calls get-model to extract counterexample values.
-pub(crate) fn generate_smtlib_script(formula: &Formula) -> String {
+/// The script installs the query's EFFORT count (`effort`, the one
+/// size-scaled count `min(C, max(1, k · size))` over this script's one
+/// assertion, sent as ay `(set-option :rlimit N)` before its check-sat: the
+/// deterministic bound that ends an undecided search; the caller's wall clock
+/// is only a backstop), declares variables, asserts the formula, calls
+/// check-sat, and if sat, calls get-model to extract counterexample values. It
+/// ends by asking for ay's statistics block, whose `:unknown.reason` says WHY
+/// an `unknown` stopped (see [`crate::ay_stop`]).
+pub(crate) fn generate_smtlib_script(
+    formula: &Formula,
+    effort: trust_types::determinism::QueryEffort,
+) -> String {
     let mut script = String::new();
 
-    // Use detect_logic() for correct logic selection.
-    // The previous `has_bitvectors() ? QF_BV : QF_LIA` missed quantified
-    // formulas (QF_ prefix means quantifier-free) and array theory.
+    // THE SAME SELECTOR as the in-process lane and the canonical transcript:
+    // `smt2_export::detect_logic`, i.e. the shared feature-set -> logic-name
+    // lattice in `trust_types::logic_lattice`. Not a private rule of this
+    // emitter's own — the previous `has_bitvectors() ? QF_BV : QF_LIA` missed
+    // quantified formulas (a `QF_` prefix means quantifier-free) and the array
+    // theory, and any second rule here would be free to disagree with the
+    // program ay actually executes. Because it IS the same function, the M1
+    // defect (a floating-point formula mixed with `Int`/`Real` arithmetic
+    // headed `QF_FP`) reached this script emitter too and is fixed here by the
+    // same change.
     let logic = smt2_export::detect_logic(formula);
     let _ = writeln!(script, "(set-logic {logic})");
 
     // Add:produce-models so (get-model) works correctly.
     script.push_str("(set-option :produce-models true)\n");
 
-    // Collect and declare variables
+    // The query's deterministic effort count (plan §3.2a).
+    let _ = writeln!(script, "{}", effort.smt2_command());
+
+    // DECLARATIONS, from the same three sources the canonical transcript
+    // (`problem_smt2`) composes, so the external-solver script and the
+    // in-process program declare the same sorts and symbols under the same
+    // logic line. The datatype sort preamble comes FIRST (a `declare-const` at
+    // a datatype sort is malformed until its sort identifier is in scope), then
+    // the free variables, then the uninterpreted `Pred`/`FnApp` symbols — which
+    // this emitter used to omit entirely, so a script could apply `(dir_open d)`
+    // or a bare `FnApp` symbol that nothing declared, under a `QF_UF*` logic
+    // line that correctly said UF was needed.
+    for decl in smt2_export::emit_sort_preamble(formula) {
+        let _ = writeln!(script, "{decl}");
+    }
     let mut vars = BTreeSet::new();
     collect_vars(formula, &mut vars);
     for (name, sort) in &vars {
@@ -80,6 +109,9 @@ pub(crate) fn generate_smtlib_script(formula: &Formula) -> String {
             sort_to_smtlib(sort)
         );
     }
+    for decl in smt2_export::uninterpreted_symbol_declarations(formula) {
+        let _ = writeln!(script, "{decl}");
+    }
 
     // Assert the formula
     let _ = writeln!(script, "(assert {})", formula_to_smtlib(formula));
@@ -89,6 +121,10 @@ pub(crate) fn generate_smtlib_script(formula: &Formula) -> String {
 
     // Request model on sat for counterexample extraction
     script.push_str("(get-model)\n");
+
+    // ay's own account of the solve: on `unknown`, `:unknown.reason` names the
+    // bound that ended it. Nothing reads it on a decided solve.
+    script.push_str("(get-info :all-statistics)\n");
 
     script.push_str("(exit)\n");
     script
@@ -104,43 +140,15 @@ fn sort_to_smtlib(sort: &Sort) -> String {
     sort.to_smtlib()
 }
 
-/// Recursively collect all free variables (with sorts) in a formula.
+/// All free variables (with sorts) in a formula, quantifier-bound names
+/// excluded.
+///
+/// Delegates to [`smt2_export::collect_free_vars`], the ONE free-variable
+/// collector: this module carried a byte-for-byte duplicate of that walk, which
+/// is the shape every divergence in this class has taken. `SymVar` resolves to
+/// its string spelling so it gets a `declare-const` like a `Var`.
 fn collect_vars(formula: &Formula, vars: &mut BTreeSet<(String, Sort)>) {
-    collect_vars_inner(formula, &FxHashSet::default(), vars);
-}
-
-fn collect_vars_inner(
-    formula: &Formula,
-    bound_names: &FxHashSet<String>,
-    vars: &mut BTreeSet<(String, Sort)>,
-) {
-    match formula {
-        Formula::Var(name, sort) => {
-            if !bound_names.contains(name) {
-                vars.insert((name.clone(), sort.clone()));
-            }
-        }
-        // SymVar is semantically identical to Var but uses an
-        // interned Symbol. Resolve to string so it gets a declare-const.
-        Formula::SymVar(sym, sort) => {
-            let name = sym.as_str().to_string();
-            if !bound_names.contains(&name) {
-                vars.insert((name, sort.clone()));
-            }
-        }
-        Formula::Forall(bindings, body) | Formula::Exists(bindings, body) => {
-            let mut nested_bound_names = bound_names.clone();
-            for (name, _) in bindings {
-                nested_bound_names.insert(name.as_str().to_string());
-            }
-            collect_vars_inner(body, &nested_bound_names, vars);
-        }
-        _ => {
-            for child in formula.children() {
-                collect_vars_inner(child, bound_names, vars);
-            }
-        }
-    }
+    vars.extend(smt2_export::collect_free_vars(formula));
 }
 
 // has_bitvectors: removed -- use Formula::has_bitvectors() directly.
@@ -197,19 +205,27 @@ pub(crate) fn parse_solver_output(
     }
 
     if trimmed.starts_with("unknown") {
-        return VerificationResult::Unknown {
-            solver: "ay-smtlib".into(),
-            time_ms: elapsed_ms,
-            reason: "solver returned unknown".to_string(),
+        // ay's statistics block (requested by `generate_smtlib_script`) names
+        // the bound that ended the search. Without it the stop is unexplained,
+        // and an unexplained stop is never counted as reproducible.
+        return match crate::ay_stop::AyUnknownAccount::parse(trimmed) {
+            Some(account) => {
+                account.stop().unknown_result("ay-smtlib", elapsed_ms, &account.describe())
+            }
+            None => trust_types::determinism::StopCause::Unclassified.unknown_result(
+                "ay-smtlib",
+                elapsed_ms,
+                "solver returned unknown",
+            ),
         };
     }
 
-    // Parse errors or unexpected output
-    VerificationResult::Unknown {
-        solver: "ay-smtlib".into(),
-        time_ms: elapsed_ms,
-        reason: format!("unexpected solver output: {}", &trimmed[..trimmed.len().min(200)]),
-    }
+    // Parse errors or unexpected output: the solver broke protocol.
+    trust_types::determinism::StopCause::SolverFault.unknown_result(
+        "ay-smtlib",
+        elapsed_ms,
+        &format!("unexpected solver output: {}", &trimmed[..trimmed.len().min(200)]),
+    )
 }
 
 /// Parse a model from solver output following the "sat" line.
@@ -561,6 +577,38 @@ mod tests {
     fn test_parse_solver_output_unknown() {
         let result = parse_solver_output("unknown\n", 1000, vec![]);
         assert!(matches!(result, VerificationResult::Unknown { .. }));
+        // No statistics block: the stop is unexplained, never deterministic.
+        assert_eq!(
+            trust_types::determinism::StopCause::of_result(&result),
+            trust_types::determinism::StopCause::Unclassified
+        );
+    }
+
+    #[test]
+    fn an_unknown_names_the_bound_ay_says_ended_it() {
+        use trust_types::determinism::StopCause;
+        // What the one-shot script's trailing `(get-info :all-statistics)`
+        // prints after `(get-model)` fails on an unknown.
+        let output = "unknown\n(error \"line 9 column 10: model is not available\")\n\
+                      (:conflicts 100000\n :unknown.reason \"resourceout\")\n";
+        let result = parse_solver_output(output, 1700, vec![]);
+        assert_eq!(StopCause::of_result(&result), StopCause::Effort);
+        let clock = parse_solver_output("unknown\n(:unknown.reason \"timeout\")\n", 9, vec![]);
+        assert_eq!(StopCause::of_result(&clock), StopCause::WallBackstop);
+        let folded = parse_solver_output("unknown\n(:unknown.reason \"canceled\")\n", 9, vec![]);
+        assert_eq!(StopCause::of_result(&folded), StopCause::Unclassified);
+    }
+
+    #[test]
+    fn a_decided_solve_ignores_the_statistics_block() {
+        let output = "sat\n(model\n  (define-fun a () Int 1)\n)\n(:conflicts 4\n :decisions 9)\n";
+        let result = parse_solver_output(output, 3, vec![]);
+        let VerificationResult::Failed { counterexample: Some(cex), .. } = &result else {
+            panic!("expected Failed with counterexample, got {result:?}");
+        };
+        assert_eq!(cex.assignments.len(), 1, "statistics lines are not model entries");
+        let proved = parse_solver_output("unsat\n(:conflicts 4)\n", 3, vec![]);
+        assert!(proved.is_proved());
     }
 
     #[test]
@@ -569,6 +617,51 @@ mod tests {
         assert!(matches!(result, VerificationResult::Unknown { .. }));
         if let VerificationResult::Unknown { reason, .. } = &result {
             assert!(reason.contains("unexpected solver output"));
+        }
+        assert_eq!(
+            trust_types::determinism::StopCause::of_result(&result),
+            trust_types::determinism::StopCause::SolverFault
+        );
+    }
+
+    #[test]
+    fn the_script_carries_the_effort_budget_and_asks_why() {
+        let formula = Formula::Bool(true);
+        let script = generate_smtlib_script(
+            &formula,
+            trust_types::determinism::QueryEffort { size: 1, conflicts: 12_345 },
+        );
+        let rlimit = script.find("(set-option :rlimit 12345)").expect("effort budget sent");
+        let check = script.find("(check-sat)").expect("check-sat sent");
+        let stats = script.find("(get-info :all-statistics)").expect("statistics requested");
+        assert!(
+            rlimit < check && check < stats,
+            "budget before the solve, account after:\n{script}"
+        );
+        assert!(!script.contains(":timeout"), "the wall clock is the caller's backstop, not ay's");
+    }
+
+    /// Plan §3.2a: the one-shot script's `:rlimit` is its own query's count,
+    /// `k · size`, so two queries of different sizes carry different values.
+    #[test]
+    fn the_one_shot_script_carries_the_per_query_count() {
+        use trust_types::determinism::EffortScale;
+        let scale = EffortScale { conflicts_per_node: 10 };
+        let x = || Formula::Var("x".into(), Sort::Int);
+        let small = Formula::Lt(Box::new(x()), Box::new(Formula::Int(1)));
+        let large = Formula::And(vec![
+            Formula::Lt(Box::new(x()), Box::new(Formula::Int(1))),
+            Formula::Gt(Box::new(x()), Box::new(Formula::Int(5))),
+        ]);
+        for formula in [small, large] {
+            let effort = scale.for_query(&[&formula]);
+            assert_eq!(effort.conflicts, 10 * trust_types::determinism::query_size(&[&formula]));
+            let script = generate_smtlib_script(&formula, effort);
+            assert!(
+                script.contains(&format!("(set-option :rlimit {})\n", effort.conflicts)),
+                "{script}"
+            );
+            assert_eq!(script.matches(":rlimit").count(), 1, "{script}");
         }
     }
 
@@ -620,7 +713,10 @@ mod tests {
     fn test_generate_smtlib_script_simple() {
         // 2 == 0 (trivially unsat for division-by-zero check)
         let formula = Formula::Eq(Box::new(Formula::Int(2)), Box::new(Formula::Int(0)));
-        let script = generate_smtlib_script(&formula);
+        let script = generate_smtlib_script(
+            &formula,
+            trust_types::determinism::EffortScale::BUILTIN.for_query(&[&formula]),
+        );
         assert!(script.contains("(set-logic QF_LIA)"));
         assert!(script.contains("(assert (= 2 0))"));
         assert!(script.contains("(check-sat)"));
@@ -635,7 +731,10 @@ mod tests {
             Box::new(Formula::Var("x".to_string(), Sort::Int)),
             Box::new(Formula::Int(10)),
         );
-        let script = generate_smtlib_script(&formula);
+        let script = generate_smtlib_script(
+            &formula,
+            trust_types::determinism::EffortScale::BUILTIN.for_query(&[&formula]),
+        );
         assert!(script.contains("(declare-const x Int)"));
         assert!(script.contains("(assert (< x 10))"));
     }
@@ -647,7 +746,10 @@ mod tests {
             Box::new(Formula::Var("y".to_string(), Sort::BitVec(32))),
             32,
         );
-        let script = generate_smtlib_script(&formula);
+        let script = generate_smtlib_script(
+            &formula,
+            trust_types::determinism::EffortScale::BUILTIN.for_query(&[&formula]),
+        );
         assert!(script.contains("(set-logic QF_BV)"));
         assert!(script.contains("(declare-const x (_ BitVec 32))"));
         assert!(script.contains("(declare-const y (_ BitVec 32))"));
@@ -695,7 +797,10 @@ mod tests {
         assert_eq!(vars.len(), 1);
         assert!(vars.contains(&("x".to_string(), Sort::Int)));
 
-        let script = generate_smtlib_script(&formula);
+        let script = generate_smtlib_script(
+            &formula,
+            trust_types::determinism::EffortScale::BUILTIN.for_query(&[&formula]),
+        );
         assert_eq!(script.matches("(declare-const x Int)").count(), 1);
     }
 
@@ -715,7 +820,10 @@ mod tests {
         assert!(!vars.contains(&("x".to_string(), Sort::Int)));
         assert!(vars.contains(&("y".to_string(), Sort::Int)));
 
-        let script = generate_smtlib_script(&formula);
+        let script = generate_smtlib_script(
+            &formula,
+            trust_types::determinism::EffortScale::BUILTIN.for_query(&[&formula]),
+        );
         assert!(!script.contains("(declare-const x Int)"));
         assert!(script.contains("(declare-const y Int)"));
     }
@@ -735,7 +843,10 @@ mod tests {
         assert!(vars.contains(&("s".to_string(), Sort::Bool)));
 
         // Also verify the generated script includes declare-const for the SymVar
-        let script = generate_smtlib_script(&formula);
+        let script = generate_smtlib_script(
+            &formula,
+            trust_types::determinism::EffortScale::BUILTIN.for_query(&[&formula]),
+        );
         assert!(script.contains("(declare-const s Bool)"));
         assert!(script.contains("(declare-const x Int)"));
     }
@@ -774,7 +885,10 @@ mod tests {
             ]))),
         ]);
 
-        let script = generate_smtlib_script(&formula);
+        let script = generate_smtlib_script(
+            &formula,
+            trust_types::determinism::EffortScale::BUILTIN.for_query(&[&formula]),
+        );
 
         // Verify script structure
         assert!(script.contains("(set-logic QF_LIA)"));

@@ -70,6 +70,7 @@ fn make_mem_add_module(name: &str, k: i128) -> Module {
         params: vec![Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
     let mut function = IrFunction::new(FuncId::new(0), name, FuncTyId::new(0), BlockId::new(0));
 

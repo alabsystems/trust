@@ -24,7 +24,6 @@ const X86_64_RET_ELF_HEX: &str = "\
 010000000100000008000000000000001800000000000000";
 
 #[test]
-#[ignore = "pre-existing drift (2026-07-02): targo-trust now builds trust-decompile WITH the trust-cg feature, so the backend-unavailable rejection path this golden pins never fires; rejection now happens at target validation with an inspectable output (inspectable_rejected). Needs a re-bless against the new blocker taxonomy — tracked in docs/design-notes/2026-07-02-assumption-ledger-stage1-plan.md follow-ups"]
 fn convert_trust_cg_json_golden_reports_translation_rejected_output() {
     let tmp_dir = temp_test_dir("targo-trust-convert-trust_cg-json-golden");
     fs::create_dir_all(&tmp_dir).expect("create temp directory");
@@ -93,25 +92,66 @@ fn convert_trust_cg_json_golden_reports_translation_rejected_output() {
             "validation": value["conversion_gate"]["validation"],
         },
         "target_validation_blockers_present": !target_blockers.is_empty(),
-        "trust_cg_output_present": value.get("trust_cg_output").is_some(),
+        "trust_cg_output_present": value["trust_cg_output"].is_object(),
     });
     assert_eq!(actual, golden);
 
-    assert!(target_blockers.iter().any(|blocker| {
-        blocker["feature"] == "trust-cg-backend-unavailable"
-            && blocker["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("feature `trust-cg`"))
-    }));
+    // This binary enables the backend: lowering produces inspectable LIR, but
+    // structural validation cannot discharge the target-semantics obligation.
+    let semantic_blocker = target_blockers
+        .iter()
+        .find(|blocker| {
+            blocker["code"] == "missing-target-semantic-validation"
+                && blocker["feature"] == "missing-target-semantic-validation"
+        })
+        .expect("inspectable LIR must retain the target-semantics refusal");
+    let reason = semantic_blocker["reason"]
+        .as_str()
+        .filter(|reason| !reason.trim().is_empty())
+        .expect("the target-semantics refusal must explain the missing evidence");
     assert!(
         value["conversion_gate"]["validation_blockers"]
             .as_array()
             .expect("conversion validation blockers should be an array")
             .iter()
-            .any(|blocker| blocker
-                .as_str()
-                .is_some_and(|blocker| blocker.contains("trust-cg-backend-unavailable")))
+            .any(|blocker| blocker.as_str().is_some_and(|blocker| {
+                blocker.starts_with("missing-target-semantic-validation")
+                    && blocker.contains(reason)
+            }))
     );
+    assert!(
+        !target_blockers.iter().any(|blocker| blocker["feature"] == "trust-cg-backend-unavailable"),
+        "the enabled backend must reach target validation"
+    );
+    assert_eq!(value["trust_cg_output"]["validation"]["status"], "inspectable_rejected");
+    assert_eq!(value["trust_cg_output"]["validation"]["trust_level"], "rejected");
+    assert_eq!(value["trust_cg_output"]["validation"]["proof_grade"], false);
+    // The missing semantic and proof evidence must each block both the target
+    // report and the conversion gate.
+    for code in [
+        "missing-target-semantic-validation",
+        "missing-refinement-metadata",
+        "missing-checked-proof-certificate",
+        "missing-binary-proof-obligation",
+    ] {
+        assert!(
+            target_blockers.iter().any(|blocker| {
+                blocker["code"] == code
+                    && blocker["feature"] == code
+                    && blocker["stage"] == "trust-cg-bridge::target-validation"
+                    && blocker["reason"].as_str().is_some_and(|reason| !reason.is_empty())
+            }),
+            "target report must retain blocker {code}: {target_blockers:?}"
+        );
+        assert!(
+            value["conversion_gate"]["validation_blockers"]
+                .as_array()
+                .expect("conversion validation blockers should be an array")
+                .iter()
+                .any(|blocker| blocker.as_str().is_some_and(|blocker| blocker.starts_with(code))),
+            "conversion gate must retain blocker {code}"
+        );
+    }
 
     let compact_json = serde_json::to_string(&value).expect("compact convert JSON");
     assert!(!compact_json.contains("\"output_trust_level\":\"proof_grade\""));
@@ -145,7 +185,12 @@ fn temp_test_dir(prefix: &str) -> PathBuf {
 fn decode_hex(hex: &str) -> Vec<u8> {
     let bytes = hex.as_bytes();
     assert_eq!(bytes.len() % 2, 0, "hex fixture should have an even length");
-    bytes.chunks_exact(2).map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1])).collect()
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
+        .collect()
 }
 
 fn hex_nibble(byte: u8) -> u8 {

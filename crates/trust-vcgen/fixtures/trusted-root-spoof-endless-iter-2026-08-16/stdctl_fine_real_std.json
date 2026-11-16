@@ -656,7 +656,7 @@
         "stmts": [],
         "terminator": {
           "Call": {
-            "func": "<core::iter::adapters::copied::Copied<core::slice::iter::Iter<'_, u8>> as core::iter::traits::iterator::Iterator>::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes@16>",
+            "func": "<core::iter::adapters::copied::Copied<core::slice::iter::Iter<'_, u8>> as core::iter::traits::iterator::Iterator>::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes@1>",
             "args": [
               {
                 "Move": {

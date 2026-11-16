@@ -1,10 +1,10 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use cargo::diagnostics::Lint;
-use cargo::diagnostics::LintLevel;
-use cargo::util::command_prelude::{ArgMatchesExt, flag};
 use itertools::Itertools;
+use targo::diagnostics::Lint;
+use targo::diagnostics::LintLevel;
+use targo::util::command_prelude::{ArgMatchesExt, flag};
 
 fn cli() -> clap::Command {
     clap::Command::new("xtask-lint-docs").arg(flag("check", "Check that the docs are up-to-date"))
@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
     let mut forbid = Vec::new();
 
     let mut lint_docs = String::new();
-    for lint in cargo::diagnostics::LINTS
+    for lint in targo::diagnostics::LINTS
         .iter()
         .sorted_by_key(|lint| lint.name)
     {
@@ -40,7 +40,26 @@ fn main() -> anyhow::Result<()> {
     writeln!(buf, "# Lints\n")?;
     writeln!(
         buf,
-        "Note: [Cargo's linting system is unstable](unstable.md#lintscargo) and can only be used on nightly toolchains"
+        "> [!NOTE]
+> This chapter is about lints emitted by `cargo` itself."
+    )?;
+    writeln!(buf)?;
+
+    writeln!(
+        buf,
+        r#"## Configuring Cargo lints
+
+Cargo lints can be configured in the `[lints.cargo]` table of the `Cargo.toml` manifest.
+The key is the lint name without the `cargo::` prefix.
+For example:
+
+```toml
+[lints.cargo]
+unused_dependencies = "deny"
+```
+
+See [the `[lints]` section](manifest.md#the-lints-section)
+for details about lint levels and priorities."#
     )?;
     writeln!(buf)?;
 
@@ -61,6 +80,9 @@ fn main() -> anyhow::Result<()> {
 
     buf.push_str(&lint_docs);
 
+    writeln!(buf)?;
+    writeln!(buf, "[`package.rust-version`]: rust-version.md")?;
+
     if check {
         let old = std::fs::read_to_string(lint_docs_path())?;
         if old != buf {
@@ -75,7 +97,14 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn lint_groups(buf: &mut String) -> anyhow::Result<()> {
-    let (max_name_len, max_desc_len) = cargo::diagnostics::LINT_GROUPS
+    writeln!(
+        buf,
+        r#"## Lint groups
+
+Cargo has the concept of a "lint group",
+where you can toggle several warnings through one name."#
+    )?;
+    let (max_name_len, max_desc_len) = targo::diagnostics::LINT_GROUPS
         .iter()
         .filter(|g| !g.hidden)
         .fold((0, 0), |(max_name_len, max_desc_len), group| {
@@ -98,7 +127,7 @@ fn lint_groups(buf: &mut String) -> anyhow::Result<()> {
         "-".repeat(max_desc_len),
         "-".repeat(default_level_len)
     )?;
-    for group in cargo::diagnostics::LINT_GROUPS.iter() {
+    for group in targo::diagnostics::LINT_GROUPS.iter() {
         if group.hidden {
             continue;
         }
@@ -125,7 +154,7 @@ fn add_lint(lint: &Lint, buf: &mut String) -> std::fmt::Result {
     writeln!(buf, "- Group: `{}`", lint.primary_group.name)?;
     writeln!(buf, "- Level: `{}`", lint.primary_group.default_level)?;
     if let Some(msrv) = &lint.msrv {
-        writeln!(buf, "- MSRV: `{msrv}`")?;
+        writeln!(buf, "- Minimal [`package.rust-version`]: `{msrv}`")?;
     }
     writeln!(buf)?;
     writeln!(buf, "{}\n", lint.docs.as_ref().unwrap())
@@ -156,7 +185,7 @@ fn lint_docs_path() -> PathBuf {
     let pkg_root = env!("CARGO_MANIFEST_DIR");
     let ws_root = PathBuf::from(format!("{pkg_root}/../.."));
     let path = {
-        let path = ws_root.join("src/doc/src/reference/lints.md");
+        let path = ws_root.join("doc/book/src/reference/lints.md");
         path.canonicalize().unwrap_or(path)
     };
     path

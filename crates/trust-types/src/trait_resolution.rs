@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::formula::{Formula, VcKind, VerificationCondition};
-use crate::fx::{FxHashMap, FxHashSet};
+use crate::fx::FxHashMap;
 use crate::model::{BlockId, SourceSpan, Terminator, Ty, VerifiableBody};
 use crate::traits::{
     CoherenceError, ConcreteTarget, MethodInfo, TraitBound, TraitConstraint, TraitImpl,
@@ -47,8 +47,16 @@ impl WhereClause {
     /// Human-readable description (e.g., "T: Clone + Debug").
     #[must_use]
     pub fn description(&self) -> String {
-        let bounds: Vec<&str> = self.bounds.iter().map(|b| b.trait_name.as_str()).collect();
-        format!("{}: {}", self.type_param, bounds.join(" + "))
+        let mut out = String::with_capacity(self.type_param.len() + 2 + self.bounds.len() * 8);
+        out.push_str(&self.type_param);
+        out.push_str(": ");
+        for (i, b) in self.bounds.iter().enumerate() {
+            if i > 0 {
+                out.push_str(" + ");
+            }
+            out.push_str(&b.trait_name);
+        }
+        out
     }
 }
 
@@ -86,7 +94,7 @@ impl SpecializationLevel {
 
 /// Check whether a type looks like a type parameter (no concrete structure).
 fn is_type_parameter(ty: &Ty) -> bool {
-    matches!(ty, Ty::Adt { name, fields, variants, .. } if fields.is_empty() && variants.is_empty() && name.len() == 1 && name.chars().all(|c| c.is_ascii_uppercase()))
+    matches!(ty, Ty::Adt { name, fields, variants, .. } if fields.is_empty() && variants.is_empty() && name.len() == 1 && name.as_bytes()[0].is_ascii_uppercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -112,9 +120,18 @@ impl MonomorphizationRequest {
     /// Build a mangled name for the monomorphized instance.
     #[must_use]
     pub fn mangled_name(&self) -> String {
-        let subs: Vec<String> =
-            self.substitutions.iter().map(|(param, ty)| format!("{param}={ty:?}")).collect();
-        format!("{}<{}>", self.generic_def_path, subs.join(", "))
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(self.generic_def_path.len() + 2 + self.substitutions.len() * 12);
+        out.push_str(&self.generic_def_path);
+        out.push('<');
+        for (i, (param, ty)) in self.substitutions.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{param}={ty:?}");
+        }
+        out.push('>');
+        out
     }
 }
 
@@ -205,8 +222,8 @@ pub fn resolve_all_trait_calls(
     // Check coherence up front.
     result.coherence_errors = resolver.check_coherence();
 
-    // Track which traits we've already built vtables for.
-    let mut vtable_traits: FxHashSet<String> = FxHashSet::default();
+    // Track which traits we've already built vtables for (trait_name -> index in `result.vtables`).
+    let mut vtable_traits: FxHashMap<&str, usize> = FxHashMap::default();
 
     for block in &body.blocks {
         let (func, span) = match &block.terminator {
@@ -231,16 +248,27 @@ pub fn resolve_all_trait_calls(
             }
 
             // Build vtable for this trait if we haven't already.
-            for imp in &matching_impls {
-                if vtable_traits.insert(imp.trait_name.clone()) {
-                    result.vtables.push(resolver.build_vtable(&imp.trait_name));
+            let mut first_vtable_idx = None;
+            for (i, imp) in matching_impls.iter().enumerate() {
+                let idx = match vtable_traits.entry(imp.trait_name.as_str()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let idx = result.vtables.len();
+                        result.vtables.push(resolver.build_vtable(&imp.trait_name));
+                        entry.insert(idx);
+                        idx
+                    }
+                };
+                if i == 0 {
+                    first_vtable_idx = Some(idx);
                 }
             }
 
-            // Resolve to concrete targets.
+            // Resolve to concrete targets using the cached vtable.
             let trait_name = &matching_impls[0].trait_name;
-            let vtable = resolver.build_vtable(trait_name);
-            let targets = TraitResolver::devirtualize(&vtable, method_name);
+            let targets = first_vtable_idx
+                .and_then(|idx| result.vtables.get(idx))
+                .map_or_else(Vec::new, |vtable| TraitResolver::devirtualize(vtable, method_name));
 
             if let Some(first_impl) = matching_impls.first() {
                 if let Some(method) = first_impl.methods.iter().find(|m| m.name == method_name) {
@@ -473,8 +501,18 @@ mod tests {
 
     fn make_blanket_impl() -> TraitImpl {
         TraitImpl {
-            implementing_type: Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+            implementing_type: Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "T".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
             trait_name: "MyTrait".to_string(),
             methods: vec![],
             where_clauses: vec![],
@@ -484,8 +522,18 @@ mod tests {
 
     fn make_bounded_blanket_impl() -> TraitImpl {
         TraitImpl {
-            implementing_type: Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+            implementing_type: Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "T".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
             trait_name: "MyTrait".to_string(),
             methods: vec![],
             where_clauses: vec![TraitBound {
@@ -578,8 +626,21 @@ mod tests {
         let req = MonomorphizationRequest {
             generic_def_path: "std::collections::HashMap::insert".to_string(),
             substitutions: vec![
-                ("K".to_string(), Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "String".to_string(), fields: vec![],
-                    disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }),
+                (
+                    "K".to_string(),
+                    Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
+                        variants: Vec::new().into(),
+                        name: "String".to_string(),
+                        fields: vec![].into(),
+                        disc_index_safe: false,
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                    },
+                ),
                 ("V".to_string(), Ty::i32()),
             ],
             call_site: span(),
@@ -650,6 +711,7 @@ mod tests {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "std::clone::Clone::clone".to_string(),
                     args: vec![],
@@ -683,6 +745,7 @@ mod tests {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "UnknownTrait::method".to_string(),
                     args: vec![],
@@ -717,6 +780,7 @@ mod tests {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "std::clone::Clone::clone".to_string(),
                     args: vec![],
@@ -982,6 +1046,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::clone::Clone::clone".to_string(),
                         args: vec![],
@@ -998,6 +1063,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::fmt::Debug::fmt".to_string(),
                         args: vec![],

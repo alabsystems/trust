@@ -129,6 +129,7 @@ fn emitted_projection(param: usize) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

@@ -29,6 +29,7 @@ fn len_call(callee: &str, receiver_ty: Ty) -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                         is_foreign: false,
                         atomic: None,
                     },
@@ -43,6 +44,7 @@ fn len_call(callee: &str, receiver_ty: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -71,10 +73,12 @@ fn len_isize_bound_requires_bytes_or_a_non_zst_slice_element() {
 
     let string = len_call(
         "alloc::string::String::len",
-        Ty::Adt { arbitrary_precision: None,
+        Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
             name: "alloc::string::String".into(),
-            fields: vec![],
-            variants: vec![],
+            fields: vec![].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -89,10 +93,12 @@ fn len_isize_bound_requires_bytes_or_a_non_zst_slice_element() {
 
     let erased_vec = len_call(
         "alloc::vec::Vec::<u8>::len",
-        Ty::Adt { arbitrary_precision: None,
+        Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
             name: "alloc::vec::Vec".into(),
-            fields: vec![],
-            variants: vec![],
+            fields: vec![].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,

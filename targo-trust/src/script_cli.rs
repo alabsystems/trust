@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Unified Trust CLI adapters for repository maintenance scripts.
 //
 // These commands keep `targo trust` as the public control surface while the
@@ -34,18 +34,25 @@ const CERTIFIED_MONITOR_EXPECTED_HEAD_ENV: &str = "TRUST_CERTIFIED_MONITOR_EXPEC
 const CERTIFIED_MONITOR_LOG_DIR_ENV: &str = "TRUST_CERTIFIED_MONITOR_E2E_LOG_DIR";
 const CERTIFIED_MONITOR_RUN_ID_ENV: &str = "TRUST_CERTIFIED_MONITOR_E2E_RUN_ID";
 const CERTIFIED_MONITOR_PAYLOAD_IDENTITY_SCHEMA: &str =
-    "trust.certified-monitor-e2e-payload-identity.v5";
+    "trust.certified-monitor-e2e-payload-identity.v8";
 const CERTIFIED_MONITOR_NATIVE_AUTHORITY_SCHEMA: &str =
     "trust.certified-monitor-native-authority.v1";
 const CERTIFIED_MONITOR_EVIDENCE_MANIFEST: &str = "evidence.sha256";
 const CERTIFIED_MONITOR_PAYLOAD_FILES: &[&str] = &[
     "gate-identity.txt",
     "compiled-test-inventory.log",
+    "test-binary-trustd.txt",
     "real_targo_test_instruments_library_used_by_integration_test.log",
     "real_targo_test_executes_loop_invariant_violation.log",
     "real_targo_test_executes_e5_tailcall_and_extended_carriers.log",
     "real_targo_test_executes_authorized_satisfying_integration_test.log",
     "real_targo_test_rejects_unharnessed_test_target_before_execution.log",
+    "real_targo_test_strict_lane_compiles_under_the_sealed_loader_closure.log",
+    "real_targo_test_strict_lane_compiles_audited_proc_macro_provider.log",
+    "real_targo_test_advisory_lane_runs_proc_macro_crate_tests_with_static_std.log",
+    "real_targo_test_strict_lane_passes_a_proved_harness_test.log",
+    "real_targo_test_strict_lane_refuses_an_unproved_test_body.log",
+    "real_targo_test_check_tests_and_test_pass_a_zero_obligation_test_crate.log",
 ];
 const CERTIFIED_MONITOR_MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const CERTIFIED_MONITOR_MAX_IDENTITY_BYTES: u64 = 1024 * 1024;
@@ -67,6 +74,10 @@ struct ScriptSpec {
     /// arguments. Release adapters use this to make evidence-strengthening
     /// policy non-optional.
     fixed_args: &'static [&'static str],
+    /// Why a green from this command is NOT evidence, printed on stderr before
+    /// the script runs. A command that sits beside real release gates reads as
+    /// one; this is where it says it is not.
+    not_evidence: Option<&'static str>,
 }
 
 struct MaintenanceSpec {
@@ -108,52 +119,44 @@ Usage: targo trust verify <command> [args...]
 Commands:
   examples              Check examples/verify*.rs Expected headers and verifier output
   cargo-cache           Materialize a dedicated registry-only Cargo seed cache for release full-verify
-  repo-gate             Run the repository verification gate without shell orchestration
+  repo-gate             Check verifier and proof inputs; --full adds broad diagnostics
   solvers               Run solver detection through the canonical Trust CLI surface
   self                  Run the Rust-native Trust self-verification harness
 
-Removed verify aliases reject when invoked. Use cargo-cache, repo-gate,
-verify self --full-verifier, and release check for release evidence.
+Removed verify aliases reject when invoked. Use cargo-cache, repo-gate --full, verify self --full-verifier, and release check for release evidence.
 
 Examples:
   targo trust verify examples --metadata-only
   targo trust verify examples --trustc build/host/stage2/bin/trustc --json-output target/trust/gates/verify-examples.json
   targo trust verify cargo-cache --repo-root . --cargo-home build/full-verify/cargo-seed-home --json-output build/full-verify/cargo-cache-materialization.json
-  targo trust verify repo-gate --quick
+  targo trust verify repo-gate
+  targo trust verify repo-gate --full
   targo trust verify solvers --json
 ";
 
-const RUST_NATIVE_RELEASE_GATE_ADVICE: &str = "targo trust verify cargo-cache, targo trust verify repo-gate, targo trust verify self --full-verifier, and targo trust release check";
+const RUST_NATIVE_RELEASE_GATE_ADVICE: &str = "targo trust verify cargo-cache, targo trust verify repo-gate --full, targo trust verify self --full-verifier, and targo trust release check";
 
 const DEPS_USAGE: &str = "\
 Usage: targo trust deps <command> [args...]
 
 Commands:
-  status        Report Trust-owned dependency alignment state
-  diff          Classify dependency drift from the Rust alignment report
-  upstream-plan Produce a dependency upstreaming/import action plan
-  export        Plan or write a deterministic dependency export
-  import        Plan or apply a deterministic dependency import
-  lock          Plan trust-engines.lock updates for imported dependencies
-  validate      Gate Trust-owned dependency alignment state
   upstream-test-inventory  Produce upstream Trust test inventory
 
+Retired commands (each exits 2 and names its replacement):
+  status, validate, diff, upstream-plan, export, import, lock
+    These read trust-engines.lock and compared checked-in first-party/
+    snapshots against it. first-party/* are git submodules pinned by
+    gitlink now (docs/first-party-pin-ledger.md), and no such lock exists.
+
 Examples:
-  targo trust deps status --json
-  targo trust deps status --dependency ty --json
-  targo trust deps status --fetch --view refresh-plan
-  targo trust deps status --fetch --gate snapshot-integrity
-  targo trust deps upstream-plan --fetch
-  targo trust deps validate --fetch
-  targo trust deps validate --source git-index --json
-  targo trust deps validate --production --source git-index --json-output reports/full-verify/owned-dependency-release-readiness.report.json
+  targo trust deps upstream-test-inventory
 ";
 
 const RELEASE_VALIDATE_USAGE: &str = "\
 Usage: targo trust release validate <command> [args...]
 
 Commands:
-  conformance                  Run Trust conformance checks
+  conformance                  Static conformance-fixture checks (NOT EVIDENCE: runs no tool)
   ledger-expirations           Fail on expired upstream-parity ledger entries
   seed-freshness               Require a current seed and all digest-bound payloads
   certified-monitors           Run real-Targo monitor E2Es (Linux/macOS x86_64/aarch64)
@@ -167,11 +170,16 @@ Commands:
   scripts         Run script syntax and verifier example metadata gates only
   verify-examples Check examples/verify*.rs Expected headers against trustc output
   coherence       Check the recorded first-party submodule SHAs type-check together
+  compare-audit   Compare complete saved compiler elision/obligation audits in Rust
+  qualify-pair    Run retained native paired input, compiler and test stages
 
 Examples:
   targo trust gate check-all --repo-root .
   targo trust gate scripts --repo-root .
   targo trust gate coherence --repo-root .
+  targo trust gate compare-audit --l4 --oracles row,identity PARENT CANDIDATE
+  targo trust gate qualify-pair inspect --help
+  targo trust gate qualify-pair paired --help
   targo trust gate verify-examples --trustc build/host/stage2/bin/trustc --json-output target/trust/gates/verify-examples.json
 ";
 
@@ -179,11 +187,14 @@ const REPO_USAGE: &str = "\
 Usage: targo trust repo <command> [args...]
 
 Commands:
-  check                         Run the repository compilation/test sanity gate
+  check                         Check verifier and proof inputs; --full adds broad diagnostics
+  check-ui                      Native compiler-target check and one selected Trust UI file
+  lock                          Native build/measurement ownership, status and recovery
   scripts                       Run script syntax and verifier example metadata gates
   verify-examples               Check examples/verify*.rs Expected headers/output
   ledger-expirations            Fail on expired upstream-parity ledger entries
   submodule-reachability        Check parent-pinned submodule commit remote reachability
+  seed-freshness                Validate Trust stage0 seed/source version cadence
   mir-extract                   Check rustc_private Trust MIR extraction path
   upstream-toolchain            Preflight upstream Rust test toolchain state
   compat                        Run compatibility harness against crate list
@@ -194,7 +205,7 @@ Commands:
   test-after-build              Run tiered tests after a completed Trust build
   stage2-noverify-mir-test      Run focused no-verification MIR-transform test
   stage2-noverify-self-build    Run bounded no-verification stage2 self-build gate
-  stage2-verify-self-build      Run bounded verification-on stage2 self-build gate
+  stage2-verify-self-build      Native verify self --full-verifier (compiler-crate evidence)
   showcase-demo                 Run internal model-check showcase demo
   concurrency-cap               Run cargo under the host concurrency limiter
   memory-monitor                Monitor RSS for a build process
@@ -238,15 +249,28 @@ static DEPS_SPECS: &[ScriptSpec] = &[ScriptSpec {
     summary: "Produce upstream Trust test inventory",
     runner: MaintenanceRunner::Python,
     fixed_args: &[],
+    not_evidence: None,
 }];
 
 static RELEASE_VALIDATE_SPECS: &[ScriptSpec] = &[
     ScriptSpec {
         names: &["conformance"],
         script: "scripts/run_trust_conformance.py",
-        summary: "Run Trust conformance checks",
+        summary: "Static conformance-fixture checks (NOT EVIDENCE: runs no tool)",
         runner: MaintenanceRunner::Python,
         fixed_args: &[],
+        // Kept as a command (docs/cli-reference.md and callers name it) but
+        // labelled: every check reads committed files only, so its "unsat" and
+        // "kernel_checked: true" are fixture text, not tool output. The report
+        // marks each such case `static_only`, and the harness row is a
+        // non-evidence diagnostic.
+        not_evidence: Some(
+            "every trust-conformance check is static: it reads committed files only (a \
+             fixture exists, or a field of a committed JSON fixture equals a manifest \
+             literal or another committed file's sha256). No trustc, solver, kernel or \
+             model checker runs, so a pass is agreement among committed files, not \
+             release evidence (see `static_only` in the report)",
+        ),
     },
     ScriptSpec {
         names: &["ledger-expirations"],
@@ -254,6 +278,7 @@ static RELEASE_VALIDATE_SPECS: &[ScriptSpec] = &[
         summary: "Fail on expired upstream-parity ledger entries",
         runner: MaintenanceRunner::Python,
         fixed_args: &[],
+        not_evidence: None,
     },
     ScriptSpec {
         names: &["seed-freshness"],
@@ -261,6 +286,7 @@ static RELEASE_VALIDATE_SPECS: &[ScriptSpec] = &[
         summary: "Validate Trust stage0 seed cadence and release payload binding",
         runner: MaintenanceRunner::Python,
         fixed_args: &["--require-payloads"],
+        not_evidence: None,
     },
     ScriptSpec {
         names: &["certified-monitors"],
@@ -268,6 +294,7 @@ static RELEASE_VALIDATE_SPECS: &[ScriptSpec] = &[
         summary: "Run the Linux/macOS stage2 certified-monitor release E2E gate",
         runner: MaintenanceRunner::Shell,
         fixed_args: &[],
+        not_evidence: None,
     },
 ];
 
@@ -348,12 +375,6 @@ static REPO_SPECS: &[MaintenanceSpec] = &[
         names: &["stage2-noverify-self-build"],
         script: "scripts/stage2_noverify_self_build.sh",
         summary: "Run bounded no-verification stage2 self-build gate",
-        runner: MaintenanceRunner::Shell,
-    },
-    MaintenanceSpec {
-        names: &["stage2-verify-self-build"],
-        script: "scripts/stage2_verify_self_build.sh",
-        summary: "Run bounded verification-on stage2 self-build gate",
         runner: MaintenanceRunner::Shell,
     },
     MaintenanceSpec {
@@ -475,7 +496,12 @@ fn run_verify_repo_gate(args: &[String]) -> ExitCode {
             other => forwarded.push(other.to_string()),
         }
     }
-    run_check_all_gate(&forwarded, include_cargo, "targo trust verify repo-gate")
+    run_check_all_gate(
+        &forwarded,
+        include_cargo,
+        "targo trust verify repo-gate",
+        RepositoryGateProfile::ProofInputs,
+    )
 }
 
 pub(crate) fn run_deps_subcommand(args: &[String]) -> ExitCode {
@@ -489,9 +515,53 @@ pub(crate) fn run_repo_subcommand(args: &[String]) -> ExitCode {
             print!("{REPO_USAGE}");
             ExitCode::SUCCESS
         }
-        Some("check") => run_check_all_gate(&args[1..], true, "targo trust repo check"),
-        Some("scripts") => run_check_all_gate(&args[1..], false, "targo trust repo scripts"),
+        Some("check") => run_check_all_gate(
+            &args[1..],
+            true,
+            "targo trust repo check",
+            RepositoryGateProfile::ProofInputs,
+        ),
+        Some("check-ui") => crate::repo_cli::run(&args[1..]),
+        Some("lock") => {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                let args = args[1..].iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+                ExitCode::from(build_helper::trust_repo_lock::management::cli::run(&args))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                eprintln!("native build-tree management is unavailable on this platform");
+                ExitCode::from(2)
+            }
+        }
+        Some("scripts") => run_check_all_gate(
+            &args[1..],
+            false,
+            "targo trust repo scripts",
+            RepositoryGateProfile::Diagnostics,
+        ),
         Some("verify-examples") => crate::verify_examples_cli::run(&args[1..]),
+        Some("stage2-verify-self-build") => {
+            // This alias shares the native owner's report and fixed-command policy.
+            // Prepend the mode: --stage-command consumes the remaining arguments,
+            // so appending it would let a caller swallow the enforced mode.
+            if args.get(1).is_some_and(|arg| is_help_arg(arg)) {
+                return crate::self_verify_cli::run(&args[1..]);
+            }
+            if let Some((name, _)) = env::vars_os().find(|(name, _)| {
+                name == "TRUST_STAGE2_SYSROOT"
+                    || name.as_encoded_bytes().starts_with(b"TRUST_STAGE2_VERIFY_")
+            }) {
+                eprintln!(
+                    "targo trust repo stage2-verify-self-build: retired shell setting {}; unset it and use the native verify self options",
+                    name.to_string_lossy()
+                );
+                return ExitCode::from(2);
+            }
+            let mut forwarded = vec!["--full-verifier".to_string()];
+            forwarded.extend_from_slice(&args[1..]);
+            crate::self_verify_cli::run(&forwarded)
+        }
         Some("check-all") => removed_repo_alias("check-all", "check"),
         Some("script-syntax") => removed_repo_alias("script-syntax", "scripts"),
         Some("examples") => removed_repo_alias("examples", "verify-examples"),
@@ -534,9 +604,21 @@ pub(crate) fn run_gate_subcommand(args: &[String]) -> ExitCode {
             print!("{GATE_USAGE}");
             ExitCode::SUCCESS
         }
-        Some("check-all") => run_check_all_gate(&args[1..], true, "targo trust gate check-all"),
-        Some("scripts") => run_check_all_gate(&args[1..], false, "targo trust gate scripts"),
+        Some("check-all") => run_check_all_gate(
+            &args[1..],
+            true,
+            "targo trust gate check-all",
+            RepositoryGateProfile::Diagnostics,
+        ),
+        Some("scripts") => run_check_all_gate(
+            &args[1..],
+            false,
+            "targo trust gate scripts",
+            RepositoryGateProfile::Diagnostics,
+        ),
         Some("coherence") => run_coherence_gate(&args[1..]),
+        Some("compare-audit") => crate::audit_comparison::run_subcommand(&args[1..]),
+        Some("qualify-pair") => crate::paired_qualification::run(&args[1..]),
         Some("verify-examples") => crate::verify_examples_cli::run(&args[1..]),
         // The removed aliases keep NAMING their replacement rather than falling
         // through to `unknown command`. Their callers are users and scripts
@@ -630,7 +712,7 @@ fn run_coherence_gate(args: &[String]) -> ExitCode {
 }
 
 const FALSIFY_USAGE: &str = "\
-Usage: targo trust falsify [bash-gate args...]
+Usage: targo trust falsify
 
 Run the verifier falsification self-test (mutation gate). For every fixture in
 tests/trust-falsification/proved/ the verifier MUST prove it; for every fixture
@@ -638,13 +720,16 @@ in tests/trust-falsification/mutant/ (a one-line-buggy twin of a proved case) it
 MUST fail closed. Green only if every proof is non-vacuous AND every mutant is
 refuted -- the load-bearing check that `proved` means something.
 
-The gate runs against the toolchain's freshly-built stage2 trustc (override with
-TRUSTC=/path/to/trustc). Exit 0 = GREEN, 1 = RED (a vacuous proof or surviving
-mutant), 2 = could not locate the gate script.
+The gate runs against the toolchain's freshly-built stage2 trustc. TRUSTC may name
+it explicitly, but only as the absolute, symlink-free
+<repo>/build/<host>/stage2/bin/trustc; any other value is refused. The gate takes
+no arguments of its own. Exit 0 = GREEN, 1 = RED (a vacuous proof or surviving
+mutant), 2 = the gate could not run (no gate script or stage2 trustc found, a
+rejected TRUSTC, a dirty checkout, stray arguments, or a non-Unix host).
 
 Examples:
   targo trust falsify
-  TRUSTC=build/aarch64-apple-darwin/stage2/bin/trustc targo trust falsify
+  TRUSTC=\"$PWD/build/aarch64-apple-darwin/stage2/bin/trustc\" targo trust falsify
 ";
 
 /// `targo trust falsify` -- run the verifier mutation self-test natively.
@@ -885,21 +970,25 @@ fn run_deps_rust_subcommand(args: &[String]) -> Option<ExitCode> {
     }
 
     match command {
-        "status" => Some(run_deps_report(command, &args[1..], false)),
-        "diff" | "upstream-plan" => Some(run_deps_report(command, &args[1..], false)),
-        "export" | "import" | "lock" => Some(run_deps_mutation(command, &args[1..])),
-        "validate" => Some(run_deps_report(command, &args[1..], true)),
+        // TRUST-08: the lock-driven alignment verbs are retired. They read
+        // `trust-engines.lock` (never tracked) and hashed checked-in
+        // `first-party/` snapshots, a model the move to git submodules made
+        // obsolete, so at the repository root each one failed on the missing
+        // lock. They keep their names so a user or script typing them is told
+        // what replaced them instead of landing in `unknown command`.
+        "status" | "validate" | "diff" | "upstream-plan" | "export" | "import" | "lock" => {
+            Some(retired_deps_verb(command))
+        }
+        // The removed pre-rename aliases pointed at `status`/`validate`, which
+        // are retired too, so they get the same directed refusal (echoing
+        // `alignment status` whole keeps the message matching what was typed).
+        "report" | "verify" => Some(retired_deps_verb(command)),
+        "alignment" if args.get(1).is_some_and(|arg| arg == "status") => {
+            Some(retired_deps_verb("alignment status"))
+        }
+        "alignment" => Some(retired_deps_verb("alignment")),
         // The removed deps aliases keep naming their replacement instead of
         // falling through to `unknown command` (fc5a9655a0 regression).
-        "report" => Some(removed_deps_alias("report", "status")),
-        "verify" => Some(removed_deps_alias("verify", "validate")),
-        // `alignment status` was a two-token spelling of the same removed
-        // alias; echoing both tokens back is what makes the message match what
-        // the user actually typed.
-        "alignment" if args.get(1).is_some_and(|arg| arg == "status") => {
-            Some(removed_deps_alias("alignment status", "status"))
-        }
-        "alignment" => Some(removed_deps_alias("alignment", "status")),
         "inventory" => Some(removed_deps_alias("inventory", "upstream-test-inventory")),
         _ => None,
     }
@@ -910,492 +999,41 @@ fn removed_deps_alias(alias: &str, replacement: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DepsGate {
-    None,
-    Full,
-    LiveCloneAlignment,
-    SnapshotIntegrity,
-    RefreshReadiness,
+/// The directed refusal for a retired lock-driven `deps` verb: exit 2, nothing
+/// on stdout, and the gitlink-era commands that answer the question it asked.
+fn retired_deps_verb(spelling: &str) -> ExitCode {
+    eprintln!("{}", retired_deps_verb_message(spelling));
+    ExitCode::from(2)
 }
 
-impl DepsGate {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "all" | "full" | "verify" | "validation" => Ok(Self::Full),
-            "live-clone-alignment" | "live-clones" => Ok(Self::LiveCloneAlignment),
-            "snapshot-integrity" | "snapshots" => Ok(Self::SnapshotIntegrity),
-            "refresh-readiness" | "refresh" => Ok(Self::RefreshReadiness),
-            other => Err(format!("unsupported --gate `{other}`")),
-        }
-    }
-
-    fn requires_deep_hash(self) -> bool {
-        matches!(self, Self::Full | Self::SnapshotIntegrity | Self::RefreshReadiness)
-    }
-
-    fn failed(self, report: &trust_deps::AlignmentReport) -> bool {
-        match self {
-            Self::None => false,
-            Self::Full | Self::RefreshReadiness => report.summary.failed > 0,
-            Self::LiveCloneAlignment => report.summary.live_clone_misaligned > 0,
-            Self::SnapshotIntegrity => report.summary.snapshot_mismatch > 0,
-        }
-    }
+fn retired_deps_verb_message(spelling: &str) -> String {
+    format!(
+        "targo trust deps {spelling}: retired — it read trust-engines.lock and checked-in \
+         first-party/ snapshots, and first-party/* are git submodules pinned by gitlink now \
+         (docs/first-party-pin-ledger.md). Use `targo trust repo submodule-reachability` \
+         (every pinned commit is fetchable from a remote ref), `targo trust gate coherence` \
+         (the pinned SHAs type-check together), or `scripts/submodule_sync.sh` (the submodule \
+         worktrees match their pins)."
+    )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DepsView {
-    Status,
-    Diff,
-    RefreshPlan,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepositoryGateProfile {
+    /// Actual verifier execution and the inputs its evidence depends on.
+    ProofInputs,
+    /// Explicit repository-wide diagnostics, including build and test probes.
+    Diagnostics,
 }
 
-impl DepsView {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "status" | "summary" => Ok(Self::Status),
-            "diff" | "drift" => Ok(Self::Diff),
-            "refresh-plan" | "upstream-plan" => Ok(Self::RefreshPlan),
-            other => Err(format!("unsupported --view `{other}`")),
-        }
-    }
-}
-
-fn run_deps_mutation(command: &str, args: &[String]) -> ExitCode {
-    let mut json = false;
-    let mut options = trust_deps::MutationOptions::for_root(
-        env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    );
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" | "--format=json" => {
-                json = true;
-                index += 1;
-            }
-            "--format" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: --format requires a value");
-                    return ExitCode::from(2);
-                };
-                match value.as_str() {
-                    "json" => json = true,
-                    "text" | "terminal" => json = false,
-                    other => {
-                        eprintln!("targo trust deps {command}: unsupported --format `{other}`");
-                        return ExitCode::from(2);
-                    }
-                }
-                index += 2;
-            }
-            "--apply" | "--write" | "--in-place" => {
-                options.apply = true;
-                index += 1;
-            }
-            "--fetch" => {
-                options.fetch = true;
-                index += 1;
-            }
-            "--allow-overwrite-local-drift" => {
-                options.allow_overwrite_local_drift = true;
-                index += 1;
-            }
-            "--overlay-policy" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: --overlay-policy requires a value");
-                    return ExitCode::from(2);
-                };
-                let Some(policy) = trust_deps::OverlayPolicy::parse(value) else {
-                    eprintln!("targo trust deps {command}: unsupported --overlay-policy `{value}`");
-                    return ExitCode::from(2);
-                };
-                options.overlay_policy = policy;
-                index += 2;
-            }
-            "--allow-bootstrap-overlays" => {
-                options.overlay_policy = trust_deps::OverlayPolicy::Bootstrap;
-                index += 1;
-            }
-            "--repo-root" | "--root" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: {} requires a path", args[index]);
-                    return ExitCode::from(2);
-                };
-                options.root = PathBuf::from(value);
-                options.lock_file = options.root.join("trust-engines.lock");
-                index += 2;
-            }
-            "--lock-file" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: --lock-file requires a path");
-                    return ExitCode::from(2);
-                };
-                options.lock_file = PathBuf::from(value);
-                index += 2;
-            }
-            "--clone-root" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: --clone-root requires a path");
-                    return ExitCode::from(2);
-                };
-                options.clone_root = PathBuf::from(value);
-                index += 2;
-            }
-            "--out" | "--output-dir" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: {} requires a path", args[index]);
-                    return ExitCode::from(2);
-                };
-                options.output_dir = Some(PathBuf::from(value));
-                index += 2;
-            }
-            "--dependency" | "--dep" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: {} requires a name", args[index]);
-                    return ExitCode::from(2);
-                };
-                options.dependencies.push(value.clone());
-                index += 2;
-            }
-            "-h" | "--help" => {
-                print!(
-                    "Usage: targo trust deps {command} [--json] [--fetch] [--dependency NAME] [--apply]\n\n\
-                     Additional options:\n\
-                       --repo-root PATH\n\
-                       --lock-file PATH\n\
-                       --clone-root PATH\n\
-                       --out DIR                         export only; write patch manifest\n\
-                       --allow-overwrite-local-drift      import only; confirms exported drift was reviewed\n\
-                       --overlay-policy forbid|bootstrap  default forbid; bootstrap explicitly applies dependency-modes overlays\n"
-                );
-                return ExitCode::SUCCESS;
-            }
-            other if other.starts_with('-') => {
-                eprintln!("targo trust deps {command}: unknown option `{other}`");
-                return ExitCode::from(2);
-            }
-            other => {
-                options.dependencies.push(other.to_string());
-                index += 1;
-            }
-        }
-    }
-
-    if command != "import" && options.allow_overwrite_local_drift {
-        eprintln!("targo trust deps {command}: --allow-overwrite-local-drift is import-only");
-        return ExitCode::from(2);
-    }
-
-    let report = match command {
-        "export" => trust_deps::run_export_transaction(&options),
-        "import" => trust_deps::run_import_transaction(&options),
-        "lock" => trust_deps::run_lock_transaction(&options),
-        _ => unreachable!("validated dependency mutation command"),
-    };
-    let report = match report {
-        Ok(report) => report,
-        Err(error) => {
-            eprintln!("targo trust deps {command}: {error}");
-            return ExitCode::from(1);
-        }
-    };
-
-    if json {
-        match trust_deps::render_mutation_json(&report) {
-            Ok(rendered) => println!("{rendered}"),
-            Err(error) => {
-                eprintln!("targo trust deps {command}: failed to render JSON: {error}");
-                return ExitCode::from(1);
-            }
-        }
-    } else {
-        print!("{}", trust_deps::render_mutation_text(&report));
-    }
-
-    if report.summary.failed > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
-}
-
-fn run_deps_report(command: &str, args: &[String], gate: bool) -> ExitCode {
-    let mut json = false;
-    let mut json_output: Option<PathBuf> = None;
-    let mut gate_mode = if gate { DepsGate::Full } else { DepsGate::None };
-    let mut view = match command {
-        "diff" => DepsView::Diff,
-        "upstream-plan" => DepsView::RefreshPlan,
-        _ => DepsView::Status,
-    };
-    let mut options = trust_deps::StatusOptions::for_root(
-        env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    );
-    if gate_mode.requires_deep_hash() {
-        options.deep_hash = true;
-    }
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" | "--format=json" => {
-                json = true;
-                index += 1;
-            }
-            "--format" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: --format requires a value");
-                    return ExitCode::from(2);
-                };
-                match value.as_str() {
-                    "json" => json = true,
-                    "text" | "terminal" => json = false,
-                    other => {
-                        eprintln!("targo trust deps {command}: unsupported --format `{other}`");
-                        return ExitCode::from(2);
-                    }
-                }
-                index += 2;
-            }
-            "--fetch" => {
-                options.fetch = true;
-                index += 1;
-            }
-            option if option.starts_with("--json-output=") => {
-                let value = option.strip_prefix("--json-output=").expect("prefix checked");
-                if value.is_empty() {
-                    eprintln!("targo trust deps {command}: --json-output requires a path");
-                    return ExitCode::from(2);
-                }
-                json_output = Some(PathBuf::from(value));
-                index += 1;
-            }
-            option if option.starts_with("--report=") => {
-                let value = option.strip_prefix("--report=").expect("prefix checked");
-                if value.is_empty() {
-                    eprintln!("targo trust deps {command}: --report requires a path");
-                    return ExitCode::from(2);
-                }
-                json_output = Some(PathBuf::from(value));
-                index += 1;
-            }
-            "--json-output" | "--report" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: {} requires a path", args[index]);
-                    return ExitCode::from(2);
-                };
-                json_output = Some(PathBuf::from(value));
-                index += 2;
-            }
-            "--deep-hash" => {
-                options.deep_hash = true;
-                index += 1;
-            }
-            "--production" => {
-                // Production dependency evidence must compare the checked-in
-                // source snapshot hash, even for non-gating status reports.
-                options.deep_hash = true;
-                index += 1;
-            }
-            option if option.starts_with("--source=") => {
-                let value = option.strip_prefix("--source=").expect("prefix checked");
-                if !apply_deps_source(command, value, &mut options) {
-                    return ExitCode::from(2);
-                }
-                index += 1;
-            }
-            "--source" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: --source requires a value");
-                    return ExitCode::from(2);
-                };
-                if !apply_deps_source(command, value, &mut options) {
-                    return ExitCode::from(2);
-                }
-                index += 2;
-            }
-            option if option.starts_with("--gate=") => {
-                let value = option.strip_prefix("--gate=").expect("prefix checked");
-                match DepsGate::parse(value) {
-                    Ok(parsed) => {
-                        gate_mode = parsed;
-                        if gate_mode.requires_deep_hash() {
-                            options.deep_hash = true;
-                        }
-                        index += 1;
-                    }
-                    Err(message) => {
-                        eprintln!("targo trust deps {command}: {message}");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            "--gate" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: --gate requires a value");
-                    return ExitCode::from(2);
-                };
-                match DepsGate::parse(value) {
-                    Ok(parsed) => {
-                        gate_mode = parsed;
-                        if gate_mode.requires_deep_hash() {
-                            options.deep_hash = true;
-                        }
-                        index += 2;
-                    }
-                    Err(message) => {
-                        eprintln!("targo trust deps {command}: {message}");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            option if option.starts_with("--view=") => {
-                let value = option.strip_prefix("--view=").expect("prefix checked");
-                match DepsView::parse(value) {
-                    Ok(parsed) => {
-                        view = parsed;
-                        index += 1;
-                    }
-                    Err(message) => {
-                        eprintln!("targo trust deps {command}: {message}");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            "--view" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: --view requires a value");
-                    return ExitCode::from(2);
-                };
-                match DepsView::parse(value) {
-                    Ok(parsed) => {
-                        view = parsed;
-                        index += 2;
-                    }
-                    Err(message) => {
-                        eprintln!("targo trust deps {command}: {message}");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            "--repo-root" | "--root" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: {} requires a path", args[index]);
-                    return ExitCode::from(2);
-                };
-                options.root = PathBuf::from(value);
-                options.lock_file = options.root.join("trust-engines.lock");
-                index += 2;
-            }
-            "--lock-file" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: --lock-file requires a path");
-                    return ExitCode::from(2);
-                };
-                options.lock_file = PathBuf::from(value);
-                index += 2;
-            }
-            "--clone-root" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: --clone-root requires a path");
-                    return ExitCode::from(2);
-                };
-                options.clone_root = PathBuf::from(value);
-                index += 2;
-            }
-            "--dependency" | "--dep" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("targo trust deps {command}: {} requires a name", args[index]);
-                    return ExitCode::from(2);
-                };
-                options.dependencies.push(value.clone());
-                index += 2;
-            }
-            "-h" | "--help" => {
-                print!("{DEPS_USAGE}");
-                return ExitCode::SUCCESS;
-            }
-            other => {
-                eprintln!("targo trust deps {command}: unknown option `{other}`");
-                return ExitCode::from(2);
-            }
-        }
-    }
-
-    let report = match trust_deps::collect_status(&options) {
-        Ok(report) => report,
-        Err(error) => {
-            eprintln!("targo trust deps {command}: {error}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let rendered_json = if json || json_output.is_some() {
-        match trust_deps::render_json(&report) {
-            Ok(rendered) => Some(rendered),
-            Err(error) => {
-                eprintln!("targo trust deps {command}: failed to render JSON: {error}");
-                return ExitCode::from(1);
-            }
-        }
-    } else {
-        None
-    };
-
-    if let Some(path) = &json_output {
-        if let Err(error) = write_deps_json_report(
-            &options.root,
-            path,
-            rendered_json.as_deref().expect("rendered JSON"),
-        ) {
-            eprintln!(
-                "targo trust deps {command}: failed to write JSON report to {}: {error}",
-                path.display()
-            );
-            return ExitCode::from(2);
-        }
-    }
-
-    if json {
-        println!("{}", rendered_json.as_deref().expect("rendered JSON"));
-    } else {
-        match view {
-            DepsView::Diff => print!("{}", trust_deps::render_diff_text(&report)),
-            DepsView::RefreshPlan => {
-                print!("{}", trust_deps::render_upstream_plan_text(&report))
-            }
-            DepsView::Status => print!("{}", trust_deps::render_text(&report)),
-        }
-    }
-
-    if gate_mode.failed(&report) { ExitCode::from(1) } else { ExitCode::SUCCESS }
-}
-
-fn write_deps_json_report(root: &Path, path: &Path, rendered: &str) -> Result<(), String> {
-    let output_path = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
-    if let Some(parent) = output_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("could not create directory: {error}"))?;
-    }
-    fs::write(output_path, format!("{rendered}\n"))
-        .map_err(|error| format!("could not write report: {error}"))
-}
-
-fn apply_deps_source(command: &str, value: &str, options: &mut trust_deps::StatusOptions) -> bool {
-    match value {
-        "git-index" | "checked-in" | "snapshot" => {
-            options.deep_hash = true;
-            true
-        }
-        "fingerprint" | "fast" => true,
-        other => {
-            eprintln!("targo trust deps {command}: unsupported --source `{other}`");
-            false
-        }
-    }
-}
-
-fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &str) -> ExitCode {
+fn run_check_all_gate(
+    args: &[String],
+    mut include_cargo: bool,
+    usage_command: &str,
+    mut profile: RepositoryGateProfile,
+) -> ExitCode {
     let mut repo_root_arg: Option<PathBuf> = None;
     let mut targo_arg: Option<(PathBuf, &'static str)> = None;
     let mut run_tests = false;
-    let mut run_host_diagnostics = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -1428,17 +1066,26 @@ fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &
                 include_cargo = false;
                 index += 1;
             }
+            "--full" => {
+                profile = RepositoryGateProfile::Diagnostics;
+                index += 1;
+            }
             "--run-tests" => {
+                profile = RepositoryGateProfile::Diagnostics;
                 run_tests = true;
                 index += 1;
             }
             "--host-diagnostics" => {
-                run_host_diagnostics = true;
-                index += 1;
+                eprintln!(
+                    "{usage_command}: --host-diagnostics was retired on 2026-09-28: it ran an \
+                     ambient host Cargo, and the golden gate already runs `targo --unverified \
+                     check` over targo-trust (owner directive: Trust for all ALab systems)"
+                );
+                return ExitCode::from(2);
             }
             "-h" | "--help" => {
-                print!(
-                    "Usage: {usage_command} [--repo-root PATH] [--targo TARGO] [--quick|--no-cargo] [--run-tests] [--host-diagnostics]\n"
+                println!(
+                    "Usage: {usage_command} [--repo-root PATH] [--targo TARGO] [--quick|--no-cargo] [--full] [--run-tests]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -1502,66 +1149,72 @@ fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &
     };
 
     let mut failed = false;
+    println!("Repository validation profile: {profile:?}");
+    if profile == RepositoryGateProfile::ProofInputs {
+        println!("Broad build/test diagnostics are opt-in with --full or --run-tests.");
+    }
 
-    println!("=== Script syntax and verifier examples ===");
-    failed |= !run_gate_step(
-        "python syntax",
-        command_in_repo(
-            python_command(),
-            &repo_root,
-            [
-                "-m",
-                "py_compile",
-                "scripts/check_cargo_manifest_alignment.py",
-                "scripts/check_ledger_expirations.py",
-                "scripts/check_seed_freshness.py",
-                "scripts/check_toolchain_coherence.py",
-            ],
-        ),
-    );
-    failed |= !run_shell_syntax_gate(&repo_root);
+    if profile == RepositoryGateProfile::Diagnostics {
+        println!("=== Script syntax and verifier examples ===");
+        failed |= !run_gate_step(
+            "python syntax",
+            command_in_repo(
+                python_command(),
+                &repo_root,
+                [
+                    "-m",
+                    "py_compile",
+                    "scripts/check_cargo_manifest_alignment.py",
+                    "scripts/check_ledger_expirations.py",
+                    "scripts/check_seed_freshness.py",
+                    "scripts/check_toolchain_coherence.py",
+                ],
+            ),
+        );
+        failed |= !run_shell_syntax_gate(&repo_root);
 
-    println!("\n=== Test-parity ledger expirations ===");
-    failed |= !run_gate_step(
-        "test-parity ledger expirations",
-        command_in_repo(
-            python_command(),
-            &repo_root,
-            ["scripts/check_ledger_expirations.py", "--warn-days", "14"],
-        ),
-    );
+        println!("\n=== Test-parity ledger expirations ===");
+        failed |= !run_gate_step(
+            "test-parity ledger expirations",
+            command_in_repo(
+                python_command(),
+                &repo_root,
+                ["scripts/check_ledger_expirations.py", "--warn-days", "14"],
+            ),
+        );
 
-    println!("\n=== Cargo manifest alignment ===");
-    failed |= !run_gate_step(
-        "cargo manifest alignment",
-        command_in_repo(
-            python_command(),
-            &repo_root,
-            ["scripts/check_cargo_manifest_alignment.py", "--workspace-drift-advisory"],
-        ),
-    );
-    failed |= !run_gate_step(
-        "cargo manifest checker self-check",
-        command_in_repo(
-            python_command(),
-            &repo_root,
-            ["scripts/check_cargo_manifest_alignment.py", "--self-check"],
-        ),
-    );
-    failed |= !run_gate_step(
-        "cargo default fanout tree proof",
-        command_in_repo(
-            python_command(),
-            &repo_root,
-            ["scripts/check_cargo_manifest_alignment.py", "--fanout-tree-proof"],
-        ),
-    );
+        println!("\n=== Cargo manifest alignment ===");
+        failed |= !run_gate_step(
+            "cargo manifest alignment",
+            command_in_repo(
+                python_command(),
+                &repo_root,
+                ["scripts/check_cargo_manifest_alignment.py"],
+            ),
+        );
+        failed |= !run_gate_step(
+            "cargo manifest checker self-check",
+            command_in_repo(
+                python_command(),
+                &repo_root,
+                ["scripts/check_cargo_manifest_alignment.py", "--self-check"],
+            ),
+        );
+        failed |= !run_gate_step(
+            "cargo default fanout tree proof",
+            command_in_repo(
+                python_command(),
+                &repo_root,
+                ["scripts/check_cargo_manifest_alignment.py", "--fanout-tree-proof"],
+            ),
+        );
 
-    println!("\n=== Toolchain coherence ===");
-    failed |= !run_gate_step(
-        "toolchain coherence",
-        command_in_repo(python_command(), &repo_root, ["scripts/check_toolchain_coherence.py"]),
-    );
+        println!("\n=== Toolchain coherence ===");
+        failed |= !run_gate_step(
+            "toolchain coherence",
+            command_in_repo(python_command(), &repo_root, ["scripts/check_toolchain_coherence.py"]),
+        );
+    }
 
     println!("\n=== Stage0 seed freshness ===");
     failed |= !run_gate_step(
@@ -1569,11 +1222,13 @@ fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &
         command_in_repo(python_command(), &repo_root, ["scripts/check_seed_freshness.py"]),
     );
 
-    println!("\n=== TCB panic-freedom ratchet ===");
-    failed |= !run_gate_step(
-        "TCB panic surface within baseline",
-        command_in_repo("bash".to_string(), &repo_root, ["scripts/check_tcb_panic_freedom.sh"]),
-    );
+    if profile == RepositoryGateProfile::Diagnostics {
+        println!("\n=== TCB panic-freedom ratchet ===");
+        failed |= !run_gate_step(
+            "TCB panic surface within baseline",
+            command_in_repo("bash".to_string(), &repo_root, ["scripts/check_tcb_panic_freedom.sh"]),
+        );
+    }
 
     println!("\n=== Submodule pin coherence ===");
     failed |= !run_gate_step(
@@ -1608,13 +1263,9 @@ fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &
         }
     }
 
-    if include_cargo {
+    if include_cargo && profile == RepositoryGateProfile::Diagnostics {
         failed |= !require_file(
-            &repo_root.join("crates/Cargo.lock"),
-            "lockfile required for --locked gate",
-        );
-        failed |= !require_file(
-            &repo_root.join("targo-trust/Cargo.lock"),
+            &repo_root.join("Cargo.lock"),
             "lockfile required for --locked gate",
         );
         failed |= !require_file(
@@ -1630,23 +1281,13 @@ fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &
         // reason without executing ty. Seed only the exact locked graph before
         // making both observations offline; successful compilation is not
         // expected.
-        failed |= !run_targo_gate(
-            &repo_root,
-            targo.as_deref().expect("resolved targo"),
-            ["fetch", "--manifest-path", TEMPORAL_FABRIC_MANIFEST, "--locked"],
+        failed |= !run_gate_step(
+            "targo",
+            temporal_fixture_fetch_command(&repo_root, targo.as_deref().expect("resolved targo")),
         );
-        failed |= !run_targo_gate(
-            &repo_root,
-            targo.as_deref().expect("resolved targo"),
-            [
-                "tree",
-                "--manifest-path",
-                TEMPORAL_FABRIC_MANIFEST,
-                "--locked",
-                "--offline",
-                "--edges",
-                "normal",
-            ],
+        failed |= !run_gate_step(
+            "targo",
+            temporal_fixture_tree_command(&repo_root, targo.as_deref().expect("resolved targo")),
         );
         failed |= !run_temporal_fixture_boundary_gate(
             &repo_root,
@@ -1673,7 +1314,7 @@ fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &
         failed |= !run_targo_gate(
             &repo_root,
             targo.as_deref().expect("resolved targo"),
-            ["check", "--manifest-path", "crates/Cargo.toml", "--locked", "--workspace", "--lib"],
+            ["check", "--manifest-path", "Cargo.toml", "--locked", "--lib"],
         );
 
         println!("\n=== Integration tests (test targets) ===");
@@ -1683,7 +1324,7 @@ fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &
             [
                 "check",
                 "--manifest-path",
-                "crates/Cargo.toml",
+                "Cargo.toml",
                 "--locked",
                 "--tests",
                 "-p",
@@ -1709,7 +1350,7 @@ fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &
                 [
                     "test",
                     "--manifest-path",
-                    "crates/Cargo.toml",
+                    "Cargo.toml",
                     "--locked",
                     "-p",
                     "trust-upstream-compat",
@@ -1721,27 +1362,40 @@ fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &
         }
 
         if run_tests {
-            println!("\n=== Workspace Trust tests ===");
-            failed |= !run_targo_gate(
-                &repo_root,
-                targo.as_deref().expect("resolved targo"),
-                [
-                    "test",
-                    "--manifest-path",
-                    "crates/Cargo.toml",
-                    "--locked",
-                    "--workspace",
-                    "--lib",
-                    "--tests",
-                    "--features",
-                    "trust-bmc/trust-mc-core-types",
-                    "--no-fail-fast",
-                ],
-            );
+            // `--tests` runs every tests/*.rs, and two of them run targo-trust
+            // and fail without one built from this tree. A failed build fails
+            // the gate and the workspace tests do not run: they could only fail.
+            let targo = targo.as_deref().expect("resolved targo");
+            println!("\n=== targo-trust for the workspace tests ===");
+            match prebuild_targo_trust_for_tests(&repo_root, targo) {
+                Ok(targo_trust) => {
+                    println!(
+                        "PASS: targo-trust built {}; the workspace tests get the copy {TARGO_TRUST_TEST_BIN_ENV}={}",
+                        targo_trust.built.display(),
+                        targo_trust.copy.display()
+                    );
+                    println!("\n=== Workspace Trust tests ===");
+                    failed |= !run_gate_step(
+                        "targo",
+                        workspace_trust_tests_command(&repo_root, targo, &targo_trust.copy),
+                    );
+                }
+                Err(failure) => {
+                    // The build's output was held (it is the same cached
+                    // warnings every run): shown now, before the verdict.
+                    eprint!("{}", failure.held_output);
+                    eprintln!("FAIL: {}", failure.why);
+                    eprintln!(
+                        "FAIL: Workspace Trust tests not run: trust-integration-tests' targo-trust \
+                         tests need {TARGO_TRUST_TEST_BIN_ENV} and fail without it"
+                    );
+                    failed = true;
+                }
+            }
             println!("\n=== targo-trust tests ===");
             failed |= !run_targo_gate(
                 &repo_root,
-                targo.as_deref().expect("resolved targo"),
+                targo,
                 [
                     "test",
                     "--manifest-path",
@@ -1750,24 +1404,6 @@ fn run_check_all_gate(args: &[String], mut include_cargo: bool, usage_command: &
                     "--all-targets",
                     "--no-fail-fast",
                 ],
-            );
-        }
-    }
-
-    if run_host_diagnostics {
-        println!("\n=== Host cargo diagnostics (advisory) ===");
-        let host_cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let mut command = Command::new(host_cargo);
-        command.current_dir(&repo_root).env("CARGO_SKIP_CACHE", "1").args([
-            "check",
-            "--manifest-path",
-            "targo-trust/Cargo.toml",
-            "--locked",
-            "--all-targets",
-        ]);
-        if !run_gate_step("host cargo diagnostics", command) {
-            eprintln!(
-                "WARN: optional host Cargo diagnostics failed; golden Trust gates are unaffected"
             );
         }
     }
@@ -1979,6 +1615,10 @@ fn require_clean_git_checkout(repo_root: &Path) -> Result<(), String> {
     ))
 }
 
+// The stage2 `trustc`/`targo` this binds are files a build has just written,
+// so the probe's first exec waits behind macOS's machine-wide syspolicyd scan
+// (docs/KNOWN_HAZARDS.md EXEC-ASSESS-STALL-1): it gets the release identity
+// probes' hang guard, not a 10 s budget a loaded host's queue outlasts.
 fn checked_version_output(program: &Path, flag: &str, tool: &str) -> Result<String, String> {
     const MAX_VERSION_BYTES: usize = 64 * 1024;
     let mut command = Command::new(program);
@@ -1987,7 +1627,7 @@ fn checked_version_output(program: &Path, flag: &str, tool: &str) -> Result<Stri
         &mut command,
         &format!("check-all stage2 {tool} identity probe"),
         MAX_VERSION_BYTES,
-        Duration::from_secs(10),
+        crate::release_cli::TOOL_IDENTITY_PROBE_HANG_GUARD,
     )
     .map_err(|error| {
         format!("check-all could not run stage2 {tool} {}: {error}", program.display())
@@ -2120,9 +1760,15 @@ fn run_shell_syntax_gate(repo_root: &Path) -> bool {
         return false;
     }
 
-    let mut command = Command::new("bash");
-    command.current_dir(repo_root).arg("-n").args(scripts);
-    run_gate_step("shell syntax", command)
+    // Bash parses only its first script operand. Further paths would become
+    // that script's positional arguments, leaving their syntax unchecked.
+    let mut passed = true;
+    for script in scripts {
+        let mut command = Command::new("bash");
+        command.current_dir(repo_root).arg("-n").arg(&script);
+        passed &= run_gate_step(&format!("shell syntax: {}", script.display()), command);
+    }
+    passed
 }
 
 fn run_targo_gate<I, S>(repo_root: &Path, targo: &Path, args: I) -> bool
@@ -2135,18 +1781,222 @@ where
     run_gate_step("targo", command)
 }
 
+/// The gate's Targo for a compilation command (`build`, `check`, `test`): the
+/// unverified lane, named as Targo requires before any such verb.
 fn targo_gate_command(repo_root: &Path, targo: &Path, offline: bool) -> Command {
+    let mut command = targo_gate_environment(repo_root, targo, offline);
+    command.arg("--unverified");
+    command
+}
+
+/// The gate's Targo with no lane: for a command that compiles nothing
+/// (`fetch`, `tree`) and for `targo trust`, the verified lane. Targo refuses
+/// `--unverified` before those verbs ("valid only for a Targo compilation
+/// command"), so a gate step that typed it would fail before judging anything.
+fn targo_gate_environment(repo_root: &Path, targo: &Path, offline: bool) -> Command {
     let mut command = Command::new(targo);
-    command.current_dir(repo_root).env("CARGO_SKIP_CACHE", "1").arg("--unverified");
+    command.current_dir(repo_root).env("CARGO_SKIP_CACHE", "1");
     if offline {
         command.env("CARGO_NET_OFFLINE", "true");
     }
     command
 }
 
-fn run_temporal_fixture_boundary_gate(repo_root: &Path, targo: &Path) -> bool {
-    let mut command = targo_gate_command(repo_root, targo, true);
+/// Seeds the temporal fixture's exact locked graph, online.
+fn temporal_fixture_fetch_command(repo_root: &Path, targo: &Path) -> Command {
+    let mut command = targo_gate_environment(repo_root, targo, false);
+    command.args(["fetch", "--manifest-path", TEMPORAL_FABRIC_MANIFEST, "--locked"]);
+    command
+}
+
+/// Resolves the seeded graph offline from the committed lock.
+fn temporal_fixture_tree_command(repo_root: &Path, targo: &Path) -> Command {
+    let mut command = targo_gate_environment(repo_root, targo, false);
+    command.args([
+        "tree",
+        "--manifest-path",
+        TEMPORAL_FABRIC_MANIFEST,
+        "--locked",
+        "--offline",
+        "--edges",
+        "normal",
+    ]);
+    command
+}
+
+/// The public automatic temporal route on the fixture, offline.
+fn temporal_fixture_boundary_command(repo_root: &Path, targo: &Path) -> Command {
+    let mut command = targo_gate_environment(repo_root, targo, true);
     command.args(["trust", "temporal", "targo-trust/tests/fixtures/fabric"]);
+    command
+}
+
+/// The path of the `targo-trust` that crates/ tests run. trust-integration-tests'
+/// binary_to_trust_ir_e2e and scale_fixture_crate read it and panic without it.
+/// Until 2026-09-30 they searched the target dirs instead, so an absent binary
+/// passed and a stale one answered for this tree
+/// (docs/issues/2026-09-29-binary-to-trust-ir-e2e-golden-stale-and-passes-without-its-binary.md,
+/// defect 2). scripts/check_crates_tests_scoped.py and scripts/dev-test.sh set it
+/// the way this gate does.
+const TARGO_TRUST_TEST_BIN_ENV: &str = "TRUST_TARGO_TRUST_BIN";
+
+/// Builds the targo-trust bin from this tree: check-all refuses a checkout
+/// that is not clean, so this is the tree as committed, and `--locked` uses its
+/// Cargo.lock as it is, never updating it. The JSON messages go to stdout and
+/// the rendered diagnostics to stderr, so the gate reads the path cargo itself
+/// reports.
+fn targo_trust_prebuild_command(repo_root: &Path, targo: &Path) -> Command {
+    let mut command = targo_gate_command(repo_root, targo, false);
+    command.args([
+        "build",
+        "--manifest-path",
+        "targo-trust/Cargo.toml",
+        "--bin",
+        "targo-trust",
+        "--locked",
+        "--message-format",
+        "json-render-diagnostics",
+    ]);
+    command
+}
+
+/// The `executable` of cargo's compiler-artifact message for the targo-trust
+/// bin, or None. It is cargo's answer, never a path derived from a target dir
+/// and a profile name: CARGO_TARGET_DIR, a config or a profile moves the file.
+fn targo_trust_executable_from_messages(stdout: &[u8]) -> Option<PathBuf> {
+    let mut found = None;
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let target = &message["target"];
+        let is_bin =
+            target["kind"].as_array().is_some_and(|kinds| kinds.iter().any(|k| k == "bin"));
+        if message["reason"] == "compiler-artifact" && target["name"] == "targo-trust" && is_bin {
+            if let Some(executable) = message["executable"].as_str() {
+                found = Some(PathBuf::from(executable));
+            }
+        }
+    }
+    found
+}
+
+/// A targo-trust built from this tree, copied out of the target dir. The copy
+/// lives as long as `_private`.
+struct TargoTrustCopy {
+    built: PathBuf,
+    copy: PathBuf,
+    _private: tempfile::TempDir,
+}
+
+/// Why the prebuild failed, and the build's own output, which is held until a
+/// failure needs it: replayed on every run, targo-trust's cached dependency
+/// warnings were 3786 lines on 2026-09-30, as scripts/check_crates_tests_scoped.py
+/// measured, and that lane holds them the same way.
+#[derive(Debug)]
+struct TargoTrustPrebuildFailure {
+    why: String,
+    held_output: String,
+}
+
+impl TargoTrustPrebuildFailure {
+    fn new(why: String) -> Self {
+        Self { why, held_output: String::new() }
+    }
+}
+
+/// The build output a failure shows: cargo's rendered text (stderr), then
+/// every stdout line that is not one of cargo's JSON messages (a wrapper's own
+/// text, say); cargo's JSON itself is never shown.
+fn targo_trust_build_held_output(output: &std::process::Output) -> String {
+    let mut held = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !held.is_empty() && !held.ends_with('\n') {
+        held.push('\n');
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| value.is_object()) {
+            continue;
+        }
+        held.push_str(line);
+        held.push('\n');
+    }
+    held
+}
+
+/// Builds targo-trust and copies the file cargo reports into a private
+/// directory the moment cargo exits. The tests run the copy, not the target
+/// dir's file, which any build sharing that target dir may relink while they
+/// run. `fs::copy` clones on APFS (`fclonefileat`), so the copy costs no disk
+/// there. Every error fails the gate: the tests that run targo-trust are never
+/// skipped. One line says the build has started; its own output is held and
+/// comes back only in a failure.
+fn prebuild_targo_trust_for_tests(
+    repo_root: &Path,
+    targo: &Path,
+) -> Result<TargoTrustCopy, TargoTrustPrebuildFailure> {
+    let mut command = targo_trust_prebuild_command(repo_root, targo);
+    let spelled: Vec<_> =
+        command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+    println!(
+        "building: {} {} (its output is shown only if it fails)",
+        targo.display(),
+        spelled.join(" ")
+    );
+    let output = bounded_script_output(&mut command, "targo-trust build")
+        .map_err(TargoTrustPrebuildFailure::new)?;
+    let held_output = targo_trust_build_held_output(&output);
+    if !output.status.success() {
+        return Err(TargoTrustPrebuildFailure {
+            why: format!("targo-trust failed to build ({})", output.status),
+            held_output,
+        });
+    }
+    let Some(built) = targo_trust_executable_from_messages(&output.stdout) else {
+        return Err(TargoTrustPrebuildFailure {
+            why: "the targo-trust build exited 0 but no compiler-artifact message named the targo-trust bin"
+                .to_string(),
+            held_output,
+        });
+    };
+    let private =
+        tempfile::Builder::new().prefix("check-all-targo-trust.").tempdir().map_err(|error| {
+            TargoTrustPrebuildFailure::new(format!(
+                "cannot create a private directory for targo-trust: {error}"
+            ))
+        })?;
+    let copy = private
+        .path()
+        .join(built.file_name().unwrap_or_else(|| std::ffi::OsStr::new("targo-trust")));
+    fs::copy(&built, &copy).map_err(|error| {
+        TargoTrustPrebuildFailure::new(format!(
+            "cannot copy {} into {}: {error}",
+            built.display(),
+            private.path().display()
+        ))
+    })?;
+    Ok(TargoTrustCopy { built, copy, _private: private })
+}
+
+/// Every crates/ member's lib tests and tests/*.rs, handed the targo-trust copy
+/// the tests that run it require.
+fn workspace_trust_tests_command(repo_root: &Path, targo: &Path, targo_trust: &Path) -> Command {
+    let mut command = targo_gate_command(repo_root, targo, false);
+    command.env(TARGO_TRUST_TEST_BIN_ENV, targo_trust).args([
+        "test",
+        "--manifest-path",
+        "Cargo.toml",
+        "--locked",
+        "--lib",
+        "--tests",
+        "--features",
+        "trust-bmc/trust-mc-core-types",
+        "--no-fail-fast",
+    ]);
+    command
+}
+
+fn run_temporal_fixture_boundary_gate(repo_root: &Path, targo: &Path) -> bool {
+    let mut command = temporal_fixture_boundary_command(repo_root, targo);
     match bounded_script_output(&mut command, "temporal fixture boundary") {
         Ok(output) => {
             emit_script_output(&output);
@@ -2240,6 +2090,9 @@ fn run_leaf_command(group: &str, args: &[String], specs: &[ScriptSpec], usage: &
     }
 
     if let Some(spec) = specs.iter().find(|spec| spec.matches(command)) {
+        if let Some(notice) = not_evidence_notice(group, spec) {
+            eprintln!("{notice}");
+        }
         let script_args = spec
             .fixed_args
             .iter()
@@ -2257,6 +2110,13 @@ fn run_leaf_command(group: &str, args: &[String], specs: &[ScriptSpec], usage: &
     eprintln!("targo trust {group}: unknown command `{command}`");
     eprint!("{usage}");
     ExitCode::from(2)
+}
+
+/// The stderr line a command whose green is not evidence prints before it runs.
+fn not_evidence_notice(group: &str, spec: &ScriptSpec) -> Option<String> {
+    spec.not_evidence.map(|reason| {
+        format!("targo trust {group} {}: NOT EVIDENCE: {reason}", spec.canonical_name())
+    })
 }
 
 fn run_maintenance_leaf_command(
@@ -2630,23 +2490,429 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn shell_syntax_gate_rejects_an_invalid_later_script() {
+        let root = tempfile::Builder::new().prefix("trust syntax gate.").tempdir().unwrap();
+        let scripts = root.path().join("scripts");
+        fs::create_dir(&scripts).unwrap();
+        fs::write(scripts.join("a-valid.sh"), ": valid first script\n").unwrap();
+        fs::write(scripts.join("z later.sh"), "if true; then\n").unwrap();
+
+        assert!(!run_shell_syntax_gate(root.path()), "the later syntax error must fail the gate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_syntax_gate_accepts_valid_scripts_without_executing_them() {
+        let root = tempfile::Builder::new().prefix("trust syntax gate.").tempdir().unwrap();
+        let scripts = root.path().join("scripts");
+        fs::create_dir(&scripts).unwrap();
+        fs::write(scripts.join("a-valid.sh"), "touch syntax-gate-must-not-run\n").unwrap();
+        fs::write(scripts.join("z valid.sh"), "items=(one two)\n").unwrap();
+
+        assert!(run_shell_syntax_gate(root.path()));
+        assert!(!root.path().join("syntax-gate-must-not-run").exists());
+    }
+
+    /// These are command-scheduling controls, not verifier proof evidence.
+    /// Exercise the real CLI dispatcher and subprocess runner against a clean
+    /// repository. Required input checks still execute and a failed verifier
+    /// input still fails; broad diagnostics run only on explicit request.
+    #[cfg(unix)]
+    #[test]
+    fn repository_gate_diagnostics_require_an_explicit_request() {
+        let root = temp_test_dir("repository-gate-scope");
+        fs::create_dir_all(root.join("targo-trust")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("targo-trust/Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        fs::write(
+            root.join("scripts/check_seed_freshness.py"),
+            "from pathlib import Path\nPath('target/seed').touch()\nraise SystemExit(7)\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("scripts/check_toolchain_coherence.py"),
+            "from pathlib import Path\nPath('target/broad').touch()\n",
+        )
+        .unwrap();
+        for (script, marker) in
+            [("check_pin_coherence.sh", "pins"), ("check_bridge_pin.sh", "bridge")]
+        {
+            fs::write(root.join("scripts").join(script), format!("touch target/{marker}\n"))
+                .unwrap();
+        }
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Trust Test",
+                "-c",
+                "user.email=trust-test@example.invalid",
+                "commit",
+                "-qm",
+                "repository gate scope fixture",
+            ],
+        ] {
+            assert!(Command::new("git").current_dir(&root).args(args).status().unwrap().success());
+        }
+        let args = vec![
+            "repo-gate".to_string(),
+            "--repo-root".to_string(),
+            root.display().to_string(),
+            "--quick".to_string(),
+        ];
+        assert_eq!(run_verify_subcommand(&args), ExitCode::from(1));
+        for marker in ["seed", "pins", "bridge"] {
+            assert!(root.join("target").join(marker).is_file(), "missing required {marker} check");
+        }
+        assert!(!root.join("target/broad").exists());
+        let mut full = args;
+        full.push("--full".to_string());
+        assert_eq!(run_verify_subcommand(&full), ExitCode::from(1));
+        assert!(root.join("target/broad").is_file(), "explicit diagnostics were not run");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Regression (2026-09-28): `--host-diagnostics` ran an ambient host Cargo
+    /// (`$CARGO`, else a bare `cargo`) with a lane-less `check`. It is retired:
+    /// the flag is refused up front, before any repository or tool resolution,
+    /// so no caller can believe it still ran.
+    #[test]
+    fn check_all_refuses_the_retired_host_diagnostics_flag() {
+        let status = run_check_all_gate(
+            &["--host-diagnostics".to_string()],
+            true,
+            "targo trust gate check-all",
+            RepositoryGateProfile::Diagnostics,
+        );
+        assert_eq!(status, ExitCode::from(2));
+    }
+
     #[test]
     fn temporal_fixture_seed_is_online_and_boundary_is_offline() {
         let repo_root = Path::new("/repo");
         let targo = Path::new("/bin/targo");
-        let online = targo_gate_command(repo_root, targo, false);
-        let offline = targo_gate_command(repo_root, targo, true);
+        let fetch = temporal_fixture_fetch_command(repo_root, targo);
+        let tree = temporal_fixture_tree_command(repo_root, targo);
+        let boundary = temporal_fixture_boundary_command(repo_root, targo);
         let cargo_offline = OsStr::new("CARGO_NET_OFFLINE");
-
-        assert!(
-            online.get_envs().all(|(name, _)| name != cargo_offline),
-            "the graph-seeding fetch must not force Cargo into offline mode"
-        );
-        assert!(
-            offline.get_envs().any(|(name, value)| {
+        let forces_offline = |command: &Command| {
+            command.get_envs().any(|(name, value)| {
                 name == cargo_offline && value == Some(OsStr::new("true"))
             })
+        };
+
+        assert!(
+            !forces_offline(&fetch),
+            "the graph-seeding fetch must not force Cargo into offline mode"
         );
+        assert!(!forces_offline(&tree), "the tree step asks for --offline itself");
+        assert!(forces_offline(&boundary), "the temporal boundary is observed offline");
+    }
+
+    /// Regression (2026-11-15): Targo refuses `--unverified` before a verb that
+    /// compiles nothing and before `trust` ("valid only for a Targo compilation
+    /// command", since 7347c005b2). The gate typed it before every step, so the
+    /// temporal fixture's fetch, tree and boundary steps all exited 101 before
+    /// judging the fixture. Each step names its own verb first; compilation
+    /// steps keep the lane.
+    #[test]
+    fn temporal_fixture_steps_name_no_compilation_lane() {
+        let repo_root = Path::new("/repo");
+        let targo = Path::new("/bin/targo");
+        let unverified = OsStr::new("--unverified");
+        for (verb, command) in [
+            ("fetch", temporal_fixture_fetch_command(repo_root, targo)),
+            ("tree", temporal_fixture_tree_command(repo_root, targo)),
+            ("trust", temporal_fixture_boundary_command(repo_root, targo)),
+        ] {
+            assert_eq!(command.get_program(), targo.as_os_str());
+            assert_eq!(command.get_current_dir(), Some(repo_root));
+            assert!(
+                command.get_args().all(|arg| arg != unverified),
+                "the {verb} step must not name the compilation lane: {:?}",
+                command.get_args().collect::<Vec<_>>()
+            );
+            assert_eq!(command.get_args().next(), Some(OsStr::new(verb)));
+            assert!(command.get_args().any(|arg| arg == OsStr::new("--locked")) || verb == "trust");
+        }
+
+        let compile = targo_gate_command(repo_root, targo, false);
+        assert_eq!(
+            compile.get_args().next(),
+            Some(unverified),
+            "a compilation step keeps its lane"
+        );
+    }
+
+    /// Regression (2026-09-30): the `--run-tests` workspace run reaches every
+    /// tests/*.rs, binary_to_trust_ir_e2e and scale_fixture_crate included, and
+    /// those panic without TRUST_TARGO_TRUST_BIN. The command must carry the copy.
+    #[test]
+    fn check_all_workspace_tests_get_the_targo_trust_copy() {
+        let copy = Path::new("/private/check-all-targo-trust.x/targo-trust");
+        let command =
+            workspace_trust_tests_command(Path::new("/repo"), Path::new("/bin/targo"), copy);
+        let handed: Vec<_> = command
+            .get_envs()
+            .filter(|(name, _)| *name == OsStr::new(TARGO_TRUST_TEST_BIN_ENV))
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(handed, [Some(copy.as_os_str())]);
+        let args: Vec<_> = command.get_args().collect();
+        assert!(!args.contains(&OsStr::new("--workspace")), "the product run must use root default-members");
+        for selects in
+            ["--unverified", "test", "Cargo.toml", "--lib", "--tests"]
+        {
+            assert!(args.contains(&OsStr::new(selects)), "missing `{selects}` in {args:?}");
+        }
+    }
+
+    #[test]
+    fn check_all_builds_targo_trust_from_this_tree_with_cargo_messages() {
+        let command = targo_trust_prebuild_command(Path::new("/repo"), Path::new("/bin/targo"));
+        assert_eq!(command.get_current_dir(), Some(Path::new("/repo")));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--unverified",
+                "build",
+                "--manifest-path",
+                "targo-trust/Cargo.toml",
+                "--bin",
+                "targo-trust",
+                "--locked",
+                "--message-format",
+                "json-render-diagnostics",
+            ]
+        );
+    }
+
+    #[test]
+    fn targo_trust_path_is_the_bin_artifact_message_executable() {
+        let messages = concat!(
+            "   Compiling targo-trust v0.1.0\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"targo-trust","kind":["lib"]},"executable":null}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"other","kind":["bin"]},"executable":"/t/debug/other"}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"targo-trust","kind":["bin"]},"executable":"/t/first/targo-trust"}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"targo-trust","kind":["bin"]},"executable":"/t/debug/targo-trust"}"#,
+            "\n",
+            // Not a bin, though it names an executable: the name alone would take it.
+            r#"{"reason":"compiler-artifact","target":{"name":"targo-trust","kind":["lib"]},"executable":"/t/debug/libtargo_trust.so"}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+            "\n",
+        );
+        // The last bin message is cargo's final word on the file.
+        assert_eq!(
+            targo_trust_executable_from_messages(messages.as_bytes()),
+            Some(PathBuf::from("/t/debug/targo-trust"))
+        );
+        assert_eq!(
+            targo_trust_executable_from_messages(b"{\"reason\":\"build-finished\"}\n"),
+            None
+        );
+    }
+
+    /// The tests get a private copy of the file cargo reported: a sibling build
+    /// relinking the target dir's file afterwards does not change what they run,
+    /// and a failed build or a build naming no binary is an error, never a skip.
+    #[cfg(unix)]
+    #[test]
+    fn check_all_prebuild_copies_the_binary_cargo_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_test_dir("check-all-targo-trust-prebuild");
+        fs::create_dir_all(&root).expect("create fixture root");
+        // The fake reports `$PWD`, which is canonical (/private/var on macOS).
+        let root = fs::canonicalize(&root).expect("canonical fixture root");
+        let targo = root.join("fake-targo");
+        write_executable_script(
+            &targo,
+            r#"#!/bin/sh
+printf '%s\n' "$*" > invoked.txt
+mkdir -p target/debug
+printf 'built from this tree\n' > target/debug/targo-trust
+chmod 755 target/debug/targo-trust
+echo '   Compiling targo-trust' >&2
+printf '{"reason":"compiler-artifact","target":{"name":"targo-trust","kind":["bin"]},"executable":"%s/target/debug/targo-trust"}\n' "$PWD"
+"#,
+        );
+        let prebuilt = prebuild_targo_trust_for_tests(&root, &targo).expect("prebuild");
+        assert_eq!(
+            fs::read_to_string(root.join("invoked.txt")).expect("invocation"),
+            "--unverified build --manifest-path targo-trust/Cargo.toml --bin targo-trust --locked \
+             --message-format json-render-diagnostics\n"
+        );
+        assert_eq!(prebuilt.built, root.join("target/debug/targo-trust"));
+        assert_ne!(prebuilt.copy.parent(), prebuilt.built.parent());
+        assert!(!prebuilt.copy.starts_with(&root), "the copy must live outside the target dir");
+        assert_ne!(fs::metadata(&prebuilt.copy).expect("copy").permissions().mode() & 0o111, 0);
+        fs::write(&prebuilt.built, "relinked by a sibling build\n").expect("relink");
+        assert_eq!(fs::read_to_string(&prebuilt.copy).expect("copy"), "built from this tree\n");
+        let copy = prebuilt.copy.clone();
+        drop(prebuilt);
+        assert!(!copy.exists(), "the private copy outlived the gate step");
+
+        // A failure carries the held output: cargo's text (stderr), then the
+        // stdout lines that are not cargo's JSON; never the JSON itself.
+        write_executable_script(
+            &targo,
+            "#!/bin/sh\necho 'targo: not cargo JSON'\necho '{\"reason\":\"build-finished\",\"success\":false}'\n\
+             echo 'error[E0425]: oops' >&2\nexit 101\n",
+        );
+        let failure = prebuild_targo_trust_for_tests(&root, &targo).err().expect("failed build");
+        assert!(failure.why.contains("targo-trust failed to build"), "{failure:?}");
+        assert_eq!(
+            failure.held_output, "error[E0425]: oops\ntargo: not cargo JSON\n",
+            "{failure:?}"
+        );
+
+        write_executable_script(
+            &targo,
+            "#!/bin/sh\necho '{\"reason\":\"build-finished\"}'\necho '   Compiling' >&2\n",
+        );
+        let failure = prebuild_targo_trust_for_tests(&root, &targo).err().expect("no artifact");
+        assert!(failure.why.contains("no compiler-artifact message"), "{failure:?}");
+        assert_eq!(failure.held_output, "   Compiling\n", "{failure:?}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Regression (2026-09-30): the wiring, not only the helpers. The whole
+    /// `check-all --run-tests` runs over a clean git fixture with a fake stage2
+    /// targo and trustc: the targo-trust build comes first, the workspace test
+    /// command alone gets the private copy (whose content survives a relink of
+    /// the target dir's file), the copy is gone when the gate returns, and a
+    /// failed build leaves the workspace tests unrun.
+    #[cfg(unix)]
+    #[test]
+    fn check_all_run_tests_hands_the_workspace_tests_a_copy_built_first() {
+        let root = temp_test_dir("check-all-run-tests-wiring");
+        fs::create_dir_all(root.join("targo-trust")).expect("create fixture repository");
+        let root = fs::canonicalize(&root).expect("canonical fixture root");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .status()
+                .expect("run git fixture command");
+            assert!(status.success(), "git fixture command failed: {args:?}");
+        };
+        git(&["init", "-q"]);
+        fs::write(root.join("targo-trust/Cargo.toml"), "[package]\nname = \"targo-trust\"\n")
+            .expect("write repository marker");
+        fs::write(root.join(".gitignore"), "build/\ntarget/\n").expect("write ignore rules");
+        git(&["add", "targo-trust/Cargo.toml", ".gitignore"]);
+        git(&[
+            "-c",
+            "user.name=Trust Test",
+            "-c",
+            "user.email=trust-test@example.invalid",
+            "commit",
+            "-qm",
+            "check-all wiring fixture",
+        ]);
+        let head = git_head(&root).expect("fixture HEAD");
+        let bin = root.join("build/host/stage2/bin");
+        fs::create_dir_all(&bin).expect("create stage2 bin");
+        let targo = bin.join("targo");
+        write_executable_script(
+            &bin.join("trustc"),
+            &format!(
+                "#!/bin/sh\nprintf 'trustc 1.99.0-dev\\ncommit-hash: {head}\\nhost: test-host\\n'\n"
+            ),
+        );
+        // Every gate command runs in the repository root; the log is under the
+        // ignored target/, so the fixture stays clean.
+        write_executable_script(
+            &targo,
+            r#"#!/bin/sh
+if [ "${1:-}" = "-Vv" ]; then
+    printf 'targo 1.99.0-dev\nrelease: 1.99.0-dev\nhost: test-host\n'
+    exit 0
+fi
+mkdir -p target/debug
+case " $* " in
+*" build --manifest-path targo-trust/Cargo.toml "*)
+    echo build >> target/calls.log
+    if [ -f target/build-fails ]; then exit 101; fi
+    printf 'built from this tree\n' > target/debug/targo-trust
+    chmod 755 target/debug/targo-trust
+    printf '{"reason":"compiler-artifact","target":{"name":"targo-trust","kind":["bin"]},"executable":"%s/target/debug/targo-trust"}\n' "$(pwd -P)"
+    ;;
+*" --lib --tests "*)
+    printf 'relinked by a sibling build\n' > target/debug/targo-trust
+    body=missing
+    if [ -f "${TRUST_TARGO_TRUST_BIN:-/nonexistent}" ]; then body=$(cat "$TRUST_TARGO_TRUST_BIN"); fi
+    printf 'workspace-tests %s %s\n' "${TRUST_TARGO_TRUST_BIN:-unset}" "$body" >> target/calls.log
+    ;;
+*" test "*)
+    printf 'other-test %s\n' "${TRUST_TARGO_TRUST_BIN:-unset}" >> target/calls.log
+    ;;
+esac
+exit 0
+"#,
+        );
+        let log = root.join("target/calls.log");
+        let args = vec![
+            "--repo-root".to_string(),
+            root.display().to_string(),
+            "--targo".to_string(),
+            targo.display().to_string(),
+            "--run-tests".to_string(),
+        ];
+
+        let _ = run_check_all_gate(
+            &args,
+            true,
+            "targo trust gate check-all",
+            RepositoryGateProfile::Diagnostics,
+        );
+        let calls = fs::read_to_string(&log).expect("the gate ran the fake targo");
+        let lines: Vec<&str> = calls.lines().collect();
+        let build = lines.iter().position(|line| *line == "build").expect("targo-trust built");
+        let workspace: Vec<_> =
+            lines.iter().enumerate().filter(|(_, l)| l.starts_with("workspace-tests ")).collect();
+        assert_eq!(workspace.len(), 1, "{calls}");
+        let (at, line) = workspace[0];
+        assert!(build < at, "the build must come before the workspace tests: {calls}");
+        let (copy, body) = line["workspace-tests ".len()..].split_once(' ').expect("path and body");
+        let copy = Path::new(copy);
+        assert!(copy.is_absolute() && !copy.starts_with(&root), "not a private copy: {calls}");
+        assert_eq!(body, "built from this tree", "{calls}");
+        assert!(!copy.exists(), "the private copy outlived the gate");
+        let others: Vec<_> = lines.iter().filter(|l| l.starts_with("other-test ")).collect();
+        assert!(!others.is_empty(), "{calls}");
+        assert!(
+            others.iter().all(|l| !l.contains(copy.to_str().expect("utf-8 path"))),
+            "only the workspace test command gets the copy: {calls}"
+        );
+
+        fs::remove_file(&log).expect("reset the log");
+        fs::write(root.join("target/build-fails"), "").expect("make the build fail");
+        let status = run_check_all_gate(
+            &args,
+            true,
+            "targo trust gate check-all",
+            RepositoryGateProfile::Diagnostics,
+        );
+        assert_eq!(status, ExitCode::from(1));
+        let calls = fs::read_to_string(&log).expect("the gate ran the fake targo");
+        assert!(calls.lines().any(|line| line == "build"), "{calls}");
+        assert!(
+            !calls.contains("workspace-tests "),
+            "a failed build ran the workspace tests: {calls}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2715,16 +2981,16 @@ mod tests {
         assert!(!VERIFY_USAGE.contains("Removed commands:"));
         assert!(VERIFY_USAGE.contains("Removed verify aliases reject when invoked"));
         assert!(VERIFY_USAGE.contains("targo trust verify cargo-cache"));
-        assert!(VERIFY_USAGE.contains("targo trust verify repo-gate --quick"));
+        assert!(VERIFY_USAGE.contains("targo trust verify repo-gate --full"));
         assert!(VERIFY_USAGE.contains("verify self --full-verifier"));
         assert!(VERIFY_USAGE.contains("release check"));
         assert!(
             !VERIFY_USAGE.contains("targo trust verify full-preflight"),
             "removed full-preflight must not be advertised as a normal verify example"
         );
-        assert!(DEPS_USAGE.contains("targo trust deps validate"));
-        assert!(DEPS_USAGE.contains("targo trust deps validate --production"));
-        assert!(DEPS_USAGE.contains("--json-output"));
+        assert!(!DEPS_USAGE.contains("targo trust deps validate"));
+        assert!(!DEPS_USAGE.contains("targo trust deps status"));
+        assert!(DEPS_USAGE.contains("Retired commands"));
         assert!(!DEPS_USAGE.contains("targo trust deps matrix"));
         assert!(!DEPS_USAGE.contains("  matrix"));
         assert!(!DEPS_USAGE.contains("  report"));
@@ -2738,10 +3004,6 @@ mod tests {
             !DEPS_USAGE.lines().any(|line| line.trim_start().starts_with("inventory ")),
             "removed deps inventory alias must not be advertised"
         );
-        assert!(DEPS_USAGE.contains("targo trust deps status --dependency ty --json"));
-        assert!(DEPS_USAGE.contains("targo trust deps status --json"));
-        assert!(DEPS_USAGE.contains("targo trust deps status --fetch --gate snapshot-integrity"));
-        assert!(DEPS_USAGE.contains("targo trust deps validate --source git-index --json"));
         assert!(RELEASE_VALIDATE_USAGE.contains("targo trust release validate"));
         assert!(RELEASE_VALIDATE_USAGE.contains("seed-freshness"));
         assert!(RELEASE_VALIDATE_USAGE.contains("certified-monitors"));
@@ -2773,6 +3035,57 @@ mod tests {
         assert_unique_aliases("release validate", RELEASE_VALIDATE_SPECS);
         assert_unique_maintenance_aliases("repo", REPO_SPECS);
         assert_unique_maintenance_aliases("bootstrap", BOOTSTRAP_SPECS);
+    }
+
+    #[test]
+    fn stage2_self_verify_alias_help_uses_the_native_owner() {
+        assert_eq!(
+            run_repo_subcommand(&["stage2-verify-self-build".into(), "--help".into()]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stage2_self_verify_alias_cannot_hide_the_fixed_mode_in_a_custom_command() {
+        let root = temp_test_dir("stage2-self-verify-custom-command");
+        fs::create_dir_all(&root).expect("create fixture repository");
+        let root = fs::canonicalize(root).expect("canonical fixture repository");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n")
+            .expect("write valid fixture manifest");
+        let report = root.join("report");
+        let marker = root.join("custom-command-executed");
+        let native_args = vec![
+            "--repo-root".into(),
+            root.display().to_string(),
+            "--evidence-manifest".into(),
+            "Cargo.toml".into(),
+            "--report-dir".into(),
+            report.display().to_string(),
+            "--stage-command".into(),
+            "/usr/bin/touch".into(),
+            marker.display().to_string(),
+        ];
+        let mut alias_args = vec!["stage2-verify-self-build".into()];
+        alias_args.extend_from_slice(&native_args);
+        let status = run_repo_subcommand(&alias_args);
+        assert_eq!(status, ExitCode::from(2));
+        assert!(!marker.exists(), "a full-verifier alias must never execute caller commands");
+        assert!(!report.exists(), "refused commands must not create a report");
+
+        // Positive control: this valid fixture reaches the diagnostic custom
+        // command when the enforced mode is absent. Dropping the alias's flag
+        // would therefore create both marker and report and fail above.
+        assert_ne!(crate::self_verify_cli::run(&native_args), ExitCode::SUCCESS);
+        assert!(marker.is_file(), "diagnostic control must actually execute");
+        let payload: serde_json::Value = serde_json::from_slice(
+            &fs::read(report.join("self-verify-harness.report.json"))
+                .expect("diagnostic control must publish its incomplete report"),
+        )
+        .expect("parse diagnostic control report");
+        assert_eq!(payload["proof"]["status"], "incomplete");
+        assert_eq!(payload["proof"]["complete"], false);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2808,10 +3121,56 @@ mod tests {
             "tests::real_targo_test_executes_e5_tailcall_and_extended_carriers",
             "tests::real_targo_test_executes_authorized_satisfying_integration_test",
             "tests::real_targo_test_rejects_unharnessed_test_target_before_execution",
+            "tests::real_targo_test_strict_lane_compiles_under_the_sealed_loader_closure",
+            "tests::real_targo_test_strict_lane_compiles_audited_proc_macro_provider",
+            "tests::real_targo_test_advisory_lane_runs_proc_macro_crate_tests_with_static_std",
+            "tests::real_targo_test_strict_lane_passes_a_proved_harness_test",
+            "tests::real_targo_test_strict_lane_refuses_an_unproved_test_body",
+            "tests::real_targo_test_check_tests_and_test_pass_a_zero_obligation_test_crate",
         ] {
             assert!(script.contains(test), "release gate omits {test}");
         }
         assert!(script.contains("--exact --ignored"));
+        // Review 2026-09-28 (Track B build): the E2Es run `targo trust`
+        // in-process, so the test executable must carry the SHIPPED
+        // targo-trust feature set; a feature-less build withheld proved rows
+        // at the publication boundary and failed a strict-PASS E2E. The list is
+        // the bootstrap one, read from its source so neither can drift alone.
+        // This is independent of the `trustd` sibling below: the features
+        // decide what the in-process frontend can publish, while the sibling
+        // is matched on release + commit + its own bytes, none of which the
+        // test executable's features change.
+        let bootstrap_tool = std::fs::read_to_string(
+            repository_root.join("src/bootstrap/src/core/build_steps/tool.rs"),
+        )
+        .expect("read bootstrap tool steps");
+        let shipped = bootstrap_tool
+            .split("fn targo_trust_in_process_features()")
+            .nth(1)
+            .and_then(|body| body.split(".into_iter()").next())
+            .expect("targo_trust_in_process_features body");
+        let shipped: Vec<&str> =
+            shipped.split('"').skip(1).step_by(2).filter(|name| !name.is_empty()).collect();
+        assert!(!shipped.is_empty(), "no shipped targo-trust feature parsed");
+        assert!(
+            script.contains(&format!("TARGO_TRUST_SHIPPED_FEATURES=\"{}\"", shipped.join(","))),
+            "release gate does not build the E2E executable with the shipped features {shipped:?}"
+        );
+        assert!(script.contains("--features \"$TARGO_TRUST_SHIPPED_FEATURES\""));
+        // The E2Es run `targo trust` in the compiled test executable, which
+        // accepts only a `trustd` sibling with its own compiled identity;
+        // without one they never reached Cargo. The gate compiles the test with
+        // the stage2 identity and stages the hashed stage2 `trustd` itself, not
+        // a side-built daemon.
+        assert!(script.contains("\"CFG_RELEASE=$TRUSTD_RELEASE\""));
+        assert!(script.contains("\"CFG_VER_HASH=$CURRENT_HEAD\""));
+        assert!(script.contains("place_test_binary_trustd || exit 1"));
+        assert!(script.contains("TEST_BINARY_TRUSTD=\"$(dirname -- \"$TEST_BINARY\")/trustd\""));
+        assert!(script.contains("cp -- \"$TRUSTD\" \"$TEST_BINARY_TRUSTD\""));
+        assert!(script.contains("\"$TEST_BINARY_TRUSTD_SHA256\" != \"$TRUSTD_SHA256\""));
+        assert!(script.contains("\"$FINAL_TEST_BINARY_TRUSTD_SHA256\" != \"$TRUSTD_SHA256\""));
+        assert!(!script.contains("--bin trustd"));
+        assert!(script.contains("test-binary-trustd.txt"));
         assert!(script.contains("RELEASE_TEST_PREFIX=\"tests::real_targo_test_\""));
         assert!(script.contains("does not match the exact reviewed set"));
         assert!(
@@ -3329,11 +3688,24 @@ mod tests {
 
     #[test]
     fn repo_and_bootstrap_specs_are_documented_and_explicitly_typed() {
-        for spec in REPO_SPECS.iter().chain(BOOTSTRAP_SPECS.iter()) {
+        // A ROW in the spec's own usage text, not a substring of either: `seed-freshness`
+        // sat inside BOOTSTRAP_USAGE's `check-seed-freshness` row for two months while
+        // REPO_USAGE never listed it, and the substring test could not tell.
+        let listed = |usage: &str, name: &str| {
+            usage.lines().any(|line| {
+                line.strip_prefix("  ").and_then(|row| row.split_whitespace().next()) == Some(name)
+            })
+        };
+        for (spec, usage) in REPO_SPECS
+            .iter()
+            .map(|spec| (spec, REPO_USAGE))
+            .chain(BOOTSTRAP_SPECS.iter().map(|spec| (spec, BOOTSTRAP_USAGE)))
+        {
             assert!(!spec.summary.is_empty());
             assert!(
-                REPO_USAGE.contains(spec.canonical_name())
-                    || BOOTSTRAP_USAGE.contains(spec.canonical_name())
+                listed(usage, spec.canonical_name()),
+                "{} has no Commands row in its usage text",
+                spec.canonical_name()
             );
             match spec.runner {
                 MaintenanceRunner::Python => assert!(spec.script.ends_with(".py")),
@@ -3349,83 +3721,50 @@ mod tests {
         assert!(RELEASE_VALIDATE_USAGE.contains("conformance"));
     }
 
+    /// `release validate conformance` sits beside real release gates and runs no
+    /// tool, so its usage row and its run must both say NOT EVIDENCE, and no
+    /// real gate may carry the label.
     #[test]
-    fn deps_gate_failure_modes_are_targeted() {
-        let report = trust_deps::AlignmentReport {
-            schema: "trust.deps.alignment.v1",
-            root: ".".to_string(),
-            lock_file: "trust-engines.lock".to_string(),
-            fetch: false,
-            summary: trust_deps::AlignmentSummary {
-                total: 7,
-                ok: 5,
-                failed: 2,
-                stale_lock: 1,
-                snapshot_mismatch: 1,
-                live_clone_misaligned: 0,
-                dirty_live_clone: 0,
-                metadata_mismatch: 0,
-            },
-            dependencies: Vec::new(),
-        };
-
-        assert!(DepsGate::Full.failed(&report));
-        assert!(DepsGate::SnapshotIntegrity.failed(&report));
-        assert!(DepsGate::RefreshReadiness.failed(&report));
-        assert!(!DepsGate::LiveCloneAlignment.failed(&report));
-        assert!(!DepsGate::None.failed(&report));
+    fn release_conformance_is_labelled_not_evidence() {
+        let spec = RELEASE_VALIDATE_SPECS
+            .iter()
+            .find(|spec| spec.matches("conformance"))
+            .expect("release validate conformance command");
+        let notice = not_evidence_notice("release validate", spec)
+            .expect("conformance must print a NOT EVIDENCE notice");
+        assert!(
+            notice.starts_with("targo trust release validate conformance: NOT EVIDENCE: ")
+                && notice.contains("static_only"),
+            "{notice}"
+        );
+        assert!(
+            RELEASE_VALIDATE_USAGE.lines().any(|line| {
+                line.trim_start().starts_with("conformance ") && line.contains("NOT EVIDENCE")
+            }),
+            "the usage row must say NOT EVIDENCE:\n{RELEASE_VALIDATE_USAGE}"
+        );
+        assert!(spec.summary.contains("NOT EVIDENCE"), "{}", spec.summary);
+        for other in RELEASE_VALIDATE_SPECS.iter().filter(|spec| !spec.matches("conformance")) {
+            assert!(
+                other.not_evidence.is_none(),
+                "release gate {} must not be labelled not-evidence",
+                other.canonical_name()
+            );
+        }
     }
 
     #[test]
-    fn deps_gate_and_view_aliases_match_runbook_terms() {
-        assert_eq!(
-            DepsGate::parse("snapshot-integrity").expect("gate"),
-            DepsGate::SnapshotIntegrity
-        );
-        assert_eq!(
-            DepsGate::parse("live-clone-alignment").expect("gate"),
-            DepsGate::LiveCloneAlignment
-        );
-        assert_eq!(DepsGate::parse("refresh-readiness").expect("gate"), DepsGate::RefreshReadiness);
-        assert!(DepsGate::parse("unknown-gate").is_err());
-
-        assert_eq!(DepsView::parse("refresh-plan").expect("view"), DepsView::RefreshPlan);
-        assert_eq!(DepsView::parse("upstream-plan").expect("view"), DepsView::RefreshPlan);
-        assert_eq!(DepsView::parse("diff").expect("view"), DepsView::Diff);
-        assert!(DepsView::parse("unknown-view").is_err());
-    }
-
-    #[test]
-    fn deps_json_report_writer_creates_parent_dirs_and_trailing_newline() {
-        let root = temp_test_dir("deps-json-report");
-        let report_path = PathBuf::from("reports").join("deps").join("release.json");
-        let report = trust_deps::AlignmentReport {
-            schema: "trust.deps.alignment.v1",
-            root: ".".to_string(),
-            lock_file: "trust-engines.lock".to_string(),
-            fetch: false,
-            summary: trust_deps::AlignmentSummary {
-                total: 0,
-                ok: 0,
-                failed: 0,
-                stale_lock: 0,
-                snapshot_mismatch: 0,
-                live_clone_misaligned: 0,
-                dirty_live_clone: 0,
-                metadata_mismatch: 0,
-            },
-            dependencies: Vec::new(),
-        };
-        let rendered = trust_deps::render_json(&report).expect("render deps report");
-
-        write_deps_json_report(&root, &report_path, &rendered).expect("write deps report");
-
-        let text = fs::read_to_string(root.join(&report_path)).expect("read deps report");
-        assert!(text.ends_with('\n'));
-        let json: serde_json::Value = serde_json::from_str(&text).expect("valid report JSON");
-        assert_eq!(json["schema"], "trust.deps.alignment.v1");
-
-        let _ = fs::remove_dir_all(root);
+    fn retired_deps_verb_message_names_every_gitlink_replacement() {
+        let message = retired_deps_verb_message("validate");
+        assert!(message.starts_with("targo trust deps validate: retired"), "{message}");
+        for replacement in [
+            "targo trust repo submodule-reachability",
+            "targo trust gate coherence",
+            "scripts/submodule_sync.sh",
+            "docs/first-party-pin-ledger.md",
+        ] {
+            assert!(message.contains(replacement), "missing `{replacement}`: {message}");
+        }
     }
 
     fn temp_test_dir(label: &str) -> PathBuf {

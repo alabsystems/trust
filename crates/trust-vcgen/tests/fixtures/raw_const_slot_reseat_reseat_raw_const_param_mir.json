@@ -1,0 +1,744 @@
+{
+  "name": "reseat_raw_const_param",
+  "def_path": "raw_const_slot_reseat::reseat_raw_const_param",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+    "line_start": 154,
+    "col_start": 0,
+    "line_end": 164,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "p"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 155,
+                "col_start": 7,
+                "line_end": 155,
+                "col_end": 8
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        5,
+                        8
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 155,
+                "col_start": 7,
+                "line_end": 155,
+                "col_end": 12
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+              "line_start": 155,
+              "col_start": 7,
+              "line_end": 155,
+              "col_end": 12
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 1,
+                    "projections": []
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 156,
+                "col_start": 16,
+                "line_end": 156,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": true,
+                      "pointee": {
+                        "Int": {
+                          "width": 8,
+                          "signed": false
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 156,
+                "col_start": 16,
+                "line_end": 156,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 158,
+                "col_start": 12,
+                "line_end": 158,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 158,
+                "col_start": 12,
+                "line_end": 158,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 158,
+                "col_start": 12,
+                "line_end": 158,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 158,
+                "col_start": 12,
+                "line_end": 158,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 158,
+                "col_start": 12,
+                "line_end": 158,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Not",
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 158,
+                "col_start": 12,
+                "line_end": 158,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "NullPointerDereference",
+            "target": 5,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+              "line_start": 158,
+              "col_start": 12,
+              "line_end": 158,
+              "col_end": 20
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 7,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 160,
+                "col_start": 8,
+                "line_end": 160,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 162,
+                "col_start": 8,
+                "line_end": 162,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": [
+                  "Deref"
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      250,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 158,
+                "col_start": 12,
+                "line_end": 158,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 160,
+                "col_start": 8,
+                "line_end": 160,
+                "col_end": 9
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        8
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+                "line_start": 160,
+                "col_start": 8,
+                "line_end": 160,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 7,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 2,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/raw_const_slot_reseat.rs",
+              "line_start": 160,
+              "col_start": 8,
+              "line_end": 160,
+              "col_end": 14
+            },
+            "unwind": "Continue"
+          }
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 255
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

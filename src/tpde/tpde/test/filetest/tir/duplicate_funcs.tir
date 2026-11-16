@@ -1,0 +1,16 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+;
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+; RUN: not %tpde_test --run-until=ir %s
+
+; Duplicate function definitions are not okay
+func() {
+entry:
+  terminate
+}
+
+func() {
+entry:
+  terminate
+}

@@ -1,0 +1,497 @@
+{
+  "name": "two_buf",
+  "def_path": "arms::two_buf",
+  "span": {
+    "file": "arms.rs",
+    "line_start": 20,
+    "col_start": 0,
+    "line_end": 24,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "c"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 16,
+                "signed": false
+              }
+            },
+            "len": 2
+          }
+        },
+        "name": "buf"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 16,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 16,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 16,
+                    "signed": false
+                  }
+                },
+                "len": 2
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Repeat": [
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        16
+                      ]
+                    }
+                  },
+                  2
+                ]
+              },
+              "span": {
+                "file": "arms.rs",
+                "line_start": 21,
+                "col_start": 18,
+                "line_end": 21,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "arms.rs",
+                "line_start": 22,
+                "col_start": 19,
+                "line_end": 22,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Ref": {
+                      "mutable": true,
+                      "inner": {
+                        "Slice": {
+                          "elem": {
+                            "Int": {
+                              "width": 16,
+                              "signed": false
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "arms.rs",
+                "line_start": 22,
+                "col_start": 19,
+                "line_end": 22,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::char::methods::<impl char>::encode_utf16",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "arms.rs",
+              "line_start": 22,
+              "col_start": 4,
+              "line_end": 22,
+              "col_end": 28
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4703791156326232143,
+              "def_index": 6578,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4703791156326232143,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "arms.rs",
+                "line_start": 23,
+                "col_start": 8,
+                "line_end": 23,
+                "col_end": 9
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "arms.rs",
+                "line_start": 23,
+                "col_start": 4,
+                "line_end": 23,
+                "col_end": 10
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 2,
+            "span": {
+              "file": "arms.rs",
+              "line_start": 23,
+              "col_start": 4,
+              "line_end": 23,
+              "col_end": 10
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      {
+                        "Index": 6
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "arms.rs",
+                "line_start": 23,
+                "col_start": 4,
+                "line_end": 23,
+                "col_end": 10
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 16,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "c",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "c",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1114111
+            }
+          ]
+        },
+        {
+          "Not": {
+            "And": [
+              {
+                "Ge": [
+                  {
+                    "Var": [
+                      "c",
+                      "Int"
+                    ]
+                  },
+                  {
+                    "Int": 55296
+                  }
+                ]
+              },
+              {
+                "Le": [
+                  {
+                    "Var": [
+                      "c",
+                      "Int"
+                    ]
+                  },
+                  {
+                    "Int": 57343
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "c",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "c",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -19,7 +19,7 @@ use crate::lifetime::{
     check_lifetime_constraints,
 };
 use crate::model::{
-    BasicBlock, BlockId, Operand, Place, Rvalue, SourceSpan, Statement, Terminator, VerifiableBody,
+    BasicBlock, BlockId, Place, Rvalue, SourceSpan, Statement, Terminator, VerifiableBody,
 };
 
 // ---------------------------------------------------------------------------
@@ -353,7 +353,7 @@ fn analyze_block_borrows(
             }
 
             // Track ownership changes.
-            checker.track_ownership(stmt);
+            checker.track_ownership_in_place(stmt);
         }
     }
 }
@@ -368,7 +368,7 @@ fn check_rvalue_borrows(
     analysis: &mut LifetimeAnalysis,
 ) {
     // Check move/copy operands for use-after-move.
-    for place in extract_operand_places(rvalue) {
+    crate::lifetime::for_each_rvalue_operand_place(rvalue, |place| {
         if let crate::lifetime::OwnershipState::Moved { span: move_span, .. } =
             checker.ownership_state(place.local)
         {
@@ -378,7 +378,7 @@ fn check_rvalue_borrows(
                 use_span: span.clone(),
             });
         }
-    }
+    });
 
     // For reference creation, the checker.check_borrow handles conflicts.
     if let Rvalue::Ref { mutable, place: borrowed } = rvalue {
@@ -392,46 +392,6 @@ fn check_rvalue_borrows(
     }
 
     let _ = block; // used in constraint generation (future extension)
-}
-
-/// Extract places used as operands in an rvalue.
-fn extract_operand_places(rvalue: &Rvalue) -> Vec<&Place> {
-    match rvalue {
-        Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
-            extract_operand_place(op).into_iter().collect()
-        }
-        Rvalue::BinaryOp(_, a, b)
-        | Rvalue::CheckedBinaryOp(_, a, b)
-        | Rvalue::UncheckedBinaryOp(_, a, b) => {
-            let mut places = Vec::new();
-            places.extend(extract_operand_place(a));
-            places.extend(extract_operand_place(b));
-            places
-        }
-        Rvalue::Ref { place, .. } | Rvalue::AddressOf(_, place) => vec![place],
-        Rvalue::Aggregate(_, ops) => ops.iter().filter_map(extract_operand_place).collect(),
-        Rvalue::Repeat(op, _) => extract_operand_place(op).into_iter().collect(),
-        Rvalue::Discriminant(p) | Rvalue::Len(p) | Rvalue::CopyForDeref(p) => vec![p],
-        // Trust: W2 inc-0 — pointer arithmetic reads BOTH the base pointer and
-        // the offset count, exactly like a `BinaryOp`.
-        Rvalue::PtrOffset { ptr, count } => {
-            let mut places = Vec::new();
-            places.extend(extract_operand_place(ptr));
-            places.extend(extract_operand_place(count));
-            places
-        }
-        Rvalue::Unsupported { operands, .. } => {
-            operands.iter().filter_map(extract_operand_place).collect()
-        }
-    }
-}
-
-/// Extract the place from a single operand.
-fn extract_operand_place(op: &Operand) -> Option<&Place> {
-    match op {
-        Operand::Copy(p) | Operand::Move(p) => Some(p),
-        Operand::Constant(_) | Operand::Symbolic(_) | Operand::Unsupported { .. } => None,
-    }
 }
 
 /// Handle terminator effects on borrow sets.
@@ -581,15 +541,6 @@ mod tests {
             line_end: line,
             col_end: 40,
         }
-    }
-
-    // --- ProgramPoint tests ---
-
-    #[test]
-    fn test_program_point_new() {
-        let pp = ProgramPoint::new(BlockId(2), 3);
-        assert_eq!(pp.block, BlockId(2));
-        assert_eq!(pp.statement_index, 3);
     }
 
     // --- BorrowSet tests ---

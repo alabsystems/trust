@@ -411,53 +411,55 @@ fn infer_from_return_type(
 
 /// Remove duplicate proposals (same kind + spec_body).
 fn dedup_proposals(proposals: &mut Vec<Proposal>) {
-    let mut seen = FxHashSet::default();
+    let mut seen: FxHashSet<(u8, String, String)> = FxHashSet::default();
     proposals.retain(|p| {
-        let key = format!("{:?}:{}", std::mem::discriminant(&p.kind), spec_body_of(&p.kind));
-        seen.insert(key)
+        let (tag, primary, secondary) = spec_body_key(&p.kind);
+        seen.insert((tag, primary.to_string(), secondary.to_string()))
     });
 }
 
-/// Extract the spec body string from a ProposalKind for dedup purposes.
-fn spec_body_of(kind: &ProposalKind) -> String {
+/// Extract a `(kind_tag, primary_body, secondary_body)` key from a `ProposalKind` for dedup purposes.
+fn spec_body_key(kind: &ProposalKind) -> (u8, &str, &str) {
     match kind {
-        ProposalKind::AddPrecondition { spec_body }
-        | ProposalKind::AddPostcondition { spec_body }
-        | ProposalKind::AddInvariant { spec_body } => spec_body.clone(),
-        ProposalKind::SafeArithmetic { original, replacement } => {
-            format!("{original}->{replacement}")
-        }
-        ProposalKind::AddBoundsCheck { check_expr } => check_expr.clone(),
-        ProposalKind::AddNonZeroCheck { check_expr } => check_expr.clone(),
+        ProposalKind::AddPrecondition { spec_body } => (0, spec_body, ""),
+        ProposalKind::AddPostcondition { spec_body } => (1, spec_body, ""),
+        ProposalKind::AddInvariant { spec_body } => (2, spec_body, ""),
+        ProposalKind::SafeArithmetic { original, replacement } => (3, original, replacement),
+        ProposalKind::AddBoundsCheck { check_expr } => (4, check_expr, ""),
+        ProposalKind::AddNonZeroCheck { check_expr } => (5, check_expr, ""),
     }
+}
+
+fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len()
+        && s.is_char_boundary(s.len() - suffix.len())
+        && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 /// Check if a parameter name looks like an index variable.
 fn is_likely_index(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower == "i"
-        || lower == "j"
-        || lower == "k"
-        || lower == "idx"
-        || lower == "index"
-        || lower == "pos"
-        || lower == "offset"
-        || lower.ends_with("_idx")
-        || lower.ends_with("_index")
+    name.eq_ignore_ascii_case("i")
+        || name.eq_ignore_ascii_case("j")
+        || name.eq_ignore_ascii_case("k")
+        || name.eq_ignore_ascii_case("idx")
+        || name.eq_ignore_ascii_case("index")
+        || name.eq_ignore_ascii_case("pos")
+        || name.eq_ignore_ascii_case("offset")
+        || ends_with_ignore_ascii_case(name, "_idx")
+        || ends_with_ignore_ascii_case(name, "_index")
 }
 
 /// Check if a parameter name looks like a divisor.
 fn is_likely_divisor(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower == "divisor"
-        || lower == "denominator"
-        || lower == "denom"
-        || lower == "d"
-        || lower == "y"
-        || lower == "b"
-        || lower == "n"
-        || lower == "modulus"
-        || lower.ends_with("_divisor")
+    name.eq_ignore_ascii_case("divisor")
+        || name.eq_ignore_ascii_case("denominator")
+        || name.eq_ignore_ascii_case("denom")
+        || name.eq_ignore_ascii_case("d")
+        || name.eq_ignore_ascii_case("y")
+        || name.eq_ignore_ascii_case("b")
+        || name.eq_ignore_ascii_case("n")
+        || name.eq_ignore_ascii_case("modulus")
+        || ends_with_ignore_ascii_case(name, "_divisor")
 }
 
 /// Check if a type string represents a numeric type.

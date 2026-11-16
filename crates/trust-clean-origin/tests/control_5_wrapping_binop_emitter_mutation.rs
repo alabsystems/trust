@@ -188,6 +188,7 @@ fn vf(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -202,6 +203,7 @@ fn prim_call(callee: &str, args: Vec<Operand>, dest: Place, target: BlockId) -> 
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         unwind: UnwindEdge::Unreachable,
     }
 }

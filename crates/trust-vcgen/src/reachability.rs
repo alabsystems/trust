@@ -31,40 +31,65 @@ pub fn reachable_from_entries(graph: &CallGraph) -> FxHashSet<String> {
 /// Perform BFS reachability from a given set of root def_paths.
 #[must_use]
 pub fn reachable_from(graph: &CallGraph, roots: &[&str]) -> FxHashSet<String> {
+    reachable_from_borrowed(graph, roots).into_iter().map(str::to_owned).collect()
+}
+
+fn reachable_from_borrowed<'a>(graph: &'a CallGraph, roots: &[&str]) -> FxHashSet<&'a str> {
+    if roots.is_empty() || graph.nodes.is_empty() {
+        return FxHashSet::default();
+    }
+    // Build a lookup for resolving callee names to node def_paths.
+    // A callee string may be a full def_path or just a function name.
+    let node_paths: FxHashSet<&'a str> = graph.nodes.iter().map(|n| n.def_path.as_str()).collect();
+
+    let mut visited: FxHashSet<&'a str> =
+        FxHashSet::with_capacity_and_hasher(graph.nodes.len(), Default::default());
+    if graph.edges.is_empty() {
+        for &root in roots {
+            if let Some(&interned) = node_paths.get(root) {
+                visited.insert(interned);
+            }
+        }
+        return visited;
+    }
+
     // Build adjacency: caller def_path -> set of callee strings
-    let mut adjacency: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
+    let mut adjacency: FxHashMap<&str, Vec<&str>> =
+        FxHashMap::with_capacity_and_hasher(graph.nodes.len(), Default::default());
     for edge in &graph.edges {
         adjacency.entry(edge.caller.as_str()).or_default().push(edge.callee.as_str());
     }
 
-    // Build a lookup for resolving callee names to node def_paths.
-    // A callee string may be a full def_path or just a function name.
-    let node_paths: FxHashSet<&str> = graph.nodes.iter().map(|n| n.def_path.as_str()).collect();
-
-    let mut visited: FxHashSet<String> = FxHashSet::default();
-    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut queue: VecDeque<&'a str> = VecDeque::with_capacity(graph.nodes.len());
 
     for &root in roots {
-        if node_paths.contains(root) {
-            visited.insert(root.to_string());
-            queue.push_back(root.to_string());
+        if let Some(&interned) = node_paths.get(root)
+            && visited.insert(interned)
+        {
+            queue.push_back(interned);
         }
     }
 
     while let Some(current) = queue.pop_front() {
-        if let Some(callees) = adjacency.get(current.as_str()) {
+        if let Some(callees) = adjacency.get(current) {
             for &callee in callees {
                 // Try exact match first
-                if node_paths.contains(callee) && visited.insert(callee.to_string()) {
-                    queue.push_back(callee.to_string());
+                if let Some(&interned) = node_paths.get(callee) {
+                    if visited.insert(interned) {
+                        queue.push_back(interned);
+                    }
                     continue;
                 }
 
                 // Deliberately fan ambiguous shorthand out to every match.
-                let suffix = format!("::{callee}");
                 for &node_path in &node_paths {
-                    if node_path.ends_with(&suffix) && visited.insert(node_path.to_string()) {
-                        queue.push_back(node_path.to_string());
+                    if !visited.contains(node_path)
+                        && node_path
+                            .strip_suffix(callee)
+                            .is_some_and(|prefix| prefix.ends_with("::"))
+                    {
+                        visited.insert(node_path);
+                        queue.push_back(node_path);
                     }
                 }
             }
@@ -80,7 +105,14 @@ pub fn reachable_from(graph: &CallGraph, roots: &[&str]) -> FxHashSet<String> {
 /// from any entry point via the call graph.
 #[must_use]
 pub fn analyze_reachability(graph: &CallGraph) -> ReachabilityResult {
-    let reachable = reachable_from_entries(graph);
+    let entries: Vec<&str> = graph.entry_points();
+    let reachable = reachable_from_borrowed(graph, &entries);
+    let entry_points: Vec<String> = entries.iter().map(|&s| s.to_string()).collect();
+    let unreachable_reason = if entry_points.is_empty() {
+        "no entry points defined"
+    } else {
+        "not reachable from any entry point"
+    };
 
     let mut reachable_fns = Vec::new();
     let mut unreachable_fns = Vec::new();
@@ -90,7 +122,7 @@ pub fn analyze_reachability(graph: &CallGraph) -> ReachabilityResult {
             continue;
         }
 
-        if reachable.contains(&node.def_path) {
+        if reachable.contains(node.def_path.as_str()) {
             reachable_fns.push(ReachableFunction {
                 def_path: node.def_path.clone(),
                 name: node.name.clone(),
@@ -101,22 +133,13 @@ pub fn analyze_reachability(graph: &CallGraph) -> ReachabilityResult {
                 def_path: node.def_path.clone(),
                 name: node.name.clone(),
                 span: node.span.clone(),
-                reason: if graph.entry_points().is_empty() {
-                    "no entry points defined".to_string()
-                } else {
-                    "not reachable from any entry point".to_string()
-                },
+                reason: unreachable_reason.to_string(),
             });
         }
     }
 
     ReachabilityResult {
-        entry_points: graph
-            .nodes
-            .iter()
-            .filter(|n| n.is_entry_point)
-            .map(|n| n.def_path.clone())
-            .collect(),
+        entry_points,
         reachable: reachable_fns,
         unreachable: unreachable_fns,
         total_functions: graph.nodes.len(),

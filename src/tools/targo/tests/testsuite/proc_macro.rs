@@ -519,6 +519,9 @@ fn proc_macro_built_once() {
 
                 [build-dependencies]
                 the-macro = { path = '../the-macro' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a/build.rs", "fn main() {}")
@@ -533,6 +536,9 @@ fn proc_macro_built_once() {
 
                 [dependencies]
                 the-macro = { path = '../the-macro', features = ['a'] }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("b/src/main.rs", "fn main() {}")
@@ -549,6 +555,9 @@ fn proc_macro_built_once() {
 
                 [features]
                 a = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("the-macro/src/lib.rs", "")
@@ -562,7 +571,7 @@ fn proc_macro_built_once() {
 [RUNNING] `rustc --crate-name b [..]`
 [COMPILING] a v0.1.0 ([ROOT]/foo/a)
 [RUNNING] `rustc --crate-name build_script_build [..]`
-[RUNNING] `[ROOT]/foo/target/debug/build/a-[HASH]/build-script-build`
+[RUNNING] `[ROOT]/foo/target/debug/build/a/[HASH]/out/build_script_build`
 [RUNNING] `rustc --crate-name a [..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 

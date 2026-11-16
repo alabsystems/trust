@@ -4487,15 +4487,30 @@ mod tests {
         use trust_types::{Ty, VariantDef};
         Ty::Adt {
             name: "main::Choice".into(),
-            fields: vec![("__tag".into(), int64()), ("__v0_0".into(), int64()), ("__v1_0".into(), int64())],
+            fields: vec![
+                ("__tag".into(), int64()),
+                ("__v0_0".into(), int64()),
+                ("__v1_0".into(), int64()),
+            ]
+            .into(),
             variants: vec![
-                VariantDef { name: "A".into(), discriminant: 0, fields: vec![("0".into(), int64())] },
-                VariantDef { name: "B".into(), discriminant: 1, fields: vec![("0".into(), int64())] },
-            ],
+                VariantDef {
+                    name: "A".into(),
+                    discriminant: 0,
+                    fields: vec![("0".into(), int64())],
+                },
+                VariantDef {
+                    name: "B".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), int64())],
+                },
+            ]
+            .into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             adt_kind: None,
             layout: None,
         }

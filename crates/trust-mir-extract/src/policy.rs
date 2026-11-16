@@ -265,8 +265,7 @@ impl LibraryVerificationLane {
             .split(',')
             .map(|entry| entry.trim().replace('-', "_"))
             .filter(|unit| {
-                !unit.is_empty()
-                    && unit.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                !unit.is_empty() && unit.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             })
             .collect();
         Self { authorized_units }
@@ -465,44 +464,59 @@ fn def_is_step4_core_num_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool 
     let DefPathData::ValueNs(method) = last.data else { return false };
     let method = method.as_str();
 
-    let spine: Vec<&DefPathData> = spine.iter().map(|component| &component.data).collect();
-    match spine.as_slice() {
+    match spine {
         // Shape 1: core::num::<impl {integer}>::{method}
-        [DefPathData::TypeNs(module), DefPathData::Impl]
-            if module.as_str() == "num" && step4_targeted_or_helper_method(method) =>
+        [first, second]
+            if matches!(
+                (&first.data, &second.data),
+                (DefPathData::TypeNs(module), DefPathData::Impl)
+                    if module.as_str() == "num" && step4_targeted_or_helper_method(method)
+            ) =>
         {
             impl_is_inherent_on_integer_primitive(tcx, tcx.parent(def_id))
         }
         // Shape 2: core::num::imp::{int_log10,int_sqrt}::{fn}
-        [
-            DefPathData::TypeNs(module),
-            DefPathData::TypeNs(imp_module),
-            DefPathData::TypeNs(leaf),
-        ] if module.as_str() == "num"
-            && imp_module.as_str() == "imp"
-            && STEP4_CORE_NUM_IMP_HELPER_MODULES.contains(&leaf.as_str()) =>
+        [first, second, third]
+            if matches!(
+                (&first.data, &second.data, &third.data),
+                (
+                    DefPathData::TypeNs(module),
+                    DefPathData::TypeNs(imp_module),
+                    DefPathData::TypeNs(leaf),
+                ) if module.as_str() == "num"
+                    && imp_module.as_str() == "imp"
+                    && STEP4_CORE_NUM_IMP_HELPER_MODULES.contains(&leaf.as_str())
+            ) =>
         {
             true
         }
         // Shape 3: core::num::nonzero::<inherent impl>::{helper}
-        [
-            DefPathData::TypeNs(module),
-            DefPathData::TypeNs(nonzero_module),
-            DefPathData::Impl,
-        ] if module.as_str() == "num"
-            && nonzero_module.as_str() == "nonzero"
-            && STEP4_CORE_NUM_NONZERO_HELPER_METHODS.contains(&method) =>
+        [first, second, third]
+            if matches!(
+                (&first.data, &second.data, &third.data),
+                (
+                    DefPathData::TypeNs(module),
+                    DefPathData::TypeNs(nonzero_module),
+                    DefPathData::Impl,
+                ) if module.as_str() == "num"
+                    && nonzero_module.as_str() == "nonzero"
+                    && STEP4_CORE_NUM_NONZERO_HELPER_METHODS.contains(&method)
+            ) =>
         {
             matches!(tcx.def_kind(tcx.parent(def_id)), DefKind::Impl { of_trait: false })
         }
         // Shape 4: core::num::traits::<impl>::{internal_*_truncate}
-        [
-            DefPathData::TypeNs(module),
-            DefPathData::TypeNs(traits_module),
-            DefPathData::Impl,
-        ] if module.as_str() == "num"
-            && traits_module.as_str() == "traits"
-            && STEP4_CORE_NUM_TRAIT_HELPER_METHODS.contains(&method) =>
+        [first, second, third]
+            if matches!(
+                (&first.data, &second.data, &third.data),
+                (
+                    DefPathData::TypeNs(module),
+                    DefPathData::TypeNs(traits_module),
+                    DefPathData::Impl,
+                ) if module.as_str() == "num"
+                    && traits_module.as_str() == "traits"
+                    && STEP4_CORE_NUM_TRAIT_HELPER_METHODS.contains(&method)
+            ) =>
         {
             true
         }
@@ -858,8 +872,8 @@ pub mod fmt {
     #[test]
     fn step4_lane_narrows_targeted_core_num_defs() {
         for (prefix, suffix) in [
-            ("::num::{impl", "::checked_add"),  // prefix family
-            ("::num::{impl", "::count_ones"),   // exact-name family
+            ("::num::{impl", "::checked_add"),   // prefix family
+            ("::num::{impl", "::count_ones"),    // exact-name family
             ("::num::{impl", "::unchecked_shl"), // measured helper
         ] {
             let buckets = bucket_for(prefix, suffix);
@@ -906,14 +920,14 @@ pub mod fmt {
     #[test]
     fn step4_lane_leaves_non_targeted_defs_unchanged() {
         for (prefix, suffix) in [
-            ("::fmt::", "::write_something"),      // core::fmt fn
-            ("::fmt::{impl", "::checked_add"),     // targeted name, wrong module
-            ("::num::{impl", "::midpoint"),        // right impl, non-targeted name
-            ("::num::{impl", "::checked_mul"),     // targeted prefix, Widget self ty
-            ("::num::", "::free_in_num"),          // free fn directly in num
-            ("::num::imp::overflow_panic", "::add"), // unmeasured imp sibling
+            ("::fmt::", "::write_something"),            // core::fmt fn
+            ("::fmt::{impl", "::checked_add"),           // targeted name, wrong module
+            ("::num::{impl", "::midpoint"),              // right impl, non-targeted name
+            ("::num::{impl", "::checked_mul"),           // targeted prefix, Widget self ty
+            ("::num::", "::free_in_num"),                // free fn directly in num
+            ("::num::imp::overflow_panic", "::add"),     // unmeasured imp sibling
             ("::num::nonzero::{impl", "::widening_mul"), // non-helper NonZero method
-            ("::num::traits::{impl", "::other_method"), // non-helper trait method
+            ("::num::traits::{impl", "::other_method"),  // non-helper trait method
         ] {
             let buckets = bucket_for(prefix, suffix);
             assert_eq!(

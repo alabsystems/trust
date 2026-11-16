@@ -8,15 +8,41 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use build_helper::ci::CiEnv;
 use build_helper::git::PathFreshness;
+use build_helper::stage0_parser::VersionMetadata;
 use xz2::bufread::XzDecoder;
 
-use crate::core::config::{BUILDER_CONFIG_FILENAME, TargetSelection};
+use crate::core::build_steps::llvm::detect_llvm_freshness;
+use crate::core::config::toml::llvm::check_incompatible_options_for_ci_llvm;
+use crate::core::config::{BUILDER_CONFIG_FILENAME, Config, TargetSelection};
 use crate::utils::build_stamp::BuildStamp;
 use crate::utils::exec::{ExecutionContext, command};
-use crate::utils::helpers::{exe, hex_encode, move_file};
-use crate::{Config, t};
+use crate::utils::helpers::{self, exe, hex_encode, move_file, t};
 
 static SHOULD_FIX_BINS_AND_DYLIBS: OnceLock<bool> = OnceLock::new();
+
+// Trust: old completion records could survive a partially destructive replacement.
+// Consumers recognize this recipe as observed completion, never desired configuration.
+pub(crate) const CI_LLVM_COMPLETION_RECIPE: &str =
+    "\nci-llvm:invalidate-before-unpack-and-complete-after-fixups:v1";
+
+fn ci_llvm_stamp(root: &Path, llvm_sha: &str, assertions: bool) -> BuildStamp {
+    BuildStamp::new(root)
+        .with_prefix("llvm")
+        .add_stamp(format!("{llvm_sha}{assertions}"))
+        .add_stamp(CI_LLVM_COMPLETION_RECIPE)
+}
+
+// Trust: download/cache failures leave the old provider's completion intact.
+// Once extraction can overwrite that provider, no old completion may survive.
+fn unpack_ci_llvm(
+    exec_ctx: &ExecutionContext,
+    tarball: &Path,
+    root: &Path,
+    completion: &BuildStamp,
+) -> PathBuf {
+    t!(completion.remove());
+    unpack(exec_ctx, tarball, root, "rust-dev")
+}
 
 fn extract_curl_version(out: String) -> semver::Version {
     // The output should look like this: "curl <major>.<minor>.<patch> ..."
@@ -491,17 +517,19 @@ fn translate_legacy_tippy_stage0_surface(bin_root: &Path, host: TargetSelection)
 
 /// Functions that are only ever called once, but named for clarity and to avoid thousand-line functions.
 impl Config {
-    pub(crate) fn download_tippy(&self) -> PathBuf {
+    pub(crate) fn download_tippy(&self, initial_sysroot: &Path) -> PathBuf {
         self.do_if_verbose(|| println!("downloading stage0 tippy artifacts"));
 
         let date = &self.stage0_metadata.compiler.date;
         let version = &self.stage0_metadata.compiler.version;
         let host = self.host_target;
 
-        let tippy_stamp =
-            BuildStamp::new(&self.initial_sysroot).with_prefix("tippy").add_stamp(date);
+        // Trust: same-day seed cuts can change this component's archive bytes.
+        let tippy_stamp = BuildStamp::new(initial_sysroot)
+            .with_prefix("tippy")
+            .add_stamp(stage0_extraction_stamp(&self.stage0_metadata));
         let tippy_paths = ["tippy", "targo-tippy", "tippy-driver"]
-            .map(|name| self.initial_sysroot.join("bin").join(exe(name, host)));
+            .map(|name| initial_sysroot.join("bin").join(exe(name, host)));
         let targo_tippy = tippy_paths[1].clone();
         if tippy_paths.iter().all(|path| path.exists()) && tippy_stamp.is_up_to_date() {
             return targo_tippy;
@@ -520,8 +548,14 @@ impl Config {
             date,
             "stage0",
         );
-        if selected.legacy && !self.dry_run() {
-            translate_legacy_tippy_stage0_surface(&self.initial_sysroot, host);
+        // Trust: download_component plans without materializing in dry-run.
+        // Neither adapters, loader repair nor a freshness stamp may mutate the
+        // caller's seed when no payload was installed.
+        if self.dry_run() {
+            return targo_tippy;
+        }
+        if selected.legacy {
+            translate_legacy_tippy_stage0_surface(initial_sysroot, host);
         }
         if self.should_fix_bins_and_dylibs() {
             for path in &tippy_paths {
@@ -529,7 +563,10 @@ impl Config {
             }
         }
 
-        t!(tippy_stamp.write());
+        // Trust: a dry-run cannot claim an external provider was updated.
+        if !self.dry_run() {
+            t!(tippy_stamp.write());
+        }
         targo_tippy
     }
 
@@ -572,6 +609,30 @@ impl Config {
         );
     }
 
+    pub(crate) fn download_std_json_docs(
+        &self,
+        target: TargetSelection,
+        commit: &str,
+    ) -> Option<PathBuf> {
+        if self.dry_run() {
+            return None;
+        }
+
+        self.do_if_verbose(|| println!("using downloaded std json docs from CI (commit {commit})"));
+
+        let version = self.artifact_version_part(commit);
+        download_component(
+            DownloadContext::from(self),
+            &self.out,
+            DownloadSource::CI,
+            format!("rust-docs-json-{version}-{target}.tar.xz"),
+            "rust-docs-json-preview",
+            // When using DownloadSource::CI, the key is assumed to end with -llvm-assertions
+            &format!("{commit}-{}", self.llvm_assertions),
+            "ci-docs-json",
+        )
+    }
+
     fn download_toolchain(
         &self,
         version: &str,
@@ -582,7 +643,7 @@ impl Config {
     ) {
         let host = self.host_target.triple;
         let bin_root = self.out.join(host).join(sysroot);
-        let rustc_stamp = BuildStamp::new(&bin_root).with_prefix("rustc").add_stamp(stamp_key);
+        let rustc_stamp = toolchain_stamp(&bin_root, stamp_key);
 
         let needs_refresh = !bin_root.join("bin").join(exe("rustc", self.host_target)).exists()
             || !rustc_stamp.is_up_to_date();
@@ -649,22 +710,15 @@ impl Config {
         download_component(dwn_ctx, &self.out, mode, filename, prefix, key, destination);
     }
 
-    #[cfg(test)]
-    pub(crate) fn maybe_download_ci_llvm(&self) {}
-
-    #[cfg(not(test))]
-    pub(crate) fn maybe_download_ci_llvm(&self) {
-        use build_helper::exit;
-        use build_helper::git::PathFreshness;
-
-        use crate::core::build_steps::llvm::detect_llvm_freshness;
-        use crate::core::config::toml::llvm::check_incompatible_options_for_ci_llvm;
-
-        if !self.llvm_from_ci {
-            return;
+    /// Attempts to download LLVM from CI for the given **target**.
+    /// Returns a path to the downloaded and extracted directory.
+    pub(crate) fn maybe_download_ci_llvm(&self, target: TargetSelection) -> Option<PathBuf> {
+        // Never try to download CI LLVM during unit tests.
+        if cfg!(test) {
+            return None;
         }
 
-        let llvm_root = self.ci_llvm_root();
+        let llvm_root = self.out.join(target).join("ci-llvm");
         let llvm_freshness =
             detect_llvm_freshness(self, self.rust_info.is_managed_git_subrepository());
         self.do_if_verbose(|| {
@@ -678,13 +732,12 @@ impl Config {
                 eprintln!("HELP: maybe your repository history is too shallow?");
                 eprintln!("HELP: consider disabling `download-ci-llvm`");
                 eprintln!("HELP: or fetch enough history to include one upstream commit");
-                crate::exit!(1);
+                helpers::exit_process(1);
             }
         };
-        let stamp_key = format!("{}{}", llvm_sha, self.llvm_assertions);
-        let llvm_stamp = BuildStamp::new(&llvm_root).with_prefix("llvm").add_stamp(stamp_key);
+        let llvm_stamp = ci_llvm_stamp(&llvm_root, &llvm_sha, self.llvm_assertions);
         if !llvm_stamp.is_up_to_date() && !self.dry_run() {
-            self.download_ci_llvm(&llvm_sha);
+            self.download_ci_llvm(&llvm_root, target, &llvm_sha, &llvm_stamp);
 
             if self.should_fix_bins_and_dylibs() {
                 for entry in t!(fs::read_dir(llvm_root.join("bin"))) {
@@ -703,7 +756,7 @@ impl Config {
             let now = std::time::SystemTime::now();
             let file_times = fs::FileTimes::new().set_accessed(now).set_modified(now);
 
-            let llvm_config = llvm_root.join("bin").join(exe("llvm-config", self.host_target));
+            let llvm_config = llvm_root.join("bin").join(exe("llvm-config", target));
             t!(crate::utils::helpers::set_file_times(llvm_config, file_times));
 
             if self.should_fix_bins_and_dylibs() {
@@ -734,17 +787,26 @@ impl Config {
                 }
                 Err(e) => {
                     eprintln!("ERROR: Failed to parse CI LLVM bootstrap.toml: {e}");
-                    exit!(2);
+                    helpers::exit_process(2);
                 }
             };
         };
+        Some(llvm_root)
     }
 
-    #[cfg(not(test))]
-    fn download_ci_llvm(&self, llvm_sha: &str) {
+    fn download_ci_llvm(
+        &self,
+        llvm_root: &Path,
+        target: TargetSelection,
+        llvm_sha: &str,
+        completion: &BuildStamp,
+    ) {
+        // For unit tests, downloading should have been blocked by `maybe_download_ci_llvm`.
+        assert!(cfg!(not(test)), "unit tests shouldn't be downloading CI LLVM");
+
         let llvm_assertions = self.llvm_assertions;
 
-        let cache_prefix = format!("llvm-{llvm_sha}-{llvm_assertions}");
+        let cache_prefix = format!("llvm-{}-{llvm_sha}-{llvm_assertions}", target.triple);
         let cache_dst =
             self.bootstrap_cache_path.as_ref().cloned().unwrap_or_else(|| self.out.join("cache"));
 
@@ -759,23 +821,25 @@ impl Config {
         };
         reject_inherited_upstream_rust_download_url(base);
         let version = self.artifact_version_part(llvm_sha);
-        let filename = format!("rust-dev-{}-{}.tar.xz", version, self.host_target.triple);
+        let filename = format!("rust-dev-{}-{}.tar.xz", version, target.triple);
         let tarball = rustc_cache.join(&filename);
         if !tarball.exists() {
-            let help_on_error = "ERROR: failed to download llvm from ci
+            let help_on_error = format!(
+                "ERROR: failed to download llvm from CI for `{target}`
 
     HELP: There could be two reasons behind this:
-        1) The host triple is not supported for `download-ci-llvm`.
+        1) `{target}` is not supported for `download-ci-llvm`.
         2) Old builds get deleted after a certain time.
     HELP: In either case, disable `download-ci-llvm` in your bootstrap.toml:
 
     [llvm]
     download-ci-llvm = false
-    ";
-            self.download_file(&format!("{base}/{llvm_sha}/{filename}"), &tarball, help_on_error);
+    ",
+                target = target.triple
+            );
+            self.download_file(&format!("{base}/{llvm_sha}/{filename}"), &tarball, &help_on_error);
         }
-        let llvm_root = self.ci_llvm_root();
-        self.unpack(&tarball, &llvm_root, "rust-dev");
+        unpack_ci_llvm(&self.exec_ctx, &tarball, llvm_root, completion);
     }
 }
 
@@ -849,6 +913,7 @@ pub(crate) fn is_download_ci_available(target_triple: &str, llvm_assertions: boo
         "powerpc64le-unknown-linux-gnu",
         "powerpc64le-unknown-linux-musl",
         "riscv64gc-unknown-linux-gnu",
+        "riscv64gc-unknown-linux-musl",
         "s390x-unknown-linux-gnu",
         "x86_64-apple-darwin",
         "x86_64-pc-windows-gnu",
@@ -871,14 +936,6 @@ pub(crate) fn is_download_ci_available(target_triple: &str, llvm_assertions: boo
     }
 }
 
-#[cfg(test)]
-pub(crate) fn maybe_download_rustfmt<'a>(
-    dwn_ctx: impl AsRef<DownloadContext<'a>>,
-    out: &Path,
-) -> Option<PathBuf> {
-    Some(PathBuf::new())
-}
-
 fn dedicated_trustfmt_component_prefix() -> &'static str {
     // Trust's formatter dist archive uses the canonical `trustfmt/` component.
     // The inherited upstream `rustfmt-preview/` prefix matches no archive
@@ -895,22 +952,21 @@ fn dedicated_trustfmt_payload_is_complete(rustfmt_path: &Path, targo_fmt_path: &
 
 /// NOTE: rustfmt is a completely different toolchain than the bootstrap compiler, so it can't
 /// reuse target directories or artifacts
-#[cfg(not(test))]
-pub(crate) fn maybe_download_rustfmt<'a>(
-    dwn_ctx: impl AsRef<DownloadContext<'a>>,
-    out: &Path,
-) -> Option<PathBuf> {
-    use build_helper::stage0_parser::VersionMetadata;
-
-    let dwn_ctx = dwn_ctx.as_ref();
-
-    if dwn_ctx.exec_ctx.dry_run() {
+pub(crate) fn maybe_download_rustfmt(config: &Config, out: &Path) -> Option<PathBuf> {
+    // Don't actually download rustfmt during unit tests.
+    if cfg!(test) {
         return Some(PathBuf::new());
     }
 
-    let VersionMetadata { date, version, .. } = dwn_ctx.stage0_metadata.rustfmt.as_ref()?;
-    let channel = format!("{version}-{date}");
+    if config.dry_run() {
+        return Some(PathBuf::new());
+    }
 
+    let VersionMetadata { date, version, .. } = config.stage0_metadata.rustfmt.as_ref()?;
+    // Trust: a version/date pair does not distinguish a same-day re-pin.
+    let channel = stage0_extraction_stamp(&config.stage0_metadata);
+
+    let dwn_ctx = DownloadContext::from(config);
     let host = dwn_ctx.host_target;
     let bin_root = out.join(host).join("trustfmt");
     let rustfmt_path = bin_root.join("bin").join(exe("trustfmt", host));
@@ -923,7 +979,7 @@ pub(crate) fn maybe_download_rustfmt<'a>(
     }
 
     download_component(
-        dwn_ctx,
+        DownloadContext::from(config),
         out,
         DownloadSource::Dist,
         format!("trustfmt-{version}-{build}.tar.xz", build = host.triple),
@@ -933,7 +989,7 @@ pub(crate) fn maybe_download_rustfmt<'a>(
     );
 
     download_component(
-        dwn_ctx,
+        DownloadContext::from(config),
         out,
         DownloadSource::Dist,
         format!("trustc-{version}-{build}.tar.xz", build = host.triple),
@@ -956,7 +1012,7 @@ pub(crate) fn maybe_download_rustfmt<'a>(
         for lib in t!(fs::read_dir(&lib_dir), lib_dir.display().to_string()) {
             let lib = t!(lib);
             if path_is_dylib(&lib.path()) {
-                fix_bin_or_dylib(out, &lib.path(), dwn_ctx.exec_ctx);
+                fix_bin_or_dylib(out, &lib.path(), &config.exec_ctx);
             }
         }
     }
@@ -965,11 +1021,12 @@ pub(crate) fn maybe_download_rustfmt<'a>(
     Some(rustfmt_path)
 }
 
-#[cfg(test)]
-pub(crate) fn download_beta_toolchain<'a>(dwn_ctx: impl AsRef<DownloadContext<'a>>, out: &Path) {}
-
-#[cfg(not(test))]
 pub(crate) fn download_beta_toolchain<'a>(dwn_ctx: impl AsRef<DownloadContext<'a>>, out: &Path) {
+    // Don't actually download a beta toolchain during unit tests.
+    if cfg!(test) {
+        return;
+    }
+
     let dwn_ctx = dwn_ctx.as_ref();
     dwn_ctx.exec_ctx.do_if_verbose(|| {
         println!("downloading stage0 beta artifacts");
@@ -1124,6 +1181,115 @@ fn assert_stage0_tool_surface(bin_root: &Path, host: TargetSelection, destinatio
     }
 }
 
+// Trust: counterpart of stage0_identity.paired_linker. This runs only in the
+// checksum-verified staging tree, before the old SDK is atomically displaced.
+// The closed compiler/Host profile continues selecting only SDK/bin/rust-lld.
+fn materialize_stage0_paired_linker(root: &Path, host: &str) {
+    if !host.ends_with("-apple-darwin") {
+        return;
+    }
+    assert!(!host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c)),
+            "noncanonical paired linker host");
+    let source_relative = PathBuf::from("lib/rustlib").join(host).join("bin/rust-lld");
+    let source = root.join(&source_relative);
+    let destination = root.join("bin/rust-lld");
+    if !path_entry_exists(&source) {
+        assert!(!path_entry_exists(&destination), "paired linker root role lacks its archived host image");
+        return;
+    }
+    #[cfg(not(unix))]
+    panic!("Darwin paired linker extraction requires directory descriptor custody");
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::io::{Read, Seek};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use sha2::Digest;
+
+        let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        let open_at = |parent: &File, name: &std::ffi::OsStr, access: i32, mode: libc::mode_t| {
+            let name = CString::new(name.as_bytes()).expect("canonical linker component");
+            // Trust: all parent descriptors name retained real staging dirs;
+            // exclusive descriptor-relative creation cannot follow a replaced
+            // lexical bin alias out of the original staged directory.
+            // Darwin mode_t is u16: C variadic arguments require integer promotion.
+            let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), access | flags, mode as libc::c_int) };
+            assert!(fd >= 0, "paired linker role open refused: {}", std::io::Error::last_os_error());
+            unsafe { File::from_raw_fd(fd) }
+        };
+        let root_file = t!(fs::OpenOptions::new().read(true)
+            .custom_flags(flags | libc::O_DIRECTORY).open(root));
+        let root_metadata = t!(root_file.metadata());
+        let mut directories = vec![(root.to_path_buf(), root_file, root_metadata)];
+        let parent = |relative: &Path, dirs: &mut Vec<(PathBuf, File, fs::Metadata)>| {
+            let mut index = 0;
+            let mut path = root.to_path_buf();
+            for component in relative.parent().unwrap().components() {
+                path.push(component);
+                let file = open_at(&dirs[index].1, component.as_os_str(), libc::O_RDONLY | libc::O_DIRECTORY, 0);
+                let metadata = t!(file.metadata());
+                assert!(metadata.is_dir(), "paired linker parent is not a real directory");
+                dirs.push((path.clone(), file, metadata));
+                index = dirs.len() - 1;
+            }
+            index
+        };
+        let source_parent = parent(&source_relative, &mut directories);
+        let selected_parent = parent(Path::new("bin/rust-lld"), &mut directories);
+        let name = std::ffi::OsStr::new("rust-lld");
+        let original = open_at(&directories[source_parent].1, name, libc::O_RDONLY, 0);
+        let source_metadata = t!(original.metadata());
+        assert!(source_metadata.is_file() && source_metadata.mode() & 0o111 != 0,
+                "paired linker host image is not regular executable");
+        // lstat is only an existence hint. Every actual open is anchored to the
+        // retained selected-parent descriptor, with exclusive/no-follow flags.
+        if !path_entry_exists(&destination) {
+            let mut selected = open_at(&directories[selected_parent].1, name,
+                                       libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600);
+            let mut input = &original;
+            t!(std::io::copy(&mut input, &mut selected));
+            t!(selected.set_permissions(source_metadata.permissions()));
+            t!(input.rewind());
+        }
+        let selected = open_at(&directories[selected_parent].1, name, libc::O_RDONLY, 0);
+        let selected_metadata = t!(selected.metadata());
+        assert!(selected_metadata.is_file(), "paired linker root role is not regular");
+        assert_ne!((source_metadata.dev(), source_metadata.ino()),
+                   (selected_metadata.dev(), selected_metadata.ino()),
+                   "paired linker roles must have distinct executable inodes");
+        assert_eq!(source_metadata.mode(), selected_metadata.mode(), "paired linker role modes differ");
+        let key = |m: &fs::Metadata| (m.dev(), m.ino(), m.mode(), m.uid(), m.gid(),
+            m.size(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec());
+        let digest = |file: &File, expected: &fs::Metadata, directory: &File| {
+            assert_eq!(key(&t!(file.metadata())), key(expected), "paired linker changed before hashing");
+            let mut input = file;
+            let mut value = sha2::Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let count = t!(input.read(&mut buffer));
+                if count == 0 { break; }
+                value.update(&buffer[..count]);
+            }
+            let named = open_at(directory, name, libc::O_RDONLY, 0);
+            assert_eq!(key(&t!(file.metadata())), key(expected), "paired linker changed while hashing");
+            assert_eq!(key(&t!(named.metadata())), key(expected), "paired linker named role changed");
+            value.finalize()
+        };
+        assert_eq!(digest(&original, &source_metadata, &directories[source_parent].1),
+                   digest(&selected, &selected_metadata, &directories[selected_parent].1),
+                   "paired linker root role differs from its archived host image");
+        let directory_key = |m: &fs::Metadata| (m.dev(), m.ino(), m.mode(), m.uid(), m.gid());
+        for (path, file, before) in directories {
+            assert_eq!(directory_key(&t!(file.metadata())), directory_key(&before),
+                       "paired linker retained directory changed");
+            assert_eq!(directory_key(&t!(fs::symlink_metadata(&path))), directory_key(&before),
+                       "paired linker lexical directory role changed");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn download_toolchain<'a>(
     dwn_ctx: impl AsRef<DownloadContext<'a>>,
@@ -1135,12 +1301,20 @@ fn download_toolchain<'a>(
     destination: &str,
     mode: DownloadSource,
 ) {
+    assert!(cfg!(not(test)), "unit tests shouldn't be downloading a toolchain");
+
     let dwn_ctx = dwn_ctx.as_ref();
     let host = dwn_ctx.host_target.triple;
     let bin_root = out.join(host).join(sysroot);
-    let stamp_prefix = if destination == "stage0" { "trustc" } else { "rustc" };
     let primary_compiler = if destination == "stage0" { "trustc" } else { "rustc" };
-    let rustc_stamp = BuildStamp::new(&bin_root).with_prefix(stamp_prefix).add_stamp(stamp_key);
+    // Trust: keep stamp_key as the dist URL/cache date, but compare the actual
+    // pinned compiler and archive identity, exactly as bootstrap.py does.
+    let extraction_key = if destination == "stage0" && matches!(&mode, DownloadSource::Dist) {
+        stage0_extraction_stamp(dwn_ctx.stage0_metadata)
+    } else {
+        stamp_key.to_owned()
+    };
+    let rustc_stamp = toolchain_stamp(&bin_root, &extraction_key);
     let missing_extra_components =
         missing_extra_component_bin(&bin_root, dwn_ctx.host_target, extra_components);
 
@@ -1251,6 +1425,9 @@ fn download_toolchain<'a>(
         if translate_legacy_tippy {
             translate_legacy_tippy_stage0_surface(&staging_root, dwn_ctx.host_target);
         }
+        if destination == "stage0" && matches!(&mode, DownloadSource::Dist) {
+            materialize_stage0_paired_linker(&staging_root, host.as_ref());
+        }
 
         // Verify the STAGED surface before the live tree is touched: an
         // incomplete replacement panics here with the working toolchain
@@ -1333,6 +1510,61 @@ fn swap_verified_toolchain(bin_root: &Path, staging_root: &Path) {
     } else {
         t!(fs::rename(staging_root, bin_root));
     }
+}
+
+/// The freshness stamp of a downloaded toolchain root (stage0 or ci-rustc):
+/// `<bin_root>/.rustc-stamp`, the upstream name, for every root.
+///
+/// Trust: ONE name, shared with bootstrap.py (`rustc_stamp()`), which
+/// materializes and stamps stage0 before this layer runs, and with the tools
+/// that read the stamp (scripts/check_seed_freshness.py, and
+/// scripts/mint_seed_support.py `pinned-stage0`). A Trust-only `.trustc-stamp`
+/// for stage0 made the two layers disagree (measured 2026-09-30 in seed mode):
+/// this layer never saw python's stamp, so every x.py run re-extracted the seed
+/// and swapped the whole root in, deleting python's stamp, so the next run
+/// re-extracted it again, and the readers found no stamp after any build.
+fn toolchain_stamp(bin_root: &Path, stamp_key: &str) -> BuildStamp {
+    BuildStamp::new(bin_root).with_prefix("rustc").add_stamp(stamp_key)
+}
+
+// Trust: byte-for-byte counterpart of src/bootstrap/stage0_identity.py. The ten
+// fixed metadata rows normalize missing fields to empty; every dist/ digest row
+// joins them in global key order. Mirrors/comments are not extraction inputs.
+fn stage0_extraction_stamp(stage0: &build_helper::stage0_parser::Stage0) -> String {
+    use sha2::Digest;
+
+    let empty = VersionMetadata::default();
+    let formatter = stage0.rustfmt.as_ref().unwrap_or(&empty);
+    let mut rows = BTreeMap::from([
+        ("compiler_channel_manifest_hash", stage0.compiler.channel_manifest_hash.as_str()),
+        ("compiler_date", stage0.compiler.date.as_str()),
+        ("compiler_dist_channel", stage0.config.compiler_dist_channel.as_str()),
+        ("compiler_git_commit_hash", stage0.compiler.git_commit_hash.as_str()),
+        ("compiler_version", stage0.compiler.version.as_str()),
+        ("rustfmt_channel_manifest_hash", formatter.channel_manifest_hash.as_str()),
+        ("rustfmt_date", formatter.date.as_str()),
+        ("rustfmt_dist_channel", stage0.config.rustfmt_dist_channel.as_str()),
+        ("rustfmt_git_commit_hash", formatter.git_commit_hash.as_str()),
+        ("rustfmt_version", formatter.version.as_str()),
+    ]);
+    for (key, value) in &stage0.checksums_sha256 {
+        if key.starts_with("dist/") {
+            rows.insert(key.as_str(), value.as_str());
+        }
+    }
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"trust-stage0-extraction-v3\n");
+    for (key, value) in rows {
+        assert!(
+            key.chars().chain(value.chars()).all(|c| !matches!(c, '\r' | '\n' | '\0')),
+            "stage0 extraction identity requires single-line text records"
+        );
+        digest.update(key.as_bytes());
+        digest.update(b"=");
+        digest.update(value.as_bytes());
+        digest.update(b"\n");
+    }
+    format!("trust-stage0-extraction-v3:{}", hex_encode(digest.finalize()))
 }
 
 pub(crate) fn remove(exec_ctx: &ExecutionContext, f: &Path) {
@@ -1462,11 +1694,11 @@ fn download_component<'a>(
     prefix: &str,
     key: &str,
     destination: &str,
-) {
+) -> Option<PathBuf> {
     let dwn_ctx = dwn_ctx.as_ref();
 
     if dwn_ctx.exec_ctx.dry_run() {
-        return;
+        return None;
     }
 
     let cache_dst =
@@ -1511,8 +1743,7 @@ fn download_component<'a>(
         let sha256 = dwn_ctx.stage0_metadata.checksums_sha256.get(&url).expect(&error);
         if tarball.exists() {
             if verify(dwn_ctx.exec_ctx, &tarball, sha256) {
-                unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix);
-                return;
+                return Some(unpack_seed_component(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix));
             } else {
                 dwn_ctx.exec_ctx.do_if_verbose(|| {
                     println!(
@@ -1525,8 +1756,7 @@ fn download_component<'a>(
         }
         Some(sha256)
     } else if tarball.exists() {
-        unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix);
-        return;
+        return Some(unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix));
     } else {
         None
     };
@@ -1549,7 +1779,11 @@ download-rustc = false
         panic!("failed to verify {}", tarball.display());
     }
 
-    unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix);
+    Some(if should_verify {
+        unpack_seed_component(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix)
+    } else {
+        unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix)
+    })
 }
 
 pub(crate) fn verify(exec_ctx: &ExecutionContext, path: &Path, expected: &str) -> bool {
@@ -1593,7 +1827,33 @@ pub(crate) fn verify(exec_ctx: &ExecutionContext, path: &Path, expected: &str) -
     verified
 }
 
-fn unpack(exec_ctx: &ExecutionContext, tarball: &Path, dst: &Path, pattern: &str) {
+fn unpack(exec_ctx: &ExecutionContext, tarball: &Path, dst: &Path, pattern: &str) -> PathBuf {
+    unpack_with_profile(exec_ctx, tarball, dst, pattern, UnpackProfile::ComponentImage)
+}
+
+// Trust: installed seed projection excludes the installer's own instruction
+// table. The v3 Python/Rust stamp invalidates earlier metadata-bearing seeds.
+fn unpack_seed_component(
+    exec_ctx: &ExecutionContext,
+    tarball: &Path,
+    dst: &Path,
+    pattern: &str,
+) -> PathBuf {
+    unpack_with_profile(exec_ctx, tarball, dst, pattern, UnpackProfile::SeedImage)
+}
+
+enum UnpackProfile {
+    ComponentImage,
+    SeedImage,
+}
+
+fn unpack_with_profile(
+    exec_ctx: &ExecutionContext,
+    tarball: &Path,
+    dst: &Path,
+    pattern: &str,
+    profile: UnpackProfile,
+) -> PathBuf {
     eprintln!("extracting {} to {}", tarball.display(), dst.display());
     if !dst.exists() {
         t!(fs::create_dir_all(dst));
@@ -1634,6 +1894,9 @@ fn unpack(exec_ctx: &ExecutionContext, tarball: &Path, dst: &Path, pattern: &str
             continue;
         }
         short_path = short_path.strip_prefix(pattern).unwrap_or(short_path);
+        if matches!(profile, UnpackProfile::SeedImage) && short_path == Path::new("manifest.in") {
+            continue;
+        }
         let dst_path = dst.join(short_path);
 
         exec_ctx.do_if_verbose(|| {
@@ -1659,6 +1922,7 @@ fn unpack(exec_ctx: &ExecutionContext, tarball: &Path, dst: &Path, pattern: &str
     if dst_dir.exists() {
         t!(fs::remove_dir_all(&dst_dir), format!("failed to remove {}", dst_dir.display()));
     }
+    dst.to_path_buf()
 }
 
 fn download_file<'a>(
@@ -1794,6 +2058,8 @@ fn download_http_with_retries(
     help_on_error: &str,
 ) {
     println!("downloading {url}");
+    assert!(cfg!(not(test)), "unit tests shouldn't be downloading things: {url:?}");
+
     // Try curl. If that fails and we are on windows, fallback to PowerShell.
     // options should be kept in sync with
     // src/bootstrap/src/core/download.rs
@@ -1863,7 +2129,7 @@ fn download_http_with_retries(
         if !help_on_error.is_empty() {
             eprintln!("{help_on_error}");
         }
-        crate::exit!(1);
+        helpers::exit_process(1);
     }
 }
 

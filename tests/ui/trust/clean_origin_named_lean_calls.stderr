@@ -1,0 +1,12 @@
+note: Clean island kernel-checked: 9 declaration(s) registered (A.b, A.b, pathPick, quotedPick, plusOne, square, nestedCall, difference, swappedCall)
+  --> $DIR/clean_origin_named_lean_calls.rs:18:9
+   |
+LL | /         def A.b (a b : UInt64) : UInt64 := a
+LL | |         def «A.b» (a b : UInt64) : UInt64 := b + 1
+LL | |         def pathPick (a b : UInt64) : UInt64 := A.b a b
+LL | |         def quotedPick (a b : UInt64) : UInt64 := «A.b» a b
+...  |
+LL | |         def difference (a b : UInt64) : UInt64 := a - b
+LL | |         def swappedCall (a b : UInt64) : UInt64 := difference b a
+   | |_________________________________________________________________^
+

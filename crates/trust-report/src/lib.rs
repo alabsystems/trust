@@ -20,7 +20,6 @@
 
 pub mod binary;
 pub(crate) mod crate_report;
-pub mod diagnostics;
 pub(crate) mod formatting;
 pub mod html;
 pub mod html_report;

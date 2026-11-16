@@ -7,6 +7,9 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 
+#[path = "support/compiler_overrides.rs"]
+mod compiler_overrides;
+
 const HARDENED_CLAIM_IDS: &[&str] = &[
     "path-re-resolution",
     "path-identity",
@@ -305,7 +308,7 @@ fn hardened_lab_json_reports_every_hardened_category_claim() {
             walkthrough
                 .get("transcript_errors")
                 .and_then(Value::as_array)
-                .map_or(true, |errors| errors.is_empty()),
+                .is_none_or(|errors| errors.is_empty()),
             "walkthrough transcript should not include validation errors for {bin}: {walkthrough}"
         );
         assert!(
@@ -457,6 +460,14 @@ fn standalone_hardened_check_json_exits_one_with_real_findings() {
     assert!(
         stderr.contains("hardened profile `unix_hardened` enabled"),
         "standalone check should enable the default hardened profile without an explicit flag\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // HARDENED-PROFILE-UNMEASURED-1: a profile on by default names its off switch.
+    assert!(
+        stderr.contains(
+            "hardened profile `unix_hardened` enabled; `--no-hardened` turns it off unless the \
+             project's Cargo configuration requires it"
+        ),
+        "the default profile's notice should name --no-hardened\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     let json: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
@@ -691,20 +702,133 @@ fn native_hardened_check_json_honors_explicit_trust_profile_when_available() {
     );
 }
 
+#[test]
+fn native_hardened_check_keeps_all_categories_without_a_declared_signal_policy_when_available() {
+    assert_native_hardened_json_uses_default_compiler_workflow_when_available(
+        "check",
+        &["--trust-profile", "hardened"],
+        "hardened",
+    );
+}
+
+#[test]
+fn native_hardened_manifest_refusal_keeps_the_helper_library_report_when_available() {
+    let manifest = workspace_root().join("examples/hardened/Cargo.toml");
+    let Some((output, json)) = native_hardened_report("check", &[], &manifest, true) else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the helper library's unproved obligations must refuse the manifest\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(json["verification_gate"]["decision"], "fail");
+    assert_eq!(json["verification_gate"]["exit_code"], 1);
+    assert_ne!(json["summary"]["verdict"], "Verified");
+    assert_eq!(json["summary"]["functions_verified"], 0);
+    assert_ne!(json["hardened"]["assurance"]["level"], "proof_backed");
+    assert!(
+        json["summary"]["total_failed"].as_u64().unwrap_or(0)
+            + json["summary"]["total_unknown"].as_u64().unwrap_or(0)
+            > 0,
+        "a refused manifest must retain its actual findings: {json}"
+    );
+    let helper = json["functions"]
+        .as_array()
+        .expect("native functions")
+        .iter()
+        .find(|function| {
+            function["function"].as_str().is_some_and(|name| name.ends_with("::safe_label"))
+        })
+        .unwrap_or_else(|| {
+            panic!("the refused support-library helper must remain reported: {json}")
+        });
+    assert!(
+        helper["obligations"]
+            .as_array()
+            .expect("helper obligations")
+            .iter()
+            .any(|row| { matches!(row["outcome"]["status"].as_str(), Some("failed" | "unknown")) }),
+        "safe_label's actual unproved rows must remain visible: {helper}"
+    );
+    assert!(
+        !json["functions"].as_array().expect("native functions").iter().any(|function| {
+            function["function"].as_str().is_some_and(|name| name.contains("::claims::"))
+        }),
+        "Cargo did not reach the dependent category binary; a partial library report must not invent its rows: {json}"
+    );
+    assert!(stderr.contains("could not compile `hardened-regression-fixtures` (lib)"));
+}
+
 fn assert_native_hardened_json_uses_default_compiler_workflow_when_available(
     subcommand: &str,
     profile_args: &[&str],
     expected_profile: &str,
 ) {
-    let manifest = workspace_root().join("examples/hardened/Cargo.toml");
+    // The Cargo package also has a walkthrough support library. Its legitimate
+    // strict refusal prevents Cargo from reaching the category binary at all.
+    // Exercise the unchanged category source through the native file frontdoor;
+    // the separate manifest regression above retains that project-path refusal.
+    let source = workspace_root().join("examples/hardened/src/main.rs");
+    let Some((output, json)) = native_hardened_report(subcommand, profile_args, &source, false)
+    else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
+    let kinds = obligation_kind_set(&json);
+    let standalone_style: Vec<&str> =
+        kinds.iter().copied().filter(|kind| kind.starts_with("Hardened")).collect();
+    assert!(
+        standalone_style.is_empty(),
+        "native hardened report should use canonical hardened_ kind tags, not standalone enum names: {standalone_style:?}\nobserved: {kinds:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let hardened_kinds: BTreeSet<&str> =
+        kinds.iter().copied().filter(|kind| kind.starts_with("hardened_")).collect();
+    assert!(
+        !hardened_kinds.is_empty(),
+        "native hardened {subcommand} should emit hardened_ obligations when native trustc is available\nobserved: {kinds:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // unix/coreutils declare SIGPIPE -> SIG_DFL. Vcgen therefore does not mint
+    // the already-satisfied ProcessSemantics mandate. The generic profile test
+    // above declares no policy and requires all fifteen original categories.
+    let declares_signal_policy = matches!(expected_profile, "unix_hardened" | "coreutils_hardened");
+    assert_eq!(
+        hardened_kinds.contains("hardened_process_semantics"),
+        !declares_signal_policy,
+        "only the profiles that actually declare the signal policy discharge its mandate"
+    );
+    let missing: Vec<&str> = NATIVE_HARDENED_KINDS
+        .iter()
+        .copied()
+        .filter(|kind| !declares_signal_policy || *kind != "hardened_process_semantics")
+        .filter(|kind| !hardened_kinds.contains(kind))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "native hardened JSON missing hardened kind(s): {missing:?}\nobserved hardened kinds: {hardened_kinds:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_native_hardened_context(&json, subcommand, expected_profile, &stdout, &stderr);
+}
+
+fn native_hardened_report(
+    subcommand: &str,
+    profile_args: &[&str],
+    subject: &Path,
+    manifest: bool,
+) -> Option<(Output, Value)> {
     let mut command = Command::new(targo_trust_binary());
-    command.args(["trust", subcommand]).args(profile_args).args([
-        "--format",
-        "json",
-        "--manifest-path",
-    ]);
-    command.arg(&manifest);
+    command.args(["trust", subcommand]).args(profile_args).args(["--format", "json"]);
+    if manifest {
+        command.arg("--manifest-path").arg(subject);
+    } else {
+        // Match the committed corpus manifest rather than rustc's 2015 default.
+        command.arg(subject).arg("--edition=2021");
+    }
     let output = command.output().unwrap_or_else(|error| {
         panic!(
             "run targo trust {subcommand} {profile_args:?} with native compiler workflow: {error}"
@@ -715,8 +839,27 @@ fn assert_native_hardened_json_uses_default_compiler_workflow_when_available(
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_stdout_does_not_report_source_audit(&stdout, &stderr);
 
+    // "When available": without a native toolchain around this binary the
+    // workflow this test is named for cannot run. It still passes then, so it
+    // says on stderr what it did not find (`--nocapture` shows it); a quiet
+    // pass would read as the workflow having been exercised.
     if assert_missing_native_trustc_setup_error(&output, &stdout, &stderr) {
-        return;
+        eprintln!(
+            "NOT RUN: native hardened {subcommand} {profile_args:?}: no native Trust compiler was \
+             found, so the default compiler workflow was not exercised. targo-trust said: {}",
+            not_available_line(&stderr, &["Trust compiler not found", "does not support Trust"])
+        );
+        return None;
+    }
+    if assert_out_of_sysroot_sibling_refusal(&output, &stdout, &stderr) {
+        eprintln!(
+            "NOT RUN: native hardened {subcommand} {profile_args:?}: no regular, non-symlink \
+             trustd sits beside {}, so the run was refused before any compiler ran and the \
+             default compiler workflow was not exercised. targo-trust said: {}",
+            targo_trust_binary().display(),
+            not_available_line(&stderr, &["non-symlink trustd sibling"])
+        );
+        return None;
     }
 
     assert!(
@@ -741,30 +884,7 @@ fn assert_native_hardened_json_uses_default_compiler_workflow_when_available(
         "native hardened {subcommand} should emit canonical trust-report JSON, not standalone JSON\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    let kinds = obligation_kind_set(&json);
-    let standalone_style: Vec<&str> =
-        kinds.iter().copied().filter(|kind| kind.starts_with("Hardened")).collect();
-    assert!(
-        standalone_style.is_empty(),
-        "native hardened report should use canonical hardened_ kind tags, not standalone enum names: {standalone_style:?}\nobserved: {kinds:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-
-    let hardened_kinds: BTreeSet<&str> =
-        kinds.iter().copied().filter(|kind| kind.starts_with("hardened_")).collect();
-    assert!(
-        !hardened_kinds.is_empty(),
-        "native hardened {subcommand} should emit hardened_ obligations when native trustc is available\nobserved: {kinds:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    let missing: Vec<&str> = NATIVE_HARDENED_KINDS
-        .iter()
-        .copied()
-        .filter(|kind| !hardened_kinds.contains(kind))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "native hardened JSON missing hardened kind(s): {missing:?}\nobserved hardened kinds: {hardened_kinds:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert_native_hardened_context(&json, subcommand, expected_profile, &stdout, &stderr);
+    Some((output, json))
 }
 
 fn assert_native_hardened_context(
@@ -841,10 +961,15 @@ fn assert_native_hardened_context(
     let proof_evidence_entries =
         summary.get("proof_evidence_entries").and_then(Value::as_u64).unwrap_or(0);
     assert!(
-        hardened_obligations >= NATIVE_HARDENED_KINDS.len() as u64,
-        "native hardened {subcommand} JSON should count hardened obligations\nsummary:\n{}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        summary.get("inventory_entries").and_then(Value::as_u64).unwrap_or(0)
+            >= NATIVE_HARDENED_KINDS.len() as u64,
+        "native hardened {subcommand} JSON must retain the unproved and mandate rows in its inventory\nsummary:\n{}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         Value::Object(summary.clone())
     );
+    // E4's evidence denominator counts proved non-mandate representatives,
+    // never all inventory rows. This deliberately risky corpus proves none.
+    assert_eq!(hardened_obligations, 0);
+    assert_eq!(proof_evidence_entries, 0);
     assert_eq!(
         proved_hardened_obligations,
         proof_evidence_entries,
@@ -860,7 +985,9 @@ fn assert_native_hardened_context(
                 Value::Object(hardened.clone())
             )
         });
-    let expected_level = if proof_evidence_entries == 0 {
+    let expected_level = if hardened_obligations == 0 {
+        "none"
+    } else if proof_evidence_entries == 0 {
         "inventory_only"
     } else if proof_evidence_entries == hardened_obligations {
         "proof_backed"
@@ -951,6 +1078,37 @@ fn assert_missing_native_trustc_setup_error(output: &Output, stdout: &str, stder
     true
 }
 
+/// The line of targo-trust's stderr that names what was not available, for the
+/// `_when_available` tests' NOT RUN message.
+fn not_available_line<'a>(stderr: &'a str, needles: &[&str]) -> &'a str {
+    stderr
+        .lines()
+        .find(|line| needles.iter().any(|needle| line.contains(needle)))
+        .unwrap_or("(no such line)")
+        .trim()
+}
+
+/// The other "not available" shape (measured 2026-09-07): a `targo-trust` test
+/// binary that does not sit beside a regular, non-symlink `trustd` — the debug
+/// binary under `target/`, for one — is refused BEFORE any compiler runs
+/// ("refusing to launch a split-authority Cargo fan-out", exit 2). That is the
+/// same-sysroot authority rule doing its job, not a verification outcome, and it
+/// names `trustd` rather than `trustc`, so the classifier above cannot see it.
+/// A `_when_available` test must skip here exactly as it skips a missing trustc.
+fn assert_out_of_sysroot_sibling_refusal(output: &Output, stdout: &str, stderr: &str) -> bool {
+    let refused = output.status.code() == Some(2)
+        && stderr.contains("non-symlink trustd sibling")
+        && stderr.contains("refusing to launch a split-authority Cargo fan-out");
+    if !refused {
+        return false;
+    }
+    assert!(
+        stdout.trim().is_empty(),
+        "a sibling-authority refusal must fail before emitting a JSON report\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    true
+}
+
 fn obligation_kind_set(json: &Value) -> BTreeSet<&str> {
     let functions = json["functions"]
         .as_array()
@@ -1012,9 +1170,16 @@ fn copy_dir_all(source: &Path, destination: &Path) -> std::io::Result<()> {
 fn hardened_lab_command(targo_root: &Path) -> Command {
     let targo = install_test_targo(targo_root);
     let mut command = Command::new(targo_trust_binary());
+    // The lab's walkthrough builds are real `targo --unverified build`s by the
+    // host frontend, which honours an inherited `RUSTC` or wrapper. The
+    // compiler settings this test was run with must not choose the compiler
+    // for them: with `RUSTC` naming a compiler that does not run, both lab
+    // tests failed at "could not execute process" before reaching anything
+    // they assert (measured 2026-10-13).
+    compiler_overrides::remove_inherited_compiler_overrides(&mut command);
     command.env("TARGO", targo);
     command
-        .env("TRUST_TEST_HOST_CARGO", std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        .env("TRUST_TEST_HOST_CARGO", std::env::var_os("CARGO").unwrap_or_else(|| "targo".into()));
     command
 }
 
@@ -1024,20 +1189,32 @@ if [ "$1" != "--unverified" ]; then
     echo "test targo: expected the explicit --unverified lane first, got: $*" >&2
     exit 2
 fi
-shift
+if ! "$TRUST_TEST_HOST_CARGO" --unverified --version >/dev/null 2>&1; then
+    echo "test targo: host frontend '$TRUST_TEST_HOST_CARGO' rejects \`--unverified --version\`, so it is not targo; no stock Cargo fallback" >&2
+    exit 2
+fi
 exec "$TRUST_TEST_HOST_CARGO" "$@"
 "#;
 
 /// Install a stand-in for the Trust Cargo frontend that hardened-lab drives.
 ///
-/// The real `targo` takes `--unverified` as a TOP-LEVEL lane flag and consumes
-/// it before dispatching the cargo command; stock cargo rejects it outright.
-/// Hardened-lab has spelled that lane explicitly since 333042c50a, because a
-/// bare `targo build` refuses rather than create an implicitly unverified
-/// artifact — so the stand-in must consume the lane the same way. It fails
-/// closed rather than silently tolerating its absence: if the walkthrough
-/// runner ever stops naming the lane, that is a product change these tests must
-/// report, not absorb.
+/// The real `targo` takes `--unverified` as a TOP-LEVEL lane flag before the
+/// cargo command. Hardened-lab has spelled that lane explicitly since
+/// 333042c50a, because a bare `targo build` refuses rather than create an
+/// implicitly unverified artifact. The stand-in fails closed rather than
+/// silently tolerating the lane's absence: if the walkthrough runner ever stops
+/// naming the lane, that is a product change these tests must report, not
+/// absorb. It then forwards the argv UNCHANGED, lane included, to the host
+/// frontend — `$CARGO`, which is targo under `targo --unverified test`, else
+/// `targo`.
+///
+/// Until 2026-09-28 the stand-in always stripped the lane for a stock host
+/// cargo, so under the `quick.targo-trust-tests` row every walkthrough build
+/// became a bare `targo build`, refused, and both lab tests went red.
+/// 505b3e9027 kept the lane for a targo host but still dropped it for stock
+/// cargo; since 2026-09-28 (no stock Cargo) there is no
+/// stock branch at all: a host that rejects `--unverified --version` — the one
+/// discriminator that tells targo from stock cargo (CLAUDE.md) — is refused.
 fn install_test_targo(targo_root: &Path) -> PathBuf {
     let path = targo_root.join(format!("targo{}", std::env::consts::EXE_SUFFIX));
     #[cfg(unix)]
@@ -1050,12 +1227,117 @@ fn install_test_targo(targo_root: &Path) -> PathBuf {
     }
     #[cfg(not(unix))]
     {
-        let host_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        let host_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap_or_else(|| "targo".into()));
         fs::copy(&host_cargo, &path).unwrap_or_else(|error| {
             panic!("copy host cargo {:?} to test targo {}: {error}", host_cargo, path.display())
         });
     }
     path
+}
+
+/// The silent-profile-downgrade case, end to end at the CLI: an unregistered
+/// label must NOT reach the banner. Before the fix this invocation printed
+/// "targo trust: hardened profile `unix_hardened_v2` enabled", ran the whole
+/// check, and generated zero hardened obligations, because
+/// `-Ztrust-verify-profile` selects the hardened obligation set and nothing
+/// else.
+#[test]
+fn an_unregistered_cli_profile_is_refused_and_never_announced() {
+    let fixture_dir = workspace_root().join("examples/hardened");
+
+    for label in ["unix_hardened_v2", "unix_hardend", "coreutils"] {
+        let output = Command::new(targo_trust_binary())
+            .args(["trust", "check", "--standalone", "--trust-profile", label])
+            .current_dir(&fixture_dir)
+            .output()
+            .expect("run targo trust check --trust-profile");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`{label}` must fail as a setup error\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("unknown trust profile"),
+            "`{label}` must say why\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("hardened profile `"),
+            "`{label}` must never be announced as an enabled profile\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// The same label, committed instead of typed. `[trust] trust_profile` is the
+/// surface a project actually uses, and it used to accept anything.
+#[test]
+fn an_unregistered_configured_profile_is_refused_and_never_announced() {
+    let project = tempfile::tempdir().expect("fixture dir");
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"downgrade-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [trust]\ntrust_profile = \"unix_hardened_v2\"\n",
+    )
+    .expect("write manifest");
+    fs::create_dir_all(project.path().join("src")).expect("create src");
+    fs::write(project.path().join("src/lib.rs"), "pub fn probe() {}\n").expect("write lib");
+
+    let output = Command::new(targo_trust_binary())
+        .args(["trust", "check", "--standalone"])
+        .current_dir(project.path())
+        .output()
+        .expect("run targo trust check");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a committed unregistered profile must fail the load\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unknown trust profile"),
+        "the refusal must name the defect\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("hardened profile `"),
+        "an unregistered profile must never be announced\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// Every registered label still turns hardening on and is announced in the
+/// registry's own spelling — including a `-`/uppercase variant, which is a
+/// spelling of the same registry entry and not a different profile.
+#[test]
+fn every_registered_profile_still_enables_and_announces_hardening() {
+    let fixture_dir = workspace_root().join("examples/hardened");
+
+    for (label, announced) in [
+        ("hardened", "hardened"),
+        ("unix_hardened", "unix_hardened"),
+        ("coreutils_hardened", "coreutils_hardened"),
+        ("UNIX-HARDENED", "unix_hardened"),
+    ] {
+        let output = Command::new(targo_trust_binary())
+            .args(["trust", "check", "--standalone", "--trust-profile", label])
+            .current_dir(&fixture_dir)
+            .output()
+            .expect("run targo trust check --trust-profile");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(
+            output.status.code(),
+            Some(2),
+            "`{label}` is registered and must not be a setup error\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("hardened profile `{announced}` enabled")),
+            "`{label}` must announce `{announced}`\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 }
 
 fn targo_trust_binary() -> PathBuf {

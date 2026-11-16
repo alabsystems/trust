@@ -98,7 +98,10 @@
 
 #![allow(clippy::doc_markdown)]
 
-use clean_kernel::{Environment, Expr, ExprKind, Name};
+use clean_kernel::{
+    Declaration, Environment, Expr, ExprKind, KernelEnvError, Level, Name,
+    TypeError as KernelTypeError,
+};
 use trust_clean_origin::emit::plan_clean_origin_body;
 
 fn island(source: &str) -> Result<Environment, String> {
@@ -118,6 +121,24 @@ fn island(source: &str) -> Result<Environment, String> {
 
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").chars().take(300).collect()
+}
+
+/// `theorem v : gcdF f a b = v := @Eq.refl Nat (gcdF f a b)` put to the
+/// kernel's full declaration check, with no elaborator in between. `env` is not
+/// modified.
+fn kernel_rfl_fuel(env: &Environment, [f, a, b]: [u32; 3], v: u32) -> Result<(), KernelEnvError> {
+    let cnst = |name: &str, levels: Vec<Level>| Expr::const_(Name::from_string(name), levels);
+    let one = || vec![Level::succ(Level::zero())];
+    let lhs = Expr::apps(cnst("gcdF", vec![]), [f, a, b].map(|n| Expr::nat_lit(n.into())));
+    env.check_decl_readonly(&Declaration::Theorem {
+        name: Name::from_string("gcd_formulation_probes_kernel_row"),
+        level_params: vec![],
+        type_: Expr::apps(
+            cnst("Eq", one()),
+            [cnst("Nat", vec![]), lhs.clone(), Expr::nat_lit(v.into())],
+        ),
+        value: Expr::apps(cnst("Eq.refl", one()), [cnst("Nat", vec![]), lhs]),
+    })
 }
 
 /// Assert that a source is rejected by the ELABORATOR (not by this compiler),
@@ -239,7 +260,11 @@ fn anatomy(tag: &str, name: &str, source: &str) {
     };
     let (outer_lams, cursor) = peel(&value);
     let (head, args) = uncurry(cursor);
-    eprintln!("ANATOMY {tag} | outer_lams={outer_lams} head={} args={}", render(head, 2), args.len());
+    eprintln!(
+        "ANATOMY {tag} | outer_lams={outer_lams} head={} args={}",
+        render(head, 2),
+        args.len()
+    );
     for (i, a) in args.iter().enumerate() {
         eprintln!("   arg[{i}] = {}", render(a, 5));
     }
@@ -385,11 +410,7 @@ fn p2_ratified_and_two_call_subtractive() {
     // now read the same; what distinguishes them is WHY, and the survey's
     // ranking (header) is what records that.
     for m in ["b", "a"] {
-        assert_island_rejects(
-            &format!("p2 2call {m}"),
-            &two_branch(m),
-            "no decreasing proof",
-        );
+        assert_island_rejects(&format!("p2 2call {m}"), &two_branch(m), "no decreasing proof");
     }
 
     // (c) one-call with swap: DEAD, and not because of Trust — the measure
@@ -465,7 +486,10 @@ fn p3_branch_free_direct_two_arg() {
             )
         });
         let plan = plan_clean_origin_body(&env, "gcdB").unwrap_or_else(|refusal| {
-            panic!("ROW p3 bf {m}: …and the CALL lane must plan it: {}", first_line(&refusal.note()))
+            panic!(
+                "ROW p3 bf {m}: …and the CALL lane must plan it: {}",
+                first_line(&refusal.note())
+            )
         });
         assert_eq!(
             format!("{:?}", plan.shape()),
@@ -539,13 +563,20 @@ fn p4_fuel_form() {
     assert!(
         plan_clean_origin_body(&env, "gcdF").is_ok(),
         "the fuel form must PLAN — this is what R3b landed: {}",
-        plan_clean_origin_body(&env, "gcdF").err().map_or_else(String::new, |r| first_line(&r.note()))
+        plan_clean_origin_body(&env, "gcdF")
+            .err()
+            .map_or_else(String::new, |r| first_line(&r.note()))
     );
 
     // …and the CLEAN-side 2-argument wrapper still does NOT, which is why the
-    // wrapper in the run-pass fixture is written in RUST. There is no emittable
-    // shape for a Clean `def` that calls a sibling Clean `def`.
-    assert_call_refuses("p4 wrapper", "gcd2", GCD_WRAPPER, "outside the emittable fragment");
+    // wrapper in the run-pass fixture is written in RUST. Since a385c099a98
+    // (named Lean call expansion, `src/named_calls.rs`) a Clean `def` that
+    // calls a sibling Clean `def` is no longer refused on sight: the call lane
+    // inlines the checked callee. For `gcd2` that pulls in `gcdF`'s whole
+    // well-founded-recursion proof term, which exceeds the expansion's work
+    // envelope — so the wrapper is refused THERE, with nothing emitted.
+    // (Before a385c099a98 this row expected "outside the emittable fragment".)
+    assert_call_refuses("p4 wrapper", "gcd2", GCD_WRAPPER, "named Lean call expansion exceeded");
     row("p4 wrapper-loop", "gcdF", GCD_WRAPPER);
 }
 
@@ -577,13 +608,46 @@ fn p5_fuel_form_values_at_the_kernel() {
     }
 
     // REFUTING CONTROLS — without these the rows above are a rubber stamp.
-    for (fuel, a, b, wrong) in [(10_u32, 4_u32, 6_u32, 3_u32), (48, 12, 18, 12), (13, 7, 3, 3)] {
-        let src = format!("{GCD_FUEL}\ntheorem v : gcdF {fuel} {a} {b} = {wrong} := rfl");
-        assert!(
-            island(&src).is_err(),
-            "CONTROL: `gcdF {fuel} {a} {b} = {wrong}` is false and must be REFUSED"
-        );
+    //
+    // Put to the KERNEL DIRECTLY (`theorem v : gcdF f a b = wrong := Eq.refl
+    // (gcdF f a b)` through `check_decl_readonly`, over the environment the
+    // island produced), and required to fail with the kernel's TYPE MISMATCH
+    // while the same builder at the true value is ADMITTED. Not through the
+    // island: Clean's elaborator refuses a false `rfl` over this definition in
+    // time exponential in the fuel (measured 2026-09-28 in `gcd_final_probes`'
+    // module docs: fuel 48 did not finish in 10 minutes), while the kernel
+    // decides each row in milliseconds. The island's own refusal is still
+    // measured at fuel 10.
+    let env = island(GCD_FUEL)
+        .unwrap_or_else(|why| panic!("the island must admit `gcdF`: {}", first_line(&why)));
+    // `right` is the value the island admitted for the same row above.
+    for (fuel, a, b, right, wrong) in
+        [(10_u32, 4_u32, 6_u32, 2_u32, 3_u32), (48, 12, 18, 6, 12), (13, 7, 3, 1, 3)]
+    {
+        if let Err(error) = kernel_rfl_fuel(&env, [fuel, a, b], right) {
+            panic!(
+                "BUILDER CONTROL: the kernel must ADMIT `gcdF {fuel} {a} {b} = {right}` built the same way: {error}"
+            );
+        }
+        match kernel_rfl_fuel(&env, [fuel, a, b], wrong) {
+            Err(KernelEnvError::TypeCheckFailed {
+                source: KernelTypeError::TypeMismatch { .. },
+                ..
+            }) => {}
+            Ok(()) => panic!(
+                "CONTROL: `gcdF {fuel} {a} {b} = {wrong}` is false and the kernel ADMITTED it"
+            ),
+            Err(other) => panic!(
+                "CONTROL: `gcdF {fuel} {a} {b} = {wrong}` must be refused by the kernel's TYPE \
+                 MISMATCH, not by: {other}"
+            ),
+        }
     }
+    let src = format!("{GCD_FUEL}\ntheorem v : gcdF 10 4 6 = 3 := rfl");
+    assert!(
+        island(&src).is_err(),
+        "CONTROL: `gcdF 10 4 6 = 3` is false and the island must REFUSE it"
+    );
 
     // And through the two-argument wrapper, which is where the fuel bound
     // `a + b + b` is supplied. (`gcd_final_probes` carries the full table.)
@@ -611,7 +675,9 @@ fn assert_plans(tag: &str, name: &str, source: &str) {
     assert!(
         plan_clean_origin_body(&env, name).is_ok(),
         "ROW {tag}: must PLAN after R3b: {}",
-        plan_clean_origin_body(&env, name).err().map_or_else(String::new, |r| first_line(&r.note()))
+        plan_clean_origin_body(&env, name)
+            .err()
+            .map_or_else(String::new, |r| first_line(&r.note()))
     );
 }
 
@@ -660,9 +726,13 @@ fn p6_feature_isolation() {
          if h : 0 < a then acc3 (a - 1) (b + 1) (c + b) else c\n\
          termination_by a",
     );
-    anatomy("p6 arity3", "acc3", "def acc3 (a b c : Nat) : Nat := \
+    anatomy(
+        "p6 arity3",
+        "acc3",
+        "def acc3 (a b c : Nat) : Nat := \
          if h : 0 < a then acc3 (a - 1) (b + 1) (c + b) else c\n\
-         termination_by a");
+         termination_by a",
+    );
     // (v) the R3a baseline, which must be UNMOVED by the widening.
     assert_plans(
         "p6 addAcc",
@@ -685,10 +755,8 @@ fn p6_feature_isolation() {
 #[test]
 fn p7_refusal_texts() {
     let env = island(GCD_MOD).expect("the modulo form elaborates");
-    let note = plan_clean_origin_body(&env, "gcd")
-        .err()
-        .expect("the modulo form must refuse")
-        .note();
+    let note =
+        plan_clean_origin_body(&env, "gcd").err().expect("the modulo form must refuse").note();
     eprintln!("\n──── NOTE for the RATIFIED `gcd b (a % b)` ────\n{note}\n");
     assert!(note.contains("options:"), "a refusal without options is an 'unsupported': {note}");
     assert!(

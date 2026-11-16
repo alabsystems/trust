@@ -1,0 +1,276 @@
+{
+  "name": "bug_a1_cast_i32_to_u32",
+  "def_path": "probes::bug_a1_cast_i32_to_u32",
+  "span": {
+    "file": "src/probes.rs",
+    "line_start": 14,
+    "col_start": 0,
+    "line_end": 14,
+    "col_end": 86
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "u"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Never",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "src/probes.rs",
+                "line_start": 14,
+                "col_start": 48,
+                "line_end": 14,
+                "col_end": 56
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Le",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2147483647,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "src/probes.rs",
+                "line_start": 14,
+                "col_start": 66,
+                "line_end": 14,
+                "col_end": 82
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "src/probes.rs",
+              "line_start": 14,
+              "col_start": 66,
+              "line_end": 14,
+              "col_end": 82
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::panicking::panic",
+            "args": [
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      97,
+                      115,
+                      115,
+                      101,
+                      114,
+                      116,
+                      105,
+                      111,
+                      110,
+                      32,
+                      102,
+                      97,
+                      105,
+                      108,
+                      101,
+                      100,
+                      58,
+                      32,
+                      117,
+                      32,
+                      60,
+                      61,
+                      32,
+                      48,
+                      120,
+                      55,
+                      70,
+                      70,
+                      70,
+                      95,
+                      70,
+                      70,
+                      70,
+                      70
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": null,
+            "span": {
+              "file": "src/probes.rs",
+              "line_start": 14,
+              "col_start": 58,
+              "line_end": 14,
+              "col_end": 83
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 6692626837626329215,
+              "def_index": 11823,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 6692626837626329215,
+              "krate_name": "core"
+            }
+          }
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": -2147483648
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2147483647
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

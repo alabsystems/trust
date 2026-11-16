@@ -49,8 +49,8 @@ impl SimplificationPipeline {
     #[must_use]
     pub fn run(&self, formula: Formula) -> (Formula, usize) {
         let mut current = formula;
+        let mut before_size = measure_size(&current);
         for iter in 0..self.max_iters {
-            let before_size = measure_size(&current);
             for pass in &self.passes {
                 current = pass.apply(current);
             }
@@ -58,6 +58,7 @@ impl SimplificationPipeline {
             if after_size >= before_size {
                 return (current, iter + 1);
             }
+            before_size = after_size;
         }
         (current, self.max_iters)
     }
@@ -71,7 +72,7 @@ impl SimplificationPipeline {
 #[must_use]
 pub fn measure_size(formula: &Formula) -> usize {
     let mut count = 0;
-    formula.visit(&mut |_| count += 1);
+    trust_types::visit_formula_nodes(formula, &mut |_| count += 1);
     count
 }
 
@@ -95,24 +96,28 @@ pub fn constant_fold(formula: Formula) -> Formula {
 
         // And: all-true -> true, any-false -> false
         Formula::And(terms) => {
-            if terms.iter().all(|t| matches!(t, Formula::Bool(true))) {
-                Formula::Bool(true)
-            } else if terms.iter().any(|t| matches!(t, Formula::Bool(false))) {
-                Formula::Bool(false)
-            } else {
-                Formula::And(terms)
+            let mut all_true = true;
+            for t in &terms {
+                match t {
+                    Formula::Bool(false) => return Formula::Bool(false),
+                    Formula::Bool(true) => {}
+                    _ => all_true = false,
+                }
             }
+            if all_true { Formula::Bool(true) } else { Formula::And(terms) }
         }
 
         // Or: all-false -> false, any-true -> true
         Formula::Or(terms) => {
-            if terms.iter().all(|t| matches!(t, Formula::Bool(false))) {
-                Formula::Bool(false)
-            } else if terms.iter().any(|t| matches!(t, Formula::Bool(true))) {
-                Formula::Bool(true)
-            } else {
-                Formula::Or(terms)
+            let mut all_false = true;
+            for t in &terms {
+                match t {
+                    Formula::Bool(true) => return Formula::Bool(true),
+                    Formula::Bool(false) => {}
+                    _ => all_false = false,
+                }
             }
+            if all_false { Formula::Bool(false) } else { Formula::Or(terms) }
         }
 
         // Implies
@@ -243,26 +248,28 @@ pub fn boolean_simplify(formula: Formula) -> Formula {
         // And: filter out true, short-circuit on false, flatten nested And,
         // detect contradiction (P and Not(P))
         Formula::And(terms) => {
-            let mut flat = Vec::with_capacity(terms.len());
-            for t in terms {
-                match t {
-                    Formula::Bool(true) => {}                            // identity: skip
-                    Formula::Bool(false) => return Formula::Bool(false), // annihilation
-                    Formula::And(inner) => flat.extend(inner),           // flatten
-                    other => flat.push(other),
+            let mut flat = if terms.iter().any(|t| matches!(t, Formula::Bool(_) | Formula::And(_)))
+            {
+                let mut flat = Vec::with_capacity(terms.len());
+                for t in terms {
+                    match t {
+                        Formula::Bool(true) => {}                            // identity: skip
+                        Formula::Bool(false) => return Formula::Bool(false), // annihilation
+                        Formula::And(inner) => flat.extend(inner),           // flatten
+                        other => flat.push(other),
+                    }
                 }
-            }
+                flat
+            } else {
+                terms
+            };
             // Contradiction detection: And([..., P, ..., Not(P), ...]) -> false
             if has_ast_contradiction(&flat) {
                 return Formula::Bool(false);
             }
             match flat.len() {
                 0 => Formula::Bool(true),
-                // SAFETY: match arm guarantees len == 1, so .next() returns Some.
-                1 => flat
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| unreachable!("empty iter despite len == 1")),
+                1 => flat.pop().unwrap_or(Formula::Bool(true)),
                 _ => Formula::And(flat),
             }
         }
@@ -270,26 +277,27 @@ pub fn boolean_simplify(formula: Formula) -> Formula {
         // Or: filter out false, short-circuit on true, flatten nested Or,
         // detect excluded middle (P or Not(P))
         Formula::Or(terms) => {
-            let mut flat = Vec::with_capacity(terms.len());
-            for t in terms {
-                match t {
-                    Formula::Bool(false) => {}                         // identity: skip
-                    Formula::Bool(true) => return Formula::Bool(true), // annihilation
-                    Formula::Or(inner) => flat.extend(inner),          // flatten
-                    other => flat.push(other),
+            let mut flat = if terms.iter().any(|t| matches!(t, Formula::Bool(_) | Formula::Or(_))) {
+                let mut flat = Vec::with_capacity(terms.len());
+                for t in terms {
+                    match t {
+                        Formula::Bool(false) => {}                         // identity: skip
+                        Formula::Bool(true) => return Formula::Bool(true), // annihilation
+                        Formula::Or(inner) => flat.extend(inner),          // flatten
+                        other => flat.push(other),
+                    }
                 }
-            }
+                flat
+            } else {
+                terms
+            };
             // Excluded middle: Or([..., P, ..., Not(P), ...]) -> true
             if has_ast_contradiction(&flat) {
                 return Formula::Bool(true);
             }
             match flat.len() {
                 0 => Formula::Bool(false),
-                // SAFETY: match arm guarantees len == 1, so .next() returns Some.
-                1 => flat
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| unreachable!("empty iter despite len == 1")),
+                1 => flat.pop().unwrap_or(Formula::Bool(false)),
                 _ => Formula::Or(flat),
             }
         }
@@ -311,31 +319,46 @@ pub fn boolean_simplify(formula: Formula) -> Formula {
 ///
 /// Used for contradiction detection in And and excluded-middle detection in Or.
 fn has_ast_contradiction(terms: &[Formula]) -> bool {
-    // Collect all positive terms and all negated terms, then check for overlap.
-    // We compare by structural equality which is already derived on Formula.
-    let mut positives: FxHashSet<usize> = FxHashSet::default();
-    let mut negative_indices: Vec<usize> = Vec::new();
-
-    for (i, term) in terms.iter().enumerate() {
-        if matches!(term, Formula::Not(_)) {
-            negative_indices.push(i);
-        } else {
-            positives.insert(i);
-        }
+    if terms.len() < 2 {
+        return false;
     }
-
-    for neg_idx in &negative_indices {
-        if let Formula::Not(inner) = &terms[*neg_idx] {
-            // Check if the inner formula appears as a positive term
-            for &pos_idx in &positives {
-                if terms[pos_idx] == **inner {
-                    return true;
-                }
+    let neg_count = terms.iter().filter(|term| matches!(term, Formula::Not(_))).count();
+    let pos_count = terms.len() - neg_count;
+    if neg_count == 0 || pos_count == 0 {
+        return false;
+    }
+    if neg_count.saturating_mul(pos_count) <= 32 {
+        return terms.iter().any(|term| match term {
+            Formula::Not(inner) if !matches!(inner.as_ref(), Formula::Not(_)) => {
+                terms.iter().any(|pos| !matches!(pos, Formula::Not(_)) && pos == inner.as_ref())
             }
-        }
+            _ => false,
+        });
     }
-
-    false
+    // Hash the smaller side (typically 1-2 negated terms vs many positive conjuncts).
+    if neg_count <= pos_count {
+        let neg_inners: FxHashSet<&Formula> = terms
+            .iter()
+            .filter_map(|term| match term {
+                Formula::Not(inner) if !matches!(inner.as_ref(), Formula::Not(_)) => {
+                    Some(inner.as_ref())
+                }
+                _ => None,
+            })
+            .collect();
+        if neg_inners.is_empty() {
+            return false;
+        }
+        return terms
+            .iter()
+            .any(|term| !matches!(term, Formula::Not(_)) && neg_inners.contains(term));
+    }
+    let positives: FxHashSet<&Formula> =
+        terms.iter().filter(|term| !matches!(term, Formula::Not(_))).collect();
+    terms.iter().any(|term| match term {
+        Formula::Not(inner) => positives.contains(inner.as_ref()),
+        _ => false,
+    })
 }
 
 /// Pass wrapper for `boolean_simplify`.
@@ -362,29 +385,61 @@ impl SimplificationPass for BooleanSimplifyPass {
 /// live even if they don't appear syntactically (e.g., for external references).
 #[must_use]
 pub fn dead_var_elimination(formula: Formula, live_vars: &FxHashSet<String>) -> Formula {
+    if !contains_quantifier(&formula) {
+        return formula;
+    }
     formula.map(&mut |f| match f {
         Formula::Forall(bindings, body) => {
-            let body_vars = body.free_variables();
-            let kept: Vec<_> = bindings
-                .into_iter()
-                .filter(|(name, _)| {
-                    body_vars.contains(name.as_str()) || live_vars.contains(name.as_str())
-                })
-                .collect();
+            let kept = filter_live_bindings(bindings, &body, live_vars);
             if kept.is_empty() { *body } else { Formula::Forall(kept, body) }
         }
         Formula::Exists(bindings, body) => {
-            let body_vars = body.free_variables();
-            let kept: Vec<_> = bindings
-                .into_iter()
-                .filter(|(name, _)| {
-                    body_vars.contains(name.as_str()) || live_vars.contains(name.as_str())
-                })
-                .collect();
+            let kept = filter_live_bindings(bindings, &body, live_vars);
             if kept.is_empty() { *body } else { Formula::Exists(kept, body) }
         }
         other => other,
     })
+}
+
+fn contains_quantifier(formula: &Formula) -> bool {
+    trust_types::any_formula_node(formula, &mut |node| {
+        matches!(node, Formula::Forall(..) | Formula::Exists(..))
+    })
+}
+
+fn filter_live_bindings(
+    bindings: Vec<(trust_types::Symbol, trust_types::Sort)>,
+    body: &Formula,
+    live_vars: &FxHashSet<String>,
+) -> Vec<(trust_types::Symbol, trust_types::Sort)> {
+    if bindings.len() <= 1 {
+        return bindings
+            .into_iter()
+            .filter(|(name, _)| {
+                live_vars.contains(name.as_str())
+                    || trust_types::any_free_variable_name(body, &mut |v| v == name.as_str())
+            })
+            .collect();
+    }
+    let mut live: Vec<bool> =
+        bindings.iter().map(|(name, _)| live_vars.contains(name.as_str())).collect();
+    let mut remaining = live.iter().filter(|&&b| !b).count();
+    if remaining > 0 {
+        let _ = trust_types::any_free_variable_name(body, &mut |v| {
+            for (is_live, (name, _)) in live.iter_mut().zip(bindings.iter()) {
+                if !*is_live && name.as_str() == v {
+                    *is_live = true;
+                    remaining -= 1;
+                }
+            }
+            remaining == 0
+        });
+    }
+    bindings
+        .into_iter()
+        .zip(live)
+        .filter_map(|(binding, is_live)| is_live.then_some(binding))
+        .collect()
 }
 
 /// Pass wrapper for `dead_var_elimination` with no external live vars.

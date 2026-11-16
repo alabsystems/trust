@@ -7,8 +7,8 @@
 
 clean {
     theorem zero_eq : 0 = 0 := rfl
-    //~^ NOTE Clean island kernel-checked: 1 declaration(s) registered (zero_eq)
 }
+//~^^ NOTE Clean island kernel-checked: 1 declaration(s) registered (zero_eq)
 
 fn count(mut n: u32) -> u32 {
     while n > 0

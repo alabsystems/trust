@@ -6,17 +6,19 @@ pub mod map;
 pub mod nested_filter;
 pub mod place;
 
+use rustc_attr_ir::Attribute;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::sorted_map::SortedMap;
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{DynSend, DynSync, try_par_for_each_in};
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdMap, LocalModDefId};
+use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdMap, LocalModId};
 use rustc_hir::lints::DelayedLints;
 use rustc_hir::*;
 use rustc_macros::{Decodable, Encodable, StableHash};
-use rustc_span::{ErrorGuaranteed, ExpnId, Span};
+use rustc_span::{ErrorGuaranteed, ExpnId, Span, bug, span_bug};
 
 use crate::query::Providers;
 use crate::ty::TyCtxt;
@@ -28,7 +30,7 @@ pub struct ModuleItems {
     /// Whether this represents the whole crate, in which case we need to add `CRATE_OWNER_ID` to
     /// the iterators if we want to account for the crate root.
     add_root: bool,
-    submodules: Box<[OwnerId]>,
+    submodules: Box<[LocalModId]>,
     free_items: Box<[ItemId]>,
     trait_items: Box<[TraitItemId]>,
     impl_items: Box<[ImplItemId]>,
@@ -92,6 +94,11 @@ impl ModuleItems {
         self.opaques.iter().copied()
     }
 
+    #[inline]
+    pub fn opaque_slice(&self) -> &[LocalDefId] {
+        &self.opaques
+    }
+
     /// Closures and inline consts
     pub fn nested_bodies(&self) -> impl Iterator<Item = LocalDefId> {
         self.nested_bodies.iter().copied()
@@ -106,62 +113,62 @@ impl ModuleItems {
         &self,
         f: impl Fn(LocalDefId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
     ) -> Result<(), ErrorGuaranteed> {
-        try_par_for_each_in(&self.nested_bodies[..], |&&id| f(id))
+        try_par_for_each_in(&self.nested_bodies[..], |&id| f(id))
     }
 
     pub fn par_items(
         &self,
         f: impl Fn(ItemId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
     ) -> Result<(), ErrorGuaranteed> {
-        try_par_for_each_in(&self.free_items[..], |&&id| f(id))
+        try_par_for_each_in(&self.free_items[..], |&id| f(id))
     }
 
     pub fn par_trait_items(
         &self,
         f: impl Fn(TraitItemId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
     ) -> Result<(), ErrorGuaranteed> {
-        try_par_for_each_in(&self.trait_items[..], |&&id| f(id))
+        try_par_for_each_in(&self.trait_items[..], |&id| f(id))
     }
 
     pub fn par_impl_items(
         &self,
         f: impl Fn(ImplItemId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
     ) -> Result<(), ErrorGuaranteed> {
-        try_par_for_each_in(&self.impl_items[..], |&&id| f(id))
+        try_par_for_each_in(&self.impl_items[..], |&id| f(id))
     }
 
     pub fn par_foreign_items(
         &self,
         f: impl Fn(ForeignItemId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
     ) -> Result<(), ErrorGuaranteed> {
-        try_par_for_each_in(&self.foreign_items[..], |&&id| f(id))
+        try_par_for_each_in(&self.foreign_items[..], |&id| f(id))
     }
 
     pub fn par_opaques(
         &self,
         f: impl Fn(LocalDefId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
     ) -> Result<(), ErrorGuaranteed> {
-        try_par_for_each_in(&self.opaques[..], |&&id| f(id))
+        try_par_for_each_in(&self.opaques[..], |&id| f(id))
     }
 }
 
 impl<'tcx> TyCtxt<'tcx> {
-    pub fn parent_module(self, id: HirId) -> LocalModDefId {
+    pub fn parent_module(self, id: HirId) -> LocalModId {
         if !id.is_owner() && self.def_kind(id.owner) == DefKind::Mod {
-            LocalModDefId::new_unchecked(id.owner.def_id)
+            LocalModId::new_unchecked(id.owner.def_id)
         } else {
             self.parent_module_from_def_id(id.owner.def_id)
         }
     }
 
-    pub fn parent_module_from_def_id(self, mut id: LocalDefId) -> LocalModDefId {
+    pub fn parent_module_from_def_id(self, mut id: LocalDefId) -> LocalModId {
         while let Some(parent) = self.opt_local_parent(id) {
             id = parent;
             if self.def_kind(id) == DefKind::Mod {
                 break;
             }
         }
-        LocalModDefId::new_unchecked(id)
+        LocalModId::new_unchecked(id)
     }
 
     /// Returns `true` if this is a foreign item (i.e., linked via `extern { ... }`).
@@ -342,6 +349,7 @@ impl<'tcx> TyCtxt<'tcx> {
             | Node::Synthetic
             | Node::Err(_)
             | Node::Ctor(_)
+            | Node::NestedUseTree(_)
             | Node::Lifetime(_)
             | Node::GenericParam(_)
             | Node::Crate(_)
@@ -349,7 +357,10 @@ impl<'tcx> TyCtxt<'tcx> {
             | Node::WherePredicate(_)
             | Node::PreciseCapturingNonLifetimeArg(_)
             | Node::ConstArgExprField(_)
-            | Node::OpaqueTy(_) => {
+            | Node::OpaqueTy(_)
+            | Node::TestBinderForall(_)
+            | Node::TestBinderExists(_)
+            | Node::TestBinderBoundTypeConstraint(_) => {
                 unreachable!("no sub-expr expected for {parent_node:?}")
             }
         }

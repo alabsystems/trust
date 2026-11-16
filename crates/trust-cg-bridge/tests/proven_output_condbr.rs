@@ -69,6 +69,7 @@ fn wrap(name: &str, body: VerifiableBody) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

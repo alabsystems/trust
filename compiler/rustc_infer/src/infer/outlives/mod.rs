@@ -3,25 +3,23 @@
 use std::iter;
 
 use rustc_data_structures::undo_log::UndoLogs;
-use rustc_middle::traits::query::{NoSolution, OutlivesBound};
+use rustc_middle::traits::query::OutlivesBound;
 use rustc_middle::ty;
-use rustc_span::Span;
 use tracing::instrument;
 
 use self::env::OutlivesEnvironment;
 use super::region_constraints::{RegionConstraintData, UndoLog};
-use super::{InferCtxt, RegionResolutionError, SubregionOrigin};
+use super::{InferCtxt, RegionResolutionError};
 use crate::infer::free_regions::RegionRelations;
 use crate::infer::lexical_region_resolve;
 use crate::infer::region_constraints::ConstraintKind;
 
 pub mod env;
-pub mod for_liveness;
 pub mod obligations;
 pub mod test_type_match;
 pub(crate) mod verify;
 
-#[instrument(level = "debug", skip(param_env), ret)]
+#[instrument(level = "debug", skip(param_env))]
 pub fn explicit_outlives_bounds<'tcx>(
     param_env: ty::ParamEnv<'tcx>,
 ) -> impl Iterator<Item = OutlivesBound<'tcx>> {
@@ -30,34 +28,23 @@ pub fn explicit_outlives_bounds<'tcx>(
         .into_iter()
         .filter_map(ty::Clause::as_region_outlives_clause)
         .filter_map(ty::Binder::no_bound_vars)
-        .map(|ty::OutlivesPredicate(r_a, r_b)| OutlivesBound::RegionSubRegion(r_b, r_a))
+        .map(|ty::OutlivesClause(r_a, r_b)| OutlivesBound::RegionSubRegion(r_b, r_a))
 }
 
 impl<'tcx> InferCtxt<'tcx> {
     /// Process the region constraints and return any errors that
     /// result. After this, no more unification operations should be
     /// done -- or the compiler will panic -- but it is legal to use
-    /// `resolve_vars_if_possible` as well as `fully_resolve`.
+    /// `deeply_resolve_ignoring_regions` as well as `fully_resolve`.
     ///
-    /// If you are in a crate that has access to `rustc_trait_selection`,
-    /// then it's probably better to use `resolve_regions`,
-    /// which knows how to normalize registered region obligations.
+    /// Don't call this directly unless you know what you're doing.
+    /// You probably want to use `resolve_regions` instead.
     #[must_use]
-    pub fn resolve_regions_with_normalize(
+    pub fn resolve_regions_with_outlives_env(
         &self,
         outlives_env: &OutlivesEnvironment<'tcx>,
-        deeply_normalize_ty: impl Fn(
-            ty::PolyTypeOutlivesPredicate<'tcx>,
-            SubregionOrigin<'tcx>,
-        ) -> Result<ty::PolyTypeOutlivesPredicate<'tcx>, NoSolution>,
-        span: Span,
     ) -> Vec<RegionResolutionError<'tcx>> {
-        match self.process_registered_region_obligations(outlives_env, deeply_normalize_ty, span) {
-            Ok(()) => {}
-            Err((clause, origin)) => {
-                return vec![RegionResolutionError::CannotNormalize(clause, origin)];
-            }
-        };
+        self.process_registered_region_obligations(outlives_env);
 
         let mut storage = {
             let mut inner = self.inner.borrow_mut();
@@ -71,22 +58,30 @@ impl<'tcx> InferCtxt<'tcx> {
             inner.region_constraint_storage.take().expect("regions already resolved")
         };
 
-        storage.data.constraints = storage
-            .data
-            .constraints
-            .iter()
-            .flat_map(|(constraint, origin)| {
-                constraint.iter_outlives().zip(iter::repeat_with(|| origin.clone()))
-            })
-            .collect();
+        // FIXME(-Zassumptions-in-binders): Handle solver_data
+        if storage.legacy_data.constraints.iter().any(|(c, _)| {
+            matches!(
+                c.kind,
+                ConstraintKind::VarEqVar | ConstraintKind::VarEqReg | ConstraintKind::RegEqReg
+            )
+        }) {
+            storage.legacy_data.constraints = storage
+                .legacy_data
+                .constraints
+                .iter()
+                .flat_map(|(constraint, origin)| {
+                    constraint.iter_outlives().zip(iter::repeat_with(|| origin.clone()))
+                })
+                .collect();
+        }
 
         // Filter out any region-region outlives assumptions that are implied by
         // coroutine well-formedness.
         if self.tcx.sess.opts.unstable_opts.higher_ranked_assumptions {
-            storage.data.constraints.retain(|(c, _)| match c.kind {
+            storage.legacy_data.constraints.retain(|(c, _)| match c.kind {
                 ConstraintKind::RegSubReg => !outlives_env
                     .higher_ranked_assumptions()
-                    .contains(&ty::OutlivesPredicate(c.sup.into(), c.sub)),
+                    .contains(&ty::OutlivesClause(c.sup.into(), c.sub)),
 
                 ConstraintKind::VarSubVar
                 | ConstraintKind::RegSubVar
@@ -101,7 +96,7 @@ impl<'tcx> InferCtxt<'tcx> {
         let region_rels = &RegionRelations::new(self.tcx, outlives_env.free_region_map());
 
         let (lexical_region_resolutions, errors) =
-            lexical_region_resolve::resolve(region_rels, storage.var_infos, storage.data);
+            lexical_region_resolve::resolve(region_rels, storage.var_infos, storage.legacy_data);
 
         let old_value = self.lexical_region_resolutions.replace(Some(lexical_region_resolutions));
         assert!(old_value.is_none());
@@ -140,6 +135,7 @@ impl<'tcx> InferCtxt<'tcx> {
         op: impl FnOnce(&RegionConstraintData<'tcx>) -> R,
     ) -> R {
         let mut inner = self.inner.borrow_mut();
-        op(inner.unwrap_region_constraints().data())
+        // FIXME(-Zassumptions-on-binders): Handle solver_data
+        op(inner.unwrap_region_constraints().legacy_data())
     }
 }

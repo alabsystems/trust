@@ -1,0 +1,937 @@
+{
+  "name": "reach_rec_inner_frame",
+  "def_path": "repro::Acc::reach_rec_inner_frame",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+    "line_start": 220,
+    "col_start": 4,
+    "line_end": 233,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "repro::Acc",
+                "fields": [
+                  [
+                    "state",
+                    {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        },
+                        "len": 8
+                      }
+                    }
+                  ],
+                  [
+                    "buf",
+                    {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        },
+                        "len": 64
+                      }
+                    }
+                  ],
+                  [
+                    "buf_len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 221,
+                "col_start": 11,
+                "line_end": 221,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 221,
+              "col_start": 11,
+              "line_end": 221,
+              "col_end": 16
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 222,
+                "col_start": 39,
+                "line_end": 222,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 6,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 2,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 222,
+              "col_start": 39,
+              "line_end": 222,
+              "col_end": 44
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 6,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 222,
+                "col_start": 39,
+                "line_end": 222,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "repro::Acc::reach_rec_inner_frame",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 222,
+              "col_start": 12,
+              "line_end": 222,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3410588637815928769,
+              "def_index": 31,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3410588637815928769,
+              "krate_name": "repro"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 224,
+                "col_start": 11,
+                "line_end": 224,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 224,
+                "col_start": 11,
+                "line_end": 224,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                9
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 224,
+              "col_start": 11,
+              "line_end": 224,
+              "col_end": 35
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "repro::poke",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 9,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 225,
+              "col_start": 20,
+              "line_end": 225,
+              "col_end": 27
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3410588637815928769,
+              "def_index": 22,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3410588637815928769,
+              "krate_name": "repro"
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 226,
+                "col_start": 21,
+                "line_end": 226,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 226,
+                "col_start": 12,
+                "line_end": 226,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 6,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 226,
+              "col_start": 12,
+              "line_end": 226,
+              "col_end": 34
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 1
+                  },
+                  {
+                    "Index": 10
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      1,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 226,
+                "col_start": 12,
+                "line_end": 226,
+                "col_end": 38
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 227,
+                "col_start": 15,
+                "line_end": 227,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 12,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                8
+              ]
+            ],
+            "otherwise": 7,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 227,
+              "col_start": 15,
+              "line_end": 227,
+              "col_end": 21
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 228,
+                "col_start": 22,
+                "line_end": 228,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "repro::stash",
+            "args": [
+              {
+                "Copy": {
+                  "local": 14,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 13,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 228,
+              "col_start": 16,
+              "line_end": 228,
+              "col_end": 40
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3410588637815928769,
+              "def_index": 19,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3410588637815928769,
+              "krate_name": "repro"
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 230,
+                "col_start": 19,
+                "line_end": 230,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 232,
+                "col_start": 8,
+                "line_end": 232,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

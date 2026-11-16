@@ -17,9 +17,9 @@ use trust_types::{
 
 use crate::BridgeError;
 use crate::mapping::{
-    cmpxchg_failure_ordering, deref_type, downcast_type, element_type, field_type,
-    is_trivially_copy_ty, map_atomic_ordering, map_atomic_rmw_op, map_binop, map_float_binop,
-    map_type, map_unop,
+    cmpxchg_failure_ordering, deref_type, downcast_type, element_type, encode_switch_case,
+    encode_switch_cases, field_type, is_trivially_copy_ty, map_atomic_ordering, map_atomic_rmw_op,
+    map_binop, map_float_binop, map_type, map_unop,
 };
 
 const ABORT_SYMBOL: &str = "abort";
@@ -95,6 +95,25 @@ fn place_is_direct_local(place: &Place) -> bool {
 
 fn is_addressable_local_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Tuple(_) | Ty::Adt { .. } | Ty::Array { .. })
+}
+
+/// Whether `resolve_place_addr` computes the address of `place` from the base local's pointer
+/// VALUE: the place starts by dereferencing a thin pointer (one I64) or a slice fat pointer held
+/// in a non-aggregate local, so the address of `*p…` is `p` itself and `p` needs no memory of
+/// its own. (`resolve_place` reads `*p…` the same way.) Spilling `p` to a slot instead would
+/// make a later read of `p` reload it from the frame after a store THROUGH `p`, which the
+/// output gate cannot show does not alias the slot. Any other pointer shape keeps the slot.
+fn place_addr_starts_at_pointer_value(place: &Place, base_ty: &Ty) -> bool {
+    if !matches!(place.projections.first(), Some(Projection::Deref))
+        || is_addressable_local_ty(base_ty)
+    {
+        return false;
+    }
+    match deref_type(base_ty) {
+        Ok(Ty::Slice { .. }) => map_lowering_type(base_ty).is_ok(),
+        Ok(_) => matches!(map_lowering_type(base_ty), Ok(LirType::I64)),
+        Err(_) => false,
+    }
 }
 
 fn slice_element_type(ty: &Ty) -> Option<Ty> {
@@ -195,6 +214,17 @@ struct LoweringCtx<'a> {
     /// Map from trust-types local index to stack slot index (for locals that
     /// need an address, e.g., aggregates or locals whose address is taken).
     local_stack_slots: FxHashMap<usize, u32>,
+    /// Locals whose value lives in ONE stack slot for the whole function (see
+    /// `collect_memory_backed_locals`): the slot is allocated before any block is
+    /// lowered, every whole-local definition stores into it, and every read loads
+    /// from it, so what a path reads never depends on which block was lowered first.
+    memory_backed: FxHashSet<usize>,
+    /// Values that ARE the address of an aggregate's bytes (a tuple/ADT/array or a slice fat
+    /// pointer; `emit_store_value`): every snapshot `emit_load_value` takes and every fat
+    /// pointer `emit_slice_fat_pointer` builds. A whole write of an aggregate type copies bytes
+    /// FROM its value, so a write whose value is not one of these (a scalar, a constant) is
+    /// refused (`emit_checked_store`) instead of copying from an address the value is not.
+    aggregate_carriers: FxHashSet<Value>,
     /// Lazily-allocated panic block ID for Assert terminators.
     /// Blocks are inserted into the function after lowering.
     panic_blocks: Vec<(PanicBlockAction, Block)>,
@@ -265,6 +295,8 @@ impl<'a> LoweringCtx<'a> {
             next_value: 0,
             stack_slots: Vec::new(),
             local_stack_slots: FxHashMap::default(),
+            memory_backed: FxHashSet::default(),
+            aggregate_carriers: FxHashSet::default(),
             panic_blocks: Vec::new(),
             options,
             pending_blocks: Vec::new(),
@@ -300,7 +332,11 @@ impl<'a> LoweringCtx<'a> {
         // Trust-types convention: local 0 is the return slot, locals 1..=arg_count are args.
         // Assign argument locals first to match ISel expectations.
         for i in 1..=arg_count {
-            if let Some(local) = locals.iter().find(|l| l.index == i) {
+            let local = locals
+                .get(i)
+                .filter(|l| l.index == i)
+                .or_else(|| locals.iter().find(|l| l.index == i));
+            if let Some(local) = local {
                 let val = Value(ctx.next_value);
                 ctx.next_value += 1;
                 ctx.local_values.insert(local.index, val);
@@ -337,29 +373,36 @@ impl<'a> LoweringCtx<'a> {
     /// Get the type of a local by index.
     fn local_ty(&self, index: usize) -> Result<&Ty, BridgeError> {
         self.locals
-            .iter()
-            .find(|l| l.index == index)
+            .get(index)
+            .filter(|l| l.index == index)
+            .or_else(|| self.locals.iter().find(|l| l.index == index))
             .map(|l| &l.ty)
             .ok_or(BridgeError::MissingLocal(index))
-    }
-
-    /// Whether a local is a signed integer type.
-    fn is_signed(&self, index: usize) -> bool {
-        self.local_ty(index).map(|ty| ty.is_signed()).unwrap_or(false)
     }
 
     /// Get the fully-projected type of a place.
     fn place_ty(&self, place: &Place) -> Result<Ty, BridgeError> {
         let mut current_ty = self.local_ty(place.local)?.clone();
+        // The variant a `Downcast` names, live for the one `Field` after it
+        // (`projected_field`): the same rule `resolve_place` and
+        // `resolve_place_addr` apply, so the three walks agree on the field.
+        let mut active_variant: Option<usize> = None;
 
         for proj in &place.projections {
+            let downcast = active_variant.take();
+            check_downcast_followed_by_field(&current_ty, downcast, proj)?;
             current_ty = match proj {
-                Projection::Field(field_idx) => field_type(&current_ty, *field_idx)?,
+                Projection::Field(field_idx) => {
+                    projected_field(&current_ty, downcast, *field_idx, "place type")?.1
+                }
                 Projection::Deref => deref_type(&current_ty)?,
                 Projection::Index(_) | Projection::ConstantIndex { .. } => {
                     element_type(&current_ty)?
                 }
-                Projection::Downcast(variant_idx) => downcast_type(&current_ty, *variant_idx)?,
+                Projection::Downcast(variant_idx) => {
+                    active_variant = Some(*variant_idx);
+                    downcast_type(&current_ty, *variant_idx)?
+                }
                 Projection::Subslice { from, to, from_end } => {
                     subslice_result_type(&current_ty, *from, *to, *from_end)?
                 }
@@ -415,22 +458,186 @@ impl<'a> LoweringCtx<'a> {
         Ok(slot)
     }
 
-    /// Materialize a local into a stack slot and return its address.
+    /// Make every local in `candidates` whose type has a LIR lowering memory-backed, and
+    /// allocate its single slot now, before any block is lowered (ascending local order, so
+    /// slot numbering is deterministic).
+    fn plan_memory_backed_locals(&mut self, candidates: &FxHashSet<usize>) {
+        let mut locals: Vec<usize> = candidates.iter().copied().collect();
+        locals.sort_unstable();
+        for local_idx in locals {
+            // A local without a LIR type cannot live in a slot; any path that asks for its
+            // address fails in `materialize_local_stack_addr` with the type error, as before.
+            let Ok(ty) = self.local_ty(local_idx) else { continue };
+            if map_lowering_type(ty).is_err() {
+                continue;
+            }
+            if self.ensure_local_stack_slot(local_idx).is_ok() {
+                self.memory_backed.insert(local_idx);
+            }
+        }
+    }
+
+    fn is_memory_backed(&self, local_idx: usize) -> bool {
+        self.memory_backed.contains(&local_idx)
+    }
+
+    /// The single slot of a memory-backed local. Asking for the slot of any other local is a
+    /// planning gap (`collect_memory_backed_locals` missed a place that needs the local's
+    /// address), refused rather than papered over with a lazily initialized slot: a lazy slot
+    /// is initialized in whichever block happens to be lowered first, which is exactly the
+    /// order-dependent wrong code this planning exists to remove.
+    fn memory_backed_slot(&self, local_idx: usize) -> Result<u32, BridgeError> {
+        if self.is_memory_backed(local_idx)
+            && let Some(&slot) = self.local_stack_slots.get(&local_idx)
+        {
+            return Ok(slot);
+        }
+        // Keep the type error for a local that has no LIR representation at all.
+        map_lowering_type(self.local_ty(local_idx)?)?;
+        Err(BridgeError::UnsupportedOp(format!(
+            "local _{local_idx} needs a stack slot but was not planned memory-backed; \
+             refusing to materialize it lazily (a lazily initialized slot is written only in \
+             the first block lowered, so sibling paths would read memory they never wrote)"
+        )))
+    }
+
+    /// The address of a memory-backed local's slot. Emits no store: the slot is kept current
+    /// at every definition (`store_memory_backed_definition`, the function-entry prologue and
+    /// the aggregate constructors), so it already holds the value on every path.
     fn materialize_local_stack_addr(
         &mut self,
         local_idx: usize,
         instructions: &mut Vec<Instruction>,
     ) -> Result<Value, BridgeError> {
-        if let Some(&slot) = self.local_stack_slots.get(&local_idx) {
-            return Ok(self.emit_stack_addr(slot, instructions));
-        }
+        let slot = self.memory_backed_slot(local_idx)?;
+        Ok(self.emit_stack_addr(slot, instructions))
+    }
 
-        let slot = self.ensure_local_stack_slot(local_idx)?;
-        let ptr = self.emit_stack_addr(slot, instructions);
-        let value = self.local_value(local_idx)?;
+    /// The current value of a whole local. A memory-backed local is loaded from its slot (it
+    /// may have been written through a pointer or a field store since its last SSA
+    /// definition); every other local is its SSA value.
+    fn read_local(
+        &mut self,
+        local_idx: usize,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Value, BridgeError> {
+        if !self.is_memory_backed(local_idx) {
+            return self.local_value(local_idx);
+        }
         let ty = map_lowering_type(self.local_ty(local_idx)?)?;
-        push_store(instructions, ty, value, ptr);
-        Ok(ptr)
+        let addr = self.materialize_local_stack_addr(local_idx, instructions)?;
+        Ok(self.emit_load_value(ty, addr, instructions))
+    }
+
+    /// Keep a memory-backed local's slot current at a whole-local definition. A no-op for
+    /// every other local.
+    fn store_memory_backed_definition(
+        &mut self,
+        local_idx: usize,
+        value: Value,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), BridgeError> {
+        if !self.is_memory_backed(local_idx) {
+            return Ok(());
+        }
+        let ty = map_lowering_type(self.local_ty(local_idx)?)?;
+        let addr = self.materialize_local_stack_addr(local_idx, instructions)?;
+        self.emit_store_value(ty, value, addr, instructions);
+        Ok(())
+    }
+
+    /// Copy the `ty.bytes()` bytes of an aggregate from `src` to `dest` with one exact-width
+    /// `Memcpy` (trust-cg inlines a small constant length as exact LDR/STR lanes).
+    fn emit_aggregate_copy(
+        &mut self,
+        ty: &LirType,
+        dest: Value,
+        src: Value,
+        instructions: &mut Vec<Instruction>,
+    ) {
+        let len = self.fresh_value();
+        instructions.push(Instruction {
+            opcode: Opcode::Iconst { ty: LirType::I64, imm: i64::from(ty.bytes()) },
+            args: vec![],
+            results: vec![len],
+        });
+        instructions.push(Instruction {
+            opcode: Opcode::Memcpy,
+            args: vec![dest, src, len],
+            results: vec![],
+        });
+    }
+
+    /// Store `value`, of LIR type `ty`, at `addr`.
+    ///
+    /// LIR represents an aggregate value (`Struct`/`Array`/`Enum`) by its ADDRESS — trust-cg's
+    /// instruction selectors bind aggregate formals, call results and returns as address
+    /// carriers — and has no whole-aggregate `Store`: `select_store` would emit ONE register
+    /// store, writing the carrier (or the first eight bytes) and leaving the rest of the
+    /// destination unwritten. So an aggregate is copied byte-exactly from the address it is;
+    /// a scalar is one `Store`.
+    fn emit_store_value(
+        &mut self,
+        ty: LirType,
+        value: Value,
+        addr: Value,
+        instructions: &mut Vec<Instruction>,
+    ) {
+        if ty.is_aggregate() {
+            self.emit_aggregate_copy(&ty, addr, value, instructions);
+        } else {
+            push_store(instructions, ty, value, addr);
+        }
+    }
+
+    /// `emit_store_value` for a value an rvalue computed: an aggregate is copied only from a
+    /// value that carries the address of its bytes (`aggregate_carriers`). A value that does
+    /// not (a scalar or a constant written as a whole tuple, ill-typed MIR) is refused, never
+    /// reinterpreted as an address (ticket 216 cg review 4).
+    fn emit_checked_store(
+        &mut self,
+        ty: LirType,
+        value: Value,
+        addr: Value,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), BridgeError> {
+        if ty.is_aggregate() && !self.aggregate_carriers.contains(&value) {
+            return Err(BridgeError::UnsupportedOp(format!(
+                "a write of aggregate type {ty:?} needs the address of the value's bytes; \
+                 {value:?} does not carry one"
+            )));
+        }
+        self.emit_store_value(ty, value, addr, instructions);
+        Ok(())
+    }
+
+    /// Load the value of LIR type `ty` at `addr`.
+    ///
+    /// A scalar is one `Load`. An aggregate value is an address (see `emit_store_value`), and
+    /// a whole-aggregate `Load` would read only its first register-width lane, so the bytes
+    /// are copied into a fresh slot and the value is that SNAPSHOT's address: a later write
+    /// to `addr` (a field store, a store through a pointer, the next definition of the local)
+    /// cannot change a value already read.
+    fn emit_load_value(
+        &mut self,
+        ty: LirType,
+        addr: Value,
+        instructions: &mut Vec<Instruction>,
+    ) -> Value {
+        if ty.is_aggregate() {
+            let slot = self.alloc_stack_slot(&ty);
+            let snapshot = self.emit_stack_addr(slot, instructions);
+            self.emit_aggregate_copy(&ty, snapshot, addr, instructions);
+            self.aggregate_carriers.insert(snapshot);
+            return snapshot;
+        }
+        let loaded = self.fresh_value();
+        instructions.push(Instruction {
+            opcode: Opcode::Load { ty, align: None },
+            args: vec![addr],
+            results: vec![loaded],
+        });
+        loaded
     }
 
     /// Get or create the panic block used by Assert terminators.
@@ -479,18 +686,82 @@ impl<'a> LoweringCtx<'a> {
         }
     }
 
+    /// Resolve a widthless integer at the chosen operation type; explicit
+    /// operand types remain untouched. Preserve upper-half u64 bit patterns.
+    fn resolve_integer_operand(
+        &mut self,
+        op: &Operand,
+        ty: Option<Ty>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Value, BridgeError> {
+        if let (Operand::Constant(ConstValue::Int(value)), Some(Ty::Int { width, signed })) =
+            (op, ty)
+        {
+            if matches!(width, 8 | 16 | 32 | 64) {
+                let (minimum, maximum) = if signed {
+                    let bound = 1_i128 << (width - 1);
+                    (-bound, bound - 1)
+                } else {
+                    (0, (1_i128 << width) - 1)
+                };
+                if !(minimum..=maximum).contains(value) {
+                    return Err(BridgeError::InvalidMir(format!(
+                        "integer constant {value} does not fit operand type width {width}, signed {signed}"
+                    )));
+                }
+                let result = self.fresh_value();
+                instructions.push(Instruction {
+                    opcode: Opcode::Iconst { ty: lir_int_type(width), imm: *value as i64 },
+                    args: vec![],
+                    results: vec![result],
+                });
+                return Ok(result);
+            }
+        }
+        self.resolve_operand(op, instructions)
+    }
+
+    /// Same-width arithmetic takes the declared destination type. Shifts keep
+    /// the count's independent type; comparisons/other operations use the peer.
+    fn resolve_binop_operands(
+        &mut self,
+        op: BinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        value_ty: &Ty,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(Value, Value), BridgeError> {
+        let (lhs_ty, rhs_ty) = if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+            (Some(value_ty.clone()), Some(value_ty.clone()))
+        } else if matches!(op, BinOp::Shl | BinOp::Shr)
+            && matches!(value_ty, Ty::Int { width: 8 | 16 | 32 | 64, .. })
+        {
+            (Some(value_ty.clone()), None)
+        } else {
+            (direct_operand_ty(self, rhs)?, direct_operand_ty(self, lhs)?)
+        };
+        Ok((
+            self.resolve_integer_operand(lhs, lhs_ty, instructions)?,
+            self.resolve_integer_operand(rhs, rhs_ty, instructions)?,
+        ))
+    }
+
     /// Resolve a Place to a LIR Value.
     ///
-    /// For simple locals (no projections), returns the Value directly.
-    /// For projected places (Field, Deref, Index), emits StructGep/Load
-    /// instructions to compute the final value.
+    /// A direct local is read by `read_local` (loaded from its slot when it is memory-backed).
+    /// A projected place walks from the base — a tuple/ADT/array base from its slot, any other
+    /// base (a pointer) from its CURRENT value — and loads the final value. A step that reaches
+    /// a tuple/ADT/array (a field, element or pointee) keeps its ADDRESS instead of loading it,
+    /// so a nested place (`(s.e as B).0`, `(*p).1`) reads to any depth; a place whose final
+    /// type is one of those is read as a snapshot of its bytes (`emit_load_value`), like a
+    /// whole-local read.
     fn resolve_place(
         &mut self,
         place: &Place,
         instructions: &mut Vec<Instruction>,
     ) -> Result<Value, BridgeError> {
         if place_is_direct_local(place) {
-            return self.local_value(place.local);
+            return self.read_local(place.local, instructions);
         }
 
         // Start with the base local's address. If it's an aggregate with a
@@ -500,12 +771,17 @@ impl<'a> LoweringCtx<'a> {
         let mut current_val = if is_addressable_local_ty(&base_ty) {
             self.materialize_local_stack_addr(place.local, instructions)?
         } else {
-            self.local_value(place.local)?
+            self.read_local(place.local, instructions)?
         };
         let mut current_ty = base_ty;
         let mut current_is_addr = is_addressable_local_ty(&current_ty);
+        // Trust (ticket 216 cg-bridge): the variant a `Downcast` names, live for
+        // the one `Field` after it — `(e as V).k` reads variant V's lane.
+        let mut active_variant: Option<usize> = None;
 
         for proj in &place.projections {
+            let downcast = active_variant.take();
+            check_downcast_followed_by_field(&current_ty, downcast, proj)?;
             match proj {
                 Projection::Field(field_idx) => {
                     if !current_is_addr {
@@ -513,28 +789,21 @@ impl<'a> LoweringCtx<'a> {
                             "Field projection requires addressable aggregate base: {current_ty:?}"
                         )));
                     }
+                    let (flat_index, field_ty) =
+                        projected_field(&current_ty, downcast, *field_idx, "field read")?;
                     let lir_struct_ty = map_type(&current_ty)?;
-                    let result = self.fresh_value();
+                    let field_addr = self.fresh_value();
                     instructions.push(Instruction {
                         opcode: Opcode::StructGep {
                             struct_ty: lir_struct_ty,
-                            field_index: *field_idx as u32,
+                            field_index: flat_index as u32,
                         },
                         args: vec![current_val],
-                        results: vec![result],
+                        results: vec![field_addr],
                     });
-                    // Load the field value.
-                    let field_ty = field_type(&current_ty, *field_idx)?;
-                    let lir_field_ty = map_type(&field_ty)?;
-                    let loaded = self.fresh_value();
-                    instructions.push(Instruction {
-                        opcode: Opcode::Load { ty: lir_field_ty, align: None },
-                        args: vec![result],
-                        results: vec![loaded],
-                    });
-                    current_val = loaded;
+                    (current_val, current_is_addr) =
+                        self.load_unless_aggregate(field_addr, &field_ty, map_type, instructions)?;
                     current_ty = field_ty;
-                    current_is_addr = false;
                 }
                 Projection::Deref => {
                     // Dereferencing a slice fat pointer preserves the data and
@@ -545,83 +814,47 @@ impl<'a> LoweringCtx<'a> {
                         current_is_addr = false;
                         continue;
                     }
-
-                    let lir_pointee = map_lowering_type(&pointee_ty)?;
-                    let loaded = self.fresh_value();
-                    instructions.push(Instruction {
-                        opcode: Opcode::Load { ty: lir_pointee, align: None },
-                        args: vec![current_val],
-                        results: vec![loaded],
-                    });
-                    current_val = loaded;
+                    (current_val, current_is_addr) = self.load_unless_aggregate(
+                        current_val,
+                        &pointee_ty,
+                        map_lowering_type,
+                        instructions,
+                    )?;
                     current_ty = pointee_ty;
-                    current_is_addr = false;
                 }
                 Projection::Index(idx_local) => {
-                    if slice_element_type(&current_ty).is_some() {
-                        let idx_val = self.local_value(*idx_local)?;
-                        let elem_ty = slice_element_type(&current_ty).expect("checked above");
-                        current_val = self.emit_slice_index_load(
-                            current_val,
-                            &current_ty,
-                            idx_val,
-                            instructions,
-                        )?;
-                        current_ty = elem_ty;
-                        current_is_addr = false;
-                        continue;
-                    }
-                    if !current_is_addr {
-                        return Err(BridgeError::UnsupportedOp(format!(
-                            "Index projection requires addressable array/slice base: {current_ty:?}"
-                        )));
-                    }
-                    // Index into an array/slice: ptr + idx * elem_size.
-                    let elem_ty = element_type(&current_ty)?;
-                    let lir_elem = map_type(&elem_ty)?;
-                    let elem_size = lir_elem.bytes();
-
-                    let idx_val = self.local_value(*idx_local)?;
-                    // Emit: offset = idx * elem_size
-                    let size_const = self.fresh_value();
-                    instructions.push(Instruction {
-                        opcode: Opcode::Iconst { ty: LirType::I64, imm: i64::from(elem_size) },
-                        args: vec![],
-                        results: vec![size_const],
-                    });
-                    let offset = self.fresh_value();
-                    instructions.push(Instruction {
-                        opcode: Opcode::Imul,
-                        args: vec![idx_val, size_const],
-                        results: vec![offset],
-                    });
-                    // Emit: addr = base + offset
-                    let addr = self.fresh_value();
-                    instructions.push(Instruction {
-                        opcode: Opcode::Iadd,
-                        args: vec![current_val, offset],
-                        results: vec![addr],
-                    });
-                    // Load the element.
-                    let loaded = self.fresh_value();
-                    instructions.push(Instruction {
-                        opcode: Opcode::Load { ty: lir_elem, align: None },
-                        args: vec![addr],
-                        results: vec![loaded],
-                    });
-                    current_val = loaded;
+                    let idx_val = self.read_local(*idx_local, instructions)?;
+                    let elem_ty = element_type(&current_ty).or_else(|_| {
+                        slice_element_type(&current_ty).ok_or_else(|| {
+                            BridgeError::UnsupportedOp(format!(
+                                "Index projection on non-sequence type: {current_ty:?}"
+                            ))
+                        })
+                    })?;
+                    let addr = if slice_element_type(&current_ty).is_some() {
+                        self.emit_slice_index_addr(current_val, &current_ty, idx_val, instructions)?
+                    } else {
+                        if !current_is_addr {
+                            return Err(BridgeError::UnsupportedOp(format!(
+                                "Index projection requires addressable array/slice base: {current_ty:?}"
+                            )));
+                        }
+                        self.emit_ptr_offset(current_val, &elem_ty, idx_val, instructions)?
+                    };
+                    (current_val, current_is_addr) =
+                        self.load_unless_aggregate(addr, &elem_ty, map_type, instructions)?;
                     current_ty = elem_ty;
-                    current_is_addr = false;
                 }
                 Projection::Downcast(variant_idx) => {
-                    // Downcast: select a variant of an enum. At the MIR level this
-                    // is just a type-level marker. The actual data pointer is the same.
-                    // We update the type tracking but don't emit instructions.
+                    // Downcast: select a variant of an enum. The data pointer is
+                    // the same and no instruction is emitted, but the variant is
+                    // NOT type-only: it picks the lane the next `Field` reads
+                    // (`projected_field`).
                     current_ty = downcast_type(&current_ty, *variant_idx)?;
+                    active_variant = Some(*variant_idx);
                 }
                 Projection::ConstantIndex { offset, min_length, from_end } => {
-                    if slice_element_type(&current_ty).is_some() {
-                        let elem_ty = slice_element_type(&current_ty).expect("checked above");
+                    if let Some(elem_ty) = slice_element_type(&current_ty) {
                         let index = if *from_end {
                             let len =
                                 self.emit_slice_metadata(current_val, &current_ty, instructions)?;
@@ -647,14 +880,15 @@ impl<'a> LoweringCtx<'a> {
                             });
                             index
                         };
-                        current_val = self.emit_slice_index_load(
+                        let addr = self.emit_slice_index_addr(
                             current_val,
                             &current_ty,
                             index,
                             instructions,
                         )?;
+                        (current_val, current_is_addr) =
+                            self.load_unless_aggregate(addr, &elem_ty, map_type, instructions)?;
                         current_ty = elem_ty;
-                        current_is_addr = false;
                         continue;
                     }
                     if !current_is_addr {
@@ -704,43 +938,39 @@ impl<'a> LoweringCtx<'a> {
                         args: vec![current_val, offset_const],
                         results: vec![addr],
                     });
-                    let loaded = self.fresh_value();
-                    instructions.push(Instruction {
-                        opcode: Opcode::Load { ty: lir_elem, align: None },
-                        args: vec![addr],
-                        results: vec![loaded],
-                    });
-                    current_val = loaded;
+                    (current_val, current_is_addr) =
+                        self.load_unless_aggregate(addr, &elem_ty, map_type, instructions)?;
                     current_ty = elem_ty;
-                    current_is_addr = false;
                 }
                 Projection::Subslice { from, to, from_end } => {
                     let result_ty = subslice_result_type(&current_ty, *from, *to, *from_end)?;
-                    current_val = if current_is_addr && matches!(current_ty, Ty::Array { .. }) {
-                        self.emit_array_subslice_value(
+                    if current_is_addr && matches!(current_ty, Ty::Array { .. }) {
+                        // A sub-array is an aggregate: the walk keeps its address.
+                        current_val = self.emit_array_subslice_addr(
                             current_val,
                             &current_ty,
                             *from,
                             *to,
                             *from_end,
                             instructions,
-                        )?
+                        )?;
+                        current_is_addr = true;
                     } else if slice_element_type(&current_ty).is_some() {
-                        self.emit_slice_subslice_value(
+                        current_val = self.emit_slice_subslice_value(
                             current_val,
                             &current_ty,
                             *from,
                             *to,
                             *from_end,
                             instructions,
-                        )?
+                        )?;
+                        current_is_addr = false;
                     } else {
                         return Err(BridgeError::UnsupportedOp(format!(
                             "Subslice projection requires array address or slice fat pointer base: {current_ty:?}"
                         )));
-                    };
+                    }
                     current_ty = result_ty;
-                    current_is_addr = false;
                 }
                 Projection::OpaqueCast(ty) | Projection::UnwrapUnsafeBinder(ty) => {
                     current_ty = ty.clone();
@@ -752,7 +982,31 @@ impl<'a> LoweringCtx<'a> {
                 }
             }
         }
+        // A walk that ends at a tuple/ADT/array holds its ADDRESS; the value read is a snapshot
+        // of its bytes, as a whole-local read is (`read_local`), so a later write to the place
+        // cannot change a value already read.
+        if current_is_addr {
+            current_val =
+                self.emit_load_value(map_lowering_type(&current_ty)?, current_val, instructions);
+        }
         Ok(current_val)
+    }
+
+    /// The value at `addr` of type `ty` for a read walk: a tuple/ADT/array stays at its
+    /// address (`(addr, true)`, so the walk can continue into it), anything else is loaded at
+    /// the LIR type `lir` gives it (`(value, false)`; a slice fat pointer is a snapshot of its
+    /// two words, `emit_load_value`).
+    fn load_unless_aggregate(
+        &mut self,
+        addr: Value,
+        ty: &Ty,
+        lir: fn(&Ty) -> Result<LirType, BridgeError>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(Value, bool), BridgeError> {
+        if is_addressable_local_ty(ty) {
+            return Ok((addr, true));
+        }
+        Ok((self.emit_load_value(lir(ty)?, addr, instructions), false))
     }
 
     /// Resolve a Place to a pointer Value (address) rather than loading.
@@ -763,17 +1017,31 @@ impl<'a> LoweringCtx<'a> {
         place: &Place,
         instructions: &mut Vec<Instruction>,
     ) -> Result<Value, BridgeError> {
-        let mut current_val = self.materialize_local_stack_addr(place.local, instructions)?;
-
-        if place.projections.is_empty() {
-            return Ok(current_val);
-        }
-
         let base_ty = self.local_ty(place.local)?.clone();
-        let mut current_ty = base_ty;
-        let mut current_is_addr = true;
+        let (mut current_val, mut current_ty, mut current_is_addr, projections) =
+            if place_addr_starts_at_pointer_value(place, &base_ty) {
+                // `*p…`: start from the pointer's value, exactly what the leading `Deref` below
+                // would load back out of `p`'s slot (the data pointer, or the whole slice fat
+                // pointer), without giving `p` a slot.
+                let pointer = self.read_local(place.local, instructions)?;
+                let pointee_ty = deref_type(&base_ty)?;
+                let pointee_is_addr = !matches!(pointee_ty, Ty::Slice { .. });
+                (pointer, pointee_ty, pointee_is_addr, &place.projections[1..])
+            } else {
+                let base_addr = self.materialize_local_stack_addr(place.local, instructions)?;
+                if place.projections.is_empty() {
+                    return Ok(base_addr);
+                }
+                (base_addr, base_ty, true, &place.projections[..])
+            };
 
-        for proj in &place.projections {
+        // Trust (ticket 216 cg-bridge): as in `resolve_place` — a write to
+        // `(e as V).k` lands in the lane a read of it reads.
+        let mut active_variant: Option<usize> = None;
+
+        for proj in projections {
+            let downcast = active_variant.take();
+            check_downcast_followed_by_field(&current_ty, downcast, proj)?;
             match proj {
                 Projection::Field(field_idx) => {
                     if !current_is_addr {
@@ -781,18 +1049,20 @@ impl<'a> LoweringCtx<'a> {
                             "Field address projection requires addressable aggregate base: {current_ty:?}"
                         )));
                     }
+                    let (flat_index, field_ty) =
+                        projected_field(&current_ty, downcast, *field_idx, "field address")?;
                     let lir_struct_ty = map_type(&current_ty)?;
                     let result = self.fresh_value();
                     instructions.push(Instruction {
                         opcode: Opcode::StructGep {
                             struct_ty: lir_struct_ty,
-                            field_index: *field_idx as u32,
+                            field_index: flat_index as u32,
                         },
                         args: vec![current_val],
                         results: vec![result],
                     });
                     current_val = result;
-                    current_ty = field_type(&current_ty, *field_idx)?;
+                    current_ty = field_ty;
                 }
                 Projection::Deref => {
                     // Load the pointer, then the result is the address. Slice
@@ -800,13 +1070,7 @@ impl<'a> LoweringCtx<'a> {
                     let pointee_ty = deref_type(&current_ty)?;
                     if matches!(pointee_ty, Ty::Slice { .. }) {
                         let fat_ty = slice_fat_pointer_lir_ty(&current_ty)?;
-                        let loaded = self.fresh_value();
-                        instructions.push(Instruction {
-                            opcode: Opcode::Load { ty: fat_ty, align: None },
-                            args: vec![current_val],
-                            results: vec![loaded],
-                        });
-                        current_val = loaded;
+                        current_val = self.emit_load_value(fat_ty, current_val, instructions);
                         current_ty = pointee_ty;
                         current_is_addr = false;
                         continue;
@@ -824,7 +1088,7 @@ impl<'a> LoweringCtx<'a> {
                 }
                 Projection::Index(idx_local) => {
                     if slice_element_type(&current_ty).is_some() {
-                        let idx_val = self.local_value(*idx_local)?;
+                        let idx_val = self.read_local(*idx_local, instructions)?;
                         if current_is_addr {
                             current_val = materialize_aggregate_value(
                                 self,
@@ -852,7 +1116,7 @@ impl<'a> LoweringCtx<'a> {
                     let lir_elem = map_type(&elem_ty)?;
                     let elem_size = lir_elem.bytes();
 
-                    let idx_val = self.local_value(*idx_local)?;
+                    let idx_val = self.read_local(*idx_local, instructions)?;
                     let size_const = self.fresh_value();
                     instructions.push(Instruction {
                         opcode: Opcode::Iconst { ty: LirType::I64, imm: i64::from(elem_size) },
@@ -877,6 +1141,7 @@ impl<'a> LoweringCtx<'a> {
                 }
                 Projection::Downcast(variant_idx) => {
                     current_ty = downcast_type(&current_ty, *variant_idx)?;
+                    active_variant = Some(*variant_idx);
                 }
                 // Trust: #828 — support ConstantIndex in address-of lowering too.
                 Projection::ConstantIndex { offset, min_length, from_end } => {
@@ -1095,18 +1360,6 @@ impl<'a> LoweringCtx<'a> {
         Ok(result)
     }
 
-    fn materialize_value_stack_addr(
-        &mut self,
-        value: Value,
-        ty: &LirType,
-        instructions: &mut Vec<Instruction>,
-    ) -> Value {
-        let slot = self.alloc_stack_slot(ty);
-        let addr = self.emit_stack_addr(slot, instructions);
-        push_store(instructions, ty.clone(), value, addr);
-        addr
-    }
-
     fn emit_slice_field_load(
         &mut self,
         fat_ptr: Value,
@@ -1116,11 +1369,12 @@ impl<'a> LoweringCtx<'a> {
         instructions: &mut Vec<Instruction>,
     ) -> Result<Value, BridgeError> {
         let fat_ty = slice_fat_pointer_lir_ty(source_ty)?;
-        let fat_addr = self.materialize_value_stack_addr(fat_ptr, &fat_ty, instructions);
+        // A fat pointer is a two-lane aggregate, and an aggregate value IS the address of its
+        // bytes (`emit_store_value`), so the lane is read straight through `fat_ptr`.
         let field_addr = self.fresh_value();
         instructions.push(Instruction {
             opcode: Opcode::StructGep { struct_ty: fat_ty, field_index },
-            args: vec![fat_addr],
+            args: vec![fat_ptr],
             results: vec![field_addr],
         });
         let loaded = self.fresh_value();
@@ -1220,28 +1474,6 @@ impl<'a> LoweringCtx<'a> {
         self.emit_ptr_offset(data_ptr, &elem_ty, index, instructions)
     }
 
-    fn emit_slice_index_load(
-        &mut self,
-        fat_ptr: Value,
-        source_ty: &Ty,
-        index: Value,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<Value, BridgeError> {
-        let elem_ty = slice_element_type(source_ty).ok_or_else(|| {
-            BridgeError::UnsupportedOp(format!(
-                "slice index projection on non-slice fat pointer type {source_ty:?}"
-            ))
-        })?;
-        let addr = self.emit_slice_index_addr(fat_ptr, source_ty, index, instructions)?;
-        let loaded = self.fresh_value();
-        instructions.push(Instruction {
-            opcode: Opcode::Load { ty: map_type(&elem_ty)?, align: None },
-            args: vec![addr],
-            results: vec![loaded],
-        });
-        Ok(loaded)
-    }
-
     fn emit_slice_fat_pointer(
         &mut self,
         elem_ty: &Ty,
@@ -1269,7 +1501,9 @@ impl<'a> LoweringCtx<'a> {
         });
         push_store(instructions, LirType::I64, len, len_field);
 
-        Ok(materialize_aggregate_value(self, slice_addr, &fat_ty, instructions))
+        // The fat pointer's value is the address of the fresh slot it was just built in.
+        self.aggregate_carriers.insert(slice_addr);
+        Ok(slice_addr)
     }
 
     fn emit_array_subslice_addr(
@@ -1306,29 +1540,6 @@ impl<'a> LoweringCtx<'a> {
 
         let elem_ty = (**elem).clone();
         self.emit_const_ptr_offset(base_addr, &elem_ty, start, instructions)
-    }
-
-    fn emit_array_subslice_value(
-        &mut self,
-        base_addr: Value,
-        source_ty: &Ty,
-        from: usize,
-        to: usize,
-        from_end: bool,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<Value, BridgeError> {
-        let result_ty = subslice_result_type(source_ty, from, to, from_end)?;
-        let result_lir_ty = match &result_ty {
-            Ty::Array { .. } => map_type(&result_ty)?,
-            _ => {
-                return Err(BridgeError::UnsupportedOp(format!(
-                    "array Subslice unexpectedly produced non-array type {result_ty:?}"
-                )));
-            }
-        };
-        let start_addr =
-            self.emit_array_subslice_addr(base_addr, source_ty, from, to, from_end, instructions)?;
-        Ok(materialize_aggregate_value(self, start_addr, &result_lir_ty, instructions))
     }
 
     fn emit_slice_subslice_value(
@@ -1634,16 +1845,29 @@ fn return_lowering_for(body: &VerifiableBody) -> ReturnLowering {
 fn return_args(
     ctx: &mut LoweringCtx<'_>,
     return_lowering: ReturnLowering,
+    instructions: &mut Vec<Instruction>,
 ) -> Result<Vec<Value>, BridgeError> {
     match return_lowering {
-        ReturnLowering::Value => Ok(vec![ctx.local_value(0)?]),
+        // A memory-backed return place is loaded from its slot (it may have been written
+        // through `&mut _0` or a field store). An aggregate return place is returned as its
+        // slot's address, with no snapshot: `Return` reads the bytes through it at once, and
+        // nothing can write the slot in between.
+        ReturnLowering::Value => {
+            if ctx.is_memory_backed(0) && map_lowering_type(ctx.local_ty(0)?)?.is_aggregate() {
+                return Ok(vec![ctx.materialize_local_stack_addr(0, instructions)?]);
+            }
+            Ok(vec![ctx.read_local(0, instructions)?])
+        }
         ReturnLowering::NoValue => Ok(vec![]),
     }
 }
 
 fn abort_call_instruction() -> Instruction {
     Instruction {
-        opcode: Opcode::Call { name: ABORT_SYMBOL.to_string(), binding: DirectCallBinding::Interposable },
+        opcode: Opcode::Call {
+            name: ABORT_SYMBOL.to_string(),
+            binding: DirectCallBinding::Interposable,
+        },
         args: vec![],
         results: vec![],
     }
@@ -1776,7 +2000,10 @@ fn panic_block_instructions(
             let mut instructions = Vec::new();
             let location = emit_panic_location(ctx, span, &mut instructions);
             instructions.push(Instruction {
-                opcode: Opcode::Call { name: symbol.clone(), binding: DirectCallBinding::Interposable },
+                opcode: Opcode::Call {
+                    name: symbol.clone(),
+                    binding: DirectCallBinding::Interposable,
+                },
                 args: vec![location],
                 results: vec![],
             });
@@ -1830,6 +2057,55 @@ fn push_store(instructions: &mut Vec<Instruction>, ty: LirType, value: Value, pt
         args: vec![value, ptr],
         results: vec![],
     });
+}
+
+/// The byte extent a MIR `Repeat` of `count` elements of `elem_size` bytes fills, checked to be
+/// EXACTLY the extent of the stack slot typed `slot_ty` that holds it.
+///
+/// The slot is sized from `slot_ty.bytes()`, a `u32` that SATURATES; the fill is a `u64` product.
+/// If the two ever differ, the fill writes past the slot (or leaves part of it unwritten), so a
+/// mismatch is refused as malformed input rather than lowered. [`map_type`] refuses every type
+/// whose extent the carrier cannot describe, so for a mapped array type the two agree; this is
+/// the fill's own statement of that invariant, at the one place a whole-array write is sized.
+pub(crate) fn repeat_fill_extent(
+    slot_ty: &LirType,
+    elem_size: u64,
+    count: u64,
+) -> Result<u64, BridgeError> {
+    let fill = count.checked_mul(elem_size).ok_or_else(|| {
+        BridgeError::UnsupportedType(format!(
+            "Repeat of {count} x {elem_size}-byte elements overflows u64"
+        ))
+    })?;
+    match slot_ty.checked_bytes() {
+        Some(slot) if slot == fill => Ok(fill),
+        slot => Err(BridgeError::InvalidMir(format!(
+            "Repeat fills {fill} bytes of a slot whose LIR extent is {slot:?}"
+        ))),
+    }
+}
+
+/// A byte offset or length as the I64 immediate LIR carries it.
+fn carrier_imm(bytes: u64) -> Result<i64, BridgeError> {
+    i64::try_from(bytes).map_err(|_| {
+        BridgeError::UnsupportedType(format!("{bytes} bytes exceed the I64 offset carrier"))
+    })
+}
+
+/// The one byte every byte of `operand`'s value is, when `operand` is an integer or bool
+/// constant of the scalar element type `elem` and its little-endian image (at `elem`'s width)
+/// repeats a single byte — so `[operand; N]` is a `Memset` of that byte. `None` for anything
+/// else (a place, a float, a wider pattern), which takes the store-and-double fill.
+pub(crate) fn repeated_fill_byte(operand: &Operand, elem: &Ty) -> Option<u8> {
+    let (width_bytes, bits) = match (elem, operand) {
+        (Ty::Bool, Operand::Constant(ConstValue::Bool(b))) => (1, u128::from(*b)),
+        (Ty::Int { width, .. }, Operand::Constant(ConstValue::Int(v))) => (*width / 8, *v as u128),
+        (Ty::Int { width, .. }, Operand::Constant(ConstValue::Uint(v, _))) => (*width / 8, *v),
+        _ => return None,
+    };
+    let bytes = bits.to_le_bytes();
+    let image = bytes.get(..usize::try_from(width_bytes).ok().filter(|w| *w > 0)?)?;
+    image.iter().all(|b| *b == image[0]).then_some(image[0])
 }
 
 fn infer_int_const_ty(val: i128) -> Ty {
@@ -1888,6 +2164,99 @@ fn cmp_operand_ty(ctx: &LoweringCtx<'_>, lhs: &Operand, rhs: &Operand) -> Result
         )));
     }
     Ok(lhs_ty)
+}
+
+/// A type whose VALUE the lowering carries as the ADDRESS of its bytes: a tuple, ADT or
+/// array, and a slice FAT pointer (`&[T]`, `*const [T]`, and the `Ty::Slice` spelling of the
+/// same two-word value). Their LIR types are aggregates (`emit_store_value`), so a value of
+/// one never reaches an arithmetic, compare or cast instruction as itself: that would act on
+/// the address, not on the bytes.
+fn is_carried_ty(ty: &Ty) -> bool {
+    is_addressable_local_ty(ty) || slice_element_type(ty).is_some()
+}
+
+/// The type of a binary operation's operands when they are CARRIED — an aggregate or a slice
+/// fat pointer, whose value `resolve_operand` gives as the ADDRESS of its bytes
+/// (`is_carried_ty`) — or `None` for scalar operands. A carried operand never reaches an
+/// arithmetic or compare instruction as itself: that would act on the address of the bytes,
+/// not on the value (ticket 216 cg review 6: `==` on two `*const [T]` compared the addresses
+/// of the two fat pointers' words). Rust's comparisons of two slice fat pointers are the one
+/// binary operation on carried operands (`lower_fat_pointer_compare`); any other is refused
+/// here.
+fn carried_operand_ty(
+    ctx: &LoweringCtx<'_>,
+    op: BinOp,
+    operands: &[&Operand],
+) -> Result<Option<Ty>, BridgeError> {
+    let mut carried = None;
+    let mut scalar = false;
+    for operand in operands {
+        match direct_operand_ty(ctx, operand)? {
+            Some(ty) if is_carried_ty(&ty) => carried = Some(ty),
+            _ => scalar = true,
+        }
+    }
+    let Some(ty) = carried else {
+        return Ok(None);
+    };
+    let comparison =
+        matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+    if scalar || !comparison || slice_element_type(&ty).is_none() {
+        return Err(BridgeError::UnsupportedOp(format!(
+            "{op:?} with a fat pointer or aggregate operand ({ty:?}) is not lowered: such an \
+             operand is carried by the address of its bytes; only ==, !=, <, <=, >, >= of two \
+             slice fat pointers are"
+        )));
+    }
+    Ok(Some(ty))
+}
+
+/// Rust's comparison of two slice fat pointers: the pairs (data, length)
+/// compared lexicographically and unsigned, as rustc's codegen compares a
+/// wide pointer (`==` both words equal, `!=` either differs, `<` the data
+/// word less, or equal and the length less; `<=`, `>`, `>=` likewise).
+/// `lhs` and `rhs` are CARRIERS: each word is read from them in place.
+fn lower_fat_pointer_compare(
+    dest: &Place,
+    op: BinOp,
+    fat_ty: &Ty,
+    lhs: Value,
+    rhs: Value,
+    ctx: &mut LoweringCtx<'_>,
+    instructions: &mut Vec<Instruction>,
+) -> Result<(), BridgeError> {
+    let lhs_data = ctx.emit_slice_data_ptr(lhs, fat_ty, instructions)?;
+    let lhs_len = ctx.emit_slice_metadata(lhs, fat_ty, instructions)?;
+    let rhs_data = ctx.emit_slice_data_ptr(rhs, fat_ty, instructions)?;
+    let rhs_len = ctx.emit_slice_metadata(rhs, fat_ty, instructions)?;
+    let compare = |ctx: &mut LoweringCtx<'_>,
+                   instructions: &mut Vec<Instruction>,
+                   cmp: BinOp,
+                   a: Value,
+                   b: Value| {
+        Ok::<Value, BridgeError>(emit_binary_inst(ctx, instructions, map_binop(cmp, false)?, a, b))
+    };
+    let result = match op {
+        BinOp::Eq | BinOp::Ne => {
+            let data = compare(ctx, instructions, op, lhs_data, rhs_data)?;
+            let len = compare(ctx, instructions, op, lhs_len, rhs_len)?;
+            let join = if op == BinOp::Eq { Opcode::Band } else { Opcode::Bor };
+            emit_binary_inst(ctx, instructions, join, data, len)
+        }
+        _ => {
+            let strict = match op {
+                BinOp::Le => BinOp::Lt,
+                BinOp::Ge => BinOp::Gt,
+                other => other,
+            };
+            let by_data = compare(ctx, instructions, strict, lhs_data, rhs_data)?;
+            let same_data = compare(ctx, instructions, BinOp::Eq, lhs_data, rhs_data)?;
+            let by_len = compare(ctx, instructions, op, lhs_len, rhs_len)?;
+            let tie = emit_binary_inst(ctx, instructions, Opcode::Band, same_data, by_len);
+            emit_binary_inst(ctx, instructions, Opcode::Bor, by_data, tie)
+        }
+    };
+    assign_to_place(dest, result, ctx, instructions)
 }
 
 fn cmp_int_conditions(
@@ -2294,22 +2663,188 @@ fn lower_checked_overflow_flag(
     }
 }
 
+/// The address an in-memory constructor (`Aggregate`, `Repeat`, `CheckedBinaryOp`) writes its
+/// lanes at. A direct local's is its ONE memory-backed slot, so every definition of the local —
+/// in whichever arm — writes the memory later projections read.
+///
+/// A projected destination (`(_1.1: E) = E::B(3)`, rustc's `s.e = E::B(3)`; `((_1 as Some).0)
+/// = ..`; `(*_2) = (7, 8)`) is written in place at the PLACE's address, the value built typed
+/// as the place (`built_dest_ty`), so its sibling lanes are untouched (ticket 216 cg-bridge,
+/// review 2: building the whole local's type there overwrote them with a mis-typed image). The
+/// callers read every operand before the first lane is written, and an aggregate operand is a
+/// snapshot of its bytes (`LoweringCtx::emit_load_value`), so no lane written here can change
+/// an operand, even one read from the destination itself or through a pointer that reaches
+/// it.
+fn constructor_dest_addr(
+    ctx: &mut LoweringCtx<'_>,
+    dest: &Place,
+    constructor: &str,
+    instructions: &mut Vec<Instruction>,
+) -> Result<Value, BridgeError> {
+    if place_is_direct_local(dest) {
+        let slot = ctx.memory_backed_slot(dest.local).map_err(|err| match err {
+            BridgeError::UnsupportedOp(detail) => {
+                BridgeError::UnsupportedOp(format!("{constructor}: {detail}"))
+            }
+            other => other,
+        })?;
+        return Ok(ctx.emit_stack_addr(slot, instructions));
+    }
+    ctx.resolve_place_addr(dest, instructions)
+}
+
+/// After a constructor wrote `dest` at `base_ptr` (`constructor_dest_addr`): a direct local's
+/// value is the address of its slot (an aggregate is carried by the address of its bytes); a
+/// projected destination was written in memory and binds nothing.
+fn bind_constructed(ctx: &mut LoweringCtx<'_>, dest: &Place, base_ptr: Value) {
+    if place_is_direct_local(dest) {
+        ctx.local_values.insert(dest.local, base_ptr);
+    }
+}
+
+/// The type of the value an rvalue BUILDS for `dest` (`Aggregate`, `Repeat`, `CheckedBinaryOp`).
+/// A direct local keeps its declared type, the type of its slot; a projected place takes the
+/// PROJECTED type (a `Downcast` + `Field` resolves to the variant's own lane), never the base
+/// local's.
+fn built_dest_ty(ctx: &LoweringCtx<'_>, dest: &Place) -> Result<Ty, BridgeError> {
+    if place_is_direct_local(dest) {
+        Ok(ctx.local_ty(dest.local)?.clone())
+    } else {
+        ctx.place_ty(dest)
+    }
+}
+
+/// Whether an `AggregateKind::Adt` name names the destination's ADT type. The aggregate carries
+/// the generics-erased def path; a type may carry the same path or, for a generic cut-point
+/// definition (`trust_mir_extract::ty_convert::rename_definition`), the path followed by its
+/// instantiated arguments (`k::Foo<u8>`).
+fn aggregate_names_adt(aggregate_name: &str, adt_name: &str) -> bool {
+    adt_name == aggregate_name
+        || adt_name.strip_prefix(aggregate_name).is_some_and(|args| args.starts_with('<'))
+}
+
+/// The value of the aggregate stored at `base_ptr`: a snapshot of its bytes, addressed (see
+/// `LoweringCtx::emit_load_value`).
 fn materialize_aggregate_value(
     ctx: &mut LoweringCtx<'_>,
     base_ptr: Value,
     lir_ty: &LirType,
     instructions: &mut Vec<Instruction>,
 ) -> Value {
-    let value = ctx.fresh_value();
-    instructions.push(Instruction {
-        opcode: Opcode::Load { ty: lir_ty.clone(), align: None },
-        args: vec![base_ptr],
-        results: vec![value],
-    });
-    value
+    ctx.emit_load_value(lir_ty.clone(), base_ptr, instructions)
 }
 
-fn terminator_successors(term: &Terminator) -> Vec<usize> {
+/// Indices into `body.blocks` in reverse postorder of the CFG, entry (`blocks[0]`) first.
+///
+/// Blocks unreachable from the entry are appended afterwards, each unreachable component in
+/// its own reverse postorder. Unreachable roots with no predecessor are taken first (in MIR
+/// order), so a dead single-predecessor block still follows its dead predecessor; any block
+/// left over (a dead cycle) roots last. The result is a permutation of `0..body.blocks.len()`:
+/// every block a lowering pass must see is visited exactly once.
+pub(crate) fn reverse_postorder_block_indices(body: &VerifiableBody) -> Vec<usize> {
+    let index_of: FxHashMap<usize, usize> =
+        body.blocks.iter().enumerate().map(|(index, bb)| (bb.id.0, index)).collect();
+    let mut visited = vec![false; body.blocks.len()];
+    let mut order = Vec::with_capacity(body.blocks.len());
+
+    let mut has_predecessor = vec![false; body.blocks.len()];
+    for bb in &body.blocks {
+        for succ in terminator_successors(&bb.terminator) {
+            if let Some(&index) = index_of.get(&succ) {
+                has_predecessor[index] = true;
+            }
+        }
+    }
+    // Entry first, then predecessor-free (dead) roots, then whatever is left (dead cycles).
+    let roots = std::iter::once(0)
+        .chain((1..body.blocks.len()).filter(|&i| !has_predecessor[i]))
+        .chain(1..body.blocks.len());
+    for root in roots {
+        if visited[root] {
+            continue;
+        }
+        visited[root] = true;
+        // Iterative DFS: (block index, its successors as block indices, next successor to try).
+        let mut postorder = Vec::new();
+        let mut stack: Vec<(usize, Vec<usize>, usize)> = vec![(
+            root,
+            terminator_successors(&body.blocks[root].terminator)
+                .into_iter()
+                .filter_map(|id| index_of.get(&id).copied())
+                .collect(),
+            0,
+        )];
+        while let Some((block, succs, next)) = stack.last_mut() {
+            if let Some(&succ) = succs.get(*next) {
+                *next += 1;
+                if !visited[succ] {
+                    visited[succ] = true;
+                    let succ_succs = terminator_successors(&body.blocks[succ].terminator)
+                        .into_iter()
+                        .filter_map(|id| index_of.get(&id).copied())
+                        .collect();
+                    stack.push((succ, succ_succs, 0));
+                }
+            } else {
+                postorder.push(*block);
+                stack.pop();
+            }
+        }
+        order.extend(postorder.into_iter().rev());
+    }
+    order
+}
+
+/// For each position in `body.blocks`, whether the block is reachable from the entry
+/// (`blocks[0]`) along `terminator_successors` edges.
+fn reachable_from_entry(body: &VerifiableBody) -> Vec<bool> {
+    let index_of: FxHashMap<usize, usize> =
+        body.blocks.iter().enumerate().map(|(index, bb)| (bb.id.0, index)).collect();
+    let mut reachable = vec![false; body.blocks.len()];
+    let mut stack = vec![0_usize];
+    reachable[0] = true;
+    while let Some(index) = stack.pop() {
+        for succ in terminator_successors(&body.blocks[index].terminator) {
+            if let Some(&succ_index) = index_of.get(&succ)
+                && !reachable[succ_index]
+            {
+                reachable[succ_index] = true;
+                stack.push(succ_index);
+            }
+        }
+    }
+    reachable
+}
+
+/// The local values block `block_id` starts from, before its own block parameters are
+/// bound: its only predecessor's exit values when that predecessor recorded them, else
+/// the function-entry values.
+///
+/// The function-entry values are exact for a join's locals that are not block
+/// parameters (never reassigned, or not live into it) and harmless in a block that
+/// never runs. They are never right for a REACHABLE block with a single predecessor:
+/// that block reads whatever its predecessor left, and reverse postorder lowers the
+/// predecessor first. If the values are missing anyway, refuse rather than read stale
+/// or never-defined entry values (the silent wrong code this ordering exists to rule out).
+pub(crate) fn block_start_values(
+    block_id: usize,
+    reachable: bool,
+    predecessors: &FxHashMap<usize, Vec<usize>>,
+    block_entry_values: &FxHashMap<usize, FxHashMap<usize, Value>>,
+    initial_local_values: &FxHashMap<usize, Value>,
+) -> Result<FxHashMap<usize, Value>, BridgeError> {
+    match block_entry_values.get(&block_id) {
+        Some(values) => Ok(values.clone()),
+        None if reachable && predecessors.get(&block_id).is_some_and(|preds| preds.len() == 1) => {
+            Err(BridgeError::InvalidMir(format!(
+                "bb{block_id} was lowered before its only predecessor; its entry values are unknown"
+            )))
+        }
+        None => Ok(initial_local_values.clone()),
+    }
+}
+
+pub(crate) fn terminator_successors(term: &Terminator) -> Vec<usize> {
     match term {
         Terminator::Goto(target) => vec![target.0],
         Terminator::SwitchInt { targets, otherwise, .. } => {
@@ -2331,7 +2866,7 @@ fn terminator_successors(term: &Terminator) -> Vec<usize> {
     }
 }
 
-fn terminator_supports_block_param_copies(term: &Terminator) -> bool {
+pub(crate) fn terminator_supports_block_param_copies(term: &Terminator) -> bool {
     matches!(
         term,
         Terminator::Goto(_)
@@ -2441,13 +2976,28 @@ fn collect_block_live_ins(bb: &TrustBlock, return_lowering: ReturnLowering) -> V
     let mut live_ins = Vec::new();
 
     for stmt in &bb.stmts {
-        if let Statement::Assign { place, rvalue, .. } = stmt {
-            collect_rvalue_live_ins(rvalue, &written, &mut seen, &mut live_ins);
-            if place_is_direct_local(place) {
-                written.insert(place.local);
-            } else {
+        match stmt {
+            Statement::Assign { place, rvalue, .. } => {
+                collect_rvalue_live_ins(rvalue, &written, &mut seen, &mut live_ins);
+                if place_is_direct_local(place) {
+                    written.insert(place.local);
+                } else {
+                    collect_place_live_ins(place, &written, &mut seen, &mut live_ins);
+                }
+            }
+            // `discriminant(*p) = k` stores the tag through `p`'s value
+            // (`lower_set_discriminant` -> `resolve_place_addr`), so `p` is read here.
+            Statement::SetDiscriminant { place, .. } => {
                 collect_place_live_ins(place, &written, &mut seen, &mut live_ins);
             }
+            // `copy_nonoverlapping(src, dst, count)` reads all three operands
+            // (`lower_copy_nonoverlapping`).
+            Statement::CopyNonOverlapping { src, dst, count, .. } => {
+                for operand in [src, dst, count] {
+                    collect_operand_live_ins(operand, &written, &mut seen, &mut live_ins);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2516,6 +3066,198 @@ fn collect_assigned_locals(body: &VerifiableBody) -> FxHashSet<usize> {
     assigned
 }
 
+/// The locals that live in memory: one stack slot each for the whole function, written at
+/// every whole-local definition and read at every use (see `LoweringCtx::memory_backed`).
+///
+/// It is the set of base locals some lowering path asks the ADDRESS of, collected before any
+/// block is lowered, as a superset of every place lowering reaches
+/// `LoweringCtx::materialize_local_stack_addr` (which refuses a local not in this set):
+/// * (a) the base local of a `Ref`/`AddressOf` place (`resolve_place_addr`);
+/// * (b) the base local of a projected assignment, call or atomic-result destination and of a
+///   `SetDiscriminant` place (stored through `resolve_place_addr`);
+///
+///   except, in (a) and (b), a place that starts by dereferencing a pointer-valued local
+///   (`&*p`, `*p = v`, `(*p).0 = v`): its address is computed from `p`'s value
+///   (`place_addr_starts_at_pointer_value`), so `p` needs no slot;
+/// * (c) the base local of a projected READ whose type is an addressable aggregate
+///   (`resolve_place` walks a tuple/ADT/array field through the slot);
+/// * (d) the destination of every `Aggregate`/`Repeat`/`CheckedBinaryOp` (built in memory: a
+///   direct destination in its own slot, a projected one through its address as in (b)) and
+///   the place of a `Discriminant` (the tag is read from the slot);
+/// * (e) every local whose LIR type is an aggregate: LIR carries an aggregate value as the
+///   address of its bytes (`LoweringCtx::emit_store_value`), so such a local's value must live
+///   in memory the local owns. An address held as its SSA value would alias the memory it was
+///   read from and see that memory's later writes (a field store, the next loop iteration's
+///   snapshot), and could not be merged across a join as a block parameter.
+///
+/// An extra member only costs a store per definition and a load per read; a missing one is
+/// refused at lowering time. Lowering order cannot affect the result: the set is a property
+/// of the whole body.
+fn collect_memory_backed_locals(body: &VerifiableBody) -> FxHashSet<usize> {
+    struct Planner<'a> {
+        local_tys: FxHashMap<usize, &'a Ty>,
+        backed: FxHashSet<usize>,
+    }
+
+    impl Planner<'_> {
+        /// (c), (d): the local's own slot is read or written.
+        fn base(&mut self, place: &Place) {
+            self.backed.insert(place.local);
+        }
+
+        /// (a), (b): `resolve_place_addr` takes the address of `place`, which needs the base
+        /// local's slot unless the place starts by dereferencing a pointer-valued local.
+        fn address(&mut self, place: &Place) {
+            let through_pointer_value = self
+                .local_tys
+                .get(&place.local)
+                .is_some_and(|ty| place_addr_starts_at_pointer_value(place, ty));
+            if !through_pointer_value {
+                self.base(place);
+            }
+        }
+
+        /// (b): a destination with projections is stored through its address.
+        fn destination(&mut self, place: &Place) {
+            if !place.projections.is_empty() {
+                self.address(place);
+            }
+        }
+
+        /// (d): an in-memory constructor writes a direct destination's own slot, and a
+        /// projected one through its address (`constructor_dest_addr`).
+        fn constructed(&mut self, place: &Place) {
+            if place.projections.is_empty() {
+                self.base(place);
+            } else {
+                self.address(place);
+            }
+        }
+
+        /// (c): a projected read of an addressable aggregate walks its slot.
+        fn read(&mut self, place: &Place) {
+            if !place.projections.is_empty()
+                && self.local_tys.get(&place.local).is_some_and(|ty| is_addressable_local_ty(ty))
+            {
+                self.base(place);
+            }
+        }
+
+        fn operand(&mut self, operand: &Operand) {
+            if let Operand::Copy(place) | Operand::Move(place) = operand {
+                self.read(place);
+            }
+        }
+
+        fn rvalue(&mut self, dest: &Place, rvalue: &Rvalue) {
+            match rvalue {
+                Rvalue::Use(operand) | Rvalue::UnaryOp(_, operand) | Rvalue::Cast(operand, _) => {
+                    self.operand(operand);
+                    self.destination(dest);
+                }
+                Rvalue::BinaryOp(_, lhs, rhs) => {
+                    self.operand(lhs);
+                    self.operand(rhs);
+                    self.destination(dest);
+                }
+                Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+                    self.operand(lhs);
+                    self.operand(rhs);
+                    self.constructed(dest);
+                }
+                Rvalue::Ref { place, .. } | Rvalue::AddressOf(_, place) => {
+                    self.address(place);
+                    self.destination(dest);
+                }
+                Rvalue::Discriminant(place) => {
+                    self.base(place);
+                    self.read(place);
+                    self.destination(dest);
+                }
+                Rvalue::Len(place) | Rvalue::CopyForDeref(place) => {
+                    self.read(place);
+                    self.destination(dest);
+                }
+                Rvalue::Aggregate(AggregateKind::RawPtr { .. }, operands) => {
+                    for operand in operands {
+                        self.operand(operand);
+                    }
+                    self.destination(dest);
+                }
+                Rvalue::Aggregate(_, operands) => {
+                    for operand in operands {
+                        self.operand(operand);
+                    }
+                    self.constructed(dest);
+                }
+                Rvalue::Repeat(operand, _) => {
+                    self.operand(operand);
+                    self.constructed(dest);
+                }
+                // Every other rvalue is refused by `lower_rvalue`; be generous anyway.
+                _ => self.destination(dest),
+            }
+        }
+    }
+
+    let mut planner = Planner {
+        local_tys: body.locals.iter().map(|local| (local.index, &local.ty)).collect(),
+        backed: FxHashSet::default(),
+    };
+
+    for bb in &body.blocks {
+        for stmt in &bb.stmts {
+            match stmt {
+                Statement::Assign { place, rvalue, .. } => planner.rvalue(place, rvalue),
+                // The tag is stored through `place` + `Field`, and a whole-local place is also
+                // reloaded from its slot (`lower_set_discriminant`).
+                Statement::SetDiscriminant { place, .. } => {
+                    planner.address(place);
+                    if place.projections.is_empty() {
+                        planner.base(place);
+                    }
+                }
+                // `copy_nonoverlapping(src, dst, count)` reads its three operands and writes
+                // through `dst`'s VALUE (`lower_copy_nonoverlapping`).
+                Statement::CopyNonOverlapping { src, dst, count, .. } => {
+                    planner.operand(src);
+                    planner.operand(dst);
+                    planner.operand(count);
+                }
+                // Every other statement lowers to no instructions or is refused
+                // (`lower_statement`).
+                _ => {}
+            }
+        }
+
+        match &bb.terminator {
+            Terminator::SwitchInt { discr, .. } | Terminator::Assert { cond: discr, .. } => {
+                planner.operand(discr);
+            }
+            Terminator::Call { args, dest, atomic, .. } => {
+                for arg in args {
+                    planner.operand(arg);
+                }
+                if let Some(atomic) = atomic {
+                    planner.read(&atomic.place);
+                    planner.destination(atomic.dest.as_ref().unwrap_or(dest));
+                }
+                planner.destination(dest);
+            }
+            _ => {}
+        }
+    }
+
+    // (e): aggregate-typed locals.
+    for local in &body.locals {
+        if map_lowering_type(&local.ty).is_ok_and(|ty| ty.is_aggregate()) {
+            planner.backed.insert(local.index);
+        }
+    }
+
+    planner.backed
+}
+
 fn terminator_written_local(term: &Terminator) -> Option<usize> {
     match term {
         Terminator::Call { dest, atomic: None, .. } => {
@@ -2573,6 +3315,7 @@ fn compute_required_locals(
         written_locals.insert(bb.id.0, collect_block_written_locals(bb));
     }
 
+    let mut propagated = Vec::new();
     loop {
         let mut changed = false;
 
@@ -2584,14 +3327,14 @@ fn compute_required_locals(
             let successors = terminator_successors(&bb.terminator);
             let written =
                 written_locals.get(&bb.id.0).expect("written locals exist for every block");
-            let mut propagated = Vec::new();
+            propagated.clear();
 
             for successor in successors {
-                let Some(successor_required) = required_locals.get(&successor).cloned() else {
+                let Some(successor_required) = required_locals.get(&successor) else {
                     continue;
                 };
 
-                for local in successor_required {
+                for &local in successor_required {
                     if written.contains(&local) {
                         continue;
                     }
@@ -2604,7 +3347,7 @@ fn compute_required_locals(
             let block_seen =
                 required_seen.get_mut(&bb.id.0).expect("required-local set exists for every block");
 
-            for local in propagated {
+            for &local in &propagated {
                 if block_seen.insert(local) {
                     block_required.push(local);
                     changed = true;
@@ -2632,31 +3375,54 @@ fn plan_block_params(
     let required_locals = compute_required_locals(body, return_lowering);
     let mut block_params =
         FxHashMap::with_capacity_and_hasher(body.blocks.len(), Default::default());
+    let entry_id = body.blocks[0].id.0;
 
     for bb in &body.blocks {
         let Some(preds) = predecessors.get(&bb.id.0) else {
             continue;
         };
-        if preds.len() <= 1 {
+        // Trust: the entry block is also entered from the function entry, an implicit extra
+        // predecessor, so once anything jumps back to it (a loop whose header is bb0) it is a
+        // join like any other. Without block parameters it would read the function-entry
+        // values of its loop-carried locals on every iteration. The function entry cannot
+        // pass parameters, so `lower_body_to_lir_with_options_and_consumptions` enters such a
+        // bb0 through a synthetic pre-entry block that copies the entry values in.
+        let is_entry = bb.id.0 == entry_id;
+        if !is_entry && preds.len() <= 1 {
             continue;
         }
-        if preds.iter().any(|pred_id| {
+
+        // A memory-backed local needs no block parameter: its slot is the value on every
+        // path (each predecessor stored it), and its SSA value is never read. Copying that SSA
+        // value would be dead at best and, on a path that wrote the local only through
+        // memory, a copy of a value that path never defined.
+        let live_ins: Vec<usize> = required_locals
+            .get(&bb.id.0)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .copied()
+            .filter(|local| assigned_locals.contains(local) && !ctx.is_memory_backed(*local))
+            .collect();
+        if live_ins.is_empty() {
+            continue;
+        }
+        // Trust: a join whose reassigned live-ins cannot be passed by every predecessor
+        // would read the function-entry values of those locals — silent wrong code — so
+        // refuse. Today every terminator with successors supports the copies
+        // (`terminator_successors` and `terminator_supports_block_param_copies` name the
+        // same variants), so this is unreachable until the two lists drift apart.
+        if let Some(pred_id) = preds.iter().find(|pred_id| {
             blocks_by_id
                 .get(pred_id)
                 .is_none_or(|pred| !terminator_supports_block_param_copies(&pred.terminator))
         }) {
-            continue;
-        }
-
-        let live_ins: Vec<usize> = required_locals
-            .get(&bb.id.0)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|local| assigned_locals.contains(local))
-            .collect();
-        if live_ins.is_empty() {
-            continue;
+            return Err(BridgeError::UnsupportedOp(format!(
+                "bb{} is a join (predecessors {preds:?}{}) that reads reassigned locals \
+                 {live_ins:?}, but the terminator of predecessor bb{pred_id} cannot copy into \
+                 block parameters",
+                bb.id.0,
+                if is_entry { ", plus the function entry" } else { "" },
+            )));
         }
 
         let mut params = Vec::with_capacity(live_ins.len());
@@ -2743,8 +3509,12 @@ fn emit_block_param_copies(
 /// - Casts (int-int, float-int, int-float, float-float, ptr-ptr)
 #[must_use = "returns the lowered LIR function"]
 pub fn lower_to_lir(func: &VerifiableFunction) -> Result<LirFunction, BridgeError> {
-    let expanded = func.with_tail_calls_expanded();
-    lower_body_to_lir(&expanded.name, &expanded.body)
+    if func.body.blocks.iter().any(|bb| matches!(bb.terminator, Terminator::TailCall { .. })) {
+        let expanded = func.with_tail_calls_expanded();
+        lower_body_to_lir(&expanded.name, &expanded.body)
+    } else {
+        lower_body_to_lir(&func.name, &func.body)
+    }
 }
 
 #[must_use = "returns the lowered LIR function"]
@@ -2752,8 +3522,12 @@ pub fn lower_to_lir_with_options(
     func: &VerifiableFunction,
     options: &LoweringOptions,
 ) -> Result<LirFunction, BridgeError> {
-    let expanded = func.with_tail_calls_expanded();
-    lower_body_to_lir_with_options(&expanded.name, &expanded.body, options)
+    if func.body.blocks.iter().any(|bb| matches!(bb.terminator, Terminator::TailCall { .. })) {
+        let expanded = func.with_tail_calls_expanded();
+        lower_body_to_lir_with_options(&expanded.name, &expanded.body, options)
+    } else {
+        lower_body_to_lir_with_options(&func.name, &func.body, options)
+    }
 }
 
 /// Convert a trust-types `VerifiableBody` to an trust_cg LIR `Function`.
@@ -2780,6 +3554,13 @@ pub fn lower_body_to_lir_with_options_and_consumptions(
     body: &VerifiableBody,
     options: &LoweringOptions,
 ) -> Result<(LirFunction, Vec<crate::entry_binding::ConsumedSymbolicLowering>), BridgeError> {
+    // Check the complete input before unsupported statement no-ops, dead code,
+    // or contextual lowering can erase a diagnostic allocation observation.
+    if body.contains_memory_image() {
+        return Err(BridgeError::UnsupportedOp(
+            "ConstValue::MemoryImage has no modeled allocation/provenance value semantics".into(),
+        ));
+    }
     // Trust: Validate that the function body is not empty.
     if body.blocks.is_empty() {
         return Err(BridgeError::EmptyBody);
@@ -2841,7 +3622,37 @@ pub fn lower_body_to_lir_with_options_and_consumptions(
     let initial_local_values = ctx.local_values.clone();
     let predecessors = collect_predecessors(body);
     let return_lowering = return_lowering_for(body);
+    // Trust: give every memory-backed local its ONE slot before any block is lowered (see
+    // `collect_memory_backed_locals`). Must precede `plan_block_params`, which leaves these
+    // locals out of the block parameters.
+    ctx.plan_memory_backed_locals(&collect_memory_backed_locals(body));
     let block_params = plan_block_params(body, &mut ctx, &predecessors, return_lowering)?;
+    // The memory-backed locals that already hold a value at function entry — the MIR
+    // arguments — are stored into their slots once, before anything reads them: at the top of
+    // the entry block, or, when the entry block is a loop target (re-entered by a back edge,
+    // which would re-run the stores and reset the arguments every iteration), in the synthetic
+    // pre-entry block below, which runs exactly once. Every other local is undefined until its
+    // first definition, which stores.
+    let entry_prologue_locals: Vec<usize> =
+        (1..=body.arg_count).filter(|&local| ctx.is_memory_backed(local)).collect();
+    let entry_is_loop_target = predecessors.contains_key(&body.blocks[0].id.0);
+    // The function entry has a value only for a formal. A bb0 block parameter for any other
+    // local (read in bb0 before any write) would be read on first entry with no value on the
+    // pre-entry edge: valid rustc MIR reads no local before writing it, but the bridge does
+    // not prove that, so such a body is REFUSED by name, at lowering (ticket 216 cg, review 6
+    // follow-up). With the refusal disabled the pre-entry block copies the local's
+    // never-defined placeholder and only trust-cg ISel stops it ("value Value(2) not defined
+    // before use"); a lane that stops before ISel would see a well-formed LIR body.
+    if let Some(param) = block_params
+        .get(&body.blocks[0].id.0)
+        .and_then(|params| params.iter().find(|param| !(1..=body.arg_count).contains(&param.local)))
+    {
+        return Err(BridgeError::UnsupportedOp(format!(
+            "local _{} is live into the re-entered entry block bb{} but is not a formal: it \
+             has no value on the function's entry edge (a read before any write)",
+            param.local, body.blocks[0].id.0
+        )));
+    }
 
     // Build signature from locals: args are locals[1..=arg_count], return is locals[0].
     //
@@ -2857,8 +3668,12 @@ pub fn lower_body_to_lir_with_options_and_consumptions(
         param_types.extend(entry.bindings.params.iter().map(|_| LirType::I64));
     }
     for i in 1..=body.arg_count {
-        let local =
-            body.locals.iter().find(|l| l.index == i).ok_or(BridgeError::MissingLocal(i))?;
+        let local = body
+            .locals
+            .get(i)
+            .filter(|l| l.index == i)
+            .or_else(|| body.locals.iter().find(|l| l.index == i))
+            .ok_or(BridgeError::MissingLocal(i))?;
         param_types.push(map_lowering_type(&local.ty)?);
     }
     let returns = return_ty.into_iter().collect();
@@ -2869,31 +3684,62 @@ pub fn lower_body_to_lir_with_options_and_consumptions(
     // Keys are Block(u32). Consumers use block_order or sorted keys when order matters.
     #[allow(rustc::default_hash_types)]
     let mut blocks = std::collections::HashMap::with_capacity(body.blocks.len());
-    let mut block_order: Vec<Block> = body.blocks.iter().map(|bb| Block(bb.id.0 as u32)).collect();
+    // Trust: lower (and lay out) the blocks in reverse postorder of the CFG, not in MIR block
+    // numbering. A block with a single predecessor takes that predecessor's EXIT values, which
+    // only exist once the predecessor has been lowered; MIR numbering does not guarantee that
+    // (after MIR inlining the return block can be numbered before the block that defines the
+    // return place). Lowering in numbering order then handed such a block `initial_local_values`:
+    // an undefined placeholder (instruction selection failed: "value Value(N) not defined before
+    // use") or, for a reassigned parameter, the STALE parameter value. Reverse postorder lowers
+    // every reachable single-predecessor block after its predecessor, so SSA local values flow
+    // correctly. Locals that need memory do not depend on the order either: each has one slot
+    // allocated above and kept current at every definition (docs/issues/2026-09-29-trust-cg-
+    // mir-address-taken-locals-across-sibling-blocks.md, FIXED). trust-cg re-derives its own
+    // layout (`layout_order`) from the CFG, starting at `entry_block` (the synthetic pre-entry
+    // block below when there is one), so `block_order` here only orders unreachable blocks.
+    let lowering_order = reverse_postorder_block_indices(body);
+    let reachable = reachable_from_entry(body);
+    let mut block_order: Vec<Block> =
+        lowering_order.iter().map(|&i| Block(body.blocks[i].id.0 as u32)).collect();
     let mut block_entry_values =
         FxHashMap::with_capacity_and_hasher(body.blocks.len(), Default::default());
     block_entry_values.insert(body.blocks[0].id.0, initial_local_values.clone());
-    for bb in &body.blocks {
+    for &block_index in &lowering_order {
+        let bb = &body.blocks[block_index];
         let block = Block(bb.id.0 as u32);
-        let mut entry_values = block_entry_values
-            .get(&bb.id.0)
-            .cloned()
-            .unwrap_or_else(|| initial_local_values.clone());
+        let mut entry_values = block_start_values(
+            bb.id.0,
+            reachable[block_index],
+            &predecessors,
+            &block_entry_values,
+            &initial_local_values,
+        )?;
         if let Some(params) = block_params.get(&bb.id.0) {
             for param in params {
                 entry_values.insert(param.local, param.value);
             }
         }
         let params = block_params.get(&bb.id.0).map_or(&[][..], Vec::as_slice);
-        let lir_block =
-            lower_block(bb, &mut ctx, return_lowering, &entry_values, params, &block_params)?;
-        let exit_values = ctx.local_values.clone();
+        let prologue_locals = if block_index == 0 && !entry_is_loop_target {
+            entry_prologue_locals.as_slice()
+        } else {
+            &[][..]
+        };
+        let lir_block = lower_block(
+            bb,
+            &mut ctx,
+            return_lowering,
+            &entry_values,
+            params,
+            &block_params,
+            prologue_locals,
+        )?;
         for successor in terminator_successors(&bb.terminator) {
             if block_params.contains_key(&successor) {
                 continue;
             }
             if predecessors.get(&successor).is_some_and(|preds| preds.len() == 1) {
-                block_entry_values.insert(successor, exit_values.clone());
+                block_entry_values.insert(successor, ctx.local_values.clone());
             }
         }
         blocks.insert(block, lir_block);
@@ -2908,14 +3754,42 @@ pub fn lower_body_to_lir_with_options_and_consumptions(
     // Panic blocks contain either the real rust panic lang-item call supplied
     // by the rustc adapter or a conservative abort for standalone synthetic
     // bridge use.
-    for (action, panic_blk) in ctx.panic_blocks.clone() {
+    for (action, panic_blk) in std::mem::take(&mut ctx.panic_blocks) {
         block_order.push(panic_blk);
         let instructions = panic_block_instructions(&mut ctx, &action);
         blocks.insert(panic_blk, LirBlock { params: vec![], instructions, source_locs: vec![] });
     }
 
     // SAFETY: body.blocks is non-empty (validated above).
-    let entry_block = Block(body.blocks[0].id.0 as u32);
+    let source_entry = body.blocks[0].id.0;
+    // Trust: an entry block that is a loop target carrying reassigned locals is a join with
+    // block parameters (see `plan_block_params`). The function entry cannot pass them, so a
+    // synthetic pre-entry block copies the function-entry values in and jumps there; it is
+    // the LIR entry, and bb0 is reached only through jumps that fill its parameters. The same
+    // block stores the memory-backed arguments of a looping entry into their slots (see
+    // `entry_prologue_locals`), so those stores run once, not on every back edge.
+    let entry_block = if block_params.contains_key(&source_entry)
+        || (entry_is_loop_target && !entry_prologue_locals.is_empty())
+    {
+        let pre_entry = ctx.fresh_block();
+        ctx.local_values = initial_local_values.clone();
+        let mut instructions = Vec::new();
+        for &local in &entry_prologue_locals {
+            let value = ctx.local_value(local)?;
+            ctx.store_memory_backed_definition(local, value, &mut instructions)?;
+        }
+        emit_block_param_copies(source_entry, &mut ctx, &mut instructions, &block_params)?;
+        instructions.push(Instruction {
+            opcode: Opcode::Jump { dest: Block(source_entry as u32) },
+            args: vec![],
+            results: vec![],
+        });
+        blocks.insert(pre_entry, LirBlock { params: vec![], instructions, source_locs: vec![] });
+        block_order.insert(0, pre_entry);
+        pre_entry
+    } else {
+        Block(source_entry as u32)
+    };
 
     let consumed_symbolic = std::mem::take(&mut ctx.consumed_symbolic);
 
@@ -2938,12 +3812,52 @@ pub fn lower_body_to_lir_with_options_and_consumptions(
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            //
+            // Trust (bridge-abi): that statement is FAITHFUL to the input and is NOT a
+            // safety argument on its own — it says "no sret was declared", never "no
+            // sret is required". On THIS lane (VerifiableFunction -> LIR) there is no
+            // `trust_ir::Module` and therefore no `TargetInfo::struct_passing` to read,
+            // so the consumer-side `struct_passing` admission lives where a policy
+            // exists to read: `module_to_lir::admit_struct_passing_policy`, reached from
+            // every `lower_module_to_lir*` entry point. What keeps THIS lane safe is the
+            // rustc driver's MIR-frontend ABI validator
+            // (`rustc_codegen_trust_cg::validate_codegen_instance_abi`, `EnumAbi::Refuse`),
+            // which cross-checks every admitted parameter and the return against rustc's
+            // real `PassMode` and never admits `PassMode::Indirect`. A consumer reaching
+            // this entry point WITHOUT such a check has no sret story at all — see
+            // `ModuleLirError::UnclassifiedAggregateAbi` for the shape of the guarantee
+            // the Module lane now states explicitly.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            // Trust: trust-cg de95c72d6 (L01-P5) adds the indirect half of that
+            // convention, keyed by the LIR callee value. This lane never emits
+            // `Opcode::CallIndirect` (grep: only `module_to_lir` does), so the
+            // empty set is exact here, not conservative.
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             // trust-cg Function carries per-function exception-handling info; the bridge does
             // not emit EH metadata yet — Default (empty) is the validated no-EH baseline.
             eh_info: Default::default(),
+            // The typed-catch table goes with `eh_info`: no landing pad, no catch type index,
+            // so the empty table is exact.
+            eh_type_table: Default::default(),
+            // trust-cg U10: a prologue stack-limit check is requested by the
+            // producer's reserved function tags and acknowledged positively,
+            // never inferred from a tag (`docs/u10-prologue-stack-limit.md`
+            // §1). This lowering decodes no such tag, so it requests none.
+            stack_limit: None,
+            // trust-cg L03-P9: the target features a function may assume,
+            // as an adapter ADMITTED them against its target vocabulary. This
+            // lowering admits none, so ISel keeps the profile's baseline
+            // instructions for every function, as it did before the field.
+            target_features: Vec::new(),
         },
         consumed_symbolic,
     ))
@@ -2960,10 +3874,18 @@ fn lower_block(
     entry_values: &FxHashMap<usize, Value>,
     params: &[BlockParam],
     block_params: &FxHashMap<usize, Vec<BlockParam>>,
+    prologue_locals: &[usize],
 ) -> Result<LirBlock, BridgeError> {
     ctx.local_values = entry_values.clone();
     ctx.current_block = bb.id.0;
     let mut instructions = Vec::new();
+
+    // Entry block only: memory-backed locals that hold a value at function entry (the
+    // arguments) start out in their slots, before anything can take their address.
+    for &local in prologue_locals {
+        let value = ctx.local_value(local)?;
+        ctx.store_memory_backed_definition(local, value, &mut instructions)?;
+    }
 
     // Lower each statement.
     for (stmt_index, stmt) in bb.stmts.iter().enumerate() {
@@ -3010,13 +3932,89 @@ fn lower_statement(
         | Statement::Coverage
         | Statement::ConstEvalCounter
         | Statement::Retag { .. } => {}
-        // Trust: #966 — Deinit/Intrinsic don't yet produce LIR;
-        // once the backend matures these may need real lowering.
-        Statement::Deinit { .. } | Statement::Intrinsic { .. } => {}
-        // Trust: #966 — Statement is #[non_exhaustive]; future variants are no-ops
-        // until explicit lowering is added.
-        _ => {}
+        // `Deinit` makes the place uninitialized: leaving its bytes as they
+        // are is one of the values an uninitialized place may hold, and no
+        // later read may observe it before a write re-initializes the place.
+        Statement::Deinit { .. } => {}
+        // `assume(c)` has no effect on any place: a false `c` is UB, so the
+        // program that ignores it refines every program that honours it. It
+        // is the only intrinsic the extractor spells as `Intrinsic`
+        // (`trust-mir-extract` `convert_nondiverging_intrinsic`); any other
+        // name may write memory and is refused, never dropped.
+        Statement::Intrinsic { name, .. } if name == "assume" => {}
+        Statement::Intrinsic { name, .. } => {
+            return Err(BridgeError::UnsupportedOp(format!(
+                "intrinsic statement `{name}` has no lowering"
+            )));
+        }
+        Statement::CopyNonOverlapping { src, dst, count, elem_ty, .. } => {
+            lower_copy_nonoverlapping(src, dst, count, elem_ty, ctx, instructions)?;
+        }
+        // Trust (ticket 216 cg-bridge, review 5): the sentinel's own contract
+        // is "downstream must fail closed", and a new `Statement` variant may
+        // write memory (a memory-backed local written that way would keep its
+        // old value). Both were a silent no-op here.
+        Statement::Unsupported { kind, detail, .. } => {
+            return Err(BridgeError::UnsupportedOp(format!(
+                "unsupported MIR statement `{kind}`: {detail}"
+            )));
+        }
+        other => {
+            return Err(BridgeError::UnsupportedOp(format!(
+                "MIR statement has no lowering: {other:?}"
+            )));
+        }
     }
+    Ok(())
+}
+
+/// `copy_nonoverlapping::<T>(src, dst, count)`: a write through `dst` of
+/// `count * size_of::<T>()` bytes read through `src` — a `Memcpy`, the same
+/// byte copy every whole-aggregate write is. A local that `dst` points at had
+/// its address taken, so it is memory-backed (`collect_memory_backed_locals`)
+/// and every later read loads the copy. The byte count is exact: a constant
+/// count is multiplied here
+/// (checked), a runtime one by an `Imul` (Rust's precondition makes the
+/// product fit `isize`).
+fn lower_copy_nonoverlapping(
+    src: &Operand,
+    dst: &Operand,
+    count: &Operand,
+    elem_ty: &Ty,
+    ctx: &mut LoweringCtx<'_>,
+    instructions: &mut Vec<Instruction>,
+) -> Result<(), BridgeError> {
+    let elem_bytes = u64::from(map_lowering_type(elem_ty)?.bytes());
+    let src = ctx.resolve_operand(src, instructions)?;
+    let dst = ctx.resolve_operand(dst, instructions)?;
+    let len = match count {
+        Operand::Constant(ConstValue::Uint(n, _)) => {
+            let bytes = u64::try_from(*n).ok().and_then(|n| n.checked_mul(elem_bytes)).ok_or_else(
+                || {
+                    BridgeError::UnsupportedOp(format!(
+                        "copy_nonoverlapping of {n} x {elem_bytes} bytes overflows u64"
+                    ))
+                },
+            )?;
+            emit_iconst(ctx, instructions, LirType::I64, carrier_imm(bytes)?)
+        }
+        _ => {
+            let count = ctx.resolve_operand(count, instructions)?;
+            let size = emit_iconst(ctx, instructions, LirType::I64, carrier_imm(elem_bytes)?);
+            let len = ctx.fresh_value();
+            instructions.push(Instruction {
+                opcode: Opcode::Imul,
+                args: vec![count, size],
+                results: vec![len],
+            });
+            len
+        }
+    };
+    instructions.push(Instruction {
+        opcode: Opcode::Memcpy,
+        args: vec![dst, src, len],
+        results: vec![],
+    });
     Ok(())
 }
 
@@ -3027,8 +4025,19 @@ fn lower_set_discriminant(
     instructions: &mut Vec<Instruction>,
 ) -> Result<(), BridgeError> {
     let place_ty = ctx.place_ty(place)?;
-    let (field_index, field_ty) = explicit_discriminant_field(&place_ty)?;
-    let (tag_lir_ty, tag_imm) = explicit_discriminant_lir_const(&field_ty, variant_index)?;
+    // A declared struct or union has no slot (`flat_enum_tag_slot`), and this
+    // REFUSES it rather than lowering it as the no-op rustc's
+    // `codegen_set_discr` makes of variant 0 on a single-variant layout: there
+    // is nothing to write, a variant other than 0 would be invalid MIR, and
+    // before the one slot rule this wrote the declared value into the struct's
+    // field spelled `tag` — its DATA. Refusing costs only a shape no MIR here
+    // needs; a silent no-op would hide a producer that thinks it has a slot.
+    let (field_index, field_ty) = explicit_discriminant_field(&place_ty, "SetDiscriminant")?;
+    // Trust (ticket 216 cg-bridge): the slot takes the target variant's DECLARED
+    // discriminant — the value MIR's `SwitchInt` over `discriminant(place)`
+    // compares against — never its index.
+    let (tag_lir_ty, tag_imm) =
+        declared_tag_lir_const(&place_ty, &field_ty, variant_index, "SetDiscriminant")?;
 
     let mut tag_place = place.clone();
     tag_place.projections.push(Projection::Field(field_index));
@@ -3040,36 +4049,185 @@ fn lower_set_discriminant(
         results: vec![tag_value],
     });
     push_store(instructions, tag_lir_ty, tag_value, tag_addr);
-
-    if place.projections.is_empty() && is_addressable_local_ty(&place_ty) {
-        let base_addr = ctx.materialize_local_stack_addr(place.local, instructions)?;
-        let aggregate_ty = map_lowering_type(&place_ty)?;
-        let aggregate_value =
-            materialize_aggregate_value(ctx, base_addr, &aggregate_ty, instructions);
-        ctx.local_values.insert(place.local, aggregate_value);
-    }
-
     Ok(())
 }
 
-fn explicit_discriminant_field(ty: &Ty) -> Result<(usize, Ty), BridgeError> {
+/// Trust (ticket 216 cg-bridge): the field SPELLED as a tag slot — `discriminant`,
+/// `__discriminant`, `tag` or `__tag`, at ANY index (the MIR extractor mints
+/// `__tag` at index 0; other shapes carry it elsewhere). Only a flat enum's such
+/// field IS a slot: every site asks [`flat_enum_tag_slot`], never this.
+fn flat_tag_field_index(fields: &[(String, Ty)]) -> Option<usize> {
+    fields.iter().position(|(field_name, _)| {
+        matches!(field_name.as_str(), "discriminant" | "__discriminant" | "tag" | "__tag")
+    })
+}
+
+/// A `Ty::Adt` DECLARED a struct or union: it has one variant and no
+/// discriminant slot, whatever its fields are spelled.
+fn is_declared_struct_or_union(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Adt { adt_kind: Some(trust_types::AdtKind::Struct | trust_types::AdtKind::Union), .. }
+    )
+}
+
+/// Trust (ticket 216 cg-bridge): THE slot rule — the tag slot of `ty` when `ty`
+/// is a FLAT ENUM, an ADT carrying a field spelled as a slot
+/// ([`flat_tag_field_index`]) that is not a declared struct or union (a
+/// struct's field spelled `tag` is data). All three sites that touch the slot —
+/// `Aggregate` construction, `SetDiscriminant` and the `Discriminant` read
+/// (through [`explicit_discriminant_field`]) — and the payload-lane resolver
+/// ([`flat_variant_lane`]) ask this one predicate, so they can never disagree
+/// on whether, or where, a slot exists.
+fn flat_enum_tag_slot(ty: &Ty) -> Option<usize> {
+    match ty {
+        _ if is_declared_struct_or_union(ty) => None,
+        Ty::Adt { fields, .. } => flat_tag_field_index(fields),
+        _ => None,
+    }
+}
+
+/// Trust (ticket 216 cg-bridge, review of 95382e6164): THE payload-lane lookup
+/// of a flat enum, shared by the aggregate writer and the `Downcast(v) +
+/// Field(k)` projection in `place_ty`, `resolve_place` and
+/// `resolve_place_addr`, so a payload is read and written through the SAME
+/// field. `ty` must be the flat enum itself.
+///
+/// The MIR extractor (`trust_mir_extract::ty_convert::lower_enum_adt`) lays a
+/// flat enum out as `__tag` followed by one `__v{v}_{name}` field per variant
+/// field, `name` being the variant descriptor's own field name. Field `k` of
+/// variant `v` is the flat field spelled `__v{v}_{variants[v].fields[k].0}`.
+///
+/// `Ok(None)`: `ty` is not a flat enum ([`flat_enum_tag_slot`]); its fields are
+/// positional (a struct, a tuple-like ADT with no slot) and the caller keeps its
+/// positional rule. Fails closed — never guesses a field by position — when a
+/// flat enum carries no descriptor, the descriptor has no such variant or field,
+/// or the lane is missing: before this, the writer took the `k`-th non-slot
+/// field (`Err(5)` of `Result<u64, u64>` wrote `Ok`'s lane) and the reader
+/// treated `Downcast` as type-only (`(r as Err).0` read flat field 0, the tag).
+fn flat_variant_lane(
+    ty: &Ty,
+    variant_index: usize,
+    field_index: usize,
+    site: &str,
+) -> Result<Option<(usize, Ty)>, BridgeError> {
+    if flat_enum_tag_slot(ty).is_none() {
+        return Ok(None);
+    }
+    let Ty::Adt { name, fields, variants, .. } = ty else {
+        return Ok(None);
+    };
+    if variants.is_empty() {
+        return Err(BridgeError::UnsupportedOp(format!(
+            "{site}: field {field_index} of variant {variant_index} of `{name}`, which carries \
+             no variant descriptor: its payload lane is unknown"
+        )));
+    }
+    let variant = variants.get(variant_index).ok_or_else(|| {
+        BridgeError::UnsupportedOp(format!(
+            "{site} names variant {variant_index}, which the variant descriptor of `{name}` \
+             does not have"
+        ))
+    })?;
+    let (variant_field_name, _) = variant.fields.get(field_index).ok_or_else(|| {
+        BridgeError::UnsupportedOp(format!(
+            "{site}: variant {variant_index} (`{}`) of `{name}` has {} field(s), no field \
+             {field_index}",
+            variant.name,
+            variant.fields.len()
+        ))
+    })?;
+    let mut prefix_buf = [0u8; 32];
+    let prefix = {
+        use std::io::Write;
+        let mut cursor = &mut prefix_buf[..];
+        let _ = write!(cursor, "__v{variant_index}_");
+        let len = 32 - cursor.len();
+        std::str::from_utf8(&prefix_buf[..len]).unwrap_or("")
+    };
+    let flat_index = fields
+        .iter()
+        .position(|(field_name, _)| {
+            field_name.strip_prefix(prefix) == Some(variant_field_name.as_str())
+        })
+        .ok_or_else(|| {
+            let lane = format!("__v{variant_index}_{variant_field_name}");
+            let field_list = fields
+                .iter()
+                .map(|(field_name, _)| field_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            BridgeError::UnsupportedOp(format!(
+                "{site}: field {field_index} of variant {variant_index} of `{name}` lives in \
+                 lane `{lane}`, which the flat layout does not have; fields=[{field_list}]"
+            ))
+        })?;
+    Ok(Some((flat_index, fields[flat_index].1.clone())))
+}
+
+/// The flat field a `Field(field_index)` projection addresses on `current_ty`,
+/// and its type. Under a `Downcast(v)` of a flat enum that is variant `v`'s
+/// payload lane ([`flat_variant_lane`]); otherwise the positional field.
+fn projected_field(
+    current_ty: &Ty,
+    downcast: Option<usize>,
+    field_index: usize,
+    site: &str,
+) -> Result<(usize, Ty), BridgeError> {
+    if let Some(variant_index) = downcast
+        && let Some(lane) = flat_variant_lane(current_ty, variant_index, field_index, site)?
+    {
+        return Ok(lane);
+    }
+    Ok((field_index, field_type(current_ty, field_index)?))
+}
+
+/// A `Downcast` of a flat enum names a variant only for the `Field` that follows
+/// it. Any other projection after it would address the flat layout as if it
+/// were the variant's, so it is refused rather than guessed.
+fn check_downcast_followed_by_field(
+    current_ty: &Ty,
+    downcast: Option<usize>,
+    projection: &Projection,
+) -> Result<(), BridgeError> {
+    if let Some(variant_index) = downcast
+        && !matches!(projection, Projection::Field(_))
+        && flat_enum_tag_slot(current_ty).is_some()
+    {
+        return Err(BridgeError::UnsupportedOp(format!(
+            "Downcast({variant_index}) of flat enum {current_ty:?} is followed by \
+             {projection:?}, not a Field: the variant's payload lane is unaddressable"
+        )));
+    }
+    Ok(())
+}
+
+/// The tag slot of `ty` ([`flat_enum_tag_slot`]) and its type, which must be
+/// `bool` or an integer. `site` names the caller in the refusal. A declared
+/// struct or union has no slot and is refused by name: before the one slot rule,
+/// `SetDiscriminant` and the `Discriminant` read took its field spelled `tag`
+/// for one, writing into and reading back DATA.
+fn explicit_discriminant_field(ty: &Ty, site: &str) -> Result<(usize, Ty), BridgeError> {
     let Ty::Adt { name, fields, .. } = ty else {
         return Err(BridgeError::UnsupportedOp(format!(
-            "SetDiscriminant is modeled only for tagged ADTs with an explicit discriminant/tag field, got {ty:?}"
+            "{site} is modeled only for tagged ADTs with an explicit discriminant/tag field, got {ty:?}"
         )));
     };
+    if is_declared_struct_or_union(ty) {
+        return Err(BridgeError::UnsupportedOp(format!(
+            "{site} on `{name}`, a declared struct/union: it has no discriminant slot (a field \
+             spelled `tag` is data)"
+        )));
+    }
 
-    let Some((field_index, (field_name, field_ty))) =
-        fields.iter().enumerate().find(|(_, (field_name, _))| {
-            matches!(field_name.as_str(), "discriminant" | "__discriminant" | "tag" | "__tag")
-        })
-    else {
+    let Some(field_index) = flat_enum_tag_slot(ty) else {
         let field_list =
             fields.iter().map(|(field_name, _)| field_name.as_str()).collect::<Vec<_>>().join(", ");
         return Err(BridgeError::UnsupportedOp(format!(
-            "ADT `{name}` has no explicit discriminant/tag field for SetDiscriminant; fields=[{field_list}]"
+            "ADT `{name}` has no explicit discriminant/tag field for {site}; fields=[{field_list}]"
         )));
     };
+    let (field_name, field_ty) = &fields[field_index];
 
     if !matches!(field_ty, Ty::Bool | Ty::Int { .. }) {
         return Err(BridgeError::UnsupportedOp(format!(
@@ -3080,27 +4238,69 @@ fn explicit_discriminant_field(ty: &Ty) -> Result<(usize, Ty), BridgeError> {
     Ok((field_index, field_ty.clone()))
 }
 
-fn explicit_discriminant_lir_const(
-    ty: &Ty,
+/// Trust (ticket 216 cg-bridge): the LIR constant the tag slot (of type
+/// `field_ty`) of the flat enum `adt_ty` holds for `variant_index` — the DECODED
+/// DECLARED discriminant, `Ty::variant_tag`, never the variant index. MIR's
+/// `SwitchInt` over `discriminant(e)` compares against declared values, so for
+/// `enum E { A = 5, B = 9 }` an index write (`E::B` as 1) takes the wrong arm:
+/// in this CODEGEN lane that is a miscompile, not a proof gap.
+///
+/// Fails closed where the value is not known exactly:
+/// * the ADT carries NO variant descriptor. `Ty::variant_tag` answers the index
+///   for such an ADT (the verification lane's convention, whose readers agree
+///   with it); here the index is only a guess at the declared value, and a wrong
+///   guess ships a wrong branch;
+/// * the descriptor has no variant `variant_index`;
+/// * the declared value does not fit the slot (`Ty::flat_tag_fits`), or has no
+///   exact LIR immediate (a negative or above-`i64::MAX` tag in a wider-than-64
+///   slot).
+fn declared_tag_lir_const(
+    adt_ty: &Ty,
+    field_ty: &Ty,
     variant_index: usize,
+    site: &str,
 ) -> Result<(LirType, i64), BridgeError> {
-    match ty {
-        Ty::Bool => match variant_index {
-            0 => Ok((LirType::B1, 0)),
-            1 => Ok((LirType::B1, 1)),
-            _ => Err(BridgeError::UnsupportedOp(format!(
-                "variant index {variant_index} does not fit bool discriminant/tag field"
-            ))),
-        },
-        Ty::Int { .. } => {
-            validate_explicit_discriminant_value(ty, variant_index)?;
-            let lir_ty = map_type(ty)?;
-            let imm = i64::try_from(variant_index).map_err(|_| {
-                BridgeError::UnsupportedOp(format!(
-                    "variant index {variant_index} exceeds LIR discriminant immediate range"
-                ))
-            })?;
-            Ok((lir_ty, imm))
+    let Ty::Adt { name, variants, .. } = adt_ty else {
+        return Err(BridgeError::UnsupportedOp(format!(
+            "{site} writes a discriminant into a non-ADT type {adt_ty:?}"
+        )));
+    };
+    if variants.is_empty() {
+        return Err(BridgeError::UnsupportedOp(format!(
+            "{site} writes the tag of variant {variant_index} of `{name}`, which carries no \
+             variant descriptor: its declared discriminant is unknown, and the variant index \
+             is only a guess at it"
+        )));
+    }
+    let tag = adt_ty.variant_tag(variant_index).ok_or_else(|| {
+        BridgeError::UnsupportedOp(format!(
+            "{site} names variant {variant_index}, which the variant descriptor of `{name}` \
+             does not have"
+        ))
+    })?;
+    if !field_ty.flat_tag_fits(tag) {
+        return Err(BridgeError::UnsupportedOp(format!(
+            "{site}: discriminant {tag} of variant {variant_index} of `{name}` does not fit its \
+             {field_ty:?} discriminant/tag field"
+        )));
+    }
+    match field_ty {
+        // `flat_tag_fits` admitted exactly {0, 1}.
+        Ty::Bool => Ok((LirType::B1, i64::from(tag == 1))),
+        Ty::Int { width, signed } => {
+            let imm = if *width <= 64 {
+                // In range for the slot, so exact: a signed tag is its own i64,
+                // an unsigned one its u64 pattern.
+                if *signed { tag as i64 } else { tag as u64 as i64 }
+            } else {
+                i64::try_from(tag).ok().filter(|value| *value >= 0).ok_or_else(|| {
+                    BridgeError::UnsupportedOp(format!(
+                        "{site}: discriminant {tag} of variant {variant_index} of `{name}` has \
+                         no exact i64 immediate for its {width}-bit tag field"
+                    ))
+                })?
+            };
+            Ok((map_type(field_ty)?, imm))
         }
         other => Err(BridgeError::UnsupportedOp(format!(
             "discriminant/tag field type {other:?} is not modeled as bool or integer"
@@ -3108,53 +4308,36 @@ fn explicit_discriminant_lir_const(
     }
 }
 
-fn validate_explicit_discriminant_value(ty: &Ty, variant_index: usize) -> Result<(), BridgeError> {
-    let Ty::Int { width, signed } = ty else {
-        return Ok(());
-    };
-    let width = *width;
-    if width == 0 || width > 128 {
-        return Err(BridgeError::UnsupportedOp(format!(
-            "integer discriminant/tag width {width} is outside the supported 1..=128 range"
-        )));
-    }
-
-    let value = variant_index as u128;
-    let max = if *signed {
-        if width == 128 { i128::MAX as u128 } else { (1u128 << (width - 1)) - 1 }
-    } else if width == 128 {
-        u128::MAX
-    } else {
-        (1u128 << width) - 1
-    };
-
-    if value > max {
-        return Err(BridgeError::UnsupportedOp(format!(
-            "variant index {variant_index} does not fit {}{} discriminant/tag field",
-            if *signed { "i" } else { "u" },
-            width
-        )));
-    }
-
-    Ok(())
-}
-
 /// Helper: assign a computed value to a destination place.
 ///
-/// For simple locals, updates the local_values map. For projected places,
-/// computes the address and emits a Store instruction.
+/// For simple locals, updates the local_values map (and, for a memory-backed
+/// local, stores into its slot). For projected places, computes the address and
+/// emits a Store instruction.
 fn assign_to_place(
     dest: &Place,
     value: Value,
     ctx: &mut LoweringCtx<'_>,
     instructions: &mut Vec<Instruction>,
 ) -> Result<(), BridgeError> {
+    // An aggregate is copied FROM its value, so the value must be the address of its bytes
+    // (`LoweringCtx::emit_checked_store`); a direct local whose type has no LIR lowering keeps
+    // the SSA binding it always had.
+    if let Ok(ty) = map_lowering_type(&ctx.place_ty(dest)?)
+        && ty.is_aggregate()
+        && !ctx.aggregate_carriers.contains(&value)
+    {
+        return Err(BridgeError::UnsupportedOp(format!(
+            "a write of aggregate type {ty:?} to {dest:?} needs the address of the value's \
+             bytes; {value:?} does not carry one"
+        )));
+    }
     if place_is_direct_local(dest) {
         ctx.local_values.insert(dest.local, value);
+        ctx.store_memory_backed_definition(dest.local, value, instructions)?;
     } else {
         let addr = ctx.resolve_place_addr(dest, instructions)?;
         let ty = map_lowering_type(&ctx.place_ty(dest)?)?;
-        push_store(instructions, ty, value, addr);
+        ctx.emit_store_value(ty, value, addr, instructions);
     }
     Ok(())
 }
@@ -3173,8 +4356,20 @@ fn lower_rvalue(
             assign_to_place(dest, src, ctx, instructions)?;
         }
         Rvalue::BinaryOp(op, lhs, rhs) => {
-            let lhs_val = ctx.resolve_operand(lhs, instructions)?;
-            let rhs_val = ctx.resolve_operand(rhs, instructions)?;
+            let value_ty = ctx.place_ty(dest)?;
+            let (lhs_val, rhs_val) =
+                ctx.resolve_binop_operands(*op, lhs, rhs, &value_ty, instructions)?;
+            if let Some(fat_ty) = carried_operand_ty(ctx, *op, &[lhs, rhs])? {
+                return lower_fat_pointer_compare(
+                    dest,
+                    *op,
+                    &fat_ty,
+                    lhs_val,
+                    rhs_val,
+                    ctx,
+                    instructions,
+                );
+            }
 
             // Trust: #828 — lower three-way compare as nested selects over lt/gt tests.
             if *op == BinOp::Cmp {
@@ -3225,17 +4420,15 @@ fn lower_rvalue(
                 return Ok(());
             }
 
+            // An operand's float-ness is its PLACE's type: `t.0 + t.1` on
+            // `t: (f64, f64)` is a float add, whatever the tuple is.
             let lhs_is_float = match lhs {
-                Operand::Copy(place) | Operand::Move(place) => {
-                    ctx.local_ty(place.local)?.is_float()
-                }
+                Operand::Copy(place) | Operand::Move(place) => ctx.place_ty(place)?.is_float(),
                 Operand::Constant(ConstValue::Float(_)) => true,
                 _ => false,
             };
             let rhs_is_float = match rhs {
-                Operand::Copy(place) | Operand::Move(place) => {
-                    ctx.local_ty(place.local)?.is_float()
-                }
+                Operand::Copy(place) | Operand::Move(place) => ctx.place_ty(place)?.is_float(),
                 Operand::Constant(ConstValue::Float(_)) => true,
                 _ => false,
             };
@@ -3256,12 +4449,13 @@ fn lower_rvalue(
             // false, which would otherwise select unsigned condition codes
             // (e.g. `x < 0` -> `x <u 0`, vacuously false) and miscompile
             // signed comparisons. Division/shift/etc. still take signedness
-            // from the destination value's type.
+            // from the destination value's type: the destination PLACE's
+            // (`t.0 = x / 2` on `t: (i64, u64)` divides signed).
             let signed = match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                     cmp_operand_ty(ctx, lhs, rhs)?.is_signed()
                 }
-                _ => ctx.is_signed(dest.local),
+                _ => ctx.place_ty(dest)?.is_signed(),
             };
             let opcode = map_binop(*op, signed)?;
 
@@ -3276,9 +4470,14 @@ fn lower_rvalue(
         // Compute the narrow wrapping result, then derive the overflow flag
         // with a sound per-op check on the checked value type.
         Rvalue::CheckedBinaryOp(op, lhs, rhs) => {
-            let lhs_val = ctx.resolve_operand(lhs, instructions)?;
-            let rhs_val = ctx.resolve_operand(rhs, instructions)?;
+            if carried_operand_ty(ctx, *op, &[lhs, rhs])?.is_some() {
+                return Err(BridgeError::UnsupportedOp(format!(
+                    "checked {op:?} of a fat pointer operand has no meaning"
+                )));
+            }
             let value_ty = checked_binary_value_ty(ctx, dest)?;
+            let (lhs_val, rhs_val) =
+                ctx.resolve_binop_operands(*op, lhs, rhs, &value_ty, instructions)?;
             if value_ty.is_float() {
                 return Err(BridgeError::UnsupportedOp(format!(
                     "checked floating-point binary op not supported: {op:?}"
@@ -3307,11 +4506,12 @@ fn lower_rvalue(
                 },
             )?;
 
-            // Build the (result, overflow) tuple in a stack slot.
-            let dest_ty = ctx.local_ty(dest.local)?.clone();
+            // Build the (result, overflow) tuple in the destination (both operands are
+            // already read), typed as the DESTINATION place (`built_dest_ty`), not its base
+            // local.
+            let dest_ty = built_dest_ty(ctx, dest)?;
             let lir_ty = map_type(&dest_ty)?;
-            let slot = ctx.alloc_stack_slot(&lir_ty);
-            let base_ptr = ctx.emit_stack_addr(slot, instructions);
+            let base_ptr = constructor_dest_addr(ctx, dest, "CheckedBinaryOp", instructions)?;
 
             // Store field 0: arithmetic result.
             let field0_ptr = ctx.fresh_value();
@@ -3331,9 +4531,7 @@ fn lower_rvalue(
             });
             push_store(instructions, LirType::B1, overflow_val, field1_ptr);
 
-            ctx.local_stack_slots.insert(dest.local, slot);
-            let tuple_value = materialize_aggregate_value(ctx, base_ptr, &lir_ty, instructions);
-            ctx.local_values.insert(dest.local, tuple_value);
+            bind_constructed(ctx, dest, base_ptr);
         }
         Rvalue::UnaryOp(op, operand) => {
             // Trust: #828 — PtrMetadata extracts the metadata lane from fat pointers.
@@ -3367,9 +4565,36 @@ fn lower_rvalue(
                 return Ok(());
             }
 
+            if let Some(ty) = direct_operand_ty(ctx, operand)?
+                && is_carried_ty(&ty)
+            {
+                return Err(BridgeError::UnsupportedOp(format!(
+                    "{op:?} of an aggregate or fat pointer operand ({ty:?}): the operand is \
+                     carried by the address of its bytes, and {op:?} would act on that address"
+                )));
+            }
             let src = ctx.resolve_operand(operand, instructions)?;
-            let opcode = map_unop(*op)?;
-            instructions.push(Instruction { opcode, args: vec![src], results: vec![dest_val] });
+            // Trust: a MIR `Not` on a `bool` is a one-bit complement. `Bnot` is a full-width
+            // bitwise NOT (`mvn` on AArch64), so on a 0/1 value it yields 0xFF..FF / 0xFF..FE
+            // (for 0 / 1) instead of 1 / 0 and every consumer of the bool reads garbage. Lower it as
+            // `Bxor(x, 1)` on the B1 value; every integer width keeps `Bnot` (measured correct:
+            // the width is re-established where the value is consumed).
+            if *op == UnOp::Not && matches!(operand_ty(ctx, operand)?, Ty::Bool) {
+                let one = ctx.fresh_value();
+                instructions.push(Instruction {
+                    opcode: Opcode::Iconst { ty: LirType::B1, imm: 1 },
+                    args: vec![],
+                    results: vec![one],
+                });
+                instructions.push(Instruction {
+                    opcode: Opcode::Bxor,
+                    args: vec![src, one],
+                    results: vec![dest_val],
+                });
+            } else {
+                let opcode = map_unop(*op)?;
+                instructions.push(Instruction { opcode, args: vec![src], results: vec![dest_val] });
+            }
             assign_to_place(dest, dest_val, ctx, instructions)?;
         }
         // Trust: #828 — Cast handles int-to-int, float-to-int, int-to-float,
@@ -3377,10 +4602,59 @@ fn lower_rvalue(
         Rvalue::Cast(operand, target_ty) => {
             let src = ctx.resolve_operand(operand, instructions)?;
 
-            let src_ty = match operand {
-                Operand::Copy(p) | Operand::Move(p) => ctx.local_ty(p.local).ok(),
+            // The source's type is its PLACE's: `t.0 as u64` on `t: (i8, u8)`
+            // widens an i8 by sign, whatever the tuple is.
+            let src_place_ty = match operand {
+                Operand::Copy(p) | Operand::Move(p) => Some(ctx.place_ty(p)?),
                 _ => None,
             };
+            let src_ty = src_place_ty.as_ref();
+            // Slice fat pointers are carried by the address of their two words
+            // (`is_carried_ty`). A cast between two of them copies both words; a cast to a
+            // thin pointer keeps the data word; an unsizing cast of `*const [T; N]` builds
+            // the pair `(data, N)`. Before ticket 216 cg review 5 all three were a no-op on
+            // a one-word value, so the length was whatever the carrier held.
+            let src_elem = src_ty.and_then(slice_element_type);
+            if let Some(target_elem) = slice_element_type(target_ty) {
+                if src_elem.is_some() {
+                    assign_to_place(dest, src, ctx, instructions)?;
+                    return Ok(());
+                }
+                let unsized_from = src_ty.and_then(|ty| match ty {
+                    Ty::Ref { inner, .. } | Ty::RawPtr { pointee: inner, .. } => {
+                        match inner.as_ref() {
+                            Ty::Array { elem, len } if **elem == target_elem => Some(*len),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                });
+                let Some(len) = unsized_from else {
+                    return Err(BridgeError::UnsupportedOp(format!(
+                        "cast of {src_ty:?} to slice fat pointer {target_ty:?} has no length to \
+                         carry"
+                    )));
+                };
+                let len = emit_iconst(ctx, instructions, LirType::I64, carrier_imm(len)?);
+                let fat_ptr = ctx.emit_slice_fat_pointer(&target_elem, src, len, instructions)?;
+                assign_to_place(dest, fat_ptr, ctx, instructions)?;
+                return Ok(());
+            }
+            if let (Some(src_ty), Some(_)) = (src_ty, src_elem.as_ref())
+                && target_ty.is_pointer_like()
+                && !is_carried_ty(target_ty)
+            {
+                let data = ctx.emit_slice_data_ptr(src, src_ty, instructions)?;
+                assign_to_place(dest, data, ctx, instructions)?;
+                return Ok(());
+            }
+            // An aggregate operand is its carrier (an address): a cast to any
+            // other type would reinterpret the ADDRESS, not the bytes.
+            if src_ty.is_some_and(is_carried_ty) && src_ty != Some(target_ty) {
+                return Err(BridgeError::UnsupportedOp(format!(
+                    "cast of aggregate {src_ty:?} to {target_ty:?} is not supported"
+                )));
+            }
 
             let src_is_float = src_ty.is_some_and(|t| t.is_float());
             let dst_is_float = target_ty.is_float();
@@ -3488,37 +4762,57 @@ fn lower_rvalue(
             }
         }
         Rvalue::Discriminant(place) => {
-            let local_ty = ctx.local_ty(place.local)?.clone();
-            if is_fieldless_adt(&local_ty) {
+            // Trust (ticket 216 cg-bridge): read the tag slot the writers write
+            // (`flat_enum_tag_slot`, any index), at the slot's OWN width, then
+            // widen it by the slot's sign (or narrow it) to the destination's
+            // discriminant type. The old read was `StructGep(0) + Load(I64)`
+            // whatever the slot: an i8/u8/i32 tag read 8 bytes (the slot plus
+            // whatever followed it), a negative narrow tag was never
+            // sign-extended, and a slot at another index was never read at all.
+            // The place is resolved with its projections, so `discriminant(*r)`
+            // reads through the reference instead of treating `r` as the enum.
+            let place_ty = ctx.place_ty(place)?;
+            let dest_ty = ctx.place_ty(dest)?;
+            if !matches!(dest_ty, Ty::Int { .. }) {
                 return Err(BridgeError::UnsupportedOp(format!(
-                    "fieldless ADT discriminant has no trustworthy LIR layout: {local_ty:?}"
+                    "Discriminant destination must be an integer, got {dest_ty:?}"
                 )));
-            } else {
-                // Discriminant: extract the tag field from an ADT.
-                // By convention the discriminant is field 0 of the struct layout,
-                // stored as an integer. We emit StructGep(0) + Load(I64).
-                let base_val = if let Some(&slot) = ctx.local_stack_slots.get(&place.local) {
-                    ctx.emit_stack_addr(slot, instructions)
-                } else {
-                    // If the local doesn't have a stack slot, allocate one.
-                    let slot = ctx.ensure_local_stack_slot(place.local)?;
-                    ctx.emit_stack_addr(slot, instructions)
-                };
-                let lir_ty = map_type(&local_ty)?;
-                let gep_result = ctx.fresh_value();
-                instructions.push(Instruction {
-                    opcode: Opcode::StructGep { struct_ty: lir_ty, field_index: 0 },
-                    args: vec![base_val],
-                    results: vec![gep_result],
-                });
-                let loaded = ctx.fresh_value();
-                instructions.push(Instruction {
-                    opcode: Opcode::Load { ty: LirType::I64, align: None },
-                    args: vec![gep_result],
-                    results: vec![loaded],
-                });
-                assign_to_place(dest, loaded, ctx, instructions)?;
             }
+            let dest_lir_ty = map_type(&dest_ty)?;
+            // A DECLARED struct or union has no slot (`flat_enum_tag_slot`): its
+            // discriminant is 0, rustc's `discriminant_value` for every
+            // non-enum type (a single-variant layout reads its variant, 0).
+            // MIR spells it when `mem::discriminant::<T>` is instantiated at a
+            // struct. Before the one slot rule this read took a struct field
+            // spelled `tag` for a slot and returned that field's DATA. An ADT
+            // not declared a struct/union and carrying no slot stays refused
+            // (`explicit_discriminant_field`): it may be an enum whose slot the
+            // lane cannot see, and 0 would then be a guess.
+            if is_declared_struct_or_union(&place_ty) {
+                let zero = emit_iconst(ctx, instructions, dest_lir_ty, 0);
+                assign_to_place(dest, zero, ctx, instructions)?;
+                return Ok(());
+            }
+            if is_fieldless_adt(&place_ty) {
+                return Err(BridgeError::UnsupportedOp(format!(
+                    "fieldless ADT discriminant has no trustworthy LIR layout: {place_ty:?}"
+                )));
+            }
+            let (tag_index, tag_ty) = explicit_discriminant_field(&place_ty, "Discriminant")?;
+            let tag_lir_ty = map_type(&tag_ty)?;
+            let mut tag_place = place.clone();
+            tag_place.projections.push(Projection::Field(tag_index));
+            let tag_addr = ctx.resolve_place_addr(&tag_place, instructions)?;
+            let loaded = ctx.fresh_value();
+            instructions.push(Instruction {
+                opcode: Opcode::Load { ty: tag_lir_ty.clone(), align: None },
+                args: vec![tag_addr],
+                results: vec![loaded],
+            });
+            let tag_is_signed = matches!(tag_ty, Ty::Int { signed: true, .. });
+            let value =
+                emit_int_cast(ctx, instructions, loaded, &tag_lir_ty, &dest_lir_ty, tag_is_signed)?;
+            assign_to_place(dest, value, ctx, instructions)?;
         }
         Rvalue::Len(place) => {
             // Len: for slices, load the length field (field 1 of the fat pointer).
@@ -3573,18 +4867,26 @@ fn lower_rvalue(
             }
         }
         Rvalue::Aggregate(kind, operands) => {
-            // Aggregate construction: allocate a stack slot, store each field.
-            let dest_ty = ctx.local_ty(dest.local)?.clone();
+            // Aggregate construction: store each field into the destination. The value built
+            // is typed as the DESTINATION place (`built_dest_ty`): `(_1.1: E) = E::B(3)`
+            // (rustc's `s.e = E::B(3)`) builds an `E` into `_1.1`, not a whole `_1`.
+            let dest_ty = built_dest_ty(ctx, dest)?;
             validate_aggregate_kind_for_lir(kind, &dest_ty)?;
             let lir_ty = map_lowering_type(&dest_ty)?;
 
-            let slot = ctx.alloc_stack_slot(&lir_ty);
-            let base_ptr = ctx.emit_stack_addr(slot, instructions);
+            // Read every operand BEFORE the first store: the slot is the destination local's
+            // only memory, and MIR lets an operand read the destination itself for a
+            // scalar-pair type (`_1 = (copy (_1.1), copy (_1.0))`, rust-lang/rust#68364).
+            let mut operand_vals = Vec::with_capacity(operands.len());
+            for operand in operands {
+                operand_vals.push(ctx.resolve_operand(operand, instructions)?);
+            }
+
+            let base_ptr = constructor_dest_addr(ctx, dest, "Aggregate", instructions)?;
 
             match kind {
                 AggregateKind::Tuple | AggregateKind::Array => {
-                    for (i, operand) in operands.iter().enumerate() {
-                        let val = ctx.resolve_operand(operand, instructions)?;
+                    for (i, &val) in operand_vals.iter().enumerate() {
                         let store_ty = match &dest_ty {
                             Ty::Tuple(fields) => {
                                 let field_ty = fields.get(i).ok_or_else(|| {
@@ -3611,131 +4913,220 @@ fn lower_rvalue(
                             args: vec![base_ptr],
                             results: vec![field_ptr],
                         });
-                        push_store(instructions, store_ty, val, field_ptr);
+                        ctx.emit_checked_store(store_ty, val, field_ptr, instructions)?;
                     }
                 }
-                AggregateKind::Adt { variant, active_field, .. } => {
+                AggregateKind::Adt { name: aggregate_name, variant, active_field, .. } => {
                     debug_assert!(active_field.is_none());
-                    {
-                        // Trust: #828 — enum variant construction must write the
-                        // discriminant tag. Convention: if field 0 of the ADT is
-                        // named "tag", it is the discriminant and operands map to
-                        // fields starting at index 1. For plain structs (no "tag"
-                        // field) operands map 1:1 to fields.
-                        let has_discriminant = matches!(
+                    let Ty::Adt { name: adt_name, fields: adt_fields, variants, .. } = &dest_ty
+                    else {
+                        return Err(BridgeError::InvalidMir(format!(
+                            "ADT aggregate `{aggregate_name}` does not match destination type \
+                             {dest_ty:?}"
+                        )));
+                    };
+                    // The lanes, the tag slot and the declared discriminants
+                    // below are the DESTINATION's: an aggregate that names
+                    // another ADT would be laid out in the wrong type's lanes.
+                    if !aggregate_names_adt(aggregate_name, adt_name) {
+                        return Err(BridgeError::InvalidMir(format!(
+                            "ADT aggregate `{aggregate_name}` does not name its destination's \
+                             type `{adt_name}`"
+                        )));
+                    }
+                    // Trust (ticket 216 cg-bridge): enum variant construction
+                    // writes the variant's DECLARED discriminant into the tag
+                    // slot. The slot is found by the one lookup the
+                    // `SetDiscriminant` write and the `Discriminant` read use
+                    // (`flat_tag_field_index`); the old convention here keyed
+                    // on field 0 spelled exactly `tag`, so the extractor's
+                    // `__tag` wrote NO tag at all (and took the first payload
+                    // operand into the slot), and it wrote the variant INDEX.
+                    // A declared struct/union has no tag: a field of it spelled
+                    // `tag` is data (`flat_enum_tag_slot`).
+                    //
+                    // Operand k of a flat enum's variant v goes to that
+                    // variant's own lane, `__v{v}_{name_k}` (`flat_variant_lane`,
+                    // the lookup the `Downcast(v) + Field(k)` read and write
+                    // use). Mapping operands in order onto the non-slot fields
+                    // (95382e6164) wrote `Err(5)` of `Result<u64, u64>` into
+                    // `Ok`'s lane. A struct, union, or slot-less ADT keeps the
+                    // positional rule.
+                    let tag_index = flat_enum_tag_slot(&dest_ty);
+
+                    if tag_index.is_some() {
+                        let (tag_slot, tag_field_ty) =
+                            explicit_discriminant_field(&dest_ty, "enum aggregate")?;
+                        let (tag_lir_ty, tag_imm) = declared_tag_lir_const(
                             &dest_ty,
-                            Ty::Adt { fields, .. }
-                                if fields.first().map(|(n, _)| n.as_str()) == Some("tag")
-                        );
+                            &tag_field_ty,
+                            *variant,
+                            "enum aggregate",
+                        )?;
+                        let tag_ptr = ctx.fresh_value();
+                        instructions.push(Instruction {
+                            opcode: Opcode::StructGep {
+                                struct_ty: lir_ty.clone(),
+                                field_index: tag_slot as u32,
+                            },
+                            args: vec![base_ptr],
+                            results: vec![tag_ptr],
+                        });
+                        let tag_val = ctx.fresh_value();
+                        instructions.push(Instruction {
+                            opcode: Opcode::Iconst { ty: tag_lir_ty.clone(), imm: tag_imm },
+                            args: vec![],
+                            results: vec![tag_val],
+                        });
+                        push_store(instructions, tag_lir_ty, tag_val, tag_ptr);
+                    }
 
-                        let field_offset: u32 = if has_discriminant {
-                            // Store the variant index as the discriminant at field 0.
-                            let tag_ptr = ctx.fresh_value();
-                            instructions.push(Instruction {
-                                opcode: Opcode::StructGep {
-                                    struct_ty: lir_ty.clone(),
-                                    field_index: 0,
-                                },
-                                args: vec![base_ptr],
-                                results: vec![tag_ptr],
-                            });
-                            let tag_field_ty = match &dest_ty {
-                                Ty::Adt { fields, .. } => &fields[0].1,
-                                other => {
-                                    return Err(BridgeError::InvalidMir(format!(
-                                        "ADT aggregate kind does not match destination type {other:?}"
-                                    )));
-                                }
-                            };
-                            let (tag_lir_ty, tag_imm) =
-                                explicit_discriminant_lir_const(tag_field_ty, *variant)?;
-                            let tag_val = ctx.fresh_value();
-                            instructions.push(Instruction {
-                                opcode: Opcode::Iconst { ty: tag_lir_ty.clone(), imm: tag_imm },
-                                args: vec![],
-                                results: vec![tag_val],
-                            });
-                            push_store(instructions, tag_lir_ty, tag_val, tag_ptr);
-                            1 // data fields start after the discriminant
+                    if tag_index.is_some()
+                        && let Some(variant_def) = variants.get(*variant)
+                        && operands.len() != variant_def.fields.len()
+                    {
+                        return Err(BridgeError::InvalidMir(format!(
+                            "enum aggregate of variant {variant} (`{}`) of `{adt_name}` has {} \
+                             operand(s) for {} declared field(s)",
+                            variant_def.name,
+                            operands.len(),
+                            variant_def.fields.len()
+                        )));
+                    }
+                    for (i, &val) in operand_vals.iter().enumerate() {
+                        let field_index = if tag_index.is_some() {
+                            flat_variant_lane(&dest_ty, *variant, i, "enum aggregate")?
+                                .map(|(flat_index, _)| flat_index)
+                                .ok_or_else(|| {
+                                    BridgeError::InvalidMir(format!(
+                                        "enum aggregate operand {i} of `{adt_name}` has no lane"
+                                    ))
+                                })?
+                        } else if i < adt_fields.len() {
+                            i
                         } else {
-                            0
+                            return Err(BridgeError::InvalidMir(format!(
+                                "ADT aggregate operand {i} maps to no field of `{adt_name}`"
+                            )));
                         };
-
-                        for (i, operand) in operands.iter().enumerate() {
-                            let val = ctx.resolve_operand(operand, instructions)?;
-                            let field_index = i + field_offset as usize;
-                            let store_ty = match &dest_ty {
-                                Ty::Adt { fields, .. } => {
-                                    let (_, field_ty) = fields.get(field_index).ok_or_else(|| {
-                                        BridgeError::InvalidMir(format!(
-                                            "ADT aggregate operand {i} maps to missing field {field_index}"
-                                        ))
-                                    })?;
-                                    map_lowering_type(field_ty)?
-                                }
-                                other => {
-                                    return Err(BridgeError::InvalidMir(format!(
-                                        "ADT aggregate kind does not match destination type {other:?}"
-                                    )));
-                                }
-                            };
-                            let field_ptr = ctx.fresh_value();
-                            instructions.push(Instruction {
-                                opcode: Opcode::StructGep {
-                                    struct_ty: lir_ty.clone(),
-                                    field_index: field_index as u32,
-                                },
-                                args: vec![base_ptr],
-                                results: vec![field_ptr],
-                            });
-                            push_store(instructions, store_ty, val, field_ptr);
-                        }
+                        let store_ty = map_lowering_type(&adt_fields[field_index].1)?;
+                        let field_ptr = ctx.fresh_value();
+                        instructions.push(Instruction {
+                            opcode: Opcode::StructGep {
+                                struct_ty: lir_ty.clone(),
+                                field_index: field_index as u32,
+                            },
+                            args: vec![base_ptr],
+                            results: vec![field_ptr],
+                        });
+                        ctx.emit_checked_store(store_ty, val, field_ptr, instructions)?;
                     }
                 }
                 other => unreachable!("validated aggregate kind before lowering: {other:?}"),
             }
 
-            // Track this local's stack slot so future projections can find it.
-            ctx.local_stack_slots.insert(dest.local, slot);
-            let aggregate_value = materialize_aggregate_value(ctx, base_ptr, &lir_ty, instructions);
-            ctx.local_values.insert(dest.local, aggregate_value);
+            bind_constructed(ctx, dest, base_ptr);
         }
         Rvalue::Repeat(operand, count) => {
-            // Array repeat: [operand; count]. Allocate stack slot and store
-            // the same value `count` times.
-            let dest_ty = ctx.local_ty(dest.local)?.clone();
+            // Array repeat `[operand; count]` into a stack slot, in a number of instructions set
+            // by the program, never proportional to `count`:
+            //   * an integer or bool CONSTANT whose byte image is one repeated byte (`[0u8; N]`,
+            //     `[0u64; N]`, `[-1i32; N]`, `[true; N]`): ONE `Memset` of the whole extent;
+            //   * any other element: lane 0 is stored once, then each `Memcpy` copies the
+            //     already-filled prefix onto the lanes after it, doubling the filled length —
+            //     ceil(log2 count) copies. That is O(log N), not constant: it is bounded by the
+            //     bit width of the u32 extent carrier (at most 32 copies), whatever N is.
+            // The per-element store loop this replaces was proportional to `count`, and its
+            // `i as u32 * elem_size` offset wrapped past 4 GiB. Every offset and length here is
+            // a checked u64 product carried as an I64 immediate, and the fill is checked to be
+            // EXACTLY the slot's extent (`repeat_fill_extent`): `map_type` refuses a type whose
+            // extent the u32 carrier cannot describe, so the slot is never smaller than what
+            // the fill writes. The array is the DESTINATION place's (`built_dest_ty`).
+            let dest_ty = built_dest_ty(ctx, dest)?;
             let lir_ty = map_type(&dest_ty)?;
-            let elem_ty = match &dest_ty {
-                Ty::Array { elem, .. } => map_type(elem)?,
+            let elem_src_ty = match &dest_ty {
+                Ty::Array { elem, .. } => elem.as_ref().clone(),
                 _ => {
                     return Err(BridgeError::UnsupportedOp("Repeat on non-array type".to_string()));
                 }
             };
+            let elem_ty = map_type(&elem_src_ty)?;
+            let elem_size = u64::from(elem_ty.bytes());
+            let count = u64::try_from(*count)
+                .map_err(|_| BridgeError::UnsupportedOp("Repeat count exceeds u64".to_string()))?;
+            let fill_bytes = repeat_fill_extent(&lir_ty, elem_size, count)?;
 
-            let slot = ctx.alloc_stack_slot(&lir_ty);
-            let base_ptr = ctx.emit_stack_addr(slot, instructions);
-            let val = ctx.resolve_operand(operand, instructions)?;
-
-            let elem_size = elem_ty.bytes();
-            for i in 0..*count {
-                let offset_const = ctx.fresh_value();
+            let fill_byte =
+                if fill_bytes > 0 { repeated_fill_byte(operand, &elem_src_ty) } else { None };
+            // The element (unless the fill is one `Memset` byte, which reads nothing) is read
+            // before the first store into the destination.
+            let val = match fill_byte {
+                Some(_) => None,
+                None => Some(ctx.resolve_operand(operand, instructions)?),
+            };
+            let base_ptr = constructor_dest_addr(ctx, dest, "Repeat", instructions)?;
+            if let Some(byte) = fill_byte {
+                // `Memset` takes the libc `int` fill; libc stores `(unsigned char)c`.
+                let fill = ctx.fresh_value();
                 instructions.push(Instruction {
-                    opcode: Opcode::Iconst { ty: LirType::I64, imm: (i as u32 * elem_size) as i64 },
+                    opcode: Opcode::Iconst { ty: LirType::I32, imm: i64::from(byte) },
                     args: vec![],
-                    results: vec![offset_const],
+                    results: vec![fill],
                 });
-                let elem_ptr = ctx.fresh_value();
+                let len = ctx.fresh_value();
                 instructions.push(Instruction {
-                    opcode: Opcode::Iadd,
-                    args: vec![base_ptr, offset_const],
-                    results: vec![elem_ptr],
+                    opcode: Opcode::Iconst { ty: LirType::I64, imm: carrier_imm(fill_bytes)? },
+                    args: vec![],
+                    results: vec![len],
                 });
-                push_store(instructions, elem_ty.clone(), val, elem_ptr);
+                instructions.push(Instruction {
+                    opcode: Opcode::Memset,
+                    args: vec![base_ptr, fill, len],
+                    results: vec![],
+                });
+            } else if let Some(val) = val
+                && fill_bytes > 0
+            {
+                ctx.emit_checked_store(elem_ty.clone(), val, base_ptr, instructions)?;
+                let mut filled: u64 = 1;
+                while filled < count {
+                    let chunk = filled.min(count - filled);
+                    let dst_offset = ctx.fresh_value();
+                    instructions.push(Instruction {
+                        opcode: Opcode::Iconst {
+                            ty: LirType::I64,
+                            imm: carrier_imm(filled * elem_size)?,
+                        },
+                        args: vec![],
+                        results: vec![dst_offset],
+                    });
+                    let dst_ptr = ctx.fresh_value();
+                    instructions.push(Instruction {
+                        opcode: Opcode::Iadd,
+                        args: vec![base_ptr, dst_offset],
+                        results: vec![dst_ptr],
+                    });
+                    let len = ctx.fresh_value();
+                    instructions.push(Instruction {
+                        opcode: Opcode::Iconst {
+                            ty: LirType::I64,
+                            imm: carrier_imm(chunk * elem_size)?,
+                        },
+                        args: vec![],
+                        results: vec![len],
+                    });
+                    // Source `[0, chunk)` and destination `[filled, filled + chunk)` never
+                    // overlap because `chunk <= filled`.
+                    instructions.push(Instruction {
+                        opcode: Opcode::Memcpy,
+                        args: vec![dst_ptr, base_ptr, len],
+                        results: vec![],
+                    });
+                    filled += chunk;
+                }
             }
 
-            ctx.local_stack_slots.insert(dest.local, slot);
-            let array_value = materialize_aggregate_value(ctx, base_ptr, &lir_ty, instructions);
-            ctx.local_values.insert(dest.local, array_value);
+            bind_constructed(ctx, dest, base_ptr);
         }
         Rvalue::CopyForDeref(place) => {
             let src = ctx.resolve_place(place, instructions)?;
@@ -3769,7 +5160,7 @@ fn lower_terminator(
             });
         }
         Terminator::Return => {
-            let args = return_args(ctx, return_lowering)?;
+            let args = return_args(ctx, return_lowering, instructions)?;
             instructions.push(Instruction { opcode: Opcode::Return, args, results: vec![] });
         }
         Terminator::Unreachable => {
@@ -3785,10 +5176,23 @@ fn lower_terminator(
                 let (value, target) = &targets[0];
                 let then_dest = conditional_edge_dest(target.0, ctx, block_params)?;
                 let else_dest = conditional_edge_dest(otherwise.0, ctx, block_params)?;
+                // Trust (ticket 216 cg-bridge): the case constant is encoded as
+                // the multi-way arm encodes it (`encode_switch_case`) and
+                // materialized AT THE SELECTOR'S TYPE. It was an `I64` of
+                // `*value as i64` whatever the selector: an `i32`/`u32`
+                // selector against a label above 4095 (every negative repr(i32)
+                // discriminant, `u32::MAX`) paired a W register with an X
+                // register and the AArch64 encoder refused the function
+                // ("CMP register widths must agree"; x86-64 ISel refuses any
+                // Icmp whose operand types differ), and a 128-bit label was
+                // silently truncated to its low 64 bits in the LIR.
+                let selector_ty = map_type(&operand_ty(ctx, discr)?)?;
+                let encoded = encode_switch_case(*value as i128, &selector_ty)
+                    .map_err(|e| BridgeError::UnsupportedOp(format!("SwitchInt: {e}")))?;
                 // Emit: cmp = icmp eq(discr, value)
                 let const_val = ctx.fresh_value();
                 instructions.push(Instruction {
-                    opcode: Opcode::Iconst { ty: LirType::I64, imm: *value as i64 },
+                    opcode: Opcode::Iconst { ty: selector_ty, imm: encoded },
                     args: vec![],
                     results: vec![const_val],
                 });
@@ -3804,10 +5208,23 @@ fn lower_terminator(
                     results: vec![],
                 });
             } else {
-                // Multi-way: emit a Switch instruction.
+                // Multi-way: emit a Switch instruction. MIR spells each case as
+                // the ZERO-extended bit pattern at the discriminant's width, but
+                // the LIR case encoding depends on the selector's width (see
+                // `mapping::encode_switch_case`): a 32-bit selector wants its
+                // two's-complement value. `*val as i64` passed `i32 -1` /
+                // `u32::MAX` through as 4294967295, which the jump-table lowering
+                // (whose index arithmetic sign-extends a 32-bit selector) routed
+                // to the default arm.
+                let selector_ty = map_type(&operand_ty(ctx, discr)?)?;
+                // `as i128` is exact for every selector of at most 64 bits (the
+                // only widths the encoder admits); a 128-bit selector is refused.
+                let encoded =
+                    encode_switch_cases(targets.iter().map(|(val, _)| *val as i128), &selector_ty)
+                        .map_err(|e| BridgeError::UnsupportedOp(format!("SwitchInt: {e}")))?;
                 let mut cases = Vec::with_capacity(targets.len());
-                for (val, blk) in targets {
-                    cases.push((*val as i64, conditional_edge_dest(blk.0, ctx, block_params)?));
+                for ((_, blk), val) in targets.iter().zip(encoded) {
+                    cases.push((val, conditional_edge_dest(blk.0, ctx, block_params)?));
                 }
                 let default = conditional_edge_dest(otherwise.0, ctx, block_params)?;
                 instructions.push(Instruction {
@@ -3973,10 +5390,32 @@ fn lower_terminator(
                 return Ok(());
             }
 
-            // Resolve call arguments.
+            // Resolve call arguments. A by-value aggregate argument's value is the address of
+            // its bytes, typed I64 by the `StackAddr` that made it; trust-cg classifies call
+            // arguments by their LIR value types, so it is passed through a fresh `Copy` temp
+            // typed as the aggregate (trust-cg-lower's call-argument temp contract: an
+            // aggregate-typed Copy of an I64 carrier with exactly one use, the call).
             let mut arg_vals = Vec::with_capacity(args.len());
             for arg in args {
-                arg_vals.push(ctx.resolve_operand(arg, instructions)?);
+                let value = ctx.resolve_operand(arg, instructions)?;
+                // Only the aggregate question is asked here: an argument whose type has no LIR
+                // lowering (a unit or fn-item constant) is passed as it always was.
+                let aggregate_ty = operand_ty(ctx, arg)
+                    .ok()
+                    .and_then(|ty| map_lowering_type(&ty).ok())
+                    .filter(LirType::is_aggregate);
+                if let Some(arg_ty) = aggregate_ty {
+                    let temp = ctx.fresh_value();
+                    ctx.record_value_type(temp, arg_ty);
+                    instructions.push(Instruction {
+                        opcode: Opcode::Copy,
+                        args: vec![value],
+                        results: vec![temp],
+                    });
+                    arg_vals.push(temp);
+                } else {
+                    arg_vals.push(value);
+                }
             }
 
             // Determine result value for the call destination.
@@ -3991,7 +5430,10 @@ fn lower_terminator(
             };
 
             instructions.push(Instruction {
-                opcode: Opcode::Call { name: callee.clone(), binding: DirectCallBinding::Interposable },
+                opcode: Opcode::Call {
+                    name: callee.clone(),
+                    binding: DirectCallBinding::Interposable,
+                },
                 args: arg_vals,
                 results: call_result.into_iter().collect(),
             });
@@ -4000,11 +5442,12 @@ fn lower_terminator(
             if let Some(call_result) = call_result {
                 if place_is_direct_local(dest) {
                     ctx.local_values.insert(dest.local, call_result);
+                    ctx.store_memory_backed_definition(dest.local, call_result, instructions)?;
                 } else {
                     // For projected destinations, compute the address and store.
                     let addr = ctx.resolve_place_addr(dest, instructions)?;
                     let ty = map_lowering_type(&dest_ty)?;
-                    push_store(instructions, ty, call_result, addr);
+                    ctx.emit_store_value(ty, call_result, addr, instructions);
                 }
             }
 
@@ -4022,7 +5465,10 @@ fn lower_terminator(
         // instance. Trivially-Copy values need no glue; every other drop must
         // fail until the exact symbol and ABI are provided by the compiler.
         Terminator::Drop { place, target, .. } => {
-            let place_ty = ctx.local_ty(place.local)?.clone();
+            // The PLACE's type, never its base local's: `drop((*_1))` on
+            // `_1: *mut String` drops a String, and a raw pointer is trivially
+            // Copy (ticket 216 cg review 3: that drop lowered as a plain jump).
+            let place_ty = ctx.place_ty(place)?;
             if !is_trivially_copy_ty(&place_ty) {
                 return Err(BridgeError::UnsupportedOp(format!(
                     "non-trivial Drop for {place_ty:?} requires an exact monomorphized drop-glue symbol and ABI; TrustIr carries neither"
@@ -4055,6 +5501,10 @@ fn lower_terminator(
 }
 
 #[cfg(test)]
+#[path = "memory_image_tests.rs"]
+mod memory_image_tests;
+
+#[cfg(test)]
 mod function_name_tests {
     use trust_types::{BlockId, SourceSpan};
 
@@ -4080,6 +5530,7 @@ mod function_name_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4172,6 +5623,7 @@ mod return_join_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let lir = lower_to_lir(&func).expect("multi-predecessor return should lower");
@@ -4222,6 +5674,7 @@ mod integer_constant_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4282,6 +5735,7 @@ mod terminator_runtime_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4343,6 +5797,7 @@ mod terminator_runtime_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let options = LoweringOptions {
             panic_symbols: PanicRuntimeSymbols {
@@ -4392,6 +5847,39 @@ mod terminator_runtime_tests {
     }
 }
 
+/// Test support: the byte length of every `Memcpy` in `block`, in order (each length operand is
+/// an `Iconst` defined in the same block).
+#[cfg(test)]
+pub(crate) fn aggregate_copy_lengths(block: &LirBlock) -> Vec<i64> {
+    block
+        .instructions
+        .iter()
+        .filter(|inst| matches!(inst.opcode, Opcode::Memcpy))
+        .map(|copy| {
+            block
+                .instructions
+                .iter()
+                .find_map(|inst| match inst.opcode {
+                    Opcode::Iconst { imm, .. } if inst.results == [copy.args[2]] => Some(imm),
+                    _ => None,
+                })
+                .expect("a Memcpy length is an Iconst in the same block")
+        })
+        .collect()
+}
+
+/// Test support: `block` loads and stores no whole aggregate. LIR carries an aggregate as the
+/// address of its bytes, and trust-cg selects a whole-aggregate `Load`/`Store` as ONE
+/// register-width access, silently dropping the rest of the value.
+#[cfg(test)]
+pub(crate) fn assert_no_whole_aggregate_access(block: &LirBlock) {
+    for inst in &block.instructions {
+        if let Opcode::Load { ty, .. } | Opcode::Store { ty, .. } = &inst.opcode {
+            assert!(!ty.is_aggregate(), "whole-aggregate access {inst:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod aggregate_projection_tests {
     use trust_types::{BlockId, SourceSpan};
@@ -4418,6 +5906,7 @@ mod aggregate_projection_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4458,6 +5947,7 @@ mod aggregate_projection_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let lir = lower_to_lir(&func).expect("array subslice value should lower");
@@ -4467,21 +5957,13 @@ mod aggregate_projection_tests {
                 .iter()
                 .any(|i| matches!(i.opcode, Opcode::Iconst { ty: LirType::I64, imm: 4 }))
         );
-        assert!(
-            bb0.instructions.iter().any(|i| matches!(
-                &i.opcode,
-                Opcode::Load { ty: LirType::Array(elem, 2), align: None } if **elem == LirType::I32
-            )),
-            "array subslice value should load a fixed-size [i32; 2]"
+        assert_eq!(
+            aggregate_copy_lengths(bb0),
+            vec![20, 8, 8],
+            "the [i32; 5] argument is copied into its slot (20 bytes); the subslice value is \
+             exactly a [i32; 2] (8 bytes) copied out of it, then into the return place"
         );
-        assert!(
-            !bb0.instructions.iter().any(|i| matches!(
-                &i.opcode,
-                Opcode::Load { ty: LirType::Struct(fields), align: None }
-                    if fields.as_slice() == [LirType::I64, LirType::I64]
-            )),
-            "array subslice value must not materialize a slice fat pointer"
-        );
+        assert_no_whole_aggregate_access(bb0);
     }
 
     #[test]
@@ -4527,6 +6009,7 @@ mod aggregate_projection_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let lir = lower_to_lir(&func).expect("array subslice address should lower as thin pointer");
@@ -4588,6 +6071,7 @@ mod aggregate_projection_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let lir = lower_to_lir(&func).expect("slice subslice value should lower as fat pointer");
@@ -4603,13 +6087,10 @@ mod aggregate_projection_tests {
             "from_end slice subslice should derive the new length from source metadata"
         );
         assert!(
-            bb0.instructions.iter().any(|i| matches!(
-                &i.opcode,
-                Opcode::Load { ty: LirType::Struct(fields), align: None }
-                    if fields.as_slice() == [LirType::I64, LirType::I64]
-            )),
-            "slice subslice value should materialize a fat pointer"
+            aggregate_copy_lengths(bb0).contains(&16),
+            "slice subslice value should materialize a whole (data, len) fat pointer: a 16-byte copy"
         );
+        assert_no_whole_aggregate_access(bb0);
     }
 
     #[test]
@@ -4653,6 +6134,7 @@ mod aggregate_projection_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let lir = lower_to_lir(&func).expect("slice subslice address should preserve metadata");
@@ -4674,11 +6156,15 @@ mod aggregate_projection_tests {
         let union_like_ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "UnionLike".into(),
-            fields: vec![("a".into(), Ty::i32()), ("b".into(), Ty::i64())],
+            fields: vec![("a".into(), Ty::i32()), ("b".into(), Ty::i64())].into(),
             disc_index_safe: false,
-         faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let func = unit_function(
             "adt_active_field",
             vec![
@@ -4858,11 +6344,15 @@ mod aggregate_projection_tests {
         let fieldless = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "OptionI32".into(),
-            fields: vec![],
+            fields: vec![].into(),
             disc_index_safe: false,
-         faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let func = unit_function(
             "fieldless_adt",
             vec![

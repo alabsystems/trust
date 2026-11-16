@@ -1783,6 +1783,7 @@ mod tests {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
                     },
                 }],
@@ -1794,6 +1795,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

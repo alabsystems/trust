@@ -3,12 +3,13 @@
 /// Public obligation metadata key that binds a verifier-api obligation to a
 /// TrustIr `ProofId` inside a typed native verification request bundle.
 pub const TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY: &str =
-    "trust.trust_ir.native.proof_obligation_id";
+    trust_verifier_api::native_routing_identity::PROOF_KEY;
 /// Optional public obligation metadata key for the TrustIr native request id.
-pub const TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY: &str = "trust.trust_ir.native.request_id";
+pub const TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY: &str =
+    trust_verifier_api::native_routing_identity::REQUEST_KEY;
 /// Optional public obligation metadata key for the expected native verifier suite.
 pub const TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY: &str =
-    "trust.trust_ir.native.verifier_suite";
+    trust_verifier_api::native_routing_identity::SUITE_KEY;
 
 // The privileged namespace is ALIASED from the crate that owns the vocabulary,
 // never re-declared: a local spelling could drift from the admitted list and

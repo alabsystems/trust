@@ -126,3 +126,62 @@ fn cargo_fmt_emits_error_on_line_overflow_true() {
         "line formatted, but exceeded maximum width (maximum: 100 (see `max_width` option)"
     ))
 }
+
+// Trust (T14d, DECISION_QUEUE T14-FMT-1): `targo fmt` formats the file an
+// item-position `include!("<literal>")` names, and names every `include!` it
+// cannot follow as not formatted, never as checked.
+#[test]
+fn literal_includes_are_checked_and_other_includes_are_named() {
+    let mut bin_dir = env::current_exe().unwrap();
+    bin_dir.pop();
+    if bin_dir.ends_with("deps") {
+        bin_dir.pop();
+    }
+    let cmd = bin_dir.join(format!("cargo-fmt{}", env::consts::EXE_SUFFIX));
+    // The formatter this crate built (it is `rustfmt` here, `trustfmt` once
+    // installed), not whatever `trustfmt` PATH names.
+    let formatter = bin_dir.join(format!("rustfmt{}", env::consts::EXE_SUFFIX));
+    let path = env::var_os("PATH").unwrap_or_default();
+    let mut paths = env::split_paths(&path).collect::<Vec<_>>();
+    paths.insert(0, bin_dir);
+    let new_path = env::join_paths(paths).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"includes\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "include!(\"generated.rs\");\ninclude!(concat!(\"computed\", \".rs\"));\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/generated.rs"), "pub fn generated( )  {}\n").unwrap();
+    std::fs::write(root.join("src/computed.rs"), "pub fn computed() {}\n").unwrap();
+
+    let manifest = root.join("Cargo.toml");
+    let output = Command::new(&cmd)
+        .args(["--check", "--manifest-path", manifest.to_str().unwrap()])
+        .env("PATH", new_path)
+        .env("TRUSTFMT", &formatter)
+        .output()
+        .expect("run cargo-fmt");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("generated.rs"),
+        "the literal include! file was not checked:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("not formatted") && stderr.contains("lib.rs:2"),
+        "the computed include! was not named:\n{stderr}"
+    );
+}

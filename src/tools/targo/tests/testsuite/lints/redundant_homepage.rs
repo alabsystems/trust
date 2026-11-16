@@ -24,10 +24,9 @@ redundant_homepage = "warn"
         .file("README.md", "")
         .build();
 
-    p.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("fetch")
         .with_stderr_data(str![[r#"
-[WARNING] `package.homepage` is redundant with another manifest field
+[WARNING] `package.homepage` is redundant with `package.repository`
  --> Cargo.toml:7:12
   |
 6 | repository = "https://github.com/rust-lang/cargo/"
@@ -65,10 +64,9 @@ redundant_homepage = "warn"
         .file("README.md", "")
         .build();
 
-    p.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("fetch")
         .with_stderr_data(str![[r#"
-[WARNING] `package.homepage` is redundant with another manifest field
+[WARNING] `package.homepage` is redundant with `package.documentation`
  --> Cargo.toml:7:12
   |
 6 | documentation = "https://docs.rs/cargo/latest/cargo/"
@@ -110,10 +108,9 @@ redundant_homepage = "warn"
         .file("README.md", "")
         .build();
 
-    p.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("fetch")
         .with_stderr_data(str![[r#"
-[WARNING] `package.homepage` is redundant with another manifest field
+[WARNING] `package.homepage` is redundant with `package.documentation`
   --> Cargo.toml:11:1
    |
 10 | documentation.workspace = true

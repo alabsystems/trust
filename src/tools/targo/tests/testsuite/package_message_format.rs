@@ -6,6 +6,7 @@ use cargo_test_support::str;
 
 #[cargo_test]
 fn gated() {
+    // Trust: retain the channel refusal and exact current Trust guidance.
     let p = project()
         .file(
             "Cargo.toml",
@@ -26,7 +27,7 @@ fn gated() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] the `--message-format` flag is unstable, pass `-Z unstable-options` to enable it
-See https://github.com/rust-lang/cargo/issues/15353 for more information about the `--message-format` flag.
+See https://github.com/alabsystems/Trust/issues for more information about the `--message-format` flag.
 
 "#]])
         .run();
@@ -49,7 +50,8 @@ fn requires_list() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("package --message-format json -Zunstable-options")
+    p.cargo("package --message-format json")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["package --message-format"])
         .with_status(1)
         .with_stderr_data(str![[r#"
@@ -81,7 +83,8 @@ fn human() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("package --list --message-format human -Zunstable-options")
+    p.cargo("package --list --message-format human")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["package --message-format"])
         .with_stderr_data(str![""])
         .with_stdout_data(str![[r#"
@@ -111,7 +114,8 @@ fn single_package() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("package --list --message-format json -Zunstable-options")
+    p.cargo("package --list --message-format json")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["package --message-format"])
         .with_stderr_data(str![""])
         .with_stdout_data(
@@ -146,7 +150,8 @@ fn single_package() {
 
     // has existing lockfile
     p.cargo("generate-lockfile").run();
-    p.cargo("package --list --message-format json -Zunstable-options")
+    p.cargo("package --list --message-format json")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["package --message-format"])
         .with_stderr_data(str![""])
         .with_stdout_data(
@@ -217,7 +222,8 @@ fn workspace() {
         .file("rohan/src/lib.rs", "")
         .build();
 
-    p.cargo("package --list --message-format json -Zunstable-options")
+    p.cargo("package --list --message-format json")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["package --message-format"])
         .with_stderr_data(str![""])
         .with_stdout_data(
@@ -272,7 +278,8 @@ fn workspace() {
 
     // has existing lockfile
     p.cargo("generate-lockfile").run();
-    p.cargo("package --list --message-format json -Zunstable-options")
+    p.cargo("package --list --message-format json")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["package --message-format"])
         .with_stderr_data(str![""])
         .with_stdout_data(

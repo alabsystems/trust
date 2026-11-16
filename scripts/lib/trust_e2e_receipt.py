@@ -1,5 +1,33 @@
-#!/usr/bin/env python3
-"""Fail-closed helpers for local Trust end-to-end diagnostic records.
+#!/bin/sh
+""":"
+# Trust: python floor. POSIX sh runs this block when the file is EXECUTED and
+# re-execs under a >=3.11 interpreter; Python reads it as a string.
+for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null; then
+        exec "$candidate" "$0" "$@"
+    fi
+done
+echo "trust_e2e_receipt.py requires Python 3.11+ (tomllib)" >&2
+exit 2
+":"""
+from __future__ import annotations
+
+import os as _floor_os
+import shutil as _floor_shutil
+import sys as _floor_sys
+
+# Trust: python floor, second half. `python3 trust_e2e_receipt.py` reads the sh block above
+# as a string, so an old `python3` (3.9 on macOS CommandLineTools) re-execs here.
+if __name__ == "__main__" and _floor_sys.version_info < (3, 11):
+    for _floor_candidate in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        _floor_path = _floor_shutil.which(_floor_candidate)
+        if _floor_path:
+            _floor_argv = [_floor_path, _floor_os.path.abspath(__file__), *_floor_sys.argv[1:]]
+            _floor_os.execv(_floor_path, _floor_argv)
+    _floor_sys.exit("trust_e2e_receipt.py requires Python 3.11+ (tomllib); none found on PATH")
+
+__doc__ = """Fail-closed helpers for local Trust end-to-end diagnostic records.
 
 The shell acceptance gates build their candidate documents in private temporary
 directories and call this module only after every check has passed.  Publishing
@@ -7,8 +35,6 @@ is atomic in the destination directory, so a failed run never exposes a partial
 record.  No-replace publication ensures that an output argument cannot overwrite
 an existing file; these local diagnostics are not release authority.
 """
-
-from __future__ import annotations
 
 import argparse
 import errno

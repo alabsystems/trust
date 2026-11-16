@@ -648,11 +648,11 @@ mod tests {
         let executable = trustd.endpoint.control.executable.clone();
 
         // Stand in for the launcher: a private endpoint directory, and the socket
-        // path handed to the shim.
-        let endpoint_root = tempfile::Builder::new()
-            .prefix("fake-trustd-unit-endpoint-")
-            .tempdir()
-            .expect("fake trustd unit endpoint root");
+        // path handed to the shim, using the same shared compact allocator
+        // as the production launcher.
+        let endpoint_root =
+            crate::smoke_socket_root::create(crate::smoke_socket_root::Purpose::SelfVerify)
+                .expect("fake trustd unit endpoint root");
         fs::set_permissions(endpoint_root.path(), fs::Permissions::from_mode(0o700))
             .expect("private endpoint directory");
         let socket = endpoint_root.path().join("trustd.sock");
@@ -736,5 +736,51 @@ mod tests {
         assert_eq!(version.release, smoke.identity.release);
         assert_eq!(version.commit, smoke.identity.commit);
         assert_eq!(version.protocol, smoke.identity.protocol);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn fake_endpoint_answers_the_full_smoke_with_long_temporary_parents() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::process::Command;
+
+        const SMOKE: &str = "self_verify_cli::tests::fake_trustd::tests::fake_endpoint_answers_the_real_trustd_release_diagnostic_smoke";
+        let fixture = tempfile::Builder::new().prefix("ft-").tempdir_in("/tmp").unwrap();
+        let fixture_root = fs::canonicalize(fixture.path()).unwrap();
+        for parent_bytes in [56_usize, 70] {
+            // 56 bytes matches a canonical Darwin temporary parent. At 70,
+            // the former verbose endpoint prefix also exceeds Unix socket
+            // limits, while the production self-verification root still fits.
+            let padding = parent_bytes
+                .checked_sub(fixture_root.as_os_str().as_bytes().len() + 1)
+                .expect("short fixture root leaves room for the selected temporary parent");
+            let selected_temp = fixture_root.join("b".repeat(padding));
+            fs::create_dir(&selected_temp).unwrap();
+            fs::set_permissions(&selected_temp, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(selected_temp.as_os_str().as_bytes().len(), parent_bytes);
+
+            // Change the temporary parent only in the child: the rest of the
+            // parallel test process keeps its original environment. Re-run the
+            // complete identity and reservation smoke, including every assertion.
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", SMOKE, "--nocapture"])
+                .env("TMPDIR", &selected_temp)
+                .env("TMP", &selected_temp)
+                .env("TEMP", &selected_temp);
+            let output = crate::bounded_process::output_with_exact_deadline(
+                &mut command,
+                "fake trustd long temporary parent smoke",
+                1024 * 1024,
+                Duration::from_secs(60),
+            )
+            .expect("capture fake trustd smoke under a long temporary parent");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "fake trustd smoke with {parent_bytes}-byte temporary parent: {stdout}\n{stderr}"
+            );
+        }
     }
 }

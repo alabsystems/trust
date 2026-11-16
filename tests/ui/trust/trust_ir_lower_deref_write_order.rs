@@ -1,6 +1,6 @@
 //@ run-pass
 //@ dont-check-compiler-stderr
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aunused_assignments
 //! Trust (wave-DRW): the `*r = v` deref-write arm evaluates the RHS FIRST, and
 //! a `&mut Scalar` field of the registered `&mut self` receiver is a writable
 //! channel (the adjudicated Drop::drop idiom).

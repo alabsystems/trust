@@ -1,5 +1,4 @@
-// ignore-tidy-linelength
-//@ only-pauthtest
+// ignore-tidy-file-linelength
 //@ add-minicore
 
 //@ revisions: O0_PAUTH O3_PAUTH O0_PAUTH-ELF-GOT O3_PAUTH-ELF-GOT O0_NO_PAUTH O3_NO_PAUTH
@@ -9,9 +8,9 @@
 //@ [O3_PAUTH] needs-llvm-components: aarch64
 //@ [O3_PAUTH] compile-flags: --target=aarch64-unknown-linux-pauthtest -C opt-level=3
 //@ [O0_PAUTH-ELF-GOT] needs-llvm-components: aarch64
-//@ [O0_PAUTH-ELF-GOT] compile-flags: --target=aarch64-unknown-linux-pauthtest -C opt-level=0 -Z ptrauth-elf-got
+//@ [O0_PAUTH-ELF-GOT] compile-flags: --target=aarch64-unknown-linux-pauthtest -C opt-level=0 -Z pointer-authentication=+elf-got
 //@ [O3_PAUTH-ELF-GOT] needs-llvm-components: aarch64
-//@ [O3_PAUTH-ELF-GOT] compile-flags: --target=aarch64-unknown-linux-pauthtest -C opt-level=3 -Z ptrauth-elf-got
+//@ [O3_PAUTH-ELF-GOT] compile-flags: --target=aarch64-unknown-linux-pauthtest -C opt-level=3 -Z pointer-authentication=+elf-got
 //@ [O0_NO_PAUTH] needs-llvm-components: aarch64
 //@ [O0_NO_PAUTH] compile-flags: --target=aarch64-unknown-linux-gnu -C opt-level=0
 //@ [O3_NO_PAUTH] needs-llvm-components: aarch64

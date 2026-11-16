@@ -160,7 +160,11 @@ fn anatomy(tag: &str, name: &str, source: &str) {
     };
     let (outer_lams, cursor) = peel(&value);
     let (head, args) = uncurry(cursor);
-    eprintln!("ANATOMY {tag} | outer_lams={outer_lams} head={} args={}", render(head, 2), args.len());
+    eprintln!(
+        "ANATOMY {tag} | outer_lams={outer_lams} head={} args={}",
+        render(head, 2),
+        args.len()
+    );
     for (i, a) in args.iter().enumerate() {
         eprintln!("   arg[{i}] = {}", render(a, 6));
     }
@@ -231,6 +235,8 @@ pub const THREAD: &str = "def thread (a b : Nat) : Nat := \
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "measurement instrument: prints the elaborated well-founded spine's anatomy, \
+            asserts none; run with --ignored --nocapture"]
 fn probe_q1_two_parameter_wf_anatomy() {
     anatomy("q1 addAcc", "addAcc", ADD_ACC);
     anatomy("q1 dbl", "dbl", DBL);
@@ -243,6 +249,7 @@ fn probe_q1_two_parameter_wf_anatomy() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "measurement instrument: prints the island and call-lane verdicts, asserts none; run with --ignored --nocapture"]
 fn probe_q2_call_lane_rows() {
     row("q2 addAcc", "addAcc", ADD_ACC);
     row("q2 dbl", "dbl", DBL);
@@ -277,7 +284,8 @@ fn probe_q3_kernel_decides_parameter_order() {
 
     // MUTATION CONTROL at the same layer — otherwise the admit above is a
     // rubber stamp rather than a decision.
-    let bad = island("def sel (a b : Nat) : Nat := b\ntheorem selWrong (a b : Nat) : sel a b = a := rfl");
+    let bad =
+        island("def sel (a b : Nat) : Nat := b\ntheorem selWrong (a b : Nat) : sel a b = a := rfl");
     eprintln!(
         "ROW q3 mutation    | {}",
         if bad.is_err() { "REFUSED (good)" } else { "ADMITTED!!" }
@@ -355,7 +363,10 @@ fn probe_q5_the_threaded_unchanged_fixture_changed_lanes() {
     let plan = plan_clean_origin_body(&env, "thread").expect("thread plans on one lane or another");
     eprintln!("ROW q5 thread      | PLANS {:?}", plan.shape());
     assert!(
-        matches!(plan.shape(), trust_clean_origin::emit::CleanOriginShape::WellFoundedNatRec { .. }),
+        matches!(
+            plan.shape(),
+            trust_clean_origin::emit::CleanOriginShape::WellFoundedNatRec { .. }
+        ),
         "MEASURED 2026-08-26: after R3a the widened well-founded reader claims this body \
          before the inductive-projection fall-through sees it. If this ever reads \
          `InductiveProjection` again, the widening has narrowed and the reason must be \

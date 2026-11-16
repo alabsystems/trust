@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 
 use trust_binary_parse::Elf64;
 use trust_lift::{BinaryLiftOptions, Lifter, LocalLayout};
@@ -42,62 +42,34 @@ const UNRESOLVED_FIXTURE_SYMBOL: &str = "trust_fixture_unresolved";
 const UNRESOLVED_INDIRECT_BRANCH_GOLDEN: &str =
     include_str!("binary_unresolved_indirect_branch_golden.json");
 
-const X86_64_RET_ASM: &str = r#"
-    .text
-    .byte 0x90
-    .globl trust_fixture_return
-    .type trust_fixture_return,@function
-trust_fixture_return:
-    retq
-    .size trust_fixture_return, .-trust_fixture_return
-    .section .note.GNU-stack,"",@progbits
-"#;
+// Reproduced by tests/fixtures/binary_decomp/regenerate_inprocess_elf.py.
+const X86_64_RET_HEX: &str =
+    include_str!("../../../tests/fixtures/binary_decomp/x86_64-inprocess-return-elf.hex");
+const X86_64_RET_SHA256: &str = "395184f6f19c06bc80e2a8a2537fa09d8b9bda322625f57462aa7096312618e6";
 
-const X86_64_UNDECODABLE_ASM: &str = r#"
-    .text
-    .byte 0x90
-    .globl trust_fixture_undecodable
-    .type trust_fixture_undecodable,@function
-trust_fixture_undecodable:
-    retq
-    .byte 0xff
-    .size trust_fixture_undecodable, .-trust_fixture_undecodable
-    .section .note.GNU-stack,"",@progbits
-"#;
+// Reproduced by tests/fixtures/binary_decomp/regenerate_inprocess_elf.py.
+const X86_64_UNDECODABLE_HEX: &str =
+    include_str!("../../../tests/fixtures/binary_decomp/x86_64-inprocess-undecodable-elf.hex");
+const X86_64_UNDECODABLE_SHA256: &str =
+    "9fdc5b1a70449e0cccc679bd86216c3303418bc70ca34ac8c0931118b2b0e53f";
 
-const X86_64_UNSUPPORTED_ASM: &str = r#"
-    .text
-    .byte 0x90
-    .globl trust_fixture_unsupported
-    .type trust_fixture_unsupported,@function
-trust_fixture_unsupported:
-    .byte 0xcc
-    .size trust_fixture_unsupported, .-trust_fixture_unsupported
-    .section .note.GNU-stack,"",@progbits
-"#;
+// Reproduced by tests/fixtures/binary_decomp/regenerate_inprocess_elf.py.
+const X86_64_UNSUPPORTED_HEX: &str =
+    include_str!("../../../tests/fixtures/binary_decomp/x86_64-inprocess-unsupported-elf.hex");
+const X86_64_UNSUPPORTED_SHA256: &str =
+    "fddb277175970a80909ad94209aa2ad65075f7b06aacd42e2c501129048d12ef";
 
-const X86_64_UNRESOLVED_ASM: &str = r#"
-    .text
-    .byte 0x90
-    .globl trust_fixture_unresolved
-    .type trust_fixture_unresolved,@function
-trust_fixture_unresolved:
-    .byte 0xff, 0xe0
-    .size trust_fixture_unresolved, .-trust_fixture_unresolved
-    .section .note.GNU-stack,"",@progbits
-"#;
+// Reproduced by tests/fixtures/binary_decomp/regenerate_inprocess_elf.py.
+const X86_64_UNRESOLVED_HEX: &str =
+    include_str!("../../../tests/fixtures/binary_decomp/x86_64-inprocess-unresolved-elf.hex");
+const X86_64_UNRESOLVED_SHA256: &str =
+    "b4777436bb2151f9ce3ae81c03017bbe459dfc57d7a38974ef6c6ec09e130a2d";
 
-const AARCH64_EXCLUSIVE_ASM: &str = r#"
-    .arch armv8-a
-    .text
-    .globl trust_fixture_aarch64_exclusive
-    .type trust_fixture_aarch64_exclusive,%function
-trust_fixture_aarch64_exclusive:
-    ldaxr x0, [x0]
-    ret
-    .size trust_fixture_aarch64_exclusive, .-trust_fixture_aarch64_exclusive
-    .section .note.GNU-stack,"",@progbits
-"#;
+// Reproduced by tests/fixtures/binary_decomp/regenerate_inprocess_elf.py.
+const AARCH64_EXCLUSIVE_HEX: &str =
+    include_str!("../../../tests/fixtures/binary_decomp/aarch64-inprocess-exclusive-elf.hex");
+const AARCH64_EXCLUSIVE_SHA256: &str =
+    "b56002f3ea0f763766124340627a2cca717c776c9c913e463f0f0a6c3b51e742";
 
 #[derive(Clone, Copy)]
 struct FailClosedFixtureCase {
@@ -147,36 +119,93 @@ impl BinaryVcFamilyCounts {
     }
 }
 
-const X86_64_EXEC_ENTRY_ASM: &str = r#"
-    .text
-    .globl _start
-    .type _start,@function
-_start:
-    retq
-    .size _start, .-_start
-    .section .note.GNU-stack,"",@progbits
-"#;
+/// The function `e_entry` names in both default-entry fixtures. It is not
+/// `_start`: each fixture also holds a function named `_start` that is not the
+/// entry.
+const EXEC_ENTRY_SYMBOL: &str = "exec_entry";
 
-const AARCH64_EXEC_ENTRY_ASM: &str = r#"
-    .text
-    .globl _start
-    .type _start,%function
-_start:
-    ret
-    .size _start, .-_start
-    .section .note.GNU-stack,"",@progbits
-"#;
+/// A checked-in, sha-pinned ELF executable (ET_EXEC) for the default-entry
+/// lift tests. `.text` holds four functions, in address order:
+/// `decoy_before_entry` (the start of `.text`), `_start` (not the entry),
+/// `exec_entry` (`e_entry`) and `decoy_after_entry` (the end of `.text`).
+/// Selecting the first, lowest, last or highest function, the start or end of
+/// `.text`, or the function named `_start` therefore each lifts one of the
+/// other three functions (the decoys), not `exec_entry`. `exec_entry` is
+/// several distinct instructions with a conditional branch (three basic
+/// blocks), not a lone return.
+struct ExecEntryFixture {
+    file_name: &'static str,
+    hex: &'static str,
+    sha256: &'static str,
+    architecture: &'static str,
+    elf_machine: u16,
+    /// `e_entry`, the address of `exec_entry`.
+    entry: u64,
+    /// `exec_entry`'s bytes: every instruction, in order.
+    entry_bytes: &'static [u8],
+    /// Every function symbol and its address, in address order.
+    functions: [(&'static str, u64); 4],
+}
+
+/// One per architecture trust-lift lifts. Generated, and reproducible, by
+/// tests/fixtures/binary_decomp/regenerate_exec_entry_elf.sh (clang, LLD,
+/// `.comment` stripped; provenance in PROVENANCE.md beside it); a regenerated
+/// file must be re-pinned here. They were linked at test time by the host
+/// `cc`, which links an ELF executable only on Linux, so on any other host
+/// both tests skipped and passed without lifting anything.
+const EXEC_ENTRY_FIXTURES: [ExecEntryFixture; 2] = [
+    ExecEntryFixture {
+        file_name: "x86_64-exec-entry.elf",
+        hex: include_str!("../../../tests/fixtures/binary_decomp/x86_64-exec-entry-elf.hex"),
+        sha256: "27dd09b8fe244b0d3c364ef80d7db0d4df58ab199edc2743463adab2119f68a5",
+        architecture: "x86-64",
+        elf_machine: 0x3e,
+        entry: 0x201129,
+        // mov eax,edi; add eax,esi; shl eax,3; sub eax,7; test eax,eax;
+        // je +2; xor edx,edx; ret
+        entry_bytes: &[
+            0x89, 0xf8, 0x01, 0xf0, 0xc1, 0xe0, 0x03, 0x83, 0xe8, 0x07, 0x85, 0xc0, 0x74, 0x02,
+            0x31, 0xd2, 0xc3,
+        ],
+        functions: [
+            ("decoy_before_entry", 0x201120),
+            ("_start", 0x201123),
+            (EXEC_ENTRY_SYMBOL, 0x201129),
+            ("decoy_after_entry", 0x20113a),
+        ],
+    },
+    ExecEntryFixture {
+        file_name: "aarch64-exec-entry.elf",
+        hex: include_str!("../../../tests/fixtures/binary_decomp/aarch64-exec-entry-elf.hex"),
+        sha256: "4165c384e83de63946de826f8609b80ed5aefba72355e1770673465b2d506880",
+        architecture: "AArch64",
+        elf_machine: 0xb7,
+        entry: 0x210130,
+        // add w0,w0,w1; lsl w0,w0,#3; sub w0,w0,#7; cbz w0,+8; eor w2,w2,w2; ret
+        entry_bytes: &[
+            0x00, 0x00, 0x01, 0x0b, 0x00, 0x70, 0x1d, 0x53, 0x00, 0x1c, 0x00, 0x51, 0x40, 0x00,
+            0x00, 0x34, 0x42, 0x00, 0x02, 0x4a, 0xc0, 0x03, 0x5f, 0xd6,
+        ],
+        functions: [
+            ("decoy_before_entry", 0x210120),
+            ("_start", 0x210128),
+            (EXEC_ENTRY_SYMBOL, 0x210130),
+            ("decoy_after_entry", 0x210148),
+        ],
+    },
+];
+
+/// The basic blocks of `exec_entry` in both fixtures: the conditional branch
+/// ends the first, the register clear it skips is the second, and the return
+/// both reach is the third.
+const EXEC_ENTRY_BLOCKS: usize = 3;
 
 #[test]
 fn test_generated_elf_parse_lift_trust_ir_and_binary_vcs() {
     let tmp = tempfile::tempdir().expect("create temp fixture dir");
-    let elf_path = match build_x86_64_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = build_x86_64_elf_fixture(tmp.path()).unwrap_or_else(|reason| {
+        panic!("checked-in in-process fixture could not be materialized: {reason}")
+    });
 
     let bytes = fs::read(&elf_path)
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", elf_path.display()));
@@ -259,13 +288,9 @@ fn test_generated_elf_parse_lift_trust_ir_and_binary_vcs() {
 #[test]
 fn test_binary_lift_fails_closed_on_undecodable_function_bytes() {
     let tmp = tempfile::tempdir().expect("create temp undecodable fixture dir");
-    let elf_path = match build_x86_64_undecodable_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = build_x86_64_undecodable_elf_fixture(tmp.path()).unwrap_or_else(|reason| {
+        panic!("checked-in in-process fixture could not be materialized: {reason}")
+    });
 
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     assert_strict_and_best_effort_lift_failure(
@@ -278,13 +303,9 @@ fn test_binary_lift_fails_closed_on_undecodable_function_bytes() {
 #[test]
 fn test_binary_lift_fails_closed_on_unsupported_instruction_semantics() {
     let tmp = tempfile::tempdir().expect("create temp unsupported fixture dir");
-    let elf_path = match build_x86_64_unsupported_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = build_x86_64_unsupported_elf_fixture(tmp.path()).unwrap_or_else(|reason| {
+        panic!("checked-in in-process fixture could not be materialized: {reason}")
+    });
 
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     // Trust: lifter no longer phrases failures as "unsupported opcode"; the
@@ -302,13 +323,9 @@ fn test_binary_lift_fails_closed_on_unsupported_instruction_semantics() {
 #[test]
 fn test_binary_lift_fails_closed_on_unresolved_indirect_control_flow() {
     let tmp = tempfile::tempdir().expect("create temp unresolved fixture dir");
-    let elf_path = match build_x86_64_unresolved_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = build_x86_64_unresolved_elf_fixture(tmp.path()).unwrap_or_else(|reason| {
+        panic!("checked-in in-process fixture could not be materialized: {reason}")
+    });
 
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     assert_strict_and_best_effort_lift_failure(
@@ -321,13 +338,9 @@ fn test_binary_lift_fails_closed_on_unresolved_indirect_control_flow() {
 #[test]
 fn test_aarch64_exclusive_lift_blocker_names_atomic_exclusive_evidence() {
     let tmp = tempfile::tempdir().expect("create temp AArch64 exclusive fixture dir");
-    let elf_path = match build_aarch64_exclusive_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = build_aarch64_exclusive_elf_fixture(tmp.path()).unwrap_or_else(|reason| {
+        panic!("checked-in in-process fixture could not be materialized: {reason}")
+    });
 
     let bytes = read_checked_elf_fixture(&elf_path, 0xb7, "AArch64 exclusive fixture");
     let elf = Elf64::parse(&bytes).expect("AArch64 fixture should parse");
@@ -346,6 +359,8 @@ fn test_aarch64_exclusive_lift_blocker_names_atomic_exclusive_evidence() {
 
 #[test]
 fn test_unresolved_indirect_branch_golden_json_stays_rejected_not_proof_grade() {
+    // First, so a missing TRUST_TARGO_TRUST_BIN fails before any fixture is built.
+    let targo_trust = require_targo_trust_binary();
     let golden: serde_json::Value = serde_json::from_str(UNRESOLVED_INDIRECT_BRANCH_GOLDEN)
         .expect("unresolved indirect branch golden JSON should parse");
     assert_eq!(golden["fixture_family"], "unresolved_indirect_branch");
@@ -359,13 +374,7 @@ fn test_unresolved_indirect_branch_golden_json_stays_rejected_not_proof_grade() 
         .collect::<Vec<_>>();
 
     let tmp = tempfile::tempdir().expect("create temp unresolved golden fixture dir");
-    let elf_path = match build_x86_64_unresolved_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = require_fixture(build_x86_64_unresolved_elf_fixture(tmp.path()));
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     assert_strict_and_best_effort_lift_failure(
         &bytes,
@@ -373,15 +382,6 @@ fn test_unresolved_indirect_branch_golden_json_stays_rejected_not_proof_grade() 
         &expected_fragments,
     );
 
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
     let entry = function_entry_for_symbol(&bytes, UNRESOLVED_FIXTURE_SYMBOL);
     let entry_arg = format!("0x{entry:x}");
     let output = Command::new(&targo_trust)
@@ -417,13 +417,9 @@ fn test_unresolved_indirect_branch_golden_json_stays_rejected_not_proof_grade() 
 #[test]
 fn test_binary_vcs_fail_closed_on_unknown_memory_read_fact() {
     let tmp = tempfile::tempdir().expect("create temp unknown-memory fixture dir");
-    let elf_path = match build_x86_64_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = build_x86_64_elf_fixture(tmp.path()).unwrap_or_else(|reason| {
+        panic!("checked-in in-process fixture could not be materialized: {reason}")
+    });
 
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     let entry = function_entry_for_symbol(&bytes, FIXTURE_SYMBOL);
@@ -481,7 +477,7 @@ fn test_macho_aarch64_fixture_gate_is_explicit_in_elf_only_integration_tests() {
     let skip_reason = macho_aarch64_skip_reason();
     assert!(skip_reason.contains("Mach-O/AArch64"), "skip reason: {skip_reason}");
     assert!(skip_reason.contains("trust-lift"), "skip reason: {skip_reason}");
-    eprintln!("SKIP: {skip_reason}");
+    eprintln!("ELF-only integration gate: {skip_reason}");
 }
 
 fn assert_strict_and_best_effort_lift_failure(
@@ -2217,6 +2213,66 @@ fn module_summary_projection(artifact: &serde_json::Value) -> serde_json::Value 
     })
 }
 
+/// A lifted function is a machine-state transformer: its return place `_0` is
+/// typed `()` and the ABI result is the final value of the return-register
+/// local (RAX / X0), not a returned value (trust-lift 887ac8352d). So every
+/// `Return` in the lowered module carries no values, matching a function type
+/// that returns nothing. Before 887ac8352d `_0` was declared `u64` and never
+/// written, and each `Return` loaded that uninitialised place and returned it
+/// from a function whose type returns nothing -- the fifth instruction the
+/// x86_64 load golden used to pin.
+fn assert_lifted_module_returns_are_untyped(artifact: &serde_json::Value, context: &str) {
+    let module = &artifact["module"];
+    let func_types = module["func_types"].as_array().expect("module func types");
+    let functions = module["functions"].as_array().expect("module functions");
+    assert!(!functions.is_empty(), "{context}: lowered module has no functions");
+    for function in functions {
+        let ty = function["ty"].as_u64().expect("module function type index") as usize;
+        let returns = func_types[ty]["returns"].as_array().expect("func type returns");
+        assert!(
+            returns.is_empty(),
+            "{context}: a lifted function's type must return nothing, got {returns:?}"
+        );
+        let mut return_count = 0;
+        for block in function["blocks"].as_array().expect("module blocks") {
+            for node in block["body"].as_array().expect("module block body") {
+                if let Some(ret) = node["inst"].get("Return") {
+                    return_count += 1;
+                    assert_eq!(
+                        ret["values"].as_array().map(Vec::len),
+                        Some(0),
+                        "{context}: `Return` must carry no values (the ABI result lives in the \
+                         return-register local, not the `()` return place): {node}"
+                    );
+                }
+            }
+        }
+        assert!(return_count > 0, "{context}: lowered function has no `Return`");
+    }
+}
+
+/// The x86_64 load's data path survives lowering: exactly one preserved
+/// `trust_symbolic.formula` (the 8-byte little-endian read of `[rdi]`) and a
+/// `Copy` of its result (the RAX write). Dropping `_0`'s read must not drop this.
+fn assert_x86_64_load_module_keeps_the_rax_write(artifact: &serde_json::Value, context: &str) {
+    let body = artifact["module"]["functions"][0]["blocks"][0]["body"]
+        .as_array()
+        .expect("module block body");
+    let formulas: Vec<_> = body
+        .iter()
+        .filter(|node| {
+            node["inst"]["DialectOp"]["dialect"] == "trust_symbolic"
+                && node["inst"]["DialectOp"]["op"] == "formula"
+        })
+        .collect();
+    assert_eq!(formulas.len(), 1, "{context}: one preserved load formula: {body:?}");
+    let formula_result = formulas[0]["results"][0].clone();
+    assert!(
+        body.iter().any(|node| node["inst"]["Copy"]["operand"] == formula_result),
+        "{context}: the load formula's value must be written to RAX by a `Copy`: {body:?}"
+    );
+}
+
 fn lifted_block_stmt_kinds(lifted_body: &serde_json::Value) -> Vec<Vec<String>> {
     lifted_body["blocks"]
         .as_array()
@@ -2326,121 +2382,327 @@ fn fail_closed_fixture_cases() -> [FailClosedFixtureCase; 3] {
 }
 
 #[test]
-fn test_host_executable_default_entry_lifts_to_trust_ir_and_vcs() {
+fn test_checked_in_executable_default_entry_lifts_to_trust_ir_and_vcs() {
     let tmp = tempfile::tempdir().expect("create temp executable fixture dir");
-    let fixture = match build_host_executable_fixture(tmp.path()) {
-        Ok(fixture) => fixture,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    for fixture in &EXEC_ENTRY_FIXTURES {
+        let (_, bytes) = materialize_exec_entry_fixture(tmp.path(), fixture);
 
-    let bytes = fs::read(&fixture.path)
-        .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", fixture.path.display()));
-    let elf = Elf64::parse(&bytes).unwrap_or_else(|e| {
-        panic!("failed to parse generated ELF {}: {e}", fixture.path.display())
-    });
-    assert_ne!(elf.header.e_type, 1, "fixture must be linked, not relocatable");
-    assert_eq!(elf.header.e_machine, fixture.elf_machine);
-    assert_ne!(elf.entry_point(), 0, "linked executable should have a default entry point");
+        let lifted_binary =
+            trust_lift::lift_binary_to_trust_ir(&bytes, BinaryLiftOptions::default())
+                .expect("default-entry public binary-to-TrustIr API should lift executable");
+        assert_eq!(lifted_binary.format, "ELF");
+        assert_eq!(lifted_binary.architecture, fixture.architecture);
+        assert_eq!(lifted_binary.entry_point, Some(fixture.entry));
+        assert!(
+            lifted_binary.failures.is_empty(),
+            "strict default lift should not collect failures"
+        );
+        assert_eq!(
+            lifted_binary.functions.len(),
+            1,
+            "the default entry selects `{EXEC_ENTRY_SYMBOL}` alone"
+        );
 
-    let lifted_binary = trust_lift::lift_binary_to_trust_ir(&bytes, BinaryLiftOptions::default())
-        .expect("default-entry public binary-to-TrustIr API should lift executable");
-    assert_eq!(lifted_binary.format, "ELF");
-    assert_eq!(lifted_binary.architecture, fixture.architecture);
-    assert_eq!(lifted_binary.entry_point, Some(elf.entry_point()));
-    assert!(lifted_binary.failures.is_empty(), "strict default lift should not collect failures");
-    assert!(
-        !lifted_binary.functions.is_empty(),
-        "default-entry executable lift should produce at least one function"
-    );
-
-    let lifted = &lifted_binary.functions[0];
-    assert_eq!(lifted.entry_point, elf.entry_point());
-    assert_eq!(lifted.name, "_start");
-    assert!(!lifted.trust_ir_body.blocks.is_empty(), "lifted entry should contain TrustIr blocks");
-    assert!(
-        lifted
-            .trust_ir_body
-            .blocks
+        let lifted = &lifted_binary.functions[0];
+        assert_eq!(lifted.entry_point, fixture.entry);
+        assert_eq!(lifted.name, EXEC_ENTRY_SYMBOL, "the function at e_entry, not a decoy");
+        assert_eq!(
+            lifted.trust_ir_body.blocks.len(),
+            EXEC_ENTRY_BLOCKS,
+            "{}: the conditional branch splits `{EXEC_ENTRY_SYMBOL}` into three blocks",
+            fixture.file_name
+        );
+        assert!(
+            lifted
+                .trust_ir_body
+                .blocks
+                .iter()
+                .any(|block| matches!(block.terminator, Terminator::Return)),
+            "lifted executable entry should contain a return terminator"
+        );
+        let lifted_bytes: Vec<u8> = lifted
+            .annotations
             .iter()
-            .any(|block| matches!(block.terminator, Terminator::Return)),
-        "lifted executable entry should contain a return terminator"
-    );
+            .flat_map(|annotation| annotation.instruction_bytes.iter().copied())
+            .collect();
+        assert_eq!(
+            lifted_bytes, fixture.entry_bytes,
+            "every instruction of `{EXEC_ENTRY_SYMBOL}` is lifted, in order"
+        );
 
-    let vcs = trust_vcgen::lift_adapter::generate_binary_vcs(lifted);
-    assert!(!vcs.is_empty(), "strict default-entry executable lift should produce binary VCs");
-    assert!(vcs.iter().all(|vc| vc.function == lifted.name));
+        let vcs = trust_vcgen::lift_adapter::generate_binary_vcs(lifted);
+        assert!(!vcs.is_empty(), "strict default-entry executable lift should produce binary VCs");
+        assert!(vcs.iter().all(|vc| vc.function == lifted.name));
+
+        // The decoys and `_start` are real, liftable functions: lifting every
+        // symbol takes all four. A selection that lands on one of them lifts
+        // that function, which the name, address and bytes above tell apart
+        // from `exec_entry`.
+        let all = trust_lift::lift_binary_to_trust_ir(&bytes, BinaryLiftOptions::all_functions())
+            .expect("all-functions lift of the default-entry fixture");
+        assert!(all.failures.is_empty(), "{}: every function lifts", fixture.file_name);
+        let all_functions: Vec<(&str, u64)> = all
+            .functions
+            .iter()
+            .map(|function| (function.name.as_str(), function.entry_point))
+            .collect();
+        assert_eq!(
+            all_functions, fixture.functions,
+            "{} must hold three liftable decoys around `{EXEC_ENTRY_SYMBOL}`",
+            fixture.file_name
+        );
+        eprintln!(
+            "lifted {} ({}): {} at {:#x}, {} instruction(s), {} block(s), {} VC(s); \
+             all functions: {}",
+            fixture.file_name,
+            fixture.architecture,
+            lifted.name,
+            lifted.entry_point,
+            lifted.annotations.len(),
+            lifted.trust_ir_body.blocks.len(),
+            vcs.len(),
+            all_functions
+                .iter()
+                .map(|(name, entry)| format!("{name} at {entry:#x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 }
 
+/// `targo-trust lift <fixture> --json` with the DEFAULT entry, for both
+/// architectures. Beyond the header fields (which a program could read off the
+/// 64-byte ELF header), it pins what a lift of `e_entry` produces: one
+/// function, `exec_entry`, at `e_entry` (not a decoy before or after it, nor
+/// the function named `_start`), whose instruction provenance covers its bytes
+/// in order, and whose blocks, statements, instruction provenance and VC count
+/// equal the in-process lift of the same bytes. Two things still pass without
+/// targo-trust lifting `e_entry`: a program that carries these two fixtures'
+/// lift results (their counts and instruction boundaries) and prints them, and
+/// a selection rule other than `e_entry` that happens to pick `exec_entry`
+/// here (say, "the third function"). No black-box assertion on two fixed files
+/// rules those out.
 #[test]
 fn test_targo_trust_lift_json_smoke_for_default_entry_executable() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create temp executable fixture dir");
-    let fixture = match build_host_executable_fixture(tmp.path()) {
-        Ok(fixture) => fixture,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
+    let mut lifted = Vec::new();
+    for fixture in &EXEC_ENTRY_FIXTURES {
+        let (path, bytes) = materialize_exec_entry_fixture(tmp.path(), fixture);
+        let expected_functions = expected_default_entry_lift_functions(fixture, &bytes);
+        let output = Command::new(&targo_trust)
+            .arg("lift")
+            .arg(&path)
+            .arg("--json")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", targo_trust.display()));
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "targo trust lift should succeed for default-entry fixture {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            fixture.file_name
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("stdout was not JSON: {e}\n{stdout}"));
+        let entry_hex = format!("{:#x}", fixture.entry);
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["format"], "ELF");
+        assert_eq!(json["architecture"], fixture.architecture);
+        assert_eq!(
+            json["entry"],
+            serde_json::Value::Null,
+            "smoke test should exercise default entry"
+        );
+        assert_eq!(
+            json["binary_entry"].as_str(),
+            Some(entry_hex.as_str()),
+            "report should expose the parsed binary entry"
+        );
+        assert_eq!(json["strict"], true);
+        assert_eq!(json["binary"].as_str(), Some(path.display().to_string().as_str()));
+        assert_eq!(json["selection"], "entry");
+
+        // What a lift of e_entry produces.
+        assert_eq!(json["functions_lifted"], 1, "the default entry is `{EXEC_ENTRY_SYMBOL}` alone");
+        let function = &json["functions"][0];
+        assert_eq!(function["name"], EXEC_ENTRY_SYMBOL, "the function at e_entry, not a decoy");
+        assert_eq!(function["entry"].as_str(), Some(entry_hex.as_str()));
+        let reported_bytes: Vec<u64> = function["instruction_provenance"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no instruction_provenance array: {function}"))
+            .iter()
+            .flat_map(|origin| {
+                origin["instruction_bytes"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("no instruction_bytes array: {origin}"))
+                    .iter()
+                    .map(|byte| byte.as_u64().expect("instruction byte"))
+            })
+            .collect();
+        assert_eq!(
+            reported_bytes,
+            fixture.entry_bytes.iter().map(|&byte| u64::from(byte)).collect::<Vec<_>>(),
+            "the lifted instructions must be `{EXEC_ENTRY_SYMBOL}`'s bytes, in order"
+        );
+        assert_eq!(
+            project_lift_report_functions(&json["functions"]),
+            expected_functions,
+            "targo-trust must report the in-process lift of {}'s default entry",
+            fixture.file_name
+        );
+        for total in ["blocks", "statements", "vcs"] {
+            let expected: u64 = expected_functions
+                .as_array()
+                .expect("expected functions are an array")
+                .iter()
+                .map(|function| function[total].as_u64().expect("expected count"))
+                .sum();
+            assert_eq!(json[total], expected, "report total `{total}`");
         }
-    };
+        assert!(json["vcs"].as_u64().unwrap_or(0) >= 1);
+        assert_eq!(json["unsupported"], 0);
+        assert_eq!(json["failures"], 0);
+        assert_eq!(json["unsupported_items"], serde_json::json!([]));
+        assert_eq!(json["failure_items"], serde_json::json!([]));
+        eprintln!(
+            "targo-trust lift {} --json: status {} architecture {} entry {} binary_entry {} \
+             functions_lifted {} function {} at {} instructions {} bytes {} blocks {} \
+             statements {} vcs {}",
+            fixture.file_name,
+            json["status"],
+            json["architecture"],
+            json["entry"],
+            json["binary_entry"],
+            json["functions_lifted"],
+            function["name"],
+            function["entry"],
+            function["instruction_provenance"].as_array().map_or(0, Vec::len),
+            reported_bytes.len(),
+            json["blocks"],
+            json["statements"],
+            json["vcs"]
+        );
+        lifted.push(fixture.architecture);
+    }
+    assert_eq!(lifted, ["x86-64", "AArch64"], "both default-entry fixtures must be lifted");
+}
 
-    let output = Command::new(&targo_trust)
-        .arg("lift")
-        .arg(&fixture.path)
-        .arg("--json")
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {}: {e}", targo_trust.display()));
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "targo trust lift should succeed for default-entry fixture\nstdout:\n{stdout}\nstderr:\n{stderr}"
+/// The `functions` a `targo-trust lift --json` report must hold for `fixture`'s
+/// default entry, computed by lifting the same bytes in process: name, entry,
+/// blocks, statements, VC count (`generate_binary_vcs`, which targo-trust
+/// counts) and per-instruction provenance. Panics unless that lift is
+/// `exec_entry` alone, in `EXEC_ENTRY_BLOCKS` blocks, with instruction
+/// provenance that tiles `fixture.entry_bytes` from `e_entry`, and at least one
+/// VC, so the expectation is never empty or trivial.
+fn expected_default_entry_lift_functions(
+    fixture: &ExecEntryFixture,
+    bytes: &[u8],
+) -> serde_json::Value {
+    let lifted = trust_lift::lift_binary_to_trust_ir(bytes, BinaryLiftOptions::default())
+        .unwrap_or_else(|e| panic!("in-process default-entry lift of {}: {e}", fixture.file_name));
+    assert!(lifted.failures.is_empty(), "{}: in-process lift failures", fixture.file_name);
+    let functions: Vec<serde_json::Value> = lifted
+        .functions
+        .iter()
+        .map(|function| {
+            serde_json::json!({
+                "name": function.name,
+                "entry": format!("{:#x}", function.entry_point),
+                "blocks": function.trust_ir_body.blocks.len(),
+                "statements": function
+                    .trust_ir_body
+                    .blocks
+                    .iter()
+                    .map(|block| block.stmts.len())
+                    .sum::<usize>(),
+                "vcs": trust_vcgen::lift_adapter::generate_binary_vcs(function).len(),
+                "instruction_provenance": function
+                    .annotations
+                    .iter()
+                    .map(|annotation| {
+                        serde_json::json!({
+                            "function_entry": function.entry_point,
+                            "instruction_address": annotation.binary_offset,
+                            "instruction_size": annotation.instruction_size,
+                            "encoding": annotation.encoding,
+                            "instruction_bytes": annotation.instruction_bytes,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let name = fixture.file_name;
+    assert_eq!(functions.len(), 1, "{name}: in-process lift is not one function");
+    assert_eq!(functions[0]["name"], EXEC_ENTRY_SYMBOL);
+    assert_eq!(functions[0]["entry"].as_str(), Some(format!("{:#x}", fixture.entry).as_str()));
+    assert_eq!(functions[0]["blocks"], EXEC_ENTRY_BLOCKS, "{name}: `{EXEC_ENTRY_SYMBOL}` blocks");
+    let origins = functions[0]["instruction_provenance"].as_array().expect("provenance array");
+    assert!(origins.len() > 1, "{name}: `{EXEC_ENTRY_SYMBOL}` is several instructions");
+    let mut address = fixture.entry;
+    let mut tiled = Vec::new();
+    for origin in origins {
+        assert_eq!(origin["function_entry"], fixture.entry, "{name}: provenance function");
+        assert_eq!(origin["instruction_address"], address, "{name}: instructions are contiguous");
+        let size = origin["instruction_size"].as_u64().expect("instruction size");
+        let instruction = origin["instruction_bytes"].as_array().expect("instruction bytes");
+        assert_eq!(instruction.len() as u64, size, "{name}: instruction size at {address:#x}");
+        tiled.extend(instruction.iter().map(|byte| byte.as_u64().expect("byte")));
+        address += size;
+    }
+    assert_eq!(
+        tiled,
+        fixture.entry_bytes.iter().map(|&byte| u64::from(byte)).collect::<Vec<_>>(),
+        "{name}: the in-process provenance must tile `{EXEC_ENTRY_SYMBOL}`'s bytes"
     );
+    assert!(functions[0]["vcs"].as_u64().unwrap_or(0) >= 1, "{name}: no VCs");
+    serde_json::Value::Array(functions)
+}
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("stdout was not JSON: {e}\n{stdout}"));
-    assert_eq!(json["status"], "ok");
-    assert_eq!(json["format"], "ELF");
-    assert_eq!(json["architecture"], fixture.architecture);
-    assert_eq!(json["entry"], serde_json::Value::Null, "smoke test should exercise default entry");
-    assert!(json["binary_entry"].as_str().is_some(), "report should expose parsed binary entry");
-    assert_eq!(json["strict"], true);
-    assert!(json["functions_lifted"].as_u64().unwrap_or(0) >= 1);
-    assert!(json["vcs"].as_u64().unwrap_or(0) >= 1);
+/// The fields of a lift report's `functions` that
+/// `expected_default_entry_lift_functions` computes; a missing field becomes
+/// `null` and so mismatches.
+fn project_lift_report_functions(functions: &serde_json::Value) -> serde_json::Value {
+    let functions = functions
+        .as_array()
+        .unwrap_or_else(|| panic!("lift report `functions` is not an array: {functions}"));
+    let project_origin = |origin: &serde_json::Value| {
+        serde_json::json!({
+            "function_entry": origin["function_entry"],
+            "instruction_address": origin["instruction_address"],
+            "instruction_size": origin["instruction_size"],
+            "encoding": origin["encoding"],
+            "instruction_bytes": origin["instruction_bytes"],
+        })
+    };
+    let projected = functions
+        .iter()
+        .map(|function| {
+            serde_json::json!({
+                "name": function["name"],
+                "entry": function["entry"],
+                "blocks": function["blocks"],
+                "statements": function["statements"],
+                "vcs": function["vcs"],
+                "instruction_provenance": function["instruction_provenance"]
+                    .as_array()
+                    .map(|origins| origins.iter().map(project_origin).collect::<Vec<_>>()),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(projected)
 }
 
 #[test]
 fn test_targo_trust_verify_binary_json_accepts_ay_solver_route_without_proof_grade_claim() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create temp fixture dir");
-    let elf_path = match build_x86_64_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = require_fixture(build_x86_64_elf_fixture(tmp.path()));
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     let entry = function_entry_for_symbol(&bytes, FIXTURE_SYMBOL);
     let entry_arg = format!("0x{entry:x}");
@@ -2546,24 +2808,10 @@ fn test_targo_trust_verify_binary_json_accepts_ay_solver_route_without_proof_gra
 
 #[test]
 fn test_targo_trust_decompile_trust_ir_json_reports_partial_binary_only_shape() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create temp fixture dir");
-    let elf_path = match build_x86_64_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = require_fixture(build_x86_64_elf_fixture(tmp.path()));
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     let entry = function_entry_for_symbol(&bytes, FIXTURE_SYMBOL);
     let entry_arg = format!("0x{entry:x}");
@@ -2628,6 +2876,7 @@ fn test_targo_trust_decompile_trust_ir_json_reports_partial_binary_only_shape() 
         .unwrap_or_else(|e| panic!("TrustIr output_content was not JSON: {e}\n{output_content}"));
     assert_decompile_release_gate_blocker_class_coverage(&json, &artifact, &entry_arg);
     assert_no_proof_grade_trust_fields(&artifact, "partial TrustIr output_content");
+    assert_lifted_module_returns_are_untyped(&artifact, "lone `retq` TrustIr module");
     assert_eq!(artifact["trust_level"], "Partial");
     assert_ne!(artifact["trust_level"], "ProofGrade");
     let expected_def_path = format!("binary::{FIXTURE_SYMBOL}");
@@ -2651,15 +2900,7 @@ fn test_targo_trust_decompile_trust_ir_json_reports_partial_binary_only_shape() 
 #[cfg(unix)]
 #[test]
 fn test_targo_trust_decompile_trust_ir_release_transcript_out_real_selected_slice_fails_closed() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create selected-slice release transcript fixture dir");
     let elf_path = materialize_hex_fixture(
@@ -2822,15 +3063,7 @@ fn test_targo_trust_decompile_trust_ir_release_transcript_out_real_selected_slic
 #[cfg(unix)]
 #[test]
 fn test_targo_trust_convert_trust_cg_release_transcript_attempt_assembles_selected_slice_bundle() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create selected-slice release transcript fixture dir");
     let elf_path = materialize_hex_fixture(
@@ -3057,24 +3290,10 @@ fn test_targo_trust_convert_trust_cg_release_transcript_attempt_assembles_select
 
 #[test]
 fn test_targo_trust_decompile_rust_json_reports_exploratory_text_only_shape() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create temp fixture dir");
-    let elf_path = match build_x86_64_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = require_fixture(build_x86_64_elf_fixture(tmp.path()));
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     let entry = function_entry_for_symbol(&bytes, FIXTURE_SYMBOL);
     let entry_arg = format!("0x{entry:x}");
@@ -3155,24 +3374,10 @@ fn test_targo_trust_decompile_rust_json_reports_exploratory_text_only_shape() {
 
 #[test]
 fn test_targo_trust_convert_trust_cg_json_reports_inspectable_rejected_gate() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create temp fixture dir");
-    let elf_path = match build_x86_64_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = require_fixture(build_x86_64_elf_fixture(tmp.path()));
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     let entry = function_entry_for_symbol(&bytes, FIXTURE_SYMBOL);
     let entry_arg = format!("0x{entry:x}");
@@ -3265,24 +3470,10 @@ fn test_targo_trust_convert_trust_cg_json_reports_inspectable_rejected_gate() {
 
 #[test]
 fn test_targo_trust_convert_trust_cg_rejects_after_partial_trust_ir_decompile_success() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create temp fixture dir");
-    let elf_path = match build_x86_64_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = require_fixture(build_x86_64_elf_fixture(tmp.path()));
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     let entry = function_entry_for_symbol(&bytes, FIXTURE_SYMBOL);
     let entry_arg = format!("0x{entry:x}");
@@ -3433,15 +3624,7 @@ fn test_targo_trust_convert_trust_cg_rejects_after_partial_trust_ir_decompile_su
 #[test]
 fn test_checked_in_x86_64_load_decompile_canonical_trust_ir_then_convert_trust_cg_golden_blockers()
 {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create checked-in x86_64 load fixture dir");
     let elf_path = materialize_hex_fixture(
@@ -3520,6 +3703,15 @@ fn test_checked_in_x86_64_load_decompile_canonical_trust_ir_then_convert_trust_c
             .unwrap_or_else(|e| panic!("could not write regenerated golden to {write_to}: {e}"));
         eprintln!("REGENERATED GOLDEN: {write_to}");
     }
+    let decompiled_artifact: serde_json::Value = serde_json::from_str(
+        decompile_json["output_content"].as_str().expect("decompile TrustIr output_content"),
+    )
+    .expect("decompile TrustIr output_content should be JSON");
+    assert_lifted_module_returns_are_untyped(&decompiled_artifact, "x86_64 load TrustIr module");
+    assert_x86_64_load_module_keeps_the_rax_write(
+        &decompiled_artifact,
+        "x86_64 load TrustIr module",
+    );
     assert_production_positive_release_gate_scaffold_rejected(
         &observed["convert_trust_cg"]["positive_release_gate_scaffold"],
         "checked-in x86_64 load trust_cg positive release-gate scaffold",
@@ -3538,32 +3730,13 @@ fn test_checked_in_x86_64_load_decompile_canonical_trust_ir_then_convert_trust_c
 
 #[test]
 fn test_targo_trust_convert_trust_cg_keeps_source_backprop_rejected_with_checked_cert_readback() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create checked-certificate readback fixture dir");
     let cert_dispatch_id = "source-backprop-readback:vc0";
-    let cert_path = match build_checked_certificate_readback_fixture(tmp.path(), cert_dispatch_id) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
-    let elf_path = match build_x86_64_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let cert_path =
+        require_fixture(build_checked_certificate_readback_fixture(tmp.path(), cert_dispatch_id));
+    let elf_path = require_fixture(build_x86_64_elf_fixture(tmp.path()));
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     let entry = function_entry_for_symbol(&bytes, FIXTURE_SYMBOL);
     let entry_arg = format!("0x{entry:x}");
@@ -3630,27 +3803,13 @@ fn test_targo_trust_convert_trust_cg_keeps_source_backprop_rejected_with_checked
 
 #[test]
 fn test_targo_trust_verify_binary_json_release_gate_rejects_unliftable_fixtures() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     for case in fail_closed_fixture_cases() {
         for allow_unsupported in [false, true] {
             let tmp = tempfile::tempdir()
                 .unwrap_or_else(|e| panic!("create temp {} fixture dir: {e}", case.label));
-            let elf_path = match (case.build)(tmp.path()) {
-                Ok(path) => path,
-                Err(reason) => {
-                    eprintln!("SKIP: {reason}");
-                    return;
-                }
-            };
+            let elf_path = require_fixture((case.build)(tmp.path()));
             let bytes = read_checked_x86_64_elf_fixture(&elf_path);
             let entry = function_entry_for_symbol(&bytes, case.symbol);
             let entry_arg = format!("0x{entry:x}");
@@ -3689,27 +3848,13 @@ fn test_targo_trust_verify_binary_json_release_gate_rejects_unliftable_fixtures(
 
 #[test]
 fn test_targo_trust_decompile_trust_ir_json_release_gate_rejects_unliftable_fixtures() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     for case in fail_closed_fixture_cases() {
         for allow_unsupported in [false, true] {
             let tmp = tempfile::tempdir()
                 .unwrap_or_else(|e| panic!("create temp {} fixture dir: {e}", case.label));
-            let elf_path = match (case.build)(tmp.path()) {
-                Ok(path) => path,
-                Err(reason) => {
-                    eprintln!("SKIP: {reason}");
-                    return;
-                }
-            };
+            let elf_path = require_fixture((case.build)(tmp.path()));
             let bytes = read_checked_x86_64_elf_fixture(&elf_path);
             let entry = function_entry_for_symbol(&bytes, case.symbol);
             let entry_arg = format!("0x{entry:x}");
@@ -3748,26 +3893,12 @@ fn test_targo_trust_decompile_trust_ir_json_release_gate_rejects_unliftable_fixt
 
 #[test]
 fn test_targo_trust_decompile_rust_json_rejects_unliftable_strict_fixtures() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     for case in fail_closed_fixture_cases() {
         let tmp = tempfile::tempdir()
             .unwrap_or_else(|e| panic!("create temp {} fixture dir: {e}", case.label));
-        let elf_path = match (case.build)(tmp.path()) {
-            Ok(path) => path,
-            Err(reason) => {
-                eprintln!("SKIP: {reason}");
-                return;
-            }
-        };
+        let elf_path = require_fixture((case.build)(tmp.path()));
         let bytes = read_checked_x86_64_elf_fixture(&elf_path);
         let entry = function_entry_for_symbol(&bytes, case.symbol);
         let entry_arg = format!("0x{entry:x}");
@@ -3940,24 +4071,10 @@ fn assert_decompile_rust_fail_closed_json(
 
 #[test]
 fn test_targo_trust_lift_json_fails_closed_on_unsupported_instruction_semantics() {
-    let targo_trust = match find_targo_trust_binary() {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "SKIP: targo-trust binary not found; build it with `cargo build --manifest-path targo-trust/Cargo.toml`"
-            );
-            return;
-        }
-    };
+    let targo_trust = require_targo_trust_binary();
 
     let tmp = tempfile::tempdir().expect("create temp unsupported fixture dir");
-    let elf_path = match build_x86_64_unsupported_elf_fixture(tmp.path()) {
-        Ok(path) => path,
-        Err(reason) => {
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    let elf_path = require_fixture(build_x86_64_unsupported_elf_fixture(tmp.path()));
     let bytes = read_checked_x86_64_elf_fixture(&elf_path);
     let entry = function_entry_for_symbol(&bytes, UNSUPPORTED_FIXTURE_SYMBOL);
     let entry_arg = format!("0x{entry:x}");
@@ -4008,6 +4125,64 @@ fn test_targo_trust_lift_json_fails_closed_on_unsupported_instruction_semantics(
 
 fn read_checked_x86_64_elf_fixture(path: &Path) -> Vec<u8> {
     read_checked_elf_fixture(path, 0x3e, "x86_64 fixture")
+}
+
+/// Writes `fixture` into `dir` and returns its path and bytes. A fixture that
+/// does not decode, does not match its pinned sha256, or is not laid out as
+/// `ExecEntryFixture` says (ET_EXEC; exactly `fixture.functions`, the first at
+/// the start of `.text` and the last ending at its end; `exec_entry` at
+/// `e_entry`, holding `entry_bytes`; `_start` elsewhere) PANICS: there is no
+/// fallback and no skip.
+fn materialize_exec_entry_fixture(dir: &Path, fixture: &ExecEntryFixture) -> (PathBuf, Vec<u8>) {
+    let path = materialize_hex_fixture(dir, fixture.file_name, fixture.hex, fixture.sha256)
+        .unwrap_or_else(|e| panic!("checked-in default-entry executable fixture: {e}"));
+    let bytes =
+        fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+
+    let name = fixture.file_name;
+    let elf = Elf64::parse(&bytes).unwrap_or_else(|e| panic!("failed to parse {name}: {e}"));
+    assert_eq!(elf.header.e_type, 2, "{name} must be an executable (ET_EXEC)");
+    assert_eq!(elf.header.e_machine, fixture.elf_machine, "{name} e_machine");
+    assert_eq!(elf.entry_point(), fixture.entry, "{name} e_entry");
+    let symbols = elf.function_symbols().unwrap_or_else(|e| panic!("{name} symbols: {e}"));
+    let layout: Vec<(&str, u64)> =
+        symbols.iter().map(|symbol| (symbol.name, symbol.st_value)).collect();
+    assert_eq!(layout, fixture.functions, "{name}: function symbols in address order");
+    assert_eq!(fixture.functions[2], (EXEC_ENTRY_SYMBOL, fixture.entry), "{name}: entry symbol");
+    assert_eq!(symbols[2].st_size, fixture.entry_bytes.len() as u64, "{name} entry size");
+    assert!(
+        fixture
+            .functions
+            .iter()
+            .any(|&(symbol, address)| symbol == "_start" && address != fixture.entry),
+        "{name}: `_start` must exist and must not be the entry"
+    );
+    let text = elf.text_section().unwrap_or_else(|| panic!("{name} has no .text"));
+    assert_eq!(text.sh_addr, fixture.functions[0].1, "{name}: the first decoy must start .text");
+    let last = &symbols[symbols.len() - 1];
+    assert_eq!(
+        last.st_value + last.st_size,
+        text.sh_addr + text.sh_size,
+        "{name}: the last decoy must end .text"
+    );
+    let text_bytes = elf.section_data(text).unwrap_or_else(|e| panic!("{name} .text: {e}"));
+    let offset = usize::try_from(fixture.entry - text.sh_addr).expect("offset fits usize");
+    assert_eq!(
+        text_bytes.get(offset..offset + fixture.entry_bytes.len()),
+        Some(fixture.entry_bytes),
+        "{name}: the bytes at e_entry must be `entry_bytes`"
+    );
+    (path, bytes)
+}
+
+/// The fixture a targo-trust test materializes at test time. An `Err` (a
+/// checked-in object failed its digest/write check, or the certificate checker
+/// rejected) PANICS instead of skipping: an early return would pass in libtest
+/// without having run targo-trust. No assembler is needed to read the fixtures.
+fn require_fixture<T>(built: Result<T, String>) -> T {
+    built.unwrap_or_else(|reason| {
+        panic!("this test runs targo-trust and does not skip, but its fixture failed: {reason}")
+    })
 }
 
 fn materialize_hex_fixture(
@@ -4074,19 +4249,34 @@ fn function_entry_for_symbol(bytes: &[u8], symbol: &str) -> u64 {
 }
 
 fn build_x86_64_elf_fixture(dir: &Path) -> Result<PathBuf, String> {
-    build_x86_64_elf_fixture_from_asm(dir, "binary_to_trust_ir_return", X86_64_RET_ASM)
+    materialize_hex_fixture(dir, "binary_to_trust_ir_return.o", X86_64_RET_HEX, X86_64_RET_SHA256)
 }
 
 fn build_x86_64_undecodable_elf_fixture(dir: &Path) -> Result<PathBuf, String> {
-    build_x86_64_elf_fixture_from_asm(dir, "binary_to_trust_ir_undecodable", X86_64_UNDECODABLE_ASM)
+    materialize_hex_fixture(
+        dir,
+        "binary_to_trust_ir_undecodable.o",
+        X86_64_UNDECODABLE_HEX,
+        X86_64_UNDECODABLE_SHA256,
+    )
 }
 
 fn build_x86_64_unsupported_elf_fixture(dir: &Path) -> Result<PathBuf, String> {
-    build_x86_64_elf_fixture_from_asm(dir, "binary_to_trust_ir_unsupported", X86_64_UNSUPPORTED_ASM)
+    materialize_hex_fixture(
+        dir,
+        "binary_to_trust_ir_unsupported.o",
+        X86_64_UNSUPPORTED_HEX,
+        X86_64_UNSUPPORTED_SHA256,
+    )
 }
 
 fn build_x86_64_unresolved_elf_fixture(dir: &Path) -> Result<PathBuf, String> {
-    build_x86_64_elf_fixture_from_asm(dir, "binary_to_trust_ir_unresolved", X86_64_UNRESOLVED_ASM)
+    materialize_hex_fixture(
+        dir,
+        "binary_to_trust_ir_unresolved.o",
+        X86_64_UNRESOLVED_HEX,
+        X86_64_UNRESOLVED_SHA256,
+    )
 }
 
 fn build_checked_certificate_readback_fixture(
@@ -4369,242 +4559,40 @@ fn checked_certificate_fixture_binary_identity() -> BinaryArtifactDigestIdentity
 }
 
 fn build_aarch64_exclusive_elf_fixture(dir: &Path) -> Result<PathBuf, String> {
-    build_aarch64_elf_fixture_from_asm(
+    materialize_hex_fixture(
         dir,
-        "binary_to_trust_ir_aarch64_exclusive",
-        AARCH64_EXCLUSIVE_ASM,
+        "binary_to_trust_ir_aarch64_exclusive.o",
+        AARCH64_EXCLUSIVE_HEX,
+        AARCH64_EXCLUSIVE_SHA256,
     )
 }
 
-fn build_x86_64_elf_fixture_from_asm(
-    dir: &Path,
-    fixture_name: &str,
-    asm: &str,
-) -> Result<PathBuf, String> {
-    let asm_path = dir.join(format!("{fixture_name}.s"));
-    let obj_path = dir.join(format!("{fixture_name}.o"));
-    fs::write(&asm_path, asm)
-        .map_err(|e| format!("could not write fixture assembly {}: {e}", asm_path.display()))?;
-
-    let mut attempts = Vec::new();
-    for compiler in candidate_compilers() {
-        for args in compiler_arg_sets() {
-            let _ = fs::remove_file(&obj_path);
-            let mut cmd = Command::new(&compiler);
-            cmd.args(&args).arg("-c").arg("-x").arg("assembler").arg(&asm_path);
-            cmd.arg("-o").arg(&obj_path);
-
-            match cmd.output() {
-                Ok(output) if output.status.success() && obj_path.exists() => {
-                    return Ok(obj_path);
-                }
-                Ok(output) => attempts.push(format_attempt(&compiler, &args, &output)),
-                Err(e) => attempts.push(format!("{compiler} {:?}: {e}", args)),
-            }
-        }
-    }
-
-    Err(format!(
-        "could not build deterministic x86_64 ELF fixture {fixture_name}; tried {}",
-        attempts.join("; ")
-    ))
-}
-
-fn build_aarch64_elf_fixture_from_asm(
-    dir: &Path,
-    fixture_name: &str,
-    asm: &str,
-) -> Result<PathBuf, String> {
-    let asm_path = dir.join(format!("{fixture_name}.s"));
-    let obj_path = dir.join(format!("{fixture_name}.o"));
-    fs::write(&asm_path, asm)
-        .map_err(|e| format!("could not write fixture assembly {}: {e}", asm_path.display()))?;
-
-    let mut attempts = Vec::new();
-    for compiler in candidate_compilers() {
-        let _ = fs::remove_file(&obj_path);
-        let mut cmd = Command::new(&compiler);
-        cmd.arg("--target=aarch64-unknown-linux-gnu")
-            .arg("-c")
-            .arg("-x")
-            .arg("assembler")
-            .arg(&asm_path)
-            .arg("-o")
-            .arg(&obj_path);
-
-        match cmd.output() {
-            Ok(output) if output.status.success() && obj_path.exists() => {
-                return Ok(obj_path);
-            }
-            Ok(output) => attempts.push(format_attempt(
-                &compiler,
-                &["--target=aarch64-unknown-linux-gnu"],
-                &output,
-            )),
-            Err(e) => attempts
-                .push(format!("{compiler} {:?}: {e}", ["--target=aarch64-unknown-linux-gnu"])),
-        }
-    }
-
-    Err(format!(
-        "could not build deterministic AArch64 ELF fixture {fixture_name}; tried {}",
-        attempts.join("; ")
-    ))
-}
-
-#[derive(Debug)]
-struct ExecutableFixture {
-    path: PathBuf,
-    architecture: &'static str,
-    elf_machine: u16,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct HostExecutableTarget {
-    asm: &'static str,
-    architecture: &'static str,
-    elf_machine: u16,
-}
-
-fn build_host_executable_fixture(dir: &Path) -> Result<ExecutableFixture, String> {
-    let target = host_executable_target()?;
-    let asm_path = dir.join("binary_to_trust_ir_entry.s");
-    let exe_path = dir.join("binary_to_trust_ir_entry");
-    fs::write(&asm_path, target.asm)
-        .map_err(|e| format!("could not write fixture assembly {}: {e}", asm_path.display()))?;
-
-    let mut attempts = Vec::new();
-    for compiler in candidate_compilers() {
-        for args in executable_link_arg_sets() {
-            let _ = fs::remove_file(&exe_path);
-            let mut cmd = Command::new(&compiler);
-            cmd.args(&args).arg("-x").arg("assembler").arg(&asm_path);
-            cmd.arg("-o").arg(&exe_path);
-
-            match cmd.output() {
-                Ok(output) if output.status.success() && exe_path.exists() => {
-                    match validate_host_executable(&exe_path, target) {
-                        Ok(()) => {
-                            return Ok(ExecutableFixture {
-                                path: exe_path,
-                                architecture: target.architecture,
-                                elf_machine: target.elf_machine,
-                            });
-                        }
-                        Err(reason) => attempts
-                            .push(format!("{compiler} {args:?} linked unusable fixture: {reason}")),
-                    }
-                }
-                Ok(output) => attempts.push(format_attempt(&compiler, &args, &output)),
-                Err(e) => attempts.push(format!("{compiler} {:?}: {e}", args)),
-            }
-        }
-    }
-
-    Err(format!(
-        "could not link deterministic host ELF executable fixture; tried {}",
-        attempts.join("; ")
-    ))
-}
-
-fn validate_host_executable(path: &Path, target: HostExecutableTarget) -> Result<(), String> {
-    let bytes = fs::read(path)
-        .map_err(|e| format!("could not read linked fixture {}: {e}", path.display()))?;
-    let elf = Elf64::parse(&bytes)
-        .map_err(|e| format!("linked fixture {} was not parseable ELF: {e}", path.display()))?;
-
-    if elf.header.e_type == 1 {
-        return Err("linker produced a relocatable object, not an executable image".to_string());
-    }
-    if elf.header.e_machine != target.elf_machine {
-        return Err(format!(
-            "unexpected ELF machine 0x{:x}, expected 0x{:x}",
-            elf.header.e_machine, target.elf_machine
-        ));
-    }
-    if elf.entry_point() == 0 {
-        return Err("linked executable has no entry point".to_string());
-    }
-
-    Ok(())
-}
-
-fn host_executable_target() -> Result<HostExecutableTarget, String> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Ok(HostExecutableTarget {
-            asm: X86_64_EXEC_ENTRY_ASM,
-            architecture: "x86-64",
-            elf_machine: 0x3e,
-        }),
-        ("linux", "aarch64") => Ok(HostExecutableTarget {
-            asm: AARCH64_EXEC_ENTRY_ASM,
-            architecture: "AArch64",
-            elf_machine: 0xb7,
-        }),
-        (os, arch) => Err(format!(
-            "default-entry executable fixture requires an ELF host supported by trust-lift; host is {arch}-{os}"
-        )),
-    }
-}
-
-fn executable_link_arg_sets() -> Vec<Vec<&'static str>> {
-    vec![
-        vec!["-nostdlib", "-static", "-no-pie", "-Wl,--build-id=none", "-Wl,-e,_start"],
-        vec!["-nostdlib", "-no-pie", "-Wl,--build-id=none", "-Wl,-e,_start"],
-        vec!["-nostdlib", "-Wl,-e,_start"],
-    ]
-}
-
-fn candidate_compilers() -> Vec<String> {
-    let mut compilers = Vec::new();
-    if let Ok(cc) = std::env::var("TRUST_TEST_CC")
-        && !cc.trim().is_empty()
-    {
-        compilers.push(cc);
-    }
-    compilers.push("clang".to_string());
-    compilers.push("cc".to_string());
-    compilers.dedup();
-    compilers
-}
-
-fn compiler_arg_sets() -> Vec<Vec<&'static str>> {
-    let mut arg_sets = vec![vec!["--target=x86_64-unknown-linux-gnu"]];
-    if std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64" {
-        arg_sets.push(vec![]);
-    }
-    arg_sets
-}
-
-fn format_attempt(compiler: &str, args: &[&str], output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim();
-    let detail = if stderr.is_empty() { "no stderr".to_string() } else { stderr.to_string() };
-    format!("{compiler} {args:?} exited with {} ({detail})", output.status)
-}
-
-fn find_targo_trust_binary() -> Option<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir.parent()?.parent()?;
-    let bin_name = format!("targo-trust{}", std::env::consts::EXE_SUFFIX);
-
-    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        for profile in ["debug", "release"] {
-            let candidate = PathBuf::from(&target_dir).join(profile).join(&bin_name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    [
-        repo_root.join("target/user/debug").join(&bin_name),
-        repo_root.join("target/user/release").join(&bin_name),
-        repo_root.join("target/debug").join(&bin_name),
-        repo_root.join("target/release").join(&bin_name),
-        repo_root.join("targo-trust/target/debug").join(&bin_name),
-        repo_root.join("targo-trust/target/release").join(&bin_name),
-    ]
-    .into_iter()
-    .find(|candidate| candidate.is_file())
+/// The `targo-trust` binary these tests run: the file `TRUST_TARGO_TRUST_BIN`
+/// names. Unset, empty, relative, or not a file panics; there is no search and
+/// no skip (docs/issues/2026-09-29-binary-to-trust-ir-e2e-golden-stale-and-passes-without-its-binary.md,
+/// defect 2). The search this replaces took whatever binary it found, built from
+/// whatever tree, and when it found none the test returned early, which libtest
+/// counts as a pass. scripts/check_crates_tests_scoped.py, scripts/dev-test.sh and
+/// `targo trust gate check-all --run-tests` build targo-trust from the tree under
+/// test and set the variable to a private copy of it. A relative value is
+/// refused: `is_file` would check it against the test's cwd, but `Command::new`
+/// looks a slash-free one up on PATH, so the file checked would not be the file
+/// run. scale_fixture_crate.rs has the same helper.
+fn require_targo_trust_binary() -> PathBuf {
+    const HOW: &str = "build it from this tree with `targo --unverified build --manifest-path \
+        targo-trust/Cargo.toml --bin targo-trust --locked` and set TRUST_TARGO_TRUST_BIN to the \
+        absolute path of that binary (the `executable` of cargo's compiler-artifact message under \
+        --message-format json). Use the binary built from this tree and commit. \
+        To leave this test out of a local run, pass \
+        libtest's `--skip <test name>`";
+    let Some(value) = std::env::var_os("TRUST_TARGO_TRUST_BIN").filter(|v| !v.is_empty()) else {
+        panic!("TRUST_TARGO_TRUST_BIN is unset or empty, and this test runs targo-trust: {HOW}");
+    };
+    let path = PathBuf::from(value);
+    assert!(
+        path.is_absolute() && path.is_file(),
+        "TRUST_TARGO_TRUST_BIN={} is not the absolute path of an existing file: {HOW}",
+        path.display()
+    );
+    path
 }

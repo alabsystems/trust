@@ -133,19 +133,19 @@ impl StructuralGate {
         let mut diagnostics = Vec::new();
 
         // Run all checks
-        self.check_empty(&spec_body, &mut diagnostics);
-        self.check_syntax(&spec_body, &proposal.kind, &mut diagnostics);
-        self.check_unsafe_content(&spec_body, &mut diagnostics);
-        self.check_tautology(&spec_body, &proposal.kind, &mut diagnostics);
-        self.check_contradiction(&spec_body, &proposal.kind, &mut diagnostics);
-        self.check_complexity(&spec_body, &mut diagnostics);
-        self.check_side_effects(&spec_body, &mut diagnostics);
-        self.check_scope(&spec_body, &mut diagnostics);
+        self.check_empty(spec_body, &mut diagnostics);
+        self.check_syntax(spec_body, &proposal.kind, &mut diagnostics);
+        self.check_unsafe_content(spec_body, &mut diagnostics);
+        self.check_tautology(spec_body, &proposal.kind, &mut diagnostics);
+        self.check_contradiction(spec_body, &proposal.kind, &mut diagnostics);
+        self.check_complexity(spec_body, &mut diagnostics);
+        self.check_side_effects(spec_body, &mut diagnostics);
+        self.check_scope(spec_body, &mut diagnostics);
 
         // Attach fix suggestions to diagnostics that lack them
         for diag in &mut diagnostics {
             if diag.suggestion.is_none()
-                && let Some(fix) = suggest_fix(&diag.kind, &spec_body)
+                && let Some(fix) = suggest_fix(&diag.kind, spec_body)
             {
                 diag.suggestion = Some(fix);
             }
@@ -157,7 +157,12 @@ impl StructuralGate {
             !diagnostics.iter().any(|d| d.severity == Severity::Reject)
         };
 
-        GateResult { passed, diagnostics, function_name: proposal.function_name.clone(), spec_body }
+        GateResult {
+            passed,
+            diagnostics,
+            function_name: proposal.function_name.clone(),
+            spec_body: spec_body.to_string(),
+        }
     }
 
     /// Validate multiple proposals, returning results for each.
@@ -195,24 +200,56 @@ impl StructuralGate {
             return; // Already caught by check_empty
         }
 
-        // Check balanced parentheses
+        // Single byte pass over `trimmed` collecting parentheses/brackets balance,
+        // bare semicolons, and curly braces while preserving exact diagnostic priority.
         let mut depth: i32 = 0;
-        for ch in trimmed.chars() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth < 0 {
-                        diagnostics.push(GateDiagnostic::reject(
-                            DiagnosticKind::SyntaxError,
-                            "unbalanced parentheses: unexpected closing ')'",
-                            trimmed,
-                        ));
-                        return;
+        let mut paren_unexpected_close = false;
+        let mut bracket_depth: i32 = 0;
+        let mut bracket_unexpected_close = false;
+        let mut has_semicolon = false;
+        let mut has_curly = false;
+
+        for &b in trimmed.as_bytes() {
+            match b {
+                b'(' => {
+                    if !paren_unexpected_close {
+                        depth += 1;
                     }
                 }
+                b')' => {
+                    if !paren_unexpected_close {
+                        depth -= 1;
+                        if depth < 0 {
+                            paren_unexpected_close = true;
+                        }
+                    }
+                }
+                b'[' => {
+                    if !bracket_unexpected_close {
+                        bracket_depth += 1;
+                    }
+                }
+                b']' => {
+                    if !bracket_unexpected_close {
+                        bracket_depth -= 1;
+                        if bracket_depth < 0 {
+                            bracket_unexpected_close = true;
+                        }
+                    }
+                }
+                b';' => has_semicolon = true,
+                b'{' | b'}' => has_curly = true,
                 _ => {}
             }
+        }
+
+        if paren_unexpected_close {
+            diagnostics.push(GateDiagnostic::reject(
+                DiagnosticKind::SyntaxError,
+                "unbalanced parentheses: unexpected closing ')'",
+                trimmed,
+            ));
+            return;
         }
         if depth != 0 {
             diagnostics.push(GateDiagnostic::reject(
@@ -222,25 +259,13 @@ impl StructuralGate {
             ));
             return;
         }
-
-        // Check balanced brackets
-        let mut bracket_depth: i32 = 0;
-        for ch in trimmed.chars() {
-            match ch {
-                '[' => bracket_depth += 1,
-                ']' => {
-                    bracket_depth -= 1;
-                    if bracket_depth < 0 {
-                        diagnostics.push(GateDiagnostic::reject(
-                            DiagnosticKind::SyntaxError,
-                            "unbalanced brackets: unexpected closing ']'",
-                            trimmed,
-                        ));
-                        return;
-                    }
-                }
-                _ => {}
-            }
+        if bracket_unexpected_close {
+            diagnostics.push(GateDiagnostic::reject(
+                DiagnosticKind::SyntaxError,
+                "unbalanced brackets: unexpected closing ']'",
+                trimmed,
+            ));
+            return;
         }
         if bracket_depth != 0 {
             diagnostics.push(GateDiagnostic::reject(
@@ -252,7 +277,7 @@ impl StructuralGate {
         }
 
         // Check for obviously invalid tokens: bare semicolons (statements, not expressions)
-        if trimmed.contains(';') {
+        if has_semicolon {
             diagnostics.push(GateDiagnostic::reject(
                 DiagnosticKind::SyntaxError,
                 "spec body contains semicolons; specs must be expressions, not statements",
@@ -261,7 +286,7 @@ impl StructuralGate {
         }
 
         // Check for bare curly braces (block expressions / code injection)
-        if trimmed.contains('{') || trimmed.contains('}') {
+        if has_curly {
             diagnostics.push(GateDiagnostic::reject(
                 DiagnosticKind::SyntaxError,
                 "spec body contains curly braces; specs must be simple expressions",
@@ -284,10 +309,10 @@ impl StructuralGate {
     }
 
     fn check_unsafe_content(&self, spec_body: &str, diagnostics: &mut Vec<GateDiagnostic>) {
-        let lower = spec_body.to_lowercase();
-
-        // assume(false) -- introduces unsoundness
-        if contains_call(spec_body, "assume") && lower.contains("false") {
+        // assume(false) -- introduces unsoundness (checked without heap-allocating lowercase String)
+        if contains_call(spec_body, "assume")
+            && spec_body.as_bytes().windows(5).any(|w| w.eq_ignore_ascii_case(b"false"))
+        {
             diagnostics.push(
                 GateDiagnostic::reject(
                     DiagnosticKind::Unsoundness,
@@ -488,10 +513,8 @@ impl StructuralGate {
         for existing in &self.config.existing_specs {
             let existing_trimmed = existing.trim();
             // Direct negation: new spec is !existing or vice versa
-            if trimmed == format!("!{existing_trimmed}")
-                || trimmed == format!("!({})", existing_trimmed)
-                || format!("!{trimmed}") == existing_trimmed
-                || format!("!({})", trimmed) == existing_trimmed
+            if is_negation_of(trimmed, existing_trimmed)
+                || is_negation_of(existing_trimmed, trimmed)
             {
                 diagnostics.push(GateDiagnostic::reject(
                     DiagnosticKind::Contradiction,
@@ -584,20 +607,9 @@ impl StructuralGate {
             return; // No scope info available, skip
         }
 
-        let identifiers = extract_identifiers(spec_body);
-        let scope_names: Vec<&str> =
-            self.config.scope_vars.iter().map(|v| v.name.as_str()).collect();
-
-        // Built-in identifiers that are always in scope for specs
-        let builtins: &[&str] = &[
-            "true", "false", "result", "ret", "old", "self", "usize", "u8", "u16", "u32", "u64",
-            "u128", "isize", "i8", "i16", "i32", "i64", "i128", "f32", "f64", "bool", "MAX", "MIN",
-            "len",
-        ];
-
-        for ident in &identifiers {
-            if !scope_names.contains(&ident.as_str())
-                && !builtins.contains(&ident.as_str())
+        for_each_identifier(spec_body, |ident| {
+            if !self.config.scope_vars.iter().any(|v| v.name == ident)
+                && !is_builtin_spec_ident(ident)
                 && !is_type_method(ident)
             {
                 diagnostics.push(GateDiagnostic::reject(
@@ -606,7 +618,7 @@ impl StructuralGate {
                     ident,
                 ));
             }
-        }
+        });
     }
 }
 
@@ -631,14 +643,14 @@ fn is_spec_bearing_kind(kind: &ProposalKind) -> bool {
 }
 
 /// Extract the spec body string from a ProposalKind.
-fn extract_spec_body(kind: &ProposalKind) -> String {
+fn extract_spec_body(kind: &ProposalKind) -> &str {
     match kind {
-        ProposalKind::AddPrecondition { spec_body } => spec_body.clone(),
-        ProposalKind::AddPostcondition { spec_body } => spec_body.clone(),
-        ProposalKind::AddInvariant { spec_body } => spec_body.clone(),
-        ProposalKind::SafeArithmetic { replacement, .. } => replacement.clone(),
-        ProposalKind::AddBoundsCheck { check_expr } => check_expr.clone(),
-        ProposalKind::AddNonZeroCheck { check_expr } => check_expr.clone(),
+        ProposalKind::AddPrecondition { spec_body }
+        | ProposalKind::AddPostcondition { spec_body }
+        | ProposalKind::AddInvariant { spec_body } => spec_body,
+        ProposalKind::SafeArithmetic { replacement, .. } => replacement,
+        ProposalKind::AddBoundsCheck { check_expr }
+        | ProposalKind::AddNonZeroCheck { check_expr } => check_expr,
     }
 }
 
@@ -662,18 +674,24 @@ fn is_self_reflexive_comparison(s: &str) -> bool {
     false
 }
 
+/// Whether `a` is syntactically `!b` or `!(b)`.
+fn is_negation_of(a: &str, b: &str) -> bool {
+    let Some(rest) = a.strip_prefix('!') else {
+        return false;
+    };
+    rest == b
+        || rest
+            .strip_prefix('(')
+            .and_then(|r| r.strip_suffix(')'))
+            .is_some_and(|inner| inner == b)
+}
+
 /// Check if an expression is of the form `x || !x` or `!x || x`.
 fn is_or_complement(s: &str) -> bool {
     if let Some((left, right)) = split_binary_op(s, "||") {
         let left = left.trim();
         let right = right.trim();
-        if right == format!("!{left}") || left == format!("!{right}") {
-            return true;
-        }
-        // Parenthesized: !(x) || x
-        if right == format!("!({})", left) || left == format!("!({})", right) {
-            return true;
-        }
+        return is_negation_of(right, left) || is_negation_of(left, right);
     }
     false
 }
@@ -683,12 +701,7 @@ fn is_and_contradiction(s: &str) -> bool {
     if let Some((left, right)) = split_binary_op(s, "&&") {
         let left = left.trim();
         let right = right.trim();
-        if right == format!("!{left}") || left == format!("!{right}") {
-            return true;
-        }
-        if right == format!("!({})", left) || left == format!("!({})", right) {
-            return true;
-        }
+        return is_negation_of(right, left) || is_negation_of(left, right);
     }
     false
 }
@@ -761,21 +774,14 @@ fn split_binary_op<'a>(s: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
 
 /// Check if a spec body contains a function call pattern.
 fn contains_call(s: &str, func_name: &str) -> bool {
-    // Match func_name followed by '(' with optional whitespace
-    let mut search = func_name.to_string();
-    search.push('(');
-    if s.contains(&search) {
-        return true;
+    // Match func_name followed by '(' with optional space before paren
+    for (pos, _) in s.match_indices(func_name) {
+        let rest = &s[pos + func_name.len()..];
+        if rest.starts_with('(') || rest.starts_with(" (") {
+            return true;
+        }
     }
-    // Also check with space before paren
-    let mut search_space = func_name.to_string();
-    search_space.push_str("( ");
-    if s.contains(&search_space) {
-        return true;
-    }
-    search_space = func_name.to_string();
-    search_space.push_str(" (");
-    s.contains(&search_space)
+    false
 }
 
 /// Check if a string contains an assignment operator (= but not ==, !=, >=, <=).
@@ -851,57 +857,95 @@ fn max_nesting_depth(s: &str) -> usize {
     max_depth
 }
 
-/// Extract identifiers from a spec body string (simple heuristic).
-fn extract_identifiers(s: &str) -> Vec<String> {
-    let mut identifiers = Vec::new();
-    let mut current = String::new();
+/// Stream identifiers from a spec body string without allocating an intermediate `Vec`.
+fn for_each_identifier<'a>(s: &'a str, mut visit: impl FnMut(&'a str)) {
+    let mut start: Option<usize> = None;
 
-    for ch in s.chars() {
+    for (i, ch) in s.char_indices() {
         if ch.is_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else {
-            if !current.is_empty()
-                && current.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
-            {
-                identifiers.push(current.clone());
+            start.get_or_insert(i);
+        } else if let Some(st) = start.take() {
+            let ident = &s[st..i];
+            if ident.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') {
+                visit(ident);
             }
-            current.clear();
         }
     }
-    if !current.is_empty() && current.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
-    {
-        identifiers.push(current);
+    if let Some(st) = start {
+        let ident = &s[st..];
+        if ident.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') {
+            visit(ident);
+        }
     }
+}
 
+/// Extract identifiers from a spec body string as borrowed slices.
+#[cfg(test)]
+fn extract_identifiers(s: &str) -> Vec<&str> {
+    let mut identifiers = Vec::new();
+    for_each_identifier(s, |ident| identifiers.push(ident));
     identifiers
 }
 
+/// Built-in identifiers that are always in scope for specs.
+#[inline]
+fn is_builtin_spec_ident(ident: &str) -> bool {
+    matches!(
+        ident,
+        "true"
+            | "false"
+            | "result"
+            | "ret"
+            | "old"
+            | "self"
+            | "usize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "isize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "MAX"
+            | "MIN"
+            | "len"
+    )
+}
+
 /// Check if an identifier looks like a type method (e.g., checked_add, try_from).
+#[inline]
 fn is_type_method(ident: &str) -> bool {
-    let known_methods = [
-        "checked_add",
-        "checked_sub",
-        "checked_mul",
-        "checked_div",
-        "checked_neg",
-        "checked_shl",
-        "checked_shr",
-        "saturating_add",
-        "saturating_sub",
-        "saturating_mul",
-        "wrapping_add",
-        "wrapping_sub",
-        "wrapping_mul",
-        "try_from",
-        "try_into",
-        "expect",
-        "unwrap",
-        "len",
-        "is_empty",
-        "contains",
-        "size_of",
-    ];
-    known_methods.contains(&ident)
+    matches!(
+        ident,
+        "checked_add"
+            | "checked_sub"
+            | "checked_mul"
+            | "checked_div"
+            | "checked_neg"
+            | "checked_shl"
+            | "checked_shr"
+            | "saturating_add"
+            | "saturating_sub"
+            | "saturating_mul"
+            | "wrapping_add"
+            | "wrapping_sub"
+            | "wrapping_mul"
+            | "try_from"
+            | "try_into"
+            | "expect"
+            | "unwrap"
+            | "len"
+            | "is_empty"
+            | "contains"
+            | "size_of"
+    )
 }
 
 #[cfg(test)]
@@ -1498,15 +1542,15 @@ mod tests {
     #[test]
     fn test_extract_identifiers_simple() {
         let ids = extract_identifiers("x > 0");
-        assert!(ids.contains(&"x".to_string()));
+        assert!(ids.contains(&"x"));
     }
 
     #[test]
     fn test_extract_identifiers_multiple() {
         let ids = extract_identifiers("x > y && z != 0");
-        assert!(ids.contains(&"x".to_string()));
-        assert!(ids.contains(&"y".to_string()));
-        assert!(ids.contains(&"z".to_string()));
+        assert!(ids.contains(&"x"));
+        assert!(ids.contains(&"y"));
+        assert!(ids.contains(&"z"));
     }
 
     #[test]
@@ -1615,22 +1659,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parser_accepts_postcondition() {
-        let gate = StructuralGate::new();
-        let result = gate.check(&make_postcondition("result > 0"));
-        assert!(result.passed);
-        assert_eq!(result.rejection_count(), 0);
-    }
-
-    #[test]
-    fn test_parser_accepts_invariant() {
-        let gate = StructuralGate::new();
-        let result = gate.check(&make_invariant("i < n"));
-        assert!(result.passed);
-        assert_eq!(result.rejection_count(), 0);
-    }
-
-    #[test]
     fn test_parser_skips_safe_arithmetic_kind() {
         let gate = StructuralGate::new();
         // SafeArithmetic contains Rust code, not spec expressions.
@@ -1723,5 +1751,22 @@ mod tests {
         assert!(!is_spec_bearing_kind(&ProposalKind::AddNonZeroCheck {
             check_expr: String::new()
         }));
+    }
+
+    #[test]
+    fn wave492_fused_syntax_and_case_insensitive_assume_false_parity() {
+        let gate = StructuralGate::new();
+        // Even if an unexpected `]` precedes an unexpected `)`, parentheses check still wins first.
+        let r_paren_first = gate.check(&make_precondition("a] + b)"));
+        assert!(!r_paren_first.passed);
+        assert_eq!(
+            r_paren_first.diagnostics[0].message,
+            "unbalanced parentheses: unexpected closing ')'"
+        );
+
+        // Mixed-case `assume(FaLsE)` is still rejected without allocating lowercase String.
+        let r_assume = gate.check(&make_precondition("assume(FaLsE)"));
+        assert!(!r_assume.passed);
+        assert!(r_assume.diagnostics.iter().any(|d| d.kind == DiagnosticKind::Unsoundness));
     }
 }

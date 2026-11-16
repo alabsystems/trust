@@ -1,0 +1,573 @@
+{
+  "name": "g1x_opaque_start_offby1",
+  "def_path": "repro::g1x_opaque_start_offby1",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+    "line_start": 370,
+    "col_start": 0,
+    "line_end": 376,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "input"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "rest"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeFrom",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Constant": {
+                      "OpaqueScalar": {
+                        "width": 64,
+                        "signed": false,
+                        "origin": {
+                          "Const": {
+                            "key": "repro::Cut::K@d32c6c75eae0751dee7e8f0e69019739"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        5,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+                "line_start": 371,
+                "col_start": 7,
+                "line_end": 371,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+              "line_start": 371,
+              "col_start": 7,
+              "line_end": 371,
+              "col_end": 15
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+                "line_start": 371,
+                "col_start": 19,
+                "line_end": 371,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+                "line_start": 371,
+                "col_start": 19,
+                "line_end": 371,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+              "line_start": 371,
+              "col_start": 19,
+              "line_end": 371,
+              "col_end": 34
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+                "line_start": 372,
+                "col_start": 15,
+                "line_end": 372,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeFrom",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeFrom<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "OpaqueScalar": {
+                          "width": 64,
+                          "signed": false,
+                          "origin": {
+                            "Const": {
+                              "key": "repro::Cut::K@d32c6c75eae0751dee7e8f0e69019739"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+                "line_start": 374,
+                "col_start": 22,
+                "line_end": 374,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8] as core::ops::index::Index<core::ops::range::RangeFrom<usize>>>::index",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+              "line_start": 374,
+              "col_start": 21,
+              "line_end": 374,
+              "col_end": 29
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 39089,
+              "substs_digest": [
+                13895456231481184179,
+                1711512104488250017
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+                "line_start": 375,
+                "col_start": 4,
+                "line_end": 375,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+                "line_start": 375,
+                "col_start": 4,
+                "line_end": 375,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 8,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 5,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+              "line_start": 375,
+              "col_start": 4,
+              "line_end": 375,
+              "col_end": 18
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 8,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/subslice_len.rs",
+                "line_start": 375,
+                "col_start": 4,
+                "line_end": 375,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -214,6 +214,7 @@ fn check_unexpected_extension(check: &mut RunningCheck, file_path: &Path, ext: &
         "stdout", // expected stdout file, corresponds to a rs file
         "fixed",  // expected source file after applying fixes
         "clean",  // Trust (I8): out-of-line Clean units (`clean mod name;` loads `name.clean`)
+        "lean",   // Trust (G2): the same unit spelled as Lean spells it (`name.lean`)
         "md",     // test directory descriptions
     ];
 

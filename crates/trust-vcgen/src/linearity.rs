@@ -96,29 +96,35 @@ fn block_moves(block: &BasicBlock, local: usize) -> bool {
         }
 }
 
-/// Successor block ids of a terminator (mirrors the CFG edges the verifier uses).
-fn successors(terminator: &Terminator) -> Vec<BlockId> {
+/// Visit successor block ids of a terminator without allocating a `Vec`.
+fn for_each_successor(terminator: &Terminator, mut f: impl FnMut(BlockId)) {
     match terminator {
-        Terminator::Goto(t) => vec![*t],
+        Terminator::Goto(t) => f(*t),
         Terminator::SwitchInt { targets, otherwise, .. } => {
-            let mut s: Vec<BlockId> = targets.iter().map(|(_, t)| *t).collect();
-            s.push(*otherwise);
-            s
+            for &(_, t) in targets {
+                f(t);
+            }
+            f(*otherwise);
         }
-        Terminator::Call { target: Some(t), .. } => vec![*t],
-        Terminator::Assert { target, .. } | Terminator::Drop { target, .. } => vec![*target],
-        Terminator::Opaque { targets, .. } => targets.clone(),
-        _ => vec![],
+        Terminator::Call { target: Some(t), .. } => f(*t),
+        Terminator::Assert { target, .. } | Terminator::Drop { target, .. } => f(*target),
+        Terminator::Opaque { targets, .. } => {
+            for &t in targets {
+                f(t);
+            }
+        }
+        _ => {}
     }
 }
 
 /// Predecessor map over the CFG.
 fn predecessors(body: &VerifiableBody) -> FxHashMap<BlockId, Vec<BlockId>> {
-    let mut preds: FxHashMap<BlockId, Vec<BlockId>> = FxHashMap::default();
+    let mut preds: FxHashMap<BlockId, Vec<BlockId>> =
+        FxHashMap::with_capacity_and_hasher(body.blocks.len(), Default::default());
     for block in &body.blocks {
-        for succ in successors(&block.terminator) {
+        for_each_successor(&block.terminator, |succ| {
             preds.entry(succ).or_default().push(block.id);
-        }
+        });
     }
     preds
 }
@@ -131,11 +137,20 @@ fn predecessors(body: &VerifiableBody) -> FxHashMap<BlockId, Vec<BlockId>> {
 /// (live_in[P] ∧ ¬consumes[P]) to a monotone fixpoint; any `Return` reached with
 /// the parameter still live and unconsumed is a leak path. Missing a real consume
 /// only ADDS live blocks → MORE (sound) leak reports, never removing one.
-fn param_leaks(body: &VerifiableBody, local: usize) -> bool {
-    let entry = body.blocks[0].id;
+fn param_leaks(
+    body: &VerifiableBody,
+    local: usize,
+    preds: &FxHashMap<BlockId, Vec<BlockId>>,
+) -> bool {
+    let Some(first_block) = body.blocks.first() else {
+        return false;
+    };
+    let entry = first_block.id;
+    if block_moves(first_block, local) && !body.blocks[1..].iter().any(|b| b.id == entry) {
+        return false;
+    }
     let moves: FxHashMap<BlockId, bool> =
         body.blocks.iter().map(|b| (b.id, block_moves(b, local))).collect();
-    let preds = predecessors(body);
 
     let mut live_in: FxHashMap<BlockId, bool> =
         body.blocks.iter().map(|b| (b.id, b.id == entry)).collect();
@@ -144,7 +159,7 @@ fn param_leaks(body: &VerifiableBody, local: usize) -> bool {
     while changed {
         changed = false;
         for block in &body.blocks {
-            if block.id == entry {
+            if live_in.get(&block.id).copied().unwrap_or(false) {
                 continue;
             }
             let new = preds
@@ -152,7 +167,7 @@ fn param_leaks(body: &VerifiableBody, local: usize) -> bool {
                 .into_iter()
                 .flatten()
                 .any(|p| *live_in.get(p).unwrap_or(&false) && !*moves.get(p).unwrap_or(&false));
-            if new && !live_in[&block.id] {
+            if new {
                 live_in.insert(block.id, true);
                 changed = true;
             }
@@ -161,8 +176,8 @@ fn param_leaks(body: &VerifiableBody, local: usize) -> bool {
 
     body.blocks.iter().any(|block| {
         matches!(&block.terminator, Terminator::Return | Terminator::TailCall { .. })
-            && live_in[&block.id]
-            && !moves[&block.id]
+            && live_in.get(&block.id).copied().unwrap_or(false)
+            && !moves.get(&block.id).copied().unwrap_or(false)
     })
 }
 
@@ -180,7 +195,10 @@ fn param_leaks(body: &VerifiableBody, local: usize) -> bool {
 /// whole-local (ignores field structure and re-moves), so it can only report MORE drops →
 /// more (sound) `Leaked`, never hide one; a genuine handoff (returning the value, or moving
 /// it into a call argument) leaves no `Drop` of the tainted local.
-fn param_resource_dropped(body: &VerifiableBody, param: usize) -> bool {
+fn param_resource_dropped(body: &VerifiableBody, param: usize, has_any_drop: bool) -> bool {
+    if !has_any_drop {
+        return false;
+    }
     let mut taint: FxHashSet<usize> = FxHashSet::default();
     taint.insert(param);
     let mut changed = true;
@@ -209,11 +227,7 @@ fn param_resource_dropped(body: &VerifiableBody, param: usize) -> bool {
 /// are NOT subject to `must_consume`: a scalar is freely copied, a reference is
 /// borrowed not owned. Checking only owned ADTs avoids flagging an unused `u32`.
 fn param_is_owned(func: &VerifiableFunction, local: usize) -> bool {
-    func.body
-        .locals
-        .iter()
-        .find(|d| d.index == local)
-        .is_some_and(|d| matches!(d.ty, trust_types::Ty::Adt { .. }))
+    crate::local_ty_ref(func, local).is_some_and(|ty| matches!(ty, trust_types::Ty::Adt { .. }))
 }
 
 /// Verify `#[trust::must_consume]`: every owned by-value (ADT) parameter is moved
@@ -226,18 +240,24 @@ pub fn check_must_consume(func: &VerifiableFunction) -> MustConsume {
     if body.blocks.is_empty() {
         return MustConsume::NotApplicable;
     }
-    let owned: Vec<usize> = (1..=body.arg_count).filter(|&p| param_is_owned(func, p)).collect();
-    if owned.is_empty() {
-        return MustConsume::NotApplicable;
-    }
-    for param in owned {
+    let mut preds: Option<FxHashMap<BlockId, Vec<BlockId>>> = None;
+    let has_any_drop =
+        body.blocks.iter().any(|b| matches!(&b.terminator, Terminator::Drop { .. }));
+    let mut any_owned = false;
+    for param in (1..=body.arg_count).filter(|&p| param_is_owned(func, p)) {
+        any_owned = true;
+        let preds_ref = preds.get_or_insert_with(|| predecessors(body));
         // Leaked if EITHER the param is never moved out on some path to Return
         // (`param_leaks`), OR its resource is moved into a local that the function then
         // DROPS (`param_resource_dropped`) — a silent drop that the slot-liveness check
         // alone misses.
-        if param_leaks(body, param) || param_resource_dropped(body, param) {
+        if param_leaks(body, param, preds_ref) || param_resource_dropped(body, param, has_any_drop)
+        {
             return MustConsume::Leaked { param };
         }
+    }
+    if !any_owned {
+        return MustConsume::NotApplicable;
     }
     MustConsume::Consumed
 }
@@ -262,11 +282,15 @@ mod tests {
                         ty: Ty::Adt {
                             adt_kind: None,
                             layout: None,
-                            variants: Vec::new(),
+                            variants: Vec::new().into(),
                             name: "Token".into(),
-                            fields: vec![],
+                            fields: vec![].into(),
                             disc_index_safe: false,
-                            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                            faithful_enum_repr: None,
+                            enum_layout: None,
+                            arbitrary_precision: None,
+                            validity_wrapper: None,
+                        },
                         name: Some("r".into()),
                     },
                     LocalDecl {
@@ -274,11 +298,15 @@ mod tests {
                         ty: Ty::Adt {
                             adt_kind: None,
                             layout: None,
-                            variants: Vec::new(),
+                            variants: Vec::new().into(),
                             name: "Token".into(),
-                            fields: vec![],
+                            fields: vec![].into(),
                             disc_index_safe: false,
-                            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                            faithful_enum_repr: None,
+                            enum_layout: None,
+                            arbitrary_precision: None,
+                            validity_wrapper: None,
+                        },
                         name: None,
                     },
                 ],
@@ -291,6 +319,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -402,6 +431,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("drop"),
                         is_foreign: false,
                         func: "drop".into(),
                         args: vec![Operand::Move(Place::local(1))],
@@ -428,6 +458,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("handoff"),
         };
         let consumed = func_with(
             vec![BasicBlock {
@@ -487,6 +518,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("sink2"),
                         is_foreign: false,
                         func: "sink2".into(),
                         args: vec![Operand::Move(Place::local(1)), Operand::Move(Place::local(2))],
@@ -521,6 +553,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("sink"),
                         is_foreign: false,
                         func: "sink".into(),
                         args: vec![Operand::Move(Place::local(1))], // the NEW _1

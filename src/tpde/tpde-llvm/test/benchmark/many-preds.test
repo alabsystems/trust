@@ -1,0 +1,31 @@
+# NOTE: Do not autogenerate
+# SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# RUN: python3 %s 2000 | tpde-llc --target=x86_64 | %objdump | FileCheck %s
+# RUN: python3 %s 2000 | tpde-llc --target=aarch64 | %objdump | FileCheck %s
+
+# Test for a PHI node with many predecessors/incoming values.
+#
+# For blocks with many predecessors, we sort PHI node entries for faster lookup
+# using binary search. We assert that the value is correct, so that in debug
+# builds, errors will be caught through this assertion.
+
+# CHECK: <f>:
+
+import sys
+
+n = int(sys.argv[1])
+print("define i32 @f(ptr %p) {")
+for i in range(n):
+    print(f'b{i}:')
+    print(f'  %g{i} = getelementptr i32, ptr %p, i32 {i}')
+    print(f'  %l{i} = load i32, ptr %g{i}')
+    print(f'  %c{i} = icmp sle i32 %l{i}, {i}')
+    print(f'  br i1 %c{i}, label %merge, label %b{i+1}')
+print(f'b{n}:')
+print('  br label %merge')
+print('merge:')
+print(f'  %r = phi i32 [0,%b{n}]', "".join(f",[%l{i},%b{i}]" for i in range(n)))
+print('  ret i32 %r')
+print('}')

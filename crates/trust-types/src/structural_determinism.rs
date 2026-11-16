@@ -18,19 +18,22 @@
 //! deterministic external calls. Conservative: an empty body, or any reachable
 //! atomic / volatile / `Unsupported` statement, yields `false`.
 
-use std::collections::HashSet;
+use crate::structural_termination::all_reachable_blocks;
+use crate::{BasicBlock, Rvalue, Statement, Terminator, VerifiableFunction};
 
-use crate::structural_termination::terminator_successors;
-use crate::{BasicBlock, BlockId, Rvalue, Statement, Terminator, VerifiableFunction};
+#[inline]
+fn contains_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
+    haystack.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
 
 /// Whether a statement is an OWN nondeterminism source: a volatile or atomic
 /// intrinsic, an `Assign` of an UNMODELED rvalue, or an unmodeled
 /// (`Unsupported`) statement (both fail closed).
-fn statement_is_nondeterministic(stmt: &Statement) -> bool {
+pub(crate) fn statement_is_nondeterministic(stmt: &Statement) -> bool {
     match stmt {
         Statement::Intrinsic { name, .. } => {
-            let n = name.to_ascii_lowercase();
-            n.contains("volatile") || n.contains("atomic")
+            contains_ascii_case_insensitive(name, b"volatile")
+                || contains_ascii_case_insensitive(name, b"atomic")
         }
         // An unmodeled rvalue may READ a nondeterministic source that has no
         // dedicated `Rvalue` variant — e.g. a `ThreadLocalRef` (per-thread
@@ -48,7 +51,7 @@ fn statement_is_nondeterministic(stmt: &Statement) -> bool {
 /// (the `atomic` annotation set on a `Call`, e.g. an atomic load), or unmodeled
 /// (`Opaque`) control flow — which may hide a nondeterministic read (inline asm
 /// observing a hardware source, an unmodeled terminator), so it fails closed.
-fn terminator_is_nondeterministic(t: &Terminator) -> bool {
+pub(crate) fn terminator_is_nondeterministic(t: &Terminator) -> bool {
     matches!(
         t,
         Terminator::Call { atomic: Some(_), .. }
@@ -61,31 +64,10 @@ fn terminator_is_nondeterministic(t: &Terminator) -> bool {
 /// the module docs). An empty block list fails closed.
 #[must_use]
 pub fn blocks_have_no_reachable_nondeterminism(blocks: &[BasicBlock]) -> bool {
-    let Some(entry) = blocks.first().map(|b| b.id) else {
-        return false;
-    };
-    let by_id: std::collections::HashMap<BlockId, &BasicBlock> =
-        blocks.iter().map(|b| (b.id, b)).collect();
-
-    let mut seen: HashSet<BlockId> = HashSet::new();
-    seen.insert(entry);
-    let mut stack = vec![entry];
-    while let Some(bid) = stack.pop() {
-        let Some(block) = by_id.get(&bid) else {
-            continue;
-        };
-        if block.stmts.iter().any(statement_is_nondeterministic)
-            || terminator_is_nondeterministic(&block.terminator)
-        {
-            return false;
-        }
-        for s in terminator_successors(&block.terminator) {
-            if seen.insert(s) {
-                stack.push(s);
-            }
-        }
-    }
-    true
+    all_reachable_blocks(blocks, |block| {
+        !block.stmts.iter().any(statement_is_nondeterministic)
+            && !terminator_is_nondeterministic(&block.terminator)
+    })
 }
 
 /// [`blocks_have_no_reachable_nondeterminism`] over a whole function body — the
@@ -99,7 +81,9 @@ pub fn is_structurally_deterministic(func: &VerifiableFunction) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AtomicOpKind, AtomicOperation, AtomicOrdering, Place, SourceSpan, UnwindEdge};
+    use crate::{
+        AtomicOpKind, AtomicOperation, AtomicOrdering, BlockId, Place, SourceSpan, UnwindEdge,
+    };
 
     fn block(id: usize, stmts: Vec<Statement>, t: Terminator) -> BasicBlock {
         BasicBlock { id: BlockId(id), stmts, terminator: t }
@@ -127,6 +111,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind: UnwindEdge::Unreachable,
         }
     }
@@ -154,6 +139,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind: UnwindEdge::Unreachable,
         };
         let blocks = vec![block(0, Vec::new(), atomic), block(1, Vec::new(), Terminator::Return)];
@@ -182,6 +168,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind: UnwindEdge::Unreachable,
         };
         // bb0 returns; the atomic op in the unreachable bb1 cannot execute.

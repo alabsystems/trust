@@ -196,6 +196,16 @@ impl MemoryModelChecker {
                     span: SourceSpan::default(),
                 });
             }
+        } else if !self.hb.is_acyclic() {
+            coverage_gaps.push(OrderingCoverageGap {
+                access_index: 0,
+                access_count: self.hb.event_count(),
+                required: MemoryOrdering::SeqCst,
+                reason: "happens-before evidence must be well-formed".to_string(),
+                detail: "happens-before relation contains a cycle or rejected contradictory edge"
+                    .to_string(),
+                span: SourceSpan::default(),
+            });
         }
 
         coverage_gaps
@@ -307,51 +317,10 @@ impl MemoryModelChecker {
         let mut vcs = Vec::new();
         let result = self.check();
 
-        // VCs for data races
+        // The atomic-only check currently reports no races. If that changes,
+        // caller labels still cannot establish aliasing, thread identity, or HB.
         for race in &result.races {
-            let reach_a = Formula::Var(
-                generated_memory_ordering_symbol(&format!(
-                    "reach_{}_{}",
-                    race.first_thread, race.first_access
-                )),
-                Sort::Bool,
-            );
-            let reach_b = Formula::Var(
-                generated_memory_ordering_symbol(&format!(
-                    "reach_{}_{}",
-                    race.second_thread, race.second_access
-                )),
-                Sort::Bool,
-            );
-            // SOUNDNESS (#59, 2026-08-19): the third conjunct is a PLACEHOLDER,
-            // not a model — the ordering question is decided in Rust above and
-            // hardcoded, so this obligation asserts only `reach_a AND reach_b` and
-            // says nothing at all about happens-before.
-            //
-            // Inert ONLY because `trust.vc/insufficient_ordering` does not route:
-            // it is an `ObligationKind::Custom` reaching the catch-all in
-            // `trust-router`'s `obligation_route`, and `fallback_route` returns
-            // None. Pinned by
-            // `full_verification::tests::concurrency_obligations_are_unroutable_until_their_formula_is_real`.
-            //
-            // DO NOT route this kind while this conjunct is `Bool(true)`. v6/D2
-            // gives `ty` ownership of concurrency, which makes "add a route" the
-            // obvious next edit; the gate is THIS FORMULA becoming a real
-            // happens-before model, not the routing table.
-            let formula = Formula::And(vec![reach_a, reach_b, Formula::Bool(true)]);
-
-            vcs.push(VerificationCondition {
-                kind: VcKind::DataRace {
-                    variable: race.location.clone(),
-                    thread_a: race.first_thread.clone(),
-                    thread_b: race.second_thread.clone(),
-                },
-                function: function_name.into(),
-                location: race.first_span.clone(),
-                formula,
-                contract_metadata: None,
-                obligation: None,
-            });
+            vcs.push(Self::race_candidate_vc(race, function_name));
         }
 
         // VCs for ordering violations
@@ -400,6 +369,29 @@ impl MemoryModelChecker {
         vcs
     }
 
+    fn race_candidate_vc(race: &RaceCondition, function_name: &str) -> VerificationCondition {
+        let detail = format!(
+            "potential conflicting accesses at indices {} and {} with location label {:?}, \
+             thread labels {:?} and {:?}; location alias, runtime-thread, and happens-before \
+             event identities are unauthenticated",
+            race.first_access,
+            race.second_access,
+            race.location,
+            race.first_thread,
+            race.second_thread
+        );
+
+        VerificationCondition {
+            kind: VcKind::UnsupportedMir { kind: "DataRaceCandidate".to_string(), detail },
+            function: function_name.into(),
+            location: race.first_span.clone(),
+            // UnsupportedMir is classified Unknown before formula dispatch.
+            formula: Formula::Bool(true),
+            contract_metadata: None,
+            obligation: None,
+        }
+    }
+
     /// Return a reference to the access log.
     #[must_use]
     pub fn log(&self) -> &AtomicAccessLog {
@@ -414,16 +406,27 @@ impl MemoryModelChecker {
 
     /// Check operation legality for a list of atomic operations.
     ///
-    /// Validates each operation against the 5 C++ standard legality rules:
+    /// Validates each operation against the single-operation legality rules
+    /// that `core::sync::atomic` enforces (each one is a `panic!` arm there):
     ///
     /// - **L1**: `load` cannot use `Release` or `AcqRel` ordering.
     /// - **L2**: `store` cannot use `Acquire` or `AcqRel` ordering.
     /// - **L3**: CAS failure ordering cannot be `Release` or `AcqRel`.
-    /// - **L4**: CAS failure ordering must be no stronger than the success
-    ///   ordering (lattice comparison via `AtomicOrdering::is_at_least()`).
     /// - **L5**: `fence` / `compiler_fence` cannot use `Relaxed` ordering.
     ///
-    /// Each violation produces a `VcKind::InsufficientOrdering` VC.
+    /// **L4 is retired.** It required the CAS failure ordering to be no
+    /// stronger than the success ordering. Rust 1.64 and C++17 dropped that
+    /// restriction, and `core::sync::atomic::atomic_compare_exchange` itself
+    /// issues `(Acquire, SeqCst)`, `(Release, Acquire)` and similar pairs. Keeping
+    /// L4 emitted an obligation against valid Rust that the routed solver
+    /// refutes (the formula below is always SAT). The label stays unused so the
+    /// L1-L5 diagnostics keep their established numbering.
+    ///
+    /// Each violation produces a `VcKind::InsufficientOrdering` VC. These are
+    /// API-legality facts about ONE operation, decided here. They are not
+    /// cross-thread ordering-sufficiency claims. The VC formula is a lone
+    /// unconstrained boolean (see `legality_vc`). trust-router refuses the kind
+    /// before dispatch (v6/D2), so the row reports `Unknown` with this rule's text.
     ///
     /// # Arguments
     ///
@@ -468,37 +471,24 @@ impl MemoryModelChecker {
                 ));
             }
 
-            // L3 & L4: CAS failure ordering rules.
+            // L3: CAS failure ordering cannot be Release or AcqRel. (L4 is
+            // retired: a failure ordering stronger than the success ordering is
+            // valid Rust; see the doc comment.)
             if matches!(
                 op.op_kind,
                 AtomicOpKind::CompareExchange | AtomicOpKind::CompareExchangeWeak
             ) && let Some(failure_ord) = &op.failure_ordering
+                && matches!(failure_ord, AtomicOrdering::Release | AtomicOrdering::AcqRel)
             {
-                // L3: CAS failure ordering cannot be Release or AcqRel.
-                if matches!(failure_ord, AtomicOrdering::Release | AtomicOrdering::AcqRel) {
-                    vcs.push(Self::legality_vc(
-                        op,
-                        function_name,
-                        &format!(
-                            "L3: {} failure ordering cannot be {} \
-                                 (failure path is load-only, cannot release)",
-                            op.op_kind, failure_ord
-                        ),
-                    ));
-                }
-
-                // L4: CAS failure ordering must not be stronger than success ordering.
-                if !op.ordering.is_at_least(failure_ord) {
-                    vcs.push(Self::legality_vc(
-                        op,
-                        function_name,
-                        &format!(
-                            "L4: {} failure ordering {} is stronger than \
-                                 success ordering {} (failure must be <= success)",
-                            op.op_kind, failure_ord, op.ordering
-                        ),
-                    ));
-                }
+                vcs.push(Self::legality_vc(
+                    op,
+                    function_name,
+                    &format!(
+                        "L3: {} failure ordering cannot be {} \
+                             (failure path is load-only, cannot release)",
+                        op.op_kind, failure_ord
+                    ),
+                ));
             }
 
             // L5: fence / compiler_fence cannot use Relaxed.
@@ -519,6 +509,13 @@ impl MemoryModelChecker {
     }
 
     /// Build a `VcKind::InsufficientOrdering` VC for a legality violation.
+    ///
+    /// The formula is the lone free boolean `__trust_memory_ordering__reach_<var>`.
+    /// Nothing constrains it, so it carries no program semantics: the violation
+    /// was decided by the caller. trust-router refuses `InsufficientOrdering`
+    /// before dispatch. Even a direct solver call can only answer SAT (model
+    /// `reach = true`) or give up, never `Proved`. Do not strengthen or conjoin
+    /// this formula without a real reachability or memory model (v6/D2).
     fn legality_vc(
         op: &AtomicOperation,
         function_name: &str,
@@ -540,6 +537,46 @@ impl MemoryModelChecker {
             formula: reach,
             contract_metadata: None,
             obligation: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_race::AccessKind;
+
+    #[test]
+    fn race_candidate_keeps_caller_labels_diagnostic() {
+        for (location, first_thread, second_thread) in
+            [("shared", "worker", "worker"), ("left", "worker_a", "worker_b")]
+        {
+            let race = RaceCondition {
+                first_access: 2,
+                second_access: 5,
+                location: location.to_string(),
+                first_thread: first_thread.to_string(),
+                second_thread: second_thread.to_string(),
+                first_kind: AccessKind::Write,
+                second_kind: AccessKind::Read,
+                first_span: SourceSpan::default(),
+                second_span: SourceSpan::default(),
+            };
+
+            let vc = MemoryModelChecker::race_candidate_vc(&race, "concurrent_fn");
+            let VcKind::UnsupportedMir { kind, detail } = &vc.kind else {
+                panic!("potential race must remain unsupported: {vc:?}");
+            };
+            assert_eq!(kind, "DataRaceCandidate");
+            assert!(detail.contains("indices 2 and 5"));
+            assert!(detail.contains(location));
+            assert!(detail.contains(first_thread));
+            assert!(detail.contains(second_thread));
+            assert!(detail.contains("unauthenticated"));
+            assert!(detail.contains("happens-before"));
+            assert_eq!(vc.function.as_str(), "concurrent_fn");
+            assert_eq!(vc.location, race.first_span);
+            assert_eq!(vc.formula, Formula::Bool(true));
         }
     }
 }

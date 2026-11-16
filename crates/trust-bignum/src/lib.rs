@@ -76,6 +76,13 @@ extern crate std;
 mod arith;
 mod decimal;
 mod divmod;
+// I6 / TRUST.md item 9: the five PINNED `trust_bignum_nat_*` C-ABI entry points
+// of the `Nat` trusted handle runtime (the fifth, `_drop`, is the RELEASE entry
+// point ratified in trust-ir `SPEC_RATIFICATIONS` §7 on 2026-09-17). PRIVATE as a Rust module on purpose —
+// nothing in this crate's Rust API changes, and `#[unsafe(no_mangle)]` exports
+// the symbols by link name regardless of Rust visibility, which is the only
+// surface the pin names.
+mod handle_abi;
 
 use alloc::vec::Vec;
 use core::cmp::Ordering;

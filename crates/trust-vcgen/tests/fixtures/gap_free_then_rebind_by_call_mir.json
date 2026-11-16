@@ -1,0 +1,1013 @@
+{
+  "name": "free_then_rebind_by_call",
+  "def_path": "gapprobe::free_then_rebind_by_call",
+  "span": {
+    "file": "gapprobe.rs",
+    "line_start": 50,
+    "col_start": 0,
+    "line_end": 56,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "core::alloc::layout::Layout",
+            "fields": [
+              [
+                "size",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "align",
+                {
+                  "Adt": {
+                    "name": "core::mem::alignment::Alignment",
+                    "fields": [
+                      [
+                        "_inner_repr_trick",
+                        {
+                          "Adt": {
+                            "name": "core::mem::alignment::AlignmentEnum",
+                            "fields": [
+                              [
+                                "__tag",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": true
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [
+                              {
+                                "name": "_Align1Shl0",
+                                "discriminant": 1,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl1",
+                                "discriminant": 2,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl2",
+                                "discriminant": 4,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl3",
+                                "discriminant": 8,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl4",
+                                "discriminant": 16,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl5",
+                                "discriminant": 32,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl6",
+                                "discriminant": 64,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl7",
+                                "discriminant": 128,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl8",
+                                "discriminant": 256,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl9",
+                                "discriminant": 512,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl10",
+                                "discriminant": 1024,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl11",
+                                "discriminant": 2048,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl12",
+                                "discriminant": 4096,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl13",
+                                "discriminant": 8192,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl14",
+                                "discriminant": 16384,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl15",
+                                "discriminant": 32768,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl16",
+                                "discriminant": 65536,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl17",
+                                "discriminant": 131072,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl18",
+                                "discriminant": 262144,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl19",
+                                "discriminant": 524288,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl20",
+                                "discriminant": 1048576,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl21",
+                                "discriminant": 2097152,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl22",
+                                "discriminant": 4194304,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl23",
+                                "discriminant": 8388608,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl24",
+                                "discriminant": 16777216,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl25",
+                                "discriminant": 33554432,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl26",
+                                "discriminant": 67108864,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl27",
+                                "discriminant": 134217728,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl28",
+                                "discriminant": 268435456,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl29",
+                                "discriminant": 536870912,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl30",
+                                "discriminant": 1073741824,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl31",
+                                "discriminant": 2147483648,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl32",
+                                "discriminant": 4294967296,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl33",
+                                "discriminant": 8589934592,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl34",
+                                "discriminant": 17179869184,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl35",
+                                "discriminant": 34359738368,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl36",
+                                "discriminant": 68719476736,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl37",
+                                "discriminant": 137438953472,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl38",
+                                "discriminant": 274877906944,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl39",
+                                "discriminant": 549755813888,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl40",
+                                "discriminant": 1099511627776,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl41",
+                                "discriminant": 2199023255552,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl42",
+                                "discriminant": 4398046511104,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl43",
+                                "discriminant": 8796093022208,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl44",
+                                "discriminant": 17592186044416,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl45",
+                                "discriminant": 35184372088832,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl46",
+                                "discriminant": 70368744177664,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl47",
+                                "discriminant": 140737488355328,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl48",
+                                "discriminant": 281474976710656,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl49",
+                                "discriminant": 562949953421312,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl50",
+                                "discriminant": 1125899906842624,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl51",
+                                "discriminant": 2251799813685248,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl52",
+                                "discriminant": 4503599627370496,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl53",
+                                "discriminant": 9007199254740992,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl54",
+                                "discriminant": 18014398509481984,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl55",
+                                "discriminant": 36028797018963968,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl56",
+                                "discriminant": 72057594037927936,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl57",
+                                "discriminant": 144115188075855872,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl58",
+                                "discriminant": 288230376151711744,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl59",
+                                "discriminant": 576460752303423488,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl60",
+                                "discriminant": 1152921504606846976,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl61",
+                                "discriminant": 2305843009213693952,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl62",
+                                "discriminant": 4611686018427387904,
+                                "fields": []
+                              },
+                              {
+                                "name": "_Align1Shl63",
+                                "discriminant": 9223372036854775808,
+                                "fields": []
+                              }
+                            ],
+                            "disc_index_safe": true,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Enum"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "l"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "p"
+      },
+      {
+        "index": 3,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::alloc::layout::Layout::from_size_align_unchecked",
+            "args": [
+              {
+                "Constant": {
+                  "Uint": [
+                    8,
+                    64
+                  ]
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    8,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "gapprobe.rs",
+              "line_start": 51,
+              "col_start": 21,
+              "line_end": 51,
+              "col_end": 60
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": true,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 294804754436949700,
+              "def_index": 17278,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "LayoutFromSizeAlignUnchecked",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 294804754436949700,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "alloc::alloc::alloc",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "gapprobe.rs",
+              "line_start": 52,
+              "col_start": 25,
+              "line_end": 52,
+              "col_end": 33
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": true,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 2928027257787172094,
+              "def_index": 132,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "AllocAlloc",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 2928027257787172094,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "gapprobe.rs",
+                "line_start": 53,
+                "col_start": 21,
+                "line_end": 53,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::alloc::dealloc",
+            "args": [
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "gapprobe.rs",
+              "line_start": 53,
+              "col_start": 13,
+              "line_end": 53,
+              "col_end": 26
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": true,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 2928027257787172094,
+              "def_index": 133,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "AllocDealloc",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 2928027257787172094,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "gapprobe::{extern#0}::fresh",
+            "args": [],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "gapprobe.rs",
+              "line_start": 54,
+              "col_start": 17,
+              "line_end": 54,
+              "col_end": 24
+            },
+            "atomic": null,
+            "is_foreign": true,
+            "is_unsafe_sig": true,
+            "callee_identity": {
+              "stable_crate_id": 8715557724471781790,
+              "def_index": 10,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 8715557724471781790,
+              "krate_name": "gapprobe",
+              "foreign_block_leaf": "fresh"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 5,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "gapprobe.rs",
+                "line_start": 54,
+                "col_start": 4,
+                "line_end": 54,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "gapprobe.rs",
+                "line_start": 55,
+                "col_start": 13,
+                "line_end": 55,
+                "col_end": 15
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "gapprobe.rs",
+                "line_start": 55,
+                "col_start": 13,
+                "line_end": 55,
+                "col_end": 15
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "gapprobe.rs",
+                "line_start": 55,
+                "col_start": 13,
+                "line_end": 55,
+                "col_end": 15
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "gapprobe.rs",
+                "line_start": 55,
+                "col_start": 13,
+                "line_end": 55,
+                "col_end": 15
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "gapprobe.rs",
+                "line_start": 55,
+                "col_start": 13,
+                "line_end": 55,
+                "col_end": 15
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Not",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "gapprobe.rs",
+                "line_start": 55,
+                "col_start": 13,
+                "line_end": 55,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "NullPointerDereference",
+            "target": 5,
+            "span": {
+              "file": "gapprobe.rs",
+              "line_start": 55,
+              "col_start": 13,
+              "line_end": 55,
+              "col_end": 15
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "gapprobe.rs",
+                "line_start": 55,
+                "col_start": 13,
+                "line_end": 55,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -272,6 +272,14 @@ pub fn derive_flip_body<'tcx>(
             body.arg_count, normal.arg_count
         ));
     }
+    // Trust (F2, 2026-09-29): the ABI also decides WHICH argument local is spread. Built MIR
+    // sets `spread_arg = Some(_last)` for a non-closure `extern "rust-call"` body (a user `impl
+    // Fn*`), the derived body is `Body::new` (`None`), and codegen maps arguments to the FnAbi
+    // by it: the flip ICEd in `arg_local_refs` on a valid program. REFUSES MORE: a body whose
+    // spread differs is simply not flipped.
+    if let Some(reason) = spread_arg_refusal(body.spread_arg, normal.spread_arg) {
+        return rejected(reason);
+    }
     for i in 0..=body.arg_count {
         let l = Local::from_usize(i);
         let (d, n) = (body.local_decls[l].ty, normal.local_decls[l].ty);
@@ -298,6 +306,13 @@ pub fn derive_flip_body<'tcx>(
     body.span = normal.span;
 
     FlipAttempt::Derived { body, asserts, lineage }
+}
+
+/// Trust (F2): the spread-argument half of the ABI gate, `TyCtxt`-free so it is tested whole.
+/// `None` iff the derived body spreads exactly the argument built spreads (including neither).
+pub(crate) fn spread_arg_refusal(derived: Option<Local>, built: Option<Local>) -> Option<String> {
+    (derived != built)
+        .then(|| format!("spread_arg mismatch: derived {derived:?} vs built {built:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +348,22 @@ pub(crate) fn const_trap_gate(module: &Module) -> Result<(), String> {
         }
     }
     let is_const = |v: &ValueId| const_vals.contains(v);
+    // Trust (2026-10-03, shift-count mask): the producer now masks a checks-OFF shift count
+    // (`emit_masked_shift_count`: `amount & (BITS - 1)`), so a literal count reaches the shift
+    // as the `And` of two constants rather than as a constant. The derived MIR is still the
+    // bare `Shl(x, const k)` (`to_mir::shift_masked_unit`), so the `KnownPanicsLint` hazard is
+    // unchanged: a shift by such an `And` stays a const-amount shift here, exactly as before
+    // the mask existed.
+    let mut masked_const_vals: HashSet<ValueId> = HashSet::new();
+    for blk in &func.blocks {
+        for node in &blk.body {
+            if let Inst::BinOp { op: BinOp::And, lhs, rhs, .. } = &node.inst {
+                if is_const(lhs) && is_const(rhs) {
+                    masked_const_vals.extend(node.results.iter().copied());
+                }
+            }
+        }
+    }
     for blk in &func.blocks {
         for node in &blk.body {
             match &node.inst {
@@ -342,7 +373,7 @@ pub(crate) fn const_trap_gate(module: &Module) -> Result<(), String> {
                         .to_string());
                 }
                 Inst::BinOp { op: BinOp::Shl | BinOp::LShr | BinOp::AShr, rhs, .. }
-                    if is_const(rhs) =>
+                    if is_const(rhs) || masked_const_vals.contains(rhs) =>
                 {
                     return Err("const shift amount (KnownPanicsLint hazard)".to_string());
                 }
@@ -3712,7 +3743,7 @@ pub(crate) fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> R
             return Err("derived block without terminator".to_string());
         };
         match &term.kind {
-            TerminatorKind::Goto { target } => target_ok(*target)?,
+            TerminatorKind::Goto { target, .. } => target_ok(*target)?,
             TerminatorKind::SwitchInt { discr, targets } => {
                 operand_ok(body, &payload_temps, discr)?;
                 for t in targets.all_targets() {
@@ -3884,7 +3915,7 @@ fn asserts_in_dfs_order<'tcx>(body: &Body<'tcx>) -> Result<Vec<BasicBlock>, Stri
             return Err("block without terminator".to_string());
         };
         let succs: Vec<BasicBlock> = match &term.kind {
-            TerminatorKind::Goto { target } => vec![*target],
+            TerminatorKind::Goto { target, .. } => vec![*target],
             TerminatorKind::SwitchInt { targets, .. } => {
                 let mut v: Vec<BasicBlock> = targets.iter().map(|(_, t)| t).collect();
                 v.push(targets.otherwise());

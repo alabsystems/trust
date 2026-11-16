@@ -58,6 +58,34 @@ pub fn strengthen(
         .collect()
 }
 
+/// Generate proposals for one function, reading its source when
+/// `function_path` names a file that defines `function_name`.
+///
+/// With source, proposals name the function's real variables
+/// ([`strengthen_with_context`]); without it, the context-free
+/// [`strengthen`] proposes nothing that needs a name it cannot recover.
+pub fn strengthen_for_function(
+    function_path: &str,
+    function_name: &str,
+    analyses: &[FailureAnalysis],
+) -> Vec<Proposal> {
+    let source = std::fs::read_to_string(function_path).ok();
+    strengthen_for_function_in_source(function_path, function_name, analyses, source.as_deref())
+}
+
+/// Generate proposals for one function using pre-loaded file contents when available.
+pub(crate) fn strengthen_for_function_in_source(
+    function_path: &str,
+    function_name: &str,
+    analyses: &[FailureAnalysis],
+    source_text: Option<&str>,
+) -> Vec<Proposal> {
+    match source_text.and_then(|src| source_reader::extract_function(src, function_name)) {
+        Some(ctx) => strengthen_with_context(function_path, function_name, analyses, &ctx),
+        None => strengthen(function_path, function_name, analyses),
+    }
+}
+
 /// Generate context-aware proposals using source code analysis.
 ///
 /// When `SourceContext` is available, proposals use real variable names:
@@ -154,65 +182,63 @@ fn propose_overflow_fix(
         _ => '?',
     };
 
-    // Try to find real operand names from source context
-    let (left, right, type_suffix) = if let Some(ctx) = source_ctx {
-        let operands = source_reader::find_arithmetic_operands(ctx);
-        let matching = operands.iter().find(|(_, _, c)| *c == op_char);
-        if let Some((l, r, _)) = matching {
-            // Determine type suffix from param types
-            let suffix = ctx
-                .params
-                .iter()
-                .find(|(name, _)| name == l)
-                .map(|(_, ty)| type_max_for(ty))
-                .unwrap_or_default();
-            (l.clone(), r.clone(), suffix)
-        } else {
-            ("a".to_string(), "b".to_string(), String::new())
-        }
-    } else {
-        ("a".to_string(), "b".to_string(), String::new())
+    // Recover the real operands from the function's source. Operand names are
+    // never invented: with no source context, or no bound variable pair around
+    // this operator, there is nothing to name, so nothing is proposed — the same
+    // policy as `FailurePattern::Unknown`. (A placeholder such as `a + b >= a`
+    // names variables the function does not have; backprop rightly refuses it as
+    // out of scope, and the matching `SafeArithmetic` pattern never occurs in
+    // the source.)
+    let Some((ctx, pair)) = source_ctx.and_then(|ctx| {
+        source_reader::find_first_arithmetic_operand_pair(ctx, op_char).map(|pair| (ctx, pair))
+    }) else {
+        return Vec::new();
     };
+    let (left, right) = (pair.left.as_str(), pair.right.as_str());
 
-    // Build context-aware spec body
-    let spec_body = if !type_suffix.is_empty() {
-        match op {
-            BinOp::Add => format!("{left} <= {type_suffix} - {right}"),
-            BinOp::Sub => format!("{left} >= {right}"),
-            BinOp::Mul => format!("{left} == 0 || {right} <= {type_suffix} / {left}"),
-            _ => format!("{left} + {right} >= {left}"),
-        }
-    } else {
-        match op {
-            BinOp::Add => format!("{left} + {right} >= {left}"),
-            BinOp::Sub => format!("{left} >= {right}"),
-            BinOp::Mul => format!("{left} == 0 || {right} == 0"),
-            _ => format!("{left} + {right} >= {left}"),
-        }
-    };
+    let mut proposals = Vec::new();
 
-    // Build context-aware checked arithmetic replacement
+    // A precondition may name only parameters: a body local is not in scope in
+    // a `requires` clause. The bound needs the operand type's maximum.
+    if pair.both_params {
+        let left_ty =
+            ctx.params.iter().find(|(name, _)| name == left).map_or("", |(_, ty)| ty.trim());
+        let type_max = type_max_for(left_ty);
+        let unsigned = left_ty.starts_with('u') && !type_max.is_empty();
+        let spec_body = match op {
+            BinOp::Add if !type_max.is_empty() => Some(format!("{left} <= {type_max} - {right}")),
+            // `l >= r` is exactly the no-underflow condition for UNSIGNED
+            // operands only; for signed operands it is not (`0 - MIN`).
+            BinOp::Sub if unsigned => Some(format!("{left} >= {right}")),
+            BinOp::Mul if !type_max.is_empty() => {
+                Some(format!("{left} == 0 || {right} <= {type_max} / {left}"))
+            }
+            _ => None,
+        };
+        if let Some(spec_body) = spec_body {
+            proposals.push(Proposal {
+                function_path: function_path.into(),
+                function_name: function_name.into(),
+                kind: ProposalKind::AddPrecondition { spec_body },
+                confidence: 0.85,
+                rationale: format!(
+                    "Arithmetic {op_name} can overflow -- add precondition bounding operands"
+                ),
+            });
+        }
+    }
+
+    // A checked-arithmetic rewrite applies to any recovered pair, locals included.
     let original = format!("{left} {sym} {right}", sym = op_symbol(op));
     let replacement = format!("{left}.{checked_method}({right}).expect(\"{op_name} overflow\")");
-
-    vec![
-        Proposal {
-            function_path: function_path.into(),
-            function_name: function_name.into(),
-            kind: ProposalKind::AddPrecondition { spec_body },
-            confidence: 0.85,
-            rationale: format!(
-                "Arithmetic {op_name} can overflow -- add precondition bounding operands"
-            ),
-        },
-        Proposal {
-            function_path: function_path.into(),
-            function_name: function_name.into(),
-            kind: ProposalKind::SafeArithmetic { original, replacement },
-            confidence: 0.75,
-            rationale: format!("Replace raw {op_name} with {checked_method}() for safe arithmetic"),
-        },
-    ]
+    proposals.push(Proposal {
+        function_path: function_path.into(),
+        function_name: function_name.into(),
+        kind: ProposalKind::SafeArithmetic { original, replacement },
+        confidence: 0.75,
+        rationale: format!("Replace raw {op_name} with {checked_method}() for safe arithmetic"),
+    });
+    proposals
 }
 
 fn propose_div_zero_fix(
@@ -221,12 +247,8 @@ fn propose_div_zero_fix(
     source_ctx: Option<&SourceContext>,
 ) -> Vec<Proposal> {
     // Try to find the actual divisor variable name
-    let divisor_name = if let Some(ctx) = source_ctx {
-        let divisors = source_reader::find_divisor_params(ctx);
-        divisors.into_iter().next().unwrap_or_else(|| "divisor".to_string())
-    } else {
-        "divisor".to_string()
-    };
+    let divisor_name =
+        source_ctx.and_then(source_reader::find_first_divisor_param).unwrap_or("divisor");
 
     vec![
         Proposal {
@@ -254,17 +276,9 @@ fn propose_oob_fix(
     source_ctx: Option<&SourceContext>,
 ) -> Vec<Proposal> {
     // Try to find the actual index and array variable names
-    let (index_name, array_expr) = if let Some(ctx) = source_ctx {
-        let indices = source_reader::find_index_params(ctx);
-        if let Some((idx, arr_opt)) = indices.into_iter().next() {
-            let arr = arr_opt.unwrap_or_else(|| "slice".to_string());
-            (idx, arr)
-        } else {
-            ("index".to_string(), "slice".to_string())
-        }
-    } else {
-        ("index".to_string(), "slice".to_string())
-    };
+    let (index_name, array_expr) = source_ctx
+        .and_then(source_reader::find_first_index_param)
+        .map_or(("index", "slice"), |(idx, arr_opt)| (idx, arr_opt.unwrap_or("slice")));
 
     vec![
         Proposal {
@@ -392,11 +406,12 @@ fn propose_shift_overflow_fix(
     // operand bit width from the VC's `operand_ty` (else symbolic `bit_width`). So
     // for `1u128 << width` this proposes `width < 128`, not the old generic
     // `shift < bit_width` — matching the div-zero/OOB context-aware fixes.
-    let shift_name = source_ctx
-        .and_then(|ctx| source_reader::find_shift_params(ctx).into_iter().next())
-        .unwrap_or_else(|| "shift".to_string());
-    let width_str = operand_width.map_or_else(|| "bit_width".to_string(), |w| w.to_string());
-    let spec = format!("{shift_name} < {width_str}");
+    let shift_name =
+        source_ctx.and_then(source_reader::find_first_shift_param).unwrap_or("shift");
+    let spec = match operand_width {
+        Some(w) => format!("{shift_name} < {w}"),
+        None => format!("{shift_name} < bit_width"),
+    };
     vec![
         Proposal {
             function_path: function_path.into(),
@@ -566,7 +581,7 @@ fn propose_temporal_fix(function_path: &str, function_name: &str) -> Vec<Proposa
 }
 
 /// Map a Rust type string to its MAX constant expression.
-fn type_max_for(ty: &str) -> String {
+fn type_max_for(ty: &str) -> &'static str {
     // Trust (loop applicability, 2026-07-04): emit the NUMERIC LITERAL, not the
     // `T::MAX` associated-const PATH. The native `requires` expression parser
     // evaluates integer literals and literal arithmetic (`a <= 4294967295 - 1`)
@@ -579,17 +594,17 @@ fn type_max_for(ty: &str) -> String {
     // overflow obligation FAILED (the loop just doesn't converge), never a false
     // proof.
     match ty {
-        "u8" => "255".to_string(),
-        "u16" => "65535".to_string(),
-        "u32" => "4294967295".to_string(),
-        "u64" | "usize" => "18446744073709551615".to_string(),
-        "u128" => "340282366920938463463374607431768211455".to_string(),
-        "i8" => "127".to_string(),
-        "i16" => "32767".to_string(),
-        "i32" => "2147483647".to_string(),
-        "i64" | "isize" => "9223372036854775807".to_string(),
-        "i128" => "170141183460469231731687303715884105727".to_string(),
-        _ => String::new(),
+        "u8" => "255",
+        "u16" => "65535",
+        "u32" => "4294967295",
+        "u64" | "usize" => "18446744073709551615",
+        "u128" => "340282366920938463463374607431768211455",
+        "i8" => "127",
+        "i16" => "32767",
+        "i32" => "2147483647",
+        "i64" | "isize" => "9223372036854775807",
+        "i128" => "170141183460469231731687303715884105727",
+        _ => "",
     }
 }
 
@@ -634,10 +649,11 @@ mod tests {
             solver: Some("ay".into()),
         };
 
+        // Without source context there are no operand names to recover, so the
+        // overflow fix proposes nothing rather than inventing `a`/`b` (which
+        // backprop refuses as out of scope since 476a4e2a890).
         let proposals = strengthen("test::get_midpoint", "get_midpoint", &[analysis]);
-        assert_eq!(proposals.len(), 2);
-        assert!(matches!(proposals[0].kind, ProposalKind::AddPrecondition { .. }));
-        assert!(matches!(proposals[1].kind, ProposalKind::SafeArithmetic { .. }));
+        assert!(proposals.is_empty(), "no context must yield no proposals: {proposals:?}");
     }
 
     #[test]
@@ -931,34 +947,104 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_context_aware_falls_back_without_match() {
-        // Source has no arithmetic, so overflow proposal falls back to generic names
-        let source = "fn noop(x: i32) -> i32 {\n    x\n}";
-        let ctx = extract_function(source, "noop").unwrap();
-
-        let analysis = FailureAnalysis {
+    fn overflow_analysis(op: BinOp, function: &str) -> FailureAnalysis {
+        FailureAnalysis {
             vc_kind: VcKind::ArithmeticOverflow {
-                op: BinOp::Add,
+                op,
                 operand_tys: (
                     Ty::Int { width: 64, signed: false },
                     Ty::Int { width: 64, signed: false },
                 ),
             },
-            function: "noop".into(),
-            pattern: FailurePattern::ArithmeticOverflow { op: BinOp::Add },
+            function: function.into(),
+            pattern: FailurePattern::ArithmeticOverflow { op },
             solver: None,
-        };
-
-        let proposals = strengthen_with_context("test::noop", "noop", &[analysis], &ctx);
-
-        assert_eq!(proposals.len(), 2);
-        // Falls back to generic formula with placeholder var names
-        if let ProposalKind::AddPrecondition { ref spec_body } = proposals[0].kind {
-            assert_eq!(spec_body, "a + b >= a");
-        } else {
-            panic!("expected AddPrecondition");
         }
+    }
+
+    #[test]
+    fn test_context_aware_no_operands_proposes_nothing() {
+        // Source has no arithmetic: no operand names can be recovered, so the
+        // overflow fix proposes nothing. It used to fall back to the placeholder
+        // `a + b >= a`, naming variables `noop` does not have.
+        let source = "fn noop(x: i32) -> i32 {\n    x\n}";
+        let ctx = extract_function(source, "noop").unwrap();
+
+        let proposals = strengthen_with_context(
+            "test::noop",
+            "noop",
+            &[overflow_analysis(BinOp::Add, "noop")],
+            &ctx,
+        );
+        assert!(proposals.is_empty(), "no recoverable operands must yield nothing: {proposals:?}");
+    }
+
+    #[test]
+    fn test_overflow_on_locals_proposes_only_safe_arithmetic() {
+        // `low`/`high` are body locals: a `requires` clause cannot name them, so
+        // only the checked-arithmetic rewrite is proposed.
+        let source = "fn binary_search(arr: &[i32], target: i32) -> Option<usize> {\n    \
+                      let mut low: usize = 0;\n    let mut high: usize = arr.len();\n    \
+                      let mid = (low + high) / 2;\n    None\n}";
+        let ctx = extract_function(source, "binary_search").unwrap();
+
+        let proposals = strengthen_with_context(
+            "test::binary_search",
+            "binary_search",
+            &[overflow_analysis(BinOp::Add, "binary_search")],
+            &ctx,
+        );
+        assert_eq!(proposals.len(), 1, "{proposals:?}");
+        assert_eq!(
+            proposals[0].kind,
+            ProposalKind::SafeArithmetic {
+                original: "low + high".into(),
+                replacement: "low.checked_add(high).expect(\"addition overflow\")".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_overflow_mixed_param_and_local_has_no_precondition() {
+        let source = "fn bump(n: u32) -> u32 {\n    let step: u32 = 3;\n    n + step\n}";
+        let ctx = extract_function(source, "bump").unwrap();
+
+        let proposals = strengthen_with_context(
+            "test::bump",
+            "bump",
+            &[overflow_analysis(BinOp::Add, "bump")],
+            &ctx,
+        );
+        assert_eq!(proposals.len(), 1, "{proposals:?}");
+        assert!(matches!(
+            &proposals[0].kind,
+            ProposalKind::SafeArithmetic { original, .. } if original == "n + step"
+        ));
+    }
+
+    #[test]
+    fn test_signed_subtraction_gets_no_unsigned_bound() {
+        // `x >= y` is the no-underflow condition only for unsigned operands.
+        let source = "fn diff(x: i32, y: i32) -> i32 {\n    x - y\n}";
+        let ctx = extract_function(source, "diff").unwrap();
+        let proposals = strengthen_with_context(
+            "test::diff",
+            "diff",
+            &[overflow_analysis(BinOp::Sub, "diff")],
+            &ctx,
+        );
+        assert_eq!(proposals.len(), 1, "{proposals:?}");
+        assert!(matches!(proposals[0].kind, ProposalKind::SafeArithmetic { .. }));
+
+        let source = "fn diff(x: u32, y: u32) -> u32 {\n    x - y\n}";
+        let ctx = extract_function(source, "diff").unwrap();
+        let proposals = strengthen_with_context(
+            "test::diff",
+            "diff",
+            &[overflow_analysis(BinOp::Sub, "diff")],
+            &ctx,
+        );
+        assert_eq!(proposals[0].kind, ProposalKind::AddPrecondition { spec_body: "x >= y".into() });
     }
 
     #[test]
@@ -1187,8 +1273,10 @@ mod tests {
         // `propose_precondition_fix`.) `Unknown` is deliberately absent: it has
         // nothing to say, and saying it anyway would rank a non-spec above a
         // real candidate.
+        // `ArithmeticOverflow` is absent too: its proposals name real operands,
+        // so without source context it proposes nothing (see
+        // `test_overflow_proposals`; the context-aware tests cover it).
         let patterns: Vec<FailurePattern> = vec![
-            FailurePattern::ArithmeticOverflow { op: BinOp::Add },
             FailurePattern::DivisionByZero,
             FailurePattern::IndexOutOfBounds,
             FailurePattern::CastOverflow,

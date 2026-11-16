@@ -27,8 +27,8 @@ command -v clang >/dev/null   || { echo "clang is required (assembles candidates
 command -v objdump >/dev/null || { echo "objdump is required (the oracle)" >&2; exit 2; }
 
 echo "building..."
-targo --unverified build --release >/dev/null 2>&1 \
-  || cargo build --release >/dev/null 2>&1 \
+. ../targo.sh
+"$TARGO" --unverified build --release >/dev/null 2>&1 \
   || { echo "build failed" >&2; exit 2; }
 
 fail=0

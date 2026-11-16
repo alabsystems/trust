@@ -3,9 +3,10 @@
 
 //! The JSON tree.
 
+use core::fmt::{self, Debug, Display};
+
 use crate::map::Map;
 use crate::number::Number;
-use core::fmt::{self, Debug, Display};
 
 /// Represents any valid JSON value.
 #[derive(Clone, PartialEq, Eq, Default)]

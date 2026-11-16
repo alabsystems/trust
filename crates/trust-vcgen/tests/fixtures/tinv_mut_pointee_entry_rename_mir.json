@@ -1,0 +1,639 @@
+{
+  "name": "rebind",
+  "def_path": "a::S::rebind",
+  "span": {
+    "file": "a.rs",
+    "line_start": 3,
+    "col_start": 4,
+    "line_end": 7,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "a::S",
+                "fields": [
+                  [
+                    "v",
+                    {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "k",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "a.rs",
+                "line_start": 4,
+                "col_start": 16,
+                "line_end": 4,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "a.rs",
+                "line_start": 4,
+                "col_start": 23,
+                "line_end": 4,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<alloc::vec::Vec<u8> as core::ops::index::Index<usize>>::index",
+            "args": [
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "a.rs",
+              "line_start": 4,
+              "col_start": 22,
+              "line_end": 4,
+              "col_end": 30
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 2303383828624967836,
+              "def_index": 39107,
+              "substs_digest": [
+                10890212348491401979,
+                6967900035612281828
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 2303383828624967836,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "a.rs",
+                "line_start": 4,
+                "col_start": 16,
+                "line_end": 4,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "a.rs",
+                "line_start": 5,
+                "col_start": 17,
+                "line_end": 5,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<u8>::len",
+            "args": [
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "a.rs",
+              "line_start": 5,
+              "col_start": 17,
+              "line_end": 5,
+              "col_end": 29
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3578689973529518797,
+              "def_index": 8821,
+              "substs_digest": [
+                936419510486979036,
+                12894693032926390076
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "VecLen",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3578689973529518797,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 1
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "a.rs",
+                "line_start": 5,
+                "col_start": 8,
+                "line_end": 5,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "a.rs",
+                "line_start": 6,
+                "col_start": 12,
+                "line_end": 6,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "a.rs",
+                "line_start": 6,
+                "col_start": 19,
+                "line_end": 6,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<alloc::vec::Vec<u8> as core::ops::index::Index<usize>>::index",
+            "args": [
+              {
+                "Move": {
+                  "local": 10,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 11,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 9,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "a.rs",
+              "line_start": 6,
+              "col_start": 18,
+              "line_end": 6,
+              "col_end": 26
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 2303383828624967836,
+              "def_index": 39107,
+              "substs_digest": [
+                10890212348491401979,
+                6967900035612281828
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 2303383828624967836,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "a.rs",
+                "line_start": 6,
+                "col_start": 12,
+                "line_end": 6,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitXor",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "a.rs",
+                "line_start": 6,
+                "col_start": 8,
+                "line_end": 6,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

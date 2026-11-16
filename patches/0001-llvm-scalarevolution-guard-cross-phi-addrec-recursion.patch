@@ -9,63 +9,120 @@ header PHIs whose operands reach back to the first PHI recurses unboundedly --
 the general path's symbolic-name cycle breaker is never reached, because the
 simple path runs first on every re-entry.
 
-Fix: a PendingAddRecPHIs set (mirroring the existing PendingPhiRanges idiom)
-guards createAddRecFromPHI. Re-entry for an in-progress PHI returns nullptr, so
-that occurrence is modelled as a plain SCEVUnknown (a sound over-approximation)
-and the outer construction completes and memoizes the precise AddRec. The set
-is transient and scope-exit-erased; no invalidation plumbing is needed.
+Fix: install the symbolic placeholder (getUnknown(PN)) into ValueExprMap
+BEFORE the simple affine path, exactly the discipline the general path
+already uses, and purge it with forgetMemoizedResults before memoizing the
+precise AddRec. Re-entry then returns the placeholder instead of recursing,
+and nothing keeps the over-approximation.
 
-Validated by a full stage-2 build on default stacks with zero SIGBUS; the crash
-was previously reproducible, and RUST_MIN_STACK=128M only outran it, which
-confirmed unbounded recursion rather than a deep-but-finite stack.
+An earlier revision (1d1d11bed9f) instead guarded re-entry with a
+PendingAddRecPHIs set returning nullptr. That stopped the recursion but left
+SCEVUnknown memoized for PHIs reached during the cycle, which broke
+IndVarSimplify's congruent-IV merging (measured 2026-08-24 on
+tests/codegen-llvm/bounds-checking/gep-issue-133979.rs). Do not reintroduce
+the bailout -- fix the ordering. The in-tree code comments carry the full
+account at both sites.
 
-Applies to the LLVM 22.1.x line (the tree Trust develops against is 22.1.2).
-Upstream LLVM releases -- including distribution packages such as Homebrew's
-llvm@22 -- carry the unguarded code, so an external LLVM must be patched and
-rebuilt before it can host a Trust build. See patches/README.md.
+Validated by full stage-2 builds on default stacks with zero SIGBUS; the
+crash was previously reproducible, and RUST_MIN_STACK=128M only outran it,
+which confirmed unbounded recursion rather than a deep-but-finite stack.
 
-Origin: Trust commit 1d1d11bed9fa32dfa20e45592dd748b0fef64e4d.
+Applies to the LLVM 23.1.x line (the tree pinned by rustc 1.101.0-nightly,
+llvm-project 915c669d232e). Upstream LLVM releases -- including distribution
+packages such as Homebrew's llvm@23 -- carry the unguarded code, so an
+external LLVM must be patched and rebuilt before it can host a Trust build.
+See patches/README.md.
 
-diff --git a/llvm/include/llvm/Analysis/ScalarEvolution.h b/llvm/include/llvm/Analysis/ScalarEvolution.h
-index dcd11daf9e..cd0d55485e 100644
+Origin: Trust commit 1d1d11bed9fa32dfa20e45592dd748b0fef64e4d, revised to the
+placeholder-first form during the 1.99 development line; regenerated against
+LLVM 23.1 during the Rust 1.101 migration (2026-10-16).
+
 --- a/llvm/include/llvm/Analysis/ScalarEvolution.h
 +++ b/llvm/include/llvm/Analysis/ScalarEvolution.h
-@@ -1532,6 +1532,16 @@ private:
-   // Mark SCEVUnknown Phis currently being processed by isImpliedViaMerge.
-   SmallPtrSet<const PHINode *, 6> PendingMerges;
+@@ -2031,8 +2031,16 @@
+   const SCEV *createAddRecFromPHI(PHINode *PN);
  
-+  /// Set of Phis whose AddRec construction is in progress. Guards
-+  /// createAddRecFromPHI against cross-PHI recursion cycles: the simple
-+  /// affine path (createSimpleAffineAddRec) evaluates the start/accum
-+  /// operands BEFORE any symbolic placeholder is inserted into
-+  /// ValueExprMap, so a chain of header PHIs whose operands reach back to
-+  /// the first PHI recurses without ever hitting the general path's
-+  /// symbolic-name cycle breaker (observed as unbounded
-+  /// createSCEV -> createAddRecFromPHI recursion; stack overflow).
-+  SmallPtrSet<const PHINode *, 6> PendingAddRecPHIs;
-+
-   /// Set to true by isLoopBackedgeGuardedByCond when we're walking the set of
-   /// conditions dominating the backedge of a loop.
-   bool WalkingBEDominatingConds = false;
-diff --git a/llvm/lib/Analysis/ScalarEvolution.cpp b/llvm/lib/Analysis/ScalarEvolution.cpp
-index e19de5f46f..7c1fa27ab4 100644
+   /// A helper function for createAddRecFromPHI to handle simple cases.
++  ///
++  /// Trust: \p SymbolicName is the placeholder createAddRecFromPHI has already
++  /// mapped \p PN to. It must be purged (forgetMemoizedResults) before this
++  /// function memoizes a precise AddRec, because the operand queries below can
++  /// re-enter and build expressions on top of it. Installing that placeholder
++  /// before this call, rather than after it, is what bounds the cross-PHI
++  /// recursion that once overflowed the stack; see the comment at the call site.
+   const SCEV *createSimpleAffineAddRec(PHINode *PN, Value *BEValueV,
+-                                            Value *StartValueV);
++                                       Value *StartValueV,
++                                       const SCEV *SymbolicName);
+ 
+   /// Helper function called from createNodeForPHI.
+   const SCEV *createNodeFromSelectLikePHI(PHINode *PN);
 --- a/llvm/lib/Analysis/ScalarEvolution.cpp
 +++ b/llvm/lib/Analysis/ScalarEvolution.cpp
-@@ -5807,6 +5807,17 @@ const SCEV *ScalarEvolution::createAddRecFromPHI(PHINode *PN) {
-   if (!L || L->getHeader() != PN->getParent())
-     return nullptr;
+@@ -5902,7 +5902,8 @@
+ /// technique for finding the AddRec expression.
+ const SCEV *ScalarEvolution::createSimpleAffineAddRec(PHINode *PN,
+                                                       Value *BEValueV,
+-                                                      Value *StartValueV) {
++                                                      Value *StartValueV,
++                                                      const SCEV *SymbolicName) {
+   const Loop *L = LI.getLoopFor(PN->getParent());
+   assert(L && L->getHeader() == PN->getParent());
+   assert(BEValueV && StartValueV);
+@@ -5931,6 +5932,13 @@
  
-+  // Make sure we do not run over cycled PHIs (mirrors PendingPhiRanges):
-+  // re-entering for a PHI already under construction means a cross-PHI
-+  // operand cycle reached back here through createSimpleAffineAddRec's
-+  // pre-placeholder getSCEV calls. Returning nullptr lets the caller model
-+  // this occurrence as a plain SCEVUnknown — a sound over-approximation —
-+  // and the outer in-progress construction completes and memoizes the
-+  // precise AddRec.
-+  if (!PendingAddRecPHIs.insert(PN).second)
-+    return nullptr;
-+  auto ClearPending = make_scope_exit([&]() { PendingAddRecPHIs.erase(PN); });
+   const SCEV *StartVal = getSCEV(StartValueV);
+   const SCEV *PHISCEV = getAddRecExpr(StartVal, Accum, L, Flags);
 +
-   // The loop may have multiple entrances or multiple exits; we can analyze
-   // this phi as an addrec if it has a unique entry value and a unique
-   // backedge value.
++  // Trust: PN is mapped to SymbolicName on entry (see createAddRecFromPHI), so
++  // purge everything derived from that placeholder before memoizing the precise
++  // AddRec -- `insertValueToMap` is first-write-wins, and any operand SCEV built
++  // during a re-entrant query holds the placeholder. Identical to what the
++  // general path does once it has its own AddRec.
++  forgetMemoizedResults({SymbolicName});
+   insertValueToMap(PN, PHISCEV);
+ 
+   if (auto *AR = dyn_cast<SCEVAddRecExpr>(PHISCEV))
+@@ -5980,14 +5988,37 @@
+   assert(ValueExprMap.find_as(PN) == ValueExprMap.end() &&
+          "PHI node already processed?");
+ 
++  // Trust: install the symbolic placeholder BEFORE the simple affine path, not
++  // after it. Upstream runs `createSimpleAffineAddRec` first, and that path
++  // calls `getSCEV` on the start/accum operands while nothing is mapped for PN
++  // yet -- so a chain of header PHIs whose operands reach back to the first PHI
++  // recurses without ever reaching the cycle breaker below, because the simple
++  // path runs first on every re-entry. That was the unbounded
++  // createSCEV -> createAddRecFromPHI recursion behind the SIGBUS in
++  // 1d1d11bed9f ("cycle encountered after 4 frames with period 15", building
++  // rustc_attr_parsing). Mapping PN to SymbolicName up front terminates the
++  // re-entry -- getSCEV(PN) now returns the placeholder instead of recursing --
++  // and `forgetMemoizedResults(SymbolicName)` on the way out purges everything
++  // that was built on top of the placeholder, so nothing keeps the
++  // over-approximation. That is the same discipline the general path below
++  // already uses; the simple path just never had it.
++  //
++  // 1d1d11bed9f instead guarded re-entry with a `PendingAddRecPHIs` set that
++  // returned nullptr. That stopped the recursion but had no way to purge, so
++  // `SCEVUnknown` stayed memoized for PHIs reached during the cycle. Measured
++  // 2026-08-24 on tests/codegen-llvm/bounds-checking/gep-issue-133979.rs: with
++  // that guard, IndVarSimplify could not merge two congruent induction
++  // variables (replaceCongruentIVs keys PHIs by their SCEV, and a PHI left as
++  // SCEVUnknown never matches its twin), so a bounds check upstream eliminates
++  // survived. Repairing the memoization in place did not help; only removing
++  // the bailout did. Do not reintroduce a bailout here -- fix the ordering.
++  const SCEV *SymbolicName = getUnknown(PN);
++  insertValueToMap(PN, SymbolicName);
++
+   // First, try to find AddRec expression without creating a fictituos symbolic
+   // value for PN.
+-  if (auto *S = createSimpleAffineAddRec(PN, BEValueV, StartValueV))
++  if (auto *S = createSimpleAffineAddRec(PN, BEValueV, StartValueV, SymbolicName))
+     return S;
+-
+-  // Handle PHI node value symbolically.
+-  const SCEV *SymbolicName = getUnknown(PN);
+-  insertValueToMap(PN, SymbolicName);
+ 
+   // Using this symbolic name for the PHI, analyze the value coming around
+   // the back-edge.

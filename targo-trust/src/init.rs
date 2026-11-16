@@ -385,19 +385,32 @@ enabled = true
 # Verification level: L0 (basic), L1 (standard), L2 (maximal default)
 level = "L2"
 
-# Solver timeout in milliseconds
-timeout_ms = 5000
-
-# Whole-function verification budget in milliseconds. This bounds all proof
-# work for one function, not just one solver call.
-function_budget_ms = 120000
+# Budgets are workspace policy: only the workspace root's [trust] table may
+# set them (one run, one budget profile), so they are shown here commented out.
+#
+# The one solver-effort count: each query gets min(100000, k * size) SAT
+# conflicts per SAT solve (ay `:rlimit`), size being the number of distinct
+# terms of the query. A search this COUNT ends stops at the same point on every
+# host at every load, so that part of the proved count is a function of the
+# code, not of the machine.
+# effort = __EFFORT__
+#
+# The wall-clock backstop, per mille of the reference clocks: 1000 is 5,000 ms
+# per query and 120,000 ms per function. The clocks still end the work no count
+# reaches yet (ay's residual clocks, the CHC/PDR engine, kernel certification);
+# an obligation a clock ends is reported `wall-backstop` and makes the run NOT
+# REPRODUCIBLE.
+# backstop = 1000
 
 # Optional codegen backend override: "llvm" (P9 compatibility default) or
 # "trust-cg" (native Trust-IR backend for its currently supported targets)
 # codegen_backend = "llvm"
 
-# Hardened boundary verification is on by default with unix_hardened.
-# Set hardened = false only for compatibility triage, or choose a profile label.
+# Hardened boundary verification is on by default with unix_hardened, which also
+# declares Unix-tool process semantics for `main` (SIGPIPE -> SIG_DFL: a write to a
+# closed pipe ends the process quietly, like C tools; RUSTFLAGS=-Zon-broken-pipe=error
+# keeps Rust's panic-on-EPIPE instead). Set hardened = false only for compatibility
+# triage, or choose a profile label.
 # hardened = true
 # trust_profile = "unix_hardened"
 
@@ -409,7 +422,10 @@ function_budget_ms = 120000
 # This does not filter ordinary check/build verification today.
 skip_functions = []
 "#
-    .to_string()
+    .replace(
+        "__EFFORT__",
+        &trust_types::determinism::EffortScale::BUILTIN.conflicts_per_node.to_string(),
+    )
 }
 
 /// Append the starter `[trust]` table to a project manifest.
@@ -743,8 +759,14 @@ mod tests {
         assert!(toml.contains("[trust]"));
         assert!(toml.contains("enabled = true"));
         assert!(toml.contains("level = \"L2\""));
-        assert!(toml.contains("timeout_ms = 5000"));
-        assert!(toml.contains("function_budget_ms = 120000"));
+        // Every budget is shown at its default, and the defaults are the
+        // built-in budget profile's (determinism plan §3.6).
+        let defaults = crate::config::TrustConfig::default();
+        assert!(
+            toml.contains(&format!("# effort = {}", defaults.effort.conflicts_per_node)),
+            "{toml}"
+        );
+        assert!(toml.contains(&format!("# backstop = {}", defaults.backstop.per_mille)));
         assert!(toml.contains("Hardened boundary verification is on by default"));
         assert!(toml.contains("skip_functions = []"));
         assert!(
@@ -755,6 +777,12 @@ mod tests {
         let table = toml.split_once("[trust]").expect("table header").1;
         let parsed: toml::Value = table.parse().expect("the generated table must parse");
         assert_eq!(parsed.get("level").and_then(toml::Value::as_str), Some("L2"));
+        // The generated table must load back as exactly the defaults it shows.
+        let file = <crate::config::TrustConfigFile as serde::Deserialize>::deserialize(parsed)
+            .expect("the generated table is a valid [trust] table");
+        // The budgets are commented out: a member's table must not name them.
+        assert_eq!(file.effort, None);
+        assert_eq!(file.backstop, None);
     }
 
     #[test]

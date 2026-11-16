@@ -13,9 +13,10 @@ use std::process::ExitCode;
 use trust_release::{AggregateReport, GateFinding, GateReport};
 
 use self::gates::{build_release_reports, build_toolchain_surface_proof};
+pub(crate) use self::identity::TOOL_IDENTITY_PROBE_HANG_GUARD;
 use self::identity::{
-    build_version_identity, discover_repo_root, generated_at_unix_seconds, option_value,
-    repo_dirty, repo_dirty_metadata,
+    RepositoryStatus, build_version_identity, discover_repo_root, generated_at_unix_seconds,
+    option_value, repository_status,
 };
 use self::product_proof::{
     product_proof_components, product_proof_evidence_classes, run_product_proof_report_subcommand,
@@ -34,6 +35,7 @@ fn release_gate_filter_includes(
     gate: &str,
 ) -> bool {
     gate == filter
+        || gate == "repository-state"
         || (profile.requires_bound_tools()
             && matches!(
                 gate,
@@ -53,6 +55,25 @@ fn release_gate_filter_includes(
                 gate,
                 "publication-inputs" | "publication-artifacts" | "publication-ledger"
             ))
+}
+
+fn repository_status_report(profile: ReleaseProfile, status: &RepositoryStatus) -> GateReport {
+    let (code, message) = match status {
+        RepositoryStatus::Clean => return GateReport::pass("repository-state"),
+        RepositoryStatus::Dirty(lines) => {
+            ("repository-dirty", format!("release repository has {} changed paths", lines.len()))
+        }
+        RepositoryStatus::Unavailable(error) => (
+            "repository-status-unavailable",
+            format!("release repository cleanliness could not be established: {error}"),
+        ),
+    };
+    let finding = if profile == ReleaseProfile::Metadata {
+        GateFinding::warning(code, message)
+    } else {
+        GateFinding::error(code, message)
+    };
+    GateReport::new("repository-state", vec![finding])
 }
 
 pub(crate) fn run_version_subcommand(args: &[String]) -> ExitCode {
@@ -318,7 +339,26 @@ pub(crate) fn run_release_subcommand(args: &[String]) -> ExitCode {
         }
     };
 
-    let all_reports = build_release_reports(&root, profile, visibility, &identity);
+    let mut all_reports = build_release_reports(&root, profile, visibility, &identity);
+    let evidence_mode = ReleaseEvidenceMode::for_release_check(profile, visibility);
+    let tools = identity.tools.clone();
+    let toolchain_surface_proof = build_toolchain_surface_proof(&identity.tools);
+    let product_proof_evidence_classes = if profile == ReleaseProfile::ProductProof {
+        product_proof_evidence_classes(&root, &all_reports)
+    } else {
+        Vec::new()
+    };
+    let product_proof_components = if profile == ReleaseProfile::ProductProof {
+        product_proof_components(
+            &root,
+            identity.candidate_commit.as_deref(),
+            Some(&identity.tools.daemon),
+        )
+    } else {
+        Vec::new()
+    };
+    let repo_status = repository_status(&root, identity.candidate_commit.as_deref());
+    all_reports.push(repository_status_report(profile, &repo_status));
     let mut reports = all_reports.clone();
     if let Some(filter) = gate_filter.as_deref() {
         if all_reports.iter().any(|report| report.gate == filter) {
@@ -341,23 +381,6 @@ pub(crate) fn run_release_subcommand(args: &[String]) -> ExitCode {
     }
 
     let aggregate = AggregateReport::new(reports.clone());
-    let evidence_mode = ReleaseEvidenceMode::for_release_check(profile, visibility);
-    let tools = identity.tools.clone();
-    let toolchain_surface_proof = build_toolchain_surface_proof(&identity.tools);
-    let product_proof_evidence_classes = if profile == ReleaseProfile::ProductProof {
-        product_proof_evidence_classes(&root, &all_reports)
-    } else {
-        Vec::new()
-    };
-    let product_proof_components = if profile == ReleaseProfile::ProductProof {
-        product_proof_components(
-            &root,
-            identity.candidate_commit.as_deref(),
-            Some(&identity.tools.daemon),
-        )
-    } else {
-        Vec::new()
-    };
     let output = ReleaseCheckOutput {
         schema_version: RELEASE_REPORT_SCHEMA,
         generated_at: generated_at_unix_seconds(),
@@ -370,8 +393,8 @@ pub(crate) fn run_release_subcommand(args: &[String]) -> ExitCode {
         candidate_commit: identity.candidate_commit.clone(),
         repo_root: root.display().to_string(),
         gate_filter,
-        repo_dirty: repo_dirty(&root),
-        repo_dirty_metadata: repo_dirty_metadata(&root),
+        repo_dirty: repo_status.is_dirty_or_unavailable(),
+        repo_dirty_metadata: repo_status.metadata(),
         runner: ReleaseRunner {
             implementation: "rust",
             entrypoint: "targo trust release check",
@@ -452,3 +475,45 @@ fn release_usage_text() -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod repository_status_tests {
+    use trust_release::{AggregateReport, GateStatus};
+
+    use super::identity::RepositoryStatus;
+    use super::{release_gate_filter_includes, repository_status_report};
+    use crate::release_cli::types::{ReleaseProfile, ReleaseVisibility};
+
+    #[test]
+    fn dirty_or_unavailable_repository_blocks_release_profiles_even_under_filter() {
+        for profile in [ReleaseProfile::Publication, ReleaseProfile::ProductProof] {
+            for status in [
+                RepositoryStatus::Dirty(vec!["?? new.txt".to_string()]),
+                RepositoryStatus::Unavailable("Git authority unavailable".to_string()),
+            ] {
+                let report = repository_status_report(profile, &status);
+                assert_eq!(report.status, GateStatus::Fail);
+                assert_eq!(AggregateReport::new(vec![report]).status(), GateStatus::Fail);
+                assert!(release_gate_filter_includes(
+                    profile,
+                    ReleaseVisibility::Public,
+                    "required-metadata",
+                    "repository-state",
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_only_repository_diagnostic_remains_non_blocking() {
+        let status = RepositoryStatus::Unavailable("Git authority unavailable".to_string());
+        assert_eq!(
+            repository_status_report(ReleaseProfile::Metadata, &status).status,
+            GateStatus::Warn,
+        );
+        assert_eq!(
+            repository_status_report(ReleaseProfile::ProductProof, &RepositoryStatus::Clean).status,
+            GateStatus::Pass,
+        );
+    }
+}

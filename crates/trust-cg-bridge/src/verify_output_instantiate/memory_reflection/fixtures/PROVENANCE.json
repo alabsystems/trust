@@ -1,0 +1,33 @@
+{
+  "producer_candidate": "98d6d1a193bfc1dba855a9eca582b32a81deb411",
+  "producer_base": "739528988170b608694576f12eef91d9474ba6bc",
+  "producer_inputs_sha256": "77c652221875cffcfddb4810a2ce22e16c1c6b53f0711ce14f25ec902c4bc321",
+  "scope": "Historical actual CerExec leaf equation exports, copied without algebraic normalization. They are standalone mathematical inputs, not machine/source completeness or shipping evidence.",
+  "files": {
+    "leaf_store.json": {
+      "original_export_sha256": "b0637e2269eb7d0c2e32e75ae77e1d76bd7e8ae777d54952c3ab561b9fa14557",
+      "fixture_sha256": "f9c1aff4d14d89bd195c4f12e6d73493f9438ddf41f5f29f2f044f191399e3bf",
+      "expected": "one independently checked original conjunction"
+    },
+    "leaf_load.json": {
+      "original_export_sha256": "0b5c2a5c7c383fedaf0f3d53e7e3a380e4f5761b650a440ac3c7c5d959eac5a1",
+      "fixture_sha256": "6facbf4d1a83cdbbe9a43cb700a415c7327b6053e92ea3c5995eac957c9a3f3d",
+      "expected": "one independently checked original conjunction"
+    },
+    "leaf_copy.json": {
+      "original_export_sha256": "bf02d6d1012f120423ed029fcec3f7a447d2609932a1bf01aac11c178cccba9b",
+      "fixture_sha256": "ca26bed5eb050f3a148446fcdf47672c513ffa1cd1579319c1a3e3fdc285db13",
+      "expected": "one independently checked original conjunction"
+    },
+    "leaf_gep.json": {
+      "original_export_sha256": "beba911229d5f4c3f2787001b57d755144ee6affe16d946fe23e09f829d3f340",
+      "fixture_sha256": "e20931e0c88c1bc4ed8deb5d2e1a61ebd25ec343cf60643e20a9a3d44fbd6dd2",
+      "expected": "one independently checked original conjunction"
+    },
+    "leaf_store_wide.json": {
+      "original_export_sha256": "f4bc20669fe1160b7aed22c9dad958c32cea093136b25196ba91d8b5ab1a6a29",
+      "fixture_sha256": "7923461ba272cde37e4e3d5967968af6ac2babb533a161ddc8353a9dfd028f3c",
+      "expected": "decline: high-offset extract outside bounded reflector"
+    }
+  }
+}

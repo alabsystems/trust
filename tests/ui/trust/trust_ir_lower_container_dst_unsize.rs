@@ -17,8 +17,11 @@
 //! extraction — clean-only / NotRun by construction, no divergence reachable.
 //!
 //! The dyn-tailed container is the standing negative: `pointee_meta` answers
-//! `Vtable` and `map_ty` fail-closes, so the mint is never reached (pinned at
-//! corpus scale by `tests/ui/dst/dst-trait.rs` keeping its tags).
+//! `Vtable`, so the `Len` gate in front of the mint excludes it and the body takes
+//! `Unsize(non-slice target)` instead. (Until trust-ir v39 `map_ty` ALSO fail-closed
+//! on that pointee; it now spells it `FatPtr(ContainerVtable)`, and the gate — not
+//! the spelling — is what keeps this mint `Len`-only. Pinned at corpus scale by
+//! `tests/ui/dst/dst-trait.rs` keeping its `Unsize(non-slice target)` tags.)
 
 pub struct Foo<T: ?Sized> {
     pub head: u32,

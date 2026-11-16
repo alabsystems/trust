@@ -60,6 +60,10 @@ pub(crate) enum DirectAssertShape {
     Shift { value_ty: Ty, amount_ty: Ty, amount: ValueId },
     /// Site F — `BoundsCheck` against a compile-time array length.
     Bounds { index: ValueId, len: u64 },
+    /// Slice bounds use the current fat pointer's metadata, not a compile-time length.
+    /// The exact SSA predicate remains on the recorded Assert node; the present formula
+    /// encoder cannot bind that metadata/state identity and must not invent a source name.
+    SliceBounds,
 }
 
 impl<'a, 'tcx> LowerCx<'a, 'tcx> {
@@ -158,6 +162,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 let index = self.direct_formula_operand(*index)?;
                 Ok((DirectFormulaClass::BoundsCheck { len: *len }, 64, false, vec![index]))
             }
+            // Next step: bind dynamic metadata operands to the same function/SSA/state
+            // identity in the canonical formula encoder. Do not substitute an allocation
+            // size, a zero constant, or an invented named parameter in the meantime.
+            DirectAssertShape::SliceBounds => Err("dynamic-slice-length-operand"),
         }
     }
 

@@ -3,13 +3,35 @@
 //@ battery-flags: -Ztrust-verify=on --crate-type=lib
 //! LANE A NEGATIVE CONTROL — FALSE LOOP INVARIANTS, one per failure mode.
 //!
-//! ## Measured outcome (2026-07-26)
+//! ## Measured outcome (2026-07-26) — SUPERSEDED, see below
 //!
 //! The bounded multi-path and collection lanes now model both bodies. The
 //! compiler genuinely refutes the bad consecution in `backoff_delay` and the
 //! bad initiation in `parity_fold`; neither rejection depends on an
 //! unsupported row. This file is therefore restored to an ordinary
 //! `battery-expect: reject` canary.
+//!
+//! ## Measured outcome (2026-09-27, stage2 = pack `5ab8dcccfcb`): NOT refuted
+//!
+//! The paragraph above no longer holds, and it already did not at `6ff31de9b6`.
+//! The compiler still exits 1, but through UNKNOWN rows, not refutations, so
+//! the runner scores this file `reject-by-frontier` (blocking). trust_mc's
+//! CHC/PDR runner does refute three obligations: `backoff_delay`'s
+//! `loop_invariant:2`, and `parity_fold`'s `loop_invariant:2` and `:3`. Each
+//! refutation is then demoted to UNKNOWN:
+//!
+//!     [unknown] UNKNOWN (trust-full-verifier): ... native trust_mc typed
+//!     CHC/PDR solver refuted the encoded VC; refutation demoted to unknown:
+//!     the submitted ChcVc has no positive producer fidelity attestation; ...
+//!     this row reports a capability gap in the CHC construction (no loop
+//!     transition relation is emitted), not a defect in the code
+//!
+//! The tallies are `2 proved, 0 failed, 1 unknown` for `backoff_delay` and
+//! `2 proved, 0 failed, 2 unknown` for `parity_fold`. The expectation stays
+//! `reject` ON PURPOSE: this row stays blocking, and so fails closed, until a
+//! real refutation arrives. Relaxing it to `frontier` would let a capability
+//! gap stand in for a negative control. Source:
+//! `reports/2026-09-27-new-pack-5ab8dcccfcb-measured.md` §1.
 //!
 //! `a3` and `a5` cover a false `ensures` and a missing descent. Nothing in
 //! those controls covers the E4 surface's own refutation: an authored loop

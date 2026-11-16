@@ -1,4 +1,4 @@
-// ignore-tidy-linelength
+// ignore-tidy-file-linelength
 //@ add-minicore
 //@ revisions: riscv32 riscv64
 //
@@ -9,9 +9,6 @@
 //@ ignore-backends: gcc
 #![no_core]
 #![feature(no_core, lang_items, abi_riscv_interrupt)]
-
-//~? WARN unstable feature specified for `-Ctarget-feature`
-//~? NOTE this feature is not stably supported; its behavior can change in the future
 
 extern crate minicore;
 use minicore::*;

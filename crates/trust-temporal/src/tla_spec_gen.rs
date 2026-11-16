@@ -33,42 +33,47 @@ pub fn generate_tla_spec(machine: &StateMachine, module_name: &str) -> String {
     let _ = writeln!(spec);
 
     // State set
-    let state_names: Vec<String> =
-        machine.states.iter().map(|s| format!("\"{}\"", s.name)).collect();
-    let _ = writeln!(spec, "States == {{{}}}", state_names.join(", "));
+    spec.push_str("States == {");
+    for (idx, s) in machine.states.iter().enumerate() {
+        if idx > 0 {
+            spec.push_str(", ");
+        }
+        let _ = write!(spec, "\"{}\"", s.name);
+    }
+    let _ = writeln!(spec, "}}");
     let _ = writeln!(spec);
 
     // Init predicate
-    let initial_name = machine
-        .state(machine.initial)
-        .map_or_else(|| format!("state_{}", machine.initial.0), |s| s.name.clone());
-    let _ = writeln!(spec, "Init == state = \"{}\"", initial_name);
+    if let Some(s) = machine.state(machine.initial) {
+        let _ = writeln!(spec, "Init == state = \"{}\"", s.name);
+    } else {
+        let _ = writeln!(spec, "Init == state = \"state_{}\"", machine.initial.0);
+    }
     let _ = writeln!(spec);
 
     // Next predicate: disjunction of transitions
     if machine.transitions.is_empty() {
         let _ = writeln!(spec, "Next == FALSE");
     } else {
-        let mut transition_disjuncts = Vec::new();
-        for t in &machine.transitions {
-            let from_name = machine
-                .state(t.from)
-                .map_or_else(|| format!("state_{}", t.from.0), |s| s.name.clone());
-            let to_name =
-                machine.state(t.to).map_or_else(|| format!("state_{}", t.to.0), |s| s.name.clone());
-
-            let disjunct = if let Some(guard) = &t.guard {
-                format!(
-                    "  /\\ state = \"{from_name}\"\n  /\\ {guard}\n  /\\ state' = \"{to_name}\""
-                )
-            } else {
-                format!("  /\\ state = \"{from_name}\"\n  /\\ state' = \"{to_name}\"")
-            };
-            transition_disjuncts.push(disjunct);
-        }
         let _ = writeln!(spec, "Next ==");
-        for d in &transition_disjuncts {
-            let _ = writeln!(spec, "  \\/ {d}");
+        for t in &machine.transitions {
+            spec.push_str("  \\/   /\\ state = \"");
+            if let Some(s) = machine.state(t.from) {
+                spec.push_str(&s.name);
+            } else {
+                let _ = write!(spec, "state_{}", t.from.0);
+            }
+            spec.push_str("\"\n");
+            if let Some(guard) = &t.guard {
+                let _ = writeln!(spec, "  /\\ {guard}");
+            }
+            spec.push_str("  /\\ state' = \"");
+            if let Some(s) = machine.state(t.to) {
+                spec.push_str(&s.name);
+            } else {
+                let _ = write!(spec, "state_{}", t.to.0);
+            }
+            spec.push_str("\"\n");
         }
     }
     let _ = writeln!(spec);

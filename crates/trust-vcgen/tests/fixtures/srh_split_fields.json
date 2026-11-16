@@ -1,0 +1,1569 @@
+{
+  "name": "split_fields",
+  "def_path": "fx::split_fields",
+  "span": {
+    "file": "foreign_call_value_refutation_held.rs",
+    "line_start": 7,
+    "col_start": 0,
+    "line_end": 20,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "rest"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                },
+                "len": 4
+              }
+            }
+          }
+        },
+        "name": "out"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::slice::iter::Iter",
+                "fields": [
+                  [
+                    "ptr",
+                    {
+                      "Adt": {
+                        "name": "core::ptr::non_null::NonNull",
+                        "fields": [
+                          [
+                            "pointer",
+                            {
+                              "RawPtr": {
+                                "mutable": false,
+                                "pointee": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                }
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ],
+                  [
+                    "end_or_len",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "_marker",
+                    {
+                      "Adt": {
+                        "name": "core::marker::PhantomData",
+                        "fields": [],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "k"
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeTo",
+            "fields": [
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeFrom",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 8,
+                "col_start": 16,
+                "line_end": 8,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 1
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 9,
+                "col_start": 10,
+                "line_end": 9,
+                "col_end": 11
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        3,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 9,
+                "col_start": 10,
+                "line_end": 9,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                12
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "foreign_call_value_refutation_held.rs",
+              "line_start": 9,
+              "col_start": 10,
+              "line_end": 9,
+              "col_end": 15
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 10,
+                "col_start": 14,
+                "line_end": 10,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 9,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 8,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "foreign_call_value_refutation_held.rs",
+              "line_start": 10,
+              "col_start": 14,
+              "line_end": 10,
+              "col_end": 25
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 17717261303976029778,
+              "def_index": 15443,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "SliceIter",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 17717261303976029778,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 8,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 10,
+                "col_start": 14,
+                "line_end": 10,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::Iter<'_, u8> as core::iter::traits::iterator::Iterator>::position::<{closure@foreign_call_value_refutation_held.rs:10:36: 10:40}>",
+            "args": [
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "CallableItem": {
+                    "def_path": "fx::split_fields::{closure#0}",
+                    "kind": "closure",
+                    "def_path_hash": {
+                      "stable_crate_id": "a9857efe2d0104c2",
+                      "local_hash": "def2759d0a575296"
+                    }
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "foreign_call_value_refutation_held.rs",
+              "line_start": 10,
+              "col_start": 14,
+              "line_end": 10,
+              "col_end": 50
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 17717261303976029778,
+              "def_index": 10697,
+              "substs_digest": [
+                7197238273247756006,
+                4057784590459706692
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "IteratorPosition",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 17717261303976029778,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 6,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 10,
+                "col_start": 14,
+                "line_end": 10,
+                "col_end": 50
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                12
+              ],
+              [
+                1,
+                6
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "foreign_call_value_refutation_held.rs",
+              "line_start": 10,
+              "col_start": 8,
+              "line_end": 10,
+              "col_end": 50
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 11,
+                "col_start": 17,
+                "line_end": 11,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 12,
+                "col_start": 25,
+                "line_end": 12,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeTo",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeTo<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 11,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 12,
+                "col_start": 30,
+                "line_end": 12,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8] as core::ops::index::Index<core::ops::range::RangeTo<usize>>>::index",
+            "args": [
+              {
+                "Move": {
+                  "local": 14,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 15,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 13,
+              "projections": []
+            },
+            "target": 7,
+            "span": {
+              "file": "foreign_call_value_refutation_held.rs",
+              "line_start": 12,
+              "col_start": 29,
+              "line_end": 12,
+              "col_end": 34
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 17717261303976029778,
+              "def_index": 39089,
+              "substs_digest": [
+                13980094862179447468,
+                5131061861350110495
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 17717261303976029778,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 12,
+                "col_start": 25,
+                "line_end": 12,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 12,
+                "col_start": 20,
+                "line_end": 12,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 16,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 12,
+                "col_start": 16,
+                "line_end": 12,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 17,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 8,
+            "span": {
+              "file": "foreign_call_value_refutation_held.rs",
+              "line_start": 12,
+              "col_start": 16,
+              "line_end": 12,
+              "col_end": 22
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": [
+                  "Deref",
+                  {
+                    "Index": 16
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 12,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 12,
+                "col_start": 16,
+                "line_end": 12,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 13,
+                "col_start": 24,
+                "line_end": 13,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 13,
+                "col_start": 29,
+                "line_end": 13,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 22,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 9,
+            "span": {
+              "file": "foreign_call_value_refutation_held.rs",
+              "line_start": 13,
+              "col_start": 29,
+              "line_end": 13,
+              "col_end": 34
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 22,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 13,
+                "col_start": 29,
+                "line_end": 13,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeFrom",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeFrom<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 21,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 13,
+                "col_start": 29,
+                "line_end": 13,
+                "col_end": 36
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8] as core::ops::index::Index<core::ops::range::RangeFrom<usize>>>::index",
+            "args": [
+              {
+                "Move": {
+                  "local": 19,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 20,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 18,
+              "projections": []
+            },
+            "target": 10,
+            "span": {
+              "file": "foreign_call_value_refutation_held.rs",
+              "line_start": 13,
+              "col_start": 28,
+              "line_end": 13,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 17717261303976029778,
+              "def_index": 39089,
+              "substs_digest": [
+                10488223428812056773,
+                13616721059892903769
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 17717261303976029778,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 18,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 13,
+                "col_start": 16,
+                "line_end": 13,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 17,
+                "col_start": 8,
+                "line_end": 17,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 23,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 11,
+            "span": {
+              "file": "foreign_call_value_refutation_held.rs",
+              "line_start": 17,
+              "col_start": 8,
+              "line_end": 17,
+              "col_end": 14
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 23,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 17,
+                "col_start": 8,
+                "line_end": 17,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 1
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "foreign_call_value_refutation_held.rs",
+                "line_start": 19,
+                "col_start": 4,
+                "line_end": 19,
+                "col_end": 5
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_10",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_10",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Ge": [
+        {
+          "Var": [
+            "rest__slice_len",
+            "Int"
+          ]
+        },
+        {
+          "Int": 0
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

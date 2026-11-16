@@ -503,10 +503,12 @@ fn is_applied1(e: &Expr, const_name: &str) -> bool {
 /// Full kernel re-check (`infer_only = false`) that `term : goal` in the empty
 /// (closed) context, mirroring `lib.rs::kernel_checks_false`.
 fn kernel_checks_goal(env: &Environment, term: &Expr, goal: &Expr) -> bool {
-    match TypeChecker::with_context(env, LocalContext::new()).check_type(term, goal) {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let checker = TypeChecker::with_context(env, LocalContext::new());
+    match crate::kernel_stop::check_type(checker, term, goal) {
         Ok(()) => true,
         Err(e) => {
-            if std::env::var("TRUST_DFA_DEBUG").is_ok() {
+            if *DEBUG.get_or_init(|| std::env::var("TRUST_DFA_DEBUG").is_ok()) {
                 eprintln!("[finite_dfa] kernel check_type rejected: {e:?}");
             }
             false
@@ -646,32 +648,6 @@ mod tests {
     use clean_kernel::Constructor;
 
     use super::*;
-
-    #[test]
-    fn zzz_diag_2d() {
-        let dom_a = state3_domain();
-        let dom_b = byteclass3_domain();
-        let cells = real_2d_matrix();
-        let impl_def = enum_transition_body_2d(&dom_a, &dom_b, &cells).unwrap();
-        let spec_def = enum_transition_body_2d(&dom_a, &dom_b, &cells).unwrap();
-        let spec = FiniteSimSpec {
-            label: "diag".to_string(),
-            flavor: SimFlavor::EnumCases2d {
-                dom_a: dom_a.clone(),
-                dom_b: dom_b.clone(),
-                impl_def,
-                spec_def,
-            },
-        };
-        let proof = enum_cases_refl_proof_2d(&dom_a, &dom_b, &cells).unwrap();
-        let term_outer = serialize_term(&proof).unwrap();
-        let term = deserialize_term(&term_outer).expect("deser");
-        let env = build_sim_env(&spec).expect("env");
-        let goal = build_sim_goal(&spec).expect("goal");
-        eprintln!("is_forward_sim_goal = {}", is_forward_sim_goal(&spec, &goal));
-        let res = TypeChecker::with_context(&env, LocalContext::new()).check_type(&term, &goal);
-        eprintln!("kernel check_type = {:?}", res);
-    }
 
     // ── NatRefl (the original lane) ──────────────────────────────────────────
 

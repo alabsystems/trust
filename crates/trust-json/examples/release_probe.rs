@@ -7,8 +7,9 @@
 //   release_probe nan            -- Formatter::write_f64/f32 on non-finite input
 //   release_probe unbounded <d>  -- disable_recursion_limit stack threshold
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use incumbent_serde_json as inc;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use trust_json as tj;
 use trust_json::Formatter as _;
 
@@ -30,11 +31,9 @@ fn main() {
     match args[1].as_str() {
         "nan" => {
             println!("debug_assertions = {}", cfg!(debug_assertions));
-            for (name, v) in [
-                ("NaN", f64::NAN),
-                ("inf", f64::INFINITY),
-                ("-inf", f64::NEG_INFINITY),
-            ] {
+            for (name, v) in
+                [("NaN", f64::NAN), ("inf", f64::INFINITY), ("-inf", f64::NEG_INFINITY)]
+            {
                 let mine = quiet(|| {
                     let mut buf = Vec::new();
                     let mut f = tj::CompactFormatter;
@@ -43,11 +42,9 @@ fn main() {
                 });
                 println!("  trust-json write_f64({name:>4}) -> {mine:?}");
             }
-            for (name, v) in [
-                ("NaN", f32::NAN),
-                ("inf", f32::INFINITY),
-                ("-inf", f32::NEG_INFINITY),
-            ] {
+            for (name, v) in
+                [("NaN", f32::NAN), ("inf", f32::INFINITY), ("-inf", f32::NEG_INFINITY)]
+            {
                 let mine = quiet(|| {
                     let mut buf = Vec::new();
                     let mut f = tj::CompactFormatter;
@@ -57,11 +54,9 @@ fn main() {
                 println!("  trust-json write_f32({name:>4}) -> {mine:?}");
             }
             // The incumbent's Formatter, same contract, for comparison.
-            for (name, v) in [
-                ("NaN", f64::NAN),
-                ("inf", f64::INFINITY),
-                ("-inf", f64::NEG_INFINITY),
-            ] {
+            for (name, v) in
+                [("NaN", f64::NAN), ("inf", f64::INFINITY), ("-inf", f64::NEG_INFINITY)]
+            {
                 let theirs = quiet(|| {
                     use inc::ser::Formatter as _;
                     let mut buf = Vec::new();

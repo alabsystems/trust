@@ -21,6 +21,46 @@
 // Deterministic hash collections for compilation reproducibility.
 pub mod fx;
 
+pub mod interior_mutability;
+pub mod local_defs;
+pub mod place_ty;
+
+mod machine_remainder;
+pub use machine_remainder::unsigned_literal_remainder_is_exact;
+
+mod postcondition_integer_carriers;
+pub use postcondition_integer_carriers::{
+    conjoin_postcondition_integer_carriers, postcondition_integer_carrier_facts,
+};
+
+// Trust (ARGS-FINGERPRINT-READ-1, 2026-10-07): the duplicate-crate-name argument
+// fingerprint `::<__trust_args@HEX>` and the one helper that reads past it.
+pub mod args_fingerprint;
+pub use args_fingerprint::{
+    TRUST_ARGS_FINGERPRINT_HEX_LEN, TRUST_ARGS_FINGERPRINT_PREFIX,
+    args_display_may_name_a_same_named_crate, render_trailing_args_fingerprint,
+    strip_trailing_args_fingerprint,
+};
+
+// Trust (unsafe mint, round 7): the COMPILER-MINTED callee key. A safety
+// contract is no longer selected by parsing a rendered string; the identity is
+// resolved once, in the extractor, from `(TyCtxt, DefId)` — never from
+// `generic_args` — and shipped as a closed vocabulary the consumer `match`es.
+// See the module docs for the four rounds of scanner defects this retires.
+pub mod callee_key;
+pub use callee_key::{
+    ALL_SYSROOT_ITEMS, CalleeKey, CalleeOwner, DivergingEntry, STD_THREAD_SPAWN_ITEMS, SelfTyHead,
+    SysrootItem,
+};
+// std-call-summaries P2 (lever L1): the panic-freedom-only intrinsic stamp, a
+// namespace the facet and determinism gates never read. See the module docs.
+pub mod panic_free_intrinsic;
+pub use panic_free_intrinsic::{
+    PANIC_FREE_RUSTC_INTRINSICS, PanicFreeIntrinsicEntry, PanicFreeIntrinsicShape,
+    TRUST_RUSTC_PANIC_FREE_INTRINSIC_PATH_PREFIX, classify_panic_free_intrinsic,
+    panic_free_intrinsic_entry, panic_free_intrinsic_entry_for_generic,
+};
+
 /// Prefix stamped onto a direct call path only after rustc's `TyCtxt` confirms
 /// that the callee is one of Trust's modeled compiler intrinsics.
 ///
@@ -72,6 +112,44 @@ pub const TRUST_RUSTC_CHECKED_PRIMITIVE_METHOD_PATH_PREFIX: &str =
 /// modular arithmetic and manufacture a false counterexample.
 pub const TRUST_RUSTC_WRAPPING_REFUTATION_METHOD_PATH_PREFIX: &str =
     "@trust-rustc-wrapping-refutation-method::";
+
+/// Prefix stamped onto a `<Self as ToString>::to_string` call path only after
+/// rustc's `TyCtxt` confirms that the callee is the compiler's own `alloc`'s
+/// `ToString::to_string` (by artifact residency — a diagnostic item alone is a
+/// source attribute) and that the INSTANTIATED `Self` is one of the
+/// foundational types whose `SpecToString` specialization runs no user code and
+/// has no panic path.
+///
+/// # Why this needs a `TyCtxt` stamp and cannot be a path-text rule
+///
+/// `ToString` has exactly ONE impl in the whole tree — the blanket
+/// `impl<T: fmt::Display + ?Sized> ToString for T` — whose `SpecToString`
+/// DEFAULT body ends in
+/// `.expect("a Display implementation returned an error unexpectedly")`.
+/// So `<T as ToString>::to_string` PANICS for every `T` whose `Display::fmt`
+/// can return `Err`, i.e. for every caller-written `Display`. Panic-freedom is
+/// a property of the SPECIALIZATION chosen for `Self`, not of the trait and not
+/// of the `::to_string` method tail.
+///
+/// A rendered-path gate cannot separate the two. `str` is NOT a keyword: it is
+/// a legal generic-parameter name, and `Ty::Param("str")` prints BARE, exactly
+/// like `TyKind::Str`. A previous revision of this model matched
+/// `<str as ToString>::to_string` on the rendered callee and was REFUTED by
+///
+/// ```text
+/// pub fn attack<str: fmt::Display + ?Sized>(t: &str) -> String { t.to_string() }
+/// ```
+///
+/// whose MIR emits that byte-identical spelling while `Self` is the caller's
+/// choice. The stamp below reads `TyKind` from `TyCtxt` instead, where a
+/// generic parameter is `TyKind::Param` and can never be mistaken for
+/// `TyKind::Str`.
+///
+/// As with the sibling markers, `@` cannot occur in a Rust identifier, so the
+/// namespace is unspellable from source; artifact authority still comes from
+/// the authenticated compiler transport/session rather than from a serialized
+/// string alone, and the consumer must still re-check the method tail.
+pub const TRUST_TOTAL_TO_STRING_PATH_PREFIX: &str = "@trust-total-to-string::";
 
 /// Prefix stamped onto a def path whose CRATE NAME is not a usable identity.
 ///
@@ -902,8 +980,7 @@ mod compiler_authenticated_sysroot_tests {
     /// is precisely the state this crate was in before this test) and it goes red.
     #[test]
     fn the_extractor_delegates_the_whole_rule_to_this_crate() {
-        let convert =
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../trust-mir-extract/src/convert.rs");
+        let convert = concat!(env!("CARGO_MANIFEST_DIR"), "/../trust-mir-extract/src/convert.rs");
         let source = std::fs::read_to_string(convert).unwrap_or_else(|e| {
             panic!(
                 "cannot read the extractor at `{convert}` ({e}), so the delegation this \
@@ -1120,6 +1197,35 @@ mod sysroot_identity_stamp_tests {
 /// whose body is absent.
 pub const TRUST_INDIRECT_CALLEE_PATH: &str = "@trust-indirect-callee";
 
+/// `Rvalue::Unsupported::kind` of a MIR `Transmute` whose destination is a
+/// PATTERN TYPE over the source's own integer type
+/// (`transmute::<i32, pattern_type!(i32 is ..-1 | 0..)>`, the body of every
+/// `define_valid_range_type!` constructor: `NonZero*`, `*NotAllOnes`,
+/// `Nanoseconds`, `UsizeNoHighBit`, reached through e.g.
+/// `OwnedFd::from_raw_fd`).
+///
+/// Such a transmute IS the identity on the integer — a pattern type has its
+/// base type's layout — and is undefined behaviour unless the value lies in the
+/// pattern's valid range. The extractor reads that range off rustc's LAYOUT
+/// (`BackendRepr::Scalar`'s `valid_range`, the exact set the compiler's niche
+/// optimisation relies on) and records it here, in a sentinel rather than a
+/// plain `Rvalue::Cast`, because the trust `Ty` of a pattern type is its base
+/// integer (`ty_convert` erases the pattern): a `Cast` would carry no trace of
+/// the range, and a consumer that admits it would silently drop the UB charge.
+///
+/// SHAPE (anything else is malformed and must be refused):
+/// `operands == [value, start, end]`, `value` of the source integer type,
+/// `start`/`end` integer constants of that type's signedness (`Uint` for an
+/// unsigned base, sign-extended `Int` for a signed one) giving rustc's
+/// `WrappingRange` — valid iff `start <= value <= end` when `start <= end`,
+/// and `value >= start || value <= end` when the range wraps.
+///
+/// Consumers: `trust-ir-bridge` lowers it EXACTLY — the identity plus an
+/// asserted membership (the UB precondition, charged); every other consumer
+/// (vcgen's UnsupportedMir row included) keeps it fail-closed as the
+/// `Rvalue::Unsupported` it is spelled as.
+pub const TRUST_TRANSMUTE_INTO_VALID_RANGE_KIND: &str = "CastKind::Transmute(valid-range)";
+
 /// The element-byte-size authority token trust-mir-extract appends — as the
 /// TRAILING turbofish group `::<__trust_elem_bytes@N>` — to a bulk-allocation
 /// sink callee (`Vec::with_capacity` / `from_elem` / `collect`), carrying the
@@ -1167,6 +1273,113 @@ pub fn parse_trailing_elem_bytes_token(callee: &str) -> Option<i128> {
         return None;
     }
     digits.parse().ok()
+}
+
+/// Trust (W4 HASHMAP r2, 2026-09-27): the HASH-TABLE qualifier of the element-size
+/// token, `::<__trust_elem_bytes@table@N>` (element size known) or
+/// `::<__trust_elem_bytes@table@?>` (the sink IS a std hash table, but the element
+/// layout could not be computed — a still-generic element or a layout error).
+///
+/// A std `HashMap`/`HashSet` does not allocate `count * size_of::<T>()` bytes the
+/// way a `Vec` does: hashbrown rounds the requested capacity up to a power-of-two
+/// bucket count (about `count * 8 / 7`, at least 4, 8 or 16) and stores one
+/// control byte per bucket beside the element array, then panics "Hash table
+/// capacity overflow" when THAT layout passes `isize::MAX`. The extractor stamps
+/// this qualified token (from the call's DefId and monomorphized types — the
+/// callee's impl self type, a `collect`/`collect_into` destination, an `extend`
+/// receiver — never from a rendering) so vcgen can charge the bucket layout
+/// instead of `count * stride`.
+///
+/// It SHARES [`TRUST_ELEM_BYTES_TOKEN_PREFIX`] on purpose: every consumer that
+/// only asks "does this callee carry a verifier-only element token" (the
+/// executable-lowering placeholder check, the def-path pin's `__trust_` marker
+/// rule) keeps answering yes, while [`parse_trailing_elem_bytes_token`] — whose
+/// grammar is digits only — answers `None` for it, so a consumer that knows only
+/// the `Vec` stride can never read a hash table's element size as one.
+pub const TRUST_TABLE_ELEM_BYTES_TOKEN_PREFIX: &str = "::<__trust_elem_bytes@table@";
+
+/// What a [`TRUST_TABLE_ELEM_BYTES_TOKEN_PREFIX`] token says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableElemBytes {
+    /// The exact `tcx.layout_of` size of the table's element (`(K, V)` for a
+    /// `HashMap`, `T` for a `HashSet`).
+    Known(i128),
+    /// A std hash table whose element size is not known: the consumer must fail
+    /// closed (it may never fall back to a count-only charge).
+    Unknown,
+}
+
+/// Render the trailing hash-table element-size token (see
+/// [`TRUST_TABLE_ELEM_BYTES_TOKEN_PREFIX`]) — the single producer spelling.
+#[must_use]
+pub fn render_trailing_table_elem_bytes_token(elem_bytes: Option<u64>) -> String {
+    match elem_bytes {
+        Some(n) => format!("{TRUST_TABLE_ELEM_BYTES_TOKEN_PREFIX}{n}>"),
+        None => format!("{TRUST_TABLE_ELEM_BYTES_TOKEN_PREFIX}?>"),
+    }
+}
+
+/// Parse the trailing hash-table element-size token, admitting ONLY the exact
+/// trailing-position grammar the extractor emits (`…::<__trust_elem_bytes@table@N>`
+/// with `N` a non-empty all-ASCII-digit run, or `…@table@?>`). Anything else is
+/// `None`: not a hash-table token.
+#[must_use]
+pub fn parse_trailing_table_elem_bytes_token(callee: &str) -> Option<TableElemBytes> {
+    let (_, after) = callee.rsplit_once(TRUST_TABLE_ELEM_BYTES_TOKEN_PREFIX)?;
+    let body = after.strip_suffix('>')?;
+    if body == "?" {
+        return Some(TableElemBytes::Unknown);
+    }
+    if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    body.parse().ok().map(TableElemBytes::Known)
+}
+
+#[cfg(test)]
+mod table_elem_bytes_token_tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_both_producer_spellings() {
+        let known = format!(
+            "std::collections::hash::set::HashSet::<[u8; 4]>::with_capacity{}",
+            render_trailing_table_elem_bytes_token(Some(4))
+        );
+        assert!(known.ends_with("::<__trust_elem_bytes@table@4>"));
+        assert_eq!(parse_trailing_table_elem_bytes_token(&known), Some(TableElemBytes::Known(4)));
+        let unknown = format!("f{}", render_trailing_table_elem_bytes_token(None));
+        assert_eq!(unknown, "f::<__trust_elem_bytes@table@?>");
+        assert_eq!(parse_trailing_table_elem_bytes_token(&unknown), Some(TableElemBytes::Unknown));
+    }
+
+    #[test]
+    fn the_vec_stride_parser_never_reads_a_table_token() {
+        let known = format!("f{}", render_trailing_table_elem_bytes_token(Some(4096)));
+        assert_eq!(parse_trailing_elem_bytes_token(&known), None);
+        let unknown = format!("f{}", render_trailing_table_elem_bytes_token(None));
+        assert_eq!(parse_trailing_elem_bytes_token(&unknown), None);
+        // And the table parser never reads a plain token.
+        let plain = format!("f{}", render_trailing_elem_bytes_token(4096));
+        assert_eq!(parse_trailing_table_elem_bytes_token(&plain), None);
+        // Both share the verifier-only prefix every placeholder check keys on.
+        assert!(known.contains(TRUST_ELEM_BYTES_TOKEN_PREFIX));
+        assert!(unknown.contains(TRUST_ELEM_BYTES_TOKEN_PREFIX));
+    }
+
+    #[test]
+    fn table_grammar_is_strict_and_trailing() {
+        for bad in [
+            "f::<__trust_elem_bytes@table@>",
+            "f::<__trust_elem_bytes@table@1x>",
+            "f::<__trust_elem_bytes@table@??>",
+            "f::<__trust_elem_bytes@table@1",
+            "f::<__trust_elem_bytes@table@1>::g",
+            "f::<__trust_elem_bytes@table@999999999999999999999999999999999999999999>",
+        ] {
+            assert_eq!(parse_trailing_table_elem_bytes_token(bad), None, "{bad}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1644,6 +1857,27 @@ pub fn ay_exec_lock() -> &'static std::sync::Mutex<()> {
 // Fail-closed-by-construction discharge result — the mechanistic prevention for
 // the false-proof class (the 2026-06-19 soundness sweep found 8 instances where an
 // unmodeled construct silently defaulted to PROVED). See `discharge`.
+/// Trust (2026-09-28): the pointer width, in bits, of the target this compilation verifies
+/// for, or `None` when no compiler has recorded one. `TrustVerify::run_pass` records it
+/// from `tcx.data_layout` before any body is verified, and rustc verifies for one target
+/// per process, so a process-wide value is exact. A consumer that rests on a 64-bit
+/// address-space fact must read `None` as "unwitnessed" and fail closed.
+static TARGET_POINTER_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record the verified target's pointer width (`0` clears it). See [`target_pointer_bits`].
+pub fn set_target_pointer_bits(bits: u32) {
+    TARGET_POINTER_BITS.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The verified target's pointer width, or `None` when no compiler has recorded one.
+#[must_use]
+pub fn target_pointer_bits() -> Option<u32> {
+    match TARGET_POINTER_BITS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        bits => Some(bits),
+    }
+}
+
 pub mod discharge;
 
 // String interning for Formula variable names.
@@ -1662,14 +1896,14 @@ mod atomic_intrinsics;
 mod concurrency;
 mod facts;
 mod formula;
-// Arena-allocated formula representation for reduced heap allocation.
-pub mod formula_arena;
 // formula_utils.rs removed — utilities now in formula/ submodules.
 pub(crate) mod generics;
 pub(crate) mod lifetime;
 pub(crate) mod lifetime_analysis;
 mod model;
 pub(crate) mod resilience;
+// Trust (2026-09-29): rustc's tuple layouts, carried out of band on the faithful lane.
+mod tuple_layouts;
 // sort_check.rs removed — sort checking now in formula/sort.rs.
 // SMT-LIB2 pretty printer for formatted solver output.
 pub mod smt_printer;
@@ -1680,6 +1914,17 @@ pub mod static_truth;
 pub mod terminator_obligations;
 // Shared matchers for modeled total core/std call summaries (bridge + vcgen must agree).
 pub mod admissible_body;
+// Trust (ref-self I1): the E6 parameter view — a borrow-erased copy of an
+// extracted body, built so the UNCHANGED validator, recognizer and mints can
+// run on it. Never edits a refusal; see the module docs for the aliasing
+// assumption (R1) it rests on and the grade that discloses it.
+pub mod e6_param_view;
+// Trust (E6 admission expansion): the E6-ONLY reader's module — consulted by
+// the E6 importer after `admissible_body`'s chain answers `None`, never by the
+// Clean-origin faithfulness gate (side B). Today it holds the I0 refusal
+// diagnostic; see the module docs.
+pub mod e6_expr;
+pub mod e6_odt;
 pub mod facet_allowlist;
 pub mod facet_inference;
 pub mod facet_propagation;
@@ -1688,9 +1933,16 @@ pub mod structural_panic_freedom;
 pub mod structural_purity;
 pub mod structural_termination;
 pub mod total_call_summaries;
+// Per-block execution bounds over the natural-loop nest: trust-vcgen's accumulator
+// lane and the bridge's native port of it must agree on `K`.
+pub mod loop_nest;
 // Trust (assumption ledger): shared markers for the compiler↔bridge assumption
 // demotion contract (extern print/format/write dispatch, native-lowering gaps).
 pub mod assumption;
+// Trust (CB4): the compiler↔targo contract for bodies excluded from the proof
+// inventory because rustc's libtest harness synthesized them. Shared for the
+// same reason `assumption` is: the verify pass writes the row, targo counts it.
+pub mod exclusion;
 // Trust (frontend firewall): the enforcement of "an untrusted frontend proposes,
 // it never asserts". Lives here for the same reason `assumption` does — it is the
 // shared dependency of the frontends that produce proposals, the lanes that admit
@@ -1704,10 +1956,20 @@ pub mod frontend_firewall;
 // cannot drift across the readers (the `ArrayVec::push` regression was exactly
 // that drift). Owns the DECISION that reads `assumption`'s marker constants.
 pub mod tolerance;
+// Trust (2026-10-02, diag-vs-report): the compiler's Level-0 REFUTATION
+// reclassifications (known-panicking call, native-unsupported safety, open
+// generic dispatch), asked by BOTH the compiler's Level-0 summary line and its
+// published transport row so the diagnostic and the gate cannot disagree.
+pub mod l0_refutation;
 // Trust (R1 corpus): depth-tolerant JSON deserialization for compiler-emitted
 // recursive formula payloads (bounded big-stack fallback past serde_json's
 // default 128-level recursion limit).
 pub mod json_depth;
+pub mod original_vc_snapshot;
+pub use original_vc_snapshot::OriginalVcSnapshot;
+// Trust (TRANSPORT-LINE-BUDGET-1): the size bound on one `TRUST_JSON` line and the
+// fail-closed ladder that fits a function's report under it.
+pub mod transport_budget;
 // Trust (falsification corpus, i128/u128 ICE class): wide-integer-tolerant
 // canonical JSON digest material (fast path byte-identical to
 // `serde_json::to_value`; out-of-JSON-range i128/u128 become tagged decimal
@@ -1720,18 +1982,68 @@ pub mod json_digest;
 // `serde_json/preserve_order` feature, which this repo enables in the root
 // workspace and not in `crates/`.
 pub mod digest;
+// The one canonical query hash: SHA-256 of every assertion in scope at one
+// check-sat, up to one consistent renaming of their free variables.
+pub mod formula_hash;
+// T3 C03: one SHA-256 Merkle digest per formula-DAG node, the bound-variable
+// alpha digest, and the number of context nodes a row reaches (equal to
+// `determinism::query_size`, I4). Nothing consumes it yet (design §12, L2′).
+pub mod formula_merkle;
+// T3 L4 (C06): the per-function VC context's types — rows over one hash-consed DAG, block-def
+// spines, row identity, materialization. Nothing outside this crate and trust-vcgen's tests
+// reads a context yet (C07 does).
+pub mod vc_context;
 // Canonical SMT-LIB2 logic selection, free variable collection, and sort inference.
 pub mod smt_logic;
+// THE ONE SMT-LIB logic-name lattice: the admissibility table (written once, as
+// data), the total feature-set -> logic-name selector both SMT lanes call, and
+// the exhaustive proof over the whole feature powerset that the selection
+// ADMITS what it must. Admissibility is the invariant every consumer rests on;
+// a group or batch unions its members' features and selects ONCE, which needs
+// nothing else. Monotonicity is NOT a property of this table and must not be
+// assumed: when SMT-LIB names no logic for a feature set itself, the least
+// admitting row must commit to dimensions the set did not ask for, and a
+// superset that SMT-LIB DOES name exactly then admits less than it did. The
+// module pins the exact extent and the exact source sets rather than a
+// characterization — re-read them there, because both move whenever a row is
+// added or a dimension is introduced.
+pub mod logic_lattice;
 // Ambient per-function verification deadline — lets every synchronous
 // preprocessing choke point (extraction, VC gen, spec inference) consult the
 // existing per-function budget and fail closed, closing the non-termination
 // hole where the cooperative deadline only covered solver dispatch.
 pub mod verify_budget;
+// Determinism accounting (docs/design/2026-09-29-incremental-deterministic-
+// trust-results.md): why each obligation's search ended (`StopCause`), whether
+// that is reproducible, the unit outcome, the verdict vector and its digest, the
+// backstop ledger and the budget profile.
+pub mod determinism;
+// T3 L4 (C06a): the audit ledger behind `TRUST_ELIDE_AUDIT`'s CAP, STOP and CERTIFY-STOP
+// rows, attributed to the one active body scope. Measurement only.
+pub mod audit_ledger;
+// The stable, content-addressed obligation key (T9): `<def_path>#<local id>`,
+// minted once per function at transport emission, plus the function source
+// digest a baseline matches moved functions by.
+pub mod expanded_function_identity;
+pub mod obligation_identity;
+// Stable names for Lean declarations, the same `<name>#<16 hex>` shape as an
+// obligation key, so a `.lean` check's records diff like a crate's.
+pub mod lean_declaration_identity;
+// Distinct-site accounting over refuted rows (a MIR assert's L0 row and its
+// hardened panic-boundary twin are two rows at one site). Informational only.
+pub mod failure_sites;
 // SMT-LIB2 string-based pretty printer for debugging and external solver interop.
 mod result;
 // The §7 multi-axis grade record (two-language design, R-U): the lossless
 // successor to the legacy AssuranceLevel ladder.
 pub mod grade;
+// The three-axis grade of a passing obligation (R7: encoding, discharge,
+// premises), stated per proof-authority class and carried on the transport.
+pub mod authority_grade;
+// The kernel theory and environment a Certified row was checked in (KR0
+// switch): wire mirrors of the Clean reference entry's token.
+pub mod kernel_theory;
+pub use kernel_theory::{KernelEnvDigest, KernelTheoryId};
 pub mod guidance;
 // The single per-obligation outcome vocabulary shared by the compiler
 // transport, the report DTOs, and every consumer downstream of them.
@@ -1744,6 +2056,9 @@ pub(crate) mod smtlib2_printer;
 pub mod int_literal;
 pub(crate) mod spec;
 pub(crate) mod spec_attrs;
+// SPEC-FLOAT-EQ-STRUCTURAL-1: the one rule for what a contract `==` between
+// floats means (Rust `PartialEq`, i.e. IEEE `FpEq`, never structural `Eq`).
+mod spec_float_eq;
 mod spec_parse;
 mod spec_render;
 // state_machine extraction lives in trust-temporal/extract.rs.
@@ -1755,14 +2070,27 @@ pub(crate) mod trait_resolution;
 // Trust (E5 conservation): the reserved `trust::` attribute vocabulary, enumerated
 // from the code that CONSUMES each name. Deliberately dependency-free so the
 // resolver can key its hard-error refusal on it without pulling in verification IR.
-pub mod trust_attr_namespace;
 pub(crate) mod traits;
+pub mod trust_attr_namespace;
 // Allocation-identity/offset model for pointer values (design of record for
 // verified-sysroot-scoping §5 step 3 lives in the module doc).
 pub mod alloc_model;
+pub mod constant_image;
+/// Occurrence/value identity for every operand carrier with no modeled value
+/// (OPAQUE-SCALAR-ID-1, OPAQUE-REF-ID-1).
+pub mod opaque_identity;
+pub use opaque_identity::{
+    OPAQUE_REF_SYMBOL_PREFIX, OPAQUE_SCALAR_SYMBOL_PREFIX, OpaqueOrigin,
+    UNSUPPORTED_OPERAND_SYMBOL_PREFIX,
+};
+// Trust (W4 HASHMAP r3): the live-source item bound and the destination-capacity
+// tests behind the "bounded std source" allocation grants (extractor + vcgen).
+pub mod live_source_bound;
+pub use constant_image::*;
 // Provenance tracking types for memory model Layer 2.
 pub mod provenance;
 // Unified memory model for trust-wp/trust-vc cross-function proof composition.
+pub mod native_admission;
 pub mod unified_memory;
 // Legacy vulnerability-pattern prototype. The production verifier has its
 // own sound VC generation/analysis lanes and nothing calls this heuristic
@@ -1770,6 +2098,9 @@ pub mod unified_memory;
 // downstream Trust crates.
 #[cfg(test)]
 mod patterns;
+// `Formula::ConstArray` across this crate's formula consumers.
+#[cfg(test)]
+mod const_array_tests;
 // Shared utility functions consolidated from multiple crates.
 pub(crate) mod utils;
 // Translation validation shared types (used by trust_vcgen and trust-transval).
@@ -1804,7 +2135,7 @@ pub use concurrency::*;
 pub use digest::{
     canonical_json_bytes, canonical_json_sha256, canonical_json_value, canonicalize_json_in_place,
     is_canonical_json, is_stable_sha256_hex, lowercase_hex, stable_sha256_hex,
-    stable_sha256_hex_parts, stable_sha256_hex_reader,
+    stable_sha256_hex_parts, stable_sha256_hex_reader, stable_sha256_parts,
 };
 pub use facts::*;
 pub use formula::*;
@@ -1820,6 +2151,7 @@ pub use result::*;
 // Re-export canonical SMT-LIB2 utilities.
 pub use smt_logic::{
     FormulaSortError, check_formula_sort, collect_free_var_decls, infer_sort, select_logic,
+    sorts_agree,
 };
 pub use smt_printer::{PrintConfig, SmtPrinter};
 pub use smtlib2_printer::{
@@ -1828,6 +2160,7 @@ pub use smtlib2_printer::{
 };
 pub use spec::*;
 pub use spec_attrs::*;
+pub use spec_float_eq::*;
 pub use spec_parse::*;
 pub use spec_render::*;
 pub use strengthen::*;
@@ -1839,4 +2172,5 @@ pub use translation_validation::{
     CheckKind, RefinementVc, RefinementVcToVc, SimulationRelation, TranslationCheck,
     TranslationValidationError, block_successors_list, detect_back_edges, infer_identity_relation,
 };
-pub use utils::{operand_place, strip_generics};
+pub use tuple_layouts::{LayoutTarget, TupleLayoutInfo, TupleLayouts};
+pub use utils::{operand_place, strip_generics, strip_generics_cow, strip_generics_eq};

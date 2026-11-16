@@ -112,12 +112,12 @@ impl CertificateDependencyDag {
 
     /// Return all certificate IDs in topological order (dependencies before dependents).
     pub fn topological_order(&self) -> Result<Vec<String>, CertError> {
-        let mut visited: BTreeSet<String> = BTreeSet::new();
-        let mut order: Vec<String> = Vec::new();
-        let mut in_progress: BTreeSet<String> = BTreeSet::new();
+        let mut visited: BTreeSet<&str> = BTreeSet::new();
+        let mut order: Vec<String> = Vec::with_capacity(self.certificates.len());
+        let mut in_progress: BTreeSet<&str> = BTreeSet::new();
 
         for id in self.certificates.keys() {
-            if !visited.contains(id) {
+            if !visited.contains(id.as_str()) {
                 self.topo_visit(id, &mut visited, &mut in_progress, &mut order)?;
             }
         }
@@ -153,8 +153,8 @@ impl CertificateDependencyDag {
             }
 
             // Verify Merkle hash
-            let deps = self.dependencies.get(cert_id).cloned().unwrap_or_default();
-            let expected_merkle = self.compute_merkle_hash(cert, &deps);
+            let deps = self.dependencies.get(cert_id).map_or(&[][..], Vec::as_slice);
+            let expected_merkle = self.compute_merkle_hash(cert, deps);
             if let Some(stored_merkle) = self.merkle_hashes.get(cert_id) {
                 if *stored_merkle != expected_merkle {
                     result.valid = false;
@@ -187,12 +187,23 @@ impl CertificateDependencyDag {
         hasher.update(cert.timestamp.as_bytes());
 
         // Hash each dependency's Merkle hash (sorted for determinism)
-        let mut sorted_deps: Vec<&str> = dep_ids.iter().map(|s| s.as_str()).collect();
-        sorted_deps.sort();
-        for dep_id in sorted_deps {
-            if let Some(dep_hash) = self.merkle_hashes.get(dep_id) {
-                hasher.update(b"|dep:");
-                hasher.update(dep_hash);
+        match dep_ids {
+            [] => {}
+            [dep_id] => {
+                if let Some(dep_hash) = self.merkle_hashes.get(dep_id.as_str()) {
+                    hasher.update(b"|dep:");
+                    hasher.update(dep_hash);
+                }
+            }
+            _ => {
+                let mut sorted_deps: Vec<&str> = dep_ids.iter().map(|s| s.as_str()).collect();
+                sorted_deps.sort_unstable();
+                for dep_id in sorted_deps {
+                    if let Some(dep_hash) = self.merkle_hashes.get(dep_id) {
+                        hasher.update(b"|dep:");
+                        hasher.update(dep_hash);
+                    }
+                }
             }
         }
 
@@ -200,11 +211,11 @@ impl CertificateDependencyDag {
     }
 
     /// Recursive topological sort helper.
-    fn topo_visit(
-        &self,
-        id: &str,
-        visited: &mut BTreeSet<String>,
-        in_progress: &mut BTreeSet<String>,
+    fn topo_visit<'a>(
+        &'a self,
+        id: &'a str,
+        visited: &mut BTreeSet<&'a str>,
+        in_progress: &mut BTreeSet<&'a str>,
         order: &mut Vec<String>,
     ) -> Result<(), CertError> {
         if in_progress.contains(id) {
@@ -216,7 +227,7 @@ impl CertificateDependencyDag {
             return Ok(());
         }
 
-        in_progress.insert(id.to_string());
+        in_progress.insert(id);
 
         if let Some(deps) = self.dependencies.get(id) {
             for dep in deps {
@@ -225,7 +236,7 @@ impl CertificateDependencyDag {
         }
 
         in_progress.remove(id);
-        visited.insert(id.to_string());
+        visited.insert(id);
         order.push(id.to_string());
 
         Ok(())
@@ -344,7 +355,7 @@ pub fn verify_cert_chain(
     certs: &[ProofCertificate],
     dependencies: &BTreeMap<String, Vec<String>>,
 ) -> Result<(), CertError> {
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
 
     for cert in certs {
         let cert_id = &cert.id.0;
@@ -359,7 +370,7 @@ pub fn verify_cert_chain(
         // Verify all dependencies are earlier in the chain
         if let Some(deps) = dependencies.get(cert_id) {
             for dep_id in deps {
-                if !seen.contains(dep_id) {
+                if !seen.contains(dep_id.as_str()) {
                     return Err(CertError::VerificationFailed {
                         reason: format!(
                             "certificate '{cert_id}' depends on '{dep_id}' which has not been verified yet"
@@ -369,7 +380,7 @@ pub fn verify_cert_chain(
             }
         }
 
-        seen.insert(cert_id.clone());
+        seen.insert(cert_id.as_str());
     }
 
     Ok(())

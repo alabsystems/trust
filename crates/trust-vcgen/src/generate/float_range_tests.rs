@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 use std::sync::Arc;
 
 use trust_types::{
@@ -9,11 +10,15 @@ use trust_types::{
 use super::{
     FLOAT_ADD_TINY_OPERAND_BOUND, FLOAT_EXP_BOUND_FUEL, FLOAT_OVERFLOW_DISCHARGE_MARGIN,
     FloatNanMode, FloatRangeCtx, canonicalize_contract_index_segments, contract_range,
-    derive_float_result_range, float_range, float_witness_width_is_supported,
-    generate_callsite_precondition_vcs, generate_callsite_precondition_vcs_attributed,
-    generate_v2_safety_vcs, parse_projection_suffix, precondition_interval_dominance,
-    substitute_summary_params, v2_float_binop_cannot_overflow, v2_float_binop_cannot_overflow_at,
-    v2_float_contract_magnitude_hypotheses, v2_float_overflow_witness_formula,
+    derive_float_result_range, float_add_tiny_operand_bound, float_overflow_discharge_margin,
+    float_range, float_witness_width_is_supported, generate_callsite_precondition_vcs,
+    generate_callsite_precondition_vcs_attributed, generate_v2_safety_vcs, parse_projection_suffix,
+    precondition_interval_dominance, substitute_summary_params, v2_float_binop_cannot_overflow,
+    v2_float_binop_cannot_overflow_at, v2_float_contract_magnitude_hypotheses,
+    v2_float_overflow_witness_formula,
+};
+use crate::generate::call_facts::sysroot_callee_key_fixture::{
+    rekey_pre_carrier_dump, sysroot_key,
 };
 use crate::modular::{FunctionSummary, SummaryDatabase};
 
@@ -65,6 +70,7 @@ fn make(
         preconditions,
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 fn range_forbid(
@@ -102,6 +108,328 @@ fn float_overflow_kinds(func: &VerifiableFunction) -> Vec<VcKind> {
 fn margin_constants_are_the_documented_powers_of_two() {
     assert_eq!(FLOAT_OVERFLOW_DISCHARGE_MARGIN, 2f64.powi(1020));
     assert_eq!(FLOAT_ADD_TINY_OPERAND_BOUND, 2f64.powi(970));
+}
+
+// ---- width-aware discharge thresholds (2026-09-17) ----
+
+#[test]
+fn discharge_thresholds_are_max_relative_per_width() {
+    // Both thresholds are derived from the width's own `MAX`, never from f64's:
+    //   margin = MAX / 8   (three binades of headroom)
+    //   tiny   = ulp(MAX) / 2   (the round-to-infinity boundary)
+    // f64:  MAX ~ 2^1024, ulp(MAX) = 2^971.
+    assert_eq!(float_overflow_discharge_margin(64), Some(2f64.powi(1020)));
+    assert_eq!(float_add_tiny_operand_bound(64), Some(2f64.powi(970)));
+    // binary32: MAX ~ 2^128, ulp(MAX) = 2^(127 - 23) = 2^104.
+    assert_eq!(float_overflow_discharge_margin(32), Some(2f64.powi(125)));
+    assert_eq!(float_add_tiny_operand_bound(32), Some(2f64.powi(103)));
+    // The binary32 margin must sit BELOW f32::MAX — the property whose absence
+    // was the measured false proof.
+    assert!(float_overflow_discharge_margin(32).unwrap() < f64::from(f32::MAX));
+    assert!(float_add_tiny_operand_bound(32).unwrap() < f64::from(f32::MAX));
+    // Unmodelled widths discharge nothing.
+    for width in [16u32, 128, 0, 80] {
+        assert_eq!(float_overflow_discharge_margin(width), None, "width {width}");
+        assert_eq!(float_add_tiny_operand_bound(width), None, "width {width}");
+    }
+}
+
+/// `fn f(a: fN, b: fN) -> fN { a op b }` under `|a| <= c`, and `|b| <= c` too
+/// when `bound_rhs`. Leaving `b` unbounded is what exercises the TINY-operand
+/// shortcut, which discharges from ONE bounded operand alone.
+fn bounded_binop_sided(width: u32, op: BinOp, c: f64, bound_rhs: bool) -> VerifiableFunction {
+    let ty = Ty::Float { width };
+    let sort = if width == 32 { Sort::Float { eb: 8, sb: 24 } } else { f64s() };
+    let lit = |v: f64| {
+        if width == 32 {
+            Formula::FpConst { bits: u128::from((v as f32).to_bits()), eb: 8, sb: 24 }
+        } else {
+            fp(v)
+        }
+    };
+    let bound = |name: &str| {
+        Formula::And(vec![
+            Formula::Le(Box::new(Formula::Var(name.into(), sort.clone())), Box::new(lit(c))),
+            Formula::Ge(Box::new(Formula::Var(name.into(), sort.clone())), Box::new(lit(-c))),
+        ])
+    };
+    make(
+        vec![
+            decl(0, ty.clone(), None),
+            decl(1, ty.clone(), Some("a")),
+            decl(2, ty.clone(), Some("b")),
+        ],
+        vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![assign(
+                Place::local(0),
+                Rvalue::BinaryOp(
+                    op,
+                    Operand::Copy(Place::local(1)),
+                    Operand::Copy(Place::local(2)),
+                ),
+            )],
+            terminator: Terminator::Return,
+        }],
+        2,
+        ty,
+        if bound_rhs { vec![bound("a"), bound("b")] } else { vec![bound("a")] },
+    )
+}
+
+fn bounded_binop(width: u32, op: BinOp, c: f64) -> VerifiableFunction {
+    bounded_binop_sided(width, op, c, true)
+}
+
+fn sided_binop_discharges(width: u32, op: BinOp, c: f64, bound_rhs: bool) -> bool {
+    let func = bounded_binop_sided(width, op, c, bound_rhs);
+    v2_float_binop_cannot_overflow_at(
+        &func,
+        Some(BlockId(0)),
+        None,
+        op,
+        &Operand::Copy(Place::local(1)),
+        &Operand::Copy(Place::local(2)),
+    )
+}
+
+fn bounded_binop_discharges(width: u32, op: BinOp, c: f64) -> bool {
+    sided_binop_discharges(width, op, c, true)
+}
+
+#[test]
+fn bounded_f32_binops_discharge() {
+    // 1e30 is three binades under the binary32 margin (2^125 ~ 4.25e37), so the
+    // sum and the product both land inside it.
+    assert!(bounded_binop_discharges(32, BinOp::Add, 1e30));
+    assert!(bounded_binop_discharges(32, BinOp::Sub, 1e30));
+    assert!(bounded_binop_discharges(32, BinOp::Mul, 1e18));
+    // The whole function must mint no overflow obligation either.
+    assert!(float_overflow_kinds(&bounded_binop(32, BinOp::Add, 1e30)).is_empty());
+}
+
+#[test]
+fn near_max_f32_add_is_not_discharged() {
+    // THE FALSE PROOF this width-awareness exists to prevent. `3e38` is just
+    // under `f32::MAX ~ 3.4e38`; `3e38 + 3e38` is INFINITY in binary32. Against
+    // the f64-scaled thresholds these operands read as "tiny" (2^970) and the
+    // add verified — measured, reverted, and now pinned.
+    assert!(!bounded_binop_discharges(32, BinOp::Add, 3e38));
+    assert!(!bounded_binop_discharges(32, BinOp::Sub, 3e38));
+    assert!(!bounded_binop_discharges(32, BinOp::Mul, 3e38));
+    // And the obligation must actually be minted, not silently dropped.
+    assert!(!float_overflow_kinds(&bounded_binop(32, BinOp::Add, 3e38)).is_empty());
+}
+
+#[test]
+fn near_max_f32_bounds_still_discharge_at_f64() {
+    // The f64 lane is unchanged: `3e38` is astronomically below `f64::MAX`, so
+    // the SAME numeric bounds that must refuse at binary32 must still discharge
+    // at binary64. This is what makes the refusal above a width fact rather
+    // than a blanket tightening.
+    assert!(bounded_binop_discharges(64, BinOp::Add, 3e38));
+    assert!(bounded_binop_discharges(64, BinOp::Mul, 3e38));
+}
+
+#[test]
+fn f32_tiny_operand_shortcut_respects_the_binary32_boundary() {
+    // The shortcut takes ONE bounded operand and leaves the other ARBITRARY, so
+    // it must hold against the worst case `|b| = f32::MAX`.
+    //
+    // At exactly `ulp(f32::MAX) / 2 = 2^103` the sum with `f32::MAX` lands on
+    // the round-to-nearest-even boundary and rounds AWAY to infinity, so the
+    // comparison is strict and the bound itself must NOT discharge.
+    let at_bound = 2f64.powi(103);
+    assert!(!sided_binop_discharges(32, BinOp::Add, at_bound, false));
+    // Strictly below it, `f32::MAX + b` rounds back down to `f32::MAX`.
+    assert!(sided_binop_discharges(32, BinOp::Add, at_bound / 2.0, false));
+    // The f64 boundary is the same derivation one format up.
+    let f64_bound = 2f64.powi(970);
+    assert!(!sided_binop_discharges(64, BinOp::Add, f64_bound, false));
+    assert!(sided_binop_discharges(64, BinOp::Add, f64_bound / 2.0, false));
+}
+
+#[test]
+fn one_sided_near_max_f32_add_is_not_discharged() {
+    // The sharpest statement of the false proof. With ONE operand bounded at
+    // `3e38` and the other arbitrary, the f64-scaled tiny bound (2^970) called
+    // `3e38` tiny and discharged. In binary32 the other operand can be
+    // `f32::MAX` and the sum is INFINITY.
+    assert!(!sided_binop_discharges(32, BinOp::Add, 3e38, false));
+    // Same numeral, f64 op: `3e38` really is tiny at binary64 scale, so the
+    // discharge is correct there and must be preserved.
+    assert!(sided_binop_discharges(64, BinOp::Add, 3e38, false));
+}
+
+// This midpoint rounds UP at binary32, despite remaining below 2^103 in
+// binary64. A subsequent MAX add must retain its real overflow obligation.
+fn f32_midpoint_chain() -> VerifiableFunction {
+    let ty = Ty::Float { width: 32 };
+    let sort = Sort::Float { eb: 8, sb: 24 };
+    let exact_a = Formula::FpConst { bits: 0x72ff_ffff, eb: 8, sb: 24 };
+    let a = Formula::Var("a".into(), sort);
+    make(
+        vec![
+            decl(0, ty.clone(), None),
+            decl(1, ty.clone(), Some("a")),
+            decl(2, ty.clone(), Some("peer")),
+            decl(3, ty.clone(), Some("rounded")),
+        ],
+        vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![
+                assign(
+                    Place::local(3),
+                    Rvalue::BinaryOp(
+                        BinOp::Add,
+                        Operand::Copy(Place::local(1)),
+                        Operand::Constant(ConstValue::FloatBits { bits: 0x6680_0000, width: 32 }),
+                    ),
+                ),
+                assign(
+                    Place::local(0),
+                    Rvalue::BinaryOp(
+                        BinOp::Add,
+                        Operand::Copy(Place::local(3)),
+                        Operand::Copy(Place::local(2)),
+                    ),
+                ),
+            ],
+            terminator: Terminator::Return,
+        }],
+        2,
+        ty,
+        vec![Formula::And(vec![
+            Formula::Le(Box::new(a.clone()), Box::new(exact_a.clone())),
+            Formula::Ge(Box::new(a), Box::new(exact_a)),
+        ])],
+    )
+}
+
+fn native_f32_midpoint() -> f32 {
+    let a = std::hint::black_box(f32::from_bits(0x72ff_ffff));
+    let b = std::hint::black_box(f32::from_bits(0x6680_0000));
+    let rounded = a + b;
+    assert_eq!(rounded.to_bits(), 0x7300_0000);
+    assert!((rounded + std::hint::black_box(f32::MAX)).is_infinite());
+    rounded
+}
+
+#[test]
+fn f32_intermediate_interval_encloses_native_rounded_midpoint() {
+    let actual = f64::from(native_f32_midpoint());
+    let function = f32_midpoint_chain();
+    let (lo, hi) = range_nob(&function, Some(BlockId(0)), &Operand::Copy(Place::local(3)))
+        .expect("finite intermediate must retain a conservative range");
+    assert!(lo <= actual && actual <= hi, "native {actual:e} is outside [{lo:e}, {hi:e}]");
+}
+
+#[test]
+fn f32_chained_midpoint_add_retains_real_overflow_obligation() {
+    native_f32_midpoint();
+    let function = f32_midpoint_chain();
+    assert!(!v2_float_binop_cannot_overflow_at(
+        &function,
+        Some(BlockId(0)),
+        None,
+        BinOp::Add,
+        &Operand::Copy(Place::local(3)),
+        &Operand::Copy(Place::local(2)),
+    ));
+    assert!(!float_overflow_kinds(&function).is_empty());
+}
+
+#[test]
+fn f32_intermediate_arithmetic_encloses_native_results() {
+    let cases = [
+        (BinOp::Add, f32::from_bits(0x72ff_ffff), f32::from_bits(0x6680_0000)),
+        (BinOp::Sub, -f32::from_bits(0x72ff_ffff), f32::from_bits(0x6680_0000)),
+        (BinOp::Mul, f32::from_bits(0x3f80_0001), f32::from_bits(0x3f80_0001)),
+        (BinOp::Div, 1.0, 3.0),
+        (BinOp::Mul, f32::from_bits(1), 0.5),
+        (BinOp::Mul, -f32::from_bits(1), 0.5),
+        (BinOp::Div, f32::MIN_POSITIVE, 3.0),
+    ];
+    for (op, a, b) in cases {
+        let (a, b) = (std::hint::black_box(a), std::hint::black_box(b));
+        let actual = match op {
+            BinOp::Add => a + b,
+            BinOp::Sub => a - b,
+            BinOp::Mul => a * b,
+            BinOp::Div => a / b,
+            _ => unreachable!(),
+        };
+        let operand = |value: f32| {
+            Operand::Constant(ConstValue::FloatBits {
+                bits: u128::from(value.to_bits()),
+                width: 32,
+            })
+        };
+        let ty = Ty::Float { width: 32 };
+        let function = make(
+            vec![decl(0, ty.clone(), None)],
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![assign(Place::local(0), Rvalue::BinaryOp(op, operand(a), operand(b)))],
+                terminator: Terminator::Return,
+            }],
+            0,
+            ty,
+            vec![],
+        );
+        let (lo, hi) = range_forbid(&function, Some(BlockId(0)), &Operand::Copy(Place::local(0)))
+            .expect("finite native result should have an enclosing interval");
+        assert!(
+            lo <= f64::from(actual) && f64::from(actual) <= hi,
+            "{op:?}({a:e}, {b:e}) = {actual:e} outside [{lo:e}, {hi:e}]"
+        );
+    }
+}
+
+#[test]
+fn f32_intermediate_overflow_never_becomes_a_finite_range() {
+    let maximum = std::hint::black_box(f32::MAX);
+    assert!((maximum * std::hint::black_box(2.0f32)).is_infinite());
+    let ty = Ty::Float { width: 32 };
+    let function = make(
+        vec![decl(0, ty.clone(), None)],
+        vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![assign(
+                Place::local(0),
+                Rvalue::BinaryOp(
+                    BinOp::Mul,
+                    Operand::Constant(ConstValue::FloatBits { bits: 0x7f7f_ffff, width: 32 }),
+                    Operand::Constant(ConstValue::FloatBits { bits: 0x4000_0000, width: 32 }),
+                ),
+            )],
+            terminator: Terminator::Return,
+        }],
+        0,
+        ty,
+        vec![],
+    );
+    assert!(range_forbid(&function, Some(BlockId(0)), &Operand::Copy(Place::local(0))).is_none());
+    assert!(!float_overflow_kinds(&function).is_empty());
+}
+
+#[test]
+fn float_discharge_refuses_mixed_missing_and_unmodelled_widths() {
+    let function = bounded_binop(32, BinOp::Add, 1.0);
+    let lhs = Operand::Copy(Place::local(1));
+    for rhs in [Operand::Constant(ConstValue::Float(0.0)), Operand::Copy(Place::local(999))] {
+        assert!(!v2_float_binop_cannot_overflow_at(
+            &function,
+            Some(BlockId(0)),
+            None,
+            BinOp::Add,
+            &lhs,
+            &rhs,
+        ));
+    }
+    for width in [16, 128] {
+        assert!(!bounded_binop_discharges(width, BinOp::Add, 1.0));
+    }
 }
 
 // ---- F0: multi-def HULL (the recon-confirmed last-def-wins false proof) ----
@@ -748,6 +1076,51 @@ fn uniform_index_with_missing_element_fails_closed() {
     assert_eq!(contract_range(&func, &read), None);
 }
 
+/// `arr: [f64; len]` (param 1), `i: usize` (param 2), read `arr[i]`.
+fn long_array_param_func(len: u64, pre: Vec<Formula>) -> VerifiableFunction {
+    make(
+        vec![
+            decl(0, Ty::f64_ty(), None),
+            decl(1, Ty::Array { elem: Box::new(Ty::f64_ty()), len }, Some("arr")),
+            decl(2, Ty::Int { width: 64, signed: false }, Some("i")),
+        ],
+        vec![BasicBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Return }],
+        2,
+        Ty::f64_ty(),
+        pre,
+    )
+}
+
+/// The retired per-lane scan declined every array longer than 64. The hull is
+/// now read off the contract in one pass, so 100 bounded lanes give their hull,
+/// and a lane the contract never mentions still fails closed.
+#[test]
+fn uniform_index_hull_past_the_retired_64_lane_cap() {
+    let read = Place { local: 1, projections: vec![Projection::Index(2)] };
+    let mut pre = Vec::new();
+    for k in 0..100 {
+        pre.extend(both(&format!("arr[{k}]"), 1.0 + f64::from(k)));
+    }
+    assert_eq!(
+        contract_range(&long_array_param_func(100, pre.clone()), &read),
+        Some((-100.0, 100.0))
+    );
+    // Lane 100 of a 101-lane array is unbounded: no interval.
+    assert_eq!(contract_range(&long_array_param_func(101, pre.clone()), &read), None);
+    // A lane named twice keeps the tightest bound; a lane named out of range
+    // (`arr[100]` of 100 lanes) is not a lane at all and changes nothing.
+    pre.extend(both("arr[0]", 0.5));
+    pre.extend(both("arr[100]", 1e30));
+    assert_eq!(contract_range(&long_array_param_func(100, pre), &read), Some((-100.0, 100.0)));
+    // A non-canonical lane spelling (`arr[07]`) is not `arr[7]`.
+    let mut sparse = Vec::new();
+    for k in 0..8 {
+        let name = if k == 7 { "arr[07]".to_string() } else { format!("arr[{k}]") };
+        sparse.extend(both(&name, 1.0));
+    }
+    assert_eq!(contract_range(&long_array_param_func(8, sparse), &read), None);
+}
+
 #[test]
 fn constant_index_render_matches_contract_spelling() {
     // A `ConstantIndex` read renders `[0;min=2]`; canonicalization maps it
@@ -831,6 +1204,7 @@ fn f5_caller() -> VerifiableFunction {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("callee"),
                     is_foreign: false,
                     func: "callee".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -942,6 +1316,7 @@ fn clamp_func() -> VerifiableFunction {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: sysroot_key("core"),
                     is_foreign: false,
                     func: "core::f64::<impl f64>::clamp".to_string(),
                     args: vec![Operand::Copy(Place::local(1)), fconst(0.0), fconst(1.0)],
@@ -1024,6 +1399,7 @@ fn summary_caller(pre: Vec<Formula>) -> VerifiableFunction {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("leaf"),
                     is_foreign: false,
                     func: "leaf".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -1175,6 +1551,7 @@ fn derive_result_range_does_not_reuse_a_stale_pre_tail_assignment() {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("test::unknown_float"),
             },
         }],
         0,
@@ -1234,6 +1611,7 @@ fn abs_guarded_div(reseat: bool) -> VerifiableFunction {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: sysroot_key("core"),
                     is_foreign: false,
                     func: "core::f64::<impl f64>::abs".to_string(),
                     args: vec![Operand::Copy(Place::local(2))],
@@ -1433,16 +1811,35 @@ fn user_crate_trig_suffixes_are_not_unit_bounded() {
     // in `::cos`/`::sin`/`::tanh` (a truncated-Taylor `approx::cos`,
     // unbounded for large inputs) must NOT be granted the [-1, 1] interval
     // — only the crate-origin-anchored std methods qualify.
+    // NUM-METHOD-ANCHOR-1 (2026-10-04): the recognizer asks the compiler-minted key
+    // first; this is the key the extractor mints for a std/core callee.
+    let sysroot = trust_types::CalleeKey {
+        sysroot_item: None,
+        krate_is_real_sysroot: true,
+        krate_name_is_ambiguous: false,
+        stable_crate_id: 0x1234,
+        krate_name: "std".into(),
+        foreign_block_leaf: None,
+        upstream_foreign_link_symbol: None,
+        diverging_entry: None,
+    };
     for forged in [
         "mycrate::approx::cos",
         "mycrate::trig::sin",
         "mycrate::act::tanh",
         "mycrate::f64::cos_unchecked",
     ] {
-        assert!(!super::is_unit_bounded_float_call(forged), "`{forged}` must not be unit-bounded");
+        assert!(
+            !super::is_unit_bounded_float_call(forged, Some(&sysroot)),
+            "`{forged}` must not be unit-bounded"
+        );
     }
     for genuine in ["std::f64::<impl f64>::cos", "core::f64::<impl f64>::sin"] {
-        assert!(super::is_unit_bounded_float_call(genuine), "`{genuine}` must stay recognized");
+        assert!(
+            super::is_unit_bounded_float_call(genuine, Some(&sysroot)),
+            "`{genuine}` must stay recognized"
+        );
+        assert!(!super::is_unit_bounded_float_call(genuine, None), "`{genuine}` without a key");
     }
 }
 
@@ -1557,6 +1954,325 @@ fn param_override_is_consulted_before_the_contract() {
     assert_eq!(r, Some((-1.0, 1.0)));
 }
 
+// ---- Wave 20: a callee trace uses only facts about its own context ----
+//
+// F6B-FIELD-OVERRIDE-UNSTABLE-1: a struct/tuple formal's leaf override is an
+// ENTRY fact, so a formal the callee writes (a projected store, or a `&mut`
+// borrow of a field) must not consume it.
+// F6B-TRACE-MEMO-KEY-1: the trace memo key is spelled in the traced
+// function's own local names, so one context's entry must never answer
+// another context's query.
+
+/// `bb<id>: _<dest> = <callee>(<args>) -> bb<id + 1>`.
+fn call_to(id: usize, callee: &str, args: Vec<Operand>, dest: usize) -> BasicBlock {
+    BasicBlock {
+        id: BlockId(id),
+        stmts: vec![],
+        terminator: Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(callee),
+            is_foreign: false,
+            func: callee.to_string(),
+            args,
+            dest: Place::local(dest),
+            target: Some(BlockId(id + 1)),
+            span: SourceSpan::default(),
+            atomic: None,
+        },
+    }
+}
+
+/// `struct P { a: f64 }`.
+fn p_ty() -> Ty {
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        name: "P".into(),
+        fields: vec![("a".into(), Ty::f64_ty())].into(),
+        variants: Vec::new().into(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
+}
+
+fn pair_ty() -> Ty {
+    Ty::Tuple(vec![Ty::f64_ty(), Ty::f64_ty()])
+}
+
+/// `fn bump(mut p: P) -> f64 { p.a = 1e300; p.a }` — the production MIR
+/// shape (`_1.0 = const 1e300; _0 = copy _1.0`).
+fn bump_callee() -> VerifiableFunction {
+    make(
+        vec![decl(0, Ty::f64_ty(), None), decl(1, p_ty(), Some("p"))],
+        vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![
+                assign(Place::field(1, 0), Rvalue::Use(fconst(1.0e300))),
+                assign(Place::local(0), Rvalue::Use(Operand::Copy(Place::field(1, 0)))),
+            ],
+            terminator: Terminator::Return,
+        }],
+        1,
+        Ty::f64_ty(),
+        vec![],
+    )
+}
+
+/// `fn keep(p: P) -> f64 { p.a }` — the twin with no write.
+fn keep_callee() -> VerifiableFunction {
+    make(
+        vec![decl(0, Ty::f64_ty(), None), decl(1, p_ty(), Some("p"))],
+        vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![assign(Place::local(0), Rvalue::Use(Operand::Copy(Place::field(1, 0))))],
+            terminator: Terminator::Return,
+        }],
+        1,
+        Ty::f64_ty(),
+        vec![],
+    )
+}
+
+/// `fn via_mut(mut p: (f64, f64)) -> f64 { set(&mut p.0); p.0 }` — the
+/// production MIR shape (`_3 = &mut _1.0; _2 = set(copy _3)`).
+fn via_mut_callee() -> VerifiableFunction {
+    let mut set_call = call_to(0, "set", vec![Operand::Copy(Place::local(3))], 2);
+    set_call.stmts =
+        vec![assign(Place::local(3), Rvalue::Ref { mutable: true, place: Place::field(1, 0) })];
+    make(
+        vec![
+            decl(0, Ty::f64_ty(), None),
+            decl(1, pair_ty(), Some("p")),
+            decl(2, Ty::Unit, None),
+            decl(3, Ty::Ref { mutable: true, inner: Box::new(Ty::f64_ty()) }, None),
+        ],
+        vec![
+            set_call,
+            BasicBlock {
+                id: BlockId(1),
+                stmts: vec![assign(
+                    Place::local(0),
+                    Rvalue::Use(Operand::Copy(Place::field(1, 0))),
+                )],
+                terminator: Terminator::Return,
+            },
+        ],
+        1,
+        Ty::f64_ty(),
+        vec![],
+    )
+}
+
+/// `fn caller(p: <formal_ty>) -> f64 requires p.0 == 0.5 { <callee>(p) }`,
+/// with the call's dest `_2` read at bb1.
+fn field_caller(formal_ty: Ty, callee: &str) -> VerifiableFunction {
+    make(
+        vec![
+            decl(0, Ty::f64_ty(), None),
+            decl(1, formal_ty, Some("p")),
+            decl(2, Ty::f64_ty(), None),
+        ],
+        vec![
+            call_to(0, callee, vec![Operand::Copy(Place::local(1))], 2),
+            BasicBlock {
+                id: BlockId(1),
+                stmts: vec![assign(Place::local(0), Rvalue::Use(Operand::Copy(Place::local(2))))],
+                terminator: Terminator::Return,
+            },
+        ],
+        1,
+        Ty::f64_ty(),
+        vec![Formula::And(vec![le_f("p.0", 0.5), ge_f("p.0", 0.5)])],
+    )
+}
+
+/// The traced interval of `<callee>(p)`'s result in `field_caller`.
+fn traced_field_call(formal_ty: Ty, name: &str, callee: VerifiableFunction) -> Option<(f64, f64)> {
+    let mut db = SummaryDatabase::new();
+    db.insert(
+        FunctionSummary::new(name)
+            .with_param_names(vec!["p".into()])
+            .with_extracted_body(Arc::new(callee)),
+    );
+    let caller = field_caller(formal_ty, name);
+    range_forbid_db(&caller, &db, Some(BlockId(1)), &Operand::Copy(Place::local(2)))
+}
+
+#[test]
+fn field_override_is_ignored_for_a_formal_field_written_before_the_read() {
+    // BEFORE: Some((0.5, 0.5)) — the caller's `p.0`, although `bump`
+    // returns 1e300.
+    let r = traced_field_call(p_ty(), "bump", bump_callee());
+    assert!(
+        r.is_none_or(|(lo, hi)| lo <= 1.0e300 && 1.0e300 <= hi),
+        "a written formal leaf must not consume the caller's entry interval, got {r:?}"
+    );
+}
+
+#[test]
+fn field_override_is_ignored_for_a_formal_field_borrowed_mutably() {
+    // BEFORE: Some((0.5, 0.5)) — `set` may write any value through `&mut p.0`.
+    let r = traced_field_call(pair_ty(), "via_mut", via_mut_callee());
+    assert_eq!(r, None, "a `&mut`-borrowed formal leaf must not consume the caller's interval");
+}
+
+#[test]
+fn field_override_still_binds_an_unwritten_formal_field() {
+    // Control: the callee never writes `p`, so its read of `p.0` sees the
+    // caller's entry value.
+    assert_eq!(traced_field_call(p_ty(), "keep", keep_callee()), Some((0.5, 0.5)));
+}
+
+#[test]
+fn param_field_override_refuses_a_written_formal_on_its_own() {
+    // Defence in depth: even with an actual bound for the written formal
+    // (the binder bypassed), the lookup itself refuses it, as
+    // `contract_range` does.
+    let caller = field_caller(p_ty(), "bump");
+    let root = FloatRangeCtx::new(&caller, None);
+    let bump = bump_callee();
+    let keep = keep_callee();
+    let actuals = || {
+        let mut m = trust_types::fx::FxHashMap::default();
+        m.insert(1usize, Place::local(1));
+        m
+    };
+    let written = super::FieldOverrideSource::for_test(&root, BlockId(0), actuals());
+    let bump_ctx = FloatRangeCtx::for_callee(&root, &bump, Default::default(), Some(&written));
+    assert_eq!(bump_ctx.param_field_override(&Place::field(1, 0)), None);
+    let stable = super::FieldOverrideSource::for_test(&root, BlockId(0), actuals());
+    let keep_ctx = FloatRangeCtx::for_callee(&root, &keep, Default::default(), Some(&stable));
+    assert_eq!(keep_ctx.param_field_override(&Place::field(1, 0)), Some((0.5, 0.5)));
+}
+
+/// `fn inner(v: f64) -> f64 { v }`.
+fn inner_callee() -> VerifiableFunction {
+    make(
+        vec![decl(0, Ty::f64_ty(), None), decl(1, Ty::f64_ty(), Some("v"))],
+        vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![assign(Place::local(0), Rvalue::Use(Operand::Copy(Place::local(1))))],
+            terminator: Terminator::Return,
+        }],
+        1,
+        Ty::f64_ty(),
+        vec![],
+    )
+}
+
+/// `fn outer(w: f64) -> f64 { inner(w) }` — its call is `inner(copy _1)` at
+/// bb0, the key a caller's own `inner(copy _1)` at bb0 also has.
+fn outer_callee() -> VerifiableFunction {
+    make(
+        vec![decl(0, Ty::f64_ty(), None), decl(1, Ty::f64_ty(), Some("w"))],
+        vec![
+            call_to(0, "inner", vec![Operand::Copy(Place::local(1))], 0),
+            BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+        ],
+        1,
+        Ty::f64_ty(),
+        vec![],
+    )
+}
+
+fn memo_db() -> SummaryDatabase {
+    let mut db = SummaryDatabase::new();
+    db.insert(body_summary("inner", inner_callee()));
+    db.insert(body_summary("outer", outer_callee()));
+    db
+}
+
+/// `fn f(x, y) requires x == 2 { let a = <first>(x); let b = <second>(y); a * b }`
+/// with `a = _3`, `b = _4`, both read at bb2.
+fn memo_caller(first: &str, second: &str, second_arg: usize) -> VerifiableFunction {
+    make(
+        vec![
+            decl(0, Ty::f64_ty(), None),
+            decl(1, Ty::f64_ty(), Some("x")),
+            decl(2, Ty::f64_ty(), Some("y")),
+            decl(3, Ty::f64_ty(), Some("a")),
+            decl(4, Ty::f64_ty(), Some("b")),
+        ],
+        vec![
+            call_to(0, first, vec![Operand::Copy(Place::local(1))], 3),
+            call_to(1, second, vec![Operand::Copy(Place::local(second_arg))], 4),
+            BasicBlock {
+                id: BlockId(2),
+                stmts: vec![assign(
+                    Place::local(0),
+                    Rvalue::BinaryOp(
+                        BinOp::Mul,
+                        Operand::Copy(Place::local(3)),
+                        Operand::Copy(Place::local(4)),
+                    ),
+                )],
+                terminator: Terminator::Return,
+            },
+        ],
+        2,
+        Ty::f64_ty(),
+        vec![Formula::And(vec![le_f("x", 2.0), ge_f("x", 2.0)])],
+    )
+}
+
+fn read_at_bb2(ctx: &FloatRangeCtx<'_>, local: usize) -> Option<(f64, f64)> {
+    float_range(
+        ctx,
+        FloatNanMode::Forbid,
+        Some(BlockId(2)),
+        &Operand::Copy(Place::local(local)),
+        &mut Vec::new(),
+        FLOAT_EXP_BOUND_FUEL,
+    )
+}
+
+#[test]
+fn trace_memo_does_not_answer_a_second_trace_of_the_same_callee() {
+    // `let a = outer(x); let b = outer(y)` from ONE root context: the first
+    // trace runs `outer` under x = 2 and traces its `inner(copy _1)` as [2, 2].
+    // The second runs `outer` with `y` unbounded; its `inner(copy _1)` has the
+    // same key. BEFORE: Some((2.0, 2.0)) for `b`.
+    let db = memo_db();
+    let caller = memo_caller("outer", "outer", 2);
+    let ctx = FloatRangeCtx::new(&caller, Some(&db));
+    assert_eq!(read_at_bb2(&ctx, 3), Some((2.0, 2.0)));
+    assert_eq!(read_at_bb2(&ctx, 4), None, "`outer(y)` with y unbounded must not be bounded");
+}
+
+#[test]
+fn trace_memo_does_not_answer_a_callee_query_from_the_caller_entry() {
+    // `let a = inner(x); let b = outer(y)`: the caller's own `inner(copy _1)`
+    // at bb0 has the key of the `inner(copy _1)` at bb0 inside `outer`.
+    // BEFORE: Some((2.0, 2.0)) for `b`.
+    let db = memo_db();
+    let caller = memo_caller("inner", "outer", 2);
+    let ctx = FloatRangeCtx::new(&caller, Some(&db));
+    assert_eq!(read_at_bb2(&ctx, 3), Some((2.0, 2.0)));
+    assert_eq!(read_at_bb2(&ctx, 4), None, "`outer(y)` with y unbounded must not be bounded");
+}
+
+#[test]
+fn trace_memo_still_serves_the_root_context() {
+    // Control: the root context keeps its memo (the mul_mat4 hits it exists
+    // for), each nested context starts its own, and a second bounded trace of
+    // the same callee still traces.
+    let db = memo_db();
+    let caller = memo_caller("outer", "outer", 1);
+    let ctx = FloatRangeCtx::new(&caller, Some(&db));
+    assert_eq!(read_at_bb2(&ctx, 3), Some((2.0, 2.0)));
+    assert_eq!(read_at_bb2(&ctx, 4), Some((2.0, 2.0)));
+    let callees: Vec<String> = ctx.trace_memo.borrow().keys().map(|k| k.1.clone()).collect();
+    assert_eq!(callees, vec!["outer".to_string(), "outer".to_string()], "root entries only");
+    // A repeated root query is answered from the root memo.
+    assert_eq!(read_at_bb2(&ctx, 3), Some((2.0, 2.0)));
+    assert_eq!(ctx.trace_memo.borrow().len(), 2);
+}
+
 // ---- W3 items 1+3: context-sensitive callee tracing ----
 
 /// `fn halve(v: f64) -> f64 { v * 0.5 }` — statically unboundable
@@ -1642,14 +2358,19 @@ fn callee_trace_requires_matching_extracted_arity() {
 // exact production residual shape (48 unknowns in a3d-geom).
 
 fn vec3_ty() -> Ty {
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "Vec3".into(),
         fields: vec![
             ("x".into(), Ty::f64_ty()),
             ("y".into(), Ty::f64_ty()),
             ("z".into(), Ty::f64_ty()),
-        ],
-        variants: Vec::new(),
+        ]
+        .into(),
+        variants: Vec::new().into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -1657,10 +2378,14 @@ fn vec3_ty() -> Ty {
 }
 
 fn aabb_ty() -> Ty {
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "Aabb".into(),
-        fields: vec![("min".into(), vec3_ty()), ("max".into(), vec3_ty())],
-        variants: Vec::new(),
+        fields: vec![("min".into(), vec3_ty()), ("max".into(), vec3_ty())].into(),
+        variants: Vec::new().into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -1762,6 +2487,7 @@ fn vec3_add_callee() -> VerifiableFunction {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("Vec3::new"),
                     is_foreign: false,
                     func: "Vec3::new".to_string(),
                     args: vec![
@@ -1817,6 +2543,7 @@ fn center_caller() -> VerifiableFunction {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("Vec3::add"),
                     is_foreign: false,
                     func: "Vec3::add".to_string(),
                     args: vec![Operand::Copy(Place::local(2)), Operand::Copy(Place::local(3))],
@@ -1833,6 +2560,7 @@ fn center_caller() -> VerifiableFunction {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("Vec3::add"),
                     is_foreign: false,
                     func: "Vec3::scale".to_string(),
                     args: vec![Operand::Move(Place::local(4)), fconst(0.5)],
@@ -2081,7 +2809,12 @@ fn a3d_geom_whole_crate_residual_diagnosis() {
         // Mat4-class contracts nest ~64 `And` levels — use the
         // depth-tolerant parser (the same one the compiler uses for VC
         // payloads).
-        let f: VerifiableFunction = trust_types::json_depth::from_str_deep(&raw).expect("parse");
+        let mut f: VerifiableFunction =
+            trust_types::json_depth::from_str_deep(&raw).expect("parse");
+        // These dumps predate the extractor's `callee_key` carrier (2026-07-18), and
+        // the std `f64` arms decide on that key since NUM-METHOD-ANCHOR-1: supply the
+        // residency key today's extractor mints (a stand-in, see the helper).
+        rekey_pre_carrier_dump(&mut f);
         fns.push(f);
     }
     for f in &fns {
@@ -2290,6 +3023,7 @@ fn forwarder(callee: &str) -> VerifiableFunction {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],
@@ -2409,6 +3143,7 @@ fn pair_caller(pre: Vec<Formula>) -> VerifiableFunction {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("leaf"),
                     is_foreign: false,
                     func: "leaf".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -2496,6 +3231,7 @@ fn option_callee(via_copy: bool, none_only: bool, call_def: bool) -> VerifiableF
                 unwind: trust_types::UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("mystery"),
                 is_foreign: false,
                 func: "mystery".to_string(),
                 args: vec![],
@@ -2564,6 +3300,7 @@ fn option_caller(pre: Vec<Formula>) -> VerifiableFunction {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("leaf"),
                     is_foreign: false,
                     func: "leaf".to_string(),
                     args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -2732,6 +3469,7 @@ fn compose_scalar_field_actual_dominates_through_copy_temps() {
                         unwind: trust_types::UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("scale"),
                         is_foreign: false,
                         func: "scale".to_string(),
                         args: vec![Operand::Move(Place::local(3)), Operand::Move(Place::local(4))],
@@ -2904,6 +3642,7 @@ fn fdiv_abs_probe(cap: f64, false_edge: bool, reseat_a: bool) -> VerifiableFunct
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: sysroot_key("core"),
                     is_foreign: false,
                     func: "core::f64::<impl f64>::abs".to_string(),
                     args: vec![Operand::Copy(Place::local(2))],
@@ -2934,6 +3673,7 @@ fn fdiv_abs_probe(cap: f64, false_edge: bool, reseat_a: bool) -> VerifiableFunct
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: sysroot_key("core"),
                     is_foreign: false,
                     func: "core::f64::<impl f64>::abs".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -3127,6 +3867,96 @@ fn no_hypothesis_without_an_entry_stable_two_sided_contract() {
     let formulas = float_overflow_formulas(&one_sided);
     assert_eq!(formulas.len(), 1);
     assert!(!has_any_bvule(&formulas[0]), "one-sided: {:?}", formulas[0]);
+}
+
+/// `fn f(a: f32, b: f32) -> f32 { a - b }` under `|a| <= c`, for the binary32
+/// hypothesis lane. `c` is given as an `f32` so the exact-narrowing rule is
+/// satisfied by construction, as it is for any bound a real `f32` contract
+/// could state.
+fn f32_sub_func(c: f32) -> VerifiableFunction {
+    let ty = Ty::Float { width: 32 };
+    let sort = Sort::Float { eb: 8, sb: 24 };
+    let lit = |v: f32| Formula::FpConst { bits: u128::from(v.to_bits()), eb: 8, sb: 24 };
+    make(
+        vec![
+            decl(0, ty.clone(), None),
+            decl(1, ty.clone(), Some("a")),
+            decl(2, ty.clone(), Some("b")),
+        ],
+        vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![assign(
+                Place::local(0),
+                Rvalue::BinaryOp(
+                    BinOp::Sub,
+                    Operand::Copy(Place::local(1)),
+                    Operand::Copy(Place::local(2)),
+                ),
+            )],
+            terminator: Terminator::Return,
+        }],
+        2,
+        ty,
+        vec![Formula::And(vec![
+            Formula::Le(Box::new(Formula::Var("a".into(), sort.clone())), Box::new(lit(c))),
+            Formula::Ge(Box::new(Formula::Var("a".into(), sort)), Box::new(lit(-c))),
+        ])],
+    )
+}
+
+#[test]
+fn f32_contract_bound_reaches_the_solver_hypothesis_lane() {
+    // The hypothesis lane was `Ty::Float { width: 64 }`-only, so an f32
+    // contract reached the solver carrying no content at all — the exact gap
+    // the f64 lane was built to close. It is now width-generic.
+    let func = f32_sub_func(3.0e38);
+    let a = Operand::Copy(Place::local(1));
+    let hyps = v2_float_contract_magnitude_hypotheses(&func, &a, &a);
+    assert_eq!(hyps.len(), 1, "same place twice must dedupe: {hyps:?}");
+    // binary32 magnitude field is 31 bits, against the f64 lane's 63.
+    let Formula::BvULe(lhs, rhs, 31) = &hyps[0] else {
+        panic!("expected BvULe at the binary32 magnitude width, got {:?}", hyps[0]);
+    };
+    assert!(
+        matches!(lhs.as_ref(), Formula::BvExtract { high: 30, low: 0, .. }),
+        "lhs must be the binary32 magnitude extract: {lhs:?}"
+    );
+    // The bound is the f32 bit pattern with the sign stripped, NOT the f64 one.
+    let expect = i128::from(3.0e38_f32.to_bits() & 0x7fff_ffff);
+    assert!(
+        matches!(rhs.as_ref(), Formula::BitVec { value, width: 31 } if *value == expect),
+        "rhs must be the binary32 sign-stripped bound {expect}: {rhs:?}"
+    );
+}
+
+#[test]
+fn f32_bound_that_does_not_narrow_exactly_mints_no_hypothesis() {
+    // SOUNDNESS twin. The hypothesis must be WEAKER than the contract: every
+    // value the contract admits has to satisfy it. `c` is tracked as f64, and
+    // narrowing to f32 rounds to NEAREST, which can land BELOW `c` and exclude
+    // values the contract admits — assuming more than the user wrote. So a
+    // bound that does not round-trip exactly mints nothing.
+    let mut func = f32_sub_func(1.0);
+    // Re-state the bound as an f64 literal whose value is NOT an f32 value.
+    let f64_sort = f64s();
+    let c = 1.0e30_f64;
+    assert_ne!(f64::from(c as f32), c, "fixture premise: 1e30 is not an f32 value");
+    func.preconditions = vec![Formula::And(vec![
+        Formula::Le(Box::new(Formula::Var("a".into(), f64_sort.clone())), Box::new(fp(c))),
+        Formula::Ge(Box::new(Formula::Var("a".into(), f64_sort)), Box::new(fp(-c))),
+    ])];
+    let a = Operand::Copy(Place::local(1));
+    // POSITIVE CONTROL: the bound must be READABLE, so that the exact-narrowing
+    // guard is demonstrably what declines. Without this the test passes
+    // vacuously the moment anything upstream stops reading the bound at all.
+    assert!(
+        contract_range(&func, &Place::local(1)).is_some(),
+        "the bound must be readable for this test to mean anything"
+    );
+    assert!(
+        v2_float_contract_magnitude_hypotheses(&func, &a, &a).is_empty(),
+        "an inexactly-narrowing f32 bound must mint no hypothesis"
+    );
 }
 
 #[test]

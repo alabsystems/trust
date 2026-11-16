@@ -13,7 +13,7 @@ authority). These fixtures pin the invariants a regression would break.
 
 ```bash
 ./x.py build --stage 2
-TRUST_SEED_STAIRCASE=1 python3 tests/trust-witness/replay_regression.py
+python3 tests/trust-witness/replay_regression.py
 ```
 
 Set `TRUST_WITNESS_TRUSTC=/path/to/stage2/bin/trustc` to exercise a staged

@@ -236,14 +236,14 @@ impl QualityEvaluator {
 
         for path in paths {
             // Extract variable-like tokens from the path.
-            let vars: Vec<String> = extract_identifiers(path);
-            let path_covered = vars.iter().any(|v| spec_lower.contains(&v.to_lowercase()));
+            let vars = extract_identifiers(path);
+            let path_covered = vars.iter().any(|v| contains_lower_token(&spec_lower, v));
             if path_covered {
                 covered += 1;
             }
-            for v in &vars {
-                if !spec_lower.contains(&v.to_lowercase()) && !all_vars.contains(v) {
-                    all_vars.push(v.clone());
+            for v in vars {
+                if !contains_lower_token(&spec_lower, v) && !all_vars.iter().any(|existing| existing == v) {
+                    all_vars.push(v.to_string());
                 }
             }
         }
@@ -262,12 +262,14 @@ impl QualityEvaluator {
     #[must_use]
     pub fn redundancy_check(&self, preconditions: &[&str]) -> Vec<(usize, usize)> {
         let mut pairs = Vec::new();
+        let normalized: Vec<String> =
+            preconditions.iter().map(|p| normalize_clause(p.trim())).collect();
         for i in 0..preconditions.len() {
+            let a = preconditions[i].trim();
             for j in (i + 1)..preconditions.len() {
-                let a = preconditions[i].trim();
                 let b = preconditions[j].trim();
                 // Textual subsumption or exact duplicate after normalization.
-                if a.contains(b) || b.contains(a) || normalize_clause(a) == normalize_clause(b) {
+                if a.contains(b) || b.contains(a) || normalized[i] == normalized[j] {
                     pairs.push((i, j));
                 }
             }
@@ -280,23 +282,23 @@ impl QualityEvaluator {
     /// Penalizes long specs, duplicate clauses, and redundant conjuncts.
     #[must_use]
     pub fn minimality_score(&self, spec: &str) -> QualityScore {
-        let clauses: Vec<&str> = spec
+        let max_val = 100u32;
+
+        // Check for duplicates.
+        let mut normalized: Vec<String> = spec
             .split("&&")
             .chain(spec.split(','))
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .map(normalize_clause)
             .collect();
 
-        let max_val = 100u32;
-
-        if clauses.is_empty() {
+        if normalized.is_empty() {
             return QualityScore::new(MetricKind::Minimality, 0, max_val, "Empty specification");
         }
 
-        // Check for duplicates.
-        let mut normalized: Vec<String> = clauses.iter().map(|c| normalize_clause(c)).collect();
         let total = normalized.len() as u32;
-        normalized.sort();
+        normalized.sort_unstable();
         normalized.dedup();
         let unique = normalized.len() as u32;
         let dup_penalty = (total - unique) * 15;
@@ -410,7 +412,7 @@ impl QualityEvaluator {
         let param_vars = extract_identifiers(function_body);
         let spec_lower = spec.to_lowercase();
         let mentioned =
-            param_vars.iter().filter(|v| spec_lower.contains(&v.to_lowercase())).count();
+            param_vars.iter().filter(|v| contains_lower_token(&spec_lower, v)).count();
         let param_coverage = if param_vars.is_empty() {
             40
         } else {
@@ -453,7 +455,7 @@ impl QualityEvaluator {
         let body_vars = extract_identifiers(function_body);
         let spec_lower = spec.to_lowercase();
         let referenced =
-            body_vars.iter().filter(|v| spec_lower.contains(&v.to_lowercase())).count();
+            body_vars.iter().filter(|v| contains_lower_token(&spec_lower, v)).count();
         if referenced > 0 {
             score += 20u32.min(referenced as u32 * 5);
         }
@@ -517,32 +519,40 @@ impl QualityEvaluator {
 
 // --- Free functions ---
 
-/// Extract identifier-like tokens from a string.
-fn extract_identifiers(text: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut current = String::new();
+fn contains_lower_token(spec_lower: &str, token: &str) -> bool {
+    if token.bytes().all(|b| !b.is_ascii_uppercase()) {
+        spec_lower.contains(token)
+    } else {
+        spec_lower.contains(&token.to_lowercase())
+    }
+}
 
-    for ch in text.chars() {
+/// Extract identifier-like tokens from a string.
+fn extract_identifiers(text: &str) -> Vec<&str> {
+    let mut ids: Vec<&str> = Vec::new();
+    let mut token_start: Option<usize> = None;
+
+    for (idx, ch) in text.char_indices() {
         if ch.is_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else {
-            if !current.is_empty()
-                && !current.chars().next().is_none_or(|c| c.is_ascii_digit())
-                && !is_keyword(&current)
-                && !ids.contains(&current)
-            {
-                ids.push(current.clone());
+            if token_start.is_none() {
+                token_start = Some(idx);
             }
-            current.clear();
+        } else if let Some(start) = token_start.take() {
+            let token = &text[start..idx];
+            if !token.as_bytes()[0].is_ascii_digit()
+                && !is_keyword(token)
+                && !ids.contains(&token)
+            {
+                ids.push(token);
+            }
         }
     }
     // Final token.
-    if !current.is_empty()
-        && !current.chars().next().is_none_or(|c| c.is_ascii_digit())
-        && !is_keyword(&current)
-        && !ids.contains(&current)
-    {
-        ids.push(current);
+    if let Some(start) = token_start {
+        let token = &text[start..];
+        if !token.as_bytes()[0].is_ascii_digit() && !is_keyword(token) && !ids.contains(&token) {
+            ids.push(token);
+        }
     }
 
     ids
@@ -593,7 +603,18 @@ fn is_keyword(word: &str) -> bool {
 
 /// Normalize a clause for deduplication: lowercase, collapse whitespace.
 fn normalize_clause(clause: &str) -> String {
-    clause.split_whitespace().collect::<Vec<&str>>().join(" ").to_lowercase()
+    let mut out = String::with_capacity(clause.len());
+    for word in clause.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        for ch in word.chars() {
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    }
+    out
 }
 
 /// Count the number of clauses in a spec (split by && and commas).
@@ -621,11 +642,11 @@ fn is_contradictory(a: &str, b: &str) -> bool {
     false
 }
 
-fn extract_comparison_var(clause: &str) -> Option<String> {
+fn extract_comparison_var(clause: &str) -> Option<&str> {
     let ops = [">=", "<=", "!=", "==", ">", "<"];
     for op in &ops {
         if let Some(idx) = clause.find(op) {
-            let var = clause[..idx].trim().to_string();
+            let var = clause[..idx].trim();
             if !var.is_empty() {
                 return Some(var);
             }
@@ -907,11 +928,11 @@ mod tests {
     #[test]
     fn test_extract_identifiers() {
         let ids = extract_identifiers("fn foo(x: i32, y_val: u64) -> bool");
-        assert!(ids.contains(&"foo".to_string()));
-        assert!(ids.contains(&"x".to_string()));
-        assert!(ids.contains(&"y_val".to_string()));
+        assert!(ids.contains(&"foo"));
+        assert!(ids.contains(&"x"));
+        assert!(ids.contains(&"y_val"));
         // Keywords should be excluded.
-        assert!(!ids.contains(&"fn".to_string()));
+        assert!(!ids.contains(&"fn"));
     }
 
     #[test]

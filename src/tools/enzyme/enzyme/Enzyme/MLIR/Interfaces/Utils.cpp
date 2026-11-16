@@ -6,16 +6,20 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-
 #include "Interfaces/Utils.h"
 #include "Dialect/Ops.h"
+#include "Interfaces/AutoDiffOpInterface.h"
 #include "Interfaces/AutoDiffTypeInterface.h"
+#include "Interfaces/GradientUtils.h"
+#include "Interfaces/OffsetViewInterface.h"
+#include "Passes/Utils.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include <optional>
 
 using namespace mlir;
@@ -35,15 +39,14 @@ const std::set<std::string> &getNonCapturingFunctions() {
   return NonCapturingFunctions;
 }
 
-static bool isCaptured(Value v, Operation *potentialUser = nullptr,
-                       bool *seenuse = nullptr) {
+bool isCaptured(Value v, Operation *potentialUser, bool *seenuse) {
   SmallVector<Value> todo = {v};
   while (todo.size()) {
     Value v = todo.pop_back_val();
     for (auto u : v.getUsers()) {
       if (seenuse && u == potentialUser)
         *seenuse = true;
-      if (isa<memref::LoadOp, LLVM::LoadOp, affine::AffineLoadOp>(u))
+      if (isa<enzyme::LoadLikeInterface>(u))
         continue;
       if (auto s = dyn_cast<memref::StoreOp>(u)) {
         if (s.getValue() == v)
@@ -60,14 +63,11 @@ static bool isCaptured(Value v, Operation *potentialUser = nullptr,
           return true;
         continue;
       }
-      if (auto sub = dyn_cast<LLVM::GEPOp>(u)) {
-        todo.push_back(sub);
-      }
-      if (auto sub = dyn_cast<LLVM::BitcastOp>(u)) {
-        todo.push_back(sub);
-      }
-      if (auto sub = dyn_cast<LLVM::AddrSpaceCastOp>(u)) {
-        todo.push_back(sub);
+      if (auto view = dyn_cast<ViewLikeOpInterface>(u)) {
+        if (view.getViewSource() == v) {
+          todo.push_back(view.getViewDest());
+          continue;
+        }
       }
       if (auto sub = dyn_cast<func::ReturnOp>(u)) {
         continue;
@@ -80,9 +80,6 @@ static bool isCaptured(Value v, Operation *potentialUser = nullptr,
       }
       if (auto sub = dyn_cast<LLVM::MemmoveOp>(u)) {
         continue;
-      }
-      if (auto sub = dyn_cast<memref::CastOp>(u)) {
-        todo.push_back(sub);
       }
       if (auto sub = dyn_cast<memref::DeallocOp>(u)) {
         continue;
@@ -104,22 +101,34 @@ static bool isCaptured(Value v, Operation *potentialUser = nullptr,
   return false;
 }
 
-static Value getBase(Value v) {
-  while (true) {
-    if (auto s = v.getDefiningOp<LLVM::GEPOp>()) {
-      v = s.getBase();
-      continue;
-    }
-    if (auto s = v.getDefiningOp<LLVM::BitcastOp>()) {
-      v = s.getArg();
-      continue;
-    }
-    if (auto s = v.getDefiningOp<LLVM::AddrSpaceCastOp>()) {
-      v = s.getArg();
-      continue;
-    }
-    if (auto s = v.getDefiningOp<memref::CastOp>()) {
-      v = s.getSource();
+Value inactiveStoredValueShadow(Operation *orig, MGradientUtils &gutils,
+                                Value stored, OpBuilder &builder) {
+  auto iface = cast<AutoDiffTypeInterface>(stored.getType());
+  // An immutable value carries no aliasing structure into the shadow; its
+  // tangent is simply zero.
+  if (!iface.isMutable())
+    return cast<AutoDiffTypeInterface>(gutils.getShadowType(stored.getType()))
+        .createNullValue(builder, orig->getLoc());
+  orig->emitWarning()
+      << "storing an inactive value into differentiated memory; the shadow "
+         "holds the primal value, which runtime activity would be needed to "
+         "check";
+  Value primal = gutils.getNewFromOriginal(stored);
+  if (gutils.width == 1)
+    return primal;
+  SmallVector<Value> batched(gutils.width, primal);
+  return getConcatValue(builder, orig->getLoc(), batched);
+}
+
+Value getBaseObject(Value v, bool offsetAllowed) {
+  while (Operation *def = v.getDefiningOp()) {
+    if (auto view = dyn_cast<ViewLikeOpInterface>(def)) {
+      if (!offsetAllowed) {
+        auto offsetView = dyn_cast<OffsetViewInterface>(def);
+        if (!offsetView || !offsetView.isZeroOffset())
+          break;
+      }
+      v = view.getViewSource();
       continue;
     }
     break;
@@ -127,15 +136,14 @@ static Value getBase(Value v) {
   return v;
 }
 
-static bool isStackAlloca(Value v) {
-  return v.getDefiningOp<memref::AllocaOp>() ||
-         v.getDefiningOp<memref::AllocOp>() ||
-         v.getDefiningOp<LLVM::AllocaOp>();
+static bool isFreshAllocation(Value v) {
+  return v.getDefiningOp<enzyme::MallocLikeInterface>() ||
+         v.getDefiningOp<enzyme::AllocaLikeInterface>();
 }
 
 bool mayAlias(Value v1, Value v2) {
-  v1 = getBase(v1);
-  v2 = getBase(v2);
+  v1 = getBaseObject(v1);
+  v2 = getBaseObject(v2);
   if (v1 == v2)
     return true;
 
@@ -156,11 +164,11 @@ bool mayAlias(Value v1, Value v2) {
   bool isAlloca[2];
   bool isGlobal[2];
 
-  isAlloca[0] = isStackAlloca(v1);
+  isAlloca[0] = isFreshAllocation(v1);
   isGlobal[0] = v1.getDefiningOp<memref::GetGlobalOp>() ||
                 v1.getDefiningOp<LLVM::AddressOfOp>();
 
-  isAlloca[1] = isStackAlloca(v2);
+  isAlloca[1] = isFreshAllocation(v2);
 
   isGlobal[1] = v2.getDefiningOp<memref::GetGlobalOp>() ||
                 v2.getDefiningOp<LLVM::AddressOfOp>();
@@ -241,7 +249,7 @@ bool isReadOnly(Operation *op) {
     // Check to see if this op either has no effects, or only reads from memory.
     SmallVector<MemoryEffects::EffectInstance, 1> effects;
     effectInterface.getEffects(effects);
-    if (!llvm::all_of(effects, [op](const MemoryEffects::EffectInstance &it) {
+    if (!llvm::all_of(effects, [](const MemoryEffects::EffectInstance &it) {
           return isa<MemoryEffects::Read>(it.getEffect());
         })) {
       return false;

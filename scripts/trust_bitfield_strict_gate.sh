@@ -128,9 +128,9 @@ no_rustc_error() { # no_rustc_error <label>
 
 fail() { echo "  FAIL $*"; fails=$((fails+1)); }
 
-run() { # run [policy]; sets RC and LOG
+run() { # run [lane flag]; sets RC and LOG
   LOG="$(mktemp)"
-  ( cd "$REPO_ROOT/crates" && TRUSTFLAGS="${1:-}" "$TARGO" trust check -p trust-bitfield ) > "$LOG" 2>&1
+  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check --all-rows ${1:+"$1"} -p trust-bitfield ) > "$LOG" 2>&1
   RC=$?
   require_env "${STEP:-run}"
   no_rustc_error "${STEP:-run}"
@@ -139,7 +139,7 @@ run() { # run [policy]; sets RC and LOG
 # whose whole job is to refuse the state H creates on purpose.
 run_raw() {
   LOG="$(mktemp)"
-  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check -p trust-bitfield ) > "$LOG" 2>&1
+  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check --all-rows -p trust-bitfield ) > "$LOG" 2>&1
   RC=$?
 }
 # `--lib` is load-bearing. A concurrent `x.py check` can rebuild
@@ -155,7 +155,26 @@ runtests() { # sets RC and LOG
   RC=$?
   require_env "${STEP:-tests}"
 }
-gate_line() { grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$LOG" | tail -1; }
+gate_line() { grep -oE 'Gate: [A-Z-]+ \[[a-z-]+ lane, exit [0-9]+\]' "$LOG" | tail -1; }  # [A-Z-]: CONDITIONAL-PASS (ruling f2a47900ec) has a hyphen
+
+# KNOWN REGRESSION (fragment §15.0, amended 2026-09-16; measured on stage1 f405fe0d5 and
+# 6430d6b06, the latter carrying ruling f2a47900ec): the 19 bodies that call into
+# trust_bits each carry a whole-function panic-freedom catch-all the registry cannot
+# discharge, because collect_proven_total_panic_free_callees gates on
+# callee_def_id.is_local() and never registers a foreign callee. The inline twin (same
+# bodies, callees copied in) certifies at 41/0 under BOTH policies, so the bodies are
+# panic-free and the SOLE cause is the crate boundary. Default tolerates the 19 as
+# RUNTIME-CHECKED (a ConditionalPass under the ruling, exit 0); certify refuses them.
+# The assertions below KEEP their target values — that is the state a fix restores —
+# and only their failure MESSAGE names this regression when the observed shape matches
+# it exactly. The gate stays red for the right reason, and any OTHER drift reads
+# differently. Nothing here is loosened.
+known_regression_19() { # $1 = log
+  grep -qE 'Summary: 41 proved, 0 failed, 19 runtime-checked, 0 assumed, .*0 inconclusive \(6[01] total\)' "$1" \
+  && [ "$(grep -cE '^[[:space:]]*\[RUNTIME-CHECKED\] \[assert\] assertion: panic freedom' "$1")" = "19" ]
+}
+KR19="KNOWN REGRESSION — 19 cross-crate panic-freedom rows RUNTIME-CHECKED (fragment §15.0 amendment 2026-09-16; origin gate in collect_proven_total_panic_free_callees); the inline twin certifies 41/0, so the target value is what a fix restores"
+
 
 # ---------------------------------------------------------------------------
 # G2. `ok` MUST MEAN "THIS SECTION'S OWN CONTENT ASSERTIONS HELD".
@@ -207,12 +226,17 @@ G="$(gate_line)"
 # no `Gate:` line, no `Summary:` and no diagnostic at all. Assert presence first.
 [ -n "$G" ] || fail "pristine: no Gate: line — the report did not seal (§9.2), so nothing below is readable"
 [ "$RC" -eq 0 ] || fail "pristine: rc=$RC (expected 0)  $G"
-case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "pristine: Gate is '$G'";; esac
+case "$G" in
+  *"Gate: PASS [strict lane, exit 0]"*) ;;
+  *"Gate: CONDITIONAL-PASS [strict lane, exit 0]"*) known_regression_19 "$LOG" || fail "pristine: Gate is '$G' — a CONDITIONAL-PASS is not a pass, and this is not the known regression shape";;
+  *) fail "pristine: Gate is '$G'";;
+esac
 if grep -qE '^error(\[|:)' "$LOG"; then fail "pristine: rustc reported errors; obligations for unlowered code are ABSENT, not proved"; fi
 grep -q 'Coverage: 26/26 eligible function bodies verified (complete)' "$LOG" \
   || fail "pristine: coverage is not 26/26 complete — $(grep -oE 'Coverage: [^)]*\)' "$LOG" | tail -1)"
-grep -qE 'Summary: 41 proved, 0 failed, 0 runtime-checked, 0 assumed, .*0 inconclusive \(41 total\)' "$LOG" \
-  || fail "pristine: summary moved — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
+if ! grep -qE 'Summary: 41 proved, 0 failed, 0 runtime-checked, 0 assumed, .*0 inconclusive \(41 total\)' "$LOG"; then
+  if known_regression_19 "$LOG"; then fail "pristine: $KR19"; else fail "pristine: summary moved — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"; fi
+fi
 # NON-VACUITY. `VcKind::Unreachable`'s formula is literally `Bool(true)`; an
 # audit once found 53% of published proofs were exactly that.
 KINDS="$(grep -oE 'proved by kind: [a-z_=0-9, ]+' "$LOG" | tail -1)"
@@ -243,27 +267,33 @@ rm -f "$LOG"
 
 mut_end
 # ---------------------------------------------------------------------------
-# 2. THE SAME PASS UNDER `-Ztrust-policy=certify`.
-#    A misspelled TRUSTFLAGS is silently dropped, so first prove the flag path
-#    reaches the compiler by requiring a bogus policy to be REJECTED BY NAME.
-#    Without this control, "certify passed" is indistinguishable from "certify
-#    never ran".
+# 2. THE SAME PASS UNDER `--certify` (the compiler's `certify` policy).
+#    The lane flag selects the compiler's `certify` policy, and the Gate line
+#    names the lane that graded the run, so `[certify lane, exit 0]` is the
+#    evidence that certify ran. (A bogus-policy control proved the TRUSTFLAGS
+#    route reached the compiler; it went with that channel, DECISION_QUEUE T7a.)
 # ---------------------------------------------------------------------------
 STEP="CERTIFY"; mut_begin
-run "-Ztrust-policy=bogus_not_a_policy"
-grep -q "incorrect value \`bogus_not_a_policy\` for unstable option \`trust-policy\`" "$LOG" \
-  || fail "TRUSTFLAGS control: a bogus policy was NOT rejected — the flag never reaches the compiler, so the certify run below proves nothing"
-rm -f "$LOG"
-
-run "-Ztrust-policy=certify"
+run "--certify"
 G="$(gate_line)"
-[ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
-case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
-grep -qE 'Summary: 41 proved, 0 failed, .*0 inconclusive \(41 total\)' "$LOG" \
-  || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
-grep -qE 'Publication boundary: [0-9]+ obligation\(s\) passed the compiler, 41 published, [0-9]+ WITHHELD .*\(0 relabelled unknown' "$LOG" \
-  || fail "certify: a favorable compiler row was RELABELLED at the publication boundary — $(grep -oE '^Publication boundary: .*' "$LOG" | tail -1)"
-mut_ok "certify   $G  [0 relabelled at the publication boundary]"
+CERT_OK=1
+[ "$RC" -eq 0 ] || CERT_OK=0
+case "$G" in *"Gate: PASS [certify lane, exit 0]"*) ;; *) CERT_OK=0;; esac
+grep -qE 'Summary: 41 proved, 0 failed, .*0 inconclusive \(41 total\)' "$LOG" || CERT_OK=0
+grep -qE 'Publication boundary: [0-9]+ obligation\(s\) passed the compiler, 41 published, [0-9]+ WITHHELD .*\(0 relabelled unknown' "$LOG" || CERT_OK=0
+if [ "$CERT_OK" = 1 ]; then
+  mut_ok "certify   $G  [0 relabelled at the publication boundary]"
+elif [ "$RC" -ne 0 ] && known_regression_19 "$LOG" \
+     && [ "$(grep -cE 'error: Trust strict verification failed for `trust_bitfield::' "$LOG")" = "19" ]; then
+  fail "certify: $KR19 — certify refuses the same 19 rows the default lane tolerates (ruling f2a47900ec keeps every bucket fatal under certify); the lost certify verdict on a COMPOSED crate is the finding  rc=$RC  $G"
+else
+  [ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
+  case "$G" in *"Gate: PASS [certify lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
+  grep -qE 'Summary: 41 proved, 0 failed, .*0 inconclusive \(41 total\)' "$LOG" \
+    || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
+  grep -qE 'Publication boundary: [0-9]+ obligation\(s\) passed the compiler, 41 published, [0-9]+ WITHHELD .*\(0 relabelled unknown' "$LOG" \
+    || fail "certify: a favorable compiler row was RELABELLED at the publication boundary — $(grep -oE '^Publication boundary: .*' "$LOG" | tail -1)"
+fi
 rm -f "$LOG"
 
 mut_end
@@ -360,15 +390,44 @@ STEP="MUTATION C (§15.2)"; mut_begin
 mutate "$SRC" '    clamp_word_index(raw_next_lo(lo, width))' '    trust_bits::clamp_width(raw_next_lo(lo, width))'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then
-  fail "mutation C: a shape-(B) wrapper over the FOREIGN contracted callee \`trust_bits::clamp_width\` now DISCHARGES ($G). Welcome news — and §15.2 of docs/STRICT_VERIFICATION_FRAGMENT.md is now stale and must be re-measured and rewritten, not deleted. next_lo's local clamp can then be replaced by the foreign one."
-else
-  mut_ok "mutation C (§15.2: next_lo's local clamp -> trust_bits::clamp_width)  rc=$RC  $G"
-fi
-grep -q "verification failed for \`trust_bitfield::next_lo\`" "$LOG" \
-  || fail "mutation C: next_lo was not refuted — the failure §15.2 records did not occur, and it did not pass either; re-read the log at $LOG"
+# §15.2 CLOSED 2026-09-16 — exactly the event this arm's header predicted. Measured on
+# stage1 6430d6b06 (carrying f2a47900ec) from an archive copy: the shape-(B) wrapper over
+# the FOREIGN contracted callee DISCHARGES, kernel-certified (call-site postcondition
+# injection, `local=false declared=true verdict=mint`); on f405fe0d5 the one remaining
+# unknown was a trust-mc-proved panic-freedom row WITHHELD at targo's publication
+# boundary, the evidence-spelling defect f2a47900ec fixed. Re-pointed from "must refuse"
+# to a capability pin; C2 below is the control that proves the proof reads the clause.
+if [ "$RC" -ne 0 ]; then fail "mutation C: the shape-(B) wrapper over the FOREIGN contracted callee is REFUSED again (rc=$RC) — §15.2's 2026-09-16 closure regressed  $G"; else mut_ok "mutation C (§15.2: next_lo's local clamp -> trust_bits::clamp_width) DISCHARGES  rc=$RC  $G"; fi
+grep -qE 'trust_bitfield::next_lo \[VERIFIED\] \(2 obligations: 2 proved, 0 runtime-checked, 0 failed, 0 unknown' "$LOG" \
+  || fail "mutation C: next_lo did not verify BOTH its rows over the foreign callee — $(grep -oE 'trust_bitfield::next_lo \[[A-Z ]+\] \([^;]*' "$LOG" | head -1)"
+grep -q 'verification failed for `trust_bitfield::next_lo`' "$LOG" \
+  && fail "mutation C: next_lo hard-errored — the boundary §15.2 recorded has REOPENED"
+grep -A6 'trust_bitfield::next_lo \[VERIFIED\]' "$LOG" | grep -q 'postcondition PROVED (trust-full-verifier, CONSTRUCTIVE (certified; validation=kernel-rechecked' \
+  || fail "mutation C: the clause over the foreign callee is no longer KERNEL-RECHECKED — a merely Trusted proof here is a downgrade from the measured KernelRechecked"
+grep -qE 'Summary: 42 proved, 0 failed, 19 runtime-checked, .*0 inconclusive \(61 total\)' "$LOG" \
+  || fail "mutation C: the row counts moved — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 rm -f "$LOG"; restore
+mut_end
 
+# ---------------------------------------------------------------------------
+# 5b. MUTATION C2 — the CONTROL for C. A kernel-certified proof that read ANY clause
+#    would also read a false one. Same substitution, with next_lo's OWN clause made
+#    FALSE (`<= 32` -> `<= 31`; replaced, not appended — appending keeps the true clause
+#    beside it and changes the obligation count). Measured on 6430d6b06: refused,
+#    next_lo [INCONCLUSIVE] (3 obligations: 1 proved, 2 unknown). So C's proof reads
+#    the callee's clause rather than accepting any.
+# ---------------------------------------------------------------------------
+STEP="MUTATION C2 (§15.2 control)"; mut_begin
+mutate "$SRC" '    clamp_word_index(raw_next_lo(lo, width))' '    trust_bits::clamp_width(raw_next_lo(lo, width))'
+mutate "$SRC" 'pub fn next_lo(lo: u32, width: u32) -> u32 ensures result <= 32 {' 'pub fn next_lo(lo: u32, width: u32) -> u32 ensures result <= 31 {'
+run
+G="$(gate_line)"
+if [ "$RC" -eq 0 ]; then fail "mutation C2: a FALSE clause over the foreign callee PASSED — the kernel-certified proof in C is not reading the callee's clause  $G"; else mut_ok "mutation C2 (C with next_lo's clause made false: <= 31)  rc=$RC  $G"; fi
+grep -q 'verification failed for `trust_bitfield::next_lo`' "$LOG" \
+  || fail "mutation C2: next_lo was not refused under a false clause"
+grep -qE 'trust_bitfield::next_lo \[INCONCLUSIVE\] \(3 obligations: 1 proved, 0 runtime-checked, 0 failed, 2 unknown' "$LOG" \
+  || fail "mutation C2: next_lo did not lose exactly the false clause (and keep the callee's) — $(grep -oE 'trust_bitfield::next_lo \[[A-Z ]+\] \([^;]*' "$LOG" | head -1)"
+rm -f "$LOG"; restore
 mut_end
 # ---------------------------------------------------------------------------
 # 6. MUTATION D — §15.3, THE TERMINAL-CALLEE BOUNDARY.
@@ -515,9 +574,14 @@ VRC="$RC"; VG="$(gate_line)"
 if [ "$VRC" -ne 0 ]; then
   fail "mutation F: the strict lane REFUTED a swap of two lookup arguments (rc=$VRC $VG) — welcome news, but this gate's claim that no obligation can see which lookup got which number is now stale and must be re-measured, not deleted"
 fi
-case "$VG" in *"PASS [strict lane, exit 0]"*) ;; *) fail "mutation F: Gate is '$VG', expected PASS — the swap was supposed to change no obligation at all";; esac
-grep -qE 'Summary: 41 proved, 0 failed, .*0 inconclusive \(41 total\)' "$LOG" \
-  || fail "mutation F: the row count moved — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
+case "$VG" in
+  *"Gate: PASS [strict lane, exit 0]"*) ;;
+  *"Gate: CONDITIONAL-PASS [strict lane, exit 0]"*) known_regression_19 "$LOG" || fail "mutation F: Gate is '$VG' — a CONDITIONAL-PASS that is not the known regression shape";;
+  *) fail "mutation F: Gate is '$VG', expected PASS — the swap was supposed to change no obligation at all";;
+esac
+if ! grep -qE 'Summary: 41 proved, 0 failed, .*0 inconclusive \(41 total\)' "$LOG"; then
+  if known_regression_19 "$LOG"; then fail "mutation F: $KR19 (the swap itself changed no obligation)"; else fail "mutation F: the row count moved — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"; fi
+fi
 KINDS="$(grep -oE 'proved by kind: [a-z_=0-9, ]+' "$LOG" | tail -1)"
 case "$KINDS" in *arithmetic_overflow_mul=3*) ;; *) fail "mutation F: the multiply rows moved — $KINDS";; esac
 rm -f "$LOG"
@@ -563,7 +627,11 @@ VRC="$RC"; VG="$(gate_line)"
 if [ "$VRC" -ne 0 ]; then
   fail "mutation G: the strict lane REFUTED a too-small return under a two-sided ensures (rc=$VRC $VG) — welcome news, and §14.1's reading that a same-direction pair admits every too-small implementation is now stale here; re-measure, do not delete"
 fi
-case "$VG" in *"PASS [strict lane, exit 0]"*) ;; *) fail "mutation G: Gate is '$VG', expected PASS";; esac
+case "$VG" in
+  *"Gate: PASS [strict lane, exit 0]"*) ;;
+  *"Gate: CONDITIONAL-PASS [strict lane, exit 0]"*) if known_regression_19 "$LOG"; then fail "mutation G: $KR19 (the mutation itself keeps both ensures TRUE)"; else fail "mutation G: Gate is '$VG' — a CONDITIONAL-PASS that is not the known regression shape"; fi;;
+  *) fail "mutation G: Gate is '$VG', expected PASS";;
+esac
 KINDS="$(grep -oE 'proved by kind: [a-z_=0-9, ]+' "$LOG" | tail -1)"
 case "$KINDS" in *postcondition=23*) ;; *) fail "mutation G: a postcondition stopped proving, so the contract did NOT stay true — $KINDS";; esac
 rm -f "$LOG"

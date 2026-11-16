@@ -87,7 +87,8 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use rustc_hir::LangItem;
+use rustc_ast::attr::AttributeExt;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;

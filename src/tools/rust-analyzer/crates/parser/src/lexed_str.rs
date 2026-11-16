@@ -195,6 +195,14 @@ impl<'a> Converter<'a> {
         }
     }
 
+    fn comment_kind(doc_style: Option<rustc_lexer::DocStyle>) -> SyntaxKind {
+        match doc_style {
+            Some(rustc_lexer::DocStyle::Outer) => OUTER_DOC_COMMENT,
+            Some(rustc_lexer::DocStyle::Inner) => INNER_DOC_COMMENT,
+            None => COMMENT,
+        }
+    }
+
     fn extend_token(&mut self, kind: &rustc_lexer::TokenKind, mut token_text: &str) {
         // A note on an intended tradeoff:
         // We drop some useful information here (see patterns with double dots `..`)
@@ -204,14 +212,14 @@ impl<'a> Converter<'a> {
 
         let syntax_kind = {
             match kind {
-                rustc_lexer::TokenKind::LineComment { doc_style: _ } => COMMENT,
-                rustc_lexer::TokenKind::BlockComment { doc_style: _, terminated } => {
+                rustc_lexer::TokenKind::LineComment { doc_style } => Self::comment_kind(*doc_style),
+                rustc_lexer::TokenKind::BlockComment { doc_style, terminated } => {
                     if !terminated {
                         errors.push(
                             "Missing trailing `*/` symbols to terminate the block comment".into(),
                         );
                     }
-                    COMMENT
+                    Self::comment_kind(*doc_style)
                 }
 
                 rustc_lexer::TokenKind::Frontmatter {
@@ -239,6 +247,22 @@ impl<'a> Converter<'a> {
 
                 rustc_lexer::TokenKind::RawIdent => IDENT,
 
+                rustc_lexer::TokenKind::ForcedKeywordIdent
+                    if self.edition < Edition::Edition2021 =>
+                {
+                    // Split the token.
+                    token_text = &token_text[.."k".len()];
+                    IDENT
+                }
+                rustc_lexer::TokenKind::ForcedKeywordIdent if token_text == "k#_" => UNDERSCORE,
+                rustc_lexer::TokenKind::ForcedKeywordIdent => {
+                    SyntaxKind::from_any_keyword(&token_text["k#".len()..]).unwrap_or_else(|| {
+                        // FIXME: This is not correct, see https://rust-lang.zulipchat.com/#narrow/channel/185405-t-compiler.2Frust-analyzer/topic/Mismatch.20versus.20rustc.20parsing.20in.20foundation/with/632168944.
+                        errors.push("invalid forced keyword".into());
+                        ERROR
+                    })
+                }
+
                 rustc_lexer::TokenKind::GuardedStrPrefix if self.edition.at_least_2024() => {
                     // FIXME: rustc does something better for recovery.
                     errors.push("Invalid string literal (reserved syntax)".into());
@@ -257,7 +281,7 @@ impl<'a> Converter<'a> {
 
                 rustc_lexer::TokenKind::Lifetime { starts_with_number } => {
                     if *starts_with_number {
-                        errors.push("Lifetime name cannot start with a number".into());
+                        errors.push("Lifetime name contains invalid characters".into());
                     }
                     LIFETIME_IDENT
                 }

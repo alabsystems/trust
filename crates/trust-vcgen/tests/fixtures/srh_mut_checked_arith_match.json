@@ -1,0 +1,524 @@
+{
+  "name": "checked_arith_match",
+  "def_path": "checked_arith_match::checked_arith_match",
+  "span": {
+    "file": "<repo>/tests/trust-falsification/mutant/checked_arith_match.rs",
+    "line_start": 7,
+    "col_start": 0,
+    "line_end": 12,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl u32>::checked_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<repo>/tests/trust-falsification/mutant/checked_arith_match.rs",
+              "line_start": 8,
+              "col_start": 10,
+              "line_end": 8,
+              "col_end": 26
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 1843546173695782917,
+              "def_index": 28485,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1843546173695782917,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "<repo>/tests/trust-falsification/mutant/checked_arith_match.rs",
+                "line_start": 8,
+                "col_start": 10,
+                "line_end": 8,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ],
+              [
+                1,
+                4
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "<repo>/tests/trust-falsification/mutant/checked_arith_match.rs",
+              "line_start": 8,
+              "col_start": 4,
+              "line_end": 8,
+              "col_end": 26
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      32
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/tests/trust-falsification/mutant/checked_arith_match.rs",
+                "line_start": 10,
+                "col_start": 16,
+                "line_end": 10,
+                "col_end": 17
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/tests/trust-falsification/mutant/checked_arith_match.rs",
+                "line_start": 9,
+                "col_start": 13,
+                "line_end": 9,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<repo>/tests/trust-falsification/mutant/checked_arith_match.rs",
+                "line_start": 9,
+                "col_start": 19,
+                "line_end": 9,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 6,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 5,
+            "span": {
+              "file": "<repo>/tests/trust-falsification/mutant/checked_arith_match.rs",
+              "line_start": 9,
+              "col_start": 19,
+              "line_end": 9,
+              "col_end": 24
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 6,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/tests/trust-falsification/mutant/checked_arith_match.rs",
+                "line_start": 9,
+                "col_start": 19,
+                "line_end": 9,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_4",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_4",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "a",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "a",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "b",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "b",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

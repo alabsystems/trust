@@ -1,11 +1,11 @@
-error: error: the publish audit refused this batch; nothing was registered
+error: Clean island batch has no source-local recovery boundary: the publish audit refused this batch; nothing was registered
          - `hole` reaches the incomplete-proof marker `sorryAx`. Finish the proof, or state the missing step as an `axiom` so it is disclosed by name in the certification closure.
   --> $DIR/clean_island_no_verify_sorry.rs:8:5
    |
 LL |     theorem hole : True := sorry
    |     ^
    |
-   = note: the island was parsed by the Clean parser and checked by the Clean CIC kernel during this build (two-language design E10)
+   = note: the Clean island was rejected during resolver checking (two-language design E10)
 
 error: aborting due to 1 previous error
 

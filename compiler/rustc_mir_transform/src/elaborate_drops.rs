@@ -14,6 +14,7 @@ use rustc_mir_dataflow::{
 use rustc_span::Span;
 use tracing::{debug, instrument};
 
+use crate::PassPolicy;
 use crate::elaborate_drop::{DropElaborator, DropFlagMode, DropStyle, Unwind, elaborate_drop};
 use crate::patch::MirPatch;
 
@@ -51,9 +52,46 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
     #[instrument(level = "trace", skip(self, tcx, body))]
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         debug!("elaborate_drops({:?} @ {:?})", body.source, body.span);
+        if !body
+            .basic_blocks
+            .iter()
+            .any(|bb| matches!(bb.terminator().kind, TerminatorKind::Drop { .. }))
+        {
+            return;
+        }
+
         // FIXME(#132279): This is used during the phase transition from analysis
         // to runtime, so we have to manually specify the correct typing mode.
         let typing_env = ty::TypingEnv::post_analysis(tcx, body.source.def_id());
+        if !body
+            .local_decls
+            .iter()
+            .any(|l| !l.is_deref_temp() && l.ty.needs_drop(tcx, typing_env))
+        {
+            // When no non-deref-temp local needs drop, `MoveData::gather_moves` produces no move
+            // paths, `collect_drop_flags` and `drop_flags_*` are no-ops, and `elaborate_drops`
+            // only rewrites `Drop` terminators whose place does not need drop into `Goto`.
+            let has_trivially_dead_drop = body.basic_blocks.iter().any(|bb| {
+                matches!(
+                    bb.terminator().kind,
+                    TerminatorKind::Drop { place, .. }
+                        if !place.ty(&body.local_decls, tcx).ty.needs_drop(tcx, typing_env)
+                )
+            });
+            if has_trivially_dead_drop {
+                let local_decls = &body.local_decls;
+                for bb in body.basic_blocks.as_mut() {
+                    let terminator = bb.terminator_mut();
+                    if let TerminatorKind::Drop { place, target, .. } = terminator.kind
+                        && !place.ty(local_decls, tcx).ty.needs_drop(tcx, typing_env)
+                    {
+                        terminator.kind = TerminatorKind::goto(target);
+                    }
+                }
+            }
+            return;
+        }
+
         // For types that do not need dropping, the behaviour is trivial. So we only need to track
         // init/uninit for types that do need dropping.
         let move_data = MoveData::gather_moves(body, tcx, |ty| ty.needs_drop(tcx, typing_env));
@@ -68,7 +106,6 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
             let dead_unwinds = compute_dead_unwinds(body, &mut inits);
 
             let uninits = MaybeUninitializedPlaces::new(tcx, body, &env.move_data)
-                .include_inactive_in_otherwise()
                 .mark_inactive_variants_as_uninit()
                 .skipping_unreachable_unwind(dead_unwinds)
                 .iterate_to_fixpoint(tcx, body, Some("elaborate_drops"))
@@ -88,8 +125,9 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
         elaborate_patch.apply(body);
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Implements MIR drop semantics.
+        PassPolicy::Required
     }
 }
 
@@ -188,17 +226,23 @@ impl<'a, 'tcx> DropElaborator<'a, 'tcx> for ElaborateDropsCtxt<'a, 'tcx> {
         }
     }
 
-    fn clear_drop_flag(&mut self, loc: Location, path: Self::Path, mode: DropFlagMode) {
+    fn drop_flags_for(&mut self, path: Self::Path, mode: DropFlagMode) -> Vec<Place<'tcx>> {
+        let mut flags = vec![];
         match mode {
             DropFlagMode::Shallow => {
-                self.set_drop_flag(loc, path, DropFlagState::Absent);
+                if let Some(flag) = self.drop_flags[path] {
+                    flags.push(flag.into());
+                }
             }
             DropFlagMode::Deep => {
                 on_all_children_bits(self.move_data(), path, |child| {
-                    self.set_drop_flag(loc, child, DropFlagState::Absent)
+                    if let Some(flag) = self.drop_flags[child] {
+                        flags.push(flag.into());
+                    }
                 });
             }
         }
+        flags
     }
 
     fn field_subpath(&self, path: Self::Path, field: FieldIdx) -> Option<Self::Path> {
@@ -274,10 +318,12 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
 
         self.elaborate_drops();
 
-        self.drop_flags_on_init();
-        self.drop_flags_for_fn_rets();
-        self.drop_flags_for_args();
-        self.drop_flags_for_locs();
+        if self.drop_flags.iter().any(Option::is_some) {
+            self.drop_flags_on_init();
+            self.drop_flags_for_fn_rets();
+            self.drop_flags_for_args();
+            self.drop_flags_for_locs();
+        }
 
         self.patch
     }
@@ -345,7 +391,7 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
                 .ty
                 .needs_drop(self.tcx, self.typing_env())
             {
-                self.patch.patch_terminator(bb, TerminatorKind::Goto { target });
+                self.patch.patch_terminator(bb, TerminatorKind::goto(target));
                 continue;
             }
 
@@ -436,7 +482,7 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
             {
                 assert!(!self.patch.is_term_patched(bb));
 
-                let loc = Location { block: tgt, statement_index: 0 };
+                let loc = tgt.start_location();
                 let path = self.move_data().rev_lookup.find(destination.as_ref());
                 on_lookup_result_bits(self.move_data(), path, |child| {
                     self.set_drop_flag(loc, child, DropFlagState::Present)

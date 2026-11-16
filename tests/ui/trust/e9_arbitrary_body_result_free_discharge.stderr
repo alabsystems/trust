@@ -29,5 +29,5 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL |     ensures ident(x) >= ident(x) by u64_ge_refl
    |                                     ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 

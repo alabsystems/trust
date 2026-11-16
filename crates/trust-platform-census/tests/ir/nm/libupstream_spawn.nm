@@ -1,0 +1,12 @@
+libupstream_spawn.rlib:lib.rmeta: no symbols
+libupstream_spawn.rlib:lib.rmeta-link: no symbols
+
+lib.rmeta:
+
+lib.rmeta-link:
+
+upstream_spawn.upstream_spawn.410413a6893174a3-cgu.0.rcgu.o:
+                 U __exit
+                 U _dup
+                 U _execv
+                 U _fork

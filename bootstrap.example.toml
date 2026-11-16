@@ -14,6 +14,18 @@
 #     build.verbose = 1
 #
 #     [build]
+
+# Trust: prepared VF5 mathematical DATA and its raw vf5-base-v1.json SHA256.
+# Both values must be set together. Relative directories resolve against the
+# selected source root. The build-host source tool validates every captured
+# member/absence and stages lib/trust/vf5-base-v1 in assembled/dist sysroots.
+# With production pins enabled, the digest must match a compiled allowed
+# manifest/environment pair; missing or corrupt inputs refuse construction.
+# With both production pin tables empty, omitting the pair keeps no resource.
+# These BUILD-time inputs cannot select runtime mathematics or confer proof.
+# vf5-base = "/absolute/prepared/vf5-package"
+# vf5-base-sha256 = "<64 lowercase hex digits>"
+
 #     verbose = 1
 
 
@@ -103,8 +115,11 @@
 # Whether to build Enzyme as AutoDiff backend.
 #llvm.enzyme = false
 
-# Whether to build LLVM with support for it's gpu offload runtime.
+# Whether to build LLVM with support for its gpu offload runtime.
 #llvm.offload = false
+
+# Whether to build TPDE as an experimental alternative LLVM backend.
+#llvm.tpde = false
 
 # Absolute path to the directory containing ClangConfig.cmake
 #llvm.offload-clang-dir = ""
@@ -308,16 +323,28 @@
 # You can still build documentation when this is disabled by explicitly passing a path: `x doc compiler`.
 #build.compiler-docs = false
 
+# Trust: explicitly retain a compiler runtime for compiler library tests only.
+# The test request must name compiler/<crate> paths and exclude doctests. This
+# does not select build.rustc or claim that the fixture matches current sources.
+# Initially supports native aarch64-apple-darwin compiler runtime closures.
+#build.compiler-test-fixture = "/absolute/immutable/compiler-sysroot"
+
 # Indicate whether git submodules are managed and updated automatically.
 #build.submodules = true
 
 # The path to (or name of) the GDB executable to use. This is only used for
 # executing the debuginfo test suite.
+# Set this to "discover" to automatically discover GDB from the environment.
 #build.gdb = "gdb"
 
 # The path to (or name of) the LLDB executable to use. This is only used for
 # executing the debuginfo test suite.
+# Set this to "discover" to automatically discover LLDB from the environment.
 #build.lldb = "lldb"
+
+# The path to (or name of) the Intel SDE executable, used to run the
+# intrinsic-test suite for x86 target features the host CPU may not support.
+#build.sde = "sde64"
 
 # The node.js executable to use. Note that this is only used for the emscripten
 # target when running tests, otherwise this can be omitted.
@@ -388,7 +415,9 @@
 #
 # If any enabled tool fails to build, the installation fails.
 # Trust: build.tools selectors match the produced toolchain (targo, tippy, targo-miri);
-# targo-trust keeps the in-tree crate/binary source name.
+# targo-trust keeps the in-tree crate/binary source name. `rust-src` is upstream's
+# install selector for the standard-library source component (the retired `src`
+# selects nothing).
 #
 # The verification backends `ay`, `ty`, and `clean` are batteries, not optional
 # user tools: they install whenever their in-tree source is present, regardless
@@ -409,7 +438,7 @@
 #    "trust-analyzer",
 #    "trust-analyzer-proc-macro-srv",
 #    "trust-analysis",
-#    "src",
+#    "rust-src",
 #    "wasm-component-ld",
 #    "trust-miri", "targo-miri" # for dev/nightly channels
 #]
@@ -521,6 +550,12 @@
 # List of paths to exclude from the build and test processes.
 # For example, exclude = ["tests/ui", "src/tools/tidy"].
 #build.exclude = []
+
+# Link the compiler and LLVM against the specified allocator instead of the default libc allocator.
+# This option is only tested on Linux and OSX. It can also be configured per-target in the
+# [target.<tuple>] section.
+# Possible options: "system" (default), "jemalloc"
+#build.allocator = "jemalloc"
 
 # =============================================================================
 # General install configuration options
@@ -645,16 +680,16 @@
 # Whether or not to build rustc, tools and the libraries with randomized type layout
 #rust.randomize-layout = false
 
-# Whether or not overflow checks are enabled for the compiler and standard
-# library.
+# Trust: overflow checks are required for the compiler and verifier tools.
+# Their embedded engines must not silently wrap arithmetic. Explicit false is
+# refused; the standard library has its own setting below.
 #
-# Defaults to rust.debug value
-#rust.overflow-checks = rust.debug (boolean)
+#rust.overflow-checks = true
 
 # Whether or not overflow checks are enabled for the standard library.
 # Overrides the `overflow-checks` option, if defined.
 #
-# Defaults to rust.overflow-checks value
+# Trust: defaults to an explicit rust.overflow-checks value, or otherwise rust.debug.
 #rust.overflow-checks-std = rust.overflow-checks (boolean)
 
 # Debuginfo level for most of Rust code, corresponds to the `-C debuginfo=N` option of `rustc`.
@@ -765,6 +800,59 @@
 # Having the git information can cause a lot of rebuilds during development.
 #rust.omit-git-hash = if rust.channel == "dev" { true } else { false }
 
+# Trust: what the version of a dev stage-1 build names. By default a build of stage 1 or
+# lower (not `x dist` or `x install`, not on `stable` or `beta`, not with `download-rustc`,
+# not a `--dry-run`) names its sources instead of HEAD: the git trees of everything outside
+# `docs/`, `reports/`, `scripts/`, `tests/` and the top-level Markdown files, this file's
+# digest with its includes', and the worktree's uncommitted changes. A commit that changes
+# only those paths then keeps the version, so it rebuilds neither the compiler nor std nor
+# the tools: targo, tippy, targo-miri, trust-analyzer and trustfmt take the identity from
+# the commit tuple bootstrap hands their build scripts (with `rust.omit-git-hash` it hands
+# none, and those scripts ask git for HEAD). In return every uncommitted edit outside
+# those paths changes the version, and rebuilds the crates that read it. The debuginfo
+# remap prefix (`rust.remap-debuginfo`) names the committed sources only, so an edit does
+# not change it. When git cannot name the sources, the build stops. `false` names HEAD at
+# every stage, as stage 2 always does; a tool that binds a stage-1 toolchain to a commit
+# (`scripts/recreate_bootstrap.py`) sets it. `build/trust-source-identity` holds what the
+# last such build's identity names.
+#rust.trust-source-identity = true
+
+# Trust: whether the first build of a fresh worktree (one with no `build/<host>/stage1-*`
+# yet) may clone the green stage 1 of another worktree of the same repository, by APFS
+# clone, instead of building it cold. It is cloned only when the other tree's last
+# successful stage-1 build recorded the same key (`build/<host>/trust-stage1-seed`: the
+# source identity above, the host, the stage-0 seed and tools, and the build
+# environment) and that tree's build lock is free; any doubt builds cold. The seeding
+# build prints what it cloned and why anything was refused. macOS only.
+#rust.trust-stage1-seed = true
+
+# Trust: whether bootstrap prunes the cargo target trees of this build directory after a
+# successful run. It removes each unit that a newer variant of the same target superseded
+# (another compiler, other flags or other dependencies gave it a new unit id), and, on
+# macOS, each loose `.rcgu.o` object that its rlib holds as a member of the same name and
+# size. A unit goes only on evidence, its fingerprint first. A tree is left as it is while
+# a cargo lock in it is held or anything in it cannot be read. An unchanged tree is not
+# judged again. The run prints the units, GiB and seconds. It never changes the build's
+# result. It is skipped for a dry run, `--bypass-bootstrap-lock`, `clean`, `setup`,
+# `format` and `vendor`, and without x.py's tree lease (`TRUST_BUILD_LOCK_TOKEN`). The
+# rules are in `src/bootstrap/src/utils/trust_prune.rs`.
+#rust.trust-prune-superseded = true
+
+# Trust: whether the standard library's metadata carries trust-ir entries. `true` adds
+# `-Ztrust-ir-lower=on -Ztrust-ir-flip=no` to every unit that a stage 1 or later compiler
+# compiles for `x build library` and `x test library` (`core`, `alloc`, `std` and the
+# crates they depend on), beside `-Zalways-encode-mir`. A stage-0 unit gets them only under
+# a local rebuild, where bootstrap treats the stage-0 compiler as stage 1 (the same rule as
+# its `-Ztrust-verify=off` default); `x check`, `x clippy`, `x doc`, Miri and the mir-opt
+# sysroot never get them. The first turns the
+# THIR -> trust-ir producer on while bootstrap still passes `-Ztrust-verify=off`; the
+# second keeps the producer from replacing any MIR that codegen reads. The option changes
+# those units' flags, so changing it rebuilds the standard library. It is off by default:
+# a panic in the producer is an internal compiler error, which fails the build of the
+# standard library. With `rust.download-rustc` an explicitly set value that differs from
+# the downloaded build's configuration is refused.
+#rust.trust-ir-metadata = false
+
 # Whether to create a source tarball by default when running `x dist`.
 #
 # You can still build a source tarball when this is disabled by explicitly passing `x dist rustc-src`.
@@ -799,7 +887,7 @@
 # sysroot.
 #rust.llvm-tools = true
 
-# Indicates whether the `self-contained` llvm-bitcode-linker, will be made available
+# Indicates whether the `self-contained` llvm-bitcode-linker will be made available
 # in the sysroot. It is required for running nvptx tests.
 #rust.llvm-bitcode-linker = false
 
@@ -822,9 +910,9 @@
 # Useful for reproducible builds. Generally only set for releases
 #rust.remap-debuginfo = false
 
-# Link the compiler and LLVM against `jemalloc` instead of the default libc allocator.
-# This option is only tested on Linux and OSX. It can also be configured per-target in the
-# [target.<tuple>] section.
+# Deprecated alias for `build.allocator`. Setting this to `true` is
+# equivalent to `build.allocator = "jemalloc"`. Both cannot be set in the same section
+# (`rust` or `target.[target]`)
 #rust.jemalloc = false
 
 # Run tests in various test suites with the "nll compare mode" in addition to
@@ -879,7 +967,7 @@
 #
 # Since libstd also builds libcore and liballoc as dependencies and all their features are mirrored
 # as libstd features, this option can also be used to configure features such as optimize_for_size.
-#rust.std-features = ["panic_unwind"]
+#rust.std-features = ["panic-unwind"]
 
 # Trigger a `DebugBreak` after an internal compiler error during bootstrap on Windows
 #rust.break-on-ice = true
@@ -887,10 +975,40 @@
 # Set the number of threads for the compiler frontend used during compilation of Rust code (passed to `-Zthreads`).
 # The valid options are:
 # 0 - Set the number of threads according to the detected number of threads of the host system
-# 1 - Use a single thread for compilation of Rust code (the default)
+# 1 - Use a single thread for compilation of Rust code
 # N - Number of threads used for compilation of Rust code
 #
+# Unset: unverified Trust seed compiles with a validated inherited GNU scheduler
+# use stable detected local frontend potential; shared tokens bound actual workers.
+# Other routes retain the compiler default (one thread). Explicit 0/1/N wins.
 #rust.parallel-frontend-threads = 1
+
+# Baseline commit SHA for comparing semver breakages in the Rust standard library.
+# The in-tree stdlib API will be evaluated for semver breakages against this commit.
+# Used for the `./x test std-semver-check` command.
+# If unset, the first upstream parent commit will be used.
+#
+# The SHA must point to a merge commit merged into the mainline rust-lang/rust `main` branch,
+# because bootstrap will attempt to download the JSON docs data for this commit from its CI.
+#rust.stdlib-semver-baseline = "<commit-sha>"
+
+# Enables building a wasm proc macro compatible toolchain.
+#
+# This requires building an additional standard library for a different target and adding it
+# to the sysroot before running tests, and so needs special handling in bootstrap. Currently
+# off by default.
+#
+# This currently opts compiletest into running/building proc-macro tests via wasm.
+#
+# The implementation for this has not finished landing, so you probably don't
+# want to enable this right now.
+#rust.wasm-proc-macros = false
+
+# Enables wasm targets to be built with `-Cpanic=unwind` by default instead of
+# the current `-Cpanic=abort`. This is currently used in testing the Rust
+# compiler itself and is only intended for local development/testing at this
+# time.
+#rust.wasm-panic-unwind-default = false
 
 # =============================================================================
 # Distribution options
@@ -941,6 +1059,44 @@
 # Whether to vendor dependencies for the dist tarball.
 #dist.vendor = if "is a tarball source" || "is a git repository" { true } else { false }
 
+
+# =============================================================================
+# Profile-guided optimization options
+#
+# Configure the PGO profile to be used for compilation, or a path where the
+# profile will be written by an instrumented binary, for individual components
+# =============================================================================
+
+# Use the following profile to PGO optimize the Rust compiler.
+#pgo.rustc.use = "/tmp/profiles/foo.profraw"
+# Instrument the Rust compiler, so that when executed, it will gather profiles
+# to this path.
+#pgo.rustc.generate = "/tmp/profiles/foo.profraw"
+# Use the following profile to PGO optimize rustdoc.
+#pgo.rustdoc.use = "/tmp/profiles/foo.profraw"
+# Instrument rustdoc, so that when executed, it will gather profiles
+# to this path.
+#pgo.rustdoc.generate = "/tmp/profiles/foo.profraw"
+# Use the following profile to PGO optimize cargo.
+#pgo.cargo.use = "/tmp/profiles/foo.profraw"
+# Instrument cargo, so that when executed, it will gather profiles
+# to this path.
+#pgo.cargo.generate = "/tmp/profiles/foo.profraw"
+# Use the following profile to PGO optimize clippy.
+#pgo.clippy.use = "/tmp/profiles/foo.profraw"
+# Instrument clippy, so that when executed, it will gather profiles
+# to this path.
+#pgo.clippy.generate = "/tmp/profiles/foo.profraw"
+# Use the following profile to PGO optimize LLVM.
+#pgo.llvm.use = "/tmp/profiles/foo.profraw"
+# Instrument LLVM, so that when executed, it will gather profiles
+# Note: for LLVM specifically, this should be a directory, not a file path.
+#pgo.llvm.generate = "/tmp/profiles"
+# Use the following profile to PGO optimize the Cranelift codegen backend.
+#pgo.cranelift.use = "/tmp/profiles/foo.profraw"
+# Instrument the Cranelift codegen backend, so that when executed, it will gather profiles
+# to this path.
+#pgo.cranelift.generate = "/tmp/profiles/foo.profraw"
 
 # =============================================================================
 # Options for specific targets
@@ -1000,6 +1156,12 @@
 # against. Note that if this is specified we don't compile LLVM at all for this
 # target.
 #llvm-config = <none> (path)
+
+# Explicit directory containing libzstd.pc for this external LLVM dependency.
+# Must be absolute; the selected canonical metadata must remain in this directory.
+# For a managed native package use its owning opt/keg lib/pkgconfig directory,
+# not an aggregate directory of individual metadata symlinks.
+#llvm-zstd-pkg-config-dir = <none> (path)
 
 # Override detection of whether this is a Rust-patched LLVM. This would be used
 # in conjunction with either an llvm-config or build.submodules = false.
@@ -1097,8 +1259,11 @@
 # order to run `x check`.
 #optimized-compiler-builtins = build.optimized-compiler-builtins (bool or path)
 
-# Link the compiler and LLVM against `jemalloc` instead of the default libc allocator.
-# This overrides the global `rust.jemalloc` option. See that option for more info.
+# Link the compiler and LLVM against the specified allocator instead of the default libc allocator.
+# This overrides the global `build.allocator` option. See that option for more info.
+#allocator = build.allocator (string)
+
+# Deprecated alias for `allocator`. See `rust.jemalloc` for more info.
 #jemalloc = rust.jemalloc (bool)
 
 # The linker configuration that will *override* the default linker used for Linux

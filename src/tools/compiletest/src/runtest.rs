@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs::{self, create_dir_all};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::prelude::*;
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::{env, fmt, io, iter, str};
 
 use build_helper::fs::remove_and_create_dir_all;
@@ -14,12 +14,14 @@ use regex::{Captures, Regex};
 use tracing::*;
 
 use crate::common::{
-    CompareMode, Config, Debugger, ForcePassMode, PassFailMode, RunResult, TestMode, TestPaths,
-    TestSuite, UI_EXTENSIONS, UI_FIXED, UI_RUN_STDERR, UI_RUN_STDOUT, UI_STDERR, UI_STDOUT, UI_SVG,
-    UI_WINDOWS_SVG, expected_output_path, incremental_dir, output_base_dir, output_base_name,
+    CompareMode, Config, Debugger, ForcePassMode, PassFailMode, RunResult, TRUST_VERIFIED_SENTINEL,
+    TestMode, TestPaths, TestSuite, UI_EXTENSIONS, UI_FIXED, UI_RUN_STDERR, UI_RUN_STDOUT,
+    UI_STDERR, UI_STDOUT, UI_SVG, UI_WINDOWS_SVG, expected_output_path, incremental_dir,
+    output_base_dir, output_base_name,
 };
 use crate::directives::{AuxCrate, TestProps};
 use crate::errors::{Error, ErrorKind, load_errors};
+use crate::executor::TestVariant;
 use crate::output_capture::ConsoleOut;
 use crate::read2::{Truncated, read2_abbreviated};
 use crate::runtest::compute_diff::{DiffLine, diff_by_lines, make_diff, write_diff};
@@ -90,7 +92,7 @@ fn disable_error_reporting<F: FnOnce() -> R, R>(f: F) -> R {
 }
 
 /// The platform-specific library name
-fn get_lib_name(name: &str, aux_type: AuxType) -> Option<String> {
+fn get_lib_name(name: &str, aux_type: AuxType, wasm_proc_macros: bool) -> Option<String> {
     match aux_type {
         AuxType::Bin => None,
         // In some cases (e.g. MUSL), we build a static
@@ -98,6 +100,8 @@ fn get_lib_name(name: &str, aux_type: AuxType) -> Option<String> {
         // In this case, the only path we can pass
         // with '--extern-meta' is the '.rlib' file
         AuxType::Lib => Some(format!("lib{name}.rlib")),
+        // FIXME maybe use `rustc --print file-names` instead?
+        AuxType::ProcMacro if wasm_proc_macros => Some(format!("{name}.wasm")),
         AuxType::Dylib | AuxType::ProcMacro => Some(dylib_name(name)),
     }
 }
@@ -111,7 +115,7 @@ pub(crate) fn run(
     stdout: &dyn ConsoleOut,
     stderr: &dyn ConsoleOut,
     testpaths: &TestPaths,
-    revision: Option<&str>,
+    variant: &TestVariant,
 ) {
     match &*config.target {
         "arm-linux-androideabi"
@@ -122,15 +126,7 @@ pub(crate) fn run(
                 panic!("android device not available");
             }
         }
-
-        _ => {
-            // FIXME: this logic seems strange as well.
-
-            // android has its own gdb handling
-            if config.debugger == Some(Debugger::Gdb) && config.gdb.is_none() {
-                panic!("gdb not available but debuginfo gdb debuginfo test requested");
-            }
-        }
+        _ => {}
     }
 
     if config.verbose {
@@ -138,16 +134,16 @@ pub(crate) fn run(
         write!(stdout, "\n\n");
     }
     debug!("running {}", testpaths.file);
-    let mut props = TestProps::from_file(&testpaths.file, revision, &config);
+    let mut props = TestProps::from_file(&testpaths.file, variant.revision(), &config);
 
     // For non-incremental (i.e. regular UI) tests, the incremental directory
     // takes into account the revision name, since the revisions are independent
     // of each other and can race.
     if props.incremental {
-        props.incremental_dir = Some(incremental_dir(&config, testpaths, revision));
+        props.incremental_dir = Some(incremental_dir(&config, testpaths, variant));
     }
 
-    let cx = TestCx { config: &config, stdout, stderr, props: &props, testpaths, revision };
+    let cx = TestCx { config: &config, stdout, stderr, props: &props, testpaths, variant };
 
     if let Err(e) = create_dir_all(&cx.output_base_dir()) {
         panic!("failed to create output base directory {}: {e}", cx.output_base_dir());
@@ -170,7 +166,10 @@ pub(crate) fn run(
                 stderr,
                 props: &revision_props,
                 testpaths,
-                revision: Some(revision),
+                variant: &TestVariant {
+                    revision: Some(revision.clone()),
+                    debugger: variant.debugger,
+                },
             };
             rev_cx.run_revision();
         }
@@ -181,14 +180,27 @@ pub(crate) fn run(
     cx.create_stamp();
 }
 
-pub(crate) fn compute_stamp_hash(config: &Config) -> String {
+pub(crate) fn compute_stamp_hash(config: &Config, variant: &TestVariant) -> String {
     let mut hash = DefaultHasher::new();
     config.stage_id.hash(&mut hash);
     config.run.hash(&mut hash);
     config.edition.hash(&mut hash);
     config.trust_vanilla().hash(&mut hash);
+    // Trust: the VERIFIED lane compiles the same test with a different flag
+    // vector (`-Ztrust-verify=on -Ztrust-policy=strict` instead of
+    // `-Ztrust-verify=off`), so its results must never be reused from -- or be
+    // reusable by -- either verification-off lane. Without this, a verified run
+    // following a default run finds every stamp current, SKIPS the tests, and
+    // reports green having verified nothing: exactly the silent no-op this lane
+    // must not have.
+    //
+    // Hashed only WHEN SET, so the stamps of the two pre-existing lanes are
+    // bit-identical to what they were before this lane existed.
+    if config.trust_verified() {
+        TRUST_VERIFIED_SENTINEL.hash(&mut hash);
+    }
 
-    match config.debugger {
+    match variant.debugger {
         Some(Debugger::Cdb) => {
             config.cdb.hash(&mut hash);
         }
@@ -224,7 +236,7 @@ struct TestCx<'test> {
     stderr: &'test dyn ConsoleOut,
     props: &'test TestProps,
     testpaths: &'test TestPaths,
-    revision: Option<&'test str>,
+    variant: &'test TestVariant,
 }
 
 enum ReadFrom {
@@ -262,6 +274,33 @@ enum CompilerKind {
     Rustc,
     Rustdoc,
 }
+
+/// Unstable compiler flags that compiletest passes to UI tests on its own, i.e. without specific
+/// tests opting into them explicitly.
+/// This should include both flags that are always passed unconditionally (e.g. `-Zui-testing`) and
+/// flags that are enabled across the whole test suite when compiletest is configured in a
+/// certain way (e.g. a specific `-Zcodegen-backend` being used for all tests).
+///
+/// Note: try to keep this up-to-date with [`TestCx::make_compile_args`].
+pub(crate) const COMPILETEST_UI_SUITE_UNSTABLE_FLAGS: &[&str] = &[
+    "simulate-remapped-rust-src-base",
+    "translate-remapped-path-to-local-path",
+    "ignore-directory-in-diagnostics-source-blocks",
+    "deduplicate-diagnostics",
+    "write-long-types-to-disk",
+    "codegen-backend",
+    "next-solver",
+    "polonius",
+    "wasm-proc-macros",
+    "threads",
+    "ui-testing",
+    "unstable-options",
+    // Trust: the harness injects `-Ztrust-verify=off` into every managed
+    // invocation (see `TRUST_VANILLA_RUSTC_FLAG`), so `act-as-stable` tests
+    // must allow it through `-allow-unstable-compiler-flags` or the stable
+    // simulation rejects the harness's own flag before the test runs.
+    "trust-verify",
+];
 
 impl<'test> TestCx<'test> {
     /// Code executed for each revision in turn (or, if there are no
@@ -396,9 +435,24 @@ impl<'test> TestCx<'test> {
     #[must_use = "caller should check whether the command succeeded"]
     fn run_command_to_procres(&self, cmd: ArgFileCommand) -> ProcRes {
         let (mut cmd, _arg_file) = cmd.build().unwrap();
-        let output = cmd
-            .output()
-            .unwrap_or_else(|e| self.fatal(&format!("failed to exec `{cmd:?}` because: {e}")));
+        // Trust: this helper is used by additional compiler/pretty/rustdoc
+        // paths. Keep them in the same passive census as compose_and_run.
+        let observation = self.config.trust_invocation_census.as_ref().map(|census| {
+            census
+                .command_started(self.config, self.testpaths, self.variant, &cmd, None)
+                .expect("retain compiletest output-helper command")
+        });
+        let output = crate::case_scheduler::output(&mut cmd).unwrap_or_else(|e| {
+            if let Some(observation) = &observation {
+                observation.spawn_failed(&e).expect("retain output-helper spawn failure");
+            }
+            self.fatal(&format!("failed to exec `{cmd:?}` because: {e}"))
+        });
+        if let Some(observation) = observation {
+            observation
+                .finished(&output.status, &output.stdout, &output.stderr, false)
+                .expect("retain compiletest output-helper terminal");
+        }
 
         let proc_res = ProcRes {
             status: output.status,
@@ -481,7 +535,7 @@ impl<'test> TestCx<'test> {
         // Otherwise the `--cfg` flag is not valid.
         let normalize_revision = |revision: &str| revision.to_lowercase().replace("-", "_");
 
-        if let Some(revision) = self.revision {
+        if let Some(revision) = self.variant.revision() {
             let normalized_revision = normalize_revision(revision);
             let cfg_arg = ["--cfg", &normalized_revision];
             let arg = format!("--cfg={normalized_revision}");
@@ -656,7 +710,12 @@ impl<'test> TestCx<'test> {
 
     fn check_forbid_output(&self, output_to_check: &str, proc_res: &ProcRes) {
         for pat in &self.props.forbid_output {
-            if output_to_check.contains(pat) {
+            // Trust: match the pattern TRIMMED, as `check_error_patterns` does. The
+            // directive's value keeps the space after `forbid-output:`, so an untrimmed
+            // pattern only matched text preceded by a space: every pattern starting at a
+            // token boundary without one (a JSON `"line_start":…` row, `[unsafe:…]`)
+            // could never be found, and the test passed while forbidding nothing.
+            if output_to_check.contains(pat.trim()) {
                 self.fatal_proc_rec("forbidden pattern found in compiler output", proc_res);
             }
         }
@@ -664,7 +723,7 @@ impl<'test> TestCx<'test> {
 
     /// Check `//~ KIND message` annotations.
     fn check_expected_errors(&self, proc_res: &ProcRes) {
-        let expected_errors = load_errors(&self.testpaths.file, self.revision);
+        let expected_errors = load_errors(&self.testpaths.file, self.variant.revision());
         debug!(
             "check_expected_errors: expected_errors={:?} proc_res.status={:?}",
             expected_errors, proc_res.status
@@ -826,7 +885,7 @@ impl<'test> TestCx<'test> {
             if !unexpected.is_empty() {
                 writeln!(
                     self.stdout,
-                    "\n{prefix}: {n} diagnostics reported in JSON output but not expected in test file",
+                    "\n{prefix}: {n} diagnostics reported in rustc output but not expected in test file",
                     prefix = self.error_prefix(),
                     n = unexpected.len(),
                 );
@@ -861,7 +920,7 @@ impl<'test> TestCx<'test> {
             if !not_found.is_empty() {
                 writeln!(
                     self.stdout,
-                    "\n{prefix}: {n} diagnostics expected in test file but not reported in JSON output",
+                    "\n{prefix}: {n} diagnostics expected in test file but not reported in rustc output",
                     prefix = self.error_prefix(),
                     n = not_found.len(),
                 );
@@ -992,14 +1051,15 @@ impl<'test> TestCx<'test> {
 
             for rel_ab in &self.props.aux.builds {
                 let aux_path = self.resolve_aux_path(rel_ab);
-                let props_for_aux = self.props.from_aux_file(&aux_path, self.revision, self.config);
+                let props_for_aux =
+                    self.props.from_aux_file(&aux_path, self.variant.revision(), self.config);
                 let aux_cx = TestCx {
                     config: self.config,
                     stdout: self.stdout,
                     stderr: self.stderr,
                     props: &props_for_aux,
                     testpaths: self.testpaths,
-                    revision: self.revision,
+                    variant: self.variant,
                 };
                 // Create the directory for the stdout/stderr files.
                 create_dir_all(aux_cx.output_base_dir()).unwrap();
@@ -1043,6 +1103,9 @@ impl<'test> TestCx<'test> {
             .arg(file_to_doc)
             .arg("-A")
             .arg("internal_features")
+            // FIXME(#160895): While the new solver is enabled by default on nightly,
+            // we don't want to use it in our tests for now.
+            .arg("-Znext-solver=coherence")
             .args(&self.props.compile_flags)
             .args(&self.props.doc_flags);
 
@@ -1053,17 +1116,56 @@ impl<'test> TestCx<'test> {
         }
 
         match kind {
-            DocKind::Html => {}
-            DocKind::Json => {
-                rustdoc.arg("--output-format").arg("json").arg("-Zunstable-options");
+            DocKind::Html => {
+                if self.props.use_rustdoc_cci_doc_meta_merge {
+                    rustdoc.arg("--write-doc-meta-dir").arg(out_dir.as_ref().join("doc.meta"));
+                }
             }
+            DocKind::Json => {
+                rustdoc.arg("--output-format").arg("json");
+            }
+        }
+
+        // Both JSON output and `--disable-minification` are unstable rustdoc options.
+        if matches!(kind, DocKind::Json)
+            || self.config.disable_minification
+            || self.props.use_rustdoc_cci_doc_meta_merge
+        {
+            rustdoc.arg("-Zunstable-options");
+        }
+        if self.config.disable_minification {
+            rustdoc.arg("--disable-minification");
         }
 
         if let Some(ref linker) = self.config.target_linker {
             rustdoc.arg(format!("-Clinker={}", linker));
         }
 
-        self.compose_and_run_compiler(rustdoc, None)
+        let docres = self.compose_and_run_compiler(rustdoc, None);
+        if !docres.status.success() {
+            return docres;
+        }
+        if kind == DocKind::Html && self.props.use_rustdoc_cci_doc_meta_merge {
+            let mut rustdoc_merge = self.config.rustdoc_command();
+            let current_dir = self.output_base_dir();
+            rustdoc_merge.current_dir(current_dir);
+            rustdoc_merge
+                .arg("-o")
+                .arg(out_dir.as_ref())
+                .args(&self.props.compile_flags)
+                .args(&self.props.doc_flags)
+                .arg("--read-doc-meta-dir")
+                .arg(out_dir.as_ref().join("doc.meta"))
+                .arg("-Zunstable-options");
+            if self.config.disable_minification {
+                rustdoc_merge.arg("--disable-minification");
+            }
+            let docmerge = self.compose_and_run_compiler(rustdoc_merge, None);
+            if !docmerge.status.success() {
+                return docmerge;
+            }
+        }
+        docres
     }
 
     fn exec_compiled_test(&self) -> ProcRes {
@@ -1271,7 +1373,8 @@ impl<'test> TestCx<'test> {
                           aux_name: &str,
                           aux_path: &str,
                           aux_type: AuxType| {
-            let lib_name = get_lib_name(&path_to_crate_name(aux_path), aux_type);
+            let lib_name =
+                get_lib_name(&path_to_crate_name(aux_path), aux_type, self.config.wasm_proc_macros);
             if let Some(lib_name) = lib_name {
                 let modifiers_and_name = match extern_modifiers {
                     Some(modifiers) => format!("{modifiers}:{aux_name}"),
@@ -1302,7 +1405,11 @@ impl<'test> TestCx<'test> {
         // to `-Zcodegen-backend` when compiling the test file.
         if let Some(aux_file) = &self.props.aux.codegen_backend {
             let aux_type = self.build_auxiliary(aux_file, aux_dir, None);
-            if let Some(lib_name) = get_lib_name(aux_file.trim_end_matches(".rs"), aux_type) {
+            if let Some(lib_name) = get_lib_name(
+                aux_file.trim_end_matches(".rs"),
+                aux_type,
+                self.config.wasm_proc_macros,
+            ) {
                 let lib_path = aux_dir.join(&lib_name);
                 rustc.arg(format!("-Zcodegen-backend={}", lib_path));
             }
@@ -1353,6 +1460,7 @@ impl<'test> TestCx<'test> {
         // Reapply isolation here; dedicated minicore flags remain last so an
         // exceptional fixture can opt in intentionally.
         self.config.configure_compiletest_rustc(&mut rustc);
+        rustc.arg("--check-cfg=cfg(target_has_reliable_f16b)");
         rustc.args(self.props.minicore_compile_flags.clone());
 
         let res =
@@ -1377,9 +1485,30 @@ impl<'test> TestCx<'test> {
         aux_type: Option<AuxType>,
     ) -> AuxType {
         let aux_path = self.resolve_aux_path(source_path);
-        let mut aux_props = self.props.from_aux_file(&aux_path, self.revision, self.config);
+        let mut aux_props =
+            self.props.from_aux_file(&aux_path, self.variant.revision(), self.config);
         if aux_type == Some(AuxType::ProcMacro) {
-            aux_props.force_host = true;
+            if self.config.wasm_proc_macros {
+                aux_props.compile_flags.push("--target=wasm32-wasip2".to_owned());
+                // Override any earlier linkers for now, otherwise we fail to build since compiletest
+                // thinks we're building for a different target and passes its linker (if one is
+                // configured).
+                //
+                // wasm32-wasip2 should in principle always be able to link with wasm-component-ld +
+                // wasm-ld. This does mean that rust.lld needs to be enabled to build wasm-ld wrapper
+                // around rust-lld.
+                aux_props.compile_flags.push("-Clinker=wasm-component-ld".to_owned());
+                aux_props.compile_flags.push(format!(
+                    "-Clink-arg=--wasm-ld-path={}",
+                    self.config
+                        .sysroot_base
+                        .join("lib/rustlib")
+                        .join(&self.config.host)
+                        .join("bin/gcc-ld/wasm-ld")
+                ));
+            } else {
+                aux_props.force_host = true;
+            }
         }
         let mut aux_dir = aux_dir.to_path_buf();
         if aux_type == Some(AuxType::Bin) {
@@ -1395,7 +1524,7 @@ impl<'test> TestCx<'test> {
             stderr: self.stderr,
             props: &aux_props,
             testpaths: self.testpaths,
-            revision: self.revision,
+            variant: self.variant,
         };
         // Create the directory for the stdout/stderr files.
         create_dir_all(aux_cx.output_base_dir()).unwrap();
@@ -1485,7 +1614,10 @@ impl<'test> TestCx<'test> {
         aux_type
     }
 
-    fn read2_abbreviated(&self, child: Child) -> (Output, Truncated) {
+    fn read2_abbreviated(
+        &self,
+        child: &mut impl crate::read2::OutputChild,
+    ) -> io::Result<(Output, Truncated)> {
         let mut filter_paths_from_len = Vec::new();
         let mut add_path = |path: &Utf8Path| {
             let path = path.to_string();
@@ -1504,7 +1636,7 @@ impl<'test> TestCx<'test> {
         add_path(&self.config.src_test_suite_root);
         add_path(&self.config.build_test_suite_root);
 
-        read2_abbreviated(child, &filter_paths_from_len).expect("failed to read output")
+        read2_abbreviated(child, &filter_paths_from_len)
     }
 
     fn compose_and_run(
@@ -1526,13 +1658,44 @@ impl<'test> TestCx<'test> {
         // search path for the child.
         add_dylib_path(&mut command, iter::once(lib_path).chain(aux_path));
 
-        let mut child = disable_error_reporting(|| command.spawn())
-            .unwrap_or_else(|e| panic!("failed to exec `{command:?}`: {e:?}"));
-        if let Some(input) = input {
-            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
-        }
+        // Trust: observe the final command, including auxiliary compilers,
+        // without inserting flags or changing its environment/exit policy.
+        let observation = self.config.trust_invocation_census.as_ref().map(|census| {
+            census
+                .command_started(
+                    self.config,
+                    self.testpaths,
+                    self.variant,
+                    &command,
+                    input.as_deref(),
+                )
+                .expect("retain actual compiletest command")
+        });
 
-        let (Output { status, stdout, stderr }, truncated) = self.read2_abbreviated(child);
+        let (Output { status, stdout, stderr }, truncated) = disable_error_reporting(|| {
+            crate::case_scheduler::run(&mut command, |child| {
+                if let Some(observation) = &observation {
+                    observation
+                        .spawned(child.id())
+                        .expect("retain actual compiler process identity");
+                }
+                if let Some(input) = input {
+                    crate::read2::OutputChild::take_stdin(child).unwrap().write_all(input.as_bytes())?;
+                }
+                self.read2_abbreviated(child)
+            })
+        })
+        .unwrap_or_else(|e| {
+            if let Some(observation) = &observation {
+                observation.spawn_failed(&e).expect("retain command execution failure");
+            }
+            panic!("failed to execute `{command:?}`: {e:?}")
+        });
+        if let Some(observation) = observation {
+            observation
+                .finished(&status, &stdout, &stderr, matches!(truncated, Truncated::Yes))
+                .expect("retain compiletest command terminal and existing body observations");
+        }
 
         let result = ProcRes {
             status,
@@ -1563,7 +1726,8 @@ impl<'test> TestCx<'test> {
             // Exhaustively match all other suites.
             // Note that some suites never actually use this method, so the
             // return value for those suites is not necessarily meaningful.
-            TestSuite::AssemblyLlvm
+            TestSuite::AssemblyGcc
+            | TestSuite::AssemblyLlvm
             | TestSuite::BuildStd
             | TestSuite::CodegenLlvm
             | TestSuite::CodegenUnits
@@ -1602,8 +1766,22 @@ impl<'test> TestCx<'test> {
         };
         compiler.arg(input_file);
 
-        // Use a single thread for efficiency and a deterministic error message order
-        compiler.arg("-Zthreads=1");
+        // Enable wasm proc macros.
+        if self.config.wasm_proc_macros {
+            compiler.arg("-Zwasm-proc-macros");
+        }
+
+        // `--disable-minification` is an unstable rustdoc option. Rustdoc UI tests intentionally
+        // exercise diagnostics for unstable options, so don't enable them for that suite.
+        if compiler_kind == CompilerKind::Rustdoc
+            && self.config.disable_minification
+            && self.config.mode != TestMode::Ui
+        {
+            compiler.arg("-Zunstable-options").arg("--disable-minification");
+        }
+
+        // Note: when adding new unstable compile flags here, also update
+        // `COMPILETEST_UI_SUITE_UNSTABLE_FLAGS`
 
         // Hide libstd sources from ui tests to make sure we generate the stderr
         // output that users will see.
@@ -1877,15 +2055,16 @@ impl<'test> TestCx<'test> {
             },
         }
 
+        // FIXME(#160895): While the new solver is enabled by default on nightly,
+        // we don't want to use it in our tests for now.
+        compiler.args(["-Znext-solver=coherence"]);
+
         match self.config.compare_mode {
             Some(CompareMode::Polonius) => {
                 compiler.args(&["-Zpolonius=next"]);
             }
             Some(CompareMode::NextSolver) => {
                 compiler.args(&["-Znext-solver"]);
-            }
-            Some(CompareMode::NextSolverCoherence) => {
-                compiler.args(&["-Znext-solver=coherence"]);
             }
             Some(CompareMode::SplitDwarf) if self.config.target.contains("windows") => {
                 compiler.args(&["-Csplit-debuginfo=unpacked", "-Zunstable-options"]);
@@ -2033,7 +2212,8 @@ impl<'test> TestCx<'test> {
     }
 
     fn dump_output(&self, print_output: bool, proc_name: &str, out: &str, err: &str) {
-        let revision = if let Some(r) = self.revision { format!("{}.", r) } else { String::new() };
+        let revision =
+            if let Some(r) = self.variant.revision() { format!("{}.", r) } else { String::new() };
 
         self.dump_output_file(out, &format!("{}out", revision));
         self.dump_output_file(err, &format!("{}err", revision));
@@ -2090,22 +2270,26 @@ impl<'test> TestCx<'test> {
 
     /// The revision, ignored for incremental compilation since it wants all revisions in
     /// the same directory.
-    fn safe_revision(&self) -> Option<&str> {
-        if self.config.mode == TestMode::Incremental { None } else { self.revision }
+    fn variant_with_safe_revision(&self) -> TestVariant {
+        if self.config.mode == TestMode::Incremental {
+            TestVariant { revision: None, debugger: self.variant.debugger }
+        } else {
+            self.variant.clone()
+        }
     }
 
     /// Gets the absolute path to the directory where all output for the given
     /// test/revision should reside.
     /// E.g., `/path/to/build/host-tuple/test/ui/relative/testname.revision.mode/`.
     fn output_base_dir(&self) -> Utf8PathBuf {
-        output_base_dir(self.config, self.testpaths, self.safe_revision())
+        output_base_dir(self.config, self.testpaths, &self.variant_with_safe_revision())
     }
 
     /// Gets the absolute path to the base filename used as output for the given
     /// test/revision.
     /// E.g., `/.../relative/testname.revision.mode/testname`.
     fn output_base_name(&self) -> Utf8PathBuf {
-        output_base_name(self.config, self.testpaths, self.safe_revision())
+        output_base_name(self.config, self.testpaths, &self.variant_with_safe_revision())
     }
 
     /// Prints a message to (captured) stdout if `config.verbose` is true.
@@ -2124,7 +2308,7 @@ impl<'test> TestCx<'test> {
     /// includes the revision name for tests that use revisions.
     #[must_use]
     fn error_prefix(&self) -> String {
-        match self.revision {
+        match self.variant.revision() {
             Some(rev) => format!("error in revision `{rev}`"),
             None => format!("error"),
         }
@@ -2201,7 +2385,7 @@ impl<'test> TestCx<'test> {
         // TL;DR We may not want to conflate `compiletest` revisions and `FileCheck` prefixes.
 
         // HACK: tests are allowed to use a revision name as a check prefix.
-        if let Some(rev) = self.revision {
+        if let Some(rev) = self.variant.revision() {
             filecheck.arg("--check-prefix").arg(rev);
         }
 
@@ -2592,7 +2776,10 @@ impl<'test> TestCx<'test> {
         //     vanilla lane at 397/0 on the same snapshot.
         if self.config.suite == TestSuite::RustdocUi {
             normalized = normalized
-                .replace("Available passes for running trustdoc:", "Available passes for running rustdoc:")
+                .replace(
+                    "Available passes for running trustdoc:",
+                    "Available passes for running rustdoc:",
+                )
                 .replace("Default passes for trustdoc:", "Default passes for rustdoc:");
         }
         // (d) Trust: the solver memory guard (`trust-router/src/memory_guard.rs`)
@@ -2605,6 +2792,46 @@ impl<'test> TestCx<'test> {
         //     runs, 2026-08-22).
         normalized = static_regex!(r"(?m)^Trust memory warning: .*\n")
             .replace_all(&normalized, "")
+            .into_owned();
+        // (f) Trust: the native verifier's CONTENT ADDRESSES are build artifacts,
+        //     never behaviour. `bundle_digest` is sha256 over the serialized
+        //     `NativeVerificationBundle` and `request_digest` over each native
+        //     request (trust-router `native_trust_ir/index.rs`), and both are
+        //     printed in the "native verifier detail" block every strict
+        //     verification failure emits. So ANY producer-side field addition
+        //     moves every digest in every fixture that prints that block, and the
+        //     fixture goes red for a reason that has nothing to do with what it
+        //     pins. That has already cost two mass re-blessings: 13 digests after
+        //     the 97-commit upstream merge (the EXPECTATION NOTE in
+        //     tests/ui/trust/e6_kernel_import_admits.rs) and 3 more after the
+        //     trust-ir v41 field additions. The repo already knew the pin was
+        //     unstable — tests/ui/trust/native_bundle_std_trait_impl_stays_fail_closed.rs
+        //     sets `dont-check-compiler-stderr` and says outright that a blessed
+        //     file carrying `bundle_digest=sha256:…` "would be unstable" — which
+        //     made the note-pin instrument the only usable one for that fixture.
+        //     Normalizing here gives every OTHER fixture the stable stderr it
+        //     needs without giving up the block.
+        //
+        //     What is NOT normalized, deliberately: `request_id`,
+        //     `proof_obligations=[..]`, `schema_version`, `requests=N` and every
+        //     status/evidence line stay byte-exact, so a fixture still pins WHICH
+        //     requests were indexed and what each one concluded — the properties
+        //     these baselines exist for. The `evidence_bundle_hash conflict`
+        //     line's own `aggregate`/`evidence` hashes are also left alone: there
+        //     the two hashes DISAGREEING is the finding.
+        normalized = static_regex!(r"\b(bundle_digest|request_digest)=sha256:[0-9a-f]{64}")
+            .replace_all(&normalized, "$1=sha256:$$DIGEST")
+            .into_owned();
+        // (g) Trust: an engine's identity carries its PACKAGE VERSION
+        //     (`engine=trust-mc@0.10.0+native-trust-ir-bundle`, `primary owner
+        //     trust-vc@0.10.0`), which follows the workspace version, so every
+        //     release bump turned every fixture that prints the native detail block
+        //     red for a reason unrelated to what it pins (measured: 7 fixtures at the
+        //     0.9.0 -> 0.10.0 bump, 2026-09-23), and six fixtures had grown a private
+        //     `normalize-stderr` for it. Same class as (f): an artifact of the build,
+        //     never behaviour. The engine NAME stays exact.
+        normalized = static_regex!(r"\b(trust-(?:mc|vc|wp))@\d+\.\d+\.\d+")
+            .replace_all(&normalized, "$1@$$ENGINE")
             .into_owned();
 
         normalized = Self::normalize_platform_differences(&normalized);
@@ -2746,17 +2973,21 @@ impl<'test> TestCx<'test> {
     }
 
     fn expected_output_path(&self, kind: &str) -> Utf8PathBuf {
-        let mut path =
-            expected_output_path(&self.testpaths, self.revision, &self.config.compare_mode, kind);
+        let mut path = expected_output_path(
+            &self.testpaths,
+            self.variant.revision(),
+            &self.config.compare_mode,
+            kind,
+        );
 
         if !path.exists() {
             if let Some(CompareMode::Polonius) = self.config.compare_mode {
-                path = expected_output_path(&self.testpaths, self.revision, &None, kind);
+                path = expected_output_path(&self.testpaths, self.variant.revision(), &None, kind);
             }
         }
 
         if !path.exists() {
-            path = expected_output_path(&self.testpaths, self.revision, &None, kind);
+            path = expected_output_path(&self.testpaths, self.variant.revision(), &None, kind);
         }
 
         path
@@ -2795,8 +3026,12 @@ impl<'test> TestCx<'test> {
         actual_unnormalized: &str,
         expected: &str,
     ) -> CompareOutcome {
-        let expected_path =
-            expected_output_path(self.testpaths, self.revision, &self.config.compare_mode, stream);
+        let expected_path = expected_output_path(
+            self.testpaths,
+            self.variant.revision(),
+            &self.config.compare_mode,
+            stream,
+        );
 
         if self.config.bless && actual.is_empty() && expected_path.exists() {
             self.delete_file(&expected_path);
@@ -2857,7 +3092,7 @@ impl<'test> TestCx<'test> {
         // Write the actual output to a file in build directory.
         let actual_path = self
             .output_base_name()
-            .with_extra_extension(self.revision.unwrap_or(""))
+            .with_extra_extension(self.variant.revision().unwrap_or(""))
             .with_extra_extension(
                 self.config.compare_mode.as_ref().map(|cm| cm.to_str()).unwrap_or(""),
             )
@@ -2885,7 +3120,7 @@ impl<'test> TestCx<'test> {
         } else {
             // Delete non-revision .stderr/.stdout file if revisions are used.
             // Without this, we'd just generate the new files and leave the old files around.
-            if self.revision.is_some() {
+            if self.variant.revision().is_some() {
                 let old =
                     expected_output_path(self.testpaths, None, &self.config.compare_mode, stream);
                 self.delete_file(&old);
@@ -3000,7 +3235,7 @@ impl<'test> TestCx<'test> {
     ) {
         for kind in UI_EXTENSIONS {
             let canon_comparison_path =
-                expected_output_path(&self.testpaths, self.revision, &None, kind);
+                expected_output_path(&self.testpaths, self.variant.revision(), &None, kind);
 
             let canon = match self.load_expected_output_from_path(&canon_comparison_path) {
                 Ok(canon) => canon,
@@ -3008,8 +3243,12 @@ impl<'test> TestCx<'test> {
             };
             let bless = self.config.bless;
             let check_and_prune_duplicate_outputs = |mode: &CompareMode, require_same: bool| {
-                let examined_path =
-                    expected_output_path(&self.testpaths, self.revision, &Some(mode.clone()), kind);
+                let examined_path = expected_output_path(
+                    &self.testpaths,
+                    self.variant.revision(),
+                    &Some(mode.clone()),
+                    kind,
+                );
 
                 // If there is no output, there is nothing to do
                 let examined_content = match self.load_expected_output_from_path(&examined_path) {
@@ -3045,8 +3284,8 @@ impl<'test> TestCx<'test> {
     }
 
     fn create_stamp(&self) {
-        let stamp_file_path = stamp_file_path(&self.config, self.testpaths, self.revision);
-        fs::write(&stamp_file_path, compute_stamp_hash(&self.config)).unwrap();
+        let stamp_file_path = stamp_file_path(&self.config, self.testpaths, self.variant);
+        fs::write(&stamp_file_path, compute_stamp_hash(&self.config, self.variant)).unwrap();
     }
 
     fn init_incremental_test(&self) {

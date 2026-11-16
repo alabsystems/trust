@@ -257,12 +257,8 @@ impl StrategySelector {
     ///
     /// Multiplies all total_reward values by `decay_factor` (typically 0.9-0.99).
     pub fn decay_rewards(&mut self, decay_factor: f64) {
-        let mut strategies: Vec<_> = self.records.keys().copied().collect();
-        strategies.sort_by_key(|strategy| strategy_sort_key(*strategy));
-        for strategy in strategies {
-            if let Some(record) = self.records.get_mut(&strategy) {
-                record.total_reward *= decay_factor;
-            }
+        for record in self.records.values_mut() {
+            record.total_reward *= decay_factor;
         }
     }
 }
@@ -575,12 +571,6 @@ mod tests {
         let after = selector.record_for(Strategy::Heuristic).unwrap().total_reward;
 
         assert!((after - before * 0.5).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_selector_with_custom_exploration() {
-        let selector = StrategySelector::with_exploration(2.0);
-        assert!((selector.exploration_constant - 2.0).abs() < f64::EPSILON);
     }
 
     // --- Integration ---

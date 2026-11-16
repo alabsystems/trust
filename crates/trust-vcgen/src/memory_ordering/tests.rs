@@ -113,7 +113,36 @@ fn test_hb_duplicate_edge() {
     let mut hb = HappensBefore::new(2);
     assert!(hb.add_edge(0, 1));
     assert!(!hb.add_edge(0, 1)); // duplicate
+    assert!(hb.is_acyclic(), "a duplicate is not contradictory evidence");
     assert_eq!(hb.edge_count(), 1);
+}
+
+#[test]
+fn test_hb_rejects_cycle_forming_edges() {
+    let mut hb = HappensBefore::new(3);
+    assert!(hb.add_edge(0, 1));
+    assert!(hb.add_edge(1, 2));
+    assert!(hb.happens_before(0, 2));
+    assert!(!hb.add_edge(2, 0));
+    assert!(!hb.add_edge(1, 1));
+    assert!(!hb.is_acyclic(), "rejected cycle must poison the evidence");
+    assert_eq!(hb.edge_count(), 0);
+    assert!(!hb.happens_before(0, 2));
+    assert!(!hb.happens_before(2, 0));
+}
+
+#[test]
+fn test_hb_chain_growth_preserves_edges_without_rebuilding() {
+    let mut hb = HappensBefore::new(0);
+    for event in 0..1_000 {
+        hb.add_event();
+        if event > 0 {
+            assert!(hb.add_edge(event - 1, event));
+        }
+    }
+    assert!(hb.is_acyclic());
+    assert_eq!(hb.edge_count(), 999);
+    assert!(hb.happens_before(0, 999));
 }
 
 #[test]
@@ -132,6 +161,46 @@ fn test_hb_query_apis_fail_closed_on_invalid_deserialized_edges() {
         !hb.happens_before(0, 1),
         "valid-looking edges must not leak out of an invalid HB relation"
     );
+    assert!(!hb.are_ordered(0, 1));
+    assert!(hb.successors(0).is_empty());
+    assert_eq!(hb.edge_count(), 0);
+}
+
+#[test]
+fn test_hb_growth_cannot_revalidate_an_invalid_deserialized_endpoint() {
+    let mut hb: HappensBefore = serde_json::from_value(serde_json::json!({
+        "edges": { "0": [2] },
+        "event_count": 2
+    }))
+    .expect("deserialization can materialize an out-of-range edge");
+
+    assert!(!hb.is_acyclic());
+    hb.add_event();
+    assert_eq!(hb.event_count(), 3);
+    assert!(!hb.is_acyclic(), "growth cannot retroactively authorize malformed evidence");
+    assert!(!hb.happens_before(0, 2));
+}
+
+#[test]
+fn test_hb_event_count_overflow_poisoned() {
+    let mut hb = HappensBefore::new(usize::MAX);
+    hb.add_event();
+    assert!(!hb.is_acyclic());
+    assert_eq!(hb.edge_count(), 0);
+}
+
+#[test]
+fn test_hb_query_apis_fail_closed_on_deserialized_cycle() {
+    let hb: HappensBefore = serde_json::from_value(serde_json::json!({
+        "edges": { "0": [1], "1": [2], "2": [0] },
+        "event_count": 3,
+        "validation_pending": false
+    }))
+    .expect("deserialization can materialize cyclic HB evidence");
+
+    assert!(hb.validate().is_ok(), "all endpoints are in range");
+    assert!(!hb.is_acyclic());
+    assert!(!hb.happens_before(0, 1));
     assert!(!hb.are_ordered(0, 1));
     assert!(hb.successors(0).is_empty());
     assert_eq!(hb.edge_count(), 0);
@@ -401,15 +470,18 @@ fn test_atomic_log_locations_and_threads() {
 }
 
 #[test]
-fn test_atomic_log_find_release_acquire_pairs() {
+fn test_atomic_log_release_acquire_without_read_from_is_diagnostic_only() {
     let mut log = AtomicAccessLog::new();
     log.record(make_atomic_entry("flag", AccessKind::AtomicWrite(MemoryOrdering::Release), "t1"));
     log.record(make_atomic_entry("flag", AccessKind::AtomicRead(MemoryOrdering::Acquire), "t2"));
     log.record(make_atomic_entry("other", AccessKind::AtomicWrite(MemoryOrdering::Relaxed), "t1"));
 
-    let pairs = log.find_release_acquire_pairs();
-    assert_eq!(pairs.len(), 1);
-    assert_eq!(pairs[0], (0, 1));
+    assert_eq!(log.entries().len(), 3);
+    assert_eq!(log.accesses_to("flag").len(), 2);
+    assert_eq!(log.accesses_to("other").len(), 1);
+    assert_eq!(log.entries()[0].thread_id, "t1");
+    assert_eq!(log.entries()[1].thread_id, "t2");
+    assert!(log.find_release_acquire_pairs().is_empty());
 }
 
 #[test]
@@ -458,17 +530,19 @@ fn test_atomic_log_no_release_acquire_same_thread() {
 }
 
 #[test]
-fn test_atomic_log_release_acquire_seqcst_counts() {
+fn test_atomic_log_seqcst_without_read_from_has_no_sync_pair() {
     let mut log = AtomicAccessLog::new();
     log.record(make_atomic_entry("flag", AccessKind::AtomicWrite(MemoryOrdering::SeqCst), "t1"));
     log.record(make_atomic_entry("flag", AccessKind::AtomicRead(MemoryOrdering::SeqCst), "t2"));
 
-    let pairs = log.find_release_acquire_pairs();
-    assert_eq!(pairs.len(), 1, "SeqCst write/read should form a release-acquire pair");
+    assert_eq!(log.accesses_with_ordering(MemoryOrdering::SeqCst).len(), 2);
+    assert_eq!(log.entries()[0].location, "flag");
+    assert_eq!(log.entries()[1].location, "flag");
+    assert!(log.find_release_acquire_pairs().is_empty());
 }
 
 #[test]
-fn test_atomic_log_release_acquire_rmw_counts() {
+fn test_atomic_log_rmw_without_read_from_has_no_sync_pair() {
     let mut log = AtomicAccessLog::new();
     log.record(make_atomic_entry(
         "counter",
@@ -483,8 +557,18 @@ fn test_atomic_log_release_acquire_rmw_counts() {
         "t4",
     ));
 
-    let pairs = log.find_release_acquire_pairs();
-    assert_eq!(pairs, vec![(0, 1), (2, 3)], "RMWs must participate in sync pairs");
+    assert_eq!(log.entries().len(), 4);
+    assert_eq!(log.accesses_to("counter").len(), 2);
+    assert_eq!(log.accesses_to("gate").len(), 2);
+    assert_eq!(
+        log.entries()[0].access_kind,
+        AccessKind::AtomicRmw(MemoryOrdering::Release, AtomicRmwOp::Add)
+    );
+    assert_eq!(
+        log.entries()[3].access_kind,
+        AccessKind::AtomicRmw(MemoryOrdering::Acquire, AtomicRmwOp::Xchg)
+    );
+    assert!(log.find_release_acquire_pairs().is_empty());
 }
 
 #[test]
@@ -515,24 +599,70 @@ fn test_detector_simple_race() {
 }
 
 #[test]
-fn test_detector_no_race_with_hb() {
+fn test_detector_claimed_hb_does_not_hide_potential_race() {
     let mut det = DataRaceDetector::new();
     let w = det.add_access("x", AccessKind::Write, "t1", SourceSpan::default());
     let r = det.add_access("x", AccessKind::Read, "t2", SourceSpan::default());
     det.add_happens_before(w, r);
 
     let races = det.detect_races();
-    assert!(races.is_empty(), "HB edge should prevent race");
+    assert_eq!(races.len(), 1, "the caller-provided edge has no event provenance");
 }
 
 #[test]
-fn test_detector_no_race_same_thread() {
+fn test_detector_rejected_cycle_does_not_reappear_when_accesses_grow() {
+    let mut det = DataRaceDetector::new();
+    let first = det.add_access("x", AccessKind::Write, "t1", SourceSpan::default());
+    let second = det.add_access("x", AccessKind::Read, "t2", SourceSpan::default());
+    assert!(det.add_happens_before(first, second));
+    assert!(!det.add_happens_before(second, first));
+    det.add_access("x", AccessKind::Read, "t3", SourceSpan::default());
+
+    assert!(!det.happens_before().is_acyclic());
+    assert_eq!(det.happens_before().edge_count(), 0);
+    assert!(!det.happens_before().happens_before(second, first));
+    assert!(det.accesses()[first].happens_before.is_empty());
+    assert!(
+        det.detect_races()
+            .iter()
+            .any(|race| { race.first_access == first && race.second_access == second })
+    );
+}
+
+#[test]
+fn test_detector_invalid_edge_request_poisoned() {
+    let mut det = DataRaceDetector::new();
+    let write = det.add_access("x", AccessKind::Write, "t1", SourceSpan::default());
+    let read = det.add_access("x", AccessKind::Read, "t2", SourceSpan::default());
+    assert!(!det.add_happens_before(write, read + 1));
+    assert!(!det.happens_before().is_acyclic());
+    assert_eq!(det.detect_races().len(), 1);
+    det.add_access("x", AccessKind::Read, "t3", SourceSpan::default());
+    assert!(!det.happens_before().is_acyclic());
+}
+
+#[test]
+fn test_detector_same_thread_label_does_not_hide_potential_race() {
     let mut det = DataRaceDetector::new();
     det.add_access("x", AccessKind::Write, "t1", SourceSpan::default());
     det.add_access("x", AccessKind::Read, "t1", SourceSpan::default());
 
     let races = det.detect_races();
-    assert!(races.is_empty(), "same-thread accesses cannot race");
+    assert_eq!(races.len(), 1, "two runtime threads can share a diagnostic label");
+    assert_eq!((races[0].first_access, races[0].second_access), (0, 1));
+    assert_eq!((races[0].first_thread.as_str(), races[0].second_thread.as_str()), ("t1", "t1"));
+}
+
+#[test]
+fn test_detector_same_thread_label_with_claimed_hb_still_races() {
+    let mut det = DataRaceDetector::new();
+    let write = det.add_access("left", AccessKind::Write, "t1", SourceSpan::default());
+    let read = det.add_access("right", AccessKind::Read, "t1", SourceSpan::default());
+    assert!(det.add_happens_before(write, read));
+
+    let races = det.detect_races();
+    assert_eq!(races.len(), 1, "labels and an unauthenticated edge cannot hide the pair");
+    assert_eq!((races[0].first_access, races[0].second_access), (write, read));
 }
 
 #[test]
@@ -581,7 +711,7 @@ fn test_detector_race_atomic_vs_non_atomic() {
 }
 
 #[test]
-fn test_detector_transitive_hb_prevents_race() {
+fn test_detector_claimed_transitive_hb_does_not_hide_race() {
     let mut det = DataRaceDetector::new();
     let w = det.add_access("x", AccessKind::Write, "t1", SourceSpan::default());
     let rel = det.add_access(
@@ -603,10 +733,10 @@ fn test_detector_transitive_hb_prevents_race() {
     det.add_happens_before(acq, r); // program order in t2
 
     let races = det.detect_races();
-    // The write-read pair on "x" should be ordered via transitive HB.
-    // Filter to only "x" races since flag accesses are both atomic.
-    let x_races: Vec<_> = races.iter().filter(|r| r.location == "x").collect();
-    assert!(x_races.is_empty(), "transitive HB via release-acquire should prevent race on x");
+    assert!(
+        races.iter().any(|race| (race.first_access, race.second_access) == (w, r)),
+        "a claimed release-acquire path has no authenticated read-from witness"
+    );
 }
 
 #[test]
@@ -618,7 +748,8 @@ fn test_detector_multiple_variables() {
     det.add_access("y", AccessKind::Write, "t2", SourceSpan::default());
 
     let races = det.detect_races();
-    assert_eq!(races.len(), 2, "should detect races on both x and y");
+    let pairs: Vec<_> = races.iter().map(|race| (race.first_access, race.second_access)).collect();
+    assert_eq!(pairs, vec![(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]);
 }
 
 #[test]
@@ -839,6 +970,35 @@ fn test_checker_invalid_happens_before_rejects_partial_ordering_evidence() {
 }
 
 #[test]
+fn test_checker_cyclic_happens_before_rejects_ordering_evidence() {
+    let hb: HappensBefore = serde_json::from_value(serde_json::json!({
+        "edges": { "0": [1], "1": [0] },
+        "event_count": 2
+    }))
+    .expect("deserialization can materialize cyclic HB evidence");
+    let checker = MemoryModelChecker::new(AtomicAccessLog::new(), hb);
+
+    let result = checker.check();
+    assert!(!result.is_sound);
+    assert_eq!(result.ordering_coverage_gaps.len(), 1);
+    assert!(result.ordering_coverage_gaps[0].detail.contains("contains a cycle"));
+    assert!(!checker.happens_before().happens_before(0, 1));
+}
+
+#[test]
+fn test_checker_rejected_cycle_is_an_ordering_evidence_gap() {
+    let mut hb = HappensBefore::new(2);
+    assert!(hb.add_edge(0, 1));
+    assert!(!hb.add_edge(1, 0));
+    let checker = MemoryModelChecker::new(AtomicAccessLog::new(), hb);
+
+    let result = checker.check();
+    assert!(!result.is_sound);
+    assert_eq!(result.ordering_coverage_gaps.len(), 1);
+    assert!(result.ordering_coverage_gaps[0].detail.contains("rejected contradictory edge"));
+}
+
+#[test]
 fn test_checker_release_acquire_consistency() {
     let mut log = AtomicAccessLog::new();
     log.record(make_atomic_entry("flag", AccessKind::AtomicWrite(MemoryOrdering::Release), "t1"));
@@ -1009,7 +1169,7 @@ fn test_memory_model_check_result_serialization_roundtrip() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn test_full_workflow_spin_lock_pattern() {
+fn test_full_workflow_claimed_spin_lock_pattern_remains_candidate() {
     // Simulate a spin-lock pattern:
     // Thread 1: write data, release-store flag=1
     // Thread 2: acquire-load flag until 1, read data
@@ -1039,8 +1199,12 @@ fn test_full_workflow_spin_lock_pattern() {
     det.add_sync_pair(release_flag, acquire_flag);
 
     let races = det.detect_races();
-    let data_races: Vec<_> = races.iter().filter(|r| r.location == "data").collect();
-    assert!(data_races.is_empty(), "spin-lock pattern should be race-free on data");
+    assert!(
+        races
+            .iter()
+            .any(|race| { (race.first_access, race.second_access) == (write_data, read_data) }),
+        "a claimed spin-lock path is not authenticated ordering evidence"
+    );
 }
 
 #[test]
@@ -1069,8 +1233,18 @@ fn test_full_workflow_broken_spin_lock() {
     // No sync pair established (because the writer used Relaxed)
 
     let races = det.detect_races();
-    let data_races: Vec<_> = races.iter().filter(|r| r.location == "data").collect();
-    assert_eq!(data_races.len(), 1, "broken spin-lock should race on data");
+    assert!(
+        races
+            .iter()
+            .any(|race| (race.first_access, race.second_access) == (write_data, _read_data)),
+        "broken spin-lock should race on data"
+    );
+    assert!(
+        races
+            .iter()
+            .any(|race| (race.first_access, race.second_access) == (write_data, _acquire_flag)),
+        "data and flag labels do not establish disjointness"
+    );
 }
 
 #[test]
@@ -2282,21 +2456,41 @@ fn test_l3_cas_weak_failure_release_is_illegal() {
     );
 }
 
-// -- L4: CAS failure ordering must be <= success ordering --
+// -- L4 (retired): a CAS failure ordering stronger than the success ordering is legal --
+//
+// Rust 1.64 and C++17 removed the "failure <= success" restriction.
+// `core::sync::atomic::atomic_compare_exchange` issues each of these pairs
+// itself. An L4 row here would be an obligation against valid Rust that the
+// routed solver refutes, because the legality formula is always SAT.
+
+/// Every (success, failure) pair `core::sync::atomic::atomic_compare_exchange`
+/// dispatches where `failure` is not `<=` `success` in the ordering lattice.
+const CORE_FAILURE_STRONGER_THAN_SUCCESS: [(AtomicOrdering, AtomicOrdering); 6] = [
+    (AtomicOrdering::Relaxed, AtomicOrdering::Acquire),
+    (AtomicOrdering::Relaxed, AtomicOrdering::SeqCst),
+    (AtomicOrdering::Acquire, AtomicOrdering::SeqCst),
+    (AtomicOrdering::Release, AtomicOrdering::Acquire),
+    (AtomicOrdering::Release, AtomicOrdering::SeqCst),
+    (AtomicOrdering::AcqRel, AtomicOrdering::SeqCst),
+];
 
 #[test]
-fn test_l4_cas_failure_stronger_than_success() {
-    // success=Relaxed, failure=Acquire: failure is stronger
-    let ops = [make_atomic_op(
-        AtomicOpKind::CompareExchange,
-        AtomicOrdering::Relaxed,
-        Some(AtomicOrdering::Acquire),
-    )];
-    let vcs = MemoryModelChecker::check_operation_legality(&ops, "test_fn");
-    assert!(
-        vcs.iter().any(|vc| vc.kind.description().contains("L4")),
-        "CAS with failure stronger than success should trigger L4"
-    );
+fn test_retired_l4_failure_stronger_than_success_is_legal() {
+    for op_kind in [AtomicOpKind::CompareExchange, AtomicOpKind::CompareExchangeWeak] {
+        for (success, failure) in CORE_FAILURE_STRONGER_THAN_SUCCESS {
+            assert!(
+                !success.is_at_least(&failure),
+                "fixture must exercise failure stronger than success: {success}/{failure}"
+            );
+            let ops = [make_atomic_op(op_kind, success, Some(failure))];
+            let vcs = MemoryModelChecker::check_operation_legality(&ops, "test_fn");
+            assert!(
+                vcs.is_empty(),
+                "{op_kind} success={success} failure={failure} is valid Rust (std issues it); \
+                 got {vcs:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2321,19 +2515,36 @@ fn test_l4_cas_failure_weaker_than_success_is_legal() {
     assert!(vcs.is_empty(), "CAS with failure=Relaxed, success=SeqCst is valid");
 }
 
+/// The complete CAS rule: over all 25 (success, failure) pairs, exactly the
+/// pairs std panics on (failure `Release` or `AcqRel`) emit one L3 row, and no
+/// other pair emits anything.
 #[test]
-fn test_l4_cas_failure_seqcst_success_acquire() {
-    // success=Acquire, failure=SeqCst: failure is strictly stronger
-    let ops = [make_atomic_op(
-        AtomicOpKind::CompareExchange,
+fn test_cas_legality_matches_std_panic_arms_exhaustively() {
+    const ALL: [AtomicOrdering; 5] = [
+        AtomicOrdering::Relaxed,
+        AtomicOrdering::Release,
         AtomicOrdering::Acquire,
-        Some(AtomicOrdering::SeqCst),
-    )];
-    let vcs = MemoryModelChecker::check_operation_legality(&ops, "test_fn");
-    assert!(
-        vcs.iter().any(|vc| vc.kind.description().contains("L4")),
-        "CAS with failure=SeqCst, success=Acquire should trigger L4"
-    );
+        AtomicOrdering::AcqRel,
+        AtomicOrdering::SeqCst,
+    ];
+    for op_kind in [AtomicOpKind::CompareExchange, AtomicOpKind::CompareExchangeWeak] {
+        for success in ALL {
+            for failure in ALL {
+                let ops = [make_atomic_op(op_kind, success, Some(failure))];
+                let vcs = MemoryModelChecker::check_operation_legality(&ops, "test_fn");
+                let std_panics =
+                    matches!(failure, AtomicOrdering::Release | AtomicOrdering::AcqRel);
+                assert_eq!(
+                    vcs.len(),
+                    usize::from(std_panics),
+                    "{op_kind} success={success} failure={failure}: {vcs:?}"
+                );
+                for vc in &vcs {
+                    assert!(vc.kind.description().contains("L3"), "{vc:?}");
+                }
+            }
+        }
+    }
 }
 
 // -- L5: fence / compiler_fence cannot use Relaxed --
@@ -2422,17 +2633,17 @@ fn test_multiple_violations_in_one_pass() {
 }
 
 #[test]
-fn test_l3_and_l4_can_fire_together_on_same_cas() {
-    // CAS with success=Relaxed, failure=Release: L3 (Release forbidden) and L4 (failure > success)
+fn test_l3_fires_alone_when_release_failure_exceeds_success() {
+    // success=Relaxed, failure=Release: L3 (Release forbidden). The retired L4
+    // (failure stronger than success) must not add a second row.
     let ops = [make_atomic_op(
         AtomicOpKind::CompareExchange,
         AtomicOrdering::Relaxed,
         Some(AtomicOrdering::Release),
     )];
     let vcs = MemoryModelChecker::check_operation_legality(&ops, "test_fn");
-    assert!(vcs.len() >= 2, "should fire both L3 and L4");
-    assert!(vcs.iter().any(|vc| vc.kind.description().contains("L3")));
-    assert!(vcs.iter().any(|vc| vc.kind.description().contains("L4")));
+    assert_eq!(vcs.len(), 1, "only L3 applies: {vcs:?}");
+    assert!(vcs[0].kind.description().contains("L3"));
 }
 
 #[test]
@@ -2465,6 +2676,39 @@ fn test_legality_vc_has_insufficient_ordering_kind() {
         vcs[0].formula,
         Formula::Var(crate::generated_formula_symbol("memory_ordering", "reach__0"), Sort::Bool,)
     );
+}
+
+/// v6/D2 pin: every legality row is a lone, unconstrained boolean. The
+/// violation is decided in Rust before emission, so the formula carries no
+/// program semantics. Because it is satisfiable, no honest engine can return
+/// `Proved` for it. If a future change conjoins facts into this formula, or
+/// emits a cross-thread ordering-sufficiency claim, it must first give that
+/// claim a real model (ty's) or refuse it before dispatch, as `DataRace` is.
+#[test]
+fn test_every_legality_vc_formula_is_a_lone_free_boolean() {
+    let ops = [
+        make_atomic_op(AtomicOpKind::Load, AtomicOrdering::Release, None), // L1
+        make_atomic_op(AtomicOpKind::Store, AtomicOrdering::AcqRel, None), // L2
+        make_atomic_op(
+            AtomicOpKind::CompareExchangeWeak,
+            AtomicOrdering::SeqCst,
+            Some(AtomicOrdering::AcqRel),
+        ), // L3
+        make_atomic_op(AtomicOpKind::CompilerFence, AtomicOrdering::Relaxed, None), // L5
+    ];
+    let vcs = MemoryModelChecker::check_operation_legality(&ops, "pin_fn");
+    assert_eq!(vcs.len(), 4, "{vcs:?}");
+    for vc in &vcs {
+        assert!(matches!(vc.kind, VcKind::InsufficientOrdering { .. }), "{vc:?}");
+        assert!(vc.contract_metadata.is_none() && vc.obligation.is_none(), "{vc:?}");
+        match &vc.formula {
+            Formula::Var(name, Sort::Bool) => assert!(
+                name.starts_with(&crate::generated_formula_symbol("memory_ordering", "reach_")),
+                "{name}"
+            ),
+            other => panic!("legality formula must stay a lone free boolean, got {other:?}"),
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -2514,6 +2758,37 @@ fn test_hb_graph_program_order() {
     assert!(graph.happens_before(&p1, &p2));
     assert!(graph.happens_before(&p0, &p2), "transitive HB");
     assert!(!graph.happens_before(&p2, &p0), "no reverse HB");
+}
+
+#[test]
+fn test_hb_graph_rejects_cycle_without_retaining_label() {
+    let mut graph = HappensBeforeGraph::new();
+    let first = ConcurrencyPoint::new("fn_a", trust_types::BlockId(0), "main");
+    let second = ConcurrencyPoint::new("fn_a", trust_types::BlockId(1), "main");
+    graph.add_node(first.clone());
+    graph.add_node(second.clone());
+
+    assert!(graph.add_edge(&first, &second, HappensBeforeEdgeKind::ProgramOrder));
+    assert!(!graph.add_edge(&second, &first, HappensBeforeEdgeKind::ProgramOrder));
+    assert_eq!(graph.edge_count(), 1);
+    assert_eq!(graph.edge_kind(&second, &first), None);
+    graph.add_node(ConcurrencyPoint::new("fn_a", trust_types::BlockId(2), "main"));
+    assert!(!graph.raw_hb().is_acyclic());
+    assert_eq!(graph.raw_hb().edge_count(), 0);
+    assert!(!graph.happens_before(&first, &second));
+}
+
+#[test]
+fn test_hb_graph_unknown_point_poisoned() {
+    let mut graph = HappensBeforeGraph::new();
+    let first = ConcurrencyPoint::new("fn_a", trust_types::BlockId(0), "main");
+    let missing = ConcurrencyPoint::new("fn_a", trust_types::BlockId(1), "main");
+    graph.add_node(first.clone());
+
+    assert!(!graph.add_edge(&first, &missing, HappensBeforeEdgeKind::ProgramOrder));
+    assert!(!graph.raw_hb().is_acyclic());
+    graph.add_node(missing.clone());
+    assert!(!graph.happens_before(&first, &missing));
 }
 
 #[test]
@@ -2669,6 +2944,9 @@ fn make_spawn_join_function() -> trust_types::VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "std::thread::spawn::<closure>",
+                        ),
                         is_foreign: false,
                         func: "std::thread::spawn::<closure>".into(),
                         args: vec![trust_types::Operand::Move(trust_types::Place::local(1))],
@@ -2692,6 +2970,9 @@ fn make_spawn_join_function() -> trust_types::VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "std::thread::JoinHandle::<()>::join",
+                        ),
                         is_foreign: false,
                         func: "std::thread::JoinHandle::<()>::join".into(),
                         args: vec![trust_types::Operand::Move(trust_types::Place::local(2))],
@@ -2716,40 +2997,101 @@ fn make_spawn_join_function() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
+fn hb_block(id: usize, terminator: trust_types::Terminator) -> trust_types::BasicBlock {
+    trust_types::BasicBlock { id: trust_types::BlockId(id), stmts: vec![], terminator }
+}
+
 #[test]
-fn test_build_happens_before_with_spawn_join() {
+fn test_build_happens_before_repeated_spawn_join_has_no_synthetic_event_edges() {
     let func = make_spawn_join_function();
     let log = AtomicAccessLog::new();
     let hb = HappensBefore::new(0);
     let checker = MemoryModelChecker::new(log, hb);
 
-    let graph = checker.build_happens_before(&[&func]);
-
-    // Should have nodes for all 4 blocks in main thread + spawn/join synthetic points
-    assert!(graph.node_count() >= 4, "should have at least 4 nodes, got {}", graph.node_count());
-
-    // Program-order edges exist within main thread
+    let single = checker.build_happens_before(&[&func]);
+    let repeated = checker.build_happens_before(&[&func, &func]);
     let bb0 = ConcurrencyPoint::new("test::spawner", trust_types::BlockId(0), "main");
     let bb1 = ConcurrencyPoint::new("test::spawner", trust_types::BlockId(1), "main");
     let bb2 = ConcurrencyPoint::new("test::spawner", trust_types::BlockId(2), "main");
-    let bb3 = ConcurrencyPoint::new("test::spawner", trust_types::BlockId(3), "main");
-
-    assert!(graph.happens_before(&bb0, &bb1), "bb0 -> bb1 (program order)");
-    assert!(graph.happens_before(&bb1, &bb2), "bb1 -> bb2 (program order)");
-    assert!(graph.happens_before(&bb2, &bb3), "bb2 -> bb3 (program order)");
-    assert!(graph.happens_before(&bb0, &bb3), "bb0 -> bb3 (transitive)");
-
-    // Spawn edge should exist
     let child_entry =
         ConcurrencyPoint::new("test::spawner", trust_types::BlockId(0), "spawned_at_bb0");
-    assert!(graph.happens_before(&bb0, &child_entry), "spawn point should HB child entry");
+    let child_exit =
+        ConcurrencyPoint::new("test::spawner", trust_types::BlockId(2), "spawned_at_bb0");
+
+    for graph in [&single, &repeated] {
+        assert_eq!(graph.node_count(), 0, "static sites are not event identities");
+        assert_eq!(graph.edge_count(), 0);
+        assert!(!graph.happens_before(&bb0, &bb1));
+        assert!(!graph.happens_before(&bb1, &bb2));
+        assert!(!graph.happens_before(&bb0, &child_entry));
+        assert!(!graph.happens_before(&child_exit, &bb2));
+        assert!(!graph.happens_before(&bb0, &bb0), "invocations must not alias an HB event");
+    }
 }
 
 #[test]
-fn test_build_happens_before_empty_function() {
+fn test_build_happens_before_loop_and_branches_do_not_create_event_order() {
+    let mut func = make_spawn_join_function();
+    func.def_path = "test::loop_branch".to_string();
+    func.body.locals[1].ty = trust_types::Ty::Bool;
+    func.body.blocks = vec![
+        hb_block(
+            0,
+            trust_types::Terminator::SwitchInt {
+                discr: trust_types::Operand::Copy(trust_types::Place::local(1)),
+                targets: vec![(1, trust_types::BlockId(1))],
+                otherwise: trust_types::BlockId(2),
+                exhaustive_enum_unreachable: false,
+                span: SourceSpan::default(),
+            },
+        ),
+        hb_block(1, trust_types::Terminator::Goto(trust_types::BlockId(0))),
+        hb_block(2, trust_types::Terminator::Return),
+    ];
+
+    let checker = MemoryModelChecker::new(AtomicAccessLog::new(), HappensBefore::new(0));
+    let graph = checker.build_happens_before(&[&func]);
+    let header = ConcurrencyPoint::new(&func.def_path, trust_types::BlockId(0), "main");
+    let loop_body = ConcurrencyPoint::new(&func.def_path, trust_types::BlockId(1), "main");
+    let exit = ConcurrencyPoint::new(&func.def_path, trust_types::BlockId(2), "main");
+
+    assert_eq!(graph.node_count(), 0);
+    assert_eq!(graph.edge_count(), 0);
+    assert!(!graph.are_ordered(&header, &loop_body));
+    assert!(!graph.are_ordered(&loop_body, &exit));
+    assert!(!graph.happens_before(&header, &exit));
+}
+
+#[test]
+fn test_build_happens_before_same_def_path_bodies_do_not_forge_transitive_path() {
+    let mut first = make_spawn_join_function();
+    first.def_path = "test::shared".to_string();
+    first.body.blocks = vec![
+        hb_block(0, trust_types::Terminator::Goto(trust_types::BlockId(1))),
+        hb_block(1, trust_types::Terminator::Return),
+    ];
+    let mut second = first.clone();
+    second.body.blocks = vec![
+        hb_block(1, trust_types::Terminator::Goto(trust_types::BlockId(2))),
+        hb_block(2, trust_types::Terminator::Return),
+    ];
+
+    let checker = MemoryModelChecker::new(AtomicAccessLog::new(), HappensBefore::new(0));
+    let graph = checker.build_happens_before(&[&first, &second]);
+    let first_entry = ConcurrencyPoint::new("test::shared", trust_types::BlockId(0), "main");
+    let second_exit = ConcurrencyPoint::new("test::shared", trust_types::BlockId(2), "main");
+
+    assert_eq!(graph.node_count(), 0);
+    assert_eq!(graph.edge_count(), 0);
+    assert!(!graph.happens_before(&first_entry, &second_exit));
+}
+
+#[test]
+fn test_build_happens_before_single_static_block_is_not_an_event() {
     let func = trust_types::VerifiableFunction {
         name: "empty".to_string(),
         def_path: "test::empty".to_string(),
@@ -2773,6 +3115,7 @@ fn test_build_happens_before_empty_function() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let log = AtomicAccessLog::new();
@@ -2780,29 +3123,29 @@ fn test_build_happens_before_empty_function() {
     let checker = MemoryModelChecker::new(log, hb);
 
     let graph = checker.build_happens_before(&[&func]);
-    assert_eq!(graph.node_count(), 1);
+    let point = ConcurrencyPoint::new("test::empty", trust_types::BlockId(0), "main");
+    assert_eq!(graph.node_count(), 0);
     assert_eq!(graph.edge_count(), 0);
+    assert!(!graph.happens_before(&point, &point));
 }
 
 #[test]
-fn test_build_happens_before_with_release_acquire() {
+fn test_build_happens_before_release_acquire_without_read_from_has_no_sync_edge() {
     let mut log = AtomicAccessLog::new();
     log.record(make_atomic_entry("flag", AccessKind::AtomicWrite(MemoryOrdering::Release), "t1"));
     log.record(make_atomic_entry("flag", AccessKind::AtomicRead(MemoryOrdering::Acquire), "t2"));
+    assert_eq!(log.accesses_to("flag").len(), 2);
 
     let hb = HappensBefore::new(2);
     let checker = MemoryModelChecker::new(log, hb);
 
     let graph = checker.build_happens_before(&[]);
 
-    // Should have release-acquire sync edge
-    assert!(graph.edge_count() >= 1, "should have at least 1 sync edge");
-
-    // Find the release and acquire points and verify HB
     let release = ConcurrencyPoint::new("flag", trust_types::BlockId(0), "t1");
     let acquire = ConcurrencyPoint::new("flag", trust_types::BlockId(1), "t2");
-    assert!(graph.happens_before(&release, &acquire), "release should HB acquire");
-    assert_eq!(graph.edge_kind(&release, &acquire), Some(HappensBeforeEdgeKind::SyncWith));
+    assert_eq!(graph.edge_count(), 0);
+    assert!(!graph.happens_before(&release, &acquire));
+    assert_eq!(graph.edge_kind(&release, &acquire), None);
 }
 
 #[test]
@@ -2827,7 +3170,7 @@ fn test_build_happens_before_fails_closed_on_invalid_release_acquire_evidence() 
 }
 
 #[test]
-fn test_build_happens_before_with_rmw_release_acquire() {
+fn test_build_happens_before_rmw_without_read_from_has_no_sync_edge() {
     let mut log = AtomicAccessLog::new();
     log.record(make_atomic_entry(
         "counter",
@@ -2839,6 +3182,7 @@ fn test_build_happens_before_with_rmw_release_acquire() {
         AccessKind::AtomicRmw(MemoryOrdering::Acquire, AtomicRmwOp::Add),
         "t2",
     ));
+    assert_eq!(log.accesses_to("counter").len(), 2);
 
     let hb = HappensBefore::new(2);
     let checker = MemoryModelChecker::new(log, hb);
@@ -2847,6 +3191,7 @@ fn test_build_happens_before_with_rmw_release_acquire() {
 
     let release = ConcurrencyPoint::new("counter", trust_types::BlockId(0), "t1");
     let acquire = ConcurrencyPoint::new("counter", trust_types::BlockId(1), "t2");
-    assert!(graph.happens_before(&release, &acquire), "RMW release should HB RMW acquire");
-    assert_eq!(graph.edge_kind(&release, &acquire), Some(HappensBeforeEdgeKind::SyncWith));
+    assert_eq!(graph.edge_count(), 0);
+    assert!(!graph.happens_before(&release, &acquire));
+    assert_eq!(graph.edge_kind(&release, &acquire), None);
 }

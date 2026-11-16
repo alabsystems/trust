@@ -32,9 +32,9 @@ status = "accepted_narrow_divergence"
 owner = "@trust-release"
 reason = "RESOLVED to an explicit porter model: the tests/ui vanilla lane is GREEN (21159 passed / 0 failed / 606 ignored, exit 0). Trust's deliberate branding and prose are represented directly in the reviewed in-tree tests/ui expectations; structural/non-branding deviations remain enumerated in tests/upstream-rust/patches.toml. Compiletest only normalizes platform/path classes that the porter does not encode. The in-tree expectation set is therefore an audited Trust adapter, not a pristine upstream mirror."
 issue = "local:reports/2026-07-30-upstream-compat-ledger-audit.md#finding-2--both-issue-anchors-pointed-at-a-path-that-has-never-existed"
-reviewed_on = "2026-07-11"
-expires_on = "2026-10-01"
-note = "2026-07-11 policy reconciliation: porter commit 9d808e84011 moved branded explain hints, ICE notes, and Trust documentation prose into the in-tree UI expectations and removed TRUST_WORDING_NORMALIZATIONS from compiletest. The large expectation rewrite is intentional adapter data, not blind bless output. The upstream Rust baseline remains recoverable from its recorded import commit; Trust release evidence reviews the adapter diff plus patches.toml rather than claiming byte-for-byte-pristine upstream expectations."
+reviewed_on = "2026-09-27"
+expires_on = "2026-11-15"
+note = "2026-07-11 policy reconciliation: porter commit 9d808e84011 moved branded explain hints, ICE notes, and Trust documentation prose into the in-tree UI expectations and removed TRUST_WORDING_NORMALIZATIONS from compiletest. The large expectation rewrite is intentional adapter data, not blind bless output. The upstream Rust baseline remains recoverable from its recorded import commit; Trust release evidence reviews the adapter diff plus patches.toml rather than claiming byte-for-byte-pristine upstream expectations. 2026-09-27 re-review (documentary, no build; a stage2 rebuild at 5ab8dcccfcb held the build lock): the porter model still holds as written — 9d808e84011 is in HEAD, TRUST_WORDING_NORMALIZATIONS is absent from src/tools/compiletest, and the compiletest Trust rules in runtest.rs (a)-(g) are comparison-space folds for classes the porter does not encode; the 28 patches.toml string-replace rows this row relies on were re-reviewed the same day. The 21159/0/606 census is the 2026-07-11 measurement and was NOT re-measured at this review. This row is status accepted_narrow_divergence, which the harness never matches (matching_divergences honours only `active`) and check_ledger_expirations.py does not count, so it waives nothing; it is renewed only as a dated record, on a shortened window, so the census is re-measured on the next stage2 vanilla ui run."
 allowed_exit_codes = [0]
 allowed_patterns = [
     "test result: ok. 21159 passed; 0 failed; 606 ignored; 0 measured; 0 filtered out",
@@ -81,21 +81,21 @@ required_action = "None; retain both focused codegen regressions."
 [[divergences]]
 id = "upstream.trust-compat.2026-05-07.stage-sysroot-skew"
 gate_id = "upstream.trust-compat"
-status = "active"
+status = "retired"
 owner = "@trust-release"
 reason = "NARROWED 2026-08-10 to the rustc_private TOOL builds (rustdoc/parser). The ui-fulldeps half of this row is RETIRED: `94446ac500` fixed the root cause on 2026-07-11 (`-Lall=` not `-Ldependency=`), and a fresh lane on 2026-08-10 ran 76 ui-fulldeps tests with 0 FAILED, its `verify_rustc_private_sysroot_dirs` control firing twice. The tool builds were NOT exercised by that run and remain unmeasured, which is the only reason this row is still active."
 issue = "local:reports/artifacts/2026-08-10-ui-fulldeps-lane.log"
-reviewed_on = "2026-07-11"
+reviewed_on = "2026-09-27"
 expires_on = "2026-10-01"
-note = "2026-07-11 re-review on the rust-1.99 release-evidence run (reports/upstream-rust/2026-07-11-rust199-evidence-a0129195797): the prepared rustc-private-sysroot (build/host/rustc-private-sysroots/ui-fulldeps-*) is assembled INCOHERENTLY — dylib-only, missing librustc_driver, carrying stale artifact hashes that skew against the stage2 compiler — so `extern crate rustc_*` fails E0463 ('can't find crate') / E0460 ('found possibly newer version') across all 71 ui-fulldeps tests plus the rustdoc/parser rustc_private tool builds. This is a HARNESS/bootstrap gap in prepare_rustc_private_sysroot (a fragile Trust-modified bootstrap area per CLAUDE.md), NOT a trustc compiler regression and NOT introduced by the 1.99 migration (this row pre-dates it; no full-proof domination run has ever produced a green fulldeps lane). trustc compiles these tests correctly given a coherent -Ldependency set (verified: force-feeding the exact rustc_macros dylib via --extern advances resolution to the next crate). required_action stands: assemble a coherent stage2-compatible rustc_private sysroot for the fulldeps invocation."
+note = "2026-07-11 re-review on the rust-1.99 release-evidence run (reports/upstream-rust/2026-07-11-rust199-evidence-a0129195797): the prepared rustc-private-sysroot (build/host/rustc-private-sysroots/ui-fulldeps-*) is assembled INCOHERENTLY — dylib-only, missing librustc_driver, carrying stale artifact hashes that skew against the stage2 compiler — so `extern crate rustc_*` fails E0463 ('can't find crate') / E0460 ('found possibly newer version') across all 71 ui-fulldeps tests plus the rustdoc/parser rustc_private tool builds. This is a HARNESS/bootstrap gap in prepare_rustc_private_sysroot (a fragile Trust-modified bootstrap area per CLAUDE.md), NOT a trustc compiler regression and NOT introduced by the 1.99 migration (this row pre-dates it; no full-proof domination run has ever produced a green fulldeps lane). trustc compiles these tests correctly given a coherent -Ldependency set (verified: force-feeding the exact rustc_macros dylib via --extern advances resolution to the next crate). required_action stands: assemble a coherent stage2-compatible rustc_private sysroot for the fulldeps invocation. RETIRED 2026-09-27 at its expiry re-review, NOT renewed (waiver withdrawn, which is the fail-closed direction: a recurrence reports failed_undocumented instead of documented_divergence). Documentary review, no build: (1) the ui-fulldeps half was already retired on the 2026-08-10 measured lane (fdfbfaf5ea8); (2) the rustdoc rustc_private tool half was MEASURED after this row was last reviewed: 7be1f1547ec (2026-08-26, rustdoc shim reads RUSTC_ADDITIONAL_SYSROOT_PATHS) records `x.py test --stage 2 src/librustdoc` rc=0 with E0463/E0460 occurrences 28 -> 0, on top of 681f6f5c0b9 (2026-07-13, CrateRustdoc test step gets the rustc-private-tool sysroot paths); (3) the remaining `parser` tool build names no test, and its only failure evidence is the 2026-07-11 run (reports/upstream-rust/2026-07-11-rust199-evidence-a0129195797, never committed), which predates all three fixes. A row exists to waive a failure; with no failure evidence after the fixes there is nothing to waive, and renewing on documentary review alone would be the stale-renewal pattern fdfbfaf5ea8 retired 71 rows for. The parser half is UNMEASURED, not claimed fixed."
 allowed_exit_codes = [1]
 allowed_patterns = [
     "found possibly newer version of crate",
     "can't find crate for `rustc_",
 ]
 classification = "stage_sysroot_skew"
-compatibility_status = "harness_blocker"
-required_action = "Run the rustdoc/parser rustc_private TOOL builds on a strict stage2 lane and either retire this row or replace it with per-tool entries carrying real diff text. The ui-fulldeps invocation this row also used to cover is fixed and measured; do not re-litigate it."
+compatibility_status = "retired_not_renewed"
+required_action = "None while retired. If the upstream.trust-compat lane shows a rustc_private E0463/E0460 again it now reports failed_undocumented (no waiver): write a NEW per-tool row carrying the failing command, its diff text and the tree it ran on, or fix it. Do not reactivate this row."
 
 [[divergences]]
 id = "upstream.trust-compat.2026-05-07.rustdoc-linkcheck-drift"
@@ -134,11 +134,12 @@ required_action = "None; keep the vanilla run-make lane green. A new run-make na
 [[divergences]]
 id = "verify.precision.2026-07-08.call-havoc-guard-severing"
 gate_id = "verify.precision"
-status = "active"
+status = "accepted_narrow_divergence"
 owner = "@trust-release"
 reason = "SOUNDNESS FIX (callee-write false-accept sweep): a guard read of a pointee (`*r`, `s.v` behind &mut) no longer transfers across ANY Call/Drop/Opaque terminator — the conservative havoc severs guard-to-use fact flow when a call/drop sits between a pointee guard and its arithmetic use, flipping previously-PROVING safe idioms to REFUTE: println!/logging between guard and use, unrelated calls with disjoint arguments, &self getters inside &mut-self methods, provably-disjoint-&mut-arg calls (probes or1_println, or1_unrelated, or2_disjoint, or2_unrelated, or3_self, or3_self_getter, or4_println, or5_div, or7_vec). ACCEPTED per the sacred invariant: the same havoc closes a CONFIRMED silent false-accept (guard `*r < 1000`, callee writes `*r = u32::MAX`, use `*r + 1` verified '1 proved' yet panicking at runtime) plus its method/nested/field/mem-replace/mem-swap/Drop-glue variants. The snapshot idiom (`let n = *r;` before the call) remains a zero-cost sound rewrite and PROVES (or6_snapshot control). SCOPE NARROWED (per-argument havoc refinement, same day): calls whose arguments are ALL constants or copies of pure pointer-free values — and whose function contains no raw-pointer laundering site — no longer sever the guard (or1_unrelated, or2_unrelated, or5_div restored CLEAN). Still severed pending the deeper lanes: pointer-carrying args incl. fmt closures (or1/or4_println), place-level disjoint &mut args (or2_disjoint, or7_vec), and &self getters inside &mut-self methods (or3_self, or3_self_getter)."
 issue = "local:crates/trust-vcgen/src/generate/per_arg_havoc_refinement_tests.rs"
 reviewed_on = "2026-07-08"
+note = "RETIRED 2026-09-14: no gate `verify.precision` has ever existed in the manifest (git log --no-renames -S\"verify.precision|\" is empty), so this row never matched; the accepted precision regression is pinned by crates/trust-vcgen/src/generate/per_arg_havoc_refinement_tests.rs, reached by quick.crates-lib-tests."
 expires_on = "2026-10-08"
 allowed_exit_codes = [1]
 allowed_patterns = [
@@ -192,3 +193,141 @@ required_action = "Precision follow-ups scheduled BEHIND the soundness fix, neve
 # If upstream already reads the way rustc is suggesting, the code is fine and
 # the PIN is stale — and a waiver would suppress the gate for a week over
 # something already fixed.
+
+# RETIRED 2026-09-13: the quarantine
+# "scoped.compiler-check.2026-09-13.stage0-sysroot-rustc-private-ambiguity" is
+# deleted because its SUBJECT DOES NOT REPRODUCE at current main, not because it
+# expired — and the gate itself demanded this: a lane that is GREEN under an
+# active row is a pre-push FAILURE, by design, because a live-looking waiver for
+# a condition that no longer bites is read by the next person as evidence the
+# lane is still broken.
+#
+# MEASURED 2026-09-13 in a worktree at main + one carrier change, with a build
+# tree assembled from scratch that day:
+#
+#   * the AMBIGUITY THE ROW NAMES IS PRESENT. Both candidates exist and their
+#     hashes differ:
+#       build/<host>/stage0-sysroot/lib/rustlib/<host>/lib/librustc_abi-2ac246d09645d15e.rmeta
+#       build/<host>/stage1-rustc-rmeta-artifacts/<host>/librustc_abi-4b7fa33728448d2b.rmeta
+#     so this is not a vacuous green from a tree that lacks the condition.
+#   * `scripts/check_compiler_targets_build.sh` (i.e. `x.py check --stage 1`)
+#     exits 0 in 39m55s — 412 crates, "compiler and its test targets check
+#     clean" — and `src/librustdoc`, the crate the row names, IS among them.
+#     ZERO `E0464` in the whole log.
+#
+# WHAT WAS NOT MEASURED, stated so the next reader does not over-read this: no
+# commit between a34acf1d66 (which filed the row) and 4a8788f30f claims to fix
+# E0464, and none touches src/bootstrap — several metadata/linker fixes landed
+# in that window (ea81d33fca, a1b29ede30, cca5158e56) and one of them is the
+# plausible cause, but that is a conjecture, not a measurement. It is therefore
+# possible the condition is environment-dependent rather than fixed. If it
+# recurs, re-file with the environment named; the report the row cited
+# (reports/2026-09-12-xpy-check-stage1-red-on-main.md) and its proposed fix
+# (make the rustc-private resolution use PrepareRustcRmetaSysroot rather than
+# the raw stage0-sysroot) stand unchanged and are still the right repair.
+
+
+# RETIRED 2026-09-13 (same day it was re-filed): the re-filed quarantine
+# "scoped.compiler-check.2026-09-13.stage0-rustc-private-rmeta-ambiguity-refiled"
+# is deleted because the LANE IS GREEN, and the pre-push hook refuses a green
+# lane under an active row by design — "FAIL: scoped.compiler-check is GREEN but
+# still quarantined."
+#
+# The row was filed honestly: the lane WAS red in this clone, with the same
+# 29-error rustdoc signature, and the retirement note above it had explicitly
+# asked for a re-file with the environment named if the condition recurred. It
+# recurred, it was named, and then it stopped recurring again — which is the
+# third observation of the same thing and settles its character: the E0464 is
+# BUILD-TREE STATE, not source. It appears when a long-lived tree carries two
+# generations of rustc-private rmeta on one search path and disappears when it
+# does not.
+#
+# NOT MEASURED, and stated rather than implied: what made it go green this time
+# was not isolated. Between the red run and the green one this clone rebased onto
+# origin/main (picking up d2769909e7 and others) and completed a full stage2
+# build, either of which could have refreshed the offending directory. Do not
+# read this retirement as evidence that anything fixed it.
+#
+# The repair named by BOTH retirement notes still stands and is still unbuilt:
+# make the rustc-private resolution use PrepareRustcRmetaSysroot INSTEAD OF the
+# raw stage0-sysroot rather than in addition to it — `RUSTC_ADDITIONAL_SYSROOT_PATHS`
+# becomes a plain `-L` alongside the build compiler's own sysroot
+# (src/bootstrap/src/bin/rustc.rs:361), and every Trust stage0 is a full Trust
+# toolchain carrying rustc-private artifacts where upstream's beta stage0 is not.
+# Until that lands, expect this to recur on any clone whose build tree lives long
+# enough, and re-file with the environment named.
+
+# "scoped.compiler-check.2026-09-13.stage0-rustc-private-rmeta-ambiguity-oscillating"
+# is deleted because the hook refuses a green lane under an active row, and the
+# lane is green: `scripts/check_compiler_targets_build.sh` exited 0 in a full
+# pre-push run on 2026-09-13 ("compiler and its test targets check clean",
+# build completed in 0:09:55). This is the same delete-on-green the row's own
+# timeline records, and the row's preamble anticipates it: "expect this to recur
+# on any clone whose build tree lives long enough, and re-file with the
+# environment named."
+#
+# WHAT IS NEW, AND IT NARROWS THE HUNT: the two-generation rmeta condition the
+# row names as the cause IS PRESENT IN THIS TREE RIGHT NOW, and the lane passed
+# anyway. Measured 2026-09-13 on aarch64-apple-darwin:
+#
+#   build/<host>/stage0-sysroot/lib/rustlib/<host>/lib/librustc_abi-b003f6891ee6aa8a.rmeta
+#   build/<host>/stage1-rustc-rmeta-artifacts/<host>/librustc_abi-31844e038d71c805.rmeta
+#
+# — two different hashes for the same crate, 76 rustc-private rmeta files in the
+# stage0-sysroot against 75 in the stage1 artifacts directory. So "a long-lived
+# tree carries two generations" is NECESSARY BUT NOT SUFFICIENT: co-presence
+# alone does not make `x.py check` ambiguous. Whoever takes the named repair
+# should find the additional gate before rebuilding the search path, because a
+# fix aimed at co-presence would be measured against a tree that already has it
+# and reads green either way — this repo's own record of +0 experiments that
+# never fired.
+#
+# Not re-filed rather than fixed: the failure could not be REPRODUCED here to
+# test a repair against. A fix for a defect you cannot currently trigger cannot
+# be verified, and the two candidate shapes in the deleted row (give RmetaSysroot
+# a real sysroot layout and pass --sysroot; or keep rustc-private artifacts out
+# of the stage0-sysroot whole-tree copy at compile.rs ~964) are both bootstrap
+# search-path surgery that a wrong guess would inflict on every clone.
+
+# "fast.bridge-pin.2026-09-14.trust-ir-v41-pin-moved-without-manifest" is deleted
+# because its SUBJECT IS FIXED, not because it expired: the bridge oleans and
+# MANIFEST were regenerated against the trust-ir v41 pin and the clean pin in
+# the SAME commit that moved clean and trust-cg to their mains — the one-commit
+# repair the row's required_action named.
+
+# "constellation.2026-09-20.open-terminal-claim" is deleted because the lane
+# went GREEN, which is the one condition its own required_action named: the
+# 2026-09-21 owner ruling (docs/first-party-pin-ledger.md, amendment block of
+# "TrustWP forward publication policy v2") replaced the v1 terminal claim and
+# the v2 state machine with terminal-policy v3, under which the sideways
+# `9cbcc2cb -> 684821d0` move that opened the claim is an admissible canonical
+# re-anchoring (lock byte-identical, target on trust-wp remote main). Measured
+# on the landing branch with the manifest's exact row: DEPENDENCY CONSTELLATION
+# OK, "9 gitlink move(s) since v1 activation admissible (P2)". Note the row
+# was only ever honoured by the pre-push hook — the harness lists this gate in
+# UNQUARANTINABLE_GATE_IDS — so its deletion changes nothing for the harness.
+
+# "constellation.2026-09-24.clean-references-trust-cg-ahead-of-pin" is deleted
+# because the lane is GREEN on the commit that deletes it, by the second of the
+# two repairs its required_action named: `first-party/clean` moves BACK
+# `b5e462fbe0 -> bf31976f48` (disclosed with a `pin-rollback:` line, so
+# fast.pin-regression passes by disclosure, not suppression). The row
+# understated the red: the checker stops at its first finding, and behind the
+# trust-cg edge clean `b5e462fbe0` ALSO referenced ty `67c94864bb`, ahead of the
+# ty pin `ae009f614e`. The forward repair is not one pin but an epoch —
+# ty `67c94864bb` names trust-cg `dfd31d3024`, which is on no trust-cg `main`,
+# so ty must go to `a5554fc2cb`, whose trust-cg `977de52caf` and trust-ir
+# `4f09dab8a8` force trust-ir to `5f678d28` (the first trust-ir main commit that
+# contains both `4f09dab8a8` and the current pin `cd5fd7f1c6`), with changed
+# Lean sources and so regenerated bridge oleans. That set is measured coherent
+# (0 reference violations) and is the next fleet epoch; it is not this row's
+# repair. As with the 2026-09-20 row, the harness never honoured this row
+# (UNQUARANTINABLE_GATE_IDS), only the pre-push hook did.
+
+# RETIRED 2026-09-30 (same day it was filed): the quarantine
+# "scoped.crates-tests.2026-09-30.trust-clean-int-div-mod-fold" is deleted because
+# the LANE IS GREEN on a push (trust-types + trust-vcgen, 1167s), and the pre-push
+# hook refuses a green lane that is still quarantined. The 13 trust-clean tests it
+# named stay covered one by one in tests/known-red/crates-tests.txt (the ratchet
+# scoped.crates-tests reads), with the same Clean 3809edf31 root cause. The fix
+# is unchanged: Clean's Int.div/Int.mod must fold again.

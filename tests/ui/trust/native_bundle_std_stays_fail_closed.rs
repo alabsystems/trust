@@ -1,10 +1,31 @@
 //@ needs-trust-verify
+//@ revisions: default certify
 //@ compile-flags: -Ztrust-verify=on
+//@[certify] compile-flags: -Ztrust-policy=certify
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: ERROR
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
-//@ check-fail
+//@[default] check-pass
+//@[certify] check-fail
+//! UPDATED 2026-09-14 — policy B as ruled, on the default lane. The rule this
+//! file guards is unchanged: the foreign-body lane must PROVE or DECLINE, never
+//! assume, and none of the callees below has become total. What changed is the
+//! DISPOSITION of a declined row under the default policy: `str::find::<char>` is
+//! a sysroot routine instantiated at foundational types, so its absent-callee row
+//! is a completeness gap with vanilla Rust semantics (std's own defined
+//! behaviour, no user code reachable) and the 2026-07-25 ruling says it is
+//! REPORTED and the build succeeds — `[assert] runtime-checked`, `0 proved`, a
+//! `Level 0 safety verification incomplete` WARNING on `probe_find`. It is not
+//! proved, it is not assumed total, and `-Ztrust-policy=certify` (the `certify`
+//! revision) still refuses it. So the soundness content of this pin now reads:
+//! default = WARN with the row still unproved; certify = ERROR. If `probe_find`
+//! ever compiles under `certify`, or the default lane stops emitting the warning
+//! while claiming `proved`, some callee here became total without an audited
+//! model — read THAT as the soundness regression. (`leading_zeros` and
+//! `saturating_sub` were already green on the default lane before this change,
+//! through audited intrinsic models; the paragraph below predates them.)
+//!
 //! The foreign-body lane must PROVE or DECLINE — never assume.
 //!
 //! This is the guard for `native_trust_ir_monomorphic_foreign_callees`. That
@@ -33,7 +54,9 @@
 //! If this fixture ever starts passing, some callee here became total without an
 //! audited model behind it — read that as a soundness regression, not progress.
 
-pub fn probe_find(s: &str) -> Option<usize> { //~ ERROR Trust strict verification failed
+pub fn probe_find(s: &str) -> Option<usize> {
+    //[default]~^ WARN Trust Level 0 safety verification incomplete
+    //[certify]~^^ ERROR Trust strict verification failed
     s.find('x')
 }
 

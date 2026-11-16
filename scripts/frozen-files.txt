@@ -2,6 +2,10 @@
 #
 # Author: Andrew Yates. Copyright 2026 Andrew Yates. License: Apache-2.0 OR MIT.
 #
+# A citation written `<commit>:<path>` names a record that git keeps at that
+# commit (the 2026-11-09 document cleanup deleted it from the tree); read it with
+# `git show <commit>:<path>`.
+#
 # WHY THIS FILE EXISTS
 # --------------------
 # The differential is the ORACLE: rustc's own freshly-built MIR is what the
@@ -40,31 +44,818 @@
 # with a name on it (scripts/frozen-waivers.txt) instead of into a heuristic
 # nobody audits.
 #
+# Since 2026-09-24 a waiver may also CITE the test that fails if its argument is
+# false (`ENFORCED-BY:`, resolved by the gate; see scripts/frozen-waivers.txt),
+# and flip_registry.rs has a REFINEMENT HARNESS that compiles THE PIN BELOW
+# beside the working tree and checks `current_accepts(x) => pinned_accepts(x)`
+# (crates/trust-thir-lower/src/flip_registry_refinement_tests.rs, fed by the
+# crate's build.rs). Moving that pin re-baselines the harness; if the pinned
+# signature changed, its pinned-side wrapper is updated in the ratifying commit.
+# Ratifying at the WORKING TREE's blob needs no OTHER harness edit: the "refuses
+# more" witness is conditional on the pin differing from the tree (the build
+# script computes `PIN_IS_CURRENT` from the two sections it compiles), and at
+# pinned == current the harness demands the two gates agree instead. The NEXT
+# movement names its lane and witness in the harness's `waived_delta` block.
+# (Corrected 2026-09-28: this paragraph used to say ratifying at the working
+# tree's blob "needs no harness edit" outright. The 2026-09-28 ratification,
+# 771cd9ec -> 2a7207af, crossed the gate's signature change and had to rewrite
+# the pinned wrapper; so does any ratification across a signature the wrapper
+# spells.)
+#
+# Since 2026-09-27 mir_differential.rs has a refinement harness too, fed by the
+# same build.rs table (crates/trust-thir-lower/src/mir_differential_refinement_tests.rs).
+# It compiles THE PIN BELOW beside the working tree and checks, over a corpus of
+# VerifiableBody pairs, that the TyCtxt-free verdict core (canonicalize,
+# canon_markers, the refs guard composed as the pair verdict; canonical_cfg_roles
+# per side, since step 2.5's composition is not in this file) admits nothing the
+# pin refused — and, for the current waiver, is IDENTICAL — plus a CENSUS: the
+# ordered production-token diff pin -> tree must equal the harness's
+# `waived_delta::TEXT_DELTA` exactly, so a movement in a TyCtxt channel the
+# behavioural half cannot see still fails until a waiver names it. Once named it
+# passes: nothing here runs TyCtxt code, so whether a named TyCtxt-side movement
+# is harmless stays the waiver's argument, declared in its PROSE-RESIDUAL clause
+# and counted by the gate (scripts/frozen-waivers.txt). Ratifying at
+# the working tree's blob leaves the census delta empty, and needs no harness
+# edit only while one `observe_wrapper!` serves both sides: a movement that
+# changes a signature the wrapper spells gives the pinned side its own wrapper,
+# and the ratification after it rewrites that one (as flip_registry.rs's did).
+# The NEXT movement writes its own TEXT_DELTA, and clears VERDICT_CORE_IDENTICAL
+# if it refuses more.
+#
 # TO CHANGE A FROZEN FILE
 # -----------------------
 #   1. Make the change and state, in the commit message, which half of the rule
 #      it satisfies and how that was MEASURED (not argued).
 #   2. Add a waiver row to scripts/frozen-waivers.txt naming the file and the
-#      exact NEW blob.
-#   3. The owner ratifies by moving the pin here and DELETING the waiver. The
-#      gate fails on a waiver that is no longer needed, so a waiver cannot
-#      outlive the change it documents.
+#      exact NEW blob, with its `PIN-DELTA: +A/-D` against THE PIN BELOW (not
+#      against the previous waiver; the gate measures it).
+#   3. Ratify by moving the pin here and DELETING the waiver, once a review of
+#      the file's WHOLE movement from the pin finds no hunk that admits more;
+#      where the claim fails, restore the refusal (with a RED/GREEN test) and
+#      pin the corrected blob. The author of the movement does not certify it
+#      alone. The gate fails on a waiver that is no longer needed, so a waiver
+#      cannot outlive the change it documents.
 #
-# Most pins below are the 2026-08-17 freeze baseline (trust 289ba550db), NOT the
-# current tree. crate_module.rs and differential.rs have moved since and still
-# carry waivers; ratifying those commits means moving their pins forward and
-# deleting their waivers, and that remains a decision for the owner, not for the
-# lane that found them.
+# EXACT PRODUCER FEATURE EXCEPTION — 2026-11-06
+# Root independently adjudicated rmeta_entry.rs blob
+# 65d75e5a71ad9b9514517966b61e5352fda2933e:
+# cd8558a1cf:docs/decisions/2026-11-06-official-s-producer-adjudication.md.
+# This adds default-off, unlicensed level-S metadata production; it is not a
+# refuses-more claim or D40 consumer authority. The original 9b08 manifest pin
+# remains, and its exact-blob waiver accounts for the complete +83/-32 movement,
+# including prior schema4. No oracle, admission, proof or validation rule widens.
+# This exception covers only that path/blob; it authorizes no other movement
+# and changes neither the ordinary rules above nor executable freeze checks.
 #
+# EXACT R PROTOCOL EXCEPTION — 2026-11-06
+# Root separately adjudicated rmeta_entry.rs blob
+# 14dc6d4053135949a93464613a38f25e859fc14f:
+# cd8558a1cf:docs/decisions/2026-11-06-r-schema5-adjudication.md. The original 9b08 pin
+# remains; the exact waiver measures +200/-57 and retains the historical
+# schema4/S-producer contracts. Schema5 binds the actual producer mode and
+# whole envelope. It grants no admission or proof authority; canonical native
+# mode-matrix qualification remains explicit. No other blob inherits this
+# exception, and no executable freeze enforcement changes.
+#
+# EXACT BRIDGE SOURCE/PROVENANCE EXCEPTION — 2026-11-06
+# Root independently adjudicated trustir_bridge.rs blob
+# cd9e89e56711d8d737dd560773834037d8e89ce5:
+# cd8558a1cf:docs/decisions/2026-11-06-bridge-source-provenance-adjudication.md.
+# This deliberately accepts different selected revisions only after checking
+# unchanged modeled producer/reader inputs and original artifact provenance.
+# It is not a refuses-more or semantic-proof claim. The original 3f9f230 pin
+# stays; its exact waiver accounts for the complete +132/-29 movement and all
+# earlier input-binding guards. Four new authoritative delegates are pinned
+# below. No other blob, helper edit, proof grade or ordinary rule is excepted.
+#
+# EXACT SCOPED-LAYOUT DATA EXCEPTION — 2026-11-08
+# Independent inherited-source review adjudicates trust-thir-lower/src/lib.rs
+# blob c7b8fce1de9ed541bb5e2b31d53855109aa104fd:
+# cd8558a1cf:docs/decisions/2026-11-08-scoped-layout-context-adjudication.md.
+# Consumer-scoped completed safety facts can widen bounded layout-data capture;
+# this is not byte identity or a refuses-more argument. The original b9c pin
+# remains, with the complete +173/-48 exact-blob waiver and all old contracts.
+# The real live-frame ownership defect is repaired separately and qualified.
+# Source fingerprint changes, existing MIR/CTFE dependence and finite-control
+# residuals stay explicit. No body/admission/proof-grade/NoUB/ABI gate widens.
+# No other blob inherits the exception; executable freeze checks are unchanged.
+#
+# EXACT INDEXED-FIELD COMPOUND LOWERING EXCEPTION — 2026-11-10
+# trust-thir-lower/src/lib.rs blob f73a1fad766cce722b130354dae6b82b66104f83
+# (eb5684db55, DQ THIR-INDEXED-FIELD-COMPOUND-1) adds one early AssignOp route
+# into indexed_field_assignment.rs. It is a bounded direct-THIR lowering
+# capability expansion: `a[i].f op= rhs` on an SSA local array of a registered
+# flat scalar struct now lowers instead of refusing. It is not byte identity or
+# a refuses-more argument. The b9c pin remains, and the exact-blob waiver
+# accounts for the whole +209/-48. The delegate is pinned BYTE-IDENTICAL below
+# at its reviewed blob. No encoder, differential, admission, proven-output,
+# proof-grade or authority rule widens, and no other blob inherits this exception.
+#
+# EXACT LOCATION-RECORD RELOCATION EXCEPTION — 2026-11-12 (PROPOSED, NOT ADJUDICATED)
+# trust-cg-bridge/src/compiled_object.rs blob
+# f573c885e633db0678156468aa1ee5cd294d53b6 carries an ADMISSION (PKG-CP,
+# "part B") in a SAMPLE-MORE-OR-REFUSE-MORE file, merged with main's
+# scheduled-switch reader repair ("part A", EXACT SUPPORT-EXTENSION EXCEPTION
+# below, INC5.4-SCHEDULED-BOUND), which the merge left line for line as it
+# was. Part B is not byte identity, not samples-more and not refuses-more. Its
+# author does not certify it; until an independent reviewer who reads the
+# whole movement from the pin records an acceptance here, this block is a
+# proposal and the merged waiver row is a disclosure. Independent
+# adjudications rejected each of the branch's seventeen earlier blobs; the
+# branch's commit messages give each rejection, the RED tests it committed
+# and the change that answered it, but for the rejection of 958f739b3f,
+# which the merge rewrite answered and merge 85b9e66c53 summarises. This
+# block and the row state the current blob only.
+# Part B newly ACCEPTS, where the pin refused the whole object:
+#   1. In an initialized data section whose every relocation has this shape,
+#      an absolute 64-bit pointer (Mach-O ARM64_RELOC_UNSIGNED of length 3,
+#      ELF R_AARCH64_ABS64), not pc-relative, one per pointer slot of the
+#      covering M_cg global's initializer (a SymbolAddr), against the LOCAL
+#      symbol that is this object's definition, in initialized data, of the
+#      immutable, non-thread-local, uniquely named M_cg global the slot names,
+#      with the initializer's addend where the format keeps it (Mach-O: the
+#      bytes in place; ELF: r_addend over zero bytes), when all of these hold:
+#      a. 0 <= addend < the length of the target's image;
+#      b. the record's own symbol is LOCAL;
+#      c. the record's section and the target's are ordinary data: Mach-O
+#         flags word 0 and `__TEXT,__const`, `__DATA,__const` or
+#         `__DATA,__data`; ELF SHT_PROGBITS with sh_flags exactly SHF_ALLOC or
+#         SHF_ALLOC|SHF_WRITE;
+#      d. the target's section is the read-only one (Mach-O `__TEXT,__const`;
+#         ELF SHF_ALLOC alone);
+#      e. no symbol defined in either section is weak;
+#      f. the file header's flags word holds no bit but
+#         MH_SUBSECTIONS_VIA_SYMBOLS on Mach-O, and is 0 on ELF;
+#     dd. the record's and the target's symbols carry exactly the binding and
+#         visibility `expected_symbol` gives their M_cg linkage and
+#         visibility, so both M_cg globals are internal or private.
+#      A section failing any of these keeps the pin's DataImage refusal and
+#      text ("carries relocations").
+#   2. The image of such a record: an immutable, non-thread-local, uniquely
+#      named M_cg global of repr(packed(1)) struct type whose contiguous
+#      fields are `ptr` (a SymbolAddr) or `[u8; n]` (n raw bytes), at least
+#      one `ptr`.
+# Part B newly REFUSES, for objects the pin parsed (the row names objects
+# under some items the pin refused too, for another reason), with or without
+# a record. At Mach-O parse: (g) a second LC_SYMTAB; (h) a second LC_DYSYMTAB;
+# (i) an ARM64_RELOC_ADDEND entry outside a code section, or a second one
+# before one code relocation; (q) a common symbol (N_UNDF, non-zero
+# n_value); (r) a symbol with N_SYMBOL_RESOLVER; (s) a `__TEXT,__text` the pin
+# took as code (an instruction attribute, not zero-fill) whose flags word is
+# not exactly S_REGULAR|S_ATTR_PURE_INSTRUCTIONS|S_ATTR_SOME_INSTRUCTIONS;
+# (v) a `__TEXT,__text` off a 4-byte address or with align below 2; (z) an
+# external defined symbol without the C prefix `_`; (aa) a cpusubtype other
+# than CPU_SUBTYPE_ARM64_ALL. At ELF parse: (j) a non-SHF_ALLOC SHT_RELA
+# section with any sh_flags bit but SHF_INFO_LINK; (k) a SHT_RELA section
+# whose sh_link is not the symbol table; (l) a second SHT_RELA section for one
+# target; (m) a STT_FILE symbol not LOCAL in SHN_ABS; (n) a STT_SECTION
+# symbol not LOCAL, defined and at value 0; (t) a `.text`/`.text.*` the pin
+# took as code (SHF_ALLOC and SHF_EXECINSTR, not SHF_WRITE) with any other
+# sh_flags bit but SHF_GNU_RETAIN; (w) a `.text`/`.text.*` whose
+# sh_addralign is not a power of two of at least 4; (bb) a symbol on the
+# wrong side of `.symtab`'s sh_info. At bind: (o) a call relocated against a
+# symbol that neither opens a body here nor is a strong external
+# declaration; (p) a body symbol at its section's end (the pin panicked);
+# (x) a code relocation that writes more than 4 bytes; a record pointer slot
+# the object does not relocate. A parse refusal may now come before what was
+# the pin's bind refusal, with its own kind and text; and a data section of
+# admitted-shape relocations whose bytes differ from the image is refused as
+# DataImage naming the global, where the pin said "carries relocations".
+# Part B newly LEAVES OUT of `verified_globals`, with no refusal: (y) a data
+# global in a section with any weak symbol, or not ordinary data or ordinary
+# zero-fill, or in zero-fill without an all-zero image that fits its extent;
+# (cc) a data global whose symbol's binding and visibility differ from
+# `expected_symbol` of its M_cg declaration. Part B newly makes UNKNOWN, with
+# no refusal: (u) an unrelocated `b`/`bl` to another symbol's start in a
+# Mach-O object with MH_SUBSECTIONS_VIA_SYMBOLS set.
+# Every lettered item is stated in full, with its refusal kind, in the merged
+# waiver row; its MUTATION EVIDENCE names the tests that fail with each
+# condition it lists removed, and its PROSE-RESIDUAL what no test reaches. No call_event or verify_output rule changes; a function sited at a
+# record grades Unknown and strict refuses it by policy (true until
+# 2026-11-15: since PKG-C5c S2a, call_event.rs's EXACT DEAD-TAIL-1
+# EXCEPTION below admits a dead sited tail's record pair, so such a function
+# can grade past O1 (s21 at O0 grades [VALIDATED]); verify_output.rs is still
+# unchanged and strict still refuses anything short of [PROVED]). A function in an
+# object the pin refused whole for its record may now be proved and shipped,
+# a function in an object the pin bound may now be refused with its object,
+# and (u) grades Unknown a call the pin paired; the row says how.
+# The original bf45acdd pin REMAINS. The merged exact-blob waiver accounts for
+# the complete +884/-66 movement from the pin: the earlier documentation
+# correction and `all_padding` helper (+22/-3, the pin to 5ca065b997), the
+# rest of part A (the pin to 62627438cf is +63/-19 with them) and part B. No other
+# blob inherits this exception; a further edit to the file needs its own row
+# and its own review. Executable freeze checks are unchanged.
+# AMENDED 2026-11-15 (PKG-C5c S2a, docs/DECISION_QUEUE.md PKG-C5c-DEAD-TAIL-1;
+# ADJUDICATED 2026-11-15, see the end of this paragraph): the current blob is
+# 09cba96fcb0903db866badc3af9771eb785bc867, which is 7ecf9024d8 (f573c885e6
+# plus round 25, the blob the merged row named) plus a RECORD-ONLY increment
+# of +95/-2: FunctionWindow gains `page_halves` (for each reachable
+# instruction whose admitted-kind page relocation the walk consumed with role
+# `address`, a PageHalf of its offset, class, relocation index, kind, target,
+# addend, pc_relative, length, Rd, Rn, in-word immediate, shift and the
+# exact line it put in `unknown`) and `trap_tail` (the trap-tail set the walk
+# already computed for MachineSite::in_trap_tail). The walk's `unknown` text,
+# consumed relocations, sites, refusals and every grade are unchanged: the
+# line is computed once, recorded, then inserted as before. This increment
+# SAMPLES MORE and admits nothing; the admission that reads it is
+# call_event.rs's (EXACT DEAD-TAIL-1 EXCEPTION below). The merged row is
+# re-keyed to 09cba96fcb with PIN-DELTA +983/-68 from bf45acdd08 and keeps
+# every earlier account; its PROSE-RESIDUAL (iv) "nothing outside the tests
+# reads verified_globals" held until this date: call_event.rs's DeadTails
+# now reads it in production (EXACT DEAD-TAIL-1 below).
+# ADJUDICATION 2026-11-15: a reviewer other than the author read blob
+# 09cba96fcb's increment and every consumer of `window.unknown`
+# (direct_ir_observation.rs, cer_memory_machine.rs, compiler_frame_inputs.rs,
+# leaf_call_instance.rs, tail_unwind.rs, call_event.rs). It found the text,
+# order and insertion point of `unknown` unchanged, FunctionWindow with no
+# serde and one literal constructor, and the PIN-DELTA reproduced. It ACCEPTED
+# the increment as SAMPLES MORE, admitting nothing. The two stale earlier
+# sentences it named are qualified above and in the waiver row.
+#
+# EXACT DEAD-TAIL-1 EXCEPTION — 2026-11-15 (ADJUDICATED 2026-11-15 for blob
+# d36a59d6d3; the post-review increment to 2c577f5e83 is disclosed below)
+# trust-cg-bridge/src/call_event.rs blob
+# 2c577f5e83ed467f20cd10c725860c26d979198e (PKG-C5c S2a; docs/DECISION_QUEUE.md
+# PKG-C5c-DEAD-TAIL-1) ADMITS MORE in a SAMPLE-MORE-OR-REFUSE-MORE file; it is
+# not byte identity, samples-more or refuses-more. Its author does not certify
+# it; the ADJUDICATION at the end of this block records the independent
+# review, and what it did not cover.
+# Newly ACCEPTED, where blob 260da39500 graded Unknown:
+#   O1. A function whose only `window.unknown` lines are those of admitted
+#       pairs grades O1 Proven (detail: the walk's text, then "N dead
+#       panic-tail Location pair(s) admitted unexecuted (PKG-C5c S2a)" and
+#       each pair). A pair is admitted when ALL hold: an `adrp` at o and an
+#       `add` (64-bit immediate) at o+4, both in one trap run of
+#       `window.trap_tail`; Mach-O ARM64_RELOC_PAGE21 pcrel length 2 then
+#       ARM64_RELOC_PAGEOFF12 not pcrel length 2, or ELF
+#       R_AARCH64_ADR_PREL_PG_HI21 then R_AARCH64_ADD_ABS_LO12_NC (same flags);
+#       both against one symbol-table entry (never section-relative or
+#       non-extern), addends 0, in-word immediates 0, the `add`'s shift 0,
+#       adrp.Rd == add.Rn; the entry a defined, LOCAL, non-weak Object in
+#       `layout.verified_globals`, named as the uniquely named, immutable,
+#       non-TLS, Internal or Private M_cg global that the PanicLocation::Global
+#       of some sited Assert of this function's own M_cg body names; and the
+#       run whole: the pair the only one of its run, the run holding exactly
+#       one site, a Call naming the PanicSite.entry of an Assert located at
+#       that record (any such Assert), the word after it the run's trap. A run
+#       failing any of these admits none of its pairs (O1 stays Unknown).
+#   O2. A trap-tail site that is the one call of an admitted pair's run: it
+#       enters neither the pairing nor the events. The O2 detail appends
+#       "panic tails at [..] are unreachable wherever the IR returns (O4 reach
+#       + (4b), decided by ay; kernel-checked only at [PROVED]); entry and
+#       Location unverified (PKG-C5c S2)" when O4 is Proven, and otherwise
+#       "panic tails at [..] admitted unexecuted on the condition that O4
+#       reach + (4b) hold, which this certificate does not establish; entry
+#       and Location unverified (PKG-C5c S2)". Every other trap-tail site
+#       keeps blob 260da39500's Unknown text. Because a tail's `bl` is not in
+#       mach_sites, the Inlined route can now be taken for a co-emitted callee
+#       whose `bl` a dead tail still holds (sound: O3/O4 bind the inlined
+#       semantics and the tail is dead wherever O4 holds).
+#   X18. CerExec::trap_tail_writes_x18 reads an admitted `adrp` by its raw Rd
+#       (`word & 0x1f == 18` is an X18 write) instead of decoding it (decode
+#       refuses `adrp`); every other tail word is decoded as before.
+# Soundness rests on O4 reach and (4b), both items of the step-(4)
+# conjunction, decided by ay and kernel-checked only when the function grades
+# [PROVED] (at [VALIDATED], as s21 at O0, on ay's UNSAT alone): CerExec scores a path into a trap tail reach=false, so a tail reached where
+# the IR returns is Refuted at O4, and (4b) refuses a check that can fail on a
+# reached path. The admitted tail is UNCLAIMED: its entry call and Location
+# operand are unverified (S2's P1/P2). The shape conditions above are SCOPE
+# POLICY, not soundness. verify_output.rs is unchanged: its legacy
+# trap_tail_writes_x18/decode_at still refuses a tail `adrp`.
+# The original 90fc6d2ecf pin REMAINS. The re-keyed exact-blob waiver accounts
+# for the complete +2447/-188 movement from the pin (the S2a increment over
+# 260da39500 is +320/-22, its tests in call_event/dead_tail_tests.rs, a new
+# unfrozen file) and keeps every earlier account. Its MUTATION EVIDENCE names
+# the tests that fail with each condition IT LISTS removed. The conditions with
+# no mutant or no separating fixture are named in its PROSE-RESIDUAL. No other
+# blob inherits this exception; a further edit needs its own row and its own
+# review. Executable freeze checks are unchanged.
+# ADJUDICATION 2026-11-15: a reviewer other than the author read blob
+# d36a59d6d3's movement and ACCEPTED the soundness of the admission. Its
+# reasons: CerExec scores entry into any trap-set word reach=false; the
+# executor's trap set equals window.trap_tail (pinned); the O4 item
+# spec_reach AND NOT machine_reach and the (4b) items are both in the
+# conjunction; the tail's contents never matter where the claim applies; the
+# raw-Rd test is exact for ADRP; the live path, the leaf route and the other
+# executors are unaffected or fail closed. The review re-ran the blobs,
+# PIN-DELTAs, ENFORCED-BY names and freeze gate, and found the rows exact. It
+# withheld adjudication until its two text findings were fixed: deadness is
+# "decided by ay; kernel-checked only at [PROVED]", not "kernel-checked"; and
+# the stale LOCATION-RECORD and verified_globals sentences are now qualified.
+# Both are fixed in 2c577f5e83. A second reviewer read the increment
+# d36a59d6d3 -> 2c577f5e83 (+71/-35) and ACCEPTED it: the whole-run rule only
+# drops collected pairs (O1 back to Unknown, the adrp back to the refusing
+# decode), the O2 text is detail that finish does not read, run bounds
+# start..=trap and offset+4 == trap match trap_run, and no partial run is
+# admitted.
+# A second reviewer confirmed the logs, counts and blobs. It found that no
+# test kept O1 Unknown for an admitted pair plus another line, and that the
+# mutation claim overstated the battery. Both are fixed in 2c577f5e83: there
+# is a whole-account test, and the battery was re-run on 2c577f5e83 with the
+# missing conditions added or named.
+# NOT separately reviewed: the increment from d36a59d6d3 to 2c577f5e83. It
+# makes four changes:
+#   (a) the whole-run rule, which REFUSES MORE and moves three former O2
+#       Unknown cells to O1 Unknown;
+#   (b) the conditional O2 text, read after the original-conjunction binding
+#       may reopen O4;
+#   (c) comments;
+#   (d) its tests.
+#
+# EXACT FOREIGN SCALAR PROTOTYPE EXCEPTION — 2026-11-11
+# Decision: docs/DECISION_QUEUE.md FOREIGN-SCALAR-SIGNATURE-1.
+# Independent /root/foreign_abi_independent_review reviewed the COMPLETE
+# manifest-pin-to-candidate movement of the twelve exact blobs below,
+# including earlier waived source/transport/data extensions. Runtime admission
+# expands deliberately; this is not BYTE-IDENTICAL or REFUSES MORE. Original
+# pins remain. Each exact waiver preserves all prior whole-pin accounting and
+# states pure-test versus TyCtxt/native/proof residuals; no ordinary rule,
+# evidence requirement, output policy, grade or default-backend change follows.
+# The source factory rechecks the actual Item/FnAbi, immutable declaration,
+# full concrete key and symbol; the compiler-selected finite scalar C consumer
+# independently reconciles target, modes, widths, extensions and placement.
+# External declarations gain no body, contracts, placement evidence or proof.
+# The three new authoritative delegates are pinned below. This exception
+# applies ONLY to these reviewed path/blob pairs; any edit requires new review.
+# Actual changed compiler/native qualification and land checks remain required.
+# compiler/rustc_codegen_trust_cg/src/lib.rs = 63e87481be0a2c4017a8f07e21a1310c82ae9d6b
+# compiler/rustc_codegen_trust_cg/src/source_abi.rs = 9f41a3f0c5d7b8e53a68a74b189c7231de3f5bc9
+# compiler/rustc_codegen_trust_cg/src/source_abi/module_carrier.rs = 4f4b359fd6f77420dd8c68a312e9fdbca5d42482
+# compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/instance_assembly.rs = 60548f304eb87b8d0094cb5b0619aa85eb8c6f24
+# compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/native_source_module.rs = b69a9a5b23fd919cf4b4d925fab4931978d7927a
+# compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/native_source_module/routing.rs = f44921f1ceea34a3d0b4b74826857ccc89c1b126
+# crates/trust-thir-lower/src/calling_convention.rs = ea1c83dbbc00b9a4b4aef98c954c618df0c1ed3d
+# crates/trust-thir-lower/src/codegen_declarations.rs = 0afaead7d5fdf38536e66fdc1536fc82005d9eaf
+# crates/trust-thir-lower/src/crate_module.rs = 835f28ebc94aa7ae1bb9ce7abf696fddc1542973
+# crates/trust-thir-lower/src/instance_admission.rs = 50cfe9da3f5227dc0053c7121c5bc6df45b1a51a
+# crates/trust-thir-lower/src/lib.rs = 4ee16f5ef135e0c13a43b60046b35c9c772a2c37
+# crates/trust-thir-lower/src/rmeta_entry.rs = 016cb164aa7e9814c8bea173d7bc1e7c85b8e240
+#
+# SCOPE WIDENED 2026-10-01 — one row added by the increment-5 design of record
+# (docs/design/2026-10-01-step2-inc5-real-calls-retarget.md §7, under
+# D30-D32): the call-event refinement gate core
+# is frozen at step 5.2's exit, under the SECOND rule, pinned at the blob it
+# landed with:
+#
+#   trust-cg-bridge call_event.rs  the per-function call-event refinement
+#       verdict: the site decisions (a real call is an event, an IR call with
+#       no machine call is interpreted ONLY when the callee is a non-preemptible
+#       co-emitted body, mixed or duplicated sites are Unknown), the pairing
+#       and its call-order check (a refutation only when every site is
+#       unconditional on both sides), the machine rely at each call, O5's
+#       frame-confinement and escape reading, the conjunction it hands the
+#       kernel, the fold of the six obligations into the verdict, and the
+#       closure. SAMPLE-MORE-OR-REFUSE-MORE: it COMPUTES a verdict, and a
+#       change may widen what is compared or add a refusal, never widen what
+#       is accepted. Its object readers (compiled_object.rs) and the shared
+#       executor pieces it reads (verify_output.rs, verify_output_trust_ir.rs)
+#       are NOT frozen; weakening one is caught by the gate's tests
+#       (crates/trust-cg-bridge/tests/call_event_gate.rs mutation battery,
+#       compiled_object_reader.rs, variadic_split_attacks.rs, abi_guarantee.rs,
+#       f1_compile.rs, pointer_slots.rs), which the row `slow.trust-cg-cer-gate`
+#       (tests/run_trust_comprehensive_harness.sh, profiles slow,release; step
+#       5.4.1, INC5.4-CER-LANE) runs. No push lane runs them. The bridge's
+#       shipping consumer (src/f1_compile.rs) exists from step 5.4.1, and an
+#       object ships through the gate only behind `-Ztrust-cg-f1-backend=compiler`
+#       (step 5.4.2: rustc_codegen_trust_cg lib.rs `codegen_crate_via_compiler_lane`,
+#       the opt-in compiler lane; the default `lir` lane never calls it).
+#
+# SCOPE WIDENED 2026-10-01 — one row added at landing by the manifest's own rule
+# (step 2 increment 4b; docs/design/2026-09-29-step2-inc4-drops.md §3.5, "drop_oracle.rs
+# computes an oracle verdict, so under the manifest's own rule it joins the frozen set at
+# landing as SAMPLE-MORE-OR-REFUSE-MORE (D17 precedent). That is a ratifying pin move, not a
+# new decision"):
+#
+#   trust-thir-lower drop_oracle.rs  THE DROP ORACLE: rustc's own drop elaboration
+#       (MoveData + MaybeInitializedPlaces/MaybeUninitializedPlaces + drop_style, configured
+#       as ElaborateDrops) run on the built MIR, the cleaning that mirrors the passes between
+#       mir_built and ElaborateDrops, the open-drop expansion, and the identity a MIR drop is
+#       named by. The effect-conservation gate's drop leg compares the producer's drops with
+#       it (a missing drop abstracted(drop), an extra one not-conserved(drop)) and refuses the
+#       body for codegen and strict, and the frozen crate_module.rs admits Inst::Drop only
+#       because that comparison exists (D18 OD-1). A change that makes it report
+#       FEWER live drops, or a drop live where rustc keeps it, or misnames one, weakens that
+#       comparison: the row's rule is that a change may only report MORE (or refuse the body
+#       with None). Pinned at the blob it lands with; nothing reviewed it but its author.
+#       effect_conservation.rs originally landed unfrozen; the 2026-11-05 scope below
+#       begins its exact 2b941 baseline and accounts for the new location-exact store
+#       capability. The producer side (drops.rs) stays NOT frozen.
+#
+# SCOPE WIDENED 2026-10-02 — two rows added at landing by the manifest's own rule
+# (step 2 increment 4c, drop glue as trust-ir; docs/design/2026-09-29-step2-inc4-drops.md
+# §4.4: "The glue lane computes a splice decision ... so its file joins the frozen set by the
+# manifest's rule, as D17 ruled for instance_assembly.rs"; D18 OD-2:
+# synthesized glue splices under D17's rule, structural checks plus the test-oracle
+# differential with no per-instance MIR seam differential yet (a defect, not policy: docs/PLAN.md
+# PKG-V5), and the glue lane's file joins the frozen set). Both rows are pinned at the blobs
+# they landed with; nothing reviewed them but their author:
+#
+#   rustc_codegen_trust_cg trust_ir_frontend/drop_glue_lane.rs  THE GLUE LANE: its condition
+#       (the session's output-gate policy is the strict one, `instance_assembly::
+#       strict_gate_from`, D17's condition for a body with no source), the type each
+#       `Inst::Drop` drops (the producer's DropSite for its pointer, recovered from the body's
+#       typeck results by `type_id_hash`) and the glue instance that is, which glue bodies
+#       enter the module (the destructor only as an ADMITTED handoff body of a monomorphic
+#       local `Drop` impl, every child glue admitted by the lane, work-list agreement with the
+#       collector's local glue items, a slice's fat pointer only over a type row the module
+#       already has), the rewrite all-or-nothing per function, the stripping of a function
+#       whose drops do not resolve and the refusal of every item that reaches it, and the
+#       POSTCONDITION on the resolved module (no `Inst::Drop` survives, every rewritten call
+#       names `symbol_name(resolve_drop_glue(T))` under the lane's body gate, the tables are
+#       the base's, the finalize validator accepts it). FROZEN under the first rule
+#       (BYTE-IDENTICAL): it COMPUTES the splice decision.
+#   trust-thir-lower drop_glue_oracle.rs  THE GLUE ORACLE: rustc's own drop shim
+#       (`instance_mir(Shim(DropGlue(T)))`) walked along its normal path as events (the
+#       destructor call, each `Drop` of a field place by its path and the child's glue, the
+#       array shim's slice-glue call, the slice shim's element loop), the multiset and
+#       per-variant-order comparison with the producer's plan, and the EXECUTED comparison
+#       (the synthesized glue run by trust-ir's reference interpreter, per inhabited variant,
+#       on rustc's own `tag_for_variant` tag, its calls recorded by a host model and required
+#       to equal the shim's events at rustc's offsets). SAMPLE-MORE-OR-REFUSE-MORE: it
+#       COMPUTES an oracle verdict; a change may compare more or refuse more, never report an
+#       agreement it did not measure.
+#
+#   RESIDUAL unfrozen inputs of these two rows (removing one fails CLOSED; WEAKENING one is
+#   the residual). NO push lane runs any of the tests named; `slow.compiler-unit-tests` runs
+#   them at stage 1 (the trust-thir-lower suite, the rustc_codegen_trust_cg ratchet, the
+#   trust-cg run-make fixtures):
+#     * the glue PRODUCER, `crates/trust-thir-lower/src/drop_glue.rs` (the plan from rustc's
+#       layout and `Drop` impls, the synthesis, the rewrite primitive and the postcondition
+#       scan): the producer under test, NOT frozen, judged by the oracle above over the corpus
+#       of run-make trust-cg-f1-drop-glue (channel C's `glue=` column; every local-closed row
+#       `match`) and exercised pure by drop_glue/tests.rs (the synthesized body EXECUTED by
+#       the reference interpreter per tag, the rewrite all-or-nothing, the postcondition);
+#     * the producer's DROP SITES (drops.rs `record_drop_site`, carried by
+#       effect_conservation.rs `drop_sites_for_codegen` for CONSERVED bodies only): a missing
+#       or unmatched site, or a hash no typeck type has, refuses the function
+#       (`[malformed-producer-module]`); exercised by run-make trust-cg-f1-drop-glue's resolved
+#       subjects (a wrong site names a wrong glue, which the postcondition's name check does
+#       not catch when both glues exist — that is the residual);
+#     * the trust-cg frontend's ROUTING: a drop-glue item takes its IR from
+#       `GlueLane::glue_item`, every other item from `Plan::source`, and the one
+#       `lower_from_module` call resolves through `GlueLane::resolve_for`; nothing else
+#       calls `synthesize_glue`, `rewrite_drops` or `glue_plan`: exercised by
+#       rustc_codegen_trust_cg tests.rs
+#       `every_planned_item_takes_its_ir_from_the_plan_and_nothing_else_calls_the_producer`.
+#       INTERIM (step 2 increment 5, until 5.4.4): on the opt-in compiler lane
+#       (`-Ztrust-cg-f1-backend=compiler`) `select_for_codegen_module` refuses every
+#       drop-glue item by name (D31(a), INC5.4-GLUE) and resolves no drop (trust-cg's
+#       adapter refuses an unresolved `Drop` by name); the same test pins that route;
+#     * the per-function disclosure of glue rows (trust_ir_frontend.rs `glue_coverage_rows`,
+#       read off what LOWERED, and lib.rs `disclose_instance_coverage`, which is fatal on a
+#       glue row under a non-strict policy): exercised by run-make trust-cg-f1-drop-glue;
+#     * first-party/trust-ir's reference interpreter and `HostCalls` (the oracle's executor),
+#       `function_dependencies` (the lane's reach), `validate_module`: gitlink-pinned.
+#   The pinned trust-ir contains the v55 drop-glue table (amendment D Part 1, D20);
+#   the lane registers no row: it keeps rewriting drops into direct calls (rule S3 refuses a
+#   direct call of registered glue). Stopping the rewrite and registering every glue body
+#   instead is a waiver of drop_glue_lane.rs. (Restated by step 2 increment 4d.0a, 2026-10-08
+#   and 2026-10-13, without the pin's current wire version, which every pin train moves;
+#   drop_glue_lane.rs's own module doc still says "pin is v47" until its next re-freeze, 4d.5.)
+#
+# SCOPE WIDENED 2026-09-29 — two rows added by D17 (docs/DECISION_QUEUE.md D17).
+# First, the opt-in trust-ir codegen frontend may splice a GENERIC instance's
+# body on the instance lane's structural admission plus the strict output gate,
+# disclosed per function; no per-instance MIR seam differential runs for it yet:
+# a defect, not policy (docs/PLAN.md PKG-V5; the owner, 2026-11-09: "we want
+# verification on and for it to work."). Second, the file that computes that
+# splice decision joins this manifest under the first FROZEN rule. Both rows are
+# pinned at the blobs they landed with (step 2 increment 3 of
+# cd8558a1cf:docs/plans/2026-09-29-trust-ir-sole-compile-path.md):
+#
+#   rustc_codegen_trust_cg trust_ir_frontend/instance_assembly.rs  the lane
+#       predicate (`plan`/`lane_for`), the Instance-keyed slots (`slot_for`: a
+#       monomorphic callee with no handoff body is refused, never re-lowered;
+#       a foreign or self-recursive callee is refused; a generic body only when
+#       the SESSION's output-gate policy is strict, read by `strict_gate_from`,
+#       which the emission path calls too), the plan's selection bound to the
+#       instance asked for (`Plan::source`), the admission token each producer
+#       body must carry for its own instance and the CONTENT names (the body and
+#       every declaration named by the link-time symbol of the instance it stands
+#       for, on both the append and the relink path), the splice preconditions
+#       (every table, the instruction set the handoff splice models), the
+#       per-edge signature check, the RELINK equality with its
+#       declaration-identity check (the definition always; the instance when the
+#       analysis-time name carries a concrete key) and its postcondition, and the
+#       whole-module tripwires on the codegen module (`tables_unchanged`, the
+#       finalize validator, body gates). FROZEN under the first rule: it
+#       COMPUTES the splice decision.
+#   trust-thir-lower instance_admission.rs  the instance-keyed producer's WHOLE
+#       THIR route (`admit_instance_body`: entry refusals, the lowering on a
+#       lane only this file can make, which starts UNREPORTED and reads as a
+#       residual until the lowering reports, the post-lowering gate in full over
+#       an exhaustive read of `Lowered` in which every field is classified and
+#       whatever can leave a placeholder for a real value GATES -- since
+#       2026-10-01 the tag-free opaque collapse and any `undef` in the body
+#       (docs/KNOWN_HAZARDS.md, OPEN 2026-10-01, abstraction lanes), the
+#       symbol and calling-convention
+#       stamps, the callee declarations with every `Item` record RE-DERIVED from
+#       its RAW call site and every edge's records required to agree
+#       (`decide_edge`), the self-contained check, standalone validation and
+#       fn-pointer freedom), the READ-ONLY `InstanceBody`/`InstanceCallee`
+#       carriers (no public field) and the `Admitted` token (minted only by the
+#       gate), the leaf-callee drop check and the `undef` scan the assembler
+#       also runs on a leaf, the finalize validator the assembler
+#       runs, and the identity of an analysis-time declaration. FROZEN under the
+#       DELEGATE half of the first rule ("a frozen gate delegates its decision to
+#       it and does not re-derive the answer"): instance_assembly.rs delegates
+#       admission to it and does not re-derive it, and D17 removes, for generic
+#       bodies, the oracle that the NOT-producer rule relies on. trust-thir-lower's
+#       lib.rs keeps the lowering (the producer under test) and a dispatch that can
+#       refuse but cannot build or change a body; it stays NOT frozen.
+#
+#   RESIDUAL unfrozen inputs of these two rows. Removing any of them fails CLOSED;
+#   WEAKENING one is the residual. Each cites the test that EXERCISES it, and the
+#   lane that runs it; a frozen-side unit test that only pins what the frozen
+#   file then does is labelled "pins the consequence". NO push lane runs any of
+#   them: `slow.compiler-unit-tests` (scripts/check_compiler_unit_tests.sh) runs
+#   trust-thir-lower's suite, the rustc_codegen_trust_cg ratchet and the trust-cg
+#   run-make fixtures at STAGE 1 whenever the backend, a crate it depends on
+#   (trust-thir-lower, trust-mir-extract, trust-cg-bridge, trust-ir-bridge,
+#   trust-types), the first-party/trust-ir or first-party/trust-cg gitlink, or a
+#   fixture changes, and it is green only when EVERY fixture PASSED (an ignored
+#   fixture, e.g. `//@ only-aarch64` on another host, is "nothing judged").
+#   `suite.run-make` is stage 2, has never run, and ignores every trust-*
+#   fixture. By hand: `./x.py test tests/run-make --stage 1 --test-args trust-cg
+#   --force-rerun` (and `trust-instance`, `trust-ir-emit`).
+#     * the LOWERING itself (`lower_module_inner` and everything under it), with
+#       the flags it reports about itself in `Lowered` -- `unsupported`,
+#       `pending_consts`, `symbolic`, `opaque_collapse`, the union and
+#       enum-param lanes, `fnptr_adapter`, `place_path_carrier`,
+#       `zst_closure_arg`, `coroutine_frame_ptr`, `body_kind`: under D17 NO
+#       oracle checks them.
+#       Exercised by run-make trust-cg-f1-generic-instance-differential (F1 vs
+#       LLVM executed on the corpus) and trust-cg-f1-generic-instance's
+#       PendingConsts and opaque-collapse refusal rows (the only rows that
+#       exercise a flag's setter); its drop-bearing and closure rows pin the
+#       consequence (frozen checks). NO
+#       row exercises the setters of `symbolic`, the union/enum-param lanes,
+#       `fnptr_adapter`, `place_path_carrier`, `zst_closure_arg`,
+#       `coroutine_frame_ptr`, `body_kind` or `unsupported`; that is what "no
+#       oracle checks them" concedes. Lane: slow.compiler-unit-tests stage-1
+#       run-make;
+#     * the lowering's REPORT (`lane.report(..)` at the end of lib.rs
+#       `lower_module_inner`) and the tripwire VALUES it reports
+#       (`LowerCx::mono_residual`, `param_arm_hits`, the callee records):
+#       exercised by lib.rs `the_lane_starts_unreported_and_only_the_lowering_reports_it`
+#       (trust-thir-lower suite) and every admitting row of run-make
+#       trust-cg-f1-generic-instance; instance_admission/tests.rs
+#       `an_unreported_lane_refuses_the_instance` pins the consequence;
+#     * the RAW CALL SITE each edge is recorded with (lib.rs `resolve_callee`,
+#       `resolve_fn_trait_callee`, `resolve_rust_call_user_impl` and the reify
+#       site, via `raw_callee_site`): exercised by lib.rs
+#       `the_callee_identity_is_monomorphized_before_it_is_read` and
+#       `the_callee_instance_is_recorded_with_its_site_and_re_derived`
+#       (trust-thir-lower suite). The rawness needle covers `resolve_callee`'s
+#       capture only; the raw site threaded into `resolve_fn_trait_callee`,
+#       `resolve_rust_call_user_impl` and `admit_callee_site`, and the reify
+#       site's own capture, are unpinned and today unreachable for admission (a
+#       rust-call user-impl edge is refused [unsupported-abi], a reify edge fails
+#       fn-pointer freedom). run-make trust-cg-f1-generic-instance
+#       `intrinsic_callee_is_not_an_item` (in1.rs) pins that a site is RECORDED
+#       AND RE-DERIVED, not that it is raw; instance_admission/tests.rs
+#       `an_edge_is_admitted_only_as_the_pair_its_site_resolves_to` pins the
+#       consequence;
+#     * the trust-cg frontend's ROUTING: every non-upstream item's IR comes from
+#       `Plan::source` (since step 2 increment 4c, every non-upstream item but a drop-glue
+#       item under the strict gate, which the frozen drop_glue_lane.rs answers; see that
+#       row), and nothing outside instance_assembly.rs calls
+#       `trust_ir_of_instance_body` (and `trust_ir_of_instance` no longer exists: 4d.0a
+#       deleted it and `trust_ir_of_instance_explained`, 2026-10-08)
+#       on the codegen path: exercised by rustc_codegen_trust_cg tests.rs
+#       `every_planned_item_takes_its_ir_from_the_plan_and_nothing_else_calls_the_producer`
+#       (the rustc_codegen_trust_cg ratchet). INTERIM (step 2 increment 5, until 5.4.4,
+#       which freezes the compiler lane's consumer): the opt-in compiler lane selects
+#       every item through `select_for_codegen_module` (trust_ir_frontend.rs), in
+#       `lower_instance`'s order with ONE `Plan::source`, and lowers nothing; the same
+#       test pins the order and that neither it nor `codegen_module.rs` lowers;
+#     * first-party/trust-ir as used here (gitlink-pinned, moved only through
+#       docs/first-party-pin-ledger.md): the `function_dependencies` census that
+#       the edge whitelist, fn-pointer freedom, self-containment and the
+#       postcondition read, `trust_ir_build::validate_module`, and the Module
+#       mechanics `add_function` / `intern_func_type`: the census is exercised by
+#       first-party/trust-ir `crates/trust-ir/tests/function_dependencies.rs`,
+#       which runs only in the sibling's own checks (by hand or `pub check` there),
+#       never in a lane of this repository; a trust-ir pin move re-judges this
+#       side through slow.compiler-unit-tests (the gitlink selects the ratchet and
+#       the stage-1 run-make); instance_assembly/tests.rs pins the consequence;
+#     * the CONSUMER TAIL after `Plan::source`: `lower_from_module`'s rename-only
+#       clone of the planned module (trust_ir_frontend.rs), the
+#       `OutputGateMode::Strict => EmitPolicy::StrictProvenOnly` mapping
+#       (rustc_codegen_trust_cg lib.rs) with `trust_cg_bridge::verify_output_trust_ir`
+#       behind it, and the per-function disclosure writer (`instance_coverage`,
+#       `disclose_instance_coverage`): exercised by run-make
+#       trust-cg-f1-generic-instance-differential (an edited clone prints other
+#       than LLVM), trust-cg-abi-extension-refusal row (4c) (a [VALIDATED] body
+#       must be refused under strict, so a weakened mapping ships it and the row
+#       fails), and trust-cg-f1-generic-instance SUBJECT A's coverage needles plus
+#       `coverage_artifact_lifecycle`; lane: slow.compiler-unit-tests stage-1
+#       run-make (a trust-cg-bridge change selects it). INTERIM (step 2 increment 5,
+#       until 5.4.4 freezes it, INC5.4-FREEZE): on the opt-in compiler lane the tail is
+#       `trust_ir_frontend/codegen_module.rs` (pure; M_cg, S and P, rules 1-13) over
+#       `abi_shape.rs`, then `trust_cg_bridge::f1_compile` under `f1_emit_policy`, whose
+#       one shipping decision is `CerReport::ships`, and the certificates and residue
+#       writers (`write_trust_cg_certificates`, `disclose_instance_coverage`): exercised
+#       by codegen_module/tests.rs, tests.rs `compiler_lane_ships_only_through_cer_ships`
+#       and `f1_emit_policy_agrees_with_both_old_sites`, run-make
+#       trust-cg-f1-real-calls, -certificates-compose, -census-complete,
+#       -inventory-residue, the compiler-lane legs of
+#       trust-cg-f1-generic-instance-differential, trust-cg-abi-extension-refusal row (4c)
+#       and trust-cg-f1-c-callee-abi, and harness row `slow.trust-cg-cer-gate`;
+#     * the handoff's leaf selection
+#       (`AssembledCrateModuleForCodegen::exact_instance_body` -> `exact_body` /
+#       `lookup_exact` in lib.rs, keyed by the frozen lineage.rs), through which a
+#       monomorphic LEAF callee is linked without re-lowering: exercised by
+#       run-make trust-cg-f1-generic-instance SUBJECT B (`pick::<u8>`/`pick::<u16>`
+#       link the leaves `<u8 as Tag>::tag`/`<u16 as Tag>::tag`; a wrong or
+#       missing leaf prints other than 24 or refuses);
+#     * INHERITED from the handoff lane, not a removable input: a LEAF callee's
+#       handoff body is linked without re-lowering, and the handoff does not
+#       carry `Lowered::opaque_collapse` (the frozen crate_module.rs discards
+#       it), so an opaque collapse that leaves no `undef` in a leaf (a field
+#       store that stores nothing, or only an `Option` discriminant) is linked
+#       unseen -- docs/KNOWN_HAZARDS.md, OPEN 2026-10-01, abstraction lanes;
+#       the leaf's drops (`instance_drop_refusal`) and any `undef` in it
+#       (`function_has_undef_placeholder`) ARE checked (run-make
+#       trust-cg-f1-generic-instance contrasts (10) and (14)), and every body the lane
+#       lowers (appended generic, relinked guest) passes the opaque-collapse
+#       gate. Closed only by a tag per abstraction lane (docs/DECISION_QUEUE.md
+#       D28);
+#     * `trust_thir_lower::encode_site_args`, from which
+#       `declaration_names_instance` recomputes a concrete key (an unencodable
+#       key refuses the relink): exercised by run-make
+#       trust-cg-f1-generic-instance SUBJECT A (`f` is RELINKED);
+#       instance_admission/tests.rs
+#       `a_declaration_name_is_matched_by_path_definition_and_concrete_key` pins
+#       the consequence.
+#     * EFFECT CONSERVATION (D28, landed on main 2026-10-01 by another session): the handoff
+#       withdraws every body whose trust-ir lost an effect of its MIR or abstracts a value
+#       (`exact_body` -> `NotConserved` / `ConservationUnchecked`), and the instance lane links
+#       every MONOMORPHIC body through that same lookup, so a withdrawn body is refused here as
+#       `[effect-not-conserved]`. An APPENDED generic body is NOT compared with its instance MIR
+#       (D17: no per-instance MIR comparison): its value abstractions are refused by the
+#       admission gate (opaque collapse, undef, drop-bearing), but a LOST effect (call, store,
+#       panic check, asm) in it is caught only by the D17 differential corpus
+#       (trust-cg-f1-generic-instance-differential); lane: slow.compiler-unit-tests stage-1
+#       run-make.
+#     Unfrozen inputs whose removal fails CLOSED or only leaves D17's scope, so
+#     they are listed, not cited: the reentrancy guards (`LOWERING_BODIES`,
+#     `would_reenter_lowering`; removing one turns a reentrant call into an E0391
+#     cycle), the clean-origin registry (`tcx.resolutions(()).clean_origin_defs`),
+#     `routes_to_upstream_mir_lane` (it only diverts an item to the upstream lane,
+#     outside D17), and the handoff storage (`assembled_module` / `checked` in
+#     lib.rs), which the frozen relink and leaf checks re-derive against.
+#       Neither file's tests (instance_assembly/tests.rs, instance_admission/
+#       tests.rs) is frozen, by the tests rule.
+#
+# SCOPE WIDENED 2026-09-28 — thirteen rows added, each pinned at the blob it has
+# at origin/main 133ac62ec5. The ratification review
+# (reports/2026-09-28-freeze-ratification-review.md, "Open, recorded and not
+# changed here") found that refusal and assembly logic had moved out of
+# crate_module.rs into files this manifest did not name, so a later edit to any
+# of them was invisible to the freeze. The rule for what was added:
+#
+#   FROZEN   a file that COMPUTES a splice, verdict or flip decision -- the
+#            predicate's body lives there, or a frozen gate delegates its
+#            decision to it and does not re-derive the answer;
+#   FROZEN   the one rustc hook whose Trust content is the oracle's wiring
+#            (rustc_mir_build builder/mod.rs: it picks the oracle's reference
+#            MIR, gates record_green on DerivedAgreed, and hands the flip gate
+#            the markers_exact bit that record_green trusts as given);
+#   NOT      the producer under test (trust-thir-lower lib.rs, to_mir.rs): the
+#            oracle judges its output; freezing it would freeze the thing the
+#            oracle exists to check;
+#   NOT      a file that only CALLS a frozen decision, or whose Trust content is
+#            mostly unrelated (rustc_mir_transform lib.rs, rustc_codegen_ssa
+#            mir/mod.rs, rustc_mir_build lib.rs): pinning a busy multipurpose
+#            file makes the gate fire on unrelated work, which trains waivers.
+#            The flip-path lines they do carry are listed in the ruling's
+#            report as residuals to move into a frozen file;
+#   NOT      tests, observers and probes that refuse nothing and admit nothing
+#            (crate_module/scalar_correspondence.rs "zero-authority observer",
+#            instance_probe.rs "measurement only", finalization_probe.rs "can
+#            only make a build FAIL", generated_coroutine.rs "no ... flip ...
+#            is minted", contract_disclosure.rs, artifact_publication.rs).
+#
+# Four rows are the moved logic the review named. Their blobs are identical at
+# the review's base 2b05b645a1, at the ratified 155d985ac9 and here, so their
+# content is the content the review judged together with crate_module.rs:
+#
+#   crate_module/static_globals.rs  SpliceRefusal::StaticGlobalOrigin
+#       (validate_origins) and static-identity interning, whose conflict poisons
+#       and withholds every claimant body.
+#   tuple_layout.rs                 SpliceRefusal::TupleLayout (merge refuses a
+#       conflicting, untargeted or unremappable tuple layout).
+#   uniform_array_spelling.rs       respells every constant array of the
+#       assembled module inside assemble, BEFORE the seam differential reads it:
+#       a change here changes what the oracle compares.
+#   direct_obligations.rs           inventory_errors_at_tier, the fatal
+#       finalization tripwire (formerly crate_module's
+#       direct_authority_inventory_errors, moved verbatim), and
+#       install_direct_obligations.
+#
+# Nine rows came out of the audit. Their content was NOT reviewed by the
+# ratification; the pin freezes movement from here and certifies nothing
+# about what is already there:
+#
+#   remap_certificate.rs            SpliceRefusal::RemapCertificate
+#       (certify_remap_shape, called from assemble's pass 1).
+#   lineage.rs                      body_lineage_digest and DefinitionIdentity:
+#       green_body refuses a body with no digest, SourceHeaderCorrespondence
+#       authenticates by it, and crate_module's (DefIndex, DefinitionIdentity)
+#       handoff and ConcreteCalleeKey rendering choose which assembled function
+#       a caller or consumer selects.
+#   source_provenance.rs            validated_source_provenance, to which the
+#       frozen flip gate source_place_provenance_allows_flip delegates, and
+#       authenticate_source_header_correspondence, step (2.5) of the frozen
+#       mir_differential verdict path.
+#   clean_origin_join.rs            the pass-3 writer and its link refusals;
+#       crate_module.rs says so of itself ("the pass-3 writer and its guards live
+#       in clean_origin_join; this frozen file only plumbs").
+#   flip.rs                         derive_flip_body's gates: def-level,
+#       const-trap, structural fragment, ABI-visible type equality, and
+#       assert-parity stitching.
+#   instance_flip.rs                the per-instance flip registry
+#       (record_green_instance), body_lane_gates_allow_instance_flip, and the
+#       per-instance re-minting of the verdict.
+#   rustc_mir_transform trust_ir_flip.rs  try_flip / try_flip_ctfe: the
+#       session gate, the CTFE taint guard and const-context partition, and the
+#       PromoteTemps and phase refusals of advance_built_to_runtime.
+#   rustc_mir_transform trust_instance_flip.rs  the instance installation
+#       refusals: incumbent instantiation, pipeline, item_refs_contained and
+#       param_attrs_agree.
+#   rustc_mir_build builder/mod.rs  see the second FROZEN rule above.
+#
+# RATIFIED 2026-09-30 — four pins moved, every waiver row of the F2-F4 soundness branch
+# (sound/frozen-refuse-more) retired. Each file's WHOLE movement pin -> blob was
+# reviewed adversarially over four rounds against "REFUSES MORE and admits nothing
+# new": round 1 confirmed six defects; rounds 2-3 confirmed three; the final
+# review confirmed none, and every candidate was refuted by at least two of its
+# three lenses. Each confirmed defect was closed with a RED/GREEN test before
+# the next round. The
+# refinement harnesses now compare pin == tree.
+#
+#   mir_differential.rs  852d4507 -> dfa53041 (+311/-4)  F3. markers_exact was
+#       equality up to an unconstrained local bijection; every marker line now
+#       carries its local's complete access list (and, for a borrowed local, every
+#       access through a pointer), both sides pass rustc's -Zlint-mir storage rule,
+#       and compare_derived applies that rule to the real derived mir::Body too.
+#       REFUSES MORE at the -O bit only. Witnesses, incl. one only the access list
+#       refuses, and an access-blind mutant in the harness.
+#   flip_registry.rs     2a7207af -> 53da2f13 (+81/-7)  F4. The -O0 marker
+#       exemption requires that RemoveStorageMarkers provably runs (its is_enabled
+#       under the -Zmir-enable-passes override), that no -Zmir-opt-bisect-limit is
+#       set, and that the CTFE seam does not install the body (try_flip_ctfe's own
+#       admission: const/static initializers and #[rustc_comptime] fns). The
+#       encodability refusal of round 2 was removed by ruling; the debuginfo limit
+#       is stated in docs/KNOWN_HAZARDS.md and tracked in
+#       cd8558a1cf:docs/issues/2026-09-30-flip-debuginfo-is-not-in-the-differential.md.
+#   flip.rs              34098243 -> 3a06a9af (+15/-0)  F2. derive_flip_body
+#       refuses a body whose spread_arg differs from built's (an extern
+#       "rust-call" user impl ICEd codegen on a valid program).
+#   instance_flip.rs     3d60cf2e -> 01a7a251 (+6/-0)  F2, instance lane:
+#       derive_instance_flip_body applies the same spread_arg refusal.
+#
+# RATIFIED 2026-09-28 — all four pins moved, every waiver row retired. Each
+# file's WHOLE movement pin -> waived
+# blob was diffed and adversarially reviewed against "REFUSES MORE / SAMPLES MORE
+# and admits nothing new"; where the claim FAILED the refusal was restored with a
+# RED/GREEN test and the CORRECTED blob is what is pinned. Full record, per
+# finding, with evidence: reports/2026-09-28-freeze-ratification-review.md.
+#
+#   mir_differential.rs  13cd4f25 -> 852d4507  RATIFIED as waived. Only TyCtxt-side
+#       tokens moved (the dump filter under with_no_trimmed_paths!, three allow
+#       attributes, one uncalled fn); the verdict path is untouched.
+#   flip_registry.rs     771cd9ec -> 2a7207af  RATIFIED as waived. REFUSES MORE:
+#       the lane-gate token (and its by-address per-body refusal in green_body),
+#       and the wave-MR mut_reborrows conjunct. The refinement harness's pinned
+#       wrapper moves to the token shape in the same commit.
+#   crate_module.rs      135ad7b0 -> e2216c17  FIXED, then ratified. The claim
+#       FAILED at the waived blob c1bc5aed in four places, each restored:
+#       R2 exempted producer-witnessed layout-less signatures (881a7e964a; six
+#       bodies the pin refused were spliced, the evidence decided outside the
+#       oracle); fnptr_target_sig_ok admitted a forced concrete edge before any
+#       comparison (W1, 8932acd798); global_const_ok and def_field_ok admitted
+#       zero-length arrays of non-scalar elements the pin refused (9fd4ebe513,
+#       ed1dc9a2df); decl_ret answered a fn-pointer RETURN through the new param
+#       map, silencing call_result_arity_incoherent (5e29156632).
+#   differential.rs      3652c58c -> dda61d28  FIXED, then ratified. The write-
+#       chain fold collapsed a list uniform only UP TO SPELLING into one Splat
+#       (db547a7256), a normalization that can hide an ill-typed write; it now
+#       collapses only a bit-exact uniform list and refuses the rest. The GEP
+#       "pointer family" of a private slot (same commit) is SAMPLE-MORE, sound on
+#       the interpreter's per-allocation GEP, and is now pinned by escape tests.
+#
+
 # RATIFIED 2026-08-27 (second, same day) — crate_module.rs re-pinned
 # (a05d9b54 -> 135ad7b0, one movement: the IR-5 link-call plumbing), its
-# waiver deleted per step 3. Owner-directed ("almost certainly unfreeze")
-# after reviewing the movement's content in-session; the adjudication text
+# waiver deleted per step 3. Ratified after the movement's content was
+# reviewed in-session; the adjudication text
 # travels in git history on the deleted waiver row. BASELINE UPDATE only.
 # RATIFIED 2026-08-27 — crate_module.rs re-pinned (266c373c -> a05d9b54, four
 # adjudicated movements) and differential.rs re-pinned (2149e954 -> 3652c58c,
-# six adjudicated movements), their waivers deleted per step 3 above. The owner
-# surfaced-and-directed on 2026-08-27 ("go address these things") after the
+# six adjudicated movements), their waivers deleted per step 3 above. They were
+# re-pinned on 2026-08-27 after the
 # pending stack was reported; the adjudication texts travel in git history on
 # the deleted waiver rows (scripts/frozen-waivers.txt at 1a85766a548 and
 # earlier). BASELINE UPDATE, not a rule change: both rules stand unchanged.
@@ -94,8 +885,8 @@
 #
 # RATIFIED 2026-08-27 — crate_module.rs re-pinned (266c373c -> a05d9b54, four
 # adjudicated movements) and differential.rs re-pinned (2149e954 -> 3652c58c,
-# six adjudicated movements), their waivers deleted per step 3 above. The owner
-# surfaced-and-directed on 2026-08-27 ("go address these things") after the
+# six adjudicated movements), their waivers deleted per step 3 above. They were
+# re-pinned on 2026-08-27 after the
 # pending stack was reported; the adjudication texts travel in git history on
 # the deleted waiver rows (scripts/frozen-waivers.txt at 1a85766a548 and
 # earlier). BASELINE UPDATE, not a rule change: both rules stand unchanged.
@@ -161,7 +952,258 @@
 # strict proof-checker boundary and absence of a corpus-output claim, is in
 # reports/freeze-adjudication-2026-08-21-tailcall.md.
 
-crates/trust-thir-lower/src/mir_differential.rs|13cd4f258683fdede1877d194d674910fb6366a9|BYTE-IDENTICAL|differential B: producer trust-ir -> to_mir derived MIR vs rustc-built MIR; the SOLE writer path to record_green -> try_flip
-crates/trust-thir-lower/src/flip_registry.rs|771cd9ec0b53cb98c342f16beb5fd35cdb015cc9|BYTE-IDENTICAL|the flip gate itself (markers_exact + DerivedAgreed); a relaxation here ships wrong code
-crates/trust-thir-lower/src/crate_module.rs|135ad7b0131242ee1067160ddd4dfa314603dd07|BYTE-IDENTICAL|hosts run_seam_differentials, the crate-finalize comparison site, and splice_ok
-crates/trust-thir-lower/src/differential.rs|3652c58c420ab065a071ee64f8f93ef81f09901a|SAMPLE-MORE-OR-REFUSE-MORE|the interpretation differential: sampled THIR-trust-ir vs MIR-trust-ir equivalence
+crates/trust-thir-lower/src/mir_differential.rs|f9a17f0fd9f4d36681fa2d0ed407570695e5a61a|BYTE-IDENTICAL|differential B: producer trust-ir -> to_mir derived MIR vs rustc-built MIR; the SOLE writer path to record_green -> try_flip
+crates/trust-thir-lower/src/flip_registry.rs|53da2f13d0bf9db7ff2cd18fbfd54e1a44c676a9|BYTE-IDENTICAL|the flip gate itself (markers_exact + DerivedAgreed); a relaxation here ships wrong code
+crates/trust-thir-lower/src/crate_module.rs|e2216c1754101ea9a21a2b35aa2ecde47de11510|BYTE-IDENTICAL|hosts run_seam_differentials, the crate-finalize comparison site, and splice_ok
+crates/trust-thir-lower/src/crate_module/zero_array_struct.rs|360fa3fc8914b115e8265634ac72c8e61e0ef3a0|BYTE-IDENTICAL|crate_module delegates its exact earlier registered-struct zero-array dependency bound to element_bound; declaration validation and the cycle-checked remap remain at the caller
+crates/trust-thir-lower/src/differential.rs|dda61d2863c927a4d11addf6c89ff7bdf95e5461|SAMPLE-MORE-OR-REFUSE-MORE|the interpretation differential: sampled THIR-trust-ir vs MIR-trust-ir equivalence
+crates/trust-thir-lower/src/crate_module/static_globals.rs|79c16b1417619f8f4db1f9483373813da7ed4395|BYTE-IDENTICAL|moved out of crate_module.rs: SpliceRefusal::StaticGlobalOrigin (validate_origins) and static-identity interning that poisons and withholds every conflicting claimant
+crates/trust-thir-lower/src/tuple_layout.rs|aab2447fe8504605e397423cc9184ee7dfd782a4|BYTE-IDENTICAL|moved out of crate_module.rs: SpliceRefusal::TupleLayout (merge refuses a conflicting, untargeted or unremappable tuple layout)
+crates/trust-thir-lower/src/uniform_array_spelling.rs|1e3255d1651f6054f22e02c65733bc03ff9b89b2|BYTE-IDENTICAL|moved out of crate_module.rs: respells the assembled module's constant arrays inside assemble, before the seam differential compares it
+crates/trust-thir-lower/src/direct_obligations.rs|bdc5729a6fa679be16bf6470ca522657f99c8740|BYTE-IDENTICAL|moved out of crate_module.rs: inventory_errors_at_tier (the fatal direct-authority finalization tripwire, moved verbatim) and install_direct_obligations
+crates/trust-thir-lower/src/remap_certificate.rs|e5b0c72dacf626acf41615d96ceb608befe220b4|BYTE-IDENTICAL|SpliceRefusal::RemapCertificate: certify_remap_shape refuses a remapped body whose shape drifted from the mini-module the flip compiled
+crates/trust-thir-lower/src/lineage.rs|d148e26f5e4910c49da7158b751df33b5fc8b675|BYTE-IDENTICAL|the identity the frozen gates bind by: green_body refuses a digest-less body, SourceHeaderCorrespondence authenticates by body_lineage_digest, and assembly selects functions by DefinitionIdentity/ConcreteCalleeKey
+crates/trust-thir-lower/src/source_provenance.rs|5d63bfe18b88537eb2531785d29b8238e254922f|BYTE-IDENTICAL|frozen gates delegate here: validated_source_provenance (flip_registry's provenance flip gate) and authenticate_source_header_correspondence (mir_differential step 2.5)
+crates/trust-thir-lower/src/clean_origin_join.rs|9fa5d5261bc459c64bb727d2aac77db6642dfad0|BYTE-IDENTICAL|the assembled module's pass-3 callee writer and its link refusals, which crate_module.rs only plumbs
+crates/trust-thir-lower/src/flip.rs|3a06a9afb5ce67c9ed4b0320421cdf4521f78ddf|BYTE-IDENTICAL|derive_flip_body: the def-level, const-trap, structural-fragment, ABI-type and assert-parity gates every codegen/CTFE flip passes
+crates/trust-thir-lower/src/instance_flip.rs|01a7a251cab07345aae7d82f3842e9c4384b2730|BYTE-IDENTICAL|the per-instance flip registry and its gates (record_green_instance, body_lane_gates_allow_instance_flip, per-instance verdict re-minting)
+compiler/rustc_mir_transform/src/trust_ir_flip.rs|aef29fc7dad206e3a9e4c53252dc9eb2a08b0b4c|BYTE-IDENTICAL|try_flip / try_flip_ctfe: installs a derived body only past the session gate, the CTFE taint and const-context gates, and the PromoteTemps and phase refusals
+compiler/rustc_mir_transform/src/trust_instance_flip.rs|12304f26d146234111368d5cabee84b2a0550e06|BYTE-IDENTICAL|installs a per-instance derived body only past the incumbent, pipeline, item_refs_contained and param_attrs_agree refusals
+compiler/rustc_mir_build/src/builder/mod.rs|b7f1d03504551123563c43eea73739205f975285|BYTE-IDENTICAL|the mir_built hook: picks the oracle's reference MIR, gates record_green on DerivedAgreed, and supplies the markers_exact bit the flip gate trusts as given
+compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/instance_assembly.rs|bd31e9422eff3cbf39273efeb3f80a5bc3dcf2a4|BYTE-IDENTICAL|the instance lane's splice decision (D17): lane predicate (a generic body only when the session's gate policy is strict, one strict_gate_from shared with emission), Instance-keyed slots, the plan bound to the instance asked for, the admission token and content names, splice preconditions, the leaf-callee drop and undef checks, per-edge signature check, relink equality and declaration identity, and the codegen module's table/validator/body-gate tripwires
+compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/instance_assembly/closure_source.rs|311ecca4619903598cd3b727f0a26a699194616d|BYTE-IDENTICAL|delegated typed FnOnce source-handoff authentication: exact source identity/license, environment/call signature, observed frame and no module mutation
+crates/trust-thir-lower/src/instance_admission.rs|921d3b380365fe280ffdd957673429233b4e4ff4|BYTE-IDENTICAL|the instance-keyed producer's whole THIR route and admission (D17, delegate rule): admit_instance_body in order, the fail-closed lane, mono_thir_result_admits in full and its Admitted token (every Lowered field classified; the opaque-collapse and undef placeholder gates), read-only InstanceBody/InstanceCallee, callee edges re-derived from raw call sites and required to agree, declaration signatures, self-contained check and standalone validation, fn-pointer freedom, the leaf undef scan, the finalize validator, declaration identity
+crates/trust-cg-bridge/src/call_event.rs|90fc6d2ecf7211ac9c81f306de5e13286e6a02cb|SAMPLE-MORE-OR-REFUSE-MORE|the call-event refinement verdict (increment 5 step 5.2, design §5/§7, D30-D32): site decisions, pairing and call order, the machine rely, O5, the kernel conjunction, the obligation fold and the closure
+crates/trust-thir-lower/src/drop_oracle.rs|97f5abc99befee1201215e35a2e1463481877c5e|SAMPLE-MORE-OR-REFUSE-MORE|the drop oracle (step 2 inc 4b): rustc's ElaborateDrops dataflow on the built MIR, against which the effect-conservation gate checks every producer drop (D18 OD-1)
+compiler/rustc_codegen_trust_cg/src/source_abi.rs|26edf46cc8be560e7bc9570cb73a45cc7053d1ec|BYTE-IDENTICAL|source-only native ABI admission: exact rustc instance/target/convention/ArgAbi, thin references, argument-only C byte extension, observed FnOnce transport and accurate optional placement; legacy bridge guards unchanged
+compiler/rustc_codegen_trust_cg/src/source_abi/agreement.rs|860c26dfc777cf9f72d55f2a53d3180594c6e04a|BYTE-IDENTICAL|delegated pure native ABI agreement: exact source capture/frame image, scalar/pair register-word agreement, no extension or layout synthesis and no proof authority
+compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/drop_glue_lane.rs|c29307757de94c6dbd2070b636fadaac484cd39c|BYTE-IDENTICAL|the drop-glue lane's splice decision (step 2 inc 4c, D18 OD-2 under D17): the strict-gate condition, each drop's type and glue, which glue enters the module (admitted local destructor, admitted children, work-list agreement), the all-or-nothing rewrite, stripping, and the postcondition (no Inst::Drop survives, rewritten calls named by resolve_drop_glue, tables unchanged, the finalize validator)
+crates/trust-thir-lower/src/drop_glue_oracle.rs|dd6037b0f5812b092443333b4de614cd653c90d7|SAMPLE-MORE-OR-REFUSE-MORE|the drop-glue oracle (step 2 inc 4c): rustc's drop shim MIR as events against the synthesized glue's plan, and the synthesized glue executed by the reference interpreter per variant at rustc's tag_for_variant
+crates/trust-thir-lower/src/direct_definition_map.rs|10de91e6fd4f3e3dccc07e3d8ebbb64f995c76f0|BYTE-IDENTICAL|the immutable pass1 local-definition to published-function association delegated by frozen crate_module; malformed assignments withdraw every association before effect conservation can join a body
+crates/trust-thir-lower/src/effect_conservation/closure_adapters.rs|5030804a2de3849a5165cedd356c13f19d965b50|BYTE-IDENTICAL|typed adapter conservation delegated by the effect-conservation context: exact protocol, validated source prefix, conserved owner and target, declared frame, separate derived disclosure; no synthetic MIR or source verdict
+
+compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/native_source_module.rs|4b316b042c644ba668f7fe8d6b70e3e4e0f5bcb8|BYTE-IDENTICAL|native source body admission and exact handoff/conservation binding, complete function dependency identity checks and their negative controls
+compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/native_source_module/routing.rs|82e4cb15eb962cf73a8a07821d90ec0911114287|BYTE-IDENTICAL|native source route selection: exact source-only primitive image, unchanged reachable-closure routing and retained legacy pruning/eligibility; no ABI or proof authority
+
+compiler/rustc_codegen_trust_cg/src/source_abi/module_carrier.rs|73ee8eed3454873deaf5851314aaeac79c9fe1e9|BYTE-IDENTICAL|delegated source ABI module classification: exact module identity and witnesses for every aggregate body/signature; only checked codegen target policy changes
+
+crates/trust-cg-bridge/src/call_event/aggregate_values.rs|c18eefc51f035199d144e8cc028046c8ae173795|SAMPLE-MORE-OR-REFUSE-MORE|CER spec-side register aggregates (DECISION_QUEUE AGG-SSA-1): integer lanes (at most 64, at most 64 bits; no pointer, bool, char, 128-bit, float or nested lane) for Tuple, Struct, Array and Enum values built by Const/Insert* and read by Extract* at literal in-range indices, enum tag and active-variant payload, exact-type block-edge binding, and the literal-selector Switch target; no memory, call, return, side-condition, solver or kernel authority
+crates/trust-cg-bridge/src/call_event/closed_branch.rs|4500687627d05007b4926f1e4b03858cb1fb2170|SAMPLE-MORE-OR-REFUSE-MORE|CER step (5) closed-branch kernel retry (DECISION_QUEUE AGG-SSA-2): folds Ites with ground conditions and one-sort arms to the selected arm, then x - 0 to x and ite(p,1,0) != 0 to p, each condition and identity instance a kernel-proved side condition; runs only when an item does not lower and the folded goal does; KernelRecheckableWithSideConditions or nothing, never Refuted or Unknown
+crates/trust-cg-bridge/src/call_event/closure_values.rs|ba2906434710f957f3042df850ff78da2e7c099b|SAMPLE-MORE-OR-REFUSE-MORE|CER logical closure value translation and independent observed-frame scalar/pair classifier; exact nominal/capture types and known versus opaque identity; direct edges restricted to the same producer and non-preemptible exact body; no memory or closure application authority
+crates/trust-cg-bridge/src/call_event/source_memory.rs|970f636f7b56ae9654559788edb58d26ec192cb6|SAMPLE-MORE-OR-REFUSE-MORE|CER source byte-state and typed Arg/capture provenance helper; pending access/exit/call memory cannot bypass the mandatory Unknown integration boundary; no frame, alias, O6 or kernel authority
+
+compiler/rustc_codegen_trust_cg/src/native_source_residue.rs|90e1be9069dac9ea02b8808f7d08e667ee0e010e|BYTE-IDENTICAL|recover only the exact session source instance from handoff and actual HIR/typeck arguments, region-only nongeneric parents and source symbol identity; no MIR lowering or synthetic arguments
+
+compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/native_source_module/adapter_placement.rs|ef51f56925759860aefd2797e56c1b36ad7b23cb|BYTE-IDENTICAL|compiler-defined typed adapter placement: exact conserved handoff and canonical protocol, independently selected source owner/body, primitive flat AArch64 ABI and actual source-body return/frame cross-check; no rustc instance or source coverage identity
+crates/trust-cg-bridge/src/call_event/abi_extensions.rs|0de9fa045130156c3e095fc17c72d63d546b21bb|SAMPLE-MORE-OR-REFUSE-MORE|Darwin C-u8 physical extension authority: exact target/CC/P, legal entry domain, W32 call/return contract, fresh unspecified padding and tail refusal; no memory or grade bypass
+crates/trust-cg-bridge/src/cer_memory_machine.rs|31a47af9c637ec60b20ee587c6dffb14182f7317|SAMPLE-MORE-OR-REFUSE-MORE|Pending actual-object CER memory auditor and diagnostic publication; exact raw binding/complete effect lists, distinct normal/tail exits and explicit incompleteness; no grade or completeness authority
+
+crates/trust-cg-bridge/src/pc_object_model.rs|584db22db34243768e6e0d5a3e1a6ba37858d122|SAMPLE-MORE-OR-REFUSE-MORE|CER object-only instruction model admission: runtime-placement address-data refusal shared by ordinary and trap-tail effects readers; relative CFG matching grants no target/site authority
+crates/trust-cg-bridge/src/call_event/leaf_memory.rs|d86ee98b83e6c2a2ef7d94ca4d778128a0512283|SAMPLE-MORE-OR-REFUSE-MORE|Sealed actual linear source/executor memory evidence, exact empty-frame effects and original ABI/scalar/full-array/query/source-byte joint-kernel consumer; no completeness flag or admission outside the private fully checked bounded leaf
+crates/trust-cg-bridge/src/original_conjunction_certificate.rs|fc280d522b5135510f3de9f2e34bc19ff21e94b2|SAMPLE-MORE-OR-REFUSE-MORE|Retained original CIC checked-wrapper boundary, actual original proof capture/typed context/environment replay, exact report transport refusal and one independent kernel check; wire data and labels cannot grant proof authority
+crates/trust-cg-bridge/src/original_conjunction_certificate/subject.rs|2bb3480f23069db820f1d6fd6db1a932d37d6268|SAMPLE-MORE-OR-REFUSE-MORE|Fresh actual object/module/symbol/body/P/relocation and object-layout subject binding for original retained CIC replay; no wire-supplied expected certificate
+crates/trust-cg-bridge/src/original_conjunction_certificate/terms.rs|84bd93070070542d35832f5b46b48ed0d7c08cd0|SAMPLE-MORE-OR-REFUSE-MORE|Bounded exact Name/universe/App/BVar/Lam/Pi transport with binder scope and DAG budgets; restoration grants no verdict and retained proof must typecheck in independently rebuilt actual environment
+crates/trust-cg-bridge/src/original_conjunction_certificate/call_instance.rs|1817a1d0294d879a4b41aca221e40d42be1836d6|SAMPLE-MORE-OR-REFUSE-MORE|Checked retained original proof specialization: total typed role map, exact closed data constants, original bindings/fullQ, independent goal/context/env and one kernel check; no producer/solver/caller grade authority
+crates/trust-cg-bridge/src/call_event/leaf_call_instance.rs|1f0275fab91124eeac31a0fa55dbd432fab31b56|SAMPLE-MORE-OR-REFUSE-MORE|Actual checked leaf provider and complete typed-source/full-effect empty-frame Tail site binding; all original ABI/M3/array/query equations remain, ordinary caller Unknown/rely untouched and no grade from wire/count/diagnostic
+# EXACT SUPPORT-EXTENSION EXCEPTION: only crates/trust-cg-bridge/src/compiled_object.rs at blob62627438cf6d7cd559b2d68ee1ce4e75a0a9f2c2, under docs/DECISION_QUEUE.md INC5.4-SCHEDULED-BOUND and the coordinating Root agent's independent whole-original-pin source review of that exact blob. This newly supported scheduled-load structural shape is NOT ordinary SAMPLE-MORE/REFUSES-MORE compliance; the original bf45 pin, full prior waiver, +63/-19 accounting and executable identity checks remain. It grants no proof, Strict or P authority and creates no exception for any other path/blob/movement. Actual focused qualification is separate.
+# MERGED (2026-11-12): blob f573c885e633db0678156468aa1ee5cd294d53b6 carries this movement line for line
+# unchanged, merged with the PKG-CP location-record admission (EXACT
+# LOCATION-RECORD RELOCATION EXCEPTION above, PROPOSED); its waiver row
+# quotes this blob's row verbatim as part A. This note grants part B nothing.
+crates/trust-cg-bridge/src/compiled_object.rs|bf45acdd08c10ec8df324e51f20a74c61f70fa37|SAMPLE-MORE-OR-REFUSE-MORE|Shared actual object-to-function/site/relocation admission, including canonical Mach-O BR26 raw operands; this reader binds bytes to source callees before proof use
+crates/trust-cg-bridge/src/verify_output.rs|abe0f5444ce7df6b71e68576a8e40306a7474b46|SAMPLE-MORE-OR-REFUSE-MORE|Legacy MIR/TrustIR proof-output reader and actual instruction/relocation model admission; canonical BR26 operands and sticky repeated-offset relocation refusal before effects
+
+crates/trust-cg-bridge/src/call_event/compact_unwind.rs|a4e3df4e47cde66cd95b0cd34f0b56e7cc182bec|SAMPLE-MORE-OR-REFUSE-MORE|Complete actual Mach-O ZERO-FRAME record/relocation/population binding and sealed every-prefix raw-register recovery with retained original Clean proofs; optional packet budget cannot change function grades; no authority from wire/labels/counts/intent
+
+# SCOPE WIDENED 2026-11-05: location-exact D28 store conservation. The actual
+# consumer and complete evidence encoder begin at the exact pre-change 2b941
+# baseline; their explicit capability waivers account for the WHOLE movement.
+# This does not ratify previously unfrozen history. Delegated new code is pinned
+# at its first reviewed implementation; no standalone helper substitutes for
+# protecting the real admission consumer.
+crates/trust-thir-lower/src/effect_conservation.rs|ff1e8e22b219d1840e2c72c72c292e32b6313c70|BYTE-IDENTICAL|actual D28 admission and abstraction consumer; retain every effect, exact source fact, call/drop authority and refusal
+crates/trust-thir-lower/src/rmeta_entry.rs|9b08ea280fbabc41bc12c62d66912a917b2deea4|BYTE-IDENTICAL|complete retained D28 evidence and fail-closed versioned entry/evidence codec
+crates/trust-thir-lower/src/effect_conservation/exact_store.rs|fb8aabf1e1d55b46988f5836f40e316722deca7e|BYTE-IDENTICAL|exact argument ordinal only under equal parameter counts; no legacy pooling
+crates/trust-thir-lower/src/effect_conservation/store_root_facts.rs|01a73ea078d0fe5a59fe5e540f278717d9db8457|BYTE-IDENTICAL|actual MIR location adapter, real CFG and conservative moves/definitions/exposed storage
+crates/trust-thir-lower/src/effect_conservation/store_root_facts/core.rs|33a43207b2504ba9b66ee6c59da0b64274c4ef64|BYTE-IDENTICAL|independent reaching-copy fixed point; unknown joins, strong updates and malformed-input refusal
+crates/trust-cg-bridge/src/call_event/leaf_call_instance/transition.rs|b7c7d06c2a636718ac646a4173514bc0098e1d13|SAMPLE-MORE-OR-REFUSE-MORE|Actual full source/machine empty-frame Tail caller goal reconstruction, exact expected-goal retained-proof reuse, actual subject/packet replay and scoped post-M5 admission; no unwind/call-free capability or grade from diagnostics
+crates/trust-cg-bridge/src/call_event/leaf_call_instance/tail_unwind.rs|3f211b7423c4ace9009dadc049396c47bddd4a2e|SAMPLE-MORE-OR-REFUSE-MORE|Distinct sealed actual Tail PRE-state recovery capability; exact actual source/ABI/P/object/target/relocation census; metadata only, never ordinary execution/function grade
+crates/trust-clean/src/trustir_bridge.rs|3f9f230aca64145d987b49476ee22db76fddff2f|SAMPLE-MORE-OR-REFUSE-MORE|Verified package input authority: exact typed module/physical-path/captured-byte binding, actual complete module inventory and imported-TCB limits; no shadow, companion, cache or old-environment authority
+crates/trust-clean/src/trustir_bridge/manifest_inputs.rs|3ebe1cbd98ae41d5c0230600c84cf0ba804d4c4d|SAMPLE-MORE-OR-REFUSE-MORE|Typed manifest-selected module input plan and pre-read/post-capture authentication; fresh context and exact bytes/all optional IR input presence, no loader fallback or proof grade authority
+crates/trust-clean/src/trustir_bridge/unsigned_mul.rs|2378ae9ee000cfaf98ecc732fa5ba7afb153e812|SAMPLE-MORE-OR-REFUSE-MORE|Overflow layer of run_bridge_gate moved out of trustir_bridge.rs by 0e2d53b07e: threshold prelude, VALUE/FLAG arms, the twelve-way composition and its four unsigned-Mul Int predicate links, and the qualified semantic forgery probes; pinned so the moved oracle code stays frozen (ORACLE-FREEZE-MOVES-20261110)
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection.rs|668fdf7e8e15490ee648b7b682e9b0d8c4b6e4fa|SAMPLE-MORE-OR-REFUSE-MORE|Original typed scalar/byte-array CIC renderer and replay goal: exact complete input operands/widths/names/binders; faithful bounded sign-extension semantic terms, no normalization/axiom/grade authority
+
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/scalar_bits.rs|790ff7b85bf33c9a02a77bf583d89815d9218bfe|SAMPLE-MORE-OR-REFUSE-MORE|Checked original scalar bit/Boolean proof construction and versioned faithful rendering; all original widths, operands, context and full-kernel goal remain mandatory
+crates/trust-cg-bridge/src/verify_output_instantiate/strength.rs|6bccce1b02c5ef77df6bcf3edc5bb5cc4189ea87|SAMPLE-MORE-OR-REFUSE-MORE|O(1) strength-reduced-multiply route (DECISION_QUEUE STRENGTH-1): the Trust.BVS rewrite theorems and their statements, the audited strength_base (every cited theorem proved with empty domain and foundational axiom closure, Err kept for the process), admit_obligation (the discharge declared as a Theorem and admitted only when its transitive axiom closure is BVC_LEAFBIT_* Bool leaves), the step guards and MAX_REWRITES
+crates/trust-cg-bridge/src/verify_output_instantiate/bv_value.rs|d3109e5a1239b6c22ef940a915968bedf727f240|SAMPLE-MORE-OR-REFUSE-MORE|O(1) strength-reduced-multiply route (DECISION_QUEUE STRENGTH-1): the Trust.BVV value theory under the Trust.BVS theorems (btn, order, div/mod, powers of two, addRecM/bvMul/natToBv/append values, inj) and its audited name list; every statement a Declaration::Theorem checked by add_decl
+
+# EXACT LOCAL-ATTRIBUTE REFUSAL — 2026-11-06
+# Root reviewed rmeta_entry.rs blob 8ba97c2c73536070edc113fd6c52b1fde0ee52ff;
+# cd8558a1cf:docs/decisions/2026-11-06-inherited-overflow-metadata.md. Both R/S writers
+# refuse this unexported local attribute before framing. Original9b08 pin
+# remains; full waiver +224/-57 preserves all predecessor contracts and
+# citations. No wire/default/runtime admission/proof-grade rule widens.
+
+# 2026-11-06: exact upstream R importer and complete direct reader delegates.
+# Compile/local controls are not source refinement or canonical machine evidence.
+compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/upstream_entry.rs|4c676f090d20dc2aa7c629b1b4241ad9d9d26752|BYTE-IDENTICAL|Actual-session strict R admission, independent Rust owner/nested identity, exact signature/ABI, original/rebound conservation and sealed own-instance token
+crates/trust-thir-lower/src/effect_conservation/retained.rs|dcda93a23f74f0bbff59199ba2f2a9ac0417ca48|BYTE-IDENTICAL|Decoded retained effect/drop/value-abstraction judgement and dense actual Rust callee ledger; source custody remains P-TIR
+crates/trust-thir-lower/src/metadata_site.rs|1f7595b289d3927e1ba2768a43b747a88b7af112|BYTE-IDENTICAL|Complete bounded legacy callee parser and actual resolved-instance canonical equality; no caller-supplied resolver at admission
+crates/trust-thir-lower/src/metadata_site/resolve.rs|6fefe51fe44109026754a37eb3e342b6df808422|BYTE-IDENTICAL|Actual Rust metadata kinds, positional type/const arguments, substituted trait projection populations and concrete Item resolution
+# EXACT D17 PARENT-WIRING EXCEPTION: only crates/trust-thir-lower/src/lib.rs at blob79378fd84279e73dff35cd053c7de0c844499edc, under docs/DECISION_QUEUE.md D17 and independent coordinating Root review of this complete original-pin movement. The increment over the fully accounted prior blob4ee16f5ef135e0c13a43b60046b35c9c772a2c37 is solely the private instance_seam_test module declaration; the original b9c101 pin, entire prior row and full +439/-235 account remain. This is not BYTE-IDENTICAL compliance or a new production/proof authority, and no other path/blob/movement inherits the exception. Actual focused qualification is separate.
+# EXACT SCALAR-CONST SOURCE EXTENSION EXCEPTION: only crates/trust-thir-lower/src/lib.rs at blob9ed5a5d0e9ee8919f1fabb0618e9cf054fa05ed3, under docs/DECISION_QUEUE.md D17-CONST-SOURCE and independent coordinating Root whole-original-pin source review of this exact movement. The new instance_const delegate is separately frozen; original b9c101 pin, entire prior waiver rows and full +455/-235 current account remain. This source capability extension is NOT BYTE-IDENTICAL/REFUSES-MORE compliance and grants no MIR production input or proof/grade authority. No other path/blob/movement inherits it; actual focused qualification is separate.
+# EXACT MERGED SCALAR-CONST SOURCE EXCEPTION: only crates/trust-thir-lower/src/lib.rs at blobce8aba052b77011d214d160e89160aff135f0caa, under docs/DECISION_QUEUE.md D17-CONST-SOURCE and independent Root complete original-pin review. Relative to383, only the authenticated public17f25 cfg(test) justified-divergence seal expectation changed from8 to9 for the ordered shared-slice exhaustive final miss; production lib prefix and fixture remain383 bytes. Originalpin/all historical prior rows and full +459/-238 account remain; no blanket exception, policy change or new proof/grade authority.
+# EXACT IR66 ANONYMOUS-ORIGIN CONSTRUCTOR EXCEPTION: only crates/trust-thir-lower/src/lib.rs at blob471b7c4fc49dcba46e42365d38e384ec85cc1e6a, under docs/DECISION_QUEUE.md IR66-CLOSURE-FRAME-IDENTITY-1 and independent /root/alignment_review complete original-pin review at e4fb96d52b. Relative to f47c09554f901e09d1fc90592d389c293b1678bb, only a comment and origin:None initializer change production. Original b9c101 pin/class and every prior contract/citation/residual remain, with current measured +568/-248. Source-module16 controls are scoped evidence, not whole compiler/TCX/cohort/source authority or BYTE-IDENTICAL compliance; no other path/blob/movement inherits this exception.
+crates/trust-thir-lower/src/lib.rs|b9c101533f936507db8a2ddb3d9c87e716ef7e22|BYTE-IDENTICAL|Exact actual-Rust argument/type/const encoder and typed carrier used by new identity equality; whole-file protection intentionally includes its producer code
+crates/trust-thir-lower/src/core_wrapping_add.rs|8bcb65a51d7cb0ac8c771727a26e39b88c423676|BYTE-IDENTICAL|Versioned actual-core U64 wrapping-add model recognizer and once-only ordered lowering; source fingerprints select a model, not cryptographic authentication or source/body/proof authority. Exact adjudication: cd8558a1cf:docs/decisions/2026-11-07-core-u64-wrapping-add-producer.md
+crates/trust-thir-lower/src/to_mir.rs|0676e4e8a2785f244da56d04d15d92035a53044c|BYTE-IDENTICAL|Exact Rust argument/type/const reconstruction used by metadata identity recovery; whole-file protection grants no MIR production authority
+compiler/rustc_codegen_trust_cg/src/lib.rs|c84d82f429d6c1d1f24c58ada7ea98c3d3e92a05|BYTE-IDENTICAL|Effective Always AArch64 object-frame setting, explicitly adjudicated in cd8558a1cf:docs/decisions/2026-11-07-f1-forced-frame-pointers.md; shared FnAbi/source/proof refusals unchanged
+compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/clean_below_gate.rs|ab03f700ff8299f273437f8790b594e7e3e3d865|BYTE-IDENTICAL|Actual Clean-origin refusal delegate prevents Rust R stand-ins from becoming Clean bodies; no Clean carrier admission
+
+# 2026-11-06 exact R declaration installation: independent source adjudication
+# in cd8558a1cf:docs/decisions/2026-11-06-upstream-r-declaration-install.md. Existing
+# manifest pins remain; four exact movement waivers preserve all predecessors.
+# This is a new bounded install capability, not canonical runtime qualification.
+compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/instance_assembly/declaration_binding.rs|93a8d61a1a4a5240e283ed180410d403677da923|BYTE-IDENTICAL|Actual same-session typed declaration projection and sealed own-instance R binding; complete stable/concrete identity and exact guest/host content before same-ID installation
+crates/trust-thir-lower/src/codegen_declarations.rs|537c2a1f1875ee25d77db2c019657acac72a119e|BYTE-IDENTICAL|Read-only exact original/current declaration Function and FuncTy retention; canonical private records only, unknown stays unknown, no admission authority
+crates/trust-bridge-closure/src/lib.rs|022d108e1c4729b1caa22d58386faf4f3e80a050|BYTE-IDENTICAL|Shared exact bridge root-module selector and source-reuse module boundary; no changed export/input population without exact adjudication
+crates/trust-bridge-closure/src/source_reuse.rs|f743a12c0aca82b7fb9a24c4a5ec3b5041449196|BYTE-IDENTICAL|Actual optional cross-revision artifact-input verifier, immutable subject/anchor/provenance/artifact/reader checks and record writers; input equality supplies no proof authority
+crates/trust-bridge-closure/src/source_reuse/effective.rs|01206e0def3781c67cd550f250254348616faae3|BYTE-IDENTICAL|Actual consuming workspace reader source/lock/patch/feature fixed point and external model-input comparison; unsupported or unresolved inputs refuse reuse
+crates/trust-bridge-closure/src/snapshot.rs|1e1c4bbecd82b4c87c12c16ce66727e29ed09fcf|BYTE-IDENTICAL|Sanitized exact Git object/root/ancestry and raw producer snapshot boundary; no replacement/graft/filter/ambient-Git authority
+
+crates/trust-cg-bridge/src/direct_ir_observation.rs|3c92e15645a987cc19ff474e5d281bd7d0ae71f7|BYTE-IDENTICAL|Conditional original-IR/final-object return and raw-O0 proof-data binding; distinct private checked return-only type, independent retained CIC replay, explicit ABI/frame/world/source/license debts, no emission/admission conversion
+crates/trust-cg-bridge/src/original_conjunction_certificate/frame_environment.rs|950883edfe9f5e8a77ea404c06de9146d05c8bf1|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/original_frame_arithmetic.rs|119a569ced09111286918786ec3755e64b0ee924|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame.rs|07e703dec2366055dc580fc15ec8df2da61e83bd|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_assembly.rs|459872b892bc2ab609304382a4f3e4968ded102e|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank.rs|ff51a200ab2fa862aff3bb10e533d818e12e91f8|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/assembly.json|9ff57cc48c56fdb187d75ca1db5ed116bfebead9|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/offsets.json|07ea3ccfe09b06d09161efcf831c2e9692130ff7|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/reads.json|e7bcafe9e4db9a01e89fcfed0872956bdbcd3100|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/shift-16.json|4b596f85602e4ae28ef87f4c729718a94bcd15c6|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/shift-24.json|837df9bf7649d3c859287a73384019787cf21618|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/shift-32.json|0cd899bffbc3430d8652a845db23272cb5469d97|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/shift-40.json|96e7eba698d26a71b21fc16dc2946395a0670244|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/shift-48.json|2c35846890551cf13e2f1d70250e65403204d02d|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/shift-56.json|ea0610fe346b13bb13b00411669f1d1565fb40c8|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/shift-8.json|7b951a99a8d3998f6cb28767c72af08118cf38ea|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_bank/words.json|867aae03111de1550243001e21a7cd70dbf61298|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_offset_model.rs|6b4f0849262606a8e16e86ed8e1a1d2f332f9a1d|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_offsets.rs|131d21278d472fb482819fdda9f8545574405c91|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_read_model.rs|3e412c598dcb216912fcc8024d8acff3f8616711|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_reads.rs|a813748ce09a82f8d257d8614cc1370040a1099d|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_word_model.rs|dcba10edc1f54c86902988667e9900377fa9f2d7|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/src/verify_output_instantiate/memory_reflection/frame_words.rs|41bfbd1c70d34acc20daed1473a3ca7d18eb2466|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+crates/trust-cg-bridge/tests/fixtures/direct_ir_observation/complete-raw.packet.json|3264fadd99e3fe38c5897365f55dafa7d3051cc6|BYTE-IDENTICAL|Qualified original-frame23 proof/statement/codec data boundary; exact originals and independently checked retained CIC only, no source/physicalABI/world/license/emission authority
+
+# Fixed canonical original-input mathematics: data predicates, no body/ABI authority.
+crates/trust-cg-bridge/src/compiler_input_capture.rs|2a5e4f37bc898dc4511738439a1dc4ecd29788cf|BYTE-IDENTICAL|Fixed canonical scalar input/model/context predicate; see cd8558a1cf:docs/decisions/2026-11-07-canonical-scalar-input-boundary.md
+crates/trust-cg-bridge/src/compiler_input_capture/semr_scalar.rs|c75823cc0689dcac58ade9e8c58bcda04761b2ab|BYTE-IDENTICAL|Fixed canonical scalar input/model/context predicate; see cd8558a1cf:docs/decisions/2026-11-07-canonical-scalar-input-boundary.md
+crates/trust-cg-bridge/src/compiler_input_capture/semr_scalar/environment.rs|d47fd6076fe48ea485b51fef8a35f90ed2131eee|BYTE-IDENTICAL|Fixed canonical scalar input/model/context predicate; see cd8558a1cf:docs/decisions/2026-11-07-canonical-scalar-input-boundary.md
+crates/trust-cg-bridge/src/compiler_input_capture/semr_scalar/source_binding.rs|95dd708420422391ab0b7b257d7f8f877bcf312a|BYTE-IDENTICAL|Fixed canonical scalar input/model/context predicate; see cd8558a1cf:docs/decisions/2026-11-07-canonical-scalar-input-boundary.md
+crates/trust-cg-bridge/src/compiler_input_capture/semr_scalar/cohort.json|ddec2db4dae5caada9665bdc35a9545ed85c1721|BYTE-IDENTICAL|Fixed canonical scalar input/model/context predicate; see cd8558a1cf:docs/decisions/2026-11-07-canonical-scalar-input-boundary.md
+crates/trust-cg-bridge/src/frame_step_evidence/cohort.rs|5e94125b71b5631824369388439383a33592f844|BYTE-IDENTICAL|Fixed canonical scalar input/model/context predicate; see cd8558a1cf:docs/decisions/2026-11-07-canonical-scalar-input-boundary.md
+
+crates/trust-thir-lower/src/ordered_slice_match.rs|ec70ec785dfb3fdb5c68faff18625f7dd3b8760e|BYTE-IDENTICAL|Exact independently reviewed ordered shared-slice structural lowering, guards, dominated projections and join provenance; semantic expansion adjudication cd8558a1cf:docs/decisions/2026-11-09-ordered-shared-slice-adjudication.md; no proof or body/grade authority
+crates/trust-thir-lower/src/indexed_field_assignment.rs|4ff1c20f3a8cb0b0b3a109397d81b2b2b910d4f3|BYTE-IDENTICAL|Indexed local-field plain and compound update planner/emitter reached from lib.rs's Assign and AssignOp routes: SSA/nonborrowed/flat-scalar admission, RHS-then-index order, bounds assert and shared checked arithmetic; pinned at the blob reviewed for ORACLE-FREEZE-MOVES-20261110; no proof or body/grade authority
+
+crates/trust-thir-lower/src/float_storage.rs|cabc8f096a8a2b8e5ce30b9eb80e620038d7762d|BYTE-IDENTICAL|Primitive F32/F64 owned-memory eligibility only; no integer arithmetic, pointer authority, proof grade or source-refinement permission. Initial exact predicate is independently reviewed with its lib call sites before publication.
+
+crates/trust-thir-lower/src/float_reference_binding.rs|c9dcec762008658b61929a507dfcffa30666cd83|BYTE-IDENTICAL|Exact irrefutable unpinned ref-mut float binding transport to an already-created typed owned local home; no snapshots, numeric comparison, raw/field/frame/caller lifetime, proof grade or authority permission. Initial exact predicate/emitter and lib integration independently reviewed by Root at source124fe9, receipt 78888f53ff48f8adaceee40092e3f683a094f3fb8215eb5e96694f0d3c42465c; actual changed native qualification remains separate.
+
+crates/trust-thir-lower/src/primitive_storage.rs|0f4831030a390b9c3dbe173c7aa6b14647579673|BYTE-IDENTICAL|Exact instantiated Rust primitive-to-IR owned-home transport eligibility including actual unit only; no reference-valued/aggregate/opaque scalar permission, initializer, arithmetic, proof grade or authority. Initial exact helper and complete lib baseline-pin delta require independent review and native qualification before publication; this source-preparation packet makes no PASS claim.
+crates/trust-thir-lower/src/primitive_unit_transport.rs|f8293579a4c42630e080604851c556d449c6fb75|BYTE-IDENTICAL|Exact source Unit-to-owned-value adapter after effect-free literal/CTFE or actual matching concrete zero-result direct call, and exact Unit tuple-field read; no invented initializer, call/effect omission, opaque Unit, computed callee, indirect Unit-store, lifetime, proof or authority grant. Whole-lib baseline remains originalb9; independent source/native qualification pending.
+crates/trust-thir-lower/src/calling_convention.rs|aa582775b4e6863d97dcf07c9cf137217edb7910|BYTE-IDENTICAL|exact source/target ABI mapping delegated to by frozen declaration, instance and metadata admission; unsupported and unknown protocols refuse rather than acquiring a calling convention
+crates/trust-thir-lower/src/foreign_signature.rs|f4a2b221f5a6e593a921180050dd7c5d1cacfeaf|BYTE-IDENTICAL|Exact independently reviewed foreign-scalar source/prototype/identity refusal delegate; immutable same-session Item/FnAbi and native physical checks, no external body, proof grade or default-tier authority
+compiler/rustc_codegen_trust_cg/src/source_abi/foreign_declarations.rs|79eb0e26fa84a7371be3ab42958487c0dac12a26|BYTE-IDENTICAL|Exact independently reviewed foreign-scalar source/prototype/identity refusal delegate; immutable same-session Item/FnAbi and native physical checks, no external body, proof grade or default-tier authority
+compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/native_source_module/foreign_declarations.rs|d1329f4be7f9ce18d61b03d020ea8147c1c4d649|BYTE-IDENTICAL|Exact independently reviewed foreign-scalar source/prototype/identity refusal delegate; immutable same-session Item/FnAbi and native physical checks, no external body, proof grade or default-tier authority
+
+# Source FP classifier delegate: exact independently reviewed runtime data only.
+crates/trust-cg-bridge/src/source_scalar_abi.rs|67cb2df7174e754334604658fa2fd0b2b2fd60b6|BYTE-IDENTICAL|Exact Darwin AArch64 complete native scalar classifier comparison, independent integer/shared-FP register banks and typed bank/width/position/overflow refusal; no rustc source witness, placement P or proof authority
+
+# Fixed scalar/program cohort private delegates; actual captures and sealed replay remain required.
+crates/trust-cg-bridge/src/compiler_input_capture/semr_scalar/scalar_contract.rs|d9135798ba722d280b0228442eebf4e50da7db9f|BYTE-IDENTICAL|Fixed scalar v2 schema, two import roots and exact fifteen declaration roots; private consumers and capture share this predicate
+crates/trust-cg-bridge/src/compiler_input_capture/semr_scalar/program_contract.rs|185e6a97fb1f882d7f8948ba6fd7e5c99410a49e|BYTE-IDENTICAL|Fixed scalar program schema, historical extension source owner and exact eight declaration roots; no generic model/context selector
+crates/trust-cg-bridge/src/compiler_input_capture/semr_scalar/source_contract.rs|46c2cc4ab31de77bb8670178d3d8a334fea18e0c|BYTE-IDENTICAL|Distinct fixed mathematical foundation, Clean consumer and profile source owners with immutable profile digest; no header-only source association
+
+# EXACT TEST-ORACLE NORMALIZATION EXCEPTION: only crates/trust-thir-lower/src/instance_seam_test.rs at blobc69430cf452a303f95f109f3a78b034a5837bb9e, under docs/DECISION_QUEUE.md D17 and independent coordinating Root review of this exact whole-original-pin movement. This diagnostic-only extension is NOT ordinary BYTE-IDENTICAL compliance; the original 599cbada524572cade9e0f2f847e875e4854612d pin and full +33/-2 waiver accounting remain. It grants no production admission, proof, Strict or grade authority and creates no exception for any other path/blob/movement. Actual focused qualification is separate.
+crates/trust-thir-lower/src/instance_seam_test.rs|599cbada524572cade9e0f2f847e875e4854612d|BYTE-IDENTICAL|explicit diagnostic actual-instance source-vs-raw-built MIR oracle, fail-closed verdict/marker policy and private negative controls; no production or proof authority
+crates/trust-thir-lower/src/template_metadata/oracle.rs|28a71888b912f0dfef573730e142cddab77c9e49|BYTE-IDENTICAL|diagnostic template-instance equivalence TEST-ORACLE: local authenticated read, hole-free/one-body fragment, exhaustive erased-field projection, fail-closed mismatch and negative-control policy; no output, admission or proof authority
+
+compiler/rustc_middle/src/ty/instance_seam_snapshot.rs|f907b16c02e6eb6660b0b6246ef8b080c4197318|BYTE-IDENTICAL|explicit diagnostic raw built-sibling custody, flag-off no allocation, permanent duplicate poison, no flip eligibility dependency
+compiler/rustc_middle/src/ty/instance_seam_snapshot/pinned-production.txt|11f9408a65cd926d298fd3785f1934cace73e136|BYTE-IDENTICAL|exact non-test prefix from frozen snapshot blob f907b16c02e6eb6660b0b6246ef8b080c4197318, read by the executable production-byte continuity check
+
+# 2026-11-11. docs/PLAN.md R-5 and the docs/DECISION_QUEUE.md row "One backend
+# consumer": the lir consumer gets no new coverage. Until this row that rule was
+# enforced by memory, and the file took admissions on 2026-11-09 and 2026-11-10.
+# A waiver here can argue only refuse-more or sample-more.
+crates/trust-cg-bridge/src/module_to_lir.rs|c494c627ee3d718d31bc9cbb7a0b4b1cf6877f4d|SAMPLE-MORE-OR-REFUSE-MORE|R-5: the lir consumer gets no new coverage; the row goes with the file when PKG-C2b exits
+
+# EXACT CONST-TYPE API REPAIR EXCEPTION: only crates/trust-thir-lower/src/instance_const.rs at blob4585c2b416ae1e7f5c94cd533209cd807f954e71, under docs/DECISION_QUEUE.md D17-CONST-SOURCE and independent Root exact source review. The original bc3a7e6ba36c085cf6d56b9afe55c74539e7fd6b pin stays; whole movement +1/-1 unwraps type_of identity data with the maintained skip_normalization API BEFORE the existing checked monomorphize funnel and all declared/expression/value equality checks. This repairs actual fd9 E0308, not a type-check removal or new fallback. No other path/blob inherits the exception; actual qualification is separate.
+crates/trust-thir-lower/src/instance_const.rs|bc3a7e6ba36c085cf6d56b9afe55c74539e7fd6b|BYTE-IDENTICAL|Actual instance const-argument owner/index/kind/type binding and checked scalar Value-leaf transport; ordinary IR literal data only, no MIR body, value-evaluation fallback, admission token or proof authority
+crates/trust-cg-bridge/src/verify_output_instantiate/branch_reflect.rs|76c7c87f521ac605c70fad757b313c60a493fb08|SAMPLE-MORE-OR-REFUSE-MORE|BRANCH-SPLIT-1 reflection: the ctx.branching arms (bit-vector Ite, faithful BvUDiv, high extract, condition B) that state the goal, the kernel-instance steps and condition bridges the proving pass splices, and the closed-data whitelist every kernel-evaluated closed term must pass; legacy contexts never reach it
+crates/trust-cg-bridge/src/verify_output_instantiate/branch_theory.rs|974c9e1f8848e7db868d3e7c704f1bc25bb2f6d9|SAMPLE-MORE-OR-REFUSE-MORE|BRANCH-SPLIT-1 kernel theory: the Trust.BVB / Trust.BVS.mul_add_self / zext_drop1_div2 theorems (each add_decl-checked), the audited branch base and environment, the constant decoder and the term-derived label
+crates/trust-cg-bridge/src/verify_output_instantiate/branch_split.rs|56ee86299dd0e22881dbb630fed6c0d11e325a94|SAMPLE-MORE-OR-REFUSE-MORE|BRANCH-SPLIT-1 route: goal built first from the items under branching_goal and only inside the width walk (trusted residual, not bypassable), caps and leaf checks that only decline, the atom case split, And.intro join and admission only through strength::admit_obligation; unwired until S3
+crates/trust-cg-bridge/src/verify_output_instantiate/cancel.rs|22d3d4b76f322b23c7ac69690e1ff7de8a084ae0|SAMPLE-MORE-OR-REFUSE-MORE|O(1) additive-cancellation route (DECISION_QUEUE CANCEL-1): the Trust.BVA.add_sub_cancel statement and proof (add_decl-checked), the audited cancel_base (the theorem, every theorem CITED lists as cited directly by the proof and the step terms, and the ring normaliser's nat_ring vocabulary, each proved with empty domain and foundational axiom closure, Err kept for the process), the sub_cancel_step guards (the same c structurally, one core_len width in {32, 64}) and the label; admission only through strength::admit_obligation
+crates/trust-cg-bridge/src/verify_output_instantiate/const_div.rs|888450f4d0cace2cf6329981e6afbcadd7182616|SAMPLE-MORE-OR-REFUSE-MORE|CONSTDIV-1 trusted residual: the umulh goal arm and this module's width walk (exactly the 128-bit multiply-high of two 64-bit zero extensions above 64 bits), the separate CONSTDIV_WHITELIST, replace (every node the search opens; a certified pair not replaced declines) and ConstDivCert::binds behind step4_rewrite (the call-event gate's step-(4) rewrite, the item's left side only); the caps, core-meet check and GoalEval differential only decline
+crates/trust-cg-bridge/src/verify_output_instantiate/const_div_theory.rs|6e82ca1c6ce5687692f7c0feb11ff50e2d178d41|SAMPLE-MORE-OR-REFUSE-MORE|CONSTDIV-1 kernel theory: the Trust.BVD magic_noadd / magic_addback / rem_tail statements and proofs and const_div_env, the environment in which strength::admit_obligation admits each step-(4) rewrite certificate
+
+# 2026-11-15 DIV-SPLIT-1 (docs/DECISION_QUEUE.md DIV-SPLIT-1). Two new files, frozen at their first
+# blob because the frozen gate delegates a decision to them: call_event.rs step (5) (both `branch`
+# arms) and call_event/closed_branch.rs check() reach branch_dispatch.rs through the unfrozen
+# recording wrapper verify_output_instantiate::try_branch_split_conjunction, which returns its
+# result unchanged. Together they ADMIT MORE, and only this: on a kernel-eligible step-(5) conj (or
+# check()'s folded items) that branch_split.rs declined, in which some side contains
+# BvUDiv(_, r, _) with a variable in r, every item passes the frozen width walk with each such
+# division read as BvAdd(l, r, w) for the walk only (branch_split::is_condition on Eq(l', r'), l' not
+# a condition), and the Clean kernel accepts a deep atom case split against G, the right-nested And
+# of bvfEval R(l) = bvfEval R(r) over the ORIGINAL items under ReflectCtx::branching_goal (the
+# frozen faithful branch_reflect::udiv arm at a symbolic divisor), admitted only through
+# strength::admit_obligation in branch_theory::env: KernelInstantiated with the label ending
+# "kernel atom case split, guarded symbolic division (DIV-SPLIT-1)" (check() would wrap it as
+# KernelRecheckableWithSideConditions; today no symbolic division reaches check(), since retry()
+# calls it only when every folded item lowers and formula_to_bvexpr refuses BvUDiv).
+# branch_split's own result is returned unchanged whenever it is Some. Nothing moves to or from
+# Refuted or Unknown.
+# ADJUDICATION 2026-11-15: a reviewer other than the author read div_split.rs c8525935 whole,
+# branch_dispatch.rs d1e967f7 and 602a9cce, branch_split goal_of/walk/is_condition,
+# branch_reflect::udiv, strength::admit_obligation, both call sites, and the tests at
+# div_split/tests.rs 39852ee8 and div_split_gate.rs 6aaee507 and, from 3a1a317a8f (S3c), c98eaa8d
+# and 89935132. It ACCEPTED the admission as stated (with conditions on the record only, no blocker
+# or major): goal_of's loop is branch_split::goal_of's over the ORIGINAL items; walk_view reaches
+# only in_walk (the frozen per-item check, one shared counter, refuses more only); udiv is SMT
+# bvudiv at every divisor, all-ones at zero; deep and norm only build terms or decline; Ok comes only
+# from admit_obligation; both sites call it inside Proven (None gives AyValidated), so nothing moves
+# to or from Refuted or Unknown. The remainder composite (S3c) is bvurem at every y. It re-read the
+# battery2 logs (counts exact). Residual: a G stating the walk's view is kernel-accepted, caught only
+# by the pins. Conditions taken: 32-bit zero-divisor samples added to
+# goal_udiv_agrees_with_smt_on_non_power_of_two_pairs (div_split/tests.rs 15b5517a); open: div_split's
+# own has_var (div_split.rs:120-124) duplicates branch_split::has_var and can only decline on a
+# disagreement; reuse it, and drop "PROPOSED" from the row below, when the pin next moves.
+# Prose residual: the delegation itself
+# is one line in an UNFROZEN file, verify_output_instantiate.rs try_branch_split_conjunction
+# (`let evidence = branch_dispatch::try_conjunction(items);`); an edit there (calling
+# div_split::try_conjunction alone, or skipping the dispatch) leaves this gate GREEN, and only the
+# tests below (the_dispatch_keeps_the_branch_split_and_falls_back_to_the_div_split and the
+# div_split_gate.rs positives, which fail without the fallback) would notice. The dispatch's ORDER
+# is not observable in any result (the two routes admit disjoint conjs: the branch walk refuses
+# every symbolic divisor and the division split runs only with one; a reversed dispatch passes every
+# test below), so these rows pin it as written, not as tested.
+# Mutation evidence (2026-11-15, each applied to the blobs below (div_split.rs c8525935,
+# branch_dispatch.rs d1e967f7), run with the lock wrapper `--no-fail-fast --lib --test
+# div_split_gate -- div_split:: s21_ raw_udiv asserted_live a_folded_symbolic_division` (12 unit,
+# 4 gate tests), restored and cmp-confirmed; logs
+# <home>/trust-cp-logs/div-split/battery2-*.log): pre-filter always on fails 5 unit tests,
+# 0 gate (a_division_free_deep_guard_is_out_of_scope, the_pre_filter_reads_divisors_only,
+# the_dispatch_keeps_the_branch_split_and_falls_back_to_the_div_split, and incidentally the two
+# walk/goal agreement tests); walk substitution off fails 8 unit and 2 gate tests; the deep
+# abstraction dropped fails 7 unit and 2 gate tests; a leaf comparison that always accepts fails
+# mutants_are_refused_by_the_kernel (its controls expect the decline); G (and the proving
+# reflection) stating the walk's BvAdd view instead of the division fails
+# declared_type_is_the_independent_goal (DIV_GOAL_PIN and the faithful-division subterm check) and
+# the gate's s21 positive (the kernel itself accepts that wrong G: both sides state the same
+# addition); the dispatch's fallback dropped fails the dispatch test,
+# call_event/closed_branch/tests.rs a_folded_symbolic_division_is_proved_by_the_div_split_under_its_premises
+# and 2 gate tests; the dispatch reversed fails nothing (equivalent, above).
+crates/trust-cg-bridge/src/verify_output_instantiate/div_split.rs|c8525935aed8d9648674b9c3eeac160fd56c0b0a|SAMPLE-MORE-OR-REFUSE-MORE|DIV-SPLIT-1 route (PROPOSED, ADMITS MORE): the symbolic-divisor pre-filter, the walk_view substitution into the frozen walk (trusted residual: the one widened arm), goal_of from the original items under branching_goal (its loop a copy of branch_split::goal_of's, trusted, pinned equal to it and by DIV_GOAL_PIN), the deep atom abstraction and decline-only leaf comparison, the kernel check on the shared pool with no wall-clock deadline, admission only through strength::admit_obligation and the DIV-SPLIT-1 label
+crates/trust-cg-bridge/src/verify_output_instantiate/branch_dispatch.rs|d1e967f75e5012b14f9c309c3daac942f7d145bf|SAMPLE-MORE-OR-REFUSE-MORE|step-(5) branch-route dispatch (PROPOSED, ADMITS MORE): branch_split first and unchanged when Some, div_split only on its decline; what every BRANCH-SPLIT-1 call site now receives

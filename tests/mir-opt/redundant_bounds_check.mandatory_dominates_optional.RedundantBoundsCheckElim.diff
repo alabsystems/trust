@@ -1,0 +1,52 @@
+- // MIR for `mandatory_dominates_optional` before RedundantBoundsCheckElim
++ // MIR for `mandatory_dominates_optional` after RedundantBoundsCheckElim
+  
+  fn mandatory_dominates_optional(_1: i32) -> (i32, i32) {
+      debug x => _1;
+      let mut _0: (i32, i32);
+      let mut _2: i32;
+      let mut _3: i32;
+      let mut _4: bool;
+      let mut _5: bool;
+      let mut _6: bool;
+      let mut _7: bool;
+      let mut _8: i32;
+      let mut _9: i32;
+      let mut _10: bool;
+  
+      bb0: {
+          StorageLive(_2);
+          StorageLive(_3);
+          _3 = copy _1;
+          _4 = const false;
+          assert(!const false, "attempt to divide `{}` by zero", copy _1) -> [success: bb1, unwind continue];
+      }
+  
+      bb1: {
+          _5 = const true;
+          _6 = Eq(copy _1, const i32::MIN);
+          _7 = copy _6;
+          assert(!copy _6, "attempt to compute `{} / {}`, which would overflow", copy _1, const -1_i32) -> [success: bb2, unwind continue];
+      }
+  
+      bb2: {
+          _2 = Div(copy _1, const -1_i32);
+          StorageDead(_3);
+          StorageLive(_8);
+          StorageLive(_9);
+          _9 = copy _1;
+          _10 = copy _6;
+-         assert(!copy _6, "attempt to negate `{}`, which would overflow", copy _1) -> [success: bb3, unwind continue];
++         goto -> bb3;
+      }
+  
+      bb3: {
+          _8 = Neg(copy _1);
+          StorageDead(_9);
+          _0 = (move _2, move _8);
+          StorageDead(_8);
+          StorageDead(_2);
+          return;
+      }
+  }
+  

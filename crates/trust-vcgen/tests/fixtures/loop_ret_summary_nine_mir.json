@@ -1,0 +1,73 @@
+{
+ "name": "nine",
+ "def_path": "loop_ret_summary::nine",
+ "span": {
+  "file": "fx/loop_ret_summary.rs",
+  "line_start": 16,
+  "col_start": 0,
+  "line_end": 18,
+  "col_end": 1
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 0,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Constant": {
+          "Uint": [
+           9,
+           64
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "fx/loop_ret_summary.rs",
+        "line_start": 18,
+        "col_start": 1,
+        "line_end": 18,
+        "col_end": 1
+       }
+      }
+     }
+    ],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 0,
+  "return_ty": {
+   "Int": {
+    "width": 64,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

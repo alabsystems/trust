@@ -58,7 +58,7 @@
 
 #![allow(unused_features)]
 #![allow(incomplete_features)]
-#![allow(unused_attributes)]
+#![expect(clippy::partialeq_ne_impl, reason = "we need to implement ne for a lot of alloc types")]
 #![stable(feature = "alloc", since = "1.36.0")]
 #![doc(
     issue_tracker_base_url = "https://github.com/andrewyates/tRust/issues/",
@@ -88,13 +88,16 @@
 //
 // Library features:
 // tidy-alphabetical-start
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 #![feature(array_into_iter_constructors)]
 #![feature(ascii_char)]
+#![feature(ascii_char_variants)]
 #![feature(async_fn_traits)]
 #![feature(async_iterator)]
-#![feature(bstr)]
-#![feature(bstr_internals)]
+#![feature(borrowed_buf_init)]
+#![feature(byte_str)]
+#![feature(byte_str_internals)]
+#![feature(can_vector)]
 #![feature(case_ignorable)]
 #![feature(cast_maybe_uninit)]
 #![feature(cell_get_cloned)]
@@ -118,12 +121,15 @@
 #![feature(core_io)]
 #![feature(core_io_borrowed_buf)]
 #![feature(core_io_internals)]
+#![feature(cursor_split)]
 #![feature(deprecated_suggestion)]
 #![feature(deref_pure_trait)]
+#![feature(derive_const)]
 #![feature(diagnostic_on_move)]
 #![feature(dispatch_from_dyn)]
 #![feature(ergonomic_clones)]
 #![feature(error_generic_member_access)]
+#![feature(error_type_id_internal)]
 #![feature(exact_size_is_empty)]
 #![feature(extend_one)]
 #![feature(extend_one_unchecked)]
@@ -137,22 +143,25 @@
 #![feature(inplace_iteration)]
 #![feature(io_const_error)]
 #![feature(io_const_error_internals)]
+#![feature(io_slice_as_bytes)]
 #![feature(iter_advance_by)]
 #![feature(iter_next_chunk)]
-#![feature(layout_for_ptr)]
 #![feature(legacy_receiver_trait)]
 #![feature(likely_unlikely)]
 #![feature(local_waker)]
+#![feature(marker_trait_attr)]
 #![feature(maybe_uninit_array_assume_init)]
+#![feature(maybe_uninit_fill)]
 #![feature(maybe_uninit_uninit_array_transpose)]
 #![feature(panic_internals)]
 #![feature(pattern)]
 #![feature(pin_coerce_unsized_trait)]
 #![feature(ptr_alignment_type)]
-#![feature(ptr_cast_slice)]
-#![feature(ptr_internals)]
+#![feature(ptr_cast_array)]
 #![feature(ptr_metadata)]
+#![feature(random)]
 #![feature(raw_os_error_ty)]
+#![feature(register_tool)]
 #![feature(rev_into_inner)]
 #![feature(seek_stream_len)]
 #![feature(set_ptr_value)]
@@ -178,7 +187,7 @@
 #![feature(ub_checks)]
 #![feature(unicode_internals)]
 #![feature(unsize)]
-#![feature(unwrap_infallible)]
+#![feature(write_all_vectored)]
 #![feature(wtf8_internals)]
 // tidy-alphabetical-end
 //
@@ -194,13 +203,12 @@
 #![feature(decl_macro)]
 #![feature(dropck_eyepatch)]
 #![feature(fundamental)]
+#![feature(impl_restriction)]
 #![feature(intrinsics)]
 #![feature(lang_items)]
 #![feature(min_specialization)]
 #![feature(multiple_supertrait_upcastable)]
 #![feature(negative_impls)]
-#![feature(never_type)]
-#![feature(optimize_attribute)]
 #![feature(rustc_attrs)]
 #![feature(slice_internals)]
 #![feature(staged_api)]
@@ -211,20 +219,38 @@
 #![feature(with_negative_coherence)]
 #![rustc_preserve_ub_checks]
 // tidy-alphabetical-end
-//
+
+// tidy-alphabetical-start
+#![register_tool(lint)]
+// tidy-alphabetical-end
+
 // Rustdoc features:
 #![feature(doc_cfg)]
+#![feature(doc_notable_trait)]
 // Technically, this is a bug in rustdoc: rustdoc sees the documentation on `#[lang = slice_alloc]`
 // blocks is for `&[T]`, which also has documentation using this feature in `core`, and gets mad
 // that the feature-gate isn't enabled. Ideally, it wouldn't check for the feature gate for docs
 // from other crates, but since this can only appear for lang items, it doesn't seem worth fixing.
 #![feature(intra_doc_pointers)]
 
+#[cfg(not(no_rc))]
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use rcs::rc;
+
 // Module with internal macros used by other modules (needs to be included before other modules).
 #[macro_use]
 mod macros;
 
 mod raw_vec;
+
+/// Implementations of reference-counted pointers.
+#[cfg(not(no_rc))]
+mod rcs {
+    pub mod rc;
+
+    #[cfg(all(not(no_sync), target_has_atomic = "ptr"))]
+    pub(crate) mod arc;
+}
 
 // Heaps provided for low-level allocation strategies
 pub mod alloc;
@@ -236,8 +262,8 @@ pub mod alloc;
 // to allow code to have `use boxed::Box;` declarations.
 pub mod borrow;
 pub mod boxed;
-#[unstable(feature = "bstr", issue = "134915")]
-pub mod bstr;
+#[unstable(feature = "byte_str", issue = "134915")]
+pub mod byte_str;
 pub mod collections;
 #[cfg(all(not(no_rc), not(no_sync), not(no_global_oom_handling)))]
 pub mod ffi;
@@ -245,8 +271,7 @@ pub mod fmt;
 pub mod intrinsics;
 #[unstable(feature = "alloc_io", issue = "154046")]
 pub mod io;
-#[cfg(not(no_rc))]
-pub mod rc;
+pub mod panicking;
 pub mod slice;
 pub mod str;
 pub mod string;

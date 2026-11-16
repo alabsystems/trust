@@ -61,6 +61,38 @@ fn canonical_tool_filename(path: &Path, tool: &str) -> bool {
     path.file_name().is_some_and(|name| name == std::ffi::OsStr::new(&host_executable_name(tool)))
 }
 
+/// The Spotlight-excluded home of the build tree (docs/BUILD_AND_INSTALL.md,
+/// "Keeping Spotlight out of build/"): `build` may be a symlink to it.
+pub(crate) const BUILD_NOINDEX: &str = "build.noindex";
+
+/// True iff `root/build` is the one symlink the build tree may be: a link that
+/// resolves to the REAL (non-symlink) directory `<canonical root>/build.noindex`.
+/// Every other link keeps being refused, because it could point a tool identity
+/// outside the checkout. Same predicate as `is_sanctioned_build_link` in
+/// scripts/mint_seed_support.py and its inlined siblings.
+pub(crate) fn is_sanctioned_build_link(root: &Path) -> bool {
+    let lexical = root.join("build");
+    if !fs::symlink_metadata(&lexical).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return false;
+    }
+    let Ok(canonical_root) = fs::canonicalize(root) else {
+        return false;
+    };
+    let physical = canonical_root.join(BUILD_NOINDEX);
+    // `symlink_metadata` does not follow: a `build.noindex` that is itself a
+    // link is not a directory here.
+    if !fs::symlink_metadata(&physical).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        return false;
+    }
+    fs::canonicalize(&lexical).is_ok_and(|resolved| resolved == physical)
+}
+
+/// The first component a repo stage2 tool path may start with: `build`, or
+/// (under the sanctioned link, once the path is canonical) `build.noindex`.
+pub(crate) fn is_repo_build_component(repo_root: &Path, component: &str) -> bool {
+    component == "build" || (component == BUILD_NOINDEX && is_sanctioned_build_link(repo_root))
+}
+
 fn path_is_repo_stage2_tool(repo_root: &Path, path: &Path, tool: &str) -> bool {
     let Ok(relative) = path.strip_prefix(repo_root) else {
         return false;
@@ -76,7 +108,7 @@ fn path_is_repo_stage2_tool(repo_root: &Path, path: &Path, tool: &str) -> bool {
         return false;
     };
     components.len() == 5
-        && components[0] == "build"
+        && is_repo_build_component(repo_root, components[0])
         && !components[1].is_empty()
         && components[2] == "stage2"
         && components[3] == "bin"
@@ -136,7 +168,7 @@ pub(crate) fn snapshot_repo_stage2_tool(
         })?;
 
     let mut prefix = canonical_root.clone();
-    for component in relative.components() {
+    for (index, component) in relative.components().enumerate() {
         if !matches!(component, Component::Normal(_)) {
             return Err(format!(
                 "{source} stage2 {tool} path contains a non-normal component: {}",
@@ -147,7 +179,13 @@ pub(crate) fn snapshot_repo_stage2_tool(
         let metadata = fs::symlink_metadata(&prefix).map_err(|error| {
             format!("{source} {tool} path is not accessible at {}: {error}", prefix.display())
         })?;
-        if metadata.file_type().is_symlink() {
+        // The one admitted link is `build` itself under the sanctioned
+        // `build -> build.noindex` layout; the identity bound below is the
+        // canonical path, which then names `build.noindex`.
+        let sanctioned_build_link = index == 0
+            && component.as_os_str() == "build"
+            && is_sanctioned_build_link(&canonical_root);
+        if metadata.file_type().is_symlink() && !sanctioned_build_link {
             return Err(format!(
                 "{source} must not use symlinks for stage2 {tool} identity: {}",
                 prefix.display()
@@ -469,5 +507,58 @@ mod tests {
                 .expect("directory aliases are ignored"),
             Some(leaf.canonicalize().expect("canonical concrete tool"))
         );
+    }
+
+    /// `mv build build.noindex && ln -s build.noindex build` keeps Spotlight
+    /// out of the build tree (docs/BUILD_AND_INSTALL.md). That one link is
+    /// admitted, whether the tool is spelled through it or physically, and the
+    /// bound identity is the canonical `build.noindex/...` path. Every other
+    /// `build` link is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn the_sanctioned_build_noindex_link_is_the_only_admitted_build_link() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("stage2 build.noindex fixture");
+        let physical = root
+            .path()
+            .join("build.noindex/actual-host/stage2/bin")
+            .join(host_executable_name("targo"));
+        executable(&physical);
+        symlink("build.noindex", root.path().join("build")).expect("link build");
+        let canonical = physical.canonicalize().expect("canonical tool");
+        let lexical =
+            root.path().join("build/actual-host/stage2/bin").join(host_executable_name("targo"));
+        for spelling in [&lexical, &physical] {
+            assert_eq!(
+                validate_repo_stage2_tool(root.path(), spelling, "test", "targo")
+                    .unwrap_or_else(|error| panic!("{}: {error}", spelling.display())),
+                canonical
+            );
+        }
+        assert_eq!(
+            discover_unique_repo_stage2_tool(root.path(), "targo").expect("discovery through link"),
+            Some(canonical.clone())
+        );
+
+        // Any other `build` link: to another in-checkout directory, or outside.
+        let outside = tempfile::tempdir().expect("outside fixture");
+        for target in [root.path().join("elsewhere"), outside.path().to_path_buf()] {
+            let tool = target.join("actual-host/stage2/bin").join(host_executable_name("targo"));
+            executable(&tool);
+            fs::remove_file(root.path().join("build")).expect("remove build link");
+            symlink(&target, root.path().join("build")).expect("relink build");
+            let error = validate_repo_stage2_tool(root.path(), &lexical, "test", "targo")
+                .expect_err("an unsanctioned build link must not satisfy stage2 identity");
+            assert!(error.contains("must not use symlinks"), "{}: {error}", target.display());
+        }
+        // A `build.noindex` that is itself a link does not sanction anything.
+        fs::remove_file(root.path().join("build")).expect("remove build link");
+        let real = root.path().join("real-noindex");
+        fs::rename(root.path().join("build.noindex"), &real).expect("move noindex aside");
+        symlink(&real, root.path().join("build.noindex")).expect("link noindex");
+        symlink("build.noindex", root.path().join("build")).expect("link build");
+        assert!(!is_sanctioned_build_link(root.path()));
+        assert!(validate_repo_stage2_tool(root.path(), &lexical, "test", "targo").is_err());
     }
 }

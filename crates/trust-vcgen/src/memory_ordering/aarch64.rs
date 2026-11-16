@@ -493,14 +493,17 @@ impl MemoryModelChecker {
             }
         }
 
-        if self.hb.successors(witness.release_access_index).contains(&witness.acquire_access_index)
-        {
+        let has_sync_edge =
+            self.hb.has_direct_edge(witness.release_access_index, witness.acquire_access_index);
+        if has_sync_edge {
             consumed.push("synchronization edge".to_string());
         } else {
             missing.push("synchronization edge".to_string());
         }
 
-        if self.hb.happens_before(witness.release_access_index, witness.acquire_access_index) {
+        if has_sync_edge
+            || self.hb.happens_before(witness.release_access_index, witness.acquire_access_index)
+        {
             consumed.push("happens-before witness".to_string());
         } else {
             missing.push("happens-before witness".to_string());
@@ -635,20 +638,22 @@ impl MemoryModelChecker {
             Some(_) | None => missing.push("store-conditional status result".to_string()),
         }
 
-        if self
-            .hb
-            .successors(witness.load_reserve_access_index)
-            .contains(&witness.store_conditional_access_index)
-        {
+        let has_sync_edge = self.hb.has_direct_edge(
+            witness.load_reserve_access_index,
+            witness.store_conditional_access_index,
+        );
+        if has_sync_edge {
             consumed.push("synchronization edge".to_string());
         } else {
             missing.push("synchronization edge".to_string());
         }
 
-        if self.hb.happens_before(
-            witness.load_reserve_access_index,
-            witness.store_conditional_access_index,
-        ) {
+        if has_sync_edge
+            || self.hb.happens_before(
+                witness.load_reserve_access_index,
+                witness.store_conditional_access_index,
+            )
+        {
             consumed.push("happens-before witness".to_string());
         } else {
             missing.push("happens-before witness".to_string());
@@ -766,19 +771,25 @@ impl MemoryModelChecker {
             missing.push("barrier thread identity".to_string());
         }
 
-        if self.hb.successors(witness.before_access_index).contains(&witness.barrier_access_index) {
+        let has_pre_edge =
+            self.hb.has_direct_edge(witness.before_access_index, witness.barrier_access_index);
+        if has_pre_edge {
             consumed.push("pre-barrier program-order edge".to_string());
         } else {
             missing.push("pre-barrier program-order edge".to_string());
         }
 
-        if self.hb.successors(witness.barrier_access_index).contains(&witness.after_access_index) {
+        let has_post_edge =
+            self.hb.has_direct_edge(witness.barrier_access_index, witness.after_access_index);
+        if has_post_edge {
             consumed.push("post-barrier program-order edge".to_string());
         } else {
             missing.push("post-barrier program-order edge".to_string());
         }
 
-        if self.hb.happens_before(witness.before_access_index, witness.after_access_index) {
+        if (has_pre_edge && has_post_edge)
+            || self.hb.happens_before(witness.before_access_index, witness.after_access_index)
+        {
             consumed.push("barrier happens-before witness".to_string());
         } else {
             missing.push("barrier happens-before witness".to_string());
@@ -969,8 +980,7 @@ fn collect_barrier_shape_requirements(
     fact: &Aarch64BarrierSemanticFact,
     missing: &mut Vec<String>,
 ) {
-    let opcode = fact.opcode.to_ascii_lowercase();
-    if opcode != "dmb" && opcode != "dsb" {
+    if !fact.opcode.eq_ignore_ascii_case("dmb") && !fact.opcode.eq_ignore_ascii_case("dsb") {
         missing.push("barrier opcode witness".to_string());
     }
     if barrier_required_ordering(fact).is_none() {
@@ -1089,13 +1099,14 @@ fn collect_release_acquire_pair_evidence(
         missing.push("cross-thread identity witness".to_string());
     }
 
-    if checker.hb.successors(release_index).contains(&acquire_index) {
+    let has_sync_edge = checker.hb.has_direct_edge(release_index, acquire_index);
+    if has_sync_edge {
         available.push("synchronization edge".to_string());
     } else {
         missing.push("synchronization edge".to_string());
     }
 
-    if checker.hb.happens_before(release_index, acquire_index) {
+    if has_sync_edge || checker.hb.happens_before(release_index, acquire_index) {
         available.push("happens-before witness".to_string());
     } else {
         missing.push("happens-before witness".to_string());
@@ -1163,13 +1174,14 @@ fn collect_exclusive_monitor_pair_evidence(
         None => missing.push("store-conditional status result".to_string()),
     }
 
-    if checker.hb.successors(load_index).contains(&store_index) {
+    let has_sync_edge = checker.hb.has_direct_edge(load_index, store_index);
+    if has_sync_edge {
         available.push("synchronization edge".to_string());
     } else {
         missing.push("synchronization edge".to_string());
     }
 
-    if checker.hb.happens_before(load_index, store_index) {
+    if has_sync_edge || checker.hb.happens_before(load_index, store_index) {
         available.push("happens-before witness".to_string());
     } else {
         missing.push("happens-before witness".to_string());

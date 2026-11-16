@@ -20,6 +20,33 @@ fn simple() {
         .run();
 }
 
+// Trust: these exercise the real authenticated Cargo compatibility alias,
+// rather than changing frontend identity inside a test process.
+#[cargo_test]
+fn cargo_ignores_colocated_targo_manifest() {
+    let p = project().file("Targo.toml", "not a manifest").build();
+    p.cargo("locate-project --message-format plain")
+        .with_stdout_data(str![[r#"
+[ROOT]/foo/Cargo.toml
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn cargo_ignores_nearer_targo_manifest() {
+    let p = project()
+        .file("nested/Targo.toml", "not a manifest")
+        .build();
+    p.cargo("locate-project --message-format plain")
+        .cwd("nested")
+        .with_stdout_data(str![[r#"
+[ROOT]/foo/Cargo.toml
+
+"#]])
+        .run();
+}
+
 #[cargo_test]
 fn message_format() {
     let p = project().build();

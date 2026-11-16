@@ -1,0 +1,234 @@
+{
+  "name": "add_past_end",
+  "def_path": "w2::add_past_end",
+  "span": {
+    "file": "w2.rs",
+    "line_start": 3,
+    "col_start": 0,
+    "line_end": 3,
+    "col_end": 85
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::as_ptr",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "w2.rs",
+              "line_start": 3,
+              "col_start": 64,
+              "line_end": 3,
+              "col_end": 74
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11987879652072705703,
+              "def_index": 15432,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "SliceAsPtr",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11987879652072705703,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::ptr::const_ptr::<impl *const u8>::add",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "w2.rs",
+              "line_start": 3,
+              "col_start": 64,
+              "line_end": 3,
+              "col_end": 81
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": true,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11987879652072705703,
+              "def_index": 3108,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "ConstPtrAdd",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11987879652072705703,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "RawPtr": {
+        "mutable": false,
+        "pointee": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        }
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "i",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "i",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

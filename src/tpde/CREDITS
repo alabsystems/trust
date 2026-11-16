@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+# SPDX-License-Identifier: CC0-1.0
+#
+# credits file similar to the Linux kernel
+# which lists all contributors to TPDE
+
+N: Alexis Engelke
+E: engelke@in.tum.de
+
+N: T0b1
+E: github@t0b1.dev

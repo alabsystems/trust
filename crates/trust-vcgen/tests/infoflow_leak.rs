@@ -41,6 +41,7 @@ fn make_func(name: &str, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> Ver
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -55,6 +56,7 @@ fn call(func: &str, args: Vec<Operand>, dest: usize, at: usize, next: Option<usi
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         is_foreign: false,
     }
 }

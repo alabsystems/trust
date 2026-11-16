@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 // The `static_mut_refs` lint is incidental to this fixture's subject (the
 // DIRECT lowering of static borrows); under ui-test defaults its warnings
 // count as unexpected diagnostics, and the fixture landed without a sweep.

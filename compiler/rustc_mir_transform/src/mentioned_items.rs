@@ -2,34 +2,47 @@ use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{self, Location, MentionedItem};
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_session::Session;
-use rustc_span::Spanned;
+use rustc_span::{Span, Spanned};
+
+use crate::PassPolicy;
 
 pub(super) struct MentionedItems;
 
-struct MentionedItemsVisitor<'a, 'tcx> {
+// Trust: the visitor reports each item to a callback with its location, so the spawn
+// census (design 2026-09-29-spawn-census-by-construction §5.1) enumerates a pre-steal
+// body exactly as this pass enumerates the codegen body. Reverted at the census flip.
+struct MentionedItemsVisitor<'a, 'tcx, F> {
     tcx: TyCtxt<'tcx>,
     body: &'a mir::Body<'tcx>,
-    mentioned_items: Vec<Spanned<MentionedItem<'tcx>>>,
+    mentioned_item: F,
+}
+
+/// Trust: every item this pass would record for `body`, in the same order, each with
+/// the location that mentions it (spawn census, `trust_verify::trust_spawn_census`).
+pub(crate) fn for_each_mentioned_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mir::Body<'tcx>,
+    mentioned_item: impl FnMut(MentionedItem<'tcx>, Span, Location),
+) {
+    MentionedItemsVisitor { tcx, body, mentioned_item }.visit_body(body);
 }
 
 impl<'tcx> crate::MirPass<'tcx> for MentionedItems {
-    fn is_enabled(&self, _sess: &Session) -> bool {
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
         // If this pass is skipped the collector assume that nothing got mentioned! We could
         // potentially skip it in opt-level 0 if we are sure that opt-level will never *remove* uses
         // of anything, but that still seems fragile. Furthermore, even debug builds use level 1, so
         // special-casing level 0 is just not worth it.
-        true
+        PassPolicy::Required
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut mir::Body<'tcx>) {
-        let mut visitor = MentionedItemsVisitor { tcx, body, mentioned_items: Vec::new() };
-        visitor.visit_body(body);
-        body.set_mentioned_items(visitor.mentioned_items);
-    }
-
-    fn is_required(&self) -> bool {
-        true
+        // Trust: through the shared enumeration (see `for_each_mentioned_item`).
+        let mut mentioned_items = Vec::new();
+        for_each_mentioned_item(tcx, body, |node, span, _| {
+            mentioned_items.push(Spanned { node, span })
+        });
+        body.set_mentioned_items(mentioned_items);
     }
 }
 
@@ -37,28 +50,45 @@ impl<'tcx> crate::MirPass<'tcx> for MentionedItems {
 // visiting the exact same places but then instead of monomorphizing and creating `MonoItems`, we
 // have to remain generic and just recording the relevant information in `mentioned_items`, where it
 // will then be monomorphized later during "mentioned items" collection.
-impl<'tcx> Visitor<'tcx> for MentionedItemsVisitor<'_, 'tcx> {
+// Trust: generic over the callback (see `for_each_mentioned_item`).
+impl<'tcx, F: FnMut(MentionedItem<'tcx>, Span, Location)> Visitor<'tcx>
+    for MentionedItemsVisitor<'_, 'tcx, F>
+{
+    fn visit_body(&mut self, body: &mir::Body<'tcx>) {
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            let mut location = Location { block, statement_index: 0 };
+            for statement in &data.statements {
+                if let mir::StatementKind::Assign(ref assign) = statement.kind {
+                    self.visit_rvalue(&assign.1, location);
+                }
+                location.statement_index += 1;
+            }
+            if let Some(ref terminator) = data.terminator {
+                self.visit_terminator(terminator, location);
+            }
+        }
+    }
+
     fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Location) {
-        self.super_terminator(terminator, location);
-        let span = || self.body.source_info(location).span;
+        let span = terminator.source_info.span;
         match &terminator.kind {
             mir::TerminatorKind::Call { func, .. } | mir::TerminatorKind::TailCall { func, .. } => {
                 let callee_ty = func.ty(self.body, self.tcx);
-                self.mentioned_items
-                    .push(Spanned { node: MentionedItem::Fn(callee_ty), span: span() });
+                (self.mentioned_item)(MentionedItem::Fn(callee_ty), span, location);
             }
             mir::TerminatorKind::Drop { place, .. } => {
                 let ty = place.ty(self.body, self.tcx).ty;
-                self.mentioned_items.push(Spanned { node: MentionedItem::Drop(ty), span: span() });
+                (self.mentioned_item)(MentionedItem::Drop(ty), span, location);
             }
             mir::TerminatorKind::InlineAsm { operands, .. } => {
                 for op in operands {
                     match *op {
                         mir::InlineAsmOperand::SymFn { ref value } => {
-                            self.mentioned_items.push(Spanned {
-                                node: MentionedItem::Fn(value.const_.ty()),
-                                span: span(),
-                            });
+                            (self.mentioned_item)(
+                                MentionedItem::Fn(value.const_.ty()),
+                                span,
+                                location,
+                            );
                         }
                         _ => {}
                     }
@@ -69,8 +99,6 @@ impl<'tcx> Visitor<'tcx> for MentionedItemsVisitor<'_, 'tcx> {
     }
 
     fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
-        self.super_rvalue(rvalue, location);
-        let span = || self.body.source_info(location).span;
         match *rvalue {
             // We need to detect unsizing casts that required vtables.
             mir::Rvalue::Cast(
@@ -91,10 +119,12 @@ impl<'tcx> Visitor<'tcx> for MentionedItemsVisitor<'_, 'tcx> {
                     _ => true,
                 };
                 if may_involve_vtable {
-                    self.mentioned_items.push(Spanned {
-                        node: MentionedItem::UnsizeCast { source_ty, target_ty },
-                        span: span(),
-                    });
+                    let span = self.body.source_info(location).span;
+                    (self.mentioned_item)(
+                        MentionedItem::UnsizeCast { source_ty, target_ty },
+                        span,
+                        location,
+                    );
                 }
             }
             // Similarly, record closures that are turned into function pointers.
@@ -103,9 +133,9 @@ impl<'tcx> Visitor<'tcx> for MentionedItemsVisitor<'_, 'tcx> {
                 ref operand,
                 _,
             ) => {
+                let span = self.body.source_info(location).span;
                 let source_ty = operand.ty(self.body, self.tcx);
-                self.mentioned_items
-                    .push(Spanned { node: MentionedItem::Closure(source_ty), span: span() });
+                (self.mentioned_item)(MentionedItem::Closure(source_ty), span, location);
             }
             // And finally, function pointer reification casts.
             mir::Rvalue::Cast(
@@ -113,8 +143,9 @@ impl<'tcx> Visitor<'tcx> for MentionedItemsVisitor<'_, 'tcx> {
                 ref operand,
                 _,
             ) => {
+                let span = self.body.source_info(location).span;
                 let fn_ty = operand.ty(self.body, self.tcx);
-                self.mentioned_items.push(Spanned { node: MentionedItem::Fn(fn_ty), span: span() });
+                (self.mentioned_item)(MentionedItem::Fn(fn_ty), span, location);
             }
             _ => {}
         }

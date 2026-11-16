@@ -178,7 +178,7 @@ impl Project<'_> {
                 // Deliberately enable all `error` logs if the user has not set RA_LOG, as there is usually
                 // useful information in there for debugging.
                 filter: std::env::var("RA_LOG").ok().unwrap_or_else(|| "error".to_owned()),
-                chalk_filter: std::env::var("CHALK_DEBUG").ok(),
+                solver_filter: std::env::var("SOLVER_DEBUG").ok(),
                 profile_filter: std::env::var("RA_PROFILE").ok(),
                 json_profile_filter: std::env::var("RA_PROFILE_JSON").ok(),
             }
@@ -233,6 +233,9 @@ impl Project<'_> {
                             lsp_types::ResourceOperationKind::Rename,
                         ]),
                         ..Default::default()
+                    }),
+                    semantic_tokens: Some(lsp_types::SemanticTokensWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
                     }),
                     ..Default::default()
                 }),
@@ -386,7 +389,10 @@ impl Server {
                         {
                             continue;
                         }
-                    } else if req.method != "workspace/diagnostic/refresh" {
+                    } else if !matches!(
+                        req.method.as_str(),
+                        "workspace/diagnostic/refresh" | "workspace/semanticTokens/refresh"
+                    ) {
                         panic!("unexpected request: {req:?}")
                     }
                 }
@@ -462,6 +468,22 @@ impl Server {
                 if params.diagnostics.is_empty() {
                     return;
                 }
+            }
+        }
+    }
+
+    pub(crate) fn wait_for_semantic_tokens_refresh(&self) {
+        loop {
+            let msg = self
+                .recv()
+                .unwrap_or_else(|Timeout| {
+                    panic!("timeout while waiting for semantic tokens refresh")
+                })
+                .expect("connection closed while waiting for semantic tokens refresh");
+            if let Message::Request(req) = &msg
+                && req.method == "workspace/semanticTokens/refresh"
+            {
+                return;
             }
         }
     }

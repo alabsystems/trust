@@ -1,0 +1,890 @@
+{
+  "schema": 2,
+  "scope": "Explicit logical/runtime boundary; kernel replay is not a runtime correspondence proof",
+  "baseline": {
+    "root_subject": "98e439cf1281e226c88448cbb24ebe9fbb07fab5",
+    "ir_source": "5e950fbff8b1beb5f0a7388a30a124ab4be3d66a",
+    "total_obligations": 7125,
+    "logical_safe_obligations": 7084,
+    "runtime_unproved_obligations": 41,
+    "roster_sha256": "89d0b2f955f0204a4adcab51a305cee0fd20a1e524a9c69c7c8f24feec7493dc",
+    "scope": "imported_restored_declarations",
+    "complete_inventory_sha256": "3d329ae9e3287c0a77b17223b7f6df1dbeb6c0ec32ead43c6f34ff9887fb1e6e",
+    "loader_findings": "Skipped and undecoded extension entries remain preserved in the complete inventory; this count does not establish complete Lean metadata fidelity."
+  },
+  "repair_base": "7895a3dd1822c7f8034f7dc7bd7e826b2392bfe6",
+  "runtime_obligations": [
+    {
+      "original_module": "TrustIr.Semantics.AggregateImages",
+      "original_full_name": "TrustIr.AggregateMemory.ArrayEncodingRuntime.encodeTree",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ArrayEncoding",
+      "runtime_full_name": "TrustIr.AggregateMemory.ArrayEncodingRuntime.encodeTree",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.Semantics.AggregateImages",
+      "original_full_name": "TrustIr.AggregateMemory.ArrayEncodingRuntime.encodeTreeWithStats",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ArrayEncoding",
+      "runtime_full_name": "TrustIr.AggregateMemory.ArrayEncodingRuntime.encodeTreeWithStats",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImage",
+      "original_full_name": "TrustIr.ByteImage.ImageMapRuntime.map",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ImageMap",
+      "runtime_full_name": "TrustIr.ByteImage.ImageMapRuntime.map",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "TrustIr.ByteImage.WindowRuntime.checkBlocks",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "TrustIr.ByteImage.WindowRuntime.checkBlocks",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "TrustIr.ByteImage.WindowRuntime.checkBlocksWithStats",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "TrustIr.ByteImage.WindowRuntime.checkBlocksWithStats",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "TrustIr.ByteImage.WindowRuntime.firstWhere",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "TrustIr.ByteImage.WindowRuntime.firstWhere",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "TrustIr.ByteImage.WindowRuntime.firstWhereWithStats",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "TrustIr.ByteImage.WindowRuntime.firstWhereWithStats",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "TrustIr.ByteImage.WindowRuntime.mapBlocks",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "TrustIr.ByteImage.WindowRuntime.mapBlocks",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "TrustIr.ByteImage.WindowRuntime.mapBlocksWithStats",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "TrustIr.ByteImage.WindowRuntime.mapBlocksWithStats",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "TrustIr.CompactArray.EqualityRuntime.tree",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.Equality",
+      "runtime_full_name": "TrustIr.CompactArray.EqualityRuntime.tree",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "TrustIr.CompactArray.EqualityRuntime.treeWithStats",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.Equality",
+      "runtime_full_name": "TrustIr.CompactArray.EqualityRuntime.treeWithStats",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "TrustIr.CompactArray.StoredCheckRuntime.leaf",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_full_name": "TrustIr.CompactArray.StoredCheckRuntime.leaf",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "TrustIr.CompactArray.StoredCheckRuntime.leafRange",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_full_name": "TrustIr.CompactArray.StoredCheckRuntime.leafRange",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "TrustIr.CompactArray.StoredCheckRuntime.range",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_full_name": "TrustIr.CompactArray.StoredCheckRuntime.range",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "TrustIr.CompactArray.StoredCheckRuntime.rangeWithStats",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_full_name": "TrustIr.CompactArray.StoredCheckRuntime.rangeWithStats",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "TrustIr.CompactArray.StoredCheckRuntime.tree",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_full_name": "TrustIr.CompactArray.StoredCheckRuntime.tree",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "TrustIr.CompactArray.StoredCheckRuntime.treeWithStats",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_full_name": "TrustIr.CompactArray.StoredCheckRuntime.treeWithStats",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ValueMap",
+      "original_full_name": "TrustIr.ValueDepthRuntime.depthWithStats",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.depthWithStats",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ValueMap",
+      "original_full_name": "TrustIr.ValueDepthRuntime.fieldDepth",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.fieldDepth",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ValueMap",
+      "original_full_name": "TrustIr.ValueDepthRuntime.leafDepth",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.leafDepth",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ValueMap",
+      "original_full_name": "TrustIr.ValueDepthRuntime.listDepth",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.listDepth",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ValueMap",
+      "original_full_name": "TrustIr.ValueDepthRuntime.treeDepth",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.treeDepth",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ValueMap",
+      "original_full_name": "TrustIr.ValueDepthRuntime.valueDepth",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.valueDepth",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.Semantics.AggregateImages",
+      "original_full_name": "_private.TrustIr.Semantics.AggregateImages.0.TrustIr.AggregateMemory.ArrayEncodingRuntime.key",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ArrayEncoding",
+      "runtime_full_name": "_private.TrustIrRuntime.ArrayEncoding.0.TrustIr.AggregateMemory.ArrayEncodingRuntime.key",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.Semantics.AggregateImages",
+      "original_full_name": "_private.TrustIr.Semantics.AggregateImages.0.TrustIr.AggregateMemory.ArrayEncodingRuntime.visit",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ArrayEncoding",
+      "runtime_full_name": "_private.TrustIrRuntime.ArrayEncoding.0.TrustIr.AggregateMemory.ArrayEncodingRuntime.visit",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImage",
+      "original_full_name": "_private.TrustIr.State.ByteImage.0.TrustIr.ByteImage.ImageMapRuntime.uncached",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ImageMap",
+      "runtime_full_name": "_private.TrustIrRuntime.ImageMap.0.TrustIr.ByteImage.ImageMapRuntime.uncached",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImage",
+      "original_full_name": "_private.TrustIr.State.ByteImage.0.TrustIr.ByteImage.ImageMapRuntime.visit",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ImageMap",
+      "runtime_full_name": "_private.TrustIrRuntime.ImageMap.0.TrustIr.ByteImage.ImageMapRuntime.visit",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "_private.TrustIr.State.ByteImageTraversal.0.TrustIr.ByteImage.WindowRuntime.Window.key",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "_private.TrustIrRuntime.ByteWindows.0.TrustIr.ByteImage.WindowRuntime.Window.key",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "_private.TrustIr.State.ByteImageTraversal.0.TrustIr.ByteImage.WindowRuntime.checkBody",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "_private.TrustIrRuntime.ByteWindows.0.TrustIr.ByteImage.WindowRuntime.checkBody",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "_private.TrustIr.State.ByteImageTraversal.0.TrustIr.ByteImage.WindowRuntime.checkVisit",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "_private.TrustIrRuntime.ByteWindows.0.TrustIr.ByteImage.WindowRuntime.checkVisit",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "_private.TrustIr.State.ByteImageTraversal.0.TrustIr.ByteImage.WindowRuntime.mapBody",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "_private.TrustIrRuntime.ByteWindows.0.TrustIr.ByteImage.WindowRuntime.mapBody",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "_private.TrustIr.State.ByteImageTraversal.0.TrustIr.ByteImage.WindowRuntime.mapVisit",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "_private.TrustIrRuntime.ByteWindows.0.TrustIr.ByteImage.WindowRuntime.mapVisit",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "_private.TrustIr.State.ByteImageTraversal.0.TrustIr.ByteImage.WindowRuntime.search",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "_private.TrustIrRuntime.ByteWindows.0.TrustIr.ByteImage.WindowRuntime.search",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ByteImageTraversal",
+      "original_full_name": "_private.TrustIr.State.ByteImageTraversal.0.TrustIr.ByteImage.WindowRuntime.searchBody",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_full_name": "_private.TrustIrRuntime.ByteWindows.0.TrustIr.ByteImage.WindowRuntime.searchBody",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "_private.TrustIr.State.CompactArray.0.TrustIr.CompactArray.EqualityRuntime.key",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.Equality",
+      "runtime_full_name": "_private.TrustIrRuntime.Equality.0.TrustIr.CompactArray.EqualityRuntime.key",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "_private.TrustIr.State.CompactArray.0.TrustIr.CompactArray.EqualityRuntime.visit",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.Equality",
+      "runtime_full_name": "_private.TrustIrRuntime.Equality.0.TrustIr.CompactArray.EqualityRuntime.visit",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "_private.TrustIr.State.CompactArray.0.TrustIr.CompactArray.StoredCheckRuntime.key",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_full_name": "_private.TrustIrRuntime.StoredCheck.0.TrustIr.CompactArray.StoredCheckRuntime.key",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.CompactArray",
+      "original_full_name": "_private.TrustIr.State.CompactArray.0.TrustIr.CompactArray.StoredCheckRuntime.visit",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_full_name": "_private.TrustIrRuntime.StoredCheck.0.TrustIr.CompactArray.StoredCheckRuntime.visit",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ValueMap",
+      "original_full_name": "_private.TrustIr.State.ValueMap.0.TrustIr.ValueDepthRuntime.key",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_full_name": "_private.TrustIrRuntime.ValueDepth.0.TrustIr.ValueDepthRuntime.key",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ValueMap",
+      "original_full_name": "_private.TrustIr.State.ValueMap.0.TrustIr.ValueDepthRuntime.run",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_full_name": "_private.TrustIrRuntime.ValueDepth.0.TrustIr.ValueDepthRuntime.run",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    },
+    {
+      "original_module": "TrustIr.State.ValueMap",
+      "original_full_name": "_private.TrustIr.State.ValueMap.0.TrustIr.ValueDepthRuntime.visit",
+      "original_kind": "definition",
+      "original_safety": "unsafe",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_full_name": "_private.TrustIrRuntime.ValueDepth.0.TrustIr.ValueDepthRuntime.visit",
+      "state": "UNPROVED",
+      "certified": false,
+      "role": "runtime implementation or physical-sharing diagnostic; not a kernel theorem"
+    }
+  ],
+  "interfaces": [
+    {
+      "logical_module": "TrustIr.State.CompactArray",
+      "logical_full_name": "TrustIr.CompactArray.Leaf.checkStored",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_provider": "leaf",
+      "symbol": "l_TrustIr_CompactArray_Leaf_checkStored",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.CompactArray.StoredCheckRuntime.leaf",
+      "abi": {
+        "arity": 5,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.CompactArray",
+      "logical_full_name": "TrustIr.CompactArray.Tree.checkStored",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_provider": "tree",
+      "symbol": "l_TrustIr_CompactArray_Tree_checkStored",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.CompactArray.StoredCheckRuntime.tree",
+      "abi": {
+        "arity": 5,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.CompactArray",
+      "logical_full_name": "TrustIr.CompactArray.Leaf.checkRange",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_provider": "leafRange",
+      "symbol": "l_TrustIr_CompactArray_Leaf_checkRange",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.CompactArray.StoredCheckRuntime.leafRange",
+      "abi": {
+        "arity": 7,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.CompactArray",
+      "logical_full_name": "TrustIr.CompactArray.Tree.checkRange",
+      "runtime_module": "TrustIrRuntime.StoredCheck",
+      "runtime_provider": "range",
+      "symbol": "l_TrustIr_CompactArray_Tree_checkRange",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.CompactArray.StoredCheckRuntime.range",
+      "abi": {
+        "arity": 7,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.CompactArray",
+      "logical_full_name": "TrustIr.CompactArray.Tree.eqByM",
+      "runtime_module": "TrustIrRuntime.Equality",
+      "runtime_provider": "tree",
+      "symbol": "l_TrustIr_CompactArray_Tree_eqByM",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.CompactArray.EqualityRuntime.tree",
+      "abi": {
+        "arity": 7,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.ValueMap",
+      "logical_full_name": "TrustIr.Value.depth",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_provider": "valueDepth",
+      "symbol": "l_TrustIr_Value_depth",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.valueDepth",
+      "abi": {
+        "arity": 1,
+        "parameter_types": [
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.ValueMap",
+      "logical_full_name": "TrustIr.valueListDepth",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_provider": "listDepth",
+      "symbol": "l_TrustIr_valueListDepth",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.listDepth",
+      "abi": {
+        "arity": 1,
+        "parameter_types": [
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.ValueMap",
+      "logical_full_name": "TrustIr.valueFieldDepth",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_provider": "fieldDepth",
+      "symbol": "l_TrustIr_valueFieldDepth",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.fieldDepth",
+      "abi": {
+        "arity": 1,
+        "parameter_types": [
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.ValueMap",
+      "logical_full_name": "TrustIr.arrayTreeDepth",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_provider": "treeDepth",
+      "symbol": "l_TrustIr_arrayTreeDepth",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.treeDepth",
+      "abi": {
+        "arity": 2,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.ValueMap",
+      "logical_full_name": "TrustIr.arrayLeafDepth",
+      "runtime_module": "TrustIrRuntime.ValueDepth",
+      "runtime_provider": "leafDepth",
+      "symbol": "l_TrustIr_arrayLeafDepth",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.ValueDepthRuntime.leafDepth",
+      "abi": {
+        "arity": 2,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.ByteImage",
+      "logical_full_name": "TrustIr.ByteImage.map",
+      "runtime_module": "TrustIrRuntime.ImageMap",
+      "runtime_provider": "map",
+      "symbol": "l_TrustIr_ByteImage_map",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.ByteImage.ImageMapRuntime.map",
+      "abi": {
+        "arity": 2,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.ByteImageTraversal",
+      "logical_full_name": "TrustIr.ByteImage.firstWhere",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_provider": "firstWhere",
+      "symbol": "l_TrustIr_ByteImage_firstWhere",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.ByteImage.WindowRuntime.firstWhere",
+      "abi": {
+        "arity": 2,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.ByteImageTraversal",
+      "logical_full_name": "TrustIr.ByteImage.mapBlocks",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_provider": "mapBlocks",
+      "symbol": "l_TrustIr_ByteImage_mapBlocks",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.ByteImage.WindowRuntime.mapBlocks",
+      "abi": {
+        "arity": 6,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.State.ByteImageTraversal",
+      "logical_full_name": "TrustIr.ByteImage.checkBlocks",
+      "runtime_module": "TrustIrRuntime.ByteWindows",
+      "runtime_provider": "checkBlocks",
+      "symbol": "l_TrustIr_ByteImage_checkBlocks",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.ByteImage.WindowRuntime.checkBlocks",
+      "abi": {
+        "arity": 5,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    },
+    {
+      "logical_module": "TrustIr.Semantics.AggregateImages",
+      "logical_full_name": "_private.TrustIr.Semantics.AggregateImages.0.TrustIr.AggregateMemory.encodeArrayImage",
+      "runtime_module": "TrustIrRuntime.ArrayEncoding",
+      "runtime_provider": "encodeTree",
+      "symbol": "l___private_TrustIr_Semantics_AggregateImages_0__TrustIr_AggregateMemory_encodeArrayImage",
+      "correspondence": "UNPROVED",
+      "certified": false,
+      "runtime_full_name": "TrustIr.AggregateMemory.ArrayEncodingRuntime.encodeTree",
+      "abi": {
+        "arity": 3,
+        "parameter_types": [
+          "lean_object*",
+          "lean_object*",
+          "lean_object*"
+        ],
+        "return_type": "lean_object*",
+        "convention": "full boxed Lean export ABI, including irrelevant placeholders"
+      }
+    }
+  ],
+  "runtime_import_roots": [
+    "Tests.AYSMTLib",
+    "Tests.ICmpParity",
+    "Tools.DecodedCFGBenchmark",
+    "Tools.DecodedCFGMappingProbe",
+    "Tools.FunctionLookupBenchmark",
+    "TrustIrEval.AggregateImageWork",
+    "TrustIrEval.ByteImageTests",
+    "TrustIrEval.ClosureTests",
+    "TrustIrEval.ComparisonTests",
+    "TrustIrEval.CoroAllBlocksFactory",
+    "TrustIrEval.CoroModuleFactory",
+    "TrustIrEval.CoroPrefixFactory",
+    "TrustIrEval.DescriptorSchema",
+    "TrustIrEval.EnumCodecTests",
+    "TrustIrEval.EnumPlanTests",
+    "TrustIrEval.FloatChoiceTests",
+    "TrustIrEval.FunctionMemoryTests",
+    "TrustIrEval.FunctionNamespaceTests",
+    "TrustIrEval.LocalTypeScaling",
+    "TrustIrEval.Main",
+    "TrustIrEval.NatIndexChecks",
+    "TrustIrEval.ObservationCorpus",
+    "TrustIrEval.ObservationSharingTests",
+    "TrustIrEval.ObservationTests",
+    "TrustIrEval.PeriodicValueTests",
+    "TrustIrEval.RecordKeysMain",
+    "TrustIrEval.RuntimeBoundaryTests",
+    "TrustIrEval.SharedConsumerTests",
+    "TrustIrEval.SignatureAbiTests",
+    "TrustIrEval.SourceLayoutOracle",
+    "TrustIrEval.SourceLayoutScaling",
+    "TrustIrEval.TypedImageTests"
+  ],
+  "runtime_modules": [
+    "TrustIrRuntime.StoredCheck",
+    "TrustIrRuntime.Equality",
+    "TrustIrRuntime.ValueDepth",
+    "TrustIrRuntime.ArrayEncoding",
+    "TrustIrRuntime.ImageMap",
+    "TrustIrRuntime.ByteWindows"
+  ],
+  "runtime_support": "Original private logical cache-state models remain unchanged; runtime uses separate private representation copies, with correspondence UNPROVED.",
+  "native_attachment": {
+    "logical_module": "TrustIrNativeLink",
+    "provider_module": "TrustIrRuntime",
+    "initializer_symbol": "initialize_TrustIrNativeLink",
+    "provider_initializer_symbol": "initialize_TrustIrRuntime",
+    "initializer_source": "lean/trust_ir-semantics/native/runtime_init.c",
+    "fixture_modules": [
+      "TrustIr.Semantics.ExecutableFixtures",
+      "TrustIr.Semantics.FloatFixtures"
+    ],
+    "activation_module": "TrustIr.Semantics.Eval",
+    "lean430_initializer": {
+      "arity": 1,
+      "symbols": "initialize_ + Lake.Module.dynlibName"
+    }
+  },
+  "support_obligations": [
+    {
+      "id": "runtime-module-initialization",
+      "source_inputs": [
+        "lean/trust_ir-semantics/native/runtime_init.c",
+        "lean/trust_ir-semantics/TrustIrRuntime.lean",
+        "lean/trust_ir-semantics/lakefile.lean"
+      ],
+      "role": "Invoke all provider module initializers through ordinary Lean import initialization; preserve errors, sticky failure and initializer ABI.",
+      "state": "UNPROVED",
+      "certified": false
+    },
+    {
+      "id": "native-only-lake-link",
+      "source_inputs": [
+        "lean/trust_ir-semantics/lakefile.lean",
+        "lean/trust_ir-semantics/TrustIrNativeLink.lean",
+        "lean/trust_ir-semantics/native/runtime_ffi.h"
+      ],
+      "role": "Build and link the complete provider once through native facets, trace the actual boxed-ABI header in C object jobs, and co-locate modern model foundations without importing unsafe declarations into logical environments.",
+      "state": "UNPROVED",
+      "certified": false
+    },
+    {
+      "id": "logical-fixture-native-evaluation",
+      "source_inputs": [
+        "lean/trust_ir-semantics/TrustIr/Semantics/Eval.lean",
+        "scripts/lean_proofs.py"
+      ],
+      "role": "Retain original semantic native_decide fixture goals and load initialized native implementations through Eval; this compiler/runtime-dependent evaluation is not a runtime correspondence proof.",
+      "state": "UNPROVED",
+      "certified": false
+    }
+  ],
+  "native_foundation_modules_lean430": [
+    "TrustIr.Basic",
+    "TrustIr.CompilerCompat",
+    "TrustIr.Constant",
+    "TrustIr.Semantics.Monad",
+    "TrustIr.State.ArrayEncodingStats",
+    "TrustIr.State.ByteImage",
+    "TrustIr.State.ByteImageTraversal",
+    "TrustIr.State.CompactArray",
+    "TrustIr.State.MachineState",
+    "TrustIr.State.Memory",
+    "TrustIr.State.Permission",
+    "TrustIr.State.ValueMap",
+    "TrustIr.StringCompat"
+  ]
+}

@@ -1,6 +1,8 @@
 //@ dont-check-compiler-stderr
-//@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //@ edition: 2021
 //! Trust (B5 stage 1b, reads): a yield-free CAPTURING coroutine body — an
 //! `async fn` reading its own parameters — lowers clean. Stage 1b signed its
@@ -12,6 +14,13 @@
 //! ref-param `Load`/`Store`. On the signing-only build every one of these
 //! bodies stopped at `UpvarRef(non-closure env pointee)`; `strict` turns that
 //! into a compile error, so this file is the mutation check.
+//!
+//! EFFECT CONSERVATION (D28, 2026-10-01): `main` drops six coroutine VALUES (a coroutine's drop
+//! glue depends on its state and saved locals, which rustc's own `needs_drop` does not compute
+//! either), while each coroutine body's drop of its OWN env runs only its `Copy` upvars' glue and
+//! stays clean. The direct trust-ir emits no `Drop` yet, so the effect-conservation gate tags each
+//! such body `Abstracted(drop, ..)` and strict refuses it (expected below). A producer tag would
+//! still be its own, unannotated, strict error, so this file keeps its mutation check.
 struct S {
     a: i64,
     b: i64,
@@ -35,6 +44,7 @@ async fn bump(p: &mut u64) {
     *p += 1;
 }
 fn main() {
+    //~^ ERROR the effect-conservation check refused it against the built MIR
     let _a = add(1, 2);
     let x = 3;
     let _p = pick(true, &x);

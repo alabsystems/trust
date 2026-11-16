@@ -371,14 +371,6 @@ fn formula_vars_are_entry_visible(f: &trust_types::Formula, arg_count: usize) ->
         if !*ok {
             return;
         }
-        fn is_parameter_local(name: &str, arg_count: usize) -> bool {
-            let digits: String =
-                name.trim_start_matches('_').chars().take_while(char::is_ascii_digit).collect();
-            if digits.is_empty() || !name.starts_with('_') || name.starts_with("__") {
-                return false;
-            }
-            digits.parse::<usize>().is_ok_and(|n| (1..=arg_count).contains(&n))
-        }
         match f {
             F::Var(name, _) => {
                 if name.starts_with('_') && !is_parameter_local(name, arg_count) {
@@ -1399,12 +1391,33 @@ impl ProveScorecard {
     /// with an explicit [`crate::trustir_bridge::BridgeGateMode::Spot`].
     /// Fail-closed: on `Err` NOTHING is attached — the caller must surface the
     /// error, and `bridge_line` reports "not run", never a claim.
+    ///
+    /// No wall-clock bound: see [`Self::attach_bridge_agreement_with_budget`].
     pub fn attach_bridge_agreement(
         &mut self,
     ) -> Result<(), crate::trustir_bridge::BridgeGateError> {
-        use crate::trustir_bridge::{BridgeGateConfig, BridgeGateMode, run_bridge_gate};
+        self.attach_bridge_agreement_with_budget(0)
+    }
+
+    /// [`Self::attach_bridge_agreement`] bounded by the per-function
+    /// wall-clock budget `budget_secs` that [`prove_dump_dir_with_budget`]
+    /// gives each function: every step of the gate gets
+    /// [`bridge_step_budget_secs`]`(budget_secs)` (see
+    /// [`crate::trustir_bridge::run_bridge_gate_with_step_budget`]), and `0`
+    /// means unbounded. A step that spends it returns
+    /// [`crate::trustir_bridge::BridgeGateError::BudgetExceeded`] — a TIMEOUT,
+    /// for which [`crate::trustir_bridge::BridgeGateError::is_incomplete`]
+    /// holds — and, like every `Err`, attaches nothing.
+    pub fn attach_bridge_agreement_with_budget(
+        &mut self,
+        budget_secs: u64,
+    ) -> Result<(), crate::trustir_bridge::BridgeGateError> {
+        use crate::trustir_bridge::{
+            BridgeGateConfig, BridgeGateMode, run_bridge_gate_with_step_budget,
+        };
         let config = BridgeGateConfig::locate(BridgeGateMode::Full);
-        self.bridge_agreement = Some(run_bridge_gate(&config)?);
+        self.bridge_agreement =
+            Some(run_bridge_gate_with_step_budget(&config, bridge_step_budget_secs(budget_secs))?);
         Ok(())
     }
 
@@ -1426,6 +1439,11 @@ impl ProveScorecard {
                 .to_string();
         };
         let arms_total = if b.mode == "full" { 18 } else { b.ops_bridged + b.ops_pinned };
+        let runtime_disclosure = b.runtime_frontier.as_ref().map_or_else(
+            || "Runtime boundary UNREPORTED by this logical gate; it \
+                makes no runtime or emitted-byte correspondence claim.".to_owned(),
+            crate::trustir_bridge::RuntimeFrontier::disclosure,
+        );
         let commit_short: String = b.trustir_commit.chars().take(12).collect();
         let pinned_clause = if b.ops_pinned == 0 {
             "0 arms un-bridged".to_string()
@@ -1507,9 +1525,13 @@ impl ProveScorecard {
             )
         };
         let overflow_composed_clause = if b.overflow_composed {
-            "the composed `bridge_semOverflowOp_agreement_all` conjunction (6 VALUE ∧ 5 FLAG \
-             arms) kernel-checks with axiom_deps = ∅"
-                .to_string()
+            format!(
+                "the composed `bridge_semOverflowOp_agreement_all` conjunction (6 VALUE ∧ 6 FLAG \
+                 arms) kernel-checks with non-foundational axiom_deps = ∅; \
+                 {} registered unsigned-Mul Int predicates have checked links (foundational \
+                 closure {:?}); this does not establish BV equivalence",
+                b.overflow_umul_predicate_bridged.len(), b.overflow_umul_foundational_axioms
+            )
         } else if b.mode == "spot" {
             "composed Overflow theorem not attempted in spot mode".to_string()
         } else {
@@ -1592,7 +1614,7 @@ impl ProveScorecard {
             )
         };
         let stepinst_binop_arms_total =
-            if b.mode == "full" { 3 } else { b.stepinst_binop_bridged + b.stepinst_binop_pinned };
+            if b.mode == "full" { 7 } else { b.stepinst_binop_bridged + b.stepinst_binop_pinned };
         let stepinst_binop_pinned_clause = if b.stepinst_binop_pinned == 0 {
             "0 stepInst-BinOp arms un-bridged".to_string()
         } else {
@@ -1602,7 +1624,7 @@ impl ProveScorecard {
             )
         };
         let stepinst_binop_composed_clause = if b.stepinst_binop_composed {
-            "the composed `bridge_stepInst_binop_agreement_all` conjunction (Add ∧ Sub ∧ Mul) \
+            "the composed `bridge_stepInst_binop_agreement_all` conjunction (Add/Sub/Mul/UDiv/SDiv/URem/SRem) \
              kernel-checks with axiom_deps = ∅"
                 .to_string()
         } else if b.mode == "spot" {
@@ -1776,11 +1798,12 @@ impl ProveScorecard {
         };
         let steploop_unbridged_clause = format!("un-bridged by design: {:?}", b.steploop_unbridged);
         format!(
-            "Lean↔Clean BRIDGE (§6 agreement gate, mode={}): {}/{} semIntBinOp arms carry a \
+            "Lean↔Clean BRIDGE (§6 agreement gate, mode={}): {} {}/{} semIntBinOp arms carry a \
              kernel-checked AGREEMENT theorem between trust-ir's IMPORTED Lean 4.8 operational \
              semantics (machine-imported from vendored .oleans, {} modules / {} constants, \
              sha256-manifested and pinned to first-party/trust-ir {}; imported TrustIr \
-             constants fully recheck {}/{} with 0 failures) and trust-clean's denotation \
+             declaration census: {} seen, {} safe kernel admissions, {} runtime implementations \
+             explicitly refused without authority, 0 fatal failures) and trust-clean's denotation \
              constants (the `Int.add/sub/mul/…` family the live grounder emits): {} form-(a) \
              float arms agree UNCONDITIONALLY (the integer path is the typeError value on both \
              sides); {} form-(b) arithmetic arms agree UNDER THE NO-OVERFLOW/IN-RANGE SIDE \
@@ -1965,9 +1988,9 @@ impl ProveScorecard {
              kernel-proven structural fact about the CURRENT vendored evaluator, not a proof- \
              engineering inconvenience. \
              HONEST BOUND: this bridges semIntBinOp (the BinOp arithmetic layer), semIntUnOp's \
-             Neg/Not/FNeg arms, semOverflowOp's VALUE (all 6 combos) + FLAG (5 of 6 combos, \
-             unsigned-Mul excluded), semICmp (all 10 comparison arms), semCast's integer arms \
-             (Trunc/ZExt/SExt), stepInst's `.BinOp` Add/Sub/Mul arms, stepInst's `.UnOp`/ \
+             Neg/Not/FNeg arms, semOverflowOp's VALUE and FLAG (all 6 generic Int combos \
+             each, with four concrete unsigned-Mul predicate links), semICmp (all 10 comparison arms), semCast's integer arms \
+             (Trunc/ZExt/SExt), stepInst's `.BinOp` Add/Sub/Mul/UDiv/SDiv/URem/SRem arms, stepInst's `.UnOp`/ \
              `.Overflow`/`.ICmp`/`.Cast` arms (one representative op each — Neg, unsigned \
              AddOverflow, Ult, Trunc — completing instruction-execution breadth across every \
              value-bridged Inst category), the FIRST whole-block `stepN`/`stepBlock` agreement \
@@ -1975,8 +1998,7 @@ impl ProveScorecard {
              `.Continue`, both paths of a 2-way branch), and — NEW — the FIRST branching \
              agreement where the ARMS THEMSELVES COMPUTE (both paths of a 2-way branch whose \
              taken arm folds one `BinOp` before returning); trust-ir's WIDER Inst/statement-level \
-             Lean semantics remains largely unbridged: `UnOp::CtPop`, unsigned `MulOverflow`'s \
-             flag, semCast's 14 non-integer (float/pointer/closure) arms, the other 15 \
+             Lean semantics remains largely unbridged: `UnOp::CtPop`, semCast's 14 non-integer (float/pointer/closure) arms, the other 11 \
              `semIntBinOp` ops + the other 5 UnOp/Overflow/ICmp/Cast ops per category (Not/FNeg; \
              the other 5 op×signedness Overflow combos; ICmp's other 9 comparisons; Cast's \
              ZExt/SExt) reachable through `stepInst` (value-bridged but not yet chained), `FCmp` \
@@ -2008,13 +2030,15 @@ impl ProveScorecard {
              UNTRUSTED planner + emitter and independently re-kernel-checked exactly like every \
              hand-written arm above): {}.",
             b.mode,
+            runtime_disclosure,
             b.ops_bridged,
             arms_total,
             b.modules_loaded,
             b.constants_loaded,
             commit_short,
+            b.trustir_recheck_seen,
             b.trustir_recheck_pass,
-            b.trustir_recheck_pass,
+            b.trustir_runtime_refused,
             b.form_a,
             b.form_b,
             b.form_b_guarded,
@@ -3923,6 +3947,7 @@ fn extract_iter_loop_function(
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind,
             ..
         } = &block.terminator
@@ -4398,9 +4423,11 @@ pub fn extract_iter_loop_function_pub(
 /// [`declared_postcondition_surface_empty`] — no `ensures` may ride the havocked
 /// accumulator. TERMINATION-CLAIM: `total_available = function_safety_vcs_all_discharged`
 /// is threaded to the witness, so the termination half is emitted ONLY when NO undischarged
-/// panic exit remains. For sum_loop/count_pos the accumulator-overflow VC is undischarged,
-/// so `total_available` is `false` and only the PARTIAL tier is certified — the function's
-/// overall verdict is UNCHANGED (this lane is verdict-neutral / diagnostic-only).
+/// panic exit remains. For sum_loop the accumulator-overflow VC is undischarged, so
+/// `total_available` is `false` and only the PARTIAL tier is certified; for count_pos it
+/// refutes (vcgen's slice trip-count bound, `371552d454`), so the termination half is minted
+/// too. Either way the function's overall verdict is UNCHANGED (this lane is
+/// verdict-neutral / diagnostic-only).
 #[must_use]
 pub fn iter_loop_partial_faithful(
     func: &VerifiableFunction,
@@ -8555,14 +8582,13 @@ fn ir_field_read_operand(
             if call_dest_written {
                 return None;
             }
+            // `&raw const` included (INT-RAWCONST-HAVOC-1); `param_reassigned_by_stmt`
+            // above already asks the same question.
             let mutably_aliased = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
-                matches!(s,
-                    trust_types::Statement::Assign {
-                        rvalue: trust_types::Rvalue::Ref { mutable: true, place }, ..
-                    } | trust_types::Statement::Assign {
-                        rvalue: trust_types::Rvalue::AddressOf(true, place), ..
-                    }
-                    if place.local == p.local)
+                trust_vcgen::place_write::write_capable_borrow(body, s, |place| {
+                    place.local == p.local
+                })
+                .is_some()
             });
             if mutably_aliased {
                 return None;
@@ -8826,6 +8852,7 @@ fn straight_line_ir_return_spine(
                             is_foreign: false,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: None,
                             ..
                         } if func == "core::panicking::panic")
                 {
@@ -9074,10 +9101,10 @@ pub(crate) fn straight_line_ir_body(
     };
     // A trust-ir binop for a MIR `BinOp` (the additive scalar fragment + division +
     // remainder). `Div` maps to the trust-ir `SDiv` (the universal-IR signed-division
-    // variant), which the anchor grounds to the SAME opaque `Int.div` `clean_ground`'s
+    // variant), which the anchor grounds to the SAME prelude `Int.div` `clean_ground`'s
     // `F::Div` arm emits — so the `checked_div` (`a / b`, precondition `b != 0`)
     // straight-line return is grounder-connected. `Rem` — Trust: witness-tier Rem arm —
-    // maps to the trust-ir `SRem`, grounding to the SAME opaque truncated `Int.mod`
+    // maps to the trust-ir `SRem`, grounding to the SAME prelude truncated `Int.mod`
     // `clean_ground`'s `F::Rem` arm emits — so the `checked_rem` (`a % b`, precondition
     // `b != 0`, rem-corpus) straight-line return is grounder-connected too.
     // SOUNDNESS: the negative controls `unsafe_div`/`unsafe_rem` (NO precondition)
@@ -10564,7 +10591,7 @@ pub(crate) fn field_post_mutator_ir_cfgs(
             {
                 return None;
             }
-            struct_params.insert(l, fields.clone());
+            struct_params.insert(l, fields.to_vec());
         } else if !matches!(ty, Ty::Int { .. } | Ty::Bool) {
             return None;
         }
@@ -13737,7 +13764,7 @@ fn branch_fully_faithful_via_trustir(func: &VerifiableFunction) -> bool {
         return false;
     };
     // (a) the TRUST-IR branch refinement closes modulo 3 (the PRIMARY witness) — the
-    // GROUNDER-CONNECTED check first; Trust: B3 (2026-08-12, owner-ruled) — the
+    // GROUNDER-CONNECTED check first; Trust: B3 (2026-08-12) — the
     // MODEL-ONLY fallback second, the same grounded-first-then-model structure the
     // chain lane carries. This is what lets a `Discr`-guarded switch (the
     // `w_result_is_ok` family) certify: its guard operand is MODEL-ONLY, so the
@@ -14156,6 +14183,7 @@ pub(crate) enum HandleActual {
     Const { fields: Vec<i128>, discr: Option<i128> },
 }
 
+#[cfg(test)]
 #[must_use]
 pub(crate) fn substitute_ret_model_for_test(
     model: &crate::trustir_anchor::IrBody,
@@ -14733,6 +14761,7 @@ pub(crate) fn efht_p_path_actual_ok_for_test(
 /// TRANSPORT lane accept this body ON ITS OWN, independent of the disjunction it sits in?
 /// "Accepts nothing" and "accepts only bodies another lane already covered" are different
 /// failures and the `||` cannot tell them apart.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn transported_call_return_for_test(
     func: &VerifiableFunction,
@@ -15074,6 +15103,7 @@ fn transported_call_return_fully_faithful_via_trustir(
 
 /// [`call_return_fully_faithful_via_trustir`] for measurement — used to tell "the transport
 /// lane accepts nothing" apart from "it accepts only what the OPAQUE lane already covers".
+#[cfg(test)]
 #[must_use]
 pub(crate) fn call_return_fully_faithful_via_trustir_for_test(
     func: &VerifiableFunction,
@@ -16259,6 +16289,7 @@ fn via_trustir_shape_witnessed(
 /// by name (`stack_safe_drift`) — fail-closed, so the no-bodies entry points
 /// are byte-identical to rung A for every other shape.
 /// [`via_trustir_shape_witnessed_with_bodies`] for measurement.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn via_trustir_shape_witnessed_for_test(
     func: &VerifiableFunction,
@@ -16926,20 +16957,21 @@ pub(crate) fn local_has_only_one_bare_call_destination(
     body: &trust_types::VerifiableBody,
     local: usize,
 ) -> bool {
-    use trust_types::{Rvalue, Statement, Terminator};
+    use trust_types::{Statement, Terminator};
 
     let mut bare_call_destinations = 0usize;
     for block in &body.blocks {
         for statement in &block.stmts {
             match statement {
-                Statement::Assign { place, rvalue, .. } => {
+                Statement::Assign { place, .. } => {
                     // Check the alias source independently of the assignment
                     // destination. In particular `_x := &mut _x` must not be
                     // accepted merely because the destination arm matched first.
-                    if matches!(rvalue,
-                        Rvalue::Ref { mutable: true, place }
-                            | Rvalue::AddressOf(true, place)
-                            if place.local == local)
+                    // A `&raw const` alias counts (INT-RAWCONST-HAVOC-1).
+                    if trust_vcgen::place_write::write_capable_borrow(body, statement, |p| {
+                        p.local == local
+                    })
+                    .is_some()
                         || place.local == local
                     {
                         return false;
@@ -17057,24 +17089,30 @@ pub(crate) fn local_write_count(body: &trust_types::VerifiableBody, local: usize
 /// different direct write effect is rooted at the same local. This is the
 /// completeness primitive behind fixed-write-set recognizers: an integer count
 /// is meaningful only after every explicit destination channel has been checked.
+///
+/// `body` is the function `blocks` belong to; the alias arm reads it to tell the
+/// extractor's fake-metadata `&raw const` (a pointer read only by `PtrMetadata`)
+/// from a real one (INT-RAWCONST-HAVOC-1).
 fn local_complete_bare_assignment_count_in_blocks<'a>(
+    body: &trust_types::VerifiableBody,
     blocks: impl IntoIterator<Item = &'a trust_types::BasicBlock>,
     local: usize,
 ) -> Option<usize> {
-    use trust_types::{Rvalue, Statement, Terminator};
+    use trust_types::{Statement, Terminator};
 
     let mut bare_assignments = 0usize;
     for block in blocks {
         for statement in &block.stmts {
             match statement {
-                Statement::Assign { place, rvalue, .. } => {
-                    // A mutable/raw-mutable alias makes later indirect writes
-                    // invisible to every rooted destination scan. Check it even
-                    // when this assignment also writes `local` itself.
-                    if matches!(rvalue,
-                        Rvalue::Ref { mutable: true, place }
-                            | Rvalue::AddressOf(true, place)
-                            if place.local == local)
+                Statement::Assign { place, .. } => {
+                    // A mutable/raw alias (`&raw const` too, INT-RAWCONST-HAVOC-1)
+                    // makes later indirect writes invisible to every rooted
+                    // destination scan. Check it even when this assignment also
+                    // writes `local` itself.
+                    if trust_vcgen::place_write::write_capable_borrow(body, statement, |p| {
+                        p.local == local
+                    })
+                    .is_some()
                     {
                         return None;
                     }
@@ -17116,7 +17154,7 @@ pub(crate) fn local_complete_bare_assignment_count(
     body: &trust_types::VerifiableBody,
     local: usize,
 ) -> Option<usize> {
-    local_complete_bare_assignment_count_in_blocks(body.blocks.iter(), local)
+    local_complete_bare_assignment_count_in_blocks(body, body.blocks.iter(), local)
 }
 
 /// Whether `local` has exactly `expected` bare `Statement::Assign` writes and no
@@ -17212,7 +17250,7 @@ fn resolve_counter_update(
             continue;
         }
         let counter_local = place.local;
-        if local_complete_bare_assignment_count_in_blocks(std::iter::once(be), counter_local)
+        if local_complete_bare_assignment_count_in_blocks(body, std::iter::once(be), counter_local)
             != Some(1)
         {
             continue; // not the sole complete rooted write in this back-edge block.
@@ -17537,8 +17575,11 @@ fn collect_loop_body_updates(
     // decline (empty) on any additional write — every caller already declines on an
     // unexpected `updates` shape/length, so an empty result here is a clean decline.
     for (local, _) in &updates {
-        if local_complete_bare_assignment_count_in_blocks(spine_blocks.iter().copied(), *local)
-            != Some(1)
+        if local_complete_bare_assignment_count_in_blocks(
+            body,
+            spine_blocks.iter().copied(),
+            *local,
+        ) != Some(1)
         {
             return Vec::new();
         }
@@ -18047,8 +18088,68 @@ pub fn augment_with_type_bounds_pub(
 /// every future duplicate-conjunct change, which is exactly the drift this pin
 /// exists to catch. A vcgen-side dedup at the normalization pass is worth doing, but
 /// it moves this pin AGAIN and belongs in its own commit with its own re-derivation.
+///
+/// SIBLING-ORDER RE-PIN (2026-09-14), `cc82c41b…` -> `9fc13a49…`. **THE BODY DID NOT
+/// MOVE** — `INSTANTIATOR_ORD_LEAF_CONTENT_HASH` is unchanged and its assert passes;
+/// only the emitted formula did. Found by the first full `crates/` unit sweep since
+/// the 08-31 re-pin (no push lane runs this test).
+///
+/// THE WHOLE DELTA IS THE ORDER OF TWO SIBLING CONJUNCTS. Measured with two
+/// standalone replay drivers over the SAME decoded function (this test's
+/// authenticated-legacy-metadata decode, dumped to JSON and fed to both): vcgen at
+/// the 08-31 pin commit `ad56b503bd` reproduces `cc82c41b…` exactly and vcgen at
+/// HEAD reproduces `9fc13a49…` exactly. Leaf-by-leaf: 32 leaves on both sides, the
+/// same multiset, the same `And`/`Or` tree shape, kind unchanged. Inside the
+/// innermost `And[4]` — the block that carries the cond-bound disjunct
+/// `Or([Lt(idx, 1), Eq(_10, Sub(idx, 1))])` — the `__trust_mir__discr__3`
+/// decoded-tag membership `Or([Eq(d, -1), Eq(d, 0), Eq(d, 1)])` now sits at index 1
+/// and the `_6` membership at index 2, where the 08-31 formula had them the other
+/// way round. Nothing else differs, and the duplicated `_6` range siblings the
+/// previous re-pin documented are still there, still adjacent, still two.
+///
+/// SOUND: `A ∧ B ≡ B ∧ A`. Not a new fact, not a widened fact, not a dropped fact —
+/// the same hypothesis set in a different serialization order, which the digest is
+/// sensitive to by design (it hashes `serde_json::to_vec` over the tree; it is not
+/// a canonical form and must not become one, see the paragraph above).
+///
+/// ANTI-VACUITY CONTROLS RE-RUN on this tree with the live in-process solver, all
+/// three UNCHANGED from the 08-31 measurement: CONTROL (no injected fact) => `None`;
+/// NEGATIVE (`Ge(idx, self*.1)`) => `None`; POSITIVE (`Gt(idx, self*.1)`) =>
+/// `Some(RefutedModulo3)`. The strict guard-implied inequality is still the sole
+/// load-bearing hypothesis.
+///
+/// MOVED BY `c1973b0c66` (2026-08-31, "seam(local_defs): ONE definition seam, and
+/// the parameter's ENTRY definition counted"), ISOLATED BY A BISECT BUILD this time:
+/// the 08-31 re-pin `ad56b503bd` and that commit sat on the two sides of the 09-01
+/// merge `78f914b6d7`, and a first-parent bisect landed on the merge; over its four
+/// merged-side vcgen commits, `945a8fbff5` still hashes `cc82c41b…` and `c1973b0c66`
+/// — the very next one — hashes `9fc13a49…`. Mechanism, read off the commit rather
+/// than traced end to end: it moved every walk over a local's writes into the one
+/// `local_defs.rs` seam, so the per-local facts are emitted in the seam's
+/// enumeration order — which puts the discriminant carrier's membership ahead of
+/// `_6`'s. Evidence level, stated plainly: the delta is measured to the byte, the
+/// controls are measured, the introducer is bisected; only the last sentence is
+/// inferred.
+///
+/// MOVED AGAIN 2026-10-01 to `f67e7a3f…` by the stale-read fix `2aacba975d`
+/// ("trust-vcgen: close the stale-read / return-pin false proofs (vac Phase 0 +
+/// 1)"), diffed to the byte against a build of `2b05b645a1` (which still hashes
+/// `9fc13a49…`): a read through `&self` now binds to the ENTRY snapshot
+/// `self*.1#e`, so the formula gains `self*.1#e`'s u32 range fact and the alias
+/// `self*.1#e == self*.1`, and `_5*#s0_1` is equated with `self*.1#e` instead of
+/// `self*.1`. Nothing is dropped; the injected `Gt(idx, self*.1)` reaches the
+/// compare through the alias. The three anti-vacuity controls are now a test
+/// (`instantiator_ordering_discharge_anti_vacuity_controls`): CONTROL `None`,
+/// NEGATIVE `None`, POSITIVE `Some(RefutedModulo3)`.
+///
+/// MOVED AGAIN 2026-11-09 to `38d00725…` after `354c8202e1` ("fix: share
+/// mutation-aware value stability checks") tightened `LocalDefinitionSummary`
+/// whole-local SSA stability across `Terminator::Drop` / escape edges; verified
+/// against `instantiator_ordering_discharge_anti_vacuity_controls` (CONTROL
+/// `None`, NEGATIVE `None`, POSITIVE `Some(RefutedModulo3)`) and
+/// `raw_and_canonical_bytes_agree_for_the_pinned_material_shape`.
 const INSTANTIATOR_ORD_LEAF_VC_HASH: &str =
-    "cc82c41b3d706ba4e1f572cd2d29f7d0d6b58199a4d67d33f2b87dc95bd9c277";
+    "38d00725af958112c67358343fbcaeb8d2a629f2cd37b06041a4ef03d8675b77";
 
 fn vc_kind_formula_hash(vc: &trust_types::VerificationCondition) -> Option<String> {
     let bytes = serde_json::to_vec(&(&vc.kind, &vc.formula)).ok()?;
@@ -18706,12 +18807,11 @@ fn collect_value_assignments(
     // through a `&mut`/`&raw mut` alias of `base` (`(*p) = v` where `p := &mut base`) is ALSO
     // invisible to the `Statement::Assign`-to-`base` scan below (it targets `p`'s place, not
     // `base`'s), so the enumeration would again be incomplete the moment such an alias exists
-    // anywhere in the body — mirrors `param_reassigned_by_stmt`'s alias arm. Fail-closed.
+    // anywhere in the body — mirrors `param_reassigned_by_stmt`'s alias arm (a `&raw const`
+    // alias included, INT-RAWCONST-HAVOC-1). Fail-closed.
     let mutably_aliased = func.body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
-        matches!(s,
-            Statement::Assign { rvalue: Rvalue::Ref { mutable: true, place }, .. }
-                | Statement::Assign { rvalue: Rvalue::AddressOf(true, place), .. }
-            if place.local == idx)
+        trust_vcgen::place_write::write_capable_borrow(&func.body, s, |place| place.local == idx)
+            .is_some()
     });
     if mutably_aliased {
         return None;
@@ -18809,9 +18909,28 @@ fn upgrade_authenticated_legacy_enum_ty(
                 upgrade_authenticated_legacy_enum_ty(field, metadata);
             }
         }
-        trust_types::Ty::Adt { layout: _,  name, fields, variants, disc_index_safe, faithful_enum_repr, enum_layout: _, adt_kind: _, arbitrary_precision: _ } => {
-            for (_, field) in fields.iter_mut() {
-                upgrade_authenticated_legacy_enum_ty(field, metadata);
+        trust_types::Ty::Adt { layout: _,  name, fields, variants, disc_index_safe, faithful_enum_repr, enum_layout: _, adt_kind: _, arbitrary_precision: _, validity_wrapper: _ } => {
+            // Descend on a clone of each field and only `make_mut` when a
+            // descendant actually changed. `fields` is a shared body now; an
+            // unconditional `make_mut` here materialized a private copy of
+            // every ADT this walk visited -- and the callers run it over every
+            // local and the return type -- which defeated the sharing on
+            // exactly the path it was introduced for. A `Ty` clone is a
+            // refcount bump for shared bodies, and the `!=` below is a
+            // pointer-equality fast path when nothing changed.
+            let mut upgraded: Vec<(usize, trust_types::Ty)> = Vec::new();
+            for (index, (_, field)) in fields.iter().enumerate() {
+                let mut candidate = field.clone();
+                upgrade_authenticated_legacy_enum_ty(&mut candidate, metadata);
+                if &candidate != field {
+                    upgraded.push((index, candidate));
+                }
+            }
+            if !upgraded.is_empty() {
+                let owned = fields.make_mut();
+                for (index, candidate) in upgraded {
+                    owned[index].1 = candidate;
+                }
             }
             if matches!(metadata, LegacyFixtureEnumMetadata::BudgetVersionMetaFor)
                 && name == "Error"
@@ -18880,7 +18999,8 @@ fn upgrade_authenticated_legacy_enum_ty(
                         discriminant: 6,
                         fields: payload(7, "0"),
                     },
-                ];
+                ]
+                .into();
                 return;
             }
             let exact_legacy_tag = !*disc_index_safe
@@ -19495,12 +19615,12 @@ fn authenticated_type_at_mut<'a>(
         ty = match (step, ty) {
             (AuthenticatedTypeStep::RefInner, trust_types::Ty::Ref { inner, .. }) => inner,
             (AuthenticatedTypeStep::AdtField(field), trust_types::Ty::Adt { fields, .. }) => {
-                &mut fields.get_mut(*field)?.1
+                &mut fields.make_mut().get_mut(*field)?.1
             }
             (
                 AuthenticatedTypeStep::VariantField { variant, field },
                 trust_types::Ty::Adt { variants, .. },
-            ) => &mut variants.get_mut(*variant)?.fields.get_mut(*field)?.1,
+            ) => &mut variants.make_mut().get_mut(*variant)?.fields.get_mut(*field)?.1,
             (
                 AuthenticatedTypeStep::ClosureUpvar(upvar),
                 trust_types::Ty::Closure { upvars, .. },
@@ -19749,7 +19869,7 @@ fn upgrade_authenticated_expr_fold_types(
                         Some(trust_types::Statement::Assign {
                             place,
                             rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(
-                                trust_types::ConstValue::OpaqueConst,
+                                trust_types::ConstValue::OpaqueConst(_),
                             )),
                             ..
                         }) if place.local == local && place.projections.is_empty())
@@ -19764,11 +19884,14 @@ fn upgrade_authenticated_expr_fold_types(
                     return None;
                 };
                 *rvalue = trust_types::Rvalue::Use(trust_types::Operand::Constant(
-                    trust_types::ConstValue::OpaqueScalar { width: 64, signed: false },
+                    trust_types::ConstValue::opaque_scalar(64, false),
                 ));
             }
         }
     }
+    // OPAQUE-SCALAR-ID-1: the restored scalars were minted after the load-time
+    // placement; give each its own site before anything names it.
+    upgraded.body.place_opaque_values();
     (trust_vcgen::validate_function(&upgraded).is_ok()
         && crate::assignment_types::all_assignments_match(&upgraded.body))
     .then_some(upgraded)
@@ -19850,6 +19973,15 @@ fn classify_struct_field_grounding(
 /// test.
 pub fn prove_dump_dir(dir: &Path) -> std::io::Result<ProveScorecard> {
     prove_dump_dir_with_budget(dir, 0)
+}
+
+/// The wall-clock budget of ONE Lean↔Clean bridge-gate step when each function
+/// gets `budget_secs`: [`crate::trustir_bridge::BRIDGE_STEP_BUDGET_SCALE`] times
+/// it (see that constant for the measurement), saturating; `0` stays `0`
+/// (unbounded).
+#[must_use]
+pub fn bridge_step_budget_secs(budget_secs: u64) -> u64 {
+    budget_secs.saturating_mul(crate::trustir_bridge::BRIDGE_STEP_BUDGET_SCALE)
 }
 
 /// [`prove_dump_dir`] with an EXPLICIT per-function wall-clock budget (seconds).
@@ -20988,6 +21120,223 @@ mod tests {
 
     use super::*;
 
+    // Trust: NO-VACUOUS-CORPUS-TEST — the fixture helpers for this module. Read
+    // the note at the top of `mirsem/tests.rs` before adding a corpus test here.
+    //
+    // A checked-in corpus is REQUIRED: a missing directory, an unreadable entry,
+    // or a `.json` row that no longer decodes is a FAILURE naming the path, never
+    // an early `return` / `continue` that lets zero assertions run and still
+    // report `ok`. Do not reintroduce `if !dir.exists() { return; }` or a
+    // `let Ok(..) = .. else { continue }` decode guard in a corpus loop.
+
+    /// Read one required fixture file, or FAIL naming the path.
+    #[track_caller]
+    fn required_fixture_bytes(path: &Path) -> Vec<u8> {
+        std::fs::read(path)
+            .unwrap_or_else(|error| panic!("read required fixture {}: {error}", path.display()))
+    }
+
+    /// Every entry of a required fixture directory, sorted. Fails on a missing or
+    /// unreadable directory, on an unreadable entry, and on an EMPTY directory.
+    #[track_caller]
+    fn required_fixture_paths(dir: &Path) -> Vec<std::path::PathBuf> {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
+            panic!(
+                "read required fixture directory {}: {error}; it is checked in, so this is a \
+                 defect, not a checkout that may be skipped",
+                dir.display()
+            )
+        });
+        let mut paths: Vec<_> = entries
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "read entry in required fixture directory {}: {error}",
+                            dir.display()
+                        )
+                    })
+                    .path()
+            })
+            .collect();
+        paths.sort();
+        assert!(!paths.is_empty(), "required fixture directory {} is empty", dir.display());
+        paths
+    }
+
+    // Trust: NO-VACUOUS-CORPUS-TEST, the whole-corpus walkers (2026-10-09). Every
+    // test in this file that walks a whole dump tree (`fixtures/`, or the
+    // `TRUST_LANE_HISTOGRAM_DIR` / `TRUST_DECLINE_HISTOGRAM_DIR` a measurement
+    // points it at) carried its own
+    //     fn walk(..) { let Ok(rd) = std::fs::read_dir(dir) else { return }; .. }
+    // plus a `let Ok(f) = serde_json::from_slice::<VerifiableFunction>(..) else
+    // { continue }` decode guard: 86 copies. A moved corpus, a mistyped root or a
+    // `VerifiableFunction` schema change read as ZERO bodies, and every `<=` /
+    // `== 0` relation those tests assert over their counts then held at 0/0. They
+    // share `corpus_walk` and `corpus_dump` now, and a test whose assertion would
+    // hold over an empty corpus also asserts a floor (`fixture_corpus` carries one).
+
+    /// Every `.json` file under `dir`, recursively, unsorted. FAILS on a missing or
+    /// unreadable directory and on an unreadable entry, naming the path.
+    #[track_caller]
+    pub(super) fn corpus_walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
+            panic!("read corpus directory {}: {error}", dir.display())
+        });
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|error| {
+                    panic!("read entry in corpus directory {}: {error}", dir.display())
+                })
+                .path();
+            if path.is_dir() {
+                corpus_walk(&path, out);
+            } else if path.extension().and_then(|x| x.to_str()) == Some("json") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The `VerifiableFunction` one corpus file dumps, or `None` when the file is
+    /// JSON that is not a function dump at all: no top-level `def_path` and `body`
+    /// (29 of the 2376 `.json` files under `fixtures/` on 2026-10-09: the
+    /// clean-axioms terms, two terminator goldens and a vendored crate's metadata;
+    /// `the_fixture_files_corpus_dump_skips_are_pinned` pins that set).
+    /// FAILS, naming the path, on an unreadable file, on a file that is not JSON,
+    /// and on a function dump that no longer decodes.
+    #[track_caller]
+    pub(super) fn corpus_dump(path: &Path) -> Option<VerifiableFunction> {
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|error| panic!("read corpus file {}: {error}", path.display()));
+        let error = match serde_json::from_slice::<VerifiableFunction>(&bytes) {
+            Ok(function) => return Some(function),
+            Err(error) => error,
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|json| panic!("corpus file {} is not JSON: {json}", path.display()));
+        assert!(
+            value.get("def_path").is_none() || value.get("body").is_none(),
+            "corpus file {} is a `VerifiableFunction` dump that no longer decodes: {error}",
+            path.display()
+        );
+        None
+    }
+
+    /// Every function dump under `root`, in sorted path order. FAILS when there is
+    /// none, so no relation asserted over the result can hold over an empty corpus.
+    #[track_caller]
+    pub(super) fn fixture_corpus(root: &str) -> Vec<VerifiableFunction> {
+        let mut files = Vec::new();
+        corpus_walk(Path::new(root), &mut files);
+        files.sort();
+        let funcs: Vec<VerifiableFunction> = files.iter().filter_map(|p| corpus_dump(p)).collect();
+        assert!(
+            !funcs.is_empty(),
+            "read NO `VerifiableFunction` dump under {root} ({} .json files found): check \
+             that the fixture corpus is present and still deserializes, or point the \
+             test's TRUST_LANE_HISTOGRAM_DIR / TRUST_DECLINE_HISTOGRAM_DIR at a dump \
+             directory",
+            files.len()
+        );
+        funcs
+    }
+
+    /// `corpus_dump` tells "not a function dump" from "a dump that no longer decodes"
+    /// by the top-level `def_path` + `body` keys, so a dump written under other keys
+    /// (a renamed field, a wrapper object, a truncated writer) is SKIPPED, not failed,
+    /// and the `> 0` floors notice only when every dump drifts at once. This pins what
+    /// may be skipped under `fixtures/`: the kernel-term fixtures under `clean-axioms/`
+    /// and four named non-dump files (29 files on 2026-10-09). Any other skipped file
+    /// fails here, named.
+    #[test]
+    fn the_fixture_files_corpus_dump_skips_are_pinned() {
+        const NON_DUMP_DIR: &str = "clean-axioms/";
+        const NON_DUMP_FILES: [&str; 4] = [
+            "census-callableitem-refresh-2026-07-13/diagnostic/merge2-fresh-block1-terminator.json",
+            "census-callableitem-refresh-2026-07-13/diagnostic/merge2-golden-block1-terminator.json",
+            "fold-crate-lambda-calculus-3.5.0/SOURCE/.cargo_vcs_info.json",
+            "fold-crate-lambda-calculus-3.5.0/metadata/source-selection.json",
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let mut files = Vec::new();
+        corpus_walk(&root, &mut files);
+        files.sort();
+        let (mut dumps, mut skipped) = (0usize, 0usize);
+        let mut unpinned = Vec::new();
+        for path in &files {
+            if corpus_dump(path).is_some() {
+                dumps += 1;
+                continue;
+            }
+            skipped += 1;
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap_or_else(|_| panic!("{} was walked from {}", path.display(), root.display()))
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !relative.starts_with(NON_DUMP_DIR) && !NON_DUMP_FILES.contains(&relative.as_str()) {
+                unpinned.push(relative);
+            }
+        }
+        eprintln!("fixtures/: {} .json files, {dumps} dumps, {skipped} pinned non-dumps", files.len());
+        assert!(
+            unpinned.is_empty(),
+            "corpus_dump skipped {} file(s) under {} that are not pinned non-dumps: {unpinned:?}. \
+             A skipped file has no top-level `def_path` + `body`; a `VerifiableFunction` dump \
+             written under other keys lands here instead of failing to decode. Fix the dump, \
+             or pin the file in this test if it is genuinely not a function dump",
+            unpinned.len(),
+            root.display()
+        );
+        assert!(dumps > 0, "read NO `VerifiableFunction` dump under {}", root.display());
+    }
+
+    /// Decode one required `VerifiableFunction` fixture (plain serde), or FAIL.
+    #[track_caller]
+    fn required_json_fixture(path: &Path) -> VerifiableFunction {
+        let bytes = required_fixture_bytes(path);
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!("decode required VerifiableFunction fixture {}: {error}", path.display())
+        })
+    }
+
+    /// Decode one required fixture through the production authenticated-legacy
+    /// decoder (the one `prove_dump_dir` uses), or FAIL.
+    #[track_caller]
+    fn required_authenticated_fixture(path: &Path) -> VerifiableFunction {
+        let bytes = required_fixture_bytes(path);
+        decode_verifiable_function_with_authenticated_legacy_metadata(&bytes).unwrap_or_else(
+            |error| panic!("decode required authenticated fixture {}: {error}", path.display()),
+        )
+    }
+
+    /// Stage one required checked-in fixture into a scratch directory, or FAIL.
+    #[track_caller]
+    fn copy_required_fixture(src: &Path, dst: &Path) {
+        std::fs::copy(src, dst).unwrap_or_else(|error| {
+            panic!(
+                "copy required checked-in fixture {} to {}: {error}",
+                src.display(),
+                dst.display()
+            )
+        });
+    }
+
+    /// Run the production `prove_dump_dir` over a required checked-in corpus. A
+    /// missing directory or any unreadable / undecodable dump FAILS, naming the path.
+    #[track_caller]
+    fn required_prove_dump_dir(dir: &Path) -> ProveScorecard {
+        assert!(
+            dir.is_dir(),
+            "required fixture corpus {} is missing; it is checked in, so this is a defect, \
+             not a checkout that may be skipped",
+            dir.display(),
+        );
+        prove_dump_dir(dir).unwrap_or_else(|error| {
+            panic!("prove required checked-in fixture corpus {}: {error}", dir.display())
+        })
+    }
+
     fn assignment_typing_function(
         name: &str,
         locals: Vec<trust_types::Ty>,
@@ -21014,6 +21363,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -22119,6 +22469,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -22157,6 +22508,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -22279,6 +22631,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -22394,6 +22747,7 @@ mod tests {
             atomic: None,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             is_foreign: false,
         };
         let commit = Statement::Assign {
@@ -22471,6 +22825,7 @@ mod tests {
                 atomic: None,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 is_foreign: false,
             };
             func.body.blocks.push(BasicBlock {
@@ -22966,6 +23321,7 @@ mod tests {
             ],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -23012,6 +23368,7 @@ mod tests {
             ],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -23024,10 +23381,7 @@ mod tests {
     #[test]
     fn prove_struct_corpus_discharges_structurally_modulo_3() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/struct-corpus");
-        if !dir.exists() {
-            return; // fixture not present
-        }
-        let sc = prove_dump_dir(&dir).expect("read struct-corpus");
+        let sc = required_prove_dump_dir(&dir);
         assert_eq!(sc.kernel_rejected, 0, "0 unsound");
         assert_eq!(sc.structural_adts, 1, "Pt registers as a real named inductive modulo 3");
         assert!(
@@ -23140,6 +23494,7 @@ mod tests {
             preconditions: vec![], // NO precondition — the negation may overflow.
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let sp = crate::vc_refute::StructParams::default();
         let mut saw_neg = false;
@@ -23171,10 +23526,7 @@ mod tests {
     #[test]
     fn prove_generic_struct_corpus_discharges_structurally_modulo_3() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/generic-struct-corpus");
-        if !dir.exists() {
-            return; // fixture not present
-        }
-        let sc = prove_dump_dir(&dir).expect("read generic-struct-corpus");
+        let sc = required_prove_dump_dir(&dir);
         assert_eq!(sc.kernel_rejected, 0, "0 unsound: {:?}", sc.rejections);
         assert_eq!(
             sc.structural_adts, 1,
@@ -23204,7 +23556,7 @@ mod tests {
         let ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Wrapper".into(),
             fields: vec![
                 (
@@ -23215,9 +23567,10 @@ mod tests {
                     },
                 ),
                 ("count".into(), Ty::Int { width: 32, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, validity_wrapper: None, };
         let carrier =
             crate::reflect::reflect_struct(&ty).expect("Wrapper<T> reflects parameterized");
         let mut env = clean_kernel::Environment::with_prelude();
@@ -23244,6 +23597,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let params = crate::vc_refute::StructParams::from_function(&func, &registry);
 
@@ -23293,14 +23647,15 @@ mod tests {
         let ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Point".into(),
             fields: vec![
                 ("x".into(), Ty::Int { width: 32, signed: false }),
                 ("y".into(), Ty::Int { width: 32, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, validity_wrapper: None, };
         let carrier = crate::reflect::reflect_struct(&ty).expect("Point reflects");
         let mut env = clean_kernel::Environment::with_prelude();
         let registry =
@@ -23326,6 +23681,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let params = crate::vc_refute::StructParams::from_function(&func, &registry);
 
@@ -23365,14 +23721,15 @@ mod tests {
         let ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Pt".into(),
             fields: vec![
                 ("x".into(), Ty::Int { width: 32, signed: true }),
                 ("y".into(), Ty::Int { width: 32, signed: true }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, validity_wrapper: None, };
         let carrier = crate::reflect::reflect_struct(&ty).expect("Pt reflects");
         let mut env = clean_kernel::Environment::with_prelude();
         let registry =
@@ -23402,6 +23759,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let params = crate::vc_refute::StructParams::from_function(&func, &registry);
 
@@ -23447,10 +23805,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("trust-ir-bridge/fixtures");
-        if !dir.exists() {
-            return; // fixtures not present in this checkout
-        }
-        let sc = prove_dump_dir(&dir).expect("read fixtures");
+        let sc = required_prove_dump_dir(&dir);
         eprintln!("real-MIR corpus: {}", sc.headline());
         assert!(sc.total > 0, "expected real-MIR fixtures to load");
         assert_eq!(sc.kernel_rejected, 0, "UNSOUND: {:?}", sc.rejections);
@@ -23513,6 +23868,7 @@ mod tests {
             preconditions: vec![ne("b", 0), ne("a", -2147483648)],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let id = VerifiableFunction {
@@ -23536,6 +23892,7 @@ mod tests {
                 Box::new(Formula::Var("x".into(), Sort::Int)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         // Safe arithmetic: `x + 1` cannot overflow under `x < 1_000_000` — the
@@ -23565,6 +23922,7 @@ mod tests {
             )],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let dir = std::env::temp_dir().join("trust_safe_corpus_all_proven");
@@ -23869,6 +24227,7 @@ mod tests {
             )))],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let dir = std::env::temp_dir().join("trust_unsigned_div_fully_faithful");
@@ -23957,6 +24316,7 @@ mod tests {
             preconditions: vec![lt("a", 100), lt("b", 100)],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let dir = std::env::temp_dir().join("trust_uadd_safety_vc_faithful");
@@ -24046,6 +24406,7 @@ mod tests {
                 preconditions: vec![],
                 postconditions: vec![],
                 spec: Default::default(),
+                tuple_layouts: Default::default(),
             };
         // uadd(a: u32, b: u32) { a + b } — OVERFLOW.
         let uadd = mk(
@@ -24189,6 +24550,7 @@ mod tests {
                 preconditions: vec![],
                 postconditions: vec![],
                 spec: Default::default(),
+                tuple_layouts: Default::default(),
             };
         // neg(x: i32) { -x } — NEGATION overflow (core `x = i32::MIN`).
         let neg = mk(
@@ -24312,6 +24674,7 @@ mod tests {
             preconditions: vec![ne("b", 0), ne("a", -2147483648)],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let mut safety = 0usize;
@@ -24378,6 +24741,7 @@ mod tests {
             )))],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let mut discharged = 0usize;
@@ -24442,6 +24806,7 @@ mod tests {
                 Box::new(trust_types::Formula::Var("x".into(), trust_types::Sort::Int)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let dir = std::env::temp_dir().join("trust_clean_prove_dump_test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -24493,10 +24858,7 @@ mod tests {
         // that directory for BOTH would corrupt both corpora's own `prove_dump_dir`
         // census (this test's `total == 1`, and the Stack corpus's `total == 8`).
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vec-get-corpus");
-        if !dir.exists() {
-            return; // fixture not present
-        }
-        let sc = prove_dump_dir(&dir).expect("read vec-get-corpus");
+        let sc = required_prove_dump_dir(&dir);
         assert_eq!(sc.total, 1, "one container function in the corpus, got {sc:?}");
         assert_eq!(sc.kernel_rejected, 0, "0 unsound: {:?}", sc.rejections);
         // The `&Vec<u32>` parameter grounds to a structural container model (Slice),
@@ -24602,6 +24964,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert_eq!(crate::clean_ground::reachable_structural_container_count(&func), 1);
     }
@@ -24623,10 +24986,7 @@ mod tests {
     #[test]
     fn prove_float_corpus_grounds_float_structurally_and_discharges_modulo_3() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/float-corpus");
-        if !dir.exists() {
-            return; // fixture not present
-        }
-        let sc = prove_dump_dir(&dir).expect("read float-corpus");
+        let sc = required_prove_dump_dir(&dir);
         assert_eq!(sc.total, 2, "two float functions in the corpus, got {sc:?}");
         assert_eq!(sc.kernel_rejected, 0, "0 unsound: {:?}", sc.rejections);
         // Both functions' f32 (the bare param, and the struct field) register as the
@@ -24893,18 +25253,12 @@ mod tests {
         );
         // PER-FUNCTION DIAGNOSTIC: which fully-faithful function takes which path.
         {
-            let mut entries: Vec<_> = std::fs::read_dir(&dir)
-                .unwrap()
-                .filter_map(Result::ok)
-                .map(|e| e.path())
+            let entries: Vec<_> = required_fixture_paths(&dir)
+                .into_iter()
                 .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
                 .collect();
-            entries.sort();
             for path in entries {
-                let Ok(bytes) = std::fs::read(&path) else { continue };
-                let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&bytes) else {
-                    continue;
-                };
+                let func = required_json_fixture(&path);
                 let ff = (crate::mirsem::function_fully_faithful_witness(&func)
                     .is_some_and(|c| c.is_modulo_3())
                     && function_safety_vcs_all_discharged(&func))
@@ -25102,13 +25456,13 @@ mod tests {
         assert!(dir.is_dir(), "required fixture corpus {} is missing", dir.display());
         let empty = std::collections::BTreeMap::new();
         let mut saw_safety_gap = false;
-        for entry in std::fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
-            let path = entry.path();
+        for path in required_fixture_paths(&dir) {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let bytes = std::fs::read(&path).unwrap();
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&bytes) else { continue };
+            // Trust: was `let Ok(func) = .. else { continue }` — an undecodable row
+            // silently dropped out of the SAFETY_GAP sweep (NO-VACUOUS-CORPUS-TEST).
+            let func = required_json_fixture(&path);
             let diag = diagnose_fully_faithful_gate(&func, &empty);
             if !diag.fully_faithful && (diag.via_ir_shape || diag.via_mirsem_shape) {
                 assert_eq!(
@@ -25174,6 +25528,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let diag = diagnose_fully_faithful_gate(&func, &empty);
         assert!(
@@ -25249,6 +25604,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         // MEASURED 2026-08-25 — the two assertions that used to stand here read
         //     function_fully_faithful_witness(..).is_some_and(is_modulo_3)   == true
@@ -25958,6 +26314,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -25984,6 +26341,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -26075,6 +26433,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -26092,6 +26451,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -26110,6 +26470,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let registry = lift_callee_registry(&func);
         assert!(
@@ -26218,6 +26579,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -26248,6 +26610,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -26355,6 +26718,7 @@ mod tests {
                 preconditions: vec![],
                 postconditions: vec![],
                 spec: FunctionSpec::default(),
+                tuple_layouts: Default::default(),
             }
         };
         let actual = crate::mirsem::SemOperand::Var(0); // parameter x.
@@ -26430,6 +26794,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -26460,6 +26825,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -26525,6 +26891,7 @@ mod tests {
                                 atomic: None,
                                 is_unsafe_sig: false,
                                 callee_identity: None,
+                                callee_key: None,
                                 is_foreign: false,
                             },
                         },
@@ -26549,6 +26916,7 @@ mod tests {
                 preconditions: vec![],
                 postconditions: vec![],
                 spec: FunctionSpec::default(),
+                tuple_layouts: Default::default(),
             }
         };
         let reachable = mk(true);
@@ -26656,6 +27024,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -26674,6 +27043,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         // A genuinely-satisfiable violation VC over the call result `y` (real overflow at y large).
         let vc = F::Gt(Box::new(F::Var("y".into(), Sort::Int)), Box::new(F::Int(1_000_000)));
@@ -26751,6 +27121,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         // A genuinely-satisfiable violation VC over the aliased-write result `y`.
         let vc = F::Gt(Box::new(F::Var("y".into(), Sort::Int)), Box::new(F::Int(1_000_000)));
@@ -26819,6 +27190,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -26845,6 +27217,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -27020,6 +27393,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27036,6 +27410,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27066,6 +27441,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let registry = lift_callee_registry(&func);
         assert!(
@@ -27132,6 +27508,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27148,6 +27525,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27174,6 +27552,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -27273,6 +27652,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27289,6 +27669,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27319,6 +27700,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let registry = lift_callee_registry(&func);
 
@@ -27398,6 +27780,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27414,6 +27797,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27431,6 +27815,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27457,6 +27842,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let registry = lift_callee_registry(&func);
         assert!(
@@ -27529,6 +27915,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27568,6 +27955,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27586,6 +27974,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -27697,6 +28086,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27743,6 +28133,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27774,6 +28165,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let registry = lift_callee_pair_registry(&func);
         assert!(
@@ -27876,6 +28268,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27919,6 +28312,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -27947,6 +28341,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -28109,6 +28504,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -28126,6 +28522,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -28194,6 +28591,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let registry = lift_callee_pair_registry(&func);
         assert!(
@@ -28282,6 +28680,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -28400,6 +28799,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -28555,6 +28955,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -28753,6 +29154,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -28880,6 +29282,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -28949,6 +29352,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -29128,10 +29532,10 @@ mod tests {
             "union_stamp" => Some(AdtKind::Union),
             _ => Some(AdtKind::Struct),
         };
-        let s_adt = Ty::Adt { arbitrary_precision: None, 
+        let s_adt = Ty::Adt { arbitrary_precision: None, validity_wrapper: None,
             name: "SYNTH::S".into(),
-            fields: vec![("x".into(), i64t()), ("y".into(), i64t())],
-            variants: vec![],
+            fields: vec![("x".into(), i64t()), ("y".into(), i64t())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
@@ -29271,6 +29675,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -29389,13 +29794,14 @@ mod tests {
         let kind = if variant == "enum_stamp" { None } else { Some(AdtKind::Struct) };
         let bs = |k| Ty::Adt {
             name: "SYNTH::BS".into(),
-            fields: fields.clone(),
-            variants: vec![],
+            fields: fields.clone().into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             adt_kind: k,
         };
         let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
@@ -29486,6 +29892,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -29621,13 +30028,14 @@ mod tests {
         let u64t = || Ty::Int { width: 64, signed: false };
         let bs = Ty::Adt {
             name: "SYNTH::BS".into(),
-            fields: vec![("0".to_string(), u64t())],
-            variants: vec![],
+            fields: vec![("0".to_string(), u64t())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             adt_kind: Some(AdtKind::Struct),
         };
         let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
@@ -29673,6 +30081,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind: UnwindEdge::Continue,
         };
         let mut spine_stmts = vec![assign(
@@ -29749,6 +30158,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -29946,25 +30356,14 @@ mod tests {
     #[test]
     fn audit_unassigned_return_locals_never_certify() {
         use std::path::Path;
-        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures");
         let mut files = Vec::new();
-        walk(Path::new(root), &mut files);
-        let mut suspects = 0usize;
+        corpus_walk(Path::new(root), &mut files);
+        let (mut dumps, mut suspects) = (0usize, 0usize);
         let mut certified: Vec<String> = Vec::new();
         for p in &files {
-            let Ok(bytes) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&bytes) else { continue };
+            let Some(f) = corpus_dump(p) else { continue };
+            dumps += 1;
             if matches!(f.body.return_ty, trust_types::Ty::Unit) {
                 continue;
             }
@@ -29996,11 +30395,16 @@ mod tests {
                 certified.push(f.def_path.clone());
             }
         }
-        eprintln!("scanned {} dumps; unassigned-return bodies: {suspects}", files.len());
+        eprintln!(
+            "scanned {} files, {dumps} dumps; unassigned-return bodies: {suspects}",
+            files.len()
+        );
         eprintln!("of those, CERTIFYING: {}", certified.len());
         for c in certified.iter().take(20) {
             eprintln!("   {c}");
         }
+        // An empty corpus would make the audit below hold vacuously: fail closed.
+        assert!(dumps > 0, "the audit read NO `VerifiableFunction` dump under {root}");
         assert!(
             certified.is_empty(),
             "FALSE CERTIFICATE: {} bodies whose return local is never assigned are \
@@ -30035,25 +30439,13 @@ mod tests {
     fn audit_no_within_directory_def_path_collisions() {
         use std::collections::{BTreeMap, BTreeSet};
         use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures");
         let mut files = Vec::new();
-        walk(Path::new(root), &mut files);
+        corpus_walk(Path::new(root), &mut files);
         // dir -> def_path -> set of body fingerprints
         let mut per_dir: BTreeMap<PathBuf, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
         for p in &files {
-            let Ok(bytes) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&bytes) else { continue };
+            let Some(f) = corpus_dump(p) else { continue };
             let Some(dir) = p.parent().map(Path::to_path_buf) else { continue };
             // A structural fingerprint of the body: the registry's identity is the
             // def_path, so ANY body difference under one name is the hazard.
@@ -30063,6 +30455,8 @@ mod tests {
             let h = format!("{:x}", std::hash::Hasher::finish(&hasher));
             per_dir.entry(dir).or_default().entry(f.def_path).or_default().insert(h);
         }
+        // An empty corpus would make the audit below hold vacuously: fail closed.
+        assert!(!per_dir.is_empty(), "the audit read NO `VerifiableFunction` dump under {root}");
         let mut collisions: Vec<String> = Vec::new();
         for (dir, by_path) in &per_dir {
             for (dp, bodies) in by_path {
@@ -30085,27 +30479,15 @@ mod tests {
     /// must now certify, and the two non-cast float bodies beside them must NOT.
     #[test]
     fn trust_ir_int_to_float_casts_certify() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
+        use std::path::Path;
         let mut files = Vec::new();
-        walk(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures")), &mut files);
+        corpus_walk(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures")), &mut files);
         files.sort();
         let mut certified = 0usize;
         let mut shapes = 0usize;
         let mut via_gate = 0usize;
         for p in &files {
-            let Ok(bytes) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&bytes) else { continue };
+            let Some(f) = corpus_dump(p) else { continue };
             // The exact shape, decided independently of the recognizer.
             let trust_types::Ty::Float { width: dw } = f.body.return_ty else { continue };
             let [blk] = f.body.blocks.as_slice() else { continue };
@@ -30190,6 +30572,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let assign = |rv: Rvalue| Statement::Assign {
             place: Place::local(0),
@@ -30317,6 +30700,7 @@ mod tests {
             preconditions,
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let run = |f: &VerifiableFunction| {
             let sc = prove_one_function(f, &Default::default(), &crate::trustir_fold::DumpBodies::new());
@@ -30361,27 +30745,34 @@ mod tests {
     /// This pins both halves of that discipline.
     #[test]
     fn vacuous_obligations_are_counted_as_a_disclosed_subset() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         let mut files = Vec::new();
-        walk(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures")), &mut files);
+        corpus_walk(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures")), &mut files);
         files.sort();
         files.truncate(60); // a bounded slice — this pins the DISCIPLINE, not a count.
         let mut sc = ProveScorecard::default();
+        let mut dumps = 0usize;
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
+                dumps += 1;
                 sc.merge_fragment(prove_one_function(&f, &Default::default(), &crate::trustir_fold::DumpBodies::new()));
             }
         }
+        eprintln!(
+            "{dumps} dumps of {} files: safety {}, unsupported {}, discharged {}",
+            files.len(),
+            sc.safety_obligations,
+            sc.unsupported_obligations,
+            sc.safety_discharged
+        );
+        // (0) A slice with no dump, or with no safety obligation, makes both
+        //     relations below hold at 0 <= 0: fail closed instead.
+        assert!(
+            dumps > 0 && sc.safety_obligations > 0,
+            "the bounded slice read {dumps} dumps carrying {} safety obligations; both \
+             relations below would hold vacuously",
+            sc.safety_obligations
+        );
         // (1) SUBSET — never more vacuous rows than safety rows. If this inverts,
         //     the two counters have drifted apart and the contentful denominator
         //     computed from them would be nonsense.
@@ -30414,28 +30805,20 @@ mod tests {
     /// the extractors key on, so a widening can be aimed at a measured majority
     /// instead of at a shape someone found by reading the corpus.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_do_real_adt_returning_bodies_look_like() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: std::collections::BTreeMap<&'static str, usize> = Default::default();
         let mut blocks_hist: std::collections::BTreeMap<&'static str, usize> = Default::default();
         let mut n = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             if !matches!(func.body.return_ty, Ty::Adt { .. }) {
                 continue;
             }
@@ -30533,27 +30916,19 @@ mod tests {
     /// registers a Pi-wrapped inductive modulo 3. Ask it directly, over the real
     /// generic carriers, before writing any witness code.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn does_a_generic_carrier_register_at_all() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let (mut ok, mut absent, mut seen) = (0usize, 0usize, 0usize);
         let mut names: Vec<String> = Vec::new();
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             let body = &func.body;
             if !matches!(body.return_ty, Ty::Adt { .. }) || body.blocks.len() != 1 {
                 continue;
@@ -30605,28 +30980,20 @@ mod tests {
     /// those need a value binder each, because `struct_field_expr`'s `Env` lookup
     /// is Int-sorted and cannot inhabit a bound `Sort 1` variable.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_many_generic_carriers_have_param_typed_fields() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: std::collections::BTreeMap<String, usize> = Default::default();
         let mut ex: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         let mut n = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             let body = &func.body;
             if !matches!(body.return_ty, Ty::Adt { .. }) || body.blocks.len() != 1 {
                 continue;
@@ -30686,28 +31053,20 @@ mod tests {
     /// for each such body, does `reflect_struct` build a carrier, and if it does,
     /// does the shape extractor still decline?
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn where_does_the_bare_constructor_actually_die() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: std::collections::BTreeMap<&'static str, usize> = Default::default();
         let mut ex: std::collections::BTreeMap<&'static str, Vec<String>> = Default::default();
         let mut n = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             let body = &func.body;
             if !matches!(body.return_ty, Ty::Adt { .. }) || body.blocks.len() != 1 {
                 continue;
@@ -30889,28 +31248,20 @@ mod tests {
     /// Adt-returning bodies, using the same three-gate split that proved decisive
     /// for the straight-line lane.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn why_the_adt_family_declines() {
         use crate::trustir_anchor::RefinementVerdict;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: std::collections::BTreeMap<&'static str, usize> = Default::default();
         let mut adt = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             if !matches!(func.body.return_ty, Ty::Adt { .. }) {
                 continue;
             }
@@ -30960,27 +31311,19 @@ mod tests {
     /// property, needing a different lane) or the RVALUE FRAGMENT (a widening of
     /// this one).
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_far_does_a_body_get_into_the_extractor() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: std::collections::BTreeMap<String, usize> = Default::default();
         let mut n = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             n += 1;
             let body = &func.body;
             let why = if !matches!(body.return_ty, Ty::Int { .. } | Ty::Bool) {
@@ -31058,27 +31401,19 @@ mod tests {
     /// Those three want completely different work, and the census total cannot tell
     /// them apart. `TRUST_LANE_HISTOGRAM_DIR` selects the corpus.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn why_the_load_bearing_lane_declines() {
         use crate::trustir_anchor::RefinementVerdict;
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: std::collections::BTreeMap<&'static str, usize> = Default::default();
         let mut n = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             n += 1;
             // The chain lane subsumes the single-statement one for this question: try
             // both extractors, and report the FIRST gate that stops the body.
@@ -31130,34 +31465,19 @@ mod tests {
     /// This attributes every accepted body to the FIRST lane that accepts it, over
     /// any dump directory (`TRUST_LANE_HISTOGRAM_DIR`, default fixtures).
     ///
-    /// DRIFT GUARD: the list below MIRRORS the real disjunction, so it could rot
-    /// silently. The test therefore asserts that the number of bodies this
-    /// attribution accepts EQUALS the number the PRODUCTION gate accepts. If a lane
-    /// is added to the gate and not here, the counts diverge and this fails.
+    /// DRIFT GUARD, ONE DIRECTION ONLY: the list below mirrors part of the real
+    /// disjunction, so it could rot silently. The test asserts that this attribution
+    /// accepts NO MORE bodies than the PRODUCTION gate, so a mirrored lane that claims
+    /// coverage the gate denies fails it. It does NOT assert equality, and a lane
+    /// added to the gate and not here is NOT caught: on `fixtures/` (2026-10-09) the
+    /// attribution accepts 552 bodies and the gate 1180: the gate admits bodies that no
+    /// lane in this list does, and the list's lanes see neither the certified-callee
+    /// registry nor the dump bodies the gate is given.
     #[test]
     fn which_lane_carries_the_coverage() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
-        let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
-        files.sort();
-        let mut funcs = Vec::new();
-        for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
-                funcs.push(f);
-            }
-        }
+        let funcs = fixture_corpus(&root);
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut certified: std::collections::BTreeMap<String, crate::mirsem::CalleeFact> =
             Default::default();
@@ -31394,27 +31714,19 @@ mod tests {
     /// asks the two questions the registration path can fail on: does every field decode
     /// to a kernel type, and does `add_inductive` accept the declaration?
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn why_does_an_enum_carrier_fail_to_register() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: std::collections::BTreeMap<&'static str, usize> = Default::default();
         let mut ex: std::collections::BTreeMap<&'static str, Vec<String>> = Default::default();
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             let body = &func.body;
             if !matches!(body.return_ty, Ty::Adt { .. }) || body.blocks.len() != 1 {
                 continue;
@@ -31471,16 +31783,9 @@ mod tests {
     /// report is measuring a mixture and says less about Rust than about which std
     /// internals these crates happen to instantiate.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn first_party_versus_pulled_in_coverage() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         /// The crate a def_path belongs to: the leading path segment, before any `<`.
         fn root_crate(def_path: &str) -> String {
             let head = def_path.split('<').next().unwrap_or(def_path);
@@ -31493,13 +31798,11 @@ mod tests {
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -31548,29 +31851,21 @@ mod tests {
     /// broader than any one lane, so print the actual mismatching pair rather than infer
     /// what it rejects.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_does_an_assignment_type_mismatch_look_like() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut shown = 0usize;
         for p in &files {
             if shown >= 4 {
                 break;
             }
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             let body = &func.body;
             if crate::assignment_types::all_assignments_match(body) {
                 continue;
@@ -31646,27 +31941,18 @@ mod tests {
     /// further gates (the drop ladder, exhaustiveness vetting, alias checks) that this
     /// cannot see. So it is an UPPER bound, and labelled as one.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_many_bodies_fail_only_the_payload_gate() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Operand, Projection, Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -31807,27 +32093,18 @@ mod tests {
     /// counted bodies the gate already accepts — the exact error named above. This asks
     /// the constructor recognizers directly, over only the bodies the gate REJECTS.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn why_do_rejected_call_free_constructors_decline() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -31908,10 +32185,6 @@ mod tests {
                             if place.local == 0))
                     })
                     .count();
-                let all_agg = body.blocks.iter().all(|b| {
-                    b.stmts.iter().all(|st| !matches!(st, Statement::Assign { place, rvalue, .. }
-                        if place.local == 0 && !matches!(rvalue, Rvalue::Aggregate(..))))
-                });
                 // The 2-arm enum lane caps a variant payload at <= 1 operand
                 // (`arm_adt_ctor_value_for`). Report the WIDEST arm payload so the cost
                 // of lifting that cap is known before it is lifted.
@@ -32037,26 +32310,18 @@ mod tests {
     /// lane's own territory, so the question is whether its RECOGNIZER or its WITNESS
     /// stops them — and this counts exactly that, gate-based rather than by MIR shape.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn passthrough_shape_accepted_but_witness_declined() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: std::collections::BTreeMap<String, usize> = Default::default();
         let mut shaped = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             let Some(sh) = crate::mirsem::sem_passthrough_return_shape_of(&func) else { continue };
             shaped += 1;
             let v = crate::trustir_adt::check_passthrough_return_refinement(&sh);
@@ -32088,30 +32353,35 @@ mod tests {
     /// Three widenings in a row moved NOTHING because I inferred the blocking gate from
     /// the body's shape instead of asking. This walks the straight-line lane's stages on
     /// a body selected by def_path substring and names the first that stops it.
+    ///
+    /// A measurement driver, not a check: `#[ignore]`d, and it panics without
+    /// `TRUST_ONE_BODY` so a bare `--ignored` run cannot pass having measured nothing.
     #[test]
+    #[ignore = "measurement driver: set TRUST_ONE_BODY=<def_path substring> \
+                (optionally TRUST_LANE_HISTOGRAM_DIR) and run with --ignored --nocapture"]
     fn which_gate_stops_one_named_body() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
-        let Ok(needle) = std::env::var("TRUST_ONE_BODY") else { return };
+        let Ok(needle) = std::env::var("TRUST_ONE_BODY") else {
+            panic!(
+                "which_gate_stops_one_named_body is a measurement driver and TRUST_ONE_BODY \
+                 is unset, so it measured nothing. Run: TRUST_ONE_BODY=<def_path substring> \
+                 [TRUST_LANE_HISTOGRAM_DIR=<dir of MIR JSON dumps; default fixtures/>] \
+                 targo --unverified test --manifest-path crates/Cargo.toml -p trust-clean \
+                 --lib -- --ignored --exact \
+                 prove::tests::which_gate_stops_one_named_body --nocapture"
+            )
+        };
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let bodies = crate::trustir_fold::DumpBodies::new();
         let empty = std::collections::BTreeMap::new();
         let mut shown = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             if !func.def_path.contains(&needle) || shown >= 2 {
                 continue;
             }
@@ -32153,27 +32423,18 @@ mod tests {
     /// written. It is how the next broad structural shape gets found by measurement
     /// rather than by guessing which lane to widen.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_does_the_gate_still_reject() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -32259,29 +32520,33 @@ mod tests {
     /// shape — `_0 = Move(_1); Return`, one block — so the passthrough lane should take
     /// it. It does not. This walks that lane's three gates on every body matching a
     /// name substring and names the one that stops it.
+    ///
+    /// A measurement driver, not a check: `#[ignore]`d, and it panics without
+    /// `TRUST_BLOCKING_CALLEE` so a bare `--ignored` run cannot pass having
+    /// measured nothing.
     #[test]
+    #[ignore = "measurement driver: set TRUST_BLOCKING_CALLEE=<def_path substring> \
+                (optionally TRUST_LANE_HISTOGRAM_DIR) and run with --ignored --nocapture"]
     fn why_is_a_blocking_callee_not_certified() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         let Ok(needle) = std::env::var("TRUST_BLOCKING_CALLEE") else {
-            eprintln!("set TRUST_BLOCKING_CALLEE to a def_path substring");
-            return;
+            panic!(
+                "why_is_a_blocking_callee_not_certified is a measurement driver and \
+                 TRUST_BLOCKING_CALLEE is unset, so it measured nothing. Run: \
+                 TRUST_BLOCKING_CALLEE=<def_path substring> \
+                 [TRUST_LANE_HISTOGRAM_DIR=<dir of MIR JSON dumps; default fixtures/>] \
+                 targo --unverified test --manifest-path crates/Cargo.toml -p trust-clean \
+                 --lib -- --ignored --exact \
+                 prove::tests::why_is_a_blocking_callee_not_certified --nocapture"
+            )
         };
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&b) else { continue };
+            let Some(func) = corpus_dump(p) else { continue };
             if !func.def_path.contains(&needle) {
                 continue;
             }
@@ -32314,7 +32579,7 @@ mod tests {
     /// The registry every measurement in this report uses — and the census builds the
     /// same way — is ONE pass over the bodies in sorted order:
     ///
-    /// ```ignore
+    /// ```ignore (illustrative)
     /// for f in &funcs { if gate(f, &certified) { certified.insert(f) } }
     /// ```
     ///
@@ -32325,28 +32590,9 @@ mod tests {
     /// difference is a free gain that the single pass was leaving behind.
     #[test]
     fn certification_pass_is_order_dependent() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
-        let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
-        files.sort();
-        let mut funcs: Vec<VerifiableFunction> = Vec::new();
-        for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
-                funcs.push(f);
-            }
-        }
+        let funcs = fixture_corpus(&root);
         let bodies = crate::trustir_fold::DumpBodies::new();
 
         // ONE pass — what every measurement in this report has used.
@@ -32384,6 +32630,22 @@ mod tests {
         eprintln!("\n=== certification order-dependence over {} bodies in {root} ===", funcs.len());
         eprintln!("  registry:   {} single-pass -> {} at fixpoint ({rounds} rounds)", single.len(), fixed.len());
         eprintln!("  gate accepts: {single_gate} -> {fixed_gate}  (free gain +{})", fixed_gate.saturating_sub(single_gate));
+        // MONOTONICITY, the claim the doc above rests on (asserted since 2026-10-09; it
+        // was only printed). A single-pass gate that admits nothing would make it hold
+        // by construction, so that fails closed too, as in the oracle ceiling below.
+        assert!(
+            single_gate > 0,
+            "the single-pass registry admits NO body under {root}: monotonicity would hold \
+             vacuously"
+        );
+        assert!(
+            fixed_gate >= single_gate,
+            "the gate admits {fixed_gate} bodies against the fixpoint registry ({} entries) \
+             but {single_gate} against the single-pass one ({} entries), which is a SUBSET of \
+             it: the production gate is not monotone in the certified registry",
+            fixed.len(),
+            single.len()
+        );
     }
 
     /// THE ORACLE CEILING ON THE WHOLE COMPOSITION PROGRAM (2026-08-25)
@@ -32398,28 +32660,18 @@ mod tests {
     /// corpus.
     #[test]
     fn the_oracle_ceiling_on_composition() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
-        let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
-        files.sort();
-        let mut funcs: Vec<VerifiableFunction> = Vec::new();
-        for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
-                funcs.push(f);
-            }
-        }
+        let funcs = fixture_corpus(&root);
+        // An empty corpus would make every bound below, and the MONOTONICITY assertion,
+        // hold vacuously: fail closed instead. (`fixture_corpus` now carries this
+        // floor for every whole-corpus test; it stays here as this test's own claim.)
+        assert!(
+            !funcs.is_empty(),
+            "the oracle ceiling read NO `VerifiableFunction` dump under {root}: check that \
+             the fixture corpus is present and still deserializes, or point \
+             TRUST_LANE_HISTOGRAM_DIR at a dump directory"
+        );
         let bodies = crate::trustir_fold::DumpBodies::new();
 
         // The real registry.
@@ -32446,6 +32698,15 @@ mod tests {
                 .count()
         };
         let (base, ceil) = (admits(&real), admits(&oracle));
+        // A real registry that admits nothing makes MONOTONICITY hold by construction
+        // (there is no admit to withdraw): fail closed on that too.
+        assert!(
+            base > 0,
+            "the delegation lane admits NO body of the {} under {root} with the REAL \
+             registry ({} keys), so MONOTONICITY below would hold vacuously",
+            funcs.len(),
+            real.len()
+        );
         // Trust: MONOTONICITY (2026-08-26) — the oracle registry is a strict SUPERSET of
         // the real one, so no body may be admitted under `real` and declined under
         // `oracle`. A delegation count that fell when the registry GREW was observed on
@@ -32482,6 +32743,20 @@ mod tests {
         for (p, why) in regressions.iter().take(5) {
             eprintln!("     {}  -> {:?}", p.chars().take(76).collect::<String>(), why);
         }
+        // The assertion the MONOTONICITY comment promises. It sits BEFORE the ceiling
+        // report below because `ceil - base` underflows on exactly this failure, which
+        // would hide the counterexamples behind an arithmetic panic.
+        assert!(
+            regressions.is_empty(),
+            "MONOTONICITY broken: {} body(ies) in {root} are admitted by the delegation lane \
+             under the REAL registry ({} keys) but declined under the ORACLE ({} keys), a \
+             superset of it. Growing the registry must never withdraw an admit; the first \
+             counterexamples (def path -> oracle-side decline reason) are: {:?}",
+            regressions.len(),
+            real.len(),
+            oracle.len(),
+            regressions.iter().take(5).collect::<Vec<_>>()
+        );
         // And the whole gate, not just the delegation lane.
         let gate_base =
             funcs.iter().filter(|f| via_trustir_shape_witnessed_with_bodies(f, &real, &bodies)).count();
@@ -32528,16 +32803,9 @@ mod tests {
     /// functions are covered, and this measures by how much — including for the
     /// numbers reported earlier in this session.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_many_distinct_functions_does_the_count_cover() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         /// Strip turbofish instantiations so `f::<u8>` and `f::<u64>` collapse to `f`.
         fn source_key(path: &str) -> String {
             let mut out = String::with_capacity(path.len());
@@ -32575,13 +32843,11 @@ mod tests {
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -32633,27 +32899,18 @@ mod tests {
     /// parameter, whose whole meaning is the post-state. This reports what the
     /// production gate already does with them.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn the_mutator_subset_of_the_unit_class() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Projection, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -32746,16 +33003,9 @@ mod tests {
     /// for the other is a false PROVE. It is used here only to put a ceiling on what
     /// the sound fix could be worth.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_DECLINE_HISTOGRAM_DIR"]
     fn upper_bound_on_fixing_callee_resolution() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         /// Strip generic argument lists, innermost-first, a bounded number of times.
         fn strip_generics(s: &str) -> String {
             let mut cur = s.to_string();
@@ -32780,13 +33030,11 @@ mod tests {
         let root = std::env::var("TRUST_DECLINE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -32848,27 +33096,18 @@ mod tests {
     /// This splits the class by how many of its returning calls resolve, so the
     /// prize is known before anyone builds chain support for it.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_DECLINE_HISTOGRAM_DIR"]
     fn how_reachable_is_the_second_returning_call_class() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_DECLINE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -32923,28 +33162,9 @@ mod tests {
 
     #[test]
     fn call_delegation_decline_histogram() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_DECLINE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
-        let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
-        files.sort();
-        let mut funcs: Vec<VerifiableFunction> = Vec::new();
-        for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&b)
-            {
-                funcs.push(f);
-            }
-        }
+        let funcs = fixture_corpus(&root);
 
         // Same discipline as the census: certify first, so the registry a caller sees
         // is the one it would really see.
@@ -33045,6 +33265,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let int_param = Ty::Int { width: 32, signed: false };
         let shared_ref = Ty::Ref { mutable: false, inner: Box::new(int_param.clone()) };
@@ -33082,23 +33303,14 @@ mod tests {
     /// and the assertion that CLOSES the float-returning class at 27/27.
     #[test]
     fn trust_ir_float_widening_casts_certify() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         let mut files = Vec::new();
-        walk(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures")), &mut files);
+        corpus_walk(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures")), &mut files);
         files.sort();
         let (mut widen_shapes, mut certified, mut via_gate) = (0usize, 0usize, 0usize);
         let (mut float_returning, mut float_ff) = (0usize, 0usize);
         for p in &files {
-            let Ok(bytes) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&bytes) else { continue };
+            let Some(f) = corpus_dump(p) else { continue };
             let trust_types::Ty::Float { width: rw } = f.body.return_ty else { continue };
             float_returning += 1;
             // The whole class must be fully faithful — that is the claim this lane closes.
@@ -33179,6 +33391,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let f32t = || Ty::Float { width: 32 };
         let f64t = || Ty::Float { width: 64 };
@@ -33227,25 +33440,13 @@ mod tests {
     /// width-mismatch boundary that separates a MOVE from a CONVERSION.
     #[test]
     fn trust_ir_float_identity_moves_certify() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
+        use std::path::Path;
         let mut files = Vec::new();
-        walk(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures")), &mut files);
+        corpus_walk(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures")), &mut files);
         files.sort();
         let (mut shapes, mut certified, mut via_gate) = (0usize, 0usize, 0usize);
         for p in &files {
-            let Ok(bytes) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<VerifiableFunction>(&bytes) else { continue };
+            let Some(f) = corpus_dump(p) else { continue };
             // Decide the shape independently of the recognizer.
             let trust_types::Ty::Float { width: rw } = f.body.return_ty else { continue };
             let [blk] = f.body.blocks.as_slice() else { continue };
@@ -33324,6 +33525,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let f32t = || Ty::Float { width: 32 };
         let f64t = || Ty::Float { width: 64 };
@@ -33402,6 +33604,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -33734,6 +33937,7 @@ mod tests {
                             is_foreign: false,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: None,
                             unwind: UnwindEdge::Cleanup(BlockId(unwind_to)),
                         },
                     },
@@ -33756,6 +33960,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         // HOT: the cleanup edge points at the RETURN block itself.
         let hot = build(Terminator::Resume, 1);
@@ -33888,6 +34093,7 @@ mod tests {
                     preconditions: vec![],
                     postconditions: vec![],
                     spec: trust_types::FunctionSpec::default(),
+                    tuple_layouts: Default::default(),
                 };
                 ((*n).to_string(), crate::mirsem::CalleeFact::of_certified(&f))
             })
@@ -33921,13 +34127,14 @@ mod tests {
         let u8t = || Ty::Int { width: 8, signed: false };
         let rhs_adt = || Ty::Adt {
             name: "SYNTH::Rhs".into(),
-            fields: vec![("0".into(), u8t())],
-            variants: vec![],
+            fields: vec![("0".into(), u8t())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             adt_kind: None,
         };
         let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
@@ -33943,13 +34150,15 @@ mod tests {
             "raw_ptr_param" => Ty::RawPtr { mutable: false, pointee: Box::new(u8t()) },
             "ptr_in_adt_param" => Ty::Adt {
                 name: "SYNTH::PtrRhs".into(),
-                fields: vec![("p".into(), Ty::RawPtr { mutable: true, pointee: Box::new(u8t()) })],
-                variants: vec![],
+                fields: vec![("p".into(), Ty::RawPtr { mutable: true, pointee: Box::new(u8t()) })]
+                    .into(),
+                variants: vec![].into(),
                 disc_index_safe: false,
                 faithful_enum_repr: None,
                 layout: None,
                 enum_layout: None,
                 arbitrary_precision: None,
+                validity_wrapper: None,
                 adt_kind: None,
             },
             _ => rhs_adt(),
@@ -34045,7 +34254,7 @@ mod tests {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_foreign: variant == "foreign",
-                    is_unsafe_sig: variant == "unsafe_sig", callee_identity: None,
+                    is_unsafe_sig: variant == "unsafe_sig", callee_identity: None, callee_key: None,
                     unwind: if variant == "cleanup_unwind" {
                         UnwindEdge::Cleanup(BlockId(1))
                     } else {
@@ -34101,6 +34310,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -34324,13 +34534,14 @@ mod tests {
         };
         let cell_adt = |kind: Option<AdtKind>| Ty::Adt {
             name: "SYNTH::Cell".into(),
-            fields: vec![("0".into(), Ty::Int { width: 8, signed: false })],
-            variants: vec![],
+            fields: vec![("0".into(), Ty::Int { width: 8, signed: false })].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             adt_kind: kind,
         };
         let kind = match variant {
@@ -34389,6 +34600,7 @@ mod tests {
                     is_foreign: variant == "foreign",
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     unwind: if variant == "cleanup_unwind" {
                         UnwindEdge::Cleanup(BlockId(1))
                     } else {
@@ -34444,6 +34656,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -34696,6 +34909,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -35132,6 +35346,7 @@ mod tests {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
             },
         };
         let func = VerifiableFunction {
@@ -35227,6 +35442,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         func
     }
@@ -35339,6 +35555,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -35571,6 +35788,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -35613,6 +35831,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
         };
         let outer_args = if intermediate_second {
             vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(4))]
@@ -35657,6 +35876,7 @@ mod tests {
             preconditions: vec![range("a"), range("b"), range("c")],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         (func, registry)
     }
@@ -35755,6 +35975,7 @@ mod tests {
                             is_foreign: false,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: None,
                             span: SourceSpan::default(),
                         },
                     },
@@ -35768,6 +35989,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -35913,6 +36135,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -36028,6 +36251,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -36127,6 +36351,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -36177,6 +36402,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let ir = straight_line_ir_body(&func)
             .expect("the single-statement PtrMetadata shape must be admitted");
@@ -36322,6 +36548,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let ir = straight_line_ir_body_chain(&func).expect("the is_none shape must be admitted");
         assert!(
@@ -36404,6 +36631,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let ir = straight_line_ir_body_chain(&func).expect("builds");
         assert_eq!(
@@ -36583,6 +36811,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -37025,10 +37254,7 @@ mod tests {
     fn u8_ascii_real_corpus_recensus_via_production_prove_dump_dir_gate() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/census-core-m5-2026-07-07/u8-ascii");
-        if !dir.exists() {
-            return; // fixtures not present in this checkout — skip, don't fail.
-        }
-        let sc = prove_dump_dir(&dir).expect("prove the real u8-ascii corpus");
+        let sc = required_prove_dump_dir(&dir);
         eprintln!("{}", sc.headline());
         eprintln!(
             "CENSUS u8-ascii (re-census, 2026-07-09): total={} fully_faithful={} \
@@ -37620,6 +37846,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -37638,6 +37865,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -38061,6 +38289,7 @@ mod tests {
                 atomic: None,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 is_foreign: false,
             };
         // fn f(self: &One, haystack: &[u8]) -> usize {
@@ -38110,6 +38339,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let registry = ptr_spine_count_raw_registry();
         assert!(
@@ -38162,6 +38392,7 @@ mod tests {
                 atomic: None,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 is_foreign: false,
             };
         // fn f(self: &One, haystack: &[u8]) -> usize {
@@ -38217,6 +38448,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let registry = ptr_spine_count_raw_registry();
         assert!(
@@ -38261,6 +38493,7 @@ mod tests {
                 atomic: None,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 is_foreign: false,
             };
         // fn f(self: &One, haystack: &[u8]) -> usize {
@@ -38317,6 +38550,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         let registry = ptr_spine_count_raw_registry();
         assert!(
@@ -39088,6 +39322,7 @@ mod tests {
                 Box::new(Formula::Var("n".into(), Sort::Int)),
             )],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
 
         // Why it MUST decline: the real per-iteration transform is `(i+1)*3` (=3 from i=0),
@@ -39353,6 +39588,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         assert!(
             extract_loop_shape(&func_shape_only).is_some(),
@@ -39501,6 +39737,7 @@ mod tests {
             ],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
 
         // Why it MUST decline: the two arms commit their checked ops into the SAME tuple-temp
@@ -39660,6 +39897,7 @@ mod tests {
                 Box::new(Formula::Var("n".into(), Sort::Int)),
             )],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
 
         // THE MIS-EXTRACTION: `extract_loop_shape` picks bb0 (the PRE-HEADER — it also
@@ -39783,6 +40021,7 @@ mod tests {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -39820,6 +40059,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         };
         assert!(
             extract_loop_shape(&func).is_none(),
@@ -40581,10 +40821,7 @@ mod tests {
     #[test]
     fn prove_enum_corpus_registers_enum_and_discharges_modulo_3() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/enum-corpus");
-        if !dir.exists() {
-            return; // fixture not present
-        }
-        let sc = prove_dump_dir(&dir).expect("read enum-corpus");
+        let sc = required_prove_dump_dir(&dir);
         assert_eq!(sc.kernel_rejected, 0, "0 unsound: {:?}", sc.rejections);
         assert_eq!(sc.total, 1, "one enum function in the corpus");
         assert_eq!(
@@ -40617,11 +40854,7 @@ mod tests {
     #[test]
     fn real_nested_loop_certificate_modulo_3() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nested-corpus");
-        if !dir.exists() {
-            return; // fixture not present
-        }
-        let bytes = std::fs::read(dir.join("nested.json")).expect("nested fixture present");
-        let func: VerifiableFunction = serde_json::from_slice(&bytes).expect("parse nested");
+        let func = required_json_fixture(&dir.join("nested.json"));
         // The postcondition is the untouched-local fact `_0 >= 0` (ret >= 0).
         assert!(
             func.postconditions.iter().any(|p| matches!(
@@ -40823,6 +41056,20 @@ mod tests {
             extract_break_loop_function(&nfunc).is_none(),
             "a nested loop must NOT extract a single-loop break function"
         );
+    }
+
+    /// The bridge gate's step budget follows the per-function budget at the
+    /// calibrated scale, keeps `0` meaning unbounded (never "zero seconds"),
+    /// and cannot wrap into a tiny bound.
+    #[test]
+    fn bridge_step_budget_scales_the_function_budget_and_keeps_zero_unbounded() {
+        assert_eq!(bridge_step_budget_secs(0), 0);
+        assert_eq!(bridge_step_budget_secs(1), crate::trustir_bridge::BRIDGE_STEP_BUDGET_SCALE);
+        assert_eq!(
+            bridge_step_budget_secs(30),
+            30 * crate::trustir_bridge::BRIDGE_STEP_BUDGET_SCALE
+        );
+        assert_eq!(bridge_step_budget_secs(u64::MAX), u64::MAX);
     }
 
     /// SCALABILITY WALL — the per-function budget makes a REAL crate's pathological
@@ -41223,7 +41470,8 @@ mod tests {
     }
 
     /// Trust: call-spine increment — the REAL-CRATE PROBE (measurement-only,
-    /// env-gated; skips silently when `TRUST_CALL_SPINE_PROBE_DIRS` is unset).
+    /// env-gated: `#[ignore]`d, and it panics when `TRUST_CALL_SPINE_PROBE_DIRS`
+    /// is unset, so a bare `--ignored` run cannot pass having measured nothing).
     /// Per dump dir it runs the PRODUCTION `prove_dump_dir_with_budget` (the
     /// callees-first pass with the accumulated certified registry — the exact
     /// shipped semantics) and prints the split, THEN prints a DIAGNOSTIC upper
@@ -41233,22 +41481,34 @@ mod tests {
     /// how much of the corpus is blocked ONLY on callee certification (vs
     /// blocked on the shape itself).
     #[test]
+    #[ignore = "measurement driver: set TRUST_CALL_SPINE_PROBE_DIRS=<dump dir>[:<dump dir>...] \
+                and run with --ignored --nocapture"]
     fn call_spine_real_crate_probe() {
         let Ok(dirs) = std::env::var("TRUST_CALL_SPINE_PROBE_DIRS") else {
-            eprintln!("call_spine_real_crate_probe: TRUST_CALL_SPINE_PROBE_DIRS unset — skipping");
-            return;
+            panic!(
+                "call_spine_real_crate_probe is a measurement driver and \
+                 TRUST_CALL_SPINE_PROBE_DIRS is unset, so it measured nothing. Run: \
+                 TRUST_CALL_SPINE_PROBE_DIRS=<dump dir>[:<dump dir>...] \
+                 [TRUST_CLEAN_CENSUS_BUDGET_SECS=<secs; default 30>] \
+                 targo --unverified test --manifest-path crates/Cargo.toml -p trust-clean \
+                 --lib -- --ignored --exact \
+                 prove::tests::call_spine_real_crate_probe --nocapture"
+            )
         };
         let budget: u64 = std::env::var("TRUST_CLEAN_CENSUS_BUDGET_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30);
-        for dir in dirs.split(':').filter(|d| !d.is_empty()) {
+        let dirs: Vec<_> = dirs.split(':').filter(|dir| !dir.is_empty()).collect();
+        assert!(!dirs.is_empty(), "TRUST_CALL_SPINE_PROBE_DIRS is set but contains no paths");
+        for dir in dirs {
             let dir = Path::new(dir);
             let corpus = dir
                 .file_name()
                 .map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned());
             // (1) THE PRODUCTION MEASUREMENT: callees-first + accumulated registry.
-            let sc = prove_dump_dir_with_budget(dir, budget).expect("probe dir reads");
+            let sc = prove_dump_dir_with_budget(dir, budget)
+                .unwrap_or_else(|error| panic!("probe corpus {}: {error:#}", dir.display()));
             println!(
                 "CALL-SPINE PROBE {corpus}: total={} fully_faithful={} via_trustir={} \
                  mirsem_fallback={} kernel_rejected={} declined={}",
@@ -41263,19 +41523,13 @@ mod tests {
             // return SHAPE at all (pretend-certify EVERYTHING in the corpus; args/
             // dest/spine constraints still apply). NOT a certificate.
             let mut funcs: Vec<VerifiableFunction> = Vec::new();
-            let mut entries: Vec<_> = std::fs::read_dir(dir)
-                .unwrap()
-                .filter_map(Result::ok)
-                .map(|e| e.path())
+            let entries: Vec<_> = required_fixture_paths(dir)
+                .into_iter()
                 .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
                 .collect();
-            entries.sort();
+            assert!(!entries.is_empty(), "probe corpus {} contains no JSON dumps", dir.display());
             for path in &entries {
-                let Ok(bytes) = std::fs::read(path) else { continue };
-                if let Ok(f) = decode_verifiable_function_with_authenticated_legacy_metadata(&bytes)
-                {
-                    funcs.push(f);
-                }
+                funcs.push(required_authenticated_fixture(path));
             }
             let pretend: std::collections::BTreeMap<String, crate::mirsem::CalleeFact> = funcs
                 .iter()
@@ -41303,11 +41557,23 @@ mod tests {
     /// fully_faithful / via_trustir / mirsem_fallback / kernel_rejected /
     /// declined), then a per-fallback-function diagnostic (which MirSem path
     /// certified it + why trust-ir declined). Prints with `--nocapture`.
+    /// `#[ignore]`d, and it panics when `TRUST_FALLBACK_CENSUS_DIRS` is unset, so
+    /// a bare `--ignored` run cannot pass having measured nothing.
     #[test]
+    #[ignore = "measurement driver: set TRUST_FALLBACK_CENSUS_DIRS=<dump dir>[:<dump dir>...] \
+                and run with --ignored --nocapture"]
     fn mirsem_fallback_census() {
         let Ok(dirs) = std::env::var("TRUST_FALLBACK_CENSUS_DIRS") else {
-            eprintln!("mirsem_fallback_census: TRUST_FALLBACK_CENSUS_DIRS unset — skipping");
-            return;
+            panic!(
+                "mirsem_fallback_census is a measurement driver and \
+                 TRUST_FALLBACK_CENSUS_DIRS is unset, so it measured nothing. Run: \
+                 TRUST_FALLBACK_CENSUS_DIRS=<dump dir>[:<dump dir>...] \
+                 [TRUST_CLEAN_CENSUS_BUDGET_SECS=<secs; default 30>] \
+                 [TRUST_FALLBACK_CENSUS_FAST=1] \
+                 targo --unverified test --manifest-path crates/Cargo.toml -p trust-clean \
+                 --lib -- --ignored --exact \
+                 prove::tests::mirsem_fallback_census --nocapture"
+            )
         };
         let budget: u64 = std::env::var("TRUST_CLEAN_CENSUS_BUDGET_SECS")
             .ok()
@@ -41323,28 +41589,25 @@ mod tests {
         // `kernel_rejected` is NOT measured in this mode (printed as -1) — it
         // belongs to the full pipeline.
         let fast = std::env::var("TRUST_FALLBACK_CENSUS_FAST").is_ok();
-        for dir in dirs.split(':').filter(|d| !d.is_empty()) {
+        let dirs: Vec<_> = dirs.split(':').filter(|dir| !dir.is_empty()).collect();
+        assert!(!dirs.is_empty(), "TRUST_FALLBACK_CENSUS_DIRS is set but contains no paths");
+        for dir in dirs {
             let dir = Path::new(dir);
             let corpus = dir
                 .file_name()
                 .map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned());
-            let mut entries: Vec<_> = std::fs::read_dir(dir)
-                .unwrap_or_else(|e| panic!("read census dir {}: {e}", dir.display()))
-                .filter_map(Result::ok)
-                .map(|e| e.path())
+            let entries: Vec<_> = required_fixture_paths(dir)
+                .into_iter()
                 .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
                 .collect();
-            entries.sort();
+            assert!(!entries.is_empty(), "census corpus {} contains no JSON dumps", dir.display());
             let mut sc = ProveScorecard::default();
             let mut fallback_fns: Vec<VerifiableFunction> = Vec::new();
             let n = entries.len();
             for (i, path) in entries.into_iter().enumerate() {
-                let Ok(bytes) = std::fs::read(&path) else { continue };
-                let Ok(func) =
-                    decode_verifiable_function_with_authenticated_legacy_metadata(&bytes)
-                else {
-                    continue;
-                };
+                // Fail-closed, like `prove_dump_dir`: an undecodable dump is a FAILURE
+                // naming its path, never a row silently dropped from `total`.
+                let func = required_authenticated_fixture(&path);
                 sc.total += 1;
                 if fast {
                     let fc = func.clone();
@@ -41756,10 +42019,7 @@ mod tests {
     #[test]
     fn assert_guard_corpus_scorecard() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/assert-guard-corpus");
-        if !dir.exists() {
-            return; // fixture not present
-        }
-        let sc = prove_dump_dir(&dir).expect("read assert-guard-corpus");
+        let sc = required_prove_dump_dir(&dir);
         assert_eq!(sc.kernel_rejected, 0, "0 unsound anywhere in the corpus");
         assert!(
             sc.fully_faithful >= 3,
@@ -41869,11 +42129,7 @@ mod tests {
     fn assert_guard_straight_line_declines_loop_keep_zero_without_cfg_termination_proof() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/real-spec-corpus/loop_keep_zero.json");
-        if !path.exists() {
-            return; // fixture not present
-        }
-        let bytes = std::fs::read(&path).expect("read loop_keep_zero.json");
-        let f: VerifiableFunction = serde_json::from_slice(&bytes).expect("parse loop_keep_zero");
+        let f = required_json_fixture(&path);
         assert!(straight_line_ir_body(&f).is_none(), "a cyclic CFG is not straight-line");
         assert!(
             !function_fully_faithful_via_trustir(&f),
@@ -41968,6 +42224,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         // An UNGUARDED bounds-style violation VC — `x > 1_000_000` (e.g. "the
@@ -42047,6 +42304,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -42153,7 +42411,7 @@ mod tests {
             let trust_types::Ty::Adt { variants, .. } = &mut func.body.locals[local].ty else {
                 unreachable!()
             };
-            variants.clear();
+            variants.make_mut().clear();
             assert!(
                 !crate::assignment_types::all_assignments_match(&func.body),
                 "removing first-class {expected_name} variants must fail closed",
@@ -42383,14 +42641,13 @@ mod tests {
             "cmp__Ordering__is_le.json",
             "cmp__Ordering__is_ge.json",
         ];
-        if names.iter().any(|n| !src.join(n).exists()) {
-            return; // fixtures not present in this checkout — skip, don't fail.
-        }
         let dir = std::env::temp_dir().join("trust_m5_slice_b_cmp_ordering_as_raw_family");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|error| {
+            panic!("create staged fixture directory {}: {error}", dir.display())
+        });
         for n in names {
-            std::fs::copy(src.join(n), dir.join(n)).unwrap();
+            copy_required_fixture(&src.join(n), &dir.join(n));
         }
         let sc = prove_dump_dir(&dir).expect("prove the staged M5 slice-B corpus");
         let _ = std::fs::remove_dir_all(&dir);
@@ -42445,23 +42702,23 @@ mod tests {
     /// scratch dir and run them through the production `prove_dump_dir` gate —
     /// the shared helper the M5-residue tests below use so the count is EXACT
     /// (none of the OTHER real dumps in that census directory can inflate or
-    /// deflate it). Returns `None` (skip, don't fail) if any named fixture is
-    /// absent from this checkout.
-    fn stage_and_prove_cmp_ordering(scratch_name: &str, names: &[&str]) -> Option<ProveScorecard> {
+    /// deflate it). Every named fixture is checked in and therefore REQUIRED: a
+    /// missing one FAILS naming its path (NO-VACUOUS-CORPUS-TEST), never skips.
+    #[track_caller]
+    fn stage_and_prove_cmp_ordering(scratch_name: &str, names: &[&str]) -> ProveScorecard {
         let src = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/census-core-m5-2026-07-07/cmp-ordering");
-        if names.iter().any(|n| !src.join(n).exists()) {
-            return None;
-        }
         let dir = std::env::temp_dir().join(scratch_name);
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|error| {
+            panic!("create staged fixture directory {}: {error}", dir.display())
+        });
         for n in names {
-            std::fs::copy(src.join(n), dir.join(n)).unwrap();
+            copy_required_fixture(&src.join(n), &dir.join(n));
         }
         let sc = prove_dump_dir(&dir).expect("prove the staged cmp-ordering corpus");
         let _ = std::fs::remove_dir_all(&dir);
-        Some(sc)
+        sc
     }
 
     /// THE M5 RESIDUE #1/§discipline PRODUCTION GATE: `Ordering::reverse` (the
@@ -42475,9 +42732,7 @@ mod tests {
     #[test]
     fn real_ordering_reverse_and_then_open_via_production_prove_dump_dir_gate() {
         let names = ["cmp__Ordering__reverse.json", "cmp__Ordering__then.json"];
-        let Some(sc) = stage_and_prove_cmp_ordering("trust_m5_residue_reverse_then", &names) else {
-            return; // fixtures not present in this checkout — skip, don't fail.
-        };
+        let sc = stage_and_prove_cmp_ordering("trust_m5_residue_reverse_then", &names);
         eprintln!("{}", sc.headline());
         assert_eq!(sc.total, 2, "exactly the 2 staged dumps (reverse + then)");
         assert_eq!(sc.kernel_rejected, 0, "unsound: {:?}", sc.rejections);
@@ -42528,9 +42783,7 @@ mod tests {
             "cmp__impls__<impl cmp__Ord for i64>__cmp.json",
             "cmp__impls__<impl cmp__Ord for i128>__cmp.json",
         ];
-        let Some(sc) = stage_and_prove_cmp_ordering("trust_m5_residue_ord_cmp", &names) else {
-            return; // fixtures not present in this checkout — skip, don't fail.
-        };
+        let sc = stage_and_prove_cmp_ordering("trust_m5_residue_ord_cmp", &names);
         eprintln!("{}", sc.headline());
         assert_eq!(sc.total, 4, "exactly the 4 staged dumps (i16/i32/i64/i128 Ord::cmp)");
         assert_eq!(sc.kernel_rejected, 0, "unsound: {:?}", sc.rejections);
@@ -42660,6 +42913,38 @@ mod tests {
         );
         assert_eq!(exact_instantiator_ord_safety_discharge(&func, &safety_vcs), Some(true));
         assert!(adt_return_opaque_ord_fully_faithful_via_trustir(&func));
+    }
+
+    /// The pinned discharge's anti-vacuity controls, which every re-pin of
+    /// `INSTANTIATOR_ORD_LEAF_VC_HASH` must re-run: the guard-implied STRICT
+    /// inequality is the only hypothesis that refutes the obligation.
+    #[test]
+    fn instantiator_ordering_discharge_anti_vacuity_controls() {
+        use trust_types::{Formula as F, Sort};
+        let func = load_instantiator_ordering_leaf();
+        let safety_vcs = trust_vcgen::generate_vcs(&func)
+            .into_iter()
+            .filter(|vc| crate::mirsem::is_safety_vc_kind_pub(&vc.kind))
+            .collect::<Vec<_>>();
+        let [vc] = safety_vcs.as_slice() else {
+            panic!("exactly one safety VC, got {}", safety_vcs.len());
+        };
+        let base = augment_with_type_bounds(&vc.formula, &func);
+        let idx = || Box::new(F::Var("idx".to_string(), Sort::Int));
+        let field = || Box::new(F::Var("self*.1".to_string(), Sort::Int));
+        let refute = |extra: Option<F>| {
+            let f = match extra {
+                Some(fact) => F::And(vec![base.clone(), fact]),
+                None => base.clone(),
+            };
+            crate::vc_refute::check_refute_vc(&f)
+        };
+        assert!(refute(None).is_none(), "CONTROL: no injected fact must not refute");
+        assert!(refute(Some(F::Ge(idx(), field()))).is_none(), "NEGATIVE: `idx >= self.1` must not refute");
+        assert!(
+            matches!(refute(Some(F::Gt(idx(), field()))), Some(crate::RefuteOutcome::RefutedModulo3)),
+            "POSITIVE: `idx > self.1` must refute"
+        );
     }
 
     #[test]
@@ -42983,27 +43268,23 @@ mod tests {
     // full design + gate rationale.
     // ================================================================================
 
-    /// Load the function named `def_path` from the w2-iter-harvest dumps directory, or
-    /// `None` if the fixture isn't present in this checkout.
-    fn w2_function(def_path: &str) -> Option<VerifiableFunction> {
+    /// Load the REQUIRED function named `def_path` from the checked-in w2-iter-harvest
+    /// dumps directory. A missing directory, an undecodable row, or an absent
+    /// `def_path` FAILS naming the path (NO-VACUOUS-CORPUS-TEST) — never a skip.
+    #[track_caller]
+    fn w2_function(def_path: &str) -> VerifiableFunction {
         let dir =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/w2-iter-harvest-2026-07-20/dumps");
-        if !dir.exists() {
-            return None;
-        }
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-            let path = entry.path();
+        for path in required_fixture_paths(&dir) {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            if let Ok(f) = decode_verifiable_function_with_authenticated_legacy_metadata(&bytes) {
-                if f.def_path == def_path {
-                    return Some(f);
-                }
+            let function = required_authenticated_fixture(&path);
+            if function.def_path == def_path {
+                return function;
             }
         }
-        None
+        panic!("required checked-in fixture function `{def_path}` not found in {}", dir.display())
     }
 
     /// HEADLINE — the first unbounded-loop certificate over real slice code. `while_idx`
@@ -43014,10 +43295,7 @@ mod tests {
     #[test]
     fn w2_while_idx_partial_tier_certificate_kernel_checks() {
         use crate::mirsem::RefinementVerdict::ProvenModulo3;
-        let Some(func) = w2_function("while_idx") else {
-            eprintln!("w2 fixture absent — skipping");
-            return;
-        };
+        let func = w2_function("while_idx");
         // The recognizer accepts the exact fragment.
         let silf = extract_slice_index_loop_function(&func)
             .expect("while_idx is the recognized slice-index-loop fragment");
@@ -43073,9 +43351,7 @@ mod tests {
     #[test]
     fn w2_termination_flip_available_when_safety_all_discharged() {
         use crate::mirsem::RefinementVerdict::ProvenModulo3;
-        let Some(func) = w2_function("while_idx") else {
-            return;
-        };
+        let func = w2_function("while_idx");
         let silf = extract_slice_index_loop_function(&func).expect("recognized");
         // Gated entry: termination withheld (undischarged panic exit).
         let gated = slice_index_loop_partial_faithful(&func).expect("partial cert");
@@ -43099,9 +43375,7 @@ mod tests {
     /// `ContractKind::Ensures` contract entry.
     #[test]
     fn w2_declared_ensures_declines_gate2() {
-        let Some(base) = w2_function("while_idx") else {
-            return;
-        };
+        let base = w2_function("while_idx");
         // A declared postcondition over the return.
         let mut with_post = base.clone();
         with_post.postconditions.push(trust_types::Formula::Ge(
@@ -43138,9 +43412,7 @@ mod tests {
     #[test]
     fn w2_forgery_hidden_second_index() {
         use crate::mirsem::{RefinementVerdict, SemCmpOp, SemCond, SemOperand};
-        let Some(func) = w2_function("while_idx") else {
-            return;
-        };
+        let func = w2_function("while_idx");
         let silf = extract_slice_index_loop_function(&func).expect("recognized");
         // Guard is Lt(i, n); forge a bounds cond Lt(j, n) with j a fresh non-counter slot.
         let SemOperand::Var(i_idx) = silf.guard.a else { panic!("guard LHS is a var") };
@@ -43161,9 +43433,7 @@ mod tests {
     #[test]
     fn w2_forgery_le_guard_and_swapped_assert() {
         use crate::mirsem::{RefinementVerdict, SemCmpOp, SemCond, SemOperand};
-        let Some(func) = w2_function("while_idx") else {
-            return;
-        };
+        let func = w2_function("while_idx");
         let silf = extract_slice_index_loop_function(&func).expect("recognized");
         let SemOperand::Var(i_idx) = silf.guard.a else { panic!() };
         let SemOperand::Var(n_idx) = silf.guard.b else { panic!() };
@@ -43205,9 +43475,7 @@ mod tests {
     #[test]
     fn w2_forgery_narrow_counter_overflow() {
         use crate::mirsem::RefinementVerdict::{KernelRejected, ProvenModulo3};
-        let Some(func) = w2_function("while_idx") else {
-            return;
-        };
+        let func = w2_function("while_idx");
         let silf = extract_slice_index_loop_function(&func).expect("recognized");
         // Matched widths — the honest instance discharges.
         let ok = crate::mirsem::check_counter_overflow_discharge_instance(
@@ -43240,9 +43508,7 @@ mod tests {
     #[test]
     fn w2_forgery_wrong_invariant() {
         use crate::mirsem::SynthInvariant;
-        let Some(func) = w2_function("while_idx") else {
-            return;
-        };
+        let func = w2_function("while_idx");
         let mut silf = extract_slice_index_loop_function(&func).expect("recognized");
         // Repoint the range's upper bound to a slot the guard `i < n` does not mention.
         let wrong_bound = silf.n_idx + 999;
@@ -43262,9 +43528,7 @@ mod tests {
     /// increment-2, not this). Plus (frame gate) a MUTABLE BORROW of the slice declines.
     #[test]
     fn w2_forgery_call_and_slice_mutation() {
-        let Some(func) = w2_function("while_idx") else {
-            return;
-        };
+        let func = w2_function("while_idx");
         // (c) replace an in-body Assert terminator with a Call.
         let with_call = replace_first_assert_with_call(&func);
         assert!(
@@ -43283,9 +43547,7 @@ mod tests {
     /// declines: a genuine loop counter has exactly two writes (init + the `+1` increment).
     #[test]
     fn w2_forgery_hidden_counter_write() {
-        let Some(func) = w2_function("while_idx") else {
-            return;
-        };
+        let func = w2_function("while_idx");
         let silf = extract_slice_index_loop_function(&func).expect("recognized");
         let counter = usize::try_from(silf.i_idx).unwrap();
         let mut mutated = func.clone();
@@ -43312,9 +43574,7 @@ mod tests {
     /// DECLINES; the decline is recorded rather than mis-certified.
     #[test]
     fn w2_count_pos_declines_honestly() {
-        let Some(func) = w2_function("count_pos") else {
-            return;
-        };
+        let func = w2_function("count_pos");
         assert!(
             slice_index_loop_partial_faithful(&func).is_none(),
             "count_pos's in-body branch is outside the increment-1 spine gate — declines"
@@ -43366,6 +43626,7 @@ mod tests {
                     is_foreign: false,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     unwind: trust_types::UnwindEdge::default(),
                 };
                 break;
@@ -43396,42 +43657,81 @@ mod tests {
     // edges, orientation pin), and every forgery probe. See the mirsem module comment.
     // ================================================================================
 
-    /// Load `def_path` from the FRESH (offset-modeled) w2 corpus twins, or `None`.
-    fn w2_offset_function(def_path: &str) -> Option<VerifiableFunction> {
+    /// Load the REQUIRED `def_path` from the checked-in FRESH (offset-modeled) w2 corpus
+    /// twins, or FAIL naming the path (NO-VACUOUS-CORPUS-TEST).
+    #[track_caller]
+    fn w2_offset_function(def_path: &str) -> VerifiableFunction {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/w2-iter-offset-modeled-2026-07-20/dumps");
-        if !dir.exists() {
-            return None;
-        }
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-            let path = entry.path();
+        for path in required_fixture_paths(&dir) {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            if let Ok(f) = decode_verifiable_function_with_authenticated_legacy_metadata(&bytes) {
-                if f.def_path == def_path {
-                    return Some(f);
-                }
+            let function = required_authenticated_fixture(&path);
+            if function.def_path == def_path {
+                return function;
             }
         }
-        None
+        panic!("required checked-in fixture function `{def_path}` not found in {}", dir.display())
     }
 
     fn empty_callees() -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact> {
         std::collections::BTreeMap::new()
     }
 
-    /// HEADLINE (INC2) — sum_loop + count_pos are recognized at the PARTIAL tier over the
-    /// GHOST-COUNTER projection, obligation (I) checks modulo 3, termination is NOT claimed,
-    /// and the ghost slots live OUTSIDE the MIR local index space.
+    /// The accumulator `Overflow(Add)` rows vcgen raises for `func`, each with whether it
+    /// refutes modulo 3 under the function's sound augmentation — the SAME re-check
+    /// `function_safety_vcs_all_discharged` runs (`check_refute_vc` answers `RefutedModulo3`
+    /// only when the Clean kernel accepts the proof term).
+    fn add_overflow_rows_refuted(func: &VerifiableFunction) -> Vec<bool> {
+        trust_vcgen::generate_vcs(func)
+            .into_iter()
+            .filter(|vc| {
+                matches!(
+                    vc.kind,
+                    trust_types::VcKind::ArithmeticOverflow { op: trust_types::BinOp::Add, .. }
+                )
+            })
+            .map(|vc| {
+                matches!(
+                    crate::vc_refute::check_refute_vc(&augment_with_type_bounds(&vc.formula, func)),
+                    Some(crate::RefuteOutcome::RefutedModulo3)
+                )
+            })
+            .collect()
+    }
+
+    /// HEADLINE (INC2) — sum_loop + count_pos are recognized over the GHOST-COUNTER
+    /// projection, obligation (I) checks modulo 3, and the ghost slots live OUTSIDE the MIR
+    /// local index space. TERMINATION is claimed EXACTLY when the function's safety-VC gate
+    /// discharges every row — pinned here as an equivalence, per function:
+    ///
+    /// * sum_loop — NOT claimed. Its signed value-accumulator overflow is REACHABLE
+    ///   (`s=[i32::MAX,1]`), its row does not refute, the gate stays shut, and the PARTIAL
+    ///   tier is all it gets.
+    /// * count_pos — CLAIMED, at the conditional-total tier (still under P-ITER-COUNT).
+    ///   This test used to assert "termination MUST NOT be claimed" for count_pos too, on
+    ///   the stated ground that its accumulator-overflow VC was open. That ground was
+    ///   removed by vcgen's slice trip-count bound (`371552d454`, 2026-09-19): vcgen now
+    ///   conjoins `c ≤ isize::MAX` (the non-ZST slice length bound it already modeled) into
+    ///   count_pos's `c + 1` row, the row refutes modulo 3 — re-checked below, per row —
+    ///   and the gate opens. MEASURED: with only that commit's two slice arms removed from
+    ///   `total_loop_iterations`, the conjunct leaves the row, the row stops refuting, and
+    ///   the old "MUST NOT be claimed" assertion passes again. This is the flip
+    ///   `w2_termination_flip_available_when_safety_all_discharged` pins for `while_idx`
+    ///   with the gate forced open; here the gate opens on its own, and the termination
+    ///   half it mints is `loopTotalCorrect`, itself kernel-checked modulo 3.
+    ///   The claim is also TRUE of the program: the loop visits each of the slice's
+    ///   `≤ isize::MAX` elements once, and `c` counts a subset of them.
+    ///
+    /// The count_pos NEGATIVE CONTROL keeps the gate honest from the other side: the same
+    /// body with its `+ 1` step widened to `+ 2^63` (a reachable overflow on a two-element
+    /// slice) must shut the gate again and lose the termination claim.
     #[test]
     fn w2_iter_loop_positive_controls_partial_tier() {
+        use crate::mirsem::RefinementVerdict::ProvenModulo3;
         for name in ["sum_loop", "count_pos"] {
-            let Some(func) = w2_function(name) else {
-                eprintln!("w2 fixture absent — skipping {name}");
-                return;
-            };
+            let func = w2_function(name);
             let callees = empty_callees();
             let ilf = extract_iter_loop_function(&func, &callees)
                 .unwrap_or_else(|| panic!("{name} is the recognized iterator-for-loop fragment"));
@@ -43447,21 +43747,13 @@ mod tests {
             let cert = iter_loop_partial_faithful(&func, &callees)
                 .unwrap_or_else(|| panic!("{name} mints the partial certificate"));
             assert!(cert.is_partial_modulo_3(), "{name}: obligation (I) checks modulo 3");
-            // TERMINATION OVERCLAIM probe — never minted (accumulator-overflow VC is open).
-            assert!(!cert.termination_claimed(), "{name}: termination MUST NOT be claimed");
-            assert!(cert.termination.is_none(), "{name}: no total-correctness half emitted");
-            assert!(
-                !function_safety_vcs_all_discharged(&func),
-                "{name}: the accumulator-overflow VC is genuinely undischarged"
-            );
-            // CLAIM-SURFACE honesty — thinner than INC1, names the premise, no MIR assert.
-            let claim = cert.tier_claim();
-            assert!(claim.contains("PARTIAL"), "{name}: partial tier: {claim}");
-            assert!(claim.contains("THINNER"), "{name}: strictly thinner than INC1: {claim}");
-            assert!(claim.contains("P-ITER-COUNT"), "{name}: names the premise: {claim}");
-            assert!(
-                claim.contains("NO MIR assert"),
-                "{name}: states NO MIR assert discharged: {claim}"
+            // TERMINATION ⇔ THE SAFETY-VC GATE — never claimed past an open panic exit, and
+            // never withheld from a body whose every safety row the kernel re-checked.
+            let gate = function_safety_vcs_all_discharged(&func);
+            assert_eq!(
+                cert.termination_claimed(),
+                gate,
+                "{name}: termination is claimed iff every safety VC is discharged"
             );
             // Trust: HONEST FLOOR inc-2 (2026-07-23) — PER-FUNCTION overflow-falsifier honesty.
             // The shipped literal surfaced sum_loop's REACHABLE `s=[i32::MAX,1]` panic as
@@ -43477,8 +43769,38 @@ mod tests {
                 },
                 "{name}: accumulator-overflow class"
             );
+            let add_rows = add_overflow_rows_refuted(&func);
+            assert_eq!(add_rows.len(), 1, "{name}: exactly one accumulator Overflow(Add) row");
+            let claim = cert.tier_claim();
+            // Both surfaces name the undischarged premise, disclaim any MIR-assert discharge
+            // by this lane, and keep the recognizer-trust boundary.
+            assert!(claim.contains("P-ITER-COUNT"), "{name}: names the premise: {claim}");
+            assert!(
+                claim.contains("NO MIR assert"),
+                "{name}: states NO MIR assert discharged: {claim}"
+            );
+            assert!(claim.contains("recognizer-trust"), "{name}: trust boundary: {claim}");
             match name {
                 "sum_loop" => {
+                    // The row is REAL and OPEN — the gate is shut for a true reason.
+                    assert_eq!(add_rows, vec![false], "sum_loop: its overflow row stays open");
+                    assert!(
+                        !gate,
+                        "sum_loop: the accumulator-overflow VC is genuinely undischarged"
+                    );
+                    assert!(
+                        !cert.termination_claimed(),
+                        "sum_loop: termination MUST NOT be claimed"
+                    );
+                    assert!(
+                        cert.termination.is_none(),
+                        "sum_loop: no total-correctness half emitted"
+                    );
+                    assert!(claim.contains("PARTIAL"), "sum_loop: partial tier: {claim}");
+                    assert!(
+                        claim.contains("THINNER"),
+                        "sum_loop: strictly thinner than INC1: {claim}"
+                    );
                     assert!(
                         claim.contains("REACHABLE panic")
                             && claim.contains("falsifier s=[i32::MAX,1]"),
@@ -43490,18 +43812,104 @@ mod tests {
                     );
                 }
                 "count_pos" => {
+                    // The flip, re-checked at its source: the one Overflow(Add) row refutes.
+                    assert_eq!(
+                        add_rows,
+                        vec![true],
+                        "count_pos: its bounded-counter overflow row must refute modulo 3 \
+                         (vcgen's slice trip-count bound, 371552d454)"
+                    );
+                    assert!(gate, "count_pos: every safety VC is discharged");
                     assert!(
-                        claim.contains("INFEASIBLE on this function"),
-                        "count_pos: unsigned +1 counter states its VC is infeasible: {claim}"
+                        matches!(cert.termination, Some(ProvenModulo3)),
+                        "count_pos: loopTotalCorrect must kernel-check modulo 3: {:?}",
+                        cert.termination
+                    );
+                    assert!(
+                        claim.contains("CONDITIONAL-TOTAL")
+                            && claim.contains("UNDISCHARGED premise")
+                            && claim.contains("BY THIS LANE")
+                            && claim.contains("safety-VC gate"),
+                        "count_pos: the total claim stays conditional on P-ITER-COUNT and says \
+                         what opened the gate: {claim}"
                     );
                     assert!(
                         !claim.contains("s=[i32::MAX,1]") && !claim.contains("panics"),
                         "count_pos: must NOT surface sum_loop's reachable panic as its own: {claim}"
                     );
+                    // The PARTIAL-tier surface count_pos would carry with the gate shut keeps
+                    // its per-function honest floor (the clause the total surface omits).
+                    let partial = crate::mirsem::iter_loop_partial_witness(&ilf, false)
+                        .expect("the partial witness mints with the gate shut");
+                    assert!(
+                        !partial.termination_claimed(),
+                        "count_pos: gate shut ⇒ no termination"
+                    );
+                    let partial_claim = partial.tier_claim();
+                    assert!(
+                        partial_claim.contains("PARTIAL")
+                            && partial_claim.contains("THINNER")
+                            && partial_claim.contains("INFEASIBLE on this function"),
+                        "count_pos: unsigned +1 counter states its VC is infeasible: {partial_claim}"
+                    );
+                    assert!(
+                        !partial_claim.contains("s=[i32::MAX,1]")
+                            && !partial_claim.contains("panics"),
+                        "count_pos: must NOT surface sum_loop's reachable panic as its own: \
+                         {partial_claim}"
+                    );
+
+                    // NEGATIVE CONTROL: widen the `+ 1` step to `+ 2^63`. `c + 2^63` overflows
+                    // on the second counted element, the row must stay open, and the
+                    // termination claim must go with it.
+                    let mut widened = func.clone();
+                    let mut widened_steps = 0;
+                    for b in &mut widened.body.blocks {
+                        for st in &mut b.stmts {
+                            if let trust_types::Statement::Assign {
+                                rvalue:
+                                    trust_types::Rvalue::CheckedBinaryOp(
+                                        trust_types::BinOp::Add,
+                                        _,
+                                        rhs,
+                                    ),
+                                ..
+                            } = st
+                                && matches!(
+                                    rhs,
+                                    trust_types::Operand::Constant(
+                                        trust_types::ConstValue::Uint(1, _)
+                                            | trust_types::ConstValue::Int(1)
+                                    )
+                                )
+                            {
+                                *rhs = trust_types::Operand::Constant(
+                                    trust_types::ConstValue::Uint(1u128 << 63, 64),
+                                );
+                                widened_steps += 1;
+                            }
+                        }
+                    }
+                    assert_eq!(widened_steps, 1, "count_pos: exactly one `+ 1` step to widen");
+                    assert_eq!(
+                        add_overflow_rows_refuted(&widened),
+                        vec![false],
+                        "count_pos + 2^63: the overflow row must NOT refute"
+                    );
+                    assert!(
+                        !function_safety_vcs_all_discharged(&widened),
+                        "count_pos + 2^63: the gate must shut"
+                    );
+                    let widened_cert = iter_loop_partial_faithful(&widened, &callees)
+                        .expect("count_pos + 2^63 stays in the recognized fragment");
+                    assert!(
+                        !widened_cert.termination_claimed() && widened_cert.termination.is_none(),
+                        "count_pos + 2^63: termination MUST NOT be claimed past an open overflow"
+                    );
                 }
                 _ => {}
             }
-            eprintln!("W2 INC2 {name} PARTIAL-TIER CLAIM: {claim}");
+            eprintln!("W2 INC2 {name} TIER CLAIM: {claim}");
         }
     }
 
@@ -43511,10 +43919,7 @@ mod tests {
     #[test]
     fn w2_iter_loop_fresh_twins_recognized() {
         for name in ["main::sum_loop", "main::count_pos"] {
-            let Some(func) = w2_offset_function(name) else {
-                eprintln!("offset-modeled fixture absent — skipping {name}");
-                return;
-            };
+            let func = w2_offset_function(name);
             let callees = empty_callees();
             assert!(
                 iter_loop_projection_recognized(&func, &callees),
@@ -43529,9 +43934,7 @@ mod tests {
     #[test]
     fn w2_iter_loop_class_neutrality() {
         for name in ["sum_loop", "count_pos"] {
-            let Some(func) = w2_function(name) else {
-                return;
-            };
+            let func = w2_function(name);
             let empty = empty_callees();
             let diag = diagnose_fully_faithful_gate(&func, &empty);
             assert_eq!(diag.cluster_tag(), "SHAPE_GAP", "{name}: cluster_tag UNCHANGED");
@@ -43551,9 +43954,7 @@ mod tests {
     /// in-loop Call are exactly what distinguish the for-desugar).
     #[test]
     fn w2_iter_loop_while_idx_declines_keeps_safety_gap() {
-        let Some(func) = w2_function("while_idx") else {
-            return;
-        };
+        let func = w2_function("while_idx");
         let empty = empty_callees();
         assert!(
             extract_iter_loop_function(&func, &empty).is_none(),
@@ -43582,11 +43983,9 @@ mod tests {
     /// are off, whatever the whole-function verdict is.
     #[test]
     fn w2_iter_loop_next_leaf_unchanged() {
-        let Some(func) = w2_offset_function(
+        let func = w2_offset_function(
             "<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::next",
-        ) else {
-            return;
-        };
+        );
         let empty = empty_callees();
         assert!(!iter_loop_projection_recognized(&func, &empty), "next() is not an iter loop");
         let diag = diagnose_fully_faithful_gate(&func, &empty);
@@ -43613,9 +44012,7 @@ mod tests {
     /// pinned std slice-Iter SEMANTICS, not CFG shape).
     #[test]
     fn w2_iter_loop_forgery_shape_coincidence() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let forged = rewrite_next_callee(&func, "<MyIter as std::iter::Iterator>::next");
         assert!(
             extract_iter_loop_function(&forged, &empty_callees()).is_none(),
@@ -43627,9 +44024,7 @@ mod tests {
     /// declines (only ONE header next() may exist — the 'one call per header re-entry' law).
     #[test]
     fn w2_iter_loop_forgery_second_next() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let forged = duplicate_next_call(&func);
         assert!(
             extract_iter_loop_function(&forged, &empty_callees()).is_none(),
@@ -43641,9 +44036,7 @@ mod tests {
     /// (a re-seat would reset the true cursor while the ghost counter keeps counting).
     #[test]
     fn w2_iter_loop_forgery_reseat() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let empty = empty_callees();
         let ilf = extract_iter_loop_function(&func, &empty).expect("recognized");
         // `it` is the sole place `_m = &mut it`; find it, then append a second bare write.
@@ -43674,9 +44067,7 @@ mod tests {
     /// escape channel) declines at G5's whole-body mention enumeration.
     #[test]
     fn w2_iter_loop_forgery_escape() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let empty = empty_callees();
         let it_local = find_iter_local(&func);
         let mut forged = func.clone();
@@ -43703,9 +44094,7 @@ mod tests {
     /// result-provenance pin declines (the mismatched-iterator-in-the-result-channel attack).
     #[test]
     fn w2_iter_loop_forgery_stale_result_g2r() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let forged = redirect_next_dest_to_junk(&func);
         assert!(
             extract_iter_loop_function(&forged, &empty_callees()).is_none(),
@@ -43718,9 +44107,7 @@ mod tests {
     /// MUST catch it).
     #[test]
     fn w2_iter_loop_forgery_inverted_switch() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let forged = invert_option_switch(&func);
         assert!(
             extract_iter_loop_function(&forged, &empty_callees()).is_none(),
@@ -43734,9 +44121,7 @@ mod tests {
     /// the None arm. This genuinely exercises the no-break clause (the cycle survives).
     #[test]
     fn w2_iter_loop_forgery_break() {
-        let Some(func) = w2_function("count_pos") else {
-            return;
-        };
+        let func = w2_function("count_pos");
         let empty = empty_callees();
         assert!(extract_iter_loop_function(&func, &empty).is_some(), "count_pos is recognized");
         // count_pos's None-exit is bb6. bb5's in-body Gt guard is the only
@@ -43762,9 +44147,7 @@ mod tests {
     /// frame gate (len-pinning unsound), verbatim from INC1.
     #[test]
     fn w2_iter_loop_forgery_slice_mutation() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let forged = mutably_borrow_slice_param(&func);
         assert!(
             extract_iter_loop_function(&forged, &empty_callees()).is_none(),
@@ -43776,9 +44159,7 @@ mod tests {
     /// rewriting the into_iter callee to a non-pinned one declines at G3.
     #[test]
     fn w2_iter_loop_forgery_wrong_source() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let forged = rewrite_into_iter_callee(
             &func,
             "<std::vec::Vec<i32> as std::iter::IntoIterator>::into_iter",
@@ -43793,9 +44174,7 @@ mod tests {
     /// closed (no ensures may ride the havocked accumulator).
     #[test]
     fn w2_iter_loop_forgery_declared_ensures() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let mut with_post = func.clone();
         with_post.postconditions.push(trust_types::Formula::Ge(
             Box::new(trust_types::Formula::Var("_0".into(), trust_types::Sort::Int)),
@@ -43815,9 +44194,7 @@ mod tests {
             SemBinOp, SemCmpOp, SemCond, SemCondTree, SemOperand, SemRvalue, SemStmt,
             SynthInvariant,
         };
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let ilf = extract_iter_loop_function(&func, &empty_callees()).expect("recognized");
         let (i, n) = (ilf.i_ghost, ilf.n_ghost);
         // Tampered: lower bound 1 (false at entry 0), stride +2, Le guard.
@@ -43847,9 +44224,7 @@ mod tests {
     /// unestablished callee precondition may ride the certificate). A vacuous fact is fine.
     #[test]
     fn w2_iter_loop_g2_requires_gate() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         let next_key = "<std::slice::Iter<'_, i32> as std::iter::Iterator>::next".to_string();
         let (param_tys, return_ty) = func
             .body
@@ -44040,24 +44415,20 @@ mod tests {
 
     /// Build the offset-modeled corpus's callees-first CERTIFIED registry + the sibling
     /// DumpBodies — exactly the composition-aware ordering the grader / production use.
-    fn offset_corpus() -> Option<(BTreeMap<String, crate::mirsem::CalleeFact>, DumpBodies)> {
+    ///
+    /// The corpus is checked in and REQUIRED: a missing directory or an undecodable
+    /// row FAILS naming the path (NO-VACUOUS-CORPUS-TEST) — a silently dropped row
+    /// would also silently change the callees-first registry every caller reads.
+    #[track_caller]
+    fn offset_corpus() -> (BTreeMap<String, crate::mirsem::CalleeFact>, DumpBodies) {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/w2-iter-offset-modeled-2026-07-20/dumps");
-        if !dir.exists() {
-            return None;
-        }
         let mut funcs: Vec<VerifiableFunction> = Vec::new();
-        let mut entries: Vec<_> =
-            std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).collect();
-        entries.sort();
-        for path in entries {
+        for path in required_fixture_paths(&dir) {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            if let Ok(f) = decode_verifiable_function_with_authenticated_legacy_metadata(&bytes) {
-                funcs.push(f);
-            }
+            funcs.push(required_authenticated_fixture(&path));
         }
         let order = trust_vcgen::compute_verification_order(&trust_vcgen::build_call_graph(&funcs));
         let mut by_path: BTreeMap<&str, std::collections::VecDeque<usize>> = BTreeMap::new();
@@ -44120,7 +44491,7 @@ mod tests {
                     .insert(func.def_path.clone(), crate::mirsem::CalleeFact::of_certified(func));
             }
         }
-        Some((certified, bodies))
+        (certified, bodies)
     }
 
     /// THE SCAFFOLD PIN. `offset_corpus` admits three leaves the PRODUCTION gate refuses;
@@ -44130,9 +44501,7 @@ mod tests {
     /// the deferral is provably the emitter's coverage gap and not a shape regression.
     #[test]
     fn w2_offset_leaves_are_scaffolded_not_certified() {
-        let Some((_, bodies)) = offset_corpus() else {
-            return;
-        };
+        let (_, bodies) = offset_corpus();
         let empty = empty_callees();
         for name in [OFF_NEXT, OFF_INTO_ITER, OFF_ITER_NEW] {
             let func = bodies.get(name).expect("offset-corpus leaf present");
@@ -44174,10 +44543,7 @@ mod tests {
     /// bundle, are asserted unchanged.
     #[test]
     fn w2_iter_premise_witness_attaches_class_neutral() {
-        let Some((certified, bodies)) = offset_corpus() else {
-            eprintln!("offset-modeled fixture absent — skipping");
-            return;
-        };
+        let (certified, bodies) = offset_corpus();
         let into_iter_body = bodies.get(OFF_INTO_ITER).expect("into_iter body present");
         let next_body = bodies.get(OFF_NEXT).expect("next body present");
         // THE ONE MISSING LINK, and the reason it is missing.
@@ -44241,9 +44607,7 @@ mod tests {
     /// INC2 partial tier is UNCHANGED.
     #[test]
     fn w2_iter_premise_witness_declines_on_uncertified_harvest() {
-        let Some(func) = w2_function("sum_loop") else {
-            return;
-        };
+        let func = w2_function("sum_loop");
         // Harvest bodies + empty registry (next() is SHAPE_GAP there — never certified).
         let bodies = DumpBodies::new();
         assert!(
@@ -44312,7 +44676,11 @@ mod tests {
         // pinned honest by `w_addr_dist_init_probes::production_mint_requires_the_d2_record_lane`).
         // The witnessed tier-claim wording is separately byte-pinned, corpus-independently,
         // by `w2_iter_premise_witness_text_byte_pins`.
-        if let Some((certified, bodies)) = offset_corpus() {
+        // The offset corpus is checked in and REQUIRED (was `if let Some(..) =
+        // offset_corpus()`, which skipped this whole scan when it went missing —
+        // NO-VACUOUS-CORPUS-TEST).
+        {
+            let (certified, bodies) = offset_corpus();
             let func = bodies.get("main::sum_loop").expect("sum_loop");
             assert!(
                 iter_count_premise_witness(func, &certified, &bodies).is_none(),
@@ -44531,9 +44899,7 @@ mod tests {
     /// step recognizer itself refuses the stride-2 PtrOffset).
     #[test]
     fn w2_iter_premise_forgery_stride_2_declines() {
-        let Some((certified, bodies)) = offset_corpus() else {
-            return;
-        };
+        let (certified, bodies) = offset_corpus();
         let mut next2 = bodies.get(OFF_NEXT).expect("next body").clone();
         retarget_ptr_offset_count(&mut next2.body, 2);
         // D3 declines directly.
@@ -44552,9 +44918,7 @@ mod tests {
     /// live receiver write declines the step recognizer AND the witness.
     #[test]
     fn w2_iter_premise_forgery_extra_receiver_writes_decline() {
-        let Some((certified, bodies)) = offset_corpus() else {
-            return;
-        };
+        let (certified, bodies) = offset_corpus();
         let base = bodies.get(OFF_NEXT).expect("next body").clone();
         let (param, cursor, end) = next_self_param_and_fields(&base.body);
         let some_blk = next_cursor_write_block(&base.body, param, cursor);
@@ -44607,9 +44971,7 @@ mod tests {
     /// and which is unaffected by the deferral.
     #[test]
     fn w2_iter_premise_forgery_uncertified_callees_decline() {
-        let Some((certified, bodies)) = offset_corpus() else {
-            return;
-        };
+        let (certified, bodies) = offset_corpus();
         let sum = bodies.get("main::sum_loop").expect("sum_loop");
         let ilf = extract_iter_loop_function(sum, &certified).expect("the for-desugar recognizes");
         // Baseline: BOTH keys resolve, and the resolved next() re-recognizes its value
@@ -44645,9 +45007,7 @@ mod tests {
     /// D6 — a cross-type stride (next()'s advance pointee ≠ the loop's slice element) declines.
     #[test]
     fn w2_iter_premise_forgery_cross_type_stride_declines() {
-        let Some((certified, bodies)) = offset_corpus() else {
-            return;
-        };
+        let (certified, bodies) = offset_corpus();
         // Retype the PtrOffset base pointer's pointee to i64 (was i32) ⇒ D3 stride = i64.
         let mut next_x = bodies.get(OFF_NEXT).expect("next").clone();
         let base_local = {
@@ -44699,9 +45059,7 @@ mod tests {
     /// decline is kept as a redundant tail.
     #[test]
     fn w2_iter_premise_forgery_caller_shapes_decline() {
-        let Some((certified, bodies)) = offset_corpus() else {
-            return;
-        };
+        let (certified, bodies) = offset_corpus();
         let sum = bodies.get("main::sum_loop").expect("sum_loop");
         assert!(
             extract_iter_loop_function(sum, &certified).is_some(),
@@ -44744,9 +45102,7 @@ mod tests {
     /// yield witness=None (the count-correctness adversarial gate). Also the positive control.
     #[test]
     fn w2_iter_premise_g8_pre_loop_bypass_declines() {
-        let Some((certified, bodies)) = offset_corpus() else {
-            return;
-        };
+        let (certified, bodies) = offset_corpus();
         let sum = bodies.get("main::sum_loop").expect("sum_loop");
         let ilf = extract_iter_loop_function(sum, &certified).expect("recognized");
         // Positive control: the real loop DOES post-dominate its Return.
@@ -44770,9 +45126,7 @@ mod tests {
     /// swapped sibling dump would mismatch the dump D1's status was established over.
     #[test]
     fn w2_iter_premise_digest_is_content_sensitive() {
-        let Some((_, bodies)) = offset_corpus() else {
-            return;
-        };
+        let (_, bodies) = offset_corpus();
         let base = bodies.get(OFF_NEXT).expect("next").clone();
         let mut mutated = base.clone();
         retarget_ptr_offset_count(&mut mutated.body, 2);
@@ -45081,6 +45435,8 @@ mod call_chain_pureop_trustir_lane_tests {
 mod vc_kind_formula_hash_domain_tripwire {
     use trust_types::{Formula, Sort, VcKind};
 
+    use super::tests::{corpus_dump, corpus_walk};
+
     #[test]
     fn raw_and_canonical_bytes_agree_for_the_pinned_material_shape() {
         let kind = VcKind::Assertion { message: "ord leaf".to_string() };
@@ -45116,29 +45472,24 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// `DowncastField`/`DowncastOpaque` payload was UNREACHABLE before and is reachable now
     /// — an exact set, not a proxy. Bodies without a downcast payload are excluded: the
     /// expected variant never gated those, so they are not a gain.
+    ///
+    /// An INSTRUMENT, not a test: `certified` only counts inside `newly`, so its one
+    /// relation holds by construction, and the in-tree corpus measures newly = 0 and
+    /// certified = 0 (2026-10-09). Run it against a harvest with `--ignored`.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_the_ref_self_downcast_widening_added() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
+        use std::path::Path;
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let (mut newly, mut certified, mut examples) = (0usize, 0usize, Vec::new());
+        let mut dumps = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else { continue };
+            let Some(f) = corpus_dump(path) else { continue };
+            dumps += 1;
             let Some(shape) = crate::mirsem::sem_adt_return_shape_of(&f) else { continue };
             let has_downcast_payload = [&shape.then_arm, &shape.else_arm].iter().any(|a| {
                 matches!(
@@ -45176,6 +45527,10 @@ mod vc_kind_formula_hash_domain_tripwire {
         for e in &examples {
             println!("      {e}");
         }
+        // `certified` only counts inside `newly`, so the subset holds by construction;
+        // what can fail is the corpus read, and a `--ignored` run over an empty one
+        // must not pass.
+        assert!(dumps > 0, "read NO `VerifiableFunction` dump under {root}");
         assert!(certified <= newly, "certified is a subset of reachable");
     }
 
@@ -45187,31 +45542,24 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// `None` from the whole recognizer. Therefore a body that is recognized AND carries a
     /// `NestedCtor` payload was unreachable before and is reachable now — exact, not a proxy.
     /// Each is then put to the KERNEL, because recognition is not coverage.
+    ///
+    /// An INSTRUMENT, not a test: `certified` only counts inside `newly`, so its one
+    /// relation holds by construction, and the in-tree corpus measures newly = 0 and
+    /// certified = 0 (2026-10-09). Run it against a harvest with `--ignored`.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_the_nested_ctor_arm_payload_added() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
+        use std::path::Path;
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let (mut newly, mut certified, mut examples) = (0usize, 0usize, Vec::new());
+        let mut dumps = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
+            dumps += 1;
             let Some(shape) = crate::mirsem::sem_adt_return_shape_of(&f) else { continue };
             let has_nested = [&shape.then_arm, &shape.else_arm]
                 .iter()
@@ -45235,6 +45583,10 @@ mod vc_kind_formula_hash_domain_tripwire {
         for e in &examples {
             println!("      {e}");
         }
+        // `certified` only counts inside `newly`, so the subset holds by construction;
+        // what can fail is the corpus read, and a `--ignored` run over an empty one
+        // must not pass.
+        assert!(dumps > 0, "read NO `VerifiableFunction` dump under {root}");
         assert!(certified <= newly, "certified is a subset of reachable");
     }
 
@@ -45254,34 +45606,21 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// INTERPROCEDURAL reasoning, which is a different capability from any shape widening,
     /// so it bounds what the intraprocedural lanes can ever reach.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_produces_the_return_in_the_unrecognized_adt_mass() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut producer: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut calls: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut total = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             if !matches!(f.body.return_ty, Ty::Adt { .. }) {
                 continue;
             }
@@ -45361,33 +45700,20 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// through `sem_struct_return_shape_reasoned`, the recognizer's OWN code, so this
     /// cannot drift from it and cannot measure an argument the recognizer computes itself.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn which_gate_refuses_the_single_aggregate_constructor_mass() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut total = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             if !matches!(f.body.return_ty, Ty::Adt { .. }) {
                 continue;
             }
@@ -45478,25 +45804,15 @@ mod vc_kind_formula_hash_domain_tripwire {
     ///
     /// Sized before building — the rule this report re-learned three times today.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_much_of_the_interprocedural_mass_calls_a_covered_callee() {
         use std::collections::{BTreeMap, HashSet};
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
 
         // AMBIGUOUS DEF PATHS — the validity gate on everything below.
@@ -45515,10 +45831,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut present: HashSet<String> = HashSet::new();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             present.insert(f.def_path.clone());
             *path_files.entry(f.def_path.clone()).or_default() += 1;
             if crate::mirsem::sem_adt_return_shape_of(&f).is_some()
@@ -45668,31 +45981,18 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// PARTITION of the same corpus by a syntactic property of the name, so both halves
     /// see identical recognizers — no gate is being guessed at.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn is_coverage_worse_on_generic_bodies() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
+        use std::path::Path;
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let (mut gen_n, mut gen_cov, mut mono_n, mut mono_cov) = (0usize, 0usize, 0usize, 0usize);
         let (mut gen_adt, mut mono_adt) = (0usize, 0usize);
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             let covered = crate::mirsem::sem_adt_return_shape_of(&f).is_some()
                 || crate::mirsem::sem_struct_return_shape_of(&f).is_some()
                 || crate::mirsem::sem_enum_ctor_return_shape_of(&f).is_some()
@@ -45734,10 +46034,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut two_arm_gates: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut mh: BTreeMap<&'static str, usize> = BTreeMap::new();
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             if !matches!(f.body.return_ty, trust_types::Ty::Adt { .. }) {
                 continue;
             }
@@ -45935,21 +46232,11 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// KIND that `reflect_ty` refuses, so the next increment is chosen by what the corpus
     /// actually contains rather than by what seems likely.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn which_field_types_have_no_carrier() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         fn kind(t: &Ty) -> String {
             match t {
                 Ty::Bool => "Bool".into(),
@@ -45973,16 +46260,13 @@ mod vc_kind_formula_hash_domain_tripwire {
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: BTreeMap<String, usize> = BTreeMap::new();
         let mut generic_hist: BTreeMap<String, usize> = BTreeMap::new();
         let mut bodies = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             // Exactly the class. TWO steps, because the label is a SPLIT of the lane's
             // error, not the lane's error itself: the struct lane says "the return type
             // does NOT REFLECT to a carrier", and `reflect_struct_reasoned` says WHY.
@@ -46037,32 +46321,25 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// arm ending in `Drop` returned `None` from the whole recognizer. Therefore a body
     /// that is recognized AND has an arm ending in `Drop` was unreachable before and is
     /// reachable now — exact, not a proxy. Each is then put to the KERNEL.
+    ///
+    /// An INSTRUMENT, not a test: `certified` only counts inside `newly`, so its one
+    /// relation holds by construction, and the in-tree corpus measures newly = 0 and
+    /// certified = 0 (2026-10-09). Run it against a harvest with `--ignored`.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_the_value_transparent_arm_drop_added() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let (mut newly, mut certified) = (0usize, 0usize);
+        let mut dumps = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
+            dumps += 1;
             let Some(shape) = crate::mirsem::sem_adt_return_shape_of(&f) else { continue };
             // An arm that writes `_0` and ends in Drop — the exact axis this opened.
             let via_drop = f.body.blocks.iter().any(|b| {
@@ -46085,6 +46362,10 @@ mod vc_kind_formula_hash_domain_tripwire {
         println!("\n=== value-transparent arm drop, over {} bodies in {root} ===", files.len());
         println!("  newly reachable (recognized + an arm ending in Drop):  {newly}");
         println!("  ... of which the KERNEL certifies modulo 3:            {certified}");
+        // `certified` only counts inside `newly`, so the subset holds by construction;
+        // what can fail is the corpus read, and a `--ignored` run over an empty one
+        // must not pass.
+        assert!(dumps > 0, "read NO `VerifiableFunction` dump under {root}");
         assert!(certified <= newly, "certified is a subset of reachable");
     }
 
@@ -46104,35 +46385,22 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// here), so a singleton count is still an upper bound on gain — but it is a far
     /// tighter one, and it is the difference between choosing a target and guessing at one.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn multi_blocker_census_of_the_two_arm_lane() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
 
         let mut size_hist: BTreeMap<usize, usize> = BTreeMap::new();
         let mut singleton: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut population = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             if !matches!(f.body.return_ty, Ty::Adt { .. }) {
                 continue;
             }
@@ -46228,25 +46496,15 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// mass, rather than the largest first-failure bucket — the distinction that made eight
     /// consecutive widenings gain nothing.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn multi_blocker_census_of_the_constructor_lanes() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
 
         let mut size_hist: BTreeMap<usize, usize> = BTreeMap::new();
@@ -46255,10 +46513,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut scalar_op: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut population = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             if !matches!(f.body.return_ty, Ty::Adt { .. }) {
                 continue;
             }
@@ -46416,34 +46671,21 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// Measured first, per the rule this report paid for eight times: characterize, then
     /// decide, then build.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_is_in_the_no_return_spine_class() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut shape: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut rets: BTreeMap<usize, usize> = BTreeMap::new();
         let mut total = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             let b = &f.body;
             // THE CLASS, taken from the extractor census's OWN predicate rather than a
             // proxy for it. `2_NO_RETURN_SPINE` is reached only on the `Int`/`Bool` arm, so
@@ -46531,33 +46773,20 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// for eight times — sizes it by counting bodies whose ONLY obstacle is the missing
     /// lane, not bodies that merely contain a call.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_big_is_an_opaque_call_result_lane() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Operand, Statement, Terminator};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut hist: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut total = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             if crate::mirsem::sem_adt_return_shape_of(&f).is_some()
                 || crate::mirsem::sem_struct_return_shape_of(&f).is_some()
                 || crate::mirsem::sem_enum_ctor_return_shape_of(&f).is_some()
@@ -46644,32 +46873,25 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// **The only reliable gain measurement for a lane widening is the lane-attribution
     /// delta from `which_lane_carries_the_coverage`, run before and after.** This test is
     /// kept as a population probe with that warning attached.
+    ///
+    /// An INSTRUMENT, not a test: `certified` only counts inside `newly`, so its one
+    /// relation holds by construction, and the in-tree corpus measures newly = 0 and
+    /// certified = 0 (2026-10-09). Run it against a harvest with `--ignored`.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_the_scalar_temp_chase_added() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Operand, Rvalue, Statement, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let (mut newly, mut certified) = (0usize, 0usize);
+        let mut dumps = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
+            dumps += 1;
             let b = &f.body;
             let argc = b.arg_count;
             let pi = move |local: usize| -> Option<u64> {
@@ -46729,6 +46951,10 @@ mod vc_kind_formula_hash_domain_tripwire {
         println!("\n=== scalar temp chase, over {} bodies in {root} ===", files.len());
         println!("  newly reachable (recognized + a chased temp operand):  {newly}");
         println!("  ... of which the KERNEL certifies modulo 3:            {certified}");
+        // `certified` only counts inside `newly`, so the subset holds by construction;
+        // what can fail is the corpus read, and a `--ignored` run over an empty one
+        // must not pass.
+        assert!(dumps > 0, "read NO `VerifiableFunction` dump under {root}");
         assert!(certified <= newly, "certified is a subset of reachable");
     }
 
@@ -46744,33 +46970,20 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// corpus's loops ACTUALLY are, which decides whether those lanes are near-misses or
     /// aimed at a shape real code does not contain.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_shape_are_the_corpus_loops() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut shape: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut total = 0usize;
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             let b = &f.body;
             let has_back_edge = b.blocks.iter().any(|blk| {
                 let succs: Vec<trust_types::BlockId> = match &blk.terminator {
@@ -46830,21 +47043,11 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// counting the callers whose ONLY obstacle is the missing callee, then re-running the
     /// same fixpoint the monomorphization-keyed version reported at +297.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_would_generic_keyed_verification_buy() {
         use std::collections::{HashMap, HashSet};
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         /// Drop `::<…>` instantiation suffixes, so `foo::<u32>` and `foo::<String>` share a
         /// key. Depth-1 nesting is enough for the shapes in this corpus.
         fn generic_key(p: &str) -> String {
@@ -46874,7 +47077,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
 
         // Pass 1: coverage, keyed BOTH ways.
@@ -46883,10 +47086,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut single_call: Vec<(String, String)> = Vec::new();
         let mut path_count: HashMap<String, usize> = HashMap::new();
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             *path_count.entry(f.def_path.clone()).or_default() += 1;
             let covered = crate::mirsem::sem_adt_return_shape_of(&f).is_some()
                 || crate::mirsem::sem_struct_return_shape_of(&f).is_some()
@@ -46959,30 +47159,18 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// This measures the overlap directly, because a correction that is not followed
     /// through is just a different error.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_much_of_the_uncovered_population_is_actually_covered() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -47087,24 +47275,14 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// it accepts today, and how many have the ingredients (a call, a guard, an ADT return)
     /// that make them candidates.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_far_does_the_opaque_chain_shape_reach() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let (mut accepted, mut candidates, mut with_calls, mut cand_uncovered) =
             (0usize, 0usize, 0usize, 0usize);
@@ -47114,10 +47292,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut opq_guard: std::collections::BTreeMap<&'static str, usize> = Default::default();
         let mut opq_form: std::collections::BTreeMap<&'static str, usize> = Default::default();
         for path in &files {
-            let Ok(bytes) = std::fs::read(path) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&bytes) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(path) else { continue };
             let b = &f.body;
             let has_call =
                 b.blocks.iter().any(|blk| matches!(blk.terminator, Terminator::Call { .. }));
@@ -47377,21 +47552,11 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// This is the number that decides whether compositional call reasoning is worth
     /// building, so it must not be computed from a proxy for coverage.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn compositional_headroom_against_the_production_gate() {
         use std::collections::{HashMap, HashSet};
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         fn generic_key(p: &str) -> String {
             let mut out = String::with_capacity(p.len());
             let mut depth = 0i32;
@@ -47417,13 +47582,11 @@ mod vc_kind_formula_hash_domain_tripwire {
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -47509,32 +47672,20 @@ mod vc_kind_formula_hash_domain_tripwire {
     ///
     /// This measures it before anything is built — the rule this report paid for nine times.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn go_no_go_pure_scalar_postcondition_transport() {
         use std::collections::{HashMap, HashSet};
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    out.push(p);
-                }
-            }
-        }
         let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            {
+            if let Some(f) = corpus_dump(p) {
                 funcs.push(f);
             }
         }
@@ -47642,6 +47793,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             )],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -47991,6 +48143,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             is_unsafe_sig: false,
             is_foreign: false,
             callee_identity: None,
+            callee_key: None,
         };
         f.body.blocks.push(BasicBlock { id: BlockId(1), stmts: ret, terminator: Terminator::Return });
         // A body with a call does not lower through `straight_line_ir_body` (the spine is
@@ -48098,12 +48251,13 @@ mod vc_kind_formula_hash_domain_tripwire {
             adt_kind: None,
             layout: None,
             name: "probe::S".into(),
-            fields: vec![("x".into(), efht_i64())],
-            variants: vec![],
+            fields: vec![("x".into(), efht_i64())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         }
     }
     fn efht_ref(inner: trust_types::Ty) -> trust_types::Ty {
@@ -48143,6 +48297,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
     fn efht_leaf(
@@ -48266,6 +48421,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                         is_unsafe_sig: false,
                         is_foreign: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -48596,6 +48752,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                 is_unsafe_sig: false,
                 is_foreign: false,
                 callee_identity: None,
+                callee_key: None,
             },
         };
         caller.body.blocks.push(sink(2, None));
@@ -48638,12 +48795,13 @@ mod vc_kind_formula_hash_domain_tripwire {
             adt_kind: None,
             layout: None,
             name: "probe::S2".into(),
-            fields: vec![("x".into(), efht_i64()), ("y".into(), efht_i64())],
-            variants: vec![],
+            fields: vec![("x".into(), efht_i64()), ("y".into(), efht_i64())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         }
     }
     /// `(*_local).field`.
@@ -48832,12 +48990,13 @@ mod vc_kind_formula_hash_domain_tripwire {
             adt_kind: None,
             layout: None,
             name: "probe::W".into(),
-            fields: vec![("m".into(), m_s.clone())],
-            variants: vec![],
+            fields: vec![("m".into(), m_s.clone())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
         let hidden = efht_caller(
             "probe::get_x::hidden_mut_writer",
@@ -48884,6 +49043,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             is_unsafe_sig: false,
             is_foreign: false,
             callee_identity: None,
+            callee_key: None,
         };
         let build = |name: &str, first_dest: usize, middle: Vec<trust_types::Statement>, second_dest: usize| {
             efht_func(
@@ -48929,12 +49089,13 @@ mod vc_kind_formula_hash_domain_tripwire {
             adt_kind: None,
             layout: None,
             name: "probe::Outer".into(),
-            fields: vec![("inner".into(), efht_struct_s())],
-            variants: vec![],
+            fields: vec![("inner".into(), efht_struct_s())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
         let cases = [
             (
@@ -49507,6 +49668,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                         is_unsafe_sig: false,
                         is_foreign: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: tail, terminator: Terminator::Return },
@@ -50031,6 +50193,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                 is_unsafe_sig: false,
                 is_foreign: false,
                 callee_identity: None,
+                callee_key: None,
             },
         };
         let guarded = efht_func(
@@ -50202,6 +50365,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                 is_unsafe_sig: false,
                 is_foreign: false,
                 callee_identity: None,
+                callee_key: None,
             },
         });
         assert_eq!(efht_t_reason(&caller, &registry), Some("diverging-sink-call-outside-transport-spine"));
@@ -50712,6 +50876,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                 is_unsafe_sig: false,
                 is_foreign: false,
                 callee_identity: None,
+                callee_key: None,
             },
         };
         let switch = |discr: usize, zero: usize, otherwise: usize| Terminator::SwitchInt {
@@ -50785,6 +50950,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                         is_unsafe_sig: false,
                         is_foreign: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: switch(3, 2, 3) },
@@ -51358,7 +51524,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             Ty::Bool,
             vec![(Some("k"), efht_i64())],
             vec![],
-            vec![Operand::Constant(ConstValue::OpaqueConst)],
+            vec![Operand::Constant(ConstValue::opaque_const())],
             0,
             vec![],
             vec![],
@@ -51714,6 +51880,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                         is_unsafe_sig: false,
                         is_foreign: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![ret0()], terminator: Terminator::Return },
@@ -52108,6 +52275,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                         is_unsafe_sig: false,
                         is_foreign: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock {
@@ -52191,6 +52359,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             is_unsafe_sig: false,
             is_foreign: false,
             callee_identity: None,
+            callee_key: None,
         };
         // bb0 { prefix; switchInt [0: bb1, otherwise: bb4] } bb1 { arm; goto bb2 }
         // bb2 { call -> bb3 } bb3 { tail; Return } bb4 { Unreachable }. The guarded arm
@@ -52934,23 +53103,25 @@ mod vc_kind_formula_hash_domain_tripwire {
             adt_kind: None,
             layout: None,
             name: "core::cell::UnsafeCell<u8>".into(),
-            fields: vec![("value".into(), efht_u8())],
-            variants: vec![],
+            fields: vec![("value".into(), efht_u8())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
         Ty::Adt {
             adt_kind: None,
             layout: None,
             name: "core::cell::Cell<u8>".into(),
-            fields: vec![("value".into(), unsafe_cell)],
-            variants: vec![],
+            fields: vec![("value".into(), unsafe_cell)].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         }
     }
     /// A user struct with an innocent name carrying a raw pointer: `probe::Slot { ptr: *mut u8 }`.
@@ -52959,12 +53130,13 @@ mod vc_kind_formula_hash_domain_tripwire {
             adt_kind: None,
             layout: None,
             name: "probe::Slot".into(),
-            fields: vec![("ptr".into(), h1_mptr(efht_u8()))],
-            variants: vec![],
+            fields: vec![("ptr".into(), h1_mptr(efht_u8()))].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         }
     }
     fn h1_handle_func(
@@ -53126,6 +53298,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             is_unsafe_sig: false,
             is_foreign: false,
             callee_identity: None,
+            callee_key: None,
         };
         // (a) diverging sink on the `otherwise` branch: every RETURNING path is call-free.
         let mut sink = shared_ref_leaf_with("h1::sink_call_branch", vec![Ty::Unit], vec![]);
@@ -53166,6 +53339,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
         };
         h1_assert_no_mint(&tailcall);
         // Twin: the same read split across a `Goto` still mints.
@@ -53178,26 +53352,17 @@ mod vc_kind_formula_hash_domain_tripwire {
 
     /// Trust: does the TRANSPORT lane accept anything, and is any of it NEW?
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_the_transport_lane_accepts() {
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut certified: std::collections::BTreeMap<String, crate::mirsem::CalleeFact> =
@@ -53238,28 +53403,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// This asks the call lane's own entry recognizer where they stop, by the same
     /// multi-blocker discipline used everywhere else.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn why_the_call_lanes_reach_so_few() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Statement, Terminator};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
@@ -53351,18 +53507,11 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// gap; the second is a reflection gap, and only the second is reachable from
     /// trust-clean.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_much_is_unreachable_by_construction() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         fn mentions(t: &Ty, want_unsupported: bool, depth: u32) -> bool {
             if depth > 6 { return false; }
             let hit = match t {
@@ -53385,13 +53534,11 @@ mod vc_kind_formula_hash_domain_tripwire {
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -53460,32 +53607,22 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// directly, so the answer separates a recognizer refusal from a kernel one, which
     /// need entirely different work.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_many_bare_aggregate_returns_and_why_declined() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let callees = Default::default();
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut why: BTreeMap<String, usize> = Default::default();
         let (mut uncovered, mut bare_agg) = (0usize, 0usize);
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -53569,28 +53706,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// of phantoms. This asks the different and previously unmeasured question: of the
     /// callees that ARE in the corpus and simply not certified, which block the most.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn which_uncertified_callees_block_the_most_callers() {
         use std::collections::{BTreeMap, BTreeSet};
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -53671,28 +53799,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// Reports it at fixpoint, split by whether the caller's own shape is the simple
     /// single-call one, because those are the ones an existing lane could take.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn is_there_a_caller_population_ready() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -53766,32 +53885,22 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// floor") rather than gaps. Splitting deliberate from gap is the same distinction
     /// that decided every other candidate in this document.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn why_does_the_carrier_decline_for_identity_returns() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Operand, Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let callees = Default::default();
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut why: BTreeMap<String, usize> = Default::default();
         let mut n = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -53850,28 +53959,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// `sem_call_return_of_mir_diag` reports the first gate to refuse, so this asks it
     /// rather than guessing.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn why_do_the_ready_callers_decline() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -53944,31 +54044,21 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// under-firing on its own shape — which is the kind of gap that paid twice this
     /// session, and the only kind left worth looking for.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn which_use_place_returns_are_uncovered() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Operand, Projection, Rvalue, Statement, Terminator};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let callees = Default::default();
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut tally: BTreeMap<String, (usize, usize)> = Default::default();
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -54015,28 +54105,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// established. This asks it directly: of ALL uncovered authored bodies, how many
     /// have a RETURN TYPE whose carrier does not build?
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn the_carrier_gap_across_all_shapes() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -54126,20 +54207,12 @@ mod vc_kind_formula_hash_domain_tripwire {
     #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn which_field_types_block_the_carrier() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -54201,10 +54274,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut authored_adt = 0usize;
         let mut scanned = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             scanned += 1;
             if !authored(&f.def_path) { continue; }
             let carrier = match &f.body.return_ty {
@@ -54261,20 +54331,12 @@ mod vc_kind_formula_hash_domain_tripwire {
     #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn why_do_the_scalar_return_bodies_fail() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -54291,10 +54353,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut lane_reached: BTreeMap<&'static str, usize> = Default::default();
         let (mut scalar, mut covered, mut uncovered) = (0usize, 0usize, 0usize);
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             if !authored(&f.def_path) { continue; }
             let rt = match &f.body.return_ty {
                 Ty::Ref { mutable: false, inner } => inner.as_ref(),
@@ -54386,20 +54445,12 @@ mod vc_kind_formula_hash_domain_tripwire {
     #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_does_the_use_mismatch_compare() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Operand, Rvalue, Statement, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -54441,10 +54492,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut pairs: BTreeMap<String, usize> = Default::default();
         let mut hit = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             if !authored(&f.def_path) { continue; }
             if crate::assignment_types::first_assignment_mismatch_kind(&f.body)
                 != Some("USE into a scalar/other place") { continue; }
@@ -54512,20 +54560,12 @@ mod vc_kind_formula_hash_domain_tripwire {
     #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_shape_are_the_unrecognized_bodies() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -54545,9 +54585,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         // honest verdict.
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
         for _ in 0..8 {
@@ -54577,10 +54615,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut authored_scalar = 0usize;
         let mut authored_scalar_covered = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             if !authored(&f.def_path) { continue; }
             let rt = match &f.body.return_ty {
                 Ty::Ref { mutable: false, inner } => inner.as_ref(),
@@ -54703,20 +54738,12 @@ mod vc_kind_formula_hash_domain_tripwire {
     #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn the_last_mile_bodies_a_lane_already_recognizes() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -54734,9 +54761,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
         // IS THE CASCADE STARVED OR SATURATED? XL concluded coverage is limited by call-
@@ -54908,30 +54933,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     #[test]
     #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_often_does_the_value_axis_mint() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Ty;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
         let (mut n, mut all_scalar_sig, mut mints) = (0usize, 0usize, 0usize);
         let mut called: std::collections::BTreeSet<String> = Default::default();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             for blk in &f.body.blocks {
                 if let trust_types::Terminator::Call { func, .. } = &blk.terminator {
                     called.insert(func.clone());
@@ -54990,29 +55004,18 @@ mod vc_kind_formula_hash_domain_tripwire {
     #[test]
     #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_would_an_effect_analysis_buy() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
         let mut called: std::collections::BTreeSet<String> = Default::default();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue;
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             for blk in &f.body.blocks {
                 if let Terminator::Call { func, .. } = &blk.terminator { called.insert(func.clone()); }
             }
@@ -55076,19 +55079,11 @@ mod vc_kind_formula_hash_domain_tripwire {
     #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn the_headline_number_on_the_complete_corpus() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -55105,9 +55100,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
         for _ in 0..8 {
@@ -55160,18 +55153,10 @@ mod vc_kind_formula_hash_domain_tripwire {
         use std::collections::{BTreeMap, BTreeSet};
         use std::path::{Path, PathBuf};
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -55187,9 +55172,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         let mut paths: Vec<PathBuf> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); paths.push(p.clone()); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); paths.push(p.clone()); }
         }
         let path_of: BTreeMap<&str, &PathBuf> =
             funcs.iter().zip(paths.iter()).map(|(f, p)| (f.def_path.as_str(), p)).collect();
@@ -55306,20 +55289,12 @@ mod vc_kind_formula_hash_domain_tripwire {
     #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn the_real_gate_go_no_go() {
         use std::collections::{BTreeMap, BTreeSet};
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{BlockId, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -55335,9 +55310,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         println!("  corpus: {} bodies from {}", funcs.len(), root);
         let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
@@ -55457,20 +55430,12 @@ mod vc_kind_formula_hash_domain_tripwire {
     #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn why_do_the_gained_callers_not_transport() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -55486,9 +55451,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
         for _ in 0..8 {
@@ -56223,6 +56186,12 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut_field = Ty::adt("name::Name", vec![("m".into(), Ty::Ref { mutable: true, inner: Box::new(efht_u8()) })]);
         assert!(im(&mut_field), "a &mut field pierces the name exemption");
         assert!(!im(&Ty::adt("expr::Expr", vec![])), "the fieldless exempted name stays unexposed");
+        // VGAPS-G2-FOLLOWUP (5): outside the exempted family a field-less, variant-less ADT is
+        // a shape whose parts were not rendered, so it reads exposed; std's zero-sized
+        // markers and a recorded `Freeze` struct do not.
+        assert!(im(&Ty::adt("holder::Holder", vec![])), "an unrendered ADT fails closed");
+        assert!(!im(&Ty::adt("core::marker::PhantomData<u8>", vec![])), "a ZST marker holds no byte");
+        assert!(!im(&Ty::adt("holder::Plain", vec![("n".into(), efht_u8())])), "a recorded `Freeze` struct");
         let genuine_kind = Ty::adt(
             "expr::kind::ExprKind",
             vec![("data".into(), Ty::adt("std::rc::Rc", vec![("inner".into(), efht_u8())]))],
@@ -56387,6 +56356,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                         is_unsafe_sig: false,
                         is_foreign: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -56463,12 +56433,13 @@ mod vc_kind_formula_hash_domain_tripwire {
         trust_types::Ty::Adt {
             name: name.into(),
             fields: fields.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
-            variants: vec![],
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             adt_kind: Some(trust_types::AdtKind::Struct),
         }
     }
@@ -56485,17 +56456,20 @@ mod vc_kind_formula_hash_domain_tripwire {
         use trust_types::VariantDef;
         trust_types::Ty::Adt {
             name: "probe::Look".into(),
-            fields: vec![("__tag".into(), trust_types::Ty::Int { width: 8, signed: tag_signed })],
+            fields: vec![("__tag".into(), trust_types::Ty::Int { width: 8, signed: tag_signed })]
+                .into(),
             variants: vec![
                 VariantDef { name: "Start".into(), discriminant: 1, fields: vec![] },
                 VariantDef { name: "End".into(), discriminant: 2, fields: vec![] },
                 VariantDef { name: "StartLF".into(), discriminant: 4, fields: vec![] },
-            ],
+            ]
+            .into(),
             disc_index_safe,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             adt_kind: Some(trust_types::AdtKind::Enum),
         }
     }
@@ -56514,17 +56488,20 @@ mod vc_kind_formula_hash_domain_tripwire {
         use trust_types::VariantDef;
         trust_types::Ty::Adt {
             name: "probe::Ordering".into(),
-            fields: vec![("__tag".into(), trust_types::Ty::Int { width: 8, signed: tag_signed })],
+            fields: vec![("__tag".into(), trust_types::Ty::Int { width: 8, signed: tag_signed })]
+                .into(),
             variants: vec![
                 VariantDef { name: "Less".into(), discriminant: -1, fields: vec![] },
                 VariantDef { name: "Equal".into(), discriminant: 0, fields: vec![] },
                 VariantDef { name: "Greater".into(), discriminant: 1, fields: vec![] },
-            ],
+            ]
+            .into(),
             disc_index_safe: true,
             faithful_enum_repr,
             layout: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             adt_kind: Some(trust_types::AdtKind::Enum),
         }
     }
@@ -56542,30 +56519,29 @@ mod vc_kind_formula_hash_domain_tripwire {
         let v = |n: &str, d: i128| VariantDef { name: n.into(), discriminant: d, fields: vec![] };
         trust_types::Ty::Adt {
             name: "probe::ReadRecordResult".into(),
-            fields: vec![("__tag".into(), trust_types::Ty::Int { width: 64, signed: true })],
+            fields: vec![("__tag".into(), trust_types::Ty::Int { width: 64, signed: true })].into(),
             variants: vec![
                 v("InputEmpty", 0),
                 v("OutputFull", 1),
                 v("OutputEndsFull", 2),
                 v("Record", 3),
                 v("End", 4),
-            ],
+            ]
+            .into(),
             disc_index_safe: true,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             adt_kind: Some(trust_types::AdtKind::Enum),
         }
     }
     fn efht_p_inner_const(v: u128) -> trust_types::ConstValue {
-        trust_types::ConstValue::StructScalarFieldsRef {
-            adt_name: "probe::Inner".into(),
-            fields: vec![trust_types::ConstValue::Uint(v, 8)],
-        }
+        trust_types::ConstValue::struct_scalar_fields_ref("probe::Inner", vec![trust_types::ConstValue::Uint(v, 8)])
     }
     fn efht_p_unit_const(name: &str, variant: usize) -> trust_types::ConstValue {
-        trust_types::ConstValue::UnitVariantRef { enum_name: name.into(), variant }
+        trust_types::ConstValue::unit_variant_ref(name, variant)
     }
     /// Derived `eq` over a one-u8-field struct: `_3 = (*_1).0; _4 = (*_2).0;
     /// _0 = Eq(_3, _4)` — mints `Cmp(Eq, Field(0,0), Field(1,0))` on the chain.
@@ -56766,7 +56742,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             "probe::is_record_opaque",
             "probe::rrr_eq",
             e,
-            trust_types::ConstValue::OpaqueConst,
+            trust_types::ConstValue::opaque_const(),
         );
         assert_eq!(efht_t_reason(&opaque, &registry), Some("argument-outside-transport-fragment"));
     }
@@ -56964,7 +56940,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         assert_eq!(
             probe(
                 efht_ref(efht_p_inner()),
-                ConstValue::StructScalarFieldsRef { adt_name: "probe::A".into(), fields: vec![ConstValue::Uint(7, 8)] },
+                ConstValue::struct_scalar_fields_ref("probe::A", vec![ConstValue::Uint(7, 8)]),
             ),
             chase
         );
@@ -56972,10 +56948,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         assert_eq!(
             probe(
                 efht_ref(efht_p_inner()),
-                ConstValue::StructScalarFieldsRef {
-                    adt_name: "probe::Inner".into(),
-                    fields: vec![ConstValue::Uint(7, 8), ConstValue::Uint(1, 8)],
-                },
+                ConstValue::struct_scalar_fields_ref("probe::Inner", vec![ConstValue::Uint(7, 8), ConstValue::Uint(1, 8)]),
             ),
             chase
         );
@@ -56984,14 +56957,14 @@ mod vc_kind_formula_hash_domain_tripwire {
         assert_eq!(
             probe(
                 efht_ref(s_i32.clone()),
-                ConstValue::StructScalarFieldsRef { adt_name: "probe::SI".into(), fields: vec![ConstValue::Uint(7, 8)] },
+                ConstValue::struct_scalar_fields_ref("probe::SI", vec![ConstValue::Uint(7, 8)]),
             ),
             chase
         );
         assert_eq!(
             probe(
                 efht_ref(efht_p_inner()),
-                ConstValue::StructScalarFieldsRef { adt_name: "probe::Inner".into(), fields: vec![ConstValue::Bool(true)] },
+                ConstValue::struct_scalar_fields_ref("probe::Inner", vec![ConstValue::Bool(true)]),
             ),
             chase
         );
@@ -57001,7 +56974,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         assert_eq!(
             probe(
                 efht_ref(s_u128),
-                ConstValue::StructScalarFieldsRef { adt_name: "probe::SW".into(), fields: vec![ConstValue::Uint(u128::MAX, 128)] },
+                ConstValue::struct_scalar_fields_ref("probe::SW", vec![ConstValue::Uint(u128::MAX, 128)]),
             ),
             Err("const-referent-leaf-unrepresentable")
         );
@@ -57011,7 +56984,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         assert_eq!(probe(efht_ref(efht_option_bool()), efht_p_unit_const("core::option::Option<bool>", 1)), chase);
         let mut no_variants = efht_p_look(false, true);
         if let trust_types::Ty::Adt { variants, .. } = &mut no_variants {
-            variants.clear();
+            variants.make_mut().clear();
         }
         assert_eq!(probe(efht_ref(no_variants), efht_p_unit_const("probe::Look", 0)), chase);
         // an UNCLASSIFIED enum (hand-built adt_enum, fieldless variant 0 so the type
@@ -57048,7 +57021,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         assert_eq!(
             probe(
                 efht_ref(s_i32),
-                ConstValue::StructScalarFieldsRef { adt_name: "probe::SI".into(), fields: vec![ConstValue::Int(-7)] },
+                ConstValue::struct_scalar_fields_ref("probe::SI", vec![ConstValue::Int(-7)]),
             ),
             Ok((vec![-7], None))
         );
@@ -57302,7 +57275,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         assert_eq!(efht_t_reason(&c, &registry), Some("actual-temp-has-no-unique-dominating-definition"));
         let mut enum_adt_field = efht_p_look(false, true);
         if let Ty::Adt { fields, .. } = &mut enum_adt_field {
-            fields.push(("__v0_0".into(), efht_p_inner()));
+            fields.make_mut().push(("__v0_0".into(), efht_p_inner()));
         }
         let c_enum = reborrow_caller("probe::t::enum-typed", enum_adt_field, vec![Projection::Field(1)]);
         assert_eq!(efht_t_reason(&c_enum, &registry), Some("field-reborrow-base-is-an-enum"));
@@ -57646,6 +57619,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             is_unsafe_sig: false,
             is_foreign: false,
             callee_identity: None,
+            callee_key: None,
         };
         let prefix = vec![
             efht_assign(3, Rvalue::Use(Operand::Copy(efht_t_deref(1)))),
@@ -57884,7 +57858,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                     func: "probe::eq".into(),
                     args: vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(4))],
                     dest: Place::local(0), target: Some(BlockId(1)), unwind: UnwindEdge::Unreachable,
-                    span: Default::default(), atomic: None, is_unsafe_sig: false, is_foreign: false, callee_identity: None,
+                    span: Default::default(), atomic: None, is_unsafe_sig: false, is_foreign: false, callee_identity: None, callee_key: None,
                 } },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
             ])
@@ -57927,7 +57901,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                     func: "probe::eq".into(),
                     args: vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(4))],
                     dest: Place::local(0), target: Some(BlockId(2)), unwind: UnwindEdge::Unreachable,
-                    span: Default::default(), atomic: None, is_unsafe_sig: false, is_foreign: false, callee_identity: None,
+                    span: Default::default(), atomic: None, is_unsafe_sig: false, is_foreign: false, callee_identity: None, callee_key: None,
                 } },
                 BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
             ])
@@ -58241,7 +58215,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(4))],
             0,
             vec![
-                efht_assign(2, Rvalue::Use(Operand::Constant(ConstValue::OpaqueConst))),
+                efht_assign(2, Rvalue::Use(Operand::Constant(ConstValue::opaque_const()))),
                 efht_assign(3, Rvalue::Use(Operand::Copy(efht_t_deref(2)))),
                 efht_assign(4, Rvalue::Use(Operand::Copy(efht_t_deref(1)))),
             ],
@@ -58257,7 +58231,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             vec![(Some("b"), hh.clone())],
             vec![h.clone()],
             vec![
-                Operand::Constant(ConstValue::UnitVariantRef { enum_name: "probe::E".into(), variant: 0 }),
+                Operand::Constant(ConstValue::unit_variant_ref("probe::E", 0)),
                 Operand::Copy(Place::local(2)),
             ],
             0,
@@ -58276,7 +58250,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             vec![Operand::Copy(Place::local(2)), Operand::Copy(Place::local(3))],
             0,
             vec![
-                efht_assign(2, Rvalue::Use(Operand::Constant(ConstValue::UnitVariantRef { enum_name: "probe::E".into(), variant: 0 }))),
+                efht_assign(2, Rvalue::Use(Operand::Constant(ConstValue::unit_variant_ref("probe::E", 0)))),
                 efht_assign(3, Rvalue::Use(Operand::Copy(efht_t_deref(1)))),
             ],
             vec![],
@@ -58952,8 +58926,9 @@ mod vc_kind_formula_hash_domain_tripwire {
     // never an OWNED aggregate base, never a closure ENVIRONMENT, never the constant
     // lane. Seven batteries:
     //   * which fence stops a RAW-EXPOSURE launder of the owned base — `base_local_is_
-    //     unwritten`, the fence EFHT-P added for exactly this base, CANNOT, because
-    //     neither `&raw const` nor a cast is a write;
+    //     unwritten`, the fence EFHT-P added for exactly this base, could not, because
+    //     neither `&raw const` nor a cast is a write (since INT-RAWCONST-HAVOC-1 it
+    //     refuses the `&raw const`, a write-capable borrow; the cast still passes it);
     //   * which interior-mutability CARRIERS the whole-base walk catches, including the
     //     one G-FROZEN structurally cannot see (a `&mut` FIELD: G-FROZEN reads TOP-LEVEL
     //     parameter types and the base's top-level type is an `Adt`);
@@ -58970,8 +58945,10 @@ mod vc_kind_formula_hash_domain_tripwire {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// ADV0-1 (H1, the OWNED base) — `base_local_is_unwritten` is a WRITE fence and
-    /// EXPOSURE is not a write: `_4 = &raw const _1` and `_4 = _1 as *mut Base` both PASS
-    /// it (asserted directly, so the claim is about the fence and not about the pipeline).
+    /// EXPOSURE is not a write: `_4 = _1 as *mut Base` PASSES it (asserted directly, so
+    /// the claim is about the fence and not about the pipeline). `_4 = &raw const _1`
+    /// passed it too until INT-RAWCONST-HAVOC-1 (2026-10-06) made a `&raw const` of the
+    /// base a write-capable borrow, which the fence now refuses.
     /// The two-sided ALLOW-LIST is the measured refusal for both, and the consumer's own
     /// deny-list belt (`raw_exposure_exists`, inside `efht_p_path_actual_ok`) refuses each
     /// independently — pinned through its own helper so neither can be deleted silently.
@@ -59002,22 +58979,55 @@ mod vc_kind_formula_hash_domain_tripwire {
             let idx = c.body.locals.len();
             c.body.locals.push(LocalDecl { index: idx, name: None, ty: raw_ty.clone() });
             c.body.blocks[0].stmts.insert(0, Statement::Assign { place: Place::local(idx), rvalue: rv, span: Default::default() });
-            // the EFHT-P base fence is BLIND: exposure is not an assignment, a
-            // discriminant set, a deinit, a retag, a mutable alias, a call dest or a drop.
-            assert!(crate::mirsem::base_local_is_unwritten(&c.body, 1), "{label}: base_local_is_unwritten counts WRITES");
-            assert_eq!(crate::mirsem::transport_path_handle(&c.body, 2, BlockId(0)).map(|(p, f, _)| (p, f)), Ok((1, 0)), "{label}: the custody derivation admits it");
-            // the ALLOW-LIST is the measured refusal (it runs before the actual loop).
+            // The EFHT-P base fence counts WRITES and write-capable borrows. A cast is
+            // neither, so it stays BLIND to `cast-to-raw-mut`. Since INT-RAWCONST-HAVOC-1
+            // (2026-10-06) a `&raw const` of the owned base IS a write-capable borrow (a
+            // write through it is defined under Tree Borrows), so the fence now refuses
+            // `addr-of-const` too; it used to pass it.
+            assert_eq!(
+                crate::mirsem::base_local_is_unwritten(&c.body, 1),
+                label == "cast-to-raw-mut",
+                "{label}: base_local_is_unwritten counts writes and write-capable borrows"
+            );
+            // The custody derivation asks the same fence: it admits the cast and, since
+            // INT-RAWCONST-HAVOC-1, refuses the `&raw const`.
+            let custody = if label == "cast-to-raw-mut" {
+                Ok((1, 0))
+            } else {
+                Err("field-reborrow-base-is-written")
+            };
+            let handle = crate::mirsem::transport_path_handle(&c.body, 2, BlockId(0));
+            assert_eq!(
+                handle.map(|(p, f, _)| (p, f)),
+                custody,
+                "{label}: the custody derivation"
+            );
+            // the ALLOW-LIST is the measured refusal of the cast (it runs before the actual
+            // loop). The `&raw const` is refused earlier, by the recognizer, whose custody
+            // derivation the base fence now stops; the allow-list refuses it as well.
             assert_eq!(crate::prove::body_is_read_only_except_sole_call(&c.body), Err(allow_list), "{label}");
+            let verdict = if label == "cast-to-raw-mut" {
+                Err("caller body not read-only except the sole call")
+            } else {
+                Err("recognizer: argument-outside-modeled-operand-fragment")
+            };
             assert_eq!(
                 crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&c, &registry),
-                Err("caller body not read-only except the sole call"),
+                verdict,
                 "{label}"
             );
-            // and the consumer's own belt refuses it independently.
+            // and the consumer's own belt refuses it independently: the cast at its entry
+            // fences (`raw_exposure_exists`), the `&raw const` already at the custody
+            // derivation it calls first.
+            let belt = if label == "cast-to-raw-mut" {
+                Err("path-base-fails-the-entry-fences")
+            } else {
+                Err("field-reborrow-base-is-written")
+            };
             assert_eq!(
                 crate::prove::efht_p_path_actual_ok_for_test(&c.body, 2, 1, 0, fact, 0, BlockId(0)),
-                Err("path-base-fails-the-entry-fences"),
-                "{label}: raw_exposure_exists is live beside the allow-list"
+                belt,
+                "{label}: the belt refuses beside the allow-list"
             );
         }
 
@@ -59428,9 +59438,8 @@ mod vc_kind_formula_hash_domain_tripwire {
             );
             crate::mirsem::transport_const_referent(&f.body, 2, BlockId(0))
         };
-        let sref = |name: &str, leaves: Vec<ConstValue>| ConstValue::StructScalarFieldsRef {
-            adt_name: name.into(),
-            fields: leaves,
+        let sref = |name: &str, leaves: Vec<ConstValue>| {
+            ConstValue::struct_scalar_fields_ref(name, leaves)
         };
         let cell = efht_p_struct("core::cell::Cell", vec![("0", efht_u8())]);
 
@@ -59526,16 +59535,22 @@ mod vc_kind_formula_hash_domain_tripwire {
         // because the CALLEE's Handle fence walks variant fields.
         let enum_ty = |name: &str, payload: Ty| Ty::Adt {
             name: name.into(),
-            fields: vec![("__tag".into(), Ty::Int { width: 8, signed: false })],
+            fields: vec![("__tag".into(), Ty::Int { width: 8, signed: false })].into(),
             variants: vec![
                 VariantDef { name: "Unit".into(), discriminant: 1, fields: vec![] },
-                VariantDef { name: "Payload".into(), discriminant: 2, fields: vec![("0".into(), payload)] },
-            ],
+                VariantDef {
+                    name: "Payload".into(),
+                    discriminant: 2,
+                    fields: vec![("0".into(), payload)],
+                },
+            ]
+            .into(),
             disc_index_safe: true,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             adt_kind: Some(trust_types::AdtKind::Enum),
         };
         let hot_enum = enum_ty("probe::adv0::HotE", cell.clone());
@@ -60927,7 +60942,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         );
         trust_types::Ty::Adt {
             name: name.into(),
-            fields: vec![("__tag".into(), trust_types::Ty::isize())],
+            fields: vec![("__tag".into(), trust_types::Ty::isize())].into(),
             variants: variants
                 .into_iter()
                 .map(|(n, d)| trust_types::VariantDef {
@@ -60940,6 +60955,7 @@ mod vc_kind_formula_hash_domain_tripwire {
             faithful_enum_repr,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             layout: None,
             adt_kind: Some(trust_types::AdtKind::Enum),
         }
@@ -61479,22 +61495,15 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// report several. Only bodies failing EXACTLY ONE are addressable by a single fix,
     /// and the gate they name is the one worth building for.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn multi_blocker_census_of_the_enum_lane() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let callees = Default::default();
         let bodies = crate::trustir_fold::DumpBodies::new();
@@ -61502,10 +61511,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut sole: BTreeMap<&'static str, usize> = Default::default();
         let mut n = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -61591,22 +61597,15 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// Until `sem_adt_return_shape_reasoned` existed this question had no answer: the
     /// recognizer had 16 refusal points and no way to say which fired. This asks it.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn why_does_the_enum_lane_refuse_try_branch() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Statement, Terminator};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let callees = Default::default();
         let bodies = crate::trustir_fold::DumpBodies::new();
@@ -61614,10 +61613,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut why_try: BTreeMap<&'static str, usize> = Default::default();
         let (mut branchy, mut trybranch) = (0usize, 0usize);
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -61672,32 +61668,22 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// like one population and turned out to be four, split by the TYPE rather than the
     /// rvalue.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_are_the_unexamined_no_call_bodies() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Operand, Rvalue, Statement, Terminator};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let callees = Default::default();
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut sig: BTreeMap<String, usize> = Default::default();
         let mut n = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -61763,22 +61749,15 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// intermediate local is written EXACTLY ONCE. A local written twice is not a
     /// forwarding temp; it is a computation, and following it would name the wrong value.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_many_constant_returns_arrive_through_a_temp() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{ConstValue, Operand, Rvalue, Statement, Terminator};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let callees = Default::default();
         let bodies = crate::trustir_fold::DumpBodies::new();
@@ -61786,10 +61765,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut kinds: BTreeMap<&'static str, usize> = Default::default();
         let mut uncovered = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -61834,7 +61810,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                 ConstValue::Int(..) | ConstValue::Uint(..) => "Int/Uint",
                 ConstValue::Bool(..) => "Bool",
                 ConstValue::Unit => "Unit (asserts nothing)",
-                ConstValue::OpaqueConst => "OpaqueConst",
+                ConstValue::OpaqueConst(_) => "OpaqueConst",
                 _ => "other",
             };
             *kinds.entry(k).or_default() += 1;
@@ -61865,22 +61841,15 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// unknown rather than falsely proved. Pinning a Str's bytes is a STRENGTHENING of
     /// that lowering and has to be argued separately from merely recognizing the shape.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_many_bodies_are_a_bare_constant_return() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{ConstValue, Operand, Rvalue, Statement, Terminator};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let callees = Default::default();
         let bodies = crate::trustir_fold::DumpBodies::new();
@@ -61888,10 +61857,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut uncovered = 0usize;
         let mut bare_const = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -61914,7 +61880,7 @@ mod vc_kind_formula_hash_domain_tripwire {
                 ConstValue::Bool(..) => "Bool",
                 ConstValue::Float(..) | ConstValue::FloatBits { .. } => "Float",
                 ConstValue::Unit => "Unit — asserts nothing, deliberately not harvested",
-                ConstValue::OpaqueConst => "OpaqueConst — contents not modeled",
+                ConstValue::OpaqueConst(_) => "OpaqueConst — contents not modeled",
                 _ => "other",
             };
             *kinds.entry(k).or_default() += 1;
@@ -61947,18 +61913,11 @@ mod vc_kind_formula_hash_domain_tripwire {
     ///   SLICE-RET  a return type that is a slice or a reference to one — the `&[T]`
     ///              family, which includes `&str` (it arrives as `&[Int]`).
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn size_the_candidate_extensions() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Operand, Projection, Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         fn is_slice_ret(t: &Ty) -> bool {
             match t {
                 Ty::Slice { .. } => true,
@@ -61969,17 +61928,14 @@ mod vc_kind_formula_hash_domain_tripwire {
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let callees = Default::default();
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut tally: BTreeMap<&'static str, usize> = Default::default();
         let mut uncovered = 0usize;
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -62039,18 +61995,11 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// carrier, before any of it is built. No fixpoint: restricted to bodies with no
     /// calls, which consult no `CalleeFact`, so an empty registry gives the same verdict.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_much_does_the_opaque_type_carrier_gate() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator, Ty};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         fn mentions_datatype(t: &Ty, depth: u32) -> bool {
             if depth > 6 { return false; }
             match t {
@@ -62067,17 +62016,14 @@ mod vc_kind_formula_hash_domain_tripwire {
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let callees = Default::default();
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut tally: BTreeMap<&'static str, usize> = Default::default();
         let (mut no_call, mut uncovered) = (0usize, 0usize);
         for p in &files {
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -62121,17 +62067,10 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// No fixpoint: a body with no calls consults no `CalleeFact`, so an empty registry
     /// gives the same verdict and the instrument runs in seconds rather than 20 minutes.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn show_me_the_uncovered_no_call_bodies() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         fn brief_ty(t: &trust_types::Ty, d: u32) -> String {
             use trust_types::Ty as T;
             if d > 3 { return "…".into() }
@@ -62152,7 +62091,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let want: usize = std::env::var("TRUST_SHOW_N").ok()
             .and_then(|v| v.parse().ok()).unwrap_or(6);
@@ -62162,10 +62101,7 @@ mod vc_kind_formula_hash_domain_tripwire {
         let mut scanned = 0usize;
         for p in &files {
             if shown >= want { break; }
-            let Ok(b) = std::fs::read(p) else { continue };
-            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
-                continue
-            };
+            let Some(f) = corpus_dump(p) else { continue };
             let dp = &f.def_path;
             if dp.contains("core::fmt::") || dp.contains("serde")
                 || dp.contains("Deserializer") || dp.contains("Serializer") { continue; }
@@ -62234,28 +62170,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// built is aimed at the rvalue shape that dominates rather than at the one that is
     /// easiest to imagine.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_are_the_no_call_reference_returning_bodies() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::{Rvalue, Statement, Terminator};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -62367,28 +62294,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     ///   * a CONCRETE path (`std::…::f`) has a body that simply was not dumped, because
     ///     the harvest did not compile that crate from source.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn the_addressable_ceiling_for_interprocedural_work() {
         use std::collections::{BTreeMap, BTreeSet};
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -62484,28 +62402,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// projections (`<S as Trait>::m`). Re-run it against a `MONO` corpus before
     /// treating any individual name here as a real target.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn which_absent_callees_block_authored_code() {
         use std::collections::{BTreeMap, BTreeSet};
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -62593,28 +62502,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// the same bodies counted twice, and a single-axis histogram would propose work
     /// that a second axis already blocks.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn what_shape_are_the_uncovered_authored_bodies() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -62705,27 +62605,18 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// reports the expression-fold decline reason alongside, so the answer names a
     /// seam rather than a mood.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn where_does_authored_code_stop() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         fn authored(dp: &str) -> bool {
             !(dp.contains("core::fmt::")
@@ -62807,27 +62698,18 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// is LOWER than the headline, not higher. (Those figures are from the pre-`MONO`
     /// dump; on the corrected 31,087-body corpus authored coverage is 5.58%.)
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn how_much_of_the_corpus_is_derive_glue() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
 
         // Classification is by def_path SHAPE, deliberately coarse and stated so the
@@ -62936,28 +62818,19 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// Two corpora, two flags, two opposite conclusions about whether interprocedural
     /// work has a ceiling — set the flag, and state which corpus a number came from.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn is_the_uncertified_callee_a_corpus_artifact() {
         use std::collections::{BTreeMap, BTreeSet};
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use trust_types::Terminator;
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         let present: BTreeSet<String> = funcs.iter().map(|f| f.def_path.clone()).collect();
         println!("\n=== corpus: {} bodies, {} distinct def_paths, in {root} ===",
@@ -63029,27 +62902,18 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// and fails, even though a second pass would succeed. This measures the difference —
     /// the multiplier the exact-set instruments were structurally blind to.
     #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
     fn does_certification_bootstrap() {
         use std::collections::BTreeMap;
-        use std::path::{Path, PathBuf};
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
-            }
-        }
+        use std::path::Path;
         let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
         let mut files = Vec::new();
-        walk(Path::new(&root), &mut files);
+        corpus_walk(Path::new(&root), &mut files);
         files.sort();
         let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
         for p in &files {
-            if let Ok(b) = std::fs::read(p)
-                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
-            { funcs.push(f); }
+            if let Some(f) = corpus_dump(p) { funcs.push(f); }
         }
         let bodies = crate::trustir_fold::DumpBodies::new();
         let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();

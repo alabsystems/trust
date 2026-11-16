@@ -6,6 +6,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 ALLOW_REBUILD="${TRUST_UPSTREAM_TEST_ALLOW_REBUILD:-}"
+TARGET_TRIPLE=""
+COMPAT_SUMMARY=""
+STAGE2_INFO_OUT=""
 TOOLCHAIN_DEGRADED=0
 TOOLCHAIN_MATCH=unknown
 POST_STAGE2_DELTA_STATUS=unknown
@@ -29,7 +32,9 @@ warn() {
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/check_upstream_rust_test_toolchain.sh [--allow-rebuild]
+  scripts/check_upstream_rust_test_toolchain.sh [--allow-rebuild] [--target-triple <triple>]
+  scripts/check_upstream_rust_test_toolchain.sh --target-triple <triple> --compat-summary <path>
+  scripts/check_upstream_rust_test_toolchain.sh --stage2-info-out <path>
   scripts/check_upstream_rust_test_toolchain.sh [--allow-rebuild] -- ./x.py test ...
 
 Without a command, validate that a coherent repo-local Trust stage2 toolchain is
@@ -38,6 +43,8 @@ available for upstream Rust tests. With a command, validate the toolchain, run a
 
 Set TRUST_UPSTREAM_TEST_ALLOW_REBUILD=1 or pass --allow-rebuild to execute the
 command even when the dry-run says it would rebuild stage/tool artifacts.
+Summary validation requires an exact-match stage2 compiler and checks the
+retained scorecard and proof bundle against the pinned upstream Rust tree.
 EOF
 }
 
@@ -54,6 +61,20 @@ while [[ $# -gt 0 ]]; do
             ALLOW_REBUILD=1
             shift
             ;;
+        --target-triple|--compat-summary|--stage2-info-out)
+            [[ $# -ge 2 && -n "$2" ]] || fail "$1 requires a value"
+            if [[ "$1" == "--target-triple" ]]; then
+                [[ -z "$TARGET_TRIPLE" ]] || fail "duplicate --target-triple"
+                TARGET_TRIPLE="$2"
+            elif [[ "$1" == "--compat-summary" ]]; then
+                [[ -z "$COMPAT_SUMMARY" ]] || fail "duplicate --compat-summary"
+                COMPAT_SUMMARY="$2"
+            else
+                [[ -z "$STAGE2_INFO_OUT" ]] || fail "duplicate --stage2-info-out"
+                STAGE2_INFO_OUT="$2"
+            fi
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -68,6 +89,20 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "$COMPAT_SUMMARY" ]]; then
+    [[ -n "$TARGET_TRIPLE" ]] || fail "--compat-summary requires --target-triple"
+    [[ ${#COMMAND[@]} -eq 0 ]] || fail "--compat-summary cannot precede a test command"
+    ! is_truthy "$ALLOW_REBUILD" || fail "--compat-summary cannot use --allow-rebuild"
+fi
+if [[ -n "$STAGE2_INFO_OUT" ]]; then
+    [[ ${#COMMAND[@]} -eq 0 && -z "$COMPAT_SUMMARY" ]] \
+        || fail "--stage2-info-out requires standalone preflight"
+    ! is_truthy "$ALLOW_REBUILD" || fail "--stage2-info-out cannot use --allow-rebuild"
+fi
+if [[ -n "$TARGET_TRIPLE" && ! "$TARGET_TRIPLE" =~ ^(aarch64|x86_64)-[a-z0-9_-]+$ ]]; then
+    fail "unsupported target triple: $TARGET_TRIPLE"
+fi
 
 candidate_sysroots() {
     if [[ -n "${TRUST_STAGE2_SYSROOT:-}" ]]; then
@@ -194,6 +229,15 @@ account_post_stage2_delta() {
 
 validate_stage2_toolchain() {
     local sysroot="$1"
+    [[ -d "$sysroot" ]] || fail "stage2 sysroot candidate does not exist: $sysroot"
+    # build/host is a convenience alias. Authenticated subcommand dispatch
+    # requires the physical directory. Resolve the alias once, then validate
+    # and retain that identity for every tool invocation and the final report.
+    sysroot="$(cd "$sysroot" && pwd -P)" \
+        || fail "cannot resolve stage2 sysroot: $sysroot"
+    repo_local_stage2_sysroot "$sysroot" \
+        || fail "stage2 sysroot must be repo-local under build/<host>/stage2: $sysroot"
+    SYSROOT="$sysroot"
     BIN="$sysroot/bin"
     LIB="$sysroot/lib"
     TARGO="$BIN/targo"
@@ -206,10 +250,6 @@ validate_stage2_toolchain() {
     local targo_tippy="$BIN/targo-tippy"
     local tippy_driver="$BIN/tippy-driver"
     local trust_analyzer="$BIN/trust-analyzer"
-
-    [[ -d "$sysroot" ]] || fail "stage2 sysroot candidate does not exist: $sysroot"
-    repo_local_stage2_sysroot "$sysroot" \
-        || fail "stage2 sysroot must be repo-local under build/<host>/stage2: $sysroot"
 
     local missing_tools
     missing_tools="$(missing_required_tools "$sysroot")"
@@ -251,6 +291,14 @@ validate_stage2_toolchain() {
         *"(trustc)"*|*"binary: trustc"*) ;;
         *) fail "stage2 compiler identity is not canonical trustc: $TRUSTC" ;;
     esac
+    local trustc_host
+    trustc_host="$(printf '%s\n' "$trustc_vv" | awk -F': ' '$1 == "host" { print $2; exit }')"
+    [[ -n "$trustc_host" && "$trustc_host" == "$(basename "$(dirname "$sysroot")")" ]] \
+        || fail "stage2 trustc host does not match physical sysroot host: $trustc_host ($sysroot)"
+    HOST_TRIPLE="$trustc_host"
+    if [[ -n "$COMPAT_SUMMARY" && "$HOST_TRIPLE" != "$TARGET_TRIPLE" ]]; then
+        fail "clean upstream summary requires native stage2 host and target to match: host=$HOST_TRIPLE target=$TARGET_TRIPLE"
+    fi
     local trustdoc_vv
     trustdoc_vv="$("$trustdoc" -Vv 2>&1)" \
         || fail "stage2 trustdoc does not run -Vv: $trustdoc"
@@ -260,6 +308,8 @@ validate_stage2_toolchain() {
     esac
     "$trustfmt" -V >/dev/null 2>&1 \
         || fail "stage2 trustfmt does not run -V: $trustfmt"
+    "$TARGO" --unverified --version >/dev/null 2>&1 \
+        || fail "stage2 targo rejects --unverified and may be stock Cargo under a stale name: $TARGO"
     "$tippy" -V >/dev/null 2>&1 \
         || fail "stage2 tippy does not run -V: $tippy"
     "$TARGO" tippy -V >/dev/null 2>&1 \
@@ -278,6 +328,7 @@ validate_stage2_toolchain() {
     if [[ ! "$trustc_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
         fail "stage2 trustc -Vv did not report a full 40-hex commit-hash: $TRUSTC"
     fi
+    STAGE2_COMMIT="$trustc_commit"
     if [[ -n "$repo_head" && "$trustc_commit" == "$repo_head" ]]; then
         TOOLCHAIN_MATCH=true
         POST_STAGE2_DELTA_STATUS=none
@@ -297,6 +348,13 @@ validate_stage2_toolchain() {
     [[ -d "$LIB/rustlib" ]] || fail "stage2 rustlib is missing: $LIB/rustlib"
     find "$LIB/rustlib" -type f -name 'libstd-*.rlib' -print -quit | grep -q . \
         || fail "stage2 libstd artifact is missing under $LIB/rustlib"
+    if [[ -n "$TARGET_TRIPLE" ]]; then
+        local target_lib="$LIB/rustlib/$TARGET_TRIPLE/lib"
+        [[ -d "$target_lib" ]] \
+            || fail "stage2 target rustlib is missing: $target_lib"
+        find "$target_lib" -maxdepth 1 -type f -name 'libstd-*.rlib' -print -quit | grep -q . \
+            || fail "stage2 target libstd artifact is missing under $target_lib"
+    fi
 
     "$TRUSTC" -Ztrust-verify=off --version >/dev/null 2>&1 \
         || fail "stage2 trustc does not run with -Ztrust-verify=off: $TRUSTC"
@@ -386,6 +444,42 @@ else
 fi
 
 dry_run_command
+
+if [[ -n "$COMPAT_SUMMARY" ]]; then
+    [[ "$TOOLCHAIN_DEGRADED" == 0 && "$TOOLCHAIN_MATCH" == true ]] \
+        || fail "compatibility summary requires a stage2 trustc built from exact checkout HEAD"
+    python3 "$ROOT/scripts/validate_upstream_rust_compat_summary.py" \
+        --repo-root "$ROOT" --summary "$COMPAT_SUMMARY" \
+        --target-triple "$TARGET_TRIPLE" --host-triple "$HOST_TRIPLE" \
+        || fail "upstream Rust compatibility summary validation failed"
+fi
+
+if [[ -n "$STAGE2_INFO_OUT" ]]; then
+    [[ "$TOOLCHAIN_DEGRADED" == 0 && "$TOOLCHAIN_MATCH" == true ]] \
+        || fail "stage2 metadata requires a trustc built from exact checkout HEAD"
+    python3 - "$STAGE2_INFO_OUT" "$SYSROOT" "$TRUSTC" "$HOST_TRIPLE" "$STAGE2_COMMIT" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+output, sysroot, trustc, host, commit = sys.argv[1:]
+path = Path(output)
+with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                 prefix=f".{path.name}.", delete=False) as stream:
+    temporary = stream.name
+    json.dump({"schema_version": "trust.stage2-preflight.v1", "sysroot": sysroot,
+               "trustc": trustc, "host_triple": host, "trustc_commit": commit,
+               "toolchain_checkout_match": True}, stream, sort_keys=True)
+    stream.write("\n")
+try:
+    os.replace(temporary, path)
+except OSError:
+    os.unlink(temporary)
+    raise
+PY
+fi
 
 if [[ "$TOOLCHAIN_DEGRADED" == 1 ]]; then
     cat <<EOF

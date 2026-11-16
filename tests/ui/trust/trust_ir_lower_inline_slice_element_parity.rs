@@ -3,7 +3,8 @@
 //@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
 //@ edition: 2021
 //! Trust (wave-NSL): the INLINE array-to-slice path admits the same element types the LOCAL
-//! path does, and the zero-length fn-ptr containment question is decided on ground truth.
+//! path does, and the zero-length fn-ptr containment question was decided on ground truth (the
+//! mint no longer asks it at all -- see GATE B).
 //!
 //! GATE A -- PARITY. `lower_inline_array_to_slice`'s own doc asserts, verbatim, "the same three
 //! gates `build_slice_fat_ptr` applies, kept verbatim so the two paths accept exactly the same
@@ -15,17 +16,19 @@
 //! A coverage answer that depended on whether an array LOCAL existed.
 //!
 //! GATE B -- GROUND TRUTH. `map_ty`'s zero-length arm asked the TABLE-FREE containment walk,
-//! which owes `true` to every `Ty::Struct`/`Ty::Enum` because it holds no tables. The
-//! table-bearing sibling already exists and is already called this exact way for fn-ptr
-//! signature components. It still answers `true` for an unregistered id and still delegates
-//! every spelling it does not model back to the table-free walk, so the invariant -- a
-//! producer-minted `Ty::Array`'s element must not reach `func_types`, because the splice's
-//! `TyId` re-interning is non-recursive -- is preserved exactly and merely decided on ground
-//! truth instead of on ignorance.
+//! which owes `true` to every `Ty::Struct`/`Ty::Enum` because it holds no tables, and refused
+//! the array as `Ty(array elem fn-ptr)`. wave-NSL moved it to the table-bearing walk. Since
+//! 2026-09-23 the gate is GONE: every fixed-size array is a first-class `Ty::Array` whatever its
+//! length, `[fn(); 2]` included, so "a producer-minted array element never reaches
+//! `func_types`" was no longer kept at the mint for any non-zero length, and a refusal that
+//! fired only when N == 0 decided coverage on a value. The splice keeps a `Ty::Func` out of the
+//! assembled module on its own predicate (`type_entry_ok`/`def_field_ok`/`remap_ty` ->
+//! `ty_table_free`), at every length.
 //!
-//! THE TWO GATES ARE ONE COMMIT. Measured: with A lifted and B left alone, `const EMPTY: &[C] =
-//! &[]` does not retire -- it SWAPS `Slice(non-scalar element)` for `Ty(array elem fn-ptr)`.
-//! Anyone lifting A, measuring +0 and closing the class would have been reading B's shadow.
+//! THE TWO GATES WERE ONE COMMIT. Measured then: with A lifted and B left alone, `const EMPTY:
+//! &[C] = &[]` did not retire -- it SWAPPED `Slice(non-scalar element)` for `Ty(array elem
+//! fn-ptr)`. Anyone lifting A, measuring +0 and closing the class would have been reading B's
+//! shadow.
 //!
 //! The retiring body has ZERO elements, so no element is ever stored, loaded or addressed: the
 //! emitted value is an empty array constant, an `Alloca`, a `Store` and a `PtrFromParts` with
@@ -71,24 +74,24 @@ pub fn via_local() -> usize {
     s.len()
 }
 
-// FAIL-CLOSED, and gate B's mutation proof: a `[T; 0]` whose element really does carry a
-// `Ty::Func` field must STILL be refused. If this body ever lowers clean, gate B has become a
-// rubber stamp and the splice invariant it protects is gone.
+// A `[T; 0]` whose element carries a `Ty::Func` field. Gate B used to refuse it at the mint;
+// it now lowers exactly as a non-empty fn-pointer array does, and it does not SPLICE: the
+// element struct's `Ty::Func` field fails `def_field_ok` (`ty_table_free`), so no per-body
+// `func_types` id can reach the assembled module through it.
 pub struct HasFnPtr {
     f: fn(),
 }
 
 pub const FP: [HasFnPtr; 0] = [];
 
-// FAIL-CLOSED, deliberately NOT widened: a TUPLE element. It looks free -- the tuple-element
-// array VALUE builds clean today -- but the slice element gate and `map_ty`'s ARRAY SPELLING
-// gate are one decision. A tuple-element array still takes the legacy `Ty::Tuple([T; N])`
-// spelling, so admitting it here would `Alloca` a `Ty::Tuple` and hand out a slice fat pointer
-// whose declared element type is not the allocation's element type, with the element address
-// computation resting on an unstated tuple-layout-equals-array-layout assumption. Moving tuples
-// to the `Ty::Array` spelling first requires teaching the two lane walkers to resolve a
-// tuple-in-array element, which the pinned array-spelling test already names as the
-// prerequisite. Excluded for +1 body.
+// FAIL-CLOSED, deliberately NOT widened: a TUPLE element. Its first premise is gone -- since
+// 2026-09-23 a tuple-element array is a first-class `Ty::Array` like every fixed-size array (no
+// longer `Ty::Tuple([T; N])`), and the two lane walkers resolve an array's element through the
+// types table. What remains is the MEMORY half: admitting it here would `Alloca` the array and
+// address element `i` at `i * size_of(T)`, which needs the tuple's layout (trust-ir has no
+// tuple layout evidence unless a `TupleLayoutDescriptor` was registered for exactly that tuple
+// type). That is a separate widening with its own measurement, not a side effect of the
+// respelling. Excluded for +1 body.
 pub const TUP: &[(&str, &str)] = &[("", ""); 3];
 
 fn main() {}

@@ -24,6 +24,7 @@ pub fn filter_dirs(path: &Path) -> bool {
         "src/tools/rust-analyzer",
         "src/tools/trustfmt",
         "src/tools/enzyme",
+        "src/tpde",
         "src/bootstrap/target",
         "third_party",
         "vendor",

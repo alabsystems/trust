@@ -29,5 +29,6 @@ non-symlink regular file, is an error rather than something to overwrite.
 
 The location is untracked: it selects where evidence lands, not what was proved.
 `targo trust` provisions a session-scoped root and reads the evidence back from
-it, which is why `TRUSTFLAGS` refuses this option — redirecting the root would
-sever artifact collection from the run that produced it.
+it, which is why no per-run channel sets this option (`TRUSTFLAGS`, which
+refused it, is not read since 2026-10-11) — redirecting the root would sever
+artifact collection from the run that produced it.

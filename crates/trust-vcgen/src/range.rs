@@ -1,77 +1,16 @@
 // trust_vcgen/range.rs: Shared integer range utilities
 //
-// Consolidates type_max_formula, type_min_formula, input_range_constraint,
-// signed_min, signed_max, and unsigned_max that were previously duplicated
-// across overflow.rs, shifts.rs, and casts.rs.
+// Integer bounds come from trust-semantics, the same definitions used by
+// the kernel-facing overflow model. Range construction remains local.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::*;
 
-/// Return a formula representing the maximum value for an integer type.
-/// For unsigned 128-bit, this returns Formula::UInt(u128::MAX) since u128::MAX
-/// exceeds i128::MAX and cannot be represented as Formula::Int.
-#[must_use]
-pub(crate) fn type_max_formula(width: u32, signed: bool) -> Formula {
-    // TOTAL (panic-free for every `u32` width); identical to the historical body for
-    // every in-domain unsigned width (8/16/32/64/128). Out-of-domain widths — which no
-    // real integer type uses — saturate to `i128::MAX` instead of overflowing: the
-    // historical `(1i128 << width) - 1` `else` arm underflowed at `width == 127` and
-    // shift-overflowed at `width >= 129`. Mirrored verbatim by
-    // `trust_semantics::type_max_formula`.
-    if signed {
-        Formula::Int(signed_max(width))
-    } else if width == 128 {
-        Formula::UInt(u128::MAX)
-    } else if width <= 126 {
-        Formula::Int((1i128 << width) - 1)
-    } else {
-        Formula::Int(i128::MAX)
-    }
-}
-
-/// Return a formula representing the minimum value for an integer type.
-#[must_use]
-pub(crate) fn type_min_formula(width: u32, signed: bool) -> Formula {
-    if signed { Formula::Int(signed_min(width)) } else { Formula::Int(0) }
-}
-
-/// Minimum value for a signed integer of the given bit width.
-///
-/// Precondition: `1 <= width && width <= 128` (the only meaningful signed
-/// bit-widths). Total/panic-free for every `u32`: in-contract widths return
-/// exactly `-(1i128 << (width - 1))` (and `i128::MIN` at 128) — byte-identical
-/// to `trust_semantics::signed_min`; out-of-domain widths (`0` or `> 128`),
-/// which previously panicked with `Overflow(Sub)` / `Overflow(Shl)`, saturate
-/// to `i128::MIN` (a sound bound, never makes a real overflow look in-range).
-#[must_use]
-pub(crate) fn signed_min(width: u32) -> i128 {
-    if width == 128 {
-        i128::MIN
-    } else if width >= 1 && width <= 127 {
-        -(1i128 << (width - 1))
-    } else {
-        i128::MIN
-    }
-}
-
-/// Maximum value for a signed integer of the given bit width.
-///
-/// Precondition: `1 <= width && width <= 128`. Total/panic-free: in-contract
-/// widths return exactly `(1i128 << (width - 1)) - 1` (and `i128::MAX` at 128)
-/// — byte-identical to `trust_semantics::signed_max`; out-of-domain widths
-/// saturate to `i128::MAX` (sound bound).
-#[must_use]
-pub(crate) fn signed_max(width: u32) -> i128 {
-    if width == 128 {
-        i128::MAX
-    } else if width >= 1 && width <= 127 {
-        (1i128 << (width - 1)) - 1
-    } else {
-        i128::MAX
-    }
-}
+// One implementation owns both VC bounds and kernel-facing bounds. Keeping
+// this as an import also retains the canonical functions' existing contracts.
+pub(crate) use trust_semantics::{signed_max, signed_min, type_max_formula, type_min_formula};
 
 /// Maximum value for an unsigned integer of the given bit width.
 ///
@@ -145,44 +84,35 @@ mod tests {
     use super::*;
 
     /// Every width a real integer type can have, plus the out-of-domain widths
-    /// whose saturating behaviour both copies must agree on (`0` underflows the
+    /// whose saturating behaviour the shared definitions retain (`0` underflows the
     /// `width - 1` shift; `127` is where the historical `(1 << w) - 1` wrapped;
     /// `129`/`255` shift past the i128 word).
     const CROSS_CHECK_WIDTHS: [u32; 11] = [0, 1, 7, 8, 16, 32, 64, 126, 127, 128, 255];
 
-    /// The bound helpers are copied verbatim into `trust_semantics`, which
-    /// states the Clean-kernel `RustVIR.noOverflow` denotation. The copy is
-    /// what makes "the kernel definition and the SMT obligation denote the same
-    /// arithmetic fact" true, so a divergence between the two is precisely a
-    /// false-proof hazard: the kernel would certify a range the generator never
-    /// asked about. Comparing them here — against the real definitions rather
-    /// than a restatement of them — is what turns that claim into an enforced
-    /// invariant.
+    /// Check the shared bounds against arithmetic independent of their shift
+    /// implementation, including sentinel widths and the full u128 boundary.
     #[test]
-    fn semantics_copy_of_the_bound_helpers_is_still_identical() {
-        for width in CROSS_CHECK_WIDTHS {
-            assert_eq!(
-                signed_min(width),
-                trust_semantics::signed_min(width),
-                "signed_min diverged at width {width}"
-            );
-            assert_eq!(
-                signed_max(width),
-                trust_semantics::signed_max(width),
-                "signed_max diverged at width {width}"
-            );
-            for signed in [false, true] {
-                assert_eq!(
-                    type_min_formula(width, signed),
-                    trust_semantics::type_min_formula(width, signed),
-                    "type_min_formula diverged at width {width} signed {signed}"
-                );
-                assert_eq!(
-                    type_max_formula(width, signed),
-                    trust_semantics::type_max_formula(width, signed),
-                    "type_max_formula diverged at width {width} signed {signed}"
-                );
-            }
+    fn shared_bounds_match_independent_integer_carriers() {
+        for width in (0..=256).chain([u32::MAX]) {
+            let signed_magnitude = (1..=128).contains(&width)
+                .then(|| 2u128.pow(width - 1));
+            let min = signed_magnitude
+                .map_or(i128::MIN, |m| -i128::try_from(m - 1).unwrap() - 1);
+            let max = signed_magnitude
+                .map_or(i128::MAX, |m| i128::try_from(m - 1).unwrap());
+            assert_eq!(signed_min(width), min, "width {width}");
+            assert_eq!(signed_max(width), max, "width {width}");
+            assert_eq!(type_min_formula(width, true), Formula::Int(min));
+            assert_eq!(type_max_formula(width, true), Formula::Int(max));
+            assert_eq!(type_min_formula(width, false), Formula::Int(0));
+            let unsigned = if width == 128 {
+                Formula::UInt(u128::MAX)
+            } else if width <= 127 {
+                Formula::Int(i128::try_from(2u128.pow(width) - 1).unwrap())
+            } else {
+                Formula::Int(i128::MAX)
+            };
+            assert_eq!(type_max_formula(width, false), unsigned, "width {width}");
         }
     }
 

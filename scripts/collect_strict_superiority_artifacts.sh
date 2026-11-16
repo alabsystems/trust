@@ -5,8 +5,12 @@
 
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGO="${TARGO:-$ROOT/targo-trust/target/debug/targo-trust}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TARGO_OVERRIDE_SET=false
+if [[ ${TARGO+x} ]]; then
+  TARGO_OVERRIDE_SET=true
+fi
+TARGO="${TARGO:-}"
 RUN_ID="${RUN_ID:-strict-superiority-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_DIR="${OUT_DIR:-$ROOT/reports/strict-superiority/$RUN_ID}"
 REPETITIONS="${REPETITIONS:-3}"
@@ -16,20 +20,29 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 MANIFEST="${TRUST_STRICT_ARTIFACT_MANIFEST:-$OUT_DIR/release-artifact-manifest.json}"
 MANIFEST_RECORDS="$OUT_DIR/.release-artifact-manifest.records.jsonl"
 STAGE2_PREFLIGHT_LOG="$OUT_DIR/stage2-toolchain-preflight.log"
+STAGE2_INFO="$OUT_DIR/stage2-toolchain-info.json"
+STAGE2_HOST_TRIPLE=""
+STAGE2_SYSROOT=""
+STAGE2_DISPATCHER=""
+STAGE2_DISPATCHER_SHA256=""
+SELECTED_DISPATCHER_SHA256_BEFORE=""
+SELECTED_DISPATCHER_SHA256_AFTER=""
+DISPATCHER_ADMISSIBILITY_REASON=""
+DISPATCHER_DRIFT_REASON=""
 PLAN_ONLY=false
 MANIFEST_STARTED_AT=""
 REVIEWED_COMMIT=""
-
-mkdir -p "$OUT_DIR"
+REVIEWED_TREE=""
 
 usage() {
   cat <<'USAGE'
 Usage: scripts/collect_strict_superiority_artifacts.sh [--plan]
 
 Environment:
-  TARGO                         targo-trust binary to run
+  TARGO                         optional targo-trust diagnostic override; a
+                                different executable withholds release admissibility
   RUN_ID                         stable run id for report paths
-  OUT_DIR                        artifact directory
+  OUT_DIR                        artifact directory inside this checkout
   REPETITIONS                    repeated benchmark samples per row
   MIN_PERF_ADVANTAGE_PCT         domination performance threshold
   PYTHON_BIN                     Python interpreter for manifest serialization
@@ -43,13 +56,22 @@ Environment:
                                  (default: reports/proof under this checkout)
   TRUST_STAGE2_SYSROOT           optional explicit repo-local build/<host>/stage2 sysroot
                                  validated before evidence collection
+  TRUST_UPSTREAM_X86_64_SUMMARY   other-host x86_64 summary to import for diagnosis only
+  TRUST_UPSTREAM_AARCH64_SUMMARY  other-host AArch64 summary to import for diagnosis only
 
 The script writes a fail-closed release artifact manifest for real runs and
 exits nonzero when any required artifact is missing, malformed, produced by a
 nonzero command, dirty, commit-mismatched, or otherwise non-admissible. Use
---plan to print the exact commands without running them. Upstream compatibility
+--plan to print the intended commands without running or validating them. Upstream compatibility
 collection uses --no-apply so a release evidence run cannot mutate the reviewed
 checkout or produce dirty provenance as a side effect.
+Real runs dispatch through the preflight-validated stage2/bin/targo-trust by
+default. An executable TARGO override can be used for diagnostics, but every
+required artifact is non-admissible unless it resolves to that exact stage2 path.
+The selected executable is hashed after preflight and after collection; drift
+withholds release admissibility from every required artifact.
+Only the validated stage2 host's native upstream suite is run. A nonnative
+summary is skipped, or imported without release admissibility when supplied.
 USAGE
 }
 
@@ -97,6 +119,30 @@ require_python() {
   fi
 }
 
+require_repo_local_out_dir() {
+  local resolved
+  resolved="$("$PYTHON_BIN" - "$ROOT" "$OUT_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+out = Path(sys.argv[2]).resolve()
+if out == root or not out.is_relative_to(root):
+    print(f"ERROR: OUT_DIR must resolve inside this checkout: {out}", file=sys.stderr)
+    sys.exit(1)
+print(out)
+PY
+  )" || return 1
+  OUT_DIR="$resolved"
+  LOG="$OUT_DIR/commands.log"
+  MANIFEST_RECORDS="$OUT_DIR/.release-artifact-manifest.records.jsonl"
+  STAGE2_PREFLIGHT_LOG="$OUT_DIR/stage2-toolchain-preflight.log"
+  STAGE2_INFO="$OUT_DIR/stage2-toolchain-info.json"
+  if [[ -z "${TRUST_STRICT_ARTIFACT_MANIFEST:-}" ]]; then
+    MANIFEST="$OUT_DIR/release-artifact-manifest.json"
+  fi
+}
+
 record_artifact() {
   local id="$1"
   local path="$2"
@@ -106,16 +152,19 @@ record_artifact() {
   local command="$6"
   local exit_code="$7"
   shift 7
+  if [[ -n "$DISPATCHER_ADMISSIBILITY_REASON" ]]; then
+    set -- "$@" "$DISPATCHER_ADMISSIBILITY_REASON"
+  fi
   "$PYTHON_BIN" - "$MANIFEST_RECORDS" "$id" "$kind" "$path" "$architecture" "$required" \
-    "$command" "$exit_code" "$REVIEWED_COMMIT" "$ROOT" "$@" <<'PY'
+    "$command" "$exit_code" "$REVIEWED_COMMIT" "$REVIEWED_TREE" "$ROOT" "$@" <<'PY'
 import hashlib
 import json
 import os
 import re
 import sys
 
-records_path, artifact_id, kind, path, architecture, required_text, command, exit_code_text, reviewed_commit, repo_root = sys.argv[1:11]
-reasons = list(sys.argv[11:])
+records_path, artifact_id, kind, path, architecture, required_text, command, exit_code_text, reviewed_commit, reviewed_tree, repo_root = sys.argv[1:12]
+reasons = list(sys.argv[12:])
 required = required_text == "true"
 try:
     exit_code = int(exit_code_text)
@@ -262,6 +311,39 @@ def validate_hash_bound_file(requirement_id, base_dir, label, reference, expecte
 
 def validate_unsafe_memory_report(payload, report_path):
     base_dir = os.path.dirname(os.path.abspath(report_path))
+    candidate_commit = payload.get("candidate_commit")
+    if (not isinstance(candidate_commit, str)
+            or not FULL_SHA.fullmatch(candidate_commit)
+            or candidate_commit.lower() != reviewed_commit.lower()):
+        fail_requirement(
+            "proof-unsafe-memory.candidate-commit",
+            "unsafe-memory candidate_commit must match the reviewed commit",
+            candidate_commit=candidate_commit,
+            reviewed_commit=reviewed_commit,
+        )
+    else:
+        pass_requirement(
+            "proof-unsafe-memory.candidate-commit",
+            "unsafe-memory candidate_commit matches the reviewed commit",
+        )
+
+    candidate_tree = payload.get("candidate_tree")
+    if (not isinstance(candidate_tree, str)
+            or not FULL_SHA.fullmatch(candidate_tree)
+            or not FULL_SHA.fullmatch(reviewed_tree)
+            or candidate_tree.lower() != reviewed_tree.lower()):
+        fail_requirement(
+            "proof-unsafe-memory.candidate-tree",
+            "unsafe-memory candidate_tree must match the reviewed commit tree",
+            candidate_tree=candidate_tree,
+            reviewed_tree=reviewed_tree,
+        )
+    else:
+        pass_requirement(
+            "proof-unsafe-memory.candidate-tree",
+            "unsafe-memory candidate_tree matches the reviewed commit tree",
+        )
+
     if payload.get("repo_dirty") is not False:
         fail_requirement(
             "proof-unsafe-memory.repo-clean",
@@ -343,6 +425,10 @@ def validate_unsafe_memory_report(payload, report_path):
             "unsafe-memory report must not contain unsupported obligations",
             unsupported=unsupported,
         )
+    fail_requirement(
+        "proof-unsafe-memory.authenticated-proof-replay",
+        "unsafe-memory proof rows and source-policy census lack authenticated replay and reconciliation; wrapper counters and artifact hashes do not establish proof authority",
+    )
 
 
 def artifact_binding_for(obligation, aliases):
@@ -727,8 +813,9 @@ for binding in dirty_bindings:
     reasons.append(f"{binding} is true")
 
 if exists and json_error is None and kind.startswith("trust."):
-    if schema != kind:
-        reasons.append(f"JSON schema `{schema}` does not match expected `{kind}`")
+    expected_schema = "0.1.0" if kind == "trust.compatibility.v1" else kind
+    if schema != expected_schema:
+        reasons.append(f"JSON schema `{schema}` does not match expected `{expected_schema}`")
 
 if exists and json_error is None:
     if kind in {"trust.proof-unsafe-memory-report.v1", "trust.proof-concurrency.authenticated-validation-report.v1"} and not isinstance(payload, dict):
@@ -737,6 +824,13 @@ if exists and json_error is None:
         validate_unsafe_memory_report(payload, path)
     elif kind == "trust.proof-concurrency.authenticated-validation-report.v1":
         validate_concurrency_report(payload, path)
+
+if kind == "trust.compatibility.v1":
+    fail_requirement(
+        "upstream-rust.independent-attestation",
+        "upstream Rust compatibility lacks independent Rust-owned execution and complete-denominator attestation",
+        architecture=architecture,
+    )
 
 deduped_reasons = []
 for reason in reasons:
@@ -817,18 +911,26 @@ write_manifest() {
   local completed_at
   completed_at="$(timestamp_utc)"
   "$PYTHON_BIN" - "$MANIFEST_RECORDS" "$MANIFEST" "$RUN_ID" "$OUT_DIR" "$LOG" \
-    "$REVIEWED_COMMIT" "$(repo_dirty)" "$MANIFEST_STARTED_AT" "$completed_at" <<'PY'
+    "$REVIEWED_COMMIT" "$(repo_dirty)" "$MANIFEST_STARTED_AT" "$completed_at" \
+    "$STAGE2_DISPATCHER" "$TARGO" "$DISPATCHER_ADMISSIBILITY_REASON" \
+    "$STAGE2_DISPATCHER_SHA256" "$SELECTED_DISPATCHER_SHA256_BEFORE" \
+    "$SELECTED_DISPATCHER_SHA256_AFTER" "$DISPATCHER_DRIFT_REASON" <<'PY'
 import json
 import os
 import sys
 
-records_path, manifest_path, run_id, out_dir, log_path, reviewed_commit, repo_dirty_text, started_at, completed_at = sys.argv[1:10]
+records_path, manifest_path, run_id, out_dir, log_path, reviewed_commit, repo_dirty_text, started_at, completed_at, stage2_dispatcher, selected_dispatcher, dispatcher_reason, stage2_sha256, selected_sha256_before, selected_sha256_after, drift_reason = sys.argv[1:17]
 artifacts = []
 if os.path.exists(records_path):
     with open(records_path, "r", encoding="utf-8") as handle:
         artifacts = [json.loads(line) for line in handle if line.strip()]
 
 required = [artifact for artifact in artifacts if artifact["required"]]
+for artifact in required:
+    for reason in (dispatcher_reason, drift_reason):
+        if reason and reason not in artifact["admissibility_reasons"]:
+            artifact["admissibility_reasons"].append(reason)
+    artifact["admissible"] = not artifact["admissibility_reasons"]
 non_admissible = [artifact for artifact in required if not artifact["admissible"]]
 manifest = {
     "schema_version": "trust.strict-superiority.artifact-manifest.v1",
@@ -839,6 +941,16 @@ manifest = {
     "completed_at": completed_at,
     "out_dir": out_dir,
     "commands_log": log_path,
+    "dispatcher": {
+        "validated_stage2_path": stage2_dispatcher,
+        "validated_stage2_sha256": stage2_sha256,
+        "selected_path": selected_dispatcher,
+        "selected_sha256_before": selected_sha256_before,
+        "selected_sha256_after": selected_sha256_after or None,
+        "content_match": not drift_reason,
+        "identity_match": not dispatcher_reason and not drift_reason,
+        "drift_reason": drift_reason or None,
+    },
     "artifact_count": len(artifacts),
     "required_artifact_count": len(required),
     "admissible_required_artifact_count": len(required) - len(non_admissible),
@@ -858,32 +970,6 @@ if non_admissible:
 PY
 }
 
-run() {
-  log "::: $*"
-  if [[ "$PLAN_ONLY" == true ]]; then
-    return 0
-  fi
-  "$@" 2>&1 | tee -a "$LOG"
-  local rc=${PIPESTATUS[0]}
-  if [[ $rc -ne 0 ]]; then
-    die "command failed with exit $rc: $*"
-  fi
-}
-
-host_triple() {
-  rustc -vV | awk '/^host:/ {print $2; exit}'
-}
-
-host_arch() {
-  local arch
-  arch="$(uname -m)"
-  case "$arch" in
-    arm64) printf 'aarch64\n' ;;
-    amd64) printf 'x86_64\n' ;;
-    *) printf '%s\n' "$arch" ;;
-  esac
-}
-
 default_triple_for() {
   local arch="$1"
   local system
@@ -897,32 +983,149 @@ default_triple_for() {
   esac
 }
 
-require_targo() {
-  if [[ ! -x "$TARGO" ]]; then
-    if [[ "$PLAN_ONLY" == true ]]; then
-      log "targo binary not found at $TARGO; planned run would build targo-trust first"
-      return 0
-    fi
-    log "targo binary not found at $TARGO; building targo-trust"
-    run cargo build --manifest-path "$ROOT/targo-trust/Cargo.toml" --bin targo-trust
-  fi
+dispatcher_sha256() {
+  "$PYTHON_BIN" - "$1" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+try:
+    if path.resolve(strict=True) != path:
+        raise ValueError("dispatcher no longer resolves to its selected path")
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or not os.access(path, os.X_OK):
+            raise ValueError("dispatcher is not an executable regular file")
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        after = os.fstat(stream.fileno())
+    current = path.stat()
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_size,
+                              value.st_mtime_ns, value.st_ctime_ns)
+    if identity(before) != identity(after) or identity(after) != identity(current):
+        raise ValueError("dispatcher changed while being hashed")
+except (OSError, RuntimeError, ValueError) as exc:
+    print(f"ERROR: selected dispatcher identity unavailable: {exc}", file=sys.stderr)
+    sys.exit(1)
+print(f"sha256:{digest.hexdigest()}")
+PY
 }
 
 preflight_stage2_toolchain() {
   local preflight="$ROOT/scripts/check_upstream_rust_test_toolchain.sh"
   if [[ "$PLAN_ONLY" == true ]]; then
-    log "::: bash $preflight"
+    if [[ "$TARGO_OVERRIDE_SET" != true ]]; then
+      TARGO="${TRUST_STAGE2_SYSROOT:-$ROOT/build/<validated-host>/stage2}/bin/targo-trust"
+    fi
+    log "::: $(command_display bash "$preflight" --stage2-info-out "$STAGE2_INFO")"
     return 0
   fi
   [[ -f "$preflight" ]] || die "stage2 toolchain preflight script not found: $preflight"
-  log "::: bash $preflight > $STAGE2_PREFLIGHT_LOG"
-  if bash "$preflight" >"$STAGE2_PREFLIGHT_LOG" 2>&1; then
+  log "::: $(command_display bash "$preflight" --stage2-info-out "$STAGE2_INFO") > $STAGE2_PREFLIGHT_LOG"
+  if bash "$preflight" --stage2-info-out "$STAGE2_INFO" >"$STAGE2_PREFLIGHT_LOG" 2>&1; then
     sed -n '1,80p' "$STAGE2_PREFLIGHT_LOG" | tee -a "$LOG" >&2
   else
     local rc=$?
     sed -n '1,160p' "$STAGE2_PREFLIGHT_LOG" | tee -a "$LOG" >&2
     die "stage2 toolchain preflight failed with exit $rc; see $STAGE2_PREFLIGHT_LOG"
   fi
+  STAGE2_SYSROOT="$("$PYTHON_BIN" - "$STAGE2_INFO" "$ROOT" "$REVIEWED_COMMIT" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+info_path, root_text, commit = sys.argv[1:]
+try:
+    with open(info_path, encoding="utf-8") as stream:
+        info = json.load(stream)
+    root = Path(root_text).resolve(strict=True)
+    sysroot = Path(info["sysroot"]).resolve(strict=True)
+    trustc = Path(info["trustc"]).resolve(strict=True)
+    dispatcher = (sysroot / "bin" / "targo-trust").resolve(strict=True)
+    host = info["host_triple"]
+    # `sysroot` is resolved, so containment is judged against the PHYSICAL build
+    # directory: `build` itself, or the real `build.noindex` it may link to
+    # (docs/BUILD_AND_INSTALL.md, "Keeping Spotlight out of build/"). Any other
+    # link keeps the lexical `root / "build"`, which a resolved path never matches.
+    build = root / "build"
+    noindex = root / "build.noindex"
+    if (build.is_symlink() and noindex.is_dir() and not noindex.is_symlink()
+            and build.resolve(strict=True) == noindex):
+        build = noindex
+    valid = (info["schema_version"] == "trust.stage2-preflight.v1"
+             and info["toolchain_checkout_match"] is True
+             and info["trustc_commit"] == commit
+             and sysroot.is_relative_to(build)
+             and sysroot.name == "stage2" and sysroot.parent.name == host
+             and trustc == sysroot / "bin" / "trustc"
+             and trustc.is_file() and os.access(trustc, os.X_OK)
+             and dispatcher == sysroot / "bin" / "targo-trust"
+             and dispatcher.is_file() and os.access(dispatcher, os.X_OK)
+             and isinstance(host, str)
+             and re.fullmatch(r"(?:aarch64|x86_64)-[a-z0-9_-]+", host))
+    if not valid:
+        raise ValueError("stage2 metadata does not bind exact native compiler and dispatcher paths")
+except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+    print(f"ERROR: invalid validated stage2 metadata: {exc}", file=sys.stderr)
+    sys.exit(1)
+print(sysroot)
+PY
+  )" || die "stage2 metadata could not be authenticated: $STAGE2_INFO"
+  STAGE2_HOST_TRIPLE="$(basename "$(dirname "$STAGE2_SYSROOT")")"
+  STAGE2_DISPATCHER="$STAGE2_SYSROOT/bin/targo-trust"
+  if [[ "$TARGO_OVERRIDE_SET" == true ]]; then
+    [[ -n "$TARGO" ]] || die "TARGO override must name an executable file"
+    TARGO="$("$PYTHON_BIN" - "$TARGO" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+try:
+    path = Path(sys.argv[1]).resolve(strict=True)
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ValueError("not an executable file")
+except (OSError, ValueError) as exc:
+    print(f"ERROR: invalid TARGO override: {exc}", file=sys.stderr)
+    sys.exit(1)
+print(path)
+PY
+    )" || die "TARGO override could not be resolved"
+    if [[ "$TARGO" != "$STAGE2_DISPATCHER" ]]; then
+      DISPATCHER_ADMISSIBILITY_REASON="dispatcher override differs from validated stage2 dispatcher: selected=$TARGO validated=$STAGE2_DISPATCHER"
+      log "WARNING: $DISPATCHER_ADMISSIBILITY_REASON; release admissibility withheld"
+    fi
+  else
+    TARGO="$STAGE2_DISPATCHER"
+  fi
+  STAGE2_DISPATCHER_SHA256="$(dispatcher_sha256 "$STAGE2_DISPATCHER")" \
+    || die "validated stage2 dispatcher could not be hashed: $STAGE2_DISPATCHER"
+  if [[ "$TARGO" == "$STAGE2_DISPATCHER" ]]; then
+    SELECTED_DISPATCHER_SHA256_BEFORE="$STAGE2_DISPATCHER_SHA256"
+  else
+    SELECTED_DISPATCHER_SHA256_BEFORE="$(dispatcher_sha256 "$TARGO")" \
+      || die "selected dispatcher could not be hashed: $TARGO"
+  fi
+  log "validated_stage2_host_triple=$STAGE2_HOST_TRIPLE"
+  log "validated_stage2_dispatcher=$STAGE2_DISPATCHER"
+  log "validated_stage2_dispatcher_sha256=$STAGE2_DISPATCHER_SHA256"
+  log "selected_dispatcher_sha256_before=$SELECTED_DISPATCHER_SHA256_BEFORE"
+}
+
+check_dispatcher_after_collection() {
+  if ! SELECTED_DISPATCHER_SHA256_AFTER="$(dispatcher_sha256 "$TARGO")"; then
+    SELECTED_DISPATCHER_SHA256_AFTER=""
+  fi
+  if [[ "$SELECTED_DISPATCHER_SHA256_AFTER" != "$SELECTED_DISPATCHER_SHA256_BEFORE" ]]; then
+    DISPATCHER_DRIFT_REASON="selected dispatcher changed during artifact collection: preflight=$SELECTED_DISPATCHER_SHA256_BEFORE after=${SELECTED_DISPATCHER_SHA256_AFTER:-unavailable}"
+    log "WARNING: $DISPATCHER_DRIFT_REASON; release admissibility withheld"
+  fi
+  log "selected_dispatcher_sha256_after=${SELECTED_DISPATCHER_SHA256_AFTER:-unavailable}"
 }
 
 collect_upstream_compat() {
@@ -931,9 +1134,76 @@ collect_upstream_compat() {
   local arch_dir="$OUT_DIR/upstream-rust/$arch"
   local summary="$arch_dir/compat-summary.json"
   local porting_dir="$arch_dir/porting"
+  local validation_log="$arch_dir/summary-validation.log"
+  local preflight="$ROOT/scripts/check_upstream_rust_test_toolchain.sh"
+  local import_path=""
+  case "$arch" in
+    x86_64) import_path="${TRUST_UPSTREAM_X86_64_SUMMARY:-}" ;;
+    aarch64) import_path="${TRUST_UPSTREAM_AARCH64_SUMMARY:-}" ;;
+    *) die "unsupported upstream compatibility architecture: $arch" ;;
+  esac
   mkdir -p "$arch_dir"
-  run_artifact "upstream-rust-$arch" "$summary" "$arch" "trust.compatibility.v1" \
-    "$TARGO" trust domination upstream-tests \
+  if [[ "$PLAN_ONLY" == true ]]; then
+    log "::: native-only upstream collection if validated stage2 host is $triple"
+  elif [[ "$STAGE2_HOST_TRIPLE" != "$triple" ]]; then
+    if [[ -z "$import_path" ]]; then
+      local reason="skipped nonnative upstream suite: validated stage2 host=$STAGE2_HOST_TRIPLE target=$triple; no other-host summary supplied"
+      log "::: $reason"
+      record_missing_artifact "upstream-rust-$arch" "$summary" "$arch" \
+        "trust.compatibility.v1" "$reason"
+      return 0
+    fi
+    local import_log="$arch_dir/import-validation.log"
+    local import_display="diagnostic import of other-host summary $import_path to $summary"
+    log "::: $import_display"
+    if "$PYTHON_BIN" - "$import_path" "$summary" "$arch" "$triple" "$REVIEWED_COMMIT" \
+      >"$import_log" 2>&1 <<'PY'
+import json
+from pathlib import Path
+import shutil
+import sys
+
+source_text, target_text, arch, triple, commit = sys.argv[1:]
+try:
+    source = Path(source_text).resolve(strict=True)
+    target = Path(target_text).resolve()
+    if not source.is_file() or source == target or source.stat().st_size > 32 * 1024 * 1024:
+        raise ValueError("source must be a distinct bounded JSON file")
+    with source.open(encoding="utf-8") as stream:
+        summary = json.load(stream)
+    expected = {"target_arch": arch, "architecture": arch, "target": triple,
+                "target_triple": triple, "host_triple": triple, "repo_head": commit,
+                "repo_dirty": False, "schema_version": "0.1.0"}
+    if (not isinstance(summary, dict)
+            or any(summary.get(key) != value for key, value in expected.items())
+            or summary.get("host") not in (arch, triple)):
+        raise ValueError("summary does not declare the other native host, target, and reviewed commit")
+    shutil.copyfile(source, target)
+except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    print(f"ERROR: other-host summary import refused: {exc}", file=sys.stderr)
+    sys.exit(1)
+print("DIAGNOSTIC: imported other-host summary; proof bundle and execution were not authenticated here")
+PY
+    then
+      sed -n '1,30p' "$import_log" | tee -a "$LOG" >&2
+      record_artifact "upstream-rust-$arch" "$summary" "$arch" "trust.compatibility.v1" \
+        true "$import_display" 0 \
+        "other-host summary is diagnostic only; native execution and complete denominator were not authenticated here"
+    else
+      sed -n '1,30p' "$import_log" | tee -a "$LOG" >&2
+      record_missing_artifact "upstream-rust-$arch" "$summary" "$arch" \
+        "trust.compatibility.v1" "other-host diagnostic import refused: $import_log"
+    fi
+    return 0
+  elif [[ -n "$import_path" ]]; then
+    local reason="native upstream target must execute locally; refusing configured summary import for $arch"
+    log "::: $reason"
+    record_missing_artifact "upstream-rust-$arch" "$summary" "$arch" \
+      "trust.compatibility.v1" "$reason"
+    return 0
+  fi
+  local metadata_host="${STAGE2_HOST_TRIPLE:-$triple}"
+  local command=("$TARGO" trust domination upstream-tests \
     --release \
     --proof-mode full \
     --execute \
@@ -944,8 +1214,42 @@ collect_upstream_compat() {
     --target-arch "$arch" \
     --target "$triple" \
     --target-triple "$triple" \
-    --host "$(host_arch)" \
-    --host-triple "$(host_triple)"
+    --host "${metadata_host%%-*}" \
+    --host-triple "$metadata_host")
+  local display
+  display="$(command_display "${command[@]}")"
+  log "::: $display"
+  log "::: $(command_display bash "$preflight" --target-triple "$triple" --compat-summary "$summary")"
+  if [[ "$PLAN_ONLY" == true ]]; then
+    if [[ -n "$import_path" ]]; then
+      log "::: otherwise import $import_path for diagnosis only; release admissibility withheld"
+    else
+      log "::: otherwise skip nonnative $arch; release admissibility withheld"
+    fi
+    return 0
+  fi
+  "${command[@]}" 2>&1 | tee -a "$LOG"
+  local rc=${PIPESTATUS[0]}
+  local reason=""
+  if [[ $rc -eq 0 ]]; then
+    if bash "$preflight" --target-triple "$triple" --compat-summary "$summary" \
+      >"$validation_log" 2>&1; then
+      sed -n '1,100p' "$validation_log" | tee -a "$LOG" >&2
+    else
+      local validation_rc=$?
+      sed -n '1,100p' "$validation_log" | tee -a "$LOG" >&2
+      reason="post-run upstream summary validation refused (exit $validation_rc): $validation_log"
+    fi
+  else
+    reason="post-run upstream summary validation not run after producer failure"
+  fi
+  if [[ -n "$reason" ]]; then
+    record_artifact "upstream-rust-$arch" "$summary" "$arch" "trust.compatibility.v1" \
+      true "$display" "$rc" "$reason"
+  else
+    record_artifact "upstream-rust-$arch" "$summary" "$arch" "trust.compatibility.v1" \
+      true "$display" "$rc"
+  fi
 }
 
 collect_program_index_proof() {
@@ -1023,7 +1327,7 @@ copy_unsafe_memory_bundle() {
   mkdir -p "$output_dir"
   cp "$source_wrapper" "$output_dir/unsafe-memory.json" 2> >(tee -a "$LOG" >&2) || return $?
   local sibling
-  for sibling in report.json report.ndjson report.html; do
+  for sibling in report.json report.ndjson report.html evidence-bundle.json; do
     if [[ -f "$source_dir/$sibling" ]]; then
       cp "$source_dir/$sibling" "$output_dir/$sibling" 2> >(tee -a "$LOG" >&2) || return $?
     fi
@@ -1079,6 +1383,12 @@ main() {
     usage >&2
     return 2
   fi
+  if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    printf 'ERROR: python interpreter not found: %s\n' "$PYTHON_BIN" >&2
+    return 1
+  fi
+  require_repo_local_out_dir || return 2
+  mkdir -p "$OUT_DIR"
   : >"$LOG"
   if [[ "$PLAN_ONLY" != true ]]; then
     require_python
@@ -1086,13 +1396,13 @@ main() {
   fi
   MANIFEST_STARTED_AT="$(timestamp_utc)"
   REVIEWED_COMMIT="$(reviewed_commit)"
-  require_targo
+  REVIEWED_TREE="$(git -C "$ROOT" rev-parse --verify "${REVIEWED_COMMIT}^{tree}" 2>/dev/null || printf 'unknown\n')"
   log "strict-superiority run_id=$RUN_ID"
   log "out_dir=$OUT_DIR"
-  log "targo=$TARGO"
   log "reviewed_commit=$REVIEWED_COMMIT"
   log "manifest=$MANIFEST"
   preflight_stage2_toolchain
+  log "dispatcher=$TARGO"
 
   collect_upstream_compat x86_64 "${TRUST_X86_64_TRIPLE:-$(default_triple_for x86_64)}"
   collect_upstream_compat aarch64 "${TRUST_AARCH64_TRIPLE:-$(default_triple_for aarch64)}"
@@ -1108,6 +1418,7 @@ main() {
     log "strict-superiority artifact manifest would be written to $MANIFEST"
     return 0
   fi
+  check_dispatcher_after_collection
   if write_manifest 2> >(tee -a "$LOG" >&2); then
     log "release artifact manifest written to $MANIFEST"
   else

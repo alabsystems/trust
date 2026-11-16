@@ -42,6 +42,7 @@ trust-ir-build = { path = "../../first-party/trust-ir/crates/trust-ir-build" }
 [patch."https://github.com/alabsystems/clean.git"]
 clean-ck0 = { path = "../../first-party/clean/crates/clean-ck0" }
 clean-kernel = { path = "../../first-party/clean/crates/clean-kernel" }
+clean-olean = { path = "../../first-party/clean/crates/clean-olean" }
 
 [patch."https://github.com/alabsystems/ay.git"]
 ay = { path = "../../first-party/ay/crates/ay" }
@@ -53,7 +54,10 @@ ay-chc = { path = "../../first-party/ay/crates/ay-chc" }
 ay-sat = { path = "../../first-party/ay/crates/ay-sat" }
 ay-frontend = { path = "../../first-party/ay/crates/ay-frontend" }
 ay-translate = { path = "../../first-party/ay/crates/ay-translate" }
-ay-encode = { path = "../../first-party/ay/crates/ay-encode" }
+# No `ay-encode` row: nothing in this graph depends on ay-encode from ay.git,
+# so the row only ever produced a `[[patch.unused]]` lock entry whose version
+# drifted with every ay pin (docs/KNOWN_HAZARDS.md). If an edge appears,
+# `--locked` resolution will name it; add the row back then.
 
 [patch."https://github.com/alabsystems/trust-cg.git"]
 trust-cg-codegen = { path = "../../first-party/trust-cg/crates/trust-cg-codegen" }
@@ -116,6 +120,63 @@ trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir", features = ["b
 # refinement rejects every module that fails the authoritative structural,
 # typing, SSA, arity, and terminator validator before generating Clean source.
 trust-ir-build = { path = "../../first-party/trust-ir/crates/trust-ir-build" }
+# Beyond-TLA B1a (lane/beyond-tla-b1a): the executable presentation's Clean source
+# and identity, served by the dependency-free trust-model-prelude and kernel-checked
+# here by `model_prelude` (B1A-D03, B1A-D53). trust-sha2 is the Trust-owned SHA-256
+# that computes PRELUDE_TERM_DIGEST over the elaborated prelude (B1A-D34, B1A-D65);
+# third-party sha2 is dependency-policy-excluded (crates/trust-sha2/Cargo.toml).
+trust-model-prelude = { path = "../trust-model-prelude" }
+trust-sha2 = { path = "../trust-sha2" }
+
+[features]
+# Test-only API of `model_prelude`: `with_model_prelude_patched` and `ModulePatch`,
+# the variant and negative-control preludes (B1A-D53), and `with_model_prelude_prefix`,
+# the base-modules prelude of the Clean capability matrix (B1A-02a). Off in every
+# production build; a test target that needs it declares it in `required-features`
+# below, or gates the test on the feature (`model_prelude_kernel`, whose debug smoke
+# subset runs featureless on the push lane).
+test-support = []
 
 [dev-dependencies]
+trust-stage-receipt = { path = "../trust-stage-receipt" }
+cargo-util = { path = "../../src/tools/targo/crates/cargo-util" }
+libc = "0.2"
 tempfile = "3"
+# B1A-D60: the FX-pin-4 control replaces one prelude term in a cloned environment
+# through `Environment::add_constant_unchecked_for_test`, which clean-kernel compiles
+# only under `test-fixtures`. As a dev-dependency feature it reaches test builds only
+# (resolver 2), never the verifier this crate ships.
+clean-kernel = { path = "../../first-party/clean/crates/clean-kernel", features = ["test-fixtures"] }
+
+# This deliberately isolated workspace does not inherit the repository's iteration
+# profiles. Keep the same runtime-critical checker optimizations here: otherwise
+# source qualification hashes compiler images and checks proofs with unoptimized
+# cryptography and kernel code. Test inherits these dev package overrides.
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.package."clean-kernel"]
+opt-level = 2
+
+[profile.dev.package."clean-olean"]
+opt-level = 2
+
+[profile.dev.package."clean-parser"]
+opt-level = 2
+
+[profile.dev.package."clean-elab"]
+opt-level = 2
+
+[profile.dev.package."trust-sha2"]
+opt-level = 2
+
+# Patched-prelude tests (B1A-D53). `model_prelude_kernel` is NOT listed: its debug
+# smoke subset must run on the push lane, which passes no features (B1A-D42).
+[[test]]
+name = "model_prelude_patched"
+required-features = ["test-support"]

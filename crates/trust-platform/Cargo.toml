@@ -1,0 +1,41 @@
+# trust-platform: the executable Darwin descriptor/process model (Trust.Platform v0).
+#
+# One definition of what the platform does to a process's descriptor table,
+# its open file descriptions and its process lifecycle: pipe, socketpair,
+# socket, accept, open, kqueue, fcntl, dup, dup2, close, ioctl, fork, exec,
+# posix_spawn (+ file actions, POSIX_SPAWN_CLOEXEC_DEFAULT), getrlimit and
+# setrlimit; since M2 also flock, named open/openat (O_EXLOCK/O_SHLOCK),
+# fstat identity, mkfifo, unlink and symlink. Each clause is a pure function Host x args x oracle -> Host x result.
+# The derivation (D-11(e)) builds its models by evaluating these clauses, and
+# tests/conformance_darwin.rs compares them step by step with real syscalls.
+#
+# No dependencies on purpose: the model is data plus pure functions.
+# `libc` is a dev-dependency used only by the conformance harness.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+libc = { workspace = true }
+
+# The conformance harness owns `main` (no libtest): it must be single-threaded
+# so `fork` is safe and the descriptor table it measures is not shared with
+# concurrently running tests, and it re-executes itself as the post-exec
+# descriptor reporter, which must start without std's runtime init (that init
+# reopens a closed fd 0/1/2 on /dev/null and would perturb the measurement).
+[[test]]
+name = "conformance_darwin"
+path = "tests/conformance_darwin.rs"
+harness = false

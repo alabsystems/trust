@@ -1,0 +1,170 @@
+{
+  "name": "div_ceil_ret_ok",
+  "def_path": "div_ceil_alloc::div_ceil_ret_ok",
+  "span": {
+    "file": "div_ceil_alloc.rs",
+    "line_start": 49,
+    "col_start": 0,
+    "line_end": 53,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "n"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl u8>::div_ceil",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    8,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "div_ceil_alloc.rs",
+              "line_start": 52,
+              "col_start": 6,
+              "line_end": 52,
+              "col_end": 6
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 14001439491740728397,
+              "def_index": 27350,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 14001439491740728397,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "div_ceil_alloc.rs",
+        "line_start": 50,
+        "col_start": 12,
+        "line_end": 50,
+        "col_end": 24
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) <= (32)"
+    }
+  ],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 255
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [
+    {
+      "Le": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": 32
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) <= (32)"
+    ],
+    "invariants": []
+  }
+}

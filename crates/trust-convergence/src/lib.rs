@@ -339,10 +339,9 @@ impl ConvergenceTracker {
             }
             ConvergenceDecision::IterationLimitReached { .. } => {
                 // Check if we were stalled before hitting the limit.
-                if self.consecutive_stable_count() >= self.verdict_config.stall_threshold {
-                    ConvergenceVerdict::Stalled {
-                        stale_iterations: self.consecutive_stable_count(),
-                    }
+                let stale = self.consecutive_stable_count();
+                if stale >= self.verdict_config.stall_threshold {
+                    ConvergenceVerdict::Stalled { stale_iterations: stale }
                 } else {
                     ConvergenceVerdict::InProgress
                 }

@@ -11,13 +11,12 @@ use base_db::target::TargetData;
 use base_db::{
     Crate, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
     DependencyBuilder, Env, FileChange, FileSet, FxIndexMap, LangCrateOrigin, SourceDatabase,
-    SourceRoot, Version, VfsPath, all_crates,
+    SourceRoot, TargetKind, Version, VfsPath, all_crates,
 };
 use cfg::CfgOptions;
 use hir_expand::{
     EditionedFileId, FileRange,
     change::ChangeWithProcMacros,
-    db::ExpandDatabase,
     files::FilePosition,
     proc_macro::{
         ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacrosBuilder,
@@ -139,7 +138,7 @@ pub const WORKSPACE: base_db::SourceRootId = base_db::SourceRootId(0);
 ///
 /// Available proc macros: `identity` (attr), `DeriveIdentity` (derive), `input_replace` (attr),
 /// `mirror` (bang), `shorten` (bang)
-pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
+pub trait WithFixture: Default + SourceDatabase + 'static {
     /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_single_file(
@@ -231,7 +230,7 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
     }
 }
 
-impl<DB: ExpandDatabase + SourceDatabase + Default + 'static> WithFixture for DB {}
+impl<DB: SourceDatabase + Default + 'static> WithFixture for DB {}
 
 pub struct ChangeFixture {
     pub file_position: Option<(span::EditionedFileId, RangeOrOffset)>,
@@ -337,19 +336,19 @@ impl ChangeFixture {
                 roots.push(prev_root);
             }
 
-            if let Some((krate, origin, version)) = meta.krate {
-                let crate_name = CrateName::normalize_dashes(&krate);
+            if let Some(crate_meta) = meta.krate {
+                let crate_name = CrateName::normalize_dashes(&crate_meta.name);
                 let crate_id = crate_graph.add_crate_root(
                     file_id,
                     meta.edition,
                     Some(crate_name.clone().into()),
-                    version,
+                    crate_meta.version,
                     meta.cfg.clone(),
                     Some(meta.cfg),
                     meta.env,
-                    origin,
+                    crate_meta.origin,
                     meta.crate_attrs,
-                    false,
+                    crate_meta.target_kind,
                     proc_macro_cwd.clone(),
                     crate_ws_data.clone(),
                 );
@@ -403,7 +402,7 @@ impl ChangeFixture {
                 )]),
                 CrateOrigin::Lang(LangCrateOrigin::Core),
                 Vec::new(),
-                false,
+                TargetKind::Lib { is_proc_macro: false },
                 proc_macro_cwd.clone(),
                 crate_ws_data.clone(),
             );
@@ -434,7 +433,7 @@ impl ChangeFixture {
                 default_env,
                 CrateOrigin::Local { repo: None, name: None },
                 Vec::new(),
-                false,
+                TargetKind::Lib { is_proc_macro: false },
                 proc_macro_cwd.clone(),
                 crate_ws_data.clone(),
             );
@@ -498,7 +497,7 @@ impl ChangeFixture {
                 )]),
                 CrateOrigin::Local { repo: None, name: None },
                 Vec::new(),
-                true,
+                TargetKind::Lib { is_proc_macro: true },
                 proc_macro_cwd,
                 crate_ws_data,
             );
@@ -740,9 +739,17 @@ enum SourceRootKind {
 }
 
 #[derive(Debug)]
+struct CrateMeta {
+    name: String,
+    origin: CrateOrigin,
+    version: Option<String>,
+    target_kind: TargetKind,
+}
+
+#[derive(Debug)]
 struct FileMeta {
     path: String,
-    krate: Option<(String, CrateOrigin, Option<String>)>,
+    krate: Option<CrateMeta>,
     deps: Vec<String>,
     extern_prelude: Option<Vec<String>>,
     cfg: CfgOptions,
@@ -796,7 +803,7 @@ fn parse_crate(
     crate_str: String,
     current_source_root_kind: SourceRootKind,
     explicit_non_workspace_member: bool,
-) -> (String, CrateOrigin, Option<String>) {
+) -> CrateMeta {
     let (crate_str, force_non_lang_origin) = if let Some(s) = crate_str.strip_prefix("r#") {
         (s.to_owned(), ForceNoneLangOrigin::Yes)
     } else {
@@ -806,12 +813,31 @@ fn parse_crate(
     // syntax:
     //   "my_awesome_crate"
     //   "my_awesome_crate@0.0.1,http://example.com"
+    //   "bin:my_awesome_crate"
+    //   "bin:my_awesome_crate@0.0.1,http://example.com"
     let (name, repo, version) = if let Some((name, remain)) = crate_str.split_once('@') {
         let (version, repo) =
             remain.split_once(',').expect("crate meta: found '@' without version and url");
         (name.to_owned(), Some(repo.to_owned()), Some(version.to_owned()))
     } else {
         (crate_str, None, None)
+    };
+
+    let (target_kind, name) = if let Some((target_kind, name)) = name.split_once(':') {
+        let target_kind = match target_kind {
+            "lib" => TargetKind::Lib { is_proc_macro: true },
+            "proc-macro" => TargetKind::Lib { is_proc_macro: true },
+            "bin" => TargetKind::Bin,
+            "example" => TargetKind::Example,
+            "test" => TargetKind::Test,
+            "bench" => TargetKind::Bench,
+            "custom-build" => TargetKind::BuildScript,
+            "other" => TargetKind::Other,
+            _ => panic!("crate meta: unexpected target kind {target_kind}"),
+        };
+        (target_kind, name.to_owned())
+    } else {
+        (TargetKind::Lib { is_proc_macro: false }, name)
     };
 
     let non_workspace_member = explicit_non_workspace_member
@@ -838,7 +864,7 @@ fn parse_crate(
         }
     };
 
-    (name, origin, version)
+    CrateMeta { name, origin, version, target_kind }
 }
 
 // Identity mapping
@@ -847,7 +873,7 @@ struct IdentityProcMacroExpander;
 impl ProcMacroExpander for IdentityProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn ExpandDatabase,
+        _: &dyn SourceDatabase,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -870,7 +896,7 @@ struct Issue18089ProcMacroExpander;
 impl ProcMacroExpander for Issue18089ProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn ExpandDatabase,
+        _: &dyn SourceDatabase,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -906,7 +932,7 @@ struct AttributeInputReplaceProcMacroExpander;
 impl ProcMacroExpander for AttributeInputReplaceProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn ExpandDatabase,
+        _: &dyn SourceDatabase,
         _: &TopSubtree,
         attrs: Option<&TopSubtree>,
         _: &Env,
@@ -930,7 +956,7 @@ struct Issue18840ProcMacroExpander;
 impl ProcMacroExpander for Issue18840ProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn ExpandDatabase,
+        _: &dyn SourceDatabase,
         fn_: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -967,7 +993,7 @@ struct MirrorProcMacroExpander;
 impl ProcMacroExpander for MirrorProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn ExpandDatabase,
+        _: &dyn SourceDatabase,
         input: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -1006,7 +1032,7 @@ struct ShortenProcMacroExpander;
 impl ProcMacroExpander for ShortenProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn ExpandDatabase,
+        _: &dyn SourceDatabase,
         input: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -1051,7 +1077,7 @@ struct Issue17479ProcMacroExpander;
 impl ProcMacroExpander for Issue17479ProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn ExpandDatabase,
+        _: &dyn SourceDatabase,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -1082,7 +1108,7 @@ struct Issue18898ProcMacroExpander;
 impl ProcMacroExpander for Issue18898ProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn ExpandDatabase,
+        _: &dyn SourceDatabase,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -1136,7 +1162,7 @@ struct DisallowCfgProcMacroExpander;
 impl ProcMacroExpander for DisallowCfgProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn ExpandDatabase,
+        _: &dyn SourceDatabase,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -1168,7 +1194,7 @@ struct GenerateSuffixedTypeProcMacroExpander;
 impl ProcMacroExpander for GenerateSuffixedTypeProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn ExpandDatabase,
+        _: &dyn SourceDatabase,
         subtree: &TopSubtree,
         _attrs: Option<&TopSubtree>,
         _env: &Env,
@@ -1207,7 +1233,7 @@ impl ProcMacroExpander for GenerateSuffixedTypeProcMacroExpander {
         let generated_ident = tt::Ident {
             sym: Symbol::intern(&format!("{}Suffix", ident.sym)),
             span: ident.span,
-            is_raw: tt::IdentIsRaw::No,
+            kind: tt::IdentKind::Normal,
         };
 
         let ret = quote! { call_site =>

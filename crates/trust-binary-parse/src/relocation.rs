@@ -185,19 +185,4 @@ mod tests {
         assert!(!relocs[1].is_pcrel);
         assert!(!relocs[1].is_extern);
     }
-
-    #[test]
-    fn test_relocation_debug_clone_copy_eq() {
-        let r = Relocation {
-            address: 0x100,
-            symbol_or_section: 1,
-            is_extern: true,
-            reloc_type: 2,
-            length: 3,
-            is_pcrel: false,
-        };
-        let r2 = r;
-        assert_eq!(r, r2);
-        let _ = format!("{:?}", r);
-    }
 }

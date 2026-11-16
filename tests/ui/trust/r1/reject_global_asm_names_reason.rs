@@ -29,17 +29,29 @@
 // a raw dcx warning cannot be suppressed by `-Awarnings`, so it must not fire on clean
 // builds. It must stay a WARNING, not an error: the poison only ever KEEPS an honest
 // verdict, so promoting it would fail builds that are perfectly sound.
+//
+// Since 2026-10-01 the `global_asm!` item is ALSO refused on its own, crate-level
+// (`trust_verify/link_level_code.rs`: assembly can define a symbol a linked crate
+// imports, or a load-time constructor, with no Rust call), so this crate carries a
+// third error. That error does not touch what this file pins: `scaled`'s two errors
+// are the poison's, and the warning is the poison's reason.
 use std::arch::global_asm;
 
 global_asm!("");
+//~^ ERROR Trust verification cannot accept global assembly
 
 fn scaled(x: u32, divisor: u32) -> u32 { //~ ERROR Level 0 safety verification incomplete
     //~| ERROR Trust strict verification failed for
     x / divisor
 }
 
+// The spawn census refuses `api` as UNKNOWN (design 2026-09-29-spawn-census-by-construction
+// §14: crates using assembly are refused wholesale): module-level assembly is foreign code
+// that may call any function it names by `sym`, so every call into foreign code reaches an
+// UNKNOWN sink, and a sink leaves every indirect call unclosed, the panic hook's included.
 #[inline]
-pub fn api(x: u32) -> u32 {
+pub fn api(x: u32) -> u32 { //~ ERROR Level 0 safety verification incomplete
+    //~| ERROR Trust strict verification failed for
     scaled(x, 4)
 }
 

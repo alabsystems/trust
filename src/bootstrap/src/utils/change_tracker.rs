@@ -641,4 +641,59 @@ pub const CONFIG_CHANGE_HISTORY: &[ChangeInfo] = &[
         severity: ChangeSeverity::Warning,
         summary: "The `[gcc]` config section is gone along with the GCC and Cranelift codegen backends. Remove `gcc.download-ci-gcc` / `gcc.libgccjit-libs-dir`, and drop \"gcc\" and \"cranelift\" from `rust.codegen-backends`.",
     },
+    ChangeInfo {
+        change_id: 158901,
+        severity: ChangeSeverity::Info,
+        summary: "New `rust.codegen-backends` value \"trust-ir-cg\": builds the trust-ir → trust-cg self-host backend from first-party/trust-cg as a dylib plugin and ships it in `codegen-backends/` (`-Zcodegen-backend=trust-ir-cg`).",
+    },
+    ChangeInfo {
+        change_id: 158912,
+        severity: ChangeSeverity::Info,
+        summary: "New config section `pgo` was introduced, to configure PGO profiling options. The `--rust-profile-use`/`--rust-profile-generate`/`--llvm-profile-use`/`--llvm-profile-generate` flags and the `rust.profile-use`/`rust.profile-generate` config options have been deprecated.",
+    },
+    ChangeInfo {
+        change_id: 155617,
+        severity: ChangeSeverity::Warning,
+        summary: "`jemalloc` options are replaced with `override-allocator` which take allocator names such as `jemalloc`",
+    },
+    ChangeInfo {
+        change_id: 159011,
+        severity: ChangeSeverity::Info,
+        summary: "A new `build.sde` configuration option has been added to support intrinsic-test.",
+    },
+    ChangeInfo {
+        change_id: 159455,
+        severity: ChangeSeverity::Warning,
+        summary: "GDB and LLDB are no longer automatically discovered from the environment. If you want to use path discovery for them, you can opt in using `build.gdb = \"discover\"` or `build.lldb = \"discover\"`.",
+    },
+    ChangeInfo {
+        change_id: 159878,
+        severity: ChangeSeverity::Warning,
+        summary: "Obsolete option `build.compiletest-use-stage0-libtest` has no effect and has been removed.",
+    },
+    ChangeInfo {
+        change_id: 160142,
+        severity: ChangeSeverity::Warning,
+        summary: "The `rust.use-lld` option has been removed. Use `rust.bootstrap-override-lld` instead.",
+    },
+    ChangeInfo {
+        change_id: 160100,
+        severity: ChangeSeverity::Warning,
+        summary: "The `override-allocator` option has been renamed: The global setting is now `build.allocator` and the per-target setting is `target.<target>.allocator`. It can now be set to 'system' to explicitly request the system allocator.",
+    },
+    ChangeInfo {
+        change_id: 162423,
+        severity: ChangeSeverity::Warning,
+        summary: "You should now use `x install rust-src` instead of `x install src` to install the standard library source component. If you want to install it as part of a custom `build.tools` set, include `rust-src` in `build.tools.",
+    },
+    ChangeInfo {
+        change_id: 158902,
+        severity: ChangeSeverity::Info,
+        summary: "A dev stage-1 build's version (`trustc -vV` commit-hash and commit-date) now names its sources, not HEAD, so a commit that changes only docs/, reports/, scripts/, tests/ or top-level Markdown rebuilds neither the compiler nor std nor targo (tippy and rust-analyzer still rebuild), while each uncommitted edit elsewhere changes the version. A build whose sources git cannot name stops. Stage 2, `x dist` and `x install` keep the commit. New option `rust.trust-source-identity = false` keeps it at every stage; `build/trust-source-identity` says what an identity names.",
+    },
+    ChangeInfo {
+        change_id: 163731,
+        severity: ChangeSeverity::Info,
+        summary: "A new option `llvm.tpde` has been added to control whether the TPDE pass plugin should be built as an experimental alternative LLVM backend.",
+    },
 ];

@@ -16,6 +16,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aho-corasick"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -115,7 +124,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ay"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-allsat",
  "ay-chc",
@@ -134,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "ay-allsat"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-sat",
  "tracing",
@@ -142,27 +151,44 @@ dependencies = [
 
 [[package]]
 name = "ay-arrays"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "num-bigint",
+ "thiserror",
  "tracing",
 ]
 
 [[package]]
 name = "ay-bv"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
+ "ay-arrays",
  "ay-core",
  "ay-sys",
  "num-bigint",
  "stacker",
+ "thiserror",
  "tracing",
 ]
 
 [[package]]
+name = "ay-cdclt"
+version = "0.28.0"
+dependencies = [
+ "ay-core",
+ "ay-diff-logic",
+ "ay-lra",
+ "ay-sat",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
+]
+
+[[package]]
 name = "ay-chc"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -170,9 +196,12 @@ dependencies = [
  "ay-dispatch",
  "ay-dpll",
  "ay-euf",
+ "ay-fp",
  "ay-frontend",
  "ay-jit",
  "ay-lia",
+ "ay-lra",
+ "ay-model-check",
  "ay-sat",
  "ay-sys",
  "num-bigint",
@@ -190,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "ay-core"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-sys",
  "foldhash 0.1.5",
@@ -206,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "ay-count"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -220,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "ay-diff-logic"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "num-bigint",
  "num-rational",
@@ -229,17 +258,18 @@ dependencies = [
 
 [[package]]
 name = "ay-dispatch"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "rustc-hash 2.1.2",
 ]
 
 [[package]]
 name = "ay-dpll"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-arrays",
  "ay-bv",
+ "ay-cdclt",
  "ay-core",
  "ay-diff-logic",
  "ay-drat-check",
@@ -275,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "ay-drat-check"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-proof-common",
  "ay-sys",
@@ -285,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "ay-dt"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "ay-euf",
@@ -294,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "ay-euf"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "hashbrown 0.15.5",
@@ -304,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "ay-fp"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -315,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "ay-frontend"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "logos 0.15.1",
@@ -328,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "ay-intsat"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -338,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "ay-jit"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "serde",
@@ -347,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "ay-lia"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "ay-intsat",
@@ -361,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "ay-lra"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "ay-jit",
@@ -376,14 +406,14 @@ dependencies = [
 
 [[package]]
 name = "ay-map"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-milp"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-dpll",
  "ay-lra",
@@ -403,25 +433,26 @@ dependencies = [
 
 [[package]]
 name = "ay-model-check"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "num-bigint",
  "num-integer",
  "num-rational",
  "num-traits",
+ "thiserror",
 ]
 
 [[package]]
 name = "ay-multiset"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-nia"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "ay-lia",
@@ -438,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "ay-nonlinear-common"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "num-rational",
  "num-traits",
@@ -446,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "ay-nra"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "ay-lra",
@@ -457,17 +488,17 @@ dependencies = [
  "num-rational",
  "num-traits",
  "stacker",
+ "thiserror",
  "tracing",
 ]
 
 [[package]]
 name = "ay-pb-core"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "ay-sat",
  "ay-sys",
- "libc",
  "num-bigint",
  "num-rational",
  "num-traits",
@@ -481,31 +512,33 @@ dependencies = [
 
 [[package]]
 name = "ay-prefetch"
-version = "0.22.0"
+version = "0.28.0"
 
 [[package]]
 name = "ay-proof"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "ay-sat",
  "num-bigint",
+ "num-integer",
  "num-rational",
  "num-traits",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-proof-common"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ay-sat"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "ay-drat-check",
@@ -528,11 +561,11 @@ dependencies = [
 
 [[package]]
 name = "ay-sat-congruence-core"
-version = "0.22.0"
+version = "0.28.0"
 
 [[package]]
 name = "ay-seq"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -540,14 +573,14 @@ dependencies = [
 
 [[package]]
 name = "ay-set"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-strings"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -556,15 +589,18 @@ dependencies = [
 
 [[package]]
 name = "ay-sys"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "libc",
+ "nix",
+ "trust-exec-policy",
+ "wait-timeout",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "ay-translate"
-version = "0.22.0"
+version = "0.28.0"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -653,6 +689,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
+dependencies = [
+ "memchr",
+ "serde_core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -685,13 +731,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "cargo-util"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "core-foundation",
+ "filetime",
+ "hex",
+ "ignore",
+ "jobserver_utils",
+ "libc",
+ "miow",
+ "portable-atomic",
+ "same-file",
+ "sha2 0.11.0",
+ "shell-escape",
+ "tempfile 3.27.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tracing",
+ "trust-resource-provenance",
+ "walkdir",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d262e149917187838d5b42777c8253bcb64500067342904e7d429499a6f277e"
 dependencies = [
  "find-msvc-tools",
- "jobserver",
+ "jobserver 0.1.35 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc",
  "shlex",
 ]
@@ -701,6 +770,12 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cfg_aliases"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chrono"
@@ -758,7 +833,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clean-auto"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "ay",
@@ -785,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "clean-ck0"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -794,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "clean-compiler"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clean-kernel",
  "serde",
@@ -803,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "clean-elab"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clean-auto",
@@ -829,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "clean-kernel"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -850,15 +925,16 @@ dependencies = [
 
 [[package]]
 name = "clean-macro"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "clean-kernel",
+ "clean-parser",
  "thiserror",
 ]
 
 [[package]]
 name = "clean-olean"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -867,9 +943,11 @@ dependencies = [
  "constant_time_eq 0.5.0",
  "hashbrown 0.17.1",
  "libc",
+ "num-bigint",
  "rayon",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "smallvec",
  "thiserror",
  "tracing",
@@ -878,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "clean-parser"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clean-kernel",
  "serde",
@@ -888,19 +966,19 @@ dependencies = [
 
 [[package]]
 name = "clean-runtime"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
- "cc",
  "thiserror",
 ]
 
 [[package]]
 name = "clean-tla"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clean-auto",
  "clean-elab",
  "clean-kernel",
+ "clean-parser",
  "glob",
  "serde",
  "serde_json",
@@ -910,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "clean-verify"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "blake3",
  "clean-elab",
@@ -947,6 +1025,16 @@ name = "constant_time_eq"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a1ec0cfec728a79a5109075543131387f911cb4d07716436d7ae20533657a96"
+
+[[package]]
+name = "core-foundation"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
 
 [[package]]
 name = "core-foundation-sys"
@@ -1105,7 +1193,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1113,6 +1201,16 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -1208,6 +1306,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
+name = "globset"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1242,6 +1353,12 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "httparse"
@@ -1283,6 +1400,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignore"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00b69833ed729dc5aa7d19541d96d6cf8e9137194207a04916d658e43168402f"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 dependencies = [
@@ -1315,10 +1448,26 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jobserver"
 version = "0.1.35"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
+name = "jobserver"
+version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
 dependencies = [
  "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
+name = "jobserver_utils"
+version = "0.0.0"
+dependencies = [
+ "jobserver 0.1.35",
  "libc",
 ]
 
@@ -1473,12 +1622,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "miow"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1577,6 +1747,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1661,6 +1837,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex-automata"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1705,7 +1892,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1713,6 +1900,15 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
+]
 
 [[package]]
 name = "scopeguard"
@@ -1851,6 +2047,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell-escape"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45bb67a18fa91266cc7807181f62f9178a6873bfad7dc788c42e6430db40184f"
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1960,10 +2162,10 @@ name = "tempfile"
 version = "3.27.0"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1973,10 +2175,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2016,7 +2218,7 @@ dependencies = [
 
 [[package]]
 name = "tla-arc"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "serde",
  "stable_deref_trait",
@@ -2024,7 +2226,7 @@ dependencies = [
 
 [[package]]
 name = "tla-arena"
-version = "0.14.0"
+version = "1.20261110.1"
 
 [[package]]
 name = "tla-ariadne"
@@ -2036,14 +2238,14 @@ dependencies = [
 
 [[package]]
 name = "tla-backend"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "tla-mc-core",
 ]
 
 [[package]]
 name = "tla-check"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "ahash",
  "chrono",
@@ -2076,7 +2278,10 @@ dependencies = [
  "tla-jit-abi",
  "tla-lock",
  "tla-mc-core",
+ "tla-model-normalizer",
  "tla-resource",
+ "tla-shapes",
+ "tla-shapes-families",
  "tla-smallvec",
  "tla-stack",
  "tla-tir",
@@ -2089,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "tla-core"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "crossbeam-epoch",
  "indexmap 2.14.0",
@@ -2100,22 +2305,24 @@ dependencies = [
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tla-ariadne",
  "tla-im",
  "tla-lock",
+ "tla-stack",
 ]
 
 [[package]]
 name = "tla-dialect"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "tla-eval"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "indexmap 2.14.0",
  "num-bigint",
@@ -2134,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "tla-im"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "bitmaps",
  "rand_core",
@@ -2147,12 +2354,16 @@ dependencies = [
 
 [[package]]
 name = "tla-ir"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
+ "clean-kernel",
  "num-traits",
+ "sha2 0.10.9",
  "thiserror",
  "tla-core",
+ "tla-im",
  "tla-jit-abi",
+ "tla-model-ir",
  "tla-tir",
  "tla-value",
  "trust-ir",
@@ -2161,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "tla-jit-abi"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "num-traits",
  "serde",
@@ -2174,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "tla-lock"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "tla-lock-api",
  "tla-lock-core",
@@ -2182,14 +2393,14 @@ dependencies = [
 
 [[package]]
 name = "tla-lock-api"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "scopeguard",
 ]
 
 [[package]]
 name = "tla-lock-core"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "cfg-if",
  "libc",
@@ -2200,29 +2411,89 @@ dependencies = [
 
 [[package]]
 name = "tla-mc-core"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "crossbeam",
  "rustc-hash 2.1.2",
+ "sha2 0.10.9",
  "thiserror",
  "tla-lock",
  "tla-smallvec",
 ]
 
 [[package]]
+name = "tla-mc-native"
+version = "1.20261110.1"
+dependencies = [
+ "tla-native-abi",
+ "trust-ir",
+ "trust-ir-build",
+]
+
+[[package]]
+name = "tla-model-ir"
+version = "1.20261110.1"
+dependencies = [
+ "tla-shapes",
+]
+
+[[package]]
+name = "tla-model-ir-exec"
+version = "1.20261110.1"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "tla-core",
+ "tla-eval",
+ "tla-model-ir",
+ "tla-value",
+]
+
+[[package]]
+name = "tla-model-normalizer"
+version = "1.20261110.1"
+dependencies = [
+ "num-traits",
+ "tla-core",
+ "tla-eval",
+ "tla-ir",
+ "tla-model-ir-exec",
+ "tla-tir",
+ "tla-value",
+]
+
+[[package]]
+name = "tla-native-abi"
+version = "1.20261110.1"
+
+[[package]]
 name = "tla-resource"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "tla-rp"
-version = "0.14.0"
+version = "1.20261110.1"
+
+[[package]]
+name = "tla-shapes"
+version = "1.20261110.1"
+
+[[package]]
+name = "tla-shapes-families"
+version = "1.20261110.1"
+dependencies = [
+ "tla-core",
+ "tla-shapes",
+ "tla-value",
+ "xxhash-rust 0.8.15",
+]
 
 [[package]]
 name = "tla-smallvec"
-version = "0.14.0"
+version = "1.20261110.1"
 
 [[package]]
 name = "tla-stack"
@@ -2237,10 +2508,12 @@ dependencies = [
 
 [[package]]
 name = "tla-tir"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
+ "num-bigint",
  "num-traits",
  "rustc-hash 2.1.2",
+ "sha2 0.10.9",
  "thiserror",
  "tla-core",
  "tla-value",
@@ -2248,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "tla-trust-cg"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "libloading",
  "num-bigint",
@@ -2257,9 +2530,12 @@ dependencies = [
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror",
  "tla-core",
+ "tla-eval",
  "tla-ir",
  "tla-jit-abi",
+ "tla-mc-native",
  "tla-resource",
+ "tla-shapes-families",
  "tla-tir",
  "tla-value",
  "trust-cg-codegen",
@@ -2274,7 +2550,7 @@ dependencies = [
 
 [[package]]
 name = "tla-value"
-version = "0.14.0"
+version = "1.20261110.1"
 dependencies = [
  "dashmap",
  "indexmap 2.14.0",
@@ -2303,19 +2579,7 @@ dependencies = [
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
- "tokio-macros",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tokio-macros"
-version = "2.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.3",
 ]
 
 [[package]]
@@ -2418,8 +2682,9 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-codegen"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
+ "libc",
  "rayon",
  "serde",
  "serde_json",
@@ -2427,6 +2692,7 @@ dependencies = [
  "thiserror",
  "trust-cg-dialect",
  "trust-cg-ir",
+ "trust-cg-irmid",
  "trust-cg-lower",
  "trust-cg-opt",
  "trust-cg-process-env",
@@ -2438,46 +2704,61 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-dialect"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-drat-trim"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "trust-cg-ir"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
 ]
 
 [[package]]
+name = "trust-cg-irmid"
+version = "0.7.0"
+dependencies = [
+ "serde_json",
+ "trust-cg-ir",
+ "trust-cg-opt",
+ "trust-cg-verify",
+ "trust-ir",
+]
+
+[[package]]
 name = "trust-cg-jit-matrix"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tempfile 3.27.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror",
  "trust-cg-codegen",
  "trust-cg-ir",
+ "trust-cg-lower",
  "trust-cg-process-env",
+ "trust-cg-verify",
  "trust-ir",
  "trust-ir-build",
 ]
 
 [[package]]
 name = "trust-cg-lower"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -2488,7 +2769,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-opt"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2500,14 +2781,15 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-process-env"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "libc",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "trust-cg-regalloc"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "thiserror",
  "trust-cg-ir",
@@ -2515,8 +2797,11 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-verify"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
+ "clean-kernel",
+ "clean-olean",
+ "libc",
  "rayon",
  "serde",
  "serde_json",
@@ -2529,11 +2814,26 @@ dependencies = [
  "trust-cg-opt",
  "trust-cg-process-env",
  "trust-ir",
+ "zstd",
+]
+
+[[package]]
+name = "trust-exec-policy"
+version = "0.13.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "trust-fs-acl"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
 name = "trust-ir"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-kernel",
@@ -2543,30 +2843,63 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-build"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "clean-kernel",
  "rayon",
  "trust-ir",
  "trust-ir-giveback",
+ "trust-ir-laws",
 ]
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "trust-ir",
 ]
 
 [[package]]
+name = "trust-ir-laws"
+version = "0.14.0"
+dependencies = [
+ "trust-ir",
+]
+
+[[package]]
+name = "trust-json"
+version = "0.14.0"
+
+[[package]]
+name = "trust-model-prelude"
+version = "0.14.0"
+
+[[package]]
+name = "trust-resource-provenance"
+version = "0.13.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "trust-fs-acl",
+ "trust-sha2",
+]
+
+[[package]]
+name = "trust-sha2"
+version = "0.14.0"
+
+[[package]]
 name = "trust-spec-temporal"
 version = "0.1.0"
 dependencies = [
+ "cargo-util",
  "clean-elab",
  "clean-kernel",
  "clean-parser",
  "clean-tla",
  "clean-verify",
+ "libc",
  "num-bigint",
  "serde",
  "serde_json",
@@ -2575,6 +2908,19 @@ dependencies = [
  "tla-core",
  "trust-ir",
  "trust-ir-build",
+ "trust-model-prelude",
+ "trust-sha2",
+ "trust-stage-receipt",
+]
+
+[[package]]
+name = "trust-stage-receipt"
+version = "0.1.0"
+dependencies = [
+ "errno",
+ "libc",
+ "trust-json",
+ "trust-sha2",
 ]
 
 [[package]]
@@ -2630,6 +2976,25 @@ name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
+
+[[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "walkdir"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
+dependencies = [
+ "same-file",
+ "winapi-util",
+]
 
 [[package]]
 name = "wasi"
@@ -2689,6 +3054,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2916,7 +3290,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "ay-encode"
-version = "0.22.0"

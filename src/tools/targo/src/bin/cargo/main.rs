@@ -1,7 +1,3 @@
-use cargo::core::features;
-use cargo::util::network::http::http_handle;
-use cargo::util::network::http::needs_custom_http_transport;
-use cargo::util::{self, CargoResult, closest_msg, command_prelude};
 use cargo_util::{ProcessBuilder, ProcessError};
 use cargo_util_schemas::manifest::StringOrVec;
 use cargo_util_terminal::Shell;
@@ -11,48 +7,425 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use targo::util::{self, CargoResult, closest_msg, command_prelude};
+use targo::workspace::features;
 
 mod cli;
 mod commands;
+// Trust: the toolchain owns native invocation admission policy.
+mod resource_capabilities;
+// Trust: build-tree administration is part of this program, before aliases.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod repo_lock;
+// Trust: the maintained Bootstrap engine stays inside this SAME managed image.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod bootstrap_runtime;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod resource_fixed;
+// Trust: manual cache cleanup runs the existing native Bootstrap judge.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod resource_prune;
 
 use crate::command_prelude::*;
-use cargo::util::file_identity::{
+use targo::util::file_identity::{
     OpenedFileIdentity, metadata_is_plain_file, opened_file_identity,
 };
 
+// A support declaration only. Host pre-GO reads this original image section;
+// native loaded-image/no-fork and authenticated live Ready remain mandatory.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C, align(8))]
+struct ResolverProtocolDeclaration([u8; 64]);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[used]
+#[unsafe(link_section = "__TEXT,__trust_resolve")]
+static RESOLVER_PROTOCOL_DECLARATION: ResolverProtocolDeclaration =
+    ResolverProtocolDeclaration(targo::resolver_service::PROTOCOL_MARKER);
+
+// Separate support declaration only; no saved marker/field grants custody.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C, align(8))]
+struct WorkloadProtocolDeclaration([u8; 64]);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[used]
+#[unsafe(link_section = "__TEXT,__trust_workload")]
+static WORKLOAD_PROTOCOL_DECLARATION: WorkloadProtocolDeclaration =
+    WorkloadProtocolDeclaration(targo::workload_service::PROTOCOL_MARKER);
+
+// Support declaration only. V1 startup remains full-width; partial return
+// additionally requires the original live Host/SDK, retained bank and SAME
+// GNU escrow. Reading these bytes creates no admission or capacity owner.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C, align(8))]
+struct PartialCpuProtocolDeclaration([u8; 64]);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[used]
+#[unsafe(link_section = "__TEXT,__trust_partial")]
+static PARTIAL_CPU_PROTOCOL_DECLARATION: PartialCpuProtocolDeclaration =
+    PartialCpuProtocolDeclaration(trust_resource_controller::workload::PARTIAL_CPU_PROTOCOL_MARKER);
+
+// Distinct paired protocol declaration only. Actual original root/SDK/all-N
+// startup and live Ready48/v2 remain mandatory before project configuration.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C, align(8))]
+struct PairedProtocolDeclaration([u8; 64]);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[used]
+#[unsafe(link_section = "__TEXT,__trust_pairqual")]
+static PAIRED_PROTOCOL_DECLARATION: PairedProtocolDeclaration =
+    PairedProtocolDeclaration(targo::paired_service::PROTOCOL_MARKER);
+
+// Trust: a distinct full general-DAG declaration. Actual live original SDK,
+// all-N resources, input/output owners and Ready48/v3 remain mandatory.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C, align(8))]
+struct NativeJobProtocolDeclaration([u8; 64]);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[used]
+#[unsafe(link_section = "__TEXT,__trust_jobroot")]
+static NATIVE_JOB_PROTOCOL_DECLARATION: NativeJobProtocolDeclaration =
+    NativeJobProtocolDeclaration(targo::native_job_service::PROTOCOL_MARKER);
+
+// Support for the exact original-root graph transport and first native object
+// leaf only. The compiled entry still requires live Host/GNU/SDK/Manager/output
+// owners and rejects every other producing selection before Steps. This image
+// declaration grants no SDK provenance, Ready, CPU, input or release authority.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C, align(8))]
+struct BootstrapGraphProtocolDeclaration([u8; 64]);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[used]
+#[unsafe(link_section = "__TEXT,__trust_bgraph")]
+static BOOTSTRAP_GRAPH_PROTOCOL_DECLARATION: BootstrapGraphProtocolDeclaration =
+    BootstrapGraphProtocolDeclaration(
+        trust_resource_controller::bootstrap_graph::BOOTSTRAP_GRAPH_PROTOCOL_MARKER,
+    );
+
 fn main() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    std::hint::black_box(&PARTIAL_CPU_PROTOCOL_DECLARATION);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(code) =
+        trust_build_tree::admission::cache_probe::private_entry(std::env::args_os().skip(1))
+    {
+        std::process::exit(code);
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if bootstrap_runtime::selected_at_entry(std::env::args_os().skip(1)) {
+        // SAFETY: original native entry, before descriptor imports, file
+        // creation or threads. Argument inspection allocates no descriptors.
+        // Frontend/Host authentication remains mandatory before engine entry.
+        unsafe { bootstrap::native_entry::clamp_creation_mask_at_entry() };
+    }
+    // Store7 is independent original Host discovery data. Snapshot before ANY
+    // GNU/SDK import can allocate/reuse a closed advertised slot.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let bootstrap_store_capture =
+        match bootstrap_runtime::snapshot_original_store_at_entry(std::env::args_os().skip(1)) {
+            Ok(capture) => capture,
+            Err(error) => {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+        };
+    // Trust: observation only, before GNU/SDK allocation can reuse a closed
+    // fixed packet/original slot. The actual checked importer runs later.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let fixed_exec_capture =
+        match resource_fixed::snapshot_exec(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+            Ok(capture) => capture,
+            Err(error) => {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+        };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let nested_fixed_capture =
+        match resource_fixed::snapshot_nested(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+            Ok(capture) => capture,
+            Err(error) => {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+        };
+    // Snapshot only native metadata: no descriptor allocation before the GNU
+    // import can validate its original numeric slots. The host maps SDK and
+    // scheduler/bootstrap targets disjointly before GO.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let sdk_capture = match targo::snapshot_sdk_lease() {
+        Ok(capture) => capture,
+        Err(error) => {
+            let mut shell = Shell::new();
+            targo::exit_with_error(error.into(), &mut shell);
+        }
+    };
+    #[cfg(unix)]
+    let workload_capture =
+        match targo::workload_service::snapshot_bootstrap(std::env::args_os().nth(1).as_deref()) {
+            Ok(capture) => capture,
+            Err(error) => {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+        };
+    // Trust: checked descriptor ownership must precede logging and frontend /
+    // proxy authentication, which open files and sockets. Do not rewrite the
+    // original environment: incoming fix-proxy claims authenticate its bytes.
+    // SAFETY: this is the native CLI's first descriptor-import operation;
+    // the preceding SDK snapshot allocates no descriptors.
+    if let Err(error) = unsafe { targo::context::initialize_jobserver() } {
+        let mut shell = Shell::new();
+        targo::exit_with_error(error.into(), &mut shell);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // SAFETY: only the fixed early scheduler importer ran after the snapshot;
+    // no logger, callback, configuration or probe can have reused the SDK slot.
+    if let Err(error) = unsafe { targo::capture_sdk_lease(sdk_capture) } {
+        let mut shell = Shell::new();
+        targo::exit_with_error(error.into(), &mut shell);
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    // SAFETY: all sources were snapshotted first. Only disjoint GNU3/4 and
+    // SDK5 importers ran; no logger/config/callback/thread can have reused7.
+    let bootstrap_store = match unsafe {
+        trust_resource_controller::client::bootstrap_graph::capture_host_store(
+            bootstrap_store_capture,
+        )
+    } {
+        Ok(original) => original,
+        Err(error) => {
+            let mut shell = Shell::new();
+            targo::exit_with_error(error.into(), &mut shell);
+        }
+    };
+    #[cfg(unix)]
+    // SAFETY: original SDK/workload locators were snapshotted before any FD
+    // allocation; only the fixed GNU/SDK importers ran. Their mapped sources
+    // are disjoint, and no config/logger/callback/thread can have reused them.
+    let workload_bootstrap =
+        match unsafe { targo::workload_service::capture_bootstrap(workload_capture) } {
+            Ok(capture) => capture,
+            Err(error) => {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+        };
+    targo::initialize_build_metadata();
     let _guard = setup_logger();
 
     // Trust: this binary is installed under two names with different authority.
     // Which one was invoked has to be settled before anything reads argv or
     // configuration, because every later decision keys off it.
-    if let Err(error) = cargo::validate_frontend_invocation() {
+    if let Err(error) = targo::validate_frontend_invocation() {
         let mut shell = Shell::new();
-        cargo::exit_with_error(
+        targo::exit_with_error(
             anyhow::format_err!("could not authenticate Cargo/Targo frontend identity: {error}")
                 .into(),
             &mut shell,
         );
     }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if bootstrap_runtime::selected_at_entry(std::env::args_os().skip(1))
+        && !targo::is_targo_invocation()
+    {
+        let mut shell = Shell::new();
+        targo::exit_with_error(
+            anyhow::anyhow!("original Bootstrap graph requires the actual Targo frontend").into(),
+            &mut shell,
+        );
+    }
+
+    // Distinct live cooperative workload entry before aliases, project
+    // configuration, completion handling or compiler queries. Older images
+    // have no declaration; supported images still require actual48/49, same
+    // original SDK/full canonical CPU set/output and the mandatory executor.
+    #[cfg(unix)]
+    {
+        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        let requested = targo::is_targo_invocation() && targo::workload_service::requested(&args);
+        let paired_requested =
+            targo::is_targo_invocation() && targo::paired_service::requested(&args);
+        let native_job_requested =
+            targo::is_targo_invocation() && targo::native_job_service::requested(&args);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let coordinator_requested = targo::is_targo_invocation()
+            && targo::compiler::candidate_coordinator::requested(&args);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let coordinator_requested = false;
+        if workload_bootstrap.is_present()
+            && !requested
+            && !paired_requested
+            && !native_job_requested
+            && !coordinator_requested
+        {
+            let mut shell = Shell::new();
+            targo::exit_with_error(
+                anyhow::anyhow!(
+                    "original workload bootstrap cannot enter another frontend purpose"
+                )
+                .into(),
+                &mut shell,
+            );
+        }
+        if native_job_requested {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            std::hint::black_box(&NATIVE_JOB_PROTOCOL_DECLARATION);
+            if let Err(error) = targo::native_job_service::run(&args, workload_bootstrap, || {
+                configure_trust_execution_policy("build", false, true)
+            }) {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+            return;
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if coordinator_requested {
+            if let Err(error) =
+                targo::compiler::candidate_coordinator::run(&args, workload_bootstrap, || {
+                    configure_trust_execution_policy("build", false, true)
+                })
+            {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+            return;
+        }
+        if paired_requested {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            std::hint::black_box(&PAIRED_PROTOCOL_DECLARATION);
+            if let Err(error) = targo::paired_service::run(&args, workload_bootstrap, || {
+                configure_trust_execution_policy("test", false, true)
+            }) {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+            return;
+        }
+        if requested {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            std::hint::black_box(&WORKLOAD_PROTOCOL_DECLARATION);
+            if let Err(error) = targo::workload_service::run(&args, workload_bootstrap, || {
+                configure_trust_execution_policy("test", false, true)
+            }) {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+            return;
+        }
+    }
+
+    // Trust: this closed in-process producer route precedes aliases/project
+    // configuration. It never executes a standalone Bootstrap image.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if targo::is_targo_invocation() {
+        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if let Some(result) = bootstrap_runtime::dispatch(&args, bootstrap_store) {
+            if let Err(error) = result {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+            return;
+        }
+    }
+
+    // Trust: standalone native fixed admission precedes project configuration.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if targo::is_targo_invocation() {
+        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if let Some(result) =
+            resource_fixed::dispatch(&args, fixed_exec_capture, nested_fixed_capture)
+        {
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(error) => {
+                    let mut shell = Shell::new();
+                    targo::exit_with_error(error.into(), &mut shell);
+                }
+            }
+        }
+    }
+
+    // Trust: exact read-only capability query. Keep it before configuration,
+    // private root sockets, aliases and any build/proof operation.
+    if targo::is_targo_invocation()
+        && resource_capabilities::respond(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    {
+        return;
+    }
+
+    // Distinct native full resolver entry before project/config/lane parsing.
+    #[cfg(unix)]
+    if targo::is_targo_invocation()
+        && targo::resolver_service::requested(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        std::hint::black_box(&RESOLVER_PROTOCOL_DECLARATION);
+        if let Err(error) =
+            targo::resolver_service::run(&std::env::args_os().skip(1).collect::<Vec<_>>(), || {
+                configure_trust_execution_policy("metadata", false, false)
+            })
+        {
+            let mut shell = Shell::new();
+            targo::exit_with_error(error.into(), &mut shell);
+        }
+        return;
+    }
+
+    // Trust: closed metadata requests use the already captured SDK/GNU owners.
+    #[cfg(unix)]
+    if targo::is_targo_invocation()
+        && targo::metadata_service::requested(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    {
+        if let Err(error) =
+            targo::metadata_service::run(&std::env::args_os().skip(1).collect::<Vec<_>>())
+        {
+            let mut shell = Shell::new();
+            targo::exit_with_error(error.into(), &mut shell);
+        }
+        return;
+    }
+
+    // Retain the original verified compiler child before any project code or
+    // configuration can run. The private argv selector is not authority: the
+    // protocol must capture the actual socket and authenticate its session.
+    let retained_test = match capture_retained_test() {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            let mut shell = Shell::new();
+            targo::exit_with_error(error.into(), &mut shell);
+        }
+    };
+
+    // Trust: own and contain the actual private root socket before aliases,
+    // project configuration, completion handling or any configured child exec.
+    let root_control = match capture_root_control() {
+        Ok(control) => control,
+        Err(error) => {
+            let mut shell = Shell::new();
+            targo::exit_with_error(error.into(), &mut shell);
+        }
+    };
 
     // Trust: `cargo fix` re-enters this executable as a rustc proxy. An ambient
     // `__CARGO_FIX_PLZ` used to bypass CLI lane selection entirely. Authenticate
     // the branded parent handoff before configuration, completion handling, or
     // argv-selected compiler parsing. Ordinary Cargo retains its upstream
     // marker behavior.
-    let fix_proxy_lock_addr = cargo::ops::prepare_fix_proxy_dispatch().unwrap_or_else(|error| {
+    let fix_proxy_lock_addr = targo::ops::prepare_fix_proxy_dispatch().unwrap_or_else(|error| {
         let mut shell = Shell::new();
-        cargo::exit_with_error(error.into(), &mut shell)
+        targo::exit_with_error(error.into(), &mut shell)
     });
 
     // Trust: `$CARGO` descendants of an explicitly unverified Targo build
     // re-enter this binary without the ancestor's CLI arguments. Authenticate
     // a live exchange with that exact ancestor before project/user
-    // configuration can influence command parsing. The abstract socket address
-    // is inert.
-    if let Err(error) = cargo::prepare_nested_unverified_targo_handoff() {
+    // configuration can influence command parsing. The socket address is
+    // inert: one that does not authenticate grants nothing, and only a compile
+    // verb naming no lane is then refused (T14c, T14-EXPORT-1). What stops
+    // startup here is an internal invariant, never the endpoint.
+    if let Err(error) = targo::prepare_nested_unverified_targo_handoff() {
         let mut shell = Shell::new();
-        cargo::exit_with_error(
+        targo::exit_with_error(
             anyhow::format_err!(
                 "could not authenticate nested-unverified Targo authority: {error}"
             )
@@ -61,13 +434,54 @@ fn main() {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if targo::is_targo_invocation() {
+        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if repo_lock::requested(&args) {
+            if retained_test.is_some() || root_control.is_some() || fix_proxy_lock_addr.is_some() {
+                let mut shell = Shell::new();
+                targo::exit_with_error(
+                    anyhow::anyhow!(
+                        "native build-tree administration cannot replace an original retained, root-control or fix-proxy purpose"
+                    )
+                    .into(),
+                    &mut shell,
+                );
+            }
+            std::process::exit(i32::from(repo_lock::run(&args)));
+        }
+    }
+
     let mut gctx = match GlobalContext::default() {
         Ok(gctx) => gctx,
         Err(e) => {
             let mut shell = Shell::new();
-            cargo::exit_with_error(e.into(), &mut shell)
+            targo::exit_with_error(e.into(), &mut shell)
         }
     };
+    #[cfg(unix)]
+    if let Some(endpoint) = retained_test {
+        if fix_proxy_lock_addr.is_some() {
+            targo::exit_with_error(
+                anyhow::anyhow!("retained tests cannot enter a fix proxy").into(),
+                &mut *gctx.shell(),
+            );
+        }
+        if let Err(error) = gctx.install_retained_test(endpoint) {
+            targo::exit_with_error(error.into(), &mut *gctx.shell());
+        }
+    }
+    if let Some(control) = root_control {
+        if fix_proxy_lock_addr.is_some() {
+            targo::exit_with_error(
+                anyhow::anyhow!("private root control cannot enter a fix proxy").into(),
+                &mut *gctx.shell(),
+            );
+        }
+        if let Err(error) = gctx.install_root_control(control) {
+            targo::exit_with_error(error.into(), &mut *gctx.shell());
+        }
+    }
 
     let nightly_features_allowed =
         features::nightly_features_allowed_on_channel(&features::channel());
@@ -84,7 +498,7 @@ fn main() {
             .try_complete(args, current_dir.as_deref())
             .unwrap_or_else(|e| {
                 let mut shell = Shell::new();
-                cargo::exit_with_error(e.into(), &mut shell)
+                targo::exit_with_error(e.into(), &mut shell)
             })
         {
             return;
@@ -92,15 +506,322 @@ fn main() {
     }
 
     let result = if let Some(lock_addr) = fix_proxy_lock_addr {
-        cargo::ops::fix_exec_rustc(&gctx, &lock_addr).map_err(|e| CliError::from(e))
+        targo::ops::fix_exec_rustc(&gctx, &lock_addr).map_err(|e| CliError::from(e))
     } else {
-        let _token = cargo::util::job::setup();
+        let _token = targo::util::job::setup();
         cli::main(&mut gctx)
     };
 
+    #[cfg(unix)]
+    {
+        let completed = match gctx.take_completed_retained_test_endpoint() {
+            Ok(endpoint) => endpoint,
+            Err(error) if result.is_ok() => {
+                targo::exit_with_error(error.into(), &mut *gctx.shell());
+            }
+            // A startup/compiler failure retains the initial endpoint in gctx
+            // and follows its original error path without a completion claim.
+            Err(_) => None,
+        };
+        if let Some(mut endpoint) = completed {
+            if !endpoint.was_granted() {
+                match result {
+                    Err(error) => targo::exit_with_error(error, &mut *gctx.shell()),
+                    Ok(()) => targo::exit_with_error(
+                        anyhow::anyhow!("retained command succeeded without execution authority")
+                            .into(),
+                        &mut *gctx.shell(),
+                    ),
+                }
+            }
+            match endpoint.poll_parent_closed() {
+                Ok(false) => {}
+                result => {
+                    let error = match result {
+                        Ok(true) => std::io::Error::other(
+                            "retained controller closed before command completion",
+                        ),
+                        Err(error) => error,
+                        Ok(false) => unreachable!(),
+                    };
+                    targo::exit_with_error(error.into(), &mut *gctx.shell());
+                }
+            }
+            let exit_code = match result {
+                Ok(()) => 0,
+                Err(error) => targo::report_cli_error(error, &mut *gctx.shell()),
+            };
+            // Keep original endpoint custody through all normal destructors
+            // and reporting, including a settled failing harness. Only kernel
+            // process exit closes it; no Rust cleanup emits an early EOF.
+            drop(gctx);
+            drop(_guard);
+            use std::io::Write as _;
+            if let Err(error) = std::io::stdout()
+                .flush()
+                .and_then(|()| std::io::stderr().flush())
+            {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+            // This reports settlement, never an ExitStatus or favorable proof.
+            // The parent still observes this original child's actual code.
+            if let Err(error) = endpoint.publish_drained(endpoint.deadline()) {
+                let mut shell = Shell::new();
+                targo::exit_with_error(error.into(), &mut shell);
+            }
+            let _endpoint_through_os_exit = endpoint;
+            std::process::exit(exit_code);
+        }
+    }
     match result {
-        Err(e) => cargo::exit_with_error(e, &mut *gctx.shell()),
+        Err(error) => targo::exit_with_error(error, &mut *gctx.shell()),
         Ok(()) => {}
+    }
+}
+
+fn retained_test_requested(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> std::io::Result<bool> {
+    let args: Vec<_> = args.into_iter().take_while(|arg| arg != "--").collect();
+    let count = args
+        .iter()
+        .filter(|arg| *arg == "--__retained-test-session")
+        .count();
+    if count == 0 {
+        return Ok(false);
+    }
+    if count != 1
+        || args.first().is_none_or(|arg| arg != "test")
+        || !args.iter().any(|arg| arg == "--no-run")
+        || args
+            .iter()
+            .any(|arg| arg == "--__resource-root-control" || arg == "--unverified")
+    {
+        return Err(std::io::Error::other(
+            "retained tests require the original verified test --no-run command and exclusive stdin custody",
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "retained-test stdin custody must reject the live proxy selector before project configuration or an environment snapshot can replace that authorization input"
+)]
+fn capture_retained_test() -> std::io::Result<Option<trust_test_execution::retained::RetainedChild>>
+{
+    if !retained_test_requested(std::env::args_os().skip(1))? {
+        return Ok(None);
+    }
+    if !targo::is_targo_invocation() || std::env::var_os("__CARGO_FIX_PLZ").is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "retained tests require genuine Targo and exclusive non-proxy stdin",
+        ));
+    }
+    // This captures inert socket custody only. The ordinary CLI dispatcher
+    // remains the single owner of verified loader/policy initialization before
+    // configuration; the retained route is checked there after authentication.
+    trust_test_execution::retained::RetainedChild::capture_stdin(
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .map(Some)
+}
+
+/// Capturing stdin never grants a lane. Rebind that original custody to the
+/// actual native command only after the one ordinary policy initializer ran.
+pub(crate) fn validate_retained_test_dispatch(
+    captured: bool,
+    verified: bool,
+    command: &str,
+    private_compile_route: bool,
+    original_unverified: bool,
+) -> CargoResult<()> {
+    if captured {
+        anyhow::ensure!(
+            verified && command == "test" && private_compile_route && !original_unverified,
+            "retained endpoint requires authenticated verified native test --no-run dispatch"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn capture_retained_test() -> std::io::Result<Option<()>> {
+    if retained_test_requested(std::env::args_os().skip(1))? {
+        return Err(std::io::Error::other(
+            "retained verified tests require Unix socket custody",
+        ));
+    }
+    Ok(None)
+}
+
+// Trust: this is a narrow original-argv selector for the helper's fixed command,
+// not a second Cargo parser. It neither follows aliases nor reads configuration.
+fn root_control_requested(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> std::io::Result<bool> {
+    let args: Vec<_> = args.into_iter().take_while(|arg| arg != "--").collect();
+    let count = args
+        .iter()
+        .filter(|arg| *arg == "--__resource-root-control")
+        .count();
+    if count == 0 {
+        return Ok(false);
+    }
+    if count != 1
+        || args.first().is_none_or(|arg| arg != "--unverified")
+        || args.get(1).is_none_or(|arg| arg != "build")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private root control requires the original --unverified build command",
+        ));
+    }
+    Ok(true)
+}
+
+fn capture_root_control() -> std::io::Result<Option<targo::context::root_control::RootControl>> {
+    if !root_control_requested(std::env::args_os().skip(1))? {
+        return Ok(None);
+    }
+    if !targo::is_targo_invocation() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private root control requires genuine Targo",
+        ));
+    }
+    targo::context::root_control::RootControl::capture_stdin().map(Some)
+}
+
+#[cfg(test)]
+mod root_control_argv_tests {
+    use super::{retained_test_requested, root_control_requested, validate_retained_test_dispatch};
+
+    fn args(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter()
+            .map(|arg| std::ffi::OsString::from(*arg))
+            .collect()
+    }
+
+    #[test]
+    fn captured_endpoint_is_inert_until_the_single_dispatch_policy_authenticates() {
+        assert!(validate_retained_test_dispatch(true, true, "test", true, false).is_ok());
+        // A real endpoint or a private CLI spelling cannot replace verified
+        // loader authentication, change command, or select an unverified lane.
+        for (verified, command, private_route, unverified) in [
+            (false, "test", true, false),
+            (true, "build", true, false),
+            (true, "test", false, false),
+            (true, "test", true, true),
+        ] {
+            assert!(
+                validate_retained_test_dispatch(true, verified, command, private_route, unverified)
+                    .is_err()
+            );
+        }
+        assert!(validate_retained_test_dispatch(false, false, "build", false, true).is_ok());
+    }
+
+    #[test]
+    fn retained_test_custody_requires_original_verified_compile_route() {
+        assert!(
+            retained_test_requested(args(&["test", "--no-run", "--__retained-test-session"]))
+                .unwrap()
+        );
+        for input in [
+            vec![
+                "--unverified",
+                "test",
+                "--no-run",
+                "--__retained-test-session",
+            ],
+            vec!["test", "--__retained-test-session"],
+            vec!["build", "--no-run", "--__retained-test-session"],
+            vec![
+                "test",
+                "--no-run",
+                "--__retained-test-session",
+                "--__resource-root-control",
+            ],
+            vec![
+                "test",
+                "--no-run",
+                "--__retained-test-session",
+                "--__retained-test-session",
+            ],
+        ] {
+            assert!(retained_test_requested(args(&input)).is_err(), "{input:?}");
+        }
+        assert!(
+            !retained_test_requested(args(&["test", "--", "--__retained-test-session"])).unwrap()
+        );
+    }
+
+    #[test]
+    fn private_socket_selectors_treat_libtest_passthrough_as_opaque() {
+        let tail = [
+            "--",
+            "--skip",
+            "--__retained-test-session",
+            "--skip",
+            "--__resource-root-control",
+        ];
+        let mut ordinary = vec!["test", "--no-run"];
+        ordinary.extend(tail);
+        assert!(!retained_test_requested(args(&ordinary)).unwrap());
+        assert!(!root_control_requested(args(&ordinary)).unwrap());
+        let mut retained = vec!["test", "--no-run", "--__retained-test-session"];
+        retained.extend(tail);
+        assert!(retained_test_requested(args(&retained)).unwrap());
+        assert!(!root_control_requested(args(&retained)).unwrap());
+        let mut controlled = vec!["--unverified", "build", "--__resource-root-control"];
+        controlled.extend(tail);
+        assert!(root_control_requested(args(&controlled)).unwrap());
+        assert!(!retained_test_requested(args(&controlled)).unwrap());
+    }
+
+    #[test]
+    fn root_control_requires_original_build_and_stops_at_the_delimiter() {
+        assert!(
+            root_control_requested(args(&[
+                "--unverified",
+                "build",
+                "--offline",
+                "--__resource-root-control"
+            ]))
+            .unwrap()
+        );
+        assert!(
+            !root_control_requested(args(&[
+                "--unverified",
+                "build",
+                "--",
+                "--__resource-root-control"
+            ]))
+            .unwrap()
+        );
+        assert!(!root_control_requested(args(&["build", "--offline"])).unwrap());
+        assert!(
+            root_control_requested(args(&[
+                "--unverified",
+                "check",
+                "--__resource-root-control"
+            ]))
+            .is_err()
+        );
+        assert!(root_control_requested(args(&["build", "--__resource-root-control"])).is_err());
+        assert!(
+            root_control_requested(args(&[
+                "--unverified",
+                "build",
+                "--__resource-root-control",
+                "--__resource-root-control"
+            ]))
+            .is_err()
+        );
     }
 }
 
@@ -197,11 +918,11 @@ fn aliased_command(gctx: &GlobalContext, command: &str) -> CargoResult<Option<Ve
     // upstream's "user alias wins" rule is inverted for them. They must resolve
     // to the tool shipped beside the selected `targo`, never to a
     // workspace/CARGO_HOME alias an untrusted checkout can supply.
-    if !user_alias_allowed_for_invocation(cargo::is_targo_invocation(), command) {
+    if !user_alias_allowed_for_invocation(targo::is_targo_invocation(), command) {
         return Ok(None);
     }
     let alias_name = format!("alias.{}", command);
-    let user_alias = match gctx.get_string(&alias_name) {
+    let user_alias = match gctx.get_string(["alias", command]) {
         Ok(Some(record)) => Some(
             record
                 .val
@@ -210,7 +931,7 @@ fn aliased_command(gctx: &GlobalContext, command: &str) -> CargoResult<Option<Ve
                 .collect(),
         ),
         Ok(None) => None,
-        Err(_) => gctx.get::<Option<Vec<String>>>(&alias_name)?,
+        Err(_) => gctx.get::<Option<Vec<String>>>(["alias", command])?,
     };
 
     let result = user_alias.or_else(|| {
@@ -259,7 +980,7 @@ fn list_commands(gctx: &GlobalContext) -> BTreeMap<String, CommandInfo> {
         "help".to_string(),
         CommandInfo::BuiltIn {
             about: Some(
-                if cargo::is_targo_invocation() {
+                if targo::is_targo_invocation() {
                     "Displays help for a targo command"
                 } else {
                     "Displays help for a cargo command"
@@ -280,7 +1001,7 @@ fn list_commands(gctx: &GlobalContext) -> BTreeMap<String, CommandInfo> {
 #[allow(clippy::disallowed_methods, clippy::print_stderr)]
 pub(crate) fn maybe_warn_trust_compiler() {
     // Only nudge for the real targo frontend, never plain `cargo`.
-    if !cargo::is_targo_invocation() {
+    if !targo::is_targo_invocation() {
         return;
     }
     if env_to_bool(env::var_os("TRUST_NO_MIGRATE_WARN").as_deref()) {
@@ -304,7 +1025,7 @@ pub(crate) fn maybe_warn_trust_compiler() {
 fn trust_compiler_override_name(path: &Path) -> bool {
     ["trustc", "rustc"]
         .iter()
-        .any(|expected| cargo::trust_executable_path_matches(path, expected))
+        .any(|expected| targo::trust_executable_path_matches(path, expected))
 }
 
 /// Trust: the branded frontend never produces an artifact whose verification
@@ -335,16 +1056,32 @@ fn authorize_trust_execution(
     }
     if !is_targo || !(is_manifest_command || is_native_compilation_command(cmd)) {
         if is_targo && explicit_unverified {
-            anyhow::bail!("`--unverified` is valid only for a Targo compilation command");
+            // Trust: this branch also takes commands that do compile (`tippy`,
+            // `trust`, an external subcommand), so the reason names only what is
+            // true of all of them: none is in `is_native_compilation_command`.
+            let what = if cmd == "trust" {
+                "`targo trust` is the verified lane".to_string()
+            } else {
+                format!("`targo {cmd}` is not one")
+            };
+            anyhow::bail!(
+                "`--unverified` is valid only for a Targo compilation command (build, check, \
+                 test, run, ...); {what}, so run it without `--unverified`"
+            );
         }
         return Ok(TrustExecutionAuthorization::NotApplicable);
     }
 
-    if verified_marker && (explicit_unverified || inherited_unverified) {
+    if verified_marker && explicit_unverified {
         anyhow::bail!(
             "explicit-unverified Targo authority conflicts with the authenticated verified lane"
         );
     }
+    // Trust (T14c, DECISION_QUEUE T14-EXPORT-1): an explicit lane beats an
+    // inherited one. A tool or test under `targo --unverified` that runs
+    // `targo trust check` keeps its verified lane; the inherited authority is
+    // not re-exposed to that lane's children (`configure_nested_unverified_
+    // targo_child` exports it only from the unverified lane).
     if verified_marker {
         return Ok(TrustExecutionAuthorization::Verified);
     }
@@ -421,6 +1158,10 @@ fn authorize_trust_execution(
 /// notice — for them the flag answers no question and the daily toll builds
 /// the type-it-without-reading reflex this authorization exists to prevent.
 fn requires_explicit_lane(cmd: &str) -> bool {
+    // Trust: the private helper launches roots only with an explicit native lane.
+    if cmd == "__resource-epoch" {
+        return true;
+    }
     matches!(cmd, "install" | "package" | "publish" | "miri")
 }
 
@@ -497,28 +1238,36 @@ pub(crate) fn configure_trust_execution_policy(
     explicit_unverified: bool,
 ) -> CargoResult<()> {
     let verified_marker = env::var_os("TRUST_TARGO_VERIFY").as_deref() == Some(OsStr::new("1"));
-    let inherited_unverified = cargo::nested_unverified_targo_handoff_active();
+    let inherited_unverified = targo::nested_unverified_targo_handoff_active();
     let legacy_bootstrap_marker = env::var_os("TRUST_BOOTSTRAP_NO_VERIFY").is_some()
         || env::var_os("TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY").is_some();
-    match authorize_trust_execution(
-        cargo::is_targo_invocation(),
+    let authorization = authorize_trust_execution(
+        targo::is_targo_invocation(),
         cmd,
         is_manifest_command,
         explicit_unverified,
         inherited_unverified,
         verified_marker,
         legacy_bootstrap_marker,
-    )? {
+    )
+    .map_err(|error| {
+        withheld_authority_note(error, targo::withheld_nested_unverified_targo_authority())
+    })?;
+    match authorization {
         TrustExecutionAuthorization::Verified => {
-            cargo::validate_verified_targo_startup_loader_environment()
+            targo::validate_verified_targo_startup_loader_environment()
                 .map_err(anyhow::Error::msg)?;
-            cargo::set_trust_verified_targo(true);
+            targo::set_trust_verified_targo(true);
         }
+        #[expect(
+            clippy::print_stderr,
+            reason = "the explicit unverified authorization must report its no-proof status before ordinary Shell setup"
+        )]
         TrustExecutionAuthorization::ExplicitUnverified => {
             // Trust: this exact authorization match is the only place allowed
             // to create live nested-unverified authority.
-            cargo::start_explicit_unverified_targo_broker().map_err(anyhow::Error::msg)?;
-            cargo::set_trust_no_verify_fast(true);
+            targo::start_explicit_unverified_targo_broker().map_err(anyhow::Error::msg)?;
+            targo::set_trust_no_verify_fast(true);
             let invocation = if is_manifest_command {
                 format!("-Zscript {cmd}")
             } else {
@@ -540,8 +1289,12 @@ pub(crate) fn configure_trust_execution_policy(
                 "warning: UNVERIFIED: `targo {invocation}` {how}; this run emits no proof claim"
             );
         }
+        #[expect(
+            clippy::print_stderr,
+            reason = "inherited unverified authorization must disclose its no-proof status before ordinary Shell setup"
+        )]
         TrustExecutionAuthorization::InheritedExplicitUnverified => {
-            cargo::set_trust_no_verify_fast(true);
+            targo::set_trust_no_verify_fast(true);
             let invocation = if is_manifest_command {
                 format!("-Zscript {cmd}")
             } else {
@@ -556,10 +1309,25 @@ pub(crate) fn configure_trust_execution_policy(
     Ok(())
 }
 
+/// Trust (T14c): a refusal under an inherited endpoint that did not
+/// authenticate says so, since the reader most likely expected the ancestor's
+/// `--unverified` to carry over (a stale endpoint, another Targo build, or a
+/// root that exited).
+fn withheld_authority_note(error: anyhow::Error, withheld: Option<&str>) -> anyhow::Error {
+    match withheld {
+        Some(reason) => anyhow::format_err!(
+            "{error}\nnote: an inherited TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT granted \
+             nothing: {reason}"
+        ),
+        None => error,
+    }
+}
+
 fn is_native_compilation_command(cmd: &str) -> bool {
     matches!(
         cmd,
         "build"
+            | "__resource-epoch" // Trust: controlled native root transport.
             | "check"
             | "fix"
             | "clippy"
@@ -577,7 +1345,7 @@ fn is_native_compilation_command(cmd: &str) -> bool {
 }
 
 fn external_subcommand_prefixes() -> &'static [&'static str] {
-    external_subcommand_prefixes_for_invocation(cargo::is_targo_invocation())
+    external_subcommand_prefixes_for_invocation(targo::is_targo_invocation())
 }
 
 fn external_subcommand_prefixes_for_invocation(trust_invocation: bool) -> &'static [&'static str] {
@@ -593,7 +1361,7 @@ fn external_subcommand_prefixes_for_invocation(trust_invocation: bool) -> &'stat
 /// upstream writes as a `cargo` literal has to route through here instead, or
 /// the tool tells users to run a command that does not exist on their PATH.
 fn frontend_binary_name() -> &'static str {
-    if cargo::is_targo_invocation() {
+    if targo::is_targo_invocation() {
         "targo"
     } else {
         "cargo"
@@ -644,8 +1412,7 @@ fn third_party_subcommands(gctx: &GlobalContext) -> BTreeMap<String, CommandInfo
                 else {
                     continue;
                 };
-                if cargo::is_targo_invocation() && protected_trust_subcommand_binary(name).is_some()
-                {
+                if targo::is_targo_invocation() && PROTECTED_TRUST_SUBCOMMANDS.contains(&name) {
                     // Trust: upstream resolves external subcommands from PATH,
                     // which would let any directory on it supply `targo trust`.
                     // Protected names are added only from the selected
@@ -660,10 +1427,19 @@ fn third_party_subcommands(gctx: &GlobalContext) -> BTreeMap<String, CommandInfo
             }
         }
     }
-    if cargo::is_targo_invocation()
+    if targo::is_targo_invocation()
         && let Ok(frontend) = gctx.cargo_exe()
     {
         for command in PROTECTED_TRUST_SUBCOMMANDS {
+            if matches!(*command, "tippy" | "clippy") {
+                commands.insert(
+                    (*command).to_string(),
+                    CommandInfo::External {
+                        path: frontend.to_path_buf(),
+                    },
+                );
+                continue;
+            }
             if let Some(path) = protected_trust_subcommand_path(&frontend, command) {
                 commands.insert((*command).to_string(), CommandInfo::External { path });
             }
@@ -674,9 +1450,9 @@ fn third_party_subcommands(gctx: &GlobalContext) -> BTreeMap<String, CommandInfo
 
 fn user_defined_aliases(gctx: &GlobalContext) -> BTreeMap<String, CommandInfo> {
     let mut commands = BTreeMap::new();
-    if let Ok(aliases) = gctx.get::<BTreeMap<String, StringOrVec>>("alias") {
+    if let Ok(aliases) = gctx.get::<BTreeMap<String, StringOrVec>>(["alias"]) {
         for (name, target) in aliases.iter() {
-            if !user_alias_allowed_for_invocation(cargo::is_targo_invocation(), name.as_str()) {
+            if !user_alias_allowed_for_invocation(targo::is_targo_invocation(), name.as_str()) {
                 continue;
             }
             commands.insert(
@@ -691,7 +1467,10 @@ fn user_defined_aliases(gctx: &GlobalContext) -> BTreeMap<String, CommandInfo> {
 }
 
 fn find_external_subcommand(gctx: &GlobalContext, cmd: &str) -> Option<PathBuf> {
-    if cargo::is_targo_invocation() && protected_trust_subcommand_binary(cmd).is_some() {
+    if targo::is_targo_invocation() && matches!(cmd, "tippy" | "clippy") {
+        return gctx.cargo_exe().ok().map(Path::to_path_buf);
+    }
+    if targo::is_targo_invocation() && protected_trust_subcommand_binary(cmd).is_some() {
         let frontend = gctx.cargo_exe().ok()?;
         return protected_trust_subcommand_path(&frontend, cmd);
     }
@@ -730,7 +1509,6 @@ const PROTECTED_TRUST_SUBCOMMANDS: &[&str] = &["trust", "tippy", "clippy", "fmt"
 fn protected_trust_subcommand_binary(command: &str) -> Option<&'static str> {
     match command {
         "trust" => Some("targo-trust"),
-        "tippy" | "clippy" => Some("targo-tippy"),
         "fmt" => Some("targo-fmt"),
         "miri" => Some("targo-miri"),
         _ => None,
@@ -778,7 +1556,7 @@ fn trust_invocation_is_dev_gate(command: &str, args: &[&OsStr]) -> bool {
 }
 
 fn user_alias_allowed_for_invocation(trust_invocation: bool, command: &str) -> bool {
-    !trust_invocation || protected_trust_subcommand_binary(command).is_none()
+    !trust_invocation || !PROTECTED_TRUST_SUBCOMMANDS.contains(&command)
 }
 
 fn protected_trust_subcommand_path(frontend: &Path, command: &str) -> Option<PathBuf> {
@@ -1049,7 +1827,7 @@ impl ProtectedSubcommandGuard {
         // compiler instead.
         //
         // What replaces it is the substitution quantifier this codebase already
-        // states for pathname-backed execution (`cargo::util::process_authority`):
+        // states for pathname-backed execution (`targo::util::process_authority`):
         // no principal other than root or the invoking identity may be able to
         // swap the object. Replacing a symlink needs write access to the same
         // containing directory that replacing a directory needs, and both are
@@ -1106,7 +1884,10 @@ impl ProtectedSubcommandGuard {
 
     fn same_identity(&self, other: &Self) -> bool {
         self.executable.identity == other.executable.identity
-            && self.executable.snapshot.same_stable_identity(&other.executable.snapshot)
+            && self
+                .executable
+                .snapshot
+                .same_stable_identity(&other.executable.snapshot)
             && same_protected_directories(&self.directories, &other.directories)
             && same_protected_symlink_hops(&self.symlink_hops, &other.symlink_hops)
     }
@@ -1151,7 +1932,10 @@ fn protected_directory_ancestors(
 /// toolchain link abort an in-flight protected subcommand, which is exactly the
 /// defect `fix(targo): tolerate unrelated protected-ancestor churn` removed from
 /// the directory chain. The rename-shaped signature is still not tolerated.
-fn same_protected_symlink_hops(left: &[ProtectedSymlinkHop], right: &[ProtectedSymlinkHop]) -> bool {
+fn same_protected_symlink_hops(
+    left: &[ProtectedSymlinkHop],
+    right: &[ProtectedSymlinkHop],
+) -> bool {
     left.len() == right.len()
         && left.iter().zip(right).all(|(left, right)| {
             left.path == right.path
@@ -1283,7 +2067,7 @@ fn push_protected_path_components(
 }
 
 /// Trust: the substitution check for one symlink hop, the same quantifier
-/// `cargo::util::process_authority` applies to a pathname-backed execution
+/// `targo::util::process_authority` applies to a pathname-backed execution
 /// object — no principal other than root or the invoking identity may be able to
 /// replace it. Two things decide that for a symlink:
 ///
@@ -1297,7 +2081,10 @@ fn push_protected_path_components(
 /// symlink as `0o777` and ignores the bits entirely, so testing them would refuse
 /// every symlink on Linux while proving nothing on any platform.
 #[cfg(unix)]
-fn capture_protected_symlink_hop(path: &Path, parent: &Path) -> Result<ProtectedSymlinkHop, String> {
+fn capture_protected_symlink_hop(
+    path: &Path,
+    parent: &Path,
+) -> Result<ProtectedSymlinkHop, String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let invoking_uid = unsafe { libc::geteuid() };
@@ -1647,6 +2434,11 @@ fn metadata_is_executable(_metadata: &fs::Metadata) -> bool {
 }
 
 fn execute_external_subcommand(gctx: &GlobalContext, cmd: &str, args: &[&OsStr]) -> CliResult {
+    if targo::is_targo_invocation() && matches!(cmd, "tippy" | "clippy") {
+        return finish_guarded_protected_subcommand(targo::util::lint_frontend::run(
+            gctx, cmd, args,
+        ));
+    }
     let path = find_external_subcommand(gctx, cmd);
     let command = match path {
         Some(command) => command,
@@ -1680,13 +2472,14 @@ fn execute_external_subcommand(gctx: &GlobalContext, cmd: &str, args: &[&OsStr])
                     // exist — and `closest_msg` could not rescue it because the
                     // candidate list only holds commands whose binary RESOLVED,
                     // so `tippy` is absent precisely when the user needs it.
+                    //
                     "\n\nhelp: this toolchain ships the linter as `tippy`: run `targo tippy`"
                         .to_string()
                 } else {
                     closest_msg(cmd, suggestions.keys(), |c| c, "command")
                 };
                 let frontend = frontend_binary_name();
-                let package_prefix = if cargo::is_targo_invocation() {
+                let package_prefix = if targo::is_targo_invocation() {
                     "targo"
                 } else {
                     "cargo"
@@ -1702,7 +2495,7 @@ fn execute_external_subcommand(gctx: &GlobalContext, cmd: &str, args: &[&OsStr])
             return Err(CliError::new(err, 101));
         }
     };
-    let protected = cargo::is_targo_invocation()
+    let protected = targo::is_targo_invocation()
         && protected_trust_subcommand_binary(cmd).is_some()
         && !trust_invocation_is_dev_gate(cmd, args);
     execute_subcommand(gctx, Some(&command), args, protected)
@@ -1726,8 +2519,9 @@ fn execute_subcommand(
         Some(cmd_path) => ProcessBuilder::new(cmd_path),
         None => ProcessBuilder::new(&cargo_exe),
     };
-    cmd.env(cargo::CARGO_ENV, cargo_exe).args(args);
-    if let Some(client) = gctx.jobserver_from_env() {
+    cmd.env(targo::CARGO_ENV, cargo_exe).args(args);
+    targo::withhold_unauthenticated_nested_unverified_endpoint(&mut cmd);
+    if let Some(client) = gctx.jobserver_from_env()? {
         cmd.inherit_jobserver(client);
     }
 
@@ -1790,7 +2584,10 @@ fn finish_guarded_protected_subcommand(
 ) -> CliResult {
     let status = outcome
         .map_err(|error| {
-            CliError::new(anyhow::format_err!(error), PROTECTED_SUBCOMMAND_AUTHORITY_EXIT)
+            CliError::new(
+                anyhow::format_err!(error),
+                PROTECTED_SUBCOMMAND_AUTHORITY_EXIT,
+            )
         })?
         // A spawn-level io error genuinely is "cargo could not execute the
         // tool", which is cargo's own 101 convention.
@@ -1858,7 +2655,7 @@ fn search_directories(gctx: &GlobalContext) -> Vec<PathBuf> {
     // This directory must be first: inserting CARGO_HOME after it used to let a
     // stale or attacker-controlled `~/.cargo/bin/targo-trust` shadow the
     // verifier bundled with the selected Trust toolchain.
-    if cargo::is_targo_invocation()
+    if targo::is_targo_invocation()
         && let Ok(frontend_exe) = gctx.cargo_exe()
         && let Some(current_bin) = frontend_exe.parent()
     {
@@ -1876,23 +2673,33 @@ fn search_directories(gctx: &GlobalContext) -> Vec<PathBuf> {
 #[cfg(test)]
 mod trust_tests {
     use super::{
-        requires_explicit_lane,
         AuthenticatedProtectedSubcommand, PROTECTED_SUBCOMMAND_AUTHORITY_EXIT,
         TrustExecutionAuthorization, authorize_trust_execution, env_to_bool,
         external_subcommand_prefixes_for_invocation, finish_guarded_protected_subcommand,
         is_native_compilation_command, protected_trust_subcommand_binary,
-        protected_trust_subcommand_path, subcommand_exit_status_code,
+        protected_trust_subcommand_path, requires_explicit_lane, subcommand_exit_status_code,
         trust_compiler_override_name, trust_invocation_is_dev_gate, unauthorized_lane_message,
-        user_alias_allowed_for_invocation, verified_trust_lane_for,
+        user_alias_allowed_for_invocation, verified_trust_lane_for, withheld_authority_note,
     };
-    use cargo::CargoResult;
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus};
     use std::sync::Mutex;
+    use targo::CargoResult;
 
     static PROTECTED_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The package, the library this binary links (`targo::…` paths above) and
+    /// this binary are all `targo`, so no Trust build compiles `--crate-name
+    /// cargo`. The stock name survives only as the compatibility entry point
+    /// bootstrap installs beside `targo` (docs/trust-naming.md).
+    #[test]
+    fn the_trust_cargo_package_and_binary_crate_are_named_targo() {
+        assert_eq!(env!("CARGO_PKG_NAME"), "targo");
+        assert_eq!(env!("CARGO_CRATE_NAME"), "targo");
+        assert_eq!(option_env!("CARGO_BIN_NAME"), Some("targo"));
+    }
 
     #[test]
     fn trust_boolean_environment_values_are_explicit() {
@@ -1998,7 +2805,9 @@ mod trust_tests {
         let message = unauthorized_lane_message("build", false);
         assert!(message.contains("`targo trust build`"), "{message}");
         assert!(message.contains("`targo --unverified build`"), "{message}");
-        let verified = message.find("VERIFIED: fail-closed").expect("verified lane claim");
+        let verified = message
+            .find("VERIFIED: fail-closed")
+            .expect("verified lane claim");
         let unverified = message.find("UNVERIFIED:").expect("unverified lane claim");
         assert!(
             verified < unverified,
@@ -2009,8 +2818,14 @@ mod trust_tests {
 
         for (command, lane) in [("check", "check"), ("test", "test")] {
             let message = unauthorized_lane_message(command, false);
-            assert!(message.contains(&format!("`targo trust {lane}`")), "{message}");
-            assert!(message.contains(&format!("`targo --unverified {command}`")), "{message}");
+            assert!(
+                message.contains(&format!("`targo trust {lane}`")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("`targo --unverified {command}`")),
+                "{message}"
+            );
         }
     }
 
@@ -2044,7 +2859,10 @@ mod trust_tests {
         // resolves no embedded manifest. Substituting the path into
         // `targo trust <cmd>` would print a command that cannot work.
         let message = unauthorized_lane_message("./script.rs", true);
-        assert!(message.contains("`targo --unverified -Zscript ./script.rs`"), "{message}");
+        assert!(
+            message.contains("`targo --unverified -Zscript ./script.rs`"),
+            "{message}"
+        );
         assert!(!message.contains("targo trust ./script.rs"), "{message}");
         assert!(message.contains("`targo trust check`"), "{message}");
     }
@@ -2066,6 +2884,83 @@ mod trust_tests {
     }
 
     #[test]
+    fn unverified_outside_a_compilation_command_names_the_command_and_remedy() {
+        // `tippy` and an external subcommand do compile, so the refusal must not
+        // say they compile nothing; `trust` is the verified lane itself.
+        for command in ["new", "metadata", "tree", "tippy", "nextest", "trust"] {
+            let error = authorize_trust_execution(true, command, false, true, false, false, false)
+                .expect_err("`--unverified` stays refused outside a compilation command");
+            let message = error.to_string();
+            assert!(
+                message.starts_with("`--unverified` is valid only for a Targo compilation command"),
+                "{message}"
+            );
+            let reason = if command == "trust" {
+                "`targo trust` is the verified lane".to_string()
+            } else {
+                format!("`targo {command}` is not one")
+            };
+            assert!(message.contains(&reason), "{message}");
+            assert!(!message.contains("compiles nothing"), "{message}");
+            assert!(
+                message.contains("run it without `--unverified`"),
+                "{message}"
+            );
+        }
+    }
+
+    /// T14c (DECISION_QUEUE T14-EXPORT-1): an explicit lane beats an
+    /// inherited one. `targo trust check` run by a tool or test under
+    /// `targo --unverified` keeps its verified lane instead of being refused.
+    #[test]
+    fn the_verified_marker_beats_inherited_unverified_authority() {
+        for command in ["build", "check", "test"] {
+            assert_eq!(
+                authorize_trust_execution(true, command, false, false, true, true, false).unwrap(),
+                TrustExecutionAuthorization::Verified,
+                "{command}"
+            );
+        }
+    }
+
+    /// T14c (T14-EXPORT-1): an inherited endpoint that did not authenticate
+    /// grants nothing (`inherited_unverified` stays false). A typed
+    /// `--unverified`, the verified marker and a verb that compiles nothing
+    /// proceed on their own; a compile verb naming no lane is refused, and the
+    /// refusal says why the ancestor's lane did not carry over.
+    #[test]
+    fn an_endpoint_that_did_not_authenticate_grants_nothing_and_is_named() {
+        assert_eq!(
+            authorize_trust_execution(true, "check", false, true, false, false, false).unwrap(),
+            TrustExecutionAuthorization::ExplicitUnverified
+        );
+        assert_eq!(
+            authorize_trust_execution(true, "check", false, false, false, true, false).unwrap(),
+            TrustExecutionAuthorization::Verified
+        );
+        assert_eq!(
+            authorize_trust_execution(true, "metadata", false, false, false, false, false).unwrap(),
+            TrustExecutionAuthorization::NotApplicable
+        );
+        let refusal = || {
+            authorize_trust_execution(true, "build", false, false, false, false, false).unwrap_err()
+        };
+        let plain = refusal().to_string();
+        let named = withheld_authority_note(
+            refusal(),
+            Some("failed to connect to nested-unverified Targo broker `/x/b`"),
+        )
+        .to_string();
+        assert!(named.starts_with(&plain), "{named}");
+        assert!(
+            named.contains("UNVERIFIED_ENDPOINT granted nothing"),
+            "{named}"
+        );
+        assert!(named.contains("failed to connect"), "{named}");
+        assert_eq!(withheld_authority_note(refusal(), None).to_string(), plain);
+    }
+
+    #[test]
     fn legacy_bootstrap_markers_never_authorize_branded_targo() {
         for command in ["build", "metadata"] {
             let error = authorize_trust_execution(true, command, false, false, false, false, true)
@@ -2076,8 +2971,10 @@ mod trust_tests {
 
     #[test]
     fn targo_authorization_lanes_cannot_be_combined_or_misapplied() {
+        // The verified marker beside a typed `--unverified`, with or without
+        // inherited authority, is a conflict.
         assert!(authorize_trust_execution(true, "build", false, true, false, true, false).is_err());
-        assert!(authorize_trust_execution(true, "build", false, false, true, true, false).is_err());
+        assert!(authorize_trust_execution(true, "build", false, true, true, true, false).is_err());
         assert!(authorize_trust_execution(true, "build", false, false, false, true, true).is_err());
         assert_eq!(
             authorize_trust_execution(true, "build", false, true, true, false, false).unwrap(),
@@ -2154,14 +3051,9 @@ mod trust_tests {
             protected_trust_subcommand_binary("trust"),
             Some("targo-trust")
         );
-        assert_eq!(
-            protected_trust_subcommand_binary("tippy"),
-            Some("targo-tippy")
-        );
-        assert_eq!(
-            protected_trust_subcommand_binary("clippy"),
-            Some("targo-tippy")
-        );
+        // Lint is protected native dispatch, not an external SDK planner.
+        assert_eq!(protected_trust_subcommand_binary("tippy"), None);
+        assert_eq!(protected_trust_subcommand_binary("clippy"), None);
         assert_eq!(protected_trust_subcommand_binary("fmt"), Some("targo-fmt"));
         assert_eq!(
             protected_trust_subcommand_binary("miri"),
@@ -2548,8 +3440,9 @@ mod trust_tests {
 
         fs::set_permissions(&holder, fs::Permissions::from_mode(0o755))
             .expect("close the holding directory again");
-        AuthenticatedProtectedSubcommand::capture(redirected_command)
-            .expect("the same ancestor symlink must authenticate once no other principal can replace it");
+        AuthenticatedProtectedSubcommand::capture(redirected_command).expect(
+            "the same ancestor symlink must authenticate once no other principal can replace it",
+        );
 
         fs::remove_dir_all(root).expect("remove protected-command symlink fixture");
     }
@@ -2800,8 +3693,11 @@ mod trust_tests {
         // A genuine content/size change to the executable must STILL fail the
         // guarded run closed.
         let rejects = authenticated.run_guarded(|| {
-            fs::write(&command, b"#!/bin/sh\nexit 0\n# tampered: strictly longer body\n")
-                .expect("rewrite protected command with different content");
+            fs::write(
+                &command,
+                b"#!/bin/sh\nexit 0\n# tampered: strictly longer body\n",
+            )
+            .expect("rewrite protected command with different content");
         });
         assert!(
             rejects.is_err(),
@@ -2834,9 +3730,8 @@ mod trust_tests {
     #[test]
     fn trust_dev_gate_subcommands_bypass_the_protected_guard_but_proof_commands_do_not() {
         // The external command's argv repeats the subcommand token at index 0.
-        let argv = |tokens: &[&str]| -> Vec<OsString> {
-            tokens.iter().map(OsString::from).collect()
-        };
+        let argv =
+            |tokens: &[&str]| -> Vec<OsString> { tokens.iter().map(OsString::from).collect() };
         // A local `fn` (not a closure) so the returned `&OsStr` borrows tie to
         // the input slice's lifetime.
         fn as_os(v: &[OsString]) -> Vec<&OsStr> {
@@ -2846,7 +3741,12 @@ mod trust_tests {
         // `targo trust domination …` is a dev/CI gate: it builds (churning the
         // in-tree toolchain ancestors) and dispatches its proof work through
         // separately-guarded nested checks, so the outer wrapper is unguarded.
-        let domination = argv(&["trust", "domination", "trust-added", "native-contracts-pipeline-v2"]);
+        let domination = argv(&[
+            "trust",
+            "domination",
+            "trust-added",
+            "native-contracts-pipeline-v2",
+        ]);
         assert!(trust_invocation_is_dev_gate("trust", &as_os(&domination)));
 
         // `doctor` is a pure diagnostic (builds an environment report, makes no
@@ -2859,7 +3759,12 @@ mod trust_tests {
         assert!(trust_invocation_is_dev_gate("trust", &as_os(&flagged)));
 
         // Proof-producing commands STAY guarded.
-        for proof in [["trust", "check"], ["trust", "build"], ["trust", "test"], ["trust", "report"]] {
+        for proof in [
+            ["trust", "check"],
+            ["trust", "build"],
+            ["trust", "test"],
+            ["trust", "report"],
+        ] {
             let v = argv(&proof);
             assert!(
                 !trust_invocation_is_dev_gate("trust", &as_os(&v)),
@@ -2893,7 +3798,10 @@ mod trust_tests {
             error.exit_code, PROTECTED_SUBCOMMAND_AUTHORITY_EXIT,
             "a guard failure is a setup/authority failure, not a compiler error"
         );
-        assert_ne!(error.exit_code, 101, "101 is reserved for `could not compile`");
+        assert_ne!(
+            error.exit_code, 101,
+            "101 is reserved for `could not compile`"
+        );
 
         // When the guard HOLDS, the child's own status governs unchanged —
         // in particular an ordinary verification-gate failure stays exit 1.
@@ -2903,7 +3811,10 @@ mod trust_tests {
             .expect("run gate-failure fixture");
         let error = finish_guarded_protected_subcommand(Ok(Ok(gate_failure)))
             .expect_err("a nonzero child status must fail closed");
-        assert_eq!(error.exit_code, 1, "an ordinary verification-gate failure stays exit 1");
+        assert_eq!(
+            error.exit_code, 1,
+            "an ordinary verification-gate failure stays exit 1"
+        );
 
         let success = Command::new("sh")
             .args(["-c", "exit 0"])
@@ -2918,7 +3829,7 @@ mod trust_tests {
 
 /// Initialize libgit2.
 #[tracing::instrument(skip_all)]
-fn init_git(gctx: &GlobalContext) {
+fn init_git() {
     // Disabling the owner validation in git can, in theory, lead to code execution
     // vulnerabilities. However, libgit2 does not launch executables, which is the foundation of
     // the original security issue. Meanwhile, issues with refusing to load git repos in
@@ -2939,39 +3850,5 @@ fn init_git(gctx: &GlobalContext) {
     unsafe {
         git2::opts::set_verify_owner_validation(false)
             .expect("set_verify_owner_validation should never fail");
-    }
-
-    init_git_transports(gctx);
-}
-
-/// Configure libgit2 to use libcurl if necessary.
-///
-/// If the user has a non-default network configuration, then libgit2 will be
-/// configured to use libcurl instead of the built-in networking support so
-/// that those configuration settings can be used.
-#[tracing::instrument(skip_all)]
-fn init_git_transports(gctx: &GlobalContext) {
-    match needs_custom_http_transport(gctx) {
-        Ok(true) => {}
-        _ => return,
-    }
-
-    let handle = match http_handle(gctx) {
-        Ok(handle) => handle,
-        Err(..) => return,
-    };
-
-    // The unsafety of the registration function derives from two aspects:
-    //
-    // 1. This call must be synchronized with all other registration calls as
-    //    well as construction of new transports.
-    // 2. The argument is leaked.
-    //
-    // We're clear on point (1) because this is only called at the start of this
-    // binary (we know what the state of the world looks like) and we're mostly
-    // clear on point (2) because we'd only free it after everything is done
-    // anyway
-    unsafe {
-        git2_curl::register(handle);
     }
 }

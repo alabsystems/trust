@@ -114,6 +114,9 @@ impl SummaryStore {
     /// globally ambiguous shorthand appear temporarily unique.
     #[must_use]
     pub fn get_by_name(&self, name: &str) -> Option<&FunctionSummary> {
+        if let Some(exact) = self.summaries.get(name) {
+            return Some(exact);
+        }
         let def_path = resolve_unique_def_path(
             name,
             self.summaries
@@ -273,6 +276,7 @@ mod tests {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],
@@ -305,6 +309,7 @@ mod tests {
             preconditions: pre,
             postconditions: post,
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -493,6 +498,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

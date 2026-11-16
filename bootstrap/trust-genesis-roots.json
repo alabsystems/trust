@@ -3,42 +3,42 @@
   "admission": "external-bootstrap-root-only",
   "counts_as_trust_stage0_evidence": false,
   "channel_manifest": {
-    "date": "2026-07-09",
-    "sha256": "5578b498ab4fcdf48aeb6205fef695c4aa8ba1d373fc720cee983fed1ebe53b7",
-    "url": "https://static.rust-lang.org/dist/2026-07-09/channel-rust-nightly.toml"
+    "date": "2026-10-19",
+    "sha256": "ea3cd9fbd20982d1072cc5ce7a53e6acd616f8041576cc8efb2260b12cfb04bc",
+    "url": "https://static.rust-lang.org/dist/2026-10-19/channel-rust-nightly.toml"
   },
   "roots": {
     "aarch64-apple-darwin": {
-      "commit_date": "2026-07-08",
-      "commit_hash": "14cae681329a63c622a6e1fbe1d30f9374bc51d8",
+      "commit_date": "2026-10-18",
+      "commit_hash": "b6eeb93c992027a03e1fd120b6652546396b142c",
       "host": "aarch64-apple-darwin",
-      "release": "1.99.0-nightly",
-      "rustc_archive_sha256": "70747c599a0c5845d82dbf6d0cfcb743782618b78581a57968631d2929d6fc93",
-      "rustup_toolchain": "nightly-2026-07-09"
+      "release": "1.101.0-nightly",
+      "rustc_archive_sha256": "a7f8ffe48d1d947bfa059688c025b684396e996a009ac0b687505c0d1092a2af",
+      "rustup_toolchain": "nightly-2026-10-19"
     },
     "aarch64-unknown-linux-gnu": {
-      "commit_date": "2026-07-08",
-      "commit_hash": "14cae681329a63c622a6e1fbe1d30f9374bc51d8",
+      "commit_date": "2026-10-18",
+      "commit_hash": "b6eeb93c992027a03e1fd120b6652546396b142c",
       "host": "aarch64-unknown-linux-gnu",
-      "release": "1.99.0-nightly",
-      "rustc_archive_sha256": "a0797e6d612e2fce5fb0f6f0378e27ff893d59bcbd796bd9858f2e2b21de1557",
-      "rustup_toolchain": "nightly-2026-07-09"
+      "release": "1.101.0-nightly",
+      "rustc_archive_sha256": "e7a0dc1df6ea98b6796ed44232f049bca00341615ebc5f6cf3c3a68b1a74f02c",
+      "rustup_toolchain": "nightly-2026-10-19"
     },
     "x86_64-pc-windows-msvc": {
-      "commit_date": "2026-07-08",
-      "commit_hash": "14cae681329a63c622a6e1fbe1d30f9374bc51d8",
+      "commit_date": "2026-10-18",
+      "commit_hash": "b6eeb93c992027a03e1fd120b6652546396b142c",
       "host": "x86_64-pc-windows-msvc",
-      "release": "1.99.0-nightly",
-      "rustc_archive_sha256": "06615e99f97b0d0502cc55d8bcb96885d366d9bda26fcf7b3fa661ff72fcd3cb",
-      "rustup_toolchain": "nightly-2026-07-09"
+      "release": "1.101.0-nightly",
+      "rustc_archive_sha256": "613f90954513cc8d79ff190567ea79cdb65b1997761f7537c66890f0448d8bac",
+      "rustup_toolchain": "nightly-2026-10-19"
     },
     "x86_64-unknown-linux-gnu": {
-      "commit_date": "2026-07-08",
-      "commit_hash": "14cae681329a63c622a6e1fbe1d30f9374bc51d8",
+      "commit_date": "2026-10-18",
+      "commit_hash": "b6eeb93c992027a03e1fd120b6652546396b142c",
       "host": "x86_64-unknown-linux-gnu",
-      "release": "1.99.0-nightly",
-      "rustc_archive_sha256": "075e02fbb48c34a81670496a209e44eb438d2e5136aee656f612dc40323e9940",
-      "rustup_toolchain": "nightly-2026-07-09"
+      "release": "1.101.0-nightly",
+      "rustc_archive_sha256": "09757fff83d3f20e521bc19358815b02639c0b1f43033c397908a131c736f1aa",
+      "rustup_toolchain": "nightly-2026-10-19"
     }
   }
 }

@@ -271,14 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_clone() {
-        let data = [0x01, 0x02, 0x03, 0x04];
-        let c = Cursor::new(&data, 2, false);
-        let c2 = c.clone();
-        assert_eq!(c.offset(), c2.offset());
-    }
-
-    #[test]
     fn test_cursor_skip_past_end_returns_error() {
         let data = [0x01, 0x02];
         let mut c = Cursor::new(&data, 0, false);

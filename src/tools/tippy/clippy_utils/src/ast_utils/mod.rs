@@ -2,9 +2,10 @@
 //!
 //! - The `eq_foobar` functions test for semantic equality but ignores `NodeId`s and `Span`s.
 
-#![allow(clippy::wildcard_imports, clippy::enum_glob_use)]
+#![allow(clippy::enum_glob_use, clippy::wildcard_imports)]
 
 use crate::{both, over};
+use rustc_ast::attr::data_structures::CfgEntry;
 use rustc_ast::visit::{self, Visitor};
 use rustc_ast::{self as ast, HasAttrs, *};
 use rustc_span::sym;
@@ -95,7 +96,6 @@ pub fn eq_pat(l: &Pat, r: &Pat) -> bool {
                 && eq_expr_opt(lt.as_deref(), rt.as_deref())
                 && eq_range_end(le.node, re.node)
         },
-        (Box(l), Box(r)) => eq_pat(l, r),
         (Ref(l, l_pin, l_mut), Ref(r, r_pin, r_mut)) => l_pin == r_pin && l_mut == r_mut && eq_pat(l, r),
         (Tuple(l), Tuple(r)) | (Slice(l), Slice(r)) => over(l, r, eq_pat),
         (Path(lq, lp), Path(rq, rp)) => both(lq.as_deref(), rq.as_deref(), eq_qself) && eq_path(lp, rp),
@@ -155,7 +155,7 @@ fn eq_generic_args(l: &GenericArgs, r: &GenericArgs) -> bool {
     match (l, r) {
         (AngleBracketed(l), AngleBracketed(r)) => over(&l.args, &r.args, eq_angle_arg),
         (Parenthesized(l), Parenthesized(r)) => {
-            over(&l.inputs, &r.inputs, |l, r| eq_ty(l, r)) && eq_fn_ret_ty(&l.output, &r.output)
+            over(&l.inputs, &r.inputs, eq_param) && eq_fn_ret_ty(&l.output, &r.output)
         },
         _ => false,
     }
@@ -207,13 +207,13 @@ fn eq_expr(l: &Expr, r: &Expr) -> bool {
         (Repeat(le, ls), Repeat(re, rs)) => eq_expr(le, re) && eq_expr(&ls.value, &rs.value),
         (Call(lc, la), Call(rc, ra)) => eq_expr(lc, rc) && over(la, ra, |l, r| eq_expr(l, r)),
         (
-            MethodCall(box ast::MethodCall {
+            MethodCall(ast::MethodCall {
                 seg: ls,
                 receiver: lr,
                 args: la,
                 ..
             }),
-            MethodCall(box ast::MethodCall {
+            MethodCall(ast::MethodCall {
                 seg: rs,
                 receiver: rr,
                 args: ra,
@@ -234,22 +234,13 @@ fn eq_expr(l: &Expr, r: &Expr) -> bool {
                 && eq_block(lt, rt)
                 && eq_loop_contract(l_contract.as_deref(), r_contract.as_deref())
         },
-        (
-            ForLoop {
-                pat: lp,
-                iter: li,
-                body: lt,
-                label: ll,
-                kind: lk,
-            },
-            ForLoop {
-                pat: rp,
-                iter: ri,
-                body: rt,
-                label: rl,
-                kind: rk,
-            },
-        ) => eq_label(ll.as_ref(), rl.as_ref()) && eq_pat(lp, rp) && eq_expr(li, ri) && eq_block(lt, rt) && lk == rk,
+        (ForLoop(lf), ForLoop(rf)) => {
+            eq_label(lf.label.as_ref(), rf.label.as_ref())
+                && eq_pat(&lf.pat, &rf.pat)
+                && eq_expr(&lf.iter, &rf.iter)
+                && eq_block(&lf.body, &rf.body)
+                && lf.kind == rf.kind
+        },
         (Loop(lt, ll, _, l_contract), Loop(rt, rl, _, r_contract)) => {
             eq_label(ll.as_ref(), rl.as_ref())
                 && eq_block(lt, rt)
@@ -270,19 +261,19 @@ fn eq_expr(l: &Expr, r: &Expr) -> bool {
         (Field(lp, lf), Field(rp, rf)) => eq_id(*lf, *rf) && eq_expr(lp, rp),
         (Match(ls, la, lkind), Match(rs, ra, rkind)) => (lkind == rkind) && eq_expr(ls, rs) && over(la, ra, eq_arm),
         (
-            Closure(box ast::Closure {
+            Closure(ast::Closure {
                 binder: lb,
                 capture_clause: lc,
-                coroutine_kind: la,
+                coroutine_marker: lcm,
                 movability: lm,
                 fn_decl: lf,
                 body: le,
                 ..
             }),
-            Closure(box ast::Closure {
+            Closure(ast::Closure {
                 binder: rb,
                 capture_clause: rc,
-                coroutine_kind: ra,
+                coroutine_marker: rcm,
                 movability: rm,
                 fn_decl: rf,
                 body: re,
@@ -291,7 +282,7 @@ fn eq_expr(l: &Expr, r: &Expr) -> bool {
         ) => {
             eq_closure_binder(lb, rb)
                 && lc == rc
-                && eq_coroutine_kind(*la, *ra)
+                && eq_opt_coroutine_marker(*lcm, *rcm)
                 && lm == rm
                 && eq_fn_decl(lf, rf)
                 && eq_expr(le, re)
@@ -311,19 +302,6 @@ fn eq_expr(l: &Expr, r: &Expr) -> bool {
         },
         _ => false,
     }
-}
-
-fn eq_coroutine_kind(a: Option<CoroutineKind>, b: Option<CoroutineKind>) -> bool {
-    matches!(
-        (a, b),
-        (Some(CoroutineKind::Async { .. }), Some(CoroutineKind::Async { .. }))
-            | (Some(CoroutineKind::Gen { .. }), Some(CoroutineKind::Gen { .. }))
-            | (
-                Some(CoroutineKind::AsyncGen { .. }),
-                Some(CoroutineKind::AsyncGen { .. })
-            )
-            | (None, None)
-    )
 }
 
 fn eq_field(l: &ExprField, r: &ExprField) -> bool {
@@ -412,40 +390,41 @@ fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
         (ExternCrate(ls, li), ExternCrate(rs, ri)) => ls == rs && eq_id(*li, *ri),
         (Use(l), Use(r)) => eq_use_tree(l, r),
         (
-            Static(box StaticItem {
+            Static(StaticItem {
                 ident: li,
                 ty: lt,
                 mutability: lm,
                 expr: le,
                 safety: ls,
                 define_opaque: _,
-                eii_impls: _,
+                eii_impl: _,
             }),
-            Static(box StaticItem {
+            Static(StaticItem {
                 ident: ri,
                 ty: rt,
                 mutability: rm,
                 expr: re,
                 safety: rs,
                 define_opaque: _,
-                eii_impls: _,
+                eii_impl: _,
             }),
         ) => eq_id(*li, *ri) && lm == rm && ls == rs && eq_ty(lt, rt) && eq_expr_opt(le.as_deref(), re.as_deref()),
         (
-            Const(box ConstItem {
+            Const(ConstItem {
                 defaultness: ld,
                 ident: li,
                 generics: lg,
                 ty: lt,
-                rhs_kind: lb,
+                body: lb,
                 define_opaque: _,
             }),
-            Const(box ConstItem {
+            Const(ConstItem {
                 defaultness: rd,
                 ident: ri,
                 generics: rg,
                 ty: rt,
-                rhs_kind: rb,
+
+                body: rb,
                 define_opaque: _,
             }),
         ) => {
@@ -453,10 +432,10 @@ fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 && eq_id(*li, *ri)
                 && eq_generics(lg, rg)
                 && eq_ty(lt, rt)
-                && both(Some(lb), Some(rb), eq_const_item_rhs)
+                && both(lb.as_deref(), rb.as_deref(), eq_expr)
         },
         (
-            Fn(box ast::Fn {
+            Fn(ast::Fn {
                 defaultness: ld,
                 sig: lf,
                 ident: li,
@@ -464,9 +443,9 @@ fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 contract: lc,
                 body: lb,
                 define_opaque: _,
-                eii_impls: _,
+                eii_impl: _,
             }),
-            Fn(box ast::Fn {
+            Fn(ast::Fn {
                 defaultness: rd,
                 sig: rf,
                 ident: ri,
@@ -474,7 +453,7 @@ fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 contract: rc,
                 body: rb,
                 define_opaque: _,
-                eii_impls: _,
+                eii_impl: _,
             }),
         ) => {
             eq_defaultness(*ld, *rd)
@@ -500,14 +479,14 @@ fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 && over(&l.items, &r.items, |l, r| eq_item(l, r, eq_foreign_item_kind))
         },
         (
-            TyAlias(box ast::TyAlias {
+            TyAlias(ast::TyAlias {
                 defaultness: ld,
                 generics: lg,
                 bounds: lb,
                 ty: lt,
                 ..
             }),
-            TyAlias(box ast::TyAlias {
+            TyAlias(ast::TyAlias {
                 defaultness: rd,
                 generics: rg,
                 bounds: rb,
@@ -527,7 +506,7 @@ fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
             eq_id(*li, *ri) && eq_generics(lg, rg) && eq_variant_data(lv, rv)
         },
         (
-            Trait(box ast::Trait {
+            Trait(ast::Trait {
                 impl_restriction: liprt,
                 constness: lc,
                 is_auto: la,
@@ -537,7 +516,7 @@ fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 bounds: lb,
                 items: lis,
             }),
-            Trait(box ast::Trait {
+            Trait(ast::Trait {
                 impl_restriction: riprt,
                 constness: rc,
                 is_auto: ra,
@@ -558,13 +537,13 @@ fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 && over(lis, ris, |l, r| eq_item(l, r, eq_assoc_item_kind))
         },
         (
-            TraitAlias(box ast::TraitAlias {
+            TraitAlias(ast::TraitAlias {
                 ident: li,
                 generics: lg,
                 bounds: lb,
                 constness: lc,
             }),
-            TraitAlias(box ast::TraitAlias {
+            TraitAlias(ast::TraitAlias {
                 ident: ri,
                 generics: rg,
                 bounds: rb,
@@ -615,27 +594,27 @@ fn eq_foreign_item_kind(l: &ForeignItemKind, r: &ForeignItemKind) -> bool {
     use ForeignItemKind::*;
     match (l, r) {
         (
-            Static(box StaticItem {
+            Static(StaticItem {
                 ident: li,
                 ty: lt,
                 mutability: lm,
                 expr: le,
                 safety: ls,
                 define_opaque: _,
-                eii_impls: _,
+                eii_impl: _,
             }),
-            Static(box StaticItem {
+            Static(StaticItem {
                 ident: ri,
                 ty: rt,
                 mutability: rm,
                 expr: re,
                 safety: rs,
                 define_opaque: _,
-                eii_impls: _,
+                eii_impl: _,
             }),
         ) => eq_id(*li, *ri) && eq_ty(lt, rt) && lm == rm && eq_expr_opt(le.as_deref(), re.as_deref()) && ls == rs,
         (
-            Fn(box ast::Fn {
+            Fn(ast::Fn {
                 defaultness: ld,
                 sig: lf,
                 ident: li,
@@ -643,9 +622,9 @@ fn eq_foreign_item_kind(l: &ForeignItemKind, r: &ForeignItemKind) -> bool {
                 contract: lc,
                 body: lb,
                 define_opaque: _,
-                eii_impls: _,
+                eii_impl: _,
             }),
-            Fn(box ast::Fn {
+            Fn(ast::Fn {
                 defaultness: rd,
                 sig: rf,
                 ident: ri,
@@ -653,7 +632,7 @@ fn eq_foreign_item_kind(l: &ForeignItemKind, r: &ForeignItemKind) -> bool {
                 contract: rc,
                 body: rb,
                 define_opaque: _,
-                eii_impls: _,
+                eii_impl: _,
             }),
         ) => {
             eq_defaultness(*ld, *rd)
@@ -664,7 +643,7 @@ fn eq_foreign_item_kind(l: &ForeignItemKind, r: &ForeignItemKind) -> bool {
                 && both(lb.as_ref(), rb.as_ref(), |l, r| eq_block(l, r))
         },
         (
-            TyAlias(box ast::TyAlias {
+            TyAlias(ast::TyAlias {
                 defaultness: ld,
                 ident: li,
                 generics: lg,
@@ -672,7 +651,7 @@ fn eq_foreign_item_kind(l: &ForeignItemKind, r: &ForeignItemKind) -> bool {
                 bounds: lb,
                 ty: lt,
             }),
-            TyAlias(box ast::TyAlias {
+            TyAlias(ast::TyAlias {
                 defaultness: rd,
                 ident: ri,
                 generics: rg,
@@ -697,20 +676,20 @@ fn eq_assoc_item_kind(l: &AssocItemKind, r: &AssocItemKind) -> bool {
     use AssocItemKind::*;
     match (l, r) {
         (
-            Const(box ConstItem {
+            Const(ConstItem {
                 defaultness: ld,
                 ident: li,
                 generics: lg,
                 ty: lt,
-                rhs_kind: lb,
+                body: lb,
                 define_opaque: _,
             }),
-            Const(box ConstItem {
+            Const(ConstItem {
                 defaultness: rd,
                 ident: ri,
                 generics: rg,
                 ty: rt,
-                rhs_kind: rb,
+                body: rb,
                 define_opaque: _,
             }),
         ) => {
@@ -718,10 +697,10 @@ fn eq_assoc_item_kind(l: &AssocItemKind, r: &AssocItemKind) -> bool {
                 && eq_id(*li, *ri)
                 && eq_generics(lg, rg)
                 && eq_ty(lt, rt)
-                && both(Some(lb), Some(rb), eq_const_item_rhs)
+                && both(lb.as_deref(), rb.as_deref(), eq_expr)
         },
         (
-            Fn(box ast::Fn {
+            Fn(ast::Fn {
                 defaultness: ld,
                 sig: lf,
                 ident: li,
@@ -729,9 +708,9 @@ fn eq_assoc_item_kind(l: &AssocItemKind, r: &AssocItemKind) -> bool {
                 contract: lc,
                 body: lb,
                 define_opaque: _,
-                eii_impls: _,
+                eii_impl: _,
             }),
-            Fn(box ast::Fn {
+            Fn(ast::Fn {
                 defaultness: rd,
                 sig: rf,
                 ident: ri,
@@ -739,7 +718,7 @@ fn eq_assoc_item_kind(l: &AssocItemKind, r: &AssocItemKind) -> bool {
                 contract: rc,
                 body: rb,
                 define_opaque: _,
-                eii_impls: _,
+                eii_impl: _,
             }),
         ) => {
             eq_defaultness(*ld, *rd)
@@ -750,7 +729,7 @@ fn eq_assoc_item_kind(l: &AssocItemKind, r: &AssocItemKind) -> bool {
                 && both(lb.as_ref(), rb.as_ref(), |l, r| eq_block(l, r))
         },
         (
-            Type(box TyAlias {
+            Type(TyAlias {
                 defaultness: ld,
                 ident: li,
                 generics: lg,
@@ -758,7 +737,7 @@ fn eq_assoc_item_kind(l: &AssocItemKind, r: &AssocItemKind) -> bool {
                 bounds: lb,
                 ty: lt,
             }),
-            Type(box TyAlias {
+            Type(TyAlias {
                 defaultness: rd,
                 ident: ri,
                 generics: rg,
@@ -805,7 +784,7 @@ fn eq_struct_field(l: &FieldDef, r: &FieldDef) -> bool {
     l.is_placeholder == r.is_placeholder
         && over(&l.attrs, &r.attrs, eq_attr)
         && eq_vis(&l.vis, &r.vis)
-        && eq_mut_restriction(&l.mut_restriction, &r.mut_restriction)
+        && eq_mut_restriction(l.mut_restriction(), r.mut_restriction())
         && both(l.ident.as_ref(), r.ident.as_ref(), |l, r| eq_id(*l, *r))
         && eq_ty(&l.ty, &r.ty)
 }
@@ -814,22 +793,17 @@ fn eq_fn_sig(l: &FnSig, r: &FnSig) -> bool {
     eq_fn_decl(&l.decl, &r.decl) && eq_fn_header(&l.header, &r.header)
 }
 
-fn eq_opt_coroutine_kind(l: Option<CoroutineKind>, r: Option<CoroutineKind>) -> bool {
-    matches!(
-        (l, r),
-        (Some(CoroutineKind::Async { .. }), Some(CoroutineKind::Async { .. }))
-            | (Some(CoroutineKind::Gen { .. }), Some(CoroutineKind::Gen { .. }))
-            | (
-                Some(CoroutineKind::AsyncGen { .. }),
-                Some(CoroutineKind::AsyncGen { .. })
-            )
-            | (None, None)
-    )
+fn eq_opt_coroutine_marker(l: Option<CoroutineMarker>, r: Option<CoroutineMarker>) -> bool {
+    match (l, r) {
+        (Some(lcm), Some(rcm)) => lcm.kind == rcm.kind,
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
 }
 
 fn eq_fn_header(l: &FnHeader, r: &FnHeader) -> bool {
     matches!(l.safety, Safety::Default) == matches!(r.safety, Safety::Default)
-        && eq_opt_coroutine_kind(l.coroutine_kind, r.coroutine_kind)
+        && eq_opt_coroutine_marker(l.coroutine_marker, r.coroutine_marker)
         && matches!(l.constness, Const::No) == matches!(r.constness, Const::No)
         && eq_ext(&l.ext, &r.ext)
 }
@@ -897,27 +871,12 @@ fn eq_anon_const(l: &AnonConst, r: &AnonConst) -> bool {
     eq_expr(&l.value, &r.value)
 }
 
-fn eq_const_item_rhs(l: &ConstItemRhsKind, r: &ConstItemRhsKind) -> bool {
-    use ConstItemRhsKind::*;
-    match (l, r) {
-        (TypeConst { rhs: Some(l) }, TypeConst { rhs: Some(r) }) => eq_anon_const(l, r),
-        (TypeConst { rhs: None }, TypeConst { rhs: None }) | (Body { rhs: None }, Body { rhs: None }) => true,
-        (Body { rhs: Some(l) }, Body { rhs: Some(r) }) => eq_expr(l, r),
-        (TypeConst { rhs: Some(..) }, TypeConst { rhs: None })
-        | (TypeConst { rhs: None }, TypeConst { rhs: Some(..) })
-        | (Body { rhs: None }, Body { rhs: Some(..) })
-        | (Body { rhs: Some(..) }, Body { rhs: None })
-        | (TypeConst { .. }, Body { .. })
-        | (Body { .. }, TypeConst { .. }) => false,
-    }
-}
-
 fn eq_use_tree_kind(l: &UseTreeKind, r: &UseTreeKind) -> bool {
     use UseTreeKind::*;
     match (l, r) {
         (Glob(_), Glob(_)) => true,
         (Simple(l), Simple(r)) => both(l.as_ref(), r.as_ref(), |l, r| eq_id(*l, *r)),
-        (Nested { items: l, .. }, Nested { items: r, .. }) => over(l, r, |(l, _), (r, _)| eq_use_tree(l, r)),
+        (Nested { items: l, .. }, Nested { items: r, .. }) => over(l, r, |l, r| eq_use_tree(&l.inner, &r.inner)),
         _ => false,
     }
 }
@@ -968,13 +927,15 @@ fn eq_restriction_kind(l: &RestrictionKind, r: &RestrictionKind) -> bool {
 }
 
 fn eq_fn_decl(l: &FnDecl, r: &FnDecl) -> bool {
-    eq_fn_ret_ty(&l.output, &r.output)
-        && over(&l.inputs, &r.inputs, |l, r| {
-            l.is_placeholder == r.is_placeholder
-                && eq_pat(&l.pat, &r.pat)
-                && eq_ty(&l.ty, &r.ty)
-                && over(&l.attrs, &r.attrs, eq_attr)
-        })
+    eq_fn_ret_ty(&l.output, &r.output) && over(&l.inputs, &r.inputs, eq_param)
+}
+
+fn eq_param(l: &Param, r: &Param) -> bool {
+    l.is_placeholder == r.is_placeholder
+        && eq_pat(&l.pat, &r.pat)
+        && eq_ty(&l.ty, &r.ty)
+        && over(&l.attrs, &r.attrs, eq_attr)
+        && l.has_const_keyword == r.has_const_keyword
 }
 
 fn eq_closure_binder(l: &ClosureBinder, r: &ClosureBinder) -> bool {
@@ -1005,12 +966,12 @@ fn eq_ty(l: &Ty, r: &Ty) -> bool {
         },
         (Slice(l), Slice(r)) => eq_ty(l, r),
         (Array(le, ls), Array(re, rs)) => eq_ty(le, re) && eq_expr(&ls.value, &rs.value),
-        (Ptr(l), Ptr(r)) => l.mutbl == r.mutbl && eq_ty(&l.ty, &r.ty),
-        (Ref(ll, l), Ref(rl, r)) => {
-            both(ll.as_ref(), rl.as_ref(), |l, r| eq_id(l.ident, r.ident)) && l.mutbl == r.mutbl && eq_ty(&l.ty, &r.ty)
+        (Ptr(l_ty, l_mutbl), Ptr(r_ty, r_mutbl)) => l_mutbl == r_mutbl && eq_ty(l_ty, r_ty),
+        (Ref(ll, l_ty, l_mutbl), Ref(rl, r_ty, r_mutbl)) => {
+            both(ll.as_ref(), rl.as_ref(), |l, r| eq_id(l.ident, r.ident)) && l_mutbl == r_mutbl && eq_ty(l_ty, r_ty)
         },
-        (PinnedRef(ll, l), PinnedRef(rl, r)) => {
-            both(ll.as_ref(), rl.as_ref(), |l, r| eq_id(l.ident, r.ident)) && l.mutbl == r.mutbl && eq_ty(&l.ty, &r.ty)
+        (PinnedRef(ll, l_ty, l_mutbl), PinnedRef(rl, r_ty, r_mutbl)) => {
+            both(ll.as_ref(), rl.as_ref(), |l, r| eq_id(l.ident, r.ident)) && l_mutbl == r_mutbl && eq_ty(l_ty, r_ty)
         },
         (FnPtr(l), FnPtr(r)) => {
             l.safety == r.safety
@@ -1109,28 +1070,24 @@ fn eq_attr(l: &Attribute, r: &Attribute) -> bool {
     l.style == r.style
         && match (&l.kind, &r.kind) {
             (DocComment(l1, l2), DocComment(r1, r2)) => l1 == r1 && l2 == r2,
-            (Normal(l), Normal(r)) => {
-                eq_path(&l.item.path, &r.item.path) && eq_attr_item_kind(&l.item.args, &r.item.args)
-            },
+            (Normal(l), Normal(r)) => eq_path(&l.item.path, &r.item.path) && eq_attr_args(&l.item.args, &r.item.args),
+            (Synthetic(l), Synthetic(r)) => eq_synthetic_attr(l, r),
             _ => false,
         }
 }
 
-fn eq_attr_item_kind(l: &AttrItemKind, r: &AttrItemKind) -> bool {
+// Trust: expanded cfg attributes survive into early lint AST comparisons. Their
+// predicates remain significant; erase only spans, as the other AST equality
+// helpers do, and retain the exact tree order and multiplicity.
+fn eq_synthetic_attr(l: &SyntheticAttr, r: &SyntheticAttr) -> bool {
     match (l, r) {
-        (AttrItemKind::Unparsed(l), AttrItemKind::Unparsed(r)) => eq_attr_args(l, r),
-        (
-            AttrItemKind::Parsed(EarlyParsedAttribute::CfgTrace(l)),
-            AttrItemKind::Parsed(EarlyParsedAttribute::CfgTrace(r)),
-        ) => l.is_equivalent_to(r),
-        (
-            AttrItemKind::Parsed(EarlyParsedAttribute::CfgAttrTrace),
-            AttrItemKind::Parsed(EarlyParsedAttribute::CfgAttrTrace),
-        ) => {
-            // `CfgAttrTrace` deliberately erases its original arguments.
-            // There is not enough information here to prove two attributes
-            // equivalent, so fail closed instead of panicking or guessing.
-            false
+        (SyntheticAttr::CfgTrace(l), SyntheticAttr::CfgTrace(r))
+        | (SyntheticAttr::CfgAttrTrace(l), SyntheticAttr::CfgAttrTrace(r)) => {
+            let mut l = l.clone();
+            let mut r = r.clone();
+            l.lower_spans(|_| rustc_span::DUMMY_SP);
+            r.lower_spans(|_| rustc_span::DUMMY_SP);
+            l == r
         },
         _ => false,
     }
@@ -1152,7 +1109,7 @@ fn eq_delim_args(l: &DelimArgs, r: &DelimArgs) -> bool {
         && l.tokens.iter().zip(r.tokens.iter()).all(|(a, b)| a.eq_unspanned(b))
 }
 
-/// Checks whether `#[cfg(test)]` is directly applied to `item`.
+/// Checks whether `item` is gated on `#[cfg(test)]`.
 pub fn is_cfg_test(item: &impl HasAttrs) -> bool {
     item.attrs().iter().any(|attr| {
         if attr.has_name(sym::cfg)
@@ -1160,27 +1117,89 @@ pub fn is_cfg_test(item: &impl HasAttrs) -> bool {
             && item_list.iter().any(|item| item.has_name(sym::test))
         {
             true
+        } else if let AttrKind::Synthetic(synthetic) = &attr.kind
+            && let SyntheticAttr::CfgTrace(cfg) = &**synthetic
+        {
+            requires_test_cfg(cfg)
         } else {
             false
         }
     })
 }
 
+fn requires_test_cfg(cfg: &CfgEntry) -> bool {
+    match cfg {
+        CfgEntry::NameValue { name: sym::test, .. } => true,
+        CfgEntry::All(subs, _) => subs.iter().any(requires_test_cfg),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthoredVerifierSourceFinder, eq_attr_item_kind, eq_loop_contract, eq_opt_fn_contract,
+        AuthoredVerifierSourceFinder, eq_loop_contract, eq_opt_fn_contract, eq_synthetic_attr,
         item_kind_has_authored_verifier_source, pat_contains_authored_contract,
     };
     use rustc_ast::DUMMY_NODE_ID;
     use rustc_ast::ast::{
-        AttrItemKind, Block, BlockCheckMode, EarlyParsedAttribute, Expr, ExprKind, FnContract, FnContractClauseKind,
-        FnContractClauseLane, FnContractClauseMarker, ItemKind, LoopClause, LoopClauseKind, LoopContract, Pat, PatKind,
-        Stmt, StmtKind, TrustCitation, TrustNativeClause,
+        Block, BlockCheckMode, Expr, ExprKind, FnContract, FnContractClauseKind, FnContractClauseLane,
+        FnContractClauseMarker, ItemKind, LoopClause, LoopClauseKind, LoopContract, Pat, PatKind, Stmt, StmtKind,
+        SyntheticAttr, TrustCitation, TrustNativeClause,
     };
     use rustc_ast::attr::data_structures::CfgEntry;
     use rustc_ast::visit::Visitor;
     use rustc_span::{BytePos, DUMMY_SP, Ident, Span, Symbol, create_default_session_globals_then};
+
+    #[test]
+    fn synthetic_cfg_equality_ignores_only_spans_and_preserves_attribute_kind() {
+        create_default_session_globals_then(|| {
+            let left = CfgEntry::All(
+                vec![CfgEntry::Not(Box::new(CfgEntry::Bool(false, DUMMY_SP)), DUMMY_SP)].into(),
+                DUMMY_SP,
+            );
+            let mut right = left.clone();
+            right.lower_spans(|_| Span::with_root_ctxt(BytePos(1), BytePos(2)));
+            assert!(eq_synthetic_attr(
+                &SyntheticAttr::CfgTrace(left.clone()),
+                &SyntheticAttr::CfgTrace(right.clone()),
+            ));
+            assert!(eq_synthetic_attr(
+                &SyntheticAttr::CfgAttrTrace(left.clone()),
+                &SyntheticAttr::CfgAttrTrace(right.clone()),
+            ));
+            assert!(!eq_synthetic_attr(
+                &SyntheticAttr::CfgTrace(left),
+                &SyntheticAttr::CfgAttrTrace(right),
+            ));
+        });
+    }
+
+    #[test]
+    fn synthetic_cfg_equality_preserves_predicate_order_and_multiplicity() {
+        create_default_session_globals_then(|| {
+            let feature = |value| CfgEntry::NameValue {
+                name: Symbol::intern("feature"),
+                value: Some(Symbol::intern(value)),
+                span: DUMMY_SP,
+            };
+            let repeated = CfgEntry::All(vec![feature("a"), feature("a")].into(), DUMMY_SP);
+            let distinct = CfgEntry::All(vec![feature("a"), feature("b")].into(), DUMMY_SP);
+            let reordered = CfgEntry::All(vec![feature("b"), feature("a")].into(), DUMMY_SP);
+            assert!(!eq_synthetic_attr(
+                &SyntheticAttr::CfgTrace(repeated),
+                &SyntheticAttr::CfgTrace(distinct.clone()),
+            ));
+            assert!(!eq_synthetic_attr(
+                &SyntheticAttr::CfgAttrTrace(distinct.clone()),
+                &SyntheticAttr::CfgAttrTrace(reordered),
+            ));
+            assert!(!eq_synthetic_attr(
+                &SyntheticAttr::CfgTrace(distinct),
+                &SyntheticAttr::CfgTrace(CfgEntry::Any(vec![feature("a"), feature("b")].into(), DUMMY_SP)),
+            ));
+        });
+    }
 
     fn citation(name: &str, span: Span) -> TrustCitation {
         TrustCitation {
@@ -1394,7 +1413,6 @@ mod tests {
                     id: DUMMY_NODE_ID,
                     rules: BlockCheckMode::Default,
                     span: DUMMY_SP,
-                    tokens: None,
                 }),
                 None,
                 Some(Box::new(contract)),
@@ -1403,7 +1421,6 @@ mod tests {
                 id: DUMMY_NODE_ID,
                 kind: PatKind::Expr(Box::new(contract_loop)),
                 span: DUMMY_SP,
-                tokens: None,
             };
 
             assert!(pat_contains_authored_contract(&pat));
@@ -1422,15 +1439,6 @@ mod tests {
     }
 
     #[test]
-    fn parsed_attribute_equality_never_panics_or_guesses() {
-        let cfg = AttrItemKind::Parsed(EarlyParsedAttribute::CfgTrace(CfgEntry::Bool(true, DUMMY_SP)));
-        assert!(eq_attr_item_kind(&cfg, &cfg));
-
-        let cfg_attr = AttrItemKind::Parsed(EarlyParsedAttribute::CfgAttrTrace);
-        assert!(!eq_attr_item_kind(&cfg_attr, &cfg_attr));
-    }
-
-    #[test]
     fn pprust_rewrite_guard_classifies_clean_islands_as_authored_source() {
         // Trust: the island payload is the real Clean parse (ruling v7/D1); an
         // empty one is still authored verifier source.
@@ -1442,29 +1450,32 @@ mod tests {
         // had never executed once. Both defects were invisible to `x.py build`
         // and surface only under `x.py test src/tools/tippy`.
         create_default_session_globals_then(|| {
-            assert!(item_kind_has_authored_verifier_source(&ItemKind::CleanIsland(Box::new(
-                rustc_ast::CleanIsland {
+            assert!(item_kind_has_authored_verifier_source(&ItemKind::CleanIsland(
+                Box::new(rustc_ast::CleanIsland {
                     content_span: DUMMY_SP,
                     text: Symbol::intern(""),
-                    decls: thin_vec::ThinVec::new(),
+                    decls: rustc_data_structures::thin_vec::ThinVec::new(),
                     // Trust (I8): inline island — not a pending `clean mod` unit.
                     unloaded_unit: None,
-                }
-            ))));
+                })
+            )));
             // And a NON-empty island, so the row is not merely the empty case:
             // v7/D1's point is that the payload is a real parse either way.
-            assert!(item_kind_has_authored_verifier_source(&ItemKind::CleanIsland(Box::new(
-                rustc_ast::CleanIsland {
+            assert!(item_kind_has_authored_verifier_source(&ItemKind::CleanIsland(
+                Box::new(rustc_ast::CleanIsland {
                     content_span: DUMMY_SP,
                     text: Symbol::intern("def six : UInt64 := 6"),
-                    decls: thin_vec::ThinVec::new(),
+                    decls: rustc_data_structures::thin_vec::ThinVec::new(),
                     unloaded_unit: None,
-                }
-            ))));
+                })
+            )));
             // The converse: a plain fn with no contract is NOT authored
             // verifier source. Without this the assertion above would pass for
             // a predicate that returned `true` unconditionally.
-            assert!(!item_kind_has_authored_verifier_source(&ItemKind::ExternCrate(None, Ident::from_str("x"))));
+            assert!(!item_kind_has_authored_verifier_source(&ItemKind::ExternCrate(
+                None,
+                Ident::from_str("x")
+            )));
         });
     }
 }

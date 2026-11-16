@@ -1,0 +1,37 @@
+# Identities for adv3.trust_ir: the review of census/c0's real stage1 dump
+# of adv3.rs. Conventions: census_shapes.identities. `Iterator::for_each`
+# is DEFINED in core: design §2.2 classifies it CoreAlloc (the review's
+# adv3.core.identities), not by its `std::` display spelling.
+body adv_for_each_dup pub
+body adv_strip_skip7 pub
+body adv_strip_le pub
+body adv_close_then_place pub
+body adv_strip_step2 pub
+body adv_strip_until_hole pub
+body adv_exec_without_strip_if_nonzero pub
+core "<std::slice::Iter<'a, T> as std::iter::Iterator>::for_each" core::iter::Iterator::for_each
+core "core::slice::<impl [T]>::iter" "core::slice::<impl [T]>::iter"
+# The symbol census: upstream_spawn's object code references _fork, _execv
+# and _dup (nm/libupstream_spawn.nm).
+spawners upstream_spawn
+product-census
+
+effects adv_for_each_dup 9:23=fork 12:39=fcntl 14:20=core::iter::Iterator::for_each 15:17=execv 15:42=_exit
+effects "adv_for_each_dup::{closure#0}" 14:47=dup
+effects adv_strip_skip7 27:23=fork 31:34=fcntl 34:17=execv 34:42=_exit
+effects adv_strip_le 41:23=fork 44:44=fcntl 45:17=execv 45:42=_exit
+effects adv_close_then_place 53:23=fork 56:39=close 57:17=dup2 58:17=execv 58:42=_exit
+effects adv_strip_step2 65:23=fork 68:43=fcntl 69:17=execv 69:42=_exit
+effects adv_strip_until_hole 77:23=fork 81:24=fcntl 84:17=execv 84:42=_exit
+effects adv_exec_without_strip_if_nonzero 93:23=fork 96:21=execv 99:39=fcntl 100:17=execv 100:42=_exit
+# The producer refused this body: a call into a spawn-capable upstream crate.
+site adv_upstream_spawn 21:4=upstream_spawn::spawn_leaky
+
+drops adv_for_each_dup
+drops "adv_for_each_dup::{closure#0}"
+drops adv_strip_skip7
+drops adv_strip_le
+drops adv_close_then_place
+drops adv_strip_step2
+drops adv_strip_until_hole
+drops adv_exec_without_strip_if_nonzero

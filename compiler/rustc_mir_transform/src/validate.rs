@@ -1,26 +1,25 @@
 //! Validates the MIR to ensure that invariants are upheld.
 
 use rustc_abi::{ExternAbi, FIRST_VARIANT, Size};
+use rustc_attr_ir::InlineAttr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_hir::LangItem;
-use rustc_hir::attrs::InlineAttr;
 use rustc_index::IndexVec;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::traits::{Obligation, ObligationCause};
-use rustc_middle::mir::coverage::CoverageKind;
 use rustc_middle::mir::visit::{MutatingUseContext, NonUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{
-    self, CoroutineArgsExt, InstanceKind, ScalarInt, Ty, TyCtxt, TypeVisitableExt, Unnormalized,
-    Upcast, Variance,
+    self, InstanceKind, ScalarInt, Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast, Variance,
 };
-use rustc_middle::{bug, span_bug};
 use rustc_mir_dataflow::debuginfo::debuginfo_locals;
+use rustc_span::{bug, span_bug};
 use rustc_trait_selection::traits::ObligationCtxt;
 
+use crate::PassPolicy;
 use crate::util::{self, most_packed_projection};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -101,8 +100,8 @@ impl<'tcx> crate::MirPass<'tcx> for Validator {
         }
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(true)
     }
 }
 
@@ -280,7 +279,7 @@ impl<'a, 'tcx> CfgChecker<'a, 'tcx> {
                     }
                     Some(e) if *e == s => (),
                     Some(e) => self.fail(
-                        Location { block: bb, statement_index: 0 },
+                        bb.start_location(),
                         format!(
                             "Cleanup control flow violation: The blocks dominated by {:?} have edges to both {:?} and {:?}",
                             bb,
@@ -302,7 +301,7 @@ impl<'a, 'tcx> CfgChecker<'a, 'tcx> {
                 let no_cycle = stack.insert(parent);
                 if !no_cycle {
                     self.fail(
-                        Location { block: bb, statement_index: 0 },
+                        bb.start_location(),
                         format!(
                             "Cleanup control flow violation: Cycle involving edge {bb:?} -> {parent:?}",
                         ),
@@ -396,7 +395,7 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
             }
             StatementKind::Coverage(kind) => {
                 if self.body.phase >= MirPhase::Analysis(AnalysisPhase::PostCleanup)
-                    && let CoverageKind::BlockMarker { .. } | CoverageKind::SpanMarker { .. } = kind
+                    && kind.is_removed_after_analysis()
                 {
                     self.fail(
                         location,
@@ -435,7 +434,7 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
         }
 
         match &terminator.kind {
-            TerminatorKind::Goto { target } => {
+            TerminatorKind::Goto { target, .. } => {
                 self.check_edge(location, *target, EdgeKind::Normal);
             }
             TerminatorKind::SwitchInt { targets, discr: _ } => {
@@ -525,6 +524,26 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
                                     terminator.kind,
                                 ),
                             );
+                        }
+
+                        // Call arguments are moved by reference, so they must be plain locals
+                        // or the contents of a box; other moved places violate MIR invariants.
+                        if self.tcx.sess.opts.unstable_opts.validate_mir
+                            && self.body.phase < MirPhase::Runtime(RuntimePhase::Initial)
+                        {
+                            let is_plain_local = place.projection.is_empty();
+                            let is_box_deref =
+                                matches!(place.projection.as_ref(), [ProjectionElem::Deref])
+                                    && self.body.local_decls[place.local].ty.is_box();
+                            if !is_plain_local && !is_box_deref {
+                                self.fail(
+                                    location,
+                                    format!(
+                                        "encountered `Move` of a non-local, non-box place in `Call` terminator: {:?}",
+                                        terminator.kind,
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
@@ -705,11 +724,12 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         // is annoying. It is harmless enough to just not validate anything
         // in that case. We still check this after analysis as all opaque
         // types have been revealed at this point.
-        if pred.has_opaque_types() {
+        if !self.tcx.next_trait_solver_globally() && pred.has_opaque_types() {
             return true;
         }
 
-        let (infcx, param_env) = self.tcx.infer_ctxt().build_with_typing_env(self.typing_env);
+        let (infcx, param_env) =
+            self.tcx.infer_ctxt().ignoring_regions().build_with_typing_env(self.typing_env);
         let ocx = ObligationCtxt::new(&infcx);
         ocx.register_obligation(Obligation::new(
             self.tcx,
@@ -717,7 +737,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             param_env,
             pred,
         ));
-        ocx.evaluate_obligations_error_on_ambiguity().is_empty()
+        ocx.evaluate_obligations_error_on_ambiguity().no_errors()
     }
 }
 
@@ -791,24 +811,19 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     // Debug info is allowed to project into pattern types
                     ty::Pat(base, _) => check_equal(self, location, *base),
                     ty::Adt(adt_def, args) => {
-                        // see <https://github.com/rust-lang/rust/blob/7601adcc764d42c9f2984082b49948af652df986/compiler/rustc_middle/src/ty/layout.rs#L861-L864>
-                        if self.tcx.is_lang_item(adt_def.did(), LangItem::DynMetadata) {
-                            self.fail(
-                                location,
-                                format!(
-                                    "You can't project to field {f:?} of `DynMetadata` because \
+                        if !adt_def.can_project_fields(self.tcx) {
+                            let message =
+                                if self.tcx.is_lang_item(adt_def.did(), LangItem::DynMetadata) {
+                                    format!(
+                                        "You can't project to field {f:?} of `DynMetadata` because \
                                      layout is weird and thinks it doesn't have fields."
-                                ),
-                            );
-                        }
-
-                        if adt_def.repr().simd() {
-                            self.fail(
-                                location,
-                                format!(
-                                    "Projecting into SIMD type {adt_def:?} is banned by MCP#838"
-                                ),
-                            );
+                                    )
+                                } else {
+                                    format!(
+                                        "Projecting into SIMD type {adt_def:?} is banned by MCP#838"
+                                    )
+                                };
+                            self.fail(location, message);
                         }
 
                         let var = parent_ty.variant_index.unwrap_or(FIRST_VARIANT);
@@ -816,7 +831,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                             fail_out_of_bounds(self, location);
                             return;
                         };
-                        check_equal(self, location, field.ty(self.tcx, args).skip_norm_wip());
+                        check_equal(self, location, field.ty(self.tcx, *args).skip_norm_wip());
                     }
                     ty::Closure(_, args) => {
                         let args = args.as_closure();
@@ -881,14 +896,11 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                             ty::EarlyBinder::bind(self.tcx, f_ty.ty)
                                 .instantiate(self.tcx, args)
                                 .skip_norm_wip()
-                        } else {
-                            let Some(&f_ty) = args.as_coroutine().prefix_tys().get(f.index())
-                            else {
-                                fail_out_of_bounds(self, location);
-                                return;
-                            };
-
+                        } else if let Some(&f_ty) = args.as_coroutine().upvar_tys().get(f.index()) {
                             f_ty
+                        } else {
+                            fail_out_of_bounds(self, location);
+                            return;
                         };
 
                         check_equal(self, location, f_ty);
@@ -1484,7 +1496,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                             );
                         }
                     }
-                    CastKind::Transmute => {
+                    CastKind::Transmute | CastKind::BoxDerefTransmute => {
                         // Unlike `mem::transmute`, a MIR `Transmute` is well-formed
                         // for any two `Sized` types, just potentially UB to run.
 
@@ -1513,6 +1525,17 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                                 location,
                                 format!("Cannot transmute to non-`Sized` type {target_type:?}"),
                             );
+                        }
+
+                        if matches!(kind, CastKind::BoxDerefTransmute) {
+                            if !target_type.is_raw_ptr() {
+                                self.fail(
+                                    location,
+                                    format!(
+                                        "Cannot BoxDerefTransmute to non-pointer type {target_type}"
+                                    ),
+                                );
+                            }
                         }
                     }
                     CastKind::Subtype => {

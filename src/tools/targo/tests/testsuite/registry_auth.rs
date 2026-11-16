@@ -2,18 +2,13 @@
 
 use crate::prelude::*;
 use cargo_test_support::compare::assert_e2e;
-use cargo_test_support::registry::{Package, RegistryBuilder, Token};
+use cargo_test_support::registry::{Package, RegistryBuilder};
 use cargo_test_support::str;
 use cargo_test_support::{Execs, Project, project};
 
 fn cargo(p: &Project, s: &str) -> Execs {
     let mut e = p.cargo(s);
-    e.masquerade_as_nightly_cargo(&["asymmetric-token"])
-        .arg("-Zasymmetric-token");
-    e.env(
-        "CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS",
-        "cargo:paseto cargo:token",
-    );
+    e.env("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS", "cargo:token");
     e
 }
 
@@ -31,6 +26,9 @@ fn make_project() -> Project {
                 [dependencies.bar]
                 version = "0.0.1"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -52,7 +50,7 @@ fn requires_credential_provider() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] failed to download `bar v0.0.1 (registry `alternative`)`
 
 Caused by:
@@ -60,7 +58,7 @@ Caused by:
 
 Caused by:
   authenticated registries require a credential-provider to be configured
-  see https://doc.rust-lang.org/cargo/reference/registry-authentication.html for details
+  see https://doc.rust-lang.org/[..]cargo/reference/registry-authentication.html for details
 
 "#]])
         .run();
@@ -78,31 +76,7 @@ fn simple() {
     cargo(&p, "build")
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
-[DOWNLOADING] crates ...
-[DOWNLOADED] bar v0.0.1 (registry `alternative`)
-[COMPILING] bar v0.0.1 (registry `alternative`)
-[COMPILING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
-        .run();
-}
-
-#[cargo_test]
-fn simple_with_asymmetric() {
-    let _registry = RegistryBuilder::new()
-        .alternative()
-        .auth_required()
-        .http_index()
-        .token(cargo_test_support::registry::Token::rfc_key())
-        .build();
-
-    let p = make_project();
-    cargo(&p, "build")
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
 [COMPILING] bar v0.0.1 (registry `alternative`)
@@ -131,7 +105,7 @@ fn environment_config() {
         .env("CARGO_REGISTRIES_ALTERNATIVE_TOKEN", registry.token())
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
 [COMPILING] bar v0.0.1 (registry `alternative`)
@@ -156,7 +130,7 @@ fn environment_token() {
         .env("CARGO_REGISTRIES_ALTERNATIVE_TOKEN", registry.token())
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
 [COMPILING] bar v0.0.1 (registry `alternative`)
@@ -164,169 +138,6 @@ fn environment_token() {
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
-        .run();
-}
-
-#[cargo_test]
-fn environment_token_with_asymmetric() {
-    let registry = RegistryBuilder::new()
-        .alternative()
-        .auth_required()
-        .no_configure_token()
-        .http_index()
-        .token(cargo_test_support::registry::Token::Keys(
-            "k3.secret.fNYVuMvBgOlljt9TDohnaYLblghqaHoQquVZwgR6X12cBFHZLFsaU3q7X3k1Zn36"
-                .to_string(),
-            None,
-        ))
-        .build();
-
-    let p = make_project();
-    cargo(&p, "build")
-        .env("CARGO_REGISTRIES_ALTERNATIVE_SECRET_KEY", registry.key())
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
-[DOWNLOADING] crates ...
-[DOWNLOADED] bar v0.0.1 (registry `alternative`)
-[COMPILING] bar v0.0.1 (registry `alternative`)
-[COMPILING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
-        .run();
-}
-
-#[cargo_test]
-fn bad_environment_token_with_asymmetric_subject() {
-    let registry = RegistryBuilder::new()
-        .alternative()
-        .auth_required()
-        .no_configure_token()
-        .http_index()
-        .token(cargo_test_support::registry::Token::Keys(
-            "k3.secret.fNYVuMvBgOlljt9TDohnaYLblghqaHoQquVZwgR6X12cBFHZLFsaU3q7X3k1Zn36"
-                .to_string(),
-            None,
-        ))
-        .build();
-
-    let p = make_project();
-    cargo(&p, "build")
-        .env("CARGO_REGISTRIES_ALTERNATIVE_SECRET_KEY", registry.key())
-        .env(
-            "CARGO_REGISTRIES_ALTERNATIVE_SECRET_KEY_SUBJECT",
-            "incorrect",
-        )
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[ERROR] failed to get `bar` as a dependency of package `foo v0.0.1 ([ROOT]/foo)`
-
-Caused by:
-  failed to load source for dependency `bar`
-
-Caused by:
-  unable to update registry `alternative`
-
-Caused by:
-  token rejected for `alternative`, please run `cargo login --registry alternative`
-  or use environment variable CARGO_REGISTRIES_ALTERNATIVE_TOKEN
-  [NOTE] the token does not include an authentication scheme
-
-Caused by:
-  failed to get successful HTTP response from `http://127.0.0.1:[..]/index/config.json` ([..]), got 401
-  body:
-  Unauthorized message from server.
-
-"#]])
-        .with_status(101)
-        .run();
-}
-
-#[cargo_test]
-fn bad_environment_token_with_asymmetric_incorrect_subject() {
-    let registry = RegistryBuilder::new()
-        .alternative()
-        .auth_required()
-        .no_configure_token()
-        .http_index()
-        .token(cargo_test_support::registry::Token::rfc_key())
-        .build();
-
-    let p = make_project();
-    cargo(&p, "build")
-        .env("CARGO_REGISTRIES_ALTERNATIVE_SECRET_KEY", registry.key())
-        .env(
-            "CARGO_REGISTRIES_ALTERNATIVE_SECRET_KEY_SUBJECT",
-            "incorrect",
-        )
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[ERROR] failed to get `bar` as a dependency of package `foo v0.0.1 ([ROOT]/foo)`
-
-Caused by:
-  failed to load source for dependency `bar`
-
-Caused by:
-  unable to update registry `alternative`
-
-Caused by:
-  token rejected for `alternative`, please run `cargo login --registry alternative`
-  or use environment variable CARGO_REGISTRIES_ALTERNATIVE_TOKEN
-  [NOTE] the token does not include an authentication scheme
-
-Caused by:
-  failed to get successful HTTP response from `http://127.0.0.1:[..]/index/config.json` ([..]), got 401
-  body:
-  Unauthorized message from server.
-
-"#]])
-        .with_status(101)
-        .run();
-}
-
-#[cargo_test]
-fn bad_environment_token_with_incorrect_asymmetric() {
-    let _registry = RegistryBuilder::new()
-        .alternative()
-        .auth_required()
-        .no_configure_token()
-        .http_index()
-        .token(cargo_test_support::registry::Token::Keys(
-            "k3.secret.fNYVuMvBgOlljt9TDohnaYLblghqaHoQquVZwgR6X12cBFHZLFsaU3q7X3k1Zn36"
-                .to_string(),
-            None,
-        ))
-        .build();
-
-    let p = make_project();
-    cargo(&p, "build")
-        .env(
-            "CARGO_REGISTRIES_ALTERNATIVE_SECRET_KEY",
-            "k3.secret.9Vxr5hVlI_g_orBZN54vPz20bmB4O76wB_MVqUSuJJJqHFLwP8kdn_RY5g6J6pQG",
-        )
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[ERROR] failed to get `bar` as a dependency of package `foo v0.0.1 ([ROOT]/foo)`
-
-Caused by:
-  failed to load source for dependency `bar`
-
-Caused by:
-  unable to update registry `alternative`
-
-Caused by:
-  token rejected for `alternative`, please run `cargo login --registry alternative`
-  or use environment variable CARGO_REGISTRIES_ALTERNATIVE_TOKEN
-  [NOTE] the token does not include an authentication scheme
-
-Caused by:
-  failed to get successful HTTP response from `http://127.0.0.1:[..]/index/config.json` ([..]), got 401
-  body:
-  Unauthorized message from server.
-
-"#]])
-        .with_status(101)
         .run();
 }
 
@@ -373,7 +184,7 @@ fn missing_token_git() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] failed to download `bar v0.0.1 (registry `alternative`)`
 
 Caused by:
@@ -439,7 +250,7 @@ fn incorrect_token_git() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [ERROR] failed to download from `http://127.0.0.1:[..]/dl/bar/0.0.1/download`
 
@@ -567,7 +378,7 @@ fn duplicate_index() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] failed to download `bar v0.0.1 (registry `alternative`)`
 
 Caused by:
@@ -590,7 +401,7 @@ fn token_not_logged() {
         .http_api()
         .http_index()
         .auth_required()
-        .token(Token::Plaintext("a-unique_token".to_string()))
+        .token("a-unique_token".to_string())
         .build();
     Package::new("bar", "1.0.0").publish();
     let p = project()

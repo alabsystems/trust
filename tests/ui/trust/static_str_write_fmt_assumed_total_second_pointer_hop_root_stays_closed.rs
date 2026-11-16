@@ -98,7 +98,14 @@ impl fmt::Write for Sink {
     }
 }
 
+// ZERO-ROW-GATE (2026-10-10): `render` must refuse for its OWN reason, an obligation it
+// keeps (the extern-call assumption-panic row), not as a zero-obligation body. `mid`
+// and `write_str` above are also refused now, by the zero-row gate, exactly as in the
+// control; this rail is about `render`.
+//~vv ERROR Trust strict verification failed for `static_str_write_fmt_assumed_total_second_pointer_hop_root_stays_closed::render`
+//~v NOTE an unproved assumption-panic row
 pub fn render(sink: &mut Sink) -> fmt::Result {
     use fmt::Write as _;
     write!(sink, "constant")
 }
+

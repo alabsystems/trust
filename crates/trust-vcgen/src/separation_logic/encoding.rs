@@ -76,39 +76,35 @@ pub fn encode_heap_disjointness(lhs: &SepFormula, rhs: &SepFormula) -> Formula {
         return Formula::Bool(true);
     }
 
-    let mut constraints = Vec::new();
+    let mut constraints = Vec::with_capacity(lhs_addrs.len() * rhs_addrs.len());
     for l_addr in &lhs_addrs {
         for r_addr in &rhs_addrs {
             // l_addr != r_addr
             constraints.push(Formula::Not(Box::new(Formula::Eq(
-                Box::new(l_addr.clone()),
-                Box::new(r_addr.clone()),
+                Box::new((*l_addr).clone()),
+                Box::new((*r_addr).clone()),
             ))));
         }
     }
 
     if constraints.len() == 1 {
-        // SAFETY: len == 1 guarantees .next() returns Some.
-        constraints
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| unreachable!("empty iter despite len == 1"))
+        constraints.pop().unwrap_or(Formula::Bool(true))
     } else {
         Formula::And(constraints)
     }
 }
 
 /// Collect all concrete address formulas from a separation logic formula.
-pub(super) fn collect_addresses(sep: &SepFormula) -> Vec<Formula> {
-    let mut addrs = Vec::new();
+pub(super) fn collect_addresses(sep: &SepFormula) -> Vec<&Formula> {
+    let mut addrs = Vec::with_capacity(sep.cell_count());
     collect_addresses_inner(sep, &mut addrs);
     addrs
 }
 
-fn collect_addresses_inner(sep: &SepFormula, addrs: &mut Vec<Formula>) {
+fn collect_addresses_inner<'a>(sep: &'a SepFormula, addrs: &mut Vec<&'a Formula>) {
     match sep {
         SepFormula::PointsTo { addr, .. } => {
-            addrs.push(addr.clone());
+            addrs.push(addr);
         }
         SepFormula::SepStar(lhs, rhs) | SepFormula::SepWand(lhs, rhs) => {
             collect_addresses_inner(lhs, addrs);
@@ -135,35 +131,33 @@ pub fn encode_unsafe_block(
     span: &SourceSpan,
     heap_var: &str,
 ) -> Vec<VerificationCondition> {
-    let mut vcs = Vec::new();
-
     let pre_fol = sep_to_formula(pre, heap_var);
     let post_fol = sep_to_formula(post, heap_var);
+    let fn_sym: trust_types::Symbol = func_name.into();
 
-    // VC 1: Precondition must be satisfiable (not trivially false)
-    vcs.push(VerificationCondition {
-        kind: VcKind::Assertion {
-            message: format!("[unsafe:sep] heap precondition for unsafe block in {func_name}"),
+    vec![
+        // VC 1: Precondition must be satisfiable (not trivially false)
+        VerificationCondition {
+            kind: VcKind::Assertion {
+                message: format!("[unsafe:sep] heap precondition for unsafe block in {func_name}"),
+            },
+            function: fn_sym,
+            location: span.clone(),
+            formula: Formula::Not(Box::new(pre_fol.clone())),
+            contract_metadata: None,
+            obligation: None,
         },
-        function: func_name.into(),
-        location: span.clone(),
-        formula: Formula::Not(Box::new(pre_fol.clone())),
-        contract_metadata: None,
-        obligation: None,
-    });
-
-    // VC 2: Postcondition must follow from precondition
-    // Violation: precondition holds but postcondition doesn't
-    vcs.push(VerificationCondition {
-        kind: VcKind::Assertion {
-            message: format!("[unsafe:sep] heap postcondition for unsafe block in {func_name}"),
+        // VC 2: Postcondition must follow from precondition
+        // Violation: precondition holds but postcondition doesn't
+        VerificationCondition {
+            kind: VcKind::Assertion {
+                message: format!("[unsafe:sep] heap postcondition for unsafe block in {func_name}"),
+            },
+            function: fn_sym,
+            location: span.clone(),
+            formula: Formula::And(vec![pre_fol, Formula::Not(Box::new(post_fol))]),
+            contract_metadata: None,
+            obligation: None,
         },
-        function: func_name.into(),
-        location: span.clone(),
-        formula: Formula::And(vec![pre_fol, Formula::Not(Box::new(post_fol))]),
-        contract_metadata: None,
-        obligation: None,
-    });
-
-    vcs
+    ]
 }

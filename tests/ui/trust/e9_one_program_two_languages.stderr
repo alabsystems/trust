@@ -69,7 +69,7 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL | pub fn s1(x: u64) -> u64 ensures x >= x by u64_ge_refl { x }
    |                                            ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s4`, with a clean certification audit
   --> $DIR/e9_one_program_two_languages.rs:39:49
@@ -77,7 +77,7 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL | pub fn s4(x: u64) -> u64 ensures result >= x by u64_ge_refl { x }
    |                                                 ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s2`, with a clean certification audit
   --> $DIR/e9_one_program_two_languages.rs:41:58
@@ -85,7 +85,7 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL | pub fn s2(x: u64) -> u64 ensures ident(x) >= ident(x) by u64_ge_refl { x }
    |                                                          ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s3`, with a clean certification audit
   --> $DIR/e9_one_program_two_languages.rs:43:44
@@ -93,7 +93,7 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL | pub fn s3(x: u64) -> u64 ensures x >= x by u64_ge_refl ensures x <= x by u64_ge_refl { x }
    |                                            ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s3`, with a clean certification audit
   --> $DIR/e9_one_program_two_languages.rs:43:74
@@ -101,7 +101,7 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL | pub fn s3(x: u64) -> u64 ensures x >= x by u64_ge_refl ensures x <= x by u64_ge_refl { x }
    |                                                                          ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `min2_le_left` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s5`, with a clean certification audit
   --> $DIR/e9_one_program_two_languages.rs:45:61
@@ -109,7 +109,7 @@ note: citation `min2_le_left` kernel-discharges this postcondition statement: th
 LL | pub fn s5(x: u64, y: u64) -> u64 ensures min2(x, y) <= x by min2_le_left { x }
    |                                                             ^^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s6`, with a clean certification audit
   --> $DIR/e9_one_program_two_languages.rs:47:58
@@ -117,5 +117,5 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL | pub fn s6(x: u64) -> u64 ensures ident(x) >= ident(x) by u64_ge_refl {
    |                                                          ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 

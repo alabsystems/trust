@@ -1,10 +1,10 @@
 use std::ops::Range;
 
 use rustc_abi::{Align, ExternAbi, HasDataLayout, Primitive, Scalar, Size, WrappingRange};
+use rustc_attr_ir::Linkage;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_codegen_ssa::common;
 use rustc_codegen_ssa::traits::*;
-use rustc_hir::LangItem;
-use rustc_hir::attrs::Linkage;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
@@ -15,15 +15,13 @@ use rustc_middle::mir::interpret::{
 use rustc_middle::mono::MonoItem;
 use rustc_middle::ty::layout::{HasTypingEnv, LayoutOf};
 use rustc_middle::ty::{self, Instance};
-use rustc_middle::{bug, span_bug};
-use rustc_span::Symbol;
-use rustc_target::spec::{Arch, LlvmAbi};
+use rustc_span::{Symbol, bug, span_bug};
+use rustc_target::spec::Arch;
 use tracing::{debug, instrument, trace};
 
 use crate::common::CodegenCx;
-use crate::errors::SymbolAlreadyDefined;
+use crate::diagnostics::SymbolAlreadyDefined;
 use crate::llvm::{self, Type, Value, const_ptr_auth};
-use crate::type_of::LayoutLlvmExt;
 use crate::{base, debuginfo};
 
 /// Indicates whether a value originates from a `static`.
@@ -32,6 +30,7 @@ pub(crate) enum IsStatic {
     No,
 }
 /// Indicates whether a symbol is part of `.init_array` or `.fini_array`.
+#[derive(PartialEq)]
 pub(crate) enum IsInitOrFini {
     Yes,
     No,
@@ -120,23 +119,14 @@ pub(crate) fn const_alloc_to_llvm<'ll>(
             as u64;
 
         let address_space = cx.tcx.global_alloc(prov.alloc_id()).address_space(cx);
-        // Under pointer authentication, function pointers stored in init/fini arrays need special
-        // handling.
-        let pac_metadata = Some(
-            if cx.sess().target.llvm_abiname == LlvmAbi::Pauthtest
-                && matches!(is_init_fini, IsInitOrFini::Yes)
-            {
-                PacMetadata {
-                    // Must correspond to ptrauth_key_init_fini_pointer from `ptrauth.h`.
-                    key: 0,
-                    // ptrauth_string_discriminator("init_fini")
-                    disc: 0xd9d4,
-                    addr_diversity: AddressDiversity::Synthetic(1),
-                }
-            } else {
-                PacMetadata::default()
-            },
-        );
+        let schema = if cx.sess().pointer_authentication() {
+            match is_init_fini {
+                IsInitOrFini::Yes => cx.sess().pointer_authentication_init_fini(),
+                IsInitOrFini::No => cx.sess().pointer_authentication_functions(),
+            }
+        } else {
+            None
+        };
         llvals.push(cx.scalar_to_backend_with_pac(
             InterpScalar::from_pointer(Pointer::new(prov, Size::from_bytes(ptr_offset)), &cx.tcx),
             Scalar::Initialized {
@@ -144,7 +134,7 @@ pub(crate) fn const_alloc_to_llvm<'ll>(
                 valid_range: WrappingRange::full(pointer_size),
             },
             cx.type_ptr_ext(address_space),
-            pac_metadata,
+            schema,
         ));
         next_offset = offset + pointer_size_bytes;
     }
@@ -209,7 +199,7 @@ fn check_and_apply_linkage<'ll, 'tcx>(
         let mut should_sign = false;
         // Declare a symbol `foo`. If `foo` is an extern_weak symbol, we declare
         // an extern_weak function, otherwise a global with the desired linkage.
-        let g1 = if matches!(attrs.import_linkage, Some(Linkage::ExternalWeak)) {
+        let actual_global = if matches!(attrs.import_linkage, Some(Linkage::ExternalWeak)) {
             // An `extern_weak` function is represented as an `Option<unsafe extern ...>`,
             // we extract the function signature and declare it as an extern_weak function
             // instead of an extern_weak i8.
@@ -221,7 +211,7 @@ fn check_and_apply_linkage<'ll, 'tcx>(
                 let fn_sig = sig.with(*header);
                 let fn_abi = cx.fn_abi_of_fn_ptr(fn_sig, ty::List::empty());
                 // Decide if the initializer needs to be signed
-                if cx.sess().target.llvm_abiname == LlvmAbi::Pauthtest
+                if cx.sess().pointer_authentication_functions().is_some()
                     && matches!(fn_sig.abi(), ExternAbi::C { .. } | ExternAbi::System { .. })
                 {
                     should_sign = true;
@@ -233,11 +223,29 @@ fn check_and_apply_linkage<'ll, 'tcx>(
         } else {
             cx.declare_global(sym, cx.type_i8())
         };
-        llvm::set_linkage(g1, base::linkage_to_llvm(linkage));
+        llvm::set_linkage(actual_global, base::linkage_to_llvm(linkage));
 
         // Normally this is done in `get_static_inner`, but when as we generate an internal global,
         // it will apply the dso_local to the internal global instead, so do it here, too.
-        cx.assume_dso_local(g1, true);
+        cx.assume_dso_local(actual_global, true);
+
+        // Sign the function pointer that is used to initialize the global
+        let initializer = if should_sign {
+            let schema = cx
+                .tcx
+                .sess
+                .pointer_authentication_functions()
+                .expect("pointer authentication functions must be available when signing");
+
+            const_ptr_auth(
+                actual_global,
+                schema.key as u32,
+                schema.constant_discriminator as u64,
+                None, /* address_diversity */
+            )
+        } else {
+            actual_global
+        };
 
         // Declare an internal global `extern_with_linkage_foo` which
         // is initialized with the address of `foo`. If `foo` is
@@ -247,35 +255,21 @@ fn check_and_apply_linkage<'ll, 'tcx>(
         // zero.
         let real_name =
             format!("_rust_extern_with_linkage_{:016x}_{sym}", cx.tcx.stable_crate_id(LOCAL_CRATE));
-        let g2 = cx.define_global(&real_name, llty).unwrap_or_else(|| {
-            cx.sess().dcx().emit_fatal(SymbolAlreadyDefined {
-                span: cx.tcx.def_span(def_id),
-                symbol_name: sym,
-            })
-        });
-        llvm::set_linkage(g2, llvm::Linkage::InternalLinkage);
-        llvm::set_unnamed_address(g2, llvm::UnnamedAddr::Global);
+        let pointer_global =
+            cx.define_global(&real_name, cx.val_ty(initializer)).unwrap_or_else(|| {
+                cx.sess().dcx().emit_fatal(SymbolAlreadyDefined {
+                    span: cx.tcx.def_span(def_id),
+                    symbol_name: sym,
+                })
+            });
+        llvm::set_linkage(pointer_global, llvm::Linkage::InternalLinkage);
+        llvm::set_unnamed_address(pointer_global, llvm::UnnamedAddr::Global);
 
-        // Sign the function pointer that is used to initialize the global
-        let initializer = if should_sign {
-            let key: u32 = 0;
-            let discriminator: u64 = 0;
+        llvm::set_initializer(pointer_global, initializer);
 
-            const_ptr_auth(
-                cx.const_bitcast(g1, llty),
-                key,
-                discriminator,
-                None, /* address_diversity */
-            )
-        } else {
-            g1
-        };
-
-        llvm::set_initializer(g2, initializer);
-
-        g2
+        pointer_global
     } else if cx.tcx.sess.target.arch == Arch::X86
-        && common::is_mingw_gnu_toolchain(&cx.tcx.sess.target)
+        && common::is_using_dlltool(&cx.tcx.sess.target)
         && let Some(dllimport) = crate::common::get_dllimport(cx.tcx, def_id, sym)
     {
         cx.declare_global(&common::i686_decorated_name(dllimport, true, true, false), llty)
@@ -364,7 +358,7 @@ impl<'ll> CodegenCx<'ll, '_> {
         } else {
             let ty = instance.ty(self.tcx, self.typing_env());
             trace!(?ty);
-            self.layout_of(ty).llvm_type(self)
+            self.type_array(self.type_i8(), self.layout_of(ty).size.bytes())
         };
         self.get_static_inner(def_id, llty)
     }
@@ -425,8 +419,11 @@ impl<'ll> CodegenCx<'ll, '_> {
         let dso_local = self.assume_dso_local(g, true);
 
         if !def_id.is_local() {
+            let is_eii = fn_attrs.flags.contains(CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM);
             let needs_dll_storage_attr = self.use_dll_storage_attrs
-                && !self.tcx.is_foreign_item(def_id)
+                // EII static declarations are encoded as foreign items, but their symbols are
+                // resolved by Rust crates, not native libraries.
+                && (!self.tcx.is_foreign_item(def_id) || is_eii)
                 // Local definitions can never be imported, so we must not apply
                 // the DLLImport annotation.
                 && !dso_local
@@ -446,10 +443,11 @@ impl<'ll> CodegenCx<'ll, '_> {
 
             if needs_dll_storage_attr {
                 // This item is external but not foreign, i.e., it originates from an external Rust
-                // crate. Since we don't know whether this crate will be linked dynamically or
-                // statically in the final application, we always mark such symbols as 'dllimport'.
-                // If final linkage happens to be static, we rely on compiler-emitted __imp_ stubs
-                // to make things work.
+                // crate. EII static declarations are handled the same way, even though they are
+                // represented as foreign items. Since we don't know whether this crate will be
+                // linked dynamically or statically in the final application, we always mark such
+                // symbols as 'dllimport'. If final linkage happens to be static, we rely on
+                // compiler-emitted __imp_ stubs to make things work.
                 //
                 // However, in some scenarios we defer emission of statics to downstream
                 // crates, so there are cases where a static with an upstream DefId
@@ -548,8 +546,9 @@ impl<'ll> CodegenCx<'ll, '_> {
         }
 
         // Wasm statics with custom link sections get special treatment as they
-        // go into custom sections of the wasm executable. The exception to this
-        // is the `.init_array` section which are treated specially by the wasm linker.
+        // also go into custom sections of the wasm executable. The exception to
+        // this is the `.init_array` section for which we can't emit a custom
+        // section as it contains relocations.
         if self.tcx.sess.target.is_like_wasm
             && attrs
                 .link_section
@@ -568,11 +567,85 @@ impl<'ll> CodegenCx<'ll, '_> {
                 let data = [section, alloc];
                 self.module_add_named_metadata_node(self.llmod(), c"wasm.custom_sections", &data);
             }
-        } else {
-            base::set_link_section(g, attrs);
         }
 
+        base::set_link_section(g, attrs);
         base::set_variable_sanitizer_attrs(g, attrs);
+
+        if let Some(ignorelist) = &self.sanitizer_ignorelist {
+            let instance = ty::Instance::mono(self.tcx, def_id);
+            let sym_name = self.tcx.symbol_name(instance).name;
+            let span = self.tcx.def_span(def_id);
+            let source_map = self.tcx.sess.source_map();
+            let filename =
+                source_map.span_to_filename(span).prefer_local_unconditionally().to_string();
+            let ty_name = rustc_middle::ty::print::with_no_trimmed_paths!(
+                self.tcx.type_of(def_id).skip_binder().to_string()
+            );
+            let mainfile = self
+                .tcx
+                .sess
+                .local_crate_source_file()
+                .and_then(|path| path.local_path().map(|p| p.display().to_string()))
+                .unwrap_or_default();
+
+            let demangled =
+                rustc_middle::ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(def_id));
+
+            let global_blame = |section| -> (
+                rustc_sanitizers::ignorelist::Blame,
+                rustc_sanitizers::ignorelist::Blame,
+            ) {
+                let mut no_san = rustc_sanitizers::ignorelist::Blame::NONE;
+                let mut san = rustc_sanitizers::ignorelist::Blame::NONE;
+                let mut update = |prefix, query| {
+                    let (ns, s) = ignorelist.in_section_blame(section, prefix, query);
+                    no_san = no_san.max(ns);
+                    san = san.max(s);
+                };
+                update(c"global", sym_name);
+                update(c"global", &demangled);
+                update(c"src", &filename);
+                if !mainfile.is_empty() {
+                    update(c"mainfile", &mainfile);
+                }
+                update(c"type", &ty_name);
+                (no_san, san)
+            };
+
+            let sanitizers = self.tcx.sess.sanitizers();
+            let (address_nosan, address_san) = global_blame(c"address");
+            let (kaddress_nosan, kaddress_san) = global_blame(c"kernel-address");
+            let (hwaddress_nosan, hwaddress_san) = global_blame(c"hwaddress");
+            let (khwaddress_nosan, khwaddress_san) = global_blame(c"kernel-hwaddress");
+
+            let ignore_address =
+                rustc_sanitizers::ignorelist::is_blame_ignored(address_nosan, address_san);
+            let ignore_kernel_address = rustc_sanitizers::ignorelist::is_blame_ignored(
+                address_nosan.max(kaddress_nosan),
+                address_san.max(kaddress_san),
+            );
+            let ignore_hwaddress =
+                rustc_sanitizers::ignorelist::is_blame_ignored(hwaddress_nosan, hwaddress_san);
+            let ignore_kernel_hwaddress = rustc_sanitizers::ignorelist::is_blame_ignored(
+                hwaddress_nosan.max(khwaddress_nosan),
+                hwaddress_san.max(khwaddress_san),
+            );
+
+            if (sanitizers.contains(rustc_target::spec::SanitizerSet::ADDRESS) && ignore_address)
+                || (sanitizers.contains(rustc_target::spec::SanitizerSet::KERNELADDRESS)
+                    && ignore_kernel_address)
+            {
+                unsafe { llvm::LLVMRustSetNoSanitizeAddress(g) };
+            }
+            if (sanitizers.contains(rustc_target::spec::SanitizerSet::HWADDRESS)
+                && ignore_hwaddress)
+                || (sanitizers.contains(rustc_target::spec::SanitizerSet::KERNELHWADDRESS)
+                    && ignore_kernel_hwaddress)
+            {
+                unsafe { llvm::LLVMRustSetNoSanitizeHWAddress(g) };
+            }
+        }
 
         if attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER) {
             // `USED` and `USED_LINKER` can't be used together.
@@ -685,7 +758,7 @@ impl<'ll> CodegenCx<'ll, '_> {
                 let g = self.define_global(&sym, llty).unwrap_or_else(|| {
                     bug!("symbol `{}` is already defined", sym);
                 });
-                set_global_alignment(self, g, self.tcx.data_layout.pointer_align().abi);
+                set_global_alignment(self, g, self.tcx.data_layout.pointer_align());
                 llvm::set_initializer(g, llval);
                 llvm::set_linkage(g, llvm::Linkage::PrivateLinkage);
                 llvm::set_section(g, c"__OBJC,__cls_refs,literal_pointers,no_dead_strip");
@@ -705,7 +778,7 @@ impl<'ll> CodegenCx<'ll, '_> {
                 let g = self.define_global(&sym, llty).unwrap_or_else(|| {
                     bug!("symbol `{}` is already defined", sym);
                 });
-                set_global_alignment(self, g, self.tcx.data_layout.pointer_align().abi);
+                set_global_alignment(self, g, self.tcx.data_layout.pointer_align());
                 llvm::set_initializer(g, llval);
                 llvm::set_linkage(g, llvm::Linkage::InternalLinkage);
                 llvm::set_section(g, c"__DATA,__objc_classrefs,regular,no_dead_strip");
@@ -768,7 +841,7 @@ impl<'ll> CodegenCx<'ll, '_> {
         let selref_g = self.define_global(&selref_sym, selref_llty).unwrap_or_else(|| {
             bug!("symbol `{}` is already defined", selref_sym);
         });
-        set_global_alignment(self, selref_g, self.tcx.data_layout.pointer_align().abi);
+        set_global_alignment(self, selref_g, self.tcx.data_layout.pointer_align());
         llvm::set_initializer(selref_g, selref_llval);
         llvm::set_externally_initialized(selref_g, true);
         llvm::set_linkage(
@@ -824,7 +897,7 @@ impl<'ll> CodegenCx<'ll, '_> {
         let g = self.define_global(&sym, llty).unwrap_or_else(|| {
             bug!("symbol `{}` is already defined", sym);
         });
-        set_global_alignment(self, g, self.tcx.data_layout.pointer_align().abi);
+        set_global_alignment(self, g, self.tcx.data_layout.pointer_align());
         llvm::set_initializer(g, llval);
         llvm::set_linkage(g, llvm::Linkage::PrivateLinkage);
         llvm::set_section(g, c"__OBJC,__module_info,regular,no_dead_strip");

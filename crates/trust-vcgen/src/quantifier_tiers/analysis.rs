@@ -6,13 +6,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::HashSet;
-
+use trust_types::fx::FxHashSet;
 use trust_types::{Formula, Sort, Symbol};
 
 use super::eliminator::{apply_tier_strategy, has_quantifiers};
 use super::finite_domain::{instantiate_binding_prefix, substitute};
-use super::presburger::free_vars;
 use super::types::{
     QuantifierConfig, QuantifierError, QuantifierStats, QuantifierTier, SolverStrategy,
 };
@@ -66,9 +64,9 @@ fn analyze_quantifiers_rec(
             analyze_quantifiers_rec(body, new_depth, Some(QPolarity::Exists), stats);
         }
         _ => {
-            for child in formula.children() {
+            trust_types::for_each_formula_child(formula, |child| {
                 analyze_quantifiers_rec(child, depth, parent_polarity, stats);
-            }
+            });
         }
     }
 }
@@ -131,15 +129,22 @@ fn skolemize_rec(
     formula: &Formula,
     enclosing_universals: &[(Symbol, Sort)],
     positive: bool,
-    allocator: &mut SkolemSymbolAllocator,
+    allocator: &mut SkolemSymbolAllocator<'_>,
 ) -> Result<Formula, QuantifierError> {
+    if !has_quantifiers(formula) {
+        return Ok(formula.clone());
+    }
     match formula {
         Formula::Forall(bindings, body) => {
             require_positive_unique_bindings("forall", bindings, positive)?;
+            if enclosing_universals.is_empty() {
+                let new_body = skolemize_rec(body, bindings, positive, allocator)?;
+                return Ok(Formula::Forall(bindings.clone(), Box::new(new_body)));
+            }
             // A nested binder shadows an outer spelling. Remove the shadowed
             // dependency while this lexical scope is active, then add the
             // inner binding as the visible universal.
-            let binding_names: HashSet<&str> =
+            let binding_names: FxHashSet<&str> =
                 bindings.iter().map(|(name, _)| name.as_str()).collect();
             let mut extended: Vec<_> = enclosing_universals
                 .iter()
@@ -152,13 +157,19 @@ fn skolemize_rec(
         }
         Formula::Exists(bindings, body) => {
             require_positive_unique_bindings("exists", bindings, positive)?;
-            let binding_names: HashSet<&str> =
-                bindings.iter().map(|(name, _)| name.as_str()).collect();
-            let visible_universals: Vec<_> = enclosing_universals
-                .iter()
-                .filter(|(name, _)| !binding_names.contains(name.as_str()))
-                .cloned()
-                .collect();
+            let visible_owned: Vec<(Symbol, Sort)>;
+            let visible_universals: &[(Symbol, Sort)] = if enclosing_universals.is_empty() {
+                &[]
+            } else {
+                let binding_names: FxHashSet<&str> =
+                    bindings.iter().map(|(name, _)| name.as_str()).collect();
+                visible_owned = enclosing_universals
+                    .iter()
+                    .filter(|(name, _)| !binding_names.contains(name.as_str()))
+                    .cloned()
+                    .collect();
+                &visible_owned
+            };
             // Replace each existentially bound variable with a Skolem term.
             let mut current_body = *body.clone();
             for (var_name, var_sort) in bindings {
@@ -173,7 +184,7 @@ fn skolemize_rec(
                 current_body = substitute(&current_body, var_name.as_str(), &skolem_term);
             }
             // Continue skolemizing in the (now existential-free) body.
-            skolemize_rec(&current_body, &visible_universals, positive, allocator)
+            skolemize_rec(&current_body, visible_universals, positive, allocator)
         }
         Formula::Not(inner) => Ok(Formula::Not(Box::new(skolemize_rec(
             inner,
@@ -219,7 +230,7 @@ fn require_positive_unique_bindings(
             reason: format!("{quantifier} occurs in a negative Boolean position"),
         });
     }
-    let mut names = HashSet::new();
+    let mut names = FxHashSet::default();
     for (name, _) in bindings {
         if name.as_str().is_empty() || !names.insert(name.as_str()) {
             return Err(QuantifierError::UnsupportedSkolemization {
@@ -230,15 +241,20 @@ fn require_positive_unique_bindings(
     Ok(())
 }
 
-struct SkolemSymbolAllocator {
-    occupied: HashSet<String>,
+struct SkolemSymbolAllocator<'a> {
+    root: &'a Formula,
+    occupied: Option<FxHashSet<String>>,
     next: usize,
 }
 
-impl SkolemSymbolAllocator {
-    fn new(formula: &Formula) -> Self {
-        let mut occupied = HashSet::new();
-        formula.visit(&mut |node| match node {
+impl<'a> SkolemSymbolAllocator<'a> {
+    fn new(formula: &'a Formula) -> Self {
+        Self { root: formula, occupied: None, next: 0 }
+    }
+
+    fn collect_occupied(formula: &Formula) -> FxHashSet<String> {
+        let mut occupied = FxHashSet::default();
+        trust_types::visit_formula_nodes(formula, &mut |node| match node {
             Formula::Var(name, _) => {
                 occupied.insert(name.clone());
             }
@@ -267,14 +283,15 @@ impl SkolemSymbolAllocator {
             }
             _ => {}
         });
-        Self { occupied, next: 0 }
+        occupied
     }
 
     fn fresh(&mut self) -> String {
+        let occupied = self.occupied.get_or_insert_with(|| Self::collect_occupied(self.root));
         loop {
             self.next = self.next.saturating_add(1);
             let candidate = crate::generated_formula_symbol("skolem", &self.next.to_string());
-            if self.occupied.insert(candidate.clone()) {
+            if occupied.insert(candidate.clone()) {
                 return candidate;
             }
         }
@@ -297,7 +314,7 @@ pub fn try_instantiate_universal(
 ) -> Result<Formula, QuantifierError> {
     match formula {
         Formula::Forall(bindings, body) => {
-            let mut seen = HashSet::new();
+            let mut seen = FxHashSet::default();
             for (name, _) in bindings {
                 if name.as_str().is_empty() || !seen.insert(name.as_str()) {
                     return Err(QuantifierError::UnsupportedInstantiation {
@@ -336,8 +353,11 @@ pub fn instantiate_universal(formula: &Formula, terms: &[Formula]) -> Formula {
 /// 3. **Empty binding removal**: `forall(). P` becomes `P`.
 #[must_use]
 pub fn simplify_quantified(formula: &Formula) -> Formula {
+    if !has_quantifiers(formula) {
+        return formula.clone();
+    }
     // Bottom-up: simplify children first, then simplify self.
-    let simplified_children = match formula {
+    match formula {
         Formula::Not(inner) => Formula::Not(Box::new(simplify_quantified(inner))),
         Formula::And(cs) => Formula::And(cs.iter().map(simplify_quantified).collect()),
         Formula::Or(cs) => Formula::Or(cs.iter().map(simplify_quantified).collect()),
@@ -352,75 +372,79 @@ pub fn simplify_quantified(formula: &Formula) -> Formula {
         Formula::Eq(a, b) => {
             Formula::Eq(Box::new(simplify_quantified(a)), Box::new(simplify_quantified(b)))
         }
-        Formula::Forall(bindings, body) => {
-            Formula::Forall(bindings.clone(), Box::new(simplify_quantified(body)))
-        }
-        Formula::Exists(bindings, body) => {
-            Formula::Exists(bindings.clone(), Box::new(simplify_quantified(body)))
-        }
-        other => other.clone(),
-    };
-
-    // Now apply quantifier-specific simplifications at this level.
-    match &simplified_children {
-        Formula::Forall(bindings, body) => simplify_forall(bindings, body),
-        Formula::Exists(bindings, body) => simplify_exists(bindings, body),
+        Formula::Forall(bindings, body) => simplify_forall(bindings, simplify_quantified(body)),
+        Formula::Exists(bindings, body) => simplify_exists(bindings, simplify_quantified(body)),
         other => other.clone(),
     }
 }
 
+fn filter_non_vacuous_bindings(
+    bindings: &[(trust_types::Symbol, Sort)],
+    body: &Formula,
+) -> Vec<(trust_types::Symbol, Sort)> {
+    if bindings.len() <= 1 {
+        return bindings
+            .iter()
+            .filter(|(name, _)| {
+                trust_types::any_free_variable_name(body, &mut |v| v == name.as_str())
+            })
+            .cloned()
+            .collect();
+    }
+    let mut live = vec![false; bindings.len()];
+    let mut remaining = bindings.len();
+    let _ = trust_types::any_free_variable_name(body, &mut |v| {
+        for (idx, (name, _)) in bindings.iter().enumerate() {
+            if !live[idx] && name.as_str() == v {
+                live[idx] = true;
+                remaining -= 1;
+            }
+        }
+        remaining == 0
+    });
+    bindings
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, b)| if live[idx] { Some(b.clone()) } else { None })
+        .collect()
+}
+
 /// Simplify a `Forall` node after children are already simplified.
-fn simplify_forall(bindings: &[(trust_types::Symbol, Sort)], body: &Formula) -> Formula {
+fn simplify_forall(bindings: &[(trust_types::Symbol, Sort)], body: Formula) -> Formula {
     if bindings.is_empty() {
-        return body.clone();
+        return body;
     }
 
-    let body_free = free_vars(body);
-    let non_vacuous: Vec<(trust_types::Symbol, Sort)> =
-        bindings.iter().filter(|(name, _)| body_free.contains(name.as_str())).cloned().collect();
-
+    let mut non_vacuous = filter_non_vacuous_bindings(bindings, &body);
     if non_vacuous.is_empty() {
-        return body.clone();
+        return body;
     }
 
     // Merge nested same-kind: forall x. forall y. P => forall x, y. P
     if let Formula::Forall(inner_bindings, inner_body) = body {
-        let mut merged = non_vacuous;
-        merged.extend(inner_bindings.iter().cloned());
-        return Formula::Forall(merged, inner_body.clone());
+        non_vacuous.extend(inner_bindings);
+        return Formula::Forall(non_vacuous, inner_body);
     }
 
-    if non_vacuous.len() == bindings.len() {
-        Formula::Forall(bindings.to_vec(), Box::new(body.clone()))
-    } else {
-        Formula::Forall(non_vacuous, Box::new(body.clone()))
-    }
+    Formula::Forall(non_vacuous, Box::new(body))
 }
 
 /// Simplify an `Exists` node after children are already simplified.
-fn simplify_exists(bindings: &[(trust_types::Symbol, Sort)], body: &Formula) -> Formula {
+fn simplify_exists(bindings: &[(trust_types::Symbol, Sort)], body: Formula) -> Formula {
     if bindings.is_empty() {
-        return body.clone();
+        return body;
     }
 
-    let body_free = free_vars(body);
-    let non_vacuous: Vec<(trust_types::Symbol, Sort)> =
-        bindings.iter().filter(|(name, _)| body_free.contains(name.as_str())).cloned().collect();
-
+    let mut non_vacuous = filter_non_vacuous_bindings(bindings, &body);
     if non_vacuous.is_empty() {
-        return body.clone();
+        return body;
     }
 
     // Merge nested same-kind: exists x. exists y. P => exists x, y. P
     if let Formula::Exists(inner_bindings, inner_body) = body {
-        let mut merged = non_vacuous;
-        merged.extend(inner_bindings.iter().cloned());
-        return Formula::Exists(merged, inner_body.clone());
+        non_vacuous.extend(inner_bindings);
+        return Formula::Exists(non_vacuous, inner_body);
     }
 
-    if non_vacuous.len() == bindings.len() {
-        Formula::Exists(bindings.to_vec(), Box::new(body.clone()))
-    } else {
-        Formula::Exists(non_vacuous, Box::new(body.clone()))
-    }
+    Formula::Exists(non_vacuous, Box::new(body))
 }

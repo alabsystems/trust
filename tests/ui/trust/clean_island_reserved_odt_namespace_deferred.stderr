@@ -1,0 +1,10 @@
+error: Clean island declaration `trust_type_ident_fact` declares into the compiler's ODT readable-alias namespace (`trust_type_*`); that namespace is reserved for the checked aliases the compiler generates for Rust types, and an island may not define or shadow a name in it. Refer to the generated `trust_type_<crate>__<Type>` names from your theorems, and give your own declarations your own names
+  --> $DIR/clean_island_reserved_odt_namespace_deferred.rs:16:5
+   |
+LL |     theorem trust_type_ident_fact (x : UInt64) :
+   |     ^^^^^^^
+   |
+   = note: this island names the kernel-import namespace, so it was checked after program admissions were minted (two-language design item 10)
+
+error: aborting due to 1 previous error
+

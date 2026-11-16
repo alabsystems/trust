@@ -32,16 +32,102 @@ pub(crate) fn unsupported_mir_vcs(func: &VerifiableFunction) -> Vec<Verification
 /// emits thousands of identical-`kind` leaves at a single span that otherwise
 /// flow downstream as distinct raw obligations and feed the result-assembly
 /// pass; here they coalesce to one entry per distinct display key.
+///
+/// The collapse must not lose WHY a collapsed row stopped (determinism plan
+/// §3.7): a marker left by a per-function budget trip carries a stop token in
+/// its detail (`[stop:steps]`, or `[stop:wall-backstop]` when the clock tripped),
+/// and the rows sharing its display key may carry none. The kept row therefore
+/// takes the least reproducible cause any collapsed row stated
+/// ([`trust_types::determinism::StopCause::combine`]); otherwise a clock-degraded
+/// marker could be dropped behind a sibling that reads as a deterministic
+/// `unsupported`. Between deterministic causes the kept row's text stands.
+#[derive(Clone, Debug)]
+enum KeptDisplaySlot {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl KeptDisplaySlot {
+    #[inline]
+    fn find(
+        &self,
+        out: &[VerificationCondition],
+        kind: &str,
+        location: &SourceSpan,
+    ) -> Option<usize> {
+        let matches_at = |idx: usize| {
+            out.get(idx).is_some_and(|kept| {
+                kept.location == *location
+                    && matches!(
+                        &kept.kind,
+                        VcKind::UnsupportedMir { kind: kept_kind, .. } if kept_kind == kind
+                    )
+            })
+        };
+        match self {
+            Self::One(idx) => matches_at(*idx).then_some(*idx),
+            Self::Many(indices) => indices.iter().copied().find(|&idx| matches_at(idx)),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, idx: usize) {
+        match self {
+            Self::One(first) => *self = Self::Many(vec![*first, idx]),
+            Self::Many(indices) => indices.push(idx),
+        }
+    }
+}
+
 pub(super) fn dedup_unsupported_by_display_key(
     vcs: Vec<VerificationCondition>,
 ) -> Vec<VerificationCondition> {
-    let mut seen: FxHashSet<(String, SourceSpan)> = FxHashSet::default();
-    let mut out = Vec::new();
+    if vcs.len() <= 1 {
+        return vcs;
+    }
+    use std::hash::{Hash, Hasher};
+    use trust_types::determinism::StopCause;
+    use trust_types::fx::FxHasher;
+    // Hash `(kind, &vc.location)` in-place and verify exact equality against
+    // `out[idx]` so neither unique nor duplicate rows clone `kind: String` or
+    // `vc.location.file: String`.
+    let mut kept_at: FxHashMap<u64, KeptDisplaySlot> = FxHashMap::default();
+    let mut out: Vec<VerificationCondition> = Vec::with_capacity(vcs.len());
     for vc in vcs {
         match &vc.kind {
-            VcKind::UnsupportedMir { kind, .. } => {
-                if seen.insert((kind.clone(), vc.location.clone())) {
+            VcKind::UnsupportedMir { kind, detail } => {
+                let mut hasher = FxHasher::default();
+                kind.hash(&mut hasher);
+                vc.location.hash(&mut hasher);
+                let hash = hasher.finish();
+                let found = match kept_at.entry(hash) {
+                    std::collections::hash_map::Entry::Vacant(vacant) => {
+                        vacant.insert(KeptDisplaySlot::One(out.len()));
+                        None
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                        if let Some(index) = occupied.get().find(&out, kind, &vc.location) {
+                            Some(index)
+                        } else {
+                            occupied.get_mut().push(out.len());
+                            None
+                        }
+                    }
+                };
+                let Some(index) = found else {
                     out.push(vc);
+                    continue;
+                };
+                let Some(dropped) = StopCause::from_reason(detail) else { continue };
+                if let Some(kept_vc) = out.get_mut(index)
+                    && let VcKind::UnsupportedMir { detail: kept_detail, .. } = &mut kept_vc.kind
+                {
+                    // A row with no token reads as `unsupported` (deterministic).
+                    let kept_rank = StopCause::from_reason(kept_detail)
+                        .map_or(0, |cause| cause.reproducibility().rank());
+                    if dropped.reproducibility().rank() > kept_rank {
+                        *kept_detail = dropped.stamp(kept_detail);
+                    }
                 }
             }
             // Defensive: anything that is not an UnsupportedMir obligation is
@@ -68,20 +154,21 @@ pub(super) fn collect_body_type_unsupported(
     // no distinct obligation is lost; provable obligations come from the
     // per-statement generators, not this type walk.
     let mut seen_types: FxHashSet<&Ty> = FxHashSet::default();
-    if seen_types.insert(&func.body.return_ty) {
-        collect_type_unsupported(
-            func,
-            "return type".to_string(),
-            &func.body.return_ty,
-            &func.span,
-            vcs,
-        );
+    // PERF-COMPILER-VCGEN-808: `collect_type_unsupported` emits nothing for a type
+    // with no unsupported declaration (its own first test), so ask that cheap,
+    // short-circuiting walk BEFORE structurally hashing the whole type into
+    // `seen_types`. Hashing a large recursive ADT per local dominated this pass on
+    // the measured fixture corpus; the emitted set is identical.
+    if ty_has_unsupported_declaration(&func.body.return_ty)
+        && seen_types.insert(&func.body.return_ty)
+    {
+        collect_type_unsupported(func, &"return type", &func.body.return_ty, &func.span, vcs);
     }
     for local in &func.body.locals {
-        if seen_types.insert(&local.ty) {
+        if ty_has_unsupported_declaration(&local.ty) && seen_types.insert(&local.ty) {
             collect_type_unsupported(
                 func,
-                format!("local _{} type", local.index),
+                &format_args!("local _{} type", local.index),
                 &local.ty,
                 &func.span,
                 vcs,
@@ -90,13 +177,46 @@ pub(super) fn collect_body_type_unsupported(
     }
 }
 
+fn ty_has_unsupported_declaration(ty: &Ty) -> bool {
+    match ty {
+        Ty::Unsupported { kind, detail }
+            if kind == "TyKind::Adt" && detail.starts_with("recursive") =>
+        {
+            false
+        }
+        Ty::Unsupported { kind, .. } if kind == "TyKind::Param" || kind == "TyKind::Array" => false,
+        Ty::Unsupported { .. } if ty.is_pre_mono_alias_marker() => false,
+        Ty::Unsupported { .. } => true,
+        Ty::Ref { inner, .. }
+        | Ty::RawPtr { pointee: inner, .. }
+        | Ty::Slice { elem: inner }
+        | Ty::Array { elem: inner, .. }
+        | Ty::SymArray { elem: inner, .. } => ty_has_unsupported_declaration(inner),
+        Ty::Tuple(fields) => fields.iter().any(ty_has_unsupported_declaration),
+        Ty::Adt { fields, .. } => {
+            fields.iter().any(|(_, field_ty)| ty_has_unsupported_declaration(field_ty))
+        }
+        Ty::Closure { upvars, .. } | Ty::Coroutine { upvars, .. } => {
+            upvars.iter().any(ty_has_unsupported_declaration)
+        }
+        Ty::FnDef { sig, .. } | Ty::FnPtr { sig } => {
+            sig.params.iter().any(ty_has_unsupported_declaration)
+                || ty_has_unsupported_declaration(&sig.ret)
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn collect_type_unsupported(
     func: &VerifiableFunction,
-    context: String,
+    context: &dyn std::fmt::Display,
     ty: &Ty,
     span: &SourceSpan,
     vcs: &mut Vec<VerificationCondition>,
 ) {
+    if !ty_has_unsupported_declaration(ty) {
+        return;
+    }
     match ty {
         // Precision: a *recursive* ADT/enum (e.g. `clean_kernel::Expr`, a tree,
         // a linked list) is a legitimate, inhabited Rust value type that merely
@@ -220,16 +340,34 @@ pub(super) fn collect_type_unsupported(
             span.clone(),
         )),
         Ty::Ref { inner, .. } => {
-            collect_type_unsupported(func, format!("{context} pointee"), inner, span, vcs);
+            collect_type_unsupported(func, &format_args!("{context} pointee"), inner, span, vcs);
         }
         Ty::RawPtr { pointee, .. } => {
-            collect_type_unsupported(func, format!("{context} raw pointee"), pointee, span, vcs);
+            collect_type_unsupported(
+                func,
+                &format_args!("{context} raw pointee"),
+                pointee,
+                span,
+                vcs,
+            );
         }
         Ty::Slice { elem } => {
-            collect_type_unsupported(func, format!("{context} slice element"), elem, span, vcs);
+            collect_type_unsupported(
+                func,
+                &format_args!("{context} slice element"),
+                elem,
+                span,
+                vcs,
+            );
         }
         Ty::Array { elem, .. } => {
-            collect_type_unsupported(func, format!("{context} array element"), elem, span, vcs);
+            collect_type_unsupported(
+                func,
+                &format_args!("{context} array element"),
+                elem,
+                span,
+                vcs,
+            );
         }
         // Trust: piece #7a — a const-generic array's DECLARATION carries no direct
         // obligation (identical to the `TyKind::Array` relaxation above: the only
@@ -238,13 +376,19 @@ pub(super) fn collect_type_unsupported(
         // element type so a `[SomeUnsupportedElem; N]` still stamps the element's
         // marker. The SymArray itself stamps no spurious declaration marker.
         Ty::SymArray { elem, .. } => {
-            collect_type_unsupported(func, format!("{context} array element"), elem, span, vcs);
+            collect_type_unsupported(
+                func,
+                &format_args!("{context} array element"),
+                elem,
+                span,
+                vcs,
+            );
         }
         Ty::Tuple(fields) => {
             for (index, field_ty) in fields.iter().enumerate() {
                 collect_type_unsupported(
                     func,
-                    format!("{context} tuple field {index}"),
+                    &format_args!("{context} tuple field {index}"),
                     field_ty,
                     span,
                     vcs,
@@ -255,7 +399,7 @@ pub(super) fn collect_type_unsupported(
             for (name, field_ty) in fields {
                 collect_type_unsupported(
                     func,
-                    format!("{context} field {name}"),
+                    &format_args!("{context} field {name}"),
                     field_ty,
                     span,
                     vcs,
@@ -266,7 +410,7 @@ pub(super) fn collect_type_unsupported(
             for (index, upvar_ty) in upvars.iter().enumerate() {
                 collect_type_unsupported(
                     func,
-                    format!("{context} upvar {index}"),
+                    &format_args!("{context} upvar {index}"),
                     upvar_ty,
                     span,
                     vcs,
@@ -277,13 +421,19 @@ pub(super) fn collect_type_unsupported(
             for (index, param_ty) in sig.params.iter().enumerate() {
                 collect_type_unsupported(
                     func,
-                    format!("{context} param {index}"),
+                    &format_args!("{context} param {index}"),
                     param_ty,
                     span,
                     vcs,
                 );
             }
-            collect_type_unsupported(func, format!("{context} return"), &sig.ret, span, vcs);
+            collect_type_unsupported(
+                func,
+                &format_args!("{context} return"),
+                &sig.ret,
+                span,
+                vcs,
+            );
         }
         _ => {}
     }
@@ -291,7 +441,7 @@ pub(super) fn collect_type_unsupported(
 
 pub(super) fn collect_place_type_unsupported(
     func: &VerifiableFunction,
-    context: String,
+    context: &dyn std::fmt::Display,
     span: &SourceSpan,
     place: &trust_types::Place,
     vcs: &mut Vec<VerificationCondition>,
@@ -331,7 +481,7 @@ pub(super) fn collect_place_type_unsupported(
             trust_types::Projection::OpaqueCast(ty)
             | trust_types::Projection::UnwrapUnsafeBinder(ty) => collect_type_unsupported(
                 func,
-                format!("{context} projection {index}"),
+                &format_args!("{context} projection {index}"),
                 ty,
                 span,
                 vcs,
@@ -401,7 +551,7 @@ pub(super) fn unsupported_mir_vc(
 ) -> VerificationCondition {
     VerificationCondition {
         kind: VcKind::UnsupportedMir { kind, detail },
-        function: func.name.clone().into(),
+        function: func.name.as_str().into(),
         location: span,
         // Direct solver callers fail closed: VCs are violation formulas, so
         // `true` is SAT and must never be reported as a proof. The compiler
@@ -433,7 +583,7 @@ pub(super) fn collect_statement_unsupported(
         Statement::Assign { place, rvalue, span } => {
             collect_place_type_unsupported(
                 func,
-                format!("bb{} stmt{} assignment place", block.0, stmt_index),
+                &format_args!("bb{} stmt{} assignment place", block.0, stmt_index),
                 span,
                 place,
                 vcs,
@@ -441,7 +591,7 @@ pub(super) fn collect_statement_unsupported(
             if let Rvalue::Aggregate(kind, operands) = rvalue {
                 collect_aggregate_field_sort_unsupported(
                     func,
-                    format!("bb{} stmt{} aggregate field", block.0, stmt_index),
+                    &format_args!("bb{} stmt{} aggregate field", block.0, stmt_index),
                     span,
                     place,
                     kind,
@@ -451,7 +601,7 @@ pub(super) fn collect_statement_unsupported(
             }
             collect_rvalue_unsupported(
                 func,
-                format!("bb{} stmt{}", block.0, stmt_index),
+                &format_args!("bb{} stmt{}", block.0, stmt_index),
                 span,
                 place,
                 rvalue,
@@ -469,16 +619,14 @@ pub(super) fn collect_statement_unsupported(
             }
             collect_place_type_unsupported(
                 func,
-                format!("bb{} stmt{} set-discriminant place", block.0, stmt_index),
+                &format_args!("bb{} stmt{} set-discriminant place", block.0, stmt_index),
                 &span,
                 place,
                 vcs,
             );
-            if set_discriminant_definitions(func, place, *variant_index).is_ok() {
+            let Some(detail) = set_discriminant_support_error(func, place, *variant_index) else {
                 return;
-            }
-            let detail = set_discriminant_support_error(func, place, *variant_index)
-                .unwrap_or_else(|| "SetDiscriminant layout could not be validated".to_string());
+            };
             vcs.push(unsupported_mir_vc(
                 func,
                 "StatementKind::SetDiscriminant".to_string(),
@@ -493,7 +641,7 @@ pub(super) fn collect_statement_unsupported(
             let span = SourceSpan::default();
             collect_place_type_unsupported(
                 func,
-                format!("bb{} stmt{} deinit place", block.0, stmt_index),
+                &format_args!("bb{} stmt{} deinit place", block.0, stmt_index),
                 &span,
                 place,
                 vcs,
@@ -512,7 +660,7 @@ pub(super) fn collect_statement_unsupported(
             let span = SourceSpan::default();
             collect_place_type_unsupported(
                 func,
-                format!("bb{} stmt{} retag place", block.0, stmt_index),
+                &format_args!("bb{} stmt{} retag place", block.0, stmt_index),
                 &span,
                 place,
                 vcs,
@@ -534,7 +682,7 @@ pub(super) fn collect_statement_unsupported(
             let span = SourceSpan::default();
             collect_place_type_unsupported(
                 func,
-                format!("bb{} stmt{} place mention", block.0, stmt_index),
+                &format_args!("bb{} stmt{} place mention", block.0, stmt_index),
                 &span,
                 place,
                 vcs,
@@ -544,7 +692,7 @@ pub(super) fn collect_statement_unsupported(
             let span = SourceSpan::default();
             collect_operands_unsupported(
                 func,
-                format!("bb{} stmt{} intrinsic args", block.0, stmt_index),
+                &format_args!("bb{} stmt{} intrinsic args", block.0, stmt_index),
                 &span,
                 args,
                 vcs,
@@ -571,7 +719,7 @@ pub(super) fn collect_statement_unsupported(
             ));
             collect_operands_unsupported(
                 func,
-                format!("bb{} stmt{} unsupported operands", block.0, stmt_index),
+                &format_args!("bb{} stmt{} unsupported operands", block.0, stmt_index),
                 span,
                 operands,
                 vcs,
@@ -587,7 +735,7 @@ pub(super) fn collect_statement_unsupported(
             for (slot, operand) in [("src", src), ("dst", dst), ("count", count)] {
                 collect_operand_unsupported(
                     func,
-                    format!("bb{} stmt{} copy_nonoverlapping {slot}", block.0, stmt_index),
+                    &format_args!("bb{} stmt{} copy_nonoverlapping {slot}", block.0, stmt_index),
                     span,
                     operand,
                     vcs,
@@ -604,10 +752,13 @@ pub(super) fn retag_is_metadata_noop(
 ) -> bool {
     // Retag only changes Stacked Borrows/provenance metadata. It is verification-inert
     // for safe MIR, but raw-pointer or unresolved places need a provenance model.
-    crate::place_ty(func, place).is_some() && !has_intrinsic_unsafe_surface(func)
+    crate::place_ty_cow(func, place).is_some() && !has_intrinsic_unsafe_surface(func)
 }
 
-pub(super) fn intrinsic_is_metadata_noop(
+/// `pub(crate)` (2026-10-09, trust-interval-drop-havoc) for the interval lane's
+/// statement transfer (`abstract_interp::transfer::StmtWrite::of`), which forgets
+/// every tracked name at an intrinsic statement this predicate does not clear.
+pub(crate) fn intrinsic_is_metadata_noop(
     func: &VerifiableFunction,
     name: &str,
     args: &[Operand],
@@ -652,24 +803,88 @@ pub(crate) fn place_is_coroutine_frame(
     matches!(ty, Ty::Coroutine { .. })
 }
 
+/// The DECODED declared discriminant a `SetDiscriminant` of `variant_index` on
+/// `place` writes (`Ty::variant_tag`); `Err` when the place's type is unknown or
+/// its variant descriptor has no such variant.
+fn set_discriminant_tag(
+    func: &VerifiableFunction,
+    place: &trust_types::Place,
+    variant_index: usize,
+) -> Result<i128, String> {
+    crate::place_ty_cow(func, place).and_then(|ty| ty.variant_tag(variant_index)).ok_or_else(
+        || {
+            format!(
+                "variant {variant_index} has no declared discriminant in the variant descriptor of `{}`",
+                place_to_var_name(func, place)
+            )
+        },
+    )
+}
+
+/// Trust (triage ticket 216): the names a `SetDiscriminant` on `place` writes
+/// besides the place itself — the canonical `discr_<place>` variable and the
+/// explicit tag field's variable, the two names `set_discriminant_definitions`
+/// defines.
+///
+/// The write oracle (`extend_with_assigned_place_dests`, `stmt_direct_write_names`)
+/// adds these even when `set_discriminant_definitions` refuses the write (a tag
+/// the field cannot hold) and so defines nothing: `discr_<place>` is not a
+/// projection of the place, so killing the bare place never reached it, and a
+/// stale `discr_<place> == old` fact survived the write. When the definitions
+/// succeed, the block-level sets already held both names as the definitions' own
+/// def names; the per-statement sets (`stmt_direct_write_names`) gain
+/// `discr_<place>` in both cases. Adding a written name only kills or versions
+/// more, so it can turn a proof into a failure, never the reverse.
+pub(crate) fn set_discriminant_synthetic_write_names(
+    func: &VerifiableFunction,
+    place: &trust_types::Place,
+) -> [Option<String>; 2] {
+    let discr = crate::discriminant_formula_var_name(&place_to_var_name(func, place));
+    let tag_field = crate::explicit_discriminant_field_for_place(func, place)
+        .ok()
+        .map(|explicit| place_to_var_name(func, &explicit.place));
+    [Some(discr), tag_field]
+}
+
 pub(crate) fn set_discriminant_definitions(
     func: &VerifiableFunction,
     place: &trust_types::Place,
     variant_index: usize,
 ) -> Result<Vec<Formula>, String> {
-    // TrustIr's simple tagged-ADT abstraction stores the variant index in an
-    // explicit tag field; the canonical discr_* fact preserves existing readers.
+    set_discriminant_definitions_with_place_name(func, place, variant_index, None)
+}
+
+fn set_discriminant_definitions_with_place_name(
+    func: &VerifiableFunction,
+    place: &trust_types::Place,
+    variant_index: usize,
+    place_name_hint: Option<&str>,
+) -> Result<Vec<Formula>, String> {
+    // TrustIr's simple tagged-ADT abstraction stores the DECODED declared
+    // discriminant in an explicit tag field, and the canonical discr_* fact
+    // carries the same value — the one `enum_variant_tag_set` constrains discr_*
+    // to and every tag reader compares against. Never the variant index (triage
+    // ticket 216): for `enum E { A = 5, B = 9 }` an index fact `discr_e == 1`
+    // contradicted `discr_e ∈ {5, 9}`.
     let explicit = crate::explicit_discriminant_field_for_place(func, place)?;
+    let tag = set_discriminant_tag(func, place, variant_index)?;
     let (explicit_sort, explicit_value) =
-        crate::explicit_discriminant_value_formula(&explicit.ty, variant_index)?;
-    let canonical_value = crate::unsigned_value_to_formula(variant_index as u128);
-    let place_name = place_to_var_name(func, place);
+        crate::explicit_discriminant_value_formula(&explicit.ty, tag, variant_index)?;
+    let canonical_value = Formula::Int(tag);
+    let owned_place_name;
+    let place_name = match place_name_hint {
+        Some(name) => name,
+        None => {
+            owned_place_name = place_to_var_name(func, place);
+            owned_place_name.as_str()
+        }
+    };
     let explicit_name = place_to_var_name(func, &explicit.place);
 
     Ok(vec![
         Formula::Eq(Box::new(Formula::Var(explicit_name, explicit_sort)), Box::new(explicit_value)),
         Formula::Eq(
-            Box::new(Formula::Var(crate::discriminant_formula_var_name(&place_name), Sort::Int)),
+            Box::new(Formula::Var(crate::discriminant_formula_var_name(place_name), Sort::Int)),
             Box::new(canonical_value),
         ),
     ])
@@ -681,11 +896,14 @@ pub(super) fn set_discriminant_support_error(
     variant_index: usize,
 ) -> Option<String> {
     match crate::explicit_discriminant_field_for_place(func, place) {
-        Ok(explicit) => crate::explicit_discriminant_value_formula(&explicit.ty, variant_index)
+        Ok(explicit) => set_discriminant_tag(func, place, variant_index)
+            .and_then(|tag| {
+                crate::explicit_discriminant_value_formula(&explicit.ty, tag, variant_index)
+            })
             .err()
             .map(|detail| {
                 format!(
-                    "ADT discriminant/tag field `{}` exists but variant index is not representable: {detail}",
+                    "ADT discriminant/tag field `{}` exists but the discriminant of variant {variant_index} is not representable: {detail}",
                     explicit.name
                 )
             }),
@@ -715,14 +933,23 @@ pub(super) fn extract_set_discriminant_definitions_until(
             continue;
         };
         let key = place_to_var_name(func, place);
-        if !seen_places.insert(key) {
+        if seen_places.contains(key.as_str()) {
             continue;
         }
-        if let Ok(defs) = set_discriminant_definitions(func, place, *variant_index) {
+        if let Ok(defs) = set_discriminant_definitions_with_place_name(
+            func,
+            place,
+            *variant_index,
+            Some(key.as_str()),
+        ) {
             groups.push(defs);
         }
+        seen_places.insert(key);
     }
 
+    if groups.len() <= 1 {
+        return groups.pop().unwrap_or_default();
+    }
     groups.reverse();
     groups.into_iter().flatten().collect()
 }
@@ -742,19 +969,19 @@ pub(super) fn collect_terminator_unsupported(
         )),
         Terminator::SwitchInt { discr, span, .. } => collect_operand_unsupported(
             func,
-            format!("bb{} switch discriminant", block.0),
+            &format_args!("bb{} switch discriminant", block.0),
             span,
             discr,
             vcs,
         ),
         Terminator::Assert { cond, span, .. } => collect_operand_unsupported(
             func,
-            format!("bb{} assert condition", block.0),
+            &format_args!("bb{} assert condition", block.0),
             span,
             cond,
             vcs,
         ),
-        Terminator::Call { func: callee, args, dest, target, span, .. } => {
+        Terminator::Call { func: callee, args, dest, target, span, callee_key, .. } => {
             // Trust: a `panic!`/`assert!` lowers to a diverging call to a panic
             // intrinsic whose arguments are the panic message/location (e.g. a
             // `&str` constant). Those arguments are irrelevant to safety — the
@@ -762,11 +989,15 @@ pub(super) fn collect_terminator_unsupported(
             // which is generated as a panic-freedom obligation during TrustIr
             // lowering. Emitting an `unsupported_mir` VC for an unrepresentable
             // panic-message constant would wedge every `assert!`/`panic!` at
-            // Unknown, so skip operand collection for recognized panic calls.
-            if !is_panic_intrinsic_call(callee) {
+            // Unknown, so skip operand collection for the sysroot's own panic
+            // entries — decided by the extractor's DIVERGE-ENTRY-1 stamp and the
+            // absence of a continuation, never by the rendered name alone
+            // (PANIC-SKIP-ANCHOR-1; see `diverging_panic_entry_operands_unread`).
+            if !diverging_panic_entry_operands_unread(callee_key.as_ref(), callee, target.is_none())
+            {
                 collect_operands_unsupported(
                     func,
-                    format!("bb{} call args", block.0),
+                    &format_args!("bb{} call args", block.0),
                     span,
                     args,
                     vcs,
@@ -792,92 +1023,285 @@ pub(super) fn collect_terminator_unsupported(
             // solvable lane keys on), the UnsupportedMir row is REPLACED by the
             // refutation-grade VC from `generate_unwrap_panic_freedom_vcs` —
             // never silently dropped: every other case keeps this fail-closed row.
-            if target.is_some()
-                && is_known_panicking_method(callee)
-                && !unwrap_is_infallible_slice_to_array(func, callee, args, dest)
-                // Trust (countdown-loop piece, B0): a const-int `try_into().expect()`
-                // that provably fits its target is success-by-construction — the
-                // panic path is unreachable, so no Unknown row (see
-                // `expect_infallible_const_int_conversion` for the hard gates).
-                && expect_infallible_const_int_conversion(func, callee, args, dest).is_none()
-                && !unwrap_panic_freedom_modeled(func, callee, args)
-            {
+            if target.is_some() {
                 let m = method_tail(callee);
-                vcs.push(unsupported_mir_vc(
-                    func,
-                    format!("Call::{m}::panic-freedom-unverified"),
-                    format!(
-                        "bb{}: `{m}` panics on None/Err and its panic-freedom is not \
-                         modeled — match / `if let` to prove it; use `-Z trust-policy=advisory` only \
-                         for non-proof triage",
-                        block.0
-                    ),
-                    span.clone(),
-                ));
-            }
-            // SOUNDNESS/honesty (reliability E1): a NORMALLY-RETURNING call to a
-            // bounds-panicking slice/`Vec` mutator — `rotate_left`/`rotate_right`
-            // (`<[T]>`: panic `mid > len`) or `split_off` (`Vec`/`String`/`VecDeque`:
-            // panic `at > len`). Unlike `s.split_at(mid)` (modeled precisely by the
-            // `SliceMethodPanic::SplitAt` lane), these lower to a `Terminator::Call`
-            // carrying NO caller-visible `Projection::Index` AND are not in
-            // `is_known_panicking_method`/`slice_method_panic`, so an unmodeled call is
-            // vacuously safe — a default-mode headline OVER-CREDIT ("N proved" while
-            // `s.rotate_left(99)` panics at runtime). Surface them as an UnsupportedMir
-            // obligation, which the compiler preclassifies to Unknown (NEVER Proved)
-            // and never dispatches to a solver, so this can ONLY make the headline more
-            // honest ("N proved, 1 unknown"), never introduce a false proof or a
-            // vacuous discharge. This is a near-exact mirror of the Class-D Unknown
-            // shape above, deliberately CONSERVATIVE (an unmodeled Unknown, not the
-            // precise `mid <= len` bound the `SplitAt` arm models) — modeling the bound
-            // precisely is a follow-up; the strict default already fails these
-            // closed. The recognizer is gated on a confirmed slice/`Vec` receiver so a
-            // TOTAL integer `u32::rotate_left`/`rotate_right` is NEVER flagged.
-            if target.is_some() && is_bounds_panicking_slice_mutator(func, callee, args) {
-                let m = method_tail(callee);
-                vcs.push(unsupported_mir_vc(
-                    func,
-                    format!("Call::{m}::panic-freedom-unverified"),
-                    format!(
-                        "bb{}: `{m}` panics on an out-of-range argument (`> len`) and its \
-                         panic-freedom is not modeled — guard the argument; use `-Z trust-policy=advisory` \
-                         only for non-proof triage",
-                        block.0
-                    ),
-                    span.clone(),
-                ));
-            }
-            // Index-panicking `Vec`/`String` mutators (`remove`/`insert`/
-            // `swap_remove`/`insert_str`) — exact-path gated (see the
-            // recognizer): their panic set is known (`index >= len` /
-            // `index > len` / char-boundary) and reachable for a caller-supplied
-            // container, so an unguarded, unmodeled call must surface the same
-            // `panic-freedom-unverified` row, which strict policy counts as
-            // FAILED rather than silently accepting a callee the verifier
-            // never saw (`absent_callee_call_only_mono`).
-            if target.is_some() && is_index_panicking_container_mutator(callee) {
-                let m = method_tail(callee);
-                vcs.push(unsupported_mir_vc(
-                    func,
-                    format!("Call::{m}::panic-freedom-unverified"),
-                    format!(
-                        "bb{}: `{m}` panics on an out-of-range index (or non-char-boundary) and \
-                         its panic-freedom is not modeled — guard the index; use \
-                         `-Z trust-policy=advisory` only for non-proof triage",
-                        block.0
-                    ),
-                    span.clone(),
-                ));
+                if matches!(m, "unwrap" | "expect" | "unwrap_err" | "expect_err")
+                    && (callee.contains("Option") || callee.contains("Result"))
+                    && !unwrap_is_infallible_slice_to_array(func, callee, args, dest)
+                    // Trust (countdown-loop piece, B0): a const-int `try_into().expect()`
+                    // that provably fits its target is success-by-construction — the
+                    // panic path is unreachable, so no Unknown row (see
+                    // `expect_infallible_const_int_conversion` for the hard gates).
+                    && expect_infallible_const_int_conversion(func, callee, args, dest).is_none()
+                    && !unwrap_panic_freedom_modeled(func, callee, args)
+                {
+                    vcs.push(unsupported_mir_vc(
+                        func,
+                        format!("Call::{m}::panic-freedom-unverified"),
+                        format!(
+                            "bb{}: `{m}` panics on None/Err and its panic-freedom is not \
+                             modeled — match / `if let` to prove it; use `-Z trust-policy=advisory` only \
+                             for non-proof triage",
+                            block.0
+                        ),
+                        span.clone(),
+                    ));
+                }
+                // SOUNDNESS/honesty (reliability E1): a NORMALLY-RETURNING call to a
+                // bounds-panicking slice/`Vec` mutator — `rotate_left`/`rotate_right`
+                // (`<[T]>`: panic `mid > len`) or `split_off` (`Vec`/`String`/`VecDeque`:
+                // panic `at > len`). Unlike `s.split_at(mid)` (modeled precisely by the
+                // `SliceMethodPanic::SplitAt` lane), these lower to a `Terminator::Call`
+                // carrying NO caller-visible `Projection::Index` AND are not in
+                // `is_known_panicking_method`/`slice_method_panic`, so an unmodeled call is
+                // vacuously safe — a default-mode headline OVER-CREDIT ("N proved" while
+                // `s.rotate_left(99)` panics at runtime). Surface them as an UnsupportedMir
+                // obligation, which the compiler preclassifies to Unknown (NEVER Proved)
+                // and never dispatches to a solver, so this can ONLY make the headline more
+                // honest ("N proved, 1 unknown"), never introduce a false proof or a
+                // vacuous discharge. This is a near-exact mirror of the Class-D Unknown
+                // shape above, deliberately CONSERVATIVE (an unmodeled Unknown, not the
+                // precise `mid <= len` bound the `SplitAt` arm models) — modeling the bound
+                // precisely is a follow-up; the strict default already fails these
+                // closed. The recognizer is gated on a confirmed slice/`Vec` receiver so a
+                // TOTAL integer `u32::rotate_left`/`rotate_right` is NEVER flagged.
+                let slice_mutator = matches!(
+                    m,
+                    "rotate_left"
+                        | "rotate_right"
+                        | "split_off"
+                        | "drain"
+                        | "copy_within"
+                        | "select_nth_unstable"
+                        | "select_nth_unstable_by"
+                        | "select_nth_unstable_by_key"
+                        | "extend_from_within"
+                ) && is_bounds_panicking_slice_mutator(func, callee, args);
+                if slice_mutator {
+                    vcs.push(unsupported_mir_vc(
+                        func,
+                        format!("Call::{m}::panic-freedom-unverified"),
+                        format!(
+                            "bb{}: `{m}` panics on an out-of-range argument (`> len`) and its \
+                             panic-freedom is not modeled — guard the argument; use `-Z trust-policy=advisory` \
+                             only for non-proof triage",
+                            block.0
+                        ),
+                        span.clone(),
+                    ));
+                }
+                // Index-panicking `Vec`/`String` mutators (`remove`/`insert`/
+                // `swap_remove`/`insert_str`) — exact-path gated (see the
+                // recognizer): their panic set is known (`index >= len` /
+                // `index > len` / char-boundary) and reachable for a caller-supplied
+                // container, so an unguarded, unmodeled call must surface the same
+                // `panic-freedom-unverified` row, which strict policy counts as
+                // FAILED rather than silently accepting a callee the verifier
+                // never saw (`absent_callee_call_only_mono`).
+                // `char::encode_utf8`/`encode_utf8_raw` panic on a destination
+                // buffer shorter than the encoding — the caller's own buffer, so the
+                // same family and the same row. See the recognizer for why this
+                // replaces an accident (the callee being absent from the tolerance
+                // ledger) with the actual reason.
+                // Trust (2026-10-09, sweep p56): `encode_utf8` panics only when the buffer
+                // is shorter than `len_utf8() <= 4`. A destination that is exactly an
+                // unsize cast of `&mut [u8; N]` with `N >= 4` (the coercion fixes its
+                // length to `N`) can never be too short.
+                // (Merge 2026-10-14: `encode_utf16` is not this row's. Review round 90's
+                // `N >= 2` arm left with it: the UTF-16 twins carry their own ROOT-call
+                // row below, which models no buffer length — UTF8-ENCODE-UTF16-SHORTBUF-1.)
+                // Trust (1.101 migration, 2026-10-18): `encode_utf8_raw` too —
+                // upstream's `char::encode_utf8` is now inlined into the root MIR
+                // the extractor reads, so the root call names the raw encoder
+                // directly. Same buffer, same bound (`len_utf8(code) <= 4` for
+                // every `u32`), same unsize-length proof.
+                if matches!(m, "encode_utf8" | "encode_utf8_raw")
+                    && is_buffer_panicking_char_encoder(callee)
+                {
+                    let buffer_always_fits = args
+                        .get(1)
+                        .and_then(|dst| super::loop_bounds::unsized_array_len(func, dst))
+                        .is_some_and(|len| len >= 4);
+                    if !buffer_always_fits {
+                        vcs.push(unsupported_mir_vc(
+                            func,
+                            format!("Call::{m}::panic-freedom-unverified"),
+                            format!(
+                                "bb{}: `{m}` panics when the destination buffer is shorter than the \
+                                 encoding and its panic-freedom is not modeled — size the buffer with \
+                                 `char::len_utf8()` (or use a 4-byte buffer); use \
+                                 `-Z trust-policy=advisory` only for non-proof triage",
+                                block.0
+                            ),
+                            span.clone(),
+                        ));
+                    }
+                }
+                // Trust (UTF8-ENCODE-UTF16-SHORTBUF-1, 2026-10-05): `char::encode_utf16` /
+                // `encode_utf16_raw` panic on the same short caller buffer. Its own
+                // recognizer, asked of ROOT call sites only (this lane, and the
+                // compiler's root-call tolerance): core's `EncodeUtf16::next` calls it
+                // with a buffer of its own, and the bundle walk must not refuse that.
+                // No buffer length is modeled, so every call is refused — a 2-element
+                // buffer, which cannot panic, included (the over-refusal `encode_utf8`
+                // has for a 4-byte buffer; docs/DECISION_QUEUE.md).
+                if matches!(m, "encode_utf16" | "encode_utf16_raw")
+                    && is_buffer_panicking_char_utf16_encoder(callee)
+                {
+                    vcs.push(unsupported_mir_vc(
+                        func,
+                        format!("Call::{m}::panic-freedom-unverified"),
+                        format!(
+                            "bb{}: `{m}` panics when the destination buffer is shorter than the \
+                             character's UTF-16 length (`char::len_utf16()`, at most 2) and the \
+                             buffer's length is not modeled, so the call is refused whatever its \
+                             buffer; use `-Z trust-policy=advisory` only for non-proof triage",
+                            block.0
+                        ),
+                        span.clone(),
+                    ));
+                }
+                // Trust (W4 fix round 1, 2026-09-25): `VecDeque`'s caller-value members
+                // that no call-site lane charges (`insert`, `splice`, `extract_if`,
+                // `prepend_from_within`) — the same family and the same row as the
+                // `Vec`/`String` mutators below, which exclude `collections::`
+                // wholesale. The members `is_bounds_panicking_slice_mutator` already
+                // rows above (`split_off`, `rotate_*`, `drain`, `extend_from_within`)
+                // are not rowed twice. No guard discharges this row: `insert` resizes
+                // its receiver, and no length tie survives a resize here (the argument
+                // main's `collection_range` makes for `insert_mut`), so a GUARDED call is
+                // an over-refusal, pinned in `tests/ui/trust/vecdeque_caller_value_panic.rs`.
+                // `swap`/`range`/`range_mut`/`insert_mut`/`d[i]` are charged by
+                // `collection_range` (precise over a stable length) and are NOT rowed
+                // here whenever that recognizer names the call (reconciled with
+                // 92e7829ca5, W4 salvage 2026-09-28; see the recognizer).
+                if !slice_mutator
+                    && matches!(
+                        m,
+                        "drain"
+                            | "splice"
+                            | "extract_if"
+                            | "extend_from_within"
+                            | "prepend_from_within"
+                            | "insert"
+                            | "split_off"
+                            | "rotate_left"
+                            | "rotate_right"
+                            | "swap"
+                            | "range"
+                            | "range_mut"
+                            | "insert_mut"
+                    )
+                    && is_caller_value_panicking_deque_method(callee)
+                    // Trust (cap vec-drain, 2026-10-03): `d.drain(..)` (and `0..`, `..0`)
+                    // left the row above because its range check cannot fail; it must not
+                    // fall through to this one.
+                    && !super::collection_range::std_vec_drain_range_cannot_panic(
+                        func, callee, args,
+                    )
+                {
+                    vcs.push(unsupported_mir_vc(
+                        func,
+                        format!("Call::{m}::panic-freedom-unverified"),
+                        format!(
+                            "bb{}: `VecDeque::{m}` panics on an out-of-range index or range and \
+                             its panic-freedom is not modeled — use a checked form (`get`, \
+                             `get_mut`) or guard the argument; use `-Z trust-policy=advisory` \
+                             only for non-proof triage",
+                            block.0
+                        ),
+                        span.clone(),
+                    ));
+                }
+                // Trust (W4 salvage, 2026-09-28): the BACKSTOP for `d[i]` / `d[i] = x`.
+                // `collection_range::deque_scalar_index_body` charges the scalar deque
+                // index at this call (precise, or its own fail-honest row); it answers
+                // `None` only when it cannot read the receiver or the index operand's
+                // type. The compiler no longer withholds the vanilla tolerance for the
+                // `Index`/`IndexMut` callee by name (that refused the guarded forms main
+                // proves), so a call that lane cannot read must not go silent: it gets
+                // the fail-closed row. Never fires where main's row exists — no guarded
+                // program main proves is refused by it.
+                if matches!(m, "index" | "index_mut")
+                    && super::unwrap_panic::is_deque_scalar_index_call(callee)
+                    && super::collection_range::deque_scalar_index_body(func, args).is_none()
+                {
+                    vcs.push(unsupported_mir_vc(
+                        func,
+                        format!("Call::{m}::panic-freedom-unverified"),
+                        format!(
+                            "bb{}: indexing a `VecDeque` panics (\"Out of bounds access\") when the \
+                             index is not below the length, and this call's receiver or index could \
+                             not be read to charge it — use `get`/`get_mut` or guard the index; use \
+                             `-Z trust-policy=advisory` only for non-proof triage",
+                            block.0
+                        ),
+                        span.clone(),
+                    ));
+                }
+                // (2026-10-09) The sole, last resize of a `&mut Vec` parameter carries the
+                // real index precondition instead (`panic_calls`, VecPanicMethod arm).
+                // Trust (VEC-INSERT, 2026-09-25): a `Vec` mutator reached inside its
+                // base's pre-mutation region is charged its REAL index precondition by
+                // the safety lane (`vec_mutator_index_violation`) instead.
+                if matches!(m, "remove" | "insert" | "swap_remove" | "insert_str")
+                    && is_index_panicking_container_mutator(callee)
+                {
+                    let sole_vec_resize = args
+                        .first()
+                        .and_then(|recv| match recv {
+                            Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
+                                if crate::local_defs::is_parameter(func, p.local) {
+                                    Some(trust_types::Place::local(p.local))
+                                } else {
+                                    crate::guards::base_collection_place_unique(func, p.local)
+                                }
+                            }
+                            _ => None,
+                        })
+                        .is_some_and(|base| {
+                            base.projections.is_empty()
+                                && super::value_facts::vec_sole_mutator_block(func, base.local)
+                                    .is_some()
+                        });
+                    let modeled_in_region = func
+                        .body
+                        .blocks
+                        .get(block.0)
+                        .filter(|candidate| candidate.id == block)
+                        .or_else(|| func.body.blocks.iter().find(|candidate| candidate.id == block))
+                        .is_some_and(|call_block| {
+                            vec_mutator_index_violation(func, call_block).is_some()
+                        });
+                    if !sole_vec_resize && !modeled_in_region {
+                        vcs.push(unsupported_mir_vc(
+                            func,
+                            format!("Call::{m}::panic-freedom-unverified"),
+                            format!(
+                                "bb{}: `{m}` panics on an out-of-range index (or non-char-boundary) and \
+                                 its panic-freedom is not modeled — guard the index; use \
+                                 `-Z trust-policy=advisory` only for non-proof triage",
+                                block.0
+                            ),
+                            span.clone(),
+                        ));
+                    }
+                }
             }
         }
-        Terminator::TailCall { func: callee, args, span, .. } => {
+        Terminator::TailCall { func: callee, args, span, callee_key, .. } => {
             // The bridge handles this through the ordinary call path with the
             // implicit return destination. Keep every unsupported argument
-            // visible here rather than silently dropping it.
-            if !is_panic_intrinsic_call(callee) {
+            // visible here rather than silently dropping it. The one exception is
+            // the Call arm's: the bridge lowers a tail call as a call with NO
+            // continuation (`lower_terminator_normal`, `target: None`), so a
+            // stamped sysroot panic entry reached by `become` takes the same
+            // must-be-unreachable site encoding and its arguments are read by no
+            // proof (PANIC-SKIP-ANCHOR-1).
+            if !diverging_panic_entry_operands_unread(callee_key.as_ref(), callee, true) {
                 collect_operands_unsupported(
                     func,
-                    format!("bb{} tail-call args", block.0),
+                    &format_args!("bb{} tail-call args", block.0),
                     span,
                     args,
                     vcs,
@@ -885,5 +1309,157 @@ pub(super) fn collect_terminator_unsupported(
             }
         }
         _ => {}
+    }
+}
+
+/// PANIC-SKIP-ANCHOR-1 (2026-10-05): may this call site's ARGUMENTS go
+/// uncollected by [`collect_operands_unsupported`]?
+///
+/// Only when the site is a call to one of the SYSROOT's own panic entry points
+/// that the bridge lowers as "this program point must be proven unreachable"
+/// (`Assert(false)` + one `PanicFreedom` row, then `Unreachable`: the
+/// diverging-site arm of `trust-ir-bridge`'s `lower.rs`). At such a site the
+/// arguments — a panic message, a `fmt::Arguments`, an identity-less payload —
+/// are read by no proof, and an `UnsupportedMir` row for one of them would only
+/// wedge every real `assert!`/`panic!` at Unknown. Every conjunct below is one
+/// the bridge arm also requires, so every site skipped here is a site the bridge
+/// charges as must-be-unreachable:
+///
+/// * `no_continuation`: the bridge sees the call with no normal-return target —
+///   a `Call` whose `target` is `None`, or any `TailCall`, which the bridge
+///   rewrites to a `Call` with `target: None` (`lower_terminator_normal`). A
+///   call WITH a continuation takes the ordinary call arms, where its
+///   arguments flow into the callee and its result, so they are proof input
+///   whatever the callee is called;
+/// * the extractor's DIVERGE-ENTRY-1 stamp, read through
+///   [`trust_types::CalleeKey::opt_diverging_entry`]: the callee's `DefId` is in
+///   a real sysroot crate, is not a trait item, and its GENERIC-FREE definition
+///   path is a panic, abort or UB entry. `None` (no key, an indirect call, a
+///   frozen dump or hand-built key, any user crate) keeps every row;
+/// * [`is_panic_intrinsic_call`] on the rendering, the first disjunct of the
+///   bridge arm's own second conjunct (`is_panic_call`). For a stamped panic
+///   entry it holds by construction, so it can only NARROW: the stamped R177
+///   terminals (`unwrap_failed`, `expect_failed`, `handle_error`, `abort`, …)
+///   and the UB family keep their argument rows exactly as before this anchor.
+///   Widening the skip to them is a separate, unmeasured capability change
+///   (DECISION_QUEUE PANIC-SKIP-ANCHOR-1).
+///
+/// Before this, the rendering alone decided. A user `fn panic(x: u64) -> u64`
+/// that returns normally, or any fn in a user module named `panicking`, had the
+/// `ConstValue::OpaqueScalar` row of its identity-less `T::LIMIT` argument
+/// dropped, and `-Ztrust-policy=certify` accepted the caller where the same body
+/// under another name was refused (measured on the stage 1 of `76a6ea45b2`;
+/// `tests/ui/trust/panic_skip_user_fn_named_panic.rs`).
+pub(super) fn diverging_panic_entry_operands_unread(
+    callee_key: Option<&trust_types::CalleeKey>,
+    callee: &str,
+    no_continuation: bool,
+) -> bool {
+    no_continuation
+        && trust_types::CalleeKey::opt_diverging_entry(callee_key).is_some()
+        && is_panic_intrinsic_call(callee)
+}
+
+#[cfg(test)]
+mod dedup_stop_cause_tests {
+    use trust_types::determinism::StopCause;
+
+    use super::*;
+
+    fn unsupported(kind: &str, detail: &str, line: u32) -> VerificationCondition {
+        VerificationCondition {
+            kind: VcKind::UnsupportedMir { kind: kind.to_string(), detail: detail.to_string() },
+            function: "m::f".into(),
+            location: SourceSpan {
+                file: "src/lib.rs".to_string(),
+                line_start: line,
+                col_start: 1,
+                line_end: line,
+                col_end: 2,
+            },
+            formula: unsupported_mir_fail_closed_formula(),
+            contract_metadata: None,
+            obligation: None,
+        }
+    }
+
+    fn detail_cause(vc: &VerificationCondition) -> Option<StopCause> {
+        match &vc.kind {
+            VcKind::UnsupportedMir { detail, .. } => StopCause::from_reason(detail),
+            _ => None,
+        }
+    }
+
+    /// Determinism review 2026-09-29: a type-lowering marker left by a CLOCK
+    /// trip must not disappear behind a deduplicated sibling at the same display
+    /// key that reads as the deterministic `unsupported`.
+    #[test]
+    fn a_collapsed_clock_stop_survives_on_the_kept_row() {
+        let clock = StopCause::WallBackstop
+            .stamp("type lowering exceeded the per-function verification budget");
+        let kept = dedup_unsupported_by_display_key(vec![
+            unsupported("TyKind", "local _3: dyn Trait", 7),
+            unsupported("TyKind", &format!("local _4: {clock}"), 7),
+            unsupported("TyKind", "another line", 9),
+        ]);
+        assert_eq!(kept.len(), 2, "one row per display key");
+        assert_eq!(detail_cause(&kept[0]), Some(StopCause::WallBackstop), "{:?}", kept[0].kind);
+        assert!(
+            matches!(&kept[0].kind, VcKind::UnsupportedMir { detail, .. }
+                if detail.starts_with("local _3: dyn Trait")),
+            "the kept row keeps its own text: {:?}",
+            kept[0].kind
+        );
+        assert_eq!(detail_cause(&kept[1]), None);
+    }
+
+    #[test]
+    fn a_collapsed_deterministic_stop_leaves_the_kept_row_as_it_was() {
+        let steps =
+            StopCause::Steps.stamp("type lowering exceeded the per-function verification budget");
+        let kept = dedup_unsupported_by_display_key(vec![
+            unsupported("TyKind", "local _3: dyn Trait", 7),
+            unsupported("TyKind", &format!("local _4: {steps}"), 7),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(detail_cause(&kept[0]), None, "{:?}", kept[0].kind);
+        // A kept clock stop is never downgraded by a later deterministic one.
+        let clock = StopCause::WallBackstop.stamp("budget");
+        let kept = dedup_unsupported_by_display_key(vec![
+            unsupported("TyKind", &clock, 7),
+            unsupported("TyKind", &steps, 7),
+        ]);
+        assert_eq!(detail_cause(&kept[0]), Some(StopCause::WallBackstop));
+    }
+
+    #[test]
+    fn dedup_preserves_distinct_kinds_and_spans_without_cloning_duplicates() {
+        let mut slot = KeptDisplaySlot::One(0);
+        slot.push(1);
+        slot.push(2);
+        let rows = vec![
+            unsupported("TyKind", "a", 7),
+            unsupported("RvalueKind", "b", 7),
+            unsupported("TyKind", "c", 8),
+        ];
+        assert_eq!(slot.find(&rows, "TyKind", &rows[0].location), Some(0));
+        assert_eq!(slot.find(&rows, "RvalueKind", &rows[1].location), Some(1));
+        assert_eq!(slot.find(&rows, "TyKind", &rows[2].location), Some(2));
+        assert_eq!(slot.find(&rows, "OtherKind", &rows[0].location), None);
+
+        let kept = dedup_unsupported_by_display_key(vec![
+            unsupported("TyKind", "first", 7),
+            unsupported("RvalueKind", "second", 7),
+            unsupported("TyKind", "dup-first", 7),
+            unsupported("TyKind", "third", 8),
+            unsupported("RvalueKind", "dup-second", 7),
+        ]);
+        assert_eq!(kept.len(), 3);
+        assert!(matches!(&kept[0].kind, VcKind::UnsupportedMir { kind, detail }
+            if kind == "TyKind" && detail == "first"));
+        assert!(matches!(&kept[1].kind, VcKind::UnsupportedMir { kind, detail }
+            if kind == "RvalueKind" && detail == "second"));
+        assert!(matches!(&kept[2].kind, VcKind::UnsupportedMir { kind, detail }
+            if kind == "TyKind" && detail == "third"));
     }
 }

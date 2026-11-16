@@ -41,10 +41,16 @@
 //! * [`gate::FaithfulnessMethod::WellFoundedFunctionalDefeq`] still has NO
 //!   wire tag, deliberately — see [`admission::mint_encoded_digest_for_export`]
 //!   — so a WF verdict cannot leave its crate and a cross-crate call to a
-//!   well-founded Clean def refuses at the export seam. That is the same
+//!   well-founded Clean def refuses. That is the same
 //!   accounting R1's per-equation verdicts get, for the same reason: the
 //!   verdict rests on a BORROW and a CLOSURE AUDIT taken in this crate's
 //!   environment, and the wire unit carries no field for either.
+//!   **Where it refuses moved on 2026-09-16; the boundary did not.** The
+//!   export seam used to be FATAL, so a crate that merely DEFINED such a def
+//!   could not be built as a library at all. The seam now exports an
+//!   [`export_notice::NonExportableNotice`] in the certificate's place — a
+//!   refusal-only row, no tag, no evidence — and the IMPORTER refuses the
+//!   call at its readmission chokepoint with the notice's v7/D3 note.
 //! * **R3a, 2026-08-26 — the well-founded fragment is no longer
 //!   single-parameter.** It is ANY NUMBER of `Nat` parameters with a
 //!   ONE-PARAMETER measure: the measure is guarded by `if h : 0 < a`, there is
@@ -170,8 +176,12 @@
 //! operator** (`a &&& b`, `a ||| b`, and `a / K` / `a % K` at a STRICTLY
 //! POSITIVE numeral `K` only — Clean's `UInt{N}.div`/`.mod` are TOTAL where
 //! Rust's `/`/`%` PANIC, so a variable or zero divisor is refused on side A,
-//! on the sealed plan, and again by the frozen producer; see
-//! `tests/landing7_selection_probes.rs`), — R1, 2026-08-21 —
+//! on the sealed plan, and again by the frozen producer; and, since clean
+//! `bf31976f48` (2026-09-23), `a ^^^ b` and `a >>> K` at a numeral `K` below
+//! the width — `a <<< K` elaborates too and is not planned at any amount: the
+//! gate identifies the frozen producer's reading of it only at `K = 1`, a
+//! function `a * 2` already emits; see `tests/landing7_selection_probes.rs`),
+//! — R1, 2026-08-21 —
 //! **structural-Nat-recursion** and — R2, 2026-08-22 —
 //! **well-founded-Nat-recursion** (`def countdownSum (n : Nat) : Nat :=
 //! if h : 0 < n then n + countdownSum (n - 1) else 0` + `termination_by n`,
@@ -341,13 +351,19 @@
 
 pub mod admission;
 pub mod closure;
+mod direct_source;
 pub mod emit;
+pub mod export_notice;
 pub mod gate;
+mod implemented_by;
 pub mod materialize;
 pub mod mint;
+mod named_calls;
 pub mod reflect;
 pub mod reflect_rec;
+pub mod reflect_rust_call;
 pub mod reflect_wf;
+pub mod symbol;
 pub mod table;
 
 pub use admission::{
@@ -355,14 +371,21 @@ pub use admission::{
     EnvironmentDigestRefusal, ExportDigestRefusal, FaithfulnessEvidence, LocalBodyRecheckRefusal,
     LocallyRechecked, ReadmissionPreflight, ReadmissionRefusal, Readmitted, VerdictDigest,
     WirePreflight, bind_readmission, environment_digest_for, local_kernel_version,
-    locally_recheck_imported_body, mint_encoded_digest_for_export, mint_verdict_digest,
-    preflight_wire, readmit,
+    locally_recheck_imported_body, mint_encoded_digest_for_export,
+    mint_encoded_digest_for_export_for_name, mint_verdict_digest, preflight_wire, readmit,
 };
 pub use closure::{ClosureAudit, audit_proof_closure, audit_term_closure};
 pub use emit::{
-    COMPOSED_MAX_OPS, CleanOriginPlan, CleanOriginShape, EmitRefusal, WfLowering,
-    WfSumMeasureAnatomy, WfSumMeasureCall, admit_lowering, plan_clean_origin_body,
+    BOOL_EXPRESSION_MAX_OPS, BoolExpr, COMPOSED_MAX_OPS, CleanOriginPlan, CleanOriginShape,
+    EmitRefusal, RustCallArg, RustCallLiteral, RustCallNode, RustCalleeRef,
+    UINT_CONDITIONAL_MAX_DECISIONS, UIntConditional, WfLowering, WfSumMeasureAnatomy,
+    WfSumMeasureCall, admit_lowering, check_rust_call_chain_for, plan_clean_origin_body,
+    plan_clean_origin_body_with_rust_callees, plan_clean_origin_body_with_rust_callees_for_name,
     read_wf_sum_measure_anatomy,
+};
+pub use export_notice::{
+    NON_EXPORTABLE_NOTICE_FORMAT_V1, NON_EXPORTABLE_NOTICE_MAGIC, NonExportableNotice,
+    NonExportableReason, NoticeDecodeRefusal,
 };
 pub use gate::{
     DECREASE_SLOT_SENTINEL, Faithful, FaithfulnessMethod, GateRefusal, MEASURE_SLOT_SENTINEL,
@@ -374,16 +397,49 @@ pub use materialize::{
     TemplateRvalue, TemplateStatement, TemplateTerminator, TemplateTy, TemplateUnwind,
     body_template, zero_test_rec_template,
 };
-pub use mint::{MintGrant, MintRefusal, decide_mint, decide_mint_from_signature};
+pub use mint::{
+    MintGrant, MintRefusal, decide_mint, decide_mint_from_signature, leading_type_variable_binders,
+    nested_island_definitions,
+};
+pub use reflect_rec::reflect_structural_rec;
+pub use reflect_rust_call::reflect_rust_call_chain;
+pub use reflect_wf::reflect_wf_functional;
+pub use table::{
+    AnchoredCarriers, CalleeSelector, CarrierAnchor, CarrierClass, DEMANDS, DemandStatus,
+    ElabToken, GateRouting, KernelSelector, MirAliasing, MirShape, ROWS, ReflectSpec, RowContext,
+    SelectionDemand, SelectionRow, TotalityDemand, UnwindDiscipline, coverage_basis_points,
+    covered_demands, missing_demands, no_selection_row, row, rows_selecting_head,
+    whole_body_refusal,
+};
 // The caller-obligation vocabulary, re-exported so a consumer of a
 // `CleanOriginPlan`/`MintGrant` does not have to reach past this crate for the
 // type its own accessors return.
 pub use trust_clean_carrier::{CleanOriginPrecondition, PreconditionOperand, PreconditionRelation};
-pub use reflect_rec::reflect_structural_rec;
-pub use reflect_wf::reflect_wf_functional;
-pub use table::{
-    CalleeSelector, CarrierClass, DEMANDS, DemandStatus, ElabToken, GateRouting, KernelSelector,
-    MirAliasing, MirShape, ROWS, ReflectSpec, RowContext, SelectionDemand, SelectionRow,
-    TotalityDemand, UnwindDiscipline, coverage_basis_points, covered_demands, missing_demands,
-    no_selection_row, row,
-};
+
+/// The planner's side-A expansion of transparent Lean helper calls, with no Rust
+/// callees in scope: every application whose head is a fully kernel-checked
+/// `Definition` at a carrier signature is unfolded, within the planner's work
+/// envelope. `Ok(None)` when nothing was unfolded.
+///
+/// Trust (2026-09-28): exported for the kernel-TV SOURCE side
+/// (`rustc_mir_transform::clean_origin_ir::mint_kernel_tv`). A `def` whose body
+/// is a call to another island `def` (`def viaId x := idA x`) plans through this
+/// expansion as a projection, so it is a carrier-gate target, and a target must
+/// carry a TV companion. The source denotation read only the unexpanded
+/// declaration, refused the `idA` head, and every `-Ztrust-verify=on` build of
+/// the crate died on "the expected kernel-TV companion is missing", even with
+/// the `def` uncalled. Like every use of this expansion it is a reading, never
+/// evidence: the carrier gate still compares the emitted body with the ORIGINAL
+/// declaration by kernel definitional equality.
+///
+/// # Errors
+///
+/// The expansion's own refusals: a work-envelope overrun, a helper without a
+/// full kernel check, or a recursive helper.
+pub fn expand_named_lean_calls(
+    env: &clean_kernel::Environment,
+    declaration: &clean_kernel::Name,
+    body: &clean_kernel::Expr,
+) -> Result<Option<clean_kernel::Expr>, String> {
+    named_calls::expand_named_calls(env, declaration, body, &[])
+}

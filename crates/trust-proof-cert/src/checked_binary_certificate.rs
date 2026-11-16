@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust-proof-cert checked binary certificate production path scaffold
 //
 // This module keeps raw solver proof bytes separate from independently checked

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use rustc_ast::node_id::NodeMap;
-use rustc_span::Span;
-use thin_vec::thin_vec;
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_span::{Span, sym};
 
 use crate::LoweringContext;
 
@@ -666,16 +666,18 @@ impl<'hir> LoweringContext<'_, 'hir> {
     }
 
     fn lower_precond(&mut self, req: &rustc_ast::Expr) -> rustc_hir::Stmt<'hir> {
-        let lowered_req = self.lower_expr_mut(req);
+        let mut lowered_req = self.lower_expr_mut(req);
+        // Trust: the checker's `-> bool` is synthesized; see below.
+        self.mark_requires_checker_return_type(&mut lowered_req);
         self.record_contract_predicate_hir_id(req.id, lowered_req.hir_id, req.span);
         let req_span = self.mark_span_with_reason(
             rustc_span::DesugaringKind::Contract,
             lowered_req.span,
-            Some(Arc::clone(&self.allow_contracts)),
+            Some(Arc::clone(&crate::ALLOW_CONTRACTS)),
         );
 
         let check_ident: rustc_span::Ident =
-            rustc_span::Ident::from_str_and_span("__requires_checker", req_span);
+            rustc_span::Ident::new(sym::__requires_checker, req_span);
         let (checker_pat, check_hir_id) =
             self.pat_ident_binding_mode_mut(req_span, check_ident, rustc_hir::BindingMode::NONE);
         let checker_decl = self.stmt_let_pat(
@@ -689,7 +691,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
         let req_checker = self.expr_ident(req_span, check_ident, check_hir_id);
         let precond = self.expr_call_lang_item_fn_mut(
             req_span,
-            rustc_hir::LangItem::ContractCheckRequires,
+            LangItem::ContractCheckRequires,
             &*arena_vec![self; *req_checker],
         );
         let precond = self.arena.alloc(precond);
@@ -698,18 +700,42 @@ impl<'hir> LoweringContext<'_, 'hir> {
         self.stmt_expr(req.span, precond_block)
     }
 
+    /// Trust: `parse_contract_requires_payload` gives every `#[requires]`
+    /// checker closure an explicit `-> bool`, because `lower_precond` binds the
+    /// closure to `__requires_checker` before the `contract_check_requires`
+    /// call and so no `Fn() -> bool` expectation reaches it; without the pin a
+    /// non-bool precondition fails as E0271 at the call instead of upstream's
+    /// E0308 at the contract. The user never wrote that return type, so re-span
+    /// it as contract desugaring: typeck's `suggest_missing_return_type` then
+    /// does not label it "expected `bool` because of return type", and the
+    /// E0308 renders exactly as upstream's, whose checker closure has no
+    /// written return type at all.
+    fn mark_requires_checker_return_type(&mut self, checker: &mut rustc_hir::Expr<'hir>) {
+        let rustc_hir::ExprKind::Closure(closure) = checker.kind else { return };
+        let rustc_hir::FnRetTy::Return(ret_ty) = closure.fn_decl.output else { return };
+        let span =
+            self.mark_span_with_reason(rustc_span::DesugaringKind::Contract, ret_ty.span, None);
+        let ret_ty = self.arena.alloc(rustc_hir::Ty { span, ..*ret_ty });
+        let fn_decl = self.arena.alloc(rustc_hir::FnDecl {
+            output: rustc_hir::FnRetTy::Return(ret_ty),
+            ..*closure.fn_decl
+        });
+        let closure = self.arena.alloc(rustc_hir::Closure { fn_decl, ..*closure });
+        checker.kind = rustc_hir::ExprKind::Closure(closure);
+    }
+
     fn lower_postcond_checker(&mut self, ens: &rustc_ast::Expr) -> &'hir rustc_hir::Expr<'hir> {
         let ens_span = self.lower_span(ens.span);
         let ens_span = self.mark_span_with_reason(
             rustc_span::DesugaringKind::Contract,
             ens_span,
-            Some(Arc::clone(&self.allow_contracts)),
+            Some(Arc::clone(&crate::ALLOW_CONTRACTS)),
         );
         let lowered_ens = self.lower_expr_mut(ens);
         self.record_contract_predicate_hir_id(ens.id, lowered_ens.hir_id, ens.span);
         self.expr_call_lang_item_fn(
             ens_span,
-            rustc_hir::LangItem::ContractBuildCheckEnsures,
+            LangItem::ContractBuildCheckEnsures,
             &*arena_vec![self; lowered_ens],
         )
     }
@@ -752,7 +778,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
         let postcond_checker = self.arena.alloc(self.expr_enum_variant_lang_item(
             postcond_checker.span,
-            rustc_hir::lang_items::LangItem::OptionSome,
+            LangItem::OptionSome,
             &*arena_vec![self; *postcond_checker],
         ));
         let then_block_stmts = self.block_all(span, stmts, Some(postcond_checker));
@@ -760,7 +786,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
         let none_expr = self.arena.alloc(self.expr_enum_variant_lang_item(
             postcond_checker.span,
-            rustc_hir::lang_items::LangItem::OptionNone,
+            LangItem::OptionNone,
             Default::default(),
         ));
         let else_block = self.block_expr(none_expr);
@@ -869,7 +895,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
         //         ret
         //     }
         // }
-        let ret_ident: rustc_span::Ident = rustc_span::Ident::from_str_and_span("__ret", span);
+        let ret_ident: rustc_span::Ident = rustc_span::Ident::new(sym::__ret, span);
 
         // Set up the return `let` statement.
         let (ret_pat, ret_hir_id) =
@@ -888,7 +914,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
         let cond_fn = self.expr_ident(span, cond_ident, cond_hir_id);
         let contract_check = self.expr_call_lang_item_fn_mut(
             span,
-            rustc_hir::LangItem::ContractCheckEnsures,
+            LangItem::ContractCheckEnsures,
             arena_vec![self; *cond_fn, *ret],
         );
         let contract_check = self.arena.alloc(contract_check);
@@ -909,9 +935,6 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 Some(ret_block),
             ),
         ));
-
-        let attrs: rustc_ast::AttrVec = thin_vec![self.unreachable_code_attr(span)];
-        self.lower_attrs(contract_check.hir_id, &attrs, span, rustc_hir::Target::Expression);
 
         let ret_block = self.block_all(span, arena_vec![self; ret_stmt], Some(contract_check));
         self.arena.alloc(self.expr_block(self.arena.alloc(ret_block)))

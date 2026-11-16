@@ -1,0 +1,9 @@
+[package]
+name = "trust-storage-geometry-visitors"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+[dependencies]
+trust-ir = { path = "@IR@/crates/trust-ir" }
+trust-ir-build = { path = "@IR@/crates/trust-ir-build" }
+tracing = "0.1"

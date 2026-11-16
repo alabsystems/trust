@@ -1,14 +1,11 @@
-// ignore-tidy-filelength
-use std::env::VarError;
-use std::{panic, thread};
+// ignore-tidy-file-filelength
+use std::panic;
 
 use build_helper::stage0_parser::parse_stage0_file;
-use llvm::prebuilt_llvm_config;
+use llvm::get_llvm_build_status;
 
 use super::*;
-use crate::Flags;
-use crate::core::build_steps::doc::DocumentationFormat;
-use crate::core::builder::cli_paths::PATH_REMAP;
+use crate::core::build_steps::llvm::LlvmKind;
 use crate::core::config::Config;
 use crate::utils::cache::ExecutedStep;
 use crate::utils::helpers::get_host_target;
@@ -17,7 +14,6 @@ use crate::utils::tests::{ConfigBuilder, TestCtx};
 
 static TEST_TRIPLE_1: &str = "i686-unknown-haiku";
 static TEST_TRIPLE_2: &str = "i686-unknown-hurd-gnu";
-static TEST_TRIPLE_3: &str = "i686-unknown-netbsd";
 
 fn configure(cmd: &str, host: &[&str], target: &[&str]) -> Config {
     configure_with_args(&[cmd], host, target)
@@ -27,15 +23,10 @@ fn configure_with_args(cmd: &[&str], host: &[&str], target: &[&str]) -> Config {
     TestCtx::new().config(cmd[0]).args(&cmd[1..]).hosts(host).targets(target).create_config()
 }
 
-fn first<A, B>(v: Vec<(A, B)>) -> Vec<A> {
-    v.into_iter().map(|(a, _)| a).collect::<Vec<_>>()
-}
-
 fn run_build(paths: &[PathBuf], config: Config) -> Cache {
-    let kind = config.cmd.kind();
-    let build = Build::new(config);
-    let builder = Builder::new(&build);
-    builder.run_step_descriptions(&Builder::get_step_descriptions(kind), paths);
+    let sess = Session::new(config);
+    let builder = Builder::new(&sess);
+    builder.run_step_descriptions(&Builder::get_step_descriptions(builder.kind), paths);
     builder.cache
 }
 
@@ -44,28 +35,6 @@ fn check_cli<const N: usize>(paths: [&str; N]) {
         &paths.map(PathBuf::from),
         configure_with_args(&paths, &[TEST_TRIPLE_1], &[TEST_TRIPLE_1]),
     );
-}
-
-macro_rules! std {
-    ($host:ident => $target:ident, stage = $stage:literal) => {
-        compile::Std::new(
-            Compiler::new($stage, TargetSelection::from_user($host)),
-            TargetSelection::from_user($target),
-        )
-    };
-}
-
-macro_rules! doc_std {
-    ($host:ident => $target:ident, stage = $stage:literal) => {{ doc::Std::new($stage, TargetSelection::from_user($target), DocumentationFormat::Html) }};
-}
-
-macro_rules! rustc {
-    ($host:ident => $target:ident, stage = $stage:literal) => {
-        compile::Rustc::new(
-            Compiler::new($stage, TargetSelection::from_user($host)),
-            TargetSelection::from_user($target),
-        )
-    };
 }
 
 #[test]
@@ -79,109 +48,6 @@ fn test_valid() {
 fn test_invalid() {
     // make sure that invalid paths are caught, even when combined with valid paths
     check_cli(["test", "library/std", "x"]);
-}
-
-#[test]
-fn test_intersection() {
-    let set = |paths: &[&str]| {
-        PathSet::Set(paths.into_iter().map(|p| TaskPath { path: p.into(), kind: None }).collect())
-    };
-    let library_set = set(&["library/core", "library/alloc", "library/std"]);
-    let mut command_paths = vec![
-        CLIStepPath::from(PathBuf::from("library/core")),
-        CLIStepPath::from(PathBuf::from("library/alloc")),
-        CLIStepPath::from(PathBuf::from("library/stdarch")),
-    ];
-    let subset = library_set.intersection_removing_matches(&mut command_paths, Kind::Build);
-    assert_eq!(subset, set(&["library/core", "library/alloc"]),);
-    assert_eq!(
-        command_paths,
-        vec![
-            CLIStepPath::from(PathBuf::from("library/core")).will_be_executed(true),
-            CLIStepPath::from(PathBuf::from("library/alloc")).will_be_executed(true),
-            CLIStepPath::from(PathBuf::from("library/stdarch")).will_be_executed(false),
-        ]
-    );
-}
-
-#[test]
-fn test_resolve_parent_and_subpaths() {
-    let set = |paths: &[&str]| {
-        PathSet::Set(paths.into_iter().map(|p| TaskPath { path: p.into(), kind: None }).collect())
-    };
-
-    let mut command_paths = vec![
-        CLIStepPath::from(PathBuf::from("src/tools/miri")),
-        CLIStepPath::from(PathBuf::from("src/tools/miri/cargo-miri")),
-    ];
-
-    let library_set = set(&["src/tools/miri", "src/tools/miri/cargo-miri"]);
-    library_set.intersection_removing_matches(&mut command_paths, Kind::Build);
-
-    assert_eq!(
-        command_paths,
-        vec![
-            CLIStepPath::from(PathBuf::from("src/tools/miri")).will_be_executed(true),
-            CLIStepPath::from(PathBuf::from("src/tools/miri/cargo-miri")).will_be_executed(true),
-        ]
-    );
-}
-
-#[test]
-fn validate_path_remap() {
-    let build = Build::new(configure("test", &[TEST_TRIPLE_1], &[TEST_TRIPLE_1]));
-
-    PATH_REMAP
-        .iter()
-        .flat_map(|(_, paths)| paths.iter())
-        .map(|path| build.src.join(path))
-        .for_each(|path| {
-            assert!(path.exists(), "{} should exist.", path.display());
-        });
-}
-
-#[test]
-fn check_missing_paths_for_x_test_tests() {
-    let build = Build::new(configure("test", &[TEST_TRIPLE_1], &[TEST_TRIPLE_1]));
-
-    let (_, tests_remap_paths) =
-        PATH_REMAP.iter().find(|(target_path, _)| *target_path == "tests").unwrap();
-
-    // These directories are inputs to other test runners, shared fixtures, or
-    // support files; none is an independently runnable bootstrap test suite.
-    // Keep the list explicit so a newly added top-level directory still has to
-    // be classified as either an `x test tests` suite or an auxiliary root.
-    const NON_BOOTSTRAP_TEST_ROOTS: &[&str] = &[
-        "auxiliary",
-        "compat",
-        "fixtures",
-        "js262",
-        "trust-added",
-        "trust-comprehensive",
-        "trust-falsification",
-        "trust-witness",
-        "upstream-rust",
-    ];
-
-    let tests_dir = fs::read_dir(build.src.join("tests")).unwrap();
-    for dir in tests_dir {
-        let path = dir.unwrap().path();
-
-        // Skip entries that are not independently runnable bootstrap suites.
-        let is_auxiliary_root = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| NON_BOOTSTRAP_TEST_ROOTS.contains(&name));
-        if is_auxiliary_root || !path.is_dir() {
-            continue;
-        }
-
-        assert!(
-            tests_remap_paths.iter().any(|item| path.ends_with(*item)),
-            "{} is missing in PATH_REMAP tests list.",
-            path.display()
-        );
-    }
 }
 
 #[test]
@@ -247,45 +113,15 @@ fn parse_config_download_rustc_at(path: &Path, download_rustc: &str, ci: bool) -
         .create_config()
 }
 
-mod dist {
-    use pretty_assertions::assert_eq;
-
-    use super::{Config, TEST_TRIPLE_1, TEST_TRIPLE_2, TEST_TRIPLE_3, first, run_build};
-    use crate::Flags;
-    use crate::core::builder::tests::host_target;
-    use crate::core::builder::*;
-
-    fn configure(host: &[&str], target: &[&str]) -> Config {
-        Config { stage: 2, ..super::configure("dist", host, target) }
-    }
-
-    #[test]
-    fn llvm_out_behaviour() {
-        let mut config = configure(&[], &[TEST_TRIPLE_2]);
-        config.llvm_from_ci = true;
-        let build = Build::new(config.clone());
-
-        let target = TargetSelection::from_user(&host_target());
-        assert!(build.llvm_out(target).ends_with("ci-llvm"));
-        let target = TargetSelection::from_user(TEST_TRIPLE_2);
-        assert!(build.llvm_out(target).ends_with("llvm"));
-
-        config.llvm_from_ci = false;
-        let build = Build::new(config.clone());
-        let target = TargetSelection::from_user(TEST_TRIPLE_1);
-        assert!(build.llvm_out(target).ends_with("llvm"));
-    }
-}
-
 mod sysroot_target_dirs {
     use super::{
-        Build, Builder, Compiler, TEST_TRIPLE_1, TEST_TRIPLE_2, TargetSelection, configure,
+        Builder, Compiler, Session, TEST_TRIPLE_1, TEST_TRIPLE_2, TargetSelection, configure,
     };
 
     #[test]
     fn test_sysroot_target_libdir() {
-        let build = Build::new(configure("build", &[TEST_TRIPLE_1], &[TEST_TRIPLE_1]));
-        let builder = Builder::new(&build);
+        let sess = Session::new(configure("build", &[TEST_TRIPLE_1], &[TEST_TRIPLE_1]));
+        let builder = Builder::new(&sess);
         let target_triple_1 = TargetSelection::from_user(TEST_TRIPLE_1);
         let compiler = Compiler::new(1, target_triple_1);
         let target_triple_2 = TargetSelection::from_user(TEST_TRIPLE_2);
@@ -304,8 +140,8 @@ mod sysroot_target_dirs {
 
     #[test]
     fn test_sysroot_target_bindir() {
-        let build = Build::new(configure("build", &[TEST_TRIPLE_1], &[TEST_TRIPLE_1]));
-        let builder = Builder::new(&build);
+        let sess = Session::new(configure("build", &[TEST_TRIPLE_1], &[TEST_TRIPLE_1]));
+        let builder = Builder::new(&sess);
         let target_triple_1 = TargetSelection::from_user(TEST_TRIPLE_1);
         let compiler = Compiler::new(1, target_triple_1);
         let target_triple_2 = TargetSelection::from_user(TEST_TRIPLE_2);
@@ -360,7 +196,7 @@ fn test_test_coverage() {
         // case is the one that failed.
         println!("Testing case: {cmd:?}");
         let config = configure_with_args(cmd, &[], &[TEST_TRIPLE_1]);
-        let mut cache = run_build(&config.paths.clone(), config);
+        let cache = run_build(&config.paths.clone(), config);
 
         let modes =
             cache.inspect_all_steps_of_type::<test::Coverage, _>(|step, ()| step.mode.as_str());
@@ -403,29 +239,28 @@ fn test_prebuilt_llvm_config_path_resolution() {
         "#,
     );
 
-    let build = Build::new(config);
-    let builder = Builder::new(&build);
+    let sess = Session::new(config);
+    let builder = Builder::new(&sess);
 
-    let expected = PathBuf::from("/some/path/to/llvm-config");
+    let host_llvm_config = PathBuf::from("/some/path/to/llvm-config");
 
-    let actual = prebuilt_llvm_config(
-        &builder,
-        TargetSelection::from_user("arm-unknown-linux-gnueabihf"),
-        false,
-    )
-    .llvm_result()
-    .host_llvm_config
-    .clone();
+    let actual =
+        get_llvm_build_status(&builder, TargetSelection::from_user("arm-unknown-linux-gnueabihf"))
+            .llvm_output()
+            .llvm_config()
+            .to_path_buf();
     let actual = drop_win_disk_prefix_if_present(actual);
-    assert_eq!(expected, actual);
+    assert_ne!(
+        host_llvm_config, actual,
+        "llvm-config should be returned for the given target, not the host"
+    );
 
-    let actual = prebuilt_llvm_config(&builder, builder.config.host_target, false)
-        .llvm_result()
-        .host_llvm_config
-        .clone();
+    let actual = get_llvm_build_status(&builder, builder.config.host_target)
+        .llvm_output()
+        .llvm_config()
+        .to_path_buf();
     let actual = drop_win_disk_prefix_if_present(actual);
-    assert_eq!(expected, actual);
-    assert_eq!(expected, actual);
+    assert_eq!(host_llvm_config, actual);
 
     let config = configure(
         r#"
@@ -434,13 +269,13 @@ fn test_prebuilt_llvm_config_path_resolution() {
         "#,
     );
 
-    let build = Build::new(config.clone());
-    let builder = Builder::new(&build);
+    let sess = Session::new(config.clone());
+    let builder = Builder::new(&sess);
 
-    let actual = prebuilt_llvm_config(&builder, builder.config.host_target, false)
-        .llvm_result()
-        .host_llvm_config
-        .clone();
+    let actual = get_llvm_build_status(&builder, builder.config.host_target)
+        .llvm_output()
+        .llvm_config()
+        .to_path_buf();
     let expected = builder
         .out
         .join(builder.config.host_target)
@@ -455,15 +290,14 @@ fn test_prebuilt_llvm_config_path_resolution() {
         "#,
     );
 
-    // CI-LLVM isn't always available; check if it's enabled before testing.
-    if config.llvm_from_ci {
-        let build = Build::new(config.clone());
-        let builder = Builder::new(&build);
+    let sess = Session::new(config.clone());
+    let builder = Builder::new(&sess);
 
-        let actual = prebuilt_llvm_config(&builder, builder.config.host_target, false)
-            .llvm_result()
-            .host_llvm_config
-            .clone();
+    let llvm = get_llvm_build_status(&builder, builder.config.host_target);
+    let llvm = llvm.llvm_output();
+    // CI-LLVM isn't always available; check if it's enabled before testing.
+    if llvm.kind() == LlvmKind::DownloadedFromCi {
+        let actual = llvm.llvm_config().to_path_buf();
         let expected = builder
             .out
             .join(builder.config.host_target)
@@ -481,8 +315,8 @@ fn test_is_builder_target() {
     for (target1, target2) in [(target1, target2), (target2, target1)] {
         let mut config = configure("build", &[], &[]);
         config.host_target = target1;
-        let build = Build::new(config);
-        let builder = Builder::new(&build);
+        let sess = Session::new(config);
+        let builder = Builder::new(&sess);
 
         assert!(builder.config.is_host_target(target1));
         assert!(!builder.config.is_host_target(target2));
@@ -520,110 +354,101 @@ fn any_debug() {
     assert_eq!(x.downcast_ref::<MyStruct>(), Some(&MyStruct { x: 7 }));
 }
 
-/// These tests use insta for snapshot testing.
-/// See bootstrap's README on how to bless the snapshots.
+/// These tests use expect-test for snapshot testing.
+/// Run `x test bootstrap --bless` to update them.
 mod snapshot {
-    use std::path::PathBuf;
-
-    use crate::core::build_steps::{compile, dist, doc, install, test, tool};
+    // Trust: snapshot cases use ConfigBuilder methods rather than the outer test helpers.
+    use crate::core::build_steps::{dist, install, test};
     use crate::core::builder::tests::{
-        RenderConfig, TEST_TRIPLE_1, TEST_TRIPLE_2, TEST_TRIPLE_3, configure, first, host_target,
-        render_steps, run_build,
+        RenderConfig, TEST_TRIPLE_1, TEST_TRIPLE_2, assert_compiler_plan, host_target,
     };
-    use crate::core::builder::{Builder, Kind, StepDescription, StepMetadata};
+    use crate::core::builder::{Builder, CommandLineStep, Kind, StepMetadata};
+    use crate::core::compiler::Compiler;
     use crate::core::config::TargetSelection;
     use crate::core::config::toml::target::{
         DefaultLinuxLinkerOverride, with_default_linux_linker_overrides,
     };
-    use crate::utils::cache::Cache;
-    use crate::utils::helpers::get_host_target;
+    use crate::core::session::Session;
     use crate::utils::tests::{ConfigBuilder, TestCtx};
-    use crate::{Build, Compiler, Config, Flags, Subcommand};
+
+    // Trust: select the runtime frontend explicitly, including in a bare
+    // checkout. Otherwise AY's availability silently selects a different
+    // dependency order before Assemble reaches target LLVM.
+    fn with_verifier_frontend(config: ConfigBuilder) -> ConfigBuilder {
+        config.args(&["--set", "build.extended=true", "--set", "build.tools=['targo-trust']"])
+    }
 
     #[test]
     fn build_default() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>"#]]
+        .assert_eq(&ctx.config("build").render_steps());
     }
 
     #[test]
     fn build_cross_compile() {
         let ctx = TestCtx::new();
 
-        insta::assert_snapshot!(
-            ctx.config("build")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [build] rustc 2 <host> -> std 2 <target1>
+            [build] rustdoc 2 <host>
+            [build] llvm <target1>
+            [build] rustc 1 <host> -> rustc 2 <target1>
+            [build] rustc 2 <target1> -> std 2 <target1>
+            [build] rustdoc 2 <target1>"#]]
+        .assert_eq(
+            &ctx.config("build")
                 // Cross-compilation fails on stage 1, as we don't have a stage0 std available
                 // for non-host targets.
                 .stage(2)
                 .hosts(&[&host_target(), TEST_TRIPLE_1])
                 .targets(&[&host_target(), TEST_TRIPLE_1])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [build] rustc 2 <host> -> std 2 <target1>
-        [build] rustdoc 2 <host>
-        [build] llvm <target1>
-        [build] rustc 1 <host> -> rustc 2 <target1>
-        [build] rustc 2 <target1> -> std 2 <target1>
-        [build] rustdoc 2 <target1>
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
     fn build_with_empty_host() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
-                .config("build")
-                .hosts(&[])
-                .targets(&[TEST_TRIPLE_1])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        "
-        );
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <target1>"#]]
+        .assert_eq(&ctx.config("build").hosts(&[]).targets(&[TEST_TRIPLE_1]).render_steps());
     }
 
     #[test]
     fn build_compiler_no_explicit_stage() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("compiler")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("build").path("compiler").render_steps());
     }
 
     #[test]
     fn build_rustc_no_explicit_stage() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("rustc")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("build").path("rustc").render_steps());
     }
 
     #[test]
@@ -636,139 +461,134 @@ mod snapshot {
     #[test]
     fn build_compiler_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("compiler")
-                .stage(1)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("build").path("compiler").stage(1).render_steps());
     }
 
     #[test]
     fn build_compiler_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("compiler")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>"#]]
+        .assert_eq(&ctx.config("build").path("compiler").stage(2).render_steps());
     }
 
     #[test]
     fn build_compiler_stage_2_full_bootstrap_installs_target_std() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>"#]]
+        .assert_eq(
+            &ctx.config("build")
                 .path("compiler")
                 .stage(2)
                 .args(&["--set", "build.full-bootstrap=true"])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
     fn build_compiler_stage_3() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("compiler")
-                .stage(3)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> rustc 3 <host>
-        [build] rustc 3 <host> -> std 3 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> rustc 3 <host>
+            [build] rustc 3 <host> -> std 3 <host>"#]]
+        .assert_eq(&ctx.config("build").path("compiler").stage(3).render_steps());
     }
 
     #[test]
     fn build_compiler_stage_3_cross() {
+        // Trust: runtime tools request std before target LLVM. The repeated
+        // host std rows have distinct link policies.
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [build] rustc 2 <host> -> std 2 <target1>
+            [build] llvm <target1>
+            [build] rustc 2 <host> -> rustc 3 <target1>
+            [build] rustc 3 <target1> -> std 3 <target1>"#]]
+        .assert_eq(
+            &with_verifier_frontend(ctx.config("build"))
                 .path("compiler")
                 .hosts(&[TEST_TRIPLE_1])
                 .stage(3)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [build] rustc 2 <host> -> std 2 <target1>
-        [build] llvm <target1>
-        [build] rustc 2 <host> -> rustc 3 <target1>
-        [build] rustc 3 <target1> -> std 3 <target1>
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
     fn build_compiler_stage_3_full_bootstrap() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> rustc 3 <host>
+            [build] rustc 3 <host> -> std 3 <host>"#]]
+        .assert_eq(
+            &ctx.config("build")
                 .path("compiler")
                 .stage(3)
                 .args(&["--set", "build.full-bootstrap=true"])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> rustc 3 <host>
-        [build] rustc 3 <host> -> std 3 <host>
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
     fn build_compiler_stage_3_cross_full_bootstrap() {
+        // Trust: retain the full-bootstrap dependency order and both host std keys.
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <target1>
+            [build] llvm <target1>
+            [build] rustc 2 <host> -> rustc 3 <target1>
+            [build] rustc 3 <target1> -> std 3 <target1>"#]]
+        .assert_eq(
+            &with_verifier_frontend(ctx.config("build"))
                 .path("compiler")
                 .stage(3)
                 .hosts(&[TEST_TRIPLE_1])
                 .args(&["--set", "build.full-bootstrap=true"])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <target1>
-        [build] llvm <target1>
-        [build] rustc 2 <host> -> rustc 3 <target1>
-        [build] rustc 3 <target1> -> std 3 <target1>
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
@@ -802,57 +622,55 @@ mod snapshot {
     #[test]
     fn build_compiler_tools() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
-                .config("build")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 0 <host> -> LldWrapper 1 <host>
+            [build] rustc 0 <host> -> LlvmBitcodeLinker 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 1 <host> -> LldWrapper 2 <host>
+            [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustdoc 2 <host>"#]]
+        .assert_eq(
+            &ctx.config("build")
                 .stage(2)
                 .args(&["--set", "rust.lld=true", "--set", "rust.llvm-bitcode-linker=true"])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 0 <host> -> LldWrapper 1 <host>
-        [build] rustc 0 <host> -> LlvmBitcodeLinker 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 1 <host> -> LldWrapper 2 <host>
-        [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustdoc 2 <host>
-        "
+                .render_steps(),
         );
     }
 
     #[test]
     fn build_compiler_tools_cross() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
-                .config("build")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 0 <host> -> LldWrapper 1 <host>
+            [build] rustc 0 <host> -> LlvmBitcodeLinker 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 1 <host> -> LldWrapper 2 <host>
+            [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [build] rustc 2 <host> -> std 2 <target1>
+            [build] llvm <target1>
+            [build] rustc 1 <host> -> rustc 2 <target1>
+            [build] rustc 1 <host> -> LldWrapper 2 <target1>
+            [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <target1>
+            [build] rustc 2 <target1> -> std 2 <target1>
+            [build] rustdoc 2 <target1>"#]]
+        .assert_eq(
+            &ctx.config("build")
                 .stage(2)
                 .args(&["--set", "rust.lld=true", "--set", "rust.llvm-bitcode-linker=true"])
                 .hosts(&[TEST_TRIPLE_1])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 0 <host> -> LldWrapper 1 <host>
-        [build] rustc 0 <host> -> LlvmBitcodeLinker 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 1 <host> -> LldWrapper 2 <host>
-        [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [build] rustc 2 <host> -> std 2 <target1>
-        [build] llvm <target1>
-        [build] rustc 1 <host> -> rustc 2 <target1>
-        [build] rustc 1 <host> -> LldWrapper 2 <target1>
-        [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <target1>
-        [build] rustc 2 <target1> -> std 2 <target1>
-        [build] rustdoc 2 <target1>
-        "
+                .render_steps(),
         );
     }
 
@@ -862,15 +680,12 @@ mod snapshot {
             [(host_target(), DefaultLinuxLinkerOverride::SelfContainedLldCc)].into(),
             || {
                 let ctx = TestCtx::new();
-                insta::assert_snapshot!(
-                ctx.config("build")
-                    .path("compiler")
-                    .render_steps(), @r"
-                [build] llvm <host>
-                [build] rustc 0 <host> -> rustc 1 <host>
-                [build] rustc 0 <host> -> LldWrapper 1 <host>
-                [build] rustc 1 <host> -> std 1 <host>
-                ");
+                expect_test::expect![[r#"
+                    [build] llvm <host>
+                    [build] rustc 0 <host> -> rustc 1 <host>
+                    [build] rustc 0 <host> -> LldWrapper 1 <host>
+                    [build] rustc 1 <host> -> std 1 <host>"#]]
+                .assert_eq(&ctx.config("build").path("compiler").render_steps());
             },
         );
     }
@@ -881,15 +696,16 @@ mod snapshot {
             [(host_target(), DefaultLinuxLinkerOverride::SelfContainedLldCc)].into(),
             || {
                 let ctx = TestCtx::new();
-                insta::assert_snapshot!(
-                ctx.config("build")
-                    .path("compiler")
-                    .args(&["--set", "rust.lld=false"])
-                    .render_steps(), @r"
-                [build] llvm <host>
-                [build] rustc 0 <host> -> rustc 1 <host>
-                [build] rustc 1 <host> -> std 1 <host>
-                ");
+                expect_test::expect![[r#"
+                    [build] llvm <host>
+                    [build] rustc 0 <host> -> rustc 1 <host>
+                    [build] rustc 1 <host> -> std 1 <host>"#]]
+                .assert_eq(
+                    &ctx.config("build")
+                        .path("compiler")
+                        .args(&["--set", "rust.lld=false"])
+                        .render_steps(),
+                );
             },
         );
     }
@@ -897,15 +713,12 @@ mod snapshot {
     #[test]
     fn build_library_no_explicit_stage() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-            .path("library")
-            .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("build").path("library").render_steps());
     }
 
     #[test]
@@ -918,60 +731,50 @@ mod snapshot {
     #[test]
     fn build_library_stage_0_local_rebuild() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
+        expect_test::expect![["[build] rustc 0 <host> -> std 0 <target1>"]].assert_eq(
+            &ctx.config("build")
                 .path("library")
                 .stage(0)
                 .targets(&[TEST_TRIPLE_1])
                 .args(&["--set", "build.local-rebuild=true"])
-                .render_steps(), @"[build] rustc 0 <host> -> std 0 <target1>");
+                .render_steps(),
+        );
     }
 
     #[test]
     fn build_library_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("library")
-                .stage(1)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("build").path("library").stage(1).render_steps());
     }
 
     #[test]
     fn build_library_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("library")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>"#]]
+        .assert_eq(&ctx.config("build").path("library").stage(2).render_steps());
     }
 
     #[test]
     fn build_miri_no_explicit_stage() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("miri")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> miri 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> miri 1 <host>"#]]
+        .assert_eq(&ctx.config("build").path("miri").render_steps());
     }
 
     #[test]
@@ -984,57 +787,44 @@ mod snapshot {
     #[test]
     fn build_miri_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("miri")
-                .stage(1)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> miri 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> miri 1 <host>"#]]
+        .assert_eq(&ctx.config("build").path("miri").stage(1).render_steps());
     }
 
     #[test]
     fn build_miri_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("miri")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> miri 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> miri 2 <host>"#]]
+        .assert_eq(&ctx.config("build").path("miri").stage(2).render_steps());
     }
 
     #[test]
     fn build_error_index() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("error_index_generator")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> error-index 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> error-index 1 <host>"#]]
+        .assert_eq(&ctx.config("build").path("error_index_generator").render_steps());
     }
 
     #[test]
     fn build_bootstrap_tool_no_explicit_stage() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("opt-dist")
-                .render_steps(), @"[build] rustc 0 <host> -> OptimizedDist 1 <host>");
+        expect_test::expect![["[build] rustc 0 <host> -> OptimizedDist 1 <host>"]]
+            .assert_eq(&ctx.config("build").path("opt-dist").render_steps());
     }
 
     #[test]
@@ -1047,21 +837,15 @@ mod snapshot {
     #[test]
     fn build_bootstrap_tool_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("opt-dist")
-                .stage(1)
-                .render_steps(), @"[build] rustc 0 <host> -> OptimizedDist 1 <host>");
+        expect_test::expect![["[build] rustc 0 <host> -> OptimizedDist 1 <host>"]]
+            .assert_eq(&ctx.config("build").path("opt-dist").stage(1).render_steps());
     }
 
     #[test]
     fn build_bootstrap_tool_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .path("opt-dist")
-                .stage(2)
-                .render_steps(), @"[build] rustc 0 <host> -> OptimizedDist 1 <host>");
+        expect_test::expect![["[build] rustc 0 <host> -> OptimizedDist 1 <host>"]]
+            .assert_eq(&ctx.config("build").path("opt-dist").stage(2).render_steps());
     }
 
     #[test]
@@ -1075,112 +859,98 @@ mod snapshot {
     #[test]
     fn alias_and_path_for_library() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(ctx.config("build")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("build").paths(&["library", "core"]).render_steps());
+
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("build").paths(&["std"]).render_steps());
+
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("build").paths(&["core"]).render_steps());
+
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("build").paths(&["alloc"]).render_steps());
+
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]"#]].assert_eq(&ctx.config("doc")
             .paths(&["library", "core"])
-            .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
-
-        insta::assert_snapshot!(ctx.config("build")
-            .paths(&["std"])
-            .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
-
-        insta::assert_snapshot!(ctx.config("build")
-            .paths(&["core"])
-            .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
-
-        insta::assert_snapshot!(ctx.config("build")
-            .paths(&["alloc"])
-            .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
-
-        insta::assert_snapshot!(ctx.config("doc")
-            .paths(&["library", "core"])
-            .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        ");
+            .render_steps());
     }
 
     #[test]
     fn build_all() {
+        // Trust: include the runtime frontend's target std dependency explicitly.
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [build] llvm <target1>
+            [build] rustc 1 <host> -> rustc 2 <target1>
+            [build] rustc 2 <target1> -> std 2 <target1>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <target1>
+            [build] rustc 1 <host> -> std 1 <target2>
+            [build] rustc 2 <host> -> std 2 <target2>"#]]
+        .assert_eq(
+            &with_verifier_frontend(ctx.config("build"))
                 .stage(2)
                 .paths(&["compiler/rustc", "library"])
                 .hosts(&[&host_target(), TEST_TRIPLE_1])
                 .targets(&[&host_target(), TEST_TRIPLE_1, TEST_TRIPLE_2])
-            .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [build] llvm <target1>
-        [build] rustc 1 <host> -> rustc 2 <target1>
-        [build] rustc 2 <target1> -> std 2 <target1>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <target1>
-        [build] rustc 1 <host> -> std 1 <target2>
-        [build] rustc 2 <host> -> std 2 <target2>
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
     fn build_targo() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .paths(&["targo"])
-            .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> targo 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> targo 1 <host>"#]]
+        .assert_eq(&ctx.config("build").paths(&["targo"]).render_steps());
     }
 
     #[test]
     fn build_targo_cross() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("build")
-                .paths(&["targo"])
-                .hosts(&[TEST_TRIPLE_1])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [build] llvm <target1>
-        [build] rustc 1 <host> -> rustc 2 <target1>
-        [build] rustc 2 <target1> -> std 2 <target1>
-        [build] rustc 1 <host> -> targo 2 <target1>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [build] llvm <target1>
+            [build] rustc 1 <host> -> rustc 2 <target1>
+            [build] rustc 2 <target1> -> std 2 <target1>
+            [build] rustc 1 <host> -> targo 2 <target1>"#]]
+        .assert_eq(&ctx.config("build").paths(&["targo"]).hosts(&[TEST_TRIPLE_1]).render_steps());
     }
 
     #[test]
@@ -1194,446 +964,417 @@ mod snapshot {
         let ctx = TestCtx::new();
         // Note that stdlib is uplifted, that is why `[dist] rustc 1 <host> -> std <host>` is in
         // the output.
-        insta::assert_snapshot!(
-            ctx
-                .config("dist")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> standalone 2 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustdoc (book) <host>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] cargo (book) <host>
-        [doc] tippy (book) <host>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] docs <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[]
-        [dist] rustc 1 <host> -> json-docs 2 <host>
-        [dist] mingw <host>
-        [build] rustdoc 2 <host>
-        [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
-        [build] rustc 0 <host> -> GenerateCopyright 1 <host>
-        [dist] trustc <host>
-        [dist] rustc 1 <host> -> std 1 <host>
-        [dist] rustc 1 <host> -> trustc-dev 2 <host>
-        [dist] src <>
-        [dist] reproducible-artifacts <host>
-        "
-        );
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> standalone 2 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustdoc (book) <host>
+            [build] rustc 0 <host> -> LintDocs 1 <host>
+            [doc] rustc (book) <host>
+            [doc] cargo (book) <host>
+            [doc] tippy (book) <host>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>
+            [dist] docs <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[]
+            [dist] rustc 1 <host> -> json-docs 2 <host>
+            [dist] mingw <host>
+            [build] rustdoc 2 <host>
+            [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
+            [build] rustc 0 <host> -> GenerateCopyright 1 <host>
+            [dist] trustc <host>
+            [dist] rustc 1 <host> -> std 1 <host>
+            [dist] rustc 1 <host> -> trustc-dev 2 <host>
+            [dist] src <>
+            [dist] reproducible-artifacts <host>"#]].assert_eq(&ctx
+            .config("dist")
+            .render_steps());
     }
 
     #[test]
     fn dist_compiler_docs() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("dist")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [doc] rustc 1 <host> -> Rustdoc 2 <host>
+            [doc] rustc 1 <host> -> Rustfmt 2 <host>
+            [doc] rustc 1 <host> -> Clippy 2 <host>
+            [doc] rustc 1 <host> -> Miri 2 <host>
+            [doc] rustc 1 <host> -> Cargo 2 <host>
+            [doc] rustc 1 <host> -> Tidy 2 <host>
+            [doc] rustc 1 <host> -> Bootstrap 2 <host>
+            [doc] rustc 1 <host> -> BuildHelper 2 <host>
+            [doc] rustc 1 <host> -> Compiletest 2 <host>
+            [doc] rustc 1 <host> -> RunMakeSupport 2 <host>
+            [doc] rustc 1 <host> -> CompilerWithTools 2 <host>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>"#]]
+        .assert_eq(
+            &ctx.config("dist")
                 .path("rustc-docs")
                 .args(&["--set", "build.compiler-docs=true"])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> standalone 2 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [doc] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [doc] rustc 1 <host> -> Rustdoc 2 <host>
-        [doc] rustc 1 <host> -> Rustfmt 2 <host>
-        [build] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustdoc (book) <host>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] rustc 1 <host> -> Cargo 2 <host>
-        [doc] cargo (book) <host>
-        [doc] rustc 1 <host> -> Clippy 2 <host>
-        [doc] tippy (book) <host>
-        [doc] rustc 1 <host> -> Miri 2 <host>
-        [doc] rustc 1 <host> -> Tidy 2 <host>
-        [doc] rustc 1 <host> -> Bootstrap 2 <host>
-        [doc] rustc 1 <host> -> RunMakeSupport 2 <host>
-        [doc] rustc 1 <host> -> BuildHelper 2 <host>
-        [doc] rustc 1 <host> -> Compiletest 2 <host>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        "
+                .render_steps(),
         );
     }
 
     #[test]
     fn dist_extended() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("dist")
-            .args(&[
-                "--set",
-                "build.extended=true",
-                "--set",
-                "rust.llvm-bitcode-linker=true",
-                "--set",
-                "rust.lld=true",
-            ])
-            .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 0 <host> -> LldWrapper 1 <host>
-        [build] rustc 0 <host> -> WasmComponentLd 1 <host>
-        [build] rustc 0 <host> -> LlvmBitcodeLinker 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> standalone 2 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 1 <host> -> LldWrapper 2 <host>
-        [build] rustc 1 <host> -> WasmComponentLd 2 <host>
-        [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustdoc (book) <host>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] cargo (book) <host>
-        [doc] tippy (book) <host>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] docs <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[]
-        [dist] rustc 1 <host> -> json-docs 2 <host>
-        [dist] mingw <host>
-        [build] rustdoc 2 <host>
-        [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
-        [build] rustc 0 <host> -> GenerateCopyright 1 <host>
-        [dist] trustc <host>
-        [dist] rustc 1 <host> -> std 1 <host>
-        [dist] rustc 1 <host> -> trustc-dev 2 <host>
-        [dist] rustc 1 <host> -> analysis 2 <host>
-        [dist] src <>
-        [build] rustc 1 <host> -> targo 2 <host>
-        [dist] rustc 1 <host> -> targo 2 <host>
-        [build] rustc 1 <host> -> trust-analyzer 2 <host>
-        [dist] rustc 1 <host> -> trust-analyzer 2 <host>
-        [build] rustc 1 <host> -> rustfmt 2 <host>
-        [build] rustc 1 <host> -> cargo-fmt 2 <host>
-        [dist] rustc 1 <host> -> trustfmt 2 <host>
-        [build] rustc 1 <host> -> cargo-clippy 2 <host>
-        [build] rustc 1 <host> -> clippy-driver 2 <host>
-        [dist] rustc 1 <host> -> tippy 2 <host>
-        [build] rustc 1 <host> -> miri 2 <host>
-        [build] rustc 1 <host> -> cargo-miri 2 <host>
-        [dist] rustc 1 <host> -> trust-miri 2 <host>
-        [build] rustc 1 <host> -> trustd 2 <host>
-        [build] rustc 1 <host> -> targo-trust 2 <host>
-        [dist] rustc 1 <host> -> targo-trust 2 <host>
-        [doc] rustc 2 <host> -> std 2 <host> crates=[]
-        [dist] rustc 2 <host> -> json-docs 3 <host>
-        [dist] rustc 1 <host> -> extended 2 <host>
-        [dist] reproducible-artifacts <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 0 <host> -> LldWrapper 1 <host>
+            [build] rustc 0 <host> -> WasmComponentLd 1 <host>
+            [build] rustc 0 <host> -> LlvmBitcodeLinker 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> standalone 2 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 1 <host> -> LldWrapper 2 <host>
+            [build] rustc 1 <host> -> WasmComponentLd 2 <host>
+            [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustdoc (book) <host>
+            [build] rustc 0 <host> -> LintDocs 1 <host>
+            [doc] rustc (book) <host>
+            [doc] cargo (book) <host>
+            [doc] tippy (book) <host>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>
+            [dist] docs <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[]
+            [dist] rustc 1 <host> -> json-docs 2 <host>
+            [dist] mingw <host>
+            [build] rustdoc 2 <host>
+            [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
+            [build] rustc 0 <host> -> GenerateCopyright 1 <host>
+            [dist] trustc <host>
+            [dist] rustc 1 <host> -> std 1 <host>
+            [dist] rustc 1 <host> -> trustc-dev 2 <host>
+            [dist] rustc 1 <host> -> analysis 2 <host>
+            [dist] src <>
+            [build] rustc 1 <host> -> targo 2 <host>
+            [dist] rustc 1 <host> -> targo 2 <host>
+            [build] rustc 1 <host> -> trust-analyzer 2 <host>
+            [dist] rustc 1 <host> -> trust-analyzer 2 <host>
+            [build] rustc 1 <host> -> rustfmt 2 <host>
+            [build] rustc 1 <host> -> cargo-fmt 2 <host>
+            [dist] rustc 1 <host> -> trustfmt 2 <host>
+            [build] rustc 1 <host> -> cargo-clippy 2 <host>
+            [build] rustc 1 <host> -> clippy-driver 2 <host>
+            [dist] rustc 1 <host> -> tippy 2 <host>
+            [build] rustc 1 <host> -> miri 2 <host>
+            [build] rustc 1 <host> -> cargo-miri 2 <host>
+            [dist] rustc 1 <host> -> trust-miri 2 <host>
+            [build] rustc 1 <host> -> trustd 2 <host>
+            [build] rustc 1 <host> -> targo-trust 2 <host>
+            [dist] rustc 1 <host> -> targo-trust 2 <host>
+            [doc] rustc 2 <host> -> std 2 <host> crates=[]
+            [dist] rustc 2 <host> -> json-docs 3 <host>
+            [dist] rustc 1 <host> -> extended 2 <host>
+            [dist] reproducible-artifacts <host>"#]].assert_eq(&ctx.config("dist")
+        .args(&[
+            "--set",
+            "build.extended=true",
+            "--set",
+            "rust.llvm-bitcode-linker=true",
+            "--set",
+            "rust.lld=true",
+        ])
+        .render_steps());
     }
 
     #[test]
     fn dist_with_targets() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
-                .config("dist")
-                .hosts(&[&host_target()])
-                .targets(&[&host_target(), TEST_TRIPLE_1])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [doc] unstable-book (book) <target1>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> standalone 2 <host>
-        [doc] rustc 1 <host> -> standalone 2 <target1>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [doc] rustc 1 <host> -> std 1 <target1> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustdoc (book) <host>
-        [doc] rustdoc (book) <target1>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] cargo (book) <host>
-        [doc] cargo (book) <target1>
-        [doc] tippy (book) <host>
-        [doc] tippy (book) <target1>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] docs <host>
-        [dist] docs <target1>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[]
-        [dist] rustc 1 <host> -> json-docs 2 <host>
-        [doc] rustc 1 <host> -> std 1 <target1> crates=[]
-        [dist] rustc 1 <host> -> json-docs 2 <target1>
-        [dist] mingw <host>
-        [dist] mingw <target1>
-        [build] rustdoc 2 <host>
-        [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
-        [build] rustc 0 <host> -> GenerateCopyright 1 <host>
-        [dist] trustc <host>
-        [dist] rustc 1 <host> -> std 1 <host>
-        [dist] rustc 1 <host> -> std 1 <target1>
-        [dist] rustc 1 <host> -> trustc-dev 2 <host>
-        [dist] src <>
-        [dist] reproducible-artifacts <host>
-        "
-        );
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [doc] unstable-book (book) <target1>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> standalone 2 <host>
+            [doc] rustc 1 <host> -> standalone 2 <target1>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [doc] rustc 1 <host> -> std 1 <target1> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustdoc (book) <host>
+            [doc] rustdoc (book) <target1>
+            [build] rustc 0 <host> -> LintDocs 1 <host>
+            [doc] rustc (book) <host>
+            [doc] cargo (book) <host>
+            [doc] cargo (book) <target1>
+            [doc] tippy (book) <host>
+            [doc] tippy (book) <target1>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>
+            [dist] docs <host>
+            [dist] docs <target1>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[]
+            [dist] rustc 1 <host> -> json-docs 2 <host>
+            [doc] rustc 1 <host> -> std 1 <target1> crates=[]
+            [dist] rustc 1 <host> -> json-docs 2 <target1>
+            [dist] mingw <host>
+            [dist] mingw <target1>
+            [build] rustdoc 2 <host>
+            [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
+            [build] rustc 0 <host> -> GenerateCopyright 1 <host>
+            [dist] trustc <host>
+            [dist] rustc 1 <host> -> std 1 <host>
+            [dist] rustc 1 <host> -> std 1 <target1>
+            [dist] rustc 1 <host> -> trustc-dev 2 <host>
+            [dist] src <>
+            [dist] reproducible-artifacts <host>"#]].assert_eq(&ctx
+            .config("dist")
+            .hosts(&[&host_target()])
+            .targets(&[&host_target(), TEST_TRIPLE_1])
+            .render_steps());
     }
 
     #[test]
     fn dist_with_hosts() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
-                .config("dist")
-                .hosts(&[&host_target(), TEST_TRIPLE_1])
-                .targets(&[&host_target()])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> standalone 2 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustc 1 <host> -> error-index 2 <host>
-        [build] llvm <target1>
-        [build] rustc 1 <host> -> rustc 2 <target1>
-        [build] rustc 2 <target1> -> std 2 <target1>
-        [build] rustc 1 <host> -> error-index 2 <target1>
-        [doc] rustc 1 <host> -> error-index 2 <target1>
-        [doc] rustdoc (book) <host>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] rustc (book) <target1>
-        [doc] cargo (book) <host>
-        [doc] tippy (book) <host>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] docs <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[]
-        [dist] rustc 1 <host> -> json-docs 2 <host>
-        [dist] mingw <host>
-        [build] rustdoc 2 <host>
-        [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
-        [build] rustc 0 <host> -> GenerateCopyright 1 <host>
-        [dist] trustc <host>
-        [build] rustdoc 2 <target1>
-        [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <target1>
-        [dist] trustc <target1>
-        [dist] rustc 1 <host> -> std 1 <host>
-        [dist] rustc 1 <host> -> trustc-dev 2 <host>
-        [dist] rustc 1 <host> -> trustc-dev 2 <target1>
-        [dist] src <>
-        [dist] reproducible-artifacts <host>
-        [dist] reproducible-artifacts <target1>
-        "
-        );
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> standalone 2 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustc 1 <host> -> error-index 2 <host>
+            [build] llvm <target1>
+            [build] rustc 1 <host> -> rustc 2 <target1>
+            [build] rustc 2 <target1> -> std 2 <target1>
+            [build] rustc 1 <host> -> error-index 2 <target1>
+            [doc] rustc 1 <host> -> error-index 2 <target1>
+            [doc] rustdoc (book) <host>
+            [build] rustc 0 <host> -> LintDocs 1 <host>
+            [doc] rustc (book) <host>
+            [doc] rustc (book) <target1>
+            [doc] cargo (book) <host>
+            [doc] tippy (book) <host>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>
+            [dist] docs <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[]
+            [dist] rustc 1 <host> -> json-docs 2 <host>
+            [dist] mingw <host>
+            [build] rustdoc 2 <host>
+            [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
+            [build] rustc 0 <host> -> GenerateCopyright 1 <host>
+            [dist] trustc <host>
+            [build] rustdoc 2 <target1>
+            [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <target1>
+            [dist] trustc <target1>
+            [dist] rustc 1 <host> -> std 1 <host>
+            [dist] rustc 1 <host> -> trustc-dev 2 <host>
+            [dist] rustc 1 <host> -> trustc-dev 2 <target1>
+            [dist] src <>
+            [dist] reproducible-artifacts <host>
+            [dist] reproducible-artifacts <target1>"#]].assert_eq(&ctx
+            .config("dist")
+            .hosts(&[&host_target(), TEST_TRIPLE_1])
+            .targets(&[&host_target()])
+            .render_steps());
     }
 
     #[test]
     fn dist_with_targets_and_hosts() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
-                .config("dist")
-                .hosts(&[&host_target(), TEST_TRIPLE_1])
-                .targets(&[&host_target(), TEST_TRIPLE_1])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [doc] unstable-book (book) <target1>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> standalone 2 <host>
-        [doc] rustc 1 <host> -> standalone 2 <target1>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [doc] rustc 1 <host> -> std 1 <target1> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustc 1 <host> -> error-index 2 <host>
-        [build] llvm <target1>
-        [build] rustc 1 <host> -> rustc 2 <target1>
-        [build] rustc 2 <target1> -> std 2 <target1>
-        [build] rustc 1 <host> -> error-index 2 <target1>
-        [doc] rustc 1 <host> -> error-index 2 <target1>
-        [doc] rustdoc (book) <host>
-        [doc] rustdoc (book) <target1>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] rustc (book) <target1>
-        [doc] cargo (book) <host>
-        [doc] cargo (book) <target1>
-        [doc] tippy (book) <host>
-        [doc] tippy (book) <target1>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] docs <host>
-        [dist] docs <target1>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[]
-        [dist] rustc 1 <host> -> json-docs 2 <host>
-        [doc] rustc 1 <host> -> std 1 <target1> crates=[]
-        [dist] rustc 1 <host> -> json-docs 2 <target1>
-        [dist] mingw <host>
-        [dist] mingw <target1>
-        [build] rustdoc 2 <host>
-        [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
-        [build] rustc 0 <host> -> GenerateCopyright 1 <host>
-        [dist] trustc <host>
-        [build] rustdoc 2 <target1>
-        [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <target1>
-        [dist] trustc <target1>
-        [dist] rustc 1 <host> -> std 1 <host>
-        [dist] rustc 1 <host> -> std 1 <target1>
-        [dist] rustc 1 <host> -> trustc-dev 2 <host>
-        [dist] rustc 1 <host> -> trustc-dev 2 <target1>
-        [dist] src <>
-        [dist] reproducible-artifacts <host>
-        [dist] reproducible-artifacts <target1>
-        "
-        );
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [doc] unstable-book (book) <target1>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> standalone 2 <host>
+            [doc] rustc 1 <host> -> standalone 2 <target1>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [doc] rustc 1 <host> -> std 1 <target1> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustc 1 <host> -> error-index 2 <host>
+            [build] llvm <target1>
+            [build] rustc 1 <host> -> rustc 2 <target1>
+            [build] rustc 2 <target1> -> std 2 <target1>
+            [build] rustc 1 <host> -> error-index 2 <target1>
+            [doc] rustc 1 <host> -> error-index 2 <target1>
+            [doc] rustdoc (book) <host>
+            [doc] rustdoc (book) <target1>
+            [build] rustc 0 <host> -> LintDocs 1 <host>
+            [doc] rustc (book) <host>
+            [doc] rustc (book) <target1>
+            [doc] cargo (book) <host>
+            [doc] cargo (book) <target1>
+            [doc] tippy (book) <host>
+            [doc] tippy (book) <target1>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>
+            [dist] docs <host>
+            [dist] docs <target1>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[]
+            [dist] rustc 1 <host> -> json-docs 2 <host>
+            [doc] rustc 1 <host> -> std 1 <target1> crates=[]
+            [dist] rustc 1 <host> -> json-docs 2 <target1>
+            [dist] mingw <host>
+            [dist] mingw <target1>
+            [build] rustdoc 2 <host>
+            [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
+            [build] rustc 0 <host> -> GenerateCopyright 1 <host>
+            [dist] trustc <host>
+            [build] rustdoc 2 <target1>
+            [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <target1>
+            [dist] trustc <target1>
+            [dist] rustc 1 <host> -> std 1 <host>
+            [dist] rustc 1 <host> -> std 1 <target1>
+            [dist] rustc 1 <host> -> trustc-dev 2 <host>
+            [dist] rustc 1 <host> -> trustc-dev 2 <target1>
+            [dist] src <>
+            [dist] reproducible-artifacts <host>
+            [dist] reproducible-artifacts <target1>"#]].assert_eq(&ctx
+            .config("dist")
+            .hosts(&[&host_target(), TEST_TRIPLE_1])
+            .targets(&[&host_target(), TEST_TRIPLE_1])
+            .render_steps());
     }
 
     #[test]
     fn dist_with_empty_host() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
-                .config("dist")
-                .hosts(&[])
-                .targets(&[TEST_TRIPLE_1])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <target1>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> standalone 2 <target1>
-        [doc] rustc 1 <host> -> std 1 <target1> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [doc] rustdoc (book) <target1>
-        [doc] cargo (book) <target1>
-        [doc] tippy (book) <target1>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] docs <target1>
-        [doc] rustc 1 <host> -> std 1 <target1> crates=[]
-        [dist] rustc 1 <host> -> json-docs 2 <target1>
-        [dist] mingw <target1>
-        [dist] rustc 1 <host> -> std 1 <target1>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <target1>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> standalone 2 <target1>
+            [doc] rustc 1 <host> -> std 1 <target1> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [doc] rustdoc (book) <target1>
+            [doc] cargo (book) <target1>
+            [doc] tippy (book) <target1>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>
+            [dist] docs <target1>
+            [doc] rustc 1 <host> -> std 1 <target1> crates=[]
+            [dist] rustc 1 <host> -> json-docs 2 <target1>
+            [dist] mingw <target1>
+            [dist] rustc 1 <host> -> std 1 <target1>"#]].assert_eq(&ctx
+            .config("dist")
+            .hosts(&[])
+            .targets(&[TEST_TRIPLE_1])
+            .render_steps());
     }
 
     #[test]
     fn dist_all_cross_extended() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
-                .config("dist")
-                .hosts(&[TEST_TRIPLE_1])
-                .targets(&[TEST_TRIPLE_1])
-                .args(&["--set", "rust.channel=nightly", "--set", "build.extended=true"])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 0 <host> -> WasmComponentLd 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <target1>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> standalone 2 <target1>
-        [doc] rustc 1 <host> -> std 1 <target1> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] llvm <target1>
-        [build] rustc 1 <host> -> rustc 2 <target1>
-        [build] rustc 1 <host> -> WasmComponentLd 2 <target1>
-        [build] rustc 2 <target1> -> std 2 <target1>
-        [build] rustc 1 <host> -> error-index 2 <target1>
-        [doc] rustc 1 <host> -> error-index 2 <target1>
-        [doc] rustdoc (book) <target1>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <target1>
-        [doc] cargo (book) <target1>
-        [doc] tippy (book) <target1>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] docs <target1>
-        [doc] rustc 1 <host> -> std 1 <target1> crates=[]
-        [dist] rustc 1 <host> -> json-docs 2 <target1>
-        [dist] mingw <target1>
-        [build] rustdoc 2 <target1>
-        [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <target1>
-        [build] rustc 0 <host> -> GenerateCopyright 1 <host>
-        [dist] trustc <target1>
-        [dist] rustc 1 <host> -> std 1 <target1>
-        [dist] rustc 1 <host> -> trustc-dev 2 <target1>
-        [dist] rustc 1 <host> -> analysis 2 <target1>
-        [dist] src <>
-        [build] rustc 1 <host> -> targo 2 <target1>
-        [dist] rustc 1 <host> -> targo 2 <target1>
-        [build] rustc 1 <host> -> trust-analyzer 2 <target1>
-        [dist] rustc 1 <host> -> trust-analyzer 2 <target1>
-        [build] rustc 1 <host> -> rustfmt 2 <target1>
-        [build] rustc 1 <host> -> cargo-fmt 2 <target1>
-        [dist] rustc 1 <host> -> trustfmt 2 <target1>
-        [build] rustc 1 <host> -> cargo-clippy 2 <target1>
-        [build] rustc 1 <host> -> clippy-driver 2 <target1>
-        [dist] rustc 1 <host> -> tippy 2 <target1>
-        [build] rustc 1 <host> -> miri 2 <target1>
-        [build] rustc 1 <host> -> cargo-miri 2 <target1>
-        [dist] rustc 1 <host> -> trust-miri 2 <target1>
-        [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <target1>
-        [build] rustc 1 <host> -> trustd 2 <target1>
-        [build] rustc 1 <host> -> targo-trust 2 <target1>
-        [dist] rustc 1 <host> -> targo-trust 2 <target1>
-        [doc] rustc 2 <target1> -> std 2 <target1> crates=[]
-        [dist] rustc 2 <target1> -> json-docs 3 <target1>
-        [dist] rustc 1 <host> -> extended 2 <target1>
-        [dist] reproducible-artifacts <target1>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 0 <host> -> WasmComponentLd 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <target1>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> standalone 2 <target1>
+            [doc] rustc 1 <host> -> std 1 <target1> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] llvm <target1>
+            [build] rustc 1 <host> -> rustc 2 <target1>
+            [build] rustc 1 <host> -> WasmComponentLd 2 <target1>
+            [build] rustc 2 <target1> -> std 2 <target1>
+            [build] rustc 1 <host> -> error-index 2 <target1>
+            [doc] rustc 1 <host> -> error-index 2 <target1>
+            [doc] rustdoc (book) <target1>
+            [build] rustc 0 <host> -> LintDocs 1 <host>
+            [doc] rustc (book) <target1>
+            [doc] cargo (book) <target1>
+            [doc] tippy (book) <target1>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>
+            [dist] docs <target1>
+            [doc] rustc 1 <host> -> std 1 <target1> crates=[]
+            [dist] rustc 1 <host> -> json-docs 2 <target1>
+            [dist] mingw <target1>
+            [build] rustdoc 2 <target1>
+            [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <target1>
+            [build] rustc 0 <host> -> GenerateCopyright 1 <host>
+            [dist] trustc <target1>
+            [dist] rustc 1 <host> -> std 1 <target1>
+            [dist] rustc 1 <host> -> trustc-dev 2 <target1>
+            [dist] rustc 1 <host> -> analysis 2 <target1>
+            [dist] src <>
+            [build] rustc 1 <host> -> targo 2 <target1>
+            [dist] rustc 1 <host> -> targo 2 <target1>
+            [build] rustc 1 <host> -> trust-analyzer 2 <target1>
+            [dist] rustc 1 <host> -> trust-analyzer 2 <target1>
+            [build] rustc 1 <host> -> rustfmt 2 <target1>
+            [build] rustc 1 <host> -> cargo-fmt 2 <target1>
+            [dist] rustc 1 <host> -> trustfmt 2 <target1>
+            [build] rustc 1 <host> -> cargo-clippy 2 <target1>
+            [build] rustc 1 <host> -> clippy-driver 2 <target1>
+            [dist] rustc 1 <host> -> tippy 2 <target1>
+            [build] rustc 1 <host> -> miri 2 <target1>
+            [build] rustc 1 <host> -> cargo-miri 2 <target1>
+            [dist] rustc 1 <host> -> trust-miri 2 <target1>
+            [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <target1>
+            [build] rustc 1 <host> -> trustd 2 <target1>
+            [build] rustc 1 <host> -> targo-trust 2 <target1>
+            [dist] rustc 1 <host> -> targo-trust 2 <target1>
+            [doc] rustc 2 <target1> -> std 2 <target1> crates=[]
+            [dist] rustc 2 <target1> -> json-docs 3 <target1>
+            [dist] rustc 1 <host> -> extended 2 <target1>
+            [dist] reproducible-artifacts <target1>"#]].assert_eq(&ctx
+            .config("dist")
+            .hosts(&[TEST_TRIPLE_1])
+            .targets(&[TEST_TRIPLE_1])
+            .args(&["--set", "rust.channel=nightly", "--set", "build.extended=true"])
+            .render_steps());
     }
 
     /// Simulates e.g. the powerpc64 builder, which is fully cross-compiled from x64, but it does
@@ -1665,169 +1406,131 @@ mod snapshot {
                 && *m.target.triple == host_target()
         });
 
-        insta::assert_snapshot!(
-                steps.render(), @r"
-        [dist] mingw <target1>
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 0 <host> -> WasmComponentLd 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] llvm <target1>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <target1>
-        [build] rustc 1 <host> -> WasmComponentLd 2 <target1>
-        [build] rustc 2 <target1> -> std 2 <target1>
-        [build] rustdoc 2 <target1>
-        [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <target1>
-        [build] rustc 0 <host> -> GenerateCopyright 1 <host>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] trustc <target1>
-        [dist] rustc 1 <host> -> std 1 <target1>
-        [dist] rustc 1 <host> -> trustc-dev 2 <target1>
-        [dist] rustc 1 <host> -> analysis 2 <target1>
-        [dist] src <>
-        [build] rustc 1 <host> -> targo 2 <target1>
-        [dist] rustc 1 <host> -> targo 2 <target1>
-        [build] rustc 1 <host> -> trust-analyzer 2 <target1>
-        [dist] rustc 1 <host> -> trust-analyzer 2 <target1>
-        [build] rustc 1 <host> -> rustfmt 2 <target1>
-        [build] rustc 1 <host> -> cargo-fmt 2 <target1>
-        [dist] rustc 1 <host> -> trustfmt 2 <target1>
-        [build] rustc 1 <host> -> cargo-clippy 2 <target1>
-        [build] rustc 1 <host> -> clippy-driver 2 <target1>
-        [dist] rustc 1 <host> -> tippy 2 <target1>
-        [build] rustc 1 <host> -> miri 2 <target1>
-        [build] rustc 1 <host> -> cargo-miri 2 <target1>
-        [dist] rustc 1 <host> -> trust-miri 2 <target1>
-        [build] rustc 1 <host> -> LlvmBitcodeLinker 2 <target1>
-        [build] rustc 1 <host> -> trustd 2 <target1>
-        [build] rustc 1 <host> -> targo-trust 2 <target1>
-        [dist] rustc 1 <host> -> targo-trust 2 <target1>
-        [dist] rustc 1 <host> -> extended 2 <target1>
-        [dist] reproducible-artifacts <target1>
-        ");
+        // Independent prerequisites can be scheduled in either order. Preserve
+        // the cross-target artifacts and the no-host-stage2 regression directly.
+        let target = TargetSelection::from_user(TEST_TRIPLE_1);
+        let host = TargetSelection::from_user(&host_target());
+        steps.assert_contains(StepMetadata::build("llvm", target));
+        steps
+            .assert_contains(StepMetadata::build("rustc", target).built_by(Compiler::new(1, host)));
+        steps
+            .assert_contains(StepMetadata::build("std", target).built_by(Compiler::new(2, target)));
+        steps.assert_contains(
+            StepMetadata::dist("extended", target).built_by(Compiler::new(1, host)),
+        );
+        steps.assert_no_match(|metadata| metadata.kind == Kind::Doc);
     }
 
     #[test]
     fn dist_trust_cg_by_default() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> standalone 2 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustdoc (book) <host>
+            [build] rustc 0 <host> -> LintDocs 1 <host>
+            [doc] rustc (book) <host>
+            [doc] cargo (book) <host>
+            [doc] tippy (book) <host>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>
+            [dist] docs <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[]
+            [dist] rustc 1 <host> -> json-docs 2 <host>
+            [dist] mingw <host>
+            [build] rustdoc 2 <host>
+            [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
+            [build] rustc 0 <host> -> GenerateCopyright 1 <host>
+            [dist] trustc <host>
+            [dist] rustc 1 <host> -> std 1 <host>
+            [dist] rustc 1 <host> -> trustc-dev 2 <host>
+            [dist] src <>
+            [dist] reproducible-artifacts <host>"#]]
+        .assert_eq(&ctx
                 .config("dist")
                 .args(&["--set", "rust.codegen-backends=['llvm', 'trust-cg']"])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> standalone 2 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustdoc (book) <host>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] cargo (book) <host>
-        [doc] tippy (book) <host>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] docs <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[]
-        [dist] rustc 1 <host> -> json-docs 2 <host>
-        [dist] mingw <host>
-        [build] rustdoc 2 <host>
-        [build] rustc 1 <host> -> trust-analyzer-proc-macro-srv 2 <host>
-        [build] rustc 0 <host> -> GenerateCopyright 1 <host>
-        [dist] trustc <host>
-        [dist] rustc 1 <host> -> std 1 <host>
-        [dist] rustc 1 <host> -> trustc-dev 2 <host>
-        [dist] src <>
-        [dist] reproducible-artifacts <host>
-        ");
+                .render_steps());
     }
 
     #[test]
     fn dist_bootstrap() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
-                .config("dist")
-                .path("bootstrap")
-                .render_steps(), @r"
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] bootstrap <host>
-        ");
+        expect_test::expect![[r#"
+            [build] rustc 0 <host> -> RustInstaller 1 <host>
+            [dist] bootstrap <host>"#]]
+        .assert_eq(&ctx.config("dist").path("bootstrap").render_steps());
     }
 
     #[test]
     fn dist_library_stage_0_local_rebuild() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("dist")
+        expect_test::expect![[r#"
+            [build] rustc 0 <host> -> std 0 <target1>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>
+            [dist] rustc 0 <host> -> std 0 <target1>"#]]
+        .assert_eq(
+            &ctx.config("dist")
                 .path("trust-std")
                 .stage(0)
                 .targets(&[TEST_TRIPLE_1])
                 .args(&["--set", "build.local-rebuild=true"])
-                .render_steps(), @r"
-        [build] rustc 0 <host> -> std 0 <target1>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        [dist] rustc 0 <host> -> std 0 <target1>
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
     fn dist_rustc_docs() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx
-                .config("dist")
-                .path("rustc-docs")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> standalone 2 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustdoc (book) <host>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] cargo (book) <host>
-        [doc] tippy (book) <host>
-        [build] rustc 0 <host> -> RustInstaller 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [doc] rustc 1 <host> -> Rustdoc 2 <host>
+            [doc] rustc 1 <host> -> Rustfmt 2 <host>
+            [doc] rustc 1 <host> -> Clippy 2 <host>
+            [doc] rustc 1 <host> -> Miri 2 <host>
+            [doc] rustc 1 <host> -> Cargo 2 <host>
+            [doc] rustc 1 <host> -> Tidy 2 <host>
+            [doc] rustc 1 <host> -> Bootstrap 2 <host>
+            [doc] rustc 1 <host> -> BuildHelper 2 <host>
+            [doc] rustc 1 <host> -> Compiletest 2 <host>
+            [doc] rustc 1 <host> -> RunMakeSupport 2 <host>
+            [doc] rustc 1 <host> -> CompilerWithTools 2 <host>
+            [build] rustc 0 <host> -> RustInstaller 1 <host>"#]]
+        .assert_eq(&ctx.config("dist").path("rustc-docs").render_steps());
     }
 
     #[test]
     fn check_compiler_no_explicit_stage() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("compiler")
-                .render_steps(), @"[check] rustc 0 <host> -> rustc 1 <host> (105 crates)");
+        assert_compiler_plan(
+            &ctx,
+            expect_test::expect!["[check] rustc 0 <host> -> rustc 1 <host> (compiler crates)"],
+            &ctx.config("check").path("compiler").render_steps(),
+        );
     }
 
     #[test]
     fn check_rustc_no_explicit_stage() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("rustc")
-                .render_steps(), @"[check] rustc 0 <host> -> rustc 1 <host> (1 crates)");
+        expect_test::expect![["[check] rustc 0 <host> -> rustc 1 <host> (1 crates)"]]
+            .assert_eq(&ctx.config("check").path("rustc").render_steps());
     }
 
     #[test]
@@ -1840,67 +1543,62 @@ mod snapshot {
     #[test]
     fn check_compiler_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("compiler")
-                .stage(1)
-                .render_steps(), @"[check] rustc 0 <host> -> rustc 1 <host> (105 crates)");
+        assert_compiler_plan(
+            &ctx,
+            expect_test::expect!["[check] rustc 0 <host> -> rustc 1 <host> (compiler crates)"],
+            &ctx.config("check").path("compiler").stage(1).render_steps(),
+        );
     }
 
     #[test]
     fn check_compiler_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("compiler")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [check] rustc 1 <host> -> rustc 2 <host> (105 crates)
-        ");
+        assert_compiler_plan(
+            &ctx,
+            expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [check] rustc 1 <host> -> rustc 2 <host> (compiler crates)"#]],
+            &ctx.config("check").path("compiler").stage(2).render_steps(),
+        );
     }
 
     #[test]
     fn check_cross_compile() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .targets(&[TEST_TRIPLE_1])
-                .hosts(&[TEST_TRIPLE_1])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [check] rustc 1 <host> -> std 1 <target1>
-        [check] rustc 1 <host> -> rustc 2 <target1> (105 crates)
-        [check] rustc 1 <host> -> rustc 2 <target1>
-        [check] rustc 1 <host> -> Rustdoc 2 <target1>
-        [check] rustc 1 <host> -> Clippy 2 <target1>
-        [check] rustc 1 <host> -> Miri 2 <target1>
-        [check] rustc 1 <host> -> CargoMiri 2 <target1>
-        [check] rustc 1 <host> -> Rustfmt 2 <target1>
-        [check] rustc 1 <host> -> RustAnalyzer 2 <target1>
-        [check] rustc 1 <host> -> TestFloatParse 2 <target1>
-        [check] rustc 1 <host> -> std 1 <target1>
-        ");
+        assert_compiler_plan(
+            &ctx,
+            expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [check] rustc 1 <host> -> std 1 <target1>
+            [check] rustc 1 <host> -> rustc 2 <target1> (compiler crates)
+            [check] rustc 1 <host> -> rustc 2 <target1>
+            [check] rustc 1 <host> -> Rustdoc 2 <target1>
+            [check] rustc 1 <host> -> Clippy 2 <target1>
+            [check] rustc 1 <host> -> Miri 2 <target1>
+            [check] rustc 1 <host> -> CargoMiri 2 <target1>
+            [check] rustc 1 <host> -> Rustfmt 2 <target1>
+            [check] rustc 1 <host> -> RustAnalyzer 2 <target1>
+            [check] rustc 1 <host> -> TestFloatParse 2 <target1>
+            [check] rustc 1 <host> -> std 1 <target1>"#]],
+            &ctx.config("check").targets(&[TEST_TRIPLE_1]).hosts(&[TEST_TRIPLE_1]).render_steps(),
+        );
     }
 
     #[test]
     fn check_library_no_explicit_stage() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("library")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [check] rustc 1 <host> -> std 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [check] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("check").path("library").render_steps());
     }
 
     #[test]
@@ -1913,50 +1611,43 @@ mod snapshot {
     #[test]
     fn check_library_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("library")
-                .stage(1)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [check] rustc 1 <host> -> std 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [check] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("check").path("library").stage(1).render_steps());
     }
 
     #[test]
     fn check_library_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("library")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [check] rustc 2 <host> -> std 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [check] rustc 2 <host> -> std 2 <host>"#]]
+        .assert_eq(&ctx.config("check").path("library").stage(2).render_steps());
     }
 
     #[test]
     fn check_library_cross_compile() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [check] rustc 1 <host> -> std 1 <target1>
+            [check] rustc 1 <host> -> std 1 <target2>"#]]
+        .assert_eq(
+            &ctx.config("check")
                 .paths(&["core", "alloc", "std"])
                 .targets(&[TEST_TRIPLE_1, TEST_TRIPLE_2])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [check] rustc 1 <host> -> std 1 <target1>
-        [check] rustc 1 <host> -> std 1 <target2>
-        ");
+                .render_steps(),
+        );
     }
 
     /// Make sure that we don't check library when download-rustc is disabled
@@ -1965,29 +1656,27 @@ mod snapshot {
     fn check_library_skip_without_download_rustc() {
         let ctx = TestCtx::new();
         let args = ["--set", "rust.download-rustc=false", "--skip-std-check-if-no-download-rustc"];
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .paths(&["library"])
-                .args(&args)
-                .render_steps(), @"");
+        expect_test::expect![[""]]
+            .assert_eq(&ctx.config("check").paths(&["library"]).args(&args).render_steps());
 
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .paths(&["library", "compiler"])
-                .args(&args)
-                .render_steps(), @"[check] rustc 0 <host> -> rustc 1 <host> (105 crates)");
+        assert_compiler_plan(
+            &ctx,
+            expect_test::expect!["[check] rustc 0 <host> -> rustc 1 <host> (compiler crates)"],
+            &ctx.config("check").paths(&["library", "compiler"]).args(&args).render_steps(),
+        );
     }
 
     #[test]
     fn check_miri_no_explicit_stage() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("miri")
-                .render_steps(), @r"
-        [check] rustc 0 <host> -> rustc 1 <host>
-        [check] rustc 0 <host> -> Miri 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [check] rustc 1 <host> -> rustc 2 <host>
+            [check] rustc 1 <host> -> Miri 2 <host>"#]]
+        .assert_eq(&ctx.config("check").path("miri").render_steps());
     }
 
     #[test]
@@ -2000,61 +1689,64 @@ mod snapshot {
     #[test]
     fn check_miri_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("miri")
-                .stage(1)
-                .render_steps(), @r"
-        [check] rustc 0 <host> -> rustc 1 <host>
-        [check] rustc 0 <host> -> Miri 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [check] rustc 1 <host> -> rustc 2 <host>
+            [check] rustc 1 <host> -> Miri 2 <host>"#]]
+        .assert_eq(&ctx.config("check").path("miri").stage(1).render_steps());
     }
 
     #[test]
     fn check_miri_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("miri")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [check] rustc 1 <host> -> rustc 2 <host>
-        [check] rustc 1 <host> -> Miri 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [check] rustc 1 <host> -> rustc 2 <host>
+            [check] rustc 1 <host> -> Miri 2 <host>"#]]
+        .assert_eq(&ctx.config("check").path("miri").stage(2).render_steps());
+    }
+
+    // Trust: the explicit Priroda path selects its unified Miri package and stage floor.
+    #[test]
+    fn check_priroda_stage_1() {
+        let ctx = TestCtx::new();
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [check] rustc 1 <host> -> rustc 2 <host>
+            [check] rustc 1 <host> -> Miri 2 <host>"#]]
+        .assert_eq(&ctx.config("check").path("src/tools/miri/priroda").stage(1).render_steps());
     }
 
     #[test]
     fn check_compiletest() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("compiletest")
-                .render_steps(), @"[check] rustc 0 <host> -> Compiletest 1 <host>");
+        expect_test::expect![["[check] rustc 0 <host> -> Compiletest 1 <host>"]]
+            .assert_eq(&ctx.config("check").path("compiletest").render_steps());
     }
 
     #[test]
     fn check_rust_analyzer() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("rust-analyzer")
-                .render_steps(), @r"
-        [check] rustc 0 <host> -> rustc 1 <host>
-        [check] rustc 0 <host> -> RustAnalyzer 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [check] rustc 0 <host> -> rustc 1 <host>
+            [check] rustc 0 <host> -> RustAnalyzer 1 <host>"#]]
+        .assert_eq(&ctx.config("check").path("rust-analyzer").render_steps());
     }
 
     #[test]
     fn check_bootstrap_tool() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("check")
-                .path("run-make-support")
-                .render_steps(), @"[check] rustc 0 <host> -> RunMakeSupport 1 <host>");
+        expect_test::expect![["[check] rustc 0 <host> -> RunMakeSupport 1 <host>"]]
+            .assert_eq(&ctx.config("check").path("run-make-support").render_steps());
     }
 
     fn prepare_test_config(ctx: &TestCtx) -> ConfigBuilder {
@@ -2091,285 +1783,328 @@ mod snapshot {
     #[test]
     fn test_all_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            prepare_test_config(&ctx)
-                .render_steps(), @r"
-        [build] rustc 0 <host> -> Tidy 1 <host>
-        [test] tidy <>
-        [build] rustdoc 0 <host>
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> Compiletest 1 <host>
-        [test] compiletest-ui 1 <host>
-        [test] compiletest-crashes 1 <host>
-        [build] rustc 0 <host> -> CoverageDump 1 <host>
-        [test] compiletest-coverage 1 <host>
-        [test] compiletest-coverage 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [test] compiletest-mir-opt 1 <host>
-        [test] compiletest-codegen-llvm 1 <host>
-        [test] compiletest-codegen-units 1 <host>
-        [test] compiletest-assembly-llvm 1 <host>
-        [test] compiletest-incremental 1 <host>
-        [test] compiletest-debuginfo 1 <host>
-        [test] compiletest-ui-fulldeps 1 <host>
-        [build] rustdoc 1 <host>
-        [test] compiletest-rustdoc-html 1 <host>
-        [test] compiletest-coverage-run-rustdoc 1 <host>
-        [test] compiletest-pretty 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> std 0 <host>
-        [test] rustc 0 <host> -> CrateLibrustc 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [test] crate-bootstrap <host> src/tools/coverage-dump
-        [test] crate-bootstrap <host> src/tools/jsondoclint
-        [test] crate-bootstrap <host> src/tools/replace-version-placeholder
-        [test] crate-bootstrap <host> tidyselftest
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [doc] rustc 0 <host> -> standalone 1 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 0 <host> -> error-index 1 <host>
-        [doc] rustc 0 <host> -> error-index 1 <host>
-        [doc] rustdoc (book) <host>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] cargo (book) <host>
-        [doc] tippy (book) <host>
-        [build] rustc 0 <host> -> Linkchecker 1 <host>
-        [test] link-check <host>
-        [test] tier-check <host>
-        [test] rustc 0 <host> -> rust-analyzer 1 <host>
-        [build] rustc 0 <host> -> RustdocTheme 1 <host>
-        [test] rustdoc-theme 1 <host>
-        [test] compiletest-rustdoc-ui 1 <host>
-        [build] rustc 0 <host> -> JsonDocCk 1 <host>
-        [build] rustc 0 <host> -> JsonDocLint 1 <host>
-        [test] compiletest-rustdoc-json 1 <host>
-        [doc] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 0 <host> -> HtmlChecker 1 <host>
-        [test] html-check <host>
-        [build] rustc 0 <host> -> RunMakeSupport 1 <host>
-        [test] compiletest-run-make 1 <host>
-        [build] rustc 0 <host> -> targo 1 <host>
-        [test] compiletest-run-make-cargo 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] rustc 0 <host> -> Tidy 1 <host>
+            [test] tidy <>
+            [build] rustdoc 0 <host>
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> Compiletest 1 <host>
+            [test] compiletest-ui 1 <host>
+            [test] compiletest-crashes 1 <host>
+            [build] rustc 0 <host> -> CoverageDump 1 <host>
+            [test] compiletest-coverage 1 <host>
+            [test] compiletest-coverage 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [test] compiletest-mir-opt 1 <host>
+            [test] compiletest-codegen-llvm 1 <host>
+            [test] compiletest-codegen-units 1 <host>
+            [test] compiletest-assembly-gcc 1 <host>
+            [test] compiletest-assembly-llvm 1 <host>
+            [test] compiletest-incremental 1 <host>
+            [test] compiletest-debuginfo 1 <host>
+            [test] compiletest-ui-fulldeps 1 <host>
+            [build] rustdoc 1 <host>
+            [test] compiletest-rustdoc-html 1 <host>
+            [test] compiletest-coverage-run-rustdoc 1 <host>
+            [test] compiletest-pretty 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> std 0 <host>
+            [test] rustc 0 <host> -> CrateLibrustc 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [test] crate-bootstrap <host> src/tools/coverage-dump
+            [test] crate-bootstrap <host> src/tools/jsondoclint
+            [test] crate-bootstrap <host> src/tools/replace-version-placeholder
+            [test] crate-bootstrap <host> tidyselftest
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <host>
+            [doc] rustc 0 <host> -> standalone 1 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 0 <host> -> error-index 1 <host>
+            [doc] rustc 0 <host> -> error-index 1 <host>
+            [doc] rustdoc (book) <host>
+            [build] rustc 0 <host> -> LintDocs 1 <host>
+            [doc] rustc (book) <host>
+            [doc] cargo (book) <host>
+            [doc] tippy (book) <host>
+            [build] rustc 0 <host> -> Linkchecker 1 <host>
+            [test] link-check <host>
+            [test] tier-check <host>
+            [test] rustc 0 <host> -> rust-analyzer 1 <host>
+            [build] rustc 0 <host> -> RustdocTheme 1 <host>
+            [test] rustdoc-theme 1 <host>
+            [test] compiletest-rustdoc-ui 1 <host>
+            [build] rustc 0 <host> -> JsonDocCk 1 <host>
+            [build] rustc 0 <host> -> JsonDocLint 1 <host>
+            [test] compiletest-rustdoc-json 1 <host>
+            [doc] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 0 <host> -> HtmlChecker 1 <host>
+            [test] html-check <host>
+            [test] test-float-parse <host>
+            [build] rustc 0 <host> -> RunMakeSupport 1 <host>
+            [test] compiletest-run-make 1 <host>
+            [build] rustc 0 <host> -> targo 1 <host>
+            [test] compiletest-run-make-cargo 1 <host>
+            [test] intrinsic-test <host>"#]].assert_eq(&prepare_test_config(&ctx)
+            .render_steps());
     }
 
     #[test]
     fn test_compiletest_self_test() {
         let ctx = TestCtx::new();
         let steps = ctx.config("test").arg("compiletest").render_steps();
-        insta::assert_snapshot!(steps, @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 0 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 0 <host>"#]]
+        .assert_eq(&steps);
     }
 
     #[test]
     fn test_compiletest_suites_stage1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .args(&["ui", "ui-fulldeps", "run-make", "rustdoc-html", "rustdoc-gui", "incremental"])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> Compiletest 1 <host>
-        [test] compiletest-ui 1 <host>
-        [test] compiletest-ui-fulldeps 1 <host>
-        [build] rustc 0 <host> -> RunMakeSupport 1 <host>
-        [build] rustdoc 1 <host>
-        [test] compiletest-run-make 1 <host>
-        [test] compiletest-rustdoc-html 1 <host>
-        [build] rustc 0 <host> -> RustdocGUITest 1 <host>
-        [test] rustdoc-gui 1 <host>
-        [test] compiletest-incremental 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> Compiletest 1 <host>
+            [test] compiletest-ui 1 <host>
+            [test] compiletest-ui-fulldeps 1 <host>
+            [build] rustc 0 <host> -> RunMakeSupport 1 <host>
+            [build] rustdoc 1 <host>
+            [test] compiletest-run-make 1 <host>
+            [test] compiletest-rustdoc-html 1 <host>
+            [build] rustc 0 <host> -> RustdocGUITest 1 <host>
+            [test] rustdoc-gui 1 <host>
+            [test] compiletest-incremental 1 <host>"#]]
+        .assert_eq(
+            &ctx.config("test")
+                .args(&[
+                    "ui",
+                    "ui-fulldeps",
+                    "run-make",
+                    "rustdoc-html",
+                    "rustdoc-gui",
+                    "incremental",
+                ])
+                .render_steps(),
+        );
     }
 
     #[test]
     fn test_compiletest_suites_stage2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .args(&["ui", "ui-fulldeps", "run-make", "rustdoc-html", "rustdoc-gui", "incremental"])
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 0 <host> -> Compiletest 1 <host>
+            [test] compiletest-ui 2 <host>
+            [test] compiletest-ui-fulldeps 2 <host>
+            [build] rustc 0 <host> -> RunMakeSupport 1 <host>
+            [build] rustdoc 2 <host>
+            [test] compiletest-run-make 2 <host>
+            [test] compiletest-rustdoc-html 2 <host>
+            [build] rustc 0 <host> -> RustdocGUITest 1 <host>
+            [test] rustdoc-gui 2 <host>
+            [test] compiletest-incremental 2 <host>"#]]
+        .assert_eq(
+            &ctx.config("test")
+                .args(&[
+                    "ui",
+                    "ui-fulldeps",
+                    "run-make",
+                    "rustdoc-html",
+                    "rustdoc-gui",
+                    "incremental",
+                ])
                 .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 0 <host> -> Compiletest 1 <host>
-        [test] compiletest-ui 2 <host>
-        [test] compiletest-ui-fulldeps 2 <host>
-        [build] rustc 0 <host> -> RunMakeSupport 1 <host>
-        [build] rustdoc 2 <host>
-        [test] compiletest-run-make 2 <host>
-        [test] compiletest-rustdoc-html 2 <host>
-        [build] rustc 0 <host> -> RustdocGUITest 1 <host>
-        [test] rustdoc-gui 2 <host>
-        [test] compiletest-incremental 2 <host>
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
     fn test_compiletest_suites_stage2_cross() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 0 <host> -> Compiletest 1 <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [build] rustc 2 <host> -> std 2 <target1>
+            [test] compiletest-ui 2 <target1>
+            [build] llvm <target1>
+            [build] rustc 1 <host> -> rustc 2 <target1>
+            [test] compiletest-ui-fulldeps 2 <target1>
+            [build] rustc 0 <host> -> RunMakeSupport 1 <host>
+            [build] rustdoc 2 <host>
+            [test] compiletest-run-make 2 <target1>
+            [build] rustc 2 <target1> -> std 2 <target1>
+            [build] rustc 2 <target1> -> std 2 <target1>
+            [build] rustdoc 2 <target1>
+            [build] rustc 0 <host> -> RustdocGUITest 1 <host>
+            [test] rustdoc-gui 2 <target1>
+            [test] compiletest-incremental 2 <target1>"#]]
+        .assert_eq(
+            &ctx.config("test")
                 .hosts(&[TEST_TRIPLE_1])
                 .targets(&[TEST_TRIPLE_1])
                 .args(&["ui", "ui-fulldeps", "run-make", "rustdoc", "rustdoc-gui", "incremental"])
                 .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 0 <host> -> Compiletest 1 <host>
-        [build] rustc 1 <host> -> std 1 <target1>
-        [build] rustc 2 <host> -> std 2 <target1>
-        [test] compiletest-ui 2 <target1>
-        [build] llvm <target1>
-        [build] rustc 1 <host> -> rustc 2 <target1>
-        [test] compiletest-ui-fulldeps 2 <target1>
-        [build] rustc 0 <host> -> RunMakeSupport 1 <host>
-        [build] rustdoc 2 <host>
-        [test] compiletest-run-make 2 <target1>
-        [build] rustc 2 <target1> -> std 2 <target1>
-        [build] rustc 2 <target1> -> std 2 <target1>
-        [build] rustdoc 2 <target1>
-        [build] rustc 0 <host> -> RustdocGUITest 1 <host>
-        [test] rustdoc-gui 2 <target1>
-        [test] compiletest-incremental 2 <target1>
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
     fn test_all_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            prepare_test_config(&ctx)
-                .stage(2)
-                .render_steps(), @r"
-        [build] rustc 0 <host> -> Tidy 1 <host>
-        [test] tidy <>
-        [build] rustdoc 0 <host>
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 0 <host> -> Compiletest 1 <host>
-        [test] compiletest-ui 2 <host>
-        [test] compiletest-crashes 2 <host>
-        [build] rustc 0 <host> -> CoverageDump 1 <host>
-        [test] compiletest-coverage 2 <host>
-        [test] compiletest-coverage 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [test] compiletest-mir-opt 2 <host>
-        [test] compiletest-codegen-llvm 2 <host>
-        [test] compiletest-codegen-units 2 <host>
-        [test] compiletest-assembly-llvm 2 <host>
-        [test] compiletest-incremental 2 <host>
-        [test] compiletest-debuginfo 2 <host>
-        [test] compiletest-ui-fulldeps 2 <host>
-        [build] rustdoc 2 <host>
-        [test] compiletest-rustdoc-html 2 <host>
-        [test] compiletest-coverage-run-rustdoc 2 <host>
-        [test] compiletest-pretty 2 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [test] rustc 1 <host> -> CrateLibrustc 2 <host>
-        [test] crate-bootstrap <host> src/tools/coverage-dump
-        [test] crate-bootstrap <host> src/tools/jsondoclint
-        [test] crate-bootstrap <host> src/tools/replace-version-placeholder
-        [test] crate-bootstrap <host> tidyselftest
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [doc] rustc 1 <host> -> standalone 2 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustc 1 <host> -> error-index 2 <host>
-        [doc] rustdoc (book) <host>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] cargo (book) <host>
-        [doc] tippy (book) <host>
-        [build] rustc 0 <host> -> Linkchecker 1 <host>
-        [test] link-check <host>
-        [test] tier-check <host>
-        [test] rustc 1 <host> -> rust-analyzer 2 <host>
-        [doc] rustc (book) <host>
-        [test] rustc 1 <host> -> lint-docs 2 <host>
-        [build] rustc 0 <host> -> RustdocTheme 1 <host>
-        [test] rustdoc-theme 2 <host>
-        [test] compiletest-rustdoc-ui 2 <host>
-        [build] rustc 0 <host> -> JsonDocCk 1 <host>
-        [build] rustc 0 <host> -> JsonDocLint 1 <host>
-        [test] compiletest-rustdoc-json 2 <host>
-        [doc] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 0 <host> -> HtmlChecker 1 <host>
-        [test] html-check <host>
-        [build] rustc 0 <host> -> RunMakeSupport 1 <host>
-        [test] compiletest-run-make 2 <host>
-        [build] rustc 1 <host> -> targo 2 <host>
-        [test] compiletest-run-make-cargo 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] rustc 0 <host> -> Tidy 1 <host>
+            [test] tidy <>
+            [build] rustdoc 0 <host>
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 0 <host> -> Compiletest 1 <host>
+            [test] compiletest-ui 2 <host>
+            [test] compiletest-crashes 2 <host>
+            [build] rustc 0 <host> -> CoverageDump 1 <host>
+            [test] compiletest-coverage 2 <host>
+            [test] compiletest-coverage 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [test] compiletest-mir-opt 2 <host>
+            [test] compiletest-codegen-llvm 2 <host>
+            [test] compiletest-codegen-units 2 <host>
+            [test] compiletest-assembly-gcc 2 <host>
+            [test] compiletest-assembly-llvm 2 <host>
+            [test] compiletest-incremental 2 <host>
+            [test] compiletest-debuginfo 2 <host>
+            [test] compiletest-ui-fulldeps 2 <host>
+            [build] rustdoc 2 <host>
+            [test] compiletest-rustdoc-html 2 <host>
+            [test] compiletest-coverage-run-rustdoc 2 <host>
+            [test] compiletest-pretty 2 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [test] rustc 1 <host> -> CrateLibrustc 2 <host>
+            [test] crate-bootstrap <host> src/tools/coverage-dump
+            [test] crate-bootstrap <host> src/tools/jsondoclint
+            [test] crate-bootstrap <host> src/tools/replace-version-placeholder
+            [test] crate-bootstrap <host> tidyselftest
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <host>
+            [doc] rustc 1 <host> -> standalone 2 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustc 1 <host> -> error-index 2 <host>
+            [doc] rustdoc (book) <host>
+            [build] rustc 0 <host> -> LintDocs 1 <host>
+            [doc] rustc (book) <host>
+            [doc] cargo (book) <host>
+            [doc] tippy (book) <host>
+            [build] rustc 0 <host> -> Linkchecker 1 <host>
+            [test] link-check <host>
+            [test] tier-check <host>
+            [test] rustc 1 <host> -> rust-analyzer 2 <host>
+            [doc] rustc (book) <host>
+            [test] rustc 1 <host> -> lint-docs 2 <host>
+            [build] rustc 0 <host> -> RustdocTheme 1 <host>
+            [test] rustdoc-theme 2 <host>
+            [test] compiletest-rustdoc-ui 2 <host>
+            [build] rustc 0 <host> -> JsonDocCk 1 <host>
+            [build] rustc 0 <host> -> JsonDocLint 1 <host>
+            [test] compiletest-rustdoc-json 2 <host>
+            [doc] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 0 <host> -> HtmlChecker 1 <host>
+            [test] html-check <host>
+            [test] test-float-parse <host>
+            [build] rustc 0 <host> -> RunMakeSupport 1 <host>
+            [test] compiletest-run-make 2 <host>
+            [build] rustc 1 <host> -> targo 2 <host>
+            [test] compiletest-run-make-cargo 2 <host>
+            [test] intrinsic-test <host>"#]].assert_eq(&prepare_test_config(&ctx)
+            .stage(2)
+            .render_steps());
     }
 
     #[test]
     fn test_compiler_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .path("compiler")
-                .stage(1)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> std 0 <host>
-        [build] rustdoc 0 <host>
-        [test] rustc 0 <host> -> CrateLibrustc 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] rustc 0 <host> -> std 0 <host>
+            [build] rustdoc 0 <host>
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [test] rustc 0 <host> -> CrateLibrustc 1 <host>"#]]
+        .assert_eq(&ctx.config("test").path("compiler").stage(1).render_steps());
+    }
+
+    // Trust: check the real step graph as well as the pass-selection helper.
+    #[test]
+    fn test_compiler_stage_1_doctests_have_current_tools_without_stage_2_compiler() {
+        let ctx = TestCtx::new();
+        for extra_args in [&[][..], &["--doc"][..]] {
+            let steps =
+                ctx.config("test").path("compiler").stage(1).args(extra_args).render_steps();
+            assert!(steps.contains("[build] rustc 0 <host> -> rustc 1 <host>"), "{steps}");
+            assert!(steps.contains("[build] rustdoc 1 <host>"), "{steps}");
+            assert!(!steps.contains("[build] rustc 1 <host> -> rustc 2 <host>"), "{steps}");
+        }
+        let steps =
+            ctx.config("test").path("compiler").stage(1).args(&["--all-targets"]).render_steps();
+        assert!(!steps.contains("[build] rustdoc 1 <host>"), "{steps}");
+    }
+
+    // Trust: these commands have no later doctest pass that could hide a
+    // missing current-driver sysroot prerequisite for in-process fixtures.
+    #[test]
+    fn test_compiler_stage_1_units_have_current_runtime_without_stage_2_compiler() {
+        let ctx = TestCtx::new();
+        for flag in ["--all-targets", "--tests"] {
+            let steps = ctx.config("test").path("compiler").stage(1).args(&[flag]).render_steps();
+            assert!(steps.contains("[test] rustc 0 <host> -> CrateLibrustc 1 <host>"), "{steps}");
+            assert!(steps.contains("[build] rustc 0 <host> -> rustc 1 <host>"), "{steps}");
+            assert!(steps.contains("[build] rustc 1 <host> -> std 1 <host>"), "{steps}");
+            assert!(!steps.contains("[build] rustc 1 <host> -> rustc 2 <host>"), "{steps}");
+            assert!(!steps.contains("[build] rustdoc 1 <host>"), "{steps}");
+        }
     }
 
     #[test]
     fn test_compiler_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .path("compiler")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [test] rustc 1 <host> -> CrateLibrustc 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [test] rustc 1 <host> -> CrateLibrustc 2 <host>"#]]
+        .assert_eq(&ctx.config("test").path("compiler").stage(2).render_steps());
     }
 
     #[test]
@@ -2427,87 +2162,71 @@ mod snapshot {
     #[test]
     fn test_library_tests_only_does_not_build_rustdoc() {
         let ctx = TestCtx::new();
-        let host = TargetSelection::from_user(&host_target());
-        insta::assert_snapshot!(
-            ctx.config("test").args(&["--tests", "library/core"]).render_steps(),
-            @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("test").args(&["--tests", "library/core"]).render_steps());
     }
 
     #[test]
     fn test_targo_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .path("targo")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> targo 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [build] rustdoc 0 <host>
-        [test] rustc 0 <host> -> cargo 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> targo 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [build] rustdoc 0 <host>
+            [test] rustc 0 <host> -> targo 1 <host>"#]]
+        .assert_eq(&ctx.config("test").path("targo").render_steps());
     }
 
     #[test]
     fn test_targo_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .path("targo")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> targo 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustdoc 2 <host>
-        [build] rustdoc 1 <host>
-        [test] rustc 1 <host> -> cargo 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> targo 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustdoc 2 <host>
+            [build] rustdoc 1 <host>
+            [test] rustc 1 <host> -> targo 2 <host>"#]]
+        .assert_eq(&ctx.config("test").path("targo").stage(2).render_steps());
     }
 
     #[test]
     fn test_cargotest() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .path("cargotest")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> targo 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> CargoTest 1 <host>
-        [build] rustdoc 1 <host>
-        [test] cargotest 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> targo 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> CargoTest 1 <host>
+            [build] rustdoc 1 <host>
+            [test] cargotest 1 <host>"#]]
+        .assert_eq(&ctx.config("test").path("cargotest").render_steps());
     }
 
     #[test]
     fn test_tier_check() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .path("tier-check")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [test] tier-check <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [test] tier-check <host>"#]]
+        .assert_eq(&ctx.config("test").path("tier-check").render_steps());
     }
 
     // Differential snapshots for `./x test run-make` run `./x test run-make-cargo`: only
@@ -2515,172 +2234,175 @@ mod snapshot {
     #[test]
     fn test_run_make_no_cargo() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .path("run-make")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> RunMakeSupport 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> Compiletest 1 <host>
-        [build] rustdoc 1 <host>
-        [test] compiletest-run-make 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> Compiletest 1 <host>
+            [build] rustc 0 <host> -> RunMakeSupport 1 <host>
+            [build] rustdoc 1 <host>
+            [test] compiletest-run-make 1 <host>"#]]
+        .assert_eq(&ctx.config("test").path("run-make").render_steps());
     }
 
     #[test]
     fn test_run_make_cargo_builds_cargo() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .path("run-make-cargo")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> RunMakeSupport 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> Compiletest 1 <host>
-        [build] rustc 0 <host> -> targo 1 <host>
-        [build] rustdoc 1 <host>
-        [test] compiletest-run-make-cargo 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> Compiletest 1 <host>
+            [build] rustc 0 <host> -> RunMakeSupport 1 <host>
+            [build] rustc 0 <host> -> targo 1 <host>
+            [build] rustdoc 1 <host>
+            [test] compiletest-run-make-cargo 1 <host>"#]]
+        .assert_eq(&ctx.config("test").path("run-make-cargo").render_steps());
     }
 
     #[test]
     fn doc_all() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> UnstableBookGen 1 <host>
-        [build] rustc 0 <host> -> Rustbook 1 <host>
-        [doc] unstable-book (book) <host>
-        [build] rustdoc 0 <host>
-        [doc] rustc 0 <host> -> standalone 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 0 <host> -> error-index 1 <host>
-        [doc] rustc 0 <host> -> error-index 1 <host>
-        [doc] rustdoc (book) <host>
-        [build] rustc 0 <host> -> LintDocs 1 <host>
-        [doc] rustc (book) <host>
-        [doc] cargo (book) <host>
-        [doc] tippy (book) <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> UnstableBookGen 1 <host>
+            [build] rustc 0 <host> -> Rustbook 1 <host>
+            [doc] unstable-book (book) <host>
+            [build] rustdoc 0 <host>
+            [doc] rustc 0 <host> -> standalone 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 0 <host> -> error-index 1 <host>
+            [doc] rustc 0 <host> -> error-index 1 <host>
+            [doc] rustdoc (book) <host>
+            [build] rustc 0 <host> -> LintDocs 1 <host>
+            [doc] rustc (book) <host>
+            [doc] cargo (book) <host>
+            [doc] tippy (book) <host>"#]].assert_eq(&ctx.config("doc")
+            .render_steps());
     }
 
     #[test]
     fn doc_library() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
-                .path("library")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]"#]].assert_eq(&ctx.config("doc")
+            .path("library")
+            .render_steps());
+    }
+
+    #[test]
+    fn doc_compiler_with_tools() {
+        let ctx = TestCtx::new();
+        expect_test::expect![[r#"
+            [build] rustdoc 0 <host>
+            [doc] rustc 0 <host> -> rustc 1 <host>
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [doc] rustc 0 <host> -> Rustdoc 1 <host>
+            [doc] rustc 0 <host> -> Rustfmt 1 <host>
+            [doc] rustc 0 <host> -> Clippy 1 <host>
+            [doc] rustc 0 <host> -> Miri 1 <host>
+            [doc] rustc 0 <host> -> Cargo 1 <host>
+            [doc] rustc 0 <host> -> Tidy 1 <host>
+            [doc] rustc 0 <host> -> Bootstrap 1 <host>
+            [doc] rustc 0 <host> -> BuildHelper 1 <host>
+            [doc] rustc 0 <host> -> Compiletest 1 <host>
+            [doc] rustc 0 <host> -> RunMakeSupport 1 <host>
+            [doc] rustc 0 <host> -> CompilerWithTools 1 <host>"#]]
+        .assert_eq(&ctx.config("doc").arg("compiler-with-tools").render_steps());
     }
 
     #[test]
     fn doc_targo_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
-                .path("targo")
-                .render_steps(), @r"
-        [build] rustdoc 0 <host>
-        [doc] rustc 0 <host> -> Cargo 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] rustdoc 0 <host>
+            [doc] rustc 0 <host> -> Cargo 1 <host>"#]]
+        .assert_eq(&ctx.config("doc").path("targo").render_steps());
     }
     #[test]
     fn doc_targo_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
-                .path("targo")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> Cargo 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> Cargo 2 <host>"#]]
+        .assert_eq(&ctx.config("doc").path("targo").stage(2).render_steps());
     }
 
     #[test]
     fn doc_core() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
-                .path("core")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[core]
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[core]"#]]
+        .assert_eq(&ctx.config("doc").path("core").render_steps());
     }
 
     #[test]
     fn doc_core_no_std_target() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
-                .path("core")
-                .override_target_no_std(&host_target())
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[core]
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[core]"#]]
+        .assert_eq(
+            &ctx.config("doc").path("core").override_target_no_std(&host_target()).render_steps(),
+        );
     }
 
     #[test]
     fn doc_library_no_std_target() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,core]"#]]
+        .assert_eq(
+            &ctx.config("doc")
                 .path("library")
                 .override_target_no_std(&host_target())
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> std 1 <host> crates=[alloc,core]
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
     fn doc_library_no_std_target_cross_compile() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> std 1 <target1> crates=[alloc,core]"#]]
+        .assert_eq(
+            &ctx.config("doc")
                 .path("library")
                 .targets(&[TEST_TRIPLE_1])
                 .override_target_no_std(TEST_TRIPLE_1)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> std 1 <target1> crates=[alloc,core]
-        ");
+                .render_steps(),
+        );
     }
 
     #[test]
@@ -2693,32 +2415,23 @@ mod snapshot {
     #[test]
     fn doc_compiler_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
-                .path("compiler")
-                .stage(1)
-                .render_steps(), @r"
-        [build] rustdoc 0 <host>
-        [build] llvm <host>
-        [doc] rustc 0 <host> -> rustc 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] rustdoc 0 <host>
+            [doc] rustc 0 <host> -> rustc 1 <host>"#]]
+        .assert_eq(&ctx.config("doc").path("compiler").stage(1).render_steps());
     }
 
     #[test]
     fn doc_compiler_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
-                .path("compiler")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> rustc 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> rustc 2 <host>"#]]
+        .assert_eq(&ctx.config("doc").path("compiler").stage(2).render_steps());
     }
 
     #[test]
@@ -2731,164 +2444,129 @@ mod snapshot {
     #[test]
     fn doc_compiletest_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
-                .path("src/tools/compiletest")
-                .stage(1)
-                .render_steps(), @r"
-        [build] rustdoc 0 <host>
-        [doc] rustc 0 <host> -> Compiletest 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] rustdoc 0 <host>
+            [doc] rustc 0 <host> -> Compiletest 1 <host>"#]]
+        .assert_eq(&ctx.config("doc").path("src/tools/compiletest").stage(1).render_steps());
     }
 
     #[test]
     fn doc_compiletest_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("doc")
-                .path("src/tools/compiletest")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustdoc 1 <host>
-        [doc] rustc 1 <host> -> Compiletest 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [doc] rustc 1 <host> -> Compiletest 2 <host>"#]]
+        .assert_eq(&ctx.config("doc").path("src/tools/compiletest").stage(2).render_steps());
     }
 
     #[test]
     fn clippy_ci() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("clippy")
-                .path("ci")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> clippy-driver 1 <host>
-        [build] rustc 0 <host> -> cargo-clippy 1 <host>
-        [clippy] rustc 1 <host> -> bootstrap 2 <host>
-        [clippy] rustc 1 <host> -> std 1 <host>
-        [clippy] rustc 1 <host> -> rustc 2 <host>
-        [check] rustc 1 <host> -> rustc 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> clippy-driver 1 <host>
+            [build] rustc 0 <host> -> cargo-clippy 1 <host>
+            [clippy] rustc 1 <host> -> bootstrap 2 <host>
+            [clippy] rustc 1 <host> -> std 1 <host>
+            [clippy] rustc 1 <host> -> rustc 2 <host>"#]]
+        .assert_eq(&ctx.config("clippy").path("ci").stage(2).render_steps());
     }
 
     #[test]
     fn clippy_compiler_stage1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("clippy")
-                .path("compiler")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [clippy] rustc 0 <host> -> rustc 1 <host>
-        ");
+        expect_test::expect![["[clippy] rustc 0 <host> -> rustc 1 <host>"]]
+            .assert_eq(&ctx.config("clippy").path("compiler").render_steps());
     }
 
     #[test]
     fn clippy_compiler_stage2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("clippy")
-                .path("compiler")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> clippy-driver 1 <host>
-        [build] rustc 0 <host> -> cargo-clippy 1 <host>
-        [clippy] rustc 1 <host> -> rustc 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> clippy-driver 1 <host>
+            [build] rustc 0 <host> -> cargo-clippy 1 <host>
+            [clippy] rustc 1 <host> -> rustc 2 <host>"#]]
+        .assert_eq(&ctx.config("clippy").path("compiler").stage(2).render_steps());
     }
 
     #[test]
     fn clippy_std_stage1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("clippy")
-                .path("std")
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> clippy-driver 1 <host>
-        [build] rustc 0 <host> -> cargo-clippy 1 <host>
-        [clippy] rustc 1 <host> -> std 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> clippy-driver 1 <host>
+            [build] rustc 0 <host> -> cargo-clippy 1 <host>
+            [clippy] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("clippy").path("std").render_steps());
     }
 
     #[test]
     fn clippy_std_stage2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("clippy")
-                .path("std")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> clippy-driver 2 <host>
-        [build] rustc 1 <host> -> cargo-clippy 2 <host>
-        [clippy] rustc 2 <host> -> std 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> clippy-driver 2 <host>
+            [build] rustc 1 <host> -> cargo-clippy 2 <host>
+            [clippy] rustc 2 <host> -> std 2 <host>"#]]
+        .assert_eq(&ctx.config("clippy").path("std").stage(2).render_steps());
     }
 
     #[test]
     fn clippy_miri_stage1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("clippy")
-                .path("miri")
-                .stage(1)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [check] rustc 0 <host> -> rustc 1 <host>
-        [clippy] rustc 0 <host> -> miri 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [check] rustc 0 <host> -> rustc 1 <host>
+            [clippy] rustc 0 <host> -> miri 1 <host>"#]]
+        .assert_eq(&ctx.config("clippy").path("miri").stage(1).render_steps());
     }
 
     #[test]
     fn clippy_miri_stage2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("clippy")
-                .path("miri")
-                .stage(2)
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [check] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 0 <host> -> clippy-driver 1 <host>
-        [build] rustc 0 <host> -> cargo-clippy 1 <host>
-        [clippy] rustc 1 <host> -> miri 2 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [check] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 0 <host> -> clippy-driver 1 <host>
+            [build] rustc 0 <host> -> cargo-clippy 1 <host>
+            [clippy] rustc 1 <host> -> miri 2 <host>"#]]
+        .assert_eq(&ctx.config("clippy").path("miri").stage(2).render_steps());
     }
 
     #[test]
     fn clippy_bootstrap() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("clippy")
-                .path("bootstrap")
-                .render_steps(), @"[clippy] rustc 0 <host> -> bootstrap 1 <host>");
+        expect_test::expect![["[clippy] rustc 0 <host> -> bootstrap 1 <host>"]]
+            .assert_eq(&ctx.config("clippy").path("bootstrap").render_steps());
     }
 
     fn targeted_install_config(ctx: &TestCtx, path: &str) -> ConfigBuilder {
-        ctx.config("install").path(path).stage(2).args(&[
+        install_into_test_dir(ctx).path(path).stage(2)
+    }
+
+    /// `x install` with every install directory inside the test's own directory.
+    fn install_into_test_dir(ctx: &TestCtx) -> ConfigBuilder {
+        ctx.config("install").args(&[
             "--set",
             &format!("install.prefix={}", ctx.normalized_dir()),
             "--set",
@@ -2926,267 +2604,389 @@ mod snapshot {
         assert!(cache.contains::<install::Cargo>(), "targo-trust installation must ensure targo");
     }
 
+    // Trust: source component names schedule sources without documentation.
+    #[test]
+    fn install_src_accepts_owned_and_compatibility_component_names() {
+        for selector in ["trust-src", "rust-src"] {
+            let ctx = TestCtx::new();
+            let cache = targeted_install_config(&ctx, selector).run();
+            assert!(cache.contains::<install::Src>(), "source install missing for {selector}");
+            assert!(cache.contains::<dist::Src>(), "source package missing for {selector}");
+            assert!(!cache.contains::<install::Docs>(), "unexpected docs install for {selector}");
+            assert!(!cache.contains::<dist::Docs>(), "unexpected docs package for {selector}");
+        }
+    }
+
+    // Trust: `src` is an existing directory selector for `src/doc`; a profile's
+    // tools allowlist spelling must not expand that command-line selection.
+    #[test]
+    fn install_src_directory_keeps_existing_docs_selection() {
+        let ctx = TestCtx::new();
+        let cache = targeted_install_config(&ctx, "src").run();
+        assert!(cache.contains::<install::Docs>());
+        assert!(cache.contains::<dist::Docs>());
+        assert!(!cache.contains::<install::Src>());
+        assert!(!cache.contains::<dist::Src>());
+    }
+
+    // Trust: the profile's `src` allowlist must select source by default, while
+    // an unrelated allowlist and a non-extended build must still exclude it.
+    #[test]
+    fn install_src_default_selection_respects_aliases_and_extended_gate() {
+        for (extended, selector, expected) in [
+            (false, None, false),
+            (false, Some("trust-src"), false),
+            (false, Some("rust-src"), false),
+            (false, Some("src"), false),
+            (true, None, true),
+            (true, Some("targo"), false),
+            (true, Some("trust-src"), true),
+            (true, Some("rust-src"), true),
+            (true, Some("src"), true),
+        ] {
+            let ctx = TestCtx::new();
+            let mut config = ctx.config("install").create_config();
+            config.extended = extended;
+            config.tools = selector.map(|tool| [tool.to_owned()].into_iter().collect());
+            let sess = Session::new(config);
+            let builder = Builder::new(&sess);
+            assert_eq!(
+                install::Src::is_default_step(&builder),
+                expected,
+                "extended={extended}, tools={selector:?}"
+            );
+        }
+    }
+
     #[test]
     fn install_plain() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("install")
-                .args(&[
-                    // Using backslashes fails with `--set`
-                    "--set", &format!("install.prefix={}", ctx.normalized_dir()),
-                    "--set", &format!("install.bindir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.libdir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.datadir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.mandir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.sysconfdir={}", ctx.normalized_dir()),
-                    "--build", "x86_64-unknown-linux-gnu",
-                    "--host", "x86_64-unknown-linux-gnu",
-                    "--target", "x86_64-unknown-linux-gnu",
-                ])
-                .get_steps()
-                .render_with(RenderConfig {
-                    normalize_host: false
-                }), @r"
-        [build] llvm <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> rustc 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> UnstableBookGen 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> Rustbook 1 <x86_64-unknown-linux-gnu>
-        [doc] unstable-book (book) <x86_64-unknown-linux-gnu>
-        [build] rustdoc 1 <x86_64-unknown-linux-gnu>
-        [doc] rustc 1 <x86_64-unknown-linux-gnu> -> standalone 2 <x86_64-unknown-linux-gnu>
-        [doc] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> rustc 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 2 <x86_64-unknown-linux-gnu> -> std 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> error-index 2 <x86_64-unknown-linux-gnu>
-        [doc] rustc 1 <x86_64-unknown-linux-gnu> -> error-index 2 <x86_64-unknown-linux-gnu>
-        [doc] rustdoc (book) <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> LintDocs 1 <x86_64-unknown-linux-gnu>
-        [doc] rustc (book) <x86_64-unknown-linux-gnu>
-        [doc] cargo (book) <x86_64-unknown-linux-gnu>
-        [doc] tippy (book) <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> RustInstaller 1 <x86_64-unknown-linux-gnu>
-        [dist] docs <x86_64-unknown-linux-gnu>
-        [dist] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
-        [build] rustdoc 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> trust-analyzer-proc-macro-srv 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> GenerateCopyright 1 <x86_64-unknown-linux-gnu>
-        [dist] trustc <x86_64-unknown-linux-gnu>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> rustc 1 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> UnstableBookGen 1 <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> Rustbook 1 <x86_64-unknown-linux-gnu>
+            [doc] unstable-book (book) <x86_64-unknown-linux-gnu>
+            [build] rustdoc 1 <x86_64-unknown-linux-gnu>
+            [doc] rustc 1 <x86_64-unknown-linux-gnu> -> standalone 2 <x86_64-unknown-linux-gnu>
+            [doc] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> rustc 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 2 <x86_64-unknown-linux-gnu> -> std 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> error-index 2 <x86_64-unknown-linux-gnu>
+            [doc] rustc 1 <x86_64-unknown-linux-gnu> -> error-index 2 <x86_64-unknown-linux-gnu>
+            [doc] rustdoc (book) <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> LintDocs 1 <x86_64-unknown-linux-gnu>
+            [doc] rustc (book) <x86_64-unknown-linux-gnu>
+            [doc] cargo (book) <x86_64-unknown-linux-gnu>
+            [doc] tippy (book) <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> RustInstaller 1 <x86_64-unknown-linux-gnu>
+            [dist] docs <x86_64-unknown-linux-gnu>
+            [dist] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
+            [build] rustdoc 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> trust-analyzer-proc-macro-srv 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> GenerateCopyright 1 <x86_64-unknown-linux-gnu>
+            [dist] trustc <x86_64-unknown-linux-gnu>"#]].assert_eq(&ctx.config("install")
+            .args(&[
+                // Using backslashes fails with `--set`
+                "--set", &format!("install.prefix={}", ctx.normalized_dir()),
+                "--set", &format!("install.bindir={}", ctx.normalized_dir()),
+                "--set", &format!("install.libdir={}", ctx.normalized_dir()),
+                "--set", &format!("install.datadir={}", ctx.normalized_dir()),
+                "--set", &format!("install.mandir={}", ctx.normalized_dir()),
+                "--set", &format!("install.sysconfdir={}", ctx.normalized_dir()),
+                "--build", "x86_64-unknown-linux-gnu",
+                "--host", "x86_64-unknown-linux-gnu",
+                "--target", "x86_64-unknown-linux-gnu",
+            ])
+            .get_steps()
+            .render_with(RenderConfig {
+                normalize_host: false
+            }));
+    }
+
+    // Trust: contributor profiles must select the source component by default.
+    // Preserve the explicit rust-src profile spelling and all supported tools
+    // allowlist aliases; the separate CLI directory selector remains unchanged.
+    #[test]
+    fn install_contributor_profiles_include_the_source_component() {
+        for profile in ["compiler", "tools"] {
+            let ctx = TestCtx::new();
+            let cache = install_into_test_dir(&ctx)
+                .with_default_toml_config(&format!("profile = \"{profile}\"\n"))
+                .run();
+            assert!(
+                cache.contains::<install::Src>(),
+                "`x install` under the {profile} profile must install the source component"
+            );
+        }
+    }
+
+    #[test]
+    fn install_source_component_follows_supported_selectors() {
+        for (tools, expected) in [
+            (r#"build.tools=["trust-src"]"#, true),
+            (r#"build.tools=["rust-src"]"#, true),
+            (r#"build.tools=["src"]"#, true),
+            (r#"build.tools=["targo"]"#, false),
+        ] {
+            let ctx = TestCtx::new();
+            let cache = install_into_test_dir(&ctx)
+                .args(&["--set", "build.extended=true", "--set", tools])
+                .run();
+            assert_eq!(cache.contains::<install::Src>(), expected, "{tools}");
+        }
     }
 
     #[test]
     fn install_src() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("install")
-                .path("src")
+        expect_test::expect![[r#"
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> RustInstaller 1 <x86_64-unknown-linux-gnu>
+            [dist] src <>"#]]
+        .assert_eq(
+            &ctx.config("install")
+                .path("rust-src")
                 .args(&[
                     // Using backslashes fails with `--set`
-                    "--set", &format!("install.prefix={}", ctx.normalized_dir()),
-                    "--set", &format!("install.bindir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.libdir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.datadir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.mandir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.sysconfdir={}", ctx.normalized_dir()),
-                    "--build", "x86_64-unknown-linux-gnu",
-                    "--host", "x86_64-unknown-linux-gnu",
-                    "--target", "x86_64-unknown-linux-gnu",
+                    "--set",
+                    &format!("install.prefix={}", ctx.normalized_dir()),
+                    "--set",
+                    &format!("install.bindir={}", ctx.normalized_dir()),
+                    "--set",
+                    &format!("install.libdir={}", ctx.normalized_dir()),
+                    "--set",
+                    &format!("install.datadir={}", ctx.normalized_dir()),
+                    "--set",
+                    &format!("install.mandir={}", ctx.normalized_dir()),
+                    "--set",
+                    &format!("install.sysconfdir={}", ctx.normalized_dir()),
+                    "--build",
+                    "x86_64-unknown-linux-gnu",
+                    "--host",
+                    "x86_64-unknown-linux-gnu",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
                 ])
                 .get_steps()
-                .render_with(RenderConfig {
-                    normalize_host: false
-                }), @r"
-        [build] llvm <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> rustc 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> UnstableBookGen 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> Rustbook 1 <x86_64-unknown-linux-gnu>
-        [doc] unstable-book (book) <x86_64-unknown-linux-gnu>
-        [build] rustdoc 1 <x86_64-unknown-linux-gnu>
-        [doc] rustc 1 <x86_64-unknown-linux-gnu> -> standalone 2 <x86_64-unknown-linux-gnu>
-        [doc] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> rustc 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 2 <x86_64-unknown-linux-gnu> -> std 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> error-index 2 <x86_64-unknown-linux-gnu>
-        [doc] rustc 1 <x86_64-unknown-linux-gnu> -> error-index 2 <x86_64-unknown-linux-gnu>
-        [doc] rustdoc (book) <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> LintDocs 1 <x86_64-unknown-linux-gnu>
-        [doc] rustc (book) <x86_64-unknown-linux-gnu>
-        [doc] cargo (book) <x86_64-unknown-linux-gnu>
-        [doc] tippy (book) <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> RustInstaller 1 <x86_64-unknown-linux-gnu>
-        [dist] docs <x86_64-unknown-linux-gnu>
-        [dist] src <>
-        ");
+                .render_with(RenderConfig { normalize_host: false }),
+        );
     }
 
     #[test]
     fn install_src_no_docs() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("install")
-                .path("src")
+        expect_test::expect![[r#"
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> RustInstaller 1 <x86_64-unknown-linux-gnu>
+            [dist] src <>"#]]
+        .assert_eq(
+            &ctx.config("install")
+                .path("rust-src")
                 .args(&[
                     // Using backslashes fails with `--set`
-                    "--set", &format!("install.prefix={}", ctx.normalized_dir()),
-                    "--set", &format!("install.bindir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.libdir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.datadir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.mandir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.sysconfdir={}", ctx.normalized_dir()),
-                    "--set", "build.docs=false",
-                    "--build", "x86_64-unknown-linux-gnu",
-                    "--host", "x86_64-unknown-linux-gnu",
-                    "--target", "x86_64-unknown-linux-gnu",
+                    "--set",
+                    &format!("install.prefix={}", ctx.normalized_dir()),
+                    "--set",
+                    &format!("install.bindir={}", ctx.normalized_dir()),
+                    "--set",
+                    &format!("install.libdir={}", ctx.normalized_dir()),
+                    "--set",
+                    &format!("install.datadir={}", ctx.normalized_dir()),
+                    "--set",
+                    &format!("install.mandir={}", ctx.normalized_dir()),
+                    "--set",
+                    &format!("install.sysconfdir={}", ctx.normalized_dir()),
+                    "--set",
+                    "build.docs=false",
+                    "--build",
+                    "x86_64-unknown-linux-gnu",
+                    "--host",
+                    "x86_64-unknown-linux-gnu",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
                 ])
                 .get_steps()
-                .render_with(RenderConfig {
-                    normalize_host: false
-                }), @r"
-        [build] llvm <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> rustc 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> RustInstaller 1 <x86_64-unknown-linux-gnu>
-        [dist] docs <x86_64-unknown-linux-gnu>
-        [dist] src <>
-        ");
+                .render_with(RenderConfig { normalize_host: false }),
+        );
     }
 
     #[test]
     fn install_extended() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("install")
-                .args(&[
-                    // Using backslashes fails with `--set`
-                    "--set", &format!("install.prefix={}", ctx.normalized_dir()),
-                    "--set", &format!("install.bindir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.libdir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.datadir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.mandir={}", ctx.normalized_dir()),
-                    "--set", &format!("install.sysconfdir={}", ctx.normalized_dir()),
-                    "--set", "build.extended=true",
-                    // Pinned because this snapshot renders un-normalized host triples
-                    "--build", "x86_64-unknown-linux-gnu",
-                    "--host", "x86_64-unknown-linux-gnu",
-                ])
-                .get_steps()
-                .render_with(RenderConfig {
-                    normalize_host: false
-                }), @r"
-        [build] llvm <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> rustc 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> WasmComponentLd 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> UnstableBookGen 1 <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> Rustbook 1 <x86_64-unknown-linux-gnu>
-        [doc] unstable-book (book) <x86_64-unknown-linux-gnu>
-        [build] rustdoc 1 <x86_64-unknown-linux-gnu>
-        [doc] rustc 1 <x86_64-unknown-linux-gnu> -> standalone 2 <x86_64-unknown-linux-gnu>
-        [doc] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,unwind]
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> rustc 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> WasmComponentLd 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 2 <x86_64-unknown-linux-gnu> -> std 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> error-index 2 <x86_64-unknown-linux-gnu>
-        [doc] rustc 1 <x86_64-unknown-linux-gnu> -> error-index 2 <x86_64-unknown-linux-gnu>
-        [doc] rustdoc (book) <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> LintDocs 1 <x86_64-unknown-linux-gnu>
-        [doc] rustc (book) <x86_64-unknown-linux-gnu>
-        [doc] cargo (book) <x86_64-unknown-linux-gnu>
-        [doc] tippy (book) <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> RustInstaller 1 <x86_64-unknown-linux-gnu>
-        [dist] docs <x86_64-unknown-linux-gnu>
-        [dist] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
-        [build] rustdoc 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> trust-analyzer-proc-macro-srv 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 0 <x86_64-unknown-linux-gnu> -> GenerateCopyright 1 <x86_64-unknown-linux-gnu>
-        [dist] trustc <x86_64-unknown-linux-gnu>
-        [dist] rustc 1 <x86_64-unknown-linux-gnu> -> trustc-dev 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> targo 2 <x86_64-unknown-linux-gnu>
-        [dist] rustc 1 <x86_64-unknown-linux-gnu> -> targo 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> trust-analyzer 2 <x86_64-unknown-linux-gnu>
-        [dist] rustc 1 <x86_64-unknown-linux-gnu> -> trust-analyzer 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> rustfmt 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> cargo-fmt 2 <x86_64-unknown-linux-gnu>
-        [dist] rustc 1 <x86_64-unknown-linux-gnu> -> trustfmt 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> cargo-clippy 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> clippy-driver 2 <x86_64-unknown-linux-gnu>
-        [dist] rustc 1 <x86_64-unknown-linux-gnu> -> tippy 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> miri 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> cargo-miri 2 <x86_64-unknown-linux-gnu>
-        [dist] rustc 1 <x86_64-unknown-linux-gnu> -> trust-miri 2 <x86_64-unknown-linux-gnu>
-        [dist] src <>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> trustd 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> targo-trust 2 <x86_64-unknown-linux-gnu>
-        [dist] rustc 1 <x86_64-unknown-linux-gnu> -> targo-trust 2 <x86_64-unknown-linux-gnu>
-        [build] rustc 1 <x86_64-unknown-linux-gnu> -> LlvmBitcodeLinker 2 <x86_64-unknown-linux-gnu>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> rustc 1 <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> WasmComponentLd 1 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> UnstableBookGen 1 <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> Rustbook 1 <x86_64-unknown-linux-gnu>
+            [doc] unstable-book (book) <x86_64-unknown-linux-gnu>
+            [build] rustdoc 1 <x86_64-unknown-linux-gnu>
+            [doc] rustc 1 <x86_64-unknown-linux-gnu> -> standalone 2 <x86_64-unknown-linux-gnu>
+            [doc] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu> crates=[alloc,compiler_builtins,core,panic_abort,panic_unwind,proc_macro,rustc-std-workspace-core,std,std_detect,sysroot,test,trust-bignum,unwind]
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> rustc 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> WasmComponentLd 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 2 <x86_64-unknown-linux-gnu> -> std 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> error-index 2 <x86_64-unknown-linux-gnu>
+            [doc] rustc 1 <x86_64-unknown-linux-gnu> -> error-index 2 <x86_64-unknown-linux-gnu>
+            [doc] rustdoc (book) <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> LintDocs 1 <x86_64-unknown-linux-gnu>
+            [doc] rustc (book) <x86_64-unknown-linux-gnu>
+            [doc] cargo (book) <x86_64-unknown-linux-gnu>
+            [doc] tippy (book) <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> RustInstaller 1 <x86_64-unknown-linux-gnu>
+            [dist] docs <x86_64-unknown-linux-gnu>
+            [dist] rustc 1 <x86_64-unknown-linux-gnu> -> std 1 <x86_64-unknown-linux-gnu>
+            [build] rustdoc 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> trust-analyzer-proc-macro-srv 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 0 <x86_64-unknown-linux-gnu> -> GenerateCopyright 1 <x86_64-unknown-linux-gnu>
+            [dist] trustc <x86_64-unknown-linux-gnu>
+            [dist] rustc 1 <x86_64-unknown-linux-gnu> -> trustc-dev 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> targo 2 <x86_64-unknown-linux-gnu>
+            [dist] rustc 1 <x86_64-unknown-linux-gnu> -> targo 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> trust-analyzer 2 <x86_64-unknown-linux-gnu>
+            [dist] rustc 1 <x86_64-unknown-linux-gnu> -> trust-analyzer 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> rustfmt 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> cargo-fmt 2 <x86_64-unknown-linux-gnu>
+            [dist] rustc 1 <x86_64-unknown-linux-gnu> -> trustfmt 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> cargo-clippy 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> clippy-driver 2 <x86_64-unknown-linux-gnu>
+            [dist] rustc 1 <x86_64-unknown-linux-gnu> -> tippy 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> miri 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> cargo-miri 2 <x86_64-unknown-linux-gnu>
+            [dist] rustc 1 <x86_64-unknown-linux-gnu> -> trust-miri 2 <x86_64-unknown-linux-gnu>
+            [dist] src <>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> trustd 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> targo-trust 2 <x86_64-unknown-linux-gnu>
+            [dist] rustc 1 <x86_64-unknown-linux-gnu> -> targo-trust 2 <x86_64-unknown-linux-gnu>
+            [build] rustc 1 <x86_64-unknown-linux-gnu> -> LlvmBitcodeLinker 2 <x86_64-unknown-linux-gnu>"#]].assert_eq(&ctx.config("install")
+            .args(&[
+                // Using backslashes fails with `--set`
+                "--set", &format!("install.prefix={}", ctx.normalized_dir()),
+                "--set", &format!("install.bindir={}", ctx.normalized_dir()),
+                "--set", &format!("install.libdir={}", ctx.normalized_dir()),
+                "--set", &format!("install.datadir={}", ctx.normalized_dir()),
+                "--set", &format!("install.mandir={}", ctx.normalized_dir()),
+                "--set", &format!("install.sysconfdir={}", ctx.normalized_dir()),
+                "--set", "build.extended=true",
+                // Pinned because this snapshot renders un-normalized host triples
+                "--build", "x86_64-unknown-linux-gnu",
+                "--host", "x86_64-unknown-linux-gnu",
+            ])
+            .get_steps()
+            .render_with(RenderConfig {
+                normalize_host: false
+            }));
     }
 
     #[test]
     fn cargo_miri_stage_1() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .args(&["cargo-miri"])
-                .stage(1)
-                .get_steps()
-                .render(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> miri 1 <host>
-        [build] rustc 0 <host> -> cargo-miri 1 <host>
-        [build] rustdoc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> miri 1 <host>
+            [build] rustc 0 <host> -> cargo-miri 1 <host>
+            [build] rustdoc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>"#]]
+        .assert_eq(&ctx.config("test").args(&["cargo-miri"]).stage(1).get_steps().render());
     }
 
     #[test]
     fn cargo_miri_stage_2() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("test")
-                .args(&["cargo-miri"])
-                .stage(2)
-                .get_steps()
-                .render(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 1 <host> -> rustc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 1 <host> -> miri 2 <host>
-        [build] rustc 1 <host> -> cargo-miri 2 <host>
-        [build] rustdoc 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
-        [build] rustc 0 <host> -> targo 1 <host>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> rustc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 1 <host> -> miri 2 <host>
+            [build] rustc 1 <host> -> cargo-miri 2 <host>
+            [build] rustdoc 2 <host>
+            [build] rustc 2 <host> -> std 2 <host>
+            [build] rustc 0 <host> -> targo 1 <host>"#]]
+        .assert_eq(&ctx.config("test").args(&["cargo-miri"]).stage(2).get_steps().render());
+    }
+
+    #[test]
+    fn test_float_parse() {
+        let ctx = TestCtx::new();
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [test] test-float-parse <host>"#]]
+        .assert_eq(&ctx.config("test").path("src/tools/test-float-parse").render_steps());
+    }
+
+    #[test]
+    fn test_float_parse_cross() {
+        let ctx = TestCtx::new();
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 1 <host> -> std 1 <target1>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustdoc 1 <host>
+            [test] test-float-parse <target1>"#]]
+        .assert_eq(
+            &ctx.config("test")
+                .path("src/tools/test-float-parse")
+                .targets(&[TEST_TRIPLE_1])
+                .render_steps(),
+        );
     }
 
     // Check that `x run miri --target FOO` actually builds miri for the host.
     #[test]
     fn run_miri() {
         let ctx = TestCtx::new();
-        insta::assert_snapshot!(
-            ctx.config("run")
-                .path("miri")
-                .stage(1)
-                .targets(&[TEST_TRIPLE_1])
-                .render_steps(), @r"
-        [build] llvm <host>
-        [build] rustc 0 <host> -> rustc 1 <host>
-        [build] rustc 1 <host> -> std 1 <host>
-        [build] rustc 0 <host> -> miri 1 <host>
-        [build] rustc 0 <host> -> cargo-miri 1 <host>
-        [run] rustc 0 <host> -> miri 1 <target1>
-        ");
+        expect_test::expect![[r#"
+            [build] llvm <host>
+            [build] rustc 0 <host> -> rustc 1 <host>
+            [build] rustc 1 <host> -> std 1 <host>
+            [build] rustc 0 <host> -> miri 1 <host>
+            [build] rustc 0 <host> -> cargo-miri 1 <host>
+            [run] rustc 0 <host> -> miri 1 <target1>"#]]
+        .assert_eq(
+            &ctx.config("run").path("miri").stage(1).targets(&[TEST_TRIPLE_1]).render_steps(),
+        );
     }
+
+    #[test]
+    fn fix_compiler() {
+        let ctx = TestCtx::new();
+        // Trust: T11 removed hmac from rustc-main's closure, keeping its workspace tests.
+        assert_compiler_plan(
+            &ctx,
+            expect_test::expect!["[fix] rustc 0 <host> -> rustc 1 <host> (compiler crates)"],
+            &ctx.config("fix").path("compiler").render_steps(),
+        );
+    }
+}
+
+// Check the selected compiler closure against native workspace metadata. Its
+// size changes when an actual compiler dependency is added or removed.
+fn assert_compiler_plan(ctx: &TestCtx, expected: expect_test::Expect, actual: &str) {
+    let session = Session::new(ctx.config("check").create_config());
+    let count = session.in_tree_crates("rustc-main", None).len();
+    let expected = expected
+        .data()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("(compiler crates)", &format!("({count} crates)"));
+    assert_eq!(actual, expected);
 }
 
 struct ExecutedSteps {
@@ -3272,7 +3072,7 @@ impl ExecutedSteps {
 }
 
 fn fuzzy_metadata_eq(executed: &StepMetadata, to_match: &StepMetadata) -> bool {
-    let StepMetadata { name, kind, target, built_by: _, stage: _, metadata } = executed;
+    let StepMetadata { name, kind, target, built_by: _, stage: _, metadata: _ } = executed;
     *name == to_match.name && *kind == to_match.kind && *target == to_match.target
 }
 
@@ -3286,10 +3086,10 @@ impl ConfigBuilder {
     fn run(self) -> Cache {
         let config = self.create_config();
 
-        let kind = config.cmd.kind();
-        let build = Build::new(config);
-        let builder = Builder::new(&build);
-        builder.run_step_descriptions(&Builder::get_step_descriptions(kind), &builder.paths);
+        let sess = Session::new(config);
+        let builder = Builder::new(&sess);
+        builder
+            .run_step_descriptions(&Builder::get_step_descriptions(builder.kind), &builder.paths);
         builder.cache
     }
 
@@ -3324,8 +3124,6 @@ fn render_steps(steps: &[ExecutedStep], config: RenderConfig) -> String {
     steps
         .iter()
         .filter_map(|step| {
-            use std::fmt::Write;
-
             let Some(metadata) = &step.metadata else {
                 return None;
             };
@@ -3339,12 +3137,13 @@ fn render_steps(steps: &[ExecutedStep], config: RenderConfig) -> String {
 fn render_metadata(metadata: &StepMetadata, config: &RenderConfig) -> String {
     let mut record = format!("[{}] ", metadata.kind.as_str());
     if let Some(compiler) = metadata.built_by {
-        write!(record, "{} -> ", render_compiler(compiler, config));
+        write!(record, "{} -> ", render_compiler(compiler, config)).unwrap();
     }
     let stage = metadata.get_stage().map(|stage| format!("{stage} ")).unwrap_or_default();
-    write!(record, "{} {stage}<{}>", metadata.name, normalize_target(metadata.target, config));
+    write!(record, "{} {stage}<{}>", metadata.name, normalize_target(metadata.target, config))
+        .unwrap();
     if let Some(metadata) = &metadata.metadata {
-        write!(record, " {metadata}");
+        write!(record, " {metadata}").unwrap();
     }
     record
 }
@@ -3386,4 +3185,331 @@ fn flags_env_prefers_plain_form_without_spaces() {
         ),
         ("CARGO_ENCODED_RUSTFLAGS", "-Clink-arg=-L/opt/my libs\u{1f}--cfg=foo".to_string()),
     );
+}
+
+/// Trust: a bootstrap `--print=…` query must never be the thing that demands a
+/// `dlopen`ed codegen backend the sysroot does not carry yet.
+///
+/// The measured failure this pins: with `codegen-backends = ["trust-ir-cg", "llvm",
+/// "trust-cg"]`, `x.py build --stage 2 compiler/rustc` died on
+/// `--print=deployment-target` with `failed to find a codegen-backends folder in the
+/// sysroot candidates: build/<host>/stage1`, because the probe runs while `Assemble`
+/// is still setting that sysroot up.
+mod metadata_probe_backend {
+    use crate::core::backend::CodegenBackendKind::{Custom, Llvm, TrustCg, TrustIrCg};
+    use crate::core::builder::metadata_probe_backend_name;
+
+    #[test]
+    fn upstream_configurations_say_nothing() {
+        // The overwhelmingly common case: LLVM is the default, it is linked into
+        // rustc_driver, and the probe needs no help. Byte-for-byte upstream behaviour.
+        assert_eq!(metadata_probe_backend_name(1, &Llvm, &[Llvm]), None);
+        assert_eq!(metadata_probe_backend_name(2, &Llvm, &[Llvm, TrustIrCg]), None);
+        // trust-cg is also linked in, so it needs no help either.
+        assert_eq!(metadata_probe_backend_name(2, &TrustCg, &[TrustCg, Llvm]), None);
+    }
+
+    #[test]
+    fn a_plugin_default_falls_back_to_the_first_linked_in_backend() {
+        assert_eq!(
+            metadata_probe_backend_name(1, &TrustIrCg, &[TrustIrCg, Llvm, TrustCg]),
+            Some("llvm"),
+        );
+        // Order within the enabled list decides, not a hard-coded name: with llvm
+        // dropped, trust-cg is the honest answer.
+        assert_eq!(
+            metadata_probe_backend_name(1, &TrustIrCg, &[TrustIrCg, TrustCg]),
+            Some("trust-cg"),
+        );
+        // A custom out-of-tree backend is a plugin too.
+        assert_eq!(
+            metadata_probe_backend_name(
+                2,
+                &Custom("cranelift".into()),
+                &[Custom("cranelift".into()), Llvm]
+            ),
+            Some("llvm"),
+        );
+    }
+
+    #[test]
+    fn stage0_is_never_pinned() {
+        // A stage0 compiler is a snapshot built elsewhere. This build's
+        // `codegen-backends` describes neither its baked default nor the options it
+        // understands, so passing it `-Zcodegen-backend` is a guess, not a fix.
+        assert_eq!(metadata_probe_backend_name(0, &TrustIrCg, &[TrustIrCg, Llvm]), None);
+    }
+
+    #[test]
+    fn no_linked_in_backend_configured_is_a_refusal_not_a_guess() {
+        // `dummy` would "work" here and is deliberately not offered: its
+        // `supported_crate_types` answers `[Rlib, Executable]`, which would make the
+        // `--print=file-names --crate-type=proc-macro` probe read "unsupported crate
+        // type" and silently drop `-Zdual-proc-macros`. Failing loudly at the probe is
+        // the honest outcome.
+        assert_eq!(metadata_probe_backend_name(1, &TrustIrCg, &[TrustIrCg]), None);
+        assert_eq!(
+            metadata_probe_backend_name(
+                1,
+                &Custom("cranelift".into()),
+                &[Custom("cranelift".into())]
+            ),
+            None,
+        );
+    }
+}
+
+/// Trust: on macOS `copy_link` must install an executable as a file of its own, never as
+/// another hard link of the cargo output, because dyld can resolve the main executable's
+/// `@loader_path` through the other link (see `FileType::may_hard_link`). A library keeps
+/// the hard-link fast path, and so does an executable everywhere else.
+#[test]
+#[cfg(unix)]
+fn copy_link_never_hard_links_an_executable_on_macos() {
+    use std::os::unix::fs::MetadataExt;
+
+    let ctx = TestCtx::new();
+    let mut build = crate::core::session::Session::new(ctx.config("build").create_config());
+    build.config.set_dry_run(crate::core::config::DryRun::Disabled);
+
+    let src = ctx.dir().join("rustc-main");
+    std::fs::write(&src, b"rustc-main").unwrap();
+    let exe = ctx.dir().join("rustc");
+    let lib = ctx.dir().join("librustc_driver.dylib");
+    build.copy_link(&src, &exe, crate::core::session::FileType::Executable);
+    build.copy_link(&src, &lib, crate::core::session::FileType::NativeLibrary);
+
+    let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
+    assert_eq!(std::fs::read(&exe).unwrap(), b"rustc-main");
+    if cfg!(target_os = "macos") {
+        assert_ne!(inode(&exe), inode(&src), "a macOS executable must not share the inode");
+    } else {
+        assert_eq!(inode(&exe), inode(&src));
+    }
+    assert_eq!(inode(&lib), inode(&src), "a library keeps the hard-link fast path");
+}
+
+// Trust: exercise the real LLVM provider installer without modifying a shared provider.
+#[cfg(unix)]
+mod resolved_provider_copy {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    use super::*;
+
+    fn identity(path: &Path) -> (u64, u64, u64, i64, i64, u64, u32, i64, i64) {
+        let metadata = std::fs::metadata(path).unwrap();
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.nlink(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.len(),
+            metadata.mode(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        )
+    }
+
+    fn executable(path: &Path) {
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn session(ctx: &TestCtx) -> Session {
+        let mut session = Session::new(ctx.config("build").create_config());
+        session.config.set_dry_run(crate::core::config::DryRun::Disabled);
+        session
+    }
+
+    #[test]
+    fn preserves_source_across_install_and_reassembly() {
+        let ctx = TestCtx::new();
+        let session = session(&ctx);
+        let source = ctx.dir().join("provider-llvm-objcopy");
+        let destination = ctx.dir().join("sysroot-rust-objcopy");
+        executable(&source);
+        let original = identity(&source);
+        let bytes = std::fs::read(&source).unwrap();
+
+        for _ in 0..2 {
+            session.resolve_symlink_and_copy(&source, &destination);
+            assert_eq!(identity(&source), original, "install must leave provider metadata intact");
+            assert_eq!(std::fs::read(&source).unwrap(), bytes);
+            assert_ne!(identity(&destination).1, original.1, "destination must have its own inode");
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+            assert_eq!(std::fs::metadata(&destination).unwrap().mode() & 0o777, 0o755);
+            std::fs::write(&destination, b"owned destination edit").unwrap();
+            assert_eq!(
+                std::fs::read(&source).unwrap(),
+                bytes,
+                "destination writes must be isolated"
+            );
+            assert_eq!(identity(&source), original);
+        }
+    }
+
+    #[test]
+    fn dereferences_relative_alias_chain_without_mutating_provider() {
+        let ctx = TestCtx::new();
+        let session = session(&ctx);
+        let source = ctx.dir().join("llvm-objcopy");
+        let alias = ctx.dir().join("llvm-strip");
+        let second_alias = ctx.dir().join("llvm-install-name-tool");
+        let destination = ctx.dir().join("installed-llvm-strip");
+        executable(&source);
+        symlink("llvm-objcopy", &alias).unwrap();
+        symlink("llvm-strip", &second_alias).unwrap();
+        let original = identity(&source);
+        let alias_metadata = std::fs::symlink_metadata(&alias).unwrap();
+
+        for _ in 0..2 {
+            session.resolve_symlink_and_copy(&second_alias, &destination);
+            assert!(!std::fs::symlink_metadata(&destination).unwrap().file_type().is_symlink());
+            assert_ne!(identity(&destination).1, original.1);
+            assert_eq!(std::fs::read(&destination).unwrap(), std::fs::read(&source).unwrap());
+            assert_eq!(std::fs::metadata(&destination).unwrap().mode() & 0o777, 0o755);
+            assert_eq!(identity(&source), original);
+            let actual_alias = std::fs::symlink_metadata(&alias).unwrap();
+            assert_eq!(actual_alias.ino(), alias_metadata.ino());
+            assert_eq!(actual_alias.nlink(), alias_metadata.nlink());
+            assert_eq!(actual_alias.ctime(), alias_metadata.ctime());
+            assert_eq!(actual_alias.ctime_nsec(), alias_metadata.ctime_nsec());
+            assert_eq!(std::fs::read_link(&alias).unwrap(), Path::new("llvm-objcopy"));
+            assert_eq!(std::fs::read_link(&second_alias).unwrap(), Path::new("llvm-strip"));
+        }
+    }
+
+    #[test]
+    fn detaches_legacy_destination_then_preserves_provider_on_reassembly() {
+        let ctx = TestCtx::new();
+        let session = session(&ctx);
+        let source = ctx.dir().join("provider-opt");
+        let destination = ctx.dir().join("legacy-installed-opt");
+        executable(&source);
+        let original = identity(&source);
+        std::fs::hard_link(&source, &destination).unwrap();
+        assert_eq!(identity(&source).2, original.2 + 1);
+
+        // Trust: retiring an old shared inode necessarily changes its link metadata once.
+        session.resolve_symlink_and_copy(&source, &destination);
+        assert_eq!(identity(&source).1, original.1);
+        assert_eq!(identity(&source).2, original.2);
+        assert_ne!(identity(&destination).1, original.1);
+        assert_eq!(std::fs::read(&source).unwrap(), b"#!/bin/sh\nexit 0\n");
+        let detached = identity(&source);
+        session.resolve_symlink_and_copy(&source, &destination);
+        assert_eq!(identity(&source), detached);
+        assert_ne!(identity(&destination).1, original.1);
+    }
+
+    #[test]
+    fn replaces_destination_symlink_without_writing_its_target() {
+        let ctx = TestCtx::new();
+        let session = session(&ctx);
+        let source = ctx.dir().join("provider-llc");
+        let unrelated = ctx.dir().join("unrelated-target");
+        let destination = ctx.dir().join("installed-llc");
+        executable(&source);
+        std::fs::write(&unrelated, b"untouched").unwrap();
+        symlink(&unrelated, &destination).unwrap();
+        let source_before = identity(&source);
+        let unrelated_before = identity(&unrelated);
+
+        session.resolve_symlink_and_copy(&source, &destination);
+
+        assert!(!std::fs::symlink_metadata(&destination).unwrap().file_type().is_symlink());
+        assert_eq!(identity(&source), source_before);
+        assert_eq!(identity(&unrelated), unrelated_before);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"untouched");
+        assert_ne!(identity(&destination).1, source_before.1);
+        assert_eq!(std::fs::read(&destination).unwrap(), std::fs::read(&source).unwrap());
+    }
+}
+
+// Trust: the explicit development component owns a real compiler1 producer,
+// not development files copied from the seed-built compiler into stage1.
+#[test]
+fn build_development_component_uses_current_producer_and_complete_targets() {
+    let host = host_target();
+    for alias in ["trustc-dev", "rustc-dev"] {
+        let config = configure_with_args(
+            &["build", "--stage", "1", alias],
+            &[&host],
+            &[&host, TEST_TRIPLE_1],
+        );
+        let cache = run_build(&config.paths.clone(), config);
+        assert_eq!(
+            cache.inspect_all_steps_of_type::<compile::RustcDev, _>(|_, compiler| compiler.stage),
+            vec![2],
+        );
+        let compilers = cache.inspect_all_steps_of_type::<compile::Rustc, _>(|step, built| {
+            assert_eq!(step.build_compiler, built.build_compiler);
+            built.build_compiler.stage
+        });
+        assert_eq!(compilers, vec![0, 1]);
+        let libraries = cache.inspect_all_steps_of_type::<compile::Std, _>(|step, _| {
+            (step.build_compiler.stage, step.target.to_string())
+        });
+        for target in [host.as_str(), TEST_TRIPLE_1] {
+            assert!(libraries.contains(&(1, target.to_owned())), "{libraries:?}");
+            assert!(libraries.contains(&(2, target.to_owned())), "{libraries:?}");
+        }
+        // The same maintained producer is used without entering Dist/Install.
+        assert!(!cache.contains::<dist::RustcDev>());
+        assert!(cache.executed_steps().iter().all(|step| {
+            step.metadata.as_ref().is_none_or(|metadata| metadata.kind == Kind::Build)
+        }));
+    }
+}
+
+#[test]
+fn build_development_component_is_never_a_default() {
+    let host = host_target();
+    let cache = run_build(&[], configure_with_args(&["build", "--stage", "1"], &[&host], &[&host]));
+    assert!(!cache.contains::<compile::RustcDev>());
+}
+
+#[test]
+fn build_development_component_rejects_alternate_producers_before_dispatch() {
+    let host = host_target();
+    // Ordinary stage0 configuration already refuses before a Builder exists.
+    assert!(
+        panic::catch_unwind(|| {
+            configure_with_args(&["build", "--stage", "0", "trustc-dev"], &[&host], &[&host]);
+        })
+        .is_err()
+    );
+    for args in [
+        // Admit ordinary source-rebuild configuration, then require this
+        // component to reject stage0 before dispatching any compiler work.
+        vec!["build", "--stage", "0", "trustc-dev", "--set", "build.local-rebuild=true"],
+        vec!["build", "--stage", "2", "trustc-dev"],
+        vec!["build", "--stage", "1", "trustc-dev", "--keep-stage", "0"],
+        vec!["build", "--stage", "1", "trustc-dev", "--keep-stage-std", "1"],
+        vec!["build", "--stage", "1", "trustc-dev", "--skip", "library"],
+    ] {
+        let sess = Session::new(configure_with_args(&args, &[&host], &[&host]));
+        let builder = Builder::new(&sess);
+        let rejected = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            builder.ensure(compile::RustcDev { target: builder.host_target });
+        }));
+        assert!(rejected.is_err(), "{args:?}");
+        assert!(!builder.cache.contains::<compile::Rustc>());
+        assert!(!builder.cache.contains::<compile::Assemble>());
+    }
+    let sess = Session::new(configure_with_args(
+        &["build", "--stage", "1", "trustc-dev"],
+        &[&host],
+        &[&host],
+    ));
+    let builder = Builder::new(&sess);
+    assert!(
+        panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            builder.ensure(compile::RustcDev { target: TargetSelection::from_user(TEST_TRIPLE_1) });
+        }))
+        .is_err()
+    );
+    assert!(!builder.cache.contains::<compile::Rustc>());
+    assert!(!builder.cache.contains::<compile::Assemble>());
 }

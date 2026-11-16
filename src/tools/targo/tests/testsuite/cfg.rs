@@ -56,7 +56,7 @@ fn dont_include() {
         .build();
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] a v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -96,7 +96,7 @@ fn works_through_the_registry() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] baz v0.1.0 (registry `dummy-registry`)
@@ -147,7 +147,7 @@ fn ignore_version_from_other_platform() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [ADDING] bar v0.1.0 (available: v0.2.0)
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
@@ -538,6 +538,9 @@ fn cfg_raw_idents() {
 
                 [target.'cfg(any(r#true, r#all, r#target_os = "<>"))'.dependencies]
                 b = { path = "b/" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -547,7 +550,7 @@ fn cfg_raw_idents() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] b v0.0.1 ([ROOT]/foo/b)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -627,6 +630,9 @@ fn cfg_keywords() {
 
                 [target.'cfg(any(async, fn, const, return, true))'.dependencies]
                 b = { path = "b/" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -642,7 +648,7 @@ fn cfg_keywords() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] b v0.0.1 ([ROOT]/foo/b)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -668,6 +674,9 @@ fn cfg_booleans() {
 
                 [target.'cfg(false)'.dependencies]
                 c = { path = 'c' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -679,7 +688,7 @@ fn cfg_booleans() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] b v0.0.1 ([ROOT]/foo/b)
 [CHECKING] a v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -733,6 +742,9 @@ fn cfg_booleans_not() {
 
                 [target.'cfg(not(false))'.dependencies]
                 b = { path = 'b' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -742,7 +754,7 @@ fn cfg_booleans_not() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] b v0.0.1 ([ROOT]/foo/b)
 [CHECKING] a v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -765,6 +777,9 @@ fn cfg_booleans_combinators() {
 
                 [target.'cfg(all(any(true), not(false), true))'.dependencies]
                 b = { path = 'b' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -774,7 +789,7 @@ fn cfg_booleans_combinators() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] b v0.0.1 ([ROOT]/foo/b)
 [CHECKING] a v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -800,6 +815,9 @@ fn cfg_booleans_rustflags_no_effect() {
 
                 [target.'cfg(false)'.dependencies]
                 c = { path = 'c' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -812,7 +830,7 @@ fn cfg_booleans_rustflags_no_effect() {
     p.cargo("check")
         .env("RUSTFLAGS", "--cfg r#false")
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] b v0.0.1 ([ROOT]/foo/b)
 [CHECKING] a v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s

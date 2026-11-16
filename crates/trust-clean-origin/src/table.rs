@@ -78,7 +78,10 @@
 //!
 //! At the reflector the dual applies: a term with no row is a NAMED refusal
 //! ([`no_selection_row`], ruling v7/D3 — *"no selection row for `<head>` at
-//! carrier `<carrier>`"* plus the options), never a silent `None`.
+//! carrier `<carrier>`"* plus the options), never a silent `None`. At the
+//! emitter's whole-body fall-through that text is used only when it is TRUE:
+//! [`whole_body_refusal`] asks [`rows_selecting_head`] first, and a head a row
+//! does select is refused on its SHAPE, citing the row.
 //!
 //! # §6f LANDING 2 — the table grew a ROUTE, not a row
 //!
@@ -122,8 +125,35 @@
 //!   divisor to a strictly positive numeral — because Clean's `{C}.div`/`.mod`
 //!   are TOTAL and Rust's `/`/`%` PANIC — lives on side A, in the sealed plan,
 //!   and independently in the frozen producer.
+//!
+//! # 2026-09-23 — `uint.xor` and `uint.shr`, and why there is no `uint.shl`
+//!
+//! The clean pin `bf31976f48` gave the prelude `HXor`/`HShiftLeft`/
+//! `HShiftRight` at every `UInt{N}`, and `l7_p7`'s tripwire fired. Measured
+//! separately (`landing7_selection_probes::l7_p7`, `l7_p11`..`l7_p15`):
+//!
+//! * `^^^` — the kernel identifies side A with the frozen producer's
+//!   `UInt{N}.ofNat (Nat.xor …)` at every width, parameter and numeral right
+//!   operand alike. A row, with no operand rule.
+//! * `>>>` — identified at a NUMERAL amount below the width (side B is
+//!   `UInt{N}.ofNat (Nat.div (UInt{N}.toNat a) 2^k)`, side A reduces the
+//!   closed `Nat.pow 2 (Nat.mod k N)` to the same literal). A row, with a
+//!   SHIFT-AMOUNT rule on side A that has the divisor rule's shape but not its
+//!   reason: MIR `Shr` and Lean both reduce the amount modulo the width, so no
+//!   amount is a wrong binary; any other amount simply has no side B.
+//! * `<<<` — swept over EVERY amount below the width at every width, the gate
+//!   ADMITS the frozen producer's `UInt{N}.mul a 2^k` at exactly `k = 1` and
+//!   refuses every other amount (`0` included) with a completed
+//!   `Disagreement`: Clean's `Nat.shiftLeft x k` unfolds one doubling at a time
+//!   (`x * 2 * 2 …`), and one multiplication by `2^k` coincides with that chain
+//!   at an open `x` only when there is one doubling. No row, by decision: the
+//!   `>>>` amount rule would plan amounts the gate refuses, and a one-amount
+//!   rule would be new machinery for a function `uint.mul` already serves as
+//!   `a * 2` (the `HShiftLeft` demand below records the choice).
 
-use trust_types::admissible_body::{ArithBinOp, PrimitiveCallee, RawBinOpKind, SelectCmp};
+use trust_types::admissible_body::{
+    ArithBinOp, BoolBinOp, PrimitiveCallee, RawBinOpKind, SelectCmp,
+};
 
 /// Which layer of a body a row realizes.
 ///
@@ -162,6 +192,103 @@ impl CarrierClass {
             Self::MachineUInt => "an unsigned machine width",
             Self::BignumNat => "the `Nat` bignum carrier",
             Self::AnyExact => "any exact carrier",
+        }
+    }
+
+    /// Whether `prefix` names a carrier of this class — the `{C}` of a
+    /// carrier-spelled head (`UInt64` in `UInt64.add`, `UInt8` in
+    /// `UInt8.ofNat`). [`Self::AnyExact`] is carrier-agnostic, so any prefix.
+    #[must_use]
+    pub fn names_carrier(self, prefix: &str) -> bool {
+        match self {
+            Self::MachineUInt => matches!(prefix, "UInt8" | "UInt16" | "UInt32" | "UInt64"),
+            Self::BignumNat => prefix == "Nat",
+            Self::AnyExact => !prefix.is_empty(),
+        }
+    }
+
+    /// Whether a row stated over this class serves a position whose carrier
+    /// is of class `position`. [`Self::AnyExact`] is carrier-agnostic ("any
+    /// exact carrier"), so it serves every position; the other two serve only
+    /// their own class.
+    #[must_use]
+    pub fn serves(self, position: CarrierClass) -> bool {
+        self == Self::AnyExact || self == position
+    }
+}
+
+/// **The POSITION a row's [`CarrierClass`] is stated over** — which carrier of
+/// a body the row's `carrier` field is a claim about.
+///
+/// The families differ, and the difference is what the recognisers already
+/// check first: `recognise_wrapping_expr`, `recognise_raw_binop_expr`,
+/// `recognise_constant_body` and `recognise_select_ite` read the RESULT carrier
+/// (and then demand every other position share it); `recognise_decide_comparison`
+/// returns `Bool` whatever the width and checks the carrier the COMPARISON is
+/// stated at (`LT.lt {C}` / `Eq {C}` / `BEq.beq {C}` against the parameters'
+/// width); `recognise_bool_value` checks that the connective's OPERANDS are
+/// `Bool`. A question of the form "does row R select head H for THIS body" is
+/// answered at R's own position ([`rows_selecting_head`]), never at one carrier
+/// assumed for the whole body — the defect that told `if a < b then true else
+/// false : Bool` it was realized by `select.*` (whose position is a machine-width
+/// RESULT) and labelled `!(a < b)`'s `bool.not` "at an unsigned machine width".
+///
+/// **There is no `Default`**, for [`TotalityDemand`]'s reason: every row must
+/// state its position, and `table_controls::every_row_declares_the_position_it_is_stated_over`
+/// checks each declaration against the row's realization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarrierAnchor {
+    /// The body's RESULT carrier — the arithmetic, raw-binop, numeral, select,
+    /// projection and `Nat` recursion rows.
+    Result,
+    /// The carrier the body's decided comparison is STATED AT: the type
+    /// argument of the proposition under `decide` (`LT.lt {C}`, `LE.le {C}`,
+    /// `Eq {C}`, and their converses `GT.gt {C}`/`GE.ge {C}`), or of `BEq.beq
+    /// {C}`. The W6 `comparison.*` rows, whose `Bool` result names no width.
+    ComparedOperands,
+    /// The carrier the head constant's own explicit OPERANDS are declared at —
+    /// `Bool` for `Bool.not`/`and`/`or`. The W6 `bool.*` rows, stated over
+    /// `Bool` operands and never at a machine width.
+    HeadOperands,
+    /// No single position: `rust.call` checks every position at its CALLEE's
+    /// declared carrier, so no one body carrier is its coordinate (and no head
+    /// label selects it — see [`KernelSelector::selects_head`]).
+    CalleeSignature,
+}
+
+/// The carrier class at each [`CarrierAnchor`] position of ONE body, read off
+/// that body by the emitter (`emit::anchored_carriers`) — what
+/// [`rows_selecting_head`] matches each row's own anchor against.
+///
+/// `None` means the body HAS no such position (its head decides no comparison
+/// stated at a carrier; its head's operands share no carrier), and a row
+/// stated over a missing position selects nothing in that body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchoredCarriers {
+    /// [`CarrierAnchor::Result`] — the class of the signature's result carrier.
+    /// Also the coordinate a TRUE row miss is named at ([`no_selection_row`]).
+    pub result: CarrierClass,
+    /// [`CarrierAnchor::ComparedOperands`].
+    pub compared_operands: Option<CarrierClass>,
+    /// [`CarrierAnchor::HeadOperands`].
+    pub head_operands: Option<CarrierClass>,
+}
+
+impl AnchoredCarriers {
+    /// A body whose only readable position is its result.
+    #[must_use]
+    pub fn result_only(result: CarrierClass) -> Self {
+        Self { result, compared_operands: None, head_operands: None }
+    }
+
+    /// The class at `anchor`'s position in this body, if the body has one.
+    #[must_use]
+    pub fn at(self, anchor: CarrierAnchor) -> Option<CarrierClass> {
+        match anchor {
+            CarrierAnchor::Result => Some(self.result),
+            CarrierAnchor::ComparedOperands => self.compared_operands,
+            CarrierAnchor::HeadOperands => self.head_operands,
+            CarrierAnchor::CalleeSignature => None,
         }
     }
 }
@@ -221,6 +348,20 @@ pub enum KernelSelector {
     /// `ite.{1} {C} <prop> <dec> t e` whose proposition is the named
     /// comparison at the prelude instance.
     IteAt(SelectCmp),
+    /// **W6 (Rust-calls-Clean, comparison to `Bool`)** — a `Bool`-VALUED
+    /// comparison as the whole peeled body: `decide <prop> <inst>` for `<`/`<=`
+    /// (`Decidable.decide` at `LT.lt`/`LE.le`), or `BEq.beq {C}
+    /// (instBEqOfDecidableEq {C} instDecidableEq{C}) l r` for `==`. Both
+    /// operands are source parameters; the result carrier is `Bool`. Disjoint
+    /// from [`Self::IteAt`] by HEAD (`decide`/`BEq.beq` vs `ite`) and from
+    /// [`Self::IteAtBoolDecisionEq`] by the absence of the `ite` frame.
+    DecideAt(SelectCmp),
+    /// **W6 (Rust-calls-Clean, boolean connective)** — a boolean negation or
+    /// strict connective over `Bool` parameters as the whole peeled body:
+    /// `Bool.not b`, `and a b`, or `or a b`. The `&'static str` is the kernel
+    /// head (`"Bool.not"`, `"and"`, `"or"`). Disjoint from every other selector
+    /// by that head.
+    BoolValueHead(&'static str),
     /// **§6f LANDING 6** — `ite.{1} {C} <prop> <dec> t e` whose proposition is
     /// stated at `Bool` rather than at the carrier:
     ///
@@ -249,6 +390,13 @@ pub enum KernelSelector {
     /// VACUOUS as a gate (probe s2) and is unrepresentable in the reflector by
     /// type.
     RecursiveOccurrence,
+    /// **W5 (Lean-calls-Rust)** — a kernel constant the COMPILER declared for
+    /// an admissible sibling Rust `fn` of the island
+    /// (`trust_certify::clean_island::declare_rust_callees`), at the head of
+    /// an application spine. Disjoint from every other selector by
+    /// construction: a callee is admitted only under a bare name the
+    /// environment did not already hold, so no prelude head can also be one.
+    RustCallee,
 }
 
 impl KernelSelector {
@@ -263,12 +411,90 @@ impl KernelSelector {
             Self::CarrierNumeral => "a carrier numeral".to_owned(),
             Self::CarrierNumeralBody => "a carrier numeral as the whole body".to_owned(),
             Self::IteAt(cmp) => format!("`ite` at {}", cmp_label(cmp)),
+            Self::DecideAt(cmp) => {
+                format!("a comparison to `Bool` at {}", cmp_label(cmp))
+            }
+            Self::BoolValueHead(head) => format!("a boolean `{head}` returned as `Bool`"),
             Self::IteAtBoolDecisionEq => {
                 "`ite` at a `Bool`-level `==` decision lifted by `= Bool.true`".to_owned()
             }
             Self::ConstantHead(head) => format!("`{head}`"),
             Self::NatLiteral => "a `Nat` literal".to_owned(),
             Self::RecursiveOccurrence => "the recursive occurrence".to_owned(),
+            Self::RustCallee => "a compiler-declared Rust callee".to_owned(),
+        }
+    }
+
+    /// Whether this spelling, on a row of layer `context`, is keyed on the
+    /// kernel CONSTANT `head` at a position of class `carrier` — the coordinate
+    /// a refusing body is named by (`emit::head_label`: the head constant's
+    /// name, or a category such as "a projection out of a structure" when the
+    /// head is not a constant). `carrier` is the class at the ROW'S OWN
+    /// position ([`CarrierAnchor`]); [`rows_selecting_head`] supplies it.
+    ///
+    /// Exhaustive with no wildcard, on purpose: a new selector must say which
+    /// constant heads it spells before it compiles, or the generic refusal would
+    /// go on telling a user "no selection row" for a head a row selects — the
+    /// false text [`rows_selecting_head`] exists to retire.
+    ///
+    /// The `{C}` of a carrier-spelled selector is a carrier OF `carrier`'s class
+    /// ([`CarrierClass::names_carrier`]); the selector's own "at the signature's
+    /// carrier" discipline is the recogniser's to enforce, and a head of one
+    /// width cannot sit at the result of another in a well-typed body.
+    #[must_use]
+    pub fn selects_head(self, head: &str, carrier: CarrierClass, context: RowContext) -> bool {
+        let carrier_spelled = |suffix: &str| {
+            head.rsplit_once('.')
+                .is_some_and(|(prefix, method)| method == suffix && carrier.names_carrier(prefix))
+        };
+        match self {
+            Self::SurfaceClass { class, projection } => {
+                head.strip_prefix(class).and_then(|rest| rest.strip_prefix('.')) == Some(projection)
+            }
+            Self::CarrierMethod { suffix } => carrier_spelled(suffix),
+            // `{C}.ofNat n`, or `OfNat.ofNat {C} n (instOfNat{C} n)` — the two
+            // spellings both numeral selectors read, in operand position and as
+            // the whole body.
+            Self::CarrierNumeral | Self::CarrierNumeralBody => {
+                head == "OfNat.ofNat" || carrier_spelled("ofNat")
+            }
+            Self::IteAt(_) | Self::IteAtBoolDecisionEq => head == "ite",
+            // `decide <prop> <inst>`, in both spellings `recognise_decide_comparison`
+            // reads (the `==` row also takes `decide (a = b)`), and for `==` the
+            // idiomatic `BEq.beq`.
+            Self::DecideAt(cmp) => {
+                matches!(head, "decide" | "Decidable.decide")
+                    || (cmp == SelectCmp::Eq && head == "BEq.beq")
+            }
+            Self::BoolValueHead(constant) | Self::ConstantHead(constant) => head == constant,
+            // What the arm readers that feed `nat.lit` read, constant by
+            // constant: `emit::read_nat_numeral` reads the kernel literal (no
+            // constant), `Nat.zero` and `OfNat.ofNat Nat n _`; the well-founded
+            // lane's `emit::read_wf_numeral` also unwinds a bounded `Nat.succ`
+            // tower over one of those, so `Nat.succ` IS a head this row's
+            // reader is keyed on — inside an arm, which is where the row sits.
+            Self::NatLiteral => matches!(head, "Nat.zero" | "OfNat.ofNat" | "Nat.succ"),
+            // A bound variable is keyed on no constant NAME — except in ONE
+            // place. Inside a structural scheme's succ arm the case
+            // substitution `n := Nat.succ k` spells the PARAMETER `Nat.succ k`,
+            // and `emit::read_case_value` reads exactly that as
+            // `RecBodyExpr::Decreasing`, which `nat.param` realizes. That
+            // spelling exists only under the recursor, so it is keyed on the
+            // LAYER: the whole-body `param` row, which shares this selector,
+            // reads a bare `BVar` and nothing else, and must not be cited for
+            // a top-level `Nat.succ n` (which is arithmetic on the parameter,
+            // not the parameter).
+            Self::BoundVariable => context == RowContext::RecursionArm && head == "Nat.succ",
+            // Keyed on no constant NAME, so no head label can select them:
+            // - `RecursiveOccurrence` is a variable (the recursor's `ih` or the
+            //   functional's `rec` slot; a variable head labels as a category);
+            // - `InductiveProjectionProof` is a proof obligation over a body,
+            //   not a spelling of its head;
+            // - `RustCallee` IS a constant, but a body headed by one never
+            //   reaches the generic refusal: `recognise_rust_call_chain`
+            //   either plans it or refuses it with its own text, and returns
+            //   `Ok(None)` only for a head that is NOT a declared callee.
+            Self::InductiveProjectionProof | Self::RecursiveOccurrence | Self::RustCallee => false,
         }
     }
 }
@@ -322,9 +548,49 @@ pub enum MirShape {
     InlineScalar,
     /// One `Call` terminator to the selected callee, writing a bare place.
     Call(CalleeSelector),
-    /// `_c = BinOp(<cmp>, l, r)` then a two-target `SwitchInt` diamond joining
-    /// at a bookkeeping-only `Return`.
+    /// `_c = BinOp(<cmp>, l, r)` then a two-target `SwitchInt`, composed into
+    /// either a single diamond or a bounded pure unsigned decision tree.
     ComparisonBranch(SelectCmp),
+    /// **W6 (Rust-calls-Clean, comparison to `Bool`)** — a BARE
+    /// `Rvalue::BinaryOp(<cmp>, l, r)` written straight into `_0` as the WHOLE
+    /// body: `_0 = <cmp>(l, r); return`, then `Return`. `_0` is at the result
+    /// carrier `bool`; the operands are the two source parameters.
+    ///
+    /// # It is NOT [`Self::ComparisonBranch`], and the difference is the whole
+    /// value
+    ///
+    /// `ComparisonBranch` computes the SAME `BinOp::Lt|Le|Eq` into a `bool`
+    /// TEMPORARY and then BRANCHES on it, returning one of two UInt arms — its
+    /// result carrier is `u{w}`. This shape RETURNS the `bool` itself, so its
+    /// result carrier is `bool` and there is no diamond: the comparison IS the
+    /// value (`def lt (a b : UInt64) : Bool := a < b`, whose kernel body is
+    /// `decide (a < b)`). Side B reads it back as
+    /// [`trust_types::admissible_body::AdmissibleBody::ComparisonBool`] — the
+    /// one-block reader — and reflects it through the FROZEN
+    /// `trust_spec_elab::admit_comparison_function`, which mints
+    /// `Decidable.decide <prop> <inst>`, definitionally equal to the `decide`
+    /// (`<`/`<=`) or `BEq.beq` (`==`) the island wrote.
+    ///
+    /// # NO branch, NO call, NO assert
+    ///
+    /// A comparison `BinaryOp` cannot fail and needs no callee — like
+    /// [`Self::RawBinOp`], the instruction IS the body. It shares
+    /// `single_assignment_body`'s skeleton for that reason.
+    ComparisonValue(SelectCmp),
+    /// **W6 (Rust-calls-Clean)** — a strict boolean CONNECTIVE over two `Bool`
+    /// parameters returned as `Bool`: `_0 = <BitAnd|BitOr>(l, r); return`,
+    /// `_0` at the `bool` result carrier. The whole body of
+    /// `def f (a b : Bool) : Bool := a && b`, whose kernel term is `and a b`
+    /// (def-eq to `Bool.and a b`). Reuses [`TemplateRvalue::RawBin`] at the
+    /// `bool` carrier, so no new realization primitive; but a DISTINCT MirShape
+    /// from [`Self::RawBinOp`], which is stated over machine-UInt carriers and
+    /// extracts a width this shape has none of.
+    BoolConnValue(BoolBinOp),
+    /// **W6 (Rust-calls-Clean)** — boolean NEGATION of a `Bool` parameter
+    /// returned as `Bool`: `_0 = UnaryOp(Not, param); return`. The whole body
+    /// of `def f (b : Bool) : Bool := not b` (kernel term `Bool.not b`). Uses
+    /// the new [`TemplateRvalue::BoolNot`] primitive.
+    BoolNotValue,
     /// **§6f LANDING 6** — the TWO-STEP diamond: `_d = Eq(l, r)` into a `bool`,
     /// then `_c = Eq(_d, const true)` into a second `bool`, then the same
     /// two-target `SwitchInt` diamond, branching on the LIFTED bool.
@@ -353,14 +619,19 @@ pub enum MirShape {
     ///
     /// Every other value-producing row either calls a marker-authenticated
     /// `core::num` primitive ([`Self::Call`]) or writes an inline constant
-    /// ([`Self::InlineScalar`]). `&`/`|`/`/`/`%` can do neither:
+    /// ([`Self::InlineScalar`]). `&`/`|`/`^`/`/`/`%`/`>>` can do neither:
     /// [`trust_types::RustcTotalPrimitiveMethod::classify`] demands the callee
     /// path be exactly `core::num::<impl u{N}>::wrapping_{add,sub,mul}`, and
-    /// `u{N}`'s `&`, `|`, `/` and `%` live on the `BitAnd`/`BitOr`/`Div`/`Rem`
-    /// trait impls, not in `core::num`. Realizing them as a call would mean
-    /// widening the authenticated marker set in `library/core` — a different
-    /// change with a different review — so the realization is the raw operator,
-    /// which is also what `rustc_mir_build` emits for the same source.
+    /// `u{N}`'s `&`, `|`, `^`, `/`, `%` and `>>` live on the
+    /// `BitAnd`/`BitOr`/`BitXor`/`Div`/`Rem`/`Shr` trait impls in `core::ops`
+    /// (`>>` on `shr_impl_all!`'s `Shr<uM> for u{N}`, one impl per integer
+    /// amount type), not in `core::num`. `core::num`'s `wrapping_shr` is the
+    /// nearest method, and it is neither what `>>` calls nor in the marker set.
+    /// Realizing any of them as a call would mean widening the authenticated
+    /// marker set in `library/core` — a different change with a different
+    /// review — so the realization is the raw operator, which is also what
+    /// `rustc_mir_build` emits for the same source (after the `Assert`s the
+    /// next section accounts for).
     ///
     /// # NO `Assert`, and that is a decision rather than an omission
     ///
@@ -374,6 +645,14 @@ pub enum MirShape {
     /// invariant is `recognise_raw_binop_expr`'s divisor rule on side A and
     /// the FROZEN producer's own refusal on side B — two independent programs,
     /// which is the double fault.
+    ///
+    /// Source-level `>>` acquires an `Assert` too, but only under overflow
+    /// checks (`amount < BITS`; `rustc_mir_build`'s `build_binary_op`). The
+    /// emitted `Shr` needs none: MIR `Shr` is total — it takes the amount as
+    /// `RHS.rem_euclid(LHS::BITS)` (`rustc_middle::mir::syntax`) — and this
+    /// lane places it only at a numeral amount strictly below the width (the
+    /// shift-amount rule, a side-B capability rule rather than a soundness one),
+    /// where that assertion would hold statically. `^` has no `Assert` at all.
     ///
     /// # The second fault is in `trust_spec_elab::elab_term`, and the gate is not a third one
     ///
@@ -401,6 +680,15 @@ pub enum MirShape {
     ZeroTestBranch,
     /// A `Call` whose callee string is the emitted body's own def path.
     SelfCall,
+    /// **W5 (Lean-calls-Rust)** — a linear chain of `Call`s to REGISTERED
+    /// USER `fn` `DefId`s (the crate's admissible Rust callees), one per
+    /// [`crate::emit::RustCallNode`] in post-order through fresh temporaries
+    /// typed at each callee's RESULT carrier, the root writing `_0`, then
+    /// `Return`. The callee is not a primitive and has no authenticated
+    /// identity: side B matches the extractor's rendering of the emitted
+    /// callee against the rendering of the registered `DefId` (an allow-list
+    /// the plan carries), and the kernel re-decides every argument.
+    RustCallChain,
 }
 
 impl MirShape {
@@ -415,6 +703,12 @@ impl MirShape {
             Self::OperandCopy
             | Self::InlineScalar
             | Self::ComparisonBranch(_)
+            // W6: a comparison-to-`Bool` value IS the instruction, exactly as
+            // a raw binary operator is — no callee.
+            | Self::ComparisonValue(_)
+            // W6: a boolean connective/negation IS the instruction — no callee.
+            | Self::BoolConnValue(_)
+            | Self::BoolNotValue
             // §6f landing 7: a raw binary operator IS the instruction. There
             // is no callee, which is exactly why the row could not be a
             // `Call`.
@@ -427,6 +721,10 @@ impl MirShape {
             // matches it against `func.def_path` and the kernel re-decides the
             // argument. Deliberately `None` rather than a fabricated identity.
             Self::SelfCall => None,
+            // W5: a user `fn` has no authenticated identity either — the
+            // allow-list of `DefId` renderings the plan carries is the
+            // identity, and it is not a `PrimitiveCallee`.
+            Self::RustCallChain => None,
         }
     }
 }
@@ -479,6 +777,13 @@ pub enum ReflectSpec {
     /// the recursor's minor premises, or the `dite` functional — assembled by
     /// the scheme's own producer out of the arm rows.
     SchemeScaffold,
+    /// **W5 (Lean-calls-Rust)** — an application of the callee's kernel
+    /// CONSTANT (`Expr::const_(clean_name)`, looked up from the rendering
+    /// side B read) to the reflected operands, through
+    /// [`crate::reflect_rust_call::reflect_rust_call_chain`]. A Trust-authored
+    /// producer, NOT covered by frozen-R's pedigree, so the row carries its
+    /// own `docs/TCB.md` line.
+    RustCalleeConst,
 }
 
 /// The token an [`ReflectSpec::ElabSurface`] row hands the frozen producer.
@@ -515,6 +820,16 @@ pub enum ElabToken {
     /// than a fourth `SelectCmp`: `==` is not a fourth comparison, it is a
     /// second SPELLING of the equality one, one layer up.
     SelectBeq,
+    /// **W6 (Rust-calls-Clean, comparison to `Bool`)** —
+    /// `trust_spec_elab::admit_comparison_function`, a FROZEN producer written
+    /// for the E6 kernel-import direction and reused here (it rides frozen-R's
+    /// pedigree, so the row carries no `docs/TCB.md` line of its own). It mints
+    /// `Decidable.decide <prop> <inst>` at the named comparison, definitionally
+    /// equal to the `decide`/`BEq.beq` an island `def … : Bool := a <cmp> b`
+    /// writes. A token of its own rather than a reuse of [`Self::Select`]: the
+    /// realization is the bare comparison value, not the four-block select
+    /// diamond, and the producer is a different one.
+    Comparison(SelectCmp),
 }
 
 /// Which faithfulness judgment a row's body is decided by.
@@ -548,6 +863,14 @@ pub enum TotalityDemand {
     /// The kernel's typing rule at the decrease slot, over an audited-empty
     /// axiom closure.
     KernelAccessibility,
+    /// **W5 (Lean-calls-Rust)** — the row cannot recur, but its TOTALITY is
+    /// NOT the kernel's: the Clean term is total and the binary computes it
+    /// only if every Rust callee RETURNS. That evidence is the callee's E6
+    /// facets (`Pure ∧ Total ∧ Det ∧ NoPanic`), charged OUTSIDE the kernel by
+    /// the verify pass (design increment 3); under `-Ztrust-verify=off`
+    /// nothing is claimed (v7/D2: capability, not trust). Named as its own
+    /// demand so the boundary cannot be eroded by omitting a field.
+    RustCalleeFacets,
 }
 
 /// Whether a row shares its MIR realization with another row.
@@ -586,6 +909,8 @@ pub struct SelectionRow {
     pub side_a: &'static [KernelSelector],
     /// The carrier class the row is stated over.
     pub carrier: CarrierClass,
+    /// WHICH carrier of a body [`Self::carrier`] is a claim about. No default.
+    pub anchor: CarrierAnchor,
     /// The MIR realization.
     pub mir: MirShape,
     /// The unwind edge the realization's call carries.
@@ -622,6 +947,7 @@ pub static ROWS: &[SelectionRow] = &[
         // ladder-not-a-boundary claim, in the smallest possible instance.
         side_a: &[KernelSelector::BoundVariable, KernelSelector::InductiveProjectionProof],
         carrier: CarrierClass::AnyExact,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::OperandCopy,
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::ElabSurface(ElabToken::Projection),
@@ -640,6 +966,7 @@ pub static ROWS: &[SelectionRow] = &[
             KernelSelector::SurfaceClass { class: "HAdd", projection: "hAdd" },
         ],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::Call(CalleeSelector::WrappingAtSignatureWidth(ArithBinOp::Add)),
         unwind: UnwindDiscipline::Unreachable,
         reflect: ReflectSpec::ElabSurface(ElabToken::ArithOperator(ArithBinOp::Add)),
@@ -657,6 +984,7 @@ pub static ROWS: &[SelectionRow] = &[
             KernelSelector::SurfaceClass { class: "HSub", projection: "hSub" },
         ],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::Call(CalleeSelector::WrappingAtSignatureWidth(ArithBinOp::Sub)),
         unwind: UnwindDiscipline::Unreachable,
         reflect: ReflectSpec::ElabSurface(ElabToken::ArithOperator(ArithBinOp::Sub)),
@@ -674,6 +1002,7 @@ pub static ROWS: &[SelectionRow] = &[
             KernelSelector::SurfaceClass { class: "HMul", projection: "hMul" },
         ],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::Call(CalleeSelector::WrappingAtSignatureWidth(ArithBinOp::Mul)),
         unwind: UnwindDiscipline::Unreachable,
         reflect: ReflectSpec::ElabSurface(ElabToken::ArithOperator(ArithBinOp::Mul)),
@@ -700,6 +1029,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Body,
         side_a: &[KernelSelector::CarrierNumeral, KernelSelector::CarrierNumeralBody],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::InlineScalar,
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::ElabSurface(ElabToken::Numeral),
@@ -727,6 +1057,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Body,
         side_a: &[KernelSelector::IteAt(SelectCmp::Lt)],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::ComparisonBranch(SelectCmp::Lt),
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::ElabSurface(ElabToken::Select(SelectCmp::Lt)),
@@ -736,6 +1067,10 @@ pub static ROWS: &[SelectionRow] = &[
         measured_by: &[
             "fragment_widening_probes::probe_h_select_admits",
             "fragment_widening_probes::probe_i_select_literal_admits",
+            // 2026-09-23: the literal comparison's CARRIER-instance spelling
+            // (Clean `c91fa93f5`+), against the unchanged Nat-reduced side B,
+            // with mutated instances measured untypable.
+            "fragment_widening_probes::probe_i4_select_literal_carrier_instance_spelling",
             // §6f landing 3 — the row did not change; its DATAFLOW reach did.
             // These measure the same row at `<` with a NUMERAL arm, against
             // side A taken from the REAL island elaborator, with four refused
@@ -752,6 +1087,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Body,
         side_a: &[KernelSelector::IteAt(SelectCmp::Le)],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::ComparisonBranch(SelectCmp::Le),
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::ElabSurface(ElabToken::Select(SelectCmp::Le)),
@@ -760,6 +1096,10 @@ pub static ROWS: &[SelectionRow] = &[
         alias: MirAliasing::Unique,
         measured_by: &[
             "fragment_widening_probes::probe_h_select_admits",
+            // The real carrier-instance spelling with a numeral RHS at all
+            // four machine widths, plus wrong comparison/instance/operand/
+            // literal/arm controls.
+            "fragment_widening_probes::probe_i5_select_literal_le_and_propositional_eq_real_elaboration_admit",
             // §6f landing 3: the numeral arm at `<=`, against the REAL
             // elaboration (`lez`), with its own refused mutation.
             "landing3_selection_probes::l3_p3_the_constant_arm_holds_across_the_operand_vocabulary",
@@ -771,6 +1111,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Body,
         side_a: &[KernelSelector::IteAt(SelectCmp::Eq)],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::ComparisonBranch(SelectCmp::Eq),
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::ElabSurface(ElabToken::Select(SelectCmp::Eq)),
@@ -779,6 +1120,10 @@ pub static ROWS: &[SelectionRow] = &[
         alias: MirAliasing::Unique,
         measured_by: &[
             "fragment_widening_probes::probe_i_select_literal_admits",
+            // Propositional equality against a numeral through the real
+            // carrier-instance spelling, with the same instance and emitted
+            // body mutation controls.
+            "fragment_widening_probes::probe_i5_select_literal_le_and_propositional_eq_real_elaboration_admit",
             // §6f landing 3: the row's side-A proposition (`Eq {C} l r` at
             // `instDecidableEq{C}`) is what the REAL elaborator mints for `a =
             // b` — measured, because `a == b` mints a DIFFERENT tree the row
@@ -821,6 +1166,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Body,
         side_a: &[KernelSelector::IteAtBoolDecisionEq],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::BoolDecisionBranch,
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::ElabSurface(ElabToken::SelectBeq),
@@ -856,6 +1202,148 @@ pub static ROWS: &[SelectionRow] = &[
             "control_15_beq_general_emitter_mutation",
         ],
         tcb_row: None,
+    },
+    // ── W6 (Rust-calls-Clean) — the COMPARISON-TO-`Bool` rows ──────────────
+    //
+    // Three rows, `<`/`<=`/`==`, for a def whose whole body is a comparison
+    // returned as `Bool` (`def lt (a b : UInt64) : Bool := a < b`, whose kernel
+    // body is `decide (a < b)`). They are NOT the `select.{lt,le,eq}` rows: a
+    // select's result carrier is `u{w}` and it realizes a four-block
+    // `ComparisonBranch` diamond; these return the `bool` ITSELF and realize a
+    // one-block `ComparisonValue`, which no other row realizes — so each is
+    // `Unique`, truthfully, and there is no alias to separate from `select.eq`.
+    //
+    // Side A is disjoint from every existing row by HEAD: `decide`/`BEq.beq` is
+    // neither `ite` (the select rows) nor a carrier arithmetic head. Side B is
+    // the FROZEN `admit_comparison_function` (E6's own producer), so these ride
+    // frozen-R's pedigree and carry no `docs/TCB.md` row — exactly as the
+    // arithmetic and select rows do.
+    //
+    // `anchor: ComparedOperands` — `MachineUInt` is a claim about the width the
+    // comparison COMPARES (`recognise_decide_comparison` checks `LT.lt {C}` /
+    // `Eq {C}` / `BEq.beq {C}` against the parameters' width). The result is
+    // `Bool` at every width, so reading these rows at the result would place
+    // them nowhere, and reading a `Bool` body at its PARAMETERS would make an
+    // unused parameter decide the answer (`l7_p17`'s `m2`/`m3`).
+    SelectionRow {
+        name: "comparison.lt",
+        context: RowContext::Body,
+        side_a: &[KernelSelector::DecideAt(SelectCmp::Lt)],
+        carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::ComparedOperands,
+        mir: MirShape::ComparisonValue(SelectCmp::Lt),
+        unwind: UnwindDiscipline::NoCall,
+        reflect: ReflectSpec::ElabSurface(ElabToken::Comparison(SelectCmp::Lt)),
+        gate: GateRouting::WholeTerm,
+        totality: TotalityDemand::None,
+        alias: MirAliasing::Unique,
+        measured_by: &[
+            "control_25_clean_comparison_emitter_mutation",
+            "landing9_comparison_probes::l9_p1_decide_lt_admits_end_to_end",
+        ],
+        tcb_row: None,
+    },
+    SelectionRow {
+        name: "comparison.le",
+        context: RowContext::Body,
+        side_a: &[KernelSelector::DecideAt(SelectCmp::Le)],
+        carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::ComparedOperands,
+        mir: MirShape::ComparisonValue(SelectCmp::Le),
+        unwind: UnwindDiscipline::NoCall,
+        reflect: ReflectSpec::ElabSurface(ElabToken::Comparison(SelectCmp::Le)),
+        gate: GateRouting::WholeTerm,
+        totality: TotalityDemand::None,
+        alias: MirAliasing::Unique,
+        measured_by: &[
+            "control_25_clean_comparison_emitter_mutation",
+            "landing9_comparison_probes::l9_p2_decide_le_admits_end_to_end",
+        ],
+        tcb_row: None,
+    },
+    SelectionRow {
+        name: "comparison.eq",
+        context: RowContext::Body,
+        side_a: &[KernelSelector::DecideAt(SelectCmp::Eq)],
+        carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::ComparedOperands,
+        mir: MirShape::ComparisonValue(SelectCmp::Eq),
+        unwind: UnwindDiscipline::NoCall,
+        reflect: ReflectSpec::ElabSurface(ElabToken::Comparison(SelectCmp::Eq)),
+        gate: GateRouting::WholeTerm,
+        totality: TotalityDemand::None,
+        alias: MirAliasing::Unique,
+        measured_by: &[
+            "control_25_clean_comparison_emitter_mutation",
+            "landing9_comparison_probes::l9_p3_beq_eq_admits_end_to_end",
+        ],
+        tcb_row: None,
+    },
+    // ── W6 (Rust-calls-Clean) — the BOOLEAN-CONNECTIVE rows ────────────────
+    //
+    // `not b`, `a && b`, `a || b` over `Bool` PARAMETERS returned as `Bool`.
+    // Their kernel terms are `Bool.not b`, `and a b`, `or a b` (the last two
+    // def-eq to `Bool.and`/`Bool.or`, measured 2026-09-13). Each realizes a
+    // one-block body no other row does — `_0 = UnaryOp(Not, p)` for negation,
+    // `_0 = <BitAnd|BitOr>(l, r)` for the connectives (a bare `Rvalue::BinaryOp`
+    // at the `bool` carrier, NOT the machine-UInt `uint.and`/`uint.or` rows,
+    // which extract a width this shape has none of) — so each is `Unique`.
+    //
+    // Side A is disjoint by HEAD (`Bool.not`/`and`/`or`) from every other row.
+    // Side B is the AUTHORED `admit_bool_value_function`, reached through the
+    // SEPARATE entry point `recognize_bool_value` (never the shared
+    // `recognize_admissible_body` chain, so the gate-free E6 import direction
+    // cannot reach it) — so these are `KernelConst` reflections carrying their
+    // own `docs/TCB.md` row, exactly as the R1/R2/W5 authored producers do.
+    //
+    // `anchor: HeadOperands` — `AnyExact` here is the class of the `Bool`
+    // OPERANDS the connective is declared over, never a machine width: a
+    // `!(a < b)` over `UInt64` parameters meets `bool.not` at `Bool`, not at the
+    // width its comparison compares (`l7_p17`).
+    SelectionRow {
+        name: "bool.not",
+        context: RowContext::Body,
+        side_a: &[KernelSelector::BoolValueHead("Bool.not")],
+        carrier: CarrierClass::AnyExact,
+        anchor: CarrierAnchor::HeadOperands,
+        mir: MirShape::BoolNotValue,
+        unwind: UnwindDiscipline::NoCall,
+        reflect: ReflectSpec::KernelConst("Bool.not"),
+        gate: GateRouting::WholeTerm,
+        totality: TotalityDemand::None,
+        alias: MirAliasing::Unique,
+        measured_by: &["control_26_clean_bool_value_emitter_mutation"],
+        tcb_row: Some("Clean-origin boolean-value reflection (NEW side-B producer, W6)"),
+    },
+    SelectionRow {
+        name: "bool.and",
+        context: RowContext::Body,
+        side_a: &[KernelSelector::BoolValueHead("and")],
+        carrier: CarrierClass::AnyExact,
+        anchor: CarrierAnchor::HeadOperands,
+        mir: MirShape::BoolConnValue(BoolBinOp::And),
+        unwind: UnwindDiscipline::NoCall,
+        reflect: ReflectSpec::KernelConst("Bool.and"),
+        gate: GateRouting::WholeTerm,
+        totality: TotalityDemand::None,
+        alias: MirAliasing::Unique,
+        measured_by: &["control_26_clean_bool_value_emitter_mutation"],
+        tcb_row: Some("Clean-origin boolean-value reflection (NEW side-B producer, W6)"),
+    },
+    SelectionRow {
+        name: "bool.or",
+        context: RowContext::Body,
+        side_a: &[KernelSelector::BoolValueHead("or")],
+        carrier: CarrierClass::AnyExact,
+        anchor: CarrierAnchor::HeadOperands,
+        mir: MirShape::BoolConnValue(BoolBinOp::Or),
+        unwind: UnwindDiscipline::NoCall,
+        reflect: ReflectSpec::KernelConst("Bool.or"),
+        gate: GateRouting::WholeTerm,
+        totality: TotalityDemand::None,
+        alias: MirAliasing::Unique,
+        measured_by: &["control_26_clean_bool_value_emitter_mutation"],
+        tcb_row: Some("Clean-origin boolean-value reflection (NEW side-B producer, W6)"),
     },
     // ── §6f LANDING 7 — the RAW-BINOP rows ─────────────────────────────────
     //
@@ -896,6 +1384,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Body,
         side_a: &[KernelSelector::SurfaceClass { class: "HAnd", projection: "hAnd" }],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::RawBinOp(RawBinOpKind::BitAnd),
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::BitAnd)),
@@ -915,6 +1404,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Body,
         side_a: &[KernelSelector::SurfaceClass { class: "HOr", projection: "hOr" }],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::RawBinOp(RawBinOpKind::BitOr),
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::BitOr)),
@@ -933,6 +1423,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Body,
         side_a: &[KernelSelector::SurfaceClass { class: "HDiv", projection: "hDiv" }],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::RawBinOp(RawBinOpKind::Div),
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::Div)),
@@ -952,6 +1443,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Body,
         side_a: &[KernelSelector::SurfaceClass { class: "HMod", projection: "hMod" }],
         carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::RawBinOp(RawBinOpKind::Rem),
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::Rem)),
@@ -963,6 +1455,62 @@ pub static ROWS: &[SelectionRow] = &[
             "landing7_selection_probes::l7_p3_the_division_rows_admit_at_a_positive_literal_divisor",
             "landing7_selection_probes::l7_p4_every_raw_binop_mutation_is_refused",
             "landing7_selection_probes::l7_p6_the_total_declaration_and_the_panicking_body_are_measured_apart",
+        ],
+        tcb_row: None,
+    },
+    // 2026-09-23 — two more rows in the same family, for the same reason as
+    // the four above: each realizes a `MirShape::RawBinOp` value no other row
+    // has, so each declares `Unique` truthfully. ONE side-A selector each, and
+    // measured the same way `l7_p1` measured the four: a real island `a ^^^ b`
+    // produces `HXor.hXor … instHXorUInt{N}` and never `UInt{N}.xor`, and side
+    // B renders the `toNat`/`ofNat` round trip, so the carrier method would be
+    // a spelling neither side produces.
+    SelectionRow {
+        name: "uint.xor",
+        context: RowContext::Body,
+        side_a: &[KernelSelector::SurfaceClass { class: "HXor", projection: "hXor" }],
+        carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
+        mir: MirShape::RawBinOp(RawBinOpKind::BitXor),
+        unwind: UnwindDiscipline::NoCall,
+        reflect: ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::BitXor)),
+        gate: GateRouting::WholeTerm,
+        totality: TotalityDemand::None,
+        alias: MirAliasing::Unique,
+        measured_by: &[
+            "landing7_selection_probes::l7_p11_xor_and_shr_are_pinned_node_by_node_at_every_width",
+            "landing7_selection_probes::l7_p12_xor_and_shr_admit_end_to_end",
+            "landing7_selection_probes::l7_p13_every_xor_and_shr_mutation_is_refused",
+            "landing7_selection_probes::l7_p15_the_new_operators_reach_the_eq_decision_operand",
+        ],
+        tcb_row: None,
+    },
+    // The SHIFT-AMOUNT rule is on side A, not in the row, for the divisor
+    // rule's structural reason (a row selects VOCABULARY) and NOT for its
+    // semantic one: MIR `Shr` takes the amount as `RHS.rem_euclid(LHS::BITS)`
+    // and Lean's `UInt{N}.shiftRight` as `Nat.mod b.toNat N`, so no amount is
+    // a wrong binary. The rule — a numeral strictly below the width — is what
+    // the FROZEN producer can mint a side B for, and nothing more.
+    SelectionRow {
+        name: "uint.shr",
+        context: RowContext::Body,
+        side_a: &[KernelSelector::SurfaceClass { class: "HShiftRight", projection: "hShiftRight" }],
+        carrier: CarrierClass::MachineUInt,
+        anchor: CarrierAnchor::Result,
+        mir: MirShape::RawBinOp(RawBinOpKind::Shr),
+        unwind: UnwindDiscipline::NoCall,
+        reflect: ReflectSpec::ElabSurface(ElabToken::RawOperator(RawBinOpKind::Shr)),
+        gate: GateRouting::WholeTerm,
+        totality: TotalityDemand::None,
+        alias: MirAliasing::Unique,
+        measured_by: &[
+            "landing7_selection_probes::l7_p11_xor_and_shr_are_pinned_node_by_node_at_every_width",
+            "landing7_selection_probes::l7_p12_xor_and_shr_admit_end_to_end",
+            "landing7_selection_probes::l7_p13_every_xor_and_shr_mutation_is_refused",
+            "landing7_selection_probes::l7_p14_the_planner_refuses_every_shift_amount_without_a_side_b",
+            "landing7_selection_probes::l7_p15_the_new_operators_reach_the_eq_decision_operand",
+            "control_15_raw_binop_emitter_mutation::half_12_the_shift_default_bridge_is_read_over_the_prelude_dictionary_only",
+            "control_15_raw_binop_emitter_mutation::half_13_a_REAL_user_shift_instance_under_the_bridge_is_refused_at_both_sites",
         ],
         tcb_row: None,
     },
@@ -978,6 +1526,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Scheme,
         side_a: &[KernelSelector::ConstantHead("Nat.rec")],
         carrier: CarrierClass::BignumNat,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::ZeroTestBranch,
         unwind: UnwindDiscipline::Continue,
         reflect: ReflectSpec::SchemeScaffold,
@@ -992,6 +1541,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::Scheme,
         side_a: &[KernelSelector::ConstantHead("WellFounded.fix")],
         carrier: CarrierClass::BignumNat,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::ZeroTestBranch,
         unwind: UnwindDiscipline::Continue,
         reflect: ReflectSpec::SchemeScaffold,
@@ -1030,6 +1580,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::RecursionArm,
         side_a: &[KernelSelector::BoundVariable],
         carrier: CarrierClass::BignumNat,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::OperandCopy,
         unwind: UnwindDiscipline::NoCall,
         reflect: ReflectSpec::BinderSite,
@@ -1073,6 +1624,7 @@ pub static ROWS: &[SelectionRow] = &[
             KernelSelector::ConstantHead("HSub.hSub"),
         ],
         carrier: CarrierClass::BignumNat,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::Call(CalleeSelector::Fixed(PrimitiveCallee::NatSub)),
         unwind: UnwindDiscipline::Continue,
         // A DUMB reading: `Nat.sub (Nat.succ k) 1`, never pre-reduced to `k`.
@@ -1176,6 +1728,7 @@ pub static ROWS: &[SelectionRow] = &[
             KernelSelector::ConstantHead("HMod.hMod"),
         ],
         carrier: CarrierClass::BignumNat,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::Call(CalleeSelector::Fixed(PrimitiveCallee::NatRem)),
         unwind: UnwindDiscipline::Continue,
         // A DUMB reading, `nat.sub`'s discipline verbatim: `Nat.mod a b` is
@@ -1217,6 +1770,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::RecursionArm,
         side_a: &[KernelSelector::RecursiveOccurrence],
         carrier: CarrierClass::BignumNat,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::SelfCall,
         unwind: UnwindDiscipline::Continue,
         reflect: ReflectSpec::BinderSite,
@@ -1231,6 +1785,7 @@ pub static ROWS: &[SelectionRow] = &[
         context: RowContext::RecursionArm,
         side_a: &[KernelSelector::NatLiteral],
         carrier: CarrierClass::BignumNat,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::Call(CalleeSelector::Fixed(PrimitiveCallee::NatFromU64)),
         unwind: UnwindDiscipline::Continue,
         reflect: ReflectSpec::KernelNatLiteral,
@@ -1248,6 +1803,7 @@ pub static ROWS: &[SelectionRow] = &[
             KernelSelector::SurfaceClass { class: "HAdd", projection: "hAdd" },
         ],
         carrier: CarrierClass::BignumNat,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::Call(CalleeSelector::Fixed(PrimitiveCallee::NatAdd)),
         unwind: UnwindDiscipline::Continue,
         reflect: ReflectSpec::KernelConst("Nat.add"),
@@ -1273,6 +1829,7 @@ pub static ROWS: &[SelectionRow] = &[
             KernelSelector::SurfaceClass { class: "HMul", projection: "hMul" },
         ],
         carrier: CarrierClass::BignumNat,
+        anchor: CarrierAnchor::Result,
         mir: MirShape::Call(CalleeSelector::Fixed(PrimitiveCallee::NatMul)),
         unwind: UnwindDiscipline::Continue,
         reflect: ReflectSpec::KernelConst("Nat.mul"),
@@ -1281,6 +1838,33 @@ pub static ROWS: &[SelectionRow] = &[
         alias: MirAliasing::Unique,
         measured_by: &["r6_nat_mul_probes::q7", "r6_nat_mul_probes::q9"],
         tcb_row: Some("Clean-origin recursive-body reflection (NEW side-B producers, R1)"),
+    },
+    // W5 (Lean-calls-Rust, design of record
+    // `docs/design/2026-09-13-lean-calls-rust-lane.md`): a Clean `def` that
+    // applies a sibling Rust `fn`. The realization is NEW — a call to a
+    // registered USER `DefId`, which no primitive row can spell — so it is a
+    // row, and the reflection is a NEW side-B producer, so it carries a TCB
+    // row. `unwind: Continue` because the callee is user code that may panic;
+    // `carrier: AnyExact` because every position is checked at the CALLEE's
+    // declared carrier rather than at one shared width.
+    SelectionRow {
+        name: "rust.call",
+        context: RowContext::Body,
+        side_a: &[KernelSelector::RustCallee],
+        carrier: CarrierClass::AnyExact,
+        anchor: CarrierAnchor::CalleeSignature,
+        mir: MirShape::RustCallChain,
+        unwind: UnwindDiscipline::Continue,
+        reflect: ReflectSpec::RustCalleeConst,
+        gate: GateRouting::WholeTerm,
+        totality: TotalityDemand::RustCalleeFacets,
+        alias: MirAliasing::Unique,
+        measured_by: &[
+            "control_23_rust_call_emitter_mutation::half_1",
+            "control_23_rust_call_emitter_mutation::half_2",
+            "control_23_rust_call_emitter_mutation::half_9",
+        ],
+        tcb_row: Some("Clean-origin Rust-callee reflection (NEW side-B producer, W5)"),
     },
 ];
 
@@ -1324,6 +1908,10 @@ pub fn ladder_row(shape: &crate::emit::CleanOriginShape) -> Option<&'static Sele
         CleanOriginShape::Select { cmp, .. }
         | CleanOriginShape::SelectLiteral { cmp, .. }
         | CleanOriginShape::SelectOperands { cmp, .. } => select_row_name(*cmp),
+        CleanOriginShape::UnsignedConditional { expr } => match expr {
+            crate::emit::UIntConditional::If { cmp, .. } => select_row_name(*cmp),
+            crate::emit::UIntConditional::Operand(_) => return None,
+        },
         // §6f landing 6: the `==` rung is the FIRST select rung that does NOT
         // map onto `select.{lt,le,eq}`, and the reason is the mirror image of
         // why the other three do. Landing 3's finding was that the arms are
@@ -1344,6 +1932,29 @@ pub fn ladder_row(shape: &crate::emit::CleanOriginShape) -> Option<&'static Sele
         CleanOriginShape::SelectBeq { .. } | CleanOriginShape::SelectBeqGeneral { .. } => {
             "select.beq"
         }
+        // W6 (Rust-calls-Clean): the comparison-to-`Bool` rung, one row per
+        // comparison. A new rung AND three new rows, because the realization is
+        // new: a bare `Rvalue::BinaryOp` returned as the value is not a select
+        // diamond, not a call and not an inline scalar, so there was nothing
+        // for it to map onto.
+        CleanOriginShape::DecideComparison { cmp, .. } => comparison_row_name(*cmp),
+        // W6 (Rust-calls-Clean): the boolean-connective rungs, one row each. New
+        // rungs and new rows: a `bool`-carrier `UnaryOp`/`BinaryOp` returned as
+        // a value is not a select, not a call and not a machine-UInt raw binop,
+        // so there was nothing for them to map onto.
+        CleanOriginShape::BoolNot { .. } => "bool.not",
+        // As for arithmetic Composed, composition introduces dataflow, not
+        // another vocabulary row with overlapping head selectors.
+        CleanOriginShape::BoolExpression { expr } => match expr {
+            crate::emit::BoolExpr::Not(_) => "bool.not",
+            crate::emit::BoolExpr::And(..) => "bool.and",
+            crate::emit::BoolExpr::Or(..) => "bool.or",
+            crate::emit::BoolExpr::Param(_) | crate::emit::BoolExpr::Literal(_) => return None,
+        },
+        CleanOriginShape::BoolConnective { op, .. } => match op {
+            BoolBinOp::And => "bool.and",
+            BoolBinOp::Or => "bool.or",
+        },
         // §6f landing 7: the raw-binop rung, one row per operator. It is a new
         // rung AND four new rows, because the realization is new: a bare
         // `Rvalue::BinaryOp` is not a call, not an inline scalar and not a
@@ -1351,6 +1962,9 @@ pub fn ladder_row(shape: &crate::emit::CleanOriginShape) -> Option<&'static Sele
         CleanOriginShape::RawBinOp { op, .. } => raw_binop_row_name(*op),
         CleanOriginShape::StructuralNatRec { .. } => "nat.rec.structural",
         CleanOriginShape::WellFoundedNatRec { .. } => "nat.wf.fix",
+        // W5: the Rust-call chain, one row whatever the callee — the callee
+        // is DATAFLOW the plan's table carries, not vocabulary.
+        CleanOriginShape::RustCallChain { .. } => "rust.call",
     };
     row(name)
 }
@@ -1383,8 +1997,31 @@ fn raw_binop_row_name(op: RawBinOpKind) -> &'static str {
     match op {
         RawBinOpKind::BitAnd => "uint.and",
         RawBinOpKind::BitOr => "uint.or",
+        RawBinOpKind::BitXor => "uint.xor",
         RawBinOpKind::Div => "uint.div",
         RawBinOpKind::Rem => "uint.mod",
+        RawBinOpKind::Shr => "uint.shr",
+    }
+}
+
+/// The Lean SURFACE token a raw-binop operator is written with at a `UInt{N}`
+/// carrier — the user's spelling, for refusal texts that name the vocabulary.
+///
+/// A closed match with no wildcard, like [`raw_binop_row_name`]: a new
+/// [`RawBinOpKind`] is a compile error here. What a refusal LISTS is still
+/// read from [`raw_binop_rows`], so an operator with no row is never offered
+/// (`landing7_selection_probes::l7_p15` pins the list the `==` boundary names,
+/// `l7_p16` the lists in the generic fall-through refusal and in
+/// `EmitRefusal::note`'s callable-fragment paragraph).
+#[must_use]
+pub fn raw_binop_surface_token(op: RawBinOpKind) -> &'static str {
+    match op {
+        RawBinOpKind::BitAnd => "&&&",
+        RawBinOpKind::BitOr => "|||",
+        RawBinOpKind::BitXor => "^^^",
+        RawBinOpKind::Div => "/",
+        RawBinOpKind::Rem => "%",
+        RawBinOpKind::Shr => ">>>",
     }
 }
 
@@ -1393,6 +2030,19 @@ fn select_row_name(cmp: SelectCmp) -> &'static str {
         SelectCmp::Lt => "select.lt",
         SelectCmp::Le => "select.le",
         SelectCmp::Eq => "select.eq",
+    }
+}
+
+/// **W6 (Rust-calls-Clean)** — the row a comparison-to-`Bool` selects.
+///
+/// A closed match with no wildcard, exactly as [`select_row_name`] is: a new
+/// [`SelectCmp`] without a row is a compile error here rather than a `row()`
+/// lookup that silently returns `None` at emission time.
+fn comparison_row_name(cmp: SelectCmp) -> &'static str {
+    match cmp {
+        SelectCmp::Lt => "comparison.lt",
+        SelectCmp::Le => "comparison.le",
+        SelectCmp::Eq => "comparison.eq",
     }
 }
 
@@ -1502,6 +2152,192 @@ pub fn no_selection_row(head: &str, carrier: CarrierClass) -> String {
     )
 }
 
+/// The rows whose side-A selectors select the kernel head `head` IN A BODY
+/// whose positions are `at`, each with the class of the position it was
+/// matched at — in table order and at EVERY layer ([`RowContext`]), so a
+/// caller asking about one layer filters on [`SelectionRow::context`] and can
+/// still say truthfully which rows select the head at another.
+///
+/// A row selects `head` for the body only when BOTH hold at the row's OWN
+/// position ([`SelectionRow::anchor`]): the body has that position and the
+/// row's [`CarrierClass`] serves its class ([`CarrierClass::serves`]), and one
+/// of the row's selectors is keyed on `head` there
+/// ([`KernelSelector::selects_head`]). `head` is a head LABEL as
+/// `emit::head_label` spells it, so a category ("a lambda") selects nothing.
+///
+/// This is the question [`no_selection_row`]'s text answers "none" to, asked
+/// of the table instead of assumed: `HOr.hOr` over a machine-width RESULT
+/// returns `uint.or`, so a nested `(a &&& b) ||| a` that the recognisers
+/// decline is refused on its SHAPE, not on a missing row. And it is asked per
+/// row, not at one carrier assumed for the whole body: `ite` in a
+/// `Bool`-VALUED body is selected by no `select.*` row, whose position is a
+/// machine-width result; `decide (a < 10)` is selected by the `comparison.*`
+/// rows at the width it COMPARES, whatever an unused parameter's type; and
+/// `and`/`or`/`Bool.not` are selected by the `bool.*` rows at their `Bool`
+/// operands, never "at an unsigned machine width" (`l7_p17`).
+#[must_use]
+pub fn rows_selecting_head(
+    head: &str,
+    at: AnchoredCarriers,
+) -> Vec<(&'static SelectionRow, CarrierClass)> {
+    ROWS.iter()
+        .filter_map(|row| {
+            let position = at.at(row.anchor)?;
+            let selects = row.carrier.serves(position)
+                && row
+                    .side_a
+                    .iter()
+                    .any(|selector| selector.selects_head(head, position, row.context));
+            selects.then_some((row, position))
+        })
+        .collect()
+}
+
+/// Whether a row of this layer realizes a WHOLE peeled body — the layer the
+/// generic refusal speaks for. A recursion-arm row realizes one node inside a
+/// scheme's arm and is reachable only under a scheme row.
+fn realizes_a_whole_body(context: RowContext) -> bool {
+    match context {
+        RowContext::Body | RowContext::Scheme => true,
+        RowContext::RecursionArm => false,
+    }
+}
+
+/// How a refusal names rows: "row `a`", or "rows `a`, `b`".
+fn cite_rows(rows: &[&SelectionRow]) -> String {
+    let names: Vec<String> = rows.iter().map(|row| format!("`{}`", row.name)).collect();
+    format!("row{} {}", if names.len() == 1 { "" } else { "s" }, names.join(", "))
+}
+
+/// The carrier a citation names, and the rows it may cite there: the class of
+/// the FIRST selecting row's position, and every selecting row matched at that
+/// class. `table_controls::a_selected_head_is_not_cited_as_a_row_miss` requires
+/// the rows one head selects to share one anchor, so today this keeps every
+/// row; were that ever to break, a row matched at another class would go
+/// uncited rather than be cited at a carrier it was not matched at.
+fn cited_at(
+    selections: &[(&'static SelectionRow, CarrierClass)],
+) -> Option<(CarrierClass, Vec<&'static SelectionRow>)> {
+    let &(_, carrier) = selections.first()?;
+    let rows = selections
+        .iter()
+        .filter(|(_, position)| *position == carrier)
+        .map(|(row, _)| *row)
+        .collect();
+    Some((carrier, rows))
+}
+
+/// **Ruling v7/D3 at the WHOLE-BODY site**: the refusal for a body every
+/// whole-body recogniser declined, keyed on its kernel head and on the
+/// carriers of its positions — and TRUE of the table in each of the three
+/// cases it can be in:
+///
+/// 1. a whole-body row selects the head → the head is served and the SHAPE
+///    around it is not, and the options are the ones that fit a shape
+///    (`row_shape_refusal`). The carrier named is the one at the selecting
+///    rows' own position — the compared width for `comparison.*`, `Bool`'s
+///    class for `bool.*` — which is the carrier the claim is true at;
+/// 2. only a recursion-arm row does → no whole-body row, and the text says
+///    which arm rows select it and where (`arm_only_refusal`);
+/// 3. no row does → [`no_selection_row`] at the RESULT's class, byte-identical
+///    to the text this site produced before any row was consulted — the
+///    carrier included.
+///
+/// Until 2026-09-23 the generic fall-through used case 3's text for all
+/// three, so a nested `(a &&& b) ||| a` was told the table had no row for
+/// `HOr.hOr` while the same text's own row list named `uint.or`.
+#[must_use]
+pub fn whole_body_refusal(head: &str, at: AnchoredCarriers) -> String {
+    let (whole, arm): (Vec<_>, Vec<_>) = rows_selecting_head(head, at)
+        .into_iter()
+        .partition(|(row, _)| realizes_a_whole_body(row.context));
+    if let Some((carrier, rows)) = cited_at(&whole) {
+        row_shape_refusal(head, carrier, &rows)
+    } else if let Some((carrier, rows)) = cited_at(&arm) {
+        arm_only_refusal(head, carrier, &rows)
+    } else {
+        no_selection_row(head, at.result)
+    }
+}
+
+/// Case 1 of [`whole_body_refusal`]: `rows` are whole-body rows that select
+/// `head` at `carrier`, and the body still did not plan — so every recogniser
+/// for them declined it, and what is outside the fragment is the shape.
+///
+/// The first option is MEASURED, not advised from the armchair
+/// (`landing7_selection_probes::l7_p17`): the inner application planned alone,
+/// and the two in-Lean splits — a call to another Lean `def`, and a `let` —
+/// arrive back at this same refusal, because named calls are expanded and a
+/// pure `let` is zeta-reduced before selection.
+fn row_shape_refusal(head: &str, carrier: CarrierClass, rows: &[&SelectionRow]) -> String {
+    let those = if rows.len() == 1 { "that row" } else { "one of those rows" };
+    format!(
+        "`{head}` at {carrier} IS selected — by {rows} — so what this body meets is not a \
+         missing row for its head: the table realizes `{head}` at this carrier, only not in \
+         the shape this body applies it. Every recogniser declined the body, so what falls \
+         outside the fragment is either the SHAPE around `{head}` — how it nests, or what its \
+         operands, arms or condition are — or the body's SIGNATURE: {those} also \
+         constrains the parameter list and the result, so a parameter the body does not \
+         read, or one at another type, can decline it on its own. It is not the head \
+         itself. This is a measured boundary of the compiler, not a rule about what you may \
+         write (ruling v7/D2).\n\
+         options:\n\
+         - if the signature carries a parameter the body does not read, or one at another \
+           type than the rest, drop it, or keep it on the Rust side and pass the rest;\n\
+         - if the body NESTS applications, split it: give each inner application its own \
+           `def` and compose them in the Rust caller — a `def` whose whole body is one \
+           application a row realizes plans on its own. Not through another Lean `def` or a \
+           `let`: a call to a Lean `def` is expanded in place and a pure `let` is \
+           zeta-reduced before selection, so both arrive back at this same shape;\n\
+         - restate the body, where the algebra allows it, in a shape {those} realizes, and \
+           keep the general definition alongside for proof position;\n\
+         - cite the declaration from a contract instead of calling it — proof position needs \
+           no emitted body and has no shape restriction;\n\
+         - write the computation as a Rust `fn` and prove it agrees with the declaration in \
+           an `ensures` clause, which is the same guarantee reached from the other side;\n\
+         - or widen the table: realizing `{head}` in this shape — by widening {those} or by \
+           a row of its own — needs its own kernel measurement first (fast-lane-first), then \
+           its MIR realization, then its reflection — see \
+           `docs/design/2026-08-04-two-language-compiler-architecture.md` §6f.",
+        carrier = carrier.label(),
+        rows = cite_rows(rows),
+    )
+}
+
+/// Case 2 of [`whole_body_refusal`]: `rows` are recursion-arm rows that select
+/// `head` at `carrier`, and no whole-body row does. It keeps
+/// [`no_selection_row`]'s leading clause — there IS no whole-body row — and
+/// says which rows select the head and at which layer, because the row list a
+/// reader sees names them.
+fn arm_only_refusal(head: &str, carrier: CarrierClass, rows: &[&SelectionRow]) -> String {
+    let schemes: Vec<&'static SelectionRow> = ROWS
+        .iter()
+        .filter(|row| row.context == RowContext::Scheme)
+        .filter(|row| row.carrier.serves(carrier))
+        .collect();
+    let scheme_clause =
+        if schemes.is_empty() { String::new() } else { format!(" ({})", cite_rows(&schemes)) };
+    format!(
+        "no selection row for `{head}` as a WHOLE body at {carrier} — {rows} {verb} this head \
+         at this carrier, but only as a node inside the arm of a recursion \
+         scheme{scheme_clause}, each within the arm reader of its own scheme, and this body \
+         applies it at the top level, where no row does. \
+         This is a measured boundary of the compiler, not a rule about what you may write \
+         (ruling v7/D2).\n\
+         options:\n\
+         - cite the declaration from a contract instead of calling it — proof position needs \
+           no emitted body and has no shape restriction;\n\
+         - write the computation as a Rust `fn` and prove it agrees with the declaration in \
+           an `ensures` clause, which is the same guarantee reached from the other side;\n\
+         - or add the whole-body row: a row needs a kernel measurement first \
+           (fast-lane-first), then its MIR realization, then its reflection — see \
+           `docs/design/2026-08-04-two-language-compiler-architecture.md` §6f.",
+        carrier = carrier.label(),
+        rows = cite_rows(rows),
+        verb = if rows.len() == 1 { "selects" } else { "select" },
+    )
+}
+
 /// Whether a selection demand is served by a row today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DemandStatus {
@@ -1552,6 +2388,13 @@ pub static DEMANDS: &[SelectionDemand] = &[
         carrier: CarrierClass::AnyExact,
         status: DemandStatus::Covered("param"),
         measured_by: &["e6-fragment-probe::d01"],
+    },
+    // W5 (Lean-calls-Rust): battery row r18's demand.
+    SelectionDemand {
+        head: "an application of a sibling Rust `fn` (Lean calls Rust)",
+        carrier: CarrierClass::AnyExact,
+        status: DemandStatus::Covered("rust.call"),
+        measured_by: &["control_23_rust_call_emitter_mutation::half_1"],
     },
     SelectionDemand {
         head: "a recursion proved equal to a projection",
@@ -1813,6 +2656,85 @@ pub static DEMANDS: &[SelectionDemand] = &[
             "landing8_selection_probes::l8_p5_the_general_beq_reading_stays_out_of_the_e6_chain",
             "landing8_selection_probes::l8_p7_the_divisor_rule_holds_inside_a_decision_operand",
             "control_15_beq_general_emitter_mutation",
+            // 2026-09-23: the operand vocabulary is `raw_binop_rows`, so the
+            // two new rows reach this position with no edit here — measured
+            // end to end rather than inherited, with the shift-amount rule
+            // holding in the operand position too.
+            "landing7_selection_probes::l7_p15_the_new_operators_reach_the_eq_decision_operand",
+        ],
+    },
+    // W6 (Rust-calls-Clean): a comparison of two parameters returned as `Bool`
+    // (`def lt (a b : UInt64) : Bool := a < b`, kernel body `decide (a < b)`).
+    // Served by the `comparison.{lt,le,eq}` rows through the FROZEN
+    // `admit_comparison_function`. Both operands are parameters — a literal
+    // operand is the measured residual below.
+    SelectionDemand {
+        head: "a comparison `a < b` returned as `Bool` (`decide (a < b)`)",
+        carrier: CarrierClass::MachineUInt,
+        status: DemandStatus::Covered("comparison.lt"),
+        measured_by: &[
+            "control_25_clean_comparison_emitter_mutation",
+            "landing9_comparison_probes::l9_p1_decide_lt_admits_end_to_end",
+        ],
+    },
+    SelectionDemand {
+        head: "a comparison `a <= b` returned as `Bool` (`decide (a <= b)`)",
+        carrier: CarrierClass::MachineUInt,
+        status: DemandStatus::Covered("comparison.le"),
+        measured_by: &[
+            "control_25_clean_comparison_emitter_mutation",
+            "landing9_comparison_probes::l9_p2_decide_le_admits_end_to_end",
+        ],
+    },
+    SelectionDemand {
+        head: "a comparison `a == b` returned as `Bool` (`BEq.beq … a b`)",
+        carrier: CarrierClass::MachineUInt,
+        status: DemandStatus::Covered("comparison.eq"),
+        measured_by: &[
+            "control_25_clean_comparison_emitter_mutation",
+            "landing9_comparison_probes::l9_p3_beq_eq_admits_end_to_end",
+        ],
+    },
+    // W6 residual, measured: a comparison with a NUMERAL operand returned as
+    // `Bool` (`a < 10 : Bool`). Its `<`/`<=` Decidable instance is Nat-reduced
+    // (`instDecidableNatLt (a.toNat…) 10`), NOT the carrier instance
+    // `admit_comparison_function` mints — so the reflected term is NOT
+    // definitionally equal to the declaration and the gate refuses it
+    // fail-closed. Serving it needs a Nat-reduced-instance producer, the same
+    // brittleness the computed-`<`-condition entry above declines.
+    // W6 (Rust-calls-Clean): boolean negation and connectives over `Bool`
+    // parameters, served by the `bool.{not,and,or}` rows through the AUTHORED
+    // `admit_bool_value_function`.
+    SelectionDemand {
+        head: "a boolean negation `not b` returned as `Bool`",
+        carrier: CarrierClass::AnyExact,
+        status: DemandStatus::Covered("bool.not"),
+        measured_by: &["control_26_clean_bool_value_emitter_mutation"],
+    },
+    SelectionDemand {
+        head: "a boolean conjunction `a && b` over `Bool` parameters",
+        carrier: CarrierClass::AnyExact,
+        status: DemandStatus::Covered("bool.and"),
+        measured_by: &["control_26_clean_bool_value_emitter_mutation"],
+    },
+    SelectionDemand {
+        head: "a boolean disjunction `a || b` over `Bool` parameters",
+        carrier: CarrierClass::AnyExact,
+        status: DemandStatus::Covered("bool.or"),
+        measured_by: &["control_26_clean_bool_value_emitter_mutation"],
+    },
+    SelectionDemand {
+        head: "a comparison `a < LIT` returned as `Bool` (`a < 10 : Bool`)",
+        carrier: CarrierClass::MachineUInt,
+        status: DemandStatus::Missing(
+            "the literal comparison's Decidable instance is Nat-reduced, not the carrier \
+             instance the frozen `admit_comparison_function` mints, so side B is not \
+             definitionally equal to side A and the gate refuses it. Options: write the \
+             comparison over two parameters and pass the literal at the call site; or await a \
+             Nat-reduced-instance comparison producer.",
+        ),
+        measured_by: &[
+            "control_25_clean_comparison_emitter_mutation::half_literal_operand_refused",
         ],
     },
     SelectionDemand {
@@ -2083,25 +3005,90 @@ pub static DEMANDS: &[SelectionDemand] = &[
             "recursion_boundary_probes::probe_r7_no_admit_path_for_recursion_and_rem_needs_literal_divisor",
         ],
     },
-    // NEW in §6f landing 7, and MEASURED ABSENT one layer further out than
-    // this lane reaches — the same class as landing 3's numeral-on-the-left
-    // entry, and recorded for the same reason: a producer for a shape no
-    // elaborator emits is capability nothing can reach.
+    // NEW in §6f landing 7 as ONE entry — `^^^` / `<<<` / `>>>`, MEASURED
+    // ABSENT in `first-party/clean`'s prelude — and SPLIT INTO FOUR on
+    // 2026-09-23, when the clean pin `bf31976f48` gave the prelude `HXor`/
+    // `HShiftLeft`/`HShiftRight` and `l7_p7`'s tripwire fired. The three
+    // operators then went three different ways, and a fourth entry is the
+    // refused half of the one that was served — landing 7's `/`/`%` split,
+    // for landing 7's reason: one entry would average a served capability and
+    // an unserved one into a number that describes neither.
     SelectionDemand {
-        head: "`^^^` / `<<<` / `>>>` (xor and the shifts)",
+        head: "`HXor.hXor` (`a ^^^ b`)",
+        carrier: CarrierClass::MachineUInt,
+        status: DemandStatus::Covered("uint.xor"),
+        measured_by: &[
+            "landing7_selection_probes::l7_p11_xor_and_shr_are_pinned_node_by_node_at_every_width",
+            "landing7_selection_probes::l7_p12_xor_and_shr_admit_end_to_end",
+            "landing7_selection_probes::l7_p13_every_xor_and_shr_mutation_is_refused",
+            "control_14_real_session_evidence::every_row_has_a_real_session_witness",
+        ],
+    },
+    SelectionDemand {
+        head: "`HShiftRight.hShiftRight` at a NUMERAL amount below the width (`a >>> 3`)",
+        carrier: CarrierClass::MachineUInt,
+        status: DemandStatus::Covered("uint.shr"),
+        measured_by: &[
+            "landing7_selection_probes::l7_p11_xor_and_shr_are_pinned_node_by_node_at_every_width",
+            "landing7_selection_probes::l7_p12_xor_and_shr_admit_end_to_end",
+            "landing7_selection_probes::l7_p13_every_xor_and_shr_mutation_is_refused",
+            "control_14_real_session_evidence::every_row_has_a_real_session_witness",
+            "control_15_raw_binop_emitter_mutation::half_12_the_shift_default_bridge_is_read_over_the_prelude_dictionary_only",
+            "control_15_raw_binop_emitter_mutation::half_13_a_REAL_user_shift_instance_under_the_bridge_is_refused_at_both_sites",
+        ],
+    },
+    SelectionDemand {
+        head: "`HShiftRight.hShiftRight` at a VARIABLE or OUT-OF-RANGE amount (`a >>> b`, `a >>> 64`)",
         carrier: CarrierClass::MachineUInt,
         status: DemandStatus::Missing(
-            "blocked in `first-party/clean`'s PRELUDE, upstream of everything this lane owns, \
-             and the refusal is instance synthesis rather than a type error: `a ^^^ b` at \
-             `UInt{N}` fails with *\"failed to synthesize instance `HXor UInt{N} UInt{N} \
-             UInt{N}`\"*, and the two shifts likewise for `HShiftLeft`/`HShiftRight` \
-             (l7_p7, all three, at UInt64). Side B is ALREADY there — the frozen \
-             `elab_term` elaborates `^` through `Nat.xor` and both shifts through \
-             multiply/divide by a literal power of two — so this is one prelude commit away \
-             on the clean side and one row here, in that order",
+            "a CAPABILITY boundary, not a soundness one — the opposite of the variable-divisor \
+             entry above, which it otherwise resembles. The semantics AGREE at every amount: \
+             Lean's `UInt{N}.shiftRight a b` shifts by `Nat.mod b.toNat N` (the kernel accepts \
+             `(256 : UInt64) >>> 72 = 1` by `rfl`, l7_p14) and MIR's `BinOp::Shr` shifts by \
+             `RHS.rem_euclid(LHS::BITS)`, so an emitted `Shr(a, b)` computes the declared \
+             function. What is missing is SIDE B: the frozen `elab_term` mints a shift only at \
+             a LITERAL amount strictly below the width (*\"a bit-shift in a spec requires a \
+             literal shift amount\"*, *\"shift amount 64 is out of range\"*), so there is \
+             nothing for the kernel to compare the emitted body against and the planner \
+             refuses up front (l7_p14). Serving it needs a side B that renders the amount \
+             modulo the width — a new producer, and so a `docs/TCB.md` row, rather than a row \
+             here. The out-of-range literal has a user-side fix today: write the reduced \
+             amount `k % N`, which is the same function",
         ),
         measured_by: &[
-            "landing7_selection_probes::l7_p7_xor_and_the_shifts_do_not_elaborate_at_a_uint_carrier",
+            "landing7_selection_probes::l7_p13_every_xor_and_shr_mutation_is_refused",
+            "landing7_selection_probes::l7_p14_the_planner_refuses_every_shift_amount_without_a_side_b",
+        ],
+    },
+    SelectionDemand {
+        head: "`HShiftLeft.hShiftLeft` (`a <<< 3`, `a <<< b`)",
+        carrier: CarrierClass::MachineUInt,
+        status: DemandStatus::Missing(
+            "ELABORATES since clean `bf31976f48`, and the gate admits the frozen producer's \
+             reading at EXACTLY ONE amount. Swept over every `k` in `0..N` at u8/u16/u32/u64 \
+             (l7_p7), `check_faithful` ADMITS `a <<< 1` against `UInt{N}.mul a (UInt{N}.ofNat \
+             2)` by definitional equality and refuses every other amount below the width, `0` \
+             included, with a completed `Disagreement` (never a resource rail); at `k >= N` \
+             and at a variable amount the producer mints nothing. The mechanism: side A \
+             unfolds to `Nat.shiftLeft (UInt{N}.toNat a) k`, which Clean computes one DOUBLING \
+             at a time (`Nat.shiftLeft x 2` is `x * 2 * 2` by `rfl`), while the frozen \
+             `elab_term` renders `a << k` as ONE multiplication by `2^k`; the two coincide at an \
+             open `x` only when there is one doubling (`Nat.shiftLeft x 1 = x * 2` is `rfl`; \
+             `= 2 * x`, `Nat.shiftLeft x 2 = x * 4` and `x * 1 = x` are not). CHOICE, by that \
+             measurement: no `uint.shl` row, and no row for the one amount either. The \
+             shift-amount rule `>>>` carries (a numeral below the width) would plan `N - 1` \
+             amounts the gate refuses, so a `k = 1` row would need a one-amount rule of its \
+             own — plus a `Shl` reader arm, a compiler arm and a witness — for a function the \
+             `uint.mul` row already emits as `a * 2` (measured ADMIT at every width, l7_p7). \
+             This ledger entry and l7_p7's pinned admitted set are the record instead; the \
+             tripwire fires if that set grows or shrinks. Serving `<<<` at every amount needs \
+             a side B that reflects `<<` through `Nat.shiftLeft` (or `UInt{N}.shiftLeft`) \
+             rather than through `mul`: a new producer with its own `docs/TCB.md` row, since \
+             the frozen one's rendering is exactly what cannot change. MIR's `Shl` is not the \
+             obstacle — it reduces the amount modulo the width exactly as Lean does",
+        ),
+        measured_by: &[
+            "landing7_selection_probes::l7_p7_the_gate_admits_the_left_shift_only_at_amount_one_and_nothing_plans_it",
         ],
     },
     // NEW in §6f landing 7, and MEASURED GREEN AT THE KERNEL, which is what
@@ -2155,12 +3142,12 @@ pub static DEMANDS: &[SelectionDemand] = &[
         carrier: CarrierClass::MachineUInt,
         status: DemandStatus::Missing(
             "the KERNEL half is green and measured (l8_p6): `if (a + 1) == 0` elaborates with \
-             `HAdd.hAdd` VERBATIM in the proposition and in the instance, exactly as the four \
-             raw operators do — there is no normal form here either. The blocker is a BLOCK \
+             `HAdd.hAdd` VERBATIM in the proposition and in the instance, exactly as the raw \
+             operators do — there is no normal form here either. The blocker is a BLOCK \
              BOUNDARY, and it is the sharpest instance of landing 7's realization split: \
              `+`/`-`/`*` realize a marker-authenticated `Call` TERMINATOR (their callees are \
-             `core::num::<impl u{N}>::wrapping_*` and nothing else), while `&`/`|`/`/`/`%` \
-             realize a bare statement. A call terminator SPLITS the entry block that the \
+             `core::num::<impl u{N}>::wrapping_*` and nothing else), while the raw operators \
+             (`&`/`|`/`^`/`/`/`%`/`>>`) realize a bare statement. A call terminator SPLITS the entry block that the \
              decision and its lift share, so a wrapping operand is a fifth skeleton in \
              `materialize` and a two-block entry for side B to read — not an operand \
              widening. Blocked on the same thing landing 7's mixed-tree entry is",

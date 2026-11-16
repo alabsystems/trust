@@ -1,13 +1,13 @@
-#![feature(box_patterns)]
+#![cfg_attr(bootstrap, feature(unwrap_infallible))]
+#![feature(deref_patterns)]
 #![feature(macro_metavar_expr)]
 #![feature(rustc_private)]
-#![feature(unwrap_infallible)]
 #![recursion_limit = "512"]
-#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::must_use_candidate)]
+#![expect(clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::must_use_candidate)]
 #![warn(
+    rust_2018_idioms,
     trivial_casts,
     trivial_numeric_casts,
-    rust_2018_idioms,
     unused_lifetimes,
     unused_qualifications,
     rustc::internal
@@ -17,6 +17,7 @@
 // (Currently there is no way to opt into sysroot crates without `extern crate`.)
 extern crate rustc_abi;
 extern crate rustc_ast;
+extern crate rustc_attr_ir;
 extern crate rustc_attr_parsing;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
@@ -39,12 +40,12 @@ extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_trait_selection;
 // Trust: `ast_utils`' Clean-island test builds a `rustc_ast::CleanIsland`, whose
-// `decls` field is a `ThinVec`. Only the `lib test` build names `thin_vec`, so
-// its absence here is invisible to an ordinary `x.py build` and surfaces only
-// under `x.py test src/tools/tippy` as `E0433: cannot find module or crate
-// `thin_vec``. Declared beside the sysroot crates for the same reason they are:
-// there is no way to opt into a sysroot crate without `extern crate`.
-extern crate thin_vec;
+// `decls` field is a `ThinVec`. It is reached through `rustc_data_structures`'
+// re-export (`pub use thin_vec`) rather than a bare `extern crate thin_vec`,
+// which is AMBIGUOUS (E0464) when the rustc-private tool sysroot carries two
+// `thin_vec` rmetas — the stage0 pack's and stage1's own, one crates.io version
+// (0.2.19) compiled twice. `rustc_data_structures` links exactly one, so the
+// re-export names it with no ambiguity and needs no `extern crate` of its own.
 
 pub mod ast_utils;
 #[deny(missing_docs)]
@@ -82,53 +83,53 @@ use core::mem;
 use core::ops::ControlFlow;
 use std::collections::hash_map::Entry;
 use std::iter::{once, repeat_n, zip};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
-use itertools::Itertools;
+use itertools::Itertools as _;
 use rustc_abi::Integer;
 use rustc_ast::ast::{self, LitKind, RangeLimits};
 use rustc_ast::{LitIntType, join_path_syms};
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_attr_ir::lang_items::LangItem::{OptionNone, OptionSome, ResultErr, ResultOk};
+use rustc_attr_ir::{CfgEntry, find_attr};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::indexmap;
 use rustc_data_structures::packed::Pu128;
 use rustc_data_structures::unhash::UnindexMap;
-use rustc_hir::LangItem::{OptionNone, OptionSome, ResultErr, ResultOk};
-use rustc_hir::attrs::CfgEntry;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId};
+use rustc_hir::def_id::{DefId, LocalDefId, LocalModId};
 use rustc_hir::definitions::{DefPath, DefPathData};
-use rustc_hir::hir_id::{HirIdMap, HirIdSet};
 use rustc_hir::intravisit::{Visitor, walk_expr};
 use rustc_hir::{
     self as hir, AnonConst, Arm, BindingMode, Block, BlockCheckMode, Body, ByRef, CRATE_HIR_ID, Closure, ConstArg,
     ConstArgKind, CoroutineDesugaring, CoroutineKind, CoroutineSource, Destination, Expr, ExprField, ExprKind,
-    FieldDef, FnDecl, FnRetTy, GenericArg, GenericArgs, HirId, Impl, ImplItem, ImplItemKind, Item, ItemKind, LangItem,
-    LetStmt, MatchSource, Mutability, Node, OwnerId, OwnerNode, Param, Pat, PatExpr, PatExprKind, PatKind, Path,
-    PathSegment, QPath, Stmt, StmtKind, TraitFn, TraitItem, TraitItemKind, TraitRef, TyKind, UnOp, Variant, def,
-    find_attr,
+    FieldDef, FnDecl, FnRetTy, GenericArg, GenericArgs, HirId, HirIdMap, HirIdSet, Impl, ImplItem, ImplItemKind, Item,
+    ItemKind, LetStmt, MatchSource, Mutability, Node, OwnerId, OwnerNode, Param, Pat, PatExpr, PatExprKind, PatKind,
+    Path, PathSegment, QPath, Stmt, StmtKind, TraitFn, TraitItem, TraitItemKind, TraitRef, TyKind, UnOp, Variant, def,
 };
 use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
-use rustc_lint::{LateContext, Level, Lint, LintContext};
+use rustc_lint::{LateContext, Level, Lint, LintContext as _};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::hir::place::PlaceBase;
 use rustc_middle::mir::{AggregateKind, Operand, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, AutoBorrow, DerefAdjustKind, PointerCoercion};
-use rustc_middle::ty::layout::IntegerExt;
+use rustc_middle::ty::layout::IntegerExt as _;
 use rustc_middle::ty::{
-    self as rustc_ty, Binder, BorrowKind, ClosureKind, EarlyBinder, GenericArgKind, GenericArgsRef, IntTy, Ty, TyCtxt,
-    TypeFlags, TypeVisitableExt, TypeckResults, UintTy, UpvarCapture,
+    self as rustc_ty, Binder, BorrowKind, ClosureKind, EarlyBinder, GenericArgKind, IntTy, Ty, TyCtxt, TypeFlags,
+    TypeVisitableExt as _, TypeckResults, UintTy, UpvarCapture,
 };
+use rustc_session::config::Input;
 use rustc_span::hygiene::{ExpnKind, MacroKind};
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{Ident, Symbol, kw};
 use rustc_span::{InnerSpan, Span, SyntaxContext};
-use source::{SpanExt, walk_span_to_context};
+use source::{SpanExt as _, walk_span_to_context};
 use visitors::{Visitable, for_each_unconsumed_temporary};
 
 use crate::ast_utils::unordered_over;
 use crate::higher::Range;
 use crate::msrvs::Msrv;
-use crate::res::{MaybeDef, MaybeQPath, MaybeResPath};
+use crate::res::{MaybeDef as _, MaybeResPath as _};
 use crate::source::HasSourceMap;
 use crate::ty::{adt_and_variant_of_res, can_partially_move_ty, expr_sig, is_copy, is_recursively_primitive_type};
 use crate::visitors::for_each_expr_without_closures;
@@ -141,12 +142,12 @@ macro_rules! extract_msrv_attr {
     () => {
         fn check_attributes(&mut self, cx: &rustc_lint::EarlyContext<'_>, attrs: &[rustc_ast::ast::Attribute]) {
             let sess = rustc_lint::LintContext::sess(cx);
-            self.msrv.check_attributes(sess, attrs);
+            self.msrv.check_attributes(attrs);
         }
 
         fn check_attributes_post(&mut self, cx: &rustc_lint::EarlyContext<'_>, attrs: &[rustc_ast::ast::Attribute]) {
             let sess = rustc_lint::LintContext::sess(cx);
-            self.msrv.check_attributes_post(sess, attrs);
+            self.msrv.check_attributes_post(attrs);
         }
     };
 }
@@ -306,13 +307,13 @@ pub fn is_lang_item_or_ctor(cx: &LateContext<'_>, did: DefId, item: LangItem) ->
 
 /// Checks is `expr` is `None`
 pub fn is_none_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
-    expr.res(cx).ctor_parent(cx).is_lang_item(cx, OptionNone)
+    expr.basic_res().ctor_parent(cx).is_lang_item(cx, OptionNone)
 }
 
 /// If `expr` is `Some(inner)`, returns `inner`
 pub fn as_some_expr<'tcx>(cx: &LateContext<'_>, expr: &'tcx Expr<'tcx>) -> Option<&'tcx Expr<'tcx>> {
     if let ExprKind::Call(e, [arg]) = expr.kind
-        && e.res(cx).ctor_parent(cx).is_lang_item(cx, OptionSome)
+        && e.basic_res().ctor_parent(cx).is_lang_item(cx, OptionSome)
     {
         Some(arg)
     } else {
@@ -357,8 +358,8 @@ pub fn is_wild(pat: &Pat<'_>) -> bool {
 
 /// If `pat` is:
 /// - `Some(inner)`, returns `inner`
-///    - it will _usually_ contain just one element, but could have two, given patterns like
-///      `Some(inner, ..)` or `Some(.., inner)`
+///    - it will _usually_ contain just one element, but could have two, given patterns like `Some(inner, ..)` or
+///      `Some(.., inner)`
 /// - `Some`, returns `[]`
 /// - otherwise, returns `None`
 pub fn as_some_pattern<'a, 'hir>(cx: &LateContext<'_>, pat: &'a Pat<'hir>) -> Option<&'a [Pat<'hir>]> {
@@ -1337,10 +1338,10 @@ pub fn is_else_clause_in_let_else(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> bool {
 
 /// Checks whether the given `Expr` is a range over the entire container.
 pub fn is_full_collection_range(cx: &LateContext<'_>, container: Option<HirId>, expr: &Expr<'_>) -> bool {
-    if let Some(Range { start, end, limits, .. }) = Range::hir(cx, expr) {
+    if let Some(Range { start, end, ty, .. }) = Range::hir(cx, expr) {
         start.is_none_or(|start| is_integer_literal(start, 0))
             && end.is_none_or(|end| {
-                if limits == RangeLimits::HalfOpen
+                if ty.limits() == RangeLimits::HalfOpen
                     && let Some(container) = container
                     && let ExprKind::MethodCall(seg, recv, [], _) = end.kind
                 {
@@ -1496,7 +1497,7 @@ pub fn is_refutable(cx: &LateContext<'_>, pat: &Pat<'_>) -> bool {
         PatKind::Missing => unreachable!(),
         PatKind::Wild | PatKind::Never => false, // If `!` typechecked then the type is empty, so not refutable.
         PatKind::Binding(_, _, _, pat) => pat.is_some_and(|pat| is_refutable(cx, pat)),
-        PatKind::Box(pat) | PatKind::Ref(pat, _, _) => is_refutable(cx, pat),
+        PatKind::Ref(pat, _, _) => is_refutable(cx, pat),
         PatKind::Expr(PatExpr {
             kind: PatExprKind::Path(qpath),
             hir_id,
@@ -1677,26 +1678,8 @@ pub fn clip(tcx: TyCtxt<'_>, u: u128, ity: UintTy) -> u128 {
     (u << amt) >> amt
 }
 
-pub fn has_attr(attrs: &[hir::Attribute], symbol: Symbol) -> bool {
-    attrs.iter().any(|attr| attr.has_name(symbol))
-}
-
 pub fn has_repr_attr(cx: &LateContext<'_>, hir_id: HirId) -> bool {
     find_attr!(cx.tcx, hir_id, Repr { .. })
-}
-
-pub fn any_parent_has_attr(tcx: TyCtxt<'_>, node: HirId, symbol: Symbol) -> bool {
-    let mut prev_enclosing_node = None;
-    let mut enclosing_node = node;
-    while Some(enclosing_node) != prev_enclosing_node {
-        if has_attr(tcx.hir_attrs(enclosing_node), symbol) {
-            return true;
-        }
-        prev_enclosing_node = Some(enclosing_node);
-        enclosing_node = tcx.hir_get_parent_item(enclosing_node).into();
-    }
-
-    false
 }
 
 /// Checks if the given HIR node is inside an `impl` block with the `automatically_derived`
@@ -1707,10 +1690,16 @@ pub fn in_automatically_derived(tcx: TyCtxt<'_>, id: HirId) -> bool {
         .any(|(id, _)| find_attr!(tcx, id.def_id, AutomaticallyDerived))
 }
 
+/// Functions marked with these attributes must have an exact signature.
+pub fn requires_exact_signature(attrs: &[rustc_attr_ir::Attribute]) -> bool {
+    find_attr!(attrs, ProcMacro | ProcMacroAttribute | ProcMacroDerive { .. })
+}
+
 /// Checks if the given `DefId` matches the `libc` item.
 pub fn match_libc_symbol(cx: &LateContext<'_>, did: DefId, name: Symbol) -> bool {
-    // libc is meant to be used as a flat list of names, but they're all actually defined in different
-    // modules based on the target platform. Ignore everything but crate name and the item name.
+    // libc is meant to be used as a flat list of names, but they're all actually defined in
+    // different modules based on the target platform. Ignore everything but crate name and the
+    // item name.
     cx.tcx.crate_name(did.krate) == sym::libc && cx.tcx.def_path_str(did).ends_with(name.as_str())
 }
 
@@ -1774,7 +1763,7 @@ pub fn get_async_closure_expr<'tcx>(tcx: TyCtxt<'tcx>, expr: &Expr<'_>) -> Optio
 
 /// Peels away all the compiler generated code surrounding the body of an async function,
 pub fn get_async_fn_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'_>) -> Option<&'tcx Expr<'tcx>> {
-    get_async_closure_expr(tcx, body.value)
+    get_async_closure_expr(tcx, &body.value)
 }
 
 // check if expr is calling method or function with #[must_use] attribute
@@ -1837,7 +1826,8 @@ fn is_body_identity_function<'hir>(cx: &LateContext<'_>, func: &Body<'hir>) -> b
         true
     };
 
-    let mut expr = func.value;
+    // Trust: coerce both the inline and arena-backed Body.value representations.
+    let mut expr: &Expr<'_> = &func.value;
     loop {
         match expr.kind {
             ExprKind::Block(
@@ -2099,15 +2089,15 @@ pub fn is_trait_impl_item(cx: &LateContext<'_>, hir_id: HirId) -> bool {
 ///     for _ in 2i32 {}
 /// }
 /// ```
-pub fn fn_has_unsatisfiable_preds(cx: &LateContext<'_>, did: DefId) -> bool {
+pub fn fn_has_unsatisfiable_clauses(cx: &LateContext<'_>, did: DefId) -> bool {
     use rustc_trait_selection::traits;
-    let predicates = cx
+    let clauses = cx
         .tcx
-        .predicates_of(did)
-        .predicates
+        .clauses_of(did)
+        .clauses
         .iter()
         .filter_map(|(p, _)| if p.is_global() { Some(*p) } else { None });
-    traits::impossible_predicates(cx.tcx, traits::elaborate(cx.tcx, predicates).collect::<Vec<_>>())
+    traits::impossible_clauses(cx.tcx, traits::elaborate(cx.tcx, clauses).collect::<Vec<_>>())
 }
 
 /// Returns the `DefId` of the callee if the given expression is a function or method call.
@@ -2120,7 +2110,7 @@ pub fn fn_def_id(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<DefId> {
 pub fn fn_def_id_with_node_args<'tcx>(
     cx: &LateContext<'tcx>,
     expr: &Expr<'_>,
-) -> Option<(DefId, GenericArgsRef<'tcx>)> {
+) -> Option<(DefId, rustc_ty::GenericArgs<'tcx>)> {
     let typeck = cx.typeck_results();
     match &expr.kind {
         ExprKind::MethodCall(..) => Some((
@@ -2298,8 +2288,8 @@ pub fn peel_hir_ty_refs<'a>(mut ty: &'a hir::Ty<'a>) -> (&'a hir::Ty<'a>, usize)
     let mut count = 0;
     loop {
         match &ty.kind {
-            TyKind::Ref(_, ref_ty) => {
-                ty = ref_ty.ty;
+            TyKind::Ref(_, inner_ty, _) => {
+                ty = inner_ty;
                 count += 1;
             },
             _ => break (ty, count),
@@ -2310,7 +2300,7 @@ pub fn peel_hir_ty_refs<'a>(mut ty: &'a hir::Ty<'a>) -> (&'a hir::Ty<'a>, usize)
 /// Returns the base type for HIR references and pointers.
 pub fn peel_hir_ty_refs_and_ptrs<'tcx>(ty: &'tcx hir::Ty<'tcx>) -> &'tcx hir::Ty<'tcx> {
     match &ty.kind {
-        TyKind::Ptr(mut_ty) | TyKind::Ref(_, mut_ty) => peel_hir_ty_refs_and_ptrs(mut_ty.ty),
+        TyKind::Ptr(inner_ty, _) | TyKind::Ref(_, inner_ty, _) => peel_hir_ty_refs_and_ptrs(inner_ty),
         _ => ty,
     }
 }
@@ -2350,27 +2340,26 @@ pub fn is_hir_ty_cfg_dependant(cx: &LateContext<'_>, ty: &hir::Ty<'_>) -> bool {
     if let TyKind::Path(QPath::Resolved(_, path)) = ty.kind
         && let Res::Def(_, def_id) = path.res
     {
-        return find_attr!(cx.tcx, def_id, CfgTrace(..) | CfgAttrTrace);
+        return find_attr!(cx.tcx, def_id, CfgTrace(..) | CfgAttrTrace(..));
     }
     false
 }
 
-static TEST_ITEM_NAMES_CACHE: OnceLock<Mutex<FxHashMap<LocalModDefId, Vec<Symbol>>>> = OnceLock::new();
+static TEST_ITEM_NAMES_CACHE: OnceLock<Mutex<FxHashMap<LocalModId, Vec<Symbol>>>> = OnceLock::new();
 
-/// Apply `f()` to the set of test item names.
+/// Returns the names of the test items in the given module.
 /// The names are sorted using the default `Symbol` ordering.
-fn with_test_item_names(tcx: TyCtxt<'_>, module: LocalModDefId, f: impl FnOnce(&[Symbol]) -> bool) -> bool {
+fn test_item_names(tcx: TyCtxt<'_>, module: LocalModId) -> Vec<Symbol> {
     let cache = TEST_ITEM_NAMES_CACHE.get_or_init(|| Mutex::new(FxHashMap::default()));
-    let mut map: MutexGuard<'_, FxHashMap<LocalModDefId, Vec<Symbol>>> = cache.lock().unwrap();
-    let value = map.entry(module);
-    match value {
-        Entry::Occupied(entry) => f(entry.get()),
+    let mut map = cache.lock().unwrap();
+    match map.entry(module) {
+        Entry::Occupied(entry) => entry.get().clone(),
         Entry::Vacant(entry) => {
             let mut names = Vec::new();
             for id in tcx.hir_module_free_items(module) {
-                if matches!(tcx.def_kind(id.owner_id), DefKind::Const { .. })
+                if matches!(tcx.def_kind(id.owner_id), DefKind::Static { .. })
                     && let item = tcx.hir_item(id)
-                    && let ItemKind::Const(ident, _generics, ty, _body) = item.kind
+                    && let ItemKind::Static(_mut, ident, ty, _body) = item.kind
                     && let TyKind::Path(QPath::Resolved(_, path)) = ty.kind
                     // We could also check for the type name `test::TestDescAndFn`
                     && let Res::Def(DefKind::Struct, _) = path.res
@@ -2380,7 +2369,7 @@ fn with_test_item_names(tcx: TyCtxt<'_>, module: LocalModDefId, f: impl FnOnce(&
                 }
             }
             names.sort_unstable();
-            f(entry.insert(names))
+            entry.insert(names).clone()
         },
     }
 }
@@ -2389,23 +2378,25 @@ fn with_test_item_names(tcx: TyCtxt<'_>, module: LocalModDefId, f: impl FnOnce(&
 ///
 /// Note: Add `//@compile-flags: --test` to UI tests with a `#[test]` function
 pub fn is_in_test_function(tcx: TyCtxt<'_>, id: HirId) -> bool {
-    with_test_item_names(tcx, tcx.parent_module(id), |names| {
-        let node = tcx.hir_node(id);
-        once((id, node))
-            .chain(tcx.hir_parent_iter(id))
-            // Since you can nest functions we need to collect all until we leave
-            // function scope
-            .any(|(_id, node)| {
-                if let Node::Item(item) = node
-                    && let ItemKind::Fn { ident, .. } = item.kind
-                {
-                    // Note that we have sorted the item names in the visitor,
-                    // so the binary_search gets the same as `contains`, but faster.
-                    return names.binary_search(&ident.name).is_ok();
-                }
-                false
-            })
-    })
+    let names = test_item_names(tcx, tcx.parent_module(id));
+    // Without `--test` there are no test items, so the parent walk can never match.
+    if names.is_empty() {
+        return false;
+    }
+    once((id, tcx.hir_node(id)))
+        .chain(tcx.hir_parent_iter(id))
+        // Since you can nest functions we need to collect all until we leave
+        // function scope
+        .any(|(_id, node)| {
+            if let Node::Item(item) = node
+                && let ItemKind::Fn { ident, .. } = item.kind
+            {
+                // Note that we have sorted the item names in the visitor,
+                // so the binary_search gets the same as `contains`, but faster.
+                return names.binary_search(&ident.name).is_ok();
+            }
+            false
+        })
 }
 
 /// Checks if `fn_def_id` has a `#[test]` attribute applied
@@ -2419,9 +2410,9 @@ pub fn is_test_function(tcx: TyCtxt<'_>, fn_def_id: LocalDefId) -> bool {
     if let Node::Item(item) = tcx.hir_node(id)
         && let ItemKind::Fn { ident, .. } = item.kind
     {
-        with_test_item_names(tcx, tcx.parent_module(id), |names| {
-            names.binary_search(&ident.name).is_ok()
-        })
+        test_item_names(tcx, tcx.parent_module(id))
+            .binary_search(&ident.name)
+            .is_ok()
     } else {
         false
     }
@@ -2450,7 +2441,18 @@ pub fn is_in_cfg_test(tcx: TyCtxt<'_>, id: HirId) -> bool {
 
 /// Checks if the node is in a `#[test]` function or has any parent node marked `#[cfg(test)]`
 pub fn is_in_test(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
-    is_in_test_function(tcx, hir_id) || is_in_cfg_test(tcx, hir_id)
+    is_in_test_function(tcx, hir_id) || is_in_cfg_test(tcx, hir_id) || is_in_integration_test_file(tcx)
+}
+
+/// Check if the node is in an integration test file (i.e. under `tests/`).
+fn is_in_integration_test_file(tcx: TyCtxt<'_>) -> bool {
+    if let Input::File(ref path) = tcx.sess.io.input
+        && !tcx.sess.opts.unstable_opts.ui_testing
+    {
+        path.starts_with("tests")
+    } else {
+        false
+    }
 }
 
 /// Checks if the item of any of its parents has `#[cfg(...)]` attribute applied.
@@ -2794,7 +2796,11 @@ pub fn expr_use_sites<'tcx>(
                 | Node::TraitRef(_)
                 | Node::Ty(_)
                 | Node::TyPat(_)
-                | Node::WherePredicate(_) => {
+                | Node::NestedUseTree(_)
+                | Node::WherePredicate(_)
+                | Node::TestBinderForall(_)
+                | Node::TestBinderExists(_)
+                | Node::TestBinderBoundTypeConstraint(_) => {
                     // This shouldn't be possible to hit; the inner iterator should have
                     // been moved to the end before we hit any of these nodes.
                     debug_assert!(false, "found {parent:?} which is after the final use node");
@@ -3141,7 +3147,8 @@ pub fn is_never_expr<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> Option<
                                 let in_final_expr = mem::replace(&mut self.in_final_expr, false);
                                 self.visit_expr(guard);
                                 self.in_final_expr = in_final_expr;
-                                // The compiler doesn't consider diverging guards as causing the arm to diverge.
+                                // The compiler doesn't consider diverging guards as causing the arm
+                                // to diverge.
                                 self.is_never = false;
                             }
                             self.visit_expr(arm.body);
@@ -3241,7 +3248,7 @@ pub fn get_path_from_caller_to_method_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     from: LocalDefId,
     method: DefId,
-    args: GenericArgsRef<'tcx>,
+    args: rustc_ty::GenericArgs<'tcx>,
 ) -> String {
     let assoc_item = tcx.associated_item(method);
     let def_id = assoc_item.container_id(tcx);
@@ -3254,7 +3261,12 @@ pub fn get_path_from_caller_to_method_type<'tcx>(
     }
 }
 
-fn get_path_to_ty<'tcx>(tcx: TyCtxt<'tcx>, from: LocalDefId, ty: Ty<'tcx>, args: GenericArgsRef<'tcx>) -> String {
+fn get_path_to_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    from: LocalDefId,
+    ty: Ty<'tcx>,
+    args: rustc_ty::GenericArgs<'tcx>,
+) -> String {
     match ty.kind() {
         rustc_ty::Adt(adt, _) => get_path_to_callee(tcx, from, adt.did()),
         // TODO these types need to be recursively resolved as well
@@ -3264,7 +3276,10 @@ fn get_path_to_ty<'tcx>(tcx: TyCtxt<'tcx>, from: LocalDefId, ty: Ty<'tcx>, args:
         | rustc_ty::RawPtr(_, _)
         | rustc_ty::Ref(..)
         | rustc_ty::Slice(_)
-        | rustc_ty::Tuple(_) => format!("<{}>", EarlyBinder::bind(tcx, ty).instantiate(tcx, args).skip_norm_wip()),
+        | rustc_ty::Tuple(_) => format!(
+            "<{}>",
+            EarlyBinder::bind(tcx, ty).instantiate(tcx, args).skip_norm_wip()
+        ),
         _ => ty.to_string(),
     }
 }
@@ -3419,6 +3434,19 @@ pub fn leaks_droppable_temporary_with_limited_lifetime<'tcx>(cx: &LateContext<'t
     .is_break()
 }
 
+/// Returns true if `expr` creates any temporary that has a significant drop and does not consume
+/// it.
+pub fn leaks_droppable_temporary<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> bool {
+    for_each_unconsumed_temporary(cx, expr, |temporary_ty| {
+        if temporary_ty.has_significant_drop(cx.tcx, cx.typing_env()) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
+}
+
 /// Returns true if the specified `expr` requires coercion,
 /// meaning that it either has a coercion or propagates a coercion from one of its sub expressions.
 ///
@@ -3479,7 +3507,7 @@ pub fn expr_requires_coercion<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -
                 v_def
                     .fields
                     .iter()
-                    .any(|field| field.ty(cx.tcx, generic_args).has_type_flags(TypeFlags::HAS_TY_PARAM))
+                    .any(|field| field.ty(cx.tcx, *generic_args).has_type_flags(TypeFlags::HAS_TY_PARAM))
             } else {
                 false
             }
@@ -3583,8 +3611,7 @@ pub fn is_expr_default<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> 
 /// - `return expr`
 /// - then or else part of a `if` in return position
 /// - arm body of a `match` in a return position
-/// - `break expr` or `break 'label expr` if the loop or block being exited is used as a return
-///   value
+/// - `break expr` or `break 'label expr` if the loop or block being exited is used as a return value
 ///
 /// Contrary to [`TyCtxt::hir_get_fn_id_for_return_block()`], if `expr` is part of a
 /// larger expression, for example a field expression of a `struct`, it will not be

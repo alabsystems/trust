@@ -1,5 +1,5 @@
 [package]
-name = "no_warn"
+name = "no-warn"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -7,3 +7,6 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+
+# Trust: this standalone UI fixture owns its workspace, independently of Tippy.
+[workspace]

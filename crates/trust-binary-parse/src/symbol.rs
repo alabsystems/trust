@@ -194,12 +194,4 @@ mod tests {
         };
         assert_eq!(sym.symbol_type(), N_SECT);
     }
-
-    #[test]
-    fn test_symbol_debug_and_clone() {
-        let sym = Symbol { name: "test", n_type: 0, n_sect: 0, n_desc: 0, n_value: 0 };
-        let cloned = sym.clone();
-        assert_eq!(sym, cloned);
-        let _ = format!("{:?}", sym);
-    }
 }

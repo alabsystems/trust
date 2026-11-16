@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // INVALID-cluster root 2 (full-population frontier, wave-full-0831): a
 // NICHE tag encoding whose untagged variant plus niche interval does NOT
 // cover every variant — an UNINHABITED variant (`V2 { f: Infallible }`)

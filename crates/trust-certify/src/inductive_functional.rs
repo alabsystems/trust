@@ -210,7 +210,8 @@ fn build_nat_eq_env() -> Option<Environment> {
 /// Full kernel re-check (`infer_only = false`) that `term : goal` in the empty
 /// closed context.
 fn kernel_checks_goal(env: &Environment, term: &Expr, goal: &Expr) -> bool {
-    TypeChecker::with_context(env, LocalContext::new()).check_type(term, goal).is_ok()
+    crate::kernel_stop::check_type(TypeChecker::with_context(env, LocalContext::new()), term, goal)
+        .is_ok()
 }
 
 /// SHA-256 lineage digest binding the term, the empty closed context, and the

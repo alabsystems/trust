@@ -85,9 +85,8 @@ const INT_SUFFIXES: &[(&str, u32, bool)] = &[
 ];
 
 /// Every suffix, as one comma-separated list for a diagnostic.
-fn suffix_menu() -> String {
-    INT_SUFFIXES.iter().map(|(name, _, _)| format!("`{name}`")).collect::<Vec<_>>().join(", ")
-}
+const SUFFIX_MENU: &str =
+    "`u8`, `u16`, `u32`, `u64`, `u128`, `usize`, `i8`, `i16`, `i32`, `i64`, `i128`, `isize`";
 
 /// The character run that a digit-led literal token occupies at the start of
 /// `rest`, in bytes.
@@ -152,12 +151,30 @@ pub fn read_contract_int_literal(spelling: &str) -> Result<u128, IntLiteralRefus
         (10u32, "decimal", "", spelling)
     };
 
-    let digits_end =
-        body.find(|ch: char| !ch.is_digit(radix) && ch != '_').unwrap_or(body.len());
+    let digits_end = body.find(|ch: char| !ch.is_digit(radix) && ch != '_').unwrap_or(body.len());
     let (digits, suffix) = body.split_at(digits_end);
-    let cleaned: String = digits.chars().filter(|ch| *ch != '_').collect();
+    let mut has_digit = false;
+    let mut overflow = false;
+    let mut value = 0u128;
+    for ch in digits.chars() {
+        if ch == '_' {
+            continue;
+        }
+        has_digit = true;
+        if !overflow {
+            if let Some(digit) = ch.to_digit(radix)
+                && let Some(next) = value
+                    .checked_mul(u128::from(radix))
+                    .and_then(|v| v.checked_add(u128::from(digit)))
+            {
+                value = next;
+            } else {
+                overflow = true;
+            }
+        }
+    }
 
-    if cleaned.is_empty() {
+    if !has_digit {
         // `0x`, `0b_`, and — the case worth naming — `0b2`, whose `2` is not a
         // binary digit and is therefore read as the start of a suffix.
         return Err(refuse(
@@ -173,7 +190,7 @@ pub fn read_contract_int_literal(spelling: &str) -> Result<u128, IntLiteralRefus
         ));
     }
 
-    let Ok(value) = u128::from_str_radix(&cleaned, radix) else {
+    if overflow {
         // Every character is a valid digit for the radix, so the only way this
         // parses badly is overflow.
         return Err(refuse(
@@ -182,18 +199,15 @@ pub fn read_contract_int_literal(spelling: &str) -> Result<u128, IntLiteralRefus
              the largest integer a contract formula can carry"
                 .to_string(),
         ));
-    };
+    }
 
     if !suffix.is_empty() {
-        let Some(&(_, width, signed)) =
-            INT_SUFFIXES.iter().find(|(name, _, _)| *name == suffix)
+        let Some(&(_, width, signed)) = INT_SUFFIXES.iter().find(|(name, _, _)| *name == suffix)
         else {
+            let cleaned: String = digits.chars().filter(|ch| *ch != '_').collect();
             return Err(refuse(
                 format!("`{suffix}` is not a Rust integer type suffix"),
-                format!(
-                    "drop the suffix and write `{cleaned}`, or use one of {}",
-                    suffix_menu()
-                ),
+                format!("drop the suffix and write `{cleaned}`, or use one of {SUFFIX_MENU}"),
             ));
         };
         // A signed suffix admits the magnitude of its own MINIMUM, because
@@ -205,6 +219,7 @@ pub fn read_contract_int_literal(spelling: &str) -> Result<u128, IntLiteralRefus
             (true, _) => 1u128 << (width - 1),
         };
         if value > limit {
+            let cleaned: String = digits.chars().filter(|ch| *ch != '_').collect();
             return Err(refuse(
                 format!("{cleaned} does not fit in `{suffix}`"),
                 format!(

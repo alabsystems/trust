@@ -50,5 +50,13 @@ fn main() {
 }
 RS
 
-"$TRUSTC" -O "$TMP/diff.rs" -o "$TMP/diff" 2>/dev/null
+# The sample program is this ORACLE's subject, not a verification subject:
+# `add`, `poly` and `idiv` admit overflow and division by zero on unconstrained
+# inputs, which the driver's shipping default (verification on, strict)
+# refuses. Measured 2026-09-29 with stage-2 trustc 71c7af9782: "Trust strict
+# verification failed for `diff::add`" (and poly, abs, idiv), and the row exited
+# 1 with no output at all, because stderr went to /dev/null. So verification is
+# turned off explicitly here, and stderr passes through so any failure names its
+# cause.
+"$TRUSTC" -Ztrust-verify=off -O "$TMP/diff.rs" -o "$TMP/diff"
 "$TMP/diff"

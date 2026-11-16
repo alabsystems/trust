@@ -67,7 +67,7 @@
           "checked-certificate-missing"
         ],
         "certificate_status": "present",
-        "checker": "ay-incremental",
+        "checker": "ay-in-process",
         "diagnostic": "raw solver proof bytes are audit-only evidence: 9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a",
         "dispatch_id": "raw-export-run:vc0",
         "error_kind": "raw_solver_bytes_audit_only",
@@ -102,7 +102,7 @@
     "proof_export_candidates": 0,
     "proof_export_records": [
       {
-        "backend": "ay-incremental",
+        "backend": "ay-in-process",
         "blocker_codes": [
           "raw-solver-proof-bytes-audit-only",
           "normalized-proof-export-missing",
@@ -117,9 +117,9 @@
           "byte_len": 4,
           "format": "solver-native",
           "sha256": "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a",
-          "solver": "ay-incremental"
+          "solver": "ay-in-process"
         },
-        "solver": "ay-incremental",
+        "solver": "ay-in-process",
         "status": "blocked_raw_solver_bytes",
         "vc_sha256": "d2515b3f23c3a1f4796b4586cc98ca0d1c836d9257f36e563ca18364b1ae5b89"
       }

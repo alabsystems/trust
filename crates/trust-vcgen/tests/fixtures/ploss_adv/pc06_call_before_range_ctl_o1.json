@@ -1,0 +1,532 @@
+{
+  "name": "pc06_call_before_range_ctl",
+  "def_path": "adv::pc06_call_before_range_ctl",
+  "span": {
+    "file": "ploss_adv/h1_ctl.rs",
+    "line_start": 65,
+    "col_start": 0,
+    "line_end": 71,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "adv::St",
+                "fields": [
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 8
+              }
+            }
+          }
+        },
+        "name": "buf"
+      },
+      {
+        "index": 3,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeTo",
+            "fields": [
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "adv::bump",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "ploss_adv/h1_ctl.rs",
+              "line_start": 66,
+              "col_start": 4,
+              "line_end": 66,
+              "col_end": 11
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 8126453274690832671,
+              "def_index": 5,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 8126453274690832671,
+              "krate_name": "adv"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageLive": 4
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "ploss_adv/h1_ctl.rs",
+                "line_start": 67,
+                "col_start": 7,
+                "line_end": 67,
+                "col_end": 12
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h1_ctl.rs",
+                "line_start": 67,
+                "col_start": 7,
+                "line_end": 67,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "ploss_adv/h1_ctl.rs",
+              "line_start": 67,
+              "col_start": 7,
+              "line_end": 67,
+              "col_end": 16
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageDead": 5
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "ploss_adv/h1_ctl.rs",
+                "line_start": 68,
+                "col_start": 15,
+                "line_end": 68,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "StorageDead": 4
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "StorageLive": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "ploss_adv/h1_ctl.rs",
+                "line_start": 70,
+                "col_start": 10,
+                "line_end": 70,
+                "col_end": 15
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeTo",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeTo<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 8,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h1_ctl.rs",
+                "line_start": 70,
+                "col_start": 8,
+                "line_end": 70,
+                "col_end": 15
+              }
+            }
+          },
+          {
+            "StorageDead": 8
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8; 8] as core::ops::index::Index<core::ops::range::RangeTo<usize>>>::index",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "ploss_adv/h1_ctl.rs",
+              "line_start": 70,
+              "col_start": 7,
+              "line_end": 70,
+              "col_end": 16
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 6692626837626329215,
+              "def_index": 39107,
+              "substs_digest": [
+                9135718132710448062,
+                7109598278395302274
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 6692626837626329215,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "StorageDead": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h1_ctl.rs",
+                "line_start": 70,
+                "col_start": 4,
+                "line_end": 70,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "StorageDead": 6
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

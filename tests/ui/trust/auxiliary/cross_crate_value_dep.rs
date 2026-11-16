@@ -8,17 +8,19 @@
 //!
 //! The postcondition-REUSE lane forces `trust_proof_results` on the callee,
 //! which makes the foreign body a verification SUBJECT of this compilation.
-//! That is only admitted for a declared crate in a `TrustOwned*` bucket: an
-//! `ExternalDep` bucket has `unsupported_is_failure() == false`, so a
-//! capability gap in the callee would be recorded as an ASSUMPTION row instead
-//! of a failure — the wrong direction for a body whose verdict is about to
-//! grant assumption authority to a caller. `classify_crate` reads the crate
-//! NAME (the module compiles into the sysroot, where paths are stripped), and
-//! `xcbundle_dep` is not a `trust_*` name.
+//! When this aux was written that was admitted only for a declared crate in a
+//! `TrustOwned*` bucket, on the reasoning that an `ExternalDep` bucket's
+//! `unsupported_is_failure() == false` would record a gap as an ASSUMPTION row.
+//! That method has no compiler caller, and D4 increment A (2026-09-24) widened
+//! the declared scope to `ExternalDep` (`foreign_rederivation::
+//! declared_scope_bucket_is_rederivable`). `classify_crate` reads the crate
+//! NAME, and `xcbundle_dep` is not a `trust_*` name.
 //!
-//! Keeping BOTH crates is what makes the bucket conjunct measurable: the
-//! `xcbundle_dep` arms and these arms differ in exactly that one classification,
-//! so the older arms are a live control for it rather than a duplicate.
+//! Keeping BOTH crates keeps the bucket conjunct measurable: the `xcbundle_dep`
+//! arms and these arms differ in exactly that one classification. Before D4-A
+//! the `xcbundle_dep` twin of `cross_crate_value_used.rs` was refused
+//! (`verdict:none`); `cross_crate_value_used_external_dep.rs` now pins that it
+//! passes, with the same refutation control.
 //!
 //! Everything else is deliberately identical to the sibling aux crate: compiled
 //! `-Ztrust-verify=off` exactly as `targo` compiles a dependency unit, so

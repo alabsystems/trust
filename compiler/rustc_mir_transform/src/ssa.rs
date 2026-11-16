@@ -9,12 +9,12 @@
 use rustc_data_structures::graph::dominators::Dominators;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_index::{IndexSlice, IndexVec};
-use rustc_middle::bug;
 use rustc_middle::middle::resolve_bound_vars::Set1;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_mir_dataflow::Analysis;
+use rustc_span::bug;
 use tracing::{debug, instrument, trace};
 
 pub(super) struct SsaLocals {
@@ -26,6 +26,8 @@ pub(super) struct SsaLocals {
     assignment_order: Vec<Local>,
     /// Copy equivalence classes between locals. See `copy_classes` for documentation.
     copy_classes: IndexVec<Local, Local>,
+    /// Whether any local in `copy_classes` is mapped to a different representative `head != local`.
+    has_copy_classes: bool,
     /// Number of "direct" uses of each local, i.e. uses that are not dereferences.
     /// We ignore non-uses (Storage statements, debuginfo).
     direct_uses: IndexVec<Local, u32>,
@@ -95,6 +97,7 @@ impl SsaLocals {
             borrowed_locals: visitor.borrowed_locals,
             // This is filled by `compute_copy_classes`.
             copy_classes: IndexVec::default(),
+            has_copy_classes: false,
         };
         compute_copy_classes(&mut ssa, body);
         ssa
@@ -165,6 +168,11 @@ impl SsaLocals {
         &self.copy_classes
     }
 
+    #[inline]
+    pub(super) fn has_copy_classes(&self) -> bool {
+        self.has_copy_classes
+    }
+
     /// Set of SSA locals that are immutably borrowed.
     pub(super) fn borrowed_locals(&self) -> &DenseBitSet<Local> {
         &self.borrowed_locals
@@ -172,6 +180,9 @@ impl SsaLocals {
 
     /// Make a property uniform on a copy equivalence class by removing elements.
     pub(super) fn meet_copy_equivalence(&self, property: &mut DenseBitSet<Local>) {
+        if !self.has_copy_classes {
+            return;
+        }
         // Consolidate to have a local iff all its copies are.
         //
         // `copy_classes` defines equivalence classes between locals. The `local`s that recursively
@@ -296,6 +307,7 @@ impl<'tcx> Visitor<'tcx> for SsaVisitor<'_, 'tcx> {
 fn compute_copy_classes(ssa: &mut SsaLocals, body: &Body<'_>) {
     let mut direct_uses = std::mem::take(&mut ssa.direct_uses);
     let mut copies = IndexVec::from_fn_n(|l| l, body.local_decls.len());
+    let mut has_copy_classes = false;
 
     for (local, rvalue, _) in ssa.assignments(body) {
         let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) = rvalue else {
@@ -340,8 +352,10 @@ fn compute_copy_classes(ssa: &mut SsaLocals, body: &Body<'_>) {
                     *h = RETURN_PLACE;
                 }
             }
+            has_copy_classes |= head != RETURN_PLACE;
         } else {
             copies[local] = head;
+            has_copy_classes |= head != local;
         }
         direct_uses[rhs] -= 1;
     }
@@ -358,6 +372,7 @@ fn compute_copy_classes(ssa: &mut SsaLocals, body: &Body<'_>) {
 
     ssa.direct_uses = direct_uses;
     ssa.copy_classes = copies;
+    ssa.has_copy_classes = has_copy_classes;
 }
 
 #[derive(Debug)]

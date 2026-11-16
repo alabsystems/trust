@@ -3,6 +3,8 @@ import argparse
 import contextlib
 import datetime
 import hashlib
+import importlib.util
+import json
 import os
 import re
 import shlex
@@ -15,6 +17,15 @@ import tempfile
 
 from time import time
 from multiprocessing import Pool, cpu_count
+
+# Trust: by-file imports and isolated Python cannot rely on sys.path containing
+# this directory. Load the pure extraction-identity owner beside this script.
+_identity_spec = importlib.util.spec_from_file_location(
+    "trust_stage0_identity", os.path.join(os.path.dirname(__file__), "stage0_identity.py")
+)
+_identity_owner = importlib.util.module_from_spec(_identity_spec)
+_identity_spec.loader.exec_module(_identity_owner)
+stage0_extraction_stamp = _identity_owner.extraction_stamp
 
 try:
     from urllib.parse import urlparse
@@ -31,6 +42,54 @@ except ImportError:
 
 def platform_is_win32():
     return sys.platform == "win32"
+
+
+# Trust: capability queries borrow the same native transport/custody owner as
+# the seed checker. No caller-selected executor or fabricated admission exists.
+def bootstrap_serial_owner():
+    library = os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "lib")
+    if library not in sys.path:
+        sys.path.insert(0, library)
+    import native_serial
+    return native_serial
+
+
+def bootstrap_capability_routes_through_serial_owner(env, serial):
+    """Whether a capability query borrows the managed serial owner.
+
+    Trust (BOOTSTRAP-SEED-PROBE-ADMISSION-1): `trust-serial-command` lends an
+    ALREADY-ADMITTED caller's one implicit execution and refuses every other
+    caller ("command requires an already-admitted caller", exit 75): it grants
+    no CPU or memory itself. Only a caller inside build-slot admission
+    (`BUILD_SLOT_HELD=1`, the exact marker the borrower checks) has an
+    execution to lend. Outside admission nothing in bootstrap borrows one:
+    this script runs its own Stage0 `targo build` of bootstrap directly, and
+    the Rust driver lends its own implicit execution to its compiler queries
+    (`metadata_scheduler`). So the query runs directly too, through the same
+    custody wait and with every advertised descriptor kept. The route is
+    chosen from the caller's admission before the query runs; it is never a
+    second attempt after a refused one. Routing an unadmitted caller through
+    the borrower made every plain `x.py` read that refusal as "could not
+    probe" and take the fallback policy.
+    """
+    return serial and sys.platform in ("linux", "darwin") and env.get("BUILD_SLOT_HELD") == "1"
+
+
+def bootstrap_capability_command(command, env, timeout, serial=False):
+    native_serial = bootstrap_serial_owner()
+    # Trust: the managed native transport exists only on Linux/macOS. Other
+    # supported bootstrap hosts retain their direct read-only query, never a
+    # fallback after managed admission failed. Windows cannot inherit POSIX FDs.
+    if platform_is_win32():
+        if native_serial.landing_targo.resource_fds(env):
+            raise RuntimeError("Windows capability query cannot inherit native POSIX custody")
+        result = subprocess.run(command, env=env, timeout=timeout, capture_output=True, text=True)
+    else:
+        if bootstrap_capability_routes_through_serial_owner(env, serial):
+            command = [str(native_serial.managed_serial_executor(env)), "--", *command]
+        result = native_serial.run_custodied_command(command, env=env, timeout=timeout)
+    return subprocess.CompletedProcess(result.args, result.returncode,
+                                       (result.stdout or "") + (result.stderr or ""))
 
 
 if platform_is_win32():
@@ -70,25 +129,9 @@ STAGE0_REQUIRED_LIBEXEC_BINS = (
 # their bare canonical names; unpack() matches on that dir, so the match must be bare
 # (a `-preview` match skips every member -> empty bin/). The CI-download path in
 # download.rs keeps `-preview` because it consumes raw x.py-produced tarballs.
-STAGE0_EXTRA_COMPONENTS = (
-    ("trustfmt", "trustfmt"),
-    ("tippy", "tippy"),
-    ("trust-analyzer", "trust-analyzer"),
-)
-# Existing checksum-pinned seeds predate the final Tippy component spelling.
-# Treat those names strictly as an admitted input format: after extraction the
-# legacy binaries are translated to the canonical surface and removed. New
-# producers must continue to emit only `tippy` / `tippy-preview`.
-STAGE0_LEGACY_EXTRA_COMPONENTS = {
-    "tippy": ("trust-clippy", "trust-clippy-preview"),
-}
-# The admitted 2026-06-23 seed predates the tcargo -> targo archive rename.
-# These are checksum-key aliases only, never network fallbacks or produced
-# names. Extracted public leaves are normalized before surface admission.
-STAGE0_LEGACY_TARGO_COMPONENTS = {
-    "targo": "tcargo",
-    "targo-trust": "tcargo-trust",
-}
+STAGE0_EXTRA_COMPONENTS = _identity_owner.STAGE0_EXTRA_COMPONENTS
+STAGE0_LEGACY_EXTRA_COMPONENTS = _identity_owner.STAGE0_LEGACY_EXTRA_COMPONENTS
+STAGE0_LEGACY_TARGO_COMPONENTS = _identity_owner.STAGE0_LEGACY_TARGO_COMPONENTS
 STAGE0_LEGACY_TARGO_BACKEND_DIR = "libexec"
 STAGE0_LEGACY_TIPPY_FRONTENDS = ("trust-clippy", "cargo-clippy", "targo-clippy")
 STAGE0_LEGACY_TIPPY_DRIVERS = ("trust-clippy-driver", "clippy-driver")
@@ -169,6 +212,30 @@ def get_cpus():
         return 1
 
 
+def bootstrap_jobs(configured_jobs, cli_jobs, env):
+    """Trust: keep the pre-driver Cargo build within an admitted CPU share.
+
+    Outside build-slot preserve the existing TOML/default Cargo argument. The
+    Rust driver owns CLI precedence; inside admission also respect a smaller
+    explicit CLI request while capping both phases by the same positive share.
+    """
+    if env.get("BUILD_SLOT_HELD") != "1":
+        return configured_jobs
+    share = env.get("CARGO_BUILD_JOBS", "")
+    if not re.fullmatch(r"[0-9]+", share) or not 0 < int(share) <= 0xFFFFFFFF:
+        raise RuntimeError(
+            "BUILD_SLOT_HELD=1 requires a positive u32 CARGO_BUILD_JOBS share"
+        )
+    requested = str(cli_jobs) if cli_jobs is not None else configured_jobs
+    if requested in ("default", "0"):
+        jobs = get_cpus()
+    elif re.fullmatch(r"[0-9]+", requested) and int(requested) <= 0xFFFFFFFF:
+        jobs = int(requested)
+    else:
+        raise RuntimeError("invalid bootstrap jobs within build-slot admission")
+    return str(min(jobs, int(share)))
+
+
 def eprint(*args, **kwargs):
     kwargs["file"] = sys.stderr
     print(*args, **kwargs)
@@ -213,13 +280,13 @@ def trust_seed_ledger_release(repo_root=None):
 
 
 def try_materialize_trust_seed_payload(
-    resolved_payload, sha256, verbose=0, gh=None, repo_root=None
+    resolved_payload, sha256, verbose=0, agh=None, repo_root=None
 ):
     """Fetch one missing checksum-pinned seed payload from the declared release.
 
     Trust: a fresh checkout tracks only the src/stage0 digest pins; the
     archive payloads live in the private GitHub release the seed ledger
-    declares. Riding the caller's authenticated `gh` keeps the transport out
+    declares. Riding the caller's authenticated `agh` keeps the transport out
     of the trust story: the download lands in a temp staging dir, is verified
     against the src/stage0 SHA-256 pin THERE, and only verified bytes are
     os.replace()d into the pinned path — so neither an interrupted transfer
@@ -243,10 +310,10 @@ def try_materialize_trust_seed_payload(
         return False
     repo, tag = release
     filename = os.path.basename(resolved)
-    gh = gh or shutil.which("gh")
-    if gh is None:
+    agh = agh or shutil.which("agh")
+    if agh is None:
         eprint(
-            "note: the seed ledger declares release {} on {}, but the `gh` CLI is "
+            "note: the seed ledger declares release {} on {}, but the `agh` CLI is "
             "not installed; cannot fetch the pinned stage0 seed payload".format(
                 tag, repo
             )
@@ -265,13 +332,12 @@ def try_materialize_trust_seed_payload(
         try:
             result = subprocess.run(
                 [
-                    gh,
+                    agh,
                     "release",
                     "download",
-                    tag,
-                    "--repo",
                     repo,
-                    "--pattern",
+                    tag,
+                    "--asset",
                     filename,
                     "--dir",
                     staging,
@@ -282,11 +348,11 @@ def try_materialize_trust_seed_payload(
                 timeout=600,
             )
         except subprocess.TimeoutExpired:
-            eprint("note: gh release download {} timed out".format(tag))
+            eprint("note: agh release download {} timed out".format(tag))
             return False
         if result.returncode != 0:
             eprint(
-                "note: gh release download {} failed: {}".format(
+                "note: agh release download {} failed: {}".format(
                     tag, (result.stderr or result.stdout or "").strip()
                 )
             )
@@ -349,7 +415,7 @@ def get(base, url, path, checksums, verbose=0):
                     "  payload={}\n"
                     "  resolved_payload={}\n"
                     "  expected_sha256={}\n"
-                    "repair (fetches the admitted-internal seed via gh and"
+                    "repair (fetches the admitted-internal seed via agh and"
                     " verifies every byte against src/stage0):\n"
                     "  python3 scripts/fetch_trust_stage0_payloads.py --fetch".format(
                         base, url, resolved_payload, sha256
@@ -503,12 +569,11 @@ def unpack(tarball, tarball_suffix, dst, verbose=0, match=None):
     fname = os.path.basename(tarball).replace(tarball_suffix, "")
     with contextlib.closing(tarfile.open(tarball)) as tar:
         for member in tar.getnames():
-            if "/" not in member:
+            # Trust: share the exact segment projection with the retained
+            # descriptor preparation route; a prefix is not a component.
+            name = _identity_owner.component_projection(member, fname, match)
+            if not name:
                 continue
-            name = member.replace(fname + "/", "", 1)
-            if match is not None and not name.startswith(match):
-                continue
-            name = name[len(match) + 1 :]
 
             dst_path = os.path.join(dst, name)
             if verbose > 0:
@@ -832,14 +897,15 @@ class DownloadInfo:
 
 
 def download_component(download_info):
-    if not os.path.exists(download_info.tarball_path):
-        get(
-            download_info.base_download_url,
-            download_info.download_path,
-            download_info.tarball_path,
-            download_info.stage0_data,
-            verbose=download_info.verbose,
-        )
+    # Trust: get verifies cached bytes too. A same-day re-pin can keep the same
+    # URL/filename while changing its admitted checksum; existence is no authority.
+    get(
+        download_info.base_download_url,
+        download_info.download_path,
+        download_info.tarball_path,
+        download_info.stage0_data,
+        verbose=download_info.verbose,
+    )
 
 
 def unpack_component(download_info):
@@ -852,47 +918,8 @@ def unpack_component(download_info):
     )
 
 
-def select_stage0_extra_component(
-    stage0_data, date, toolchain_suffix, component, pattern
-):
-    """Select a canonical stage0 component, or an explicitly admitted legacy pin."""
-    filename = "{}-{}".format(component, toolchain_suffix)
-    download_path = "dist/{}/{}".format(date, filename)
-    if download_path in stage0_data:
-        return filename, pattern, False
-
-    legacy = STAGE0_LEGACY_EXTRA_COMPONENTS.get(component)
-    if legacy is not None:
-        legacy_component, legacy_pattern = legacy
-        legacy_filename = "{}-{}".format(legacy_component, toolchain_suffix)
-        legacy_download_path = "dist/{}/{}".format(date, legacy_filename)
-        if legacy_download_path in stage0_data:
-            return legacy_filename, legacy_pattern, True
-
-    # Preserve the canonical missing-checksum diagnostic when neither format
-    # is pinned instead of silently broadening the fallback surface.
-    return filename, pattern, False
-
-
-def select_stage0_targo_component(stage0_data, date, toolchain_suffix, component):
-    """Prefer a canonical Targo archive; admit only its checksum-pinned legacy name."""
-    if component not in STAGE0_LEGACY_TARGO_COMPONENTS:
-        raise ValueError("not a Targo stage0 component: {}".format(component))
-
-    filename = "{}-{}".format(component, toolchain_suffix)
-    download_path = "dist/{}/{}".format(date, filename)
-    if download_path in stage0_data:
-        return filename, component, False
-
-    legacy_component = STAGE0_LEGACY_TARGO_COMPONENTS[component]
-    legacy_filename = "{}-{}".format(legacy_component, toolchain_suffix)
-    legacy_download_path = "dist/{}/{}".format(date, legacy_filename)
-    if legacy_download_path in stage0_data:
-        return legacy_filename, legacy_component, True
-
-    # Preserve the canonical checksum-miss diagnostic when neither spelling is
-    # pinned. Ambient or merely present legacy archives are never considered.
-    return filename, component, False
+select_stage0_extra_component = _identity_owner.select_stage0_extra_component
+select_stage0_targo_component = _identity_owner.select_stage0_targo_component
 
 
 def translate_legacy_targo_stage0_surface(bin_root, legacy_components):
@@ -1259,9 +1286,20 @@ class FakeArgs:
         self.json_output = False
         self.color = "auto"
         self.warnings = "default"
+        self.jobs = None
 
 
 TRUST_BOOTSTRAP_NO_VERIFY_FLAG = "-Ztrust-verify=off"
+
+# Trust: the unstable Trust std features that bootstrap's own dependency graph
+# enables, each only under the `trust_std` cfg its build script derives from a
+# `trust:` line in the compiler's `-vV`. `crates/trust-resource-controller`
+# (`features = ["client"]`) selects `trust_process_inherit_fds`, std's
+# per-child descriptor inheritance. The initial bootstrap build's otherwise
+# empty `-Zallow-features=` names these and nothing else, as the Rust driver's
+# `TARGO_ALLOW_FEATURES` does for the tools that enable the same client.
+# `bootstrap_test.py` re-derives the set from the dependency sources.
+TRUST_BOOTSTRAP_STD_FEATURES = ("trust_process_inherit_fds",)
 
 
 def trust_verifier_controls(value, encoded=False):
@@ -1300,11 +1338,82 @@ def trust_verifier_controls(value, encoded=False):
     return controls
 
 
+# Per-attempt timeouts (seconds) for the Stage0 `-Z help` capability probe.
+# The first attempt is short so a warm driver answers without delay. A retry is
+# made ONCE, with a timeout long enough to outlast a macOS first-exec scan of a
+# freshly extracted `trustc` (measured ~40s) or a concurrent extraction. Only if
+# every attempt fails is the probe "unanswerable" -- and an unanswerable probe
+# is costly even though it fails closed (see `apply_trust_bootstrap_compiler_policy`).
+STAGE0_Z_HELP_TIMEOUTS = (10, 120)
+
+# Memo of `stage0_z_help` answers, keyed by (driver path, environment).
+# A process asks each driver ONCE: independent probes of the same driver can
+# disagree (the first times out on a cold binary, a later one answers), and a
+# policy assembled from disagreeing probes is incoherent. Measured 2026-09-28:
+# three separate 10s probes of a freshly extracted stage0 `trustc` returned
+# None, None, text -- the policy read that as "asked, no off-switch: stock
+# upstream" and applied NO policy, a fail-open that sent the whole bootstrap
+# dependency tree through batteries-on verification (regex-syntax E0391 cycle,
+# memchr strict-verify errors). `None` answers are memoized too, so "could not
+# ask" stays "could not ask" for every decision this process makes.
+_STAGE0_Z_HELP_CACHE = {}
+
+# Why a memoized `None` answer is unavailable, under the same key: the last
+# attempt's refusal (status and first output line) or exception. Diagnostic
+# data for the fallback warning only; no decision reads it.
+_STAGE0_Z_HELP_UNAVAILABLE = {}
+
+
+# Variables `apply_trust_bootstrap_compiler_policy` itself writes. They are not
+# part of the memo key: the policy's own output must not turn a later question
+# about the same driver into a fresh (possibly different) probe. None of them
+# changes what a driver lists under `-Z help` -- the RUSTFLAGS lanes are read by
+# Cargo, not rustc, and the TRUST_* transports act after option parsing.
+_STAGE0_Z_HELP_POLICY_OUTPUTS = frozenset(
+    (
+        "TRUST_NO_VERIFY",
+        "TRUST_VANILLA_ANNOUNCED",
+        "RUSTFLAGS_BOOTSTRAP",
+        "CARGO_ENCODED_RUSTFLAGS",
+    )
+)
+
+
+def _stage0_z_help_cache_key(rustc, env):
+    if env is None:
+        return (rustc, None)
+    return (
+        rustc,
+        tuple(
+            sorted(
+                (name, value)
+                for name, value in env.items()
+                if name not in _STAGE0_Z_HELP_POLICY_OUTPUTS
+            )
+        ),
+    )
+
+
+def clear_stage0_z_help_cache():
+    """Forget every memoized Stage0 probe answer (tests; a replaced driver)."""
+    _STAGE0_Z_HELP_CACHE.clear()
+    _STAGE0_Z_HELP_UNAVAILABLE.clear()
+
+
+def stage0_z_help_unavailable_reason(rustc, env):
+    """Why the memoized probe of this driver did not answer, or None."""
+    return _STAGE0_Z_HELP_UNAVAILABLE.get(_stage0_z_help_cache_key(rustc, env))
+
+
 def stage0_z_help(rustc, env):
     """`rustc -Z help` output for the concrete Stage0 driver, or None.
 
-    `None` means ONLY "the probe could not run" — the driver could not be
-    executed at all. It does NOT mean "the driver has no Trust surface"; that is
+    Memoized per (driver, environment) for the life of the process: see
+    `_STAGE0_Z_HELP_CACHE`. Every capability decision about one driver must be
+    made from ONE answer.
+
+    `None` means no usable capability answer: execution/admission failed or the
+    response was empty or refused. It does NOT mean "no Trust surface"; that is
     a positive answer and is returned as text, even when the driver delivers it
     by exiting non-zero.
 
@@ -1329,36 +1438,113 @@ def stage0_z_help(rustc, env):
     failure signal was not produced" (monitors not aborting, expected errors not
     emitted). See reports/red-145-root-cause-2026-08-08.md.
 
-    Only OSError/TimeoutExpired -- the genuinely unanswerable cases the
-    fail-closed branch was written for -- may report unavailability.
+    Execution exceptions retain the existing bounded attempt policy. An
+    infrastructure refusal (including status 75), blank output or other failed
+    response is unavailable; only the known stable rejection is a nonzero
+    capability answer. Cached unavailability never becomes a stock answer.
     """
+    key = _stage0_z_help_cache_key(rustc, env)
+    if key in _STAGE0_Z_HELP_CACHE:
+        return _STAGE0_Z_HELP_CACHE[key]
+    reasons = []
+    answer = _probe_stage0_z_help(rustc, env, reasons)
+    _STAGE0_Z_HELP_CACHE[key] = answer
+    if answer is None and reasons:
+        _STAGE0_Z_HELP_UNAVAILABLE[key] = reasons[-1]
+    return answer
+
+
+def _probe_refusal_reason(result):
+    """`exit N: <first output line>` for a probe response that is no answer."""
+    first = next((line.strip() for line in (result.stdout or "").splitlines() if line.strip()),
+                 "no output")
+    return "exit {}: {}".format(result.returncode, first[:240])
+
+
+def _probe_stage0_z_help(rustc, env, reasons=None):
+    """Run the uncached `-Z help` probe, retrying an unanswered attempt.
+
+    `reasons`, when given, receives one line per unanswered attempt.
+    """
+    if reasons is None:
+        reasons = []
+    # Trust: compiler identity is independent of the shared native transport.
+    # Only a materialized compiler under this source's pinned stage0 is bound;
+    # explicit non-pinned stock/genesis drivers keep their existing query path.
+    from pathlib import Path
+    bootstrap_serial_owner()  # Select only this source's scripts/lib imports.
+    import seed_compiler_identity
+    compiler = Path(rustc)
+    root = Path(__file__).resolve().parents[2]
     try:
-        result = subprocess.run(
-            [rustc, "-Z", "help"],
-            env=env,
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
+        # Windows retains its existing direct, read-only query path. Producing
+        # materialized-seed checks there remain unavailable, not POSIX custody.
+        binding = None if platform_is_win32() else seed_compiler_identity.pinned_compiler_binding(
+            root, compiler, timeout=max(STAGE0_Z_HELP_TIMEOUTS)
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, seed_compiler_identity.SeedIdentityError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"pinned Stage0 identity unavailable: {error}") from error
+    for attempt, timeout in enumerate(STAGE0_Z_HELP_TIMEOUTS):
+        try:
+            if binding is not None:
+                seed_compiler_identity.check_compiler_snapshot(compiler, binding)
+            result = bootstrap_capability_command(
+                [rustc, "-Z", "help"],
+                env=env,
+                timeout=timeout,
+                serial=True,
+            )
+            if binding is not None:
+                seed_compiler_identity.check_compiler_snapshot(compiler, binding)
+        except seed_compiler_identity.SeedIdentityError:
+            # A changed applicable pin is not a cold-start timeout or a reason
+            # to query a different driver/owner.
+            raise
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            reasons.append("{}: {}".format(type(error).__name__, str(error)[:240]))
+            if attempt + 1 < len(STAGE0_Z_HELP_TIMEOUTS):
+                eprint(
+                    "note: the Stage0 driver's Trust flag-surface probe ({}) did not "
+                    "answer ({}); retrying once with a {}s timeout (a freshly "
+                    "extracted driver can take ~40s on its first exec)".format(
+                        rustc,
+                        type(error).__name__,
+                        STAGE0_Z_HELP_TIMEOUTS[attempt + 1],
+                    )
+                )
+            continue
+        # Trust: infrastructure refusals and empty output cannot establish that
+        # this compiler lacks Trust. Preserve the genuine stable -Z rejection.
+        stable_rejection = (
+            result.returncode == 1
+            and "the option `Z` is only accepted on the nightly compiler" in result.stdout
+        )
+        if (result.returncode == 0 and result.stdout.strip()) or stable_rejection:
+            return result.stdout
+        reasons.append(_probe_refusal_reason(result))
         return None
-    # A non-zero exit is an ANSWER, not a failure to ask: the merged output
-    # carries the driver's own words, and the two spelling detectors below
-    # correctly find no Trust flag in them.
-    return result.stdout
+    return None
+
+
+def help_advertises_trust_bootstrap_no_verify(help_text):
+    """Whether answered `-Z help` text advertises the current off-switch."""
+    return help_text is not None and any(
+        re.match(r"^\s*-Z\s+trust-verify(?:=|\s|$)", line)
+        for line in help_text.splitlines()
+    )
+
+
+def help_advertises_retired_no_verify(help_text):
+    """Whether answered `-Z help` text advertises the retired off-switch."""
+    return help_text is not None and any(
+        re.match(r"^\s*-Z\s+no-trust-verify(?:=|\s|$)", line)
+        for line in help_text.splitlines()
+    )
 
 
 def rustc_supports_trust_bootstrap_no_verify(rustc, env):
     """Capability-probe the concrete Stage0 driver without compiling input."""
-    help_text = stage0_z_help(rustc, env)
-    if help_text is None:
-        return False
-    return any(
-        re.match(r"^\s*-Z\s+trust-verify(?:=|\s|$)", line)
-        for line in help_text.splitlines()
-    )
+    return help_advertises_trust_bootstrap_no_verify(stage0_z_help(rustc, env))
 
 
 def stage0_trust_surface_available(rustc, env):
@@ -1382,13 +1568,7 @@ def rustc_advertises_retired_no_verify(rustc, env):
     would otherwise verify the whole bootstrap dependency tree and abort on
     the first verification-refused dep (memchr's SIMD paths, ~700 errors).
     """
-    help_text = stage0_z_help(rustc, env)
-    if help_text is None:
-        return False
-    return any(
-        re.match(r"^\s*-Z\s+no-trust-verify(?:=|\s|$)", line)
-        for line in help_text.splitlines()
-    )
+    return help_advertises_retired_no_verify(stage0_z_help(rustc, env))
 
 
 def apply_trust_bootstrap_compiler_policy(rustc, env):
@@ -1403,42 +1583,22 @@ def apply_trust_bootstrap_compiler_policy(rustc, env):
     would abort it with `unknown unstable option`, and appending the retired
     spelling would abort every post-rename seed. Conflicting verifier controls
     fail closed instead of relying on unstable-option ordering.
+
+    The driver is asked ONCE and every branch below reads that one answer.
+    Three independent probes used to make the three decisions; a cold driver
+    answered None, None, text, and the mixed answers selected the stock
+    upstream branch -- no policy at all. `help_text is None` ("could not ask")
+    now always reaches the fail-closed transport.
     """
-    if not rustc_supports_trust_bootstrap_no_verify(rustc, env):
-        if rustc_advertises_retired_no_verify(rustc, env):
-            env["TRUST_NO_VERIFY"] = "1"
-            return False
-        if not stage0_trust_surface_available(rustc, env):
-            # FAIL CLOSED. An unanswerable probe used to fall through here to
-            # "stock upstream, nothing to disable", which is the wrong default
-            # in the wrong direction: if the driver IS a batteries-on Trust
-            # seed, applying no policy verifies the ENTIRE third-party
-            # bootstrap dependency tree and aborts the build. Measured
-            # 2026-08-04: a `--stage 2` run whose probe did not answer spent
-            # 1:18:20 and 582,226 log lines inside "Building bootstrap" before
-            # dying on `memchr` with 694 verification errors, having never
-            # reached a single compiler step. The probe is a subprocess with a
-            # 10s timeout against a binary x.py may be extracting concurrently,
-            # so "could not ask" is a real, transient, load-dependent state —
-            # not a hypothetical.
-            #
-            # The env transport is the safe fallback precisely because it
-            # cannot abort anything: `TRUST_NO_VERIFY` is read before option
-            # parsing by every Trust vintage, and a stock upstream rustc
-            # ignores an unknown environment variable. Appending an argv
-            # spelling here could not be safe — the two spellings abort each
-            # other's vintage with `unknown unstable option`.
-            eprint(
-                "warning: could not probe the Stage0 driver's Trust flag surface "
-                "({}); assuming a batteries-on Trust seed and disabling "
-                "verification for the bootstrap build via TRUST_NO_VERIFY=1. "
-                "Bootstrap establishes compiler lineage and is deliberately not "
-                "a self-proving session, so this is safe for a stock driver "
-                "too.".format(rustc)
-            )
-            env["TRUST_NO_VERIFY"] = "1"
+    help_text = stage0_z_help(rustc, env)
+    current_surface = help_advertises_trust_bootstrap_no_verify(help_text)
+    retired_surface = help_advertises_retired_no_verify(help_text)
+    if help_text is not None and not current_surface and not retired_surface:
         return False
 
+    # Trust: every path that selects the bootstrap policy must reject
+    # conflicting caller controls before changing the environment. An unknown
+    # surface or an older Trust seed still selects that policy via transport.
     flag_sources = (
         ("RUSTFLAGS", False),
         ("RUSTFLAGS_BOOTSTRAP", False),
@@ -1451,6 +1611,55 @@ def apply_trust_bootstrap_compiler_policy(rustc, env):
                     "bootstrap compiler verification control `{}` in {} conflicts with the "
                     "recorded non-self-proving bootstrap policy".format(option, name)
                 )
+
+    if not current_surface:
+        if retired_surface:
+            env["TRUST_NO_VERIFY"] = "1"
+            return False
+        if help_text is None:
+            # FAIL CLOSED. An unanswerable probe used to fall through here to
+            # "stock upstream, nothing to disable", which is the wrong default
+            # in the wrong direction: if the driver IS a batteries-on Trust
+            # seed, applying no policy verifies the ENTIRE third-party
+            # bootstrap dependency tree and aborts the build. Measured
+            # 2026-08-04: a `--stage 2` run whose probe did not answer spent
+            # 1:18:20 and 582,226 log lines inside "Building bootstrap" before
+            # dying on `memchr` with 694 verification errors, having never
+            # reached a single compiler step. The probe is a subprocess with a
+            # bounded timeout (retried once; `STAGE0_Z_HELP_TIMEOUTS`) against a
+            # binary x.py may be extracting concurrently or macOS may be
+            # first-exec scanning, so "could not ask" is a real, transient,
+            # load-dependent state — not a hypothetical.
+            #
+            # The env transport is the safe fallback precisely because it
+            # cannot abort anything: `TRUST_NO_VERIFY` is read before option
+            # parsing by every Trust vintage, and a stock upstream rustc
+            # ignores an unknown environment variable. Appending an argv
+            # spelling here could not be safe — the two spellings abort each
+            # other's vintage with `unknown unstable option`.
+            #
+            # Trust (BOOTSTRAP-SEED-PROBE-ADMISSION-1): say WHY the probe did
+            # not answer and what to do. A status-75 refusal is native custody
+            # or admission refusing the query, not a slow driver, and the env
+            # transport does not change it, so the warning names the fix.
+            reason = stage0_z_help_unavailable_reason(rustc, env) or "no attempt answered"
+            eprint(
+                "warning: could not probe the Stage0 driver's Trust flag surface "
+                "({}: {}); assuming a batteries-on Trust seed and disabling "
+                "verification for the bootstrap build via TRUST_NO_VERIFY=1. "
+                "Bootstrap establishes compiler lineage and is deliberately not "
+                "a self-proving session, so this is safe for a stock driver "
+                "too.".format(rustc, reason)
+            )
+            if reason.startswith("exit 75:"):
+                eprint(
+                    "help: exit 75 is a native custody or admission refusal, not a "
+                    "capability answer. Inside a managed context run x.py under "
+                    "scripts/build-slot, which admits the probe; otherwise remove the "
+                    "custody advertisement the refusal names from the environment."
+                )
+            env["TRUST_NO_VERIFY"] = "1"
+        return False
 
     bootstrap_flags = env.get("RUSTFLAGS_BOOTSTRAP", "").strip()
     if "trust-verify=off" not in trust_verifier_controls(bootstrap_flags):
@@ -1531,6 +1740,7 @@ class RustBuild(object):
             self.download_url, "Trust stage0 dist_server"
         )
         self.jobs = self.get_toml("jobs", "build") or "default"
+        self.cli_jobs = args.jobs
 
         self.build = args.build or self.build_triple()
 
@@ -1553,7 +1763,8 @@ class RustBuild(object):
         rustc_channel = self.stage0_compiler.version
         bin_root = self.bin_root()
 
-        key = self.stage0_compiler.date
+        # Trust: date is a reproducible dist location, not a seed identity.
+        key = stage0_extraction_stamp(self.stage0_data)
         is_outdated = self.program_out_of_date(self.rustc_stamp(), key)
         surface_needs_refresh = self.stage0_tool_surface_needs_refresh()
         need_rustc = self.rustc().startswith(bin_root) and (
@@ -1593,55 +1804,19 @@ class RustBuild(object):
             self.build_dir, "cache"
         )
 
-        rustc_cache = os.path.join(cache_dst, key)
+        # Trust: retain date-based cache paths; get() verifies the current pin.
+        rustc_cache = os.path.join(cache_dst, self.stage0_compiler.date)
         if not os.path.exists(rustc_cache):
             os.makedirs(rustc_cache)
 
         tarball_suffix = ".tar.gz" if lzma is None else ".tar.xz"
 
-        toolchain_suffix = "{}-{}{}".format(
-            rustc_channel, self.build, tarball_suffix
-        )
-
-        # The refresh replaces the ENTIRE seed tree, so the download list is
-        # always the full component surface, never scoped to whichever of
-        # need_rustc/need_cargo fired: assert_stage0_tool_surface demands
-        # every required bin regardless of the trigger.
-        tarballs_to_download = []
-        legacy_targo_components = []
-        translate_legacy_tippy = False
-
-        tarballs_to_download.append(
-            ("trust-std-{}".format(toolchain_suffix), "trust-std-{}".format(self.build))
-        )
-        tarballs_to_download.append(
-            ("trustc-{}".format(toolchain_suffix), "trustc")
-        )
-
-        for component in ("targo", "targo-trust"):
-            filename, selected_pattern, selected_legacy = (
-                select_stage0_targo_component(
-                    self.stage0_data,
-                    self.stage0_compiler.date,
-                    toolchain_suffix,
-                    component,
-                )
-            )
-            tarballs_to_download.append((filename, selected_pattern))
-            if selected_legacy:
-                legacy_targo_components.append(component)
-
-        for component, pattern in STAGE0_EXTRA_COMPONENTS:
-            filename, selected_pattern, selected_legacy = select_stage0_extra_component(
-                self.stage0_data,
-                self.stage0_compiler.date,
-                toolchain_suffix,
-                component,
-                pattern,
-            )
-            tarballs_to_download.append((filename, selected_pattern))
-            if component == "tippy" and selected_legacy:
-                translate_legacy_tippy = True
+        # This SAME pure selection also feeds the retained native planner.
+        # Only the download/extraction owner admits the selected payload bytes.
+        (tarballs_to_download, legacy_targo_components,
+         translate_legacy_tippy) = _identity_owner.component_archives(
+            self.stage0_data, self.stage0_compiler.date, rustc_channel,
+            self.build, tarball_suffix)
 
         # Stage the replacement seed NEXT TO the live one (same filesystem,
         # so the final swap is a rename) and only touch bin_root once the
@@ -1702,6 +1877,11 @@ class RustBuild(object):
                 )
             if translate_legacy_tippy:
                 translate_legacy_tippy_stage0_surface(staging_root)
+
+            # Trust: the closed native profile selects SDK/bin/rust-lld. Older
+            # authenticated distributions shipped only the same host image in
+            # rustlib; materialize its explicit role before the atomic swap.
+            _identity_owner.paired_linker(staging_root, self.build, materialize=True)
 
             # Verify the replacement surface is complete BEFORE swapping it
             # in. An incomplete extraction aborts with the working seed
@@ -1769,6 +1949,9 @@ class RustBuild(object):
             shutil.rmtree(previous_root)
         else:
             os.rename(staging_root, bin_root)
+        # A different driver now answers at the same path: no probe answer
+        # memoized for the old one may decide policy for the new one.
+        clear_stage0_z_help_cache()
 
         with output(self.rustc_stamp()) as rust_stamp:
             rust_stamp.write(key)
@@ -1815,6 +1998,7 @@ class RustBuild(object):
             path = os.path.join(bin_dir, filename)
             if os.path.lexists(path):
                 raise RuntimeError("Trust stage0 seed must not contain {}".format(path))
+        _identity_owner.paired_linker(bin_root, self.build)
         for name in STAGE0_FORBIDDEN_LIBEXEC_BINS:
             path = os.path.join(bin_root, "libexec", name + EXE_SUFFIX)
             if os.path.lexists(path):
@@ -2177,11 +2361,73 @@ exec "$trustc" "$@"
             eprint("Building bootstrap")
 
         args = self.build_bootstrap_cmd(env)
+        # Trust: materialize the frozen metatool, then let its canonical native
+        # parser choose readiness before metadata, seeding or requested units.
+        # No partial Python CLI parse can classify a native request safely.
         # Run this from the source directory so cargo finds .cargo/config
-        run(args, env=env, verbose=self.verbose, cwd=self.rust_root)
+        try:
+            run(args, env=env, verbose=self.verbose, cwd=self.rust_root,
+                exception=True)
+        except RuntimeError as error:
+            # Trust: the producer is --frozen and never fetches, so on a machine
+            # whose Cargo home lacks the locked sources Cargo says only "no
+            # matching package". Name the explicit preparation operation.
+            eprint(self.frozen_source_hint(env))
+            sys.exit(str(error))
 
         if "GITHUB_ACTIONS" in env:
             print("::endgroup::")
+
+    def frozen_source_hint(self, env):
+        """The preparation command for a frozen bootstrap build's missing sources.
+
+        Trust: printed only after the bootstrap producer failed. It runs
+        nothing: fetching stays the operator's explicit, separate operation.
+        Only the bootstrap producer's manifest is selected here; readiness for
+        the native request remains the native parser's responsibility. Use the
+        same driver, source directory, Cargo home and warning/offline policy.
+        """
+        lead = ("note: the bootstrap build is --frozen and never fetches. If "
+                "Cargo reported a missing package or source above, ")
+        if self.use_vendored_sources:
+            # A vendored build resolves from vendor/, never the Cargo home.
+            return lead + ("vendor/ does not hold the locked sources: refresh "
+                           "it with `x.py vendor`, or build without "
+                           "build.vendor after preparing the Cargo home.")
+        root = os.path.abspath(self.rust_root)
+        # Cargo's own default when CARGO_HOME is unset; the failed build used it.
+        cargo_home = env.get("CARGO_HOME") or os.path.join(
+            os.path.expanduser("~"), ".cargo")
+        if not os.path.isabs(cargo_home):
+            cargo_home = os.path.join(root, cargo_home)
+        driver = self.cargo()
+        # A bare configured program uses PATH in the actual producer too.
+        # Only relative paths with a directory component are source-relative.
+        if not os.path.isabs(driver) and os.path.dirname(driver):
+            driver = os.path.join(root, driver)
+        # Absence is policy too: a pasted command must not acquire a new
+        # warning override or turn an explicitly offline caller online.
+        policy_keys = ("CARGO_BUILD_WARNINGS", "TARGO_BUILD_WARNINGS",
+                       "CARGO_NET_OFFLINE")
+        command = ["env", "-u", "CARGO_BUILD_WARNINGS", "-u",
+                   "TARGO_BUILD_WARNINGS", "-u", "CARGO_NET_OFFLINE",
+                   "CARGO_HOME=" + cargo_home]
+        command.extend(key + "=" + env[key]
+                       for key in policy_keys if key in env)
+        command += [driver, "fetch", "--locked", "--manifest-path",
+                    os.path.join(root, "src", "bootstrap", "Cargo.toml")]
+        # Fetch is a source-only native operation, not a compilation lane or a
+        # full dependency-envelope check. Other network policy is inherited.
+        offline_command = command + ["--offline"]
+        prefix = "cd " + shlex.quote(root) + " && "
+        return lead + (
+            "prepare ONLY the bootstrap producer's locked sources in the SAME "
+            "Cargo home under the caller's network policy, check them offline, "
+            "then retry bootstrap. This does not prepare the full toolchain "
+            "dependency closure:\n  "
+            + prefix + " ".join(shlex.quote(part) for part in command)
+            + "\n  " + prefix
+            + " ".join(shlex.quote(part) for part in offline_command))
 
     def targo_supports_unverified_lane(self):
         """Does the configured cargo implement Targo's two-lane policy?
@@ -2194,20 +2440,24 @@ exec "$trustc" "$@"
             return cached
         supported = False
         try:
-            proc = subprocess.Popen(
+            result = bootstrap_capability_command(
                 [self.cargo(), "--help"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                env=dict(os.environ),
+                timeout=60,
             )
-            out, _ = proc.communicate()
-            supported = b"--unverified" in (out or b"")
-        except Exception:
-            supported = False
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError("cannot establish bootstrap Targo lane capability") from error
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError("bootstrap Targo lane capability did not answer")
+        supported = "--unverified" in result.stdout
         self._targo_unverified_lane = supported
         return supported
 
     def build_bootstrap_cmd(self, env):
         """For tests."""
+        # Trust: refuse an invalid admission before cleaning directories,
+        # opening the compiler adapter, or probing any stage0 tool.
+        jobs = bootstrap_jobs(self.jobs, self.cli_jobs, env)
         build_dir = os.path.join(self.build_dir, "bootstrap")
         if self.clean and os.path.exists(build_dir):
             shutil.rmtree(build_dir)
@@ -2287,11 +2537,17 @@ exec "$trustc" "$@"
         # get introduced into bootstrap over time. Distros rely on being able to
         # compile bootstrap with a variety of their toolchains, not necessarily
         # the same as Rust's CI uses.
+        #
+        # Trust: the allow-list names exactly the Trust std features bootstrap's
+        # own dependency graph selects (`TRUST_BOOTSTRAP_STD_FEATURES`). Each is
+        # requested only when the compiler's `-vV` reports a Trust std, so a
+        # stock driver uses none of them, while an empty list fails a Trust
+        # seed with E0725 (BOOTSTRAP-SEED-PROBE-ADMISSION-1).
         if env.get("RUSTFLAGS", "") or env.get("RUSTFLAGS_BOOTSTRAP", ""):
             # Preserve existing RUSTFLAGS.
             env.setdefault("RUSTFLAGS", "")
         else:
-            env["RUSTFLAGS"] = "-Zallow-features="
+            env["RUSTFLAGS"] = "-Zallow-features=" + ",".join(TRUST_BOOTSTRAP_STD_FEATURES)
 
         if not os.path.isfile(self.cargo()):
             raise Exception(
@@ -2313,7 +2569,7 @@ exec "$trustc" "$@"
             args.append("--unverified")
         args += [
             "build",
-            "--jobs=" + self.jobs,
+            "--jobs=" + jobs,
             "--manifest-path",
             os.path.join(self.rust_root, "src/bootstrap/Cargo.toml"),
             "-Zroot-dir=" + self.rust_root,
@@ -2354,8 +2610,10 @@ exec "$trustc" "$@"
 
         if self.use_locked_deps:
             args.append("--locked")
-        if self.use_vendored_sources:
-            args.append("--frozen")
+        # Trust: the actual producer may neither update locks nor fetch. Native
+        # Cargo resolves/downloads this request's sources before executing units;
+        # online source preparation remains an explicit separate operation.
+        args.append("--frozen")
         if self.get_toml("metrics", "build"):
             args.append("--features")
             args.append("build-metrics")
@@ -2441,6 +2699,84 @@ exec "$trustc" "$@"
                 raise Exception("{} not found".format(cargo_dir))
 
 
+_TOML_STRING_RE = r'"((?:[^"\\\n]|\\.)*)"|\'([^\'\n]*)\''
+
+
+def _toml_top_level_include(config_toml):
+    """The strings of a config's top-level `include = [...]`, in order ([] if none).
+
+    A subset parser like get_toml_static: basic ("...", with the usual escapes) and
+    literal ('...') strings in a one-line or multi-line array, read only above the
+    first `[section]` header.
+    """
+    value = None
+    for line in config_toml.splitlines():
+        if value is None:
+            stripped = line.strip()
+            if stripped.startswith("["):
+                return []
+            match = re.match(r"^include\s*=\s*(.*)$", stripped)
+            if match is None:
+                continue
+            value = match.group(1)
+        else:
+            value += "\n" + line
+        # The array ends at the first `]` outside a string and a comment.
+        bare = "\n".join(
+            part.split("#", 1)[0]
+            for part in re.sub(_TOML_STRING_RE, "", value).splitlines()
+        )
+        if "]" in bare:
+            break
+    if value is None:
+        return []
+    items = []
+    # Trust: consume comments as tokens so quoted commentary is never a path;
+    # matching complete strings first keeps '#' inside real filenames intact.
+    for match in re.finditer(_TOML_STRING_RE + r"|#[^\n]*", value):
+        basic, literal = match.group(1), match.group(2)
+        if basic is not None:
+            items.append(json.loads('"' + basic + '"'))
+        elif literal is not None:
+            items.append(literal)
+    return items
+
+
+def config_with_includes(config_toml, toml_path, chain=()):
+    """`config_toml` followed by every file its `include` names, as config.rs merges them.
+
+    Trust: the Rust loader (src/bootstrap/src/core/config/toml/mod.rs) merges each
+    included file beneath the config that names it, but this script read the named file
+    alone. A generated config that overrides a few keys and includes the checkout's
+    bootstrap.toml (the pack cut's DDC and proof-build configs,
+    scripts/mint_seed_support.py) then built bootstrap with settings x.py does not
+    read: measured on the cut of dd6cd894cf (2026-10-22), the DDC build saw no
+    `rust.deny-warnings = false`, denied bootstrap's ten warnings that the pinned-seed
+    build had allowed reading that key from bootstrap.toml itself, and the cut stopped.
+
+    get_toml returns the first match, so the precedence is the loader's when each
+    included file follows the text that names it: the config's own keys first, the
+    last include before an earlier one, and a file's own keys before its includes.
+    Paths resolve against the including file's directory. A `[]` line before each
+    included file puts its top-level keys back at the top level for get_toml_static.
+    """
+    real = os.path.realpath(toml_path)
+    if real in chain:
+        raise Exception(
+            "cyclic config include: '{}' is included again".format(toml_path)
+        )
+    chain = chain + (real,)
+    parent = os.path.dirname(real)
+    for name in reversed(_toml_top_level_include(config_toml)):
+        path = os.path.join(parent, name)
+        with open(path, encoding="utf-8") as included:
+            text = included.read()
+        config_toml += os.linesep + "[]" + os.linesep + config_with_includes(
+            text, path, chain
+        )
+    return config_toml
+
+
 def parse_args(args):
     """Parse the command line arguments that the python script needs."""
 
@@ -2453,6 +2789,7 @@ def parse_args(args):
     parser.add_argument("--config")
     parser.add_argument("--build-dir")
     parser.add_argument("--build")
+    parser.add_argument("-j", "--jobs", type=int)
     parser.add_argument("--color", choices=["always", "never", "auto"])
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--json-output", action="store_true")
@@ -2466,7 +2803,8 @@ def parse_args(args):
     # through that should have been suppressed.
     group.add_argument("-q", "--quiet", action="store_const", const=-1, dest="verbose")
 
-    return parser.parse_known_args(args)[0]
+    parsed, _ = parser.parse_known_args(args)
+    return parsed
 
 
 def parse_stage0_file(path):
@@ -2513,6 +2851,7 @@ def bootstrap(args):
     if not using_default_path or os.path.exists(toml_path):
         with open(toml_path, encoding="utf-8") as config:
             config_toml = config.read()
+        config_toml = config_with_includes(config_toml, toml_path)
     else:
         config_toml = ""
 

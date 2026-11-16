@@ -13,19 +13,20 @@ use rustc_abi::WrappingRange;
 use rustc_const_eval::interpret::Scalar;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::graph::dominators::Dominators;
-use rustc_index::bit_set::DenseBitSet;
+use rustc_middle::mir::basic_blocks::Predecessors;
 use rustc_middle::mir::visit::{MutVisitor, Visitor};
 use rustc_middle::mir::{BasicBlock, Body, Location, Operand, Place, TerminatorKind, *};
 use rustc_middle::ty::{TyCtxt, TypingEnv};
 use rustc_span::DUMMY_SP;
 
+use crate::PassPolicy;
 use crate::ssa::SsaLocals;
 
 pub(super) struct SsaRangePropagation;
 
 impl<'tcx> crate::MirPass<'tcx> for SsaRangePropagation {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() > 1
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 2)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -44,20 +45,23 @@ impl<'tcx> crate::MirPass<'tcx> for SsaRangePropagation {
 
         let typing_env = body.typing_env(tcx);
         let ssa = SsaLocals::new(tcx, body, typing_env);
-        // Clone dominators because we need them while mutating the body.
-        let dominators = body.basic_blocks.dominators().clone();
-        let mut range_set =
-            RangeSet::new(tcx, typing_env, body, &ssa, &body.local_decls, dominators, &candidates);
+        let cfg_cache = body.basic_blocks.cfg_cache();
+        let dominators = cfg_cache.dominators(&body.basic_blocks);
+        let predecessors = cfg_cache.predecessors(&body.basic_blocks);
+        let mut range_set = RangeSet::new(
+            tcx,
+            typing_env,
+            &ssa,
+            &body.local_decls,
+            dominators,
+            predecessors,
+            &candidates,
+        );
 
-        let reverse_postorder = body.basic_blocks.reverse_postorder().to_vec();
-        for bb in reverse_postorder {
+        for &bb in cfg_cache.reverse_postorder(&body.basic_blocks) {
             let data = &mut body.basic_blocks.as_mut_preserves_cfg()[bb];
             range_set.visit_basic_block_data(bb, data);
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -85,36 +89,37 @@ impl<'tcx> CandidateScan<'tcx> {
 impl<'tcx> Visitor<'tcx> for CandidateScan<'tcx> {
     fn visit_operand(&mut self, operand: &Operand<'tcx>, _location: Location) {
         if let Some(place) = operand.place()
-            && place.is_stable_offset()
+            && self.seen_sources.contains(&place)
         {
             let count = self.operand_uses.entry(place).or_default();
             *count = count.saturating_add(1);
         }
     }
-
-    fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
-        if let StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(operand)) = &statement.kind {
-            self.record_source(operand);
-        }
-        self.super_statement(statement, location);
-    }
-
-    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
-        match &terminator.kind {
-            TerminatorKind::Assert { cond, .. } => self.record_source(cond),
-            // RangeSet intentionally declines larger switches; mirror that
-            // gate so their discriminants cannot keep the expensive path live.
-            TerminatorKind::SwitchInt { discr, targets } if targets.all_targets().len() < 16 => {
-                self.record_source(discr);
-            }
-            _ => {}
-        }
-        self.super_terminator(terminator, location);
-    }
 }
 
 fn range_propagation_candidates<'tcx>(body: &Body<'tcx>) -> FxHashSet<Place<'tcx>> {
     let mut scan = CandidateScan::default();
+    for bb in body.basic_blocks.iter() {
+        for stmt in &bb.statements {
+            if let StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(operand)) = &stmt.kind {
+                scan.record_source(operand);
+            }
+        }
+        match &bb.terminator().kind {
+            TerminatorKind::Assert { cond, msg, .. } if !msg.is_optional_overflow_check() => {
+                scan.record_source(cond);
+            }
+            // RangeSet intentionally declines larger switches; mirror that
+            // gate so their discriminants cannot keep the expensive path live.
+            TerminatorKind::SwitchInt { discr, targets } if targets.all_targets().len() < 16 => {
+                scan.record_source(discr);
+            }
+            _ => {}
+        }
+    }
+    if scan.range_sources.is_empty() {
+        return FxHashSet::default();
+    }
     scan.visit_body(body);
     scan.range_sources
         .into_iter()
@@ -127,32 +132,24 @@ struct RangeSet<'tcx, 'body, 'a> {
     typing_env: TypingEnv<'tcx>,
     ssa: &'a SsaLocals,
     local_decls: &'body LocalDecls<'tcx>,
-    dominators: Dominators<BasicBlock>,
+    dominators: &'a Dominators<BasicBlock>,
     /// Known ranges at each locations.
     ranges: FxHashMap<Place<'tcx>, Vec<(Location, WrappingRange)>>,
     /// Raw syntactic superset of places that can actually be rewritten.
     candidates: &'a FxHashSet<Place<'tcx>>,
-    /// Determines if the basic block has a single unique predecessor.
-    unique_predecessors: DenseBitSet<BasicBlock>,
+    predecessors: &'a Predecessors,
 }
 
 impl<'tcx, 'body, 'a> RangeSet<'tcx, 'body, 'a> {
     fn new(
         tcx: TyCtxt<'tcx>,
         typing_env: TypingEnv<'tcx>,
-        body: &Body<'tcx>,
         ssa: &'a SsaLocals,
         local_decls: &'body LocalDecls<'tcx>,
-        dominators: Dominators<BasicBlock>,
+        dominators: &'a Dominators<BasicBlock>,
+        predecessors: &'a Predecessors,
         candidates: &'a FxHashSet<Place<'tcx>>,
     ) -> Self {
-        let predecessors = body.basic_blocks.predecessors();
-        let mut unique_predecessors = DenseBitSet::new_empty(body.basic_blocks.len());
-        for bb in body.basic_blocks.indices() {
-            if predecessors[bb].len() == 1 {
-                unique_predecessors.insert(bb);
-            }
-        }
         RangeSet {
             tcx,
             typing_env,
@@ -161,8 +158,12 @@ impl<'tcx, 'body, 'a> RangeSet<'tcx, 'body, 'a> {
             dominators,
             ranges: FxHashMap::default(),
             candidates,
-            unique_predecessors,
+            predecessors,
         }
+    }
+
+    fn has_unique_predecessor(&self, bb: BasicBlock) -> bool {
+        self.predecessors[bb].len() == 1
     }
 
     /// Create a new known range at the location.
@@ -238,12 +239,26 @@ impl<'tcx> MutVisitor<'tcx> for RangeSet<'tcx, '_, '_> {
     fn visit_terminator(&mut self, terminator: &mut Terminator<'tcx>, location: Location) {
         self.super_terminator(terminator, location);
         match &terminator.kind {
-            TerminatorKind::Assert { cond, expected, target, .. }
+            // Trust: `msg` bound for the optional-overflow-check guard below.
+            TerminatorKind::Assert { cond, expected, target, msg, .. }
                 if let Some(place) = cond.place()
                     && self.is_ssa(place) =>
             {
-                let successor = Location { block: *target, statement_index: 0 };
-                if location.strictly_dominates(successor, &self.dominators) {
+                let successor = target.start_location();
+                if location.strictly_dominates(successor, &self.dominators)
+                    // Don't propagate range information from built-in overflow checks,
+                    // this MIR might be lowered without them!
+                    // Trust: backport of rust-lang/rust a9b28d3 ("Skip optional
+                    // asserts in SsaRangePropagation", 2026-10-05), found by the
+                    // RBCE-OPTIONAL-DOMINATOR-1 audit. An optional overflow check
+                    // is erased by codegen in any session with overflow checks
+                    // off (including a checks-off crate that codegens this
+                    // encoded MIR), so its success edge proves nothing about
+                    // `cond`. Before this, `let _ = Add::add(a, b);
+                    // a.overflowing_add(b).1` folded to `false` at -O with checks
+                    // off, and returned false for `u32::MAX + 1`.
+                    && !msg.is_optional_overflow_check()
+                {
                     let val = *expected as u128;
                     let range = WrappingRange { start: val, end: val };
                     self.insert_range(place, successor, range);
@@ -265,8 +280,8 @@ impl<'tcx> MutVisitor<'tcx> for RangeSet<'tcx, '_, '_> {
                         // FIXME: For multiple targets, the range can be the union of their values.
                         continue;
                     }
-                    let successor = Location { block: target, statement_index: 0 };
-                    if self.unique_predecessors.contains(successor.block) {
+                    let successor = target.start_location();
+                    if self.has_unique_predecessor(successor.block) {
                         assert_ne!(location.block, successor.block);
                         let range = WrappingRange { start: val, end: val };
                         self.insert_range(place, successor, range);
@@ -275,10 +290,10 @@ impl<'tcx> MutVisitor<'tcx> for RangeSet<'tcx, '_, '_> {
 
                 // FIXME: The range for the otherwise target be extend to more types.
                 // For instance, `val` is within the range [4, 1) at the otherwise target of `matches!(val, 1 | 2 | 3)`.
-                let otherwise = Location { block: targets.otherwise(), statement_index: 0 };
+                let otherwise = targets.otherwise().start_location();
                 if place.ty(self.local_decls, self.tcx).ty.is_bool()
                     && let [val] = targets.all_values()
-                    && self.unique_predecessors.contains(otherwise.block)
+                    && self.has_unique_predecessor(otherwise.block)
                 {
                     assert_ne!(location.block, otherwise.block);
                     let range = if val.get() == 0 {

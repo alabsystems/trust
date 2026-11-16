@@ -730,15 +730,6 @@ fn dangling_dependency_is_reported_without_explicit_missing_node() {
 }
 
 #[test]
-fn test_composition_node_status_variants() {
-    // Ensure all status variants are distinguishable
-    assert_ne!(CompositionNodeStatus::Valid, CompositionNodeStatus::Missing);
-    assert_ne!(CompositionNodeStatus::Valid, CompositionNodeStatus::ChainBroken);
-    assert_ne!(CompositionNodeStatus::Valid, CompositionNodeStatus::Stale);
-    assert_ne!(CompositionNodeStatus::Missing, CompositionNodeStatus::ChainBroken);
-}
-
-#[test]
 fn test_proof_composition_default() {
     let comp = ProofComposition::default();
     assert!(comp.is_empty());

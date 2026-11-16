@@ -139,13 +139,21 @@ pub(crate) struct Core256 {
     total_bytes: u64,
 }
 
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    target_feature = "neon",
+    target_feature = "sha2"
+))]
+mod aarch64;
+
 impl Core256 {
     const fn new(iv: [u32; 8]) -> Self {
         Self { h: iv, block: [0; BLOCK_SIZE], filled: 0, total_bytes: 0 }
     }
 
     /// Absorb `data`, which may start or end anywhere relative to a block.
-    fn update(&mut self, mut data: &[u8]) {
+    fn update(&mut self, mut data: &[u8], compress: impl Fn(&mut Self, &[u8; BLOCK_SIZE])) {
         self.total_bytes = self.total_bytes.wrapping_add(data.len() as u64);
 
         // 1. Top up a partially filled block first.
@@ -156,7 +164,7 @@ impl Core256 {
             data = &data[take..];
             if self.filled == BLOCK_SIZE {
                 let block = self.block;
-                self.compress(&block);
+                compress(self, &block);
                 self.filled = 0;
             }
         }
@@ -165,7 +173,7 @@ impl Core256 {
         while data.len() >= BLOCK_SIZE {
             let (block, rest) = data.split_at(BLOCK_SIZE);
             let block: &[u8; BLOCK_SIZE] = block.try_into().expect("split_at yields BLOCK_SIZE");
-            self.compress(block);
+            compress(self, block);
             data = rest;
         }
 
@@ -185,7 +193,7 @@ impl Core256 {
     /// smallest non-negative solution of `l + 1 + k ≡ 448 (mod 512)`, then `l`
     /// as a 64-bit big-endian integer. Since messages here are whole bytes,
     /// the `1` bit is the byte `0x80`.
-    fn finish(&mut self) -> [u32; 8] {
+    fn finish(&mut self, compress: impl Fn(&mut Self, &[u8; BLOCK_SIZE])) -> [u32; 8] {
         let bit_len = self.total_bytes.wrapping_mul(8);
 
         // The `1` bit. `filled < BLOCK_SIZE` is an invariant of `update`.
@@ -197,17 +205,34 @@ impl Core256 {
         if self.filled > LENGTH_OFFSET {
             self.block[self.filled..].fill(0);
             let block = self.block;
-            self.compress(&block);
+            compress(self, &block);
             self.filled = 0;
         }
 
         self.block[self.filled..LENGTH_OFFSET].fill(0);
         self.block[LENGTH_OFFSET..].copy_from_slice(&bit_len.to_be_bytes());
         let block = self.block;
-        self.compress(&block);
+        compress(self, &block);
         self.filled = 0;
 
         self.h
+    }
+
+    fn compress_native(&mut self, block: &[u8; BLOCK_SIZE]) {
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            target_feature = "neon",
+            target_feature = "sha2"
+        ))]
+        aarch64::compress(&mut self.h, block);
+        #[cfg(not(all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            target_feature = "neon",
+            target_feature = "sha2"
+        )))]
+        self.compress(block);
     }
 
     /// FIPS 180-4 §6.2.2 — the SHA-256 hash computation for one block.
@@ -257,8 +282,9 @@ impl Core256 {
 /// digest is `H(N)0 || H(N)1 || ...`, each word most-significant byte first.
 fn state_to_bytes(h: &[u32; 8]) -> [u8; 32] {
     let mut out = [0u8; 32];
-    for (chunk, word) in out.chunks_exact_mut(4).zip(h.iter()) {
-        chunk.copy_from_slice(&word.to_be_bytes());
+    // 32 = 8 * 4, so the remainder is empty and every word has its own chunk.
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
+        *chunk = word.to_be_bytes();
     }
     out
 }
@@ -294,17 +320,44 @@ impl Digest for Sha256 {
     }
 
     fn update(&mut self, data: impl AsRef<[u8]>) {
-        self.core.update(data.as_ref());
+        self.core.update(data.as_ref(), Core256::compress);
     }
 
     fn finalize(mut self) -> Digest32 {
-        Digest32::from_bytes(state_to_bytes(&self.core.finish()))
+        Digest32::from_bytes(state_to_bytes(&self.core.finish(Core256::compress)))
     }
 }
 
 impl Default for Sha256 {
     fn default() -> Self {
         <Self as Digest>::new()
+    }
+}
+
+/// SHA-256 with native compression when the compilation target guarantees
+/// the required instructions. Buffering, padding and encoding are shared with
+/// [Sha256]. All other targets use the portable compression.
+#[derive(Clone)]
+pub struct NativeSha256 {
+    core: Core256,
+}
+
+impl Digest for NativeSha256 {
+    type Output = Digest32;
+
+    const BLOCK_SIZE: usize = BLOCK_SIZE;
+    const OUTPUT_SIZE: usize = 32;
+
+    fn new() -> Self {
+        Self { core: Core256::new(IV_256) }
+    }
+
+    fn update(&mut self, data: impl AsRef<[u8]>) {
+        self.core.update(data.as_ref(), Core256::compress_native);
+    }
+
+    fn finalize(mut self) -> Digest32 {
+        Digest32::from_bytes(state_to_bytes(&self.core.finish(Core256::compress_native)))
     }
 }
 
@@ -330,12 +383,12 @@ impl Digest for Sha224 {
     }
 
     fn update(&mut self, data: impl AsRef<[u8]>) {
-        self.core.update(data.as_ref());
+        self.core.update(data.as_ref(), Core256::compress);
     }
 
     fn finalize(mut self) -> Digest28 {
         // §6.1: "the final hash value ... truncated to its left-most 224 bits".
-        let full = state_to_bytes(&self.core.finish());
+        let full = state_to_bytes(&self.core.finish(Core256::compress));
         let mut out = [0u8; 28];
         out.copy_from_slice(&full[..28]);
         Digest28::from_bytes(out)

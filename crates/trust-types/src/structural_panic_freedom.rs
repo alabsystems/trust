@@ -18,10 +18,8 @@
 //! pass, exactly as the structural `Total` halves compose. Conservative: an
 //! empty body, or any reachable `Assert` / panic call, yields `false`.
 
-use std::collections::HashSet;
-
-use crate::structural_termination::terminator_successors;
-use crate::{BasicBlock, BlockId, Terminator, VerifiableFunction};
+use crate::structural_termination::all_reachable_blocks;
+use crate::{BasicBlock, Terminator, VerifiableFunction};
 
 /// The panic runtime entrypoints the compiler lowers an explicit `panic!` /
 /// `unwrap` / bounds failure into. A direct call to one is an own panic site.
@@ -45,7 +43,7 @@ fn is_panic_entrypoint(name: &str) -> bool {
 /// failure), a direct call to a panic runtime entrypoint, a `Drop` (its
 /// destructor may panic), or unmodeled (`Opaque`) control flow (may hide a
 /// panic).
-fn is_own_panic_site(t: &Terminator) -> bool {
+pub(crate) fn is_own_panic_site(t: &Terminator) -> bool {
     match t {
         Terminator::Assert { .. } => true,
         Terminator::Call { func, .. } | Terminator::TailCall { func, .. } => {
@@ -69,31 +67,7 @@ fn is_own_panic_site(t: &Terminator) -> bool {
 /// module docs). An empty block list fails closed.
 #[must_use]
 pub fn blocks_have_no_reachable_panic_site(blocks: &[BasicBlock]) -> bool {
-    let Some(entry) = blocks.first().map(|b| b.id) else {
-        return false;
-    };
-    let by_id: std::collections::HashMap<BlockId, &BasicBlock> =
-        blocks.iter().map(|b| (b.id, b)).collect();
-
-    let mut seen: HashSet<BlockId> = HashSet::new();
-    seen.insert(entry);
-    let mut stack = vec![entry];
-    while let Some(bid) = stack.pop() {
-        let Some(block) = by_id.get(&bid) else {
-            // A dangling successor references no block: it cannot execute a
-            // panic site, so it is a leaf.
-            continue;
-        };
-        if is_own_panic_site(&block.terminator) {
-            return false;
-        }
-        for s in terminator_successors(&block.terminator) {
-            if seen.insert(s) {
-                stack.push(s);
-            }
-        }
-    }
-    true
+    all_reachable_blocks(blocks, |block| !is_own_panic_site(&block.terminator))
 }
 
 /// [`blocks_have_no_reachable_panic_site`] over a whole function body — one
@@ -107,7 +81,7 @@ pub fn is_structurally_panic_free(func: &VerifiableFunction) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AssertMessage, Operand, Place, SourceSpan, UnwindEdge};
+    use crate::{AssertMessage, BlockId, Operand, Place, SourceSpan, UnwindEdge};
 
     fn block(id: usize, t: Terminator) -> BasicBlock {
         BasicBlock { id: BlockId(id), stmts: Vec::new(), terminator: t }
@@ -124,6 +98,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind: UnwindEdge::Unreachable,
         }
     }

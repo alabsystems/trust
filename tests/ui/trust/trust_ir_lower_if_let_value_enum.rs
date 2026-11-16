@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-LV): the BY-VALUE enum `if let` CONDITION lowers as a real discriminant
 //! `Switch` — the same shape `lower_enum_match_general` already emits for
 //! `match e { V(..) => .., _ => .. }` — instead of refusing as

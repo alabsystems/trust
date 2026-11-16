@@ -197,6 +197,9 @@ fn publish_with_replacement() {
 
                 [dependencies]
                 bar = "1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -277,6 +280,9 @@ fn source_replacement_with_registry_url() {
                 edition = "2015"
                 [dependencies.bar]
                 version = "0.0.1"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -286,7 +292,7 @@ fn source_replacement_with_registry_url() {
         .replace_crates_io(crates_io.index_url())
         .with_stderr_data(str![[r#"
 [UPDATING] `using-registry-url` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `using-registry-url`)
 [CHECKING] bar v0.0.1

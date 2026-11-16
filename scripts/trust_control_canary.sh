@@ -131,8 +131,9 @@ if [ "$LIST_ONLY" -eq 1 ]; then
 fi
 
 # ── Driver ──────────────────────────────────────────────────────────────────
-# Prefer targo, which scopes verification per unit; fall back to cargo with
-# RUSTC_BOOTSTRAP=1 for the workspace's nightly features. A stage whose `targo`
+# targo, which scopes verification per unit — and nothing else: there is no
+# stock-cargo fallback (the ATERM_STOCK_REASON
+# escape was removed). A stage whose `targo`
 # was never rebuilt ships upstream `cargo` UNDER THE NAME `targo`, and it then
 # works while verifying nothing — so a candidate is only accepted when it
 # ACCEPTS `--unverified`, which cargo-in-disguise rejects. (CLAUDE.md, "VERIFY
@@ -156,12 +157,10 @@ do
 done
 if [ -n "$TARGO_BIN" ]; then
   DRIVER=("$TARGO_BIN" --unverified)
-elif command -v cargo >/dev/null 2>&1; then
-  echo "NOTE: no targo accepting --unverified found; falling back to cargo." >&2
-  export RUSTC_BOOTSTRAP=1
-  DRIVER=(cargo)
 else
-  echo "FAIL: no targo and no cargo on PATH — cannot build the canary." >&2
+  echo "FAIL: no targo accepting --unverified found (\$TARGO, build/host/stage2/bin/targo," >&2
+  echo "      targo on PATH) — cannot build the canary. Install/repair the Trust toolchain" >&2
+  echo "      (aterm pkg doctor). Stock cargo is never used." >&2
   exit 2
 fi
 
@@ -173,7 +172,7 @@ echo "Driver: ${DRIVER[*]}"
 echo "Building the trust-certify test binary (release) …"
 
 BUILD_START=$(date +%s)
-"${DRIVER[@]}" test --release --manifest-path crates/Cargo.toml -p trust-certify --lib --no-run
+"${DRIVER[@]}" test --release --manifest-path Cargo.toml -p trust-certify --lib --no-run
 BUILD_RC=$?
 BUILD_ELAPSED=$(( $(date +%s) - BUILD_START ))
 if [ "$BUILD_RC" -ne 0 ]; then
@@ -185,7 +184,7 @@ echo "Build: ${BUILD_ELAPSED}s"
 # `--no-run` prints the binary path, but parsing its human output is brittle;
 # ask for the machine-readable artifact instead. This second invocation is a
 # no-op rebuild.
-TEST_BIN="$("${DRIVER[@]}" test --release --manifest-path crates/Cargo.toml -p trust-certify \
+TEST_BIN="$("${DRIVER[@]}" test --release --manifest-path Cargo.toml -p trust-certify \
   --lib --no-run --message-format=json 2>/dev/null \
   | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1)"
 if [ -z "$TEST_BIN" ] || [ ! -x "$TEST_BIN" ]; then

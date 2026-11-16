@@ -1,0 +1,2 @@
+# Retain the extracted Targo implementation's formatting for source review.
+style_edition = "2024"

@@ -1,4 +1,6 @@
 //! Tests for Cargo's behavior under Rustup.
+// Trust: transparent proxy fixture adapters for SP-1; exact changed coverage
+// is ledgered in tests/upstream-rust/divergence-audit.toml.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -84,18 +86,18 @@ fn real_rustc_wrapper(bin_dir: &Path, message: &str) -> PathBuf {
     make_exe(
         bin_dir,
         "rustc",
-        &format!(
+        &crate::utils::tools::with_transparent_proxy(&format!(
             r#"
                 eprintln!("{message}");
-                let r = std::process::Command::new(env!("CARGO_RUSTUP_TEST_real_rustc"))
+                let r = transparent_proxy::status(std::process::Command::new(env!("CARGO_RUSTUP_TEST_real_rustc"))
                     .args(std::env::args_os().skip(1))
                     {rustup_toolchain_source_setup}
                     {rustup_toolchain_setup}
                     {rustup_home_setup}
-                    .status();
+                    );
                 std::process::exit(r.unwrap().code().unwrap_or(2));
             "#
-        ),
+        )),
         &env,
     )
 }
@@ -166,7 +168,7 @@ impl RustupEnvironmentBuilder {
         let rustc_proxy = make_exe(
             &cargo_bin,
             "rustc",
-            &format!(
+            &crate::utils::tools::with_transparent_proxy(&format!(
                 r#"
                     let file_stem = std::path::PathBuf::from(std::env::args().next().unwrap())
                         .file_stem()
@@ -178,13 +180,13 @@ impl RustupEnvironmentBuilder {
                         arg => panic!("proxy only supports cargo and rustc, got {{arg:?}}"),
                     }};
                     eprintln!("`{{program}}` proxy running");
-                    let r = std::process::Command::new(program)
+                    let r = transparent_proxy::status(std::process::Command::new(program)
                         .args(std::env::args_os().skip(1))
                         {env_setup}
-                        .status();
+                        );
                     std::process::exit(r.unwrap().code().unwrap_or(2));
             "#
-            ),
+            )),
             &[
                 ("CARGO_RUSTUP_TEST_rustc_toolchain_exe", rustc_toolchain_exe),
                 (
@@ -256,6 +258,98 @@ real rustc running
         .run();
 }
 
+#[cargo_test]
+fn absolute_toolchain_path_bypasses_proxy() {
+    let RustupEnvironment {
+        cargo_bin,
+        rustup_home,
+        cargo_toolchain_exe: _,
+    } = RustupEnvironmentBuilder::new().build();
+
+    // Put the toolchain outside RUSTUP_HOME
+    // so it won't be found through named toolchain lookup
+    let toolchain_path = root().join("custom-toolchain");
+    let toolchain_bin = toolchain_path.join("bin");
+    toolchain_bin.mkdir_p();
+    real_rustc_wrapper(&toolchain_bin, "custom toolchain rustc running");
+
+    let p = project().file("src/lib.rs", "").build();
+    let path = prepend_path(&cargo_bin);
+    p.cargo("check")
+        .env("RUSTUP_TOOLCHAIN", &toolchain_path)
+        .env("RUSTUP_HOME", &rustup_home)
+        .env("PATH", &path)
+        .with_stderr_data(str![[r#"
+[CHECKING] foo v0.0.1 ([ROOT]/foo)
+custom toolchain rustc running
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn relative_toolchain_path_uses_proxy() {
+    let RustupEnvironment {
+        cargo_bin,
+        rustup_home,
+        cargo_toolchain_exe: _,
+    } = RustupEnvironmentBuilder::new().build();
+
+    let p = project().file("src/lib.rs", "").build();
+
+    // Create a decoy relative toolchain in cwd to verify Cargo does not
+    // resolve relative toolchain paths against the current directory.
+    let decoy_bin = p.root().join("relative").join("toolchain").join("bin");
+    decoy_bin.mkdir_p();
+    make_exe(
+        &decoy_bin,
+        "rustc",
+        r#"panic!("relative toolchain should not be executed");"#,
+        &[],
+    );
+
+    let path = prepend_path(&cargo_bin);
+    p.cargo("check")
+        .env("RUSTUP_TOOLCHAIN", "relative/toolchain")
+        .env("RUSTUP_HOME", &rustup_home)
+        .env("PATH", &path)
+        .with_stderr_data(str![[r#"
+[CHECKING] foo v0.0.1 ([ROOT]/foo)
+`[..]rustc[EXE]` proxy running
+real rustc running
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn missing_absolute_toolchain_uses_proxy() {
+    let RustupEnvironment {
+        cargo_bin,
+        rustup_home,
+        cargo_toolchain_exe: _,
+    } = RustupEnvironmentBuilder::new().build();
+
+    let missing_toolchain = root().join("non-existent-toolchain");
+
+    let p = project().file("src/lib.rs", "").build();
+    let path = prepend_path(&cargo_bin);
+    p.cargo("check")
+        .env("RUSTUP_TOOLCHAIN", &missing_toolchain)
+        .env("RUSTUP_HOME", &rustup_home)
+        .env("PATH", &path)
+        .with_stderr_data(str![[r#"
+[CHECKING] foo v0.0.1 ([ROOT]/foo)
+`[..]rustc[EXE]` proxy running
+real rustc running
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
 // This doesn't work on Windows because Cargo forces the PATH to contain the
 // sysroot_libdir, which is actually `bin`, preventing the test from
 // overriding the bin directory.
@@ -296,13 +390,18 @@ fn custom_calls_other_cargo() {
             paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
             let path = env::join_paths(paths).unwrap();
 
-            let status = Command::new("cargo")
-                .arg("check")
+            let mut command = Command::new("cargo");
+            command.arg("check")
                 .current_dir(env!("CARGO_RUSTUP_TEST_project_dir"))
-                .env("PATH", path)
-                .status()
-                .unwrap();
-            assert!(status.success());
+                .env("PATH", path);
+            // Trust: the custom command forwards directly to Cargo.
+            #[cfg(unix)] {
+                use std::os::unix::process::CommandExt;
+                panic!("failed to exec cargo: {}", command.exec());
+            }
+            #[cfg(not(unix))] {
+                assert!(command.status().unwrap().success());
+            }
         "#,
         &[
             ("CARGO_RUSTUP_TEST_custom_bin", custom_bin),

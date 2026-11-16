@@ -50,14 +50,16 @@ use std::path::PathBuf;
 /// (`MonoItem::Static` materialization) without depending on trust-cg-codegen
 /// directly.
 pub use trust_cg_codegen::pipeline::ObjectGlobal;
-use trust_cg_ir::{AArch64Opcode, BlockId as MachBlockId, MachFunction, MachOperand};
+use trust_cg_ir::{AArch64Opcode, MachFunction, MachOperand};
 // Trust: the element type of the PUBLIC `CompiledModule::lir_functions` field.
 // It was reachable only through this crate's private import, so an out-of-crate
 // caller could receive a `CompiledModule` but never name its contents or build
 // one. The trust-ir codegen frontend in `rustc_codegen_trust_cg` does both.
 pub use trust_cg_lower::function::Function as LirFunction;
 use trust_cg_lower::function::{BasicBlock as LirBasicBlock, Signature as LirSignature};
-use trust_cg_lower::instructions::{Block, DirectCallBinding, Instruction as LirInstruction, Opcode, Value};
+use trust_cg_lower::instructions::{
+    Block, DirectCallBinding, Instruction as LirInstruction, Opcode, Value,
+};
 use trust_cg_lower::types::Type as LirType;
 use trust_types::VerifiableFunction;
 use trust_types::fx::FxHashSet;
@@ -160,9 +162,15 @@ pub enum FunctionLinkage {
 impl FunctionLinkage {
     fn symbol_binding(self) -> trust_cg_codegen::pipeline::FunctionSymbolBinding {
         match self {
-            Self::External => trust_cg_codegen::pipeline::FunctionSymbolBinding::Global,
-            Self::Internal => trust_cg_codegen::pipeline::FunctionSymbolBinding::Local,
-            Self::Hidden => trust_cg_codegen::pipeline::FunctionSymbolBinding::Hidden,
+            // trust-cg made `FunctionSymbolBinding` a STRUCT of (linkage,
+            // visibility); the three variants this arm used are now the
+            // associated consts naming the same three quadrants, so the
+            // mapping is unchanged. `HIDDEN` is still Global linkage +
+            // Hidden visibility, which is what `FunctionLinkage::Hidden`
+            // documents two lines above.
+            Self::External => trust_cg_codegen::pipeline::FunctionSymbolBinding::GLOBAL,
+            Self::Internal => trust_cg_codegen::pipeline::FunctionSymbolBinding::LOCAL,
+            Self::Hidden => trust_cg_codegen::pipeline::FunctionSymbolBinding::HIDDEN,
         }
     }
 }
@@ -543,6 +551,165 @@ enum TargetObjectFamily {
     Coff,
 }
 
+// Check the ELF local/nonlocal table invariant, not source-level symbol identity.
+fn require_elf_symbol_binding_partition(object: &[u8]) -> Result<(), String> {
+    use trust_cg_codegen::elf::constants::{ELF64_SHDR_SIZE, ELF64_SYM_SIZE, SHT_SYMTAB};
+
+    let malformed = || "emitted ELF symbol binding partition is malformed".to_string();
+    let read_u16 = |at: usize| {
+        object
+            .get(at..at.checked_add(2)?)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u16::from_le_bytes)
+    };
+    let read_u32 = |at: usize| {
+        object
+            .get(at..at.checked_add(4)?)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    let read_u64 = |at: usize| {
+        object
+            .get(at..at.checked_add(8)?)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes)
+    };
+    let section_table =
+        usize::try_from(read_u64(40).ok_or_else(malformed)?).map_err(|_| malformed())?;
+    let section_size = usize::from(read_u16(58).ok_or_else(malformed)?);
+    let section_count = usize::from(read_u16(60).ok_or_else(malformed)?);
+    let table_end = section_count
+        .checked_mul(section_size)
+        .and_then(|size| section_table.checked_add(size))
+        .ok_or_else(malformed)?;
+    if section_size != ELF64_SHDR_SIZE
+        || section_count == 0
+        || object.get(section_table..table_end).is_none()
+    {
+        return Err(malformed());
+    }
+
+    let mut found = false;
+    for index in 0..section_count {
+        let at = section_table + index * section_size;
+        if read_u32(at + 4) != Some(SHT_SYMTAB) {
+            continue;
+        }
+        if found {
+            return Err(malformed());
+        }
+        found = true;
+        let symbols =
+            usize::try_from(read_u64(at + 24).ok_or_else(malformed)?).map_err(|_| malformed())?;
+        let size =
+            usize::try_from(read_u64(at + 32).ok_or_else(malformed)?).map_err(|_| malformed())?;
+        let first_nonlocal =
+            usize::try_from(read_u32(at + 44).ok_or_else(malformed)?).map_err(|_| malformed())?;
+        let entry_size = read_u64(at + 56).ok_or_else(malformed)?;
+        let end = symbols.checked_add(size).ok_or_else(malformed)?;
+        let count = size / ELF64_SYM_SIZE;
+        if entry_size != ELF64_SYM_SIZE as u64
+            || size % ELF64_SYM_SIZE != 0
+            || first_nonlocal == 0
+            || first_nonlocal > count
+            || object.get(symbols..end).is_none()
+        {
+            return Err(malformed());
+        }
+        for symbol in 0..count {
+            let info = object[symbols + symbol * ELF64_SYM_SIZE + 4];
+            let local = info >> 4 == trust_cg_codegen::elf::constants::STB_LOCAL;
+            if local != (symbol < first_nonlocal) {
+                return Err(malformed());
+            }
+        }
+    }
+    if !found {
+        return Err(malformed());
+    }
+    Ok(())
+}
+
+fn emitted_object_family(
+    object: &[u8],
+    target_arch: TrustCgTargetArch,
+) -> Result<TargetObjectFamily, String> {
+    let read_u16 = |offset: usize| {
+        object
+            .get(offset..offset + 2)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u16::from_le_bytes)
+    };
+    let read_u32 = |offset: usize| {
+        object
+            .get(offset..offset + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    let mismatch =
+        || format!("emitted object header does not match {target_arch:?} relocatable target");
+    if object.get(..4) == Some(b"\x7fELF") {
+        let expected_machine = match target_arch {
+            TrustCgTargetArch::AArch64 => trust_cg_codegen::elf::constants::EM_AARCH64,
+            TrustCgTargetArch::X86_64 => trust_cg_codegen::elf::constants::EM_X86_64,
+        };
+        if object.get(..7) != Some(b"\x7fELF\x02\x01\x01")
+            || object.len() < 64
+            || !object.get(7).is_some_and(|osabi| {
+                [
+                    trust_cg_codegen::elf::constants::ELFOSABI_NONE,
+                    trust_cg_codegen::elf::constants::ELFOSABI_GNU,
+                ]
+                .contains(osabi)
+            })
+            || object.get(8) != Some(&0)
+            || read_u16(16) != Some(trust_cg_codegen::elf::constants::ET_REL)
+            || read_u16(18) != Some(expected_machine)
+            || read_u32(20) != Some(u32::from(trust_cg_codegen::elf::constants::EV_CURRENT))
+            || read_u32(48) != Some(0)
+        {
+            return Err(mismatch());
+        }
+        require_elf_symbol_binding_partition(object)?;
+        return Ok(TargetObjectFamily::Elf);
+    }
+    if read_u32(0) == Some(trust_cg_codegen::macho::constants::MH_MAGIC_64) {
+        let (expected_cpu, expected_subtype) = match target_arch {
+            TrustCgTargetArch::AArch64 => (
+                trust_cg_codegen::macho::constants::CPU_TYPE_ARM64,
+                trust_cg_codegen::macho::constants::CPU_SUBTYPE_ARM64_ALL,
+            ),
+            TrustCgTargetArch::X86_64 => (
+                trust_cg_codegen::macho::constants::CPU_TYPE_X86_64,
+                trust_cg_codegen::macho::constants::CPU_SUBTYPE_X86_64_ALL,
+            ),
+        };
+        if object.len() < 32
+            || read_u32(4) != Some(expected_cpu)
+            || read_u32(8) != Some(expected_subtype)
+            || read_u32(12) != Some(trust_cg_codegen::macho::constants::MH_OBJECT)
+        {
+            return Err(mismatch());
+        }
+        return Ok(TargetObjectFamily::MachO);
+    }
+    if target_arch == TrustCgTargetArch::X86_64
+        && object.len() >= 20
+        && read_u16(0) == Some(trust_cg_codegen::coff::IMAGE_FILE_MACHINE_AMD64)
+        && read_u16(16) == Some(0)
+    {
+        return Ok(TargetObjectFamily::Coff);
+    }
+    Err(mismatch())
+}
+
+pub(crate) fn require_object_architecture(
+    object: &[u8],
+    target_arch: TrustCgTargetArch,
+) -> Result<(), String> {
+    emitted_object_family(object, target_arch).map(|_| ())
+}
+
 fn audited_object_family(
     target_arch: TrustCgTargetArch,
     triple: &str,
@@ -651,6 +818,86 @@ impl TrustCgTargetArch {
 }
 
 impl TrustCgCodegenBackend {
+    pub(crate) fn require_object_target(&self, object: &[u8]) -> Result<(), String> {
+        let expected = audited_object_family(self.target_arch, &self.target_triple)
+            .map_err(|error| error.to_string())?;
+        let actual = emitted_object_family(object, self.target_arch)?;
+        if actual != expected {
+            return Err(format!(
+                "emitted object format {actual:?} differs from target `{}`'s {expected:?}",
+                self.target_triple
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exact effective settings retained by the opt-in object replay diagnostic.
+    #[cfg(feature = "ay-proofs")]
+    pub(crate) fn object_replay_descriptor(
+        &self,
+    ) -> Result<crate::object_replay::BackendDescriptor, String> {
+        let Self {
+            target_arch,
+            target_triple,
+            lowering_options,
+            optimization_level,
+            frame_pointer_policy,
+        } = self;
+        let LoweringOptions { panic_symbols, entry_bindings } = lowering_options;
+        if entry_bindings.is_some() {
+            return Err("object replay does not yet retain binary entry bindings".into());
+        }
+        let PanicRuntimeSymbols {
+            add_overflow,
+            sub_overflow,
+            mul_overflow,
+            div_overflow,
+            rem_overflow,
+            neg_overflow,
+            shl_overflow,
+            shr_overflow,
+            div_by_zero,
+            rem_by_zero,
+            null_pointer_dereference,
+        } = panic_symbols;
+        Ok(crate::object_replay::BackendDescriptor {
+            architecture: match target_arch {
+                TrustCgTargetArch::AArch64 => "aarch64",
+                TrustCgTargetArch::X86_64 => "x86_64",
+            }
+            .into(),
+            target_triple: target_triple.clone(),
+            optimization_level: match optimization_level {
+                BridgeOptimizationLevel::O0 => 0,
+                BridgeOptimizationLevel::O1 => 1,
+                BridgeOptimizationLevel::O2 => 2,
+                BridgeOptimizationLevel::O3 => 3,
+            },
+            frame_pointer_policy: match frame_pointer_policy {
+                BridgeFramePointerPolicy::MayOmit => "may-omit",
+                BridgeFramePointerPolicy::NonLeaf => "non-leaf",
+                BridgeFramePointerPolicy::Always => "always",
+            }
+            .into(),
+            panic_symbols: [
+                ("add_overflow", add_overflow),
+                ("sub_overflow", sub_overflow),
+                ("mul_overflow", mul_overflow),
+                ("div_overflow", div_overflow),
+                ("rem_overflow", rem_overflow),
+                ("neg_overflow", neg_overflow),
+                ("shl_overflow", shl_overflow),
+                ("shr_overflow", shr_overflow),
+                ("div_by_zero", div_by_zero),
+                ("rem_by_zero", rem_by_zero),
+                ("null_pointer_dereference", null_pointer_dereference),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.clone()))
+            .collect(),
+            entry_bindings_absent: true,
+        })
+    }
     /// Create a new trust_cg codegen backend for the given target.
     #[must_use]
     pub fn new(target_arch: TrustCgTargetArch) -> Self {
@@ -1106,7 +1353,10 @@ impl TrustCgCodegenBackend {
 
         let mut entry = LirBasicBlock::default();
         entry.instructions.push(LirInstruction {
-            opcode: Opcode::Call { name: spec.callee_symbol_name.clone(), binding: DirectCallBinding::Interposable },
+            opcode: Opcode::Call {
+                name: spec.callee_symbol_name.clone(),
+                binding: DirectCallBinding::Interposable,
+            },
             args: (0..param_count).map(Value).collect(),
             results: call_result.into_iter().collect(),
         });
@@ -1165,105 +1415,24 @@ impl TrustCgCodegenBackend {
         })
     }
 
-    /// Recover cross-block targets after the upstream preparation path has
-    /// resolved symbolic block operands to PC-relative immediates. Frame
-    /// promotion inserts instructions at entry and exit, so those offsets must
-    /// be made symbolic again before running the canonical resolver a second
-    /// time. Same-block fixed-distance branches (for example a guard skipping a
-    /// trap) are intentionally left alone: entry insertion shifts both ends by
-    /// the same amount, and the epilogue begins at the old return position.
-    fn aarch64_resolved_cross_block_targets(
-        func: &MachFunction,
-    ) -> Result<Vec<(usize, MachBlockId)>, CodegenBackendError> {
-        let mut block_ranges = Vec::with_capacity(func.block_order.len());
-        let mut next_offset = 0_i64;
-        for &block_id in &func.block_order {
-            let start = next_offset;
-            for &inst_id in &func.blocks[block_id.0 as usize].insts {
-                if !func.insts[inst_id.0 as usize].is_pseudo() {
-                    next_offset += 1;
-                }
-            }
-            block_ranges.push((block_id, start, next_offset));
-        }
-
-        let mut resolved = Vec::new();
-        let mut inst_offset = 0_i64;
-        for &(source_block, source_start, source_end) in &block_ranges {
-            let block = &func.blocks[source_block.0 as usize];
-            for &inst_id in &block.insts {
-                let inst = &func.insts[inst_id.0 as usize];
-                if inst.is_pseudo() {
-                    continue;
-                }
-
-                let is_branch = matches!(
-                    inst.opcode,
-                    AArch64Opcode::B
-                        | AArch64Opcode::BCond
-                        | AArch64Opcode::Cbz
-                        | AArch64Opcode::Cbnz
-                        | AArch64Opcode::Tbz
-                        | AArch64Opcode::Tbnz
-                );
-                let Some(MachOperand::Imm(relative)) = inst.operands.last() else {
-                    inst_offset += 1;
-                    continue;
-                };
-                if !is_branch {
-                    inst_offset += 1;
-                    continue;
-                }
-
-                let target_offset = inst_offset.checked_add(*relative).ok_or_else(|| {
-                    CodegenBackendError::Pipeline {
-                        func_name: func.name.clone(),
-                        reason: "frame-pointer promotion overflowed a resolved branch offset"
-                            .to_string(),
-                    }
-                })?;
-
-                // Fixed-distance intra-block branches retain their distance.
-                if (source_start..source_end).contains(&target_offset) {
-                    inst_offset += 1;
-                    continue;
-                }
-
-                let candidates = block_ranges
-                    .iter()
-                    .filter(|(_, start, _)| *start == target_offset)
-                    .map(|(block_id, _, _)| *block_id)
-                    .collect::<Vec<_>>();
-                let target = candidates
-                    .iter()
-                    .copied()
-                    .find(|candidate| block.succs.contains(candidate))
-                    .or_else(|| (candidates.len() == 1).then_some(candidates[0]))
-                    .ok_or_else(|| CodegenBackendError::Pipeline {
-                        func_name: func.name.clone(),
-                        reason: format!(
-                            "cannot recover cross-block target at instruction offset \
-                             {inst_offset} (resolved target {target_offset}) while forcing an \
-                             AArch64 frame pointer; refusing to emit stale branch offsets"
-                        ),
-                    })?;
-                resolved.push((inst_id.0 as usize, target));
-                inst_offset += 1;
-            }
-        }
-        Ok(resolved)
-    }
-
-    fn enforce_aarch64_frame_pointer_policy(
+    /// Check the prepared layout without editing an already resolved function.
+    /// `Always` reaches frame lowering before red-zone/shrink-wrap decisions.
+    fn validate_aarch64_frame_pointer_policy(
         &self,
-        func: &mut MachFunction,
+        func: &MachFunction,
         prepared_layout: &trust_cg_codegen::frame::FrameLayout,
     ) -> Result<(), CodegenBackendError> {
-        if prepared_layout.uses_frame_pointer {
-            return Ok(());
+        if self.frame_pointer_policy == BridgeFramePointerPolicy::Always
+            && (!prepared_layout.uses_frame_pointer || prepared_layout.uses_red_zone)
+        {
+            return Err(CodegenBackendError::Pipeline {
+                func_name: func.name.clone(),
+                reason: "AArch64 `always` frame-pointer policy was not honored during preparation"
+                    .to_string(),
+            });
         }
-
         if self.frame_pointer_policy == BridgeFramePointerPolicy::NonLeaf
+            && !prepared_layout.uses_frame_pointer
             && Self::aarch64_has_call(func)
         {
             return Err(CodegenBackendError::Pipeline {
@@ -1272,46 +1441,6 @@ impl TrustCgCodegenBackend {
                     .to_string(),
             });
         }
-        if self.frame_pointer_policy != BridgeFramePointerPolicy::Always {
-            return Ok(());
-        }
-
-        let cross_block_targets = Self::aarch64_resolved_cross_block_targets(func)?;
-        let outgoing_arg_size = trust_cg_codegen::frame::compute_max_outgoing_arg_size(func);
-        let forced_layout =
-            trust_cg_codegen::frame::compute_frame_layout(func, outgoing_arg_size, false);
-        if !forced_layout.uses_frame_pointer {
-            return Err(CodegenBackendError::Pipeline {
-                func_name: func.name.clone(),
-                reason: "AArch64 `always` frame-pointer policy did not produce an FP/LR frame"
-                    .to_string(),
-            });
-        }
-
-        trust_cg_codegen::frame::insert_prologue_epilogue(func, &forced_layout).map_err(
-            |error| CodegenBackendError::Pipeline {
-                func_name: func.name.clone(),
-                reason: format!("AArch64 frame-pointer promotion failed: {error}"),
-            },
-        )?;
-
-        for (inst_index, target) in cross_block_targets {
-            let Some(target_operand) = func.insts[inst_index].operands.last_mut() else {
-                return Err(CodegenBackendError::Pipeline {
-                    func_name: func.name.clone(),
-                    reason: "branch lost its target during AArch64 frame-pointer promotion"
-                        .to_string(),
-                });
-            };
-            *target_operand = MachOperand::Block(target);
-        }
-        let func_name = func.name.clone();
-        trust_cg_codegen::pipeline::resolve_branches(func).map_err(|error| {
-            CodegenBackendError::Pipeline {
-                func_name,
-                reason: format!("AArch64 branch re-resolution failed: {error}"),
-            }
-        })?;
         Ok(())
     }
 
@@ -1320,6 +1449,8 @@ impl TrustCgCodegenBackend {
         trust_cg_codegen::pipeline::Pipeline::new(trust_cg_codegen::pipeline::PipelineConfig {
             opt_level,
             target_triple: self.target_triple.clone(),
+            aarch64_force_frame_pointers: self.frame_pointer_policy
+                == BridgeFramePointerPolicy::Always,
             ..Default::default()
         })
     }
@@ -1363,7 +1494,7 @@ impl TrustCgCodegenBackend {
             // locals-first partition (worse). Fail closed until that path
             // carries the flag too.
             if bindings.iter().any(|binding| {
-                *binding != trust_cg_codegen::pipeline::FunctionSymbolBinding::Global
+                *binding != trust_cg_codegen::pipeline::FunctionSymbolBinding::GLOBAL
             }) {
                 return Err(CodegenBackendError::EmitFailed {
                     reason: "the x86-64 object emitters do not yet carry per-function symbol \
@@ -1384,18 +1515,18 @@ impl TrustCgCodegenBackend {
 
         let mut prepared = Vec::with_capacity(functions.len());
         for func in functions {
-            let (mut prepared_func, metrics) = pipeline
+            let (prepared_func, metrics) = pipeline
                 .prepare_function_with_metrics(func, None)
                 .map_err(|e| CodegenBackendError::Pipeline {
-                func_name: func.name.clone(),
-                reason: e.to_string(),
-            })?;
+                    func_name: func.name.clone(),
+                    reason: e.to_string(),
+                })?;
             let prepared_layout =
                 metrics.frame_layout.as_ref().ok_or_else(|| CodegenBackendError::Pipeline {
                     func_name: func.name.clone(),
                     reason: "AArch64 preparation returned no frame layout".to_string(),
                 })?;
-            self.enforce_aarch64_frame_pointer_policy(&mut prepared_func, prepared_layout)?;
+            self.validate_aarch64_frame_pointer_policy(&prepared_func, prepared_layout)?;
             prepared.push(prepared_func);
         }
 
@@ -1735,8 +1866,73 @@ pub fn assembled_internal_object_globals(
     // GlobalIds are not part of initializer encoding. Canonicalize the checked
     // data subset through the real compiler encoder while leaving function
     // proxies to the function symbol table.
-    let mut data_module = module.clone();
-    data_module.globals = data_globals;
+    // The encoder (`module_object_globals`) reads the layout tables, the target
+    // and the globals, never the function bodies, so the copy leaves them out:
+    // cloning every Function here ran once per emitted function and was the
+    // quadratic part of F1's emission (plan item K; measured 2026-10-01, ~28%
+    // of a 3,200-function compile). Exhaustive destructuring: a new Module
+    // field fails to compile here until someone decides whether it is copied.
+    let trust_ir::Module {
+        name,
+        functions: _,
+        structs,
+        enums,
+        records,
+        closure_types,
+        globals: _,
+        func_types,
+        types,
+        proof_obligations,
+        proof_certificates,
+        target_info,
+        files,
+        obligation_diagnostics,
+        spec_modules,
+        universes,
+        predicates,
+        global_asm,
+        imports,
+        tuple_layouts,
+        completeness,
+        // The drop-glue table (trust-ir v55) maps glue FUNCTIONS to the types
+        // they drop; the data copy carries no function, so it has no glue.
+        drop_glue: _,
+        // The closure-frame table (trust-ir v58) is a layout table, like
+        // `tuple_layouts`: the copy keeps `closure_types`, so it keeps their frames.
+        closure_layouts,
+        // The weight-blob table (trust-ir v70) holds the bytes a
+        // `Constant::TensorBlob` names. The copy keeps only the u64 globals
+        // admitted above, and a tensor-blob initializer is tensor-typed, so no
+        // row of the copy can name a blob: it carries none, and an encoder that
+        // looked one up would refuse the missing digest.
+        blobs: _,
+    } = module;
+    let data_module = trust_ir::Module {
+        name: name.clone(),
+        functions: Vec::new(),
+        structs: structs.clone(),
+        enums: enums.clone(),
+        records: records.clone(),
+        closure_types: closure_types.clone(),
+        globals: data_globals,
+        func_types: func_types.clone(),
+        types: types.clone(),
+        proof_obligations: proof_obligations.clone(),
+        proof_certificates: proof_certificates.clone(),
+        target_info: target_info.clone(),
+        files: files.clone(),
+        obligation_diagnostics: obligation_diagnostics.clone(),
+        spec_modules: spec_modules.clone(),
+        universes: universes.clone(),
+        predicates: predicates.clone(),
+        global_asm: global_asm.clone(),
+        imports: imports.clone(),
+        tuple_layouts: tuple_layouts.clone(),
+        completeness: completeness.clone(),
+        drop_glue: Vec::new(),
+        closure_layouts: closure_layouts.clone(),
+        blobs: Vec::new(),
+    };
     let encoded =
         trust_cg_codegen::compiler::module_object_globals(&data_module).map_err(|error| {
             CodegenBackendError::EmitFailed {
@@ -1876,6 +2072,27 @@ fn collect_trust_location_globals(functions: &[LirFunction]) -> Vec<ObjectGlobal
                     // sufficient alignment is 1 — there is no trust-ir Global
                     // to derive a stricter alignment from.
                     align: 1,
+                    // trust-ir v41 visibility/retention, both at their no-claim
+                    // values. This is a synthesized INTERNAL definition, so
+                    // `Visibility::Default` is vacuous on it by trust-cg's own
+                    // doc ("on a LOCAL definition the flag is vacuous"), and
+                    // `retained: false` because nothing here asks the linker to
+                    // keep an unreferenced copy — a location-file blob that
+                    // nothing references SHOULD be collectable.
+                    visibility: trust_ir::Visibility::Default,
+                    retained: false,
+                    // trust-ir v45 placement, both at their no-claim values
+                    // for the same reason as `retained` above. `section:
+                    // None` means placement by mutability/initializer, which
+                    // is what an immutable synthesized blob wants — and the
+                    // x86-64 emitters refuse every explicit section, so a
+                    // name here would narrow the targets this lane runs on.
+                    // `comdat: false` because a location-file blob is not a
+                    // one-definition-rule definition: it is internal, so no
+                    // other object can carry an equivalent copy to coalesce
+                    // with.
+                    section: None,
+                    comdat: false,
                 }
             })
         })
@@ -2101,6 +2318,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2132,6 +2350,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2189,7 +2408,10 @@ mod tests {
         let mut caller = LirFunction::new("_Rshim_caller".to_string(), LirSignature::default());
         let mut caller_entry = LirBasicBlock::default();
         caller_entry.instructions.push(LirInstruction {
-            opcode: Opcode::Call { name: "_Rshim_callee".to_string(), binding: DirectCallBinding::Interposable },
+            opcode: Opcode::Call {
+                name: "_Rshim_callee".to_string(),
+                binding: DirectCallBinding::Interposable,
+            },
             args: vec![],
             results: vec![],
         });
@@ -2441,6 +2663,77 @@ mod tests {
     }
 
     #[test]
+    fn object_target_binding_requires_exact_format_and_relocatable_header() {
+        let cases = [
+            ("x86_64-unknown-linux-gnu", emit_x86_add_object("x86_64-unknown-linux-gnu")),
+            ("x86_64-apple-darwin", emit_x86_add_object("x86_64-apple-darwin")),
+            ("x86_64-pc-windows-msvc", emit_x86_add_object("x86_64-pc-windows-msvc")),
+        ];
+        for (triple, object) in &cases {
+            let backend = TrustCgCodegenBackend::new_for_triple(TrustCgTargetArch::X86_64, *triple);
+            assert!(backend.require_object_target(object).is_ok(), "{triple}");
+        }
+        let linux = TrustCgCodegenBackend::new_for_triple(
+            TrustCgTargetArch::X86_64,
+            "x86_64-unknown-linux-gnu",
+        );
+        assert!(linux.require_object_target(&cases[1].1).is_err());
+
+        let mut wrong_kind = cases[0].1.clone();
+        wrong_kind[16..18].copy_from_slice(&2u16.to_le_bytes());
+        assert!(linux.require_object_target(&wrong_kind).is_err());
+
+        let mut gnu_osabi = cases[0].1.clone();
+        gnu_osabi[7] = trust_cg_codegen::elf::constants::ELFOSABI_GNU;
+        assert!(linux.require_object_target(&gnu_osabi).is_ok());
+        let mut solaris_osabi = cases[0].1.clone();
+        solaris_osabi[7] = 6;
+        assert!(linux.require_object_target(&solaris_osabi).is_err());
+        let mut no_elf_version = cases[0].1.clone();
+        no_elf_version[20..24].copy_from_slice(&0u32.to_le_bytes());
+        assert!(linux.require_object_target(&no_elf_version).is_err());
+        for offset in [8, 48, 49, 50, 51] {
+            assert_eq!(cases[0].1[offset], 0, "emitter default at offset {offset}");
+            let mut wrong_abi = cases[0].1.clone();
+            wrong_abi[offset] = 1;
+            assert!(linux.require_object_target(&wrong_abi).is_err(), "offset {offset}");
+        }
+        let mut overflowing_sections = cases[0].1.clone();
+        overflowing_sections[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(linux.require_object_target(&overflowing_sections).is_err());
+
+        let mac =
+            TrustCgCodegenBackend::new_for_triple(TrustCgTargetArch::X86_64, "x86_64-apple-darwin");
+        let mut wrong_subtype = cases[1].1.clone();
+        wrong_subtype[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert!(mac.require_object_target(&wrong_subtype).is_err());
+    }
+
+    #[test]
+    fn elf_symbol_partition_accepts_emitted_local_and_global_symbols() {
+        let mut writer =
+            trust_cg_codegen::elf::ElfWriter::new(trust_cg_codegen::elf::ElfMachine::AArch64);
+        let text = writer.add_text_section(&0xd65f03c0u32.to_le_bytes());
+        writer.add_symbol(
+            "local_helper",
+            text,
+            0,
+            4,
+            false,
+            trust_cg_codegen::elf::constants::STT_FUNC,
+        );
+        writer.add_symbol("exported", text, 0, 4, true, trust_cg_codegen::elf::constants::STT_FUNC);
+        let object = writer
+            .write_checked()
+            .expect("a one-instruction text section is a well-formed ELF object");
+        let backend = TrustCgCodegenBackend::new_for_triple(
+            TrustCgTargetArch::AArch64,
+            "aarch64-unknown-linux-gnu",
+        );
+        assert!(backend.require_object_target(&object).is_ok());
+    }
+
+    #[test]
     fn test_x86_aot_rejects_unmapped_object_abi_family() {
         let error = TrustCgCodegenBackend::try_new_for_triple(
             TrustCgTargetArch::X86_64,
@@ -2611,6 +2904,154 @@ mod tests {
         assert!(
             forced_text.len() > default_text.len(),
             "forcing a leaf frame must materially change the emitted function"
+        );
+    }
+
+    #[test]
+    fn aarch64_always_frame_pointer_policy_precedes_darwin_shrinkwrap() {
+        // A well-typed conditional caller: the slow path calls a void callee
+        // and then returns i64 7, so that call cannot become a tail call. The
+        // leaf path returns i64 0 and needs no incoming value across the call.
+        let mut caller = LirFunction::new(
+            "guarded_caller",
+            LirSignature { params: vec![LirType::I32], returns: vec![LirType::I64] },
+        );
+        caller.value_types.extend([
+            (Value(0), LirType::I32),
+            (Value(1), LirType::I64),
+            (Value(2), LirType::I64),
+        ]);
+        caller.block_order = vec![Block(0), Block(1), Block(2)];
+        caller.blocks.insert(
+            Block(0),
+            LirBasicBlock {
+                params: vec![(Value(0), LirType::I32)],
+                instructions: vec![LirInstruction {
+                    opcode: Opcode::Brif {
+                        cond: Value(0),
+                        then_dest: Block(1),
+                        else_dest: Block(2),
+                    },
+                    args: vec![Value(0)],
+                    results: vec![],
+                }],
+                ..Default::default()
+            },
+        );
+        caller.blocks.insert(
+            Block(1),
+            LirBasicBlock {
+                instructions: vec![
+                    LirInstruction {
+                        opcode: Opcode::Call {
+                            name: "guarded_callee".into(),
+                            binding: DirectCallBinding::Interposable,
+                        },
+                        args: vec![],
+                        results: vec![],
+                    },
+                    LirInstruction {
+                        opcode: Opcode::Iconst { ty: LirType::I64, imm: 7 },
+                        args: vec![],
+                        results: vec![Value(1)],
+                    },
+                    LirInstruction {
+                        opcode: Opcode::Return,
+                        args: vec![Value(1)],
+                        results: vec![],
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        caller.blocks.insert(
+            Block(2),
+            LirBasicBlock {
+                instructions: vec![
+                    LirInstruction {
+                        opcode: Opcode::Iconst { ty: LirType::I64, imm: 0 },
+                        args: vec![],
+                        results: vec![Value(2)],
+                    },
+                    LirInstruction {
+                        opcode: Opcode::Return,
+                        args: vec![Value(2)],
+                        results: vec![],
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        crate::validation::validate_lir(&caller)
+            .expect("typed guarded caller must satisfy the maintained LIR validator");
+        let ordinary = macho_aarch64_backend()
+            .with_optimization_level(BridgeOptimizationLevel::O2)
+            .with_frame_pointer_policy(BridgeFramePointerPolicy::NonLeaf);
+        let (_, metrics) = ordinary
+            .trust_cg_pipeline()
+            .prepare_function_with_metrics(&caller, None)
+            .expect("typed guarded caller should prepare");
+        let layout = metrics.frame_layout.expect("actual prepared frame layout");
+        assert!(layout.uses_frame_pointer && !layout.is_leaf);
+
+        let words = |bytes: &[u8]| {
+            mach_o_text(bytes)
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let is_frame_save = |word: u32| {
+            let pair = (30 << 10) | (31 << 5) | 29;
+            let opcode = word & 0xffc0_7fff;
+            opcode == 0xa980_0000 | pair || opcode == 0xa900_0000 | pair
+        };
+        let entry_frame = |words: &[u32]| {
+            let first_control = words
+                .iter()
+                .position(|word| {
+                    word & 0x7c00_0000 == 0x1400_0000
+                        || word & 0xff00_0010 == 0x5400_0000
+                        || word & 0x7e00_0000 == 0x3400_0000
+                        || word & 0x7e00_0000 == 0x3600_0000
+                        || word & 0xfe00_0000 == 0xd600_0000
+                })
+                .unwrap_or(words.len());
+            let prefix = &words[..first_control.min(4)];
+            let pair = (30 << 10) | (31 << 5) | 29;
+            let add_fp_sp = |offset: u32| 0x9100_0000 | (offset << 10) | (31 << 5) | 29;
+            prefix.iter().any(|word| match word & 0xffc0_7fff {
+                opcode if opcode == 0xa980_0000 | pair => prefix.contains(&add_fp_sp(0)),
+                opcode if opcode == 0xa900_0000 | pair => {
+                    let offset = ((word >> 15) & 0x7f) * 8;
+                    prefix.contains(&add_fp_sp(offset))
+                }
+                _ => false,
+            })
+        };
+        let ordinary_object = ordinary
+            .emit_object(std::slice::from_ref(&caller))
+            .expect("ordinary conditional caller should emit");
+        let ordinary_words = words(&ordinary_object);
+        assert!(
+            ordinary_words.iter().any(|word| is_frame_save(*word)),
+            "the ordinary control must really have a frame"
+        );
+        assert!(
+            !entry_frame(&ordinary_words),
+            "the ordinary control must really shrink-wrap past entry"
+        );
+        assert!(
+            ordinary_words.iter().any(|word| word & 0xfc00_0000 == 0x9400_0000),
+            "the conditional caller must retain its actual call"
+        );
+
+        let forced = ordinary.with_frame_pointer_policy(BridgeFramePointerPolicy::Always);
+        let forced_object =
+            forced.emit_object(&[caller]).expect("Always conditional caller should emit");
+        let forced_words = words(&forced_object);
+        assert!(
+            entry_frame(&forced_words),
+            "Always must save FP/LR and establish FP before the entry guard, not merely report a frame: {forced_words:08x?}"
         );
     }
 
@@ -2805,7 +3246,10 @@ mod tests {
         assert_eq!(
             alloc_entry.instructions[0],
             LirInstruction {
-                opcode: Opcode::Call { name: "_Rdefault_alloc".to_string(), binding: DirectCallBinding::Interposable },
+                opcode: Opcode::Call {
+                    name: "_Rdefault_alloc".to_string(),
+                    binding: DirectCallBinding::Interposable
+                },
                 args: vec![Value(0), Value(1)],
                 results: vec![Value(2)],
             }
@@ -2823,7 +3267,10 @@ mod tests {
         assert_eq!(
             oom_entry.instructions[0],
             LirInstruction {
-                opcode: Opcode::Call { name: "_Rdefault_alloc_error_handler".to_string(), binding: DirectCallBinding::Interposable },
+                opcode: Opcode::Call {
+                    name: "_Rdefault_alloc_error_handler".to_string(),
+                    binding: DirectCallBinding::Interposable
+                },
                 args: vec![Value(0), Value(1)],
                 results: vec![],
             }
@@ -3489,6 +3936,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3630,6 +4078,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3724,6 +4173,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3750,10 +4200,28 @@ mod tests {
         let object = backend
             .emit_object(&[lir])
             .expect("forcing a frame must retain valid cross-block branch offsets");
-        assert_eq!(
-            mach_o_text(&object).get(..4),
-            Some(STP_FP_LR_PREINDEX.as_slice()),
-            "the multi-block leaf must receive the requested frame"
+        let text = mach_o_text(&object);
+        assert_eq!(text.get(..4), Some(STP_FP_LR_PREINDEX.as_slice()));
+        let (backedge_index, backedge) = text
+            .chunks_exact(4)
+            .enumerate()
+            .filter_map(|(index, bytes)| {
+                let word = u32::from_le_bytes(bytes.try_into().expect("AArch64 instruction"));
+                (word & 0xfc00_0000 == 0x1400_0000).then_some((index, word))
+            })
+            .last()
+            .expect("loop must retain a backedge branch");
+        let displacement = ((backedge << 6) as i32) >> 6;
+        let target_index = backedge_index as i64 + i64::from(displacement);
+        assert!(target_index >= 2, "backedge must bypass the one-time prologue");
+        let target_offset = usize::try_from(target_index).expect("forward text index") * 4;
+        let target_inst = text
+            .get(target_offset..target_offset + 4)
+            .expect("backedge target must remain inside emitted text");
+        assert_ne!(
+            target_inst,
+            STP_FP_LR_PREINDEX.as_slice(),
+            "backedge must not re-enter the FP/LR save"
         );
     }
 

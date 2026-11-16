@@ -25,7 +25,31 @@ use trust_verifier_api::{
     VerificationRunResult, VerificationRunStatus, VerifierExecutionContext, VerifierResourceLimits,
 };
 
+use super::engine::{
+    TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT, TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY,
+};
 use super::*;
+
+#[path = "engine/kernel_replay_tests.rs"]
+mod kernel_replay_tests;
+
+#[cfg(feature = "trust-build")]
+#[path = "native_wp_tests.rs"]
+mod native_wp_tests;
+
+#[cfg(feature = "trust-build")]
+#[path = "engine/whole_function_receipt_tests.rs"]
+mod whole_function_receipt_tests;
+
+// Synthetic unit-fixture issuer only, inside the existing cfg(test) module.
+// Keep this conspicuous test-only call separate from the audited production
+// issuer; the source census must continue to find exactly one production seam.
+#[cfg(feature = "trust-build")]
+fn whole_function_fixture_source_authority(
+    native: &mut NativeVerificationBundle,
+) -> trust_ir::SourceGenerationAuthority {
+    trust_ir::SourceGenerationAuthority::mint_from_live_lowering(native).unwrap()
+}
 
 fn bundle_with_postcondition(required_strength: Option<ProofStrength>) -> TrustContractBundle {
     bundle_with_obligation(
@@ -157,8 +181,13 @@ fn direct_trust_vc_bundle(obligation_id: &str) -> TrustContractBundle {
         },
         MetadataEntry {
             key: "trust.vc.formula.payload".to_string(),
-            value: serde_json::to_string(&public_predicate)
-                .expect("direct public predicate serializes canonically"),
+            // The producer's canonical bytes (sorted keys), the one spelling
+            // the direct-carrier validator accepts since 10e364d13f.
+            value: String::from_utf8(
+                trust_types::canonical_json_bytes(&public_predicate)
+                    .expect("direct public predicate serializes canonically"),
+            )
+            .expect("canonical JSON is UTF-8"),
         },
         MetadataEntry {
             key: "trust.vc.digest.sha256".to_string(),
@@ -472,27 +501,6 @@ fn direct_trust_vc_receipt_rejects_byte_identical_cross_dispatch_transplant() {
         None,
         &context,
     );
-    // The public batch diagnostic includes measured elapsed milliseconds. Run
-    // a few independent calls until that diagnostic also matches, so this
-    // regression genuinely exercises byte-identical public carriers rather
-    // than obtaining rejection from an incidental timing difference.
-    let second = (0..64)
-        .find_map(|_| {
-            let candidate = engine
-                .verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
-                    &bundle,
-                    &bundle.obligations,
-                    None,
-                    None,
-                    &context,
-                );
-            (candidate.result() == first.result()).then_some(candidate)
-        })
-        .expect("fixture must produce a byte-identical independent public run");
-    let (first_run, mut first_live_receipts) = first.into_parts();
-    let (second_run, second_live_receipts) = second.into_parts();
-    let mut first_receipts = first_live_receipts.take_direct_trust_vc_receipts();
-
     // The public batch diagnostic deliberately reports measured elapsed
     // milliseconds. Normalize only that observational field at this test seam
     // so host timing cannot decide whether the authority test runs. The exact
@@ -518,6 +526,34 @@ fn direct_trust_vc_receipt_rejects_byte_identical_cross_dispatch_transplant() {
         assert_eq!(normalized_count, 1, "one batch timing diagnostic is normalized");
         normalized
     };
+    // Run independent calls until one agrees with the first in everything but
+    // that timing field, so this regression exercises byte-identical public
+    // carriers rather than obtaining rejection from a difference in them. The
+    // comparison must normalize. 77ce4babd5 (2026-08-20) replaced this loop with
+    // one second run compared after normalizing; the b62 squash d24c671211
+    // (2026-08-31) brought back the loop over the raw results, so whether any
+    // of 64 candidates matched was down to host timing (measured
+    // 2026-10-01: the first call's batch took 9-51 ms and later ones 6-9 ms;
+    // 0-2 candidates matched in one series of runs, none in 5 of 5 in another,
+    // which failed the test before its subject).
+    let second = (0..64)
+        .find_map(|_| {
+            let candidate = engine
+                .verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
+                    &bundle,
+                    &bundle.obligations,
+                    None,
+                    None,
+                    &context,
+                );
+            (normalize_batch_elapsed(candidate.result()) == normalize_batch_elapsed(first.result()))
+                .then_some(candidate)
+        })
+        .expect("fixture must produce a byte-identical independent public run");
+    let (first_run, mut first_live_receipts) = first.into_parts();
+    let (second_run, second_live_receipts) = second.into_parts();
+    let mut first_receipts = first_live_receipts.take_direct_trust_vc_receipts();
+
     assert_eq!(
         normalize_batch_elapsed(&first_run),
         normalize_batch_elapsed(&second_run),
@@ -1006,6 +1042,110 @@ fn full_verifier_wall_time_limit_does_not_extend_existing_deadline() {
     assert_eq!(result.evidence[0].status, EvidenceStatus::Timeout);
 }
 
+/// A liveness primary that records the deadline of every context it is handed.
+struct DeadlineRecordingEngine {
+    manifest: EngineManifest,
+    seen: Arc<Mutex<Vec<Option<Instant>>>>,
+}
+
+impl DeadlineRecordingEngine {
+    fn new(seen: Arc<Mutex<Vec<Option<Instant>>>>) -> Self {
+        let mut manifest = EngineManifest::new("ty", "0.1.0", EngineKind::Temporal);
+        manifest.capabilities.push(EngineCapability {
+            obligation_kind: ObligationKind::Liveness,
+            support: SupportLevel::Preferred,
+        });
+        Self { manifest, seen }
+    }
+}
+
+impl VerificationEngine for DeadlineRecordingEngine {
+    fn manifest(&self) -> &EngineManifest {
+        &self.manifest
+    }
+
+    fn supports(&self, obligation: &TrustObligation) -> SupportLevel {
+        if obligation.kind == ObligationKind::Liveness {
+            SupportLevel::Preferred
+        } else {
+            SupportLevel::Unsupported { reason: "liveness only".to_string() }
+        }
+    }
+
+    fn verify_validated(
+        &self,
+        request: ValidatedVerificationRequest<'_>,
+    ) -> Vec<ObligationEvidence> {
+        request
+            .obligations()
+            .iter()
+            .map(|obligation| ObligationEvidence {
+                evidence_id: format!("ty:deadline:{}", obligation.obligation_id),
+                obligation_id: obligation.obligation_id.clone(),
+                engine: self.manifest.clone(),
+                status: EvidenceStatus::Proved,
+                decline: None,
+                proof_strength: Some(ProofStrength {
+                    reasoning: ReasoningKind::TemporalModelCheck,
+                    assurance: AssuranceLevel::Sound,
+                }),
+                artifacts: exact_fixture_proof_artifacts(obligation, "deadline-ty"),
+                counterexample: None,
+                publication: EvidencePublicationMetadata::default(),
+                diagnostics: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn verify_with_context_validated(
+        &self,
+        request: ValidatedVerificationRequest<'_>,
+        context: &VerifierExecutionContext,
+    ) -> VerificationRunResult {
+        self.seen.lock().expect("seen lock").push(context.deadline());
+        let (bundle, obligations) = request.into_parts();
+        let evidence = self.verify_validated(request);
+        VerificationRunResult::from_evidence(
+            context.snapshot(),
+            bundle,
+            self.manifest.clone(),
+            obligations,
+            evidence,
+        )
+    }
+}
+
+/// gate-rca deadline (2026-10-17): the native lane's primary solve stops at the context's
+/// native solve cutoff — the engine is handed the cutoff as its deadline — while the run
+/// itself stays live until the function deadline and keeps the proof the solve made in
+/// time. Control: without a cutoff the engine is handed the function deadline.
+#[test]
+fn full_verifier_hands_the_native_solve_cutoff_to_the_primary_solve() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let engine = FullVerificationEngine::new(
+        vec![Box::new(DeadlineRecordingEngine::new(seen.clone()))],
+        route_only_policy(),
+    );
+    let bundle = bundle_with_obligation(ObligationKind::Liveness, "obligation-live", None, None);
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    let cutoff = Instant::now() + Duration::from_secs(1800);
+
+    let cut = VerifierExecutionContext::new("run-native-cutoff")
+        .with_deadline(deadline)
+        .with_native_solve_cutoff(Some(cutoff));
+    let result = engine.verify_bundle(&bundle, &cut);
+    assert_eq!(result.summary.proved, 1, "a solve inside the cutoff keeps its proof");
+    assert_eq!(result.summary.timed_out, 0, "the run is not late: its deadline is the function's");
+
+    let plain = VerifierExecutionContext::new("run-no-cutoff").with_deadline(deadline);
+    let _ = engine.verify_bundle(&bundle, &plain);
+    assert_eq!(
+        *seen.lock().expect("seen lock"),
+        vec![Some(cutoff), Some(deadline)],
+        "the primary solve is clocked by the cutoff, and only when one is set"
+    );
+}
+
 #[test]
 fn full_verifier_obligation_limit_times_out_before_dispatch() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1450,12 +1590,15 @@ fn historical_trust_wp_metadata_cannot_revive_retired_ownership() {
 }
 
 #[test]
-fn historical_trust_wp_native_request_round_trips_without_reviving_a_route() {
+fn body_aware_trust_wp_request_preserves_primary_and_historical_wire() {
     let live = native_trust_ir_mc_bundle();
-    assert!(
+    assert_eq!(
         live.requests
             .iter()
-            .all(|request| { !matches!(request, NativeVerificationRequest::TrustWp(_)) })
+            .filter(|request| matches!(request, NativeVerificationRequest::TrustWp(_)))
+            .count(),
+        1,
+        "the postcondition has one native deductive alternative",
     );
 
     let historical = historical_native_trust_wp_bundle();
@@ -1786,6 +1929,95 @@ fn full_verifier_reports_refuted_native_ty_temporal_model() {
     assert!(result.evidence[0].counterexample.is_some());
 }
 
+/// L1b (platform pass): a platform obligation — `TemporalSafety` carrying a
+/// refutation-only `TY_TEMPORAL_MODEL_METADATA_KEY` payload, the shape
+/// `trust-platform-derive` emits — routes to the ty primary, the ty primary
+/// among the required native engines is `NativeTyEngine`, and no fallback is
+/// designated. Through the composite it is never proved: no counterexample is
+/// `Unknown` with no strength, a counterexample is `Failed` — and only when
+/// the payload declares the atom vocabulary its formula is vetted against
+/// (derive's payloads do; without one nothing is answered, not even a
+/// refutation).
+#[test]
+fn routing_sends_platform_obligations_to_native_ty() {
+    let platform_bundle_with = |single_writer, vocabulary: bool| {
+        let mut bundle = bundle_with_obligation(
+            ObligationKind::TemporalSafety,
+            "vc:census::spawn_capped:temporal_safety:0",
+            None,
+            None,
+        );
+        let mut payload =
+            trust_types::TyTemporalModelPayload::refutation_only(&trust_types::VcKind::Temporal {
+                property: "AG !bad".to_string(),
+                machine: Some(trust_types::StateMachineMetadata::mmap_temporal_model(
+                    single_writer,
+                )),
+            })
+            .expect("Temporal is a ty-owned kind");
+        if vocabulary {
+            payload = payload.with_vocabulary(["bad".to_string()]);
+        }
+        bundle.obligations[0].metadata.push(MetadataEntry {
+            key: trust_types::TY_TEMPORAL_MODEL_METADATA_KEY.to_string(),
+            value: payload.to_metadata_value().expect("payload serializes"),
+        });
+        bundle
+    };
+    let platform_bundle = |single_writer| platform_bundle_with(single_writer, true);
+    let bundle = platform_bundle(trust_types::SingleWriterEvidence::Verified);
+    let obligation = &bundle.obligations[0];
+
+    let route = super::routing::obligation_route(obligation).expect("TemporalSafety routes");
+    assert_eq!(route.primary, super::routing::PrimaryEngine::Ty);
+    assert_eq!(route.proof_family, super::routing::ProofFamily::TyTemporal);
+    assert!(
+        super::routing::fallback_route(obligation).is_none(),
+        "a platform obligation has no fallback engine"
+    );
+
+    let engines = required_native_engines();
+    let ty: Vec<_> =
+        engines.iter().filter(|engine| route.primary.matches_manifest(engine.manifest())).collect();
+    assert_eq!(ty.len(), 1, "exactly one ty primary among the required native engines");
+    assert!(
+        ty[0].manifest().version.ends_with("+native-temporal"),
+        "the ty primary is NativeTyEngine: {:?}",
+        ty[0].manifest()
+    );
+    assert!(ty[0].supports(obligation).is_supported());
+
+    let engine =
+        FullVerificationEngine::new(vec![Box::new(NativeTyEngine::new())], route_only_policy());
+    let result = engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-platform"));
+    assert_ne!(result.status, VerificationRunStatus::Proved, "{result:#?}");
+    assert_eq!(result.summary.proved, 0);
+    assert!(
+        result.evidence.iter().all(|evidence| evidence.proof_strength.is_none()),
+        "{result:#?}"
+    );
+    assert!(
+        result
+            .evidence
+            .iter()
+            .any(|evidence| evidence.diagnostics.iter().any(|d| d.contains("refutation-only"))),
+        "{result:#?}"
+    );
+
+    let refuted = platform_bundle(trust_types::SingleWriterEvidence::None);
+    let result =
+        engine.verify_bundle(&refuted, &VerifierExecutionContext::new("run-platform-refuted"));
+    assert_eq!(result.summary.failed, 1, "{result:#?}");
+    assert_eq!(result.summary.proved, 0);
+
+    let unvetted = platform_bundle_with(trust_types::SingleWriterEvidence::None, false);
+    let result =
+        engine.verify_bundle(&unvetted, &VerifierExecutionContext::new("run-platform-unvetted"));
+    assert_eq!(result.summary.failed, 0, "{result:#?}");
+    assert_eq!(result.summary.proved, 0);
+    assert!(result.evidence.iter().all(|evidence| evidence.status == EvidenceStatus::Unknown));
+}
+
 #[test]
 fn bounded_required_strength_is_rejected_in_full_mode() {
     let engine = FullVerificationEngine::new(
@@ -2065,11 +2297,12 @@ fn router_native_obligation_source_formula(
                 "line_end": line,
                 "col_end": 19,
             },
-            "public_obligation_id": public_obligation_id,
         })
         .to_string(),
         smtlib: None,
         sort: None,
+        // v41: no clause bindings — an empty table reads as UNBINDABLE, never as a wildcard.
+        bindings: Vec::new(),
     }
 }
 
@@ -2196,20 +2429,24 @@ fn rebind_native_bundle_module_digest(bundle: &mut NativeVerificationBundle) {
 /// TrustMc requests for all three rows.
 fn native_trust_ir_mc_bundle() -> NativeVerificationBundle {
     let mut module = trust_ir::Module::new("router_native_trust_ir_bundle");
-    let source_file = module.intern_file("router_native_fixture.rs");
+    let source_file =
+        module.intern_file("router_native_fixture.rs").expect("Module::intern_file: test fixture");
     let function_id = trust_ir::FuncId::new(0);
-    let func_ty = module.add_func_type(trust_ir::FuncTy {
-        params: Vec::new(),
-        returns: Vec::new(),
-        is_vararg: false,
-    });
+    let func_ty = module
+        .add_func_type(trust_ir::FuncTy {
+            params: Vec::new(),
+            returns: Vec::new(),
+            is_vararg: false,
+            abi: None,
+        })
+        .expect("Module::add_func_type: test fixture");
     let entry = trust_ir::BlockId::new(0);
     let mut function = trust_ir::Function::new(function_id, "checked_transfer", func_ty, entry)
         .with_producer(trust_ir::Producer::TrustIr);
     let mut block = trust_ir::Block::new(entry);
     block.body.push(trust_ir::InstrNode::new(trust_ir::Inst::Return { values: Vec::new() }));
     function.blocks.push(block);
-    module.add_function(function);
+    module.try_add_function(function).expect("Module::try_add_function: test fixture");
     module.proof_obligations.push(
         trust_ir::ProofObligation::new(
             trust_ir::ProofId::new(0),
@@ -2300,6 +2537,7 @@ fn native_trust_ir_mc_bundle() -> NativeVerificationBundle {
 /// while making the planner's zero-TrustWP invariant anti-vacuous.
 fn historical_native_trust_wp_bundle() -> NativeVerificationBundle {
     let mut bundle = native_trust_ir_mc_bundle();
+    bundle.requests.retain(|request| !matches!(request, NativeVerificationRequest::TrustWp(_)));
     let request_index = bundle
         .requests
         .iter()
@@ -2449,20 +2687,24 @@ fn kernel_certified_postcondition_fixture() -> (TrustContractBundle, NativeVerif
     let public_semantic_digest = proof_digest_from_canonical_sha256(&public_semantic_digest);
 
     let mut module = trust_ir::Module::new("router_kernel_certified_trust_vc_trust_mc_bundle");
-    let source_file = module.intern_file("router_kernel_fixture.rs");
+    let source_file =
+        module.intern_file("router_kernel_fixture.rs").expect("Module::intern_file: test fixture");
     let function_id = trust_ir::FuncId::new(0);
-    let func_ty = module.add_func_type(trust_ir::FuncTy {
-        params: Vec::new(),
-        returns: Vec::new(),
-        is_vararg: false,
-    });
+    let func_ty = module
+        .add_func_type(trust_ir::FuncTy {
+            params: Vec::new(),
+            returns: Vec::new(),
+            is_vararg: false,
+            abi: None,
+        })
+        .expect("Module::add_func_type: test fixture");
     let entry = trust_ir::BlockId::new(0);
     let mut function = trust_ir::Function::new(function_id, "checked_transfer", func_ty, entry)
         .with_producer(trust_ir::Producer::TrustIr);
     let mut block = trust_ir::Block::new(entry);
     block.body.push(trust_ir::InstrNode::new(trust_ir::Inst::Return { values: Vec::new() }));
     function.blocks.push(block);
-    module.add_function(function);
+    module.try_add_function(function).expect("Module::try_add_function: test fixture");
 
     module.proof_obligations.push(
         trust_ir::ProofObligation::new(
@@ -2719,6 +2961,8 @@ fn native_trust_ir_unreplayed_trust_vc_bundle() -> NativeVerificationBundle {
         evidence: trust_ir::ProofEvidence::LeanProof(
             "exact trust_vc.Router.unreplayed_fixture".to_string(),
         ),
+        // v41: no native evidence bundle to project a coverage assurance from.
+        assurance: None,
     };
     let certificate_ref = certificate.lineage_ref();
     bundle.module.proof_certificates.push(certificate);
@@ -2813,8 +3057,9 @@ fn native_trust_mc_safe_trust_ir_bundle() -> NativeVerificationBundle {
         fb.build();
     }
 
-    let mut module = mb.build();
-    let source_file = module.intern_file("router_native_fixture.rs");
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
+    let source_file =
+        module.intern_file("router_native_fixture.rs").expect("Module::intern_file: test fixture");
     let trust_mc_function = module
         .functions
         .iter()
@@ -2900,11 +3145,7 @@ fn native_trust_mc_safe_trust_ir_bundle() -> NativeVerificationBundle {
         function: trust_mc_function,
         obligations: vec![ProofId::new(0)],
         lineage_roots: vec![ProofLineageId::new(0)],
-        options: {
-            let mut options = trust_ir::TrustMcRequestOptions::default();
-            options.chc.emit_horn_clauses = true;
-            options
-        },
+        options: trust_ir_bridge::trust_mc_chc_request_options(),
         diagnostics: Default::default(),
         provenance: NativeRequestProvenance::trust_mc(
             NativeToolIdentity::new("trust-mc")
@@ -4049,7 +4290,9 @@ fn native_trust_ir_bundle_identity_is_preserved_for_active_trust_mc() {
     }));
     assert!(manifest.diagnostics.iter().any(|diagnostic| {
         diagnostic.contains("typed TrustIr NativeVerificationBundle indexed")
-            && diagnostic.contains("requests=3")
+            // The three original primary requests keep their identities; the
+            // postcondition also carries one separate native WP alternative.
+            && diagnostic.contains("requests=4")
     }));
 
     let structured = result.full_verification_obligation_evidence();
@@ -4650,6 +4893,47 @@ fn missing_primary_evidence_fails_without_skipping_obligation() {
 }
 
 #[test]
+fn pre_solve_stop_generic_primary_cannot_copy_native_or_router_phase() {
+    for (name, kind, obligation_kind) in [
+        ("trust-mc", EngineKind::Reachability, ObligationKind::ArithmeticSafety),
+        ("trust-vc", EngineKind::Deductive, ObligationKind::MemorySafety),
+    ] {
+        let engine = FullVerificationEngine::new(
+            vec![Box::new(UnitEngine::new(
+                name,
+                kind,
+                obligation_kind.clone(),
+                SupportLevel::Preferred,
+                UnitEvidenceMode::Evidence {
+                    status: EvidenceStatus::Unsupported,
+                    proof_strength: None,
+                    artifacts: Vec::new(),
+                    diagnostics: vec![
+                        trust_verifier_api::NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC.into(),
+                        trust_verifier_api::ROUTED_NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC.into(),
+                    ],
+                },
+            ))],
+            route_only_policy(),
+        );
+        let bundle = bundle_with_obligation(obligation_kind, "copied-phase", None, None);
+        let result = engine.verify_bundle(&bundle, &VerifierExecutionContext::new("copied-phase"));
+        assert!(!result.is_fully_proved());
+        assert_eq!(result.evidence.len(), 1);
+        let row = &result.evidence[0];
+        assert_eq!(row.status, EvidenceStatus::Unsupported);
+        assert!(row.proof_strength.is_none() && row.artifacts.is_empty() && row.decline.is_none());
+        assert!(
+            !row.diagnostics.iter().any(|d| {
+                d == trust_verifier_api::NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC
+                    || d == trust_verifier_api::ROUTED_NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC
+            }),
+            "generic primary {name} copied a native stop phase through the composite"
+        );
+    }
+}
+
+#[test]
 fn bounded_primary_evidence_fails_full_mode() {
     let engine = FullVerificationEngine::new(
         vec![Box::new(UnitEngine::proving(
@@ -5047,15 +5331,16 @@ fn required_engine_policy_rejects_name_only_experimental_placeholder() {
     );
 }
 
-/// Trust (#59, 2026-08-19) — the concurrency obligations MUST NOT ROUTE.
+/// Trust (#59, 2026-08-19) — these concurrency obligations MUST NOT ROUTE.
 ///
-/// CLAUDE.md records why this matters, and it is not a style point:
-/// `trust-vcgen/src/data_race.rs` and `memory_ordering/checker.rs` emit
-/// `reach_a AND reach_b AND true` — the happens-before question is decided in Rust
-/// beforehand and hardcoded, so the obligation is VACUOUS. Routing a vacuous
-/// obligation to any engine manufactures a verdict about a claim nobody stated.
+/// Potential-race producers now emit `UnsupportedMir` candidates, not
+/// solver-dischargeable race VCs. The typed `trust.vc/insufficient_ordering`
+/// obligation still lacks an execution model, and a typed `data_race` obligation
+/// must not gain a route independently of authenticated source, event, and
+/// happens-before evidence. Local atomic-log ordering checks remain separate.
 ///
-/// Today that cannot happen, but only INCIDENTALLY: `ObligationKind::Custom { .. }
+/// These typed obligations cannot route today, but only INCIDENTALLY:
+/// `ObligationKind::Custom { .. }
 /// => return None` is a catch-all reached after the two privileged namespace arms,
 /// and `fallback_route` returns `None` unconditionally. Nothing anywhere asserted
 /// the intent, so the protection was a side effect of the match order rather than a
@@ -5066,9 +5351,9 @@ fn required_engine_policy_rejects_name_only_experimental_placeholder() {
 /// someone who has not read the hazard note. This test makes that edit go RED
 /// instead of green.
 ///
-/// THE UNBLOCK CONDITION, stated so this test is not read as a permanent veto: route
-/// these only once the emitters carry a REAL happens-before model. The gate is the
-/// formula, not this assertion.
+/// THE UNBLOCK CONDITION, stated so this test is not read as a permanent veto:
+/// route these only once the emitters carry a real memory and happens-before model.
+/// The gate is the model, not this assertion.
 #[test]
 fn concurrency_obligations_are_unroutable_until_their_formula_is_real() {
     fn custom(namespace: &str, name: &str) -> TrustObligation {
@@ -5093,16 +5378,12 @@ fn concurrency_obligations_are_unroutable_until_their_formula_is_real() {
 
         assert!(
             super::routing::obligation_route(&obligation).is_none(),
-            "`trust.vc/{name}` MUST NOT route: its emitted formula is \
-             `reach_a AND reach_b AND true`, so any engine asked to discharge it would \
-             return a verdict about a claim nobody stated. Route it only after the \
-             emitter carries a real happens-before model."
+            "`trust.vc/{name}` MUST NOT route without an authenticated concurrency model"
         );
         assert!(
             super::routing::fallback_route(&obligation).is_none(),
-            "`trust.vc/{name}` MUST NOT reach a fallback engine either — a second \
-             engine discharging a vacuous obligation is the same defect with a \
-             different label."
+            "`trust.vc/{name}` MUST NOT reach a fallback engine without an authenticated \
+             concurrency model"
         );
     }
 }
@@ -5131,4 +5412,411 @@ fn the_privileged_hardened_namespace_still_routes() {
         "the hardened namespace is the ONE privileged Custom namespace and must still \
          route — without this, the unroutability guard above could pass vacuously"
     );
+}
+
+/// A native-trust-mc look-alike that records every obligation it is asked to
+/// solve. Default-feature builds have no in-process native trust-mc adapter,
+/// so the router falls through to this engine's `verify_validated` whenever it
+/// dispatches the row.
+struct DispatchRecordingNativeTrustMc {
+    manifest: EngineManifest,
+    dispatched: Arc<Mutex<Vec<String>>>,
+}
+
+impl DispatchRecordingNativeTrustMc {
+    fn new(dispatched: Arc<Mutex<Vec<String>>>) -> Self {
+        let mut manifest = EngineManifest::new(
+            "trust-mc",
+            "0.1.0+native-trust-ir-bundle",
+            EngineKind::Reachability,
+        );
+        manifest.repository = Some("trust-bmc".to_string());
+        manifest.capabilities.push(EngineCapability {
+            obligation_kind: ObligationKind::Assertion,
+            support: SupportLevel::Preferred,
+        });
+        Self { manifest, dispatched }
+    }
+}
+
+impl VerificationEngine for DispatchRecordingNativeTrustMc {
+    fn manifest(&self) -> &EngineManifest {
+        &self.manifest
+    }
+
+    fn supports(&self, obligation: &TrustObligation) -> SupportLevel {
+        if obligation.kind == ObligationKind::Assertion {
+            SupportLevel::Preferred
+        } else {
+            SupportLevel::Unsupported { reason: "assertions only".to_string() }
+        }
+    }
+
+    fn verify_validated(
+        &self,
+        request: ValidatedVerificationRequest<'_>,
+    ) -> Vec<ObligationEvidence> {
+        request
+            .obligations()
+            .iter()
+            .map(|obligation| {
+                self.dispatched
+                    .lock()
+                    .expect("dispatch log")
+                    .push(obligation.obligation_id.clone());
+                ObligationEvidence {
+                    evidence_id: format!("trust-mc:recorded:{}", obligation.obligation_id),
+                    obligation_id: obligation.obligation_id.clone(),
+                    engine: self.manifest.clone(),
+                    status: EvidenceStatus::Proved,
+                    decline: None,
+                    proof_strength: Some(ProofStrength {
+                        reasoning: ReasoningKind::Pdr,
+                        assurance: AssuranceLevel::SmtBacked,
+                    }),
+                    artifacts: exact_fixture_proof_artifacts(obligation, "recorded-trust-mc"),
+                    counterexample: None,
+                    publication: EvidencePublicationMetadata::default(),
+                    diagnostics: Vec::new(),
+                }
+            })
+            .collect()
+    }
+}
+
+const NATIVE_TRUST_MC_SKIP_DIAGNOSTIC: &str = "native trust-mc solve not dispatched";
+
+fn native_trust_mc_skip_obligation(kind: ObligationKind, exact: bool) -> TrustObligation {
+    let mut obligation = native_trust_ir_obligation(
+        "trust-mc",
+        1,
+        1,
+        kind,
+        Some(ProofStrength { reasoning: ReasoningKind::Pdr, assurance: AssuranceLevel::SmtBacked }),
+    );
+    if exact {
+        obligation.metadata.push(MetadataEntry {
+            key: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY.to_string(),
+            value: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT.to_string(),
+        });
+    }
+    obligation
+}
+
+/// The `bundle`-role materialization's payload of `bundle`, decoded.
+fn native_bundle_transport_payload_of(bundle: &NativeVerificationBundle) -> serde_json::Value {
+    let index = super::native_trust_ir::NativeTrustIrEvidenceIndex::from_bundle(bundle);
+    assert!(
+        index.validation_errors_for_test().is_empty(),
+        "fixture bundle must index cleanly: {:?}",
+        index.validation_errors_for_test()
+    );
+    let bytes = index
+        .bundle_artifact_for_test()
+        .materialization
+        .as_ref()
+        .expect("fixture bundle materializes inline")
+        .bytes()
+        .to_vec();
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("bundle envelope is JSON");
+    assert_eq!(envelope["role"], "bundle");
+    envelope["payload"].take()
+}
+
+fn native_bundle_transport_atoms(payload: &serde_json::Value) -> Vec<serde_json::Value> {
+    payload["bundle"]["requests"]
+        .as_array()
+        .expect("requests")
+        .iter()
+        .flat_map(|request| request.as_object().expect("tagged request").values())
+        .flat_map(|request| {
+            request["provenance"]["replay_context"]["atoms"].as_array().cloned().unwrap_or_default()
+        })
+        .collect()
+}
+
+/// G3 (2026-10-27): the bundle materialization carried every obligation formula
+/// twice (once in the module, once in its request's replay atom), which put
+/// agy-alab's `civil_from_days` bundle at 19.7 MB, over the 16 MiB inline cap, and
+/// cost every row of the function its native evidence. A replay atom whose formula
+/// is byte-identical to its obligation's now carries a reference; an atom whose
+/// formula differs (obligation 1 in this fixture) stays inline; and the reader
+/// restores the exact typed bundle.
+#[test]
+fn native_bundle_transport_references_duplicate_replay_formulas_and_rehydrates_exactly() {
+    let bundle = native_trust_ir_mc_bundle();
+    let payload = native_bundle_transport_payload_of(&bundle);
+    assert_eq!(payload["encoding"], super::NATIVE_BUNDLE_REPLAY_FORMULA_REF_ENCODING);
+    assert_eq!(payload.as_object().map(serde_json::Map::len), Some(2));
+
+    let atoms = native_bundle_transport_atoms(&payload);
+    let referenced = atoms
+        .iter()
+        .filter(|atom| atom.get("formula_ref").is_some())
+        .map(|atom| {
+            assert!(atom.get("formula").is_none(), "a referenced atom keeps no inline copy");
+            assert_eq!(atom["formula_ref"]["obligation"], atom["obligation"]);
+            atom["obligation"].as_u64().expect("obligation id")
+        })
+        .collect::<Vec<_>>();
+    let inline = atoms
+        .iter()
+        .filter(|atom| atom.get("formula").is_some())
+        .map(|atom| atom["obligation"].as_u64().expect("obligation id"))
+        .collect::<Vec<_>>();
+    assert_eq!(referenced, vec![0, 2], "byte-identical replay formulas are referenced");
+    assert_eq!(inline, vec![1], "a replay formula that differs from its obligation stays inline");
+
+    let rehydrated = super::rehydrate_native_bundle_transport_payload(&payload)
+        .expect("the reader restores the bundle");
+    assert_eq!(rehydrated, bundle, "the transport encoding is lossless");
+    assert_eq!(rehydrated.stable_digest(), bundle.stable_digest());
+}
+
+/// The cap itself, through `NativeTrustIrEvidenceIndex::from_bundle` (the in-process
+/// engine's index): a bundle whose obligation formula and its replay-atom copy are
+/// each ~12 MB of JSON (6 MB of SMT-LIB, carried in both `payload` and `smtlib`)
+/// serializes to ~24 MB, more than `MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES`
+/// (16 MiB), with the copy inline, and to ~12 MB with the copy referenced. Before the fix this
+/// index reported "canonical TrustIr bundle payload is empty or exceeds inline
+/// transport limit" and refused every proof on the bundle; the positive control
+/// below measures that the plain JSON is over the cap, so the test cannot pass by
+/// the fixture being small.
+#[test]
+fn native_bundle_over_the_inline_cap_only_by_replay_duplicates_still_materializes() {
+    let mut bundle = native_trust_ir_mc_bundle();
+    let large = trust_ir::ProofFormula::smtlib2(
+        format!("(and {})", vec!["true"; 1_200_000].join(" ")),
+        "Bool",
+    );
+    replace_native_proof_obligation_formula(&mut bundle, trust_ir::ProofId::new(0), large.clone());
+    replace_router_native_replay_formula(
+        &mut bundle,
+        trust_ir::NativeVerifierSuite::TrustMc,
+        trust_ir::ProofId::new(0),
+        large,
+    );
+    rebind_native_bundle_module_digest(&mut bundle);
+    bundle.validate().expect("large fixture remains a valid bundle");
+    let plain = serde_json::to_vec(&bundle).expect("plain bundle JSON");
+    assert!(
+        plain.len() > trust_verifier_api::MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES,
+        "positive control: the plain bundle must exceed the inline cap ({} bytes)",
+        plain.len()
+    );
+
+    let payload = native_bundle_transport_payload_of(&bundle);
+    let rehydrated = super::rehydrate_native_bundle_transport_payload(&payload)
+        .expect("the reader restores the large bundle");
+    assert_eq!(rehydrated, bundle);
+}
+
+fn first_referenced_transport_atom_mut(payload: &mut serde_json::Value) -> &mut serde_json::Value {
+    payload["bundle"]["requests"]
+        .as_array_mut()
+        .expect("requests")
+        .iter_mut()
+        .flat_map(|request| request.as_object_mut().expect("tagged request").values_mut())
+        .flat_map(|request| {
+            request["provenance"]["replay_context"]["atoms"].as_array_mut().into_iter().flatten()
+        })
+        .find(|atom| atom.get("formula_ref").is_some())
+        .expect("fixture has a referenced atom")
+}
+
+/// Negative controls for the reader: every malformed reference is refused.
+#[test]
+fn native_bundle_transport_reader_refuses_malformed_references() {
+    let bundle = native_trust_ir_mc_bundle();
+    let payload = native_bundle_transport_payload_of(&bundle);
+    let refuse = |payload: &serde_json::Value, needle: &str| {
+        let error = super::rehydrate_native_bundle_transport_payload(payload)
+            .expect_err("malformed transport payload must be refused");
+        assert!(error.contains(needle), "{needle:?} not in {error:?}");
+    };
+    let with_atom = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut payload = payload.clone();
+        edit(first_referenced_transport_atom_mut(&mut payload));
+        payload
+    };
+
+    // Another encoding (the plain bundle JSON, or a forged name).
+    refuse(&payload["bundle"], "encoding");
+    let mut forged = payload.clone();
+    forged["encoding"] = serde_json::json!("trust.native-bundle.replay-formula-ref.v0");
+    refuse(&forged, "encoding");
+    // A reference to some other obligation than the atom's own.
+    refuse(
+        &with_atom(&|atom| atom["formula_ref"]["obligation"] = serde_json::json!(1)),
+        "not the atom's own",
+    );
+    // A reference whose target is absent.
+    refuse(
+        &with_atom(&|atom| {
+            atom["formula_ref"]["obligation"] = serde_json::json!(99);
+            atom["obligation"] = serde_json::json!(99);
+        }),
+        "absent obligation 99",
+    );
+    // Both an inline formula and a reference.
+    refuse(
+        &with_atom(&|atom| atom["formula"] = serde_json::json!({"schema": "x", "payload": "y"})),
+        "both an inline formula and a formula reference",
+    );
+    // A reference that is not exactly `{"obligation": id}`.
+    refuse(
+        &with_atom(&|atom| atom["formula_ref"]["extra"] = serde_json::json!(true)),
+        "is not `{\"obligation\": <id>}`",
+    );
+    // The referenced obligation formula was changed: the restored atom no longer
+    // reproduces the payload digest the producer recorded over its formula.
+    let mut changed = payload.clone();
+    let obligations =
+        changed["bundle"]["module"]["proof_obligations"].as_array_mut().expect("obligations");
+    let target = obligations
+        .iter_mut()
+        .find(|obligation| obligation["id"] == serde_json::json!(0))
+        .expect("obligation 0");
+    target["formula"]["smtlib"] = serde_json::json!("(not true)");
+    refuse(&changed, "does not reproduce its recorded payload digest");
+    // A repeated obligation id makes every reference to it ambiguous.
+    let mut repeated = payload.clone();
+    let obligations =
+        repeated["bundle"]["module"]["proof_obligations"].as_array_mut().expect("obligations");
+    let copy = obligations[0].clone();
+    obligations.push(copy);
+    refuse(&repeated, "is repeated");
+}
+
+/// The admission-valid TrustMc fixture with a validation error injected: an
+/// unsupported schema version. The over-limit bundle measured on tla-cert
+/// reaches the same refusal through the inline-materialization check.
+fn invalid_native_trust_ir_mc_bundle() -> NativeVerificationBundle {
+    let mut native_bundle = native_trust_ir_mc_bundle();
+    native_bundle.schema_version = u32::MAX;
+    assert!(native_bundle.validate().is_err(), "fixture must fail native bundle validation");
+    native_bundle
+}
+
+fn native_manifest_for_skip_tests() -> EngineManifest {
+    DispatchRecordingNativeTrustMc::new(Arc::new(Mutex::new(Vec::new()))).manifest
+}
+
+/// fix10 (tla-cert timeouts): the dispatch predicate itself. It fires only when
+/// neither of the native trust-mc lane's countable outcomes is possible.
+#[test]
+fn native_trust_mc_skip_predicate_fires_only_when_no_outcome_could_publish() {
+    let invalid = super::native_trust_ir::NativeTrustIrEvidenceIndex::from_bundle(
+        &invalid_native_trust_ir_mc_bundle(),
+    );
+    let valid = super::native_trust_ir::NativeTrustIrEvidenceIndex::from_bundle(
+        &native_trust_ir_mc_bundle(),
+    );
+    let native = native_manifest_for_skip_tests();
+    let policy = FullVerificationPolicy::default();
+    assert!(policy.require_proof_artifacts);
+    let assertion = native_trust_mc_skip_obligation(ObligationKind::Assertion, false);
+    let route = super::routing::obligation_route(&assertion).expect("assertion routes");
+    assert_eq!(route.primary, super::routing::PrimaryEngine::TrustMc);
+
+    let reason = super::engine::native_trust_mc_solve_cannot_publish(
+        policy,
+        route,
+        &native,
+        &assertion,
+        Some(&invalid),
+    )
+    .expect("invalid bundle + unattested non-postcondition row must not dispatch");
+    assert!(reason.contains(NATIVE_TRUST_MC_SKIP_DIAGNOSTIC), "{reason}");
+    assert!(reason.contains("missing a valid typed TrustIr NativeVerificationBundle"), "{reason}");
+
+    let skip = |policy, manifest: &EngineManifest, obligation: &TrustObligation, index| {
+        super::engine::native_trust_mc_solve_cannot_publish(
+            policy, route, manifest, obligation, index,
+        )
+    };
+    // A valid bundle, or none at all: proofs can count, so dispatch.
+    assert_eq!(skip(policy, &native, &assertion, Some(&valid)), None);
+    assert_eq!(skip(policy, &native, &assertion, None), None);
+    // Artifacts not required: the bundle refusal is not consulted for proofs.
+    let lax = FullVerificationPolicy { require_proof_artifacts: false, ..policy };
+    assert_eq!(skip(lax, &native, &assertion, Some(&invalid)), None);
+    // A refutation that could count keeps the row dispatched.
+    let exact = native_trust_mc_skip_obligation(ObligationKind::Assertion, true);
+    assert_eq!(skip(policy, &native, &exact, Some(&invalid)), None);
+    let postcondition = native_trust_mc_skip_obligation(ObligationKind::Postcondition, false);
+    assert_eq!(skip(policy, &native, &postcondition, Some(&invalid)), None);
+    // Only the native trust-mc adapter's outcomes are reasoned about.
+    let mut other = native.clone();
+    other.repository = Some("elsewhere".to_string());
+    assert_eq!(skip(policy, &other, &assertion, Some(&invalid)), None);
+}
+
+#[cfg(not(feature = "trust-build"))]
+fn run_recording_native_trust_mc(
+    exact: bool,
+    native_bundle: &NativeVerificationBundle,
+) -> (VerificationRunResult, Vec<String>) {
+    let dispatched = Arc::new(Mutex::new(Vec::new()));
+    let engine = FullVerificationEngine::new(
+        vec![Box::new(DispatchRecordingNativeTrustMc::new(Arc::clone(&dispatched)))],
+        route_only_policy(),
+    );
+    let mut bundle = TrustContractBundle::empty(
+        "bundle-native-trust-mc-skip",
+        BundleSubject::Function {
+            crate_name: "demo".to_string(),
+            path: "demo::checked_transfer".to_string(),
+        },
+    );
+    bundle.obligations = vec![native_trust_mc_skip_obligation(ObligationKind::Assertion, exact)];
+    let result = engine.verify_bundle_with_native_trust_ir_bundle(
+        &bundle,
+        native_bundle,
+        &VerifierExecutionContext::new("run-native-trust-mc-skip"),
+    );
+    let dispatched = dispatched.lock().expect("dispatch log").clone();
+    (result, dispatched)
+}
+
+/// End to end through the router: the skipped row is never sent to the
+/// engine, is `Unsupported` (never `Proved`), and names why.
+#[cfg(not(feature = "trust-build"))]
+#[test]
+fn native_trust_mc_is_not_dispatched_when_no_outcome_could_publish() {
+    let (result, dispatched) =
+        run_recording_native_trust_mc(false, &invalid_native_trust_ir_mc_bundle());
+
+    assert!(dispatched.is_empty(), "solve must not be dispatched: {dispatched:?}");
+    assert_eq!(result.summary.proved, 0, "{result:#?}");
+    let evidence = &result.evidence[0];
+    assert_eq!(evidence.status, EvidenceStatus::Unsupported);
+    assert!(evidence.proof_strength.is_none());
+    assert!(
+        evidence
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains(NATIVE_TRUST_MC_SKIP_DIAGNOSTIC)),
+        "{:?}",
+        evidence.diagnostics
+    );
+    assert!(!result.full_verification_obligation_evidence()[0].has_accepted_proof());
+}
+
+/// The controls: an exact-attested row against the same invalid bundle, and an
+/// unattested row against a valid one, both reach the engine.
+#[cfg(not(feature = "trust-build"))]
+#[test]
+fn native_trust_mc_still_dispatches_when_an_outcome_could_publish() {
+    let (result, dispatched) =
+        run_recording_native_trust_mc(true, &invalid_native_trust_ir_mc_bundle());
+    assert_eq!(dispatched.len(), 1, "exact-attested row must dispatch");
+    assert_eq!(result.summary.proved, 0, "an invalid bundle still never proves: {result:#?}");
+    assert!(
+        result.evidence[0].diagnostics.iter().all(|d| !d.contains(NATIVE_TRUST_MC_SKIP_DIAGNOSTIC))
+    );
+
+    let (_result, dispatched) = run_recording_native_trust_mc(false, &native_trust_ir_mc_bundle());
+    assert_eq!(dispatched.len(), 1, "a valid bundle must dispatch");
 }

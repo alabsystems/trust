@@ -25,8 +25,8 @@
 
 clean {
     def dup_pick (a b : UInt64) : UInt64 := a
-    //~^ ERROR `dup_pick` is declared twice in this batch
 }
+//~^^ ERROR `dup_pick` is declared twice in this batch
 
 clean mod clean_unit_dup_name_helper;
 

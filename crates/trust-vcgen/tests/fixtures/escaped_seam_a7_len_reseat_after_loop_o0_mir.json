@@ -1,0 +1,1241 @@
+{
+  "name": "len_reseat_after_loop",
+  "def_path": "a7_pins::len_reseat_after_loop",
+  "span": {
+    "file": "a7_pins.rs",
+    "line_start": 86,
+    "col_start": 0,
+    "line_end": 92,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "iter"
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::ops::range::Range",
+                "fields": [
+                  [
+                    "start",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "end",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 87,
+                "col_start": 23,
+                "line_end": 87,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 88,
+                "col_start": 16,
+                "line_end": 88,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 16,
+                "line_end": 89,
+                "col_end": 17
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 16,
+                "line_end": 89,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          64
+                        ]
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 7,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 13,
+                "line_end": 89,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "a7_pins.rs",
+              "line_start": 89,
+              "col_start": 13,
+              "line_end": 89,
+              "col_end": 23
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 10353,
+              "substs_digest": [
+                5745722422160505471,
+                13244169602595488977
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 5,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 13,
+                "line_end": 89,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 2
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 13,
+                "line_end": 89,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Copy": {
+                  "local": 11,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 10,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "a7_pins.rs",
+              "line_start": 89,
+              "col_start": 13,
+              "line_end": 89,
+              "col_end": 23
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 10534,
+              "substs_digest": [
+                5745722422160505471,
+                13244169602595488977
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 10,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 13,
+                "line_end": 89,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 12,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ],
+              [
+                1,
+                5
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "a7_pins.rs",
+              "line_start": 89,
+              "col_start": 13,
+              "line_end": 89,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 10,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 8,
+                "line_end": 89,
+                "col_end": 9
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 30,
+                "line_end": 89,
+                "col_end": 31
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 45,
+                "line_end": 89,
+                "col_end": 49
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 17,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 45,
+                "line_end": 89,
+                "col_end": 49
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 18,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 7,
+            "span": {
+              "file": "a7_pins.rs",
+              "line_start": 89,
+              "col_start": 45,
+              "line_end": 89,
+              "col_end": 49
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 90,
+                "col_start": 4,
+                "line_end": 90,
+                "col_end": 9
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 91,
+                "col_start": 4,
+                "line_end": 91,
+                "col_end": 5
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 91,
+                "col_start": 19,
+                "line_end": 91,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 91,
+                "col_start": 19,
+                "line_end": 91,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 8,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 91,
+                "col_start": 19,
+                "line_end": 91,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 19,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 20,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 9,
+            "span": {
+              "file": "a7_pins.rs",
+              "line_start": 91,
+              "col_start": 4,
+              "line_end": 91,
+              "col_end": 33
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 27313,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 13
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 45,
+                "line_end": 89,
+                "col_end": 49
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 15,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 16,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 14,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "a7_pins.rs",
+              "line_start": 89,
+              "col_start": 30,
+              "line_end": 89,
+              "col_end": 50
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 27313,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 14,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "a7_pins.rs",
+                "line_start": 89,
+                "col_start": 26,
+                "line_end": 89,
+                "col_end": 50
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 2
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_12",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_12",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

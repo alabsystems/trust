@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+[submodule "tp/spdlog"]
+	path = deps/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "deps/args"]
+	path = deps/args
+	url = https://github.com/Taywee/args.git
+	branch = master
+[submodule "deps/fadec"]
+	path = deps/fadec
+	url = https://github.com/aengelke/fadec.git
+	branch = master
+[submodule "deps/disarm"]
+	path = deps/disarm
+	url = https://github.com/aengelke/disarm.git
+	branch = master
+[submodule "deps/doxygen-awesome-css"]
+	path = deps/doxygen-awesome-css
+	url = https://github.com/jothepro/doxygen-awesome-css.git

@@ -10,8 +10,13 @@ differential comparator *must* reject the result. A run in which the comparator
 accepts a perturbed lowering is a failed control — it means the differential gate
 has no teeth.
 
-Accepted classes: `enum-reshape`, `enum-case-value`, `enum-ctor`,
-`enum-disc-index`, `switch-map`, `enum-payload`. Anything else is rejected.
+Accepted classes, in the order the driver's domain check lists them:
+`enum-reshape`, `enum-case-value`, `enum-ctor`, `enum-disc-index`, `switch-map`,
+`enum-payload`, `marker-order`, `marker-drop`, `agg-field-order`, `marker-arm`,
+`payload-tramp`, `dr-tramp`, `dr-retire`, `mc-plan`, `cf-lit-order`,
+`chain-ret-order`, `cf-field-drop`, `cf-unit-late`, `cf-pair-order`,
+`cf-ret-late`, `cf-post-late`, `sw-tramp`, `swr-tramp`, `g25-hoist`,
+`seq-unit-late`, `g21-ret-order`, `uc-unit-late`. Anything else is rejected.
 
 It requires **both** `-Z trust-verify=off` and `-Z trust-ir-lower`. Requiring
 the first keeps a deliberately corrupted lowering out of every evidence policy;

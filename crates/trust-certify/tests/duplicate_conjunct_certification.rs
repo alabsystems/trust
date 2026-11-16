@@ -93,10 +93,7 @@ fn clamp_upper_hi_arm(copies: usize) -> Formula {
             gt(int("v"), int("hi")),
             Formula::And(vec![ge(int("v"), lit(0)), le(int("v"), lit(4294967295))]),
             Formula::And(vec![ge(int("hi"), lit(0)), le(int("hi"), lit(4294967295))]),
-            Formula::And(vec![
-                eq(boolean("_3"), gt(int("v"), int("hi"))),
-                Formula::And(inner),
-            ]),
+            Formula::And(vec![eq(boolean("_3"), gt(int("v"), int("hi"))), Formula::And(inner)]),
         ]),
     ])
 }
@@ -165,10 +162,7 @@ fn deduplication_does_not_certify_a_satisfiable_obligation() {
         conjuncts.push(not(le(int("_0"), int("hi"))));
         Formula::And(conjuncts)
     };
-    assert!(
-        !certifies(satisfiable(1)),
-        "`_0 = v ∧ ¬(_0 ≤ hi)` has a model — it must NOT certify"
-    );
+    assert!(!certifies(satisfiable(1)), "`_0 = v ∧ ¬(_0 ≤ hi)` has a model — it must NOT certify");
     assert!(
         !certifies(satisfiable(2)),
         "duplicating a conjunct of a satisfiable violation must not mint a certificate"

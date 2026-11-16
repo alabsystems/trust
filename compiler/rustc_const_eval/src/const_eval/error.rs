@@ -11,7 +11,7 @@ use rustc_middle::ty::layout::LayoutError;
 use rustc_span::{DUMMY_SP, Span, Symbol};
 
 use super::CompileTimeMachine;
-use crate::errors::{self, FrameNote};
+use crate::diagnostics::{self, FrameNote};
 use crate::interpret::{
     CtfeProvenance, ErrorHandled, Frame, InterpCx, InterpErrorInfo, InterpErrorKind,
     MachineStopType, Pointer, err_inval, err_machine_stop,
@@ -30,6 +30,7 @@ pub enum ConstEvalErrKind {
         col: u32,
         file: Symbol,
     },
+    Abort,
     WriteThroughImmutablePointer,
     /// Called `const_make_global` twice.
     ConstMakeGlobalPtrAlreadyMadeGlobal(AllocId),
@@ -51,6 +52,7 @@ impl fmt::Display for ConstEvalErrKind {
                 write!(f, "modifying a static's initial value from another static's initializer")
             }
             Panic { msg, .. } => write!(f, "evaluation panicked: {msg}"),
+            Abort => write!(f, "the program aborted execution"),
             RecursiveStatic => {
                 write!(f, "encountered static that tried to access itself during initialization")
             }
@@ -95,7 +97,7 @@ impl<'tcx> Into<InterpErrorInfo<'tcx>> for ConstEvalErrKind {
 pub(crate) fn get_span_and_frames<'tcx>(
     tcx: TyCtxtAt<'tcx>,
     stack: &[Frame<'tcx, impl Provenance, impl Sized>],
-) -> (Span, Vec<errors::FrameNote>) {
+) -> (Span, Vec<diagnostics::FrameNote>) {
     let mut stacktrace = Frame::generate_stacktrace_from_stack(stack, *tcx);
     // Filter out `requires_caller_location` frames.
     stacktrace.retain(|frame| !frame.instance.def.requires_caller_location(*tcx));
@@ -106,8 +108,8 @@ pub(crate) fn get_span_and_frames<'tcx>(
     // Add notes to the backtrace. Don't print a single-line backtrace though.
     if stacktrace.len() > 1 {
         // Helper closure to print duplicated lines.
-        let mut add_frame = |mut frame: errors::FrameNote| {
-            frames.push(errors::FrameNote { times: 0, ..frame.clone() });
+        let mut add_frame = |mut frame: diagnostics::FrameNote| {
+            frames.push(diagnostics::FrameNote { times: 0, ..frame.clone() });
             // Don't print [... additional calls ...] if the number of lines is small
             if frame.times < 3 {
                 let times = frame.times;
@@ -118,7 +120,7 @@ pub(crate) fn get_span_and_frames<'tcx>(
             }
         };
 
-        let mut last_frame: Option<errors::FrameNote> = None;
+        let mut last_frame: Option<diagnostics::FrameNote> = None;
         for frame_info in &stacktrace {
             let frame = frame_info.as_note(*tcx);
             match last_frame.as_mut() {
@@ -207,7 +209,7 @@ pub(super) fn report<'tcx>(
             {
                 let bytes = ecx.print_alloc_bytes_for_diagnostics(alloc_id);
                 let info = ecx.get_alloc_info(alloc_id);
-                let raw_bytes = errors::RawBytesNote {
+                let raw_bytes = diagnostics::RawBytesNote {
                     size: info.size.bytes(),
                     align: info.align.bytes(),
                     bytes,
@@ -223,11 +225,11 @@ pub(super) fn report<'tcx>(
             );
 
             mk(&mut err, span, frames);
-            let g = err.emit();
+            let guar = err.emit_err();
             let reported = if allowed_in_infallible {
-                ReportedErrorInfo::allowed_in_infallible(g)
+                ReportedErrorInfo::allowed_in_infallible(guar)
             } else {
-                ReportedErrorInfo::const_eval_error(g)
+                ReportedErrorInfo::const_eval_error(guar)
             };
             ErrorHandled::Reported(reported, span)
         }
@@ -240,10 +242,10 @@ pub(super) fn report<'tcx>(
 pub(super) fn lint<'tcx, L>(
     tcx: TyCtxtAt<'tcx>,
     machine: &CompileTimeMachine<'tcx>,
-    lint: &'static rustc_session::lint::Lint,
-    decorator: impl FnOnce(Vec<errors::FrameNote>) -> L,
+    lint: &'static rustc_lint_defs::Lint,
+    decorator: impl FnOnce(Vec<diagnostics::FrameNote>) -> L,
 ) where
-    L: for<'a> rustc_errors::Diagnostic<'a, ()>,
+    L: for<'a> rustc_errors::Diagnostic<'a>,
 {
     let (span, frames) = get_span_and_frames(tcx, &machine.stack);
 

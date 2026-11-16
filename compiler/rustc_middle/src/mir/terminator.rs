@@ -3,10 +3,10 @@
 use std::slice;
 
 use rustc_ast::InlineAsmOptions;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::packed::Pu128;
-use rustc_hir::LangItem;
-use rustc_hir::attrs::AttributeKind;
 use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_span::bug;
 use smallvec::{SmallVec, smallvec};
 use thin_vec::ThinVec;
 
@@ -103,7 +103,13 @@ impl SwitchTargets {
     /// Returns true if all targets (including the fallback target) are distinct.
     #[inline]
     pub fn is_distinct(&self) -> bool {
-        self.targets.iter().collect::<FxHashSet<_>>().len() == self.targets.len()
+        match self.targets.as_slice() {
+            // ~95% of cases in our benchmark suite are 2 or 3 targets,
+            // Avoid allocating the HashSet for those.
+            &[a, b] => a != b,
+            &[a, b, c] => a != b && a != c && b != c,
+            targets => targets.iter().collect::<FxHashSet<_>>().len() == targets.len(),
+        }
     }
 }
 
@@ -368,7 +374,7 @@ impl<O: fmt::Debug> fmt::Display for AssertKind<O> {
                 write!(f, "`async fn` resumed after completion")
             }
             ResumedAfterReturn(CoroutineKind::Desugared(CoroutineDesugaring::AsyncGen, _)) => {
-                todo!()
+                unimplemented!()
             }
             ResumedAfterReturn(CoroutineKind::Desugared(CoroutineDesugaring::Gen, _)) => {
                 bug!("gen blocks can be resumed after they return and will keep returning `None`")
@@ -380,7 +386,7 @@ impl<O: fmt::Debug> fmt::Display for AssertKind<O> {
                 write!(f, "`async fn` resumed after panicking")
             }
             ResumedAfterPanic(CoroutineKind::Desugared(CoroutineDesugaring::AsyncGen, _)) => {
-                todo!()
+                unimplemented!()
             }
             ResumedAfterPanic(CoroutineKind::Desugared(CoroutineDesugaring::Gen, _)) => {
                 write!(f, "`gen` fn or block cannot be further iterated on after it panicked")
@@ -397,7 +403,7 @@ impl<O: fmt::Debug> fmt::Display for AssertKind<O> {
                 write!(f, "`async fn` resumed after async drop")
             }
             ResumedAfterDrop(CoroutineKind::Desugared(CoroutineDesugaring::AsyncGen, _)) => {
-                todo!()
+                unimplemented!()
             }
             ResumedAfterDrop(CoroutineKind::Desugared(CoroutineDesugaring::Gen, _)) => {
                 write!(f, "`gen` fn or block cannot be further iterated on after it async dropped")
@@ -418,7 +424,6 @@ impl<O: fmt::Debug> fmt::Display for AssertKind<O> {
 pub struct Terminator<'tcx> {
     pub source_info: SourceInfo,
     pub kind: TerminatorKind<'tcx>,
-    pub attributes: ThinVec<AttributeKind>,
 }
 
 impl<'tcx> Terminator<'tcx> {
@@ -478,6 +483,11 @@ impl<'tcx> TerminatorKind<'tcx> {
     pub fn if_(cond: Operand<'tcx>, t: BasicBlock, f: BasicBlock) -> TerminatorKind<'tcx> {
         TerminatorKind::SwitchInt { discr: cond, targets: SwitchTargets::static_if(0, f, t) }
     }
+
+    #[inline]
+    pub fn goto(target: BasicBlock) -> TerminatorKind<'tcx> {
+        TerminatorKind::Goto { target, loop_hint_attrs: ThinVec::new() }
+    }
 }
 
 pub use helper::*;
@@ -526,7 +536,7 @@ mod helper {
                     mk_successors(slice::from_ref(t), Some(u), None)
                 }
                 // single successor
-                Goto { target: ref t }
+                Goto { target: ref t, .. }
                 | Call { target: None, unwind: UnwindAction::Cleanup(ref t), .. }
                 | Call { target: Some(ref t), unwind: _, .. }
                 | Yield { resume: ref t, drop: None, .. }
@@ -589,7 +599,7 @@ mod helper {
                         f(u)
                     }
                 }
-                Goto { target } => {
+                Goto { target, .. } => {
                     f(target);
                 }
                 UnwindResume
@@ -674,7 +684,7 @@ impl<'tcx> TerminatorKind<'tcx> {
     #[inline]
     pub fn as_goto(&self) -> Option<BasicBlock> {
         match self {
-            TerminatorKind::Goto { target } => Some(*target),
+            TerminatorKind::Goto { target, loop_hint_attrs: _ } => Some(*target),
             _ => None,
         }
     }
@@ -692,7 +702,7 @@ pub enum TerminatorEdges<'mir, 'tcx> {
     Double(BasicBlock, BasicBlock),
     /// Special action for `Yield`, `Call` and `InlineAsm` terminators.
     AssignOnReturn {
-        return_: Box<[BasicBlock]>,
+        return_: SmallVec<[BasicBlock; 1]>,
         /// The cleanup block, if it exists.
         cleanup: Option<BasicBlock>,
         place: CallReturnPlaces<'mir, 'tcx>,
@@ -744,7 +754,7 @@ impl<'tcx> TerminatorKind<'tcx> {
             | CoroutineDrop
             | Unreachable => TerminatorEdges::None,
 
-            Goto { target } => TerminatorEdges::Single(target),
+            Goto { target, loop_hint_attrs: _ } => TerminatorEdges::Single(target),
 
             // FIXME: Maybe we need also TerminatorEdges::Trio for async drop
             // (target + unwind + dropline)
@@ -786,7 +796,7 @@ impl<'tcx> TerminatorKind<'tcx> {
                 ref targets,
                 unwind,
             } => TerminatorEdges::AssignOnReturn {
-                return_: targets.to_owned(),
+                return_: targets.iter().copied().collect(),
                 cleanup: unwind.cleanup_block(),
                 place: CallReturnPlaces::InlineAsm(operands),
             },

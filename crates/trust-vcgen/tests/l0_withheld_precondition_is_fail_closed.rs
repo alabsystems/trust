@@ -44,6 +44,7 @@ fn caller_dividing_by_zero() -> VerifiableFunction {
                         is_unsafe_sig: false,
                         is_foreign: false,
                         callee_identity: None,
+                        callee_key: None,
                         func: CALLEE.to_string(),
                         args: vec![
                             Operand::Copy(Place::local(1)),
@@ -74,6 +75,7 @@ fn caller_dividing_by_zero() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -248,34 +250,47 @@ fn precondition_free_definitional_summary_still_rides_l0_untouched() {
 }
 
 #[test]
-fn an_ordinary_contracted_callee_is_not_withheld() {
-    // A plain `#[requires]` summary never rode the L0 lane in the first place
-    // (no definitional authority), so recording it would be pure
-    // over-rejection: every L0 call to a contracted callee would go unknown.
+fn an_ordinary_contracted_callee_is_withheld_and_charged() {
+    // Trust (2026-10-03): a plain `requires` summary has no definitional value
+    // fact to withhold, but its CALLEE assumed the clause at entry and elided
+    // the checks it proved under it. Dropping the summary unrecorded left the
+    // L0 call site with NO row, so a caller violating the clause read clean
+    // while the callee ran with its checks gone (MEASURED on stage 1 of
+    // `782780ea0d`: `p() { add1(u32::MAX) }` at `-Ztrust-verify-level=0` built
+    // exit 0 under certify and returned `0`). This test pinned that drop as
+    // "not over-rejection" until then; it now pins the recorded withholding.
     let caller = caller_dividing_by_zero();
-    let subset = db_of(
+    let full = db_of(
         FunctionSummary::new(CALLEE)
             .with_param_names(formals())
             .with_precondition(divisor_positive())
             .with_postcondition(definitional_value_fact()),
-    )
-    .definitional_precondition_free_subset();
+    );
+    assert!(
+        full.owes_caller_preconditions(&caller_dividing_by_zero()),
+        "the compiler lifts a caller of this callee to L1"
+    );
+    let subset = full.definitional_precondition_free_subset();
 
-    assert!(subset.get(CALLEE).is_none());
+    assert!(subset.get(CALLEE).is_none(), "an ordinary clause still never rides L0");
     assert_eq!(
         subset.l0_withheld_precondition_count(CALLEE),
-        None,
-        "only summaries that WOULD have ridden L0 are withheld"
+        Some(1),
+        "every preconditioned summary the L0 subset drops is recorded"
     );
-    assert!(subset.is_empty(), "an all-dropped subset carries nothing and owes nothing");
-    assert!(withheld_rows(&generate_callsite_precondition_vcs(&caller, &subset)).is_empty());
+    assert!(!subset.is_empty(), "a withholding DB still owes its call sites a row");
+    assert_eq!(
+        withheld_rows(&generate_callsite_precondition_vcs(&caller, &subset)).len(),
+        1,
+        "the violating L0 call site mints the fail-closed row, not silence"
+    );
 }
 
 #[test]
-fn mixed_provenance_summary_is_not_withheld_either() {
+fn mixed_provenance_summary_is_withheld_too() {
     // `with_postcondition` permanently strips definitional authority (mixed
     // provenance fails closed), so this summary is in the same class as the
-    // ordinary contracted one above — dropped, not withheld.
+    // ordinary contracted one above — dropped from the subset AND recorded.
     let subset = db_of(
         FunctionSummary::new(CALLEE)
             .with_param_names(formals())
@@ -286,5 +301,107 @@ fn mixed_provenance_summary_is_not_withheld_either() {
     .definitional_precondition_free_subset();
 
     assert!(subset.get(CALLEE).is_none());
+    assert_eq!(subset.l0_withheld_precondition_count(CALLEE), Some(1));
+}
+
+#[test]
+fn a_contracted_callee_with_no_precondition_owes_nothing() {
+    // The anti-over-rejection control for the bit the compiler lifts on: a
+    // summary with an `ensures` and no `requires` charges no call site, so it
+    // neither lifts its caller nor is recorded as a withholding.
+    let full = db_of(
+        FunctionSummary::new(CALLEE)
+            .with_param_names(formals())
+            .with_postcondition(definitional_value_fact()),
+    );
+    assert!(!full.owes_caller_preconditions(&caller_dividing_by_zero()));
+    let subset = full.definitional_precondition_free_subset();
+    assert!(subset.get(CALLEE).is_none());
     assert_eq!(subset.l0_withheld_precondition_count(CALLEE), None);
+    assert!(subset.is_empty(), "an all-dropped precondition-free subset owes nothing");
+    assert!(!subset.owes_caller_preconditions(&caller_dividing_by_zero()));
+}
+
+#[test]
+fn owes_caller_preconditions_reads_every_preconditioned_summary() {
+    // The bit `effective_max_level` lifts on: true for a definitional,
+    // a guarded and an ordinary preconditioned summary alike, and for a DB that
+    // holds only a recorded withholding — each under the name the caller calls.
+    let caller = caller_dividing_by_zero();
+    assert!(db_of(preconditioned_definitional_summary()).owes_caller_preconditions(&caller));
+    assert!(
+        db_of(
+            FunctionSummary::new(CALLEE)
+                .with_param_names(formals())
+                .with_precondition(divisor_positive())
+                .with_verified_callee_postcondition(definitional_value_fact()),
+        )
+        .owes_caller_preconditions(&caller),
+        "a guarded summary rides L0 with its value fact, but its call still owes the clause"
+    );
+    assert!(
+        db_of(
+            FunctionSummary::new(CALLEE)
+                .with_param_names(formals())
+                .with_precondition(divisor_positive()),
+        )
+        .owes_caller_preconditions(&caller),
+        "a `requires` with no `ensures` is the measured shape (`add1`)"
+    );
+    let withheld_only =
+        db_of(preconditioned_definitional_summary()).definitional_precondition_free_subset();
+    assert!(withheld_only.get(CALLEE).is_none());
+    assert!(withheld_only.owes_caller_preconditions(&caller));
+    assert!(!SummaryDatabase::new().owes_caller_preconditions(&caller));
+}
+
+/// `fn relay(n: u64) -> u64 { w(n) }` — a call to a function with no summary
+/// precondition of its own (`w`), which is where the compiler's transitive-trace
+/// closure registers the summary of `w`'s OWN callee beside it.
+fn caller_of_an_intermediate() -> VerifiableFunction {
+    let mut caller = caller_dividing_by_zero();
+    caller.name = "relay".to_string();
+    caller.def_path = "l0_withheld_test::relay".to_string();
+    let Terminator::Call { func, args, .. } = &mut caller.body.blocks[0].terminator else {
+        unreachable!("block 0 of the base caller is its call")
+    };
+    *func = "l0_withheld_test::w".to_string();
+    args.truncate(1);
+    caller
+}
+
+#[test]
+fn a_precondition_the_caller_does_not_call_owes_nothing() {
+    // Trust (review of the level-0 lift, 2026-10-03): the compiler's DB for a
+    // caller holds the summaries of the callees OF an attached callee body too
+    // (the transitive-trace closure), with their authored `requires`, and no
+    // call-site producer mints a row for a name the caller never calls. Asked over
+    // the whole DB, the bit lifted such a caller to L1: on the stage 1 of
+    // `6011b74bad`, `p(b: bool) { if b { p(b) } else { w(3) } }` got the level-1
+    // termination charge at `-Ztrust-verify-level=0` because `w` calls a
+    // `requires` function (`tests/ui/trust/l0_callsite_lift_scope.rs`).
+    let caller = caller_of_an_intermediate();
+    let mut db = db_of(
+        FunctionSummary::new(CALLEE)
+            .with_param_names(formals())
+            .with_precondition(divisor_positive()),
+    );
+    db.insert(FunctionSummary::new("l0_withheld_test::w").with_param_names(vec!["a0".into()]));
+    assert!(
+        !db.owes_caller_preconditions(&caller),
+        "a preconditioned summary under a name the caller never calls lifts nothing"
+    );
+    assert!(
+        generate_callsite_precondition_vcs(&caller, &db).iter().all(|vc| {
+            !matches!(&vc.kind, VcKind::Precondition { .. })
+                && !matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
+                    if kind == "L0WithheldPreconditionedSummary")
+        }),
+        "and the producer the bit stands for mints no row for it"
+    );
+    // The same summary, recorded as withheld in the level-0 subset, owes nothing
+    // to this caller either: the withheld row is minted only at a call to it.
+    assert!(!db.definitional_precondition_free_subset().owes_caller_preconditions(&caller));
+    // Control: the caller that DOES call it owes it.
+    assert!(db.owes_caller_preconditions(&caller_dividing_by_zero()));
 }

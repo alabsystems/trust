@@ -8,6 +8,9 @@
 use incumbent_serde_json as inc;
 use trust_json as tj;
 
+mod common;
+use common::{abbreviated, first_difference, inc_from_slice, inc_from_str};
+
 // ---------------------------------------------------------------------------
 // Reporting harness
 // ---------------------------------------------------------------------------
@@ -30,42 +33,57 @@ impl Report {
     }
 }
 
+/// The note for two re-serializations of one input that disagree: the input,
+/// abbreviated, and the first byte at which the renderings part, with a window
+/// from each side. Never the documents: the inputs here run to a megabyte, and
+/// a note carrying the input and both renderings in full (as this harness's
+/// did) is a single multi-megabyte line in which the divergence cannot be
+/// found. `None` when the renderings agree.
+fn reserialize_note(label: &str, src: &str, ours: &str, theirs: &str) -> Option<String> {
+    first_difference(ours, theirs)
+        .map(|d| format!("{label} {}: reserialize differs at {d}", abbreviated(src)))
+}
+
 /// Compare a parse of `src` (as &str) both ways. Records, never panics.
 fn cmp_parse(rep: &mut Report, src: &str, label: &str) {
     rep.checked += 1;
     let mine = tj::from_str(src);
-    let theirs = inc::from_str::<inc::Value>(src);
+    let theirs = inc_from_str(src);
+    let shown = abbreviated(src);
     match (&mine, &theirs) {
         (Ok(a), Ok(b)) => {
             let am = tj::to_string(a).unwrap();
             let bm = inc::to_string(b).unwrap();
-            if am != bm {
-                rep.note(format!("{label} {src:?}: reserialize tj={am:?} inc={bm:?}"));
+            if let Some(note) = reserialize_note(label, src, &am, &bm) {
+                rep.note(note);
             }
             // carrier check
             if let (tj::Value::Number(x), inc::Value::Number(y)) = (a, b) {
-                if x.is_u64() != y.is_u64() || x.is_i64() != y.is_i64() || x.is_f64() != y.is_f64() {
-                    rep.note(format!("{label} {src:?}: number carrier differs"));
+                if x.is_u64() != y.is_u64() || x.is_i64() != y.is_i64() || x.is_f64() != y.is_f64()
+                {
+                    rep.note(format!("{label} {shown}: number carrier differs"));
                 }
             }
         }
         (Err(a), Err(b)) => {
             if a.to_string() != b.to_string() {
                 rep.note(format!(
-                    "{label} {src:?}: ERROR TEXT tj={:?} inc={:?}",
+                    "{label} {shown}: ERROR TEXT tj={:?} inc={:?}",
                     a.to_string(),
                     b.to_string()
                 ));
             }
             if (a.classify() == tj::Category::Eof) != (b.classify() == inc::error::Category::Eof) {
-                rep.note(format!("{label} {src:?}: is_eof tj={} inc={}", a.is_eof(), b.is_eof()));
+                rep.note(format!("{label} {shown}: is_eof tj={} inc={}", a.is_eof(), b.is_eof()));
             }
         }
         (Ok(a), Err(b)) => rep.note(format!(
-            "{label} {src:?}: tj ACCEPTED as {a}, inc rejected: {b}"
+            "{label} {shown}: tj ACCEPTED as {}, inc rejected: {b}",
+            abbreviated(&a.to_string())
         )),
         (Err(a), Ok(b)) => rep.note(format!(
-            "{label} {src:?}: tj REJECTED ({a}), inc accepted as {b}"
+            "{label} {shown}: tj REJECTED ({a}), inc accepted as {}",
+            abbreviated(&b.to_string())
         )),
     }
 }
@@ -74,37 +92,50 @@ fn cmp_parse(rep: &mut Report, src: &str, label: &str) {
 fn cmp_parse_bytes(rep: &mut Report, src: &[u8], label: &str) {
     rep.checked += 1;
     let mine = tj::from_slice(src);
-    let theirs = inc::from_slice::<inc::Value>(src);
+    let theirs = inc_from_slice(src);
+    let lossy = String::from_utf8_lossy(src);
+    let shown = abbreviated(&lossy);
     match (&mine, &theirs) {
         (Ok(a), Ok(b)) => {
             let am = tj::to_string(a).unwrap();
             let bm = inc::to_string(b).unwrap();
-            if am != bm {
-                rep.note(format!(
-                    "{label} {:?}: reserialize tj={am:?} inc={bm:?}",
-                    String::from_utf8_lossy(src)
-                ));
+            if let Some(note) = reserialize_note(label, &lossy, &am, &bm) {
+                rep.note(note);
             }
         }
         (Err(a), Err(b)) => {
             if a.to_string() != b.to_string() {
                 rep.note(format!(
-                    "{label} {:?}: ERROR TEXT tj={:?} inc={:?}",
-                    String::from_utf8_lossy(src),
+                    "{label} {shown}: ERROR TEXT tj={:?} inc={:?}",
                     a.to_string(),
                     b.to_string()
                 ));
             }
         }
-        (Ok(_), Err(b)) => rep.note(format!(
-            "{label} {:?}: tj ACCEPTED, inc rejected: {b}",
-            String::from_utf8_lossy(src)
-        )),
-        (Err(a), Ok(_)) => rep.note(format!(
-            "{label} {:?}: tj REJECTED ({a}), inc accepted",
-            String::from_utf8_lossy(src)
-        )),
+        (Ok(_), Err(b)) => rep.note(format!("{label} {shown}: tj ACCEPTED, inc rejected: {b}")),
+        (Err(a), Ok(_)) => rep.note(format!("{label} {shown}: tj REJECTED ({a}), inc accepted")),
     }
+}
+
+/// The harness's own failure report stays readable at the sizes it feeds.
+///
+/// Two 1 MiB renderings that part at one byte must produce a note that names
+/// that byte and stays a few hundred bytes long. Before this, `enormous_inputs`
+/// reported a divergence on its 100k-key object as one 5,033,389-byte line
+/// (measured 2026-11-13 under the incumbent's `preserve_order` backing, on the
+/// test sources from before a53889fef7, which did not yet take the incumbent's
+/// tree in key order).
+#[test]
+fn a_divergence_note_names_the_difference_not_the_document() {
+    let ours = "a".repeat(1 << 20);
+    let mut theirs = ours.clone();
+    theirs.replace_range(700_000..700_001, "b");
+    let src = format!("\"{ours}\"");
+    let note = reserialize_note("probe", &src, &ours, &theirs).expect("the renderings differ");
+    assert!(note.len() < 1024, "the note is {} bytes: {}", note.len(), abbreviated(&note));
+    assert!(note.contains("byte 700000 of 1048576 (ours) / 1048576 (theirs)"), "{note}");
+    assert!(note.contains("(1048578 bytes)"), "the input's size is named: {note}");
+    assert_eq!(reserialize_note("probe", &src, &ours, &ours), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -235,19 +266,19 @@ fn from_slice_on_invalid_utf8() {
         b"\"\xff\"".to_vec(),
         b"\"\x80\"".to_vec(),
         b"\"a\xffb\"".to_vec(),
-        b"\"\xc3\"".to_vec(),          // truncated 2-byte seq
-        b"\"\xe2\x82\"".to_vec(),      // truncated 3-byte seq
-        b"\"\xed\xa0\x80\"".to_vec(),  // UTF-8-encoded lone surrogate
+        b"\"\xc3\"".to_vec(),             // truncated 2-byte seq
+        b"\"\xe2\x82\"".to_vec(),         // truncated 3-byte seq
+        b"\"\xed\xa0\x80\"".to_vec(),     // UTF-8-encoded lone surrogate
         b"\"\xf4\x90\x80\x80\"".to_vec(), // above U+10FFFF
         b"[\"\xff\"]".to_vec(),
         b"{\"\xff\":1}".to_vec(),
         b"{\"a\":\"\xff\"}".to_vec(),
-        b"\"\\n\xff\"".to_vec(),       // escape forces the scratch path first
+        b"\"\\n\xff\"".to_vec(), // escape forces the scratch path first
         b"\"\xff\\n\"".to_vec(),
-        b"[1,\xff]".to_vec(),          // invalid byte OUTSIDE a string
+        b"[1,\xff]".to_vec(), // invalid byte OUTSIDE a string
         b"\xff".to_vec(),
-        b"\xef\xbb\xbf[1]".to_vec(),   // UTF-8 BOM
-        b"\"\xff".to_vec(),            // invalid AND unterminated
+        b"\xef\xbb\xbf[1]".to_vec(), // UTF-8 BOM
+        b"\"\xff".to_vec(),          // invalid AND unterminated
         b"".to_vec(),
     ];
     for c in &cases {
@@ -272,14 +303,10 @@ fn recursion_limit_through_objects_and_mixed_nesting() {
         let obj = "{\"a\":".repeat(depth) + "1" + &"}".repeat(depth);
         cmp_parse(&mut rep, &obj, "obj");
 
-        let mixed: String = (0..depth)
-            .map(|i| if i % 2 == 0 { "[" } else { "{\"a\":" })
-            .collect::<String>()
-            + "1"
-            + &(0..depth)
-                .rev()
-                .map(|i| if i % 2 == 0 { "]" } else { "}" })
-                .collect::<String>();
+        let mixed: String =
+            (0..depth).map(|i| if i % 2 == 0 { "[" } else { "{\"a\":" }).collect::<String>()
+                + "1"
+                + &(0..depth).rev().map(|i| if i % 2 == 0 { "]" } else { "}" }).collect::<String>();
         cmp_parse(&mut rep, &mixed, "mixed");
 
         // depth reached inside a sibling, so `ascend` correctness matters
@@ -361,13 +388,12 @@ fn enormous_inputs() {
     let arr = format!("[{}]", vec!["1"; 300_000].join(","));
     cmp_parse(&mut rep, &arr, "300k-array");
 
-    // 200k-key object (BTreeMap vs BTreeMap, but the writer path is O(n))
+    // 100k-key object written in numeric order, which is not key order (`k10`
+    // sorts before `k2`); the writer path is O(n). `cmp_parse` compares the
+    // incumbent's tree in key order (`common::key_sorted`).
     let obj = format!(
         "{{{}}}",
-        (0..100_000)
-            .map(|i| format!("\"k{i}\":{i}"))
-            .collect::<Vec<_>>()
-            .join(",")
+        (0..100_000).map(|i| format!("\"k{i}\":{i}")).collect::<Vec<_>>().join(",")
     );
     cmp_parse(&mut rep, &obj, "100k-object");
 
@@ -387,10 +413,7 @@ fn enormous_inputs() {
 struct Lcg(u64);
 impl Lcg {
     fn next_u64(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let x = self.0;
         x ^ (x >> 31)
     }
@@ -458,9 +481,9 @@ fn wide_byte_soup_non_utf8() {
 fn escape_fragment_fuzz() {
     let mut rep = Report::default();
     let frags: &[&str] = &[
-        "\\u", "\\ud800", "\\udc00", "\\udbff", "\\udfff", "\\u0041", "\\uffff", "\\u0000",
-        "\\n", "\\\\", "\\\"", "\\/", "\\b", "\\f", "\\r", "\\t", "\\x", "\\", "a", "\u{7f}",
-        "0", "d", "D", "8", "\\uD800", "\\uDC00", "\\u00", "\\ud80",
+        "\\u", "\\ud800", "\\udc00", "\\udbff", "\\udfff", "\\u0041", "\\uffff", "\\u0000", "\\n",
+        "\\\\", "\\\"", "\\/", "\\b", "\\f", "\\r", "\\t", "\\x", "\\", "a", "\u{7f}", "0", "d",
+        "D", "8", "\\uD800", "\\uDC00", "\\u00", "\\ud80",
     ];
     let mut rng = Lcg(0xA4093822299F31D0);
     for _ in 0..200_000 {
@@ -512,7 +535,8 @@ fn f32_values_through_value_and_128_bit_integers() {
     // Formatter::write_i128 / write_u128 vs serde_json's.
     use trust_json::Formatter as _;
     let mut fmt = tj::CompactFormatter;
-    let mut vals: Vec<i128> = vec![0, 1, -1, i128::MIN, i128::MAX, i64::MIN as i128, i64::MAX as i128];
+    let mut vals: Vec<i128> =
+        vec![0, 1, -1, i128::MIN, i128::MAX, i64::MIN as i128, i64::MAX as i128];
     for _ in 0..50_000 {
         let hi = rng.next_u64() as u128;
         let lo = rng.next_u64() as u128;
@@ -544,18 +568,20 @@ fn f32_values_through_value_and_128_bit_integers() {
 // ---------------------------------------------------------------------------
 // 10. Round-trip stability.
 //
-// `parse -> serialize` is NOT a fixpoint -- measured at 8.245% of random number
-// texts, and 8358 of those are still moving after a THIRD hop. That is a
-// property of the incumbent's deliberately-imprecise default float parse
-// (`float_roundtrip` is off), faithfully reproduced here, so it is NOT a
-// divergence and this test does not fail on it. What it DOES assert is that the
-// two implementations move together: any input where trust-json's rendering
-// differs from the incumbent's, at any hop, is a real defect.
+// `parse -> serialize` IS a fixpoint after the first hop. It was not while the
+// incumbent's float parse was the imprecise default one (measured then at 8.245%
+// of random number texts, 8358 still moving after a THIRD hop); first-party/clean
+// 99ddfe452 enabled `float_roundtrip` in clean-olean, feature unification made
+// the incumbent correctly rounded workspace-wide, and trust-json's Cargo.toml
+// now names that feature on the oracle. A correctly-rounded parse of a
+// shortest-round-trip rendering returns the same bits, so hop 2 must equal hop
+// 1, and this test asserts it. It also asserts that the two implementations
+// move together: any input where trust-json's rendering differs from the
+// incumbent's, at any hop, is a real defect.
 //
-// It matters anyway, and is recorded rather than hidden: this tree hashes
-// serialized JSON as a proof-bundle identity, so a bundle that makes two
-// process hops can hash differently from one that makes one -- on the
-// incumbent today, and on trust-json after the swap, identically.
+// It matters: this tree hashes serialized JSON as a proof-bundle identity, so a
+// parse that is not a fixpoint makes a bundle that takes two process hops hash
+// differently from one that takes one.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -600,7 +626,9 @@ fn round_trip_agrees_with_the_incumbent_at_every_hop() {
                 let sb = inc::to_string(&b).unwrap();
                 if sa != sb {
                     rep.note(format!("{s:?} pass1 tj={sa} inc={sb}"));
-                    if rep.diffs.len() > 20 { break; }
+                    if rep.diffs.len() > 20 {
+                        break;
+                    }
                     continue;
                 }
                 // Hop 2 and hop 3 must still AGREE, even where neither is
@@ -623,12 +651,12 @@ fn round_trip_agrees_with_the_incumbent_at_every_hop() {
             (Ok(_), Err(e)) => rep.note(format!("{s:?}: tj accepted, inc rejected {e}")),
             (Err(e), Ok(_)) => rep.note(format!("{s:?}: tj rejected {e}, inc accepted")),
         }
-        if rep.diffs.len() > 20 { break; }
+        if rep.diffs.len() > 20 {
+            break;
+        }
     }
-    println!(
-        "  NOT a fixpoint (incumbent property, reproduced): {unstable} of {} checked",
-        rep.checked
-    );
+    println!("  NOT a fixpoint after hop 1: {unstable} of {} checked", rep.checked);
     rep.finish("round_trip_agrees_with_the_incumbent_at_every_hop");
     assert!(rep.diffs.is_empty(), "{} divergences", rep.diffs.len());
+    assert_eq!(unstable, 0, "a correctly-rounded parse must make hop 2 == hop 1");
 }

@@ -303,7 +303,18 @@ impl Substitution {
             // Recursively substitute through composite types — both the
             // struct/union `fields` view and (Trust P4) each enum variant's
             // own field list.
-            Ty::Adt { name, fields, variants, disc_index_safe, faithful_enum_repr, layout, enum_layout: _, adt_kind, arbitrary_precision } => Ty::Adt {
+            Ty::Adt {
+                name,
+                fields,
+                variants,
+                disc_index_safe,
+                faithful_enum_repr,
+                layout,
+                enum_layout: _,
+                adt_kind,
+                arbitrary_precision,
+                validity_wrapper,
+            } => Ty::Adt {
                 name: name.clone(),
                 fields: fields
                     .iter()
@@ -342,12 +353,19 @@ impl Substitution {
                 // element), so substitution is structurally a no-op on it and
                 // the ARBITRARY-PRECISION provenance carries through unchanged.
                 arbitrary_precision: *arbitrary_precision,
+                validity_wrapper: *validity_wrapper,
             },
             Ty::Ref { mutable, inner } => {
                 Ty::Ref { mutable: *mutable, inner: Box::new(self.apply_ty(inner)) }
             }
             Ty::Slice { elem } => Ty::Slice { elem: Box::new(self.apply_ty(elem)) },
-            Ty::Seq { elem } => Ty::Seq { elem: Box::new(self.apply_ty(elem)) },
+            // The stamp is only ever `Some` on a fully monomorphic type
+            // (`tcx_drop_is_total` fails closed on any type param), for which
+            // substitution is the identity -- so carrying it is exact, never a
+            // widening. Same treatment `arbitrary_precision` gets above.
+            Ty::Seq { elem, drop_auth } => {
+                Ty::Seq { elem: Box::new(self.apply_ty(elem)), drop_auth: *drop_auth }
+            }
             Ty::Array { elem, len } => Ty::Array { elem: Box::new(self.apply_ty(elem)), len: *len },
             // Trust: piece #7a — substitute the element type but PRESERVE the
             // const-param length identity. Type-substitution does not rewrite a
@@ -509,6 +527,13 @@ impl Substitution {
                 Box::new(self.apply_formula(idx)),
                 Box::new(self.apply_formula(val)),
             ),
+            // The constant array's carried sorts are substituted like every
+            // other sort position, and its value like every other operand.
+            Formula::ConstArray { index_sort, elem_sort, value } => Formula::ConstArray {
+                index_sort: self.apply_sort(index_sort),
+                elem_sort: self.apply_sort(elem_sort),
+                value: Box::new(self.apply_formula(value)),
+            },
             // Uninterpreted predicate: apply substitution to each argument term.
             Formula::Pred(name, args) => {
                 Formula::Pred(*name, args.iter().map(|a| self.apply_formula(a)).collect())
@@ -884,8 +909,18 @@ mod tests {
         subst.bind_type("T", Ty::i32());
 
         // A bare type parameter is Adt { name: "T", fields: [] }.
-        let param_ty = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-            disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        let param_ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
+            name: "T".to_string(),
+            fields: vec![].into(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let result = subst.apply_ty(&param_ty);
         assert_eq!(result, Ty::i32());
     }
@@ -893,8 +928,18 @@ mod tests {
     #[test]
     fn test_apply_ty_unbound_parameter() {
         let subst = Substitution::new();
-        let param_ty = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-            disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        let param_ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
+            name: "T".to_string(),
+            fields: vec![].into(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         // Unbound parameter stays as-is.
         let result = subst.apply_ty(&param_ty);
         assert_eq!(result, param_ty);
@@ -918,8 +963,18 @@ mod tests {
 
         let ref_ty = Ty::Ref {
             mutable: false,
-            inner: Box::new(Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }),
+            inner: Box::new(Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "T".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            }),
         };
         let result = subst.apply_ty(&ref_ty);
         assert_eq!(result, Ty::Ref { mutable: false, inner: Box::new(Ty::i32()) });
@@ -930,9 +985,20 @@ mod tests {
         let mut subst = Substitution::new();
         subst.bind_type("T", Ty::u32());
 
-        let slice_ty =
-            Ty::Slice { elem: Box::new(Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }) };
+        let slice_ty = Ty::Slice {
+            elem: Box::new(Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "T".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            }),
+        };
         let result = subst.apply_ty(&slice_ty);
         assert_eq!(result, Ty::Slice { elem: Box::new(Ty::u32()) });
     }
@@ -943,12 +1009,23 @@ mod tests {
         let mut subst = Substitution::new();
         subst.bind_type("T", Ty::u32());
 
-        let seq_ty =
-            Ty::Seq { elem: Box::new(Ty::Adt { adt_kind: None, layout: None, variants: Vec::new(), arbitrary_precision: None,
-                name: "T".to_string(), fields: vec![],
-                disc_index_safe: false, faithful_enum_repr: None, enum_layout: None, }) };
+        let seq_ty = Ty::Seq {
+            drop_auth: None,
+            elem: Box::new(Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                arbitrary_precision: None,
+                validity_wrapper: None,
+                name: "T".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+            }),
+        };
         let result = subst.apply_ty(&seq_ty);
-        assert_eq!(result, Ty::Seq { elem: Box::new(Ty::u32()) });
+        assert_eq!(result, Ty::Seq { drop_auth: None, elem: Box::new(Ty::u32()) });
     }
 
     /// The property `Ty::Seq` exists for: two sequences of DIFFERENT element
@@ -963,10 +1040,10 @@ mod tests {
     /// could not be told apart.
     #[test]
     fn seq_distinguishes_its_element_type() {
-        let a = Ty::Seq { elem: Box::new(Ty::u32()) };
-        let b = Ty::Seq { elem: Box::new(Ty::Bool) };
+        let a = Ty::Seq { drop_auth: None, elem: Box::new(Ty::u32()) };
+        let b = Ty::Seq { drop_auth: None, elem: Box::new(Ty::Bool) };
         assert_ne!(a, b, "sequences of different element types must differ");
-        assert_eq!(a, Ty::Seq { elem: Box::new(Ty::u32()) });
+        assert_eq!(a, Ty::Seq { drop_auth: None, elem: Box::new(Ty::u32()) });
         // And a sequence is not the slice of the same element: one owns, one borrows.
         assert_ne!(a, Ty::Slice { elem: Box::new(Ty::u32()) });
     }
@@ -977,8 +1054,18 @@ mod tests {
         subst.bind_type("T", Ty::Bool);
 
         let array_ty = Ty::Array {
-            elem: Box::new(Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }),
+            elem: Box::new(Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "T".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            }),
             len: 10,
         };
         let result = subst.apply_ty(&array_ty);
@@ -992,10 +1079,30 @@ mod tests {
         subst.bind_type("U", Ty::Bool);
 
         let tuple_ty = Ty::Tuple(vec![
-            Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
-            Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "U".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+            Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "T".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
+            Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "U".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
         ]);
         let result = subst.apply_ty(&tuple_ty);
         assert_eq!(result, Ty::Tuple(vec![Ty::i32(), Ty::Bool]));
@@ -1009,23 +1116,45 @@ mod tests {
         let adt_ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "MyStruct".to_string(),
-            fields: vec![("value".to_string(), Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, })],
+            fields: vec![(
+                "value".to_string(),
+                Ty::Adt {
+                    adt_kind: None,
+                    layout: None,
+                    variants: Vec::new().into(),
+                    name: "T".to_string(),
+                    fields: vec![].into(),
+                    disc_index_safe: false,
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                    arbitrary_precision: None,
+                    validity_wrapper: None,
+                },
+            )]
+            .into(),
             disc_index_safe: false,
-         faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let result = subst.apply_ty(&adt_ty);
         assert_eq!(
             result,
             Ty::Adt {
                 adt_kind: None,
                 layout: None,
-                variants: Vec::new(),
+                variants: Vec::new().into(),
                 name: "MyStruct".to_string(),
-                fields: vec![("value".to_string(), Ty::i32())],
+                fields: vec![("value".to_string(), Ty::i32())].into(),
                 disc_index_safe: false,
-             faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            }
         );
     }
 
@@ -1038,14 +1167,42 @@ mod tests {
         let inner = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Option".to_string(),
-            fields: vec![("value".to_string(), Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, })],
+            fields: vec![(
+                "value".to_string(),
+                Ty::Adt {
+                    adt_kind: None,
+                    layout: None,
+                    variants: Vec::new().into(),
+                    name: "T".to_string(),
+                    fields: vec![].into(),
+                    disc_index_safe: false,
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                    arbitrary_precision: None,
+                    validity_wrapper: None,
+                },
+            )]
+            .into(),
             disc_index_safe: false,
-         faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
-        let outer = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "Vec".to_string(), fields: vec![("elem".to_string(), inner)],
-            disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
+        let outer = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
+            name: "Vec".to_string(),
+            fields: vec![("elem".to_string(), inner)].into(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
 
         let result = subst.apply_ty(&outer);
         if let Ty::Adt { name, fields, .. } = &result {
@@ -1155,8 +1312,21 @@ mod tests {
     #[test]
     fn test_substitution_compose_basic() {
         let mut s1 = Substitution::new();
-        s1.bind_type("T", Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "U".to_string(), fields: vec![],
-            disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, });
+        s1.bind_type(
+            "T",
+            Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "U".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
+        );
 
         let mut s2 = Substitution::new();
         s2.bind_type("U", Ty::i32());

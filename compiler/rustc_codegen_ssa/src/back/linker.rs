@@ -5,27 +5,28 @@ use std::path::{Path, PathBuf};
 use std::{env, iter, mem, str};
 
 use find_msvc_tools;
-use rustc_hir::attrs::WindowsSubsystemKind;
+use rustc_attr_ir::WindowsSubsystemKind;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
-use rustc_metadata::{
-    find_native_static_library, try_find_native_dynamic_library, try_find_native_static_library,
-};
-use rustc_middle::bug;
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::{
     self, ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
 };
 use rustc_middle::ty::{SymbolName, TyCtxt};
 use rustc_session::Session;
-use rustc_session::config::{self, CrateType, DebugInfo, LinkerPluginLto, Lto, OptLevel, Strip};
+use rustc_session::config::{self, DebugInfo, LinkerPluginLto, Lto, OptLevel, Strip};
+use rustc_span::bug;
+use rustc_structures::CrateType;
 use rustc_target::spec::{Arch, Cc, CfgAbi, LinkOutputKind, LinkerFlavor, Lld, Os};
 use tracing::{debug, warn};
 
 use super::command::Command;
 use super::symbol_export;
+use crate::back::link::{
+    find_native_static_library, try_find_native_dynamic_library, try_find_native_static_library,
+};
 use crate::back::symbol_export::allocator_shim_symbols;
 use crate::base::needs_allocator_shim_for_linking;
-use crate::{SymbolExport, errors};
+use crate::{SymbolExport, diagnostics};
 
 #[cfg(test)]
 mod tests;
@@ -137,9 +138,6 @@ pub(crate) fn get_linker<'a>(
     // to the linker args construction.
     assert!(cmd.get_args().is_empty() || sess.target.cfg_abi == CfgAbi::Uwp);
     match flavor {
-        LinkerFlavor::Unix(Cc::No) if sess.target.os == Os::L4Re => {
-            Box::new(L4Bender::new(cmd, sess)) as Box<dyn Linker>
-        }
         LinkerFlavor::Unix(Cc::No) if sess.target.os == Os::Aix => {
             Box::new(AixLinker::new(cmd, sess)) as Box<dyn Linker>
         }
@@ -279,7 +277,6 @@ generate_arg_methods! {
     MsvcLinker<'_>
     EmLinker<'_>
     WasmLd<'_>
-    L4Bender<'_>
     AixLinker<'_>
     LlbcLinker<'_>
     BpfLinker<'_>
@@ -417,7 +414,7 @@ impl<'a> GccLinker<'a> {
             config::OptLevel::Aggressive => "O3",
         };
 
-        if let Some(path) = &self.sess.opts.unstable_opts.profile_sample_use {
+        if let Some(path) = &self.sess.opts.cg.profile_sample_use {
             self.link_arg(&format!("-plugin-opt=sample-profile={}", path.display()));
         };
         let prefix = if self.codegen_backend == "gcc" {
@@ -443,11 +440,46 @@ impl<'a> GccLinker<'a> {
                 // Clang also sets `-dynamic`, but that's implied by `-dylib`, so unnecessary.
             }
 
-            // Note that the `osx_rpath_install_name` option here is a hack
-            // purely to support bootstrap right now, we should get a more
-            // principled solution at some point to force the compiler to pass
-            // the right `-Wl,-install_name` with an `@rpath` in it.
-            if self.sess.opts.cg.rpath || self.sess.opts.unstable_opts.osx_rpath_install_name {
+            // Trust: a proc-macro dylib is `dlopen`ed by absolute path and is never
+            // linked against, so its `LC_ID_DYLIB` has exactly one consumer: dyld's
+            // already-loaded registry. Leaving it as the build output path makes that
+            // registry key a LOCATION rather than an identity — and bootstrap copies
+            // the file into several sysroots without rewriting it, so every copy goes
+            // on claiming the original path. Once any copy is loaded in a process,
+            // `dlopen` of the original path returns the COPY, and `dlsym` of this
+            // build's `__rustc_proc_macro_decls_*` misses.
+            //
+            // Upstream mostly survives this because a rebuild at the same version
+            // yields the same `StableCrateId`, so the aliased images export the same
+            // symbol and the substitution is invisible. Trust's `CFG_VERSION` embeds
+            // the git short sha, so every commit changes the symbol and the aliasing
+            // becomes a hard failure. Measured 2026-09-13: sixteen copies of
+            // `libdisplaydoc-2ef9e771ac39abb5.dylib` all claiming one path that a
+            // different binary occupied, reproduced standalone with two `dlopen`
+            // calls, and asymmetric in exactly the way install-name matching predicts
+            // (stale-then-fresh conflates; fresh-then-stale does not).
+            //
+            // So key the install name on the crate's IDENTITY. The file name already
+            // carries the crate name and `-Cextra-filename` (derived from
+            // `-Cmetadata`); `cfg_version` is the one component it lacks and the one
+            // component `StableCrateId` adds, so the pair is the identity. Copies of
+            // one build still share a name — correctly, they are the same crate — and
+            // two revisions can no longer collide.
+            if crate_type == CrateType::ProcMacro {
+                let version: String =
+                    rustc_span::def_id::effective_rustc_version(self.sess.cfg_version)
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' })
+                        .collect();
+                let mut install_name = OsString::from(format!("rustc-proc-macro/{version}/"));
+                install_name.push(out_filename.file_name().unwrap());
+                self.link_arg("-install_name").link_arg(install_name);
+            } else if self.sess.opts.cg.rpath || self.sess.opts.unstable_opts.osx_rpath_install_name
+            {
+                // Note that the `osx_rpath_install_name` option here is a hack
+                // purely to support bootstrap right now, we should get a more
+                // principled solution at some point to force the compiler to pass
+                // the right `-Wl,-install_name` with an `@rpath` in it.
                 let mut rpath = OsString::from("@rpath/");
                 rpath.push(out_filename.file_name().unwrap());
                 self.link_arg("-install_name").link_arg(rpath);
@@ -484,11 +516,11 @@ impl<'a> GccLinker<'a> {
                 // FIXME(81490): ld64 doesn't support these flags but macOS 11
                 // has -needed-l{} / -needed_library {}
                 // but we have no way to detect that here.
-                self.sess.dcx().emit_warn(errors::Ld64UnimplementedModifier);
+                self.sess.dcx().emit_warn(diagnostics::Ld64UnimplementedModifier);
             } else if self.is_gnu && !self.sess.target.is_like_windows {
                 self.link_arg("--no-as-needed");
             } else {
-                self.sess.dcx().emit_warn(errors::LinkerUnsupportedModifier);
+                self.sess.dcx().emit_warn(diagnostics::LinkerUnsupportedModifier);
             }
         }
 
@@ -536,7 +568,8 @@ impl<'a> Linker for GccLinker<'a> {
             LinkOutputKind::StaticNoPicExe => {
                 // `-static` works for both gcc wrapper and ld.
                 self.link_or_cc_arg("-static");
-                if !self.is_ld && self.is_gnu {
+                // noop on windows w/ gcc, warning w/ clang
+                if !self.is_ld && self.is_gnu && !self.sess.target.is_like_windows {
                     self.cc_arg("-no-pie");
                 }
             }
@@ -619,7 +652,7 @@ impl<'a> Linker for GccLinker<'a> {
             // FIXME(81490): ld64 as of macOS 11 supports the -needed_framework
             // flag but we have no way to detect that here.
             // self.link_or_cc_arg("-needed_framework").link_or_cc_arg(name);
-            self.sess.dcx().emit_warn(errors::Ld64UnimplementedModifier);
+            self.sess.dcx().emit_warn(diagnostics::Ld64UnimplementedModifier);
         }
         self.link_or_cc_args(&["-framework", name]);
     }
@@ -822,7 +855,7 @@ impl<'a> Linker for GccLinker<'a> {
                 }
             };
             if let Err(error) = res {
-                self.sess.dcx().emit_fatal(errors::LibDefWriteFailure { error });
+                self.sess.dcx().emit_fatal(diagnostics::LibDefWriteFailure { error });
             }
             self.link_arg("-exported_symbols_list").link_arg(path);
         } else if self.sess.target.is_like_windows {
@@ -842,7 +875,7 @@ impl<'a> Linker for GccLinker<'a> {
                 }
             };
             if let Err(error) = res {
-                self.sess.dcx().emit_fatal(errors::LibDefWriteFailure { error });
+                self.sess.dcx().emit_fatal(diagnostics::LibDefWriteFailure { error });
             }
             self.link_arg(path);
         } else if self.sess.target.is_like_wasm {
@@ -861,7 +894,7 @@ impl<'a> Linker for GccLinker<'a> {
                 writeln!(f, "}};")?;
             };
             if let Err(error) = res {
-                self.sess.dcx().emit_fatal(errors::VersionScriptWriteFailure { error });
+                self.sess.dcx().emit_fatal(diagnostics::VersionScriptWriteFailure { error });
             }
             self.link_arg("--dynamic-list").link_arg(path);
         } else {
@@ -879,7 +912,7 @@ impl<'a> Linker for GccLinker<'a> {
                 writeln!(f, "\n  local:\n    *;\n}};")?;
             };
             if let Err(error) = res {
-                self.sess.dcx().emit_fatal(errors::VersionScriptWriteFailure { error });
+                self.sess.dcx().emit_fatal(diagnostics::VersionScriptWriteFailure { error });
             }
             if self.sess.target.is_like_solaris {
                 self.link_arg("-M").link_arg(path);
@@ -902,7 +935,14 @@ impl<'a> Linker for GccLinker<'a> {
     fn linker_plugin_lto(&mut self) {
         match self.sess.opts.cg.linker_plugin_lto {
             LinkerPluginLto::Disabled => {
-                // Nothing to do
+                // GCC, when used as a linker, will perform LTO even without -flto when it sees
+                // object files with the GCC IR (which can happen when using rustc_codegen_gcc).
+                // Since the std is compiled with -Cembed-bitcode=yes, any program using the std
+                // will have the linker do LTO.
+                // So, we disable this with -fno-lto when linker plugin LTO is not requested.
+                if self.is_cc() && self.codegen_backend == "gcc" {
+                    self.cc_arg("-fno-lto");
+                }
             }
             LinkerPluginLto::LinkerPluginAuto => {
                 self.push_linker_plugin_lto_args(None);
@@ -1103,7 +1143,7 @@ impl<'a> Linker for MsvcLinker<'a> {
                         }
                     }
                     Err(error) => {
-                        self.sess.dcx().emit_warn(errors::NoNatvisDirectory { error });
+                        self.sess.dcx().emit_warn(diagnostics::NoNatvisDirectory { error });
                     }
                 }
             }
@@ -1136,7 +1176,7 @@ impl<'a> Linker for MsvcLinker<'a> {
             writeln!(f, "EXPORTS")?;
         };
         if let Err(error) = res {
-            self.sess.dcx().emit_fatal(errors::LibDefWriteFailure { error });
+            self.sess.dcx().emit_fatal(diagnostics::LibDefWriteFailure { error });
         }
         let mut arg = OsString::from("/DEF:");
         arg.push(path);
@@ -1286,9 +1326,24 @@ impl<'a> Linker for EmLinker<'a> {
 
         self.cc_arg("-s");
 
+        // Emscripten exposes the program entry point under the JS name `_main`
+        // regardless of the underlying wasm symbol (which is `__main_argc_argv`
+        // per the wasm C ABI in the tool-conventions BasicCABI spec), bridging
+        // the two internally. So the entry symbol must be requested as `_main`
+        // here rather than as a `_`-prefixed form of its wasm name.
+        let entry_name = self.sess.target.entry_name.as_ref();
         let mut arg = OsString::from("EXPORTED_FUNCTIONS=");
         let encoded = serde_json::to_string(
-            &symbols.iter().map(|sym| "_".to_owned() + &sym.name).collect::<Vec<_>>(),
+            &symbols
+                .iter()
+                .map(|sym| {
+                    if sym.name == entry_name {
+                        "_main".to_owned()
+                    } else {
+                        "_".to_owned() + &sym.name
+                    }
+                })
+                .collect::<Vec<_>>(),
         )
         .unwrap();
         debug!("{encoded}");
@@ -1450,128 +1505,6 @@ impl<'a> WasmLd<'a> {
             config::OptLevel::Size | config::OptLevel::SizeMin => "O2",
         };
         self.link_arg(&format!("--lto-{opt_level}"));
-    }
-}
-
-/// Linker shepherd script for L4Re (Fiasco)
-struct L4Bender<'a> {
-    cmd: Command,
-    sess: &'a Session,
-    hinted_static: bool,
-}
-
-impl<'a> Linker for L4Bender<'a> {
-    fn cmd(&mut self) -> &mut Command {
-        &mut self.cmd
-    }
-
-    fn set_output_kind(
-        &mut self,
-        _output_kind: LinkOutputKind,
-        _crate_type: CrateType,
-        _out_filename: &Path,
-    ) {
-    }
-
-    fn link_staticlib_by_name(&mut self, name: &str, _verbatim: bool, whole_archive: bool) {
-        self.hint_static();
-        if !whole_archive {
-            self.link_arg(format!("-PC{name}"));
-        } else {
-            self.link_arg("--whole-archive")
-                .link_or_cc_arg(format!("-l{name}"))
-                .link_arg("--no-whole-archive");
-        }
-    }
-
-    fn link_staticlib_by_path(&mut self, path: &Path, whole_archive: bool) {
-        self.hint_static();
-        if !whole_archive {
-            self.link_or_cc_arg(path);
-        } else {
-            self.link_arg("--whole-archive").link_or_cc_arg(path).link_arg("--no-whole-archive");
-        }
-    }
-
-    fn full_relro(&mut self) {
-        self.link_args(&["-z", "relro", "-z", "now"]);
-    }
-
-    fn partial_relro(&mut self) {
-        self.link_args(&["-z", "relro"]);
-    }
-
-    fn no_relro(&mut self) {
-        self.link_args(&["-z", "norelro"]);
-    }
-
-    fn gc_sections(&mut self, keep_metadata: bool) {
-        if !keep_metadata {
-            self.link_arg("--gc-sections");
-        }
-    }
-
-    fn optimize(&mut self) {
-        // GNU-style linkers support optimization with -O. GNU ld doesn't
-        // need a numeric argument, but other linkers do.
-        if self.sess.opts.optimize == config::OptLevel::More
-            || self.sess.opts.optimize == config::OptLevel::Aggressive
-        {
-            self.link_arg("-O1");
-        }
-    }
-
-    fn pgo_gen(&mut self) {}
-
-    fn debuginfo(&mut self, strip: Strip, _: &[PathBuf]) {
-        match strip {
-            Strip::None => {}
-            Strip::Debuginfo => {
-                self.link_arg("--strip-debug");
-            }
-            Strip::Symbols => {
-                self.link_arg("--strip-all");
-            }
-        }
-    }
-
-    fn no_default_libraries(&mut self) {
-        self.cc_arg("-nostdlib");
-    }
-
-    fn export_symbols(&mut self, _: &Path, _: CrateType, _: &[SymbolExport]) {
-        // ToDo, not implemented, copy from GCC
-        self.sess.dcx().emit_warn(errors::L4BenderExportingSymbolsUnimplemented);
-    }
-
-    fn windows_subsystem(&mut self, subsystem: WindowsSubsystemKind) {
-        let subsystem = subsystem.as_str();
-        self.link_arg(&format!("--subsystem {subsystem}"));
-    }
-
-    fn reset_per_library_state(&mut self) {
-        self.hint_static(); // Reset to default before returning the composed command line.
-    }
-
-    fn linker_plugin_lto(&mut self) {}
-
-    fn control_flow_guard(&mut self) {}
-
-    fn ehcont_guard(&mut self) {}
-
-    fn no_crt_objects(&mut self) {}
-}
-
-impl<'a> L4Bender<'a> {
-    fn new(cmd: Command, sess: &'a Session) -> L4Bender<'a> {
-        L4Bender { cmd, sess, hinted_static: false }
-    }
-
-    fn hint_static(&mut self) {
-        if !self.hinted_static {
-            self.link_or_cc_arg("-static");
-            self.hinted_static = true;
-        }
     }
 }
 
@@ -1929,8 +1862,13 @@ impl<'a> Linker for LlbcLinker<'a> {
         self.link_or_cc_arg(path);
     }
 
-    fn debuginfo(&mut self, _strip: Strip, _: &[PathBuf]) {
-        self.link_arg("--debug");
+    fn debuginfo(&mut self, strip: Strip, _: &[PathBuf]) {
+        match strip {
+            Strip::None => {
+                self.link_arg("--debug");
+            }
+            Strip::Debuginfo | Strip::Symbols => {}
+        }
     }
 
     fn optimize(&mut self) {
@@ -1997,7 +1935,7 @@ impl<'a> Linker for BpfLinker<'a> {
     }
 
     fn link_staticlib_by_name(&mut self, _name: &str, _verbatim: bool, _whole_archive: bool) {
-        self.sess.dcx().emit_fatal(errors::BpfStaticlibNotSupported)
+        self.sess.dcx().emit_fatal(diagnostics::BpfStaticlibNotSupported)
     }
 
     fn link_staticlib_by_path(&mut self, path: &Path, _whole_archive: bool) {
@@ -2046,7 +1984,7 @@ impl<'a> Linker for BpfLinker<'a> {
             }
         };
         if let Err(error) = res {
-            self.sess.dcx().emit_fatal(errors::SymbolFileWriteFailure { error });
+            self.sess.dcx().emit_fatal(diagnostics::SymbolFileWriteFailure { error });
         } else {
             self.link_arg("--export-symbols").link_arg(&path);
         }

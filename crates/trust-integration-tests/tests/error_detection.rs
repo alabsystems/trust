@@ -83,6 +83,7 @@ fn overflow_add_u32_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -141,6 +142,7 @@ fn overflow_sub_u32_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -207,6 +209,7 @@ fn divzero_variable_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -242,6 +245,7 @@ fn divzero_constant_safe() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -293,6 +297,7 @@ fn index_oob_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -356,6 +361,7 @@ fn rem_zero_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -391,6 +397,7 @@ fn rem_constant_safe() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -450,6 +457,7 @@ fn overflow_mul_u32_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -515,6 +523,7 @@ fn shift_overflow_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -571,6 +580,7 @@ fn cast_overflow_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -630,6 +640,7 @@ fn negation_overflow_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -696,6 +707,7 @@ fn assertion_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -737,6 +749,7 @@ fn unreachable_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -761,6 +774,7 @@ fn unreachable_safe() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -813,6 +827,7 @@ fn slice_bounds_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -874,6 +889,7 @@ fn invalid_discriminant_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -891,15 +907,20 @@ fn invalid_discriminant_safe() -> VerifiableFunction {
                     ty: Ty::Adt {
                         adt_kind: None,
                         layout: None,
-                        variants: Vec::new(),
+                        variants: Vec::new().into(),
                         name: "Option".to_string(),
                         fields: vec![
                             ("None".to_string(), Ty::Unit),
                             ("Some".to_string(), Ty::u32()),
-                        ],
+                        ]
+                        .into(),
                         disc_index_safe: false,
                         // Trust (B3-1 field completion): pre-existing E0063.
-                        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                    },
                     name: Some("opt".into()),
                 },
                 LocalDecl { index: 2, ty: Ty::u32(), name: None },
@@ -921,6 +942,7 @@ fn invalid_discriminant_safe() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1255,7 +1277,12 @@ fn test_detect_shift_overflow_safe() {
 
 #[test]
 fn test_detect_cast_overflow_u32_to_u8() {
-    let ay = require_ay();
+    // STALE expectation retired by 9f4b2c84179 ("trust-vcgen: defined int `as`
+    // casts compile (drop-in) with type-change tracking"): an integer-to-integer
+    // `as` cast is defined Rust — it truncates and never traps — so `x as u8`
+    // mints NO CastOverflow obligation. The truncated result is range-tracked
+    // instead, so a downstream overflow or out-of-bounds use of it is still caught
+    // by that use's own VC (pinned in trust-vcgen's unit tests).
     let func = cast_overflow_buggy();
     let vcs = trust_vcgen::generate_vcs(&func);
 
@@ -1264,21 +1291,10 @@ fn test_detect_cast_overflow_u32_to_u8() {
         eprintln!("  VC: {:?} -- {}", vc.kind, vc.function);
     }
 
-    let cast_vcs: Vec<_> =
-        vcs.iter().filter(|vc| matches!(vc.kind, VcKind::CastOverflow { .. })).collect();
-
-    assert!(!cast_vcs.is_empty(), "vcgen must produce CastOverflow VC for u32 -> u8 cast");
-
-    for vc in &cast_vcs {
-        let result = ay.verify(vc);
-        eprintln!("ay result for cast overflow: {:?}", result);
-
-        assert!(result.is_failed(), "ay must find u32 -> u8 cast CAN overflow. Got: {result:?}");
-
-        if let VerificationResult::Failed { counterexample: Some(cex), .. } = &result {
-            eprintln!("  Counterexample: {cex}");
-        }
-    }
+    assert!(
+        !vcs.iter().any(|vc| matches!(vc.kind, VcKind::CastOverflow { .. })),
+        "a u32 -> u8 `as` cast is defined truncation (9f4b2c84179): no CastOverflow VC may be emitted: {vcs:#?}"
+    );
 }
 
 #[test]

@@ -66,10 +66,11 @@ pub fn extract_types(units: &[CompilationUnit<'_>]) -> Vec<(usize, DwarfType)> {
         collect_type_offsets(&unit.dies, &mut offsets);
     }
 
+    let mut visiting = FxHashSet::default();
     offsets
         .into_iter()
         .filter_map(|offset| {
-            let mut visiting = FxHashSet::default();
+            visiting.clear();
             resolve_type_with_index(&index, offset, &mut visiting).ok().map(|type_| (offset, type_))
         })
         .collect()

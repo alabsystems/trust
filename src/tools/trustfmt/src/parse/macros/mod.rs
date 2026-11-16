@@ -10,7 +10,9 @@ use crate::macros::MacroArg;
 use crate::rewrite::RewriteContext;
 
 pub(crate) mod cfg_if;
-pub(crate) mod cfg_match;
+pub(crate) mod cfg_select;
+// Trust (T14d): the literal path of an item-position `include!`.
+pub(crate) mod include;
 pub(crate) mod lazy_static;
 
 fn build_stream_parser<'a>(psess: &'a ParseSess, tokens: TokenStream) -> Parser<'a> {
@@ -25,7 +27,9 @@ fn parse_macro_arg<'a, 'b: 'a>(parser: &'a mut Parser<'b>) -> Option<MacroArg> {
     macro_rules! parse_macro_arg {
         ($macro_arg:ident, $nt_kind:expr, $try_parse:expr, $then:expr) => {
             let mut cloned_parser = (*parser).clone();
-            if Parser::nonterminal_may_begin_with($nt_kind, &cloned_parser.token) {
+            if Parser::nonterminal_may_begin_with($nt_kind, &cloned_parser.token)
+                || matches!(cloned_parser.token.kind, TokenKind::DocComment(..))
+            {
                 match $try_parse(&mut cloned_parser) {
                     Ok(x) => {
                         if parser.psess.dcx().has_errors().is_some() {

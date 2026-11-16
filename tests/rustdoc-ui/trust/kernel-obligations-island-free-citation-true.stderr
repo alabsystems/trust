@@ -1,0 +1,8 @@
+note: citation `Nat.le_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `le_self`, with a clean certification audit
+  --> $DIR/kernel-obligations-island-free-citation-true.rs:10:38
+   |
+LL |     ensures forall n: nat, n <= n by Nat.le_refl
+   |                                      ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
+

@@ -73,7 +73,7 @@ use trust_types::admissible_body::{
 };
 use trust_types::{
     BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
-    Statement, Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
+    Statement, Terminator, Ty, UnOp, UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 // ═══════════════════════ THE TEST-SIDE REFERENCE RENDERER ══════════════════
@@ -136,6 +136,9 @@ fn render_operand(operand: TemplateOperand) -> Operand {
         // through `try_to_bool`), never into a one-byte `Uint` — which is why
         // the emitter spells it `Scalar::from_bool` and side B matches a
         // boolean rather than an integer it would have to interpret.
+        TemplateOperand::UIntScalar { value, width } => {
+            Operand::Constant(ConstValue::Uint(value, width))
+        }
         TemplateOperand::BoolScalar(value) => Operand::Constant(ConstValue::Bool(value)),
     }
 }
@@ -154,6 +157,9 @@ fn render(template: &BodyTemplate, rendering: &Rendering) -> VerifiableFunction 
         TemplateTy::Result => rendering.result_ty.clone(),
         TemplateTy::Param { index } => rendering.param_tys[index].clone(),
         TemplateTy::Bool => Ty::Bool,
+        TemplateTy::RustCalleeResult { .. } => {
+            panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement")
+        }
         TemplateTy::ResultRef => {
             Ty::Ref { mutable: false, inner: Box::new(rendering.result_ty.clone()) }
         }
@@ -195,6 +201,10 @@ fn render(template: &BodyTemplate, rendering: &Rendering) -> VerifiableFunction 
                         TemplateRvalue::SharedRef(of) => {
                             Rvalue::Ref { mutable: false, place: Place::local(of) }
                         }
+                        // W6 (Rust-calls-Clean): boolean negation.
+                        TemplateRvalue::BoolNot(op) => {
+                            Rvalue::UnaryOp(UnOp::Not, render_operand(op))
+                        }
                     },
                     span: SourceSpan::default(),
                 })
@@ -215,6 +225,7 @@ fn render(template: &BodyTemplate, rendering: &Rendering) -> VerifiableFunction 
                     Terminator::Call {
                         func: match callee {
                             TemplateCallee::Primitive(identity) => extracted_callee_path(*identity),
+                            TemplateCallee::RustFn { .. } => panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement"),
                             TemplateCallee::SelfDef => rendering.def_path.to_owned(),
                         },
                         args: args.iter().map(|arg| render_operand(*arg)).collect(),
@@ -229,6 +240,7 @@ fn render(template: &BodyTemplate, rendering: &Rendering) -> VerifiableFunction 
                             TemplateUnwind::Continue => UnwindEdge::Continue,
                         },
                         callee_identity: None,
+                        callee_key: None,
                     }
                 }
             },
@@ -249,6 +261,7 @@ fn render(template: &BodyTemplate, rendering: &Rendering) -> VerifiableFunction 
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -376,6 +389,7 @@ fn vf(arg_count: usize, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> Veri
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -392,6 +406,7 @@ fn unreachable_call(callee: &str, args: Vec<Operand>, dest: usize, target: usize
         is_unsafe_sig: false,
         unwind: UnwindEdge::Unreachable,
         callee_identity: None,
+        callee_key: None,
     }
 }
 
@@ -409,6 +424,7 @@ fn unwinding_call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) 
         is_unsafe_sig: false,
         unwind: UnwindEdge::Continue,
         callee_identity: None,
+        callee_key: None,
     }
 }
 
@@ -1271,8 +1287,26 @@ fn half_10_every_row_realization_resolves_to_one_of_five_skeletons() {
             // sharpest available statement of landing 6's qualification that
             // the two are different kinds of cost.
             MirShape::RawBinOp(_) => "single-assignment",
+            // W6 (Rust-calls-Clean): the comparison-to-`Bool` value is ALSO the
+            // single-assignment skeleton — `_0 = <cmp>(l, r); return`, one block
+            // with one statement and a `Return`, `single_assignment_body`'s
+            // locals and terminator with a `Compare` rvalue. Like landing 7's
+            // raw-binop, it adds a realization PRIMITIVE reuse, not a body
+            // SHAPE, so the skeleton count does not move.
+            MirShape::ComparisonValue(_) => "single-assignment",
+            // W6 (Rust-calls-Clean): the boolean connective/negation is also the
+            // single-assignment skeleton — one block, one statement into `_0`
+            // (a `RawBin` at the `bool` carrier for `&&`/`||`, a `BoolNot` for
+            // negation), a `Return`. A realization primitive reuse (`&&`/`||`)
+            // or one new primitive (`BoolNot`), not a body shape.
+            MirShape::BoolConnValue(_) | MirShape::BoolNotValue => "single-assignment",
             MirShape::ZeroTestBranch => "zero-test-recursion",
             MirShape::SelfCall => "arm-node (never a whole body)",
+            // W5 (Lean-calls-Rust): the SAME call-chain skeleton — one `Call`
+            // per node in post-order through fresh temporaries, the root
+            // writing `_0` — with a table-indexed callee and per-callee
+            // temporary types. A row, not a skeleton.
+            MirShape::RustCallChain => "call-chain",
         })
         .collect();
     assert_eq!(

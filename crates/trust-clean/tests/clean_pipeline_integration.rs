@@ -285,7 +285,6 @@ fn test_full_bridge_pipeline_to_store() {
 
 // ===========================================================================
 // AC2: Integration test invoking clean kernel on generated proof
-//      (gated by cfg(feature = "clean-integration"))
 // ===========================================================================
 
 /// Test that the clean kernel correctly rejects a structurally valid but

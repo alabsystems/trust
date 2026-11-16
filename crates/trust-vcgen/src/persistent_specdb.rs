@@ -287,11 +287,18 @@ impl PersistentSpecDatabase {
     /// Conflict resolution: higher confidence wins. On tie, the newer entry
     /// (from `other`) wins. User specs always override inferred/heuristic.
     pub fn merge(&mut self, other: &PersistentSpecDatabase) {
+        if other.entries.is_empty() {
+            return;
+        }
+        if self.entries.is_empty() {
+            self.entries.clone_from(&other.entries);
+            return;
+        }
         for (key, new_entry) in &other.entries {
-            match self.entries.get(key) {
+            match self.entries.get_mut(key) {
                 Some(existing) => {
                     if should_replace(existing, new_entry) {
-                        self.entries.insert(key.clone(), new_entry.clone());
+                        *existing = new_entry.clone();
                     }
                 }
                 None => {
@@ -307,6 +314,9 @@ impl PersistentSpecDatabase {
     /// `self` is treated as "old", `other` as "new".
     #[must_use]
     pub fn diff(&self, other: &PersistentSpecDatabase) -> SpecDiff {
+        if self.entries.is_empty() && other.entries.is_empty() {
+            return SpecDiff { added: Vec::new(), removed: Vec::new(), changed: Vec::new() };
+        }
         let mut added = Vec::new();
         let mut removed = Vec::new();
         let mut changed = Vec::new();
@@ -341,6 +351,9 @@ impl PersistentSpecDatabase {
     /// in the map are left untouched (they may belong to functions not
     /// currently being compiled).
     pub fn prune_stale(&mut self, current_hashes: &FxHashMap<String, String>) -> Vec<SpecEntry> {
+        if current_hashes.is_empty() || self.entries.is_empty() {
+            return Vec::new();
+        }
         let mut pruned = Vec::new();
         self.entries.retain(|key, entry| {
             if let Some(current_hash) = current_hashes.get(key) {

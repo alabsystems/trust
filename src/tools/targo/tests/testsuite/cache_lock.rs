@@ -3,9 +3,9 @@
 use std::thread::JoinHandle;
 
 use crate::prelude::*;
-use cargo::util::cache_lock::{CacheLockMode, CacheLocker};
 use cargo_test_support::paths;
 use cargo_test_support::{retry, thread_wait_timeout, threaded_timeout};
+use targo::util::cache_lock::{CacheLockMode, CacheLocker};
 
 use crate::config::GlobalContextBuilder;
 

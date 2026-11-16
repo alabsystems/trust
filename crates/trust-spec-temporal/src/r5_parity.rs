@@ -89,7 +89,7 @@ pub enum R5TemporalParityBlocker {
     /// kernel-replayed. Requiring an automatic proof searcher for arbitrary
     /// propositions would be an impossible completeness criterion.
     ArbitraryLeadsToDischargeMissing,
-    /// Historical blocker ID (closed by the owner policy flip 2026-07-21).
+    /// Historical blocker ID (closed by the policy flip of 2026-07-21).
     /// The Clean scalar decoder used to impose three Clean-only resource caps
     /// the legacy macro/certifier did not share: `MAX_EXPR_DEPTH` (expression
     /// nesting), `MAX_MODEL_NAMES` (distinct names per model), and
@@ -110,14 +110,14 @@ pub enum R5TemporalParityBlocker {
     /// macro-constructible but not macro-CERTIFIABLE, and only certifiable
     /// models define the parity domain.  That shared stricter grammar — no
     /// leading underscore, the `MAX_NAME_BYTES` length cap, reserved-token
-    /// rejection — is ratified as the parity target itself (owner ruling
+    /// rejection — is ratified as the parity target itself (ruled
     /// 2026-07-20): `valid_tla_identifier` is the TLA+ anti-injection guard
     /// and will not be relaxed.  Likewise the Clean lane's nonnegative
     /// (`Nat`) value domain matches the macro DSL's own `LitInt` restriction
     /// and is not a parity gap (same ruling).  The ID remains only so stored
     /// reports stay deserializable.
     ScalarModelAdmissionDomainParityMissing,
-    /// Historical blocker ID (closed by the owner policy flip 2026-07-21).
+    /// Historical blocker ID (closed by the policy flip of 2026-07-21).
     /// Converting a decoded Clean model through the legacy `Model` ABI used to
     /// consume a process-global finite name-interner budget, so a later small
     /// migration could fail solely because unrelated earlier conversions used
@@ -131,7 +131,7 @@ pub enum R5TemporalParityBlocker {
     ProcessGlobalNameInterningParityMissing,
     /// Historical blocker ID: `temporal_model!` used to register item-position
     /// models into a legacy link-time package inventory with no explicit
-    /// replacement.  That inventory was deleted as extraneous (owner ruling
+    /// replacement.  That inventory was deleted as extraneous (ruled
     /// 2026-07-20): the live gates never trusted the linked registry as
     /// program evidence, and callers/build integration own the explicit
     /// definition list they certify — so this gap no longer exists and the ID
@@ -142,11 +142,11 @@ pub enum R5TemporalParityBlocker {
 /// Gaps in advisory migration parity for well-formed, certifiable scalar models
 /// authored with the now-retired `trust_model!` and `temporal_model!` DSLs.
 ///
-/// Empty means every scalar macro model in the owner-ratified operational parity
+/// Empty means every scalar macro model in the ratified operational parity
 /// domain has a Clean migration. That domain excludes only malformed models and
 /// the `MAX_MODEL_ITEMS = 65_536` decode-cost/DoS ceiling; this is an explicit
 /// practical source-size scope, not literal unbounded parser-domain equality.
-/// EMPTY since the owner policy flip of 2026-07-21: the replacement-only
+/// EMPTY since the policy flip of 2026-07-21: the replacement-only
 /// admission limits and the process-history-dependent interner failures are
 /// gone (interner + name caps deleted, depth cap widened to a decode-cost
 /// guard, positive near-cap vectors passed — conversion past the old depth
@@ -656,7 +656,7 @@ mod tests {
             R5TemporalParityBlocker::CertifiedTemporalPropertyClassesIncomplete
         );
 
-        // The deleted automatic link-time inventory (owner ruling 2026-07-20):
+        // The deleted automatic link-time inventory (2026-07-20):
         // its wire ID stays readable for stored reports but gates nothing.
         let inventory_id: R5TemporalParityBlocker = serde_json::from_value(serde_json::json!(
             "automatic_model_inventory_replacement_missing"
@@ -782,11 +782,11 @@ mod tests {
     fn physical_macro_surface_stays_retired() {
         let manifest = include_str!("../Cargo.toml");
         let library = include_str!("lib.rs");
-        let crates_workspace = include_str!("../../Cargo.toml");
+        // Workspace unification retired crates/Cargo.toml. Check the current
+        // root workspace and this package's own standalone workspace instead.
         let root_workspace = include_str!("../../../Cargo.toml");
         assert!(!manifest.contains("trust-spec-temporal-macros"));
         assert!(!library.contains("pub use trust_spec_temporal_macros"));
-        assert!(!crates_workspace.contains("trust-spec-temporal-macros"));
         assert!(!root_workspace.contains("trust-spec-temporal-macros"));
         assert!(R5_TEMPORAL_MACRO_RETIREMENT_ALLOWED);
     }

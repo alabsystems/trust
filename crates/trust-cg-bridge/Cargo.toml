@@ -18,12 +18,16 @@ workspace = true
 default = []
 # Trust: goal-scoreboard — the `tir_scoreboard` example loads `-Ztrust-dump=ir:`
 # binary Modules and replays the WORKING-TREE `lower_module_to_lir` over every
-# function, classifying refusals. Measurement only; nothing in the library uses
-# the binary codec, so the trust-ir feature stays example-scoped.
+# function, classifying refusals. This diagnostic feature enables the example
+# without ay-proofs; original-IR observation retention also uses binary encoding
+# through ay-proofs to bind the complete supplied Module.
 tir-scoreboard = ["trust-ir/binary"]
+# Diagnostic only: decode both published Trust-IR transports and compare the
+# complete structures. This does not validate the codegen result or earn G7.
+trust-ir-pair-check = ["trust-ir/binary", "trust-ir/parser", "trust-ir/fmt"]
 # Trust: M-POS — the proven-output gate (verify_output module) needs the
 # disassembler + machine semantics in the library, not just dev-deps.
-ay-proofs = ["dep:ay", "dep:ay-proof", "dep:trust-disasm", "dep:trust-machine-sem"]
+ay-proofs = ["trust-ir/binary", "dep:trust-ir-build", "dep:ay", "dep:ay-proof", "dep:object", "dep:trust-disasm", "dep:trust-machine-sem"]
 # Trust: RUNG 1 (anti-Thompson) — route the [PROVED] grade through the CLEAN
 # CIC KERNEL re-check. With this on, `try_kernel_recheckable_proof` hands the
 # ay-exported BvBlastProof to clean-auto's `kernel_recheck_proved_grade`, which
@@ -33,7 +37,23 @@ ay-proofs = ["dep:ay", "dep:ay-proof", "dep:trust-disasm", "dep:trust-machine-se
 # `ay-proofs` (the gate needs the exporter). Acyclic: clean-auto's trust-* edges
 # are dev-deps only (see crates/Cargo.toml: clean-auto already consumed by
 # trust-clean). Behind a feature so default builds don't pull the clean kernel.
-kernel-recheck = ["ay-proofs", "dep:clean-auto", "dep:clean-kernel"]
+kernel-recheck = ["ay-proofs", "dep:clean-auto", "dep:clean-kernel", "dep:stacker"]
+# Conditional per-instruction SemR4.30 reference evidence; no function grade.
+frame-step-reference = ["kernel-recheck", "dep:clean-olean", "trust-ir/clean-expr"]
+# Data-only canonical SemR scalar claims over independently selected original
+# Compiler input; never a function/source/ABI grade or shipping capability.
+canonical-semr-scalar = ["frame-step-reference"]
+# Trust: WS7.12 — the proven-output gate's MUTATION-CONTROL hook
+# (`verify_trust_ir_output_preserved_with_lowering`), which lets a test inject a
+# deliberately WRONG lowering and demand `Refuted`. Integration tests cannot see
+# `cfg(test)` items, so the hook needs a feature rather than a test cfg. It is
+# NOT default and nothing in the compiler path turns it on: the hook changes
+# only the MACHINE side, never the spec, so it can make the gate refute but
+# never make it prove. Trust (O0, increment-5 step 5.0): the same feature
+# exposes the text-section corruptor (`verify_output::with_text_corruptor`,
+# machine side only) and the read-only PHASE-0 admission probe
+# (`verify_output::bundle_gate_admitted_callees`) to `tests/abi_guarantee.rs`.
+test-hooks = ["ay-proofs"]
 
 # Trust: `ccc_probe` imports `verify_output_trust_ir`, which is itself
 # `#[cfg(feature = "ay-proofs")]`. Without this declaration cargo auto-discovers
@@ -49,18 +69,43 @@ required-features = ["ay-proofs"]
 name = "tir_scoreboard"
 required-features = ["tir-scoreboard"]
 
+[[example]]
+name = "trust_ir_pair_check"
+required-features = ["trust-ir-pair-check"]
+
+[[example]]
+name = "capture_frame_step_cohort"
+required-features = ["frame-step-reference"]
+
+[[example]]
+name = "capture_frame_caller_cohort"
+required-features = ["frame-step-reference"]
+
+[[example]]
+name = "capture_canonical_scalar_cohort"
+required-features = ["canonical-semr-scalar"]
+
+[[example]]
+name = "capture_scalar_program_cohort"
+required-features = ["canonical-semr-scalar"]
+
 [dependencies]
 trust-types = { workspace = true }
 # Trust: the "trust-ir first" codegen seam consumes trust_ir::Module
 # (module_to_lir.rs); its reference interpreter is used by the test
 # value-differential. The trust-ir core crate is zero-required-dep.
-trust-ir = { workspace = true }
+trust-ir = { workspace = true, features = ["serde"] }
+# Validate the complete original input before deriving diagnostic observations.
+trust-ir-build = { workspace = true, optional = true }
 trust-cg-lower = { workspace = true }
 trust-cg-ir = { workspace = true }
 trust-cg-codegen = { path = "../../first-party/trust-cg/crates/trust-cg-codegen", default-features = false }
 trust-cg-opt = { path = "../../first-party/trust-cg/crates/trust-cg-opt" }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+object = { version = "0.39.1", default-features = false, features = ["std", "read"], optional = true }
 ay = { workspace = true, optional = true }
 # Trust: M-POS [PROVED] path — generalized zero-trust bit-blast exporter
 # (BvExpr + export_bv_blast_proof_expr). The gate lowers its Formula obligation
@@ -80,9 +125,19 @@ clean-auto = { workspace = true, optional = true, features = ["ay-bv-blast"] }
 # `Expr` terms (the `Clean.BVC.BvF` reflection) and runs the kernel `check_type`.
 # Optional, pulled in only by `kernel-recheck` (same as `clean-auto`).
 clean-kernel = { workspace = true, optional = true }
+clean-olean = { workspace = true, optional = true }
+# Trust: the O(1) and memory routes reflect a Formula by recursion, one frame per
+# node; they run on a stack grown on the calling thread (`verify_output_instantiate`).
+# The version rustc_data_structures already locks.
+stacker = { version = "0.1.25", optional = true }
 
 [dev-dependencies]
+ar_archive_writer = "0.5"
 tempfile = { workspace = true }
+# Trust (R-5 census): the in-crate census test decodes the production-driver
+# `module.trust-ir.bin` fixtures, which needs the binary codec as public API.
+# Test builds only — the library and the compiler plugin never decode binaries.
+trust-ir = { workspace = true, features = ["serde", "binary"] }
 trust-disasm = { workspace = true }
 trust-machine-sem = { workspace = true }
 # Trust: RUNG 4 (F3 retirement) — the trust_machine_sem <-> Lean ISA differential
@@ -93,3 +148,26 @@ trust-machine-sem = { workspace = true }
 # this is an [VALIDATED]/differential gate, not part of the gate's runtime TCB.
 clean-kernel = { workspace = true }
 trust-ir-bridge = { workspace = true }
+trust-wp-lib = { workspace = true, features = ["trust-ir-native"] }
+# Diagnostic native-translation replay uses Clean's existing pinned-fixture
+# compiler and the same WP typed codec, only in the test graph.
+clean-olean = { workspace = true, features = ["test-support"] }
+trust-wp-vc = { package = "trust-wp-core", path = "../../first-party/trust-wp/crates/trust-wp-core" }
+
+[[test]]
+name = "native_wp_translation_semr"
+required-features = ["ay-proofs"]
+
+[[test]]
+name = "f1_native_question_binding"
+required-features = ["ay-proofs"]
+
+# Retained original-CIC data requires a real kernel; denial instrumentation is
+# enabled only for its producer-free replay regression.
+[[test]]
+name = "direct_ir_observation"
+required-features = ["kernel-recheck", "test-hooks"]
+
+[[test]]
+name = "direct_ir_complete_observation"
+required-features = ["kernel-recheck", "test-hooks"]

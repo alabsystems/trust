@@ -61,6 +61,7 @@ fn call_func(args: Vec<Operand>, extra_stmt: Option<Statement>) -> VerifiableFun
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("test::callee"),
                     is_foreign: false,
                 },
             }],
@@ -72,15 +73,23 @@ fn call_func(args: Vec<Operand>, extra_stmt: Option<Statement>) -> VerifiableFun
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
-/// Pure-scalar args (a Copy u32 + a constant): the callee cannot reach any
-/// local, so ONLY the dest — and the dest's OWN derived slice-length metadata
-/// name, which the callee's write to `dest` also invalidates — is killed. Guard
-/// facts on `*r`/`x` survive, which is what the exact-equality assertion pins:
-/// either alias name appearing here is the callee-write false-accept this fast
-/// path must not reopen.
+/// Pure-scalar args (a Copy u32 + a constant): the dest — and its OWN derived
+/// slice-length metadata name, which the callee's write to `dest` also invalidates —
+/// is killed, and so is everything of the whole-function list except the protected,
+/// pointer-free `&mut` PARAMETER `r` that never leaves the body (TINV-18 correction,
+/// coarse rule, `path_defs::escape_havoc`): the `&mut`-borrowed stack local `x`, its
+/// derived length, and the `&mut` temp `_3` are havocked (a callee may reach a stack
+/// local's borrow through channels the fine-grained rule missed). Guard facts on `*r`
+/// survive, which is what the exact-equality assertion pins: `r` appearing here would
+/// be the fast path lost; `x` missing would be CALL-HAVOC-ESCAPE-1 reopened. No
+/// index-segment fallback `_0` here: nothing in this body indexes BY the
+/// destination, so there is no `..[_0]..` name for it to reach (round A10,
+/// `local_is_index_operand` — the fallback is minted only where it can rebind
+/// something; see `scalar_args_dest_used_as_an_index_mints_its_fallback`).
 #[test]
 fn scalar_args_skip_the_global_havoc() {
     let func = call_func(
@@ -90,8 +99,35 @@ fn scalar_args_skip_the_global_havoc() {
     let names = terminator_def_names(&func, &func.body.blocks[0]);
     assert_eq!(
         names,
-        vec!["ret".to_string(), "ret__slice_len".to_string()],
-        "only the dest and its own derived metadata; got {names:?}"
+        ["x", "x__slice_len", "_3", "ret", "ret__slice_len"].map(String::from).to_vec(),
+        "everything but the protected parameter `r`; got {names:?}"
+    );
+}
+
+/// The same fast path when the destination IS an index operand somewhere in the
+/// body (`x = (*r)[ret]`): a place name indexed BY the destination (`r*[_0]`) must
+/// re-version after the call exactly as it does after an `Assign`, so the
+/// index-segment fallback `_0` joins the kill — and, as before, the protected
+/// parameter `r` does not.
+#[test]
+fn scalar_args_dest_used_as_an_index_mints_its_fallback() {
+    let indexed_read = Statement::Assign {
+        place: Place::local(4),
+        rvalue: Rvalue::Use(Operand::Copy(Place {
+            local: 1,
+            projections: vec![trust_types::Projection::Deref, trust_types::Projection::Index(0)],
+        })),
+        span: SourceSpan::default(),
+    };
+    let func = call_func(
+        vec![Operand::Copy(Place::local(2)), Operand::Constant(ConstValue::Uint(7, 32))],
+        Some(indexed_read),
+    );
+    let names = terminator_def_names(&func, &func.body.blocks[0]);
+    assert_eq!(
+        names,
+        ["x", "x__slice_len", "_3", "ret", "ret__slice_len", "_0"].map(String::from).to_vec(),
+        "the dest, its derived metadata and its index fallback; got {names:?}"
     );
 }
 
@@ -189,6 +225,7 @@ fn slice_reassign_func(rvalue: Rvalue) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

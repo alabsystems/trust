@@ -36,36 +36,55 @@ pub struct FunctionLocation {
 /// then walks backward to find the true item start (visibility, qualifiers).
 #[must_use]
 pub fn find_function(source: &str, name: &str) -> Vec<FunctionLocation> {
-    let target = format!("fn {name}(");
-    let mut results = Vec::new();
-
-    for (fn_byte_offset, _) in source.match_indices(&target) {
-        // Verify this is a token boundary: the char before `fn` must be whitespace
-        // or start-of-file (not part of another identifier like `cfg_fn`)
-        if fn_byte_offset > 0 {
-            let prev = source.as_bytes()[fn_byte_offset - 1];
-            if prev != b' ' && prev != b'\t' && prev != b'\n' && prev != b'\r' {
-                continue;
-            }
-        }
-
-        // Walk backward from `fn` to find the true item start (visibility + qualifiers).
-        let item_offset = find_item_start(source, fn_byte_offset);
-
-        // Compute line number and indentation.
-        let line = source[..item_offset].matches('\n').count() + 1;
-        let indent = extract_indent(source, item_offset);
-
-        results.push(FunctionLocation { item_offset, fn_offset: fn_byte_offset, line, indent });
-    }
-
-    results
+    find_function_iter(source, name).collect()
 }
 
 /// Find the first occurrence of `fn <name>(` in source.
 #[must_use]
 pub fn find_function_first(source: &str, name: &str) -> Option<FunctionLocation> {
-    find_function(source, name).into_iter().next()
+    find_function_iter(source, name).next()
+}
+
+fn find_function_iter<'a>(
+    source: &'a str,
+    name: &'a str,
+) -> impl Iterator<Item = FunctionLocation> + 'a {
+    let mut search_pos = 0usize;
+    std::iter::from_fn(move || {
+        while let Some(rel_idx) = source[search_pos..].find("fn ") {
+            let fn_byte_offset = search_pos + rel_idx;
+            let after_fn = fn_byte_offset + 3;
+            search_pos = after_fn;
+
+            let rest = &source[after_fn..];
+            let Some(after_name) = rest.strip_prefix(name) else {
+                continue;
+            };
+            if !after_name.starts_with('(') {
+                continue;
+            }
+            search_pos = after_fn + name.len() + 1;
+
+            // Verify this is a token boundary: the char before `fn` must be whitespace
+            // or start-of-file (not part of another identifier like `cfg_fn`)
+            if fn_byte_offset > 0 {
+                let prev = source.as_bytes()[fn_byte_offset - 1];
+                if prev != b' ' && prev != b'\t' && prev != b'\n' && prev != b'\r' {
+                    continue;
+                }
+            }
+
+            // Walk backward from `fn` to find the true item start (visibility + qualifiers).
+            let item_offset = find_item_start(source, fn_byte_offset);
+
+            // Compute line number and indentation.
+            let line = source[..item_offset].matches('\n').count() + 1;
+            let indent = extract_indent(source, item_offset);
+
+            return Some(FunctionLocation { item_offset, fn_offset: fn_byte_offset, line, indent });
+        }
+        None
+    })
 }
 
 /// Walk backward from `fn` keyword to find the start of the item,

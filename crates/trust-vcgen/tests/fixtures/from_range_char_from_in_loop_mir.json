@@ -1,0 +1,1053 @@
+{
+  "name": "char_from_in_loop",
+  "def_path": "from_range::char_from_in_loop",
+  "span": {
+    "file": "from_range.rs",
+    "line_start": 22,
+    "col_start": 0,
+    "line_end": 25,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "cs"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "iter"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::slice::iter::Iter",
+                "fields": [
+                  [
+                    "ptr",
+                    {
+                      "Adt": {
+                        "name": "core::ptr::non_null::NonNull",
+                        "fields": [
+                          [
+                            "pointer",
+                            {
+                              "RawPtr": {
+                                "mutable": false,
+                                "pointee": {
+                                  "Int": {
+                                    "width": 32,
+                                    "signed": false
+                                  }
+                                }
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ],
+                  [
+                    "end_or_len",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "_marker",
+                    {
+                      "Adt": {
+                        "name": "core::marker::PhantomData",
+                        "fields": [],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "c"
+      },
+      {
+        "index": 8,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<&[char] as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "from_range.rs",
+              "line_start": 23,
+              "col_start": 13,
+              "line_end": 23,
+              "col_end": 15
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 9649407740589385080,
+              "def_index": 10353,
+              "substs_digest": [
+                12351561350720944919,
+                103853109605825514
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 9649407740589385080,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "from_range.rs",
+                "line_start": 23,
+                "col_start": 13,
+                "line_end": 23,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 2
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "from_range.rs",
+                "line_start": 23,
+                "col_start": 13,
+                "line_end": 23,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::Iter<'_, char> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Copy": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "from_range.rs",
+              "line_start": 23,
+              "col_start": 13,
+              "line_end": 23,
+              "col_end": 15
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 9649407740589385080,
+              "def_index": 10534,
+              "substs_digest": [
+                13205013460289016836,
+                11872879644382350192
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 9649407740589385080,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "from_range.rs",
+                "line_start": 23,
+                "col_start": 13,
+                "line_end": 23,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ],
+              [
+                1,
+                5
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "from_range.rs",
+              "line_start": 23,
+              "col_start": 13,
+              "line_end": 23,
+              "col_end": 15
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "from_range.rs",
+                "line_start": 23,
+                "col_start": 8,
+                "line_end": 23,
+                "col_end": 9
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 7,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "from_range.rs",
+                "line_start": 23,
+                "col_start": 31,
+                "line_end": 23,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<u32 as core::convert::From<char>>::from",
+            "args": [
+              {
+                "Move": {
+                  "local": 11,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 10,
+              "projections": []
+            },
+            "target": 7,
+            "span": {
+              "file": "from_range.rs",
+              "line_start": 23,
+              "col_start": 21,
+              "line_end": 23,
+              "col_end": 34
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 9649407740589385080,
+              "def_index": 3764,
+              "substs_digest": [
+                3620711863917442630,
+                11760524760473230342
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 9649407740589385080,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "from_range.rs",
+                "line_start": 24,
+                "col_start": 4,
+                "line_end": 24,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4293853184,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "from_range.rs",
+                "line_start": 23,
+                "col_start": 21,
+                "line_end": 23,
+                "col_end": 48
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 12,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 8,
+            "span": {
+              "file": "from_range.rs",
+              "line_start": 23,
+              "col_start": 21,
+              "line_end": 23,
+              "col_end": 48
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 12,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "from_range.rs",
+                "line_start": 23,
+                "col_start": 21,
+                "line_end": 23,
+                "col_end": 48
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        7,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "from_range.rs",
+                "line_start": 23,
+                "col_start": 21,
+                "line_end": 23,
+                "col_end": 52
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 8,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 9,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "from_range.rs",
+              "line_start": 23,
+              "col_start": 21,
+              "line_end": 23,
+              "col_end": 52
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "from_range.rs",
+                "line_start": 23,
+                "col_start": 62,
+                "line_end": 23,
+                "col_end": 66
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "_11",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "_11",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1114111
+            }
+          ]
+        },
+        {
+          "Not": {
+            "And": [
+              {
+                "Ge": [
+                  {
+                    "Var": [
+                      "_11",
+                      "Int"
+                    ]
+                  },
+                  {
+                    "Int": 55296
+                  }
+                ]
+              },
+              {
+                "Le": [
+                  {
+                    "Var": [
+                      "_11",
+                      "Int"
+                    ]
+                  },
+                  {
+                    "Int": 57343
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

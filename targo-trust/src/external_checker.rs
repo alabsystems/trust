@@ -66,12 +66,7 @@ pub(crate) fn prepare_external_checker(
         )
         .map_err(|error| format!("could not initialize checker: {error}"))?
         .with_timeout_ms(OUTER_CHECKER_TIMEOUT_MS);
-        return Ok(PreparedExternalChecker {
-            _checker: checker,
-            _supervisor: None,
-            runner,
-            checker_sha256,
-        });
+        Ok(PreparedExternalChecker { _checker: checker, _supervisor: None, runner, checker_sha256 })
     }
 
     #[cfg(not(test))]
@@ -302,11 +297,11 @@ const BOUND_CHECKER_FLAGS: [&str; 9] = [
 ];
 
 fn parse_bound_checker_args(args: &[String]) -> Result<BoundCheckerArgs, String> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err("checker artifact arguments must be flag/value pairs".to_string());
     }
     let mut values = BTreeMap::new();
-    for pair in args.chunks_exact(2) {
+    for pair in args.as_chunks::<2>().0 {
         let key = BOUND_CHECKER_FLAGS
             .iter()
             .copied()

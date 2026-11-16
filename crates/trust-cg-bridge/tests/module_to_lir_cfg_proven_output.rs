@@ -72,6 +72,7 @@ fn make_select_module(name: &str, op: ICmpOp) -> Module {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
     let func_ty_id = FuncTyId::new(0);
     let mut function = IrFunction::new(FuncId::new(0), name, func_ty_id, BlockId::new(0));

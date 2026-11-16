@@ -30,9 +30,9 @@
 #     is asserted and `unreachable` is asserted ABSENT.
 #  3. A pass never seen to fail is not evidence. Nine mutations run: seven that
 #     must refute, and TWO that must NOT (H and I below).
-#  4. `TRUSTFLAGS` is silently dropped if misspelled, so the certify lane can
-#     look like it ran when it did not. The flag path is proved by feeding it a
-#     bogus policy and requiring the compiler to reject it BY NAME.
+#  4. The certify lane must be seen to run, not assumed. `--certify` selects
+#     it (TRUSTFLAGS is not read since T7a), and the Gate line names the lane
+#     that graded the run, so the certify step requires `[certify lane`.
 #  5. Proofs cover overflow and discharged contracts — NOT whether the answer is
 #     right.
 #
@@ -43,10 +43,14 @@
 # the compiler learns one, this gate goes RED and says so, rather than the map
 # entry going quietly stale (the §10.1 precedent).
 #
-#   F pins §13.1 — a DIGIT SEPARATOR in an `ensures` literal (`999_999_999`)
-#     makes the whole clause `SpecEnsuresUnparseable`. The body is unaffected:
-#     the identical separator inside the body proves. Bare decimal digits are
-#     the entire literal language of the predicate.
+#   F pins §13.1 as CLOSED — the contract reader learned Rust's own integer
+#     literal grammar on 2026-08-29, so a DIGIT SEPARATOR in an `ensures`
+#     literal (`999_999_999`) now PARSES and proves. F holds that capability;
+#     F2 and F3 are its CONTROLS, because a reader that accepts the clause and
+#     ignores it (F2: the same separated bound made false), or reads it larger
+#     than written (F3: that bound against a body returning 1500000000), would
+#     each pass F on its own. Re-pointed 2026-09-15, which is what §13.1's
+#     closure note asked for by name.
 #   G pins §13.5 — a subtraction whose MINUEND is a literal (`1000000000 - r`)
 #     does not prove at any width and NO guard repairs it, not even on a bare
 #     parameter. `var - var` and `var - CONST` both prove.
@@ -166,32 +170,11 @@ TARGO="${TARGO:-$REPO_ROOT/build/host/stage1/bin/targo}"
 [ -x "$(dirname "$TARGO")/trustc" ] \
   || { echo "REFUSE: no sibling trustc beside $TARGO — the stage1 sysroot is not assembled"; exit 2; }
 
-# PREFLIGHT: `crates/Cargo.toml` must LOAD. A workspace member listed without a
-# manifest — or with a manifest but no `src/lib.rs` yet — makes every `targo
-# trust check` in this workspace exit 2 with no `Gate:` line, indistinguishable
-# from the seal failure and from a real crate regression. This is not
-# hypothetical: it blocked this crate's first measurement while a sibling agent
-# was mid-way through adding `trust-bits`.
-MISSING_MEMBERS="$(python3 - "$REPO_ROOT/crates" <<'PY'
-import os, re, sys
-root = sys.argv[1]
-s = open(os.path.join(root, "Cargo.toml")).read()
-m = re.search(r'^members\s*=\s*\[(.*?)^\]', s, re.S | re.M)
-if m:
-    for name in re.findall(r'^\s*"([^"]+)",\s*$', m.group(1), re.M):
-        d = os.path.join(root, name)
-        if not os.path.exists(os.path.join(d, "Cargo.toml")):
-            print(f"{name} (no Cargo.toml)")
-        elif not any(os.path.exists(os.path.join(d, p))
-                     for p in ("src/lib.rs", "src/main.rs")):
-            print(f"{name} (manifest with no target)")
-PY
-)"
-[ -z "$MISSING_MEMBERS" ] || {
-  echo "REFUSE: crates/Cargo.toml lists member(s) cargo cannot load:"
-  echo "$MISSING_MEMBERS" | sed 's/^/          /'
-  echo "        Every targo run in this workspace exits 2 with no Gate: line until"
-  echo "        that is fixed. This is NOT a trust-timearith result."
+# Ask Targo to load the canonical workspace before attributing a load failure
+# to the contract under test. Native metadata resolves members and manifests.
+"$TARGO" metadata --locked --no-deps --format-version 1 \
+  --manifest-path "$REPO_ROOT/Cargo.toml" >/dev/null || {
+  echo "REFUSE: Targo cannot load the canonical workspace"
   exit 2
 }
 
@@ -202,9 +185,9 @@ trap 'restore; rm -f "$BACKUP"' EXIT INT TERM
 
 fails=0
 LOG=""
-run() { # run [policy]; sets RC and LOG
+run() { # run [lane flag]; sets RC and LOG
   LOG="$(mktemp)"
-  ( cd "$REPO_ROOT/crates" && TRUSTFLAGS="${1:-}" "$TARGO" trust check -p trust-timearith ) > "$LOG" 2>&1
+  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check --all-rows ${1:+"$1"} -p trust-timearith ) > "$LOG" 2>&1
   RC=$?
   require_env "${STEP:-run}"
   no_rustc_error "${STEP:-run}"
@@ -219,7 +202,7 @@ runtests() { # sets RC and LOG
   RC=$?
   require_env "${STEP:-tests}"
 }
-gate_line() { grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$LOG" | tail -1; }
+gate_line() { grep -oE 'Gate: [A-Z-]+ \[[a-z-]+ lane, exit [0-9]+\]' "$LOG" | tail -1; }
 fail() { echo "  FAIL $*"; fails=$((fails+1)); }
 
 # ---------------------------------------------------------------------------
@@ -344,23 +327,18 @@ rm -f "$LOG"
 mut_end
 
 # ---------------------------------------------------------------------------
-# 2. THE SAME PASS UNDER `-Ztrust-policy=certify`.
-#    A misspelled TRUSTFLAGS is dropped, so first prove the flag path reaches
-#    the compiler by requiring a bogus policy to be REJECTED BY NAME. Without
-#    this control, "certify passed" is indistinguishable from "certify never
-#    ran".
+# 2. THE SAME PASS UNDER `--certify` (the compiler's `certify` policy).
+#    The lane flag selects the compiler's `certify` policy, and the Gate line
+#    names the lane that graded the run, so `[certify lane, exit 0]` is the
+#    evidence that certify ran. (A bogus-policy control proved the TRUSTFLAGS
+#    route reached the compiler; it went with that channel, DECISION_QUEUE T7a.)
 # ---------------------------------------------------------------------------
-STEP="THE SAME PASS UNDER '-Ztrust-policy=certify'"; mut_begin
-run "-Ztrust-policy=bogus_not_a_policy"
-grep -q "incorrect value \`bogus_not_a_policy\` for unstable option \`trust-policy\`" "$LOG" \
-  || fail "TRUSTFLAGS control: a bogus policy was NOT rejected — the flag never reaches the compiler, so the certify run below proves nothing"
-rm -f "$LOG"
-
-run "-Ztrust-policy=certify"
+STEP="THE SAME PASS UNDER '--certify'"; mut_begin
+run "--certify"
 G="$(gate_line)"
 [ -n "$G" ] || fail "certify: no Gate: line"
 [ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
-case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
+case "$G" in *"PASS [certify lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
 grep -qE 'Summary: 127 proved, 0 failed, .*0 inconclusive \(127 total\)' "$LOG" \
   || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 [ "$(grep -oE 'proved by kind: [a-z_=0-9, ]+' "$LOG" | tail -1)" = "$PRISTINE_KINDS" ] \
@@ -463,10 +441,23 @@ mutate '    (secs as u64) * 1000000000 + (nanos as u64)
 run
 G="$(gate_line)"
 if [ "$RC" -eq 0 ]; then fail "mutation C: a coefficient one past the computed boundary still passed — the peak is no longer tight, re-measure  $G"; else mut_ok "mutation C (total_nanos coefficient 4294967297, one past the exact boundary)  rc=$RC  $G"; fi
-grep -qE 'trust_timearith::total_nanos \[INCONCLUSIVE\]' "$LOG" \
-  || fail "mutation C: total_nanos did not lose a row — $(grep -oE 'trust_timearith::total_nanos \[[A-Z]+\] \([^;]*' "$LOG" | head -1)"
+# AMENDED 2026-09-15: the Add is now REFUTED rather than left unproved, so
+# total_nanos reports [VIOLATIONS] with a counterexample instead of losing the
+# row to [INCONCLUSIVE]. Measured (`repro-tmC`): 1 Add FAILED, 18 Mul PROVED,
+# total_nanos 2 proved / 2 failed. A refutation is strictly stronger than a
+# coverage loss, so accept either — but when it refutes, demand the witness,
+# because a refutation with no counterexample is a capability gap wearing the
+# wrong label.
+grep -qE 'trust_timearith::total_nanos \[(VIOLATIONS|INCONCLUSIVE)\]' "$LOG" \
+  || fail "mutation C: total_nanos neither refuted nor lost a row — $(grep -oE 'trust_timearith::total_nanos \[[A-Z]+\] \([^;]*' "$LOG" | head -1)"
 grep -qE 'arithmetic overflow \(Add\) (FAILED|UNKNOWN|RUNTIME CHECKED)' "$LOG" \
   || fail "mutation C: no add row went FAILED, UNKNOWN or RUNTIME CHECKED — $(grep -oE 'arithmetic overflow \([A-Za-z]+\) [A-Z ]+' "$LOG" | sort -u | tr '\n' ' ')"
+if grep -qE 'trust_timearith::total_nanos \[VIOLATIONS\]' "$LOG"; then
+  grep -qE 'arithmetic overflow \(Add\) FAILED' "$LOG" \
+    || fail "mutation C: total_nanos reported VIOLATIONS but no Add row FAILED — the violation is not the overflow this mutation creates"
+  grep -q 'counterexample:' "$LOG" \
+    || fail "mutation C: a refuted Add carried no counterexample — without a witness this is a capability gap, not a refutation"
+fi
 # The Mul must still PROVE. If it ever stops, the coefficient is no longer
 # sitting exactly on the boundary and §13.7's arithmetic needs re-deriving.
 grep -q 'arithmetic overflow (Mul) PROVED' "$LOG" \
@@ -494,13 +485,16 @@ mutate 'fn raw_nanos_field_sum(a: u32, b: u32) -> u32 {
     let s: u64 = (a as u64) + (b as u64);'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation D: an Assert behind a CALL bundled — §9.1 is stale and must be re-measured  $G"; else mut_ok "mutation D (is_canonical_nanos call folded into raw_nanos_field_sum)  rc=$RC  $G"; fi
+# §9.1 AMENDED 2026-09-15: a CALL before the Assert no longer breaks entry-prefix
+# bundling. Measured the same day (`repro-tmD`): 127 proved / 127, 51/51
+# complete, exit 0, zero refusal notes. Re-pointed to a capability pin.
+if [ "$RC" -ne 0 ]; then fail "mutation D: a CALL before the Assert is REFUSED again (rc=$RC) — the 2026-09-15 capability in §9.1 regressed  $G"; else mut_ok "mutation D (is_canonical_nanos call folded into raw_nanos_field_sum) bundles  rc=$RC  $G"; fi
 grep -q 'member has a guarded or non-entry-prefix Assert' "$LOG" \
-  || fail "mutation D: the bundle did not refuse a non-entry-prefix Assert — $(grep -oE 'native TrustIr bundle for .*' "$LOG" | head -1)"
-grep -q 'refused Assert-bearing member `trust_timearith::raw_nanos_field_sum`' "$LOG" \
-  || fail "mutation D: raw_nanos_field_sum was not the refused member"
-grep -q 'verification failed for `trust_timearith::nanos_field_sum`' "$LOG" \
-  || fail "mutation D: the refusal was not raised against the CALLER — the §11.5 attribution direction changed"
+  && fail "mutation D: a non-entry-prefix refusal note reappeared — §9.1's amendment is no longer the whole story"
+grep -q 'Coverage: 51/51 eligible function bodies verified (complete)' "$LOG" \
+  || fail "mutation D: coverage moved under the folded call"
+grep -qE 'Summary: 127 proved, 0 failed, .*0 inconclusive \(127 total\)' "$LOG" \
+  || fail "mutation D: the folded call moved the row counts — $(grep -oE 'Summary:.*' "$LOG" | head -1)"
 rm -f "$LOG"; restore
 mut_end
 
@@ -554,11 +548,59 @@ mutate 'pub fn clamp_nanos(v: u32) -> u32 ensures result <= 999999999 {' \
        'pub fn clamp_nanos(v: u32) -> u32 ensures result <= 999_999_999 {'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation F: a digit-separated ensures literal PARSED — §13.1 is stale; re-measure and the whole map's 'bare decimal only' rule can be relaxed  $G"; else mut_ok "mutation F (ensures literal respelled 999_999_999)  rc=$RC  $G"; fi
+if [ "$RC" -ne 0 ]; then fail "mutation F: a digit-separated ensures literal no longer parses (rc=$RC) — the capability §13.1 records as CLOSED on 2026-08-29 has regressed  $G"; else mut_ok "mutation F (ensures literal respelled 999_999_999) parses and proves  rc=$RC  $G"; fi
 grep -q 'SpecEnsuresUnparseable' "$LOG" \
-  || fail "mutation F: the clause was not reported unparseable — the failure mode changed"
-grep -q 'unsupported contract predicate expression `result <= 999_999_999`' "$LOG" \
-  || fail "mutation F: the predicate was not named in the diagnostic"
+  && fail "mutation F: the clause was reported unparseable — §13.1's closure regressed"
+grep -qE 'Summary: 127 proved, 0 failed, .*0 inconclusive \(127 total\)' "$LOG" \
+  || fail "mutation F: a pure respelling moved the row counts, so the separated literal did not parse to the same proposition — $(grep -oE 'Summary:.*' "$LOG" | head -1)"
+grep -q 'Coverage: 51/51 eligible function bodies verified (complete)' "$LOG" \
+  || fail "mutation F: a pure respelling moved coverage"
+rm -f "$LOG"; restore
+mut_end
+
+# ---------------------------------------------------------------------------
+# 8b. MUTATION F2 — the separated literal is ENFORCED, not merely accepted.
+#    F on its own cannot tell a parser that READS `999_999_999` from one that
+#    accepts the clause and ignores it: both leave the crate proving. F2 makes
+#    the same separated clause FALSE. It must refuse.
+
+STEP="mutation F2"; mut_begin
+mutate 'pub fn clamp_nanos(v: u32) -> u32 ensures result <= 999999999 {' \
+       'pub fn clamp_nanos(v: u32) -> u32 ensures result <= 999_999_998 {'
+run
+G="$(gate_line)"
+if [ "$RC" -eq 0 ]; then fail "mutation F2: a FALSE digit-separated bound passed — the separated clause is being accepted and IGNORED, which is exactly what F's capability claim must rule out  $G"; else mut_ok "mutation F2 (the separated bound made false: 999_999_998)  rc=$RC  $G"; fi
+grep -q 'verification failed for `trust_timearith::clamp_nanos`' "$LOG" \
+  || fail "mutation F2: clamp_nanos was not the function that lost rows — the false bound was not enforced on its own function"
+grep -qE 'trust_timearith::clamp_nanos \[INCONCLUSIVE\].*[1-9][0-9]* unknown' "$LOG" \
+  || fail "mutation F2: clamp_nanos kept every row under a false bound — $(grep -oE 'trust_timearith::clamp_nanos \[[A-Z]+\] \([^;]*' "$LOG" | head -1)"
+grep -q 'solver refuted the encoded VC' "$LOG" \
+  || fail "mutation F2: nothing refuted the encoded VC — a row that went unproved for want of capability is NOT evidence that the separated literal was read at its true magnitude"
+rm -f "$LOG"; restore
+mut_end
+
+# ---------------------------------------------------------------------------
+# 8c. MUTATION F3 — the separated literal is read at the RIGHT MAGNITUDE.
+#    F2 refuses for any parsed value below 999999999, a truncation at the
+#    separator included. F3 closes the other side: the bound stays the honest
+#    `999_999_999` and the BODY returns 1500000000. A parse that came out too
+#    large would prove this, and that would be unsound.
+
+STEP="mutation F3"; mut_begin
+mutate 'pub fn clamp_nanos(v: u32) -> u32 ensures result <= 999999999 {
+    if v > 999999999 {
+        return 999999999;
+    }' 'pub fn clamp_nanos(v: u32) -> u32 ensures result <= 999_999_999 {
+    if v > 999999999 {
+        return 1500000000;
+    }'
+run
+G="$(gate_line)"
+if [ "$RC" -eq 0 ]; then fail "mutation F3: a return of 1500000000 satisfied the separated bound 999_999_999 — the literal parsed LARGER than it reads, which is unsound  $G"; else mut_ok "mutation F3 (the separated bound held against a body returning 1500000000)  rc=$RC  $G"; fi
+grep -q 'verification failed for `trust_timearith::clamp_nanos`' "$LOG" \
+  || fail "mutation F3: clamp_nanos did not lose a row against an over-large return"
+grep -q 'solver refuted the encoded VC' "$LOG" \
+  || fail "mutation F3: nothing refuted the encoded VC — an unproved row is not evidence about the literal's magnitude"
 rm -f "$LOG"; restore
 mut_end
 
@@ -586,15 +628,58 @@ mutate '    let s: u64 = (a as u64) + 1000000000;
 }'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation G: a literal minuend PROVED — §13.5 is stale; re-measure, the borrow arm can be spelled the textbook way  $G"; else mut_ok "mutation G (borrow arm respelled 1000000000 - (b - a))  rc=$RC  $G"; fi
-grep -qE 'trust_timearith::raw_nanos_field_diff \[INCONCLUSIVE\]' "$LOG" \
-  || fail "mutation G: raw_nanos_field_diff did not lose a row — $(grep -oE 'trust_timearith::raw_nanos_field_diff \[[A-Z]+\] \([^;]*' "$LOG" | head -1)"
-# SPECIFICITY, as for E. `raw_nanos_field_diff` has exactly one caller,
-# `nanos_field_diff`, which is therefore excluded from this list; every function
-# below is on an independent chain.
+# §13.5 CLOSED 2026-09-16 — a LITERAL MINUEND PROVES. Measured on stage1 6430d6b06
+# (archive lane ra-tmG): the borrow arm respelled the textbook way,
+# `if r > 1000000000 { return 0; } 1000000000 - r`, gives raw_nanos_field_diff
+# [VERIFIED] (5 obligations: 5 proved), every overflow:sub row PROVED, 127/127 — the
+# SAME counts as pristine. G2 loosens that guard by one and must be refuted.
+if [ "$RC" -ne 0 ]; then fail "mutation G: a literal minuend is REFUSED again (rc=$RC) — §13.5's 2026-09-16 closure regressed  $G"; else mut_ok "mutation G (borrow arm respelled 1000000000 - (b - a)) PROVES  rc=$RC  $G"; fi
+grep -qE 'trust_timearith::raw_nanos_field_diff \[VERIFIED\] \(5 obligations: 5 proved, 0 runtime-checked, 0 failed, 0 unknown' "$LOG" \
+  || fail "mutation G: raw_nanos_field_diff did not verify all 5 rows with a literal minuend — $(grep -oE 'trust_timearith::raw_nanos_field_diff \[[A-Z ]+\] \([^;]*' "$LOG" | head -1)"
+grep -qE '\[(UNKNOWN|FAILED|RUNTIME-CHECKED)\] \[overflow:sub\]' "$LOG" \
+  && fail "mutation G: a subtraction row is not PROVED — $(grep -oE '\[(UNKNOWN|FAILED|RUNTIME-CHECKED)\] \[overflow:sub\][^(]*' "$LOG" | head -2 | tr '\n' ' ')"
+grep -qE 'Summary: 127 proved, 0 failed, 0 runtime-checked, .*0 inconclusive \(127 total\)' "$LOG" \
+  || fail "mutation G: the counts moved from pristine's 127/127 — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
+# SPECIFICITY, as before: every function below is on an independent chain.
 for f in raw_nanos_field_sum raw_nanos_field_carry raw_nanos_field_borrow total_nanos; do
   grep -qE "trust_timearith::$f \[(INCONCLUSIVE|FAILED)\]" "$LOG" \
-    && fail "mutation G: $f also stopped verifying — it does not reach raw_nanos_field_diff, so this run is a general regression and says nothing about §13.5"
+    && fail "mutation G: $f also changed — it does not reach raw_nanos_field_diff, so this run is a general change and says nothing about §13.5"
+done
+rm -f "$LOG"; restore
+mut_end
+
+# ---------------------------------------------------------------------------
+# MUTATION G2 — the CONTROL for G. The guard loosened by ONE (`r > 1000000001`) admits
+#    r = 1000000001, and `1000000000 - r` underflows. Must be REFUTED. Measured on
+#    6430d6b06 (ra-tmG-ctrl): raw_nanos_field_diff [VIOLATIONS] (6 obligations:
+#    4 proved, 2 failed), one [FAILED] [overflow:sub], exit 1.
+# ---------------------------------------------------------------------------
+STEP="mutation G2 (§13.5 control)"; mut_begin
+mutate '    let s: u64 = (a as u64) + 1000000000;
+    let t: u64 = b as u64;
+    if s < t {
+        return 0;
+    }
+    let d: u64 = s - t;
+    d as u32
+}' '    let r: u32 = b - a;
+    if r > 1000000001 {
+        return 0;
+    }
+    1000000000 - r
+}'
+run
+G="$(gate_line)"
+if [ "$RC" -eq 0 ]; then fail "mutation G2: a guard loosened by one PASSED — G's proof is tolerance, not reasoning  $G"; else mut_ok "mutation G2 (guard > 1000000001: a reachable underflow) refuted  rc=$RC  $G"; fi
+grep -qE 'trust_timearith::raw_nanos_field_diff \[VIOLATIONS\] \(6 obligations: 4 proved, 0 runtime-checked, 2 failed, 0 unknown' "$LOG" \
+  || fail "mutation G2: raw_nanos_field_diff did not carry exactly the refuted subtraction and its twin — $(grep -oE 'trust_timearith::raw_nanos_field_diff \[[A-Z ]+\] \([^;]*' "$LOG" | head -1)"
+grep -qE '\[FAILED\] \[overflow:sub\]' "$LOG" \
+  || fail "mutation G2: the underflow went unproved rather than REFUTED — a capability gap, not a caught bug"
+grep -q 'verification failed for `trust_timearith::raw_nanos_field_diff`' "$LOG" \
+  || fail "mutation G2: raw_nanos_field_diff did not hard-error on a reachable underflow"
+for f in raw_nanos_field_sum raw_nanos_field_carry raw_nanos_field_borrow total_nanos; do
+  grep -qE "trust_timearith::$f \[(INCONCLUSIVE|FAILED)\]" "$LOG" \
+    && fail "mutation G2: $f also stopped verifying — an unrelated regression, not evidence about the control"
 done
 rm -f "$LOG"; restore
 mut_end

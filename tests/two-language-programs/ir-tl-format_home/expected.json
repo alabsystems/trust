@@ -1,0 +1,66 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-tl-format_home",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (trustc 0.10.0)",
+  "trust-ir": "first-party/trust-ir@29744d5f950d sha256:021eb4558763f378",
+  "clean": "first-party/clean@336d20039925 sha256:c1e37466960647a0",
+  "trust-cg": "first-party/trust-cg@d6738e893ca0 sha256:25df6cd8794ebfeb"
+ },
+ "ratchets": {
+  "FORMAT_HOME.native.enum": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "FIXED IN trust-cg, not blessed. The gap was `enum module refused: InsertField needs value-semantic (fresh-slot) insert lowering` — a variant built with payload `InsertField`s could not be lowered, because the fresh slot that struct, array and sequence inserts get from `insert_destination` was never wired to the direct-tag enum carrier's field walk, and updating the operand in place would alias every other value sharing it. This is the FOURTH carrier that trust-cg `fda1c5e5c` (\"fresh storage for insert results\") did not reach; its struct half is what closed `FORMAT_HOME.native.struct` above. Wired in trust-cg `d6738e893ca0` (branch `trust/ws71c-direct-tag-payload-insert`) by threading two facts the read side already had — the byte offset every candidate variant agrees on, from `direct_enum_field_access`, and the lane's machine type — into the existing byte-offset store path. The gitlink moved 69ba15740afd -> d6738e893ca0 in the same series. NOT TAKEN ON TRUST: the sibling verifies the insert against the trust-ir INTERPRETER at every optimisation level, and the decisive case is `no_alias` — two inserts into the SAME base value, then read both. Fresh slots give 3 * 5 = 15; an in-place update clobbers the first write and gives 25. Element 0 (a re-tag) and an ill-typed payload lane both stay refused, so the projection was not widened."
+  },
+  "FORMAT_HOME.native.scalar": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "FORMAT_HOME.native.struct": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "FIXED UPSTREAM, not blessed. The gap was `dotOf(1,2,3,4)=25: shared-seed InsertField aliasing; distinct-seed control correct` — every InsertField wrote into one shared seed slot, so a struct built by successive inserts aliased its own earlier fields. trust-cg `fda1c5e5c` (2026-09-23), \"Merge the aggregate wrong-code fixes: FRESH STORAGE FOR INSERT RESULTS and block parameters, ...\", gives each insert its own slot; the pin advanced with the gitlink (trust-cg 3f79b19a3d7f -> 69ba15740afd) and this row measured PASS. CORROBORATED by its sibling rather than by the flip alone: `FORMAT_HOME.native.enum` now refuses with `the fresh-slot insert that struct, array and sequence values use is not wired to the direct-tag enum carrier` — the same fresh-slot mechanism, named as reaching struct/array/sequence and NOT the enum carrier, which is exactly the shape of a fix that landed for three carriers out of four. The enum row is the open remainder and keeps this row red (a FAIL is never pinnable); see the battery KNOWN_RED line for `ir-tl-format_home`."
+  },
+  "FORMAT_HOME.p01_bool_result": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "FORMAT_HOME.p02_if_select": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "FORMAT_HOME.p06_inductive_match": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "FORMAT_HOME.p07_structure": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "FORMAT_HOME.p12b_width_conversion": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "FORMAT_HOME.p13_division": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "FORMAT_HOME.p14_lean_to_lean_call": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "FORMAT_HOME.p15_bitwise": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "FORMAT_HOME.p18_literal_out_of_range": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "FORMAT_HOME.p20_bool_connective": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

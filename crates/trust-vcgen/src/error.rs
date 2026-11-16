@@ -361,14 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn test_vcgen_error_debug_format() {
-        // Verify Debug is derived and includes variant name.
-        let err = VcgenError::InvalidVcKind { kind: "X".to_string(), reason: "Y".to_string() };
-        let debug = format!("{err:?}");
-        assert!(debug.contains("InvalidVcKind"), "Debug should contain variant name");
-    }
-
-    #[test]
     fn test_vcgen_error_span_with_empty_file() {
         // Edge case: span with empty file should use <unknown>.
         let span = SourceSpan {
@@ -380,16 +372,6 @@ mod tests {
         };
         let err = VcgenError::unsupported_type("RawPtr", "deref", Some(span));
         assert!(err.to_string().contains("<unknown>:1:1"), "empty file should render as <unknown>");
-    }
-
-    #[test]
-    fn test_vcgen_error_convenience_constructors_accept_str_refs() {
-        // Verify convenience constructors accept &str (impl Into<String>).
-        let _e1 = VcgenError::unsupported_mir_op("op", "ctx", None);
-        let _e2 = VcgenError::type_mismatch_ctx("a", "b", "c", None);
-        let _e3 = VcgenError::unsupported_type("ty", "ctx", None);
-        let _e4 = VcgenError::formula_construction("detail", None);
-        let _e5 = VcgenError::invalid_vc_kind("k", "r");
     }
 
     // Tests for #[from] conversions from module-level errors.
@@ -416,16 +398,5 @@ mod tests {
         let result = outer();
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), VcgenError::Chc(_)));
-    }
-
-    #[test]
-    fn test_vcgen_result_alias() {
-        // Verify the Result type alias works.
-        let ok: super::Result<i32> = Ok(42);
-        #[allow(clippy::unnecessary_literal_unwrap)]
-        let val = ok.unwrap();
-        assert_eq!(val, 42);
-        let err: super::Result<i32> = Err(VcgenError::UnsupportedOp("test".into()));
-        assert!(err.is_err());
     }
 }

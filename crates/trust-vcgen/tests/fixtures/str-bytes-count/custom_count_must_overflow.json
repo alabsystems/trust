@@ -1,0 +1,270 @@
+{
+  "name": "custom_count_must_overflow",
+  "def_path": "count_bytes::custom_count_must_overflow",
+  "span": {
+    "file": "count_bytes.rs",
+    "line_start": 30,
+    "col_start": 0,
+    "line_end": 32,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "count_bytes::UserBytes",
+            "fields": [],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "count_bytes::UserBytes::bytes",
+            "args": [
+              {
+                "Constant": "Unit"
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "count_bytes.rs",
+              "line_start": 31,
+              "col_start": 4,
+              "line_end": 31,
+              "col_end": 21
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 9014083685331633428,
+              "def_index": 16,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 9014083685331633428,
+              "krate_name": "count_bytes"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<count_bytes::UserBytes as core::iter::traits::iterator::Iterator>::count",
+            "args": [
+              {
+                "Constant": "Unit"
+              }
+            ],
+            "dest": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "count_bytes.rs",
+              "line_start": 31,
+              "col_start": 4,
+              "line_end": 31,
+              "col_end": 29
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 17085351922330956479,
+              "def_index": 11178,
+              "substs_digest": [
+                14751519969266185125,
+                17392098689631826849
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 17085351922330956479,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "count_bytes.rs",
+                "line_start": 31,
+                "col_start": 4,
+                "line_end": 31,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 3,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 3,
+            "span": {
+              "file": "count_bytes.rs",
+              "line_start": 31,
+              "col_start": 4,
+              "line_end": 31,
+              "col_end": 33
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "count_bytes.rs",
+                "line_start": 31,
+                "col_start": 4,
+                "line_end": 31,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

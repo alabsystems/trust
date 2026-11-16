@@ -14,12 +14,18 @@ sh tests/trust-contract/contract_inline_repro.sh
 Exits non-zero if a caller contract was dropped. Skips (exit 0) with no stage2
 toolchain.
 
-> **CURRENTLY RED, ON PURPOSE.** Measured on stage2 `13962dbde` (== HEAD, build
-> and harness sharing one commit): `-O3` accepts the violating caller, the A2
-> binary returns `0` where vanilla must panic, and the cross-crate consumer is
-> accepted. `-O0`, `-O1`, `-Zinline-mir=no` and `#[inline(never)]` all reject
-> correctly. This battery goes green when the defect is fixed; do not "fix" it by
-> weakening an assertion.
+> **Status, 2026-09-30.** Measured on stage2 `13962dbde` (July): `-O3` accepted the
+> violating caller, the A2 binary returned `0` where vanilla must panic, and the
+> cross-crate consumer was accepted. The plain `-Copt-level` rows went green with
+> the -O parity ruling R1 (2026-09-25), which runs the `-O0` MIR pipeline in a
+> verifying session at every opt-level, so those rows no longer reach the MIR
+> inliner at all: the defect was masked, not fixed. The `[explicit inliner]` rows
+> (`-Zmir-opt-level=2`, `-Zinline-mir=yes`) ask for the inliner and were RED on a
+> stage 1 of `fbc6068e3` (every one accepted; the A2 binary returned `0`). The rule
+> that keeps a call to a `requires`-carrying callee in a verifying session
+> (`compiler/rustc_mir_transform/src/trust_verify/requires_callee_inlining.rs`)
+> is prepared, not built: they are predicted green with it. Do not "fix" a red row
+> by weakening an assertion.
 >
 > A non-zero exit is deliberately **not** accepted as proof of rejection. The
 > first version of this script reported all-green because a renamed flag made every
@@ -31,11 +37,11 @@ toolchain.
 
 | property | fixture | assertion |
 |---|---|---|
-| **`requires` is opt-level invariant** | `identity(x) requires x < 1000`, called with `u32::MAX` | rejected at `-O0`, `-O1` and `-O3` alike |
+| **`requires` is opt-level invariant** | `identity(x) requires x < 1000`, called with `u32::MAX` | rejected at `-O0`, `-O1` and `-O3` alike, and with an explicit inliner (`-Copt-level=3 -Zmir-opt-level=2`, `-Zinline-mir=yes`) |
 | **inlining is the isolating variable** | same fixture | `-Zinline-mir=no` and `#[inline(never)]` reject — so a divergence at `-O3` is inlining, not contract transport |
 | **`ensures` stays callee-side** | `wrong(x) ensures result > x { x }` | rejected at every level (it never depended on a surviving call) |
-| **elision cannot outlive its licence** | `inc(x) requires x < 1000 { x + 1 }` | rejected; and if accepted, the linked binary must not return a wrapped value |
-| **contracts bind downstream** | `#[inline]` contract in an rlib + violating consumer | the downstream crate is rejected |
+| **elision cannot outlive its licence** | `inc(x) requires x < 1000 { x + 1 }` | rejected at `-O3` and with an explicit inliner; and if accepted, the linked binary must not return a wrapped value |
+| **contracts bind downstream** | `#[inline]` contract in an rlib + violating consumer | the downstream crate is rejected, with and without an explicit inliner |
 
 ## Why this exists
 

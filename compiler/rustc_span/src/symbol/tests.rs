@@ -57,7 +57,28 @@ fn without_first_quote_test() {
 /// driver to stop interoperating across that commit.
 #[test]
 fn preinterned_index_abi_is_frozen() {
-    const FROZEN_DIGEST: u64 = 0x0af6_e99b_e5c8_6221;
+    // Re-recorded for the 1.101 toolchain port: upstream renamed/reordered
+    // preinterned symbols below the frozen len (count unchanged, so
+    // `SYMBOL_DIGITS_BASE`'s assertion stands). The whole sysroot is rebuilt
+    // in the same step, so no already-built `.rmeta` interoperates across it.
+    // Re-recorded again for upstream a0326caa8961: the preinterned string
+    // `derive_const_issue` changed "118304" -> "143874" (index and count
+    // unchanged), under the same whole-sysroot-rebuild condition.
+    // Re-recorded for upstream 76456a688bc0: `derive_const_issue` REMOVED
+    // (net -1 entry, SYMBOL_DIGITS_BASE 2398 -> 2397, frozen len 2459),
+    // same whole-sysroot-rebuild condition.
+    // Re-recorded for upstream ff7c30e864ac (in the 2a01bd6..4c46afa port
+    // range): `debug_tuple_fields_finish` REMOVED when the Debug derive
+    // switched tuple structs to the debug_struct helpers (net -1 entry,
+    // SYMBOL_DIGITS_BASE 2397 -> 2396, frozen len 2458), same
+    // whole-sysroot-rebuild condition.
+    // Re-recorded for upstream 249cb163c0d0: the keyword-path rework moves
+    // `deref`/`field_of`/`offset_of`/`type_ascribe`/`unwrap_binder`/
+    // `wrap_binder` from Symbols to Keywords and renames
+    // `rustc_as_ptr`/`rustc_never_returns_null_ptr` (net +2 entries,
+    // SYMBOL_DIGITS_BASE 2396 -> 2398, frozen len 2460), same
+    // whole-sysroot-rebuild condition.
+    const FROZEN_DIGEST: u64 = 0xe832_21da_eb1f_da2d;
 
     create_default_session_globals_then(|| {
         let frozen_len = super::SYMBOL_LOWERCASE_LETTERS_BASE + 26;

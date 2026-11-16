@@ -1,10 +1,13 @@
 //@ dont-check-compiler-stderr
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-UC): the REFUSAL half of `trust_ir_lower_unit_const.rs`.
 //!
 //! Under `strict` a refusal is a compile error, so the refusals cannot share a
 //! file with the admissions. One body per conjunct of the two gates the wave
-//! touches, and every `//~ ERROR` here must survive every future widening.
+//! touches, and every error annotation here must survive every future widening.
 //!
 //! G2 (`try_lower_unit_arg`) is what refuses the first five, and NOTHING ELSE
 //! IS — measured 2026-08-31, each reports `Call(unsupported arg) [masking:
@@ -39,8 +42,14 @@ pub fn call_produces_unit() { f(Data, produces_unit()); } //~ ERROR could not fu
 pub fn var_holding_unit() { let u = (); f(Data, u); } //~ ERROR could not fully lower
 pub fn block_computing_unit() { f(Data, { side(); () }); } //~ ERROR could not fully lower
 pub fn branch_computing_unit(c: bool) { f(Data, if c {} else {}); } //~ ERROR could not fully lower
-pub fn never_coerced_to_unit() -> i32 { f(Data, return 3); 0 } //~ ERROR could not fully lower
-pub fn non_unit_ref_const() { h(Data, K); } //~ ERROR could not fully lower
+// RE-PINNED 2026-09-14 (measured on the 4d972edcfd stage1, `-Ztrust-ir-lower` coverage
+// rows): these two bodies now LOWER — `never_coerced_to_unit` clean, `non_unit_ref_const`
+// symbolic (the `&u32` named const rides the promoted-constant lane). Neither is a G2
+// unit-argument shape any more; the four G2 refusals above still measure
+// `Call(unsupported arg)`. The G2 doc comment in `crates/trust-thir-lower/src/lib.rs`
+// still lists the `!`-coerced `NeverToAny` arg as refused — that sentence is stale.
+pub fn never_coerced_to_unit() -> i32 { f(Data, return 3); 0 }
+pub fn non_unit_ref_const() { h(Data, K); }
 
 // NOT an error: a zero-sized NON-unit const keeps its own lane.
 pub fn fieldless_struct_const() { z(Data, ZC); }

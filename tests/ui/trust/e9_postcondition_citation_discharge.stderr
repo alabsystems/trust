@@ -23,5 +23,5 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL | pub fn identity(x: u64) -> u64 ensures x >= x by u64_ge_refl { x }
    |                                                  ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 

@@ -117,13 +117,13 @@ pub(crate) fn straight_line_return_definition<'a>(
     body: &'a trust_types::VerifiableBody,
     spine: &[&'a trust_types::BasicBlock],
 ) -> Option<StraightLineReturnDefinition<'a>> {
-    use trust_types::{Rvalue, Statement, Terminator};
+    use trust_types::{Statement, Terminator};
 
     let mut definition = None;
     for block in spine {
         for (statement_index, statement) in block.stmts.iter().enumerate() {
             match statement {
-                Statement::Assign { place, rvalue, .. } => {
+                Statement::Assign { place, .. } => {
                     // A projected write mutates only part of the return place and
                     // cannot be represented by the scalar final-definition model.
                     if place.local == 0 {
@@ -138,13 +138,14 @@ pub(crate) fn straight_line_return_definition<'a>(
                             statement: statement_index,
                         });
                     }
-                    // Once a mutable/raw-mutable alias of `_0` exists, later writes
-                    // through it escape every direct destination scan.  The exact
-                    // straight-line return lane therefore declines the whole body.
-                    if matches!(rvalue,
-                        Rvalue::Ref { mutable: true, place }
-                            | Rvalue::AddressOf(true, place)
-                            if place.local == 0)
+                    // Once a mutable/raw alias of `_0` exists (a `&raw const` too,
+                    // INT-RAWCONST-HAVOC-1), later writes through it escape every
+                    // direct destination scan.  The exact straight-line return lane
+                    // therefore declines the whole body.
+                    if trust_vcgen::place_write::write_capable_borrow(body, statement, |place| {
+                        place.local == 0
+                    })
+                    .is_some()
                     {
                         return None;
                     }
@@ -1064,19 +1065,20 @@ pub(crate) fn local_has_only_guarded_writes_reasoned(
     expected_assignments: usize,
     expected_calls: usize,
 ) -> Result<(), &'static str> {
-    use trust_types::{Rvalue, Statement, Terminator};
+    use trust_types::{Statement, Terminator};
 
     let mut assignments = 0usize;
     for statement in body.blocks.iter().flat_map(|block| &block.stmts) {
         match statement {
-            Statement::Assign { place, rvalue, .. } => {
+            Statement::Assign { place, .. } => {
                 // Inspect the alias source independently of the destination.
                 // In particular, a malformed self-destination must not let the
-                // earlier destination arm hide a mutable path to `local`.
-                if matches!(rvalue,
-                    Rvalue::Ref { mutable: true, place }
-                        | Rvalue::AddressOf(true, place)
-                        if place.local == local)
+                // earlier destination arm hide a mutable path to `local`. A
+                // `&raw const` is one (INT-RAWCONST-HAVOC-1).
+                if trust_vcgen::place_write::write_capable_borrow(body, statement, |place| {
+                    place.local == local
+                })
+                .is_some()
                 {
                     return Err("the local is MUTABLY ALIASED");
                 }

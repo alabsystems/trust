@@ -8,18 +8,15 @@
 //! Exactness arguments for the machine-applicable subset (each anchored on the
 //! compiler's own semantics, not on pearlite folklore):
 //!
-//! * comparisons map verbatim: Trust elaborates machine comparisons through
-//!   `toNat` (unsigned) / the sign-flip order key (signed), whose order IS the
-//!   machine order (`crates/trust-spec-elab/src/lib.rs:441-443`, `:321-337`);
-//! * `old(x)` where `x` is an immutable by-value parameter maps to `x`: entry
-//!   and exit values coincide for exactly this class, which is the compiler's
-//!   own by-value prime-collapse rule
+//! * comparisons map verbatim: Trust elaborates machine comparisons through `toNat` (unsigned) / the sign-flip order
+//!   key (signed), whose order IS the machine order (`crates/trust-spec-elab/src/lib.rs:441-443`, `:321-337`);
+//! * `old(x)` where `x` is an immutable by-value parameter maps to `x`: entry and exit values coincide for exactly this
+//!   class, which is the compiler's own by-value prime-collapse rule
 //!   (`rustc_mir_transform/src/trust_verify.rs:20169-20183`);
 //! * `result` is the native reserved identifier for the return value;
-//! * arithmetic maps verbatim only when it is machine-spelled (no `@` views,
-//!   no `Int`, no non-machine literal suffixes) — Trust's encoding is exact
-//!   wrapping (`trust-spec-elab/src/lib.rs:412`), so the machine spelling
-//!   denotes the machine value on both sides.
+//! * arithmetic maps verbatim only when it is machine-spelled (no `@` views, no `Int`, no non-machine literal suffixes)
+//!   — Trust's encoding is exact wrapping (`trust-spec-elab/src/lib.rs:412`), so the machine spelling denotes the
+//!   machine value on both sides.
 //!
 //! Everything else is DISCLOSED per attribute with the blocker named and the
 //! fix options listed (v7/D3): `@`/Int reads (a false-proof vector under
@@ -43,12 +40,10 @@ use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_ast::token::{Delimiter, LitKind, TokenKind};
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
 use rustc_ast::{
-    self as ast, AttrArgs, AttrItem, AttrKind, Attribute, BindingMode, ByRef, FnRetTy, Mutability,
-    PatKind, TyKind,
+    self as ast, AttrArgs, AttrItem, AttrKind, Attribute, BindingMode, ByRef, FnRetTy, Mutability, PatKind, TyKind,
 };
 use rustc_errors::Applicability;
-use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{EarlyContext, EarlyLintPass, declare_lint_pass};
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -120,8 +115,9 @@ const FAMILY_CRATES: [&str; 3] = ["creusot_contracts", "creusot_std", "creusot"]
 /// when every referenced parameter (and `result`, if referenced) has one of
 /// these types — the fragment where the pearlite reading and the native
 /// reading provably coincide.
-const MACHINE_TYPES: [&str; 13] =
-    ["u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize", "bool"];
+const MACHINE_TYPES: [&str; 13] = [
+    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize", "bool",
+];
 
 #[derive(Clone, Copy, PartialEq)]
 enum ClauseKind {
@@ -290,9 +286,7 @@ impl Blocker {
                 "`{name}` is not a parameter of this function; the machine-applicable subset maps \
                  only parameter reads, `result`, `old(..)`, literals, and machine operators"
             ),
-            Blocker::ResultInRequires => {
-                "`result` has no meaning in a precondition".to_string()
-            }
+            Blocker::ResultInRequires => "`result` has no meaning in a precondition".to_string(),
             Blocker::ResultNotMachine => "the clause reads `result`, and the return type is \
                  outside the machine fragment at this rung; option: restate the property in a \
                  `clean { .. }` island over the return value's model"
@@ -357,11 +351,11 @@ fn classify_stream(tokens: &TokenStream, ccx: &ClauseCx<'_>, out: &mut Classific
                 classify_stream(inner, ccx, out);
                 out.parts.push(")".to_string());
                 prev_was_eqeq = false;
-            }
+            },
             TokenTree::Delimited(..) => {
                 out.block(Blocker::Unsupported("`{ .. }` / `[ .. ]` grouping".to_string()));
                 prev_was_eqeq = false;
-            }
+            },
             TokenTree::Token(token, _) => {
                 let was_eqeq = prev_was_eqeq;
                 prev_was_eqeq = matches!(token.kind, TokenKind::EqEq);
@@ -371,28 +365,28 @@ fn classify_stream(tokens: &TokenStream, ccx: &ClauseCx<'_>, out: &mut Classific
                         "forall" | "exists" => {
                             out.block(Blocker::Quantifier);
                             out.halt = true;
-                        }
+                        },
                         "result" => match ccx.kind {
                             ClauseKind::Requires => out.block(Blocker::ResultInRequires),
                             ClauseKind::Ensures if ccx.ret_machine => {
                                 out.parts.push("result".to_string());
-                            }
+                            },
                             ClauseKind::Ensures => out.block(Blocker::ResultNotMachine),
                         },
                         "old" => {
                             classify_old_call(&mut iter, ccx, out);
-                        }
+                        },
                         other => match ccx.params.get(other) {
                             Some(ParamKind::Supported) => out.parts.push(other.to_string()),
                             Some(ParamKind::MutBinding) => {
                                 out.block(Blocker::MutableParam(other.to_string()));
-                            }
+                            },
                             Some(ParamKind::Reference) => {
                                 out.block(Blocker::ReferenceParam(other.to_string()));
-                            }
+                            },
                             Some(ParamKind::NonMachine) => {
                                 out.block(Blocker::NonMachineParam(other.to_string()));
-                            }
+                            },
                             None => out.block(Blocker::UnknownIdent(other.to_string())),
                         },
                     },
@@ -401,20 +395,17 @@ fn classify_stream(tokens: &TokenStream, ccx: &ClauseCx<'_>, out: &mut Classific
                             None => out.parts.push(lit.symbol.to_string()),
                             Some(suffix) if MACHINE_TYPES.contains(&suffix.as_str()) => {
                                 out.parts.push(format!("{}{}", lit.symbol, suffix));
-                            }
+                            },
                             Some(suffix) => out.block(Blocker::WidthSuffix(suffix.to_string())),
                         },
                         LitKind::Bool => out.parts.push(lit.symbol.to_string()),
-                        _ => out.block(Blocker::Unsupported(format!(
-                            "the literal `{}`",
-                            lit.symbol
-                        ))),
+                        _ => out.block(Blocker::Unsupported(format!("the literal `{}`", lit.symbol))),
                     },
                     // `==>`: pearlite implication lexes as `==` `>`.
                     TokenKind::Gt if was_eqeq => {
                         out.parts.pop();
                         out.block(Blocker::Implication);
-                    }
+                    },
                     TokenKind::EqEq => out.parts.push("==".to_string()),
                     TokenKind::Ne => out.parts.push("!=".to_string()),
                     TokenKind::Lt => out.parts.push("<".to_string()),
@@ -431,16 +422,12 @@ fn classify_stream(tokens: &TokenStream, ccx: &ClauseCx<'_>, out: &mut Classific
                     TokenKind::Percent => out.parts.push("%".to_string()),
                     TokenKind::At => out.block(Blocker::IntView),
                     TokenKind::Caret => out.block(Blocker::Prophecy),
-                    TokenKind::And | TokenKind::Or | TokenKind::Shl | TokenKind::Shr
-                    | TokenKind::Tilde => {
+                    TokenKind::And | TokenKind::Or | TokenKind::Shl | TokenKind::Shr | TokenKind::Tilde => {
                         out.block(Blocker::Unsupported("a bitwise operator".to_string()));
-                    }
-                    other => out.block(Blocker::Unsupported(format!(
-                        "the token `{}`",
-                        token_kind_label(other)
-                    ))),
+                    },
+                    other => out.block(Blocker::Unsupported(format!("the token `{}`", token_kind_label(other)))),
                 }
-            }
+            },
         }
     }
 }
@@ -493,20 +480,20 @@ fn classify_old_call<'a>(
                         out.parts.push(name.to_string());
                         iter.next();
                         return;
-                    }
+                    },
                     Some(ParamKind::MutBinding) => {
                         format!("`{name}` has a mutable binding")
-                    }
+                    },
                     Some(ParamKind::Reference) => format!("`{name}` lives behind a reference"),
                     Some(ParamKind::NonMachine) => {
                         format!("`{name}` is outside the machine fragment")
-                    }
+                    },
                     None => format!("`{name}` is not a parameter"),
                 }
             } else {
                 "the operand is not a plain parameter".to_string()
             }
-        }
+        },
         _ => "the operand is not a plain parameter".to_string(),
     };
     out.block(Blocker::OldUnsupported(detail));
@@ -546,17 +533,20 @@ fn check_fn_carrier(cx: &EarlyContext<'_>, attrs: &[Attribute], fn_: &ast::Fn) {
         };
         let item = &normal.item;
         match family_attr(item) {
-            None => {}
+            None => {},
             Some(FamilyAttr::Marker(name)) => markers.push((attr.span, name)),
             Some(FamilyAttr::Clause(kind)) => {
-                let ccx = ClauseCx { kind, params: &params, ret_machine };
+                let ccx = ClauseCx {
+                    kind,
+                    params: &params,
+                    ret_machine,
+                };
                 let mut classification = Classification::default();
-                match item.args.unparsed_ref() {
-                    Some(AttrArgs::Delimited(delim)) if !delim.tokens.is_empty() => {
+                match &item.args {
+                    AttrArgs::Delimited(delim) if !delim.tokens.is_empty() => {
                         classify_stream(&delim.tokens, &ccx, &mut classification);
-                    }
-                    _ => classification
-                        .block(Blocker::Unsupported("an empty predicate".to_string())),
+                    },
+                    _ => classification.block(Blocker::Unsupported("an empty predicate".to_string())),
                 }
                 if classification.blockers.is_empty() {
                     proposals.push(NativeProposal {
@@ -570,7 +560,7 @@ fn check_fn_carrier(cx: &EarlyContext<'_>, attrs: &[Attribute], fn_: &ast::Fn) {
                         blockers: classification.blockers,
                     });
                 }
-            }
+            },
         }
     }
 
@@ -603,8 +593,7 @@ fn emit_native_proposals(cx: &EarlyContext<'_>, fn_: &ast::Fn, proposals: &[Nati
             clause_text.push_str(&format!(" {} {}", kind.keyword(), proposal.text));
         }
     }
-    let mut parts: Vec<(Span, String)> =
-        proposals.iter().map(|p| (p.attr_span, String::new())).collect();
+    let mut parts: Vec<(Span, String)> = proposals.iter().map(|p| (p.attr_span, String::new())).collect();
     parts.push((insert_at, clause_text));
 
     span_lint_and_then(
@@ -657,22 +646,32 @@ fn emit_marker_disclosure(cx: &EarlyContext<'_>, span: Span, name: &'static str)
          authority and is not examined by this build",
         |diag| {
             let note = match name {
-                "variant" => "`#[variant(..)]` maps to the native `decreases` signature clause, \
+                "variant" => {
+                    "`#[variant(..)]` maps to the native `decreases` signature clause, \
                      but the migration harness does not cover termination measures yet; option: \
                      hand-write `decreases <expr>` in the signature and prove it via `targo \
-                     trust check`",
-                "invariant" => "loop invariants migrate to the native loop-clause positions; \
+                     trust check`"
+                },
+                "invariant" => {
+                    "loop invariants migrate to the native loop-clause positions; \
                      option: hand-write the native loop `invariant` clause and prove it via \
-                     `targo trust check`",
-                "logic" | "predicate" | "law" | "open" => "pearlite logic bodies have no \
+                     `targo trust check`"
+                },
+                "logic" | "predicate" | "law" | "open" => {
+                    "pearlite logic bodies have no \
                      ingestion rung; option: restate the definition as a `clean { .. }` island \
-                     and cite it from `ensures .. by <theorem>`",
-                "trusted" => "`#[trusted]` asserts without proof, which Trust does not admit at \
+                     and cite it from `ensures .. by <theorem>`"
+                },
+                "trusted" => {
+                    "`#[trusted]` asserts without proof, which Trust does not admit at \
                      any authority level; without it the function simply stays unverified until \
-                     its obligations prove",
-                _ => "no native carrier exists for this marker yet; option: keep the attribute \
+                     its obligations prove"
+                },
+                _ => {
+                    "no native carrier exists for this marker yet; option: keep the attribute \
                      (zero-authority, disclosed) and track the ingestion ladder in the \
-                     two-language design doc",
+                     two-language design doc"
+                },
             };
             diag.note(note);
         },

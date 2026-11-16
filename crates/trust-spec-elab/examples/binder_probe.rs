@@ -8,7 +8,7 @@
 //! the one-engine discipline means only trust-spec-elab may judge a typing.
 //!
 //! Usage:
-//!   cargo run --example binder_probe -- <forall|exists> <binder> <body> [name:ty ...]
+//!   targo --unverified run --example binder_probe -- <forall|exists> <binder> <body> [name:ty ...]
 //!
 //! Output: {"binder":"i","outcomes":{"nat":false,...},"unique":"u64"|null}
 

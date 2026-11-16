@@ -85,34 +85,36 @@ pub fn merge_states_with_pre_branch(
     pre_branch: Option<&SymbolicState>,
     merge_id: usize,
 ) -> SymbolicState {
-    let guard = SymbolicValue::Symbol(format!("merge_guard_{merge_id}"));
+    let mut guard: Option<SymbolicValue> = None;
 
     let mut merged = SymbolicState::new();
 
-    // Collect all variable names from both states.
-    let all_vars: BTreeSet<String> =
-        a.iter().map(|(k, _)| k.to_owned()).chain(b.iter().map(|(k, _)| k.to_owned())).collect();
+    // Collect all variable names from both states without cloning strings upfront.
+    let all_vars: BTreeSet<&str> = a.iter().map(|(k, _)| k).chain(b.iter().map(|(k, _)| k)).collect();
 
     // Counter for generating unique fresh symbolic variables within this merge.
     let mut fresh_counter: usize = 0;
 
     for var in all_vars {
         // Compute the effective values using phi-node semantics for missing vars.
-        let eff_a = match a.try_get(&var) {
+        let eff_a = match a.try_get(var) {
             Some(v) => v.clone(),
-            None => phi_default(pre_branch, &var, merge_id, &mut fresh_counter),
+            None => phi_default(pre_branch, var, merge_id, &mut fresh_counter),
         };
-        let eff_b = match b.try_get(&var) {
+        let eff_b = match b.try_get(var) {
             Some(v) => v.clone(),
-            None => phi_default(pre_branch, &var, merge_id, &mut fresh_counter),
+            None => phi_default(pre_branch, var, merge_id, &mut fresh_counter),
         };
 
         if eff_a == eff_b {
             // Same value: no Ite needed.
-            merged.set(var, eff_a);
+            merged.set(var.to_owned(), eff_a);
         } else {
             // Divergent: merge with Ite(guard, a_val, b_val).
-            merged.set(var, SymbolicValue::ite(guard.clone(), eff_a, eff_b));
+            let g = guard
+                .get_or_insert_with(|| SymbolicValue::Symbol(format!("merge_guard_{merge_id}")))
+                .clone();
+            merged.set(var.to_owned(), SymbolicValue::ite(g, eff_a, eff_b));
         }
     }
 
@@ -198,15 +200,17 @@ fn decisions_to_conjunction(decisions: &[crate::path::BranchDecision]) -> Option
     if decisions.is_empty() {
         return None;
     }
-    let clauses: Vec<Formula> = decisions
+    let mut clauses: Vec<Formula> = decisions
         .iter()
         .map(|d| {
             let f = symbolic_to_formula(&d.condition);
             if d.taken { f } else { Formula::Not(Box::new(f)) }
         })
         .collect();
-    if clauses.len() == 1 {
-        Some(clauses.into_iter().next().expect("len == 1"))
+    if clauses.len() == 1
+        && let Some(single) = clauses.pop()
+    {
+        Some(single)
     } else {
         Some(Formula::And(clauses))
     }
@@ -290,20 +294,11 @@ fn common_prefix_len(
 /// code used `Concrete(0)` as a default for missing variables, which
 /// incorrectly treated absent variables as equal to 0-valued ones.
 fn count_differing_vars(a: &SymbolicState, b: &SymbolicState) -> usize {
-    let all_vars: BTreeSet<String> =
-        a.iter().map(|(k, _)| k.to_owned()).chain(b.iter().map(|(k, _)| k.to_owned())).collect();
-
-    all_vars
-        .iter()
-        .filter(|var| {
-            // If a variable is missing from one side, it is always "different"
-            // — using Concrete(0) as default would mask real divergence.
-            match (a.try_get(var), b.try_get(var)) {
-                (Some(va), Some(vb)) => va != vb,
-                _ => true, // present in one, absent in other => differing
-            }
-        })
-        .count()
+    // Count keys in `a` that are absent or have a different value in `b`,
+    // plus keys in `b` that are absent in `a`, with zero heap allocations.
+    let diff_or_only_a = a.iter().filter(|&(k, va)| b.try_get(k) != Some(va)).count();
+    let only_b = b.iter().filter(|&(k, _)| a.try_get(k).is_none()).count();
+    diff_or_only_a + only_b
 }
 
 /// A stateful path merger that tracks merge IDs and applies a policy.
@@ -494,7 +489,7 @@ impl WideningMerger {
             trust_types::BinOp::Le,
             SymbolicValue::Concrete(interval.hi),
         );
-        // TODO: Use a logical conjunction once `trust_types::BinOp::And`
+        // FIXME: Use a logical conjunction once `trust_types::BinOp::And`
         // exists; `BitAnd` is the closest available operator today.
         let in_range = SymbolicValue::bin_op(lo_check, trust_types::BinOp::BitAnd, hi_check);
         SymbolicValue::ite(in_range, widened_sym, SymbolicValue::Concrete(interval.lo))
@@ -511,16 +506,14 @@ impl StateMerger for WideningMerger {
         pre_branch: Option<&SymbolicState>,
         merge_id: usize,
     ) -> MergedState {
-        let all_vars: BTreeSet<String> = a
-            .iter()
-            .map(|(k, _)| k.to_owned())
-            .chain(b.iter().map(|(k, _)| k.to_owned()))
-            .collect();
+        let all_vars: BTreeSet<&str> =
+            a.iter().map(|(k, _)| k).chain(b.iter().map(|(k, _)| k)).collect();
 
         let mut merged = SymbolicState::new();
         let mut fresh_counter: usize = 0;
+        let mut guard: Option<SymbolicValue> = None;
 
-        for var in &all_vars {
+        for var in all_vars {
             // Phi-node semantics for missing variables.
             let eff_a = match a.try_get(var) {
                 Some(v) => v.clone(),
@@ -532,7 +525,7 @@ impl StateMerger for WideningMerger {
             };
 
             if eff_a == eff_b {
-                merged.set(var.clone(), eff_a);
+                merged.set(var.to_owned(), eff_a);
                 continue;
             }
 
@@ -540,12 +533,16 @@ impl StateMerger for WideningMerger {
             match (value_to_interval(&eff_a), value_to_interval(&eff_b)) {
                 (Some(ia), Some(ib)) => {
                     let joined = ia.join(ib);
-                    merged.set(var.clone(), Self::interval_to_symbolic(joined, var));
+                    merged.set(var.to_owned(), Self::interval_to_symbolic(joined, var));
                 }
                 _ => {
                     // Fall back to Ite merge for non-concrete values.
-                    let guard = SymbolicValue::Symbol(format!("merge_guard_{merge_id}"));
-                    merged.set(var.clone(), SymbolicValue::ite(guard, eff_a, eff_b));
+                    let g = guard
+                        .get_or_insert_with(|| {
+                            SymbolicValue::Symbol(format!("merge_guard_{merge_id}"))
+                        })
+                        .clone();
+                    merged.set(var.to_owned(), SymbolicValue::ite(g, eff_a, eff_b));
                 }
             }
         }
@@ -758,12 +755,11 @@ impl MergingExplorer {
         let mut result = Vec::new();
         for (_block, mut forks) in by_block {
             // Pairwise merge within each group.
-            while forks.len() > 1 {
-                // SAFETY: while loop condition guarantees forks.len() > 1.
-                let b = forks.pop().unwrap_or_else(|| unreachable!("forks empty despite len > 1"));
-                let a = forks
-                    .last()
-                    .unwrap_or_else(|| unreachable!("forks empty after pop with len > 1"));
+            while let Some(b) = forks.pop() {
+                let Some(a) = forks.last() else {
+                    result.push(b);
+                    break;
+                };
 
                 if let Some(merged_state) = self.merger.try_merge(&a.state, &b.state) {
                     let merged_path = merge_paths(&a.path, &b.path, self.merger.merge_count());
@@ -780,7 +776,6 @@ impl MergingExplorer {
                     result.push(b);
                 }
             }
-            result.extend(forks);
         }
 
         self.pending = result;

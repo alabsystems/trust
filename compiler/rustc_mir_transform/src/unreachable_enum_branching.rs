@@ -2,14 +2,15 @@
 
 use rustc_abi::Variants;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_middle::bug;
 use rustc_middle::mir::{
     BasicBlockData, Body, Local, Operand, Rvalue, StatementKind, TerminatorKind,
 };
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{Ty, TyCtxt};
+use rustc_span::bug;
 use tracing::trace;
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 pub(super) struct UnreachableEnumBranching;
@@ -77,15 +78,15 @@ fn variant_discriminants<'tcx>(
 }
 
 impl<'tcx> crate::MirPass<'tcx> for UnreachableEnumBranching {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() > 0
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 1)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         trace!("UnreachableEnumBranching starting for {:?}", body.source);
 
         let mut unreachable_targets = Vec::new();
-        let mut patch = MirPatch::new(body);
+        let mut patch: Option<MirPatch<'tcx>> = None;
 
         for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
             trace!("processing block {:?}", bb);
@@ -149,6 +150,7 @@ impl<'tcx> crate::MirPass<'tcx> for UnreachableEnumBranching {
                 continue;
             }
 
+            let patch = patch.get_or_insert_with(|| MirPatch::new(body));
             let unreachable_block = patch.unreachable_no_cleanup_block();
             let mut targets = targets.clone();
             if replace_otherwise_to_unreachable {
@@ -167,10 +169,8 @@ impl<'tcx> crate::MirPass<'tcx> for UnreachableEnumBranching {
             patch.patch_terminator(bb, TerminatorKind::SwitchInt { targets, discr: discr.clone() });
         }
 
-        patch.apply(body);
-    }
-
-    fn is_required(&self) -> bool {
-        false
+        if let Some(patch) = patch {
+            patch.apply(body);
+        }
     }
 }

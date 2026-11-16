@@ -2,7 +2,7 @@ use std::io::Error;
 use std::path::{Path, PathBuf};
 
 use rustc_errors::codes::*;
-use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, msg};
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level, msg};
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Span, Symbol, sym};
 use rustc_target::spec::{PanicStrategy, TargetTuple};
@@ -254,48 +254,6 @@ pub(crate) struct FailedCopyToStdout {
 pub(crate) struct BinaryOutputToTty;
 
 #[derive(Diagnostic)]
-#[diag("could not find native static library `{$libname}`, perhaps an -L flag is missing?")]
-pub(crate) struct MissingNativeLibrary<'a> {
-    libname: &'a str,
-    #[subdiagnostic]
-    suggest_name: Option<SuggestLibraryName<'a>>,
-}
-
-impl<'a> MissingNativeLibrary<'a> {
-    pub(crate) fn new(libname: &'a str, verbatim: bool) -> Self {
-        // if it looks like the user has provided a complete filename rather just the bare lib name,
-        // then provide a note that they might want to try trimming the name
-        let suggested_name = if !verbatim {
-            // trust stage0-staircase shim: `strip_circumfix` is unstable on the 1.96
-            // genesis seed; prefix-then-suffix is its exact definition.
-            if let Some(libname) = libname.strip_prefix("lib").and_then(|s| s.strip_suffix(".a")) {
-                // this is a unix style filename so trim prefix & suffix
-                Some(libname)
-            } else if let Some(libname) = libname.strip_suffix(".lib") {
-                // this is a Windows style filename so just trim the suffix
-                Some(libname)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        Self {
-            libname,
-            suggest_name: suggested_name
-                .map(|suggested_name| SuggestLibraryName { suggested_name }),
-        }
-    }
-}
-
-#[derive(Subdiagnostic)]
-#[help("only provide the library name `{$suggested_name}`, not the full filename")]
-pub(crate) struct SuggestLibraryName<'a> {
-    suggested_name: &'a str,
-}
-
-#[derive(Diagnostic)]
 #[diag("couldn't create a temp dir: {$err}")]
 pub(crate) struct FailedCreateTempdir {
     pub err: Error,
@@ -347,8 +305,8 @@ pub(crate) struct MultipleCandidates {
     pub candidates: Vec<PathBuf>,
 }
 
-impl<G: EmissionGuarantee> Diagnostic<'_, G> for MultipleCandidates {
-    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+impl Diagnostic<'_> for MultipleCandidates {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_> {
         let mut diag = Diag::new(
             dcx,
             level,
@@ -367,7 +325,7 @@ impl<G: EmissionGuarantee> Diagnostic<'_, G> for MultipleCandidates {
 
 #[derive(Diagnostic)]
 #[diag(
-    "only metadata stub found for `{$flavor}` dependency `{$crate_name}` please provide path to the corresponding .rmeta file with full metadata"
+    "only metadata stub found for `{$flavor}` dependency `{$crate_name}`. Please provide path to the corresponding .rmeta file with full metadata"
 )]
 pub(crate) struct FullMetadataNotFound {
     #[primary_span]
@@ -400,6 +358,31 @@ pub(crate) struct DlError {
     pub span: Span,
     pub path: String,
     pub err: String,
+}
+
+// Trust: a proc-macro dylib that opens cleanly but carries the wrong declarations
+// symbol. The bare `dlsym: symbol not found` says nothing about *why*, so name the
+// two files whose identities disagree and give the reader the way out.
+#[derive(Diagnostic)]
+#[diag("`{$path}` does not contain the proc-macro declarations for crate `{$crate_name}`")]
+#[note(
+    "the compiler looked for `{$expected_symbol}`, an identity it read from the metadata in `{$metadata_path}`"
+)]
+#[note("but that dylib is {$dylib_identity}")]
+#[help(
+    "`-Cextra-filename` does not incorporate the compiler version while `StableCrateId` does, so a dylib built at a different revision can occupy the exact file name this build needs"
+)]
+#[help(
+    "remove the stale artifact, or rebuild the stage that produced it, so that only one build of `{$crate_name}` is reachable on the library search path"
+)]
+pub(crate) struct ProcMacroDeclsMissing {
+    #[primary_span]
+    pub span: Span,
+    pub path: String,
+    pub crate_name: Symbol,
+    pub expected_symbol: String,
+    pub metadata_path: String,
+    pub dylib_identity: String,
 }
 
 #[derive(Diagnostic)]
@@ -460,9 +443,9 @@ pub(crate) struct InvalidMetadataFiles {
     pub crate_rejections: Vec<String>,
 }
 
-impl<G: EmissionGuarantee> Diagnostic<'_, G> for InvalidMetadataFiles {
+impl Diagnostic<'_> for InvalidMetadataFiles {
     #[track_caller]
-    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_> {
         let mut diag = Diag::new(
             dcx,
             level,
@@ -492,9 +475,9 @@ pub(crate) struct CannotFindCrate {
     pub is_tier_3: bool,
 }
 
-impl<G: EmissionGuarantee> Diagnostic<'_, G> for CannotFindCrate {
+impl Diagnostic<'_> for CannotFindCrate {
     #[track_caller]
-    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_> {
         let mut diag =
             Diag::new(dcx, level, msg!("can't find crate for `{$crate_name}`{$add_info}"));
         diag.arg("crate_name", self.crate_name);
@@ -592,8 +575,6 @@ pub(crate) struct WasmCAbi {
     "if you are sure this will not cause problems, you may use `-Cunsafe-allow-abi-mismatch={$flag_name}` to silence this error"
 )]
 pub(crate) struct IncompatibleTargetModifiers {
-    #[primary_span]
-    pub span: Span,
     pub extern_crate: Symbol,
     pub local_crate: Symbol,
     pub flag_name: String,
@@ -608,22 +589,27 @@ pub(crate) struct IncompatibleTargetModifiers {
     "the `{$flag_name_prefixed}` flag modifies the ABI so Rust crates compiled with different values of this flag cannot be used together safely"
 )]
 #[note(
-    "unset `{$flag_name_prefixed}` in this crate is incompatible with `{$flag_name_prefixed}={$extern_value}` in dependency `{$extern_crate}`"
+    "`{$flag_name_prefixed}` is unset in this crate which is incompatible with {$has_extern_value ->
+        [false]  `{$flag_name_prefixed}` being set
+        *[other] `{$flag_name_prefixed}={$extern_value}`
+    } in dependency `{$extern_crate}`"
 )]
 #[help(
-    "set `{$flag_name_prefixed}={$extern_value}` in this crate or unset `{$flag_name_prefixed}` in `{$extern_crate}`"
+    "set {$has_extern_value ->
+        [false]  `{$flag_name_prefixed}`
+        *[other] `{$flag_name_prefixed}={$extern_value}`
+    } in this crate or unset `{$flag_name_prefixed}` in `{$extern_crate}`"
 )]
 #[help(
     "if you are sure this will not cause problems, you may use `-Cunsafe-allow-abi-mismatch={$flag_name}` to silence this error"
 )]
 pub(crate) struct IncompatibleTargetModifiersLMissed {
-    #[primary_span]
-    pub span: Span,
     pub extern_crate: Symbol,
     pub local_crate: Symbol,
     pub flag_name: String,
     pub flag_name_prefixed: String,
     pub extern_value: String,
+    pub has_extern_value: bool,
 }
 
 #[derive(Diagnostic)]
@@ -632,22 +618,27 @@ pub(crate) struct IncompatibleTargetModifiersLMissed {
     "the `{$flag_name_prefixed}` flag modifies the ABI so Rust crates compiled with different values of this flag cannot be used together safely"
 )]
 #[note(
-    "`{$flag_name_prefixed}={$local_value}` in this crate is incompatible with unset `{$flag_name_prefixed}` in dependency `{$extern_crate}`"
+    "{$has_local_value ->
+        [false]  `{$flag_name_prefixed}` being set
+        *[other] `{$flag_name_prefixed}={$local_value}`
+    } in this crate is incompatible with `{$flag_name_prefixed}` being unset in dependency `{$extern_crate}`"
 )]
 #[help(
-    "unset `{$flag_name_prefixed}` in this crate or set `{$flag_name_prefixed}={$local_value}` in `{$extern_crate}`"
+    "unset `{$flag_name_prefixed}` in this crate or set {$has_local_value ->
+        [false]  `{$flag_name_prefixed}`
+        *[other] `{$flag_name_prefixed}={$local_value}`
+    } in `{$extern_crate}`"
 )]
 #[help(
     "if you are sure this will not cause problems, you may use `-Cunsafe-allow-abi-mismatch={$flag_name}` to silence this error"
 )]
 pub(crate) struct IncompatibleTargetModifiersRMissed {
-    #[primary_span]
-    pub span: Span,
     pub extern_crate: Symbol,
     pub local_crate: Symbol,
     pub flag_name: String,
     pub flag_name_prefixed: String,
     pub local_value: String,
+    pub has_local_value: bool,
 }
 
 #[derive(Diagnostic)]
@@ -655,8 +646,6 @@ pub(crate) struct IncompatibleTargetModifiersRMissed {
     "unknown target modifier `{$flag_name}`, requested by `-Cunsafe-allow-abi-mismatch={$flag_name}`"
 )]
 pub(crate) struct UnknownTargetModifierUnsafeAllowed {
-    #[primary_span]
-    pub span: Span,
     pub flag_name: String,
 }
 
@@ -700,8 +689,6 @@ pub(crate) struct UnusedCrateDependency {
     "it is possible to disable `-Z allow-partial-mitigations={$mitigation_name}` via `-Z deny-partial-mitigations={$mitigation_name}`"
 )]
 pub(crate) struct MitigationLessStrictInDependency {
-    #[primary_span]
-    pub span: Span,
     pub mitigation_name: String,
     pub mitigation_level: String,
     pub extern_crate: Symbol,

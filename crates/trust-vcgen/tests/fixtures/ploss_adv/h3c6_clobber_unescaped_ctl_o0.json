@@ -1,0 +1,266 @@
+{
+  "name": "h3c6_clobber_unescaped_ctl",
+  "def_path": "adv::h3c6_clobber_unescaped_ctl",
+  "span": {
+    "file": "ploss_adv/h3_asm.rs",
+    "line_start": 152,
+    "col_start": 0,
+    "line_end": 156,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 4
+              }
+            }
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "k"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        3,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h3_asm.rs",
+                "line_start": 153,
+                "col_start": 12,
+                "line_end": 153,
+                "col_end": 17
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Opaque": {
+            "kind": "InlineAsm",
+            "targets": [
+              1
+            ],
+            "span": {
+              "file": "ploss_adv/h3_asm.rs",
+              "line_start": 154,
+              "col_start": 13,
+              "line_end": 154,
+              "col_end": 24
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h3_asm.rs",
+                "line_start": 155,
+                "col_start": 4,
+                "line_end": 155,
+                "col_end": 8
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 2,
+            "span": {
+              "file": "ploss_adv/h3_asm.rs",
+              "line_start": 155,
+              "col_start": 4,
+              "line_end": 155,
+              "col_end": 8
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "ploss_adv/h3_asm.rs",
+                "line_start": 155,
+                "col_start": 4,
+                "line_end": 155,
+                "col_end": 8
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

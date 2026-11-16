@@ -1,10 +1,9 @@
 //@ needs-trust-verify
 //@ compile-flags: -Ztrust-verify=on --crate-type lib
 //@ dont-check-compiler-stderr
-//@ dont-require-annotations: ERROR
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
-//@ check-pass
+//@ check-fail
 //@ forbid-output: copy operand type mismatch
 //@ forbid-output: full TrustIr module validation failed
 //! A dyn-coercion-bearing body must produce a WELL-TYPED native TrustIr bundle
@@ -92,6 +91,9 @@ impl fmt::Write for Sink {
 // The dyn coercion (`&S1 -> &dyn T`) and a panic-freedom obligation (the
 // `write!` chain) share one body, so the native lane must build — and
 // type-check — a bundle containing the coercion havoc.
+// ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
+//~vv ERROR Trust strict verification failed for `dyn_coercion_bundle_stays_well_typed::go`
+//~v NOTE this function has no obligation of its own
 pub fn go(s: &S1, w: &mut Sink) -> fmt::Result {
     let d: &dyn T = s;
     let _ = d.f();

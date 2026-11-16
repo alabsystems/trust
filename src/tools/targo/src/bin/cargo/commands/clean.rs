@@ -2,21 +2,37 @@ use crate::command_prelude::*;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::time_span::parse_time_span;
 
-use cargo::core::gc::Gc;
-use cargo::core::gc::GcOpts;
-use cargo::core::gc::parse_human_size;
-use cargo::core::global_cache_tracker::GlobalCacheTracker;
-use cargo::ops::CleanContext;
-use cargo::ops::{self, CleanOptions};
-use cargo::util::print_available_packages;
+use crate::util::data_structures::IndexSet;
 use clap_complete::ArgValueCandidates;
-use indexmap::IndexSet;
 use std::time::Duration;
+use targo::ops::CleanContext;
+use targo::ops::{self, CleanOptions};
+use targo::util::print_available_packages;
+use targo::workspace::gc::Gc;
+use targo::workspace::gc::GcOpts;
+use targo::workspace::gc::parse_human_size;
+use targo::workspace::global_cache_tracker::GlobalCacheTracker;
 
 pub fn cli() -> Command {
     subcommand("clean")
         .about("Remove artifacts that cargo has generated in the past")
-        .arg_doc("Whether or not to clean just the documentation directory")
+        .arg_doc("Clean only the documentation directory")
+        // Trust: explicit compiler-free cache recovery, never a degraded full clean.
+        .arg(
+            flag(
+                "intermediates-only",
+                "Remove selected package unit caches using existing output locks; preserve final artifacts",
+            )
+            .long_help("Remove only the selected packages' build-unit directories without querying a compiler or creating output locks. Requires an existing Cargo.lock, unqualified package names (-p NAME or --workspace), the build-unit layout and idle existing native output locks on macOS or Linux. Preserves final artifacts, incremental caches and other package caches. Refuses output-root overlap, unsafe paths or missing locks. Use --dry-run for a preview.")
+            .conflicts_with_all(["doc", "incremental-only"]),
+        )
+        .arg(
+            flag(
+                "incremental-only",
+                "Remove incremental caches while preserving compiled artifacts",
+            )
+            .conflicts_with_all(["doc", "package", "workspace"]),
+        )
         .arg_silent_suggestion()
         .arg_package_spec_simple(
             "Package to clean artifacts for",
@@ -26,9 +42,9 @@ pub fn cli() -> Command {
             flag("workspace", "Clean artifacts of the workspace members")
                 .help_heading(heading::PACKAGE_SELECTION),
         )
-        .arg_release("Whether or not to clean release artifacts")
-        .arg_profile("Clean artifacts of the specified profile")
-        .arg_target_triple("Target triple to clean output for")
+        .arg_release("Clean only release artifacts")
+        .arg_profile("Clean only artifacts of the specified profile")
+        .arg_target_tuple("Target tuple to clean output for")
         .arg_target_dir()
         .arg_manifest_path()
         .arg_dry_run("Display what would be deleted without deleting anything")
@@ -158,13 +174,21 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
     if args.flag("workspace") {
         spec.extend(ws.members().map(|package| package.name().to_string()))
     };
+    let default_profile = gctx
+        .build_config()?
+        .profile
+        .as_ref()
+        .map(|p| p.as_ref())
+        .unwrap_or_else(|| "dev");
     let opts = CleanOptions {
         gctx,
         spec,
         targets: args.targets()?,
-        requested_profile: args.get_profile_name("dev", ProfileChecking::Custom)?,
+        requested_profile: args.get_profile_name(default_profile, ProfileChecking::Custom)?,
         profile_specified: args.contains_id("profile") || args.flag("release"),
         doc: args.flag("doc"),
+        incremental_only: args.flag("incremental-only"),
+        intermediates_only: args.flag("intermediates-only"),
         dry_run: args.dry_run(),
         explicit_target_dir_arg: args.contains_id("target-dir"),
     };

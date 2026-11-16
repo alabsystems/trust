@@ -1,19 +1,20 @@
 use rustc_abi::Align;
-use rustc_hir::LangItem;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_index::IndexVec;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::visit::PlaceContext;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{Ty, TyCtxt};
-use rustc_session::Session;
 
+use crate::PassPolicy;
 use crate::check_pointers::{BorrowedFieldProjectionMode, PointerCheck, check_pointers};
 
 pub(super) struct CheckAlignment;
 
 impl<'tcx> crate::MirPass<'tcx> for CheckAlignment {
-    fn is_enabled(&self, sess: &Session) -> bool {
-        sess.ub_checks()
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // When UB checks are enabled this is part of their semantics, not an optimization.
+        PassPolicy::optional(ctx.ub_checks())
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -30,10 +31,6 @@ impl<'tcx> crate::MirPass<'tcx> for CheckAlignment {
             insert_alignment_check,
             BorrowedFieldProjectionMode::FollowProjections,
         );
-    }
-
-    fn is_required(&self) -> bool {
-        true
     }
 }
 
@@ -61,8 +58,12 @@ fn insert_alignment_check<'tcx>(
 
     // Get the alignment of the pointee
     let align_def_id = tcx.require_lang_item(LangItem::AlignOf, source_info.span);
-    let alignment =
-        Operand::unevaluated_constant(tcx, align_def_id, &[pointee_ty.into()], source_info.span);
+    let alignment = Operand::unevaluated_constant(
+        tcx,
+        align_def_id,
+        tcx.mk_args(&[pointee_ty.into()]),
+        source_info.span,
+    );
 
     // Subtract 1 from the alignment to get the alignment mask
     let alignment_mask =

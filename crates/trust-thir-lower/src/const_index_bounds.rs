@@ -76,7 +76,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 .with_result(inbounds),
         );
         self.push_node(
-            InstrNode::new(Inst::Assert { cond: inbounds }).with_proof(ProofAnnotation::InBounds),
+            InstrNode::new(Inst::Assert {
+                cond: inbounds,
+                kind: trust_ir::AssertKind::BoundsCheck { index: idx_c, len: len_c },
+                site: None,
+            })
+            .with_proof(ProofAnnotation::InBounds),
         );
         // The record births the Pending `BoundsCheck` row at the finalizer;
         // the typed capture resolves the open-block `Const` index to a

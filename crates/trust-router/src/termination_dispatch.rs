@@ -447,6 +447,44 @@ mod tests {
         }
     }
 
+    /// The names the compiler actually registers, pinned against the guard.
+    ///
+    /// `discover_router_backends` (`compiler/rustc_mir_transform/src/
+    /// trust_verify.rs`) returns exactly `interval`, `ay-in-process`, `ty` and
+    /// `trust-wp` (plan P4 / T4.1 replaced the subprocess `ay-incremental`
+    /// there with the in-process ay); `Router::new` adds `constant-folder`, plus
+    /// `ay-in-process` under the `ay-backend` feature that `rustc_mir_transform`
+    /// turns on. Nothing else in `compiler/` pushes a router backend.
+    ///
+    /// This test PINS today's measured behavior: none of those names is
+    /// safety-only, so the issue-#194 `Invalid` arm never fires on any
+    /// configuration the compiler builds. It is a measurement, not an
+    /// endorsement — without it, adding rows to `is_safety_only` (or rekeying
+    /// the table on `BackendRole`) silently starts blocking real backends, and
+    /// `ty` is the only registered backend whose `can_handle` accepts
+    /// `VcKind::NonTermination`, so such a change can delete the compiler's only
+    /// termination route. That is a capability loss, reserved to the owner:
+    /// see `docs/DECISION_QUEUE.md` before editing the table.
+    #[test]
+    fn test_registered_compiler_backend_names_are_not_safety_only() {
+        for name in ["interval", "ay-in-process", "ty", "trust-wp", "constant-folder"] {
+            assert!(
+                !is_safety_only(name),
+                "{name} is a backend the compiler registers, but is_safety_only now claims it \
+                 proves safety only. If that is intended it is a CAPABILITY LOSS, not a fix: \
+                 see docs/DECISION_QUEUE.md (termination_dispatch table keying)."
+            );
+            let validity = validate_dispatch(PropertyKind::Termination, name);
+            assert!(
+                !validity.is_invalid(),
+                "{name} would now be blocked for termination dispatch ({validity:?}). All three \
+                 callers of validate_dispatch skip an Invalid backend, and ty is the only \
+                 registered backend accepting VcKind::NonTermination — this deletes the \
+                 compiler's termination route. See docs/DECISION_QUEUE.md."
+            );
+        }
+    }
+
     #[test]
     fn test_safety_vc_accepted_by_all_solvers() {
         let vc = make_vc(VcKind::DivisionByZero);

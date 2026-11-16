@@ -1,6 +1,14 @@
 //@ dont-check-compiler-stderr
-//@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ check-fail
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
+// Re-pinned 2026-10-15 (the merge of 2026-10-14 brought WS5.2, 87388a9d3ec and aa2f22aa306):
+// `Function.name` is now the link-time symbol, and a GENERIC definition has none until
+// per-instance lowering (B8), so `-Ztrust-ir-lower=strict` refuses each one by name at crate
+// assembly ("lowered for coverage, never spliced"). Those refusals are pinned below; every
+// other body must still lower, and any other strict error fails this test.
 //! Trust (wave-HM): `&mut T` PARAMS whose pointee is a bare type parameter, a
 //! tuple, an enum, or a scalar-element array are registered as mut borrow
 //! pointers (the wave-23 `&mut Struct` argument, one pointee kind over each):
@@ -9,8 +17,10 @@
 //! `state: &mut H` forward is the measured shape. Under `strict`.
 
 fn sink<H>(_h: &mut H) {}
+    //~^ ERROR NoLinkTimeSymbol(sink): no link-time symbol for `sink`
 
 fn forward_param<H>(state: &mut H) {
+    //~^ ERROR NoLinkTimeSymbol(forward_param): no link-time symbol for `forward_param`
     sink(state);
     sink(&mut *state);
 }

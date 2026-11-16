@@ -3,6 +3,53 @@
 //! a frontend embedding the driver may never assert. Each case names a way
 //! a caller could otherwise acquire evidence authority it was not granted.
 
+// Trust: use the maintained compiletest native-entry pattern before libtest setup.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+extern crate test;
+
+/// Trust: generated main constructs only static test references before this call;
+/// capture must precede libtest argument handling, file opens and worker threads.
+/// These tests run the compiler in process, so under `build-slot` protocol 1 the
+/// binary lends it its own execution (CUSTODY-EMBEDDED-TEST-LOAN-1).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn native_test_main(tests: &[&test::TestDescAndFn]) {
+    // SAFETY: first generated native-entry operation, before arbitrary callbacks.
+    if let Err(error) =
+        unsafe { rustc_data_structures::jobserver::capture_early_for_test_harness() }
+    {
+        eprintln!("driver unit entry: inherited compiler scheduler refused: {error}");
+        std::process::exit(75);
+    }
+    #[cfg(panic = "unwind")]
+    let result = test::test_main_env_args(tests);
+    #[cfg(not(panic = "unwind"))]
+    let result = test::test_main_env_args_abort(tests);
+    // Trust: custom runners return unit; preserve libtest's actual exit code.
+    result.exit_process();
+}
+
+/// Trust (CUSTODY-EMBEDDED-TEST-LOAN-1): this binary's native entry lends its
+/// in-process compiles its own execution exactly when it is owed one (a bare
+/// `build-slot` protocol-1 run), and then one test at a time.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_native_entry_lends_its_own_execution_exactly_when_owed() {
+    use rustc_data_structures::jobserver;
+    if jobserver::own_execution_owed() {
+        assert!(jobserver::lends_own_execution(), "an owed run captured no loan");
+        assert_eq!(std::env::var("RUST_TEST_THREADS").as_deref(), Ok("1"));
+    } else {
+        assert!(!jobserver::lends_own_execution(), "a run that is not owed one was lent");
+    }
+}
+
+// Trust: real source Freeze controls use the canonical in-process compiler owner.
+mod shared_receiver_freeze;
+// Trust: real constructor source admission must retain transient extraction metadata.
+mod constructor_return_admission;
+// Trust: actual compiler phases, terminal dep-info and native-link controls.
+mod tool_inputs;
+
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
@@ -13,13 +60,44 @@ use super::{
     FrontendTrustPolicy, apply_trust_verify_override, authenticated_pre_analysis_exit_message,
     authenticated_pre_session_early_exit, canonicalize_trust_options, compiler_arguments,
     direct_ir_pre_typed_options_early_exit, frontend_forbidden_option,
-    no_trust_evidence_callback_backend_error, raw_outer_direct_ir_publication_identity,
-    should_preflight_direct_ir_publication, trust_callback_changed_contract_checks,
-    trust_dump_domain_error, trust_ir_lower_is_active, trust_option_domain_error,
-    trust_semantics_are_active, trust_strict_policy_is_active, trust_strict_policy_option_error,
-    trust_targo_test_monitor_domain_error, trust_targo_test_monitor_sysroot_error,
-    trust_verify_override_requested,
+    no_trust_evidence_callback_backend_error, private_fixed_pre_session_exit,
+    raw_outer_direct_ir_publication_identity, should_preflight_direct_ir_publication,
+    trust_callback_changed_contract_checks, trust_dump_domain_error, trust_ir_lower_is_active,
+    trust_option_domain_error, trust_semantics_are_active, trust_strict_policy_is_active,
+    trust_strict_policy_option_error, trust_targo_test_monitor_domain_error,
+    trust_targo_test_monitor_sysroot_error, trust_verify_override_requested,
 };
+
+// Trust: even callback-written resource metadata must be a complete canonical binding.
+#[test]
+#[allow(rustc::bad_opt_access)]
+fn native_admission_context_is_all_or_none_and_cargo_scoped() {
+    let mut valid = config::Options::default();
+    valid.unstable_opts.trust_verify_session = Some("session".into());
+    valid.unstable_opts.trust_verify_package_name = Some("demo".into());
+    valid.unstable_opts.trust_verify_crate_role = "primary".into();
+    valid.unstable_opts.trust_admission_run_digest = Some("a".repeat(64));
+    valid.unstable_opts.trust_admission_unit_digest = Some("b".repeat(64));
+    valid.unstable_opts.trust_admission_semantics_digest = Some("c".repeat(64));
+    valid.unstable_opts.trust_admission_unit_role = Some("primary".into());
+    valid.unstable_opts.trust_admission_compile_target = Some("aarch64-apple-darwin".into());
+    assert_eq!(trust_option_domain_error(&valid), None);
+    for mutation in 0..9 {
+        let mut invalid = valid.clone();
+        match mutation {
+            0 => invalid.unstable_opts.trust_admission_run_digest = None,
+            1 => invalid.unstable_opts.trust_admission_unit_digest = Some("B".repeat(64)),
+            2 => invalid.unstable_opts.trust_admission_semantics_digest = Some("bad".into()),
+            3 => invalid.unstable_opts.trust_admission_unit_role = Some("excluded".into()),
+            4 => invalid.unstable_opts.trust_verify_session = None,
+            5 => invalid.unstable_opts.trust_verify_crate_role = "unscoped".into(),
+            6 => invalid.unstable_opts.trust_admission_compile_target = None,
+            7 => invalid.unstable_opts.trust_admission_compile_target = Some(String::new()),
+            _ => invalid.unstable_opts.trust_admission_compile_target = Some("x".repeat(4097)),
+        }
+        assert!(trust_option_domain_error(&invalid).is_some(), "mutation {mutation}");
+    }
+}
 
 #[test]
 #[allow(rustc::bad_opt_access)]
@@ -68,6 +146,14 @@ fn targo_test_monitor_pins_the_running_compiler_sysroot() {
         None,
         "bootstrap may spell the compiler's exact default sysroot explicitly"
     );
+}
+
+/// `frontend_forbidden_option` exactly as the pre-backend check runs it: on the
+/// effective configuration the option table's own parser resolves from `matches`.
+fn forbidden_in(policy: FrontendTrustPolicy, matches: &getopts::Matches) -> Option<String> {
+    let early_dcx =
+        rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
+    frontend_forbidden_option(&early_dcx, policy, matches)
 }
 
 fn parsed_matches(args: &[&str]) -> (Vec<String>, getopts::Matches) {
@@ -325,6 +411,48 @@ fn callback_cannot_set_or_erase_retired_contract_checks_in_trust_mode() {
     }
 }
 
+/// Trust (T6): every unit of a proof session — verifying, or a
+/// verification-off dependency carrying `-Ztrust-verify-session` — refuses each
+/// MIR-pipeline option BY NAME, and the vanilla lane (no verification, no
+/// session; the direct-trustc UI fixtures' `-Ztrust-verify=off` revisions and
+/// every upstream suite) keeps upstream's options.
+#[test]
+#[allow(rustc::bad_opt_access)]
+fn a_proof_session_refuses_each_mir_pipeline_option_by_name() {
+    type Set = fn(&mut config::UnstableOptions);
+    let cases: [(&str, Set); 9] = [
+        ("-Zmir-opt-level", |u| u.mir_opt_level = Some(2)),
+        ("-Zinline-mir", |u| u.inline_mir = Some(true)),
+        ("-Zinline-mir-threshold", |u| u.inline_mir_threshold = Some(50)),
+        ("-Zinline-mir-hint-threshold", |u| u.inline_mir_hint_threshold = Some(100)),
+        ("-Zinline-mir-forwarder-threshold", |u| u.inline_mir_forwarder_threshold = Some(30)),
+        ("-Zmir-enable-passes", |u| u.mir_enable_passes = vec![("GVN".to_string(), true)]),
+        ("-Zmir-opt-bisect-limit", |u| u.mir_opt_bisect_limit = Some(0)),
+        ("-Zmir-preserve-ub", |u| u.mir_preserve_ub = true),
+        ("-Zmir-strip-debuginfo", |u| u.mir_strip_debuginfo = config::MirStripDebugInfo::AllLocals),
+    ];
+    for (flag, set) in cases {
+        let named = format!("; {flag} would make the verified MIR");
+        let mut verifying = rustc_session::config::Options::default();
+        assert!(verifying.unstable_opts.trust_verify.is_on(), "verification is the default");
+        set(&mut verifying.unstable_opts);
+        let error = trust_option_domain_error(&verifying).unwrap_or_else(|| panic!("{flag}"));
+        assert!(error.contains(&named) && error.contains("-O0 MIR pipeline"), "{error}");
+
+        let mut dependency = rustc_session::config::Options::default();
+        dependency.unstable_opts.trust_verify = config::TrustVerify::Off;
+        dependency.unstable_opts.trust_verify_session = Some("proof-session".to_string());
+        set(&mut dependency.unstable_opts);
+        let error = trust_option_domain_error(&dependency).unwrap_or_else(|| panic!("{flag}"));
+        assert!(error.contains(&named), "{error}");
+
+        let mut vanilla = rustc_session::config::Options::default();
+        vanilla.unstable_opts.trust_verify = config::TrustVerify::Off;
+        set(&mut vanilla.unstable_opts);
+        assert_eq!(trust_option_domain_error(&vanilla), None, "vanilla keeps {flag}");
+    }
+}
+
 #[test]
 #[allow(rustc::bad_opt_access)]
 fn callback_injected_trust_option_domains_fail_closed() {
@@ -333,6 +461,15 @@ fn callback_injected_trust_option_domains_fail_closed() {
 
     let mut invalid = valid.clone();
     invalid.unstable_opts.trust_verify_timeout_ms = 0;
+    assert!(trust_option_domain_error(&invalid).is_some());
+    invalid = valid.clone();
+    invalid.unstable_opts.trust_verify_effort = 0;
+    assert!(trust_option_domain_error(&invalid).is_some());
+    invalid = valid.clone();
+    invalid.unstable_opts.trust_verify_effort = 100_001;
+    assert!(trust_option_domain_error(&invalid).is_some());
+    invalid = valid.clone();
+    invalid.unstable_opts.trust_verify_function_budget_steps = 0;
     assert!(trust_option_domain_error(&invalid).is_some());
     invalid = valid.clone();
     invalid.unstable_opts.trust_verify_worker_threads = 257;
@@ -350,6 +487,17 @@ fn callback_injected_trust_option_domains_fail_closed() {
     // The two admitted spellings must both survive the domain check; `mir` is
     // also the declared default, which `valid` above already exercises.
     invalid.unstable_opts.trust_cg_frontend = "trust-ir".to_string();
+    assert_eq!(trust_option_domain_error(&invalid), None);
+    // Trust (step 2 increment 5, sub-step 5.4.2): F1's consumer is a closed domain too; both
+    // admitted spellings survive (`lir`, the default, through `valid`).
+    invalid = valid.clone();
+    invalid.unstable_opts.trust_cg_f1_backend = "Compiler".to_string();
+    assert_eq!(
+        trust_option_domain_error(&invalid),
+        Some("invalid callback-injected -Ztrust-cg-f1-backend value")
+    );
+    invalid = valid.clone();
+    invalid.unstable_opts.trust_cg_f1_backend = "compiler".to_string();
     assert_eq!(trust_option_domain_error(&invalid), None);
     invalid = valid.clone();
     invalid.unstable_opts.trust_verify_output = "jsonl".to_string();
@@ -430,8 +578,52 @@ fn callback_injected_trust_option_domains_fail_closed() {
     invalid.unstable_opts.trust_verify_package_name = Some(" padded ".to_string());
     assert!(trust_option_domain_error(&invalid).is_some());
     invalid = valid;
-    invalid.unstable_opts.trust_verify_ay_path = Some(std::path::PathBuf::new());
+    invalid.unstable_opts.trust_proof_artifact_root = Some(std::path::PathBuf::new());
     assert!(trust_option_domain_error(&invalid).is_some());
+}
+
+// Trust (2026-10-03, docs/DECISION_QUEUE.md "L0-CERTIFY"): certify at level 0
+// built `pub fn spin() { spin() }` exit 0 (the D9 charge is an L1 obligation the
+// level filter dropped). The combination is refused before any session exists;
+// certify at levels 1 and 2, and level 0 on every other policy or with
+// verification off, stay accepted.
+#[test]
+#[allow(rustc::bad_opt_access)]
+fn certify_is_refused_at_verification_level_zero() {
+    let valid = rustc_session::config::Options::default();
+    let refusal = "-Ztrust-policy=certify requires -Ztrust-verify-level=1 or 2";
+
+    let mut certify_l0 = valid.clone();
+    certify_l0.unstable_opts.trust_policy = config::TrustPolicy::Certify;
+    certify_l0.unstable_opts.trust_verify_level = 0;
+    let error = trust_option_domain_error(&certify_l0).expect("certify at level 0 is refused");
+    assert!(error.starts_with(refusal), "{error}");
+    assert!(error.contains("termination"), "the refusal names what level 0 drops: {error}");
+    assert!(error.contains("[trust] level"), "the refusal names the targo spelling: {error}");
+
+    for level in [1, 2] {
+        let mut certify = valid.clone();
+        certify.unstable_opts.trust_policy = config::TrustPolicy::Certify;
+        certify.unstable_opts.trust_verify_level = level;
+        assert_eq!(trust_option_domain_error(&certify), None, "certify at level {level}");
+    }
+    for policy in [
+        config::TrustPolicy::Strict,
+        config::TrustPolicy::Advisory,
+        config::TrustPolicy::MemorySafe,
+    ] {
+        let mut level0 = valid.clone();
+        level0.unstable_opts.trust_policy = policy;
+        level0.unstable_opts.trust_verify_level = 0;
+        assert_eq!(trust_option_domain_error(&level0), None, "{policy:?} at level 0");
+    }
+    let mut vanilla = certify_l0;
+    vanilla.unstable_opts.trust_verify = config::TrustVerify::Off;
+    assert_eq!(
+        trust_option_domain_error(&vanilla),
+        None,
+        "with verification off there is no certify verdict to refuse"
+    );
 }
 
 #[test]
@@ -606,7 +798,7 @@ fn no_verify_deauthorization_never_rewrites_compiler_arguments() {
     let (_, matches) = parsed_matches(&["--crate-name", "--", "-Ztrust-verify=on", "--print=cfg"]);
     let mut typed_dcx =
         rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
-    let mut options = rustc_session::config::build_session_options(&mut typed_dcx, &matches);
+    let mut options = rustc_session::config::build_session_options(&mut typed_dcx, &matches, false);
     assert!(options.unstable_opts.trust_verify.is_on());
     apply_trust_verify_override(&mut options, true);
     assert_eq!(
@@ -639,38 +831,85 @@ fn inherited_and_frontend_no_verify_requests_are_typed_and_exact() {
 
 #[test]
 fn deauthorized_frontends_reject_trust_controls_but_only_tippy_rejects_backends() {
+    // Evidence controls: a frontend that produces no evidence can neither honour nor
+    // silently drop them (`TrustAuthorityClass::EvidenceControl`).
     for option in [
-        "trust-ir-lower",
         "trust-dump=ir:/tmp/ir",
         "trust-verify-session=proof",
-        "trust-verify-output=json",
-        "trust-proof-artifact-root=/tmp/proof",
         "trust-dump=mir:/tmp/mir",
-        "trust-policy=advisory",
         "trust-cg-output-gate=off",
+        "trust-body-census=/tmp/census",
+        "trust-sat-perturb=enum-reshape",
+        "trust-targo-test-monitor=yes",
+        "trust-witness=off",
     ] {
         let (_, matches) = parsed_matches(&["-Z", option]);
         for policy in
             [FrontendTrustPolicy::EmbeddedNoOfficialEvidence, FrontendTrustPolicy::EvidenceInert]
         {
             assert!(
-                frontend_forbidden_option(policy, &matches).is_some(),
+                forbidden_in(policy, &matches).is_some(),
                 "{} accepted -Z{option}",
                 policy.diagnostic_name(),
             );
         }
-        assert_eq!(frontend_forbidden_option(FrontendTrustPolicy::CanonicalTrustc, &matches), None,);
+        assert_eq!(forbidden_in(FrontendTrustPolicy::CanonicalTrustc, &matches), None,);
+    }
+
+    // `-Ztrust-policy` is a verification selector a deauthorized frontend ACCEPTS: it
+    // decides what an ACTIVE verification does with a refutation, and these frontends force
+    // `trust_verify = Off` and reset every selector to its default before anything can read
+    // it (`TrustFrontendAuthoritySnapshot::deauthorize`; the rest of the selectors are
+    // `deauthorized_frontends_accept_a_posture_whose_effective_verification_is_off`).
+    // Refusing it made `targo tippy` impossible in every repo
+    // that commits the policy in `.cargo/config.toml` rustflags — the sanctioned place for
+    // it — which is how the fleet's lint gates died before their first lint (2026-09-11).
+    for option in ["trust-policy=advisory", "trust-policy=certify", "trust-policy=strict"] {
+        let (_, matches) = parsed_matches(&["-Z", option]);
+        for policy in [
+            FrontendTrustPolicy::CanonicalTrustc,
+            FrontendTrustPolicy::EmbeddedNoOfficialEvidence,
+            FrontendTrustPolicy::EvidenceInert,
+        ] {
+            assert_eq!(
+                forbidden_in(policy, &matches),
+                None,
+                "{} must accept the inert -Z{option}",
+                policy.diagnostic_name(),
+            );
+        }
+    }
+
+    // ... and accepting it may never let the caller's value survive.
+    for option in ["-Ztrust-policy=advisory", "-Ztrust-policy=certify"] {
+        let (_, matches) = parsed_matches(&[option]);
+        let mut typed_dcx =
+            rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
+        let mut options =
+            rustc_session::config::build_session_options(&mut typed_dcx, &matches, false);
+        let selected = options.unstable_opts.trust_policy;
+        apply_trust_verify_override(&mut options, true);
+        assert_eq!(
+            options.unstable_opts.trust_verify,
+            config::TrustVerify::Off,
+            "a deauthorized frontend forces verification off",
+        );
+        assert_eq!(
+            options.unstable_opts.trust_policy,
+            config::TrustPolicy::default(),
+            "a deauthorized frontend must neutralize the caller's {option} (parsed as {selected:?})",
+        );
     }
 
     for option in ["codegen-backend=trust-cg", "codegen_backend=llvm"] {
         let (_, matches) = parsed_matches(&["-Z", option]);
         assert_eq!(
-            frontend_forbidden_option(FrontendTrustPolicy::EmbeddedNoOfficialEvidence, &matches,),
+            forbidden_in(FrontendTrustPolicy::EmbeddedNoOfficialEvidence, &matches,),
             None,
             "embedded tools retain custom-backend compatibility",
         );
         assert!(
-            frontend_forbidden_option(FrontendTrustPolicy::EvidenceInert, &matches).is_some(),
+            forbidden_in(FrontendTrustPolicy::EvidenceInert, &matches).is_some(),
             "Tippy's EvidenceInert route must reject -Z{option}",
         );
     }
@@ -689,14 +928,14 @@ fn deauthorized_frontends_reject_trust_controls_but_only_tippy_rejects_backends(
             [FrontendTrustPolicy::CanonicalTrustc, FrontendTrustPolicy::EmbeddedNoOfficialEvidence]
         {
             assert_eq!(
-                frontend_forbidden_option(compatible_policy, &matches),
+                forbidden_in(compatible_policy, &matches),
                 None,
                 "{} must retain ordinary LLVM-control compatibility",
                 compatible_policy.diagnostic_name(),
             );
         }
         assert_eq!(
-            frontend_forbidden_option(FrontendTrustPolicy::EvidenceInert, &matches).as_deref(),
+            forbidden_in(FrontendTrustPolicy::EvidenceInert, &matches).as_deref(),
             Some(expected),
             "Tippy's EvidenceInert route accepted {switch}{option}",
         );
@@ -705,23 +944,19 @@ fn deauthorized_frontends_reject_trust_controls_but_only_tippy_rejects_backends(
     // An ordinary command line carries no Trust option at all, and must pass both deauthorized
     // policies.
     let (_, ordinary) = parsed_matches(&["--crate-type=lib", "input.rs"]);
-    assert_eq!(
-        frontend_forbidden_option(FrontendTrustPolicy::EmbeddedNoOfficialEvidence, &ordinary),
-        None,
-    );
-    assert_eq!(frontend_forbidden_option(FrontendTrustPolicy::EvidenceInert, &ordinary), None,);
+    assert_eq!(forbidden_in(FrontendTrustPolicy::EmbeddedNoOfficialEvidence, &ordinary), None,);
+    assert_eq!(forbidden_in(FrontendTrustPolicy::EvidenceInert, &ordinary), None,);
 
     // `-Ztrust-verify=on` is not an ordinary line for a deauthorized frontend. Letting a frontend
     // that was stripped of evidence authority turn verification back on is exactly what
     // deauthorization exists to prevent.
     let (_, verify_on) = parsed_matches(&["-Ztrust-verify=on", "--crate-type=lib", "input.rs"]);
     assert_eq!(
-        frontend_forbidden_option(FrontendTrustPolicy::EmbeddedNoOfficialEvidence, &verify_on)
-            .as_deref(),
+        forbidden_in(FrontendTrustPolicy::EmbeddedNoOfficialEvidence, &verify_on).as_deref(),
         Some("-Ztrust-verify"),
     );
     assert_eq!(
-        frontend_forbidden_option(FrontendTrustPolicy::EvidenceInert, &verify_on).as_deref(),
+        forbidden_in(FrontendTrustPolicy::EvidenceInert, &verify_on).as_deref(),
         Some("-Ztrust-verify"),
     );
 
@@ -744,51 +979,288 @@ fn deauthorized_frontends_reject_trust_controls_but_only_tippy_rejects_backends(
     );
 }
 
-#[test]
-fn deauthorized_frontends_accept_only_exact_redundant_trust_verify_off() {
-    for args in [
-        &["-Ztrust-verify=off", "--crate-type=lib", "input.rs"][..],
-        &["-Z", "trust-verify=off", "--crate-type=lib", "input.rs"][..],
-        &["-Z", "trust_verify=off", "--crate-type=lib", "input.rs"][..],
-    ] {
-        let (_, matches) = parsed_matches(args);
-        assert_eq!(
-            frontend_forbidden_option(FrontendTrustPolicy::EvidenceInert, &matches),
-            None,
-            "the evidence-inert frontend rejected redundant {args:?}",
-        );
-        assert_eq!(
-            frontend_forbidden_option(FrontendTrustPolicy::EmbeddedNoOfficialEvidence, &matches,),
-            None,
-            "an embedded deauthorized frontend rejected redundant {args:?}",
-        );
-    }
+const DEAUTHORIZED_POLICIES: [FrontendTrustPolicy; 2] =
+    [FrontendTrustPolicy::EmbeddedNoOfficialEvidence, FrontendTrustPolicy::EvidenceInert];
 
+/// ay's committed verification posture (its `.cargo/config.toml` rustflags), which
+/// Cargo hands every unit — including the ones a deauthorized frontend compiles.
+const AY_POSTURE: [&str; 6] = [
+    "-Ztrust-verify=on",
+    "-Ztrust-policy=certify",
+    "-Ztrust-verify-level=2",
+    "-Ztrust-verify-profile=unix_hardened",
+    "-Ztrust-verify-include-dependencies=yes",
+    "-Ztrust-ir-lower=strict",
+];
+
+fn with_input<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut argv = args.to_vec();
+    argv.extend(["--crate-type=lib", "input.rs"]);
+    argv
+}
+
+#[test]
+fn deauthorized_frontends_decide_trust_verify_on_its_effective_explicit_value() {
+    // The one activation control is judged on its last-wins value. An effective `off`
+    // — however it was reached — is what these frontends force anyway, so every
+    // spelling of it is accepted; this is what lets a committed `-Ztrust-verify=on`
+    // be followed by the `-Ztrust-verify=off` Targo appends for lint and doc passes.
     for args in [
-        &["-Ztrust-verify=on", "--crate-type=lib", "input.rs"][..],
-        &["-Ztrust-verify", "--crate-type=lib", "input.rs"][..],
-        &["-Ztrust-verify=invalid", "--crate-type=lib", "input.rs"][..],
-        &["-Ztrust-verify=off", "-Ztrust-verify=on", "--crate-type=lib", "input.rs"][..],
-        &["-Ztrust-verify=on", "-Ztrust-verify=off", "--crate-type=lib", "input.rs"][..],
-        &["-Ztrust-verify=off", "-Ztrust-ir-lower", "--crate-type=lib", "input.rs"][..],
+        &["-Ztrust-verify=off"][..],
+        &["-Z", "trust-verify=off"][..],
+        &["-Z", "trust_verify=off"][..],
+        &["-Ztrust-verify=on", "-Ztrust-verify=off"][..],
+        &["-Z", "trust-verify=on", "-Z", "trust_verify=off"][..],
+        &["-Ztrust-verify=off", "-Ztrust-verify=off"][..],
     ] {
-        let (_, matches) = parsed_matches(args);
-        let expected = Some(if args.contains(&"-Ztrust-ir-lower") {
-            "-Ztrust-ir-lower"
-        } else {
-            "-Ztrust-verify"
-        });
-        for policy in
-            [FrontendTrustPolicy::EmbeddedNoOfficialEvidence, FrontendTrustPolicy::EvidenceInert]
-        {
+        let (_, matches) = parsed_matches(&with_input(args));
+        for policy in DEAUTHORIZED_POLICIES {
             assert_eq!(
-                frontend_forbidden_option(policy, &matches).as_deref(),
-                expected,
-                "{} accepted authority-bearing {args:?}",
+                forbidden_in(policy, &matches),
+                None,
+                "{} refused effective-off {args:?}",
                 policy.diagnostic_name(),
             );
         }
     }
+
+    // An EXPLICIT, EFFECTIVE `on` demands verification from a frontend that cannot
+    // verify: refused, never silently turned into an unverified compile. (A bare or
+    // malformed value never reaches this decision: the option table's parser refuses
+    // it first, as `build_session_options` would.)
+    for args in [
+        &["-Ztrust-verify=on"][..],
+        &["-Ztrust-verify=off", "-Ztrust-verify=on"][..],
+        &["-Ztrust-verify=on", "-Ztrust-policy=certify"][..],
+        &AY_POSTURE[..],
+    ] {
+        let (_, matches) = parsed_matches(&with_input(args));
+        for policy in DEAUTHORIZED_POLICIES {
+            assert_eq!(
+                forbidden_in(policy, &matches).as_deref(),
+                Some("-Ztrust-verify"),
+                "{} accepted an effective explicit verification request {args:?}",
+                policy.diagnostic_name(),
+            );
+        }
+        assert_eq!(forbidden_in(FrontendTrustPolicy::CanonicalTrustc, &matches), None);
+    }
+}
+
+/// The effective decision parses the classified Trust controls ONLY. Any other `-Z`
+/// value — `help`, whose early mode `handle_help` answers after this check, or an
+/// option the full parse would warn about — is left to the one full parse the
+/// compilation runs, so interleaving it with a posture changes nothing here (a parse
+/// of the whole `-Z` list would die on `help` as an unknown option).
+#[test]
+fn the_effective_decision_parses_only_the_trust_authority_controls() {
+    for args in [
+        &["-Ztrust-verify=on", "-Zhelp", "-Ztrust-verify=off"][..],
+        &["-Zhelp", "-Ztrust-policy=certify"][..],
+        &["-Z", "help", "-Z", "trust-ir-lower=strict", "-Z", "trust-verify=off"][..],
+    ] {
+        let (_, matches) = parsed_matches(args);
+        for policy in DEAUTHORIZED_POLICIES {
+            assert_eq!(forbidden_in(policy, &matches), None, "{args:?}");
+        }
+    }
+    let (_, matches) = parsed_matches(&["-Ztrust-verify=off", "-Zhelp", "-Ztrust-verify=on"]);
+    for policy in DEAUTHORIZED_POLICIES {
+        assert_eq!(forbidden_in(policy, &matches).as_deref(), Some("-Ztrust-verify"));
+    }
+
+    // The parser reports exactly the classified fields it met, once each.
+    let (_, matches) = parsed_matches(&[
+        "-Ztrust-verify=on",
+        "-Zhelp",
+        "-Ztrust_policy=certify",
+        "-Ztrust-verify=off",
+        "-Zcodegen-backend=llvm",
+    ]);
+    let early_dcx =
+        rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
+    let (effective, spelled) =
+        rustc_session::config::UnstableOptions::build_trust_authority_controls(
+            &early_dcx, &matches,
+        );
+    assert_eq!(spelled, ["trust_verify", "trust_policy", "codegen_backend"]);
+    assert_eq!(effective.trust_verify, config::TrustVerify::Off);
+    assert_eq!(effective.trust_policy, config::TrustPolicy::Certify);
+}
+
+/// The bootstrap-only `-Zno-trust-verify` alias (compiled only into a stage0-built
+/// compiler) is a spelling of `trust_verify` with the retired option's INVERTED
+/// meaning, resolved by the same parser: `=no` asks for verification and must be
+/// refused like `-Ztrust-verify=on`, while bare `-Zno-trust-verify` is an off-switch.
+#[cfg(bootstrap)]
+#[test]
+fn the_bootstrap_no_trust_verify_alias_is_judged_by_its_resolved_value() {
+    for (args, expected) in [
+        (&["-Zno-trust-verify=no"][..], Some("-Ztrust-verify")),
+        (&["-Ztrust-verify=off", "-Zno-trust-verify=off"][..], Some("-Ztrust-verify")),
+        (&["-Zno-trust-verify"][..], None),
+        (&["-Zno-trust-verify=no", "-Ztrust-verify=off"][..], None),
+        (&["-Ztrust-verify=on", "-Zno-trust-verify=yes"][..], None),
+    ] {
+        let (_, matches) = parsed_matches(&with_input(args));
+        for policy in DEAUTHORIZED_POLICIES {
+            assert_eq!(forbidden_in(policy, &matches).as_deref(), expected, "{args:?}");
+        }
+    }
+}
+
+/// The shapes measured refused on seal 7d5533b2 (tippy-driver and trustdoc alike),
+/// ay's exact posture followed by the off-switch, and every verification selector at
+/// a non-default value: all resolve to verification off and carry no evidence
+/// control, so both deauthorized routes accept them.
+#[test]
+fn deauthorized_frontends_accept_a_posture_whose_effective_verification_is_off() {
+    let mut ay_then_off = AY_POSTURE.to_vec();
+    ay_then_off.push("-Ztrust-verify=off");
+    let accepted: Vec<Vec<&str>> = vec![
+        vec!["-Ztrust-verify=on", "-Ztrust-verify=off"],
+        vec!["-Ztrust-policy=certify", "-Ztrust-verify=off"],
+        vec!["-Ztrust-verify-level=2", "-Ztrust-verify=off"],
+        vec!["-Ztrust-verify-level=0", "-Ztrust-verify=off"],
+        vec!["-Ztrust-ir-lower=strict", "-Ztrust-verify=off"],
+        vec!["-Ztrust-ir-lower", "-Ztrust-verify=off"],
+        vec!["-Ztrust-verify-profile=unix_hardened", "-Ztrust-verify=off"],
+        vec!["-Ztrust-verify-include-dependencies=yes", "-Ztrust-verify=off"],
+        vec!["-Ztrust-verify-timeout-ms=1", "-Ztrust-verify=off"],
+        vec!["-Ztrust-verify-worker-threads=1", "-Ztrust-verify=off"],
+        vec!["-Ztrust-verify-function-budget-ms=1", "-Ztrust-verify=off"],
+        vec!["-Ztrust-verify-function-budget-steps=1", "-Ztrust-verify=off"],
+        vec!["-Ztrust-verify-effort=1", "-Ztrust-verify=off"],
+        vec!["-Ztrust-verify-output=json", "-Ztrust-verify=off"],
+        vec!["-Ztrust-no-adapter-yield", "-Ztrust-verify=off"],
+        vec!["-Ztrust-no-r1", "-Ztrust-verify=off"],
+        vec!["-Ztrust-bundle-foreign-crate=dep", "-Ztrust-verify=off"],
+        vec!["-Ztrust-proof-artifact-root=/tmp/proof", "-Ztrust-verify=off"],
+        vec!["-Ztrust-ir-flip=no", "-Ztrust-verify=off"],
+        vec!["-Ztrust-instance-flip=no", "-Ztrust-verify=off"],
+        // Evidence controls AT their declared default carry no authority.
+        vec!["-Ztrust-cg-output-gate=strict", "-Ztrust-verify-crate-role=unscoped"],
+        ay_then_off,
+    ];
+    for args in &accepted {
+        let (_, matches) = parsed_matches(&with_input(args));
+        for policy in DEAUTHORIZED_POLICIES {
+            assert_eq!(
+                forbidden_in(policy, &matches),
+                None,
+                "{} refused {args:?}, whose effective verification is off",
+                policy.diagnostic_name(),
+            );
+        }
+    }
+}
+
+#[test]
+fn deauthorized_frontends_still_refuse_evidence_controls_under_the_off_switch() {
+    for (control, expected) in [
+        ("-Ztrust-dump=ir:/tmp/ir", "-Ztrust-dump"),
+        ("-Ztrust-dump=spec-clean:/tmp/spec", "-Ztrust-dump"),
+        ("-Ztrust-body-census=/tmp/census", "-Ztrust-body-census"),
+        ("-Ztrust-instance-census=/tmp/census", "-Ztrust-instance-census"),
+        ("-Ztrust-lean-census=/tmp/census", "-Ztrust-lean-census"),
+        ("-Ztrust-verify-session=proof", "-Ztrust-verify-session"),
+        ("-Ztrust-verify-package-name=pkg", "-Ztrust-verify-package-name"),
+        ("-Ztrust-verify-crate-role=primary", "-Ztrust-verify-crate-role"),
+        ("-Ztrust-proc-macro-boundary", "-Ztrust-proc-macro-boundary"),
+        ("-Ztrust-proc-macro-isolation", "-Ztrust-proc-macro-isolation"),
+        ("-Ztrust-audited-proc-macro=/tmp/libaudited.dylib", "-Ztrust-audited-proc-macro"),
+        ("-Ztrust-targo-test-monitor", "-Ztrust-targo-test-monitor"),
+        ("-Ztrust-certified-test-monitors", "-Ztrust-certified-test-monitors"),
+        ("-Ztrust-cg-frontend=trust-ir", "-Ztrust-cg-frontend"),
+        ("-Ztrust-cg-output-gate=off", "-Ztrust-cg-output-gate"),
+        ("-Ztrust-ir-cg-args=no-proof-certs", "-Ztrust-ir-cg-args"),
+        // Trust: `-Ztrust-ir-upstream-mir` is gone (a4e15ca586 removed the option and its
+        // frontend_authority row); an unknown `-Z` is not an evidence control to classify.
+        ("-Ztrust-ir-crate-module", "-Ztrust-ir-crate-module"),
+        ("-Ztrust-sat-perturb=enum-reshape", "-Ztrust-sat-perturb"),
+        ("-Ztrust-instance-flip-mutate=abi-swap", "-Ztrust-instance-flip-mutate"),
+        ("-Ztrust-instance-flip-probe=*", "-Ztrust-instance-flip-probe"),
+        ("-Ztrust-clean-origin-mutate-emitter", "-Ztrust-clean-origin-mutate-emitter"),
+        ("-Ztrust-ir-lower-mutate-finalization", "-Ztrust-ir-lower-mutate-finalization"),
+        ("-Ztrust-test-mutate-derived-assert-msg", "-Ztrust-test-mutate-derived-assert-msg"),
+        ("-Ztrust-ctfe-trivial-probe", "-Ztrust-ctfe-trivial-probe"),
+        ("-Ztrust-witness=off", "-Ztrust-witness"),
+        ("-Ztrust-witness-precise", "-Ztrust-witness-precise"),
+        ("-Ztrust-spawn-census-shadow=report", "-Ztrust-spawn-census-shadow"),
+        ("-Ztrust-send-census", "-Ztrust-send-census"),
+        ("-Ztrust-writer-census=config.harness", "-Ztrust-writer-census"),
+        ("-Ztrust-no-str-byte-position", "-Ztrust-no-str-byte-position"),
+        ("-Ztrust-tinv", "-Ztrust-tinv"),
+        ("-Ztrust-ir-lower-mutate-rhs-effects", "-Ztrust-ir-lower-mutate-rhs-effects"),
+        ("-Ztrust-ir-seam-reference=/tmp/seam", "-Ztrust-ir-seam-reference"),
+        // Trust (step 2 increment 6, step 6.5.1): the TEST-ONLY template lane switch.
+        ("-Ztrust-ir-lower-templates=yes", "-Ztrust-ir-lower-templates"),
+    ] {
+        let mut argv = AY_POSTURE.to_vec();
+        argv.extend(["-Ztrust-verify=off", control]);
+        let (_, matches) = parsed_matches(&with_input(&argv));
+        for policy in DEAUTHORIZED_POLICIES {
+            assert_eq!(
+                forbidden_in(policy, &matches).as_deref(),
+                Some(expected),
+                "{} accepted evidence control {control} under the off-switch",
+                policy.diagnostic_name(),
+            );
+        }
+    }
+    // The session-bound custom-target digest needs a 64-hex value to parse at all.
+    let target_digest = format!("-Ztrust-verify-target-spec-sha256={}", "a".repeat(64));
+    let (_, matches) = parsed_matches(&with_input(&["-Ztrust-verify=off", target_digest.as_str()]));
+    for policy in DEAUTHORIZED_POLICIES {
+        assert_eq!(
+            forbidden_in(policy, &matches).as_deref(),
+            Some("-Ztrust-verify-target-spec-sha256"),
+        );
+    }
+}
+
+/// Accepting a posture must add NO behaviour: after the driver's own neutralization
+/// sequence (typed parse, the verification override, deauthorization), ay's posture
+/// followed by the off-switch is the same tracked configuration as a plain
+/// `-Ztrust-verify=off` — up to the SIGPIPE disposition its `unix_hardened` profile
+/// declares for `main` in every lane, which survives as `-Zon-broken-pipe=kill`.
+#[test]
+#[allow(rustc::bad_opt_access)]
+fn an_accepted_posture_neutralizes_to_the_plain_off_configuration() {
+    fn neutralized(args: &[&str]) -> config::Options {
+        let (_, matches) = parsed_matches(args);
+        let mut typed_dcx =
+            rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
+        let mut options =
+            rustc_session::config::build_session_options(&mut typed_dcx, &matches, false);
+        apply_trust_verify_override(&mut options, true);
+        TrustFrontendAuthoritySnapshot::deauthorize(&mut options);
+        options
+    }
+
+    let mut ay_then_off = AY_POSTURE.to_vec();
+    ay_then_off.push("-Ztrust-verify=off");
+    let posture = neutralized(&with_input(&ay_then_off));
+    let plain = neutralized(&with_input(&["-Ztrust-verify=off", "-Zon-broken-pipe=kill"]));
+    assert_eq!(posture.unstable_opts.trust_verify, config::TrustVerify::Off);
+    assert_eq!(posture.unstable_opts.trust_policy, config::TrustPolicy::default());
+    assert_eq!(posture.unstable_opts.trust_verify_profile, None);
+    assert_eq!(posture.unstable_opts.trust_ir_lower, Some(config::TrustIrLower::Off));
+    assert_eq!(TrustFrontendAuthoritySnapshot::first_live_verification_selector(&posture), None);
+    for for_crate_hash in [false, true] {
+        assert_eq!(
+            posture.dep_tracking_hash(for_crate_hash),
+            plain.dep_tracking_hash(for_crate_hash),
+            "the neutralized posture differs from plain `-Ztrust-verify=off` \
+             (for_crate_hash={for_crate_hash})",
+        );
+    }
+    // Pinned, so the equality cannot hold by the profile's SIGPIPE declaration
+    // having been dropped on both sides.
+    assert_ne!(
+        neutralized(&with_input(&["-Ztrust-verify=off"])).dep_tracking_hash(true),
+        posture.dep_tracking_hash(true),
+    );
 }
 
 #[test]
@@ -876,7 +1348,9 @@ fn every_direct_frontend_lane_resolves_to_its_pinned_value() {
         (Off, Some(IrOn), true),
         (Off, Some(IrOff), false),
         // Trust (A2): `strict` is `on` plus fail-closed reporting, so it runs the frontend in
-        // both lanes.
+        // both lanes. The fail-closed half is honoured only under verification: with
+        // `-Ztrust-verify=off` the request degrades to a plain `on` (see the stamp below and
+        // `trust_ir_lower_strict_by_flags`), because the off-switch is the master switch.
         (On, Some(IrStrict), true),
         (Off, Some(IrStrict), true),
     ];
@@ -891,10 +1365,18 @@ fn every_direct_frontend_lane_resolves_to_its_pinned_value() {
             "raw lane trust_verify={verify:?} requested={requested:?}",
         );
 
-        // A `strict` request survives canonicalization; everything else collapses to the
-        // resolved on/off answer. Stamping `On` for a strict request would silently drop the
-        // fail-closed half while leaving the mode looking enabled.
-        let stamped = if requested == Some(IrStrict) {
+        // A `strict` request survives canonicalization only under verification; everything
+        // else collapses to the resolved on/off answer. Stamping `On` for a verified strict
+        // request would silently drop the fail-closed half while leaving the mode looking
+        // enabled; stamping `Strict` for an UNVERIFIED one would record a strictness the
+        // compile does not enforce — two hashes for one compilation.
+        let strict = verify == On && requested == Some(IrStrict);
+        assert_eq!(
+            rustc_session::trust_ir_lower_strict_by_flags(verify, requested),
+            strict,
+            "strict lane trust_verify={verify:?} requested={requested:?}",
+        );
+        let stamped = if strict {
             IrStrict
         } else if expected {
             IrOn
@@ -969,6 +1451,10 @@ fn direct_frontend_spellings_collapse_to_one_tracked_hash_per_compilation() {
     assert_eq!(vanilla, canonical(Off, Some(IrOff)));
 
     let burn_in = canonical(Off, Some(IrOn));
+    // `-Ztrust-verify=off` is the master switch: a strict request in the off lane is the same
+    // compilation as the plain burn-in lane, and its tracked identity must say so. This is the
+    // assertion that would have caught strict lowering firing on unverified units.
+    assert_eq!(burn_in, canonical(Off, Some(IrStrict)));
     assert_ne!(vanilla, burn_in);
     assert_ne!(verifying, vanilla);
     assert_ne!(verifying, burn_in);
@@ -1052,6 +1538,70 @@ fn sat_perturbation_requires_an_exact_class_and_the_direct_ir_burn_in_lane() {
 
 #[test]
 #[allow(rustc::bad_opt_access)]
+fn derived_assert_msg_mutation_is_fenced_to_the_burn_in_lane_with_no_flip_and_no_dump() {
+    let mut verifying = rustc_session::config::Options::default();
+    verifying.unstable_opts.trust_test_mutate_derived_assert_msg = true;
+    let lane = Some(
+        "-Ztrust-test-mutate-derived-assert-msg is a test-only control and requires \
+         -Ztrust-verify=off -Ztrust-ir-lower",
+    );
+    // Batteries-on verification (the default) refuses it.
+    assert_eq!(trust_option_domain_error(&verifying), lane);
+    // So does the off lane without direct lowering.
+    let mut no_lower = verifying.clone();
+    no_lower.unstable_opts.trust_verify = config::TrustVerify::Off;
+    assert_eq!(trust_option_domain_error(&no_lower), lane);
+    let mut lower_off = no_lower.clone();
+    lower_off.unstable_opts.trust_ir_lower = Some(config::TrustIrLower::Off);
+    assert_eq!(trust_option_domain_error(&lower_off), lane);
+    // Verification on with lowering on is still an evidence lane.
+    let mut evidence = verifying.clone();
+    evidence.unstable_opts.trust_ir_lower = Some(config::TrustIrLower::On);
+    assert_eq!(trust_option_domain_error(&evidence), lane);
+
+    // The burn-in lane with the flip on (its default): inert, so refused.
+    let mut flip_on = no_lower.clone();
+    flip_on.unstable_opts.trust_ir_lower = Some(config::TrustIrLower::On);
+    assert!(flip_on.unstable_opts.trust_ir_flip, "the flip defaults on");
+    assert_eq!(
+        trust_option_domain_error(&flip_on),
+        Some(
+            "-Ztrust-test-mutate-derived-assert-msg is inert while the Trust-IR flip is on \
+             and requires -Ztrust-ir-flip=no"
+        )
+    );
+
+    // The one admitted posture: verification off, lowering on, flip off, no artifact sink.
+    let mut admitted = flip_on.clone();
+    admitted.unstable_opts.trust_ir_flip = false;
+    assert_eq!(trust_option_domain_error(&admitted), None);
+
+    // Every -Ztrust-dump sink is refused alongside it, the coverage report (`ir`) included.
+    let dump = Some(
+        "-Ztrust-test-mutate-derived-assert-msg mutates the derived MIR the differential \
+         compares and cannot be combined with any -Ztrust-dump artifact sink",
+    );
+    for what in ["ir", "mir", "native-bundle", "spec-clean"] {
+        let mut sink = admitted.clone();
+        let path = Some(PathBuf::from(what));
+        let d = &mut sink.unstable_opts.trust_dump;
+        match what {
+            "ir" => d.ir = path,
+            "mir" => d.mir = path,
+            "native-bundle" => d.native_bundle = path,
+            _ => d.spec_clean = path,
+        }
+        assert_eq!(trust_option_domain_error(&sink), dump, "sink={what}");
+    }
+
+    // Unset, the same postures are untouched by this fence.
+    let mut unset = flip_on;
+    unset.unstable_opts.trust_test_mutate_derived_assert_msg = false;
+    assert_eq!(trust_option_domain_error(&unset), None);
+}
+
+#[test]
+#[allow(rustc::bad_opt_access)]
 fn strict_policy_rejects_disabling_the_codegen_output_gate() {
     let mut strict = rustc_session::config::Options::default();
     strict.unstable_opts.trust_cg_output_gate = "off".to_string();
@@ -1126,4 +1676,196 @@ fn diagnostic_only_env_remains_available() {
     for diagnostic in ["TRUST_ASSERT_DEBUG", "TRUST_NATIVE_DEBUG", "TRUST_VERIFY_TRACE_CERTIFIED"] {
         assert!(!LEGACY_TRUST_SEMANTIC_ENV_VARS.contains(&diagnostic));
     }
+}
+
+/// Trust (D21): `-Ztrust-proc-macro-isolation` is refused on a host without the
+/// worker's sandbox and admitted on one with it; off, it refuses nowhere. The rule
+/// is pure, so both hosts' answers are pinned here whichever host runs the test,
+/// and the driver's admission applies it to the host it was built for.
+#[test]
+#[allow(rustc::bad_opt_access)]
+fn proc_macro_isolation_is_refused_on_a_host_without_the_sandbox() {
+    use rustc_session::{
+        TRUST_PROC_MACRO_ISOLATION_HOST, trust_proc_macro_isolation_refusal_by_flags,
+    };
+    let refusal = trust_proc_macro_isolation_refusal_by_flags(true, false)
+        .expect("a host without the sandbox refuses the option");
+    assert!(refusal.starts_with("-Ztrust-proc-macro-isolation is refused on this host"));
+    assert!(refusal.contains("does not fall back"));
+    assert_eq!(trust_proc_macro_isolation_refusal_by_flags(true, true), None);
+    assert_eq!(trust_proc_macro_isolation_refusal_by_flags(false, false), None);
+    assert_eq!(trust_proc_macro_isolation_refusal_by_flags(false, true), None);
+
+    let mut opts = rustc_session::config::Options::default();
+    assert_eq!(trust_option_domain_error(&opts), None);
+    opts.unstable_opts.trust_proc_macro_isolation = true;
+    assert_eq!(
+        trust_option_domain_error(&opts),
+        trust_proc_macro_isolation_refusal_by_flags(true, TRUST_PROC_MACRO_ISOLATION_HOST)
+    );
+    assert_eq!(TRUST_PROC_MACRO_ISOLATION_HOST, cfg!(target_os = "macos"));
+}
+
+// Trust (PM-1): the crate-loader proc-macro boundary is Targo's per-unit control.
+#[test]
+#[allow(rustc::bad_opt_access)]
+fn proc_macro_boundary_options_require_their_session_and_boundary() {
+    let mut opts = rustc_session::config::Options::default();
+    opts.unstable_opts.trust_proc_macro_boundary = true;
+    assert_eq!(
+        trust_option_domain_error(&opts),
+        Some("-Ztrust-proc-macro-boundary requires -Ztrust-verify-session")
+    );
+    opts.unstable_opts.trust_verify_session = Some("session".to_string());
+    assert_eq!(trust_option_domain_error(&opts), None);
+
+    let mut audited_only = rustc_session::config::Options::default();
+    audited_only.unstable_opts.trust_verify_session = Some("session".to_string());
+    audited_only.unstable_opts.trust_audited_proc_macro = vec!["libaudited.dylib".to_string()];
+    assert_eq!(
+        trust_option_domain_error(&audited_only),
+        Some("-Ztrust-audited-proc-macro requires -Ztrust-proc-macro-boundary")
+    );
+
+    opts.unstable_opts.trust_audited_proc_macro = vec![String::new()];
+    assert_eq!(
+        trust_option_domain_error(&opts),
+        Some("-Ztrust-audited-proc-macro requires a non-empty dylib path")
+    );
+}
+
+#[test]
+#[allow(rustc::bad_opt_access)]
+fn instance_seam_test_is_default_off_and_fenced_to_diagnostic_frontend() {
+    let mut opts = rustc_session::config::Options::default();
+    assert!(!opts.unstable_opts.trust_ir_instance_seam_test);
+    opts.unstable_opts.trust_ir_instance_seam_test = true;
+    assert!(trust_option_domain_error(&opts).is_some());
+    opts.unstable_opts.trust_verify = config::TrustVerify::Off;
+    assert!(trust_option_domain_error(&opts).is_some());
+    opts.unstable_opts.trust_ir_lower = Some(config::TrustIrLower::On);
+    assert!(trust_option_domain_error(&opts).is_some());
+    opts.unstable_opts.trust_cg_frontend = "trust-ir".into();
+    assert!(trust_option_domain_error(&opts).is_some(), "default backend is not F1");
+    opts.unstable_opts.codegen_backend = Some("trust-cg".into());
+    opts.output_types = config::OutputTypes::new(&[(config::OutputType::Object, None)]);
+    assert_eq!(trust_option_domain_error(&opts), None);
+    for backend in [None, Some("llvm"), Some("dummy")] {
+        let mut wrong = opts.clone();
+        wrong.unstable_opts.codegen_backend = backend.map(str::to_string);
+        assert!(trust_option_domain_error(&wrong).is_some(), "backend={backend:?}");
+    }
+    for kind in [config::OutputType::Metadata, config::OutputType::DepInfo, config::OutputType::Mir]
+    {
+        let mut wrong = opts.clone();
+        wrong.output_types = config::OutputTypes::new(&[(kind, None)]);
+        assert!(trust_option_domain_error(&wrong).is_some(), "output={kind:?}");
+    }
+    for mode in 0..3 {
+        let mut wrong = opts.clone();
+        match mode {
+            0 => wrong.unstable_opts.no_codegen = true,
+            1 => wrong.unstable_opts.no_analysis = true,
+            _ => wrong.unstable_opts.parse_crate_root_only = true,
+        }
+        assert!(trust_option_domain_error(&wrong).is_some(), "early mode={mode}");
+    }
+    for sink in ["ir", "mir", "native-bundle", "spec-clean"] {
+        let mut forbidden = opts.clone();
+        let path = Some(PathBuf::from(sink));
+        match sink {
+            "ir" => forbidden.unstable_opts.trust_dump.ir = path,
+            "mir" => forbidden.unstable_opts.trust_dump.mir = path,
+            "native-bundle" => forbidden.unstable_opts.trust_dump.native_bundle = path,
+            _ => forbidden.unstable_opts.trust_dump.spec_clean = path,
+        }
+        assert!(trust_option_domain_error(&forbidden).is_some(), "{sink}");
+    }
+    for mode in ["bool-constant", "undef-constant"] {
+        opts.unstable_opts.trust_test_instance_seam_mutation = Some(mode.into());
+        assert_eq!(trust_option_domain_error(&opts), None);
+    }
+    opts.unstable_opts.trust_test_instance_seam_mutation = Some("unknown".into());
+    assert!(trust_option_domain_error(&opts).is_some());
+    opts.unstable_opts.trust_test_instance_seam_mutation = Some("bool-constant".into());
+    opts.unstable_opts.trust_ir_instance_seam_test = false;
+    assert!(trust_option_domain_error(&opts).is_some());
+}
+
+/// Trust (PKG-C2d2 slice 1): the template-instance TEST-ORACLE is default off, rides only on the
+/// accepted D17 seam-test lane with the template producer, and its negative controls require it.
+#[test]
+#[allow(rustc::bad_opt_access)]
+fn template_instance_oracle_is_default_off_and_fenced_to_the_seam_test_lane() {
+    const NEEDS_LANE: Option<&str> = Some(
+        "-Ztrust-ir-template-instance-oracle requires -Ztrust-ir-instance-seam-test \
+                     and -Ztrust-ir-lower-templates",
+    );
+    let mut opts = rustc_session::config::Options::default();
+    assert!(!opts.unstable_opts.trust_ir_template_instance_oracle);
+    assert!(opts.unstable_opts.trust_test_template_oracle_mutation.is_none());
+    opts.unstable_opts.trust_verify = config::TrustVerify::Off;
+    opts.unstable_opts.trust_ir_lower = Some(config::TrustIrLower::On);
+    opts.unstable_opts.trust_cg_frontend = "trust-ir".into();
+    opts.unstable_opts.codegen_backend = Some("trust-cg".into());
+    opts.output_types = config::OutputTypes::new(&[(config::OutputType::Object, None)]);
+    opts.unstable_opts.trust_ir_instance_seam_test = true;
+    assert_eq!(trust_option_domain_error(&opts), None, "the seam-test lane alone");
+    opts.unstable_opts.trust_ir_template_instance_oracle = true;
+    assert_eq!(trust_option_domain_error(&opts), NEEDS_LANE, "no template producer");
+    opts.unstable_opts.trust_ir_lower_templates = true;
+    assert_eq!(trust_option_domain_error(&opts), None);
+    let mut no_seam = opts.clone();
+    no_seam.unstable_opts.trust_ir_instance_seam_test = false;
+    assert_eq!(trust_option_domain_error(&no_seam), NEEDS_LANE, "no seam-test lane");
+    let mut llvm = opts.clone();
+    llvm.unstable_opts.codegen_backend = Some("llvm".into());
+    assert!(trust_option_domain_error(&llvm).is_some(), "the seam fence still binds");
+    for mode in ["int-constant", "envelope-byte"] {
+        opts.unstable_opts.trust_test_template_oracle_mutation = Some(mode.into());
+        assert_eq!(trust_option_domain_error(&opts), None, "{mode}");
+    }
+    opts.unstable_opts.trust_test_template_oracle_mutation = Some("bool-constant".into());
+    assert_eq!(
+        trust_option_domain_error(&opts),
+        Some(
+            "invalid -Ztrust-test-template-oracle-mutation: expected \
+                         int-constant or envelope-byte"
+        )
+    );
+    opts.unstable_opts.trust_test_template_oracle_mutation = Some("int-constant".into());
+    opts.unstable_opts.trust_ir_template_instance_oracle = false;
+    assert_eq!(
+        trust_option_domain_error(&opts),
+        Some(
+            "-Ztrust-test-template-oracle-mutation requires \
+                         -Ztrust-ir-template-instance-oracle"
+        )
+    );
+}
+
+// Trust: use actual rustc option parsing; no alternate custody/argv classifier.
+#[test]
+fn private_fixed_routing_rejects_every_pre_adoption_early_exit() {
+    for arguments in [
+        &["--help"][..],
+        &["-V"],
+        &["-vV"],
+        &["-Zhelp"],
+        &["-Chelp"],
+        &["-Cpasses=list"],
+        &["-Wall"],
+        &["-Whelp"],
+        &["--explain=E0001"],
+    ] {
+        let mut private = vec!["--resource-bootstrap-fixed-v1"];
+        private.extend_from_slice(arguments);
+        let (args, matches) = parsed_matches(&private);
+        assert!(private_fixed_pre_session_exit(&matches, &args).is_some(), "{arguments:?}");
+        let (args, matches) = parsed_matches(arguments);
+        assert_eq!(private_fixed_pre_session_exit(&matches, &args), None);
+    }
+    let (args, matches) =
+        parsed_matches(&["--resource-bootstrap-fixed-v1", "lib.rs", "--crate-type=rlib"]);
+    assert_eq!(private_fixed_pre_session_exit(&matches, &args), None);
 }

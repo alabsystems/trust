@@ -3,6 +3,7 @@ use rustc_middle::mir::visit::{MutVisitor, PlaceContext};
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 pub(super) struct Derefer;
@@ -20,19 +21,14 @@ impl<'a, 'tcx> MutVisitor<'tcx> for DerefChecker<'a, 'tcx> {
     }
 
     fn visit_place(&mut self, place: &mut Place<'tcx>, cntxt: PlaceContext, loc: Location) {
-        if !place.projection.is_empty()
-            && cntxt != PlaceContext::NonUse(VarDebugInfo)
-            && place.projection[1..].contains(&ProjectionElem::Deref)
+        if cntxt != PlaceContext::NonUse(VarDebugInfo)
+            && let Some(rest) = place.projection.get(1..)
+            && let Some(rel_last_deref) =
+                rest.iter().rposition(|&elem| elem == ProjectionElem::Deref)
         {
             let mut place_local = place.local;
             let mut last_len = 0;
-            let mut last_deref_idx = 0;
-
-            for (idx, elem) in place.projection[0..].iter().enumerate() {
-                if *elem == ProjectionElem::Deref {
-                    last_deref_idx = idx;
-                }
-            }
+            let last_deref_idx = rel_last_deref + 1;
 
             for (idx, (p_ref, p_elem)) in place.iter_projections().enumerate() {
                 if !p_ref.projection.is_empty() && p_elem == ProjectionElem::Deref {
@@ -85,7 +81,7 @@ pub(super) fn deref_finder<'tcx>(
     body: &mut Body<'tcx>,
     add_deref_metadata: bool,
 ) {
-    let patch = MirPatch::new(body);
+    let patch = MirPatch::new_without_block_cache(body);
     let mut checker =
         DerefChecker { tcx, patcher: patch, local_decls: &body.local_decls, add_deref_metadata };
 
@@ -101,7 +97,8 @@ impl<'tcx> crate::MirPass<'tcx> for Derefer {
         deref_finder(tcx, body, true);
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Later MIR stages expect derefs to only appear as the first place projection.
+        PassPolicy::Required
     }
 }

@@ -1,8 +1,8 @@
 use rustc_abi::Size;
 use rustc_ast::{self as ast, UintTy};
-use rustc_hir::LangItem;
-use rustc_middle::bug;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_middle::ty::{self, LitToConstInput, ScalarInt, Ty, TyCtxt, TypeVisitableExt as _};
+use rustc_span::bug;
 use tracing::trace;
 
 use crate::builder::parse_float_into_scalar;
@@ -37,11 +37,18 @@ pub(crate) fn lit_to_const<'tcx>(
             let valtree_ty = Ty::new_imm_ref(tcx, tcx.lifetimes.re_static, tcx.types.str_);
             (ty::ValTree::from_raw_bytes(tcx, str_bytes), valtree_ty)
         }
-        (ast::LitKind::ByteStr(byte_sym, _), Some(ty::Ref(_, inner_ty, _)))
+        (ast::LitKind::ByteStr(byte_sym, _), Some(ty::Ref(region, inner_ty, mutbl)))
             if let ty::Slice(ty) | ty::Array(ty, _) = inner_ty.kind()
                 && let ty::Uint(UintTy::U8) = ty.kind() =>
         {
-            (ty::ValTree::from_raw_bytes(tcx, byte_sym.as_byte_str()), expected_ty.unwrap())
+            let valtree_ty = if inner_ty.is_slice() {
+                expected_ty.unwrap()
+            } else {
+                let array_ty =
+                    Ty::new_array(tcx, tcx.types.u8, byte_sym.as_byte_str().len() as u64);
+                Ty::new_ref(tcx, *region, array_ty, *mutbl)
+            };
+            (ty::ValTree::from_raw_bytes(tcx, byte_sym.as_byte_str()), valtree_ty)
         }
         (
             ast::LitKind::ByteStr(byte_sym, _),
@@ -51,7 +58,12 @@ pub(crate) fn lit_to_const<'tcx>(
         {
             // Byte string literal patterns may have type `[u8]` or `[u8; N]` if `deref_patterns` is
             // enabled, in order to allow, e.g., `deref!(b"..."): Vec<u8>`.
-            (ty::ValTree::from_raw_bytes(tcx, byte_sym.as_byte_str()), expected_ty.unwrap())
+            let valtree_ty = if expected_ty.unwrap().is_slice() {
+                expected_ty.unwrap()
+            } else {
+                Ty::new_array(tcx, tcx.types.u8, byte_sym.as_byte_str().len() as u64)
+            };
+            (ty::ValTree::from_raw_bytes(tcx, byte_sym.as_byte_str()), valtree_ty)
         }
         (ast::LitKind::ByteStr(byte_sym, _), _) => {
             let valtree = ty::ValTree::from_raw_bytes(tcx, byte_sym.as_byte_str());
@@ -113,4 +125,83 @@ pub(crate) fn lit_to_const<'tcx>(
     };
 
     Some(ty::Value { ty: valtree_ty, valtree })
+}
+
+// Trust: re-export `lit_to_mir_constant` through `thir::constant` so `builder/mod.rs`
+// (frozen in `scripts/frozen-files.txt`) remains byte-identical.
+#[tracing::instrument(skip(tcx, lit_input))]
+pub fn lit_to_mir_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    lit_input: LitToConstInput<'tcx>,
+) -> rustc_middle::mir::Const<'tcx> {
+    use rustc_middle::mir::interpret::{CTFE_ALLOC_SALT, Scalar};
+    use rustc_middle::mir::{Const, ConstValue};
+
+    let LitToConstInput { lit, ty, neg } = lit_input;
+
+    let ty = ty.expect("type of literal must be known at this point");
+
+    if let Err(guar) = ty.error_reported() {
+        return Const::Ty(Ty::new_error(tcx, guar), ty::Const::new_error(tcx, guar));
+    }
+
+    let lit_ty = match *ty.kind() {
+        ty::Pat(base, _) => base,
+        _ => ty,
+    };
+
+    let trunc = |n| {
+        let width = lit_ty.primitive_size(tcx);
+        trace!("trunc {} with size {} and shift {}", n, width.bits(), 128 - width.bits());
+        let result = width.truncate(n);
+        trace!("trunc result: {}", result);
+        ConstValue::Scalar(Scalar::from_uint(result, width))
+    };
+
+    let value = match (lit, lit_ty.kind()) {
+        (ast::LitKind::Str(s, _), ty::Ref(_, inner_ty, _)) if inner_ty.is_str() => {
+            let s = s.as_str().as_bytes();
+            let len = s.len();
+            let allocation = tcx.allocate_bytes_dedup(s, CTFE_ALLOC_SALT);
+            ConstValue::Slice { alloc_id: allocation, meta: len.try_into().unwrap() }
+        }
+        (ast::LitKind::ByteStr(byte_sym, _), ty::Ref(_, inner_ty, _))
+            if matches!(inner_ty.kind(), ty::Slice(_)) =>
+        {
+            let data = byte_sym.as_byte_str();
+            let len = data.len();
+            let allocation = tcx.allocate_bytes_dedup(data, CTFE_ALLOC_SALT);
+            ConstValue::Slice { alloc_id: allocation, meta: len.try_into().unwrap() }
+        }
+        (ast::LitKind::ByteStr(byte_sym, _), ty::Ref(_, inner_ty, _)) if inner_ty.is_array() => {
+            let id = tcx.allocate_bytes_dedup(byte_sym.as_byte_str(), CTFE_ALLOC_SALT);
+            ConstValue::Scalar(Scalar::from_pointer(id.into(), &tcx))
+        }
+        (ast::LitKind::CStr(byte_sym, _), ty::Ref(_, inner_ty, _))
+            if matches!(inner_ty.kind(), ty::Adt(def, _) if tcx.is_lang_item(def.did(), LangItem::CStr)) =>
+        {
+            let data = byte_sym.as_byte_str();
+            let len = data.len();
+            let allocation = tcx.allocate_bytes_dedup(data, CTFE_ALLOC_SALT);
+            ConstValue::Slice { alloc_id: allocation, meta: len.try_into().unwrap() }
+        }
+        (ast::LitKind::Byte(n), ty::Uint(ty::UintTy::U8)) => {
+            ConstValue::Scalar(Scalar::from_uint(n, Size::from_bytes(1)))
+        }
+        (ast::LitKind::Int(n, _), ty::Uint(_)) if !neg => trunc(n.get()),
+        (ast::LitKind::Int(n, _), ty::Int(_)) => {
+            trunc(if neg { u128::wrapping_neg(n.get()) } else { n.get() })
+        }
+        (ast::LitKind::Float(n, _), ty::Float(fty)) => {
+            ConstValue::Scalar(parse_float_into_scalar(n, *fty, neg).unwrap().into())
+        }
+        (ast::LitKind::Bool(b), ty::Bool) => ConstValue::Scalar(Scalar::from_bool(b)),
+        (ast::LitKind::Char(c), ty::Char) => ConstValue::Scalar(Scalar::from_char(c)),
+        (ast::LitKind::Err(guar), _) => {
+            return Const::Ty(Ty::new_error(tcx, guar), ty::Const::new_error(tcx, guar));
+        }
+        _ => bug!("invalid lit/ty combination in `lit_to_mir_constant`: {lit:?}: {ty:?}"),
+    };
+
+    Const::Val(value, ty)
 }

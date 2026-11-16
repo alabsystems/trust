@@ -31,6 +31,7 @@ fn probe_func() -> VerifiableFunction {
                         unwind: trust_types::UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "mmap::MmapMut::map_mut".to_string(),
                         args: vec![],
@@ -48,6 +49,7 @@ fn probe_func() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

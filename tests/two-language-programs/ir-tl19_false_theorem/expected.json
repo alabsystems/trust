@@ -1,0 +1,18 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-tl19_false_theorem",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (6fc5ee102 2026-09-28) (trustc 0.10.0+g6fc5ee102)",
+  "trust-ir": "first-party/trust-ir@a50b394e428c sha256:82836109f40b33cc",
+  "clean": "first-party/clean@352b9d7344f7 sha256:68a0c8796625d02f",
+  "trust-cg": "first-party/trust-cg@e058030cdead sha256:13b449bda946b0da"
+ },
+ "ratchets": {
+  "STANDALONE.p19_false_theorem": {
+   "verdict": "REFUSED",
+   "signature": "error: probes/p19_false_theorem.lean:2:1: error: `dbl_wrong` did not elaborate: Type mismatch: expected dbl fvar#N = fvar#N, got dbl fvar#N = dbl fvar#N",
+   "audit": "REFUSED",
+   "note": "2026-09-28: signature re-pinned, verdict unchanged (REFUSED, audit REFUSED): the same false theorem is refused, and only the kernel term the elaborator prints for the mismatch moved. clean 1a8f1c807 (\"assign a bare metavariable the constant AS WRITTEN, not its unfolding\"), inside the clean 336d2003 -> 352b9d73 move of the trust-ir v50 pin commit 27c75be420a, now shows `dbl fvar = dbl fvar` where it printed dbl's UInt64 unfolding. Same cause as that commit's e9_requires_hypothesis stderr re-bless."
+  }
+ }
+}

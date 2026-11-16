@@ -96,9 +96,9 @@ Operation *clone(Operation *src, IRMapping &mapper,
   if (!newOp) {
     SmallVector<Type> resultTypes(src->getResultTypes().begin(),
                                   src->getResultTypes().end());
-    newOp = Operation::create(
-        src->getLoc(), src->getName(), resultTypes, operands, src->getAttrs(),
-        OpaqueProperties(nullptr), successors, src->getNumRegions());
+    newOp = Operation::create(src->getLoc(), src->getName(), resultTypes,
+                              operands, src->getAttrs(), mlir::PropertyRef(),
+                              successors, src->getNumRegions());
 
     // Clone the regions.
     if (options.shouldCloneRegions()) {
@@ -252,6 +252,7 @@ FunctionOpInterface CloneFunctionWithReturns(
   SymbolTable table(parent);
   table.insert(NewF);
   SymbolTable::setSymbolVisibility(NewF, SymbolTable::Visibility::Private);
+  cast<AutoDiffFunctionInterface>(*NewF).detachFromPrimalDefinition();
 
   cloneInto(&F.getFunctionBody(), &NewF.getFunctionBody(), VMap, OpMap);
 

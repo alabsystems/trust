@@ -67,10 +67,10 @@ pub fn le_u64(a: u64, b: u64) -> bool
 // non-trivial one would not close by reflexivity: `decide (Nat.le k k)` on a
 // NEUTRAL `k` is stuck, so proving it needs a cited theorem — and a cited clause
 // that calls an island definition is a different lane, NOT exercised here.
-// Neither the advisory citation sweep nor the in-walk cited route installs
-// island admissions into its facet table (only the uncited defeq route does),
-// so such a clause reports "no diagnostic E6 facet record exists". That gap
-// predates this change and is orthogonal to it.
+// (That lane exists: the cited routes and the citation sweep admit the island
+// definitions a clause names into a clause-local facet table, as the uncited
+// defeq route always did — see `e9_cited_island_def_discharge`. It used to
+// report "no diagnostic E6 facet record exists"; it is orthogonal to this.)
 pub fn prop_position(a: i64) -> bool
     ensures in_range(a)
 {

@@ -1,0 +1,1 @@
+{"term": {"Const": "bad"}, "context": [{"name": "False", "entry": {"Definition": {"ty": {"Sort": 1}, "value": {"Sort": 0}}}}, {"name": "bad", "entry": {"Definition": {"ty": {"Const": "False"}, "value": {"Sort": 4294967295}}}}]}

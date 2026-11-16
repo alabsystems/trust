@@ -3,7 +3,7 @@ use clap_complete::engine::CompletionCandidate;
 
 use crate::command_prelude::*;
 
-use cargo::ops;
+use targo::ops;
 
 pub fn cli() -> Command {
     subcommand("generate-lockfile")

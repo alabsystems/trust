@@ -1,4 +1,5 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-todo -- the hardened-rule token table names the `todo!` token as data; tidy's check is textual
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Lightweight non-proof source audit for explicit standalone mode.
 //
 // Parses Rust source files to extract function signatures, native contract
@@ -1612,18 +1613,18 @@ fn generate_hardened_source_vcs_from_source(
 
         if let Some((function, function_key)) = active_function.clone() {
             let segment = active_function_line_segment(code, tokens, brace_depth);
-            scan_hardened_segment(
-                &mut vcs,
+            scan_hardened_segment(HardenedSegmentInput {
+                vcs: &mut vcs,
                 file,
                 line_no,
-                segment.active_code,
-                segment.active_tokens,
-                &function,
-                &function_key,
-                &mut create_seen,
-                &mut trust_transition_seen,
-                &mut pending_split_unsafe,
-            );
+                code: segment.active_code,
+                tokens: segment.active_tokens,
+                function: &function,
+                function_key: &function_key,
+                create_seen: &mut create_seen,
+                trust_transition_seen: &mut trust_transition_seen,
+                pending_split_unsafe: &mut pending_split_unsafe,
+            });
 
             let active_trimmed_code = segment.active_code.trim();
             let active_trimmed_tokens = segment.active_tokens.trim();
@@ -1635,34 +1636,34 @@ fn generate_hardened_source_vcs_from_source(
             {
                 active_function = None;
                 brace_depth = 0;
-                scan_hardened_segment(
-                    &mut vcs,
+                scan_hardened_segment(HardenedSegmentInput {
+                    vcs: &mut vcs,
                     file,
                     line_no,
-                    segment.suffix_code,
-                    segment.suffix_tokens,
-                    &module_context.0,
-                    &module_context.1,
-                    &mut create_seen,
-                    &mut trust_transition_seen,
-                    &mut pending_split_unsafe,
-                );
+                    code: segment.suffix_code,
+                    tokens: segment.suffix_tokens,
+                    function: &module_context.0,
+                    function_key: &module_context.1,
+                    create_seen: &mut create_seen,
+                    trust_transition_seen: &mut trust_transition_seen,
+                    pending_split_unsafe: &mut pending_split_unsafe,
+                });
             } else {
                 brace_depth = segment.brace_depth;
             }
         } else {
-            scan_hardened_segment(
-                &mut vcs,
+            scan_hardened_segment(HardenedSegmentInput {
+                vcs: &mut vcs,
                 file,
                 line_no,
                 code,
                 tokens,
-                &module_context.0,
-                &module_context.1,
-                &mut create_seen,
-                &mut trust_transition_seen,
-                &mut pending_split_unsafe,
-            );
+                function: &module_context.0,
+                function_key: &module_context.1,
+                create_seen: &mut create_seen,
+                trust_transition_seen: &mut trust_transition_seen,
+                pending_split_unsafe: &mut pending_split_unsafe,
+            });
         }
     }
 
@@ -1734,18 +1735,32 @@ fn byte_index_after_chars(text: &str, char_count: usize) -> usize {
     text.char_indices().nth(char_count).map_or(text.len(), |(idx, _)| idx)
 }
 
-fn scan_hardened_segment(
-    vcs: &mut Vec<StandaloneVc>,
-    file: &Path,
+struct HardenedSegmentInput<'a> {
+    vcs: &'a mut Vec<StandaloneVc>,
+    file: &'a Path,
     line_no: usize,
-    code: &str,
-    tokens: &str,
-    function: &str,
-    function_key: &str,
-    create_seen: &mut BTreeMap<String, usize>,
-    trust_transition_seen: &mut BTreeMap<String, (usize, &'static str)>,
-    pending_split_unsafe: &mut BTreeMap<String, (String, usize)>,
-) {
+    code: &'a str,
+    tokens: &'a str,
+    function: &'a str,
+    function_key: &'a str,
+    create_seen: &'a mut BTreeMap<String, usize>,
+    trust_transition_seen: &'a mut BTreeMap<String, (usize, &'static str)>,
+    pending_split_unsafe: &'a mut BTreeMap<String, (String, usize)>,
+}
+
+fn scan_hardened_segment(input: HardenedSegmentInput<'_>) {
+    let HardenedSegmentInput {
+        vcs,
+        file,
+        line_no,
+        code,
+        tokens,
+        function,
+        function_key,
+        create_seen,
+        trust_transition_seen,
+        pending_split_unsafe,
+    } = input;
     let trimmed_code = code.trim();
     let trimmed_tokens = tokens.trim();
     if trimmed_code.is_empty() && trimmed_tokens.is_empty() {
@@ -2106,8 +2121,8 @@ fn contains_split_line_unsafe_start(tokens: &str) -> bool {
         let before = normalized[..idx].chars().next_back();
         let after_idx = idx + "unsafe".len();
         let after = normalized[after_idx..].chars().next();
-        let ident_boundary = before.map_or(true, |ch| !is_rust_ident_continue(ch))
-            && after.map_or(true, |ch| !is_rust_ident_continue(ch));
+        let ident_boundary = before.is_none_or(|ch| !is_rust_ident_continue(ch))
+            && after.is_none_or(|ch| !is_rust_ident_continue(ch));
         if ident_boundary {
             let after_keyword = normalized[after_idx..].trim_start();
             return !after_keyword.starts_with('{');
@@ -2210,8 +2225,7 @@ fn contains_open_options_builder_open_call_normalized(tokens: &str) -> bool {
 }
 
 fn contains_open_options_create_open_call_normalized(tokens: &str) -> bool {
-    open_options_builder_contexts_before_open(tokens)
-        .any(|context| builder_context_has_create_mode(context))
+    open_options_builder_contexts_before_open(tokens).any(builder_context_has_create_mode)
 }
 
 fn open_options_builder_contexts_before_open<'a>(
@@ -2232,9 +2246,8 @@ impl<'a> Iterator for OpenOptionsOpenContexts<'a> {
         while let Some(relative_idx) = self.tokens[self.search_start..].find(".open(") {
             let open_idx = self.search_start + relative_idx;
             self.search_start = open_idx + 1;
-            let context_start = self.tokens[..open_idx]
-                .rfind(|ch| matches!(ch, ';' | '{' | '}'))
-                .map_or(0, |idx| idx + 1);
+            let context_start =
+                self.tokens[..open_idx].rfind([';', '{', '}']).map_or(0, |idx| idx + 1);
             let context = &self.tokens[context_start..open_idx];
             if contains_rust_call_token_normalized(context, "OpenOptions::new(")
                 || contains_rust_call_token_normalized(context, "File::options(")

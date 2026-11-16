@@ -17,10 +17,10 @@
 //! 1. **Census.** Every local `static` whose EXACT type is one of the five cells
 //!    (diagnostic items on the types). A crate with none returns immediately, having
 //!    paid one `type_of` per static and nothing else.
-//! 2. **Per-body facts** (`trust_mir_once_body_facts`, disk-cached, MIR-free result):
-//!    for each call in the body's MIR — the elaborated body, or `optimized_mir` for a
-//!    coroutine, whose elaborated body is already stolen (`with_body`) — the WAITING
-//!    methods (diagnostic items on
+//! 2. **Per-body facts** (`trust_mir_once_body_facts`, memoized, MIR-free result):
+//!    for each call in the body's MIR — the elaborated body (`optimized_mir` once
+//!    stolen), and for a coroutine the body the vanilla lane optimizes (`with_body`) —
+//!    the WAITING methods (diagnostic items on
 //!    `get_or_init`, `set`, `wait`, `call_once`, `force`, ... — see `waiting_method`)
 //!    and `Deref`/`DerefMut` on the `Lazy*` types, recognised structurally. The
 //!    receiver is resolved to a static through the `&(*_n)` reborrow chain down to
@@ -68,10 +68,12 @@
 use std::collections::VecDeque;
 
 use rustc_abi::Size;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::sync::par_for_each_in;
+use rustc_hir::ConstContext;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::{ConstContext, LangItem};
 use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::mir::trust_once::{TrustOnceBodyFacts, TrustOnceCellKind, TrustOnceWaitSite};
 use rustc_middle::mir::{
@@ -79,7 +81,8 @@ use rustc_middle::mir::{
     TerminatorKind,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::{self, GenericArgsRef, Instance, InstanceKind, ShimKind, TyCtxt, TypingEnv};
+use rustc_middle::ty::{self, GenericArgs, Instance, InstanceKind, ShimKind, TyCtxt, TypingEnv};
+use rustc_span::symbol::kw;
 use rustc_span::{Span, Symbol, sym};
 
 use crate::diagnostics::TrustOnceInitializerReentrancy;
@@ -142,19 +145,6 @@ fn waiting_method(name: Symbol) -> Option<(TrustOnceCellKind, bool)> {
     })
 }
 
-/// The `std::thread` entry points that run their closure/fn argument on ANOTHER
-/// thread: not a synchronous edge for the walk.
-fn is_thread_spawn(name: Symbol) -> bool {
-    matches!(
-        name,
-        sym::thread_spawn
-            | sym::thread_builder_spawn
-            | sym::thread_builder_spawn_unchecked
-            | sym::thread_builder_spawn_scoped
-            | sym::thread_scope_spawn
-    )
-}
-
 /// `<LazyLock<..> as Deref>::deref` / `DerefMut::deref_mut` (and the `LazyCell`
 /// twins), recognised structurally: the callee is the `Deref`/`DerefMut` lang trait's
 /// method and its `Self` type is a `Lazy*` cell. Every `*LAZY`, `LAZY.field` and
@@ -162,16 +152,17 @@ fn is_thread_spawn(name: Symbol) -> bool {
 fn lazy_deref_kind<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee: DefId,
-    gen_args: GenericArgsRef<'tcx>,
+    gen_args: GenericArgs<'tcx>,
 ) -> Option<TrustOnceCellKind> {
+    let self_ty = gen_args.get(0)?.as_type()?;
+    let adt_did = self_ty.ty_adt_def()?.did();
     let trait_did = tcx.trait_of_assoc(callee)?;
     if !(tcx.is_lang_item(trait_did, LangItem::Deref)
         || tcx.is_lang_item(trait_did, LangItem::DerefMut))
     {
         return None;
     }
-    let self_ty = gen_args.get(0)?.as_type()?;
-    let kind = cell_kind_of_adt(tcx, self_ty.ty_adt_def()?.did())?;
+    let kind = cell_kind_of_adt(tcx, adt_did)?;
     kind.is_lazy().then_some(kind)
 }
 
@@ -187,31 +178,76 @@ fn lazy_deref_kind<'tcx>(
 /// `#[rustc_comptime]` fn (`inner_mir_for_ctfe` steals it), not a static/const body,
 /// not a Clean-origin def (served by a gated emission), and not a synthetic
 /// coroutine body. A REAL coroutine (an `async fn`/`async` block body) passes the
-/// filter but is never read through that borrow — see `with_body`.
+/// filter but is never read through the adjacency query's borrow — see `with_body`
+/// and `synchronous_callees`.
 pub(crate) fn is_eligible_body(tcx: TyCtxt<'_>, def: LocalDefId) -> bool {
     matches!(tcx.def_kind(def), DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
         && matches!(tcx.hir_body_const_context(def), None | Some(ConstContext::ConstFn))
         && !crate::clean_origin_mir::is_clean_origin(tcx, def)
 }
 
-/// Run `f` on the MIR the check reads for `def`. An ordinary fn or closure is read
-/// through its elaborated body, still unstolen when the driver hook runs. A
-/// COROUTINE (an `async fn`/`async` block body) is read through `optimized_mir`:
-/// `run_required_analyses` computes every coroutine's layout before `analysis` runs
-/// the hooks, and `coroutine_layout` forces `optimized_mir`, whose first act is to
-/// steal the elaborated body — reading the `Steal` then ICEs ("attempted to read
-/// from stolen value"; measured 2026-08-30 on aterm v0.65.0's `aterm-gpu`, where
-/// `async fn adapter_from_env` shares a crate with cell statics). Same routing as
-/// the R1 caller scan (`tests/ui/trust/r1/flip_with_async_present.rs`). The
-/// `optimized_mir` demand is a cache hit there, never a fresh steal.
+/// Run `f` on the MIR the check reads for `def`.
+///
+/// A COROUTINE (an `async fn`/`async` block body) is read through the body the vanilla
+/// (`-Ztrust-verify=off`) lane optimizes, in BOTH lanes, so the same program gets the
+/// same once-initializer verdict whether or not it is verified — at the same MIR opt
+/// level. At `-O` without an explicit `-Zmir-opt-level` a verifying session runs level 1
+/// (ruling R1) and the vanilla lane 2, so a start site under a condition only GVN folds
+/// is still a verified-lane-only error there (docs/KNOWN_HAZARDS.md, probe `e4_gvn`):
+///
+/// * verification disabled: `optimized_mir`. Upstream's eager coroutine layout check in
+///   `run_required_analyses` has already demanded it in a clean session, so this is a
+///   cache hit; on an incremental replay it is loaded from disk. Reading the elaborated
+///   body instead — intact on a replay whose layout check was green-skipped, stolen in a
+///   clean session — made this query's result differ between sessions, and the ICH check
+///   ICEd (`-Ztrust-verify=off -Cincremental`, an `async fn` whose `LazyLock` deref sits
+///   in a constant-false branch: `tests/incremental/trust-once-facts-async-verify-off*`).
+/// * verification enabled: `trust_once_coroutine_mir`, a clone of the elaborated body run
+///   through the same pipeline without `TrustVerify`. The coroutine's own
+///   `optimized_mir` runs TrustVerify, which must run after the adapter-yield and
+///   backing-certificate seams and whose callee bundling steals other bodies; its
+///   ELABORATED body keeps constant-false branches the vanilla lane's optimizations
+///   remove, which gave a verified-lane-only hard error
+///   (`tests/ui/trust/async-layout-no-cycle/once_start_in_dead_async_branch.rs`).
+///
+/// Any other body is read through its elaborated MIR, still intact when the driver hook
+/// runs, and through `optimized_mir` once stolen (a cache hit — the steal is the proof
+/// that `optimized_mir` already ran).
 fn with_body<'tcx, R>(tcx: TyCtxt<'tcx>, def: LocalDefId, f: impl FnOnce(&Body<'tcx>) -> R) -> R {
     if tcx.is_coroutine(def.to_def_id()) {
-        f(tcx.optimized_mir(def))
-    } else {
-        let elaborated = tcx.mir_drops_elaborated_and_const_checked(def);
-        let body = elaborated.borrow();
-        f(&body)
+        return if crate::trust_verify::verification_enabled(tcx.sess) {
+            f(tcx.trust_once_coroutine_mir(def))
+        } else {
+            f(tcx.optimized_mir(def))
+        };
     }
+    let elaborated = tcx.mir_drops_elaborated_and_const_checked(def);
+    // Trust (2026-09-09): a coroutine's `optimized_mir` does not only steal ITS OWN
+    // elaborated body. MEASURED on `first-party/ty`'s `tla-cli` (seal trust-45f6241e):
+    // `fn modified_ns` is a plain fn reached from `tool_fingerprint`'s `OnceLock`
+    // initializer AND from an `async fn`, and the walk ICEd with "attempted to read
+    // from stolen value: Body" at the borrow below. CORRECTED 2026-09-29: the steal
+    // was not upstream's MIR inliner, which never inlines into a coroutine
+    // (`inline.rs`; only an internal `#[rustc_force_inline]` callee is); it was the
+    // coroutine's TrustVerify pass bundling its callees
+    // (`optimized_mir(callee)`), run during `run_required_analyses` because the
+    // coroutine's layout was read from `optimized_mir`. That route is closed: with
+    // verification enabled a coroutine's layout is read pre-steal
+    // (`trust_local_coroutine_layout`) and this check reads `trust_once_coroutine_mir`,
+    // so nothing runs a coroutine's TrustVerify before this check; with verification
+    // disabled TrustVerify does not run. The fallback stays for a body stolen on any
+    // other route (a `#[rustc_force_inline]` callee inlined into a coroutine, whose
+    // `optimized_mir` the inliner demands).
+    //
+    // Completeness, not soundness: this check is a DEADLOCK DETECTOR that emits a
+    // hard error on a once-initializer that can wait on its own cell. A fact lost
+    // to optimization costs a missed diagnostic; it can never manufacture one, and it
+    // is never a premise for a proof.
+    if elaborated.is_stolen() {
+        return f(tcx.optimized_mir(def));
+    }
+    let body = elaborated.borrow();
+    f(&body)
 }
 
 // ---------------------------------------------------------------------------
@@ -446,9 +482,21 @@ fn push_unique(list: &mut Vec<LocalDefId>, def: LocalDefId) {
 /// `trust_mir_direct_local_callees`: the only caller is the whole-crate walk in this
 /// module, which demands the query only for bodies passing `is_eligible_body` — and
 /// the accessor follow (`resolve_returned_static`) borrows OTHER bodies' MIR under
-/// the same filter, through `with_body`, at the same pre-steal moment. Do NOT
-/// "harden" it with `is_stolen()` — that is untracked by the query system and this
-/// query is `cache_on_disk`, so the cached result would depend on query ORDER.
+/// the same filter, through `with_body`.
+///
+/// This doc used to say "do NOT harden it with `is_stolen()` — that is untracked by
+/// the query system and this query is `cache_on_disk`, so the cached result would
+/// depend on query ORDER". The reasoning was right and the PREMISE was false: the
+/// pre-steal moment was not guaranteed, because a coroutine's layout stole ordinary
+/// callees through the coroutine's TrustVerify bundling (see `with_body`; with
+/// verification enabled that route is closed since 2026-09-29), and the walk ICEd on a
+/// real crate.
+/// Both halves are now honoured — `with_body` falls back to `optimized_mir` when the
+/// body is stolen, AND this query is no longer `cache_on_disk`, so an order-dependent
+/// result can never be persisted across sessions. Within one session the query is
+/// memoized per def, so it is self-consistent; the cost of recomputing is one MIR
+/// walk per eligible body, and only in a crate that has once-cell statics at all
+/// (the census returns immediately otherwise).
 pub(crate) fn trust_mir_once_body_facts<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
@@ -479,8 +527,10 @@ fn collect_body_facts<'tcx>(
         };
         let diagnostic_name = tcx.get_diagnostic_name(callee);
 
-        // Thread boundary: whatever this call receives runs on another thread.
-        if diagnostic_name.is_some_and(is_thread_spawn) {
+        // Thread boundary: whatever this call receives runs on another thread. The
+        // spawn census's seed predicate (one identity: std's diagnostic item, in the
+        // real sysroot `std`).
+        if trust_mir_extract::concurrency_effects::is_std_thread_spawn(tcx, callee) {
             for arg in args.iter() {
                 if let Some(local) = fn_value_def(tcx, body, &arg.node).and_then(DefId::as_local) {
                     push_unique(&mut facts.spawned, local);
@@ -633,11 +683,10 @@ struct Start {
 /// can reach a wait on its own cell, in `DefIndex` order.
 pub fn trust_check_once_initializer_reentrancy(tcx: TyCtxt<'_>) {
     // 1. Census — the pre-filter. One `type_of` per static; nothing else for a crate
-    //    without a cell-typed static.
+    //    without a cell-typed static. Every `DefKind::Static { nested: false, .. }`
+    //    is a HIR body owner, so scanning `hir_body_owners` avoids forcing `mir_keys`.
     let mut cells: Vec<(LocalDefId, TrustOnceCellKind)> = tcx
-        .mir_keys(())
-        .iter()
-        .copied()
+        .hir_body_owners()
         .filter_map(|def| cell_kind_of_static(tcx, def).map(|kind| (def, kind)))
         .collect();
     if cells.is_empty() {
@@ -645,23 +694,42 @@ pub fn trust_check_once_initializer_reentrancy(tcx: TyCtxt<'_>) {
     }
     cells.sort_unstable_by_key(|(def, _)| def.local_def_index.as_u32());
 
-    // 2. Every body the walk may visit, in a deterministic order.
-    let mut nodes: Vec<LocalDefId> =
-        tcx.mir_keys(()).iter().copied().filter(|&def| is_eligible_body(tcx, def)).collect();
-    nodes.sort_unstable_by_key(|def| def.local_def_index.as_u32());
-
-    // 3. Every initializer start: a waiting call that names its initializer, plus the
-    //    initializer each `Lazy*` static carries.
+    // 2 & 3. Every initializer start: a waiting call that names its initializer
+    //        (only possible for non-lazy `OnceLock` / `Once` / `OnceCell` statics),
+    //        plus the initializer each `Lazy*` static carries in its own definition.
     let mut starts: Vec<Start> = Vec::new();
-    for &node in &nodes {
-        for site in tcx.trust_mir_once_body_facts(node).waits.iter() {
-            if let Some(initializer) = site.initializer {
-                starts.push(Start {
-                    cell: site.cell,
-                    kind: site.kind,
-                    initializer,
-                    span: site.span,
-                });
+    if cells.iter().any(|(_, kind)| !kind.is_lazy()) {
+        // Every body the walk may visit, in a deterministic order.
+        let mut nodes: Vec<LocalDefId> =
+            tcx.mir_keys(()).iter().copied().filter(|&def| is_eligible_body(tcx, def)).collect();
+        nodes.sort_unstable_by_key(|def| def.local_def_index.as_u32());
+
+        // Pre-demand every body's facts in parallel. The facts query is not
+        // `cache_on_disk` (its result can depend on whether a body was stolen), so
+        // each session pays one MIR walk per eligible body; demanded sequentially
+        // below that walk dominated a touch-only rebuild of a large crate
+        // (measured 18.6 s of a 32 s `aterm-gui` lib-test compile). The queries are
+        // independent per body, so demand them across the query threads first; the
+        // ordered walk then reads memoized results.
+        par_for_each_in(nodes.as_slice(), |&node| {
+            // The real getter, not `ensure_ok`: for a query that is not
+            // `cache_on_disk`, `ensure_ok` only green-checks the dep node and the
+            // provider still runs on first real demand — serially, in the walk
+            // below. Demanding the value here runs providers in parallel and
+            // populates the arena cache the walk then reads.
+            let _ = tcx.trust_mir_once_body_facts(node);
+        });
+
+        for &node in &nodes {
+            for site in tcx.trust_mir_once_body_facts(node).waits.iter() {
+                if let Some(initializer) = site.initializer {
+                    starts.push(Start {
+                        cell: site.cell,
+                        kind: site.kind,
+                        initializer,
+                        span: site.span,
+                    });
+                }
             }
         }
     }
@@ -672,12 +740,14 @@ pub fn trust_check_once_initializer_reentrancy(tcx: TyCtxt<'_>) {
             starts.push(Start { cell, kind, initializer, span });
         }
     }
+    // Upstream 1.101: `Span` lost `Ord`; order by byte positions.
     starts.sort_by_key(|start| {
         (
             start.cell.local_def_index.as_u32(),
             start.initializer.krate.as_u32(),
             start.initializer.index.as_u32(),
-            start.span,
+            start.span.lo(),
+            start.span.hi(),
         )
     });
     starts.dedup_by_key(|start| (start.cell, start.initializer));
@@ -696,11 +766,14 @@ fn synchronous_callees(
     body: LocalDefId,
     facts: &TrustOnceBodyFacts,
 ) -> Vec<LocalDefId> {
-    // The adjacency query borrows the elaborated MIR unguarded, so a coroutine — whose
-    // elaborated body is already stolen (`with_body`) — gets the query's own extraction
-    // applied to its `optimized_mir` instead of the query.
+    // The adjacency query borrows the elaborated MIR, but a coroutine is read through
+    // the body the vanilla lane optimizes (`with_body`), so it gets the query's own
+    // extraction applied to that body instead of the query: its edges then come from
+    // the same MIR as its wait sites.
     let direct: Vec<LocalDefId> = if tcx.is_coroutine(body.to_def_id()) {
-        crate::trust_verify::trust_direct_local_callees_of_body(tcx, tcx.optimized_mir(body))
+        with_body(tcx, body, |mir| {
+            crate::trust_verify::trust_direct_local_callees_of_body(tcx, mir)
+        })
     } else {
         tcx.trust_mir_direct_local_callees(body).to_vec()
     };
@@ -783,7 +856,7 @@ fn render_wait(tcx: TyCtxt<'_>, site: &TrustOnceWaitSite) -> String {
     let method = site.method;
     match site.kind {
         TrustOnceCellKind::LazyLock | TrustOnceCellKind::LazyCell => {
-            if matches!(method, sym::deref | sym::deref_mut) {
+            if matches!(method, kw::Deref | sym::deref_mut) {
                 format!("*{cell}")
             } else {
                 let ty =

@@ -1,0 +1,32 @@
+[package]
+name = "trust-bridge-closure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "bridge_closure"
+path = "src/main.rs"
+required-features = ["olean-closure"]
+
+[[bin]]
+name = "bridge_source_reuse"
+path = "src/source_reuse_main.rs"
+
+[features]
+default = ["olean-closure"]
+olean-closure = ["dep:clean-kernel", "dep:clean-olean"]
+
+[dependencies]
+clean-kernel = { workspace = true, optional = true }
+clean-olean = { workspace = true, optional = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

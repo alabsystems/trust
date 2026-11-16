@@ -63,8 +63,6 @@ pub fn build_json_report_with_policy(
             trust_version: TRUST_VERSION.to_string(),
             timestamp: now_iso8601(),
             total_time_ms,
-            timeout_ms: None,
-            function_budget_ms: None,
         },
         crate_name: crate_name.to_string(),
         summary,
@@ -99,6 +97,7 @@ pub fn build_json_report_from_annotations(
                     // Derive ProofEvidence from annotation strength.
                     let evidence = obligation.strength.as_ref().map(|s| s.clone().into());
                     ObligationReport {
+                        assumes: Vec::new(),
                         obligation_id: None,
                         description: obligation.description.clone(),
                         kind: obligation.kind.clone(),
@@ -158,8 +157,6 @@ pub fn build_json_report_from_annotations(
             trust_version: TRUST_VERSION.to_string(),
             timestamp: now_iso8601(),
             total_time_ms,
-            timeout_ms: None,
-            function_budget_ms: None,
         },
         crate_name: crate_name.to_string(),
         summary,
@@ -242,6 +239,7 @@ fn build_obligations(
             let evidence = result.evidence();
 
             ObligationReport {
+                assumes: Vec::new(),
                 obligation_id: None,
                 description: vc.kind.description(),
                 kind: result_kind_tag(&vc.kind, result),
@@ -300,7 +298,10 @@ fn convert_annotation_status(
             }
         }
         AnnotationStatus::Failed => {
-            ObligationOutcome::Failed { counterexample: counterexample.map(cex_to_report) }
+            ObligationOutcome::Failed {
+                counterexample: counterexample.map(cex_to_report),
+                basis: trust_types::FailureBasis::Refuted,
+            }
         }
         AnnotationStatus::Unknown => {
             ObligationOutcome::Unknown { reason: "annotation reported unknown".to_string() }
@@ -322,14 +323,33 @@ fn convert_annotation_location(location: Option<SourceSpan>) -> Option<SourceSpa
 /// raw/opaque API, not a property to discharge), so it must be reported as a
 /// design requirement rather than ride the proof `failed`/`unknown` channel.
 /// MIR-assert hardened VCs carry a real condition and are NOT matched here.
+///
+/// G3-MANDATE-L1-ONLY-1 (2026-10-27): nor is a `HardenedBoundary` in the L0
+/// `UnsafeOperation`/`FfiBoundary` categories (the compiler reconstructs an FFI
+/// row with no summary as one): its `true` is a modelling-gap fail-close, and
+/// `VcKind::is_hardened_design_mandate` is the compiler's predicate too.
 fn hardened_design_mandate(kind: &VcKind, formula: &Formula) -> Option<String> {
     match kind {
         VcKind::HardenedBoundary { callee, detail, .. }
-            if matches!(formula, Formula::Bool(true)) =>
+            if kind.is_hardened_design_mandate(formula) =>
         {
             Some(format!("{callee}: {detail}"))
         }
         _ => None,
+    }
+}
+
+fn gate_reporting_floor_cow(
+    result: &VerificationResult,
+) -> std::borrow::Cow<'_, VerificationResult> {
+    if matches!(
+        result,
+        VerificationResult::Proved { strength, .. }
+            if !strength.assurance.meets_reporting_floor()
+    ) {
+        std::borrow::Cow::Owned(result.clone().require_reporting_floor())
+    } else {
+        std::borrow::Cow::Borrowed(result)
     }
 }
 
@@ -351,8 +371,8 @@ fn result_to_outcome(
     // floor. require_assurance is monotone (only weakens Proved->Unknown), so this
     // is fail-closed and idempotent w.r.t. the inner gate that remains in
     // raw_result_to_outcome. (T-GATE, docs/PROOF_OF_PERFECTION.md.)
-    let gated = result.clone().require_reporting_floor();
-    let result = &gated;
+    let gated = gate_reporting_floor_cow(result);
+    let result = gated.as_ref();
 
     let outcome = if result.is_memory_guard_solver_skip() {
         raw_result_to_outcome(result)
@@ -379,14 +399,17 @@ fn raw_result_to_outcome(result: &VerificationResult) -> ObligationOutcome {
     // boundary — a `Proved` whose assurance is below the reported-proof floor
     // (`SmtBacked`) is downgraded to `Unknown`, so no deserialized/cached/forged
     // weak-assurance result surfaces as a reported proof.
-    let gated = result.clone().require_reporting_floor();
-    let result = &gated;
+    let gated = gate_reporting_floor_cow(result);
+    let result = gated.as_ref();
     match result {
         VerificationResult::Proved { strength, .. } => {
             ObligationOutcome::Proved { strength: strength.clone() }
         }
-        VerificationResult::Failed { counterexample, .. } => {
-            ObligationOutcome::Failed { counterexample: counterexample.as_ref().map(cex_to_report) }
+        VerificationResult::Failed { solver, counterexample, .. } => {
+            ObligationOutcome::failed_from_backend(
+                solver.as_str(),
+                counterexample.as_ref().map(cex_to_report),
+            )
         }
         VerificationResult::Unknown { reason, .. } => ObligationOutcome::Unknown {
             reason: result.release_blocking_proof_gap_reason().unwrap_or_else(|| reason.clone()),
@@ -417,9 +440,12 @@ fn disposition_to_outcome(
             ObligationOutcome::RuntimeChecked { note: Some(note) }
         }
         RuntimeDisposition::Failed => match result {
-            VerificationResult::Failed { counterexample, .. } => ObligationOutcome::Failed {
-                counterexample: counterexample.as_ref().map(cex_to_report),
-            },
+            VerificationResult::Failed { solver, counterexample, .. } => {
+                ObligationOutcome::failed_from_backend(
+                    solver.as_str(),
+                    counterexample.as_ref().map(cex_to_report),
+                )
+            }
             _ => ObligationOutcome::Unknown {
                 reason: "failed disposition but result is not Failed".to_string(),
             },
@@ -447,11 +473,18 @@ fn cex_to_report(cex: &Counterexample) -> CounterexampleReport {
                     CounterexampleValue::Int(n) => (n.to_string(), "int"),
                     CounterexampleValue::Uint(n) => (n.to_string(), "uint"),
                     CounterexampleValue::Float(n) => (n.to_string(), "float"),
+                    // The solver's own SMT-LIB spelling of a non-scalar value
+                    // (a datatype constructor application `(succ zero)`, a
+                    // store chain, an exact rational…). Dropping it into the
+                    // "unknown" bucket would throw away the witness the solver
+                    // actually found — the one thing a counterexample is for.
+                    // Kept in lockstep with trust-router's `cex_to_report`.
+                    CounterexampleValue::Term(term) => (term.clone(), "term"),
                     _ => ("unknown".to_string(), "unknown"),
                 };
                 CounterexampleVariable {
                     name: name.clone(),
-                    value: value_str.clone(),
+                    value: value_str,
                     value_type: value_type.to_string(),
                     display: val.to_string(),
                 }
@@ -541,6 +574,7 @@ pub(crate) fn vc_kind_tag(kind: &VcKind) -> String {
         VcKind::LoopInvariantSufficiency { .. } => "loop_invariant_sufficiency".to_string(),
         VcKind::TypeRefinementViolation { .. } => "type_refinement_violation".to_string(),
         VcKind::FrameConditionViolation { .. } => "frame_condition_violation".to_string(),
+        VcKind::TypeInvariant { point, .. } => format!("type_invariant_{}", point.as_tag()),
         _ => "unknown".to_string(),
     }
 }
@@ -598,7 +632,11 @@ fn is_symbolic_formula_not_consumed_kind(kind: &str) -> bool {
 
 fn source_backpropagation_gate_kind_tag(detail: &str) -> &'static str {
     let detail = detail.to_ascii_lowercase();
-    let normalized = detail.replace(['_', '-'], " ");
+    let normalized: std::borrow::Cow<'_, str> = if detail.contains(['_', '-']) {
+        std::borrow::Cow::Owned(detail.replace(['_', '-'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(&detail)
+    };
     if detail.contains("missing_reconstruction")
         || normalized.contains("missing reconstruction")
         || normalized.contains("accepted reconstruction")
@@ -692,6 +730,7 @@ fn build_function_summary(obligations: &[ObligationReport]) -> FunctionSummary {
     let mut unknown = 0usize;
     let mut timed_out = 0usize;
     let mut design_requirements = 0usize;
+    let mut failed_unproved = 0usize;
     let mut total_time_ms = 0u64;
     let mut max_proof_level: Option<ProofLevel> = None;
 
@@ -699,7 +738,14 @@ fn build_function_summary(obligations: &[ObligationReport]) -> FunctionSummary {
         match &ob.outcome {
             ObligationOutcome::Proved { .. } => proved += 1,
             ObligationOutcome::RuntimeChecked { .. } => runtime_checked += 1,
-            ObligationOutcome::Failed { .. } => failed += 1,
+            // `failed_unproved` is a SUBSET of `failed` (display only); the
+            // verdict below reads `failed` exactly as before.
+            ObligationOutcome::Failed { basis, .. } => {
+                failed += 1;
+                if *basis == trust_types::FailureBasis::UnprovedFailClosed {
+                    failed_unproved += 1;
+                }
+            }
             ObligationOutcome::Unknown { .. } => unknown += 1,
             ObligationOutcome::Timeout { .. } => {
                 unknown += 1;
@@ -737,6 +783,7 @@ fn build_function_summary(obligations: &[ObligationReport]) -> FunctionSummary {
         unknown,
         timed_out,
         design_requirements,
+        failed_unproved,
         unattributed_failed: 0,
         unattributed_unknown: 0,
         unattributed_proved: 0,
@@ -759,6 +806,7 @@ pub(crate) fn build_crate_summary(functions: &[FunctionProofReport]) -> CrateSum
     let mut total_unknown = 0usize;
     let mut total_timed_out = 0usize;
     let mut total_design_requirements = 0usize;
+    let mut total_failed_unproved = 0usize;
     let mut total_unattributed_failed = 0usize;
     let mut total_unattributed_unknown = 0usize;
     let mut total_unattributed_proved = 0usize;
@@ -782,6 +830,7 @@ pub(crate) fn build_crate_summary(functions: &[FunctionProofReport]) -> CrateSum
         total_unknown += func.summary.unknown;
         total_timed_out += func.summary.timed_out;
         total_design_requirements += func.summary.design_requirements;
+        total_failed_unproved += func.summary.failed_unproved;
         total_unattributed_failed += func.summary.unattributed_failed;
         total_unattributed_unknown += func.summary.unattributed_unknown;
         total_unattributed_proved += func.summary.unattributed_proved;
@@ -811,6 +860,7 @@ pub(crate) fn build_crate_summary(functions: &[FunctionProofReport]) -> CrateSum
         total_unknown,
         total_timed_out,
         total_design_requirements,
+        total_failed_unproved,
         total_unattributed_failed,
         total_unattributed_unknown,
         total_unattributed_proved,
@@ -840,14 +890,16 @@ mod verdict_invariant_tests {
     //! `#[non_exhaustive]` `ObligationOutcome` variant) could be minted into a
     //! false proof.
     use trust_types::{
-        CrateVerdict, Formula, FunctionVerdict, HardenedVcCategory, ObligationOutcome,
-        ObligationReport, ProofLevel, ProofStrength, ScopeVerdict, ScopeVerdictCounts, VcKind,
+        Counterexample, CounterexampleValue, CrateVerdict, Formula, FunctionVerdict,
+        HardenedVcCategory, ObligationOutcome, ObligationReport, ProofLevel, ProofStrength,
+        ScopeVerdict, ScopeVerdictCounts, VcKind,
     };
 
-    use super::{build_function_summary, hardened_design_mandate};
+    use super::{build_function_summary, cex_to_report, hardened_design_mandate};
 
     fn ob(outcome: ObligationOutcome) -> ObligationReport {
         ObligationReport {
+            assumes: Vec::new(),
             obligation_id: None,
             description: "t".into(),
             kind: "t".into(),
@@ -1187,6 +1239,15 @@ mod verdict_invariant_tests {
         assert!(hardened_design_mandate(&kind, &Formula::Bool(false)).is_none());
         // A non-hardened VC is never a design mandate, even with a `true` formula.
         assert!(hardened_design_mandate(&VcKind::DivisionByZero, &Formula::Bool(true)).is_none());
+        // G3-MANDATE-L1-ONLY-1: nor is an L0 unsafe/FFI modelling gap.
+        for category in [HardenedVcCategory::FfiBoundary, HardenedVcCategory::UnsafeOperation] {
+            let gap = VcKind::HardenedBoundary {
+                category,
+                callee: "getpgrp".into(),
+                detail: "no summary".into(),
+            };
+            assert!(hardened_design_mandate(&gap, &Formula::Bool(true)).is_none(), "{category:?}");
+        }
     }
 
     #[test]
@@ -1202,5 +1263,134 @@ mod verdict_invariant_tests {
         // Not every obligation is proved, so not Verified — but it's an advisory,
         // not a violation.
         assert_eq!(s.verdict, FunctionVerdict::Inconclusive);
+    }
+
+    /// A non-scalar witness keeps the solver's OWN spelling in the machine
+    /// report: `(succ zero)` under `value_type: "term"`, not the `"unknown"`
+    /// bucket that throws the witness away. This renderer is the duplicate of
+    /// trust-router's `cex_to_report` and must agree with it value for value.
+    #[test]
+    fn cex_to_report_carries_the_solvers_spelling_of_a_non_scalar_witness() {
+        let cex = Counterexample::new(vec![
+            ("m".to_string(), CounterexampleValue::Term("(succ zero)".to_string())),
+            ("n".to_string(), CounterexampleValue::Int(-7)),
+        ]);
+        let report = cex_to_report(&cex);
+        let term = report
+            .variables
+            .iter()
+            .find(|variable| variable.name == "m")
+            .expect("the witness must bind `m`");
+        assert_eq!(term.value, "(succ zero)");
+        assert_eq!(term.value_type, "term");
+        assert_eq!(term.display, "(succ zero)");
+        let scalar = report
+            .variables
+            .iter()
+            .find(|variable| variable.name == "n")
+            .expect("the witness must bind `n`");
+        assert_eq!((scalar.value.as_str(), scalar.value_type.as_str()), ("-7", "int"));
+    }
+}
+
+#[cfg(test)]
+mod failure_basis_tests {
+    //! A fail-closed `[unsafe…]` row (`trust_types::UNSAFE_DEMAND_FAIL_CLOSED_SOLVER`)
+    //! FAILS exactly as before but is labelled "unproved, no counterexample"
+    //! in report.json, the counts and the terminal — never as a refutation.
+    use trust_types::*;
+
+    use crate::build_json_report;
+    use crate::terminal::format_terminal_report;
+
+    fn unsafe_vc(function: &str) -> VerificationCondition {
+        VerificationCondition {
+            kind: VcKind::Assertion {
+                message: "[unsafe:unmodeled-call] call to `ext` (unsafe fn) is not covered by \
+                          Trust's model"
+                    .into(),
+            },
+            function: function.into(),
+            location: SourceSpan {
+                file: "src/lib.rs".into(),
+                line_start: 3,
+                col_start: 1,
+                line_end: 3,
+                col_end: 9,
+            },
+            formula: Formula::Bool(true),
+            contract_metadata: None,
+            obligation: None,
+        }
+    }
+
+    fn failed(solver: &str) -> VerificationResult {
+        VerificationResult::Failed { solver: solver.into(), time_ms: 0, counterexample: None }
+    }
+
+    fn report(solvers: &[&str]) -> JsonProofReport {
+        let results: Vec<_> =
+            solvers.iter().map(|solver| (unsafe_vc("f"), failed(solver))).collect();
+        build_json_report("c", &results)
+    }
+
+    #[test]
+    fn fail_closed_unsafe_row_is_labelled_unproved_and_still_fails() {
+        let label = UNSAFE_DEMAND_FAIL_CLOSED_SOLVER;
+        let unproved = report(&[label, label]);
+        // CONTROL: identical rows a backend refuted (the label is the only
+        // difference). Every gate-read number and verdict must match.
+        let control = report(&["ay", "ay"]);
+        let (u, c) = (&unproved.summary, &control.summary);
+        assert_eq!(
+            (u.total_obligations, u.total_failed, u.total_unknown, u.verdict),
+            (c.total_obligations, c.total_failed, c.total_unknown, c.verdict)
+        );
+        assert_eq!(u.total_failed, 2);
+        assert_eq!(u.verdict, CrateVerdict::HasViolations);
+        assert_eq!((u.total_failed_unproved, c.total_failed_unproved), (2, 0));
+        let row = &unproved.functions[0].obligations[0];
+        assert!(row.outcome.is_unproved_fail_closed(), "{:?}", row.outcome);
+        assert_eq!(Outcome::from(&row.outcome), Outcome::Failed);
+        let json = serde_json::to_value(&row.outcome).unwrap();
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["basis"], "unproved_fail_closed");
+        assert!(json.get("counterexample").is_none());
+        let control_json =
+            serde_json::to_value(&control.functions[0].obligations[0].outcome).unwrap();
+        assert!(control_json.get("basis").is_none(), "a refuted row keeps its old wire shape");
+
+        let text = format_terminal_report(&unproved);
+        assert!(text.contains("FAILED (unproved, no counterexample; failed closed)"), "{text}");
+        assert!(text.contains("2 failed (2 unproved, no counterexample)"), "{text}");
+        let control_text = format_terminal_report(&control);
+        assert!(!control_text.contains("unproved"), "{control_text}");
+        assert!(control_text.contains("2 failed"), "{control_text}");
+    }
+
+    #[test]
+    fn both_outcome_paths_read_the_basis_off_the_backend_label() {
+        // The raw path (no runtime-check policy) and the disposition path
+        // (a policy) each build the failed outcome; both must classify.
+        let kind = unsafe_vc("f").kind;
+        let label = UNSAFE_DEMAND_FAIL_CLOSED_SOLVER;
+        for policy in [None, Some(RuntimeCheckPolicy::Auto)] {
+            let (outcome, solver, _) =
+                super::result_to_outcome(&kind, &failed(label), policy, Some(true));
+            assert_eq!(solver, label);
+            assert!(outcome.is_unproved_fail_closed(), "{policy:?}: {outcome:?}");
+            let (control, _, _) =
+                super::result_to_outcome(&kind, &failed("ay"), policy, Some(true));
+            assert_eq!(control.failure_basis(), Some(FailureBasis::Refuted), "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn refused_proof_variants_of_the_family_are_unproved_too() {
+        let label = UNSAFE_DEMAND_FAIL_CLOSED_SOLVER;
+        let over = format!("{label}-over-vacuous-placeholder-proof:ay-in-process");
+        let r = report(&[over.as_str()]);
+        assert!(r.functions[0].obligations[0].outcome.is_unproved_fail_closed());
+        assert_eq!(r.summary.total_failed, 1);
     }
 }

@@ -1,0 +1,4886 @@
+[
+  {
+    "identity": {
+      "stable_crate_id": 5191966108663675485,
+      "def_index": 27,
+      "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+      ]
+    },
+    "func": {
+      "name": "clone",
+      "def_path": "<tinvrec::Json as core::clone::Clone>::clone",
+      "span": {
+        "file": "tinv_recursive_reach_fx.rs",
+        "line_start": 3,
+        "col_start": 9,
+        "line_end": 3,
+        "col_end": 14
+      },
+      "body": {
+        "locals": [
+          {
+            "index": 0,
+            "ty": {
+              "Datatype": {
+                "name": "tinvrec::Json",
+                "variants": []
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 1,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Datatype": {
+                    "name": "tinvrec::Json",
+                    "variants": []
+                  }
+                }
+              }
+            },
+            "name": "self"
+          },
+          {
+            "index": 2,
+            "ty": {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 3,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 4,
+            "ty": {
+              "Float": {
+                "width": 64
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 5,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 6,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Adt": {
+                    "name": "alloc::string::String",
+                    "fields": [
+                      [
+                        "vec",
+                        {
+                          "Seq": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 7,
+            "ty": {
+              "Adt": {
+                "name": "alloc::string::String",
+                "fields": [
+                  [
+                    "vec",
+                    {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 8,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Adt": {
+                    "name": "alloc::string::String",
+                    "fields": [
+                      [
+                        "vec",
+                        {
+                          "Seq": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 9,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Seq": {
+                    "elem": {
+                      "Datatype": {
+                        "name": "tinvrec::Json",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 10,
+            "ty": {
+              "Seq": {
+                "elem": {
+                  "Datatype": {
+                    "name": "tinvrec::Json",
+                    "variants": []
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 11,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Seq": {
+                    "elem": {
+                      "Datatype": {
+                        "name": "tinvrec::Json",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 12,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Seq": {
+                    "elem": {
+                      "Tuple": [
+                        {
+                          "Adt": {
+                            "name": "alloc::string::String",
+                            "fields": [
+                              [
+                                "vec",
+                                {
+                                  "Seq": {
+                                    "elem": {
+                                      "Int": {
+                                        "width": 8,
+                                        "signed": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        },
+                        {
+                          "Datatype": {
+                            "name": "tinvrec::Json",
+                            "variants": []
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 13,
+            "ty": {
+              "Seq": {
+                "elem": {
+                  "Tuple": [
+                    {
+                      "Adt": {
+                        "name": "alloc::string::String",
+                        "fields": [
+                          [
+                            "vec",
+                            {
+                              "Seq": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                }
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    },
+                    {
+                      "Datatype": {
+                        "name": "tinvrec::Json",
+                        "variants": []
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 14,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Seq": {
+                    "elem": {
+                      "Tuple": [
+                        {
+                          "Adt": {
+                            "name": "alloc::string::String",
+                            "fields": [
+                              [
+                                "vec",
+                                {
+                                  "Seq": {
+                                    "elem": {
+                                      "Int": {
+                                        "width": 8,
+                                        "signed": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        },
+                        {
+                          "Datatype": {
+                            "name": "tinvrec::Json",
+                            "variants": []
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "name": null
+          }
+        ],
+        "blocks": [
+          {
+            "id": 0,
+            "stmts": [
+              {
+                "Assign": {
+                  "place": {
+                    "local": 2,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Discriminant": {
+                      "local": 1,
+                      "projections": [
+                        "Deref"
+                      ]
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 3,
+                    "col_start": 9,
+                    "line_end": 3,
+                    "col_end": 14
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "SwitchInt": {
+                "discr": {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                },
+                "targets": [
+                  [
+                    0,
+                    6
+                  ],
+                  [
+                    1,
+                    5
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    3
+                  ],
+                  [
+                    4,
+                    2
+                  ]
+                ],
+                "otherwise": 1,
+                "exhaustive_enum_unreachable": true,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 3,
+                  "col_start": 9,
+                  "line_end": 3,
+                  "col_end": 14
+                }
+              }
+            }
+          },
+          {
+            "id": 1,
+            "stmts": [],
+            "terminator": "Unreachable"
+          },
+          {
+            "id": 2,
+            "stmts": [
+              {
+                "StorageLive": 12
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 12,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": false,
+                      "place": {
+                        "local": 1,
+                        "projections": [
+                          "Deref",
+                          {
+                            "Downcast": 4
+                          },
+                          {
+                            "Field": 0
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 9,
+                    "col_start": 8,
+                    "line_end": 9,
+                    "col_end": 27
+                  }
+                }
+              },
+              {
+                "StorageLive": 13
+              },
+              {
+                "StorageLive": 14
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 14,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": false,
+                      "place": {
+                        "local": 12,
+                        "projections": [
+                          "Deref"
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 9,
+                    "col_start": 8,
+                    "line_end": 9,
+                    "col_end": 27
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "Call": {
+                "func": "__trust_total_clone",
+                "args": [
+                  {
+                    "Move": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  }
+                ],
+                "dest": {
+                  "local": 13,
+                  "projections": []
+                },
+                "target": 10,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 9,
+                  "col_start": 8,
+                  "line_end": 9,
+                  "col_end": 27
+                },
+                "atomic": null,
+                "is_foreign": false,
+                "is_unsafe_sig": false,
+                "unwind": "Continue",
+                "callee_identity": {
+                  "stable_crate_id": 17860114905107164610,
+                  "def_index": 3468,
+                  "substs_digest": [
+                    14035900544290465580,
+                    7875448797867206365
+                  ]
+                },
+                "callee_key": {
+                  "sysroot_item": "CloneClone",
+                  "krate_is_real_sysroot": true,
+                  "krate_name_is_ambiguous": false,
+                  "stable_crate_id": 17860114905107164610,
+                  "krate_name": "core"
+                }
+              }
+            }
+          },
+          {
+            "id": 3,
+            "stmts": [
+              {
+                "StorageLive": 9
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 9,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": false,
+                      "place": {
+                        "local": 1,
+                        "projections": [
+                          "Deref",
+                          {
+                            "Downcast": 3
+                          },
+                          {
+                            "Field": 0
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 8,
+                    "col_start": 8,
+                    "line_end": 8,
+                    "col_end": 17
+                  }
+                }
+              },
+              {
+                "StorageLive": 10
+              },
+              {
+                "StorageLive": 11
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 11,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": false,
+                      "place": {
+                        "local": 9,
+                        "projections": [
+                          "Deref"
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 8,
+                    "col_start": 8,
+                    "line_end": 8,
+                    "col_end": 17
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "Call": {
+                "func": "__trust_total_clone",
+                "args": [
+                  {
+                    "Move": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  }
+                ],
+                "dest": {
+                  "local": 10,
+                  "projections": []
+                },
+                "target": 9,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 8,
+                  "col_start": 8,
+                  "line_end": 8,
+                  "col_end": 17
+                },
+                "atomic": null,
+                "is_foreign": false,
+                "is_unsafe_sig": false,
+                "unwind": "Continue",
+                "callee_identity": {
+                  "stable_crate_id": 17860114905107164610,
+                  "def_index": 3468,
+                  "substs_digest": [
+                    9092883830431496767,
+                    8914281392139740508
+                  ]
+                },
+                "callee_key": {
+                  "sysroot_item": "CloneClone",
+                  "krate_is_real_sysroot": true,
+                  "krate_name_is_ambiguous": false,
+                  "stable_crate_id": 17860114905107164610,
+                  "krate_name": "core"
+                }
+              }
+            }
+          },
+          {
+            "id": 4,
+            "stmts": [
+              {
+                "StorageLive": 6
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 6,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": false,
+                      "place": {
+                        "local": 1,
+                        "projections": [
+                          "Deref",
+                          {
+                            "Downcast": 2
+                          },
+                          {
+                            "Field": 0
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 7,
+                    "col_start": 8,
+                    "line_end": 7,
+                    "col_end": 14
+                  }
+                }
+              },
+              {
+                "StorageLive": 7
+              },
+              {
+                "StorageLive": 8
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 8,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": false,
+                      "place": {
+                        "local": 6,
+                        "projections": [
+                          "Deref"
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 7,
+                    "col_start": 8,
+                    "line_end": 7,
+                    "col_end": 14
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "Call": {
+                "func": "__trust_total_clone",
+                "args": [
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  }
+                ],
+                "dest": {
+                  "local": 7,
+                  "projections": []
+                },
+                "target": 8,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 7,
+                  "col_start": 8,
+                  "line_end": 7,
+                  "col_end": 14
+                },
+                "atomic": null,
+                "is_foreign": false,
+                "is_unsafe_sig": false,
+                "unwind": "Continue",
+                "callee_identity": {
+                  "stable_crate_id": 17860114905107164610,
+                  "def_index": 3468,
+                  "substs_digest": [
+                    8202493999803551806,
+                    2721416635326541962
+                  ]
+                },
+                "callee_key": {
+                  "sysroot_item": "CloneClone",
+                  "krate_is_real_sysroot": true,
+                  "krate_name_is_ambiguous": false,
+                  "stable_crate_id": 17860114905107164610,
+                  "krate_name": "core"
+                }
+              }
+            }
+          },
+          {
+            "id": 5,
+            "stmts": [
+              {
+                "StorageLive": 3
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 3,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": false,
+                      "place": {
+                        "local": 1,
+                        "projections": [
+                          "Deref",
+                          {
+                            "Downcast": 1
+                          },
+                          {
+                            "Field": 0
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 6,
+                    "col_start": 8,
+                    "line_end": 6,
+                    "col_end": 11
+                  }
+                }
+              },
+              {
+                "StorageLive": 4
+              },
+              {
+                "StorageLive": 5
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 5,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": false,
+                      "place": {
+                        "local": 3,
+                        "projections": [
+                          "Deref"
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 6,
+                    "col_start": 8,
+                    "line_end": 6,
+                    "col_end": 11
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "Call": {
+                "func": "__trust_total_clone",
+                "args": [
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ],
+                "dest": {
+                  "local": 4,
+                  "projections": []
+                },
+                "target": 7,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 6,
+                  "col_start": 8,
+                  "line_end": 6,
+                  "col_end": 11
+                },
+                "atomic": null,
+                "is_foreign": false,
+                "is_unsafe_sig": false,
+                "unwind": "Continue",
+                "callee_identity": {
+                  "stable_crate_id": 17860114905107164610,
+                  "def_index": 3468,
+                  "substs_digest": [
+                    17192387589042751175,
+                    9044903409831887707
+                  ]
+                },
+                "callee_key": {
+                  "sysroot_item": "CloneClone",
+                  "krate_is_real_sysroot": true,
+                  "krate_name_is_ambiguous": false,
+                  "stable_crate_id": 17860114905107164610,
+                  "krate_name": "core"
+                }
+              }
+            }
+          },
+          {
+            "id": 6,
+            "stmts": [
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "tinvrec::Json",
+                          "variant": 0,
+                          "active_field": null,
+                          "args": "tinvrec::Json"
+                        }
+                      },
+                      []
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 3,
+                    "col_start": 9,
+                    "line_end": 3,
+                    "col_end": 14
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "Goto": 11
+            }
+          },
+          {
+            "id": 7,
+            "stmts": [
+              {
+                "StorageDead": 5
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "tinvrec::Json",
+                          "variant": 1,
+                          "active_field": null,
+                          "args": "tinvrec::Json"
+                        }
+                      },
+                      [
+                        {
+                          "Move": {
+                            "local": 4,
+                            "projections": []
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 3,
+                    "col_start": 9,
+                    "line_end": 3,
+                    "col_end": 14
+                  }
+                }
+              },
+              {
+                "StorageDead": 4
+              },
+              {
+                "StorageDead": 3
+              }
+            ],
+            "terminator": {
+              "Goto": 11
+            }
+          },
+          {
+            "id": 8,
+            "stmts": [
+              {
+                "StorageDead": 8
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "tinvrec::Json",
+                          "variant": 2,
+                          "active_field": null,
+                          "args": "tinvrec::Json"
+                        }
+                      },
+                      [
+                        {
+                          "Move": {
+                            "local": 7,
+                            "projections": []
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 3,
+                    "col_start": 9,
+                    "line_end": 3,
+                    "col_end": 14
+                  }
+                }
+              },
+              {
+                "StorageDead": 7
+              },
+              {
+                "StorageDead": 6
+              }
+            ],
+            "terminator": {
+              "Goto": 11
+            }
+          },
+          {
+            "id": 9,
+            "stmts": [
+              {
+                "StorageDead": 11
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "tinvrec::Json",
+                          "variant": 3,
+                          "active_field": null,
+                          "args": "tinvrec::Json"
+                        }
+                      },
+                      [
+                        {
+                          "Move": {
+                            "local": 10,
+                            "projections": []
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 3,
+                    "col_start": 9,
+                    "line_end": 3,
+                    "col_end": 14
+                  }
+                }
+              },
+              {
+                "StorageDead": 10
+              },
+              {
+                "StorageDead": 9
+              }
+            ],
+            "terminator": {
+              "Goto": 11
+            }
+          },
+          {
+            "id": 10,
+            "stmts": [
+              {
+                "StorageDead": 14
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "tinvrec::Json",
+                          "variant": 4,
+                          "active_field": null,
+                          "args": "tinvrec::Json"
+                        }
+                      },
+                      [
+                        {
+                          "Move": {
+                            "local": 13,
+                            "projections": []
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 3,
+                    "col_start": 9,
+                    "line_end": 3,
+                    "col_end": 14
+                  }
+                }
+              },
+              {
+                "StorageDead": 13
+              },
+              {
+                "StorageDead": 12
+              }
+            ],
+            "terminator": {
+              "Goto": 11
+            }
+          },
+          {
+            "id": 11,
+            "stmts": [],
+            "terminator": "Return"
+          }
+        ],
+        "arg_count": 1,
+        "return_ty": {
+          "Datatype": {
+            "name": "tinvrec::Json",
+            "variants": []
+          }
+        },
+        "datatype_defs": {
+          "tinvrec::Json": {
+            "Adt": {
+              "name": "tinvrec::Json",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_0",
+                  {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                ],
+                [
+                  "__v2_0",
+                  {
+                    "Adt": {
+                      "name": "alloc::string::String",
+                      "fields": [
+                        [
+                          "vec",
+                          {
+                            "Seq": {
+                              "elem": {
+                                "Int": {
+                                  "width": 8,
+                                  "signed": false
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false,
+                      "faithful_enum_repr": null,
+                      "layout": null,
+                      "enum_layout": null,
+                      "adt_kind": "Struct"
+                    }
+                  }
+                ],
+                [
+                  "__v3_0",
+                  {
+                    "Seq": {
+                      "elem": {
+                        "Datatype": {
+                          "name": "tinvrec::Json",
+                          "variants": []
+                        }
+                      }
+                    }
+                  }
+                ],
+                [
+                  "__v4_0",
+                  {
+                    "Seq": {
+                      "elem": {
+                        "Tuple": [
+                          {
+                            "Adt": {
+                              "name": "alloc::string::String",
+                              "fields": [
+                                [
+                                  "vec",
+                                  {
+                                    "Seq": {
+                                      "elem": {
+                                        "Int": {
+                                          "width": 8,
+                                          "signed": false
+                                        }
+                                      }
+                                    }
+                                  }
+                                ]
+                              ],
+                              "variants": [],
+                              "disc_index_safe": false,
+                              "faithful_enum_repr": null,
+                              "layout": null,
+                              "enum_layout": null,
+                              "adt_kind": "Struct"
+                            }
+                          },
+                          {
+                            "Datatype": {
+                              "name": "tinvrec::Json",
+                              "variants": []
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Null",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "Num",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Float": {
+                          "width": 64
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Str",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Adt": {
+                          "name": "alloc::string::String",
+                          "fields": [
+                            [
+                              "vec",
+                              {
+                                "Seq": {
+                                  "elem": {
+                                    "Int": {
+                                      "width": 8,
+                                      "signed": false
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Arr",
+                  "discriminant": 3,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Seq": {
+                          "elem": {
+                            "Datatype": {
+                              "name": "tinvrec::Json",
+                              "variants": []
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Obj",
+                  "discriminant": 4,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Seq": {
+                          "elem": {
+                            "Tuple": [
+                              {
+                                "Adt": {
+                                  "name": "alloc::string::String",
+                                  "fields": [
+                                    [
+                                      "vec",
+                                      {
+                                        "Seq": {
+                                          "elem": {
+                                            "Int": {
+                                              "width": 8,
+                                              "signed": false
+                                            }
+                                          }
+                                        }
+                                      }
+                                    ]
+                                  ],
+                                  "variants": [],
+                                  "disc_index_safe": false,
+                                  "faithful_enum_repr": null,
+                                  "layout": null,
+                                  "enum_layout": null,
+                                  "adt_kind": "Struct"
+                                }
+                              },
+                              {
+                                "Datatype": {
+                                  "name": "tinvrec::Json",
+                                  "variants": []
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          }
+        }
+      },
+      "contracts": [],
+      "preconditions": [
+        {
+          "Or": [
+            {
+              "Eq": [
+                {
+                  "Var": [
+                    "_2",
+                    "Int"
+                  ]
+                },
+                {
+                  "Int": 0
+                }
+              ]
+            },
+            {
+              "Eq": [
+                {
+                  "Var": [
+                    "_2",
+                    "Int"
+                  ]
+                },
+                {
+                  "Int": 1
+                }
+              ]
+            },
+            {
+              "Eq": [
+                {
+                  "Var": [
+                    "_2",
+                    "Int"
+                  ]
+                },
+                {
+                  "Int": 2
+                }
+              ]
+            },
+            {
+              "Eq": [
+                {
+                  "Var": [
+                    "_2",
+                    "Int"
+                  ]
+                },
+                {
+                  "Int": 3
+                }
+              ]
+            },
+            {
+              "Eq": [
+                {
+                  "Var": [
+                    "_2",
+                    "Int"
+                  ]
+                },
+                {
+                  "Int": 4
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "postconditions": [],
+      "spec": {
+        "requires": [],
+        "ensures": [],
+        "invariants": []
+      }
+    }
+  },
+  {
+    "identity": {
+      "stable_crate_id": 5191966108663675485,
+      "def_index": 21,
+      "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+      ]
+    },
+    "func": {
+      "name": "Arr",
+      "def_path": "tinvrec::Json::Arr",
+      "span": {
+        "file": "tinv_recursive_reach_fx.rs",
+        "line_start": 8,
+        "col_start": 4,
+        "line_end": 8,
+        "col_end": 7
+      },
+      "body": {
+        "locals": [
+          {
+            "index": 0,
+            "ty": {
+              "Datatype": {
+                "name": "tinvrec::Json",
+                "variants": []
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 1,
+            "ty": {
+              "Seq": {
+                "elem": {
+                  "Datatype": {
+                    "name": "tinvrec::Json",
+                    "variants": []
+                  }
+                }
+              }
+            },
+            "name": null
+          }
+        ],
+        "blocks": [
+          {
+            "id": 0,
+            "stmts": [
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "tinvrec::Json",
+                          "variant": 3,
+                          "active_field": null,
+                          "args": "tinvrec::Json"
+                        }
+                      },
+                      [
+                        {
+                          "Move": {
+                            "local": 1,
+                            "projections": []
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 8,
+                    "col_start": 4,
+                    "line_end": 8,
+                    "col_end": 7
+                  }
+                }
+              }
+            ],
+            "terminator": "Return"
+          }
+        ],
+        "arg_count": 1,
+        "return_ty": {
+          "Datatype": {
+            "name": "tinvrec::Json",
+            "variants": []
+          }
+        },
+        "datatype_defs": {
+          "tinvrec::Json": {
+            "Adt": {
+              "name": "tinvrec::Json",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_0",
+                  {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                ],
+                [
+                  "__v2_0",
+                  {
+                    "Adt": {
+                      "name": "alloc::string::String",
+                      "fields": [
+                        [
+                          "vec",
+                          {
+                            "Seq": {
+                              "elem": {
+                                "Int": {
+                                  "width": 8,
+                                  "signed": false
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false,
+                      "faithful_enum_repr": null,
+                      "layout": null,
+                      "enum_layout": null,
+                      "adt_kind": "Struct"
+                    }
+                  }
+                ],
+                [
+                  "__v3_0",
+                  {
+                    "Seq": {
+                      "elem": {
+                        "Datatype": {
+                          "name": "tinvrec::Json",
+                          "variants": []
+                        }
+                      }
+                    }
+                  }
+                ],
+                [
+                  "__v4_0",
+                  {
+                    "Seq": {
+                      "elem": {
+                        "Tuple": [
+                          {
+                            "Adt": {
+                              "name": "alloc::string::String",
+                              "fields": [
+                                [
+                                  "vec",
+                                  {
+                                    "Seq": {
+                                      "elem": {
+                                        "Int": {
+                                          "width": 8,
+                                          "signed": false
+                                        }
+                                      }
+                                    }
+                                  }
+                                ]
+                              ],
+                              "variants": [],
+                              "disc_index_safe": false,
+                              "faithful_enum_repr": null,
+                              "layout": null,
+                              "enum_layout": null,
+                              "adt_kind": "Struct"
+                            }
+                          },
+                          {
+                            "Datatype": {
+                              "name": "tinvrec::Json",
+                              "variants": []
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Null",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "Num",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Float": {
+                          "width": 64
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Str",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Adt": {
+                          "name": "alloc::string::String",
+                          "fields": [
+                            [
+                              "vec",
+                              {
+                                "Seq": {
+                                  "elem": {
+                                    "Int": {
+                                      "width": 8,
+                                      "signed": false
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Arr",
+                  "discriminant": 3,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Seq": {
+                          "elem": {
+                            "Datatype": {
+                              "name": "tinvrec::Json",
+                              "variants": []
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Obj",
+                  "discriminant": 4,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Seq": {
+                          "elem": {
+                            "Tuple": [
+                              {
+                                "Adt": {
+                                  "name": "alloc::string::String",
+                                  "fields": [
+                                    [
+                                      "vec",
+                                      {
+                                        "Seq": {
+                                          "elem": {
+                                            "Int": {
+                                              "width": 8,
+                                              "signed": false
+                                            }
+                                          }
+                                        }
+                                      }
+                                    ]
+                                  ],
+                                  "variants": [],
+                                  "disc_index_safe": false,
+                                  "faithful_enum_repr": null,
+                                  "layout": null,
+                                  "enum_layout": null,
+                                  "adt_kind": "Struct"
+                                }
+                              },
+                              {
+                                "Datatype": {
+                                  "name": "tinvrec::Json",
+                                  "variants": []
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          }
+        }
+      },
+      "contracts": [],
+      "preconditions": [],
+      "postconditions": [],
+      "spec": {
+        "requires": [],
+        "ensures": [],
+        "invariants": []
+      }
+    }
+  },
+  {
+    "identity": {
+      "stable_crate_id": 5191966108663675485,
+      "def_index": 15,
+      "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+      ]
+    },
+    "func": {
+      "name": "Num",
+      "def_path": "tinvrec::Json::Num",
+      "span": {
+        "file": "tinv_recursive_reach_fx.rs",
+        "line_start": 6,
+        "col_start": 4,
+        "line_end": 6,
+        "col_end": 7
+      },
+      "body": {
+        "locals": [
+          {
+            "index": 0,
+            "ty": {
+              "Datatype": {
+                "name": "tinvrec::Json",
+                "variants": []
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 1,
+            "ty": {
+              "Float": {
+                "width": 64
+              }
+            },
+            "name": null
+          }
+        ],
+        "blocks": [
+          {
+            "id": 0,
+            "stmts": [
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "tinvrec::Json",
+                          "variant": 1,
+                          "active_field": null,
+                          "args": "tinvrec::Json"
+                        }
+                      },
+                      [
+                        {
+                          "Move": {
+                            "local": 1,
+                            "projections": []
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 6,
+                    "col_start": 4,
+                    "line_end": 6,
+                    "col_end": 7
+                  }
+                }
+              }
+            ],
+            "terminator": "Return"
+          }
+        ],
+        "arg_count": 1,
+        "return_ty": {
+          "Datatype": {
+            "name": "tinvrec::Json",
+            "variants": []
+          }
+        },
+        "datatype_defs": {
+          "tinvrec::Json": {
+            "Adt": {
+              "name": "tinvrec::Json",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_0",
+                  {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                ],
+                [
+                  "__v2_0",
+                  {
+                    "Adt": {
+                      "name": "alloc::string::String",
+                      "fields": [
+                        [
+                          "vec",
+                          {
+                            "Seq": {
+                              "elem": {
+                                "Int": {
+                                  "width": 8,
+                                  "signed": false
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false,
+                      "faithful_enum_repr": null,
+                      "layout": null,
+                      "enum_layout": null,
+                      "adt_kind": "Struct"
+                    }
+                  }
+                ],
+                [
+                  "__v3_0",
+                  {
+                    "Seq": {
+                      "elem": {
+                        "Datatype": {
+                          "name": "tinvrec::Json",
+                          "variants": []
+                        }
+                      }
+                    }
+                  }
+                ],
+                [
+                  "__v4_0",
+                  {
+                    "Seq": {
+                      "elem": {
+                        "Tuple": [
+                          {
+                            "Adt": {
+                              "name": "alloc::string::String",
+                              "fields": [
+                                [
+                                  "vec",
+                                  {
+                                    "Seq": {
+                                      "elem": {
+                                        "Int": {
+                                          "width": 8,
+                                          "signed": false
+                                        }
+                                      }
+                                    }
+                                  }
+                                ]
+                              ],
+                              "variants": [],
+                              "disc_index_safe": false,
+                              "faithful_enum_repr": null,
+                              "layout": null,
+                              "enum_layout": null,
+                              "adt_kind": "Struct"
+                            }
+                          },
+                          {
+                            "Datatype": {
+                              "name": "tinvrec::Json",
+                              "variants": []
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Null",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "Num",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Float": {
+                          "width": 64
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Str",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Adt": {
+                          "name": "alloc::string::String",
+                          "fields": [
+                            [
+                              "vec",
+                              {
+                                "Seq": {
+                                  "elem": {
+                                    "Int": {
+                                      "width": 8,
+                                      "signed": false
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Arr",
+                  "discriminant": 3,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Seq": {
+                          "elem": {
+                            "Datatype": {
+                              "name": "tinvrec::Json",
+                              "variants": []
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Obj",
+                  "discriminant": 4,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Seq": {
+                          "elem": {
+                            "Tuple": [
+                              {
+                                "Adt": {
+                                  "name": "alloc::string::String",
+                                  "fields": [
+                                    [
+                                      "vec",
+                                      {
+                                        "Seq": {
+                                          "elem": {
+                                            "Int": {
+                                              "width": 8,
+                                              "signed": false
+                                            }
+                                          }
+                                        }
+                                      }
+                                    ]
+                                  ],
+                                  "variants": [],
+                                  "disc_index_safe": false,
+                                  "faithful_enum_repr": null,
+                                  "layout": null,
+                                  "enum_layout": null,
+                                  "adt_kind": "Struct"
+                                }
+                              },
+                              {
+                                "Datatype": {
+                                  "name": "tinvrec::Json",
+                                  "variants": []
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          }
+        }
+      },
+      "contracts": [],
+      "preconditions": [],
+      "postconditions": [],
+      "spec": {
+        "requires": [],
+        "ensures": [],
+        "invariants": []
+      }
+    }
+  },
+  {
+    "identity": {
+      "stable_crate_id": 5191966108663675485,
+      "def_index": 24,
+      "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+      ]
+    },
+    "func": {
+      "name": "Obj",
+      "def_path": "tinvrec::Json::Obj",
+      "span": {
+        "file": "tinv_recursive_reach_fx.rs",
+        "line_start": 9,
+        "col_start": 4,
+        "line_end": 9,
+        "col_end": 7
+      },
+      "body": {
+        "locals": [
+          {
+            "index": 0,
+            "ty": {
+              "Datatype": {
+                "name": "tinvrec::Json",
+                "variants": []
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 1,
+            "ty": {
+              "Seq": {
+                "elem": {
+                  "Tuple": [
+                    {
+                      "Adt": {
+                        "name": "alloc::string::String",
+                        "fields": [
+                          [
+                            "vec",
+                            {
+                              "Seq": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                }
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    },
+                    {
+                      "Datatype": {
+                        "name": "tinvrec::Json",
+                        "variants": []
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "name": null
+          }
+        ],
+        "blocks": [
+          {
+            "id": 0,
+            "stmts": [
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "tinvrec::Json",
+                          "variant": 4,
+                          "active_field": null,
+                          "args": "tinvrec::Json"
+                        }
+                      },
+                      [
+                        {
+                          "Move": {
+                            "local": 1,
+                            "projections": []
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 9,
+                    "col_start": 4,
+                    "line_end": 9,
+                    "col_end": 7
+                  }
+                }
+              }
+            ],
+            "terminator": "Return"
+          }
+        ],
+        "arg_count": 1,
+        "return_ty": {
+          "Datatype": {
+            "name": "tinvrec::Json",
+            "variants": []
+          }
+        },
+        "datatype_defs": {
+          "tinvrec::Json": {
+            "Adt": {
+              "name": "tinvrec::Json",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_0",
+                  {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                ],
+                [
+                  "__v2_0",
+                  {
+                    "Adt": {
+                      "name": "alloc::string::String",
+                      "fields": [
+                        [
+                          "vec",
+                          {
+                            "Seq": {
+                              "elem": {
+                                "Int": {
+                                  "width": 8,
+                                  "signed": false
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false,
+                      "faithful_enum_repr": null,
+                      "layout": null,
+                      "enum_layout": null,
+                      "adt_kind": "Struct"
+                    }
+                  }
+                ],
+                [
+                  "__v3_0",
+                  {
+                    "Seq": {
+                      "elem": {
+                        "Datatype": {
+                          "name": "tinvrec::Json",
+                          "variants": []
+                        }
+                      }
+                    }
+                  }
+                ],
+                [
+                  "__v4_0",
+                  {
+                    "Seq": {
+                      "elem": {
+                        "Tuple": [
+                          {
+                            "Adt": {
+                              "name": "alloc::string::String",
+                              "fields": [
+                                [
+                                  "vec",
+                                  {
+                                    "Seq": {
+                                      "elem": {
+                                        "Int": {
+                                          "width": 8,
+                                          "signed": false
+                                        }
+                                      }
+                                    }
+                                  }
+                                ]
+                              ],
+                              "variants": [],
+                              "disc_index_safe": false,
+                              "faithful_enum_repr": null,
+                              "layout": null,
+                              "enum_layout": null,
+                              "adt_kind": "Struct"
+                            }
+                          },
+                          {
+                            "Datatype": {
+                              "name": "tinvrec::Json",
+                              "variants": []
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Null",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "Num",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Float": {
+                          "width": 64
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Str",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Adt": {
+                          "name": "alloc::string::String",
+                          "fields": [
+                            [
+                              "vec",
+                              {
+                                "Seq": {
+                                  "elem": {
+                                    "Int": {
+                                      "width": 8,
+                                      "signed": false
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Arr",
+                  "discriminant": 3,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Seq": {
+                          "elem": {
+                            "Datatype": {
+                              "name": "tinvrec::Json",
+                              "variants": []
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Obj",
+                  "discriminant": 4,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Seq": {
+                          "elem": {
+                            "Tuple": [
+                              {
+                                "Adt": {
+                                  "name": "alloc::string::String",
+                                  "fields": [
+                                    [
+                                      "vec",
+                                      {
+                                        "Seq": {
+                                          "elem": {
+                                            "Int": {
+                                              "width": 8,
+                                              "signed": false
+                                            }
+                                          }
+                                        }
+                                      }
+                                    ]
+                                  ],
+                                  "variants": [],
+                                  "disc_index_safe": false,
+                                  "faithful_enum_repr": null,
+                                  "layout": null,
+                                  "enum_layout": null,
+                                  "adt_kind": "Struct"
+                                }
+                              },
+                              {
+                                "Datatype": {
+                                  "name": "tinvrec::Json",
+                                  "variants": []
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          }
+        }
+      },
+      "contracts": [],
+      "preconditions": [],
+      "postconditions": [],
+      "spec": {
+        "requires": [],
+        "ensures": [],
+        "invariants": []
+      }
+    }
+  },
+  {
+    "identity": {
+      "stable_crate_id": 5191966108663675485,
+      "def_index": 18,
+      "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+      ]
+    },
+    "func": {
+      "name": "Str",
+      "def_path": "tinvrec::Json::Str",
+      "span": {
+        "file": "tinv_recursive_reach_fx.rs",
+        "line_start": 7,
+        "col_start": 4,
+        "line_end": 7,
+        "col_end": 7
+      },
+      "body": {
+        "locals": [
+          {
+            "index": 0,
+            "ty": {
+              "Datatype": {
+                "name": "tinvrec::Json",
+                "variants": []
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 1,
+            "ty": {
+              "Adt": {
+                "name": "alloc::string::String",
+                "fields": [
+                  [
+                    "vec",
+                    {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            },
+            "name": null
+          }
+        ],
+        "blocks": [
+          {
+            "id": 0,
+            "stmts": [
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "tinvrec::Json",
+                          "variant": 2,
+                          "active_field": null,
+                          "args": "tinvrec::Json"
+                        }
+                      },
+                      [
+                        {
+                          "Move": {
+                            "local": 1,
+                            "projections": []
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 7,
+                    "col_start": 4,
+                    "line_end": 7,
+                    "col_end": 7
+                  }
+                }
+              }
+            ],
+            "terminator": "Return"
+          }
+        ],
+        "arg_count": 1,
+        "return_ty": {
+          "Datatype": {
+            "name": "tinvrec::Json",
+            "variants": []
+          }
+        },
+        "datatype_defs": {
+          "tinvrec::Json": {
+            "Adt": {
+              "name": "tinvrec::Json",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_0",
+                  {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                ],
+                [
+                  "__v2_0",
+                  {
+                    "Adt": {
+                      "name": "alloc::string::String",
+                      "fields": [
+                        [
+                          "vec",
+                          {
+                            "Seq": {
+                              "elem": {
+                                "Int": {
+                                  "width": 8,
+                                  "signed": false
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false,
+                      "faithful_enum_repr": null,
+                      "layout": null,
+                      "enum_layout": null,
+                      "adt_kind": "Struct"
+                    }
+                  }
+                ],
+                [
+                  "__v3_0",
+                  {
+                    "Seq": {
+                      "elem": {
+                        "Datatype": {
+                          "name": "tinvrec::Json",
+                          "variants": []
+                        }
+                      }
+                    }
+                  }
+                ],
+                [
+                  "__v4_0",
+                  {
+                    "Seq": {
+                      "elem": {
+                        "Tuple": [
+                          {
+                            "Adt": {
+                              "name": "alloc::string::String",
+                              "fields": [
+                                [
+                                  "vec",
+                                  {
+                                    "Seq": {
+                                      "elem": {
+                                        "Int": {
+                                          "width": 8,
+                                          "signed": false
+                                        }
+                                      }
+                                    }
+                                  }
+                                ]
+                              ],
+                              "variants": [],
+                              "disc_index_safe": false,
+                              "faithful_enum_repr": null,
+                              "layout": null,
+                              "enum_layout": null,
+                              "adt_kind": "Struct"
+                            }
+                          },
+                          {
+                            "Datatype": {
+                              "name": "tinvrec::Json",
+                              "variants": []
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Null",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "Num",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Float": {
+                          "width": 64
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Str",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Adt": {
+                          "name": "alloc::string::String",
+                          "fields": [
+                            [
+                              "vec",
+                              {
+                                "Seq": {
+                                  "elem": {
+                                    "Int": {
+                                      "width": 8,
+                                      "signed": false
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Arr",
+                  "discriminant": 3,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Seq": {
+                          "elem": {
+                            "Datatype": {
+                              "name": "tinvrec::Json",
+                              "variants": []
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Obj",
+                  "discriminant": 4,
+                  "fields": [
+                    [
+                      "0",
+                      {
+                        "Seq": {
+                          "elem": {
+                            "Tuple": [
+                              {
+                                "Adt": {
+                                  "name": "alloc::string::String",
+                                  "fields": [
+                                    [
+                                      "vec",
+                                      {
+                                        "Seq": {
+                                          "elem": {
+                                            "Int": {
+                                              "width": 8,
+                                              "signed": false
+                                            }
+                                          }
+                                        }
+                                      }
+                                    ]
+                                  ],
+                                  "variants": [],
+                                  "disc_index_safe": false,
+                                  "faithful_enum_repr": null,
+                                  "layout": null,
+                                  "enum_layout": null,
+                                  "adt_kind": "Struct"
+                                }
+                              },
+                              {
+                                "Datatype": {
+                                  "name": "tinvrec::Json",
+                                  "variants": []
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          }
+        }
+      },
+      "contracts": [],
+      "preconditions": [],
+      "postconditions": [],
+      "spec": {
+        "requires": [],
+        "ensures": [],
+        "invariants": []
+      }
+    }
+  },
+  {
+    "identity": {
+      "stable_crate_id": 5191966108663675485,
+      "def_index": 9,
+      "substs_digest": [
+        13503156978159448136,
+        2716896576507566245
+      ]
+    },
+    "func": {
+      "name": "bump",
+      "def_path": "tinvrec::P::<'_>::bump",
+      "span": {
+        "file": "tinv_recursive_reach_fx.rs",
+        "line_start": 18,
+        "col_start": 4,
+        "line_end": 22,
+        "col_end": 5
+      },
+      "body": {
+        "locals": [
+          {
+            "index": 0,
+            "ty": {
+              "Adt": {
+                "name": "core::option::Option",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "None",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Some",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 1,
+            "ty": {
+              "Ref": {
+                "mutable": true,
+                "inner": {
+                  "Adt": {
+                    "name": "tinvrec::P",
+                    "fields": [
+                      [
+                        "b",
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": {
+                              "Slice": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "i",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              }
+            },
+            "name": "self"
+          },
+          {
+            "index": 2,
+            "ty": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "name": "c"
+          },
+          {
+            "index": 3,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 4,
+            "ty": {
+              "Adt": {
+                "name": "core::ops::control_flow::ControlFlow",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v0_0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Adt": {
+                        "name": "core::option::Option",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ],
+                          [
+                            "__v1_0",
+                            {
+                              "Adt": {
+                                "name": "core::convert::Infallible",
+                                "fields": [
+                                  [
+                                    "__tag",
+                                    {
+                                      "Int": {
+                                        "width": 64,
+                                        "signed": true
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Enum"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "None",
+                            "discriminant": 0,
+                            "fields": []
+                          },
+                          {
+                            "name": "Some",
+                            "discriminant": 1,
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Adt": {
+                                    "name": "core::convert::Infallible",
+                                    "fields": [
+                                      [
+                                        "__tag",
+                                        {
+                                          "Int": {
+                                            "width": 64,
+                                            "signed": true
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Enum"
+                                  }
+                                }
+                              ]
+                            ]
+                          }
+                        ],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "Continue",
+                    "discriminant": 0,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  {
+                    "name": "Break",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "core::option::Option",
+                            "fields": [
+                              [
+                                "__tag",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": true
+                                  }
+                                }
+                              ],
+                              [
+                                "__v1_0",
+                                {
+                                  "Adt": {
+                                    "name": "core::convert::Infallible",
+                                    "fields": [
+                                      [
+                                        "__tag",
+                                        {
+                                          "Int": {
+                                            "width": 64,
+                                            "signed": true
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Enum"
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [
+                              {
+                                "name": "None",
+                                "discriminant": 0,
+                                "fields": []
+                              },
+                              {
+                                "name": "Some",
+                                "discriminant": 1,
+                                "fields": [
+                                  [
+                                    "0",
+                                    {
+                                      "Adt": {
+                                        "name": "core::convert::Infallible",
+                                        "fields": [
+                                          [
+                                            "__tag",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": true
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Enum"
+                                      }
+                                    }
+                                  ]
+                                ]
+                              }
+                            ],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Enum"
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 5,
+            "ty": {
+              "Adt": {
+                "name": "core::option::Option",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "None",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Some",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 6,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 7,
+            "ty": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 8,
+            "ty": {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 9,
+            "ty": {
+              "Adt": {
+                "name": "core::option::Option",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Adt": {
+                        "name": "core::convert::Infallible",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "None",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Some",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "core::convert::Infallible",
+                            "fields": [
+                              [
+                                "__tag",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": true
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Enum"
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            },
+            "name": "residual"
+          },
+          {
+            "index": 10,
+            "ty": "Never",
+            "name": null
+          },
+          {
+            "index": 11,
+            "ty": {
+              "Adt": {
+                "name": "core::option::Option",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Adt": {
+                        "name": "core::convert::Infallible",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "None",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Some",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "core::convert::Infallible",
+                            "fields": [
+                              [
+                                "__tag",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": true
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Enum"
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 12,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            },
+            "name": "val"
+          },
+          {
+            "index": 13,
+            "ty": {
+              "Tuple": [
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                },
+                "Bool"
+              ]
+            },
+            "name": null
+          },
+          {
+            "index": 14,
+            "ty": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 15,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "name": null
+          }
+        ],
+        "blocks": [
+          {
+            "id": 0,
+            "stmts": [
+              {
+                "StorageLive": 2
+              },
+              {
+                "StorageLive": 3
+              },
+              {
+                "StorageLive": 4
+              },
+              {
+                "StorageLive": 5
+              },
+              {
+                "StorageLive": 6
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 15,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Use": {
+                      "Copy": {
+                        "local": 1,
+                        "projections": [
+                          "Deref",
+                          {
+                            "Field": 0
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 19,
+                    "col_start": 17,
+                    "line_end": 19,
+                    "col_end": 23
+                  }
+                }
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 6,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": false,
+                      "place": {
+                        "local": 15,
+                        "projections": [
+                          "Deref"
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 19,
+                    "col_start": 17,
+                    "line_end": 19,
+                    "col_end": 23
+                  }
+                }
+              },
+              {
+                "StorageLive": 7
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 7,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Use": {
+                      "Copy": {
+                        "local": 1,
+                        "projections": [
+                          "Deref",
+                          {
+                            "Field": 1
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 19,
+                    "col_start": 28,
+                    "line_end": 19,
+                    "col_end": 34
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "Call": {
+                "func": "core::slice::<impl [u8]>::get::<usize>",
+                "args": [
+                  {
+                    "Move": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  }
+                ],
+                "dest": {
+                  "local": 5,
+                  "projections": []
+                },
+                "target": 1,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 19,
+                  "col_start": 17,
+                  "line_end": 19,
+                  "col_end": 35
+                },
+                "atomic": null,
+                "is_foreign": false,
+                "is_unsafe_sig": false,
+                "unwind": "Continue",
+                "callee_identity": {
+                  "stable_crate_id": 17860114905107164610,
+                  "def_index": 15424,
+                  "substs_digest": [
+                    7188599374986519057,
+                    7171913466277952757
+                  ]
+                },
+                "callee_key": {
+                  "krate_is_real_sysroot": true,
+                  "krate_name_is_ambiguous": false,
+                  "stable_crate_id": 17860114905107164610,
+                  "krate_name": "core"
+                }
+              }
+            }
+          },
+          {
+            "id": 1,
+            "stmts": [
+              {
+                "StorageDead": 7
+              },
+              {
+                "StorageDead": 6
+              }
+            ],
+            "terminator": {
+              "Call": {
+                "func": "<core::option::Option<&u8> as core::ops::try_trait::Try>::branch::<__trust_try_total>",
+                "args": [
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ],
+                "dest": {
+                  "local": 4,
+                  "projections": []
+                },
+                "target": 2,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 19,
+                  "col_start": 17,
+                  "line_end": 19,
+                  "col_end": 36
+                },
+                "atomic": null,
+                "is_foreign": false,
+                "is_unsafe_sig": false,
+                "unwind": "Continue",
+                "callee_identity": {
+                  "stable_crate_id": 17860114905107164610,
+                  "def_index": 4755,
+                  "substs_digest": [
+                    4387412187717398358,
+                    12221873398335870718
+                  ]
+                },
+                "callee_key": {
+                  "sysroot_item": "TryBranch",
+                  "krate_is_real_sysroot": true,
+                  "krate_name_is_ambiguous": false,
+                  "stable_crate_id": 17860114905107164610,
+                  "krate_name": "core"
+                }
+              }
+            }
+          },
+          {
+            "id": 2,
+            "stmts": [
+              {
+                "StorageDead": 5
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 8,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Discriminant": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 19,
+                    "col_start": 17,
+                    "line_end": 19,
+                    "col_end": 36
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "SwitchInt": {
+                "discr": {
+                  "Move": {
+                    "local": 8,
+                    "projections": []
+                  }
+                },
+                "targets": [
+                  [
+                    0,
+                    4
+                  ],
+                  [
+                    1,
+                    5
+                  ]
+                ],
+                "otherwise": 3,
+                "exhaustive_enum_unreachable": true,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 19,
+                  "col_start": 17,
+                  "line_end": 19,
+                  "col_end": 36
+                }
+              }
+            }
+          },
+          {
+            "id": 3,
+            "stmts": [],
+            "terminator": "Unreachable"
+          },
+          {
+            "id": 4,
+            "stmts": [
+              {
+                "StorageLive": 12
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 12,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Use": {
+                      "Copy": {
+                        "local": 4,
+                        "projections": [
+                          {
+                            "Downcast": 0
+                          },
+                          {
+                            "Field": 0
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 19,
+                    "col_start": 17,
+                    "line_end": 19,
+                    "col_end": 36
+                  }
+                }
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 3,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Use": {
+                      "Copy": {
+                        "local": 12,
+                        "projections": []
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 19,
+                    "col_start": 17,
+                    "line_end": 19,
+                    "col_end": 36
+                  }
+                }
+              },
+              {
+                "StorageDead": 12
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 2,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Use": {
+                      "Copy": {
+                        "local": 3,
+                        "projections": [
+                          "Deref"
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 19,
+                    "col_start": 16,
+                    "line_end": 19,
+                    "col_end": 36
+                  }
+                }
+              },
+              {
+                "StorageDead": 4
+              },
+              {
+                "StorageDead": 3
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 13,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "CheckedBinaryOp": [
+                      "Add",
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": [
+                            "Deref",
+                            {
+                              "Field": 1
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "Constant": {
+                          "Uint": [
+                            1,
+                            64
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 20,
+                    "col_start": 8,
+                    "line_end": 20,
+                    "col_end": 19
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "Assert": {
+                "cond": {
+                  "Move": {
+                    "local": 13,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                },
+                "expected": false,
+                "msg": {
+                  "Overflow": "Add"
+                },
+                "target": 7,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 20,
+                  "col_start": 8,
+                  "line_end": 20,
+                  "col_end": 19
+                },
+                "unwind": "Continue"
+              }
+            }
+          },
+          {
+            "id": 5,
+            "stmts": [
+              {
+                "StorageLive": 9
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 9,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Use": {
+                      "Copy": {
+                        "local": 4,
+                        "projections": [
+                          {
+                            "Downcast": 1
+                          },
+                          {
+                            "Field": 0
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 19,
+                    "col_start": 35,
+                    "line_end": 19,
+                    "col_end": 36
+                  }
+                }
+              },
+              {
+                "StorageLive": 11
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 11,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Use": {
+                      "Copy": {
+                        "local": 9,
+                        "projections": []
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 19,
+                    "col_start": 35,
+                    "line_end": 19,
+                    "col_end": 36
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "Call": {
+                "func": "<core::option::Option<u8> as core::ops::try_trait::FromResidual<core::option::Option<core::convert::Infallible>>>::from_residual::<__trust_try_total>",
+                "args": [
+                  {
+                    "Move": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  }
+                ],
+                "dest": {
+                  "local": 0,
+                  "projections": []
+                },
+                "target": 6,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 19,
+                  "col_start": 17,
+                  "line_end": 19,
+                  "col_end": 36
+                },
+                "atomic": null,
+                "is_foreign": false,
+                "is_unsafe_sig": false,
+                "unwind": "Continue",
+                "callee_identity": {
+                  "stable_crate_id": 17860114905107164610,
+                  "def_index": 4758,
+                  "substs_digest": [
+                    3177671446984665720,
+                    8607099533385592150
+                  ]
+                },
+                "callee_key": {
+                  "krate_is_real_sysroot": true,
+                  "krate_name_is_ambiguous": false,
+                  "stable_crate_id": 17860114905107164610,
+                  "krate_name": "core"
+                }
+              }
+            }
+          },
+          {
+            "id": 6,
+            "stmts": [
+              {
+                "StorageDead": 11
+              },
+              {
+                "StorageDead": 9
+              },
+              {
+                "StorageDead": 4
+              },
+              {
+                "StorageDead": 3
+              },
+              {
+                "StorageDead": 2
+              }
+            ],
+            "terminator": {
+              "Goto": 8
+            }
+          },
+          {
+            "id": 7,
+            "stmts": [
+              {
+                "Assign": {
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  },
+                  "rvalue": {
+                    "Use": {
+                      "Move": {
+                        "local": 13,
+                        "projections": [
+                          {
+                            "Field": 0
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 20,
+                    "col_start": 8,
+                    "line_end": 20,
+                    "col_end": 19
+                  }
+                }
+              },
+              {
+                "StorageLive": 14
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 14,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Use": {
+                      "Copy": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 21,
+                    "col_start": 13,
+                    "line_end": 21,
+                    "col_end": 14
+                  }
+                }
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 0,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "core::option::Option",
+                          "variant": 1,
+                          "active_field": null,
+                          "args": "core::option::Option<u8>"
+                        }
+                      },
+                      [
+                        {
+                          "Move": {
+                            "local": 14,
+                            "projections": []
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 21,
+                    "col_start": 8,
+                    "line_end": 21,
+                    "col_end": 15
+                  }
+                }
+              },
+              {
+                "StorageDead": 14
+              },
+              {
+                "StorageDead": 2
+              }
+            ],
+            "terminator": {
+              "Goto": 8
+            }
+          },
+          {
+            "id": 8,
+            "stmts": [],
+            "terminator": "Return"
+          }
+        ],
+        "arg_count": 1,
+        "return_ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        }
+      },
+      "contracts": [],
+      "preconditions": [
+        {
+          "Or": [
+            {
+              "Eq": [
+                {
+                  "Var": [
+                    "_8",
+                    "Int"
+                  ]
+                },
+                {
+                  "Int": 0
+                }
+              ]
+            },
+            {
+              "Eq": [
+                {
+                  "Var": [
+                    "_8",
+                    "Int"
+                  ]
+                },
+                {
+                  "Int": 1
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "postconditions": [],
+      "spec": {
+        "requires": [],
+        "ensures": [],
+        "invariants": []
+      }
+    }
+  },
+  {
+    "identity": {
+      "stable_crate_id": 5191966108663675485,
+      "def_index": 10,
+      "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+      ]
+    },
+    "func": {
+      "name": "parse",
+      "def_path": "tinvrec::parse",
+      "span": {
+        "file": "tinv_recursive_reach_fx.rs",
+        "line_start": 25,
+        "col_start": 0,
+        "line_end": 28,
+        "col_end": 1
+      },
+      "body": {
+        "locals": [
+          {
+            "index": 0,
+            "ty": {
+              "Adt": {
+                "name": "core::option::Option",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "None",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Some",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 1,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "name": "b"
+          },
+          {
+            "index": 2,
+            "ty": {
+              "Adt": {
+                "name": "tinvrec::P",
+                "fields": [
+                  [
+                    "b",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Slice": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "i",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            },
+            "name": "p"
+          },
+          {
+            "index": 3,
+            "ty": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "name": null
+          },
+          {
+            "index": 4,
+            "ty": {
+              "Ref": {
+                "mutable": true,
+                "inner": {
+                  "Adt": {
+                    "name": "tinvrec::P",
+                    "fields": [
+                      [
+                        "b",
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": {
+                              "Slice": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "i",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              }
+            },
+            "name": null
+          }
+        ],
+        "blocks": [
+          {
+            "id": 0,
+            "stmts": [
+              {
+                "StorageLive": 2
+              },
+              {
+                "StorageLive": 3
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 3,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": false,
+                      "place": {
+                        "local": 1,
+                        "projections": [
+                          "Deref"
+                        ]
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 26,
+                    "col_start": 20,
+                    "line_end": 26,
+                    "col_end": 21
+                  }
+                }
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 2,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Aggregate": [
+                      {
+                        "Adt": {
+                          "name": "tinvrec::P",
+                          "variant": 0,
+                          "active_field": null,
+                          "args": "tinvrec::P<'_>"
+                        }
+                      },
+                      [
+                        {
+                          "Move": {
+                            "local": 3,
+                            "projections": []
+                          }
+                        },
+                        {
+                          "Constant": {
+                            "Uint": [
+                              0,
+                              64
+                            ]
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 26,
+                    "col_start": 16,
+                    "line_end": 26,
+                    "col_end": 29
+                  }
+                }
+              },
+              {
+                "StorageDead": 3
+              },
+              {
+                "StorageLive": 4
+              },
+              {
+                "Assign": {
+                  "place": {
+                    "local": 4,
+                    "projections": []
+                  },
+                  "rvalue": {
+                    "Ref": {
+                      "mutable": true,
+                      "place": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    }
+                  },
+                  "span": {
+                    "file": "tinv_recursive_reach_fx.rs",
+                    "line_start": 27,
+                    "col_start": 4,
+                    "line_end": 27,
+                    "col_end": 5
+                  }
+                }
+              }
+            ],
+            "terminator": {
+              "Call": {
+                "func": "tinvrec::P::<'_>::bump",
+                "args": [
+                  {
+                    "Move": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  }
+                ],
+                "dest": {
+                  "local": 0,
+                  "projections": []
+                },
+                "target": 1,
+                "span": {
+                  "file": "tinv_recursive_reach_fx.rs",
+                  "line_start": 27,
+                  "col_start": 4,
+                  "line_end": 27,
+                  "col_end": 12
+                },
+                "atomic": null,
+                "is_foreign": false,
+                "is_unsafe_sig": false,
+                "unwind": "Continue",
+                "callee_identity": {
+                  "stable_crate_id": 5191966108663675485,
+                  "def_index": 9,
+                  "substs_digest": [
+                    13503156978159448136,
+                    2716896576507566245
+                  ]
+                },
+                "callee_key": {
+                  "krate_is_real_sysroot": false,
+                  "krate_name_is_ambiguous": false,
+                  "stable_crate_id": 5191966108663675485,
+                  "krate_name": "tinvrec"
+                }
+              }
+            }
+          },
+          {
+            "id": 1,
+            "stmts": [
+              {
+                "StorageDead": 4
+              },
+              {
+                "StorageDead": 2
+              }
+            ],
+            "terminator": "Return"
+          }
+        ],
+        "arg_count": 1,
+        "return_ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        }
+      },
+      "contracts": [],
+      "preconditions": [],
+      "postconditions": [],
+      "spec": {
+        "requires": [],
+        "ensures": [],
+        "invariants": []
+      }
+    }
+  }
+]

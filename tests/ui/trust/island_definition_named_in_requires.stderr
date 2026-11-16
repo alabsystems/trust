@@ -1,0 +1,12 @@
+error: invalid `requires` clause: unsupported source-contract call `ident_isl`
+  --> $DIR/island_definition_named_in_requires.rs:49:14
+   |
+LL |     requires ident_isl(x) == x
+   |              ^^^^^^^^^^^^^^^^^
+   |
+   = note: `ident_isl` is a Clean island definition in this crate, not an unknown name: a `requires` payload is validated against the closed source-contract predicate vocabulary, which no island definition (and no Rust function) is a member of
+   = note: `ensures` is the one clause role with an island lane today — the kernel judges an island-calling postcondition against this function's imported defining equation — so the two sides of a signature are not governed by the same admission rule
+   = help: state the predicate in the clause grammar (comparisons, `&& || !`) and derive `ident_isl … = true` from it inside the Lean theorem, or keep `ident_isl` for an `ensures` clause
+
+error: aborting due to 1 previous error
+

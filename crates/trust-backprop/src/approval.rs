@@ -655,16 +655,4 @@ mod tests {
             ApprovalPolicy::Block,
         );
     }
-
-    // --- PendingRewrite tests ---
-
-    #[test]
-    fn test_pending_rewrite_reviewer_notes_default_none() {
-        let pr = PendingRewrite {
-            rewrite: make_rewrite("f", "a.rs", attr_kind()),
-            policy: ApprovalPolicy::Review,
-            reviewer_notes: None,
-        };
-        assert!(pr.reviewer_notes.is_none());
-    }
 }

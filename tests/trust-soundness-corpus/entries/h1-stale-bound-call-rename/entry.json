@@ -1,0 +1,48 @@
+{
+  "id": "h1-stale-bound-call-rename",
+  "class": "H1 (STALE-BOUND-CALL-RENAME)",
+  "title": "a range bound read through a reference was re-versioned at the index call, so a guard on the new value discharged the old range",
+  "origin": [
+    "KH:23794 (H1)",
+    "fix 252f3a9fbf in c054d5b16f",
+    "crates/trust-vcgen/tests/ploss_adv_false_proofs_realmir.rs::h1_stale_bound_renamed_at_the_call_is_never_proved",
+    "crates/trust-vcgen/tests/fixtures/ploss_adv/adv_ptrbound.rs (pb04)",
+    "crates/trust-vcgen/tests/fixtures/ploss_adv/h1_ctl.rs (pc02)"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "pb04_folded_ref_bound_bug",
+    "obligation": {
+      "kind": "slice",
+      "at": "buf[r].len()"
+    }
+  },
+  "twin": {
+    "function": "pc02_folded_ssa_local_ctl",
+    "obligation": {
+      "kind": "slice",
+      "at": "buf[..*z].len()"
+    }
+  },
+  "witness": {
+    "input": "m = 100, n = 3",
+    "observed": "range end index 100 out of range for slice of length 8",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  },
+  "opt_levels": [
+    "0",
+    "1"
+  ],
+  "expected_refusal": {
+    "trust-vc-syn": {
+      "reproducer": "has ambiguous multi-path return extraction (nested explicit return value with call expression) — postconditions referencing `result` would be unsound"
+    }
+  }
+}

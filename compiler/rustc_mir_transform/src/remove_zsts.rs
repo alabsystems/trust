@@ -4,16 +4,18 @@ use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 
+use crate::PassPolicy;
+
 pub(super) struct RemoveZsts;
 
 impl<'tcx> crate::MirPass<'tcx> for RemoveZsts {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() > 0
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 1)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         // Avoid query cycles (coroutines require optimized MIR for layout).
-        if tcx.type_of(body.source.def_id()).instantiate_identity().skip_norm_wip().is_coroutine() {
+        if tcx.is_coroutine(body.source.def_id()) {
             return;
         }
 
@@ -26,10 +28,6 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveZsts {
         for (bb, data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated_mut() {
             replacer.visit_basic_block_data(bb, data);
         }
-    }
-
-    fn is_required(&self) -> bool {
-        true
     }
 }
 
@@ -128,7 +126,10 @@ impl<'tcx> MutVisitor<'tcx> for Replacer<'_, 'tcx> {
                 Some(place)
             }
             StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
-                Some(local.into())
+                if self.known_to_be_zst(self.local_decls[local].ty) {
+                    statement.make_nop(true);
+                }
+                return;
             }
             StatementKind::Coverage(_)
             | StatementKind::Intrinsic(_)
@@ -136,7 +137,11 @@ impl<'tcx> MutVisitor<'tcx> for Replacer<'_, 'tcx> {
             | StatementKind::BackwardIncompatibleDropHint { .. }
             | StatementKind::ConstEvalCounter => None,
         };
+        // Under move-elimination semantics, direct ZST writes still serve to
+        // allocate the base local and give it an address. Genuinely unused
+        // assignments are later deleted by DSE.
         if let Some(place_for_ty) = place_for_ty
+            && place_for_ty.is_indirect()
             && let ty = place_for_ty.ty(self.local_decls, self.tcx).ty
             && self.known_to_be_zst(ty)
         {

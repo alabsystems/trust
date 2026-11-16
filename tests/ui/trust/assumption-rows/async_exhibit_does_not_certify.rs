@@ -95,7 +95,10 @@
 //@ check-fail
 //@ dont-check-compiler-stderr
 pub async fn tick(x: u32) -> u32 { x }
-//~^ WARN Trust Level 0 safety verification incomplete
-//~| ERROR coroutine executor-protocol premise is unproved
-//~| ERROR obligation(s) were not fully verified
+//~^ ERROR coroutine executor-protocol premise is unproved
+// RE-PINNED 2026-09-14 (measured, stage1 4d972edcfd and the sealed 43f8b339f pack alike):
+// the premise abort is the coroutine body's ONLY strict diagnostic. Its stamped
+// conditional rows are accounted in a NOTE ("N conditionally discharged (NOT proved),
+// … 1 skipped out of M obligation(s)"), not in the Level-0 incomplete WARN / "were not
+// fully verified" ERROR pair this file pinned at D2. Exit is still 1; nothing proves.
 //~? RAW Trust: ASSUMPTION [coroutine] `async_exhibit_does_not_certify::tick::{closure#0}`

@@ -8,9 +8,10 @@ use rustc_metadata::creader::MetadataLoaderDyn;
 use rustc_middle::dep_graph::WorkProductMap;
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::Providers;
-use rustc_session::Session;
-use rustc_session::config::{CrateType, OutputFilenames, PrintRequest};
+use rustc_session::config::{OutputFilenames, PrintRequest};
+use rustc_session::{CodegenBackendInit, EarlySession, IncrCompSession, Session};
 use rustc_span::Symbol;
+use rustc_structures::CrateType;
 
 use super::CodegenObject;
 use crate::back::archive::ArArchiveBuilderBuilder;
@@ -36,7 +37,9 @@ pub trait BackendTypes {
 pub trait CodegenBackend {
     fn name(&self) -> &'static str;
 
-    fn init(&self, _sess: &Session) {}
+    fn init(&mut self, _sess: &EarlySession) -> CodegenBackendInit {
+        Default::default()
+    }
 
     /// Answer a backend-owned `--print` request.
     ///
@@ -54,14 +57,14 @@ pub trait CodegenBackend {
 
     /// Collect target-specific options that should be set in `cfg(...)`, including
     /// `target_feature` and support for unstable float types.
-    fn target_config(&self, _sess: &Session) -> TargetConfig {
+    fn target_config(&self, _sess: &EarlySession) -> TargetConfig {
         TargetConfig {
-            target_features: vec![],
-            unstable_target_features: vec![],
+            internal_target_features: Default::default(),
             // `true` is used as a default so backends need to acknowledge when they do not
             // support the float types, rather than accidentally quietly skipping all tests.
             has_reliable_f16: true,
             has_reliable_f16_math: true,
+            has_reliable_f16b: true,
             has_reliable_f128: true,
             has_reliable_f128_math: true,
         }
@@ -77,6 +80,24 @@ pub trait CodegenBackend {
             CrateType::ProcMacro,
             CrateType::Sdylib,
         ]
+    }
+
+    /// Trust (WS7.10 / F-114): whether a requested crate type that
+    /// `supported_crate_types` does not advertise is a hard ERROR for this
+    /// session rather than rustc's default "dropping unsupported crate type"
+    /// warning.
+    ///
+    /// The default (`false`) keeps the upstream behaviour for every backend
+    /// that does not opt in. A backend returns `true` when dropping the type
+    /// would make a real compilation exit 0 without the artifact it was asked
+    /// for. It must return `false` for a print-only invocation that the driver
+    /// answers before codegen (Cargo's `--print=file-names --crate-type …`
+    /// capability probe reads a missing line as "unsupported"; an error there
+    /// would fail every Cargo build, including ones that need only supported
+    /// crate types), and for a driver mode that exits before codegen and link
+    /// (`-Zunpretty=<mode>`, `-Zno-analysis`), which emits no artifact at all.
+    fn unsupported_crate_type_is_fatal(&self, _sess: &Session) -> bool {
+        false
     }
 
     /// Returns crate types for which this backend can produce the complete
@@ -95,23 +116,6 @@ pub trait CodegenBackend {
     }
 
     fn print_version(&self) {}
-
-    /// Returns a list of all intrinsics that this backend definitely
-    /// replaces, which means their fallback bodies do not need to be monomorphized.
-    fn replaced_intrinsics(&self) -> Vec<Symbol> {
-        vec![]
-    }
-
-    /// Returns a list of all intrinsics that this backend definitely
-    /// does *not* replace, which means their fallback bodies can be MIR-inlined.
-    fn fallback_intrinsics(&self) -> Vec<Symbol> {
-        vec![]
-    }
-
-    /// Is ThinLTO supported by this backend?
-    fn thin_lto_supported(&self) -> bool {
-        true
-    }
 
     /// Value printed by `--print=backend-has-zstd`.
     ///
@@ -137,6 +141,8 @@ pub trait CodegenBackend {
         Box::new(crate::back::metadata::DefaultMetadataLoader)
     }
 
+    /// Allows queries to be overridden. Not used by any in-tree backends, but rustc_codegen_spirv
+    /// and rustc_codegen_nvvm use it.
     fn provide(&self, _providers: &mut Providers) {}
 
     fn target_cpu(&self, sess: &Session) -> String;
@@ -152,17 +158,10 @@ pub trait CodegenBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
+        incr_comp_session: Option<&IncrCompSession>,
         outputs: &OutputFilenames,
         crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap);
-
-    fn print_pass_timings(&self) {}
-
-    fn print_statistics(&self) {}
-
-    fn print_statistics_json(&self) -> String {
-        String::new()
-    }
 
     /// This is called on the returned [`CompiledModules`] from [`join_codegen`](Self::join_codegen).
     fn link(
@@ -201,5 +200,6 @@ pub trait ExtraBackendMethods: Send + Sync + DynSend + DynSync {
         &self,
         tcx: TyCtxt<'_>,
         cgu_name: Symbol,
+        bitcode_needed: bool,
     ) -> (ModuleCodegen<Self::Module>, u64);
 }

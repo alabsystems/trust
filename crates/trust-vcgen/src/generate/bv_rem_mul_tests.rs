@@ -89,6 +89,7 @@ fn mod_mul_func(lhs_div: Option<u128>, rhs_div: Option<u128>) -> VerifiableFunct
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -156,9 +157,11 @@ fn zero_divisor_rem_adds_no_bound() {
 /// checks downstream).
 ///
 /// THE HISTORY MATTERS, because this exact conjunct was retracted once. Adding
-/// the Int core makes the query a mixed QF_BV + NIA problem that ay answers
-/// with `internal-error`, which cost the class its refutation: an unguarded
-/// overflowing `a*b` went from `Failed` WITH A COUNTEREXAMPLE to `Unknown`.
+/// the Int core makes the query a mixed QF_BV + NIA problem ay has no combined
+/// decision procedure for (`incomplete`, phase `theory-combination`, its
+/// executor refusal as the detail; `internal-error` before ay's AD1 fix),
+/// which cost the class its refutation: an unguarded overflowing `a*b` went
+/// from `Failed` WITH A COUNTEREXAMPLE to `Unknown`.
 /// What makes it safe now is `trust-router`'s DISJOINT-COMPONENT REFUTATION
 /// lane, which refutes such a query component-wise. The pair is held together
 /// by `trust_router::in_process_ay_backend::tests::
@@ -202,7 +205,7 @@ fn unsigned_var_var_mul_vc_carries_authenticated_record() {
                     let terms: Vec<Formula> = paths
                         .iter()
                         .map(|p| match p {
-                            P::Raw => cur.clone(),
+                            P::Raw | P::Collapsed => cur.clone(),
                             P::Guarded { guards } => {
                                 let mut c = guards.clone();
                                 match cur.clone() {

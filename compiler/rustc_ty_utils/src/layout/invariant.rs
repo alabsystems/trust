@@ -1,8 +1,10 @@
 use std::assert_matches;
 
 use rustc_abi::{BackendRepr, FieldsShape, Scalar, Size, TagEncoding, Variants};
+use rustc_middle::ty;
+use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutCx, TyAndLayout};
-use rustc_middle::{bug, ty};
+use rustc_span::bug;
 
 /// Enforce some basic invariants on layouts.
 pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayout<'tcx>) {
@@ -31,6 +33,15 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
         assert!(
             layout.is_uninhabited(),
             "{:?} is type-level uninhabited but not ABI-uninhabited?",
+            layout.ty
+        );
+    }
+    // ABI uninhabitedness should imply opsem uninhabitedness. However, we can only check that if
+    // the type is really monomorphic (while we can compute a layout for some generic types).
+    if layout.is_uninhabited() && !layout.ty.has_param() {
+        assert!(
+            !layout.ty.is_opsem_inhabited(tcx, cx.typing_env),
+            "{:?} is ABI-uninhabited but not opsem-uninhabited?",
             layout.ty
         );
     }
@@ -88,7 +99,7 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
         let size = layout.backend_repr.scalar_size(cx);
         if let Some(align) = align {
             assert_eq!(
-                layout.layout.align().abi,
+                layout.layout.align(),
                 align,
                 "alignment mismatch between ABI and layout in {layout:#?}"
             );
@@ -145,7 +156,7 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
                         );
                         assert_eq!(field.size, size, "`Scalar` field with bad size in {inner:#?}",);
                         assert_eq!(
-                            field.align.abi, align,
+                            field.align, align,
                             "`Scalar` field with bad align in {inner:#?}",
                         );
                         assert!(
@@ -158,14 +169,20 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
                     }
                 }
             }
-            BackendRepr::ScalarPair(scalar1, scalar2) => {
+            BackendRepr::ScalarPair { a: scalar1, b: scalar2, b_offset } => {
                 // Check that the underlying pair of fields matches.
                 let inner = skip_newtypes(cx, layout);
                 assert!(
-                    matches!(inner.layout.backend_repr(), BackendRepr::ScalarPair(..)),
+                    matches!(inner.layout.backend_repr(), BackendRepr::ScalarPair { .. }),
                     "`ScalarPair` type {} is newtype around non-`ScalarPair` type {}",
                     layout.ty,
                     inner.ty
+                );
+                // `a` is at memory offset zero, so to keep them from overlapping the offset
+                // to `b` must be at least as much as the size of `a`.
+                assert!(
+                    b_offset >= scalar1.size(cx),
+                    "`ScalarPair` scalars are overlapping in {layout:?}",
                 );
                 if matches!(inner.layout.variants(), Variants::Multiple { .. }) {
                     // FIXME: ScalarPair for enums is enormously complicated and it is very hard
@@ -208,9 +225,9 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
                 };
                 // The fields should be at the right offset, and match the `scalar` layout.
                 let size1 = scalar1.size(cx);
-                let align1 = scalar1.default_align(cx).abi;
+                let align1 = scalar1.default_align(cx);
                 let size2 = scalar2.size(cx);
-                let align2 = scalar2.default_align(cx).abi;
+                let align2 = scalar2.default_align(cx);
                 assert_eq!(
                     offset1,
                     Size::ZERO,
@@ -221,7 +238,7 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
                     "`ScalarPair` first field with bad size in {inner:#?}",
                 );
                 assert_eq!(
-                    field1.align.abi, align1,
+                    field1.align, align1,
                     "`ScalarPair` first field with bad align in {inner:#?}",
                 );
                 assert_matches!(
@@ -235,11 +252,15 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
                     "`ScalarPair` second field at bad offset in {inner:#?}",
                 );
                 assert_eq!(
+                    b_offset, field2_offset,
+                    "`ScalarPair` with inconsistent b_offset in {inner:#?}",
+                );
+                assert_eq!(
                     field2.size, size2,
                     "`ScalarPair` second field with bad size in {inner:#?}",
                 );
                 assert_eq!(
-                    field2.align.abi, align2,
+                    field2.align, align2,
                     "`ScalarPair` second field with bad align in {inner:#?}",
                 );
                 assert_matches!(
@@ -249,14 +270,14 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
                 );
             }
             BackendRepr::SimdVector { element, count } => {
-                let align = layout.align.abi;
+                let align = layout.align;
                 let size = layout.size;
-                let element_align = element.default_align(cx).abi;
+                let element_align = element.default_align(cx);
                 let element_size = element.size(cx);
                 // Currently, vectors must always be aligned to at least their elements:
                 assert!(align >= element_align);
                 // And the size has to be element * count plus alignment padding, of course
-                assert!(size == (element_size * count).align_to(align));
+                assert!(size == (element_size * count.as_u64()).align_to(align));
             }
             BackendRepr::Memory { .. } | BackendRepr::SimdScalableVector { .. } => {} // Nothing to check.
         }
@@ -289,16 +310,10 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
                     }
 
                     // Ensure that for niche encoded tags the discriminant coincides with the variant index.
-                    let val = layout.ty.discriminant_for_variant(tcx, idx).unwrap().val;
-                    if val != u128::from(idx.as_u32()) {
-                        let adt_def = layout.ty.ty_adt_def().unwrap();
-                        cx.tcx().dcx().span_delayed_bug(
-                            cx.tcx().def_span(adt_def.did()),
-                            format!(
-                                "variant {idx:?} has discriminant {val:?} in niche-encoded type"
-                            ),
-                        );
-                    }
+                    assert_eq!(
+                        layout.ty.discriminant_for_variant(tcx, idx).unwrap().val,
+                        u128::from(idx.as_u32()),
+                    );
                 }
             }
             for variant in variants.iter() {
@@ -325,8 +340,11 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
                 };
                 let abi_coherent = match (layout.backend_repr, variant.backend_repr) {
                     (BackendRepr::Scalar(s1), BackendRepr::Scalar(s2)) => scalar_coherent(s1, s2),
-                    (BackendRepr::ScalarPair(a1, b1), BackendRepr::ScalarPair(a2, b2)) => {
-                        scalar_coherent(a1, a2) && scalar_coherent(b1, b2)
+                    (
+                        BackendRepr::ScalarPair { a: a1, b: b1, b_offset: b1_offset },
+                        BackendRepr::ScalarPair { a: a2, b: b2, b_offset: b2_offset },
+                    ) => {
+                        scalar_coherent(a1, a2) && scalar_coherent(b1, b2) && b1_offset == b2_offset
                     }
                     (BackendRepr::Memory { .. }, _) => true,
                     _ => false,

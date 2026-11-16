@@ -1,0 +1,46 @@
+# Identities for the HAND-EDITED adv2t.trust_ir (see its header): adv2's,
+# with the added `std::thread::spawn` call.
+body adv_drop_dup pub
+body adv_drop_dup_explicit pub
+body adv_owner_closed pub
+body adv_strip_via_for pub
+body adv_close_via_for pub
+body adv_unstrip_all pub
+body adv_match_pid pub
+spawners
+product-census
+
+effects "<DupOnDrop as std::ops::Drop>::drop" 9:34=dup
+effects adv_drop_dup 11:4=std::thread::spawn 12:23=fork 15:39=fcntl 19:17=execv 19:42=_exit
+effects adv_drop_dup_explicit 26:23=fork 29:39=fcntl 31:8=std::mem::drop 32:17=execv 32:42=_exit
+effects "<Fd as std::ops::Drop>::drop" 41:34=close
+effects adv_owner_closed 44:23=fork 47:39=fcntl 49:33=dup 51:17=execv 51:42=_exit
+effects mark 58:28=fcntl
+# The `for` calls `mark`; the producer's summary erased it (a bare `ret`).
+effects strip_for 59:48=mark
+effects adv_strip_via_for 61:23=fork 63:8=strip_for 64:17=execv 64:42=_exit
+effects close_dup_for 71:52=close
+effects adv_close_via_for 73:23=fork 76:39=fcntl 77:17=dup2 78:8=close_dup_for 79:17=execv 79:42=_exit
+effects adv_unstrip_all 87:23=fork 90:39=fcntl 91:17=execv 91:42=_exit
+effects "adv_move_closure::{closure#0}" 103:47=dup
+effects "adv_generic_closure::{closure#0}" 117:31=dup
+effects adv_match_pid 125:19=fork 128:43=fcntl 129:21=dup 130:21=execv 130:46=_exit
+site adv_move_closure 98:23=fork 101:39=fcntl 104:17=execv
+site adv_generic_closure 112:23=fork 115:39=fcntl 118:17=execv
+
+drops "<DupOnDrop as std::ops::Drop>::drop"
+# `let _g = DupOnDrop { src: 1 }`: a guard whose Drop impl dups.
+drops adv_drop_dup DupOnDrop
+drops adv_drop_dup_explicit DupOnDrop
+drops "<Fd as std::ops::Drop>::drop"
+# `let _t = Fd(dup(1))`: an owner whose Drop impl closes.
+drops adv_owner_closed Fd
+drops mark
+drops strip_for
+drops adv_strip_via_for
+drops close_dup_for
+drops adv_close_via_for
+drops adv_unstrip_all
+drops "adv_move_closure::{closure#0}"
+drops "adv_generic_closure::{closure#0}"
+drops adv_match_pid

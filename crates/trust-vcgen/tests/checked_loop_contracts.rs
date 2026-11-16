@@ -92,6 +92,7 @@ fn checked_countdown(guard_op: BinOp, step: u128) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

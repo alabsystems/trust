@@ -203,6 +203,8 @@ macro_rules! run_driver {
                 // env the --trust-vanilla harness sets (docs/test-env-vars.md) — the
                 // ONE nested-propagation mechanism, covering every API uniformly.
                 let compiler_result = rustc_driver::catch_fatal_errors(|| -> interface::Result::<()> {
+                    // Trust: the embedded route (no official Trust evidence);
+                    // the facade exports no canonical `compiler_entrypoint`.
                     run_compiler(&args, self);
                     Ok(())
                 });

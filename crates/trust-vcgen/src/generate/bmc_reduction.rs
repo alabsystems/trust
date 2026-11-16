@@ -44,10 +44,12 @@
 //       reachable terminator is on a tiny allowlist, every reachable `Assert`
 //       is either the accumulator's own overflow assert or has a statically
 //       constant-true condition, and the only `SwitchInt` is the iterator's own
-//       `Option` discriminant test. Reachability follows every public TrustIR
-//       successor; the caller-constructible `exhaustive_enum_unreachable` bit
-//       never prunes an edge or grants proof authority. Consequently an
-//       `Unreachable` successor makes this optional refutation lane decline.
+//       `Option` discriminant test. Reachability is `bmc_terminator_succs`,
+//       which prunes ONLY the `otherwise` edge of a switch whose scrutinee is a
+//       `Discriminant` read of a place whose DECLARED type is an enum, and whose
+//       case set is exactly that enum's declared discriminant set. The
+//       caller-constructible `exhaustive_enum_unreachable` bit is never read and
+//       never prunes an edge; any OTHER reachable `Unreachable` still refuses.
 //
 // Any doubt about any of the three ⇒ NO CANDIDATE. Withholding a candidate leaves
 // the build at exactly today's (already fail-closed) `incomplete` verdict.
@@ -187,30 +189,157 @@ fn fold_const_bool(func: &VerifiableFunction, op: &Operand, fuel: u32) -> Option
     }
 }
 
-/// CFG successors for this refutation-only module. Public serialized hints do
-/// not remove successors; any future pruning must be based on locally rederived,
-/// subject-bound datatype/layout evidence rather than a boolean field.
-fn bmc_terminator_succs(_func: &VerifiableFunction, t: &Terminator) -> Vec<usize> {
-    // `exhaustive_enum_unreachable` is serialized public input, not proof
-    // authority. Even the old `{0,1}` structural recheck could be forged on an
-    // ordinary integer switch whose default remains reachable. BMC therefore
-    // follows every ordinary successor. A future optimization may prune only
-    // from locally rederived, subject-bound type/layout evidence; this public
-    // hint alone can never erase an edge.
-    terminator_succs(t)
+/// CFG successors for THIS module's reachability walk: `terminator_succs` minus
+/// the `otherwise` edge of a `SwitchInt` that is provably exhaustive **from the
+/// declared enum type of the place it switches on**.
+///
+/// WHY AN OVERRIDE IS NEEDED AT ALL. `for &x in <array>` lowers to
+/// `SwitchInt(Discriminant(next_result)) { 0 -> exit, 1 -> body, otherwise -> bbU }`
+/// with `bbU: Unreachable` — rustc's spelling of "the `Option` tag is 0 or 1".
+/// `terminator_succs` chains `otherwise` unconditionally, so `bbU` lands in the
+/// reachable set and `body_is_straight_line_reduction`'s terminator allowlist
+/// refuses the function. That refusal is right in general (a reachable
+/// `Terminator::Unreachable` is `unreachable_unchecked()`-shaped UB, which
+/// falsifies P3) and wrong for this one edge, which no execution takes.
+///
+/// WHY THE EVIDENCE IS THE TYPE AND NOT THE HINT. `Terminator::SwitchInt` also
+/// carries `exhaustive_enum_unreachable`. **This function does not read it**, and
+/// must not: it is `#[serde(default)]` serialized public input, so a caller can
+/// set it on an ordinary integer switch whose default really is reachable, and
+/// `trust-mir-extract`'s coroutine lane sets it with no tag-set check at all
+/// (computing the tag set there needs the layout query, which cycles inside that
+/// MIR pass). `4ca0cb0eac` removed the earlier hint-keyed override for exactly
+/// that reason and named the bar for restoring it: *"A future optimization may
+/// prune only from locally rederived, subject-bound type/layout evidence; this
+/// public hint alone can never erase an edge."* That is what
+/// [`switch_otherwise_is_dead_by_declared_enum_type`] supplies — the discriminant
+/// is read off a whole local whose DECLARED type is an `enum`, and the case set
+/// is exactly that enum's declared discriminant set, so every value the scrutinee
+/// can hold is matched by a named case.
+///
+/// This is deliberately NOT a change to the shared `loop_bounds::terminator_succs`:
+/// that function feeds `count_back_edges`, `block_is_on_cycle` and
+/// `total_loop_iterations` for every PROVING-side consumer, and this
+/// refutation-only module has no business changing the discharge path.
+fn bmc_terminator_succs(func: &VerifiableFunction, t: &Terminator) -> Vec<usize> {
+    let mut succs = terminator_succs(t);
+    let Terminator::SwitchInt { discr, targets, otherwise, .. } = t else {
+        return succs;
+    };
+    if switch_otherwise_is_dead_by_declared_enum_type(func, discr, targets, *otherwise) {
+        succs.retain(|b| *b != otherwise.0);
+    }
+    succs
+}
+
+/// Is the `otherwise` edge of this `SwitchInt` taken by NO execution, argued
+/// from the switched-on place's own declared type?
+///
+/// Every conjunct is re-derived from this body; none of them consults
+/// `exhaustive_enum_unreachable`, which this module never reads.
+///
+///   1. `otherwise` really ends in `Terminator::Unreachable`. If it does not, the
+///      block is an ordinary successor and pruning it would hide real control
+///      flow — there is nothing to argue about and nothing to gain.
+///   2. `otherwise` is not ALSO a named case target. A block that some case
+///      reaches is genuinely reached, and dropping the edge would hide that.
+///   3. The scrutinee is `Rvalue::Discriminant(p)` for a WHOLE local `p` with no
+///      projections, and that rvalue is the local's UNIQUE whole-local definition
+///      (`local_defs::body_unique_value_def`), so the switch really tests a discriminant
+///      read of one identified place — never an ordinary integer temp.
+///   4. `p`'s DECLARED type is `Ty::Adt { adt_kind: Enum }` with a non-empty
+///      variant list carrying pairwise-distinct discriminants. This is the
+///      subject-bound datatype evidence: it is attached to the very place being
+///      switched on, and it says what values a `Discriminant` read of that place
+///      can produce.
+///   5. Every declared discriminant is non-negative (a `#[repr(iN)]` enum with a
+///      negative discriminant encodes its tag as a two's-complement bit pattern
+///      at the tag width, which this comparison would get wrong — so it declines).
+///   6. The case-value set is EXACTLY the declared discriminant set — no missing
+///      variant, no extra value.
+///
+/// Under 3-6 the scrutinee is the discriminant of a value of enum type `E`, every
+/// value of `E` carries one of `E`'s declared discriminants, and every one of
+/// those has a named case; with 1-2 the `otherwise` block is therefore entered by
+/// no execution. The forgery `4ca0cb0eac` named — "an ordinary integer switch
+/// whose default remains reachable" — is excluded by 3 and 4 together: such a
+/// switch has neither a `Discriminant` definition nor an enum-typed scrutinee.
+///
+/// Every conjunct failing means only that this OPTIONAL refutation lane declines,
+/// leaving the build at its existing fail-closed `incomplete` verdict.
+fn switch_otherwise_is_dead_by_declared_enum_type(
+    func: &VerifiableFunction,
+    discr: &Operand,
+    targets: &[(u128, BlockId)],
+    otherwise: BlockId,
+) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    // (1) the `otherwise` arm must really be rustc's Unreachable certificate.
+    let is_unreachable = func
+        .body
+        .blocks
+        .get(otherwise.0)
+        .filter(|b| b.id == otherwise)
+        .or_else(|| func.body.blocks.iter().find(|b| b.id == otherwise))
+        .is_some_and(|b| matches!(b.terminator, Terminator::Unreachable));
+    if !is_unreachable {
+        return false;
+    }
+    // (2) ... and must not also be reached by a named case.
+    if targets.iter().any(|(_, b)| *b == otherwise) {
+        return false;
+    }
+    // (3) the scrutinee is a discriminant read of ONE whole local.
+    let Some(root) = root_local(func, discr, 8) else { return false };
+    // Upstream renamed this resolver during the 1377-commit merge. The pre-seam
+    // spelling took the whole FUNCTION; the entry-definition-aware question now
+    // lives in `local_defs` and takes the BODY, as called below. The old name is
+    // deliberately NOT quoted here: `tests/local_defs_seam_lint.rs` bans it as a
+    // SOURCE FACT so a rebase cannot reintroduce a call, and that scan is a plain
+    // substring match that does not exclude comments.
+    let Some(Rvalue::Discriminant(p)) = crate::local_defs::body_unique_value_def(&func.body, root)
+    else {
+        return false;
+    };
+    if !p.projections.is_empty() {
+        return false;
+    }
+    // (4) that local's DECLARED type is an enum with distinct discriminants.
+    let Some(Ty::Adt { variants, adt_kind: Some(trust_types::AdtKind::Enum), .. }) =
+        crate::local_ty_ref(func, p.local)
+    else {
+        return false;
+    };
+    if variants.is_empty() || targets.len() < variants.len() {
+        return false;
+    }
+    // (5) every declared discriminant must be a non-negative `u128` tag.
+    let mut declared: Vec<u128> = Vec::with_capacity(variants.len());
+    for v in variants {
+        let Ok(tag) = u128::try_from(v.discriminant) else { return false };
+        declared.push(tag);
+    }
+    declared.sort_unstable();
+    if declared.windows(2).any(|w| w[0] == w[1]) {
+        return false;
+    }
+    // (6) the case set is EXACTLY the declared discriminant set.
+    let mut cases: Vec<u128> = targets.iter().map(|(v, _)| *v).collect();
+    cases.sort_unstable();
+    cases.dedup();
+    cases == declared
 }
 
 /// Blocks reachable from the entry block along ORDINARY successors
 /// (`bmc_terminator_succs`, which excludes unwind/cleanup edges — an unwind sink
-/// is only entered from a panic that has already violated something).
+/// is only entered from a panic that has already violated something — and the
+/// `otherwise` edge of a switch proved exhaustive from the scrutinee's declared
+/// enum type).
 fn reachable_blocks(func: &VerifiableFunction) -> FxHashSet<usize> {
-    let succ: FxHashMap<usize, Vec<usize>> = func
-        .body
-        .blocks
-        .iter()
-        .map(|b| (b.id.0, bmc_terminator_succs(func, &b.terminator)))
-        .collect();
-    let mut seen: FxHashSet<usize> = FxHashSet::default();
+    let mut seen: FxHashSet<usize> =
+        FxHashSet::with_capacity_and_hasher(func.body.blocks.len(), Default::default());
     let Some(entry) = func.body.blocks.first().map(|b| b.id.0) else {
         return seen;
     };
@@ -219,8 +348,14 @@ fn reachable_blocks(func: &VerifiableFunction) -> FxHashSet<usize> {
         if !seen.insert(b) {
             continue;
         }
-        if let Some(s) = succ.get(&b) {
-            stack.extend(s.iter().copied());
+        let block = func
+            .body
+            .blocks
+            .get(b)
+            .filter(|blk| blk.id.0 == b)
+            .or_else(|| func.body.blocks.iter().find(|blk| blk.id.0 == b));
+        if let Some(blk) = block {
+            stack.extend(bmc_terminator_succs(func, &blk.terminator));
         }
     }
     seen
@@ -378,11 +513,18 @@ fn formula_const_int(f: &Formula) -> Option<i128> {
 /// positional `_<index>` fallback. Zero or MORE THAN ONE match ⇒ None; an
 /// ambiguous binding is refused, never guessed.
 fn resolve_fact_local(func: &VerifiableFunction, name: &str) -> Option<usize> {
+    let parsed_local_index = name
+        .strip_prefix('_')
+        .filter(|rest| !rest.is_empty() && (*rest == "0" || !rest.starts_with('0')))
+        .and_then(|rest| rest.parse::<usize>().ok());
+    let mut name_is_unique: Option<bool> = None;
     let mut hit: Option<usize> = None;
     for decl in &func.body.locals {
         let named_uniquely = decl.name.as_deref() == Some(name)
-            && func.body.locals.iter().filter(|d| d.name.as_deref() == Some(name)).count() == 1;
-        if !named_uniquely && name != format!("_{}", decl.index) {
+            && *name_is_unique.get_or_insert_with(|| {
+                func.body.locals.iter().filter(|d| d.name.as_deref() == Some(name)).count() == 1
+            });
+        if !named_uniquely && parsed_local_index != Some(decl.index) {
             continue;
         }
         if hit.is_some() {
@@ -398,8 +540,8 @@ fn resolve_fact_local(func: &VerifiableFunction, name: &str) -> Option<usize> {
 /// call destination).
 fn local_write_count(func: &VerifiableFunction, local: usize) -> usize {
     let mut writes = 0usize;
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
+    crate::visit_local_write_candidates(func, &func.body.blocks, local, |block, item| match item {
+        Some(stmt) => {
             let written = match stmt {
                 Statement::Assign { place, .. }
                 | Statement::SetDiscriminant { place, .. }
@@ -410,12 +552,14 @@ fn local_write_count(func: &VerifiableFunction, local: usize) -> usize {
                 writes += 1;
             }
         }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.local == local
-        {
-            writes += 1;
+        None => {
+            if let Terminator::Call { dest, .. } = &block.terminator
+                && dest.local == local
+            {
+                writes += 1;
+            }
         }
-    }
+    });
     writes
 }
 
@@ -494,14 +638,21 @@ fn is_integer_param_range_fact(func: &VerifiableFunction, formula: &Formula) -> 
     if lo_name != hi_name {
         return false;
     }
-    let (Some(min), Some(max)) = (formula_const_int(lo_bound), formula_const_int(hi_bound)) else {
-        return false;
-    };
     let Some(p) = resolve_fact_local(func, lo_name) else { return false };
     if p == 0 || p > func.body.arg_count {
         return false;
     }
     let Some(Ty::Int { width, signed }) = crate::local_ty_ref(func, p) else { return false };
+    // `u128`'s MAX has no `i128` spelling (`int_range` declines it): the generator
+    // states that range as `0 <= p <= UInt(u128::MAX)` (INTRINSIC-RESIDUAL-1,
+    // `generate::missing_param_type_range_facts`), and only that exact pair is it.
+    if *width == 128 && !*signed {
+        return matches!(lo_bound.as_ref(), Formula::Int(0))
+            && matches!(hi_bound.as_ref(), Formula::UInt(u128::MAX));
+    }
+    let (Some(min), Some(max)) = (formula_const_int(lo_bound), formula_const_int(hi_bound)) else {
+        return false;
+    };
     int_range(*width, *signed) == Some((min, max))
 }
 
@@ -522,7 +673,7 @@ fn is_integer_param_range_fact(func: &VerifiableFunction, formula: &Formula) -> 
 /// of them on the impl's `VerifiableFunction`. Measured with the HEAD-matching
 /// stage2 trustc (`-Ztrust-dump=mir:`) on
 ///
-/// ```ignore
+/// ```ignore (illustrative)
 /// trait R { #[trust::requires(a[0] == 0)] fn f(&self, a: &[i128; 4]) -> i128; }
 /// impl R for S { fn f(&self, a: &[i128; 4]) -> i128 { /* reduction */ } }
 /// ```
@@ -566,28 +717,18 @@ fn iterated_array_is_free_parameter(func: &VerifiableFunction, array_op: &Operan
     if root == 0 || root > func.body.arg_count {
         return false;
     }
-    for block in &func.body.blocks {
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.local == root
-        {
-            return false;
+    !crate::any_local_write_candidate(func, &func.body.blocks, root, |block, item| match item {
+        Some(stmt) => {
+            let Statement::Assign { place, rvalue, .. } = stmt else { return false };
+            place.local == root
+                || matches!(
+                    rvalue,
+                    Rvalue::Ref { mutable: true, place: p } | Rvalue::AddressOf(_, p)
+                        if p.local == root
+                )
         }
-        for stmt in &block.stmts {
-            let Statement::Assign { place, rvalue, .. } = stmt else { continue };
-            if place.local == root {
-                return false;
-            }
-            match rvalue {
-                Rvalue::Ref { mutable: true, place: p } | Rvalue::AddressOf(_, p)
-                    if p.local == root =>
-                {
-                    return false;
-                }
-                _ => {}
-            }
-        }
-    }
-    true
+        None => matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == root),
+    })
 }
 
 /// Trace an operand to its root local through whole-local `Use` copies AND
@@ -612,7 +753,7 @@ fn deref_ref_root_local(func: &VerifiableFunction, op: &Operand, fuel: u32) -> O
         {
             deref_ref_root_local(
                 func,
-                &Operand::Copy(Place { local: place.local, projections: vec![] }),
+                &Operand::Copy(Place::local(place.local)),
                 fuel - 1,
             )
             .or(Some(place.local))
@@ -626,8 +767,8 @@ fn on_cycle_next_dest(func: &VerifiableFunction) -> Option<usize> {
     let mut found = None;
     for block in &func.body.blocks {
         if let Terminator::Call { func: callee, dest, .. } = &block.terminator
-            && callee_is_iterator_next(callee)
             && dest.projections.is_empty()
+            && callee_is_iterator_next(callee)
             && block_is_on_cycle(func, block.id.0)
         {
             if found.is_some() {
@@ -677,22 +818,17 @@ fn sole_checked_add(
 /// loop's cycle? A const init INSIDE the loop would reset the accumulator every
 /// iteration and make the unroll (and any refutation from it) wrong.
 fn const_init_is_outside_loop(func: &VerifiableFunction, acc: usize) -> bool {
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            let Statement::Assign { place, rvalue, .. } = stmt else { continue };
-            if place.local != acc || !place.projections.is_empty() {
-                continue;
-            }
-            let is_const = matches!(
-                rvalue,
-                Rvalue::Use(Operand::Constant(ConstValue::Int(_) | ConstValue::Uint(..)))
-            );
-            if is_const && block_is_on_cycle(func, block.id.0) {
-                return false;
-            }
+    !crate::any_local_write_stmt(func, &func.body.blocks, acc, |block, stmt| {
+        let Statement::Assign { place, rvalue, .. } = stmt else { return false };
+        if place.local != acc || !place.projections.is_empty() {
+            return false;
         }
-    }
-    true
+        let is_const = matches!(
+            rvalue,
+            Rvalue::Use(Operand::Constant(ConstValue::Int(_) | ConstValue::Uint(..)))
+        );
+        is_const && block_is_on_cycle(func, block.id.0)
+    })
 }
 
 /// Recognize the BMC-refutable bounded reduction, or return None.
@@ -701,16 +837,45 @@ fn const_init_is_outside_loop(func: &VerifiableFunction, acc: usize) -> bool {
 pub(super) fn recognize_bounded_reduction(func: &VerifiableFunction) -> Option<BmcReduction> {
     // rustc's dense local/block layout is assumed positionally by the shared MIR
     // helpers; a hand-built or deserialized body that violates it is refused.
-    if func.body.arg_count == 0
+    if !func.spec.requires.is_empty()
+        || !func.contracts.is_empty()
+        || func.def_path.starts_with('<')
+        || func.def_path.contains(" as ")
+        || func.body.arg_count == 0
         || func.body.arg_count >= func.body.locals.len()
+        || func.body.blocks.len() < 2
+        || !super::terminator_presence_for(func).has_bare_dest_call
         || !func.body.locals.iter().enumerate().all(|(i, d)| d.index == i)
         || !func.body.blocks.iter().enumerate().all(|(i, b)| b.id.0 == i)
     {
         return None;
     }
+    let (add_tuple, acc_local, addend_op, location, add_block) = sole_checked_add(func)?;
+    let acc_ty_ref = crate::local_ty_ref(func, acc_local)?;
+    let acc_width = acc_ty_ref.int_width()?;
+    if !acc_ty_ref.is_integer() {
+        return None;
+    }
+    let acc_signed = acc_ty_ref.is_signed();
+    let (acc_min, acc_max) = int_range(acc_width, acc_signed)?;
+    // The addend: either the loop element itself / a value-preserving widening of
+    // it, or that value left-shifted by a constant.
+    let (elem_local, shift) = recognize_addend(func, &addend_op)?;
+    // `acc`'s only two whole-local definitions are a constant init and the
+    // self-add's `.0` — and it is neither call-clobbered nor mutably aliased.
+    let init = accumulator_init_const(func, acc_local, add_tuple)?;
+    if init < acc_min || init > acc_max {
+        return None;
+    }
     // EXACTLY one loop, with a statically known trip count. `count_back_edges == 1`
     // plus `total_loop_iterations` (which requires #on-cycle-`next` == #back-edges)
-    // makes `K` the EXACT trip count of the one loop, not a product over several.
+    // makes `K` the EXACT trip count of the one loop, not a product over several —
+    // for every loop that runs at least once. Trust (2026-10-04, TRIP-ZERO-PRODUCT-1):
+    // `total_loop_iterations` reports a zero-trip loop as the factor 1, an UPPER
+    // bound that is no longer exact. This lane stays exact without a gate of its own:
+    // a zero-trip for-each runs over a `[T; 0]`, and the `elem_len == trip` check below
+    // refuses it (0 != 1). (The lane is refutation-only besides: no `trip` it reads
+    // can grant a proof.)
     if count_back_edges(func) != 1 {
         return None;
     }
@@ -728,31 +893,15 @@ pub(super) fn recognize_bounded_reduction(func: &VerifiableFunction) -> Option<B
     if !preconditions_leave_the_input_free(func, next_dest) {
         return None;
     }
-    let (add_tuple, acc_local, addend_op, location, add_block) = sole_checked_add(func)?;
     // The accumulation must be INSIDE the loop.
     if !block_is_on_cycle(func, add_block) {
         return None;
     }
-    // `acc`'s only two whole-local definitions are a constant init and the
-    // self-add's `.0` — and it is neither call-clobbered nor mutably aliased.
-    let init = accumulator_init_const(func, acc_local, add_tuple)?;
     if !const_init_is_outside_loop(func, acc_local) {
         return None;
     }
-    let acc_ty = crate::local_ty_ref(func, acc_local)?.clone();
-    let acc_width = acc_ty.int_width()?;
-    if !acc_ty.is_integer() {
-        return None;
-    }
-    let acc_signed = acc_ty.is_signed();
-    let (acc_min, acc_max) = int_range(acc_width, acc_signed)?;
-    if init < acc_min || init > acc_max {
-        return None;
-    }
+    let acc_ty = acc_ty_ref.clone();
 
-    // The addend: either the loop element itself / a value-preserving widening of
-    // it, or that value left-shifted by a constant.
-    let (elem_local, shift) = recognize_addend(func, &addend_op)?;
     // The element must be the for-each element of a FIXED-SIZE array whose length
     // IS the trip count (so `x_j` really is the j-th element of the iterated array).
     let (elem_ty, elem_len, array_op) = for_each_array_source(func, elem_local)?;
@@ -904,7 +1053,9 @@ fn mul(l: Formula, r: Formula) -> Formula {
 /// SIZE: `O(K)` atoms, each of constant size. `K = 64` is a few hundred atoms.
 fn build_unrolled_violation(red: &BmcReduction) -> Option<Formula> {
     let (acc_min, acc_max) = int_range(red.acc_width, red.acc_signed)?;
-    let mut conj: Vec<Formula> = Vec::new();
+    let mut conj: Vec<Formula> = Vec::with_capacity(
+        2 + (red.trip as usize) * if red.shift.is_some() { 7 } else { 3 },
+    );
     conj.push(eq(bmc_var("acc", 0), Formula::Int(red.init)));
 
     let two_k = match red.shift {
@@ -927,10 +1078,10 @@ fn build_unrolled_violation(red: &BmcReduction) -> Option<Formula> {
                 conj.push(ge(lo.clone(), Formula::Int(0)));
                 conj.push(le(lo.clone(), Formula::Int(split - 1)));
                 conj.push(ge(hi.clone(), Formula::Int(0)));
-                conj.push(eq(x.clone(), add(mul(hi, Formula::Int(split)), lo.clone())));
+                conj.push(eq(x, add(mul(hi, Formula::Int(split)), lo.clone())));
                 mul(Formula::Int(two_k), lo)
             }
-            _ => x.clone(),
+            _ => x,
         };
         conj.push(eq(bmc_var("acc", j + 1), add(bmc_var("acc", j), addend)));
     }
@@ -938,9 +1089,10 @@ fn build_unrolled_violation(red: &BmcReduction) -> Option<Formula> {
     let goal = Formula::Or(
         (0..red.trip)
             .map(|j| {
+                let acc_next = bmc_var("acc", j + 1);
                 Formula::Or(vec![
-                    Formula::Gt(Box::new(bmc_var("acc", j + 1)), Box::new(Formula::Int(acc_max))),
-                    Formula::Lt(Box::new(bmc_var("acc", j + 1)), Box::new(Formula::Int(acc_min))),
+                    Formula::Gt(Box::new(acc_next.clone()), Box::new(Formula::Int(acc_max))),
+                    Formula::Lt(Box::new(acc_next), Box::new(Formula::Int(acc_min))),
                 ])
             })
             .collect(),
@@ -993,6 +1145,19 @@ pub fn generate_bounded_reduction_bmc_refutation_candidates(
         contract_metadata: None,
         obligation: None,
     }]
+}
+
+/// [`generate_bounded_reduction_bmc_refutation_candidates`] into the caller's context
+/// `rows`, the body's (T3 C07p, design D-VC-1): every candidate is interned through the row
+/// oracle and the candidates are returned as generated.
+#[must_use]
+pub fn generate_bounded_reduction_bmc_refutation_candidates_rows(
+    func: &VerifiableFunction,
+    rows: &mut trust_types::vc_context::VcContext,
+) -> Vec<VerificationCondition> {
+    let candidates = generate_bounded_reduction_bmc_refutation_candidates(func);
+    intern_eager_rows(rows, &candidates);
+    candidates
 }
 
 #[cfg(test)]

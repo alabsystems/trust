@@ -127,6 +127,9 @@ fn render_operand(operand: TemplateOperand) -> Operand {
         TemplateOperand::U64Scalar(value) => {
             Operand::Constant(ConstValue::Uint(u128::from(value), 64))
         }
+        TemplateOperand::UIntScalar { value, width } => {
+            Operand::Constant(ConstValue::Uint(value, width))
+        }
         TemplateOperand::BoolScalar(value) => Operand::Constant(ConstValue::Bool(value)),
     }
 }
@@ -135,6 +138,9 @@ fn render(template: &BodyTemplate) -> VerifiableFunction {
     let local_ty = |ty: TemplateTy| match ty {
         TemplateTy::Result | TemplateTy::Param { .. } => nat_adt(),
         TemplateTy::Bool => Ty::Bool,
+        TemplateTy::RustCalleeResult { .. } => {
+            panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement")
+        }
         TemplateTy::ResultRef => Ty::Ref { mutable: false, inner: Box::new(nat_adt()) },
     };
     let locals = template
@@ -180,6 +186,7 @@ fn render(template: &BodyTemplate) -> VerifiableFunction {
                     Terminator::Call {
                         func: match callee {
                             TemplateCallee::Primitive(identity) => extracted_callee_path(*identity),
+                            TemplateCallee::RustFn { .. } => panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement"),
                             TemplateCallee::SelfDef => SELF_PATH.to_owned(),
                         },
                         args: args.iter().map(|arg| render_operand(*arg)).collect(),
@@ -194,6 +201,7 @@ fn render(template: &BodyTemplate) -> VerifiableFunction {
                             TemplateUnwind::Continue => UnwindEdge::Continue,
                         },
                         callee_identity: None,
+                        callee_key: None,
                     }
                 }
             },
@@ -214,6 +222,7 @@ fn render(template: &BodyTemplate) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -349,7 +358,10 @@ fn control_18_the_unmutated_emission_admits() {
     );
     let faithful = admit_lowering(&env, &plan, &extracted).expect("the honest emission admits");
     assert_eq!(faithful.method(), FaithfulnessMethod::WellFoundedFunctionalDefeq);
-    assert!(gate_side_b(&env, &honest_reading()).is_ok(), "…and so does the same reading reflected");
+    assert!(
+        gate_side_b(&env, &honest_reading()).is_ok(),
+        "…and so does the same reading reflected"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -379,11 +391,9 @@ fn control_18_a_swapped_self_call_operands_are_refused_at_both_layers() {
 
     // …AND THE KERNEL SEPARATES THEM. Without this the row would only show that
     // two trees differ.
-    let detail = gate_side_b(
-        &env,
-        &WfRecBody { rec_args: vec![min_ab(), abs_diff()], ..honest_reading() },
-    )
-    .expect_err("the kernel must refuse the exchanged legs");
+    let detail =
+        gate_side_b(&env, &WfRecBody { rec_args: vec![min_ab(), abs_diff()], ..honest_reading() })
+            .expect_err("the kernel must refuse the exchanged legs");
     assert!(
         detail.contains("FunctionalDisagreement") || detail.contains("DecreaseSlotBorrowRefused"),
         "the swap must die at the defeq or at side A's borrowed decrease proof: {detail}"
@@ -520,10 +530,11 @@ fn control_18_d_transposed_operands_inside_a_leg_are_refused_at_both_layers() {
 
     // bb7 computes `_17 - _18` where `_17 = &_1` and `_18 = &_16` (`a - b`).
     // Exchanging its two operands emits `(a - b) - a`.
-    let transposed = with_args(with_borrow(with_borrow(emitted(&env), 7, 0, 16), 7, 1, 1), 7, vec![
-        mv(17),
-        mv(18),
-    ]);
+    let transposed = with_args(
+        with_borrow(with_borrow(emitted(&env), 7, 0, 16), 7, 1, 1),
+        7,
+        vec![mv(17), mv(18)],
+    );
     let refusal = admit_lowering(&env, &plan, &transposed)
         .expect_err("transposing a truncated subtraction's operands must never emit");
     assert!(refusal.is_compiler_defect(), "{refusal:?}");
@@ -631,7 +642,8 @@ fn control_18_f_the_phase2_telescope_against_a_phase3_side_a_is_refused() {
     .expect("a phase-2 telescope must not admit against a phase-3 declaration");
     let rendered = format!("{refusal:?}");
     assert!(
-        rendered.contains("binder") || rendered.contains("recursive slot")
+        rendered.contains("binder")
+            || rendered.contains("recursive slot")
             || rendered.contains("author the measure"),
         "the refusal must be about the telescope: {rendered}"
     );

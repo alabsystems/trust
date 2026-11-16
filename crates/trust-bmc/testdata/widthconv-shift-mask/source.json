@@ -1,0 +1,18 @@
+{
+  "module": "trust_widthconv::shift_mask",
+  "original_record": "<home>/release-evidence/trust-forward-recovery-20261029/NOV10-CURRENT-COMPILER/run-20261110T065107454649Z/captures/trust-widthconv/verifier-inputs/units/32a40c8da3ccd3a645050a6ad8b90c11badaed937488a0c3f201326ec6fcdfce/native-bundle/paired-inputs/trust-verifier-input-pair-1aff51c476b11a89eafc2821cf9ce496027b3d470aae4eae3a7962ff336b7cc7.json",
+  "files": {
+    "public.json": {
+      "original_name": "trust-verifier-input-public-00640ead4e4614b0fd9537d4a7239dfb112f75a81becba9efe1cb154dac342d4.json",
+      "sha256": "00640ead4e4614b0fd9537d4a7239dfb112f75a81becba9efe1cb154dac342d4"
+    },
+    "requested.json": {
+      "original_name": "trust-verifier-input-requested-1f86a37cc2caa86bb23009f5885d225b52918ce261bb0d22c5bfcb06aa2dfab3.json",
+      "sha256": "1f86a37cc2caa86bb23009f5885d225b52918ce261bb0d22c5bfcb06aa2dfab3"
+    },
+    "native.json": {
+      "original_name": "trust-verifier-input-native-2673922db9bbf3b78e1635ffdf3a4a5e9b4e2db365abac376188b6e62230c39c.json",
+      "sha256": "2673922db9bbf3b78e1635ffdf3a4a5e9b4e2db365abac376188b6e62230c39c"
+    }
+  }
+}

@@ -28,6 +28,7 @@ fn single_block_fn(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -175,7 +176,7 @@ fn u8_to_char_is_total_but_other_char_sources_fail_closed() {
 /// must not over-fire and start modeling value-changing casts as no-ops.
 #[test]
 fn i128_to_u128_reinterpret_is_defined_no_obligation() {
-    // Drop-in (owner decision 2026-07-06): `i128 as u128` is a same-width
+    // Drop-in (decision 2026-07-06): `i128 as u128` is a same-width
     // signedness reinterpret — DEFINED behavior (never UB), so it carries NO
     // cast safety obligation (no CastOverflow, no fail-closed UnsupportedMir).
     // Soundness is preserved because the result is NOT modeled as a

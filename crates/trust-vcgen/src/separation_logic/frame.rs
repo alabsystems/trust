@@ -69,44 +69,42 @@ pub fn encode_framed_unsafe_block(
 
     // VC 3: Frame preservation -- the frame addresses must not overlap
     // with the operation's footprint.
-    let footprint_addrs: Vec<Formula> = {
-        let mut a = collect_addresses(pre);
-        a.extend(collect_addresses(post));
-        a
-    };
     let frame_addrs = collect_addresses(frame);
-
-    if !footprint_addrs.is_empty() && !frame_addrs.is_empty() {
-        let mut constraints = Vec::new();
-        for f_addr in &footprint_addrs {
-            for r_addr in &frame_addrs {
-                constraints.push(Formula::Not(Box::new(Formula::Eq(
-                    Box::new(f_addr.clone()),
-                    Box::new(r_addr.clone()),
-                ))));
+    if !frame_addrs.is_empty() {
+        let mut footprint_addrs = collect_addresses(pre);
+        footprint_addrs.extend(collect_addresses(post));
+        if !footprint_addrs.is_empty() {
+            let mut constraints = Vec::with_capacity(footprint_addrs.len() * frame_addrs.len());
+            for f_addr in &footprint_addrs {
+                for r_addr in &frame_addrs {
+                    constraints.push(Formula::Not(Box::new(Formula::Eq(
+                        Box::new((*f_addr).clone()),
+                        Box::new((*r_addr).clone()),
+                    ))));
+                }
             }
-        }
-        let disjointness = if constraints.len() == 1 {
-            constraints
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| unreachable!("empty iter despite len == 1"))
-        } else {
-            Formula::And(constraints)
-        };
+            let disjointness = match constraints.pop() {
+                Some(only) if constraints.is_empty() => only,
+                Some(last) => {
+                    constraints.push(last);
+                    Formula::And(constraints)
+                }
+                None => Formula::And(constraints),
+            };
 
-        vcs.push(VerificationCondition {
-            kind: VcKind::Assertion {
-                message: format!(
-                    "[unsafe:sep:frame] frame preservation for unsafe block in {func_name}"
-                ),
-            },
-            function: func_name.into(),
-            location: span.clone(),
-            formula: Formula::Not(Box::new(disjointness)),
-            contract_metadata: None,
-            obligation: None,
-        });
+            vcs.push(VerificationCondition {
+                kind: VcKind::Assertion {
+                    message: format!(
+                        "[unsafe:sep:frame] frame preservation for unsafe block in {func_name}"
+                    ),
+                },
+                function: func_name.into(),
+                location: span.clone(),
+                formula: Formula::Not(Box::new(disjointness)),
+                contract_metadata: None,
+                obligation: None,
+            });
+        }
     }
 
     vcs

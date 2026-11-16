@@ -40,8 +40,8 @@ use std::cmp::min;
 use std::fmt;
 #[cfg(feature = "nightly")]
 use std::iter::Step;
-use std::num::{NonZeroUsize, ParseIntError};
-use std::ops::{Add, AddAssign, Deref, Mul, RangeFull, Sub};
+use std::num::{NonZero, ParseIntError};
+use std::ops::{Add, AddAssign, Mul, Sub};
 use std::range::RangeInclusive;
 use std::str::FromStr;
 
@@ -51,7 +51,7 @@ use rustc_data_structures::stable_hash::StableOrd;
 #[cfg(feature = "nightly")]
 use rustc_error_messages::{DiagArgValue, IntoDiagArg};
 #[cfg(feature = "nightly")]
-use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, msg};
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level, msg};
 use rustc_hashes::Hash64;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 #[cfg(feature = "nightly")]
@@ -65,6 +65,7 @@ mod extern_abi;
 mod layout;
 #[cfg(test)]
 mod tests;
+mod wrapping_range;
 
 pub use callconv::{Heterogeneous, HomogeneousAggregate, Reg, RegKind};
 pub use canon_abi::{ArmCall, CanonAbi, InterruptKind, X86Call};
@@ -74,6 +75,7 @@ pub use extern_abi::{ExternAbi, all_names};
 pub use layout::{FIRST_VARIANT, FieldIdx, LayoutCalculator, LayoutCalculatorError, VariantIdx};
 #[cfg(feature = "nightly")]
 pub use layout::{Layout, TyAbiInterface, TyAndLayout};
+pub use wrapping_range::WrappingRange;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
@@ -90,6 +92,10 @@ bitflags! {
         /// If true, the type's crate has opted into layout randomization.
         /// Other flags can still inhibit reordering and thus randomization.
         /// The seed stored in `ReprOptions.field_shuffle_seed`.
+        ///
+        /// `repr(Rust)` structs with only zero-sized fields, single-variant `repr(Rust)` enums with only
+        /// zero-sized fields, and zero-variant `repr(Rust)` enums must remain zero-sized as per
+        /// T-lang decisions in https://github.com/rust-lang/reference/pull/2262 and https://github.com/rust-lang/reference/pull/2293
         const RANDOMIZE_LAYOUT   = 1 << 4;
         /// If true, the type is always passed indirectly by non-Rustic ABIs.
         /// See [`TyAndLayout::pass_indirectly_in_non_rustic_abis`] for details.
@@ -178,6 +184,14 @@ impl ReprOptions {
         self.flags.contains(ReprFlags::IS_C)
     }
 
+    /// Returns whether this is (implicitly or explicitly) `repr(Rust)`, i.e., its layout
+    /// is defined by Rust and we make no stable commitments.
+    #[inline]
+    pub fn rust(&self) -> bool {
+        // `linear` is currently just an internal flag we set on Box; that's still `repr(Rust)`.
+        !self.c() & !self.simd() & !self.scalable() & !self.transparent()
+    }
+
     #[inline]
     pub fn packed(&self) -> bool {
         self.pack.is_some()
@@ -231,6 +245,16 @@ impl ReprOptions {
     pub fn inhibits_union_abi_opt(&self) -> bool {
         self.c()
     }
+
+    /// Ensures two `repr` are equal up to the seed.
+    pub fn equal_up_to_seed(&self, other: &Self) -> bool {
+        let ReprOptions { int, align, pack, flags, scalable, field_shuffle_seed: _ } = *self;
+        int == other.int
+            && align == other.align
+            && pack == other.pack
+            && flags == other.flags
+            && scalable == other.scalable
+    }
 }
 
 /// The maximum supported number of lanes in a SIMD vector.
@@ -238,7 +262,42 @@ impl ReprOptions {
 /// This value is selected based on backend support:
 /// * LLVM does not appear to have a vector width limit.
 /// * Cranelift stores the base-2 log of the lane count in a 4 bit integer.
-pub const MAX_SIMD_LANES: u64 = 1 << 0xF;
+pub const MAX_SIMD_LANES: u16 = 1 << 0xF;
+
+/// The number of lanes in a [`BackendRepr::SimdVector`], `1..=`[`MAX_SIMD_LANES`].
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
+pub struct BackendLaneCount(NonZero<u16>);
+
+impl BackendLaneCount {
+    pub fn new<N>(count: u64) -> Result<Self, LayoutCalculatorError<N>> {
+        let Ok(count @ ..=MAX_SIMD_LANES) = u16::try_from(count) else {
+            return Err(LayoutCalculatorError::OversizedSimdType {
+                max_lanes: crate::MAX_SIMD_LANES.into(),
+            });
+        };
+        if let Some(count) = NonZero::new(count) {
+            Ok(BackendLaneCount(count))
+        } else {
+            Err(LayoutCalculatorError::ZeroLengthSimdType)
+        }
+    }
+
+    #[inline]
+    pub fn is_power_of_two(self) -> bool {
+        self.0.is_power_of_two()
+    }
+
+    #[inline]
+    pub fn as_u64(self) -> u64 {
+        self.0.get().into()
+    }
+
+    #[inline]
+    pub fn as_u32(self) -> u32 {
+        self.0.get().into()
+    }
+}
 
 /// How pointers are represented in a given address space
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -340,8 +399,8 @@ pub enum TargetDataLayoutError<'a> {
 }
 
 #[cfg(feature = "nightly")]
-impl<G: EmissionGuarantee> Diagnostic<'_, G> for TargetDataLayoutError<'_> {
-    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+impl Diagnostic<'_> for TargetDataLayoutError<'_> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_> {
         match self {
             TargetDataLayoutError::InvalidAddressSpace { addr_space, err, cause } => {
                 Diag::new(dcx, level, msg!("invalid address space `{$addr_space}` for `{$cause}` in \"data-layout\": {$err}"))
@@ -658,17 +717,25 @@ impl TargetDataLayout {
 
     /// psABI-mandated alignment for a vector type, if any
     #[inline]
-    fn cabi_vector_align(&self, vec_size: Size) -> Option<Align> {
+    fn c_vector_align(&self, vec_size: Size) -> Option<Align> {
         self.vector_align
             .iter()
             .find(|(size, _align)| *size == vec_size)
             .map(|(_size, align)| *align)
     }
 
-    /// an alignment resembling the one LLVM would pick for a vector
+    /// Rust-assigned alignment of any vector type
+    ///
+    /// When the shape of a vector matches that in a C psABI, we *must* agree when performing FFI.
+    /// This currently answers correctly for C compatibility purposes as it is a useful default.
+    /// Otherwise this choice is arbitrary, as vector types do not necessarily match hardware so
+    /// this can conjure "imaginary" answers that just happen to be convenient for us.
+    ///
+    /// Importantly, Rust vector alignment is not required to be monotonic between vector sizes,
+    /// even though it currently is.
     #[inline]
-    pub fn llvmlike_vector_align(&self, vec_size: Size) -> Align {
-        self.cabi_vector_align(vec_size)
+    pub fn rust_vector_align(&self, vec_size: Size) -> Align {
+        self.c_vector_align(vec_size)
             .unwrap_or(Align::from_bytes(vec_size.bytes().next_power_of_two()).unwrap())
     }
 
@@ -714,20 +781,20 @@ impl TargetDataLayout {
 
     /// Get the pointer alignment in the default data address space.
     #[inline]
-    pub fn pointer_align(&self) -> AbiAlign {
-        AbiAlign::new(self.default_address_space_pointer_spec.pointer_align)
+    pub fn pointer_align(&self) -> Align {
+        self.default_address_space_pointer_spec.pointer_align
     }
 
     /// Get the pointer alignment in a specific address space.
     #[inline]
-    pub fn pointer_align_in(&self, c: AddressSpace) -> AbiAlign {
-        AbiAlign::new(if c == self.default_address_space {
+    pub fn pointer_align_in(&self, c: AddressSpace) -> Align {
+        if c == self.default_address_space {
             self.default_address_space_pointer_spec.pointer_align
         } else if let Some(e) = self.address_space_info.iter().find(|(a, _)| a == &c) {
             e.1.pointer_align
         } else {
             panic!("Use of unknown address space {c:?}");
-        })
+        }
     }
 }
 
@@ -992,6 +1059,12 @@ impl Step for Size {
     }
 
     #[inline]
+    fn forward_overflowing(start: Self, count: usize) -> (Self, bool) {
+        let (s, o) = u64::forward_overflowing(start.bytes(), count);
+        (Self::from_bytes(s), o)
+    }
+
+    #[inline]
     fn forward(start: Self, count: usize) -> Self {
         Self::from_bytes(u64::forward(start.bytes(), count))
     }
@@ -1004,6 +1077,12 @@ impl Step for Size {
     #[inline]
     fn backward_checked(start: Self, count: usize) -> Option<Self> {
         u64::backward_checked(start.bytes(), count).map(Self::from_bytes)
+    }
+
+    #[inline]
+    fn backward_overflowing(start: Self, count: usize) -> (Self, bool) {
+        let (s, o) = u64::backward_overflowing(start.bytes(), count);
+        (Self::from_bytes(s), o)
     }
 
     #[inline]
@@ -1054,6 +1133,7 @@ impl fmt::Display for AlignFromBytesError {
 
 impl Align {
     pub const ONE: Align = Align { pow2: 0 };
+    pub const FOUR: Align = Align { pow2: 2 };
     pub const EIGHT: Align = Align { pow2: 3 };
     // LLVM has a maximal supported alignment of 2^29, we inherit that.
     pub const MAX: Align = Align { pow2: 29 };
@@ -1136,46 +1216,6 @@ impl Align {
     }
 }
 
-/// A pair of alignments, ABI-mandated and preferred.
-///
-/// The "preferred" alignment is an LLVM concept that is virtually meaningless to Rust code:
-/// it is not exposed semantically to programmers nor can they meaningfully affect it.
-/// The only concern for us is that preferred alignment must not be less than the mandated alignment
-/// and thus in practice the two values are almost always identical.
-///
-/// An example of a rare thing actually affected by preferred alignment is aligning of statics.
-/// It is of effectively no consequence for layout in structs and on the stack.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(feature = "nightly", derive(StableHash))]
-pub struct AbiAlign {
-    pub abi: Align,
-}
-
-impl AbiAlign {
-    #[inline]
-    pub fn new(align: Align) -> AbiAlign {
-        AbiAlign { abi: align }
-    }
-
-    #[inline]
-    pub fn min(self, other: AbiAlign) -> AbiAlign {
-        AbiAlign { abi: self.abi.min(other.abi) }
-    }
-
-    #[inline]
-    pub fn max(self, other: AbiAlign) -> AbiAlign {
-        AbiAlign { abi: self.abi.max(other.abi) }
-    }
-}
-
-impl Deref for AbiAlign {
-    type Target = Align;
-
-    fn deref(&self) -> &Self::Target {
-        &self.abi
-    }
-}
-
 /// Integers, also used for enum discriminants.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
@@ -1232,17 +1272,17 @@ impl Integer {
         }
     }
 
-    pub fn align<C: HasDataLayout>(self, cx: &C) -> AbiAlign {
+    pub fn align<C: HasDataLayout>(self, cx: &C) -> Align {
         use Integer::*;
         let dl = cx.data_layout();
 
-        AbiAlign::new(match self {
+        match self {
             I8 => dl.i8_align,
             I16 => dl.i16_align,
             I32 => dl.i32_align,
             I64 => dl.i64_align,
             I128 => dl.i128_align,
-        })
+        }
     }
 
     /// Returns the largest signed value that can be represented by this Integer.
@@ -1303,7 +1343,7 @@ impl Integer {
         let dl = cx.data_layout();
 
         [I8, I16, I32, I64, I128].into_iter().find(|&candidate| {
-            wanted == candidate.align(dl).abi && wanted.bytes() == candidate.size().bytes()
+            wanted == candidate.align(dl) && wanted.bytes() == candidate.size().bytes()
         })
     }
 
@@ -1314,7 +1354,7 @@ impl Integer {
 
         // FIXME(eddyb) maybe include I128 in the future, when it works everywhere.
         for candidate in [I64, I32, I16] {
-            if wanted >= candidate.align(dl).abi && wanted.bytes() >= candidate.size().bytes() {
+            if wanted >= candidate.align(dl) && wanted.bytes() >= candidate.size().bytes() {
                 return candidate;
             }
         }
@@ -1341,9 +1381,17 @@ impl Integer {
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Float {
     F16,
+    /// `f16b`. This is not a builtin type in Rust (it is exposed as a lang item),
+    /// but it is a builtin type in LLVM so needs to be explicitly represented
+    /// in the backend.
+    F16B,
     F32,
     F64,
     F128,
+    /// `ppcf128`. This is not a builtin type in Rust (it is exposed as a lang item),
+    /// but it is a builtin type in LLVM so needs to be explicitly represented
+    /// in the backend.
+    PpcF128,
 }
 
 impl Float {
@@ -1352,27 +1400,80 @@ impl Float {
 
         match self {
             F16 => Size::from_bits(16),
+            F16B => Size::from_bits(16),
             F32 => Size::from_bits(32),
             F64 => Size::from_bits(64),
             F128 => Size::from_bits(128),
+            PpcF128 => Size::from_bits(128),
         }
     }
 
-    pub fn align<C: HasDataLayout>(self, cx: &C) -> AbiAlign {
+    pub fn align<C: HasDataLayout>(self, cx: &C) -> Align {
         use Float::*;
         let dl = cx.data_layout();
 
-        AbiAlign::new(match self {
-            F16 => dl.f16_align,
+        match self {
+            F16 | F16B => dl.f16_align,
             F32 => dl.f32_align,
             F64 => dl.f64_align,
             F128 => dl.f128_align,
-        })
+            PpcF128 => dl.f128_align,
+        }
+    }
+
+    pub fn ty_str(self) -> &'static str {
+        use Float::*;
+
+        match self {
+            F16 => "f16",
+            F16B => "f16b",
+            F32 => "f32",
+            F64 => "f64",
+            F128 => "f128",
+            PpcF128 => "ppcf128",
+        }
+    }
+
+    pub fn is_ieee(self) -> bool {
+        use Float::*;
+
+        match self {
+            F16 | F32 | F64 | F128 => true,
+            F16B | PpcF128 => false,
+        }
+    }
+}
+
+/// Numeric primitives.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
+pub enum Numeric {
+    /// The `bool` is the signedness of the `Integer` type.
+    Int(Integer, bool),
+    Float(Float),
+}
+
+impl Numeric {
+    pub fn size(self) -> Size {
+        match self {
+            Numeric::Int(integer, _) => integer.size(),
+            Numeric::Float(float) => float.size(),
+        }
+    }
+
+    pub fn reg_kind(self) -> RegKind {
+        match self {
+            Numeric::Int(_, _) => RegKind::Integer,
+            Numeric::Float(Float::PpcF128) => RegKind::PpcF128,
+            Numeric::Float(Float::F16 | Float::F16B | Float::F32 | Float::F64 | Float::F128) => {
+                RegKind::Float
+            }
+        }
     }
 }
 
 /// Fundamental unit of memory access and layout.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Primitive {
     /// The `bool` is the signedness of the `Integer` type.
@@ -1385,6 +1486,29 @@ pub enum Primitive {
     Int(Integer, bool),
     Float(Float),
     Pointer(AddressSpace),
+}
+
+impl fmt::Debug for Primitive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match *self {
+            Primitive::Int(integer, is_signed) => {
+                if is_signed {
+                    integer.int_ty_str()
+                } else {
+                    integer.uint_ty_str()
+                }
+            }
+            Primitive::Float(float) => float.ty_str(),
+            Primitive::Pointer(addr_space) => {
+                if addr_space == AddressSpace::ZERO {
+                    "pointer"
+                } else {
+                    return write!(f, "pointer({addr_space:?})");
+                }
+            }
+        };
+        f.write_str(name)
+    }
 }
 
 impl Primitive {
@@ -1403,7 +1527,7 @@ impl Primitive {
     ///
     /// This is the type alignment for the corresponding built-in.
     /// In other contexts it might have different alignment.
-    pub fn default_align<C: HasDataLayout>(self, cx: &C) -> AbiAlign {
+    pub fn default_align<C: HasDataLayout>(self, cx: &C) -> Align {
         use Primitive::*;
         let dl = cx.data_layout();
 
@@ -1415,128 +1539,8 @@ impl Primitive {
     }
 }
 
-/// Inclusive wrap-around range of valid values, that is, if
-/// start > end, it represents `start..=MAX`, followed by `0..=end`.
-///
-/// That is, for an i8 primitive, a range of `254..=2` means following
-/// sequence:
-///
-///    254 (-2), 255 (-1), 0, 1, 2
-///
-/// This is intended specifically to mirror LLVM’s `!range` metadata semantics.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "nightly", derive(StableHash))]
-pub struct WrappingRange {
-    pub start: u128,
-    pub end: u128,
-}
-
-impl WrappingRange {
-    pub fn full(size: Size) -> Self {
-        Self { start: 0, end: size.unsigned_int_max() }
-    }
-
-    /// Returns `true` if `v` is contained in the range.
-    #[inline(always)]
-    pub fn contains(&self, v: u128) -> bool {
-        if self.start <= self.end {
-            self.start <= v && v <= self.end
-        } else {
-            self.start <= v || v <= self.end
-        }
-    }
-
-    /// Returns `true` if all the values in `other` are contained in this range,
-    /// when the values are considered as having width `size`.
-    #[inline(always)]
-    pub fn contains_range(&self, other: Self, size: Size) -> bool {
-        if self.is_full_for(size) {
-            true
-        } else {
-            let trunc = |x| size.truncate(x);
-
-            let delta = self.start;
-            let max = trunc(self.end.wrapping_sub(delta));
-
-            let other_start = trunc(other.start.wrapping_sub(delta));
-            let other_end = trunc(other.end.wrapping_sub(delta));
-
-            // Having shifted both input ranges by `delta`, now we only need to check
-            // whether `0..=max` contains `other_start..=other_end`, which can only
-            // happen if the other doesn't wrap since `self` isn't everything.
-            (other_start <= other_end) && (other_end <= max)
-        }
-    }
-
-    /// Returns `self` with replaced `start`
-    #[inline(always)]
-    fn with_start(mut self, start: u128) -> Self {
-        self.start = start;
-        self
-    }
-
-    /// Returns `self` with replaced `end`
-    #[inline(always)]
-    fn with_end(mut self, end: u128) -> Self {
-        self.end = end;
-        self
-    }
-
-    /// Returns `true` if `size` completely fills the range.
-    ///
-    /// Note that this is *not* the same as `self == WrappingRange::full(size)`.
-    /// Niche calculations can produce full ranges which are not the canonical one;
-    /// for example `Option<NonZero<u16>>` gets `valid_range: (..=0) | (1..)`.
-    #[inline]
-    fn is_full_for(&self, size: Size) -> bool {
-        let max_value = size.unsigned_int_max();
-        debug_assert!(self.start <= max_value && self.end <= max_value);
-        self.start == (self.end.wrapping_add(1) & max_value)
-    }
-
-    /// Checks whether this range is considered non-wrapping when the values are
-    /// interpreted as *unsigned* numbers of width `size`.
-    ///
-    /// Returns `Ok(true)` if there's no wrap-around, `Ok(false)` if there is,
-    /// and `Err(..)` if the range is full so it depends how you think about it.
-    #[inline]
-    pub fn no_unsigned_wraparound(&self, size: Size) -> Result<bool, RangeFull> {
-        if self.is_full_for(size) { Err(..) } else { Ok(self.start <= self.end) }
-    }
-
-    /// Checks whether this range is considered non-wrapping when the values are
-    /// interpreted as *signed* numbers of width `size`.
-    ///
-    /// This is heavily dependent on the `size`, as `100..=200` does wrap when
-    /// interpreted as `i8`, but doesn't when interpreted as `i16`.
-    ///
-    /// Returns `Ok(true)` if there's no wrap-around, `Ok(false)` if there is,
-    /// and `Err(..)` if the range is full so it depends how you think about it.
-    #[inline]
-    pub fn no_signed_wraparound(&self, size: Size) -> Result<bool, RangeFull> {
-        if self.is_full_for(size) {
-            Err(..)
-        } else {
-            let start: i128 = size.sign_extend(self.start);
-            let end: i128 = size.sign_extend(self.end);
-            Ok(start <= end)
-        }
-    }
-}
-
-impl fmt::Debug for WrappingRange {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.start > self.end {
-            write!(fmt, "(..={}) | ({}..)", self.end, self.start)?;
-        } else {
-            write!(fmt, "{}..={}", self.start, self.end)?;
-        }
-        Ok(())
-    }
-}
-
 /// Information about one scalar component of a Rust type.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Scalar {
     Initialized {
@@ -1555,6 +1559,24 @@ pub enum Scalar {
         /// so there is no `valid_range`.
         value: Primitive,
     },
+}
+
+impl fmt::Debug for Scalar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Scalar::Initialized { value, valid_range } => {
+                let (size, is_signed) = match *value {
+                    Primitive::Int(integer, is_signed) => (integer.size(), is_signed),
+                    Primitive::Float(float) => (float.size(), false),
+                    Primitive::Pointer(_) => (Size::from_bits(128), false),
+                };
+                write!(f, "{value:?} is {:?}", valid_range.debug_as(size, is_signed))
+            }
+            Scalar::Union { value } => {
+                write!(f, "union {value:?}")
+            }
+        }
+    }
 }
 
 impl Scalar {
@@ -1582,7 +1604,7 @@ impl Scalar {
     ///
     /// This is the type alignment for the corresponding built-in.
     /// This is *not* necessarily the correct alignment for a type that has this `BackendRepr::Scalar`!
-    pub fn default_align(self, cx: &impl HasDataLayout) -> AbiAlign {
+    pub fn default_align(self, cx: &impl HasDataLayout) -> Align {
         self.primitive().default_align(cx)
     }
 
@@ -1651,7 +1673,7 @@ pub enum FieldsShape<FieldIdx: Idx> {
     Primitive,
 
     /// All fields start at no offset. The `usize` is the field count.
-    Union(NonZeroUsize),
+    Union(NonZero<usize>),
 
     /// Array/vector-like placement, with all fields of identical types.
     Array { stride: Size, count: u64 },
@@ -1736,6 +1758,10 @@ pub struct AddressSpace(pub u32);
 impl AddressSpace {
     /// LLVM's `0` address space.
     pub const ZERO: Self = AddressSpace(0);
+    /// The address space for constant memory on nvptx and amdgpu.
+    /// This address space is used e.g. for kernel arguments that are constant throughout the
+    /// execution.
+    pub const GPU_CONSTANT: Self = AddressSpace(4);
     /// The address space for workgroup memory on nvptx and amdgpu.
     /// See e.g. the `gpu_launch_sized_workgroup_mem` intrinsic for details.
     pub const GPU_WORKGROUP: Self = AddressSpace(3);
@@ -1796,22 +1822,26 @@ impl IntoDiagArg for NumScalableVectors {
 pub enum BackendRepr {
     Scalar(Scalar),
     /// The data contained in this type can be entirely represented by two scalars.
-    /// The two scalars are listed in *memory* order, so the first is at offset zero
-    /// and the second at a non-zero offset.
+    /// The two scalars are listed in *memory* order, so `a` is at offset zero
+    /// and `b` is at non-zero offset `b_offset`.
     /// These need not be `FieldIdx(0)` and `FieldIdx(1)`.
     ///
-    /// As of June 2026 the offset to the second scalar is the size of the first
-    /// scalar rounded up to the platform alignment of the second scalar.
+    /// As of June 2026 the `b_offset` is always the size of the `a`
+    /// scalar rounded up to the platform alignment of the `b` scalar.
     /// That may soon change, however; see MCP#1007.
-    ScalarPair(Scalar, Scalar),
+    ScalarPair {
+        a: Scalar,
+        b: Scalar,
+        b_offset: Size,
+    },
     SimdScalableVector {
         element: Scalar,
-        count: u64,
+        count: BackendLaneCount,
         number_of_vectors: NumScalableVectors,
     },
     SimdVector {
         element: Scalar,
-        count: u64,
+        count: BackendLaneCount,
     },
     // FIXME: I sometimes use memory, sometimes use an IR aggregate!
     Memory {
@@ -1826,7 +1856,7 @@ impl BackendRepr {
     pub fn is_unsized(&self) -> bool {
         match *self {
             BackendRepr::Scalar(_)
-            | BackendRepr::ScalarPair(..)
+            | BackendRepr::ScalarPair { .. }
             // FIXME(rustc_scalable_vector): Scalable vectors are `Sized` while the
             // `sized_hierarchy` feature is not yet fully implemented. After `sized_hierarchy` is
             // fully implemented, scalable vectors will remain `Sized`, they just won't be
@@ -1853,10 +1883,23 @@ impl BackendRepr {
         }
     }
 
-    /// Returns `true` if this is a scalar type
+    /// Returns `true` if this is specifically a [`Self::Scalar`] type.
+    ///
+    /// This excludes SIMD types.
     #[inline]
     pub fn is_scalar(&self) -> bool {
         matches!(*self, BackendRepr::Scalar(_))
+    }
+
+    /// Returns `true` if this is a scalar type or SIMD type.
+    #[inline]
+    pub fn is_scalar_or_simd(&self) -> bool {
+        matches!(
+            *self,
+            BackendRepr::Scalar(_)
+                | BackendRepr::SimdVector { .. }
+                | BackendRepr::SimdScalableVector { .. }
+        )
     }
 
     /// Returns `true` if this is a bool
@@ -1874,9 +1917,9 @@ impl BackendRepr {
     /// not calculating something from the `Scalar`s.
     pub fn scalar_platform_align<C: HasDataLayout>(&self, cx: &C) -> Option<Align> {
         match *self {
-            BackendRepr::Scalar(s) => Some(s.default_align(cx).abi),
-            BackendRepr::ScalarPair(s1, s2) => {
-                Some(s1.default_align(cx).max(s2.default_align(cx)).abi)
+            BackendRepr::Scalar(s) => Some(s.default_align(cx)),
+            BackendRepr::ScalarPair { a: s1, b: s2, b_offset: _ } => {
+                Some(s1.default_align(cx).max(s2.default_align(cx)))
             }
             // The align of a Vector can vary in surprising ways
             BackendRepr::SimdVector { .. }
@@ -1893,8 +1936,7 @@ impl BackendRepr {
             // No padding in scalars.
             BackendRepr::Scalar(s) => Some(s.size(cx)),
             // May have some padding between the pair.
-            BackendRepr::ScalarPair(s1, s2) => {
-                let field2_offset = s1.size(cx).align_to(s2.default_align(cx).abi);
+            BackendRepr::ScalarPair { a: _, b: s2, b_offset: field2_offset } => {
                 let size = (field2_offset + s2.size(cx)).align_to(
                     self.scalar_platform_align(cx)
                         // We absolutely must have an answer here or everything is FUBAR.
@@ -1913,8 +1955,8 @@ impl BackendRepr {
     pub fn to_union(&self) -> Self {
         match *self {
             BackendRepr::Scalar(s) => BackendRepr::Scalar(s.to_union()),
-            BackendRepr::ScalarPair(s1, s2) => {
-                BackendRepr::ScalarPair(s1.to_union(), s2.to_union())
+            BackendRepr::ScalarPair { a: s1, b: s2, b_offset } => {
+                BackendRepr::ScalarPair { a: s1.to_union(), b: s2.to_union(), b_offset }
             }
             BackendRepr::SimdVector { element, count } => {
                 BackendRepr::SimdVector { element: element.to_union(), count }
@@ -1939,8 +1981,13 @@ impl BackendRepr {
                 BackendRepr::SimdVector { element: element_l, count: count_l },
                 BackendRepr::SimdVector { element: element_r, count: count_r },
             ) => element_l.primitive() == element_r.primitive() && count_l == count_r,
-            (BackendRepr::ScalarPair(l1, l2), BackendRepr::ScalarPair(r1, r2)) => {
-                l1.primitive() == r1.primitive() && l2.primitive() == r2.primitive()
+            (
+                BackendRepr::ScalarPair { a: l1, b: l2, b_offset: l_offset },
+                BackendRepr::ScalarPair { a: r1, b: r2, b_offset: r_offset },
+            ) => {
+                l1.primitive() == r1.primitive()
+                    && l2.primitive() == r2.primitive()
+                    && l_offset == r_offset
             }
             // Everything else must be strictly identical.
             _ => self == other,
@@ -1948,24 +1995,40 @@ impl BackendRepr {
     }
 }
 
+/// Describes the variants of a type.
 // NOTE: This struct is generic over the FieldIdx and VariantIdx for rust-analyzer usage.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Variants<FieldIdx: Idx, VariantIdx: Idx> {
-    /// A type with no valid variants. Must be uninhabited.
+    /// The type has no valid variants. Must be uninhabited.
+    ///
+    /// This is the case for:
+    /// 1. enums with no inhabited variants
+    /// 2. the never type
     Empty,
 
-    /// Single enum variants, structs/tuples, unions, and all non-ADTs.
+    /// The type has a single valid variant. Such types are called "univariant".
+    ///
+    /// This is the case for:
+    /// 1. enums with a single inhabited variant, aka. "univariant enums"
+    /// 2. structs, unions, and non-ADTs (except coroutines; see below),
+    ///    as those can't have multiple variants
     Single {
-        /// Always `0` for types that cannot have multiple variants.
+        /// - for case 1, this is the index of the inhabited variant
+        /// - for case 2, this is always `0` (a dummy value)
         index: VariantIdx,
     },
 
-    /// Enum-likes with more than one variant: each variant comes with
-    /// a *discriminant* (usually the same as the variant index but the user can
-    /// assign explicit discriminant values). That discriminant is encoded
-    /// as a *tag* on the machine. The layout of each variant is
-    /// a struct, and they all have space reserved for the tag.
+    /// The type has multiple valid variants.
+    ///
+    /// This is the case for:
+    /// 1. enums with multiple inhabited variants
+    /// 2. coroutines
+    ///
+    /// Each variant comes with a *discriminant* (usually the same as the
+    /// variant index but the user can assign explicit discriminant values).
+    /// That discriminant is encoded as a *tag* on the machine. The layout of
+    /// each variant is a struct, and they all have space reserved for the tag.
     /// For enums, the tag is the sole field of the layout.
     Multiple {
         tag: Scalar,
@@ -2081,8 +2144,7 @@ impl Niche {
         let distance_end_zero = max_value - v.end;
         // FIXME: this ought to work for `bool` too, but that seems to be hitting a miscompilation
         // <https://github.com/rust-lang/rust/pull/155473#issuecomment-4302036343>
-        let is_bool = size.bytes() == 1 && v == WrappingRange { start: 0, end: 1 };
-        if count == 1 && !is_bool {
+        if count == 1 && v != (WrappingRange { start: 0, end: 1 }) {
             // We only need one, so just pick the one closest to zero.
             // Not only does that obviously use zero if it's possible, but it also
             // simplifies testing things like `Option<char>`, since looking for `-1`
@@ -2111,6 +2173,18 @@ impl Niche {
             }
         }
     }
+}
+
+/// Whether niche optimizations should be performed during layout calculation.
+///
+/// [`UnsafeCell`] and [`UnsafePinned`] both disable niche optimizations.
+///
+/// [`UnsafeCell`]: std::cell::UnsafeCell
+/// [`UnsafePinned`]: std::pin::UnsafePinned
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum NicheOptimizations {
+    Enabled,
+    Disabled,
 }
 
 // NOTE: This struct is generic over the FieldIdx and VariantIdx for rust-analyzer usage.
@@ -2147,7 +2221,7 @@ pub struct LayoutData<FieldIdx: Idx, VariantIdx: Idx> {
     /// especially in the case of by-pointer struct returns, which allocate stack even when unused.
     pub uninhabited: bool,
 
-    pub align: AbiAlign,
+    pub align: Align,
     pub size: Size,
 
     /// The largest alignment explicitly requested with `repr(align)` on this type or any field.
@@ -2156,9 +2230,16 @@ pub struct LayoutData<FieldIdx: Idx, VariantIdx: Idx> {
     pub max_repr_align: Option<Align>,
 
     /// The alignment the type would have, ignoring any `repr(align)` but including `repr(packed)`.
-    /// Only used on aarch64-linux, where the argument passing ABI ignores the requested alignment
-    /// in some cases.
+    /// Only used on aarch64-linux and arm, where the argument passing ABI ignores the requested
+    /// alignment in some cases.
     pub unadjusted_abi_align: Align,
+
+    /// Whether this type is `repr(C)`, or a `repr(transparent)` wrapper around such,
+    /// or an array of such.
+    /// This matters because we must follow the C ABI for these types.
+    /// Some C ABIs pass `repr(C)` ZSTs by pointer, but `repr(Rust)` ZSTs should always
+    /// be ignored.
+    pub repr_c: bool,
 
     /// The randomization seed based on this type's own repr and its fields.
     ///
@@ -2180,13 +2261,30 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
             BackendRepr::Scalar(_)
             | BackendRepr::SimdVector { .. }
             | BackendRepr::SimdScalableVector { .. } => false,
-            BackendRepr::ScalarPair(..) | BackendRepr::Memory { .. } => true,
+            BackendRepr::ScalarPair { .. } | BackendRepr::Memory { .. } => true,
         }
     }
 
     /// Returns `true` if this is an uninhabited type
     pub fn is_uninhabited(&self) -> bool {
         self.uninhabited
+    }
+
+    /// Returns `true` if the given variant is uninhabited.
+    pub fn is_variant_uninhabited(&self, variant: VariantIdx) -> bool {
+        match self.variants {
+            Variants::Empty => true,
+            Variants::Single { index } => variant != index || self.uninhabited,
+            Variants::Multiple { ref variants, .. } => {
+                variants.get(variant).map(|v| v.uninhabited).unwrap_or(true)
+            }
+        }
+    }
+
+    /// Returns `true` if this is a `repr(C)` type,
+    /// or an array of such, or a `repr(transparent)` wrapper around such
+    pub fn is_repr_c(&self) -> bool {
+        self.repr_c
     }
 }
 
@@ -2209,6 +2307,7 @@ where
             variants,
             max_repr_align,
             unadjusted_abi_align,
+            repr_c,
             randomization_seed,
         } = self;
         f.debug_struct("Layout")
@@ -2221,6 +2320,7 @@ where
             .field("variants", variants)
             .field("max_repr_align", max_repr_align)
             .field("unadjusted_abi_align", unadjusted_abi_align)
+            .field("repr_c", repr_c)
             .field("randomization_seed", randomization_seed)
             .finish()
     }
@@ -2249,9 +2349,12 @@ pub struct PointeeInfo {
     /// If `size` is not zero, then the pointer is either null or dereferenceable for this many bytes
     /// (independent of `safe`).
     ///
-    /// On a function argument, "dereferenceable" here means "dereferenceable for the entire duration
-    /// of this function call", i.e. it is UB for the memory that this pointer points to be freed
-    /// while this function is still running.
+    /// "Dereferenceable" means that it's sound to add a speculative (spurious) read of the pointer.
+    /// The backend is free to add such reads at will. (This is useful to hoist pointer reads out of
+    /// loops without proving that the loop executes at least once, for example.)
+    ///
+    /// This can be used in both argument and return position, in both cases it means
+    /// "dereferenceable right now" (function entry/return) (but could be freed any time later).
     pub size: Size,
     /// The pointer is guaranteed to be aligned this much (independent of `safe`).
     pub align: Align,
@@ -2280,7 +2383,7 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
     }
 
     /// Returns the elements count of a scalable vector.
-    pub fn scalable_vector_element_count(&self) -> Option<u64> {
+    pub fn scalable_vector_element_count(&self) -> Option<BackendLaneCount> {
         match self.backend_repr {
             BackendRepr::SimdScalableVector { count, .. } => Some(count),
             _ => None,
@@ -2294,29 +2397,66 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
     pub fn is_zst(&self) -> bool {
         match self.backend_repr {
             BackendRepr::Scalar(_)
-            | BackendRepr::ScalarPair(..)
+            | BackendRepr::ScalarPair { .. }
             | BackendRepr::SimdScalableVector { .. }
             | BackendRepr::SimdVector { .. } => false,
             BackendRepr::Memory { sized } => sized && self.size.bytes() == 0,
         }
     }
 
+    /// In the backend, a value with this type and layout is fully represented by
+    /// its SSA value(s), independent of the contents of memory.
+    ///
+    /// For example, you can swap by reading both then writing both without using
+    /// an alloca because the store of one cannot affect the value of the other.
+    ///
+    /// Any projection into a standalone type must also yield a standalone type,
+    /// since it might not be in memory at all.
+    #[inline]
+    pub fn is_ssa_standalone(&self) -> bool {
+        match self.backend_repr {
+            BackendRepr::Memory { .. } => self.is_zst(),
+            BackendRepr::Scalar(..)
+            | BackendRepr::ScalarPair { .. }
+            | BackendRepr::SimdVector { .. }
+            | BackendRepr::SimdScalableVector { .. } => true,
+        }
+    }
+
     /// Checks if these two `Layout` are equal enough to be considered "the same for all function
     /// call ABIs". Note however that real ABIs depend on more details that are not reflected in the
     /// `Layout`; the `PassMode` need to be compared as well. Also note that we assume
-    /// aggregates are passed via `PassMode::Indirect` or `PassMode::Cast`; more strict
-    /// checks would otherwise be required.
+    /// aggregates are passed via `PassMode::Indirect`, `PassMode::IndirectUnsized` or
+    /// `PassMode::Cast`; more strict checks would otherwise be required.
     pub fn eq_abi(&self, other: &Self) -> bool {
+        let LayoutData {
+            size,
+            align,
+            backend_repr,
+            // We assume aggregates are passed via `Cast` or `Indirect*` so their details either
+            // do not matter or they are checked by `PassMode::eq_abi`.
+            fields: _,
+            variants: _,
+            // Inhabitedness and niches are not ABI-relevant.
+            largest_niche: _,
+            uninhabited: _,
+            // max_repr_align, unadjusted_abi_align, repr_c are not read directly by codegen
+            // backends. They are only used to compute `PassMode`. So we can ignore them here, any
+            // differences they may cause are picked up by the `PassMode` check.
+            max_repr_align: _,
+            unadjusted_abi_align: _,
+            repr_c: _,
+            // The seed does not affect the ABI.
+            randomization_seed: _,
+        } = self;
         // The one thing that we are not capturing here is that for unsized types, the metadata must
         // also have the same ABI, and moreover that the same metadata leads to the same size. The
         // 2nd point is quite hard to check though.
-        self.size == other.size
-            && self.is_sized() == other.is_sized()
-            && self.backend_repr.eq_up_to_validity(&other.backend_repr)
-            && self.backend_repr.is_bool() == other.backend_repr.is_bool()
-            && self.align.abi == other.align.abi
-            && self.max_repr_align == other.max_repr_align
-            && self.unadjusted_abi_align == other.unadjusted_abi_align
+        *size == other.size
+            && *align == other.align
+            && backend_repr.eq_up_to_validity(&other.backend_repr)
+            // `is_bool` checks validity and is ABI-relevant, so we need to consider it.
+            && backend_repr.is_bool() == other.backend_repr.is_bool()
     }
 }
 
@@ -2338,12 +2478,22 @@ pub enum AbiFromStrErr {
     NoExplicitUnwind,
 }
 
-// NOTE: This struct is generic over the FieldIdx and VariantIdx for rust-analyzer usage.
+/// The layout information for a variant.
+///
+/// For items with multiple variants ([`Variants::Multiple`]), the layout information of each
+/// variant largely matches that of the overall item. So, instead of giving each one a new [`LayoutData`],
+/// we use this struct, which stores only the information that differs between the variants.
+///
+/// See <https://github.com/rust-lang/rust/issues/113988> for more context.
+// NOTE: This struct is generic over the FieldIdx for rust-analyzer usage.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub struct VariantLayout<FieldIdx: Idx> {
+    // FIXME: ideally we'd remove these as variants should not have their own
+    // size or backend_repr.
     pub size: Size,
     pub backend_repr: BackendRepr,
+
     pub field_offsets: IndexVec<FieldIdx, Size>,
     fields_in_memory_order: IndexVec<u32, FieldIdx>,
     largest_niche: Option<Niche>,

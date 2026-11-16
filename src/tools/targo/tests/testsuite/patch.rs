@@ -55,7 +55,7 @@ fn replace() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] baz v0.1.0 (registry `dummy-registry`)
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
@@ -90,6 +90,9 @@ fn from_config() {
 
                 [dependencies]
                 bar = "0.1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -107,7 +110,7 @@ fn from_config() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.1 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -132,6 +135,9 @@ fn from_config_relative() {
 
                 [dependencies]
                 bar = "0.1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -149,7 +155,7 @@ fn from_config_relative() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.1 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -177,6 +183,9 @@ fn from_config_precedence() {
 
                 [patch.crates-io]
                 bar = { path = 'no-such-path' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -194,7 +203,7 @@ fn from_config_precedence() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.1 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -235,7 +244,7 @@ fn nonexistent() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -288,7 +297,7 @@ fn patch_git() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -342,7 +351,7 @@ fn patch_to_git() {
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/override`
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.0 ([ROOTURL]/override#[..])
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -398,16 +407,12 @@ Caused by:
   failed to clone into: [ROOT]/home/.cargo/git/db/123-[HASH]
 
 Caused by:
-  network failure seems to have happened
-  if a proxy or similar is necessary `net.git-fetch-with-cli` may help here
-  https://doc.rust-lang.org/cargo/reference/config.html#netgit-fetch-with-cli
+  `git fetch` failed for https://github.com/rust-lang/does-not-exist/pull/123
 
-  [NOTE] GitHub url https://github.com/rust-lang/does-not-exist/pull/123 is not a repository. 
-  [HELP] Replace the dependency with 
-         `git = "https://github.com/rust-lang/does-not-exist.git" rev = "refs/pull/123/head"` 
-     to specify pull requests as dependencies' revision.
+  [NOTE] GitHub url https://github.com/rust-lang/does-not-exist/pull/123 is not a repository
+  [HELP] to specify a pull request as a dependency, replace the dependency with:
+         `git = "https://github.com/rust-lang/does-not-exist.git" rev = "refs/pull/123/head"`
 
-Caused by:
 ...
 
 "#]])
@@ -433,6 +438,9 @@ fn unused() {
 
                 [patch.crates-io]
                 bar = { path = "bar" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -448,7 +456,7 @@ fn unused() {
       with the dependency requirements. If the patch has a different version from
       what is locked in the Cargo.lock file, run `cargo update` to use the new
       version. This may also occur with an optional dependency that is not enabled.
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.1.0 (available: v0.2.0)
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
@@ -481,6 +489,67 @@ fn unused() {
     );
 }
 
+// Trust: lockfile array order must not turn an unchanged local resolve into a
+// --locked update, and a real unused-patch version update must still refuse.
+#[cargo_test]
+fn unused_patch_permutation_preserves_locked_file() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                "{}\n[patch.crates-io]\nalpha = {{ path = 'alpha' }}\nbeta = {{ path = 'beta' }}\n",
+                basic_manifest("foo", "0.1.0")
+            ),
+        )
+        .file("src/lib.rs", "")
+        .file("alpha/Cargo.toml", &basic_manifest("alpha", "1.0.0"))
+        .file("alpha/src/lib.rs", "")
+        .file("beta/Cargo.toml", &basic_manifest("beta", "1.0.0"))
+        .file("beta/src/lib.rs", "")
+        .build();
+    p.cargo("generate-lockfile --offline").run();
+    let original = p.read_lockfile();
+    let mut entries = original.split("[[patch.unused]]");
+    let prefix = entries.next().unwrap();
+    let mut entries: Vec<_> = entries.collect();
+    assert_eq!(entries.len(), 2);
+    entries.reverse();
+    let reordered = format!(
+        "{prefix}{}",
+        entries
+            .into_iter()
+            .map(|entry| format!("[[patch.unused]]{entry}"))
+            .collect::<String>()
+    );
+    p.change_file("Cargo.lock", &reordered);
+    let modified = fs::metadata(p.root().join("Cargo.lock"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    for _ in 0..2 {
+        p.cargo("generate-lockfile --offline --locked").run();
+        assert_eq!(p.read_lockfile(), reordered);
+        assert_eq!(
+            fs::metadata(p.root().join("Cargo.lock"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified
+        );
+    }
+    p.change_file("alpha/Cargo.toml", &basic_manifest("alpha", "1.0.1"));
+    p.cargo("generate-lockfile --offline --locked")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+...
+[ERROR] cannot update the lock file [ROOT]/foo/Cargo.lock because --locked was passed to prevent this
+[HELP] to generate the lock file without accessing the network, remove the --locked flag and use --offline instead.
+
+"#]])
+        .run();
+    assert_eq!(p.read_lockfile(), reordered);
+}
+
 #[cargo_test]
 fn unused_with_mismatch_source_being_patched() {
     registry::alt_init();
@@ -504,6 +573,9 @@ fn unused_with_mismatch_source_being_patched() {
 
                 [patch.crates-io]
                 bar = { path = "baz" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -525,7 +597,7 @@ fn unused_with_mismatch_source_being_patched() {
       with the dependency requirements. If the patch has a different version from
       what is locked in the Cargo.lock file, run `cargo update` to use the new
       version. This may also occur with an optional dependency that is not enabled.
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.1.0 (available: v0.3.0)
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
@@ -556,6 +628,9 @@ fn prefer_patch_version() {
 
                 [patch.crates-io]
                 bar = { path = "bar" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -566,7 +641,7 @@ fn prefer_patch_version() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.1 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -602,6 +677,9 @@ fn unused_from_config() {
 
                 [dependencies]
                 bar = "0.1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -624,7 +702,7 @@ fn unused_from_config() {
       with the dependency requirements. If the patch has a different version from
       what is locked in the Cargo.lock file, run `cargo update` to use the new
       version. This may also occur with an optional dependency that is not enabled.
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.1.0 (available: v0.2.0)
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
@@ -682,6 +760,9 @@ fn unused_git() {
 
                     [patch.crates-io]
                     bar = {{ git = '{}' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
                 foo.url()
             ),
@@ -698,7 +779,7 @@ fn unused_git() {
       with the dependency requirements. If the patch has a different version from
       what is locked in the Cargo.lock file, run `cargo update` to use the new
       version. This may also occur with an optional dependency that is not enabled.
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.1.0 (available: v0.2.0)
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
@@ -737,6 +818,9 @@ fn add_patch() {
 
                 [dependencies]
                 bar = "0.1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -747,7 +831,7 @@ fn add_patch() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
 [CHECKING] bar v0.1.0
@@ -777,12 +861,15 @@ fn add_patch() {
 
             [patch.crates-io]
             bar = { path = 'bar' }
+
+            [lints.cargo]
+            default = "allow"
         "#,
     );
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -814,6 +901,9 @@ fn add_patch_from_config() {
 
                 [dependencies]
                 bar = "0.1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -824,7 +914,7 @@ fn add_patch_from_config() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
 [CHECKING] bar v0.1.0
@@ -850,7 +940,7 @@ fn add_patch_from_config() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -882,6 +972,9 @@ fn add_ignored_patch() {
 
                 [dependencies]
                 bar = "0.1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -892,7 +985,7 @@ fn add_ignored_patch() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
 [CHECKING] bar v0.1.0
@@ -922,6 +1015,9 @@ fn add_ignored_patch() {
 
             [patch.crates-io]
             bar = { path = 'bar' }
+
+            [lints.cargo]
+            default = "allow"
         "#,
     );
 
@@ -978,6 +1074,9 @@ fn add_patch_with_features() {
 
             [patch.crates-io]
             bar = { path = 'bar', features = ["some_feature"] }
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/lib.rs", "")
@@ -991,7 +1090,7 @@ fn add_patch_with_features() {
   |
   = [HELP] configure `features` in the `dependencies` entry
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1028,6 +1127,9 @@ fn add_patch_with_setting_default_features() {
 
             [patch.crates-io]
             bar = { path = 'bar', default-features = false, features = ["none_default_feature"] }
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/lib.rs", "")
@@ -1041,7 +1143,7 @@ fn add_patch_with_setting_default_features() {
   |
   = [HELP] configure `features`, `default-features` in the `dependencies` entry
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1123,6 +1225,9 @@ fn new_minor() {
 
                 [patch.crates-io]
                 bar = { path = 'bar' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1133,7 +1238,7 @@ fn new_minor() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.1 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1161,6 +1266,9 @@ fn transitive_new_minor() {
 
                 [patch.crates-io]
                 baz = { path = 'baz' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1175,6 +1283,9 @@ fn transitive_new_minor() {
 
                 [dependencies]
                 baz = '0.1.0'
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/lib.rs", r#""#)
@@ -1185,7 +1296,7 @@ fn transitive_new_minor() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] baz v0.1.1 ([ROOT]/foo/baz)
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -1214,6 +1325,9 @@ fn new_major() {
 
                 [patch.crates-io]
                 bar = { path = 'bar' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1224,7 +1338,7 @@ fn new_major() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.2.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1252,12 +1366,15 @@ fn new_major() {
 
             [dependencies]
             bar = "0.2.0"
+
+            [lints.cargo]
+            default = "allow"
         "#,
     );
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.2.0
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.2.0 (registry `dummy-registry`)
@@ -1288,6 +1405,9 @@ fn transitive_new_major() {
 
                 [patch.crates-io]
                 baz = { path = 'baz' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1302,6 +1422,9 @@ fn transitive_new_major() {
 
                 [dependencies]
                 baz = '0.2.0'
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/lib.rs", r#""#)
@@ -1312,7 +1435,7 @@ fn transitive_new_major() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] baz v0.2.0 ([ROOT]/foo/baz)
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -1347,6 +1470,9 @@ fn shared_by_transitive() {
 
                     [patch.crates-io]
                     baz = {{ git = "{}", version = "0.1" }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
                 baz.url(),
             ),
@@ -1362,6 +1488,9 @@ fn shared_by_transitive() {
 
                 [dependencies]
                 baz = "0.1.1"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/lib.rs", "")
@@ -1371,7 +1500,7 @@ fn shared_by_transitive() {
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/override`
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] baz v0.1.2 ([ROOTURL]/override#[..])
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
@@ -1545,6 +1674,9 @@ fn patch_in_virtual() {
 
                 [dependencies]
                 bar = "0.1"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("foo/src/lib.rs", r#""#)
@@ -1553,7 +1685,7 @@ fn patch_in_virtual() {
     p.cargo("check -p foo")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.1.0 ([ROOT]/foo/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1596,6 +1728,9 @@ fn patch_depends_on_another_patch() {
                 [patch.crates-io]
                 bar = { path = "bar" }
                 baz = { path = "baz" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1612,6 +1747,9 @@ fn patch_depends_on_another_patch() {
 
                 [dependencies]
                 bar = "0.1"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("baz/src/lib.rs", r#""#)
@@ -1695,6 +1833,9 @@ fn patch_older() {
 
                 [patch.crates-io]
                 baz = { path = "./baz" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1709,6 +1850,9 @@ fn patch_older() {
 
                 [dependencies]
                 baz = "1.0.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/lib.rs", "")
@@ -1720,6 +1864,9 @@ fn patch_older() {
                 version = "1.0.1"
                 edition = "2015"
                 authors = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("baz/src/lib.rs", "")
@@ -1728,7 +1875,7 @@ fn patch_older() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] baz v1.0.1 ([ROOT]/foo/baz)
 [CHECKING] bar v0.5.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
@@ -2162,6 +2309,9 @@ fn update_unused_new_version() {
 
                 [patch.crates-io]
                 bar = { path = "../bar" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -2201,7 +2351,7 @@ fn update_unused_new_version() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.1.6 ([ROOT]/bar)
 [CHECKING] bar v0.1.6 ([ROOT]/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -2225,7 +2375,7 @@ fn update_unused_new_version() {
     p.cargo("update bar")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.1.6 ([ROOT]/bar)
 [REMOVING] bar v0.1.5
 
@@ -2237,7 +2387,7 @@ fn update_unused_new_version() {
     p.cargo("update")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.1.6 ([ROOT]/bar)
 [REMOVING] bar v0.1.5
 
@@ -2507,6 +2657,9 @@ fn patch_from_env_config_is_ignored() {
 
                  [dependencies]
                  bar = "1.0.0"
+
+                 [lints.cargo]
+                 default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -2520,7 +2673,7 @@ fn patch_from_env_config_is_ignored() {
         .with_status(0)
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
 [CHECKING] bar v1.0.0
@@ -2550,6 +2703,9 @@ fn patch_walks_backwards() {
 
             [patch.crates-io]
             bar = {path="bar"}
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -2560,7 +2716,7 @@ fn patch_walks_backwards() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.1 ([ROOT]/foo/bar)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -2574,7 +2730,7 @@ fn patch_walks_backwards() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNGRADING] bar v0.1.1 ([ROOT]/foo/bar) -> v0.1.0
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
@@ -2604,6 +2760,9 @@ fn patch_walks_backwards_restricted() {
 
             [patch.crates-io]
             bar = {path="bar", version="0.1.1"}
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -2614,7 +2773,7 @@ fn patch_walks_backwards_restricted() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.1 ([ROOT]/foo/bar)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -2659,6 +2818,9 @@ fn patched_dep_new_version() {
 
             [patch.crates-io]
             bar = {path="bar"}
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -2672,6 +2834,9 @@ fn patched_dep_new_version() {
 
             [dependencies]
             baz = "0.1"
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("bar/src/lib.rs", "")
@@ -2681,7 +2846,7 @@ fn patched_dep_new_version() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] baz v0.1.0 (registry `dummy-registry`)
 [CHECKING] baz v0.1.0
@@ -2713,6 +2878,9 @@ fn patched_dep_new_version() {
 
             [dependencies]
             baz = "0.1.1"
+
+            [lints.cargo]
+            default = "allow"
         "#,
     );
 
@@ -2720,7 +2888,7 @@ fn patched_dep_new_version() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [UPDATING] baz v0.1.0 -> v0.1.1
 [DOWNLOADING] crates ...
 [DOWNLOADED] baz v0.1.1 (registry `dummy-registry`)
@@ -2756,6 +2924,9 @@ fn patch_update_doesnt_update_other_sources() {
 
             [patch.crates-io]
             bar = { path = "bar" }
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -2768,7 +2939,7 @@ fn patch_update_doesnt_update_other_sources() {
             str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] `alternative` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `alternative`)
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
@@ -2800,7 +2971,7 @@ fn patch_update_doesnt_update_other_sources() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [UPDATING] bar v0.1.0 ([ROOT]/foo/bar) -> v0.1.1
 [CHECKING] bar v0.1.1 ([ROOT]/foo/bar)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
@@ -2832,6 +3003,9 @@ fn can_update_with_alt_reg() {
 
                 [patch.crates-io]
                 bar = { version = "=0.1.1", registry = "alternative" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -2841,7 +3015,7 @@ fn can_update_with_alt_reg() {
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.1 (registry `alternative`)
 [CHECKING] bar v0.1.1 (registry `alternative`)
@@ -2866,7 +3040,7 @@ fn can_update_with_alt_reg() {
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [UPDATING] `dummy-registry` index
-[LOCKING] 0 packages to latest compatible versions
+[LOCKING] 0 packages to highest compatible versions
 [NOTE] pass `--verbose` to see 1 unchanged dependencies behind latest
 
 "#]])
@@ -2886,6 +3060,9 @@ fn can_update_with_alt_reg() {
 
             [patch.crates-io]
             bar = { version = "=0.1.2", registry = "alternative" }
+
+            [lints.cargo]
+            default = "allow"
         "#,
     );
 
@@ -2893,7 +3070,7 @@ fn can_update_with_alt_reg() {
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [UPDATING] bar v0.1.1 (registry `alternative`) -> v0.1.2
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.2 (registry `alternative`)
@@ -2983,7 +3160,7 @@ dependencies = [
         .with_stderr_data(
             "\
 [UPDATING] git repository `[ROOTURL]/bar`
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v1.0.0 ([ROOTURL]/bar?branch=master#[..])
 ",
         )

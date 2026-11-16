@@ -158,7 +158,7 @@ pub(crate) fn lower_cfg_to_blocks(
     cfg.nodes
         .iter()
         .map(|node| {
-            let mut stmts = Vec::new();
+            let mut stmts = Vec::with_capacity(node.instructions.len());
             let mut terminator = None;
 
             for insn in &node.instructions {
@@ -337,6 +337,10 @@ fn lower_instruction(
             Some(Terminator::Call {
                 is_unsafe_sig: false,
                 callee_identity: None,
+                // NO KEY: this terminator is lowered from a BINARY, not from MIR — there is
+                // no `TyCtxt` and therefore no `DefId` to resolve. `None` is the honest
+                // answer and it fails closed: the unsafe mint declines every contract here.
+                callee_key: None,
                 is_foreign: false,
                 func: func.clone(),
                 args: args.iter().map(|arg| abstract_value_to_operand(arg, context)).collect(),

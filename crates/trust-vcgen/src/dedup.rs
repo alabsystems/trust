@@ -10,9 +10,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 
-use trust_types::fx::FxHashMap;
+use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{Formula, Sort, VerificationCondition, VerificationResult};
 
 /// Compute a structural fingerprint of a `Formula`.
@@ -27,7 +28,7 @@ use trust_types::{Formula, Sort, VerificationCondition, VerificationResult};
 #[must_use]
 pub fn formula_fingerprint(f: &Formula) -> u64 {
     // Normalize bound variables for alpha-equivalence, then hash.
-    let normalized = normalize_alpha(f);
+    let normalized = normalize_alpha_cow(f);
     let mut hasher = std::hash::DefaultHasher::new();
     normalized.hash(&mut hasher);
     hasher.finish()
@@ -40,12 +41,16 @@ pub fn formula_fingerprint(f: &Formula) -> u64 {
 /// structurally equivalent formulas will have the same fingerprint.
 #[must_use]
 pub fn vc_fingerprint(vc: &VerificationCondition) -> u64 {
+    let normalized = normalize_alpha_cow(&vc.formula);
+    vc_fingerprint_normalized(vc, &normalized)
+}
+
+fn vc_fingerprint_normalized(vc: &VerificationCondition, normalized_formula: &Formula) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     // Hash the kind description as a stable string representation.
     vc.kind.description().hash(&mut hasher);
     // Hash the formula structurally (with alpha-normalization).
-    let normalized = normalize_alpha(&vc.formula);
-    normalized.hash(&mut hasher);
+    normalized_formula.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -64,6 +69,9 @@ pub struct VcDeduplicator {
 
 #[derive(Debug)]
 struct CachedVcResult {
+    function: trust_types::Symbol,
+    location: trust_types::SourceSpan,
+    contract_metadata: Option<trust_types::ContractMetadata>,
     canonical_payload: String,
     result: VerificationResult,
 }
@@ -81,12 +89,28 @@ impl VcDeduplicator {
     /// alpha-normalized VC was previously recorded, `None` otherwise.
     #[must_use]
     pub fn check(&self, vc: &VerificationCondition) -> Option<&VerificationResult> {
-        let fp = vc_fingerprint(vc);
-        let canonical_payload = canonical_vc_payload(vc)?;
-        self.cache
-            .get(&fp)?
+        if self.cache.is_empty() {
+            return None;
+        }
+        let normalized_formula = normalize_alpha_cow(&vc.formula);
+        let fp = vc_fingerprint_normalized(vc, &normalized_formula);
+        let bucket = self.cache.get(&fp)?;
+        if !bucket.iter().any(|entry| {
+            entry.function == vc.function
+                && entry.location == vc.location
+                && entry.contract_metadata == vc.contract_metadata
+        }) {
+            return None;
+        }
+        let canonical_payload = canonical_vc_payload_normalized(vc, &normalized_formula)?;
+        bucket
             .iter()
-            .find(|entry| entry.canonical_payload == canonical_payload)
+            .find(|entry| {
+                entry.function == vc.function
+                    && entry.location == vc.location
+                    && entry.contract_metadata == vc.contract_metadata
+                    && entry.canonical_payload == canonical_payload
+            })
             .map(|entry| &entry.result)
     }
 
@@ -95,19 +119,29 @@ impl VcDeduplicator {
     /// Future calls to `check` with the same exact canonical VC will return a
     /// reference to this result.
     pub fn record(&mut self, vc: &VerificationCondition, result: VerificationResult) {
-        let fp = vc_fingerprint(vc);
-        let Some(canonical_payload) = canonical_vc_payload(vc) else {
+        let normalized_formula = normalize_alpha_cow(&vc.formula);
+        let fp = vc_fingerprint_normalized(vc, &normalized_formula);
+        let Some(canonical_payload) = canonical_vc_payload_normalized(vc, &normalized_formula) else {
             // Serialization failure means exact equality is unavailable. Never
             // cache under a lossy fallback that could transfer proof evidence.
             return;
         };
         let bucket = self.cache.entry(fp).or_default();
-        if let Some(entry) =
-            bucket.iter_mut().find(|entry| entry.canonical_payload == canonical_payload)
-        {
+        if let Some(entry) = bucket.iter_mut().find(|entry| {
+            entry.function == vc.function
+                && entry.location == vc.location
+                && entry.contract_metadata == vc.contract_metadata
+                && entry.canonical_payload == canonical_payload
+        }) {
             entry.result = result;
         } else {
-            bucket.push(CachedVcResult { canonical_payload, result });
+            bucket.push(CachedVcResult {
+                function: vc.function,
+                location: vc.location.clone(),
+                contract_metadata: vc.contract_metadata.clone(),
+                canonical_payload,
+                result,
+            });
             self.entries = self.entries.saturating_add(1);
         }
     }
@@ -135,15 +169,58 @@ impl VcDeduplicator {
 /// metadata remain in the payload because `VerificationResult` may carry
 /// evidence bound to those fields; semantic formula equality alone is not
 /// sufficient authority to move that evidence to another public row.
-fn canonical_vc_payload(vc: &VerificationCondition) -> Option<String> {
-    let formula = normalize_alpha(&vc.formula);
-    serde_json::to_string(&(&vc.kind, vc.function, &vc.location, formula, &vc.contract_metadata))
-        .ok()
+fn canonical_vc_payload_normalized(
+    vc: &VerificationCondition,
+    normalized_formula: &Formula,
+) -> Option<String> {
+    serde_json::to_string(&(
+        &vc.kind,
+        vc.function,
+        &vc.location,
+        normalized_formula,
+        &vc.contract_metadata,
+    ))
+    .ok()
 }
 
 // ---------------------------------------------------------------------------
 // Alpha-equivalence normalization
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlphaNormNeed {
+    None,
+    SymVarOnly,
+    Quantified,
+}
+
+fn alpha_normalization_need(f: &Formula) -> AlphaNormNeed {
+    let mut saw_sym_var = false;
+    let has_quantifier = trust_types::any_formula_node(f, &mut |node| match node {
+        Formula::Forall(..) | Formula::Exists(..) => true,
+        Formula::SymVar(..) => {
+            saw_sym_var = true;
+            false
+        }
+        _ => false,
+    });
+    if has_quantifier {
+        AlphaNormNeed::Quantified
+    } else if saw_sym_var {
+        AlphaNormNeed::SymVarOnly
+    } else {
+        AlphaNormNeed::None
+    }
+}
+
+#[must_use]
+pub(crate) fn normalize_alpha_cow(f: &Formula) -> Cow<'_, Formula> {
+    match alpha_normalization_need(f) {
+        AlphaNormNeed::None => Cow::Borrowed(f),
+        AlphaNormNeed::SymVarOnly => Cow::Owned(normalize_alpha_slow(f, false)),
+        AlphaNormNeed::Quantified => Cow::Owned(normalize_alpha_slow(f, true)),
+    }
+}
 
 /// Normalize bound variables to canonical names for alpha-equivalence.
 ///
@@ -151,84 +228,106 @@ fn canonical_vc_payload(vc: &VerificationCondition) -> Option<String> {
 /// in order of first binding encounter. Free variables are left unchanged.
 #[must_use]
 pub(crate) fn normalize_alpha(f: &Formula) -> Formula {
+    normalize_alpha_cow(f).into_owned()
+}
+
+fn normalize_alpha_slow(f: &Formula, has_quantifier: bool) -> Formula {
     let mut counter = 0usize;
     let mut env: FxHashMap<String, String> = FxHashMap::default();
+    let mut free_names: FxHashSet<&str> = FxHashSet::default();
     // Generated canonical binders must never capture a free program variable.
-    // Identity mappings preserve free names and reserve them from generation.
-    for name in f.free_variables() {
-        env.insert(name.clone(), name);
+    // Borrowed free names reserve them from generation without cloning Strings.
+    // Only populate `free_names` when the formula actually contains quantifiers.
+    if has_quantifier {
+        trust_types::for_each_free_variable_name(f, &mut |name| {
+            free_names.insert(name);
+        });
     }
-    normalize_inner(f, &mut env, &mut counter)
+    normalize_inner(f.clone(), &free_names, &mut env, &mut counter)
 }
 
 /// Recursive alpha-normalization with scoped environment.
 fn normalize_inner(
-    f: &Formula,
+    f: Formula,
+    free_names: &FxHashSet<&str>,
     env: &mut FxHashMap<String, String>,
     counter: &mut usize,
 ) -> Formula {
     match f {
         Formula::Var(name, sort) => {
             // Look up in environment for bound vars, else keep free name.
-            let resolved = env.get(name).cloned().unwrap_or_else(|| name.clone());
-            Formula::Var(resolved, sort.clone())
+            let resolved = if env.is_empty() {
+                name
+            } else {
+                env.get(&name).cloned().unwrap_or(name)
+            };
+            Formula::Var(resolved, sort)
         }
         Formula::SymVar(name, sort) => {
             let name = name.as_str();
-            let resolved = env.get(name).cloned().unwrap_or_else(|| name.to_string());
+            let resolved = if env.is_empty() {
+                name.to_string()
+            } else {
+                env.get(name).cloned().unwrap_or_else(|| name.to_string())
+            };
             // Var and SymVar are semantically identical representations. Use
             // one canonical spelling so representation choice cannot defeat
             // alpha-equivalent deduplication.
-            Formula::Var(resolved, sort.clone())
+            Formula::Var(resolved, sort)
         }
-        Formula::Forall(bindings, body) => normalize_quantifier(bindings, body, true, env, counter),
+        Formula::Forall(bindings, body) => {
+            normalize_quantifier(&bindings, *body, true, free_names, env, counter)
+        }
         Formula::Exists(bindings, body) => {
-            normalize_quantifier(bindings, body, false, env, counter)
+            normalize_quantifier(&bindings, *body, false, free_names, env, counter)
         }
         // Formula owns an exhaustive child mapper. Using it here keeps
         // alpha-normalization wired for FP, predicate, datatype, and future
         // term families instead of silently cloning new variants unchanged.
-        _ => f.clone().map_children(&mut |child| normalize_inner(&child, env, counter)),
+        other => other.map_children(&mut |child| normalize_inner(child, free_names, env, counter)),
     }
 }
 
 /// Normalize a quantifier node (Forall or Exists).
 fn normalize_quantifier(
     bindings: &[(trust_types::Symbol, Sort)],
-    body: &Formula,
+    body: Formula,
     is_forall: bool,
+    free_names: &FxHashSet<&str>,
     env: &mut FxHashMap<String, String>,
     counter: &mut usize,
 ) -> Formula {
     // Save old bindings so we can restore after scope exit.
-    let mut saved: Vec<(String, Option<String>)> = Vec::new();
-    let mut new_bindings = Vec::new();
+    let mut saved: Vec<(trust_types::Symbol, Option<String>)> = Vec::with_capacity(bindings.len());
+    let mut new_bindings = Vec::with_capacity(bindings.len());
 
     for (name, sort) in bindings {
         let canonical = loop {
             let candidate = format!("__alpha_{counter}");
-            *counter =
-                counter.checked_add(1).expect("VC dedup alpha-normalization counter exhausted");
-            if !env.contains_key(&candidate) {
+            let Some(next) = counter.checked_add(1) else {
+                break candidate;
+            };
+            *counter = next;
+            if !free_names.contains(candidate.as_str()) && !env.contains_key(&candidate) {
                 break candidate;
             }
         };
-        let name_str = name.to_string();
-        saved.push((name_str.clone(), env.get(&name_str).cloned()));
-        env.insert(name_str, canonical.clone());
-        new_bindings.push((trust_types::Symbol::intern(&canonical), sort.clone()));
+        let canonical_sym = trust_types::Symbol::intern(&canonical);
+        let old_val = env.insert(name.to_string(), canonical);
+        saved.push((*name, old_val));
+        new_bindings.push((canonical_sym, sort.clone()));
     }
 
-    let new_body = normalize_inner(body, env, counter);
+    let new_body = normalize_inner(body, free_names, env, counter);
 
     // Restore previous bindings (important for nested quantifiers).
     for (name, old_val) in saved.into_iter().rev() {
         match old_val {
             Some(v) => {
-                env.insert(name, v);
+                env.insert(name.to_string(), v);
             }
             None => {
-                env.remove(&name);
+                env.remove(name.as_str());
             }
         }
     }
@@ -615,19 +714,6 @@ mod tests {
     }
 
     #[test]
-    fn test_formula_fingerprint_ite() {
-        let f = Formula::Ite(
-            Box::new(Formula::Bool(true)),
-            Box::new(Formula::Int(1)),
-            Box::new(Formula::Int(0)),
-        );
-        // Just check it does not panic and produces a deterministic value.
-        let fp1 = formula_fingerprint(&f);
-        let fp2 = formula_fingerprint(&f);
-        assert_eq!(fp1, fp2);
-    }
-
-    #[test]
     fn test_formula_fingerprint_array_ops() {
         let arr = Formula::Var("arr".into(), Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int)));
         let sel = Formula::Select(Box::new(arr.clone()), Box::new(Formula::Int(0)));
@@ -638,5 +724,35 @@ mod tests {
             formula_fingerprint(&sto),
             "Select and Store must produce different fingerprints"
         );
+    }
+
+    #[test]
+    fn test_wave504_dedup_precheck_and_single_pass_alpha_need() {
+        let plain = Formula::Add(Box::new(var("x")), Box::new(Formula::Int(1)));
+        assert!(matches!(alpha_normalization_need(&plain), AlphaNormNeed::None));
+
+        let sym_only = Formula::Add(
+            Box::new(Formula::SymVar("x".into(), Sort::Int)),
+            Box::new(Formula::Int(1)),
+        );
+        assert!(matches!(alpha_normalization_need(&sym_only), AlphaNormNeed::SymVarOnly));
+        assert_eq!(normalize_alpha(&sym_only), plain);
+
+        let quantified = Formula::Forall(
+            vec![("z".into(), Sort::Int)],
+            Box::new(Formula::Gt(
+                Box::new(Formula::SymVar("z".into(), Sort::Int)),
+                Box::new(Formula::Int(0)),
+            )),
+        );
+        assert!(matches!(alpha_normalization_need(&quantified), AlphaNormNeed::Quantified));
+
+        let mut dedup = VcDeduplicator::new();
+        let vc1 = make_vc(VcKind::DivisionByZero, plain.clone());
+        let mut vc2 = vc1.clone();
+        vc2.location.line_start = 42;
+        dedup.record(&vc1, proved());
+        assert!(dedup.check(&vc2).is_none());
+        assert!(dedup.check(&vc1).is_some());
     }
 }

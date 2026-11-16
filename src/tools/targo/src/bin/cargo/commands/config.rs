@@ -1,9 +1,15 @@
 use crate::command_prelude::*;
-use cargo::ops::cargo_config;
+use targo::ops::cargo_config;
 
 pub fn cli() -> Command {
     subcommand("config")
         .about("Inspect configuration values")
+        // Trust: internal typed project-policy query, not verification activation.
+        .subcommand(
+            subcommand("trust-policy")
+                .hide(true)
+                .arg_target_tuple("Target whose effective project requirements are resolved"),
+        )
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(
@@ -39,6 +45,15 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
         gctx.cli_unstable().unstable_options,
     )?;
     match args.subcommand() {
+        Some(("trust-policy", args)) => {
+            let targets = args
+                .get_many::<String>("target")
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>();
+            cargo_config::trust_policy(gctx, &targets)?;
+        }
         Some(("get", args)) => {
             let opts = cargo_config::GetOptions {
                 key: args.get_one::<String>("key").map(String::as_str),

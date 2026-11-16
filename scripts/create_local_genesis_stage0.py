@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -20,6 +21,15 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+# Trust: load the extraction-key owner by path, including under isolated -I -S.
+_IDENTITY_SPEC = importlib.util.spec_from_file_location(
+    "trust_stage0_identity", Path(__file__).resolve().parents[1] / "src/bootstrap/stage0_identity.py",
+)
+_IDENTITY_OWNER = importlib.util.module_from_spec(_IDENTITY_SPEC)
+_IDENTITY_SPEC.loader.exec_module(_IDENTITY_OWNER)
+stage0_extraction_stamp = _IDENTITY_OWNER.extraction_stamp
 
 
 SCHEMA = "trust.local-genesis-stage0-adapter.v1"
@@ -122,8 +132,18 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+# Every tool probe runs from the filesystem root. A rustup proxy reads
+# rust-toolchain.toml from its cwd upward, and the dev tree pins
+# channel = "trust": probed from the checkout,
+# the host Rust this adapter wraps would resolve to the Trust channel, or fail
+# where none is linked. install-trust-toolchain.sh probes stage0 the same way.
+NEUTRAL_PROBE_CWD = os.path.abspath(os.sep)
+
+
 def run_stdout(args: list[str]) -> str:
-    return subprocess.run(args, text=True, check=True, stdout=subprocess.PIPE).stdout
+    return subprocess.run(
+        args, text=True, check=True, stdout=subprocess.PIPE, cwd=NEUTRAL_PROBE_CWD
+    ).stdout
 
 
 def sha256_file(path: Path) -> str:
@@ -407,6 +427,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     root = args.repo_root.resolve()
     values = stage0_values(root / "src" / "stage0")
+    # GENESIS ADAPTER (developer adapter, never release evidence; retiring it is
+    # decided separately): wrapping a host (stock) Rust is its purpose.
     rustc_frontend = find_tool("rustc")
     if rustc_frontend is None:
         raise SystemExit("rustc must be on PATH to create a genesis adapter")
@@ -426,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
     host = args.host or host_triple_from_rustc(rustc) or host_from_platform()
     genesis_root = validate_pinned_genesis_toolchain(root, rustc, host)
     # Default OUTSIDE bootstrap.py's managed bin_root (build/<host>/stage0):
-    # download_toolchain() wipes that root on any stage0 pin-date advance,
+    # download_toolchain() refreshes that root on any stage0 pin-identity change,
     # which would delete this adapter mid-flow.
     out = args.out.resolve() if args.out else root / "build" / host / "genesis-stage0"
     bin_dir = out / "bin"
@@ -497,15 +519,11 @@ def main(argv: list[str] | None = None) -> int:
         if os.path.lexists(forbidden_path):
             forbidden_path.unlink()
 
-    stamp = values.get("compiler_date")
-    if not stamp:
+    if not values.get("compiler_date"):
         raise SystemExit("src/stage0 does not contain compiler_date")
-    # Bootstrap's BuildStamp::with_prefix("trustc") looks for `.trustc-stamp`
-    # in the stage0 root for the "is the downloaded stage0 still current?"
-    # check. Writing `.rustc-stamp` (the upstream-Rust name) leaves the stamp
-    # invisible to bootstrap, which then wipes the genesis adapter and tries to
-    # download. Write both names so the adapter satisfies Trust's check while
-    # keeping the inherited filename for tooling that reads it.
+    stamp = stage0_extraction_stamp(values)
+    # Both aliases carry the current cache key. This is not Trust seed admission:
+    # the adapter remains an explicitly external, genesis-only bootstrap root.
     (out / ".trustc-stamp").write_text(stamp, encoding="utf-8")
     (out / ".rustc-stamp").write_text(stamp, encoding="utf-8")
 

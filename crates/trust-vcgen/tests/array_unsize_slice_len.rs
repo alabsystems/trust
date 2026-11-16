@@ -22,6 +22,9 @@
 use trust_types::*;
 use trust_vcgen::generate_vcs;
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn fixture(json: &str) -> VerifiableFunction {
     serde_json::from_str(json).expect("fixture MIR must deserialize")
 }
@@ -53,7 +56,7 @@ fn unsafe_crossed_lengths() -> VerifiableFunction {
 }
 
 fn router() -> trust_router::Router {
-    trust_router::Router::deterministic_in_process_ay(30_000)
+    test_router::deterministic_test_router()
 }
 
 fn verdict(router: &trust_router::Router, vc: &VerificationCondition) -> VerificationResult {

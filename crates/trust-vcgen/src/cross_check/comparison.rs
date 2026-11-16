@@ -4,7 +4,7 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::fx::FxHashSet;
-use trust_types::{VcKind, VerifiableFunction};
+use trust_types::{VcKind, VerifiableFunction, VerificationCondition};
 
 use super::cross_check_all_vcs;
 use super::reference_vcgen::reference_vcgen;
@@ -72,11 +72,21 @@ impl CrossCheckResult {
 /// run structural checks on the primary VCs, and compare the VC-kind sets.
 #[must_use]
 pub fn full_cross_check(func: &VerifiableFunction) -> CrossCheckResult {
-    let reference_kinds = reference_vcgen(func);
     let primary_vcs = crate::generate_vcs(func);
+    full_cross_check_with_vcs(func, &primary_vcs)
+}
+
+/// Run a full cross-check using pre-generated primary VCs so callers that
+/// already generated `primary_vcs` do not run `crate::generate_vcs(func)` twice.
+#[must_use]
+pub(crate) fn full_cross_check_with_vcs(
+    func: &VerifiableFunction,
+    primary_vcs: &[VerificationCondition],
+) -> CrossCheckResult {
+    let reference_kinds = reference_vcgen(func);
     let primary_kinds: Vec<VcKind> = primary_vcs.iter().map(|vc| vc.kind.clone()).collect();
 
-    let structural_warnings = cross_check_all_vcs(&primary_vcs, func);
+    let structural_warnings = cross_check_all_vcs(primary_vcs, func);
     let verdict = compare_vc_sets(&primary_kinds, &reference_kinds);
 
     CrossCheckResult {
@@ -128,6 +138,14 @@ pub(crate) fn categorize_vc(kind: &VcKind) -> VcCategory {
 pub(crate) fn compare_vc_sets(primary: &[VcKind], reference: &[VcKind]) -> CrossCheckVerdict {
     let primary_cats: FxHashSet<VcCategory> = primary.iter().map(categorize_vc).collect();
     let reference_cats: FxHashSet<VcCategory> = reference.iter().map(categorize_vc).collect();
+
+    let has_primary_only = primary_cats.iter().any(|c| !reference_cats.contains(c));
+    let has_reference_only = reference_cats
+        .iter()
+        .any(|&c| c != VcCategory::FloatSafety && !primary_cats.contains(&c));
+    if !has_primary_only && !has_reference_only {
+        return CrossCheckVerdict::Agree;
+    }
 
     let in_primary_only: FxHashSet<_> = primary_cats.difference(&reference_cats).copied().collect();
     // FloatSafety compares ONE-DIRECTIONALLY: the primary generator's interval

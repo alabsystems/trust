@@ -1,0 +1,4 @@
+error: unknown unstable option: `trust-platform-dumpfacts`
+  |
+  = help: you might have meant to use `-Z trust-platform-dump-facts=<value>`
+

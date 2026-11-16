@@ -73,8 +73,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::HashMap;
-
+use trust_types::fx::FxHashMap;
 use trust_types::{
     BlockId, Formula, Operand, Place, Projection, Rvalue, Sort, Statement, Terminator, Ty, VcKind,
     VerifiableFunction, VerificationCondition,
@@ -266,8 +265,10 @@ fn emit_bundle(func: &VerifiableFunction) -> Option<Vec<VerificationCondition>> 
     }
     // Coverage: one base, step arms cover every payload constructor once.
     out.steps.sort_by_key(|a| a.tag);
-    let tags: Vec<usize> = out.steps.iter().map(|a| a.tag).collect();
-    if out.base.len() != 1 || tags != (0..payload_variants.len()).collect::<Vec<_>>() {
+    if out.base.len() != 1
+        || out.steps.len() != payload_variants.len()
+        || !out.steps.iter().enumerate().all(|(idx, a)| a.tag == idx)
+    {
         return None;
     }
 
@@ -362,7 +363,13 @@ fn owalk(
     if depth > 64 {
         return false;
     }
-    let Some(block) = func.body.blocks.iter().find(|b| b.id == block_id) else {
+    let Some(block) = func
+        .body
+        .blocks
+        .get(block_id.0)
+        .filter(|b| b.id == block_id)
+        .or_else(|| func.body.blocks.iter().find(|b| b.id == block_id))
+    else {
         return false;
     };
     for stmt in &block.stmts {
@@ -373,7 +380,7 @@ fn owalk(
             let Some(result) = resolve_place(func, &state, &Place::local(0)) else {
                 return false;
             };
-            match (fuel, state.ctor.clone()) {
+            match (fuel, state.ctor.take()) {
                 (FuelLayer::None, _) => false,
                 (FuelLayer::Base, None) => {
                     // Exhaustion arm: `Exh` (nullary) or `Exh(e)` — pinned.
@@ -393,7 +400,7 @@ fn owalk(
                         return false;
                     }
                     out.exh_ctor = Some(ctor.clone());
-                    out.base.push(subst_post(func, post, &state, result.clone()));
+                    out.base.push(subst_post(func, post, &state, result));
                     out.base.len() == 1
                 }
                 (FuelLayer::Base, Some(_)) | (FuelLayer::Step, None) => false,
@@ -406,10 +413,10 @@ fn owalk(
                             let [tree] = args.as_slice() else {
                                 return false;
                             };
-                            let Some(payload_dt) = out.payload_dt.clone() else {
+                            let Some(payload_dt) = &out.payload_dt else {
                                 return false;
                             };
-                            if !valid_done_tree(tree, &arm.field_names, &payload_dt) {
+                            if !valid_done_tree(tree, &arm.field_names, payload_dt) {
                                 return false;
                             }
                             None
@@ -427,12 +434,12 @@ fn owalk(
                             return false; // a step arm may not fake exhaustion
                         }
                     }
-                    let conclusion = subst_post(func, post, &state, result.clone());
+                    let conclusion = subst_post(func, post, &state, result);
                     let body = if state.ih_atoms.is_empty() {
                         conclusion
                     } else {
                         Formula::Implies(
-                            Box::new(conjoin_all(state.ih_atoms.clone())),
+                            Box::new(conjoin_all(state.ih_atoms)),
                             Box::new(conclusion),
                         )
                     };
@@ -476,9 +483,7 @@ fn owalk(
                     };
                     let mut tags: Vec<usize> = targets.iter().map(|(t, _)| *t as usize).collect();
                     tags.sort_unstable();
-                    let mut expected = vec![z_tag, s_tag];
-                    expected.sort_unstable();
-                    if tags != expected {
+                    if tags.as_slice() != [z_tag.min(s_tag), z_tag.max(s_tag)] {
                         return false;
                     }
                     out.fuel_dt = Some(dt.clone());
@@ -552,7 +557,7 @@ fn owalk(
                     let dt_sort = crate::sort_for_ty(&dt);
                     for (tag, target) in targets {
                         let tag = *tag as usize;
-                        let Some((ctor, fields)) = variants.get(tag).cloned() else {
+                        let Some((ctor, fields)) = variants.get(tag) else {
                             return false;
                         };
                         let mut arm_state = state.clone();
@@ -573,7 +578,7 @@ fn owalk(
                                 sort: dt_sort.clone(),
                             },
                         );
-                        arm_state.ctor = Some((tag, ctor));
+                        arm_state.ctor = Some((tag, ctor.clone()));
                         if !owalk(
                             func,
                             post,
@@ -630,7 +635,8 @@ fn owalk(
             let ih_var = Formula::var_owned(ih_name.clone(), ret_sort.clone());
             state.binders.push((ih_name.clone(), ret_sort));
             state.store.insert(dest.local, ih_var.clone());
-            let mut map: HashMap<String, Formula> = HashMap::new();
+            let mut map: FxHashMap<String, Formula> =
+                FxHashMap::with_capacity_and_hasher(3, Default::default());
             map.insert(crate::place_to_var_name(func, &Place::local(FUEL_LOCAL)), fuel_arg);
             map.insert(crate::place_to_var_name(func, &Place::local(PAYLOAD_LOCAL)), payload_arg);
             map.insert("_0".to_string(), ih_var);
@@ -720,7 +726,7 @@ fn emit_loop_sim(
         let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue else {
             return None;
         };
-        if src.projections != vec![Projection::Deref] {
+        if src.projections.as_slice() != [Projection::Deref] {
             return None;
         }
         match src.local {
@@ -738,9 +744,17 @@ fn emit_loop_sim(
     let Terminator::Goto(head_id) = entry.terminator else {
         return None;
     };
+    let find_block = |id: BlockId| {
+        loop_fn
+            .body
+            .blocks
+            .get(id.0)
+            .filter(|blk| blk.id == id)
+            .or_else(|| loop_fn.body.blocks.iter().find(|blk| blk.id == id))
+    };
 
     // ── Loop head: switch on the counter's discriminant. ────────────────────
-    let head = loop_fn.body.blocks.iter().find(|blk| blk.id == head_id)?;
+    let head = find_block(head_id)?;
     let [Statement::Assign { place: d_place, rvalue: Rvalue::Discriminant(d_of), .. }] =
         head.stmts.as_slice()
     else {
@@ -759,9 +773,7 @@ fn emit_loop_sim(
     }
     let mut sorted_tags: Vec<usize> = targets.iter().map(|(t, _)| *t as usize).collect();
     sorted_tags.sort_unstable();
-    let mut expected = vec![z_tag, s_tag];
-    expected.sort_unstable();
-    if sorted_tags != expected {
+    if sorted_tags.as_slice() != [z_tag.min(s_tag), z_tag.max(s_tag)] {
         return None;
     }
     let z_target = targets.iter().find(|(t, _)| *t as usize == z_tag)?.1;
@@ -785,15 +797,15 @@ fn emit_loop_sim(
     let exits = |blk: &trust_types::BasicBlock| -> bool {
         match blk.terminator {
             Terminator::Return => true,
-            Terminator::Goto(t) => loop_fn.body.blocks.iter().any(|b2| {
-                b2.id == t && b2.stmts.is_empty() && matches!(b2.terminator, Terminator::Return)
+            Terminator::Goto(t) => find_block(t).is_some_and(|b2| {
+                b2.stmts.is_empty() && matches!(b2.terminator, Terminator::Return)
             }),
             _ => false,
         }
     };
 
     // ── Bail arm (counter = Z): _0 := Exh[(cur)], exit. ─────────────────────
-    let bail = loop_fn.body.blocks.iter().find(|blk| blk.id == z_target)?;
+    let bail = find_block(z_target)?;
     if !exits(bail) {
         return None;
     }
@@ -825,7 +837,7 @@ fn emit_loop_sim(
     };
 
     // ── Body arm (counter = S k): decrement then switch on cur. ─────────────
-    let body = loop_fn.body.blocks.iter().find(|blk| blk.id == s_target)?;
+    let body = find_block(s_target)?;
     let (cur_switch_targets, decremented) = {
         let mut state = WalkState::default();
         state.store.insert(cur, c_var.clone());
@@ -857,15 +869,16 @@ fn emit_loop_sim(
     }
     let mut arm_tags: Vec<usize> = cur_switch_targets.iter().map(|(t, _)| *t as usize).collect();
     arm_tags.sort_unstable();
-    if arm_tags != (0..variants.len()).collect::<Vec<_>>() {
+    if arm_tags.len() != variants.len() || !arm_tags.iter().copied().eq(0..variants.len()) {
         return None;
     }
 
     // ── Per-constructor arms. ────────────────────────────────────────────────
-    let mut arms: Vec<(String, Vec<Formula>, LoopArm)> = Vec::new();
+    let mut arms: Vec<(String, Vec<Formula>, LoopArm)> =
+        Vec::with_capacity(cur_switch_targets.len());
     for (tag, target) in &cur_switch_targets {
         let tag = *tag as usize;
-        let (ctor, fields) = variants.get(tag)?.clone();
+        let (ctor, fields) = variants.get(tag)?;
         let mut state = WalkState::default();
         let mut field_vars = Vec::with_capacity(fields.len());
         for (i, (_, fty)) in fields.iter().enumerate() {
@@ -884,7 +897,7 @@ fn emit_loop_sim(
             },
         );
         state.store.insert(b, k_var.clone());
-        let blk = loop_fn.body.blocks.iter().find(|b2| &b2.id == target)?;
+        let blk = find_block(*target)?;
         for stmt in &blk.stmts {
             apply_stmt(loop_fn, &mut state, stmt);
         }
@@ -918,7 +931,7 @@ fn emit_loop_sim(
         } else {
             return None;
         };
-        arms.push((ctor, field_vars, arm));
+        arms.push((ctor.clone(), field_vars, arm));
     }
     arms.sort_by(|(a, _, _), (b2, _, _)| {
         let pa = variants.iter().position(|(c, _)| c == a);
@@ -950,12 +963,12 @@ fn emit_loop_sim(
     let mut n_dones = 0usize;
     let mut n_continues = 0usize;
     for (ctor, field_vars, arm) in &arms {
-        let mut binders: Vec<(&str, Sort)> = vec![("__k", fuel_sort.clone())];
-        let names: Vec<String> =
-            field_vars.iter().filter_map(|v| v.var_name().map(str::to_string)).collect();
-        let sorts: Vec<Sort> = vec![payload_sort.clone(); names.len()];
-        for (n, s) in names.iter().zip(&sorts) {
-            binders.push((n.as_str(), s.clone()));
+        let mut binders: Vec<(&str, Sort)> = Vec::with_capacity(1 + field_vars.len());
+        binders.push(("__k", fuel_sort.clone()));
+        for v in field_vars {
+            if let Some(n) = v.var_name() {
+                binders.push((n, payload_sort.clone()));
+            }
         }
         let pattern = Formula::Ctor {
             ctor: ctor.clone(),
@@ -1253,6 +1266,8 @@ pub mod fixtures {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        // NO KEY: synthesized terminator, no compiler-resolved callee. Fails closed.
+                        callee_key: None,
                         is_foreign: false,
                         func: name.to_string(),
                         args: vec![Operand::Move(Place::local(9)), Operand::Move(Place::local(10))],
@@ -1288,6 +1303,7 @@ pub mod fixtures {
             preconditions: vec![],
             postconditions: post,
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1435,6 +1451,7 @@ pub mod fixtures {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 }

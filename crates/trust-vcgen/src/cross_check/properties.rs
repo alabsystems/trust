@@ -4,11 +4,16 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::Formula;
+use trust_types::fx::FxHashSet;
 
 /// Count the free variables in a formula.
 #[must_use]
 pub fn formula_free_var_count(formula: &Formula) -> usize {
-    formula.free_variables().len()
+    let mut vars = FxHashSet::default();
+    trust_types::for_each_free_variable_name(formula, &mut |name| {
+        vars.insert(name);
+    });
+    vars.len()
 }
 
 /// Property: weakening a VC (adding a disjunction) should not lose safety.
@@ -52,7 +57,6 @@ pub fn strengthen_by_dropping_assumption(formula: &Formula) -> Option<Formula> {
 }
 
 /// Structural equality check for formulas (used in property tests).
-/// This is a conservative check — it compares Debug representations.
 fn formula_structurally_eq(a: &Formula, b: &Formula) -> bool {
-    format!("{a:?}") == format!("{b:?}")
+    a == b
 }

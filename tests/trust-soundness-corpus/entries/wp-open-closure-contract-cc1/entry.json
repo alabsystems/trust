@@ -1,0 +1,24 @@
+{
+  "id": "wp-open-closure-contract-cc1",
+  "class": "trust-wp OPEN: closure contract (cc1)",
+  "title": "a closure contract naming a capture that shadows a parameter was read against the parameter",
+  "origin": [
+    "r24-wpv-probes (2026-10-14 trust-wp verifier probe), zz_vfy_probe_a.rs cc1",
+    "FIXED: trust-wp D-239 08ce51305 (a captured parameter's clause is the capture's), on D-238 2f3738026; refused on trust-wp origin/main 08ce51305 (2026-10-14), the known-open marker retired. It was: OPEN 2026-10-14: r24 trust-wp verifier probe (zz_vfy_probe_a/b, run on trust-wp with and without aee6e8f2, transcripts in this entry's probe-2026-10-14.verdicts.txt): the closure precondition naming the capture `x` was discharged against the parameter `x` the capture's binding shadows. No trust-wp fix exists yet; D-237 names bindings apart by HIR pattern, which does not reach the text of a closure contract.",
+    "2026-10-14 twin rewrite: the twin's closure body reads its capture as `let _c = x;`. The reproducer keeps `let _ = x;`, which does not capture `x`: its clause names the shadowing local `x` (0) in scope, and pre-D-239 trust-wp read it against the parameter `x` (5). trust-wp main refuses that clause (`it names x, which the closure does not capture, while the function binds x more than once`) and so withholds the reproducer (verdict unknown); it refused the old twin, written the same way, identically. With the capture real the twin is a control: verified on trust-wp main and on the aee6e8f2-reverted tree"
+  ],
+  "lang": "creusot",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "cc1"
+  },
+  "twin": {
+    "function": "cc1_ok"
+  },
+  "witness": {
+    "input": "x = 5",
+    "observed": "closure precondition x@ == 5 is false at the call",
+    "exit": 101,
+    "main": "witness.rs"
+  }
+}

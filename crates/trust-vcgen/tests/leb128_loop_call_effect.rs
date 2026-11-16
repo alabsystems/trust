@@ -133,15 +133,17 @@ fn the_loop_moves_off_call_effect() {
 
 /// AND WHAT IT DOES NOT BUY, measured rather than assumed. Moving off
 /// `call-effect` does not give this loop an E4 row: it is now blocked by
-/// `e4.machine.mixed-domain`, because the body mixes a `u32` `shift` with a
-/// `u64` `value` and a `usize` `pos` and the machine-faithful translator
-/// requires ONE exact declared width.
+/// `e4.machine.mixed-domain`: the reported `u32`/`u64` domains have an exact
+/// widening join at `u64`, but `data` still has no machine domain. The
+/// translator supports exact per-operand widening; that does not supply the
+/// missing leaf's machine semantics.
 ///
 /// That blocker is NOT something this lane introduced. Measured on the SAME
 /// body with the call at bb7 replaced by a plain constant assignment and a
 /// `Goto` — i.e. the identical loop with no call in it at all — the identical
 /// `e4.machine.mixed-domain` row is produced for the identical invariants. The
-/// residual refusal is a property of leb128's arithmetic, not of the call.
+/// residual refusal is a property of this body's exact machine translation,
+/// independent of the call.
 ///
 /// So the probe file's ledger for this loop needs a third entry. It named two
 /// blockers, `e45.transition.call-effect` and `%`. There are three, and after
@@ -182,18 +184,24 @@ fn the_residual_blocker_is_the_mixed_machine_domain_and_predates_this_lane() {
     );
 }
 
-/// The `%` blocker the probe file also names is untouched by this lane, and
-/// still refuses for its own reason.
+/// The modulus-bearing clause is still refused before either E4 row is minted.
+/// Its values now pass formula typing; exact machine translation exposes the
+/// same mixed-domain residual as the other clauses on this extracted body.
 #[test]
 fn the_modulus_blocker_is_untouched_and_still_refuses() {
     let (blockers, initiation, consecution) = outcome("shift % 7 == 0");
     assert!(
-        blockers.iter().any(|detail| detail.contains("unsupported or ambiguous MIR value")),
-        "`%` in a clause predicate must still fail closed, loudly: {blockers:?}",
+        blockers.iter().any(|detail| {
+            detail.contains("e4.machine.mixed-domain")
+                && detail.contains("loop invariant `shift % 7 == 0` initiation")
+                && detail.contains("no exact per-operand machine translation at bb1")
+                && detail.contains("leaves with no machine domain: data")
+        }),
+        "the exact modulus-bearing loop must still fail closed, loudly: {blockers:?}",
     );
     assert!(
         !blockers.iter().any(|detail| detail.contains("e45.transition.call-effect")),
-        "…and for its OWN reason, not the call: {blockers:?}",
+        "the machine-domain refusal must remain independent of the call: {blockers:?}",
     );
     assert!(!initiation && !consecution, "a refused clause must mint no E4 row");
 }

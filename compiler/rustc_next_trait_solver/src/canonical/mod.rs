@@ -14,35 +14,36 @@ use std::iter;
 use canonicalizer::Canonicalizer;
 use rustc_index::IndexVec;
 use rustc_type_ir::inherent::*;
-use rustc_type_ir::relate::solver_relating::RelateExt;
+use rustc_type_ir::relate::{
+    self, Relate, RelateResult, TypeRelation, VarianceDiagInfo, relate_args_invariantly,
+};
 use rustc_type_ir::{
-    self as ty, Canonical, CanonicalVarKind, CanonicalVarValues, InferCtxtLike, Interner,
-    TypeFoldable, TypingMode, TypingModeEqWrapper,
+    self as ty, Canonical, CanonicalVarKind, CanonicalVarValues, Canonicalized, Const,
+    InferCtxtLike, Interner, Region, TypeFoldable, TypingMode, TypingModeEqWrapper,
 };
 use tracing::instrument;
 
 use crate::delegate::SolverDelegate;
-use crate::resolve::eager_resolve_vars;
 use crate::solve::{
-    CanonicalInput, CanonicalResponse, Certainty, ExternalConstraintsData,
-    ExternalRegionConstraints, Goal, NestedNormalizationGoals, QueryInput, Response,
-    VisibleForLeakCheck, inspect,
+    CanonicalResponse, Certainty, ExternalConstraintsData, ExternalRegionConstraints, Goal,
+    IsIdentity, NestedNormalizationGoals, QueryInput, Response, VisibleForLeakCheck,
+    has_no_inference_or_external_constraints, inspect,
 };
 
 pub mod canonicalizer;
 
 trait ResponseT<I: Interner> {
-    fn var_values(&self) -> CanonicalVarValues<I>;
+    fn var_values(&self) -> I::GenericArgs;
 }
 
 impl<I: Interner> ResponseT<I> for Response<I> {
-    fn var_values(&self) -> CanonicalVarValues<I> {
+    fn var_values(&self) -> I::GenericArgs {
         self.var_values
     }
 }
 
 impl<I: Interner, T> ResponseT<I> for inspect::State<I, T> {
-    fn var_values(&self) -> CanonicalVarValues<I> {
+    fn var_values(&self) -> I::GenericArgs {
         self.var_values
     }
 }
@@ -56,7 +57,7 @@ pub(super) fn canonicalize_goal<D, I>(
     goal: Goal<I, I::Predicate>,
     opaque_types: &[(ty::OpaqueTypeKey<I>, I::Ty)],
     typing_mode: TypingMode<I>,
-) -> (Vec<I::GenericArg>, CanonicalInput<I, I::Predicate>)
+) -> (Vec<I::GenericArg>, I::CanonicalInput)
 where
     D: SolverDelegate<Interner = I>,
     I: Interner,
@@ -69,8 +70,10 @@ where
         },
     );
 
-    let query_input =
-        ty::CanonicalQueryInput { canonical, typing_mode: TypingModeEqWrapper(typing_mode) };
+    let query_input = delegate.cx().mk_canonical_input(ty::CanonicalQueryInput {
+        canonical,
+        typing_mode: TypingModeEqWrapper(typing_mode),
+    });
     (orig_values, query_input)
 }
 
@@ -90,29 +93,48 @@ where
 /// After calling a canonical query, we apply the constraints returned
 /// by the query using this function.
 ///
-/// This happens in three steps:
+/// If a quick early-return check fails, this happens in three steps:
 /// - we instantiate the bound variables of the query response
 /// - we unify the `var_values` of the response with the `original_values`
 /// - we apply the `external_constraints` returned by the query, returning
 ///   the `normalization_nested_goals`
 pub(super) fn instantiate_and_apply_query_response<D, I>(
     delegate: &D,
-    param_env: I::ParamEnv,
     original_values: &[I::GenericArg],
     response: CanonicalResponse<I>,
+    canonical_goal_var_kinds: I::CanonicalVarKinds,
     span: I::Span,
 ) -> (NestedNormalizationGoals<I>, Certainty)
 where
     D: SolverDelegate<Interner = I>,
     I: Interner,
 {
+    let certainty = response.value.certainty;
+
+    // If the response is an identity, and there are no external constraints, and the response var
+    // kinds match the canonical goal var kinds, this function is a no-op and we can return early.
+    if has_no_inference_or_external_constraints(response)
+        && response.var_kinds == canonical_goal_var_kinds
+    {
+        return (NestedNormalizationGoals::empty(), certainty);
+    }
+
     let instantiation =
         compute_query_response_instantiation_values(delegate, &original_values, &response, span);
 
-    let Response { var_values, external_constraints, certainty } =
-        delegate.instantiate_canonical(response, instantiation);
-
-    unify_query_var_values(delegate, param_env, &original_values, var_values, span);
+    // We could call `instantiate_canonical` on `response`, but it's more efficient to instantiate
+    // the fields within `response` separately. That way we can instantiate and unify `var_values`
+    // in a single step, rather than instantiating first (which creates an intermediate list) and
+    // then unifying afterwards.
+    let external_constraints =
+        delegate.instantiate_value(response.project(|r| r.external_constraints), instantiation);
+    instantiate_and_unify_query_var_values(
+        delegate,
+        &original_values,
+        response.project(|r| r.var_values),
+        instantiation,
+        span,
+    );
 
     let ExternalConstraintsData { region_constraints, opaque_types, normalization_nested_goals } =
         &*external_constraints;
@@ -132,7 +154,7 @@ where
             span,
         ),
         ExternalRegionConstraints::NextGen(r) => {
-            delegate.register_solver_region_constraint(r.clone())
+            delegate.register_solver_region_constraint(r.clone(), span)
         }
     };
     register_new_opaque_types(delegate, opaque_types, span);
@@ -160,57 +182,103 @@ where
     let prev_universe = delegate.universe();
     let universes_created_in_query = response.max_universe.index();
     for _ in 0..universes_created_in_query {
-        delegate.create_next_universe();
+        let new_universe = delegate.create_next_universe();
+        if delegate.cx().assumptions_on_binders() {
+            // FIXME(-Zassumptions-on-binders): Remove this temporary workaround once
+            // opaque types no longer escape query responses with query-created placeholders.
+            // Region constraints involving query-created placeholders were handled inside
+            // the query. However, the placeholders can still escape in other response
+            // fields, such as opaque type constraints. To avoid triggering
+            // assertions, we explicitly insert empty assumptions for the
+            // recreated universes here.
+            delegate.insert_placeholder_assumptions(
+                new_universe,
+                rustc_type_ir::region_constraint::Assumptions::empty(),
+            );
+        }
     }
 
+    compute_query_response_instantiation_values_in_universe(
+        delegate,
+        original_values,
+        response,
+        span,
+        prev_universe,
+    )
+}
+
+fn compute_query_response_instantiation_values_in_universe<D, I, T>(
+    delegate: &D,
+    original_values: &[I::GenericArg],
+    response: &Canonical<I, T>,
+    span: I::Span,
+    prev_universe: ty::UniverseIndex,
+) -> CanonicalVarValues<I>
+where
+    D: SolverDelegate<Interner = I>,
+    I: Interner,
+    T: ResponseT<I>,
+{
     let var_values = response.value.var_values();
     assert_eq!(original_values.len(), var_values.len());
 
-    // If the query did not make progress with constraining inference variables,
-    // we would normally create a new inference variables for bound existential variables
-    // only then unify this new inference variable with the inference variable from
-    // the input.
-    //
-    // We therefore instantiate the existential variable in the canonical response with the
-    // inference variable of the input right away, which is more performant.
-    let mut opt_values = IndexVec::from_elem_n(None, response.var_kinds.len());
-    for (original_value, result_value) in iter::zip(original_values, var_values.var_values.iter()) {
-        match result_value.kind() {
-            ty::GenericArgKind::Type(t) => {
-                // We disable the instantiation guess for inference variables
-                // and only use it for placeholders. We need to handle the
-                // `sub_root` of type inference variables which would make this
-                // more involved. They are also a lot rarer than region variables.
-                if let ty::Bound(index_kind, b) = t.kind()
-                    && !matches!(
-                        response.var_kinds.get(b.var().as_usize()).unwrap(),
-                        CanonicalVarKind::Ty { .. }
-                    )
-                {
-                    assert!(matches!(index_kind, ty::BoundVarIndexKind::Canonical));
-                    opt_values[b.var()] = Some(*original_value);
+    // `opt_values` below is expensive to build and rarely needed. Do a quick scan to see if it's
+    // needed. (This duplicates the test in the `instantiate` closure below.)
+    let has_root_existentials = response
+        .var_kinds
+        .iter()
+        .any(|kind| kind.universe() == ty::UniverseIndex::ROOT && kind.is_existential());
+
+    // Build it only if necessary.
+    let opt_values = has_root_existentials.then(|| {
+        // If the query did not make progress with constraining inference variables,
+        // we would normally create a new inference variables for bound existential variables
+        // only then unify this new inference variable with the inference variable from
+        // the input.
+        //
+        // We therefore instantiate the existential variable in the canonical response with the
+        // inference variable of the input right away, which is more performant.
+        let mut opt_values = IndexVec::from_elem_n(None, response.var_kinds.len());
+        for (original_value, result_value) in iter::zip(original_values, var_values.iter()) {
+            match result_value.kind() {
+                ty::GenericArgKind::Type(t) => {
+                    // We disable the instantiation guess for inference variables
+                    // and only use it for placeholders. We need to handle the
+                    // `sub_root` of type inference variables which would make this
+                    // more involved. They are also a lot rarer than region variables.
+                    if let ty::Bound(index_kind, b) = t.kind()
+                        && !matches!(
+                            response.var_kinds.get(b.var().as_usize()).unwrap(),
+                            CanonicalVarKind::Ty { .. }
+                        )
+                    {
+                        assert!(matches!(index_kind, ty::BoundVarIndexKind::Canonical));
+                        opt_values[b.var()] = Some(*original_value);
+                    }
                 }
-            }
-            ty::GenericArgKind::Lifetime(r) => {
-                if let ty::ReBound(index_kind, br) = r.kind() {
-                    assert!(matches!(index_kind, ty::BoundVarIndexKind::Canonical));
-                    opt_values[br.var()] = Some(*original_value);
+                ty::GenericArgKind::Lifetime(r) => {
+                    if let ty::ReBound(index_kind, br) = r.kind() {
+                        assert!(matches!(index_kind, ty::BoundVarIndexKind::Canonical));
+                        opt_values[br.var()] = Some(*original_value);
+                    }
                 }
-            }
-            ty::GenericArgKind::Const(c) => {
-                if let ty::ConstKind::Bound(index_kind, bc) = c.kind() {
-                    assert!(matches!(index_kind, ty::BoundVarIndexKind::Canonical));
-                    opt_values[bc.var()] = Some(*original_value);
+                ty::GenericArgKind::Const(c) => {
+                    if let ty::ConstKind::Bound(index_kind, bc) = c.kind() {
+                        assert!(matches!(index_kind, ty::BoundVarIndexKind::Canonical));
+                        opt_values[bc.var()] = Some(*original_value);
+                    }
                 }
             }
         }
-    }
-    CanonicalVarValues::instantiate(delegate.cx(), response.var_kinds, |var_values, kind| {
+        opt_values
+    });
+
+    CanonicalVarValues::instantiate(delegate.cx(), response.var_kinds, |prev_var_values, kind| {
         if kind.universe() != ty::UniverseIndex::ROOT {
             // A variable from inside a binder of the query. While ideally these shouldn't
             // exist at all (see the FIXME at the start of this method), we have to deal with
             // them for now.
-            delegate.instantiate_canonical_var(kind, span, &var_values, |idx| {
+            delegate.instantiate_canonical_var(kind, span, &prev_var_values, |idx| {
                 prev_universe + idx.index()
             })
         } else if kind.is_existential() {
@@ -221,10 +289,12 @@ where
             // more placeholders then they should be able to. However the inference variables have
             // to "come from somewhere", so by equating them with the original values of the caller
             // later on, we pull them down into their correct universe again.
-            if let Some(v) = opt_values[ty::BoundVar::from_usize(var_values.len())] {
+            if let Some(v) =
+                opt_values.as_ref().unwrap()[ty::BoundVar::from_usize(prev_var_values.len())]
+            {
                 v
             } else {
-                delegate.instantiate_canonical_var(kind, span, &var_values, |_| prev_universe)
+                delegate.instantiate_canonical_var(kind, span, &prev_var_values, |_| prev_universe)
             }
         } else {
             // For placeholders which were already part of the input, we simply map this
@@ -246,7 +316,200 @@ where
     })
 }
 
-/// Unify the `original_values` with the `var_values` returned by the canonical query..
+/// Enforce that `a` is equal to `b`.
+///
+/// In normal type relating, we don't structurally relate non-rigid aliases
+/// as they can be normalized to any type. So we emit projection obligations to
+/// defer the checks. E.g. in `infcx.eq` or `infcx.relate`.
+/// But when unifying query response with original vars, we want to directly
+/// set the original vars to values in response.
+///
+/// Therefore this type relation is created to **always** structurally relate
+/// aliases, or more specifically, structurally eq everything.
+struct ResponseRelating<'infcx, Infcx, I: Interner> {
+    infcx: &'infcx Infcx,
+    span: I::Span,
+}
+
+impl<'infcx, Infcx, I> ResponseRelating<'infcx, Infcx, I>
+where
+    Infcx: InferCtxtLike<Interner = I>,
+    I: Interner,
+{
+    fn new(infcx: &'infcx Infcx, span: I::Span) -> Self {
+        ResponseRelating { infcx, span }
+    }
+}
+
+impl<Infcx, I> TypeRelation<I> for ResponseRelating<'_, Infcx, I>
+where
+    Infcx: InferCtxtLike<Interner = I>,
+    I: Interner,
+{
+    fn cx(&self) -> I {
+        self.infcx.cx()
+    }
+
+    fn relate_ty_args(
+        &mut self,
+        a_ty: I::Ty,
+        _b_ty: I::Ty,
+        _def_id: I::DefId,
+        a_args: I::GenericArgs,
+        b_args: I::GenericArgs,
+        _: impl FnOnce(I::GenericArgs) -> I::Ty,
+    ) -> RelateResult<I, I::Ty> {
+        relate_args_invariantly(self, a_args, b_args)?;
+        Ok(a_ty)
+    }
+
+    fn relate_with_variance<T: Relate<I>>(
+        &mut self,
+        _variance: ty::Variance,
+        _info: VarianceDiagInfo<I>,
+        a: T,
+        b: T,
+    ) -> RelateResult<I, T> {
+        self.relate(a, b)
+    }
+
+    #[instrument(skip(self), level = "trace")]
+    fn tys(&mut self, a: I::Ty, b: I::Ty) -> RelateResult<I, I::Ty> {
+        if a == b {
+            return Ok(a);
+        }
+
+        let infcx = self.infcx;
+        let a = infcx.shallow_resolve(a);
+        let b = infcx.shallow_resolve(b);
+
+        match (a.kind(), b.kind()) {
+            (ty::Infer(ty::TyVar(a_id)), ty::Infer(ty::TyVar(b_id))) => {
+                infcx.equate_ty_vids_raw(a_id, b_id);
+            }
+
+            (ty::Infer(ty::TyVar(a_vid)), _) => {
+                infcx.instantiate_ty_var_raw(a_vid, b);
+            }
+
+            (_, ty::Infer(ty::TyVar(b_vid))) => {
+                infcx.instantiate_ty_var_raw(b_vid, a);
+            }
+
+            (ty::Error(e), _) | (_, ty::Error(e)) => {
+                infcx.set_tainted_by_errors(e);
+                return Ok(Ty::new_error(infcx.cx(), e));
+            }
+
+            // FIXME: Share the arms below with `super_combine_tys`.
+            // We can't use `super_combine_tys` here because we want to support
+            // values with escaping bound vars so that we can avoid
+            // instantiating binders when relating them.
+            //
+            // Relate integral variables to other types
+            (ty::Infer(ty::IntVar(a_id)), ty::Infer(ty::IntVar(b_id))) => {
+                infcx.equate_int_vids_raw(a_id, b_id);
+            }
+            (ty::Infer(ty::IntVar(v_id)), ty::Int(v)) => {
+                infcx.instantiate_int_var_raw(v_id, ty::IntVarValue::IntType(v));
+            }
+            (ty::Int(v), ty::Infer(ty::IntVar(v_id))) => {
+                infcx.instantiate_int_var_raw(v_id, ty::IntVarValue::IntType(v));
+            }
+            (ty::Infer(ty::IntVar(v_id)), ty::Uint(v)) => {
+                infcx.instantiate_int_var_raw(v_id, ty::IntVarValue::UintType(v));
+            }
+            (ty::Uint(v), ty::Infer(ty::IntVar(v_id))) => {
+                infcx.instantiate_int_var_raw(v_id, ty::IntVarValue::UintType(v));
+            }
+
+            // Relate floating-point variables to other types
+            (ty::Infer(ty::FloatVar(a_id)), ty::Infer(ty::FloatVar(b_id))) => {
+                infcx.equate_float_vids_raw(a_id, b_id);
+            }
+            (ty::Infer(ty::FloatVar(v_id)), ty::Float(v)) => {
+                infcx.instantiate_float_var_raw(v_id, ty::FloatVarValue::Known(v));
+            }
+            (ty::Float(v), ty::Infer(ty::FloatVar(v_id))) => {
+                infcx.instantiate_float_var_raw(v_id, ty::FloatVarValue::Known(v));
+            }
+
+            (_, ty::Infer(ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)))
+            | (ty::Infer(ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)), _) => {
+                panic!("We do not expect to encounter `Fresh` variables in the new solver")
+            }
+
+            _ => {
+                relate::structurally_relate_tys(self, a, b)?;
+            }
+        }
+
+        Ok(a)
+    }
+
+    #[instrument(skip(self), level = "trace")]
+    fn regions(&mut self, a: Region<I>, b: Region<I>) -> RelateResult<I, Region<I>> {
+        self.infcx.equate_regions(a, b, VisibleForLeakCheck::Yes, self.span);
+
+        Ok(a)
+    }
+
+    #[instrument(skip(self), level = "trace")]
+    fn consts(&mut self, a: Const<I>, b: Const<I>) -> RelateResult<I, Const<I>> {
+        if a == b {
+            return Ok(a);
+        }
+
+        let infcx = self.infcx;
+        // Proof tree evaluation can unify inference variables in the original
+        // values without eagerly resolving them.
+        let a = infcx.shallow_resolve_const(a);
+        let b = infcx.shallow_resolve_const(b);
+        match (a.kind(), b.kind()) {
+            (
+                ty::ConstKind::Infer(ty::InferConst::Var(a_vid)),
+                ty::ConstKind::Infer(ty::InferConst::Var(b_vid)),
+            ) => {
+                infcx.equate_const_vids_raw(a_vid, b_vid);
+            }
+
+            (ty::ConstKind::Infer(ty::InferConst::Var(a_vid)), _) => {
+                infcx.instantiate_const_var_raw(a_vid, b);
+            }
+
+            (_, ty::ConstKind::Infer(ty::InferConst::Var(b_vid))) => {
+                infcx.instantiate_const_var_raw(b_vid, a);
+            }
+
+            _ => {
+                relate::structurally_relate_consts(self, a, b)?;
+            }
+        }
+
+        Ok(a)
+    }
+
+    fn binders<T>(
+        &mut self,
+        a: ty::Binder<I, T>,
+        b: ty::Binder<I, T>,
+    ) -> RelateResult<I, ty::Binder<I, T>>
+    where
+        T: Relate<I>,
+    {
+        if a == b {
+            return Ok(a);
+        }
+
+        debug_assert_eq!(a.bound_vars(), b.bound_vars());
+        self.relate(a.skip_binder(), b.skip_binder())?;
+
+        Ok(a)
+    }
+}
+
+/// Instantiate `var_values` as returned by the canonical query and also unify it with
+/// `original_values`.
 ///
 /// This assumes that this unification will always succeed. This is the case when
 /// applying a query response right away. However, calling a canonical query, doing any
@@ -259,11 +522,11 @@ where
 /// from the solver we assume that the solver correctly handled aliases and therefore
 /// always relate them structurally here.
 #[instrument(level = "trace", skip(delegate))]
-fn unify_query_var_values<D, I>(
+fn instantiate_and_unify_query_var_values<D, I>(
     delegate: &D,
-    param_env: I::ParamEnv,
     original_values: &[I::GenericArg],
-    var_values: CanonicalVarValues<I>,
+    var_values: Canonicalized<I::GenericArgs>,
+    instantiation: CanonicalVarValues<I>,
     span: I::Span,
 ) where
     D: SolverDelegate<Interner = I>,
@@ -271,10 +534,49 @@ fn unify_query_var_values<D, I>(
 {
     assert_eq!(original_values.len(), var_values.len());
 
-    for (&orig, response) in iter::zip(original_values, var_values.var_values.iter()) {
-        let goals =
-            delegate.eq_structurally_relating_aliases(param_env, orig, response, span).unwrap();
-        assert!(goals.is_empty());
+    for (&orig, response) in iter::zip(original_values, var_values.iter()) {
+        let response = instantiate_generic_arg(delegate, response, instantiation);
+        if orig == response {
+            continue;
+        }
+
+        let mut must_eq = ResponseRelating::new(&**delegate, span);
+        must_eq.relate(orig, response).unwrap();
+    }
+}
+
+fn instantiate_generic_arg<D, I>(
+    delegate: &D,
+    arg: Canonicalized<I::GenericArg>,
+    instantiation: CanonicalVarValues<I>,
+) -> I::GenericArg
+where
+    D: SolverDelegate<Interner = I>,
+    I: Interner,
+{
+    // Canonical bound vars are very common here. `CanonicalInstantiator::fold_{ty,region,const}`'s
+    // handling of them is simple, and we replicate that handling here to avoid the cost of the
+    // surrounding machinery.
+    fn canonical_bound_var<I: Interner>(arg: Canonicalized<I::GenericArg>) -> Option<ty::BoundVar> {
+        match arg.into_uninstantiated().kind() {
+            ty::GenericArgKind::Type(t) => match t.kind() {
+                ty::Bound(ty::BoundVarIndexKind::Canonical, bt) => Some(bt.var()),
+                _ => None,
+            },
+            ty::GenericArgKind::Lifetime(r) => match r.kind() {
+                ty::ReBound(ty::BoundVarIndexKind::Canonical, br) => Some(br.var()),
+                _ => None,
+            },
+            ty::GenericArgKind::Const(c) => match c.kind() {
+                ty::ConstKind::Bound(ty::BoundVarIndexKind::Canonical, bc) => Some(bc.var()),
+                _ => None,
+            },
+        }
+    }
+
+    match canonical_bound_var::<I>(arg) {
+        Some(var) => instantiation[var],
+        None => delegate.instantiate_value(arg, instantiation),
     }
 }
 
@@ -288,7 +590,7 @@ fn register_region_constraints<D, I>(
 {
     for (constraint, vis) in constraints {
         match constraint {
-            ty::RegionConstraint::Outlives(ty::OutlivesPredicate(lhs, rhs)) => match lhs.kind() {
+            ty::RegionConstraint::Outlives(ty::OutlivesClause(lhs, rhs)) => match lhs.kind() {
                 ty::GenericArgKind::Lifetime(lhs) => delegate.sub_regions(rhs, lhs, vis, span),
                 ty::GenericArgKind::Type(lhs) => delegate.register_ty_outlives(lhs, rhs, span),
                 ty::GenericArgKind::Const(_) => panic!("const outlives: {lhs:?}: {rhs:?}"),
@@ -338,9 +640,9 @@ where
     I: Interner,
     T: TypeFoldable<I>,
 {
-    let var_values = CanonicalVarValues { var_values: delegate.cx().mk_args(var_values) };
+    let var_values = delegate.cx().mk_args(var_values);
     let state = inspect::State { var_values, data };
-    let state = eager_resolve_vars(&**delegate, state);
+    let state = delegate.deeply_resolve_via_unification_table(state);
     Canonicalizer::canonicalize_response(delegate, max_input_universe, state)
 }
 
@@ -349,29 +651,46 @@ where
 pub fn instantiate_canonical_state<D, I, T>(
     delegate: &D,
     span: I::Span,
-    param_env: I::ParamEnv,
+    prev_universe: ty::UniverseIndex,
     orig_values: &mut Vec<I::GenericArg>,
     state: inspect::CanonicalState<I, T>,
 ) -> T
 where
     D: SolverDelegate<Interner = I>,
     I: Interner,
-    T: TypeFoldable<I>,
+    T: TypeFoldable<I> + Copy,
 {
     // In case any fresh inference variables have been created between `state`
     // and the previous instantiation, extend `orig_values` for it.
+    let max_universe = prev_universe + state.max_universe.index();
+    while delegate.universe() < max_universe {
+        delegate.create_next_universe();
+    }
     orig_values.extend(
-        state.value.var_values.var_values.as_slice()[orig_values.len()..]
+        state.value.var_values.as_slice()[orig_values.len()..]
             .iter()
-            .map(|&arg| delegate.fresh_var_for_kind_with_span(arg, span)),
+            .map(|&arg| delegate.fresh_var_for_kind(arg, span, max_universe)),
     );
 
-    let instantiation =
-        compute_query_response_instantiation_values(delegate, orig_values, &state, span);
+    let instantiation = compute_query_response_instantiation_values_in_universe(
+        delegate,
+        orig_values,
+        &state,
+        span,
+        prev_universe,
+    );
 
-    let inspect::State { var_values, data } = delegate.instantiate_canonical(state, instantiation);
+    // We instantiate the fields within `state` separately. See the corresponding code in
+    // `instantiate_and_apply_query_response` for an explanation why.
+    let data = delegate.instantiate_value(state.project(|r| r.data), instantiation);
+    instantiate_and_unify_query_var_values(
+        delegate,
+        orig_values,
+        state.project(|r| r.var_values),
+        instantiation,
+        span,
+    );
 
-    unify_query_var_values(delegate, param_env, orig_values, var_values, span);
     data
 }
 
@@ -381,15 +700,36 @@ pub fn response_no_constraints_raw<I: Interner>(
     var_kinds: I::CanonicalVarKinds,
     certainty: Certainty,
 ) -> CanonicalResponse<I> {
+    // Given a list of canonical variables, construct a set of values which are
+    // the identity response.
+    let var_values =
+        cx.mk_args_from_iter(var_kinds.iter().enumerate().map(|(i, kind)| -> I::GenericArg {
+            match kind {
+                CanonicalVarKind::Ty { .. }
+                | CanonicalVarKind::Int
+                | CanonicalVarKind::Float
+                | CanonicalVarKind::PlaceholderTy(_) => {
+                    Ty::new_canonical_bound(cx, ty::BoundVar::from_usize(i)).into()
+                }
+                CanonicalVarKind::Region(_) | CanonicalVarKind::PlaceholderRegion(_) => {
+                    Region::new_canonical_bound(cx, ty::BoundVar::from_usize(i)).into()
+                }
+                CanonicalVarKind::Const(_) | CanonicalVarKind::PlaceholderConst(_) => {
+                    Const::new_canonical_bound(cx, ty::BoundVar::from_usize(i)).into()
+                }
+            }
+        }));
+
     ty::Canonical {
         max_universe,
         var_kinds,
         value: Response {
-            var_values: ty::CanonicalVarValues::make_identity(cx, var_kinds),
+            certainty,
+            var_values,
+            var_values_is_identity: IsIdentity::Yes,
             // FIXME: maybe we should store the "no response" version in cx, like
             // we do for cx.types and stuff.
             external_constraints: cx.mk_external_constraints(ExternalConstraintsData::new(cx)),
-            certainty,
         },
     }
 }

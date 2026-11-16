@@ -1,0 +1,236 @@
+{
+  "name": "f",
+  "def_path": "f4_sum_u32::f",
+  "span": {
+    "file": "h/f4_sum_u32.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 3,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u32]>::iter",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "h/f4_sum_u32.rs",
+              "line_start": 2,
+              "col_start": 4,
+              "line_end": 2,
+              "col_end": 12
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 2959423433945328612,
+              "def_index": 15447,
+              "substs_digest": [
+                12295953916534365648,
+                15423895294860648131
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 2959423433945328612,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::Iter<'_, u32> as core::iter::traits::iterator::Iterator>::sum::<u32>",
+            "args": [
+              {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "h/f4_sum_u32.rs",
+              "line_start": 2,
+              "col_start": 4,
+              "line_end": 2,
+              "col_end": 25
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 2959423433945328612,
+              "def_index": 10771,
+              "substs_digest": [
+                13946678712644077913,
+                852900184240510998
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 2959423433945328612,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

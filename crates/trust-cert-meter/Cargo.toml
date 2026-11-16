@@ -12,7 +12,7 @@
 
 [package]
 name = "trust-cert-meter"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 publish = false
 description = "The ONE honesty meter: strictly audit a kernel proof judgment and its complete declaration/provenance closure."

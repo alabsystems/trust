@@ -62,10 +62,15 @@
 //!   `invalid unicode code point` at the position where the parser copied the
 //!   bad bytes, which need not be the incumbent's byte offset. Every caller in
 //!   this tree feeds it either a `&str` or bytes that came from one.
-//! * `arbitrary_precision`, `raw_value`, `preserve_order` and `float_roundtrip`
-//!   have no counterpart, on purpose: measured across `crates/` and
-//!   `targo-trust/`, exactly one non-default feature is enabled anywhere
-//!   (`unbounded_depth`), which is [`de::Deserializer::disable_recursion_limit`].
+//! * `arbitrary_precision`, `raw_value` and `preserve_order` have no
+//!   counterpart. `raw_value` IS enabled in `crates/`
+//!   (`crates/trust-ir-bridge/Cargo.toml`), so that consumer cannot swap in
+//!   this crate as it stands.
+//! * `unbounded_depth` is [`de::Deserializer::disable_recursion_limit`].
+//! * `float_roundtrip` (enabled by first-party/clean's `clean-olean` and
+//!   unified into every `serde_json` in the graph) is not a switch here: this
+//!   parser is always correctly rounded, which is what that feature makes the
+//!   incumbent. See [`de`].
 
 #![forbid(unsafe_code)]
 

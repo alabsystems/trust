@@ -3,6 +3,7 @@
 //@ check-fail
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
+//@ normalize-stderr: "elapsed_ms=\d+" -> "elapsed_ms=$$TIME"
 //! The NET under `e9_comparison_bool_discharge`. Widening `==` to a `Bool`
 //! relation carrier must not widen anything else, so each citation here is one
 //! step outside the new lane and each must stay refused with a reason that names

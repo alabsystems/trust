@@ -1,35 +1,30 @@
-// The reaching-version fixpoint (`generate::path_defs::entry_versions_fixpoint`):
-// it must scale in BLOCK count, it must be BOUNDED by the ambient verify budget,
+// The statement-version oracle on a BACK-EDGE ladder: it must scale in BLOCK count,
 // and it must never change an obligation.
 //
-// WHAT WENT WRONG, AND WHY THE EXISTING PIN COULD NOT SEE IT.
-// `tests/vcgen_havoc_memoization.rs` grows STATEMENT count inside ONE block.
-// This fixpoint is a whole-CFG dataflow analysis whose cost is
-// `rounds x blocks x predecessor-edges x live names`, and a single-block body
-// exercises none of that — nor does a forward-only DAG, which converges in about
-// two round-robin passes. Real MIR has BACK EDGES. Measured on the ladder below
-// (one obligation per block, so the obligation count is a clean truncation
-// detector), VC generation grew with exponent ~2.8 in BLOCK count:
+// HISTORY. This file pinned `generate::path_defs::entry_versions_fixpoint`, the
+// whole-CFG reaching-version fixpoint the oracle used to be. Its cost was
+// `rounds x blocks x predecessor-edges x live names`, and on the ladder below — where
+// information must travel backwards one block per round-robin pass — VC generation
+// grew with exponent ~2.8 in BLOCK count (285 ms at 48 blocks, 93.7 s at 384 before
+// the per-edge map rebuild was removed; 42.6 s after). The fixpoint also polled the
+// ambient verify budget, because a truncated reaching-version map was its failure
+// mode, and this file pinned that poll with a wall-clock bound.
 //
-//     blocks   obligations    before      after
-//         48            48     285 ms     170 ms
-//         96            96    1771 ms     905 ms
-//        144           144    5296 ms    2551 ms
-//        192           192   11959 ms    5551 ms
-//        288           288   40398 ms   18080 ms
-//        384           384   93671 ms   42552 ms
-//
-// A stack sample of the wedged `nn-core` generator put
-// `entry_versions_fixpoint`'s own frame at the TOP of self time, with
-// `HashMap<String, BTreeSet<String>>`'s `reserve_rehash` and `insert` second and
-// third — the per-(round x block x edge) intermediate map that is now gone.
+// The fixpoint is gone: `generate::version_ssa` resolves the same reaching sets on
+// demand over the dominator tree and has no truncated state of its own (the retired
+// fixpoint survives only as the `cfg(test)` differential it is checked against, byte
+// for byte, in `version_ssa_parity_tests`). So the timing pin and the fixpoint's own
+// budget pin are retired with it. (The oracle's INPUTS still come from the polled
+// block-definition extraction; `version_ssa_parity_tests::
+// an_oracle_built_after_a_budget_trip_fails_closed` pins what it does after a trip.)
+// What this file pins now is COST AS WORK — deterministic counters, not wall time —
+// and the two staleness properties below.
 //
 // THE DANGEROUS DIRECTION IS NOT SLOWNESS. A reaching-version set that came back
-// SHORT — a stale memo entry, or a truncated walk passed off as a finished one —
-// is a short KILL set, which lets a stale fact survive and vacuously discharge a
-// real obligation. That is a false PROVE. The staleness and budget tests below
-// are the ones that matter; the timing bound is only a regression guard.
-use std::time::Instant;
+// SHORT — a stale memo entry, an oracle answering for the wrong function — is a short
+// KILL set, which lets a stale fact survive and vacuously discharge a real
+// obligation. That is a false PROVE. The staleness tests below are the ones that
+// matter.
 use trust_types::{
     BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan,
     Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
@@ -91,7 +86,10 @@ fn cfg_func(name: &str, blocks: usize, borrows: usize) -> VerifiableFunction {
             for i in 0..borrows {
                 stmts.push(Statement::Assign {
                     place: Place::local(first_borrow + 2 * i + 1),
-                    rvalue: Rvalue::Ref { mutable: true, place: Place::local(first_borrow + 2 * i) },
+                    rvalue: Rvalue::Ref {
+                        mutable: true,
+                        place: Place::local(first_borrow + 2 * i),
+                    },
                     span: SourceSpan::default(),
                 });
             }
@@ -134,6 +132,7 @@ fn cfg_func(name: &str, blocks: usize, borrows: usize) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -141,30 +140,47 @@ fn render(vcs: &[trust_types::VerificationCondition]) -> Vec<String> {
     vcs.iter().map(|vc| format!("{:?} | {:?} | {:?}", vc.kind, vc.formula, vc.location)).collect()
 }
 
-/// THE COMPLEXITY PIN, in BLOCK count. Deliberately loose — this guards against
-/// the return of the per-edge map rebuild, not a benchmark, and it must not
-/// flake on a loaded machine. The pre-fix build took ~12 s at this size; a
-/// regression misses the bound by a wide margin rather than narrowly.
+/// THE COMPLEXITY PIN, in BLOCK count, as WORK. For each doubling of the ladder the
+/// oracle's build — the dominator index, the per-block write index, the tracked name
+/// universe — must grow at most 2.5x, and it must be built exactly ONCE per
+/// generation (every site shares it). These are deterministic counters: they cannot
+/// flake on a loaded machine, and a return of any per-(block x name) structure shows
+/// up as a 4x rung, not as a slower run.
 #[test]
-fn generation_is_not_superlinear_in_block_count() {
-    let func = cfg_func("wide", 192, 8);
-    let start = Instant::now();
-    let vcs = generate_vcs(&func);
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed.as_secs() < 40,
-        "VC generation for a 192-block CFG took {elapsed:?} — the reaching-version \
-         fixpoint is rebuilding a whole intermediate map per (round x block x predecessor \
-         edge) again, or its per-function precompute is no longer shared between the two \
-         callers (see `entry_version_gen_sets`)"
-    );
-    assert!(!vcs.is_empty(), "the body must still produce obligations");
+fn the_version_oracle_build_is_linear_in_block_count() {
+    let mut previous: Option<(usize, trust_vcgen::AnalysisMemoStats)> = None;
+    for blocks in [48usize, 96, 192] {
+        let func = cfg_func("wide", blocks, 8);
+        trust_vcgen::reset_analysis_memo_stats();
+        let vcs = generate_vcs(&func);
+        let stats = trust_vcgen::analysis_memo_stats();
+        assert!(!vcs.is_empty(), "the body must still produce obligations");
+        assert_eq!(
+            stats.entry_versions_computed, 1,
+            "the oracle is built once per generation: {stats:?}"
+        );
+        if let Some((small, prev)) = previous {
+            for (name, a, b) in [
+                ("cfg_work", prev.cfg_work, stats.cfg_work),
+                ("block_write_entries", prev.block_write_entries, stats.block_write_entries),
+                ("tracked_names", prev.tracked_names, stats.tracked_names),
+            ] {
+                let ratio = b as f64 / a.max(1) as f64;
+                assert!(
+                    ratio <= 2.5,
+                    "`{name}` grew {ratio:.2}x ({a} -> {b}) from {small} to {blocks} blocks: \
+                     the version oracle's build is super-linear again. {prev:?} -> {stats:?}"
+                );
+            }
+        }
+        previous = Some((blocks, stats));
+    }
 }
 
-/// THE STALENESS PIN for the new per-function precompute memo.
+/// THE STALENESS PIN for the per-function oracle memo.
 ///
 /// `alpha` and `beta` have deliberately different CFGs, different local counts
-/// and different havoc lists, so a precompute replayed across them would yield
+/// and different havoc lists, so an oracle replayed across them would yield
 /// different gen-sets, different OUT tokens, and therefore different kill sets.
 /// Run a, then b, then a again: `a`'s obligations must be byte-identical.
 ///
@@ -173,7 +189,7 @@ fn generation_is_not_superlinear_in_block_count() {
 /// scope, cleared on every outermost scope entry AND exit. Drop any one of the
 /// three and this is what fails.
 #[test]
-fn a_precompute_entry_never_crosses_functions() {
+fn an_oracle_never_crosses_functions() {
     let a = cfg_func("alpha", 9, 3);
     let b = cfg_func("beta", 14, 7);
 
@@ -183,8 +199,8 @@ fn a_precompute_entry_never_crosses_functions() {
 
     assert_eq!(
         a_first, a_second,
-        "generating `beta` in between changed `alpha`'s obligations — a reaching-version \
-         precompute leaked across functions. A wrong gen-set is a wrong KILL set, which can \
+        "generating `beta` in between changed `alpha`'s obligations — a statement-version \
+         oracle leaked across functions. A wrong gen-set is a wrong KILL set, which can \
          vacuously discharge a real obligation (a false PROVE)"
     );
     assert_ne!(
@@ -200,44 +216,5 @@ fn repeated_generation_is_byte_identical() {
     let func = cfg_func("repeat", 11, 4);
     let first = render(&generate_vcs(&func));
     let second = render(&generate_vcs(&func));
-    assert_eq!(first, second, "a precompute memo hit changed this function's obligations");
-}
-
-/// THE BUDGET PIN: `-Ztrust-verify-function-budget-{ms,steps}` must actually
-/// bound the reaching-version fixpoint.
-///
-/// MEASURED before this: a budgeted `nn-core` run reached its 143rd function and
-/// then sat 10+ minutes inside `entry_versions_fixpoint` with the budget LIVE —
-/// it was correctly recording 'timed out' obligations elsewhere and simply had
-/// no poll here. The whole loop ran outside the bound, and the checkpoint that
-/// reports an overrun sits AFTER generation returns.
-///
-/// With a deliberately tiny ambient budget, generation must stop PROMPTLY. The
-/// truncation is not a verdict: the caller observes the spent budget and applies
-/// the discipline `d9d9d675e3` landed — advisory warns and substitutes one
-/// COUNTED `Unknown` with the partial VCs discarded wholesale,
-/// strict/certify/memory-safe keep the located hard error.
-#[test]
-fn the_fixpoint_is_bounded_by_the_ambient_budget() {
-    let func = cfg_func("budgeted", 192, 8);
-
-    let _guard = trust_types::verify_budget::VerifyBudgetGuard::install(None, 50);
-    let start = Instant::now();
-    let _bounded = generate_vcs(&func);
-    let elapsed = start.elapsed();
-
-    assert!(
-        trust_types::verify_budget::exhausted_readonly(),
-        "the tiny step budget must be observably spent, or this test proves nothing"
-    );
-    // 30s, not 5: the disease this pins ran 10+ MINUTES (see the doc above),
-    // so a 30s wall still catches it with 20x margin — while the fixture's own
-    // setup + the between-poll strides measure ~5.4s on a loaded dev box
-    // (controlled: identical with and without the e6 merge's vcgen delta), so
-    // a 5s wall failed on machine speed, not on the property.
-    assert!(
-        elapsed.as_secs() < 30,
-        "VC generation did not stop promptly on an exhausted budget (took {elapsed:?}) — the \
-         reaching-version fixpoint is not polling `budget_exhausted()`"
-    );
+    assert_eq!(first, second, "an oracle memo hit changed this function's obligations");
 }

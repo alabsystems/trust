@@ -1,10 +1,15 @@
 /target
-/Cargo.lock
+# Trust: retain failed native test worlds at their original input paths.
+/.ubd/
+# Trust: Core's native source DATA unit worlds keep their guarded input paths.
+/crates/targo-core/.ubd/native-local-source-unit.noindex/
+# Cargo.lock is tracked: bootstrap builds this independent Targo workspace
+# with locked dependencies, including from a fresh source checkout.
 /config.stamp
 /Makefile
 /config.mk
-/src/doc/build
-/src/etc/*.pyc
+/doc/build
+/etc/*.pyc
 /src/registry/target
 rustc
 __pycache__
@@ -18,3 +23,6 @@ __pycache__
 # workspace config is part of the test harness and must remain tracked.
 !/.cargo/
 !/.cargo/config.toml
+# Trust: these are upstream test inputs, not developer Cargo configuration.
+!/tests/testsuite/**/.cargo/
+!/tests/testsuite/**/.cargo/**

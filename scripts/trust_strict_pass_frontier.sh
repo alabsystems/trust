@@ -53,9 +53,9 @@ run() { # run <variant> <expect-pass|expect-fail>
   local v="$1" expect="$2" log rc gate
   log="$(mktemp)"
   cp "$FIX/$v.rs" "$FIX/src/lib.rs"
-  ( cd "$FIX" && "$TARGO" trust check -p strict-pass-frontier ) > "$log" 2>&1
+  ( cd "$FIX" && "$TARGO" trust check --all-rows -p strict-pass-frontier ) > "$log" 2>&1
   rc=$?
-  gate="$(grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$log" | tail -1)"
+  gate="$(grep -oE 'Gate: [A-Z-]+ \[strict lane, exit [0-9]+\]' "$log" | tail -1)"
   # A run that produced no Gate line did not verify anything; never let that
   # read as a pass.
   if [ -z "$gate" ]; then

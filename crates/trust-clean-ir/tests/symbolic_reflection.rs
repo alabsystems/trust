@@ -60,12 +60,22 @@ use trust_ir::{Constant, Function};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReflectRefusal {
-    NotStraightLine { blocks: usize },
-    UnspelledInst { what: &'static str },
+    NotStraightLine {
+        blocks: usize,
+    },
+    UnspelledInst {
+        what: &'static str,
+    },
     /// A comparison this reflector has no canonical Clean instance name for.
-    UnspelledComparison { op: &'static str },
-    UnboundValue { value: u32 },
-    UnsupportedCarrier { bits: u32 },
+    UnspelledComparison {
+        op: &'static str,
+    },
+    UnboundValue {
+        value: u32,
+    },
+    UnsupportedCarrier {
+        bits: u32,
+    },
 }
 
 fn carrier_name(bits: u32) -> Result<String, ReflectRefusal> {
@@ -157,8 +167,12 @@ fn reflect_function(function: &Function, bits: u32) -> Result<Expr, ReflectRefus
                     .find(|(id, ..)| id == cond)
                     .ok_or(ReflectRefusal::UnboundValue { value: cond.index() })?;
                 let (rel, rel_inst, dec_inst) = match op {
-                    ICmpOp::Ult => ("LT.lt", format!("instLT{carrier}"), format!("instDecidable{carrier}Lt")),
-                    ICmpOp::Ule => ("LE.le", format!("instLE{carrier}"), format!("instDecidable{carrier}Le")),
+                    ICmpOp::Ult => {
+                        ("LT.lt", format!("instLT{carrier}"), format!("instDecidable{carrier}Lt"))
+                    }
+                    ICmpOp::Ule => {
+                        ("LE.le", format!("instLE{carrier}"), format!("instDecidable{carrier}Le"))
+                    }
                     ICmpOp::Eq => return Err(ReflectRefusal::UnspelledComparison { op: "Eq" }),
                     _ => return Err(ReflectRefusal::UnspelledComparison { op: "icmp" }),
                 };
@@ -180,10 +194,8 @@ fn reflect_function(function: &Function, bits: u32) -> Result<Expr, ReflectRefus
                     b.clone(),
                 );
                 // instDecidableCLt a b
-                let inst = Expr::app(
-                    Expr::app(Expr::const_(Name::from_string(&dec_inst), vec![]), a),
-                    b,
-                );
+                let inst =
+                    Expr::app(Expr::app(Expr::const_(Name::from_string(&dec_inst), vec![]), a), b);
                 // ite {C} prop inst t e
                 let ite = Expr::app(
                     Expr::app(
@@ -243,13 +255,13 @@ fn kernel_accepts_reflection(decl_tpl: &str, name: &str, bits: u32) {
     let carrier = carrier_name(bits).expect("admitted carrier");
     let decl = decl_tpl.replace("{C}", &carrier);
     let env = env_with(&decl);
-    let plan = plan_clean_origin_body(&env, name)
-        .unwrap_or_else(|e| panic!("`{decl}` must plan: {e:?}"));
+    let plan =
+        plan_clean_origin_body(&env, name).unwrap_or_else(|e| panic!("`{decl}` must plan: {e:?}"));
     let f = emit_clean_origin_function(&plan, FuncId::new(0), FuncTyId::new(0))
         .unwrap_or_else(|e| panic!("`{decl}` must emit: {e}"));
 
-    let reflected = reflect_function(&f, bits)
-        .unwrap_or_else(|e| panic!("`{decl}` must reflect: {e:?}"));
+    let reflected =
+        reflect_function(&f, bits).unwrap_or_else(|e| panic!("`{decl}` must reflect: {e:?}"));
 
     let declared = env
         .get_const(&Name::from_string(name))
@@ -327,7 +339,8 @@ fn an_unspelled_comparison_refuses_rather_than_being_approximated() {
     // `Eq` has a different instance shape (`DecidableEq`), and guessing at it
     // would be exactly the "invent proof-relevant structure" move this gate
     // exists to avoid. It refuses BY NAME.
-    let f = Function::new(FuncId::new(0), "unused", FuncTyId::new(0), trust_ir::value::BlockId::new(0));
+    let f =
+        Function::new(FuncId::new(0), "unused", FuncTyId::new(0), trust_ir::value::BlockId::new(0));
     assert!(matches!(
         reflect_function(&f, 8),
         Err(ReflectRefusal::NotStraightLine { .. }) | Err(ReflectRefusal::UnspelledInst { .. })
@@ -393,7 +406,10 @@ fn the_kernel_rejects_a_select_reflection_with_swapped_arms() {
                     Expr::app(
                         Expr::app(
                             Expr::app(
-                                Expr::const_(Name::from_string("ite"), vec![Level::succ(Level::Zero)]),
+                                Expr::const_(
+                                    Name::from_string("ite"),
+                                    vec![Level::succ(Level::Zero)],
+                                ),
                                 carrier_ty,
                             ),
                             prop,

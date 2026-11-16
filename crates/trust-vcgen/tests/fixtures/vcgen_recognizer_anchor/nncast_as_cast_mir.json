@@ -1,0 +1,334 @@
+{
+ "name": "as_cast",
+ "def_path": "nncast::as_cast",
+ "span": {
+  "file": "nncast.rs",
+  "line_start": 24,
+  "col_start": 0,
+  "line_end": 26,
+  "col_end": 1
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": true
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": true
+     }
+    },
+    "name": "fd"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Int": {
+      "width": 8,
+      "signed": false
+     }
+    },
+    "name": "byte"
+   },
+   {
+    "index": 3,
+    "ty": {
+     "RawPtr": {
+      "mutable": false,
+      "pointee": {
+       "Adt": {
+        "name": "core::ffi::c_void",
+        "fields": [
+         [
+          "__tag",
+          {
+           "Int": {
+            "width": 64,
+            "signed": true
+           }
+          }
+         ]
+        ],
+        "variants": [
+         {
+          "name": "__variant1",
+          "discriminant": 0,
+          "fields": []
+         },
+         {
+          "name": "__variant2",
+          "discriminant": 1,
+          "fields": []
+         }
+        ],
+        "disc_index_safe": true,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Enum"
+       }
+      }
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 4,
+    "ty": {
+     "RawPtr": {
+      "mutable": false,
+      "pointee": {
+       "Int": {
+        "width": 8,
+        "signed": false
+       }
+      }
+     }
+    },
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 4,
+        "projections": []
+       },
+       "rvalue": {
+        "AddressOf": [
+         false,
+         {
+          "local": 2,
+          "projections": []
+         }
+        ]
+       },
+       "span": {
+        "file": "nncast.rs",
+        "line_start": 25,
+        "col_start": 23,
+        "line_end": 25,
+        "col_end": 38
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 3,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Move": {
+           "local": 4,
+           "projections": []
+          }
+         },
+         {
+          "RawPtr": {
+           "mutable": false,
+           "pointee": {
+            "Adt": {
+             "name": "core::ffi::c_void",
+             "fields": [
+              [
+               "__tag",
+               {
+                "Int": {
+                 "width": 64,
+                 "signed": true
+                }
+               }
+              ]
+             ],
+             "variants": [
+              {
+               "name": "__variant1",
+               "discriminant": 0,
+               "fields": []
+              },
+              {
+               "name": "__variant2",
+               "discriminant": 1,
+               "fields": []
+              }
+             ],
+             "disc_index_safe": true,
+             "faithful_enum_repr": null,
+             "layout": null,
+             "enum_layout": null,
+             "adt_kind": "Enum"
+            }
+           }
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "nncast.rs",
+        "line_start": 25,
+        "col_start": 23,
+        "line_end": 25,
+        "col_end": 55
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Call": {
+      "func": "nncast::{extern#0}::write",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       },
+       {
+        "Move": {
+         "local": 3,
+         "projections": []
+        }
+       },
+       {
+        "Constant": {
+         "Uint": [
+          1,
+          64
+         ]
+        }
+       }
+      ],
+      "dest": {
+       "local": 0,
+       "projections": []
+      },
+      "target": 1,
+      "span": {
+       "file": "nncast.rs",
+       "line_start": 25,
+       "col_start": 13,
+       "line_end": 25,
+       "col_end": 59
+      },
+      "atomic": null,
+      "is_foreign": true,
+      "is_unsafe_sig": true,
+      "callee_identity": {
+       "stable_crate_id": 6844794364146063139,
+       "def_index": 7,
+       "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": false,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 6844794364146063139,
+       "krate_name": "nncast",
+       "foreign_block_leaf": "write"
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 2,
+  "return_ty": {
+   "Int": {
+    "width": 64,
+    "signed": true
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "fd",
+        "Int"
+       ]
+      },
+      {
+       "Int": -2147483648
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "fd",
+        "Int"
+       ]
+      },
+      {
+       "Int": 2147483647
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "byte",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "byte",
+        "Int"
+       ]
+      },
+      {
+       "Int": 255
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

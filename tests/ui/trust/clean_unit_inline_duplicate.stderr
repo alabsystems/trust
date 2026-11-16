@@ -1,4 +1,4 @@
-error: error: `dup_pick` is declared twice in this batch
+error: `dup_pick` is declared twice in this batch
          note: first at Span { start: 0, end: 3 } (unit 0), again at Span { start: 256, end: 259 } (unit 1)
          help: header-first checking builds ONE name index for the whole batch, so two declarations cannot share a canonical name — rename one, or move one into its own `namespace` so the qualified names differ
   --> $DIR/clean_unit_inline_duplicate.rs:27:5
@@ -6,9 +6,9 @@ error: error: `dup_pick` is declared twice in this batch
 LL |     def dup_pick (a b : UInt64) : UInt64 := a
    |     ^^^
    |
-   = note: the island was parsed by the Clean parser and checked by the Clean CIC kernel during this build (two-language design E10)
+   = note: the Clean island was rejected during resolver checking (two-language design E10)
 
-error: error: `dup_pick` is declared twice in this batch
+error: `dup_pick` is declared twice in this batch
          note: first at Span { start: 0, end: 3 } (unit 0), again at Span { start: 256, end: 259 } (unit 1)
          help: header-first checking builds ONE name index for the whole batch, so two declarations cannot share a canonical name — rename one, or move one into its own `namespace` so the qualified names differ
   --> $DIR/clean_unit_dup_name_helper.clean:5:1
@@ -16,7 +16,7 @@ error: error: `dup_pick` is declared twice in this batch
 LL | def dup_pick (a b : UInt64) : UInt64 := b
    | ^^^
    |
-   = note: the island was parsed by the Clean parser and checked by the Clean CIC kernel during this build (two-language design E10)
+   = note: the Clean island was rejected during resolver checking (two-language design E10)
 
 error: aborting due to 2 previous errors
 

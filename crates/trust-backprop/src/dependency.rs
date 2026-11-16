@@ -157,18 +157,15 @@ pub fn topological_order(graph: &CallGraph) -> Vec<String> {
             }
         }
     }
-
-    let mut queue: VecDeque<&str> = VecDeque::new();
-    for (node, &deg) in &out_degree {
-        if deg == 0 {
-            queue.push_back(node);
-        }
+    for callers in reverse.values_mut() {
+        callers.sort_unstable();
     }
 
     // Sort the initial queue for deterministic output.
-    let mut sorted_queue: Vec<&str> = queue.drain(..).collect();
-    sorted_queue.sort();
-    queue.extend(sorted_queue);
+    let mut sorted_queue: Vec<&str> =
+        out_degree.iter().filter_map(|(&node, &deg)| (deg == 0).then_some(node)).collect();
+    sorted_queue.sort_unstable();
+    let mut queue: VecDeque<&str> = VecDeque::from(sorted_queue);
 
     let mut result = Vec::with_capacity(graph.nodes.len());
 
@@ -176,9 +173,7 @@ pub fn topological_order(graph: &CallGraph) -> Vec<String> {
         result.push(node.to_owned());
         // For each caller of this node, decrement their out-degree.
         if let Some(callers) = reverse.get(node) {
-            let mut callers_sorted: Vec<&str> = callers.clone();
-            callers_sorted.sort();
-            for caller in callers_sorted {
+            for &caller in callers {
                 if let Some(deg) = out_degree.get_mut(caller) {
                     *deg = deg.saturating_sub(1);
                     if *deg == 0 {
@@ -222,6 +217,7 @@ mod tests {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],
@@ -255,6 +251,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -286,7 +283,7 @@ mod tests {
     #[test]
     fn tail_call_orders_the_callee_before_the_caller() {
         let mut caller = make_function("caller", &["callee"]);
-        let Terminator::Call { func, args, span, atomic, callee_identity, .. } =
+        let Terminator::Call { func, args, span, atomic, callee_identity, callee_key, .. } =
             caller.body.blocks[0].terminator.clone()
         else {
             unreachable!();
@@ -299,6 +296,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity,
+            callee_key,
         };
         caller.body.blocks.truncate(1);
         let graph = build_call_graph(&[caller, make_function("callee", &[])]);

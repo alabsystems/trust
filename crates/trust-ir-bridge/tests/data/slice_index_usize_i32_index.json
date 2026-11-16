@@ -1,0 +1,246 @@
+{
+  "name": "index",
+  "def_path": "<usize as core::slice::index::SliceIndex<[i32]>>::index",
+  "span": {
+    "file": "library/core/src/slice/index.rs",
+    "line_start": 236,
+    "col_start": 4,
+    "line_end": 239,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "slice"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/core/src/slice/index.rs",
+                "line_start": 238,
+                "col_start": 9,
+                "line_end": 238,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/core/src/slice/index.rs",
+                "line_start": 238,
+                "col_start": 9,
+                "line_end": 238,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 1,
+            "span": {
+              "file": "library/core/src/slice/index.rs",
+              "line_start": 238,
+              "col_start": 9,
+              "line_end": 238,
+              "col_end": 23
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/slice/index.rs",
+                "line_start": 238,
+                "col_start": 8,
+                "line_end": 238,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Ref": {
+        "mutable": false,
+        "inner": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        }
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "self",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "self",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

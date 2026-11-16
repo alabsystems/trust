@@ -1,0 +1,36 @@
+{
+  "id": "trip-init-cycle",
+  "class": "TRIP-INIT-CYCLE-1",
+  "title": "a manual loop counter initialised inside the loop was read as a trip-count bound",
+  "origin": [
+    "DQ:10126 (TRIP-INIT-CYCLE-1)",
+    "tests/ui/trust/manual_counter_init_in_loop{,_run}.rs"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "reset_loop",
+    "obligation": {
+      "kind": "overflow",
+      "at": "c += 1;"
+    }
+  },
+  "twin": {
+    "function": "counted_for",
+    "obligation": {
+      "kind": "overflow",
+      "at": "c += 1;"
+    }
+  },
+  "witness": {
+    "input": "limit = 0 (the 256th c += 1)",
+    "observed": "attempt to add with overflow",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  }
+}

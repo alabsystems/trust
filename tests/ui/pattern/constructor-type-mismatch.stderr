@@ -1,14 +1,18 @@
 error[E0532]: expected unit struct, unit variant or constant, found tuple variant `Foo::Bar`
   --> $DIR/constructor-type-mismatch.rs:11:9
    |
+LL | enum Foo {
 LL |     Bar(i32),
    |     -------- `Foo::Bar` defined here
-LL |     Baz
-   |     --- similarly named unit variant `Baz` defined here
 ...
 LL |         Foo::Bar => {}
    |         ^^^^^^^^
    |
+note: similarly named unit variant `Baz` defined here
+  --> $DIR/constructor-type-mismatch.rs:4:5
+   |
+LL |     Baz
+   |     ^^^
 help: use the tuple variant pattern syntax instead
    |
 LL |         Foo::Bar(_) => {}
@@ -26,7 +30,13 @@ LL | struct S;
    | --------- `S` defined here
 ...
 LL |         S(()) => {}
-   |         ^^^^^ help: use this syntax instead: `S`
+   |         ^^^^^
+   |
+help: use the unit struct syntax instead
+   |
+LL -         S(()) => {}
+LL +         S => {}
+   |
 
 error: aborting due to 2 previous errors
 

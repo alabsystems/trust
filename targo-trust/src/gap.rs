@@ -96,7 +96,7 @@ impl OrderedTally {
     fn ranked(&self) -> Vec<(&str, usize)> {
         let mut ranked =
             self.order.iter().map(|key| (key.as_str(), self.get(key))).collect::<Vec<_>>();
-        ranked.sort_by(|left, right| right.1.cmp(&left.1));
+        ranked.sort_by_key(|row| std::cmp::Reverse(row.1));
         ranked
     }
 }

@@ -1,0 +1,365 @@
+{
+  "name": "ctl_call_bug",
+  "def_path": "ctl::ctl_call_bug",
+  "span": {
+    "file": "probe/ctl.rs",
+    "line_start": 4,
+    "col_start": 17,
+    "line_end": 4,
+    "col_end": 104
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": "Bool",
+        "name": "c"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 4
+              }
+            }
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "m"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "ctl::pick",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "probe/ctl.rs",
+              "line_start": 4,
+              "col_start": 85,
+              "line_end": 4,
+              "col_end": 92
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 10567958951782897924,
+              "def_index": 3,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe/ctl.rs",
+                "line_start": 4,
+                "col_start": 96,
+                "line_end": 4,
+                "col_end": 101
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "RemainderByZero",
+            "target": 2,
+            "span": {
+              "file": "probe/ctl.rs",
+              "line_start": 4,
+              "col_start": 96,
+              "line_end": 4,
+              "col_end": 101
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Rem",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe/ctl.rs",
+                "line_start": 4,
+                "col_start": 96,
+                "line_end": 4,
+                "col_end": 101
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe/ctl.rs",
+                "line_start": 4,
+                "col_start": 94,
+                "line_end": 4,
+                "col_end": 102
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 3,
+            "span": {
+              "file": "probe/ctl.rs",
+              "line_start": 4,
+              "col_start": 94,
+              "line_end": 4,
+              "col_end": 102
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 5
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "probe/ctl.rs",
+                "line_start": 4,
+                "col_start": 94,
+                "line_end": 4,
+                "col_end": 102
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

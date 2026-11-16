@@ -1,0 +1,15 @@
+error[E0603]: function `secret` is private
+  --> $DIR/clean_origin_cross_crate_private_def.rs:24:48
+   |
+LL |     let _ = clean_origin_aux_private_def::api::secret(21);
+   |                                                ^^^^^^ private function
+   |
+note: the function `secret` is defined here
+  --> $DIR/auxiliary/clean_origin_aux_private_def.rs:15:17
+   |
+LL |         private def secret (a : UInt64) : UInt64 := a * 2
+   |                 ^^^
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `trustc --explain E0603`.

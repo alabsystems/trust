@@ -35,10 +35,10 @@
 // these runs into the exporter's would trade independence for compile time;
 // do not.
 
-use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_middle::bug;
+use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
 use rustc_middle::mir::Body;
 use rustc_middle::ty::{Ty, TyCtxt};
+use rustc_span::bug;
 use trust_clean_origin::VerdictDigest;
 
 use crate::clean_origin_mir;
@@ -94,8 +94,51 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                  - call `{path}` from its own crate (the local lane is gated at the \
                    sole constructor and does not need the digest)."
             ))
-            .emit()
+            .emit_fatal()
     };
+
+    // ── 1b. a NON-EXPORTABLE NOTICE is not a certificate (2026-09-16) ───────
+    //       The exporter writes one, in the digest's place, for a def it may
+    //       DEFINE and call locally but whose verdict cannot leave it: an
+    //       evidence form with no wire tag (well-founded / per-equation
+    //       recursion) or a body that calls the exporter's own Rust `fn`s
+    //       (`clean_origin_export`). This is where the documented refusal of
+    //       the cross-crate CALL lives now that the defining crate is allowed
+    //       to build as a library. Every arm below is FATAL: a recognised
+    //       notice admits nothing, a damaged one is never reinterpreted as a
+    //       digest, and only bytes that do not carry the notice magic at all
+    //       fall through to the certificate lane. Reached from the guarded
+    //       `optimized_mir`/`mir_for_ctfe` decode arms like every other
+    //       refusal here, so no body of such a def is ever served to a call,
+    //       a const evaluation, an inlining or a local instantiation — and
+    //       the exporter never emits a linkable symbol for a Clean-origin def
+    //       (`cross_crate_inlinable`), so there is nothing to link instead.
+    match trust_clean_origin::NonExportableNotice::recognize(bytes) {
+        None => {}
+        Some(Ok(notice)) => tcx
+            .dcx()
+            .struct_span_fatal(
+                span,
+                format!(
+                    "Clean-origin definition `{path}` cannot be called from another \
+                     crate: `{krate}` exported no certificate for `{decl}`",
+                    decl = notice.decl(),
+                ),
+            )
+            .with_note(notice.import_note())
+            .emit_fatal(),
+        Some(Err(refusal)) => tcx
+            .dcx()
+            .struct_span_fatal(
+                span,
+                format!(
+                    "the non-exportable notice for Clean-origin `{path}` in `{krate}` \
+                     does not decode; refusing to import the definition"
+                ),
+            )
+            .with_note(refusal.note())
+            .emit_fatal(),
+    }
 
     // ── 2. the digest must decode whole (fail-closed on truncation, unknown
     //       versions, malformed fields, trailing bytes) ─────────────────────
@@ -111,7 +154,7 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                 ),
             )
             .with_note(refusal.note())
-            .emit(),
+            .emit_fatal(),
     };
 
     // ── 3. reject stale-kernel and assumption-bearing CALL rows BEFORE
@@ -133,16 +176,54 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                 ),
             )
             .with_note(refusal.note())
-            .emit(),
+            .emit_fatal(),
     };
 
     // ── 4. rebuild the EXPORTER's Clean environment LOCALLY, under the
     //       IMPORTER's kernel — the sources are transport, never authority ──
     let sources = tcx.trust_clean_island_sources(def.krate);
-    let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
+    // Trust (2026-11-10, E9-DEFERRED-SUFFIX-ENV-2): only the PRE-ADMISSION
+    // prefix, the islands before the first that names `trust_import_*`, which
+    // is exactly what the exporter's gate and digest were built over
+    // (`clean_origin_mir::clean_crate_environment`). The deferred suffix names
+    // the exporter's E6 program admissions, which exist only in the session
+    // that minted them and never cross crates, so a fresh session here
+    // rejected the whole batch and every certificate of such a library failed
+    // with the kernel-skew text below. Every minted declaration is in the
+    // prefix and the suffix only extends that environment; the exporter's own
+    // build checked the suffix, and readmission still compares every digest
+    // field against this prefix's recomputed closure.
+    let prefix = trust_certify::clean_island::pre_admission_island_count(sources.as_slice());
+    let sources: Vec<&str> = sources[..prefix].iter().map(String::as_str).collect();
     let mut session = trust_certify::clean_island::CleanIslandSession::new();
+    // Trust (TG6): the exporter's islands, rebuilt here, are a local kernel
+    // fact of this compiler like any other.
+    crate::clean_origin_mir::enable_clean_facts(tcx.sess, &mut session);
     let batch = session.check_all(&sources);
     if batch.is_rejected() || session.is_tainted() {
+        // A KNOWN cause is named before the skew guess below (2026-09-17). Now
+        // that a library may DEFINE a Clean def that calls its own Rust `fn`s
+        // (1b), its island sources reach importers — and they cannot elaborate
+        // in the fresh session above: a Rust callee is a constant the compiler
+        // declares in the DEFINING crate's environment, never island text, and
+        // no callee table crosses (Lean-calls-Rust increment 6). So EVERY
+        // certificate of such a crate refuses here, the exportable siblings'
+        // included. Same fatal, same place; only the explanation changes —
+        // "rebuild the dependency" would send the user nowhere.
+        if let Some(note) = rust_callee_sibling_note(tcx, def.krate, digest.decl()) {
+            tcx.dcx()
+                .struct_span_fatal(
+                    span,
+                    format!(
+                        "cannot import the Clean-origin certificate for `{decl}` from \
+                         `{krate}`: the `clean {{ … }}` islands of `{krate}` call Rust \
+                         `fn`s of `{krate}` and cannot be re-elaborated in this crate",
+                        decl = digest.decl(),
+                    ),
+                )
+                .with_note(note)
+                .emit_fatal();
+        }
         // A refusal NAMING THE SKEW, not an ICE: the usual reason a
         // once-green island stops elaborating is that the importer links a
         // different kernel/elaborator than the one the exporter minted under,
@@ -160,6 +241,18 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                     decl = digest.decl(),
                 ),
             )
+            // Trust (2026-09-19): the third option here used to read "cite the
+            // declaration from proof position instead — proof-position citation
+            // re-checks under the local kernel and does not import a
+            // certificate". CROSS-CRATE proof-position citation does not exist:
+            // a citation resolves against this crate's own islands and the
+            // Clean prelude, so that option could not be taken — the defect
+            // class of commit `3e9b1e3d2de` (`help-surfaces(lean_build)`). It
+            // is replaced by the cross-crate Clean share that IS measured to
+            // work today. When cross-crate citation lands (design note
+            // `2026-09-18-cross-crate-proof-citation.md`, increment 3) the
+            // original sentence becomes true and may come back — spelled
+            // `by <crate>.<decl>`, per ruling R1.
             .with_note(format!(
                 "the certificate was minted under Clean kernel {minted}; this build \
                  links kernel {local}.\n\
@@ -168,11 +261,12 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                    certificates are produced by the kernel that will check them;\n\
                  - if the two versions above match, this is elaborator drift under one \
                    kernel version: report it with both strings and the island sources;\n\
-                 - cite the declaration from proof position instead — proof-position \
-                   citation re-checks under the local kernel and does not import a \
-                   certificate."
+                 - if you only need the declaration in PROOF position, mount its Clean \
+                   source in this crate too (`#[path = \"…/Defs.lean\"] clean mod defs;`, \
+                   re-elaborated here under this kernel) and cite it as this crate's own: \
+                   nothing is imported, so nothing can be skewed."
             ))
-            .emit();
+            .emit_fatal();
     }
     let Some(env) = session.environment() else {
         // Unreachable for an unrejected, untainted session; a fail-closed arm
@@ -203,7 +297,7 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                 ),
             )
             .with_note(refusal.note())
-            .emit(),
+            .emit_fatal(),
     };
 
     // The signature every call in THIS crate was type-checked against is the
@@ -271,7 +365,7 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                 },
             )
             .with_note(refusal.note())
-            .emit(),
+            .emit_fatal(),
     };
     if plan.signature() != preflight.signature() {
         tcx.dcx().span_fatal(
@@ -321,7 +415,7 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                     },
                 )
                 .with_note(refusal.note())
-                .emit(),
+                .emit_fatal(),
         };
         let readmitted = match trust_clean_origin::readmit(&preflight, &local) {
             Ok(readmitted) => readmitted,
@@ -336,7 +430,7 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                     ),
                 )
                 .with_note(refusal.note())
-                .emit(),
+                .emit_fatal(),
         };
         match observed_method {
             None => observed_method = Some(readmitted.method()),
@@ -371,6 +465,24 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
     // sealed local check, matched the preflighted wire, and agreed on method.
     // Completing this query is the compiler-side authority consumed by the
     // metadata chokepoints; no transferable token or wire claim escapes it.
+}
+
+/// The note for "`krate`'s islands cannot elaborate HERE because one of its
+/// defs calls `krate`'s own Rust `fn`s" — `Some` iff `krate` exported a
+/// Rust-callee non-exportable notice (`NonExportableNotice::sibling_import_note`
+/// owns the text and the `Some`/`None` decision). Rows that are certificates,
+/// damaged notices or well-founded notices answer `None` and are skipped.
+///
+/// Consulted ONLY from the already-fatal "exporter's islands do not
+/// re-elaborate" arm of the provider above, to choose its explanation. It
+/// admits nothing, and a forged row can change only which refusal text the
+/// user reads. Registry order, so the def named is deterministic.
+fn rust_callee_sibling_note(tcx: TyCtxt<'_>, krate: CrateNum, sibling: &str) -> Option<String> {
+    tcx.trust_clean_origin_exports(krate).iter().find_map(|&index| {
+        let row = tcx.trust_clean_verdict_digest(DefId { krate, index })?;
+        let notice = trust_clean_origin::NonExportableNotice::recognize(row)?.ok()?;
+        notice.sibling_import_note(sibling)
+    })
 }
 
 /// LOCAL arm of `trust_clean_extern_unreadmitted_optimized_mir` — a bug, on

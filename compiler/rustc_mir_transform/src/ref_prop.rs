@@ -3,14 +3,15 @@ use std::borrow::Cow;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_index::IndexVec;
 use rustc_index::bit_set::DenseBitSet;
-use rustc_middle::bug;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::Analysis;
 use rustc_mir_dataflow::impls::{MaybeStorageDead, always_storage_live_locals};
+use rustc_span::bug;
 use tracing::{debug, instrument};
 
+use crate::PassPolicy;
 use crate::ssa::{SsaLocals, StorageLiveLocals};
 
 /// Propagate references using SSA analysis.
@@ -72,8 +73,8 @@ use crate::ssa::{SsaLocals, StorageLiveLocals};
 pub(super) struct ReferencePropagation;
 
 impl<'tcx> crate::MirPass<'tcx> for ReferencePropagation {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 2
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 2)
     }
 
     #[instrument(level = "trace", skip(self, tcx, body))]
@@ -81,10 +82,6 @@ impl<'tcx> crate::MirPass<'tcx> for ReferencePropagation {
         debug!(def_id = ?body.source.def_id());
         move_to_copy_pointers(tcx, body);
         while propagate_ssa(tcx, body) {}
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -124,7 +121,22 @@ fn propagate_ssa<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> bool {
     let typing_env = body.typing_env(tcx);
     let ssa = SsaLocals::new(tcx, body, typing_env);
 
-    let mut replacer = compute_replacement(tcx, body, ssa);
+    let has_ptr_candidate = ssa.assignments(body).any(|(local, rvalue, _)| {
+        body.local_decls[local].ty.is_any_ptr()
+            && matches!(
+                rvalue,
+                Rvalue::Use(Operand::Copy(_) | Operand::Move(_), _)
+                    | Rvalue::Ref(..)
+                    | Rvalue::RawPtr(..)
+            )
+    });
+    if !has_ptr_candidate {
+        return false;
+    }
+
+    let Some(mut replacer) = compute_replacement(tcx, body, ssa) else {
+        return false;
+    };
     debug!(?replacer.targets);
     debug!(?replacer.allowed_replacements);
     debug!(?replacer.storage_to_remove);
@@ -153,7 +165,7 @@ fn compute_replacement<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     ssa: SsaLocals,
-) -> Replacer<'tcx> {
+) -> Option<Replacer<'tcx>> {
     let always_live_locals = always_storage_live_locals(body);
 
     // Compute which locals have a single `StorageLive` statement ever.
@@ -219,6 +231,7 @@ fn compute_replacement<'tcx>(
         }
     };
 
+    let mut any_target = false;
     for (local, rvalue, location) in ssa.assignments(body) {
         debug!(?local);
 
@@ -260,6 +273,7 @@ fn compute_replacement<'tcx>(
                         targets[local] =
                             Value::Pointer(tcx.mk_place_deref(rhs.into()), needs_unique);
                     }
+                    any_target = true;
                 }
             }
             Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
@@ -278,11 +292,16 @@ fn compute_replacement<'tcx>(
                 assert_ne!(place.local, local);
                 if is_constant_place(place) {
                     targets[local] = Value::Pointer(place, needs_unique);
+                    any_target = true;
                 }
             }
             // We do not know what to do, so keep as not-a-pointer.
             _ => {}
         }
+    }
+
+    if !any_target {
+        return None;
     }
 
     debug!(?targets);
@@ -298,14 +317,14 @@ fn compute_replacement<'tcx>(
     }
 
     let allowed_replacements = finder.allowed_replacements;
-    return Replacer {
+    return Some(Replacer {
         tcx,
         targets: finder.targets,
         remap_var_debug_infos: IndexVec::from_elem(None, body.local_decls()),
         storage_to_remove,
         allowed_replacements,
         any_replacement: false,
-    };
+    });
 
     struct ReplacementFinder<'tcx, F> {
         targets: IndexVec<Local, Value<'tcx>>,
@@ -338,7 +357,7 @@ fn compute_replacement<'tcx>(
                     //
                     // This also allows to detect cases where `target.local` is not replaceable,
                     // and mark it as such.
-                    if let &[PlaceElem::Deref] = &target.projection[..] {
+                    if target.is_indirect_first_projection() {
                         assert!(perform_opt);
                         self.allowed_replacements.insert((target.local, loc));
                         place.local = target.local;

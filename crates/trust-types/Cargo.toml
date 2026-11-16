@@ -23,14 +23,17 @@ workspace = true
 # Stable-only consumers (e.g. the `clean` workspace) depend with
 # `default-features = false` to drop the nightly requirement; the `Discharge`
 # type and all its combinators remain available on stable, only `?`-sugar is off.
-default = []
+default = ["try-sugar"]
 try-sugar = []
 test-utils = []
-# trust #571: ay-bindings for Formula->Expr conversion bridge.
-ay-bridge = ["dep:ay-bindings"]
+# trust #571: ay-bindings for Formula->Expr conversion bridge. `num-bigint` is
+# the exact carrier for `Formula::Rat` literals on that lane (ay's
+# `real_const` takes a `BigInt`); it rides the same feature so the default
+# build stays as lean as before.
+ay-bridge = ["dep:ay-bindings", "dep:num-bigint"]
 # Opt-in: run the FP bridge's *end-to-end solver* regression tests in-process
 # (pulls the ay-dpll backend via `ay-bindings/direct`). Heavy; not in default or
-# plain `ay-bridge`. Run: `cargo test -p trust-types --features ay-bridge-solve`.
+# plain `ay-bridge`. Run: `targo --unverified test -p trust-types --features ay-bridge-solve`.
 ay-bridge-solve = ["ay-bridge", "ay-bindings/direct"]
 # trust #632: trust-wp-core PureExpr conversion bridge for native trust-wp integration.
 trust-wp-bridge = ["dep:trust-wp-core"]
@@ -41,6 +44,10 @@ trust-wp-bridge = ["dep:trust-wp-core"]
 # public API (and the whole compiler) is unchanged; the leaf crate lets backends
 # (e.g. clean) share the vocabulary without depending on the Trust repo.
 trust-ir-contract = { workspace = true }
+# Publication binds v2 body-WP identities through the IR owner's canonical
+# native-input digest. This is the same workspace package, with codecs only:
+# do not inherit the workspace dependency's Clean-kernel replay feature.
+trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir", default-features = false, features = ["native-transport-json"] }
 thiserror = { workspace = true }
 serde = { workspace = true }
 # Trust (R1 corpus): `unbounded_depth` gates `Deserializer::disable_recursion_limit`,
@@ -53,8 +60,13 @@ rustc-hash = { workspace = true }
 indexmap = { workspace = true }
 # trust #571: ay-bindings for Formula->Expr conversion bridge (optional bridge).
 ay-bindings = { workspace = true, optional = true }
+# Exact-rational literal carrier for the ay bridge (`Formula::Rat` → Real).
+num-bigint = { workspace = true, optional = true }
 # trust #632: trust-wp-core for Formula→PureExpr bridge (optional, behind trust-wp-bridge feature)
 trust-wp-core = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 bincode = { workspace = true }

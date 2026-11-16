@@ -1,0 +1,1 @@
+neg(true)=false conj(true,false)=false disj(false,false)=false all=true

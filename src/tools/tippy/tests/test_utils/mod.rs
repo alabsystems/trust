@@ -17,14 +17,37 @@ pub static CARGO_CLIPPY_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
 
 pub const IS_RUSTC_TEST_SUITE: bool = option_env!("RUSTC_TEST_SUITE").is_some();
 
+// Trust: this is only a Cargo UI comparison prelude, not proof authority.
+// The genuine Targo producer must keep disclosing its unverified lane. Match
+// exactly its authenticated inherited-lane notice, never other warnings,
+// verification notes, verdicts or errors.
+pub const INHERITED_UNVERIFIED_NOTICE: &str = "warning: UNVERIFIED: `targo check` inherited live broker-authenticated explicit-unverified authority from its Targo ancestor; this run emits no proof claim";
+
+pub fn inherited_unverified_notice_regex() -> regex::bytes::Regex {
+    regex::bytes::Regex::new(&format!(
+        r"(?m)^{}(?:\n|\z)",
+        regex::escape(INHERITED_UNVERIFIED_NOTICE),
+    ))
+    .unwrap()
+}
+
+pub fn cargo_notice_normalizer_if_unasserted(expected_stderr: &[u8]) -> Option<regex::bytes::Regex> {
+    let normalizer = inherited_unverified_notice_regex();
+    // Security fixtures that assert this exact disclosure must keep testing it.
+    (!normalizer.is_match(expected_stderr)).then_some(normalizer)
+}
+
 /// Reject any Trust semantic/evidence control in a direct driver invocation.
 ///
 /// UI compiles need batteries-on verification out of the way, but they must not
 /// ask for it: the driver enters rustc through the no-evidence boundary, and
-/// that same policy both turns verification off by itself and fatally rejects
-/// every `-Ztrust-*` option. Passing one is not redundant, it is fatal — and it
-/// fails identically for all ~1000 UI tests, which reads as a broken harness
-/// rather than a broken argument. Fail here instead, with the argument named.
+/// that same policy turns verification off by itself, neutralizes every
+/// verification-posture selector, and fatally rejects an effective
+/// `-Ztrust-verify=on` and every evidence control
+/// (`rustc_driver_impl::frontend_forbidden_option`). A Trust control here is
+/// therefore at best redundant and at worst fatal — and a fatal one fails
+/// identically for all ~1000 UI tests, which reads as a broken harness rather
+/// than a broken argument. Fail here instead, with the argument named.
 pub fn reject_trust_frontend_controls(args: &[OsString]) {
     if let Some(forbidden) = args
         .iter()

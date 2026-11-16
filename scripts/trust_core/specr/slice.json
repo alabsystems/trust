@@ -1,0 +1,39 @@
+{
+  "comment": "K8 probe translator configuration. Inputs: the MiniRust specr files of the integer/pointer/call slice and the parts of the language and basic memory model the slice's execution path needs, at the pinned MiniRust revision. The monomorphization binds MiniRust's generic parameters to the instance minitest runs: BasicMemory<x86_64>.",
+  "minirust_revision": "e8666821f7ee06282199e126a623679f8df85a36",
+  "files": [
+    "prelude/main.md",
+    "prelude/target.md",
+    "lang/prelude.md",
+    "mem/prelude.md",
+    "lang/syntax.md",
+    "lang/types.md",
+    "lang/values.md",
+    "lang/representation.md",
+    "lang/well-formed.md",
+    "lang/machine.md",
+    "lang/step/expressions.md",
+    "lang/step/statements.md",
+    "lang/step/terminators.md",
+    "lang/step/operators.md",
+    "lang/step/intrinsics.md",
+    "lang/step/locks.md",
+    "mem/pointer.md",
+    "mem/interface.md",
+    "mem/basic.md",
+    "mem/concurrent.md",
+    "mem/intptrcast.md"
+  ],
+  "monomorphization": {
+    "bound": {"Memory": ["adt", "BasicMemory"], "Target": ["adt", "x86_64"]},
+    "param": {"Provenance": ["tuple", [["adt", "AllocId"], ["unit"]]], "ProvExtra": ["unit"], "AllocExtra": ["unit"]},
+    "polymorphic": ["O"],
+    "assoc_type": {"Provenance": ["tuple", [["adt", "AllocId"], ["unit"]]], "T": ["adt", "x86_64"], "FrameExtra": ["unit"], "Params": ["unit"]}
+  },
+  "library_enums": {
+    "Signedness": ["Signed", "Unsigned"],
+    "Mutability": ["Mutable", "Immutable"],
+    "Endianness": ["LittleEndian", "BigEndian"]
+  },
+  "pick_candidate_bound": 65536
+}

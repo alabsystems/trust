@@ -1,0 +1,1 @@
+{"id": 6, "empty": {}, "nested": {"a": {"b": {"c": {"d": {}}}}}, "exp": 100000.0, "": "empty key", "ключ": "non-ASCII key", "items": [{}], "neg": -6, "big": 9007199254740998}

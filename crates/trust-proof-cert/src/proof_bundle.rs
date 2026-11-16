@@ -704,9 +704,8 @@ impl ProofBundle {
             .map(|(cert, chain)| FunctionCertificate::from_existing(cert, chain))
             .collect();
         canonicalize_function_records(&mut function_certs);
-        ensure_function_record_integrity(&function_certs)?;
+        let record_inventory = ensure_function_record_integrity(&function_certs)?;
         let reported_assurance = compute_weakest_reported_assurance(&function_certs);
-        let record_inventory = compute_record_inventory(&function_certs);
 
         let timestamp = current_timestamp();
 
@@ -741,11 +740,12 @@ impl ProofBundle {
     /// arbitrary claims.
     pub fn check_internal_consistency(&self) -> Result<bool, CertError> {
         let computed = self.compute_hash()?;
+        let inventory = compute_record_inventory(&self.function_certs);
         Ok(computed == self.bundle_digest
             && self.version == PROOF_BUNDLE_VERSION
             && self.reported_assurance == compute_weakest_reported_assurance(&self.function_certs)
-            && self.record_inventory == compute_record_inventory(&self.function_certs)
-            && self.function_certs.iter().all(FunctionCertificate::record_integrity_valid))
+            && self.record_inventory == inventory
+            && inventory.integrity_invalid_functions.is_empty())
     }
 
     /// Carried function certificate records.
@@ -791,61 +791,77 @@ impl ProofBundle {
         hasher.update(b"|");
         hasher.update(self.created_at.as_bytes());
         hasher.update(b"|");
-        hasher.update(format!("{:?}", self.reported_assurance).as_bytes());
+        let assurance_tag = match self.reported_assurance {
+            ReportedAssurance::SignedCertificationClaim => b"SignedCertificationClaim".as_slice(),
+            ReportedAssurance::ReportedSoundnessClaim => b"ReportedSoundnessClaim".as_slice(),
+            ReportedAssurance::BoundedResultClaim => b"BoundedResultClaim".as_slice(),
+            ReportedAssurance::Unclassified => b"Unclassified".as_slice(),
+        };
+        hasher.update(assurance_tag);
         hasher.update(b"|");
+
+        let mut scratch = Vec::with_capacity(256);
 
         // Function certificates (serialized)
-        let fc_json = serde_json::to_string(&self.function_certs)
+        serde_json::to_writer(&mut scratch, &self.function_certs)
             .map_err(|e| CertError::SerializationFailed { reason: e.to_string() })?;
-        hasher.update(fc_json.as_bytes());
+        hasher.update(&scratch);
         hasher.update(b"|");
+        scratch.clear();
 
         // Transval certificates
-        let tv_json = serde_json::to_string(&self.transval_records)
+        serde_json::to_writer(&mut scratch, &self.transval_records)
             .map_err(|e| CertError::SerializationFailed { reason: e.to_string() })?;
-        hasher.update(tv_json.as_bytes());
+        hasher.update(&scratch);
         hasher.update(b"|");
+        scratch.clear();
 
         // Codegen certificates
-        let cg_json = serde_json::to_string(&self.codegen_records)
+        serde_json::to_writer(&mut scratch, &self.codegen_records)
             .map_err(|e| CertError::SerializationFailed { reason: e.to_string() })?;
-        hasher.update(cg_json.as_bytes());
+        hasher.update(&scratch);
         hasher.update(b"|");
+        scratch.clear();
 
         // Self cert
-        let sc_json = serde_json::to_string(&self.self_check_record)
+        serde_json::to_writer(&mut scratch, &self.self_check_record)
             .map_err(|e| CertError::SerializationFailed { reason: e.to_string() })?;
-        hasher.update(sc_json.as_bytes());
+        hasher.update(&scratch);
         hasher.update(b"|");
+        scratch.clear();
 
         // Assumptions
-        let as_json = serde_json::to_string(&self.assumptions)
+        serde_json::to_writer(&mut scratch, &self.assumptions)
             .map_err(|e| CertError::SerializationFailed { reason: e.to_string() })?;
-        hasher.update(as_json.as_bytes());
+        hasher.update(&scratch);
         hasher.update(b"|");
+        scratch.clear();
 
         // Environment
-        let env_json = serde_json::to_string(&self.environment)
+        serde_json::to_writer(&mut scratch, &self.environment)
             .map_err(|e| CertError::SerializationFailed { reason: e.to_string() })?;
-        hasher.update(env_json.as_bytes());
+        hasher.update(&scratch);
         hasher.update(b"|");
+        scratch.clear();
 
         // Dependencies
-        let dep_json = serde_json::to_string(&self.dependencies)
+        serde_json::to_writer(&mut scratch, &self.dependencies)
             .map_err(|e| CertError::SerializationFailed { reason: e.to_string() })?;
-        hasher.update(dep_json.as_bytes());
+        hasher.update(&scratch);
         hasher.update(b"|");
+        scratch.clear();
 
         // Coverage
-        let cov_json = serde_json::to_string(&self.record_inventory)
+        serde_json::to_writer(&mut scratch, &self.record_inventory)
             .map_err(|e| CertError::SerializationFailed { reason: e.to_string() })?;
-        hasher.update(cov_json.as_bytes());
+        hasher.update(&scratch);
         hasher.update(b"|");
+        scratch.clear();
 
         // Artifact records, including descriptive metadata and inline bytes.
-        let artifact_json = serde_json::to_string(&self.artifacts)
+        serde_json::to_writer(&mut scratch, &self.artifacts)
             .map_err(|e| CertError::SerializationFailed { reason: e.to_string() })?;
-        hasher.update(artifact_json.as_bytes());
+        hasher.update(&scratch);
 
         Ok(hasher.finalize().into())
     }
@@ -914,8 +930,11 @@ impl fmt::Display for ProofBundle {
             writeln!(f, "    Target: {}", self.environment.target_triple)?;
         }
 
-        let digest_hex: String = self.bundle_digest.iter().map(|b| format!("{b:02x}")).collect();
-        writeln!(f, "  Internal digest: {}", &digest_hex[..16])?;
+        write!(f, "  Internal digest: ")?;
+        for b in &self.bundle_digest[..8] {
+            write!(f, "{b:02x}")?;
+        }
+        writeln!(f)?;
         Ok(())
     }
 }
@@ -1008,10 +1027,9 @@ impl ProofBundleBuilder {
     /// Build the ProofBundle, computing the integrity hash.
     pub fn build(mut self) -> Result<ProofBundle, CertError> {
         canonicalize_function_records(&mut self.function_certs);
-        ensure_function_record_integrity(&self.function_certs)?;
+        let record_inventory = ensure_function_record_integrity(&self.function_certs)?;
         ensure_inline_artifact_integrity(&self.artifacts)?;
         let reported_assurance = compute_weakest_reported_assurance(&self.function_certs);
-        let record_inventory = compute_record_inventory(&self.function_certs);
 
         let mut bundle = ProofBundle {
             version: PROOF_BUNDLE_VERSION,
@@ -1046,8 +1064,11 @@ fn canonicalize_function_records(records: &mut [FunctionCertificate]) {
     }
 }
 
-fn ensure_function_record_integrity(records: &[FunctionCertificate]) -> Result<(), CertError> {
+fn ensure_function_record_integrity(
+    records: &[FunctionCertificate],
+) -> Result<RecordInventory, CertError> {
     let mut paths = BTreeSet::new();
+    let mut integrity_valid_functions = Vec::with_capacity(records.len());
     for record in records {
         if !paths.insert(record.function_path.as_str()) {
             return Err(CertError::InvalidCertificate {
@@ -1062,8 +1083,14 @@ fn ensure_function_record_integrity(records: &[FunctionCertificate]) -> Result<(
                 ),
             });
         }
+        integrity_valid_functions.push(record.function_path.clone());
     }
-    Ok(())
+    Ok(RecordInventory {
+        function_records: records.len(),
+        integrity_valid_function_records: integrity_valid_functions.len(),
+        integrity_valid_functions,
+        integrity_invalid_functions: Vec::new(),
+    })
 }
 
 fn ensure_inline_artifact_integrity(artifacts: &[ProvenArtifact]) -> Result<(), CertError> {
@@ -1131,7 +1158,12 @@ mod optional_bytes_as_base64 {
             Some(bytes) => {
                 // Encode bytes as hex string for JSON compatibility without
                 // adding a base64 dependency.
-                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let mut hex = String::with_capacity(bytes.len() * 2);
+                for &b in bytes {
+                    hex.push(HEX[(b >> 4) as usize] as char);
+                    hex.push(HEX[(b & 0x0f) as usize] as char);
+                }
                 hex.serialize(serializer)
             }
             None => serializer.serialize_none(),

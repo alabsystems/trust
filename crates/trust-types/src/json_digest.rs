@@ -468,7 +468,11 @@ impl serde::ser::SerializeMap for SerializeWideMap {
     where
         T: ?Sized + Serialize,
     {
-        let key = self.next_key.take().expect("serialize_value called before serialize_key");
+        // Unsupported Serialize implementations must fail through the digest
+        // Result boundary rather than unwind while evidence is being hashed.
+        let key = self.next_key.take().ok_or_else(|| {
+            <Error as serde::ser::Error>::custom("serialize_value called before serialize_key")
+        })?;
         self.map.insert(key, to_wide_value(value)?);
         Ok(())
     }
@@ -982,6 +986,31 @@ mod tests {
         bad_key.insert((1u8, 2u8), i128::MIN);
         assert!(serde_json::to_value(&bad_key).is_err());
         assert!(canonical_digest_json_value(&bad_key).is_err());
+    }
+
+    #[test]
+    fn malformed_map_values_in_wide_digest_material_return_errors() {
+        struct ValueBeforeKey;
+        impl Serialize for ValueBeforeKey {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_value(&7u8)?;
+                map.end()
+            }
+        }
+
+        // The raw wide leaf makes the normal JSON value lane decline before
+        // it visits the malformed sibling. The fallback must propagate the
+        // map protocol error rather than panic during evidence hashing.
+        for result in [
+            canonical_digest_json_value(&(u128::MAX, ValueBeforeKey)),
+            canonical_digest_json_value(&(i128::MIN, vec![ValueBeforeKey])),
+        ] {
+            let error = result.expect_err("incomplete map material must not get a digest identity");
+            assert!(error.to_string().contains("serialize_value called before serialize_key"));
+        }
     }
 
     #[test]

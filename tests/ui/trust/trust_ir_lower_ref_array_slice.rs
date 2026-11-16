@@ -1,6 +1,14 @@
 //@ dont-check-compiler-stderr
-//@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ check-fail
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory --crate-type=lib
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
+// Re-pinned 2026-10-15 (the merge of 2026-10-14 brought WS5.2, 87388a9d3ec and aa2f22aa306):
+// `Function.name` is now the link-time symbol, and a GENERIC definition has none until
+// per-instance lowering (B8), so `-Ztrust-ir-lower=strict` refuses each one by name at crate
+// assembly ("lowered for coverage, never spliced"). Those refusals are pinned below; every
+// other body must still lower, and any other strict error fails this test.
 //! Trust (wave-RAS): the array-to-slice unsize whose SOURCE IS ALREADY A
 //! `&[T; N]` REFERENCE VALUE — a caller PARAMETER — rather than an array PLACE.
 //!
@@ -56,6 +64,7 @@ pub const extern "C" fn unsize_const_extern(x: &[u8; 3]) -> &[u8] {
 /// `map_ty` already admits for the `&[T]` TYPE, because it stores nothing and so
 /// needs no `is_scalar_ty` round-trip gate.
 pub fn long_to_short<'a, 'b, T>(xs: &'b [&'static T; 1]) -> &'b [&'a T] {
+    //~^ ERROR NoLinkTimeSymbol(long_to_short): no link-time symbol for `long_to_short`
     xs
 }
 
@@ -67,9 +76,11 @@ pub fn zero_len<B>(x: &[B; 0]) -> &[B] {
 }
 
 fn lub_short<'a, T>(_: &[&'a T], _: &[&'a T]) {}
+    //~^ ERROR NoLinkTimeSymbol(lub_short): no link-time symbol for `lub_short`
 
 /// `coerce-unsize-subtype.rs::long_and_short`: the coerced value is a call
 /// ARGUMENT, so the masking `Call(unsupported arg)` retires with the leaf.
 pub fn call_arg<'a, T>(xs: &[&'static T; 1], ys: &[&'a T; 1]) {
+    //~^ ERROR NoLinkTimeSymbol(call_arg): no link-time symbol for `call_arg`
     lub_short(xs, ys);
 }

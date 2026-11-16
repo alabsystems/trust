@@ -59,7 +59,7 @@ public:
 
   Value createAddOp(Type self, OpBuilder &builder, Location loc, Value a,
                     Value b) const {
-    return arith::AddFOp::create(builder, loc, a, b);
+    return setDerivativeFastMath(arith::AddFOp::create(builder, loc, a, b));
   }
   Value createConjOp(Type self, OpBuilder &builder, Location loc,
                      Value a) const {
@@ -105,7 +105,7 @@ public:
     if (auto G = dyn_cast<ComplexType>(ET)) {
       if (auto F = dyn_cast<FloatType>(G.getElementType())) {
         APFloat apvalue(F.getFloatSemantics(), 0);
-        std::complex<APFloat> c(apvalue, apvalue);
+        mlir::Complex<APFloat> c(apvalue, apvalue);
         return DenseElementsAttr::get(tenType, c);
       }
     }
@@ -273,7 +273,8 @@ public:
 
   Value createAddOp(Type self, OpBuilder &builder, Location loc, Value a,
                     Value b) const {
-    return complex::AddOp::create(builder, loc, a, b)->getResult(0);
+    return setDerivativeFastMath(complex::AddOp::create(builder, loc, a, b))
+        ->getResult(0);
   }
   Value createConjOp(Type self, OpBuilder &builder, Location loc,
                      Value a) const {

@@ -12,7 +12,8 @@ use trust_cg_lower::instructions::{Block, Opcode};
 use trust_cg_lower::types::Type as LirType;
 use trust_types::{
     AggregateKind, AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand,
-    Place, Rvalue, SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+    Place, Rvalue, SourceSpan, Statement, Terminator, Ty, VariantDef, VerifiableBody,
+    VerifiableFunction,
 };
 
 fn make_add() -> VerifiableFunction {
@@ -47,6 +48,7 @@ fn make_add() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -77,6 +79,7 @@ fn make_identity() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -100,19 +103,35 @@ fn make_unit_main() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
 fn make_checked_div_option() -> VerifiableFunction {
+    // Trust (ticket 216 cg-bridge): the MIR codegen lane writes the DECLARED
+    // discriminant into `tag`, so the ADT carries its variant descriptor, and
+    // `Some`'s payload lives in its own `__v1_0` lane (the extractor's spelling).
     let option_ty = Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: vec![
+            VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+            VariantDef {
+                name: "Some".into(),
+                discriminant: 1,
+                fields: vec![("0".into(), Ty::i32())],
+            },
+        ]
+        .into(),
         name: "Option".to_string(),
-        fields: vec![("tag".to_string(), Ty::i64()), ("value".to_string(), Ty::i32())],
+        fields: vec![("tag".to_string(), Ty::i64()), ("__v1_0".to_string(), Ty::i32())].into(),
         disc_index_safe: false,
         // Trust (B3-1 field completion): pre-existing E0063 missed by 11598e13fe.
-        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
 
     VerifiableFunction {
         name: "checked_div".to_string(),
@@ -191,6 +210,7 @@ fn make_checked_div_option() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -198,12 +218,16 @@ fn pair_ty() -> Ty {
     Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         name: "Pair".to_string(),
-        fields: vec![("left".to_string(), Ty::i64()), ("right".to_string(), Ty::i32())],
+        fields: vec![("left".to_string(), Ty::i64()), ("right".to_string(), Ty::i32())].into(),
         disc_index_safe: false,
         // Trust (B3-1 field completion): pre-existing E0063 missed by 11598e13fe.
-        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    }
 }
 
 fn make_pair_helper() -> VerifiableFunction {
@@ -244,6 +268,7 @@ fn make_pair_helper() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -268,6 +293,7 @@ fn make_pair_via_helper_call() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "make_pair_helper".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -296,6 +322,7 @@ fn make_pair_via_helper_call() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -355,6 +382,7 @@ fn make_checked_add_overflowing() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -376,6 +404,7 @@ fn make_checked_add_overflow_main() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "checked_add_overflowing".to_string(),
                         args: vec![
@@ -407,6 +436,7 @@ fn make_checked_add_overflow_main() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

@@ -34,16 +34,25 @@ impl TcpStream {
     }
 
     pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+        if timeout == Duration::ZERO {
+            return Err(io::Error::ZERO_TIMEOUT);
+        }
         let inner = tcp::Tcp::connect(addr, Some(timeout))?;
         Ok(Self::new(inner))
     }
 
     pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
+        if t == Some(Duration::ZERO) {
+            return Err(io::Error::ZERO_TIMEOUT);
+        }
         self.read_timeout.set(t).unwrap();
         Ok(())
     }
 
     pub fn set_write_timeout(&self, t: Option<Duration>) -> io::Result<()> {
+        if t == Some(Duration::ZERO) {
+            return Err(io::Error::ZERO_TIMEOUT);
+        }
         self.write_timeout.set(t).unwrap();
         Ok(())
     }
@@ -136,6 +145,14 @@ impl TcpStream {
         self.inner.ttl()
     }
 
+    pub fn set_hop_limit_v6(&self, _: u8) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn hop_limit_v6(&self) -> io::Result<u8> {
+        unsupported()
+    }
+
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         unsupported()
     }
@@ -147,7 +164,8 @@ impl TcpStream {
 
 impl fmt::Debug for TcpStream {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        // FIXME(implement this)
+        unimplemented!()
     }
 }
 
@@ -187,6 +205,14 @@ impl TcpListener {
         self.inner.ttl()
     }
 
+    pub fn set_hop_limit_v6(&self, _: u8) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn hop_limit_v6(&self) -> io::Result<u8> {
+        unsupported()
+    }
+
     pub fn set_only_v6(&self, _: bool) -> io::Result<()> {
         unsupported()
     }
@@ -206,7 +232,8 @@ impl TcpListener {
 
 impl fmt::Debug for TcpListener {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        // FIXME(implement this)
+        unimplemented!()
     }
 }
 
@@ -310,6 +337,22 @@ impl UdpSocket {
     }
 
     pub fn ttl(&self) -> io::Result<u32> {
+        self.0
+    }
+
+    pub fn set_hop_limit_v6(&self, _: u8) -> io::Result<()> {
+        self.0
+    }
+
+    pub fn hop_limit_v6(&self) -> io::Result<u8> {
+        self.0
+    }
+
+    pub fn set_multicast_hop_limit_v6(&self, _: u8) -> io::Result<()> {
+        self.0
+    }
+
+    pub fn multicast_hop_limit_v6(&self) -> io::Result<u8> {
         self.0
     }
 

@@ -123,18 +123,37 @@ const REFL_ONLY_FAKE_SRC: &str = concat!(
 /// term is a large `KExpr.rec` tree — both blow the default 8 MB thread stack.
 const CHECKER_CORE_STACK_BYTES: usize = 512 * 1024 * 1024;
 
+/// Borrow the full specification after one successful in-process construction.
+///
+/// Its embedded sources and kernel declarations are fixed by this binary, and
+/// this interface exposes only a shared reference. Construction still performs
+/// every registration and kernel check. Each certificate separately rebuilds
+/// its goal and checks its own term, controls, serialization and lineage.
+/// Nothing is restored from disk; declaration-verification provenance remains
+/// in the live environment. A failed construction is retried on a later call.
+/// Call only from `run_on_large_stack`, including on the first use.
+pub(crate) fn checker_specification() -> Option<&'static clean_verify::spec::Specification> {
+    static SPEC: crate::checked_once::CheckedOnce<clean_verify::spec::Specification> =
+        crate::checked_once::CheckedOnce::new();
+    SPEC.get_or_try_init(|| clean_verify::spec::Specification::new().ok())
+}
+
 /// Run `f` on a dedicated large-stack thread. `None` if the thread cannot be
 /// spawned or panics (fail-closed).
 ///
 /// `pub(crate)` so the sibling checker-core lemma lanes
 /// ([`crate::checker_core_lemma`]) run their heavy spec-build + kernel-recheck
 /// bodies on the same 512 MB stack.
+///
+/// The thread hop goes through [`crate::on_stack_carrying_stop`], so a stop
+/// recorded on the kernel stack (none today: no checker-core lane asks ay)
+/// reaches the enclosing certification run instead of exiting with the thread.
 pub(crate) fn run_on_large_stack<F, T>(f: F) -> Option<T>
 where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
+    F: FnOnce() -> T + Send,
+    T: Send,
 {
-    std::thread::Builder::new().stack_size(CHECKER_CORE_STACK_BYTES).spawn(f).ok()?.join().ok()
+    crate::on_stack_carrying_stop("trust-certify-kernel", CHECKER_CORE_STACK_BYTES, || Some(f()))
 }
 
 /// Full kernel re-check (`infer_only = false`) that `term : goal` in the empty
@@ -143,7 +162,7 @@ where
 /// `pub(crate)` so the sibling checker-core lemma lanes reuse the exact same
 /// kernel-recheck entry point (same TCB).
 pub(crate) fn kernel_checks_goal(env: &Environment, term: &Expr, goal: &Expr) -> bool {
-    TypeChecker::with_mode(env, env.mode()).check_type(term, goal).is_ok()
+    crate::kernel_stop::check_type(TypeChecker::with_mode(env, env.mode()), term, goal).is_ok()
 }
 
 /// Elaborate `src` in `env` with full metavariable + universe-level instantiation
@@ -217,7 +236,7 @@ fn lemma_authority_is_clean(spec: &clean_verify::spec::Specification) -> bool {
 
 /// The heavy body of the mint, run on the large-stack thread.
 fn certify_inner() -> Option<trust_ir::ProofEvidence> {
-    let spec = clean_verify::spec::Specification::new().ok()?;
+    let spec = checker_specification()?;
     let def = spec.get_definition(LEMMA_NAME)?;
 
     // Pin the exact checker-core Prop: fail closed if the spec has drifted, so
@@ -226,7 +245,7 @@ fn certify_inner() -> Option<trust_ir::ProofEvidence> {
         return None;
     }
     // Honesty residual (model level): a constructive, zero-domain-axiom proof.
-    if !lemma_authority_is_clean(&spec) {
+    if !lemma_authority_is_clean(spec) {
         return None;
     }
 
@@ -278,7 +297,7 @@ pub fn certify_lift_instantiate_swap() -> Option<trust_ir::ProofEvidence> {
 
 /// The heavy body of the consumer-side re-check, run on the large-stack thread.
 fn recheck_inner(term_bytes: &[u8], context_bytes: &[u8], lineage: &trust_ir::ProofDigest) -> bool {
-    let Some(spec) = clean_verify::spec::Specification::new().ok() else {
+    let Some(spec) = checker_specification() else {
         return false;
     };
     let Some(def) = spec.get_definition(LEMMA_NAME) else {
@@ -288,7 +307,7 @@ fn recheck_inner(term_bytes: &[u8], context_bytes: &[u8], lineage: &trust_ir::Pr
     if def.type_src != LIFT_INSTANTIATE_SWAP_TYPE_SRC {
         return false;
     }
-    if !lemma_authority_is_clean(&spec) {
+    if !lemma_authority_is_clean(spec) {
         return false;
     }
     let (Some(goal), Some(canonical_proof)) =

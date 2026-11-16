@@ -29,27 +29,53 @@
 //   NOT  — FULLY SYMBOLIC (no guard): ay (QF_BV) proves `machine_out == ~a` for
 //          ALL 2^32 values of the symbolic `a` (UNSAT of the negation). No
 //          precondition — complement is total. + value-diffs (!0=-1, !5=-6).
-//   NEG  — GUARDED: the trap arm (a == i32::MIN) diverges into the abort `Trap`,
-//          so the executor records the no-trap precondition `a != i32::MIN` and
-//          returns the live arm's value. ay proves `precondition =>
-//          (machine_out == -a)` for ALL 2^32 values of `a` (UNSAT). + value-diffs
-//          (neg(5)=-5, neg(-5)=5). + the guard survives (Brif+Trap in LIR, a
-//          conditional branch in __text).
+//   NEG  — GUARDED: the source-level no-trap domain `a != i32::MIN` is supplied
+//          INDEPENDENTLY of emitted control flow. The LIR `Trap` on the guard's
+//          failing arm selects to AArch64 `BRK #1` (trust-cg b80b958f5, as LLVM
+//          does for llvm.trap), which the machine semantics refuse fail-closed.
+//          The executor omits a branch arm only when ay proves it UNSAT under
+//          that domain plus the byte-derived guards, so the BRK arm is skipped
+//          because it is impossible there, not because it is a trap. ay proves
+//          `precondition => (machine_out == -a)` for ALL 2^32 values of `a`
+//          (UNSAT). + value-diffs (neg(5)=-5, neg(-5)=5). + the guard survives
+//          (Brif+Trap in LIR, a conditional branch in __text), and a == i32::MIN
+//          still reaches the exact BRK refusal.
 //        BARE (unguarded, WRAPPING): no precondition; ay proves the emitted
 //          bytes compute the wrapping negation for ALL a, INCLUDING i32::MIN
 //          (neg(i32::MIN) == i32::MIN — the two's-complement wrap).
 //   Each op carries a MANDATORY NEGATIVE CONTROL: the SAME bytes proven against
-//   `op(a) + 1` (under the same precondition) MUST be SAT, else the certificate
-//   is vacuous.
+//   `op(a) + 1` (under the same precondition) MUST be SAT, else the check is
+//   vacuous. Reachable BRK and any call stay refusals: pruning can never hide a
+//   feasible trap. These are bounded development solver checks, not kernel
+//   certificates.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#![cfg(feature = "ay-proofs")]
+// Trust (2026-09-30, plan §5 fail-open item 1): every shipping `module_to_lir`
+// entry point now refuses an `Assert`-bearing body as
+// `ModuleLirError::ImplicitPanicUnfaithful` — the `Brif`/`Trap` lowering this
+// file proves is a bare `brk`, not Rust's panic. The proofs stay under test
+// for plan §5 item P through the trap oracle, which exists only under the
+// non-default `test-hooks` feature (never enabled by the compiler); this file
+// moved from the `ay-proofs` lane to `test-hooks` with it (`test-hooks`
+// implies `ay-proofs`).
+#![cfg(feature = "test-hooks")]
 
-use ay::{BigInt, Logic, Solver, Term};
+use std::time::Duration;
+
+use ay::{BigInt, Logic, Solver, SolverConfig, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
-use trust_cg_bridge::lower_trust_ir_function_to_lir;
+use trust_cg_bridge::module_to_lir::lower_trust_ir_function_to_lir_trap_assert_oracle;
+
+/// The trap oracle under the name this file always used (see the note at the
+/// top): `Assert` lowers to `Brif`/`Trap` here and is refused everywhere else.
+fn lower_trust_ir_function_to_lir(
+    module: &trust_ir::Module,
+    function: &trust_ir::Function,
+) -> Result<trust_cg_lower::function::Function, trust_cg_bridge::ModuleLirError> {
+    lower_trust_ir_function_to_lir_trap_assert_oracle(module, function, false)
+}
 use trust_disasm::{Opcode, decode_aarch64};
 use trust_ir::Module;
 use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
@@ -107,9 +133,10 @@ fn make_bridge_unop_module(kind: UnKind) -> Module {
         //
         // The `_2` guard-flag DEFINITION (`Eq(a, i32::MIN)`) makes the assert's
         // condition a defined SSA value; `expected: false` means "trap iff _2",
-        // so the no-trap precondition the byte executor records is `!(a == MIN)`
-        // == `a != i32::MIN` — exactly the precondition under which `-a` does not
-        // overflow.
+        // so the source no-trap domain is `!(a == MIN)` == `a != i32::MIN` —
+        // exactly the precondition under which `-a` does not overflow. The test
+        // supplies that domain independently (`source_no_trap_domain`); the byte
+        // executor never derives it from the emitted branch.
         UnKind::NegGuarded => {
             locals.push(LocalDecl { index: 2, ty: TtTy::Bool, name: Some("is_min".into()) });
             vec![
@@ -160,6 +187,7 @@ fn make_bridge_unop_module(kind: UnKind) -> Module {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     trust_ir_bridge::lower_to_trust_ir(&vf).expect("bridge lower_to_trust_ir failed for unop")
@@ -245,10 +273,13 @@ fn has_conditional_branch(code: &[u8], base: u64) -> bool {
 }
 
 // ===========================================================================
-// BOUNDED SYMBOLIC PATH-MERGING EXECUTOR (mirrors the shift/div-rem tests): the
-// trapping guard arm (a `Trap`/abort call) diverges that arm, accumulating the
-// no-trap precondition. For the unguarded shapes (Not, NegBare) there is no
-// branch, so the precondition is trivially `true` (fully symbolic).
+// BOUNDED SYMBOLIC RETURN-PATH EXECUTOR (ported from the inline-multiblock
+// replay, 7a1034b5c1). The source no-trap domain is supplied independently of
+// emitted control flow and threaded as the root path condition. An arm is
+// omitted only when ay establishes that its accumulated path condition is
+// UNSAT. Reachable BRK, calls, and unknown feasibility remain refusals; no trap
+// semantics is invented. The unguarded shapes (Not, NegBare) have no branch and
+// run under the total domain `true`, so any BRK in them would be refused.
 // ===========================================================================
 
 const MAX_STEPS: u32 = 4096;
@@ -258,7 +289,6 @@ const MAX_DEPTH: u32 = 16;
 enum ExecError {
     Loop { at: u64 },
     BudgetExceeded,
-    Trapped,
     Unsupported(String),
     Decode(String),
 }
@@ -268,12 +298,11 @@ struct Executor<'a> {
     code: &'a [u8],
     base: u64,
     steps: u32,
-    precondition: Vec<Formula>,
 }
 
 impl<'a> Executor<'a> {
     fn new(code: &'a [u8], base: u64) -> Self {
-        Executor { sem: Aarch64Semantics, code, base, steps: 0, precondition: Vec::new() }
+        Executor { sem: Aarch64Semantics, code, base, steps: 0 }
     }
 
     fn decode_at(&self, pc: u64) -> Result<trust_disasm::Instruction, ExecError> {
@@ -294,6 +323,7 @@ impl<'a> Executor<'a> {
         mut state: MachineState,
         mut visited: Vec<u64>,
         depth: u32,
+        path_condition: Formula,
     ) -> Result<Formula, ExecError> {
         if depth > MAX_DEPTH {
             return Err(ExecError::BudgetExceeded);
@@ -331,11 +361,11 @@ impl<'a> Executor<'a> {
                     }
                     Effect::Branch { target } => uncond_target = Some(target.clone()),
                     Effect::PcUpdate { .. } => {}
-                    // The Assert trap block begins with `call abort`: the abort
-                    // call IS the trap/panic path, so this arm diverges — the
-                    // no-trap precondition excludes it.
+                    // The Assert trap block is `BRK #1` since trust-cg b80b958f5,
+                    // no longer `call abort`, so a call is never a trap here: it
+                    // is an unmodeled control transfer and refuses the replay.
                     Effect::Call { .. } => {
-                        return Err(ExecError::Trapped);
+                        return Err(ExecError::Unsupported(format!("call at {pc:#x}")));
                     }
                     Effect::Aarch64SyncBoundary { .. } | Effect::Aarch64AtomicAccess { .. } => {
                         return Err(ExecError::Unsupported(format!("atomic/sync at {pc:#x}")));
@@ -362,10 +392,30 @@ impl<'a> Executor<'a> {
                     return Err(ExecError::Loop { at: pc });
                 }
 
-                let taken = self.run(target_pc, state.clone(), visited.clone(), depth + 1);
-                let fall = self.run(fall_pc, state.clone(), visited.clone(), depth + 1);
-
-                return self.merge(path_cond, taken, fall);
+                let taken_path = Formula::And(vec![path_condition.clone(), path_cond.clone()]);
+                let fall_path = Formula::And(vec![
+                    path_condition.clone(),
+                    Formula::Not(Box::new(path_cond.clone())),
+                ]);
+                // Do not even decode an infeasible destination. In particular,
+                // a BRK may only be avoided by proving its path impossible;
+                // a feasible BRK still reaches the unchanged Semantics refusal.
+                return match (path_is_feasible(&taken_path)?, path_is_feasible(&fall_path)?) {
+                    (true, true) => {
+                        let taken = self.run(
+                            target_pc,
+                            state.clone(),
+                            visited.clone(),
+                            depth + 1,
+                            taken_path,
+                        )?;
+                        let fall = self.run(fall_pc, state, visited, depth + 1, fall_path)?;
+                        Ok(Formula::Ite(Box::new(path_cond), Box::new(taken), Box::new(fall)))
+                    }
+                    (true, false) => self.run(target_pc, state, visited, depth + 1, taken_path),
+                    (false, true) => self.run(fall_pc, state, visited, depth + 1, fall_path),
+                    (false, false) => Err(ExecError::Unsupported("no feasible return path".into())),
+                };
             }
 
             if let Some(target) = uncond_target {
@@ -381,26 +431,25 @@ impl<'a> Executor<'a> {
             pc += 4;
         }
     }
+}
 
-    fn merge(
-        &mut self,
-        path_cond: Formula,
-        taken: Result<Formula, ExecError>,
-        fall: Result<Formula, ExecError>,
-    ) -> Result<Formula, ExecError> {
-        match (taken, fall) {
-            (Ok(t), Ok(f)) => Ok(Formula::Ite(Box::new(path_cond), Box::new(t), Box::new(f))),
-            (Err(ExecError::Trapped), Ok(f)) => {
-                self.precondition.push(Formula::Not(Box::new(path_cond)));
-                Ok(f)
-            }
-            (Ok(t), Err(ExecError::Trapped)) => {
-                self.precondition.push(path_cond);
-                Ok(t)
-            }
-            (Err(ExecError::Trapped), Err(ExecError::Trapped)) => Err(ExecError::Trapped),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
+/// Unknown (including the finite solver deadline) is never an infeasibility
+/// certificate. This is a test oracle, not a kernel-certified proof artifact.
+fn path_is_feasible(path: &Formula) -> Result<bool, ExecError> {
+    let config = SolverConfig::default().with_timeout(Duration::from_secs(30));
+    let mut solver = Solver::try_new_with_config(Logic::QfAbv, config)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility solver: {e:?}")))?;
+    let condition = formula_to_term(&mut solver, path);
+    solver
+        .try_assert_term(condition)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility assertion: {e:?}")))?;
+    let result = solver.check_sat();
+    if result.is_unsat() {
+        Ok(false)
+    } else if result.is_sat() {
+        Ok(true)
+    } else {
+        Err(ExecError::Unsupported(format!("unknown branch feasibility: {result:?}")))
     }
 }
 
@@ -411,28 +460,46 @@ fn const_addr(f: &Formula) -> Option<u64> {
     }
 }
 
-/// Path-merge with X0 (== `a`, the unary operand) FULLY SYMBOLIC. For the
-/// unguarded shapes the precondition is `true`; for the guarded Neg the trap arm
-/// diverges and the executor records `a != i32::MIN`.
-fn symbolic_machine_output(code: &[u8], base: u64) -> Result<(Formula, Formula), ExecError> {
-    let state = MachineState::symbolic();
-    run_machine_output(code, base, state)
+/// The SOURCE-level no-trap domain of `kind` over its operand `a` (== W0),
+/// written from the trust-ir semantics, never read off the emitted bytes:
+///   * Not / NegBare: `true` — complement and wrapping negation are total;
+///   * NegGuarded   : `a != i32::MIN` — the only input whose checked `-a`
+///                    overflows (the `Assert { OverflowNeg }` fires iff a == MIN).
+fn source_no_trap_domain(kind: UnKind, a: Formula) -> Formula {
+    match kind {
+        UnKind::Not | UnKind::NegBare => Formula::Bool(true),
+        UnKind::NegGuarded => {
+            Formula::Not(Box::new(Formula::Eq(Box::new(a), Box::new(bv32(i128::from(i32::MIN))))))
+        }
+    }
 }
 
+/// Path-merge with X0 (== `a`, the unary operand) FULLY SYMBOLIC. Bind the
+/// source no-trap domain to the ORIGINAL operand register before any emitted
+/// instruction executes; decoded branches cannot redefine this domain.
+fn symbolic_machine_output(
+    code: &[u8],
+    base: u64,
+    kind: UnKind,
+) -> Result<(Formula, Formula), ExecError> {
+    let state = MachineState::symbolic();
+    let pre = source_no_trap_domain(kind, state.read_gpr(0, 32));
+    run_machine_output(code, base, state, pre)
+}
+
+/// Replay from `state` under the input domain `pre` (the root path condition).
+/// An empty domain would make every arm "infeasible" and the proof vacuous, so
+/// it refuses instead.
 fn run_machine_output(
     code: &[u8],
     base: u64,
     state: MachineState,
+    pre: Formula,
 ) -> Result<(Formula, Formula), ExecError> {
-    let mut exec = Executor::new(code, base);
-    let out = exec.run(base, state, Vec::new(), 0)?;
-    let pre = if exec.precondition.is_empty() {
-        Formula::Bool(true)
-    } else if exec.precondition.len() == 1 {
-        exec.precondition.pop().unwrap()
-    } else {
-        Formula::And(exec.precondition.clone())
-    };
+    if !path_is_feasible(&pre)? {
+        return Err(ExecError::Unsupported("empty input domain".into()));
+    }
+    let out = Executor::new(code, base).run(base, state, Vec::new(), 0, pre.clone())?;
     Ok((out, pre))
 }
 
@@ -586,20 +653,16 @@ fn unop_plus_one_spec(kind: UnKind) -> Formula {
 // Concrete byte-execution oracle.
 // ---------------------------------------------------------------------------
 
-enum ConcreteOutcome {
-    Trapped,
-    Value(Formula),
-}
-
-fn concrete_run(code: &[u8], base: u64, a: i32) -> ConcreteOutcome {
+/// Run the emitted bytes with X0 bound to the constant `a`. The concrete input
+/// IS the precondition: the root path condition is `W0 == a`, so ay prunes
+/// exactly the branch arms this input cannot take. It is NOT restricted to the
+/// source no-trap domain: an input that actually reaches the guard's trap (e.g.
+/// guarded neg(i32::MIN)) must reach the unchanged BRK refusal, never a value.
+fn concrete_run(code: &[u8], base: u64, a: i32) -> Result<Formula, ExecError> {
     let mut state = MachineState::symbolic();
     state.gpr[0] = Formula::BitVec { value: i128::from(a) & 0xffff_ffff, width: 64 };
-    let mut exec = Executor::new(code, base);
-    match exec.run(base, state, Vec::new(), 0) {
-        Ok(out) => ConcreteOutcome::Value(out),
-        Err(ExecError::Trapped) => ConcreteOutcome::Trapped,
-        Err(e) => panic!("concrete run failed: {e:?}"),
-    }
+    let input = Formula::Eq(Box::new(state.read_gpr(0, 32)), Box::new(bv32(i128::from(a))));
+    Executor::new(code, base).run(base, state, Vec::new(), 0, input)
 }
 
 fn concrete_equals(out: &Formula, expected: i32) -> bool {
@@ -616,10 +679,9 @@ fn concrete_equals(out: &Formula, expected: i32) -> bool {
 }
 
 fn bytes_value_equals(code: &[u8], base: u64, a: i32, expected: i32) -> bool {
-    match concrete_run(code, base, a) {
-        ConcreteOutcome::Value(out) => concrete_equals(&out, expected),
-        ConcreteOutcome::Trapped => false,
-    }
+    let out = concrete_run(code, base, a)
+        .unwrap_or_else(|e| panic!("concrete no-trap execution of a={a} must return: {e:?}"));
+    concrete_equals(&out, expected)
 }
 
 // ===========================================================================
@@ -724,11 +786,12 @@ fn unop_emits_object_and_guard_branch_only_when_guarded() {
 // TEST 2 — concrete value-differential: the EMITTED BYTES compute the right
 // unary value. !0=-1, !5=-6, neg(5)=-5, neg(-5)=5, and the WRAP neg(i32::MIN)=
 // i32::MIN for the BARE (unguarded) neg. The GUARDED neg's TRAP-on-i32::MIN is
-// covered by TEST 1 (the guard's conditional branch survives in __text) and
-// TEST 3 (the proof carries the non-trivial `a != i32::MIN` no-trap precondition,
-// i.e. the executor DID diverge the i32::MIN arm into the abort). The symbolic
-// path-merge `concrete_run` merges the guard's two arms rather than reporting a
-// single-input trap, so it is not the right oracle for "this input traps".
+// covered by TEST 1 (the guard's conditional branch survives in __text), TEST 3
+// (the complement of the no-trap domain reaches BRK) and TEST 5 (concrete
+// neg(i32::MIN) reaches the exact BRK refusal). `concrete_run` now prunes the
+// arm its concrete input cannot take (it formerly merged both arms and read a
+// `call abort` as a trap), so a returned value here also proves these inputs do
+// NOT reach the guard's BRK.
 // ===========================================================================
 
 #[test]
@@ -753,6 +816,16 @@ fn unop_emitted_bytes_values_are_correct() {
     assert!(bytes_value_equals(&code, base, 5, -5), "guarded neg(5) == -5");
     assert!(bytes_value_equals(&code, base, -5, 5), "guarded neg(-5) == 5");
     assert!(bytes_value_equals(&code, base, 100, -100), "guarded neg(100) == -100");
+    // The tightest no-trap inputs on either side of the trap: pruning must not
+    // over-refuse the domain boundary.
+    assert!(
+        bytes_value_equals(&code, base, i32::MIN + 1, i32::MAX),
+        "guarded neg(i32::MIN + 1) == i32::MAX"
+    );
+    assert!(
+        bytes_value_equals(&code, base, i32::MAX, i32::MIN + 1),
+        "guarded neg(i32::MAX) == i32::MIN + 1"
+    );
 }
 
 // ===========================================================================
@@ -760,7 +833,7 @@ fn unop_emitted_bytes_values_are_correct() {
 // path the emitted bytes compute the unary op for ALL 2^32 values of `a`.
 // UNSAT of the negation.
 //   * Not / NegBare : precondition is `true` (fully symbolic, total).
-//   * NegGuarded    : precondition is `a != i32::MIN` (the trap arm excluded).
+//   * NegGuarded    : precondition is `a != i32::MIN` (the trap arm is UNSAT).
 // ===========================================================================
 
 fn run_proven_output(kind: UnKind) {
@@ -768,22 +841,34 @@ fn run_proven_output(kind: UnKind) {
     let (code, base) = emit_text(&module);
     assert!(!code.is_empty(), "emitted __text is empty");
 
-    let (machine_out, precondition) = symbolic_machine_output(&code, base)
+    let (machine_out, precondition) = symbolic_machine_output(&code, base, kind)
         .unwrap_or_else(|e| panic!("path-merge failed for {kind:?}: {e:?}"));
 
     // The unguarded shapes must be TOTAL (precondition `true` — the whole point is
     // that Not/wrapping-Neg never trap); the guarded Neg must carry the non-trivial
-    // `a != i32::MIN` precondition (guard explored, trap arm excluded).
+    // `a != i32::MIN` precondition. The domain is now supplied, not recorded from
+    // a `call abort` arm, so these checks alone no longer show which arms the
+    // bytes reach. That is carried by the replay itself: under `true` a reachable
+    // BRK would have refused above (so Not/NegBare really are total), and for the
+    // guarded Neg the complement domain is checked to reach BRK just below.
     match kind {
         UnKind::Not | UnKind::NegBare => assert!(
             matches!(precondition, Formula::Bool(true)),
             "expected a TOTAL (no-precondition) proof for {kind:?}; got {precondition:?}"
         ),
-        UnKind::NegGuarded => assert!(
-            !matches!(precondition, Formula::Bool(true)),
-            "expected a non-trivial no-trap precondition for guarded neg; got `true` \
-             (guard not explored — neg could wrap where source traps)"
-        ),
+        UnKind::NegGuarded => {
+            assert!(
+                !matches!(precondition, Formula::Bool(true)),
+                "expected a non-trivial no-trap precondition for guarded neg; got `true` \
+                 (guard not explored — neg could wrap where source traps)"
+            );
+            // Guard explored: OUTSIDE the domain (a == i32::MIN) the same bytes
+            // must reach the exact BRK refusal. A dropped guard would instead
+            // return the wrapped i32::MIN here.
+            let state = MachineState::symbolic();
+            let outside = Formula::Not(Box::new(precondition.clone()));
+            assert_brk_refused(run_machine_output(&code, base, state, outside).map(|(o, _)| o));
+        }
     }
 
     let spec = unop_spec(kind);
@@ -821,7 +906,7 @@ fn run_negative_control(kind: UnKind) {
     let (code, base) = emit_text(&module);
     assert!(!code.is_empty(), "emitted __text is empty");
 
-    let (machine_out, precondition) = symbolic_machine_output(&code, base)
+    let (machine_out, precondition) = symbolic_machine_output(&code, base, kind)
         .unwrap_or_else(|e| panic!("path-merge failed for {kind:?}: {e:?}"));
     let wrong = unop_plus_one_spec(kind);
     let proven = discharge_equal_under(&precondition, &machine_out, &wrong);
@@ -845,4 +930,120 @@ fn negative_control_bare_neg_vs_plus_one_is_sat() {
 #[test]
 fn negative_control_guarded_neg_vs_plus_one_is_sat() {
     run_negative_control(UnKind::NegGuarded);
+}
+
+// ===========================================================================
+// TEST 5 — REFUSAL CONTROLS: pruning may skip a BRK only by proving its path
+// impossible. A FEASIBLE trap (guarded neg at i32::MIN, or a BRK at entry) must
+// still reach the exact, unchanged machine-semantics refusal, and a call is not
+// a trap.
+// ===========================================================================
+
+fn assert_brk_refused(result: Result<Formula, ExecError>) {
+    assert!(
+        matches!(result, Err(ExecError::Decode(ref message))
+        if message.contains("effects Brk")
+        && message.contains("aarch64-brk-debug-trap-not-proof-consumed")),
+        "reachable BRK must remain the exact semantics refusal: {result:?}"
+    );
+}
+
+#[test]
+fn feasible_neg_trap_and_entry_brk_remain_refused() {
+    let (code, base) = emit_text(&make_bridge_unop_module(UnKind::NegGuarded));
+    assert_brk_refused(concrete_run(&code, base, i32::MIN));
+    // With no source domain at all, the trap arm is feasible and is NOT pruned.
+    let state = MachineState::symbolic();
+    assert_brk_refused(run_machine_output(&code, base, state, Formula::Bool(true)).map(|(o, _)| o));
+    assert_brk_refused(concrete_run(&0xd4200020u32.to_le_bytes(), 0, 5));
+}
+
+#[test]
+fn arbitrary_call_is_not_treated_as_a_trap() {
+    let result = concrete_run(&0x94000000u32.to_le_bytes(), 0, 5);
+    assert!(
+        matches!(result, Err(ExecError::Unsupported(ref message))
+        if message.starts_with("call at ")),
+        "a call is not a proved diverging branch: {result:?}"
+    );
+}
+
+#[test]
+fn independent_no_trap_domain_has_exact_boundaries() {
+    for (a, guarded_fits) in [
+        (i32::MIN, false),
+        (i32::MIN + 1, true),
+        (-1, true),
+        (0, true),
+        (1, true),
+        (i32::MAX, true),
+    ] {
+        let operand = || bv32(i128::from(a));
+        let guarded = source_no_trap_domain(UnKind::NegGuarded, operand());
+        assert_eq!(path_is_feasible(&guarded).unwrap(), guarded_fits, "guarded domain for -({a})");
+        for total in [UnKind::Not, UnKind::NegBare] {
+            let domain = source_no_trap_domain(total, operand());
+            assert!(path_is_feasible(&domain).unwrap(), "{total:?} must admit {a}");
+        }
+    }
+}
+
+/// Decode all emitted words. Unknown words or a truncated instruction refuse
+/// the structural check rather than being omitted from the call/trap counts.
+fn count_opcode(code: &[u8], base: u64, wanted: &[Opcode]) -> usize {
+    assert_eq!(code.len() % 4, 0, "AArch64 text must contain complete instructions");
+    code.chunks_exact(4)
+        .enumerate()
+        .filter(|(index, bytes)| {
+            let bytes: [u8; 4] = (*bytes).try_into().unwrap();
+            let insn = decode_aarch64(&bytes, base + (*index * 4) as u64)
+                .expect("every emitted word must decode for structural accounting");
+            wanted.contains(&insn.opcode)
+        })
+        .count()
+}
+
+// The guard's LIR `Trap` is emitted as BRK (not `call abort`), and no shape
+// emits a call: the replay's refusal of calls cannot be what makes it pass.
+#[test]
+fn guard_trap_is_brk_and_no_shape_emits_a_call() {
+    for kind in [UnKind::Not, UnKind::NegBare, UnKind::NegGuarded] {
+        let (code, base) = emit_text(&make_bridge_unop_module(kind));
+        assert_eq!(
+            count_opcode(&code, base, &[Opcode::Bl, Opcode::Blr]),
+            0,
+            "{kind:?} must have no emitted call edge"
+        );
+        let want_brk = usize::from(kind == UnKind::NegGuarded);
+        assert_eq!(
+            count_opcode(&code, base, &[Opcode::Brk]),
+            want_brk,
+            "{kind:?} BRK count (only the guarded neg carries the trap)"
+        );
+    }
+}
+
+// Inverting the actual guard branch sends every in-domain input into the BRK.
+// The executor must then refuse, NOT silently prove the output over a smaller
+// domain: the domain is independent of the emitted branch.
+#[test]
+fn corrupted_neg_guard_cannot_shrink_the_input_domain() {
+    let (mut code, base) = emit_text(&make_bridge_unop_module(UnKind::NegGuarded));
+    let branches: Vec<_> = code
+        .chunks_exact(4)
+        .enumerate()
+        .filter_map(|(index, bytes)| {
+            let bytes: [u8; 4] = bytes.try_into().unwrap();
+            (decode_aarch64(&bytes, base + (index * 4) as u64).unwrap().opcode == Opcode::BCond)
+                .then_some(index * 4)
+        })
+        .collect();
+    assert_eq!(branches.len(), 1, "fixture must have one actual i32::MIN guard branch");
+    let offset = branches[0];
+    let word = u32::from_le_bytes(code[offset..offset + 4].try_into().unwrap()) ^ 1;
+    code[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    assert_brk_refused(concrete_run(&code, base, 5));
+    assert_brk_refused(
+        symbolic_machine_output(&code, base, UnKind::NegGuarded).map(|(out, _)| out),
+    );
 }

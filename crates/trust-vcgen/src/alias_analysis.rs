@@ -196,8 +196,17 @@ impl AliasAnalyzer {
             }
             // `_x = Copy(_y)` or `_x = Move(_y)` -- copy points-to set
             Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => {
-                if let Some(src_pts) = pts.get(&src.local).cloned() {
-                    pts.entry(dst.local).or_default().extend(src_pts);
+                if dst.local != src.local
+                    && let Some(src_pts) = pts.get(&src.local).cloned()
+                {
+                    match pts.entry(dst.local) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(src_pts);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            e.get_mut().extend(src_pts);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -207,17 +216,26 @@ impl AliasAnalyzer {
     /// Query the alias relationship between two places.
     #[must_use]
     pub fn query_alias(&self, a: &Place, b: &Place) -> AliasResult {
-        let loc_a = MemoryLocation::from_place(a);
-        let loc_b = MemoryLocation::from_place(b);
-
-        // Same place is always MustAlias.
-        if loc_a == loc_b {
+        if a == b {
             return AliasResult::MustAlias;
         }
 
-        // Different locals with no pointer indirection cannot alias.
-        if loc_a.local != loc_b.local && !self.has_pointer_overlap(a, b) {
-            return AliasResult::NoAlias;
+        // Different locals only depend on pointer overlap; avoid allocating
+        // projection vectors when `a.local != b.local`.
+        if a.local != b.local {
+            return if self.has_pointer_overlap(a, b) {
+                AliasResult::MayAlias
+            } else {
+                AliasResult::NoAlias
+            };
+        }
+
+        let loc_a = MemoryLocation::from_place(a);
+        let loc_b = MemoryLocation::from_place(b);
+
+        // Same canonical location is always MustAlias (e.g. two index projections).
+        if loc_a == loc_b {
+            return AliasResult::MustAlias;
         }
 
         // Check if one is a prefix of the other (overlapping fields).
@@ -226,7 +244,7 @@ impl AliasAnalyzer {
         }
 
         // Same local, disjoint projections -> NoAlias.
-        if loc_a.local == loc_b.local && Self::disjoint_projections(&loc_a, &loc_b) {
+        if Self::disjoint_projections(&loc_a, &loc_b) {
             return AliasResult::NoAlias;
         }
 
@@ -268,8 +286,13 @@ impl AliasAnalyzer {
     /// Compute alias sets: partition all referenced locations into alias classes.
     #[must_use]
     pub fn compute_alias_sets(&self) -> Vec<AliasSet> {
-        let mut sets: Vec<AliasSet> = Vec::new();
-        let mut loc_to_set: FxHashMap<MemoryLocation, usize> = FxHashMap::default();
+        if self.points_to.is_empty() {
+            return (0..self.num_locals)
+                .map(|local| AliasSet::singleton(local, MemoryLocation::from_local(local)))
+                .collect();
+        }
+
+        let mut sets: Vec<AliasSet> = Vec::with_capacity(self.num_locals);
 
         // Collect all referenced locations.
         let mut all_locs: BTreeSet<MemoryLocation> = BTreeSet::new();
@@ -281,12 +304,12 @@ impl AliasAnalyzer {
         }
 
         // Assign each location to a set. Merge sets when aliasing detected.
-        for loc in &all_locs {
+        for loc in all_locs {
             let mut merged_into: Option<usize> = None;
 
             for (set_idx, set) in sets.iter().enumerate() {
                 for existing in &set.locations {
-                    if self.locations_may_alias(loc, existing) {
+                    if self.locations_may_alias(&loc, existing) {
                         merged_into = Some(set_idx);
                         break;
                     }
@@ -298,13 +321,11 @@ impl AliasAnalyzer {
 
             match merged_into {
                 Some(idx) => {
-                    sets[idx].locations.insert(loc.clone());
-                    loc_to_set.insert(loc.clone(), idx);
+                    sets[idx].locations.insert(loc);
                 }
                 None => {
                     let id = sets.len();
-                    sets.push(AliasSet::singleton(id, loc.clone()));
-                    loc_to_set.insert(loc.clone(), id);
+                    sets.push(AliasSet::singleton(id, loc));
                 }
             }
         }
@@ -350,6 +371,10 @@ pub fn refine_vc_with_alias(
     func: &VerifiableFunction,
     vcs: Vec<VerificationCondition>,
 ) -> Vec<VerificationCondition> {
+    if vcs.is_empty() {
+        return vcs;
+    }
+
     let analyzer = AliasAnalyzer::analyze(func);
     let alias_sets = analyzer.compute_alias_sets();
 
@@ -359,7 +384,7 @@ pub fn refine_vc_with_alias(
     }
 
     // Build non-aliasing constraints between distinct alias sets.
-    let no_alias_constraints = build_no_alias_constraints(&alias_sets);
+    let mut no_alias_constraints = build_no_alias_constraints(&alias_sets);
 
     if no_alias_constraints.is_empty() {
         return vcs;
@@ -367,45 +392,47 @@ pub fn refine_vc_with_alias(
 
     // Conjoin the no-alias constraints as assumptions to each VC.
     let assumption = if no_alias_constraints.len() == 1 {
-        // SAFETY: len == 1 guarantees .next() returns Some.
-        no_alias_constraints
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| unreachable!("empty iter despite len == 1"))
+        no_alias_constraints.pop().unwrap_or(Formula::Bool(true))
     } else {
         Formula::And(no_alias_constraints)
     };
 
-    vcs.into_iter()
-        .map(|mut vc| {
-            vc.formula = Formula::Implies(Box::new(assumption.clone()), Box::new(vc.formula));
-            vc
-        })
-        .collect()
+    let mut vcs = vcs;
+    let last_idx = vcs.len() - 1;
+    for vc in &mut vcs[..last_idx] {
+        let old_formula = std::mem::replace(&mut vc.formula, Formula::Bool(false));
+        vc.formula = Formula::Implies(Box::new(assumption.clone()), Box::new(old_formula));
+    }
+    let last_vc = &mut vcs[last_idx];
+    let old_formula = std::mem::replace(&mut last_vc.formula, Formula::Bool(false));
+    last_vc.formula = Formula::Implies(Box::new(assumption), Box::new(old_formula));
+    vcs
 }
 
 /// Build formulas asserting that locations in different alias sets are distinct.
 fn build_no_alias_constraints(sets: &[AliasSet]) -> Vec<Formula> {
-    let mut constraints = Vec::new();
+    let rep_vars: Vec<Formula> = sets
+        .iter()
+        .filter_map(|s| s.locations.iter().next())
+        .map(|rep| {
+            Formula::Var(
+                crate::generated_formula_symbol("alias", &format!("loc_{}", loc_name(rep))),
+                Sort::Int,
+            )
+        })
+        .collect();
+    if rep_vars.len() < 2 {
+        return Vec::new();
+    }
+    let mut constraints = Vec::with_capacity(rep_vars.len() * (rep_vars.len() - 1) / 2);
 
-    for i in 0..sets.len() {
-        for j in (i + 1)..sets.len() {
-            // Pick a representative from each set.
-            if let (Some(rep_a), Some(rep_b)) =
-                (sets[i].locations.iter().next(), sets[j].locations.iter().next())
-            {
-                let var_a = Formula::Var(
-                    crate::generated_formula_symbol("alias", &format!("loc_{}", loc_name(rep_a))),
-                    Sort::Int,
-                );
-                let var_b = Formula::Var(
-                    crate::generated_formula_symbol("alias", &format!("loc_{}", loc_name(rep_b))),
-                    Sort::Int,
-                );
-                // Assert the two representatives are not equal.
-                constraints
-                    .push(Formula::Not(Box::new(Formula::Eq(Box::new(var_a), Box::new(var_b)))));
-            }
+    for (i, var_a) in rep_vars.iter().enumerate() {
+        for var_b in &rep_vars[(i + 1)..] {
+            // Assert the two representatives are not equal.
+            constraints.push(Formula::Not(Box::new(Formula::Eq(
+                Box::new(var_a.clone()),
+                Box::new(var_b.clone()),
+            ))));
         }
     }
 
@@ -454,6 +481,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

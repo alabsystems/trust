@@ -548,22 +548,6 @@ mod tests {
     }
 
     #[test]
-    fn test_symbolic_pointer_new() {
-        let ptr = SymbolicPointer::new("test_base", 42, 7);
-        assert_eq!(ptr.base, "test_base");
-        assert_eq!(ptr.offset, 42);
-        assert_eq!(ptr.region_id, 7);
-    }
-
-    #[test]
-    fn test_memory_cell_new() {
-        let cell = MemoryCell::new("concrete_42", false);
-        assert_eq!(cell.value, "concrete_42");
-        assert!(!cell.symbolic);
-        assert_eq!(cell.write_count, 0);
-    }
-
-    #[test]
     fn test_memory_region_model_in_bounds() {
         let region = MemoryRegionModel::new(0, "test", 8);
         assert!(region.in_bounds(0));

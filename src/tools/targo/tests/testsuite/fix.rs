@@ -1,14 +1,16 @@
 //! Tests for the `cargo fix` command.
+// Trust: transparent proxy fixture adapters for SP-1; exact changed coverage
+// is ledgered in tests/upstream-rust/divergence-audit.toml.
 
 use crate::prelude::*;
 use crate::utils::tools;
-use cargo::core::Edition;
 use cargo_test_support::compare::assert_e2e;
 use cargo_test_support::git::{self, init};
 use cargo_test_support::paths;
 use cargo_test_support::registry::{Dependency, Package};
 use cargo_test_support::str;
 use cargo_test_support::{basic_manifest, is_nightly, project};
+use targo::workspace::Edition;
 
 #[cargo_test]
 fn do_not_fix_broken_builds() {
@@ -1319,6 +1321,9 @@ fn only_warn_for_relevant_crates() {
 
                 [dependencies]
                 a = { path = 'a' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1329,6 +1334,9 @@ fn only_warn_for_relevant_crates() {
                 name = "a"
                 version = "0.1.0"
                 edition = "2015"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -1346,7 +1354,7 @@ fn only_warn_for_relevant_crates() {
     p.cargo("fix --allow-no-vcs --edition")
         .with_stderr_data(str![[r#"
 [MIGRATING] Cargo.toml from 2015 edition to 2018
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] a v0.1.0 ([ROOT]/foo/a)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [MIGRATING] src/lib.rs from 2015 edition to 2018
@@ -1371,7 +1379,7 @@ fn fix_to_broken_code() {
         )
         .file(
             "foo/src/main.rs",
-            r#"
+            &tools::with_transparent_proxy(r#"
                 use std::env;
                 use std::fs;
                 use std::io::Write;
@@ -1399,13 +1407,12 @@ fn fix_to_broken_code() {
                         }
                     }
 
-                    let status = Command::new("rustc")
-                        .args(env::args().skip(1))
-                        .status()
+                    let status = transparent_proxy::status(Command::new("rustc")
+                        .args(env::args().skip(1)))
                         .expect("failed to run rustc");
                     process::exit(status.code().unwrap_or(2));
                 }
-            "#,
+            "#),
         )
         .file(
             "bar/Cargo.toml",
@@ -1435,7 +1442,7 @@ fn fix_to_broken_code() {
   = cause: thread 'main' ([..]) panicked at src/main.rs:23:29:
            explicit panic
            [NOTE] run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-[HELP] to report this as a bug, open an issue at https://github.com/andrewyates/Trust/issues, quoting the full output of this command
+[HELP] to report this as a bug, open an issue at https://github.com/alabsystems/Trust/issues, quoting the full output of this command
 [HELP] to possibly apply more fixes, pass in the `--broken-code` flag
 [NOTE] original diagnostics will follow:
 ...
@@ -1562,6 +1569,9 @@ fn edition_v2_resolver_report() {
 
                 [dev-dependencies]
                 common = { version="1.0", features=["dev-feat"] }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1571,7 +1581,7 @@ fn edition_v2_resolver_report() {
         .with_stderr_data(str![[r#"
 [MIGRATING] Cargo.toml from 2018 edition to 2021
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] common v1.0.0 (registry `dummy-registry`)
 [DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
@@ -1780,14 +1790,14 @@ fn abnormal_exit() {
         )
         // "signal: 6, SIGABRT: process abort signal" on some platforms
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] pm v0.1.0 ([ROOT]/foo/pm)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [ERROR] errors present after applying fixes to crate `foo`
   |
   = cause: I'm not a diagnostic.
   = cause: rustc exited abnormally: [..]
-[HELP] to report this as a bug, open an issue at https://github.com/andrewyates/Trust/issues, quoting the full output of this command
+[HELP] to report this as a bug, open an issue at https://github.com/alabsystems/Trust/issues, quoting the full output of this command
 [HELP] to possibly apply more fixes, pass in the `--broken-code` flag
 [NOTE] original diagnostics will follow:
 ...
@@ -2586,7 +2596,8 @@ fn main() {
         )
         .build();
 
-    p.cargo("-Zscript fix --edition --allow-no-vcs --manifest-path foo.rs")
+    p.cargo("fix --edition --allow-no-vcs --manifest-path foo.rs")
+        .arg("-Zscript")
         .masquerade_as_nightly_cargo(&["script"])
         .with_stderr_data(str![[r#"
 [MIGRATING] foo.rs from 2021 edition to 2024
@@ -2668,6 +2679,12 @@ a = {path = "a", default_features = false}
 # After build_dependencies line
 a = {path = "a", default_features = false}
 # After build_dependencies table
+
+[lints.cargo]
+default = "allow"
+
+[workspace.lints.cargo]
+default = "allow"
 "#,
         )
         .file("src/lib.rs", "")
@@ -2684,6 +2701,9 @@ a = {path = "a", default_features = false}
                 name = "a"
                 version = "0.0.1"
                 edition = "2015"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a/src/lib.rs", "")
@@ -2751,6 +2771,12 @@ a = {path = "a", default-features = false}
 a = {path = "a", default-features = false}
 # After build_dependencies table
 
+[lints.cargo]
+default = "allow"
+
+[workspace.lints.cargo]
+default = "allow"
+
 "#]],
     );
 }
@@ -2769,6 +2795,9 @@ resolver = "2"
 # Before default_features
 a = {path = "a", default_features = false}  # After default_features value
 # After default_features line
+
+[workspace.lints.cargo]
+default = "allow"
 "#,
         )
         .file(
@@ -2777,6 +2806,9 @@ a = {path = "a", default_features = false}  # After default_features value
 [package]
 name = "foo"
 edition = "2021"
+
+[lints.cargo]
+default = "allow"
 "#,
         )
         .file("foo/src/lib.rs", "")
@@ -2787,6 +2819,9 @@ edition = "2021"
                 name = "a"
                 version = "0.0.1"
                 edition = "2015"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a/src/lib.rs", "")
@@ -2816,6 +2851,9 @@ resolver = "2"
 a = {path = "a", default-features = false}  # After default_features value
 # After default_features line
 
+[workspace.lints.cargo]
+default = "allow"
+
 "#]],
     );
     assert_e2e().eq(
@@ -2825,6 +2863,9 @@ a = {path = "a", default-features = false}  # After default_features value
 [package]
 name = "foo"
 edition = "2021"
+
+[lints.cargo]
+default = "allow"
 
 "#]],
     );
@@ -2856,6 +2897,9 @@ dep_df_false = { workspace = true }
 dep_simple = { workspace = true }
 dep_df_true = { workspace = true }
 dep_df_false = { workspace = true }
+
+[lints.cargo]
+default = "allow"
 "#;
     let pkg_df_true = r#"
 [package]
@@ -2877,6 +2921,9 @@ dep_df_false = { workspace = true, default-features = true }
 dep_simple = { workspace = true, default-features = true }
 dep_df_true = { workspace = true, default-features = true }
 dep_df_false = { workspace = true, default-features = true }
+
+[lints.cargo]
+default = "allow"
 "#;
     let pkg_df_false = r#"
 [package]
@@ -2898,6 +2945,9 @@ dep_df_false = { workspace = true, default-features = false }
 dep_simple = { workspace = true, default-features = false }
 dep_df_true = { workspace = true, default-features = false }
 dep_df_false = { workspace = true, default-features = false }
+
+[lints.cargo]
+default = "allow"
 "#;
     let p = project()
         .file(
@@ -2929,7 +2979,7 @@ dep_df_false = { version = "0.1.0", default-features = false }
 [MIGRATING] pkg_df_false/Cargo.toml from 2021 edition to 2024
 [FIXED] pkg_df_false/Cargo.toml (6 fixes)
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep_simple v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] dep_df_true v0.1.0 (registry `dummy-registry`)
@@ -2976,6 +3026,9 @@ dep_simple = { workspace = true}
 dep_df_true = { workspace = true}
 dep_df_false = { workspace = true, default-features = false }
 
+[lints.cargo]
+default = "allow"
+
 "#]],
     );
 }
@@ -3012,7 +3065,8 @@ fn fix_edition_skips_old_editions() {
         .build();
 
     // Doing the whole workspace should skip since there is a 2021 in the mix.
-    p.cargo("fix -Zfix-edition=start=2024 -v")
+    p.cargo("fix -v")
+        .arg("-Zfix-edition=start=2024")
         .masquerade_as_nightly_cargo(&["fix-edition"])
         .with_stderr_data(str![[r#"
 [SKIPPING] not all packages are at edition 2024
@@ -3021,7 +3075,8 @@ fn fix_edition_skips_old_editions() {
         .run();
 
     // Same with `end`.
-    p.cargo("fix -Zfix-edition=end=2024,future -v")
+    p.cargo("fix -v")
+        .arg("-Zfix-edition=end=2024,future")
         .masquerade_as_nightly_cargo(&["fix-edition"])
         .with_stderr_data(str![[r#"
 [SKIPPING] not all packages are at edition 2024
@@ -3030,7 +3085,8 @@ fn fix_edition_skips_old_editions() {
         .run();
 
     // Doing an individual package at the correct edition should check it.
-    p.cargo("fix -Zfix-edition=start=2024 -p e2024")
+    p.cargo("fix -p e2024")
+        .arg("-Zfix-edition=start=2024")
         .masquerade_as_nightly_cargo(&["fix-edition"])
         .with_stderr_data(str![[r#"
 [CHECKING] e2024 v0.0.0 ([ROOT]/foo/e2024)
@@ -3054,7 +3110,8 @@ fn fix_edition_future() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("fix -Zfix-edition=end=2024,future")
+    p.cargo("fix")
+        .arg("-Zfix-edition=end=2024,future")
         .masquerade_as_nightly_cargo(&["fix-edition"])
         .with_stderr_data(str![[r#"
 [MIGRATING] Cargo.toml from 2024 edition to future
@@ -3086,7 +3143,8 @@ fn script_without_frontmatter() {
         .file("echo.rs", "fn main() {}")
         .build();
 
-    p.cargo("fix -Zscript --allow-no-vcs --manifest-path echo.rs")
+    p.cargo("fix --allow-no-vcs --manifest-path echo.rs")
+        .arg("-Zscript")
         .masquerade_as_nightly_cargo(&["script"])
         .with_stdout_data(str![""])
         .with_stderr_data(str![[r#"
@@ -3125,7 +3183,8 @@ fn main() {}",
         )
         .build();
 
-    p.cargo("fix -Zscript --allow-no-vcs --manifest-path echo.rs")
+    p.cargo("fix --allow-no-vcs --manifest-path echo.rs")
+        .arg("-Zscript")
         .masquerade_as_nightly_cargo(&["script"])
         .with_stdout_data(str![""])
         .with_stderr_data(str![[r#"
@@ -3166,7 +3225,8 @@ fn main() {}"#,
         )
         .build();
 
-    p.cargo("fix -Zscript --allow-no-vcs --manifest-path echo.rs")
+    p.cargo("fix --allow-no-vcs --manifest-path echo.rs")
+        .arg("-Zscript")
         .masquerade_as_nightly_cargo(&["script"])
         .with_stdout_data(str![""])
         .with_stderr_data(str![[r#"
@@ -3206,7 +3266,8 @@ fn main() {}"#,
         )
         .build();
 
-    p.cargo("fix -Zscript --allow-no-vcs --manifest-path echo.rs")
+    p.cargo("fix --allow-no-vcs --manifest-path echo.rs")
+        .arg("-Zscript")
         .masquerade_as_nightly_cargo(&["script"])
         .with_stdout_data(str![""])
         .with_stderr_data(str![[r#"
@@ -3245,7 +3306,8 @@ fn main() {}"#,
         )
         .build();
 
-    p.cargo("fix -Zscript --allow-no-vcs --manifest-path echo.rs")
+    p.cargo("fix --allow-no-vcs --manifest-path echo.rs")
+        .arg("-Zscript")
         .masquerade_as_nightly_cargo(&["script"])
         .with_stdout_data(str![""])
         .with_stderr_data(str![[r#"

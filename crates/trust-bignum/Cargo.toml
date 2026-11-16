@@ -70,6 +70,8 @@ alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-all
 # `extern crate trust_bignum` off the rustc_private gate). All of it is
 # cfg_attr-gated so the plain-cargo fast lane of this crate stays green on a
 # stock toolchain.
+# PUBLIC BOUNDARY (kept 2026-09-28): that stock toolchain is the export's T4
+# nightly (publish/transforms.sh).
 rustc-dep-of-std = ["dep:core", "dep:alloc"]
 
 [dev-dependencies]

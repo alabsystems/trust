@@ -39,31 +39,44 @@ fn load_coverage_manifest() -> serde_json::Value {
         .unwrap_or_else(|e| panic!("failed to parse manifest {}: {e}", path.display()))
 }
 
-/// Load a VerifiableFunction from a JSON fixture file.
-///
-/// Returns None if the fixture does not exist (allows tests to skip gracefully
-/// when fixtures have not been generated yet).
-fn load_fixture(name: &str) -> Option<VerifiableFunction> {
+// NO-VACUOUS-CORPUS-TEST: the `fixtures/real_mir/` corpus is checked in, so a
+// missing, unreadable or unparseable fixture is a FAILURE naming the path —
+// never a `SKIPPING:` early return that runs zero assertions and reports `ok`.
+
+/// Load a REQUIRED VerifiableFunction from a checked-in JSON fixture file.
+/// Panics, naming the path, on a missing, unreadable or unparseable file.
+fn load_fixture(name: &str) -> VerifiableFunction {
+    let path = fixtures_dir().join(format!("{name}.json"));
+    let json = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
+    serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e}", path.display()))
+}
+
+/// Load a deliberately OPTIONAL future fixture named by an unsupported-source
+/// manifest entry. Absence is the manifest's explicit `unsupported_until_modeled`
+/// state; once generated, the caller verifies it fails closed. A present but
+/// unreadable or unparseable file still panics.
+fn try_load_unsupported_fixture(name: &str) -> Option<VerifiableFunction> {
     let path = fixtures_dir().join(format!("{name}.json"));
     if !path.exists() {
         return None;
     }
-    let json = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
-    let func: VerifiableFunction = serde_json::from_str(&json)
-        .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e}", path.display()));
-    Some(func)
+    Some(load_fixture(name))
 }
 
-/// Load all JSON fixtures from the fixtures directory.
+/// Load every checked-in `test_functions__*.json` fixture (this excludes
+/// `coverage_manifest.json`). Panics on an unreadable directory or entry, on an
+/// unparseable fixture, and on an empty result.
 fn load_all_fixtures() -> Vec<(String, VerifiableFunction)> {
     let dir = fixtures_dir();
-    if !dir.exists() {
-        return vec![];
-    }
     let mut fixtures = Vec::new();
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let entry = entry.unwrap();
+    for entry in std::fs::read_dir(&dir).unwrap_or_else(|error| {
+        panic!("failed to read fixture directory {}: {error}", dir.display())
+    }) {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!("failed to read entry in fixture directory {}: {error}", dir.display())
+        });
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
@@ -74,44 +87,12 @@ fn load_all_fixtures() -> Vec<(String, VerifiableFunction)> {
         }
         let json = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-        match serde_json::from_str::<VerifiableFunction>(&json) {
-            Ok(func) => fixtures.push((name, func)),
-            Err(e) => {
-                eprintln!("WARNING: skipping invalid fixture {}: {e}", path.display());
-            }
-        }
+        let func = serde_json::from_str::<VerifiableFunction>(&json)
+            .unwrap_or_else(|error| panic!("failed to parse fixture {}: {error}", path.display()));
+        fixtures.push((name, func));
     }
+    assert!(!fixtures.is_empty(), "no required real MIR fixtures found in {}", dir.display());
     fixtures
-}
-
-/// Skip a test if no fixtures are available, with a helpful message.
-macro_rules! require_fixtures {
-    ($fixtures:expr) => {
-        if $fixtures.is_empty() {
-            eprintln!(
-                "SKIPPING: No real MIR fixtures found. Generate them with:\n  \
-                 ./scripts/generate_mir_fixtures.sh"
-            );
-            return;
-        }
-    };
-}
-
-/// Skip a single-fixture test if the fixture does not exist.
-macro_rules! require_fixture {
-    ($fixture:expr, $name:expr) => {
-        match $fixture {
-            Some(f) => f,
-            None => {
-                eprintln!(
-                    "SKIPPING: Fixture '{}' not found. Generate with:\n  \
-                     ./scripts/generate_mir_fixtures.sh",
-                    $name
-                );
-                return;
-            }
-        }
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +102,6 @@ macro_rules! require_fixture {
 #[test]
 fn test_real_mir_all_fixtures_parse() {
     let fixtures = load_all_fixtures();
-    require_fixtures!(fixtures);
 
     for (name, func) in &fixtures {
         // Every fixture should have a name and def_path.
@@ -161,7 +141,6 @@ fn test_real_mir_all_fixtures_parse() {
 #[test]
 fn test_real_mir_vcgen_all() {
     let fixtures = load_all_fixtures();
-    require_fixtures!(fixtures);
 
     let mut total_vcs = 0usize;
     let mut fixtures_with_vcs = 0usize;
@@ -191,7 +170,6 @@ fn test_real_mir_vcgen_all() {
 #[test]
 fn test_real_mir_full_pipeline() {
     let fixtures = load_all_fixtures();
-    require_fixtures!(fixtures);
 
     let router = trust_router::Router::new();
 
@@ -234,10 +212,7 @@ fn test_real_mir_full_pipeline() {
 
 #[test]
 fn test_real_mir_arithmetic_overflow() {
-    let func = require_fixture!(
-        load_fixture("test_functions__checked_add"),
-        "test_functions__checked_add"
-    );
+    let func = load_fixture("test_functions__checked_add");
 
     // Structural: checked_add(a: u32, b: u32) -> u32 should have 2 args.
     assert_eq!(func.body.arg_count, 2, "checked_add should have 2 arguments");
@@ -266,10 +241,7 @@ fn test_real_mir_arithmetic_overflow() {
 
 #[test]
 fn test_real_mir_division() {
-    let func = require_fixture!(
-        load_fixture("test_functions__safe_divide"),
-        "test_functions__safe_divide"
-    );
+    let func = load_fixture("test_functions__safe_divide");
 
     // Structural: safe_divide(a: u32, b: u32) -> u32 should have 2 args.
     assert_eq!(func.body.arg_count, 2, "safe_divide should have 2 arguments");
@@ -296,7 +268,7 @@ fn test_real_mir_division() {
 
 #[test]
 fn test_real_mir_control_flow() {
-    let func = require_fixture!(load_fixture("test_functions__max_of"), "test_functions__max_of");
+    let func = load_fixture("test_functions__max_of");
 
     // max_of uses if/else, so it should have multiple basic blocks.
     assert!(
@@ -322,7 +294,7 @@ fn test_real_mir_control_flow() {
 
 #[test]
 fn test_real_mir_loop() {
-    let func = require_fixture!(load_fixture("test_functions__sum_to"), "test_functions__sum_to");
+    let func = load_fixture("test_functions__sum_to");
 
     // sum_to uses a while loop, so should have multiple blocks with back-edges.
     assert!(
@@ -345,8 +317,7 @@ fn test_real_mir_loop() {
 
 #[test]
 fn test_real_mir_references() {
-    let func =
-        require_fixture!(load_fixture("test_functions__read_ref"), "test_functions__read_ref");
+    let func = load_fixture("test_functions__read_ref");
 
     // read_ref takes &i32, should have at least one argument.
     assert!(func.body.arg_count >= 1, "read_ref should have at least 1 argument");
@@ -372,10 +343,7 @@ fn test_real_mir_references() {
 
 #[test]
 fn test_real_mir_unsafe() {
-    let func = require_fixture!(
-        load_fixture("test_functions__unsafe_read"),
-        "test_functions__unsafe_read"
-    );
+    let func = load_fixture("test_functions__unsafe_read");
 
     let vcs = trust_vcgen::generate_vcs(&func);
 
@@ -397,10 +365,7 @@ fn test_real_mir_unsafe() {
 
 #[test]
 fn test_real_mir_closure() {
-    let func = require_fixture!(
-        load_fixture("test_functions__apply_twice"),
-        "test_functions__apply_twice"
-    );
+    let func = load_fixture("test_functions__apply_twice");
 
     // apply_twice uses a closure, so should have basic blocks.
     assert!(!func.body.blocks.is_empty(), "apply_twice should have basic blocks");
@@ -420,10 +385,7 @@ fn test_real_mir_closure() {
 
 #[test]
 fn test_real_mir_drop_elaboration() {
-    let func = require_fixture!(
-        load_fixture("test_functions__string_creation"),
-        "test_functions__string_creation"
-    );
+    let func = load_fixture("test_functions__string_creation");
 
     // String creation and drop should produce more complex MIR than simple
     // arithmetic — more blocks, more locals for temporaries.
@@ -447,10 +409,7 @@ fn test_real_mir_drop_elaboration() {
 fn test_real_mir_generic_monomorphized() {
     // After monomorphization, identity<i32> should exist as a concrete function.
     // The fixture name depends on the compiler's def_path for the monomorphized instance.
-    let func = require_fixture!(
-        load_fixture("test_functions__use_identity"),
-        "test_functions__use_identity"
-    );
+    let func = load_fixture("test_functions__use_identity");
 
     // This function calls identity::<i32>, so should have a call terminator or
     // inline expansion.
@@ -472,7 +431,6 @@ fn test_real_mir_generic_monomorphized() {
 #[test]
 fn test_real_mir_no_panics() {
     let fixtures = load_all_fixtures();
-    require_fixtures!(fixtures);
 
     let router = trust_router::Router::new();
 
@@ -499,7 +457,6 @@ fn test_real_mir_no_panics() {
 #[test]
 fn test_real_mir_router_classify_all() {
     let fixtures = load_all_fixtures();
-    require_fixtures!(fixtures);
 
     let router = MirRouter::with_defaults();
     let mut strategy_counts: std::collections::HashMap<String, usize> =
@@ -534,7 +491,6 @@ fn test_real_mir_router_classify_all() {
 #[test]
 fn test_real_mir_router_verify_all() {
     let fixtures = load_all_fixtures();
-    require_fixtures!(fixtures);
 
     let router = MirRouter::with_defaults();
     let mut proved = 0usize;
@@ -567,7 +523,6 @@ fn test_real_mir_router_verify_all() {
 #[test]
 fn test_real_mir_terminator_diversity() {
     let fixtures = load_all_fixtures();
-    require_fixtures!(fixtures);
 
     let mut terminator_types: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut total_blocks = 0usize;
@@ -618,7 +573,6 @@ fn test_real_mir_terminator_diversity() {
 #[test]
 fn test_real_mir_statement_diversity() {
     let fixtures = load_all_fixtures();
-    require_fixtures!(fixtures);
 
     let mut has_storage_live = false;
     let mut has_assign = false;
@@ -656,7 +610,6 @@ fn test_real_mir_statement_diversity() {
 #[test]
 fn test_real_mir_type_diversity() {
     let fixtures = load_all_fixtures();
-    require_fixtures!(fixtures);
 
     let mut ty_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -694,7 +647,6 @@ fn test_real_mir_type_diversity() {
 #[test]
 fn test_real_mir_coverage_manifest_tracks_required_fixtures() {
     let fixtures = load_all_fixtures();
-    require_fixtures!(fixtures);
 
     let manifest = load_coverage_manifest();
     assert_eq!(
@@ -788,7 +740,7 @@ fn test_real_mir_unsupported_manifest_fixtures_fail_closed_when_generated() {
             .get("fixture")
             .and_then(|v| v.as_str())
             .expect("unsupported anchor fixture must be a string");
-        let Some(func) = load_fixture(fixture) else {
+        let Some(func) = try_load_unsupported_fixture(fixture) else {
             continue;
         };
         generated_count += 1;

@@ -1,0 +1,11 @@
+// INT-RAWCONST-HAVOC-1: the edition-2024 safe-FFI write through `&raw const x`.
+unsafe extern "C" {
+    safe fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8;
+}
+pub fn ffi_const(k: u8) -> u8 {
+    let mut x: u8 = 5;
+    let p = &raw const x;
+    // SAFETY: p points to x, which is live and mutable.
+    memset(p as *mut u8, k as i32, 1);
+    x + 1
+}

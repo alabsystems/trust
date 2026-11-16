@@ -1,11 +1,12 @@
-use std::collections::{BTreeSet, HashSet};
-use std::fs;
+// Trust: include the exact step-to-target census for mixed-host/target regressions.
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::Build;
-use crate::core::builder::cli_paths::match_paths_to_steps_and_run;
-use crate::core::builder::{Builder, StepDescription};
+use crate::core::builder::{Builder, CommandLineStepDescription};
+// Trust: compare actual scheduler selections without executing tool or UI jobs.
+use crate::core::config::TargetSelection;
+use crate::core::session::Session;
 use crate::utils::tests::TestCtx;
 
 fn render_steps_for_cli_args(args_str: &str) -> String {
@@ -27,20 +28,20 @@ fn render_steps_for_cli_args(args_str: &str) -> String {
         .hosts(hosts)
         .targets(targets)
         .create_config();
-    let mut build = Build::new(config);
+    let mut sess = Session::new(config);
     // Some rustdoc test steps are only run by default if nodejs is
     // configured/discovered, causing inconsistency.
-    build.config.nodejs = Some(PathBuf::from("node"));
-    let mut builder = Builder::new(&build);
+    sess.config.nodejs = Some(PathBuf::from("node"));
+    let mut builder = Builder::new(&sess);
 
     // Tell the builder to log steps that it would run, instead of running them.
-    let mut buf = Arc::new(Mutex::new(String::new()));
+    let buf = Arc::new(Mutex::new(String::new()));
     let buf2 = Arc::clone(&buf);
     builder.log_cli_step_for_tests = Some(Box::new(move |step_desc, pathsets, targets| {
         use std::fmt::Write;
         let mut buf = buf2.lock().unwrap();
 
-        let StepDescription { name, kind, .. } = step_desc;
+        let CommandLineStepDescription { name, kind, .. } = step_desc;
         // Strip boilerplate to make step names easier to read.
         let name = name.strip_prefix("bootstrap::core::build_steps::").unwrap_or(name);
 
@@ -60,13 +61,74 @@ fn render_steps_for_cli_args(args_str: &str) -> String {
     String::clone(&buf.lock().unwrap())
 }
 
+// Trust: a cross-compilation target must not become compiletest's execution host.
+#[test]
+fn compiletest_self_tests_use_configured_hosts() {
+    assert_eq!(
+        render_steps_for_cli_args("test src/tools/compiletest"),
+        concat!(
+            "[Test] test::CompiletestTest\n",
+            "    targets: [x86_64-unknown-linux-gnu]\n",
+            "    - Set({src/tools/compiletest})\n",
+        )
+    );
+}
+
+// Trust: reproduce the native host plus two UI targets without a build.host override.
+#[test]
+fn compiletest_self_tests_preserve_both_ui_targets() {
+    let targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
+    let config = TestCtx::new()
+        .config("test")
+        .args(&["--ci=false", "src/tools/compiletest", "tests/ui"])
+        .stage(1)
+        .targets(&targets)
+        .create_config();
+    let sess = Session::new(config);
+    let mut builder = Builder::new(&sess);
+    let native_host = builder.host_target;
+    let selections = Arc::new(Mutex::new(BTreeMap::new()));
+    let selected = Arc::clone(&selections);
+    builder.log_cli_step_for_tests = Some(Box::new(move |step, _, targets| {
+        let name = step.name.rsplit("::").next().unwrap().to_owned();
+        assert!(selected.lock().unwrap().insert(name, targets.to_vec()).is_none());
+    }));
+
+    builder.execute_cli();
+
+    assert_eq!(
+        *selections.lock().unwrap(),
+        BTreeMap::from([
+            ("CompiletestTest".to_owned(), vec![native_host]),
+            ("Ui".to_owned(), targets.map(TargetSelection::from_user).to_vec()),
+        ])
+    );
+}
+
 fn snapshot_test_inner(name: &str, args_str: &str) {
-    let mut settings = insta::Settings::clone_current();
-    // Use the test name as the snapshot filename, not its whole fully-qualified name.
-    settings.set_prepend_module_to_snapshot(false);
-    settings.bind(|| {
-        insta::assert_snapshot!(name, render_steps_for_cli_args(args_str), args_str);
-    });
+    // Trust: name the snapshot by this package's own directory, and write its `source:`
+    // as the repository-relative path `x.py test bootstrap` records. `file!()` is
+    // relative to the repository under `x.py`, which passes `-Zroot-dir=<src>`, but to
+    // `src/bootstrap` (its own workspace) in a direct `targo --unverified test
+    // --manifest-path src/bootstrap/Cargo.toml` (docs/VALIDATION_LADDER.md), where
+    // `expect_file!` then looked for every snapshot under `<src>/src/core/…` and read
+    // it as empty.
+    let name = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/core/builder/cli_paths/snapshots")
+        .join(format!("{name}.snap"));
+    let steps = render_steps_for_cli_args(args_str);
+    // Normalize Windows path separators
+    let file = file!().replace("\\", "/");
+    let file =
+        if file.starts_with("src/bootstrap/") { file } else { format!("src/bootstrap/{file}") };
+    let content = format!(
+        r"---
+source: {file}
+expression: {args_str}
+---
+{steps}",
+    );
+    expect_test::expect_file![name].assert_eq(&content);
 }
 
 /// Keep the snapshots directory tidy by forbidding `.snap` files that don't
@@ -121,10 +183,7 @@ macro_rules! declare_tests {
 
 // Snapshot tests for bootstrap's command-line path-to-step handling.
 //
-// To bless these tests as necessary, choose one:
-// - Run `INSTA_UPDATE=always ./x test bootstrap`
-// - Run `./x test bootstrap --bless`
-// - Follow the instructions for `cargo-insta` in bootstrap's README.md
+// To bless these tests as necessary, run `./x test bootstrap --bless`.
 //
 // These snapshot tests capture _current_ behavior, to prevent unintended
 // changes or regressions. If the current behavior is wrong or undersirable,
@@ -137,8 +196,20 @@ declare_tests!(
     (x_build_compiletest, "build compiletest"),
     (x_build_library, "build library"),
     (x_build_llvm, "build llvm"),
+    (x_build_proc_macro_srv_cli, "build proc-macro-srv-cli"),
+    (x_build_rust_analyzer, "build rust-analyzer"),
+    (x_build_rust_analyzer_proc_macro_srv, "build trust-analyzer-proc-macro-srv"),
+    (
+        x_build_rust_analyzer_proc_macro_srv_plus_full_path,
+        "build trust-analyzer-proc-macro-srv src/tools/rust-analyzer/crates/proc-macro-srv-cli"
+    ),
     (x_build_rustc, "build rustc"),
     (x_build_rustc_llvm, "build rustc_llvm"),
+    (x_build_src_tools_rust_analyzer, "build src/tools/rust-analyzer"),
+    (
+        x_build_src_tools_rust_analyzer_crates_proc_macro_srv_cli,
+        "build src/tools/rust-analyzer/crates/proc-macro-srv-cli"
+    ),
     (x_build_sysroot, "build sysroot"),
     (x_build_trustdoc, "build trustdoc"),
     (x_check, "check"),
@@ -175,25 +246,40 @@ declare_tests!(
     (x_test_coverage_skip_coverage_run, "test coverage --skip=coverage-run"),
     (x_test_debuginfo, "test debuginfo"),
     (x_test_library, "test library"),
+    (x_test_library_core_and_alloc_and_stdarch, "test library/core library/alloc library/stdarch"),
     (x_test_librustdoc, "test librustdoc"),
     (x_test_librustdoc_rustdoc, "test librustdoc rustdoc"),
     (x_test_librustdoc_rustdoc_html, "test librustdoc rustdoc-html"),
+    (x_test_miri, "test miri"),
     (x_test_rustdoc, "test rustdoc"),
     (x_test_rustdoc_html, "test rustdoc-html"),
+    (x_test_rustdoc_skip_rustdoc, "test rustdoc --skip=rustdoc"),
+    (x_test_semver_check, "test std-semver-check"),
     (x_test_skip_coverage, "test --skip=coverage"),
-    // FIXME(Zalathar): This doesn't skip the coverage-map or coverage-run tests.
+    (x_test_skip_coverage_map, "test --skip=coverage-map"),
+    (x_test_skip_coverage_run, "test --skip=coverage-run"),
     (x_test_skip_tests, "test --skip=tests"),
+    (x_test_skip_tests_coverage, "test --skip=tests/coverage"),
     // The skip combination upstream's second test-set split runs; pinned because it is
     // easy to break by accident and slow to notice.
     (
         x_test_skip_tests_etc,
         "test --skip=tests --skip=coverage-map --skip=coverage-run --skip=library --skip=tidyselftest"
     ),
+    // Note: this also runs cargo-miri tests!
+    (x_test_src_tools_miri, "test src/tools/miri"),
+    (x_test_src_tools_miri_and_cargo_miri, "test src/tools/miri src/tools/miri/cargo-miri"),
     (x_test_targo, "test src/tools/targo"),
     (x_test_targo_trust, "test targo-trust"),
     (x_test_tests, "test tests"),
+    (x_test_tests_coverage_trivial_rs, "test tests/coverage/trivial.rs"),
+    (
+        x_test_tests_coverage_trivial_rs_and_attr_impl_rs,
+        "test tests/coverage/trivial.rs tests/coverage/attr/impl.rs"
+    ),
     (x_test_tests_skip_coverage, "test tests --skip=coverage"),
     (x_test_tests_ui, "test tests/ui"),
+    (x_test_tests_ui_dot_prefix, "test ./tests/ui"),
     (x_test_tidy, "test tidy"),
     (x_test_tidyselftest, "test tidyselftest"),
     (x_test_tippy, "test src/tools/tippy"),

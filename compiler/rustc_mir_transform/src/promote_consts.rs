@@ -16,16 +16,17 @@ use std::{assert_matches, cmp, iter, mem};
 use either::{Left, Right};
 use rustc_const_eval::check_consts::{ConstCx, qualifs};
 use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::thin_vec::ThinVec;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_index::{IndexSlice, IndexVec};
+use rustc_middle::mir;
 use rustc_middle::mir::visit::{MutVisitor, MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, GenericArgs, List, Ty, TyCtxt, TypeVisitableExt};
-use rustc_middle::{bug, mir, span_bug};
-use rustc_span::{Span, Spanned};
+use rustc_span::{Span, Spanned, bug, span_bug};
 use tracing::{debug, instrument};
+
+use crate::PassPolicy;
 
 /// A `MirPass` for promotion.
 ///
@@ -52,9 +53,23 @@ impl<'tcx> crate::MirPass<'tcx> for PromoteTemps<'tcx> {
         if body.source.promoted.is_some() {
             return;
         }
+        if !body.basic_blocks.iter().any(|bb| {
+            bb.statements.iter().any(|stmt| {
+                matches!(
+                    &stmt.kind,
+                    StatementKind::Assign((_, Rvalue::Ref(_, kind, place)))
+                        if is_promotable_ref_candidate(body, *kind, place)
+                )
+            })
+        }) {
+            return;
+        }
 
         let ccx = ConstCx::new(tcx, body);
         let (mut temps, all_candidates) = collect_temps_and_candidates(&ccx);
+        if all_candidates.is_empty() {
+            return;
+        }
 
         let promotable_candidates = validate_candidates(&ccx, &mut temps, all_candidates);
 
@@ -62,8 +77,9 @@ impl<'tcx> crate::MirPass<'tcx> for PromoteTemps<'tcx> {
         self.promoted_fragments.set(promoted);
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Implements promotion by extracting eligible values into separate constant MIR bodies.
+        PassPolicy::Required
     }
 }
 
@@ -147,10 +163,26 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
     fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
         self.super_rvalue(rvalue, location);
 
-        if let Rvalue::Ref(..) = *rvalue {
+        if let Rvalue::Ref(_, kind, ref place) = *rvalue
+            && is_promotable_ref_candidate(self.ccx.body, kind, place)
+        {
             self.candidates.push(Candidate { location });
         }
     }
+}
+
+#[inline]
+fn is_promotable_ref_candidate<'tcx>(
+    body: &Body<'tcx>,
+    kind: BorrowKind,
+    place: &Place<'tcx>,
+) -> bool {
+    !matches!(
+        kind,
+        BorrowKind::Fake(_) | BorrowKind::Mut { kind: MutBorrowKind::ClosureCapture }
+    ) && body.local_kind(place.local) != LocalKind::Arg
+        && !body.local_decls[place.local].is_user_variable()
+        && !place.projection.contains(&ProjectionElem::Deref)
 }
 
 fn collect_temps_and_candidates<'tcx>(
@@ -296,7 +328,9 @@ impl<'tcx> Validator<'_, 'tcx> {
             | ProjectionElem::UnwrapUnsafeBinder(_) => {}
 
             // Never recurse.
-            ProjectionElem::OpaqueCast(..) | ProjectionElem::Downcast(..) => {
+            ProjectionElem::PhantomDeref
+            | ProjectionElem::OpaqueCast(..)
+            | ProjectionElem::Downcast(..) => {
                 return Err(Unpromotable);
             }
 
@@ -318,6 +352,8 @@ impl<'tcx> Validator<'_, 'tcx> {
                     // can only promote static accesses inside statics.
                     && let Some(hir::ConstContext::Static(..)) = self.const_kind
                     && !self.tcx.is_thread_local_static(did)
+                    // Extern statics can never be read by CTFE, even inside a static.
+                    && !self.tcx.is_foreign_item(did)
                 {
                     // Recurse.
                 } else {
@@ -603,7 +639,7 @@ impl<'tcx> Validator<'_, 'tcx> {
             safe_blocks.insert(safe_block);
             // Let's see if we can find another safe block.
             safe_block = match body.basic_blocks[safe_block].terminator().kind {
-                TerminatorKind::Goto { target } => target,
+                TerminatorKind::Goto { target, .. } => target,
                 TerminatorKind::Call { target: Some(target), .. }
                 | TerminatorKind::Drop { target, .. } => {
                     // This calls a function or the destructor. `target` does not get executed if
@@ -704,7 +740,10 @@ impl<'tcx> Validator<'_, 'tcx> {
             // const function that uses that constant, again requiring evaluation of the constant.
             // However, this form of cycle renders both the constant and function unusable in
             // general, so we don't need to special-case it here.
-            Const::Unevaluated(uc, _) => self.tcx.def_kind(uc.def) != DefKind::InlineConst,
+            Const::Unevaluated(uc, _) => {
+                self.tcx.def_kind(uc.def) != DefKind::AnonConst
+                    || self.tcx.anon_const_kind(uc.def) != ty::AnonConstKind::NonTypeSystemInline
+            }
         }
     }
 }
@@ -746,7 +785,6 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
             Some(Terminator {
                 source_info: SourceInfo::outermost(span),
                 kind: TerminatorKind::Return,
-                attributes: ThinVec::new(),
             }),
             false,
         ))
@@ -806,11 +844,10 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
                         rhs.clone()
                     } else {
                         let unit = Rvalue::Use(
-                            Operand::Constant(Box::new(ConstOperand {
-                                span: statement.source_info.span,
-                                user_ty: None,
-                                const_: Const::zero_sized(self.tcx.types.unit),
-                            })),
+                            Operand::zero_sized_constant(
+                                self.tcx.types.unit,
+                                statement.source_info.span,
+                            ),
                             WithRetag::Yes,
                         );
                         mem::replace(rhs, unit)
@@ -834,8 +871,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
                 };
                 Terminator {
                     source_info: terminator.source_info,
-                    kind: mem::replace(&mut terminator.kind, TerminatorKind::Goto { target }),
-                    attributes: ThinVec::new(),
+                    kind: mem::replace(&mut terminator.kind, TerminatorKind::goto(target)),
                 }
             };
 
@@ -1088,7 +1124,7 @@ fn promote_candidates<'tcx>(
             && let Some(index) = place.as_local()
         {
             if promoted(index) {
-                terminator.kind = TerminatorKind::Goto { target: *target };
+                terminator.kind = TerminatorKind::goto(*target);
             }
         }
     }

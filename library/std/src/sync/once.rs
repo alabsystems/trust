@@ -74,6 +74,7 @@ pub(crate) enum OnceExclusiveState {
     note = "the `Once::new()` function is now preferred",
     suggestion = "Once::new()"
 )]
+#[expect(clippy::declare_interior_mutable_const, reason = "legacy Once initializer")]
 pub const ONCE_INIT: Once = Once::new();
 
 impl Once {
@@ -154,7 +155,7 @@ impl Once {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[track_caller]
-    #[rustc_should_not_be_called_on_const_items]
+    #[lint::should_not_be_called_on_const_items]
     // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
     #[cfg_attr(not(test), rustc_diagnostic_item = "once_call_once")]
     pub fn call_once<F>(&self, f: F)
@@ -216,7 +217,7 @@ impl Once {
     /// ```
     #[inline]
     #[stable(feature = "once_poison", since = "1.51.0")]
-    #[rustc_should_not_be_called_on_const_items]
+    #[lint::should_not_be_called_on_const_items]
     // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
     #[cfg_attr(not(test), rustc_diagnostic_item = "once_call_once_force")]
     pub fn call_once_force<F>(&self, f: F)
@@ -302,8 +303,9 @@ impl Once {
     /// If this [`Once`] has been poisoned because an initialization closure has
     /// panicked, this method will also panic. Use [`wait_force`](Self::wait_force)
     /// if this behavior is not desired.
+    #[inline]
     #[stable(feature = "once_wait", since = "1.86.0")]
-    #[rustc_should_not_be_called_on_const_items]
+    #[lint::should_not_be_called_on_const_items]
     // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
     #[cfg_attr(not(test), rustc_diagnostic_item = "once_wait")]
     pub fn wait(&self) {
@@ -317,8 +319,9 @@ impl Once {
     ///
     /// If this [`Once`] has been poisoned, this function blocks until it
     /// becomes completed, unlike [`Once::wait()`], which panics in this case.
+    #[inline]
     #[stable(feature = "once_wait", since = "1.86.0")]
-    #[rustc_should_not_be_called_on_const_items]
+    #[lint::should_not_be_called_on_const_items]
     // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
     #[cfg_attr(not(test), rustc_diagnostic_item = "once_wait_force")]
     pub fn wait_force(&self) {
@@ -352,6 +355,16 @@ impl Once {
 impl fmt::Debug for Once {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Once").finish_non_exhaustive()
+    }
+}
+
+#[stable(feature = "once_default", since = "1.100.0")]
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+const impl Default for Once {
+    /// Creates a new `Once` value, same as [`Once::new`].
+    #[inline]
+    fn default() -> Once {
+        Once::new()
     }
 }
 

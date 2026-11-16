@@ -385,9 +385,8 @@ fn bool_join_chain_certifies_via_trustir() {
             .expect("`eq_ignore_ascii_case` fixture must be present");
     assert!(
         shape_witnessed(&func),
-        "the two-fold compare chain must be SHAPE-witnessed via trust-ir (its safety \
-         pillar declines on the unmodelled unsigned-Mul overflow family, tracked \
-         separately)"
+        "the two-fold compare chain must be SHAPE-witnessed via trust-ir; this shape \
+         assertion does not establish the safety pillar or BV predicate equivalence"
     );
 }
 

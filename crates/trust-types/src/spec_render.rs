@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     Formula, HighLevelSpecAttr, Sort, SpecBinOp, SpecExpr, SpecParseError, SpecUnaryOp,
-    check_formula_sort, parse_spec_attr, parse_spec_expr_result,
+    parse_spec_attr, parse_spec_expr_result,
 };
 
 /// A source-contract rendering or round-trip validation failure.
@@ -78,6 +78,12 @@ impl SourceContractClause {
 /// The Trust parser intentionally starts ordinary identifiers at `Sort::Int`.
 /// Consumers that know the signature must call this before accepting a parsed
 /// predicate, notably for `bool` parameters and the Boolean return place.
+///
+/// It also fixes what a contract `==` MEANS once the sorts are known
+/// (SPEC-FLOAT-EQ-STRUCTURAL-1): an `Eq` whose operand is now float-sorted is
+/// Rust `PartialEq` on floats, i.e. IEEE [`Formula::FpEq`], never structural
+/// `=` (which reads `NaN == NaN` as true and `0.0 == -0.0` as false). `map` is
+/// post-order, so an `Eq` node sees its operands already retyped.
 #[must_use]
 pub fn retype_formula_variables(formula: Formula, sorts: &BTreeMap<String, Sort>) -> Formula {
     formula.map(&mut |node| match node {
@@ -89,6 +95,7 @@ pub fn retype_formula_variables(formula: Formula, sorts: &BTreeMap<String, Sort>
             let sort = sorts.get(symbol.as_str()).cloned().unwrap_or(old_sort);
             Formula::SymVar(symbol, sort)
         }
+        Formula::Eq(lhs, rhs) => crate::spec_equality(lhs, rhs),
         other => other,
     })
 }
@@ -101,7 +108,7 @@ pub fn retype_formula_variables(formula: Formula, sorts: &BTreeMap<String, Sort>
 /// the parser's default `Int` sort.
 pub fn formula_to_spec_expr(formula: &Formula) -> Result<String, SpecRenderError> {
     let sorts = formula_variable_sorts(formula)?;
-    render_and_validate(formula, &sorts)
+    render_and_validate_with_formula_sorts(formula, None, sorts)
 }
 
 /// Parse and canonicalize an externally supplied contract expression.
@@ -147,6 +154,31 @@ pub fn validate_source_spec_expr(
 /// exact source layouts are available. Native query callers must not inherit
 /// the legacy integer aggregate abstraction retained by the compatibility
 /// entry point.
+/// The bits of a binary64 float literal rewritten in a NARROWER IEEE format, or
+/// `None` when the value is not the same number there.
+///
+/// The spec lexer builds every float literal as binary64, so an `f32` parameter
+/// meets a wide literal and the two sorts disagree. Rewriting the literal is
+/// sound ONLY when it is exact: `1.0` and `0.5` are the same number in both
+/// formats, and `0.1` is not — narrowing that one would move an author's bound to
+/// a number they did not write. Round-tripping through the narrow format is the
+/// test, and a value that fails it keeps the mismatch and its honest refusal.
+///
+/// ONE RULE, TWO CONSUMERS, deliberately: the source sort checker uses it to
+/// decide whether a comparison is well-typed, and the contract lowerer uses it to
+/// rewrite the literal in the FORMULA. If those two disagreed, a clause would
+/// validate while the solver received a wide literal against a narrow variable —
+/// a silently ill-sorted query, which is exactly what the refusal prevents.
+#[must_use]
+pub fn float_literal_narrowed_bits(bits: u64, eb: u32, sb: u32) -> Option<u64> {
+    if (eb, sb) != (8, 24) {
+        return None;
+    }
+    let wide = f64::from_bits(bits);
+    let narrow = wide as f32;
+    (f64::from(narrow) == wide).then(|| u64::from(narrow.to_bits()))
+}
+
 pub fn validate_source_spec_expr_with_exact_projections(
     expression: &str,
     clause: SourceContractClause,
@@ -178,13 +210,14 @@ fn validate_source_spec_expr_inner(
     // in this context.  Callers must reject a real parameter named `_0` before
     // constructing this map; otherwise the two source meanings are impossible
     // to distinguish after lowering.
-    let mut variables = signature_sorts.clone();
-    let return_sort = variables.remove("_0");
+    let return_sort = signature_sorts.get("_0");
+    let mut bound_vars = Vec::new();
     let actual = check_source_expr_sort(
         &expr,
         clause,
-        &return_sort,
-        &mut variables,
+        return_sort,
+        signature_sorts,
+        &mut bound_vars,
         true,
         exact_projections,
     )?;
@@ -210,6 +243,29 @@ fn source_expect(operator: &str, actual: Sort, expected: Sort) -> Result<(), Spe
     }
 }
 
+/// Reconcile a comparison's operand sorts when one side is a binary64 float
+/// LITERAL and the other a narrower float, using the exactness rule in
+/// [`float_literal_narrowed_bits`]. Every other pair is returned untouched, so a
+/// genuine mismatch still reaches `source_same` and is refused there.
+fn reconcile_float_literal_operand(
+    lhs: &SpecExpr,
+    rhs: &SpecExpr,
+    left: Sort,
+    right: Sort,
+) -> (Sort, Sort) {
+    let narrows = |literal: &SpecExpr, target: &Sort| -> bool {
+        matches!((literal, target), (SpecExpr::FloatLit(bits), Sort::Float { eb, sb })
+            if float_literal_narrowed_bits(*bits, *eb, *sb).is_some())
+    };
+    if matches!(left, Sort::Float { .. }) && narrows(rhs, &left) {
+        return (left.clone(), left);
+    }
+    if matches!(right, Sort::Float { .. }) && narrows(lhs, &right) {
+        return (right.clone(), right);
+    }
+    (left, right)
+}
+
 fn source_same(operator: &str, left: Sort, right: Sort) -> Result<Sort, SpecRenderError> {
     if left == right {
         Ok(left)
@@ -220,11 +276,12 @@ fn source_same(operator: &str, left: Sort, right: Sort) -> Result<Sort, SpecRend
     }
 }
 
-fn check_source_expr_sort(
-    expr: &SpecExpr,
+fn check_source_expr_sort<'a>(
+    expr: &'a SpecExpr,
     clause: SourceContractClause,
-    return_sort: &Option<Sort>,
-    variables: &mut BTreeMap<String, Sort>,
+    return_sort: Option<&Sort>,
+    signature_sorts: &BTreeMap<String, Sort>,
+    bound_vars: &mut Vec<(&'a str, Sort)>,
     allow_result: bool,
     exact_projections: bool,
 ) -> Result<Sort, SpecRenderError> {
@@ -234,15 +291,17 @@ fn check_source_expr_sort(
         // An f64 literal carries its IEEE binary64 sort, matching the
         // executable formula parser's `FpConst { eb: 11, sb: 53 }` atom.
         SpecExpr::FloatLit(_) => Ok(Sort::Float { eb: 11, sb: 53 }),
-        SpecExpr::Var(name) => variables
-            .get(name)
-            .cloned()
+        SpecExpr::Var(name) => bound_vars
+            .iter()
+            .rev()
+            .find_map(|(bound, sort)| (*bound == name.as_str()).then(|| sort.clone()))
+            .or_else(|| (name != "_0").then(|| signature_sorts.get(name).cloned()).flatten())
             .ok_or_else(|| SpecRenderError::UnknownVariable { name: name.clone() }),
         SpecExpr::Result => {
             if clause != SourceContractClause::Ensures || !allow_result {
                 return Err(SpecRenderError::ResultOutsidePostcondition);
             }
-            return_sort.clone().ok_or(SpecRenderError::UnitResult)
+            return_sort.cloned().ok_or(SpecRenderError::UnitResult)
         }
         SpecExpr::Old(inner) => {
             if clause != SourceContractClause::Ensures {
@@ -250,14 +309,23 @@ fn check_source_expr_sort(
             }
             // `old(result)` has no entry-state meaning.  Parameters and their
             // projections retain the operand's signature-derived sort.
-            check_source_expr_sort(inner, clause, return_sort, variables, false, exact_projections)
+            check_source_expr_sort(
+                inner,
+                clause,
+                return_sort,
+                signature_sorts,
+                bound_vars,
+                false,
+                exact_projections,
+            )
         }
         SpecExpr::UnaryOp { op, expr } => {
             let actual = check_source_expr_sort(
                 expr,
                 clause,
                 return_sort,
-                variables,
+                signature_sorts,
+                bound_vars,
                 allow_result,
                 exact_projections,
             )?;
@@ -279,7 +347,8 @@ fn check_source_expr_sort(
                 lhs,
                 clause,
                 return_sort,
-                variables,
+                signature_sorts,
+                bound_vars,
                 allow_result,
                 exact_projections,
             )?;
@@ -287,7 +356,8 @@ fn check_source_expr_sort(
                 rhs,
                 clause,
                 return_sort,
-                variables,
+                signature_sorts,
+                bound_vars,
                 allow_result,
                 exact_projections,
             )?;
@@ -315,6 +385,7 @@ fn check_source_expr_sort(
                     }
                 }
                 SpecBinOp::Eq | SpecBinOp::Ne => {
+                    let (left, right) = reconcile_float_literal_operand(lhs, rhs, left, right);
                     source_same("equality", left, right)?;
                     Ok(Sort::Bool)
                 }
@@ -323,6 +394,7 @@ fn check_source_expr_sort(
                     // sides: Int, or the same IEEE float sort (the float
                     // magnitude bounds `(self.0) <= (1.0e30)`). Bool ordering
                     // stays a hard type error.
+                    let (left, right) = reconcile_float_literal_operand(lhs, rhs, left, right);
                     let operand = source_same("ordering comparison", left, right)?;
                     if matches!(operand, Sort::Int | Sort::Float { .. }) {
                         Ok(Sort::Bool)
@@ -348,7 +420,8 @@ fn check_source_expr_sort(
                 lhs,
                 clause,
                 return_sort,
-                variables,
+                signature_sorts,
+                bound_vars,
                 allow_result,
                 exact_projections,
             )?;
@@ -356,7 +429,8 @@ fn check_source_expr_sort(
                 rhs,
                 clause,
                 return_sort,
-                variables,
+                signature_sorts,
+                bound_vars,
                 allow_result,
                 exact_projections,
             )?;
@@ -369,7 +443,7 @@ fn check_source_expr_sort(
             // `self.0[3].1`) is looked up under its exact signature-environment
             // spelling. The environment, not the field token alone, is the
             // authority for the projected sort.
-            if let Some(sort) = projected_chain_sort(expr, variables) {
+            if let Some(sort) = projected_chain_sort(expr, signature_sorts) {
                 return Ok(sort);
             }
             // Validate the base's scope even though v1 lacks structural source
@@ -380,7 +454,8 @@ fn check_source_expr_sort(
                 base,
                 clause,
                 return_sort,
-                variables,
+                signature_sorts,
+                bound_vars,
                 allow_result,
                 exact_projections,
             )?;
@@ -403,7 +478,8 @@ fn check_source_expr_sort(
                 base,
                 clause,
                 return_sort,
-                variables,
+                signature_sorts,
+                bound_vars,
                 allow_result,
                 exact_projections,
             )?;
@@ -431,14 +507,15 @@ fn check_source_expr_sort(
             // Literal indexing inside a pure projected chain can carry an exact
             // signature-environment sort. Computed indexing cannot form such a
             // name and proceeds through the structural Array rules below.
-            if let Some(sort) = projected_chain_sort(expr, variables) {
+            if let Some(sort) = projected_chain_sort(expr, signature_sorts) {
                 return Ok(sort);
             }
             let base = check_source_expr_sort(
                 base,
                 clause,
                 return_sort,
-                variables,
+                signature_sorts,
+                bound_vars,
                 allow_result,
                 exact_projections,
             )?;
@@ -446,7 +523,8 @@ fn check_source_expr_sort(
                 index,
                 clause,
                 return_sort,
-                variables,
+                signature_sorts,
+                bound_vars,
                 allow_result,
                 exact_projections,
             )?;
@@ -478,7 +556,8 @@ fn check_source_expr_sort(
                     argument,
                     clause,
                     return_sort,
-                    variables,
+                    signature_sorts,
+                    bound_vars,
                     allow_result,
                     exact_projections,
                 )?;
@@ -493,26 +572,75 @@ fn check_source_expr_sort(
                 "bool" => Sort::Bool,
                 _ => return Err(SpecRenderError::UnsupportedFormula),
             };
-            let previous = variables.insert(var.clone(), bound_sort);
+            bound_vars.push((var.as_str(), bound_sort));
             let body_sort = check_source_expr_sort(
                 body,
                 clause,
                 return_sort,
-                variables,
+                signature_sorts,
+                bound_vars,
                 allow_result,
                 exact_projections,
             );
-            if let Some(previous) = previous {
-                variables.insert(var.clone(), previous);
-            } else {
-                variables.remove(var);
-            }
+            bound_vars.pop();
             source_expect("quantifier body", body_sort?, Sort::Bool)?;
             Ok(Sort::Bool)
         }
         #[allow(unreachable_patterns)]
         _ => Err(SpecRenderError::UnsupportedFormula),
     }
+}
+
+/// Every pure projection-chain name a source contract clause spells
+/// (`self.0[3].1`), in exactly the canonical spelling
+/// [`validate_source_spec_expr`] looks up in its signature environment; empty
+/// when the clause does not parse.
+///
+/// A caller that types projection chains from the parameter TYPES resolves
+/// the chains a clause actually names, a cost proportional to the clause's
+/// text, instead of pre-enumerating every leaf of every parameter type, whose
+/// count is set by the types' array LENGTHS (values).
+#[must_use]
+pub fn source_spec_projected_chain_names(
+    expression: &str,
+    clause: SourceContractClause,
+) -> Vec<String> {
+    fn walk(expr: &SpecExpr, out: &mut Vec<String>) {
+        if matches!(expr, SpecExpr::Field { .. } | SpecExpr::Index { .. })
+            && let Some(name) = projected_chain_name(expr)
+        {
+            out.push(name);
+        }
+        match expr {
+            SpecExpr::BinOp { lhs, rhs, .. } | SpecExpr::Implies { lhs, rhs } => {
+                walk(lhs, out);
+                walk(rhs, out);
+            }
+            SpecExpr::UnaryOp { expr, .. } | SpecExpr::Old(expr) => walk(expr, out),
+            SpecExpr::FnCall { args, .. } => args.iter().for_each(|arg| walk(arg, out)),
+            SpecExpr::Forall { body, .. } | SpecExpr::Exists { body, .. } => walk(body, out),
+            SpecExpr::Field { base, .. } | SpecExpr::MethodCall { base, .. } => walk(base, out),
+            SpecExpr::Index { base, index } => {
+                walk(base, out);
+                walk(index, out);
+            }
+            _ => {}
+        }
+    }
+    let Ok(parsed) = parse_spec_attr(clause.attr_name(), expression) else {
+        return Vec::new();
+    };
+    let expr = match parsed {
+        HighLevelSpecAttr::Requires(expr)
+        | HighLevelSpecAttr::Ensures(expr)
+        | HighLevelSpecAttr::Invariant(expr)
+        | HighLevelSpecAttr::Decreases(expr) => expr,
+        #[allow(unreachable_patterns)]
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    walk(&expr, &mut out);
+    out
 }
 
 /// Look up a pure projection chain's signature-environment sort under its
@@ -529,27 +657,55 @@ fn projected_chain_sort(expr: &SpecExpr, variables: &BTreeMap<String, Sort>) -> 
 /// non-negative array indices form a stable place spelling; any other shape
 /// (computed index, `old(..)`/`result` in the chain) returns `None`.
 fn projected_chain_name(expr: &SpecExpr) -> Option<String> {
-    match expr {
-        SpecExpr::Var(name) => Some(name.clone()),
-        SpecExpr::Field { base, field } => Some(format!("{}.{field}", projected_chain_name(base)?)),
-        SpecExpr::Index { base, index } => match index.as_ref() {
-            SpecExpr::IntLit(value) if *value >= 0 => {
-                Some(format!("{}[{value}]", projected_chain_name(base)?))
+    fn write_chain(expr: &SpecExpr, out: &mut String) -> bool {
+        match expr {
+            SpecExpr::Var(name) => {
+                out.push_str(name);
+                true
             }
-            _ => None,
-        },
-        _ => None,
+            SpecExpr::Field { base, field } => {
+                if !write_chain(base, out) {
+                    return false;
+                }
+                out.push('.');
+                out.push_str(field);
+                true
+            }
+            SpecExpr::Index { base, index } => {
+                let SpecExpr::IntLit(value) = index.as_ref() else {
+                    return false;
+                };
+                if *value < 0 || !write_chain(base, out) {
+                    return false;
+                }
+                use std::fmt::Write;
+                let _ = write!(out, "[{value}]");
+                true
+            }
+            _ => false,
+        }
     }
+    let mut out = String::new();
+    write_chain(expr, &mut out).then_some(out)
 }
 
 fn render_and_validate(
     formula: &Formula,
     supplied_sorts: &BTreeMap<String, Sort>,
 ) -> Result<String, SpecRenderError> {
-    let actual = check_formula_sort(formula)
+    let formula_sorts = formula_variable_sorts(formula)?;
+    render_and_validate_with_formula_sorts(formula, Some(supplied_sorts), formula_sorts)
+}
+
+fn render_and_validate_with_formula_sorts<'a>(
+    formula: &'a Formula,
+    supplied_sorts: Option<&BTreeMap<String, Sort>>,
+    formula_sorts: BTreeMap<&'a str, &'a Sort>,
+) -> Result<String, SpecRenderError> {
+    let actual = crate::smt_logic::check_formula_sort_cow(formula)
         .map_err(|error| SpecRenderError::IllTyped { detail: error.to_string() })?;
-    if actual != Sort::Bool {
-        return Err(SpecRenderError::NonBoolean { actual });
+    if *actual != Sort::Bool {
+        return Err(SpecRenderError::NonBoolean { actual: actual.into_owned() });
     }
 
     let rendered = render_inner(formula)?;
@@ -557,108 +713,205 @@ fn render_and_validate(
 
     // Formula-owned sorts take precedence, while supplied signature sorts fill
     // in parser-created names.  Conflicts are rejected by collection above.
-    let mut sorts = supplied_sorts.clone();
-    for (name, sort) in formula_variable_sorts(formula)? {
-        if let Some(existing) = sorts.get(&name)
-            && existing != &sort
-        {
-            return Err(SpecRenderError::ConflictingVariableSort {
-                name,
-                first: existing.clone(),
-                second: sort,
-            });
+    let reparsed = match supplied_sorts {
+        Some(supplied) if !supplied.is_empty() => {
+            for (&name, &sort) in &formula_sorts {
+                if let Some(existing) = supplied.get(name)
+                    && existing != sort
+                {
+                    return Err(SpecRenderError::ConflictingVariableSort {
+                        name: name.to_string(),
+                        first: existing.clone(),
+                        second: sort.clone(),
+                    });
+                }
+            }
+            retype_formula_variables_borrowed(reparsed, &formula_sorts, Some(supplied))
         }
-        sorts.insert(name, sort);
-    }
-    let reparsed = retype_formula_variables(reparsed, &sorts);
+        _ => retype_formula_variables_borrowed(reparsed, &formula_sorts, None),
+    };
     if reparsed != *formula {
         return Err(SpecRenderError::RoundTripMismatch);
     }
     Ok(rendered)
 }
 
-fn formula_variable_sorts(formula: &Formula) -> Result<BTreeMap<String, Sort>, SpecRenderError> {
-    let mut sorts: BTreeMap<String, Sort> = BTreeMap::new();
+fn retype_formula_variables_borrowed(
+    formula: Formula,
+    formula_sorts: &BTreeMap<&str, &Sort>,
+    supplied_sorts: Option<&BTreeMap<String, Sort>>,
+) -> Formula {
+    let lookup = |name: &str| -> Option<Sort> {
+        formula_sorts
+            .get(name)
+            .copied()
+            .or_else(|| supplied_sorts.and_then(|s| s.get(name)))
+            .cloned()
+    };
+    formula.map(&mut |node| match node {
+        Formula::Var(name, old_sort) => {
+            let sort = lookup(&name).unwrap_or(old_sort);
+            Formula::Var(name, sort)
+        }
+        Formula::SymVar(symbol, old_sort) => {
+            let sort = lookup(symbol.as_str()).unwrap_or(old_sort);
+            Formula::SymVar(symbol, sort)
+        }
+        Formula::Eq(lhs, rhs) => crate::spec_equality(lhs, rhs),
+        other => other,
+    })
+}
+
+fn formula_variable_sorts(formula: &Formula) -> Result<BTreeMap<&str, &Sort>, SpecRenderError> {
+    let mut sorts: BTreeMap<&str, &Sort> = BTreeMap::new();
     let mut conflict = None;
-    formula.visit(&mut |node| {
+    let _ = crate::all_formula_nodes(formula, &mut |node| {
         let (name, sort) = match node {
-            Formula::Var(name, sort) => (name.clone(), sort.clone()),
-            Formula::SymVar(symbol, sort) => (symbol.as_str().to_string(), sort.clone()),
-            _ => return,
+            Formula::Var(name, sort) => (name.as_str(), sort),
+            Formula::SymVar(symbol, sort) => (symbol.as_str(), sort),
+            _ => return true,
         };
-        if let Some(first) = sorts.get(&name)
-            && first != &sort
-        {
-            conflict = Some(SpecRenderError::ConflictingVariableSort {
-                name,
-                first: first.clone(),
-                second: sort,
-            });
+        if let Some(&first) = sorts.get(name) {
+            if first != sort {
+                conflict = Some(SpecRenderError::ConflictingVariableSort {
+                    name: name.to_string(),
+                    first: first.clone(),
+                    second: sort.clone(),
+                });
+                return false;
+            }
         } else {
             sorts.insert(name, sort);
         }
+        true
     });
     conflict.map_or(Ok(sorts), Err)
 }
 
 fn render_inner(formula: &Formula) -> Result<String, SpecRenderError> {
-    fn binary(op: &str, lhs: &Formula, rhs: &Formula) -> Result<String, SpecRenderError> {
-        Ok(format!("({} {op} {})", render_inner(lhs)?, render_inner(rhs)?))
+    let mut out = String::new();
+    render_into(formula, &mut out)?;
+    Ok(out)
+}
+
+fn render_into(formula: &Formula, out: &mut String) -> Result<(), SpecRenderError> {
+    use std::fmt::Write;
+    fn binary(
+        op: &str,
+        lhs: &Formula,
+        rhs: &Formula,
+        out: &mut String,
+    ) -> Result<(), SpecRenderError> {
+        out.push('(');
+        render_into(lhs, out)?;
+        out.push(' ');
+        out.push_str(op);
+        out.push(' ');
+        render_into(rhs, out)?;
+        out.push(')');
+        Ok(())
     }
 
     match formula {
-        Formula::Bool(value) => Ok(value.to_string()),
-        Formula::Int(value) => Ok(value.to_string()),
+        Formula::Bool(value) => {
+            out.push_str(if *value { "true" } else { "false" });
+            Ok(())
+        }
+        Formula::Int(value) => {
+            let _ = write!(out, "{value}");
+            Ok(())
+        }
         // The parser has no UInt/BitVec literal node, so accepting these would
         // necessarily fail the exact structural round trip.
         Formula::UInt(_) | Formula::BitVec { .. } => Err(SpecRenderError::UnsupportedFormula),
-        Formula::Var(name, _) => render_variable(name),
-        Formula::SymVar(symbol, _) => render_variable(symbol.as_str()),
-        Formula::Not(inner) => Ok(format!("!({})", render_inner(inner)?)),
+        Formula::Var(name, _) => render_variable_into(name, out),
+        Formula::SymVar(symbol, _) => render_variable_into(symbol.as_str(), out),
+        Formula::Not(inner) => {
+            out.push_str("!(");
+            render_into(inner, out)?;
+            out.push(')');
+            Ok(())
+        }
         Formula::And(items) => match items.as_slice() {
-            [] => Ok("true".to_string()),
-            [only] => render_inner(only),
+            [] => {
+                out.push_str("true");
+                Ok(())
+            }
+            [only] => render_into(only, out),
             _ => {
-                let parts = items.iter().map(render_inner).collect::<Result<Vec<_>, _>>()?;
-                Ok(format!("({})", parts.join(" && ")))
+                out.push('(');
+                for (idx, item) in items.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str(" && ");
+                    }
+                    render_into(item, out)?;
+                }
+                out.push(')');
+                Ok(())
             }
         },
         Formula::Or(items) => match items.as_slice() {
-            [] => Ok("false".to_string()),
-            [only] => render_inner(only),
+            [] => {
+                out.push_str("false");
+                Ok(())
+            }
+            [only] => render_into(only, out),
             _ => {
-                let parts = items.iter().map(render_inner).collect::<Result<Vec<_>, _>>()?;
-                Ok(format!("({})", parts.join(" || ")))
+                out.push('(');
+                for (idx, item) in items.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str(" || ");
+                    }
+                    render_into(item, out)?;
+                }
+                out.push(')');
+                Ok(())
             }
         },
-        Formula::Implies(lhs, rhs) => binary("=>", lhs, rhs),
-        Formula::Eq(lhs, rhs) => binary("==", lhs, rhs),
-        Formula::Lt(lhs, rhs) => binary("<", lhs, rhs),
-        Formula::Le(lhs, rhs) => binary("<=", lhs, rhs),
-        Formula::Gt(lhs, rhs) => binary(">", lhs, rhs),
-        Formula::Ge(lhs, rhs) => binary(">=", lhs, rhs),
-        Formula::Add(lhs, rhs) => binary("+", lhs, rhs),
-        Formula::Sub(lhs, rhs) => binary("-", lhs, rhs),
-        Formula::Mul(lhs, rhs) => binary("*", lhs, rhs),
-        Formula::Div(lhs, rhs) => binary("/", lhs, rhs),
-        Formula::Rem(lhs, rhs) => binary("%", lhs, rhs),
-        Formula::Neg(inner) => Ok(format!("-({})", render_inner(inner)?)),
+        Formula::Implies(lhs, rhs) => binary("=>", lhs, rhs, out),
+        Formula::Eq(lhs, rhs) => binary("==", lhs, rhs, out),
+        // A float `==` is IEEE `FpEq` (SPEC-FLOAT-EQ-STRUCTURAL-1) and its source
+        // spelling is the same `==`: the reparse yields `Eq`, and the retype with
+        // the formula's own float sorts restores `FpEq`, so the exact round trip
+        // in `render_and_validate` still decides acceptance.
+        Formula::FpEq(lhs, rhs) => binary("==", lhs, rhs, out),
+        Formula::Lt(lhs, rhs) => binary("<", lhs, rhs, out),
+        Formula::Le(lhs, rhs) => binary("<=", lhs, rhs, out),
+        Formula::Gt(lhs, rhs) => binary(">", lhs, rhs, out),
+        Formula::Ge(lhs, rhs) => binary(">=", lhs, rhs, out),
+        Formula::Add(lhs, rhs) => binary("+", lhs, rhs, out),
+        Formula::Sub(lhs, rhs) => binary("-", lhs, rhs, out),
+        Formula::Mul(lhs, rhs) => binary("*", lhs, rhs, out),
+        Formula::Div(lhs, rhs) => binary("/", lhs, rhs, out),
+        Formula::Rem(lhs, rhs) => binary("%", lhs, rhs, out),
+        Formula::Neg(inner) => {
+            out.push_str("-(");
+            render_into(inner, out)?;
+            out.push(')');
+            Ok(())
+        }
         _ => Err(SpecRenderError::UnsupportedFormula),
     }
 }
 
-fn render_variable(name: &str) -> Result<String, SpecRenderError> {
+fn render_variable_into(name: &str, out: &mut String) -> Result<(), SpecRenderError> {
     // MIR names a dereferenced source parameter `a*`; the source grammar spells
     // that same leaf `*a`.  Preserve multiple deref projections exactly.
     let derefs = name.as_bytes().iter().rev().take_while(|byte| **byte == b'*').count();
     let base = &name[..name.len() - derefs];
+    enum SourceBase<'a> {
+        Result,
+        ResultField(&'a str),
+        Old(&'a str),
+        Projected(&'a str),
+    }
     let source_base = if base == "_0" {
         // `_0` is MIR's return place, but only `result` is in scope in a
         // source postcondition. The parser maps it back to `_0` exactly.
-        "result".to_string()
+        SourceBase::Result
     } else if let Some(field) = base.strip_prefix("_0.") {
         if field.split('.').all(is_projected_component) {
-            format!("result.{field}")
+            SourceBase::ResultField(field)
         } else {
             return Err(SpecRenderError::InvalidIdentifier { name: name.to_string() });
         }
@@ -667,16 +920,32 @@ fn render_variable(name: &str) -> Result<String, SpecRenderError> {
         // parser's synthetic `old_<identifier>` variable without guessing.
         let source_old = if old_name == "_0" { "result" } else { old_name };
         if is_identifier(source_old) || source_old == "result" {
-            format!("old({source_old})")
+            SourceBase::Old(source_old)
         } else {
             return Err(SpecRenderError::InvalidIdentifier { name: name.to_string() });
         }
     } else if is_projected_identifier(base) {
-        base.to_string()
+        SourceBase::Projected(base)
     } else {
         return Err(SpecRenderError::InvalidIdentifier { name: name.to_string() });
     };
-    Ok(format!("{}{}", "*".repeat(derefs), source_base))
+    for _ in 0..derefs {
+        out.push('*');
+    }
+    match source_base {
+        SourceBase::Result => out.push_str("result"),
+        SourceBase::ResultField(field) => {
+            out.push_str("result.");
+            out.push_str(field);
+        }
+        SourceBase::Old(source_old) => {
+            out.push_str("old(");
+            out.push_str(source_old);
+            out.push(')');
+        }
+        SourceBase::Projected(base) => out.push_str(base),
+    }
+    Ok(())
 }
 
 fn is_projected_identifier(name: &str) -> bool {
@@ -795,9 +1064,10 @@ mod tests {
         );
         let rendered = formula_to_spec_expr(&formula).unwrap();
         assert_eq!(
-            retype_formula_variables(
+            retype_formula_variables_borrowed(
                 parse_spec_expr_result(&rendered).unwrap(),
-                &formula_variable_sorts(&formula).unwrap()
+                &formula_variable_sorts(&formula).unwrap(),
+                None,
             ),
             formula
         );
@@ -826,7 +1096,11 @@ mod tests {
         assert_eq!(rendered, "(p => !(q))");
         let sorts = formula_variable_sorts(&formula).unwrap();
         assert_eq!(
-            retype_formula_variables(parse_spec_expr_result(&rendered).unwrap(), &sorts),
+            retype_formula_variables_borrowed(
+                parse_spec_expr_result(&rendered).unwrap(),
+                &sorts,
+                None,
+            ),
             formula
         );
     }

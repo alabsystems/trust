@@ -1,0 +1,452 @@
+{
+  "name": "h2c7_raw_mut_then_call_ctl",
+  "def_path": "adv::h2c7_raw_mut_then_call_ctl",
+  "span": {
+    "file": "ploss_adv/h2_raw_const.rs",
+    "line_start": 154,
+    "col_start": 0,
+    "line_end": 159,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 4
+              }
+            }
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "k"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "p"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        3,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 155,
+                "col_start": 16,
+                "line_end": 155,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  true,
+                  {
+                    "local": 3,
+                    "projections": []
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 156,
+                "col_start": 12,
+                "line_end": 156,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "StorageLive": 5
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::hint::black_box::<u8>",
+            "args": [
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "ploss_adv/h2_raw_const.rs",
+              "line_start": 157,
+              "col_start": 12,
+              "line_end": 157,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 6692626837626329215,
+              "def_index": 1562,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 6692626837626329215,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 158,
+                "col_start": 15,
+                "line_end": 158,
+                "col_end": 17
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 158,
+                "col_start": 4,
+                "line_end": 158,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 8,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 2,
+            "span": {
+              "file": "ploss_adv/h2_raw_const.rs",
+              "line_start": 158,
+              "col_start": 4,
+              "line_end": 158,
+              "col_end": 20
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 7
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 158,
+                "col_start": 4,
+                "line_end": 158,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitXor",
+                  {
+                    "Move": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 158,
+                "col_start": 4,
+                "line_end": 158,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageDead": 3
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

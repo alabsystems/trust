@@ -998,6 +998,9 @@ dependencies = [
 
                     [dependencies]
                     dep1 = {{ git = '{url}', {ref_kind} = '{git_ref}' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
             ),
         )
@@ -1009,7 +1012,7 @@ dependencies = [
         .with_stderr_data(format!(
             "\
 [UPDATING] git repository `[ROOTURL]/dep1`
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] dep1 v0.5.0 ([ROOTURL]/dep1?{ref_kind}={encoded_ref}#[..])
 [CHECKING] dep1 v0.5.0 ([ROOTURL]/dep1?{ref_kind}={encoded_ref}#[..])
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -1093,6 +1096,9 @@ dependencies = [
 
                     [dependencies]
                     dep1 = {{ git = '{url}', {ref_kind} = '{git_ref}' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
             ),
         )
@@ -1104,7 +1110,7 @@ dependencies = [
         .with_stderr_data(format!(
             "\
 [UPDATING] git repository `[ROOTURL]/dep1`
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] dep1 v0.5.0 ([ROOTURL]/dep1?{ref_kind}={encoded_ref}#[..])
 [CHECKING] dep1 v0.5.0 ([ROOTURL]/dep1?{ref_kind}={encoded_ref}#[..])
 [CHECKING] foo v0.0.1 ([ROOT]/foo)

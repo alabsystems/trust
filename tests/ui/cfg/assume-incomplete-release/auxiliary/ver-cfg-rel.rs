@@ -7,7 +7,7 @@ use std::str::FromStr;
 // against `RustcVersion::CURRENT` (`compiler/rustc_ast/src/attr/version.rs`),
 // which bootstrap fills from `CFG_RELEASE` = `src/rust-compat-version`.
 // Trust's own product version in `src/version` is a different numbering
-// entirely (0.1.0 vs 1.99.0), and reading it here builds `cfg(version(..))`
+// entirely (0.x vs 1.x), and reading it here builds `cfg(version(..))`
 // gates around the wrong number — `-1` underflows to the unparseable
 // "0.-1.0" and `+1`/`+2` land below the real release, so every relative gate
 // resolves backwards. Same redirect, same reason, as

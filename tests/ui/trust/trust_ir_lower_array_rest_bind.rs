@@ -7,9 +7,9 @@
 // `VarRef(unbound)` (34 sole-tag bodies; subslice-patterns-const-eval
 // alone carries 12). `BindNode::ArrayRest` now models it: prefix
 // subplans bind at `0..np`, suffix at `n-ns..n` (n resolved from the
-// mapped arity at EMIT time — the pattern alone cannot know it), and a
-// by-value `x @ ..` middle binds a fresh tuple built with the
-// tuple-literal seed+InsertField machinery. `ref x @ ..` and an EMPTY
+// mapped length at EMIT time — the pattern alone cannot know it), and a
+// by-value `x @ ..` middle binds a fresh `Ty::Array` built with the
+// element-op seed+InsertElement machinery. `ref x @ ..` and an EMPTY
 // bound middle stay fail-closed. TWO integration traps recorded: the
 // `Action::LetDestructure` guard pattern-matched `BindNode::Fields`
 // specifically (a new variant must join it or the whole lane is dead

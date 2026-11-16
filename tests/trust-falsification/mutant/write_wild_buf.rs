@@ -16,6 +16,6 @@ unsafe extern "C" {
 /// A literal null buffer with a non-zero count — the summary's buf-nonnull
 /// demand is the ONLY thing standing between this and a false PROVE.
 pub fn null_write(fd: i32) -> isize {
-    // SAFETY: none — this is the mutant; the null `buf` is the injected bug.
+    // UNSOUND, deliberately: this is the mutant; the null `buf` is the injected bug.
     unsafe { write(fd, ptr::null(), 1) }
 }

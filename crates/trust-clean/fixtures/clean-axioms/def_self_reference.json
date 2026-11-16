@@ -1,0 +1,1 @@
+{"term": {"Const": "x"}, "context": [{"name": "x", "entry": {"Definition": {"ty": {"Sort": 0}, "value": {"Const": "x"}}}}]}

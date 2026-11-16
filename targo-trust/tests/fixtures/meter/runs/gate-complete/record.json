@@ -1,0 +1,81 @@
+{
+ "schema": "trust-land-gate/2",
+ "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+ "changed": 1,
+ "profile": "development",
+ "legs": {
+  "push-rows": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "NOT JUDGED (fresh stated landing required)",
+   "reason": "fixture: the stated landing is not fresh"
+  },
+  "tidy": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "NOT RUN (explicit development profile; full diagnostic selection retained)"
+  },
+  "tcb-panic-ratchet": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "PASS",
+   "rc": 0,
+   "seconds": 80.6,
+   "log": "/dev/null"
+  },
+  "ir-cohort": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "PASS",
+   "rc": 0,
+   "seconds": 38.9,
+   "log": "/dev/null"
+  }
+ },
+ "seconds": 1629.6,
+ "checkout_checks": [
+  {
+   "boundary": "before legs",
+   "seconds": 76.966226
+  },
+  {
+   "boundary": "before push-rows",
+   "seconds": 73.083581
+  },
+  {
+   "boundary": "before final record",
+   "seconds": 68.866771
+  }
+ ],
+ "split_keys": {},
+ "checkout_startup": {
+  "python_seconds": 0.023644,
+  "native_seconds": 7.173539,
+  "native": "unavailable"
+ }
+}

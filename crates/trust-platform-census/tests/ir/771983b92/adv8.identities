@@ -1,0 +1,9 @@
+# Identities for 771983b92/adv8.trust_ir (held, platform-pass L0): ../adv8.identities as it
+# was when this dump was current.
+# Identities for adv8.trust_ir: the review of census/c0's real stage1 dump
+# of adv8.rs (the drop gate's control). Conventions: census_shapes.identities.
+body adv_owned_implicit pub
+spawners
+product-census
+effects adv_owned_implicit 5:23=fork 8:39=fcntl 10:30=std::os::fd::FromRawFd::from_raw_fd 10:64=dup 12:17=execv 12:42=_exit
+drops adv_owned_implicit std::os::fd::OwnedFd

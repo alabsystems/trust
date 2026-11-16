@@ -45,7 +45,19 @@
 # binary is exactly as useless as an absent one and is the failure mode a
 # `[ -f ]` test cannot see. So every entry is EXECUTED with a bounded probe
 # ladder (`--version`, `-V`, `--help`) and must exit 0 with output on at least
-# one rung.
+# one rung. Targo instead must accept its own `--unverified --version` surface:
+# upstream Cargo renamed to targo can answer the generic probes and delegate
+# `trust doctor` to a sibling targo-trust without implementing Targo's lanes.
+#
+# Running is not enough either: a STOCK program under a Trust name runs fine.
+# Every Trust tool that descends from a stock program (trustc, targo, trustfmt,
+# tippy, trust-analyzer, ...; TRUST_TOOLCHAIN_BRANDED_PUBLIC_BINS in
+# scripts/lib/trust_toolchain_surface.sh) must name itself on the first line of
+# its `--version` STANDARD OUTPUT (stderr is not read: Cargo warns there before
+# its banner), and one that prints the stock name is refused as NOT THE TRUST
+# BUILD, never waived by --allow-missing. The banner is self-reported, so this
+# refuses an unmodified stock artifact, not a wrapper that rewrites the banner
+# (docs/trust-naming.md, "What The Banner Check Does Not Establish").
 #
 # Exit: 0 contract satisfied (possibly degraded-but-declared)
 #       1 contract VIOLATED
@@ -63,6 +75,7 @@ ALLOW_MISSING_BACKEND=${TRUST_VERIFY_ALLOW_MISSING_BACKEND:-}
 CHECK_FORBIDDEN=1
 CHECK_ALIASES=1
 SYSROOT=
+RESOURCE_RECEIPT=
 
 EXE=
 case "${OS:-}$(uname -s 2>/dev/null || true)" in
@@ -88,6 +101,7 @@ Options:
   --no-forbidden-check      Skip the stock/retired-name check.
   --no-alias-check          Skip the rustc==trustc / cargo==targo byte-identity check.
   --probe-timeout=SECONDS   Per-binary probe budget (default 30).
+  --resource-receipt=PATH   Write the native Targo discovery receipt exclusively.
   --list                    Print the derived required set with evidence, exit 0.
   -h, --help                This message.
 
@@ -122,7 +136,7 @@ required_set() {
 1|ty|bin|discharge temporal / TLA+ obligations; aterm's L0 pre-push gate shells straight out to this binary|tool.rs:858 install_bin(ty); gate l2_backend_enabled(tools,"ty") && first-party/ty/crates/tla-cli/Cargo.toml|l2
 1|clean|bin|re-check any CIC certificate or higher-order proof|tool.rs:885 install_bin(clean); gate l2_backend_enabled(tools,"clean") && first-party/clean/crates/clean/Cargo.toml|l2
 2|rustc|bin|be selected by tools that spawn `rustc` by name|compile.rs:2070 bindir.join(exe("rustc")); byte-identical same-surface alias of trustc|compiler
-2|cargo|bin|be registered by rustup at all — rustup refuses a toolchain with no `cargo` entrypoint|tool.rs:1035 upstream_compat_bin_for_tool_source: the single retained upstream alias|alias
+2|cargo|bin|answer `cargo` itself — without it rustup's proxy runs ANOTHER toolchain's stock Cargo (docs/trust-naming.md)|tool.rs upstream_compat_bin_for_tool_source: the `targo` artifact installed a second time, the single retained upstream Cargo alias|alias
 2|targo|bin|drive any package build|tool.rs:785 install_bin(targo)|tools
 2|targo-trust|bin|run `targo trust` — the verifier frontend|tool.rs:801 install_bin(targo-trust)|tools
 2|trustd|bin|start the coordination daemon `targo trust` spawns on demand|tool.rs:807 install_bin(trustd), unconditional inside the targo-trust block, same-sysroot by design|alias
@@ -220,8 +234,42 @@ in_csv_list() {
 #   0 = present and demonstrably runnable
 #   1 = present but broken (zero-byte, not executable, every probe failed)
 #   2 = absent
+#   3 = present and runnable, but NOT THE TRUST BUILD of this name: the first
+#       line of its `--version` stdout is not its Trust banner
+#       (trust_toolchain_identity_error)
 # Prints its own diagnosis.
 # ---------------------------------------------------------------------------
+report_not_trust_build() {
+    printf '  NOT-TRUST %-30s %s\n' "$1" "$2"
+    printf '            Its banner is not the Trust banner: typically a stock program under a\n'
+    printf '            Trust name. Rebuild this tool from this tree; a stale artifact in a\n'
+    printf '            stage tools directory is the usual source.\n'
+}
+
+# Run one identity probe with standard output and standard error kept apart,
+# and set _vout (stdout), _verr (the first stderr line) and _vrc (exit status).
+# Identity is read from stdout alone. Every Trust banner is printed there
+# (measured with 2>/dev/null on seal trust-7d5533b2, 2026-09-30: trustc,
+# trustdoc, targo, `targo --unverified --version`, trustfmt, targo-fmt, tippy,
+# targo-tippy, tippy-driver and trust-analyzer), while Cargo prints its
+# configuration warnings to stderr BEFORE its banner: an unused key in a
+# .cargo/config.toml in the working directory or any parent, or a CARGO_HOME
+# holding both `config` and `config.toml`. Merged with 2>&1, that warning was
+# the first line, and the genuine targo was refused as a stock program.
+# Stderr is kept only to explain a failure.
+probe_identity_output() {
+    _vpath=$1
+    shift
+    _vout=$(run_bounded "$PROBE_TIMEOUT" "$_vpath" "$@" 2>"$PROBE_STDERR_FILE") && _vrc=0 || _vrc=$?
+    _verr=$(sed -n '1p' "$PROBE_STDERR_FILE" | cut -c1-100)
+}
+
+report_probe_stderr() {
+    if [ -n "$_verr" ]; then
+        printf '            stderr: %s\n' "$_verr"
+    fi
+}
+
 probe_binary() {
     _name=$1
     _loc=$2
@@ -259,6 +307,64 @@ probe_binary() {
     if [ "$_loc" = libexec ]; then
         printf '  OK(shape) %-30s (%s bytes; stdio-protocol server, not CLI-probed)\n' \
             "$_name" "$(wc -c <"$_path" | tr -d ' ')"
+        return 0
+    fi
+
+    # Trust's lane selector belongs to Targo itself. Neither its filename nor
+    # successful subcommand delegation distinguishes it from renamed Cargo.
+    # Keep this a mandatory bounded behavior probe: generic help/version may
+    # not rescue an artifact that rejects the explicit lane selector.
+    if [ "$_name" = targo ]; then
+        probe_identity_output "$_path" --unverified --version
+        if [ "$_vrc" -eq 0 ] && [ -n "$_vout" ]; then
+            if _identity=$(trust_toolchain_identity_error "$_name" "$_vout"); then
+                report_not_trust_build "$_name" "$_identity"
+                return 3
+            fi
+            printf '  OK        %-30s --unverified --version -> %s\n' \
+                "$_name" "$(printf '%s' "$_vout" | head -n 1 | cut -c1-72)"
+            _python=${TRUST_TOOLCHAIN_PYTHON3:-python3}
+            if ! command -v "$_python" >/dev/null 2>&1; then
+                printf '  BROKEN    targo resource discovery requires Python 3\n'
+                return 1
+            fi
+            if [ -n "$RESOURCE_RECEIPT" ]; then
+                "$_python" -I -S -B "$REPO_ROOT/scripts/qualify_targo_resource.py" \
+                    --sysroot "$SYSROOT" --receipt "$RESOURCE_RECEIPT" || return 1
+            else
+                "$_python" -I -S -B "$REPO_ROOT/scripts/qualify_targo_resource.py" \
+                    --sysroot "$SYSROOT" || return 1
+            fi
+            return 0
+        fi
+        printf '  BROKEN    %-30s (Targo lane probe --unverified --version exited %s or printed nothing on stdout)\n' \
+            "$_name" "$_vrc"
+        report_probe_stderr
+        printf '            Rebuild Targo itself; generic version/help and delegated trust commands do not establish its lane surface.\n'
+        return 1
+    fi
+
+    # A Trust tool with a stock ancestor must answer `--version` itself, with
+    # its Trust name: no other rung can rescue it, because a stock program under
+    # this name answers every rung.
+    if in_csv_list "$_name" "$TRUST_TOOLCHAIN_BRANDED_PUBLIC_BINS"; then
+        probe_identity_output "$_path" --version
+        if [ "$_vrc" -eq 125 ]; then
+            printf '  ERROR     %-30s (no timeout/gtimeout/perl available to bound the probe)\n' "$_name"
+            return 1
+        fi
+        if [ "$_vrc" -ne 0 ] || [ -z "$_vout" ]; then
+            printf '  BROKEN    %-30s (RUNS BUT FAILS: --version exited %s or printed nothing on stdout)\n' \
+                "$_name" "$_vrc"
+            report_probe_stderr
+            return 1
+        fi
+        if _identity=$(trust_toolchain_identity_error "$_name" "$_vout"); then
+            report_not_trust_build "$_name" "$_identity"
+            return 3
+        fi
+        printf '  OK        %-30s --version -> %s\n' \
+            "$_name" "$(printf '%s' "$_vout" | head -n 1 | cut -c1-72)"
         return 0
     fi
 
@@ -358,6 +464,7 @@ while [ $# -gt 0 ]; do
         --allow-missing-backend=*)
             ALLOW_MISSING_BACKEND="${ALLOW_MISSING_BACKEND:+$ALLOW_MISSING_BACKEND,}${1#--allow-missing-backend=}" ;;
         --probe-timeout=*) PROBE_TIMEOUT="${1#--probe-timeout=}" ;;
+        --resource-receipt=*) RESOURCE_RECEIPT="${1#--resource-receipt=}" ;;
         --no-forbidden-check) CHECK_FORBIDDEN=0 ;;
         --no-alias-check) CHECK_ALIASES=0 ;;
         --) shift; break ;;
@@ -409,9 +516,27 @@ printf '  probes bounded by %s (%ss)\n\n' "$TIMEOUT_KIND" "$PROBE_TIMEOUT"
 FAILURES=0
 DEGRADED=0
 WAIVED=0
+# The shared surface library carries the forbidden-name inventory, the
+# same-surface alias check and the Trust identity check the probes below use.
+# Single source: the repo already owns these inventories and
+# scripts/check_toolchain_coherence.py enforces that the forbidden one stays
+# coherent with bootstrap.py. Re-listing them here would create exactly the
+# duplicate-that-drifts this repo has been bitten by before. Without it this
+# script cannot check any tool's Trust banner, so it cannot run the contract at
+# all.
+if [ ! -f "$SURFACE_LIB" ]; then
+    printf 'verify-toolchain: %s not found.\n' "$SURFACE_LIB" >&2
+    printf 'DETAIL: without it no probe can check a tool'"'"'s Trust banner; refusing to\n' >&2
+    printf '        report a contract it did not check.\n' >&2
+    exit 2
+fi
+# shellcheck source=/dev/null
+. "$SURFACE_LIB"
+
 CANNOT_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-toolchain.cannot.XXXXXX")
 FAIL_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-toolchain.fail.XXXXXX")
-trap 'rm -f "$CANNOT_FILE" "$FAIL_FILE"' EXIT INT TERM
+PROBE_STDERR_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-toolchain.stderr.XXXXXX")
+trap 'rm -f "$CANNOT_FILE" "$FAIL_FILE" "$PROBE_STDERR_FILE"' EXIT INT TERM
 
 for tier in 1 2; do
     if [ "$tier" = 1 ]; then
@@ -458,6 +583,10 @@ for tier in 1 2; do
                 printf '            --allow-missing-backend=%s waives ABSENCE, not BREAKAGE.\n' "$name"
                 printf '            A backend that is present but does not run is a build defect.\n'
             fi
+            if [ "$status" -eq 3 ]; then
+                printf 'IDENTITY: %s (tier 1) is not the Trust build of %s\n' "$name" "$name" >>"$FAIL_FILE"
+                continue
+            fi
             if [ "$status" -eq 2 ]; then
                 explain_absence "$name" "$gate"
             else
@@ -474,6 +603,10 @@ for tier in 1 2; do
             printf 'WAIVED: %s\n' "$name" >>"$CANNOT_FILE"
             continue
         fi
+        if [ "$status" -eq 3 ]; then
+            printf 'IDENTITY: %s (tier 2) is not the Trust build of %s\n' "$name" "$name" >>"$FAIL_FILE"
+            continue
+        fi
         if [ "$status" -eq 2 ]; then
             explain_absence "$name" "$gate"
         else
@@ -487,18 +620,6 @@ done
 # The alias pairs are same-surface copies. A stale or divergent `rustc` is a
 # real and silent failure: tooling that spawns `rustc` by name gets a different
 # compiler than `trustc`.
-if [ -f "$SURFACE_LIB" ]; then
-    # Single source: the repo already owns this inventory and
-    # scripts/check_toolchain_coherence.py enforces that it stays coherent with
-    # bootstrap.py. Re-listing forbidden names here would create exactly the
-    # duplicate-that-drifts this repo has been bitten by before.
-    # shellcheck source=/dev/null
-    . "$SURFACE_LIB"
-else
-    printf '\nNOTE: %s not found — alias and forbidden-name checks skipped.\n' "$SURFACE_LIB"
-    CHECK_ALIASES=0
-    CHECK_FORBIDDEN=0
-fi
 
 # The alias check canonicalizes paths through the shared library, which needs a
 # Python 3. Say so rather than reporting a false BROKEN.

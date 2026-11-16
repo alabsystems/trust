@@ -13,9 +13,11 @@ import subprocess
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+UTC = timezone.utc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SAMPLE = Path("examples/full_verifier_three_suite.rs")
@@ -1414,10 +1416,6 @@ def discover_stage2_tools(root: Path, tools: Sequence[str]) -> dict[str, Path]:
     if missing:
         raise Stage2ToolDiscoveryError(missing)
     return found
-
-
-def discover_stage2_tool(root: Path, tool: str) -> Path:
-    return discover_stage2_tools(root, (tool,))[tool]
 
 
 def stage2_tool_blockers(exc: Stage2ToolDiscoveryError) -> list[dict[str, Any]]:

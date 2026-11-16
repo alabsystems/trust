@@ -1,4 +1,3 @@
-//@ ignore-test (red until the `def_path_data_namespace` narrowing is COMPILED — see below)
 //@ needs-trust-verify
 //@ compile-flags: -Ztrust-verify=on --crate-type lib
 //@ dont-check-compiler-stderr
@@ -40,14 +39,15 @@
 //! `pub mod f` + `pub fn f` are the ones to check if this file is ever "fixed"
 //! by weakening the index further.
 //!
-//! WHY IGNORED, and what un-ignores it. The narrowing that makes this green is a
-//! `trustc` source change, and it has NOT been compiled — `x.py` was not
-//! available to its author, and the two states above were measured on a `trustc`
-//! that still has `MacroNs` in the index. Landing this file live today would put
-//! a knowingly-red test in the suite, which is its own defect. Delete the
-//! `ignore-test` line in the same commit as the first `x.py build` that includes
-//! the narrowing; if it is then still red, the narrowing did not take and the
-//! narrowing — not this file — is what is wrong.
+//! LIVE since 2026-09-27. This file shipped `//@ ignore-test` because the
+//! narrowing that makes it green (`d298c1229c1`, 2026-08-21) had never been
+//! compiled — `x.py` was not available to its author — and its instruction was to
+//! delete that line in the first `x.py build` that included it. That step was
+//! never taken: every stage1 built for five weeks contained the narrowing, and
+//! nobody re-ran this file to notice. Re-run on a stage1 at `49d76d46097`: green, and
+//! the diagnostic names `…_macro_shadow::increment`, not `…::increment#ns0v`, so
+//! the annotation below is discriminating rather than passing by accident. If it
+//! goes red again, the narrowing regressed — not this file.
 //!
 //! CHECK THE SIBLING PROBE IN THE SAME BUILD. `DefKind::ExternCrate` is the same
 //! defect in a namespace with no fixture of its own: `#![no_std] extern crate

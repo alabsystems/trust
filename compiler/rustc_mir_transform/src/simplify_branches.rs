@@ -2,6 +2,7 @@ use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use tracing::trace;
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 pub(super) enum SimplifyConstCondition {
@@ -22,21 +23,28 @@ impl<'tcx> crate::MirPass<'tcx> for SimplifyConstCondition {
         }
     }
 
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(true)
+    }
+
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         trace!("Running SimplifyConstCondition on {:?}", body.source);
-        let typing_env = body.typing_env(tcx);
-        let mut patch = MirPatch::new(body);
+        let mut typing_env = None;
+        let mut patch = MirPatch::new_without_block_cache(body);
 
         fn try_get_const<'tcx, 'a>(
             operand: &'a Operand<'tcx>,
-            has_place_const: Option<(Place<'tcx>, &'a ConstOperand<'tcx>)>,
+            prev_stmt: Option<&'a Statement<'tcx>>,
         ) -> Option<&'a ConstOperand<'tcx>> {
             match operand {
                 Operand::Constant(const_operand) => Some(const_operand),
-                // `has_place_const` must be the LHS of the previous statement.
-                // Soundness: There is nothing can modify the place, as there are no statements between the two statements.
+                // `prev_stmt` is the immediately preceding statement in the same basic block.
+                // Soundness: There is nothing that can modify the place, as there are no statements between the two statements.
                 Operand::Copy(place) | Operand::Move(place)
-                    if let Some((place_const, const_operand)) = has_place_const
+                    if let Some(stmt) = prev_stmt
+                        && let StatementKind::Assign(ref assign) = stmt.kind
+                        && let (place_const, Rvalue::Use(Operand::Constant(ref const_operand), _)) =
+                            **assign
                         && place_const == *place =>
                 {
                     Some(const_operand)
@@ -46,14 +54,13 @@ impl<'tcx> crate::MirPass<'tcx> for SimplifyConstCondition {
         }
 
         'blocks: for (bb, block) in body.basic_blocks.iter_enumerated() {
-            let mut pre_place_const: Option<(Place<'tcx>, &ConstOperand<'tcx>)> = None;
-
             for (statement_index, stmt) in block.statements.iter().enumerate() {
-                let has_place_const = pre_place_const.take();
                 // Simplify `assume` of a known value: either a NOP or unreachable.
                 if let StatementKind::Intrinsic(ref intrinsic) = stmt.kind
-                    && let NonDivergingIntrinsic::Assume(discr) = intrinsic
-                    && let Some(c) = try_get_const(discr, has_place_const)
+                    && let NonDivergingIntrinsic::Assume(ref discr) = **intrinsic
+                    && let prev_stmt = statement_index.checked_sub(1).map(|i| &block.statements[i])
+                    && let Some(c) = try_get_const(discr, prev_stmt)
+                    && let typing_env = *typing_env.get_or_insert_with(|| body.typing_env(tcx))
                     && let Some(constant) = c.const_.try_eval_bool(tcx, typing_env)
                 {
                     if constant {
@@ -62,37 +69,31 @@ impl<'tcx> crate::MirPass<'tcx> for SimplifyConstCondition {
                         patch.patch_terminator(bb, TerminatorKind::Unreachable);
                         continue 'blocks;
                     }
-                } else if let StatementKind::Assign((lhs, ref rvalue)) = stmt.kind
-                    && let Rvalue::Use(Operand::Constant(c), _) = rvalue
-                {
-                    pre_place_const = Some((lhs, c));
                 }
             }
 
             let terminator = block.terminator();
             let terminator = match terminator.kind {
                 TerminatorKind::SwitchInt { ref discr, ref targets, .. }
-                    if let Some(c) = try_get_const(discr, pre_place_const.take())
+                    if let Some(c) = try_get_const(discr, block.statements.last())
+                        && let typing_env = *typing_env.get_or_insert_with(|| body.typing_env(tcx))
                         && let Some(constant) = c.const_.try_eval_bits(tcx, typing_env) =>
                 {
                     let target = targets.target_for_value(constant);
-                    TerminatorKind::Goto { target }
+                    TerminatorKind::goto(target)
                 }
                 TerminatorKind::Assert { target, ref cond, expected, .. }
-                    if let Some(c) = try_get_const(&cond, pre_place_const.take())
+                    if let Some(c) = try_get_const(cond, block.statements.last())
+                        && let typing_env = *typing_env.get_or_insert_with(|| body.typing_env(tcx))
                         && let Some(constant) = c.const_.try_eval_bool(tcx, typing_env)
                         && constant == expected =>
                 {
-                    TerminatorKind::Goto { target }
+                    TerminatorKind::goto(target)
                 }
                 _ => continue,
             };
             patch.patch_terminator(bb, terminator);
         }
         patch.apply(body);
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }

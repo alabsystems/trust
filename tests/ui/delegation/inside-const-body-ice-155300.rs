@@ -1,16 +1,19 @@
-#![feature(min_generic_const_args)]
+#![feature(gca_min_const_items)]
 #![feature(fn_delegation)]
+
+use std::gca;
 
 pub struct S<const N: usize>;
 
 impl
     S<
-        { //~ ERROR: complex const arguments must be placed inside of a `const` block
+        gca!({
+            //~^ ERROR: complex const arguments must be placed inside of a `const` block
             fn foo() {}
             reuse foo::<> as bar;
             reuse bar;
             //~^ ERROR: the name `bar` is defined multiple times
-        },
+        }),
     >
 {
 }

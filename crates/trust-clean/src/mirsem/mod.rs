@@ -7483,9 +7483,12 @@ impl SliceIndexPartialCertificate {
 // analogue of obligation (III) (the ghost counter has no MIR `CheckedAdd`; minting a
 // discharge with no corresponding MIR assert would be claim inflation). NO MIR assert is
 // discharged by this certificate: sum_loop's `Overflow(Add)` on `acc+*x` and count_pos's
-// `Overflow(Add)` on `c+1` both ride the HAVOCKED accumulator channel, stay open safety
-// VCs, so `function_safety_vcs_all_discharged(func)=false` for both exemplars,
-// termination is NOT minted, and no reach-Return claim is made.
+// `Overflow(Add)` on `c+1` both ride the HAVOCKED accumulator channel in the ghost model.
+// Whether termination is minted is decided by vcgen's OWN rows, through
+// `function_safety_vcs_all_discharged(func)`: false for sum_loop (a reachable signed
+// overflow), so no reach-Return claim is made; true for count_pos since vcgen's slice
+// trip-count bound (`371552d454`) refutes its bounded-counter row, so its termination
+// half IS minted, conditional on P-ITER-COUNT.
 //
 // FENCE COMPLIANCE BY CONSTRUCTION: the projected model mentions ONLY `Var(i_ghost)` and
 // `Var(n_ghost)` — no IterRegion / IterHasNext / SemAdtReturn / call_result is
@@ -7635,7 +7638,10 @@ pub const P_ADDR_REFINE_CONTRACT: &str = "at a D4-recognized whole-slice mint \
 /// the iteration count — overflow INFEASIBLE) no longer surfaces sum_loop's REACHABLE
 /// `s=[i32::MAX,1]` panic as its own overflow evidence (the honesty defect the claim-surface
 /// adversarial verdict refuted). It flips NO verdict/cluster/funnel bit — it selects
-/// certificate TEXT only, and the VC stays OPEN/undischarged in every case.
+/// certificate TEXT only. Whether the VC is DISCHARGED is decided elsewhere, by
+/// `prove::function_safety_vcs_all_discharged` over vcgen's own row: since vcgen's slice
+/// trip-count bound (`371552d454`) count_pos's row refutes modulo 3 and sum_loop's does not
+/// (`prove::tests::w2_iter_loop_positive_controls_partial_tier`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccumulatorOverflowShape {
     /// A SIGNED value-accumulator whose in-loop `CheckedAdd` adds a NON-constant (element)
@@ -7645,9 +7651,11 @@ pub enum AccumulatorOverflowShape {
     /// An UNSIGNED accumulator whose in-loop `CheckedAdd` is a `+ 1` counter — e.g.
     /// count_pos's `c += 1` over `usize`. Its value is bounded by the iteration count
     /// (`≤ isize::MAX < usize::MAX`), so the `Overflow(Add)` VC is INFEASIBLE on this
-    /// function (`count_pos(&[i32::MAX,1])` returns `2` and reaches `Return`); it stays
-    /// undischarged ONLY because the value channel is havocked, NOT because a reachable
-    /// panic exists.
+    /// function (`count_pos(&[i32::MAX,1])` returns `2` and reaches `Return`). THIS lane
+    /// cannot discharge it — its value channel is havocked — but vcgen's own row for it
+    /// refutes modulo 3 once vcgen conjoins its slice trip-count bound (`371552d454`), and
+    /// that is what moves count_pos to the conditional-total tier (see
+    /// [`IterLoopPartialCertificate::termination`]).
     BoundedUnsignedCounter,
     /// Any other accumulator shape (a signed `+1` counter, an unsigned value-accumulator,
     /// or no recognized `CheckedAdd` update found). CONSERVATIVE: the VC is
@@ -7761,8 +7769,10 @@ pub struct IterCountPremiseWitness {
 /// There is NO bounds-assert discharge field (no `BoundsCheck` assert exists in the
 /// for-desugar caller) and NO counter-overflow discharge field (the ghost counter has no
 /// MIR `CheckedAdd`) — those obligations DO NOT EXIST here, so their fields are ABSENT (a
-/// vacuous guard→guard instance would be claim inflation). NO MIR assert is discharged:
-/// the accumulator-overflow assert rides the havocked channel and stays OPEN.
+/// vacuous guard→guard instance would be claim inflation). NO MIR assert is discharged BY
+/// THIS CERTIFICATE: the accumulator-overflow assert rides the havocked channel here, and
+/// only the function's own safety-VC gate (over vcgen's rows) can clear it — which is what
+/// [`Self::termination`] is gated on.
 #[derive(Debug, Clone)]
 pub struct IterLoopPartialCertificate {
     /// The ghost-counter-projected loop this certifies.
@@ -7773,9 +7783,14 @@ pub struct IterLoopPartialCertificate {
     /// The TERMINATION half (loopRankTerminates + loopTotalCorrect, rank `toNat(n−i)`).
     /// `Some(verdict)` ONLY when `total_available` was true at mint time (the function's
     /// safety VCs are all discharged — the mandatory termination gate); `None` for the
-    /// PARTIAL tier. For sum_loop/count_pos this is ALWAYS `None` (their accumulator
-    /// overflow VCs are open), and even a future all-VCs-discharged run leaves termination
-    /// conditional on P-ITER-COUNT's None-at-n direction (the tier claim says so).
+    /// PARTIAL tier. sum_loop's is `None`: its signed value-accumulator overflow has a
+    /// reachable falsifier and its VC stays open. count_pos's is `Some(ProvenModulo3)`
+    /// since vcgen's slice trip-count bound (`371552d454`) made its bounded-counter
+    /// overflow VC refute modulo 3 — the flip
+    /// `w2_termination_flip_available_when_safety_all_discharged` pins for `while_idx`, here
+    /// reached with the gate opening on its own. Either way
+    /// termination stays conditional on P-ITER-COUNT's None-at-n direction (the tier claim
+    /// says so).
     pub termination: Option<RefinementVerdict>,
     /// Trust: P-ITER-COUNT WITNESS DECORATION (2026-07-22) — the ADDITIVE, DIAGNOSTIC-ONLY
     /// per-link recognizer witness ([`IterCountPremiseWitness`]). `Some` ONLY when ALL
@@ -7795,7 +7810,8 @@ impl IterLoopPartialCertificate {
     }
 
     /// Whether a TERMINATION / total-correctness claim is being made (only under the
-    /// mandatory gate: full safety-VC discharge). Always `false` for sum_loop/count_pos.
+    /// mandatory gate: full safety-VC discharge). `false` for sum_loop; `true` for
+    /// count_pos (see [`Self::termination`]).
     #[must_use]
     pub fn termination_claimed(&self) -> bool {
         matches!(self.termination, Some(RefinementVerdict::ProvenModulo3))
@@ -7844,8 +7860,9 @@ impl IterLoopPartialCertificate {
     /// verdict refuted that as applied to count_pos (an `usize` accumulator with
     /// `c ≤ len ≤ isize::MAX < usize::MAX`, so `c+1` CANNOT overflow —
     /// `count_pos(&[i32::MAX,1])` returns `2` and REACHES `Return`). This selects the honest
-    /// clause per [`IterLoopFunction::accumulator_overflow`]. The `Overflow(Add)` VC stays
-    /// OPEN/undischarged in EVERY case — this flips no bit; only the falsifier TEXT differs.
+    /// clause per [`IterLoopFunction::accumulator_overflow`]. Only the PARTIAL tier reads it,
+    /// i.e. only when the function's safety-VC gate left some VC undischarged — this flips
+    /// no bit; only the falsifier TEXT differs.
     #[must_use]
     fn accumulator_overflow_clause(&self) -> &'static str {
         match self.function.accumulator_overflow {
@@ -7880,7 +7897,11 @@ impl IterLoopPartialCertificate {
              0≤i ∧ i≤n over the GHOST counter i, n=sliceLen(s)) + loopRankTerminates/\
              loopTotalCorrect (rank toNat(n−i)), modulo 3, UNDER the UNDISCHARGED premise \
              P-ITER-COUNT (still conditional on its None-at-n direction). NO MIR assert is \
-             discharged. The Some-payload/deref/accumulator value channel is HAVOCKED. The \
+             discharged BY THIS LANE: the termination half is minted only because the \
+             function's own safety-VC gate refuted EVERY safety VC modulo 3, the \
+             accumulator-overflow VC included, over the facts vcgen conjoins into those VCs \
+             (a loop trip-count bound among them). The Some-payload/deref/accumulator value \
+             channel is HAVOCKED in this lane's ghost model. The \
              ghost counter and the Some↔i<n guard bridge are recognizer-trust extensions of \
              the split-claim boundary."
                 .to_string()
@@ -8194,6 +8215,8 @@ pub use vc_faithful::*;
 pub(crate) mod opaque_fixtures;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod memory_image_tests;
 // ---------------------------------------------------------------------------
 // Trust: W6 CLOSURE-COMPOSITION recognizer tests (increment 1, 2026-07-18).
 // ---------------------------------------------------------------------------

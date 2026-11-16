@@ -3,6 +3,7 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
+//@ forbid-output: this function has no obligation of its own
 //! The POISON direction for `core::fmt::Write`, which
 //! `dyn_dispatch_reliance_open_sink_stays_closed.rs` CLAIMED in its title and
 //! never tested. Read that file's header first — it now says what it actually
@@ -64,3 +65,7 @@ impl fmt::Display for Tag {
         f.write_str("tag")
     }
 }
+
+// ZERO-ROW-GATE (2026-10-10): this rail must refuse for its OWN reason; a refusal by the
+// zero-row gate (whose note is forbidden here) would mean the gate under test regressed
+// into discharging and the zero-row gate masked it.

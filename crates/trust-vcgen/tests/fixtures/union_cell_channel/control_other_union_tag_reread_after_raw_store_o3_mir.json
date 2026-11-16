@@ -1,0 +1,2177 @@
+{
+  "name": "control_other_union_tag_reread_after_raw_store",
+  "def_path": "union_cell_channel::control_other_union_tag_reread_after_raw_store",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+    "line_start": 273,
+    "col_start": 0,
+    "line_end": 286,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "union_cell_channel::UT",
+            "fields": [
+              [
+                "e",
+                {
+                  "Adt": {
+                    "name": "core::option::Option",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ],
+                      [
+                        "__v1_0",
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "None",
+                        "discriminant": 0,
+                        "fields": []
+                      },
+                      {
+                        "name": "Some",
+                        "discriminant": 1,
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ]
+                      }
+                    ],
+                    "disc_index_safe": true,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Enum"
+                  }
+                }
+              ],
+              [
+                "c",
+                {
+                  "Adt": {
+                    "name": "core::mem::manually_drop::ManuallyDrop",
+                    "fields": [
+                      [
+                        "value",
+                        {
+                          "Adt": {
+                            "name": "core::mem::maybe_dangling::MaybeDangling",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Array": {
+                                    "elem": {
+                                      "Adt": {
+                                        "name": "core::cell::Cell",
+                                        "fields": [
+                                          [
+                                            "value",
+                                            {
+                                              "Adt": {
+                                                "name": "core::cell::UnsafeCell",
+                                                "fields": [
+                                                  [
+                                                    "value",
+                                                    {
+                                                      "Int": {
+                                                        "width": 32,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false,
+                                                "faithful_enum_repr": null,
+                                                "layout": null,
+                                                "enum_layout": null,
+                                                "adt_kind": "Struct"
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Struct"
+                                      }
+                                    },
+                                    "len": 2
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Union"
+          }
+        },
+        "name": "u"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "union_cell_channel::UT",
+            "fields": [
+              [
+                "e",
+                {
+                  "Adt": {
+                    "name": "core::option::Option",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ],
+                      [
+                        "__v1_0",
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "None",
+                        "discriminant": 0,
+                        "fields": []
+                      },
+                      {
+                        "name": "Some",
+                        "discriminant": 1,
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ]
+                      }
+                    ],
+                    "disc_index_safe": true,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Enum"
+                  }
+                }
+              ],
+              [
+                "c",
+                {
+                  "Adt": {
+                    "name": "core::mem::manually_drop::ManuallyDrop",
+                    "fields": [
+                      [
+                        "value",
+                        {
+                          "Adt": {
+                            "name": "core::mem::maybe_dangling::MaybeDangling",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Array": {
+                                    "elem": {
+                                      "Adt": {
+                                        "name": "core::cell::Cell",
+                                        "fields": [
+                                          [
+                                            "value",
+                                            {
+                                              "Adt": {
+                                                "name": "core::cell::UnsafeCell",
+                                                "fields": [
+                                                  [
+                                                    "value",
+                                                    {
+                                                      "Int": {
+                                                        "width": 32,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false,
+                                                "faithful_enum_repr": null,
+                                                "layout": null,
+                                                "enum_layout": null,
+                                                "adt_kind": "Struct"
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Struct"
+                                      }
+                                    },
+                                    "len": 2
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Union"
+          }
+        },
+        "name": "w"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "core::option::Option",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "None",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Some",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                },
+                "len": 2
+              }
+            }
+          }
+        },
+        "name": "p"
+      },
+      {
+        "index": 13,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Adt": {
+                "name": "core::mem::manually_drop::ManuallyDrop",
+                "fields": [
+                  [
+                    "value",
+                    {
+                      "Adt": {
+                        "name": "core::mem::maybe_dangling::MaybeDangling",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Array": {
+                                "elem": {
+                                  "Adt": {
+                                    "name": "core::cell::Cell",
+                                    "fields": [
+                                      [
+                                        "value",
+                                        {
+                                          "Adt": {
+                                            "name": "core::cell::UnsafeCell",
+                                            "fields": [
+                                              [
+                                                "value",
+                                                {
+                                                  "Int": {
+                                                    "width": 32,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                },
+                                "len": 2
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "core::mem::manually_drop::ManuallyDrop",
+                "fields": [
+                  [
+                    "value",
+                    {
+                      "Adt": {
+                        "name": "core::mem::maybe_dangling::MaybeDangling",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Array": {
+                                "elem": {
+                                  "Adt": {
+                                    "name": "core::cell::Cell",
+                                    "fields": [
+                                      [
+                                        "value",
+                                        {
+                                          "Adt": {
+                                            "name": "core::cell::UnsafeCell",
+                                            "fields": [
+                                              [
+                                                "value",
+                                                {
+                                                  "Int": {
+                                                    "width": 32,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                },
+                                "len": 2
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 18,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "core::option::Option",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "None",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Some",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::option::Option",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::option::Option<u32>"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 274,
+                "col_start": 20,
+                "line_end": 274,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "union_cell_channel::UT",
+                      "variant": 0,
+                      "active_field": 0,
+                      "args": "union_cell_channel::UT"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 4,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 274,
+                "col_start": 12,
+                "line_end": 274,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::option::Option",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::option::Option<u32>"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 275,
+                "col_start": 20,
+                "line_end": 275,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "union_cell_channel::UT",
+                      "variant": 0,
+                      "active_field": 0,
+                      "args": "union_cell_channel::UT"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 6,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 275,
+                "col_start": 12,
+                "line_end": 275,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "StorageLive": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 276,
+                "col_start": 7,
+                "line_end": 276,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        3,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 276,
+                "col_start": 7,
+                "line_end": 276,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+              "line_start": 276,
+              "col_start": 7,
+              "line_end": 276,
+              "col_end": 18
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 277,
+                "col_start": 15,
+                "line_end": 277,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "StorageDead": 7
+          }
+        ],
+        "terminator": {
+          "Goto": 16
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageDead": 8
+          },
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageLive": 9
+          },
+          {
+            "StorageLive": 10
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 279,
+                "col_start": 26,
+                "line_end": 279,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 10,
+                  "projections": [
+                    "Deref"
+                  ]
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 279,
+                "col_start": 17,
+                "line_end": 279,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                1,
+                4
+              ],
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 18,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "<home>/toolchains/trust-b58a105d/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+              "line_start": 430,
+              "col_start": 8,
+              "line_end": 430,
+              "col_end": 8
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/toolchains/trust-b58a105d/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+                "line_start": 432,
+                "col_start": 17,
+                "line_end": 432,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/toolchains/trust-b58a105d/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+                "line_start": 431,
+                "col_start": 38,
+                "line_end": 431,
+                "col_end": 42
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 9,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ]
+            ],
+            "otherwise": 7,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<home>/toolchains/trust-b58a105d/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+              "line_start": 430,
+              "col_start": 8,
+              "line_end": 433,
+              "col_end": 9
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "StorageDead": 10
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 280,
+                "col_start": 15,
+                "line_end": 280,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "StorageDead": 9
+          }
+        ],
+        "terminator": {
+          "Goto": 16
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "StorageDead": 10
+          },
+          {
+            "StorageDead": 9
+          },
+          {
+            "StorageLive": 12
+          },
+          {
+            "StorageLive": 13
+          },
+          {
+            "StorageLive": 14
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 5,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 282,
+                "col_start": 21,
+                "line_end": 282,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 14,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 282,
+                "col_start": 21,
+                "line_end": 282,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": true,
+                      "pointee": {
+                        "Array": {
+                          "elem": {
+                            "Int": {
+                              "width": 32,
+                              "signed": false
+                            }
+                          },
+                          "len": 2
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 282,
+                "col_start": 12,
+                "line_end": 282,
+                "col_end": 83
+              }
+            }
+          },
+          {
+            "StorageDead": 13
+          },
+          {
+            "StorageDead": 14
+          },
+          {
+            "StorageLive": 15
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 283,
+                "col_start": 18,
+                "line_end": 283,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 15,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 283,
+                "col_start": 13,
+                "line_end": 283,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 16,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 8,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+              "line_start": 283,
+              "col_start": 13,
+              "line_end": 283,
+              "col_end": 20
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": [
+                  "Deref",
+                  {
+                    "Index": 15
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      32
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 283,
+                "col_start": 13,
+                "line_end": 283,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "StorageDead": 15
+          },
+          {
+            "StorageLive": 17
+          },
+          {
+            "StorageLive": 18
+          },
+          {
+            "StorageLive": 19
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 284,
+                "col_start": 40,
+                "line_end": 284,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 19,
+                  "projections": [
+                    "Deref"
+                  ]
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 284,
+                "col_start": 31,
+                "line_end": 284,
+                "col_end": 46
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 20,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                1,
+                10
+              ],
+              [
+                0,
+                9
+              ]
+            ],
+            "otherwise": 18,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "<home>/toolchains/trust-b58a105d/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+              "line_start": 430,
+              "col_start": 8,
+              "line_end": 430,
+              "col_end": 8
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/toolchains/trust-b58a105d/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+                "line_start": 432,
+                "col_start": 17,
+                "line_end": 432,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 11
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/toolchains/trust-b58a105d/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+                "line_start": 431,
+                "col_start": 38,
+                "line_end": 431,
+                "col_end": 42
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 11
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 18,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                13
+              ]
+            ],
+            "otherwise": 12,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<home>/toolchains/trust-b58a105d/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+              "line_start": 430,
+              "col_start": 8,
+              "line_end": 433,
+              "col_end": 9
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "StorageDead": 19
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      1,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 284,
+                "col_start": 59,
+                "line_end": 284,
+                "col_end": 60
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 14
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "StorageDead": 19
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      5,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 284,
+                "col_start": 70,
+                "line_end": 284,
+                "col_end": 71
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 14
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "StorageDead": 18
+          },
+          {
+            "StorageLive": 21
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 17,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 285,
+                "col_start": 6,
+                "line_end": 285,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 285,
+                "col_start": 4,
+                "line_end": 285,
+                "col_end": 8
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 285,
+                "col_start": 4,
+                "line_end": 285,
+                "col_end": 8
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 23,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 15,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+              "line_start": 285,
+              "col_start": 4,
+              "line_end": 285,
+              "col_end": 8
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 21
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/union_cell_channel.rs",
+                "line_start": 285,
+                "col_start": 4,
+                "line_end": 285,
+                "col_end": 8
+              }
+            }
+          },
+          {
+            "StorageDead": 17
+          },
+          {
+            "StorageDead": 12
+          },
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 3
+          },
+          {
+            "StorageDead": 21
+          }
+        ],
+        "terminator": {
+          "Goto": 17
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 3
+          }
+        ],
+        "terminator": {
+          "Goto": 17
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 18,
+        "stmts": [],
+        "terminator": "Unreachable"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_11",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_11",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_20",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_20",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "v",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "v",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

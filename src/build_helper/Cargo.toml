@@ -8,6 +8,11 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", optional = true }
 serde_derive = { version = "1", optional = true }
+# Trust: the guards retain one canonical, independently packageable implementation.
+trust-build-tree = { path = "../../crates/trust-build-tree", version = "0.1.0" }
 
 [features]
 metrics = ["dep:serde", "dep:serde_derive"]
+machine-admission = ["trust-build-tree/machine-admission"]
+resident-inputs = ["trust-build-tree/resident-inputs"]
+native-exec = ["machine-admission", "trust-build-tree/native-exec"]

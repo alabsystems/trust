@@ -1,0 +1,83 @@
+# Known-red tests of `x.py test --stage 1 tests/ui/trust`, judged by
+# scripts/land_gate.py (judge_suite, the ui-trust leg) the way
+# scripts/check_trust_verify_suite_ratchet.sh judges a compiler crate's unit
+# suite: a failure NOT listed here fails the leg, and a listed test that ran and
+# PASSED fails it too until its row is deleted. One row per failing test or
+# revision, spelled exactly as compiletest's failures list prints it, then two
+# spaces, `#`, the owner and the reason. Delete a row in the commit that fixes it.
+#
+# Seeded 2026-10-14 by the landing of gates/trust-scale-select from the first
+# whole-suite run of this leg: origin/main dc7306be94's tree (the branch changes
+# no compiler, library or test file), stage 1 built in its own build dir with
+# Homebrew LLVM 22.1.7 and the atpkg Trust 9192 stage0; both Apple targets ran
+# (aarch64: 4497 passed, 5 failed, 25 ignored; x86_64: 4496 passed, 5 failed,
+# 26 ignored), the same five each. Every row is a red docs/KNOWN_HAZARDS.md
+# already records on main, cited per row.
+# The five rows seeded above were DELETED 2026-10-18 (the 1.101 toolchain
+# migration): all five capabilities measured returned on the 1.101 stage 1
+# with their discriminating siblings still refusing, and the tests were
+# flipped back to check-pass in the same change (plain_binaryop's
+# postconditions prove again; the SP-1 cost pair builds with its report;
+# Inventory::add and the sysroot_call_reach `add` build on the vanilla
+# absent-callee row over hashbrown 0.17's `rustc_entry`).
+#
+# Added 2026-10-15 from the landing's whole-suite run on origin/main b2260d8608's
+# tree (both targets, the same three each); the test passed on dc7306be94.
+# docs/KNOWN_HAZARDS.md VTABLE-DISCHARGE-RED-1 says what is and is not known.
+# DELETED 2026-10-18: all three revisions pass again on the 1.101 stage 1
+# in the migration's whole-suite run.
+#
+# Added 2026-10-18 (the 1.101 toolchain migration). KNOWN_HAZARDS
+# ADT-IMPL-DISCHARGE-1: the assume_total revocation still fires, but the
+# fully verified `t` now builds: its bundle reaches the dependency's
+# `Act2` impl through `Take::count`'s advance_by/try_fold chain without
+# bundling `Lw::next`, and the panic-freedom aggregate lands
+# runtime-checked instead of fail-closed. Whether the instance-hypothesis
+# discharge at that site is legitimate premise-query discharge or a spent
+# un-discharged hypothesis is for the OD-1 lane to adjudicate; the test
+# stays check-fail on purpose until then.
+# DELETED 2026-10-21: the completed-instance walk now refuses this edge and
+# its check-fail revision passes on both Apple targets. The complete 706-case
+# focused/broader standard-library configuration matrix passes on each target;
+# this retires only this UI exception, not the separate advisory corpus REDs.
+
+# DELETED 2026-10-27: the call-walk leaf now requires the canonical concrete
+# instance body check as well as the type-only screen. The unchanged check-fail
+# fixture additionally pins the call-reach refusal; its compiler qualification
+# must pass without a known-red exemption.
+
+# MAIN-TIP-PREEXISTING-20261020: clean_origin_select_beq_call_summary#crc_poly_mask
+# landed in 7aa69d2cf5a with its SelectBeqGeneral model and fails THE SAME
+# WAY at that main tip on the old pin (scratch, 2026-10-20): the % in the
+# caller ensures is refused as unmodeled fixed-width arithmetic. The other
+# four revisions pass on both pins. Owner: the SelectBeqGeneral/vcgen lane.
+# DELETED 2026-10-27: the frozen C6 full UI run passes this exact revision on
+# both Apple targets; the ratchet correctly rejects keeping its obsolete row.
+
+# MAIN-UI-BLIND-WINDOW-REDS-1 (2026-11-09, docs/DECISION_QUEUE.md): main's
+# long-standing ui/trust reds, classified but not fixed. Each is a LOST PROOF
+# (class b), not a false proof. The tests still state the proof they exist to
+# witness and are not re-pinned to the weaker verdict. All came with 8862c94337
+# (2026-11-02), which adopted trust-mc's operand-consumption guard (c88bca8d7,
+# 803cb0d51). The guard refuses a consumed value that has no initializedness
+# record:
+#   - an erased reference with no source-reference fact;
+#   - a bridge havoc (`FreshSymbolicHavoc`), scalar or aggregate
+#     (VEC-U8-GROW-HAVOC-GATE-1, POLY-RECURSION-SIZE-OF-VAL-1);
+#   - a partial-construction seed (BMC-LANE-1).
+# Owner: the trust-mc source-reference / call-summary lane. Delete a row in the
+# commit that makes its test pass. Main settled these, so they have no row:
+#   - the two native_bundle files (NATIVE-BUNDLE-NET-REMEASURE-1);
+#   - fn_bound_admitted_site_passes_strict (EMPTY-CLOSURE-REF-VALUE-1);
+#   - sysroot_call_reach_local_generic_controls
+#     (CONSUMER-FOREIGN-ITEM-REFUSAL-1);
+#   - e9_field_projection_discharge (E9-ODT-FACE-SELF-CALL-1);
+#   - postcondition_composition_attribute_at_call_site (E2-ZST-INACTIVE-LANE-1).
+[ui] tests/ui/trust/checked_return_enum_composition.rs  # trust-mc guard (8862c94337): `contradicts` refused, OperandConsumption + UnsupportedDirectCallSummary
+[ui] tests/ui/trust/instance_hypothesis/drop_glue_finite_nesting_discharge.rs#advisory  # trust-mc guard (8862c94337): `polymorphic_recursion_size` gains an unannotated L0 row; the bridge's fresh-symbolic `usize` result of the absent `size_of_val` is a scalar Undef the gate never transports (POLY-RECURSION-SIZE-OF-VAL-1)
+[ui] tests/ui/trust/instance_hypothesis/drop_glue_finite_nesting_discharge.rs#strict  # as #advisory
+[ui] tests/ui/trust/instance_hypothesis/drop_glue_finite_nesting_discharge.rs#certify  # as #advisory
+[ui] tests/ui/trust/return_const_summary_interposable_callee_not_summarised.rs#certify  # trust-mc guard (8862c94337): the CONTROL `unwrap_if_has_plain` is refused (13 OperandConsumption constructs)
+[ui] tests/ui/trust/vec_u8_extend_from_slice_seq_axiom.rs#pinned  # trust-mc guard (8862c94337) on the bridge grow summary's FreshSymbolicHavoc lengths and receiver havoc (VEC-U8-GROW-HAVOC-GATE-1): `grow` runtime-checked, 9 OperandConsumption constructs
+[ui] tests/ui/trust/vec_u8_extend_from_slice_under_live_alloc_axiom.rs#global  # as vec_u8_extend_from_slice_seq_axiom.rs#pinned, for `push_all`
+[ui] tests/ui/trust/vec_u8_grow_alloc_error_handler_declines.rs#plain  # as vec_u8_extend_from_slice_seq_axiom.rs#pinned

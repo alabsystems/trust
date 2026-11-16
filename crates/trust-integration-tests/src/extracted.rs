@@ -6,9 +6,10 @@
 //! extractor's output through these files instead of hand-transcribing the
 //! extracted shapes. Every semantic field is literal. The sole transport
 //! canonicalization is the compiler-version salt in the single synthetic
-//! crate's `CalleeIdentity::stable_crate_id`; identity presence, `def_index`,
-//! and `substs_digest` remain exact, and the extract-side gate refuses to
-//! collapse multiple crate identities.
+//! crate's `CalleeIdentity::stable_crate_id` and `CalleeKey::stable_crate_id`;
+//! both carriers' presence, `def_index`, `substs_digest`, and every other key
+//! fact remain exact. The extract-side gate refuses multiple crate identities
+//! or a disagreement between the two carriers.
 //!
 //! TRUSTWORTHINESS — the drift gate: the artifacts are REGENERATED, never
 //! hand-edited. trust-mir-extract's `extracted_*_artifact_matches_committed`

@@ -24,6 +24,12 @@
 //! certified carriers. Each negative revision falsifies exactly one clause so
 //! a missing carrier cannot pass vacuously.
 
+// Each mismatch revision compiles only the item(s) its assertion exercises;
+// `pass` still compiles and runs every item, so coverage is unchanged.
+// `not(test)` keeps every body in a harness-free build of this file: the trust-ir
+// producer scorecard compiles it as a plain lib with no revision cfg.
+
+#[cfg(any(pass, not(test), i8_mismatch))]
 fn signed_i8(x: i8) -> i8
     ensures result == x
 {
@@ -33,6 +39,7 @@ fn signed_i8(x: i8) -> i8
     x
 }
 
+#[cfg(any(pass, not(test), i16_mismatch))]
 fn signed_i16(x: i16) -> i16
     ensures result == x
 {
@@ -42,6 +49,7 @@ fn signed_i16(x: i16) -> i16
     x
 }
 
+#[cfg(any(pass, not(test), i32_mismatch))]
 fn signed_i32(x: i32) -> i32
     ensures result == x
 {
@@ -51,6 +59,7 @@ fn signed_i32(x: i32) -> i32
     x
 }
 
+#[cfg(any(pass, not(test), i64_mismatch))]
 fn signed_i64(x: i64) -> i64
     ensures result == x
 {
@@ -60,6 +69,7 @@ fn signed_i64(x: i64) -> i64
     x
 }
 
+#[cfg(any(pass, not(test), usize_mismatch))]
 fn pointer_unsigned(x: usize) -> usize
     ensures result == x
 {
@@ -69,6 +79,7 @@ fn pointer_unsigned(x: usize) -> usize
     x
 }
 
+#[cfg(any(pass, not(test), isize_mismatch))]
 fn pointer_signed(x: isize) -> isize
     ensures result == x
 {
@@ -78,6 +89,7 @@ fn pointer_signed(x: isize) -> isize
     x
 }
 
+#[cfg(any(pass, not(test), u128_mismatch))]
 fn wide_unsigned(x: u128) -> u128
     ensures result == x
 {
@@ -87,6 +99,7 @@ fn wide_unsigned(x: u128) -> u128
     x
 }
 
+#[cfg(any(pass, not(test), i128_mismatch))]
 fn wide_signed(x: i128) -> i128
     ensures result == x
 {
@@ -98,12 +111,20 @@ fn wide_signed(x: i128) -> i128
 
 #[test]
 fn every_extended_carrier_executes() {
+    #[cfg(any(pass, i8_mismatch))]
     assert_eq!(signed_i8(-7), -7);
+    #[cfg(any(pass, i16_mismatch))]
     assert_eq!(signed_i16(-700), -700);
+    #[cfg(any(pass, i32_mismatch))]
     assert_eq!(signed_i32(-70_000), -70_000);
+    #[cfg(any(pass, i64_mismatch))]
     assert_eq!(signed_i64(-7_000_000_000), -7_000_000_000);
+    #[cfg(any(pass, usize_mismatch))]
     assert_eq!(pointer_unsigned(11), 11);
+    #[cfg(any(pass, isize_mismatch))]
     assert_eq!(pointer_signed(-3), -3);
+    #[cfg(any(pass, u128_mismatch))]
     assert_eq!(wide_unsigned(u128::MAX - 1), u128::MAX - 1);
+    #[cfg(any(pass, i128_mismatch))]
     assert_eq!(wide_signed(i128::MIN + 1), i128::MIN + 1);
 }

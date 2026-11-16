@@ -31,7 +31,7 @@ workspace = true
 # trust #790: `trust-build` compiles historical native inspection/conformance
 # support against the first-party TrustWP crates. The public verifier remains
 # zero-capability and cannot authorize a verdict in either feature mode.
-trust-build = ["dep:trust-wp-core", "dep:trust-wp-ay", "dep:trust-ir"]
+trust-build = ["dep:trust-wp-core", "dep:trust-ir"]
 
 [dependencies]
 trust-types = { workspace = true }
@@ -43,5 +43,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 trust-wp-core = { workspace = true, optional = true }
-trust-wp-ay = { workspace = true, optional = true }
 trust-ir = { workspace = true, features = ["serde"], optional = true }

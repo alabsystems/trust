@@ -31,7 +31,7 @@
 //!   are **deliberately not** treated as forbidden. Although `734c12188e7`
 //!   deleted them, a later reviewed commit (`13916beab1d`) intentionally
 //!   re-created them as the live version-CLI / release-CLI skeleton; they are
-//!   referenced today by `crates/trust-release`, `crates/trust-deps`, and
+//!   referenced today by `crates/trust-release` and
 //!   `targo-trust/src/release_cli/gates.rs`. Flagging live config would make
 //!   this a gate rigged to *fail*, which is as dishonest as one rigged to pass.
 //!   The publication ledgers the audit actually forbade — `product-proof.toml`

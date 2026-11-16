@@ -1,0 +1,181 @@
+{
+ "name": "strict_mul_i32",
+ "def_path": "nm::strict_mul_i32",
+ "span": {
+  "file": "nm.rs",
+  "line_start": 47,
+  "col_start": 0,
+  "line_end": 47,
+  "col_end": 64
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": true
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": true
+     }
+    },
+    "name": "a"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": true
+     }
+    },
+    "name": "b"
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "core::num::<impl i32>::strict_mul",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       },
+       {
+        "Copy": {
+         "local": 2,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 0,
+       "projections": []
+      },
+      "target": 1,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 47,
+       "col_start": 49,
+       "line_end": 47,
+       "col_end": 49
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 16308397492346268927,
+       "def_index": 26559,
+       "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 16308397492346268927,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 2,
+  "return_ty": {
+   "Int": {
+    "width": 32,
+    "signed": true
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": -2147483648
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": 2147483647
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "b",
+        "Int"
+       ]
+      },
+      {
+       "Int": -2147483648
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "b",
+        "Int"
+       ]
+      },
+      {
+       "Int": 2147483647
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

@@ -1,0 +1,4977 @@
+[
+  {
+    "name": "coverage_bounded_against_unbounded",
+    "def_path": "enum_helpers::coverage_bounded_against_unbounded",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 67,
+      "col_start": 0,
+      "line_end": 69,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": "depth"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 2,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 68,
+                  "col_start": 22,
+                  "line_end": 68,
+                  "col_end": 60
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 3,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 0,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    []
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 68,
+                  "col_start": 62,
+                  "line_end": 68,
+                  "col_end": 86
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Call": {
+              "func": "enum_helpers::coverage_supports",
+              "args": [
+                {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 0,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 68,
+                "col_start": 4,
+                "line_end": 68,
+                "col_end": 87
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 12435276415459576182,
+                "def_index": 3,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 12435276415459576182,
+                "krate_name": "enum_helpers"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "depth",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "depth",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 18446744073709551615
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "coverage_constants",
+    "def_path": "enum_helpers::coverage_constants",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 63,
+      "col_start": 0,
+      "line_end": 65,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 1,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 0,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    []
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 64,
+                  "col_start": 22,
+                  "line_end": 64,
+                  "col_end": 46
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 2,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 0,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    []
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 64,
+                  "col_start": 48,
+                  "line_end": 64,
+                  "col_end": 72
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Call": {
+              "func": "enum_helpers::coverage_supports",
+              "args": [
+                {
+                  "Move": {
+                    "local": 1,
+                    "projections": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 0,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 64,
+                "col_start": 4,
+                "line_end": 64,
+                "col_end": 73
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 12435276415459576182,
+                "def_index": 3,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 12435276415459576182,
+                "krate_name": "enum_helpers"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 0,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "coverage_depths",
+    "def_path": "enum_helpers::coverage_depths",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 83,
+      "col_start": 0,
+      "line_end": 88,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": "have"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": "need"
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 4,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 3,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 85,
+                  "col_start": 8,
+                  "line_end": 85,
+                  "col_end": 52
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 4,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 2,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 86,
+                  "col_start": 8,
+                  "line_end": 86,
+                  "col_end": 52
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Call": {
+              "func": "enum_helpers::coverage_supports",
+              "args": [
+                {
+                  "Move": {
+                    "local": 3,
+                    "projections": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 0,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 84,
+                "col_start": 4,
+                "line_end": 87,
+                "col_end": 5
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 12435276415459576182,
+                "def_index": 3,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 12435276415459576182,
+                "krate_name": "enum_helpers"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 2,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "have",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "have",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 18446744073709551615
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "need",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "need",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 18446744073709551615
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "coverage_depths_reversed",
+    "def_path": "enum_helpers::coverage_depths_reversed",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 90,
+      "col_start": 0,
+      "line_end": 95,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": "have"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": "need"
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 4,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 3,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 2,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 92,
+                  "col_start": 8,
+                  "line_end": 92,
+                  "col_end": 52
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 4,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 93,
+                  "col_start": 8,
+                  "line_end": 93,
+                  "col_end": 52
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Call": {
+              "func": "enum_helpers::coverage_supports",
+              "args": [
+                {
+                  "Move": {
+                    "local": 3,
+                    "projections": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 0,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 91,
+                "col_start": 4,
+                "line_end": 94,
+                "col_end": 5
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 12435276415459576182,
+                "def_index": 3,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 12435276415459576182,
+                "krate_name": "enum_helpers"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 2,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "have",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "have",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 18446744073709551615
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "need",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "need",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 18446744073709551615
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "coverage_large_against_unbounded",
+    "def_path": "enum_helpers::coverage_large_against_unbounded",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 75,
+      "col_start": 0,
+      "line_end": 77,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 1,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Constant": {
+                          "Uint": [
+                            16,
+                            64
+                          ]
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 76,
+                  "col_start": 22,
+                  "line_end": 76,
+                  "col_end": 64
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 2,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 0,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    []
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 76,
+                  "col_start": 66,
+                  "line_end": 76,
+                  "col_end": 90
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Call": {
+              "func": "enum_helpers::coverage_supports",
+              "args": [
+                {
+                  "Move": {
+                    "local": 1,
+                    "projections": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 0,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 76,
+                "col_start": 4,
+                "line_end": 76,
+                "col_end": 91
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 12435276415459576182,
+                "def_index": 3,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 12435276415459576182,
+                "krate_name": "enum_helpers"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 0,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "coverage_reflexive",
+    "def_path": "enum_helpers::coverage_reflexive",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 49,
+      "col_start": 0,
+      "line_end": 54,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": "depth"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 2,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 51,
+                  "col_start": 8,
+                  "line_end": 51,
+                  "col_end": 46
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 3,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 52,
+                  "col_start": 8,
+                  "line_end": 52,
+                  "col_end": 46
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Call": {
+              "func": "enum_helpers::coverage_supports",
+              "args": [
+                {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 0,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 50,
+                "col_start": 4,
+                "line_end": 53,
+                "col_end": 5
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 12435276415459576182,
+                "def_index": 3,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 12435276415459576182,
+                "krate_name": "enum_helpers"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "depth",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "depth",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 18446744073709551615
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "coverage_supports",
+    "def_path": "enum_helpers::coverage_supports",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 13,
+      "col_start": 0,
+      "line_end": 29,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": "far"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": "needs"
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Tuple": [
+              {
+                "Adt": {
+                  "name": "enum_helpers::CoverageBound",
+                  "fields": [
+                    [
+                      "__tag",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": true
+                        }
+                      }
+                    ],
+                    [
+                      "__v1_depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ],
+                    [
+                      "__v2_size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ],
+                  "variants": [
+                    {
+                      "name": "Unbounded",
+                      "discriminant": 0,
+                      "fields": []
+                    },
+                    {
+                      "name": "UnwindBounded",
+                      "discriminant": 1,
+                      "fields": [
+                        [
+                          "depth",
+                          {
+                            "Int": {
+                              "width": 64,
+                              "signed": false
+                            }
+                          }
+                        ]
+                      ]
+                    },
+                    {
+                      "name": "ModelBounded",
+                      "discriminant": 2,
+                      "fields": [
+                        [
+                          "size",
+                          {
+                            "Int": {
+                              "width": 64,
+                              "signed": false
+                            }
+                          }
+                        ]
+                      ]
+                    },
+                    {
+                      "name": "Unrecorded",
+                      "discriminant": 3,
+                      "fields": []
+                    }
+                  ],
+                  "disc_index_safe": true,
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Enum"
+                }
+              },
+              {
+                "Adt": {
+                  "name": "enum_helpers::CoverageBound",
+                  "fields": [
+                    [
+                      "__tag",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": true
+                        }
+                      }
+                    ],
+                    [
+                      "__v1_depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ],
+                    [
+                      "__v2_size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ],
+                  "variants": [
+                    {
+                      "name": "Unbounded",
+                      "discriminant": 0,
+                      "fields": []
+                    },
+                    {
+                      "name": "UnwindBounded",
+                      "discriminant": 1,
+                      "fields": [
+                        [
+                          "depth",
+                          {
+                            "Int": {
+                              "width": 64,
+                              "signed": false
+                            }
+                          }
+                        ]
+                      ]
+                    },
+                    {
+                      "name": "ModelBounded",
+                      "discriminant": 2,
+                      "fields": [
+                        [
+                          "size",
+                          {
+                            "Int": {
+                              "width": 64,
+                              "signed": false
+                            }
+                          }
+                        ]
+                      ]
+                    },
+                    {
+                      "name": "Unrecorded",
+                      "discriminant": 3,
+                      "fields": []
+                    }
+                  ],
+                  "disc_index_safe": true,
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Enum"
+                }
+              }
+            ]
+          },
+          "name": null
+        },
+        {
+          "index": 4,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": true
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 5,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": true
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 6,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": true
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 7,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": true
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 8,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 9,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 10,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 11,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 3,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    "Tuple",
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      },
+                      {
+                        "Copy": {
+                          "local": 2,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 14,
+                  "col_start": 10,
+                  "line_end": 14,
+                  "col_end": 22
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 7,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Discriminant": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 14,
+                  "col_start": 10,
+                  "line_end": 14,
+                  "col_end": 22
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "SwitchInt": {
+              "discr": {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              },
+              "targets": [
+                [
+                  0,
+                  2
+                ],
+                [
+                  1,
+                  3
+                ],
+                [
+                  2,
+                  4
+                ],
+                [
+                  3,
+                  10
+                ]
+              ],
+              "otherwise": 12,
+              "exhaustive_enum_unreachable": true,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 14,
+                "col_start": 4,
+                "line_end": 14,
+                "col_end": 22
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Constant": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 27,
+                  "col_start": 13,
+                  "line_end": 27,
+                  "col_end": 18
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 11
+          }
+        },
+        {
+          "id": 2,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 4,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Discriminant": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 14,
+                  "col_start": 10,
+                  "line_end": 14,
+                  "col_end": 22
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "SwitchInt": {
+              "discr": {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              "targets": [
+                [
+                  0,
+                  9
+                ]
+              ],
+              "otherwise": 1,
+              "exhaustive_enum_unreachable": false,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 14,
+                "col_start": 4,
+                "line_end": 14,
+                "col_end": 22
+              }
+            }
+          }
+        },
+        {
+          "id": 3,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 5,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Discriminant": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 14,
+                  "col_start": 10,
+                  "line_end": 14,
+                  "col_end": 22
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "SwitchInt": {
+              "discr": {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              },
+              "targets": [
+                [
+                  0,
+                  8
+                ],
+                [
+                  1,
+                  6
+                ]
+              ],
+              "otherwise": 1,
+              "exhaustive_enum_unreachable": false,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 14,
+                "col_start": 4,
+                "line_end": 14,
+                "col_end": 22
+              }
+            }
+          }
+        },
+        {
+          "id": 4,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 6,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Discriminant": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 14,
+                  "col_start": 10,
+                  "line_end": 14,
+                  "col_end": 22
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "SwitchInt": {
+              "discr": {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              },
+              "targets": [
+                [
+                  0,
+                  7
+                ],
+                [
+                  2,
+                  5
+                ]
+              ],
+              "otherwise": 1,
+              "exhaustive_enum_unreachable": false,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 14,
+                "col_start": 4,
+                "line_end": 14,
+                "col_end": 22
+              }
+            }
+          }
+        },
+        {
+          "id": 5,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 10,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Copy": {
+                      "local": 3,
+                      "projections": [
+                        {
+                          "Field": 0
+                        },
+                        {
+                          "Downcast": 2
+                        },
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 24,
+                  "col_start": 48,
+                  "line_end": 24,
+                  "col_end": 52
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 11,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Copy": {
+                      "local": 3,
+                      "projections": [
+                        {
+                          "Field": 1
+                        },
+                        {
+                          "Downcast": 2
+                        },
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 25,
+                  "col_start": 48,
+                  "line_end": 25,
+                  "col_end": 52
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "BinaryOp": [
+                    "Ge",
+                    {
+                      "Copy": {
+                        "local": 10,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 11,
+                        "projections": []
+                      }
+                    }
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 26,
+                  "col_start": 13,
+                  "line_end": 26,
+                  "col_end": 25
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 11
+          }
+        },
+        {
+          "id": 6,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 8,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Copy": {
+                      "local": 3,
+                      "projections": [
+                        {
+                          "Field": 0
+                        },
+                        {
+                          "Downcast": 1
+                        },
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 20,
+                  "col_start": 50,
+                  "line_end": 20,
+                  "col_end": 54
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 9,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Copy": {
+                      "local": 3,
+                      "projections": [
+                        {
+                          "Field": 1
+                        },
+                        {
+                          "Downcast": 1
+                        },
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 21,
+                  "col_start": 50,
+                  "line_end": 21,
+                  "col_end": 54
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "BinaryOp": [
+                    "Ge",
+                    {
+                      "Copy": {
+                        "local": 8,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 9,
+                        "projections": []
+                      }
+                    }
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 22,
+                  "col_start": 13,
+                  "line_end": 22,
+                  "col_end": 25
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 11
+          }
+        },
+        {
+          "id": 7,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Constant": {
+                      "Bool": true
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 18,
+                  "col_start": 74,
+                  "line_end": 18,
+                  "col_end": 78
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 11
+          }
+        },
+        {
+          "id": 8,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Constant": {
+                      "Bool": true
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 17,
+                  "col_start": 75,
+                  "line_end": 17,
+                  "col_end": 79
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 11
+          }
+        },
+        {
+          "id": 9,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Constant": {
+                      "Bool": true
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 16,
+                  "col_start": 64,
+                  "line_end": 16,
+                  "col_end": 68
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 11
+          }
+        },
+        {
+          "id": 10,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Constant": {
+                      "Bool": true
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 15,
+                  "col_start": 42,
+                  "line_end": 15,
+                  "col_end": 46
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 11
+          }
+        },
+        {
+          "id": 11,
+          "stmts": [],
+          "terminator": "Return"
+        },
+        {
+          "id": 12,
+          "stmts": [],
+          "terminator": "Unreachable"
+        }
+      ],
+      "arg_count": 2,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "Or": [
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_4",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_4",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 1
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_4",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 2
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_4",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 3
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "Or": [
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_5",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_5",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 1
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_5",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 2
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_5",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 3
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "Or": [
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_6",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_6",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 1
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_6",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 2
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_6",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 3
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "Or": [
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_7",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_7",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 1
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_7",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 2
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_7",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 3
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "coverage_unbounded_against_bounded",
+    "def_path": "enum_helpers::coverage_unbounded_against_bounded",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 79,
+      "col_start": 0,
+      "line_end": 81,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": "depth"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 2,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 0,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    []
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 80,
+                  "col_start": 22,
+                  "line_end": 80,
+                  "col_end": 46
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 3,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 80,
+                  "col_start": 48,
+                  "line_end": 80,
+                  "col_end": 86
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Call": {
+              "func": "enum_helpers::coverage_supports",
+              "args": [
+                {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 0,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 80,
+                "col_start": 4,
+                "line_end": 80,
+                "col_end": 87
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 12435276415459576182,
+                "def_index": 3,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 12435276415459576182,
+                "krate_name": "enum_helpers"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "depth",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "depth",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 18446744073709551615
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "coverage_wrong",
+    "def_path": "enum_helpers::coverage_wrong",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 56,
+      "col_start": 0,
+      "line_end": 61,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": false
+            }
+          },
+          "name": "depth"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 2,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 58,
+                  "col_start": 8,
+                  "line_end": 58,
+                  "col_end": 46
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 3,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 2,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 59,
+                  "col_start": 8,
+                  "line_end": 59,
+                  "col_end": 51
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Call": {
+              "func": "enum_helpers::coverage_supports",
+              "args": [
+                {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 0,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 57,
+                "col_start": 4,
+                "line_end": 60,
+                "col_end": 5
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 12435276415459576182,
+                "def_index": 3,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 12435276415459576182,
+                "krate_name": "enum_helpers"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "depth",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "depth",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 18446744073709551615
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "coverage_zero_against_unbounded",
+    "def_path": "enum_helpers::coverage_zero_against_unbounded",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 71,
+      "col_start": 0,
+      "line_end": 73,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::CoverageBound",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ],
+                [
+                  "__v1_depth",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "__v2_size",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Unbounded",
+                  "discriminant": 0,
+                  "fields": []
+                },
+                {
+                  "name": "UnwindBounded",
+                  "discriminant": 1,
+                  "fields": [
+                    [
+                      "depth",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "ModelBounded",
+                  "discriminant": 2,
+                  "fields": [
+                    [
+                      "size",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                },
+                {
+                  "name": "Unrecorded",
+                  "discriminant": 3,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 1,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 1,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    [
+                      {
+                        "Constant": {
+                          "Uint": [
+                            0,
+                            64
+                          ]
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 72,
+                  "col_start": 22,
+                  "line_end": 72,
+                  "col_end": 63
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 2,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "enum_helpers::CoverageBound",
+                        "variant": 0,
+                        "active_field": null,
+                        "args": "enum_helpers::CoverageBound"
+                      }
+                    },
+                    []
+                  ]
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 72,
+                  "col_start": 65,
+                  "line_end": 72,
+                  "col_end": 89
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Call": {
+              "func": "enum_helpers::coverage_supports",
+              "args": [
+                {
+                  "Move": {
+                    "local": 1,
+                    "projections": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 0,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 72,
+                "col_start": 4,
+                "line_end": 72,
+                "col_end": 90
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 12435276415459576182,
+                "def_index": 3,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 12435276415459576182,
+                "krate_name": "enum_helpers"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 0,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "signed_tag_forward",
+    "def_path": "enum_helpers::signed_tag_forward",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 45,
+      "col_start": 0,
+      "line_end": 47,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::SignedTag",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Low",
+                  "discriminant": -3,
+                  "fields": []
+                },
+                {
+                  "name": "High",
+                  "discriminant": 7,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": "tag"
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [],
+          "terminator": {
+            "Call": {
+              "func": "enum_helpers::signed_tag_is_low",
+              "args": [
+                {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 0,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 46,
+                "col_start": 4,
+                "line_end": 46,
+                "col_end": 26
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 12435276415459576182,
+                "def_index": 4,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 12435276415459576182,
+                "krate_name": "enum_helpers"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "signed_tag_is_low",
+    "def_path": "enum_helpers::signed_tag_is_low",
+    "span": {
+      "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+      "line_start": 38,
+      "col_start": 0,
+      "line_end": 43,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Adt": {
+              "name": "enum_helpers::SignedTag",
+              "fields": [
+                [
+                  "__tag",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ]
+              ],
+              "variants": [
+                {
+                  "name": "Low",
+                  "discriminant": -3,
+                  "fields": []
+                },
+                {
+                  "name": "High",
+                  "discriminant": 7,
+                  "fields": []
+                }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+            }
+          },
+          "name": "tag"
+        },
+        {
+          "index": 2,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Int": {
+              "width": 8,
+              "signed": true
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 3,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Discriminant": {
+                    "local": 1,
+                    "projections": []
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 39,
+                  "col_start": 4,
+                  "line_end": 39,
+                  "col_end": 4
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "SwitchInt": {
+              "discr": {
+                "Copy": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              "targets": [
+                [
+                  253,
+                  1
+                ],
+                [
+                  7,
+                  2
+                ]
+              ],
+              "otherwise": 4,
+              "exhaustive_enum_unreachable": true,
+              "span": {
+                "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                "line_start": 39,
+                "col_start": 4,
+                "line_end": 39,
+                "col_end": 4
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 2,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Constant": {
+                      "Bool": true
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 39,
+                  "col_start": 4,
+                  "line_end": 39,
+                  "col_end": 4
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 3
+          }
+        },
+        {
+          "id": 2,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 2,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Constant": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 39,
+                  "col_start": 4,
+                  "line_end": 39,
+                  "col_end": 4
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 3
+          }
+        },
+        {
+          "id": 3,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                },
+                "span": {
+                  "file": "crates/trust-vcgen/tests/fixtures/d5b_enum_helpers.rs",
+                  "line_start": 43,
+                  "col_start": 1,
+                  "line_end": 43,
+                  "col_end": 1
+                }
+              }
+            }
+          ],
+          "terminator": "Return"
+        },
+        {
+          "id": 4,
+          "stmts": [],
+          "terminator": "Unreachable"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": "Bool"
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "Or": [
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_3",
+                  "Int"
+                ]
+              },
+              {
+                "Int": -3
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_3",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 7
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  }
+]

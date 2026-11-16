@@ -1,16 +1,19 @@
-use rustc_feature::AttributeStability;
-use rustc_hir::attrs::{
-    CoverageAttrKind, InstrumentFnAttr, OptimizeAttr, RtsanSetting, SanitizerSet, UsedBy,
+use rustc_attr_ir::{
+    CoverageAttrKind, InstrumentFnAttr, OptimizeAttr, RtsanSetting, UsedBy, find_attr,
 };
-use rustc_session::errors::feature_err;
+use rustc_feature::AttributeStability;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::edition::Edition::Edition2024;
+use rustc_structures::SanitizerSet;
 
 use super::prelude::*;
 use crate::attributes::AttributeSafety;
-use crate::session_diagnostics::{
+use crate::context::FinalizeCheckFn;
+use crate::diagnostics::{
     EmptyExportName, EmptySection, NakedFunctionIncompatibleAttribute, NullOnExport,
     NullOnObjcClass, NullOnObjcSelector, NullOnSection, ObjcClassExpectedStringLiteral,
     ObjcSelectorExpectedStringLiteral, SanitizeInvalidStatic, TargetFeatureOnLangItem,
+    TrackCallerOnLangItem,
 };
 use crate::target_checking::Policy::AllowSilent;
 
@@ -26,7 +29,7 @@ impl SingleAttributeParser for OptimizeParser {
         Allow(Target::Method(MethodKind::Inherent)),
     ]);
     const TEMPLATE: AttributeTemplate = template!(List: &["size", "speed", "none"]);
-    const STABILITY: AttributeStability = unstable!(optimize_attribute);
+    const STABILITY: AttributeStability = AttributeStability::Stable;
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let single = cx.expect_single_element_list(args, cx.attr_span)?;
@@ -58,6 +61,7 @@ impl NoArgsAttributeParser for ColdParser {
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::ForeignFn),
         Allow(Target::Closure),
+        Error(Target::Param),
     ]);
     const STABILITY: AttributeStability = AttributeStability::Stable;
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::Cold;
@@ -248,9 +252,6 @@ impl AttributeParser for NakedParser {
         // NOTE: when making changes to this list, check that `error_codes/E0736.md` remains
         // accurate.
         const ALLOW_LIST: &[rustc_span::Symbol] = &[
-            // conditional compilation
-            sym::cfg_trace,
-            sym::cfg_attr_trace,
             // testing (allowed here so better errors can be generated in `rustc_builtin_macros::test`)
             sym::test,
             sym::ignore,
@@ -283,7 +284,7 @@ impl AttributeParser for NakedParser {
 
         let span = self.span?;
 
-        let Some(tools) = cx.tools else {
+        let Some(tools) = cx.attr_tools else {
             unreachable!("tools required while parsing attributes");
         };
 
@@ -308,7 +309,7 @@ impl AttributeParser for NakedParser {
                 if other_attr.word_is(sym::target_feature) {
                     if !cx.features().naked_functions_target_feature() {
                         feature_err(
-                            &cx.sess(),
+                            cx.sess(),
                             sym::naked_functions_target_feature,
                             other_attr.span(),
                             "`#[target_feature(/* ... */)]` is currently unstable on `#[naked]` functions",
@@ -327,6 +328,40 @@ impl AttributeParser for NakedParser {
         }
 
         Some(AttributeKind::Naked(span))
+    }
+
+    fn deferred_finalize_check(&self) -> Option<(FinalizeCheckFn, Span)> {
+        // FIXME(rtjkro): Currently, we're enum matching on `cx.target` instead of `cx.ast_target`
+        // because `AstTarget::Method` doesn't contain `MethodKind` yet. In the future, when this field is available to `AstTarget::Method`,
+        // update this check to use `cx.ast_target` instead of `cx.target`.
+        Some((
+            |cx, _| match cx.target {
+                Target::Fn
+                | Target::Method(
+                    MethodKind::Trait { body: true } | MethodKind::TraitImpl | MethodKind::Inherent,
+                ) => {
+                    let fn_sig =
+                        cx.ast_target.get_fn_sig().expect("missing fn signature for AST target");
+                    let Some(abi) = cx.ast_target.get_abi() else {
+                        return;
+                    };
+
+                    if abi.is_rustic_abi() && !cx.features().naked_functions_rustic_abi() {
+                        feature_err(
+                            cx.sess(),
+                            sym::naked_functions_rustic_abi,
+                            fn_sig.span,
+                            format!(
+                                "`#[naked]` is currently unstable on `extern {abi}` functions",
+                            ),
+                        )
+                        .emit();
+                    }
+                }
+                _ => {}
+            },
+            self.span?,
+        ))
     }
 }
 
@@ -349,6 +384,34 @@ impl NoArgsAttributeParser for TrackCallerParser {
     ]);
     const STABILITY: AttributeStability = AttributeStability::Stable;
     const CREATE: fn(Span) -> AttributeKind = AttributeKind::TrackCaller;
+
+    fn finalize_check(cx: &mut FinalizeCheckContext<'_, '_>, attr_span: Span) {
+        match cx.target {
+            Target::Fn => {
+                // `#[track_caller]` is not valid on weak lang items because they are called via
+                // `extern` declarations and `#[track_caller]` would alter their ABI.
+                if let Some(item) = find_attr!(cx.parsed_attrs, Lang(item) => item)
+                    && item.is_weak()
+                {
+                    cx.emit_err(TrackCallerOnLangItem {
+                        attr_span,
+                        name: item.name(),
+                        sig_span: cx.target_span,
+                    });
+                }
+            }
+            Target::Closure if !cx.features().closure_track_caller() => {
+                feature_err(
+                    cx.sess(),
+                    sym::closure_track_caller,
+                    attr_span,
+                    "`#[track_caller]` on closures is currently unstable",
+                )
+                .emit();
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) struct NoMangleParser;
@@ -366,6 +429,7 @@ impl NoArgsAttributeParser for NoMangleParser {
         Allow(Target::Method(MethodKind::TraitImpl)),
         AllowSilent(Target::Const), // Handled in the `InvalidNoMangleItems` pass
         Error(Target::Closure),
+        Error(Target::Param),
     ]);
     const STABILITY: AttributeStability = AttributeStability::Stable;
     const CREATE: fn(Span) -> AttributeKind = AttributeKind::NoMangle;
@@ -399,7 +463,7 @@ impl AttributeParser for UsedParser {
                         Some(sym::compiler) => {
                             if !cx.features().used_with_arg() {
                                 feature_err(
-                                    &cx.sess(),
+                                    cx.sess(),
                                     sym::used_with_arg,
                                     cx.attr_span,
                                     "`#[used(compiler)]` is currently unstable",
@@ -411,7 +475,7 @@ impl AttributeParser for UsedParser {
                         Some(sym::linker) => {
                             if !cx.features().used_with_arg() {
                                 feature_err(
-                                    &cx.sess(),
+                                    cx.sess(),
                                     sym::used_with_arg,
                                     cx.attr_span,
                                     "`#[used(linker)]` is currently unstable",
@@ -506,7 +570,7 @@ fn parse_tf_attribute(
         let Some(value_str) = cx.expect_string_literal(value) else {
             return features;
         };
-        for feature in value_str.as_str().split(",") {
+        for feature in value_str.as_str().split(',') {
             features.push((Symbol::intern(feature), item.span()));
         }
     }
@@ -544,7 +608,7 @@ impl CombineAttributeParser for TargetFeatureParser {
         parse_tf_attribute(cx, args)
     }
 
-    fn finalize_check(cx: &FinalizeContext<'_, '_>, attr_span: Span) {
+    fn finalize_check(cx: &mut FinalizeCheckContext<'_, '_>, attr_span: Span) {
         // `#[target_feature]` is incompatible with lang item functions,
         // except on WASM where calling target-feature functions is safe (see #84988).
         if !cx.sess().target.is_like_wasm && !cx.sess().opts.actually_rustdoc {
@@ -605,7 +669,7 @@ impl SingleAttributeParser for InstrumentFnParser {
     const STABILITY: AttributeStability = unstable!(instrument_fn);
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
-        let instrument = match args {
+        match args {
             ArgParser::NameValue(nv) => match nv.value_as_str() {
                 Some(sym::on) => Some(AttributeKind::InstrumentFn(InstrumentFnAttr::On)),
                 Some(sym::off) => Some(AttributeKind::InstrumentFn(InstrumentFnAttr::Off)),
@@ -624,8 +688,7 @@ impl SingleAttributeParser for InstrumentFnParser {
                 cx.adcx().expected_specific_argument_strings(span, &[sym::on, sym::off]);
                 None
             }
-        };
-        instrument
+        }
     }
 }
 
@@ -654,6 +717,7 @@ impl SingleAttributeParser for SanitizeParser {
         r#"kcfi = "on|off""#,
         r#"memory = "on|off""#,
         r#"memtag = "on|off""#,
+        r#"safestack = "on|off""#,
         r#"shadow_call_stack = "on|off""#,
         r#"thread = "on|off""#,
         r#"realtime = "nonblocking|blocking|caller""#,
@@ -676,14 +740,7 @@ impl SingleAttributeParser for SanitizeParser {
                 let is_on = match value.value_as_str() {
                     Some(sym::on) => true,
                     Some(sym::off) => false,
-                    Some(_) => {
-                        cx.adcx().expected_specific_argument_strings(
-                            value.value_span,
-                            &[sym::on, sym::off],
-                        );
-                        return;
-                    }
-                    None => {
+                    _ => {
                         cx.adcx().expected_specific_argument_strings(
                             value.value_span,
                             &[sym::on, sym::off],
@@ -707,6 +764,7 @@ impl SingleAttributeParser for SanitizeParser {
                 sym::kcfi => apply(SanitizerSet::KCFI),
                 sym::memory => apply(SanitizerSet::MEMORY),
                 sym::memtag => apply(SanitizerSet::MEMTAG),
+                sym::safestack => apply(SanitizerSet::SAFESTACK),
                 sym::shadow_call_stack => apply(SanitizerSet::SHADOWCALLSTACK),
                 sym::thread => apply(SanitizerSet::THREAD),
                 sym::hwaddress | sym::kernel_hwaddress => {
@@ -733,6 +791,7 @@ impl SingleAttributeParser for SanitizeParser {
                             sym::kcfi,
                             sym::memory,
                             sym::memtag,
+                            sym::safestack,
                             sym::shadow_call_stack,
                             sym::thread,
                             sym::hwaddress,
@@ -740,7 +799,6 @@ impl SingleAttributeParser for SanitizeParser {
                             sym::realtime,
                         ],
                     );
-                    continue;
                 }
             }
         }
@@ -812,9 +870,7 @@ impl SingleAttributeParser for PatchableFunctionEntryParser {
         }
 
         for item in meta_item_list.mixed() {
-            let Some((ident, value)) = cx.expect_name_value(item, item.span(), None) else {
-                return None;
-            };
+            let (ident, value) = cx.expect_name_value(item, item.span(), None)?;
 
             let attrib_to_write = match ident.name {
                 sym::prefix_nops => {

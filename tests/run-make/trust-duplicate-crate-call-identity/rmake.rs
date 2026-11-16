@@ -154,12 +154,48 @@ fn main() {
         "both same-name dependency instances must survive exact Instance dedup: {mono_paths:#?}"
     );
     assert_ne!(duplicate_generics[0], duplicate_generics[1]);
+    // Trust (ARGS-FINGERPRINT-TAG-POLICY-1, 2026-10-13): since
+    // ARGS-FINGERPRINT-READ-1 round 2 (`e2cf8d14bf`) the producer writes the
+    // `::<__trust_args@…>` argument tag exactly when a def named in the generic
+    // arguments lives in a crate whose rendered name does not identify it. `<i32>`
+    // names no crate, so its display is already an exact argument identity and
+    // the instance is told apart by the callee root's `__trust_crate@<hex16>::`
+    // stamp alone. Pin that exact shape: a distinct crate stamp per dependency
+    // instance, the faithful primitive turbofish, and NO argument tag (a tag here
+    // would make the round-2 type-path readers decline on a primitive call). The
+    // argument tag itself stays required below, where the arguments do name a
+    // same-named crate (`shared::Marker` from `shared_a` vs `shared_b`).
+    let mut generic_crate_tags = BTreeSet::new();
     for path in duplicate_generics {
+        let tag = path
+            .strip_prefix("__trust_crate@")
+            .and_then(|rest| rest.strip_suffix("::shared::generic::<i32>"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "monomorphic duplicate-crate identity is not exactly \
+                     `__trust_crate@<hex16>::shared::generic::<i32>`: {path}"
+                )
+            });
         assert!(
-            path.contains("__trust_crate@") && path.contains("__trust_args@"),
-            "monomorphic duplicate-crate identity lacks stable crate/argument binding: {path}"
+            tag.len() == 16 && tag.chars().all(|c| c.is_ascii_hexdigit()),
+            "monomorphic duplicate-crate identity lacks a stable-crate tag `@<hex16>`: {path}"
         );
+        assert!(
+            !path.contains("__trust_args@"),
+            "a primitive-only instantiation must not carry the ambiguous-argument tag: {path}"
+        );
+        generic_crate_tags.insert(tag);
     }
+    assert_eq!(
+        generic_crate_tags.len(),
+        2,
+        "same-name dependency generic instances must carry distinct stable-crate tags: \
+         {mono_paths:#?}"
+    );
+    assert_eq!(
+        generic_crate_tags, crate_tags.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+        "the mono lane must stamp the same stable-crate identities as the direct call keys"
+    );
 
     let rendered_arg_instances = mono_paths
         .iter()
@@ -190,11 +226,13 @@ fn main() {
         "a foreign generic with a non-empty Trust contract bundle must be excluded: {mono_paths:#?}"
     );
 
+    // 1.101 renders an `Ord` method of a primitive under the impl's module
+    // (`core::cmp::impls::<impl core::cmp::Ord for i32>::max`, was `<i32 as core::cmp::Ord>::max`).
     for expected in [
-        "<i32 as core::cmp::Ord>::max",
-        "<i32 as core::cmp::Ord>::min",
-        "<u8 as core::cmp::Ord>::max",
-        "<u8 as core::cmp::Ord>::min",
+        "core::cmp::impls::<impl core::cmp::Ord for i32>::max",
+        "core::cmp::impls::<impl core::cmp::Ord for i32>::min",
+        "core::cmp::impls::<impl core::cmp::Ord for u8>::max",
+        "core::cmp::impls::<impl core::cmp::Ord for u8>::min",
         "core::cmp::max::<i32>",
         "core::cmp::min::<i32>",
     ] {

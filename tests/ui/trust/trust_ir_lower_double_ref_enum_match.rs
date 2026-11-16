@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-MR3: `match x` on a DOUBLE shared reference `&&E` (rfc-2005's
 // ref-region shape). THIR normalizes BOTH the match-ergonomics arm and the
 // explicit `&`-pattern arm to the identical `Deref{Deref{Variant}}`

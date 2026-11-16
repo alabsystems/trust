@@ -227,6 +227,13 @@ fn add_regex_redactions(subs: &mut snapbox::Redactions) {
         regex!(r"\.cargo/target/(?<redacted>[0-9a-f]{2}/[0-9a-f]{14})"),
     )
     .unwrap();
+    // Avoid 2 letter crate names being merged into hashes in file paths.
+    // e.g. target/debug/build/d1/[HASH]/out
+    subs.insert(
+        "[HASH]",
+        regex!(r"build/[a-z0-9]{2}/(?<redacted>[a-f0-9]{16})"),
+    )
+    .unwrap();
     subs.insert("[HASH]", regex!(r"/[a-z0-9\-_]+-(?<redacted>[0-9a-f]{16})"))
         .unwrap();
     // Match multi-part hashes like `06/b451d0d6f88b1d` used in directory paths
@@ -660,10 +667,24 @@ impl_from_tuples_for_inmemorydir!(
 #[cfg(test)]
 mod test {
     use snapbox::assert_data_eq;
-    use snapbox::prelude::*;
     use snapbox::str;
 
     use super::*;
+
+    #[test]
+    fn unverified_warning_negative_rejects_announcements_but_allows_help() {
+        let redactions = snapbox::Redactions::new();
+        let pattern = "warning: UNVERIFIED:[..]";
+        let help = "  UNVERIFIED: explicitly run without a proof claim\n";
+        assert!(match_does_not_contain(pattern, help, &redactions).is_ok());
+        for announcement in [
+            "warning: UNVERIFIED: `targo build` was explicitly authorized with Trust verification disabled; this run emits no proof claim",
+            "warning: UNVERIFIED: `targo build` inherited live broker-authenticated explicit-unverified authority from its Targo ancestor; this run emits no proof claim",
+        ] {
+            let stderr = format!("error: alias refused\n{help}{announcement}\n");
+            assert!(match_does_not_contain(pattern, &stderr, &redactions).is_err());
+        }
+    }
 
     #[test]
     fn wild_str_cmp() {

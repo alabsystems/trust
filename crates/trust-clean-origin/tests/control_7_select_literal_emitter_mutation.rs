@@ -44,7 +44,12 @@ fn env_with_min10() -> Environment {
     // comparison's decidability through `instDecidableNatLt` over a `toNat`
     // projection chain — a spelling the original hand-built term missed.
     // probe_i3 pins the planner against this same real tree; this control
-    // must exercise the SAME side A the compiler actually sees.
+    // must exercise the SAME side A the compiler actually sees. (From Clean
+    // `c91fa93f5` on, that tree carries the CARRIER instance
+    // `instDecidableUInt64Lt a <unfolded 10>` instead — measured 2026-09-23,
+    // `fragment_widening_probes::probe_i4`. Nothing here changes with it:
+    // side A is whatever the pinned elaborator mints, and every mutation
+    // below is injected into the emitted body only.)
     let mut session = trust_certify::clean_island::CleanIslandSession::new();
     let batch = session.check_all(&[
         "def min10_isl (a : UInt64) (b : UInt64) : UInt64 := if a < 10 then a else b",
@@ -122,6 +127,7 @@ fn emitted_select_literal(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

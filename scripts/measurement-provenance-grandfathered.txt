@@ -1,24 +1,15 @@
-# Commits that fall AFTER the R2 epoch (2026-08-20) but were authored BEFORE
-# `scripts/check_measurement_provenance.sh` existed. Each quotes a test count,
-# touches a soundness-gate path, and names no tree — through no fault of its
-# author, because at the moment it was written there was nothing to name it
-# with.
+# Commits authored before `scripts/check_measurement_provenance.sh` existed
+# that quote a test count, touch a soundness-gate path, and name no tree.
 #
-# THIS LIST MAY ONLY EVER SHRINK. Adding a row for a NEW commit is the same act
-# as deleting the gate, and there is no situation in which it is the right one:
-# the fix for a commit that cannot stamp is to stamp it (`git commit --amend`,
-# paste the `--- trailer` lines from scripts/lib/measure_stamp.sh), not to
-# record that it did not. `scripts/tests/check_measurement_provenance_test.sh`
+# THIS LIST MAY ONLY EVER SHRINK. Adding a row for a new commit is the same act
+# as deleting the gate: a commit that cannot stamp is fixed by stamping it
+# before it is pushed (`git commit --amend`, pasting the `--- trailer` lines
+# from scripts/lib/measure_stamp.sh). scripts/tests/check_measurement_provenance_test.sh
 # asserts the count never grows.
 #
-# One full 40-hex sha per line. A short sha, a ref name or a prefix is INERT
-# here by construction: the sweep matches /^[0-9a-f]{40}$/ and silently ignores
-# anything else, so a typo cannot widen the waiver — it can only fail to apply.
-#
-# Measured 2026-08-20 by `scripts/check_measurement_provenance.sh --history`
-# over 7,112 commits: exactly these five, and R1 found nothing at all
-# (0 trailers in the whole history, which is what makes R1 safe to apply with
-# no epoch and no waiver).
+# One full 40-hex sha per line. A short sha, a ref name or a prefix is inert
+# here by construction: the sweep matches /^[0-9a-f]{40}$/ and ignores anything
+# else, so a typo cannot widen the list; it can only fail to apply.
 
 # 2026-08-20T00:40  feat(thir-lower): wave-SG — the STRUCT-INTERIOR offset class is GATED
 # THE INCIDENT ITSELF (lane copy of 8e214e90d5). Quotes "599 passed, 0 failed"

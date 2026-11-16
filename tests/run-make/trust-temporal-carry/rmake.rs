@@ -19,7 +19,23 @@ fn write_source(name: &str, body: &str) -> String {
 fn compile_fail(name: &str, body: &str, expected: &str) {
     let source = write_source(name, body);
     cmd(trustc())
-        .arg("-Ztrust-verify=off")
+        // A CLAIMING lane, and that is the whole point of this helper. Since
+        // `eac9434f541` (2026-09-22) `-Ztrust-verify=off` is the master off-switch:
+        // a lane that claims no proof demotes a crate-level trust-ir finalization
+        // failure to a WARNING and exits 0, which is deliberate and is pinned by
+        // `tests/ui/trust/verify_off_invalid_module_is_a_warning.rs`. Under
+        // `-Ztrust-verify=off` this helper's `.run_fail()` was asserting a fatality
+        // the off lane does not promise, and it failed with `command unexpectedly
+        // succeeded` the moment the run-make suite could run again.
+        //
+        // `-Ztrust-policy=strict` is required as well as `=on`, not decoration:
+        // `trust_proof_claimed_by_flags` is `verify.is_on() && !policy.is_advisory()`
+        // (compiler/rustc_session/src/session.rs), so `=advisory` would leave the
+        // refusal a warning and make the assertions below vacuous. Same spelling as
+        // the compiler-side control,
+        // `tests/ui/trust/advisory_invalid_module_strict_control.rs`.
+        .arg("-Ztrust-verify=on")
+        .arg("-Ztrust-policy=strict")
         .arg("-Ztrust-ir-lower")
         .arg("--crate-type=lib")
         .arg(format!("--crate-name={name}"))
@@ -120,7 +136,6 @@ pub mod terminal {
         "invariant \"scrollback.path\" : \"1,1\"",
         "invariant \"Erase.guard\" : \"enabled\"",
         "invariant \"Erase.ghost\" : \"scrollback' = empty\"",
-        "rust \"terminal::Grid::erase\"",
         "project \"trust-ir.temporal-field-paths.v1\"",
         "target temporal-field-paths-v1",
     ] {
@@ -132,22 +147,46 @@ pub mod terminal {
     );
 
     let function_id = anchor_function_id(&text, machine, "Erase");
-    let function_headers: Vec<_> = text.lines().filter(|line| line.contains("fn @")).collect();
-    let exact_header = "fn @terminal::Grid::erase(";
-    let exact_index = function_headers
+    // WS5.2: `Function.name` is the link-time symbol; the annotated method is found by its
+    // def path, carried as the function's `; #display-path:` directive.
+    let function_offsets: Vec<usize> = text
+        .match_indices('\n')
+        .map(|(at, _)| at + 1)
+        .chain(std::iter::once(0))
+        .filter(|&at| text[at..].split('\n').next().is_some_and(|line| line.contains("fn @")))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let exact_path = "; #display-path: \"terminal::Grid::erase\"\n";
+    let exact_index = function_offsets
         .iter()
-        .position(|line| line.contains(exact_header))
-        .unwrap_or_else(|| panic!("missing exact action function `{exact_header}`:\n{text}"));
+        .position(|&at| {
+            let end = text[at..].find("\n}\n").map_or(text.len(), |end| at + end);
+            text[at..end].contains(exact_path)
+        })
+        .unwrap_or_else(|| panic!("missing exact action function `{exact_path}`:\n{text}"));
     assert_eq!(
         function_id, exact_index,
         "typed anchor FuncId must resolve to the annotated method"
     );
-    let header_offset = text.find(exact_header).unwrap();
+    let header_offset = function_offsets[exact_index];
     let action_body =
         &text[header_offset..text[header_offset..].find("\n}\n").unwrap() + header_offset];
     assert!(
         action_body.contains("bb0"),
         "typed action target must be a body-bearing function, not a declaration:\n{action_body}"
+    );
+    // WS5.2: the anchor's rust symbol is the bound function's NAME, its link-time symbol (the
+    // spec link compares the two), while the def path is that function's display path above.
+    let action_name = action_body
+        .split_once("fn @")
+        .and_then(|(_, tail)| tail.split_once('('))
+        .map(|(name, _)| name.trim_matches('"'))
+        .expect("the action function's header names it");
+    assert!(action_name.starts_with("_R"), "a v0 link-time symbol: {action_name}");
+    assert!(
+        block.contains(&format!("rust \"{action_name}\"")),
+        "the anchor must carry the bound function's link-time symbol `{action_name}`:\n{block}"
     );
 
     // A failed replacement with the same crate/output identity must invalidate
@@ -162,7 +201,13 @@ struct Detached { #[trust::var(name = "state", kind = "Int")] state: u64 }
 "#,
     );
     cmd(trustc())
-        .arg("-Ztrust-verify=off")
+        // The claiming lane, for the same reason as `compile_fail` above: this
+        // invocation asserts that the replacement REFUSES and that it purges the
+        // earlier dump, and only a proof-claiming lane makes the finalization
+        // failure fatal. The SUCCESSFUL invocation above deliberately stays on
+        // `-Ztrust-verify=off` — it is measuring the off lane's own dump.
+        .arg("-Ztrust-verify=on")
+        .arg("-Ztrust-policy=strict")
         .arg("-Ztrust-ir-lower")
         .arg("-Ztrust-dump=ir:grid-ir")
         .arg("--crate-type=lib")

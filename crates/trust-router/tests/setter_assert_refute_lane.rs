@@ -16,10 +16,16 @@
 // guarded_mut_slice_len_tie_proves twin.
 use trust_router::{InProcessAyBackend, VerificationBackend};
 use trust_types::{
-    BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
-    SourceSpan, Statement, Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
+    BasicBlock, BinOp, BlockId, CalleeIdentity, ConstValue, LocalDecl, Operand, Place, Projection,
+    Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
     VerificationResult,
 };
+
+// The concrete caller and the independent body registry name the same setter.
+const SETTER_PATH: &str = "fixture::set";
+// The production extractor supplies the body identity from the resolved DefId.
+const SETTER_IDENTITY: CalleeIdentity =
+    CalleeIdentity { stable_crate_id: 1, def_index: 1, substs_digest: [0, 0] };
 
 fn u32_ty() -> Ty {
     Ty::Int { width: 32, signed: false }
@@ -29,7 +35,7 @@ fn u32_ty() -> Ty {
 fn setter_fn() -> VerifiableFunction {
     VerifiableFunction {
         name: "set".into(),
-        def_path: "fixture::set".into(),
+        def_path: SETTER_PATH.into(),
         span: SourceSpan::default(),
         body: VerifiableBody {
             locals: vec![
@@ -58,6 +64,7 @@ fn setter_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -131,7 +138,7 @@ fn caller_fn(compare_local: usize) -> VerifiableFunction {
                         },
                     ],
                     terminator: Terminator::Call {
-                        func: "fixture::set".into(),
+                        func: SETTER_PATH.into(),
                         args: vec![Operand::Move(Place::local(5)), Operand::Copy(Place::local(2))],
                         dest: Place::local(4),
                         target: Some(BlockId(1)),
@@ -139,7 +146,8 @@ fn caller_fn(compare_local: usize) -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
-                        callee_identity: None,
+                        callee_identity: Some(SETTER_IDENTITY),
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -184,6 +192,7 @@ fn caller_fn(compare_local: usize) -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -205,6 +214,7 @@ fn caller_fn(compare_local: usize) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -214,10 +224,33 @@ fn refutation_claims(
     callees: &[VerifiableFunction],
     caller: &VerifiableFunction,
 ) -> Vec<trust_types::VerificationCondition> {
+    refutation_claims_with_body_identity(
+        callees,
+        caller,
+        Some(trust_vcgen::SummaryBodyIdentity::Item {
+            stable_crate_id: SETTER_IDENTITY.stable_crate_id,
+            def_index: SETTER_IDENTITY.def_index,
+        }),
+    )
+}
+
+fn refutation_claims_with_body_identity(
+    callees: &[VerifiableFunction],
+    caller: &VerifiableFunction,
+    identity: Option<trust_vcgen::SummaryBodyIdentity>,
+) -> Vec<trust_types::VerificationCondition> {
     let summaries = trust_vcgen::compute_trivial_setter_summaries(callees);
+    // The fixture's body registry is independent of the caller and of the
+    // summary's rendered key. Negative controls may omit or mismatch this entry.
+    let mut body_identities = trust_types::fx::FxHashMap::default();
+    if let Some(identity) = identity {
+        body_identities.insert(SETTER_PATH.into(), identity);
+    }
     let context = trust_vcgen::VcgenContext::for_function(caller.def_path.clone())
         .with_callee_summaries(
-            trust_vcgen::CalleeSummaryContext::default().with_setter_summaries(summaries),
+            trust_vcgen::CalleeSummaryContext::default()
+                .with_setter_summaries(summaries)
+                .with_summary_body_identities(body_identities),
         );
     trust_vcgen::generate_full_assert_refutation_vcs_with_context(caller, &context)
 }
@@ -268,6 +301,29 @@ fn trivial_setter_stale_assert_still_refutes() {
 }
 
 #[test]
+fn setter_without_matching_body_identity_emits_no_refutation_claim() {
+    // Keep the same rendered setter name and recognized body. Neither a missing
+    // identity nor a different crate/item may contribute its summary's effect.
+    for identity in [
+        None,
+        Some(CalleeIdentity { stable_crate_id: 2, ..SETTER_IDENTITY }),
+        Some(CalleeIdentity { def_index: 2, ..SETTER_IDENTITY }),
+    ] {
+        let mut caller = caller_fn(2);
+        let Terminator::Call { callee_identity, .. } = &mut caller.body.blocks[0].terminator else {
+            unreachable!("the fixture's first block must call the setter");
+        };
+        *callee_identity = identity;
+        let vcs = refutation_claims(&[setter_fn()], &caller);
+        assert!(
+            vcs.is_empty(),
+            "a setter call with identity {identity:?} must leave the assert \
+             ungrounded despite its matching name; got {vcs:?}"
+        );
+    }
+}
+
+#[test]
 fn computed_setter_emits_no_refutation_claim() {
     // FAIL-CLOSED twin (the `bump` mutant shape): a callee whose store is a
     // COMPUTED value earns NO summary, so the caller's assert panic path stays
@@ -279,4 +335,47 @@ fn computed_setter_emits_no_refutation_claim() {
         "an unrecognized (computed-store) setter must leave the assert \
          ungrounded — no refutation-lane claim; got {vcs:?}"
     );
+}
+
+#[test]
+fn unresolved_or_different_setter_body_emits_no_refutation_claim() {
+    for identity in [
+        None,
+        Some(CalleeIdentity { stable_crate_id: 2, ..SETTER_IDENTITY }),
+        Some(CalleeIdentity { def_index: 2, ..SETTER_IDENTITY }),
+    ] {
+        for comparison in [1, 2] {
+            let mut caller = caller_fn(comparison);
+            let Terminator::Call { callee_identity, .. } = &mut caller.body.blocks[0].terminator
+            else {
+                unreachable!("the fixture starts with the setter call")
+            };
+            *callee_identity = identity;
+            assert!(
+                refutation_claims(&[setter_fn()], &caller).is_empty(),
+                "a name alone must not ground either polarity: {identity:?}, comparison {comparison}"
+            );
+        }
+    }
+}
+
+#[test]
+fn absent_or_different_summary_body_identity_emits_no_refutation_claim() {
+    for identity in [
+        None,
+        Some(trust_vcgen::SummaryBodyIdentity::Item { stable_crate_id: 2, def_index: 1 }),
+        Some(trust_vcgen::SummaryBodyIdentity::Item { stable_crate_id: 1, def_index: 2 }),
+    ] {
+        for comparison in [1, 2] {
+            assert!(
+                refutation_claims_with_body_identity(
+                    &[setter_fn()],
+                    &caller_fn(comparison),
+                    identity
+                )
+                .is_empty(),
+                "an unrelated summary body must not ground either polarity: {identity:?}, comparison {comparison}"
+            );
+        }
+    }
 }

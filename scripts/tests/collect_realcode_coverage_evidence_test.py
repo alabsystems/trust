@@ -45,13 +45,13 @@ class Fixture:
         self.output = root / "receipt.json"
         self.repo.mkdir()
         (self.repo / "scripts/tests").mkdir(parents=True)
-        (self.repo / "reports/2026-06-29-honest-real-code-coverage/corpus").mkdir(parents=True)
+        (self.repo / "scripts/realcode-coverage/corpus").mkdir(parents=True)
         shutil.copy2(SOURCE_SCRIPT, self.repo / "scripts/collect_realcode_coverage_evidence.py")
         (self.repo / ".gitignore").write_text("build/\n", encoding="utf-8")
-        (self.repo / "reports/2026-06-29-honest-real-code-coverage/corpus/realcode.rs").write_text(
+        (self.repo / "scripts/realcode-coverage/corpus/realcode.rs").write_text(
             "pub fn alpha() -> i32 { 1 }\npub fn beta() -> i32 { 2 }\n", encoding="utf-8"
         )
-        (self.repo / "reports/2026-06-29-honest-real-code-coverage/analyze.py").write_text(
+        (self.repo / "scripts/realcode-coverage/analyze.py").write_text(
             textwrap.dedent(
                 """\
                 #!/usr/bin/env python3
@@ -196,7 +196,8 @@ class Fixture:
                         "package_name": "", "primary_package": False,
                         "verification_session": session, "eligible": eligible, "processed": processed,
                         "function_identities": {{"schema": "trustc.coverage-function-identities.v1",
-                            "eligible_functions": functions, "processed_functions": processed_functions}}}}
+                            "eligible_functions": functions, "processed_functions": processed_functions}},
+                        "memory": {{"schema": "trust-memory-summary/v1", "counters": {{}}}}}}
             print("TRUST_JSON:" + json.dumps(coverage, separators=(",", ":")), file=sys.stderr)
             proved = 0 if dump_only else 1
             failed = 0 if dump_only or processed == 1 else 1
@@ -288,16 +289,25 @@ class Fixture:
                 scorecard["total_obligations"] = total + 1
             elif MODE == "missing_bridge_agreement":
                 scorecard["bridge_agreement"] = None
+            elif MODE == "bridge_timeout":
+                scorecard["bridge_agreement"] = None
+            status = {"kernel_rejected": "rejected", "bridge_timeout": "incomplete"}.get(MODE, "measured")
             print(json.dumps({
                 "schema": "trust.prove-scorecard.v1",
-                "status": "rejected" if MODE == "kernel_rejected" else "measured",
+                "status": status,
                 "claim_boundary": "fixture",
                 "budget_secs_per_function": budget,
                 "scorecard": scorecard,
-                "bridge_gate_error": None
+                "bridge_gate_error": (
+                    "TIMEOUT: fixture bridge gate step did not finish within the --budget-secs budget"
+                    if MODE == "bridge_timeout" else None
+                )
             }))
             if MODE == "kernel_rejected":
                 print("fixture kernel rejection", file=sys.stderr)
+                raise SystemExit(1)
+            if MODE == "bridge_timeout":
+                print("fixture bridge gate INCOMPLETE", file=sys.stderr)
                 raise SystemExit(1)
             """
         ).replace("__MODE__", repr(mode))
@@ -491,6 +501,30 @@ class CoverageEvidenceReceiptTest(unittest.TestCase):
             self.assertTrue(
                 any(
                     "no attached bridge agreement evidence" in reason
+                    for reason in attempt["rejection_reasons"]
+                )
+            )
+
+    def test_timed_out_bridge_gate_preserves_authority_and_publishes_zero_credit_attempt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), "bridge_timeout")
+            accepted = b'{"accepted":"prior"}\n'
+            fixture.output.write_bytes(accepted)
+            result = fixture.run()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("zero-credit diagnostic published", result.stderr)
+            self.assertEqual(fixture.output.read_bytes(), accepted)
+            attempt_path = fixture.output.with_name(fixture.output.name + ".last-attempt.json")
+            attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+            self.assertFalse(attempt["admissible_as_measurement"])
+            self.assertEqual(attempt["proof_credit"], 0)
+            self.assertEqual(attempt["proof"]["status"], "incomplete")
+            self.assertIn("prove process exited 1", attempt["rejection_reasons"])
+            self.assertTrue(
+                any(
+                    "not an accepted measured kernel scorecard" in reason
                     for reason in attempt["rejection_reasons"]
                 )
             )

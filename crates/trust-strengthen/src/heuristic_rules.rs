@@ -99,25 +99,16 @@ impl HeuristicRule for BoundsCheck {
     fn propose(&self, sig: &FunctionSignature) -> Vec<Proposal> {
         let mut proposals = Vec::new();
 
-        let index_params: Vec<&str> = sig
+        let collection = sig
             .params
             .iter()
-            .filter(|(name, ty)| is_index_name(name) && ty.trim() == "usize")
-            .map(|(name, _)| name.as_str())
-            .collect();
-
-        let slice_params: Vec<&str> = sig
-            .params
-            .iter()
-            .filter(|(_, ty)| {
+            .find(|(_, ty)| {
                 let t = ty.trim();
                 t.starts_with("&[") || t.starts_with("&mut [") || t.starts_with("Vec<")
             })
-            .map(|(name, _)| name.as_str())
-            .collect();
+            .map_or("collection", |(name, _)| name.as_str());
 
-        for idx in &index_params {
-            let collection = slice_params.first().copied().unwrap_or("collection");
+        for (idx, _) in sig.params.iter().filter(|(name, ty)| is_index_name(name) && ty.trim() == "usize") {
             proposals.push(Proposal {
                 function_path: sig.path.clone(),
                 function_name: sig.name.clone(),
@@ -164,64 +155,60 @@ impl HeuristicRule for DivisionGuard {
         let mut proposals = Vec::new();
 
         // Find explicit divisor-like parameters
-        let divisor_params: Vec<&str> = sig
+        for (d, _) in sig
             .params
             .iter()
             .filter(|(name, ty)| is_divisor_name(name) && is_numeric_type(ty.trim()))
-            .map(|(name, _)| name.as_str())
-            .collect();
+        {
+            proposals.push(Proposal {
+                function_path: sig.path.clone(),
+                function_name: sig.name.clone(),
+                kind: ProposalKind::AddPrecondition { spec_body: format!("{d} != 0") },
+                confidence: 0.9,
+                rationale: format!(
+                    "DivisionGuard: parameter `{d}` is likely used as a divisor"
+                ),
+            });
+        }
 
-        if !divisor_params.is_empty() {
-            for d in &divisor_params {
-                proposals.push(Proposal {
-                    function_path: sig.path.clone(),
-                    function_name: sig.name.clone(),
-                    kind: ProposalKind::AddPrecondition { spec_body: format!("{d} != 0") },
-                    confidence: 0.9,
-                    rationale: format!(
-                        "DivisionGuard: parameter `{d}` is likely used as a divisor"
-                    ),
-                });
-            }
-        } else {
+        if proposals.is_empty() {
             // Function name suggests division but no obvious divisor param;
             // pick numeric params that could be divisors (second numeric param, or "n", "b", etc.)
-            let numeric_params: Vec<&str> = sig
+            let mut numeric_iter = sig
                 .params
                 .iter()
                 .filter(|(_, ty)| is_numeric_type(ty.trim()))
-                .map(|(name, _)| name.as_str())
-                .collect();
+                .map(|(name, _)| name.as_str());
 
-            if numeric_params.len() >= 2 {
-                // Second numeric param is likely the divisor
-                let divisor = numeric_params[1];
-                proposals.push(Proposal {
-                    function_path: sig.path.clone(),
-                    function_name: sig.name.clone(),
-                    kind: ProposalKind::AddPrecondition {
-                        spec_body: format!("{divisor} != 0"),
-                    },
-                    confidence: 0.7,
-                    rationale: format!(
-                        "DivisionGuard: `{}` likely involves division; `{divisor}` may be the divisor",
-                        sig.name
-                    ),
-                });
-            } else if numeric_params.len() == 1 {
-                let param = numeric_params[0];
-                proposals.push(Proposal {
-                    function_path: sig.path.clone(),
-                    function_name: sig.name.clone(),
-                    kind: ProposalKind::AddPrecondition {
-                        spec_body: format!("{param} != 0"),
-                    },
-                    confidence: 0.6,
-                    rationale: format!(
-                        "DivisionGuard: `{}` suggests division; `{param}` is the only numeric param",
-                        sig.name
-                    ),
-                });
+            if let Some(first) = numeric_iter.next() {
+                if let Some(second) = numeric_iter.next() {
+                    // Second numeric param is likely the divisor
+                    proposals.push(Proposal {
+                        function_path: sig.path.clone(),
+                        function_name: sig.name.clone(),
+                        kind: ProposalKind::AddPrecondition {
+                            spec_body: format!("{second} != 0"),
+                        },
+                        confidence: 0.7,
+                        rationale: format!(
+                            "DivisionGuard: `{}` likely involves division; `{second}` may be the divisor",
+                            sig.name
+                        ),
+                    });
+                } else {
+                    proposals.push(Proposal {
+                        function_path: sig.path.clone(),
+                        function_name: sig.name.clone(),
+                        kind: ProposalKind::AddPrecondition {
+                            spec_body: format!("{first} != 0"),
+                        },
+                        confidence: 0.6,
+                        rationale: format!(
+                            "DivisionGuard: `{}` suggests division; `{first}` is the only numeric param",
+                            sig.name
+                        ),
+                    });
+                }
             }
         }
 
@@ -238,8 +225,14 @@ impl HeuristicRule for OverflowGuard {
     }
 
     fn matches(&self, sig: &FunctionSignature) -> bool {
+        let has_numeric_params =
+            sig.params.iter().filter(|(_, ty)| is_integer_type(ty.trim())).count() >= 2;
+        if !has_numeric_params {
+            return false;
+        }
+
         let lower = sig.name.to_lowercase();
-        let name_suggests_arith = lower.contains("add")
+        lower.contains("add")
             || lower.contains("sub")
             || lower.contains("mul")
             || lower.contains("sum")
@@ -247,12 +240,7 @@ impl HeuristicRule for OverflowGuard {
             || lower.contains("total")
             || lower.contains("accumulate")
             || lower.contains("midpoint")
-            || lower.contains("average");
-
-        let has_numeric_params =
-            sig.params.iter().filter(|(_, ty)| is_integer_type(ty.trim())).count() >= 2;
-
-        name_suggests_arith && has_numeric_params
+            || lower.contains("average")
     }
 
     fn propose(&self, sig: &FunctionSignature) -> Vec<Proposal> {
@@ -496,11 +484,21 @@ impl Default for RuleEngine {
 // --- Utility functions ---
 
 fn dedup_by_spec(proposals: &mut Vec<Proposal>) {
-    let mut seen = FxHashSet::default();
+    let mut seen: FxHashSet<(u8, String)> = FxHashSet::default();
     proposals.retain(|p| {
-        let key = format!("{:?}:{}", std::mem::discriminant(&p.kind), extract_spec_body(&p.kind));
-        seen.insert(key)
+        seen.insert((kind_tag(&p.kind), extract_spec_body(&p.kind).to_string()))
     });
+}
+
+fn kind_tag(kind: &ProposalKind) -> u8 {
+    match kind {
+        ProposalKind::AddPrecondition { .. } => 0,
+        ProposalKind::AddPostcondition { .. } => 1,
+        ProposalKind::AddInvariant { .. } => 2,
+        ProposalKind::SafeArithmetic { .. } => 3,
+        ProposalKind::AddBoundsCheck { .. } => 4,
+        ProposalKind::AddNonZeroCheck { .. } => 5,
+    }
 }
 
 fn extract_spec_body(kind: &ProposalKind) -> &str {
@@ -514,32 +512,36 @@ fn extract_spec_body(kind: &ProposalKind) -> &str {
     }
 }
 
+fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len()
+        && s.is_char_boundary(s.len() - suffix.len())
+        && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
 fn is_index_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower == "i"
-        || lower == "j"
-        || lower == "k"
-        || lower == "idx"
-        || lower == "index"
-        || lower == "pos"
-        || lower == "offset"
-        || lower.ends_with("_idx")
-        || lower.ends_with("_index")
+    name.eq_ignore_ascii_case("i")
+        || name.eq_ignore_ascii_case("j")
+        || name.eq_ignore_ascii_case("k")
+        || name.eq_ignore_ascii_case("idx")
+        || name.eq_ignore_ascii_case("index")
+        || name.eq_ignore_ascii_case("pos")
+        || name.eq_ignore_ascii_case("offset")
+        || ends_with_ignore_ascii_case(name, "_idx")
+        || ends_with_ignore_ascii_case(name, "_index")
 }
 
 fn is_divisor_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower == "divisor"
-        || lower == "denominator"
-        || lower == "denom"
-        || lower == "d"
-        || lower == "y"
-        || lower == "b"
-        || lower == "n"
-        || lower == "modulus"
-        || lower == "count"
-        || lower.ends_with("_divisor")
-        || lower.ends_with("_denom")
+    name.eq_ignore_ascii_case("divisor")
+        || name.eq_ignore_ascii_case("denominator")
+        || name.eq_ignore_ascii_case("denom")
+        || name.eq_ignore_ascii_case("d")
+        || name.eq_ignore_ascii_case("y")
+        || name.eq_ignore_ascii_case("b")
+        || name.eq_ignore_ascii_case("n")
+        || name.eq_ignore_ascii_case("modulus")
+        || name.eq_ignore_ascii_case("count")
+        || ends_with_ignore_ascii_case(name, "_divisor")
+        || ends_with_ignore_ascii_case(name, "_denom")
 }
 
 fn is_numeric_type(ty: &str) -> bool {

@@ -2,10 +2,14 @@ use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::sync::atomic::Ordering;
 
+use rustc_attr_ir::OptimizeAttr;
 use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
+use rustc_hir::def_id::DefId;
 use rustc_middle::mir::{Body, MirDumper, MirPhase, RuntimePhase};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
+use rustc_session::config::OptLevel;
+use rustc_span::bug;
 use tracing::trace;
 
 use crate::lint::lint_body;
@@ -23,19 +27,19 @@ fn to_profiler_name(type_name: &'static str) -> &'static str {
     PASS_TO_PROFILER_NAMES.with(|names| match names.borrow_mut().entry(type_name) {
         Entry::Occupied(e) => *e.get(),
         Entry::Vacant(e) => {
-            let snake_case: String = type_name
-                .chars()
-                .flat_map(|c| {
-                    if c.is_ascii_uppercase() {
-                        vec!['_', c.to_ascii_lowercase()]
-                    } else if c == '-' {
-                        vec!['_']
-                    } else {
-                        vec![c]
-                    }
-                })
-                .collect();
-            let result = &*String::leak(format!("mir_pass{}", snake_case));
+            let mut result = String::with_capacity("mir_pass".len() + type_name.len() + 4);
+            result.push_str("mir_pass");
+            for c in type_name.chars() {
+                if c.is_ascii_uppercase() {
+                    result.push('_');
+                    result.push(c.to_ascii_lowercase());
+                } else if c == '-' {
+                    result.push('_');
+                } else {
+                    result.push(c);
+                }
+            }
+            let result = &*String::leak(result);
             e.insert(result);
             result
         }
@@ -79,6 +83,29 @@ const fn simplify_pass_type_name(name: &'static str) -> &'static str {
     }
 }
 
+/// Rules outlining when this pass may be overridden or suppressed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PassPolicy {
+    /// This pass implements a mandatory lowering step, either to implement parts of the MIR semantics
+    /// or to bring MIR into a shape that is easier to deal with for later passes/codegen.
+    /// Passes using this cannot be disabled via any means. They must not remove any UB, as they will
+    /// run in Miri. They must also come with a comment justifying why they must always run.
+    Required,
+    /// An optional pass that may be configured by `-Zmir-enable-passes`.
+    Optional {
+        /// Whether this pass should be enabled in the absence of an explicit
+        /// `-Zmir-enable-passes` override.
+        enabled_by_default: bool,
+    },
+}
+
+impl PassPolicy {
+    /// Create a [`PassPolicy::Optional`] enabled by default under the given condition.
+    pub(crate) fn optional(enabled_by_default: bool) -> Self {
+        Self::Optional { enabled_by_default }
+    }
+}
+
 /// A streamlined trait that you can implement to create a pass; the
 /// pass will be named after the type, and it will consist of a main
 /// loop that goes over each available MIR and applies `run_pass`.
@@ -91,27 +118,85 @@ pub(super) trait MirPass<'tcx> {
         to_profiler_name(self.name())
     }
 
-    /// Returns `true` if this pass is enabled with the current combination of compiler flags.
-    fn is_enabled(&self, _sess: &Session) -> bool {
-        true
-    }
-
-    /// Returns `true` if this pass can be overridden by `-Zenable-mir-passes`. This should be
-    /// true for basically every pass other than those that are necessary for correctness.
-    fn can_be_overridden(&self) -> bool {
-        true
-    }
+    /// Describes how this pass is enabled and which mechanisms may disable it.
+    fn policy(&self, ctx: &PassCtx<'_>) -> PassPolicy;
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>);
 
     fn is_mir_dump_enabled(&self) -> bool {
         true
     }
+}
 
-    /// Returns `true` if this pass must be run (i.e. it is required for soundness).
-    /// For passes which are strictly optimizations, this should return `false`.
-    /// If this is `false`, `#[optimize(none)]` will disable the pass.
-    fn is_required(&self) -> bool;
+#[derive(Copy, Clone)]
+pub(super) struct PassCtx<'sess> {
+    /// Prefer [`Self::mir_opt_level`] to [`Session::mir_opt_level`] to account for overrides.
+    session: &'sess Session,
+    /// The MIR optimization level for this body; may be overridden by `#[optimize]`.
+    body_mir_opt_level: usize,
+}
+
+impl<'sess> PassCtx<'sess> {
+    pub(super) fn for_body(tcx: TyCtxt<'sess>, def_id: DefId) -> Self {
+        // Trust: the session's level is `trust_session_mir_opt_level`, never read
+        // directly here (KERNEL-MIR-PARITY-1).
+        let body_mir_opt_level = if !tcx.def_kind(def_id).has_codegen_attrs() {
+            trust_session_mir_opt_level(tcx)
+        } else {
+            match tcx.codegen_fn_attrs(def_id).optimize {
+                OptimizeAttr::Default => trust_session_mir_opt_level(tcx),
+                OptimizeAttr::DoNotOptimize => OptLevel::No.mir_opt_level(),
+                OptimizeAttr::Speed => OptLevel::Aggressive.mir_opt_level(),
+                OptimizeAttr::Size => OptLevel::Size.mir_opt_level(),
+            }
+        };
+        Self { session: tcx.sess, body_mir_opt_level }
+    }
+
+    /// The effective MIR optimization level for this body, including `#[optimize]` overrides.
+    pub(super) fn mir_opt_level(&self) -> usize {
+        self.body_mir_opt_level
+    }
+}
+
+/// Trust (TG16, KERNEL-MIR-PARITY-1): the level a body runs when nothing on the body
+/// overrides the session's: [`Session::mir_opt_level`], except in a crate that carries
+/// a kernel obligation (`trust_crate_has_kernel_obligations`), whose vanilla `-O`
+/// session runs the level a verifying session runs, 1.
+///
+/// With verification off, the kernel-only lane E6-imports the bodies its islands and
+/// citations name from `optimized_mir` (`trust_kernel_discharge_without_verification`).
+/// A verifying session runs level 1 at every `-Copt-level` (`-O` parity,
+/// `trust_default_mir_opt_level_by_flags`); the vanilla lane runs upstream's 2 at
+/// `-O`, whose inliner rewrites the body the lane imports, so one citation got two
+/// verdicts: a body that forwards to a local helper is refused at level 1 (the
+/// forwarding gate) and, the call inlined, discharged at level 2 — a hard error in a
+/// dev build that built under `--release` (KNOWN_HAZARDS "WHICH OPTIMIZATION PASSES
+/// RAN"; `off_kernel_mir_level_parity.rs`). Now every ordinary build of such a crate
+/// reads the same MIR the verifying lane reads.
+/// A session level above 1 with no explicit `-Zmir-opt-level` is exactly the vanilla
+/// `-O` lane (a proof session answers 1); an explicit level, `-Zinline-mir` and an
+/// `#[optimize]` attribute are the author's choices and are kept (an `#[optimize]`
+/// body runs the same level in both lanes). A crate with neither islands nor
+/// citations, std and every upstream test among them, is untouched.
+fn trust_session_mir_opt_level(tcx: TyCtxt<'_>) -> usize {
+    let session_level = tcx.sess.mir_opt_level();
+    if session_level > 1
+        && tcx.sess.opts.unstable_opts.mir_opt_level.is_none()
+        && tcx.trust_crate_has_kernel_obligations(())
+    {
+        1
+    } else {
+        session_level
+    }
+}
+
+impl std::ops::Deref for PassCtx<'_> {
+    type Target = Session;
+
+    fn deref(&self) -> &Self::Target {
+        self.session
+    }
 }
 
 /// Just like `MirPass`, except it cannot mutate `Body`, and MIR dumping is
@@ -119,10 +204,6 @@ pub(super) trait MirPass<'tcx> {
 pub(super) trait MirLint<'tcx> {
     fn name(&self) -> &'static str {
         const { simplify_pass_type_name(std::any::type_name::<Self>()) }
-    }
-
-    fn is_enabled(&self, _sess: &Session) -> bool {
-        true
     }
 
     fn run_lint(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>);
@@ -140,10 +221,6 @@ where
         self.0.name()
     }
 
-    fn is_enabled(&self, sess: &Session) -> bool {
-        self.0.is_enabled(sess)
-    }
-
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         self.0.run_lint(tcx, body)
     }
@@ -152,12 +229,12 @@ where
         false
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(true)
     }
 }
 
-pub(super) struct WithMinOptLevel<T>(pub u32, pub T);
+pub(super) struct WithMinOptLevel<T>(pub usize, pub T);
 
 impl<'tcx, T> MirPass<'tcx> for WithMinOptLevel<T>
 where
@@ -167,26 +244,19 @@ where
         self.1.name()
     }
 
-    fn is_enabled(&self, sess: &Session) -> bool {
-        sess.mir_opt_level() >= self.0 as usize
-    }
-
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         self.1.run_pass(tcx, body)
     }
 
-    fn is_required(&self) -> bool {
-        self.1.is_required()
+    fn policy(&self, ctx: &PassCtx<'_>) -> PassPolicy {
+        let policy = self.1.policy(ctx);
+        match policy {
+            PassPolicy::Required => bug!("required pass cannot be gated by an opt level"),
+            PassPolicy::Optional { enabled_by_default } => PassPolicy::Optional {
+                enabled_by_default: enabled_by_default && ctx.mir_opt_level() >= self.0,
+            },
+        }
     }
-}
-
-/// Whether to allow non-[required] optimizations
-///
-/// [required]: MirPass::is_required
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Optimizations {
-    Suppressed,
-    Allowed,
 }
 
 /// Run the sequence of passes without validating the MIR after each pass. The MIR is still
@@ -197,7 +267,7 @@ pub(super) fn run_passes_no_validate<'tcx>(
     passes: &[&dyn MirPass<'tcx>],
     phase_change: Option<MirPhase>,
 ) {
-    run_passes_inner(tcx, body, passes, phase_change, false, Optimizations::Allowed);
+    run_passes_inner(tcx, body, passes, phase_change, false);
 }
 
 /// The optional `phase_change` is applied after executing all the passes, if present
@@ -206,37 +276,39 @@ pub(super) fn run_passes<'tcx>(
     body: &mut Body<'tcx>,
     passes: &[&dyn MirPass<'tcx>],
     phase_change: Option<MirPhase>,
-    optimizations: Optimizations,
 ) {
-    run_passes_inner(tcx, body, passes, phase_change, true, optimizations);
+    run_passes_inner(tcx, body, passes, phase_change, true);
 }
 
-pub(super) fn should_run_pass<'tcx, P>(
-    tcx: TyCtxt<'tcx>,
-    pass: &P,
-    optimizations: Optimizations,
-) -> bool
+pub(super) fn should_run_pass<'tcx, P>(pass: &P, ctx: &PassCtx<'_>) -> bool
 where
     P: MirPass<'tcx> + ?Sized,
 {
     let name = pass.name();
+    let pass_override = || {
+        ctx.opts
+            .unstable_opts
+            .mir_enable_passes
+            .iter()
+            .rev()
+            .find_map(|(name_, polarity)| if name == name_ { Some(*polarity) } else { None })
+    };
 
-    if !pass.can_be_overridden() {
-        return pass.is_enabled(tcx.sess);
+    match pass.policy(ctx) {
+        PassPolicy::Required => true,
+        PassPolicy::Optional { enabled_by_default } => {
+            if let Some(o) = pass_override() {
+                trace!(
+                    pass = %name,
+                    "{} as requested by flag",
+                    if o { "Running" } else { "Not running" }
+                );
+                o
+            } else {
+                enabled_by_default
+            }
+        }
     }
-
-    let overridden_passes = &tcx.sess.opts.unstable_opts.mir_enable_passes;
-    let overridden =
-        overridden_passes.iter().rev().find(|(s, _)| s == &*name).map(|(_name, polarity)| {
-            trace!(
-                pass = %name,
-                "{} as requested by flag",
-                if *polarity { "Running" } else { "Not running" },
-            );
-            *polarity
-        });
-    let suppressed = !pass.is_required() && matches!(optimizations, Optimizations::Suppressed);
-    overridden.unwrap_or_else(|| !suppressed && pass.is_enabled(tcx.sess))
 }
 
 fn run_passes_inner<'tcx>(
@@ -245,29 +317,31 @@ fn run_passes_inner<'tcx>(
     passes: &[&dyn MirPass<'tcx>],
     phase_change: Option<MirPhase>,
     validate_each: bool,
-    optimizations: Optimizations,
 ) {
     let overridden_passes = &tcx.sess.opts.unstable_opts.mir_enable_passes;
     trace!(?overridden_passes);
 
-    let named_passes: FxIndexSet<_> =
-        overridden_passes.iter().map(|(name, _)| name.as_str()).collect();
+    if !overridden_passes.is_empty() {
+        let named_passes: FxIndexSet<_> =
+            overridden_passes.iter().map(|(name, _)| name.as_str()).collect();
 
-    let mut unknown_found = false;
-    for &name in named_passes.difference(&*crate::PASS_NAMES) {
-        tcx.dcx().emit_warn(diagnostics::UnknownPassName { name });
-        unknown_found = true;
-    }
+        let mut unknown_found = false;
+        for &name in named_passes.difference(&*crate::PASS_NAMES) {
+            tcx.dcx().emit_warn(diagnostics::UnknownPassName { name });
+            unknown_found = true;
+        }
 
-    if unknown_found {
-        let mut valid_pass_names = crate::PASS_NAMES.iter().copied().collect::<Vec<_>>();
-        valid_pass_names.sort();
-        tcx.dcx().emit_note(diagnostics::ValidPassNames { valid_passes: valid_pass_names.into() });
+        if unknown_found {
+            let mut valid_pass_names = crate::PASS_NAMES.iter().copied().collect::<Vec<_>>();
+            valid_pass_names.sort();
+            tcx.dcx()
+                .emit_note(diagnostics::ValidPassNames { valid_passes: valid_pass_names.into() });
+        }
     }
 
     // Verify that no passes are missing from the `declare_passes` invocation
     #[cfg(debug_assertions)]
-    {
+    if passes.iter().any(|p| !crate::PASS_NAMES.contains(p.name())) {
         let used_passes: FxIndexSet<_> = passes.iter().map(|p| p.name()).collect();
 
         let undeclared = used_passes.difference(&*crate::PASS_NAMES).collect::<Vec<_>>();
@@ -277,7 +351,7 @@ fn run_passes_inner<'tcx>(
             for name in rest {
                 err.note(format!("pass `{name}` is also not declared in `PASS_NAMES`"));
             }
-            err.emit();
+            err.emit_bug();
         }
     }
 
@@ -287,15 +361,19 @@ fn run_passes_inner<'tcx>(
         let validate = validate_each & tcx.sess.opts.unstable_opts.validate_mir;
         let lint = tcx.sess.opts.unstable_opts.lint_mir;
 
+        let ctx = PassCtx::for_body(tcx, body.source.def_id());
+
         for pass in passes {
             let pass_name = pass.name();
 
-            if !should_run_pass(tcx, *pass, optimizations) {
+            if !should_run_pass(*pass, &ctx) {
                 continue;
             };
 
-            if is_optimization_stage(body, phase_change, optimizations)
+            if body.phase == MirPhase::Runtime(RuntimePhase::PostCleanup)
+                && phase_change == Some(MirPhase::Runtime(RuntimePhase::Optimized))
                 && let Some(limit) = &tcx.sess.opts.unstable_opts.mir_opt_bisect_limit
+                && matches!(pass.policy(&ctx), PassPolicy::Optional { .. })
                 && limited_by_opt_bisect(
                     tcx,
                     tcx.def_path_debug_str(body.source.def_id()),
@@ -376,16 +454,6 @@ pub(super) fn dump_mir_for_phase_change<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tc
     if let Some(dumper) = MirDumper::new(tcx, body.phase.name(), body) {
         dumper.set_show_pass_num().set_disambiguator(&"after").dump_mir(body)
     }
-}
-
-fn is_optimization_stage(
-    body: &Body<'_>,
-    phase_change: Option<MirPhase>,
-    optimizations: Optimizations,
-) -> bool {
-    optimizations == Optimizations::Allowed
-        && body.phase == MirPhase::Runtime(RuntimePhase::PostCleanup)
-        && phase_change == Some(MirPhase::Runtime(RuntimePhase::Optimized))
 }
 
 fn limited_by_opt_bisect<'tcx, P>(

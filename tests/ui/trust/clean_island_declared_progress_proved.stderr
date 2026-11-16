@@ -1,0 +1,24 @@
+note: Clean island kernel-checked: 13 declaration(s) registered (HarnessPolicy.v, HarnessPolicy.n, HarnessPolicy.c, HarnessPolicy.is, HarnessPolicy.both, HarnessPolicy.either, HarnessPolicy.above, HarnessPolicy.set, HarnessPolicy.act, HarnessPolicy.editsLeft, HarnessPolicy.Protocol, HarnessPolicy.OneWriter, HarnessPolicy.CatchesUp)
+  --> $DIR/clean_island_declared_progress_proved.rs:15:5
+   |
+LL | /     import Trust.FiniteModelCheck
+LL | |     -- A model taken from a real program: aterm, a terminal whose supervisor
+LL | |     -- approves agent dialogs under a policy written in a config file. The policy
+LL | |     -- has ONE writer, the config watcher. This is the scalar model of that
+...  |
+LL | |           (HarnessPolicy.is (HarnessPolicy.v "in_force") (HarnessPolicy.v "disk")))
+LL | |         ["Poll", "Deliver", "Forget"] []
+   | |________________________________________^
+
+note: finite model `HarnessPolicy.OneWriter` proved safe by the kernel: every reachable state satisfies every invariant (`trust_checked_safe.HarnessPolicy.OneWriter : ScalarModel.safetyClaim HarnessPolicy.OneWriter`, state budget 256)
+  --> $DIR/clean_island_declared_progress_proved.rs:110:5
+   |
+LL |     def OneWriter : Trust.Temporal.FiniteModel.ScalarModel := Protocol 0
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: progress claim `HarnessPolicy.CatchesUp` proved by the kernel: on every fair run of `HarnessPolicy.OneWriter` the goal holds again and again (`trust_checked_live.HarnessPolicy.CatchesUp : ScalarProgress.claim HarnessPolicy.CatchesUp`, from a certificate of its 85 reachable states)
+  --> $DIR/clean_island_declared_progress_proved.rs:114:5
+   |
+LL |     def HarnessPolicy.CatchesUp : Trust.Temporal.FiniteModel.ScalarProgress :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

@@ -77,3 +77,15 @@ inclusive functions; the inclusive family was never a zero-row case here.
 `exclusive_at_ceiling` is a reported Level-0 violation in the shipped compiler
 run; `inclusive_at_ceiling` — the same 2^28-element allocation — is an
 unproved-coverage-gap row, not a proof. Both are unchanged by this patch.
+
+## Amendment 2026-10-06 — the destination-size token
+
+The dumps were taken when the extractor's `__trust_elem_bytes@N` token on a
+`collect` did not yet carry the destination element's layout size (`@32` above for
+a `Vec<u8>` destination). The current extractor emits `@1` for the same program
+(measured on stage1, 2026-10-06: `v.into_iter().collect::<Vec<u8>>()` dumps
+`…::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes@1>`). Since D12 option (a)
+the bounded-source grant compares that token with the source's item bound, so every
+`Vec<u8>` collect sink in this directory, `no-std-sysroot-impersonation-2026-08-17`
+and `trusted-root-spoof-endless-iter-2026-08-16` was rewritten to `@1`. Nothing else
+in the bundles was touched.

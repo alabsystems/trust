@@ -3,8 +3,8 @@
 #
 # 1 as of 2026-08-23 — `crates/trust-memchr`, and it is a legitimate opt-out
 # rather than debt. That crate is consumed as a `[patch.crates-io]` path from
-# five workspace roots (root, crates/, targo-trust/, src/bootstrap/, library/),
-# and `[lints] workspace = true` makes it resolve against `crates/Cargo.toml` as
+# multiple build roots (root, src/bootstrap/, library/),
+# and `[lints] workspace = true` makes it resolve against root `Cargo.toml` as
 # its workspace root. Measured: with the table present, the `rustc-dep-of-std`
 # build loses its prelude and the crate fails with 156 `cannot find ... in this
 # scope` errors. Its own manifest header documents the general rule — manifest
@@ -14,6 +14,10 @@
 # This is the case `workspace_lints.rs`'s own doc comment anticipates: "a future
 # split of the policy (a workspace whose members legitimately opt out) can be
 # recorded and then walked back down." Walk it back down only if trust-memchr
-# stops being a multi-root patch, not by re-adding the table.
+# stops being a multi-root patch, not by re-adding the table. Crates that
+# declare their own `[workspace]` are not members and are not counted.
+#
+# 1 again as of 2026-11-10: `crates/trust-sha2-compat` (2 from 2026-09-29) was
+# deleted with the other crates nothing used.
 
 1

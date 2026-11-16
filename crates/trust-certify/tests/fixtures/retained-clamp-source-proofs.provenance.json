@@ -1,0 +1,24 @@
+{
+  "description": "Exact selected proof/identity/snapshot fields from the authenticated c276/d461 live 117-obligation run. Compression and JSON container encoding alone changed; certificate envelope and original VC strings are retained unchanged. Saved reports supply test inputs, not proof authority.",
+  "source_commit": "c276f8622de860bcb2c4ffc7876d9a704fe6bf88",
+  "compiler_source_identity": "d461d0eacace51437f12dd2b2b66ff7dd2852aa9",
+  "capture": "NOV3-CLAMP-SELFUSE/recovery-20261109/run-20261110T015722537389Z",
+  "report_sha256": {
+    "trust-budget": "cf5eff3a66d33a9da7a372734a37d3d750bbf61555f8e1d74249bba0d9c97fba",
+    "trust-intbound": "bc71c3d3eab50425038c15d4098c7a774ba627fbf7c2092e731e7fdeceefc494",
+    "trust-widthconv": "1477569ab6e1b15aceb64326261e51d6fed8370822ebe6a7d95d0e4ee44c5933"
+  },
+  "compressed_sha256": "d3c041807e4301a0278878b8880b29d1eac7661dae52bfeb39464373a2d3d54f",
+  "raw_sha256": "9e80b4deebb1a5a303879b8998413f573d3f3134b59b65bd8ae9c32b7de1a742",
+  "raw_bytes": 3295411,
+  "obligation_ids": [
+    "obligation:trust_budget__process_ceiling_mb:postcondition:0",
+    "obligation:trust_budget__process_ceiling_mb:postcondition:1",
+    "obligation:trust_intbound__clamp_to_max:postcondition:0",
+    "obligation:trust_intbound__clamp_to_max:postcondition:1",
+    "obligation:trust_intbound__clamp_width:postcondition:0",
+    "obligation:trust_intbound__clamp_width:postcondition:1",
+    "obligation:trust_widthconv__join_width:postcondition:0",
+    "obligation:trust_widthconv__join_width:postcondition:1"
+  ]
+}

@@ -1,0 +1,30 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+;
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+; RUN: %tpde_test --run-until=ir --print-ir %s | FileCheck %s --dump-input always
+
+; CHECK: Printing IR
+
+; CHECK-LABEL: Extern function ext_func
+; CHECK-NEXT: Argument a
+ext_func(%a)!
+
+; CHECK-LABEL: Function impl_func
+impl_func() {
+; CHECK-NEXT: Block entry
+entry:
+; CHECK-NEXT: Value a (call)
+; CHECK-NEXT: Target ext_func2
+  %a = call @ext_func2
+; CHECK-NEXT: Value b (call)
+; CHECK-NEXT: Target ext_func
+; CHECK-NEXT: Op a
+  %b = call @ext_func, %a
+; CHECK-NEXT: Value (ret)
+; CHECK-NEXT: Op b
+  ret %b
+}
+
+; CHECK-LABEL: Extern function ext_func2
+ext_func2()!

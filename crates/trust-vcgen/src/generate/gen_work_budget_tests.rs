@@ -72,6 +72,7 @@ fn func_with_locals(name: &str, locals: Vec<LocalDecl>, return_ty: Ty) -> Verifi
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -119,37 +120,68 @@ fn gen_work_meter_trips_and_place_ty_degrades_to_leaf() {
 
 /// A function whose generation explodes past the work budget degrades WHOLESALE to a
 /// single fail-closed `UnsupportedMir` obligation (which preclassifies to Unknown,
-/// never Proved). This is the SOUNDNESS core: the bound only ADDS Unknown — it never
+/// never Proved), discarding every partial safety obligation built before or after the
+/// trip. This is the SOUNDNESS core: the bound only ADDS Unknown — it never
 /// manufactures a PROVE and never a guaranteed-violation.
 #[test]
 fn generate_vcs_degrades_whole_function_on_work_budget_trip() {
     let _guard = GEN_WORK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _budget = GenWorkBudgetGuard::new(GEN_WORK_TEST_BUDGET);
+    let i64_ty = Ty::Int { width: 64, signed: true };
     let mut func = func_with_locals(
         "gen_explode",
         vec![
-            LocalDecl { index: 0, ty: Ty::Unit, name: None },
+            LocalDecl { index: 0, ty: i64_ty.clone(), name: None },
             LocalDecl { index: 1, ty: fat_adt_ty(GEN_WORK_FAT_FIELDS), name: Some("e".into()) },
             LocalDecl { index: 2, ty: fat_adt_ty(GEN_WORK_FAT_FIELDS), name: Some("f".into()) },
+            LocalDecl { index: 3, ty: i64_ty.clone(), name: Some("x".into()) },
+            LocalDecl { index: 4, ty: i64_ty.clone(), name: Some("y".into()) },
         ],
-        Ty::Unit,
+        i64_ty,
     );
-    // Statements that read the fat-Adt locals so the VC-gen walk materializes
-    // their types through `place_ty` (driving the meter over budget).
+    // Assign between the fat-Adt locals AND follow with two real arithmetic safety
+    // obligations (`Div` + `Rem`) so VC generation both emits multiple partial rows
+    // and materializes the fat locals' sorts/types (driving the meter over budget).
     func.body.blocks[0].stmts = vec![
         Statement::Assign {
-            place: Place::local(0),
-            rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
-            span: SourceSpan::default(),
-        },
-        Statement::Assign {
-            place: Place::local(0),
+            place: Place::local(1),
             rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
             span: SourceSpan::default(),
         },
+        Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::BinaryOp(
+                trust_types::BinOp::Div,
+                Operand::Copy(Place::local(3)),
+                Operand::Copy(Place::local(4)),
+            ),
+            span: SourceSpan::default(),
+        },
+        Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::BinaryOp(
+                trust_types::BinOp::Rem,
+                Operand::Copy(Place::local(3)),
+                Operand::Copy(Place::local(4)),
+            ),
+            span: SourceSpan::default(),
+        },
     ];
+    {
+        let _unbounded = GenWorkBudgetGuard::new(0);
+        let unbounded_vcs = super::generate_vcs(&func);
+        assert_eq!(
+            unbounded_vcs.len(),
+            4,
+            "without the work-budget bound, signed Div + Rem emit 4 safety obligations (div/rem-by-zero + MIN/-1 overflow)"
+        );
+    }
+    let _budget = GenWorkBudgetGuard::new(GEN_WORK_TEST_BUDGET);
     let vcs = super::generate_vcs(&func);
-    assert_eq!(vcs.len(), 1, "a tripped function degrades to a SINGLE obligation");
+    assert_eq!(
+        vcs.len(),
+        1,
+        "a tripped function discards all partial obligations and degrades to a SINGLE obligation"
+    );
     match &vcs[0].kind {
         VcKind::UnsupportedMir { kind, .. } => {
             assert_eq!(
@@ -164,6 +196,35 @@ fn generate_vcs_degrades_whole_function_on_work_budget_trip() {
     assert!(
         matches!(vcs[0].formula, Formula::Bool(true)),
         "the fail-closed degrade formula must be Bool(true) (never provable)"
+    );
+
+    // Conversely, an obligation-free `Return` body that merely copies fat-Adt locals
+    // into `Unit` does not eagerly build `StmtVersionCtx` / `path_definition_map` /
+    // `semantic_guards`, so it emits 0 obligations rather than spuriously degrading.
+    let mut noop = func_with_locals(
+        "gen_noop_fat_copy",
+        vec![
+            LocalDecl { index: 0, ty: Ty::Unit, name: None },
+            LocalDecl { index: 1, ty: fat_adt_ty(GEN_WORK_FAT_FIELDS), name: Some("e".into()) },
+            LocalDecl { index: 2, ty: fat_adt_ty(GEN_WORK_FAT_FIELDS), name: Some("f".into()) },
+        ],
+        Ty::Unit,
+    );
+    noop.body.blocks[0].stmts = vec![
+        Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+            span: SourceSpan::default(),
+        },
+        Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+            span: SourceSpan::default(),
+        },
+    ];
+    assert!(
+        super::generate_vcs(&noop).is_empty(),
+        "an obligation-free Unit copy body must not spuriously trip the work budget"
     );
 }
 
@@ -524,13 +585,18 @@ fn enum_variant_tag_set_uses_actual_discriminants() {
     };
     assert_eq!(super::enum_variant_tag_set(&dt), Some(vec![0, 1, 2]));
     // #[repr] enum with explicit non-contiguous discriminants: tags are {5, 10}.
-    let adt = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    let adt = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "Repr".into(),
-        fields: vec![],
+        fields: vec![].into(),
         variants: vec![
             VariantDef { name: "A".into(), discriminant: 5, fields: vec![] },
             VariantDef { name: "B".into(), discriminant: 10, fields: vec![] },
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -544,10 +610,14 @@ fn enum_variant_tag_set_uses_actual_discriminants() {
     // A struct (no variants), a by-name datatype reference (empty variants), and a
     // scalar are NOT enums — no tag set, so no (potentially-vacuous) bound.
     assert_eq!(
-        super::enum_variant_tag_set(&Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+        super::enum_variant_tag_set(&Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
+            adt_kind: None,
+            layout: None,
             name: "S".into(),
-            fields: vec![("x".into(), Ty::Bool)],
-            variants: vec![],
+            fields: vec![("x".into(), Ty::Bool)].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -567,14 +637,19 @@ fn enum_variant_tag_set_uses_actual_discriminants() {
 /// a phantom tag outside the variant range.
 fn func_reading_enum_discriminant() -> VerifiableFunction {
     use trust_types::VariantDef;
-    let e = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    let e = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "clean_kernel::Expr".into(),
         variants: vec![
             VariantDef { name: "App".into(), discriminant: 0, fields: vec![] },
             VariantDef { name: "Var".into(), discriminant: 1, fields: vec![] },
             VariantDef { name: "Lam".into(), discriminant: 2, fields: vec![] },
-        ],
-        fields: vec![],
+        ]
+        .into(),
+        fields: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -631,10 +706,14 @@ fn discriminant_range_facts_skip_non_enum_source() {
             // A struct ADT (variants: []) — its discriminant has no variant range.
             LocalDecl {
                 index: 1,
-                ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+                ty: Ty::Adt {
+                    arbitrary_precision: None,
+                    validity_wrapper: None,
+                    adt_kind: None,
+                    layout: None,
                     name: "S".into(),
-                    fields: vec![("x".into(), Ty::Bool)],
-                    variants: vec![],
+                    fields: vec![("x".into(), Ty::Bool)].into(),
+                    variants: vec![].into(),
                     disc_index_safe: false,
                     faithful_enum_repr: None,
                     enum_layout: None,
@@ -665,14 +744,19 @@ fn discriminant_range_facts_skip_non_enum_source() {
 #[test]
 fn discriminant_range_facts_fold_tags_across_narrowing_cast() {
     use trust_types::VariantDef;
-    let e = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    let e = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "t::E".into(),
         variants: vec![
             VariantDef { name: "A".into(), discriminant: 0, fields: vec![] },
             VariantDef { name: "B".into(), discriminant: 260, fields: vec![] },
             VariantDef { name: "C".into(), discriminant: 512, fields: vec![] },
-        ],
-        fields: vec![],
+        ]
+        .into(),
+        fields: vec![].into(),
         disc_index_safe: true,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -747,19 +831,16 @@ fn func_casting_enum_discriminant(
     use trust_types::VariantDef;
     let e = Ty::Adt {
         arbitrary_precision: None,
+        validity_wrapper: None,
         adt_kind: None,
         layout: None,
         name: "t::E".into(),
         variants: raw_tags
             .iter()
             .enumerate()
-            .map(|(i, &t)| VariantDef {
-                name: format!("V{i}"),
-                discriminant: t,
-                fields: vec![],
-            })
+            .map(|(i, &t)| VariantDef { name: format!("V{i}"), discriminant: t, fields: vec![] })
             .collect(),
-        fields: vec![],
+        fields: vec![].into(),
         disc_index_safe: true,
         faithful_enum_repr: repr_hint.map(Some),
         enum_layout: None,
@@ -798,7 +879,7 @@ fn has_cast_dest_tag_fact(func: &VerifiableFunction, facts: &[Formula]) -> bool 
 /// in its `i128` carrier, so the old `tags.iter().all(|&t| t >= 0)` gate was VACUOUS for
 /// every signed repr. WITNESS:
 ///
-/// ```ignore
+/// ```ignore (illustrative)
 /// #[repr(i8)] enum E { A = 0, B = -1 }        // patterns {0, 255}
 /// fn f(e: E, arr: &[u8; 256]) -> u8 { arr[e as usize] }
 /// ```
@@ -809,8 +890,7 @@ fn has_cast_dest_tag_fact(func: &VerifiableFunction, facts: &[Formula]) -> bool 
 /// `{0, -1}`, so the gate declines and NO cast fact is emitted (fail-closed).
 #[test]
 fn discriminant_cast_fact_fails_closed_for_negative_repr_i8_tag() {
-    let func =
-        func_casting_enum_discriminant(&[0, 255], Ty::Int { width: 8, signed: true }, None);
+    let func = func_casting_enum_discriminant(&[0, 255], Ty::Int { width: 8, signed: true }, None);
     let facts = super::build_discriminant_variant_range_facts(&func);
     assert!(
         !has_cast_dest_tag_fact(&func, &facts),
@@ -860,10 +940,8 @@ fn discriminant_cast_fact_still_emitted_for_nonnegative_tags() {
         "a non-negative repr(i8) tag set {{0,1,2}} keeps its `as usize` cast fact: {facts:?}"
     );
     let cast_name = crate::place_to_var_name(&func, &Place::local(3));
-    let cast_fact = facts
-        .iter()
-        .find(|f| f.free_variables().contains(&cast_name))
-        .expect("checked above");
+    let cast_fact =
+        facts.iter().find(|f| f.free_variables().contains(&cast_name)).expect("checked above");
     assert!(
         matches!(cast_fact, Formula::Or(cases) if cases.len() == 3),
         "expected the 3-way membership `_3 ∈ {{0,1,2}}`: {cast_fact:?}"

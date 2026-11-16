@@ -5,7 +5,7 @@
 mod tests;
 
 use std::io::{self, Write};
-use std::process::{Child, Output};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output};
 
 use self::imp::read2;
 
@@ -15,17 +15,65 @@ pub(crate) enum Truncated {
     No,
 }
 
+// Trust: borrow the execution owner's child; errors must not detach it from
+// the scheduler guard which kills/reaps it before another case may execute.
+pub(crate) trait OutputChild {
+    fn take_stdin(&mut self) -> Option<ChildStdin>;
+    fn take_stdout(&mut self) -> Option<ChildStdout>;
+    fn take_stderr(&mut self) -> Option<ChildStderr>;
+    fn wait(&mut self) -> io::Result<ExitStatus>;
+}
+impl OutputChild for Child {
+    fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.stdin.take()
+    }
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.stdout.take()
+    }
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.stderr.take()
+    }
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        Child::wait(self)
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl OutputChild for trust_resource_controller::client::probe_scheduler::InheritedChild {
+    fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.take_stdin()
+    }
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.take_stdout()
+    }
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.take_stderr()
+    }
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.wait()
+    }
+}
+
+pub(crate) fn read2_output(child: &mut impl OutputChild) -> io::Result<Output> {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    drop(child.take_stdin());
+    read2(child.take_stdout().unwrap(), child.take_stderr().unwrap(), &mut |out, data, _| {
+        if out { &mut stdout } else { &mut stderr }.append(data);
+    })?;
+    Ok(Output { status: child.wait()?, stdout, stderr })
+}
+
 pub(crate) fn read2_abbreviated(
-    mut child: Child,
+    child: &mut impl OutputChild,
     filter_paths_from_len: &[String],
 ) -> io::Result<(Output, Truncated)> {
     let mut stdout = ProcOutput::new();
     let mut stderr = ProcOutput::new();
 
-    drop(child.stdin.take());
+    drop(child.take_stdin());
     read2(
-        child.stdout.take().unwrap(),
-        child.stderr.take().unwrap(),
+        child.take_stdout().unwrap(),
+        child.take_stderr().unwrap(),
         &mut |is_stdout, data, _| {
             if is_stdout { &mut stdout } else { &mut stderr }.extend(data, filter_paths_from_len);
             data.clear();
@@ -38,7 +86,16 @@ pub(crate) fn read2_abbreviated(
     Ok((Output { status, stdout: stdout.into_bytes(), stderr: stderr.into_bytes() }, truncated))
 }
 
-const MAX_OUT_LEN: usize = 512 * 1024;
+// Trust: upstream keeps the first 512 KiB. A Trust compile's `TRUST_JSON` rows carry each
+// function's inline native verification bundle, and rustc's JSON emitter repeats a diagnostic's
+// message in `rendered`, so one row of a six-line function measured 546,796 bytes (2026-10-13,
+// `instance_hypothesis/mutual_recursion_discharge_through_closure_callee.rs#json`) and a
+// whole-file capture about 2 MB (`self_guarded_literal_operand.rs`). Past the cap the remaining
+// diagnostics were never parsed, so annotations after it could not be checked (and unexpected
+// diagnostics there went unseen). 16 MiB keeps the runaway-output guard this constant exists for
+// while leaving room for the evidence a verifying compiler prints. A capture that still hits it
+// is refused by the UI runner rather than checked partially (see `runtest/ui.rs`).
+const MAX_OUT_LEN: usize = 16 * 1024 * 1024;
 
 // Whenever a path is filtered when counting the length of the output, we need to add some
 // placeholder length to ensure a compiler emitting only filtered paths doesn't cause a OOM.

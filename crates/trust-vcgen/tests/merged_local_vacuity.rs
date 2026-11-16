@@ -28,6 +28,9 @@
 
 use trust_types::{VcKind, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 /// `-Ztrust-dump` capture of
 ///
 ///   pub fn grid_merged(g: &[u8; 6], c: bool, b: usize) -> u8 {
@@ -152,7 +155,7 @@ fn verdicts(mir: &str) -> Vec<(VcKind, VerificationResult, bool)> {
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
             let vcs = trust_vcgen::generate_vcs(&func);
-            let router = trust_router::Router::deterministic_in_process_ay(30_000);
+            let router = test_router::deterministic_test_router();
             router
                 .verify_all(&vcs)
                 .into_iter()

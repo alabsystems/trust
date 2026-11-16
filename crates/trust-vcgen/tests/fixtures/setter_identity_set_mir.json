@@ -1,6 +1,6 @@
 {
   "name": "set",
-  "def_path": "set",
+  "def_path": "assert_mut_setter_identity::set",
   "span": {
     "file": "tests/trust-falsification/proved/assert_mut_setter_identity.rs",
     "line_start": 9,

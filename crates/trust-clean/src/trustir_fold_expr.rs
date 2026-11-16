@@ -1691,7 +1691,7 @@ fn match_inline_tail(
     else {
         return Err(ws("inline key cast is not the opaque ptr-to-usize constant"));
     };
-    if !matches!(cast_value, ConstValue::OpaqueScalar { width: 64, signed: false })
+    if !matches!(cast_value, ConstValue::OpaqueScalar { width: 64, signed: false, .. })
         || !castp.projections.is_empty()
     {
         return Err(ws("inline key cast writes a projection"));
@@ -2363,7 +2363,7 @@ fn match_memo_get(func: &VerifiableFunction) -> R<()> {
         return Err(drift(m, "get bb0 is not the pinned key construction"));
     };
     let ok = mapsrc.local == 1
-        && matches!(k0_value, ConstValue::OpaqueScalar { width: 64, signed: false })
+        && matches!(k0_value, ConstValue::OpaqueScalar { width: 64, signed: false, .. })
         && mapsrc.projections == vec![Projection::Deref, Projection::Field(0)]
         && addrsrc.local == 2
         && addrsrc.projections == vec![Projection::Deref]
@@ -2431,7 +2431,7 @@ fn match_memo_put(func: &VerifiableFunction) -> R<()> {
         return Err(drift(m, "put bb0 is not the pinned key+clone construction"));
     };
     let ok = mapsrc.local == 1
-        && matches!(k0_value, ConstValue::OpaqueScalar { width: 64, signed: false })
+        && matches!(k0_value, ConstValue::OpaqueScalar { width: 64, signed: false, .. })
         && mapsrc.projections == vec![Projection::Deref, Projection::Field(0)]
         && addrsrc.local == 2
         && addrsrc.projections == vec![Projection::Deref]
@@ -4048,6 +4048,7 @@ fn match_ctor_closure(
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 ..
             } if dest.projections.is_empty() => {
                 if output_written || !defined.insert(dest.local) {
@@ -5252,6 +5253,7 @@ fn match_zst_ctor_closure(
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 ..
             } if dest.projections.is_empty() => {
                 if output_written || !defined.insert(dest.local) {
@@ -5356,6 +5358,21 @@ fn ty_can_carry_folder_alias(ty: &Ty) -> bool {
     }
 }
 
+/// std's zero-sized markers: an ADT at one of these exact paths has no field because it
+/// has no byte, not because its fields went unrendered.
+fn is_zero_sized_std_marker(name: &str) -> bool {
+    let base = name.split('<').next().unwrap_or(name).trim();
+    matches!(
+        base,
+        "core::marker::PhantomData"
+            | "std::marker::PhantomData"
+            | "core::marker::PhantomPinned"
+            | "std::marker::PhantomPinned"
+            | "alloc::alloc::Global"
+            | "std::alloc::Global"
+    )
+}
+
 /// Detect semantic interior-mutability channels visible through a shared
 /// reference. Runtime bookkeeping hidden inside immutable std containers
 /// (Arc refcounts, collection allocation state) is not a mutation of the
@@ -5450,9 +5467,18 @@ fn has_exposed_interior_mutability_fueled(defs: &DatatypeDefs, ty: &Ty, fuel: u3
                     has_exposed_interior_mutability_fueled(defs, pointee, fuel)
                 });
             }
-            fields
-                .iter()
-                .any(|(_, field)| has_exposed_interior_mutability_fueled(defs, field, fuel))
+            // Trust: 2026-10-20 (VGAPS-G2-FOLLOWUP (5), the audit of the interior-mutability
+            // predicates outside trust-vcgen) — an ADT rendered with NO field and NO variant
+            // is not evidence of holding nothing: a shape the extractor did not record
+            // renders the same way, and the `any` below is vacuously `false` on it, a GRANT
+            // (a `&Holder` whose `Cell` was never rendered read as detached). Fail closed, as
+            // trust-vcgen's cell walk (`path_defs::ty_may_hold_cell_bytes`) does, except for
+            // std's zero-sized markers, which hold no byte. The pinned clean-kernel name
+            // family above keeps its own one-level field fence.
+            (fields.is_empty() && variants.is_empty() && !is_zero_sized_std_marker(name))
+                || fields
+                    .iter()
+                    .any(|(_, field)| has_exposed_interior_mutability_fueled(defs, field, fuel))
                 || variants
                     .iter()
                     .flat_map(|variant| &variant.fields)

@@ -29,15 +29,14 @@
 //! `trust_certify::clean_island::CleanIslandSession` — the exact compiler
 //! path; harness outside this file because trust-certify is not a dependency)
 //!
-//! **R0 diagnostic flip — LANDED IN THE SIBLING, NOT YET AT THE PIN.**
+//! **R0 diagnostic flip — landed in the sibling and now AT THE PIN.**
 //! Written on `alabsystems/clean` branch `recursion-refusal-r0`, commit
-//! **`f391bd4664a9bd95eae814e449db8a941bd66dce`** (2026-08-22), pushed. The
-//! pin this superproject carries is still `315d9a41c`, so **as measured from
-//! THIS tree today the "was" column below is what the compiler still
-//! prints**; the "now" column becomes true in the same commit that moves the
-//! `first-party/clean` gitlink onto that sha, and the rows are written this
-//! way so the two cannot be confused. Do not read a "now" as a measurement
-//! from here.
+//! **`f391bd4664a9bd95eae814e449db8a941bd66dce`** (2026-08-22). When this
+//! header was first written the superproject still pinned `315d9a41c`, so the
+//! rows below carry a "was" column (what the compiler printed then) and a
+//! "now" column (what the R0 commit prints). Measured 2026-09-21: the
+//! `first-party/clean` gitlink (`faf434b73`) contains `f391bd4664`, so the
+//! "now" column is what THIS tree compiles; "was" is history.
 //!
 //! What it changes: the five gcd-shaped REJECTED rows below surfaced as
 //! `UnknownIdentWithSuggestions`/`UnknownIdent`, and the suggestion machinery
@@ -90,11 +89,11 @@
 //!
 //! # R4 amendment (2026-08-22) — the Bool-test spelling now ADMITS on a branch
 //!
-//! **This is a BRANCH measurement, not a superproject one.** The gitlink still
-//! names R3 (`27a46804e`); the rows marked *"on branch `gcd-bool-spelling`"*
-//! above were measured in `first-party/clean` on that branch and do NOT
-//! describe what this repo compiles until the pin moves. Read them the same way
-//! as the older *"on the R0 branch"* annotations.
+//! **Originally a BRANCH measurement.** When written, the gitlink still named
+//! R3 (`27a46804e`) and the rows marked *"on branch `gcd-bool-spelling`"* were
+//! measured in `first-party/clean` on that branch. Measured 2026-09-21: the
+//! pin (`faf434b73`) contains both `27a46804e` and the R4 commit, so those rows
+//! now describe what this repo compiles.
 //!
 //! What changed there, and what it cost:
 //!
@@ -296,6 +295,7 @@ fn vf(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -310,6 +310,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: Place, target: BlockId) -> Termi
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         unwind: UnwindEdge::Unreachable,
     }
 }

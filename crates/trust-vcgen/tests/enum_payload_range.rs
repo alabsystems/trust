@@ -75,6 +75,9 @@
 
 use trust_types::{VcKind, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn load(json: &str) -> VerifiableFunction {
     serde_json::from_str(json).expect("fixture MIR must deserialize")
 }
@@ -151,7 +154,7 @@ fn safety_verdicts(json: &str) -> Vec<(VcKind, VerificationResult)> {
                  every assertion below vacuous",
                 func.name
             );
-            let router = trust_router::Router::deterministic_in_process_ay(60_000);
+            let router = test_router::deterministic_test_router();
             let results = router.verify_all(&vcs);
             vcs.iter().map(|vc| vc.kind.clone()).zip(results.into_iter().map(|(_, r)| r)).collect()
         })
@@ -198,6 +201,35 @@ fn assert_not_proved(json: &str, want: fn(&VcKind) -> bool, witness: &str) {
 
 fn is_overflow(k: &VcKind) -> bool {
     matches!(k, VcKind::ArithmeticOverflow { .. })
+}
+
+/// Does the rendered formula carry the conjunct `var <= bound`, under the bare
+/// name OR any SSA version of it (`var#<token>`)?
+///
+/// Trust (W4 fix round 1, 2026-09-25): a downcast payload name `_47@1.0` is now
+/// VERSIONED by a write of its enum local `_47` (`@` joined the place-name
+/// algebra's separator set, so `place_names_overlap("_47", "_47@1.0")` holds). On
+/// the two corpus rows below `_47`/`_19`/`_28` are call destinations inside a
+/// loop, so their payload reads now spell `_47@1.0#s28_t` — the version of the
+/// payload the latest write produced — where they used to spell one bare name
+/// for every iteration's payload. The range facts these tests are about are
+/// unchanged; only the spelling moved, so the string checks match either.
+fn has_upper_bound(rendered: &str, var: &str, bound: &str) -> bool {
+    let head = format!("Le(Var(\"{var}");
+    let tail = format!("\", Int), Int({bound}))");
+    let mut from = 0;
+    while let Some(at) = rendered[from..].find(&head) {
+        let rest = &rendered[from + at + head.len()..];
+        let versioned = rest
+            .strip_prefix('#')
+            .and_then(|r| r.find('"').map(|q| &r[q..]))
+            .is_some_and(|r| r.starts_with(&tail));
+        if rest.starts_with(&tail) || versioned {
+            return true;
+        }
+        from += at + 1;
+    }
+    false
 }
 fn is_bounds(k: &VcKind) -> bool {
     matches!(k, VcKind::IndexOutOfBounds)
@@ -791,16 +823,14 @@ fn pre_p4_option_u64_in_the_clean_kernel_corpus_is_bounded_by_the_payload() {
             for vc in trust_vcgen::generate_vcs(&func) {
                 let rendered = format!("{:?}", vc.formula);
                 for var in ["_19@1.0", "_28@1.0"] {
-                    let signed = format!("Le(Var(\"{var}\", Int), Int({tag}))");
-                    let unsigned = format!("Le(Var(\"{var}\", Int), Int({payload}))");
                     assert!(
-                        !rendered.contains(&signed),
+                        !has_upper_bound(&rendered, var, tag),
                         "{var} is an `Option<u64>` payload read through \
                          `Downcast(1).Field(0)`; bounding it by the `__tag: i64` slot \
                          excludes every value above i64::MAX and deletes the overflow \
                          witness"
                     );
-                    saw_payload_bound |= rendered.contains(&unsigned);
+                    saw_payload_bound |= has_upper_bound(&rendered, var, payload);
                 }
             }
             saw_payload_bound
@@ -847,7 +877,7 @@ fn the_wrong_tag_bound_was_discharging_a_corpus_obligation() {
         .stack_size(SOLVER_STACK_BYTES)
         .spawn(move || {
             let vcs = trust_vcgen::generate_vcs(&func);
-            let router = trust_router::Router::deterministic_in_process_ay(60_000);
+            let router = test_router::deterministic_test_router();
             let results = router.verify_all(&vcs);
             vcs.iter()
                 .zip(results)
@@ -869,12 +899,12 @@ fn the_wrong_tag_bound_was_discharging_a_corpus_obligation() {
     );
     let (formula, verdict) = &decided[0];
     assert!(
-        !formula.contains("Le(Var(\"_47@1.0\", Int), Int(9223372036854775807))"),
+        !has_upper_bound(formula, "_47@1.0", "9223372036854775807"),
         "the `__tag: i64` upper bound on the payload is the hypothesis that discharged \
          this row at pristine HEAD; it may not come back"
     );
     assert!(
-        formula.contains("Le(Var(\"_47@1.0\", Int), Int(18446744073709551615))"),
+        has_upper_bound(formula, "_47@1.0", "18446744073709551615"),
         "and the payload's own declared `usize` range must be there instead — an absent \
          fact would pass the assertion above vacuously"
     );

@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 // trust-certify: CHECKER-CORE STRUCTURAL-POSTCONDITION discharge lane (`is_whnf`).
 //
 // This is the DISCHARGE half of Gap-A. The STATE + EMIT half already landed
@@ -552,8 +553,8 @@ pub fn certify_is_whnf(fixture: &'static WhnfFixture) -> Option<trust_ir::ProofE
         return None;
     }
     run_on_large_stack(move || {
-        let spec = Specification::new().ok()?;
-        certify_with_spec(&spec, fixture)
+        let spec = crate::checker_core::checker_specification()?;
+        certify_with_spec(spec, fixture)
     })
     .flatten()
 }
@@ -602,10 +603,10 @@ pub fn recheck_is_whnf(
     let context = context_bytes.to_vec();
     let lineage = *lineage;
     run_on_large_stack(move || {
-        let Some(spec) = Specification::new().ok() else {
+        let Some(spec) = crate::checker_core::checker_specification() else {
             return false;
         };
-        recheck_with_spec(&spec, fixture, &term, &context, &lineage)
+        recheck_with_spec(spec, fixture, &term, &context, &lineage)
     })
     .unwrap_or(false)
 }
@@ -1039,8 +1040,8 @@ pub fn certify_is_whnf_from_mir(func: &VerifiableFunction) -> Option<trust_ir::P
     sealed_constructor_material(func)?;
     let func = func.clone();
     run_on_large_stack(move || {
-        let spec = Specification::new().ok()?;
-        certify_from_mir_with_spec(&spec, &func)
+        let spec = crate::checker_core::checker_specification()?;
+        certify_from_mir_with_spec(spec, &func)
     })
     .flatten()
 }
@@ -1097,10 +1098,10 @@ pub fn recheck_is_whnf_from_mir(
     let context = context_bytes.to_vec();
     let lineage = *lineage;
     run_on_large_stack(move || {
-        let Some(spec) = Specification::new().ok() else {
+        let Some(spec) = crate::checker_core::checker_specification() else {
             return false;
         };
-        recheck_from_mir_with_spec(&spec, &func, &term, &context, &lineage)
+        recheck_from_mir_with_spec(spec, &func, &term, &context, &lineage)
     })
     .unwrap_or(false)
 }
@@ -1245,10 +1246,9 @@ type WhnfKindSwitch = (usize, Vec<(u128, BlockId)>, BlockId);
 /// Find the SwitchInt that head-matches on `discriminant((*e).kind)` for an
 /// argument `e`, returning `(arg_local, targets, otherwise)`. Fail closed if no
 /// block ends in such a SwitchInt (the fn does not match on an argument's
-/// `ExprKind` head at all).
-pub(crate) fn whnf_kind_switch_public(
-    func: &VerifiableFunction,
-) -> Option<(usize, Vec<(u128, BlockId)>, BlockId)> {
+/// `ExprKind` head at all). Only the `cfg(test)` reducer composition reads it.
+#[cfg(test)]
+pub(crate) fn whnf_kind_switch_public(func: &VerifiableFunction) -> Option<WhnfKindSwitch> {
     whnf_kind_switch(func)
 }
 
@@ -1299,7 +1299,9 @@ fn skip_noop_gotos(func: &VerifiableFunction, start: BlockId) -> Option<&BasicBl
 /// then reach `return` — with NO intervening value-writing statement? This is the
 /// structural read of `return e.clone()` (the identity). Fail closed on any other
 /// shape (the FVar conditional arm's `RefCell::borrow`, the fall-through's
-/// `inc_heartbeat`, or a block that clones a DIFFERENT local).
+/// `inc_heartbeat`, or a block that clones a DIFFERENT local). Only the
+/// `cfg(test)` reducer composition reads it.
+#[cfg(test)]
 pub(crate) fn block_returns_clone_of_arg_public(
     func: &VerifiableFunction,
     target: BlockId,
@@ -1705,9 +1707,17 @@ pub fn whnf_inner_is_cached_reducer(func: &VerifiableFunction) -> bool {
 /// diagnostic Rust witness; no certificate-authority path consumes it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CachedReducerLandmarks {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read only by the cfg(test) reducer_universal_composition")
+    )]
     pub reducer: BlockId,
     pub insert: BlockId,
     pub hit_arm: BlockId,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read only by the cfg(test) reducer_universal_composition")
+    )]
     pub miss_arm: BlockId,
     pub after_reducer: BlockId,
 }
@@ -2118,8 +2128,8 @@ pub fn certify_whnf_identity_from_mir(
     sealed_whnf_identity_material(func, variant)?;
     let func = func.clone();
     run_on_large_stack(move || {
-        let spec = Specification::new().ok()?;
-        certify_whnf_identity_with_spec(&spec, &func, variant)
+        let spec = crate::checker_core::checker_specification()?;
+        certify_whnf_identity_with_spec(spec, &func, variant)
     })
     .flatten()
 }
@@ -2179,10 +2189,10 @@ pub fn recheck_whnf_identity_from_mir(
     let context = context_bytes.to_vec();
     let lineage = *lineage;
     run_on_large_stack(move || {
-        let Some(spec) = Specification::new().ok() else {
+        let Some(spec) = crate::checker_core::checker_specification() else {
             return false;
         };
-        recheck_whnf_identity_with_spec(&spec, &func, variant, &term, &context, &lineage)
+        recheck_whnf_identity_with_spec(spec, &func, variant, &term, &context, &lineage)
     })
     .unwrap_or(false)
 }

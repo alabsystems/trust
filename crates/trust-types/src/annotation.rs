@@ -176,7 +176,7 @@ pub fn build_proof_annotation(
     }
 }
 
-fn vc_kind_tag(kind: &VcKind) -> String {
+pub(crate) fn vc_kind_tag(kind: &VcKind) -> String {
     #[allow(unreachable_patterns)] // wildcard kept for #[non_exhaustive] forward compat
     match kind {
         VcKind::ArithmeticOverflow { op, .. } => format!("arithmetic_overflow_{}", op_tag(op)),
@@ -241,6 +241,7 @@ fn vc_kind_tag(kind: &VcKind) -> String {
         // trust_wp contract VcKind tags.
         VcKind::TypeRefinementViolation { .. } => "type_refinement_violation".to_string(),
         VcKind::FrameConditionViolation { .. } => "frame_condition_violation".to_string(),
+        VcKind::TypeInvariant { point, .. } => format!("type_invariant_{}", point.as_tag()),
         // Catch-all for future #[non_exhaustive] variants.
         _ => "unknown".to_string(),
     }

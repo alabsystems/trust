@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-MRB): the SYNTACTIC SHARED-BORROW PEEL. A scrutinee the programmer
 //! WROTE as `&e` — at any depth — against arms that each carry the matching
 //! `PatKind::Deref` layers is notation for the by-value match: the dispatch reads

@@ -1,0 +1,11 @@
+error: the out-of-line Clean unit `clean_unit_both_spellings_helper` is spelled twice on disk: both `$DIR/clean_unit_both_spellings_helper.lean` and `$DIR/clean_unit_both_spellings_helper.clean` exist
+  --> $DIR/clean_unit_both_spellings.rs:7:1
+   |
+LL | clean mod clean_unit_both_spellings_helper;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `clean mod …;` accepts either spelling for ONE unit; with both present, no preference order could say which text is the authored one
+   = help: options: delete one of the two files; or name the intended one explicitly with `#[path = "…"]` on this item
+
+error: aborting due to 1 previous error
+

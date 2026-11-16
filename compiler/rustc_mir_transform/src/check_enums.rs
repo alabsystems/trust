@@ -1,14 +1,14 @@
 use rustc_abi::{Scalar, Size, TagEncoding, Variants, WrappingRange};
-use rustc_data_structures::thin_vec::ThinVec;
-use rustc_hir::LangItem;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_index::IndexVec;
-use rustc_middle::bug;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout::PrimitiveExt;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypingEnv};
-use rustc_session::Session;
+use rustc_span::bug;
 use tracing::debug;
+
+use crate::PassPolicy;
 
 /// This pass inserts checks for a valid enum discriminant where they are most
 /// likely to find UB, because checking everywhere like Miri would generate too
@@ -16,11 +16,25 @@ use tracing::debug;
 pub(super) struct CheckEnums;
 
 impl<'tcx> crate::MirPass<'tcx> for CheckEnums {
-    fn is_enabled(&self, sess: &Session) -> bool {
-        sess.ub_checks()
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // When UB checks are enabled this is part of their semantics, not an optimization.
+        PassPolicy::optional(ctx.ub_checks())
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        let has_enum_transmute = body.basic_blocks.iter().any(|block| {
+            block.statements.iter().any(|stmt| {
+                matches!(
+                    &stmt.kind,
+                    StatementKind::Assign((_, Rvalue::Cast(CastKind::Transmute, _, ty)))
+                        if ty.is_enum()
+                )
+            })
+        });
+        if !has_enum_transmute {
+            return;
+        }
+
         // This pass emits new panics. If for whatever reason we do not have a panic
         // implementation, running this pass may cause otherwise-valid code to not compile.
         if tcx.lang_items().get(LangItem::PanicImpl).is_none() {
@@ -61,8 +75,7 @@ impl<'tcx> crate::MirPass<'tcx> for CheckEnums {
                             );
                             basic_blocks[block].terminator = Some(Terminator {
                                 source_info,
-                                kind: TerminatorKind::Goto { target: new_block },
-                                attributes: ThinVec::new(),
+                                kind: TerminatorKind::goto(new_block),
                             });
                         }
                         EnumCheckType::Direct { source_op, discr, op_size, valid_discrs } => {
@@ -108,10 +121,6 @@ impl<'tcx> crate::MirPass<'tcx> for CheckEnums {
                 }
             }
         }
-    }
-
-    fn is_required(&self) -> bool {
-        true
     }
 }
 
@@ -397,7 +406,6 @@ fn insert_direct_enum_check<'tcx>(
                 invalid_discr_block,
             ),
         },
-        attributes: ThinVec::new(),
     });
 
     // Abort in case of an invalid enum discriminant.
@@ -417,7 +425,6 @@ fn insert_direct_enum_check<'tcx>(
             // make a failing UB check turn into much worse UB when we start unwinding.
             unwind: UnwindAction::Unreachable,
         },
-        attributes: ThinVec::new(),
     });
 }
 
@@ -463,7 +470,6 @@ fn insert_uninhabited_enum_check<'tcx>(
             // make a failing UB check turn into much worse UB when we start unwinding.
             unwind: UnwindAction::Unreachable,
         },
-        attributes: ThinVec::new(),
     });
 }
 
@@ -541,6 +547,5 @@ fn insert_niche_check<'tcx>(
             // make a failing UB check turn into much worse UB when we start unwinding.
             unwind: UnwindAction::Unreachable,
         },
-        attributes: ThinVec::new(),
     });
 }

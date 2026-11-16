@@ -37,7 +37,7 @@ use rustc_hir::def::DefKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{ConstOperand, Location, Terminator, TerminatorKind};
-use rustc_middle::ty::{self, GenericArgsRef, TyCtxt, TypingEnv};
+use rustc_middle::ty::{self, GenericArgs, TyCtxt, TypingEnv};
 use rustc_span::def_id::{DefId, LocalDefId};
 use trust_router::strengthen_whole_program::CoverageSignals;
 
@@ -51,7 +51,7 @@ use trust_router::strengthen_whole_program::CoverageSignals;
 #[derive(Clone)]
 pub(crate) struct MonoCallSite<'tcx> {
     /// The resolved generic args of this call's callee instance (`A` in `F::<A>`).
-    pub args: GenericArgsRef<'tcx>,
+    pub args: GenericArgs<'tcx>,
     /// The in-crate function whose body holds this call.
     pub caller: DefId,
     /// The call terminator's source `(line_start, col_start)`. Lets the per-mono harvest
@@ -284,9 +284,10 @@ fn source_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> trust_types::SourceSp
     let lo = source_map.lookup_char_pos(span.lo());
     let hi = source_map.lookup_char_pos(span.hi());
     trust_types::SourceSpan {
-        file: trust_types::stable_obligation_file(
+        file: trust_types::stable_obligation_file(trust_types::identity_file_rendering(
             lo.file.name.prefer_local_unconditionally().to_string(),
-        ),
+            lo.file.name.prefer_remapped_unconditionally().to_string(),
+        )),
         line_start: lo.line as u32,
         col_start: lo.col.0 as u32,
         line_end: hi.line as u32,
@@ -507,10 +508,40 @@ pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
             // consumer query cannot be read (we are inside this very body's `optimized_mir`,
             // or it sits in a mutual-recursion SCC whose members snapshot instead): there the
             // old poison is kept — sound, and strictly no worse than before this arm existed.
+            //
+            // Trust (2026-09-29): the premise above no longer holds. This scan runs only with
+            // verification enabled, and there a coroutine's layout is served from its
+            // pre-steal elaborated MIR (`trust_local_coroutine_layout`), so the coroutine's
+            // `Steal` is intact here. Demanding `optimized_mir` from this scan was then no
+            // cache hit: it ran the coroutine's TrustVerify pass mid-scan, whose callee
+            // bundling stole the elaborated MIR of callees the scan had not reached yet, so
+            // whether this crate-level gap fired depended on ITEM ORDER (measured: an
+            // `async fn` declared before its local callees poisoned R1, declared after did
+            // not). The intact elaborated body is read instead — the pre-inlining superset of
+            // the optimized body's calls — still with `reproducible: false`, so every callee
+            // stays `hidden` exactly as before; only a body stolen on some other route falls
+            // back to the consumer query.
             kind @ (DefKind::Closure | DefKind::SyntheticCoroutineBody)
                 if tcx.is_coroutine(did) || matches!(kind, DefKind::SyntheticCoroutineBody) =>
             {
-                if crate::trust_verify::optimized_mir_query_would_cycle(tcx, did) {
+                let steal = tcx.mir_drops_elaborated_and_const_checked(local);
+                if !steal.is_stolen() {
+                    let body = steal.borrow();
+                    let mut scan = CallScan {
+                        tcx,
+                        owner: did,
+                        owner_typing_env: body.typing_env(tcx),
+                        address_taken: &mut address_taken,
+                        edges: &mut edges,
+                        direct_call_sites: &mut direct_call_sites,
+                        hidden: &mut hidden,
+                        mono_call_sites: &mut mono_call_sites,
+                        mono_unresolved: &mut mono_unresolved,
+                        reproducible: false,
+                    };
+                    scan.visit_body(&body);
+                    None
+                } else if crate::trust_verify::optimized_mir_query_would_cycle(tcx, did) {
                     Some(R1ScanGap::ElaboratedBodyStolen { owner: did })
                 } else {
                     let body = tcx.optimized_mir(did);
@@ -534,7 +565,8 @@ pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
             // only CLONES). The elaborated body is a `Steal` borrowed pre-codegen-steal:
             // for a NON-coroutine body, `optimized_mir`'s steal really is a codegen-phase
             // event (the two analysis-phase fn-like steals that exist — comptime const-eval
-            // and coroutine layout — are both routed to their consumer queries above), so at
+            // and, with verification disabled only, coroutine layout — are both routed
+            // above), so at
             // the analysis phase this borrow is valid. If the `Steal` is nonetheless already
             // stolen, NO consumer query serves the body, so the scan cannot account for it:
             // poison, fail-closed, with the gap naming WHICH body — a named crate-level gap
@@ -610,8 +642,7 @@ pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
             DefKind::Const { .. }
             | DefKind::AssocConst { .. }
             | DefKind::Static { .. }
-            | DefKind::AnonConst
-            | DefKind::InlineConst => {
+            | DefKind::AnonConst => {
                 let body = tcx.mir_for_ctfe(did);
                 let mut scan = CallScan {
                     tcx,
@@ -874,10 +905,7 @@ fn compute_danger_signals(
     let ev = tcx.effective_visibilities(());
     let cg = tcx.codegen_fn_attrs(did);
     let exactly_bin = !tcx.crate_types().is_empty()
-        && tcx
-            .crate_types()
-            .iter()
-            .all(|ct| matches!(ct, rustc_session::config::CrateType::Executable));
+        && tcx.crate_types().iter().all(|ct| matches!(ct, rustc_structures::CrateType::Executable));
     let visibility_exposed = !exactly_bin && ev.public_at_level(f).is_some();
     // The crate ENTRY function (`main`/`#[start]`) is invoked by the language
     // runtime, not by any enumerable in-crate call site — an external caller by
@@ -1067,10 +1095,7 @@ pub(crate) fn compute_coverage_signals(
     // identical to today's behavior. `is_empty()` guard: never treat an unknown/empty
     // crate-type set as closed (fail closed to the visibility gate).
     let exactly_bin = !tcx.crate_types().is_empty()
-        && tcx
-            .crate_types()
-            .iter()
-            .all(|ct| matches!(ct, rustc_session::config::CrateType::Executable));
+        && tcx.crate_types().iter().all(|ct| matches!(ct, rustc_structures::CrateType::Executable));
     // The visibility contribution is suppressed ONLY in an exactly-bin (closed) crate.
     let visibility_exposed = !exactly_bin && ev.public_at_level(f).is_some();
     // The crate ENTRY function is invoked by the language runtime — an external

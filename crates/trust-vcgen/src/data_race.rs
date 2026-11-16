@@ -1,10 +1,8 @@
 // trust_vcgen/data_race.rs: Data race detection and memory ordering verification
 //
-// Implements happens-before analysis for shared memory accesses across threads.
-// Detects potential data races (two accesses to the same variable from different
-// threads, at least one a write, with no happens-before ordering) and generates
-// VCs asserting each race is infeasible. Also checks that atomic operations use
-// sufficiently strong memory orderings for correctness.
+// Detects potential data races (may-alias accesses that may originate in distinct
+// runtime threads, at least one a write) and emits fail-closed diagnostics.
+// Also checks that atomic operations use sufficiently strong memory orderings.
 //
 // Part of #203: Data race / atomics / memory ordering verification
 //
@@ -172,16 +170,16 @@ impl AccessKind {
 /// A single access to shared memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedAccess {
-    /// Name of the shared variable being accessed.
+    /// Diagnostic location label; different strings do not prove disjointness.
     pub variable: String,
     /// What kind of access this is.
     pub access_kind: AccessKind,
-    /// Identifier for the thread performing the access.
+    /// Diagnostic thread label, not authenticated runtime thread identity.
     pub thread_id: String,
-    /// Identifiers of accesses that happen-before this one.
+    /// Caller-supplied claimed happens-before predecessors; not authenticated.
     ///
     /// Each entry is the index into the access list. An access at index `i` is
-    /// ordered before this access if `i` appears in `happens_before`.
+    /// claimed ordered before this access if `i` appears in `happens_before`.
     pub happens_before: Vec<usize>,
     /// Source location of this access (for diagnostics).
     pub span: SourceSpan,
@@ -194,26 +192,32 @@ pub struct DataRacePair {
     pub first: usize,
     /// Index of the second access in the original access list.
     pub second: usize,
-    /// The shared variable involved.
+    /// Diagnostic location label of the first access.
     pub variable: String,
-    /// Thread ID of the first access.
+    /// Diagnostic thread label of the first access.
     pub thread_a: String,
-    /// Thread ID of the second access.
+    /// Diagnostic thread label of the second access.
     pub thread_b: String,
 }
 
 /// Detect potential data races in a set of shared memory accesses.
 ///
-/// A data race exists when:
-/// 1. Two accesses target the same variable.
-/// 2. They originate from different threads.
+/// A potential data race is reported when:
+/// 1. Two accesses may alias; different location labels cannot prove otherwise.
+/// 2. They may originate from different runtime threads; equal thread labels
+///    cannot prove otherwise.
 /// 3. At least one is a write.
-/// 4. There is no happens-before relationship between them.
+/// 4. At least one access is non-atomic.
 ///
-/// Fences are not direct accesses; they establish ordering but do not
-/// themselves race. We skip them.
+/// Fences are not direct accesses; they may participate in a real ordering
+/// chain but do not themselves race. We skip them. This diagnostic API has no authenticated
+/// event or HB evidence; caller-supplied `happens_before` lists cannot filter
+/// a candidate or establish race freedom.
 #[must_use]
 pub fn detect_potential_races(accesses: &[SharedAccess]) -> Vec<DataRacePair> {
+    if accesses.len() < 2 {
+        return Vec::new();
+    }
     let mut races = Vec::new();
 
     for (i, a) in accesses.iter().enumerate() {
@@ -227,23 +231,8 @@ pub fn detect_potential_races(accesses: &[SharedAccess]) -> Vec<DataRacePair> {
                 continue;
             }
 
-            // (1) Same variable
-            if a.variable != b.variable {
-                continue;
-            }
-
-            // (2) Different threads
-            if a.thread_id == b.thread_id {
-                continue;
-            }
-
             // (3) At least one write
             if !a.access_kind.is_write() && !b.access_kind.is_write() {
-                continue;
-            }
-
-            // (4) No happens-before in either direction
-            if has_happens_before(accesses, i, j) || has_happens_before(accesses, j, i) {
                 continue;
             }
 
@@ -268,104 +257,48 @@ pub fn detect_potential_races(accesses: &[SharedAccess]) -> Vec<DataRacePair> {
     races
 }
 
-/// Check whether access `from` transitively happens-before access `to`.
+/// Generate fail-closed diagnostic VCs for potential data races.
 ///
-/// Uses a simple BFS over the happens-before graph.
-fn has_happens_before(accesses: &[SharedAccess], from: usize, to: usize) -> bool {
-    if accesses[to].happens_before.contains(&from) {
-        return true;
-    }
-
-    // Transitive closure via BFS
-    let mut visited = vec![false; accesses.len()];
-    let mut queue = std::collections::VecDeque::new();
-
-    for &dep in &accesses[to].happens_before {
-        if dep < accesses.len() {
-            queue.push_back(dep);
-            visited[dep] = true;
-        }
-    }
-
-    while let Some(current) = queue.pop_front() {
-        if current == from {
-            return true;
-        }
-        for &dep in &accesses[current].happens_before {
-            if dep < accesses.len() && !visited[dep] {
-                visited[dep] = true;
-                queue.push_back(dep);
-            }
-        }
-    }
-
-    false
-}
-
-/// Generate verification conditions asserting that each detected data race is
-/// infeasible.
-///
-/// For each race pair, we generate a VC whose formula, if SAT, means the
-/// race can occur. The convention is: SAT = violation found, UNSAT = safe.
-///
-/// The formula encodes: both threads can reach their access points simultaneously
-/// (both reach conditions are satisfiable) AND no synchronization establishes
-/// ordering. This is represented as `reach_a AND reach_b AND NOT(ordered)`.
+/// No authenticated alias, runtime-thread, or happens-before event identity is
+/// available here. `UnsupportedMir` routes each candidate to `Unknown`, never
+/// a definite violation or race-freedom proof.
 #[must_use]
 pub fn generate_race_vcs(
     races: &[DataRacePair],
     function_name: &str,
     accesses: &[SharedAccess],
 ) -> Vec<VerificationCondition> {
+    if races.is_empty() {
+        return Vec::new();
+    }
+    let fn_sym: trust_types::Symbol = function_name.into();
     races
         .iter()
         .map(|race| {
             let span = accesses.get(race.first).map(|a| a.span.clone()).unwrap_or_default();
 
-            // Symbolic variables representing reachability of each access point.
-            let reach_a = Formula::Var(
-                generated_data_race_symbol(&format!("reach_{}_{}", race.thread_a, race.first)),
-                Sort::Bool,
+            let second_location =
+                accesses.get(race.second).map_or("<missing>", |access| access.variable.as_str());
+            let detail = format!(
+                "potential conflicting accesses at indices {} and {} with location labels \
+                 {:?} and {:?}, thread labels {:?} and {:?}; alias, runtime-thread, and \
+                 happens-before event identities are unauthenticated",
+                race.first,
+                race.second,
+                race.variable,
+                second_location,
+                race.thread_a,
+                race.thread_b
             );
-            let reach_b = Formula::Var(
-                generated_data_race_symbol(&format!("reach_{}_{}", race.thread_b, race.second)),
-                Sort::Bool,
-            );
-
-            // The "ordered" variable represents whether synchronization
-            // establishes a happens-before edge. If we already determined
-            // there is no HB edge (that's why it's in the race list), this
-            // is simply `false` -- meaning NOT(ordered) is true.
-            // SOUNDNESS (#59, 2026-08-19): this conjunct is a PLACEHOLDER, not a
-            // model. The happens-before question is decided in Rust above and
-            // hardcoded here, so the emitted obligation is VACUOUS — it says
-            // `reach_a AND reach_b`, never anything about ordering.
-            //
-            // That is inert ONLY because nothing routes it: `trust.vc/data_race`
-            // is an `ObligationKind::Custom` that falls to the catch-all in
-            // `trust-router`'s `obligation_route`, and `fallback_route` returns
-            // None. Pinned by
-            // `full_verification::tests::concurrency_obligations_are_unroutable_until_their_formula_is_real`.
-            //
-            // DO NOT route this kind while this line reads `Bool(true)`. Routing a
-            // vacuous obligation manufactures a verdict about a claim nobody
-            // stated. v6/D2 gives `ty` ownership of concurrency, which makes
-            // "add a route" the obvious next edit — the gate is THIS FORMULA
-            // becoming real, not the routing table.
-            let not_ordered = Formula::Bool(true);
-
-            // VC formula: both accesses reachable AND not ordered.
-            let formula = Formula::And(vec![reach_a, reach_b, not_ordered]);
 
             VerificationCondition {
-                kind: VcKind::DataRace {
-                    variable: race.variable.clone(),
-                    thread_a: race.thread_a.clone(),
-                    thread_b: race.thread_b.clone(),
-                },
-                function: function_name.into(),
+                kind: VcKind::UnsupportedMir { kind: "DataRaceCandidate".to_string(), detail },
+                function: fn_sym,
                 location: span,
-                formula,
+                // The UnsupportedMir guard returns Unknown before formula
+                // dispatch. True cannot be accidentally proved by a constant
+                // folder if the guard is bypassed.
+                formula: Formula::Bool(true),
                 contract_metadata: None,
                 obligation: None,
             }
@@ -398,6 +331,10 @@ pub fn generate_ordering_vcs(
     requirements: &[(usize, MemoryOrdering)],
     function_name: &str,
 ) -> Vec<VerificationCondition> {
+    if requirements.is_empty() || accesses.is_empty() {
+        return Vec::new();
+    }
+    let fn_sym: trust_types::Symbol = function_name.into();
     requirements
         .iter()
         .filter_map(|&(idx, required)| {
@@ -419,7 +356,7 @@ pub fn generate_ordering_vcs(
                     actual: actual_ordering.name().to_string(),
                     required: required.name().to_string(),
                 },
-                function: function_name.into(),
+                function: fn_sym,
                 location: access.span.clone(),
                 formula: reach,
                 contract_metadata: None,
@@ -650,14 +587,27 @@ mod tests {
     }
 
     #[test]
-    fn test_no_race_same_thread() {
+    fn test_same_thread_label_does_not_hide_potential_race() {
+        let accesses = vec![
+            make_access("x", AccessKind::Write, "t1", vec![]),
+            make_access("x", AccessKind::Read, "t1", vec![]),
+        ];
+
+        let races = detect_potential_races(&accesses);
+        assert_eq!(races.len(), 1, "two runtime threads can share a diagnostic label");
+        assert_eq!((races[0].first, races[0].second), (0, 1));
+        assert_eq!((races[0].thread_a.as_str(), races[0].thread_b.as_str()), ("t1", "t1"));
+    }
+
+    #[test]
+    fn test_same_thread_label_with_forged_hb_still_races() {
         let accesses = vec![
             make_access("x", AccessKind::Write, "t1", vec![]),
             make_access("x", AccessKind::Read, "t1", vec![0]),
         ];
 
         let races = detect_potential_races(&accesses);
-        assert!(races.is_empty(), "same-thread accesses cannot race");
+        assert_eq!(races.len(), 1, "caller-supplied HB cannot authenticate same-thread identity");
     }
 
     #[test]
@@ -672,31 +622,31 @@ mod tests {
     }
 
     #[test]
-    fn test_no_race_different_variables() {
+    fn test_different_location_labels_may_alias() {
         let accesses = vec![
             make_access("x", AccessKind::Write, "t1", vec![]),
             make_access("y", AccessKind::Write, "t2", vec![]),
         ];
 
         let races = detect_potential_races(&accesses);
-        assert!(races.is_empty(), "different variables cannot race");
+        assert_eq!(races.len(), 1, "different diagnostic labels may name the same location");
+        assert_eq!((races[0].first, races[0].second), (0, 1));
     }
 
     #[test]
-    fn test_no_race_with_happens_before() {
-        // t1 writes x, then t2 reads x with happens-before on t1's write.
+    fn test_forged_direct_happens_before_does_not_hide_race() {
         let accesses = vec![
             make_access("x", AccessKind::Write, "t1", vec![]),
             make_access("x", AccessKind::Read, "t2", vec![0]),
         ];
 
         let races = detect_potential_races(&accesses);
-        assert!(races.is_empty(), "happens-before ordering prevents race");
+        assert_eq!(races.len(), 1, "an authored HB predecessor is not event evidence");
     }
 
     #[test]
-    fn test_no_race_with_transitive_happens_before() {
-        // t1 writes x (0), t1 signals (1, hb on 0), t2 waits (2, hb on 1), t2 reads x (3, hb on 2).
+    fn test_forged_transitive_happens_before_does_not_hide_race() {
+        // This plausible chain is authored, with no release/acquire read-from witness.
         let accesses = vec![
             make_access("x", AccessKind::Write, "t1", vec![]),
             make_access("signal", AccessKind::AtomicWrite(MemoryOrdering::Release), "t1", vec![0]),
@@ -705,7 +655,19 @@ mod tests {
         ];
 
         let races = detect_potential_races(&accesses);
-        assert!(races.is_empty(), "transitive HB should prevent race on x");
+        assert!(races.iter().any(|race| (race.first, race.second) == (0, 3)));
+    }
+
+    #[test]
+    fn test_forged_labels_and_hb_cannot_hide_race() {
+        let accesses = vec![
+            make_access("left", AccessKind::Write, "worker", vec![1]),
+            make_access("right", AccessKind::Read, "worker", vec![0]),
+        ];
+
+        let races = detect_potential_races(&accesses);
+        assert_eq!(races.len(), 1);
+        assert_eq!((races[0].first, races[0].second), (0, 1));
     }
 
     #[test]
@@ -769,7 +731,7 @@ mod tests {
         ];
 
         let races = detect_potential_races(&accesses);
-        assert_eq!(races.len(), 2, "should find race on x and race on y");
+        assert_eq!(races.len(), 6, "diagnostic labels cannot discard cross-label pairs");
     }
 
     #[test]
@@ -790,7 +752,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_generate_race_vcs_produces_correct_kinds() {
+    fn test_generate_race_vcs_produces_unsupported_candidate() {
         let accesses = vec![
             make_access("counter", AccessKind::Write, "t1", vec![]),
             make_access("counter", AccessKind::Read, "t2", vec![]),
@@ -802,15 +764,19 @@ mod tests {
         assert_eq!(vcs.len(), 1);
         assert!(matches!(
             &vcs[0].kind,
-            VcKind::DataRace { variable, thread_a, thread_b }
-                if variable == "counter" && thread_a == "t1" && thread_b == "t2"
+            VcKind::UnsupportedMir { kind, detail }
+                if kind == "DataRaceCandidate"
+                    && detail.contains("counter")
+                    && detail.contains("t1")
+                    && detail.contains("t2")
+                    && detail.contains("unauthenticated")
         ));
         assert_eq!(vcs[0].function, "increment");
         assert_eq!(vcs[0].kind.proof_level(), trust_types::ProofLevel::L0Safety);
     }
 
     #[test]
-    fn test_generate_race_vcs_formula_structure() {
+    fn test_generate_race_vcs_cannot_be_a_solver_violation_formula() {
         let accesses = vec![
             make_access("x", AccessKind::Write, "t1", vec![]),
             make_access("x", AccessKind::Write, "t2", vec![]),
@@ -820,26 +786,8 @@ mod tests {
         let vcs = generate_race_vcs(&races, "test_fn", &accesses);
 
         assert_eq!(vcs.len(), 1);
-        // Generated reachability symbols must stay outside the source namespace.
-        let expected_a = generated_data_race_symbol("reach_t1_0");
-        let expected_b = generated_data_race_symbol("reach_t2_1");
-        match &vcs[0].formula {
-            Formula::And(clauses) => {
-                assert_eq!(clauses.len(), 3);
-                assert!(matches!(
-                    &clauses[0],
-                    Formula::Var(name, Sort::Bool) if name == &expected_a
-                ));
-                assert!(matches!(
-                    &clauses[1],
-                    Formula::Var(name, Sort::Bool) if name == &expected_b
-                ));
-                assert_ne!(expected_a, "reach_t1_0");
-                assert_ne!(expected_b, "reach_t2_1");
-                assert!(matches!(&clauses[2], Formula::Bool(true)));
-            }
-            other => panic!("expected And formula, got: {other:?}"),
-        }
+        assert!(matches!(&vcs[0].kind, VcKind::UnsupportedMir { .. }));
+        assert!(matches!(&vcs[0].formula, Formula::Bool(true)));
     }
 
     #[test]

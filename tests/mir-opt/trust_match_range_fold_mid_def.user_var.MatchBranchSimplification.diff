@@ -1,0 +1,42 @@
+- // MIR for `user_var` before MatchBranchSimplification
++ // MIR for `user_var` after MatchBranchSimplification
+  
+  fn user_var(_1: u8) -> bool {
+      debug x => _1;
+      let mut _0: bool;
+      let mut _2: bool;
+      let mut _3: bool;
+      let _4: ();
+      scope 1 {
+          debug b => _2;
+          scope 2 {
+              scope 3 {
+                  scope 4 (inlined std::hint::black_box::<()>) {
+                  }
+              }
+          }
+      }
+  
+      bb0: {
+          StorageLive(_2);
+          _2 = const false;
+          _3 = Le(const 10_u8, copy _1);
+          switchInt(move _3) -> [0: bb3, otherwise: bb1];
+      }
+  
+      bb1: {
+          _2 = Le(copy _1, const 20_u8);
+          switchInt(copy _2) -> [0: bb3, otherwise: bb2];
+      }
+  
+      bb2: {
+          _4 = std::intrinsics::black_box::<()>(const ()) -> [return: bb3, unwind unreachable];
+      }
+  
+      bb3: {
+          _0 = copy _2;
+          StorageDead(_2);
+          return;
+      }
+  }
+  

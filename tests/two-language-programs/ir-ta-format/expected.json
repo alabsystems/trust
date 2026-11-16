@@ -1,0 +1,22 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta-format",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (f344fb244 2026-09-21) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@7b9146ba2ab5 sha256:c9692ee58d31e864",
+  "clean": "first-party/clean@faf434b73aac sha256:a9d64ad7f7b7ccde",
+  "trust-cg": "first-party/trust-cg@3f79b19a3d7f sha256:f24a73c879facca4"
+ },
+ "ratchets": {
+  "a.format.text_fn_name": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was `format.text_fn_name:validates:bin-identical:text-parse-refused` \u2014 the module VALIDATED and was bin-identical, and only the text leg refused, because the name (a function name, `m::dep_clamp`) leaves the bare-identifier alphabet and text had no escape for it. trust-ir's WS4.3 identifier half prints `@\"escaped\"` and `Parser::read_name` decodes it, so the name is carried rather than laundered and the text codec round-trips it byte-identically. The refusal was CORRECT while the spelling was missing; the fix carries the field instead of relaxing the check."
+  },
+  "a.format.text_typedef_name": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was `format.text_typedef_name:validates:bin-identical:text-parse-refused` \u2014 the module VALIDATED and was bin-identical, and only the text leg refused, because the name (a type name, `m::Pt<u8>`) leaves the bare-identifier alphabet and text had no escape for it. trust-ir's WS4.3 identifier half prints `@\"escaped\"` and `Parser::read_name` decodes it, so the name is carried rather than laundered and the text codec round-trips it byte-identically. The refusal was CORRECT while the spelling was missing; the fix carries the field instead of relaxing the check."
+  }
+ }
+}

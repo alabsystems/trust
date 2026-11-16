@@ -10,7 +10,7 @@
 //!
 //! ## The measured refutation
 //!
-//! ```ignore
+//! ```ignore (illustrative)
 //! // aux, PLAIN SAFE RUST, built `--crate-name std` into a `#![no_std]` graph
 //! pub struct Vec<T> { pub k: u64, pub t: core::marker::PhantomData<T> }
 //! impl<'a, T> IntoIterator for &'a Vec<T> {
@@ -93,7 +93,7 @@ fn parse(json: &str) -> VerifiableFunction {
 }
 
 fn unbounded_rows(func: &VerifiableFunction) -> usize {
-    generate_unbounded_allocation_vcs(func)
+    generate_unbounded_allocation_vcs_on_64_bit(func)
         .iter()
         .filter(|vc| format!("{:?}", vc.kind).contains("UnboundedAllocation"))
         .count()
@@ -128,7 +128,15 @@ fn adt(name: &str) -> Ty {
 /// at the grant sites of the 2 572-bundle corpus: `&[T]` for the slice inherent
 /// producers, `&str` for the str views, and `&Collection` for everything else.
 pub(super) fn faithful_receiver_ty(producer: &str) -> Ty {
+    // An UNQUALIFIED producer path ends in its method (`alloc::vec::Vec::<u32>::iter`);
+    // the receiver's type is the path before it. (2026-10-06: the bounded-source
+    // grant now reads the receiver ADT's own name, so `…::Vec::iter` no longer passes.)
     let recv = producer_receiver_path(producer);
+    let recv = if producer.starts_with('<') {
+        recv
+    } else {
+        recv.rsplit_once("::").map_or(recv.clone(), |(head, _)| head.to_string())
+    };
     let inner = if recv.starts_with("core::slice") || recv.starts_with("std::slice") {
         Ty::Slice { elem: Box::new(Ty::u32()) }
     } else if recv.starts_with("core::str")
@@ -675,6 +683,7 @@ fn receiver_probe_bundle(receiver_ty: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

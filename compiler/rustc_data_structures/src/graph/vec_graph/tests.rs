@@ -55,13 +55,17 @@ fn successors() {
 #[test]
 fn predecessors() {
     let graph = create_graph_with_back_refs();
-    assert_eq!(graph.predecessors(0), &[]);
+    // Trust: the empty slices name their element type, as `successors` above does. This crate
+    // links `trust-build-cpu`'s `observations` feature, whose serde_json adds
+    // `impl PartialEq<Value> for usize`, so a bare `&[]` leaves `usize: PartialEq<?U>` ambiguous
+    // (E0282) and the crate's unit tests do not compile.
+    assert_eq!(graph.predecessors(0), &[] as &[usize]);
     assert_eq!(graph.predecessors(1), &[0, 5]);
     assert_eq!(graph.predecessors(2), &[1]);
     assert_eq!(graph.predecessors(3), &[1]);
     assert_eq!(graph.predecessors(4), &[3]);
-    assert_eq!(graph.predecessors(5), &[]);
-    assert_eq!(graph.predecessors(6), &[]);
+    assert_eq!(graph.predecessors(5), &[] as &[usize]);
+    assert_eq!(graph.predecessors(6), &[] as &[usize]);
 }
 
 #[test]

@@ -173,10 +173,10 @@ impl VtableModel {
     /// Number of known implementing types.
     #[must_use]
     pub fn impl_count(&self) -> usize {
-        let mut types: FxHashSet<String> = FxHashSet::default();
+        let mut types: FxHashSet<&trust_types::Ty> = FxHashSet::default();
         for slot in &self.vtable.slots {
             for target in &slot.targets {
-                types.insert(format!("{:?}", target.impl_type));
+                types.insert(&target.impl_type);
             }
         }
         types.len()
@@ -383,16 +383,24 @@ impl<'a> DynDispatchVc<'a> {
             return vcs;
         }
 
-        let pre_conj = conjunction(&self.contract.preconditions);
-        let post_conj = conjunction(&self.contract.postconditions);
+        let fn_name: trust_types::Symbol = function_name.into();
+        let mut pre_conj = (!self.contract.preconditions.is_empty())
+            .then(|| conjunction(&self.contract.preconditions));
+        let mut post_conj = (!self.contract.postconditions.is_empty())
+            .then(|| conjunction(&self.contract.postconditions));
 
         // For each known impl, generate VCs ensuring the dispatch is sound
-        for target in self.targets {
+        let n_targets = self.targets.len();
+        for (target_idx, target) in self.targets.iter().enumerate() {
+            let is_last = target_idx + 1 == n_targets;
             let impl_ty_name = format!("{:?}", target.impl_type);
+            let mut target_method = (pre_conj.is_some() || post_conj.is_some())
+                .then(|| format!("<{impl_ty_name} as {}>::{}", self.trait_name, self.method_name));
 
             // Precondition VC: trait precondition must be accepted by each impl
             // Formula: NOT(pre_trait => pre_impl) -- if SAT, impl rejects valid input
-            if !self.contract.preconditions.is_empty() {
+            let pre_formula = if is_last { pre_conj.take() } else { pre_conj.clone() };
+            if let Some(pre_formula) = pre_formula {
                 let impl_pre_var = Formula::Var(
                     generated_vtable_symbol(&format!(
                         "impl_pre_{}_{}",
@@ -401,15 +409,15 @@ impl<'a> DynDispatchVc<'a> {
                     Sort::Bool,
                 );
                 let implication =
-                    Formula::Implies(Box::new(pre_conj.clone()), Box::new(impl_pre_var));
+                    Formula::Implies(Box::new(pre_formula), Box::new(impl_pre_var));
+                let callee = if post_conj.is_some() {
+                    target_method.clone().unwrap_or_default()
+                } else {
+                    target_method.take().unwrap_or_default()
+                };
                 vcs.push(VerificationCondition {
-                    kind: VcKind::Precondition {
-                        callee: format!(
-                            "<{} as {}>::{}",
-                            impl_ty_name, self.trait_name, self.method_name
-                        ),
-                    },
-                    function: function_name.into(),
+                    kind: VcKind::Precondition { callee },
+                    function: fn_name,
                     location: location.clone(),
                     formula: Formula::Not(Box::new(implication)),
                     contract_metadata: None,
@@ -419,7 +427,8 @@ impl<'a> DynDispatchVc<'a> {
 
             // Postcondition VC: each impl must guarantee at least what the trait promises
             // Formula: NOT(post_impl => post_trait) -- if SAT, impl fails to deliver
-            if !self.contract.postconditions.is_empty() {
+            let post_formula = if is_last { post_conj.take() } else { post_conj.clone() };
+            if let Some(post_formula) = post_formula {
                 let impl_post_var = Formula::Var(
                     generated_vtable_symbol(&format!(
                         "impl_post_{}_{}",
@@ -428,14 +437,10 @@ impl<'a> DynDispatchVc<'a> {
                     Sort::Bool,
                 );
                 let implication =
-                    Formula::Implies(Box::new(impl_post_var), Box::new(post_conj.clone()));
+                    Formula::Implies(Box::new(impl_post_var), Box::new(post_formula));
                 vcs.push(VerificationCondition {
                     kind: VcKind::Postcondition,
-                    function: format!(
-                        "<{} as {}>::{}",
-                        impl_ty_name, self.trait_name, self.method_name
-                    )
-                    .into(),
+                    function: target_method.unwrap_or_default().into(),
                     location: location.clone(),
                     formula: Formula::Not(Box::new(implication)),
                     contract_metadata: None,
@@ -460,7 +465,7 @@ impl<'a> DynDispatchVc<'a> {
                         target_names.join(", ")
                     ),
                 },
-                function: function_name.into(),
+                function: fn_name,
                 location,
                 formula: Formula::Bool(false),
                 contract_metadata: None,
@@ -542,18 +547,18 @@ impl TraitBoundPropagation {
         concrete_ty: &trust_types::Ty,
         function_name: &str,
     ) -> Vec<VerificationCondition> {
-        let results = self.check_bounds(resolver, concrete_ty);
-        results
-            .into_iter()
-            .filter(|r| !r.satisfied)
-            .map(|r| VerificationCondition {
+        let mut fn_name: Option<trust_types::Symbol> = None;
+        self.bounds
+            .iter()
+            .filter(|bound| resolver.resolve_impl(concrete_ty, &bound.trait_name).is_none())
+            .map(|bound| VerificationCondition {
                 kind: VcKind::Assertion {
                     message: format!(
-                        "trait bound `{}: {}` not satisfied: {}",
-                        self.type_name, r.bound.trait_name, r.reason
+                        "trait bound `{}: {}` not satisfied: {:?} does not implement {}",
+                        self.type_name, bound.trait_name, concrete_ty, bound.trait_name
                     ),
                 },
-                function: function_name.into(),
+                function: *fn_name.get_or_insert_with(|| function_name.into()),
                 location: SourceSpan::default(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
@@ -703,7 +708,10 @@ impl ObjectSafetyChecker {
     /// Whether the trait is object-safe.
     #[must_use]
     pub fn is_object_safe(&self) -> bool {
-        self.check().is_empty()
+        !self.has_sized_supertrait
+            && self.methods.iter().all(|m| {
+                m.where_self_sized || (m.has_receiver && !m.returns_self && !m.has_type_params)
+            })
     }
 
     /// Generate VCs for object safety violations.
@@ -711,7 +719,12 @@ impl ObjectSafetyChecker {
     /// Each violation produces an assertion VC with formula `true`.
     #[must_use]
     pub fn generate_vcs(&self, function_name: &str) -> Vec<VerificationCondition> {
-        self.check()
+        let violations = self.check();
+        if violations.is_empty() {
+            return Vec::new();
+        }
+        let fn_name: trust_types::Symbol = function_name.into();
+        violations
             .into_iter()
             .map(|violation| VerificationCondition {
                 kind: VcKind::Assertion {
@@ -721,7 +734,7 @@ impl ObjectSafetyChecker {
                         violation.description()
                     ),
                 },
-                function: function_name.into(),
+                function: fn_name.clone(),
                 location: SourceSpan::default(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
@@ -764,25 +777,24 @@ impl WitnessType {
     ) -> Self {
         let type_param = type_param.into();
 
-        // Collect all concrete types known to implement at least one required trait.
-        let mut candidate_types: FxHashSet<String> = FxHashSet::default();
-        let mut type_map: FxHashMap<String, trust_types::Ty> = FxHashMap::default();
-
-        for bound in bounds {
+        // Collect all concrete types known to implement at least one required trait,
+        // and find the first candidate that satisfies ALL bounds.
+        let mut seen_types: FxHashSet<&trust_types::Ty> = FxHashSet::default();
+        let mut witness = None;
+        'outer: for bound in bounds {
             for imp in resolver.impls_for_trait(&bound.trait_name) {
-                let key = format!("{:?}", imp.implementing_type);
-                candidate_types.insert(key.clone());
-                type_map.insert(key, imp.implementing_type.clone());
+                let ty = &imp.implementing_type;
+                if seen_types.insert(ty)
+                    && bounds.iter().all(|b| {
+                        std::ptr::eq(b, bound)
+                            || resolver.resolve_impl(ty, &b.trait_name).is_some()
+                    })
+                {
+                    witness = Some(ty.clone());
+                    break 'outer;
+                }
             }
         }
-
-        // Find a type that satisfies ALL bounds.
-        let witness = candidate_types.iter().find_map(|type_key| {
-            let ty = &type_map[type_key];
-            let all_satisfied =
-                bounds.iter().all(|bound| resolver.resolve_impl(ty, &bound.trait_name).is_some());
-            if all_satisfied { Some(ty.clone()) } else { None }
-        });
 
         Self { type_param, bounds: bounds.to_vec(), witness }
     }
@@ -1115,6 +1127,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("Compute::compute"),
                             is_foreign: false,
                             func: "Compute::compute".to_string(),
                             args: vec![],
@@ -1134,6 +1147,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

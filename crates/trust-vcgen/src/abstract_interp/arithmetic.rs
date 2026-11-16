@@ -164,18 +164,12 @@ pub fn interval_shr(a: &Interval, b: &Interval) -> Interval {
     if b.lo < 0 {
         return Interval::TOP;
     }
-    // If shift amount is too large, result depends on sign.
-    if b.hi >= 128 {
-        if a.lo >= 0 {
-            return Interval::constant(0);
-        }
-        return Interval::new(-1, 0);
-    }
-    // Clamp shift amounts to prevent panic on negative or large values.
-    // At this point b.hi < 128 (checked above). Guard b.lo >= 0 for safety.
-    if b.lo < 0 {
-        return Interval::TOP;
-    }
+    // Trust (2026-09-30): an amount interval reaching 128 used to answer `[0, 0]`
+    // (or `[-1, 0]`) whatever its LOWER end, so `x >> k` with `k` in `[0, u32::MAX]`
+    // was zero (round 10 of the review: `h / x >> s.min(31)` proved and panicked).
+    // `a >> s` is monotone in `s` (towards 0, or towards -1 for a negative `a`),
+    // so the variable-shift arm below, which clamps each end at 127, covers it.
+    // (The transfer clamps an amount to the operand's width before it gets here.)
     // For constant shift amount (common case).
     if b.lo == b.hi {
         let shift = (b.lo as u32).min(127);
@@ -207,9 +201,15 @@ pub fn interval_shl(a: &Interval, b: &Interval) -> Interval {
         return Interval::TOP;
     }
     if b.lo == b.hi {
-        let shift = b.lo as u32;
-        let lo = a.lo.checked_shl(shift);
-        let hi = a.hi.checked_shl(shift);
+        // Trust (2026-09-28): multiply by `2^shift` with `checked_mul`. `i128::checked_shl`
+        // checks only the shift AMOUNT, so bits shifted past bit 127 were lost silently,
+        // and `2^126 << 2` answered 0. The destination's own width is applied separately,
+        // by `clamp_bare_binop_to_dest_range`.
+        let Some(factor) = 1i128.checked_shl(b.lo as u32).filter(|f| *f > 0) else {
+            return Interval::TOP;
+        };
+        let lo = a.lo.checked_mul(factor);
+        let hi = a.hi.checked_mul(factor);
         return match (lo, hi) {
             (Some(lo), Some(hi)) => Interval::new(lo.min(hi), lo.max(hi)),
             _ => Interval::TOP,
@@ -218,7 +218,7 @@ pub fn interval_shl(a: &Interval, b: &Interval) -> Interval {
     Interval::TOP
 }
 
-/// Bitwise AND interval (conservative: non-negative inputs).
+/// Bitwise AND interval (conservative: at least one non-negative input).
 #[must_use]
 pub fn interval_bitand(a: &Interval, b: &Interval) -> Interval {
     if a.is_bottom() || b.is_bottom() {
@@ -227,6 +227,17 @@ pub fn interval_bitand(a: &Interval, b: &Interval) -> Interval {
     // If both are non-negative, result is in [0, min(a.hi, b.hi)].
     if a.lo >= 0 && b.lo >= 0 {
         return Interval::new(0, a.hi.min(b.hi));
+    }
+    // Trust (2026-10-10): ONE non-negative operand bounds the result alone. Its sign
+    // bit is clear, so the result's is too, and the result's set bits are a subset of
+    // its bits, so `0 <= a & m <= m` whatever the other operand is (any width, two's
+    // complement). `s = (s + b) & 0xffff` read `s` as Top at its loop head (the add
+    // temp it masks has no interval), so `s + b` was refused overflow (sweep p21).
+    if b.lo >= 0 {
+        return Interval::new(0, b.hi);
+    }
+    if a.lo >= 0 {
+        return Interval::new(0, a.hi);
     }
     Interval::TOP
 }

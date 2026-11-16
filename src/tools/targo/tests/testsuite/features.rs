@@ -1,6 +1,9 @@
 //! Tests for `[features]` table.
 
+use std::fs::File;
+
 use crate::prelude::*;
+use cargo_test_support::publish::validate_crate_contents;
 use cargo_test_support::registry::{Dependency, Package};
 use cargo_test_support::{basic_manifest, project};
 use cargo_test_support::{rustc_host, str};
@@ -133,7 +136,7 @@ fn same_name() {
     p.cargo("tree -f")
         .arg("{p} [{f}]")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -496,7 +499,7 @@ fn cli_activates_required_dependency() {
 
     p.cargo("check --features bar")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] package `foo v0.0.1 ([ROOT]/foo)` does not have feature `bar`
 
 [HELP] a dependency with that name exists but it is required dependency and only optional dependencies can be used as features.
@@ -666,7 +669,7 @@ fn no_feature_doesnt_build() {
 
     p.cargo("build")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -674,28 +677,15 @@ fn no_feature_doesnt_build() {
         .run();
     p.process(&p.bin("foo")).with_stdout_data("").run();
 
-    let expected = if cfg!(target_os = "windows") && cfg!(target_env = "msvc") {
-        str![[r#"
-[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
-[RUNNING] `rustc --crate-name bar [..]`
-[DIRTY] foo v0.0.1 ([ROOT]/foo): the list of features changed
-[COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..]`
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]]
-    } else {
-        str![[r#"
-[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
-[RUNNING] `rustc --crate-name bar [..]`
-[COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..]`
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]]
-    };
     p.cargo("build --features bar -v")
-        .with_stderr_data(expected)
+        .with_stderr_data(str![[r#"
+[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
+[RUNNING] `rustc --crate-name bar [..]`
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]`
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
         .run();
     p.process(&p.bin("foo"))
         .with_stdout_data(str![[r#"
@@ -742,7 +732,7 @@ fn default_feature_pulled_in() {
 
     p.cargo("build")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -756,24 +746,13 @@ bar
 "#]])
         .run();
 
-    let expected = if cfg!(target_os = "windows") && cfg!(target_env = "msvc") {
-        str![[r#"
-[DIRTY] foo v0.0.1 ([ROOT]/foo): the list of features changed
-[COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..]`
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]]
-    } else {
-        str![[r#"
-[COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..]`
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]]
-    };
     p.cargo("build --no-default-features -v")
-        .with_stderr_data(expected)
+        .with_stderr_data(str![[r#"
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]`
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
         .run();
     p.process(&p.bin("foo")).with_stdout_data("").run();
 }
@@ -885,7 +864,7 @@ fn groups_on_groups_on_groups() {
     p.cargo("check")
         .with_stderr_data(
             str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] bar v0.0.1 ([ROOT]/foo/bar)
 [CHECKING] baz v0.0.1 ([ROOT]/foo/baz)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -938,7 +917,7 @@ fn many_cli_features() {
         .arg("bar baz")
         .with_stderr_data(
             str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] bar v0.0.1 ([ROOT]/foo/bar)
 [CHECKING] baz v0.0.1 ([ROOT]/foo/baz)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -1026,7 +1005,7 @@ fn union_features() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] d2 v0.0.1 ([ROOT]/foo/d2)
 [CHECKING] d1 v0.0.1 ([ROOT]/foo/d1)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -1051,6 +1030,9 @@ fn many_features_no_rebuilds() {
                 [dependencies.a]
                 path = "a"
                 features = ["fall"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -1067,6 +1049,9 @@ fn many_features_no_rebuilds() {
                 ftest  = []
                 ftest2 = []
                 fall   = ["ftest", "ftest2"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a/src/lib.rs", "")
@@ -1074,7 +1059,7 @@ fn many_features_no_rebuilds() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] a v0.1.0 ([ROOT]/foo/a)
 [CHECKING] b v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1237,6 +1222,9 @@ fn no_rebuild_when_frobbing_default_feature() {
                 [dependencies]
                 a = { path = "a" }
                 b = { path = "b" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1251,6 +1239,9 @@ fn no_rebuild_when_frobbing_default_feature() {
 
                 [dependencies]
                 a = { path = "../a", features = ["f1"], default-features = false }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("b/src/lib.rs", "")
@@ -1266,6 +1257,9 @@ fn no_rebuild_when_frobbing_default_feature() {
                 [features]
                 default = ["f1"]
                 f1 = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a/src/lib.rs", "")
@@ -1301,6 +1295,9 @@ fn unions_work_with_no_default_features() {
                 [dependencies]
                 a = { path = "a" }
                 b = { path = "b" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "extern crate a; pub fn foo() { a::a(); }")
@@ -1315,6 +1312,9 @@ fn unions_work_with_no_default_features() {
 
                 [dependencies]
                 a = { path = "../a", features = [], default-features = false }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("b/src/lib.rs", "")
@@ -1330,6 +1330,9 @@ fn unions_work_with_no_default_features() {
                 [features]
                 default = ["f1"]
                 f1 = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a/src/lib.rs", r#"#[cfg(feature = "f1")] pub fn a() {}"#)
@@ -1375,7 +1378,7 @@ fn optional_and_dev_dep() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] test v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1663,7 +1666,7 @@ fn many_cli_features_comma_delimited() {
     p.cargo("check --features bar,baz")
         .with_stderr_data(
             str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] bar v0.0.1 ([ROOT]/foo/bar)
 [CHECKING] baz v0.0.1 ([ROOT]/foo/baz)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -1732,7 +1735,7 @@ fn many_cli_features_comma_and_space_delimited() {
         .arg("bar,baz bam bap")
         .with_stderr_data(
             str![[r#"
-[LOCKING] 4 packages to latest compatible versions
+[LOCKING] 4 packages to highest compatible versions
 [CHECKING] bam v0.0.1 ([ROOT]/foo/bam)
 [CHECKING] bap v0.0.1 ([ROOT]/foo/bap)
 [CHECKING] bar v0.0.1 ([ROOT]/foo/bar)
@@ -1907,7 +1910,7 @@ fn warn_if_default_features() {
 [WARNING] Cargo.toml: `[features]` defines a feature named `default-features`
 [NOTE] only a feature named `default` will be enabled by default
 [WARNING] `foo` (manifest) generated 1 warning
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -2267,7 +2270,7 @@ fn registry_summary_order_doesnt_matter() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] dep v0.1.0 (registry `dummy-registry`)
@@ -2456,5 +2459,314 @@ required-features = ["feat"]
     let host = rustc_host();
     p.cargo(&format!("fetch --target={host}")).run();
     p.cargo(&format!("check --target={host} --examples --frozen"))
+        .run();
+}
+
+#[cargo_test]
+fn feature_metadata() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                cargo-features = ["feature-metadata"]
+
+                [package]
+                name = "foo"
+                edition = "2015"
+
+                [features]
+                a = []
+                b = []
+                c = { enables = ["a", "b"] }
+            "#,
+        )
+        .file(
+            "src/main.rs",
+            r#"
+                fn main() {
+                    #[cfg(not(all(feature = "a", feature = "b")))]
+                    compile_error!("Cargo features `a` and `b` must be enabled");
+                }
+            "#,
+        )
+        .build();
+
+    p.cargo("check --features c")
+        .masquerade_as_nightly_cargo(&["feature-metadata"])
+        .with_stderr_data(str![[r#"
+[CHECKING] foo v0.0.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn feature_metadata_is_unstable() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                edition = "2015"
+
+                [features]
+                a = { enables = [] }
+            "#,
+        )
+        .file("src/main.rs", "")
+        .build();
+
+    p.cargo("check --features a")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[ERROR] failed to parse manifest at `[ROOT]/foo/Cargo.toml`
+
+Caused by:
+  feature `feature-metadata` is required
+
+  The package requires the Cargo feature called `feature-metadata`, but that feature is not stabilized in this version of Cargo ([..]).
+  Consider trying a newer version of Cargo (this may require the nightly release).
+  See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#feature_metadata for more information about the status of this feature.
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn feature_metadata_missing_enables() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                cargo-features = ["feature-metadata"]
+
+                [package]
+                name = "foo"
+                edition = "2015"
+
+                [features]
+                foo = {}
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("check")
+        .masquerade_as_nightly_cargo(&["feature-metadata"])
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[ERROR] missing field `enables`
+ --> Cargo.toml:9:23
+  |
+9 |                 foo = {}
+  |                       ^^
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn feature_metadata_empty_enables() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                cargo-features = ["feature-metadata"]
+
+                [package]
+                name = "foo"
+                edition = "2015"
+
+                [features]
+                foo = { enables = [] }
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("check")
+        .masquerade_as_nightly_cargo(&["feature-metadata"])
+        .with_stderr_data(str![[r#"
+[CHECKING] foo v0.0.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn unused_keys_in_feature_metadata() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                cargo-features = ["feature-metadata"]
+
+                [package]
+                name = "foo"
+                edition = "2015"
+
+                [features]
+                foo = { enables = ["bar"], a = false, b = true }
+                bar = []
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("check")
+        .masquerade_as_nightly_cargo(&["feature-metadata"])
+        .with_stderr_data(str![[r#"
+[WARNING] Cargo.toml: unused manifest key: `features.foo.a`
+[WARNING] Cargo.toml: unused manifest key: `features.foo.b`
+[WARNING] `foo` (manifest) generated 2 warnings
+[CHECKING] foo v0.0.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn package_preserves_feature_metadata() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                cargo-features = ["feature-metadata"]
+
+                [package]
+                name = "foo"
+                edition = "2015"
+
+                [features]
+                a = []
+                b = []
+                c = { enables = ["a", "dev-only/feature", "b"], doc = "Enables a and b." }
+                empty = { enables = [], doc = "Enables nothing." }
+                only_enables = { enables = ["a"] }
+
+                [dev-dependencies]
+                dev-only = { path = "dev-only" }
+            "#,
+        )
+        .file("src/main.rs", "")
+        .file(
+            "dev-only/Cargo.toml",
+            r#"
+                [package]
+                name = "dev-only"
+                version = "0.0.0"
+
+                [features]
+                feature = []
+            "#,
+        )
+        .file("dev-only/src/lib.rs", "")
+        .build();
+
+    p.cargo("package --no-verify")
+        .masquerade_as_nightly_cargo(&["feature-metadata"])
+        .with_stderr_data(str![[r#"
+[WARNING] manifest has no description, license, license-file, documentation, homepage or repository
+  |
+  = [NOTE] see https://doc.rust-lang.org/cargo/reference/manifest.html#package-metadata for more info
+[PACKAGING] foo v0.0.0 ([ROOT]/foo)
+[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
+
+"#]])
+        .run();
+    let f = File::open(&p.root().join("target/package/foo-0.0.0.crate")).unwrap();
+    let normalized_manifest = str![[r#"
+...
+[features]
+a = []
+b = []
+
+[features.c]
+enables = [
+    "a",
+    "b",
+]
+doc = "Enables a and b."
+
+[features.empty]
+enables = []
+doc = "Enables nothing."
+
+[features.only_enables]
+enables = ["a"]
+
+...
+"#]];
+    validate_crate_contents(
+        f,
+        "foo-0.0.0.crate",
+        &["Cargo.lock", "Cargo.toml", "Cargo.toml.orig", "src/main.rs"],
+        [("Cargo.toml", normalized_manifest)],
+    );
+}
+
+#[cargo_test]
+fn feature_documentation_is_unstable() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                edition = "2015"
+
+                [features]
+                foo = { enables = [], doc = "Enables foo." }
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    p.cargo("check")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[ERROR] failed to parse manifest at `[ROOT]/foo/Cargo.toml`
+
+Caused by:
+  feature `feature-metadata` is required
+
+  The package requires the Cargo feature called `feature-metadata`, but that feature is not stabilized in this version of Cargo ([..]).
+  Consider trying a newer version of Cargo (this may require the nightly release).
+  See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#feature_metadata for more information about the status of this feature.
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn feature_has_documentation() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                cargo-features = ["feature-metadata"]
+
+                [package]
+                name = "foo"
+                edition = "2015"
+
+                [features]
+                foo = { enables = [], doc = "Enables foo." }
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    p.cargo("check")
+        .masquerade_as_nightly_cargo(&["feature-metadata"])
+        .with_stderr_data(str![[r#"
+[CHECKING] foo v0.0.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
         .run();
 }

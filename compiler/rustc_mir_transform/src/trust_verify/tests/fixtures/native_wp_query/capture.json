@@ -1,0 +1,28 @@
+{
+  "compiler_source": "6c9ad76dd38f001df3397e621667e038679ce3da",
+  "command": [
+    "targo",
+    "trust",
+    "check",
+    "--offline",
+    "--report-dir",
+    "real-source-report",
+    "--dump-verifier-inputs",
+    "real-source-inputs"
+  ],
+  "input_sha256": "53b7c2303176003ee64c0b2cb25c24905cc6075f520bd9d17c47bc6c03449e78",
+  "exit": 1,
+  "scope": "Actual compiler-extracted MIR fixtures; wrong source is refuted as expected. Query/HIR carry record in the unit test is a separately identified fixture, not an exported capture. No new compiler or whole-pipeline proof claim.",
+  "fixtures": [
+    {
+      "fixture": "identity_mir.json",
+      "source_dump": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-WP-QUERY-PRODUCER/real-source-inputs/units/2cfaea908ce156b2129a944b030eac9b9861ba868835aab4d5cba2de82180036/mir/trust-mir-f2939cb1aec248f7-fc6567b7dea470b5.json",
+      "sha256": "c2653f37fc42710344f03c98561a9c270ff6199073bbfbc48238e8211cc86c6f"
+    },
+    {
+      "fixture": "wrong_mir.json",
+      "source_dump": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-WP-QUERY-PRODUCER/real-source-inputs/units/2cfaea908ce156b2129a944b030eac9b9861ba868835aab4d5cba2de82180036/mir/trust-mir-916857623b6fd1f5-eae3e0bbf0d69862.json",
+      "sha256": "e6a4d114e53ff90ef12cbd930f29edd3d7956e08b39ce2b66749f9de835145a1"
+    }
+  ]
+}

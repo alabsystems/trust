@@ -7,14 +7,14 @@ Rustfix is a library defining useful structures that represent fix suggestions f
 
 This is a low-level library. You pass it the JSON output from `rustc`, and you can then use it to apply suggestions to in-memory strings. This library doesn't execute commands, or read or write from the filesystem.
 
-If you are looking for the [`cargo fix`] implementation, the core of it is located in [`cargo::ops::fix`].
+If you are looking for the [`cargo fix`] implementation, the core of it is located in [`targo::ops::fix`].
 
 > This crate is maintained by the Cargo team, primarily for use by Cargo and Rust compiler test suite
 > and not intended for external use (except as a transitive dependency). This
 > crate may make major changes to its APIs or be deprecated without warning.
 
 [`cargo fix`]: https://doc.rust-lang.org/cargo/commands/cargo-fix.html
-[`cargo::ops::fix`]: https://github.com/rust-lang/cargo/blob/master/src/cargo/ops/fix.rs
+[`targo::ops::fix`]: https://github.com/rust-lang/cargo/blob/master/src/ops/fix.rs
 
 ## License
 

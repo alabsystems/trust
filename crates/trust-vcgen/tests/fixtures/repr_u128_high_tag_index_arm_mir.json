@@ -1,0 +1,345 @@
+{
+  "name": "index_arm",
+  "def_path": "repr_u128_high_tag_no_false_proof::liars::index_arm",
+  "span": {
+    "file": "<repo>/tests/ui/trust/repr_u128_high_tag_no_false_proof.rs",
+    "line_start": 67,
+    "col_start": 4,
+    "line_end": 74,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "repr_u128_high_tag_no_false_proof::liars::E",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "A",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "B",
+                "discriminant": -1,
+                "fields": []
+              },
+              {
+                "name": "C",
+                "discriminant": 5,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "e"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 1
+              }
+            }
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "<repo>/tests/ui/trust/repr_u128_high_tag_no_false_proof.rs",
+                "line_start": 70,
+                "col_start": 14,
+                "line_end": 70,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                340282366920938463463374607431768211455,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<repo>/tests/ui/trust/repr_u128_high_tag_no_false_proof.rs",
+              "line_start": 70,
+              "col_start": 8,
+              "line_end": 70,
+              "col_end": 15
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/tests/ui/trust/repr_u128_high_tag_no_false_proof.rs",
+                "line_start": 72,
+                "col_start": 17,
+                "line_end": 72,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<repo>/tests/ui/trust/repr_u128_high_tag_no_false_proof.rs",
+                "line_start": 71,
+                "col_start": 20,
+                "line_end": 71,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 3,
+            "span": {
+              "file": "<repo>/tests/ui/trust/repr_u128_high_tag_no_false_proof.rs",
+              "line_start": 71,
+              "col_start": 20,
+              "line_end": 71,
+              "col_end": 24
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<repo>/tests/ui/trust/repr_u128_high_tag_no_false_proof.rs",
+                "line_start": 71,
+                "col_start": 20,
+                "line_end": 71,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "i",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "i",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

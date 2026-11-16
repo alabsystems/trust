@@ -62,6 +62,7 @@ fn fn_with_ensures(ensures: &str) -> VerifiableFunction {
             ensures: vec![ensures.to_string()],
             invariants: vec![],
         },
+        tuple_layouts: Default::default(),
     }
 }
 

@@ -1,0 +1,1513 @@
+{
+  "name": "ctl_index_local_len_end",
+  "def_path": "r5c_pins::ctl_index_local_len_end",
+  "span": {
+    "file": "r5c_pins.rs",
+    "line_start": 10,
+    "col_start": 0,
+    "line_end": 10,
+    "col_end": 196
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Slice": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 5
+              }
+            }
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "j"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "iter"
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::ops::range::Range",
+                "fields": [
+                  [
+                    "start",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "end",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 83,
+                "line_end": 10,
+                "col_end": 90
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ge",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 78,
+                "line_end": 10,
+                "col_end": 90
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "r5c_pins.rs",
+              "line_start": 10,
+              "col_start": 78,
+              "line_end": 10,
+              "col_end": 90
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 94,
+                "line_end": 10,
+                "col_end": 98
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 94,
+                "line_end": 10,
+                "col_end": 98
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 9,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 2,
+            "span": {
+              "file": "r5c_pins.rs",
+              "line_start": 10,
+              "col_start": 94,
+              "line_end": 10,
+              "col_end": 98
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 94,
+                "line_end": 10,
+                "col_end": 98
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 25,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 94,
+                "line_end": 10,
+                "col_end": 104
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        5,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 94,
+                "line_end": 10,
+                "col_end": 108
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                4
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "r5c_pins.rs",
+              "line_start": 10,
+              "col_start": 94,
+              "line_end": 10,
+              "col_end": 108
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 118,
+                "line_end": 10,
+                "col_end": 119
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 14
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 135,
+                "line_end": 10,
+                "col_end": 138
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 152,
+                "line_end": 10,
+                "col_end": 156
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 152,
+                "line_end": 10,
+                "col_end": 156
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 15,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 5,
+            "span": {
+              "file": "r5c_pins.rs",
+              "line_start": 10,
+              "col_start": 152,
+              "line_end": 10,
+              "col_end": 156
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 152,
+                "line_end": 10,
+                "col_end": 156
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 26,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 152,
+                "line_end": 10,
+                "col_end": 162
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          64
+                        ]
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 13,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 149,
+                "line_end": 10,
+                "col_end": 162
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 12,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 11,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "r5c_pins.rs",
+              "line_start": 10,
+              "col_start": 149,
+              "line_end": 10,
+              "col_end": 162
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 10353,
+              "substs_digest": [
+                5745722422160505471,
+                13244169602595488977
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 11,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 149,
+                "line_end": 10,
+                "col_end": 162
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 7
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 16,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 149,
+                "line_end": 10,
+                "col_end": 162
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Copy": {
+                  "local": 18,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 17,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "r5c_pins.rs",
+              "line_start": 10,
+              "col_start": 149,
+              "line_end": 10,
+              "col_end": 162
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 10534,
+              "substs_digest": [
+                5745722422160505471,
+                13244169602595488977
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 17,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 149,
+                "line_end": 10,
+                "col_end": 162
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 19,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                11
+              ],
+              [
+                1,
+                10
+              ]
+            ],
+            "otherwise": 9,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "r5c_pins.rs",
+              "line_start": 10,
+              "col_start": 149,
+              "line_end": 10,
+              "col_end": 162
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 17,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 144,
+                "line_end": 10,
+                "col_end": 145
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 10,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 169,
+                "line_end": 10,
+                "col_end": 170
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 20,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        5,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 184,
+                "line_end": 10,
+                "col_end": 188
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 24,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 12,
+            "span": {
+              "file": "r5c_pins.rs",
+              "line_start": 10,
+              "col_start": 184,
+              "line_end": 10,
+              "col_end": 188
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 10,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 193,
+                "line_end": 10,
+                "col_end": 194
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 14
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 20
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 184,
+                "line_end": 10,
+                "col_end": 188
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 22,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 23,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 21,
+              "projections": []
+            },
+            "target": 13,
+            "span": {
+              "file": "r5c_pins.rs",
+              "line_start": 10,
+              "col_start": 169,
+              "line_end": 10,
+              "col_end": 189
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 27313,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 21,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r5c_pins.rs",
+                "line_start": 10,
+                "col_start": 165,
+                "line_end": 10,
+                "col_end": 189
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 7
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_19",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_19",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "j",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "j",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

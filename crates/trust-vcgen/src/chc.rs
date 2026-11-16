@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust_vcgen/chc.rs: Constrained Horn Clause encoding for loop invariant inference
 //
 // Encodes MIR loops as CHC systems for ay's Spacer engine. Each loop header
@@ -26,20 +26,43 @@ fn generated_chc_symbol(unqualified: &str) -> String {
     crate::generated_formula_symbol("chc", unqualified)
 }
 
-fn chc_local_decl(func: &VerifiableFunction, local: usize) -> Option<&LocalDecl> {
-    let mut matches = func.body.locals.iter().filter(|decl| decl.index == local);
-    let found = matches.next()?;
-    matches.next().is_none().then_some(found)
+fn chc_locals_are_dense(func: &VerifiableFunction) -> bool {
+    crate::all_locals_canonical(func)
 }
 
-fn chc_local_name(func: &VerifiableFunction, local: usize) -> String {
-    if func.body.locals.iter().enumerate().all(|(position, decl)| decl.index == position)
-        && local < func.body.locals.len()
+fn chc_blocks_are_dense(func: &VerifiableFunction) -> bool {
+    func.body.blocks.iter().enumerate().all(|(position, block)| block.id.0 == position)
+}
+
+fn chc_local_decl(func: &VerifiableFunction, local: usize) -> Option<&LocalDecl> {
+    crate::unique_local_decl(func, local)
+}
+
+#[inline]
+fn chc_local_decl_with_density(
+    func: &VerifiableFunction,
+    local: usize,
+    dense_locals: bool,
+) -> Option<&LocalDecl> {
+    if dense_locals {
+        func.body.locals.get(local)
+    } else {
+        chc_local_decl(func, local)
+    }
+}
+
+fn chc_local_name_with_density(
+    func: &VerifiableFunction,
+    local: usize,
+    dense_locals: bool,
+) -> String {
+    if dense_locals
+        && let Some(decl) = func.body.locals.get(local)
     {
         // Share the VC generator's collision-safe local vocabulary. In
         // particular, two shadowed MIR locals must not collapse to one CHC
         // predicate parameter or transition equality.
-        crate::place_to_var_name(func, &Place::local(local))
+        crate::local_var_name(func, decl)
     } else {
         format!("_{local}")
     }
@@ -53,6 +76,19 @@ fn chc_block(func: &VerifiableFunction, block: usize) -> Option<&BasicBlock> {
     matches.next().is_none().then_some(found)
 }
 
+#[inline]
+fn chc_block_with_density(
+    func: &VerifiableFunction,
+    block: usize,
+    dense_blocks: bool,
+) -> Option<&BasicBlock> {
+    if dense_blocks {
+        func.body.blocks.get(block)
+    } else {
+        chc_block(func, block)
+    }
+}
+
 fn validate_chc_function(func: &VerifiableFunction) -> Result<(), ChcError> {
     crate::validate_function(func).map_err(|error| ChcError::UnsupportedMir {
         kind: "MalformedTrustIr".to_string(),
@@ -60,20 +96,29 @@ fn validate_chc_function(func: &VerifiableFunction) -> Result<(), ChcError> {
     })?;
 
     // The ordinary VC pipeline's exhaustive unsupported-body walk is also a
-    // proof-admission boundary for CHC.  In particular, OpaqueScalar carries a
-    // type but no occurrence identity: two distinct runtime constants would be
-    // interned to the same solver symbol if they reached the loop encoder.  Do
-    // not duplicate a partial operand walk here; reuse the canonical statement
-    // and terminator traversal and retain its exact fail-closed diagnostic.
-    if let Some((kind, detail)) =
-        crate::generate::unsupported_mir_vcs(func).into_iter().find_map(|vc| match vc.kind {
-            VcKind::UnsupportedMir { kind, detail } if kind == "ConstValue::OpaqueScalar" => {
-                Some((kind, detail))
-            }
-            _ => None,
-        })
-    {
-        return Err(ChcError::UnsupportedMir { kind, detail });
+    // proof-admission boundary for CHC.  In particular, an OpaqueScalar's
+    // symbol (OPAQUE-SCALAR-ID-1) names the value of its statement's MOST RECENT
+    // execution; a transition relation instantiates that statement once per
+    // iteration, so the one symbol would pin every iteration's runtime value
+    // (an address, transmuted bits) to the same number.  Fast-skip the full
+    // `unsupported_mir_vcs` allocation/traversal when the exhaustive structural
+    // `contains_opaque_scalar` preflight (memoized per function) finds none, and
+    // retain `unsupported_mir_vcs`'s exact fail-closed diagnostic when one exists.
+    if crate::generate::body_mentions_opaque_scalar(func) {
+        if let Some((kind, detail)) =
+            crate::generate::unsupported_mir_vcs(func).into_iter().find_map(|vc| match vc.kind {
+                VcKind::UnsupportedMir { kind, detail } if kind == "ConstValue::OpaqueScalar" => {
+                    Some((kind, detail))
+                }
+                _ => None,
+            })
+        {
+            return Err(ChcError::UnsupportedMir { kind, detail });
+        }
+        return Err(ChcError::UnsupportedMir {
+            kind: "ConstValue::OpaqueScalar".to_string(),
+            detail: "opaque scalar constant has no modeled value".to_string(),
+        });
     }
 
     Ok(())
@@ -290,11 +335,7 @@ fn unsupported_machine_body_arithmetic(
             if operation_has_machine_int_family(func, Some(dest), lhs, Some(rhs)) =>
         {
             Some((
-                match op {
-                    BinOp::Div => "Div",
-                    BinOp::Rem => "Rem",
-                    _ => unreachable!("pattern restricts the operation"),
-                },
+                if matches!(op, BinOp::Div) { "Div" } else { "Rem" },
                 "division-by-zero and signed MIN/-1 panic conditions are not carried by the CHC transition"
                     .to_string(),
             ))
@@ -303,11 +344,7 @@ fn unsupported_machine_body_arithmetic(
             if operation_has_machine_int_family(func, Some(dest), lhs, Some(rhs)) =>
         {
             Some((
-                match op {
-                    BinOp::Shl => "Shl",
-                    BinOp::Shr => "Shr",
-                    _ => unreachable!("pattern restricts the operation"),
-                },
+                if matches!(op, BinOp::Shl) { "Shl" } else { "Shr" },
                 "out-of-range shift panic conditions are not carried by the CHC transition"
                     .to_string(),
             ))
@@ -370,6 +407,12 @@ impl ChcPredicate {
     #[must_use]
     pub fn apply(&self, args: &[Formula]) -> ChcAtom {
         ChcAtom { predicate: self.name.clone(), args: args.to_vec() }
+    }
+
+    /// Create a predicate application taking ownership of the argument formulas.
+    #[must_use]
+    pub(crate) fn apply_owned(&self, args: Vec<Formula>) -> ChcAtom {
+        ChcAtom { predicate: self.name.clone(), args }
     }
 
     /// Create a predicate application using primed variable names (post-state).
@@ -507,6 +550,8 @@ impl ChcSystem {
 ///
 /// The resulting system can be passed to Spacer via `spacer_bridge::to_smtlib2`.
 pub fn encode_function_loops(func: &VerifiableFunction) -> Result<ChcSystem, ChcError> {
+    let _gen_memo = crate::gen_work_memo_scope_if_unscoped();
+    let _func_scope = crate::generate::FuncAnalysisScope::enter(func);
     // CHC is a proof-producing public adapter and must share the complete
     // Trust-MIR admission boundary with ordinary VC generation. The narrower
     // transition gate below checks semantic applicability; it is not a
@@ -522,30 +567,67 @@ pub fn encode_function_loops(func: &VerifiableFunction) -> Result<ChcSystem, Chc
     // `encode_single_loop` uses the same first-write transition builder as the
     // safety adapter; without this gate a branching or multi-write loop can
     // make the transition too strong and false-prove its exit postcondition.
+    let dense_locals = chc_locals_are_dense(func);
+    let dense_blocks = chc_blocks_are_dense(func);
+    let mut loop_modified = Vec::with_capacity(loops.len());
     for loop_info in &loops {
-        let modified = collect_modified_variables(func, loop_info);
-        if !loop_transition_is_faithful(func, loop_info, &modified) {
+        let modified =
+            collect_modified_variables_with_density(func, loop_info, dense_locals, dense_blocks);
+        let Some((loop_cond, body_order)) = loop_transition_faithful_condition_with_order(
+            func,
+            loop_info,
+            &modified,
+            dense_locals,
+            dense_blocks,
+        ) else {
             return Err(ChcError::UnfaithfulLoopTransition {
                 function: func.def_path.clone(),
                 header: loop_info.header.0,
             });
-        }
+        };
         if modified.is_empty() {
             return Err(ChcError::NoInductionVars { header: loop_info.header.0 });
         }
+        loop_modified.push((modified, loop_cond, body_order));
     }
 
     // Applicability precedes semantic-gap reporting: arithmetic contracts on
     // functions outside the exact loop fragment are not owned by this lane.
     reject_unmodeled_contract_arithmetic(func)?;
 
-    let mut predicates = Vec::new();
-    let mut clauses = Vec::new();
-    let mut roles = Vec::new();
+    let mut predicates = Vec::with_capacity(loops.len());
+    let mut clauses = Vec::with_capacity(loops.len() * 3);
+    let mut roles = Vec::with_capacity(loops.len() * 3);
+    let mut shared_precondition = (loops.len() > 1).then(|| build_precondition(func));
+    let mut shared_postcondition = (loops.len() > 1).then(|| build_postcondition(func));
+    let last_loop_idx = loops.len().saturating_sub(1);
 
-    for loop_info in &loops {
+    for (idx, (loop_info, (modified_vars, loop_cond, body_order))) in
+        loops.iter().zip(loop_modified).enumerate()
+    {
         reject_unmodeled_loop_body_arithmetic(func, loop_info)?;
-        let (pred, loop_clauses, loop_roles) = encode_single_loop(func, loop_info)?;
+        let precondition = if idx == last_loop_idx {
+            shared_precondition.take()
+        } else {
+            shared_precondition.clone()
+        };
+        let postcondition = if idx == last_loop_idx {
+            shared_postcondition.take()
+        } else {
+            shared_postcondition.clone()
+        };
+        let (pred, loop_clauses, loop_roles) =
+            encode_single_loop_with_modified_and_cond_and_order(
+                func,
+                loop_info,
+                modified_vars,
+                Some(loop_cond),
+                Some(&body_order),
+                precondition,
+                postcondition,
+                true,
+                true,
+            )?;
         predicates.push(pred);
         clauses.extend(loop_clauses);
         roles.extend(loop_roles);
@@ -554,31 +636,56 @@ pub fn encode_function_loops(func: &VerifiableFunction) -> Result<ChcSystem, Chc
     Ok(ChcSystem { predicates, clauses, roles, function_name: func.name.clone() })
 }
 
-/// Encode a single loop as CHC clauses.
+/// Encode a single loop as CHC clauses given its pre-collected modified variables.
 ///
 /// Returns the predicate and the entry/inductive/exit clauses.
-fn encode_single_loop(
+#[cfg(test)]
+fn encode_single_loop_with_modified(
     func: &VerifiableFunction,
     loop_info: &LoopInfo,
+    modified_vars: Vec<(String, Sort)>,
 ) -> Result<(ChcPredicate, Vec<ChcClause>, Vec<ClauseRole>), ChcError> {
-    // Collect variables modified in the loop body
-    let modified_vars = collect_modified_variables(func, loop_info);
+    encode_single_loop_with_modified_and_cond_and_order(
+        func,
+        loop_info,
+        modified_vars,
+        None,
+        None,
+        None,
+        None,
+        chc_locals_are_dense(func),
+        chc_blocks_are_dense(func),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_single_loop_with_modified_and_cond_and_order(
+    func: &VerifiableFunction,
+    loop_info: &LoopInfo,
+    modified_vars: Vec<(String, Sort)>,
+    precomputed_loop_cond: Option<Formula>,
+    precomputed_body_order: Option<&[usize]>,
+    precomputed_precondition: Option<Formula>,
+    precomputed_postcondition: Option<Formula>,
+    dense_locals: bool,
+    dense_blocks: bool,
+) -> Result<(ChcPredicate, Vec<ChcClause>, Vec<ClauseRole>), ChcError> {
     if modified_vars.is_empty() {
         return Err(ChcError::NoInductionVars { header: loop_info.header.0 });
     }
 
     // Create invariant predicate
     let pred_name = format!("inv_bb{}", loop_info.header.0);
-    let predicate = ChcPredicate { name: pred_name, params: modified_vars.clone() };
+    let predicate = ChcPredicate { name: pred_name, params: modified_vars };
 
-    let mut clauses = Vec::new();
-    let mut roles = Vec::new();
+    let mut clauses = Vec::with_capacity(3);
+    let mut roles = Vec::with_capacity(3);
 
     // --- Entry clause ---
     // precondition => inv(init_values)
-    let init_args = build_init_args(func, loop_info, &modified_vars);
-    let entry_head = predicate.apply(&init_args);
-    let precondition = build_precondition(func);
+    let init_args = build_init_args_with_density(func, loop_info, &predicate.params, dense_locals);
+    let entry_head = predicate.apply_owned(init_args);
+    let precondition = precomputed_precondition.unwrap_or_else(|| build_precondition(func));
 
     clauses.push(ChcClause {
         head: Some(entry_head),
@@ -593,14 +700,29 @@ fn encode_single_loop(
     let body_pred = predicate.apply_unprimed();
     let primed_head = predicate.apply_primed();
 
-    let loop_cond =
-        exact_header_loop_condition(func, loop_info).ok_or_else(|| ChcError::EncodingFailed {
+    let loop_cond = match precomputed_loop_cond {
+        Some(cond) => cond,
+        None => exact_header_loop_condition_with_density(
+            func,
+            loop_info,
+            dense_locals,
+            dense_blocks,
+        )
+        .ok_or_else(|| ChcError::EncodingFailed {
             reason: format!(
                 "loop header {} is outside the exact comparison fragment",
                 loop_info.header.0
             ),
-        })?;
-    let body_transition = build_body_transition(func, loop_info, &modified_vars)?;
+        })?,
+    };
+    let body_transition = build_body_transition_with_order(
+        func,
+        loop_info,
+        &predicate.params,
+        precomputed_body_order,
+        dense_locals,
+        dense_blocks,
+    )?;
 
     let inductive_constraint = Formula::And(vec![loop_cond.clone(), body_transition]);
 
@@ -617,7 +739,7 @@ fn encode_single_loop(
     // Encoded as: inv(vars) /\ !cond /\ !post => false
     let exit_pred = predicate.apply_unprimed();
     let exit_cond = Formula::Not(Box::new(loop_cond));
-    let postcondition = build_postcondition(func);
+    let postcondition = precomputed_postcondition.unwrap_or_else(|| build_postcondition(func));
 
     let exit_constraint = Formula::And(vec![exit_cond, Formula::Not(Box::new(postcondition))]);
 
@@ -694,57 +816,83 @@ pub fn encode_loop_safety_query(
 /// else returns `false` => the encoder yields `None` and the obligation stays on
 /// the single-formula lane (fail-closed). Over-conservative by design: a rejected
 /// loop is never a soundness bug, only a missed discharge.
+#[cfg(test)]
 fn loop_transition_is_faithful(
     func: &VerifiableFunction,
     loop_info: &LoopInfo,
     modified: &[(String, Sort)],
 ) -> bool {
+    loop_transition_faithful_condition_with_order(
+        func,
+        loop_info,
+        modified,
+        chc_locals_are_dense(func),
+        chc_blocks_are_dense(func),
+    )
+    .is_some()
+}
+
+fn loop_transition_faithful_condition_with_order(
+    func: &VerifiableFunction,
+    loop_info: &LoopInfo,
+    modified: &[(String, Sort)],
+    dense_locals: bool,
+    dense_blocks: bool,
+) -> Option<(Formula, Vec<usize>)> {
     // Shared MIR helpers interpret local/block identifiers positionally. Keep
     // the public CHC adapters fail-closed on hand-built or deserialized bodies
     // that violate rustc extraction's dense layout invariant.
-    if func.body.arg_count >= func.body.locals.len()
-        || !func.body.locals.iter().enumerate().all(|(position, decl)| decl.index == position)
-        || !func.body.blocks.iter().enumerate().all(|(position, block)| block.id.0 == position)
-    {
-        return false;
+    if func.body.arg_count >= func.body.locals.len() || !dense_locals || !dense_blocks {
+        return None;
     }
 
     // Recover the one real, ordered path from the taken header edge back to the
     // header. Merely checking terminator *kinds* is insufficient: a Goto can
     // leave the loop, skip a block, or form a smaller cycle.
-    let Some(body_order) = ordered_loop_body_blocks(func, loop_info) else {
-        return false;
-    };
+    let body_order = ordered_loop_body_blocks_with_density(func, loop_info, true)?;
 
     // The condition temporary is recomputed in the header.  It is not loop
     // state, and using the stale temporary in the exit clause admits an extra
     // iteration (`i == n + 1`).  Require the exact comparison shape that the
     // inductive and exit clauses lower directly instead.
-    if exact_header_loop_condition(func, loop_info).is_none() {
-        return false;
-    }
+    let loop_cond = exact_header_loop_condition_with_density(func, loop_info, true, true)?;
 
-    // (c) each modified variable is assigned at most once across the whole body.
+    // (c) each modified variable is assigned at most once across the whole body,
+    // and (d) `build_body_transition` expresses each RHS over the iteration's
+    // unprimed state (exact for reads before any write, rejected on read-after-write).
     // Projected writes are rejected: this scalar transition has no heap/field
     // update relation and must not silently treat the root as unchanged.
-    let mut modified_locals = FxHashSet::default();
+    // Because both `locals` and `blocks` were verified dense above, direct slice
+    // indexing (`blocks.get(bid)`, `locals.get(place.local)`) and
+    // `local_to_var_name` are exact and $O(1)$.
+    let modified_names: FxHashSet<&str> = modified.iter().map(|(n, _)| n.as_str()).collect();
+    let mut written_locals =
+        FxHashSet::with_capacity_and_hasher(modified.len(), Default::default());
+    let mut written_names =
+        FxHashSet::with_capacity_and_hasher(modified.len(), Default::default());
     for &bid in &body_order {
-        let Some(block) = chc_block(func, bid) else {
-            return false;
-        };
+        let block = func.body.blocks.get(bid)?;
         for stmt in &block.stmts {
             match stmt {
-                Statement::Assign { place, .. } => {
+                Statement::Assign { place, rvalue, .. } => {
                     if !place.projections.is_empty() {
-                        return false;
+                        return None;
                     }
-                    let Some(decl) = chc_local_decl(func, place.local) else {
-                        return false;
-                    };
+                    let decl = func.body.locals.get(place.local)?;
                     if !chc_scalar_state_ty_supported(&decl.ty) {
-                        return false;
+                        return None;
                     }
-                    modified_locals.insert(place.local);
+                    if rvalue_reads_written_local(rvalue, &written_locals, &written_names) {
+                        return None;
+                    }
+                    let name = crate::local_var_name(func, decl);
+                    if modified_names.contains(name.as_str())
+                        && written_names.contains(name.as_str())
+                    {
+                        return None;
+                    }
+                    written_locals.insert(place.local);
+                    written_names.insert(name);
                 }
                 // These extraction markers have no value semantics.
                 Statement::StorageLive(_)
@@ -759,55 +907,13 @@ fn loop_transition_is_faithful(
                 | Statement::Retag { .. }
                 | Statement::PlaceMention(_)
                 | Statement::Intrinsic { .. }
-                | Statement::Unsupported { .. } => return false,
-                _ => return false,
+                | Statement::Unsupported { .. } => return None,
+                _ => return None,
             }
         }
     }
 
-    for (name, _) in modified {
-        let mut writes = 0usize;
-        for &bid in &body_order {
-            let Some(block) = chc_block(func, bid) else {
-                return false;
-            };
-            for stmt in &block.stmts {
-                if let Statement::Assign { place, .. } = stmt
-                    && place.projections.is_empty()
-                    && chc_local_name(func, place.local) == *name
-                {
-                    writes += 1;
-                    if writes > 1 {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-
-    // (d) `build_body_transition` expresses each RHS over the iteration's
-    // unprimed state. That is exact for reads before any write (including
-    // `sum += i; i += 1`) but not for a read-after-write (`x += 1; y = x`).
-    // Walk the actual path in order and reject only the latter.
-    let mut written_locals = FxHashSet::default();
-    let mut written_names = FxHashSet::default();
-    for &bid in &body_order {
-        let Some(block) = chc_block(func, bid) else {
-            return false;
-        };
-        for stmt in &block.stmts {
-            let Statement::Assign { place, rvalue, .. } = stmt else {
-                continue;
-            };
-            if rvalue_reads_written_local(rvalue, &written_locals, &written_names) {
-                return false;
-            }
-            written_locals.insert(place.local);
-            written_names.insert(chc_local_name(func, place.local));
-        }
-    }
-
-    true
+    Some((loop_cond, body_order))
 }
 
 /// Return the unique, ordered, non-header loop-body path.
@@ -816,7 +922,11 @@ fn loop_transition_is_faithful(
 /// body, no `otherwise` body edge, and a chain of `Goto`/successful `Assert`
 /// edges which visits every non-header loop block exactly once before returning
 /// to the header.
-fn ordered_loop_body_blocks(func: &VerifiableFunction, loop_info: &LoopInfo) -> Option<Vec<usize>> {
+fn ordered_loop_body_blocks_with_density(
+    func: &VerifiableFunction,
+    loop_info: &LoopInfo,
+    dense_blocks: bool,
+) -> Option<Vec<usize>> {
     let header_id = loop_info.header.0;
     let mut remaining: FxHashSet<usize> = loop_info
         .body_blocks
@@ -828,7 +938,7 @@ fn ordered_loop_body_blocks(func: &VerifiableFunction, loop_info: &LoopInfo) -> 
         return None;
     }
 
-    let header = chc_block(func, header_id)?;
+    let header = chc_block_with_density(func, header_id, dense_blocks)?;
     let Terminator::SwitchInt { targets, otherwise, .. } = &header.terminator else {
         return None;
     };
@@ -848,7 +958,7 @@ fn ordered_loop_body_blocks(func: &VerifiableFunction, loop_info: &LoopInfo) -> 
             return None;
         }
         ordered.push(current);
-        let block = chc_block(func, current)?;
+        let block = chc_block_with_density(func, current, dense_blocks)?;
         let next = match &block.terminator {
             Terminator::Goto(target) | Terminator::Assert { target, .. } => target.0,
             _ => return None,
@@ -874,7 +984,7 @@ fn operand_reads_written_local(
         Operand::Copy(place) | Operand::Move(place) => written_locals.contains(&place.local),
         Operand::Constant(_) => false,
         Operand::Symbolic(formula) => {
-            formula.free_variables().into_iter().any(|name| written_names.contains(name.as_str()))
+            trust_types::any_free_variable_name(formula, &mut |name| written_names.contains(name))
         }
         Operand::Unsupported { .. } => true,
         _ => true,
@@ -951,11 +1061,28 @@ pub fn try_build_loop_safety_chc_system(
     loop_info: &LoopInfo,
     obligation: &LoopSafetyObligation<'_>,
 ) -> Result<Option<ChcSystem>, ChcError> {
+    let _gen_memo = crate::gen_work_memo_scope_if_unscoped();
+    let _func_scope = crate::generate::FuncAnalysisScope::enter(func);
     validate_chc_function(func)?;
     // Faithful loop state: the same modified-variable set the functional lane
     // solves over. An empty set means there is no induction variable to relate
     // the violation to => fall back.
-    let modified_vars = collect_modified_variables(func, loop_info);
+    let dense_locals = chc_locals_are_dense(func);
+    let dense_blocks = chc_blocks_are_dense(func);
+    if func.body.arg_count >= func.body.locals.len() || !dense_locals || !dense_blocks {
+        return Ok(None);
+    }
+
+    // Check obligation applicability up front before walking or sorting loop
+    // body blocks. `build_loop_violation` is purely a function of `(func,
+    // obligation)` and returns `Ok(None)` when the obligation is inapplicable,
+    // unlocatable, or trivially UNSAT (`Formula::Bool(false)`).
+    let Some(violation) = build_loop_violation(func, obligation) else {
+        return Ok(None);
+    };
+
+    let modified_vars =
+        collect_modified_variables_with_density(func, loop_info, dense_locals, dense_blocks);
     if modified_vars.is_empty() {
         return Ok(None);
     }
@@ -969,45 +1096,47 @@ pub fn try_build_loop_safety_chc_system(
     // reachable violation (false-PROVE). Reject those here => the caller falls
     // back to the single-formula lane (fail-closed). This gate is what makes the
     // whole CHC lane sound to enable, independent of the compiler-side router.
-    if !loop_transition_is_faithful(func, loop_info, &modified_vars) {
+    let Some((loop_cond, body_order)) = loop_transition_faithful_condition_with_order(
+        func,
+        loop_info,
+        &modified_vars,
+        dense_locals,
+        dense_blocks,
+    ) else {
         return Ok(None);
-    }
+    };
 
-    // Finish the obligation/condition applicability checks before turning a
-    // semantic gap into a typed lane-owned error. A syntactically faithful
-    // loop with an unrelated or unexpressible safety obligation still belongs
-    // to the ordinary single-formula lane.
-    let Some(inductive_cond) = exact_header_loop_condition(func, loop_info) else {
-        return Ok(None);
-    };
-    let Some((loop_cond, violation)) =
-        extract_loop_safety_query_inputs(func, loop_info, obligation)
-    else {
-        return Ok(None);
-    };
+    let inductive_cond = loop_cond.clone();
 
     // An otherwise applicable transition owns exact body-arithmetic
     // diagnostics. Other unsupported transition shapes remain an ordinary
     // `Ok(None)` fallback, and an arithmetic source contract is reported only
     // after the full body relation was successfully constructed.
     reject_unmodeled_loop_body_arithmetic(func, loop_info)?;
-    let Ok(body_transition) = build_body_transition(func, loop_info, &modified_vars) else {
+    let Ok(body_transition) = build_body_transition_with_order(
+        func,
+        loop_info,
+        &modified_vars,
+        Some(&body_order),
+        true,
+        true,
+    ) else {
         return Ok(None);
     };
     reject_unmodeled_contract_arithmetic(func)?;
 
     let predicate = ChcPredicate {
         name: format!("inv_bb{}", loop_info.header.0),
-        params: modified_vars.clone(),
+        params: modified_vars,
     };
 
-    let mut clauses = Vec::new();
-    let mut roles = Vec::new();
+    let mut clauses = Vec::with_capacity(3);
+    let mut roles = Vec::with_capacity(3);
 
     // --- Entry: precondition => inv(init_values) ---
-    let init_args = build_init_args(func, loop_info, &modified_vars);
+    let init_args = build_init_args_with_density(func, loop_info, &predicate.params, true);
     clauses.push(ChcClause {
-        head: Some(predicate.apply(&init_args)),
+        head: Some(predicate.apply_owned(init_args)),
         body_atoms: vec![],
         constraint: build_precondition(func),
         label: format!("entry_bb{}", loop_info.header.0),
@@ -1512,6 +1641,19 @@ fn chc_formula_to_typed_expr(
         Formula::BvMul(a, b, _) => chc_binary_expr("bv_mul", a, b, vars),
         Formula::BvUDiv(a, b, _) => chc_binary_expr("bv_udiv", a, b, vars),
         Formula::BvURem(a, b, _) => chc_binary_expr("bv_urem", a, b, vars),
+        Formula::BvSRem(a, b, width) => {
+            // The wire derives its width from the operands. Authenticate the
+            // formula's declared width before dropping that redundant field.
+            if *width == 0 {
+                return Err(ChcError::EncodingFailed {
+                    reason: "signed remainder width must be positive".to_string(),
+                });
+            }
+            trust_types::check_formula_sort(f).map_err(|err| ChcError::EncodingFailed {
+                reason: format!("ill-sorted typed-CHC signed remainder expression: {err}"),
+            })?;
+            chc_binary_expr("bv_srem", a, b, vars)
+        }
         Formula::BvAnd(a, b, _) => chc_binary_expr("bv_and", a, b, vars),
         Formula::BvOr(a, b, _) => chc_binary_expr("bv_or", a, b, vars),
         Formula::BvXor(a, b, _) => chc_binary_expr("bv_xor", a, b, vars),
@@ -1524,10 +1666,9 @@ fn chc_formula_to_typed_expr(
         Formula::BvSLe(a, b, _) => chc_binary_expr("bv_sle", a, b, vars),
 
         // Everything else (ITE, arrays, quantifiers, floats, uninterpreted
-        // preds, Bv{S}Div/{S}Rem/Concat/ZeroExt) has no typed-CHC encoding —
-        // fail closed to the single-formula lane. (`IntToBv`/`BvToInt` ARE
-        // encoded above; the consumer has no `bv_sdiv`/`bv_srem` op, so signed
-        // BV division/remainder stays fail-closed.)
+        // preds, BvSDiv/Concat/ZeroExt) has no typed-CHC encoding — fail
+        // closed to the single-formula lane. (`IntToBv`/`BvToInt` ARE encoded
+        // above; signed BV division still has no wire operation.)
         other => Err(ChcError::UnsupportedMir {
             kind: "Formula".to_string(),
             detail: format!(
@@ -1583,27 +1724,41 @@ pub(crate) fn collect_modified_variables(
     func: &VerifiableFunction,
     loop_info: &LoopInfo,
 ) -> Vec<(String, Sort)> {
+    collect_modified_variables_with_density(
+        func,
+        loop_info,
+        chc_locals_are_dense(func),
+        chc_blocks_are_dense(func),
+    )
+}
+
+fn collect_modified_variables_with_density(
+    func: &VerifiableFunction,
+    loop_info: &LoopInfo,
+    dense_locals: bool,
+    dense_blocks: bool,
+) -> Vec<(String, Sort)> {
     let mut modified = Vec::new();
     let mut seen_locals = FxHashSet::default();
-    let body_set: FxHashSet<usize> = loop_info
-        .body_blocks
-        .iter()
-        .map(|b| b.0)
-        .filter(|block| *block != loop_info.header.0)
-        .collect();
 
-    for &body_id in &body_set {
-        let Some(block) = chc_block(func, body_id) else {
+    for &BlockId(body_id) in &loop_info.body_blocks {
+        if body_id == loop_info.header.0 {
+            continue;
+        }
+        let Some(block) = chc_block_with_density(func, body_id, dense_blocks) else {
             continue;
         };
         for stmt in &block.stmts {
             if let Statement::Assign { place, .. } = stmt
                 && place.projections.is_empty()
-                && !seen_locals.contains(&place.local)
+                && seen_locals.insert(place.local)
             {
-                seen_locals.insert(place.local);
-                if let Some(decl) = chc_local_decl(func, place.local) {
-                    let name = chc_local_name(func, place.local);
+                if let Some(decl) = chc_local_decl_with_density(func, place.local, dense_locals) {
+                    let name = if dense_locals {
+                        crate::local_var_name(func, decl)
+                    } else {
+                        format!("_{}", place.local)
+                    };
                     let sort = crate::sort_for_ty(&decl.ty);
                     modified.push((name, sort));
                 }
@@ -1620,21 +1775,38 @@ pub(crate) fn collect_modified_variables(
 ///
 /// Uses induction variable init values where available, falls back to
 /// uninterpreted variable references.
+#[cfg(test)]
 fn build_init_args(
     func: &VerifiableFunction,
     loop_info: &LoopInfo,
     params: &[(String, Sort)],
 ) -> Vec<Formula> {
+    build_init_args_with_density(func, loop_info, params, chc_locals_are_dense(func))
+}
+
+fn build_init_args_with_density(
+    func: &VerifiableFunction,
+    loop_info: &LoopInfo,
+    params: &[(String, Sort)],
+    dense_locals: bool,
+) -> Vec<Formula> {
+    let mut ivar_inits: Vec<(String, &Formula)> = Vec::new();
+    if !loop_info.induction_vars.is_empty() {
+        for iv in &loop_info.induction_vars {
+            if let Some(init) = &iv.init {
+                let iv_name = chc_local_name_with_density(func, iv.local_idx, dense_locals);
+                if !ivar_inits.iter().any(|(existing, _)| existing == &iv_name) {
+                    ivar_inits.push((iv_name, init));
+                }
+            }
+        }
+    }
     params
         .iter()
         .map(|(name, sort)| {
             // Try to find an induction variable with a known init
-            if let Some(ivar) = loop_info.induction_vars.iter().find(|iv| {
-                let iv_name = chc_local_name(func, iv.local_idx);
-                iv_name == *name
-            }) && let Some(init) = &ivar.init
-            {
-                return init.clone();
+            if let Some((_, init)) = ivar_inits.iter().find(|(iv_name, _)| iv_name == name) {
+                return (*init).clone();
             }
             // Fallback: use an initial-state variable
             Formula::Var(generated_chc_symbol(&format!("init_{name}")), sort.clone())
@@ -1719,25 +1891,73 @@ pub(crate) fn extract_exit_condition(
 /// Build the body transition relation: how variables change in one iteration.
 ///
 /// For each modified variable, generates `var' = update_expr(var, ...)`.
+#[cfg(test)]
 fn build_body_transition(
     func: &VerifiableFunction,
     loop_info: &LoopInfo,
     params: &[(String, Sort)],
 ) -> Result<Formula, ChcError> {
-    let mut constraints = Vec::new();
-    let body_order =
-        ordered_loop_body_blocks(func, loop_info).ok_or_else(|| ChcError::EncodingFailed {
-            reason: format!(
-                "loop {} does not have one exact ordered body path",
-                loop_info.header.0
-            ),
-        })?;
+    build_body_transition_with_order(
+        func,
+        loop_info,
+        params,
+        None,
+        chc_locals_are_dense(func),
+        chc_blocks_are_dense(func),
+    )
+}
 
+fn build_body_transition_with_order(
+    func: &VerifiableFunction,
+    loop_info: &LoopInfo,
+    params: &[(String, Sort)],
+    precomputed_body_order: Option<&[usize]>,
+    dense_locals: bool,
+    dense_blocks: bool,
+) -> Result<Formula, ChcError> {
+    let owned_body_order;
+    let body_order = match precomputed_body_order {
+        Some(order) => order,
+        None => {
+            owned_body_order =
+                ordered_loop_body_blocks_with_density(func, loop_info, dense_blocks).ok_or_else(
+                    || ChcError::EncodingFailed {
+                        reason: format!(
+                            "loop {} does not have one exact ordered body path",
+                            loop_info.header.0
+                        ),
+                    },
+                )?;
+            owned_body_order.as_slice()
+        }
+    };
+    let mut seen_locals = FxHashSet::with_capacity_and_hasher(params.len(), Default::default());
+    let mut first_assigns: trust_types::fx::FxHashMap<String, (&Place, &Rvalue, &LocalDecl)> =
+        trust_types::fx::FxHashMap::with_capacity_and_hasher(params.len(), Default::default());
+    for &bid in body_order {
+        let Some(block) = chc_block_with_density(func, bid, dense_blocks) else { continue };
+        for stmt in &block.stmts {
+            if let Statement::Assign { place, rvalue, .. } = stmt
+                && place.projections.is_empty()
+                && seen_locals.insert(place.local)
+                && let Some(decl) = chc_local_decl_with_density(func, place.local, dense_locals)
+            {
+                let name = if dense_locals {
+                    crate::local_var_name(func, decl)
+                } else {
+                    format!("_{}", place.local)
+                };
+                first_assigns.entry(name).or_insert((place, rvalue, decl));
+            }
+        }
+    }
+
+    let mut constraints = Vec::with_capacity(params.len());
     for (name, sort) in params {
         let primed = Formula::Var(format!("{name}'"), sort.clone());
 
         // Try to find the update expression from the loop body
-        let update = find_variable_update(func, &body_order, name)?;
+        let update = find_variable_update_from_index(func, &first_assigns, name)?;
 
         match update {
             Some(update_formula) => {
@@ -1766,53 +1986,28 @@ fn build_body_transition(
         }
     }
 
-    if constraints.is_empty() {
-        Ok(Formula::Bool(true))
-    } else if constraints.len() == 1 {
-        // SAFETY: len == 1 arm of the match guarantees .next() returns Some.
-        Ok(constraints
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| unreachable!("empty iter despite len == 1")))
+    if constraints.len() <= 1 {
+        Ok(constraints.pop().unwrap_or(Formula::Bool(true)))
     } else {
         Ok(Formula::And(constraints))
     }
 }
 
-/// Find the update expression for a variable in the loop body.
-fn find_variable_update(
+/// Find the update expression for a variable from the pre-indexed first assignments in the loop body.
+fn find_variable_update_from_index(
     func: &VerifiableFunction,
-    body_order: &[usize],
+    first_assigns: &trust_types::fx::FxHashMap<String, (&Place, &Rvalue, &LocalDecl)>,
     var_name: &str,
 ) -> Result<Option<Formula>, ChcError> {
-    for &body_id in body_order {
-        let Some(block) = chc_block(func, body_id) else {
-            continue;
-        };
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, rvalue, .. } = stmt
-                && place.projections.is_empty()
-                && let Some(decl) = chc_local_decl(func, place.local)
-            {
-                let name = chc_local_name(func, place.local);
-                if name == var_name {
-                    let sort = crate::place_sort(func, place)
-                        .unwrap_or_else(|| crate::sort_for_ty(&decl.ty));
-                    return Ok(Some(rvalue_to_formula_with_dest(
-                        func,
-                        rvalue,
-                        Some((
-                            name.as_str(),
-                            sort,
-                            machine_int_info(&decl.ty),
-                            is_machine_int_family(&decl.ty),
-                        )),
-                    )?));
-                }
-            }
-        }
-    }
-    Ok(None)
+    let Some(&(place, rvalue, decl)) = first_assigns.get(var_name) else {
+        return Ok(None);
+    };
+    let sort = crate::place_sort(func, place).unwrap_or_else(|| crate::sort_for_ty(&decl.ty));
+    Ok(Some(rvalue_to_formula_with_dest(
+        func,
+        rvalue,
+        Some((var_name, sort, machine_int_info(&decl.ty), is_machine_int_family(&decl.ty))),
+    )?))
 }
 
 /// Convert an Rvalue to a Formula.
@@ -1909,8 +2104,6 @@ fn rvalue_to_formula_with_dest(
                 .as_ref()
                 .and_then(|(_, _, machine, _)| *machine)
                 .or_else(|| operation_machine_int_info(func, None, lhs, Some(rhs)));
-            let has_machine_family = dest.as_ref().is_some_and(|(_, _, _, machine)| *machine)
-                || operation_has_machine_int_family(func, None, lhs, Some(rhs));
             match (*op, machine) {
                 (BinOp::Add | BinOp::Sub | BinOp::Mul, Some((width, signed))) => {
                     if !operand_is_compatible_machine_value(func, lhs, (width, signed))
@@ -1944,12 +2137,16 @@ fn rvalue_to_formula_with_dest(
                     | BinOp::Shl
                     | BinOp::Shr,
                     None,
-                ) if has_machine_family => Err(unsupported_chc_lowering(
-                    "Rvalue::BinaryOp",
-                    format!(
-                        "{op:?} has an unsupported or unavailable machine width; mathematical-Int fallback is forbidden"
-                    ),
-                )),
+                ) if dest.as_ref().is_some_and(|(_, _, _, machine)| *machine)
+                    || operation_has_machine_int_family(func, None, lhs, Some(rhs)) =>
+                {
+                    Err(unsupported_chc_lowering(
+                        "Rvalue::BinaryOp",
+                        format!(
+                            "{op:?} has an unsupported or unavailable machine width; mathematical-Int fallback is forbidden"
+                        ),
+                    ))
+                }
                 (_, machine) => {
                     // Comparisons are exact over the integer interpretation of
                     // machine values. Bitwise operations use the existing exact
@@ -2036,9 +2233,7 @@ fn rvalue_to_formula_with_dest(
             let ty = crate::operand_ty_cow(func, op);
             match ty.as_deref() {
                 Some(Ty::Bool) => Ok(Formula::Not(Box::new(value))),
-                Some(ty) if machine_int_info(ty).is_some() => {
-                    let (width, signed) = machine_int_info(ty)
-                        .expect("guard established a supported machine-integer carrier");
+                Some(ty) if let Some((width, signed)) = machine_int_info(ty) => {
                     Ok(Formula::BvToInt(
                         Box::new(Formula::BvNot(
                             Box::new(Formula::IntToBv(Box::new(value), width)),
@@ -2149,7 +2344,7 @@ pub(crate) fn operand_to_formula_checked(
         }
         Operand::Constant(cv) => const_value_to_formula_checked(cv),
         Operand::Symbolic(formula) => Ok(formula.clone()),
-        Operand::Unsupported { kind, detail } => {
+        Operand::Unsupported { kind, detail, .. } => {
             Err(unsupported_chc_lowering(kind.clone(), detail.clone()))
         }
         _ => Err(unsupported_chc_lowering(
@@ -2160,6 +2355,9 @@ pub(crate) fn operand_to_formula_checked(
 }
 
 fn const_value_to_formula_checked(cv: &ConstValue) -> Result<Formula, ChcError> {
+    if cv.contains_memory_image() {
+        return Err(unsupported_chc_lowering(crate::MEMORY_IMAGE_KIND, crate::MEMORY_IMAGE_DETAIL));
+    }
     match cv {
         ConstValue::Bool(b) => Ok(Formula::Bool(*b)),
         ConstValue::Int(n) => Ok(Formula::Int(*n)),
@@ -2183,14 +2381,14 @@ fn const_value_to_formula_checked(cv: &ConstValue) -> Result<Formula, ChcError> 
         ConstValue::Str { bytes } => {
             Ok(Formula::var_owned(ConstValue::str_smt_var_name(bytes), Sort::Int))
         }
-        // OpaqueScalar has no occurrence identity.  Naming it by type aliases
-        // distinct constants and can turn `a - b` into `x - x`, which is an
-        // under-approximation and can false-prove a loop invariant.  Public CHC
-        // entry points reject it during their exhaustive body preflight; keep
-        // this lowering boundary fail closed as defense for internal callers.
+        // An OpaqueScalar symbol names one execution of its statement (see
+        // `validate_chc_function`); a loop transition would reuse it across
+        // iterations and could false-prove a loop invariant.  Public CHC entry
+        // points reject it during their exhaustive body preflight; keep this
+        // lowering boundary fail closed as defense for internal callers.
         ConstValue::OpaqueScalar { .. } => Err(unsupported_chc_lowering(
             "ConstValue::OpaqueScalar",
-            "identity-less opaque scalar cannot be used as CHC proof input".to_string(),
+            "opaque scalar has no modeled value and no per-iteration identity; it cannot be used as CHC proof input".to_string(),
         )),
         // Trust: piece #7a — a const-generic PARAM value on the NATIVE (`-full`)
         // path. It MUST mint the SAME per-param symbol `__trust_constparam_*` (via
@@ -2217,14 +2415,15 @@ fn cast_to_formula_checked(
     to_ty: &Ty,
     dest: Option<(&str, Sort, Option<(u32, bool)>, bool)>,
 ) -> Result<Formula, ChcError> {
-    let from_ty = crate::operand_ty(func, op).ok_or_else(|| {
+    let from_ty = crate::operand_ty_cow(func, op).ok_or_else(|| {
         unsupported_chc_lowering(
             "Rvalue::Cast",
             format!("source operand type is unavailable for cast to {to_ty:?}"),
         )
     })?;
+    let from_ty = from_ty.as_ref();
 
-    if matches!(&from_ty, Ty::Bool) && to_ty.is_integer() {
+    if matches!(from_ty, Ty::Bool) && to_ty.is_integer() {
         let value = operand_to_formula_checked(func, op)?;
         return Ok(Formula::Ite(
             Box::new(value),
@@ -2233,7 +2432,7 @@ fn cast_to_formula_checked(
         ));
     }
 
-    if crate::is_callable_reification_cast(&from_ty, to_ty) {
+    if crate::is_callable_reification_cast(from_ty, to_ty) {
         let Some((dest_name, sort, _, _)) = dest else {
             return Err(unsupported_chc_lowering(
                 "Rvalue::Cast",
@@ -2246,6 +2445,49 @@ fn cast_to_formula_checked(
 
     if crate::is_modeled_identity_cast(&from_ty, to_ty) {
         return operand_to_formula_checked(func, op);
+    }
+
+    // A cast between two inhabited zero-sized types (the ZST transmute the
+    // extractor admits) moves the unique inhabitant. Both sides lower to
+    // the same Int representative sort (`Sort::from_ty`'s fallback, the
+    // sort `ConstValue::Unit`'s `Int(0)` uses), so — like a modeled
+    // identity cast — the operand's formula IS the result: any equality
+    // between two values of one ZST type is runtime-true.
+    if crate::is_zst_to_zst_cast(&from_ty, to_ty) {
+        return operand_to_formula_checked(func, op);
+    }
+
+    // Trust (2026-09-12, -O print machinery) — two casts `format_args!` emits when
+    // inlined into `main` at -Copt-level>=2, each a DEFINED value-preserving
+    // operation (design principle 9) whose result the CHC lane cannot express as
+    // identity, so it is a FRESH UNCONSTRAINED value of the destination sort — the
+    // sound over-approximation the `&T -> &dyn Trait` arm below already uses.
+    // Nothing is asserted about the value, so no value-dependent obligation can
+    // be falsely proved; the cast merely stops poisoning its whole function.
+    //   [A] `*const str -> *const u8`: a fat->thin metadata DROP (direction-gated).
+    //   [C] `usize -> NonNull<T>`: the fmt-packing transmute the extractor admits;
+    //       a fresh newtype value launders NO provenance (identity would).
+    if crate::is_fat_to_thin_raw_ptr_cast(&from_ty, to_ty)
+        || crate::is_pointer_wrapper_to_raw_fat_ptr_cast(&from_ty, to_ty)
+    {
+        let Some((dest_name, sort, _, _)) = dest else {
+            return Err(unsupported_chc_lowering(
+                "Rvalue::Cast",
+                "fat->thin raw pointer cast requires an assignment destination for a stable fresh value"
+                    .to_string(),
+            ));
+        };
+        return Ok(Formula::Var(format!("__trust_fat_to_thin_ptr_cast_{dest_name}"), sort));
+    }
+    if crate::is_ptr_width_int_to_pointer_newtype_transmute(&from_ty, to_ty) {
+        let Some((dest_name, sort, _, _)) = dest else {
+            return Err(unsupported_chc_lowering(
+                "Rvalue::Cast",
+                "int->pointer-newtype transmute requires an assignment destination for a stable fresh value"
+                    .to_string(),
+            ));
+        };
+        return Ok(Formula::Var(format!("__trust_int_to_ptr_newtype_cast_{dest_name}"), sort));
     }
 
     // float `as` casts (int<->float, float->float) are infallible; model the
@@ -2262,6 +2504,20 @@ fn cast_to_formula_checked(
             ));
         };
         return Ok(Formula::Var(format!("__trust_float_cast_{dest_name}"), sort));
+    }
+
+    // Trust (G1, 2026-10-27): `fn as *const ()` (MIR `FnPtrToPtr`) is an opaque code
+    // address: a fresh unconstrained value of the destination sort, never identity with
+    // the fn pointer (`is_fn_pointer_to_code_address_cast`).
+    if crate::is_fn_pointer_to_code_address_cast(&from_ty, to_ty) {
+        let Some((dest_name, sort, _, _)) = dest else {
+            return Err(unsupported_chc_lowering(
+                "Rvalue::Cast",
+                "fn-pointer code-address cast requires an assignment destination for a stable fresh value"
+                    .to_string(),
+            ));
+        };
+        return Ok(Formula::Var(format!("__trust_fn_code_addr_{dest_name}"), sort));
     }
 
     // A pointer→integer cast (the `*const _ -> usize` address-exposure leg of the
@@ -2438,9 +2694,11 @@ fn pow2_formula(k: u32) -> Formula {
 /// Covered cases, each an EXACT machine-semantics identity:
 ///
 /// * fully-constant UNSIGNED `x >> k` / `x << k` — folded to the literal
-///   result (`<<` with the w-bit wrap Rust release semantics has; a shift
-///   whose amount is out of range stays on the BV path — the checked-shift
-///   obligation owns that case).
+///   result (`<<` with the w-bit wrap Rust release semantics has). A shift
+///   whose amount is out of range stays on the BV path, which applies Rust's
+///   count mask (`k.rem_euclid(w)`) — the value of a plain MIR shift with no
+///   overflow `Assert`; under overflow checks the checked-shift obligation
+///   still owns the out-of-range case.
 /// * UNSIGNED `x >> k` (variable `x`) — `x div 2^k`. `Formula::Div` lowers to
 ///   Rust TRUNCATED division (see smtlib.rs); for the non-negative values an
 ///   unsigned operand takes in every real execution, truncated == floor ==
@@ -2462,9 +2720,14 @@ fn const_shift_to_linear(
     w: u32,
     signed: bool,
 ) -> Option<Formula> {
-    if !matches!(op, BinOp::Shl | BinOp::Shr) || signed {
+    if signed {
         return None;
     }
+    let shift_left = match op {
+        BinOp::Shl => true,
+        BinOp::Shr => false,
+        _ => return None,
+    };
     let k = nonneg_int_literal(rhs)?;
     if k >= u128::from(w) || k >= 128 {
         return None;
@@ -2473,19 +2736,16 @@ fn const_shift_to_linear(
     if let Some(x) = nonneg_int_literal(lhs) {
         // Fully-constant fold with exact w-bit machine semantics.
         let mask = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
-        let value = match op {
-            BinOp::Shl => (x << k) & mask,
-            BinOp::Shr => (x & mask) >> k,
-            _ => unreachable!("gated to Shl|Shr above"),
-        };
+        let value = if shift_left { (x << k) & mask } else { (x & mask) >> k };
         return Some(match i128::try_from(value) {
             Ok(v) => Formula::Int(v),
             Err(_) => Formula::UInt(value),
         });
     }
-    match op {
-        BinOp::Shr => Some(Formula::Div(Box::new(lhs.clone()), Box::new(pow2_formula(k)))),
-        _ => None,
+    if !shift_left {
+        Some(Formula::Div(Box::new(lhs.clone()), Box::new(pow2_formula(k))))
+    } else {
+        None
     }
 }
 
@@ -2572,7 +2832,35 @@ pub fn try_binop_to_formula(
             // IntToBv/BvToInt to maintain sort compatibility with the rest of
             // the formula tree.
             let lhs_bv = Box::new(Formula::IntToBv(Box::new(lhs), w));
-            let rhs_bv = Box::new(Formula::IntToBv(Box::new(rhs), w));
+            // A SHIFT COUNT is Rust's, not SMT-LIB's: a plain MIR `Shl`/`Shr`
+            // shifts by `rhs.rem_euclid(w)` (rustc_middle `mir::BinOp::Shl`;
+            // `rustc_codegen_ssa::base::build_shift_expr_rhs` ANDs the count
+            // with `w - 1`), while `bvshl`/`bvlshr`/`bvashr` by a count `>= w`
+            // yield `0` (or the sign fill). The bare `IntToBv(rhs, w)` count
+            // this arm used to emit therefore defined `x << 33u32` as `0` where
+            // Rust computes `x << 1` — a definition FALSE of every execution
+            // with an out-of-range count, which as a conjoined hypothesis
+            // excluded exactly those traces. With `-C overflow-checks` on, the
+            // dominating `Assert(amount < w)` makes the mask the identity on
+            // every path that reaches the shift, so no checked verdict moves;
+            // with checks off it is the whole semantics.
+            //
+            // `rust_shift_amount_formula` is the crate's one spelling of that
+            // count: `BvAnd(IntToBv(rhs, w), w - 1)`. `IntToBv` reduces the
+            // Int-sorted count modulo `2^w`, and `w` divides `2^w`, so the
+            // masked bits are `rhs.rem_euclid(w)` for every count of every
+            // integer type, signed or not. It is also the spelling
+            // `contracts::machine_faithful_shift_amount` authenticates.
+            let rhs_bv = if matches!(op, BinOp::Shl | BinOp::Shr) {
+                crate::contracts::rust_shift_amount_formula(&rhs, w).ok_or_else(|| {
+                    unsupported_chc_lowering(
+                        "Rvalue::BinaryOp",
+                        format!("{op:?} at width {w} has no Rust shift-count mask"),
+                    )
+                })?
+            } else {
+                Box::new(Formula::IntToBv(Box::new(rhs), w))
+            };
             let bv_result = match op {
                 BinOp::BitAnd => Formula::BvAnd(lhs_bv, rhs_bv, w),
                 BinOp::BitOr => Formula::BvOr(lhs_bv, rhs_bv, w),
@@ -2580,11 +2868,8 @@ pub fn try_binop_to_formula(
                 BinOp::Shl => Formula::BvShl(lhs_bv, rhs_bv, w),
                 // Use arithmetic right shift for signed types,
                 // logical right shift for unsigned.
-                BinOp::Shr if signed => Formula::BvAShr(lhs_bv, rhs_bv, w),
-                BinOp::Shr => Formula::BvLShr(lhs_bv, rhs_bv, w),
-                _ => unreachable!(
-                    "bitvector lowering only handles bitwise and shift BinOp variants selected by the outer match"
-                ),
+                _ if signed => Formula::BvAShr(lhs_bv, rhs_bv, w),
+                _ => Formula::BvLShr(lhs_bv, rhs_bv, w),
             };
             // Bridge back to integer domain for compatibility with overflow/range checks.
             //
@@ -2799,41 +3084,46 @@ pub(crate) fn build_loop_cond_with_arithmetic(
 /// supported header contains exactly that one assignment: accepting additional
 /// header effects would omit them from the body transition.
 fn exact_header_loop_condition(func: &VerifiableFunction, loop_info: &LoopInfo) -> Option<Formula> {
-    let header = chc_block(func, loop_info.header.0)?;
+    exact_header_loop_condition_with_density(func, loop_info, false, false)
+}
+
+fn exact_header_loop_condition_with_density(
+    func: &VerifiableFunction,
+    loop_info: &LoopInfo,
+    dense_locals: bool,
+    dense_blocks: bool,
+) -> Option<Formula> {
+    let header = chc_block_with_density(func, loop_info.header.0, dense_blocks)?;
     let Terminator::SwitchInt { discr, targets, otherwise, .. } = &header.terminator else {
         return None;
     };
-
-    let body_set: FxHashSet<usize> = loop_info
-        .body_blocks
-        .iter()
-        .map(|b| b.0)
-        .filter(|block| *block != loop_info.header.0)
-        .collect();
-    if body_set.contains(&otherwise.0) {
+    let [Statement::Assign { place, rvalue, .. }] = header.stmts.as_slice() else {
+        return None;
+    };
+    let discr_local = match discr {
+        Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
+        _ => return None,
+    };
+    if place.local != discr_local || !place.projections.is_empty() || !is_comparison_rvalue(rvalue)
+    {
         return None;
     }
-    let mut body_edges = targets.iter().filter(|(_, target)| body_set.contains(&target.0));
+
+    let is_non_header_body =
+        |block: BlockId| block != loop_info.header && loop_info.body_blocks.contains(&block);
+    if is_non_header_body(*otherwise) {
+        return None;
+    }
+    let mut body_edges = targets.iter().filter(|(_, target)| is_non_header_body(*target));
     let (body_value, _) = body_edges.next()?;
     if body_edges.next().is_some() {
         return None;
     }
 
-    // The discriminant must be a bare local we can trace to a comparison assign.
-    let discr_local = match discr {
-        Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
-        _ => return None,
-    };
-    if !matches!(chc_local_decl(func, discr_local).map(|decl| &decl.ty), Some(Ty::Bool))
-        || crate::operand_sort(func, discr) != Some(Sort::Bool)
-    {
-        return None;
-    }
-
-    let [Statement::Assign { place, rvalue, .. }] = header.stmts.as_slice() else {
-        return None;
-    };
-    if place.local != discr_local || !place.projections.is_empty() || !is_comparison_rvalue(rvalue)
+    if !matches!(
+        chc_local_decl_with_density(func, discr_local, dense_locals).map(|decl| &decl.ty),
+        Some(Ty::Bool)
+    ) || crate::operand_sort(func, discr) != Some(Sort::Bool)
     {
         return None;
     }
@@ -3185,6 +3475,47 @@ mod tests {
     }
 
     #[test]
+    fn test_typed_chc_transport_keeps_signed_remainder_distinct() {
+        for signed in [false, true] {
+            let lhs = Box::new(Formula::Var("x".into(), Sort::BitVec(8)));
+            let rhs = Box::new(Formula::BitVec { value: 2, width: 8 });
+            let formula =
+                if signed { Formula::BvSRem(lhs, rhs, 8) } else { Formula::BvURem(lhs, rhs, 8) };
+            let mut vars = std::collections::BTreeMap::new();
+            let wire = chc_formula_to_typed_expr(&formula, &mut vars)
+                .expect("machine remainder has an exact typed-CHC operation");
+            assert_eq!(wire["op"], if signed { "bv_srem" } else { "bv_urem" });
+            assert_eq!(wire["rhs"]["width"], 8);
+            assert_eq!(vars.get("x"), Some(&Sort::BitVec(8)));
+        }
+        let division = Formula::BvSDiv(
+            Box::new(Formula::Var("x".into(), Sort::BitVec(8))),
+            Box::new(Formula::BitVec { value: 2, width: 8 }),
+            8,
+        );
+        assert!(chc_formula_to_typed_expr(&division, &mut Default::default()).is_err());
+    }
+
+    #[test]
+    fn test_typed_chc_signed_remainder_rejects_lost_declared_width_and_sort() {
+        let x = |width| Box::new(Formula::Var("x".into(), Sort::BitVec(width)));
+        let two = |width| Box::new(Formula::BitVec { value: 2, width });
+        for malformed in [
+            Formula::BvSRem(x(8), two(8), 16),
+            Formula::BvSRem(x(8), two(16), 8),
+            Formula::BvSRem(Box::new(Formula::Var("x".into(), Sort::Int)), two(8), 8),
+            Formula::BvSRem(x(0), two(0), 0),
+        ] {
+            let mut vars = Default::default();
+            assert!(matches!(
+                chc_formula_to_typed_expr(&malformed, &mut vars),
+                Err(ChcError::EncodingFailed { .. }),
+            ));
+            assert!(vars.is_empty(), "a rejected value must not register ill-sorted variables");
+        }
+    }
+
+    #[test]
     fn test_typed_chc_transport_marks_rust_division_and_remainder_as_truncating() {
         let x = || Formula::Var("x".into(), Sort::Int);
         for (formula, expected_op) in [
@@ -3288,6 +3619,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3801,6 +4133,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3955,6 +4288,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3985,6 +4319,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4843,8 +5178,8 @@ mod tests {
         };
         *rvalue = Rvalue::BinaryOp(
             BinOp::Sub,
-            Operand::Constant(ConstValue::OpaqueScalar { width: 32, signed: false }),
-            Operand::Constant(ConstValue::OpaqueScalar { width: 32, signed: false }),
+            Operand::Constant(ConstValue::opaque_scalar(32, false)),
+            Operand::Constant(ConstValue::opaque_scalar(32, false)),
         );
 
         crate::validate_function(&func)
@@ -4854,7 +5189,8 @@ mod tests {
                 error,
                 ChcError::UnsupportedMir { kind, detail }
                     if kind == "ConstValue::OpaqueScalar"
-                        && detail.contains("identity-less opaque")
+                        && detail.contains("opaque")
+                        && detail.contains("no modeled value")
             ));
         };
         assert_opaque(
@@ -4875,10 +5211,7 @@ mod tests {
         assert!(legacy.is_none(), "legacy wrapper must fail closed on the typed refusal");
 
         assert!(matches!(
-            const_value_to_formula_checked(&ConstValue::OpaqueScalar {
-                width: 32,
-                signed: false,
-            }),
+            const_value_to_formula_checked(&ConstValue::opaque_scalar(32, false)),
             Err(ChcError::UnsupportedMir { kind, .. })
                 if kind == "ConstValue::OpaqueScalar"
         ));
@@ -4949,10 +5282,10 @@ mod tests {
     #[test]
     fn test_rvalue_to_formula_unsupported_operand_fails_closed() {
         let func = counting_loop_function();
-        let rvalue = Rvalue::Use(Operand::Unsupported {
-            kind: "Operand::Opaque".into(),
-            detail: "opaque operand must not become an unconstrained CHC symbol".into(),
-        });
+        let rvalue = Rvalue::Use(Operand::unsupported(
+            "Operand::Opaque",
+            "opaque operand must not become an unconstrained CHC symbol",
+        ));
         let err = rvalue_to_formula(&func, &rvalue).expect_err("unsupported operand should fail");
         assert!(matches!(
             err,
@@ -5065,6 +5398,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let Statement::Assign { rvalue, .. } = &func.body.blocks[0].stmts[0] else {
             unreachable!("fixture has one assignment")
@@ -5142,6 +5476,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let Statement::Assign { rvalue, .. } = &func.body.blocks[0].stmts[0] else {
             unreachable!("fixture has one assignment")
@@ -5306,5 +5641,40 @@ mod tests {
         // -1i128 renders as a bare number the consumer's i128 parse accepts (then
         // masks to all-ones-128 = u128::MAX). No high-bit value is try_from-rejected.
         assert_eq!(json["value"], -1);
+    }
+
+    #[test]
+    fn wave505_chc_transition_order_reuse_and_apply_owned_preserve_exact_clauses() {
+        let func = counting_loop_function();
+        let loops = detect_loops(&func);
+        assert_eq!(loops.len(), 1);
+        let modified = collect_modified_variables(&func, &loops[0]);
+        let (cond, body_order) = loop_transition_faithful_condition_with_order(
+            &func,
+            &loops[0],
+            &modified,
+            chc_locals_are_dense(&func),
+            chc_blocks_are_dense(&func),
+        )
+        .expect("counting loop transition must be faithful");
+        assert_eq!(body_order, vec![2]);
+
+        let reused_transition = build_body_transition_with_order(
+            &func,
+            &loops[0],
+            &modified,
+            Some(&body_order),
+            true,
+            true,
+        )
+        .expect("reused body order must encode transition");
+        let fresh_transition =
+            build_body_transition(&func, &loops[0], &modified).expect("fresh transition");
+        assert_eq!(reused_transition, fresh_transition);
+
+        let pred = ChcPredicate { name: "inv_bb1".into(), params: modified };
+        let args = build_init_args(&func, &loops[0], &pred.params);
+        assert_eq!(pred.apply(&args), pred.apply_owned(args));
+        assert!(matches!(cond, Formula::Lt(_, _)));
     }
 }

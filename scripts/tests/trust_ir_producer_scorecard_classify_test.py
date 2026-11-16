@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import unittest
 from pathlib import Path
 
 
@@ -90,3 +91,37 @@ def test_in_fragment_rate_is_secondary_and_headline_never_moves():
     assert b["lowered_clean"] == 1
     assert b["lowered_clean_pct"] == round(100.0 * 1 / 3, 1), "headline is FULL-denominator"
     assert b["lowered_clean_in_fragment_pct"] == round(100.0 * 1 / 2, 1)
+
+
+def load_tests(loader, tests, pattern):
+    """`land_gate.py validation-tests` loads this module with unittest (the
+    landing gate's selector names it, LAND-SELECT-VALIDATION-REACH-1): each
+    module-level test_* function is one case, as a direct run runs them."""
+    tests.addTests(unittest.FunctionTestCase(value) for name, value in sorted(globals().items())
+                   if name.startswith("test_") and callable(value))
+    return tests
+
+
+if __name__ == "__main__":
+    # scripts/check_script_tests.sh runs `python3 -B <file>`: without this block the
+    # module only DEFINED its tests and exited 0, so the suite counted a pass that
+    # executed nothing. Run every `test_*` here; zero tests found is a failure.
+    tests = [
+        (name, fn)
+        for name, fn in sorted(globals().items())
+        if name.startswith("test_") and callable(fn)
+    ]
+    if not tests:
+        print("trust_ir_producer_scorecard_classify_test: no tests found", file=sys.stderr)
+        sys.exit(2)
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - report every failing test
+            failed += 1
+            print(f"FAIL {name}: {exc!r}", file=sys.stderr)
+        else:
+            print(f"ok   {name}")
+    print(f"{len(tests) - failed} passed, {failed} failed")
+    sys.exit(1 if failed else 0)

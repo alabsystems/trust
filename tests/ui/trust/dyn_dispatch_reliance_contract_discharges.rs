@@ -3,7 +3,7 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
-//@ check-pass
+//@ check-fail
 //! C-UNIVERSAL: a call through `InstanceKind::Virtual` discharges FROM the trait
 //! method's `#[trust::panic_free]` contract.
 //!
@@ -57,6 +57,9 @@ impl Emitter for Latch {
 }
 
 // The virtual call. Its receiver is erased; the contract is what discharges it.
+// ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
+//~vv ERROR Trust strict verification failed for `dyn_dispatch_reliance_contract_discharges::drive`
+//~v NOTE this function has no obligation of its own
 pub fn drive(emitter: &mut dyn Emitter) {
     emitter.emit(7);
 }

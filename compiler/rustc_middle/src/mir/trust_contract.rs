@@ -84,8 +84,12 @@ impl<'tcx> TrustContractBundle<'tcx> {
     #[must_use]
     pub fn def_may_have_contracts(tcx: TyCtxt<'tcx>, local_def_id: LocalDefId) -> bool {
         matches!(tcx.def_kind(local_def_id), DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
-            && tcx.opt_hir_owner_nodes(local_def_id).is_some()
-            && tcx.hir_maybe_body_owned_by(local_def_id).is_some_and(|body| body.contract.is_some())
+            && tcx.opt_hir_owner_nodes(local_def_id).is_some_and(|owner_nodes| {
+                owner_nodes
+                    .node()
+                    .body_id()
+                    .is_some_and(|body_id| owner_nodes.bodies[&body_id.hir_id.local_id].contract.is_some())
+            })
     }
 
     /// Lookup a contract by dense id.
@@ -326,7 +330,21 @@ pub enum TrustContractProposition {
     Bool(bool),
     Int(i128),
     UInt(u128),
-    Var { name: Symbol, domain: TrustContractPropositionDomain },
+    /// An IEEE-754 literal, carried BY BITS rather than as an `f64`.
+    ///
+    /// Bits, because this enum derives `PartialEq`, `Eq` and `Hash` and a float
+    /// has neither a total equality nor a hash consistent with one. The bit
+    /// pattern has both, and it is also the lossless form: it round-trips a
+    /// signalling NaN and the two zeroes, which an `f64` field compared with
+    /// `==` would silently merge.
+    Float {
+        bits: u64,
+        width: u32,
+    },
+    Var {
+        name: Symbol,
+        domain: TrustContractPropositionDomain,
+    },
     Not(Box<Self>),
     And(Vec<Self>),
     Or(Vec<Self>),
@@ -364,6 +382,17 @@ pub enum TrustContractPropositionDomain {
     MachineInt {
         width: u32,
         signed: bool,
+    },
+    /// An IEEE-754 binary float, by its Rust width (32 or 64).
+    ///
+    /// Kept distinct from every integer domain for the reason the rest of this
+    /// enum is split: a proposition's identity has to carry the Rust signature
+    /// that authorizes an executable monitor, and `f32` and `f64` compare and
+    /// round differently. It is also what admits a float PARAMETER into the
+    /// contract scope at all — without a domain the lowerer reports the
+    /// variable out of scope, so no clause could name one.
+    Float {
+        width: u32,
     },
 }
 

@@ -5,7 +5,6 @@
 
 #![crate_type = "lib"]
 #![feature(sanitize)]
-#![feature(c_variadic)]
 
 #[inline]
 #[target_feature(enable = "sse2")]
@@ -16,6 +15,7 @@ fn nop() {}
 
 // CHECK-LABEL: fn f0()
 // CHECK:       bb0: {
+// CHECK-NEXT:  _0 = const ();
 // CHECK-NEXT:  return;
 #[target_feature(enable = "sse2")]
 pub unsafe fn f0() {
@@ -43,6 +43,7 @@ pub unsafe fn sanitize_off() {}
 
 // CHECK-LABEL: fn inlined_sanitize_off()
 // CHECK:       bb0: {
+// CHECK-NEXT:  _0 = const ();
 // CHECK-NEXT:  return;
 #[sanitize(address = "off")]
 pub unsafe fn inlined_sanitize_off() {

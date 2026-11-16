@@ -14,7 +14,7 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::fx::FxHashMap;
-use trust_types::{Formula, Sort, SourceSpan, VcKind, VerificationCondition};
+use trust_types::{CalleeKey, Formula, Sort, SourceSpan, VcKind, VerificationCondition};
 
 /// Safety classification for an FFI function.
 ///
@@ -74,6 +74,46 @@ pub struct ParamContract {
     pub aliasing_class: Option<String>,
 }
 
+/// A buffer argument must provide at least `count_param` BYTES. This is a
+/// caller obligation, distinct from nullness and from the callee's return bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferContract {
+    pub pointer_param: usize,
+    pub count_param: usize,
+}
+
+/// What a call must be before a summary binds to it.
+///
+/// Trust: FFI-SCALAR-LIBC-1 (2026-11-01). The database is keyed on a NAME, and the
+/// name a call reaches the lookup with is the declaration's Rust name (the extractor
+/// keys the call on the decl path and drops `#[link_name]`). A summary that drops the
+/// call-site row therefore vouches for whatever symbol a declaration of that name links
+/// to: `#[link_name = "memset"] fn getpid(..)` would borrow `getpid`'s "no obligation".
+/// The legacy rows keep [`SummaryBinding::DeclName`]; a row added from FFI-SCALAR-LIBC-1
+/// on binds only through [`SummaryBinding::UpstreamLibcSymbol`], the identity
+/// `ffi_pointer_contract::direct_call_contract` (G1) believes for a libc contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SummaryBinding {
+    /// Binds any call the FFI lane routes (`is_foreign`, or the synthetic-MIR name
+    /// fallback) whose declaration's Rust name is the summary's name.
+    DeclName,
+    /// Binds only a direct FOREIGN call (`is_foreign`) whose declaration an UPSTREAM
+    /// crate named `libc` writes, whose Rust name (`CalleeKey::foreign_block_leaf`) and
+    /// link symbol (`CalleeKey::upstream_foreign_link_symbol`, `tcx.symbol_name`) are
+    /// both the summary's name, with exactly `arity` arguments. Any other call gets no
+    /// summary, so it keeps the fail-closed `unmodeled FFI call` row.
+    UpstreamLibcSymbol {
+        /// The documented number of parameters of the C prototype.
+        arity: usize,
+    },
+}
+
+/// The crate whose `extern` declarations a [`SummaryBinding::UpstreamLibcSymbol`] row
+/// believes (the same name `ffi_pointer_contract` believes, for the same reasons: the
+/// name is defense in depth on top of the upstream link-symbol and arity checks).
+pub(crate) const SUMMARY_DECLARING_CRATE: &str = "libc";
+
 /// Summary of an extern/FFI function's behavior for verification.
 ///
 /// Captures the full contract: parameter constraints, return value
@@ -86,6 +126,8 @@ pub struct FfiSummary {
     pub function_name: String,
     /// Per-parameter contracts.
     pub parameter_contracts: Vec<ParamContract>,
+    /// Pointer/count relations measured in bytes independently of pointee type.
+    pub buffer_contracts: Vec<BufferContract>,
     /// Formula constraining the return value. Uses `Var("__ffi_ret", Sort::Int)`
     /// as the return value placeholder.
     pub return_contract: Option<Formula>,
@@ -93,6 +135,8 @@ pub struct FfiSummary {
     pub side_effects: Vec<SideEffect>,
     /// Safety classification.
     pub safety_level: SafetyLevel,
+    /// What a call must be before this summary binds to it.
+    pub binding: SummaryBinding,
 }
 
 impl FfiSummary {
@@ -102,9 +146,42 @@ impl FfiSummary {
         Self {
             function_name: name.into(),
             parameter_contracts: Vec::new(),
+            buffer_contracts: Vec::new(),
             return_contract: None,
             side_effects: vec![SideEffect::None],
             safety_level: SafetyLevel::UnsafeUnknown,
+            binding: SummaryBinding::DeclName,
+        }
+    }
+
+    /// Builder: bind only an upstream `libc` declaration of this symbol with `arity`
+    /// arguments ([`SummaryBinding::UpstreamLibcSymbol`]).
+    #[must_use]
+    pub fn binding_upstream_libc_symbol(mut self, arity: usize) -> Self {
+        self.binding = SummaryBinding::UpstreamLibcSymbol { arity };
+        self
+    }
+
+    /// Whether this summary binds a call: `is_foreign` is the extractor's
+    /// `tcx.is_foreign_item`, `key` the call's [`CalleeKey`], `arg_count` its argument
+    /// count. A [`SummaryBinding::DeclName`] row binds every call it is looked up for;
+    /// a [`SummaryBinding::UpstreamLibcSymbol`] row binds only the identity it names,
+    /// and anything missing (no key, a local declaration, a renamed link symbol, another
+    /// arity, another declaring crate) answers `false`.
+    #[must_use]
+    pub fn binds_call(&self, is_foreign: bool, key: Option<&CalleeKey>, arg_count: usize) -> bool {
+        match self.binding {
+            SummaryBinding::DeclName => true,
+            SummaryBinding::UpstreamLibcSymbol { arity } => {
+                let name = self.function_name.as_str();
+                is_foreign
+                    && arg_count == arity
+                    && key.is_some_and(|key| {
+                        key.krate_name == SUMMARY_DECLARING_CRATE
+                            && key.foreign_block_leaf.as_deref() == Some(name)
+                            && key.upstream_foreign_link_symbol.as_deref() == Some(name)
+                    })
+            }
         }
     }
 
@@ -112,6 +189,12 @@ impl FfiSummary {
     #[must_use]
     pub fn with_param(mut self, contract: ParamContract) -> Self {
         self.parameter_contracts.push(contract);
+        self
+    }
+
+    #[must_use]
+    pub fn with_buffer(mut self, contract: BufferContract) -> Self {
+        self.buffer_contracts.push(contract);
         self
     }
 
@@ -145,6 +228,9 @@ impl FfiSummary {
 #[derive(Debug, Clone)]
 pub struct FfiSummaryDb {
     summaries: FxHashMap<String, FfiSummary>,
+    min_name_len: usize,
+    max_name_len: usize,
+    has_path_separator: bool,
 }
 
 impl Default for FfiSummaryDb {
@@ -154,10 +240,23 @@ impl Default for FfiSummaryDb {
 }
 
 impl FfiSummaryDb {
+    /// Return a shared static reference to the built-in FFI summary database,
+    /// initialized once on first access.
+    #[must_use]
+    pub fn builtin() -> &'static Self {
+        static BUILTIN: std::sync::OnceLock<FfiSummaryDb> = std::sync::OnceLock::new();
+        BUILTIN.get_or_init(Self::new)
+    }
+
     /// Create a new database pre-populated with built-in libc summaries.
     #[must_use]
     pub fn new() -> Self {
-        let mut db = Self { summaries: FxHashMap::default() };
+        let mut db = Self {
+            summaries: FxHashMap::with_capacity_and_hasher(48, Default::default()),
+            min_name_len: usize::MAX,
+            max_name_len: 0,
+            has_path_separator: false,
+        };
         db.register_builtins();
         db
     }
@@ -165,17 +264,50 @@ impl FfiSummaryDb {
     /// Create an empty database with no built-in summaries.
     #[must_use]
     pub fn empty() -> Self {
-        Self { summaries: FxHashMap::default() }
+        Self {
+            summaries: FxHashMap::default(),
+            min_name_len: usize::MAX,
+            max_name_len: 0,
+            has_path_separator: false,
+        }
     }
 
     /// Look up a summary by function name.
+    #[inline]
     #[must_use]
     pub fn lookup(&self, name: &str) -> Option<&FfiSummary> {
+        let len = name.len();
+        if len < self.min_name_len || len > self.max_name_len {
+            return None;
+        }
+        if !self.has_path_separator && name.contains("::") {
+            return None;
+        }
+        self.summaries.get(name)
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn has_path_separator(&self) -> bool {
+        self.has_path_separator
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn lookup_prechecked_bare(&self, name: &str) -> Option<&FfiSummary> {
+        let len = name.len();
+        if len < self.min_name_len || len > self.max_name_len {
+            return None;
+        }
         self.summaries.get(name)
     }
 
     /// Register a custom FFI summary.
     pub fn register(&mut self, summary: FfiSummary) {
+        let len = summary.function_name.len();
+        self.min_name_len = self.min_name_len.min(len);
+        self.max_name_len = self.max_name_len.max(len);
+        self.has_path_separator |= summary.function_name.contains("::");
         self.summaries.insert(summary.function_name.clone(), summary);
     }
 
@@ -259,7 +391,68 @@ impl FfiSummaryDb {
         self.register(builtin_poll());
         self.register(builtin_pipe());
         self.register(builtin_ioctl());
+        // FFI-SCALAR-LIBC-1 (2026-11-01): the integer-only process, session and
+        // terminal queries the agy-alab and claude-code-alab strict gates call, and the
+        // errno-slot accessors. Each binds only an upstream `libc` declaration of its
+        // own symbol at its documented arity (`SummaryBinding::UpstreamLibcSymbol`);
+        // docs/TCB.md "libc integer-argument call summaries" lists the same rows.
+        for summary in scalar_libc_summaries() {
+            self.register(summary);
+        }
     }
+}
+
+/// FFI-SCALAR-LIBC-1: C functions whose every parameter is an integer and whose call
+/// therefore reads and writes no memory through any argument the caller supplies. No
+/// value of an integer argument is undefined behaviour for them: a bad pid, fd or
+/// signal number is an error return (`ESRCH`, `EBADF`/`ENOTTY`, `EINVAL`). Each is
+/// `Safe` with no parameter contract, so a bound call mints no call-site obligation;
+/// its result is an unconstrained integer (or pointer) to every later use, which is
+/// verified on its own. The return contracts are informational: this layer has no
+/// assumption channel (see `generate_call_site_vcs_with_extents`, step 2).
+pub(crate) fn scalar_libc_summaries() -> Vec<FfiSummary> {
+    vec![
+        // `pid_t getpid(void)`: "shall always be successful" (POSIX.1-2024 getpid).
+        FfiSummary::new("getpid")
+            .with_return_contract(ffi_ret_ge(0))
+            .with_safety(SafetyLevel::Safe)
+            .binding_upstream_libc_symbol(0),
+        // `pid_t getpgrp(void)`: "shall always be successful" (POSIX getpgrp).
+        FfiSummary::new("getpgrp")
+            .with_return_contract(ffi_ret_ge(0))
+            .with_safety(SafetyLevel::Safe)
+            .binding_upstream_libc_symbol(0),
+        // `uid_t geteuid(void)`: "shall always be successful" (POSIX geteuid).
+        FfiSummary::new("geteuid")
+            .with_return_contract(ffi_ret_ge(0))
+            .with_safety(SafetyLevel::Safe)
+            .binding_upstream_libc_symbol(0),
+        // `pid_t getsid(pid_t pid)`: the session id, or -1 with errno (POSIX getsid).
+        FfiSummary::new("getsid")
+            .with_return_contract(ffi_ret_ge(-1))
+            .with_safety(SafetyLevel::Safe)
+            .binding_upstream_libc_symbol(1),
+        // `pid_t tcgetpgrp(int fildes)`: the foreground process group id, or -1 with
+        // errno (POSIX tcgetpgrp).
+        FfiSummary::new("tcgetpgrp")
+            .with_return_contract(ffi_ret_ge(-1))
+            .with_safety(SafetyLevel::Safe)
+            .binding_upstream_libc_symbol(1),
+        // `int raise(int sig)`: 0, or nonzero on failure (C17 7.14.2.1). It delivers
+        // `sig` to the calling thread, so a handler the program installed may run
+        // before it returns: that handler is a function of the program, verified as
+        // its own body, and what it changes outside this frame is state a foreign call
+        // already leaves unconstrained (the `kill` row, the same delivery to the
+        // caller's own process, has been `Safe` since T6).
+        FfiSummary::new("raise").with_safety(SafetyLevel::Safe).binding_upstream_libc_symbol(1),
+        // `int *__error(void)` (Darwin) and `int *__errno_location(void)` (glibc, musl):
+        // the calling thread's errno slot; always succeed. What a dereference of the
+        // result may assume is `ffi_pointer_contract`'s (G1), not this row's.
+        FfiSummary::new("__error").with_safety(SafetyLevel::Safe).binding_upstream_libc_symbol(0),
+        FfiSummary::new("__errno_location")
+            .with_safety(SafetyLevel::Safe)
+            .binding_upstream_libc_symbol(0),
+    ]
 }
 
 /// Return the zero-based format-string argument index for printf-family calls.
@@ -491,15 +684,15 @@ fn builtin_sprintf() -> FfiSummary {
 /// Reads up to `count` bytes from file descriptor `fd` into `buf`.
 /// Returns bytes read (0 at EOF), or -1 on error.
 ///
-/// T6 demand audit (report addendum): the ONLY caller obligation is the
-/// non-null buffer. `fd` carries NO demand — a bad fd is EBADF, an
+/// The buffer must be non-null and provide `count` bytes. `fd` carries NO
+/// demand — a bad fd is EBADF, an
 /// errno-level runtime error, not UB, so the old `[0, i128::MAX]` range
-/// refuted every runtime-provided fd. `count` carries NO demand —
-/// `count == 0` is defined (and the old integer "non-null" check refuted
-/// exactly that), and short reads make any upper bound a semantic, not
-/// safety, property.
+/// refuted every runtime-provided fd. `count == 0` is defined (the old
+/// integer "non-null" check refuted it), but a short read does not license
+/// passing a buffer smaller than the requested count.
 fn builtin_read() -> FfiSummary {
     FfiSummary::new("read")
+        .with_buffer(BufferContract { pointer_param: 1, count_param: 2 })
         .with_param(ParamContract {
             param_index: 1,
             is_nullable: false,
@@ -518,14 +711,16 @@ fn builtin_read() -> FfiSummary {
 /// Writes up to `count` bytes from `buf` to file descriptor `fd`.
 /// Returns bytes written, or -1 on error.
 ///
-/// T6 demand audit: same as `read` — buf non-null is the ONLY demand; fd and
-/// count demands were over-refutation (EBADF is errno, `write(fd, buf, 0)` is
-/// defined). The `WritesGlobal("fd")` effect is dropped: it minted an
+/// Like `read`, requires a non-null buffer and its requested BYTE extent.
+/// The former fd and integer-nonzero count demands were over-refutation
+/// (EBADF is errno, `write(fd, buf, 0)` is defined). The `WritesGlobal("fd")`
+/// effect is dropped: it minted an
 /// undischargeable audit obligation per call site (the report's 38-obligation
 /// aterm-types refutation shape), and the fd-offset havoc it described is
 /// already the model default (nothing constrains kernel state here).
 fn builtin_write() -> FfiSummary {
     FfiSummary::new("write")
+        .with_buffer(BufferContract { pointer_param: 1, count_param: 2 })
         .with_param(ParamContract {
             param_index: 1,
             is_nullable: false,
@@ -1094,13 +1289,19 @@ fn builtin_ioctl() -> FfiSummary {
 /// with concrete symbolic state.
 #[must_use]
 pub fn apply_summary(summary: &FfiSummary, args: &[Formula]) -> Formula {
-    let contract = match &summary.return_contract {
-        Some(c) => c.clone(),
-        None => return Formula::Bool(true),
+    let Some(contract) = &summary.return_contract else {
+        return Formula::Bool(true);
     };
+    if args.is_empty()
+        || !trust_types::any_formula_node(contract, &mut |node| {
+            matches!(node, Formula::Var(var_sym, _) if var_sym.starts_with("__ffi_arg_"))
+        })
+    {
+        return contract.clone();
+    }
 
     // Substitute __ffi_arg_N placeholders with concrete args.
-    contract.map(&mut |node| {
+    contract.clone().map(&mut |node| {
         if let Formula::Var(ref name, _) = node
             && let Some(idx_str) = name.strip_prefix("__ffi_arg_")
             && let Ok(idx) = idx_str.parse::<usize>()
@@ -1139,8 +1340,20 @@ pub fn generate_ffi_vcs(
     // counterexample (`arg := 0`) for a value that can never be 0.
     nonnull_args: &std::collections::HashSet<usize>,
 ) -> Vec<VerificationCondition> {
+    generate_ffi_vcs_with_extents(call_site, summary, args, nonnull_args, &Default::default())
+}
+
+/// Same caller demands, with must-proven byte extents from the current call site.
+pub(crate) fn generate_ffi_vcs_with_extents(
+    call_site: &str,
+    summary: &FfiSummary,
+    args: &[Formula],
+    nonnull_args: &std::collections::HashSet<usize>,
+    byte_extents: &std::collections::HashMap<usize, u64>,
+) -> Vec<VerificationCondition> {
     let mut vcs = Vec::new();
     let location = SourceSpan::default();
+    let call_site_sym: trust_types::Symbol = call_site.into();
 
     // 1. Non-null checks for non-nullable pointer parameters
     for contract in &summary.parameter_contracts {
@@ -1159,13 +1372,44 @@ pub fn generate_ffi_vcs(
                         summary.function_name, contract.param_index, call_site,
                     ),
                 },
-                function: call_site.into(),
+                function: call_site_sym.clone(),
                 location: location.clone(),
                 formula: null_vc,
                 contract_metadata: None,
                 obligation: None,
             });
         }
+    }
+
+    for contract in &summary.buffer_contracts {
+        let count =
+            args.get(contract.count_param).filter(|_| args.get(contract.pointer_param).is_some());
+        let extent = byte_extents.get(&contract.pointer_param);
+        let formula = match (count, extent) {
+            (Some(count), Some(bytes)) => Formula::Or(vec![
+                Formula::Lt(Box::new(count.clone()), Box::new(Formula::Int(0))),
+                Formula::Gt(Box::new(count.clone()), Box::new(Formula::Int(i128::from(*bytes)))),
+            ]),
+            // No allocation is required for an empty access. No unknown extent
+            // is assumed: a positive count still has a satisfiable violation.
+            (Some(count), None) => Formula::Not(Box::new(Formula::Eq(
+                Box::new(count.clone()),
+                Box::new(Formula::Int(0)),
+            ))),
+            (None, _) => Formula::Bool(true),
+        };
+        let extent_label: std::borrow::Cow<'static, str> = match extent {
+            Some(bytes) => std::borrow::Cow::Owned(bytes.to_string()),
+            None => std::borrow::Cow::Borrowed("unknown"),
+        };
+        vcs.push(VerificationCondition {
+            kind: VcKind::Assertion {
+                message: format!("FFI `{}`: parameter {} byte count must fit parameter {} available byte extent ({extent_label})",
+                    summary.function_name, contract.count_param, contract.pointer_param),
+            },
+            function: call_site_sym.clone(), location: location.clone(), formula,
+            contract_metadata: None, obligation: None,
+        });
     }
 
     // 2. Range checks for integer parameters
@@ -1186,7 +1430,7 @@ pub fn generate_ffi_vcs(
                         summary.function_name, contract.param_index, lo, hi, call_site,
                     ),
                 },
-                function: call_site.into(),
+                function: call_site_sym.clone(),
                 location: location.clone(),
                 formula: range_violation,
                 contract_metadata: None,
@@ -1196,36 +1440,39 @@ pub fn generate_ffi_vcs(
     }
 
     // 3. Non-aliasing checks for parameters in the same aliasing class
-    let mut aliasing_groups: FxHashMap<&str, Vec<(usize, &Formula)>> = FxHashMap::default();
-    for contract in &summary.parameter_contracts {
-        if let Some(ref class) = contract.aliasing_class
-            && let Some(arg) = args.get(contract.param_index)
-        {
-            aliasing_groups.entry(class.as_str()).or_default().push((contract.param_index, arg));
+    if summary.parameter_contracts.len() >= 2 {
+        let mut aliasing_groups: FxHashMap<&str, Vec<(usize, &Formula)>> = FxHashMap::default();
+        for contract in &summary.parameter_contracts {
+            if let Some(ref class) = contract.aliasing_class
+                && let Some(arg) = args.get(contract.param_index)
+            {
+                aliasing_groups.entry(class.as_str()).or_default().push((contract.param_index, arg));
+            }
         }
-    }
-    for members in aliasing_groups.values() {
-        // Check all pairs within each aliasing class
-        for i in 0..members.len() {
-            for j in (i + 1)..members.len() {
-                let (idx_a, arg_a) = &members[i];
-                let (idx_b, arg_b) = &members[j];
-                // VC: arg_a == arg_b (alias violation)
-                // If UNSAT, the pointers never alias.
-                let alias_vc = Formula::Eq(Box::new((*arg_a).clone()), Box::new((*arg_b).clone()));
-                vcs.push(VerificationCondition {
-                    kind: VcKind::Assertion {
-                        message: format!(
-                            "FFI `{}`: parameters {} and {} must not alias at {}",
-                            summary.function_name, idx_a, idx_b, call_site,
-                        ),
-                    },
-                    function: call_site.into(),
-                    location: location.clone(),
-                    formula: alias_vc,
-                    contract_metadata: None,
-                    obligation: None,
-                });
+        for members in aliasing_groups.values() {
+            // Check all pairs within each aliasing class
+            for i in 0..members.len() {
+                for j in (i + 1)..members.len() {
+                    let (idx_a, arg_a) = &members[i];
+                    let (idx_b, arg_b) = &members[j];
+                    // VC: arg_a == arg_b (alias violation)
+                    // If UNSAT, the pointers never alias.
+                    let alias_vc =
+                        Formula::Eq(Box::new((*arg_a).clone()), Box::new((*arg_b).clone()));
+                    vcs.push(VerificationCondition {
+                        kind: VcKind::Assertion {
+                            message: format!(
+                                "FFI `{}`: parameters {} and {} must not alias at {}",
+                                summary.function_name, idx_a, idx_b, call_site,
+                            ),
+                        },
+                        function: call_site_sym.clone(),
+                        location: location.clone(),
+                        formula: alias_vc,
+                        contract_metadata: None,
+                        obligation: None,
+                    });
+                }
             }
         }
     }
@@ -1512,13 +1759,6 @@ mod tests {
     }
 
     #[test]
-    fn test_safety_level_values() {
-        assert_ne!(SafetyLevel::Safe, SafetyLevel::UnsafeRequiresContract);
-        assert_ne!(SafetyLevel::UnsafeRequiresContract, SafetyLevel::UnsafeUnknown);
-        assert_ne!(SafetyLevel::Safe, SafetyLevel::UnsafeUnknown);
-    }
-
-    #[test]
     fn test_side_effect_variants() {
         let effects = [
             SideEffect::AllocatesMemory,
@@ -1759,6 +1999,15 @@ mod tests {
             "ioctl",
             // T9: #[link_name = "getuid"] Rust-decl-name alias (see register_builtins).
             "libc_getuid",
+            // FFI-SCALAR-LIBC-1: integer-argument rows bound by libc identity.
+            "getpid",
+            "getpgrp",
+            "geteuid",
+            "getsid",
+            "tcgetpgrp",
+            "raise",
+            "__error",
+            "__errno_location",
         ];
         for name in &expected {
             assert!(db.lookup(name).is_some(), "missing builtin summary for `{name}`");
@@ -1786,7 +2035,8 @@ mod tests {
 
     #[test]
     fn test_read_write_fd_and_count_demands_dropped() {
-        // T6: read/write demand ONLY the non-null buffer (param 1). The old
+        // Retain T6's null/range demands, with a separate BYTE-buffer contract.
+        // The old
         // fd range demand ([0, i128::MAX] on param 0) treated EBADF — an
         // errno-level runtime error — as UB and refuted every
         // runtime-provided fd; the old param-2 contract's integer "non-null"
@@ -1804,6 +2054,10 @@ mod tests {
             assert_eq!(buf.param_index, 1, "`{name}` demand must be on the buffer");
             assert!(!buf.is_nullable, "`{name}` buffer stays non-null (NULL buf is UB)");
             assert!(buf.valid_range.is_none(), "`{name}` buffer carries no range");
+            assert_eq!(
+                s.buffer_contracts,
+                vec![BufferContract { pointer_param: 1, count_param: 2 }]
+            );
         }
         // write loses the WritesGlobal("fd") effect (it minted an
         // undischargeable per-call obligation; havoc is the model default).
@@ -1812,6 +2066,43 @@ mod tests {
             !write.side_effects.iter().any(|e| matches!(e, SideEffect::WritesGlobal(_))),
             "write must not carry WritesGlobal, got {:?}",
             write.side_effects
+        );
+    }
+
+    #[test]
+    fn test_ffi_buffer_contract_is_generic_and_unknown_is_not_capacity() {
+        let summary = FfiSummary::new("custom_buffer")
+            .with_buffer(BufferContract { pointer_param: 0, count_param: 1 });
+        let fold = |vcs: Vec<VerificationCondition>| {
+            assert_eq!(vcs.len(), 1, "the buffer contract must be charged by the public API");
+            crate::simplify::SimplificationPipeline::default_pipeline()
+                .run(vcs[0].formula.clone())
+                .0
+        };
+        let args = |n| vec![Formula::Int(123), Formula::Int(n)];
+        assert_eq!(
+            fold(generate_ffi_vcs("caller", &summary, &args(1), &Default::default())),
+            Formula::Bool(true)
+        );
+        assert_eq!(
+            fold(generate_ffi_vcs("caller", &summary, &args(0), &Default::default())),
+            Formula::Bool(false)
+        );
+        for count in [64, 65] {
+            assert_eq!(
+                fold(generate_ffi_vcs_with_extents(
+                    "caller",
+                    &summary,
+                    &args(count),
+                    &Default::default(),
+                    &[(0, 64)].into_iter().collect()
+                )),
+                Formula::Bool(count > 64)
+            );
+        }
+        assert_eq!(
+            fold(generate_ffi_vcs("caller", &summary, &[], &Default::default())),
+            Formula::Bool(true)
         );
     }
 
@@ -1959,5 +2250,172 @@ mod tests {
                         && **rhs == Formula::Int(1024))),
             "missing `__ffi_ret <= count(1024)` (arg_2 substitution): {result:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // FFI-SCALAR-LIBC-1: the identity-bound integer-argument libc rows
+    // ---------------------------------------------------------------------
+
+    /// A key as the extractor mints it for a call to `leaf`, declared in an `extern`
+    /// block of the crate `krate` and linking to `link` (`None` = a declaration of
+    /// the crate under verification, or no foreign function at all).
+    fn scalar_key(krate: &str, leaf: Option<&str>, link: Option<&str>) -> CalleeKey {
+        CalleeKey {
+            sysroot_item: None,
+            krate_is_real_sysroot: false,
+            // The crates.io `libc` shares its name with the sysroot's copy.
+            krate_name_is_ambiguous: true,
+            stable_crate_id: 0x5ca1,
+            krate_name: krate.to_string(),
+            foreign_block_leaf: leaf.map(str::to_string),
+            upstream_foreign_link_symbol: link.map(str::to_string),
+            diverging_entry: None,
+        }
+    }
+
+    fn libc_key(symbol: &str) -> CalleeKey {
+        scalar_key("libc", Some(symbol), Some(symbol))
+    }
+
+    /// The rows a call gets: the production call-site entry point with the call's
+    /// own identity.
+    fn call_rows(
+        callee: &str,
+        arg_count: usize,
+        is_foreign: bool,
+        key: Option<&CalleeKey>,
+    ) -> Vec<VerificationCondition> {
+        let args: Vec<Formula> =
+            (0..arg_count).map(|i| Formula::Var(format!("a{i}"), Sort::Int)).collect();
+        crate::ffi_vcgen::generate_call_site_vcs_with_extents(
+            "caller",
+            callee,
+            &args,
+            "_0",
+            &SourceSpan::default(),
+            &FfiSummaryDb::new(),
+            (&Default::default(), &Default::default()),
+            crate::ffi_vcgen::CallIdentity { is_foreign, key, arg_count },
+        )
+    }
+
+    fn is_unmodeled(rows: &[VerificationCondition]) -> bool {
+        rows.len() == 1
+            && rows[0].formula == Formula::Bool(true)
+            && rows[0].kind.description().contains("unmodeled FFI call: no summary")
+    }
+
+    #[test]
+    fn scalar_libc_rows_are_registered_safe_with_no_parameter_contract() {
+        let db = FfiSummaryDb::new();
+        let expected = [
+            ("getpid", 0),
+            ("getpgrp", 0),
+            ("geteuid", 0),
+            ("getsid", 1),
+            ("tcgetpgrp", 1),
+            ("raise", 1),
+            ("__error", 0),
+            ("__errno_location", 0),
+        ];
+        assert_eq!(scalar_libc_summaries().len(), expected.len());
+        for (name, arity) in expected {
+            let s = db.lookup(name).unwrap_or_else(|| panic!("`{name}` is registered"));
+            assert_eq!(s.safety_level, SafetyLevel::Safe, "`{name}`");
+            assert!(s.parameter_contracts.is_empty(), "`{name}` reads no argument memory");
+            assert!(s.buffer_contracts.is_empty(), "`{name}`");
+            assert_eq!(s.side_effects, vec![SideEffect::None], "`{name}`: no allocation effect");
+            assert_eq!(
+                s.binding,
+                SummaryBinding::UpstreamLibcSymbol { arity },
+                "`{name}` binds only by libc identity"
+            );
+        }
+    }
+
+    /// Positive control, then each identity component removed in turn. Every
+    /// negative keeps the fail-closed `unmodeled FFI call` row the call had before
+    /// the row existed.
+    #[test]
+    fn scalar_libc_row_binds_only_the_upstream_libc_symbol_at_its_arity() {
+        let callee = "libc::unix::{extern#0}::getsid";
+        // Positive: a foreign call to libc's own `getsid` at arity 1 mints nothing.
+        let key = libc_key("getsid");
+        assert!(call_rows(callee, 1, true, Some(&key)).is_empty());
+        // Positive control for the instrument: the same call with NO identity is
+        // the unmodeled row, so an empty result above is the binding, not a lane
+        // that never mints.
+        assert!(is_unmodeled(&call_rows(callee, 1, true, None)));
+
+        let negatives: [(&str, bool, Option<CalleeKey>, usize); 7] = [
+            ("not foreign (a Rust fn of that name)", false, Some(libc_key("getsid")), 1),
+            ("no key (fn pointer, synthetic MIR)", true, None, 1),
+            ("wrong arity", true, Some(libc_key("getsid")), 2),
+            (
+                "a crate other than libc",
+                true,
+                Some(scalar_key("mylibc", Some("getsid"), Some("getsid"))),
+                1,
+            ),
+            (
+                "declared by the crate under verification (no upstream link symbol)",
+                true,
+                Some(scalar_key("libc", Some("getsid"), None)),
+                1,
+            ),
+            (
+                "`#[link_name = \"malloc\"] fn getsid` (links another symbol)",
+                true,
+                Some(scalar_key("libc", Some("getsid"), Some("malloc"))),
+                1,
+            ),
+            (
+                "`#[link_name = \"getsid\"] fn other` (Rust name differs)",
+                true,
+                Some(scalar_key("libc", Some("other"), Some("getsid"))),
+                1,
+            ),
+        ];
+        for (label, is_foreign, key, arity) in negatives {
+            let rows = call_rows(callee, arity, is_foreign, key.as_ref());
+            assert!(is_unmodeled(&rows), "{label}: must keep the unmodeled row, got {rows:#?}");
+        }
+    }
+
+    /// Every new row needs the identity; zero-arity rows refuse an argument.
+    #[test]
+    fn every_scalar_libc_row_requires_identity_and_arity() {
+        for s in scalar_libc_summaries() {
+            let SummaryBinding::UpstreamLibcSymbol { arity } = s.binding else {
+                panic!("`{}` must be identity-bound", s.function_name);
+            };
+            let name = s.function_name.as_str();
+            let callee = format!("libc::{name}");
+            let key = libc_key(name);
+            assert!(call_rows(&callee, arity, true, Some(&key)).is_empty(), "`{name}` binds");
+            assert!(is_unmodeled(&call_rows(&callee, arity, true, None)), "`{name}` unkeyed");
+            assert!(
+                is_unmodeled(&call_rows(&callee, arity + 1, true, Some(&key))),
+                "`{name}` at arity {}",
+                arity + 1
+            );
+            assert!(
+                is_unmodeled(&call_rows(&callee, arity, false, Some(&key))),
+                "`{name}` not foreign"
+            );
+        }
+    }
+
+    /// The legacy rows keep binding by declaration name, keyed or not: the change
+    /// restricts only the rows it adds.
+    #[test]
+    fn decl_name_rows_bind_as_before() {
+        let db = FfiSummaryDb::new();
+        let getuid = db.lookup("getuid").expect("getuid exists");
+        assert_eq!(getuid.binding, SummaryBinding::DeclName);
+        assert!(getuid.binds_call(false, None, 7));
+        assert!(call_rows("dirs::libc_getuid", 0, true, None).is_empty());
+        let local = scalar_key("dirs", Some("libc_getuid"), None);
+        assert!(call_rows("dirs::{extern#0}::libc_getuid", 0, true, Some(&local)).is_empty());
     }
 }

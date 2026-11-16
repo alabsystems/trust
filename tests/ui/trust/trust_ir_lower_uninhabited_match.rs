@@ -1,7 +1,10 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
 //@ edition: 2021
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 #![feature(never_type)]
 #![allow(unreachable_code, dead_code)]
 //! Trust (wave-UM): an ARM-LESS `match` over a scrutinee that is SYNTACTICALLY

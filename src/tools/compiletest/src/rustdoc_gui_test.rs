@@ -12,11 +12,25 @@
 //! See <https://github.com/rust-lang/rust/issues/143827> for more context.
 
 use std::path::Path;
+use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
-use crate::common::{CodegenBackend, Config, TestMode, TestSuite};
+use crate::common::{
+    CodegenBackend, Config, TRUST_VANILLA_ANNOUNCED_ENV, TRUST_VANILLA_RUSTC_FLAG, TestMode,
+    TestSuite,
+};
 use crate::directives::TestProps;
+
+#[cfg(test)]
+mod tests;
+
+/// Trust: the GUI fixtures are upstream crates documented to be looked at, not
+/// verified. Build them on compiletest's isolated lane (its off flag, announced),
+/// or a fixture's build script fails strict verification before any GUI test runs.
+pub fn isolate_fixture_build(cargo: &mut Command) {
+    cargo.env("RUSTFLAGS", TRUST_VANILLA_RUSTC_FLAG).env(TRUST_VANILLA_ANNOUNCED_ENV, "1");
+}
 
 /// Subset of compiletest directive values that are actually used by
 /// rustdoc-gui-test.
@@ -33,7 +47,10 @@ impl RustdocGuiTestProps {
 
         let props = TestProps::from_file(test_file_path, None, &config);
 
-        let TestProps { compile_flags, run_flags, .. } = props;
+        let TestProps { mut compile_flags, run_flags, .. } = props;
+        // We don't want to pass `--edition=2015` in, which is being set by default by
+        // `TestProps::from_file`.
+        compile_flags.remove(0);
         Self { compile_flags, run_flags }
     }
 }
@@ -50,6 +67,8 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
     //
     // For instance, `//@ ignore-stage1` will not work at all.
     Config {
+        // Trust: this separate rustdoc-GUI entrypoint does not request observations.
+        trust_invocation_census: None,
         mode: TestMode::RustdocHtml,
         // E.g. this has no sensible default tbh.
         suite: TestSuite::Ui,
@@ -63,7 +82,10 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
         rustc_path: Utf8PathBuf::default(),
         cargo_path: Default::default(),
         stage0_rustc_path: Default::default(),
+        run_make_support_rlib: Default::default(),
+        run_make_support_rmeta: Default::default(),
         query_rustc_path: Default::default(),
+        query_rustc_lib_path: Default::default(),
         rustdoc_path: Default::default(),
         coverage_dump_path: Default::default(),
         python: Default::default(),
@@ -79,7 +101,6 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
         sysroot_base: Utf8PathBuf::default(),
         stage: Default::default(),
         stage_id: String::default(),
-        debugger: Default::default(),
         run_ignored: Default::default(),
         with_rustc_debug_assertions: Default::default(),
         with_std_debug_assertions: Default::default(),
@@ -95,6 +116,7 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
         rustc_supports_trust_verification: Default::default(),
         rust_randomized_layout: Default::default(),
         optimize_tests: Default::default(),
+        disable_minification: Default::default(),
         target: Default::default(),
         host: Default::default(),
         cdb: Default::default(),
@@ -144,5 +166,6 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
         jobs: Default::default(),
         parallel_frontend_threads: Config::DEFAULT_PARALLEL_FRONTEND_THREADS,
         iteration_count: Config::DEFAULT_ITERATION_COUNT,
+        wasm_proc_macros: false,
     }
 }

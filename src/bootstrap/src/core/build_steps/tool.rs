@@ -9,20 +9,40 @@
 //! Each Rust tool **MUST** utilize `ToolBuild` inside their `Step` logic,
 //! return `ToolBuildResult` and should never prepare `cargo` invocations manually.
 
-use std::ffi::OsStr;
+// Trust: preserve unknown ambient compiler postures when scheduling intermediate tools.
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
-use crate::core::build_steps::compile::is_lto_stage;
+use crate::core::build_steps::compile::{CargoMessage, is_lto_stage};
+use crate::core::build_steps::dist::LLD_FILE_NAMES;
 use crate::core::build_steps::{compile, llvm};
-use crate::core::builder;
 use crate::core::builder::{
-    Builder, Cargo as CargoCommand, RunConfig, ShouldRun, Step, StepMetadata, cargo_profile_var,
+    self, Builder, Cargo as CargoCommand, CargoInput, CargoProgram, CommandLineStep, Kind,
+    RunConfig, ShouldRun, Step, StepMetadata, apply_pgo, cargo_profile_var,
 };
-use crate::core::config::{Config, DebuginfoLevel, RustcLto, TargetSelection};
-use crate::utils::exec::{BootstrapCommand, command};
-use crate::utils::helpers::{add_dylib_path, dylib_path_var, exe, t};
-use crate::{Compiler, FileType, Kind, Mode};
+use crate::core::compiler::Compiler;
+use crate::core::config::{Allocator, Config, DebuginfoLevel, RustcLto, TargetSelection};
+use crate::core::session::{FileType, Mode};
+use crate::utils::exec::{BootstrapCommand, ExecutionContext, command};
+use crate::utils::helpers::{self, add_dylib_path, dylib_path_var, exe, t};
+use crate::utils::trust_source_identity;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "tool/engineering_pairing.rs"]
+mod engineering_pairing;
+#[path = "tool/native_build_tool.rs"]
+mod native_build_tool;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "tool/paired_compiler.rs"]
+mod paired_compiler;
+pub use native_build_tool::TargoNativeBuildTool;
+// Trust: the sysroot compatibility-alias check lives in its own child module, which keeps this
+// upstream file under tidy's 3000-line limit.
+mod sysroot_aliases;
+pub(crate) use sysroot_aliases::validate_sysroot_compat_aliases;
+#[cfg(test)]
+use sysroot_aliases::{inspect_sysroot_compat_aliases, sysroot_compat_alias_problems};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum SourceType {
@@ -33,7 +53,60 @@ pub enum SourceType {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum ToolArtifactKind {
     Binary,
+    /// Explicit host/stage0 artifact with independently held compiler inputs.
+    NativeEngineeringBinary,
+    // Trust: build-host mathematical DATA helper, built through the normal tool step.
+    Example,
     Library,
+}
+
+// Trust: old Cargo exports its Rust sysroot source remap to native build scripts.
+// OpenSSL's Configure writes those arguments into Make without preserving spaces.
+// Give the snapshot a different spelling, not different files or compiler identity.
+#[cfg(unix)]
+fn bootstrap_tool_sysroot_alias(
+    snapshot: &Path,
+    build_out: &Path,
+    dry_run: bool,
+) -> io::Result<Option<PathBuf>> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    if !snapshot.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot sysroot must be absolute",
+        ));
+    }
+    if !snapshot.as_os_str().as_encoded_bytes().iter().any(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    if build_out.as_os_str().as_encoded_bytes().iter().any(u8::is_ascii_whitespace) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the legacy seed's native tool build needs a whitespace-free build-dir",
+        ));
+    }
+    let mut hash = DefaultHasher::new();
+    snapshot.hash(&mut hash);
+    let alias = build_out.join(format!("bootstrap-tool-sysroot-{:016x}", hash.finish()));
+    if !dry_run {
+        fs::create_dir_all(build_out)?;
+        match fs::read_link(&alias) {
+            Ok(target) if target == snapshot => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("refusing to replace a different sysroot alias: {}", alias.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                std::os::unix::fs::symlink(snapshot, &alias)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some(alias))
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -64,14 +137,12 @@ pub struct ToolBuildResult {
     pub tool_path: PathBuf,
     /// Compiler used to build the tool.
     pub build_compiler: Compiler,
+    /// All Cargo artifacts produced during the compilation of this tool
+    pub artifacts: Vec<PathBuf>,
 }
 
 impl Step for ToolBuild {
     type Output = ToolBuildResult;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
 
     /// Builds a tool in `src/tools`
     ///
@@ -81,6 +152,29 @@ impl Step for ToolBuild {
         let target = self.target;
         let mut tool = self.tool;
         let path = self.path;
+        let native_engineering = self.artifact_kind == ToolArtifactKind::NativeEngineeringBinary;
+        if native_engineering {
+            assert_eq!(path, "src/tools/targo");
+            assert_eq!(self.build_compiler.stage, 0);
+            assert_eq!(self.output_compiler.stage, 0);
+            assert_eq!(self.target, builder.host_target);
+            assert_eq!(self.build_compiler.host, builder.host_target);
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let engineering = (native_engineering && !builder.config.dry_run())
+            .then(|| engineering_pairing::Inputs::capture(builder))
+            .transpose()
+            .unwrap_or_else(|error| panic!("engineering compiler capture failed: {error}"));
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        assert!(!native_engineering, "native engineering pairing requires macOS arm64");
+
+        // Trust: the mathematical DATA preparer is never built/executed for a foreign host.
+        if self.artifact_kind == ToolArtifactKind::Example {
+            assert_eq!(self.mode, Mode::ToolBootstrap);
+            assert_eq!(self.target, builder.host_target);
+            assert_eq!(self.build_compiler.stage, 0);
+            assert_eq!(self.build_compiler.host, builder.host_target);
+        }
 
         match self.mode {
             Mode::ToolRustcPrivate => {
@@ -100,7 +194,10 @@ impl Step for ToolBuild {
             _ => panic!("unexpected Mode for tool build"),
         }
 
-        let mut cargo = prepare_tool_cargo(
+        // Trust: this exact recipe is the root of the internal Cargo dependency.
+        // Every other ToolTarget recipe uses the source-built engineering Cargo.
+        let input = self.cargo_input(builder);
+        let mut cargo = prepare_tool_cargo_with_input(
             builder,
             self.build_compiler,
             self.mode,
@@ -109,7 +206,27 @@ impl Step for ToolBuild {
             path,
             self.source_type,
             &self.extra_features,
+            input,
         );
+        // The private compile-time pairing input belongs solely to this SDK
+        // constructor. Engineering/stage0 tools never inherit an ambient one.
+        cargo.env_remove("TRUST_TARGO_PAIRED_COMPILER_PROFILE");
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(inputs) = &engineering {
+            inputs
+                .bind(&mut cargo)
+                .unwrap_or_else(|error| panic!("engineering pairing failed: {error}"));
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if path == "src/tools/targo"
+            && self.output_compiler.stage > 0
+            && self.output_compiler.host == target
+            && target == builder.config.host_target
+        {
+            paired_compiler::bind(builder, &mut cargo, self.output_compiler).unwrap_or_else(
+                |error| panic!("cannot bind final Targo compiler pairing: {error}"),
+            );
+        }
         if self.mode == Mode::ToolRustcPrivate {
             add_rustc_private_tool_metadata_search_path(
                 builder,
@@ -118,6 +235,7 @@ impl Step for ToolBuild {
                 target,
             );
         }
+        name_tool_ay_record_host_sysroot(builder, &mut cargo, self.mode, self.output_compiler);
 
         // The stage0 compiler changes infrequently and does not directly depend on code
         // in the current working directory. Therefore, caching it with sccache should be
@@ -146,20 +264,38 @@ impl Step for ToolBuild {
             }
         }
 
+        let pgo_config = match self.path {
+            "src/tools/rustdoc" => Some(&builder.config.rustdoc_pgo),
+            "src/tools/cargo" => Some(&builder.config.cargo_pgo),
+            "src/tools/clippy" => Some(&builder.config.clippy_pgo),
+            _ => None,
+        };
+        if let Some(pgo_config) = pgo_config {
+            apply_pgo(builder, &mut cargo, self.build_compiler, pgo_config);
+        }
+
         if !self.allow_features.is_empty() {
             cargo.allow_features(self.allow_features);
         }
 
-        cargo.args(self.cargo_args);
+        cargo.args(tool_cargo_args(builder.config.locked_deps, self.cargo_args));
 
         let _guard =
             builder.msg(Kind::Build, self.tool, self.mode, self.build_compiler, self.target);
 
         // we check this below
-        let build_success = compile::stream_cargo(builder, cargo, vec![], &mut |_| {});
+        let mut artifacts = vec![];
+        let build_success = compile::stream_cargo(builder, cargo, vec![], &mut |msg| match msg {
+            CargoMessage::CompilerArtifact { filenames, .. } => {
+                artifacts.extend(filenames.into_iter().map(|p| PathBuf::from(p.as_ref())));
+            }
+            // Trust: the variant now carries the run's `OUT_DIR` (`utils::trust_prune`).
+            CargoMessage::BuildScriptExecuted { .. } => {}
+            CargoMessage::BuildFinished => {}
+        });
 
         if !build_success {
-            crate::exit!(1);
+            helpers::exit_process(1);
         } else {
             // HACK(#82501): on Windows, the tools directory gets added to PATH when running tests, and
             // compiletest confuses HTML tidy with the in-tree tidy. Name the in-tree tidy something
@@ -168,21 +304,122 @@ impl Step for ToolBuild {
                 tool = "rust-tidy";
             }
             let tool_path = match self.artifact_kind {
-                ToolArtifactKind::Binary => copy_link_tool_bin(
-                    builder,
-                    self.output_compiler,
-                    self.target,
-                    self.mode,
-                    self.build_compiler,
-                    tool,
-                ),
+                ToolArtifactKind::Binary | ToolArtifactKind::NativeEngineeringBinary => {
+                    copy_link_tool_bin(
+                        builder,
+                        self.output_compiler,
+                        self.target,
+                        self.mode,
+                        self.build_compiler,
+                        tool,
+                        input,
+                    )
+                }
+                ToolArtifactKind::Example => {
+                    let source = builder
+                        .cargo_out(self.build_compiler, input.cache_mode(self.mode), self.target)
+                        .join("examples")
+                        .join(exe(tool, self.target));
+                    let destination = builder
+                        .tools_dir(self.output_compiler, self.target)
+                        .join(exe(tool, self.target));
+                    builder.copy_link(&source, &destination, FileType::Executable);
+                    destination
+                }
                 ToolArtifactKind::Library => builder
-                    .cargo_out(self.build_compiler, self.mode, self.target)
+                    .cargo_out_for_input(self.build_compiler, self.mode, self.target, input)
                     .join(format!("lib{tool}.rlib")),
             };
 
-            ToolBuildResult { tool_path, build_compiler: self.build_compiler }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if let Some(inputs) = &engineering {
+                inputs
+                    .finish(builder, &tool_path)
+                    .unwrap_or_else(|error| panic!("engineering input bookend failed: {error}"));
+            }
+            ToolBuildResult { tool_path, build_compiler: self.build_compiler, artifacts }
         }
+    }
+}
+
+// Trust: only the native engineering producer's exact recipe closes the cycle
+// with the pinned seed; SDK Targo recipes remain consumers of the built Cargo.
+impl ToolBuild {
+    fn cargo_input(&self, builder: &Builder<'_>) -> CargoInput {
+        let compiler = Compiler::new(0, builder.host_target);
+        if *self == targo_tool_build_recipe(compiler, compiler, builder.host_target)
+            || *self == native_build_tool::recipe(compiler, builder.host_target)
+        {
+            CargoInput::Seed.for_original(builder.sess)
+        } else if *self == trustup_tool_build_recipe(compiler, compiler, builder.host_target) {
+            CargoInput::CurrentBuildToolSnapshotStd
+        } else if *self == targo_trust_tool_build_recipe(compiler, compiler, builder.host_target) {
+            CargoInput::CurrentBuildToolSnapshotStd
+        } else {
+            builder.cargo_input(self.mode)
+        }
+    }
+}
+
+// Trust: this example is a BUILD-host DATA tool, not a compiler/proof producer.
+// Snapshot std and CargoInput::Seed avoid any Assemble -> tool -> Assemble cycle.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct Vf5ResourceTool;
+
+// The host preparer links AY and trust-types with its default try-sugar API.
+// Keep their actual language requirements local to this recipe.
+const VF5_RESOURCE_ALLOW_FEATURES: &str =
+    "min_specialization,allocator_api,try_trait_v2,try_trait_v2_residual";
+
+fn vf5_resource_tool_recipe(builder: &Builder<'_>) -> ToolBuild {
+    let compiler = builder.compiler(0, builder.host_target);
+    ToolBuild {
+        build_compiler: compiler,
+        output_compiler: output_compiler_for_tool(compiler, builder.host_target),
+        target: builder.host_target,
+        tool: "prepare_vf5_inputs",
+        path: "crates/trust-certify",
+        mode: Mode::ToolBootstrap,
+        source_type: SourceType::InTree,
+        extra_features: Vec::new(),
+        allow_features: VF5_RESOURCE_ALLOW_FEATURES,
+        cargo_args: vec!["--example".into(), "prepare_vf5_inputs".into()],
+        artifact_kind: ToolArtifactKind::Example,
+    }
+}
+
+impl Step for Vf5ResourceTool {
+    type Output = ToolBuildResult;
+
+    fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
+        builder.ensure(vf5_resource_tool_recipe(builder))
+    }
+}
+
+/// Trust (2026-10-09): a battery that links trust-cg-verify -- `targo-trust`
+/// from this tree, or `ty` through its own
+/// trust-cg pin -- admits only the `ay` whose bytes its build script recorded,
+/// and it runs from the sysroot it is installed in, beside that sysroot's
+/// `bin/ay`. Name that sysroot (`TOOLCHAIN_AY_RECORD_HOST_SYSROOT`), as
+/// `compile::rustc_cargo` does for the compiler crates. Left to the build
+/// compiler's `--print sysroot`, the stage-N battery recorded the stage N-1
+/// sysroot's `ay`, the one the stage N-2 compiler built: it refused the `ay`
+/// shipped beside it, and its bytes depended on the bootstrap seed, which the
+/// pack cut's double compile reports as a difference. `ensure_default_verifier_tool_bins`
+/// installs the sysroot's `ay` before any battery, so the named `ay` exists when
+/// a battery's build script runs. Tools that do not link trust-cg-verify never
+/// read the variable.
+fn name_tool_ay_record_host_sysroot(
+    builder: &Builder<'_>,
+    cargo: &mut CargoCommand,
+    mode: Mode,
+    output_compiler: Compiler,
+) {
+    if mode == Mode::ToolTarget && output_compiler.stage > 0 {
+        cargo.env(
+            compile::AY_RECORD_HOST_SYSROOT_ENV,
+            compile::local_sysroot_dir(builder, output_compiler),
+        );
     }
 }
 
@@ -197,14 +434,83 @@ pub fn prepare_tool_cargo(
     source_type: SourceType,
     extra_features: &[String],
 ) -> CargoCommand {
-    let mut cargo = builder::Cargo::new(builder, compiler, mode, source_type, target, cmd_kind);
+    prepare_tool_cargo_with_input(
+        builder,
+        compiler,
+        mode,
+        target,
+        cmd_kind,
+        path,
+        source_type,
+        extra_features,
+        builder.cargo_input(mode),
+    )
+}
+
+// Trust: share every flag and generated identity with the explicit seed edge.
+#[expect(clippy::too_many_arguments)]
+fn prepare_tool_cargo_with_input(
+    builder: &Builder<'_>,
+    compiler: Compiler,
+    mode: Mode,
+    target: TargetSelection,
+    cmd_kind: Kind,
+    path: &str,
+    source_type: SourceType,
+    extra_features: &[String],
+    input: CargoInput,
+) -> CargoCommand {
+    let mut cargo = builder::Cargo::new_with_input(
+        builder,
+        compiler,
+        mode,
+        source_type,
+        target,
+        cmd_kind,
+        input,
+    );
 
     let path = PathBuf::from(path);
     let dir = builder.src.join(&path);
     cargo.arg("--manifest-path").arg(dir.join("Cargo.toml"));
 
+    // Trust: an explicit sysroot also reaches Cargo's compiler-info probe. A
+    // binary symlink alone is canonicalized by the shipped 1.99 compiler.
+    #[cfg(unix)]
+    if compiler.stage == 0
+        && (mode == Mode::ToolBootstrap
+            || (mode == Mode::ToolTarget
+                && (!builder.local_rebuild || input.uses_snapshot_compiler())))
+        && (path.ends_with("targo") || matches!(input, CargoInput::CurrentBuildToolSnapshotStd))
+    {
+        let alias = if input.is_original_control() {
+            // Trust: this is the actual separately held private seed runtime.
+            // Its native invocation guard requires the original root; ordinary
+            // filesystem aliases do not issue a replacement private sysroot.
+            Some(builder.rustc_snapshot_sysroot().to_owned())
+        } else {
+            bootstrap_tool_sysroot_alias(
+                builder.rustc_snapshot_sysroot(),
+                &builder.out,
+                builder.config.dry_run(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("cannot prepare the snapshot's native-tool sysroot: {error}")
+            })
+        };
+        if let Some(alias) = alias {
+            cargo.rustflag("--sysroot").rustflag(alias.to_str().expect("sysroot must be UTF-8"));
+        } else if matches!(input, CargoInput::CurrentBuildToolSnapshotStd) {
+            // Track the selected std spelling in Cargo's actual Rustflags;
+            // do not rely only on an untracked shim environment difference.
+            cargo.rustflag("--sysroot").rustflag(
+                builder.rustc_snapshot_sysroot().to_str().expect("sysroot must be UTF-8"),
+            );
+        }
+    }
+
     let mut features = extra_features.to_vec();
-    if builder.build.config.cargo_native_static {
+    if builder.sess.config.cargo_native_static {
         if path.ends_with("targo")
             || path.ends_with("tippy")
             || path.ends_with("miri")
@@ -266,7 +572,9 @@ pub fn prepare_tool_cargo(
     cargo.env("LZMA_API_STATIC", "1");
 
     // See also the "JEMALLOC_SYS_WITH_LG_PAGE" setting in the compile build step.
-    if builder.config.jemalloc(target) && env::var_os("JEMALLOC_SYS_WITH_LG_PAGE").is_none() {
+    if builder.config.allocator(target) == Allocator::Jemalloc
+        && env::var_os("JEMALLOC_SYS_WITH_LG_PAGE").is_none()
+    {
         // Build jemalloc on AArch64 with support for page sizes up to 64K
         // See: https://github.com/rust-lang/rust/pull/135081
         if target.starts_with("aarch64") {
@@ -282,6 +590,11 @@ pub fn prepare_tool_cargo(
     // import rustc-ap-rustc_attr which requires this to be set for the
     // `#[cfg(version(...))]` attribute.
     cargo.env("CFG_RELEASE", builder.rust_release());
+    // Trust: see rustc_cargo_env; the identity lives in each native host entrypoint.
+    cargo.env(
+        "CFG_TRUST_ORACLE_HOST",
+        if builder.version_info().sha().is_some() { "1" } else { "0" },
+    );
     cargo.env("CFG_RELEASE_CHANNEL", &builder.config.channel);
     cargo.env("CFG_VERSION", builder.rust_version());
     // Trust: the product version, distinct from the rustc-protocol one above.
@@ -289,11 +602,12 @@ pub fn prepare_tool_cargo(
     cargo.env("CFG_RELEASE_NUM", &builder.version);
     cargo.env("DOC_RUST_LANG_ORG_CHANNEL", builder.doc_rust_lang_org_channel());
 
-    if let Some(ref ver_date) = builder.rust_info().commit_date() {
+    // Trust: a dev stage-1 build's identity names its sources, not HEAD (TB1).
+    if let Some(ref ver_date) = builder.version_info().commit_date() {
         cargo.env("CFG_VER_DATE", ver_date);
     }
 
-    if let Some(ref ver_hash) = builder.rust_info().sha() {
+    if let Some(ref ver_hash) = builder.version_info().sha() {
         cargo.env("CFG_VER_HASH", ver_hash);
     }
 
@@ -301,14 +615,47 @@ pub fn prepare_tool_cargo(
         cargo.env("CFG_VER_DESCRIPTION", description);
     }
 
-    // Targo is vendored in the Trust monorepo, so its version tuple must come
-    // from the single root identity captured during bootstrap configuration.
-    // Other tools may still be independently versioned subrepositories.
-    let info = if path == Path::new("src/tools/targo") {
-        builder.cargo_info.clone()
-    } else {
-        builder.config.git_info(builder.config.omit_git_hash, &dir)
-    };
+    // Trust: the commit tuple a tool's build script reads instead of asking git (targo's
+    // `build_commit_info.rs`, `rustc_tools_util::setup_version_info!` for tippy and
+    // targo-miri, trust-analyzer's and its proc-macro server's `build.rs`, trustfmt's). A
+    // tool built from this checkout's own sources carries the identity the compiler's
+    // version carries (TB1), so that its version and `trustc -vV` name the same build and a
+    // commit that keeps the identity reruns none of those scripts. A tool inside a submodule
+    // keeps its own repository's commit (`trust_source_identity::tool_commit`). The
+    // submodules are what `.gitmodules` lists, not `Builder::submodule_paths`, which names
+    // `src/tools/targo` among the trees Trust carries in place of upstream's submodules
+    // when it finds no `.gitmodules`.
+    let submodules = build_helper::util::parse_gitmodules(&builder.src);
+    let component = trust_source_identity::independent_tool_component(&path, &submodules);
+    // GitInfo expects the repository root, not the nested executable package.
+    let own_root = component
+        .map(|component| builder.src.join(component.root()))
+        .unwrap_or_else(|| dir.clone());
+    let info =
+        trust_source_identity::tool_commit(&path, &submodules, builder.version_info(), || {
+            builder.config.git_info(builder.config.omit_git_hash, &own_root)
+        });
+    // Trust: the standalone verifier batteries do not compile the surrounding
+    // Trust checkout. Its file!/diagnostic/debug paths follow its own source identity,
+    // so changing Targo alone does not rebuild the solver. The applied mapping
+    // stays in Cargo's fingerprint AND artifact unit_id; mixed tool and compiler
+    // graphs keep the whole-build mapping prepared by Builder::cargo.
+    if mode == Mode::ToolTarget && builder.config.rust_remap_debuginfo {
+        if let Some(component) = component {
+            let remap = trust_source_identity::component_remap(
+                builder.exec_ctx(),
+                &builder.src.join(component.root()),
+                &info,
+                component,
+            )
+            .unwrap_or_else(|error| {
+                panic!("cannot name the independent verifier sources: {error}")
+            });
+            if let Some(remap) = remap {
+                cargo.env("__CARGO_RUSTC_BOOTSTRAP_WS_REMAP", remap);
+            }
+        }
+    }
     if let Some(sha) = info.sha() {
         cargo.env("CFG_COMMIT_HASH", sha);
     }
@@ -383,7 +730,7 @@ pub(crate) fn add_rustc_private_metadata_search_path(
     add_rustc_private_metadata_search_path_impl(builder, cargo, output_compiler, target, false);
 }
 
-fn add_rustc_private_tool_metadata_search_path(
+pub(crate) fn add_rustc_private_tool_metadata_search_path(
     builder: &Builder<'_>,
     cargo: &mut CargoCommand,
     output_compiler: Compiler,
@@ -521,8 +868,10 @@ fn copy_link_tool_bin(
     mode: Mode,
     build_compiler: Compiler,
     name: &str,
+    input: CargoInput,
 ) -> PathBuf {
-    let cargo_out = builder.cargo_out(build_compiler, mode, target).join(exe(name, target));
+    let cargo_out =
+        builder.cargo_out_for_input(build_compiler, mode, target, input).join(exe(name, target));
     let bin = builder.tools_dir(output_compiler, target).join(exe(name, target));
     builder.copy_link(&cargo_out, &bin, FileType::Executable);
     bin
@@ -580,7 +929,7 @@ fn validate_installed_rustc_private_tool(
     if builder.config.dry_run() {
         return;
     }
-    if target_compiler.host != builder.build.host_target {
+    if target_compiler.host != builder.sess.host_target {
         // Cross-host binaries are not runnable by bootstrap. Do not probe
         // them with the build compiler's libraries: that would be a silent,
         // incoherent fallback. Their content-bound private-sysroot identity
@@ -590,7 +939,7 @@ fn validate_installed_rustc_private_tool(
              (tool host {}, build host {})",
             binary.display(),
             target_compiler.host,
-            builder.build.host_target,
+            builder.sess.host_target,
         ));
         return;
     }
@@ -650,7 +999,7 @@ fn validate_installed_rustc_private_tool(
 }
 
 pub(crate) fn restored_sysroot_bins(builder: &Builder<'_>) -> Vec<(&'static str, &'static str)> {
-    restored_sysroot_bins_for_config(&builder.config, builder.build.unstable_features())
+    restored_sysroot_bins_for_config(&builder.config, builder.sess.unstable_features())
 }
 
 fn default_source_solver_enabled(
@@ -710,6 +1059,43 @@ fn locked_cargo_args(args: &[&str]) -> Vec<String> {
     std::iter::once("--locked").chain(args.iter().copied()).map(ToString::to_string).collect()
 }
 
+/// Compose recipe arguments with the lock policy already applied by `Builder::cargo`.
+///
+/// Recipes may require a checked-in lockfile even when `build.locked-deps` is false.
+/// Keep that requirement, but do not repeat the global flag (Cargo rejects duplicate
+/// `--locked`). Only this exact option is normalized; other arguments, including
+/// attached option values and anything after `--`, retain their original spelling
+/// and order. Cargo build also accepts hyphen-leading values for `--jobs`/`-j`;
+/// preserve that next token even if it spells `--locked` (an invalid jobs value
+/// belongs to Cargo's diagnostics, not this normalizer). This is not a general
+/// Cargo argument rewriter.
+fn tool_cargo_args(global_locked: bool, args: Vec<String>) -> Vec<String> {
+    let mut locked = global_locked;
+    let mut options = true;
+    let mut jobs_value = false;
+    args.into_iter()
+        .filter(|arg| {
+            if jobs_value {
+                jobs_value = false;
+                return true;
+            }
+            if arg == "--" {
+                options = false;
+            }
+            if options && matches!(arg.as_str(), "--jobs" | "-j") {
+                jobs_value = true;
+            }
+            if options && arg == "--locked" {
+                let keep = !locked;
+                locked = true;
+                keep
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
 fn ay_bootstrap_cargo_args(src: &Path) -> Vec<String> {
     let manifest_text = std::fs::read_to_string(src.join(AY_SOURCE_MANIFEST)).unwrap_or_default();
     ay_bootstrap_cargo_args_for_manifest(&manifest_text)
@@ -754,10 +1140,110 @@ fn ay_bootstrap_cargo_args_for_manifest(manifest_text: &str) -> Vec<String> {
     locked_cargo_args(&["--no-default-features", "--features", features])
 }
 
+// Trust: AY preserves allocation failure with Box::try_new. Its ahash dependency
+// detects this nightly seed in build.rs and requests min_specialization. Keep
+// these permissions recipe-local; AY does not need full specialization.
+const AY_ALLOW_FEATURES: &str = "min_specialization,allocator_api";
+const VERIFIER_BACKEND_ALLOW_FEATURES: &str = "min_specialization,specialization,allocator_api";
+
+fn ay_tool_build_recipe(
+    build_compiler: Compiler,
+    output_compiler: Compiler,
+    target: TargetSelection,
+    src: &Path,
+) -> ToolBuild {
+    ToolBuild {
+        build_compiler,
+        output_compiler,
+        target,
+        tool: "ay",
+        mode: Mode::ToolTarget,
+        path: "first-party/ay/crates/ay",
+        source_type: SourceType::InTree,
+        extra_features: Vec::new(),
+        allow_features: AY_ALLOW_FEATURES,
+        cargo_args: ay_bootstrap_cargo_args(src),
+        artifact_kind: ToolArtifactKind::Binary,
+    }
+}
+
+/// Build the `ay` battery of `target_compiler`'s sysroot and install it as
+/// `<sysroot>/bin/ay`; `None` (and nothing built) when the tree carries no
+/// in-tree AY source, or for stage 0.
+///
+/// The compiler's trust-cg verifier pins the bytes of exactly this file
+/// (`compile::rustc_cargo`), so `Rustc::run` calls this for every kind before
+/// it compiles a compiler, not only for the batteries-on local build: dist,
+/// install and test must ship a compiler whose record names the AY beside
+/// it. It is the same `ToolBuild` the batteries use, so it is built once.
+pub(crate) fn ensure_sysroot_ay(
+    builder: &Builder<'_>,
+    target_compiler: Compiler,
+    sysroot: &Path,
+) -> Option<PathBuf> {
+    if target_compiler.stage == 0
+        || !verifier_backend_source_present(&builder.src, AY_SOURCE_MANIFEST)
+    {
+        return None;
+    }
+    let target = target_compiler.host;
+    let build_compiler =
+        get_tool_target_compiler(builder, ToolTargetBuildMode::Dist(target_compiler));
+    let ay =
+        builder.ensure(ay_tool_build_recipe(build_compiler, target_compiler, target, &builder.src));
+    let bindir = sysroot.join("bin");
+    t!(fs::create_dir_all(&bindir));
+    let installed = bindir.join(exe("ay", target_compiler.host));
+    builder.copy_link(&ay.tool_path, &installed, FileType::Executable);
+    Some(installed)
+}
+
+// Trust: Sysroot may build compiler prerequisites, never a frontend bound to itself.
+pub(crate) fn ensure_sysroot_verifier_prerequisites(
+    builder: &Builder<'_>,
+    target_compiler: Compiler,
+    sysroot: &Path,
+) {
+    ensure_verifier_tool_bins(builder, target_compiler, sysroot, false);
+}
+
+// Trust: dist's explicit component graph requests the completed compiler's
+// whole verifier surface. Keep that entry separate from Sysroot prerequisites;
+// its caller has already ensured compiler assembly before preparing the image.
 pub(crate) fn ensure_default_verifier_tool_bins(
     builder: &Builder<'_>,
     target_compiler: Compiler,
     sysroot: &Path,
+) {
+    ensure_verifier_tool_bins(builder, target_compiler, sysroot, true);
+}
+
+// Trust: final Targo records this compiler's held image and runtime closure.
+// Construct all selected frontends only after compiler/runtime/std assembly and
+// validation. Sysroot is then complete and cached before pairing requests it.
+pub(crate) fn finish_verifier_tool_bins_after_assembly(
+    builder: &Builder<'_>,
+    target_compiler: Compiler,
+    sysroot: &Path,
+) {
+    if should_ensure_default_verifier_tool_bins(builder.kind, target_compiler.stage)
+        && !is_partial_stage1_source_build(
+            builder.kind,
+            target_compiler.stage,
+            builder.top_stage,
+            builder.config.include_default_paths,
+            &builder.paths,
+        )
+    {
+        ensure_default_verifier_tool_bins(builder, target_compiler, sysroot);
+    }
+}
+
+fn ensure_verifier_tool_bins(
+    builder: &Builder<'_>,
+    target_compiler: Compiler,
+    sysroot: &Path,
+    compiler_assembled: bool,
 ) {
     let extended = builder.config.extended;
     let tools = builder.config.tools.as_ref();
@@ -778,6 +1264,43 @@ pub(crate) fn ensure_default_verifier_tool_bins(
             FileType::Executable,
         );
     };
+    let solvers = default_source_solver_enabled(extended, tools, ay_source_present);
+
+    // `ay` — the core solver — installs whenever its in-tree source is present.
+    // Guarding on the manifest keeps a bare checkout (no first-party sources)
+    // building instead of hard-failing when the block is reached via
+    // `targo-trust`/`tools` without the `ay` source.
+    //
+    // Trust (2026-10-09): FIRST, before any battery that links trust-cg-verify.
+    // Each of them records the bytes of THIS sysroot's `bin/ay` from its build
+    // script (`name_tool_ay_record_host_sysroot`), and `Rustc::run` reaches this
+    // function through `builder.sysroot(..)` before its own `ensure_sysroot_ay`,
+    // so `targo-trust` and `trustd`, built here before `ay` until now (a pack-cut
+    // probe's log, 2026-10-09: "Building stage1 targo", "targo-trust", "trustd",
+    // then "ay"), would have found no `ay` to record.
+    if solvers && ay_source_present {
+        ensure_sysroot_ay(builder, target_compiler, sysroot);
+    }
+
+    // Trust: AY is a compiler prerequisite, while final Targo consumes the
+    // completed compiler. Asking for that Targo while Sysroot is active closes
+    // a dependency cycle (and cannot capture the not-yet-installed image).
+    if !compiler_assembled {
+        return;
+    }
+    // Keep the audited older-line intermediate Stage1 deferral. Every other
+    // selected generation retains its complete surface after assembly, including
+    // same-line Stage1 and a non-partial top-level Stage1 build.
+    if solvers
+        && ay_source_present
+        && should_defer_intermediate_verifier_tool_bins(builder, target_compiler, env::vars_os())
+    {
+        return;
+    }
+
+    // Trust: selecting a final tool's build compiler can itself assemble a
+    // prior compiler. It belongs to the completed phase too; AY owns its own
+    // explicit prerequisite selection above.
     let build_compiler =
         get_tool_target_compiler(builder, ToolTargetBuildMode::Dist(target_compiler));
 
@@ -787,21 +1310,13 @@ pub(crate) fn ensure_default_verifier_tool_bins(
     // batteries in the sysroot, while staging only one half of the frontend
     // produces a present-but-unusable command.
     {
-        builder.build.require_submodule("src/tools/targo", None);
-        let cargo = builder.ensure(ToolBuild {
-            build_compiler,
-            output_compiler: target_compiler,
-            target,
-            tool: "cargo",
-            mode: Mode::ToolTarget,
-            path: "src/tools/targo",
-            source_type: SourceType::Submodule,
-            extra_features: Vec::new(),
-            allow_features: "min_specialization,specialization",
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        install_bin(builder, &cargo.tool_path, "targo");
+        builder.sess.require_submodule("src/tools/targo", None);
+        let targo =
+            builder.ensure(targo_tool_build_recipe(build_compiler, target_compiler, target));
+        // Trust: with its `cargo` alias; no later pass installs it for the top stage.
+        for bin_name in sysroot_bin_names_for_tool_source("targo") {
+            install_bin(builder, &targo.tool_path, bin_name);
+        }
     }
     {
         let targo_trust = builder.ensure(ToolBuild {
@@ -825,28 +1340,7 @@ pub(crate) fn ensure_default_verifier_tool_bins(
         let trustd = build_trustd_tool(builder, build_compiler, target_compiler, target);
         install_bin(builder, &trustd.tool_path, "trustd");
     }
-    if default_source_solver_enabled(extended, tools, ay_source_present) {
-        // `ay` — the core solver — installs whenever its in-tree source is
-        // present. Guarding on the manifest keeps a bare checkout (no
-        // first-party sources) building instead of hard-failing when the block
-        // is reached via `targo-trust`/`tools` without the `ay` source.
-        if ay_source_present {
-            let ay = builder.ensure(ToolBuild {
-                build_compiler,
-                output_compiler: target_compiler,
-                target,
-                tool: "ay",
-                mode: Mode::ToolTarget,
-                path: "first-party/ay/crates/ay",
-                source_type: SourceType::InTree,
-                extra_features: Vec::new(),
-                allow_features: "",
-                cargo_args: ay_bootstrap_cargo_args(&builder.src),
-                artifact_kind: ToolArtifactKind::Binary,
-            });
-            install_bin(builder, &ay.tool_path, "ay");
-        }
-
+    if solvers {
         // Trust: batteries-on default — build EVERY verification backend into
         // the sysroot, not just `ay`. The two L2 backends — `ty` (temporal
         // logic / TLA+) and `clean` (higher-order theorem prover) — are each
@@ -857,7 +1351,8 @@ pub(crate) fn ensure_default_verifier_tool_bins(
         // allow `min_specialization,specialization` so dependency crates that
         // gate impls on those features (e.g. `ahash`'s `specialize` path, which
         // otherwise trips an E0119 blanket/specialized impl conflict) compile.
-        let backend_allow_features = "min_specialization,specialization";
+        // Trust: both TY and Clean also reach ay-sat's fallible allocations.
+        let backend_allow_features = VERIFIER_BACKEND_ALLOW_FEATURES;
         if l2_backend_enabled(tools, "ty")
             && verifier_backend_source_present(&builder.src, TY_SOURCE_MANIFEST)
         {
@@ -880,14 +1375,54 @@ pub(crate) fn ensure_default_verifier_tool_bins(
         if l2_backend_enabled(tools, "clean")
             && verifier_backend_source_present(&builder.src, CLEAN_SOURCE_MANIFEST)
         {
-            // `extra_features` stays empty deliberately: the Lean->TrustIr leg
-            // (`clean compile --emit trustir`, and the `--emit obj` handoff to
-            // trust-cg) lives behind clean's `trust-ir-backend` feature, whose
-            // closure reaches the trust-ir and trust-cg siblings. Turning it on
-            // is not a one-line change here — it needs `first-party/clean`'s
-            // own lockfile to describe that closure at the currently pinned
-            // sibling revisions, and `--locked` is not negotiable for a
-            // reproducible, credential-free bootstrap.
+            // Trust: exactly ONE clean feature is enabled here: `carcara-verify`.
+            //
+            // Why it is on. A `clean` built without it answers EVERY Alethe
+            // certificate with "carcara-verify feature required for tier 1
+            // verification", whatever the proof says (measured 2026-09-14/15 on
+            // trust-stage1-r2/bin/clean and on the aterm trust pack 8590/8595
+            // `bin/clean`; the aterm-packaged clean 8606, built with the feature,
+            // verifies the same control proof and rejects a one-premise mutant of
+            // it). trust-cg's certificate lane capability-probes its checker and
+            // treats such a build as NO checker, so a sysroot shipping it carries
+            // no independent Alethe authority. clean's own workspace `build-args`
+            // (first-party/clean/Cargo.toml) already request
+            // `clean/carcara-verify`; this makes the sysroot build match them.
+            //
+            // Who consumes it. trust-cg-verify's default discovery tries the
+            // aterm-packaged `store/clean/current/bin/clean` first
+            // (aterm_toolchain.rs) and falls back to THIS binary -- the `clean`
+            // in the running compiler's `<sysroot>/bin` -- only when that package
+            // is absent or fails the control-proof probe
+            // (`default_clean_checker_candidates`, obligation_cert_store.rs);
+            // `TCG_EXTERNAL_CLEAN_CHECKER` (legacy `TCG_CLEAN_CHECKER`) can also
+            // name it explicitly. Either way it is re-probed and bound by its
+            // SHA-256 before any proof is credited.
+            //
+            // What it costs. The closure clean -> clean-cli -> clean-elab ->
+            // clean-auto -> carcara (a path dependency on clean's audited vendored
+            // copy, first-party/clean/third-party/carcara, with its path sibling
+            // carcara-macros) adds five crates.io crates: az 1.3.0, libm 0.2.16,
+            // rug 1.30.0, gmp-mpfr-sys 1.7.1 and nom 8.0.0. All five are already
+            // in first-party/clean/Cargo.lock, so `--locked` still resolves, but a
+            // box that has never fetched them must reach crates.io once; carcara
+            // itself comes from the clean checkout and needs no fetch.
+            // gmp-mpfr-sys builds GMP from bundled C source (m4, make and cc
+            // required; it runs GMP's C test suite and caches the result in the
+            // user cache directory), a one-time multi-minute cost, and the binary
+            // grows by roughly 8 MB. A `vendor = true` bootstrap (which passes
+            // `--frozen`) fails here on any box that has not already cached those
+            // five crates: `default_paths_to_vendor` (vendor.rs) does not list
+            // first-party/clean's workspace, and `vendor/` does not contain them.
+            //
+            // Why `trust-ir-backend` stays off. The Lean->TrustIr leg (`clean
+            // compile --emit trustir`, and the `--emit obj` handoff to trust-cg)
+            // lives behind clean's `trust-ir-backend` feature, whose closure
+            // reaches the trust-ir and trust-cg siblings. Turning it on is not a
+            // one-line change here — it needs `first-party/clean`'s own lockfile
+            // to describe that closure at the currently pinned sibling revisions,
+            // and `--locked` is not negotiable for a reproducible, credential-free
+            // bootstrap.
             let clean = builder.ensure(ToolBuild {
                 build_compiler,
                 output_compiler: target_compiler,
@@ -896,7 +1431,7 @@ pub(crate) fn ensure_default_verifier_tool_bins(
                 mode: Mode::ToolTarget,
                 path: "first-party/clean/crates/clean",
                 source_type: SourceType::InTree,
-                extra_features: Vec::new(),
+                extra_features: vec!["carcara-verify".to_string()],
                 allow_features: backend_allow_features,
                 cargo_args: locked_cargo_args(&["--bin", "clean"]),
                 artifact_kind: ToolArtifactKind::Binary,
@@ -936,7 +1471,13 @@ fn restored_sysroot_bins_for_config(
     )
 }
 
-fn restored_sysroot_bins_for_tool_settings(
+// Trust: local sysroots support both the canonical documentation command and
+// rustup's compatibility entry point. Cold assembly and restoration must agree
+// with the standalone Rustdoc step; distribution owns its separate name policy.
+const LOCAL_RUSTDOC_BIN_NAMES: &[&str] = &["trustdoc", "rustdoc"];
+
+// Trust: repository qualification shares the installed public tool names.
+pub(crate) fn restored_sysroot_bins_for_tool_settings(
     extended: bool,
     tools: Option<&std::collections::HashSet<String>>,
     unstable_features: bool,
@@ -945,14 +1486,16 @@ fn restored_sysroot_bins_for_tool_settings(
     let mut bins = Vec::new();
 
     if tool_enabled_for_tool_settings(extended, tools, "trustdoc") {
-        bins.push(("rustdoc_tool_binary", "trustdoc"));
+        bins.extend(LOCAL_RUSTDOC_BIN_NAMES.iter().map(|&name| ("rustdoc_tool_binary", name)));
     }
 
     // The public frontend is one unit. Any enabled verifier-surface member
     // restores both halves (and the daemon used by `targo trust`) so a
-    // batteries-on sysroot always has a usable entry point.
+    // batteries-on sysroot always has a usable entry point. The frontend's
+    // source is the `targo` artifact (`targo_tool_build_recipe`), never a file
+    // named `cargo`.
     if default_verifier_tool_bins_enabled(extended, tools, ay_source_present) {
-        bins.push(("cargo", "targo"));
+        bins.push(("targo", "targo"));
         bins.push(("targo-trust", "targo-trust"));
         bins.push(("trustd", "trustd"));
     }
@@ -1048,21 +1591,46 @@ fn restored_sysroot_bins_for_tool_settings(
 }
 
 pub(crate) fn upstream_compat_bin_for_tool_source(src_name: &str) -> Option<&str> {
-    // Trust: the toolchain ships Trust-branded command names ONLY. The single
-    // retained upstream-compat alias emitted here is `cargo` — rustup refuses to
-    // register a toolchain whose bin/ lacks a `cargo` entrypoint, and `cargo
-    // +trust` must resolve. (The matching `rustc` name is materialized on a
-    // separate path: `materialize_local_compiler_aliases` / `Assemble`, and
-    // `rustdoc` on the Rustdoc step's `bin_rustdoc` closure — cargo's doctest
-    // phase spawns that stock name.) Every other stock secondary name —
-    // cargo-trust, cargo-clippy, clippy-driver, cargo-fmt, rustfmt,
-    // rust-analyzer, cargo-miri, miri — is intentionally NOT materialized.
-    // This stops those names at the source (the root-cause replacement for the
-    // former scripts/purge-stock-names.sh, which deleted them post-build).
+    // Trust: the generic compatibility alias emitted here is `cargo`: `cargo
+    // +trust` must resolve, and for a linked toolchain without `bin/cargo`
+    // rustup's proxy falls back to ANOTHER toolchain's (stock) Cargo. It is a
+    // copy of the `targo` artifact and nothing else — the Trust Cargo's
+    // package, library and binary are all `targo`, so a file in a tools
+    // directory that is merely NAMED `cargo` (a stale build from before the
+    // rename, say) can never be installed under either name.
+    // (The matching `rustc` name is materialized on a separate path:
+    // `materialize_local_compiler_aliases` / `Assemble`, and `rustdoc` through
+    // the explicit local documentation bin list and the Rustdoc step's
+    // `bin_rustdoc` closure.) Every other stock secondary name — cargo-trust,
+    // cargo-clippy, clippy-driver, cargo-fmt, rustfmt, rust-analyzer,
+    // cargo-miri, miri — is intentionally NOT materialized. This stops those
+    // names at the source (the root-cause replacement for the former
+    // scripts/purge-stock-names.sh, which deleted them post-build).
     match src_name {
-        "cargo" => Some("cargo"),
+        "targo" => Some("cargo"),
         _ => None,
     }
+}
+
+/// Trust: the file names one built tool is installed under in a sysroot `bin/`:
+/// its own name, then its upstream-compatible alias when it has one (`cargo`
+/// for `targo`). Every step that installs a built `targo` into a sysroot
+/// installs all of these from the one artifact, in the one place.
+///
+/// The alias used to be left to sysroot restoration
+/// (`restore_user_facing_tools`, compile.rs), which copies what already sits in
+/// the stage's tools directory. That was enough while restoration built the
+/// frontend first. Since 0b37a090af (2026-11-10) the frontend is built after
+/// the compiler is assembled: for the top stage, restoration had already run
+/// and found no `targo`, the later install wrote `bin/targo` alone, and nothing
+/// restored again. `x.py build --stage 2` at 7cbb5e4327 left `stage2/bin` with
+/// `targo` and no `cargo` (aarch64 Linux, 2026-11-10; stage1 kept its alias only
+/// because `StdLink` restores a stage1 sysroot once more), and
+/// `scripts/seed_staircase.py admit` refused that stage2 as a stage0.
+pub(crate) fn sysroot_bin_names_for_tool_source(src_name: &str) -> Vec<&str> {
+    let mut names = vec![src_name];
+    names.extend(upstream_compat_bin_for_tool_source(src_name));
+    names
 }
 
 pub(crate) fn restore_rust_analyzer_proc_macro_srv(builder: &Builder<'_>) -> bool {
@@ -1088,9 +1656,10 @@ pub(crate) fn remove_retired_proc_macro_srv_alias(path: &Path) -> io::Result<()>
 const CARGO_CLIPPY_CARGO_ARGS: &[&str] = &["--bin", "cargo-clippy"];
 const CLIPPY_DRIVER_CARGO_ARGS: &[&str] = &["--bin", "clippy-driver"];
 
-fn owned_cargo_args(args: &[&str]) -> Vec<String> {
-    args.iter().map(|arg| (*arg).to_string()).collect()
-}
+// Trust: this package also has development-only format-diff/git helpers.
+// Each public formatter step owns one binary; keep its library/features shared.
+const CARGOFMT_CARGO_ARGS: &[&str] = &["--bin", "cargo-fmt"];
+const RUSTFMT_CARGO_ARGS: &[&str] = &["--bin", "rustfmt"];
 
 pub(crate) fn ensure_user_facing_tools(
     builder: &Builder<'_>,
@@ -1110,12 +1679,21 @@ pub(crate) fn ensure_user_facing_tools(
     }
 
     let target = target_compiler.host;
-    // A linked stage2 sysroot is a user-facing toolchain. Rustc-private tools
-    // installed into that sysroot must link against that same sysroot's
-    // compiler libraries; otherwise their rpath points at stage2/lib while the
-    // binary still expects stage1 hashes.
-    let compilers =
-        RustcPrivateCompilers::from_build_and_target_compiler(target_compiler, target_compiler);
+    // ONE producer per installed tool. Each rustc-private tool of this sysroot
+    // is the standalone step's own (`Rustdoc`, `CargoClippy`, `Clippy`, ...):
+    // built by the stage N-1 compiler and linked against this sysroot's
+    // compiler libraries (`RustcPrivateCompilers::from_target_compiler`), the
+    // tool `x.py dist` ships and a full `x build` runs as a default step.
+    // Until 2026-10-14 this function built its own copy of each with the
+    // stage N compiler, into another cargo directory, and both copies were
+    // installed at the same `bin/<name>`: the last step to run decided the
+    // bytes (they differed in the N_OSO paths that name the cargo directory).
+    // A `build compiler/rustc library/std` then left other tools in the
+    // sysroot than a full build did or the dist archives shipped: the seed
+    // mint's double compile compared one copy, the pack would have carried
+    // the other, and its `verify-stage2-unchanged` refused the cut
+    // (`scripts/mint_and_prove_seed.sh`, D7 of the first mint).
+    let compilers = RustcPrivateCompilers::from_target_compiler(builder, target_compiler);
     let bindir = sysroot.join("bin");
     t!(fs::create_dir_all(&bindir));
 
@@ -1128,57 +1706,24 @@ pub(crate) fn ensure_user_facing_tools(
             );
         }
     };
-    let install_private_bins = |builder: &Builder<'_>, tool_path: &Path, bin_names: &[&str]| {
-        install_rustc_private_tool_bins(builder, target_compiler, &bindir, tool_path, bin_names);
-    };
 
     if tool_enabled_for_tool_settings(
         builder.config.extended,
         builder.config.tools.as_ref(),
         "trustdoc",
     ) {
-        let mut rustdoc_features = Vec::new();
-        if builder.config.jemalloc(target) {
-            rustdoc_features.push("jemalloc".to_string());
-        }
-        let rustdoc = builder.ensure(ToolBuild {
-            build_compiler: compilers.build_compiler,
-            output_compiler: target_compiler,
-            target,
-            tool: "rustdoc_tool_binary",
-            mode: Mode::ToolRustcPrivate,
-            path: "src/tools/trustdoc",
-            source_type: SourceType::InTree,
-            extra_features: rustdoc_features,
-            allow_features: "",
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        if builder.config.rust_debuginfo_level_tools == DebuginfoLevel::None {
-            compile::strip_debug(builder, target, &rustdoc.tool_path);
-        }
-        install_private_bins(builder, &rustdoc.tool_path, &["trustdoc"]);
+        builder.ensure(Rustdoc { target_compiler });
     }
 
     if targo_runtime_enabled(builder.config.extended, builder.config.tools.as_ref()) {
-        builder.build.require_submodule("src/tools/targo", None);
-        let cargo = builder.ensure(ToolBuild {
-            build_compiler: get_tool_target_compiler(
-                builder,
-                ToolTargetBuildMode::Dist(target_compiler),
-            ),
-            output_compiler: target_compiler,
+        builder.sess.require_submodule("src/tools/targo", None);
+        let targo = builder.ensure(targo_tool_build_recipe(
+            get_tool_target_compiler(builder, ToolTargetBuildMode::Dist(target_compiler)),
+            target_compiler,
             target,
-            tool: "cargo",
-            mode: Mode::ToolTarget,
-            path: "src/tools/targo",
-            source_type: SourceType::Submodule,
-            extra_features: Vec::new(),
-            allow_features: "min_specialization,specialization",
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        install_bins(builder, &cargo.tool_path, &["targo"]);
+        ));
+        // Trust: with its `cargo` alias (`sysroot_bin_names_for_tool_source`).
+        install_bins(builder, &targo.tool_path, &sysroot_bin_names_for_tool_source("targo"));
     }
     if tool_enabled_for_tool_settings(
         builder.config.extended,
@@ -1222,164 +1767,40 @@ pub(crate) fn ensure_user_facing_tools(
         // `Mode::ToolTarget` frontends and installs under its own name only.
         // Wiring it in is not adopting it: nothing here makes it the default
         // selector, and no existing selection path consults it.
-        let trustup = builder.ensure(ToolBuild {
-            build_compiler: get_tool_target_compiler(
-                builder,
-                ToolTargetBuildMode::Dist(target_compiler),
-            ),
-            output_compiler: target_compiler,
+        let trustup = builder.ensure(trustup_tool_build_recipe(
+            get_tool_target_compiler(builder, ToolTargetBuildMode::Dist(target_compiler)),
+            target_compiler,
             target,
-            tool: "trustup",
-            mode: Mode::ToolTarget,
-            path: "src/tools/trustup",
-            source_type: SourceType::InTree,
-            extra_features: Vec::new(),
-            allow_features: "",
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
+        ));
         install_bins(builder, &trustup.tool_path, &["trustup"]);
     }
     if extended_rustc_tool_is_default_step(builder, "cargo-clippy", true) {
-        let tool = builder.ensure(ToolBuild {
-            build_compiler: compilers.build_compiler,
-            output_compiler: target_compiler,
-            target,
-            tool: "cargo-clippy",
-            mode: Mode::ToolRustcPrivate,
-            path: "src/tools/tippy",
-            source_type: SourceType::InTree,
-            extra_features: Vec::new(),
-            allow_features: "",
-            cargo_args: owned_cargo_args(CARGO_CLIPPY_CARGO_ARGS),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        install_private_bins(builder, &tool.tool_path, &["tippy", "targo-tippy"]);
+        builder.ensure(CargoClippy::from_compilers(compilers));
     }
     if extended_rustc_tool_is_default_step(builder, "clippy-driver", true) {
-        let extra_features = tippy_driver_features(builder, target);
-        let tool = builder.ensure(ToolBuild {
-            build_compiler: compilers.build_compiler,
-            output_compiler: target_compiler,
-            target,
-            tool: "clippy-driver",
-            mode: Mode::ToolRustcPrivate,
-            path: "src/tools/tippy",
-            source_type: SourceType::InTree,
-            extra_features,
-            allow_features: "",
-            cargo_args: owned_cargo_args(CLIPPY_DRIVER_CARGO_ARGS),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        install_private_bins(builder, &tool.tool_path, &["tippy-driver"]);
+        builder.ensure(Clippy::from_compilers(compilers));
     }
     if extended_rustc_tool_is_default_step(builder, "cargo-fmt", true) {
-        let tool = builder.ensure(ToolBuild {
-            build_compiler: compilers.build_compiler,
-            output_compiler: target_compiler,
-            target,
-            tool: "cargo-fmt",
-            mode: Mode::ToolRustcPrivate,
-            path: "src/tools/trustfmt",
-            source_type: SourceType::InTree,
-            extra_features: Vec::new(),
-            allow_features: "",
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        install_private_bins(builder, &tool.tool_path, &["targo-fmt"]);
+        builder.ensure(Cargofmt::from_compilers(compilers));
     }
     if extended_rustc_tool_is_default_step(builder, "rustfmt", true) {
-        let tool = builder.ensure(ToolBuild {
-            build_compiler: compilers.build_compiler,
-            output_compiler: target_compiler,
-            target,
-            tool: "rustfmt",
-            mode: Mode::ToolRustcPrivate,
-            path: "src/tools/trustfmt",
-            source_type: SourceType::InTree,
-            extra_features: Vec::new(),
-            allow_features: "",
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        install_private_bins(builder, &tool.tool_path, &["trustfmt"]);
+        builder.ensure(Rustfmt::from_compilers(compilers));
     }
     if tool_enabled_for_tool_settings(
         builder.config.extended,
         builder.config.tools.as_ref(),
         "trust-analyzer",
     ) {
-        let tool = builder.ensure(ToolBuild {
-            build_compiler: compilers.build_compiler,
-            output_compiler: target_compiler,
-            target,
-            tool: "rust-analyzer",
-            mode: Mode::ToolRustcPrivate,
-            path: "src/tools/rust-analyzer",
-            source_type: SourceType::InTree,
-            extra_features: vec!["in-rust-tree".to_owned()],
-            allow_features: RustAnalyzer::ALLOW_FEATURES,
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        install_private_bins(builder, &tool.tool_path, &["trust-analyzer"]);
+        builder.ensure(RustAnalyzer::from_compilers(compilers));
     }
     if restore_rust_analyzer_proc_macro_srv(builder) {
-        let tool = builder.ensure(ToolBuild {
-            build_compiler: compilers.build_compiler,
-            output_compiler: target_compiler,
-            target,
-            tool: "rust-analyzer-proc-macro-srv",
-            mode: Mode::ToolRustcPrivate,
-            path: "src/tools/rust-analyzer/crates/proc-macro-srv-cli",
-            source_type: SourceType::InTree,
-            extra_features: vec!["in-rust-tree".to_owned()],
-            allow_features: RustAnalyzer::ALLOW_FEATURES,
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        let libexec = sysroot.join("libexec");
-        t!(fs::create_dir_all(&libexec));
-        let installed = libexec.join(exe("trust-analyzer-proc-macro-srv", target_compiler.host));
-        builder.copy_link(&tool.tool_path, &installed, FileType::Executable);
-        validate_installed_rustc_private_tool(builder, target_compiler, &installed);
+        builder.ensure(RustAnalyzerProcMacroSrv::from_compilers(compilers));
     }
     if extended_rustc_tool_is_default_step(builder, "miri", false) {
-        let mut extra_features = Vec::new();
-        if builder.config.jemalloc(target) {
-            extra_features.push("jemalloc".to_string());
-        }
-        let tool = builder.ensure(ToolBuild {
-            build_compiler: compilers.build_compiler,
-            output_compiler: target_compiler,
-            target,
-            tool: "miri",
-            mode: Mode::ToolRustcPrivate,
-            path: "src/tools/miri",
-            source_type: SourceType::InTree,
-            extra_features,
-            allow_features: "",
-            cargo_args: vec!["--all-targets".to_string()],
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        install_private_bins(builder, &tool.tool_path, &["trust-miri"]);
+        builder.ensure(Miri::from_compilers(compilers));
     }
     if extended_rustc_tool_is_default_step(builder, "cargo-miri", false) {
-        let tool = builder.ensure(ToolBuild {
-            build_compiler: compilers.build_compiler,
-            output_compiler: target_compiler,
-            target,
-            tool: "cargo-miri",
-            mode: Mode::ToolRustcPrivate,
-            path: "src/tools/miri/cargo-miri",
-            source_type: SourceType::InTree,
-            extra_features: Vec::new(),
-            allow_features: "",
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-        install_private_bins(builder, &tool.tool_path, &["targo-miri"]);
+        builder.ensure(CargoMiri::from_compilers(compilers));
     }
 
     // Enforce the Trust-only public libexec surface at the very end of local
@@ -1397,6 +1818,208 @@ pub(crate) fn should_restore_user_facing_tools(compiler_stage: u32) -> bool {
 
 pub(crate) fn should_ensure_default_verifier_tool_bins(kind: Kind, compiler_stage: u32) -> bool {
     compiler_stage > 0 && kind == Kind::Build
+}
+
+// Trust: only the audited internal Stage1 of a native, LLVM-default Stage2
+// build is eligible. Unknown configuration keeps the existing batteries-on
+// graph. This is scheduling, never permission to change compiler verification.
+fn should_defer_intermediate_verifier_tool_bins(
+    builder: &Builder<'_>,
+    compiler: Compiler,
+    ambient: impl IntoIterator<Item = (OsString, OsString)>,
+) -> bool {
+    !builder.config.local_rebuild
+        && intermediate_verifier_tool_scheduling_known(builder, compiler, ambient)
+}
+
+fn intermediate_verifier_tool_scheduling_known(
+    builder: &Builder<'_>,
+    compiler: Compiler,
+    ambient: impl IntoIterator<Item = (OsString, OsString)>,
+) -> bool {
+    use crate::core::backend::CodegenBackendKind::{Llvm, TrustCg};
+    let config = &builder.config;
+    let native = helpers::get_host_target();
+    if builder.kind != Kind::Build
+        || builder.top_stage != 2
+        || compiler.stage != 1
+        || compiler.host != native
+        || config.host_target != native
+        || config.hosts != [native]
+        || !intermediate_tool_std_targets_known(builder, native)
+        || config.full_bootstrap
+        || config.download_rustc()
+        || !config.keep_stage.is_empty()
+        || !config.keep_stage_std.is_empty()
+        || config.external_rustc.is_some()
+        || config.external_cargo.is_some()
+        || config.external_rustdoc.is_some()
+        || !config.tool.is_empty()
+        || !config.free_args.is_empty()
+        || !config.skip.is_empty()
+        || !config.rust_rustflags.is_empty()
+        || config.target_config.values().any(|target| !target.rustflags.is_empty())
+        || !matches!(config.enabled_codegen_backends(native), [Llvm] | [Llvm, TrustCg])
+        || builder
+            .paths
+            .iter()
+            .any(|path| path != Path::new("compiler/rustc") && path != Path::new("library/std"))
+    {
+        return false;
+    }
+    let ambient: Vec<_> = ambient.into_iter().collect();
+    // Require the existing announced native bootstrap posture. Neither an
+    // arbitrary flag string nor a per-library verification request qualifies.
+    if !ambient.iter().any(|(key, value)| {
+        (key == "RUSTFLAGS_BOOTSTRAP" && value == "-Ztrust-verify=off")
+            || (key == "TRUST_NO_VERIFY" && value == "1")
+    }) || ambient.iter().any(|(key, value)| intermediate_tool_ambient_override(key, value))
+    {
+        return false;
+    }
+    let cargo_home = ambient
+        .iter()
+        .find(|(key, _)| key == "CARGO_HOME")
+        .map(|(_, value)| PathBuf::from(value))
+        .or_else(|| {
+            ambient
+                .iter()
+                .find(|(key, _)| key == "HOME")
+                .map(|(_, value)| PathBuf::from(value).join(".cargo"))
+        });
+    cargo_home.is_some_and(|home| intermediate_tool_cargo_configuration_known(&config.src, &home))
+}
+
+// Trust: the compiler still has one native host. The canonical Apple SDK adds
+// only the other builtin Apple architecture's std; neither target uses a verifier
+// CLI under the already-required, announced LLVM bootstrap policy. Keep unknown
+// target specifications/backends on the eager graph, and retain every final tool.
+fn intermediate_tool_std_targets_known(builder: &Builder<'_>, native: TargetSelection) -> bool {
+    use crate::core::backend::CodegenBackendKind::{Llvm, TrustCg};
+    let config = &builder.config;
+    if config.targets == [native] {
+        return true;
+    }
+    config.targets.len() == 2
+        && config.targets.contains(&native)
+        && native.file.is_none()
+        && !native.synthetic
+        && matches!(&*native.triple, "aarch64-apple-darwin" | "x86_64-apple-darwin")
+        && config.targets.iter().all(|target| {
+            target.file.is_none()
+                && !target.synthetic
+                && matches!(&*target.triple, "aarch64-apple-darwin" | "x86_64-apple-darwin")
+                && matches!(config.enabled_codegen_backends(*target), [Llvm] | [Llvm, TrustCg])
+        })
+        && config.targets[0] != config.targets[1]
+}
+
+// Trust: accept only the preexisting native transport and scheduling/diagnostic
+// state; do not parse arbitrary flags or infer an effective backend from TOML
+// while inherited flags, wrappers or untracked verifier controls can override it.
+fn intermediate_tool_ambient_override(key: &OsStr, value: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return true;
+    };
+    match key {
+        "RUSTFLAGS_BOOTSTRAP" => value != "-Ztrust-verify=off",
+        "TRUST_NO_VERIFY"
+        | "RUSTC_BOOTSTRAP"
+        | "TRUST_VANILLA_ANNOUNCED"
+        | "TRUST_BOOTSTRAP_OFFLINE_CLOSURE" => value != "1",
+        "TRUST_BUILD_LOCK_TOKEN" | "TRUST_BUILD_LOCK_WAIT" | "TRUST_REPO" => false,
+        _ => {
+            key.contains("RUSTFLAGS")
+                || key.contains("RUSTDOCFLAGS")
+                || key.contains("CODEGEN_BACKEND")
+                || key.starts_with("CARGO_UNSTABLE_")
+                || key.starts_with("RUSTC")
+                || (key.starts_with("CARGO_") && key.contains("RUSTC"))
+                || key.starts_with("TRUST_")
+                || key == "TRUSTFLAGS"
+                || key.starts_with("TCG_")
+                || key.starts_with("TOOLCHAIN_AY_")
+                || key.starts_with("AY_")
+                || key.starts_with("CLEAN_")
+                || key.starts_with("LEAN_")
+                || key.starts_with("TY_")
+        }
+    }
+}
+
+// Trust: Cargo can inject wrappers or flags from files as well as env. Match
+// the recreator's empty-home/no-ancestor-config posture. At the source root,
+// accept only the current non-compiler jobs/net settings and a string target-dir.
+// Bootstrap overrides target-dir through CARGO_TARGET_DIR for every tool build;
+// it cannot change the selected compiler or verification policy. Unknown tables,
+// legacy config, malformed/unreadable files and dangling links keep the old graph.
+fn intermediate_tool_cargo_configuration_known(src: &Path, cargo_home: &Path) -> bool {
+    let absent = |path: &Path| matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound);
+    if !cargo_home.is_absolute()
+        || [cargo_home.join("config"), cargo_home.join("config.toml")]
+            .iter()
+            .any(|path| !absent(path))
+        || src.ancestors().skip(1).any(|parent| {
+            ["config", "config.toml"].iter().any(|name| !absent(&parent.join(".cargo").join(name)))
+        })
+        || !absent(&src.join(".cargo/config"))
+    {
+        return false;
+    }
+    let path = src.join(".cargo/config.toml");
+    if absent(&path) {
+        return true;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(document) = text.parse::<toml::Value>() else {
+        return false;
+    };
+    document.as_table().is_some_and(|table| {
+        table.iter().all(|(key, value)| match key.as_str() {
+            "net" => value.is_table(),
+            "build" => value.as_table().is_some_and(|build| {
+                build.iter().all(|(key, value)| match key.as_str() {
+                    "jobs" => true,
+                    "target-dir" => value.is_str(),
+                    _ => false,
+                })
+            }),
+            _ => false,
+        })
+    })
+}
+
+// Trust: share the actual Rustdoc step's registered source aliases with the
+// partial-source selector so either spelling builds the same dependency graph.
+const RUSTDOC_SOURCE_PATHS: &[&str] = &["src/tools/trustdoc", "src/librustdoc"];
+
+/// Trust: an exact stage1 source request builds only those requested targets
+/// and their real dependencies. In particular Rustc::run still installs the
+/// exact AY whose bytes the compiler records. This is not a complete SDK build:
+/// default/full, mixed or unknown selections and every stage2+ invocation keep
+/// the existing batteries-on assembly graph.
+pub(crate) fn is_partial_stage1_source_build(
+    kind: Kind,
+    compiler_stage: u32,
+    top_stage: u32,
+    include_default_paths: bool,
+    paths: &[PathBuf],
+) -> bool {
+    kind == Kind::Build
+        && compiler_stage == 1
+        && top_stage == 1
+        && !include_default_paths
+        && !paths.is_empty()
+        && paths.iter().all(|path| {
+            path.to_str().is_some_and(|path| {
+                matches!(
+                    path,
+                    "compiler" | "compiler/rustc" | "library" | "library/std" | "src/tools/targo"
+                ) || RUSTDOC_SOURCE_PATHS.contains(&path)
+            })
+        })
 }
 
 fn should_assemble_user_facing_tools(kind: Kind, compiler_stage: u32) -> bool {
@@ -1429,8 +2052,9 @@ macro_rules! bootstrap_tool {
         ;
     )+) => {
         #[derive(PartialEq, Eq, Clone)]
-        pub enum Tool {
+        pub(crate) enum Tool {
             $(
+                #[allow(dead_code, reason = "not all bootstrap-tools need a variant")]
                 $name,
             )+
         }
@@ -1439,13 +2063,20 @@ macro_rules! bootstrap_tool {
             /// Ensure a tool is built, then get the path to its executable.
             ///
             /// The actual building, if any, will be handled via [`ToolBuild`].
-            pub fn tool_exe(&self, tool: Tool) -> PathBuf {
+            pub(crate) fn tool_exe(&self, tool: Tool) -> PathBuf {
+                self.tool(tool).tool_path
+            }
+
+            /// Ensure a tool is built, then return its build output.
+            ///
+            /// The actual building, if any, will be handled via [`ToolBuild`].
+            pub(crate) fn tool(&self, tool: Tool) -> ToolBuildResult {
                 match tool {
                     $(Tool::$name =>
                         self.ensure($name {
                             compiler: self.compiler(0, self.config.host_target),
                             target: self.config.host_target,
-                        }).tool_path,
+                        }),
                     )+
                 }
             }
@@ -1458,7 +2089,7 @@ macro_rules! bootstrap_tool {
             pub target: TargetSelection,
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ToolBuildResult;
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -1518,6 +2149,39 @@ macro_rules! bootstrap_tool {
     }
 }
 
+// Trust: the compiletest library now carries the native query transport even when
+// consumed only for rustdoc GUI properties. Keep its FD API permission scoped
+// to these two consumers; the ordinary stable tool sandbox stays unchanged.
+pub(super) const COMPILETEST_ALLOW_FEATURES: &str = "trust_process_inherit_fds";
+
+// Trust: compiletest's own library test target also enables the native unit-entry
+// runner (lib.rs's `#![cfg_attr(test, feature(...))]`). Its test build and its
+// `--all-targets` check both compile that target, so both allow exactly this set
+// (COMPILETEST-CHECK-INHERIT-FDS-1).
+pub(super) const COMPILETEST_SELF_ALLOW_FEATURES: &str =
+    "trust_process_inherit_fds,test,custom_test_frameworks,exitcode_exit_method";
+
+pub(super) fn prepare_compiletest_test_cargo(
+    builder: &Builder<'_>,
+    compiler: Compiler,
+    target: TargetSelection,
+) -> CargoCommand {
+    let mut cargo = prepare_tool_cargo(
+        builder,
+        compiler,
+        Mode::ToolBootstrap,
+        target,
+        Kind::Test,
+        "src/tools/compiletest",
+        SourceType::InTree,
+        &[],
+    );
+    // Trust: native unit entry must capture before libtest opens descriptors; its three
+    // runner features preserve libtest's real ExitCode beside the transport's one.
+    cargo.allow_features(COMPILETEST_SELF_ALLOW_FEATURES);
+    cargo
+}
+
 bootstrap_tool!(
     // This is marked as an external tool because it includes dependencies
     // from submodules. Trying to keep the lints in sync between all the repos
@@ -1528,7 +2192,7 @@ bootstrap_tool!(
     Tidy, "src/tools/tidy", "tidy";
     Linkchecker, "src/tools/linkchecker", "linkchecker";
     CargoTest, "src/tools/cargotest", "cargotest";
-    Compiletest, "src/tools/compiletest", "compiletest";
+    Compiletest, "src/tools/compiletest", "compiletest", allow_features = COMPILETEST_ALLOW_FEATURES;
     RemoteTestClient, "src/tools/remote-test-client", "remote-test-client";
     RustInstaller, "src/tools/rust-installer", "rust-installer";
     RustdocTheme, "src/tools/rustdoc-themes", "rustdoc-themes";
@@ -1541,7 +2205,7 @@ bootstrap_tool!(
     CollectLicenseMetadata, "src/tools/collect-license-metadata", "collect-license-metadata";
     GenerateCopyright, "src/tools/generate-copyright", "generate-copyright";
     GenerateWindowsSys, "src/tools/generate-windows-sys", "generate-windows-sys";
-    RustdocGUITest, "src/tools/rustdoc-gui-test", "rustdoc-gui-test";
+    RustdocGUITest, "src/tools/rustdoc-gui-test", "rustdoc-gui-test", allow_features = COMPILETEST_ALLOW_FEATURES;
     CoverageDump, "src/tools/coverage-dump", "coverage-dump";
     UnicodeTableGenerator, "src/tools/unicode-table-generator", "unicode-table-generator";
     FeaturesStatusDump, "src/tools/features-status-dump", "features-status-dump";
@@ -1572,7 +2236,7 @@ impl ErrorIndex {
     }
 }
 
-impl Step for ErrorIndex {
+impl CommandLineStep for ErrorIndex {
     type Output = ToolBuildResult;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -1624,7 +2288,7 @@ pub struct RemoteTestServer {
     pub target: TargetSelection,
 }
 
-impl Step for RemoteTestServer {
+impl CommandLineStep for RemoteTestServer {
     type Output = ToolBuildResult;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -1694,14 +2358,14 @@ fn rustdoc_sysroot_bins(
     }
 }
 
-impl Step for Rustdoc {
+impl CommandLineStep for Rustdoc {
     /// Path to the built rustdoc binary.
     type Output = PathBuf;
 
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.selectors(&["src/tools/trustdoc", "src/librustdoc"])
+        run.multi_path(RUSTDOC_SOURCE_PATHS)
     }
 
     fn is_default_step(_builder: &Builder<'_>) -> bool {
@@ -1775,10 +2439,9 @@ impl Step for Rustdoc {
         // they'll be linked to those libraries). As such, don't explicitly `ensure` any additional
         // libraries here. The intuition here is that If we've built a compiler, we should be able
         // to build rustdoc.
-        //
         let mut extra_features = Vec::new();
-        if builder.config.jemalloc(target) {
-            extra_features.push("jemalloc".to_string());
+        if !builder.config.rust_debug_logging {
+            extra_features.push("max_level_info".to_string())
         }
 
         let compilers = RustcPrivateCompilers::from_target_compiler(builder, target_compiler);
@@ -1790,6 +2453,9 @@ impl Step for Rustdoc {
                 // Cargo adds a number of paths to the dylib search path on windows, which results in
                 // the wrong rustdoc being executed. To avoid the conflicting rustdocs, we name the "tool"
                 // rustdoc a different name.
+                // Trust: the trustdoc tool binary keeps its underscore name
+                // (src/tools/trustdoc/Cargo.toml); upstream renamed theirs to
+                // hyphens in 1.101.
                 tool: "rustdoc_tool_binary",
                 mode: Mode::ToolRustcPrivate,
                 path: "src/tools/trustdoc",
@@ -1826,7 +2492,144 @@ impl Step for Rustdoc {
     }
 }
 
-/// Builds the cargo tool.
+/// Trust: the one build recipe for the Trust Cargo, shared by the standalone
+/// `Cargo` step, the batteries-on verifier frontend and the user-facing sysroot
+/// tools so they cannot drift apart (they are the same `ToolBuild` step).
+///
+/// The Trust Cargo's package, library crate and only binary are all named
+/// `targo` (src/tools/targo/Cargo.toml), so the build compiles `--crate-name
+/// targo` and the artifact in `cargo_out` and in the stage's tools directory is
+/// the file `targo`. Sysroot restoration installs exactly that artifact as
+/// `bin/targo` and, as the one compatibility alias, `bin/cargo`
+/// (`restored_sysroot_bins_for_tool_settings`,
+/// `upstream_compat_bin_for_tool_source`). Until 2026-09-29 all three were named
+/// `cargo`, and restoration copied whatever tools-directory file carried that
+/// name to `bin/targo`, so a stale `cargo` file there could reach the sysroot
+/// under the Trust name. The artifact name is spelled as a literal here and in
+/// those two functions because `tools/preflight.py` and
+/// `scripts/recreate_bootstrap.py` read it textually;
+/// `trust_cargo_is_built_restored_and_aliased_under_targo` pins the three
+/// spellings together.
+fn targo_tool_build_recipe(
+    build_compiler: Compiler,
+    output_compiler: Compiler,
+    target: TargetSelection,
+) -> ToolBuild {
+    ToolBuild {
+        build_compiler,
+        output_compiler,
+        target,
+        tool: "targo",
+        mode: Mode::ToolTarget,
+        path: "src/tools/targo",
+        source_type: SourceType::Submodule,
+        extra_features: Vec::new(),
+        allow_features: TARGO_ALLOW_FEATURES,
+        cargo_args: Vec::new(),
+        artifact_kind: ToolArtifactKind::Binary,
+    }
+}
+
+// Native Targo's job service uses the same proof-session, certification and
+// discharge implementations as the verifier tools. Its build and self-test
+// recipes share the verifier runtime's exact allowances.
+pub(super) const TARGO_ALLOW_FEATURES: &str = CARGO_TRUST_ALLOW_FEATURES;
+
+// Trust: build an engineering Cargo input without assembling a next-stage SDK.
+// Keep the ordinary Cargo build/test steps below responsible for SDK installation.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TargoBuildTool {
+    target: TargetSelection,
+}
+
+// Trust: cache capabilities with this built artifact, never the seed's answer.
+#[derive(Clone)]
+pub(crate) struct TargoBuildToolResult {
+    // Trust: only bootstrap's assertions inspect the full artifact descriptor.
+    #[cfg(test)]
+    pub(crate) artifact: ToolBuildResult,
+    pub(crate) cargo: CargoProgram,
+    // Trust: retain the original produced spelling; probe it only if selected.
+    pub(crate) native_path: PathBuf,
+}
+
+impl TargoBuildTool {
+    pub(crate) fn native(builder: &Builder<'_>) -> Self {
+        Self { target: builder.host_target }
+    }
+}
+
+impl CommandLineStep for TargoBuildTool {
+    type Output = TargoBuildToolResult;
+    const IS_HOST: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("targo-build-tool")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        // Explicit engineering production requires identity. Internal SDK builds
+        // retain their existing omit-git-hash/source-tarball policy.
+        run.builder
+            .version_info()
+            .sha()
+            .expect("targo-build-tool requires source identity; do not omit git hash");
+        run.builder.ensure(Self { target: run.target });
+    }
+
+    fn run(self, builder: &Builder<'_>) -> TargoBuildToolResult {
+        assert_eq!(
+            self.target, builder.host_target,
+            "targo-build-tool only supports the native build host"
+        );
+        builder.sess.require_submodule("src/tools/targo", None);
+        let compiler = builder.compiler(0, builder.host_target);
+        // The output descriptor is also stage0: ToolBuild copies into tools-bin,
+        // never the downloaded seed or a stage1 sysroot, and needs no host SDK.
+        let result = builder.ensure(targo_tool_build_recipe(compiler, compiler, self.target));
+        let cargo_alias =
+            copy_targo_build_tool_alias(&result.tool_path, self.target, |src, dst| {
+                builder.copy_link(src, dst, FileType::Executable);
+            });
+        let cargo = CargoProgram::probe(builder.config.exec_ctx(), cargo_alias);
+        assert!(!cargo.unverified_lane, "the built cargo alias must retain Cargo compatibility");
+        // Trust: compatibility-only builds need no native capability probe.
+        let native_path = result.tool_path.clone();
+        builder.info(&format!(
+            "Engineering build-tool artifact: {} (cargo: {}; metadata: {}; compiler: stage0 {}; release: {}; source: {}). \
+             This is not SDK, seed, or proof qualification.",
+            result.tool_path.display(),
+            cargo.path.display(),
+            cargo.metadata_flag,
+            builder.initial_rustc.display(),
+            builder.rust_release(),
+            builder.version_info().sha().unwrap_or("omitted or unavailable"),
+        ));
+        TargoBuildToolResult {
+            #[cfg(test)]
+            artifact: result,
+            cargo,
+            native_path,
+        }
+    }
+}
+
+// Trust: keep both invocation names byte-identical without installing a sysroot.
+fn copy_targo_build_tool_alias(
+    artifact: &Path,
+    target: TargetSelection,
+    copy: impl FnOnce(&Path, &Path),
+) -> PathBuf {
+    let alias = artifact.with_file_name(exe("cargo", target));
+    copy(artifact, &alias);
+    alias
+}
+
+/// Builds the Trust Cargo, `targo` (the tool historically called cargo).
 /// Note that it can be built using a stable compiler.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Cargo {
@@ -1842,7 +2645,7 @@ impl Cargo {
     }
 }
 
-impl Step for Cargo {
+impl CommandLineStep for Cargo {
     type Output = ToolBuildResult;
     const IS_HOST: bool = true;
 
@@ -1865,38 +2668,151 @@ impl Step for Cargo {
     }
 
     fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
-        builder.build.require_submodule("src/tools/targo", None);
+        builder.sess.require_submodule("src/tools/targo", None);
 
         builder.std(self.build_compiler, builder.host_target);
         builder.std(self.build_compiler, self.target);
 
         let target_compiler = builder.compiler(self.build_compiler.stage + 1, self.target);
-        let tool_result = builder.ensure(ToolBuild {
-            build_compiler: self.build_compiler,
-            output_compiler: target_compiler,
-            target: self.target,
-            tool: "cargo",
-            mode: Mode::ToolTarget,
-            path: "src/tools/targo",
-            source_type: SourceType::Submodule,
-            extra_features: Vec::new(),
-            // Cargo is compilable with a stable compiler, but since we run in bootstrap,
-            // with RUSTC_BOOTSTRAP being set, some "clever" build scripts enable specialization
-            // based on this, which breaks stuff. We thus have to explicitly allow these features
-            // here.
-            allow_features: "min_specialization,specialization",
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
+        let tool_result = builder.ensure(targo_tool_build_recipe(
+            self.build_compiler,
+            target_compiler,
+            self.target,
+        ));
 
-        let tool_path =
-            copy_bins_to_sysroot(builder, target_compiler, &tool_result.tool_path, &["targo"]);
+        // Trust: with its `cargo` alias (`sysroot_bin_names_for_tool_source`);
+        // the returned path is still the first name, `targo`.
+        let tool_path = copy_bins_to_sysroot(
+            builder,
+            target_compiler,
+            &tool_result.tool_path,
+            &sysroot_bin_names_for_tool_source("targo"),
+        );
 
-        ToolBuildResult { tool_path, build_compiler: tool_result.build_compiler }
+        ToolBuildResult {
+            tool_path,
+            build_compiler: tool_result.build_compiler,
+            artifacts: tool_result.artifacts,
+        }
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
         Some(StepMetadata::build("targo", self.target).built_by(self.build_compiler))
+    }
+}
+
+/// Builds the selected toolchain frontend in a local stage1 build as well as
+/// later stages. The broad sysroot assembly intentionally starts at stage2;
+/// this standalone step is the stage1/default and explicit-path owner.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct Trustup {
+    build_compiler: Compiler,
+    target: TargetSelection,
+}
+
+fn trustup_tool_build_recipe(
+    build_compiler: Compiler,
+    output_compiler: Compiler,
+    target: TargetSelection,
+) -> ToolBuild {
+    ToolBuild {
+        build_compiler,
+        output_compiler,
+        target,
+        tool: "trustup",
+        mode: Mode::ToolTarget,
+        path: "src/tools/trustup",
+        source_type: SourceType::InTree,
+        extra_features: Vec::new(),
+        allow_features: "",
+        cargo_args: Vec::new(),
+        artifact_kind: ToolArtifactKind::Binary,
+    }
+}
+
+/// Produces the same native Trustup recipe without assembling or installing an SDK.
+/// Engineering continuations bind the returned bytes and own any later delivery.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TrustupBuildTool {
+    target: TargetSelection,
+}
+
+impl CommandLineStep for TrustupBuildTool {
+    type Output = ToolBuildResult;
+    const IS_HOST: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("trustup-build-tool")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder
+            .version_info()
+            .sha()
+            .expect("trustup-build-tool requires source identity; do not omit git hash");
+        run.builder.ensure(Self { target: run.target });
+    }
+
+    fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
+        assert_eq!(
+            self.target, builder.host_target,
+            "trustup-build-tool only supports the native build host"
+        );
+        let compiler = builder.compiler(0, builder.host_target);
+        // ToolTarget uses the actual snapshot's native std and the current
+        // source-built Cargo. output0 writes tools-bin, never stage1 or the seed.
+        let result = builder.ensure(trustup_tool_build_recipe(compiler, compiler, self.target));
+        builder.info(&format!(
+            "Engineering Trustup artifact: {} (source: {}). This is not SDK, seed, or proof qualification.",
+            result.tool_path.display(),
+            builder.version_info().sha().unwrap_or("omitted or unavailable"),
+        ));
+        result
+    }
+}
+
+impl CommandLineStep for Trustup {
+    type Output = ToolBuildResult;
+    const IS_HOST: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.path("src/tools/trustup")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.tool_enabled("trustup")
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(Trustup {
+            build_compiler: get_tool_target_compiler(
+                run.builder,
+                ToolTargetBuildMode::Build(run.target),
+            ),
+            target: run.target,
+        });
+    }
+
+    fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
+        builder.std(self.build_compiler, builder.host_target);
+        builder.std(self.build_compiler, self.target);
+        let target_compiler = builder.compiler(self.build_compiler.stage + 1, self.target);
+        let result = builder.ensure(trustup_tool_build_recipe(
+            self.build_compiler,
+            target_compiler,
+            self.target,
+        ));
+        let tool_path =
+            copy_bins_to_sysroot(builder, target_compiler, &result.tool_path, &["trustup"]);
+        ToolBuildResult { tool_path, ..result }
+    }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(StepMetadata::build("trustup", self.target).built_by(self.build_compiler))
     }
 }
 
@@ -1905,6 +2821,27 @@ impl Step for Cargo {
 pub struct TCargoTrust {
     build_compiler: Compiler,
     target: TargetSelection,
+}
+
+// Trust: share the unchanged frontend recipe between SDK and artifact producers.
+fn targo_trust_tool_build_recipe(
+    build_compiler: Compiler,
+    output_compiler: Compiler,
+    target: TargetSelection,
+) -> ToolBuild {
+    ToolBuild {
+        build_compiler,
+        output_compiler,
+        target,
+        tool: "targo-trust",
+        mode: Mode::ToolTarget,
+        path: "targo-trust",
+        source_type: SourceType::InTree,
+        extra_features: targo_trust_in_process_features(),
+        allow_features: CARGO_TRUST_ALLOW_FEATURES,
+        cargo_args: locked_cargo_args(&[]),
+        artifact_kind: ToolArtifactKind::Binary,
+    }
 }
 
 pub(super) fn targo_trust_in_process_features() -> Vec<String> {
@@ -1934,6 +2871,9 @@ pub(super) fn targo_trust_in_process_features() -> Vec<String> {
 // `try_trait_v2_residual` joined in the 1.99 migration: the newer `Try` trait
 // requires `type Residual: Residual<Self::Output>`, so `Discharge` now also
 // implements `std::ops::Residual`.
+// Trust: `allocator_api` is required by ay-sat's fallible Box::try_new through
+// the proof-runtime closure shared by the native job service and verifier
+// tools. Generic tool defaults keep their own restrictions.
 // This list is a LIABILITY, not a convenience: every entry is an unstable
 // feature the compiler's own build graph is then permitted to depend on.
 // `variant_count` was briefly added here for `crates/trust-machine-sem` (which
@@ -1960,7 +2900,7 @@ pub(super) fn targo_trust_in_process_features() -> Vec<String> {
 //   * targo-trust (5 of the 6 sites; `Kind::Test` at test.rs includes dev-deps):
 //     curve25519-dalek is absent entirely, and NO package's Rust source gates on
 //     `stdarch_x86_avx512`.
-//   * trustd from `crates/trust-router` (a `--bin` build, so no dev-deps):
+//   * the former trustd build from `crates/trust-router` (a `--bin` build, so no dev-deps):
 //     curve25519-dalek is absent; the only two sources mentioning the feature are
 //     `rand` (needs `feature = "simd_support"` AND `target_feature = "avx512bw"`;
 //     resolved features are alloc/default/os_rng/small_rng/std/std_rng/thread_rng
@@ -1972,8 +2912,9 @@ pub(super) fn targo_trust_in_process_features() -> Vec<String> {
 // an x86_64 host ever fails on a missing `stdarch_x86_avx512`, the cause is a NEW
 // edge into curve25519-dalek (or `simd_support` being switched on), and the fix is
 // to remove that edge rather than to re-add the allowance.
-pub(super) const CARGO_TRUST_ALLOW_FEATURES: &str =
-    "min_specialization,specialization,try_trait_v2,try_trait_v2_residual";
+// The frontend's native member client needs the same child-only descriptor API
+// as Targo. This shared runtime recipe also governs trustd and their self-tests.
+pub(super) const CARGO_TRUST_ALLOW_FEATURES: &str = "min_specialization,specialization,try_trait_v2,try_trait_v2_residual,allocator_api,trust_process_inherit_fds";
 
 fn trustd_cargo_args() -> Vec<String> {
     locked_cargo_args(&["--bin", "trustd"])
@@ -1990,7 +2931,7 @@ fn trustd_tool_build_recipe(
         target,
         tool: "trustd",
         mode: Mode::ToolTarget,
-        path: "crates/trust-router",
+        path: "crates/trust-coordinator",
         source_type: SourceType::InTree,
         extra_features: Vec::new(),
         allow_features: CARGO_TRUST_ALLOW_FEATURES,
@@ -2027,15 +2968,6 @@ impl Trustd {
 
 impl Step for Trustd {
     type Output = ToolBuildResult;
-    const IS_HOST: bool = true;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
-
-    fn is_default_step(_builder: &Builder<'_>) -> bool {
-        false
-    }
 
     fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
         builder.std(self.build_compiler, builder.host_target);
@@ -2047,7 +2979,11 @@ impl Step for Trustd {
         let tool_path =
             copy_bins_to_sysroot(builder, target_compiler, &tool_result.tool_path, &["trustd"]);
 
-        ToolBuildResult { tool_path, build_compiler: tool_result.build_compiler }
+        ToolBuildResult {
+            tool_path,
+            build_compiler: tool_result.build_compiler,
+            artifacts: tool_result.artifacts,
+        }
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
@@ -2062,19 +2998,10 @@ impl TCargoTrust {
         Self { build_compiler, target }
     }
 
-    /// Returns `TCargoTrust` that should be **used** by the passed compiler.
-    pub fn from_target_compiler(builder: &Builder<'_>, target_compiler: Compiler) -> Self {
-        Self {
-            build_compiler: get_tool_target_compiler(
-                builder,
-                ToolTargetBuildMode::Dist(target_compiler),
-            ),
-            target: target_compiler.host,
-        }
-    }
+    // Trust: retain the active build-compiler constructor; no caller needs a target adapter.
 }
 
-impl Step for TCargoTrust {
+impl CommandLineStep for TCargoTrust {
     type Output = ToolBuildResult;
     const IS_HOST: bool = true;
 
@@ -2101,19 +3028,11 @@ impl Step for TCargoTrust {
         builder.std(self.build_compiler, self.target);
 
         let target_compiler = builder.compiler(self.build_compiler.stage + 1, self.target);
-        let tool_result = builder.ensure(ToolBuild {
-            build_compiler: self.build_compiler,
-            output_compiler: target_compiler,
-            target: self.target,
-            tool: "targo-trust",
-            mode: Mode::ToolTarget,
-            path: "targo-trust",
-            source_type: SourceType::InTree,
-            extra_features: targo_trust_in_process_features(),
-            allow_features: CARGO_TRUST_ALLOW_FEATURES,
-            cargo_args: locked_cargo_args(&[]),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
+        let tool_result = builder.ensure(targo_trust_tool_build_recipe(
+            self.build_compiler,
+            target_compiler,
+            self.target,
+        ));
 
         // Keep the runtime daemon coupled to the public frontend at the build
         // graph boundary.  Dist/install reuse this cached step and package both
@@ -2127,11 +3046,141 @@ impl Step for TCargoTrust {
             &["targo-trust"],
         );
 
-        ToolBuildResult { tool_path, build_compiler: tool_result.build_compiler }
+        ToolBuildResult {
+            tool_path,
+            build_compiler: tool_result.build_compiler,
+            artifacts: tool_result.artifacts,
+        }
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
         Some(StepMetadata::build("targo-trust", self.target).built_by(self.build_compiler))
+    }
+}
+
+/// Trust: build a native frontend artifact without assembling or changing an SDK.
+/// The ordinary `TCargoTrust` step remains the owner of SDK/daemon delivery.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TCargoTrustBuildTool {
+    target: TargetSelection,
+}
+
+impl CommandLineStep for TCargoTrustBuildTool {
+    type Output = ToolBuildResult;
+    const IS_HOST: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("targo-trust-build-tool")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder
+            .version_info()
+            .sha()
+            .expect("targo-trust-build-tool requires source identity; do not omit git hash");
+        run.builder.ensure(Self { target: run.target });
+    }
+
+    fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
+        assert_eq!(
+            self.target, builder.host_target,
+            "targo-trust-build-tool only supports the native build host"
+        );
+        // The component origin is observed under the same normal build owner;
+        // neither a version label nor this source-only key authorizes a runtime.
+        let inputs = if builder.config.dry_run() {
+            None
+        } else {
+            let fresh = ExecutionContext::new(builder.config.exec_ctx().verbosity, false);
+            let head = builder.rust_info().info().expect("frontend source must be Git-backed");
+            let config = trust_source_identity::config_digest(
+                builder.config.config.as_deref(),
+                &builder.src,
+            );
+            let full = trust_source_identity::of_sources(&fresh, &builder.src, &config, head)
+                .unwrap_or_else(|error| panic!("cannot capture frontend source inputs: {error}"));
+            let runtime = trust_source_identity::frontend_runtime_sources(
+                &fresh,
+                &builder.src,
+                &config,
+                head,
+            )
+            .unwrap_or_else(|error| panic!("cannot capture nonfrontend source inputs: {error}"));
+            Some((full.info.sha, runtime, config))
+        };
+        let compiler = builder.compiler(0, builder.host_target);
+        // This exact role uses the current native Cargo and actual snapshot std.
+        // Output0 writes only tools-bin. No stage1 compiler, daemon or sysroot is
+        // assembled, copied or relabelled, and existing runtime refusals remain.
+        let result = builder.ensure(targo_trust_tool_build_recipe(compiler, compiler, self.target));
+        if let Some((full, runtime, config)) = inputs {
+            let fresh = ExecutionContext::new(builder.config.exec_ctx().verbosity, false);
+            let head = builder.rust_info().info().unwrap();
+            let after_config = trust_source_identity::config_digest(
+                builder.config.config.as_deref(),
+                &builder.src,
+            );
+            assert_eq!(config, after_config, "frontend configuration changed during construction");
+            let after =
+                trust_source_identity::of_sources(&fresh, &builder.src, &after_config, head)
+                    .unwrap_or_else(|error| {
+                        panic!("cannot recheck frontend source inputs: {error}")
+                    });
+            assert_eq!(full, after.info.sha, "frontend source inputs changed during construction");
+            let after_runtime = trust_source_identity::frontend_runtime_sources(
+                &fresh,
+                &builder.src,
+                &after_config,
+                head,
+            )
+            .unwrap_or_else(|error| panic!("cannot recheck nonfrontend source inputs: {error}"));
+            assert_eq!(
+                runtime, after_runtime,
+                "nonfrontend source inputs changed during construction"
+            );
+            // Diagnostic artifact provenance only. No reader can reconstruct a
+            // completed/qualified SDK or a live daemon owner from these fields.
+            use sha2::Digest as _;
+            let mut artifact = fs::File::open(&result.tool_path).unwrap();
+            let mut hash = sha2::Sha256::new();
+            let artifact_bytes = io::copy(&mut artifact, &mut hash).unwrap();
+            let origin = serde_json::json!({
+                "schema": "trust.frontend-artifact-origin.v1",
+                "scope": "engineering-artifact-only; no runtime, SDK, seed, or proof qualification",
+                "build_version_commit": builder.version_info().sha(),
+                "observed_source_digest": full,
+                "nonfrontend_source_digest": runtime,
+                "configuration_digest": config,
+                "host": self.target.triple.to_string(),
+                "artifact": result.tool_path,
+                "artifact_bytes": artifact_bytes,
+                "artifact_sha256_observation": format!("{:x}", hash.finalize()),
+            });
+            let path = result.tool_path.with_extension("component-origin.json");
+            let bytes = serde_json::to_vec_pretty(&origin).unwrap();
+            let temporary = path.with_extension(format!("json.{}.partial", std::process::id()));
+            let publish = || -> io::Result<()> {
+                use io::Write as _;
+                let mut file =
+                    fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                fs::rename(&temporary, &path)
+            };
+            publish().unwrap_or_else(|error| {
+                panic!("cannot write frontend component origin {}: {error}", path.display())
+            });
+        }
+        builder.info(&format!(
+            "Engineering frontend artifact: {} (source: {}). This is not SDK, runtime, seed, or proof qualification.",
+            result.tool_path.display(),
+            builder.version_info().sha().unwrap_or("omitted or unavailable"),
+        ));
+        result
     }
 }
 
@@ -2162,7 +3211,7 @@ impl LldWrapper {
     }
 }
 
-impl Step for LldWrapper {
+impl CommandLineStep for LldWrapper {
     type Output = BuiltLldWrapper;
 
     const IS_HOST: bool = true;
@@ -2216,16 +3265,20 @@ pub(crate) fn copy_lld_artifacts(
 
     let src_exe = exe("lld", target);
     let dst_exe = exe("rust-lld", target);
+    let source = lld_wrapper.lld_dir.join("bin").join(src_exe);
 
-    builder.copy_link(
-        &lld_wrapper.lld_dir.join("bin").join(src_exe),
-        &libdir_bin.join(dst_exe),
-        FileType::Executable,
-    );
+    builder.copy_link(&source, &libdir_bin.join(&dst_exe), FileType::Executable);
+    // The closed native workload profile selects this exact SDK-relative
+    // executable. Keep the usual rustlib copy for ordinary compiler callers.
+    // Executable copies on Darwin use distinct inodes, so the SDK input
+    // validator can retain each original image without a hard-link alias.
+    let native_bin = builder.sysroot(target_compiler).join("bin");
+    t!(fs::create_dir_all(&native_bin));
+    builder.copy_link(&source, &native_bin.join(dst_exe), FileType::Executable);
     let self_contained_lld_dir = libdir_bin.join("gcc-ld");
     t!(fs::create_dir_all(&self_contained_lld_dir));
 
-    for name in crate::LLD_FILE_NAMES {
+    for name in LLD_FILE_NAMES {
         builder.copy_link(
             &lld_wrapper.tool.tool_path,
             &self_contained_lld_dir.join(exe(name, target)),
@@ -2255,7 +3308,7 @@ impl WasmComponentLd {
     }
 }
 
-impl Step for WasmComponentLd {
+impl CommandLineStep for WasmComponentLd {
     type Output = ToolBuildResult;
 
     const IS_HOST: bool = true;
@@ -2310,7 +3363,7 @@ impl RustAnalyzer {
     pub const ALLOW_FEATURES: &'static str = "rustc_private,proc_macro_internals,proc_macro_diagnostic,proc_macro_span,proc_macro_span_shrink,proc_macro_def_site,new_zeroed_alloc";
 }
 
-impl Step for RustAnalyzer {
+impl CommandLineStep for RustAnalyzer {
     type Output = ToolBuildResult;
     const IS_HOST: bool = true;
 
@@ -2358,7 +3411,11 @@ impl Step for RustAnalyzer {
             &["trust-analyzer"],
         );
 
-        ToolBuildResult { tool_path, build_compiler: tool_result.build_compiler }
+        ToolBuildResult {
+            tool_path,
+            build_compiler: tool_result.build_compiler,
+            artifacts: tool_result.artifacts,
+        }
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
@@ -2380,15 +3437,17 @@ impl RustAnalyzerProcMacroSrv {
     }
 }
 
-impl Step for RustAnalyzerProcMacroSrv {
+impl CommandLineStep for RustAnalyzerProcMacroSrv {
     type Output = ToolBuildResult;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         // Allow building `rust-analyzer-proc-macro-srv` both as part of the `rust-analyzer` and as a stand-alone tool.
-        run.path("src/tools/rust-analyzer")
-            .path("src/tools/rust-analyzer/crates/proc-macro-srv-cli")
-            .alias("trust-analyzer-proc-macro-srv")
+        // FIXME(Zalathar): Should we stop registering "src/tools/rust-analyzer" here?
+        run.path("src/tools/rust-analyzer").path_with_alias(
+            "src/tools/rust-analyzer/crates/proc-macro-srv-cli",
+            "trust-analyzer-proc-macro-srv",
+        )
     }
 
     fn is_default_step(builder: &Builder<'_>) -> bool {
@@ -2483,7 +3542,7 @@ impl LlvmBitcodeLinker {
     }
 }
 
-impl Step for LlvmBitcodeLinker {
+impl CommandLineStep for LlvmBitcodeLinker {
     type Output = ToolBuildResult;
     const IS_HOST: bool = true;
 
@@ -2537,15 +3596,6 @@ pub enum LibcxxVersion {
 
 impl Step for LibcxxVersionTool {
     type Output = LibcxxVersion;
-    const IS_HOST: bool = true;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
-
-    fn is_default_step(_builder: &Builder<'_>) -> bool {
-        false
-    }
 
     fn run(self, builder: &Builder<'_>) -> LibcxxVersion {
         let out_dir = builder.out.join(self.target.to_string()).join("libcxx-version");
@@ -2601,7 +3651,7 @@ impl BuildManifest {
     }
 }
 
-impl Step for BuildManifest {
+impl CommandLineStep for BuildManifest {
     type Output = ToolBuildResult;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -2666,13 +3716,6 @@ impl RustcPrivateCompilers {
         // FIXME: make 100% sure that `target_compiler` was indeed built with `build_compiler`...
         let target_compiler = builder.compiler(build_compiler.stage + 1, target);
 
-        Self { build_compiler, target_compiler }
-    }
-
-    pub fn from_build_and_target_compiler(
-        build_compiler: Compiler,
-        target_compiler: Compiler,
-    ) -> Self {
         Self { build_compiler, target_compiler }
     }
 
@@ -2747,7 +3790,7 @@ macro_rules! tool_rustc_extended {
             }
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ToolBuildResult;
             const IS_HOST: bool = true;
 
@@ -2806,7 +3849,7 @@ pub(crate) fn extended_rustc_tool_is_default_step(
 ) -> bool {
     extended_rustc_tool_is_default_step_for_config(
         &builder.config,
-        builder.build.unstable_features(),
+        builder.sess.unstable_features(),
         tool_name,
         stable,
     )
@@ -2858,6 +3901,10 @@ fn tool_enabled_for_tool_settings(
 }
 
 pub(crate) fn tool_config_entry_selects_user_tool(config_tool: &str, tool: &str) -> bool {
+    // Trust: the left-hand spellings are `bootstrap.toml` `[build] tools`
+    // entries an upstream-shaped config may still carry. They SELECT the Trust
+    // tool; they never name an artifact (docs/trust-naming.md, "What is still
+    // spelled `cargo`").
     match config_tool {
         "cargo" => tool == "targo",
         "cargo-trust" => tool == "targo-trust",
@@ -2903,6 +3950,8 @@ fn build_extended_rustc_tool(
     tool_name: &'static str,
     path: &'static str,
     add_bins_to_sysroot: Option<&[&str]>,
+    // Trust: per-tool cargo feature hook (tippy-driver/miri jemalloc), lost
+    // when upstream simplified this macro; restored by the 1.101 port.
     add_features: Option<fn(&Builder<'_>, TargetSelection, &mut Vec<String>)>,
     cargo_args: Option<&[&'static str]>,
 ) -> ToolBuildResult {
@@ -2913,7 +3962,7 @@ fn build_extended_rustc_tool(
     }
 
     let build_compiler = compilers.build_compiler;
-    let ToolBuildResult { tool_path, .. } = builder.ensure(ToolBuild {
+    let ToolBuildResult { tool_path, artifacts, .. } = builder.ensure(ToolBuild {
         build_compiler,
         output_compiler: compilers.target_compiler,
         target,
@@ -2939,9 +3988,9 @@ fn build_extended_rustc_tool(
             &tool_path,
             add_bins_to_sysroot,
         );
-        ToolBuildResult { tool_path: path, build_compiler }
+        ToolBuildResult { tool_path: path, build_compiler, artifacts }
     } else {
-        ToolBuildResult { tool_path, build_compiler }
+        ToolBuildResult { tool_path, build_compiler, artifacts }
     }
 }
 
@@ -2949,7 +3998,8 @@ tool_rustc_extended!(Cargofmt {
     path: "src/tools/trustfmt",
     tool_name: "cargo-fmt",
     stable: true,
-    add_bins_to_sysroot: ["targo-fmt"]
+    add_bins_to_sysroot: ["targo-fmt"],
+    cargo_args: CARGOFMT_CARGO_ARGS
 });
 tool_rustc_extended!(CargoClippy {
     path: "src/tools/tippy",
@@ -2965,7 +4015,7 @@ tool_rustc_extended!(CargoClippy {
 /// can build a jemalloc-enabled public driver while CI exercises a different
 /// no-feature test binary.
 pub(super) fn tippy_driver_features(builder: &Builder<'_>, target: TargetSelection) -> Vec<String> {
-    tippy_driver_features_for_jemalloc(builder.config.jemalloc(target))
+    tippy_driver_features_for_jemalloc(builder.config.allocator(target) == Allocator::Jemalloc)
 }
 
 fn tippy_driver_features_for_jemalloc(jemalloc: bool) -> Vec<String> {
@@ -2988,7 +4038,7 @@ tool_rustc_extended!(Miri {
     stable: false,
     add_bins_to_sysroot: ["trust-miri"],
     add_features: |builder, target, features| {
-        if builder.config.jemalloc(target) {
+        if builder.config.allocator(target) == Allocator::Jemalloc {
             features.push("jemalloc".to_string());
         }
     },
@@ -3005,7 +4055,8 @@ tool_rustc_extended!(Rustfmt {
     path: "src/tools/trustfmt",
     tool_name: "rustfmt",
     stable: true,
-    add_bins_to_sysroot: ["trustfmt"]
+    add_bins_to_sysroot: ["trustfmt"],
+    cargo_args: RUSTFMT_CARGO_ARGS
 });
 
 pub const TEST_FLOAT_PARSE_ALLOW_FEATURES: &str = "f16,cfg_target_has_reliable_f16_f128";
@@ -3018,8 +4069,18 @@ impl Builder<'_> {
     /// `host`.
     ///
     /// This also ensures that the given tool is built (using [`ToolBuild`]).
-    pub fn tool_cmd(&self, tool: Tool) -> BootstrapCommand {
-        let mut cmd = command(self.tool_exe(tool));
+    pub(crate) fn tool_cmd(&self, tool: Tool) -> BootstrapCommand {
+        self.bootstrap_tool_command(self.tool_exe(tool))
+    }
+
+    // Trust: reuse the ordinary host-tool runtime closure and ToolBuild cache.
+    pub(crate) fn vf5_resource_tool_cmd(&self) -> BootstrapCommand {
+        let result = self.ensure(Vf5ResourceTool);
+        self.bootstrap_tool_command(result.tool_path)
+    }
+
+    fn bootstrap_tool_command(&self, tool: PathBuf) -> BootstrapCommand {
+        let mut cmd = command(tool);
         let compiler = self.compiler(0, self.config.host_target);
         let host = &compiler.host;
         // Prepares the `cmd` provided to be able to run the `compiler` provided.
@@ -3027,7 +4088,13 @@ impl Builder<'_> {
         // Notably this munges the dynamic library lookup path to point to the
         // right location to run `compiler`.
         let mut lib_paths: Vec<PathBuf> = discover_out_dirs_with_dylibs(
-            self.cargo_out(compiler, Mode::ToolBootstrap, *host).join("build"),
+            self.cargo_out_for_input(
+                compiler,
+                Mode::ToolBootstrap,
+                *host,
+                self.cargo_input(Mode::ToolBootstrap),
+            )
+            .join("build"),
         );
 
         // On MSVC a tool may invoke a C compiler (e.g., compiletest in run-make

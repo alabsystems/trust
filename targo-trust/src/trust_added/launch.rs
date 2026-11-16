@@ -142,7 +142,7 @@ pub(crate) fn run(root: &Path, policy: GatePolicy) -> Result<()> {
     let real_proved_rows =
         outcomes.iter().filter(|row| row.kind != "no_obligations").collect::<Vec<_>>();
     if real_proved_rows.is_empty()
-        || outcomes.iter().any(|row| !row.outcome.is_proved())
+        || outcomes.iter().any(|row| !row.credited_outcome().is_proved())
         || real_proved_rows.iter().any(|row| !row.has_obligation_id || !row.has_location)
     {
         bail!(

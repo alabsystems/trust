@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory -Aprivate_interfaces
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //@ edition: 2021
 //! Trust (wave-FTR): a TUPLE-typed field read resolves its holder by the pure ledger scan FIRST
 //! and by map-and-rollback only when that answers `None`.

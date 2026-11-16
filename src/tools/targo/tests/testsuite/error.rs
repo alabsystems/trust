@@ -15,7 +15,7 @@ fn internal_error() {
 [NOTE] we would appreciate a bug report: https://github.com/rust-lang/cargo/issues/
 [NOTE] cargo {}
 ",
-            cargo::version()
+            targo::version()
         ))
         .run();
 }

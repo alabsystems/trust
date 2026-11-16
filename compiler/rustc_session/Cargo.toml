@@ -16,14 +16,17 @@ rustc_errors = { path = "../rustc_errors" }
 rustc_feature = { path = "../rustc_feature" }
 rustc_fs_util = { path = "../rustc_fs_util" }
 rustc_hashes = { path = "../rustc_hashes" }
-rustc_hir = { path = "../rustc_hir" }
 rustc_lint_defs = { path = "../rustc_lint_defs" }
 rustc_macros = { path = "../rustc_macros" }
 rustc_serialize = { path = "../rustc_serialize" }
 rustc_span = { path = "../rustc_span" }
+rustc_structures = { path = "../rustc_structures" }
 rustc_target = { path = "../rustc_target" }
+serde_json = { workspace = true }
 termize = "0.2"
 tracing = "0.1"
+# Trust: data-only local tool lookup observations shared with native Targo.
+trust-fs-observation = { path = "../../crates/trust-fs-observation" }
 # tidy-alphabetical-end
 
 [target.'cfg(unix)'.dependencies]

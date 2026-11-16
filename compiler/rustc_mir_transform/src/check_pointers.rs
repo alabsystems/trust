@@ -1,5 +1,4 @@
-use rustc_data_structures::thin_vec::ThinVec;
-use rustc_hir::lang_items::LangItem;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_index::IndexVec;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
@@ -58,6 +57,10 @@ pub(crate) fn check_pointers<'tcx, F>(
         /* source_info: */ SourceInfo,
     ) -> PointerCheck<'tcx>,
 {
+    if !body.local_decls.iter().any(|decl| decl.ty.is_raw_ptr()) {
+        return;
+    }
+
     // This pass emits new panics. If for whatever reason we do not have a panic
     // implementation, running this pass may cause otherwise-valid code to not compile.
     if tcx.lang_items().get(LangItem::PanicImpl).is_none() {
@@ -117,7 +120,6 @@ pub(crate) fn check_pointers<'tcx, F>(
                         // worse UB when we start unwinding.
                         unwind: UnwindAction::Unreachable,
                     },
-                    attributes: ThinVec::new(),
                 });
             }
         }

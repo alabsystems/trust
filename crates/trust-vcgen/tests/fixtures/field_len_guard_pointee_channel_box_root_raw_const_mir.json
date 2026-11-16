@@ -1,0 +1,1882 @@
+{
+  "name": "box_root_raw_const",
+  "def_path": "field_len_guard_pointee_channel::box_root_raw_const",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+    "line_start": 95,
+    "col_start": 0,
+    "line_end": 101,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "alloc::boxed::Box",
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "core::ptr::unique::Unique",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "Adt": {
+                            "name": "core::ptr::non_null::NonNull",
+                            "fields": [
+                              [
+                                "pointer",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Adt": {
+                                        "name": "field_len_guard_pointee_channel::VH",
+                                        "fields": [
+                                          [
+                                            "v",
+                                            {
+                                              "Seq": {
+                                                "elem": {
+                                                  "Int": {
+                                                    "width": 8,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Struct"
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "core::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "1",
+                {
+                  "Adt": {
+                    "name": "alloc::alloc::Global",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Adt": {
+                "name": "field_len_guard_pointee_channel::VH",
+                "fields": [
+                  [
+                    "v",
+                    {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Adt": {
+                "name": "field_len_guard_pointee_channel::VH",
+                "fields": [
+                  [
+                    "v",
+                    {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Adt": {
+                "name": "field_len_guard_pointee_channel::VH",
+                "fields": [
+                  [
+                    "v",
+                    {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Adt": {
+                "name": "field_len_guard_pointee_channel::VH",
+                "fields": [
+                  [
+                    "v",
+                    {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": [
+                        {
+                          "Field": 0
+                        },
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": {
+                        "Adt": {
+                          "name": "field_len_guard_pointee_channel::VH",
+                          "fields": [
+                            [
+                              "v",
+                              {
+                                "Seq": {
+                                  "elem": {
+                                    "Int": {
+                                      "width": 8,
+                                      "signed": false
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 17,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 18,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 19,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 20,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+              "line_start": 96,
+              "col_start": 7,
+              "line_end": 96,
+              "col_end": 20
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 97,
+                "col_start": 15,
+                "line_end": 97,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+              "line_start": 101,
+              "col_start": 0,
+              "line_end": 101,
+              "col_end": 1
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": [
+                        {
+                          "Field": 0
+                        },
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": {
+                        "Adt": {
+                          "name": "field_len_guard_pointee_channel::VH",
+                          "fields": [
+                            [
+                              "v",
+                              {
+                                "Seq": {
+                                  "elem": {
+                                    "Int": {
+                                      "width": 8,
+                                      "signed": false
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 99,
+                "col_start": 13,
+                "line_end": 99,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": true,
+                      "pointee": {
+                        "Adt": {
+                          "name": "field_len_guard_pointee_channel::VH",
+                          "fields": [
+                            [
+                              "v",
+                              {
+                                "Seq": {
+                                  "elem": {
+                                    "Int": {
+                                      "width": 8,
+                                      "signed": false
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 99,
+                "col_start": 13,
+                "line_end": 99,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "field_len_guard_pointee_channel::clear_vh",
+            "args": [
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+              "line_start": 99,
+              "col_start": 4,
+              "line_end": 99,
+              "col_end": 38
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 7
+            },
+            "callee_identity": {
+              "stable_crate_id": 1435695744087620798,
+              "def_index": 5,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1435695744087620798,
+              "krate_name": "field_len_guard_pointee_channel"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": [
+                        {
+                          "Field": 0
+                        },
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": {
+                        "Adt": {
+                          "name": "field_len_guard_pointee_channel::VH",
+                          "fields": [
+                            [
+                              "v",
+                              {
+                                "Seq": {
+                                  "elem": {
+                                    "Int": {
+                                      "width": 8,
+                                      "signed": false
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 15,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 7,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 10
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+              "line_start": 101,
+              "col_start": 0,
+              "line_end": 101,
+              "col_end": 1
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 7,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+              "line_start": 101,
+              "col_start": 0,
+              "line_end": 101,
+              "col_end": 1
+            },
+            "unwind": "Terminate"
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [],
+        "terminator": "Resume"
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 27,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 28,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 30,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 29,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Bool": true
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 31,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Not",
+                  {
+                    "Copy": {
+                      "local": 30,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 31,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": {
+              "Custom": "null reference constructed"
+            },
+            "target": 12,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+              "line_start": 100,
+              "col_start": 4,
+              "line_end": 100,
+              "col_end": 7
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 23,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 24,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Bool": true
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Not",
+                  {
+                    "Copy": {
+                      "local": 25,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Copy": {
+                "local": 26,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": {
+              "Custom": "null reference constructed"
+            },
+            "target": 11,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+              "line_start": 96,
+              "col_start": 7,
+              "line_end": 96,
+              "col_end": 10
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 9,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 10
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<u8>::len",
+            "args": [
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+              "line_start": 96,
+              "col_start": 7,
+              "line_end": 96,
+              "col_end": 16
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 7
+            },
+            "callee_identity": {
+              "stable_crate_id": 7397931576985651038,
+              "def_index": 8821,
+              "substs_digest": [
+                1605478745222021096,
+                16463750082054224262
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 7397931576985651038,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 11,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+                "line_start": 100,
+                "col_start": 4,
+                "line_end": 100,
+                "col_end": 7
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<alloc::vec::Vec<u8> as core::ops::index::Index<usize>>::index",
+            "args": [
+              {
+                "Move": {
+                  "local": 8,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    3,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 7,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/field_len_guard_pointee_channel.rs",
+              "line_start": 100,
+              "col_start": 7,
+              "line_end": 100,
+              "col_end": 10
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 7
+            },
+            "callee_identity": {
+              "stable_crate_id": 7523458650639990602,
+              "def_index": 39107,
+              "substs_digest": [
+                16909871312717074271,
+                355052896512808577
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 7523458650639990602,
+              "krate_name": "core"
+            }
+          }
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,0 +1,1702 @@
+{
+  "name": "reach_nested_loop",
+  "def_path": "repro::Acc::reach_nested_loop",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+    "line_start": 201,
+    "col_start": 4,
+    "line_end": 213,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "repro::Acc",
+                "fields": [
+                  [
+                    "state",
+                    {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        },
+                        "len": 8
+                      }
+                    }
+                  ],
+                  [
+                    "buf",
+                    {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        },
+                        "len": 64
+                      }
+                    }
+                  ],
+                  [
+                    "buf_len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "outer"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "inner"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "acc"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::ops::range::Range",
+                "fields": [
+                  [
+                    "start",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "end",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::ops::range::Range",
+                "fields": [
+                  [
+                    "start",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "end",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 202,
+                "col_start": 22,
+                "line_end": 202,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          64
+                        ]
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 203,
+                "col_start": 17,
+                "line_end": 203,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 203,
+              "col_start": 17,
+              "line_end": 203,
+              "col_end": 25
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 10349,
+              "substs_digest": [
+                15726425152148681580,
+                7803413674666336092
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 5,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 203,
+                "col_start": 17,
+                "line_end": 203,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 2
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 7,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 203,
+                "col_start": 17,
+                "line_end": 203,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Copy": {
+                  "local": 9,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 8,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 203,
+              "col_start": 17,
+              "line_end": 203,
+              "col_end": 25
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 10530,
+              "substs_digest": [
+                15726425152148681580,
+                7803413674666336092
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 8,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 203,
+                "col_start": 17,
+                "line_end": 203,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ],
+              [
+                1,
+                5
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 203,
+              "col_start": 17,
+              "line_end": 203,
+              "col_end": 25
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 204,
+                "col_start": 15,
+                "line_end": 204,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 204,
+                "col_start": 15,
+                "line_end": 204,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                10
+              ]
+            ],
+            "otherwise": 7,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 204,
+              "col_start": 15,
+              "line_end": 204,
+              "col_end": 39
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 212,
+                "col_start": 8,
+                "line_end": 212,
+                "col_end": 11
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 205,
+                "col_start": 27,
+                "line_end": 205,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "repro::poke",
+            "args": [
+              {
+                "Move": {
+                  "local": 14,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 13,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 205,
+              "col_start": 22,
+              "line_end": 205,
+              "col_end": 31
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3410588637815928769,
+              "def_index": 22,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3410588637815928769,
+              "krate_name": "repro"
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 13,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 205,
+                "col_start": 16,
+                "line_end": 205,
+                "col_end": 31
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 206,
+                "col_start": 25,
+                "line_end": 206,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 15,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 206,
+                "col_start": 16,
+                "line_end": 206,
+                "col_end": 38
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 16,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 9,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 206,
+              "col_start": 16,
+              "line_end": 206,
+              "col_end": 38
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 1
+                  },
+                  {
+                    "Index": 15
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      1,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 206,
+                "col_start": 16,
+                "line_end": 206,
+                "col_end": 42
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          64
+                        ]
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 3,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 208,
+                "col_start": 21,
+                "line_end": 208,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 18,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 17,
+              "projections": []
+            },
+            "target": 11,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 208,
+              "col_start": 21,
+              "line_end": 208,
+              "col_end": 29
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 10349,
+              "substs_digest": [
+                15726425152148681580,
+                7803413674666336092
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 17,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 208,
+                "col_start": 21,
+                "line_end": 208,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 12
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 19,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 208,
+                "col_start": 21,
+                "line_end": 208,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Copy": {
+                  "local": 21,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 20,
+              "projections": []
+            },
+            "target": 13,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 208,
+              "col_start": 21,
+              "line_end": 208,
+              "col_end": 29
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 10530,
+              "substs_digest": [
+                15726425152148681580,
+                7803413674666336092
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 20,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 208,
+                "col_start": 21,
+                "line_end": 208,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 22,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ],
+              [
+                1,
+                14
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 208,
+              "col_start": 21,
+              "line_end": 208,
+              "col_end": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+                "line_start": 209,
+                "col_start": 22,
+                "line_end": 209,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "repro::stash",
+            "args": [
+              {
+                "Copy": {
+                  "local": 24,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 23,
+              "projections": []
+            },
+            "target": 12,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/digest_update_topup.rs",
+              "line_start": 209,
+              "col_start": 16,
+              "line_end": 209,
+              "col_end": 40
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3410588637815928769,
+              "def_index": 19,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3410588637815928769,
+              "krate_name": "repro"
+            }
+          }
+        }
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_10",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_10",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_22",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_22",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "outer",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "outer",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "inner",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "inner",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

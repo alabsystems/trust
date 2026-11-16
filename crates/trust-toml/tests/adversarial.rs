@@ -165,32 +165,71 @@ const READ_HAZARDS: &[(&str, &str)] = &[
     ("float with i64-overflowing mantissa", "a = 9223372036854775808.0\n"),
     ("many decimal places", "a = 0.1000000000000000055511151231257827\n"),
     // -- strings: escapes and the surrogate rule ---------------------------
-    ("all simple escapes", r#"a = "\b\t\n\f\r\"\\"
-"#),
-    ("short unicode escape", r#"a = "\u00e9"
-"#),
-    ("long unicode escape", r#"a = "\U0001F600"
-"#),
-    ("lone high surrogate", r#"a = "\ud800"
-"#),
-    ("lone low surrogate", r#"a = "\udfff"
-"#),
-    ("surrogate pair spelled separately", r#"a = "\ud83d\ude00"
-"#),
-    ("escape past Unicode max", r#"a = "\U00110000"
-"#),
-    ("null escape", r#"a = "\u0000"
-"#),
-    ("hex escape (not TOML)", r#"a = "\x41"
-"#),
-    ("unknown escape", r#"a = "\q"
-"#),
-    ("escape at end of string", r#"a = "\"
-"#),
-    ("uppercase U short form", r#"a = "\U00e9"
-"#),
-    ("lowercase u long form", r#"a = "\u0001F600"
-"#),
+    (
+        "all simple escapes",
+        r#"a = "\b\t\n\f\r\"\\"
+"#,
+    ),
+    (
+        "short unicode escape",
+        r#"a = "\u00e9"
+"#,
+    ),
+    (
+        "long unicode escape",
+        r#"a = "\U0001F600"
+"#,
+    ),
+    (
+        "lone high surrogate",
+        r#"a = "\ud800"
+"#,
+    ),
+    (
+        "lone low surrogate",
+        r#"a = "\udfff"
+"#,
+    ),
+    (
+        "surrogate pair spelled separately",
+        r#"a = "\ud83d\ude00"
+"#,
+    ),
+    (
+        "escape past Unicode max",
+        r#"a = "\U00110000"
+"#,
+    ),
+    (
+        "null escape",
+        r#"a = "\u0000"
+"#,
+    ),
+    (
+        "hex escape (not TOML)",
+        r#"a = "\x41"
+"#,
+    ),
+    (
+        "unknown escape",
+        r#"a = "\q"
+"#,
+    ),
+    (
+        "escape at end of string",
+        r#"a = "\"
+"#,
+    ),
+    (
+        "uppercase U short form",
+        r#"a = "\U00e9"
+"#,
+    ),
+    (
+        "lowercase u long form",
+        r#"a = "\u0001F600"
+"#,
+    ),
     ("literal string with backslashes", "a = 'C:\\Users\\n'\n"),
     ("literal string with quote", "a = 'he said \"hi\"'\n"),
     ("empty basic", "a = \"\"\n"),
@@ -511,7 +550,8 @@ fn emitted_text_reread_by_the_incumbent_preserves_every_hazard_value() {
     for (name, document) in WRITE_HAZARDS {
         let Outcome::Ok(reference) = parse_incumbent(document) else { continue };
         let Outcome::Ok(ours_tree) = parse_ours(document) else { continue };
-        let Outcome::Ok(text) = probe(|| trust_toml::to_string(&ours_tree).map_err(|e| e.to_string()))
+        let Outcome::Ok(text) =
+            probe(|| trust_toml::to_string(&ours_tree).map_err(|e| e.to_string()))
         else {
             failures.push(format!("{name}: trust-toml could not emit `{}`", show(document)));
             continue;
@@ -667,8 +707,9 @@ fn compare_serialize<T: serde::Serialize>(
 
 #[test]
 fn the_write_path_agrees_with_the_incumbent_on_what_it_refuses() {
-    use serde::Serialize;
     use std::collections::BTreeMap;
+
+    use serde::Serialize;
 
     #[derive(Serialize)]
     struct Inner {
@@ -778,7 +819,11 @@ fn the_write_path_agrees_with_the_incumbent_on_what_it_refuses() {
     compare_serialize("Some(None)", &NestedOption { a: Some(None) }, &mut failures);
     compare_serialize("Some(Some)", &NestedOption { a: Some(Some(1)) }, &mut failures);
     compare_serialize("outer None", &NestedOption { a: None }, &mut failures);
-    compare_serialize("None inside an array", &ArrayWithNone { a: vec![Some(1), None] }, &mut failures);
+    compare_serialize(
+        "None inside an array",
+        &ArrayWithNone { a: vec![Some(1), None] },
+        &mut failures,
+    );
 
     // -- numeric range and shape -------------------------------------------
     compare_serialize("u64 above i64::MAX", &BigU { u: u64::MAX }, &mut failures);
@@ -814,7 +859,11 @@ fn the_write_path_agrees_with_the_incumbent_on_what_it_refuses() {
         &mut failures,
     );
     compare_serialize("empty key", &EmptyKey { v: 1 }, &mut failures);
-    compare_serialize("two fields renamed to one key", &DuplicateKeys { one: 1, two: 2 }, &mut failures);
+    compare_serialize(
+        "two fields renamed to one key",
+        &DuplicateKeys { one: 1, two: 2 },
+        &mut failures,
+    );
 
     // -- ordering and enum shapes -------------------------------------------
     compare_serialize(
@@ -932,7 +981,8 @@ fn depth_is_nesting_and_not_a_running_total() {
     assert!(matches!(parse_incumbent(&one_deep_many_times), Outcome::Ok(_)));
 
     // Same for a sequence of deep-but-legal headers.
-    let many_headers: String = (0..200).map(|index| deep_header(70).replace("k0", &format!("t{index}"))).collect();
+    let many_headers: String =
+        (0..200).map(|index| deep_header(70).replace("k0", &format!("t{index}"))).collect();
     assert!(matches!(parse_ours(&many_headers), Outcome::Ok(_)));
     assert!(matches!(parse_incumbent(&many_headers), Outcome::Ok(_)));
 }

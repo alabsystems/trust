@@ -53,6 +53,7 @@ impl PrimaryEngine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProofFamily {
+    TrustWpDeductive,
     TrustVcOwnership,
     TrustMcReachability,
     TyTemporal,
@@ -74,6 +75,11 @@ pub(super) struct ObligationRoute {
 
 impl ObligationRoute {
     pub(super) fn accepts_strength(&self, strength: &ProofStrength) -> bool {
+        if self.proof_family == ProofFamily::TrustWpDeductive {
+            // Native replay establishes this Trusted derivation only. A
+            // caller cannot promote it to a Clean-certified translation.
+            return strength == &ProofStrength::deductive();
+        }
         strength.is_publication_grade()
             && assurance_satisfies(strength, self.minimum_assurance)
             && self.accepts_reasoning(&strength.reasoning)
@@ -81,6 +87,7 @@ impl ObligationRoute {
 
     pub(super) fn accepts_reasoning(&self, reasoning: &ReasoningKind) -> bool {
         match self.proof_family {
+            ProofFamily::TrustWpDeductive => matches!(reasoning, ReasoningKind::Deductive),
             ProofFamily::TrustVcOwnership => {
                 matches!(reasoning, ReasoningKind::OwnershipAnalysis | ReasoningKind::Deductive)
             }
@@ -96,6 +103,7 @@ impl ObligationRoute {
 
     pub(super) fn required_strength_description(&self) -> &'static str {
         match self.proof_family {
+            ProofFamily::TrustWpDeductive => "trust-wp body-aware deductive Sound proof (Trusted)",
             ProofFamily::TrustVcOwnership => {
                 "trust-vc ownership-analysis or deductive Sound+ proof"
             }
@@ -144,19 +152,19 @@ pub(super) struct FallbackRoute(pub(super) ObligationRoute);
 
 /// The deductive-fallback table.
 ///
-/// **EMPTY BY DESIGN.** The mechanism ships as a provable no-op; each row added
-/// here is its own reviewed commit with its own verdict-flip check.
-///
-/// A row must NEVER be written as "the primary's route with `primary` swapped" —
-/// see [`FallbackRoute`]. Write a complete route, and re-derive the proof family
-/// and assurance floor for the engine that will actually run.
-///
-/// Adding the first row is additionally blocked on work outside this module:
-/// `TrustVcVerificationMode` has no solve variant, so trust-vc cannot be asked to
-/// derive on the native lane, and the compiler-side suite stamp is one of four
-/// tables that must agree.
-pub(super) fn fallback_route(_obligation: &TrustObligation) -> Option<FallbackRoute> {
-    None
+/// Body-aware WP is an alternative deductive strategy for postconditions.
+/// It carries its own Sound assurance floor and must replay against the same
+/// typed body and original contract. Preconditions need call-site semantics
+/// and remain outside this route.
+pub(super) fn fallback_route(obligation: &TrustObligation) -> Option<FallbackRoute> {
+    matches!(obligation.kind, ObligationKind::Postcondition).then_some(FallbackRoute(
+        ObligationRoute {
+            obligation_kind: "Postcondition",
+            primary: PrimaryEngine::TrustWp,
+            proof_family: ProofFamily::TrustWpDeductive,
+            minimum_assurance: RequiredAssurance::Sound,
+        },
+    ))
 }
 
 /// Why a declined obligation is, or is not, eligible for a second engine.
@@ -182,8 +190,8 @@ pub(super) enum FallbackRefusal {
     Definitive,
     /// The primary's evidence was accepted. Nothing to retry.
     Accepted,
-    /// Not an `Unsupported` decline (Timeout, Canceled, Unknown, ...). None of
-    /// these is a capability gap.
+    /// Neither an inconclusive result nor an explicitly classified capability
+    /// gap. Timeouts and cancellations are never retried here.
     NotADecline,
     /// No decline class, or a class that is not retryable. This is the default
     /// for every router-minted decline, every engine that has not been taught
@@ -235,10 +243,10 @@ pub(super) fn fallback_eligibility(
     if accepted {
         return Terminal(R::Accepted);
     }
-    if status != EvidenceStatus::Unsupported {
+    if !matches!(status, EvidenceStatus::Unsupported | EvidenceStatus::Unknown) {
         return Terminal(R::NotADecline);
     }
-    if !DeclineClass::is_retryable(decline) {
+    if status == EvidenceStatus::Unsupported && !DeclineClass::is_retryable(decline) {
         return Terminal(R::Unclassified);
     }
     if budget_exceeded {

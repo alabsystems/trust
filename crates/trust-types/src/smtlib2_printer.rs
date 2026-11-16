@@ -7,6 +7,29 @@
 // works with plain string inputs — useful for pipeline stages that don't have
 // typed formula access.
 //
+// WHY THIS IS NOT FOLDED ONTO THE SHARED LOGIC SELECTOR.
+//
+// This is the workspace's THIRD complete `(set-logic)/(declare-const)/(assert)/
+// (check-sat)` emitter (after `smt_printer` and trust-router's `smt2_export`),
+// and the first two were reconciled onto one admissibility table
+// (`logic_lattice::LOGIC_LATTICE`) precisely so that no emitter could write a
+// logic line its own body contradicts. This one CANNOT join them, and the
+// reason is structural rather than a deferral: it never sees a `Formula`. Its
+// inputs are `&str` declarations and `&str` assertion bodies that it only
+// re-indents, so there is no feature record to compute and nothing to select
+// from — `logic_lattice::formula_theories` takes a typed `Formula`.
+//
+// What replaces selection here is a FIXED CHOICE AT THE TOP OF THE LATTICE:
+// `SmtLib2Config::default_logic` is `ALL`, the row that admits
+// `Theories::EVERYTHING`. `ALL` is admissible for every possible body, so this
+// emitter is the one case where the invariant holds without a classifier, and
+// `the_default_logic_is_the_lattice_top` pins it against the shared table so a
+// future edit cannot quietly narrow the default to a name that could be too
+// weak for a string this printer was handed. A caller that HAS a typed formula
+// must use `smt_printer`/`smt2_export` and get a precise name; this one is for
+// debug and interop dumps, and it has no in-tree caller beyond the crate's
+// re-export.
+//
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
@@ -24,6 +47,14 @@ pub struct SmtLib2Config {
     /// Whether to include a `(set-logic ...)` command in full queries.
     pub include_logic: bool,
     /// Default logic to use when `include_logic` is true.
+    ///
+    /// Defaults to `ALL` — the TOP of the shared admissibility table
+    /// ([`crate::logic_lattice::LOGIC_LATTICE`]). This printer is handed
+    /// strings, not a `Formula`, so it cannot compute a feature record and
+    /// cannot select a precise name; the top row is the only choice that is
+    /// admissible for every body it might be given. Narrowing this default
+    /// would put a logic line over text nothing has classified. See the module
+    /// header.
     pub default_logic: String,
 }
 
@@ -74,7 +105,9 @@ impl SmtLib2Printer {
         if trimmed.len() <= self.config.line_width {
             return trimmed.to_string();
         }
-        self.indent_sexp(trimmed, 0)
+        let mut out = String::with_capacity(trimmed.len() + 32);
+        self.indent_sexp_into(trimmed, 0, &mut out);
+        out
     }
 
     // ------------------------------------------------------------------
@@ -84,7 +117,9 @@ impl SmtLib2Printer {
     /// Emit a `(declare-const name sort)` command.
     #[must_use]
     pub fn emit_declare_const(&self, name: &str, sort: &str) -> String {
-        format!("(declare-const {} {})", escape_smt_symbol(name), sort_to_smt(sort))
+        let mut out = String::with_capacity(name.len() + sort.len() + 20);
+        write_declare_const(&mut out, name, sort);
+        out
     }
 
     /// Emit an `(assert expr)` command.
@@ -93,7 +128,7 @@ impl SmtLib2Printer {
     #[must_use]
     pub fn emit_assert(&self, expr: &str) -> String {
         let formatted = self.formula_to_smt(expr);
-        format!("(assert {})", formatted)
+        format!("(assert {formatted})")
     }
 
     /// Emit a `(check-sat)` command.
@@ -123,7 +158,7 @@ impl SmtLib2Printer {
     /// Emit a `(set-logic logic)` command.
     #[must_use]
     pub fn emit_set_logic(&self, logic: &str) -> String {
-        format!("(set-logic {})", logic)
+        format!("(set-logic {logic})")
     }
 
     // ------------------------------------------------------------------
@@ -139,58 +174,77 @@ impl SmtLib2Printer {
     ///   4. `(check-sat)`
     #[must_use]
     pub fn emit_full_query(&self, declarations: &[(&str, &str)], assertions: &[&str]) -> String {
-        let mut lines: Vec<String> = Vec::new();
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(
+            (if self.config.include_logic { self.config.default_logic.len() + 13 } else { 0 })
+                + declarations.len() * 28
+                + assertions.len() * 24
+                + 11,
+        );
 
         if self.config.include_logic {
-            lines.push(self.emit_set_logic(&self.config.default_logic));
+            out.push_str("(set-logic ");
+            out.push_str(&self.config.default_logic);
+            out.push_str(")\n");
         }
 
         for &(name, sort) in declarations {
-            lines.push(self.emit_declare_const(name, sort));
+            write_declare_const(&mut out, name, sort);
+            out.push('\n');
         }
 
         if self.config.use_named_asserts {
             for (i, &expr) in assertions.iter().enumerate() {
                 let formatted = self.formula_to_smt(expr);
-                lines.push(format!("(assert (! {} :named a{}))", formatted, i));
+                let _ = writeln!(out, "(assert (! {formatted} :named a{i}))");
             }
         } else {
             for &expr in assertions {
-                lines.push(self.emit_assert(expr));
+                let formatted = self.formula_to_smt(expr);
+                out.push_str("(assert ");
+                out.push_str(&formatted);
+                out.push_str(")\n");
             }
         }
 
-        lines.push(self.emit_check_sat());
-
-        lines.join("\n")
+        out.push_str("(check-sat)");
+        out
     }
 
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
 
-    /// Recursively indent an s-expression.
+    /// Recursively indent an s-expression into `out`.
     ///
     /// Uses `smt_logic::split_top_level` — the canonical
     /// s-expression splitter shared across all SMT printers.
-    fn indent_sexp(&self, sexp: &str, depth: usize) -> String {
+    fn indent_sexp_into(&self, sexp: &str, depth: usize, out: &mut String) {
         let sexp = sexp.trim();
         let current_indent = depth * self.config.indent_width;
         if sexp.len() + current_indent <= self.config.line_width {
-            return sexp.to_string();
+            out.push_str(sexp);
+            return;
         }
         if !sexp.starts_with('(') || !sexp.ends_with(')') {
-            return sexp.to_string();
+            out.push_str(sexp);
+            return;
         }
         let inner = &sexp[1..sexp.len() - 1];
         let parts = split_top_level(inner);
         if parts.len() <= 1 {
-            return sexp.to_string();
+            out.push_str(sexp);
+            return;
         }
-        let indent = " ".repeat((depth + 1) * self.config.indent_width);
-        let head = &parts[0];
-        let rest: Vec<String> = parts[1..].iter().map(|p| self.indent_sexp(p, depth + 1)).collect();
-        format!("({head}\n{indent}{})", rest.join(&format!("\n{indent}")))
+        let child_indent = (depth + 1) * self.config.indent_width;
+        out.push('(');
+        out.push_str(parts[0]);
+        for part in &parts[1..] {
+            out.push('\n');
+            out.extend(std::iter::repeat_n(' ', child_indent));
+            self.indent_sexp_into(part, depth + 1, out);
+        }
+        out.push(')');
     }
 }
 
@@ -272,20 +326,23 @@ pub fn is_valid_smt_identifier(s: &str) -> bool {
 /// - `"int"` -> `"Int"`
 #[must_use]
 pub fn sort_to_smt(sort: &str) -> String {
+    sort_to_smt_str(sort).to_string()
+}
+
+fn sort_to_smt_str(sort: &str) -> &str {
     match sort {
-        "bool" | "Bool" => "Bool".to_string(),
-        "int" | "Int" | "integer" => "Int".to_string(),
-        "real" | "Real" => "Real".to_string(),
-        "i8" | "u8" => "(_ BitVec 8)".to_string(),
-        "i16" | "u16" => "(_ BitVec 16)".to_string(),
-        "i32" | "u32" => "(_ BitVec 32)".to_string(),
-        "i64" | "u64" => "(_ BitVec 64)".to_string(),
-        "i128" | "u128" => "(_ BitVec 128)".to_string(),
-        "isize" | "usize" => "(_ BitVec 64)".to_string(),
-        "f32" => "(_ FloatingPoint 8 24)".to_string(),
-        "f64" => "(_ FloatingPoint 11 53)".to_string(),
+        "bool" | "Bool" => "Bool",
+        "int" | "Int" | "integer" => "Int",
+        "real" | "Real" => "Real",
+        "i8" | "u8" => "(_ BitVec 8)",
+        "i16" | "u16" => "(_ BitVec 16)",
+        "i32" | "u32" => "(_ BitVec 32)",
+        "i64" | "u64" | "isize" | "usize" => "(_ BitVec 64)",
+        "i128" | "u128" => "(_ BitVec 128)",
+        "f32" => "(_ FloatingPoint 8 24)",
+        "f64" => "(_ FloatingPoint 11 53)",
         // Already SMT-LIB format — pass through
-        _ => sort.to_string(),
+        _ => sort,
     }
 }
 
@@ -298,41 +355,42 @@ pub fn sort_to_smt(sort: &str) -> String {
 #[must_use]
 pub fn operator_to_smt(op: &str) -> String {
     match op {
-        "+" => "+".to_string(),
-        "-" => "-".to_string(),
-        "*" => "*".to_string(),
-        "/" => "div".to_string(),
-        "%" => "mod".to_string(),
-        "==" => "=".to_string(),
-        "!=" => "distinct".to_string(),
-        "<" => "<".to_string(),
-        "<=" => "<=".to_string(),
-        ">" => ">".to_string(),
-        ">=" => ">=".to_string(),
-        "&&" => "and".to_string(),
-        "||" => "or".to_string(),
-        "!" => "not".to_string(),
-        "&" => "bvand".to_string(),
-        "|" => "bvor".to_string(),
-        "^" => "bvxor".to_string(),
-        "~" => "bvnot".to_string(),
-        "<<" => "bvshl".to_string(),
-        ">>" => "bvashr".to_string(), // signed (arithmetic) right shift
-        ">>>" => "bvlshr".to_string(), // unsigned (logical) right shift
-        _ => op.to_string(),
+        "/" => "div",
+        "%" => "mod",
+        "==" => "=",
+        "!=" => "distinct",
+        "&&" => "and",
+        "||" => "or",
+        "!" => "not",
+        "&" => "bvand",
+        "|" => "bvor",
+        "^" => "bvxor",
+        "~" => "bvnot",
+        "<<" => "bvshl",
+        ">>" => "bvashr",  // signed (arithmetic) right shift
+        ">>>" => "bvlshr", // unsigned (logical) right shift
+        _ => op,
     }
+    .to_string()
 }
 
 // ======================================================================
 // Internal helpers
 // ======================================================================
 
-/// Escape a symbol name for use as a simple or quoted SMT-LIB2 symbol.
-fn escape_smt_symbol(name: &str) -> String {
+fn write_declare_const(out: &mut String, name: &str, sort: &str) {
+    let sort_smt = sort_to_smt_str(sort);
+    out.push_str("(declare-const ");
+    write_smt_symbol(out, name);
+    out.push(' ');
+    out.push_str(sort_smt);
+    out.push(')');
+}
+
+fn write_smt_symbol(out: &mut String, name: &str) {
     if is_valid_smt_identifier(name) {
-        name.to_string()
+        out.push_str(name);
     } else {
-        let mut out = String::with_capacity(name.len() + 2);
         out.push('|');
         for ch in name.chars() {
             if ch == '|' || ch == '\\' {
@@ -341,6 +399,17 @@ fn escape_smt_symbol(name: &str) -> String {
             out.push(ch);
         }
         out.push('|');
+    }
+}
+
+/// Escape a symbol name for use as a simple or quoted SMT-LIB2 symbol.
+#[cfg(test)]
+fn escape_smt_symbol(name: &str) -> String {
+    if is_valid_smt_identifier(name) {
+        name.to_string()
+    } else {
+        let mut out = String::with_capacity(name.len() + 2);
+        write_smt_symbol(&mut out, name);
         out
     }
 }
@@ -463,6 +532,23 @@ mod tests {
     fn test_emit_set_logic() {
         let p = printer();
         assert_eq!(p.emit_set_logic("QF_LIA"), "(set-logic QF_LIA)");
+    }
+
+    /// This emitter has no `Formula` to classify, so its one defence against
+    /// writing a logic line its own body contradicts is that the default name
+    /// is the TOP of the shared admissibility table. Pinned against that table
+    /// rather than against the literal `"ALL"`, so the two cannot drift: if a
+    /// future edit narrows the default, or if `ALL` ever stops admitting
+    /// everything, this fails.
+    #[test]
+    fn the_default_logic_is_the_lattice_top() {
+        let default_logic = SmtLib2Config::default().default_logic;
+        assert_eq!(
+            crate::logic_lattice::logic_admits(&default_logic),
+            Some(crate::logic_lattice::Theories::EVERYTHING),
+            "`{default_logic}` is this printer's default over UNCLASSIFIED text, so it must be \
+             the row that admits every theory"
+        );
     }
 
     // -----------------------------------------------------------------

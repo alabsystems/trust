@@ -135,6 +135,7 @@ fn make_bridge_cast_module(kind: CastKind) -> Module {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     trust_ir_bridge::lower_to_trust_ir(&vf).expect("bridge lower_to_trust_ir failed for cast")

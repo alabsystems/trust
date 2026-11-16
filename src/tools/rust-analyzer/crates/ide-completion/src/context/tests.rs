@@ -13,7 +13,8 @@ fn check_expected_type_and_name(#[rust_analyzer::rust_fixture] ra_fixture: &str,
         hir::attach_db(&db, || CompletionContext::new(&db, pos, &config, None).unwrap());
 
     let ty = completion_context
-        .expected_type
+        .expected
+        .ty
         .map(|t| {
             hir::attach_db(&db, || {
                 t.display_test(&db, completion_context.krate.to_display_target(&db)).to_string()
@@ -22,7 +23,7 @@ fn check_expected_type_and_name(#[rust_analyzer::rust_fixture] ra_fixture: &str,
         .unwrap_or("?".to_owned());
 
     let name =
-        completion_context.expected_name.map_or_else(|| "?".to_owned(), |name| name.to_string());
+        completion_context.expected.name.map_or_else(|| "?".to_owned(), |name| name.to_string());
 
     expect.assert_eq(&format!("ty: {ty}, name: {name}"));
 }
@@ -403,6 +404,21 @@ fn expected_type_if_condition() {
         r#"
 fn foo() {
     if a$0 { }
+}
+"#,
+        expect![[r#"ty: bool, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_guard_condition() {
+    check_expected_type_and_name(
+        r#"
+enum E { V }
+fn foo() {
+    match E::V {
+        _ if a$0 => {}
+    }
 }
 "#,
         expect![[r#"ty: bool, name: ?"#]],

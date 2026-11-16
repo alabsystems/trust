@@ -1,3 +1,4 @@
+#include "Analysis/DataFlowAliasAnalysis.h"
 #include "Dialect/Ops.h"
 #include "Interfaces/AutoDiffOpInterface.h"
 #include "Interfaces/AutoDiffTypeInterface.h"
@@ -17,6 +18,7 @@
 #include "EnzymeLogic.h"
 #include "Interfaces/GradientUtils.h"
 #include "Interfaces/GradientUtilsReverse.h"
+#include "Interfaces/Utils.h"
 #include "llvm/ADT/ScopeExit.h"
 
 using namespace mlir;
@@ -37,14 +39,65 @@ void handleReturns(Block *oBB, Block *newBB, Block *reverseBB,
   }
 }
 
+// Returns true if the operation, or any operation nested in it with recursive
+// memory effects, may have an effect other than a read on active memory. An
+// effect on an inactive value cannot touch shadow memory. An effect with no
+// known target can only reach active memory through an active operand.
+static bool mayWriteActiveMemory(Operation *op, MGradientUtils *gutils) {
+  if (auto effectInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
+    SmallVector<MemoryEffects::EffectInstance, 1> effects;
+    effectInterface.getEffects(effects);
+    for (const MemoryEffects::EffectInstance &it : effects) {
+      if (isa<MemoryEffects::Read>(it.getEffect()))
+        continue;
+      if (Value v = it.getValue()) {
+        if (!gutils->isConstantValue(v))
+          return true;
+        continue;
+      }
+      if (llvm::any_of(op->getOperands(), [gutils](Value v) {
+            return !gutils->isConstantValue(v);
+          }))
+        return true;
+    }
+  }
+
+  bool isRecursiveContainer =
+      op->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+  if (isRecursiveContainer) {
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region) {
+        for (Operation &nestedOp : block) {
+          if (mayWriteActiveMemory(&nestedOp, gutils))
+            return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
 // Returns true iff the operation:
 //    1. Produces no active data nor active pointers
-//    2. Does not propagate active data nor pointers (via side effects)
+//    2. Does not need its reverse hook to update shadow memory: an op with a
+//       ReverseAutoDiffOpInterface must be read-only, an op without one must
+//       not write to active memory.
+//    3. Does not propagate active data nor pointers (via side effects)
 static bool isFullyInactive(Operation *op, MGradientUtils *gutils) {
-  return llvm::all_of(
-             op->getResults(),
-             [gutils](Value v) { return gutils->isConstantValue(v); }) &&
-         gutils->isConstantInstruction(op);
+  for (auto v : op->getResults()) {
+    if (!gutils->isConstantValue(v)) {
+      return false;
+    }
+  }
+
+  if (!gutils->isConstantInstruction(op))
+    return false;
+
+  if (isa<ReverseAutoDiffOpInterface>(op))
+    return oputils::isReadOnly(op);
+
+  return !mayWriteActiveMemory(op, gutils);
 }
 
 /*
@@ -58,7 +111,8 @@ LogicalResult MEnzymeLogic::visitChild(Operation *op, OpBuilder &builder,
   if (auto ifaceOp = dyn_cast<ReverseAutoDiffOpInterface>(op)) {
     SmallVector<Value> caches = ifaceOp.cacheValues(gutils);
     OpBuilder augmentBuilder(gutils->getNewFromOriginal(op));
-    ifaceOp.createShadowValues(augmentBuilder, gutils);
+    if (failed(ifaceOp.createShadowValues(augmentBuilder, gutils)))
+      return failure();
     return ifaceOp.createReverseModeAdjoint(builder, gutils, caches);
   }
   op->emitError() << "could not compute the adjoint for this operation " << *op;
@@ -173,8 +227,6 @@ LogicalResult MEnzymeLogic::differentiate(
     llvm::function_ref<buildReturnFunction> buildFuncReturnOp,
     std::function<std::pair<Value, Value>(Type)> cacheCreator) {
   gutils->registerCacheCreatorHook(cacheCreator);
-  auto scope = llvm::make_scope_exit(
-      [&]() { gutils->deregisterCacheCreatorHook(cacheCreator); });
 
   gutils->createReverseModeBlocks(oldRegion, newRegion);
 
@@ -186,6 +238,8 @@ LogicalResult MEnzymeLogic::differentiate(
     valid &= visitChildren(&oBB, reverseBB, gutils).succeeded();
     handlePredecessors(&oBB, newBB, reverseBB, gutils, buildFuncReturnOp);
   }
+
+  gutils->deregisterCacheCreatorHook(cacheCreator);
   return success(valid);
 }
 
@@ -193,14 +247,16 @@ FunctionOpInterface MEnzymeLogic::CreateReverseDiff(
     FunctionOpInterface fn, std::vector<DIFFE_TYPE> retType,
     std::vector<DIFFE_TYPE> constants, MTypeAnalysis &TA,
     std::vector<bool> returnPrimals, std::vector<bool> returnShadows,
-    DerivativeMode mode, bool freeMemory, size_t width, mlir::Type addedType,
-    MFnTypeInfo type_args, std::vector<bool> volatile_args, void *augmented,
-    bool omp, llvm::StringRef postpasses, bool verifyPostPasses,
-    bool strongZero) {
+    DerivativeMode mode, bool freeMemory, bool atomicAdd, size_t width,
+    mlir::Type addedType, MFnTypeInfo type_args,
+    std::vector<bool> overwritten_args, void *augmented, bool omp,
+    llvm::StringRef postpasses, bool verifyPostPasses, bool strongZero,
+    bool markReadonly) {
 
   if (fn.getFunctionBody().empty()) {
-    llvm::errs() << fn << "\n";
-    llvm_unreachable("Differentiating empty function");
+    fn.emitError() << "cannot differentiate a function without a body: "
+                   << fn.getNameAttr() << "\n";
+    return nullptr;
   }
 
   MReverseCacheKey tup = {fn,
@@ -210,10 +266,11 @@ FunctionOpInterface MEnzymeLogic::CreateReverseDiff(
                           returnShadows,
                           mode,
                           freeMemory,
+                          atomicAdd,
                           static_cast<unsigned>(width),
                           addedType,
                           type_args,
-                          volatile_args,
+                          overwritten_args,
                           omp};
 
   {
@@ -229,6 +286,13 @@ FunctionOpInterface MEnzymeLogic::CreateReverseDiff(
       *this, mode, width, fn, TA, type_args, returnPrimalsP, returnShadowsP,
       retType, constants, addedType, omp, postpasses, verifyPostPasses,
       strongZero);
+  if (markReadonly) {
+    markReadOnlyLoads(gutils->oldFunc, [&](Operation *origOp) {
+      gutils->getNewFromOriginal(origOp)->setAttr(
+          "enzyme.readonly", UnitAttr::get(origOp->getContext()));
+    });
+  }
+  gutils->AtomicAdd = atomicAdd;
 
   ReverseCachedFunctions[tup] = gutils->newFunc;
 

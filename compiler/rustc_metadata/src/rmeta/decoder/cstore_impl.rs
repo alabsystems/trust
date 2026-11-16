@@ -2,14 +2,15 @@ use std::any::Any;
 use std::mem;
 use std::sync::Arc;
 
-use rustc_hir::attrs::Deprecation;
+use rustc_attr_ir::Deprecation;
+use rustc_crate_store::{CrateStore, ExternCrate};
+use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LOCAL_CRATE};
 use rustc_hir::definitions::{DefKey, DefPath, DefPathHash};
 use rustc_middle::arena::ArenaAllocatable;
-use rustc_middle::bug;
-use rustc_middle::metadata::{AmbigModChild, ModChild};
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
+use rustc_middle::middle::resolve::{AmbigModChild, ModChild};
 use rustc_middle::middle::stability::DeprecationEntry;
 use rustc_middle::mir::trust_contract::TrustContractBundle;
 use rustc_middle::queries::ExternProviders;
@@ -19,9 +20,9 @@ use rustc_middle::ty::{self, TyCtxt, TypeVisitable};
 use rustc_middle::util::Providers;
 use rustc_serialize::Decoder;
 use rustc_session::StableCrateId;
-use rustc_session::cstore::{CrateStore, ExternCrate};
+use rustc_span::def_id::{LocalDefId, ModId};
 use rustc_span::hygiene::ExpnId;
-use rustc_span::{Span, Symbol, kw};
+use rustc_span::{Span, Symbol, bug, kw};
 
 use super::{Decodable, DecodeIterator};
 use crate::creader::{CStore, LoadedMacro};
@@ -192,6 +193,13 @@ impl IntoArgs for DefId {
     }
 }
 
+impl IntoArgs for ModId {
+    type Other = ();
+    fn into_args(self) -> (DefId, ()) {
+        (self.to_def_id(), ())
+    }
+}
+
 impl IntoArgs for CrateNum {
     type Other = ();
     fn into_args(self) -> (DefId, ()) {
@@ -223,17 +231,18 @@ impl IntoArgs for (CrateNum, SimplifiedType) {
 provide! { tcx, def_id, other, cdata,
     explicit_item_bounds => { table_defaulted_array }
     explicit_item_self_bounds => { table_defaulted_array }
-    explicit_predicates_of => { table }
+    explicit_clauses_of => { table }
     generics_of => { table }
     inferred_outlives_of => { table_defaulted_array }
-    explicit_super_predicates_of => { table_defaulted_array }
-    explicit_implied_predicates_of => { table_defaulted_array }
+    explicit_super_clauses_of => { table_defaulted_array }
+    explicit_implied_clauses_of => { table_defaulted_array }
     type_of => { table }
-    type_alias_is_lazy => { table_direct }
+    type_alias_is_checked => { table_direct }
     variances_of => { table }
     fn_sig => { table }
     codegen_fn_attrs => { table }
     impl_trait_header => { table }
+    impl_is_fully_generic_for_reflection => { table_direct }
     const_param_default => { table }
     object_lifetime_default => { table }
     thir_abstract_const => { table }
@@ -336,11 +345,33 @@ provide! { tcx, def_id, other, cdata,
     // at the extern `optimized_mir`/`mir_for_ctfe` decode arms above, plus the local
     // re-gate inside the readmission provider — these three feed it and decide nothing.
     trust_clean_verdict_digest => { table }
+    // Trust: ODT transport only. The logical-face query owns local B1 readmission.
+    trust_odt_entry => { table }
     trust_clean_island_sources => {
         cdata.root.trust_clean_island_sources.decode((cdata, tcx)).collect()
     }
     trust_clean_origin_exports => {
-        cdata.root.trust_clean_origin_exports.decode((cdata, tcx)).collect()
+        // Trust: stored as `LocalDefId` (see the CrateRoot field); the query's
+        // element is the exporting crate's raw index.
+        cdata.root
+            .trust_clean_origin_exports
+            .decode((cdata, tcx))
+            .map(|local: LocalDefId| local.local_def_index)
+            .collect()
+    }
+    // Trust: cross-crate PROOF-position citation, increment 2 — the transport manifest.
+    // Also authority-free: the two strings it carries are the ones the consumer COMPARES
+    // (kernel version) and RECOMPUTES (source digest) before it re-elaborates the bytes.
+    // `None` for a crate that encoded no islands, which is every ordinary crate.
+    trust_clean_proof_manifest => {
+        cdata.root.trust_clean_proof_manifest.map(|lazy| lazy.decode((cdata, tcx)))
+    }
+    // Trust: step 2 increment 6 (6.2) — the trust-ir carrier, read back as written. Plain
+    // decodes, authority-free: the consumer checks the entry's digest and binding and
+    // re-derives every verdict (D4, D39 (ii)).
+    trust_ir_entry => { table }
+    trust_ir_crate_header => {
+        cdata.root.trust_ir_header.map(|lazy| lazy.decode((cdata, tcx)))
     }
     // Trust: (I7) — decode-only unreadmitted MIR accessors, for the readmission provider
     // ONLY: it must re-gate the same bodies the guarded arms would serve, without
@@ -418,6 +449,18 @@ provide! { tcx, def_id, other, cdata,
     attrs_for_def => { tcx.arena.alloc_from_iter(cdata.get_item_attrs(tcx, def_id.index)) }
     is_mir_available => { cdata.is_item_mir_available(def_id.index) }
     cross_crate_inlinable => { table_direct }
+    // Trust: D4 increment A (2026-09-24) — the extern half of the user-`unsafe`
+    // source fact. The row is stored negated ("known free of user unsafe"), so a
+    // missing row — a def the producer did not vouch for — answers `true`.
+    trust_def_has_user_unsafe_source => {
+        !cdata.root.tables.trust_no_user_unsafe_source.get(cdata, def_id.index)
+    }
+    // Trust: CB3 (2026-09-28) — the extern half of the per-def island marker. The
+    // row is written only for an island, so a missing row answers `false`: a
+    // `DefKind::GlobalAsm` def the producer did not vouch for stays real assembly.
+    trust_def_is_clean_island => {
+        cdata.root.tables.trust_clean_island_item.get(cdata, def_id.index)
+    }
 
     dylib_dependency_formats => { cdata.get_dylib_dependency_formats(tcx) }
     is_private_dep => { cdata.private_dep }
@@ -446,6 +489,10 @@ provide! { tcx, def_id, other, cdata,
     is_no_builtins => { cdata.root.no_builtins }
     symbol_mangling_version => { cdata.root.symbol_mangling_version }
     specialization_enabled_in => { cdata.root.specialization_enabled_in }
+    // Trust (2026-10-03): the per-crate "may install an allocation-error hook" fact.
+    trust_crate_references_alloc_error_hook => { cdata.root.trust_references_alloc_error_hook }
+    // Trust (T6): was the crate's MIR built by the proof-session -O0 pipeline?
+    trust_crate_mir_is_proof_session_pipeline => { cdata.root.trust_proof_session_mir }
     reachable_non_generics => {
         let reachable_non_generics = tcx
             .exported_non_generic_symbols(cdata.cnum)
@@ -463,12 +510,12 @@ provide! { tcx, def_id, other, cdata,
     }
     native_libraries => { cdata.get_native_libraries(tcx).collect() }
     foreign_modules => { cdata.get_foreign_modules(tcx).map(|m| (m.def_id, m)).collect() }
-    crate_hash => { cdata.root.header.hash }
+    crate_hash => { cdata.hash() }
     crate_host_hash => { cdata.host_hash }
     crate_name => { cdata.root.header.name }
     num_extern_def_ids => { cdata.num_def_ids() }
 
-    extra_filename => { cdata.root.extra_filename.clone() }
+    extra_filename => { tcx.arena.alloc_str(&cdata.unhashed.extra_filename) }
 
     traits => { tcx.arena.alloc_from_iter(cdata.get_traits(tcx)) }
     trait_impls_in_crate => { tcx.arena.alloc_from_iter(cdata.get_trait_impls(tcx)) }
@@ -487,6 +534,8 @@ provide! { tcx, def_id, other, cdata,
     intrinsic_raw => { cdata.get_intrinsic(tcx, def_id.index) }
     defined_lang_items => { cdata.get_lang_items(tcx) }
     diagnostic_items => { cdata.get_diagnostic_items(tcx) }
+    canonical_symbols => { cdata.get_canonical_symbols(tcx) }
+    fake_doc_items => { cdata.get_fake_doc_items(tcx) }
     missing_lang_items => { cdata.get_missing_lang_items(tcx) }
 
     missing_extern_crate_item => {
@@ -503,7 +552,9 @@ provide! { tcx, def_id, other, cdata,
     exported_non_generic_symbols => { cdata.exported_non_generic_symbols(tcx) }
     exported_generic_symbols => { cdata.exported_generic_symbols(tcx) }
 
-    crate_extern_paths => { cdata.source().paths().cloned().collect() }
+    crate_extern_paths => {
+        tcx.arena.alloc_from_iter(cdata.source().paths().map(|p| tcx.arena.alloc_path(p)))
+    }
     expn_that_defined => { cdata.get_expn_that_defined(tcx, def_id.index) }
     default_field => { cdata.get_default_field(tcx, def_id.index) }
     is_doc_hidden => { cdata.get_attr_flags(def_id.index).contains(AttrFlags::IS_DOC_HIDDEN) }
@@ -513,6 +564,7 @@ provide! { tcx, def_id, other, cdata,
     }
     anon_const_kind => { table }
     const_of_item => { table }
+    args_known_to_outlive_alias_params => { table }
 }
 
 pub(in crate::rmeta) fn provide(providers: &mut Providers) {
@@ -557,7 +609,7 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
             // the former.
             // This is a rudimentary check that does not catch all cases,
             // just the easiest.
-            let mut fallback_map: Vec<(DefId, DefId)> = Default::default();
+            let mut fallback_map: FxHashMap<DefId, DefId> = Default::default();
 
             // Issue 46112: We want the map to prefer the shortest
             // paths when reporting the path to an item. Therefore we
@@ -586,14 +638,14 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
                 }
 
                 if let Some(def_id) = child.res.opt_def_id() {
+                    let mut fallback = false;
+
                     if child.ident.name == kw::Underscore {
-                        fallback_map.push((def_id, parent));
-                        return;
+                        fallback = true;
                     }
 
                     if tcx.is_doc_hidden(parent) {
-                        fallback_map.push((def_id, parent));
-                        return;
+                        fallback = true;
                     }
 
                     // If the re-export itself is `#[doc(hidden)]`, deprioritize it.
@@ -604,20 +656,40 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
                         .and_then(|r| r.id())
                         .is_some_and(|id| tcx.is_doc_hidden(id))
                     {
-                        fallback_map.push((def_id, parent));
-                        return;
+                        fallback = true;
                     }
 
                     match visible_parent_map.entry(def_id) {
                         Entry::Occupied(mut entry) => {
-                            // If `child` is defined in crate `cnum`, ensure
-                            // that it is mapped to a parent in `cnum`.
-                            if def_id.is_local() && entry.get().is_local() {
-                                entry.insert(parent);
+                            if !fallback {
+                                // If `child` is defined in crate `cnum`, ensure
+                                // that it is mapped to a parent in `cnum`.
+                                if def_id.is_local() && entry.get().is_local() {
+                                    entry.insert(parent);
+                                }
                             }
                         }
                         Entry::Vacant(entry) => {
-                            entry.insert(parent);
+                            if !fallback {
+                                entry.insert(parent);
+                            }
+
+                            // Make sure that we have not already explored this child
+                            // through a previous fallback entry further up the BFS,
+                            // in which case we do not want to put it back into the BFS queue,
+                            // nor record a new fallback parent.
+                            if fallback_map.contains_key(&def_id) {
+                                return;
+                            }
+
+                            if fallback {
+                                // We do all of the same steps to fallback entries as to
+                                // preferred entries, except for recording them in a separate map.
+                                // It is important to not return early in the fallback cases to
+                                // ensure that we extend the BFS to the children of fallback items.
+                                fallback_map.insert(def_id, parent);
+                            }
+
                             if child.res.module_like_def_id().is_some() {
                                 bfs_queue.push_back(def_id);
                             }
@@ -635,7 +707,14 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
             // Fill in any missing entries with the less preferable path.
             // If this path re-exports the child as `_`, we still use this
             // path in a diagnostic that suggests importing `::*`.
-
+            // We must extend the fallback map with items from the visible parent map
+            // as the extend call overrides existing entries from the latter map,
+            // which we prefer over fallback entries.
+            // FIXME: The Unord* APIs lack an efficient way of merging
+            //        the values of one map for only the missing keys of the other map,
+            //        which is required to merge the fallback map into the visible parent map.
+            //        In the meantime, use an "ordered" map internally for fallback entries.
+            #[allow(rustc::potential_query_instability)]
             for (child, parent) in fallback_map {
                 visible_parent_map.entry(child).or_insert(parent);
             }
@@ -731,12 +810,13 @@ impl CStore {
         self.get_crate_data(cnum).num_def_ids()
     }
 
+    // Trust (D21): preserve checked absence across the metadata boundary.
     pub fn get_proc_macro_quoted_span_untracked(
         &self,
         tcx: TyCtxt<'_>,
         cnum: CrateNum,
         id: usize,
-    ) -> Span {
+    ) -> Option<Span> {
         self.get_crate_data(cnum).get_proc_macro_quoted_span(tcx, id)
     }
 

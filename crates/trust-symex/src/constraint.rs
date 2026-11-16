@@ -116,37 +116,37 @@ impl ConstraintSet {
 /// - Flatten nested `And` at the top level.
 #[must_use]
 pub fn simplify_constraints(constraints: &[Formula]) -> Vec<Formula> {
-    let mut result: Vec<Formula> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::default();
+    let mut result: Vec<Formula> = Vec::with_capacity(constraints.len());
 
     for c in constraints {
-        // Flatten nested And.
-        let flattened = flatten_and(c);
-        for f in flattened {
-            // Skip tautologies.
-            if f == Formula::Bool(true) {
-                continue;
-            }
-            // Contradiction: short-circuit.
-            if f == Formula::Bool(false) {
-                return vec![Formula::Bool(false)];
-            }
-            // Deduplicate via debug representation (structural equality).
-            let key = format!("{f:?}");
-            if seen.insert(key) {
-                result.push(f);
-            }
+        if visit_conjuncts(c, &mut result) {
+            return vec![Formula::Bool(false)];
         }
     }
 
     if result.is_empty() { vec![Formula::Bool(true)] } else { result }
 }
 
-/// Flatten top-level `And` nodes into a flat list.
-fn flatten_and(f: &Formula) -> Vec<Formula> {
+/// Visit top-level `And` conjuncts in `f`, appending simplified unique conjuncts to `result`.
+/// Returns `true` if a `Bool(false)` contradiction was encountered.
+fn visit_conjuncts(f: &Formula, result: &mut Vec<Formula>) -> bool {
     match f {
-        Formula::And(children) => children.iter().flat_map(flatten_and).collect(),
-        other => vec![other.clone()],
+        Formula::And(children) => {
+            for child in children {
+                if visit_conjuncts(child, result) {
+                    return true;
+                }
+            }
+            false
+        }
+        Formula::Bool(true) => false,
+        Formula::Bool(false) => true,
+        other => {
+            if !result.contains(other) {
+                result.push(other.clone());
+            }
+            false
+        }
     }
 }
 
@@ -174,25 +174,11 @@ pub fn check_feasibility(constraints: &ConstraintSet) -> FeasibilityResult {
     }
 
     // Check for direct contradictions: X and Not(X) both present.
-    let mut pos: BTreeSet<String> = BTreeSet::default();
-    let mut neg: BTreeSet<String> = BTreeSet::default();
     for f in &simplified {
-        let key = format!("{f:?}");
-        match f {
-            Formula::Not(inner) => {
-                let inner_key = format!("{inner:?}");
-                neg.insert(inner_key.clone());
-                if pos.contains(&inner_key) {
-                    return FeasibilityResult::Infeasible;
-                }
-            }
-            _ => {
-                pos.insert(key);
-                let neg_key = format!("{f:?}");
-                if neg.contains(&neg_key) {
-                    return FeasibilityResult::Infeasible;
-                }
-            }
+        if let Formula::Not(inner) = f
+            && simplified.iter().any(|other| other == &**inner)
+        {
+            return FeasibilityResult::Infeasible;
         }
     }
 
@@ -217,16 +203,16 @@ pub fn independence_splitting(constraints: &ConstraintSet) -> Vec<ConstraintSet>
     let formulas = constraints.formulas();
     let n = formulas.len();
 
-    // Collect free variables for each constraint.
-    let vars_per_constraint: Vec<BTreeSet<String>> = formulas.iter().map(collect_vars).collect();
-
-    // Union-find: group constraints that share variables.
+    // Collect free variables for each constraint and union constraints sharing a variable.
     let mut parent: Vec<usize> = (0..n).collect();
+    let mut first_owner: BTreeMap<&str, usize> = BTreeMap::default();
 
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if !vars_per_constraint[i].is_disjoint(&vars_per_constraint[j]) {
-                union(&mut parent, i, j);
+    for (i, f) in formulas.iter().enumerate() {
+        for var in collect_vars(f) {
+            if let Some(&owner) = first_owner.get(var) {
+                union(&mut parent, owner, i);
+            } else {
+                first_owner.insert(var, i);
             }
         }
     }
@@ -238,17 +224,12 @@ pub fn independence_splitting(constraints: &ConstraintSet) -> Vec<ConstraintSet>
         groups.entry(root).or_default().push(f.clone());
     }
 
-    // Build output ConstraintSets in a deterministic order.
-    let mut roots: Vec<usize> = groups.keys().copied().collect();
-    roots.sort_unstable();
-
-    roots
-        .into_iter()
-        .map(|root| {
+    // BTreeMap iterates keys in ascending order, preserving deterministic root order.
+    groups
+        .into_values()
+        .map(|group| {
             let mut cs = ConstraintSet::new();
-            // SAFETY: root came from groups.keys(), so it must exist in the map.
-            for f in groups.remove(&root).unwrap_or_else(|| unreachable!("root key not in groups"))
-            {
+            for f in group {
                 cs.add(f);
             }
             cs
@@ -257,16 +238,16 @@ pub fn independence_splitting(constraints: &ConstraintSet) -> Vec<ConstraintSet>
 }
 
 /// Collect all variable names occurring in a formula.
-fn collect_vars(f: &Formula) -> BTreeSet<String> {
+fn collect_vars(f: &Formula) -> BTreeSet<&str> {
     let mut out = BTreeSet::default();
     collect_vars_inner(f, &mut out);
     out
 }
 
-fn collect_vars_inner(f: &Formula, out: &mut BTreeSet<String>) {
+fn collect_vars_inner<'a>(f: &'a Formula, out: &mut BTreeSet<&'a str>) {
     match f {
         Formula::Var(name, _) => {
-            out.insert(name.clone());
+            out.insert(name.as_str());
         }
         // Unary wrappers.
         Formula::Not(inner)

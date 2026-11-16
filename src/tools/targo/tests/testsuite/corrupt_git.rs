@@ -34,6 +34,13 @@ fn deleting_database_files() {
             ),
         )
         .file("src/lib.rs", "")
+        .file(
+            ".cargo/config.toml",
+            "
+                [net]
+                git-fetch-with-cli = false
+                ",
+        )
         .build();
 
     project.cargo("check").run();
@@ -42,7 +49,7 @@ fn deleting_database_files() {
     find_files(&paths::home().join(".cargo/git/db"), &mut files);
     assert!(!files.is_empty());
 
-    let log = "cargo::sources::git=trace";
+    let log = "targo::sources::git=trace";
     for file in files {
         if !file.exists() {
             continue;
@@ -92,6 +99,13 @@ fn deleting_checkout_files() {
             ),
         )
         .file("src/lib.rs", "")
+        .file(
+            ".cargo/config.toml",
+            "
+                [net]
+                git-fetch-with-cli = false
+                ",
+        )
         .build();
 
     project.cargo("check").run();
@@ -118,7 +132,7 @@ fn deleting_checkout_files() {
     find_files(&dir, &mut files);
     assert!(!files.is_empty());
 
-    let log = "cargo::sources::git=trace";
+    let log = "targo::sources::git=trace";
     for file in files {
         if !file.exists() {
             continue;

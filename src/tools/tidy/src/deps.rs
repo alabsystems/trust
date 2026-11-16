@@ -1,18 +1,16 @@
 //! Checks the licenses of third-party dependencies.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::fs::{File, read_dir};
-use std::io::Write;
+use std::fs::{self, read_dir};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{io, thread};
 
 use cargo_metadata::semver::Version;
 use cargo_metadata::{Metadata, Package, PackageId};
 
 use crate::diagnostics::{RunningCheck, TidyCtx};
-
-#[path = "../../../bootstrap/src/utils/proc_macro_deps.rs"]
-mod proc_macro_deps;
 
 #[derive(Clone, Copy)]
 struct ListLocation {
@@ -38,6 +36,7 @@ macro_rules! location {
 #[rustfmt::skip]
 const LICENSES: &[&str] = &[
     // tidy-alphabetical-start
+    "(MIT OR Apache-2.0) AND MIT",
     "0BSD OR MIT OR Apache-2.0",                           // adler2 license
     "Apache-2.0 / MIT",
     "Apache-2.0 OR ISC OR MIT",
@@ -97,13 +96,32 @@ pub(crate) struct WorkspaceInfo<'a> {
     pub(crate) path: &'a str,
     /// The list of license exceptions.
     pub(crate) exceptions: ExceptionList,
-    /// Optionally:
-    /// * A list of crates for which dependencies need to be explicitly allowed.
-    /// * The list of allowed dependencies.
-    /// * The source code location of the allowed dependencies list
-    crates_and_deps: Option<(&'a [&'a str], &'a [&'a str], ListLocation)>,
+    /// The list of dependencies that are allowed. If None, any crate with an
+    /// acceptable license is allowed.
+    allowed_deps: Option<PermittedDeps<'a>>,
     /// Submodules required for the workspace
     pub(crate) submodules: &'a [&'a str],
+}
+
+#[derive(Clone, Copy)]
+struct PermittedDeps<'a> {
+    /// A list of crates for which dependencies need to be explicitly allowed
+    /// or None to check the entire workspace.
+    roots: Option<&'a [&'a str]>,
+    /// The list of allowed dependencies.
+    deps: &'a [&'a str],
+    /// The source code location of the allowed dependencies list.
+    deps_loc: ListLocation,
+}
+
+impl<'a> PermittedDeps<'a> {
+    const fn new(
+        roots: Option<&'a [&'a str]>,
+        deps: &'a [&'a str],
+        deps_loc: ListLocation,
+    ) -> Self {
+        Self { roots, deps, deps_loc }
+    }
 }
 
 const WORKSPACE_LOCATION: ListLocation = location!(+4);
@@ -115,8 +133,8 @@ pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
     WorkspaceInfo {
         path: ".",
         exceptions: EXCEPTIONS,
-        crates_and_deps: Some((
-            &["rustc-main"],
+        allowed_deps: Some(PermittedDeps::new(
+            Some(&["rustc-main"]),
             PERMITTED_RUSTC_DEPENDENCIES,
             PERMITTED_RUSTC_DEPS_LOCATION,
         )),
@@ -125,8 +143,8 @@ pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
     WorkspaceInfo {
         path: "library",
         exceptions: EXCEPTIONS_STDLIB,
-        crates_and_deps: Some((
-            &["sysroot"],
+        allowed_deps: Some(PermittedDeps::new(
+            None,
             PERMITTED_STDLIB_DEPENDENCIES,
             PERMITTED_STDLIB_DEPS_LOCATION,
         )),
@@ -135,19 +153,19 @@ pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
     WorkspaceInfo {
         path: "library/stdarch",
         exceptions: EXCEPTIONS_STDARCH,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &[],
     },
     WorkspaceInfo {
         path: "src/bootstrap",
         exceptions: EXCEPTIONS_BOOTSTRAP,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &[],
     },
     WorkspaceInfo {
         path: "src/tools/targo",
         exceptions: EXCEPTIONS_CARGO,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &["src/tools/targo"],
     },
     // FIXME uncomment once all deps are vendored
@@ -164,19 +182,19 @@ pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
     WorkspaceInfo {
         path: "src/tools/rust-analyzer",
         exceptions: EXCEPTIONS_RUST_ANALYZER,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &[],
     },
     WorkspaceInfo {
         path: "src/tools/rustbook",
         exceptions: EXCEPTIONS_RUSTBOOK,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &[],
     },
     WorkspaceInfo {
         path: "tests/run-make-cargo/uefi-qemu/uefi_qemu_test",
         exceptions: EXCEPTIONS_UEFI_QEMU_TEST,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &[],
     },
 ];
@@ -293,7 +311,6 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "equivalent",
     "errno",
     "expect-test",
-    "fallible-iterator", // dependency of `thorin`
     "fastrand",
     "find-msvc-tools",
     "flate2",
@@ -308,11 +325,10 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "gimli",
     "gsgdt",
     "hashbrown",
-    "icu_collections",
     "icu_list",
-    "icu_locale",
     "icu_locale_core",
-    "icu_locale_data",
+    "icu_locale_fallback",
+    "icu_locale_fallback_data",
     "icu_provider",
     "ident_case",
     "indexmap",
@@ -323,9 +339,11 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "itoa",
     "jiff",
     "jiff-static",
+    "jiff-tzdb",
+    "jiff-tzdb-platform",
     "jobserver",
     "lazy_static",
-    "leb128",
+    "leb128fmt",
     "libc",
     "libloading",
     "linux-raw-sys",
@@ -358,7 +376,6 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "ppv-lite86",
     "proc-macro-hack",
     "proc-macro2",
-    "psm",
     "pulldown-cmark",
     "pulldown-cmark-escape",
     "punycode",
@@ -382,11 +399,13 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "rustc_apfloat",
     "rustix",
     "ruzstd", // via object in thorin-dwp
+    "ryu",
     "schemars",
     "schemars_derive",
     "scoped-tls",
     "scopeguard",
     "self_cell",
+    "semver",
     "serde",
     "serde_core",
     "serde_derive",
@@ -400,7 +419,6 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "simd-adler32",
     "smallvec",
     "stable_deref_trait",
-    "stacker",
     "static_assertions",
     "strsim",
     "syn",
@@ -437,7 +455,6 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "unicode-script",
     "unicode-security",
     "unicode-width",
-    "utf8_iter",
     "utf8parse",
     "valuable",
     "version_check",
@@ -502,7 +519,7 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
 #[rustfmt::skip]
 const TRUST_RETIRED_UPSTREAM_RUSTC_DEPENDENCIES: &[&str] = &[
     // tidy-alphabetical-start
-    "arrayref",   // blake3 1.8.7 replaced it with arrayvec
+    "ryu",        // serde_json 1.0.151 replaced it with zmij; upstream 1.101 pins 1.0.145
     // tidy-alphabetical-end
 ];
 
@@ -517,7 +534,7 @@ const TRUST_RETIRED_UPSTREAM_RUSTC_DEPENDENCIES: &[&str] = &[
 /// verifier-stack drift is auditable on its own, and mixing upstream drift into
 /// it would destroy exactly that.
 ///
-/// Each row carries the edge that introduces it, traced 2026-08-22 through
+/// Each row carries the edge that introduces it, traced 2026-08-22 (borsh/chacha20/core_detect rows traced 2026-10-17) through
 /// `cargo metadata --all-features` (which is the configuration tidy itself
 /// resolves, so an optional feature that upstream never activates still counts
 /// here). When a merge brings upstream's own list forward past these, the rows
@@ -525,12 +542,13 @@ const TRUST_RETIRED_UPSTREAM_RUSTC_DEPENDENCIES: &[&str] = &[
 #[rustfmt::skip]
 const TRUST_UPSTREAM_DRIFT_RUSTC_DEPENDENCIES: &[&str] = &[
     // tidy-alphabetical-start
-    "defmt",                     // rustc_driver_impl <- jiff <- jiff-static <- jiff-core <- defmt
-    "defmt-macros",              //   "  <- defmt <- defmt-macros
-    "defmt-parser",              //   "  <- defmt-macros <- defmt-parser
+    "borsh",                     // bit-vec <- borsh (optional serde-adjacent feature; tidy resolves --all-features)
+    "borsh-derive",              //   "  <- borsh <- borsh-derive
+    "chacha20",                  // rand <- rand_chacha <- chacha20 (and proptest <- rand), dev-graph only
+    "core_detect",               // proptest <- core_detect, dev-graph only
     "icu_locale_fallback",       // rustc_error_messages <- icu_locale <- icu_locale_fallback
     "icu_locale_fallback_data",  //   "  <- icu_locale_fallback <- icu_locale_fallback_data
-    "jiff-core",                 // rustc_driver_impl <- jiff <- jiff-static <- jiff-core
+    "zmij",                      // rustc_errors <- serde_json 1.0.151 <- zmij (2026-11-08)
     // tidy-alphabetical-end
 ];
 
@@ -573,7 +591,6 @@ const TRUST_UPSTREAM_DRIFT_RUSTC_DEPENDENCIES: &[&str] = &[
 const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     // tidy-alphabetical-start
     "ahash",
-    "android_system_properties",
     "anyhow",
     "autocfg",
     "az",
@@ -586,15 +603,7 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "bytemuck",
     "bytemuck_derive",
     "bytes",
-    "camino",
     "carcara",
-    "cargo-manifest",
-    "cargo-platform",
-    "cargo_metadata",
-    "clap",
-    "clap_builder",
-    "clap_derive",
-    "clap_lex",
     "const-oid",
     "crossbeam-channel",
     "crossbeam-queue",
@@ -607,9 +616,6 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "fixedbitset",
     "fs2",
     "gmp-mpfr-sys",
-    "heck",
-    "hmac",
-    "home",
     "httparse",
     "hybrid-array",
     "inventory",
@@ -619,53 +625,36 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "logos-derive",
     "lz4_flex",
     "mio",
+    "nom",                    // Trust: carcara's parser (D6), reached via clean-auto's carcara-verify feature
     "num-bigint",
     "num-integer",
     "num-rational",
     "num-traits",
-    "objc2-cloud-kit",
-    "objc2-core-data",
-    "objc2-core-foundation",
-    "objc2-core-graphics",
-    "objc2-core-image",
-    "objc2-core-location",
-    "objc2-core-text",
-    "objc2-foundation",
-    "objc2-io-surface",
-    "objc2-quartz-core",
-    "objc2-ui-kit",
-    "objc2-user-notifications",
-    "os_info",
     "percent-encoding",
     "pkcs8",
     "pkg-config",
     "proc-macro-crate",
     "proptest",
+    "psm",                    // Trust: restored rustc_data_structures::stack (upstream deleted it at 1.101; stacker+psm came back with it)
     "quick-error",
     "rayon",
     "rayon-core",
-    "rmp",
-    "rmp-serde",
     "rug",
     "rustc-std-workspace-core",
-    "rustdoc-json-stable",
     "rustdoc-types",
     "rustversion",
     "rusty-fork",
     "semver",
     "serde_spanned",
-    "sha1-checked",
     "sha2-asm",
     "signal-hook",
     "signal-hook-registry",
     "signature",
     "socket2",
     "spki",
-    "strum",
-    "strum_macros",
+    "stacker",                // Trust: restored rustc_data_structures::stack (see psm above)
     "subtle",
     "tokio",
-    "tokio-macros",
     "toml",
     "toml_datetime",
     "toml_edit",
@@ -673,7 +662,6 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "toml_write",
     "unarray",
     "unty",
-    "utf8_iter",
     "virtue",
     "wait-timeout",
     "winapi",
@@ -681,7 +669,6 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "winapi-x86_64-pc-windows-gnu",
     "winnow",
     "zeroize",
-    "zmij",
     "zstd",
     "zstd-safe",
     "zstd-sys",
@@ -698,6 +685,7 @@ const PERMITTED_STDLIB_DEPENDENCIES: &[&str] = &[
     "cfg-if",
     "compiler_builtins",
     "dlmalloc",
+    "find-msvc-tools", // via cc
     "foldhash", // FIXME: only appears in Cargo.lock due to https://github.com/rust-lang/cargo/issues/10801
     "fortanix-sgx-abi",
     "getopts",
@@ -733,22 +721,29 @@ const PERMITTED_STDLIB_DEPENDENCIES: &[&str] = &[
 ///
 /// `root` is path to the directory with the root `Cargo.toml` (for the workspace). `cargo` is path
 /// to the cargo executable.
-pub fn check(root: &Path, cargo: &Path, tidy_ctx: TidyCtx) {
+pub fn check(root: &Path, cargo: &Path, sem: &'_ crate::Semaphore, tidy_ctx: TidyCtx) {
     let mut check = tidy_ctx.start_check("deps");
     let bless = tidy_ctx.is_bless_enabled();
+    let is_ci = tidy_ctx.is_running_on_ci();
 
-    let mut checked_runtime_licenses = false;
+    let checked_runtime_licenses = AtomicBool::new(false);
 
     check_proc_macro_dep_list(root, cargo, bless, &mut check);
 
-    for &WorkspaceInfo { path, exceptions, crates_and_deps, submodules } in WORKSPACES {
-        if has_missing_submodule(root, submodules, tidy_ctx.is_running_on_ci()) {
-            continue;
+    // Trust: deps owns one outer permit. Use it for inline work whenever no
+    // additional permit is free, rather than blocking while holding that permit.
+    for_each_with_parent_permit(WORKSPACES, sem, |workspace| {
+        let WorkspaceInfo { path, exceptions, allowed_deps: crates_and_deps, submodules } =
+            workspace;
+        let check = &check;
+        let checked_runtime_licenses = &checked_runtime_licenses;
+        if has_missing_submodule(root, submodules, is_ci) {
+            return;
         }
 
         if !root.join(path).join("Cargo.lock").exists() {
             check.error(format!("the `{path}` workspace doesn't have a Cargo.lock"));
-            continue;
+            return;
         }
 
         let mut cmd = cargo_metadata::MetadataCommand::new();
@@ -759,37 +754,66 @@ pub fn check(root: &Path, cargo: &Path, tidy_ctx: TidyCtx) {
         let metadata = t!(cmd.exec());
 
         // Check for packages which have been moved into a different workspace and not updated
-        let absolute_root =
-            if path == "." { root.to_path_buf() } else { t!(std::path::absolute(root.join(path))) };
+        let absolute_root = if *path == "." {
+            root.to_path_buf()
+        } else {
+            t!(std::path::absolute(root.join(path)))
+        };
         let absolute_root_real = t!(std::path::absolute(&metadata.workspace_root));
         if absolute_root_real != absolute_root {
             check.error(format!("{path} is part of another workspace ({} != {}), remove from `WORKSPACES` ({WORKSPACE_LOCATION})", absolute_root.display(), absolute_root_real.display()));
         }
-        check_license_exceptions(&metadata, path, exceptions, &mut check);
-        if let Some((crates, permitted_deps, location)) = crates_and_deps {
-            let descr = crates.get(0).unwrap_or(&path);
+        check_license_exceptions(&metadata, path, exceptions, &check);
+        if let Some(PermittedDeps { roots, deps: permitted_deps, deps_loc }) = crates_and_deps {
+            let descr = roots.map_or(path, |roots| roots.get(0).unwrap_or(&path));
             check_permitted_dependencies(
                 &metadata,
                 descr,
                 permitted_deps,
-                crates,
-                location,
-                &mut check,
+                *roots,
+                *deps_loc,
+                &check,
             );
         }
 
-        if path == "library" {
-            check_runtime_license_exceptions(&metadata, &mut check);
-            check_runtime_no_duplicate_dependencies(&metadata, &mut check);
-            check_runtime_no_proc_macros(&metadata, &mut check);
-            checked_runtime_licenses = true;
+        if *path == "library" {
+            check_runtime_license_exceptions(&metadata, &check);
+            check_runtime_no_duplicate_dependencies(&metadata, &check);
+            check_runtime_no_proc_macros(&metadata, &check);
+            checked_runtime_licenses.store(true, Ordering::Relaxed);
         }
-    }
+    });
 
     // Sanity check to ensure we don't accidentally remove the workspace containing the runtime
     // crates.
-    assert!(checked_runtime_licenses);
+    assert!(checked_runtime_licenses.load(Ordering::Relaxed));
 }
+
+// Trust: the caller holds one permit for this thread throughout the scope.
+fn for_each_with_parent_permit<T: Sync>(
+    items: &[T],
+    sem: &crate::Semaphore,
+    action: impl Fn(&T) + Sync,
+) {
+    thread::scope(|scope| {
+        for item in items {
+            let action = &action;
+            if let Some(guard) = sem.try_acquire() {
+                scope.spawn(move || {
+                    action(item);
+                    drop(guard);
+                });
+            } else {
+                action(item);
+            }
+        }
+    });
+}
+
+// Trust: exercise completion and the shared permit limit, including exhaustion
+// by a peer check. A timeout reports the deadlock without hanging the test runner.
+#[cfg(test)]
+mod tests;
 
 /// Ensure the list of proc-macro crate transitive dependencies is up to date
 fn check_proc_macro_dep_list(root: &Path, cargo: &Path, bless: bool, check: &mut RunningCheck) {
@@ -810,53 +834,65 @@ fn check_proc_macro_dep_list(root: &Path, cargo: &Path, bless: bool, check: &mut
     }
     // Remove the proc-macro crates themselves
     proc_macro_deps.retain(|pkg| !is_proc_macro_pkg(&metadata[pkg]));
+    // Sort and deduplicate the crate names.
+    // Cargo package names may contain `-`, but will normalize these to `_` before passing to rustc.
+    // As bootstrap parses the `--crate-name` flag, use the name of the actual lib target which has
+    // been normalized.
+    let proc_macro_deps = proc_macro_deps
+        .into_iter()
+        .filter_map(|dep| {
+            metadata[dep].targets.iter().find_map(|target| target.is_lib().then_some(&target.name))
+        })
+        .collect::<BTreeSet<_>>();
 
-    let proc_macro_deps: HashSet<_> =
-        proc_macro_deps.into_iter().map(|dep| metadata[dep].name.as_ref()).collect();
-    let expected = proc_macro_deps::CRATES.iter().copied().collect::<HashSet<_>>();
+    let expected = {
+        use std::fmt::Write;
 
-    let needs_blessing = proc_macro_deps.difference(&expected).next().is_some()
-        || expected.difference(&proc_macro_deps).next().is_some();
-
-    if needs_blessing && bless {
-        let mut proc_macro_deps: Vec<_> = proc_macro_deps.into_iter().collect();
-        proc_macro_deps.sort();
-        let mut file = File::create(root.join("src/bootstrap/src/utils/proc_macro_deps.rs"))
-            .expect("`proc_macro_deps` should exist");
-        writeln!(
-            &mut file,
-            "/// Do not update manually - use `./x.py test tidy --bless`
+        const HEADER: &str = "\
+/// Do not update manually - use `./x.py test tidy --bless`
 /// Holds all direct and indirect dependencies of proc-macro crates in tree.
 /// See <https://github.com/rust-lang/rust/issues/134863>
 pub static CRATES: &[&str] = &[
-    // tidy-alphabetical-start"
-        )
-        .unwrap();
-        for dep in proc_macro_deps {
-            writeln!(&mut file, "    {dep:?},").unwrap();
-        }
-        writeln!(
-            &mut file,
-            "    // tidy-alphabetical-end
-];"
-        )
-        .unwrap();
-    } else {
-        let mut error_found = false;
+    // tidy-alphabetical-start
+";
+        const FOOTER: &str = "    // tidy-alphabetical-end
+];
+";
 
-        for missing in proc_macro_deps.difference(&expected) {
-            error_found = true;
-            check.error(format!(
-                "proc-macro crate dependency `{missing}` is not registered in `src/bootstrap/src/utils/proc_macro_deps.rs`",
-            ));
+        let mut buf = String::with_capacity(4096);
+        buf.push_str(HEADER);
+        for dep in proc_macro_deps {
+            writeln!(buf, "    {dep:?},").unwrap();
         }
-        for extra in expected.difference(&proc_macro_deps) {
-            error_found = true;
-            check.error(format!(
-                "`{extra}` is registered in `src/bootstrap/src/utils/proc_macro_deps.rs`, but is not a proc-macro crate dependency",
-            ));
+        buf.push_str(FOOTER);
+        buf
+    };
+
+    const PROC_MACRO_DEPS_RS: &str = "src/bootstrap/src/utils/proc_macro_deps.rs";
+    let proc_macro_deps_rs_path = &root.join(PROC_MACRO_DEPS_RS);
+    let actual = match fs::read_to_string(proc_macro_deps_rs_path) {
+        Ok(actual) => actual,
+        Err(e) => {
+            if e.kind() == io::ErrorKind::NotFound {
+                check.error(format!(
+                    "`{PROC_MACRO_DEPS_RS}` not found; has it been moved or renamed?"
+                ));
+            } else {
+                check.error(format!("`{PROC_MACRO_DEPS_RS}` could not be read: {e:?}"));
+            }
+            return;
         }
-        if error_found {
+    };
+
+    if actual != expected {
+        if bless {
+            fs::write(proc_macro_deps_rs_path, &expected).unwrap();
+        } else {
+            let diff = similar::TextDiff::from_lines(&actual, &expected);
+            let mut unified = diff.unified_diff();
+            unified.header(PROC_MACRO_DEPS_RS, "(expected)");
+
+            check.error(format!("`{PROC_MACRO_DEPS_RS}` is not up-to-date:\n{unified}"));
             check.message("Run `./x.py test tidy --bless` to regenerate the list");
         }
     }
@@ -879,7 +915,7 @@ pub fn has_missing_submodule(root: &Path, submodules: &[&str], is_ci: bool) -> b
 ///
 /// Unlike for tools we don't allow exceptions to the `LICENSES` list for the runtime with the sole
 /// exception of `fortanix-sgx-abi` which is only used on x86_64-fortanix-unknown-sgx.
-fn check_runtime_license_exceptions(metadata: &Metadata, check: &mut RunningCheck) {
+fn check_runtime_license_exceptions(metadata: &Metadata, check: &RunningCheck) {
     for pkg in &metadata.packages {
         if pkg.source.is_none() {
             // No need to check local packages.
@@ -914,7 +950,7 @@ fn check_license_exceptions(
     metadata: &Metadata,
     workspace: &str,
     exceptions: &[(&str, &str)],
-    check: &mut RunningCheck,
+    check: &RunningCheck,
 ) {
     // Validate the EXCEPTIONS list hasn't changed.
     for (name, license) in exceptions {
@@ -981,7 +1017,7 @@ fn check_license_exceptions(
     }
 }
 
-fn check_runtime_no_duplicate_dependencies(metadata: &Metadata, check: &mut RunningCheck) {
+fn check_runtime_no_duplicate_dependencies(metadata: &Metadata, check: &RunningCheck) {
     let mut seen_pkgs = HashSet::new();
     for pkg in &metadata.packages {
         if pkg.source.is_none() {
@@ -997,7 +1033,7 @@ fn check_runtime_no_duplicate_dependencies(metadata: &Metadata, check: &mut Runn
     }
 }
 
-fn check_runtime_no_proc_macros(metadata: &Metadata, check: &mut RunningCheck) {
+fn check_runtime_no_proc_macros(metadata: &Metadata, check: &RunningCheck) {
     for pkg in &metadata.packages {
         if pkg.targets.iter().any(|target| target.is_proc_macro()) {
             check.error(format!(
@@ -1018,9 +1054,9 @@ fn check_permitted_dependencies(
     metadata: &Metadata,
     descr: &str,
     permitted_dependencies: &[&'static str],
-    restricted_dependency_crates: &[&'static str],
+    restricted_dependency_crates: Option<&[&'static str]>,
     permitted_location: ListLocation,
-    check: &mut RunningCheck,
+    check: &RunningCheck,
 ) {
     let mut has_permitted_dep_error = false;
     // Trust: two additive lists, kept apart on purpose — verifier-stack drift
@@ -1035,9 +1071,15 @@ fn check_permitted_dependencies(
         Vec::new()
     };
     let mut deps = HashSet::new();
-    for to_check in restricted_dependency_crates {
-        let to_check = pkg_from_name(metadata, to_check);
-        deps_of(metadata, &to_check.id, &mut deps);
+    if let Some(restricted_dependency_crates) = restricted_dependency_crates {
+        for to_check in restricted_dependency_crates {
+            let to_check = pkg_from_name(metadata, to_check);
+            deps_of(metadata, &to_check.id, &mut deps);
+        }
+    } else {
+        for to_check in &metadata.packages {
+            deps_of(metadata, &to_check.id, &mut deps);
+        }
     }
 
     fn compare(pkg: &Package, permitted: &str) -> bool {

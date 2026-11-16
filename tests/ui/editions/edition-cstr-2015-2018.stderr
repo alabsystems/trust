@@ -6,8 +6,8 @@ LL |     c"str";
    |
    = note: you may be trying to write a c-string literal
    = note: c-string literals require Rust 2021 or later
-   = help: pass `--edition 2024` to `trustc`
-   = note: for more on editions, read the Trust Edition Guide
+   = help: pass `--edition 2024` to `rustc`
+   = note: for more on editions, read https://doc.rust-lang.org/edition-guide
 
 error: expected one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found `"str"`
   --> $DIR/edition-cstr-2015-2018.rs:38:7
@@ -17,8 +17,8 @@ LL |     cr"str";
    |
    = note: you may be trying to write a c-string literal
    = note: c-string literals require Rust 2021 or later
-   = help: pass `--edition 2024` to `trustc`
-   = note: for more on editions, read the Trust Edition Guide
+   = help: pass `--edition 2024` to `rustc`
+   = note: for more on editions, read https://doc.rust-lang.org/edition-guide
 
 error: expected one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found `#`
   --> $DIR/edition-cstr-2015-2018.rs:48:7
@@ -28,8 +28,8 @@ LL |     cr##"str"##;
    |
    = note: you may be trying to write a c-string literal
    = note: c-string literals require Rust 2021 or later
-   = help: pass `--edition 2024` to `trustc`
-   = note: for more on editions, read the Trust Edition Guide
+   = help: pass `--edition 2024` to `rustc`
+   = note: for more on editions, read https://doc.rust-lang.org/edition-guide
 
 error: expected one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found `"str"`
   --> $DIR/edition-cstr-2015-2018.rs:58:7
@@ -45,8 +45,6 @@ LL | macro_rules! construct { ($x:ident) => { $x"str" } }
 ...
 LL |     construct!(c);
    |     ------------- in this macro invocation
-   |
-   = note: this error originates in the macro `construct` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: expected one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found `"str"`
   --> $DIR/edition-cstr-2015-2018.rs:6:33
@@ -59,9 +57,8 @@ LL |     contain!();
    |
    = note: you may be trying to write a c-string literal
    = note: c-string literals require Rust 2021 or later
-   = help: pass `--edition 2024` to `trustc`
-   = note: for more on editions, read the Trust Edition Guide
-   = note: this error originates in the macro `contain` (in Nightly builds, run with -Z macro-backtrace for more info)
+   = help: pass `--edition 2024` to `rustc`
+   = note: for more on editions, read https://doc.rust-lang.org/edition-guide
 
 error: aborting due to 6 previous errors
 

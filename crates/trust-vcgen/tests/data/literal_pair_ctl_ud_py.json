@@ -1,0 +1,120 @@
+{
+  "name": "ctl_ud_py",
+  "def_path": "literal_pair_width_arms::ctl_ud_py",
+  "span": {
+    "file": "literal_pair_width_arms.rs",
+    "line_start": 54,
+    "col_start": 0,
+    "line_end": 56,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": true
+          }
+        },
+        "name": "y"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Constant": {
+                      "Int": -128
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_pair_width_arms.rs",
+                "line_start": 55,
+                "col_start": 13,
+                "line_end": 55,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "y",
+                "Int"
+              ]
+            },
+            {
+              "Int": -128
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "y",
+                "Int"
+              ]
+            },
+            {
+              "Int": 127
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

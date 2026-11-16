@@ -1,12 +1,17 @@
 //! This module defines the `Rust` struct, which represents the `[rust]` table
 //! in the `bootstrap.toml` configuration file.
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
 use build_helper::ci::CiEnv;
 use serde::{Deserialize, Deserializer};
 
+use crate::core::backend::CodegenBackendKind;
+use crate::core::config::macros::define_config;
 use crate::core::config::toml::TomlConfig;
-use crate::core::config::{CompressDebuginfo, DebuginfoLevel, Merge, ReplaceOpt, StringOrBool};
-use crate::{BTreeSet, CodegenBackendKind, HashSet, PathBuf, TargetSelection, define_config, exit};
+use crate::core::config::{CompressDebuginfo, DebuginfoLevel, StringOrBool, TargetSelection};
+use crate::utils::helpers;
 
 define_config! {
     /// TOML representation of how the Rust build is configured.
@@ -48,14 +53,13 @@ define_config! {
         llvm_bitcode_linker: Option<bool> = "llvm-bitcode-linker",
         lld: Option<bool> = "lld",
         bootstrap_override_lld: Option<BootstrapOverrideLld> = "bootstrap-override-lld",
-        // FIXME: Remove this option in Spring 2026
-        bootstrap_override_lld_legacy: Option<BootstrapOverrideLld> = "use-lld",
         llvm_tools: Option<bool> = "llvm-tools",
         deny_warnings: Option<bool> = "deny-warnings",
         backtrace_on_ice: Option<bool> = "backtrace-on-ice",
         verify_llvm_ir: Option<bool> = "verify-llvm-ir",
         thin_lto_import_instr_limit: Option<u32> = "thin-lto-import-instr-limit",
         remap_debuginfo: Option<bool> = "remap-debuginfo",
+        // FIXME: Remove this option in Q1 2027
         jemalloc: Option<bool> = "jemalloc",
         test_compare_mode: Option<bool> = "test-compare-mode",
         llvm_libunwind: Option<String> = "llvm-libunwind",
@@ -63,8 +67,10 @@ define_config! {
         ehcont_guard: Option<bool> = "ehcont-guard",
         new_symbol_mangling: Option<bool> = "new-symbol-mangling",
         annotate_moves_size_limit: Option<u64> = "annotate-moves-size-limit",
-        profile_generate: Option<String> = "profile-generate",
-        profile_use: Option<String> = "profile-use",
+        // FIXME: Remove this option at the end of 2026
+        profile_generate: Option<PathBuf> = "profile-generate",
+        // FIXME: Remove this option at the end of 2026
+        profile_use: Option<PathBuf> = "profile-use",
         // ignored; this is set from an env var set by bootstrap.py
         download_rustc: Option<StringOrBool> = "download-rustc",
         lto: Option<String> = "lto",
@@ -72,6 +78,21 @@ define_config! {
         std_features: Option<BTreeSet<String>> = "std-features",
         break_on_ice: Option<bool> = "break-on-ice",
         parallel_frontend_threads: Option<u32> = "parallel-frontend-threads",
+        // Trust: whether a dev stage-1 build's version names its sources (TB1).
+        trust_source_identity: Option<bool> = "trust-source-identity",
+        // Trust: whether a fresh worktree's first build may clone another worktree's
+        // green stage 1 (EW-9, `utils::trust_stage1_seed`).
+        trust_stage1_seed: Option<bool> = "trust-stage1-seed",
+        // Trust: whether bootstrap prunes the superseded units and duplicate objects of its
+        // build trees after every successful run (`utils::trust_prune`).
+        trust_prune_superseded: Option<bool> = "trust-prune-superseded",
+        // Trust: whether every `Mode::Std` unit of a stage >= 1 compiler is built with the
+        // trust-ir producer on, so std's metadata carries trust-ir entries
+        // (`compile::trust_std_rustflags`).
+        trust_ir_metadata: Option<bool> = "trust-ir-metadata",
+        stdlib_semver_baseline: Option<String> = "stdlib-semver-baseline",
+        wasm_proc_macros: Option<bool> = "wasm-proc-macros",
+        wasm_panic_unwind_default: Option<bool> = "wasm-panic-unwind-default",
     }
 }
 
@@ -292,6 +313,10 @@ pub fn check_incompatible_options_for_ci_rustc(
         ci_config_toml.build.as_ref().and_then(|b| b.optimized_compiler_builtins.clone());
     err!(current_optimized_compiler_builtins, optimized_compiler_builtins, "build");
 
+    let current_allocator = current_config_toml.build.as_ref().and_then(|b| b.allocator);
+    let allocator = ci_config_toml.build.as_ref().and_then(|b| b.allocator);
+    err!(current_allocator, allocator, "build");
+
     // We always build the in-tree compiler on cross targets, so we only care
     // about the host target here.
     let host_str = host.to_string();
@@ -304,10 +329,17 @@ pub fn check_incompatible_options_for_ci_rustc(
         ))?;
 
         let profiler = &ci_cfg.profiler;
-        err!(current_cfg.profiler, profiler, "build");
+        err!(current_cfg.profiler, profiler, format!("target.{host_str}"));
 
         let optimized_compiler_builtins = &ci_cfg.optimized_compiler_builtins;
-        err!(current_cfg.optimized_compiler_builtins, optimized_compiler_builtins, "build");
+        err!(
+            current_cfg.optimized_compiler_builtins,
+            optimized_compiler_builtins,
+            format!("target.{host_str}")
+        );
+
+        err!(current_cfg.allocator, &ci_cfg.allocator, format!("target.{host_str}"));
+        err!(current_cfg.jemalloc, &ci_cfg.jemalloc, format!("target.{host_str}"));
     }
 
     let (Some(current_rust_config), Some(ci_rust_config)) =
@@ -332,6 +364,10 @@ pub fn check_incompatible_options_for_ci_rustc(
         channel,
         default_linker,
         std_features,
+        // Trust: decides whether std's metadata carries trust-ir entries. A downloaded
+        // std was built with CI's value, so a different value here would be silently
+        // ignored: the sysroot would not hold what this configuration asks for.
+        trust_ir_metadata,
 
         // Rest of the options can simply be ignored.
         incremental: _,
@@ -376,8 +412,16 @@ pub fn check_incompatible_options_for_ci_rustc(
         break_on_ice: _,
         parallel_frontend_threads: _,
         bootstrap_override_lld: _,
-        bootstrap_override_lld_legacy: _,
         rustflags: _,
+        // Trust: names the build; changes nothing the compiler does.
+        trust_source_identity: _,
+        // Trust: decides only where this build directory starts from (EW-9).
+        trust_stage1_seed: _,
+        // Trust: decides only what bootstrap deletes of its own trees after a run.
+        trust_prune_superseded: _,
+        stdlib_semver_baseline: _,
+        wasm_proc_macros: _,
+        wasm_panic_unwind_default: _,
     } = ci_rust_config;
 
     // There are two kinds of checks for CI rustc incompatible options:
@@ -400,20 +444,24 @@ pub fn check_incompatible_options_for_ci_rustc(
     err!(current_rust_config.default_linker, default_linker, "rust");
     err!(current_rust_config.stack_protector, stack_protector, "rust");
     err!(current_rust_config.std_features, std_features, "rust");
+    // Trust: see the destructure above.
+    err!(current_rust_config.trust_ir_metadata, trust_ir_metadata, "rust");
 
     warn!(current_rust_config.channel, channel, "rust");
 
     Ok(())
 }
 
-/// Backend names for which `compiler/rustc_codegen_<name>` is in this tree.
+/// Backend names this tree can produce.
 ///
 /// Trust: naming a backend here promises the build can produce it. Trust builds
-/// LLVM and its own verified trust-cg backend; anything else is an out-of-tree
-/// `Custom` backend and gets the "might fail" warning it deserves rather than
-/// an endorsement followed by a missing-manifest error.
-pub(crate) const BUILTIN_CODEGEN_BACKENDS: &[&str] = &["llvm", "trust-cg"];
+/// LLVM, its own builtin verified trust-cg backend, and the trust-ir → trust-cg
+/// self-host backend from the `first-party/trust-cg` sibling; anything else is
+/// an out-of-tree `Custom` backend and gets the "might fail" warning it
+/// deserves rather than an endorsement followed by a missing-manifest error.
+pub(crate) const BUILTIN_CODEGEN_BACKENDS: &[&str] = &["llvm", "trust-cg", "trust-ir-cg"];
 
+/// FIXME(Zalathar): This is partly redundant with the parsing code in [`CodegenBackendKind`].
 pub(crate) fn parse_codegen_backends(
     backends: Vec<String>,
     section: &str,
@@ -433,6 +481,9 @@ pub(crate) fn parse_codegen_backends(
             "llvm" => CodegenBackendKind::Llvm,
             // Trust: trust-cg verified codegen backend (#956).
             "trust-cg" => CodegenBackendKind::TrustCg,
+            // Trust: the trust-ir → trust-cg self-host backend, built from the
+            // `first-party/trust-cg` sibling (build_steps/trust_ir_cg.rs).
+            "trust-ir-cg" => CodegenBackendKind::TrustIrCg,
             backend => CodegenBackendKind::Custom(backend.to_string()),
         };
 
@@ -447,7 +498,7 @@ pub(crate) fn parse_codegen_backends(
         if !BUILTIN_CODEGEN_BACKENDS.contains(&backend.name()) {
             if CiEnv::is_rust_lang_managed_ci_job() {
                 eprintln!("Unknown codegen backend {}", backend.name());
-                exit!(1);
+                helpers::exit_process(1);
             }
 
             println!(
@@ -460,7 +511,7 @@ pub(crate) fn parse_codegen_backends(
     }
     if found_backends.is_empty() {
         eprintln!("ERROR: `{section}.codegen-backends` should not be set to `[]`");
-        exit!(1);
+        helpers::exit_process(1);
     }
     found_backends
 }

@@ -10,7 +10,7 @@
 name = "trust-spec"
 # NY now owns a separate compatibility surface (`ny-contracts`); this package
 # remains Trust's canonical contract attribute crate.
-version = "0.1.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

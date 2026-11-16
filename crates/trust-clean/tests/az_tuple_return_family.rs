@@ -21,7 +21,7 @@
 // and the via_trustir assertions below are written to fail loudly on it.
 //
 // Run with:
-//   cd crates && RUSTC_BOOTSTRAP=1 cargo test -p trust-clean \
+//   cd crates && targo --unverified test -p trust-clean \
 //       --test az_tuple_return_family -- --test-threads=1 --nocapture
 
 use std::collections::BTreeMap;

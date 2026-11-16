@@ -1,0 +1,322 @@
+{
+  "name": "{closure#0}",
+  "def_path": "range_filter_count::nz::{closure#0}",
+  "span": {
+    "file": "range_filter_count.rs",
+    "line_start": 1,
+    "col_start": 53,
+    "line_end": 1,
+    "col_end": 66
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Closure": {
+                "name": "range_filter_count::nz::{closure#0}",
+                "upvars": [
+                  {
+                    "Ref": {
+                      "mutable": false,
+                      "inner": {
+                        "Array": {
+                          "elem": {
+                            "Int": {
+                              "width": 8,
+                              "signed": false
+                            }
+                          },
+                          "len": 8
+                        }
+                      }
+                    }
+                  }
+                ],
+                "call": {
+                  "kind": "FnMut",
+                  "params": [
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "ret": "Bool"
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 8
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "range_filter_count.rs",
+                "line_start": 1,
+                "col_start": 55,
+                "line_end": 1,
+                "col_end": 56
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "range_filter_count.rs",
+                "line_start": 1,
+                "col_start": 58,
+                "line_end": 1,
+                "col_end": 62
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 1,
+            "span": {
+              "file": "range_filter_count.rs",
+              "line_start": 1,
+              "col_start": 58,
+              "line_end": 1,
+              "col_end": 62
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "range_filter_count.rs",
+                "line_start": 1,
+                "col_start": 58,
+                "line_end": 1,
+                "col_end": 62
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "range_filter_count.rs",
+                "line_start": 1,
+                "col_start": 58,
+                "line_end": 1,
+                "col_end": 62
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        8
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "range_filter_count.rs",
+                "line_start": 1,
+                "col_start": 58,
+                "line_end": 1,
+                "col_end": 66
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -6,22 +6,23 @@
 //            lowering, `trust_wp::verify_with_contracts` -> `CliBackend`),
 //            driven only through an EXPLICIT solver path so the measurement
 //            never depends on ambient env.
-//   Lane B — the LIVE flipped route (`TrustWpRouterBackend`, native-backed
-//            through trust-wp's typed in-process `TrustWpVerificationEngine`).
+//   Lane B — the canonical constant folder that replaced formula-only WP
+//            registration. Real body-WP has independent typed request tests.
 //
 // Design gate (docs/design/2026-07-09-two-language-spec-surface.md, quoted in
 // docs/audits/2026-08-20-r-phase-reaudit.md R4):
 //   * corpus pass-rates >= baseline on the loose axis,
-//   * zero false-accepts on the native strict path,
-//   * identical verdicts with the `trust_wp` binary absent from PATH.
+//   * zero false-accepts on the current per-VC path,
+//   * preserved verdicts with the `trust_wp` binary absent from PATH, plus
+//     canonical folding of contract-less constant safety rows.
 //
-// This file asserts all three, and additionally DEMONSTRATES the channel the
+// This file asserts those properties and additionally DEMONSTRATES the channel the
 // flip closes: with a binary that satisfies the old text protocol, lane A
 // minted a full deductive Proved from parsed subprocess text; lane B is
 // invariant to that binary's existence.
 
 use trust_router::VerificationBackend;
-use trust_router::trust_wp_backend::TrustWpRouterBackend;
+use trust_router::constant_folder::ConstantFolderBackend;
 use trust_types::{
     ContractMetadata, Formula, Sort, SourceSpan, VcKind, VerificationCondition, VerificationResult,
 };
@@ -301,12 +302,12 @@ const FAKE_PROVING_SCRIPT: &str = "#!/bin/sh\n\
 
 /// Design-gate axis 1 + 3: with the trust_wp binary ABSENT (the shipping
 /// default — no TRUST_WP_PATH, no configured path), every corpus verdict class
-/// from the flipped route is identical to the retired route's, and the flipped
-/// route never invents a verdict.
+/// from the current route is identical to the retired route's, except that the
+/// shared folder also decides contract-less constants with canonical polarity.
 #[test]
-fn flipped_route_matches_binary_absent_baseline_class_for_class() {
+fn canonical_route_preserves_baseline_and_folds_contractless_constants() {
     let absent = TrustWpConfig::new().with_solver_path("/nonexistent/trust-wp-r4-ab-absent");
-    let flipped = TrustWpRouterBackend::new();
+    let flipped = ConstantFolderBackend;
 
     let mut agreements = 0usize;
     let mut rows = Vec::new();
@@ -316,17 +317,23 @@ fn flipped_route_matches_binary_absent_baseline_class_for_class() {
         let agree = class(&a) == class(&b);
         agreements += usize::from(agree);
         rows.push(format!(
-            "{name:32} baseline(absent)={:8} native={:8} {}",
+            "{name:32} baseline(absent)={:8} current={:8} {}",
             class(&a),
             class(&b),
             if agree { "AGREE" } else { "DIVERGE" }
         ));
-        assert_eq!(
-            class(&a),
-            class(&b),
-            "R4 gate: verdict class must be identical with the trust_wp binary absent \
-             (corpus item `{name}`): baseline {a:?} vs native {b:?}"
-        );
+        if name == "bare_assertion_no_contract" {
+            // The shared folder also handles constant safety rows without
+            // contract metadata. No formula-only WP claim is formed.
+            assert_eq!(class(&a), "Unknown");
+            assert_eq!(class(&b), "Proved");
+        } else {
+            assert_eq!(
+                class(&a),
+                class(&b),
+                "retired formula route changed `{name}`: baseline {a:?} vs current {b:?}"
+            );
+        }
     }
     eprintln!("R4 A/B corpus (binary absent): {agreements}/{} agree", rows.len());
     for row in rows {
@@ -334,21 +341,23 @@ fn flipped_route_matches_binary_absent_baseline_class_for_class() {
     }
 }
 
-/// Design-gate axis 2: zero false-accepts on the native strict path. The only
-/// corpus rows the native route may decide are the constant-folded ones; every
+/// Design-gate axis 2: zero false-accepts on the current per-VC path. The only
+/// corpus rows the current route may decide are the constant-folded ones; every
 /// symbolic row stays Unknown on the bare per-VC carrier.
 #[test]
-fn native_route_mints_no_verdict_beyond_constant_folding() {
-    let flipped = TrustWpRouterBackend::new();
+fn canonical_route_mints_no_verdict_beyond_constant_folding() {
+    let flipped = ConstantFolderBackend;
     for (name, vc) in corpus() {
         let b = flipped.verify(&vc);
         match name {
-            "post_const_holds" => assert_eq!(class(&b), "Proved", "{name}: {b:?}"),
+            "post_const_holds" | "bare_assertion_no_contract" => {
+                assert_eq!(class(&b), "Proved", "{name}: {b:?}")
+            }
             "post_const_violated" => assert_eq!(class(&b), "Failed", "{name}: {b:?}"),
             _ => assert_eq!(
                 class(&b),
                 "Unknown",
-                "native strict path must not decide symbolic corpus item `{name}`: {b:?}"
+                "constant folder must not decide symbolic corpus item `{name}`: {b:?}"
             ),
         }
     }
@@ -360,10 +369,21 @@ fn native_route_mints_no_verdict_beyond_constant_folding() {
 /// flipped route on the same VC stays Unknown.
 #[cfg(unix)]
 #[test]
-fn retired_lane_minted_proved_from_text_protocol_and_native_lane_refuses() {
+fn retired_text_protocol_cannot_authorize_current_formula_route() {
     let script = write_script("proving", FAKE_PROVING_SCRIPT);
+    // macOS assesses a file's first execution, one file at a time machine-wide,
+    // and a push lane queues freshly linked test binaries ahead of it. Pay that
+    // here, so the first corpus row's run is not charged it against trust-wp's
+    // timeout.
+    let warm_up = std::process::Command::new(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run the fresh proving script once before the retired lane times it");
+    assert!(warm_up.success(), "proving script warm-up failed: {warm_up:?}");
     let present = TrustWpConfig::new().with_solver_path(script.to_string_lossy().as_ref());
-    let flipped = TrustWpRouterBackend::new();
+    let flipped = ConstantFolderBackend;
 
     let mut retired_proved = 0usize;
     let mut rows = Vec::new();
@@ -375,11 +395,11 @@ fn retired_lane_minted_proved_from_text_protocol_and_native_lane_refuses() {
             retired_proved += 1;
             assert!(
                 !matches!(b, VerificationResult::Proved { .. }),
-                "corpus item `{name}`: the native route must not reproduce the \
+                "corpus item `{name}`: the current route must not reproduce the \
                  text-protocol Proved: {b:?}"
             );
         }
-        rows.push(format!("{name:32} baseline(present)={:8} native={:8}", class(&a), class(&b)));
+        rows.push(format!("{name:32} baseline(present)={:8} current={:8}", class(&a), class(&b)));
     }
     let _ = std::fs::remove_file(script);
 
@@ -398,7 +418,7 @@ fn retired_lane_minted_proved_from_text_protocol_and_native_lane_refuses() {
     );
 }
 
-/// THE SEAL: the flipped route never consults TRUST_WP_PATH (or any subprocess).
+/// THE SEAL: the current route never consults TRUST_WP_PATH (or any subprocess).
 /// Pointing TRUST_WP_PATH at a binary that would satisfy the old protocol
 /// changes nothing — verdicts are bit-for-bit the same class on every corpus
 /// item. This is the regression tripwire against reintroducing the subprocess
@@ -407,7 +427,7 @@ fn retired_lane_minted_proved_from_text_protocol_and_native_lane_refuses() {
 #[test]
 fn route_is_invariant_to_trust_wp_path_env() {
     let script = write_script("seal", FAKE_PROVING_SCRIPT);
-    let flipped = TrustWpRouterBackend::new();
+    let flipped = ConstantFolderBackend;
 
     let without_env: Vec<(String, &'static str)> = corpus()
         .into_iter()
@@ -415,7 +435,7 @@ fn route_is_invariant_to_trust_wp_path_env() {
         .collect();
 
     // SAFETY (edition 2024 set_var contract): this test is the only code in
-    // this test binary that mutates TRUST_WP_PATH, and the flipped route under
+    // this test binary that mutates TRUST_WP_PATH, and the current route under
     // test must not read it — that is the property being pinned.
     unsafe { std::env::set_var("TRUST_WP_PATH", &script) };
     let with_env: Vec<(String, &'static str)> = corpus()

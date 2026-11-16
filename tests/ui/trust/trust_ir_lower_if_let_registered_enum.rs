@@ -1,6 +1,6 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Airrefutable_let_patterns
 //@ edition: 2021
 //! Trust (wave-LNO): the if-let VALUE-enum lane's G2 -- a `is_pure_value_shape` test -- is
 //! DELETED, not widened.

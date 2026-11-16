@@ -1,4 +1,5 @@
-// TEMPORARY probe harness (not for commit): drive the F1 proven-output gate over
+// ccc_probe — developer example (`[[example]]`, requires the `ay-proofs`
+// feature): drive the F1 proven-output gate over
 // either a serialized producer trust_ir::Module or a synthetic select function,
 // so gate work can be iterated with plain cargo instead of `x.py build`.
 //
@@ -31,6 +32,7 @@ fn selects(ty: Ty, n: u32) -> TrustIrGateSource {
         params: vec![ty.clone()],
         returns: vec![ty.clone()],
         is_vararg: false,
+        abi: None,
     });
     let mut f = IrFunction::new(FuncId::new(0), "k", FuncTyId::new(0), BlockId::new(0));
 
@@ -106,7 +108,12 @@ fn selects(ty: Ty, n: u32) -> TrustIrGateSource {
 
     f.blocks = blocks;
     module.functions.push(f);
-    TrustIrGateSource { symbol: "k".to_string(), module, func_id: FuncId::new(0) }
+    TrustIrGateSource {
+        abi_cross_check: None,
+        symbol: "k".to_string(),
+        module: module.into(),
+        func_id: FuncId::new(0),
+    }
 }
 
 fn report(source: &TrustIrGateSource, label: &str) {
@@ -152,7 +159,8 @@ fn main() {
             Err(e) => println!("== SPEC-ONLY err in {:?}: {e}", t.elapsed()),
         }
 
-        let source = TrustIrGateSource { symbol, module, func_id };
+        let source =
+            TrustIrGateSource { abi_cross_check: None, symbol, module: module.into(), func_id };
         let (verdict, obj) = verify_trust_ir_output_preserved(&source, &backend());
         if let Some(o) = &obj {
             std::fs::write("/tmp/ccc_probe.o", o).expect("write");

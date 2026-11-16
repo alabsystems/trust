@@ -22,6 +22,7 @@ mod warnings;
 mod tests;
 
 // Re-export public types
+pub(crate) use comparison::full_cross_check_with_vcs;
 pub use comparison::{CrossCheckResult, CrossCheckVerdict, full_cross_check};
 pub use properties::{
     formula_free_var_count, strengthen_by_dropping_assumption, weakening_preserves_safety,
@@ -29,7 +30,9 @@ pub use properties::{
 use structural::{
     check_degenerate_connectives, check_divzero_structure, check_overflow_bounds,
     check_sort_consistency, check_trivial_formula, check_variable_scope,
+    check_variable_scope_with_known, collect_known_local_names,
 };
+use trust_types::fx::FxHashSet;
 use trust_types::{VerifiableFunction, VerificationCondition};
 pub use warnings::{CrossCheckWarning, SortClass};
 
@@ -57,11 +60,33 @@ pub fn cross_check_vc(
     warnings
 }
 
+fn cross_check_vc_with_known(
+    vc: &VerificationCondition,
+    func: &VerifiableFunction,
+    known_names: &FxHashSet<&str>,
+    warnings: &mut Vec<CrossCheckWarning>,
+) {
+    check_variable_scope_with_known(vc, func, known_names, warnings);
+    check_overflow_bounds(vc, warnings);
+    check_divzero_structure(vc, warnings);
+    check_sort_consistency(&vc.formula, warnings);
+    check_degenerate_connectives(&vc.formula, warnings);
+    check_trivial_formula(vc, warnings);
+}
+
 /// Cross-check all VCs produced for a function.
 #[must_use]
 pub fn cross_check_all_vcs(
     vcs: &[VerificationCondition],
     func: &VerifiableFunction,
 ) -> Vec<CrossCheckWarning> {
-    vcs.iter().flat_map(|vc| cross_check_vc(vc, func)).collect()
+    if vcs.is_empty() {
+        return Vec::new();
+    }
+    let known_names = collect_known_local_names(func);
+    let mut warnings = Vec::new();
+    for vc in vcs {
+        cross_check_vc_with_known(vc, func, &known_names, &mut warnings);
+    }
+    warnings
 }

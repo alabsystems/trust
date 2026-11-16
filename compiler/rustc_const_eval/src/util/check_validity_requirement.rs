@@ -1,11 +1,11 @@
 use rustc_abi::{BackendRepr, FieldsShape, Scalar, Variants};
+use rustc_middle::ty;
 use rustc_middle::ty::layout::{
     HasTyCtxt, LayoutCx, LayoutError, LayoutOf, TyAndLayout, ValidityRequirement,
 };
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{PseudoCanonicalInput, ScalarInt, Ty, TyCtxt};
-use rustc_middle::{bug, ty};
-use rustc_span::DUMMY_SP;
+use rustc_span::{DUMMY_SP, bug};
 
 use crate::const_eval::{CanAccessMutGlobal, CheckAlignment, CompileTimeMachine};
 use crate::interpret::{InterpCx, MemoryKind};
@@ -42,6 +42,24 @@ pub fn check_validity_requirement<'tcx>(
     }
 }
 
+// Trust: G1 (2026-10-27) — the exact ('strict') check, whatever `-Zstrict-init-checks` says,
+// for the verifier's `mem::zeroed::<T>()` admission
+// (`rustc_mir_transform::trust_verify::zero_valid_zeroed_call_blocks`). The lax default is a
+// miscompilation mitigation that accepts Rust UB (it skips arrays and enum variants), so a
+// proof may not rest on it.
+pub fn check_validity_requirement_exact<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    kind: ValidityRequirement,
+    input: PseudoCanonicalInput<'tcx, Ty<'tcx>>,
+) -> Result<bool, &'tcx LayoutError<'tcx>> {
+    let layout = tcx.layout_of(input)?;
+    if kind == ValidityRequirement::Inhabited {
+        return Ok(!layout.is_uninhabited());
+    }
+    let layout_cx = LayoutCx::new(tcx, input.typing_env);
+    Ok(check_validity_requirement_strict(layout, &layout_cx, kind))
+}
+
 /// Implements the 'strict' version of the [`check_validity_requirement`] checks; see that function
 /// for details.
 fn check_validity_requirement_strict<'tcx>(
@@ -76,7 +94,7 @@ fn check_validity_requirement_strict<'tcx>(
     // option this is fine, but if this is ever meant to be stable we should probably add
     // a "fast mode" to validation.
     with_no_trimmed_paths!(
-        cx.validate_operand(
+        cx.validate_place(
             &allocated.into(),
             /*recursive*/ false,
             /*reset_provenance_and_padding*/ false,
@@ -121,10 +139,10 @@ fn check_validity_requirement_lax<'tcx>(
     let valid = !this.is_uninhabited() // definitely UB if uninhabited
         && match this.backend_repr {
             BackendRepr::Scalar(s) => scalar_allows_raw_init(s),
-            BackendRepr::ScalarPair(s1, s2) => {
+            BackendRepr::ScalarPair { a: s1, b: s2, b_offset: _ } => {
                 scalar_allows_raw_init(s1) && scalar_allows_raw_init(s2)
             }
-            BackendRepr::SimdVector { element: s, count } => count == 0 || scalar_allows_raw_init(s),
+            BackendRepr::SimdVector { element: s, count: _ } => scalar_allows_raw_init(s),
             BackendRepr::Memory { .. } => true, // Fields are checked below.
             BackendRepr::SimdScalableVector { element, .. } => scalar_allows_raw_init(element),
         };
@@ -200,7 +218,7 @@ pub(crate) fn validate_scalar_in_layout<'tcx>(
 
     cx.write_scalar(scalar, &allocated).unwrap();
 
-    cx.validate_operand(
+    cx.validate_place(
         &allocated.into(),
         /*recursive*/ false,
         /*reset_provenance_and_padding*/ false,

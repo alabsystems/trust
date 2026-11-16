@@ -1,0 +1,19 @@
+# Known-red tests in `compiler/rustc_codegen_trust_cg`'s unit suite.
+#
+# The ACCEPTED failing SET, judged by scripts/check_trust_verify_suite_ratchet.sh
+# (RATCHET_SUITE=compiler/rustc_codegen_trust_cg), which
+# scripts/check_compiler_unit_tests.sh (`slow.compiler-unit-tests`) runs whenever
+# a change touches this crate or a crate it depends on. Same rules as
+# rustc_mir_transform.txt: FULL libtest paths, one OWNER and one REASON per row,
+# and a row is deleted the moment its test passes (the gate fails on a stale row).
+#
+# EMPTY since 2026-10-01: main's 1ec945d698 ("trust-cg: repair the 10 unit tests
+# main has been failing") fixed the ten rows recorded here on 2026-09-30 (nine
+# `trust_ir_frontend::tests::crate_module_tests::*` fixtures that stamped the
+# `clean-kernel-tv` license, and
+# `tests::production_linkage_policy_never_strengthens_weak_definitions`).
+# Measured on the merged step 2 increment 3 head: `x.py test --stage 1
+# compiler/rustc_codegen_trust_cg` runs 103 tests, 103 passed, 0 failed. With no
+# row, the ratchet refuses ANY failure in this suite. History:
+# docs/KNOWN_HAZARDS.md, "`x.py test compiler/rustc_codegen_trust_cg` was red on
+# `main`".

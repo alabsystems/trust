@@ -113,7 +113,7 @@ fn parse(text: &str, slots: usize) -> Vec<Option<OracleInsn>> {
     // Bytes of bare-prefix lines seen since the last slot boundary.
     let mut pending_prefix: Option<(usize, usize)> = None; // (slot, bytes)
     for line in text.lines() {
-        // `       0: 48 8b 05 10 00 00 00         	movq	0x10(%rip), %rax        ## 0x17 <...>`
+        // `       0: 48 8b 05 10 00 00 00         \tmovq\t0x10(%rip), %rax        ## 0x17 <...>`
         let Some((addr_part, rest)) = line.split_once(':') else { continue };
         let Ok(addr) = u64::from_str_radix(addr_part.trim(), 16) else { continue };
         let at_slot_start = addr as usize % SLOT == 0;

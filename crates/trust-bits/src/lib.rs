@@ -366,7 +366,7 @@ pub fn weight(k: u32) -> u32 {
 ///
 /// **Tier 2.** Arithmetic-free.
 pub fn mask_below(k: u32) -> u32 {
-    if k <= 0 {
+    if k == 0 {
         return 0;
     }
     if k <= 1 {
@@ -1024,7 +1024,7 @@ pub fn round_up_pow2(x: u32) -> u64 {
 
 // -------------------------------------------------------------------------
 // Section 2 — tier-1 predicates.
-// 
+//
 // Each is `docs/STRICT_VERIFICATION_FRAGMENT.md` §1.1 shape B: a contracted
 // wrapper whose whole body is one call to an uncontracted helper that
 // returns only `0` or `1`. §9.3's rule is that the bound is carried by the
@@ -1157,14 +1157,14 @@ pub fn clamp_index(k: u32) -> u32 ensures result <= 31 {
 
 // -------------------------------------------------------------------------
 // Section 4 — population count.
-// 
+//
 // The shape is forced by a boundary measured for this crate and recorded as
 // §12.1: a chain of widened `u8 -> u32` additions proves for at most NINE
 // terms. Ten terms leaves the tenth add RUNTIME-CHECKED with an UNKNOWN
 // hardened twin; sixteen stops lowering the body at all. It is a term count,
 // not a peak (the peak here is 2040) and not an arity — sixteen parameters
 // summed eight at a time proves 14/14.
-// 
+//
 // So a 32-bit population count cannot be one 32-term sum. It is four groups
 // of eight, each narrowed back to a `u8` by `narrow8` so that §2.1's
 // widening exception re-supplies the range for the four-term total. This is
@@ -1381,7 +1381,7 @@ pub fn trailing_zeros_u8(b: u8) -> u32 ensures result <= 8 {
 
 // -------------------------------------------------------------------------
 // Section 6 — rank and select.
-// 
+//
 // `rank` is a dispatcher: a mask, then a call. No arithmetic of its own, so
 // it reports `[NO OBLIGATIONS]` and bundles its callee's Asserts (§11.6).
 // -------------------------------------------------------------------------
@@ -1548,11 +1548,11 @@ pub fn select_u32(x: u32, n: u32) -> u32 {
 
 // -------------------------------------------------------------------------
 // Section 7 — bit-field extraction and insertion.
-// 
+//
 // These are `decode.rs:21` with all three of its conditions decided. Both
 // take the field as (`lo`, `width`) and both are defined for every value of
 // both, including `lo >= 32` and `width > 32`.
-// 
+//
 // `field` divides, and `/` is opaque to BUNDLING (§2.4, §7.2) — so no
 // verified function in this crate may call it, and the weight lookups are
 // inlined into its own body rather than hoisted into a wrapper. That is why
@@ -1616,7 +1616,7 @@ pub fn deposit(x: u32, value: u32, lo: u32, width: u32) -> u32 {
 
 // -------------------------------------------------------------------------
 // Section 8 — bit reversal.
-// 
+//
 // One weighted eight-term sum, used four times. Sixteen weighted terms in
 // one body does not lower (§12.1), so the `u32` reversal is four byte
 // reversals recombined with a FOUR-term sum at `u64` — where each `u32 as

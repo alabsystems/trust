@@ -1,0 +1,1021 @@
+{
+  "name": "subslice_rest",
+  "def_path": "slice_from_end_patterns::subslice_rest",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+    "line_start": 34,
+    "col_start": 0,
+    "line_end": 39,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Tuple": [
+            {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "rest"
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "y"
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 35,
+                "col_start": 10,
+                "line_end": 35,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 9,
+                "line_end": 36,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 17,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 9,
+                "line_end": 36,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 9,
+                "line_end": 36,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ge",
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 9,
+                "line_end": 36,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 9,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+              "line_start": 36,
+              "col_start": 9,
+              "line_end": 36,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 37,
+                "col_start": 13,
+                "line_end": 37,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 25,
+                "line_end": 36,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 18,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 25,
+                "line_end": 36,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 25,
+                "line_end": 36,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 25,
+                "line_end": 36,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+              "line_start": 36,
+              "col_start": 25,
+              "line_end": 36,
+              "col_end": 28
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 13,
+                "line_end": 36,
+                "col_end": 17
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 19,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Subslice": {
+                          "from": 1,
+                          "to": 0,
+                          "from_end": true
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 13,
+                "line_end": 36,
+                "col_end": 17
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 26,
+                "line_end": 36,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 20,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 0,
+                          "min_length": 1,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 26,
+                "line_end": 36,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      1,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 38,
+                "line_end": 36,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 33,
+                "line_end": 36,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 33,
+                "line_end": 36,
+                "col_end": 40
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 15,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 4,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+              "line_start": 36,
+              "col_start": 33,
+              "line_end": 36,
+              "col_end": 40
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 10,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 13
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 33,
+                "line_end": 36,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 11,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 43,
+                "line_end": 36,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitXor",
+                  {
+                    "Move": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 16,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_from_end_patterns.rs",
+                "line_start": 36,
+                "col_start": 33,
+                "line_end": 36,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,0 +1,35 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (key64, axis_within_isl)
+  --> $DIR/e9_island_defeq_bool_binary_unoptimized.rs:32:5
+   |
+LL | /     def key64 (v : BitVec 64) : Nat :=
+LL | |         Nat.xor (BitVec.toNat v) 9223372036854775808
+LL | |     def axis_within_isl (p : BitVec 64) (lo : BitVec 64) (hi : BitVec 64) : Bool :=
+LL | |         Bool.and (Decidable.decide (Nat.le (key64 lo) (key64 p))
+LL | |                                    (Nat.decLe (key64 lo) (key64 p)))
+LL | |                  (Decidable.decide (Nat.le (key64 p) (key64 hi))
+LL | |                                    (Nat.decLe (key64 p) (key64 hi)))
+   | |____________________________________________________________________^
+
+note: island definition `axis_within_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_island_defeq_bool_binary_unoptimized::axis_contains`
+  --> $DIR/e9_island_defeq_bool_binary_unoptimized.rs:42:13
+   |
+LL |     ensures result == axis_within_isl(p, lo, hi)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+
+=== Trust Verification Report (e9_island_defeq_bool_binary_unoptimized) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_island_defeq_bool_binary_unoptimized.rs:41:1
+   |
+LL | / fn axis_contains(p: i64, lo: i64, hi: i64) -> bool
+LL | |     ensures result == axis_within_isl(p, lo, hi)
+LL | | {
+LL | |     p >= lo && p <= hi
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+

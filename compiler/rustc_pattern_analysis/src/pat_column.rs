@@ -29,12 +29,14 @@ impl<'p, Cx: PatCx> PatternColumn<'p, Cx> {
     /// Internal method, prefer [`PatternColumn::new`].
     fn expand_and_push(&mut self, pat: PatOrWild<'p, Cx>) {
         // We flatten or-patterns and skip algorithm-generated wildcards.
-        if pat.is_or_pat() {
-            self.patterns.extend(
-                pat.flatten_or_pat().into_iter().filter_map(|pat_or_wild| pat_or_wild.as_pat()),
-            )
-        } else if let Some(pat) = pat.as_pat() {
-            self.patterns.push(pat)
+        if let Some(pat) = pat.as_pat() {
+            if pat.is_or_pat() {
+                for ipat in pat.iter_fields() {
+                    self.expand_and_push(PatOrWild::Pat(&ipat.pat));
+                }
+            } else {
+                self.patterns.push(pat);
+            }
         }
     }
 

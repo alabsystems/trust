@@ -36,7 +36,9 @@ pub(crate) fn generate_spec_vcs(func: &VerifiableFunction) -> Vec<VerificationCo
     }
 
     let contract_metadata = Some(spec.to_contract_metadata());
-    let mut vcs = Vec::new();
+    let mut vcs =
+        Vec::with_capacity(spec.requires.len() + spec.ensures.len() + spec.invariants.len());
+    let fn_sym: trust_types::Symbol = func.name.as_str().into();
     // MIR extraction mirrors every raw source contract into `FunctionSpec`.
     // Consume each raw row at most once so the compatibility lane does not
     // manufacture a second obligation for the same authored clause.  A
@@ -74,7 +76,7 @@ pub(crate) fn generate_spec_vcs(func: &VerifiableFunction) -> Vec<VerificationCo
             }
             vcs.push(VerificationCondition {
                 kind: VcKind::Precondition { callee: func.name.clone() },
-                function: func.name.as_str().into(),
+                function: fn_sym.clone(),
                 location: func.span.clone(),
                 formula: Formula::Bool(false),
                 contract_metadata,
@@ -130,7 +132,7 @@ pub(crate) fn generate_spec_vcs(func: &VerifiableFunction) -> Vec<VerificationCo
             }
             vcs.push(VerificationCondition {
                 kind: VcKind::Postcondition,
-                function: func.name.as_str().into(),
+                function: fn_sym.clone(),
                 location: func.span.clone(),
                 formula: Formula::Not(Box::new(formula)),
                 contract_metadata,
@@ -210,6 +212,10 @@ fn claim_raw_contract_mirror(
     expression: &str,
     claimed: &mut Vec<usize>,
 ) -> bool {
+    if func.contracts.is_empty() {
+        return false;
+    }
+    let trimmed_expr = expression.trim();
     let matching_index = func.contracts.iter().enumerate().find_map(|(index, contract)| {
         if claimed.contains(&index) {
             return None;
@@ -228,7 +234,7 @@ fn claim_raw_contract_mirror(
             .strip_prefix(crate::contracts::LOWERED_CONTRACT_PREFIX)
             .unwrap_or(&contract.body)
             .trim();
-        (body == expression.trim()).then_some(index)
+        (body == trimmed_expr).then_some(index)
     });
     if let Some(index) = matching_index {
         claimed.push(index);
@@ -281,6 +287,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec,
+            tuple_layouts: Default::default(),
         }
     }
 

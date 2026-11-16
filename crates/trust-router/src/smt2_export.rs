@@ -10,9 +10,12 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use trust_types::{Formula, Sort, escape_smtlib_symbol, pred_arg_sorts};
+use trust_types::logic_lattice::Theories;
+use trust_types::{Formula, Sort, escape_smtlib_symbol};
+
+use crate::disjoint_components::uninterpreted_symbol_signatures;
 
 /// Convert a formula to its SMT-LIB2 text representation.
 ///
@@ -34,34 +37,136 @@ pub(crate) fn sort_to_smt2(sort: &Sort) -> String {
 ///
 /// Returns declarations sorted by variable name for deterministic output.
 /// Quantifier-bound variables are excluded.
+///
+/// THREE SOURCES: [`emit_sort_preamble`] for the datatype sort identifiers,
+/// [`collect_free_vars`] for the variables, and
+/// [`uninterpreted_symbol_declarations`] for the `Pred`/`FnApp` symbols. Every
+/// SMT-LIB emitter on the ROUTER'S VERIFICATION PATH composes the same three —
+/// `in_process_ay_backend::problem_smt2`, `build_program` and
+/// `smtlib_backend::generate_smtlib_script` — so none of them can declare a
+/// different set from another.
+///
+/// TWO OTHER EMITTERS/COLLECTORS EXIST, and an earlier version of this comment
+/// called these three sources "each of them the only one of its kind", which
+/// was false. Both live in trust-types, both are OFF this path, and they are
+/// listed here so the claim above stays the narrow one it can support:
+///
+/// * `trust_types::smt_logic::collect_free_var_decls` — the other free-variable
+///   collector. It is no longer a SECOND traversal: it is now the one
+///   scope-tracking implementation and [`collect_free_vars`] delegates to it
+///   (see that function). Folding them together also fixed a real divergence —
+///   it used to take every `Var`/`SymVar` node whose NAME was free somewhere,
+///   so a name bound in one subterm and free in another yielded two
+///   `(declare-fun …)` lines at two sorts.
+/// * `trust_types::smt_printer::SmtPrinter::format_benchmark` — a second
+///   complete `(set-logic)`/`(declare-fun)`/`(assert)`/`(check-sat)` emitter.
+///   It is NOT folded in, deliberately, and the reason is precise: it is a
+///   DEBUG PRETTY-PRINTER with no caller anywhere in `crates/*/src` (checked),
+///   it takes its logic name as an `Option<&str>` PARAMETER rather than from
+///   any selector, and it emits neither the datatype sort preamble nor the
+///   `Pred`/`FnApp` signatures — so it cannot render a datatype-sorted or
+///   uninterpreted-symbol query correctly and must never be used to build a
+///   query a solver is asked to decide. Its own doc now says so. Giving it the
+///   router's three sources would mean moving them into trust-types, which is
+///   the wrong direction: the sort preamble and the signature map are facts
+///   about the ROUTER's transcript contract.
+/// * (A third DERIVED emitter, `trust_report::binary`'s
+///   `collect_formula_sort_declarations`, formats `(declare-fun x () S)` lines
+///   for the binary VC REPORT. It is a report field, never a solver input, and
+///   it now shares the single collector above.)
 #[must_use]
 pub(crate) fn emit_declarations(formula: &Formula) -> Vec<String> {
-    let vars = collect_free_vars(formula);
+    let mut decls = emit_sort_preamble(formula);
 
-    // Lever A: datatype sorts must be DECLARED before any `declare-fun` that
-    // uses them. Gather every datatype declaration reachable from the formula's
-    // datatype-bearing sorts, de-duplicated and topologically ordered (a
-    // referenced datatype before the one that uses it). A datatype that appears
-    // only as a BY-NAME reference (empty constructors — a recursive back-edge
-    // whose full definition is modeled by the flat-`Ty::Adt` encoding, not as a
-    // real SMT datatype) has no `declare-datatype`; it is declared as an
-    // uninterpreted sort (`declare-sort … 0`) so the referencing `declare-fun`
-    // is well-formed. Without this, a `(declare-fun e () Expr)` over an
-    // undeclared sort `Expr` makes the whole SMT query malformed.
-    //
-    // The walk is over `visit_datatype_bearing_sorts`, NOT over `vars`: a
-    // formula whose only datatype content is a ground `Ctor`/`Sel`/`IsCtor`
-    // term has no datatype-sorted free variable at all, and keying off `vars`
-    // would emit the query with no preamble for it.
-    let mut decls: Vec<String> = Vec::new();
+    decls.extend(collect_free_vars(formula).into_iter().map(|(name, sort)| {
+        format!("(declare-fun {} () {})", escape_smtlib_symbol(&name), sort_to_smt2(&sort))
+    }));
+
+    decls.extend(uninterpreted_symbol_declarations(formula));
+
+    decls
+}
+
+/// Append the exact lines of [`emit_declarations`], each followed by `'\n'`,
+/// directly into `out` without allocating an intermediate `Vec<String>` or
+/// per-signature `params: Vec<String>`.
+#[cfg(any(feature = "ay-backend", test))]
+pub(crate) fn write_declarations(formula: &Formula, out: &mut String) {
+    use std::fmt::Write as _;
+
+    for decl in emit_sort_preamble(formula) {
+        out.push_str(&decl);
+        out.push('\n');
+    }
+    for (name, sort) in collect_free_vars(formula) {
+        let _ = writeln!(
+            out,
+            "(declare-fun {} () {})",
+            escape_smtlib_symbol(&name),
+            sort_to_smt2(&sort)
+        );
+    }
+    for (name, (arg_sorts, result_sort)) in uninterpreted_symbol_signatures(formula) {
+        out.push_str("(declare-fun ");
+        out.push_str(&escape_smtlib_symbol(&name));
+        out.push_str(" (");
+        for (idx, arg_sort) in arg_sorts.iter().enumerate() {
+            if idx != 0 {
+                out.push(' ');
+            }
+            out.push_str(&sort_to_smt2(arg_sort));
+        }
+        out.push_str(") ");
+        out.push_str(&sort_to_smt2(&result_sort));
+        out.push_str(")\n");
+    }
+}
+
+/// The SORT PREAMBLE: every datatype sort identifier the query mentions,
+/// declared before anything that uses it.
+///
+/// Lever A: datatype sorts must be DECLARED before any `declare-fun` that uses
+/// them. Gather every datatype declaration reachable from the formula's
+/// datatype-bearing sorts, de-duplicated and topologically ordered (a
+/// referenced datatype before the one that uses it). A datatype that appears
+/// only as a BY-NAME reference (empty constructors — a recursive back-edge
+/// whose full definition is modeled by the flat-`Ty::Adt` encoding, not as a
+/// real SMT datatype) has no `declare-datatype`; it is declared as an
+/// uninterpreted sort (`declare-sort … 0`) so the referencing `declare-fun`
+/// is well-formed. Without this, a `(declare-fun e () Expr)` over an
+/// undeclared sort `Expr` makes the whole SMT query malformed.
+///
+/// The walk is over [`visit_datatype_bearing_sorts`], NOT over the free
+/// variables: a formula whose only datatype content is a ground
+/// `Ctor`/`Sel`/`IsCtor` term has no datatype-sorted free variable at all, and
+/// keying off the variables would emit the query with no preamble for it.
+fn sort_mentions_datatype(sort: &Sort) -> bool {
+    match sort {
+        Sort::Datatype { .. } => true,
+        Sort::Array(idx, elem) => sort_mentions_datatype(idx) || sort_mentions_datatype(elem),
+        _ => false,
+    }
+}
+
+#[must_use]
+pub(crate) fn emit_sort_preamble(formula: &Formula) -> Vec<String> {
+    let mut saw_datatype = false;
     let mut datatype_decls: Vec<String> = Vec::new();
     visit_datatype_bearing_sorts(formula, &mut |sort| {
+        if !sort_mentions_datatype(sort) {
+            return;
+        }
+        saw_datatype = true;
         for d in sort.datatype_declarations() {
             if !datatype_decls.contains(&d) {
                 datatype_decls.push(d);
             }
         }
     });
+    if !saw_datatype {
+        return Vec::new();
+    }
+    let mut decls: Vec<String> = Vec::new();
     // Record full-datatype names so a name that has a real definition is NOT
     // also emitted as an uninterpreted sort (which would be a redeclaration).
     let mut defined_dt: BTreeSet<String> = BTreeSet::new();
@@ -80,28 +185,40 @@ pub(crate) fn emit_declarations(formula: &Formula) -> Vec<String> {
         decls.push(format!("(declare-sort {} 0)", escape_smtlib_symbol(name)));
     }
     decls.extend(datatype_decls);
-
-    decls.extend(vars.into_iter().map(|(name, sort)| {
-        format!("(declare-fun {} () {})", escape_smtlib_symbol(&name), sort_to_smt2(&sort))
-    }));
-
-    // safe-api: uninterpreted predicate symbols (Formula::Pred) need an
-    // ARITY declare-fun returning Bool. Their argument Vars are already declared
-    // above (Pred's args are its children, visited by collect_free_vars).
-    // Without this, an application like `(dir_open d)` references an undeclared
-    // function and the solver errors.
-    let mut preds: BTreeMap<String, Vec<Sort>> = BTreeMap::new();
-    collect_pred_symbols(formula, &mut preds);
-    for (name, arg_sorts) in preds {
-        let params: Vec<String> = arg_sorts.iter().map(sort_to_smt2).collect();
-        decls.push(format!(
-            "(declare-fun {} ({}) Bool)",
-            escape_smtlib_symbol(&name),
-            params.join(" ")
-        ));
-    }
-
     decls
+}
+
+/// The `(declare-fun name (<arg sorts>) <result sort>)` line for every
+/// UNINTERPRETED SYMBOL the query applies.
+///
+/// safe-api: uninterpreted symbols need an ARITY `declare-fun`. That is the
+/// predicate symbols (`Formula::Pred`, result `Bool`) AND the function symbols
+/// (`Formula::FnApp`, result sort carried on the node) — an `FnApp` lowers to a
+/// bare EUF application (`Formula::to_smtlib`), so without its declaration the
+/// exported query references an undeclared function and the solver errors,
+/// exactly as `(dir_open d)` would. Their argument Vars are declared
+/// separately (the arguments are children, visited by `collect_free_vars`).
+///
+/// IN LOCKSTEP with the in-process lane: both declare from
+/// [`uninterpreted_symbol_signatures`], which is also what `detect_logic`
+/// classifies the UF dimension and the signature sorts from, so the canonical
+/// transcript (and the Carcara cross-check and revalidation digest built from
+/// it) declares the same symbols at the same signatures as the program ay
+/// executes, under a logic that admits them.
+#[must_use]
+pub(crate) fn uninterpreted_symbol_declarations(formula: &Formula) -> Vec<String> {
+    uninterpreted_symbol_signatures(formula)
+        .into_iter()
+        .map(|(name, (arg_sorts, result_sort))| {
+            let params: Vec<String> = arg_sorts.iter().map(sort_to_smt2).collect();
+            format!(
+                "(declare-fun {} ({}) {})",
+                escape_smtlib_symbol(&name),
+                params.join(" "),
+                sort_to_smt2(&result_sort)
+            )
+        })
+        .collect()
 }
 
 /// Collect the names of BY-NAME datatype references (empty-constructor
@@ -134,108 +251,139 @@ fn collect_uninterpreted_datatype_refs(
     }
 }
 
-/// Detect the appropriate SMT-LIB2 logic string for a formula.
+/// Detect the SMT-LIB2 logic name for a formula's canonical transcript.
 ///
-/// Analyzes the formula structure to select the most specific logic:
-/// - `QF_LIA` for quantifier-free linear integer arithmetic
-/// - `QF_BV` for quantifier-free bitvectors
-/// - `QF_AUFLIA` for quantifier-free arrays + integers
-/// - `QF_ABV` for quantifier-free arrays + bitvectors
-/// - `AUFBVLIA` for quantified arrays + bitvectors + integers
-/// - `ALL` as fallback for mixed theories
+/// A TOTAL FUNCTION OF THE FEATURE SET. [`analyze_formula`] computes the whole
+/// feature record first — every sort position, every declared `declare-fun`
+/// signature, every literal and operator — and
+/// [`trust_types::logic_lattice::select_logic_name`] then makes ONE decision
+/// over all the bits: the least name in the shared admissibility table
+/// ([`trust_types::logic_lattice::LOGIC_LATTICE`]) that admits every feature
+/// present, falling back to `ALL` when no listed name does.
+///
+/// WHY NOT THE OLD CASCADE. The previous implementation was a chain of early
+/// returns, and a chain decides on a PREFIX of the features. Its
+/// floating-point arm returned `QF_FP` for any FP formula that carried no
+/// BV/array/quantifier/UF — without ever reading `has_integers` or
+/// `has_reals`, which [`analyze_formula`] had computed correctly. Measured
+/// shape: `And([Gt(Var(x, Int), Int(0)), FpIsNaN(f)])` was exported as
+/// `(set-logic QF_FP)` over `(declare-fun __trust_u_x () Int)` — a transcript
+/// declaring a sort its own logic line does not admit, in 8 of 2000 generated
+/// transcripts.
+///
+/// THE INVARIANT now holds by construction and is proved by EXHAUSTIVE
+/// ENUMERATION of the entire 2^11 feature powerset (2048 sets) in
+/// `trust_types::logic_lattice`'s test
+/// `every_feature_set_selects_an_admitting_logic`:
+///
+/// * ADMISSIBILITY — for every feature set `S`, the chosen name admits every
+///   feature in `S`. So the `(set-logic …)` line always admits the sorts its
+///   own `(declare-*)` lines write and the operators its own `(assert …)`
+///   applies. `smt2_self_consistency_tests` checks the same property from the
+///   other end, by PARSING the emitted text against the same table.
+///
+/// MONOTONICITY IS NOT CLAIMED, and the table does not have it. THIS function
+/// is a SINGLE-FORMULA caller and does not need it: it selects once, from the
+/// complete record of the one formula it is about to emit. The MULTI-formula
+/// callers — the function-group and session logic in `incremental_ay` — do not
+/// call this function per member and combine the NAMES; they fold
+/// [`formula_features`] over their members with `Theories::union_all` and
+/// select ONCE from the union, which admissibility alone covers. See
+/// `trust_types::logic_lattice::select_logic_name` for the audit of every call
+/// site, and that module's header for the exact characterization of where
+/// monotonicity fails (751 of 177_147 subset pairs, all with a source set no
+/// row names exactly).
+///
+/// THE LEVERS the old cascade spelled out by hand are now table rows, and the
+/// soundness argument for each is unchanged — a WIDER logic only enlarges the
+/// admissible theory set, never a formula's models, so it cannot turn a SAT
+/// violation into UNSAT (no false prove):
+///
+/// * datatypes (LEVER A, RE-POINTED 2026-09-18): twelve `*DT*` rows now name
+///   the datatype fragments, so a datatype-bearing sort — a variable's, a
+///   `Ctor` result sort, a `Sel` field sort, a tester's datatype name, a
+///   binder's, or one written into a `declare-fun` SIGNATURE — selects an
+///   SMT-LIB `DT` name where one is attested, and `ALL` where none is (the
+///   `A`-leading `DT` names are deliberately absent). MEASURED SAFE: ay's
+///   in-process gate maps EVERY name containing `DT` to `Logic::All` before it
+///   routes, so the re-point cannot change which pipeline a query takes, and
+///   8 queries × 19 candidate names came back byte-identical to `ALL`;
+/// * bitvectors mixed with integers and reals (LEVER C, CLOSED 2026-09-18): all
+///   EIGHT names are rows — `QF_UFBVLIA` and `QF_AUFBVLIA`, which came in when
+///   the lever was split, plus `UFBVLIA`, `QF_AUFBVNIA` and the four
+///   `*BVFPLRA` names, which had been held out ONLY because ay's IN-PROCESS
+///   parser refuses them. That was never a property of the name: it is a
+///   property of one consumer, and it is now handled at that consumer by
+///   `in_process_ay_backend::native_lane_logic`, which re-selects the NATIVE
+///   lane's header from the sublattice that parser accepts. `{BitVectors,
+///   Reals}` therefore gets its first name, `QF_BVFPLRA`, in THIS lane. WHEN
+///   THAT WAS WRITTEN the native lane's header was unchanged for all 1024
+///   feature sets, because that parser refused all six; re-measured 2026-09-19
+///   against ay `9d2cda9c8727` it accepts all six, so the SAME 53 feature sets
+///   move on the native lane too and the two lanes now write the same header
+///   everywhere.
+///   THE OLD JUSTIFICATION HERE WAS RE-MEASURED AND REFUTED: this note used to cite a
+///   five-line query (`_45: Int`, `heap: Array Int Int`, `(= _45 7)`) as
+///   `unknown` + MODEL-UNCONFIRMED under `QF_AUFBV` and `sat` under `ALL`. At
+///   today's ay pin four of five re-measured shapes come back DECIDED under
+///   `QF_AUFBV`, three with a strict-verified UNSAT artifact, and the one
+///   `unknown` reproduces IDENTICALLY under `ALL` — it is a property of ay's
+///   combined BV+LIA SAT lane, not of the header;
+/// * floating point: `QF_FP` is admissible only for the PURE fragment; mixed
+///   with any other theory — including the `Int`/`Real` arithmetic the old
+///   cascade skipped past — the answer is `ALL`;
+/// * DIFFERENCE LOGIC (the tenth dimension, added 2026-09-18): `QF_IDL` and
+///   `QF_RDL` are rows, reachable only from a formula whose every arithmetic
+///   atom is provably in SMT-LIB's difference grammar. [`analyze_formula`]
+///   charges `Theories::WIDE_ARITH` for anything else, so an ordinary integer
+///   transcript still heads `QF_LIA`.
+///
+/// `smtlib_backend::generate_smtlib_script` and `in_process_ay_backend`'s
+/// `problem_smt2` call THIS function, and `trust_types::smt_logic::select_logic`
+/// calls the same selector with its own (UF-less) feature walk, so every lane in
+/// the workspace maps a feature set to a name through one table.
+///
+/// ONE LANE DOES NOT CALL THIS FUNCTION, DELIBERATELY. `in_process_ay_backend`'s
+/// NATIVE `set_logic` calls `native_lane_logic` on the SAME record
+/// ([`formula_features`]) instead, because the linked
+/// `ay_bindings::execute_direct` path carries its own logic-name parser and
+/// aborts the whole solve on a name it does not know. That is a narrowing at
+/// the consumer, not a second table: the rows, the order and the first-minimum
+/// rule are this one's, and the restriction is provably a NO-OP wherever this
+/// function's answer is a name that parser already accepts. MEASURED 2026-09-19
+/// at ay `9d2cda9c8727`, that parser accepts EVERY row, so the narrowing is a
+/// no-op for all 2048 feature sets and the two lanes agree on every header. It
+/// stays where it is: `HORN` is still refused there, and a narrowing in ay must
+/// fail a test rather than silently cost a verdict.
 #[must_use]
 pub(crate) fn detect_logic(formula: &Formula) -> &'static str {
-    // Lever A: if ANY sort the formula carries — a variable's, a constructor
-    // term's result sort, a selector's field sort, a tester's datatype name, a
-    // quantifier binder's — is a datatype (or datatype-back-edge uninterpreted)
-    // sort, the query needs the datatype theory. Rather than
-    // enumerate every datatype×theory combination (QF_DT / QF_UFDT / AUFDT / …),
-    // select `ALL` — ay accepts it and it admits datatypes alongside the BV/Int/
-    // UF scalar fields a recursive ADT's leaves produce. SOUNDNESS: `ALL` only
-    // WIDENS the admissible theory set; it never changes a formula's models, so
-    // it cannot turn a SAT violation into UNSAT (no false-prove).
-    if formula_has_datatype_sort(formula) {
-        return "ALL";
-    }
+    trust_types::logic_lattice::select_logic_name(formula_features(formula))
+}
 
-    let features = analyze_formula(formula);
-
-    // SMT-LIB has no small standard logic name for the mixed FP/BV/array/UF
-    // combinations produced by reinterpretation and model formulas. Pure
-    // quantifier-free floating point is `QF_FP`; every mix uses the honest
-    // `ALL` superset rather than advertising an unrelated integer logic.
-    if features.has_floating_point {
-        if !features.has_bitvectors
-            && !features.has_arrays
-            && !features.has_quantifiers
-            && !features.has_uninterpreted_functions
-        {
-            return "QF_FP";
-        }
-        return "ALL";
-    }
-
-    // Lever C: BITVECTORS MIXED WITH INTEGERS. Every QF_*BV / *BV name below
-    // routes ay to the eager bit-blast pipeline, which carries no integer
-    // theory, so Int-sorted variables come back with NO assignment. Model
-    // completion then fills them with the sort default (0), and the validator
-    // correctly reports the original Int assertion as violated — the query
-    // degrades to `unknown (:reason-unknown incomplete)` instead of `sat`.
-    //
-    // MEASURED: a five-line query (`_45: Int`, `heap: Array Int Int`,
-    // `(= _45 7)`) is `unknown` + MODEL-UNCONFIRMED under QF_AUFBV and `sat`
-    // under ALL — identical formula, only the logic line differs. Across the
-    // orca-alab workspace this mislabel produced ~59,896 MODEL-UNCONFIRMED
-    // events; all 627 distinct violated shapes evaluate false under the
-    // sort-default fill, and none has `0` on its right-hand side.
-    //
-    // SOUNDNESS: identical to the datatype lever above — `ALL` only WIDENS the
-    // admissible theory set and never changes a formula's models, so it cannot
-    // turn a SAT violation into UNSAT. It can only let a query be decided that
-    // was previously abandoned.
-    if features.has_bitvectors && features.has_integers {
-        return "ALL";
-    }
-
-    match (
-        features.has_bitvectors,
-        features.has_arrays,
-        features.has_quantifiers,
-        features.has_uninterpreted_functions,
-    ) {
-        // Bitvectors.
-        (true, false, false, false) => "QF_BV",
-        (true, false, true, false) => "BV",
-        (true, false, false, true) => "QF_UFBV",
-        (true, false, true, true) => "UFBV",
-        // Bitvectors + arrays.
-        (true, true, false, false) => "QF_ABV",
-        (true, true, true, false) => "ABV",
-        (true, true, false, true) => "QF_AUFBV",
-        (true, true, true, true) => "AUFBV",
-        // Integers + arrays. AUFLIA already includes UF.
-        (false, true, false, _) => "QF_AUFLIA",
-        (false, true, true, _) => "AUFLIA",
-        // Pure UF / integer arithmetic.
-        (false, false, false, true) => "QF_UFLIA",
-        (false, false, true, true) => "UFLIA",
-        (false, false, false, false) => "QF_LIA",
-        (false, false, true, false) => "LIA",
-    }
+/// The THEORY FEATURE RECORD of `formula`, as the transcript lane sees it —
+/// [`detect_logic`] without the final selection.
+///
+/// This is what a MULTI-FORMULA caller needs. One `(set-logic L)` covering
+/// several queries must satisfy `admits(L) ⊇ features(f1) ∪ … ∪ features(fn)`,
+/// and the only way to get that from a selector that is not monotone is to take
+/// the union FIRST and select ONCE:
+///
+/// ```ignore (illustrative)
+/// let joint = Theories::union_all(vcs.iter().map(|vc| formula_features(&vc.formula)));
+/// let logic = trust_types::logic_lattice::select_logic_name(joint);
+/// ```
+///
+/// `incremental_ay::detect_group_logic` and the session-wide base logic both do
+/// exactly this. Selecting per member and picking the "widest" NAME would be
+/// wrong: the names are not totally ordered by admission, which is what
+/// `logic_lattice`'s `monotonicity_fails_only_from_sets_no_row_names_exactly`
+/// records.
+#[must_use]
+pub(crate) fn formula_features(formula: &Formula) -> Theories {
+    analyze_formula(formula)
 }
 
 // --- Internal helpers ---
-
-/// True iff any sort carried anywhere in `formula` is (or transitively
-/// contains) a datatype sort — including a by-name datatype back-edge
-/// reference. Drives the `ALL`-logic selection in `detect_logic`.
-fn formula_has_datatype_sort(formula: &Formula) -> bool {
-    let mut found = false;
-    visit_datatype_bearing_sorts(formula, &mut |sort| {
-        found = found || sort.contains_datatype();
-    });
-    found
-}
 
 /// The canonical BY-NAME datatype reference for `name`: a `Sort::Datatype` with
 /// EMPTY constructors, the same shape a recursive back-edge already uses. It
@@ -266,208 +414,191 @@ fn by_name_datatype(name: &str) -> Sort {
 /// Both SMT lanes walk through this one function so the canonical text
 /// transcript and the native AY program cannot disagree about which datatype
 /// sorts the query mentions.
+///
+/// THE ONE INVENTORY. The sort positions themselves are not re-spelled here:
+/// they come from `trust_types::smt_logic::visit_node_sort_positions`, the
+/// single list `DatatypeDefs::extend_from_formula`, `unlowerable_sort_position`
+/// and `select_logic` also read. This function adds exactly one thing on top —
+/// the BY-NAME datatype reference a `Sel`/`IsCtor` carries as a bare `&str`
+/// rather than a `Sort` — and `detect_logic`, `emit_declarations` and
+/// `disjoint_components` all consume THIS function, so the logic line, the
+/// declarations and the component split see the same sorts by construction.
 pub(crate) fn visit_datatype_bearing_sorts(formula: &Formula, f: &mut impl FnMut(&Sort)) {
-    formula.visit(&mut |node| match node {
-        Formula::Var(_, sort) | Formula::SymVar(_, sort) => f(sort),
-        Formula::Ctor { sort, .. } | Formula::FnApp { sort, .. } => f(sort),
-        Formula::Sel { datatype, field_sort, .. } => {
-            f(field_sort);
-            f(&by_name_datatype(datatype));
+    trust_types::visit_formula_nodes(formula, &mut |node| {
+        trust_types::smt_logic::visit_node_sort_positions(node, f);
+        // `Sel`/`IsCtor` know their datatype only BY NAME, so it has no `Sort`
+        // field for the inventory to hand over; synthesize the canonical
+        // by-name reference for it. Emitted AFTER the node's own sort
+        // positions, which for `Sel` means `field_sort` first — the order
+        // `emit_declarations` dedups its preamble in.
+        if let Some(name) = trust_types::smt_logic::node_named_datatype_reference(node) {
+            f(&by_name_datatype(name));
         }
-        Formula::IsCtor { datatype, .. } => f(&by_name_datatype(datatype)),
-        // A quantifier's bound sorts appear in the `(forall ((e Expr)) …)`
-        // binder itself, which is a sort position like any other — and the
-        // binder's sorts are NOT `children()`, so the recursive walk misses
-        // them even when the body mentions the bound variable.
-        Formula::Forall(bindings, _) | Formula::Exists(bindings, _) => {
-            for (_, sort) in bindings {
-                f(sort);
-            }
-        }
-        _ => {}
     });
 }
 
-/// Formula features relevant to logic detection.
-struct FormulaFeatures {
-    has_bitvectors: bool,
-    /// Int/Real-sorted content. Required because a BV-family logic name routes
-    /// ay to the eager bit-blast pipeline, which has NO integer theory: the Int
-    /// vars come back unassigned, model completion fills them with the sort
-    /// default 0, and the validator then correctly finds the original Int
-    /// assertion false. Measured: the same formula is `unknown
-    /// (:reason-unknown incomplete)` under QF_AUFBV and `sat` under ALL.
-    has_integers: bool,
-    has_floating_point: bool,
-    has_arrays: bool,
-    has_quantifiers: bool,
-    has_uninterpreted_functions: bool,
+/// Analyze a formula for the theory features its transcript requires.
+///
+/// Returns the SHARED feature record
+/// ([`trust_types::logic_lattice::Theories`]) that [`detect_logic`] hands to
+/// the shared selector. No name is chosen here: this function only SEES, and
+/// the whole record is complete before anything decides.
+///
+/// ONE SHARED TRAVERSAL, not a fourth parallel walker. The bits come from
+/// exactly three sources, and each is a source the TRANSCRIPT ITSELF is written
+/// from, so the `(set-logic …)` line cannot admit less than the declarations
+/// and the assertion beside it use:
+///
+/// 1. **Sort positions** — [`visit_datatype_bearing_sorts`], the same walk
+///    `emit_declarations` uses to write the `(declare-sort …)`,
+///    `(declare-datatype …)` and `(declare-fun x () S)` lines, and (through
+///    `trust_types::smt_logic::visit_node_sort_positions`) the same list
+///    `DatatypeDefs::extend_from_formula` and the router's
+///    `unlowerable_sort_position` gate read. Previously this function
+///    classified only TWO of the six positions (`Var`/`SymVar`) plus the
+///    binders, so a `Ctor`/`FnApp` result sort and a `Sel` field sort were
+///    declared but never classified.
+///
+/// 2. **Literals and operators** —
+///    [`trust_types::logic_lattice::node_theories`], the same per-node
+///    classifier `trust_types::smt_logic::select_logic` reads, so the library
+///    selector and the transcript selector cannot disagree about what an
+///    `fp.*` or `bv*` node needs. That classification is complete, and provably
+///    so, by induction over the sorts a term can have. Every term of sort
+///
+///    * `BitVec` is a `BitVec` literal, a `Bv*` operator, `IntToBv`,
+///      `FpToIeeeBv`, `FpToSbv`/`FpToUbv`, a `Select` from a BV-element array,
+///      or a sort position (`Var`/`SymVar`/`Ctor`/`Sel`/`FnApp`/binder);
+///    * `Float`/`RoundingMode` is an `Fp*` literal or operator,
+///      `FpFromBits`/`FpFromSbv`/`FpFromUbv`/`FpConvert`, a `Select`, or a sort
+///      position;
+///    * `Int` is an `Int`/`UInt` literal, `BvToInt`, a `Select`, or a sort
+///      position — the arithmetic nodes (`Add`/`Sub`/`Mul`/`Div`/`Rem`/`Neg`)
+///      and `Ite` are sort-GENERIC and carry the SORT theory of their operands,
+///      which are themselves covered by this same induction. `Mul`, `Div` and
+///      `Rem` additionally carry `Theories::NONLINEAR` when their operands make
+///      them nonlinear (a product of two non-literals, a division or remainder
+///      by a non-literal), which is a LINEARITY qualifier rather than a sort
+///      and comes from the same shared `node_theories` — so a `(* x y)` in a
+///      transcript is headed `QF_NIA`, not `QF_LIA`, on THIS lane too, with no
+///      edit here;
+///    * `Real` is a `Rat` literal, a `Select`, or a sort position;
+///    * `Array` is a `Store`, an `Ite`, or a sort position;
+///    * a datatype is a `Ctor`, `Sel`, `IsCtor` or a sort position — all of
+///      which reach `Theories::DATATYPES` through (1);
+///    * `Bool` needs no theory.
+///
+///    So a node with no arm can only be one whose theory content is already
+///    carried by a child or by a sort position — or a FUTURE
+///    `#[non_exhaustive]` variant, which the router declines outright
+///    (`is_lowerable_formula`) before this function is consulted.
+///
+/// 3. **Declared signatures** — [`uninterpreted_symbol_signatures`], the same
+///    map `emit_declarations` writes the `(declare-fun f (A B) R)` lines from
+///    and `build_program` declares natively from. Every sort in a signature is
+///    a sort the transcript writes, so each is classified here. The UF bit is
+///    set for a signature of arity >= 1 only: a 0-ary `declare-fun` is an
+///    ordinary free constant, which every SMT-LIB logic admits — exactly the
+///    rule `smt2_self_consistency_tests` charges `Req::Uf` by, so the selector
+///    and the checker agree on what "needs UF" means. Previously only
+///    `Formula::Pred` set that bit, so an `FnApp` — which lowers to a bare EUF
+///    application and IS declared — headed a `QF_*` logic with no UF at all.
+fn array_sort_theories_ref(index: &Sort, element: &Sort) -> Theories {
+    let theories = Theories::ARRAYS
+        .union(trust_types::logic_lattice::sort_theories(index))
+        .union(trust_types::logic_lattice::sort_theories(element));
+    match (index, element) {
+        (Sort::Int, Sort::Int) => theories,
+        (Sort::BitVec(i), Sort::BitVec(j)) if *i > 0 && *j > 0 => theories,
+        _ => theories.union(Theories::WIDE_ARRAY),
+    }
 }
 
-/// Analyze a formula for theory features.
-fn analyze_formula(formula: &Formula) -> FormulaFeatures {
-    let mut features = FormulaFeatures {
-        has_bitvectors: false,
-        has_integers: false,
-        has_floating_point: false,
-        has_arrays: false,
-        has_quantifiers: false,
-        has_uninterpreted_functions: false,
-    };
+fn analyze_formula(formula: &Formula) -> Theories {
+    let mut features = Theories::NONE;
+    let mut has_uninterpreted_app = false;
 
-    formula.visit(&mut |node| {
+    // (1) + (2) FUSED SINGLE WALK: sort positions, by-name `Sel`/`IsCtor`
+    // datatype references, literals and operators (`node_theories`), and an
+    // uninterpreted-application presence flag (`Pred`/`FnApp`) so pure-theory
+    // formulas pay only ONE AST pass with zero `ConstArray`/`by_name_datatype`
+    // heap allocations.
+    trust_types::visit_formula_nodes(formula, &mut |node| {
         match node {
-            // Bitvector detection
-            Formula::BitVec { .. }
-            | Formula::BvAdd(..)
-            | Formula::BvSub(..)
-            | Formula::BvMul(..)
-            | Formula::BvUDiv(..)
-            | Formula::BvSDiv(..)
-            | Formula::BvURem(..)
-            | Formula::BvSRem(..)
-            | Formula::BvAnd(..)
-            | Formula::BvOr(..)
-            | Formula::BvXor(..)
-            | Formula::BvNot(..)
-            | Formula::BvShl(..)
-            | Formula::BvLShr(..)
-            | Formula::BvAShr(..)
-            | Formula::BvULt(..)
-            | Formula::BvULe(..)
-            | Formula::BvSLt(..)
-            | Formula::BvSLe(..)
-            | Formula::BvToInt(..)
-            | Formula::IntToBv(..)
-            | Formula::BvExtract { .. }
-            | Formula::BvConcat(..)
-            | Formula::BvZeroExt(..)
-            | Formula::BvSignExt(..) => features.has_bitvectors = true,
-
-            Formula::Var(_, Sort::BitVec(_)) | Formula::SymVar(_, Sort::BitVec(_)) => {
-                features.has_bitvectors = true;
+            Formula::ConstArray { index_sort, elem_sort, .. } => {
+                features.insert(array_sort_theories_ref(index_sort, elem_sort));
             }
-
-            // Floating-point detection. `FpToIeeeBv` deliberately sets both
-            // feature bits because it mixes FP input with BV output.
-            Formula::FpToIeeeBv(..) => {
-                features.has_bitvectors = true;
-                features.has_floating_point = true;
+            _ => {
+                trust_types::smt_logic::visit_node_sort_positions(node, &mut |sort| {
+                    features.insert(trust_types::logic_lattice::sort_theories(sort));
+                });
             }
-            Formula::FpConst { .. }
-            | Formula::FpNaN { .. }
-            | Formula::FpInf { .. }
-            | Formula::FpZero { .. }
-            | Formula::FpRoundingMode(..)
-            | Formula::FpFromBits { .. }
-            | Formula::FpAdd(..)
-            | Formula::FpSub(..)
-            | Formula::FpMul(..)
-            | Formula::FpDiv(..)
-            | Formula::FpFma(..)
-            | Formula::FpSqrt(..)
-            | Formula::FpRem(..)
-            | Formula::FpNeg(..)
-            | Formula::FpAbs(..)
-            | Formula::FpMin(..)
-            | Formula::FpMax(..)
-            | Formula::FpEq(..)
-            | Formula::FpLt(..)
-            | Formula::FpLe(..)
-            | Formula::FpGt(..)
-            | Formula::FpGe(..)
-            | Formula::FpIsNaN(..)
-            | Formula::FpIsInfinite(..)
-            | Formula::FpIsZero(..)
-            | Formula::FpIsNormal(..)
-            | Formula::FpIsSubnormal(..)
-            | Formula::FpIsNegative(..)
-            | Formula::FpIsPositive(..) => features.has_floating_point = true,
-            Formula::Var(_, Sort::Float { .. } | Sort::RoundingMode)
-            | Formula::SymVar(_, Sort::Float { .. } | Sort::RoundingMode) => {
-                features.has_floating_point = true;
-            }
-
-            // Integer/real detection. Mirrors the BV and array cases: a var of
-            // Int/Real sort is enough — the arithmetic operators over them are
-            // already covered by whichever branch built them.
-            Formula::Var(_, Sort::Int) | Formula::SymVar(_, Sort::Int) => {
-                features.has_integers = true;
-            }
-            Formula::Int(_) => features.has_integers = true,
-
-            // Array detection
-            Formula::Select(..) | Formula::Store(..) => features.has_arrays = true,
-            Formula::Var(_, Sort::Array(..)) | Formula::SymVar(_, Sort::Array(..)) => {
-                features.has_arrays = true;
-            }
-
-            // Quantifier detection
-            Formula::Forall(..) | Formula::Exists(..) => features.has_quantifiers = true,
-            Formula::Pred(..) => features.has_uninterpreted_functions = true,
-
-            _ => {}
+        }
+        if trust_types::smt_logic::node_named_datatype_reference(node).is_some() {
+            features.insert(Theories::DATATYPES);
+        }
+        features.insert(trust_types::logic_lattice::node_theories(node));
+        if matches!(node, Formula::Pred(..) | Formula::FnApp { .. }) {
+            has_uninterpreted_app = true;
         }
     });
+
+    // (3) DECLARED SIGNATURES — the declarations' own signature map. A symbol
+    // in it is a `(declare-fun …)` line in the transcript and an application in
+    // the assertion, so the logic must admit every sort the line names, and —
+    // at arity >= 1 — uninterpreted functions. Only populated when at least one
+    // `Pred` or `FnApp` node exists in `formula`.
+    if has_uninterpreted_app {
+        for (_, (arg_sorts, result_sort)) in uninterpreted_symbol_signatures(formula) {
+            if !arg_sorts.is_empty() {
+                features.insert(Theories::UF);
+            }
+            for arg_sort in &arg_sorts {
+                features.insert(trust_types::logic_lattice::sort_theories(arg_sort));
+            }
+            features.insert(trust_types::logic_lattice::sort_theories(&result_sort));
+        }
+    }
+
+    // (4) LINEAR FORM — the DIFFERENCE-fragment qualifier, which is the one
+    // dimension no per-node classifier can decide: `Theories::WIDE_ARITH` is a
+    // property of a whole ATOM (`(- x y) < 3` is in SMT-LIB's `QF_IDL` grammar,
+    // `x + y < 3` is not), so `node_theories` cannot charge it and steps (1)
+    // and (2) above cannot see it.
+    //
+    // THIS LINE IS LOAD-BEARING. Without it this lane would hand
+    // `select_logic_name` a record carrying `INTS` and no `WIDE_ARITH` for
+    // EVERY integer query, and the selector would answer `QF_IDL` — a header
+    // NARROWER than the transcript under it, and a silent one: ay maps
+    // `QF_IDL` onto its full `QfLia` solver and enforces no restriction, so
+    // every in-house verdict would stay correct and only an external replayer
+    // would reject the evidence. `features_carry_the_linear_form_bit` pins it.
+    // Gated on `INTS | REALS` exactly as `trust_types::logic_lattice::formula_theories`:
+    // `wide_arithmetic_theories` only ever charges `WIDE_ARITH` on atoms whose
+    // subtrees already contribute `INTS` or `REALS` under steps (1) and (2).
+    if features.contains(Theories::INTS) || features.contains(Theories::REALS) {
+        features.insert(trust_types::logic_lattice::wide_arithmetic_theories(formula));
+    }
 
     features
 }
 
 /// Collect all free variables (name, sort) from a formula, excluding
-/// quantifier-bound names. Both string-backed [`Formula::Var`] and interned
-/// [`Formula::SymVar`] nodes share this one collector so the native AY program
-/// and its canonical SMT transcript cannot disagree about declarations.
+/// quantifier-bound names.
+///
+/// DELEGATES to [`trust_types::collect_free_var_decls`], which is now the ONE
+/// free-variable collector in the workspace. It used to be a second,
+/// independent scope-tracking walk that happened to agree with the trust-types
+/// one on every shape anyone had tried; the traversal audit that called this
+/// function "the single free-variable collector" had simply not listed the
+/// other one. They did NOT agree everywhere: the trust-types collector asked
+/// `Formula::free_variables()` for the free NAMES and then took every
+/// `Var`/`SymVar` node with such a name, so a name bound in one subterm and
+/// free in another produced two `(declare-fun …)` lines at two different sorts.
+/// That collector now tracks binder scope structurally — this body — and both
+/// callers share it, so the divergence cannot come back by editing one copy.
 pub(crate) fn collect_free_vars(formula: &Formula) -> BTreeSet<(String, Sort)> {
-    fn collect(
-        formula: &Formula,
-        bound_names: &BTreeSet<String>,
-        free_vars: &mut BTreeSet<(String, Sort)>,
-    ) {
-        match formula {
-            Formula::Var(name, sort) => {
-                if !bound_names.contains(name) {
-                    free_vars.insert((name.clone(), sort.clone()));
-                }
-            }
-            Formula::SymVar(name, sort) => {
-                let name = name.as_str().to_string();
-                if !bound_names.contains(&name) {
-                    free_vars.insert((name, sort.clone()));
-                }
-            }
-            Formula::Forall(bindings, body) | Formula::Exists(bindings, body) => {
-                let mut nested_bound_names = bound_names.clone();
-                nested_bound_names
-                    .extend(bindings.iter().map(|(name, _)| name.as_str().to_string()));
-                collect(body, &nested_bound_names, free_vars);
-            }
-            _ => {
-                for child in formula.children() {
-                    collect(child, bound_names, free_vars);
-                }
-            }
-        }
-    }
-
-    let mut free_vars = BTreeSet::new();
-    collect(formula, &BTreeSet::new(), &mut free_vars);
-    free_vars
-}
-
-/// Collect uninterpreted predicate symbols (name -> declared argument sorts)
-/// from a formula, for arity `declare-fun` emission. A predicate's signature is
-/// fixed by the closed vocabulary, so we key by name and take the canonical
-/// `pred_arg_sorts`; any out-of-vocabulary predicate (should not occur — `Pred`
-/// is vocab-gated at parse time) falls back to all-`Int` of the applied arity.
-fn collect_pred_symbols(formula: &Formula, preds: &mut BTreeMap<String, Vec<Sort>>) {
-    formula.visit(&mut |node| {
-        if let Formula::Pred(name, args) = node {
-            let arg_sorts = pred_arg_sorts(name.as_str())
-                .map(<[Sort]>::to_vec)
-                .unwrap_or_else(|| vec![Sort::Int; args.len()]);
-            preds.entry(name.as_str().to_string()).or_insert(arg_sorts);
-        }
-    });
+    trust_types::collect_free_var_decls(formula)
 }
 
 #[cfg(test)]
@@ -499,7 +630,14 @@ mod tests {
             Box::new(Formula::Var("e".into(), dt.clone())),
             Box::new(Formula::Var("e".into(), dt)),
         );
-        assert_eq!(detect_logic(&f), "ALL", "a datatype var must select a datatype-capable logic");
+        // Lever A, re-pointed 2026-09-18: the narrowest attested SMT-LIB name
+        // for "datatypes and nothing else". Still datatype-capable, and still
+        // `Logic::All` at ay's `parse_logic` (`contains("DT")`).
+        assert_eq!(
+            detect_logic(&f),
+            "QF_DT",
+            "a datatype var must select a datatype-capable logic"
+        );
 
         let decls = emit_declarations(&f);
         let sort_pos = decls.iter().position(|d| d.contains("(declare-sort Expr 0)"));
@@ -626,7 +764,15 @@ mod tests {
                 collect_free_vars(&f).iter().all(|(_, s)| !s.contains_datatype()),
                 "this test is only meaningful when no FREE VAR carries a datatype sort"
             );
-            assert_eq!(detect_logic(&f), "ALL", "Sel/IsCtor range over a datatype: {f:?}");
+            // `{Datatypes, Ints, …}`: `Sel`'s bitvector field sort takes the
+            // first shape to `ALL` (no attested `A`-free `BVDT`+`Int` name),
+            // while `IsCtor` over an `Int` argument heads `QF_UFDTLIA`. Both
+            // are datatype-capable, which is what this test is about.
+            let logic = detect_logic(&f);
+            assert!(
+                logic == "ALL" || logic.contains("DT"),
+                "Sel/IsCtor range over a datatype: {f:?} headed `{logic}`"
+            );
 
             let decls = emit_declarations(&f);
             let sort_pos = decls.iter().position(|d| d.contains("(declare-sort Expr 0)"));
@@ -646,6 +792,12 @@ mod tests {
             vec![("e".into(), expr_dt_sort())],
             Box::new(Formula::Eq(Box::new(int_var("n")), Box::new(Formula::Int(0)))),
         );
+        // `{Quantifiers, Datatypes, BitVectors, Ints, WideArith}` — the bound
+        // sort's `Const` field is a bitvector and the body compares an `Int`.
+        // SMT-LIB's only names for that mix are the `A`-leading `AUFBVDT*`
+        // ones, which the table declines for want of an [S1] declaration of
+        // their array fragment, so the honest answer is the top. What this test
+        // is about is that the BINDER SORT REACHED the logic line at all.
         assert_eq!(detect_logic(&f), "ALL", "a datatype binder needs the datatype theory");
         let decls = emit_declarations(&f);
         let dt_pos = decls.iter().position(|d| d.contains("(declare-datatype Expr"));
@@ -833,6 +985,32 @@ mod tests {
         assert_eq!(formula_to_smt2(&exists), "(exists ((x Int)) (> x 0))");
     }
 
+    /// The BINDER-SORT hole in logic detection. A quantifier's binding sorts
+    /// are not `Formula::children()`, so `detect_logic`'s walk never saw them:
+    /// a binder whose bound variable is not USED in the body contributed no
+    /// theory at all, and the emitted `(set-logic …)` disagreed with the
+    /// declarations `emit_declarations` produced from the same binder list.
+    #[test]
+    fn a_quantifier_binder_sort_reaches_logic_detection() {
+        // The bound variable is deliberately UNUSED, so only the binder sort
+        // itself can carry the theory.
+        let trivial = || Box::new(Formula::Bool(true));
+        for (sort, expected) in [
+            (Sort::BitVec(8), "BV"),
+            (Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int)), "A"),
+            (Sort::Real, "R"),
+            (Sort::Float { eb: 8, sb: 24 }, "FP"),
+        ] {
+            let quantified = Formula::Forall(vec![("q".into(), sort.clone())], trivial());
+            let logic = detect_logic(&quantified);
+            assert!(
+                logic.contains(expected) || logic == "ALL",
+                "a {sort:?} binder must reach logic detection, got {logic}"
+            );
+            assert_ne!(logic, "QF_LIA", "{sort:?} binder mis-detected as {logic}");
+        }
+    }
+
     #[test]
     fn test_formula_to_smt2_arrays() {
         let arr = Formula::Var("arr".into(), Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int)));
@@ -929,6 +1107,14 @@ mod tests {
         assert_eq!(emit_declarations(&f), vec!["(declare-fun q () Int)"]);
     }
 
+    /// The PURE float fragment heads `QF_FP`; the moment a BITVECTOR joins it,
+    /// the transcript is in the COMBINED BV+FP fragment and heads `QF_BVFP`.
+    ///
+    /// Both names are SMT-LIB's. The mixed case answered `ALL` until the
+    /// SMT-LIB name audit added the floating-point family to the shared table —
+    /// sound, since `ALL` admits strictly more, but it sent every `fp.to_ieee_bv`
+    /// / `FpConst` transcript to the top of the lattice for want of a row, and
+    /// `QF_BVFP` is precisely the fragment SMT-LIB puts that form in.
     #[test]
     fn test_detect_logic_for_floating_point_and_fp_bv_mix() {
         let fp_sort = Sort::Float { eb: 8, sb: 24 };
@@ -940,10 +1126,27 @@ mod tests {
         assert_eq!(emit_declarations(&fp), vec!["(declare-fun f () (_ FloatingPoint 8 24))"]);
 
         let fp_bits = Formula::Eq(
-            Box::new(Formula::FpToIeeeBv(Box::new(Formula::SymVar(Symbol::intern("f"), fp_sort)))),
+            Box::new(Formula::FpToIeeeBv(Box::new(Formula::SymVar(
+                Symbol::intern("f"),
+                fp_sort.clone(),
+            )))),
             Box::new(Formula::BitVec { value: 0, width: 32 }),
         );
-        assert_eq!(detect_logic(&fp_bits), "ALL");
+        assert_eq!(detect_logic(&fp_bits), "QF_BVFP");
+
+        // An INTEGER beside the float is still the top: SMT-LIB's only names
+        // for floats-with-integers are the four `*FPDT*` ones, which drag
+        // DATATYPES and NONLINEARITY in with them — a separate rejection with
+        // its own reason, untouched when Lever A was re-pointed. This is the M1
+        // shape and it has not moved.
+        let fp_and_int = Formula::And(vec![
+            fp,
+            Formula::Gt(
+                Box::new(Formula::SymVar(Symbol::intern("n"), Sort::Int)),
+                Box::new(Formula::Int(0)),
+            ),
+        ]);
+        assert_eq!(detect_logic(&fp_and_int), "ALL");
     }
 
     #[test]
@@ -1002,21 +1205,128 @@ mod tests {
         assert_eq!(detect_logic(&f), "QF_BV");
     }
 
+    /// Arrays over integers, with NO uninterpreted function applied, select
+    /// `QF_ALIA` — the least row that admits arrays and ints. The cascade used
+    /// to answer `QF_AUFLIA` here because it had folded the UF dimension into
+    /// the array arm; the lattice keeps the two apart, and `QF_ALIA` is the
+    /// strictly more precise (smaller) admitting logic.
     #[test]
     fn test_detect_logic_arrays_int() {
         let arr = Formula::Var("arr".into(), Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int)));
         let f = Formula::Select(Box::new(arr), Box::new(Formula::Int(0)));
-        assert_eq!(detect_logic(&f), "QF_AUFLIA");
+        assert_eq!(detect_logic(&f), "QF_ALIA");
+    }
+
+    /// Arrays OF bitvectors take `QF_ABV`, the name that spells exactly what
+    /// the transcript uses.
+    ///
+    /// A previous revision answered `ALL` here, because a FULLY MONOTONE table
+    /// cannot hold `QF_ALIA` and `QF_ABV` at once: `{Arrays}` is a subset of
+    /// both and would have to select a name admitting no more than their
+    /// intersection. Monotonicity is no longer claimed
+    /// (`trust_types::logic_lattice`'s
+    /// `monotonicity_fails_only_from_sets_no_row_names_exactly` says exactly
+    /// where it fails), so the array and bitvector names are both selectable
+    /// again and this query reaches a bitvector pipeline instead of the top of
+    /// the lattice. ADMISSIBILITY — which is what this transcript needs — is
+    /// unaffected: `QF_ABV` admits arrays and bitvectors, and the query uses
+    /// nothing else.
+    ///
+    /// `{Arrays}` alone is no longer one of the violating sets, incidentally:
+    /// the SMT-LIB name audit found that SMT-LIB DOES spell arrays-and-nothing-
+    /// else, `QF_AX`, and added the row. That does not touch this query, which
+    /// uses bitvectors too.
+    /// THIS LANE BUILDS ITS OWN FEATURE RECORD, AND IT MUST CARRY THE
+    /// LINEAR-FORM BIT.
+    ///
+    /// [`analyze_formula`] assembles `Theories` from `sort_theories` +
+    /// `node_theories` + the `declare-fun` signature map — three per-node
+    /// sources, none of which can decide whether an ATOM is a difference
+    /// constraint. Since `QF_IDL` became a row, a record carrying `INTS` and
+    /// no `WIDE_ARITH` selects `QF_IDL`, so an omission here would head EVERY
+    /// integer transcript with a logic admitting only `x - y ▷◁ n`.
+    ///
+    /// It would also be SILENT: ay routes `QF_IDL` to its full `QfLia` solver
+    /// and enforces no fragment restriction (measured 2026-09-18), so every
+    /// in-house verdict would stay correct and only an external replayer would
+    /// reject the evidence. Hence this test, which pins the two lanes against
+    /// each other on both sides of the boundary.
+    #[test]
+    fn features_carry_the_linear_form_bit() {
+        use trust_types::logic_lattice::{Theories, formula_theories};
+
+        let x = || int_var("x");
+        let y = || int_var("y");
+
+        // OUT of the fragment: the bit must be charged, and the transcript
+        // lane must head the GENERAL integer logic.
+        let general = Formula::Gt(
+            Box::new(Formula::Add(Box::new(x()), Box::new(y()))),
+            Box::new(Formula::Int(3)),
+        );
+        assert!(
+            formula_features(&general).contains(Theories::WIDE_ARITH),
+            "this lane must charge the linear-form bit for a general arithmetic atom"
+        );
+        assert_eq!(detect_logic(&general), "QF_LIA");
+
+        // IN the fragment: the bit must NOT be charged, and the answer is the
+        // difference logic.
+        let difference = Formula::Gt(
+            Box::new(Formula::Sub(Box::new(x()), Box::new(y()))),
+            Box::new(Formula::Int(3)),
+        );
+        assert!(!formula_features(&difference).contains(Theories::WIDE_ARITH));
+        assert_eq!(detect_logic(&difference), "QF_IDL");
+
+        // THE TWO LANES AGREE. `formula_theories` is trust-types' own record
+        // builder; this lane's only additions are the `declare-fun` signature
+        // sorts, so on a formula with no applied uninterpreted symbol the two
+        // records must be EQUAL — including the linear-form bit.
+        for formula in [&general, &difference] {
+            assert_eq!(
+                formula_features(formula),
+                formula_theories(formula),
+                "the transcript lane and trust-types must agree on {formula:?}"
+            );
+        }
+
+        // A declared UF signature does not disturb the bit: `(f x)` is not a
+        // free constant, so the atom is not a difference atom either way.
+        let applied = Formula::Gt(
+            Box::new(Formula::Sub(
+                Box::new(Formula::FnApp { func: "f".into(), args: vec![x()], sort: Sort::Int }),
+                Box::new(y()),
+            )),
+            Box::new(Formula::Int(3)),
+        );
+        let features = formula_features(&applied);
+        assert!(features.contains(Theories::WIDE_ARITH) && features.contains(Theories::UF));
+        assert_eq!(detect_logic(&applied), "QF_UFLIA");
     }
 
     #[test]
-    fn test_detect_logic_arrays_bv() {
+    fn test_detect_logic_arrays_bv_is_qf_abv() {
         let arr = Formula::Var(
             "mem".into(),
             Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8))),
         );
         let f = Formula::Select(Box::new(arr), Box::new(bv_var("addr", 64)));
         assert_eq!(detect_logic(&f), "QF_ABV");
+        // LEVER C, SPLIT ON MEASUREMENT 2026-09-18: the moment an `Int` joins
+        // the bitvectors the pure BV name is no longer honest, and the answer
+        // is `QF_AUFBVLIA` — the narrowest attested name for arrays + UF +
+        // bitvectors + linear integers. THE SENTENCE THAT USED TO FOLLOW HERE
+        // IS GONE because both halves of it are: it said the six SMT-LIB names
+        // of the same class are on `LOGIC_LATTICE`'s rejection list "because ay
+        // REFUSES them", and that `{BitVectors, Reals}` therefore stays on
+        // `ALL`. Lever C made all six ROWS on 2026-09-18, so `{BitVectors,
+        // Reals}` heads `QF_BVFPLRA`; and ay `9d2cda9c8727` taught the
+        // in-process parser all six, re-measured 2026-09-19, so what the parser
+        // accepts is no longer a reason for anything in this table.
+        let mixed =
+            Formula::And(vec![f, Formula::Gt(Box::new(int_var("len")), Box::new(Formula::Int(0)))]);
+        assert_eq!(detect_logic(&mixed), "QF_AUFBVLIA");
     }
 
     #[test]
@@ -1028,8 +1338,12 @@ mod tests {
         assert_eq!(detect_logic(&f), "LIA");
     }
 
+    /// A quantified BITVECTOR formula takes `BV`, the SMT-LIB name for exactly
+    /// that fragment. A previous revision answered `ALL` because `BV` and `LIA`
+    /// would meet at "quantifiers alone", which no SMT-LIB name spells, and a
+    /// monotone table cannot hold both; monotonicity is no longer claimed.
     #[test]
-    fn test_detect_logic_quantified_bv() {
+    fn test_detect_logic_quantified_bv_is_bv() {
         let f = Formula::Forall(
             vec![("x".into(), Sort::BitVec(32))],
             Box::new(Formula::BvULt(
@@ -1041,10 +1355,18 @@ mod tests {
         assert_eq!(detect_logic(&f), "BV");
     }
 
+    /// A purely propositional formula requires no theory at all, and takes the
+    /// lattice BOTTOM, `QF_UF`. It used to take `QF_LIA` — harmless on its own
+    /// (a Core transcript is well formed under any logic) but fatal to
+    /// monotonicity: `∅ ⊆ {Floats}` while `QF_LIA` admits integers that
+    /// `QF_FP` does not, so adding a feature produced a logic admitting LESS.
+    /// A least element is what makes a total selector monotone at all; see note
+    /// (a) on `trust_types::logic_lattice::LOGIC_LATTICE` for why `QF_UF` is
+    /// recorded as admitting nothing.
     #[test]
-    fn test_detect_logic_pure_bool() {
+    fn test_detect_logic_pure_bool_is_the_lattice_bottom() {
         let f = Formula::And(vec![Formula::Bool(true), Formula::Bool(false)]);
-        assert_eq!(detect_logic(&f), "QF_LIA");
+        assert_eq!(detect_logic(&f), "QF_UF");
     }
 
     // --- Additional bitvector operation coverage ---
@@ -1163,5 +1485,159 @@ mod tests {
             decls.iter().any(|d| d == "(declare-fun priv_dropped () Bool)"),
             "nullary predicate must be declared: {decls:?}"
         );
+    }
+
+    /// A real-valued query (a `Real`-sorted variable or a `Formula::Rat`
+    /// literal) must be labelled with a Reals logic. Before this it fell into
+    /// the `QF_LIA` arm — an integer question about real variables.
+    #[test]
+    fn real_sorted_formulas_select_a_reals_logic() {
+        let x = Formula::Var("x".into(), Sort::Real);
+        let half = Formula::rat("1", "2").expect("canonical");
+        let pure = Formula::And(vec![
+            Formula::Le(
+                Box::new(Formula::Mul(Box::new(half), Box::new(x.clone()))),
+                Box::new(Formula::rat_from_int(1)),
+            ),
+            Formula::Ge(Box::new(x.clone()), Box::new(Formula::rat_from_int(3))),
+        ]);
+        assert_eq!(detect_logic(&pure), "QF_LRA");
+        let n = Formula::Var("n".into(), Sort::Int);
+        let mixed = Formula::And(vec![
+            Formula::Le(Box::new(x.clone()), Box::new(Formula::rat_from_int(1))),
+            Formula::Le(Box::new(n), Box::new(Formula::Int(4))),
+        ]);
+        assert_eq!(detect_logic(&mixed), "QF_LIRA");
+        let quantified = Formula::Forall(
+            vec![(Symbol::intern("y"), Sort::Real)],
+            Box::new(Formula::Le(Box::new(x.clone()), Box::new(x.clone()))),
+        );
+        // QUANTIFIED reals take `LRA`, the name that says exactly that. A
+        // previous revision answered `LIRA` — sound, since it admits reals —
+        // because a fully monotone table cannot hold both `LRA` and `LIA`.
+        // Monotonicity is no longer claimed, so the precise name is back and
+        // the logic line promises no integer theory the transcript does not
+        // use.
+        assert_eq!(detect_logic(&quantified), "LRA");
+        // Declarations carry the sort through unchanged.
+        let decls = emit_declarations(&pure);
+        assert!(decls.iter().any(|d| d == "(declare-fun x () Real)"), "{decls:?}");
+    }
+
+    /// TRUST-04 on the TEXT lane. `emit_declarations` over the RAW formula is
+    /// what the external-ay session (`IncrementalAYSession`, the compiler's
+    /// solver lane) and the SMT-LIB backend send; no ay namespace applies
+    /// there. The declaration it renders for a datatype lowered from a
+    /// `Ty::Datatype` must be legal SMT-LIB on its own: with the raw Rust
+    /// member names, `Level`'s selectors were `0`, `0`, `1`, `0` — a numeral
+    /// is not a symbol (the ay binary answers `selector name must be symbol`)
+    /// and a repeated selector is one symbol for several fields.
+    #[test]
+    fn a_lowered_datatype_declares_legal_distinct_selectors() {
+        let level_ref = || Ty::Datatype { name: "Level".into(), variants: vec![] };
+        let level = Sort::from_ty(&Ty::Datatype {
+            name: "Level".into(),
+            variants: vec![
+                ("Zero".into(), vec![]),
+                ("Succ".into(), vec![("0".into(), level_ref())]),
+                ("Max".into(), vec![("0".into(), level_ref()), ("1".into(), level_ref())]),
+                ("Param".into(), vec![("0".into(), Ty::Int { width: 64, signed: false })]),
+            ],
+        });
+        let f = Formula::Eq(
+            Box::new(Formula::Var("l".into(), level.clone())),
+            Box::new(Formula::Var("m".into(), level)),
+        );
+        let decls = emit_declarations(&f);
+        assert!(
+            decls.iter().any(|d| d
+                == "(declare-datatype Level ((Zero) (Succ (Succ.0 Level)) \
+                    (Max (Max.0 Level) (Max.1 Level)) (Param (Param.0 (_ BitVec 64)))))"),
+            "each field must be declared under its own selector symbol: {decls:?}"
+        );
+    }
+
+    #[test]
+    fn test_analyze_formula_fused_matches_four_walk_oracle() {
+        let oracle = |formula: &Formula| -> Theories {
+            let mut features = Theories::NONE;
+            visit_datatype_bearing_sorts(formula, &mut |sort| {
+                features.insert(trust_types::logic_lattice::sort_theories(sort));
+            });
+            trust_types::visit_formula_nodes(formula, &mut |node| {
+                features.insert(trust_types::logic_lattice::node_theories(node));
+            });
+            for (_, (arg_sorts, result_sort)) in uninterpreted_symbol_signatures(formula) {
+                if !arg_sorts.is_empty() {
+                    features.insert(Theories::UF);
+                }
+                for arg_sort in &arg_sorts {
+                    features.insert(trust_types::logic_lattice::sort_theories(arg_sort));
+                }
+                features.insert(trust_types::logic_lattice::sort_theories(&result_sort));
+            }
+            features.insert(trust_types::logic_lattice::wide_arithmetic_theories(formula));
+            features
+        };
+
+        let samples = vec![
+            Formula::Bool(false),
+            Formula::BvULt(
+                Box::new(Formula::Var("bv".into(), Sort::BitVec(32))),
+                Box::new(Formula::BitVec { value: 7, width: 32 }),
+                32,
+            ),
+            Formula::FpIsNaN(Box::new(Formula::Var("f".into(), Sort::Float { eb: 8, sb: 24 }))),
+            Formula::Lt(
+                Box::new(Formula::Sub(
+                    Box::new(Formula::Var("x".into(), Sort::Int)),
+                    Box::new(Formula::Var("y".into(), Sort::Int)),
+                )),
+                Box::new(Formula::Int(3)),
+            ),
+            Formula::Lt(
+                Box::new(Formula::Add(
+                    Box::new(Formula::Var("x".into(), Sort::Int)),
+                    Box::new(Formula::Var("y".into(), Sort::Int)),
+                )),
+                Box::new(Formula::Int(3)),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Select(
+                    Box::new(Formula::ConstArray {
+                        index_sort: Sort::Bool,
+                        elem_sort: Sort::Bool,
+                        value: Box::new(Formula::Bool(true)),
+                    }),
+                    Box::new(Formula::Bool(false)),
+                )),
+                Box::new(Formula::Bool(true)),
+            ),
+            Formula::And(vec![
+                Formula::IsCtor {
+                    datatype: "GhostDt".into(),
+                    ctor: "Some".into(),
+                    arg: Box::new(Formula::Var("g".into(), Sort::Int)),
+                },
+                Formula::Pred(
+                    Symbol::intern("p"),
+                    vec![Formula::FnApp {
+                        func: "k0".into(),
+                        args: vec![],
+                        sort: Sort::BitVec(16),
+                    }],
+                ),
+            ]),
+        ];
+
+        for sample in &samples {
+            assert_eq!(analyze_formula(sample), oracle(sample), "mismatch on {sample:?}");
+            let mut streamed = String::new();
+            write_declarations(sample, &mut streamed);
+            let emitted = emit_declarations(sample);
+            let expected =
+                if emitted.is_empty() { String::new() } else { format!("{}\n", emitted.join("\n")) };
+            assert_eq!(streamed, expected, "declaration mismatch on {sample:?}");
+        }
     }
 }

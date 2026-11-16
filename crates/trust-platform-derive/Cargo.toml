@@ -1,0 +1,37 @@
+# trust-platform-derive: D-11(e) at M1 scope.
+#
+# Event program (a CFG of Trust.Platform events, thread roots, spawn sites
+# with their child-side programs) -> explicit finite state machine over the
+# scalar encoding of plan D7, built by evaluating trust-platform's one Darwin
+# definition, emitted as the `TyTemporalModelPayload` NativeTyEngine checks
+# unchanged, plus an event map from every machine action to its source.
+#
+# The library depends on the model, the payload types and ty's CTL parser
+# (trust-temporal: a formula's atoms are checked against the model's
+# vocabulary with the same parser NativeTyEngine uses). The tests run the
+# emitted payload through trust-router's NativeTyEngine (the in-process `ty`
+# primary), which is why trust-router is a dev-dependency only.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-platform-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rayon = { workspace = true }
+trust-platform = { workspace = true }
+trust-temporal = { workspace = true }
+trust-types = { workspace = true }
+
+[dev-dependencies]
+trust-router = { workspace = true }
+trust-verifier-api = { workspace = true }
+serde_json = { workspace = true }

@@ -31,6 +31,7 @@ fn wrapping_neg_fn(ty: Ty, callee: &str) -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                         is_foreign: false,
                     },
                 },
@@ -44,6 +45,7 @@ fn wrapping_neg_fn(ty: Ty, callee: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -127,7 +129,7 @@ fn wrapping_neg_const_fn(dest_ty: Ty, k: i128, callee: &str) -> VerifiableFuncti
 ///
 /// WITNESS — a live false proof before the agreement check:
 ///
-/// ```ignore
+/// ```ignore (illustrative)
 /// const K: i128 = i64::MIN as i128;
 /// let n = K.wrapping_neg();          // truly +2^63
 /// ```
@@ -143,11 +145,8 @@ fn wrapping_neg_const_fn(dest_ty: Ty, k: i128, callee: &str) -> VerifiableFuncti
 /// A/B: this test FAILS on the unfixed recognizer.
 #[test]
 fn wrapping_neg_declines_when_the_path_width_disagrees_with_the_operand() {
-    let func = wrapping_neg_const_fn(
-        Ty::i128(),
-        i64::MIN as i128,
-        "core::num::<impl i128>::wrapping_neg",
-    );
+    let func =
+        wrapping_neg_const_fn(Ty::i128(), i64::MIN as i128, "core::num::<impl i128>::wrapping_neg");
     let guards = successor_guards(&func);
     assert!(
         guards.iter().all(|f| !format!("{f:?}").contains("n#")),
@@ -161,8 +160,7 @@ fn wrapping_neg_declines_when_the_path_width_disagrees_with_the_operand() {
 /// cannot "work" by disabling the model.
 #[test]
 fn wrapping_neg_still_models_a_width_agreeing_constant_receiver() {
-    let func =
-        wrapping_neg_const_fn(Ty::i64(), -5, "core::num::<impl i64>::wrapping_neg");
+    let func = wrapping_neg_const_fn(Ty::i64(), -5, "core::num::<impl i64>::wrapping_neg");
     let guards = successor_guards(&func);
     assert!(
         guards.iter().any(|f| format!("{f:?}").contains("n#")),

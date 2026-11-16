@@ -62,44 +62,30 @@ pub(crate) fn extract_hints(
     }
 }
 
+fn hint_to_precondition(h: &CounterexampleHint) -> String {
+    match &h.kind {
+        HintKind::UpperBound { bound } => format!("{} <= {bound}", h.variable),
+        HintKind::LowerBound { bound } => format!("{} >= {bound}", h.variable),
+        HintKind::NotEqual { value } => format!("{} != {value}", h.variable),
+        HintKind::NonZero => format!("{} != 0", h.variable),
+        HintKind::LessThan { other } => format!("{} < {other}", h.variable),
+        HintKind::BoundExpr { spec_fragment } => spec_fragment.clone(),
+    }
+}
+
 /// Build a spec body string from a set of hints for a given failure pattern.
 #[must_use]
 pub(crate) fn hints_to_spec_body(
     hints: &[CounterexampleHint],
-    pattern: &FailurePattern,
+    _pattern: &FailurePattern,
 ) -> Option<String> {
-    if hints.is_empty() {
-        return None;
+    let mut iter = hints.iter().map(hint_to_precondition);
+    let mut out = iter.next()?;
+    for part in iter {
+        out.push_str(" && ");
+        out.push_str(&part);
     }
-
-    let parts: Vec<String> = hints
-        .iter()
-        .map(|h| match &h.kind {
-            HintKind::UpperBound { bound } => format!("{} <= {bound}", h.variable),
-            HintKind::LowerBound { bound } => format!("{} >= {bound}", h.variable),
-            HintKind::NotEqual { value } => format!("{} != {value}", h.variable),
-            HintKind::NonZero => format!("{} != 0", h.variable),
-            HintKind::LessThan { other } => format!("{} < {other}", h.variable),
-            HintKind::BoundExpr { spec_fragment } => spec_fragment.clone(),
-        })
-        .collect();
-
-    if parts.is_empty() {
-        return None;
-    }
-
-    // For overflow patterns, wrap in a more descriptive spec if we have two operands
-    if matches!(pattern, FailurePattern::ArithmeticOverflow { .. }) && parts.len() == 1 {
-        // SAFETY: We checked parts.is_empty() above and returned None.
-        return Some(
-            parts
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| unreachable!("parts empty after non-empty check")),
-        );
-    }
-
-    Some(parts.join(" && "))
+    Some(out)
 }
 
 /// Convert a list of counterexample hints into precondition formula strings.
@@ -108,17 +94,7 @@ pub(crate) fn hints_to_spec_body(
 /// for use as a native `requires ...` clause. Returns one precondition per hint.
 #[must_use]
 pub(crate) fn hints_to_preconditions(hints: &[CounterexampleHint]) -> Vec<String> {
-    hints
-        .iter()
-        .map(|h| match &h.kind {
-            HintKind::UpperBound { bound } => format!("{} <= {bound}", h.variable),
-            HintKind::LowerBound { bound } => format!("{} >= {bound}", h.variable),
-            HintKind::NotEqual { value } => format!("{} != {value}", h.variable),
-            HintKind::NonZero => format!("{} != 0", h.variable),
-            HintKind::LessThan { other } => format!("{} < {other}", h.variable),
-            HintKind::BoundExpr { spec_fragment } => spec_fragment.clone(),
-        })
-        .collect()
+    hints.iter().map(hint_to_precondition).collect()
 }
 
 // --- Extraction helpers ---
@@ -177,14 +153,13 @@ fn extract_overflow_hints(
     }
 
     // If we have exactly two numeric variables, produce a combined bound
-    let numeric_vars: Vec<_> = assignments
+    let mut numeric_vars = assignments
         .iter()
-        .filter(|(_, v)| matches!(v, CounterexampleValue::Uint(_) | CounterexampleValue::Int(_)))
-        .collect();
+        .filter(|(_, v)| matches!(v, CounterexampleValue::Uint(_) | CounterexampleValue::Int(_)));
 
-    if numeric_vars.len() == 2 {
-        let (name_a, _) = numeric_vars[0];
-        let (name_b, _) = numeric_vars[1];
+    if let (Some((name_a, _)), Some((name_b, _)), None) =
+        (numeric_vars.next(), numeric_vars.next(), numeric_vars.next())
+    {
         hints.push(CounterexampleHint {
             variable: name_a.clone(),
             kind: HintKind::BoundExpr {

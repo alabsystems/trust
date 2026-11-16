@@ -1,0 +1,56 @@
+//@ needs-trust-verify
+//@ edition: 2021
+//@ aux-build: seal_dep_bodies_checked.rs
+//@ compile-flags: -Ztrust-verify=off -A warnings
+//@ check-fail
+//@ dont-check-compiler-stderr
+//@ dont-require-annotations: NOTE
+//@ dont-require-annotations: HELP
+//! A seal checked against a dependency built for `check` (`--emit=metadata`),
+//! where the compiler's own collector, asked what a body uses, lists a body
+//! of that dependency whose MIR its metadata does not carry: the clone the
+//! compiler writes for a tuple `(Tag<Wake>, u8)` (a shim, no code of any
+//! crate) calls the dependency's `Clone` impl at `Wake`. Before, the
+//! collector stopped the build there ("missing optimized MIR", which names no
+//! seal). Now it lists that body as it lists one whose MIR is there, and the
+//! seal must FAIL saying which body could not be read
+//! (`Trust.Protocol.Seal`). (Every seal is refused where this happens: this
+//! file has one.) Built in full, the same dependency holds:
+//! `clean_island_seal_check_build_clone_shim_holds.rs`. No rule was relaxed
+//! for it.
+
+#![allow(unused)]
+
+extern crate seal_dep_bodies_checked;
+
+use std::marker::PhantomData;
+
+use seal_dep_bodies_checked::Tag;
+
+pub struct Cell { n: u32 }
+impl Cell {
+    fn new() -> Self { Cell { n: 0 } }
+    fn bump(&mut self) { self.n += 1; }
+}
+pub struct App { cell: Cell }
+impl App { fn new() -> Self { App { cell: Cell::new() } } }
+
+/// A type of this crate that owns no `Cell`, as aterm's `Wake` owns none.
+pub struct Wake { id: u32 }
+
+fn main() {
+    let mut a = App::new();
+    a.cell.bump();
+    let pair = (Tag::<Wake> { n: 1, of: PhantomData }, 2u8);
+    let copy = pair.clone(); //~ NOTE the body of `seal_dep_bodies_checked::Tag::clone`, which the metadata of its crate does not carry
+    let _ = copy.0.n;
+}
+
+clean {
+    import Trust.Binding
+    namespace CheckBuildCloneShim
+    open Trust.Protocol
+    def cell : Trust.Protocol.Seal := seals "Cell" ["Cell::bump"] ["Cell::new"] ["App::new"] []
+    end CheckBuildCloneShim
+}
+//~^^^ ERROR seal `CheckBuildCloneShim.cell` on `Cell` does not hold

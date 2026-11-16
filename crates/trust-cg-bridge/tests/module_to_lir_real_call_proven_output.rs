@@ -71,11 +71,13 @@ fn make_caller_add_module(k: i128) -> Module {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
     module.func_types.push(FuncTy {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
 
     // --- callee: add(x, y) = x + y  (FuncId 1) ---

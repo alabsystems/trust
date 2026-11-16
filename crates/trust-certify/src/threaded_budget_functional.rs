@@ -515,16 +515,12 @@ fn parse_ref_arm(
     // Reconstruct the call CHAIN: call 0 is the FnApp at fuel `k`; call p the
     // FnApp at call p-1's remainder. Calls are definitional applications
     // `FnApp(ref_c, [fuel, field])`.
-    fn collect_fnapps<'f>(f: &'f Formula, out: &mut Vec<&'f Formula>) {
-        if matches!(f, Formula::FnApp { .. }) && !out.iter().any(|g| *g == f) {
-            out.push(f);
-        }
-        for child in f.children() {
-            collect_fnapps(child, out);
-        }
-    }
     let mut apps: Vec<&Formula> = Vec::new();
-    collect_fnapps(result, &mut apps);
+    trust_types::visit_formula_nodes(result, &mut |f| {
+        if matches!(f, Formula::FnApp { .. }) && !apps.contains(&f) {
+            apps.push(f);
+        }
+    });
     let mut chain: Vec<Formula> = Vec::new();
     let mut calls: Vec<(usize, usize)> = Vec::new();
     for p in 0..calls_tag.len() {
@@ -1750,7 +1746,8 @@ impl ThreadedPlan {
 // ---------------------------------------------------------------------------
 
 fn kernel_checks_goal(env: &Environment, term: &Expr, goal: &Expr) -> bool {
-    TypeChecker::with_context(env, LocalContext::new()).check_type(term, goal).is_ok()
+    crate::kernel_stop::check_type(TypeChecker::with_context(env, LocalContext::new()), term, goal)
+        .is_ok()
 }
 
 fn threaded_lineage_digest(
@@ -1891,10 +1888,12 @@ mod tests {
         Formula::Ctor { ctor: "Mk".to_string(), args: vec![rem, tree], sort: res_sort() }
     }
 
+    // Selectors are spelled as `Sort::from_ty` declares them and trust-vcgen
+    // emits them: `Mk`'s fields `0` and `1` are `Mk.0` and `Mk.1`.
     fn fst_of(inner: Formula) -> Formula {
         Formula::Sel {
             datatype: "res::Res".to_string(),
-            field: "0".to_string(),
+            field: trust_types::datatype_selector_name("Mk", "0"),
             field_sort: fuel_sort(),
             arg: Box::new(inner),
         }
@@ -1903,7 +1902,7 @@ mod tests {
     fn snd_of(inner: Formula) -> Formula {
         Formula::Sel {
             datatype: "res::Res".to_string(),
-            field: "1".to_string(),
+            field: trust_types::datatype_selector_name("Mk", "1"),
             field_sort: e_sort(),
             arg: Box::new(inner),
         }

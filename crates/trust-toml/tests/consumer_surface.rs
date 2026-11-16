@@ -30,8 +30,8 @@
 //! | `to_string_pretty` 2 | `Table` 2 | `Value::as_table` 1 | `Value::Boolean` 1 |
 //! | `Value::Array` 1 | | | |
 //!
-//! `to_string` / `to_string_pretty` (11 sites, all in `trust-js-differential`)
-//! are the write path. They landed in slice 2 (`src/ser.rs`), and the rename is
+//! `to_string` / `to_string_pretty` (11 sites, all in `trust-js-differential`,
+//! deleted 2026-11-10) are the write path. They landed in slice 2 (`src/ser.rs`), and the rename is
 //! now WIRED — every item in that table is exercised below, and the write path
 //! additionally carries `tests/serialize_differential.rs`.
 
@@ -120,9 +120,9 @@ fn the_real_release_version_file_deserializes_identically() {
     // implementations that were wrong the same way would pass the line above.
     assert_eq!(ours.schema_version, "trust.version-source.v2");
     assert_eq!(ours.product, "Trust");
-    assert_eq!(ours.rust_alignment.rustc_version, "1.99.0");
+    assert_eq!(ours.rust_alignment.rustc_version, "1.101.0");
     assert!(ours.rust_alignment.revision.starts_with("rust-lang/rust:"));
-    assert_eq!(ours.schemas.get("version").map(String::as_str), Some("trust.version.v3"));
+    assert_eq!(ours.schemas.get("version").map(String::as_str), Some("trust.version.v4"));
 }
 
 #[test]
@@ -130,18 +130,16 @@ fn an_absent_serde_default_table_arrives_empty() {
     // The `[schemas]` table is optional. This is the path `#[serde(default)]`
     // exists for, and the release file itself does NOT exercise it — so
     // without this case the attribute would be untested by the vertical.
-    let text = "\
-schema_version = \"trust.version-source.v2\"
-product = \"Trust\"
-toolchain_alias = \"trust\"
-trust_product_version = \"0.1.0\"
-release_report_schema = \"trust.release-report.v1\"
-
-[rust_alignment]
-rustc_version = \"1.99.0\"
-revision = \"rust-lang/rust:0000000000000000000000000000000000000000\"
-merged_on = \"2026-07-08\"
-";
+    //
+    // The document is the REAL release file with its `[schemas]` table cut
+    // off, rather than a copy with a hand-typed version number in it: a copy
+    // is one more place for the version to go stale, and the real file is the
+    // shape this reader actually meets.
+    let real = std::fs::read_to_string(version_source_path())
+        .expect("release/trust-version.toml must exist — it is the release gate's own input");
+    let cut = real.find("\n[schemas]\n").expect("the release file carries a [schemas] table");
+    let text = &real[..=cut];
+    assert!(!text.contains("[schemas]"), "the defaulted table must be absent from this case");
     let incumbent: TrustVersionSource = incumbent_toml::from_str(text).expect("incumbent");
     let ours: TrustVersionSource = trust_toml::from_str(text).expect("trust-toml");
     assert_eq!(incumbent, ours);
@@ -210,15 +208,16 @@ fn indexing_a_manifest_matches_the_incumbent() {
 }
 
 // ---------------------------------------------------------------------------
-// crates/trust-deps/src/lib.rs:1600 — parse ONE dependency line into a
-// `toml::Table`, then match on `Value::String` / `Boolean` / `Array` to
-// re-render it. This is the only consumer that pattern-matches variants.
+// The dependency-line parser of the retired `trust-deps` crate (removed by
+// TRUST-08, 2026-09-24): parse ONE dependency line into a `toml::Table`, then
+// match on `Value::String` / `Boolean` / `Array` to re-render it. It was the
+// only consumer that pattern-matched variants; the test keeps pinning that
+// shape because it is the incumbent's public API the rename contract promises.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn a_single_dependency_line_round_trips_through_table_and_variants() {
-    let line =
-        "trust-ir = { path = \"../trust-ir\", default-features = false, features = [\"a\", \"b\"], optional = true }";
+    let line = "trust-ir = { path = \"../trust-ir\", default-features = false, features = [\"a\", \"b\"], optional = true }";
 
     let incumbent: incumbent_toml::Value = incumbent_toml::from_str(line).expect("incumbent");
     let ours: trust_toml::Value = trust_toml::from_str(line).expect("trust-toml");
@@ -226,7 +225,7 @@ fn a_single_dependency_line_round_trips_through_table_and_variants() {
     compare(&incumbent, &ours, "", &mut differences);
     assert!(differences.is_empty(), "{differences:?}");
 
-    // `trust-deps`' exact chain: as_table -> get -> as_table -> cloned.
+    // The retired parser's exact chain: as_table -> get -> as_table -> cloned.
     let spec: trust_toml::Table = ours
         .as_table()
         .and_then(|table| table.get("trust-ir"))
@@ -236,7 +235,9 @@ fn a_single_dependency_line_round_trips_through_table_and_variants() {
 
     // And its `format_inline_toml_value` match, which is exhaustive over the
     // three variants it supports and errors on everything else.
-    assert!(matches!(spec.get("path"), Some(trust_toml::Value::String(path)) if path == "../trust-ir"));
+    assert!(
+        matches!(spec.get("path"), Some(trust_toml::Value::String(path)) if path == "../trust-ir")
+    );
     assert!(matches!(spec.get("optional"), Some(trust_toml::Value::Boolean(true))));
     let Some(trust_toml::Value::Array(features)) = spec.get("features") else {
         panic!("features must be an array");

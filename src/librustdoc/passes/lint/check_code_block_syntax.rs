@@ -41,8 +41,8 @@ fn check_rust_syntax(
         is_precise_span: bool,
     }
 
-    impl<'a, 'b> Diagnostic<'a, ()> for CodeblockError<'b> {
-        fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+    impl<'a, 'b> Diagnostic<'a> for CodeblockError<'b> {
+        fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a> {
             let Self { buffer, code_block, span, is_precise_span } = self;
 
             // Trust: the LANGUAGE of a doc code block is Rust (the tool is Trust). The

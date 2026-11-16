@@ -80,8 +80,10 @@ fn island_try(sources: &[&str]) -> Result<Environment, String> {
 
 const WIDTHS: [u32; 4] = [8, 16, 32, 64];
 
-/// The four raw operators, with the source token and the surface class. A
-/// probe cannot silently measure three of the four.
+/// Landing 8's four raw operators, with the source token and the surface class.
+/// A probe cannot silently measure three of the four. (`^^^` and `>>>` joined the
+/// raw family later, on 2026-09-23; their `==`-operand position is measured in
+/// `landing7_selection_probes::l7_p15`, since `>>>` needs a numeral amount.)
 const OPERATORS: [(RawBinOpKind, &str, &str, &str); 4] = [
     (RawBinOpKind::BitAnd, "&&&", "HAnd", "hAnd"),
     (RawBinOpKind::BitOr, "|||", "HOr", "hOr"),
@@ -145,6 +147,9 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
     let local_ty = |ty: TemplateTy| match ty {
         TemplateTy::Result | TemplateTy::Param { .. } => result_ty.clone(),
         TemplateTy::Bool => Ty::Bool,
+        TemplateTy::RustCalleeResult { .. } => {
+            panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement")
+        }
         TemplateTy::ResultRef => Ty::Ref { mutable: false, inner: Box::new(result_ty.clone()) },
     };
     let operand = |operand: TemplateOperand| match operand {
@@ -155,6 +160,9 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
         }
         TemplateOperand::U64Scalar(value) => {
             Operand::Constant(ConstValue::Uint(u128::from(value), 64))
+        }
+        TemplateOperand::UIntScalar { value, width } => {
+            Operand::Constant(ConstValue::Uint(value, width))
         }
         TemplateOperand::BoolScalar(value) => Operand::Constant(ConstValue::Bool(value)),
     };
@@ -191,6 +199,7 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
                         TemplateRvalue::SharedRef(of) => {
                             Rvalue::Ref { mutable: false, place: Place::local(of) }
                         }
+                        TemplateRvalue::BoolNot(_) => panic!("W6: bool negation not exercised by this probe"),
                     },
                     span: SourceSpan::default(),
                 })
@@ -211,6 +220,7 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
                     Terminator::Call {
                         func: match callee {
                             TemplateCallee::Primitive(identity) => identity.canonical_path(),
+                            TemplateCallee::RustFn { .. } => panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement"),
                             TemplateCallee::SelfDef => "crate::m::probe".to_owned(),
                         },
                         args: args.iter().map(|arg| operand(*arg)).collect(),
@@ -225,6 +235,7 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
                             TemplateUnwind::Continue => UnwindEdge::Continue,
                         },
                         callee_identity: None,
+                        callee_key: None,
                     }
                 }
             },
@@ -245,6 +256,7 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -268,7 +280,7 @@ fn plan_and_emit(
 
 /// **The measurement that deleted landing 6's refusal text.**
 ///
-/// For every unsigned machine width and every one of the four raw operators,
+/// For every unsigned machine width and every one of landing 8's four raw operators,
 /// in BOTH decision positions:
 ///
 /// * the elaborated condition is the landing-6 `ite` tree, unchanged;
@@ -1140,16 +1152,23 @@ fn l8_p9_two_parameter_well_founded_recursion_now_elaborates_and_is_refused_here
 ///
 /// * **`Nat.rec` wrapped back to a machine width.** The recorded reason (the
 ///   e2 boundary: open equations at the u64 carrier are not definitional) is
-///   RIGHT, but the arm that states it fires only when the user hand-writes
-///   `Nat.rec`. The spelling a user actually writes — define the recursion at
-///   `Nat` by equations and wrap it — has a NAMED CONSTANT at its head and
-///   falls through to the generic no-row message, which mentions neither e2 nor
-///   the carrier. And a third spelling (the equation form declared at the
-///   machine width) does not elaborate at all.
+///   RIGHT. The spelling a user actually writes — define the recursion at
+///   `Nat` by equations and wrap it — has a NAMED CONSTANT at its head; since
+///   a385c099a98 (named Lean call expansion) the call lane inlines that checked
+///   helper to its `Nat.rec` body, so this spelling now reaches the same e2 arm
+///   as the hand-written `Nat.rec`. (Before a385c099a98 it fell through to the
+///   generic no-row message, which mentioned neither e2 nor the carrier.) The
+///   bare `ofNat`/`toNat` round trip, with no recursion, still meets the
+///   generic fall-through — which since 2026-09-23 cites `uint.lit` as the row
+///   that selects `UInt64.ofNat` (at a literal), because it does
+///   (`landing7_selection_probes::l7_p17`). And a third spelling (the equation
+///   form declared at the machine width) does not elaborate at all.
 /// * **A pair-valued recursion (`fib`).** The recorded reason names the missing
 ///   `Prod` carrier. `fib` never reaches the carrier: its own signature is
-///   `Nat -> Nat`, so it refuses at the TABLE, on `Prod.fst`. A planner who
-///   trusted the entry would build the carrier and find `fib` still refusing.
+///   `Nat -> Nat`, so it refuses at the TABLE, on the `Prod` projection
+///   (`Prod.fst`, inlined to a kernel projection since a385c099a98). A planner
+///   who trusted the entry would build the carrier and find `fib` still
+///   refusing.
 #[test]
 fn l8_p10_two_miss_reasons_are_re_pointed_at_the_boundary_the_program_meets() {
     // ── `Nat.rec` wrapped back to a machine width: THREE spellings ─────────
@@ -1160,23 +1179,28 @@ fn l8_p10_two_miss_reasons_are_re_pointed_at_the_boundary_the_program_meets() {
     ]);
     let natural_text =
         refusal_text(&plan_clean_origin_body(&natural, "tz64").expect_err("must be refused"));
+    // Since a385c099a98 (named Lean call expansion) the named constant
+    // `tozero` is inlined to its `Nat.rec` body, so the NATURAL spelling now
+    // meets the e2 boundary itself. (Before that commit this assertion was
+    // negated: the named head fell through to the generic no-row message.)
     assert!(
-        !natural_text.contains("r1_equation_probes e2"),
-        "the NATURAL spelling's head is the named constant `tozero`, so it does NOT reach the \
-         e2 arm — the entry must not claim it does:\n{natural_text}"
+        natural_text.contains("r1_equation_probes e2"),
+        "the NATURAL spelling's named head `tozero` is expanded to its `Nat.rec` body, so it \
+         must reach the e2 arm — the boundary this program actually meets:\n{natural_text}"
     );
     assert!(
         natural_text.contains("UInt64.ofNat"),
-        "…it falls to the generic no-row message, which at least names the head:\n{natural_text}"
+        "…and the e2 refusal names the machine-width wrapper:\n{natural_text}"
     );
-    // The BARE round trip, with no recursion at all, refuses at the SAME site —
-    // so the natural spelling's blocker is the missing carrier-conversion row,
-    // not the recursion.
+    // The BARE round trip, with no recursion at all, has nothing to expand and
+    // still refuses at the generic fall-through, which names the head — so the
+    // bare conversion's blocker is its SHAPE (`uint.lit` selects `UInt64.ofNat`
+    // only over a literal; no row realizes the conversion), while the
+    // recursion's blocker is e2.
     let bare = refusal_text(&plan_clean_origin_body(&natural, "rt").expect_err("must be refused"));
     assert!(
-        bare.contains("UInt64.ofNat"),
-        "the bare `ofNat`/`toNat` round trip refuses at the same generic site, which is what \
-         locates the natural spelling's real blocker:\n{bare}"
+        bare.contains("UInt64.ofNat") && !bare.contains("r1_equation_probes e2"),
+        "the bare `ofNat`/`toNat` round trip refuses at the generic fall-through, not at e2:\n{bare}"
     );
     // The EXPLICIT `Nat.rec` spelling IS the one the e2 arm was written for.
     let explicit = island(&["def tzr (n : UInt64) : UInt64 := \
@@ -1199,12 +1223,21 @@ fn l8_p10_two_miss_reasons_are_re_pointed_at_the_boundary_the_program_meets() {
     // ── the pair-valued recursion: `fib` meets the TABLE, not the carrier ──
     let fib =
         island(&["def fib : Nat -> Nat\n  | 0 => 0\n  | 1 => 1\n  | n + 2 => fib (n + 1) + fib n"]);
-    let fib_text = refusal_text(&plan_clean_origin_body(&fib, "fib").expect_err("must be refused"));
+    let fib_refusal = plan_clean_origin_body(&fib, "fib").expect_err("must be refused");
+    let fib_text = refusal_text(&fib_refusal);
+    // Since a385c099a98 (named Lean call expansion) the checked helpers in
+    // `fib`'s body — `Prod.fst` and `fib.cov` — are inlined before the table
+    // is consulted a second time, so the head the table meets is the kernel
+    // projection itself (`a projection out of a structure`) rather than the
+    // named constant `Prod.fst` this assertion used to pin. The boundary is
+    // unchanged: the TABLE, with no row for the projection, not the carrier.
     assert!(
-        fib_text.contains("Prod.fst"),
+        matches!(fib_refusal, EmitRefusal::NotEmittable { .. })
+            && fib_text.contains("a projection out of a structure")
+            && fib_text.contains("no selection row"),
         "`fib`'s own signature is `Nat -> Nat`, so the CARRIER is granted and the plan refuses \
-         at the TABLE on `Prod.fst`. The entry's reason named the missing `Prod` carrier, which \
-         this body never reaches:\n{fib_text}"
+         at the TABLE on the `Prod` projection. The entry's reason named the missing `Prod` \
+         carrier, which this body never reaches:\n{fib_text}"
     );
     // …and `fib.cov`, which DOES carry a pair, is where the carrier refusal
     // lives — and it is a DIFFERENT `EmitRefusal` VARIANT, which is the sharpest
@@ -1213,7 +1246,7 @@ fn l8_p10_two_miss_reasons_are_re_pointed_at_the_boundary_the_program_meets() {
     assert!(
         matches!(cov, EmitRefusal::NoTotalCarrier { .. }),
         "`fib.cov` is the pair-valued half and refuses at the CARRIER (`NoTotalCarrier`), while \
-         `fib` itself refuses at the TABLE (`NotEmittable` on `Prod.fst`). Two halves, two \
+         `fib` itself refuses at the TABLE (`NotEmittable` on the `Prod` projection). Two halves, two \
          boundaries, two refusal variants — which the single-cause entry could not say: {cov:?}"
     );
     assert!(

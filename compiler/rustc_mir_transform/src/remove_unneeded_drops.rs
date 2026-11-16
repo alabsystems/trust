@@ -10,6 +10,7 @@ use rustc_middle::ty::TyCtxt;
 use tracing::{debug, trace};
 
 use super::simplify::simplify_cfg;
+use crate::PassPolicy;
 
 pub(super) struct RemoveUnneededDrops;
 
@@ -19,16 +20,18 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveUnneededDrops {
 
         let typing_env = body.typing_env(tcx);
         let mut should_simplify = false;
-        for block in body.basic_blocks.as_mut() {
-            let terminator = block.terminator_mut();
-            let TerminatorKind::Drop { place, target, .. } = terminator.kind else { continue };
+        for bb in body.basic_blocks.indices() {
+            let TerminatorKind::Drop { place, target, .. } = body.basic_blocks[bb].terminator().kind
+            else {
+                continue;
+            };
             let ty = place.ty(&body.local_decls, tcx).ty;
 
             if ty.needs_drop(tcx, typing_env) {
                 continue;
             }
             debug!("SUCCESS: replacing `drop` with goto({:?})", target);
-            terminator.kind = TerminatorKind::Goto { target };
+            body.basic_blocks.as_mut()[bb].terminator_mut().kind = TerminatorKind::goto(target);
             should_simplify = true;
         }
 
@@ -39,7 +42,7 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveUnneededDrops {
         }
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(true)
     }
 }

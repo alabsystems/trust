@@ -38,10 +38,13 @@ use trust_sha2::Digest as _;
 // Deterministic input patterns
 // ---------------------------------------------------------------------------
 
+/// A named deterministic byte pattern: `generator(i)` is byte `i`.
+type Pattern = (&'static str, fn(usize) -> u8);
+
 /// The deterministic byte patterns. `(name, generator)`; `generator(i)` is
 /// byte `i`, so any prefix of a pattern is that pattern at a shorter length
 /// and a failing input can be regenerated from the name and the length alone.
-const PATTERNS: &[(&str, fn(usize) -> u8)] = &[
+const PATTERNS: &[Pattern] = &[
     ("counter", |i| i as u8),
     ("lcg", |i| (i.wrapping_mul(167).wrapping_add(13)) as u8),
     ("zeros", |_| 0x00),
@@ -215,8 +218,8 @@ fn multi_megabyte_inputs_agree() {
 }
 
 /// A multi-megabyte input fed through `update` in 64 KiB pieces — the exact
-/// shape `trust_buildcache` uses when it streams a file — compared against the
-/// incumbent's one-shot digest of the same bytes.
+/// shape `trust_buildcache` used to stream a file until T11 — compared against
+/// the incumbent's one-shot digest of the same bytes.
 ///
 /// One-shot-vs-streamed is the comparison that matters: it catches a buffer
 /// bug that both implementations' streaming paths could otherwise share.

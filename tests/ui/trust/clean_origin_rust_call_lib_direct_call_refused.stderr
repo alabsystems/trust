@@ -1,0 +1,14 @@
+error: Clean-origin definition `clean_origin_rust_call_lib_aux::m::twice_inc` cannot be called from another crate: `clean_origin_rust_call_lib_aux` exported no certificate for `twice_inc`
+  --> $DIR/auxiliary/clean_origin_rust_call_lib_aux.rs:38:9
+   |
+LL |         def twice_inc (x : UInt64) : UInt64 := inc (inc x)
+   |         ^^^
+   |
+   = note: `twice_inc` is callable inside the crate that defines it, but it calls a Rust `fn` of that crate, and a certificate for it cannot be re-admitted here: this crate's Clean environment has no table of the defining crate's Rust callees to re-elaborate `twice_inc` against (that wire is a later increment of the Lean-calls-Rust lane). The defining crate therefore exported a non-exportable notice instead of a certificate, and without a certificate this compiler serves no body for `twice_inc`: it cannot be called, const-evaluated or linked from here. This is a measured boundary of the compiler, not a rule about what you may write (ruling v7/D2).
+           options:
+           - call `twice_inc` from an ordinary `pub fn` in its defining crate and call that wrapper from here (keep the wrapper non-generic and without `#[inline]`, or its body is instantiated in this crate and lands here again);
+           - restate `twice_inc` without the Rust callee (a wrapping op, a select, a projection …), which IS exportable;
+           - keep `twice_inc` proof-only and cite it from a contract in its defining crate instead of calling it across crates.
+
+error: aborting due to 1 previous error
+

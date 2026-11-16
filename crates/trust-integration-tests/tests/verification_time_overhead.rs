@@ -10,7 +10,7 @@
 //   3. Full MirRouter verification (classify + dispatch)
 //   4. Scaling analysis (1 to 60 functions)
 //
-// Run with: cargo test -p trust-integration-tests --test verification_time_overhead -- --nocapture
+// Run with: targo --unverified test -p trust-integration-tests --test verification_time_overhead -- --nocapture
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -47,6 +47,15 @@ fn build_workload(count: usize) -> Vec<VerifiableFunction> {
 }
 
 /// Create a MirRouter with benchmark-appropriate config (fast timeouts, no proofs).
+///
+/// Every field this benchmark depends on is named; the rest come from
+/// `MirRouterConfig::default()`. The struct has a field that exists only under
+/// trust-router's `trust-cg-backend` feature, and that feature is on whenever this
+/// target is built in the compiler's graph (`rustc_mir_transform` enables
+/// `trust-cg-output-gate`). A literal listing every field compiled in the `crates/`
+/// workspace and failed to compile there (E0063), so the target never built in the
+/// graph that ships. Every other `MirRouterConfig` literal in the tree already uses
+/// struct-update syntax for this reason.
 fn benchmark_router() -> MirRouter {
     let config = MirRouterConfig {
         bmc_depth: 10,
@@ -55,6 +64,7 @@ fn benchmark_router() -> MirRouter {
         shadow_mode: false,
         enable_portfolio_racing: false,
         infer_invariants: false,
+        ..MirRouterConfig::default()
     };
     MirRouter::new(Router::new(), config)
 }
@@ -157,6 +167,8 @@ fn benchmark_mir_router_classification_overhead() {
 /// directly from MIR blocks. trust_vcgen::generate_vcs is the full VC generation
 /// pipeline. This benchmark measures both paths on the same functions.
 #[test]
+#[ignore = "measurement instrument: prints VC-generation timings and asserts nothing; run \
+            with --ignored --nocapture"]
 fn benchmark_vc_generation_overhead() {
     let workload = build_workload(60);
 

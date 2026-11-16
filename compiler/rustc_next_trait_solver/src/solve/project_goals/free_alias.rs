@@ -1,5 +1,5 @@
 //! Computes a projection goal for inherent associated types,
-//! `#![feature(lazy_type_alias)]` and `#![feature(type_alias_impl_trait)]`.
+//! `#![feature(checked_type_aliases)]` and `#![feature(type_alias_impl_trait)]`.
 //!
 //! Since a free alias is never ambiguous, this just computes the `type_of` of
 //! the alias and registers the where-clauses of the type alias.
@@ -17,7 +17,7 @@ where
 {
     pub(super) fn normalize_free_alias(
         &mut self,
-        goal: Goal<I, ty::ProjectionPredicate<I>>,
+        goal: Goal<I, ty::ProjectionClause<I>>,
     ) -> QueryResultOrRerunNonErased<I> {
         let cx = self.cx();
         let free_alias = goal.predicate.projection_term;
@@ -25,26 +25,28 @@ where
         // Check where clauses
         self.add_goals(
             GoalSource::Misc,
-            cx.predicates_of(free_alias.expect_free_def_id().into())
+            cx.clauses_of(free_alias.expect_free_def_id().into())
                 .iter_instantiated(cx, free_alias.args)
                 .map(Unnormalized::skip_norm_wip)
-                .map(|pred| goal.with(cx, pred)),
+                .map(|clause| goal.with(cx, clause)),
         )?;
 
         let actual = match free_alias.kind {
             ty::AliasTermKind::FreeTy { def_id } => {
                 let free = cx.type_of(def_id.into()).instantiate(cx, free_alias.args);
-                let free = self.normalize(GoalSource::Misc, goal.param_env, free)?;
+                let free = self.normalize(goal.param_env, free)?;
                 free.into()
             }
-            ty::AliasTermKind::FreeConst { def_id } if cx.is_type_const(def_id.into()) => {
-                let free = cx.const_of_item(def_id.into()).instantiate(cx, free_alias.args);
-                let free = self.normalize(GoalSource::Misc, goal.param_env, free)?;
+            ty::AliasTermKind::FreeConst { def_id }
+                if let Some(free) = cx.const_of_item(ty::AliasConstKind::Free { def_id }) =>
+            {
+                let free = free.instantiate(cx, free_alias.args);
+                let free = self.normalize(goal.param_env, free)?;
 
                 free.into()
             }
             ty::AliasTermKind::FreeConst { .. } => {
-                return self.evaluate_const_and_instantiate_projection_term(
+                return self.evaluate_const(
                     goal.param_env,
                     free_alias,
                     goal.predicate.term,

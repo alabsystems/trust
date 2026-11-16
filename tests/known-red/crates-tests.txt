@@ -1,0 +1,113 @@
+# Known-red crates/ tests for scripts/check_crates_tests_scoped.py (the
+# push-tier `scoped.crates-tests` lane). One row per failing test, keyed
+# `<test binary>::<test path>` exactly as the lane prints it.
+#
+# This is a RATCHET, not a mask: a failure NOT listed here fails the lane, and a
+# listed test that runs and PASSES also fails the lane until its row is deleted
+# (rows tagged [flaky] are exempt from that half: load-sensitive tests that may
+# pass or fail). Every row says why it is red and who owns the fix; delete the
+# row in the commit that fixes the test.
+#
+# [flaky] has a second, narrower use (added 2026-09-29): a test that is red where
+# it runs but returns early and passes VACUOUSLY when a prerequisite is absent
+# (a built binary, say). Whether it passes then depends on the checkout, not on
+# the code. Such a row names its prerequisite. Because [flaky] exempts it from
+# the ratchet, a fix will never fail the lane to prompt the row's deletion:
+# delete it by hand in the fixing commit.
+#
+# Measured 2026-09-26/27: each row below failed identically on the pushed
+# series' base 0a53ac3c94 and on the integrated tip, i.e. it was red on main
+# before the series that added this lane.
+
+unfolded_const_bound_mul_realmir::every_unsafe_unfolded_bound_twin_is_still_refuted_with_a_witness  # trust-vcgen: ay times out at 30 s under load (measured failing at load ~55 with and without the 2026-09-24 datatype-naming change); passed in the 2026-09-26 tip run [flaky]
+unfolded_const_bound_mul_realmir::every_unsafe_unfolded_bound_witness_is_an_execution_that_really_overflows  # same ay 30 s timeout under load; passed in the 2026-09-26 tip run [flaky]
+
+# binary_to_trust_ir_e2e's golden row is retired: 887ac8352d gave the lifted return place
+# `_0` its declared type (), which drops block 0's read of that never-written slot
+# (`Load U64`, returned as `Return [%27]` from a function with no returns: trust-ir's
+# validate_module rejects the old module as ReturnArityMismatch{expected 0, actual 1}).
+# The golden is regenerated (5 -> 4, output_content_sha256 f590d731...). Without a
+# targo-trust binary the test used to pass vacuously; since 2026-09-30 it FAILS: every
+# targo-trust test in binary_to_trust_ir_e2e and scale_fixture_crate reads the binary from
+# TRUST_TARGO_TRUST_BIN and panics without it, and this lane builds targo-trust and exports
+# a private copy whenever trust-integration-tests is touched (defect 2, fixed, of
+# docs/issues/2026-09-29-binary-to-trust-ir-e2e-golden-stale-and-passes-without-its-binary.md).
+
+# Train T1 (4711072a3a, merged into main by fcdc14c7dc) moved Clean 5390f432b -> 033d6726c,
+# 71 Clean commits. Two crates went red with it, and no push row ran either: T1's evidence
+# was x.py stage 1, tests/ui/trust and run-make. Measured 2026-09-29: the same failures at
+# bare origin/main 268b79222d and on the Trust-migration branch rebased onto it, and again
+# at bare 7ba04180de (T2, whose Clean 60f4b09c differs from 033d6726c in 8 pins-only
+# files, clean-kernel unchanged) and on the branch rebased onto that. The
+# branch changes no source file of either crate, only comments in their tests and
+# fixture scripts and a fixture PROVENANCE.md. On the branch rebased onto 56a238ca8a,
+# before T1, trust-certify passed all 913 tests it ran (90 ignored) and trust-clean
+# failed only its 13 Int rows above. Both clusters are now root-caused and retired:
+#
+# (1) trust-certify's 18 scalar_mir rows are retired: the raw-MIR model bound a variable
+# named `local`, a Lean 4.8.0 keyword under Clean fd20888d5, and b14185d2b4f (E6 slice 1)
+# renames it `loc`. Measured 2026-09-29 on the merge of e6/slice1 into origin/main
+# cb0551b399: scoped.crates-tests ran trust-certify 793 passed, 0 failed, 90 ignored, and
+# flagged all 18 rows STALE.
+
+# (2) trust-clean's 5 olean_census rows are retired. Clean 5018d3076 (in T1's range)
+# parses ONE module per `import`, as Lean 4.8.0's header does: `import Q P` imports Q,
+# and P is an erroneous command. The tests wrote several modules on one line
+# (`import A B`, `import Leaf Missing`, `import all «Q.Dot».fidèle, Plain`), so only the
+# first was an import root; the "missing" modules were the dropped trailing ones, not a
+# census, filesystem or host defect. The fixtures now write one `import` per module, and
+# olean_census_second_module_on_one_import_line_is_incomplete_not_imported pins that a
+# second module on the line is neither a root nor a complete parse. Measured 2026-09-30
+# at 635aa09c06: trust-clean olean_census 85 passed, 0 failed, 5 ignored.
+# cb/track-b fixed the same five fixtures the same way (landed as 22370fd86f) and also pins the
+# one-line spelling inside captured_candidates_keep_missing_malformed_and_shadowed_populations
+# (it imports `Leaf` only and reports incomplete import parsing); both pins are kept.
+
+# Train T2's trust-cg-bridge row is retired: aterm_table_step_codegen's x86-64 ISA
+# differential died at its first input because trust-cg's dense-switch jump table
+# dispatches with `jmp rax`, and trust-machine-sem's x86-64 semantics refused every
+# indirect JMP ("no branch target found"). JMP now resolves a register or memory target
+# as CALL already did, and the differential matches the proven table on all 3584 inputs.
+
+# The intrinsic_semantics_realmir residual row (added by c132f5a193) is retired: the
+# method-spelling counterexample `y = -1` was a fixture artifact (sat_add_ge.json and
+# sat_sub_le.json lacked the extractor's u32 parameter-range preconditions), not a pin
+# defect. With the range facts both method rows prove, and all four saturating rows are
+# promoted (tinv/step10-wiring). Measured 2026-10-08: intrinsic_semantics_realmir 23
+# passed, saturating_call_model 3 passed, three runs.
+
+# Retired 2026-10-21 (SPEC-ELAB-TYPED-BITVEC-FIXTURES-1, DECISION_QUEUE): Clean's
+# reviewed canon explicitly refuses that carrier-changing fold. The fixtures now
+# supply genuine typed BitVec constructors and observe exact payloads through
+# BitVec.toNat; signed results, range refusals and the structural 2^127 key stay.
+# SDK545: both exact tests pass; complete crate 227 passed, 0 failed/ignored.
+
+# Measured 2026-10-19/20 by the rust-latest migration gate (record
+# 20261019T210108 and scratch A/B): each row below fails IDENTICALLY at the
+# pre-port base b9e4f26dba6 (same commands, same messages) and on the
+# 8144389c895d port, i.e. red on main before this series. (The setter pair
+# measured with them, `setter_assert_refute_lane`'s two rows, is fixed: the
+# fixture's call now carries the setter body's identity (main's d2f56f46de and,
+# independently, Track K2's 84033ac726), and its rows were
+# deleted with that fix on 2026-10-20; docs/DECISION_QUEUE.md, the gate-RCA
+# entry.)
+#
+
+# Retired 2026-10-20: trust-spec-elab's two machine-domain rows that pinned
+# `BitVec.ofNat w 3` definitionally equal to the raw literal 3. MEASURED red by the
+# landing gate's crates-tests leg (gates/trust-scale-select, every member reached) on
+# origin/main b2260d8608 and again on the landing merge with 25a12e7777, both times the
+# same two assertions ("BitVec.ofNat 64 3 is definitionally the raw literal 3", and its
+# 128-bit twin); no other trust-spec-elab test failed. The Clean pin moved twice in the
+# history before them (b959e290e4, 4a2bac9642 -> d0ad43b7f); that historical pin
+# transition was not bisected. Fixture repair 9d5a08ea3a checks actual typed
+# BitVec applications, rejects raw Nat arguments and observes values via BitVec.toNat.
+# All original signed cases remain. At f9167e182b, the complete native library
+# passed all 206 tests; both integration targets passed 20 more. No kernel change,
+# new ignore, flaky allowance, proof-grade change or semantic-case deletion.
+# The original RED remains archived; these tests must now pass under the ratchet.
+# port_cli pair retired 2026-10-21 (PORTING-CLI-PRIMARY-ROSTER-FIXTURE-1).
+# Native reproduction corrected the diagnosis above: the two-file import was
+# nonempty, but contained metadata and an unsupported assembly-gcc input, with
+# no primary cases. The fixtures now reach a named primary and independently
+# retain exactly one unknown proof row / Python rejection before launch.

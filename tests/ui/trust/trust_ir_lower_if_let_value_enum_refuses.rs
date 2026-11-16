@@ -1,5 +1,8 @@
 //@ dont-check-compiler-stderr
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory -Airrefutable_let_patterns --crate-type=lib
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-LV, the NEGATIVE pin): shapes the by-value enum `if let` lane must
 //! keep REFUSING, each for a measured reason.
 //!
@@ -22,10 +25,10 @@ pub enum OneP {
     A(i32),
 }
 pub fn single_variant_niladic(o: One) -> i32 {
+    //~^ ERROR -Ztrust-ir-lower=strict: the direct trust-ir producer could not fully lower this body
     if let One::A = o { 1 } else { 0 }
-    //~^ ERROR
 }
 pub fn single_variant_payload(o: OneP) -> i32 {
+    //~^ ERROR -Ztrust-ir-lower=strict: the direct trust-ir producer could not fully lower this body
     if let OneP::A(x) = o { x } else { 0 }
-    //~^ ERROR
 }

@@ -14,7 +14,7 @@
 // touch prove.rs/mirsem.rs/trustir_multieq.rs from here — it only measures.
 //
 // Run with:
-//   RUSTC_BOOTSTRAP=1 cargo test -p trust-clean --manifest-path crates/Cargo.toml \
+//   targo --unverified test -p trust-clean --manifest-path crates/Cargo.toml \
 //       --test multi_eq_corpus -- --nocapture
 
 use std::path::Path;

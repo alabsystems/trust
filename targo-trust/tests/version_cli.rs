@@ -71,6 +71,26 @@ fn trust_version_json_binds_distinct_tool_identities() {
     assert_eq!(json["tools"]["daemon"]["name"], "trustd");
     assert_eq!(json["tools"]["miri"]["name"], "trust-miri");
     assert_eq!(json["tools"]["targo_miri"]["name"], "targo-miri");
+
+    // The product surface reports the ONE authority's number (root Cargo.toml
+    // `[workspace.package] version`) and a channel derived from the bootstrap
+    // channel — the same input that names the archive — never numbers of its own.
+    let root = repo_root();
+    let authority = trust_version::parse_version_authority(
+        &fs::read_to_string(root.join(trust_version::VERSION_AUTHORITY_PATH))
+            .expect("read the root Cargo.toml"),
+    )
+    .expect("the version authority must be MAJOR.MINOR.0")
+    .to_string();
+    let bootstrap_channel =
+        fs::read_to_string(root.join("src/ci/channel")).expect("read src/ci/channel");
+    let bootstrap_channel = bootstrap_channel.trim();
+    assert_eq!(json["trust_product_version"], authority.as_str());
+    assert_eq!(json["trust_product_channel"], trust_version::product_channel(bootstrap_channel));
+    assert_eq!(
+        json["archive_version"],
+        trust_version::trust_archive_version(&authority, bootstrap_channel)
+    );
 }
 
 #[test]
@@ -208,6 +228,47 @@ fn trust_version_json_accepts_same_sysroot_rust_compatible_aliases() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// A bound tool's version answer must come, so the probe's limit is a hang
+/// guard, not a latency budget. On a loaded Mac a just-written executable's
+/// first exec waits in syspolicyd's machine-wide scan queue (29-57 s measured
+/// on 2026-10-22; docs/KNOWN_HAZARDS.md EXEC-ASSESS-STALL-1), and the 10 s
+/// limit the probe had until then reported such a tool `version-probe-failed`.
+/// This stand-in answers 15 s after it starts, so no host lets it answer
+/// inside that old limit, and the slow answer is still the tool's to bind.
+#[cfg(unix)]
+#[test]
+fn trust_version_json_binds_a_tool_whose_version_answer_comes_after_ten_seconds() {
+    let root = temp_test_dir("version-slow-answer");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create fake Trust bin dir");
+    let targo_trust = install_targo_trust_binary(&bin_dir);
+    let formatter = bin_dir.join("trustfmt");
+    fs::write(&formatter, "#!/bin/sh\n/bin/sleep 15\necho \"trustfmt 1.96.0-trust\"\n")
+        .unwrap_or_else(|error| {
+            panic!("write slow fake trustfmt {}: {error}", formatter.display())
+        });
+    make_executable(&formatter);
+
+    let output = Command::new(targo_trust)
+        .args(["trust", "version", "--format=json", "--repo-root"])
+        .arg(repo_root())
+        .output()
+        .expect("run copied targo-trust trust version --json with a slow tool");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "version json should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse version json");
+    let formatter = &json["tools"]["formatter"];
+    assert_eq!(formatter["resolution"], "bound-executable", "slow trustfmt: {formatter}");
+    assert_eq!(formatter["version"], "trustfmt 1.96.0-trust", "slow trustfmt: {formatter}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn targo_trust_binary() -> PathBuf {
     if let Some(path) = option_env!("CARGO_BIN_EXE_targo-trust") {
         return PathBuf::from(path);
@@ -264,7 +325,7 @@ fn write_trustd_tool(path: &std::path::Path) {
         path,
         format!(
             "#!/bin/sh\ncat <<'TRUSTD_IDENTITY'\ntrustd {release}\ntrust.identity=trustd\n\
-             trust.package=trust-router\ntrust.protocol={protocol}\ncommit-hash: {commit}\n\
+             trust.package=trust-coordinator\ntrust.protocol={protocol}\ncommit-hash: {commit}\n\
              trust-repo-commit-hash: {commit}\nTRUSTD_IDENTITY\n"
         ),
     )

@@ -52,7 +52,6 @@ def measure(pattern):
     for path in sorted(glob.glob(os.path.join(REPO, pattern))):
         d = tempfile.mkdtemp(prefix="ratchet_")
         env = dict(os.environ)
-        env["TRUST_SEED_STAIRCASE"] = "1"
         try:
             r = subprocess.run(
                 [TRUSTC, "-Zthreads=1", "-Ztrust-verify=on", "-Ztrust-policy=advisory",

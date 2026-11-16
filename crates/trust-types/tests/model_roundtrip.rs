@@ -82,6 +82,7 @@ fn midpoint_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -362,15 +363,19 @@ fn test_ty_all_variants_roundtrip() {
         Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "MyStruct".into(),
-            fields: vec![("x".into(), Ty::i32()), ("y".into(), Ty::Bool)],
+            fields: vec![("x".into(), Ty::i32()), ("y".into(), Ty::Bool)].into(),
             disc_index_safe: false,
             // Trust (B3-1 field completion): this construction site was missed by
             // 11598e13fe, leaving `cargo test -p trust-types` uncompilable (E0063)
             // since B3-1 — masked because the suite was not run. `None` = the
             // historical flattened-struct semantics.
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        },
     ];
     for ty in &types {
         let json = serde_json::to_string(ty).expect("serialize");
@@ -465,6 +470,14 @@ fn test_verification_condition_all_kinds_roundtrip() {
         VcKind::LoopInvariantSufficiency { invariant: "i <= n".into(), header_block: 1 },
         VcKind::TypeRefinementViolation { variable: "n".into(), predicate: "n >= 0".into() },
         VcKind::FrameConditionViolation { variable: "state".into(), function: "update".into() },
+        VcKind::TypeInvariant {
+            ty: "c::S".into(),
+            point: TypeInvariantPoint::Unwind,
+            site: TypeInvariantSite { block: 3, statement_index: 1 },
+            conjunct: 2,
+            ordinal: 1,
+            edge: Some(2),
+        },
     ];
 
     for kind in vc_kinds {
@@ -1583,8 +1596,6 @@ fn test_json_proof_report_deserialization_sanitizes_claimed_authority_and_summar
             trust_version: "0.1.0".into(),
             timestamp: "2026-03-29T00:00:00Z".into(),
             total_time_ms: 42,
-            timeout_ms: Some(5_000),
-            function_budget_ms: Some(120_000),
         },
         crate_name: "test_crate".into(),
         summary: CrateSummary {
@@ -1600,6 +1611,7 @@ fn test_json_proof_report_deserialization_sanitizes_claimed_authority_and_summar
             total_unknown: 1,
             total_timed_out: 1,
             total_design_requirements: 0,
+            total_failed_unproved: 0,
             total_unattributed_failed: 0,
             total_unattributed_unknown: 0,
             total_unattributed_proved: 0,
@@ -1616,6 +1628,7 @@ fn test_json_proof_report_deserialization_sanitizes_claimed_authority_and_summar
                 unknown: 1,
                 timed_out: 1,
                 design_requirements: 0,
+                failed_unproved: 0,
                 unattributed_failed: 0,
                 unattributed_unknown: 0,
                 unattributed_proved: 0,
@@ -1624,6 +1637,7 @@ fn test_json_proof_report_deserialization_sanitizes_claimed_authority_and_summar
                 verdict: FunctionVerdict::Verified,
             },
             obligations: vec![ObligationReport {
+                assumes: Vec::new(),
                 obligation_id: None,
                 description: "division by zero".into(),
                 kind: "division_by_zero".into(),
@@ -1646,8 +1660,6 @@ fn test_json_proof_report_deserialization_sanitizes_claimed_authority_and_summar
     let json = serde_json::to_string_pretty(&report).expect("serialize");
     assert!(json.contains("\"total_timed_out\": 1"));
     assert!(json.contains("\"timed_out\": 1"));
-    assert!(json.contains("\"timeout_ms\": 5000"));
-    assert!(json.contains("\"function_budget_ms\": 120000"));
     let round: JsonProofReport = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(round.crate_name, "test_crate");
     assert_eq!(round.summary.verdict, CrateVerdict::Inconclusive);
@@ -1658,18 +1670,6 @@ fn test_json_proof_report_deserialization_sanitizes_claimed_authority_and_summar
     assert_eq!(round.functions[0].summary.timed_out, 0);
     assert_eq!(round.functions[0].summary.verdict, FunctionVerdict::Inconclusive);
     assert!(matches!(round.functions[0].obligations[0].outcome, ObligationOutcome::Unknown { .. }));
-    assert_eq!(round.metadata.timeout_ms, Some(5_000));
-    assert_eq!(round.metadata.function_budget_ms, Some(120_000));
-
-    // Backward compatibility: reports written before the additive metadata
-    // fields deserialize with no invented policy values.
-    let mut legacy: serde_json::Value = serde_json::from_str(&json).expect("JSON value");
-    legacy["metadata"].as_object_mut().expect("metadata object").remove("function_budget_ms");
-    legacy["metadata"].as_object_mut().expect("metadata object").remove("timeout_ms");
-    let legacy_round: JsonProofReport =
-        serde_json::from_value(legacy).expect("legacy report should deserialize");
-    assert_eq!(legacy_round.metadata.timeout_ms, None);
-    assert_eq!(legacy_round.metadata.function_budget_ms, None);
 }
 
 // ---------------------------------------------------------------------------

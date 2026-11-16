@@ -1,0 +1,17 @@
+{
+  "at": 1794433269.314302,
+  "fixture_bytes": 117321,
+  "fixture_sha256": "a030619d5e963e579a64e992737df75edc90018d14a3ac7eafa1a60acc1348f2",
+  "fresh_export_record_sha256": "d2947ad4296d856df7e1819a49cfbe482042018df0f4f0ce26796c0c6a9cacfd",
+  "historical_v1_fixture_unchanged": true,
+  "original_forensic_failed_unit_fixture_unchanged": true,
+  "prebirth_binding_established": false,
+  "process_authority": "UNESTABLISHED",
+  "producer_source": "bb88792ed196922fafa9708ff41c462206fd7efc",
+  "publication_test_target_scope": "not established by this producer receipt; full12 has a separate execution record",
+  "qualification_sha256": "ed67c97dc3b80cc388939253ab94c73a1ca4dee186219f6ee7b477c30f179ccf",
+  "qualifying_case": "trust_verify::tests::native_wp_source_tests::query_bound_catalog_keeps_raw_postcondition_and_real_body_vcs",
+  "schema": "trust.current-unit-WP-v2-positive-fixture.v1",
+  "scope": "genuine successful repaired current-unit v2 export over original6c9 MIR DATA; not a fresh Rust CLI compile or formal correctness/process custody claim",
+  "unit_image_sha256": "f7e6421dd559d75488f1324ce722fc13c10f1b38783c0daedcfdb784aca6cabe"
+}

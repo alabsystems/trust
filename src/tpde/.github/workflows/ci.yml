@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+name: CI
+
+on: [push]
+
+jobs:
+  build-llvm19:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Install dependencies
+      run: sudo apt install -y ninja-build cmake clang-19 libclang-19-dev llvm-19-dev doxygen
+    - name: Configure
+      run: CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DTPDE_BUILD_DOCS=ON -DLIT=/usr/lib/llvm-19/build/utils/lit/lit.py
+    - name: Build
+      run: ninja -v -C build
+    - name: Test
+      run: ninja -v -C build check-tpde
+
+  build-llvm20:
+    runs-on: ubuntu-latest
+    container: t0b1fox/tpde
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Configure
+      run: CC=clang-20 CXX=clang++-20 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DTPDE_BUILD_DOCS=ON -DLIT=/usr/bin/lit 
+    - name: Build
+      run: ninja -v -C build
+    - name: Test
+      run: ninja -v -C build check-tpde
+    - name: Upload docs as artifact
+      if: github.ref == 'refs/heads/master'
+      id: deployment
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: build/docs/html/
+
+  deploy-docs:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    needs: build-llvm20
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  license-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: pip3 install --user reuse
+    - name: Check
+      run: reuse lint

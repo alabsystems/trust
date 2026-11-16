@@ -24,7 +24,7 @@ const RATCHET: &str = "src/tools/tidy/trust-workspace-lints-ratchet.txt";
 
 /// Workspace manifests that must carry a `[workspace.lints]` table, because a
 /// Trust-owned member of theirs is expected to inherit from it.
-const TRUST_WORKSPACES: &[&str] = &["Cargo.toml", "crates/Cargo.toml", "targo-trust/Cargo.toml"];
+const TRUST_WORKSPACES: &[&str] = &["Cargo.toml"];
 
 /// Does this manifest text contain a `[lints]` table whose `workspace` is true?
 ///
@@ -51,6 +51,10 @@ fn declares_workspace_lints(contents: &str) -> bool {
         let line = line.split('#').next().unwrap_or("").trim();
         line == "[workspace.lints]" || line.starts_with("[workspace.lints.")
     })
+}
+
+fn declares_workspace_root(contents: &str) -> bool {
+    contents.lines().any(|line| line.split('#').next().unwrap_or("").trim() == "[workspace]")
 }
 
 /// Trust-owned member manifests, in a stable order.
@@ -115,7 +119,9 @@ pub fn check(root_path: &Path, tidy_ctx: TidyCtx) {
     let mut outstanding = Vec::new();
     for manifest in trust_member_manifests(root_path) {
         let Ok(contents) = std::fs::read_to_string(&manifest) else { continue };
-        if !contents.contains("[package]") {
+        // A crate that is its own `[workspace]` root is not a member: it has no
+        // Trust table to inherit (e.g. the standalone worker crates).
+        if !contents.contains("[package]") || declares_workspace_root(&contents) {
             continue;
         }
         if !opts_into_workspace_lints(&contents) {

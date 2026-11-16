@@ -1,0 +1,50 @@
+# Identities for constructs.trust_ir (a stage1 dump of constructs.rs, the
+# measurement's repro/constructs.rs, aterm-uds shapes; the dump's `; trustc`
+# header names the trustc): see
+# census_shapes.identities for the conventions (every HIR call not audited
+# effect-free; typeck drop facts; the HIR site census). `effects` rows are
+# read from constructs.rs, NOT from the dump.
+
+body c2_builder pub
+body c3_pre_exec pub
+body c4_pre_exec_call pub
+body c5_as_raw pub
+body c6_from_raw pub
+body c7_into_raw pub
+body c8_drop_owned pub
+body c9_range_loop pub
+body c10_range_loop_count pub
+body c11_while_loop pub
+body c12_flock pub
+body c13_fork pub
+
+closure func.19 "c3_pre_exec::{closure#0}"
+closure func.21 "c4_pre_exec_call::{closure#0}"
+
+spawners
+product-census
+
+effects c2_builder 16:8=std::process::Command::arg 16:18=std::process::Command::stdin 16:24=std::process::Stdio::null
+effects c3_pre_exec 21:12=std::os::unix::process::CommandExt::pre_exec
+effects "c3_pre_exec::{closure#0}" 23:16=fcntl
+effects c4_pre_exec_call 32:12=std::os::unix::process::CommandExt::pre_exec
+effects "c4_pre_exec_call::{closure#0}" 33:12=close
+effects c5_as_raw 39:45=std::os::fd::AsRawFd::as_raw_fd
+effects c6_from_raw 40:53=std::os::fd::FromRawFd::from_raw_fd
+effects c7_into_raw 41:46=std::os::fd::IntoRawFd::into_raw_fd
+effects c8_drop_owned 42:36=std::mem::drop
+# 771983b92's wave-ER `for` summary erased these loops' calls (increment
+# S1); today's producer lowers them.
+effects c9_range_loop 45:32=fcntl
+effects c10_range_loop_count 49:35=fcntl
+effects c11_while_loop 54:29=fcntl
+effects c12_flock 57:50=flock 57:65=std::os::fd::AsRawFd::as_raw_fd
+effects c13_fork 60:23=fork 63:42=fcntl 64:17=execv 64:42=_exit
+# Bodies the producer refused: their HIR sites.
+site c1_plain_spawn 11:42=std::process::Command::spawn
+
+drops c3_pre_exec
+drops "c3_pre_exec::{closure#0}"
+drops c4_pre_exec_call
+drops "c4_pre_exec_call::{closure#0}"
+drops c13_fork

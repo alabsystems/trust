@@ -10,15 +10,15 @@
 //! the shared dependency of trust-ir-bridge and trust-vcgen — makes the two
 //! artifacts impossible to drift apart.
 
-/// Canonical wire name for compiler-authenticated, pinned-total std primitive
-/// comparison calls. The extractor rewrites only a resolved comparison whose
-/// defining crate, diagnostic trait, method, and primitive `Self` type are all
-/// authenticated by rustc; source-spellable derived attributes and generic
-/// container traits carry no authority.
-///
-/// The legacy `CLONE` identifier and `__trust_total_clone` bytes are retained for
-/// dump compatibility. They no longer authorize derived `Clone`, keyed
-/// collection, hashing, or ordering summaries.
+/// Canonical wire name for a call the extractor proved TOTAL from compiler-
+/// authenticated facts (`trust_mir_extract::convert::apply_total_clone_sentinel`):
+/// a pinned-total std primitive comparison (defining crate, diagnostic trait,
+/// method and primitive `Self` all authenticated by rustc), or a `Clone::clone`
+/// whose trait is the real `Clone` lang item and whose receiver clone tree
+/// `tcx_clone_is_total` proves total (a local impl only via `is_builtin_derived`,
+/// i.e. rustc builtin-macro provenance), among the other arms that function
+/// documents. A source-spellable `#[automatically_derived]` attribute carries no
+/// authority (retired 2026-07-24).
 pub const TRUST_TOTAL_CLONE_SENTINEL: &str = "__trust_total_clone";
 
 /// True for canonical `str`/`String`/`Vec`/slice `len()` calls.
@@ -109,7 +109,7 @@ pub fn is_value_preserving_int_convert_call(callee: &str) -> bool {
 
 fn canonical_plain_trait_method(callee: &str, trait_path: &str, method: &str) -> bool {
     let Some(rest) = callee.strip_prefix(trait_path) else { return false };
-    if rest == format!("::{method}") {
+    if rest.strip_prefix("::") == Some(method) {
         return true;
     }
     let generic = rest.strip_prefix("::").unwrap_or(rest);
@@ -121,7 +121,7 @@ fn canonical_plain_trait_method(callee: &str, trait_path: &str, method: &str) ->
             b'>' => {
                 depth -= 1;
                 if depth == 0 {
-                    return &generic[index + 1..] == format!("::{method}");
+                    return generic[index + 1..].strip_prefix("::") == Some(method);
                 }
             }
             _ => {}

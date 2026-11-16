@@ -24,6 +24,7 @@ impl Parse for Newtype {
         let mut encodable = false;
         let mut ord = false;
         let mut stable_hash = false;
+        let mut default = false;
         let mut gate_rustc_only = quote! {};
         let mut gate_rustc_only_cfg = quote! { all() };
 
@@ -44,6 +45,10 @@ impl Parse for Newtype {
                 }
                 "stable_hash" => {
                     stable_hash = true;
+                    false
+                }
+                "default" => {
+                    default = true;
                     false
                 }
                 "max" => {
@@ -136,15 +141,29 @@ impl Parse for Newtype {
                     fn backward_checked(start: Self, u: usize) -> Option<Self> {
                         Self::index(start).checked_sub(u).map(Self::from_usize)
                     }
+
+                    #[inline]
+                    fn forward_overflowing(start: Self, u: usize) -> (Self, bool) {
+                        let (s, o) = Self::index(start).overflowing_add(u);
+                        (Self::from_usize(s), o)
+                    }
+
+                    #[inline]
+                    fn backward_overflowing(start: Self, u: usize) -> (Self, bool) {
+                        let (s, o) = Self::index(start).overflowing_sub(u);
+                        (Self::from_usize(s), o)
+                    }
                 }
                 impl ::std::cmp::Ord for #name {
+                    #[inline]
                     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
                         self.as_u32().cmp(&other.as_u32())
                     }
                 }
                 impl ::std::cmp::PartialOrd for #name {
+                    #[inline]
                     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                        self.as_u32().partial_cmp(&other.as_u32())
+                        Some(self.cmp(other))
                     }
                 }
             }
@@ -164,6 +183,19 @@ impl Parse for Newtype {
                         hasher: &mut ::rustc_data_structures::stable_hash::StableHasher
                     ) {
                         self.as_u32().stable_hash(hcx, hasher)
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        let default_impl = if default {
+            quote! {
+                impl std::default::Default for #name {
+                    #[inline]
+                    fn default() -> Self {
+                        Self::ZERO
                     }
                 }
             }
@@ -308,6 +340,8 @@ impl Parse for Newtype {
             #step
 
             #stable_hash_impl
+
+            #default_impl
 
             impl From<#name> for u32 {
                 #[inline]

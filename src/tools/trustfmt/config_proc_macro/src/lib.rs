@@ -52,10 +52,17 @@ pub fn config_type(_args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn nightly_only_test(_args: TokenStream, input: TokenStream) -> TokenStream {
     // if CFG_RELEASE_CHANNEL is not set we default to nightly, hence why the default is true
-    if option_env!("CFG_RELEASE_CHANNEL").map_or(true, |c| c == "nightly" || c == "dev") {
+    // Trust: bootstrap builds every tool with CFG_RELEASE_CHANNEL=trust, and trustfmt's
+    // `is_nightly_channel!` (src/release_channel.rs) and bin/main.rs `is_nightly` already treat
+    // `trust` as nightly. This gate must agree with them, or the shipped channel runs nightly
+    // behaviour while compiling out the tests of it (`self_tests` among them).
+    if option_env!("CFG_RELEASE_CHANNEL")
+        .map_or(true, |c| c == "nightly" || c == "dev" || c == "trust")
+    {
         input
     } else {
-        // output an empty token stream if CFG_RELEASE_CHANNEL is not set to "nightly" or "dev"
+        // output an empty token stream if CFG_RELEASE_CHANNEL is not set to "nightly", "dev"
+        // or "trust"
         TokenStream::from_str("").unwrap()
     }
 }

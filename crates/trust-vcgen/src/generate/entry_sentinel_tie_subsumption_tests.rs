@@ -35,7 +35,7 @@
 //! its consumer read and the clause legitimately ADMITS there — the clause is
 //! kept fail-closed for the step-cap/unreachable corners, and the shape's new
 //! adjudication lives in
-//! `the_tie_at_a_cleanup_consumer_is_sound_and_the_stale_sibling_degrades`.
+//! `the_tie_at_a_cleanup_consumer_is_sound_and_no_stale_sibling_is_minted`.
 //!
 //! NOT because nothing else would notice: dropping the `otherwise` arm of
 //! `discovered_clauses` reddens 60 lib tests, 57 of them pre-existing
@@ -60,8 +60,8 @@ use std::collections::HashSet;
 
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ClauseTarget, ConstValue, Formula, LocalDecl,
-    Operand, Place, Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VerifiableBody,
-    VerifiableFunction,
+    Operand, Place, Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VcKind,
+    VerifiableBody, VerifiableFunction,
 };
 
 use super::StmtVersionCtx;
@@ -186,6 +186,50 @@ fn every_fixpoint_edge_is_a_full_graph_map_edge() {
 /// STEP (1) again, against the REAL fixpoint rather than a reconstruction of its
 /// dispatch. Coarser — reachability, not per-edge — but it is the only check that
 /// runs the function the argument is actually about.
+/// **Regression (2026-09-09): the fixpoint's STEP CAP IS NOT A TIME BOUND, so it
+/// must also poll the ambient per-function budget.**
+///
+/// `cap` bounds DEQUEUES (`8n² + 8n + 4096`), but one dequeue costs
+/// `|existing| × |incoming|` deep structural `Formula` comparisons, so a wide CFG
+/// carrying large fact sets makes the cap worth hours. MEASURED on
+/// `first-party/ty`'s `tla-cli` (seal trust-9e08c848): two `trustc` processes sat
+/// at 99% CPU for 2 h 52 min inside this fixpoint, 172 minutes of CPU each,
+/// emitting nothing — with the ambient budget installed above them and DEAD,
+/// because nothing here polled it. `verify_budget`'s module doc states the
+/// converse of this defect ("a poll bounds nothing unless a guard is installed
+/// above it"); this is the missing poll.
+///
+/// The assertion is the DEGRADATION, not the timing: under an exhausted budget
+/// the fixpoint must answer with its sound, less precise empty map — the same
+/// fallback the step cap already used — rather than run to completion. A corpus
+/// function that normally returns facts is the control.
+#[test]
+fn an_exhausted_budget_degrades_the_fixpoint_to_its_empty_fallback() {
+    let (name, func) = corpus()
+        .into_iter()
+        .find(|(_, f)| !f.body.blocks.is_empty())
+        .expect("the corpus has a non-empty function");
+
+    // Control: with no budget installed the fixpoint does real work.
+    let unbounded = v2_path_def_fixpoint(&func, &Default::default());
+    assert!(!unbounded.is_empty(), "{name}: control must not be the empty fallback");
+
+    // A budget of ONE step is spent by the first poll, so the very first dequeue
+    // degrades. `install` restores the previous budget on drop (RAII), so this
+    // cannot leak into another test on this thread.
+    let guard = trust_types::verify_budget::VerifyBudgetGuard::install(None, 1);
+    let bounded = v2_path_def_fixpoint(&func, &Default::default());
+    drop(guard);
+    assert!(
+        bounded.is_empty(),
+        "{name}: an exhausted budget must degrade to the empty fallback, not run to completion"
+    );
+
+    // And the budget is restored: the same call answers like the control again.
+    let after = v2_path_def_fixpoint(&func, &Default::default());
+    assert_eq!(after.len(), unbounded.len(), "{name}: the guard must restore the ambient budget");
+}
+
 #[test]
 fn the_fixpoint_reaches_every_v2_reachable_block() {
     for (name, func) in corpus().into_iter().chain(unwind_shapes()) {
@@ -308,6 +352,7 @@ fn unwind_only_writer(label: &str, terminator: Terminator) -> VerifiableFunction
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -355,10 +400,22 @@ fn unwind_shapes() -> Vec<(String, VerifiableFunction)> {
                     is_unsafe_sig: false,
                     unwind: cleanup,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("ext::sink"),
                 },
             ),
         ),
     ]
+}
+
+/// `Eq(n#e, n)` somewhere in `f` — the entry tie's exact shape.
+fn carries_entry_tie(f: &Formula) -> bool {
+    if let Formula::Eq(l, r) = f
+        && l.var_name() == Some("n#e")
+        && r.var_name() == Some("n")
+    {
+        return true;
+    }
+    f.children().into_iter().any(carries_entry_tie)
 }
 
 fn mentions_entry_sentinel(f: &Formula) -> bool {
@@ -427,11 +484,24 @@ fn the_unwind_shapes_lose_the_pinned_def_to_the_join_not_to_the_mint_side_clause
         );
 
         // Laundering control: the refusal costs a hypothesis, never the obligation.
+        // RE-ADJUDICATED 2026-09-30 (vac Phase 1.1): bb1's own assertion now
+        // ships `n#e` together with the entry tie `Eq(n#e, n)` — at bb1 bare `n`
+        // IS the entry value, so the tie is the identity `entry == entry`. What
+        // stays forbidden is `n#e` reaching bb4's division, the cleanup consumer
+        // the join intersection severs.
         let vcs = crate::generate_vcs(&func);
-        assert!(
-            !vcs.iter().any(|vc| mentions_entry_sentinel(&vc.formula)),
-            "{label}: no shipped VC may carry `n#e` here"
-        );
+        for vc in vcs.iter().filter(|vc| mentions_entry_sentinel(&vc.formula)) {
+            assert!(
+                !matches!(vc.kind, VcKind::DivisionByZero),
+                "{label}: bb4's division may not carry `n#e`: {:?}",
+                vc.formula
+            );
+            assert!(
+                carries_entry_tie(&vc.formula),
+                "{label}: `n#e` may ship only with its entry tie: {:?}",
+                vc.formula
+            );
+        }
         assert!(!vcs.is_empty(), "{label}: bb4's `100 / n` must still raise an obligation");
     }
 }

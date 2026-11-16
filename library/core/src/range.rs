@@ -20,7 +20,7 @@ use crate::hash::Hash;
 
 mod iter;
 
-#[stable(feature = "new_range_api_legacy", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "new_range_api_legacy", since = "1.98.0")]
 pub mod legacy;
 
 use core::ops::Bound::{self, Excluded, Included, Unbounded};
@@ -40,13 +40,17 @@ use crate::iter::Step;
 // FIXME(range_into_bounds): Ditto. Also consider re-exporting `RangeBounds` and related.
 use crate::ops::{IntoBounds, OneSidedRange, OneSidedRangeBound, RangeBounds};
 #[doc(inline)]
-#[stable(feature = "new_range_api_exports", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "new_range_api_exports", since = "1.98.0")]
 pub use crate::ops::{RangeFull, RangeTo};
 
 /// A (half-open) range bounded inclusively below and exclusively above.
 ///
 /// The `Range` contains all values with `start <= x < end`.
 /// It is empty if `start >= end`.
+///
+/// Note that this type is not suited to represent all possible ranges. For example, `Range<u8>`
+/// cannot represent the range that covers all of `u8`. Use [`(Bound<T>, Bound<T>)`][Bound] if you
+/// need a type that can store an arbitrary range.
 ///
 /// # Examples
 ///
@@ -162,6 +166,7 @@ impl<Idx: PartialOrd<Idx>> Range<Idx> {
     #[inline]
     #[stable(feature = "new_range_api", since = "1.96.0")]
     #[rustc_const_unstable(feature = "const_range", issue = "none")]
+    #[expect(clippy::neg_cmp_op_on_partial_ord, reason = "incomparable ranges are empty")]
     pub const fn is_empty(&self) -> bool
     where
         Idx: [const] PartialOrd,
@@ -320,6 +325,7 @@ impl<Idx: PartialOrd<Idx>> RangeInclusive<Idx> {
     #[stable(feature = "new_range_inclusive_api", since = "1.95.0")]
     #[inline]
     #[rustc_const_unstable(feature = "const_range", issue = "none")]
+    #[expect(clippy::neg_cmp_op_on_partial_ord, reason = "incomparable ranges are empty")]
     pub const fn is_empty(&self) -> bool
     where
         Idx: [const] PartialOrd,

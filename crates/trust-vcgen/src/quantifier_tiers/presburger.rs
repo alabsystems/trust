@@ -3,6 +3,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+#[cfg(test)]
 use trust_types::fx::FxHashSet;
 use trust_types::{Formula, Sort};
 
@@ -20,48 +21,34 @@ pub(super) fn is_presburger(bindings: &[(trust_types::Symbol, Sort)], body: &For
     if !bindings.iter().all(|(_, s)| matches!(s, Sort::Int)) {
         return false;
     }
-    let bound_vars: FxHashSet<&str> = bindings.iter().map(|(n, _)| n.as_str()).collect();
-    is_presburger_formula(body, &bound_vars)
+    is_presburger_formula(body)
 }
 
 /// Recursively check if a formula is within Presburger arithmetic.
-pub(super) fn is_presburger_formula(f: &Formula, bound: &FxHashSet<&str>) -> bool {
+pub(super) fn is_presburger_formula(f: &Formula) -> bool {
     match f {
         Formula::Bool(_) | Formula::Int(_) => true,
         Formula::Var(_, sort) => matches!(sort, Sort::Int | Sort::Bool),
-        Formula::Not(inner) => is_presburger_formula(inner, bound),
-        Formula::And(cs) | Formula::Or(cs) => cs.iter().all(|c| is_presburger_formula(c, bound)),
-        Formula::Implies(a, b) => {
-            is_presburger_formula(a, bound) && is_presburger_formula(b, bound)
-        }
+        Formula::Not(inner) => is_presburger_formula(inner),
+        Formula::And(cs) | Formula::Or(cs) => cs.iter().all(is_presburger_formula),
+        Formula::Implies(a, b) => is_presburger_formula(a) && is_presburger_formula(b),
         Formula::Eq(a, b)
         | Formula::Lt(a, b)
         | Formula::Le(a, b)
         | Formula::Gt(a, b)
-        | Formula::Ge(a, b) => is_presburger_term(a, bound) && is_presburger_term(b, bound),
-        Formula::Add(a, b) | Formula::Sub(a, b) => {
-            is_presburger_term(a, bound) && is_presburger_term(b, bound)
-        }
-        Formula::Neg(inner) => is_presburger_term(inner, bound),
+        | Formula::Ge(a, b) => is_presburger_term(a) && is_presburger_term(b),
+        Formula::Add(a, b) | Formula::Sub(a, b) => is_presburger_term(a) && is_presburger_term(b),
+        Formula::Neg(inner) => is_presburger_term(inner),
         // Mul is linear only if at least one operand is a constant.
         Formula::Mul(a, b) => {
-            (is_const(a) && is_presburger_term(b, bound))
-                || (is_presburger_term(a, bound) && is_const(b))
+            (is_const(a) && is_presburger_term(b)) || (is_presburger_term(a) && is_const(b))
         }
         // Rem/Div by constant is OK in Presburger (divisibility constraints).
-        Formula::Rem(a, b) => is_presburger_term(a, bound) && is_const(b),
-        Formula::Div(a, b) => is_presburger_term(a, bound) && is_const(b),
-        Formula::Forall(inner_bindings, body) | Formula::Exists(inner_bindings, body) => {
-            let mut extended = bound.clone();
-            for (n, _) in inner_bindings {
-                extended.insert(n.as_str());
-            }
-            is_presburger_formula(body, &extended)
-        }
+        Formula::Rem(a, b) => is_presburger_term(a) && is_const(b),
+        Formula::Div(a, b) => is_presburger_term(a) && is_const(b),
+        Formula::Forall(_, body) | Formula::Exists(_, body) => is_presburger_formula(body),
         Formula::Ite(c, t, e) => {
-            is_presburger_formula(c, bound)
-                && is_presburger_formula(t, bound)
-                && is_presburger_formula(e, bound)
+            is_presburger_formula(c) && is_presburger_formula(t) && is_presburger_formula(e)
         }
         // Select/Store, BitVec ops, etc. are NOT Presburger.
         _ => false,
@@ -69,25 +56,20 @@ pub(super) fn is_presburger_formula(f: &Formula, bound: &FxHashSet<&str>) -> boo
 }
 
 /// Check if a formula is a valid Presburger term (integer expression).
-pub(super) fn is_presburger_term(f: &Formula, bound: &FxHashSet<&str>) -> bool {
+pub(super) fn is_presburger_term(f: &Formula) -> bool {
     match f {
         Formula::Int(_) => true,
         Formula::Var(_, Sort::Int) => true,
-        Formula::Add(a, b) | Formula::Sub(a, b) => {
-            is_presburger_term(a, bound) && is_presburger_term(b, bound)
-        }
-        Formula::Neg(inner) => is_presburger_term(inner, bound),
+        Formula::Add(a, b) | Formula::Sub(a, b) => is_presburger_term(a) && is_presburger_term(b),
+        Formula::Neg(inner) => is_presburger_term(inner),
         Formula::Mul(a, b) => {
-            (is_const(a) && is_presburger_term(b, bound))
-                || (is_presburger_term(a, bound) && is_const(b))
+            (is_const(a) && is_presburger_term(b)) || (is_presburger_term(a) && is_const(b))
         }
-        Formula::Rem(a, b) => is_presburger_term(a, bound) && is_const(b),
-        Formula::Div(a, b) => is_presburger_term(a, bound) && is_const(b),
+        Formula::Rem(a, b) => is_presburger_term(a) && is_const(b),
+        Formula::Div(a, b) => is_presburger_term(a) && is_const(b),
         // Ite with Presburger condition and Presburger branches is a valid term.
         Formula::Ite(c, t, e) => {
-            is_presburger_formula(c, bound)
-                && is_presburger_term(t, bound)
-                && is_presburger_term(e, bound)
+            is_presburger_formula(c) && is_presburger_term(t) && is_presburger_term(e)
         }
         _ => false,
     }
@@ -99,12 +81,14 @@ fn is_const(f: &Formula) -> bool {
 }
 
 /// Collect free variables in a formula.
+#[cfg(test)]
 pub(super) fn free_vars(f: &Formula) -> FxHashSet<String> {
     let mut result = FxHashSet::default();
     collect_free_vars(f, &FxHashSet::default(), &mut result);
     result
 }
 
+#[cfg(test)]
 fn collect_free_vars(f: &Formula, bound: &FxHashSet<String>, out: &mut FxHashSet<String>) {
     match f {
         Formula::Var(name, _) if !bound.contains(name) => {
@@ -141,6 +125,7 @@ fn collect_free_vars(f: &Formula, bound: &FxHashSet<String>, out: &mut FxHashSet
             collect_free_vars(a, bound, out);
             collect_free_vars(i, bound, out);
         }
+        Formula::ConstArray { value, .. } => collect_free_vars(value, bound, out),
         Formula::Forall(bindings, body) | Formula::Exists(bindings, body) => {
             let mut extended = bound.clone();
             for (n, _) in bindings {
@@ -169,17 +154,16 @@ pub enum ArithmeticFragment {
 /// Classify a formula into a decidable arithmetic fragment.
 #[must_use]
 pub fn classify_fragment(formula: &Formula) -> ArithmeticFragment {
-    let bound = FxHashSet::default();
     if has_bitvec_ops(formula) {
         return ArithmeticFragment::Bitvector;
     }
     if has_array_ops(formula) {
-        if is_presburger_formula(formula, &bound) || array_indices_linear(formula) {
+        if array_indices_linear(formula) {
             return ArithmeticFragment::ArrayLinear;
         }
         return ArithmeticFragment::Other;
     }
-    if is_presburger_formula(formula, &bound) {
+    if is_presburger_formula(formula) {
         return ArithmeticFragment::Presburger;
     }
     ArithmeticFragment::Other
@@ -230,15 +214,17 @@ fn has_bitvec_ops(f: &Formula) -> bool {
             has_bitvec_ops(c) || has_bitvec_ops(t) || has_bitvec_ops(e)
         }
         Formula::Select(a, i) => has_bitvec_ops(a) || has_bitvec_ops(i),
+        // A bitvector index or element sort is written into the term.
+        Formula::ConstArray { .. } => f.has_bitvectors(),
         Formula::Forall(_, body) | Formula::Exists(_, body) => has_bitvec_ops(body),
         _ => false,
     }
 }
 
-/// Check if formula uses array operations (Select/Store).
+/// Check if formula uses array operations (Select/Store/ConstArray).
 fn has_array_ops(f: &Formula) -> bool {
     match f {
-        Formula::Select(..) | Formula::Store(..) => true,
+        Formula::Select(..) | Formula::Store(..) | Formula::ConstArray { .. } => true,
         Formula::Not(inner) | Formula::Neg(inner) => has_array_ops(inner),
         Formula::And(cs) | Formula::Or(cs) => cs.iter().any(has_array_ops),
         Formula::Implies(a, b)
@@ -260,10 +246,10 @@ fn has_array_ops(f: &Formula) -> bool {
 
 /// Check if array indices are linear integer expressions.
 fn array_indices_linear(f: &Formula) -> bool {
-    let bound = FxHashSet::default();
     match f {
-        Formula::Select(_, idx) => is_presburger_term(idx, &bound),
-        Formula::Store(_, idx, val) => is_presburger_term(idx, &bound) && array_indices_linear(val),
+        Formula::Select(_, idx) => is_presburger_term(idx),
+        Formula::Store(_, idx, val) => is_presburger_term(idx) && array_indices_linear(val),
+        Formula::ConstArray { value, .. } => array_indices_linear(value),
         Formula::And(cs) | Formula::Or(cs) => cs.iter().all(array_indices_linear),
         Formula::Implies(a, b) | Formula::Eq(a, b) => {
             array_indices_linear(a) && array_indices_linear(b)
@@ -322,16 +308,15 @@ pub(super) fn cooper_eliminate_exists(
     let var_name = bindings[0].0.as_str();
 
     // Collect all atomic constraints as a conjunction.
-    let atoms = flatten_conjunction(body);
+    let mut atoms = Vec::new();
+    flatten_conjunction_refs(body, &mut atoms);
 
     // Extract lower bounds (B-set) for the variable.
     let mut b_set: Vec<Formula> = Vec::new();
-    let mut _other_constraints: Vec<Formula> = Vec::new();
 
-    for atom in &atoms {
-        match extract_lower_bound(atom, var_name) {
-            Some(bound_expr) => b_set.push(bound_expr),
-            None => _other_constraints.push(atom.clone()),
+    for &atom in &atoms {
+        if let Some(bound_expr) = extract_lower_bound(atom, var_name) {
+            b_set.push(bound_expr);
         }
     }
 
@@ -370,24 +355,21 @@ struct LinearBounds {
 
 /// Extract linear bounds on `var_name` from a guard formula.
 fn extract_linear_bounds(guard: &Formula, var_name: &str) -> Option<LinearBounds> {
-    let atoms = flatten_conjunction(guard);
     let mut lo = None;
     let mut hi = None;
 
-    for atom in &atoms {
-        match atom {
-            Formula::Le(a, b) if is_var(b, var_name) => lo = Some(*a.clone()),
-            Formula::Le(a, b) if is_var(a, var_name) => hi = Some(*b.clone()),
-            Formula::Lt(a, b) if is_var(a, var_name) => hi = Some(*b.clone()),
-            Formula::Lt(a, b) if is_var(b, var_name) => lo = Some(*a.clone()),
-            Formula::Ge(a, b) if is_var(a, var_name) => lo = Some(*b.clone()),
-            Formula::Ge(a, b) if is_var(b, var_name) => hi = Some(*a.clone()),
-            Formula::Gt(a, b) if is_var(a, var_name) => {
-                hi = Some(Formula::Add(b.clone(), Box::new(Formula::Int(1))));
-            }
-            _ => {}
+    for_each_conjunct_ref(guard, &mut |atom| match atom {
+        Formula::Le(a, b) if is_var(b, var_name) => lo = Some(*a.clone()),
+        Formula::Le(a, b) if is_var(a, var_name) => hi = Some(*b.clone()),
+        Formula::Lt(a, b) if is_var(a, var_name) => hi = Some(*b.clone()),
+        Formula::Lt(a, b) if is_var(b, var_name) => lo = Some(*a.clone()),
+        Formula::Ge(a, b) if is_var(a, var_name) => lo = Some(*b.clone()),
+        Formula::Ge(a, b) if is_var(b, var_name) => hi = Some(*a.clone()),
+        Formula::Gt(a, b) if is_var(a, var_name) => {
+            hi = Some(Formula::Add(b.clone(), Box::new(Formula::Int(1))));
         }
-    }
+        _ => {}
+    });
 
     if lo.is_some() || hi.is_some() { Some(LinearBounds { lo, hi }) } else { None }
 }
@@ -398,8 +380,7 @@ fn cooper_check_universal(
     bounds: &LinearBounds,
     body: &Formula,
 ) -> Result<Formula, QuantifierError> {
-    let fv = free_vars(body);
-    if !fv.contains(var_name) {
+    if !trust_types::any_free_variable_name(body, &mut |v| v == var_name) {
         return Ok(body.clone());
     }
 
@@ -428,8 +409,7 @@ fn cooper_check_universal(
 
 /// Try to analyze a simple linear formula and determine its truth universally.
 fn try_simple_linear_forall(var_name: &str, body: &Formula) -> Option<Formula> {
-    let fv = free_vars(body);
-    if !fv.contains(var_name) {
+    if !trust_types::any_free_variable_name(body, &mut |v| v == var_name) {
         return Some(body.clone());
     }
 
@@ -442,11 +422,19 @@ fn try_simple_linear_forall(var_name: &str, body: &Formula) -> Option<Formula> {
     None
 }
 
-/// Flatten a formula into a list of conjuncts.
-fn flatten_conjunction(f: &Formula) -> Vec<Formula> {
+/// Flatten a formula into a list of borrowed conjunct references.
+fn flatten_conjunction_refs<'a>(f: &'a Formula, out: &mut Vec<&'a Formula>) {
+    for_each_conjunct_ref(f, &mut |atom| out.push(atom));
+}
+
+fn for_each_conjunct_ref<'a>(f: &'a Formula, visit: &mut impl FnMut(&'a Formula)) {
     match f {
-        Formula::And(cs) => cs.iter().flat_map(flatten_conjunction).collect(),
-        other => vec![other.clone()],
+        Formula::And(cs) => {
+            for c in cs {
+                for_each_conjunct_ref(c, visit);
+            }
+        }
+        other => visit(other),
     }
 }
 

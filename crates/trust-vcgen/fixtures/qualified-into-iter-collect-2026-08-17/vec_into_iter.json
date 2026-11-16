@@ -560,7 +560,7 @@
         "stmts": [],
         "terminator": {
           "Call": {
-            "func": "<alloc::vec::into_iter::IntoIter<u8> as core::iter::traits::iterator::Iterator>::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes@32>",
+            "func": "<alloc::vec::into_iter::IntoIter<u8> as core::iter::traits::iterator::Iterator>::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes@1>",
             "args": [
               {
                 "Move": {

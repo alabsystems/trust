@@ -11,8 +11,11 @@ macro_rules! emit_ambiguous_contract {
     ($call_site_x:ident) => {
         fn ambiguous_contract(
             mut n: u32,
+            //~^ ERROR parameter `n` and a contract clause of this function have different macro hygiene
             $call_site_x: u32,
+            //~^ ERROR parameter `x` and a contract clause of this function have different macro hygiene
             x: u32, //~ ERROR parameters named `x` have distinct hygienic identities
+            //~^ ERROR parameter `x` and a contract clause of this function have different macro hygiene
         ) requires x == x {
             while n > 0 invariant x == x decreases n {
                 n -= 1;

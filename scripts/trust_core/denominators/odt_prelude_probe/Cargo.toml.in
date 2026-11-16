@@ -1,0 +1,24 @@
+# The ODT census's prelude probe (Stage 0.5 denominator `odt`, row
+# clean.prelude.e2_5_6.*). TEMPLATE: scripts/trust_core/denominators/odt.py
+# --probe-prelude substitutes @CLEAN@ with a `git archive` export of the PINNED
+# first-party/clean tree, so the probe links the exact clean-kernel the
+# superproject pins. Not a workspace member of anything in the superproject.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
+[package]
+name = "odt-prelude-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# The feature set D0.5's inventory probe used (the superproject's
+# [workspace.dependencies] unification), so the prelude is the same one D0.5
+# dumped and the type-hash control compares like with like.
+clean-kernel = { path = "@CLEAN@/crates/clean-kernel", features = ["math-overlays"] }
+
+[profile.release]
+debug = false

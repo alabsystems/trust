@@ -1,0 +1,299 @@
+{
+  "name": "{closure#0}",
+  "def_path": "windows_position::f::{closure#0}",
+  "span": {
+    "file": "windows_position.rs",
+    "line_start": 1,
+    "col_start": 61,
+    "line_end": 1,
+    "col_end": 74
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Closure": {
+                "name": "windows_position::f::{closure#0}",
+                "upvars": [],
+                "call": {
+                  "kind": "FnMut",
+                  "params": [
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Slice": {
+                            "elem": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "ret": "Bool"
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "w"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      2,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "windows_position.rs",
+                "line_start": 1,
+                "col_start": 67,
+                "line_end": 1,
+                "col_end": 68
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "windows_position.rs",
+                "line_start": 1,
+                "col_start": 65,
+                "line_end": 1,
+                "col_end": 69
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "windows_position.rs",
+                "line_start": 1,
+                "col_start": 65,
+                "line_end": 1,
+                "col_end": 69
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 1,
+            "span": {
+              "file": "windows_position.rs",
+              "line_start": 1,
+              "col_start": 65,
+              "line_end": 1,
+              "col_end": 69
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 4
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "windows_position.rs",
+                "line_start": 1,
+                "col_start": 65,
+                "line_end": 1,
+                "col_end": 69
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Move": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "windows_position.rs",
+                "line_start": 1,
+                "col_start": 65,
+                "line_end": 1,
+                "col_end": 74
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

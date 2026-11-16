@@ -125,7 +125,12 @@ PY
 
 process_identity() {
   local pid="$1"
-  ps -o lstart= -p "$pid" 2>/dev/null \
+  # EW18-LOCKUTC-1: ps formats the lstart string in the running zone
+  # (TZ env or system zone). Two invocations of the same live process
+  # in different zones produce different strings and the lock thinks
+  # its live owner died. UTC makes the same process always compare
+  # equal regardless of the caller's zone.
+  TZ=UTC0 ps -o lstart= -p "$pid" 2>/dev/null \
     | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g'
 }
 

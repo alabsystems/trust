@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::discovery::discover_native_trust_cargo_checked;
+use super::backend::{
+    TRUST_TARGO_LANE_RUSTFLAGS_ENV, cfg_probe_lane_rustflags, encode_lane_rustflags,
+};
+use super::discovery::discover_native_trust_toolchain_checked;
 use crate::bounded_process;
 use crate::cli::parse_subcommand_args;
 
@@ -155,6 +158,17 @@ impl CargoSelectionArgs {
         self.manifest_path.as_deref()
     }
 
+    /// Forward only Cargo context and target selectors; policy resolution
+    /// remains inside the authenticated Cargo config implementation.
+    pub(super) fn project_policy_query_args(&self) -> Vec<String> {
+        let mut args = self.global_context_args.clone();
+        args.extend(["-Z", "unstable-options", "config", "trust-policy"].map(str::to_string));
+        if let Some(target) = self.explicit_target_triple() {
+            args.extend(["--target".to_string(), target.to_string()]);
+        }
+        args
+    }
+
     fn explicit_target_triple(&self) -> Option<&str> {
         self.target_triples.iter().next().map(String::as_str)
     }
@@ -190,7 +204,7 @@ fn required_value(args: &[String], index: &mut usize, option: &str) -> Result<St
     let value = args
         .get(*index)
         .filter(|value| !value.is_empty() && value.as_str() != "--")
-        .ok_or_else(|| format!("{option} requires a nonempty value"))?;
+        .ok_or_else(|| format!("{option} requires a value, and `--` is not one"))?;
     Ok(value.clone())
 }
 
@@ -256,6 +270,10 @@ pub(crate) struct ResolvedCargoPackage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedCargoSelection {
     pub(crate) packages: Vec<ResolvedCargoPackage>,
+    /// The names of every package in the workspace's resolve (its members and
+    /// everything they depend on), from the same metadata: a committed
+    /// baseline drops a package the resolve no longer has (T9).
+    pub(crate) resolved_packages: BTreeSet<String>,
     /// Cargo's authoritative effective target directory from the same
     /// authenticated metadata invocation used for package selection.
     pub(crate) target_directory: PathBuf,
@@ -278,8 +296,8 @@ pub(crate) struct ResolvedDependency {
 /// sibling `targo`, the same authenticated path package selection uses — a PATH
 /// cargo could resolve a different graph than the one being built.
 pub(crate) fn resolve_dependencies(args: &[String]) -> Result<Vec<ResolvedDependency>, String> {
-    let targo = discover_native_trust_cargo_checked()?;
-    let (metadata, _, _) = resolve_cargo_selection_and_metadata_with_targo(args, &targo)?;
+    let (rustc, targo) = discover_native_trust_toolchain_checked()?;
+    let (metadata, _, _) = resolve_cargo_selection_and_metadata_with_targo(args, &targo, &rustc)?;
     let members: BTreeSet<&str> = metadata.workspace_members.iter().map(String::as_str).collect();
     let mut deps: Vec<ResolvedDependency> = metadata
         .packages
@@ -302,27 +320,92 @@ pub(crate) fn resolve_dependencies(args: &[String]) -> Result<Vec<ResolvedDepend
 /// Metadata is always obtained through the canonical sibling `targo` belonging
 /// to the selected Trust compiler; PATH Cargo is never proof evidence.
 pub(crate) fn resolve_cargo_selection(args: &[String]) -> Result<ResolvedCargoSelection, String> {
-    let targo = discover_native_trust_cargo_checked()?;
-    resolve_cargo_selection_with_targo(args, &targo)
+    let (rustc, targo) = discover_native_trust_toolchain_checked()?;
+    resolve_cargo_selection_with_targo(args, &targo, &rustc)
 }
 
 /// Resolve selection with the exact Targo executable already authenticated by
 /// the caller. Compiler execution and metadata selection must use the same
 /// frontend bytes/path; independently rediscovering Targo here can select a
-/// different installation between the two operations.
+/// different installation between the two operations. `rustc` is the
+/// authenticated compiler that Targo belongs to; every probe pins it.
 pub(crate) fn resolve_cargo_selection_with_targo(
     args: &[String],
     targo: &Path,
+    rustc: &Path,
 ) -> Result<ResolvedCargoSelection, String> {
-    resolve_cargo_selection_and_metadata_with_targo(args, targo).map(|(_, _, selection)| selection)
+    resolve_cargo_selection_and_metadata_with_targo(args, targo, rustc)
+        .map(|(_, _, selection)| selection)
+}
+
+/// A `targo` command for one selection-only probe: `metadata`, `pkgid`,
+/// `config get` or the trust-cg unit-graph preflight.
+///
+/// Cargo's rustc target-info query inside `targo metadata` and
+/// `build --unit-graph` executes trustc with the effective rustflags and any
+/// configured wrapper. Before S9 an inherited or configured external
+/// `-Zcodegen-backend`, the trust-mc dylib, loaded into trustc there, before
+/// the `UNEXAMINED_KANI_SURFACE` disclosure (measured 2026-09-12 on targo
+/// 45dc60873 through `RUSTFLAGS` and `--config build.rustflags`). S9 silenced
+/// every rustflags channel for the probes; T14a lets the probes resolve the
+/// project's flags exactly as the build does (a probe that ignored them
+/// selected different `[target.'cfg(..)']` tables and dependencies than the
+/// build compiled) and closes the same door the way the build does: every
+/// probe carries a lane in `TRUST_TARGO_LANE_RUSTFLAGS` (empty here, the
+/// build's codegen contract under `export_cfg_probe_lane`), and the sibling
+/// Targo drops the project's `-Zcodegen-backend`, `-Zllvm-plugins` and
+/// `-Cllvm-args` from every channel whenever a lane is present, naming each
+/// (DECISION_QUEUE T14-APPEND-2). The caller's RUSTFLAGS and
+/// CARGO_ENCODED_RUSTFLAGS are left as they are.
+///
+/// Empty wrapper variables disable a configured `build.rustc-wrapper` exactly
+/// as the verified build does, and `RUSTC` / `CARGO_BUILD_RUSTC` pin the
+/// authenticated compiler `rustc` as the verified build pins it: a
+/// config-file `build.rustc`, which `run::cargo_compiler_override_diagnostic`
+/// cannot see (it refuses only the environment and `--config` spellings),
+/// otherwise ran as the compiler of the target-info query (S9 re-review;
+/// measured 2026-09-12 on targo 45dc60873: an arbitrary config-file
+/// `build.rustc` script ran during `targo metadata`, and did not with both
+/// variables pinned). `[host]` rustflags under `-Zhost-config` (in any config
+/// file, `include` chain or variable) refuse the probe before a command
+/// exists when they carry external code, and so does a Cargo config that
+/// refusal cannot examine.
+pub(crate) fn selection_probe_command(
+    targo: &Path,
+    rustc: &Path,
+    cargo_args: &[String],
+) -> Result<Command, String> {
+    if let Some(refusal) = super::kani_gate::inherited_host_rustflags_refusal(cargo_args) {
+        return Err(refusal);
+    }
+    let mut command = Command::new(targo);
+    command
+        .env(TRUST_TARGO_LANE_RUSTFLAGS_ENV, "")
+        .env("RUSTC", rustc)
+        .env("CARGO_BUILD_RUSTC", rustc)
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "");
+    Ok(command)
+}
+
+/// Hand a probe built by `selection_probe_command` the lane
+/// `cfg_probe_lane_rustflags` assembled: trust-cg's codegen contract and the
+/// strict safety checks, which are target cfgs, so the probe resolves the
+/// graph the build compiles.
+pub(crate) fn export_cfg_probe_lane(command: &mut Command, lane: &[String]) -> Result<(), String> {
+    command.env(TRUST_TARGO_LANE_RUSTFLAGS_ENV, encode_lane_rustflags(lane)?);
+    Ok(())
 }
 
 fn resolve_cargo_selection_and_metadata_with_targo(
     args: &[String],
     targo: &Path,
+    rustc: &Path,
 ) -> Result<(CargoMetadata, CargoSelectionArgs, ResolvedCargoSelection), String> {
     let selection = CargoSelectionArgs::parse(args)?;
-    let mut command = Command::new(targo);
+    let mut command = selection_probe_command(targo, rustc, args)?;
     command.args(&selection.global_context_args);
     command.args(["metadata", "--format-version", "1"]);
     if let Some(manifest_path) = &selection.manifest_path {
@@ -348,10 +431,15 @@ fn resolve_cargo_selection_and_metadata_with_targo(
     }
     let metadata = serde_json::from_slice::<CargoMetadata>(&output.stdout)
         .map_err(|error| format!("could not parse canonical `targo metadata` output: {error}"))?;
-    let exact_resolutions = resolve_exact_package_specs(targo, &metadata, &selection)?;
+    let exact_resolutions = resolve_exact_package_specs(targo, rustc, &metadata, &selection)?;
     let packages = select_packages(&metadata, &selection, &exact_resolutions)?;
     let target_directory = validated_metadata_target_directory(&metadata.target_directory)?;
-    Ok((metadata, selection, ResolvedCargoSelection { packages, target_directory }))
+    let resolved_packages = metadata.packages.iter().map(|package| package.name.clone()).collect();
+    Ok((
+        metadata,
+        selection,
+        ResolvedCargoSelection { packages, resolved_packages, target_directory },
+    ))
 }
 
 fn validated_metadata_target_directory(path: &Path) -> Result<PathBuf, String> {
@@ -478,10 +566,16 @@ fn validate_trust_cg_unit_graph(graph: &CargoUnitGraph) -> Result<(), String> {
 /// workspace, and optional selector semantics to Cargo itself rather than
 /// maintaining a second approximate selector implementation. `--unit-graph`
 /// resolves the graph but does not compile units or execute build scripts.
+///
+/// `strict_artifact_policy` is the build's strict lane: its forced overflow
+/// checks and debug assertions are target cfgs, so the preflight replays them
+/// with the rest of the build's sanitized target rustflags
+/// (`cfg_probe_cargo_rustflags`).
 pub(crate) fn preflight_trust_cg_cargo_targets_with_targo(
     args: &[String],
     targo: &Path,
     rustc: &Path,
+    strict_artifact_policy: bool,
 ) -> Result<(), String> {
     if args
         .iter()
@@ -494,40 +588,45 @@ pub(crate) fn preflight_trust_cg_cargo_targets_with_targo(
     let separator = dry_args.iter().position(|arg| arg == "--").unwrap_or(dry_args.len());
     dry_args.insert(separator, "--unit-graph".to_string());
 
-    let mut command = Command::new(targo);
+    // `selection_probe_command` pins the authenticated compiler and disables
+    // wrappers as the real build does: branded Targo otherwise falls back to a
+    // PATH-resolved `trustc`, so preflight could inspect a different toolchain
+    // (or fail even though the selected compiler is usable).
+    let mut command = selection_probe_command(targo, rustc, args)?;
+    export_cfg_probe_lane(
+        &mut command,
+        &cfg_probe_lane_rustflags(Some("trust-cg"), strict_artifact_policy),
+    )?;
     command
         .args(["--unverified", "-Z", "unstable-options", "build"])
         .args(&dry_args)
-        // The real build pins the authenticated compiler and rejects wrappers.
-        // Do the same for graph resolution: branded Targo otherwise falls back
-        // to a PATH-resolved `trustc`, so preflight could inspect a different
-        // toolchain (or fail even though the selected compiler is usable).
-        .env("RUSTC", rustc)
-        .env("CARGO_BUILD_RUSTC", rustc)
-        .env("RUSTC_WRAPPER", "")
-        .env("RUSTC_WORKSPACE_WRAPPER", "")
-        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
-        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "")
         // This process resolves Cargo's selection only; it must not enter the
         // verified-child protocol without the real build's fresh session nonce
         // and complete policy. Canonical Targo therefore uses its explicit
         // `-Ztrust-verify=off` dry lane against the authenticated Trust compiler.
         .env_remove("TRUST_TARGO_VERIFY")
-        .env_remove("TRUST_TARGO_TEST_EXECUTE_FRESH_SESSION")
+        .env_remove("TRUST_TARGO_PREPARED_TESTS_EXPORT")
+        .env_remove("TRUST_TARGO_PREPARED_TESTS_SESSION")
+        .env_remove("TRUST_TARGO_PREPARED_TEST_SESSION")
         .env_remove("TRUST_TARGO_TEST_EXECUTION_MANIFEST")
         .env_remove("TRUST_TARGO_TEST_EXECUTION_MANIFEST_SHA256")
         .env_remove("TRUST_TARGO_TEST_MONITOR_AUTHORITY_SESSION")
         .env_remove("TRUST_TARGO_TEST_MONITOR_SESSION")
-        // Ambient flags are sanitized and reassembled for the real build.
-        // They must not affect this earlier selection-only compiler query.
-        // TRUSTFLAGS overrides deliberately do not reach this preflight
-        // either: verifier policy is inert in the `-Ztrust-verify=off` dry
-        // lane, and forwarding it would only widen the surface that could
-        // enter the verified-child protocol without the real build's fresh
-        // session nonce (the probe/preflight session stripping is the fix for
-        // the v24 early-exit regression — keep probes minimal).
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        // The project's flags reach this query exactly as they reach the
+        // build: resolved by Cargo's precedence, minus what the lane owns (an
+        // external backend, LLVM plugins, `-Cllvm-args`, the codegen contract
+        // and the safety checks) and every environment `-Ztrust-*` token, plus
+        // the probe lane (trust-cg's codegen contract and the strict safety
+        // checks), all of which can change target cfgs, so a `--cfg` gates the
+        // same target dependencies here as in the build (S9 re-review: with no
+        // rustflags at all the preflight validated a graph the build did not
+        // compile). No targo-owned `-Z` option is added, and the project
+        // requirements deliberately do not reach this preflight either:
+        // verifier policy is inert in the `-Ztrust-verify=off` dry lane, and
+        // forwarding it would only widen the surface that could enter the
+        // verified-child protocol without the real build's fresh session
+        // nonce (the probe/preflight session stripping is the fix for the v24
+        // early-exit regression — keep probes minimal).
         .env("CARGO_INCREMENTAL", "0")
         .env("TRUST_NO_MIGRATE_WARN", "1");
     let output = bounded_process::output(
@@ -559,6 +658,28 @@ pub(crate) fn preflight_trust_cg_cargo_targets_with_targo(
 pub(crate) fn effective_cargo_target_with_targo(
     args: &[String],
     targo: &Path,
+    rustc: &Path,
+) -> Result<Option<String>, String> {
+    effective_cargo_target_with_targo_budget(args, targo, rustc, None)
+}
+
+pub(super) fn effective_cargo_target_with_targo_until(
+    args: &[String],
+    targo: &Path,
+    rustc: &Path,
+    deadline: std::time::Instant,
+) -> Result<Option<String>, String> {
+    super::project_policy::remaining(deadline)?;
+    let result = effective_cargo_target_with_targo_budget(args, targo, rustc, Some(deadline));
+    super::project_policy::remaining(deadline)?;
+    result
+}
+
+fn effective_cargo_target_with_targo_budget(
+    args: &[String],
+    targo: &Path,
+    rustc: &Path,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Option<String>, String> {
     let selection = CargoSelectionArgs::parse(args)?;
     if let Some(target) = selection.explicit_target_triple() {
@@ -568,7 +689,7 @@ pub(crate) fn effective_cargo_target_with_targo(
         return Ok(Some(target));
     }
 
-    let mut command = Command::new(targo);
+    let mut command = selection_probe_command(targo, rustc, args)?;
     command.args(&selection.global_context_args);
     command.args([
         "-Z",
@@ -579,11 +700,15 @@ pub(crate) fn effective_cargo_target_with_targo(
         "--format",
         "json-value",
     ]);
-    let output = bounded_process::output(
+    let timeout = match deadline {
+        Some(deadline) => super::project_policy::remaining(deadline)?,
+        None => bounded_process::resolve_probe_deadline(Duration::from_secs(30)),
+    };
+    let output = bounded_process::output_with_exact_deadline(
         &mut command,
         &format!("canonical Targo build.target probe at {}", targo.display()),
         1024 * 1024,
-        Duration::from_secs(30),
+        timeout,
     )?;
     if !output.status.success() {
         let stderr = String::from_utf8(output.stderr).map_err(|error| {
@@ -676,6 +801,7 @@ pub(crate) fn validate_trust_cg_effective_target(target: &str) -> Result<(), Str
 /// Cargo and are handled below with Cargo's own `glob` crate.
 fn resolve_exact_package_specs(
     targo: &Path,
+    rustc: &Path,
     metadata: &CargoMetadata,
     selection: &CargoSelectionArgs,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
@@ -688,8 +814,11 @@ fn resolve_exact_package_specs(
         if is_package_pattern(spec) || resolved.contains_key(spec) {
             continue;
         }
-        let ids =
-            constrain_pkgid_to_workspace(metadata, spec, canonical_pkgid(targo, selection, spec))?;
+        let ids = constrain_pkgid_to_workspace(
+            metadata,
+            spec,
+            canonical_pkgid(targo, rustc, selection, spec),
+        )?;
         resolved.insert(spec.clone(), ids);
     }
 
@@ -698,7 +827,7 @@ fn resolve_exact_package_specs(
             if is_package_pattern(spec) || resolved.contains_key(spec) {
                 continue;
             }
-            let ids = match canonical_pkgid(targo, selection, spec) {
+            let ids = match canonical_pkgid(targo, rustc, selection, spec) {
                 Ok(id) => vec![id],
                 Err(detail) => {
                     // Unmatched excludes are warning-only in Cargo. If pkgid
@@ -747,10 +876,11 @@ fn constrain_pkgid_to_workspace(
 
 fn canonical_pkgid(
     targo: &Path,
+    rustc: &Path,
     selection: &CargoSelectionArgs,
     spec: &str,
 ) -> Result<String, String> {
-    let mut command = Command::new(targo);
+    let mut command = selection_probe_command(targo, rustc, &selection.global_context_args)?;
     command.arg("--color=never");
     command.args(&selection.global_context_args);
     command.arg("pkgid");
@@ -802,8 +932,9 @@ fn workspace_ids_suggested_by_pkgid(metadata: &CargoMetadata, detail: &str) -> V
         .collect()
 }
 
-/// Resolve wrapper arguments used by `targo trust build`. `None` is the
-/// intentional single-file lane, which has no Cargo package gate.
+/// Resolve the wrapper arguments of a compile verb (`targo trust check` or
+/// `build`) for the gates that run after it. `None` is the intentional
+/// single-file lane, which has no Cargo package gate.
 pub(crate) fn resolve_cargo_gate_package_roots(
     wrapper_args: &[String],
 ) -> Result<Option<Vec<PathBuf>>, String> {
@@ -815,7 +946,7 @@ fn resolve_cargo_gate_selection(
     wrapper_args: &[String],
 ) -> Result<Option<ResolvedCargoSelection>, String> {
     let parsed = parse_subcommand_args(wrapper_args).map_err(|error| {
-        format!("could not parse build arguments for post-build gates: {error}")
+        format!("could not parse compile arguments for post-compile gates: {error}")
     })?;
     if parsed.is_single_file {
         return Ok(None);
@@ -1015,6 +1146,70 @@ mod tests {
 
     fn exact(entries: &[(&str, &str)]) -> BTreeMap<String, Vec<String>> {
         entries.iter().map(|(spec, id)| ((*spec).to_string(), vec![(*id).to_string()])).collect()
+    }
+
+    /// T14a: a probe sets no rustflags variable (the project's flags reach it
+    /// as they reach the build) and carries an empty lane, under which the
+    /// sibling Targo drops an external backend from every channel.
+    #[test]
+    fn selection_probe_command_sets_no_rustflags_carries_a_lane_and_runs_no_wrapper() {
+        // The `[host]` refusal reads this process's environment and Cargo
+        // configs, which env-locked tests set: serialize with them.
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let backend = "/abs/librustc_codegen_trust_mc.dylib";
+        let command = selection_probe_command(
+            Path::new("/abs/targo"),
+            Path::new("/abs/trustc"),
+            &strings(&["--config", &format!("build.rustflags=['-Zcodegen-backend={backend}']")]),
+        )
+        .expect("target-side rustflags are dropped by the lane, not refused");
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(envs.get("CARGO_ENCODED_RUSTFLAGS"), None, "{envs:?}");
+        assert_eq!(envs.get("RUSTFLAGS"), None, "{envs:?}");
+        assert_eq!(
+            envs.get(TRUST_TARGO_LANE_RUSTFLAGS_ENV),
+            Some(&Some(String::new())),
+            "{envs:?}"
+        );
+        for wrapper in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            assert_eq!(envs.get(wrapper), Some(&Some(String::new())), "{wrapper}: {envs:?}");
+        }
+        // A config-file `build.rustc` is not an environment variable, so the
+        // compiler overrides above cannot refuse it; pinning the authenticated
+        // compiler keeps it from running during a probe, as in the real build.
+        for compiler in ["RUSTC", "CARGO_BUILD_RUSTC"] {
+            assert_eq!(
+                envs.get(compiler),
+                Some(&Some("/abs/trustc".to_string())),
+                "{compiler}: {envs:?}"
+            );
+        }
+        assert_eq!(command.get_args().count(), 0, "callers add the probe's own argv");
+
+        let refusal = selection_probe_command(
+            Path::new("/abs/targo"),
+            Path::new("/abs/trustc"),
+            &strings(&[
+                "-Zhost-config",
+                "--config",
+                &format!("host.rustflags=['-Zcodegen-backend={backend}']"),
+            ]),
+        )
+        .expect_err("[host] rustflags survive the scrub, so they refuse the probe");
+        assert!(refusal.contains(super::super::kani_gate::HOST_RUSTFLAGS_EXTERNAL_CODE_TAG));
     }
 
     #[test]

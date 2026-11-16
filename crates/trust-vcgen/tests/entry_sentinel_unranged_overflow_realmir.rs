@@ -58,6 +58,9 @@
 
 use trust_types::{Formula, VcKind, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn load(stem: &str) -> VerifiableFunction {
     let path = format!("{}/tests/data/{stem}.json", env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(&path).expect("fixture must be readable");
@@ -114,7 +117,7 @@ fn has_entry_tie(f: &Formula) -> bool {
 }
 
 fn verdict(vc: &trust_types::VerificationCondition) -> VerificationResult {
-    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+    let router = test_router::deterministic_test_router();
     let results = router.verify_all(std::slice::from_ref(vc));
     results.into_iter().next().expect("one verdict per VC").1
 }

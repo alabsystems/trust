@@ -1,3 +1,13 @@
+# 2026-11-15: retain incoming native_check_all_targets fixture manifest; one document added, none removed.
+# 2026-11-14: include incoming main's committed-source crate manifest; one document added, none removed.
+# 2026-11-14: include the new Gix-free filesystem ACL crate manifest; one document added, none removed.
+# 2026-11-14: crates/trust-luminal-rows/Cargo.toml, the crate of the PKG-U13f Luminal row tests (tests/luminal-domination), joins with the change that adds it. Regenerated from the index and read: this one line, nothing vanished.
+# 2026-11-14: gates/land.toml, the landing gate's row table (docs/PLAN.md PKG-LIVE-4), joins with the change that adds it. Regenerated from the index and read: this one line, nothing vanished.
+# 2026-11-12: the dispatch-cost probe's Cargo.toml (scripts/dispatch-cost, docs/STATUS.md "Dispatch cost") joins with the change that adds it.
+# 2026-11-11: b167ffefa2 added the unit-transport probe's Cargo.toml without its re-pin; the next landing carries it (CORPUS-MEMBERSHIP-BYPASS-1).
+# 2026-11-10: c5e73dac73 added the float-reference probe's Cargo.toml without its re-pin; the next landing carries it (CORPUS-MEMBERSHIP-BYPASS-1).
+# 2026-11-10: eb5684db55 added the indexed-field compound probe's Cargo.toml without its re-pin; the next landing carries it (CORPUS-MEMBERSHIP-BYPASS-1).
+# 2026-11-10: home consolidation includes proof-session manifest and incoming Lean linker qualification reports.
 # trust-toml corpus manifest — the acceptance gate's SAMPLE, pinned.
 #
 # One checked-in TOML document per line, path relative to the repository root,
@@ -7,6 +17,14 @@
 # REGENERATE (and read the diff before committing it):
 #
 #   git ls-files -- '*.toml' | grep -v '^first-party/' | grep -v '^vendor/' | sort
+#
+# CHECKED AT LANDING (2026-11-10, docs/DECISION_QUEUE.md
+# CORPUS-MEMBERSHIP-AT-LANDING-1). The push row `fast.corpus-membership`
+# (scripts/check_corpus_membership.py) applies this rule to the pushed tree,
+# so a landing that adds or removes a document must carry its re-pin.
+# `python3 scripts/check_corpus_membership.py --write` regenerates this body
+# from the checkout's index under exactly the command above, keeping this
+# header; the row refuses a header whose command it does not apply.
 #
 # SCOPE, and why it stops where it does:
 #   * `git ls-files`, not `find`: checked-in documents only. `bootstrap.toml` is
@@ -65,22 +83,180 @@
 #       direction that would have mattered — and the differential was re-run
 #       after re-pinning so these four are actually compared rather than
 #       merely tolerated. 1381 -> 1385 documents.
+#
+#   +21 docs/trust-core/{,reviews/,denominators/}*.toml  (2026-09-27)
+#       The Trust-core semantics ledgers — the 14 tables and reviews of
+#       0e0c2abbbb (Phase 0 Stage 0.2, 2026-09-24) and the 7 denominators of
+#       8a501268ba (2026-09-26), 30-540 KB each. Nothing vanished. Re-run after
+#       re-pinning: all 21 are accepted by both readers with equal trees, key
+#       order included (1424 -> 1445 accepted, rejected-by-both unchanged at 4).
+#       1428 -> 1449 documents. (The 1385 -> 1428 re-pins before this one went
+#       unlogged here; `git log` on this file has them.)
+#
+#   +14 docs/trust-core/{core-vocabulary,language-decisions,minirust-baseline,
+#       mir-constructor-table,semantics-retirement,static-semantics-source-map,
+#       ub-coverage-matrix}.toml and their seven docs/trust-core/reviews/*.toml
+#       Landed with the trust-core Stage 0.2 commit (0e0c2abbbb), which did not
+#       re-pin this list; the gate reported exactly these 14 as newly present and
+#       nothing as vanished. Re-pinned 2026-09-27 and the differential re-run, so
+#       all 14 are parsed by both readers and compared rather than tolerated.
+#       1428 -> 1442 documents.
+#
+#   -13 reports/2026-09-1[78]-*/**.toml  (2026-09-25)
+#       Session residue deleted under the owner's 2026-09-23 ruling on the
+#       session handoffs (docs/DECISION_QUEUE.md): archived Cargo manifests
+#       and other TOML copied out of scratch worktrees. The construct floors
+#       were re-run after the deletion. 1442 -> 1429 documents.
+#
+#   -1  .github/ci/trust-authority-harness/Cargo.toml  (2026-09-25)
+#       The parked CI harness crate, deleted with .github/workflows-pending
+#       under the owner's 2026-09-23 no-CI ruling. 1429 -> 1428 documents.
+#
+#   -6  tests/upstream-rust/fixtures/{baseline,exceptions,gate-wiring,
+#       upstream-fixes}.seed.toml and trust-conformance/external/dterm/crates/
+#       {dterm-alloc,dterm-core-ffi}/Cargo.toml  (2026-10-01)
+#       Unread fixtures deleted in the test-and-gate cruft sweep: 2026-04-26
+#       ledger seeds whose schema ids nothing else names, and the dterm mirror
+#       of the retired Publication V3 admission gate. The construct floors were
+#       recomputed over the edited list in Python and all hold; the differential
+#       itself was not run (no Trust toolchain on that host). 1446 -> 1440
+#       documents.
+#
+#   +1  crates/trust-temporal-prelude/Cargo.toml  (2026-10-01)
+#       Landed with a7eb9dcdd5 (trust-certify's `import Trust.Temporal`), which
+#       did not re-pin this list, so the membership test was red on exactly this
+#       path at 7e1854057f. 1440 -> 1441 documents.
+#
+#   +1  crates/trust-model-prelude/Cargo.toml  (2026-10-09)
+#       The Beyond-TLA executable-presentation crate (lane/beyond-tla-b1a,
+#       B1A-01a), pinned in the commit that adds it. 1446 -> 1447 documents
+#       (the 1441 -> 1446 re-pins before it went unlogged here; `git log` on this
+#       file has them).
+#
+#   +1  tests/fixtures/instance-discharge/Cargo.toml  (2026-10-12)
+#       The fixture crate of tests/e2e_instance_discharge_accounting.sh (a
+#       `proved` instance-discharge row, end to end). It landed in 2d4323e3d6,
+#       which did not re-pin this list; the pre-push hook's scoped.crates-tests
+#       row ran the membership test and refused the push on exactly this path,
+#       nothing vanished. Regenerated with the command above and read: this one
+#       line. 1448 -> 1449 documents (the 1447 -> 1448 re-pin before it,
+#       tests/fixtures/obligation-ids/Cargo.toml, is 0cb8517b6e).
+#
+#   +2  src/tools/rust-analyzer/crates/hir-ide/Cargo.toml, src/tpde/REUSE.toml
+#       (2026-10-19) The bf9448e4..8144389c895d upstream port: a new
+#       rust-analyzer crate manifest and the flattened TPDE tree's REUSE
+#       manifest. Nothing vanished. 1494 -> 1496 documents.
+# RE-PINNED 2026-10-21, self-host integration c8614f12f3: +14 documents.
+#   +1 jobserver_utils Cargo manifest; +13 tracked Targo registry/path-base
+#       fixture configs recovered by the self-host source alignment.
+#       1496 -> 1510 documents, 7193347 bytes. Nothing vanished.
+#       Same documented scope/size rules, construct floors and incumbents;
+#       the complete parser differential remains required after this refresh.
+#
+
+# RE-PINNED 2026-10-21 on c6c34a8be8 after actual D9 gate membership refusal:
+# +14/-0 tracked documents, 1496 -> 1510. The documented selection rule,
+# parser/incumbent comparison and construct floors are unchanged; see
+# docs/audits/2026-10-21-native-d9-landing-red.md.
+
+# COMPOSED 2026-10-21: ordinary H10bb + canonical4b99 integration.
+#   Retain both source refresh notes and the complete parent path union.
+#   1510 TOML documents; no parent paths removed.
+#   Scope, floors and parser comparison unchanged; full runtime gate remains due.
+#
+#
+#   +6  src/tools/targo/tests/testsuite/cargo_add/*/in/.cargo/config.toml
+#       (2026-10-24) One vendored-source configuration and five named path-base
+#       configurations used by the Targo fixtures. The membership gate reported
+#       exactly these six additions and no removals. Include them in the full
+#       independent differential and retain every construct floor.
+#       1496 -> 1502 documents.
+#
+#   -2  src/tools/miri/priroda/{Cargo,rust-toolchain}.toml  (2026-10-26)
+#       The 76456a..019b59d8101b upstream port: priroda folded into miri as
+#       a feature and its standalone crate manifests were deleted upstream.
+#       Both vanished documents are upstream deletions, not sample decay;
+#       regenerated with the command above and read: exactly these two
+#       lines. 1502 -> 1500 documents after the six Targo additions above.
+#
+#   +1  crates/trust-proc-macro-bridge/Cargo.toml (2026-10-28 integration)
+#       D21 adds this workspace manifest. Include it in the complete differential.
+#       1500 -> 1501 documents.
+
+#       lines. 1496 -> 1494 documents.
+#
+# COMPOSED 2026-10-28 with the toolchain integration: retain all 14 recovered
+# documents and add the tracked trust-coordinator manifest missing from the
+# old integration sample. The two upstream priroda deletions remain deleted.
+# The maintained tracked-path selection now contains 1509 documents; parser
+# comparison, construct floors and every surviving incumbent stay unchanged.
+# Re-pinned 2026-11-03: 1510 -> 1518 tracked documents (+10, -2).
+# The old 2026-10-19 stage0 manifest was replaced in 7f14179937; crates/Cargo.toml
+# moved to the root workspace in 992ace2954. New native bridge/CPU/file-lock/source-
+# contract/test-execution/Targo manifests, the new seed, and three upstream TOML
+# configs are now sampled. Both membership directions and construct floors stay.
+#
+# RE-PINNED 2026-11-06 (Continuum EW-1 landing): +4/-0 tracked documents,
+#   1517 -> 1521. crates/trust-build-tree/Cargo.toml (92dd9cc159),
+#   crates/trust-resource-provenance/Cargo.toml (ebc3bc69eb) and the two
+#   reports/2026-11-05-tg5-consumer-repair/qualified-*-manifest.toml (91d6fc93ee)
+#   landed without re-pinning this list; regenerated with the command above
+#   and read: these four lines, nothing vanished. The parser differential ran
+#   over the new list and agrees.
+#
+# RE-PINNED 2026-11-10 (CORPUS-MANIFEST-REFRESH-1): +7/-0 tracked documents,
+#   1525 -> 1532. Landed on main without re-pinning this list, so
+#   `corpus_membership_matches_the_pinned_manifest` was red on main (nothing
+#   vanished): crates/trust-cmake/Cargo.toml (2d8a7c1cc3),
+#   crates/trust-exec-policy/Cargo.toml (25f98090c2),
+#   crates/trust-fs-observation/Cargo.toml (9eb7d506d9),
+#   crates/trust-fs-observation/rustfmt.toml (9eb7d506d9),
+#   crates/trust-oracle-freeze-facts/Cargo.toml (0a0650bc00),
+#   crates/trust-thir-lower/probes/ordered_slice_original_module/Cargo.toml
+#   (9c840aab04),
+#   reports/2026-11-10-formatter-scheduler/qualification/frontend/Cargo.toml
+#   (141c1bf34d). Regenerated with the command above against origin/main e26cd00b03,
+#   body in byte order (LC_ALL=C), and read: these 7 lines, nothing vanished. All 7
+#   parse with Python's tomllib. The parser differential ran over the new list and
+#   agrees.
+#
+# RE-PINNED 2026-11-10 with the dead-code deletion: +1/-29 tracked documents,
+#   1533 -> 1505. Gone with the deleted code: the Cargo.toml of the eighteen
+#   deleted crates (trust-js-*, trust-ts-embed, trust-ts-strip, trust-bincode,
+#   trust-hmac, trust-ny-bridge, trust-sha2-compat), the ten tests/js262/*.toml
+#   ledgers, tools/ts2rust/_crate/Cargo.toml. Added: the unpinned
+#   crates/trust-thir-lower/probes/indexed_field_compound_original_module/Cargo.toml
+#   that main already carried. Regenerated with the command above from the index.
+#
+# RE-PINNED 2026-11-11: +1/-0 tracked documents, 1506 -> 1507. b167ffefa2 landed
+#   crates/trust-thir-lower/probes/unit_transport_original_module/Cargo.toml
+#   without re-pinning this list, so fast.corpus-membership was red on main.
+#   Regenerated with the command above from the index at 3ae3bb5ca7, and read:
+#   this one line, nothing vanished. The new file parses with Python's tomllib.
+#
+# RE-PINNED 2026-11-14: +1/-0 tracked documents, 1509 -> 1510. tests/corpora.toml
+#   is the table `targo trust gate corpus-delta` reads (the daily-driver corpora).
+#   Regenerated with the command above from the index, and read: this one line,
+#   nothing vanished. The new file parses with Python's tomllib.
+
 .cargo/config.toml
-.github/ci/trust-authority-harness/Cargo.toml
 .gitleaks.toml
+Cargo.toml
+REUSE.toml
 benchmarks/verify_overhead/Cargo.toml
 bootstrap.example.toml
-bootstrap/trust-stage0/dist/2026-07-13/channel-rust-trust.toml
+bootstrap/trust-stage0/dist/2026-11-07/channel-rust-trust.toml
 bootstrap/trust-stage0/dist/channel-rust-trust.toml
 bootstrap/trust-stage0/seed-ledger.toml
-Cargo.toml
+compiler/rustc/Cargo.toml
 compiler/rustc_abi/Cargo.toml
 compiler/rustc_arena/Cargo.toml
+compiler/rustc_ast/Cargo.toml
 compiler/rustc_ast_ir/Cargo.toml
 compiler/rustc_ast_lowering/Cargo.toml
 compiler/rustc_ast_passes/Cargo.toml
 compiler/rustc_ast_pretty/Cargo.toml
-compiler/rustc_ast/Cargo.toml
+compiler/rustc_attr_ir/Cargo.toml
 compiler/rustc_attr_parsing/Cargo.toml
 compiler/rustc_baked_icu_data/Cargo.toml
 compiler/rustc_borrowck/Cargo.toml
@@ -89,30 +265,33 @@ compiler/rustc_codegen_llvm/Cargo.toml
 compiler/rustc_codegen_ssa/Cargo.toml
 compiler/rustc_codegen_trust_cg/Cargo.toml
 compiler/rustc_const_eval/Cargo.toml
+compiler/rustc_crate_store/Cargo.toml
 compiler/rustc_data_structures/Cargo.toml
-compiler/rustc_driver_impl/Cargo.toml
+compiler/rustc_data_structures/src/jobserver/early/Cargo.toml
 compiler/rustc_driver/Cargo.toml
+compiler/rustc_driver_impl/Cargo.toml
 compiler/rustc_error_codes/Cargo.toml
 compiler/rustc_error_messages/Cargo.toml
 compiler/rustc_errors/Cargo.toml
 compiler/rustc_expand/Cargo.toml
+compiler/rustc_expand_queries/Cargo.toml
 compiler/rustc_feature/Cargo.toml
 compiler/rustc_fs_util/Cargo.toml
 compiler/rustc_graphviz/Cargo.toml
 compiler/rustc_hashes/Cargo.toml
+compiler/rustc_hir/Cargo.toml
 compiler/rustc_hir_analysis/Cargo.toml
 compiler/rustc_hir_id/Cargo.toml
 compiler/rustc_hir_pretty/Cargo.toml
 compiler/rustc_hir_typeck/Cargo.toml
-compiler/rustc_hir/Cargo.toml
 compiler/rustc_incremental/Cargo.toml
-compiler/rustc_index_macros/Cargo.toml
 compiler/rustc_index/Cargo.toml
+compiler/rustc_index_macros/Cargo.toml
 compiler/rustc_infer/Cargo.toml
 compiler/rustc_interface/Cargo.toml
 compiler/rustc_lexer/Cargo.toml
-compiler/rustc_lint_defs/Cargo.toml
 compiler/rustc_lint/Cargo.toml
+compiler/rustc_lint_defs/Cargo.toml
 compiler/rustc_llvm/Cargo.toml
 compiler/rustc_log/Cargo.toml
 compiler/rustc_macros/Cargo.toml
@@ -123,21 +302,22 @@ compiler/rustc_mir_dataflow/Cargo.toml
 compiler/rustc_mir_transform/Cargo.toml
 compiler/rustc_monomorphize/Cargo.toml
 compiler/rustc_next_trait_solver/Cargo.toml
-compiler/rustc_parse_format/Cargo.toml
 compiler/rustc_parse/Cargo.toml
+compiler/rustc_parse_format/Cargo.toml
 compiler/rustc_passes/Cargo.toml
 compiler/rustc_pattern_analysis/Cargo.toml
 compiler/rustc_privacy/Cargo.toml
 compiler/rustc_proc_macro/Cargo.toml
-compiler/rustc_public_bridge/Cargo.toml
 compiler/rustc_public/Cargo.toml
 compiler/rustc_public/rust-toolchain.toml
+compiler/rustc_public_bridge/Cargo.toml
 compiler/rustc_query_impl/Cargo.toml
 compiler/rustc_resolve/Cargo.toml
 compiler/rustc_sanitizers/Cargo.toml
 compiler/rustc_serialize/Cargo.toml
 compiler/rustc_session/Cargo.toml
 compiler/rustc_span/Cargo.toml
+compiler/rustc_structures/Cargo.toml
 compiler/rustc_symbol_mangling/Cargo.toml
 compiler/rustc_target/Cargo.toml
 compiler/rustc_thread_pool/Cargo.toml
@@ -145,21 +325,29 @@ compiler/rustc_trait_selection/Cargo.toml
 compiler/rustc_traits/Cargo.toml
 compiler/rustc_transmute/Cargo.toml
 compiler/rustc_ty_utils/Cargo.toml
-compiler/rustc_type_ir_macros/Cargo.toml
+compiler/rustc_ty_walk/Cargo.toml
 compiler/rustc_type_ir/Cargo.toml
+compiler/rustc_type_ir_macros/Cargo.toml
 compiler/rustc_windows_rc/Cargo.toml
-compiler/rustc/Cargo.toml
-crates/Cargo.toml
+crates/trust-align/Cargo.toml
 crates/trust-backprop/Cargo.toml
 crates/trust-bignum/Cargo.toml
 crates/trust-binary-parse/Cargo.toml
+crates/trust-bitfield/Cargo.toml
+crates/trust-bits/Cargo.toml
 crates/trust-bmc/Cargo.toml
-crates/trust-buildcache/Cargo.toml
+crates/trust-bridge-closure/Cargo.toml
+crates/trust-budget/Cargo.toml
+crates/trust-build-cpu/Cargo.toml
+crates/trust-build-tree/Cargo.toml
 crates/trust-cache/Cargo.toml
 crates/trust-cert-meter/Cargo.toml
 crates/trust-certify/Cargo.toml
 crates/trust-cg-bridge/Cargo.toml
+crates/trust-checksum/Cargo.toml
 crates/trust-clean-carrier/Cargo.toml
+crates/trust-clean-ir-gate/Cargo.toml
+crates/trust-clean-ir/Cargo.toml
 crates/trust-clean-origin/Cargo.toml
 crates/trust-clean/Cargo.toml
 crates/trust-clean/fixtures/census-m6-cleankernel-2026-07-08/extract-foldmemo/Cargo.toml
@@ -168,70 +356,121 @@ crates/trust-clean/fixtures/stdlib-leaf-bitmethods-2026-07-16/SOURCE/Cargo.toml
 crates/trust-clean/fixtures/stdlib-leaf-cmp-2026-07-16/SOURCE/Cargo.toml
 crates/trust-clean/fixtures/stdlib-leaf-num-2026-07-16/SOURCE/Cargo.toml
 crates/trust-clean/fixtures/trustir-oleans/MANIFEST.toml
+crates/trust-cmake/Cargo.toml
+crates/trust-committed-source/Cargo.toml
 crates/trust-convergence/Cargo.toml
+crates/trust-coordinator/Cargo.toml
 crates/trust-decompile/Cargo.toml
-crates/trust-deps/Cargo.toml
 crates/trust-disasm/Cargo.toml
 crates/trust-disasm/harness/native-invariant/Cargo.toml
 crates/trust-disasm/harness/native-semantic/Cargo.toml
 crates/trust-disasm/harness/x86-decode-differential/Cargo.toml
 crates/trust-disasm/harness/x86-semantic-differential/Cargo.toml
 crates/trust-ed25519/Cargo.toml
-crates/trust-hmac/Cargo.toml
+crates/trust-endian/Cargo.toml
+crates/trust-exec-policy/Cargo.toml
+crates/trust-file-lock/Cargo.toml
+crates/trust-fixed/Cargo.toml
+crates/trust-floatbits/Cargo.toml
+crates/trust-fs-acl/Cargo.toml
+crates/trust-fs-observation/Cargo.toml
+crates/trust-fs-observation/rustfmt.toml
+crates/trust-hex/Cargo.toml
+crates/trust-index/Cargo.toml
+crates/trust-intbound/Cargo.toml
 crates/trust-integration-tests/Cargo.toml
 crates/trust-integration-tests/fixtures/sample_crate/Cargo.toml
+crates/trust-interval/Cargo.toml
 crates/trust-ir-bridge/Cargo.toml
-crates/trust-js-autoform/Cargo.toml
-crates/trust-js-certify-bridge/Cargo.toml
-crates/trust-js-differential/Cargo.toml
-crates/trust-js-interp/Cargo.toml
-crates/trust-js-modules/Cargo.toml
-crates/trust-js-parse/Cargo.toml
-crates/trust-js-reactor/Cargo.toml
-crates/trust-js-regexp/Cargo.toml
-crates/trust-js-sem/Cargo.toml
-crates/trust-js-trace/Cargo.toml
-crates/trust-js-value/Cargo.toml
 crates/trust-json/Cargo.toml
 crates/trust-lift/Cargo.toml
 crates/trust-loop/Cargo.toml
+crates/trust-luminal-rows/Cargo.toml
 crates/trust-machine-sem/Cargo.toml
 crates/trust-memchr/Cargo.toml
 crates/trust-mir-extract/Cargo.toml
-crates/trust-ny-bridge/Cargo.toml
+crates/trust-model-prelude/Cargo.toml
+crates/trust-modular/Cargo.toml
+crates/trust-odt/Cargo.toml
+crates/trust-oracle-freeze-facts/Cargo.toml
 crates/trust-os/Cargo.toml
+crates/trust-platform-census/Cargo.toml
+crates/trust-platform-derive/Cargo.toml
+crates/trust-platform/Cargo.toml
+crates/trust-proc-macro-bridge/Cargo.toml
+crates/trust-process-isolation/Cargo.toml
 crates/trust-proof-cert/Cargo.toml
+crates/trust-proof-session/Cargo.toml
+crates/trust-qualification/Cargo.toml
+crates/trust-radix64/Cargo.toml
 crates/trust-rand/Cargo.toml
+crates/trust-ratio/Cargo.toml
 crates/trust-release/Cargo.toml
 crates/trust-report/Cargo.toml
+crates/trust-resource-controller/Cargo.toml
+crates/trust-resource-provenance/Cargo.toml
 crates/trust-router/Cargo.toml
 crates/trust-semantics/Cargo.toml
-crates/trust-sha2-compat/Cargo.toml
 crates/trust-sha2/Cargo.toml
+crates/trust-source-contract/Cargo.toml
 crates/trust-spec-elab/Cargo.toml
 crates/trust-spec-temporal/Cargo.toml
 crates/trust-spec/Cargo.toml
+crates/trust-stage-receipt/Cargo.toml
 crates/trust-strengthen/Cargo.toml
 crates/trust-symbols/Cargo.toml
 crates/trust-symex/Cargo.toml
+crates/trust-temporal-prelude/Cargo.toml
 crates/trust-temporal/Cargo.toml
+crates/trust-test-execution/Cargo.toml
 crates/trust-thir-lower/Cargo.toml
+crates/trust-thir-lower/probes/float_reference_original_module/Cargo.toml
+crates/trust-thir-lower/probes/indexed_field_compound_original_module/Cargo.toml
+crates/trust-thir-lower/probes/ordered_slice_original_module/Cargo.toml
+crates/trust-thir-lower/probes/unit_transport_original_module/Cargo.toml
+crates/trust-timearith/Cargo.toml
 crates/trust-toml/Cargo.toml
 crates/trust-transval/Cargo.toml
-crates/trust-ts-embed/Cargo.toml
-crates/trust-ts-strip/Cargo.toml
 crates/trust-types/Cargo.toml
 crates/trust-upstream-compat/Cargo.toml
+crates/trust-utf/Cargo.toml
+crates/trust-varint/Cargo.toml
 crates/trust-vc-bridge/Cargo.toml
 crates/trust-vcgen/Cargo.toml
 crates/trust-verifier-api/Cargo.toml
 crates/trust-version/Cargo.toml
 crates/trust-wasm-bridge/Cargo.toml
+crates/trust-widthconv/Cargo.toml
 crates/trust-witness/Cargo.toml
+crates/trust-worker-linux/Cargo.toml
 crates/trust-wp/Cargo.toml
+docs/trust-core/EXTERNAL_PINS.toml
+docs/trust-core/core-vocabulary.toml
+docs/trust-core/denominators/checkpoint-a.toml
+docs/trust-core/denominators/hosts.toml
+docs/trust-core/denominators/imports.toml
+docs/trust-core/denominators/odt.toml
+docs/trust-core/denominators/std-surface.toml
+docs/trust-core/denominators/templates.toml
+docs/trust-core/denominators/ui-tests.toml
+docs/trust-core/language-decisions.toml
+docs/trust-core/minirust-baseline.toml
+docs/trust-core/mir-constructor-table.toml
+docs/trust-core/reviews/core_vocabulary.toml
+docs/trust-core/reviews/language_decisions.toml
+docs/trust-core/reviews/minirust_baseline.toml
+docs/trust-core/reviews/mir_constructor_table.toml
+docs/trust-core/reviews/semantics_retirement.toml
+docs/trust-core/reviews/static_semantics_source_map.toml
+docs/trust-core/reviews/ub_coverage_matrix.toml
+docs/trust-core/semantics-retirement.toml
+docs/trust-core/static-semantics-source-map.toml
+docs/trust-core/ub-coverage-matrix.toml
 examples/contracts/basic-contracts/Cargo.toml
 examples/contracts/postcondition-branch-repro/Cargo.toml
 examples/hardened/Cargo.toml
+gates/land.toml
+library/Cargo.toml
 library/alloc/Cargo.toml
 library/alloctests/Cargo.toml
 library/backtrace/Cargo.toml
@@ -242,18 +481,18 @@ library/backtrace/crates/dylib-dep/Cargo.toml
 library/backtrace/crates/line-tables-only/Cargo.toml
 library/backtrace/crates/macos_frames_test/Cargo.toml
 library/backtrace/crates/without_debuginfo/Cargo.toml
-library/Cargo.toml
 library/compiler-builtins/.rustfmt.toml
+library/compiler-builtins/Cargo.toml
 library/compiler-builtins/builtins-shim/Cargo.toml
 library/compiler-builtins/builtins-test-intrinsics/Cargo.toml
 library/compiler-builtins/builtins-test/Cargo.toml
-library/compiler-builtins/Cargo.toml
 library/compiler-builtins/compiler-builtins/Cargo.toml
 library/compiler-builtins/crates/api-list-common/Cargo.toml
 library/compiler-builtins/crates/libm-macros/Cargo.toml
 library/compiler-builtins/crates/musl-math-sys/Cargo.toml
 library/compiler-builtins/crates/panic-handler/Cargo.toml
-library/compiler-builtins/crates/symbol-check/Cargo.toml
+library/compiler-builtins/crates/symcheck/Cargo.toml
+library/compiler-builtins/crates/sysbench/Cargo.toml
 library/compiler-builtins/crates/update-api-list/Cargo.toml
 library/compiler-builtins/crates/util/Cargo.toml
 library/compiler-builtins/josh-sync.toml
@@ -265,10 +504,11 @@ library/coretests/Cargo.toml
 library/panic_abort/Cargo.toml
 library/panic_unwind/Cargo.toml
 library/portable-simd/Cargo.toml
+library/portable-simd/Cross.toml
 library/portable-simd/crates/core_simd/Cargo.toml
 library/portable-simd/crates/std_float/Cargo.toml
 library/portable-simd/crates/test_helpers/Cargo.toml
-library/portable-simd/Cross.toml
+library/portable-simd/josh-sync.toml
 library/portable-simd/rust-toolchain.toml
 library/portable-simd/triagebot.toml
 library/proc_macro/Cargo.toml
@@ -276,8 +516,8 @@ library/profiler_builtins/Cargo.toml
 library/rustc-std-workspace-alloc/Cargo.toml
 library/rustc-std-workspace-core/Cargo.toml
 library/rustc-std-workspace-std/Cargo.toml
-library/std_detect/Cargo.toml
 library/std/Cargo.toml
+library/std_detect/Cargo.toml
 library/stdarch/Cargo.toml
 library/stdarch/crates/assert-instr-macro/Cargo.toml
 library/stdarch/crates/core_arch/Cargo.toml
@@ -286,7 +526,6 @@ library/stdarch/crates/intrinsic-test/Cargo.toml
 library/stdarch/crates/simd-test-macro/Cargo.toml
 library/stdarch/crates/stdarch-gen-arm/Cargo.toml
 library/stdarch/crates/stdarch-gen-common/Cargo.toml
-library/stdarch/crates/stdarch-gen-hexagon-scalar/Cargo.toml
 library/stdarch/crates/stdarch-gen-hexagon/Cargo.toml
 library/stdarch/crates/stdarch-gen-loongarch/Cargo.toml
 library/stdarch/crates/stdarch-test/Cargo.toml
@@ -298,13 +537,30 @@ library/stdarch/triagebot.toml
 library/sysroot/Cargo.toml
 library/test/Cargo.toml
 library/unwind/Cargo.toml
-library/windows_link/Cargo.toml
 library/windows-sys/Cargo.toml
+library/windows_link/Cargo.toml
 release/internal-repo-versions.toml
 release/trust-version.toml
-REUSE.toml
+reports/2026-09-17-phase0-k1-one-env/audit/k1probe/Cargo.toml
+reports/2026-09-17-phase0-k1-one-env/clean-lane/lib-namespaced/lakefile.toml
+reports/2026-09-17-phase0-k1-one-env/clean-lane/lib/lakefile.toml
+reports/2026-09-17-phase0-k8-specr/translator/frontend/Cargo.toml
+reports/2026-09-28-proc-macro-boundary-b2/probes/derive-macro/Cargo.toml
+reports/2026-09-28-proc-macro-boundary-b2/probes/direct-user/Cargo.toml
+reports/2026-09-28-proc-macro-boundary-b2/probes/facade-user/Cargo.toml
+reports/2026-09-28-proc-macro-boundary-b2/probes/facade/Cargo.toml
+reports/2026-09-28-proc-macro-boundary-b2/probes/initializer-macro/Cargo.toml
+reports/2026-09-28-proc-macro-boundary-b2/probes/private-user/Cargo.toml
+reports/2026-09-28-proc-macro-boundary-b2/probes/s3-foreign-workspace-root/consumer/Cargo.toml
+reports/2026-09-28-proc-macro-boundary-b2/probes/s3-foreign-workspace-root/vend/Cargo.toml
+reports/2026-09-28-proc-macro-boundary-b2/probes/verified-root/Cargo.toml
+reports/2026-11-05-tg5-consumer-repair/qualified-bridge-manifest.toml
+reports/2026-11-05-tg5-consumer-repair/qualified-core-manifest.toml
+reports/2026-11-10-formatter-scheduler/qualification/frontend/Cargo.toml
+rust-toolchain.toml
 rustfmt.toml
-scratchpad/fusion-demo/fuse-merge/Cargo.toml
+scripts/dispatch-cost/Cargo.toml
+scripts/gates/land-escape-audits.toml
 src/bootstrap/Cargo.toml
 src/bootstrap/defaults/bootstrap.compiler.toml
 src/bootstrap/defaults/bootstrap.dist.toml
@@ -315,10 +571,12 @@ src/doc/rustc/book.toml
 src/doc/rustdoc/book.toml
 src/doc/unstable-book/book.toml
 src/etc/rust_analyzer_helix.toml
-src/librustdoc/askama.toml
+src/jobserver_utils/Cargo.toml
 src/librustdoc/Cargo.toml
+src/librustdoc/askama.toml
 src/llvm-project/clang/bindings/python/pyproject.toml
 src/llvm-project/llvm/utils/lit/pyproject.toml
+src/llvm-project/llvm/utils/llvm-testing-tools/pyproject.toml
 src/llvm-project/llvm/utils/mlgo-utils/pyproject.toml
 src/llvm-project/mlir/examples/standalone/pyproject.toml
 src/llvm-project/pyproject.toml
@@ -327,14 +585,17 @@ src/rustc-std-workspace/rustc-std-workspace-alloc/Cargo.toml
 src/rustc-std-workspace/rustc-std-workspace-core/Cargo.toml
 src/rustc-std-workspace/rustc-std-workspace-std/Cargo.toml
 src/rustdoc-json-types/Cargo.toml
+src/shim_utils/Cargo.toml
 src/tools/build-manifest/Cargo.toml
 src/tools/bump-stage0/Cargo.toml
 src/tools/cargotest/Cargo.toml
 src/tools/collect-license-metadata/Cargo.toml
 src/tools/compiletest/Cargo.toml
 src/tools/coverage-dump/Cargo.toml
-src/tools/error_index_generator/book_config.toml
+src/tools/enzyme/fortitude.toml
+src/tools/enzyme/fpm.toml
 src/tools/error_index_generator/Cargo.toml
+src/tools/error_index_generator/book_config.toml
 src/tools/features-status-dump/Cargo.toml
 src/tools/generate-copyright/Cargo.toml
 src/tools/generate-windows-sys/Cargo.toml
@@ -345,6 +606,7 @@ src/tools/linkchecker/Cargo.toml
 src/tools/lint-docs/Cargo.toml
 src/tools/lld-wrapper/Cargo.toml
 src/tools/llvm-bitcode-linker/Cargo.toml
+src/tools/miri/Cargo.toml
 src/tools/miri/bench-cargo-miri/backtraces/Cargo.toml
 src/tools/miri/bench-cargo-miri/big-allocs/Cargo.toml
 src/tools/miri/bench-cargo-miri/mse/Cargo.toml
@@ -357,14 +619,12 @@ src/tools/miri/bench-cargo-miri/string-replace/Cargo.toml
 src/tools/miri/bench-cargo-miri/unicode/Cargo.toml
 src/tools/miri/bench-cargo-miri/zip-equal/Cargo.toml
 src/tools/miri/cargo-miri/Cargo.toml
-src/tools/miri/Cargo.toml
 src/tools/miri/clippy.toml
 src/tools/miri/etc/rust_analyzer_helix.toml
 src/tools/miri/genmc-sys/Cargo.toml
 src/tools/miri/josh-sync.toml
 src/tools/miri/miri-script/Cargo.toml
-src/tools/miri/priroda/Cargo.toml
-src/tools/miri/priroda/rust-toolchain.toml
+src/tools/miri/rust-bors.toml
 src/tools/miri/rustfmt.toml
 src/tools/miri/test-cargo-miri/Cargo.toml
 src/tools/miri/test-cargo-miri/exported-symbol-dep/Cargo.toml
@@ -378,6 +638,7 @@ src/tools/miri/test-cargo-miri/proc-macro-crate/Cargo.toml
 src/tools/miri/test-cargo-miri/subcrate/Cargo.toml
 src/tools/miri/test-cargo-miri/test-local-crate-detection/Cargo.toml
 src/tools/miri/tests/deps/Cargo.toml
+src/tools/miri/tests/deps/cross-crate-items/Cargo.toml
 src/tools/miri/triagebot.toml
 src/tools/miropt-test-tools/Cargo.toml
 src/tools/opt-dist/Cargo.toml
@@ -394,6 +655,7 @@ src/tools/rust-analyzer/crates/cfg/Cargo.toml
 src/tools/rust-analyzer/crates/edition/Cargo.toml
 src/tools/rust-analyzer/crates/hir-def/Cargo.toml
 src/tools/rust-analyzer/crates/hir-expand/Cargo.toml
+src/tools/rust-analyzer/crates/hir-ide/Cargo.toml
 src/tools/rust-analyzer/crates/hir-ty/Cargo.toml
 src/tools/rust-analyzer/crates/hir/Cargo.toml
 src/tools/rust-analyzer/crates/ide-assists/Cargo.toml
@@ -415,7 +677,6 @@ src/tools/rust-analyzer/crates/proc-macro-srv/proc-macro-test/Cargo.toml
 src/tools/rust-analyzer/crates/proc-macro-srv/proc-macro-test/imp/Cargo.toml
 src/tools/rust-analyzer/crates/profile/Cargo.toml
 src/tools/rust-analyzer/crates/project-model/Cargo.toml
-src/tools/rust-analyzer/crates/query-group-macro/Cargo.toml
 src/tools/rust-analyzer/crates/rust-analyzer/Cargo.toml
 src/tools/rust-analyzer/crates/span/Cargo.toml
 src/tools/rust-analyzer/crates/stdx/Cargo.toml
@@ -445,9 +706,9 @@ src/tools/rustbook/Cargo.toml
 src/tools/rustdoc-gui-test/Cargo.toml
 src/tools/rustdoc-themes/Cargo.toml
 src/tools/targo/.cargo/config.toml
+src/tools/targo/Cargo.toml
 src/tools/targo/benches/benchsuite/Cargo.toml
 src/tools/targo/benches/capture/Cargo.toml
-src/tools/targo/Cargo.toml
 src/tools/targo/clippy.toml
 src/tools/targo/crates/build-rs-test-lib/Cargo.toml
 src/tools/targo/crates/build-rs/Cargo.toml
@@ -465,6 +726,7 @@ src/tools/targo/crates/mdman/Cargo.toml
 src/tools/targo/crates/resolver-tests/Cargo.toml
 src/tools/targo/crates/rustfix/Cargo.toml
 src/tools/targo/crates/semver-check/Cargo.toml
+src/tools/targo/crates/targo-core/Cargo.toml
 src/tools/targo/crates/xtask-build-man/Cargo.toml
 src/tools/targo/crates/xtask-bump-check/Cargo.toml
 src/tools/targo/crates/xtask-lint-docs/Cargo.toml
@@ -476,24 +738,29 @@ src/tools/targo/credential/cargo-credential-macos-keychain/Cargo.toml
 src/tools/targo/credential/cargo-credential-wincred/Cargo.toml
 src/tools/targo/credential/cargo-credential/Cargo.toml
 src/tools/targo/deny.toml
+src/tools/targo/doc/book/book.toml
+src/tools/targo/doc/contrib/book.toml
 src/tools/targo/rustfmt.toml
 src/tools/targo/src/doc/book.toml
 src/tools/targo/src/doc/contrib/book.toml
+src/tools/targo/tests/fixtures/native_check_all_targets/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/add-basic.in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/add_basic/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/add_multiple/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/add_no_vendored_package_with_alter_registry/in/.cargo/config.toml
 src/tools/targo/tests/testsuite/cargo_add/add_no_vendored_package_with_alter_registry/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/add_no_vendored_package_with_alter_registry/in/vendor/aa/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/add_no_vendored_package_with_alter_registry/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/add_no_vendored_package_with_vendor/in/.cargo/config.toml
 src/tools/targo/tests/testsuite/cargo_add/add_no_vendored_package_with_vendor/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/add_no_vendored_package_with_vendor/in/vendor/aa/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/add_no_vendored_package_with_vendor/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/add_toolchain/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/add-basic.in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/build/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/build_prefer_existing_version/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/build_prefer_existing_version/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/build_prefer_existing_version/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/build_prefer_existing_version/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/build/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/change_rename_target/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/change_rename_target/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/cyclic_features/out/Cargo.toml
@@ -502,6 +769,12 @@ src/tools/targo/tests/testsuite/cargo_add/deprecated_default_features/in/Cargo.t
 src/tools/targo/tests/testsuite/cargo_add/deprecated_default_features/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/deprecated_section/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/deprecated_section/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/in/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/in/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/out/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_features/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_features/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_features/in/primary/Cargo.toml
@@ -514,6 +787,7 @@ src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_optional/in/p
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_optional/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_optional/out/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_optional/out/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_path_base/in/.cargo/config.toml
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_path_base/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_path_base/in/deps/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_path_base/in/primary/Cargo.toml
@@ -526,13 +800,9 @@ src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_public/in/pri
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_public/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_public/out/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit_public/out/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/in/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/in/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/detect_workspace_inherit/out/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/dev/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/dev_build_conflict/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/dev_existing_path_base/in/.cargo/config.toml
 src/tools/targo/tests/testsuite/cargo_add/dev_existing_path_base/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/dev_existing_path_base/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/dev_existing_path_base/out/dependency/Cargo.toml
@@ -541,12 +811,12 @@ src/tools/targo/tests/testsuite/cargo_add/dev_prefer_existing_version/in/Cargo.t
 src/tools/targo/tests/testsuite/cargo_add/dev_prefer_existing_version/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/dev_prefer_existing_version/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/dev_prefer_existing_version/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/dev/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/dry_run/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/empty_dep_name/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/feature_suggestion_multiple/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/feature_suggestion_none/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/feature_suggestion_single/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/features/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/features_activated_over_limit/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/features_activated_over_limit/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/features_deactivated_over_limit/in/Cargo.toml
@@ -560,22 +830,33 @@ src/tools/targo/tests/testsuite/cargo_add/features_multiple_occurrences/out/Carg
 src/tools/targo/tests/testsuite/cargo_add/features_preserve/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/features_preserve/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/features_spaced_values/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/features_unknown_no_features/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/features_unknown/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/features/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/features_unknown_no_features/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/git/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/git_branch/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/git_conflicts_namever/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/git_dev/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/git_inferred_name_multiple/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/git_inferred_name/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/git_inferred_name_multiple/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/git_multiple_names/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/git_multiple_packages_features/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/git_registry/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/git_registry/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/git_rev/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/git_tag/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/git/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/infer_prerelease/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_default_features_2024_edition/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_default_features_2024_edition/in/bar/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_default_features_2024_edition/in/foo/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_default_features_2024_edition/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_default_features_2024_edition/out/bar/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_default_features_2024_edition/out/foo/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_no_default_features_2024_edition/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_no_default_features_2024_edition/in/bar/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_no_default_features_2024_edition/in/foo/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_no_default_features_2024_edition/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_no_default_features_2024_edition/out/bar/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/inherit_no_default_features_2024_edition/out/foo/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_arg/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_git_name/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_inherited_dependency/in/Cargo.toml
@@ -607,21 +888,15 @@ src/tools/targo/tests/testsuite/cargo_add/invalid_key_rename_inherit_dependency/
 src/tools/targo/tests/testsuite/cargo_add/invalid_manifest/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_manifest/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_name_external/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/invalid_path/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_path_name/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_path_name/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_path_name/out/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_path_name/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_path_self/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/invalid_path/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_target_empty/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/invalid_vers/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/in/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/in/optional/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/in/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/out/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/list_features/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/list_features_path/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/list_features_path/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/list_features_path/in/optional/Cargo.toml
@@ -629,7 +904,13 @@ src/tools/targo/tests/testsuite/cargo_add/list_features_path/in/primary/Cargo.to
 src/tools/targo/tests/testsuite/cargo_add/list_features_path/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/list_features_path/out/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/list_features_path/out/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/list_features/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/in/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/in/optional/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/in/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/out/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/list_features_path_no_default/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/locked_changed/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/locked_unchanged/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/locked_unchanged/out/Cargo.toml
@@ -657,29 +938,29 @@ src/tools/targo/tests/testsuite/cargo_add/no_optional/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/no_public/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/no_public/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_git/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/normalize_name_path/in/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/normalize_name_path/in/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/normalize_name_path/out/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/normalize_name_path/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_path_existing/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_path_existing/in/fuzzy_name/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_path_existing/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_path_existing/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_path_existing/out/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/normalize_name_path/in/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/normalize_name_path/in/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/normalize_name_path/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/normalize_name_path/out/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/normalize_name_registry/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_registry_existing/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_registry_existing/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_registry_yanked/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/normalize_name_registry/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_workspace_dep/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_workspace_dep/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_workspace_dep/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/normalize_name_workspace_dep/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/offline_empty_cache/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/optional/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_default_features_with_no_default_features/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_default_features_with_no_default_features/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_default_features/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_default_features/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_default_features_with_no_default_features/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_default_features_with_no_default_features/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_features/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_features/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_git_with_path/in/dependency/Cargo.toml
@@ -714,24 +995,25 @@ src/tools/targo/tests/testsuite/cargo_add/overwrite_name_noop/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_name_noop/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_name_noop/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_name_noop/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_no_default_features_with_default_features/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_no_default_features_with_default_features/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_no_default_features/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_no_default_features/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_no_optional_with_optional/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_no_optional_with_optional/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_no_default_features_with_default_features/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_no_default_features_with_default_features/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_no_optional/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_no_optional/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_no_public_with_public/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_no_public_with_public/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_no_optional_with_optional/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_no_optional_with_optional/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_no_public/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_no_public/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_no_public_with_public/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_no_public_with_public/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_optional/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_optional/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_optional_with_no_optional/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_optional_with_no_optional/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_optional_with_optional/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_optional_with_optional/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_optional/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_optional/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_path_base_with_version/in/.cargo/config.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_path_base_with_version/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_path_base_with_version/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_path_base_with_version/out/dependency/Cargo.toml
@@ -746,16 +1028,16 @@ src/tools/targo/tests/testsuite/cargo_add/overwrite_path_with_version/out/depend
 src/tools/targo/tests/testsuite/cargo_add/overwrite_path_with_version/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_preserves_inline_table/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_preserves_inline_table/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_public_with_no_public/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_public_with_no_public/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_public/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_public/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_public_with_no_public/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_public_with_no_public/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_rename_with_no_rename/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_rename_with_no_rename/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_rename_with_rename_noop/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_rename_with_rename_noop/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_rename_with_rename/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_rename_with_rename/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_rename_with_rename_noop/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_rename_with_rename_noop/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_version_with_git/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_version_with_git/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_version_with_path/in/dependency/Cargo.toml
@@ -764,18 +1046,28 @@ src/tools/targo/tests/testsuite/cargo_add/overwrite_version_with_path/out/depend
 src/tools/targo/tests/testsuite/cargo_add/overwrite_version_with_path/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_with_rename/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_with_rename/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/in/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/in/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep/out/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep/out/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/in/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/in/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/out/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/overwrite_workspace_dep_features/out/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path/in/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path/in/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path/out/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path/out/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path_base/in/.cargo/config.toml
+src/tools/targo/tests/testsuite/cargo_add/path_base/in/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path_base/in/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path_base/out/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path_base/out/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path_base_inferred_name/in/.cargo/config.toml
 src/tools/targo/tests/testsuite/cargo_add/path_base_inferred_name/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_base_inferred_name/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_base_inferred_name/out/dependency/Cargo.toml
@@ -784,14 +1076,14 @@ src/tools/targo/tests/testsuite/cargo_add/path_base_missing_base_path/in/primary
 src/tools/targo/tests/testsuite/cargo_add/path_base_missing_base_path/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_base_unstable/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_base_unstable/out/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path_base/in/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path_base/in/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path_base/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path_base/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_dev/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_dev/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_dev/out/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_dev/out/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path_inferred_name/in/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path_inferred_name/in/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path_inferred_name/out/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/path_inferred_name/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_inferred_name_conflicts_full_feature/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_inferred_name_conflicts_full_feature/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_inferred_name_conflicts_full_feature/in/optional/Cargo.toml
@@ -799,14 +1091,6 @@ src/tools/targo/tests/testsuite/cargo_add/path_inferred_name_conflicts_full_feat
 src/tools/targo/tests/testsuite/cargo_add/path_inferred_name_conflicts_full_feature/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_inferred_name_conflicts_full_feature/out/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/path_inferred_name_conflicts_full_feature/out/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path_inferred_name/in/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path_inferred_name/in/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path_inferred_name/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path_inferred_name/out/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path/in/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path/in/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/path/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/prefixed_v_in_version/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/preserve_dep_std_table/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/preserve_dep_std_table/out/Cargo.toml
@@ -820,10 +1104,10 @@ src/tools/targo/tests/testsuite/cargo_add/preserve_sorted/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/preserve_sorted/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/preserve_unsorted/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/preserve_unsorted/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/public_common_version/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/public_common_version/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/public/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/public/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/public_common_version/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/public_common_version/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/quiet/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/registry/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/registry/out/Cargo.toml
@@ -848,8 +1132,8 @@ src/tools/targo/tests/testsuite/cargo_add/rustc_older/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/rustc_older/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/sorted_table_with_dotted_item/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/sorted_table_with_dotted_item/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/target_cfg/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/target/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/target_cfg/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/unknown_inherited_feature/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/unknown_inherited_feature/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/unknown_inherited_feature/in/primary/Cargo.toml
@@ -863,18 +1147,18 @@ src/tools/targo/tests/testsuite/cargo_add/workspace_name/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/workspace_name/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/workspace_name/out/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/workspace_name/out/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/in/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/in/primary/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/out/dependency/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/workspace_path/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/workspace_path/in/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/workspace_path/in/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/workspace_path/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/workspace_path/out/dependency/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/workspace_path/out/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/in/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/in/primary/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/out/dependency/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_add/workspace_path_dev/out/primary/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_add/yanked/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_bench/no_keep_going/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/not_found/out/Cargo.toml
@@ -882,18 +1166,18 @@ src/tools/targo/tests/testsuite/cargo_info/path_dependency/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/path_dependency/in/crates/crate1/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/path_dependency/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/path_dependency/out/crates/crate1/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/in/crate1/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/in/crate2/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/out/crate1/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/out/crate2/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws/in/crate1/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws/in/crate2/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws/out/crate1/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws/out/crate2/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/in/crate1/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/in/crate2/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/out/crate1/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/pick_msrv_compatible_package_within_ws_and_use_msrv_from_ws/out/crate2/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/specify_version_within_ws_and_conflict_with_lockfile/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/specify_version_within_ws_and_match_with_lockfile/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/transitive_dependency_within_ws/in/Cargo.toml
@@ -908,34 +1192,40 @@ src/tools/targo/tests/testsuite/cargo_info/transitive_dependency_within_ws/out/c
 src/tools/targo/tests/testsuite/cargo_info/transitive_dependency_within_ws/out/crates/transitive1/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/transitive_dependency_within_ws/out/crates/transitive123/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/transitive_dependency_within_ws/out/crates/transitive2/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured_and_specified/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured_and_specified/in/crates/crate1/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured_and_specified/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured_and_specified/out/crates/crate1/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured/in/.cargo/config.toml
 src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured/in/crates/crate1/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured/out/.cargo/config.toml
 src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured/out/crates/crate1/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured_and_specified/in/.cargo/config.toml
+src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured_and_specified/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured_and_specified/in/crates/crate1/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured_and_specified/out/.cargo/config.toml
+src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured_and_specified/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/with_default_registry_configured_and_specified/out/crates/crate1/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/with_frozen_within_ws/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/with_locked_within_ws/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/with_locked_within_ws_and_pick_the_package/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/with_locked_within_ws_and_pick_the_package/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/with_locked_within_ws/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/within_workspace.in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/within_ws/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/within_ws_and_pick_ws_package/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/within_ws_and_pick_ws_package/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/within_ws_with_alternative_registry/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/within_ws_without_lockfile/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_info/within_ws_without_lockfile/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_info/within_ws/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/without_requiring_registry_auth/in/.cargo/config.toml
 src/tools/targo/tests/testsuite/cargo_info/without_requiring_registry_auth/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_info/without_requiring_registry_auth/out/.cargo/config.toml
 src/tools/targo/tests/testsuite/cargo_info/without_requiring_registry_auth/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/auto_git/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_init/bin_already_exists_explicit_nosrc/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/bin_already_exists_explicit/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_init/bin_already_exists_explicit_nosrc/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_init/bin_already_exists_implicit/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/bin_already_exists_implicit_namenosrc/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/bin_already_exists_implicit_namesrc/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/bin_already_exists_implicit_nosrc/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_init/bin_already_exists_implicit/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/creates_binary_when_both_binlib_present/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/creates_binary_when_instructed_and_has_lib_file/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/creates_library_when_instructed_and_has_bin_file/out/Cargo.toml
@@ -960,18 +1250,18 @@ src/tools/targo/tests/testsuite/cargo_init/mercurial_autodetect/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/path_contains_separator/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/pijul_autodetect/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/simple_bin/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_init/simple_git_ignore_exists/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/simple_git/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_init/simple_hg_ignore_exists/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_init/simple_git_ignore_exists/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/simple_hg/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_init/simple_hg_ignore_exists/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/simple_lib/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/with_argument/out/foo/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/workspace_add_member/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/workspace_add_member/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_init/workspace_add_member/out/crates/foo/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/add_members_to_non_workspace/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_new/add_members_to_non_workspace/out/bar/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/add_members_to_non_workspace/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_new/add_members_to_non_workspace/out/bar/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/add_members_to_workspace_format_previous_items/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/add_members_to_workspace_format_previous_items/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/add_members_to_workspace_format_previous_items/out/crates/foo/Cargo.toml
@@ -993,14 +1283,17 @@ src/tools/targo/tests/testsuite/cargo_new/add_members_to_workspace_with_members_
 src/tools/targo/tests/testsuite/cargo_new/add_members_to_workspace_with_members_glob/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/add_members_to_workspace_with_members_glob/out/crates/foo/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/add_members_to_workspace_without_members/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_new/add_members_to_workspace_without_members/out/bar/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/add_members_to_workspace_without_members/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_new/add_members_to_workspace_without_members/out/bar/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/ignore_current_dir_workspace/in/workspace/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/ignore_current_dir_workspace/out/out-of-workspace/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/ignore_current_dir_workspace/out/workspace/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_lints/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_lints/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_lints/out/crates/foo/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table.in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table/out/crates/foo/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table_with_edition/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table_with_edition/out/crates/foo/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table_with_registry/out/Cargo.toml
@@ -1008,22 +1301,19 @@ src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table_with_r
 src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table_without_version/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table_without_version/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table_without_version/out/crates/foo/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table.in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_new/inherit_workspace_package_table/out/crates/foo/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/not_inherit_workspace_package_table_if_not_members/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_new/not_inherit_workspace_package_table_if_not_members/out/bar/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_new/not_inherit_workspace_package_table_if_not_members/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_new/not_inherit_workspace_package_table_if_not_members/out/bar/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/avoid_empty_tables/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/build/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/dev/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/dry_run/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/gc_keep_used_patch/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/gc_keep_used_patch/in/serde_derive/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/gc_keep_used_patch/in/serde/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/gc_keep_used_patch/in/serde_derive/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/gc_keep_used_patch/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/gc_keep_used_patch/out/serde_derive/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/gc_keep_used_patch/out/serde/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/gc_keep_used_patch/out/serde_derive/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/gc_patch/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/gc_profile/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/gc_profile/out/Cargo.toml
@@ -1034,44 +1324,48 @@ src/tools/targo/tests/testsuite/cargo_remove/gc_replace/out/my-package/Cargo.tom
 src/tools/targo/tests/testsuite/cargo_remove/invalid_arg/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/invalid_dep/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/invalid_dep/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/invalid_package_multiple/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/invalid_package_multiple/out/dep-a/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/invalid_package_multiple/out/dep-b/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/invalid_package/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/invalid_package/out/dep-a/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/invalid_package/out/dep-b/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/invalid_package_multiple/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/invalid_package_multiple/out/dep-a/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/invalid_package_multiple/out/dep-b/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/invalid_section/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/invalid_section_dep/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/invalid_section_missing_flags/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/invalid_section_missing_flags/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/invalid_section/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/invalid_target_dep/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/invalid_target/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/invalid_target_dep/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/last_dep/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/last_dep/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/multiple_deps/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/multiple_dev/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/no_arg/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/offline/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/optional_dep_feature/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/optional_dep_feature_formatting/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/optional_dep_feature_formatting/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/optional_dep_feature/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/optional_feature/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/package/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/package/out/dep-a/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/package/out/dep-b/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/remove_basic/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/remove-basic.in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/remove-package.in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/remove-package.in/dep-a/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/remove-package.in/dep-b/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/remove-target.in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/remove_basic/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/skip_gc_glob_profile/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/skip_gc_glob_profile/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/target/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/target_build/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/target_dev/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/target/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/update_lock_file/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/update_lock_file/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/workspace/in/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/workspace/in/my-package/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/workspace/out/Cargo.toml
+src/tools/targo/tests/testsuite/cargo_remove/workspace/out/my-package/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/workspace_non_virtual/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/workspace_non_virtual/in/my-member/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/workspace_non_virtual/out/Cargo.toml
@@ -1082,15 +1376,11 @@ src/tools/targo/tests/testsuite/cargo_remove/workspace_preserved/in/my-package/C
 src/tools/targo/tests/testsuite/cargo_remove/workspace_preserved/out/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/workspace_preserved/out/my-other-package/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_remove/workspace_preserved/out/my-package/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/workspace/in/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/workspace/in/my-package/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/workspace/out/Cargo.toml
-src/tools/targo/tests/testsuite/cargo_remove/workspace/out/my-package/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_test/no_keep_going/in/Cargo.toml
 src/tools/targo/tests/testsuite/cargo_update/toolchain_pkgname/in/Cargo.toml
 src/tools/targo/tests/testsuite/mock-std/dep_test/Cargo.toml
-src/tools/targo/tests/testsuite/mock-std/library/alloc/Cargo.toml
 src/tools/targo/tests/testsuite/mock-std/library/Cargo.toml
+src/tools/targo/tests/testsuite/mock-std/library/alloc/Cargo.toml
 src/tools/targo/tests/testsuite/mock-std/library/compiler_builtins/Cargo.toml
 src/tools/targo/tests/testsuite/mock-std/library/core/Cargo.toml
 src/tools/targo/tests/testsuite/mock-std/library/panic_unwind/Cargo.toml
@@ -1107,35 +1397,37 @@ src/tools/test-float-parse/Cargo.toml
 src/tools/tidy/Cargo.toml
 src/tools/tidy/config/ruff.toml
 src/tools/tier-check/Cargo.toml
+src/tools/tippy/Cargo.toml
 src/tools/tippy/askama.toml
 src/tools/tippy/book/book.toml
-src/tools/tippy/Cargo.toml
+src/tools/tippy/clippy.toml
 src/tools/tippy/clippy_config/Cargo.toml
 src/tools/tippy/clippy_dev/Cargo.toml
 src/tools/tippy/clippy_dummy/Cargo.toml
-src/tools/tippy/clippy_lints_internal/Cargo.toml
 src/tools/tippy/clippy_lints/Cargo.toml
+src/tools/tippy/clippy_lints_internal/Cargo.toml
 src/tools/tippy/clippy_test_deps/Cargo.toml
 src/tools/tippy/clippy_utils/Cargo.toml
-src/tools/tippy/clippy.toml
 src/tools/tippy/declare_clippy_lint/Cargo.toml
 src/tools/tippy/lintcheck/Cargo.toml
-src/tools/tippy/lintcheck/ci_crates.toml
 src/tools/tippy/lintcheck/ci-config/clippy.toml
+src/tools/tippy/lintcheck/ci_crates.toml
 src/tools/tippy/lintcheck/lintcheck_crates.toml
 src/tools/tippy/lintcheck/test_sources.toml
 src/tools/tippy/rust-toolchain.toml
 src/tools/tippy/rustc_tools_util/Cargo.toml
 src/tools/tippy/rustfmt.toml
 src/tools/tippy/tests/clippy.toml
-src/tools/tippy/tests/ui-cargo/cargo_common_metadata/fail_publish_true/Cargo.toml
-src/tools/tippy/tests/ui-cargo/cargo_common_metadata/fail_publish/Cargo.toml
+src/tools/tippy/tests/example_integration_test/Cargo.toml
+src/tools/tippy/tests/example_integration_test/clippy.toml
 src/tools/tippy/tests/ui-cargo/cargo_common_metadata/fail/Cargo.toml
 src/tools/tippy/tests/ui-cargo/cargo_common_metadata/fail/clippy.toml
-src/tools/tippy/tests/ui-cargo/cargo_common_metadata/pass_publish_empty/Cargo.toml
-src/tools/tippy/tests/ui-cargo/cargo_common_metadata/pass_publish_false/Cargo.toml
+src/tools/tippy/tests/ui-cargo/cargo_common_metadata/fail_publish/Cargo.toml
+src/tools/tippy/tests/ui-cargo/cargo_common_metadata/fail_publish_true/Cargo.toml
 src/tools/tippy/tests/ui-cargo/cargo_common_metadata/pass/Cargo.toml
 src/tools/tippy/tests/ui-cargo/cargo_common_metadata/pass/clippy.toml
+src/tools/tippy/tests/ui-cargo/cargo_common_metadata/pass_publish_empty/Cargo.toml
+src/tools/tippy/tests/ui-cargo/cargo_common_metadata/pass_publish_false/Cargo.toml
 src/tools/tippy/tests/ui-cargo/cargo_rust_version/fail_both_diff/Cargo.toml
 src/tools/tippy/tests/ui-cargo/cargo_rust_version/fail_both_diff/clippy.toml
 src/tools/tippy/tests/ui-cargo/cargo_rust_version/fail_both_same/Cargo.toml
@@ -1153,14 +1445,20 @@ src/tools/tippy/tests/ui-cargo/cargo_rust_version/pass_clippy/clippy.toml
 src/tools/tippy/tests/ui-cargo/cargo_rust_version/pass_file_attr/Cargo.toml
 src/tools/tippy/tests/ui-cargo/cargo_rust_version/warn_both_diff/Cargo.toml
 src/tools/tippy/tests/ui-cargo/cargo_rust_version/warn_both_diff/clippy.toml
+src/tools/tippy/tests/ui-cargo/definition_in_module_root/fail_edge_cases/Cargo.toml
+src/tools/tippy/tests/ui-cargo/definition_in_module_root/fail_mod/Cargo.toml
+src/tools/tippy/tests/ui-cargo/definition_in_module_root/fail_path_attr/Cargo.toml
+src/tools/tippy/tests/ui-cargo/definition_in_module_root/pass_bin/Cargo.toml
+src/tools/tippy/tests/ui-cargo/definition_in_module_root/pass_lib_with_definitions/Cargo.toml
+src/tools/tippy/tests/ui-cargo/definition_in_module_root/pass_path_attr/Cargo.toml
 src/tools/tippy/tests/ui-cargo/duplicate_mod/fail/Cargo.toml
 src/tools/tippy/tests/ui-cargo/feature_name/fail/Cargo.toml
 src/tools/tippy/tests/ui-cargo/feature_name/pass/Cargo.toml
 src/tools/tippy/tests/ui-cargo/lint_groups_priority/fail/Cargo.toml
 src/tools/tippy/tests/ui-cargo/lint_groups_priority/pass/Cargo.toml
 src/tools/tippy/tests/ui-cargo/module_style/duplicated_mod_names_14697/Cargo.toml
-src/tools/tippy/tests/ui-cargo/module_style/fail_mod_remap/Cargo.toml
 src/tools/tippy/tests/ui-cargo/module_style/fail_mod/Cargo.toml
+src/tools/tippy/tests/ui-cargo/module_style/fail_mod_remap/Cargo.toml
 src/tools/tippy/tests/ui-cargo/module_style/fail_no_mod/Cargo.toml
 src/tools/tippy/tests/ui-cargo/module_style/inline_mod/Cargo.toml
 src/tools/tippy/tests/ui-cargo/module_style/pass_mod/Cargo.toml
@@ -1202,27 +1500,29 @@ src/tools/tippy/tests/ui-toml/absolute_paths/allow_long/clippy.toml
 src/tools/tippy/tests/ui-toml/absolute_paths/default/clippy.toml
 src/tools/tippy/tests/ui-toml/absolute_paths/no_short/clippy.toml
 src/tools/tippy/tests/ui-toml/allow_mixed_uninlined_format_args/clippy.toml
+src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/alphabetical_or_trait_item_order/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/bad_conf_1/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/bad_conf_2/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/bad_conf_3/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/bad_conf_4/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/bad_conf_5/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/bad_conf_6/clippy.toml
-src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/default_exp/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/default/clippy.toml
+src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/default_exp/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/only_enum/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/only_impl/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/only_trait/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/ord_in_2/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/ord_in_3/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/ord_within/clippy.toml
+src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/trait_definition_order/clippy.toml
 src/tools/tippy/tests/ui-toml/arbitrary_source_item_ordering/var_1/clippy.toml
 src/tools/tippy/tests/ui-toml/arithmetic_side_effects_allowed/clippy.toml
 src/tools/tippy/tests/ui-toml/array_size_threshold/clippy.toml
-src/tools/tippy/tests/ui-toml/await_holding_invalid_type_with_replacement/clippy.toml
 src/tools/tippy/tests/ui-toml/await_holding_invalid_type/clippy.toml
-src/tools/tippy/tests/ui-toml/bad_toml_type/clippy.toml
+src/tools/tippy/tests/ui-toml/await_holding_invalid_type_with_replacement/clippy.toml
 src/tools/tippy/tests/ui-toml/bad_toml/clippy.toml
+src/tools/tippy/tests/ui-toml/bad_toml_type/clippy.toml
 src/tools/tippy/tests/ui-toml/borrow_interior_mutable_const/clippy.toml
 src/tools/tippy/tests/ui-toml/check_incompatible_msrv_in_tests/default/clippy.toml
 src/tools/tippy/tests/ui-toml/check_incompatible_msrv_in_tests/enabled/clippy.toml
@@ -1237,9 +1537,9 @@ src/tools/tippy/tests/ui-toml/disallowed_names_replace/clippy.toml
 src/tools/tippy/tests/ui-toml/disallowed_script_idents/clippy.toml
 src/tools/tippy/tests/ui-toml/doc_valid_idents_append/clippy.toml
 src/tools/tippy/tests/ui-toml/doc_valid_idents_replace/clippy.toml
-src/tools/tippy/tests/ui-toml/duplicated_keys_deprecated_2/clippy.toml
-src/tools/tippy/tests/ui-toml/duplicated_keys_deprecated/clippy.toml
 src/tools/tippy/tests/ui-toml/duplicated_keys/clippy.toml
+src/tools/tippy/tests/ui-toml/duplicated_keys_deprecated/clippy.toml
+src/tools/tippy/tests/ui-toml/duplicated_keys_deprecated_2/clippy.toml
 src/tools/tippy/tests/ui-toml/enum_variant_size/clippy.toml
 src/tools/tippy/tests/ui-toml/excessive_nesting/clippy.toml
 src/tools/tippy/tests/ui-toml/excessive_precision/clippy.toml
@@ -1249,26 +1549,29 @@ src/tools/tippy/tests/ui-toml/extra_unused_type_parameters/clippy.toml
 src/tools/tippy/tests/ui-toml/fn_params_excessive_bools/clippy.toml
 src/tools/tippy/tests/ui-toml/functions_maxlines/clippy.toml
 src/tools/tippy/tests/ui-toml/good_toml_no_false_negatives/clippy.toml
+src/tools/tippy/tests/ui-toml/grouped_import_diagnostics/clippy.toml
 src/tools/tippy/tests/ui-toml/ifs_same_cond/clippy.toml
 src/tools/tippy/tests/ui-toml/impl_trait_in_params/clippy.toml
 src/tools/tippy/tests/ui-toml/indexing_slicing/clippy.toml
 src/tools/tippy/tests/ui-toml/invalid_min_rust_version/clippy.toml
 src/tools/tippy/tests/ui-toml/item_name_repetitions/allow_exact_repetitions/clippy.toml
-src/tools/tippy/tests/ui-toml/item_name_repetitions/allowed_prefixes_extend/clippy.toml
 src/tools/tippy/tests/ui-toml/item_name_repetitions/allowed_prefixes/clippy.toml
+src/tools/tippy/tests/ui-toml/item_name_repetitions/allowed_prefixes_extend/clippy.toml
 src/tools/tippy/tests/ui-toml/item_name_repetitions/threshold0/clippy.toml
 src/tools/tippy/tests/ui-toml/item_name_repetitions/threshold5/clippy.toml
 src/tools/tippy/tests/ui-toml/large_futures/clippy.toml
 src/tools/tippy/tests/ui-toml/large_include_file/clippy.toml
+src/tools/tippy/tests/ui-toml/large_stack_frames/clippy.toml
 src/tools/tippy/tests/ui-toml/large_stack_frames_for_macros/clippy.toml
 src/tools/tippy/tests/ui-toml/large_stack_frames_for_special_targets/clippy.toml
-src/tools/tippy/tests/ui-toml/large_stack_frames/clippy.toml
 src/tools/tippy/tests/ui-toml/large_types_passed_by_value/clippy.toml
 src/tools/tippy/tests/ui-toml/lint_decimal_readability/clippy.toml
+src/tools/tippy/tests/ui-toml/local_grouped_reexports/clippy.toml
 src/tools/tippy/tests/ui-toml/macro_metavars_in_unsafe/private/clippy.toml
 src/tools/tippy/tests/ui-toml/manual_let_else/clippy.toml
 src/tools/tippy/tests/ui-toml/max_suggested_slice_pattern_length/clippy.toml
 src/tools/tippy/tests/ui-toml/min_ident_chars/clippy.toml
+src/tools/tippy/tests/ui-toml/min_ident_chars_trait_impl/clippy.toml
 src/tools/tippy/tests/ui-toml/min_rust_version/clippy.toml
 src/tools/tippy/tests/ui-toml/missing_docs_in_private_items/allow_unused/clippy.toml
 src/tools/tippy/tests/ui-toml/missing_docs_in_private_items/crate_root/clippy.toml
@@ -1315,16 +1618,16 @@ src/tools/tippy/tests/ui-toml/type_repetition_in_bounds/clippy.toml
 src/tools/tippy/tests/ui-toml/undocumented_unsafe_blocks/default/clippy.toml
 src/tools/tippy/tests/ui-toml/undocumented_unsafe_blocks/disabled/clippy.toml
 src/tools/tippy/tests/ui-toml/unnecessary_box_returns/clippy.toml
-src/tools/tippy/tests/ui-toml/unwrap_used_allowed/clippy.toml
 src/tools/tippy/tests/ui-toml/unwrap_used/clippy.toml
+src/tools/tippy/tests/ui-toml/unwrap_used_allowed/clippy.toml
 src/tools/tippy/tests/ui-toml/upper_case_acronyms_aggressive/clippy.toml
 src/tools/tippy/tests/ui-toml/use_self/default/clippy.toml
 src/tools/tippy/tests/ui-toml/use_self/disabled/clippy.toml
 src/tools/tippy/tests/ui-toml/useless_vec/clippy.toml
 src/tools/tippy/tests/ui-toml/vec_box_sized/clippy.toml
 src/tools/tippy/tests/ui-toml/verbose_bit_mask/clippy.toml
-src/tools/tippy/tests/ui-toml/wildcard_imports_whitelist/clippy.toml
 src/tools/tippy/tests/ui-toml/wildcard_imports/clippy.toml
+src/tools/tippy/tests/ui-toml/wildcard_imports_whitelist/clippy.toml
 src/tools/tippy/tests/ui-toml/zero_single_char_names/clippy.toml
 src/tools/tippy/tests/ui/crashes/third-party/clippy.toml
 src/tools/tippy/tests/workspace_test/Cargo.toml
@@ -1338,20 +1641,25 @@ src/tools/tippy/triagebot.toml
 src/tools/trustdoc/Cargo.toml
 src/tools/trustfmt/Cargo.toml
 src/tools/trustfmt/check_diff/Cargo.toml
+src/tools/trustfmt/ci/Cargo.toml
 src/tools/trustfmt/config_proc_macro/Cargo.toml
-src/tools/trustfmt/Makefile.toml
+src/tools/trustfmt/josh-sync.toml
+src/tools/trustfmt/rust-toolchain.toml
 src/tools/trustfmt/rustfmt.toml
 src/tools/trustfmt/tests/cargo-fmt/source/divergent-crate-dir-names/Cargo.toml
 src/tools/trustfmt/tests/cargo-fmt/source/divergent-crate-dir-names/dependency-dir-name/Cargo.toml
 src/tools/trustfmt/tests/cargo-fmt/source/divergent-crate-dir-names/dependency-dir-name/subdep-dir-name/Cargo.toml
 src/tools/trustfmt/tests/cargo-fmt/source/issue_3164/Cargo.toml
+src/tools/trustfmt/tests/cargo-fmt/source/issues_6517/Cargo.toml
+src/tools/trustfmt/tests/cargo-fmt/source/issues_6517/inner_bin/Cargo.toml
+src/tools/trustfmt/tests/cargo-fmt/source/issues_6517/inner_lib/Cargo.toml
 src/tools/trustfmt/tests/cargo-fmt/source/workspaces/path-dep-above/e/Cargo.toml
+src/tools/trustfmt/tests/cargo-fmt/source/workspaces/path-dep-above/ws/Cargo.toml
 src/tools/trustfmt/tests/cargo-fmt/source/workspaces/path-dep-above/ws/a/Cargo.toml
 src/tools/trustfmt/tests/cargo-fmt/source/workspaces/path-dep-above/ws/a/d/Cargo.toml
 src/tools/trustfmt/tests/cargo-fmt/source/workspaces/path-dep-above/ws/a/d/f/Cargo.toml
 src/tools/trustfmt/tests/cargo-fmt/source/workspaces/path-dep-above/ws/b/Cargo.toml
 src/tools/trustfmt/tests/cargo-fmt/source/workspaces/path-dep-above/ws/c/Cargo.toml
-src/tools/trustfmt/tests/cargo-fmt/source/workspaces/path-dep-above/ws/Cargo.toml
 src/tools/trustfmt/tests/config/disable_all_formatting.toml
 src/tools/trustfmt/tests/config/issue-1111.toml
 src/tools/trustfmt/tests/config/issue-2641.toml
@@ -1360,6 +1668,9 @@ src/tools/trustfmt/tests/config/issue-5801-v1.toml
 src/tools/trustfmt/tests/config/issue-5801-v2.toml
 src/tools/trustfmt/tests/config/issue-5816.toml
 src/tools/trustfmt/tests/config/issue-6302.toml
+src/tools/trustfmt/tests/config/issue_4660/Cargo.toml
+src/tools/trustfmt/tests/config/issue_4660/configs/rustfmt.hard_tabs.toml
+src/tools/trustfmt/tests/config/issue_4660/rustfmt.toml
 src/tools/trustfmt/tests/config/skip_children.toml
 src/tools/trustfmt/tests/config/small_tabs.toml
 src/tools/trustfmt/tests/config/style-edition/just-style-edition/rustfmt.toml
@@ -1376,22 +1687,17 @@ src/tools/unicode-table-generator/Cargo.toml
 src/tools/unstable-book-gen/Cargo.toml
 src/tools/wasm-component-ld/Cargo.toml
 src/tools/x/Cargo.toml
+src/tpde/REUSE.toml
 targo-trust/Cargo.toml
 targo-trust/tests/fixtures/creusot-equiv/native/Cargo.toml
 targo-trust/tests/fixtures/creusot-equiv/pearlite/Cargo.toml
 targo-trust/tests/fixtures/creusot-equiv/proposed/Cargo.toml
 targo-trust/tests/fixtures/fabric/Cargo.toml
+tests/corpora.toml
+tests/fixtures/determinism/Cargo.toml
 tests/fixtures/installed-serde-derive/Cargo.toml
-tests/js262/baseline.toml
-tests/js262/coverage-async.toml
-tests/js262/coverage-module.toml
-tests/js262/coverage.toml
-tests/js262/divergence-audit.toml
-tests/js262/S-async.toml
-tests/js262/S-module.toml
-tests/js262/S-ts.toml
-tests/js262/S0.toml
-tests/js262/test-exceptions.toml
+tests/fixtures/instance-discharge/Cargo.toml
+tests/fixtures/obligation-ids/Cargo.toml
 tests/run-make-cargo/amdgpu-lto/Cargo.toml
 tests/run-make-cargo/apple-slow-tls/tls_test/Cargo.toml
 tests/run-make-cargo/compiler-builtins/Cargo.toml
@@ -1426,27 +1732,25 @@ tests/rustdoc-gui/src/lib2/implementors/Cargo.toml
 tests/rustdoc-gui/src/link_to_definition/Cargo.toml
 tests/rustdoc-gui/src/macro_expansion/Cargo.toml
 tests/rustdoc-gui/src/proc_macro_test/Cargo.toml
-tests/rustdoc-gui/src/scrape_examples_ice/Cargo.toml
 tests/rustdoc-gui/src/scrape_examples/Cargo.toml
+tests/rustdoc-gui/src/scrape_examples_ice/Cargo.toml
 tests/rustdoc-gui/src/settings/.cargo/config.toml
 tests/rustdoc-gui/src/settings/Cargo.toml
 tests/rustdoc-gui/src/staged_api/Cargo.toml
 tests/rustdoc-gui/src/test_docs/Cargo.toml
 tests/rustdoc-gui/src/theme_css/Cargo.toml
+tests/self-proof/strict-pass-frontier/Cargo.toml
+tests/test-plans/crates.toml
 tests/trust-added/compiletest-exceptions.toml
 tests/trust-added/manifest.toml
 tests/trust-comprehensive/divergences.toml
+tests/two-language-programs/r13_package_unverified_run/Cargo.toml
+tests/two-language-programs/r14_package_trust_build/Cargo.toml
 tests/upstream-rust/baseline.toml
 tests/upstream-rust/divergence-audit.toml
 tests/upstream-rust/exceptions.toml
-tests/upstream-rust/fixtures/baseline.seed.toml
-tests/upstream-rust/fixtures/exceptions.seed.toml
-tests/upstream-rust/fixtures/gate-wiring.seed.toml
 tests/upstream-rust/fixtures/porting-cli-rust.seed.toml
-tests/upstream-rust/fixtures/upstream-fixes.seed.toml
 tests/upstream-rust/patches.toml
+tests/upstream-rust/test-exception-lanes.toml
 tests/upstream-rust/test-exceptions.toml
 tests/upstream-rust/upstream-fixes.toml
-tools/ts2rust/_crate/Cargo.toml
-trust-conformance/external/dterm/crates/dterm-alloc/Cargo.toml
-trust-conformance/external/dterm/crates/dterm-core-ffi/Cargo.toml

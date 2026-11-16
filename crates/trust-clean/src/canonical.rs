@@ -28,13 +28,48 @@ const MAGIC: &[u8; 4] = b"tVC1";
 /// The output includes only the VC kind and formula (the logical content).
 /// Source location and function name are excluded. This makes fingerprints
 /// stable across code movement and renaming.
+///
+/// Consequently this lane binds ONLY the kind and the formula: no function, location or
+/// obligation record enters these bytes (nor the fingerprint derived from them), so a
+/// certificate keyed on them carries no row-level identity — two rows with equal kind
+/// and formula are indistinguishable here. A consumer that needs row identity (the TINV
+/// step-10 consumer, `docs/KNOWN_HAZARDS.md`) must bind it before trusting this lane.
 #[must_use]
 pub fn canonical_vc_bytes(vc: &VerificationCondition) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
-    buf.extend_from_slice(MAGIC);
-    encode_vc_kind(&vc.kind, &mut buf);
-    encode_formula(&vc.formula, &mut buf);
+    canonical_vc_bytes_into(vc, &mut buf);
     buf
+}
+
+/// Encode `vc` into `buf` after clearing it, reusing `buf`'s existing heap allocation.
+pub fn canonical_vc_bytes_into(vc: &VerificationCondition, buf: &mut Vec<u8>) {
+    buf.clear();
+    buf.extend_from_slice(MAGIC);
+    encode_vc_kind(&vc.kind, buf);
+    encode_formula(&vc.formula, buf);
+}
+
+/// Borrow the canonical byte encoding of `vc` from a thread-local scratch buffer
+/// (falling back to a fresh `Vec<u8>` only on re-entrant borrows), avoiding
+/// per-call heap allocations in `compute_vc_fingerprint` and `verify_certificate`.
+pub(crate) fn with_canonical_vc_bytes<R>(
+    vc: &VerificationCondition,
+    f: impl FnOnce(&[u8]) -> R,
+) -> R {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<u8>> =
+            std::cell::RefCell::new(Vec::with_capacity(512));
+    }
+    SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buf) => {
+            canonical_vc_bytes_into(vc, &mut buf);
+            f(&buf)
+        }
+        Err(_) => {
+            let owned = canonical_vc_bytes(vc);
+            f(&owned)
+        }
+    })
 }
 
 /// Encode a VcKind into canonical bytes.
@@ -167,6 +202,26 @@ fn encode_vc_kind(kind: &VcKind, buf: &mut Vec<u8>) {
         VcKind::UnsafeOperation { desc } => {
             buf.push(0x2b);
             encode_str(desc, buf);
+        }
+        // TINV: the next unused tag (0x20-0x23 are retired, never reuse them). The point
+        // byte is trust-types' frozen `canonical_byte`, never a local match.
+        // The whole row identity: two rows that differ in any field (another conjunct,
+        // another root, another edge part of a split join) never share an identity.
+        VcKind::TypeInvariant { ty, point, site, conjunct, ordinal, edge } => {
+            buf.push(0x2c);
+            encode_str(ty, buf);
+            buf.push(point.canonical_byte());
+            buf.extend_from_slice(&(site.block as u64).to_le_bytes());
+            buf.extend_from_slice(&(site.statement_index as u64).to_le_bytes());
+            buf.extend_from_slice(&conjunct.to_le_bytes());
+            buf.extend_from_slice(&ordinal.to_le_bytes());
+            match edge {
+                None => buf.push(0),
+                Some(p) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&(*p as u64).to_le_bytes());
+                }
+            }
         }
         _ => {
             buf.push(0xFF); /* unknown Ty variant */
@@ -475,6 +530,14 @@ fn encode_formula(formula: &Formula, buf: &mut Vec<u8>) {
             encode_formula(index, buf);
             encode_formula(value, buf);
         }
+        // `((as const (Array I E)) v)`: both carried sorts are part of the
+        // term's identity, then the value.
+        Formula::ConstArray { index_sort, elem_sort, value } => {
+            buf.push(0xA2);
+            encode_sort(index_sort, buf);
+            encode_sort(elem_sort, buf);
+            encode_formula(value, buf);
+        }
         _ => {
             buf.push(0xFF); /* unknown Ty variant */
         }
@@ -751,5 +814,94 @@ mod tests {
         );
         // Must be deterministic
         assert_eq!(bytes, canonical_vc_bytes(&vc));
+    }
+
+    /// TINV: the 0x2C arm carries the whole row identity (`ty`, `point`, `site`,
+    /// `conjunct`, `ordinal`, `edge`), so two TINV obligations that differ in any one of
+    /// them never share an identity, and none collapses onto the payload-free 0xFF of the
+    /// unlisted kinds.
+    #[test]
+    fn type_invariant_canonical_bytes_are_lossless() {
+        let row = |ty: &str,
+                   point: TypeInvariantPoint,
+                   block: usize,
+                   stmt: usize,
+                   conjunct: u32,
+                   ordinal: u32,
+                   edge: Option<usize>| {
+            VerificationCondition {
+                kind: VcKind::TypeInvariant {
+                    ty: ty.into(),
+                    point,
+                    site: TypeInvariantSite { block, statement_index: stmt },
+                    conjunct,
+                    ordinal,
+                    edge,
+                },
+                function: "f".into(),
+                location: SourceSpan::default(),
+                formula: Formula::Bool(false),
+                contract_metadata: None,
+                obligation: None,
+            }
+        };
+        let tinv = |ty: &str, point: TypeInvariantPoint, block: usize, stmt: usize| {
+            row(ty, point, block, stmt, 0, 0, None)
+        };
+        let base = canonical_vc_bytes(&tinv("a::S", TypeInvariantPoint::Call, 1, 0));
+        assert_eq!(base[4], 0x2c, "the TINV kind tag follows the magic");
+        for other in [
+            tinv("b::S", TypeInvariantPoint::Call, 1, 0),
+            tinv("a::S", TypeInvariantPoint::Return, 1, 0),
+            tinv("a::S", TypeInvariantPoint::Call, 2, 0),
+            tinv("a::S", TypeInvariantPoint::Call, 1, 1),
+            row("a::S", TypeInvariantPoint::Call, 1, 0, 1, 0, None),
+            row("a::S", TypeInvariantPoint::Call, 1, 0, 0, 1, None),
+            row("a::S", TypeInvariantPoint::Call, 1, 0, 0, 0, Some(0)),
+            row("a::S", TypeInvariantPoint::Call, 1, 0, 0, 0, Some(1)),
+        ] {
+            assert_ne!(base, canonical_vc_bytes(&other), "{:?}", other.kind);
+        }
+        let mut invariant = tinv("a::S", TypeInvariantPoint::Call, 1, 0);
+        invariant.kind = VcKind::ContractInvariant { expression: "x".into() };
+        assert_ne!(base, canonical_vc_bytes(&invariant));
+    }
+
+    #[test]
+    fn wave493_with_canonical_vc_bytes_matches_owned_and_reentrant_borrow() {
+        let vc_a = VerificationCondition {
+            kind: VcKind::ArithmeticOverflow {
+                op: BinOp::Add,
+                operand_tys: (Ty::usize(), Ty::usize()),
+            },
+            function: "fa".into(),
+            location: SourceSpan::default(),
+            formula: Formula::Add(
+                Box::new(Formula::Var("x".into(), Sort::Int)),
+                Box::new(Formula::Int(7)),
+            ),
+            contract_metadata: None,
+            obligation: None,
+        };
+        let vc_b = VerificationCondition {
+            kind: VcKind::DivisionByZero,
+            function: "fb".into(),
+            location: SourceSpan::default(),
+            formula: Formula::Not(Box::new(Formula::Eq(
+                Box::new(Formula::Var("d".into(), Sort::Int)),
+                Box::new(Formula::Int(0)),
+            ))),
+            contract_metadata: None,
+            obligation: None,
+        };
+        let owned_a = canonical_vc_bytes(&vc_a);
+        let owned_b = canonical_vc_bytes(&vc_b);
+        with_canonical_vc_bytes(&vc_a, |slice_a| {
+            assert_eq!(slice_a, owned_a.as_slice());
+            with_canonical_vc_bytes(&vc_b, |slice_b| {
+                assert_eq!(slice_b, owned_b.as_slice());
+            });
+            assert_eq!(slice_a, owned_a.as_slice());
+        });
     }
 }

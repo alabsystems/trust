@@ -1,0 +1,42 @@
+// Source of the `stamped_genuine_core/*_family_*.json` dumps (wave 23, 2026-10-11).
+// `fakecore` is a verify-off `--crate-name core -C metadata=fakecore` rlib
+// (`pub fn hello() -> u32 { 7 }`); with it in the graph the extractor stamps the
+// GENUINE core's paths `__trust_crate@414739228a72f04f::core::…`. Built with the
+// stage 1 of `5911b1325f`: `--edition 2021 -Ztrust-verify=on -Ztrust-policy=advisory
+// --crate-type lib --extern fakecore=<dir>/libcore.rlib -Ztrust-dump=mir-only:<dir>`.
+extern crate fakecore as _;
+pub fn ilog2_family_unguarded(x: u32) -> u32 {
+    x.ilog2()
+}
+pub fn ilog2_family_guarded(x: u32) -> u32 {
+    if x > 0 { x.ilog2() } else { 0 }
+}
+pub fn strict_add_family_unguarded(a: u32, b: u32) -> u32 {
+    a.strict_add(b)
+}
+pub fn strict_add_family_guarded(a: u32, b: u32) -> u32 {
+    if a < 1000 && b < 1000 { a.strict_add(b) } else { 0 }
+}
+pub fn clamp_family_unguarded(x: i32, lo: i32, hi: i32) -> i32 {
+    x.clamp(lo, hi)
+}
+pub fn clamp_family_guarded(x: i32, lo: i32, hi: i32) -> i32 {
+    if lo <= hi { x.clamp(lo, hi) } else { lo }
+}
+pub fn next_power_of_two_family_unguarded(x: u32) -> u32 {
+    x.next_power_of_two()
+}
+pub fn next_power_of_two_family_guarded(x: u32) -> u32 {
+    if x <= 1024 { x.next_power_of_two() } else { 0 }
+}
+pub fn strict_neg_family_unguarded(x: i32) -> i32 {
+    x.strict_neg()
+}
+pub fn strict_neg_family_guarded(x: i32) -> i32 {
+    if x != i32::MIN { x.strict_neg() } else { 0 }
+}
+// The disclosed COST: a literal `Duration` sum whose constructors are stamped is not
+// read as decided (the literal reader is a grant and stays authenticated).
+pub fn dur_lit_add_family_cost() -> std::time::Duration {
+    std::time::Duration::from_secs(1) + std::time::Duration::from_secs(2)
+}

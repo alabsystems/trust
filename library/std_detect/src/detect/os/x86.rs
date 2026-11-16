@@ -121,6 +121,8 @@ pub(crate) fn detect_features() -> cache::Initializer {
         enable(extended_features_ecx, 8, Feature::gfni);
         enable(extended_features_ecx, 9, Feature::vaes);
         enable(extended_features_ecx, 10, Feature::vpclmulqdq);
+        enable(extended_features_ecx, 27, Feature::movdiri);
+        enable(extended_features_ecx, 28, Feature::movdir64b);
 
         enable(extended_features_ebx, 3, Feature::bmi1);
         enable(extended_features_ebx, 8, Feature::bmi2);
@@ -216,7 +218,6 @@ pub(crate) fn detect_features() -> cache::Initializer {
                             __cpuid_count(0x1e_u32, 1);
 
                         enable(amx_feature_flags_eax, 4, Feature::amx_fp8);
-                        enable(amx_feature_flags_eax, 6, Feature::amx_tf32);
                         enable(amx_feature_flags_eax, 7, Feature::amx_avx512);
                         enable(amx_feature_flags_eax, 8, Feature::amx_movrs);
                     }

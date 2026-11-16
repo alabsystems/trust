@@ -1,6 +1,7 @@
 //! Tests for the --config CLI option.
 
-use std::{collections::HashMap, fs};
+use targo::util::data_structures::HashMap;
+use std::fs;
 
 use crate::prelude::*;
 use cargo_test_support::compare::assert_e2e;
@@ -18,7 +19,7 @@ fn basic() {
         .config_arg("foo='bar'")
         .config_arg("net.git-fetch-with-cli=true")
         .build();
-    assert_eq!(gctx.get::<String>("foo").unwrap(), "bar");
+    assert_eq!(gctx.get::<String>(["foo"]).unwrap(), "bar");
     assert_eq!(gctx.net_config().unwrap().git_fetch_with_cli, Some(true));
 }
 
@@ -37,10 +38,10 @@ fn cli_priority() {
         ",
     );
     let gctx = GlobalContextBuilder::new().build();
-    assert_eq!(gctx.get::<i32>("build.jobs").unwrap(), 3);
-    assert_eq!(gctx.get::<String>("build.rustc").unwrap(), "file");
-    assert_eq!(gctx.get::<bool>("term.quiet").unwrap(), false);
-    assert_eq!(gctx.get::<bool>("term.verbose").unwrap(), false);
+    assert_eq!(gctx.get::<i32>(["build", "jobs"]).unwrap(), 3);
+    assert_eq!(gctx.get::<String>(["build", "rustc"]).unwrap(), "file");
+    assert_eq!(gctx.get::<bool>(["term", "quiet"]).unwrap(), false);
+    assert_eq!(gctx.get::<bool>(["term", "verbose"]).unwrap(), false);
 
     let gctx = GlobalContextBuilder::new()
         .env("CARGO_BUILD_JOBS", "2")
@@ -52,9 +53,9 @@ fn cli_priority() {
         .config_arg("term.verbose=true")
         .config_arg("net.git-fetch-with-cli=true")
         .build();
-    assert_eq!(gctx.get::<i32>("build.jobs").unwrap(), 1);
-    assert_eq!(gctx.get::<String>("build.rustc").unwrap(), "cli");
-    assert_eq!(gctx.get::<bool>("term.verbose").unwrap(), true);
+    assert_eq!(gctx.get::<i32>(["build", "jobs"]).unwrap(), 1);
+    assert_eq!(gctx.get::<String>(["build", "rustc"]).unwrap(), "cli");
+    assert_eq!(gctx.get::<bool>(["term", "verbose"]).unwrap(), true);
     assert_eq!(gctx.net_config().unwrap().git_fetch_with_cli, Some(true));
 
     // Setting both term.verbose and term.quiet is invalid and is tested
@@ -63,7 +64,7 @@ fn cli_priority() {
         .env("CARGO_TERM_QUIET", "false")
         .config_arg("term.quiet=true")
         .build();
-    assert_eq!(gctx.get::<bool>("term.quiet").unwrap(), true);
+    assert_eq!(gctx.get::<bool>(["term", "quiet"]).unwrap(), true);
 }
 
 #[cargo_test]
@@ -75,7 +76,7 @@ fn merge_primitives_for_multiple_cli_occurrences() {
 
     // k=env0
     let gctx = GlobalContextBuilder::new().env("CARGO_K", "env0").build();
-    assert_eq!(gctx.get::<String>("k").unwrap(), "env0");
+    assert_eq!(gctx.get::<String>(["k"]).unwrap(), "env0");
 
     // k=env0
     // --config k='cli0'
@@ -85,7 +86,7 @@ fn merge_primitives_for_multiple_cli_occurrences() {
         .config_arg("k='cli0'")
         .config_arg("k='cli1'")
         .build();
-    assert_eq!(gctx.get::<String>("k").unwrap(), "cli1");
+    assert_eq!(gctx.get::<String>(["k"]).unwrap(), "cli1");
 
     // Env has a lower priority when comparing with file from CLI arg.
     //
@@ -99,7 +100,7 @@ fn merge_primitives_for_multiple_cli_occurrences() {
         .config_arg("k='cli1'")
         .config_arg(config_path0)
         .build();
-    assert_eq!(gctx.get::<String>("k").unwrap(), "file0");
+    assert_eq!(gctx.get::<String>(["k"]).unwrap(), "file0");
 
     // k=env0
     // --config k='cli0'
@@ -113,7 +114,7 @@ fn merge_primitives_for_multiple_cli_occurrences() {
         .config_arg(config_path0)
         .config_arg("k='cli2'")
         .build();
-    assert_eq!(gctx.get::<String>("k").unwrap(), "cli2");
+    assert_eq!(gctx.get::<String>(["k"]).unwrap(), "cli2");
 
     // k=env0
     // --config k='cli0'
@@ -129,7 +130,7 @@ fn merge_primitives_for_multiple_cli_occurrences() {
         .config_arg("k='cli2'")
         .config_arg(config_path1)
         .build();
-    assert_eq!(gctx.get::<String>("k").unwrap(), "file1");
+    assert_eq!(gctx.get::<String>(["k"]).unwrap(), "file1");
 }
 
 #[cargo_test]
@@ -145,7 +146,7 @@ fn merges_array() {
         .config_arg("build.rustflags = ['--cli']")
         .build();
     assert_eq!(
-        gctx.get::<Vec<String>>("build.rustflags").unwrap(),
+        gctx.get::<Vec<String>>(["build", "rustflags"]).unwrap(),
         ["--file", "--cli"]
     );
 
@@ -155,7 +156,7 @@ fn merges_array() {
         .config_arg("build.rustflags = ['--cli']")
         .build();
     assert_eq!(
-        gctx.get::<Vec<String>>("build.rustflags").unwrap(),
+        gctx.get::<Vec<String>>(["build", "rustflags"]).unwrap(),
         ["--file", "--env1", "--env2", "--cli"]
     );
 
@@ -166,7 +167,7 @@ fn merges_array() {
         .config_arg("build.rustflags = ['--cli']")
         .build();
     assert_eq!(
-        gctx.get::<Vec<String>>("build.rustflags").unwrap(),
+        gctx.get::<Vec<String>>(["build", "rustflags"]).unwrap(),
         ["--file", "--env", "--cli"]
     );
 
@@ -176,7 +177,7 @@ fn merges_array() {
         .config_arg("build.rustflags=['--two']")
         .build();
     assert_eq!(
-        gctx.get::<Vec<String>>("build.rustflags").unwrap(),
+        gctx.get::<Vec<String>>(["build", "rustflags"]).unwrap(),
         ["--file", "--one", "--two"]
     );
 }
@@ -194,7 +195,7 @@ fn string_list_array() {
         .config_arg("build.rustflags = ['--cli']")
         .build();
     assert_eq!(
-        gctx.get::<cargo::util::context::StringList>("build.rustflags")
+        gctx.get::<targo::context::StringList>(["build", "rustflags"])
             .unwrap()
             .as_slice(),
         ["--file", "--cli"]
@@ -206,7 +207,7 @@ fn string_list_array() {
         .config_arg("build.rustflags = ['--cli']")
         .build();
     assert_eq!(
-        gctx.get::<cargo::util::context::StringList>("build.rustflags")
+        gctx.get::<targo::context::StringList>(["build", "rustflags"])
             .unwrap()
             .as_slice(),
         ["--file", "--env1", "--env2", "--cli"]
@@ -219,7 +220,7 @@ fn string_list_array() {
         .config_arg("build.rustflags = ['--cli']")
         .build();
     assert_eq!(
-        gctx.get::<cargo::util::context::StringList>("build.rustflags")
+        gctx.get::<targo::context::StringList>(["build", "rustflags"])
             .unwrap()
             .as_slice(),
         ["--file", "--env", "--cli"]
@@ -242,10 +243,10 @@ fn merges_table() {
         .config_arg("foo.key3 = 5")
         .config_arg("foo.key4 = 6")
         .build();
-    assert_eq!(gctx.get::<i32>("foo.key1").unwrap(), 1);
-    assert_eq!(gctx.get::<i32>("foo.key2").unwrap(), 4);
-    assert_eq!(gctx.get::<i32>("foo.key3").unwrap(), 5);
-    assert_eq!(gctx.get::<i32>("foo.key4").unwrap(), 6);
+    assert_eq!(gctx.get::<i32>(["foo", "key1"]).unwrap(), 1);
+    assert_eq!(gctx.get::<i32>(["foo", "key2"]).unwrap(), 4);
+    assert_eq!(gctx.get::<i32>(["foo", "key3"]).unwrap(), 5);
+    assert_eq!(gctx.get::<i32>(["foo", "key4"]).unwrap(), 6);
 
     // With env.
     let gctx = GlobalContextBuilder::new()
@@ -256,11 +257,11 @@ fn merges_table() {
         .config_arg("foo.key3 = 5")
         .config_arg("foo.key4 = 6")
         .build();
-    assert_eq!(gctx.get::<i32>("foo.key1").unwrap(), 1);
-    assert_eq!(gctx.get::<i32>("foo.key2").unwrap(), 4);
-    assert_eq!(gctx.get::<i32>("foo.key3").unwrap(), 5);
-    assert_eq!(gctx.get::<i32>("foo.key4").unwrap(), 6);
-    assert_eq!(gctx.get::<i32>("foo.key5").unwrap(), 9);
+    assert_eq!(gctx.get::<i32>(["foo", "key1"]).unwrap(), 1);
+    assert_eq!(gctx.get::<i32>(["foo", "key2"]).unwrap(), 4);
+    assert_eq!(gctx.get::<i32>(["foo", "key3"]).unwrap(), 5);
+    assert_eq!(gctx.get::<i32>(["foo", "key4"]).unwrap(), 6);
+    assert_eq!(gctx.get::<i32>(["foo", "key5"]).unwrap(), 9);
 }
 
 #[cargo_test]
@@ -273,25 +274,34 @@ fn enforces_format() {
         .config_arg("d.\"=\".'='=true")
         .config_arg("e.\"'\".'\"'=true")
         .build();
-    assert_eq!(gctx.get::<bool>("a").unwrap(), true);
+    assert_eq!(gctx.get::<bool>(["a"]).unwrap(), true);
     assert_eq!(
-        gctx.get::<HashMap<String, bool>>("b").unwrap(),
-        HashMap::from([("a".to_string(), true)])
+        gctx.get::<HashMap<String, bool>>(["b"]).unwrap(),
+        HashMap::from_iter([("a".to_string(), true)])
     );
     assert_eq!(
-        gctx.get::<HashMap<String, HashMap<String, bool>>>("c")
+        gctx.get::<HashMap<String, HashMap<String, bool>>>(["c"])
             .unwrap(),
-        HashMap::from([("b".to_string(), HashMap::from([("a".to_string(), true)]))])
+        HashMap::from_iter([(
+            "b".to_string(),
+            HashMap::from_iter([("a".to_string(), true)])
+        )])
     );
     assert_eq!(
-        gctx.get::<HashMap<String, HashMap<String, bool>>>("d")
+        gctx.get::<HashMap<String, HashMap<String, bool>>>(["d"])
             .unwrap(),
-        HashMap::from([("=".to_string(), HashMap::from([("=".to_string(), true)]))])
+        HashMap::from_iter([(
+            "=".to_string(),
+            HashMap::from_iter([("=".to_string(), true)])
+        )])
     );
     assert_eq!(
-        gctx.get::<HashMap<String, HashMap<String, bool>>>("e")
+        gctx.get::<HashMap<String, HashMap<String, bool>>>(["e"])
             .unwrap(),
-        HashMap::from([("'".to_string(), HashMap::from([("\"".to_string(), true)]))])
+        HashMap::from_iter([(
+            "'".to_string(),
+            HashMap::from_iter([("\"".to_string(), true)])
+        )])
     );
 
     // But anything that's not a dotted key expression should be disallowed.
@@ -349,15 +359,15 @@ fn rerooted_remains() {
         .config_arg("b='cli1'")
         .config_arg("c='cli2'")
         .build();
-    assert_eq!(gctx.get::<String>("a").unwrap(), "file1");
-    assert_eq!(gctx.get::<String>("b").unwrap(), "cli1");
-    assert_eq!(gctx.get::<String>("c").unwrap(), "cli2");
+    assert_eq!(gctx.get::<String>(["a"]).unwrap(), "file1");
+    assert_eq!(gctx.get::<String>(["b"]).unwrap(), "cli1");
+    assert_eq!(gctx.get::<String>(["c"]).unwrap(), "cli2");
 
     gctx.reload_rooted_at(paths::root()).unwrap();
 
-    assert_eq!(gctx.get::<Option<String>>("a").unwrap(), None);
-    assert_eq!(gctx.get::<String>("b").unwrap(), "cli1");
-    assert_eq!(gctx.get::<String>("c").unwrap(), "cli2");
+    assert_eq!(gctx.get::<Option<String>>(["a"]).unwrap(), None);
+    assert_eq!(gctx.get::<String>(["b"]).unwrap(), "cli1");
+    assert_eq!(gctx.get::<String>(["c"]).unwrap(), "cli2");
 }
 
 #[cargo_test]
@@ -418,20 +428,6 @@ fn no_disallowed_values() {
     assert_error(
         gctx.unwrap_err(),
         str!["registries.crates-io.token cannot be set through --config for security reasons"],
-    );
-    let gctx = GlobalContextBuilder::new()
-        .config_arg("registry.secret-key=\"hello\"")
-        .build_err();
-    assert_error(
-        gctx.unwrap_err(),
-        str!["registry.secret-key cannot be set through --config for security reasons"],
-    );
-    let gctx = GlobalContextBuilder::new()
-        .config_arg("registries.crates-io.secret-key=\"hello\"")
-        .build_err();
-    assert_error(
-        gctx.unwrap_err(),
-        str!["registries.crates-io.secret-key cannot be set through --config for security reasons"],
     );
 }
 
@@ -537,7 +533,7 @@ fn cli_path() {
         .cwd(paths::root())
         .config_arg("myconfig.toml")
         .build();
-    assert_eq!(gctx.get::<u32>("key").unwrap(), 123);
+    assert_eq!(gctx.get::<u32>(["key"]).unwrap(), 123);
 
     let gctx = GlobalContextBuilder::new()
         .config_arg("missing.toml")

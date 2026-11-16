@@ -1,12 +1,12 @@
 //! Tests for --offline flag.
 
 use crate::prelude::*;
-use cargo::core::SourceId;
 use cargo_test_support::{
     Execs, basic_manifest, git, main_file, paths, project,
     registry::{self, Package, RegistryBuilder},
     str,
 };
+use targo::workspace::SourceId;
 
 #[cargo_test]
 fn offline_unused_target_dep() {
@@ -122,6 +122,9 @@ fn cargo_compile_with_downloaded_dependency_with_offline() {
 
             [dependencies]
             present_dep = "1.2.3"
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -140,6 +143,9 @@ fn cargo_compile_with_downloaded_dependency_with_offline() {
 
             [dependencies]
             present_dep = "1.2.3"
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -147,7 +153,7 @@ fn cargo_compile_with_downloaded_dependency_with_offline() {
 
     p2.cargo("check --offline")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] present_dep v1.2.3
 [CHECKING] bar v0.1.0 ([ROOT]/bar)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -265,7 +271,7 @@ fn main(){
 
     p2.cargo("run --offline")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] present_dep v1.2.3
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -316,6 +322,59 @@ Caused by:
 
 #[cargo_test]
 fn compile_offline_while_transitive_dep_not_cached() {
+    // Trust: observe every compiler invocation, including the informational
+    // probes that are permitted before dependency source readiness is known.
+    // Unknown invocations count as build units rather than escaping the witness.
+    let wrapper_project = project()
+        .at("readiness-compiler-observer")
+        .file(
+            "Cargo.toml",
+            &basic_manifest("readiness-compiler-observer", "1.0.0"),
+        )
+        .file(
+            "src/main.rs",
+            r#"
+            fn main() {
+                let args: Vec<_> = std::env::args_os().collect();
+                let compiler_args = &args[2..];
+                let has_unit_output = compiler_args.iter().any(|arg| {
+                    let arg = arg.to_string_lossy();
+                    arg == "--emit" || arg.starts_with("--emit=")
+                        || arg == "--out-dir" || arg.starts_with("--out-dir=")
+                        || arg == "-o"
+                });
+                let is_information = !has_unit_output && compiler_args.iter().any(|arg| {
+                    let arg = arg.to_string_lossy();
+                    arg == "-vV" || arg == "--print" || arg.starts_with("--print=")
+                });
+                let observations = std::env::var_os("TARGO_READINESS_OBSERVATIONS").unwrap();
+                let kind = if is_information { "information" } else { "unit" };
+                std::fs::write(std::path::Path::new(&observations).join(kind), "observed").unwrap();
+
+                let mut command = std::process::Command::new(&args[1]);
+                command.args(compiler_args);
+                // Trust: preserve the transparent scheduling handoff on Unix.
+                #[cfg(unix)] {
+                    use std::os::unix::process::CommandExt;
+                    panic!("failed to exec compiler: {}", command.exec());
+                }
+                #[cfg(not(unix))] {
+                    let status = command.status().unwrap();
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+            }
+            "#,
+        )
+        .build();
+    // Trust: this observer is test tooling, with no proof claim. Name the
+    // unverified lane on the actual branded frontend rather than inheriting
+    // verifier settings through the compatibility entry point.
+    wrapper_project
+        .process(snapbox::cmd::cargo_bin!("targo"))
+        .args(&["--unverified", "build"])
+        .run();
+    let wrapper = wrapper_project.bin("readiness-compiler-observer");
+
     let registry = registry::init();
     let baz = Package::new("baz", "1.0.0");
     baz.publish();
@@ -332,18 +391,28 @@ fn compile_offline_while_transitive_dep_not_cached() {
 
             [dependencies]
             bar = "0.1.0"
+            available = { path = "available" }
             "#,
         )
         .file("src/main.rs", "fn main(){}")
+        .file(
+            "available/Cargo.toml",
+            &basic_manifest("available", "1.0.0"),
+        )
+        .file("available/src/lib.rs", "")
         .build();
 
-    // download both bar and baz
-    p.cargo("check").run();
+    // Populate sources and the lockfile without compiling the selected graph.
+    p.cargo("fetch").run();
+    let lockfile = std::fs::read(p.root().join("Cargo.lock")).unwrap();
+    let observations = p.root().join("compiler-observations");
+    std::fs::create_dir(&observations).unwrap();
+    p.build_dir().rm_rf();
 
     // Delete `baz` from the caches, so it has to be re-downloaded.
     let registry_path = paths::cargo_home().join("registry");
     let id = SourceId::for_registry(registry.index_url()).unwrap();
-    let hash = cargo::util::hex::short_hash(&id);
+    let hash = targo::util::hex::short_hash(&id);
     registry_path
         .join("cache")
         .join(format!("-{hash}"))
@@ -355,7 +424,9 @@ fn compile_offline_while_transitive_dep_not_cached() {
         .join("baz-1.0.0")
         .rm_rf();
 
-    p.cargo("check --offline")
+    p.cargo("check --locked --offline")
+        .env("RUSTC_WRAPPER", &wrapper)
+        .env("TARGO_READINESS_OBSERVATIONS", &observations)
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] failed to download `baz v1.0.0`
@@ -365,6 +436,27 @@ Caused by:
 
 "#]])
         .run();
+    assert!(
+        !observations.join("unit").exists(),
+        "a selected source must be available before any build unit starts, including an independent available dependency"
+    );
+    assert_eq!(
+        std::fs::read(p.root().join("Cargo.lock")).unwrap(),
+        lockfile
+    );
+
+    // The same observer must see real compilation when the source is restored;
+    // otherwise the absence assertion above could pass with a broken witness.
+    p.cargo("fetch --locked").run();
+    p.cargo("check --locked --offline")
+        .env("RUSTC_WRAPPER", &wrapper)
+        .env("TARGO_READINESS_OBSERVATIONS", &observations)
+        .run();
+    assert!(observations.join("unit").exists());
+    assert_eq!(
+        std::fs::read(p.root().join("Cargo.lock")).unwrap(),
+        lockfile
+    );
 }
 
 fn update_offline_not_cached() {
@@ -521,7 +613,7 @@ fn compile_offline_with_cached_git_dep(shallow: bool) {
     let mut cargo = p.cargo("build --offline");
     cargo.with_stderr_data(format!(
         "\
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] dep1 v0.5.0 ([ROOTURL]/dep1#[..])
 [COMPILING] foo v0.5.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -702,7 +794,7 @@ fn main(){
 
     p2.cargo("build --offline")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] present_dep v1.2.9
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -743,7 +835,7 @@ fn main(){
     p2.cargo("update --offline")
         .with_status(0)
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [UPDATING] present_dep v1.2.3 -> v1.2.9
 
 "#]])

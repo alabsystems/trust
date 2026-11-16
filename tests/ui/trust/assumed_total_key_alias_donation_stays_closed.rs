@@ -1,11 +1,41 @@
 //@ needs-trust-verify
-//@ compile-flags: -Ztrust-verify=on --crate-type lib
+//@ compile-flags: -Ztrust-verify=on -Ztrust-policy=certify --crate-type lib
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: ERROR
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
 //@ check-fail
 //~? RAW Trust
+//! **FIXED 2026-09-26 — this row now passes, and it is the regression test for the repair.**
+//! Filed as `docs/issues/2026-09-26-assume-total-discharges-the-whole-function-aggregate.md`.
+//! The repair this file originally described (narrowing the rendered key) landed and works —
+//! the assumption row names the audited definition alone — and the donation crossed anyway,
+//! so THE KEY WAS NEVER THE MECHANISM. The real mechanism was the whole-function
+//! panic-freedom AGGREGATE: `extern_call_description` labelled it with the audited site's
+//! marker whenever no fatally-prefixed row existed, and the marker then discharged every
+//! panic source the aggregate folds — including a BUNDLED callee body's own `Inst::Assert`s,
+//! which raise no marker row at all. Fixed by requiring the fold to be the audited site(s)
+//! ALONE (`panic_freedom_fold_is_audited_assumed_total_exclusive`), the same condition r09's
+//! `gap_class` attestation already applies to this same aggregate.
+//!
+//! `-Ztrust-policy=certify` IS REQUIRED IN THE FLAGS ABOVE and is not decoration: under the
+//! default policy the honest state is "reported rather than failed", so BOTH the donated and
+//! the repaired state exit 0 and this fixture could not grade the repair at all. Measured:
+//!
+//! | crate | certify exit |
+//! |---|---|
+//! | the donee block alone | 1 |
+//! | TWO donee blocks, no audit anywhere | 1 |
+//! | an audit on a wholly unrelated `fn` | 1 |
+//! | donee + the donor below, donor's type RENAMED `S` -> `T` | **0** |
+//!
+//! Renaming the donor changes nothing, so this is not key aliasing. The audit is spent
+//! on the SYNTHESIZED WHOLE-FUNCTION panic-freedom row, which folds every panic source
+//! in `render`; nothing requires the audit to cover every site the fold contains. The
+//! donee's row is not refuted or deferred — it is absorbed. The r09 `gap_class`
+//! attestation already has the missing rule in the right shape ("the fold is the one
+//! attested site alone"); see the issue file.
+//!
 //! A `#[trust::assume_total]` audit must discharge the call it was written for
 //! and NOTHING ELSE. The channel is a callee STRING, so that holds only if the
 //! string DISTINGUISHES the two callees. The seam does NOT make the key

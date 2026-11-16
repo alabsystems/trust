@@ -1,11 +1,10 @@
-use super::sealed::Sealed;
 use crate::simd::{
     Mask, Select, Simd, SimdCast, SimdElement,
     cmp::{SimdPartialEq, SimdPartialOrd},
 };
 
 /// Operations on SIMD vectors of floats.
-pub trait SimdFloat: Copy + Sealed {
+pub impl(self) trait SimdFloat: Copy {
     /// Mask type used for manipulating this SIMD vector type.
     type Mask;
 
@@ -240,8 +239,6 @@ pub trait SimdFloat: Copy + Sealed {
 macro_rules! impl_trait {
     { $($ty:ty { bits: $bits_ty:ty, mask: $mask_ty:ty }),* } => {
         $(
-        impl<const N: usize> Sealed for Simd<$ty, N> {}
-
         impl<const N: usize> SimdFloat for Simd<$ty, N>
         {
             type Mask = Mask<<$mask_ty as SimdElement>::Mask, N>;
@@ -249,40 +246,11 @@ macro_rules! impl_trait {
             type Bits = Simd<$bits_ty, N>;
             type Cast<T: SimdElement> = Simd<T, N>;
 
-            #[cfg(not(target_arch = "aarch64"))]
             #[inline]
             fn cast<T: SimdCast>(self) -> Self::Cast<T>
             {
                 // Safety: supported types are guaranteed by SimdCast
                 unsafe { core::intrinsics::simd::simd_as(self) }
-            }
-
-            // workaround for https://github.com/llvm/llvm-project/issues/94694 (fixed in LLVM 20)
-            // tracked in: https://github.com/rust-lang/rust/issues/135982
-            #[cfg(target_arch = "aarch64")]
-            #[inline]
-            fn cast<T: SimdCast>(self) -> Self::Cast<T>
-            {
-                const { assert!(N <= 64) };
-                if N <= 2 || N == 4 || N == 8 || N == 16 || N == 32 || N == 64 {
-                    // Safety: supported types are guaranteed by SimdCast
-                    unsafe { core::intrinsics::simd::simd_as(self) }
-                } else if N < 4 {
-                    let x = self.resize::<4>(Default::default()).cast();
-                    x.resize::<N>(x[0])
-                } else if N < 8 {
-                    let x = self.resize::<8>(Default::default()).cast();
-                    x.resize::<N>(x[0])
-                } else if N < 16 {
-                    let x = self.resize::<16>(Default::default()).cast();
-                    x.resize::<N>(x[0])
-                } else if N < 32 {
-                    let x = self.resize::<32>(Default::default()).cast();
-                    x.resize::<N>(x[0])
-                } else {
-                    let x = self.resize::<64>(Default::default()).cast();
-                    x.resize::<N>(x[0])
-                }
             }
 
             #[inline]

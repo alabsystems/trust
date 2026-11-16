@@ -4,10 +4,10 @@
 
 #![allow(clippy::disallowed_methods)]
 
-use cargo::GlobalContext;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use targo::GlobalContext;
 use url::Url;
 
 #[macro_export]

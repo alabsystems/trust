@@ -4,7 +4,7 @@
 // intended crate root, not whatever directory the user happened to launch from.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::cli::SubcommandArgs;
 
@@ -79,4 +79,27 @@ fn find_manifest_in_ancestors(path: &Path) -> Option<PathBuf> {
             .map(|name| ancestor.join(name))
             .find(|candidate| candidate.is_file())
     })
+}
+
+/// Cargo's lexical path normalization (`cargo_util::paths::normalize_path`):
+/// `.` is dropped and `..` pops a component, without touching the filesystem.
+pub(crate) fn lexically_normalized(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.ends_with(Component::ParentDir) {
+                    normalized.push(Component::ParentDir);
+                } else {
+                    let popped = normalized.pop();
+                    if !popped && !normalized.has_root() {
+                        normalized.push(Component::ParentDir);
+                    }
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
 }

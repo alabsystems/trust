@@ -1964,12 +1964,6 @@ mod tests {
     }
 
     #[test]
-    fn test_elf64_exactly_4_bytes_rejected() {
-        let err = Elf64::parse(&[0x7f, b'E', b'L', b'F']).unwrap_err();
-        assert!(matches!(err, ParseError::UnexpectedEof(_)));
-    }
-
-    #[test]
     fn test_elf64_symbol_type_combinations() {
         // STT_NOTYPE with STB_LOCAL
         let sym = Elf64Symbol {

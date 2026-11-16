@@ -1,8 +1,9 @@
 //! Exact assembled-body selection across non-injective rustc display paths.
 //!
 //! Two macro expansions below create distinct nested `same` definitions under
-//! one parent. rustc gives them the same `def_path_str`; crate assembly therefore
-//! gives both a `!trust_definition::...::<DefinitionIdentity>` operational name.
+//! one parent. rustc gives them the same `def_path_str`; since WS5.2 crate
+//! assembly NAMES each by its link-time symbol (here its `export_name`) and keeps
+//! the shared def path as `display_path`, so no collision rename is needed.
 //! Each body calls `helper`, so its single-body `trust_ir_of` artifact has only a
 //! bodyless local declaration and cannot substitute for the linked crate module.
 //! Each colliding definition also has a distinct exported C symbol. Calling
@@ -112,17 +113,23 @@ pub fn dispatch(selector: u64, x: u64) -> u64 {
     assert_eq!(ids.len(), 2, "distinct definitions must map to distinct FuncIds");
 
     let text = rfs::read_to_string("ir/assembled_identity.trust-ir.txt");
-    let renamed: Vec<_> = text
-        .lines()
-        .filter(|line| {
-            line.contains("fn @!trust_definition::") && line.contains("::dispatch::same::")
-        })
-        .collect();
-    assert_eq!(
-        renamed.len(),
-        2,
-        "both non-injective display paths must be collision-renamed:\n{text}"
-    );
+    // WS5.2: each colliding definition is NAMED by its link-time symbol — its
+    // `export_name`, exactly what `nm` shows for the native object — and both
+    // carry the ONE shared def path as display path (display paths are not
+    // identity). The retired `!trust_definition::…` collision name is gone.
+    // The shared def path is the coverage rows' own `def_path` (rustc's
+    // `def_path_str`, which spells a local item without the crate name).
+    let shared = same_rows[0]["def_path"].as_str().expect("the rows' shared def path");
+    for symbol in ["assembled_same_left", "assembled_same_right"] {
+        let header = format!("fn @{symbol}(");
+        assert_eq!(text.matches(&header).count(), 1, "{symbol} must name exactly one row:\n{text}");
+        let body = text.split_once(&header).unwrap().1.split_once("\n}\n").unwrap().0;
+        assert!(
+            body.contains(&format!("; #display-path: {shared:?}")),
+            "{symbol} must display the shared def path `{shared}`:\n{body}"
+        );
+    }
+    assert!(!text.contains("!trust_definition::"), "the collision rename is retired:\n{text}");
 
     rfs::write(
         "driver.rs",
@@ -150,6 +157,20 @@ fn main() {
         .input("driver.rs")
         .edition("2024")
         .arg("-Cpanic=abort")
+        // Trust: `driver` is the OBSERVER, not the subject — this test asserts the
+        // codegen backend's exact body SELECTION through the printed results, never
+        // a verdict about `driver` itself, so it is built verify-off like the
+        // sibling observers. Measured 2026-09-13 on the 7ef82153b7 driver: under the
+        // default strict policy `driver::main` fails closed HONESTLY — two
+        // `hardened_ffi_boundary` unknowns for the unmodeled extern-C calls, and the
+        // `println!` std path refused by name ("native TrustIr bundle … refused
+        // Assert-bearing member `std::sync::reentrant_lock::ReentrantLock<…>`") — and
+        // its native bundle VALIDATES. An earlier driver (d8997ace61-era) emitted an
+        // INVALID native bundle for this `main` (use-before-def in an orphaned block,
+        // `insert_field` index out of range, a bitcast without layout evidence); that
+        // was the BRIDGE's bundle, not the direct producer's module, and d2769909e7
+        // fixed both root causes in `crates/trust-ir-bridge/src/lower.rs`.
+        .arg("-Ztrust-verify=off")
         .extern_("assembled_identity", "out/libassembled_identity.rlib")
         .library_search_path("out")
         .output(bin_name("driver"))

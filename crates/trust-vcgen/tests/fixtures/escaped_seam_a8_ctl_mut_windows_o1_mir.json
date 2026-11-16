@@ -1,0 +1,1146 @@
+{
+  "name": "ctl_mut_windows",
+  "def_path": "r2_pins::ctl_mut_windows",
+  "span": {
+    "file": "r2_pins.rs",
+    "line_start": 8,
+    "col_start": 0,
+    "line_end": 8,
+    "col_end": 117
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Windows",
+            "fields": [
+              [
+                "v",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Slice": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "size",
+                {
+                  "Adt": {
+                    "name": "core::num::nonzero::NonZero",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "core::num::niche_types::NonZeroUsizeInner",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Windows",
+            "fields": [
+              [
+                "v",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Slice": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "size",
+                {
+                  "Adt": {
+                    "name": "core::num::nonzero::NonZero",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "core::num::niche_types::NonZeroUsizeInner",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Windows",
+            "fields": [
+              [
+                "v",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Slice": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "size",
+                {
+                  "Adt": {
+                    "name": "core::num::nonzero::NonZero",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "core::num::niche_types::NonZeroUsizeInner",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "iter"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Slice": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Slice": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::slice::iter::Windows",
+                "fields": [
+                  [
+                    "v",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Slice": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "size",
+                    {
+                      "Adt": {
+                        "name": "core::num::nonzero::NonZero",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Adt": {
+                                "name": "core::num::niche_types::NonZeroUsizeInner",
+                                "fields": [
+                                  [
+                                    "0",
+                                    {
+                                      "Int": {
+                                        "width": 64,
+                                        "signed": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "w"
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r2_pins.rs",
+                "line_start": 8,
+                "col_start": 57,
+                "line_end": 8,
+                "col_end": 60
+              }
+            }
+          },
+          {
+            "StorageLive": 2
+          },
+          {
+            "StorageLive": 3
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r2_pins.rs",
+                "line_start": 8,
+                "col_start": 71,
+                "line_end": 8,
+                "col_end": 72
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::windows",
+            "args": [
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    2,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "r2_pins.rs",
+              "line_start": 8,
+              "col_start": 71,
+              "line_end": 8,
+              "col_end": 83
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 15449,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 4
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::Windows<'_, u8> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "r2_pins.rs",
+              "line_start": 8,
+              "col_start": 71,
+              "line_end": 8,
+              "col_end": 83
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 10353,
+              "substs_digest": [
+                16794778968112815896,
+                8141961810546032769
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageDead": 3
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r2_pins.rs",
+                "line_start": 8,
+                "col_start": 71,
+                "line_end": 8,
+                "col_end": 83
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 5,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r2_pins.rs",
+                "line_start": 8,
+                "col_start": 71,
+                "line_end": 8,
+                "col_end": 83
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::Windows<'_, u8> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "r2_pins.rs",
+              "line_start": 8,
+              "col_start": 71,
+              "line_end": 8,
+              "col_end": 83
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 10534,
+              "substs_digest": [
+                16794778968112815896,
+                8141961810546032769
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 6,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "r2_pins.rs",
+                "line_start": 8,
+                "col_start": 71,
+                "line_end": 8,
+                "col_end": 83
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 8,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ],
+              [
+                1,
+                6
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "r2_pins.rs",
+              "line_start": 8,
+              "col_start": 71,
+              "line_end": 8,
+              "col_end": 83
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "StorageLive": 9
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r2_pins.rs",
+                "line_start": 8,
+                "col_start": 66,
+                "line_end": 8,
+                "col_end": 67
+              }
+            }
+          },
+          {
+            "StorageLive": 10
+          },
+          {
+            "StorageLive": 11
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r2_pins.rs",
+                "line_start": 8,
+                "col_start": 105,
+                "line_end": 8,
+                "col_end": 109
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "r2_pins.rs",
+                "line_start": 8,
+                "col_start": 105,
+                "line_end": 8,
+                "col_end": 109
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 8,
+            "span": {
+              "file": "r2_pins.rs",
+              "line_start": 8,
+              "col_start": 105,
+              "line_end": 8,
+              "col_end": 109
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 2
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 1,
+                          "min_length": 2,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "r2_pins.rs",
+                "line_start": 8,
+                "col_start": 105,
+                "line_end": 8,
+                "col_end": 109
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 0,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 11,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 10,
+              "projections": []
+            },
+            "target": 9,
+            "span": {
+              "file": "r2_pins.rs",
+              "line_start": 8,
+              "col_start": 90,
+              "line_end": 8,
+              "col_end": 110
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 9644579079924054985,
+              "def_index": 27313,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "StorageDead": 11
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 10,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "r2_pins.rs",
+                "line_start": 8,
+                "col_start": 86,
+                "line_end": 8,
+                "col_end": 110
+              }
+            }
+          },
+          {
+            "StorageDead": 10
+          },
+          {
+            "StorageDead": 9
+          },
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageDead": 6
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

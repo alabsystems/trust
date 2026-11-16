@@ -39,6 +39,14 @@ pub struct SymbolicHeap {
     next_provenance: u64,
     /// Freed provenance IDs.
     freed_provenances: Vec<ProvenanceId>,
+    /// Provenances freed on the path condition of the block being interpreted
+    /// RIGHT NOW, and on no other. Replaced wholesale by
+    /// [`SymbolicHeap::set_path_freed`] on entry to every block, so — unlike
+    /// [`SymbolicHeap::free`] — nothing here survives into a later block the
+    /// free does not reach. Read only through [`SymbolicHeap::is_freed`]; it
+    /// never touches a pointer's permission, so there is nothing to restore when
+    /// the walk leaves the region the free dominates.
+    path_freed: Vec<ProvenanceId>,
 }
 
 /// A single heap cell in the symbolic heap.
@@ -62,6 +70,7 @@ impl SymbolicHeap {
             pointers: FxHashMap::default(),
             next_provenance: 1,
             freed_provenances: Vec::new(),
+            path_freed: Vec::new(),
         }
     }
 
@@ -113,10 +122,18 @@ impl SymbolicHeap {
         self.pointers.len()
     }
 
-    /// Whether a provenance has been freed.
+    /// Replace the set of provenances freed on the CURRENT block's path
+    /// condition (see the `path_freed` field). The caller recomputes it for every
+    /// block; passing an empty vector makes no path-conditioned free visible.
+    pub fn set_path_freed(&mut self, provs: Vec<ProvenanceId>) {
+        self.path_freed = provs;
+    }
+
+    /// Whether a provenance has been freed — by [`SymbolicHeap::free`], or on the
+    /// current block's path condition ([`SymbolicHeap::set_path_freed`]).
     #[must_use]
     pub fn is_freed(&self, prov: ProvenanceId) -> bool {
-        self.freed_provenances.contains(&prov)
+        self.freed_provenances.contains(&prov) || self.path_freed.contains(&prov)
     }
 
     /// Convert the current heap state to a separation logic formula.
@@ -149,7 +166,7 @@ impl SymbolicHeap {
         func_name: &str,
         span: &SourceSpan,
     ) -> Vec<VerificationCondition> {
-        let mut vcs = Vec::new();
+        let mut vcs = Vec::with_capacity(4);
 
         if let Some(ptr) = self.pointers.get(ptr_name) {
             // Check for use-after-free.
@@ -221,7 +238,7 @@ impl SymbolicHeap {
         func_name: &str,
         span: &SourceSpan,
     ) -> Vec<VerificationCondition> {
-        let mut vcs = Vec::new();
+        let mut vcs = Vec::with_capacity(4);
 
         if let Some(ptr) = self.pointers.get(ptr_name) {
             // Check for use-after-free.

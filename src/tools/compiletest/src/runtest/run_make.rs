@@ -6,17 +6,61 @@ use build_helper::fs::{ignore_not_found, recursive_remove};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use super::{ProcRes, TestCx, disable_error_reporting};
-use crate::common::{TRUST_VANILLA_ANNOUNCED_ENV, TRUST_VANILLA_RUSTC_FLAG, TestSuite};
+use crate::common::{
+    Config, TRUST_VANILLA_ANNOUNCED_ENV, TRUST_VANILLA_RUSTC_FLAG, TestPaths, TestSuite,
+    TrustVerificationLane,
+};
 use crate::util::{ArgFileCommand, copy_dir_all, dylib_env_var};
 
+/// Trust: the real driver the `-Ztrust-verify=off` wrapper execs. Transport only.
+const TRUST_OFF_REAL_RUSTC_ENV: &str = "__COMPILETEST_TRUST_OFF_REAL_RUSTC";
+/// Trust: set on `--trust-vanilla` only; recipes read it as that lane's signal.
 const TRUST_VANILLA_REAL_RUSTC_ENV: &str = "__COMPILETEST_TRUST_VANILLA_REAL_RUSTC";
+
+/// Trust: what a recipe's `RUSTC` is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RecipeRustc {
+    /// The real driver at its own default.
+    Real,
+    /// The wrapper that prepends `-Ztrust-verify=off`.
+    Isolated,
+    /// `Isolated`, plus the vanilla lane's signal.
+    Vanilla,
+}
+
+/// Trust: the run-make half of `TrustVerificationLane::IsolatedOff`. On the
+/// default lane an INHERITED recipe's compiles are isolated like every other
+/// inherited test's, while Trust's own recipes keep the real driver (they state
+/// `-Ztrust-verify=on|off` themselves, and some read `RUSTC`'s sysroot). The
+/// verified lane and a non-Trust driver get the real driver unchanged.
+fn recipe_rustc(config: &Config, testpaths: &TestPaths) -> RecipeRustc {
+    match config.trust_verification_lane() {
+        TrustVerificationLane::IsolatedOff if config.trust_vanilla() => RecipeRustc::Vanilla,
+        TrustVerificationLane::IsolatedOff if !is_trust_run_make_test(testpaths) => {
+            RecipeRustc::Isolated
+        }
+        TrustVerificationLane::IsolatedOff
+        | TrustVerificationLane::Verified
+        | TrustVerificationLane::Unsupported => RecipeRustc::Real,
+    }
+}
+
+/// Trust: Trust's own run-make tests are the top-level `trust-*` / `trustc-*`
+/// directories.
+fn is_trust_run_make_test(testpaths: &TestPaths) -> bool {
+    testpaths
+        .relative_dir
+        .iter()
+        .next()
+        .or_else(|| testpaths.file.file_name())
+        .is_some_and(|top| top.starts_with("trust"))
+}
 
 impl TestCx<'_> {
     pub(super) fn run_rmake_test(&self) {
         // For `run-make`, we need to perform 2 steps to build and run a `run-make` recipe
         // (`rmake.rs`) to run the actual tests. The support library is already built as a tool rust
-        // library and is available under
-        // `build/$HOST/bootstrap-tools/$TARGET/release/librun_make_support.rlib`.
+        // library. Bootstrap supplies its exact Cargo artifact paths.
         //
         // 1. We need to build the recipe `rmake.rs` as a binary and link in the `run_make_support`
         //    library.
@@ -57,31 +101,22 @@ impl TestCx<'_> {
             }
         }
 
-        // In order to link in the support library as a rlib when compiling recipes, we need three
-        // paths:
-        // 1. Path of the built support library rlib itself.
-        // 2. Path of the built support library's dependencies directory.
-        // 3. Path of the built support library's dependencies' dependencies directory.
-        //
-        // The paths look like
-        //
-        // ```
-        // build/<target_triple>/
-        // ├── bootstrap-tools/
-        // │   ├── <host_triple>/release/librun_make_support.rlib   // <- support rlib itself
-        // │   ├── <host_triple>/release/build/<pkg>/<hash>/out     // <- deps
-        // │   └── release/build/<pkg>/<hash>/out                   // <- deps of deps
-        // ```
-        //
-        // FIXME(jieyouxu): there almost certainly is a better way to do this (specifically how the
-        // support lib and its deps are organized), but this seems to work for now.
+        let support_lib_rlib_path = self
+            .config
+            .run_make_support_rlib
+            .as_ref()
+            .expect("run-make-support .rlib has to be passed for run-make tests");
+        let support_lib_rmeta_path = self.config.run_make_support_rmeta.as_ref();
 
-        let tools_bin = host_build_root.join("bootstrap-tools");
-        let support_host_path = tools_bin.join(&self.config.host).join("release");
-        let support_lib_path = support_host_path.join("librun_make_support.rlib");
-
-        let support_lib_deps = discover_out_dirs(support_host_path.join("build"));
-        let support_lib_deps_deps = discover_out_dirs(tools_bin.join("release").join("build"));
+        // Trust: the support library and its dependencies must come from one Cargo
+        // producer. Reconstructing a cache name here mixed current-Cargo dependencies
+        // with the seed-built support library after Bootstrap split those caches.
+        let support_lib_dependency_dirs = run_make_support_dependency_dirs(
+            support_lib_rlib_path,
+            support_lib_rmeta_path.map(|p| p.as_path()),
+            &self.config.host,
+        )
+        .unwrap_or_else(|error| self.fatal(&error));
 
         // To compile the recipe with rustc, we need to provide suitable dynamic library search
         // paths to rustc. This includes both:
@@ -122,19 +157,36 @@ impl TestCx<'_> {
             // a stable-channel compiler via `RUSTC_BOOTSTRAP=-1` to prevent *any* unstable
             // library/compiler usages, even if stage 0 rustc is *actually* a nightly rustc.
             .env("RUSTC_BOOTSTRAP", "-1")
+            // Trust: the recipe is HARNESS code, not a verification subject. When stage0 is
+            // a batteries-on Trust compiler — the sanctioned atpkg-pack stage0 — its own
+            // Level-0 obligations on ordinary recipe code fail closed under strict policy,
+            // and the whole run-make mode aborts at recipe-build before a single subject
+            // compiles (measured: a stock control fails identically). bootstrap.py only
+            // plants this env when stage0 does NOT understand the current flag, so the
+            // modern stage0 path is exactly the one that verifies the recipe. Disable
+            // verification for the RECIPE COMPILE ONLY via the version-invariant nested-
+            // process transport (`rustc_driver_impl::apply_trust_verify_override`, a
+            // post-parse override): a stock stage0 ignores the env, and it bypasses the
+            // `RUSTC_BOOTSTRAP=-1` stable `-Z` gate that an argv `-Ztrust-verify=off`
+            // would depend on. The recipe RUN below is a separate Command and drives the
+            // subject compilations with their own explicit `-Ztrust-verify=on|off`, so
+            // nothing a test asserts about verification is touched.
+            .env("TRUST_NO_VERIFY", "1")
             .arg("-o")
             .arg(&recipe_bin)
             // Specify library search paths for `run_make_support`.
-            .arg(format!("-Ldependency={}", &support_lib_path.parent().unwrap()))
-            .args(out_dirs_to_args(support_lib_deps))
-            .args(out_dirs_to_args(support_lib_deps_deps))
+            .args(out_dirs_to_args(support_lib_dependency_dirs))
             // Provide `run_make_support` as extern prelude, so test writers don't need to write
             // `extern run_make_support;`.
             .arg("--extern")
-            .arg(format!("run_make_support={}", &support_lib_path))
+            .arg(format!("run_make_support={}", &support_lib_rlib_path))
             .arg("--edition=2024")
             .arg(&self.testpaths.file.join("rmake.rs"))
             .arg("-Cprefer-dynamic");
+
+        if let Some(support_lib_rmeta_path) = support_lib_rmeta_path {
+            rustc.arg("--extern").arg(format!("run_make_support={}", &support_lib_rmeta_path));
+        }
 
         // In test code we want to be very pedantic about values being silently discarded that are
         // annotated with `#[must_use]`.
@@ -148,10 +200,23 @@ impl TestCx<'_> {
 
         // To actually run the recipe, we have to provide the recipe with a bunch of information
         // provided through env vars.
-        let recipe_rustc = if self.config.trust_vanilla() {
-            write_trust_vanilla_rustc_wrapper(&base_dir)
-        } else {
-            self.config.rustc_path.clone()
+        // Trust: a recipe spawns its OWN compilations through `RUSTC`, so the
+        // lane has to reach it through this path or the recipe silently opts
+        // out of whatever lane the run claims.
+        //   vanilla  -- every recipe gets the `-Ztrust-verify=off` wrapper.
+        //   default  -- inherited recipes get the same wrapper; Trust's own
+        //               (`recipe_rustc`) get the real driver.
+        //   verified -- the real BRANDED driver with NO injected flag, so
+        //               recipe compiles land on the compiler's own shipping
+        //               default (`-Ztrust-verify=on`, `-Ztrust-policy=strict`),
+        //               which is exactly what this lane exists to witness. A
+        //               wrapper here would measure the wrapper, not the default.
+        let recipe_rustc_kind = recipe_rustc(self.config, self.testpaths);
+        let recipe_rustc = match recipe_rustc_kind {
+            RecipeRustc::Real => self.config.rustc_path.clone(),
+            RecipeRustc::Isolated | RecipeRustc::Vanilla => {
+                write_trust_off_rustc_wrapper(&base_dir)
+            }
         };
 
         // Compute dynamic library search paths for recipes.
@@ -200,16 +265,55 @@ impl TestCx<'_> {
             .env("RUSTC", &recipe_rustc)
             // Provide which LLVM components are available (e.g. which LLVM components are provided
             // through a specific CI runner).
-            .env("LLVM_COMPONENTS", &self.config.llvm_components)
-            // Trust (loud-when-off): run-make is a managed harness lane; its
-            // vanilla wrapper and any per-recipe `-Ztrust-verify=off` compile
-            // are announced policy, so quiet the compiler's once-per-crate
-            // vanilla note. A recipe that wants to observe the note removes
-            // this variable from its own command.
-            .env(TRUST_VANILLA_ANNOUNCED_ENV, "1");
+            .env("LLVM_COMPONENTS", &self.config.llvm_components);
 
-        if self.config.trust_vanilla() {
-            cmd.env(TRUST_VANILLA_REAL_RUSTC_ENV, &self.config.rustc_path);
+        // Trust: the recipe RUN is where a run-make test's subject compiles
+        // happen, so it gets the same unconditional strip of an INHERITED
+        // `TRUST_NO_VERIFY` that `configure_trust_verification_isolation` gives
+        // every compile compiletest issues itself (see the reasoning there: the
+        // driver applies the variable as a post-parse override, so it beats a
+        // recipe's explicit `-Ztrust-verify=on`). The recipe COMPILE above sets it
+        // on purpose and is a different command. Measured 2026-09-27 under
+        // `x.py test --stage 1 tests/run-make/...` on a seed that makes
+        // bootstrap plant the variable: trust-assumption-rows,
+        // trustc-verifier-options, trust-temporal-carry,
+        // trust-native-bundle-obligation-site and
+        // trust-duplicate-crate-call-identity failed with verification OFF ("0
+        // assumption:coroutine rows", "command unexpectedly succeeded",
+        // "-Ztrust-dump=mir:<dir> ... require batteries-on Trust verification")
+        // while the same recipe binaries passed when run with the same `RUSTC`
+        // outside x.py, and failed identically with `TRUST_NO_VERIFY=1` added.
+        // A recipe that wants vanilla compiles spells `-Ztrust-verify=off`, and
+        // the vanilla lane's wrapper injects it.
+        cmd.env_remove("TRUST_NO_VERIFY");
+
+        // Trust (loud-when-off): run-make is a managed harness lane; its
+        // isolation wrapper and any per-recipe `-Ztrust-verify=off` compile are
+        // announced policy, so quiet the compiler's once-per-crate vanilla
+        // note. A recipe that wants to observe the note removes this variable
+        // from its own command.
+        //
+        // NOT on the verified lane: there, `-Ztrust-verify=off` is never
+        // announced policy, so a recipe that reaches it is a FINDING and the
+        // note must stay loud. (Every other lane is byte-identical to before.)
+        if !self.config.trust_verified() {
+            cmd.env(TRUST_VANILLA_ANNOUNCED_ENV, "1");
+        }
+
+        match recipe_rustc_kind {
+            RecipeRustc::Real => {}
+            RecipeRustc::Isolated => {
+                cmd.env(TRUST_OFF_REAL_RUSTC_ENV, &self.config.rustc_path);
+            }
+            RecipeRustc::Vanilla => {
+                cmd.env(TRUST_OFF_REAL_RUSTC_ENV, &self.config.rustc_path)
+                    .env(TRUST_VANILLA_REAL_RUSTC_ENV, &self.config.rustc_path);
+            }
+        }
+
+        if let Some(codegen_backend) = &self.config.override_codegen_backend {
+            // In case it's a different codegen backend than LLVM.
+            cmd.env("RUSTC_CODEGEN_BACKEND", codegen_backend.as_str());
         }
 
         // The `run-make-cargo` and `build-std` suites need an in-tree `cargo`, `run-make` does not.
@@ -346,8 +450,10 @@ impl TestCx<'_> {
             }
         }
 
-        let proc = disable_error_reporting(|| cmd.spawn().expect("failed to spawn `rmake`"));
-        let (Output { stdout, stderr, status }, truncated) = self.read2_abbreviated(proc);
+        let (Output { stdout, stderr, status }, truncated) = disable_error_reporting(|| {
+            crate::case_scheduler::run(&mut cmd, |child| self.read2_abbreviated(child))
+        })
+        .expect("failed to execute `rmake`");
         let stdout = String::from_utf8_lossy(&stdout).into_owned();
         let stderr = String::from_utf8_lossy(&stderr).into_owned();
         // This conditions on `status.success()` so we don't print output twice on error.
@@ -360,25 +466,134 @@ impl TestCx<'_> {
     }
 }
 
-/// Gets all of the `out` dirs in a given Cargo `build-dir/<profile>/build` dir.
-fn discover_out_dirs(dir: Utf8PathBuf) -> Vec<PathBuf> {
-    let read_dir = |path: &Path| path.read_dir().ok().into_iter().flatten().filter_map(Result::ok);
-    let contents = dir
-        .read_dir()
-        .unwrap_or_else(|e| panic!("Couldn't read {}: {}", dir, e))
-        .map(|e| e.unwrap())
-        .flat_map(|e| read_dir(&e.path()))
-        .flat_map(|e| read_dir(&e.path()))
-        .map(|e| e.path())
-        .filter(|path| path.ends_with("out"))
-        .collect::<Vec<_>>();
-
-    return contents;
+// Trust: accept Cargo's uplifted, legacy deps, and new build-unit artifact
+// locations. rlib and separate rmeta must identify the same producer profile;
+// neither a host name nor a cache-domain name supplied elsewhere can replace it.
+fn run_make_support_profile_dir(
+    artifact: &Utf8Path,
+    extension: &str,
+) -> Result<Utf8PathBuf, String> {
+    let stem = artifact.file_stem().unwrap_or_default();
+    if artifact.extension() != Some(extension)
+        || !(stem == "librun_make_support"
+            || stem.strip_prefix("librun_make_support-").is_some_and(|hash| !hash.is_empty()))
+    {
+        return Err(format!("invalid run-make-support .{extension} artifact: {artifact}"));
+    }
+    let parent = artifact.parent().ok_or_else(|| format!("no artifact directory: {artifact}"))?;
+    let profile = match parent.file_name() {
+        Some("deps") => parent.parent(),
+        Some("out") => parent
+            .parent()
+            .and_then(Utf8Path::parent)
+            .and_then(Utf8Path::parent)
+            .filter(|build| build.file_name() == Some("build"))
+            .and_then(Utf8Path::parent),
+        _ => Some(parent),
+    };
+    profile
+        .filter(|profile| profile.file_name().is_some())
+        .map(Utf8Path::to_path_buf)
+        .ok_or_else(|| format!("unrecognized run-make-support artifact layout: {artifact}"))
 }
 
-fn write_trust_vanilla_rustc_wrapper(base_dir: &Utf8Path) -> Utf8PathBuf {
-    let wrapper = trust_vanilla_rustc_wrapper_path(base_dir);
-    fs::write(&wrapper, trust_vanilla_rustc_wrapper_script()).unwrap();
+// Trust: keep the host-qualified and unqualified dependency halves in the
+// selected producer only. In the new layout Rust libraries and build scripts
+// both live under build/<package>/<unit>/out, so those directories matter too.
+fn run_make_support_dependency_dirs(
+    rlib: &Utf8Path,
+    rmeta: Option<&Utf8Path>,
+    host: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let profile = run_make_support_profile_dir(rlib, "rlib")?;
+    if let Some(rmeta) = rmeta {
+        let metadata_profile = run_make_support_profile_dir(rmeta, "rmeta")?;
+        if metadata_profile != profile {
+            return Err(format!(
+                "run-make-support rlib and rmeta use different Cargo producer profiles: \
+                 {rlib} and {rmeta}"
+            ));
+        }
+        if let Some(rlib_hash) = rlib.file_stem().unwrap().strip_prefix("librun_make_support-")
+            && let Some(rmeta_hash) =
+                rmeta.file_stem().unwrap().strip_prefix("librun_make_support-")
+            && rlib_hash != rmeta_hash
+        {
+            return Err(format!(
+                "run-make-support rlib and rmeta use different Cargo artifact hashes: \
+                 {rlib} and {rmeta}"
+            ));
+        }
+    }
+    let mut profiles = vec![profile.clone()];
+    if let Some(target) = profile.parent()
+        && target.file_name() == Some(host)
+        && let Some(root) = target.parent()
+    {
+        profiles.push(root.join(profile.file_name().expect("profile directory has a name")));
+    }
+    let mut paths = profiles.iter().map(|p| p.join("deps").into_std_path_buf()).collect::<Vec<_>>();
+    for profile in profiles {
+        let build = profile.join("build");
+        paths.extend(discover_out_dirs(build.as_std_path()).map_err(|error| {
+            format!("could not read support producer directory {build}: {error}")
+        })?);
+    }
+    Ok(paths)
+}
+
+/// Trust: handle both build/<package-hash>/out and build/<package>/<unit>/out.
+/// Missing build-script directories are normal for graphs without build scripts.
+fn discover_out_dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    fn output_is_directory(path: &Path) -> std::io::Result<bool> {
+        match fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn directories(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let entries = match path.read_dir() {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(error) => return Err(error),
+        };
+        let mut dirs = vec![];
+        for entry in entries {
+            let path = entry?.path();
+            if fs::metadata(&path)?.is_dir() {
+                dirs.push(path);
+            }
+        }
+        dirs.sort();
+        Ok(dirs)
+    }
+
+    let mut outs = vec![];
+    for package in directories(dir)? {
+        let legacy_out = package.join("out");
+        if output_is_directory(&legacy_out)? {
+            outs.push(legacy_out);
+        }
+        for unit in directories(&package)? {
+            if unit.file_name().is_some_and(|name| name == "out") {
+                continue;
+            }
+            let out = unit.join("out");
+            if output_is_directory(&out)? {
+                outs.push(out);
+            }
+        }
+    }
+    outs.sort();
+    outs.dedup();
+    Ok(outs)
+}
+
+fn write_trust_off_rustc_wrapper(base_dir: &Utf8Path) -> Utf8PathBuf {
+    let wrapper = trust_off_rustc_wrapper_path(base_dir);
+    fs::write(&wrapper, trust_off_rustc_wrapper_script()).unwrap();
 
     #[cfg(unix)]
     {
@@ -392,22 +607,24 @@ fn write_trust_vanilla_rustc_wrapper(base_dir: &Utf8Path) -> Utf8PathBuf {
     wrapper
 }
 
-fn trust_vanilla_rustc_wrapper_path(base_dir: &Utf8Path) -> Utf8PathBuf {
+/// Trust: keep this file name. `rustc_interface::util::rustc_path` accepts it
+/// from `RUSTC`, which is how rustdoc's doctest compiles reach the wrapper too.
+fn trust_off_rustc_wrapper_path(base_dir: &Utf8Path) -> Utf8PathBuf {
     let wrapper_name =
         if cfg!(windows) { "rustc-trust-vanilla.cmd" } else { "rustc-trust-vanilla" };
     base_dir.join(wrapper_name)
 }
 
-fn trust_vanilla_rustc_wrapper_script() -> String {
+fn trust_off_rustc_wrapper_script() -> String {
     if cfg!(windows) {
         format!(
             "@echo off\r\nif \"%~1\"==\"\" (\r\n    \"%{}%\"\r\n) else (\r\n    \"%{}%\" {} %*\r\n)\r\nexit /b %ERRORLEVEL%\r\n",
-            TRUST_VANILLA_REAL_RUSTC_ENV, TRUST_VANILLA_REAL_RUSTC_ENV, TRUST_VANILLA_RUSTC_FLAG
+            TRUST_OFF_REAL_RUSTC_ENV, TRUST_OFF_REAL_RUSTC_ENV, TRUST_VANILLA_RUSTC_FLAG
         )
     } else {
         format!(
             "#!/bin/sh\nif [ \"$#\" -eq 0 ]; then\n    exec \"${{{}}}\"\nelse\n    exec \"${{{}}}\" {} \"$@\"\nfi\n",
-            TRUST_VANILLA_REAL_RUSTC_ENV, TRUST_VANILLA_REAL_RUSTC_ENV, TRUST_VANILLA_RUSTC_FLAG
+            TRUST_OFF_REAL_RUSTC_ENV, TRUST_OFF_REAL_RUSTC_ENV, TRUST_VANILLA_RUSTC_FLAG
         )
     }
 }

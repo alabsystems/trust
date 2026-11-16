@@ -664,6 +664,13 @@ impl GlobalState {
         {
             info!("Spawning proc-macro servers");
 
+            // Workspaces referring to the same proc-macro server executable (i.e. the same
+            // sysroot) with an identical spawn environment share a single client, and thereby
+            // a single set of server processes.
+            let mut clients: Vec<(
+                (AbsPathBuf, Option<semver::Version>, FxHashMap<String, Option<String>>),
+                ProcMacroClient,
+            )> = Vec::new();
             self.proc_macro_clients = Arc::from_iter(self.workspaces.iter().map(|ws| {
                 let path = match self.config.proc_macro_srv() {
                     Some(path) => path,
@@ -695,20 +702,30 @@ impl GlobalState {
 
                     _ => Default::default(),
                 };
-                info!("Using proc-macro server at {path}");
+
+                let key = (path, ws.toolchain.clone(), env);
+                if let Some((_, client)) = clients.iter().find(|(k, _)| *k == key) {
+                    return Some(Ok(client.clone()));
+                }
+
+                let (path, toolchain, env) = &key;
+                info!("Spawning proc-macro server at {path}");
                 let num_process = self.config.proc_macro_num_processes();
 
-                Some(
-                    ProcMacroClient::spawn(&path, &env, ws.toolchain.as_ref(), num_process)
-                        .map_err(|err| {
-                            tracing::error!(
-                                "Failed to run proc-macro server from path {path}, error: {err:?}",
-                            );
-                            anyhow::format_err!(
-                                "Failed to run proc-macro server from path {path}, error: {err:?}",
-                            )
-                        }),
-                )
+                Some(match ProcMacroClient::spawn(path, env, toolchain.as_ref(), num_process) {
+                    Ok(client) => {
+                        clients.push((key.clone(), client.clone()));
+                        Ok(client)
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to run proc-macro server from path {path}, error: {err:?}",
+                        );
+                        Err(anyhow::format_err!(
+                            "Failed to run proc-macro server from path {path}, error: {err:?}",
+                        ))
+                    }
+                })
             }))
         }
 
@@ -884,6 +901,8 @@ impl GlobalState {
                     self.config.default_root_path().clone(),
                     None,
                     None,
+                    None,
+                    None,
                 )]
             }
             crate::flycheck::InvocationStrategy::PerWorkspace => {
@@ -903,6 +922,7 @@ impl GlobalState {
                                     cargo.workspace_root(),
                                     Some(cargo.manifest_path()),
                                     Some(cargo.target_directory()),
+                                    cargo.build_directory(),
                                 ),
                                 ProjectWorkspaceKind::Json(project) => {
                                     let config_json = crate::flycheck::FlycheckConfigJson {
@@ -914,10 +934,10 @@ impl GlobalState {
                                     // in the workspace configuration.
                                     match config {
                                         _ if config_json.any_configured() => {
-                                            (config_json, project.path(), None, None)
+                                            (config_json, project.path(), None, None, None)
                                         }
                                         FlycheckConfig::CustomCommand { .. } => {
-                                            (config_json, project.path(), None, None)
+                                            (config_json, project.path(), None, None, None)
                                         }
                                         _ => return None,
                                     }
@@ -925,21 +945,31 @@ impl GlobalState {
                                 ProjectWorkspaceKind::DetachedFile { .. } => return None,
                             },
                             ws.sysroot.root().map(ToOwned::to_owned),
+                            ws.toolchain.clone(),
                         ))
                     })
-                    .map(|(id, (config_json, root, manifest_path, target_dir), sysroot_root)| {
-                        FlycheckHandle::spawn(
+                    .map(
+                        |(
                             id,
-                            generation.clone(),
-                            sender.clone(),
-                            config.clone(),
-                            config_json,
+                            (config_json, root, manifest_path, target_dir, build_dir),
                             sysroot_root,
-                            root.to_path_buf(),
-                            manifest_path.map(|it| it.to_path_buf()),
-                            target_dir.map(|it| AsRef::<Utf8Path>::as_ref(it).to_path_buf()),
-                        )
-                    })
+                            toolchain,
+                        )| {
+                            FlycheckHandle::spawn(
+                                id,
+                                generation.clone(),
+                                sender.clone(),
+                                config.clone(),
+                                config_json,
+                                sysroot_root,
+                                root.to_path_buf(),
+                                manifest_path.map(|it| it.to_path_buf()),
+                                target_dir.map(|it| AsRef::<Utf8Path>::as_ref(it).to_path_buf()),
+                                build_dir.map(|it| AsRef::<Utf8Path>::as_ref(it).to_path_buf()),
+                                toolchain,
+                            )
+                        },
+                    )
                     .collect()
             }
         }

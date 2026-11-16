@@ -16,6 +16,7 @@ import copy
 import importlib.util
 import json
 import sys
+import unittest
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parent.parent / "regen_raw_enum_tag_fixtures.py"
@@ -149,8 +150,21 @@ check(not regen.is_raw_encoding(1, -1), "1 must not read as a raw encoding of -1
 check(not regen.is_raw_encoding(0, 0), "an unchanged value is not a raw encoding")
 check(not regen.is_raw_encoding(256, -1), "256 exceeds every width whose pattern it could be")
 
-if FAILURES:
-    for failure in FAILURES:
-        print(f"FAIL: {failure}", file=sys.stderr)
-    sys.exit(1)
-print("regen_raw_enum_tag_fixtures: all checks passed")
+
+def load_tests(loader, tests, pattern):
+    """`land_gate.py validation-tests` loads this module with unittest (the
+    landing gate's selector names it, LAND-SELECT-VALIDATION-REACH-1): the
+    checks above ran at import, and their verdict is one case."""
+    def test_rewrite_decisions():
+        if FAILURES:
+            raise AssertionError("\n".join(FAILURES))
+    tests.addTest(unittest.FunctionTestCase(test_rewrite_decisions))
+    return tests
+
+
+if __name__ == "__main__":
+    if FAILURES:
+        for failure in FAILURES:
+            print(f"FAIL: {failure}", file=sys.stderr)
+        sys.exit(1)
+    print("regen_raw_enum_tag_fixtures: all checks passed")

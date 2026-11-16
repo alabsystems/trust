@@ -1,0 +1,23 @@
+error: `trust_import_off_import_unreadable__sum_to` names a Rust function body that cannot be imported into the Clean kernel
+  --> $DIR/off_import_unreadable.rs:25:27
+   |
+LL |     theorem sum_to_zero : trust_import_off_import_unreadable__sum_to 0 = 0 := rfl
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: `off_import_unreadable::sum_to`: E6 admission of `off_import_unreadable::sum_to` was refused by the FACET gate (Pure, Total, Deterministic and NoPanic must all be established): Total (not established: back-edge present; structural totality requires a loop-free body (the E5 termination lane certifies measured loops)), NoPanic (not established: validated closed-fragment firewall declined NoPanic; the body is malformed, ill-typed, unsupported, or contains an undischarged panic operation); the construct outside the E6 fragment is a loop (the back edge bb3 -> bb1) (and 1 further construct(s) outside it)
+  --> $DIR/off_import_unreadable.rs:14:1
+   |
+LL | pub fn sum_to(n: u64) -> u64 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: a kernel import is checked in every build (COMPILE-TIME-FACTS-1); the importable body shapes are a parameter or field projection, a constant, a wrapping `+`/`-`/`*` tree, a select, a comparison, `checked_*` arithmetic, a guarded narrowing, a widened equality, a `bool` connective tree (`&&`, `||` and `!`, and `&`/`|`/`^`/`==`/`!=` over `bool`, whose leaves are `bool` parameters and comparisons of parameters, literals and fixed-width arithmetic), a decision tree (`if`/`else`, or a `match` or `matches!` on a `bool`, `u8`..`u64` or `i8`..`i128` parameter with literal arms and `_`, whose arms are parameters, literals and decisions), or one call forwarding the parameters to a Clean island definition
+
+error: `trust_import_off_import_unreadable__sum_to` has no checked E6 program admission; this island cannot be checked
+  --> $DIR/off_import_unreadable.rs:25:27
+   |
+LL |     theorem sum_to_zero : trust_import_off_import_unreadable__sum_to 0 = 0 := rfl
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this island names the kernel-import namespace, so it was checked after program admissions were minted (two-language design item 10)
+
+error: aborting due to 2 previous errors
+

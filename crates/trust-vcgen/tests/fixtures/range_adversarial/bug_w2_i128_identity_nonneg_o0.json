@@ -1,0 +1,109 @@
+{
+  "name": "bug_w2_i128_identity_nonneg",
+  "def_path": "probes_128_false::bug_w2_i128_identity_nonneg",
+  "span": {
+    "file": "probes_128_false.rs",
+    "line_start": 5,
+    "col_start": 0,
+    "line_end": 5,
+    "col_end": 77
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": true
+          }
+        },
+        "name": "x"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "probes_128_false.rs",
+                "line_start": 5,
+                "col_start": 77,
+                "line_end": 5,
+                "col_end": 77
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 128,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "probes_128_false.rs",
+        "line_start": 5,
+        "col_start": 60,
+        "line_end": 5,
+        "col_end": 71
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) >= (0)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Ge": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": 0
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) >= (0)"
+    ],
+    "invariants": []
+  }
+}

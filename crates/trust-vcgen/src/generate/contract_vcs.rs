@@ -4,6 +4,31 @@
 
 use super::*;
 
+mod return_metadata;
+#[cfg(test)]
+mod return_metadata_tests;
+// INTRINSIC-RESIDUAL-1: the call twin of the free-return-value tripwire.
+#[cfg(test)]
+mod call_return_tripwire_tests;
+
+/// How many enumerated return PATHS a single `Return`-block predecessor may be
+/// split into, one postcondition row per path (see the per-path split in
+/// [`generate_v2_contract_vcs_impl`]).
+///
+/// The guard walk itself keeps at most `safety::MAX_PATHS_PER_BLOCK` (64) paths
+/// per block, and splitting 64 ways would multiply this clause's solver calls by
+/// 64 for a shape no author writes. Past the cap the row keeps TODAY'S single
+/// `Or([per-path term, ..])` spelling, which is exactly the behaviour every row
+/// had before the split existed — so the cap can only cost capability, never
+/// soundness.
+///
+/// KILL SWITCH. Setting this to `1` makes the admitting range `2..=1` empty, so
+/// no split ever fires and every emitted row is byte-identical to the pre-split
+/// compiler. That is the one-line revert if the split ever has to be backed out
+/// without reverting the tests and docs; `per_path_postcondition_tests`'s two
+/// `row_count_*` tests are the ones that then go red, by design.
+pub(super) const POSTCONDITION_PATH_SPLIT_CAP: usize = 8;
+
 /// Summary-aware contract generation: the caller's OWN declared `ensures` (the
 /// `VcKind::Postcondition` lane) consults the summary-aware guard map, so the
 /// canonical separate-compilation case — proving `caller ensures P` from a
@@ -15,29 +40,6 @@ pub(super) fn generate_v2_contract_vcs_impl(
     // Len-witness debug context: tag every `LENWITNESS:` line emitted while this
     // function's contract VCs are generated (env-gated; no-op when unset).
     lenwitness_dbg_set_fn(&func.def_path);
-    let guard_paths_map = super::guard_map_for(func);
-    // Trust (lane-A CSE): one statement-version oracle for the whole function.
-    let sv = super::stmt_versions_for(func);
-    let path_definition_map = v2_build_path_definition_map(func);
-    let semantic_guards = match summaries {
-        Some(s) => build_semantic_guard_map_with_summaries(func, s),
-        None => build_semantic_guard_map(func),
-    };
-    let may_reassigned = v2_may_reassigned_per_block(func);
-    // Every `&mut`-parameter place the body stores to — the population the
-    // return-edge merge pin is allowed to state a reaching-value identity for.
-    // Function-wide on purpose: the writing block need not be a predecessor of
-    // the `Return` block at all (the ladder's top rung writes the flag three
-    // blocks upstream of the exit), which is exactly why the per-predecessor
-    // statement scan in `with_out_param_pins` could not see it.
-    let out_param_store_sorts = out_param_store_sorts(func);
-    // The authored `requires` clauses the assumption gate DROPPED — the entry
-    // hypothesis this function's postcondition VCs are assembled WITHOUT. Empty
-    // (the overwhelmingly common case) unless the function declares a `requires`
-    // and none of them is carried in `func.preconditions`; see the third
-    // silent-weakening tripwire below.
-    let dropped_requires = dropped_requires_clauses(func);
-    let empty_kill: FxHashSet<String> = FxHashSet::default();
     let contract_metadata =
         if func.spec.is_empty() { None } else { Some(func.spec.to_contract_metadata()) };
 
@@ -68,27 +70,73 @@ pub(super) fn generate_v2_contract_vcs_impl(
     // `check_contracts` is *replaced* by the body-aware VCs generated
     // here. Without that swap, the placeholder fires with no knowledge of
     // the return-block dataflow and the obligation is always SAT (refuted).
-    let mut seen_posts: Vec<Formula> = func.postconditions.clone();
-    let mut posts: Vec<(Formula, String, SourceSpan, Option<usize>)> = func
-        .postconditions
+    if func.postconditions.is_empty()
+        && !func.contracts.iter().any(|c| matches!(c.kind, ContractKind::Ensures))
+    {
+        return vcs;
+    }
+
+    enum PostOrigin<'a> {
+        FormulaDebug,
+        BorrowedText(&'a str),
+    }
+    impl PostOrigin<'_> {
+        fn into_owned_string(self, post: &Formula) -> String {
+            match self {
+                Self::FormulaDebug => format!("{post:?}"),
+                Self::BorrowedText(body) => body.to_string(),
+            }
+        }
+    }
+
+    let parsed_ensures: Vec<(usize, &str, &SourceSpan, Formula)> = func
+        .contracts
         .iter()
-        .map(|f| {
-            (
-                f.clone(),
-                format!("{f:?}"),
-                func.span.clone(),
-                unique_source_contract_index_for_formula(func, ContractKind::Ensures, f),
-            )
+        .enumerate()
+        .filter_map(|(contract_index, contract)| {
+            if !matches!(contract.kind, ContractKind::Ensures) {
+                return None;
+            }
+            let body = contract
+                .body
+                .strip_prefix(contracts::LOWERED_CONTRACT_PREFIX)
+                .unwrap_or(&contract.body);
+            // Extraction rebinds an admitted `xs.len()` leaf (`xs__len`) to the
+            // canonical `xs__slice_len` in `func.postconditions`
+            // (`rebind_postcondition_lengths`); re-read the raw text copy the same way,
+            // and ONLY for a base extraction rebound, or it would look like a second
+            // clause over a free `xs__len`.
+            let parsed =
+                trust_types::parse_spec_expr(body).map(|parsed| rebind_text_lengths(func, parsed))?;
+            Some((contract_index, body, &contract.span, parsed))
         })
         .collect();
-    for (contract_index, contract) in func.contracts.iter().enumerate() {
-        if !matches!(contract.kind, ContractKind::Ensures) {
-            continue;
+
+    let mut matched_ensures = vec![false; parsed_ensures.len()];
+    let mut posts: Vec<(Formula, PostOrigin<'_>, SourceSpan, Option<usize>)> =
+        Vec::with_capacity(func.postconditions.len() + parsed_ensures.len());
+    for f in &func.postconditions {
+        let mut first_idx = None;
+        let mut multiple = false;
+        for (pos, (idx, _, _, parsed)) in parsed_ensures.iter().enumerate() {
+            if parsed_clause_matches_typed(parsed, f) {
+                matched_ensures[pos] = true;
+                if first_idx.is_none() {
+                    first_idx = Some(*idx);
+                } else {
+                    multiple = true;
+                }
+            }
         }
-        let body = contract
-            .body
-            .strip_prefix(contracts::LOWERED_CONTRACT_PREFIX)
-            .unwrap_or(&contract.body);
+        posts.push((
+            f.clone(),
+            PostOrigin::FormulaDebug,
+            func.span.clone(),
+            if multiple { None } else { first_idx },
+        ));
+    }
+    let declared_post_len = posts.len();
+    for (pos, (contract_index, body, span, parsed)) in parsed_ensures.into_iter().enumerate() {
         // Sort-exact equality here made every `bool` clause fail to recognize
         // its own typed lowering, appending a SECOND, ill-sorted copy of the
         // same postcondition. That copy cannot lower to typed TrustIr, so it
@@ -97,11 +145,17 @@ pub(super) fn generate_v2_contract_vcs_impl(
         // modulo the parser's `Sort::Int` sentinel so the typed clause — the
         // type-faithful reading, and the one that actually gets solved — is
         // recognized as already present.
-        if let Some(parsed) = trust_types::parse_spec_expr(body)
-            && !seen_posts.iter().any(|f| parsed_clause_matches_typed(&parsed, f))
+        if !matched_ensures[pos]
+            && !posts[declared_post_len..]
+                .iter()
+                .any(|(f, _, _, _)| parsed_clause_matches_typed(&parsed, f))
         {
-            seen_posts.push(parsed.clone());
-            posts.push((parsed, body.to_string(), contract.span.clone(), Some(contract_index)));
+            posts.push((
+                parsed,
+                PostOrigin::BorrowedText(body),
+                span.clone(),
+                Some(contract_index),
+            ));
         }
     }
 
@@ -128,22 +182,76 @@ pub(super) fn generate_v2_contract_vcs_impl(
     // `explicit_postconditions` so it reaches the pin loop's discr/value pins,
     // instead of being shunted to fail-closed Unknown. Compared on BASE name
     // (strip any `#version` token) since the return-slot terms are unversioned.
-    let groundable = enum_return_grounded_model_vars(func);
-    // Len-witness lane (b62): payload-component length pairs whose equality every
-    // return path establishes in-body. The same resolver supplies the pins below.
-    let len_pairs = len_witness_credited_pairs(func, &posts);
-    let len_groundable: FxHashSet<String> =
-        len_pairs.iter().flat_map(|(a, b)| [a.name.clone(), b.name.clone()]).collect();
-    // Ordering/sign-witness lane (b62 F4), likewise gated across every return path.
-    let ord_items = ordering_witness_credited_items(func, &posts);
-    let ord_groundable: FxHashSet<String> =
-        ord_items.iter().flat_map(OrdWitnessItem::model_names).collect();
-    let mut explicit_postconditions: Vec<(Formula, Option<usize>, bool)> = Vec::new();
+    let lenwitness_dbg = super::witness_grounding::lenwitness_debug();
+    let mut any_spec_model_var = lenwitness_dbg;
+    let mut any_enum_return_model_var = lenwitness_dbg;
+    let mut any_len_witness_var = lenwitness_dbg;
+    let mut any_ord_witness_var = false;
+    for (f, _, _, _) in &posts {
+        trust_types::visit_formula_nodes(f, &mut |node| {
+            let Formula::Var(name, _) = node else { return };
+            if !contracts::is_spec_model_var(name) {
+                return;
+            }
+            any_spec_model_var = true;
+            let base = name.split('#').next().unwrap_or(name);
+            if base == "_0__discr" || base == "_0__value" {
+                any_enum_return_model_var = true;
+            } else if base.starts_with("_0__value.__trust_ok_") {
+                any_ord_witness_var = true;
+            } else if base.starts_with("_0__value.") && base.ends_with("__len") {
+                any_len_witness_var = true;
+            }
+        });
+    }
+    let (groundable, len_pairs, len_groundable, ord_items, ord_groundable) = if any_spec_model_var {
+        let groundable = if any_enum_return_model_var {
+            enum_return_grounded_model_vars(func)
+        } else {
+            FxHashSet::default()
+        };
+        let post_refs: Vec<&Formula> = if any_len_witness_var || any_ord_witness_var {
+            posts.iter().map(|(f, _, _, _)| f).collect()
+        } else {
+            Vec::new()
+        };
+        // Len-witness lane (b62): payload-component length pairs whose equality every
+        // return path establishes in-body. The same resolver supplies the pins below.
+        let len_pairs = if any_len_witness_var {
+            len_witness_credited_pairs(func, &post_refs)
+        } else {
+            Vec::new()
+        };
+        let len_groundable: FxHashSet<String> =
+            len_pairs.iter().flat_map(|(a, b)| [a.name.clone(), b.name.clone()]).collect();
+        // Ordering-witness lane (b62 F4), likewise gated across every return path (pair
+        // terms only, on a compiler-established order-consistent payload type; the sign
+        // half is retired: ORD-WITNESS-CONSISTENT-1).
+        let ord_items = if any_ord_witness_var {
+            ordering_witness_credited_items(func, &post_refs)
+        } else {
+            Vec::new()
+        };
+        let ord_groundable: FxHashSet<String> =
+            ord_items.iter().flat_map(OrdWitnessItem::model_names).collect();
+        (groundable, len_pairs, len_groundable, ord_items, ord_groundable)
+    } else {
+        (
+            FxHashSet::default(),
+            Vec::new(),
+            FxHashSet::default(),
+            Vec::new(),
+            FxHashSet::default(),
+        )
+    };
+    let mut explicit_postconditions: Vec<(Formula, Option<usize>, bool)> =
+        Vec::with_capacity(posts.len());
     let mut ungrounded_posts: Vec<(Vec<String>, String, SourceSpan, Option<usize>)> = Vec::new();
     for (post, origin, span, source_contract_index) in posts {
         // An arithmetic-bearing clause the Machine{w} lane admits
         // (`machine_faithful_clause_admissible`: one shared declared machine
-        // width, wrap-exact fragment, no spec `/`/`%`) enters the refutable
+        // width, wrap-exact fragment, only spec `%` by a total literal divisor)
+        // enters the refutable
         // body-aware lane — flagged so the FINAL assembled VC is translated
         // wholesale into declared-width QF_BV before it is emitted (the
         // ratified L1 rule 4 type-directed reading; the mathematical-Int
@@ -160,31 +268,45 @@ pub(super) fn generate_v2_contract_vcs_impl(
         // use the general unverifiable specification row.
         if contracts::formula_uses_unmodeled_machine_arithmetic_in_function(func, &post) {
             if contracts::machine_faithful_clause_admissible(func, &post) {
-                let ungrounded = contracts::ungrounded_spec_model_vars(&post);
+                let ungrounded = if any_spec_model_var {
+                    contracts::ungrounded_spec_model_vars(&post)
+                } else {
+                    Vec::new()
+                };
                 if ungrounded.is_empty() {
                     explicit_postconditions.push((post, source_contract_index, true));
                 } else {
-                    ungrounded_posts.push((ungrounded, origin, span, source_contract_index));
+                    let origin_str = origin.into_owned_string(&post);
+                    ungrounded_posts.push((ungrounded, origin_str, span, source_contract_index));
                 }
                 continue;
             }
             if !parsed_source_clause_matches(func, ContractKind::Ensures, &post) {
-                let ungrounded = contracts::ungrounded_spec_model_vars(&post);
+                let ungrounded = if any_spec_model_var {
+                    contracts::ungrounded_spec_model_vars(&post)
+                } else {
+                    Vec::new()
+                };
+                let origin_str = origin.into_owned_string(&post);
                 if ungrounded.is_empty() {
                     vcs.push(contracts::spec_unverifiable_vc(
                         func,
                         span,
                         "formula-only ensures uses unmodeled fixed-width machine arithmetic",
-                        &origin,
+                        &origin_str,
                         contract_metadata_with_source_index(
                             contract_metadata,
                             source_contract_index,
                         ),
                     ));
                 } else {
-                    ungrounded_posts.push((ungrounded, origin, span, source_contract_index));
+                    ungrounded_posts.push((ungrounded, origin_str, span, source_contract_index));
                 }
             }
+            continue;
+        }
+        if !any_spec_model_var {
+            explicit_postconditions.push((post, source_contract_index, false));
             continue;
         }
         let ungrounded: Vec<String> = contracts::ungrounded_spec_model_vars(&post)
@@ -199,7 +321,8 @@ pub(super) fn generate_v2_contract_vcs_impl(
         if ungrounded.is_empty() {
             explicit_postconditions.push((post, source_contract_index, false));
         } else {
-            ungrounded_posts.push((ungrounded, origin, span, source_contract_index));
+            let origin_str = origin.into_owned_string(&post);
+            ungrounded_posts.push((ungrounded, origin_str, span, source_contract_index));
         }
     }
 
@@ -228,41 +351,151 @@ pub(super) fn generate_v2_contract_vcs_impl(
         return vcs;
     }
 
+    if !func
+        .body
+        .blocks
+        .iter()
+        .any(|b| matches!(&b.terminator, Terminator::Return | Terminator::TailCall { .. }))
+    {
+        return vcs;
+    }
+
+    let guard_paths_map_cell: std::cell::OnceCell<
+        std::rc::Rc<FxHashMap<BlockId, Vec<Vec<(BlockId, GuardCondition)>>>>,
+    > = std::cell::OnceCell::new();
+    let sv_cell: std::cell::OnceCell<std::rc::Rc<StmtVersionCtx>> = std::cell::OnceCell::new();
+    let path_definition_map_cell: std::cell::OnceCell<
+        std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>,
+    > = std::cell::OnceCell::new();
+    let semantic_guards_cell: std::cell::OnceCell<std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>> =
+        std::cell::OnceCell::new();
+    let out_param_store_sorts_cell: std::cell::OnceCell<FxHashMap<String, Option<Sort>>> =
+        std::cell::OnceCell::new();
+    let dropped_requires_cell: std::cell::OnceCell<Vec<Formula>> = std::cell::OnceCell::new();
+    let empty_kill: FxHashSet<String> = FxHashSet::default();
+
+    // Trust: the postcondition parser models `result`/`_0` as a default
+    // (Int) sort, but the return slot's true sort may differ — e.g. a
+    // `-> bool` predicate `fn f(x) -> bool { x > 0 }`. Re-sort the postcond's
+    // `_0` to the function's ACTUAL return sort so it unifies with the body's
+    // typed return value; otherwise a `-> bool` postcondition like
+    // `ret == (x > 0)` is false-refuted (the body fact `__ret == (x > 0)` is
+    // Bool while the postcond's `_0` is Int — two disconnected variables).
+    let ret_place = Place::local(0);
+    let ret_sort = crate::place_sort(func, &ret_place).unwrap_or(Sort::Int);
+    let ret_alias = place_to_var_name(func, &ret_place);
+    let ret_subst = [("_0".to_string(), Formula::var_owned("_0".to_string(), ret_sort.clone()))];
+    let ret_alias_subst = (ret_alias != "_0")
+        .then(|| [(ret_alias.clone(), Formula::var_owned("_0".to_string(), ret_sort.clone()))]);
+    let may_have_enum_return = !groundable.is_empty()
+        || super::witness_grounding::body_may_have_std_enum_return(func)
+        || super::witness_grounding::lenwitness_debug();
+    let global_facts_cell: std::cell::OnceCell<std::rc::Rc<RowGlobalFacts>> =
+        std::cell::OnceCell::new();
+    let fn_sym: Symbol = func.name.as_str().into();
+    let mut v2_preds: Option<std::rc::Rc<crate::fn_memo::V2Predecessors>> = None;
+    let empty_clause_sorts: FxHashMap<String, Option<Sort>> = FxHashMap::default();
+
+    struct PreparedPostcondition {
+        raw_post: Formula,
+        clause_metadata: Option<ContractMetadata>,
+        machine_lane: bool,
+        formula_refs_return_slot: bool,
+        refs_mutated_param: bool,
+        resorted_post: std::cell::OnceCell<Formula>,
+        clause_sorts: std::cell::OnceCell<FxHashMap<String, Option<Sort>>>,
+        base_clause_written_out_params: std::cell::OnceCell<Vec<String>>,
+    }
+    let mutated_param_places_cell: std::cell::OnceCell<super::callee_summaries::MutatedParamPlaces> =
+        std::cell::OnceCell::new();
+    let prepared_posts: Vec<PreparedPostcondition> = explicit_postconditions
+        .into_iter()
+        .map(|(raw_post, source_contract_index, machine_lane)| {
+            let clause_metadata =
+                contract_metadata_with_source_index(contract_metadata, source_contract_index);
+            let formula_refs_return_slot = formula_references_return_slot(&raw_post);
+            let refs_mutated_param =
+                super::callee_summaries::postcondition_references_mutated_param_cached(
+                    func,
+                    &raw_post,
+                    &mutated_param_places_cell,
+                );
+            PreparedPostcondition {
+                raw_post,
+                clause_metadata,
+                machine_lane,
+                formula_refs_return_slot,
+                refs_mutated_param,
+                resorted_post: std::cell::OnceCell::new(),
+                clause_sorts: std::cell::OnceCell::new(),
+                base_clause_written_out_params: std::cell::OnceCell::new(),
+            }
+        })
+        .collect();
+
     for block in &func.body.blocks {
         if !matches!(&block.terminator, Terminator::Return | Terminator::TailCall { .. }) {
             continue;
         }
 
-        let predecessors: Vec<&trust_types::BasicBlock> = func
-            .body
-            .blocks
-            .iter()
-            .filter(|pred| v2_terminator_targets(&pred.terminator).contains(&block.id))
-            .collect();
+        let preds = v2_preds.get_or_insert_with(|| crate::fn_memo::v2_predecessors_or_build(func));
+        let predecessors = preds.predecessors(func, block.id);
         let vc_blocks: Vec<&trust_types::BasicBlock> =
             if predecessors.is_empty() { vec![block] } else { predecessors };
+        let metadata_pins: Vec<_> = vc_blocks
+            .iter()
+            .map(|predecessor| return_metadata::for_return_path(func, predecessor, block))
+            .collect();
+        let agg_operands_cell: std::cell::OnceCell<FxHashMap<String, Option<Sort>>> =
+            std::cell::OnceCell::new();
 
-        // Trust: the postcondition parser models `result`/`_0` as a default
-        // (Int) sort, but the return slot's true sort may differ — e.g. a
-        // `-> bool` predicate `fn f(x) -> bool { x > 0 }`. Re-sort the postcond's
-        // `_0` to the function's ACTUAL return sort so it unifies with the body's
-        // typed return value; otherwise a `-> bool` postcondition like
-        // `ret == (x > 0)` is false-refuted (the body fact `__ret == (x > 0)` is
-        // Bool while the postcond's `_0` is Int — two disconnected variables).
-        let ret_place = Place::local(0);
-        let ret_sort = crate::place_sort(func, &ret_place).unwrap_or(Sort::Int);
-        let ret_alias = place_to_var_name(func, &ret_place);
+        struct PreparedReturnPath {
+            vc_block_span: SourceSpan,
+            direct_return_pins: Vec<Formula>,
+            unlowerable_return_assignment: bool,
+            enum_return_pins: Vec<Formula>,
+            witness_pins: Vec<Formula>,
+            call_dest_return_pins: Vec<Formula>,
+            arm_copy_pin: Option<(Vec<Formula>, bool)>,
+            has_deref_load_return: bool,
+            edge_guard: Option<Formula>,
+            live_path_defs: Vec<Formula>,
+            sem_conjuncts: Vec<Formula>,
+            unmarked_sysroot_call: std::cell::OnceCell<bool>,
+        }
+        let prepared_paths: Vec<std::cell::OnceCell<PreparedReturnPath>> =
+            (0..vc_blocks.len()).map(|_| std::cell::OnceCell::new()).collect();
 
-        for (post, source_contract_index, machine_lane) in &explicit_postconditions {
-            let clause_metadata =
-                contract_metadata_with_source_index(contract_metadata, *source_contract_index);
+        for prep in &prepared_posts {
+            let clause_metadata = prep.clause_metadata.clone();
+            let machine_lane = &prep.machine_lane;
+            let formula_refs_return_slot = prep.formula_refs_return_slot;
+            // A failed metadata relation is independently fatal to this
+            // authored postcondition. Do this before the reassigned-parameter
+            // shortcut and before any other return-pin producer: neither a
+            // free clause nor a stale scalar pin can repair the missing value.
+            if formula_refs_return_slot
+                && let Some(reason) = metadata_pins.iter().find_map(|pin| match pin {
+                    return_metadata::MetadataReturnPin::Unsupported(reason) => Some(*reason),
+                    _ => None,
+                })
+            {
+                vcs.push(contracts::spec_unverifiable_vc(
+                    func,
+                    v2_block_span(func, block),
+                    reason,
+                    &format!("{:?}", prep.raw_post),
+                    clause_metadata,
+                ));
+                continue;
+            }
             // SOUNDNESS (P0, hunt-6): a postcondition over a REASSIGNED by-value parameter would
             // be proved against the parameter's FINAL value, not its `ensures` ENTRY snapshot — a
             // false proof (`#[ensures(move |r| *r==a)] fn f(mut a){ a+=1; a }`: VC checks r==a_final
             // = 11==11 PROVED, true r==a_entry = 11==10 FALSE). Fail-close: emit ONE not-proved
             // Postcondition VC (a SATisfiable `Bool(true)` is never UNSAT, so it is reported
             // not-proved, NEVER PROVED) until entry-snapshot modeling lands. (FULL is already sound.)
-            if postcondition_references_mutated_param(func, post) {
+            if prep.refs_mutated_param {
                 // Emit `Not(post)` with NO body/param bindings: the parameter is then FREE (its
                 // unknown entry value), so the negated postcondition is trivially SATisfiable —
                 // reported not-proved (fast, like any refuted postcondition), never PROVED. This
@@ -278,7 +511,7 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 let formula = if *machine_lane {
                     match contracts::machine_faithful_vc_formula(
                         func,
-                        &Formula::Not(Box::new(post.clone())),
+                        &Formula::Not(Box::new(prep.raw_post.clone())),
                     ) {
                         Some(machine) => machine,
                         None => {
@@ -286,18 +519,18 @@ pub(super) fn generate_v2_contract_vcs_impl(
                                 func,
                                 func.span.clone(),
                                 "machine-arithmetic ensures over a reassigned parameter is outside the declared-width fragment",
-                                &format!("{post:?}"),
+                                &format!("{:?}", prep.raw_post),
                                 clause_metadata,
                             ));
                             continue;
                         }
                     }
                 } else {
-                    Formula::Not(Box::new(post.clone()))
+                    Formula::Not(Box::new(prep.raw_post.clone()))
                 };
                 vcs.push(VerificationCondition {
                     kind: VcKind::Postcondition,
-                    function: func.name.as_str().into(),
+                    function: fn_sym,
                     location: func.span.clone(),
                     formula,
                     contract_metadata: clause_metadata,
@@ -305,13 +538,68 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 });
                 continue;
             }
-            // Re-sort the postcond's return variable `_0` to the real return sort.
-            let post = substitute_summary_params(
-                post,
-                &[("_0".to_string(), Formula::var_owned("_0".to_string(), ret_sort.clone()))],
-            );
-            for vc_block in &vc_blocks {
-                let mut formula = Formula::Not(Box::new(post.clone()));
+            let guard_paths_map = guard_paths_map_cell.get_or_init(|| super::guard_map_for(func));
+            let sv = sv_cell.get_or_init(|| super::stmt_versions_for(func));
+            let path_definition_map =
+                path_definition_map_cell.get_or_init(|| super::path_definition_map_for(func));
+            let semantic_guards =
+                semantic_guards_cell.get_or_init(|| super::semantic_guard_map_for(func, summaries));
+            let out_param_store_sorts =
+                out_param_store_sorts_cell.get_or_init(|| out_param_store_sorts(func));
+            let dropped_requires =
+                dropped_requires_cell.get_or_init(|| dropped_requires_clauses(func));
+            let agg_operands = agg_operands_cell.get_or_init(|| {
+                vc_blocks
+                    .iter()
+                    .any(|vb| vb.id != block.id)
+                    .then(|| return_slot_aggregate_operand_sorts(func, block))
+                    .unwrap_or_default()
+            });
+
+            // Re-sort the postcond's return variable `_0` to the real return sort (once per clause).
+            let post = prep
+                .resorted_post
+                .get_or_init(|| substitute_summary_params_owned(prep.raw_post.clone(), &ret_subst));
+            let clause_sorts: &FxHashMap<String, Option<Sort>> =
+                if out_param_store_sorts.is_empty() && agg_operands.is_empty() {
+                    &empty_clause_sorts
+                } else {
+                    prep.clause_sorts.get_or_init(|| collect_clause_base_sorts(post))
+                };
+            let base_clause_written_out_params: &[String] = if out_param_store_sorts.is_empty() {
+                &[]
+            } else {
+                prep.base_clause_written_out_params.get_or_init(|| {
+                    let mut names: Vec<String> = clause_sorts
+                        .keys()
+                        .filter(|base| out_param_store_sorts.get(*base).is_some_and(Option::is_some))
+                        .cloned()
+                        .collect();
+                    if names.len() > 1 {
+                        names.sort_unstable();
+                    }
+                    names
+                })
+            };
+            for ((vc_block, metadata_pin), path_cell) in
+                vc_blocks.iter().zip(&metadata_pins).zip(&prepared_paths)
+            {
+                let Some(mut formula) = postcondition_at_return_path(
+                    func,
+                    sv,
+                    vc_block,
+                    block,
+                    Formula::Not(Box::new(post.clone())),
+                ) else {
+                    vcs.push(contracts::spec_unverifiable_vc(
+                        func,
+                        v2_block_span(func, block),
+                        "postcondition result has no established return-path value",
+                        &format!("{post:?}"),
+                        clause_metadata.clone(),
+                    ));
+                    continue;
+                };
                 formula = v2_formula_with_block_defs(func, block, formula);
                 if vc_block.id != block.id {
                     formula = v2_formula_with_block_defs(func, vc_block, formula);
@@ -338,106 +626,870 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 // assert-passed `_t.0 == x + 1` semantic this pins `_0` to the
                 // body's computed result. Sound: `_0` is the return slot, assigned
                 // once before `Return`, so the equality holds on the return path.
-                let mut unlowerable_return_assignment = false;
-                for def_block in [&**vc_block, block] {
-                    for stmt in &def_block.stmts {
-                        let Statement::Assign { place, rvalue, .. } = stmt else {
-                            continue;
-                        };
-                        if place.local != 0 || !place.projections.is_empty() {
-                            continue;
-                        }
-                        // CheckedBinaryOp's value is its `.0` field, pinned via the
-                        // assert-passed semantic guard (`_t.0 == x + 1`), NOT its raw
-                        // wrapping result — leave it to that path.
-                        if matches!(rvalue, Rvalue::CheckedBinaryOp(..)) {
-                            continue;
-                        }
-                        // Pin `_0 == <rvalue>` for ANY directly-representable return
-                        // assignment (Use / BinaryOp / UnaryOp / Cast), not just
-                        // `Use`. The block-def relevance filter DROPS a
-                        // `__ret == <rvalue>` def when the postcondition shares no
-                        // variable with it — e.g. `ensures(r < 0)` for `-x`
-                        // references only `_0`, not `x`, so `__ret == Neg(x)` is
-                        // pruned and `_0` stays havoc'd, FALSE-REFUTING a valid
-                        // postcondition. Pinning by the STANDARD `_0` name the
-                        // postcond uses (not the `place_to_var_name` alias `__ret`)
-                        // bypasses the relevance filter. Sound: `_0` is the return
-                        // slot, assigned once before `Return`.
-                        match crate::chc::rvalue_to_formula(func, rvalue) {
-                            Ok(rformula) => {
-                                let sort = crate::place_sort(func, place).unwrap_or(Sort::Int);
-                                let ret_def = Formula::Eq(
-                                    Box::new(Formula::var_owned(format!("_{}", place.local), sort)),
-                                    Box::new(rformula),
-                                );
-                                formula = Formula::And(vec![ret_def, formula]);
+                let path_prep = path_cell.get_or_init(|| {
+                    let vc_block_span = v2_block_span(func, vc_block);
+                    let mut direct_return_pins: Vec<Formula> = Vec::new();
+                    let mut unlowerable_return_assignment = false;
+                    for def_block in [&**vc_block, block] {
+                        // Trust (2026-09-30, P2): `k` stamps each pin at its OWN statement.
+                        for (k, stmt) in def_block.stmts.iter().enumerate() {
+                            let Statement::Assign { place, rvalue, .. } = stmt else {
+                                continue;
+                            };
+                            if place.local != 0 || !place.projections.is_empty() {
+                                continue;
                             }
-                            // A return assignment whose rvalue the encoder
-                            // cannot lower must not be SILENTLY dropped: with
-                            // no pin the return slot is FREE, the negated
-                            // clause becomes vacuously satisfiable, and the
-                            // row turns into a refutable query about nothing
-                            // (the abs `-x` branch spent a day as exactly this
-                            // — a spuriously SAT VC whose native refutation
-                            // had to be firewalled to Unknown). Record the
-                            // gap; the emission check below fails the row
-                            // closed to a VISIBLE unsupported shape when no
-                            // other conjunct pinned the slot.
-                            Err(_) => unlowerable_return_assignment = true,
-                        }
+                            // Review round 43: the pin is conjoined BARE, and the final
+                            // rename stamps each of its reads with the version at the
+                            // return point. A read the path rewrites after this statement
+                            // (`let e = y; y = 5; e`, MIR `_0 = copy y; y = 5`) became a
+                            // claim about the NEW value: `ensures result == 5` was proved
+                            // and kernel-certified while `e` returns the old `y`. Such a
+                            // pin is withheld.
+                            let path_buf = [(def_block, k + 1), (block, 0)];
+                            let path: &[(&trust_types::BasicBlock, usize)] =
+                                if std::ptr::eq(def_block, *vc_block) && vc_block.id != block.id {
+                                    &path_buf[..]
+                                } else {
+                                    &path_buf[..1]
+                                };
+                            // A withheld pin leaves the slot to the other return pins
+                            // (the per-path hop below); a slot nothing pins is free, so
+                            // its row can fail or be unknown but never prove.
+                            let window_buf = [&**vc_block, block];
+                            let window: &[&trust_types::BasicBlock] = if vc_block.id == block.id {
+                                &window_buf[1..]
+                            } else {
+                                &window_buf[..]
+                            };
+                            if !return_pin_reads_are_current(func, path, window, rvalue) {
+                                // An operand the encoder cannot lower keeps its old
+                                // meaning: the slot is reported unlowerable, so a
+                                // partial pin never makes the rest refutable.
+                                if rvalue_has_unlowerable_operand(rvalue) {
+                                    unlowerable_return_assignment = true;
+                                }
+                                continue;
+                            }
+                            // CheckedBinaryOp's value is its `.0` field, pinned via the
+                            // assert-passed semantic guard (`_t.0 == x + 1`), NOT its raw
+                            // wrapping result — leave it to that path.
+                            if matches!(rvalue, Rvalue::CheckedBinaryOp(..)) {
+                                continue;
+                            }
+                            // Pin `_0 == <rvalue>` for ANY directly-representable return
+                            // assignment (Use / BinaryOp / UnaryOp / Cast), not just
+                            // `Use`. The block-def relevance filter DROPS a
+                            // `__ret == <rvalue>` def when the postcondition shares no
+                            // variable with it — e.g. `ensures(r < 0)` for `-x`
+                            // references only `_0`, not `x`, so `__ret == Neg(x)` is
+                            // pruned and `_0` stays havoc'd, FALSE-REFUTING a valid
+                            // postcondition. Pinning by the STANDARD `_0` name the
+                            // postcond uses (not the `place_to_var_name` alias `__ret`)
+                            // bypasses the relevance filter. Each pin names this
+                            // assignment's value, even if a later write replaces it.
+                            let return_formula = match (rvalue, metadata_pin) {
+                                (
+                                    Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, _),
+                                    return_metadata::MetadataReturnPin::Exact(length),
+                                ) => Ok(length.clone()),
+                                _ => crate::chc::rvalue_to_formula(func, rvalue),
+                            };
+                            // Trust (2026-09-30, P2): stamp the pin's reads at its own
+                            // statement; a stamp that cannot be made fails the row
+                            // closed exactly like an unlowerable rvalue.
+                            let return_formula = return_formula.ok().and_then(|rformula| {
+                                stamp_return_pin_reads(
+                                    sv, func, vc_block, block, def_block, k, rformula,
+                                )
+                            });
+                            match return_formula {
+                                Some(rformula) => {
+                                    let sort =
+                                        crate::place_sort(func, place).unwrap_or(Sort::Int);
+                                    // The destination belongs to this write too.
+                                    // A later `_0` assignment must not turn an old
+                                    // return pin into a contradictory final-value pin.
+                                    let ret_var = version_rename_at(
+                                        &Formula::var_owned("_0".to_string(), sort),
+                                        sv,
+                                        func,
+                                        def_block.id,
+                                        k + 1,
+                                    );
+                                    direct_return_pins
+                                        .push(Formula::Eq(Box::new(ret_var), Box::new(rformula)));
+                                }
+                                // A return assignment whose rvalue the encoder
+                                // cannot lower must not be SILENTLY dropped: with
+                                // no pin the return slot is FREE, the negated
+                                // clause becomes vacuously satisfiable, and the
+                                // row turns into a refutable query about nothing
+                                // (the abs `-x` branch spent a day as exactly this
+                                // — a spuriously SAT VC whose native refutation
+                                // had to be firewalled to Unknown). Record the
+                                // gap; the emission check below fails the row
+                                // closed to a VISIBLE unsupported shape when no
+                                // other conjunct pinned the slot.
+                                None => unlowerable_return_assignment = true,
+                            }
 
-                        // Trust (tuple/struct return-aggregate pin, over-refutation
-                        // audit #2): a `_0 = (op0, op1, ...)` Tuple / single-variant
-                        // struct aggregate return is NOT scalar, so `rvalue_to_formula`
-                        // above yields nothing and the return FIELDS `_0.i` stay free.
-                        // A postcondition over `ret.0`/`ret.1` (`Var("_0.0")`,
-                        // `Var("_0.1")` from the contract parser) is then vacuously
-                        // refutable even when the body makes it hold (`(x, x)` ⇒
-                        // `_0.0 == _0.1`). Decompose the aggregate: pin each
-                        // `_0.i == <field op_i>` under the SAME `_0.i` name the parser
-                        // mints (`place_to_var_name` of a `Field(i)` projection).
-                        // SOUND: `_0` is assigned once before `Return`, so each field
-                        // equality holds on the return path; a FALSE postcondition
-                        // stays refutable (each field is pinned to its genuine value,
-                        // never credited). Only `Tuple` / variant-0 `Adt` (structs and
-                        // single-variant enums) decompose positionally to `.i`;
-                        // multi-variant / array / closure aggregates are left free
-                        // (fail-closed).
-                        if let Rvalue::Aggregate(kind, ops) = rvalue {
-                            let positional = matches!(
-                                kind,
-                                AggregateKind::Tuple | AggregateKind::Adt { variant: 0, .. }
-                            );
-                            if positional {
-                                for (i, op) in ops.iter().enumerate() {
-                                    let field_place = Place {
-                                        local: place.local,
-                                        projections: vec![trust_types::Projection::Field(i)],
-                                    };
-                                    if let Ok(field_formula) =
-                                        crate::chc::operand_to_formula_checked(func, op)
-                                    {
-                                        // Pin under the RAW `_<local>.<i>` name the
-                                        // contract parser mints (`Var("_0.0")`), NOT
-                                        // the `place_to_var_name` alias `__ret.<i>`
-                                        // (local 0 carries source name `__ret`) — just
-                                        // as the scalar pin above uses raw `_<local>`.
-                                        // Otherwise the pin and the postcondition name
-                                        // distinct field vars and never connect.
-                                        let field_name = format!("_{}.{}", place.local, i);
-                                        let field_sort = crate::place_sort(func, &field_place)
-                                            .unwrap_or(Sort::Int);
-                                        let field_def = Formula::Eq(
-                                            Box::new(Formula::var_owned(field_name, field_sort)),
-                                            Box::new(field_formula),
-                                        );
-                                        formula = Formula::And(vec![field_def, formula]);
+                            // Trust (tuple/struct return-aggregate pin, over-refutation
+                            // audit #2): a `_0 = (op0, op1, ...)` Tuple / single-variant
+                            // struct aggregate return is NOT scalar, so `rvalue_to_formula`
+                            // above yields nothing and the return FIELDS `_0.i` stay free.
+                            // A postcondition over `ret.0`/`ret.1` (`Var("_0.0")`,
+                            // `Var("_0.1")` from the contract parser) is then vacuously
+                            // refutable even when the body makes it hold (`(x, x)` ⇒
+                            // `_0.0 == _0.1`). Decompose the aggregate: pin each
+                            // `_0.i == <field op_i>` under the SAME `_0.i` name the parser
+                            // mints (`place_to_var_name` of a `Field(i)` projection).
+                            // SOUND: `_0` is assigned once before `Return`, so each field
+                            // equality holds on the return path; a FALSE postcondition
+                            // stays refutable (each field is pinned to its genuine value,
+                            // never credited). Only `Tuple` / variant-0 `Adt` (structs and
+                            // single-variant enums) decompose positionally to `.i`;
+                            // multi-variant / array / closure aggregates are left free
+                            // (fail-closed).
+                            if let Rvalue::Aggregate(kind, ops) = rvalue {
+                                let positional = matches!(
+                                    kind,
+                                    AggregateKind::Tuple | AggregateKind::Adt { variant: 0, .. }
+                                );
+                                if positional {
+                                    for (i, op) in ops.iter().enumerate() {
+                                        let field_place = Place {
+                                            local: place.local,
+                                            projections: vec![trust_types::Projection::Field(i)],
+                                        };
+                                        // Trust (2026-09-30, P2): stamped at the
+                                        // aggregate's own statement; unstampable → no pin.
+                                        if let Ok(field_formula) =
+                                            crate::chc::operand_to_formula_checked(func, op)
+                                            && let Some(field_formula) = stamp_return_pin_reads(
+                                                sv,
+                                                func,
+                                                vc_block,
+                                                block,
+                                                def_block,
+                                                k,
+                                                field_formula,
+                                            )
+                                        {
+                                            // Pin under the RAW `_<local>.<i>` name the
+                                            // contract parser mints (`Var("_0.0")`), NOT
+                                            // the `place_to_var_name` alias `__ret.<i>`
+                                            // (local 0 carries source name `__ret`) — just
+                                            // as the scalar pin above uses raw `_<local>`.
+                                            // Otherwise the pin and the postcondition name
+                                            // distinct field vars and never connect.
+                                            let field_name = format!("_{}.{}", place.local, i);
+                                            let field_sort =
+                                                crate::place_sort(func, &field_place)
+                                                    .unwrap_or(Sort::Int);
+                                            direct_return_pins.push(Formula::Eq(
+                                                Box::new(Formula::var_owned(
+                                                    field_name, field_sort,
+                                                )),
+                                                Box::new(field_formula),
+                                            ));
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+
+                    // Trust (Option/Result-return discriminant/value pin): ground the
+                    // synthetic spec-model terms `_0__discr` / `_0__value` that the
+                    // contract parser mints for `result.is_none()`/`is_some()`/
+                    // `is_ok()`/`is_err()`/`unwrap()` to the body's ACTUAL in-body
+                    // `_0 = Some(x)` / `_0 = None` / `_0 = Ok(x)` / `_0 = Err(e)`
+                    // construction. Without this the postcondition's wrapper accessors
+                    // stay free and a valid `r.is_none() || low <= r.unwrap() <= high`
+                    // is un-groundable (the split above routes it to fail-closed
+                    // Unknown UNLESS `enum_return_grounded_model_vars` credited it —
+                    // which it does ONLY when EVERY return path pins the terms here).
+                    // Scoped to the EXACT std/core `Option`/`Result` ADTs. The pinned
+                    // value is the PARSER-CONVENTION model discriminant
+                    // (`std_enum_model_discr`), NOT the raw machine variant index:
+                    // Option's variant order matches the convention (None=0, Some=1 —
+                    // identity), while Result's is INVERTED (`Ok` is machine variant 0
+                    // but must pin `_0__discr==1`, the parser's `is_ok ⟹ _0__discr!=0`;
+                    // `Err` is variant 1 and pins `_0__discr==0`). Pinning the raw
+                    // index for Result would swap `is_ok`/`is_err` polarity — a
+                    // simultaneous false-PROVE and false-FAIL. Pin at MOST ONE
+                    // discriminant per return path (last / nearest-to-return wins) so
+                    // two differing-variant assignments can never conjoin
+                    // `_0__discr==0 ∧ _0__discr==1` into a vacuous UNSAT (a
+                    // false-PROVE). SOUND: `_0 = Some(x)` / `_0 = Ok(x)` literally
+                    // carries its variant and payload x, so `_0__discr==<model> ∧
+                    // _0__value==x` are exact identities of the constructed value under
+                    // the parser's reading; `_0 = None` / `_0 = Err(e)` is
+                    // `_0__discr==0` exactly — a FALSE postcondition still refutes
+                    // (every term pinned to its genuine value, never credited).
+                    // `_0__value` is pinned only on the payload variant's path
+                    // (`Some`/`Ok`) with an integer payload; leaving it free on the
+                    // other path — and on non-integer payloads (ny-cert's Rat/Vec
+                    // shapes, whose `_0__value*` terms the gate keeps UNGROUNDED so
+                    // they never reach this refutable lane) — is sound (a free var
+                    // only adds SAT/refute, never manufactures UNSAT/proof).
+                    let mut enum_return_pins: Vec<Formula> = Vec::new();
+                    let enum_return_pin = may_have_enum_return
+                        .then(|| {
+                            super::witness_grounding::resolve_enum_return_aggregate_located(
+                                func, vc_block, block,
+                            )
+                        })
+                        .flatten()
+                        .map(|(kind, variant, ops, agg_block, agg_stmt)| {
+                            // Parser-convention model discriminant (Result INVERTED).
+                            let discr = std_enum_model_discr(kind, variant);
+                            let payload = if variant == std_enum_payload_variant(kind)
+                                && ops.len() == 1
+                                && crate::operand_ty_cow(func, &ops[0])
+                                    .as_deref()
+                                    .is_some_and(|t| matches!(t, Ty::Int { .. }))
+                            {
+                                // Trust (2026-09-30, P2): stamp the payload's reads at the
+                                // aggregate's OWN statement; no located statement or an
+                                // unstampable read drops the payload pin (fail closed).
+                                let agg_def_block = func
+                                    .body
+                                    .blocks
+                                    .get(agg_block.0)
+                                    .filter(|b| b.id == agg_block);
+                                crate::chc::operand_to_formula_checked(func, &ops[0])
+                                    .ok()
+                                    .and_then(|pf| {
+                                        stamp_return_pin_reads(
+                                            sv,
+                                            func,
+                                            vc_block,
+                                            block,
+                                            agg_def_block?,
+                                            agg_stmt?,
+                                            pf,
+                                        )
+                                    })
+                            } else {
+                                None
+                            };
+                            (discr, payload)
+                        });
+                    if let Some((discr, payload)) = enum_return_pin {
+                        enum_return_pins.push(Formula::Eq(
+                            Box::new(Formula::var_owned("_0__discr".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(discr)),
+                        ));
+                        if let Some(pf) = payload {
+                            enum_return_pins.push(Formula::Eq(
+                                Box::new(Formula::var_owned("_0__value".to_string(), Sort::Int)),
+                                Box::new(pf),
+                            ));
+                        }
+                    }
+
+                    // Trust (len-witness pin, b62): ground the CREDITED payload-
+                    // component length pairs (`_0__value.<i>.<j>_len` — the lowered
+                    // crown `matches!(r, Ok(c) if c.….len() != c.….len())` idiom) on
+                    // this return path, via the SAME per-path resolver the gate ran
+                    // (`len_witness_path_pins` — gate/pin agreement is what keeps a
+                    // credited term from ever reaching a refutable VC unpinned).
+                    // Payload-variant paths conjoin the construction-derived
+                    // equality `len_a == len_b` (plus, for the guard shape, the
+                    // individual `Vec::len`-dest witness pins); empty-variant paths
+                    // conjoin nothing (the terms have no denotation there — free is
+                    // the sound direction, and the discr pin already decides those
+                    // VCs). Every fact is TRUE of the returned value on this path
+                    // (see the len-witness section banner), so a FALSE postcondition
+                    // stays refutable.
+                    let mut witness_pins: Vec<Formula> = Vec::new();
+                    for pair in &len_pairs {
+                        if let Some(pins) = len_witness_path_pins(func, *vc_block, block, pair) {
+                            witness_pins.extend(pins);
+                        }
+                    }
+                    // Trust (ordering-witness pin, b62 F4): ground the
+                    // CREDITED `__trust_ok` pair terms (the sign term is no longer
+                    // credited, ORD-WITNESS-CONSISTENT-1; the shapes were
+                    // lowered ny selfcheck/branch `matches!(r, Ok((d, c)) if
+                    // d > c)` / `Ok(c) if c.is_positive()` idioms over opaque
+                    // `Rat` arena handles) on this return path, via the SAME
+                    // per-path resolver the gate ran (`ordering_witness_path_pins`
+                    // — gate/pin agreement keeps a credited term from ever
+                    // reaching a refutable VC unpinned). Payload-variant paths
+                    // conjoin ONE guard-derived ordering fact per item (bound to
+                    // the dominating witness call's bool edge — never a
+                    // re-encoding of the handle ints); empty-variant paths
+                    // conjoin nothing (the terms have no denotation there — free
+                    // is the sound direction, and the discr pin already decides
+                    // those VCs). Every fact is TRUE of the returned values on
+                    // this path (see the F4 section banner), so a FALSE
+                    // postcondition stays refutable.
+                    for item in &ord_items {
+                        if let Some(pins) =
+                            ordering_witness_path_pins(func, *vc_block, block, item)
+                        {
+                            witness_pins.extend(pins);
+                        }
+                    }
+
+                    // Trust (saturating-return pin, over-refutation audit #5): when a
+                    // predecessor's TERMINATOR is a std `saturating_add`/`saturating_sub`
+                    // call whose dest IS the return slot `_0` (the function returns the
+                    // saturating result directly), the general call-dest fact names it via
+                    // the `place_to_var_name` alias `__ret`, which does NOT reach the
+                    // postcondition's `_0` in this lane. Pin `_0 == clamp(x±y, MIN, MAX)`
+                    // under the RAW `_0` name the postcondition uses (exactly as the
+                    // scalar/tuple return-pins above do), so `#[ensures(|r| *r >= x)]` over
+                    // `x.saturating_add(y)` proves. SOUND: the value is the exact, total std
+                    // semantics (see `saturating_call_dest_value`); `_0` is assigned once
+                    // before `Return` on this path.
+                    let mut call_dest_return_pins: Vec<Formula> = Vec::new();
+                    let has_ret_call = [&**vc_block, block].into_iter().any(|tb| {
+                        matches!(
+                            &tb.terminator,
+                            Terminator::Call { dest, .. }
+                                if dest.local == 0 && dest.projections.is_empty()
+                        )
+                    });
+                    if has_ret_call {
+                        for term_block in [&**vc_block, block] {
+                            let Terminator::Call { dest, .. } = &term_block.terminator else {
+                                continue;
+                            };
+                            if dest.local != 0 || !dest.projections.is_empty() {
+                                continue;
+                            }
+                            // Any exact-value MODELED call (saturating_add/sub, wrapping_neg)
+                            // whose dest is the return slot. Its value is an `Ite`; a term-
+                            // `Ite` in a postcondition obligation is pruned by trust-mc / not
+                            // routed by trust-wp, so `_0 == <Ite>` stays UNKNOWN. `ite_free_equality`
+                            // LIFTS the `Ite` to formula-level guards, which both backends
+                            // discharge — so `#[ensures]` over `x.saturating_add(y)` /
+                            // `x.wrapping_neg()` proves. See `ite_free_equality`.
+                            let modeled = saturating_call_dest_value(func, &term_block.terminator)
+                                .or_else(|| {
+                                    wrapping_neg_call_dest_value(func, &term_block.terminator)
+                                });
+                            if let Some((modeled_dest, value)) = modeled
+                                && modeled_dest.local == 0
+                                && modeled_dest.projections.is_empty()
+                            {
+                                call_dest_return_pins.push(ite_free_equality(
+                                    &Formula::var_owned("_0".to_string(), ret_sort.clone()),
+                                    &value,
+                                ));
+                            }
+                            // Unsigned `div_ceil` returned directly: the same raw-`_0` pin, by
+                            // the ceiling's exact linear characterization (no term `Ite`, so
+                            // no lift) — see `div_ceil_call_dest_fact`.
+                            if let Some((ceil_dest, a, b)) =
+                                div_ceil_call_operands(func, &term_block.terminator)
+                                && ceil_dest.local == 0
+                                && ceil_dest.projections.is_empty()
+                            {
+                                call_dest_return_pins.push(
+                                    super::call_facts::div_ceil_fact_from_operands(
+                                        &Formula::var_owned("_0".to_string(), Sort::Int),
+                                        a,
+                                        b,
+                                    ),
+                                );
+                            }
+                        }
+                        // Trust (std-intrinsics lane): the SAME return-slot problem for a
+                        // function whose tail is a body-less rustc bit intrinsic —
+                        // `fn f(x: u32) -> u32 ensures result <= 32 { ctpop(x) }`. The
+                        // guard-map fact names the dest `__ret`, which never reaches the
+                        // postcondition's `_0`, so the `#[ensures]` read an unconstrained
+                        // havoc and the clause was REFUTED. Re-emit the intrinsic's facts
+                        // under the RAW `_0` name, exactly as the saturating pin above does.
+                        //
+                        // No `ite_free_equality` lift is needed: unlike the saturating and
+                        // `wrapping_neg` models, none of these definitions contains a term
+                        // `Ite` (`ctpop`/`bswap`/`bitreverse` are pure bitvector terms and
+                        // the `ctlz`/`cttz` facts are formula-level `Implies` already).
+                        //
+                        // SOUND: every fact is true of the intrinsic's result for EVERY
+                        // input — `intrinsic_semantics` states them and its tests check
+                        // each exhaustively at width 8 against the real Rust operation —
+                        // and the builder itself requires `_0` to be single-static-assignment
+                        // and the argument to be a stable whole local.
+                        for term_block in [&**vc_block, block] {
+                            if let Terminator::Call { func: callee, dest, .. } =
+                                &term_block.terminator
+                                && dest.local == 0
+                                && dest.projections.is_empty()
+                                && callee.starts_with('@')
+                            {
+                                let ret_var =
+                                    Formula::var_owned("_0".to_string(), ret_sort.clone());
+                                if let Some((_, facts)) = value_modeled_intrinsic_facts(
+                                    func,
+                                    &term_block.terminator,
+                                    &ret_var,
+                                ) {
+                                    call_dest_return_pins.extend(facts);
+                                }
+                            }
+                        }
+                        // Trust (clamp/min/max return pin, over-refutation audit #8): when a
+                        // predecessor's TERMINATOR is an integer std `Ord::min`/`max`/`clamp`
+                        // call (a primitive integer `Self`: `primitive_int_ord_method`,
+                        // NAME-ANCHOR-2) whose dest IS the return slot `_0` (the function returns the
+                        // ordered result directly, e.g. `range_usize`'s
+                        // `…unwrap_or(lo).clamp(lo, hi)`), the general call-dest fact
+                        // (`build_semantic_guard_map`) names it via the `place_to_var_name`
+                        // alias `__ret`, which does NOT reach the postcondition's `_0` in this
+                        // lane — `normalize_ssa_version_tokens` collapses `__ret#tok` to the
+                        // debug base `__ret`, never `_0`, so a valid `#[ensures(|r| lo<=*r<=hi)]`
+                        // over a clamp result was FALSELY REFUTED (the `¬(lo<=_0<=hi)` obligation
+                        // stayed havoc'd). This is IDENTICAL to the saturating/wrapping_neg pins
+                        // above; re-emit the SAME (sound) result bound under the RAW `_0` name.
+                        // SOUND: reuses `ord_min_max_clamp_result_facts` (unconditional min/max
+                        // bounds; GUARDED clamp bound `(lo<=hi) -> lo<=_0<=hi`, vacuous when
+                        // `lo>hi` so a clamp that PANICS is never false-proved); `_0` is
+                        // single-static-assignment (assigned once by this call before `Return`),
+                        // the SAME SSA gate the call-dest arm applies.
+                        for term_block in [&**vc_block, block] {
+                            if let Terminator::Call {
+                                func: callee,
+                                args,
+                                dest,
+                                target: Some(_),
+                                ..
+                            } = &term_block.terminator
+                                && dest.local == 0
+                                && dest.projections.is_empty()
+                                && matches!(method_tail(callee), "min" | "max" | "clamp")
+                                && is_single_static_assignment(func, dest.local)
+                            {
+                                let ret_var =
+                                    Formula::var_owned("_0".to_string(), ret_sort.clone());
+                                call_dest_return_pins.extend(ord_min_max_clamp_result_facts(
+                                    func, callee, args, dest, &ret_var,
+                                ));
+                            }
+                        }
+                    }
+
+                    // Trust (branchy computed-return fix, 2026-07-04): the pin above
+                    // connects `_0` only to a DIRECT `_0 = <rvalue>`. But a MULTI-RETURN
+                    // body routes the value through a shared return binding `__ret`
+                    // (`_L`): the return block does `_0 = copy _L`, while each ARM
+                    // assigns `_L` (`_L = move _5.0` — a CheckedAdd `.0` field — on the
+                    // computed arm, `_L = copy _1` on the plain arm). `_L`/`__ret` is
+                    // MULTI-ASSIGNED, so it is NOT single-static-assignment: its per-arm
+                    // version tokens do not unify and `normalize_ssa_version_tokens`
+                    // cannot collapse them, so the computed arm's value never reaches
+                    // `_0` and a VALID branchy postcondition (`if a<100 {a+1} else {a}`
+                    // `ensures r>=a`) is falsely refuted. Add ONE transitive hop: when
+                    // the return block copies `_0 = _L` (whole-local, L!=0), pin
+                    // `_0 == <_L's rvalue on THIS path>` using `_L`'s assignment in the
+                    // vc_block arm (else the return block). Combined with the arm's
+                    // assert-passed semantic guard (`_5.0 == a+1`) this pins `_0` to the
+                    // computed value. SOUND + monotone: `_0 = _L` and `_L = <rvalue>`
+                    // both hold on this per-predecessor path (path-consistent copies),
+                    // and `_L`'s def is taken ONLY from this arm — so it constrains `_0`
+                    // to its genuine per-path value (removes a spurious free-`_0` cex),
+                    // never crediting a violated postcondition. CheckedBinaryOp itself
+                    // is skipped (its `.0` field is the value, pinned by the semantic
+                    // guard); a field-projected Use of it is what we pin here.
+                    // The `_0 = copy _L` copy may live in the RETURN block (the
+                    // `if a<100 {a+1} else {a}` expression-branch shape) OR in the ARM
+                    // itself (the `if x>0 { return 1 }` early-`return` / match-arm
+                    // multi-EXIT shape — the Return block is empty and each exit site
+                    // does `_L = <val>; _0 = copy _L` in its own block, with distinct
+                    // `__ret` temps that ALIAS on the debug name and fall back to RAW
+                    // `_L` names, and `_0` is MULTI-assigned so it never normalizes to
+                    // bare). Scan BOTH blocks for the copy and for `_L`'s per-path
+                    // value, and pin BOTH spellings:
+                    //   `_0 == value` — connects when `_0` is SSA and normalizes bare
+                    //                   (expression-branch shape);
+                    //   `_L == value` — connects when the VC references the RAW temp
+                    //                   `_L` (aliased/multi-exit shape) via the
+                    //                   already-present `_0#v = _L` block-def.
+                    // Both are monotone-sound: `_0 = _L` and `_L = <val>` both hold on
+                    // THIS per-predecessor path (path-consistent copies), and `_L`'s def
+                    // is taken ONLY from this arm — constraining the return slot to its
+                    // genuine per-path value, never crediting a violated postcondition.
+                    let scan_blocks: [&trust_types::BasicBlock; 2] = [&**vc_block, block];
+                    // Trust (2026-09-30, P4 — hunter Finding 1): carry the COPY's own
+                    // location `(copy_block, copy_idx)` out of the search, so `_L`'s
+                    // definition can be required to REACH it (below).
+                    let return_copy: Option<(&trust_types::BasicBlock, usize, usize)> =
+                        scan_blocks
+                            .iter()
+                            .flat_map(|b| {
+                                b.stmts
+                                    .iter()
+                                    .enumerate()
+                                    .rev()
+                                    .map(move |(i, s)| (*b, i, s))
+                            })
+                            .find_map(|(copy_block, copy_idx, stmt)| {
+                                let Statement::Assign { place, rvalue, .. } = stmt else {
+                                    return None;
+                                };
+                                if place.local != 0 || !place.projections.is_empty() {
+                                    return None;
+                                }
+                                match rvalue {
+                                    Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                                        if p.projections.is_empty() && p.local != 0 =>
+                                    {
+                                        Some((copy_block, copy_idx, p.local))
+                                    }
+                                    _ => None,
+                                }
+                            });
+                    let arm_copy_pin = if let Some((copy_block, copy_idx, src)) = return_copy {
+                        // Trust (2026-09-30, P2): carry the defining `(block, k)` out so
+                        // the pins are stamped at `_L`'s OWN statement.
+                        //
+                        // Trust (2026-09-30, P4 — hunter Finding 1): the definition must
+                        // be the one that REACHES `_0 = copy _L`. The scan used to run
+                        // the PREDECESSOR's statements first and each block backwards
+                        // from its END, taking the first `_L = ..` it met — so it could
+                        // pick a write AFTER the copy (`_3 = copy (*_1); _0 = copy _3;
+                        // _3 = copy _2`: `replace(slot, v) ensures result == v` proved
+                        // although it returns the OLD value) or the predecessor's write
+                        // when the Return block rewrites `_L` before the copy
+                        // (`let mut r = a; extr(&r); r = !r; r` proved
+                        // `ensures result && !result`). Both were measured false proofs
+                        // through the falsification gate's flags. Now the search walks
+                        // BACKWARDS FROM THE COPY — the copy block's statements before
+                        // `copy_idx`, then (only when the copy is in the Return block and
+                        // the predecessor is a separate block) the predecessor's — and
+                        // the candidate must pass the SAME oracle that renamed the VC:
+                        //   * same block: `version_token_at(copy_block, copy_idx, _L)`
+                        //     is exactly the def's own write token `s{b}_{k}`;
+                        //   * predecessor def, Return-block copy: the def's token is the
+                        //     one at the predecessor's END, the predecessor's terminator
+                        //     does not rebind `_L` (a call destination writes after the
+                        //     statements), and the Return block does not write `_L`
+                        //     before the copy (its token there equals its entry token).
+                        // Anything else drops BOTH `pin_ret` and `pin_src` (fail closed).
+                        let def_is_src = |stmt: &Statement| {
+                            matches!(stmt, Statement::Assign { place, .. }
+                                if place.local == src && place.projections.is_empty())
+                        };
+                        let in_copy_block = copy_block.stmts[..copy_idx]
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find(|(_, stmt)| def_is_src(stmt))
+                            .map(|(k, stmt)| (copy_block, k, stmt));
+                        let from_pred = copy_block.id == block.id && vc_block.id != block.id;
+                        let candidate = match in_copy_block {
+                            Some(found) => Some(found),
+                            None if from_pred => vc_block
+                                .stmts
+                                .iter()
+                                .enumerate()
+                                .rev()
+                                .find(|(_, stmt)| def_is_src(stmt))
+                                .map(|(k, stmt)| (&**vc_block, k, stmt)),
+                            None => None,
+                        };
+                        let def_reaches_copy = |def_block: &trust_types::BasicBlock, k: usize| {
+                            let src_var = crate::place_to_var_name(func, &Place::local(src));
+                            let def_tok = format!("s{}_{k}", def_block.id.0);
+                            if def_block.id == copy_block.id {
+                                return k < copy_idx
+                                    && sv
+                                        .version_token_at(func, copy_block.id, copy_idx, &src_var)
+                                        .as_deref()
+                                        == Some(def_tok.as_str());
+                            }
+                            from_pred
+                                && def_block.id == vc_block.id
+                                && sv
+                                    .version_token_at(
+                                        func,
+                                        vc_block.id,
+                                        vc_block.stmts.len(),
+                                        &src_var,
+                                    )
+                                    .as_deref()
+                                    == Some(def_tok.as_str())
+                                && sv.terminator_kill(func, vc_block).survives(&Formula::var_owned(
+                                    src_var.clone(),
+                                    crate::place_sort(func, &Place::local(src))
+                                        .unwrap_or(Sort::Int),
+                                ))
+                                && sv.version_token_at(func, block.id, copy_idx, &src_var)
+                                    == sv.version_token_at(func, block.id, 0, &src_var)
+                        };
+                        // Review round 43 (local twin of P4, kept on merge 2026-10-14 so the
+                        // pin is admitted only when BOTH gates admit it): nothing may write
+                        // `_L` after its def anywhere in the window (statements or
+                        // terminators), `_L` must not escape, and the def's own reads must
+                        // still be current at the return point.
+                        let own_scan_blocks_buf = [&**vc_block, block];
+                        let own_scan_blocks: &[&trust_types::BasicBlock] =
+                            if vc_block.id == block.id {
+                                &own_scan_blocks_buf[1..]
+                            } else {
+                                &own_scan_blocks_buf[..]
+                            };
+                        let local_order_admits =
+                            |def_block: &trust_types::BasicBlock, k: usize, rvalue: &Rvalue| {
+                                let Some(def_bi) =
+                                    own_scan_blocks.iter().position(|b| b.id == def_block.id)
+                                else {
+                                    return false;
+                                };
+                                let writes = |stmt: &Statement| {
+                                    !matches!(
+                                        stmt.local_write(src),
+                                        trust_types::LocalWrite::Untouched
+                                    )
+                                };
+                                let later_stmt_write = own_scan_blocks
+                                    .iter()
+                                    .enumerate()
+                                    .skip(def_bi)
+                                    .any(|(bi, b)| {
+                                        let from = if bi == def_bi { k + 1 } else { 0 };
+                                        b.stmts
+                                            .get(from..)
+                                            .is_some_and(|rest| rest.iter().any(writes))
+                                    });
+                                let later_terminator_write =
+                                    own_scan_blocks.iter().skip(def_bi).any(|b| {
+                                        !matches!(
+                                            b.terminator.local_write(src),
+                                            trust_types::LocalWrite::Untouched
+                                        )
+                                    });
+                                if later_stmt_write
+                                    || later_terminator_write
+                                    || crate::any_local_write_stmt(
+                                        func,
+                                        &func.body.blocks,
+                                        src,
+                                        |_block, stmt| crate::stmt_escapes_local(func, stmt, src),
+                                    )
+                                {
+                                    return false;
+                                }
+                                let def_path_buf = [(own_scan_blocks[def_bi], k + 1), (block, 0)];
+                                let def_path = &def_path_buf[..own_scan_blocks.len() - def_bi];
+                                return_pin_reads_are_current(func, def_path, own_scan_blocks, rvalue)
+                            };
+                        let arm_def = candidate
+                            .filter(|(def_block, k, _)| def_reaches_copy(def_block, *k))
+                            .filter(|(def_block, k, stmt)| match stmt {
+                                Statement::Assign { rvalue, .. } => {
+                                    local_order_admits(def_block, *k, rvalue)
+                                }
+                                _ => false,
+                            })
+                            .and_then(|(def_block, k, stmt)| {
+                                let Statement::Assign { rvalue, .. } = stmt else {
+                                    return None;
+                                };
+                                if matches!(rvalue, Rvalue::CheckedBinaryOp(..)) {
+                                    return None;
+                                }
+                                crate::chc::rvalue_to_formula(func, rvalue)
+                                    .ok()
+                                    .map(|rformula| (def_block, k, rformula))
+                            });
+                        // `rformula_for_scope` stays RAW: the scope gate below parses raw
+                        // `_N` names. The pinned copy is stamped at `(def_block, k)`, and
+                        // the source local `_L` it defines at `k + 1` (the value just
+                        // after its write — never a later reseat's or the predecessor's
+                        // spelling; bare only when NO point versions the raw name, so
+                        // no rename can re-stamp it). A read stamp failing drops both
+                        // pins; a source spelling that cannot be fixed drops `pin_src`
+                        // alone (fail closed).
+                        let arm_def = arm_def.and_then(|(def_block, k, rformula)| {
+                            let stamped = stamp_return_pin_reads(
+                                sv,
+                                func,
+                                vc_block,
+                                block,
+                                def_block,
+                                k,
+                                rformula.clone(),
+                            )?;
+                            let src_name = format!("_{src}");
+                            let src_lhs =
+                                match sv.version_token_at(func, def_block.id, k + 1, &src_name) {
+                                    Some(tok) => Some(format!("{src_name}#{tok}")),
+                                    None if !sv.ever_versioned(func, &src_name) => Some(src_name),
+                                    None => None,
+                                };
+                            Some((rformula, stamped, src_lhs))
+                        });
+                        if let Some((rformula_for_scope, rformula, src_lhs)) = arm_def {
+                            let pin_ret = Formula::Eq(
+                                Box::new(Formula::var_owned("_0".to_string(), ret_sort.clone())),
+                                Box::new(rformula.clone()),
+                            );
+                            // Review round 45 (local; composed with upstream's P2 stamping on
+                            // merge 2026-10-14): a BARE `_L` name is the one the
+                            // predecessor's block defs also use for `_L`'s EARLIER value
+                            // (`let mut r = x; r = r + 1; r` gave `_2 == _2 + 1`,
+                            // unsatisfiable: every clause proved). A bare `pin_src` is stated
+                            // only when the def is `_L`'s ONLY write on the path; a
+                            // version-stamped `_L#tok` names the def's own value and needs no
+                            // such gate. `pin_ret` alone connects `_0` otherwise.
+                            let mut pins = vec![pin_ret];
+                            if let Some(src_lhs) = src_lhs
+                                && (src_lhs.contains('#')
+                                    || local_writes_reaching(func, own_scan_blocks, src) == 1)
+                            {
+                                pins.push(Formula::Eq(
+                                    Box::new(Formula::var_owned(src_lhs, ret_sort.clone())),
+                                    Box::new(rformula),
+                                ));
+                            }
+                            // Trust (plain-`BinaryOp` return value, 2026-09-17): ONE
+                            // MORE HOP, by the audit-#7 route below.
+                            //
+                            // The pin above binds the return slot to `_L`'s rvalue.
+                            // When that rvalue is itself a WHOLE LOCAL this arm
+                            // assigns — `_2 = _8` after `_8 = x / 2`, the MIR of
+                            // `if x < 0 { 0 } else { x / 2 }` — the pin INTRODUCES
+                            // `_8` and nothing grounds it. `_8`'s defining equation
+                            // is a BLOCK definition, and `v2_formula_with_block_defs`
+                            // already ran its relevance filter against a body whose
+                            // only free variables were `_0` and the merged `_2`
+                            // token. `_8` was not among them, so `_8 == x / 2` was
+                            // pruned BEFORE this pin created the link; the solver
+                            // then sees `_8` free and the TRUE postcondition
+                            // `result >= 0` is satisfiably negated. Measured: the
+                            // row came back `unknown`, and a `_8 = -1` model is a
+                            // model of the encoding, never of the program.
+                            //
+                            // Checked arithmetic never hits this. `a + 1` lowers to
+                            // `CheckedBinaryOp`, whose value is a FIELD (`_5.0`)
+                            // pinned by the arm's assert-passed semantic guard — a
+                            // lane that survives the merge. Division, remainder and
+                            // the shifts are plain `BinaryOp`, so their value
+                            // equation exists ONLY as a block def. That is why the
+                            // defect is operator-shaped rather than general, which
+                            // is otherwise a baffling thing for a verifier to be.
+                            //
+                            // Re-conjoin the block defs now that the name exists,
+                            // exactly as the deref-load return fix below does for
+                            // its own late-introduced referent. SOUND for the same
+                            // reason: block defs are TRUE facts of the body, stamped
+                            // at their own establish points, and relevance is a
+                            // solver-performance heuristic rather than a soundness
+                            // gate — so a FALSE postcondition stays refutable, and
+                            // the falsification suite is the standing guard on that.
+                            //
+                            // SCOPED to the shape that needs it: the pinned rvalue
+                            // names a whole local THIS arm assigns. A field operand
+                            // (`_5.0`, the checked-arithmetic shape) does not match,
+                            // and neither does a parameter read (`_L = copy _1`), so
+                            // no other return shape's formula is perturbed.
+                            let reconjoin = transitive_pin_names_locally_defined_local(
+                                &rformula_for_scope,
+                                &scan_blocks,
+                            );
+                            Some((pins, reconjoin))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Trust (deref-load return over-refutation, audit #7, 2026-07-06):
+                    // a return via a `&mut`/`&` store-then-load (`let p=&mut x; *p=v; *p`,
+                    // `#[ensures(|r| *r==v)]`) is FALSELY REFUTED. The block-def pass DOES
+                    // compute the correct, self-consistent chain `x#<k>==v` (the store) and
+                    // `__ret#<k'>==x#<k>` (the load), but `v2_formula_with_block_defs` ran its
+                    // relevance filter (`combine_relevant_block_defs`) against the bare
+                    // obligation `¬(_0==v)` — whose only free var is `_0` — BEFORE the
+                    // return-value pin above reconnected `_0` to the referent `x#<k>`. Both
+                    // defs mention `x#<k>`/`__ret#<k'>`, not `_0`, so they were pruned; the
+                    // late pin then reintroduced `x#<k>` with no `x#<k>==v` to ground it, so
+                    // `¬(_0==v)` stayed SAT. The pins above now put the referent version
+                    // (`x#<k>`) back into `formula`, so RE-conjoining the relevant block-defs
+                    // pulls the establishing store `x#<k>==v` (and transitively the load def)
+                    // back in — and `¬(_0==v)` becomes UNSAT (proved). SOUND: block-defs are
+                    // TRUE facts of the body (relevance is a solver-perf heuristic, never a
+                    // soundness gate — see `combine_relevant_block_defs`), so a FALSE
+                    // postcondition stays refutable (each fact pins a genuine value, never
+                    // credits a violation). SCOPED to a whole-return `_0 = copy/move(*p)`
+                    // deref-LOAD so no other return shape's formula is perturbed.
+                    let returns_via_deref_load = |b: &trust_types::BasicBlock| {
+                        b.stmts.iter().any(|stmt| {
+                            matches!(stmt, Statement::Assign { place, rvalue, .. }
+                                if place.local == 0
+                                    && place.projections.is_empty()
+                                    && matches!(rvalue,
+                                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                                            | Rvalue::CopyForDeref(p)
+                                        if matches!(p.projections.first(),
+                                            Some(trust_types::Projection::Deref))))
+                        })
+                    };
+                    let has_deref_load_return = returns_via_deref_load(block)
+                        || (vc_block.id != block.id && returns_via_deref_load(vc_block));
+
+                    let edge_guard = (vc_block.id != block.id)
+                        .then(|| return_edge_guard(func, vc_block, block.id))
+                        .flatten();
+
+                    let live_path_defs = if let Some(path_defs) = path_definition_map.get(&vc_block.id)
+                        && !path_defs.is_empty()
+                    {
+                        let mut live = v2_live_path_defs(func, vc_block, path_defs);
+                        // soundness (round-11): v2_live_path_defs only sees
+                        // STATEMENT-level redefs, so a fact the block's TERMINATOR
+                        // invalidates (a `Call` dest such as `_0`, or a `&mut`/`&raw
+                        // mut` pointee escaping into the call) would survive into the
+                        // postcondition VC and vacuously discharge it. Drop those here,
+                        // mirroring the fixpoint outflow kill. Monotone-sound.
+                        let kill = sv.terminator_kill(func, vc_block);
+                        if !kill.is_empty() {
+                            live.retain(|f| kill.survives(f));
+                        }
+                        live
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Conjoin assert-passed semantic guards from BOTH the predecessor
+                    // (vc_block) AND the return block itself — EXEMPT from the rename.
+                    let mut sem_conjuncts: Vec<Formula> = Vec::new();
+                    if let Some(g) = semantic_guards.get(&block.id) {
+                        sem_conjuncts.extend(g.iter().cloned());
+                    }
+                    if vc_block.id != block.id
+                        && let Some(g) = semantic_guards.get(&vc_block.id)
+                    {
+                        sem_conjuncts.extend(g.iter().cloned());
+                    }
+
+                    PreparedReturnPath {
+                        vc_block_span,
+                        direct_return_pins,
+                        unlowerable_return_assignment,
+                        enum_return_pins,
+                        witness_pins,
+                        call_dest_return_pins,
+                        arm_copy_pin,
+                        has_deref_load_return,
+                        edge_guard,
+                        live_path_defs,
+                        sem_conjuncts,
+                        unmarked_sysroot_call: std::cell::OnceCell::new(),
+                    }
+                });
+
+                let unlowerable_return_assignment = path_prep.unlowerable_return_assignment;
+                for def in &path_prep.direct_return_pins {
+                    formula = Formula::And(vec![def.clone(), formula]);
                 }
 
                 // Trust (OUT-PARAMETER pin): a postcondition over a place written
@@ -445,353 +1497,66 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 // == 0`) had NO antecedent at all and was decided by havoc.
                 //
                 // The block-def extraction DOES produce the fact
-                // (`Eq(Var("x*"), Int(0))` for `(*_1) = 0`), but
-                // `version_block_def_at_establish` cannot stamp it: it looks for
-                // the establish point of the `*`-STRIPPED base (`x`), and a `&mut`
-                // PARAMETER is never assigned in-body, so `block_def_establish_stmt`
-                // returns `None` and the fact is left BARE. Meanwhile the
-                // obligation body IS versioned (`x*#s0_0`), so the bare fact is
-                // name-disjoint and `combine_relevant_block_defs` prunes it as
-                // irrelevant. The VC collapses to `Not(Eq(Var("x*#s0_0"), Int(0)))`
-                // — a query about a free variable, which the solver "refutes"
-                // regardless of the body. TRUE and FALSE twins came back
-                // identically Failed.
+                // (`Eq(Var("x*"), Int(0))` for `(*_1) = 0`), but until 2026-09-30
+                // `version_block_def_at_establish` could not stamp it: it looked
+                // for the establish point of the `*`-STRIPPED base (`x`), and a
+                // `&mut` PARAMETER is never assigned in-body, so the fact was left
+                // BARE. The obligation body IS versioned (`x*#s0_0`), so the bare
+                // fact was name-disjoint and `combine_relevant_block_defs` pruned it
+                // as irrelevant; the VC collapsed to a query about a free variable,
+                // and TRUE and FALSE twins came back identically Failed. (The same
+                // bare fact, threaded into a successor, also conflated the stored
+                // value with the value read before the store — a certified false
+                // proof; `block_defs::def_subject_establish_stmt` now stamps it.)
                 //
-                // Pin it explicitly here, exactly as the return slot above is
-                // pinned for the same reason ("block-def extraction does not
-                // surface a `_0 = Use(..)` ... so `_0` stays havoc'd").
-                let (with_pins, unpinned_out_params) =
-                    with_out_param_pins(func, &sv, block, &[vc_block, &block], &post, formula);
+                // The pin stays: it carries the liveness gate and the
+                // silent-weakening ledger (`unpinned_out_params`), exactly as the
+                // return slot above is pinned ("block-def extraction does not
+                // surface a `_0 = Use(..)` ... so `_0` stays havoc'd"). Where the
+                // stamped def is already a conjunct, the pin repeats it; a repeated
+                // conjunct changes no model, and the exact-formula tests
+                // (`mut_ref_postcondition_tests`) read the pair as the witness that
+                // both lanes bind the store.
+                let (with_pins, unpinned_out_params) = if out_param_store_sorts.is_empty() {
+                    (formula, Vec::new())
+                } else {
+                    with_out_param_pins(
+                        func,
+                        sv,
+                        block,
+                        &[vc_block, &block],
+                        clause_sorts,
+                        formula,
+                    )
+                };
                 formula = with_pins;
 
-                // Trust (Option/Result-return discriminant/value pin): ground the
-                // synthetic spec-model terms `_0__discr` / `_0__value` that the
-                // contract parser mints for `result.is_none()`/`is_some()`/
-                // `is_ok()`/`is_err()`/`unwrap()` to the body's ACTUAL in-body
-                // `_0 = Some(x)` / `_0 = None` / `_0 = Ok(x)` / `_0 = Err(e)`
-                // construction. Without this the postcondition's wrapper accessors
-                // stay free and a valid `r.is_none() || low <= r.unwrap() <= high`
-                // is un-groundable (the split above routes it to fail-closed
-                // Unknown UNLESS `enum_return_grounded_model_vars` credited it —
-                // which it does ONLY when EVERY return path pins the terms here).
-                // Scoped to the EXACT std/core `Option`/`Result` ADTs. The pinned
-                // value is the PARSER-CONVENTION model discriminant
-                // (`std_enum_model_discr`), NOT the raw machine variant index:
-                // Option's variant order matches the convention (None=0, Some=1 —
-                // identity), while Result's is INVERTED (`Ok` is machine variant 0
-                // but must pin `_0__discr==1`, the parser's `is_ok ⟹ _0__discr!=0`;
-                // `Err` is variant 1 and pins `_0__discr==0`). Pinning the raw
-                // index for Result would swap `is_ok`/`is_err` polarity — a
-                // simultaneous false-PROVE and false-FAIL. Pin at MOST ONE
-                // discriminant per return path (last / nearest-to-return wins) so
-                // two differing-variant assignments can never conjoin
-                // `_0__discr==0 ∧ _0__discr==1` into a vacuous UNSAT (a
-                // false-PROVE). SOUND: `_0 = Some(x)` / `_0 = Ok(x)` literally
-                // carries its variant and payload x, so `_0__discr==<model> ∧
-                // _0__value==x` are exact identities of the constructed value under
-                // the parser's reading; `_0 = None` / `_0 = Err(e)` is
-                // `_0__discr==0` exactly — a FALSE postcondition still refutes
-                // (every term pinned to its genuine value, never credited).
-                // `_0__value` is pinned only on the payload variant's path
-                // (`Some`/`Ok`) with an integer payload; leaving it free on the
-                // other path — and on non-integer payloads (ny-cert's Rat/Vec
-                // shapes, whose `_0__value*` terms the gate keeps UNGROUNDED so
-                // they never reach this refutable lane) — is sound (a free var
-                // only adds SAT/refute, never manufactures UNSAT/proof).
-                let enum_return_pin = resolve_enum_return_aggregate(func, *vc_block, block).map(
-                    |(kind, variant, ops)| {
-                        // Parser-convention model discriminant (Result INVERTED).
-                        let discr = std_enum_model_discr(kind, variant);
-                        let payload = if variant == std_enum_payload_variant(kind)
-                            && ops.len() == 1
-                            && crate::operand_ty_cow(func, &ops[0])
-                                .as_deref()
-                                .is_some_and(|t| matches!(t, Ty::Int { .. }))
-                        {
-                            crate::chc::operand_to_formula_checked(func, &ops[0]).ok()
-                        } else {
-                            None
-                        };
-                        (discr, payload)
-                    },
-                );
-                if let Some((discr, payload)) = enum_return_pin {
-                    let discr_def = Formula::Eq(
-                        Box::new(Formula::var_owned("_0__discr".to_string(), Sort::Int)),
-                        Box::new(Formula::Int(discr)),
-                    );
-                    formula = Formula::And(vec![discr_def, formula]);
-                    if let Some(pf) = payload {
-                        let value_def = Formula::Eq(
-                            Box::new(Formula::var_owned("_0__value".to_string(), Sort::Int)),
-                            Box::new(pf),
-                        );
-                        formula = Formula::And(vec![value_def, formula]);
-                    }
+                for pin in &path_prep.enum_return_pins {
+                    formula = Formula::And(vec![pin.clone(), formula]);
                 }
 
-                // Trust (len-witness pin, b62): ground the CREDITED payload-
-                // component length pairs (`_0__value.<i>.<j>_len` — the lowered
-                // crown `matches!(r, Ok(c) if c.….len() != c.….len())` idiom) on
-                // this return path, via the SAME per-path resolver the gate ran
-                // (`len_witness_path_pins` — gate/pin agreement is what keeps a
-                // credited term from ever reaching a refutable VC unpinned).
-                // Payload-variant paths conjoin the construction-derived
-                // equality `len_a == len_b` (plus, for the guard shape, the
-                // individual `Vec::len`-dest witness pins); empty-variant paths
-                // conjoin nothing (the terms have no denotation there — free is
-                // the sound direction, and the discr pin already decides those
-                // VCs). Every fact is TRUE of the returned value on this path
-                // (see the len-witness section banner), so a FALSE postcondition
-                // stays refutable.
-                for pair in &len_pairs {
-                    if let Some(pins) = len_witness_path_pins(func, *vc_block, block, pair) {
-                        for pin in pins {
-                            formula = Formula::And(vec![pin, formula]);
+                for pin in &path_prep.witness_pins {
+                    formula = Formula::And(vec![pin.clone(), formula]);
+                }
+
+                for pin in &path_prep.call_dest_return_pins {
+                    formula = Formula::And(vec![pin.clone(), formula]);
+                }
+
+                if let Some((ref copy_pins, reconjoin_block_defs)) = path_prep.arm_copy_pin {
+                    let mut pins = Vec::with_capacity(copy_pins.len() + 1);
+                    pins.extend(copy_pins.iter().cloned());
+                    pins.push(formula);
+                    formula = Formula::And(pins);
+                    if reconjoin_block_defs {
+                        formula = v2_formula_with_block_defs(func, block, formula);
+                        if vc_block.id != block.id {
+                            formula = v2_formula_with_block_defs(func, vc_block, formula);
                         }
                     }
                 }
 
-                // Trust (ordering/sign-witness pin, b62 F4): ground the
-                // CREDITED `__trust_ok` pair / `_0__value__sign` terms (the
-                // lowered ny selfcheck/branch `matches!(r, Ok((d, c)) if
-                // d > c)` / `Ok(c) if c.is_positive()` idioms over opaque
-                // `Rat` arena handles) on this return path, via the SAME
-                // per-path resolver the gate ran (`ordering_witness_path_pins`
-                // — gate/pin agreement keeps a credited term from ever
-                // reaching a refutable VC unpinned). Payload-variant paths
-                // conjoin ONE guard-derived ordering fact per item (bound to
-                // the dominating witness call's bool edge — never a
-                // re-encoding of the handle ints); empty-variant paths
-                // conjoin nothing (the terms have no denotation there — free
-                // is the sound direction, and the discr pin already decides
-                // those VCs). Every fact is TRUE of the returned values on
-                // this path (see the F4 section banner), so a FALSE
-                // postcondition stays refutable.
-                for item in &ord_items {
-                    if let Some(pins) = ordering_witness_path_pins(func, *vc_block, block, item) {
-                        for pin in pins {
-                            formula = Formula::And(vec![pin, formula]);
-                        }
-                    }
-                }
-
-                // Trust (saturating-return pin, over-refutation audit #5): when a
-                // predecessor's TERMINATOR is a std `saturating_add`/`saturating_sub`
-                // call whose dest IS the return slot `_0` (the function returns the
-                // saturating result directly), the general call-dest fact names it via
-                // the `place_to_var_name` alias `__ret`, which does NOT reach the
-                // postcondition's `_0` in this lane. Pin `_0 == clamp(x±y, MIN, MAX)`
-                // under the RAW `_0` name the postcondition uses (exactly as the
-                // scalar/tuple return-pins above do), so `#[ensures(|r| *r >= x)]` over
-                // `x.saturating_add(y)` proves. SOUND: the value is the exact, total std
-                // semantics (see `saturating_call_dest_value`); `_0` is assigned once
-                // before `Return` on this path.
-                for term_block in [&**vc_block, block] {
-                    // Any exact-value MODELED call (saturating_add/sub, wrapping_neg)
-                    // whose dest is the return slot. Its value is an `Ite`; a term-
-                    // `Ite` in a postcondition obligation is pruned by trust-mc / not
-                    // routed by trust-wp, so `_0 == <Ite>` stays UNKNOWN. `ite_free_equality`
-                    // LIFTS the `Ite` to formula-level guards, which both backends
-                    // discharge — so `#[ensures]` over `x.saturating_add(y)` /
-                    // `x.wrapping_neg()` proves. See `ite_free_equality`.
-                    let modeled = saturating_call_dest_value(func, &term_block.terminator)
-                        .or_else(|| wrapping_neg_call_dest_value(func, &term_block.terminator));
-                    if let Some((dest, value)) = modeled
-                        && dest.local == 0
-                        && dest.projections.is_empty()
-                    {
-                        let sort = crate::place_sort(func, &Place::local(0)).unwrap_or(Sort::Int);
-                        let pin =
-                            ite_free_equality(&Formula::var_owned("_0".to_string(), sort), &value);
-                        formula = Formula::And(vec![pin, formula]);
-                    }
-                }
-
-                // Trust (std-intrinsics lane): the SAME return-slot problem for a
-                // function whose tail is a body-less rustc bit intrinsic —
-                // `fn f(x: u32) -> u32 ensures result <= 32 { ctpop(x) }`. The
-                // guard-map fact names the dest `__ret`, which never reaches the
-                // postcondition's `_0`, so the `#[ensures]` read an unconstrained
-                // havoc and the clause was REFUTED. Re-emit the intrinsic's facts
-                // under the RAW `_0` name, exactly as the saturating pin above does.
-                //
-                // No `ite_free_equality` lift is needed: unlike the saturating and
-                // `wrapping_neg` models, none of these definitions contains a term
-                // `Ite` (`ctpop`/`bswap`/`bitreverse` are pure bitvector terms and
-                // the `ctlz`/`cttz` facts are formula-level `Implies` already).
-                //
-                // SOUND: every fact is true of the intrinsic's result for EVERY
-                // input — `intrinsic_semantics` states them and its tests check
-                // each exhaustively at width 8 against the real Rust operation —
-                // and the builder itself requires `_0` to be single-static-assignment
-                // and the argument to be a stable whole local.
-                for term_block in [&**vc_block, block] {
-                    let ret_sort_here =
-                        crate::place_sort(func, &Place::local(0)).unwrap_or(Sort::Int);
-                    let ret_var = Formula::var_owned("_0".to_string(), ret_sort_here);
-                    if let Some((dest, facts)) =
-                        value_modeled_intrinsic_facts(func, &term_block.terminator, &ret_var)
-                        && dest.local == 0
-                        && dest.projections.is_empty()
-                    {
-                        for fact in facts {
-                            formula = Formula::And(vec![fact, formula]);
-                        }
-                    }
-                }
-
-                // Trust (clamp/min/max return pin, over-refutation audit #8): when a
-                // predecessor's TERMINATOR is an integer std `Ord::min`/`max`/`clamp`
-                // call whose dest IS the return slot `_0` (the function returns the
-                // ordered result directly, e.g. `range_usize`'s
-                // `…unwrap_or(lo).clamp(lo, hi)`), the general call-dest fact
-                // (`build_semantic_guard_map`) names it via the `place_to_var_name`
-                // alias `__ret`, which does NOT reach the postcondition's `_0` in this
-                // lane — `normalize_ssa_version_tokens` collapses `__ret#tok` to the
-                // debug base `__ret`, never `_0`, so a valid `#[ensures(|r| lo<=*r<=hi)]`
-                // over a clamp result was FALSELY REFUTED (the `¬(lo<=_0<=hi)` obligation
-                // stayed havoc'd). This is IDENTICAL to the saturating/wrapping_neg pins
-                // above; re-emit the SAME (sound) result bound under the RAW `_0` name.
-                // SOUND: reuses `ord_min_max_clamp_result_facts` (unconditional min/max
-                // bounds; GUARDED clamp bound `(lo<=hi) -> lo<=_0<=hi`, vacuous when
-                // `lo>hi` so a clamp that PANICS is never false-proved); `_0` is
-                // single-static-assignment (assigned once by this call before `Return`),
-                // the SAME SSA gate the call-dest arm applies.
-                for term_block in [&**vc_block, block] {
-                    if let Terminator::Call { func: callee, args, dest, target: Some(_), .. } =
-                        &term_block.terminator
-                        && dest.local == 0
-                        && dest.projections.is_empty()
-                        && is_single_static_assignment(func, dest.local)
-                    {
-                        let ret_var = Formula::var_owned("_0".to_string(), ret_sort.clone());
-                        for fact in ord_min_max_clamp_result_facts(func, callee, args, &ret_var) {
-                            formula = Formula::And(vec![fact, formula]);
-                        }
-                    }
-                }
-
-                // Trust (branchy computed-return fix, 2026-07-04): the pin above
-                // connects `_0` only to a DIRECT `_0 = <rvalue>`. But a MULTI-RETURN
-                // body routes the value through a shared return binding `__ret`
-                // (`_L`): the return block does `_0 = copy _L`, while each ARM
-                // assigns `_L` (`_L = move _5.0` — a CheckedAdd `.0` field — on the
-                // computed arm, `_L = copy _1` on the plain arm). `_L`/`__ret` is
-                // MULTI-ASSIGNED, so it is NOT single-static-assignment: its per-arm
-                // version tokens do not unify and `normalize_ssa_version_tokens`
-                // cannot collapse them, so the computed arm's value never reaches
-                // `_0` and a VALID branchy postcondition (`if a<100 {a+1} else {a}`
-                // `ensures r>=a`) is falsely refuted. Add ONE transitive hop: when
-                // the return block copies `_0 = _L` (whole-local, L!=0), pin
-                // `_0 == <_L's rvalue on THIS path>` using `_L`'s assignment in the
-                // vc_block arm (else the return block). Combined with the arm's
-                // assert-passed semantic guard (`_5.0 == a+1`) this pins `_0` to the
-                // computed value. SOUND + monotone: `_0 = _L` and `_L = <rvalue>`
-                // both hold on this per-predecessor path (path-consistent copies),
-                // and `_L`'s def is taken ONLY from this arm — so it constrains `_0`
-                // to its genuine per-path value (removes a spurious free-`_0` cex),
-                // never crediting a violated postcondition. CheckedBinaryOp itself
-                // is skipped (its `.0` field is the value, pinned by the semantic
-                // guard); a field-projected Use of it is what we pin here.
-                // The `_0 = copy _L` copy may live in the RETURN block (the
-                // `if a<100 {a+1} else {a}` expression-branch shape) OR in the ARM
-                // itself (the `if x>0 { return 1 }` early-`return` / match-arm
-                // multi-EXIT shape — the Return block is empty and each exit site
-                // does `_L = <val>; _0 = copy _L` in its own block, with distinct
-                // `__ret` temps that ALIAS on the debug name and fall back to RAW
-                // `_L` names, and `_0` is MULTI-assigned so it never normalizes to
-                // bare). Scan BOTH blocks for the copy and for `_L`'s per-path
-                // value, and pin BOTH spellings:
-                //   `_0 == value` — connects when `_0` is SSA and normalizes bare
-                //                   (expression-branch shape);
-                //   `_L == value` — connects when the VC references the RAW temp
-                //                   `_L` (aliased/multi-exit shape) via the
-                //                   already-present `_0#v = _L` block-def.
-                // Both are monotone-sound: `_0 = _L` and `_L = <val>` both hold on
-                // THIS per-predecessor path (path-consistent copies), and `_L`'s def
-                // is taken ONLY from this arm — constraining the return slot to its
-                // genuine per-path value, never crediting a violated postcondition.
-                let scan_blocks: [&trust_types::BasicBlock; 2] = [&**vc_block, block];
-                let return_src_local: Option<usize> =
-                    scan_blocks.iter().flat_map(|b| b.stmts.iter().rev()).find_map(|stmt| {
-                        let Statement::Assign { place, rvalue, .. } = stmt else {
-                            return None;
-                        };
-                        if place.local != 0 || !place.projections.is_empty() {
-                            return None;
-                        }
-                        match rvalue {
-                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
-                                if p.projections.is_empty() && p.local != 0 =>
-                            {
-                                Some(p.local)
-                            }
-                            _ => None,
-                        }
-                    });
-                if let Some(src) = return_src_local {
-                    let arm_def =
-                        scan_blocks.iter().flat_map(|b| b.stmts.iter().rev()).find_map(|stmt| {
-                            let Statement::Assign { place, rvalue, .. } = stmt else {
-                                return None;
-                            };
-                            if place.local != src || !place.projections.is_empty() {
-                                return None;
-                            }
-                            if matches!(rvalue, Rvalue::CheckedBinaryOp(..)) {
-                                return None;
-                            }
-                            crate::chc::rvalue_to_formula(func, rvalue).ok()
-                        });
-                    if let Some(rformula) = arm_def {
-                        let sort = crate::place_sort(func, &Place::local(0)).unwrap_or(Sort::Int);
-                        let pin_ret = Formula::Eq(
-                            Box::new(Formula::var_owned("_0".to_string(), sort.clone())),
-                            Box::new(rformula.clone()),
-                        );
-                        let pin_src = Formula::Eq(
-                            Box::new(Formula::var_owned(format!("_{src}"), sort)),
-                            Box::new(rformula),
-                        );
-                        formula = Formula::And(vec![pin_ret, pin_src, formula]);
-                    }
-                }
-
-                // Trust (deref-load return over-refutation, audit #7, 2026-07-06):
-                // a return via a `&mut`/`&` store-then-load (`let p=&mut x; *p=v; *p`,
-                // `#[ensures(|r| *r==v)]`) is FALSELY REFUTED. The block-def pass DOES
-                // compute the correct, self-consistent chain `x#<k>==v` (the store) and
-                // `__ret#<k'>==x#<k>` (the load), but `v2_formula_with_block_defs` ran its
-                // relevance filter (`combine_relevant_block_defs`) against the bare
-                // obligation `¬(_0==v)` — whose only free var is `_0` — BEFORE the
-                // return-value pin above reconnected `_0` to the referent `x#<k>`. Both
-                // defs mention `x#<k>`/`__ret#<k'>`, not `_0`, so they were pruned; the
-                // late pin then reintroduced `x#<k>` with no `x#<k>==v` to ground it, so
-                // `¬(_0==v)` stayed SAT. The pins above now put the referent version
-                // (`x#<k>`) back into `formula`, so RE-conjoining the relevant block-defs
-                // pulls the establishing store `x#<k>==v` (and transitively the load def)
-                // back in — and `¬(_0==v)` becomes UNSAT (proved). SOUND: block-defs are
-                // TRUE facts of the body (relevance is a solver-perf heuristic, never a
-                // soundness gate — see `combine_relevant_block_defs`), so a FALSE
-                // postcondition stays refutable (each fact pins a genuine value, never
-                // credits a violation). SCOPED to a whole-return `_0 = copy/move(*p)`
-                // deref-LOAD so no other return shape's formula is perturbed.
-                let returns_via_deref_load = |b: &trust_types::BasicBlock| {
-                    b.stmts.iter().any(|stmt| {
-                        matches!(stmt, Statement::Assign { place, rvalue, .. }
-                            if place.local == 0
-                                && place.projections.is_empty()
-                                && matches!(rvalue,
-                                    Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
-                                        | Rvalue::CopyForDeref(p)
-                                    if matches!(p.projections.first(),
-                                        Some(trust_types::Projection::Deref))))
-                    })
-                };
-                if returns_via_deref_load(block)
-                    || (vc_block.id != block.id && returns_via_deref_load(vc_block))
-                {
+                if path_prep.has_deref_load_return {
                     formula = v2_formula_with_block_defs(func, block, formula);
                     if vc_block.id != block.id {
                         formula = v2_formula_with_block_defs(func, vc_block, formula);
@@ -843,14 +1608,15 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 if vc_block.id != block.id {
                     let (merge_pins, store_grounds) = return_edge_merge_pins(
                         func,
-                        &sv,
+                        sv,
                         vc_block,
                         block,
-                        &post,
-                        &out_param_store_sorts,
+                        clause_sorts,
+                        out_param_store_sorts,
+                        agg_operands,
                     );
                     let mut edge_facts: Vec<Formula> = Vec::new();
-                    edge_facts.extend(return_edge_guard(func, vc_block, block.id));
+                    edge_facts.extend(path_prep.edge_guard.clone());
                     edge_facts.extend(merge_pins);
                     if !edge_facts.is_empty() {
                         edge_facts.push(formula);
@@ -869,26 +1635,11 @@ pub(super) fn generate_v2_contract_vcs_impl(
                     }
                 }
 
-                if let Some(path_defs) = path_definition_map.get(&vc_block.id)
-                    && !path_defs.is_empty()
-                {
-                    let mut live = v2_live_path_defs(func, vc_block, path_defs);
-                    // soundness (round-11): v2_live_path_defs only sees
-                    // STATEMENT-level redefs, so a fact the block's TERMINATOR
-                    // invalidates (a `Call` dest such as `_0`, or a `&mut`/`&raw
-                    // mut` pointee escaping into the call) would survive into the
-                    // postcondition VC and vacuously discharge it. Drop those here,
-                    // mirroring the fixpoint outflow kill. Monotone-sound.
-                    let term_defs: FxHashSet<String> =
-                        terminator_def_names(func, vc_block).into_iter().collect();
-                    if !term_defs.is_empty() {
-                        live.retain(|f| formula_survives_redefs(f, &term_defs));
-                    }
-                    if !live.is_empty() {
-                        let mut conjuncts = live;
-                        conjuncts.push(formula);
-                        formula = Formula::And(conjuncts);
-                    }
+                if !path_prep.live_path_defs.is_empty() {
+                    let mut conjuncts = Vec::with_capacity(path_prep.live_path_defs.len() + 1);
+                    conjuncts.extend(path_prep.live_path_defs.iter().cloned());
+                    conjuncts.push(formula);
+                    formula = Formula::And(conjuncts);
                 }
 
                 // Trust S2c (exemption): path + semantic guards conjoined AFTER the
@@ -898,7 +1649,7 @@ pub(super) fn generate_v2_contract_vcs_impl(
                     // so an establish-versioned threaded fact connects to its LIVE
                     // postcondition-lane successor read; verdict-preserving with
                     // empty preconditions.
-                    let killed = may_reassigned.get(&vc_block.id).unwrap_or(&empty_kill);
+                    let killed = &empty_kill;
                     formula = conjoin_preconditions_versioned(
                         func,
                         vc_block.id,
@@ -907,109 +1658,202 @@ pub(super) fn generate_v2_contract_vcs_impl(
                         formula,
                     );
                 }
+                // Trust (a7 — ONE POSTCONDITION ROW PER ENUMERATED RETURN PATH,
+                // 2026-09-18). MEASURED root cause of two-language battery
+                // blocker a7, on managed `trustc d75f13f97`:
+                //
+                //   `fn pick(a,b) ensures a <= 1000000 ==> result >= a`
+                //   `{ if a >= 1000000 { 1000000 } else if b >= a { b } else { a } }`
+                //
+                // lowers to a Return block with TWO predecessors, one of which is
+                // the `goto`-only JOIN of the inner `if`'s two arms. That one
+                // predecessor is reached by TWO guard paths, so
+                // `v2_formula_with_path_guards` wraps its row as
+                // `Or([And([guards_1, body]), And([guards_2, body])])`. Measured
+                // verdicts on that toolchain: the FLAT sibling row
+                // (`vc:…:postcondition:0`) is proved by `trust-full-verifier` with
+                // a trust-mc PDR receipt; the `Or`-shaped row
+                // (`vc:…:postcondition:1`) gets no such receipt and falls back to
+                // `ay-in-process`, whose authority the source-clause composition
+                // rule does not accept — so the clause stays UNDISCHARGED although
+                // every body row reads `Proved`.
+                //
+                // The SAME function written with early `return`s gets one FLAT row
+                // per path (rustc gives each `return` its own `Return` block) and
+                // measures 4 proved / 0 unknown, marker discharged. The defect is
+                // therefore the row SHAPE, not the clause, the arithmetic or the
+                // path count: an author who writes the value-producing `if`
+                // expression is charged a disjunctive query that the `return`
+                // spelling of the same program is not.
+                //
+                // SPLIT IT. `Or(t_1..t_n)` is UNSAT exactly when every `t_i` is
+                // UNSAT, so emitting one row per `t_i` DISTRIBUTES the path-guard
+                // conjunct: no fact is added, dropped or changed by the split
+                // itself, and the CONJUNCTION of the emitted `t_i` is logically
+                // identical to the single `Or` row it replaces. A clause violated
+                // on path `i` leaves `t_i` satisfiable and that row fails closed
+                // exactly as the merged row did, so nothing false becomes provable
+                // (the false twins are the standing guard on that).
+                //
+                // NOT PURE DISTRIBUTION, AND SAYING SO. The shared tail below is
+                // SPINE-sensitive in two places, and a per-path row has a
+                // positive `And` spine where the merged `Or` row had none, so a
+                // per-path row can be STRICTLY more provable than the corresponding
+                // disjunct of the merged row. See `finish_row`'s header for the
+                // per-helper argument. The direction is fail-open-to-verdict, never
+                // credit-a-violation: each helper is scoped to the return slot and
+                // a per-path row is a RESTRICTION of the per-predecessor row those
+                // helpers were written for.
+                //
+                // The per-path inputs are built HERE, from the same
+                // `formula`/guard map the merged row is built from, and are then
+                // taken through the SAME tail as the merged row (`finish_row`
+                // below) — one function, so the emitted rows can never drift from
+                // the decisions taken on the merged row.
+                //
+                // DROPPED-`requires` FUNCTIONS DECLINE THE SPLIT ENTIRELY. Of the
+                // four `spec_unverifiable_vc` decisions below, three are shape
+                // tests that on an `Or` row are at least as eager as they would be
+                // on any one path (`formula_has_return_slot_pin` has no `Or` arm
+                // and so reads "unpinned"; `formula_pins_var_name`'s `Or` arm
+                // requires EVERY arm to pin), so deciding them on the merged row
+                // can only suppress rows a per-path decision would have emitted.
+                // The 2026-08-06 dropped-`requires` tripwire is the exception and
+                // runs the other way: `only_excluded_counterexamples` is a
+                // PER-MODEL test, `models(Or(t_1..t_n))` is the UNION of the
+                // `models(t_i)`, so "every model of the merged row is an entry
+                // state the dropped `requires` excludes" is STRICTLY STRONGER than
+                // the same statement about one `t_i`. Deciding it on the merged row
+                // and then shipping per-path rows could therefore emit a row whose
+                // own models are all excluded — the false-refutation-against-correct-code
+                // this P0 guard exists to stop. Rather than re-run a bounded model
+                // search per path (a larger change, and one nothing in this lane
+                // measured), a function whose contract preconditions the gate
+                // dropped keeps HEAD's single merged row: `dropped_requires` is
+                // per-FUNCTION, so this is decided identically for every clause and
+                // every predecessor of such a function. The `machine_lane` half
+                // mirrors the tripwire's own `!*machine_lane` guard — that lane
+                // never consults the model search at all, so splitting there
+                // bypasses no decision.
+                //
+                // An empty vector means "no split": one row, spelled exactly as
+                // before.
+                let split_declined_for_dropped_requires =
+                    !*machine_lane && !dropped_requires.is_empty();
+                let path_split_inputs: Vec<Formula> = match guard_paths_map.get(&vc_block.id) {
+                    Some(paths)
+                        if !split_declined_for_dropped_requires
+                            && (2..=POSTCONDITION_PATH_SPLIT_CAP).contains(&paths.len()) =>
+                    {
+                        paths
+                            .iter()
+                            .map(|path| {
+                                v2_formula_with_path_guards(
+                                    func,
+                                    sv,
+                                    vc_block.id,
+                                    std::slice::from_ref(path),
+                                    formula.clone(),
+                                )
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
                 if let Some(block_guard_paths) = guard_paths_map.get(&vc_block.id) {
-                    formula = v2_formula_with_path_guards(func, &sv, block_guard_paths, formula);
-                }
-                // Conjoin assert-passed semantic guards from BOTH the predecessor
-                // (vc_block) AND the return block itself — EXEMPT from the rename.
-                let mut sem_conjuncts: Vec<Formula> = Vec::new();
-                if let Some(g) = semantic_guards.get(&block.id) {
-                    sem_conjuncts.extend(g.iter().cloned());
-                }
-                if vc_block.id != block.id
-                    && let Some(g) = semantic_guards.get(&vc_block.id)
-                {
-                    sem_conjuncts.extend(g.iter().cloned());
-                }
-                if !sem_conjuncts.is_empty() {
-                    sem_conjuncts.push(formula);
-                    formula = Formula::And(sem_conjuncts);
-                }
-
-                // Unify the return slot's two names to `_0`: rename the block-def
-                // alias `__ret` (from `place_to_var_name`) onto the `_0` the
-                // postcond and the `Rvalue::Use` pin use. This connects a non-`Use`
-                // return assignment (e.g. a `BinaryOp` comparison `_0 = (x > 0)`
-                // captured by block-def extraction as `__ret == (x > 0)`) to the
-                // postcondition WITHOUT introducing a `_0 == __ret` Bool-equality
-                // chain that drives the SMT solver to `unknown`. Sound: both names
-                // denote local 0. No-op when the alias is already `_0`.
-                if ret_alias != "_0" {
-                    formula = substitute_summary_params(
-                        &formula,
-                        &[(
-                            ret_alias.clone(),
-                            Formula::var_owned("_0".to_string(), ret_sort.clone()),
-                        )],
+                    formula = v2_formula_with_path_guards(
+                        func,
+                        sv,
+                        vc_block.id,
+                        block_guard_paths,
+                        formula,
                     );
                 }
+                // The tail EVERY emitted row of this (clause, predecessor) shares.
+                // It is a closure rather than inline code so the per-path rows and
+                // the merged row cannot diverge: a row that reached a different
+                // normalization than the one the tripwires below judged would be a
+                // row nothing had checked.
+                //
+                // Two of these steps are SPINE-sensitive —
+                // `dedup_identical_return_slot_pin` and, in the tripwires,
+                // `formula_has_return_slot_pin` walk only
+                // the positive `And` spine. On an `Or`-rooted merged row that spine
+                // is empty, so they are no-ops; on a per-path row they see the pins
+                // this lane conjoined and can fire. That is the intended direction:
+                // each helper retains the return slot's versioned value, and a
+                // per-path row is a RESTRICTION of the per-predecessor row those helpers were written
+                // for — so their soundness arguments hold a fortiori. They can turn
+                // a fail-closed non-verdict into a verdict; they cannot credit a
+                // violated clause.
+                let finish_row = |mut formula: Formula| -> Formula {
+                    if !path_prep.sem_conjuncts.is_empty() {
+                        let mut sem_conjuncts =
+                            Vec::with_capacity(path_prep.sem_conjuncts.len() + 1);
+                        sem_conjuncts.extend(path_prep.sem_conjuncts.iter().cloned());
+                        sem_conjuncts.push(formula);
+                        formula = Formula::And(sem_conjuncts);
+                    }
 
-                // Trust (return-slot version unification): vcgen versions the negated
-                // postcondition's `_0` at the Return point, where `_0` carries the MERGED
-                // reaching-set token of all return predecessors (e.g. `_0#s1_0_s6_0`),
-                // while the return-value pin this lane conjoined (`Eq(_0#s6_0, <retval>)`)
-                // carries the SINGLE establish-point token of THIS predecessor's write.
-                // The two names denote the SAME final return value on this per-predecessor
-                // Return-block VC but do not unify, so the negated postcondition stays
-                // havoc'd and a valid bound (`retval >= step`) is vacuously SAT (fails
-                // closed as-emitted). Unify the return slot's versions to the pin's version
-                // so the linear chain `step <= retval = _0 < step` contradicts and
-                // `certify_violation` discharges. Version-aware, scoped to the return slot
-                // ONLY and to THIS one VC — see `unify_return_slot_versions`.
-                formula = unify_return_slot_versions(formula);
+                    // Unify the return slot's two names to `_0`: rename the block-def
+                    // alias `__ret` (from `place_to_var_name`) onto the `_0` the
+                    // postcond and the `Rvalue::Use` pin use. This connects a non-`Use`
+                    // return assignment (e.g. a `BinaryOp` comparison `_0 = (x > 0)`
+                    // captured by block-def extraction as `__ret == (x > 0)`) to the
+                    // postcondition WITHOUT introducing a `_0 == __ret` Bool-equality
+                    // chain that drives the SMT solver to `unknown`. Sound: both names
+                    // denote local 0. No-op when the alias is already `_0`.
+                    if let Some(subst) = &ret_alias_subst {
+                        formula = substitute_summary_params_owned(formula, subst);
+                    }
 
-                // Trust (safe-midpoint postcondition, 2026-07-08): conjoin the
-                // FUNCTION-WIDE invariant facts — the same set the hardened panic
-                // lane and the v2 block-VC lane already conjoin (their per-builder
-                // docs prove each fact unconditionally true and SSA-gated, so
-                // "conjoining the set onto ANY VC of `func` is sound"). Without
-                // them a postcondition consuming a CHECKED-OP RESULT copied out of
-                // its overflow pair (`_dst = (_c.0)`; the classic
-                // `low + (high - low) / 2`) leaves `_dst` COMPLETELY FREE in this
-                // lane: z3 on the emitted VC produced `_dst ≈ 2^127` while the
-                // computed sum was in range — a TRUE postcondition spuriously
-                // refuted. Conjoined BEFORE `normalize_ssa_version_tokens` so the
-                // facts' bare whole-local names unify with the body's versioned
-                // reads (the same collapse argument the safety lane relies on).
-                let global_facts = build_global_invariant_facts(func);
-                if !global_facts.is_empty() {
-                    let mut with_facts = global_facts;
-                    with_facts.push(formula);
-                    formula = Formula::And(with_facts);
-                }
+                    // Trust (safe-midpoint postcondition, 2026-07-08): conjoin the
+                    // FUNCTION-WIDE invariant facts — the same set the hardened panic
+                    // lane and the v2 block-VC lane already conjoin (their per-builder
+                    // docs prove each fact unconditionally true and SSA-gated, so
+                    // "conjoining the set onto ANY VC of `func` is sound"). Without
+                    // them a postcondition consuming a CHECKED-OP RESULT copied out of
+                    // its overflow pair (`_dst = (_c.0)`; the classic
+                    // `low + (high - low) / 2`) leaves `_dst` COMPLETELY FREE in this
+                    // lane: z3 on the emitted VC produced `_dst ≈ 2^127` while the
+                    // computed sum was in range — a TRUE postcondition spuriously
+                    // refuted. Conjoined BEFORE `normalize_ssa_version_tokens` so the
+                    // facts' bare whole-local names unify with the body's versioned
+                    // reads (the same collapse argument the safety lane relies on).
+                    // Less the element-read congruences it cannot use
+                    // (`RowGlobalFacts::for_row`).
+                    let global_facts = global_facts_cell
+                        .get_or_init(|| build_global_invariant_facts(func))
+                        .for_row(&formula);
+                    if !global_facts.is_empty() {
+                        let mut with_facts = global_facts;
+                        with_facts.push(formula);
+                        formula = Formula::And(with_facts);
+                    }
 
-                // Trust (branchy #[ensures] over-refutation fix, 2026-07-04):
-                // `unify_return_slot_versions` only fires when the return slot has a
-                // SINGLE pin version; a MULTI-RETURN body (`if c { a } else { a }`)
-                // pins `_0` under two distinct reaching-def tokens (bare `_0` from
-                // one predecessor's block-def, `_0#s3_0` from the return block's
-                // merged-token read), so it bails and the negated postcondition
-                // stays disconnected from the return value — FALSE-REFUTING a valid
-                // branchy postcondition (`ensures |r| *r >= a` over `if a<100 {a}
-                // else {a}` is UNSAT-to-violate yet was refuted). The return slot
-                // `_0` is single-static-assignment (assigned once, before `Return`),
-                // so collapsing its version tokens to the bare name is an IDENTITY on
-                // the formula's meaning (the same argument the safety lane relies on
-                // — see `normalize_ssa_version_tokens`) that CONNECTS the two pins:
-                // `_0 == __ret#s1_0 == a` and `_0 == __ret#s1_0_s2_0` then unify so
-                // `¬(_0 >= a)` becomes `¬(a >= a)` = UNSAT = proved. SOUND in the
-                // false-PROOF direction too: a REASSIGNED-parameter postcondition
-                // already fail-closed above (`postcondition_references_mutated_param`),
-                // and a NON-SSA local keeps its load-bearing token disjointness
-                // (normalize only collapses genuinely single-assignment locals), so
-                // this never credits a violated postcondition.
-                formula = normalize_ssa_version_tokens(func, &formula);
+                    // Collapse only locals that are genuinely single-assignment.
+                    // A multiply-written return slot keeps its per-write tokens,
+                    // including historical values consumed by path guards.
+                    formula = normalize_ssa_version_tokens_owned(func, formula);
+                    formula =
+                        return_metadata::normalize_stable_length_epochs(formula, metadata_pin);
 
-                // Block-def extraction and the explicit return-pin fallback can
-                // converge to the SAME `_0 == value` equality only after the
-                // return alias and SSA tokens above are normalized.  Keep one
-                // copy: besides avoiding a redundant solver premise, this keeps
-                // the live postcondition formula byte-equal to the independently
-                // reconstructed trust-ir spine formula.  The helper is narrowly
-                // gated to an AST-identical return-slot equality already present
-                // on the unconditional `And` spine; nonidentical pins and every
-                // other semantic guard are preserved.
-                formula = dedup_identical_return_slot_pin(formula);
+                    // Block-def extraction and the explicit return-pin fallback can
+                    // converge to the SAME `_0 == value` equality only after the
+                    // return alias and SSA tokens above are normalized.  Keep one
+                    // copy: besides avoiding a redundant solver premise, this keeps
+                    // the live postcondition formula byte-equal to the independently
+                    // reconstructed trust-ir spine formula.  The helper is narrowly
+                    // gated to an AST-identical return-slot equality already present
+                    // on the unconditional `And` spine; nonidentical pins and every
+                    // other semantic guard are preserved.
+                    formula = dedup_identical_return_slot_pin(formula);
+                    formula
+                };
+                formula = finish_row(formula);
+                // Per-path rows, through the identical tail.
+                let mut path_split_rows: Vec<Formula> =
+                    path_split_inputs.into_iter().map(&finish_row).collect();
 
                 // Silent-weakening tripwire: a return assignment failed to
                 // lower AND nothing else pinned the return slot AND the
@@ -1022,15 +1866,48 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 // proceeds; a clause that never references the slot is
                 // unaffected by the missing pin.)
                 if unlowerable_return_assignment
+                    && formula_refs_return_slot
                     && !formula_has_return_slot_pin(&formula)
                     && !formula_has_complete_return_projection_pins(&formula, &post)
-                    && formula_references_return_slot(&post)
                 {
                     vcs.push(contracts::spec_unverifiable_vc(
                         func,
-                        v2_block_span(func, vc_block),
+                        path_prep.vc_block_span.clone(),
                         "return assignment is outside the encoder fragment and no conjunct pins the return slot; refusing a refutable query over a free return value",
                         &format!("{post:?}"),
+                        clause_metadata,
+                    ));
+                    continue;
+                }
+
+                // Trust (INTRINSIC-RESIDUAL-1, 2026-10-08) — the CALL twin of the
+                // tripwire above. A return slot written directly by a call
+                // TERMINATOR has no statement for the pin loop to lower, so it is
+                // pinned only by the per-callee models this lane conjoins
+                // (saturating ≤ 64 bits, `wrapping_neg`, the bit intrinsics,
+                // `Ord::min/max/clamp`). An unmodeled sysroot method
+                // (`i32::unsigned_abs`, `u128::saturating_add`) leaves `_0` FREE, and
+                // the row is a refutable query over havoc: measured on the stage-2
+                // capture `fn f(x: i32) -> u32 ensures result <= 2147483648 {
+                // x.unsigned_abs() }` as `Failed { _0 = 2147483649 }` — a value the
+                // call never returns — with the formula `range(x) ∧ ¬(_0 ≤ 2147483648)`.
+                // Fire only for an unmarked sysroot callee
+                // (`return_slot_written_by_unmarked_sysroot_call` says why) and only
+                // when NOTHING but the negated clause mentions the return slot
+                // (`return_slot_only_in_negated_clause`), so a modeled call, a
+                // callee fact or a guard that constrains `_0` keeps its row. Firing
+                // can only withhold a verdict: a row that would have PROVED here
+                // proved for every value of `_0`, i.e. a tautology of the clause.
+                if formula_refs_return_slot
+                    && *path_prep.unmarked_sysroot_call.get_or_init(|| {
+                        return_slot_written_by_unmarked_sysroot_call(vc_block, block)
+                    })
+                    && return_slot_only_in_negated_clause(&formula)
+                {
+                    vcs.push(contracts::unconstrained_return_call_vc(
+                        func,
+                        path_prep.vc_block_span.clone(),
+                        &post,
                         clause_metadata,
                     ));
                     continue;
@@ -1073,17 +1950,18 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 // accounted for. A place the body never writes is still absent
                 // from it and stays genuinely refutable, which is what makes
                 // `ensures self.n == 0` over an empty body correctly fail.
-                let clause_written_out_params: Vec<String> = {
-                    let mut names: Vec<String> = formula_var_sorts(&post)
-                        .into_iter()
-                        .map(|(name, _)| name.split('#').next().unwrap_or(&name).to_string())
-                        .filter(|base| out_param_store_sorts.get(base).is_some_and(Option::is_some))
-                        .collect();
-                    names.extend(unpinned_out_params.iter().cloned());
-                    names.sort();
-                    names.dedup();
-                    names
-                };
+                let clause_written_out_params: std::borrow::Cow<'_, [String]> =
+                    if unpinned_out_params.is_empty() {
+                        std::borrow::Cow::Borrowed(base_clause_written_out_params)
+                    } else {
+                        let mut names = base_clause_written_out_params.to_vec();
+                        names.extend(unpinned_out_params.iter().cloned());
+                        if names.len() > 1 {
+                            names.sort_unstable();
+                            names.dedup();
+                        }
+                        std::borrow::Cow::Owned(names)
+                    };
                 let unconstrained_out_param = clause_written_out_params.iter().find(|subject| {
                     let versioned =
                         match sv.version_token_at(func, block.id, block.stmts.len(), subject) {
@@ -1095,7 +1973,7 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 if let Some(subject) = unconstrained_out_param {
                     vcs.push(contracts::spec_unverifiable_vc(
                         func,
-                        v2_block_span(func, vc_block),
+                        path_prep.vc_block_span.clone(),
                         &format!(
                             "postcondition references `&mut`-parameter place `{subject}`, which the \
                              body writes but no conjunct pins at the obligation's read version; \
@@ -1138,7 +2016,19 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 // therefore requires a concrete model in hand, so:
                 //   * a PROVABLE row has no model, none is found, and the row is
                 //     emitted unchanged — `ensures(*ret >= n)` over `{ n }` with
-                //     the same dropped `requires` still proves;
+                //     the same dropped `requires` still proves. "Provable" means
+                //     provable as judged HERE, before the stored-value type ranges
+                //     are conjoined below: a row that proves only through a
+                //     carrier range (`ensures(*ret >= 0)` over `{ x }` for a
+                //     `usize` `x`, with `x > 0` dropped) has the out-of-range
+                //     model `x = -1`, which the dropped clause excludes, so it is
+                //     refused. A fail-closed precision gap, kept on purpose:
+                //     conjoining the ranges here would add their bounds to
+                //     `candidate_ints` (a `u128` bound is no `i128` and declines
+                //     outright; each bound adds three candidates against the
+                //     32-candidate cap), so the search would DECLINE on rows it
+                //     fires on today and emit exactly the refutation this
+                //     tripwire suppresses (VCGEN-LIB-REDS-1);
                 //   * a GENUINE bug whose counterexample satisfies the
                 //     precondition is found to be genuine and still refutes —
                 //     `requires(n >= 0)` with `ensures(|r| *r >= 5)` over `{ n }`
@@ -1168,13 +2058,24 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 // its emitted formula is the declared-width QF_BV translation
                 // below, and a model of the mathematical-`Int` spelling is not
                 // a model of that.
+                //
+                // Trust (a7 per-path split, 2026-09-18): this is the ONE decision
+                // in this loop that does NOT distribute over the path-guard `Or`
+                // — models of a disjunction are the UNION of the disjuncts'
+                // models, so "every model is excluded" is strictly stronger for
+                // the merged row than for any one path, and judging it on the
+                // merged row while shipping per-path rows could emit exactly the
+                // row this guard exists to suppress. The split therefore declines
+                // outright on a function with a dropped `requires`; see
+                // `split_declined_for_dropped_requires` above. The row this test
+                // judges is then the only row emitted, exactly as at HEAD.
                 if !*machine_lane
                     && !dropped_requires.is_empty()
-                    && only_excluded_counterexamples(func, &formula, &dropped_requires)
+                    && only_excluded_counterexamples(func, &formula, dropped_requires)
                 {
                     vcs.push(contracts::spec_unverifiable_vc(
                         func,
-                        v2_block_span(func, vc_block),
+                        path_prep.vc_block_span.clone(),
                         "the authored `requires` was not assumed for body verification (see the \
                          `is not assumed for body verification` warning on this function), and \
                          every counterexample this row admits is an entry state that `requires` \
@@ -1189,22 +2090,13 @@ pub(super) fn generate_v2_contract_vcs_impl(
                     continue;
                 }
 
-                // Machine{w} lane: the clause was admitted CONDITIONALLY on the
-                // fully assembled VC — negated clause, block defs, return pins,
-                // versioned hypotheses, guards — translating wholesale into
-                // declared-width QF_BV (ratified L1 rule 4). The mathematical-Int
-                // spelling assembled above reads machine arithmetic unbounded —
-                // the confirmed `result + 1 > result` false-proof vector — so it
-                // must NEVER be emitted for such a clause: on any conjunct
-                // outside the fragment (mixed body widths, collection facts) the
-                // row falls closed to the visible unsupported shape instead.
                 if *machine_lane {
                     match contracts::machine_faithful_vc_formula(func, &formula) {
                         Some(machine) => formula = machine,
                         None => {
                             vcs.push(contracts::spec_unverifiable_vc(
                                 func,
-                                v2_block_span(func, vc_block),
+                                path_prep.vc_block_span.clone(),
                                 "machine-arithmetic ensures conjoined body facts outside the declared-width fragment",
                                 &format!("{post:?}"),
                                 clause_metadata,
@@ -1212,20 +2104,29 @@ pub(super) fn generate_v2_contract_vcs_impl(
                             continue;
                         }
                     }
+                    let translated: Option<Vec<Formula>> = path_split_rows
+                        .iter()
+                        .map(|row| contracts::machine_faithful_vc_formula(func, row))
+                        .collect();
+                    path_split_rows = translated.unwrap_or_default();
                 }
 
-                // (Term-`Ite` elimination is applied UNIFORMLY to every VC — this
-                // postcondition included — by the central normalization loop in
-                // `generate_vcs_impl`, so it is not repeated here.)
-
-                vcs.push(VerificationCondition {
-                    kind: VcKind::Postcondition,
-                    function: func.name.as_str().into(),
-                    location: v2_block_span(func, vc_block),
-                    formula,
-                    contract_metadata: clause_metadata,
-                    obligation: None,
-                });
+                let rows = if path_split_rows.is_empty() { vec![formula] } else { path_split_rows };
+                for row in rows {
+                    let row = if *machine_lane {
+                        row
+                    } else {
+                        conjoin_postcondition_value_type_ranges(func, row)
+                    };
+                    vcs.push(VerificationCondition {
+                        kind: VcKind::Postcondition,
+                        function: fn_sym,
+                        location: path_prep.vc_block_span.clone(),
+                        formula: row,
+                        contract_metadata: clause_metadata,
+                        obligation: None,
+                    });
+                }
             }
         }
     }
@@ -1274,7 +2175,20 @@ pub(super) fn generate_v2_contract_vcs_impl(
 /// is compared exactly by construction, rather than silently falling into a
 /// permissive catch-all arm.
 pub(super) fn parsed_clause_matches_typed(parsed: &Formula, typed: &Formula) -> bool {
-    // The one and only relaxation, and only on a variable leaf.
+    // The sentinel's one consequence ABOVE a leaf (SPEC-FLOAT-EQ-STRUCTURAL-1).
+    // A contract `==` is Rust `PartialEq`, so once its operands are known to be
+    // floats the typed lowering spells it IEEE `FpEq`; between two bare
+    // identifiers the parser cannot know that and spells it `Eq`. Same clause,
+    // so the operands are matched pairwise under the same rules. One direction
+    // only: a parsed `FpEq` (a float literal fixed the sort) must meet a typed
+    // `FpEq`, and a typed structural `Eq` is never the lowering of either.
+    if let (Formula::Eq(parsed_lhs, parsed_rhs), Formula::FpEq(typed_lhs, typed_rhs)) =
+        (parsed, typed)
+    {
+        return parsed_clause_matches_typed(parsed_lhs, typed_lhs)
+            && parsed_clause_matches_typed(parsed_rhs, typed_rhs);
+    }
+    // The one and only relaxation on a variable leaf.
     if let (Some((parsed_name, parsed_sort)), Some((typed_name, typed_sort))) =
         (formula_var_leaf(parsed), formula_var_leaf(typed))
     {
@@ -1283,16 +2197,8 @@ pub(super) fn parsed_clause_matches_typed(parsed: &Formula, typed: &Formula) -> 
     }
     // Identical constructor and identical non-formula payload, then identical
     // children pairwise.
-    if !same_formula_shape(parsed, typed) {
-        return false;
-    }
-    let parsed_children = parsed.children();
-    let typed_children = typed.children();
-    parsed_children.len() == typed_children.len()
-        && parsed_children
-            .iter()
-            .zip(typed_children.iter())
-            .all(|(p, t)| parsed_clause_matches_typed(p, t))
+    same_formula_shape(parsed, typed)
+        && trust_types::all_formula_children_zip(parsed, typed, parsed_clause_matches_typed)
 }
 
 /// `Var` and `SymVar` viewed uniformly as `(name, sort)`. `SymVar` is
@@ -1316,6 +2222,50 @@ fn formula_var_leaf(formula: &Formula) -> Option<(&str, &Sort)> {
 /// happens to BE the sentinel is harmless: erasure decides the shape only, and
 /// the caller still compares every child pairwise afterwards.
 fn same_formula_shape(a: &Formula, b: &Formula) -> bool {
+    if std::mem::discriminant(a) != std::mem::discriminant(b) {
+        return false;
+    }
+    match (a, b) {
+        (Formula::And(ca), Formula::And(cb)) | (Formula::Or(ca), Formula::Or(cb)) => {
+            return ca.len() == cb.len();
+        }
+        (
+            Formula::Not(_)
+            | Formula::Neg(_)
+            | Formula::Implies(_, _)
+            | Formula::Eq(_, _)
+            | Formula::Lt(_, _)
+            | Formula::Le(_, _)
+            | Formula::Gt(_, _)
+            | Formula::Ge(_, _)
+            | Formula::Add(_, _)
+            | Formula::Sub(_, _)
+            | Formula::Mul(_, _)
+            | Formula::Div(_, _)
+            | Formula::Rem(_, _)
+            | Formula::BvConcat(_, _)
+            | Formula::Select(_, _)
+            | Formula::Ite(_, _, _)
+            | Formula::Store(_, _, _),
+            _,
+        ) => return true,
+        (
+            Formula::Bool(_)
+            | Formula::Int(_)
+            | Formula::UInt(_)
+            | Formula::Rat { .. }
+            | Formula::BitVec { .. }
+            | Formula::Var(..)
+            | Formula::SymVar(..)
+            | Formula::FpConst { .. }
+            | Formula::FpNaN { .. }
+            | Formula::FpInf { .. }
+            | Formula::FpZero { .. }
+            | Formula::FpRoundingMode(_),
+            _,
+        ) => return a == b,
+        _ => {}
+    }
     fn erase(formula: &Formula) -> Formula {
         formula.clone().map_children(&mut |_| Formula::Bool(false))
     }
@@ -1348,6 +2298,7 @@ pub(super) fn unique_source_contract_index_for_formula(
         // Ambiguity handling below is untouched: two matching clauses still
         // yield `None`.
         trust_types::parse_spec_expr(body)
+            .map(|parsed| rebind_text_lengths(func, parsed))
             .filter(|parsed| parsed_clause_matches_typed(parsed, formula))
             .map(|_| index)
     });
@@ -1442,33 +2393,32 @@ pub(super) fn formula_has_complete_return_projection_pins(
     postcondition: &Formula,
 ) -> bool {
     fn mentions_unsupported_value_sentinel(formula: &Formula) -> bool {
-        let mut found = false;
-        formula.visit(&mut |node| {
-            if let Formula::Var(name, _) = node {
-                found |=
-                    name.starts_with("__trust_unsupported_operand_") || name == "__unknown_operand";
-            }
-        });
-        found
+        trust_types::any_formula_node(formula, &mut |node| {
+            matches!(
+                node,
+                Formula::Var(name, _)
+                    if name.starts_with("__trust_unsupported_operand_") || name == "__unknown_operand"
+            )
+        })
     }
 
-    let mut references_whole_slot = false;
-    let mut required: FxHashSet<String> = FxHashSet::default();
-    postcondition.visit(&mut |node| {
+    let mut required: FxHashSet<&str> = FxHashSet::default();
+    if !trust_types::all_formula_nodes(postcondition, &mut |node| {
         if let Formula::Var(name, _) = node {
             let base = name.split('#').next().unwrap_or(name);
             if base == "_0" {
-                references_whole_slot = true;
+                return false;
             } else if base.starts_with("_0.") {
-                required.insert(base.to_string());
+                required.insert(base);
             }
         }
-    });
-    if references_whole_slot || required.is_empty() {
+        true
+    }) || required.is_empty()
+    {
         return false;
     }
 
-    fn collect_positive_projection_pins(formula: &Formula, pins: &mut FxHashSet<String>) {
+    fn collect_positive_projection_pins<'a>(formula: &'a Formula, pins: &mut FxHashSet<&'a str>) {
         match formula {
             Formula::And(conjuncts) => {
                 for conjunct in conjuncts {
@@ -1482,7 +2432,7 @@ pub(super) fn formula_has_complete_return_projection_pins(
                         && !formula_references_return_slot(rhs)
                         && !mentions_unsupported_value_sentinel(rhs)
                     {
-                        pins.insert(base.to_string());
+                        pins.insert(base);
                     }
                 }
             }
@@ -1490,96 +2440,145 @@ pub(super) fn formula_has_complete_return_projection_pins(
         }
     }
 
-    let mut pinned: FxHashSet<String> = FxHashSet::default();
+    let mut pinned: FxHashSet<&str> = FxHashSet::default();
     collect_positive_projection_pins(formula, &mut pinned);
     required.is_subset(&pinned)
+}
+
+/// Whether the predecessor or the return block ends in a call whose destination is
+/// the WHOLE return slot `_0` — the shape the call-model pins above handle and the
+/// statement pin loop cannot see — to an UNMARKED SYSROOT callee.
+///
+/// Both restrictions keep rows other lanes may still decide. A callee path the
+/// extractor stamped with one of the MODELED `@trust-…` prefixes
+/// ([`callee_carries_a_modeled_stamp`]) is one some lane models — the inferred-return
+/// check hands exactly such a row (`_0 = wrapping_add(a, b)`, `_0` free in this
+/// formula) to the Clean kernel. A user callee may be composed through its own
+/// certified contract. A sysroot method that carries no marker
+/// (`i32::unsigned_abs`, `u128::saturating_add`) has neither; an absent `callee_key`
+/// is not evidence of one, so it does not fire.
+///
+/// Trust (std-call-summaries P2 review, 2026-10-12): the exemption used to be ANY
+/// `@`-prefixed callee. The panic-freedom-only intrinsic stamp
+/// (`@trust-rustc-panic-free-intrinsic::`) is modeled by NO lane — its result is a
+/// fresh havoc by design — so `_0 = minimumf64(x, 0.0)` left `_0` free and the row
+/// was a refutable query over havoc. The modeled stamps are now listed positively;
+/// any other `@` spelling (the panic-free stamp, `@trust-total-to-string::`,
+/// `@trust-indirect-callee`) fires. Firing can only withhold a verdict.
+fn callee_carries_a_modeled_stamp(callee: &str) -> bool {
+    [
+        trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX,
+        trust_types::TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX,
+        trust_types::TRUST_RUSTC_CHECKED_PRIMITIVE_METHOD_PATH_PREFIX,
+        trust_types::TRUST_RUSTC_WRAPPING_REFUTATION_METHOD_PATH_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| callee.starts_with(prefix))
+}
+
+fn return_slot_written_by_unmarked_sysroot_call(
+    vc_block: &trust_types::BasicBlock,
+    block: &trust_types::BasicBlock,
+) -> bool {
+    [vc_block, block].into_iter().any(|b| {
+        matches!(&b.terminator, Terminator::Call { func: callee, dest, callee_key, .. }
+            if dest.local == 0
+                && dest.projections.is_empty()
+                && !callee_carries_a_modeled_stamp(callee)
+                && callee_key.as_ref().is_some_and(|key| key.krate_is_real_sysroot))
+    })
+}
+
+/// Whether the return slot is constrained by NOTHING but the negated clause: on the
+/// positive `And` spine exactly one conjunct mentions a return-slot variable, and
+/// it is a `Not` (the clause); an `Or` on the spine (the path-guard wrap) answers
+/// this for every arm. Anything else that mentions `_0` — a pin, a guarded model
+/// equality, a callee fact, a second negation — is a constraint, and answers
+/// `false`.
+fn return_slot_only_in_negated_clause(formula: &Formula) -> bool {
+    fn scan_spine<'f>(formula: &'f Formula, sole: &mut Option<&'f Formula>) -> Result<(), ()> {
+        match formula {
+            Formula::And(conjuncts) => {
+                for c in conjuncts {
+                    scan_spine(c, sole)?;
+                }
+                Ok(())
+            }
+            other => {
+                if formula_references_return_slot(other) {
+                    if sole.is_some() {
+                        return Err(());
+                    }
+                    *sole = Some(other);
+                }
+                Ok(())
+            }
+        }
+    }
+    let mut sole = None;
+    if scan_spine(formula, &mut sole).is_err() {
+        return false;
+    }
+    match sole {
+        Some(Formula::Not(_)) => true,
+        Some(Formula::Or(arms)) => {
+            !arms.is_empty() && arms.iter().all(return_slot_only_in_negated_clause)
+        }
+        _ => false,
+    }
 }
 
 /// Whether a clause formula references the return slot (`_0`, a versioned
 /// `_0#<tok>`, or a projected `_0.<field>` spelling) anywhere.
 pub(super) fn formula_references_return_slot(formula: &Formula) -> bool {
-    let mut found = false;
-    formula.visit(&mut |node| {
+    trust_types::any_formula_node(formula, &mut |node| {
         if let Formula::Var(name, _) = node {
             let base = name.split('#').next().unwrap_or(name);
-            found |= base == "_0" || base.starts_with("_0.");
+            base == "_0" || base.starts_with("_0.")
+        } else {
+            false
         }
-    });
-    found
+    })
 }
 
-/// The UNIQUE return-slot version (`_0` / `_0#<tok>`) appearing as the LHS of an
-/// `Eq` conjunct on the formula's positive `And` SPINE — i.e. the return-value
-/// pin `Eq(_0#<v>, <retval>)` the postcondition lane conjoined for this
-/// Return-block VC. `None` when there is no such pin, or more than one distinct
-/// version (ambiguous — leave the formula untouched rather than risk unifying to
-/// a non-final version, so we never over-unify unsoundly).
+/// Stamp only the clause's scalar result read with this return path's final value.
 ///
-/// SPINE-ONLY is load-bearing, exactly as in [`formula_has_return_slot_pin`]:
-/// an equality inside the negated clause is the OBLIGATION, not a pin. The
-/// previous everywhere-walk counted the clause's own `Not(Eq(_0#<merged>, …))`
-/// as a second pin whenever the ensures was Eq-SHAPED (`result == …`), so on a
-/// multi-write body (the `&&`-lowering diamond of probe f53: `ensures result ==
-/// (x >= -128 && x <= 127)`) the pin set looked ambiguous, the unifier bailed,
-/// the clause's merged join name (`_0#s1_0_s2_0`) stayed FREE, and the row
-/// FALSE-REFUTED a tautology with `verified_counterexample = true`. An Eq under
-/// `Not`/`Or`/`Implies` is conditional or negated and is never the pin this
-/// lane conjoined; a nested Eq below the spine likewise must not become a
-/// rename target (mirrors `dedup_identical_return_slot_pin`'s walk).
-pub(super) fn return_slot_pin_version(formula: &Formula) -> Option<String> {
-    fn collect_spine_pins(formula: &Formula, pins: &mut FxHashSet<String>) {
-        match formula {
-            Formula::And(conjuncts) => {
-                for conjunct in conjuncts {
-                    collect_spine_pins(conjunct, pins);
-                }
-            }
-            Formula::Eq(l, _) => {
-                if let Formula::Var(n, _) = &**l
-                    && is_return_slot_name(n)
-                {
-                    pins.insert(n.clone());
-                }
-            }
-            _ => {}
-        }
+/// A Return block can join several writers, while each emitted row covers one
+/// predecessor. Its clause must therefore use that predecessor's value, unless
+/// the Return block writes a newer value itself. Do this before adding body facts:
+/// an earlier `_0` read in a guard is a different value and must stay different.
+/// In particular, neither a pin hidden under `Or` nor a historical pin on the
+/// positive `And` spine is authority to rename all return-slot versions.
+fn postcondition_at_return_path(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    pred: &trust_types::BasicBlock,
+    ret: &trust_types::BasicBlock,
+    clause: Formula,
+) -> Option<Formula> {
+    if !trust_types::any_free_variable_name(&clause, &mut |name| name == "_0") {
+        return Some(clause);
     }
-    let mut pins: FxHashSet<String> = FxHashSet::default();
-    collect_spine_pins(formula, &mut pins);
-    if pins.len() == 1 { pins.into_iter().next() } else { None }
-}
-
-/// Within a SINGLE per-predecessor Return-block Postcondition VC, unify every
-/// statement-version of the return slot `_0` (`_0` / `_0#<tok>`) to the version the
-/// return-value pin uses.
-///
-/// vcgen versions the negated postcondition's `_0` at the Return point, where `_0`
-/// carries the MERGED reaching-set token of all return predecessors (e.g.
-/// `_0#s1_0_s6_0` from `version_token_at`'s inter-block reaching set), while the
-/// return-value pin this lane conjoined (`Eq(_0#s6_0, <retval>)`) carries the SINGLE
-/// establish-point token of THIS predecessor's write. The two names denote the SAME
-/// final return value on this per-predecessor VC but do not unify, so the negated
-/// postcondition stays havoc'd and a valid bound is vacuously SAT.
-///
-/// SOUNDNESS: `_0` (RETURN_PLACE) is assigned before `Return`, so within one
-/// per-predecessor Return-block VC every surviving `_0#*` denotes local 0's single
-/// final value — unifying them equates only provably-equal names. Scoped to the
-/// return slot ONLY (never another local, via `is_return_slot_name`) and to THIS one
-/// VC (never across blocks), so it cannot make a FALSE postcondition provable: the
-/// FALSE `result > step` control still fails closed because `retval == step` stays
-/// satisfiable after unification. Unifies ONLY when the pin gives a UNIQUE version;
-/// an ambiguous or absent pin leaves the formula unchanged (no unsound over-unify).
-pub(super) fn unify_return_slot_versions(formula: Formula) -> Formula {
-    let Some(target) = return_slot_pin_version(&formula) else {
-        return formula;
+    let ret_token = sv.version_token_at(func, ret.id, ret.stmts.len(), "_0");
+    let token = if pred.id == ret.id || ret_token != sv.version_token_at(func, ret.id, 0, "_0") {
+        ret_token
+    } else if terminator_def_names(func, pred).iter().any(|name| write_rebinds(name, "_0")) {
+        // Terminator destinations are written after the predecessor's last
+        // statement. This is the same establish token as its semantic facts.
+        Some(format!("s{}_t", pred.id.0))
+    } else {
+        sv.version_token_at(func, pred.id, pred.stmts.len(), "_0")
     };
-    let mut out = formula.clone();
-    for v in formula.free_variables() {
-        if v != target && is_return_slot_name(&v) {
-            out = out.rename_var(&v, &target);
-        }
-    }
-    out
+    // An absent token is not evidence of an initialized entry value. Leave a
+    // visible unsupported row instead of letting a later rename bind `_0` to
+    // a different predecessor's value.
+    let result_name = format!("_0#{}", token?);
+    let sort = crate::place_sort(func, &Place::local(0)).unwrap_or(Sort::Int);
+    Some(crate::quantifier_tiers::finite_domain::substitute(
+        &clause,
+        "_0",
+        &Formula::var_owned(result_name, sort),
+    ))
 }
 
 /// Remove the explicit outer return pin only when an AST-identical `_0 == value`
@@ -1659,16 +2658,23 @@ pub(super) fn unconditional_and_spine_contains(formula: &Formula, expected: &For
 // self-referential store (`*x = *x + 1`) pins `x*_new == x*_old + 1` rather than
 // the unsatisfiable `x* == x* + 1`.
 
-/// Collect `(name, sort)` for every `Var` in `formula`.
-fn formula_var_sorts(formula: &Formula) -> Vec<(String, Sort)> {
-    let mut out: Vec<(String, Sort)> = Vec::new();
-    let _ = formula.clone().map(&mut |node| {
-        if let Formula::Var(name, sort) = &node {
-            out.push((name.clone(), sort.clone()));
+/// Collect base (unversioned) variable sorts in `formula`: a base name spelled at two
+/// different sorts maps to `None` (ambiguous).
+fn collect_clause_base_sorts(formula: &Formula) -> FxHashMap<String, Option<Sort>> {
+    let mut clause_sorts: FxHashMap<String, Option<Sort>> = FxHashMap::default();
+    trust_types::visit_formula_nodes(formula, &mut |node| {
+        if let Formula::Var(name, sort) = node {
+            let base = name.split('#').next().unwrap_or(name);
+            if let Some(slot) = clause_sorts.get_mut(base) {
+                if slot.as_ref() != Some(sort) {
+                    *slot = None;
+                }
+            } else {
+                clause_sorts.insert(base.to_string(), Some(sort.clone()));
+            }
         }
-        node
     });
-    out
+    clause_sorts
 }
 
 /// True iff `place` is an OUT-PARAMETER place: the pointee of a `&mut`
@@ -1690,12 +2696,8 @@ fn is_out_param_place(func: &VerifiableFunction, place: &Place) -> bool {
     if !is_parameter(func, place.local) {
         return false;
     }
-    let mut decls = func.body.locals.iter().filter(|d| d.index == place.local);
-    let Some(decl) = decls.next() else { return false };
-    // A duplicated declaration index makes the type ambiguous; refuse.
-    if decls.next().is_some() {
-        return false;
-    }
+    // A duplicated declaration index makes the type ambiguous; `unique_local_decl` refuses.
+    let Some(decl) = crate::unique_local_decl(func, place.local) else { return false };
     matches!(decl.ty, Ty::Ref { mutable: true, .. })
 }
 
@@ -1713,22 +2715,32 @@ fn is_out_param_place(func: &VerifiableFunction, place: &Place) -> bool {
 /// would risk pinning a Bool place under an Int reading.
 fn out_param_store_sorts(func: &VerifiableFunction) -> FxHashMap<String, Option<Sort>> {
     let mut sorts: FxHashMap<String, Option<Sort>> = FxHashMap::default();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            let Statement::Assign { place, .. } = stmt else { continue };
-            if !is_out_param_place(func, place) {
-                continue;
-            }
-            let Some(sort) = crate::place_sort(func, place) else { continue };
-            sorts
-                .entry(crate::place_to_var_name(func, place))
-                .and_modify(|slot| {
-                    if slot.as_ref() != Some(&sort) {
-                        *slot = None;
-                    }
-                })
-                .or_insert(Some(sort));
+    for param_local in 1..=func.body.arg_count {
+        if !matches!(crate::local_ty_ref(func, param_local), Some(Ty::Ref { mutable: true, .. })) {
+            continue;
         }
+        crate::visit_local_write_stmts(
+            func,
+            &func.body.blocks,
+            param_local,
+            |_block, stmt| {
+                let Statement::Assign { place, .. } = stmt else {
+                    return;
+                };
+                if place.local != param_local || !is_out_param_place(func, place) {
+                    return;
+                }
+                let Some(sort) = crate::place_sort(func, place) else { return };
+                sorts
+                    .entry(crate::place_to_var_name(func, place))
+                    .and_modify(|slot| {
+                        if slot.as_ref() != Some(&sort) {
+                            *slot = None;
+                        }
+                    })
+                    .or_insert(Some(sort));
+            },
+        );
     }
     sorts
 }
@@ -1762,11 +2774,11 @@ fn return_edge_guard(
     pred: &trust_types::BasicBlock,
     ret: BlockId,
 ) -> Option<Formula> {
-    if !v2_terminator_targets(&pred.terminator).contains(&ret) {
+    if !v2_terminator_has_target(&pred.terminator, ret) {
         return None;
     }
     // Reachable without taking any guarded clause: the edge asserts nothing.
-    if pred.terminator.unguarded_successors().contains(&ret) {
+    if pred.terminator.has_unguarded_successor(ret) {
         return None;
     }
     let mut disjuncts: Vec<Formula> = Vec::new();
@@ -1812,8 +2824,23 @@ fn return_edge_guard(
 ///   2. THE PREDECESSOR'S TERMINATOR MUST NOT WRITE THE PLACE. A `Call` taking
 ///      `&mut self` runs AFTER the block's statements, so the post-statement
 ///      value is not what reaches `ret`. `terminator_def_names` is the same
-///      oracle the path-def lane kills stale facts with, and its overlap test
-///      catches a havoc of any ancestor (`self` covers `self*.0.0`).
+///      oracle the path-def lane kills stale facts with, and each of its names is
+///      tested against the subject through `write_rebinds(term_def, subject)` —
+///      the DIRECTIONAL write/read relation, written name FIRST. That test carries
+///      TWO channels, and the gate needs both:
+///
+///        * ANCESTOR (and descendant) HAVOC, via the symmetric
+///          `place_names_overlap` core: `self` covers `self*.0.0`, and a
+///          symbolic-index write covers its array-base siblings.
+///        * A WRITE OF AN INDEX LOCAL, via `write_covers_index_segment`: a `Call`
+///          whose dest is the WHOLE local `l` and that is used as an index operand
+///          somewhere in the body contributes the fallback spelling `_l` to
+///          `terminator_def_names` (`push_index_fallback_name`), and that name
+///          rebinds every subject carrying the segment `[_l]` — `s*[_l]`,
+///          `s*[_l]__slice_len`, anything projected below it. This channel is NOT
+///          symmetric and is not reachable from `place_names_overlap`, which is why
+///          the gate must call the relation with the written name first rather than
+///          testing overlap.
 ///
 ///   3. THE TWO TOKENS MUST DIFFER. An equal pair is the single-predecessor
 ///      case already owned by the same-block pin lane, and emitting `x == x`
@@ -1876,36 +2903,35 @@ fn return_edge_merge_pins(
     sv: &StmtVersionCtx,
     pred: &trust_types::BasicBlock,
     ret: &trust_types::BasicBlock,
-    post: &Formula,
+    clause_sorts: &FxHashMap<String, Option<Sort>>,
     out_params: &FxHashMap<String, Option<Sort>>,
+    agg_operands: &FxHashMap<String, Option<Sort>>,
 ) -> (Vec<Formula>, Vec<Formula>) {
-    // Subjects reached only through a return-slot FIELD pin: the clause never
-    // names them, so they must be collected from the aggregate store itself.
-    let agg_operands = return_slot_aggregate_operand_sorts(func, ret);
-    if out_params.is_empty() && agg_operands.is_empty() {
+    if (out_params.is_empty() || clause_sorts.is_empty()) && agg_operands.is_empty() {
         return (Vec::new(), Vec::new());
     }
     // Gate 2: anything the predecessor's TERMINATOR can write is off limits.
-    let term_defs = terminator_def_names(func, pred);
+    let mut term_defs: Option<Vec<String>> = None;
 
-    // Sorts the CLAUSE uses, keyed by base (unversioned) name — the same
-    // ambiguity discipline as `with_out_param_pins`.
-    let mut clause_sorts: FxHashMap<String, Option<Sort>> = FxHashMap::default();
-    for (name, sort) in formula_var_sorts(post) {
-        let base = name.split('#').next().unwrap_or(&name).to_string();
-        clause_sorts
-            .entry(base)
-            .and_modify(|slot| {
-                if slot.as_ref() != Some(&sort) {
-                    *slot = None;
-                }
-            })
-            .or_insert(Some(sort));
+    let mut subjects: Vec<&String> =
+        Vec::with_capacity(out_params.len().min(clause_sorts.len()) + agg_operands.len());
+    if !out_params.is_empty() {
+        subjects.extend(
+            clause_sorts
+                .keys()
+                .filter(|k| out_params.get(*k).is_some_and(Option::is_some)),
+        );
     }
-
-    let mut subject_set: std::collections::BTreeSet<&String> = clause_sorts.keys().collect();
-    subject_set.extend(agg_operands.keys());
-    let subjects: Vec<&String> = subject_set.into_iter().collect();
+    subjects.extend(
+        agg_operands
+            .iter()
+            .filter_map(|(k, sort)| sort.is_some().then_some(k)),
+    );
+    if subjects.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    subjects.sort_unstable();
+    subjects.dedup();
 
     let mut pins = Vec::new();
     let mut grounds = Vec::new();
@@ -1917,16 +2943,21 @@ fn return_edge_merge_pins(
         // store; the clause cannot name it, so no clause-sort agreement exists to
         // check and none is required.
         let (place_sort, plain_local) = match out_params.get(subject) {
-            Some(Some(place_sort)) if clause_sorts.get(subject) == Some(&Some(place_sort.clone())) => {
-                (place_sort.clone(), false)
+            Some(Some(place_sort))
+                if clause_sorts.get(subject).and_then(Option::as_ref) == Some(place_sort) =>
+            {
+                (place_sort, false)
             }
             _ => match agg_operands.get(subject) {
-                Some(Some(sort)) => (sort.clone(), true),
+                Some(Some(sort)) => (sort, true),
                 _ => continue,
             },
         };
-        let place_sort = &place_sort;
-        if term_defs.iter().any(|d| place_names_overlap(d, subject)) {
+        if term_defs
+            .get_or_insert_with(|| terminator_def_names(func, pred))
+            .iter()
+            .any(|d| write_rebinds(d, subject))
+        {
             continue; // gate 2
         }
         let use_tok = sv.version_token_at(func, ret.id, ret.stmts.len(), subject);
@@ -1948,7 +2979,8 @@ fn return_edge_merge_pins(
         // post-state, now invisible. So the predecessor side must be one of the
         // two shapes this lane can actually account for:
         //
-        //   * `None` — the ENTRY value. The row then says "the post-state IS the
+        //   * `None` — the ENTRY value (bare; see the Phase 1.3 note below). The
+        //     row then says "the post-state IS the
         //     pre-state", which is the literal truth of an early-return path and
         //     is what lets the return-edge guard decide the clause. A clause the
         //     guard does NOT decide stays genuinely refutable, as it must.
@@ -1966,6 +2998,21 @@ fn return_edge_merge_pins(
                 None => continue,
             },
         };
+        // Trust (2026-09-30, vac Phase 1.3 audit — DOCUMENTED, not sealed): the
+        // ENTRY-valued predecessor side stays BARE, and that is sound because every
+        // whole-formula rename this pin ever meets is at the PREDECESSOR END
+        // `(pred, pred.stmts.len())` — the `v2_formula_with_block_defs(vc_block, ..)`
+        // re-run right after it is conjoined and `conjoin_preconditions_versioned`
+        // at `vc_block` — where `pred_tok` is `None`, so each rename is the identity
+        // on it (path guards are renamed per guard, and `normalize_ssa_version_tokens`
+        // only collapses whole locals that are single-assignment). The bare name is
+        // thus exactly the `Fact::entry` spelling. What regressed the early-return
+        // shape under Phase 0 was not this pin but the REFUSED TIE: the guard def is
+        // sealed to `_2 == self*.0.0#e`, and `entry_sentinel_tie_is_sound` (widened
+        // in Phase 1.1 to a token-less consumer whose reaching union is exactly
+        // `{e}`) now ties `self*.0.0#e == self*.0.0`, reconnecting the two spellings.
+        // Should a rename at any OTHER point ever be added after this conjoin, this
+        // operand must be sealed (`seal_bare_reads` at the predecessor end) first.
         let pred_name = match &pred_tok {
             Some(tok) => format!("{subject}#{tok}"),
             None => subject.clone(),
@@ -2005,6 +3052,76 @@ fn return_edge_merge_pins(
 /// token that is not a single statement establish token, a statement that does
 /// not store `subject`, a `CheckedBinaryOp` or array-theory store (owned by
 /// their own encodings), or an rvalue the encoder cannot lower.
+/// Trust (2026-09-30, P2 of the `vac` root cause): stamp every bare read of a
+/// postcondition RETURN-VALUE pin at the pin's OWN statement `(def_block, k)`.
+///
+/// The pins used to be conjoined bare and stamped by whichever whole-formula
+/// rename ran next — the predecessor-end rename of `conjoin_preconditions_versioned`
+/// (TOO EARLY for a Return-block write before the pin: `ext(t); s.f = !t; s.f`
+/// read the pre-write `s.f`) or a Return-block re-run of
+/// `v2_formula_with_block_defs` (TOO LATE for a write after the pin: `let t = s.f;
+/// s.f = c; t` read the post-write `s.f`). Each proved a false `ensures`.
+///
+/// Per bare name `n`, including a read of an older return-slot value:
+///  * a pin in the Return block with a separate predecessor, when the Return
+///    block has not written `n` before `k` and the predecessor's terminator does
+///    not rebind it, resolves at the PREDECESSOR END — exactly today's
+///    per-predecessor spelling, so a join-token pin is unchanged;
+///  * otherwise it resolves at `(def_block, k)`.
+///
+/// A token found becomes `n#tok`; no token SEALS `n` at the resolution point
+/// (`seal_bare_reads`). `None` (drop the pin — fail closed) on a seal collision.
+fn stamp_return_pin_reads(
+    sv: &StmtVersionCtx,
+    func: &VerifiableFunction,
+    vc_block: &trust_types::BasicBlock,
+    block: &trust_types::BasicBlock,
+    def_block: &trust_types::BasicBlock,
+    k: usize,
+    f: Formula,
+) -> Option<Formula> {
+    let in_return_block = def_block.id == block.id && block.id != vc_block.id;
+    let pred_term = in_return_block.then(|| sv.terminator_kill(func, vc_block));
+    let mut failed = false;
+    let stamped = f.map(&mut |node| match node {
+        Formula::Var(ref name, _) if !name.contains('#') => {
+            let per_predecessor = pred_term.as_ref().is_some_and(|term| {
+                sv.version_token_at(func, block.id, k, name)
+                    == sv.version_token_at(func, block.id, 0, name)
+                    && term.survives(&node)
+            });
+            let (at_block, at_point) = if per_predecessor {
+                (vc_block.id, vc_block.stmts.len())
+            } else {
+                (def_block.id, k)
+            };
+            let Formula::Var(mut name, sort) = node else { return node };
+            match sv.version_token_at(func, at_block, at_point, &name) {
+                Some(tok) => {
+                    name.reserve(1 + tok.len());
+                    name.push('#');
+                    name.push_str(&tok);
+                    Formula::Var(name, sort)
+                }
+                None if is_return_slot_name(&name) => {
+                    failed = true;
+                    Formula::Var(name, sort)
+                }
+                None => match seal_bare_reads(sv, func, at_block, at_point, Formula::Var(name, sort))
+                {
+                    Some(sealed) => sealed,
+                    None => {
+                        failed = true;
+                        Formula::Bool(false)
+                    }
+                },
+            }
+        }
+        other => other,
+    });
+    (!failed).then_some(stamped)
+}
+
 fn store_at_token(
     func: &VerifiableFunction,
     sv: &StmtVersionCtx,
@@ -2034,7 +3151,10 @@ fn store_at_token(
     }
     let sort = crate::place_sort(func, place)?;
     let value = crate::chc::rvalue_to_formula(func, rvalue).ok()?;
-    let value = version_rename_at(&value, sv, func, block.id, stmt_idx);
+    let value = version_rename_owned_at(value, sv, func, block.id, stmt_idx);
+    // Trust (2026-09-30, stale-read seal): reads still bare at the store would be
+    // re-stamped by a later whole-formula rename; seal them, or emit no pin.
+    let value = seal_bare_reads(sv, func, block.id, stmt_idx, value)?;
     Some(Formula::Eq(
         Box::new(Formula::var_owned(format!("{subject}#{token}"), sort)),
         Box::new(value),
@@ -2051,23 +3171,9 @@ fn with_out_param_pins(
     sv: &StmtVersionCtx,
     use_block: &trust_types::BasicBlock,
     def_blocks: &[&trust_types::BasicBlock],
-    post: &Formula,
+    clause_sorts: &FxHashMap<String, Option<Sort>>,
     mut formula: Formula,
 ) -> (Formula, Vec<String>) {
-    // Sorts the CLAUSE uses, keyed by base (unversioned) name. A name the clause
-    // spells at two different sorts is ambiguous and gets no pin.
-    let mut clause_sorts: FxHashMap<String, Option<Sort>> = FxHashMap::default();
-    for (name, sort) in formula_var_sorts(post) {
-        let base = name.split('#').next().unwrap_or(&name).to_string();
-        clause_sorts
-            .entry(base)
-            .and_modify(|slot| {
-                if slot.as_ref() != Some(&sort) {
-                    *slot = None;
-                }
-            })
-            .or_insert(Some(sort));
-    }
     if clause_sorts.is_empty() {
         return (formula, Vec::new());
     }
@@ -2120,13 +3226,26 @@ fn with_out_param_pins(
             let Some(use_tok) = sv.version_token_at(func, use_block.id, use_point, &subject) else {
                 continue;
             };
-            if use_tok != format!("s{}_{k}", def_block.id.0) {
+            if !use_tok
+                .strip_prefix('s')
+                .and_then(|s| s.split_once('_'))
+                .is_some_and(|(b_str, k_str)| {
+                    (b_str == "0" || !b_str.starts_with('0'))
+                        && (k_str == "0" || !k_str.starts_with('0'))
+                        && b_str.parse::<usize>().ok() == Some(def_block.id.0)
+                        && k_str.parse::<usize>().ok() == Some(k)
+                })
+            {
                 continue;
             }
             // (1) VALUE FROM THE BODY: the statement's own rvalue, with its reads
             // taken at the read-point `k` (values BEFORE this write).
             let Ok(value) = crate::chc::rvalue_to_formula(func, rvalue) else { continue };
-            let value = version_rename_at(&value, sv, func, def_block.id, k);
+            let value = version_rename_owned_at(value, sv, func, def_block.id, k);
+            // Trust (2026-09-30, stale-read seal): reads still bare at `k` would be
+            // re-stamped by a later whole-formula rename; seal them, or emit no pin
+            // (the ledger below then fails the row closed).
+            let Some(value) = seal_bare_reads(sv, func, def_block.id, k, value) else { continue };
             let versioned = format!("{subject}#{use_tok}");
             if !pinned.insert(versioned.clone()) {
                 continue;
@@ -2134,7 +3253,7 @@ fn with_out_param_pins(
             let pin =
                 Formula::Eq(Box::new(Formula::var_owned(versioned, place_sort)), Box::new(value));
             formula = Formula::And(vec![pin, formula]);
-            pinned_bases.insert(subject.clone());
+            pinned_bases.insert(subject);
         }
     }
     // The ledger's residue: clause-mentioned places the body writes but this lane
@@ -2143,4 +3262,290 @@ fn with_out_param_pins(
         required.into_iter().filter(|s| !pinned_bases.contains(s)).collect();
     unpinned.sort();
     (formula, unpinned)
+}
+
+/// Does a transitive-return-pin rvalue name a WHOLE LOCAL that one of the scanned
+/// blocks assigns?
+///
+/// This is the scope gate for the one-more-hop re-conjoin at the transitive return
+/// pin. It answers the only question that matters there: did the pin just introduce
+/// a name whose VALUE lives in a block definition that the relevance filter has
+/// already run past?
+///
+///   * `Var("_8")` where the arm does `_8 = x / 2` — YES. The pin says
+///     `_0 == _8` and nothing else in the formula says what `_8` is.
+///   * `Var("_5.0")`, the checked-arithmetic value field — NO. Not a whole local,
+///     and the arm's assert-passed semantic guard already pins it.
+///   * `Var("_1")`, a parameter read — NO. No statement assigns it, so there is
+///     no block definition to recover and the entry facts already ground it.
+///   * a constant — NO free variables at all.
+///
+/// Whole-local only, by exact `_<digits>` spelling: a projected or derived name
+/// (`_5.0`, `x*`, `s__slice_len`) is grounded by a different lane, and widening
+/// this gate to them would perturb formulas that are already correct.
+fn transitive_pin_names_locally_defined_local(
+    rformula: &Formula,
+    scan_blocks: &[&trust_types::BasicBlock],
+) -> bool {
+    trust_types::any_free_variable_name(rformula, &mut |name| {
+        let Some(rest) = name.strip_prefix('_') else {
+            return false;
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let Ok(local) = rest.parse::<usize>() else {
+            return false;
+        };
+        scan_blocks.iter().any(|b| {
+            b.stmts.iter().any(|stmt| {
+                matches!(stmt, Statement::Assign { place, .. }
+                    if place.local == local && place.projections.is_empty())
+            })
+        })
+    })
+}
+
+/// Whether every value `rvalue` reads is unchanged from its statement to the
+/// return point along `path` (each block with the index of its first statement
+/// still to run; a block's terminator runs too). A whole local must not be
+/// written on the path nor mutably borrowed anywhere in `func` (an alias could
+/// write it unseen); a read through a `Deref` additionally rules out any store
+/// through a pointer, `Unlocatable` write, call or drop on the path. An rvalue
+/// whose reads are not enumerated here answers `false`.
+fn return_pin_reads_are_current(
+    func: &VerifiableFunction,
+    path: &[(&trust_types::BasicBlock, usize)],
+    window: &[&trust_types::BasicBlock],
+    rvalue: &Rvalue,
+) -> bool {
+    fn operand_place(operand: &Operand) -> Option<&Place> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => Some(place),
+            _ => None,
+        }
+    }
+    let mut places = Vec::new();
+    match rvalue {
+        Rvalue::Use(a) | Rvalue::UnaryOp(_, a) | Rvalue::Cast(a, _) => {
+            if let Some(p) = operand_place(a) {
+                places.push(p);
+            } else if !matches!(a, Operand::Constant(_)) {
+                return false;
+            }
+        }
+        Rvalue::BinaryOp(_, a, b)
+        | Rvalue::CheckedBinaryOp(_, a, b)
+        | Rvalue::UncheckedBinaryOp(_, a, b) => {
+            for op in [a, b] {
+                if let Some(p) = operand_place(op) {
+                    places.push(p);
+                } else if !matches!(op, Operand::Constant(_)) {
+                    return false;
+                }
+            }
+        }
+        Rvalue::Aggregate(_, operands) => {
+            places.reserve(operands.len());
+            for op in operands {
+                if let Some(p) = operand_place(op) {
+                    places.push(p);
+                } else if !matches!(op, Operand::Constant(_)) {
+                    return false;
+                }
+            }
+        }
+        _ => return false,
+    }
+    let reads_through_pointer =
+        places.iter().any(|p| p.projections.iter().any(|q| matches!(q, Projection::Deref)));
+    // Review round 44: the pin is conjoined with BARE names, and a bare PARAMETER
+    // name is its ENTRY value. After `s.0 += 1`, the bare `s.0` read by `_0 = copy
+    // s.0` named the entry field and contradicted the versioned pin of the same
+    // return, so `ensures result == 12345` was vacuously proved and certified. A
+    // parameter read is admitted only when the body never writes it, and a read
+    // through a pointer is refused (its pointee has no such guarantee).
+    if reads_through_pointer {
+        return false;
+    }
+    let mut locals: Vec<usize> = places.iter().map(|p| p.local).collect();
+    locals.sort_unstable();
+    locals.dedup();
+    for (block, from) in path {
+        for stmt in block.stmts.iter().skip(*from) {
+            if locals.iter().any(|&local| {
+                !matches!(stmt.local_write(local), trust_types::LocalWrite::Untouched)
+            }) {
+                return false;
+            }
+            if reads_through_pointer {
+                let pointer_store = match stmt {
+                    Statement::Assign { place, .. }
+                    | Statement::SetDiscriminant { place, .. }
+                    | Statement::Deinit { place } => {
+                        place.projections.iter().any(|q| matches!(q, Projection::Deref))
+                    }
+                    _ => false,
+                };
+                if pointer_store
+                    || matches!(stmt.local_write(usize::MAX), trust_types::LocalWrite::Unlocatable)
+                {
+                    return false;
+                }
+            }
+        }
+        if locals.iter().any(|&local| {
+            !matches!(block.terminator.local_write(local), trust_types::LocalWrite::Untouched)
+        }) {
+            return false;
+        }
+        if reads_through_pointer
+            && !matches!(
+                block.terminator,
+                Terminator::Goto(_)
+                    | Terminator::SwitchInt { .. }
+                    | Terminator::Return
+                    | Terminator::Assert { .. }
+            )
+        {
+            return false;
+        }
+    }
+    // Review round 45: the block defs of every `window` block are conjoined with the
+    // pin, and they name a local written in the window by VERSION, and READ it bare
+    // as its value entering the block, while the pin names it BARE as its value at
+    // the return. `let mut c = x; c += 1; c` pinned `_0` to both `c`'s pre- and
+    // post-write versions (a vacuous proof), and `c = x; side(); c = c + 1; c` (the
+    // first write in an ANCESTOR) pinned the stale `c`. A read local with two or more
+    // writes among the window and every block that can reach it is refused; one write
+    // is the only value this path gives it (a later one is refused above), and a
+    // single-assignment local has one value everywhere.
+    if locals.iter().any(|&local| {
+        !crate::local_defs::is_single_static_assignment(func, local)
+            && ((1..=func.body.arg_count).contains(&local)
+                || local_writes_reaching(func, window, local) > 1)
+    }) {
+        return false;
+    }
+    if locals.iter().any(|&local| {
+        crate::any_local_write_stmt(func, &func.body.blocks, local, |_block, stmt| {
+            crate::stmt_escapes_local(func, stmt, local)
+        })
+    }) {
+        return false;
+    }
+    true
+}
+
+/// Whether `rvalue` has an operand that is neither a place read nor a constant (an
+/// `Operand::Unsupported` the encoder cannot lower).
+fn rvalue_has_unlowerable_operand(rvalue: &Rvalue) -> bool {
+    let is_unlowerable = |operand: &Operand| {
+        !matches!(operand, Operand::Copy(_) | Operand::Move(_) | Operand::Constant(_))
+    };
+    match rvalue {
+        Rvalue::Use(a) | Rvalue::UnaryOp(_, a) | Rvalue::Cast(a, _) => is_unlowerable(a),
+        Rvalue::BinaryOp(_, a, b)
+        | Rvalue::CheckedBinaryOp(_, a, b)
+        | Rvalue::UncheckedBinaryOp(_, a, b) => is_unlowerable(a) || is_unlowerable(b),
+        Rvalue::Aggregate(_, operands) => operands.iter().any(is_unlowerable),
+        _ => false,
+    }
+}
+
+/// The most writes of `local` any single execution path makes through `window`
+/// (in order; the last block holds the pin) and the blocks before it: the window's
+/// own writes plus the heaviest predecessor chain into its first block. Sibling
+/// arms that merge before the window count once, not summed; a cycle on the way
+/// counts as two (review round 45: a value pinned under a bare name must be the
+/// only one the path gives it; see [`return_pin_reads_are_current`]).
+fn local_writes_reaching(
+    func: &VerifiableFunction,
+    window: &[&trust_types::BasicBlock],
+    local: usize,
+) -> usize {
+    fn writes_in(block: &trust_types::BasicBlock, local: usize) -> usize {
+        block
+            .stmts
+            .iter()
+            .filter(|stmt| !matches!(stmt.local_write(local), trust_types::LocalWrite::Untouched))
+            .count()
+            + usize::from(!matches!(
+                block.terminator.local_write(local),
+                trust_types::LocalWrite::Untouched
+            ))
+    }
+    fn heaviest_into(
+        func: &VerifiableFunction,
+        v2_preds: &crate::fn_memo::V2Predecessors,
+        target: usize,
+        local: usize,
+        memo: &mut FxHashMap<usize, usize>,
+        on_stack: &mut Vec<usize>,
+    ) -> usize {
+        if let Some(&known) = memo.get(&target) {
+            return known;
+        }
+        if on_stack.contains(&target) {
+            return 2;
+        }
+        on_stack.push(target);
+        let mut best = 0;
+        v2_preds.for_each_predecessor(func, BlockId(target), |pred| {
+            let through = writes_in(pred, local)
+                + heaviest_into(func, v2_preds, pred.id.0, local, memo, on_stack);
+            best = best.max(through);
+            if best >= 2 {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        on_stack.pop();
+        let best = best.min(2);
+        memo.insert(target, best);
+        best
+    }
+    let Some(first) = window.first() else { return 0 };
+    let own: usize = window.iter().map(|b| writes_in(b, local)).sum();
+    if own >= 2 {
+        return own;
+    }
+    let v2_preds = crate::fn_memo::v2_predecessors_or_build(func);
+    let mut memo = FxHashMap::default();
+    own + heaviest_into(func, &v2_preds, first.id.0, local, &mut memo, &mut Vec::new())
+}
+
+/// Re-read a raw `ensures` text copy with extraction's admitted length rebinding:
+/// `xs__len` becomes `xs__slice_len` ONLY for a base whose canonical leaf already
+/// occurs in `func.postconditions` (extraction rebound it there under the
+/// `requires` admission, `rebind_postcondition_lengths`). Any other `__len` leaf is
+/// left as written.
+fn rebind_text_lengths(func: &VerifiableFunction, mut parsed: Formula) -> Formula {
+    if func.postconditions.is_empty()
+        || !trust_types::any_formula_node(&parsed, &mut |node| {
+            node.var_name().is_some_and(|name| name.ends_with("__len"))
+        })
+    {
+        return parsed;
+    }
+    let mut rebindings = Vec::new();
+    trust_types::for_each_free_variable_name(&parsed, &mut |name| {
+        if let Some(base) = name.strip_suffix("__len") {
+            let canonical = format!("{base}__slice_len");
+            if func
+                .postconditions
+                .iter()
+                .any(|f| trust_types::any_free_variable_name(f, &mut |v| v == canonical))
+            {
+                rebindings.push((name.to_string(), canonical));
+            }
+        }
+    });
+    rebindings.sort();
+    rebindings.dedup();
+    for (name, canonical) in rebindings {
+        parsed = parsed.rename_var(&name, &canonical);
+    }
+    parsed
 }

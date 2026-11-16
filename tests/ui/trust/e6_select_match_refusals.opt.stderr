@@ -1,0 +1,250 @@
+note: Clean island kernel-checked: 4 declaration(s) registered (sel_const_isl, subr_bias_isl, three_arm_isl, above_isl)
+  --> $DIR/e6_select_match_refusals.rs:23:5
+   |
+LL | /     def sel_const_isl (a b : UInt64) : UInt64 := if a < b then 0 else 1
+LL | |     def subr_bias_isl (n : UInt32) : UInt32 := if n < 1240 then 107 else if n < 33900 then 1131 else 32768
+LL | |     def three_arm_isl (x : UInt8) : UInt8 := if x = 0 then 10 else if x = 1 then 20 else if x = 7 then 30 else 0
+LL | |     def above_isl (a b : UInt8) : UInt8 := if a > b then 1 else 0
+   | |_________________________________________________________________^
+
+error: uncited `ensures` naming the Clean island definition `sel_const_isl` was not discharged by definitional equality: the two sides are not definitionally equal (Eq.refl does not check)
+  --> $DIR/e6_select_match_refusals.rs:30:13
+   |
+LL |     ensures result == sel_const_isl(a, b)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: an uncited island-calling clause has exactly one discharge route — the kernel judging it against this function's E6-admitted body — so a refusal here leaves the clause constraining nothing
+   = help: make the body definitionally equal to the island definition, or cite a theorem for the clause with `by <theorem>`
+
+
+=== Trust Verification Report (e6_select_match_refusals) ===
+
+note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_refusals.rs:29:1
+   |
+LL | / pub fn arms_swapped(a: u64, b: u64) -> u64
+LL | |     ensures result == sel_const_isl(a, b)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `result == sel_const_isl(a, b)` [stop:unclassified]
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `result == sel_const_isl(a, b)` [stop:unclassified]
+
+error: Trust Level 0 safety verification incomplete for `e6_select_match_refusals::arms_swapped`: 2 obligation(s) were not proved
+  --> $DIR/e6_select_match_refusals.rs:29:1
+   |
+LL | / pub fn arms_swapped(a: u64, b: u64) -> u64
+LL | |     ensures result == sel_const_isl(a, b)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: strict Trust verification requires every Level 0 obligation to be statically proved; failed, unknown, timed-out, runtime-checked, unsupported, and skipped outcomes are all build errors
+   = note: Level 0 summary: 0 failed, 2 unknown or timed out, 0 runtime-checked, 0 skipped
+   = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
+
+error: Trust strict verification failed for `e6_select_match_refusals::arms_swapped`: 2 obligation(s) were not fully verified
+  --> $DIR/e6_select_match_refusals.rs:29:1
+   |
+LL | / pub fn arms_swapped(a: u64, b: u64) -> u64
+LL | |     ensures result == sel_const_isl(a, b)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: summary: 0 trusted, 0 certified, 0 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 2
+   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one UNPROVED non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = help: this build failed on unproved coverage, not on a refutation: to record these rows as warnings and continue only in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: --- native verifier detail (9 line(s) below; engine internals, not required to act on this error) ---
+   = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=8 bundle_digest=sha256:$DIGEST requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier evidence `unsupported:e6_select_match_refusals__arms_swapped:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `result == sel_const_isl(a, b)`
+   = note: native full verifier evidence `vc:e6_select_match_refusals__arms_swapped:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `result == sel_const_isl(a, b)`
+   = note: native full verifier evidence `vc:e6_select_match_refusals__arms_swapped:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
+   = note: native full verifier evidence `vc:e6_select_match_refusals__arms_swapped:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
+   = note: native full verifier evidence `vc:e6_select_match_refusals__arms_swapped:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
+
+error: uncited `ensures` naming the Clean island definition `subr_bias_isl` was not discharged by definitional equality: the two sides are not definitionally equal (Eq.refl does not check)
+  --> $DIR/e6_select_match_refusals.rs:37:13
+   |
+LL |     ensures result == subr_bias_isl(n)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: an uncited island-calling clause has exactly one discharge route — the kernel judging it against this function's E6-admitted body — so a refusal here leaves the clause constraining nothing
+   = help: make the body definitionally equal to the island definition, or cite a theorem for the clause with `by <theorem>`
+
+note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_refusals.rs:36:1
+   |
+LL | / pub fn threshold_moved(n: u32) -> u32
+LL | |     ensures result == subr_bias_isl(n)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `result == subr_bias_isl(n)` [stop:unclassified]
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `result == subr_bias_isl(n)` [stop:unclassified]
+
+error: Trust Level 0 safety verification incomplete for `e6_select_match_refusals::threshold_moved`: 2 obligation(s) were not proved
+  --> $DIR/e6_select_match_refusals.rs:36:1
+   |
+LL | / pub fn threshold_moved(n: u32) -> u32
+LL | |     ensures result == subr_bias_isl(n)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: strict Trust verification requires every Level 0 obligation to be statically proved; failed, unknown, timed-out, runtime-checked, unsupported, and skipped outcomes are all build errors
+   = note: Level 0 summary: 0 failed, 2 unknown or timed out, 0 runtime-checked, 0 skipped
+   = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
+
+error: Trust strict verification failed for `e6_select_match_refusals::threshold_moved`: 2 obligation(s) were not fully verified
+  --> $DIR/e6_select_match_refusals.rs:36:1
+   |
+LL | / pub fn threshold_moved(n: u32) -> u32
+LL | |     ensures result == subr_bias_isl(n)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: summary: 0 trusted, 0 certified, 0 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 2
+   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one UNPROVED non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = help: this build failed on unproved coverage, not on a refutation: to record these rows as warnings and continue only in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: --- native verifier detail (9 line(s) below; engine internals, not required to act on this error) ---
+   = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=8 bundle_digest=sha256:$DIGEST requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier evidence `unsupported:e6_select_match_refusals__threshold_moved:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `result == subr_bias_isl(n)`
+   = note: native full verifier evidence `vc:e6_select_match_refusals__threshold_moved:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `result == subr_bias_isl(n)`
+   = note: native full verifier evidence `vc:e6_select_match_refusals__threshold_moved:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
+   = note: native full verifier evidence `vc:e6_select_match_refusals__threshold_moved:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
+   = note: native full verifier evidence `vc:e6_select_match_refusals__threshold_moved:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
+
+error: uncited `ensures` naming the Clean island definition `three_arm_isl` was not discharged by definitional equality: the two sides are not definitionally equal (Eq.refl does not check)
+  --> $DIR/e6_select_match_refusals.rs:50:13
+   |
+LL |     ensures result == three_arm_isl(x)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: an uncited island-calling clause has exactly one discharge route — the kernel judging it against this function's E6-admitted body — so a refusal here leaves the clause constraining nothing
+   = help: make the body definitionally equal to the island definition, or cite a theorem for the clause with `by <theorem>`
+
+note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_refusals.rs:49:1
+   |
+LL | / pub fn otherwise_wrong(x: u8) -> u8
+LL | |     ensures result == three_arm_isl(x)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `result == three_arm_isl(x)` [stop:unclassified]
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `result == three_arm_isl(x)` [stop:unclassified]
+
+error: Trust Level 0 safety verification incomplete for `e6_select_match_refusals::otherwise_wrong`: 2 obligation(s) were not proved
+  --> $DIR/e6_select_match_refusals.rs:49:1
+   |
+LL | / pub fn otherwise_wrong(x: u8) -> u8
+LL | |     ensures result == three_arm_isl(x)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: strict Trust verification requires every Level 0 obligation to be statically proved; failed, unknown, timed-out, runtime-checked, unsupported, and skipped outcomes are all build errors
+   = note: Level 0 summary: 0 failed, 2 unknown or timed out, 0 runtime-checked, 0 skipped
+   = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
+
+error: Trust strict verification failed for `e6_select_match_refusals::otherwise_wrong`: 2 obligation(s) were not fully verified
+  --> $DIR/e6_select_match_refusals.rs:49:1
+   |
+LL | / pub fn otherwise_wrong(x: u8) -> u8
+LL | |     ensures result == three_arm_isl(x)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: summary: 0 trusted, 0 certified, 0 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 2
+   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one UNPROVED non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = help: this build failed on unproved coverage, not on a refutation: to record these rows as warnings and continue only in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: --- native verifier detail (9 line(s) below; engine internals, not required to act on this error) ---
+   = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=8 bundle_digest=sha256:$DIGEST requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier evidence `unsupported:e6_select_match_refusals__otherwise_wrong:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `result == three_arm_isl(x)`
+   = note: native full verifier evidence `vc:e6_select_match_refusals__otherwise_wrong:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `result == three_arm_isl(x)`
+   = note: native full verifier evidence `vc:e6_select_match_refusals__otherwise_wrong:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
+   = note: native full verifier evidence `vc:e6_select_match_refusals__otherwise_wrong:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
+   = note: native full verifier evidence `vc:e6_select_match_refusals__otherwise_wrong:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
+
+error: uncited `ensures` naming the Clean island definition `above_isl` was not discharged by definitional equality: the two sides are not definitionally equal (Eq.refl does not check)
+  --> $DIR/e6_select_match_refusals.rs:62:13
+   |
+LL |     ensures result == above_isl(a, b)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: an uncited island-calling clause has exactly one discharge route — the kernel judging it against this function's E6-admitted body — so a refusal here leaves the clause constraining nothing
+   = help: make the body definitionally equal to the island definition, or cite a theorem for the clause with `by <theorem>`
+
+note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_select_match_refusals.rs:61:1
+   |
+LL | / pub fn ge_against_gt(a: u8, b: u8) -> u8
+LL | |     ensures result == above_isl(a, b)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `result == above_isl(a, b)` [stop:unclassified]
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `result == above_isl(a, b)` [stop:unclassified]
+
+error: Trust Level 0 safety verification incomplete for `e6_select_match_refusals::ge_against_gt`: 2 obligation(s) were not proved
+  --> $DIR/e6_select_match_refusals.rs:61:1
+   |
+LL | / pub fn ge_against_gt(a: u8, b: u8) -> u8
+LL | |     ensures result == above_isl(a, b)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: strict Trust verification requires every Level 0 obligation to be statically proved; failed, unknown, timed-out, runtime-checked, unsupported, and skipped outcomes are all build errors
+   = note: Level 0 summary: 0 failed, 2 unknown or timed out, 0 runtime-checked, 0 skipped
+   = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
+
+error: Trust strict verification failed for `e6_select_match_refusals::ge_against_gt`: 2 obligation(s) were not fully verified
+  --> $DIR/e6_select_match_refusals.rs:61:1
+   |
+LL | / pub fn ge_against_gt(a: u8, b: u8) -> u8
+LL | |     ensures result == above_isl(a, b)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: summary: 0 trusted, 0 certified, 0 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 2
+   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one UNPROVED non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = help: this build failed on unproved coverage, not on a refutation: to record these rows as warnings and continue only in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: --- native verifier detail (9 line(s) below; engine internals, not required to act on this error) ---
+   = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=8 bundle_digest=sha256:$DIGEST requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier evidence `unsupported:e6_select_match_refusals__ge_against_gt:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate was not lowered into a typed verifier formula: unsupported contract predicate expression `result == above_isl(a, b)`
+   = note: native full verifier evidence `vc:e6_select_match_refusals__ge_against_gt:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `result == above_isl(a, b)`
+   = note: native full verifier evidence `vc:e6_select_match_refusals__ge_against_gt:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
+   = note: native full verifier evidence `vc:e6_select_match_refusals__ge_against_gt:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
+   = note: native full verifier evidence `vc:e6_select_match_refusals__ge_against_gt:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
+
+error: aborting due to 12 previous errors
+

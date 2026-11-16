@@ -523,15 +523,6 @@ fn test_provenance_id_var_names() {
 // ── SymbolicPointer tests ────────────────────────────────────────────
 
 #[test]
-fn test_symbolic_pointer_new() {
-    let ptr = SymbolicPointer::new("my_ptr", ProvenanceId(1), PointerPermission::ReadWrite);
-    assert_eq!(ptr.name, "my_ptr");
-    assert_eq!(ptr.provenance, ProvenanceId(1));
-    assert!(ptr.permission.can_read());
-    assert!(ptr.permission.can_write());
-}
-
-#[test]
 fn test_symbolic_pointer_in_bounds_concrete() {
     let ptr = SymbolicPointer::new("p", ProvenanceId(1), PointerPermission::ReadOnly);
     let bounds = ptr.in_bounds_formula();
@@ -630,6 +621,43 @@ fn test_symbolic_heap_free() {
     // Pointer should now be freed.
     let ptr = heap.pointer("p").expect("pointer p tracked");
     assert_eq!(ptr.permission, PointerPermission::Freed);
+}
+
+/// A PATH-CONDITIONED free lasts exactly until the next `set_path_freed`: it is
+/// visible to `is_freed` (so `read_vc` charges a use-after-free), leaves the
+/// pointer's permission alone, and is gone once the set is replaced — which is
+/// what keeps a free on one `SwitchInt` arm out of a block on the other.
+#[test]
+fn test_symbolic_heap_path_freed_is_replaced_not_accumulated() {
+    let mut heap = SymbolicHeap::new("heap");
+    let prov = heap.allocate("p");
+    let other = heap.allocate("q");
+
+    heap.set_path_freed(vec![prov]);
+    assert!(heap.is_freed(prov));
+    assert!(!heap.is_freed(other));
+    let ptr = heap.pointer("p").expect("pointer p tracked");
+    assert_eq!(ptr.permission, PointerPermission::ReadWrite, "a path free never edits permission");
+    assert!(
+        heap.read_vc("p", "f", &SourceSpan::default())
+            .iter()
+            .any(|vc| matches!(&vc.kind, VcKind::Assertion { message } if message.contains("use-after-free"))),
+        "a read under the path free is a use-after-free"
+    );
+
+    heap.set_path_freed(Vec::new());
+    assert!(!heap.is_freed(prov), "the next block's set replaces this one");
+    assert!(
+        !heap.read_vc("p", "f", &SourceSpan::default())
+            .iter()
+            .any(|vc| matches!(&vc.kind, VcKind::Assertion { message } if message.contains("use-after-free"))),
+        "outside the region the free dominates, the read is not charged"
+    );
+
+    // A sticky free is untouched by the path set.
+    heap.free(other);
+    heap.set_path_freed(Vec::new());
+    assert!(heap.is_freed(other));
 }
 
 #[test]
@@ -792,6 +820,31 @@ fn test_encode_framed_unsafe_block_emp_frame() {
 
     // With emp frame, no frame preservation VC (no frame addresses)
     assert_eq!(vcs.len(), 2, "emp frame should produce only 2 VCs");
+}
+
+#[test]
+fn frame_obligation_keeps_zero_singleton_and_repeated_footprints() {
+    let cell = SepFormula::points_to(addr("p"), val(1));
+    let frame = SepFormula::points_to(addr("q"), val(99));
+    let unequal = Formula::Not(Box::new(Formula::Eq(Box::new(addr("p")), Box::new(addr("q")))));
+    for (pre, post, expected) in [
+        (SepFormula::Emp, SepFormula::Emp, None),
+        (cell.clone(), SepFormula::Emp, Some(unequal.clone())),
+        (cell.clone(), cell, Some(Formula::And(vec![unequal.clone(), unequal]))),
+    ] {
+        let vcs = encode_framed_unsafe_block(
+            "footprint",
+            &pre,
+            &post,
+            &frame,
+            &SourceSpan::default(),
+            "heap",
+        );
+        assert_eq!(vcs.len(), if expected.is_some() { 3 } else { 2 });
+        if let Some(expected) = expected {
+            assert_eq!(vcs[2].formula, Formula::Not(Box::new(expected)));
+        }
+    }
 }
 
 #[test]

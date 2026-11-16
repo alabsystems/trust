@@ -28,6 +28,10 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         temporary_used_locals: FxIndexSet<Local>,
         mut never_initialized_mut_locals: FxIndexSet<Local>,
     ) {
+        if temporary_used_locals.is_empty() && never_initialized_mut_locals.is_empty() {
+            return;
+        }
+
         {
             let mut visitor = GatherUsedMutsVisitor {
                 temporary_used_locals,
@@ -40,16 +44,16 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         // Take the union of the existed `used_mut` set with those variables we've found were
         // never initialized.
         debug!("gather_used_muts: never_initialized_mut_locals={:?}", never_initialized_mut_locals);
-        self.used_mut = self.used_mut.union(&never_initialized_mut_locals).cloned().collect();
+        self.used_mut.extend(never_initialized_mut_locals);
     }
 }
 
 /// MIR visitor for collecting used mutable variables.
 /// The 'visit lifetime represents the duration of the MIR walk.
-struct GatherUsedMutsVisitor<'a, 'b, 'infcx, 'tcx> {
+struct GatherUsedMutsVisitor<'a, 'b, 'diag, 'tcx> {
     temporary_used_locals: FxIndexSet<Local>,
     never_initialized_mut_locals: &'a mut FxIndexSet<Local>,
-    mbcx: &'a mut MirBorrowckCtxt<'b, 'infcx, 'tcx>,
+    mbcx: &'a mut MirBorrowckCtxt<'b, 'diag, 'tcx>,
 }
 
 impl GatherUsedMutsVisitor<'_, '_, '_, '_> {
@@ -74,7 +78,9 @@ impl<'tcx> Visitor<'tcx> for GatherUsedMutsVisitor<'_, '_, '_, 'tcx> {
             _ => {}
         }
 
-        self.super_terminator(terminator, location);
+        if !self.temporary_used_locals.is_empty() {
+            self.super_terminator(terminator, location);
+        }
     }
 
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
@@ -87,14 +93,16 @@ impl<'tcx> Visitor<'tcx> for GatherUsedMutsVisitor<'_, '_, '_, 'tcx> {
             self.remove_never_initialized_mut_locals(*into);
         }
 
-        self.super_statement(statement, location);
+        if !self.temporary_used_locals.is_empty() {
+            self.super_statement(statement, location);
+        }
     }
 
     fn visit_local(&mut self, local: Local, place_context: PlaceContext, location: Location) {
         if place_context.is_place_assignment() && self.temporary_used_locals.contains(&local) {
             // Propagate the Local assigned at this Location as a used mutable local variable
-            for moi in &self.mbcx.move_data.loc_map[location] {
-                let mpi = &self.mbcx.move_data.moves[*moi].path;
+            for moi in &self.mbcx.move_data.move_out_loc_map[location] {
+                let mpi = &self.mbcx.move_data.move_outs[*moi].path;
                 let path = &self.mbcx.move_data.move_paths[*mpi];
                 debug!(
                     "assignment of {:?} to {:?}, adding {:?} to used mutable set",
@@ -106,4 +114,17 @@ impl<'tcx> Visitor<'tcx> for GatherUsedMutsVisitor<'_, '_, '_, 'tcx> {
             }
         }
     }
+
+    fn visit_source_info(&mut self, _: &rustc_middle::mir::SourceInfo) {}
+
+    fn visit_ty(
+        &mut self,
+        _: rustc_middle::ty::Ty<'tcx>,
+        _: rustc_middle::mir::visit::TyContext,
+    ) {
+    }
+
+    fn visit_local_decl(&mut self, _: Local, _: &rustc_middle::mir::LocalDecl<'tcx>) {}
+
+    fn visit_var_debug_info(&mut self, _: &rustc_middle::mir::VarDebugInfo<'tcx>) {}
 }

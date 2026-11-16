@@ -38,6 +38,9 @@ fn joined_unreachable_from_infeasible_and_feasible_paths() -> VerifiableFunction
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::panicking::unreachable_display",
+                        ),
                         is_foreign: false,
                         func: "core::panicking::unreachable_display".to_string(),
                         args: vec![],
@@ -96,6 +99,7 @@ fn joined_unreachable_from_infeasible_and_feasible_paths() -> VerifiableFunction
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -247,6 +251,7 @@ fn unguarded_i128_shift_remains_refutable() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_v2_safety_vcs(&func);
@@ -496,6 +501,7 @@ fn signed_max_fixture() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     func
 }
@@ -536,6 +542,7 @@ fn many_paths_fixture(arms: u128) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -647,10 +654,7 @@ fn ptr_deref_span(file: &str) -> SourceSpan {
     SourceSpan { file: file.to_string(), line_start: 1, col_start: 1, line_end: 1, col_end: 20 }
 }
 
-fn ptr_deref_assert_func(
-    msg: trust_types::AssertMessage,
-    span: SourceSpan,
-) -> VerifiableFunction {
+fn ptr_deref_assert_func(msg: trust_types::AssertMessage, span: SourceSpan) -> VerifiableFunction {
     VerifiableFunction {
         name: "ptr_deref".to_string(),
         def_path: "ptr_deref".to_string(),
@@ -683,6 +687,7 @@ fn ptr_deref_assert_func(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -691,13 +696,29 @@ fn fix_a_std_span_pointer_deref_assert_suppressed() {
     // The `vec!`-macro Box::new_uninit pointer asserts, span at a canonical
     // std root — both sysroot spellings (remapped bare-crate-root and the
     // virtual `/rustc/<hash>/library/` form).
+    //
+    // AUTHENTICATED SINCE 2026-09-20. The suppression is bought by the
+    // compiler's `TrustedStdSourceFiles` table (artifact residency, keyed on
+    // `SourceFile::cnum`), never by the shape of the path — so the table below
+    // is what a real compilation installs for these two files, and the
+    // companion test `fix_a_std_shaped_path_without_the_table_stays_refutable`
+    // compiles the IDENTICAL spellings with the table absent.
     for span_file in ["alloc/src/macros.rs", "/rustc/e8be5c8/library/alloc/src/macros.rs"] {
         for msg in [
             trust_types::AssertMessage::NullPointerDereference,
             trust_types::AssertMessage::MisalignedPointerDereference,
         ] {
             let func = ptr_deref_assert_func(msg, ptr_deref_span(span_file));
-            let vcs = generate_v2_safety_vcs(&func);
+            let context = crate::VcgenContext::for_function(func.def_path.clone())
+                .with_trusted_std_source_files(
+                    trust_types::TrustedStdSourceFiles::from_authenticated_files([(
+                        span_file.to_string(),
+                        true,
+                    )]),
+                );
+            let vcs = crate::with_function_vcgen_context(&func.def_path, &context, || {
+                generate_v2_safety_vcs(&func)
+            });
             let has_unmodeled = vcs.iter().any(|vc| {
                 matches!(&vc.kind,
                     VcKind::UnsupportedMir { kind, .. } if kind.contains("UnmodeledSafetyAssert"))
@@ -705,6 +726,41 @@ fn fix_a_std_span_pointer_deref_assert_suppressed() {
             assert!(
                 !has_unmodeled,
                 "trusted-std pointer-deref assert ({span_file}) must be suppressed, got {:?}",
+                vcs.iter().map(|v| &v.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// THE FILE-PATH KEY IS GONE (2026-09-20). The BYTE-IDENTICAL std spellings the
+/// test above suppresses stay REFUTABLE when no authenticated table stands
+/// behind them — which is every caller that is not the compiler, and every
+/// user file that merely LOOKS like the standard library.
+///
+/// FAILS ON UNFIXED CODE: `is_trusted_std_file` read the path and nothing else,
+/// so `core/src/evil.rs` suppressed the same asserts as `core/src/ptr/mod.rs`.
+#[test]
+fn fix_a_std_shaped_path_without_the_table_stays_refutable() {
+    for span_file in [
+        "alloc/src/macros.rs",
+        "/rustc/e8be5c8/library/alloc/src/macros.rs",
+        // The measured attack path.
+        "core/src/evil.rs",
+        "library/core/src/evil.rs",
+    ] {
+        for msg in [
+            trust_types::AssertMessage::NullPointerDereference,
+            trust_types::AssertMessage::MisalignedPointerDereference,
+        ] {
+            let func = ptr_deref_assert_func(msg, ptr_deref_span(span_file));
+            let vcs = generate_v2_safety_vcs(&func);
+            assert!(
+                vcs.iter().any(|vc| {
+                    matches!(&vc.kind,
+                        VcKind::UnsupportedMir { kind, .. } if kind.contains("UnmodeledSafetyAssert"))
+                }),
+                "a std-SHAPED path with no authenticated table behind it must keep its \
+                 fail-closed stand-in ({span_file}), got {:?}",
                 vcs.iter().map(|v| &v.kind).collect::<Vec<_>>()
             );
         }
@@ -731,6 +787,169 @@ fn fix_a_user_span_pointer_deref_assert_still_emitted() {
                 has_unmodeled,
                 "user/empty/binary-span pointer-deref assert ({span_file:?}) must stay refutable, got {:?}",
                 vcs.iter().map(|v| &v.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PATH-GUARD-VALUE-1: a path guard is spelled by the VALUE it tested.
+//
+// Real MIR (`tests/fixtures/path_guard_value/`, d36c551fa stage2 `-Ztrust-dump=mir-only`,
+// `-Copt-level=0`) of
+//
+//     let mut len = m;
+//     for &c in xs {
+//         match len { 3 => {} _ => return acc }   // the guard
+//         if c { len = n; }                        // the write
+//         acc ^= buf[len];                         // the read
+//     }
+//
+// `len` reaches the guard (the loop header's join) and the read (the join after
+// `if c`) with ONE reaching-set token. The guard used to be spelled by that token, so
+// `len == 3` pinned the value the read sees and the bounds row PROVED (certified) on a
+// program that panics. The tests below pin the spelling itself; the verdicts are
+// pinned by `tests/path_guard_value_identity_realmir.rs`.
+// ---------------------------------------------------------------------------
+
+fn path_guard_value_fixture(name: &str) -> VerifiableFunction {
+    let path =
+        format!("{}/tests/fixtures/path_guard_value/{name}_o0.json", env!("CARGO_MANIFEST_DIR"));
+    let json = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    serde_json::from_str(&json).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// Every `(row block, spelled guard)` of `func`'s path-guard map, spelled the way the
+/// ordinary splice spells it for a row of that block.
+fn spelled_guards(func: &VerifiableFunction) -> Vec<(BlockId, Formula)> {
+    let sv = super::stmt_versions_for(func);
+    let map = super::guard_map_for(func);
+    let mut blocks: Vec<BlockId> = map.keys().copied().collect();
+    blocks.sort_by_key(|b| b.0);
+    let mut out = Vec::new();
+    for at in blocks {
+        let (_, terms) = super::safety::v2_formula_with_path_guards_recorded(
+            func,
+            &sv,
+            at,
+            &map[&at],
+            Formula::Bool(true),
+        );
+        for term in terms {
+            if let trust_types::PathGuardTerm::Guarded { guards } = term {
+                out.extend(guards.into_iter().map(|g| (at, g)));
+            }
+        }
+    }
+    out
+}
+
+fn guard_value_names(f: &Formula) -> Vec<String> {
+    f.free_variables().into_iter().filter(|v| crate::version_token_is_guard_value(v)).collect()
+}
+
+/// THE DEFECT, cut. Some row block's guard on `len` is spelled guard-locally (the
+/// loop header's join, `len#gv_p{J}`), and that block's ENTRY reads `len` under the
+/// very token the plain source-terminal rename would have given the guard — the tie
+/// the spelling exists to cut — while its value identity differs.
+#[test]
+fn path_guard_on_a_loop_header_join_is_not_tied_to_a_later_join() {
+    let func = path_guard_value_fixture("gs_one_arm_scalar_bug");
+    let sv = super::stmt_versions_for(&func);
+    let map = super::guard_map_for(&func);
+    let mut cut = 0usize;
+    for (at, guard) in spelled_guards(&func) {
+        for name in guard_value_names(&guard) {
+            let (base, token) = name.split_once('#').expect("a spelled name");
+            assert!(token.starts_with("gv_p"), "a join-valued guard read: {name}");
+            assert_eq!(base, "len", "only the loop-carried `len` is ambiguous: {name}");
+            cut += 1;
+            // The plain spelling: the source block's terminal token.
+            let (src, _) = map[&at]
+                .iter()
+                .flatten()
+                .find(|(src, g)| {
+                    guard_value_names(&super::guard_value_spelling::spell_path_guard(
+                        &func,
+                        &sv,
+                        &crate::guards::guard_to_formula(&func, g),
+                        *src,
+                        at,
+                    ))
+                    .contains(&name)
+                })
+                .expect("the spelled guard has a source");
+            let terminal = func.body.blocks[src.0].stmts.len();
+            let at_source = sv.version_token_at(&func, *src, terminal, base);
+            assert!(at_source.is_some(), "a versioned guard read");
+            if sv.version_token_at(&func, at, 0, base) == at_source {
+                assert_ne!(
+                    sv.value_id_at(&func, *src, terminal, base),
+                    sv.value_id_at(&func, at, 0, base),
+                    "one token AND one value at bb{} must keep the token spelling",
+                    at.0
+                );
+            }
+        }
+    }
+    assert!(cut > 0, "the loop-header guard must be spelled guard-locally somewhere");
+    // The refutation polarity declines exactly where the proof polarity cut a tie.
+    for (at, paths) in map.iter() {
+        let needs =
+            spelled_guards(&func).iter().any(|(b, g)| b == at && !guard_value_names(g).is_empty());
+        if needs {
+            assert!(
+                super::safety::v2_formula_with_refutation_path_guards(
+                    &func,
+                    &sv,
+                    *at,
+                    paths,
+                    Formula::Bool(true)
+                )
+                .is_none(),
+                "bb{}: a refutation path condition must not be weakened",
+                at.0
+            );
+        }
+    }
+}
+
+/// THE PRECISION KEPT. Where the guard and the index read share one value — the read
+/// precedes the write (`gs_read_before_write_ctl`), the guarded value is a copy taken
+/// before the write (`a2_copy_def_ctl`), no write reaches the read through a join
+/// (`diamond_nowrite_ctl`), the canonical guarded index (`loop_index_ctl`) — no guard
+/// of the bounds-check block is respelled, so its rows are byte-identical to the
+/// token spelling. (A JOIN block such as the shared `return` is a different value
+/// even when one path through it does not write, and is respelled — correctly.)
+#[test]
+fn path_guard_reading_the_rows_value_keeps_its_token_spelling() {
+    for name in
+        ["gs_read_before_write_ctl", "a2_copy_def_ctl", "diamond_nowrite_ctl", "loop_index_ctl"]
+    {
+        let func = path_guard_value_fixture(name);
+        let bounds_blocks: Vec<BlockId> = func
+            .body
+            .blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    &b.terminator,
+                    Terminator::Assert { msg: trust_types::AssertMessage::BoundsCheck, .. }
+                )
+            })
+            .map(|b| b.id)
+            .collect();
+        assert!(!bounds_blocks.is_empty(), "{name}: no bounds check");
+        let spelled: Vec<(BlockId, Formula)> = spelled_guards(&func)
+            .into_iter()
+            .filter(|(at, _)| bounds_blocks.contains(at))
+            .collect();
+        assert!(!spelled.is_empty(), "{name}: the bounds check is unguarded");
+        for (at, guard) in spelled {
+            assert!(
+                guard_value_names(&guard).is_empty(),
+                "{name} bb{}: a guard on the row's own value was respelled: {guard:?}",
+                at.0
             );
         }
     }

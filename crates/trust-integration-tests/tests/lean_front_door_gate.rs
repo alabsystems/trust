@@ -15,8 +15,11 @@
 //! conditional: the kernel is a dependency of this test binary, so the gate
 //! cannot degrade into a skip, and its verdict cannot change with whichever
 //! `clean` executable happens to be installed. The sibling gates that shell out
-//! to a discovered `clean` binary are reproducibility evidence about that
-//! binary, not about the proofs.
+//! to the `clean` binary `TRUST_CLEAN_BIN` names (`#[ignore]`d; run by
+//! `slow.clean-binary-proof-gates`) are reproducibility evidence about that
+//! binary, not about the proofs. The theorem NAMES those gates require, and the
+//! multiply-cap coupling, are checked in process too, by
+//! `trust_integration_tests::clean_proof_obligations`.
 
 use std::path::{Path, PathBuf};
 

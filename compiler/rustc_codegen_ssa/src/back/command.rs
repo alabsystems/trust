@@ -5,7 +5,29 @@ use std::ffi::{OsStr, OsString};
 use std::process::{self, Output};
 use std::{fmt, io, mem};
 
+// Trust: invocation-owned observations are consumed only after the owning wait.
+use rustc_session::{Session, tool_inputs::Attempt};
 use rustc_target::spec::LldFlavor;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "command/native.rs"]
+mod native;
+// Trust: same original Fixed compiler primary, separate from cooperative v3.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "command/bootstrap_fixed.rs"]
+mod bootstrap_fixed;
+
+pub(crate) enum LinkChild {
+    // Trust: retain the live window alongside the child that owns its wait.
+    Local {
+        child: process::Child,
+        attempt: Option<Attempt>,
+    },
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Native(native::Child),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    BootstrapFixed(bootstrap_fixed::Child),
+}
 
 #[derive(Clone)]
 pub(crate) struct Command {
@@ -14,6 +36,8 @@ pub(crate) struct Command {
     env: Vec<(OsString, OsString)>,
     env_remove: Vec<OsString>,
     env_clear: bool,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    resources: Option<rustc_data_structures::jobserver::ChildResources>,
 }
 
 #[derive(Clone)]
@@ -43,6 +67,8 @@ impl Command {
             env: Vec::new(),
             env_remove: Vec::new(),
             env_clear: false,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            resources: None,
         }
     }
 
@@ -95,8 +121,161 @@ impl Command {
         self.env_remove.push(key.to_owned());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn set_resources(
+        &mut self,
+        resources: Option<rustc_data_structures::jobserver::ChildResources>,
+    ) {
+        self.resources = resources;
+    }
+
+    fn check_local_execution(&self) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if rustc_data_structures::jobserver::native_v3_context().is_some()
+            || rustc_data_structures::jobserver::bootstrap_fixed_context().is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "native v3 external compiler phases require a retained hosted execution loan",
+            ));
+        }
+        Ok(())
+    }
+
+    // Trust: linker attempts, including response-file retries, share this path.
+    pub(crate) fn spawn_linker(&self, sess: &Session) -> io::Result<LinkChild> {
+        self.spawn_linker_inner(sess, false)
+    }
+
+    fn spawn_linker_inner(&self, sess: &Session, null_stdin: bool) -> io::Result<LinkChild> {
+        // Trust: this backend path follows the actual codegen join. No local fallback.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(context) = rustc_data_structures::jobserver::bootstrap_fixed_context() {
+            sess.tool_inputs_unavailable();
+            return bootstrap_fixed::Child::spawn(self, context).map(LinkChild::BootstrapFixed);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(context) = rustc_data_structures::jobserver::native_v3_context() {
+            // Trust: a hosted transport has a different lookup and security context.
+            sess.tool_inputs_unavailable();
+            return native::Child::spawn(self, context).map(LinkChild::Native);
+        }
+        self.check_local_execution()?;
+        let mut command = self.command();
+        command.stdout(process::Stdio::piped()).stderr(process::Stdio::piped());
+        if null_stdin {
+            command.stdin(process::Stdio::null());
+        }
+        let attempt = self.observe_linker(sess, &command);
+        match command.spawn() {
+            Ok(child) => Ok(LinkChild::Local { child, attempt }),
+            Err(error) => {
+                // Trust: a failed spawn can cause a later command retry. Preserve
+                // that lookup attempt too; observation failure never masks it.
+                if let Some(attempt) = attempt {
+                    sess.finish_tool_inputs(attempt);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn observe_linker(&self, sess: &Session, command: &process::Command) -> Option<Attempt> {
+        if !sess.tool_inputs_requested() {
+            return None;
+        }
+        let inherited_path = std::env::var_os("PATH");
+        let Ok(cwd) = std::env::current_dir()
+            .map(|cwd| command.get_current_dir().map_or(cwd.clone(), |path| cwd.join(path)))
+        else {
+            sess.tool_inputs_unavailable();
+            return None;
+        };
+        let child_path = self.final_child_path(command, inherited_path.as_deref());
+        Some(sess.begin_tool_inputs(
+            command.get_program(),
+            &cwd,
+            child_path.as_deref(),
+            sess.tool_inputs_parent_path(),
+        ))
+    }
+
+    // Trust: inspect the fully constructed std Command, after all localization,
+    // removals and resource configuration. env_clear is not exposed by std.
+    fn final_child_path(
+        &self,
+        command: &process::Command,
+        parent_path: Option<&OsStr>,
+    ) -> Option<OsString> {
+        let mut path = if self.env_clear { None } else { parent_path.map(OsStr::to_owned) };
+        for (key, value) in command.get_envs() {
+            if key == OsStr::new("PATH") {
+                path = value.map(OsStr::to_owned);
+            }
+        }
+        path
+    }
+
+    // Trust: preserve std::Command::output's null stdin for the response-file
+    // fallback, while using the same actual-launch observation and owning wait.
+    pub(crate) fn linker_output(&self, sess: &Session) -> io::Result<Output> {
+        let child = self.spawn_linker_inner(sess, true)?;
+        self.wait_with_output(sess, child)
+    }
+
     pub(crate) fn output(&mut self) -> io::Result<Output> {
+        // Trust: generic output is not a separately joined linker boundary.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if rustc_data_structures::jobserver::bootstrap_fixed_context().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private Fixed compiler external phase requires its post-join paired linker path",
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(context) = rustc_data_structures::jobserver::native_v3_context() {
+            return native::Child::spawn(self, context)?.output();
+        }
+        self.check_local_execution()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(resources) = &self.resources {
+            let child = self
+                .command()
+                .stdin(process::Stdio::null())
+                .stdout(process::Stdio::piped())
+                .stderr(process::Stdio::piped())
+                .spawn()?;
+            return resources.wait_with_output(child);
+        }
         self.command().output()
+    }
+
+    pub(crate) fn wait_with_output(&self, sess: &Session, child: LinkChild) -> io::Result<Output> {
+        let (child, attempt) = match child {
+            LinkChild::Local { child, attempt } => (child, attempt),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            LinkChild::Native(child) => return child.output(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            LinkChild::BootstrapFixed(child) => return child.output(),
+        };
+        // Trust: even an unsuccessful linker exit has a completed owning wait.
+        // An I/O wait error cannot establish completion and withholds the unit.
+        let output = self.wait_local(child);
+        if let Some(attempt) = attempt {
+            if output.is_err() {
+                sess.tool_inputs_unavailable();
+            }
+            sess.finish_tool_inputs(attempt);
+        }
+        output
+    }
+
+    fn wait_local(&self, child: process::Child) -> io::Result<Output> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(resources) = &self.resources {
+            return resources.wait_with_output(child);
+        }
+        child.wait_with_output()
     }
 
     pub(crate) fn command(&self) -> process::Command {
@@ -120,6 +299,10 @@ impl Command {
         }
         if self.env_clear {
             ret.env_clear();
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(resources) = &self.resources {
+            resources.configure(&mut ret);
         }
         ret
     }
@@ -211,3 +394,9 @@ impl fmt::Debug for Command {
         self.command().fmt(f)
     }
 }
+
+// Trust: tool-input tests, in the sibling `command/tests.rs` as tidy's unit_tests
+// layout requires. They exercise extraction from the actual std Command; they neither
+// mutate process environment nor replace a linker with a fabricated tool role.
+#[cfg(test)]
+mod tests;

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import hashlib
 import json
 import subprocess
 import sys
@@ -107,34 +108,26 @@ def artifact(aggregate: dict | None = None) -> dict:
     }
 
 
+def fixture_subject_stderr() -> str:
+    lines = []
+    for index in range(3):
+        identity = f"DefId(0:{index + 1} ~ fixture::f{index})"
+        lines.append(f"trust-ir-lower: body class, def={identity}, symbolic=false, opaque=false, clean=true")
+        lines.append(f'trust-ir-lower: differential, def={identity}, equal=true, samples=1, mode=Agreed, note=""')
+    lines.append("trust-ir-lower: module validation summary, total=0")
+    return "\n".join(lines) + "\n"
+
+
 def complete_raw_files() -> list[dict]:
-    bodies = [
-        {
-            "def": f"fixture::f{index}",
-            "unsupported": 0,
-            "reasons": [],
-            "kind": "named",
-            "mode": "Agreed",
-            "equal": True,
-            "samples": 1,
-            "note": "",
-            "note_class": "agreed",
-            "symbolic": False,
-            "opaque_collapse": False,
-        }
-        for index in range(3)
-    ]
+    stderr = fixture_subject_stderr()
+    bodies, anomalies = scorecard.parse_bodies(stderr)
     return [
         {
             "file": "fixture.rs",
             "outcome": "ok",
             "bodies": bodies,
-            "anomalies": {
-                "duplicate_differential_events": 0,
-                "duplicate_unsupported_events": 0,
-                "unsupported_event_without_differential_event": [],
-            },
-            "validation": {"total": 0, "classes": {}},
+            "anomalies": anomalies,
+            "validation": scorecard.parse_validation(stderr),
         },
         {"file": "excluded.rs", "outcome": "compile_fail", "bodies": []},
     ]
@@ -158,13 +151,151 @@ def raw_artifact() -> dict:
     }
     corpus["body_census"] = {
         "schema": "trust.trust-ir.producer-body-census.v1",
-        "source": "independent-hir-body-owner-census/v1",
+        "source": scorecard.BODY_CENSUS_SOURCE,
         "bodies": [
             {"file": "fixture.rs", "def": f"fixture::f{index}", "kind": "named"}
             for index in range(3)
         ],
     }
+    add_census_evidence(corpus)
     return data
+
+
+def compiler_census(input_path, rows, digest, lowering, *, complete=True, edition="2021"):
+    header = {"schema": scorecard.CENSUS_SCHEMA, "event": "begin", "input": input_path,
+              "compiler_version": "fixture-compiler", "target": "fixture-target",
+              "edition": edition, "crate_types": ["Rlib"],
+              "direct_lowering": lowering, "verification_enabled": False,
+              "scope": "local-hir-body-owners-after-typeck", "reachable_instances": "unmeasured"}
+    header["generated_scope"] = "local-typeck-synthetic-coroutine-bodies"
+    snapshot = {"schema": scorecard.CENSUS_SCHEMA, "event": "hir_snapshot",
+                "body_count": len(rows), "sources": [{"file": input_path, "sha256": digest}],
+                "generated_body_count": 0, "generated_bodies": [],
+                "bodies": [{"def": row["def"], "kind": row["kind"], "def_kind": "Fn",
+                            "def_index": index, "def_path_hash": f"fixture-identity-{index}"}
+                           for index, row in enumerate(rows)]}
+    lines = [json.dumps(header) + "\n", json.dumps(snapshot) + "\n"]
+    if complete:
+        footer = {"schema": scorecard.CENSUS_SCHEMA, "event": "complete", "status": "complete",
+                  "body_count": len(rows), "sources": snapshot["sources"],
+                  "generated_body_count": 0,
+                  "other_inputs": {"tracked_files": [], "environment_variables": [],
+                                   "proc_macro_io": "unmeasured", "build_environment": "unmeasured",
+                                   "external_dependency_closure": "unmeasured"},
+                  "snapshot_sha256": hashlib.sha256(lines[1].encode()).hexdigest()}
+        lines.append(json.dumps(footer) + "\n")
+    return "".join(lines)
+
+
+def mono_census(input_path, rows, digest, lowering, *, complete=True, edition="2021"):
+    census = scorecard.rust_instance_census
+    schema = census.SCHEMA_V3
+    header = {
+        "schema": schema, "event": "begin", "scope": census.SCOPE, "input": input_path,
+        "compiler_version": "fixture-compiler", "target": "fixture-target", "edition": edition,
+        "direct_lowering": lowering, "verification_enabled": False,
+        "collection_strategy": "lazy", "optimization": "No", "incremental": False,
+        "codegen_requested": True,
+        "identity_scheme": "rustc-stable-mono-item-fingerprint-128-diagnostic-only",
+        "dependency_identity_scheme": census.DEPENDENCY_IDENTITY,
+        "dependency_scope": census.DEPENDENCY_SCOPE,
+        "eager_const_root_scope": census.EAGER_CONST_ROOT_SCOPE,
+        "eager_const_root_identity_scheme": census.EAGER_CONST_ROOT_IDENTITY,
+        "unmeasured": list(census.UNMEASURED_V2),
+    }
+    if not complete:
+        return json.dumps(header) + "\n"
+    items = [
+        {"id": f"{index + 1:032x}", "kind": "item", "instance_detail": "Item(fixture)",
+         "generic_args": "[]", "def": row["def"], "def_path_hash": f"fixture-identity-{index}",
+         "def_kind": "Fn", "definition_is_local": True, "symbol": f"fixture_symbol_{index}"}
+        for index, row in enumerate(rows)
+    ]
+    ids = [item["id"] for item in items]
+    nodes = [
+        {"id": "item:" + item["id"], "kind": "item", "mono_item_kind": item["kind"],
+         "collected": True, **{key: item[key] for key in (
+             "instance_detail", "generic_args", "def", "def_path_hash", "def_kind",
+             "definition_is_local")}}
+        for item in items
+    ]
+    owners = [{"id": node["id"] + ":used", "item": node["id"],
+               "collection_mode": "used", "collected": True} for node in nodes]
+    snapshot = {
+        "schema": schema, "event": "mono_snapshot", "item_count": len(items),
+        "items": items, "roots": ids, "usage_edges": [],
+        "codegen_units": {"fixture-cgu.0": [
+            {"id": identity, "linkage": "Internal", "visibility": "Default", "inlined": False}
+            for identity in ids]},
+        "unplaced_items": [], "dependency_node_count": len(nodes),
+        "dependency_owner_count": len(owners), "dependency_occurrence_count": 0,
+        "dependency_nodes": nodes, "dependency_owners": owners, "dependency_occurrences": [],
+        "eager_const_root_owner_count": 0, "eager_const_root_occurrence_count": 0,
+        "eager_const_root_owners": [], "eager_const_root_occurrences": [],
+    }
+    snapshot_line = json.dumps(snapshot) + "\n"
+    footer = {
+        "schema": schema, "event": "complete", "status": "collector_observed",
+        "item_count": len(items), "snapshot_sha256": hashlib.sha256(snapshot_line.encode()).hexdigest(),
+        "sources": {input_path: "sha256=" + digest},
+        "unmeasured": list(census.UNMEASURED_V2), "whole_program_complete": False,
+    }
+    return json.dumps(header) + "\n" + snapshot_line + json.dumps(footer) + "\n"
+
+
+def add_census_evidence(corpus, repo="/fixture"):
+    inputs = corpus["input_census"]["files"]
+    hashes = {row["file"]: row["sha256"] for row in inputs}
+    stage_root = str(Path(repo) / "stage")
+    compiler = str(Path(stage_root) / "bin" / "trustc")
+    closure = {
+        "schema": scorecard.STAGE_CLOSURE_SCHEMA, "stage_root": stage_root,
+        "compiler": compiler, "compiler_sha256": "a" * 64,
+        "files": [{"path": "lib/librustc_driver-fixture.dylib",
+                   "target": "lib/librustc_driver-fixture.dylib", "sha256": "b" * 64}],
+    }
+    closure["sha256"] = scorecard.stage_closure_digest(closure)
+    corpus["census_evidence"] = {
+        "schema": "trust.rust.producer-census-evidence.v2", "repo": repo,
+        "target": "fixture-target", "edition": "2021",
+        "compiler_sha256_before": "a" * 64, "compiler_sha256_after": "a" * 64,
+        "stage_closure_before": copy.deepcopy(closure),
+        "stage_closure_after": copy.deepcopy(closure),
+        "precompile_errors": [], "postcompile_errors": [],
+        "input_manifest": {"schema": scorecard.INPUT_MANIFEST_SCHEMA, "corpora": {"corpus": {
+            "files": copy.deepcopy(inputs),
+            "sources": [{"file": row["file"], "sha256": row["sha256"]} for row in inputs],
+        }}},
+    }
+    for row in corpus["files"]:
+        input_path = str(Path(repo) / row["file"])
+        complete = row["outcome"] == "ok"
+        row["measurement"] = {}
+        for role, lowering, codegen in (("control", False, False), ("subject", True, False),
+                                        ("codegen_control", False, True),
+                                        ("codegen_subject", True, True)):
+            argv = [compiler, "-Z", "trust-ir-lower=" + ("on" if lowering else "off"),
+                    "-Z", "trust-verify=off", "-Z", "checksum-hash-algorithm=sha256",
+                    "-Z", "trust-body-census=fixture.jsonl"]
+            if codegen:
+                argv += ["-Z", "trust-instance-census=mono-fixture.jsonl"]
+            argv += ["--edition", "2021", "--crate-type", "lib",
+                     "--emit=link" if codegen else "--emit=metadata", "--out-dir", "/fixture-output",
+                     "--cap-lints", "allow", input_path]
+            run = {
+                "input": input_path, "error": None,
+                "stderr": fixture_subject_stderr() if complete and lowering and not codegen else "",
+                "exit_code": 0 if complete else 1,
+                "argv": argv,
+                "census_raw": compiler_census(input_path, row["bodies"], hashes[row["file"]],
+                                              lowering, complete=complete),
+                "compiler_sha256_before": "a" * 64,
+                "compiler_sha256_after": "a" * 64,
+            }
+            if codegen:
+                run["mono_raw"] = mono_census(input_path, row["bodies"], hashes[row["file"]],
+                                               lowering, complete=complete)
+            row["measurement"][role] = run
 
 
 def check_by_id(result: dict, check_id: str) -> dict:
@@ -307,6 +438,7 @@ class ProducerCompletionEvaluatorTests(unittest.TestCase):
         rendered = scorecard.render_markdown(artifact())
         self.assertIn("corpus-local instrumented-row zero-residue gate: **PASS**", rendered)
         self.assertIn("does not establish G1", rendered)
+        self.assertIn("G1/G3 **RED**", rendered)
         self.assertIn("not a proof", rendered)
         self.assertIn("lowered clean (diagnostic only; **NOT an acceptance metric**", rendered)
 
@@ -330,6 +462,7 @@ class ProducerCompletionCliTests(unittest.TestCase):
         self.assertTrue(passed_result["complete"])
         self.assertEqual(passed_result["aggregate_source"], "recomputed_from_files")
         self.assertIn("instrumented-row", passed_result["scope"])
+        self.assertIn("G3", passed_result["does_not_establish"])
 
         incomplete = raw_artifact()
         # Leave the stored aggregate green and mutate only the raw evidence: CLI mode must not
@@ -360,6 +493,17 @@ class ProducerCompletionCliTests(unittest.TestCase):
         failed = self.run_gate(data)
         self.assertEqual(failed.returncode, 1, failed.stderr)
         self.assertIn("do not equal", failed.stdout)
+
+    def test_cli_rejects_legacy_artifact_without_codegen_observations(self) -> None:
+        data = raw_artifact()
+        for row in data["corpora"]["fixture"]["files"]:
+            del row["measurement"]["codegen_control"]
+            del row["measurement"]["codegen_subject"]
+        failed = self.run_gate(data)
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        result = json.loads(failed.stdout)
+        self.assertFalse(result["complete"])
+        self.assertIn("codegen control/subject", " ".join(result["artifact_errors"]))
 
     def test_sampled_agreed_requires_real_equal_samples_and_provenance(self) -> None:
         for field, value in (("equal", False), ("samples", 0)):
@@ -409,7 +553,7 @@ class ProducerCompletionCliTests(unittest.TestCase):
         }
         failed = self.run_gate(data)
         self.assertEqual(failed.returncode, 1, failed.stderr)
-        self.assertIn("inconsistent", failed.stdout)
+        self.assertIn("producer validation differs from saved subject stderr", failed.stdout)
 
         data = raw_artifact()
         data["schema"] = "forged.v1"

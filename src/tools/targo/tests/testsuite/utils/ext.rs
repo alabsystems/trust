@@ -28,9 +28,11 @@ impl CargoProjectExt for Project {
     }
 }
 
-/// Path to the cargo binary
+/// Path to the cargo binary: the `cargo` compatibility entry point of the
+/// `targo` executable this package builds (see
+/// [`cargo_test_support::cargo_compat_alias`]).
 pub fn cargo_exe() -> PathBuf {
-    snapbox::cmd::cargo_bin!("cargo").to_path_buf()
+    cargo_test_support::cargo_compat_alias(snapbox::cmd::cargo_bin!("targo"))
 }
 
 /// Test the cargo command

@@ -10,7 +10,7 @@ pub(super) use rustc_target::spec::apple::OSVersion;
 use rustc_target::spec::{Arch, Env, Os, Target};
 use tracing::debug;
 
-use crate::errors::{XcrunError, XcrunSdkPathWarning};
+use crate::diagnostics::{XcrunError, XcrunSdkPathWarning};
 
 #[cfg(test)]
 mod tests;
@@ -158,6 +158,18 @@ pub(super) fn add_version_to_llvm_target(
 }
 
 pub(super) fn get_sdk_root(sess: &Session) -> Option<PathBuf> {
+    if sess.opts.resource_worker_v3 {
+        // An explicit SDKROOT is input data, not permission to execute discovery
+        // helpers. Never fall through to PATH-based xcrun/xcode-select here.
+        let root = std::env::var_os("SDKROOT").map(PathBuf::from);
+        return Some(root.filter(|path| path.is_absolute() && path.is_dir()).unwrap_or_else(
+            || sess.dcx().fatal("native v3 Apple codegen requires an explicit absolute SDKROOT"),
+        ));
+    }
+    // Trust: compiler-owned SDK discovery is outside the native linker-driver
+    // readset. Keep valid compilation and diagnostics, but withhold reuse even
+    // when discovery fails. An accepted explicit SDKROOT bypasses this function.
+    sess.tool_inputs_unavailable();
     let sdk_name = sdk_name(&sess.target);
 
     // Attempt to invoke `xcrun` to find the SDK.
@@ -247,7 +259,8 @@ fn xcrun_show_sdk_path(
 
     // It is fine to do lossy conversion here, non-UTF-8 paths are quite rare on macOS nowadays
     // (only possible with the HFS+ file system), and we only use it for error messages.
-    let stderr = String::from_utf8_lossy_owned(output.stderr);
+    // Trust: the shipped 1.99 seed still gates the owned conversion API.
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !stderr.is_empty() {
         debug!(stderr, "original xcrun stderr");
     }
@@ -267,7 +280,8 @@ fn xcrun_show_sdk_path(
     } else {
         // Output both stdout and stderr, since shims of `xcrun` (such as the one provided by
         // nixpkgs), do not always use stderr for errors.
-        let stdout = String::from_utf8_lossy_owned(output.stdout).trim().to_string();
+        // Trust: keep the same lossy diagnostics on the early bootstrap seed.
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Err(XcrunError::Unsuccessful {
             sdk_name,
             command_formatted: format!("{cmd:?}"),

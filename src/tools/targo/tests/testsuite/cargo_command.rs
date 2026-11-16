@@ -22,6 +22,16 @@ fn path() -> Vec<PathBuf> {
     env::split_paths(&env::var_os("PATH").unwrap_or_default()).collect()
 }
 
+// Trust: fixture commands scrub the outer bootstrap shim's private controls.
+// Select the dedicated compiler from that same fixture context; standalone
+// callers retain their authored RUSTC through the existing factory.
+fn fixture_rustc() -> std::ffi::OsString {
+    cargo_test_support::rustc_fixture_command()
+        .expect("valid isolated compiler fixture context")
+        .get_program()
+        .to_os_string()
+}
+
 #[cargo_test]
 fn list_commands_with_descriptions() {
     let p = project().build();
@@ -140,7 +150,8 @@ fn list_command_handles_known_external_commands() {
         .executable(Path::new("path-test").join("cargo-fmt"), "")
         .build();
 
-    let fmt_desc = "    fmt                  Formats all bin and lib files of the current crate using rustfmt.";
+    // Trust: the canonical external formatter description names targo-fmt.
+    let fmt_desc = "    fmt                  Formats all bin and lib files of the current crate using targo-fmt.";
 
     // Without path - fmt isn't there
     p.cargo("--list")
@@ -157,7 +168,7 @@ fn list_command_handles_known_external_commands() {
         .env("PATH", &path)
         .with_stdout_data(str![[r#"
 ...
-    fmt                  Formats all bin and lib files of the current crate using rustfmt.
+    fmt                  Formats all bin and lib files of the current crate using targo-fmt.
 ..."#]])
         .run();
 }
@@ -377,7 +388,7 @@ fn cargo_subcommand_env() {
             println!("{{}}", env::var("{}").unwrap());
         }}
         "#,
-        cargo::CARGO_ENV
+        targo::CARGO_ENV
     );
 
     let p = project()
@@ -411,7 +422,7 @@ fn cargo_subcommand_env() {
     // exe when it is detected to be a cargo binary.
     cargo_process("envtest")
         .env("PATH", &path)
-        .env(cargo::CARGO_ENV, &envtest_bin)
+        .env(targo::CARGO_ENV, &envtest_bin)
         .with_stdout_data(format!("{}\n", cargo.display()).raw())
         .run();
 }
@@ -568,7 +579,7 @@ fn targo_external_subcommands_prefer_trust_prefix_then_cargo_compat() {
     p.process(&targo_exe)
         .arg("foo")
         .env("PATH", &path)
-        .env(cargo::CARGO_ENV, &targo_exe)
+        .env(targo::CARGO_ENV, &targo_exe)
         .with_stdout_data(str![[r#"
 TRUST
 
@@ -580,7 +591,7 @@ TRUST
     p.process(&targo_exe)
         .arg("env-probe")
         .env("PATH", &path)
-        .env(cargo::CARGO_ENV, &cargo_exe)
+        .env(targo::CARGO_ENV, &cargo_exe)
         .with_stdout_data(format!("{}\n", targo_exe.display()).raw())
         .run();
 
@@ -589,7 +600,7 @@ TRUST
     p.process(&targo_exe)
         .arg("foo")
         .env("PATH", &path)
-        .env(cargo::CARGO_ENV, &targo_exe)
+        .env(targo::CARGO_ENV, &targo_exe)
         .with_stdout_data(str![[r#"
 CARGO
 
@@ -652,7 +663,7 @@ fn plain_cargo_symlink_keeps_upstream_frontend_semantics() {
     p.process(&cargo)
         .arg("identity-probe")
         .env("PATH", env::join_paths(command_path).unwrap())
-        .env(cargo::CARGO_ENV, cargo_exe())
+        .env(targo::CARGO_ENV, cargo_exe())
         .with_stdout_data(str![[r#"
 CARGO=cargo
 RUST_HELP=true
@@ -689,10 +700,12 @@ fn forged_argv0_cannot_promote_or_demote_frontend_brand() {
         .arg0("cargo")
         .arg("--help")
         .env("PATH", &command_path)
-        .env(cargo::CARGO_ENV, &cargo)
+        .env(targo::CARGO_ENV, &cargo)
         .output()
         .expect("run Targo with forged Cargo argv0");
     assert!(!demotion.status.success(), "{demotion:?}");
+    assert_eq!(demotion.status.code(), Some(101), "{demotion:?}");
+    assert!(demotion.stdout.is_empty(), "{demotion:?}");
     let demotion_stderr = String::from_utf8(demotion.stderr).expect("UTF-8 Targo error");
     assert!(
         demotion_stderr.contains("could not authenticate Cargo/Targo frontend identity"),
@@ -703,16 +716,47 @@ fn forged_argv0_cannot_promote_or_demote_frontend_brand() {
         .arg0("targo")
         .arg("--help")
         .env("PATH", &command_path)
-        .env(cargo::CARGO_ENV, &targo)
+        .env(targo::CARGO_ENV, &targo)
         .output()
         .expect("run Cargo with forged Targo argv0");
-    assert!(promotion.status.success(), "{promotion:?}");
-    let promotion_stdout = String::from_utf8(promotion.stdout).expect("UTF-8 Cargo help");
+    // Trust: a recognized Targo spelling on a loaded Cargo image is refused,
+    // rather than silently dispatching compatibility-only cargo-trust tools.
+    assert_eq!(promotion.status.code(), Some(101), "{promotion:?}");
+    assert!(promotion.stdout.is_empty(), "{promotion:?}");
+    let promotion_stderr = String::from_utf8(promotion.stderr).expect("UTF-8 Cargo error");
     assert!(
-        promotion_stdout.contains("Rust's package manager")
-            && !promotion_stdout.contains("Trust's Cargo-compatible package manager"),
-        "forged Targo argv0 promoted plain Cargo:\n{promotion_stdout}"
+        promotion_stderr.contains("could not authenticate Cargo/Targo frontend identity")
+            && promotion_stderr.contains("resolves to a Cargo executable"),
+        "forged Targo argv0 did not fail closed:\n{promotion_stderr}"
     );
+
+    // Trust: the same context accepts both honest spellings, so refusing the
+    // forged identities cannot pass by rejecting every executable or request.
+    for (program, expected, forbidden) in [
+        (
+            &cargo,
+            "Rust's package manager",
+            "Trust's Cargo-compatible package manager",
+        ),
+        (
+            &targo,
+            "Trust's Cargo-compatible package manager",
+            "Rust's package manager",
+        ),
+    ] {
+        let honest = std::process::Command::new(program)
+            .arg("--help")
+            .env("PATH", &command_path)
+            .env(targo::CARGO_ENV, program)
+            .output()
+            .expect("run honest frontend identity control");
+        assert!(honest.status.success(), "{honest:?}");
+        let help = String::from_utf8(honest.stdout).expect("UTF-8 honest frontend help");
+        assert!(
+            help.contains(expected) && !help.contains(forbidden),
+            "honest frontend lost its own semantics:\n{help}"
+        );
+    }
 }
 
 #[cargo_test]
@@ -750,6 +794,76 @@ fn targo_help_uses_canonical_frontend_name() {
         .arg("--list")
         .with_stdout_contains("[..]help[..]Displays help for a cargo command[..]")
         .with_stdout_does_not_contain("[..]Displays help for a targo command[..]")
+        .run();
+}
+
+// Trust: channel admission is shared, but the two authenticated entrypoints
+// retain their own diagnostic text and documentation links.
+#[cargo_test]
+fn unstable_diagnostics_follow_authenticated_frontend() {
+    let p = project()
+        .at("unstable-frontend-diagnostics")
+        .file("src/lib.rs", "")
+        .build();
+    let targo = p.root().join(format!("targo{}", env::consts::EXE_SUFFIX));
+    fs::hard_link(cargo_exe(), &targo).unwrap();
+
+    p.process(cargo_exe())
+        .arg("build")
+        .arg("--artifact-dir")
+        .arg("out")
+        .env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "stable")
+        .with_status(101)
+        .with_stderr_contains("[..]only available on the nightly channel of Cargo[..]")
+        .with_stderr_contains("[..]https://github.com/rust-lang/cargo/issues/6790[..]")
+        .with_stderr_does_not_contain("Trust/nightly-capable")
+        .run();
+
+    p.process(&targo)
+        .arg("--unverified")
+        .arg("build")
+        .arg("--artifact-dir")
+        .arg("out")
+        .env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "stable")
+        .with_status(101)
+        .with_stderr_contains("[..]only available on Trust/nightly-capable Cargo channels[..]")
+        .with_stderr_contains("[..]https://github.com/alabsystems/Trust/issues[..]")
+        .with_stderr_does_not_contain("https://github.com/rust-lang/cargo/issues/6790")
+        .run();
+
+    p.process(cargo_exe())
+        .arg("-Z")
+        .arg("help")
+        .with_stdout_contains("[..]Available unstable (nightly-only) flags:[..]")
+        .with_stdout_contains(
+            "[..]https://doc.rust-lang.org/nightly/cargo/reference/unstable.html[..]",
+        )
+        .with_stdout_does_not_contain("Available Trust unstable flags")
+        .run();
+
+    p.process(&targo)
+        .arg("-Z")
+        .arg("help")
+        .with_stdout_contains("[..]Available Trust unstable flags:[..]")
+        .with_stdout_contains("[..]Trust Cargo unstable-features documentation[..]")
+        .with_stdout_does_not_contain("Available unstable (nightly-only) flags")
+        .run();
+
+    p.process(cargo_exe())
+        .arg("tree")
+        .arg("--help")
+        .with_stdout_does_not_contain("[..]--proof[..]")
+        .run();
+    p.process(&targo)
+        .arg("tree")
+        .arg("--help")
+        .with_stdout_contains("[..]--proof[..]")
+        .run();
+    p.process(cargo_exe())
+        .arg("tree")
+        .arg("--proof")
+        .with_status(1)
+        .with_stderr_contains("[..]unexpected argument '--proof' found[..]")
         .run();
 }
 
@@ -890,6 +1004,8 @@ fn targo_aliases_cannot_mint_unverified_authority() {
     let targo = p.root().join(format!("targo{}", env::consts::EXE_SUFFIX));
     fs::hard_link(cargo_exe(), &targo).unwrap();
 
+    // Trust: refusal help describes the unverified lane; an actual lane
+    // execution is announced by UNVERIFIED: followed by the Targo invocation.
     for alias in ["repo-fast", "repo-chain"] {
         p.process(&targo)
             .arg(alias)
@@ -900,7 +1016,7 @@ fn targo_aliases_cannot_mint_unverified_authority() {
             .with_stderr_contains(
                 "[..]alias attempted to inject `--unverified`[..]configuration cannot grant verification bypass authority[..]",
             )
-            .with_stderr_does_not_contain("[..]UNVERIFIED:[..]")
+            .with_stderr_does_not_contain("[..]UNVERIFIED: `targo[..]")
             .run();
     }
     // External-subcommand arguments are intentionally opaque to Cargo's global
@@ -917,7 +1033,7 @@ fn targo_aliases_cannot_mint_unverified_authority() {
             .with_stderr_contains(
                 "[..]`targo miri` refuses to create an implicitly unverified artifact[..]",
             )
-            .with_stderr_does_not_contain("[..]UNVERIFIED:[..]")
+            .with_stderr_does_not_contain("[..]UNVERIFIED: `targo[..]")
             .run();
     }
     assert!(
@@ -935,7 +1051,7 @@ fn targo_aliases_cannot_mint_unverified_authority() {
             .with_stderr_contains(
                 "[..]`targo miri` refuses to create an implicitly unverified artifact[..]",
             )
-            .with_stderr_does_not_contain("[..]UNVERIFIED:[..]")
+            .with_stderr_does_not_contain("[..]UNVERIFIED: `targo[..]")
             .run();
     }
 
@@ -948,7 +1064,7 @@ fn targo_aliases_cannot_mint_unverified_authority() {
         .env_remove("TRUST_BOOTSTRAP_NO_VERIFY")
         .env_remove("TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY")
         .with_status(101)
-        .with_stderr_contains("[..]UNVERIFIED:[..]")
+        .with_stderr_contains("[..]UNVERIFIED: `targo[..]")
         .with_stderr_does_not_contain("[..]alias attempted to inject[..]")
         .run();
 
@@ -974,7 +1090,7 @@ fn targo_aliases_cannot_mint_unverified_authority() {
             .with_stderr_contains(
                 "[..]alias attempted to inject `--unverified`[..]configuration cannot grant verification bypass authority[..]",
             )
-            .with_stderr_does_not_contain("[..]UNVERIFIED:[..]")
+            .with_stderr_does_not_contain("[..]UNVERIFIED: `targo[..]")
             .run();
     }
 }
@@ -1045,14 +1161,9 @@ fn targo_script_requires_a_lane_before_creating_its_target_directory() {
     ordinary
         .masquerade_as_nightly_cargo(&["script"])
         .env("CARGO_TARGET_DIR", &cargo_target)
-        // Cargo's fixture environment deliberately removes the outer compiler
-        // and flags. Restore the exact driver inputs used to compile this test
-        // so this behavioral control exercises a real script compiler rather
-        // than the bootstrap fixture shim.
-        .env(
-            "RUSTC",
-            env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-        )
+        // Trust: use the fixture compiler after command isolation, retaining
+        // this control's authored flags and ordinary Cargo script semantics.
+        .env("RUSTC", fixture_rustc())
         .with_stdout_contains("[..]args=[\"--unverified\"][..]");
     if let Some(rustflags) = env::var_os("RUSTFLAGS") {
         ordinary.env("RUSTFLAGS", rustflags);
@@ -1060,7 +1171,7 @@ fn targo_script_requires_a_lane_before_creating_its_target_directory() {
     ordinary.run();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cargo_test]
 fn ambient_nested_unverified_broker_address_cannot_mint_targo_authority() {
     let p = project()
@@ -1074,31 +1185,81 @@ fn ambient_nested_unverified_broker_address_cannot_mint_targo_authority() {
     let targo = p.root().join(format!("targo{}", env::consts::EXE_SUFFIX));
     fs::hard_link(cargo_exe(), &targo).unwrap();
 
-    for address in [
+    // On macOS the endpoint is a socket path: a relative one is refused, and
+    // an absolute one with no live, ancestral, same-image peer behind it (here
+    // a socket whose listener is gone) authenticates nothing.
+    // (`sun_path` is short, so the socket lives in the temporary directory.)
+    let stale_socket = std::env::temp_dir().join(format!("ttb-stale-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&stale_socket);
+    drop(std::os::unix::net::UnixListener::bind(&stale_socket).unwrap());
+    let stale_socket_path = stale_socket.clone();
+    let stale_socket = stale_socket.display().to_string();
+    let addresses = [
         "nonexistent",
         "trust-targo-unverified-forged",
         "trust-targo-unverified-stale",
-    ] {
+        stale_socket.as_str(),
+    ];
+    // T14c (T14-EXPORT-1): an address that does not authenticate grants
+    // nothing. A compile verb naming no lane is refused as if nothing had been
+    // inherited, and the refusal names the endpoint that granted nothing.
+    for address in addresses {
         p.process(&targo)
             .arg("check")
-            .env("TRUST_TARGO_NESTED_UNVERIFIED_BROKER", address)
+            .env("TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT", address)
             .env_remove("TRUST_TARGO_VERIFY")
             .env_remove("TRUST_BOOTSTRAP_NO_VERIFY")
             .env_remove("TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY")
             .with_status(101)
-            .with_stderr_contains(
-                "[..]could not authenticate nested-unverified Targo authority[..]",
-            )
-            .with_stderr_does_not_contain("[..]UNVERIFIED:[..]")
+            .with_stderr_contains("[..]implicitly unverified artifact[..]")
+            .with_stderr_contains("[..]UNVERIFIED_ENDPOINT granted nothing[..]")
+            .with_stderr_does_not_contain("warning: UNVERIFIED:[..]")
             .run();
     }
     assert!(
         !p.build_dir().exists(),
         "forged ambient broker addresses must fail before build materialization"
     );
+    // A lane the invocation selects itself, and a verb that compiles nothing,
+    // proceed: the endpoint never stops them (a stale one, another Targo
+    // build's, or one a pre-T14c Targo leaves behind).
+    for address in addresses {
+        p.process(&targo)
+            .args(&["metadata", "--format-version", "1", "--no-deps"])
+            .env("TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT", address)
+            .env_remove("TRUST_TARGO_VERIFY")
+            .with_stderr_does_not_contain("[..]nested-unverified[..]")
+            .run();
+        p.process(&targo)
+            .args(&["--unverified", "check"])
+            .env("TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT", address)
+            .env_remove("TRUST_TARGO_VERIFY")
+            .env_remove("TRUST_BOOTSTRAP_NO_VERIFY")
+            .env_remove("TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY")
+            .with_stderr_contains("[..]UNVERIFIED: `targo check` was explicitly authorized[..]")
+            .with_stderr_does_not_contain("[..]inherited live broker-authenticated[..]")
+            .run();
+    }
+    // The pre-T14c name is never read: a root of that era cannot hand a
+    // newer Targo its lane, and the refusal has no endpoint to name.
+    p.process(&targo)
+        .arg("check")
+        .env(
+            "TRUST_TARGO_NESTED_UNVERIFIED_BROKER",
+            stale_socket.as_str(),
+        )
+        .env_remove("TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT")
+        .env_remove("TRUST_TARGO_VERIFY")
+        .env_remove("TRUST_BOOTSTRAP_NO_VERIFY")
+        .env_remove("TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY")
+        .with_status(101)
+        .with_stderr_contains("[..]implicitly unverified artifact[..]")
+        .with_stderr_does_not_contain("[..]granted nothing[..]")
+        .run();
+    let _ = fs::remove_file(&stale_socket_path);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cargo_test]
 fn explicit_unverified_targo_propagates_to_nested_cargo_compile_without_rustflags() {
     let p = project()
@@ -1176,14 +1337,11 @@ fn explicit_unverified_targo_propagates_to_nested_cargo_compile_without_rustflag
 
     let mut run = p.process(&targo);
     run.args(&["--unverified", "run"])
-        .env(
-            "RUSTC",
-            env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-        )
+        .env("RUSTC", fixture_rustc())
         .env_remove("TRUST_TARGO_VERIFY")
         .env_remove("TRUST_BOOTSTRAP_NO_VERIFY")
         .env_remove("TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY")
-        .env_remove("TRUST_TARGO_NESTED_UNVERIFIED_BROKER")
+        .env_remove("TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT")
         .with_stdout_contains("nested-unverified-broker-ok")
         .with_stderr_contains("[..]UNVERIFIED: `targo run`[..]");
     if let Some(rustflags) = env::var_os("RUSTFLAGS") {
@@ -1193,14 +1351,11 @@ fn explicit_unverified_targo_propagates_to_nested_cargo_compile_without_rustflag
 
     p.process(&targo)
         .args(&["--unverified", "run", "--", "exit-42"])
-        .env(
-            "RUSTC",
-            env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-        )
+        .env("RUSTC", fixture_rustc())
         .env_remove("TRUST_TARGO_VERIFY")
         .env_remove("TRUST_BOOTSTRAP_NO_VERIFY")
         .env_remove("TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY")
-        .env_remove("TRUST_TARGO_NESTED_UNVERIFIED_BROKER")
+        .env_remove("TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT")
         .with_status(42)
         .with_stderr_contains("[..]UNVERIFIED: `targo run`[..]")
         .with_stderr_does_not_contain("[..]process didn't exit successfully[..]")
@@ -1212,14 +1367,11 @@ fn explicit_unverified_targo_propagates_to_nested_cargo_compile_without_rustflag
         .args(["--unverified", "run", "--", "signal-wait"])
         .current_dir(p.root())
         .env("SIGNAL_TARGET_PID_FILE", &target_pid_file)
-        .env(
-            "RUSTC",
-            env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-        )
+        .env("RUSTC", fixture_rustc())
         .env_remove("TRUST_TARGO_VERIFY")
         .env_remove("TRUST_BOOTSTRAP_NO_VERIFY")
         .env_remove("TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY")
-        .env_remove("TRUST_TARGO_NESTED_UNVERIFIED_BROKER")
+        .env_remove("TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(rustflags) = env::var_os("RUSTFLAGS") {
@@ -1296,7 +1448,7 @@ fn explicit_unverified_targo_propagates_to_nested_cargo_compile_without_rustflag
         );
     }
     assert!(
-        Path::new(&format!("/proc/{target_pid}")).exists(),
+        process_exists(target_pid),
         "forwarded SIGHUP killed a target which inherited nohup-style SIG_IGN"
     );
     assert_eq!(
@@ -1315,9 +1467,19 @@ fn explicit_unverified_targo_propagates_to_nested_cargo_compile_without_rustflag
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        !Path::new(&format!("/proc/{target_pid}")).exists(),
+        !process_exists(target_pid),
         "SIGTERM sent to the Targo pid left target pid {target_pid} orphaned"
     );
+}
+
+/// Whether `pid` names a live (or unreaped) process: `kill(pid, 0)` succeeds,
+/// or fails only for permission.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_exists(pid: u32) -> bool {
+    let pid = libc::pid_t::try_from(pid).unwrap();
+    // SAFETY: signal 0 only checks that `pid` exists.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1366,28 +1528,25 @@ fn forged_targo_fix_proxy_environment_cannot_select_a_compiler() {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[cargo_test]
-fn authenticated_targo_fix_proxy_completes_a_real_fix() {
+fn authenticated_targo_fix_proxy_fixes(project_name: &str, invoke: impl FnOnce(&Path) -> PathBuf) {
     let p = project()
-        .at("targo-authenticated-fix-proxy")
+        .at(project_name)
         .file("Cargo.toml", &basic_manifest("fix-proxy-subject", "1.0.0"))
         .file(
             "src/lib.rs",
             "pub fn answer() -> i32 { let mut value = 42; value }\n",
         )
         .build();
-    let targo = p.root().join(format!("targo{}", env::consts::EXE_SUFFIX));
+    let toolchain = p.root().join("toolchain");
+    fs::create_dir_all(&toolchain).unwrap();
+    let targo = toolchain.join(format!("targo{}", env::consts::EXE_SUFFIX));
     fs::hard_link(cargo_exe(), &targo).unwrap();
 
-    let mut fix = p.process(&targo);
+    let mut fix = p.process(invoke(&targo));
     fix.args(&["--unverified", "fix", "--allow-no-vcs"])
-        // The Cargo test fixture normally substitutes a rustc shim. Exercise
-        // the real proxy/compiler handoff with the same compiler and flags
-        // that built this test binary.
-        .env(
-            "RUSTC",
-            env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-        )
+        // Trust: exercise the real proxy/compiler handoff using the isolated
+        // fixture compiler and this test's unchanged authored flags.
+        .env("RUSTC", fixture_rustc())
         .env_remove("TRUST_TARGO_VERIFY")
         .env_remove("TRUST_BOOTSTRAP_NO_VERIFY")
         .env_remove("TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY")
@@ -1404,6 +1563,27 @@ fn authenticated_targo_fix_proxy_completes_a_real_fix() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cargo_test]
+fn authenticated_targo_fix_proxy_completes_a_real_fix() {
+    authenticated_targo_fix_proxy_fixes("targo-authenticated-fix-proxy", Path::to_path_buf);
+}
+
+/// T13d: a `targo` run through a symlink authenticates the file the link resolves
+/// to, and starts its fix proxy as that file, so the parent and the proxy agree on
+/// one Targo (on macOS the OS reports the link's own path for the parent).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cargo_test]
+fn authenticated_targo_fix_proxy_completes_a_real_fix_through_a_symlink() {
+    authenticated_targo_fix_proxy_fixes("targo-authenticated-fix-proxy-link", |targo| {
+        let links = targo.parent().unwrap().parent().unwrap().join("links");
+        fs::create_dir_all(&links).unwrap();
+        let link = links.join(targo.file_name().unwrap());
+        std::os::unix::fs::symlink(targo, &link).unwrap();
+        link
+    });
+}
+
 #[cargo_test]
 fn snapbox_source_paths_use_the_nested_targo_workspace_root() {
     let source_dir = snapbox::utils::current_dir!();
@@ -1414,6 +1594,34 @@ fn snapbox_source_paths_use_the_nested_targo_workspace_root() {
         source_dir.join("cargo/help/stdout.term.svg").is_file(),
         "the source-relative snapshot root must resolve Targo's tracked fixtures"
     );
+}
+
+/// The package builds exactly one executable, `targo`; the `cargo` this suite
+/// drives is that executable under the compatibility name, as in a sysroot.
+/// Same bytes, two frontends: the OS-reported name alone decides which.
+#[cargo_test]
+fn the_suites_cargo_is_the_compat_entry_point_of_the_built_targo() {
+    let targo = snapbox::cmd::cargo_bin!("targo");
+    let cargo = cargo_exe();
+    assert_eq!(targo.file_stem(), Some(std::ffi::OsStr::new("targo")));
+    assert_eq!(cargo.file_stem(), Some(std::ffi::OsStr::new("cargo")));
+    assert_eq!(
+        fs::read(&cargo).unwrap(),
+        fs::read(targo).unwrap(),
+        "the `cargo` entry point must be the built `targo` executable, not another program"
+    );
+
+    let banner = |program: &Path| {
+        let output = cargo_test_support::process(program)
+            .arg("--version")
+            .exec_with_output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let targo_banner = banner(targo);
+    let cargo_banner = banner(&cargo);
+    assert!(targo_banner.starts_with("targo "), "{targo_banner}");
+    assert!(cargo_banner.starts_with("cargo "), "{cargo_banner}");
 }
 
 #[cargo_test]
@@ -1547,7 +1755,7 @@ fn targo_external_subcommands_prefer_selected_toolchain_sibling() {
     p.process(&targo_exe)
         .arg("priority-probe")
         .env("PATH", env::join_paths(path()).unwrap())
-        .env(cargo::CARGO_ENV, cargo_exe())
+        .env(targo::CARGO_ENV, cargo_exe())
         .with_stdout_data(str![[r#"
 SIBLING
 
@@ -1578,11 +1786,16 @@ fn direct_cargo_compat_frontend_uses_sibling_rustc() {
                         "invoked"
                     ).unwrap();
                     let real = std::env::var_os("REAL_RUSTC").unwrap();
-                    let status = Command::new(real)
-                        .args(std::env::args_os().skip(1))
-                        .status()
-                        .unwrap();
-                    exit(status.code().unwrap_or(1));
+                    let mut command = Command::new(real);
+                    command.args(std::env::args_os().skip(1));
+                    // Trust: replace this transparent proxy to retain the caller's handoff.
+                    #[cfg(unix)] {
+                        use std::os::unix::process::CommandExt;
+                        panic!("failed to exec compiler: {}", command.exec());
+                    }
+                    #[cfg(not(unix))] {
+                        exit(command.status().unwrap().code().unwrap_or(1));
+                    }
                 }
             "#,
         )
@@ -1597,14 +1810,14 @@ fn direct_cargo_compat_frontend_uses_sibling_rustc() {
     fs::hard_link(p.bin("rustc-proxy"), &rustc).unwrap();
 
     let marker = p.root().join("sibling-rustc.marker");
-    let real_rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let real_rustc = fixture_rustc();
     p.process(&cargo)
         .arg("check")
         .env_remove("RUSTC")
         .env_remove("RUSTDOC")
         .env("REAL_RUSTC", real_rustc)
         .env("SIBLING_RUSTC_MARKER", &marker)
-        .env(cargo::CARGO_ENV, cargo_exe())
+        .env(targo::CARGO_ENV, cargo_exe())
         .run();
 
     assert!(marker.is_file(), "sibling rustc was not invoked");
@@ -1677,15 +1890,20 @@ fn targo_honors_canonical_compiler_overrides_then_uses_trust_siblings() {
                         index += 1;
                     }
 
-                    let status = Command::new(Path::new(&real))
-                        .args(forwarded)
+                    let mut command = Command::new(Path::new(&real));
+                    command.args(forwarded)
                         // The proxy has recorded and removed Targo's protocol;
                         // keep the downstream Cargo-test shim on its ordinary
                         // compiler path rather than reactivating Trust policy.
-                        .env_remove("TRUST_TARGO_FRONTEND")
-                        .status()
-                        .unwrap();
-                    exit(status.code().unwrap_or(1));
+                        .env_remove("TRUST_TARGO_FRONTEND");
+                    // Trust: replace this transparent proxy to retain the caller's handoff.
+                    #[cfg(unix)] {
+                        use std::os::unix::process::CommandExt;
+                        panic!("failed to exec compiler: {}", command.exec());
+                    }
+                    #[cfg(not(unix))] {
+                        exit(command.status().unwrap().code().unwrap_or(1));
+                    }
                 }
             "#,
         )
@@ -1749,7 +1967,7 @@ fn targo_honors_canonical_compiler_overrides_then_uses_trust_siblings() {
             .env("REAL_RUSTDOC", &real_rustdoc)
             .env("TARGO_TOOL_SELECTION_MARKER", &marker)
             .env("TARGO_BUILD_SCRIPT_RUSTC_CAPTURE", &build_script_rustc)
-            .env(cargo::CARGO_ENV, cargo_exe());
+            .env(targo::CARGO_ENV, cargo_exe());
         command
     };
     let selections = || fs::read_to_string(&marker).unwrap_or_default();
@@ -1930,11 +2148,16 @@ fn overwrite_cargo_environment_variable() {
                 fn main() {
                     let mut args = std::env::args().skip(1);
                     if let Some(arg1) = args.next() {
-                        let status = std::process::Command::new(arg1)
-                            .args(args)
-                            .status()
-                            .unwrap();
-                        assert!(status.success());
+                        let mut command = std::process::Command::new(arg1);
+                        command.args(args);
+                        // Trust: forwarding this command needs no intervening parent.
+                        #[cfg(unix)] {
+                            use std::os::unix::process::CommandExt;
+                            panic!("failed to exec command: {}", command.exec());
+                        }
+                        #[cfg(not(unix))] {
+                            assert!(command.status().unwrap().success());
+                        }
                     } else {
                         eprintln!("{}", std::env::var("CARGO").unwrap());
                     }
@@ -1996,5 +2219,72 @@ fn overwrite_cargo_environment_variable() {
 
     p.cargo(&format!("run -- {other_cargo} run"))
         .with_stderr_contains(stderr_other_cargo)
+        .run();
+}
+
+// Trust: metadata inherited from a running parent must not make changed
+// package metadata fresh. Both native and Cargo output names are really present.
+#[cargo_test]
+fn native_nested_build_rechecks_changed_package_metadata() {
+    native_nested_metadata_case(
+        r#"concat!(env!("CARGO_PKG_LICENSE_FILE"), ":", env!("TARGO_PKG_LICENSE_FILE"))"#,
+        "after:after",
+    );
+}
+
+#[cargo_test]
+fn native_nested_build_tracks_native_only_package_metadata() {
+    // A Cargo-named compile-time dependency must not cause this rebuild.
+    native_nested_metadata_case(r#"env!("TARGO_PKG_LICENSE_FILE")"#, "after");
+}
+
+fn native_nested_metadata_case(value_expression: &str, expected: &str) {
+    let source = r#"
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("nested") {
+        println!("{}", METADATA_VALUE);
+        return;
+    }
+    assert_eq!(std::env::var("CARGO_PKG_LICENSE_FILE").unwrap(), "before");
+    assert_eq!(std::env::var("TARGO_PKG_LICENSE_FILE").unwrap(), "before");
+    let manifest = std::fs::read_to_string("Cargo.toml").unwrap();
+    std::fs::write("Cargo.toml", manifest.replace("license-file = \"before\"", "license-file = \"after\"")).unwrap();
+    let mut command = std::process::Command::new(std::env::var_os("TEST_TARGO_LAUNCHER").unwrap());
+    command.args(["--unverified", "run", "--", "nested"]);
+    #[cfg(unix)] {
+        use std::os::unix::process::CommandExt;
+        panic!("failed to exec nested targo: {}", command.exec());
+    }
+    #[cfg(not(unix))] {
+        std::process::exit(command.status().unwrap().code().unwrap_or(1));
+    }
+}
+"#
+    .replace("METADATA_VALUE", value_expression);
+    let p = project()
+        .at("native-metadata-freshness")
+        .file(
+            "Cargo.toml",
+            r#"[package]
+name = "native-metadata-freshness"
+version = "0.1.0"
+edition = "2021"
+license-file = "before"
+"#,
+        )
+        .file("src/main.rs", &source)
+        .build();
+    let targo = p.root().join(format!("targo{}", env::consts::EXE_SUFFIX));
+    fs::hard_link(cargo_exe(), &targo).unwrap();
+    p.process(&targo)
+        .args(&["--unverified", "run"])
+        .env("TEST_TARGO_LAUNCHER", &targo)
+        .with_stdout_data(format!("{expected}\n").raw())
+        .run();
+    p.process(&targo)
+        .args(&["--unverified", "run", "-v", "--", "nested"])
+        .env("TEST_TARGO_LAUNCHER", &targo)
+        .with_stdout_data(format!("{expected}\n").raw())
+        .with_stderr_contains("[FRESH] native-metadata-freshness[..]")
         .run();
 }

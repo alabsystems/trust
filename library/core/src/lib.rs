@@ -85,7 +85,7 @@
 // Library features:
 // tidy-alphabetical-start
 #![feature(asm_experimental_arch)]
-#![feature(bstr_internals)]
+#![feature(byte_str_internals)]
 #![feature(cfg_target_has_reliable_f16_f128)]
 #![feature(const_carrying_mul_add)]
 #![feature(const_cmp)]
@@ -104,10 +104,10 @@
 //
 // Language features:
 // tidy-alphabetical-start
-#![feature(abi_unadjusted)]
 #![feature(adt_const_params)]
 #![feature(allow_internal_unsafe)]
 #![feature(allow_internal_unstable)]
+#![feature(arbitrary_self_types_pointers)]
 #![feature(auto_traits)]
 #![feature(cfg_sanitize)]
 #![feature(cfg_target_has_atomic)]
@@ -120,6 +120,7 @@
 #![feature(derive_const)]
 #![feature(diagnostic_on_const)]
 #![feature(diagnostic_on_unmatched_args)]
+#![feature(diagnostic_opaque)]
 #![feature(doc_cfg)]
 #![feature(doc_notable_trait)]
 #![feature(extern_types)]
@@ -127,9 +128,9 @@
 #![feature(f128)]
 #![feature(field_projections)]
 #![feature(final_associated_functions)]
+#![feature(forced_keywords)]
 #![feature(freeze_impls)]
 #![feature(fundamental)]
-#![feature(funnel_shifts)]
 #![feature(impl_restriction)]
 #![feature(intra_doc_pointers)]
 #![feature(intrinsics)]
@@ -143,16 +144,16 @@
 #![feature(multiple_supertrait_upcastable)]
 #![feature(must_not_suspend)]
 #![feature(negative_impls)]
-#![feature(never_type)]
 #![feature(no_core)]
-#![feature(optimize_attribute)]
 #![feature(pattern_types)]
 #![feature(pin_macro_internals)]
 #![feature(prelude_import)]
+#![feature(register_tool)]
 #![feature(repr_simd)]
 #![feature(rustc_attrs)]
 #![feature(rustdoc_internals)]
 #![feature(simd_ffi)]
+#![feature(splat)]
 #![feature(staged_api)]
 #![feature(stmt_expr_attributes)]
 #![feature(strict_provenance_lints)]
@@ -182,6 +183,14 @@
 #![feature(s390x_target_feature)]
 #![feature(wasm_target_feature)]
 #![feature(x86_amx_intrinsics)]
+// tidy-alphabetical-end
+
+// tidy-alphabetical-start
+#![register_tool(lint)]
+// tidy-alphabetical-end
+
+// tidy-alphabetical-start
+#![expect(clippy::partialeq_ne_impl, reason = "we need to implement ne for a lot of core types")]
 // tidy-alphabetical-end
 
 // allow using `core::` in intra-doc links
@@ -224,6 +233,11 @@ pub mod offload;
 #[unstable(feature = "contracts", issue = "128044")]
 pub mod contracts;
 
+#[allow(clippy::useless_attribute)]
+#[expect(
+    ineffective_unstable_reexports,
+    reason = "accepted as stable after accidental stabilization in 1.96, see #154645"
+)]
 #[unstable(feature = "derive_macro_global_path", issue = "154645")]
 pub use crate::macros::builtin::derive;
 #[stable(feature = "cfg_select", since = "1.95.0")]
@@ -235,13 +249,14 @@ mod internal_macros;
 #[path = "num/shells/legacy_int_modules.rs"]
 mod legacy_int_modules;
 #[stable(feature = "rust1", since = "1.0.0")]
-#[allow(clippy::useless_attribute)] // FIXME false positive (https://github.com/rust-lang/rust-clippy/issues/15636)
-#[allow(deprecated_in_future)]
+#[allow(deprecated, clippy::legacy_numeric_constants)]
 pub use legacy_int_modules::{i8, i16, i32, i64, isize, u8, u16, u32, u64, usize};
 #[stable(feature = "i128", since = "1.26.0")]
-#[allow(clippy::useless_attribute)] // FIXME false positive (https://github.com/rust-lang/rust-clippy/issues/15636)
-#[allow(deprecated_in_future)]
+#[allow(deprecated, clippy::legacy_numeric_constants)]
 pub use legacy_int_modules::{i128, u128};
+
+#[macro_use]
+pub mod num;
 
 #[path = "num/f128.rs"]
 pub mod f128;
@@ -251,9 +266,6 @@ pub mod f16;
 pub mod f32;
 #[path = "num/f64.rs"]
 pub mod f64;
-
-#[macro_use]
-pub mod num;
 
 /* Core modules for ownership management */
 
@@ -288,8 +300,8 @@ pub mod ascii;
 pub mod asserting;
 #[unstable(feature = "async_iterator", issue = "79024")]
 pub mod async_iter;
-#[unstable(feature = "bstr", issue = "134915")]
-pub mod bstr;
+#[unstable(feature = "byte_str", issue = "134915")]
+pub mod byte_str;
 pub mod cell;
 pub mod char;
 pub mod ffi;
@@ -338,7 +350,6 @@ mod bool;
 mod escape;
 mod tuple;
 mod unit;
-#[cfg_attr(feature = "nightly", not(bootstrap))]
 #[unstable(feature = "view_type_macro", issue = "155938")]
 pub mod view;
 
@@ -359,8 +370,9 @@ pub mod primitive;
     unused_imports,
     unsafe_op_in_unsafe_fn,
     ambiguous_glob_reexports,
-    deprecated_in_future,
-    unreachable_pub
+    unreachable_pub,
+    // FIXME: stdach is a submodule so clippy lints should be fixed (and ideally enforced) there
+    clippy::all,
 )]
 #[allow(rustdoc::bare_urls)]
 mod core_arch;

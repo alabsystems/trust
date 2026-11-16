@@ -30,6 +30,7 @@ fn make_func(name: &str, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> Ver
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

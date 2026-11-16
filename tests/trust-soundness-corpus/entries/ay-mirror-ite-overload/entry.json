@@ -1,0 +1,31 @@
+{
+  "id": "ay-mirror-ite-overload",
+  "class": "ay consumer mirror (db768acbd), ite_overload_int",
+  "title": "a problem's own `ite` function was read as the Core connective and folded",
+  "origin": [
+    "ay db768acbd (consumer-certificate mirror), crates/.../mirror_controls/overload.rs ite_overload_int"
+  ],
+  "lang": "smt",
+  "source": "repro.json",
+  "reproducer": {
+    "cert": "repro.json",
+    "claim": "the problem is unsatisfiable (the certificate refutes it)"
+  },
+  "twin": {
+    "cert": "twin.json",
+    "claim": "unsatisfiable, with a correct refutation, and it contains the reproducer's construct: the problem declares its own `ite`, as the reproducer does, and asserts an equation over it and its negation; the refutation is resolution on those two premises"
+  },
+  "witness": {
+    "solver": "ay",
+    "expect": "sat",
+    "input": "the reproducer's problem script, with (get-model) after every check-sat",
+    "observed": "sat at every check, with a model under which an independent evaluator (smt_model_check in the runner) finds every assertion and assumption in scope true"
+  },
+  "construct": "(declare-fun ite ",
+  "no_control": "Clean main refuses any problem that declares `ite` ('ite' is a built-in operator and cannot be declared or defined), the twin included; clean-external is the only verifier of an SMT entry",
+  "expect": {
+    "clean-external": {
+      "twin": "not-in-fragment"
+    }
+  }
+}

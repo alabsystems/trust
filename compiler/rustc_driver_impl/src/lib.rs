@@ -9,9 +9,18 @@
 #![feature(file_buffered)]
 #![feature(panic_backtrace_config)]
 #![feature(panic_update_hook)]
-#![feature(trim_prefix_suffix)]
 #![feature(try_blocks)]
 // tidy-alphabetical-end
+
+// Trust: capture inherited scheduler custody at generated native unit-test entry.
+#![cfg_attr(
+    all(test, any(target_os = "linux", target_os = "macos")),
+    feature(test, custom_test_frameworks, exitcode_exit_method)
+)]
+#![cfg_attr(
+    all(test, any(target_os = "linux", target_os = "macos")),
+    test_runner(crate::tests::native_test_main)
+)]
 
 use std::cmp::max;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,20 +37,25 @@ use std::time::Instant;
 use std::{env, str};
 
 use rustc_ast as ast;
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_attr_ir::{Attribute, AttributeKind};
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_codegen_ssa::{CodegenError, CompiledModules};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[doc(hidden)]
+pub use rustc_data_structures::jobserver::{
+    BOOTSTRAP_FIXED_COMPILER_PROTOCOL_MARKER, WORKLOAD_MEMBER_PROTOCOL_MARKER,
+};
 use rustc_data_structures::profiling::{
     TimePassesFormat, get_resident_set_size, print_time_passes_entry,
 };
 pub use rustc_errors::catch_fatal_errors;
 use rustc_errors::emitter::stderr_destination;
-use rustc_errors::{ColorConfig, DiagCtxt, ErrCode, PResult, markdown};
+use rustc_errors::{ColorConfig, DiagCtxt, DiagCtxtHandle, ErrCode, PResult, markdown};
 use rustc_feature::find_gated_cfg;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::lang_items::LangItem;
-use rustc_hir::{self, Attribute};
+use rustc_hir::{self};
 // This avoids a false positive with `-Wunused_crate_dependencies`.
 // `rust_index` isn't used in this crate's code, but it must be named in the
 // `Cargo.toml` for the `rustc_randomized_layouts` feature.
@@ -50,6 +64,7 @@ use rustc_interface::passes::collect_crate_types;
 use rustc_interface::util::{self, get_codegen_backend};
 use rustc_interface::{Linker, create_and_enter_global_ctxt, interface, passes};
 use rustc_lint::unerased_lint_store;
+use rustc_lint_defs::{Lint, LintId};
 use rustc_metadata::creader::MetadataLoader;
 use rustc_metadata::locator;
 use rustc_middle::hir::nested_filter::OnlyBodies;
@@ -60,15 +75,15 @@ use rustc_middle::ty::TyCtxt;
 use rustc_parse::lexer::StripTokens;
 use rustc_parse::{new_parser_from_file, new_parser_from_source_str, unwrap_or_emit_fatal};
 use rustc_session::config::{
-    CG_OPTIONS, CrateType, ErrorOutputType, Input, OptionDesc, OutFileName, OutputType, Sysroot,
+    CG_OPTIONS, ErrorOutputType, Input, OptionDesc, OutFileName, OutputType, Sysroot,
     UnstableOptions, Z_OPTIONS, nightly_options, parse_target_triple,
 };
 use rustc_session::getopts::{self, Matches};
-use rustc_session::lint::{Lint, LintId};
 use rustc_session::output::invalid_output_for_target;
 use rustc_session::{EarlyDiagCtxt, Session, config};
 use rustc_span::def_id::{CrateNum, DefId, DefIndex, LOCAL_CRATE};
 use rustc_span::{DUMMY_SP, FileName};
+use rustc_structures::{CrateType, LintName};
 use rustc_target::json::ToJson;
 use rustc_target::spec::{Target, TargetTuple};
 use tracing::trace;
@@ -91,12 +106,14 @@ macro do_not_use_safe_print($($t:tt)*) {
 #[allow(unused_imports)]
 use {do_not_use_print as print, do_not_use_print as println};
 
+mod allocator;
 pub mod args;
+mod native_v3_early;
 pub mod pretty;
 #[macro_use]
 mod print;
+mod diagnostics;
 pub mod highlighter;
-mod session_diagnostics;
 
 // Keep the OS parts of this `cfg` in sync with the `cfg` on the `libc`
 // dependency in `compiler/rustc_driver/Cargo.toml`, to keep
@@ -111,8 +128,8 @@ mod signal_handler {
     pub(super) fn install() {}
 }
 
-use crate::session_diagnostics::{
-    CantEmitMir, RLinkEmptyVersionNumber, RLinkEncodingVersionMismatch, RLinkRustcVersionMismatch,
+use crate::diagnostics::{
+    CantEmitMIR, RLinkEmptyVersionNumber, RLinkEncodingVersionMismatch, RLinkRustcVersionMismatch,
     RLinkWrongFileType, RlinkCorruptFile, RlinkNotAFile, RlinkUnableToRead, UnstableFeatureUsage,
 };
 
@@ -320,17 +337,22 @@ fn canonicalize_trust_options(opts: &mut config::Options) {
     // hashes for one compilation; the same collapse applies to the two off
     // spellings in the `-Ztrust-verify=off` lane. Nothing downstream should ever
     // observe an unresolved request.
-    // A `strict` request must survive canonicalization. Resolving "does the frontend run" and
-    // stamping `On` would silently drop "and fail closed on a body it cannot lower" — the
-    // resolved answer has to carry both halves, not just the one this predicate asks about.
-    let resolved_ir_lower =
-        if opts.unstable_opts.trust_ir_lower == Some(config::TrustIrLower::Strict) {
-            config::TrustIrLower::Strict
-        } else if trust_ir_lower_is_active(opts) {
-            config::TrustIrLower::On
-        } else {
-            config::TrustIrLower::Off
-        };
+    // A `strict` request must survive canonicalization UNDER VERIFICATION. Resolving "does the
+    // frontend run" and stamping `On` would silently drop "and fail closed on a body it cannot
+    // lower" — the resolved answer has to carry both halves. Under `-Ztrust-verify=off` there is
+    // no second half to carry: strictness is a verification-quality property, so the request
+    // collapses to `On`, and `(Off, Strict)` shares one tracked identity with `(Off, On)`. The
+    // stamp asks the same predicate every error site asks, so hash and behaviour cannot disagree.
+    let resolved_ir_lower = if rustc_session::trust_ir_lower_strict_by_flags(
+        opts.unstable_opts.trust_verify,
+        opts.unstable_opts.trust_ir_lower,
+    ) {
+        config::TrustIrLower::Strict
+    } else if trust_ir_lower_is_active(opts) {
+        config::TrustIrLower::On
+    } else {
+        config::TrustIrLower::Off
+    };
     opts.unstable_opts.trust_ir_lower = Some(resolved_ir_lower);
 
     if trust_strict_policy_is_active(opts) {
@@ -352,6 +374,22 @@ fn canonicalize_trust_options(opts: &mut config::Options) {
         opts.cg.debug_assertions = Some(true);
         opts.debug_assertions = true;
     }
+}
+
+/// Trust (T6): the MIR-pipeline option a Trust proof session refuses, if any is
+/// set (`rustc_session::trust_mir_pipeline_option_refusal`, the one list).
+/// Outside a proof session (the vanilla lane) every one is upstream's.
+#[allow(rustc::bad_opt_access)]
+fn trust_proof_session_mir_option_error(
+    unstable: &config::UnstableOptions,
+) -> Option<&'static str> {
+    if !rustc_session::trust_proof_session_by_flags(
+        unstable.trust_verify,
+        unstable.trust_verify_session.is_some(),
+    ) {
+        return None;
+    }
+    rustc_session::trust_mir_pipeline_option_refusal(unstable)
 }
 
 #[allow(rustc::bad_opt_access)]
@@ -414,6 +452,18 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
             "-Ztrust-verify-session requests authenticated verification coverage and cannot be combined with a compiler early-exit mode (--print/help/list/unpretty, dep-info-only, -Zno-analysis, -Zparse-crate-root-only, or -Ztrust-dump=mir-only:<dir>)",
         );
     }
+    // Trust (T6, 2026-10-09): every unit of a Trust proof session — a verifying
+    // one, or a verification-off dependency carrying `-Ztrust-verify-session`,
+    // whose encoded MIR a verified dependent re-derives — runs the `-O0` MIR
+    // pipeline at every `-Copt-level` (`trust_default_mir_opt_level_by_flags`).
+    // An option that changes which MIR passes run would make the verified MIR,
+    // and so the verdicts, depend on the caller's flags, and the MIR inliner is
+    // the one route by which another function's body enters a verified one. So
+    // each is refused here, by name, whatever channel it arrived through
+    // (command line, RUSTFLAGS, Cargo configuration): there is no opt-out.
+    if let Some(error) = trust_proof_session_mir_option_error(unstable) {
+        return Some(error);
+    }
     if !matches!(unstable.trust_cg_output_gate.as_str(), "allow-unknown" | "strict" | "off") {
         return Some("invalid callback-injected -Ztrust-cg-output-gate value");
     }
@@ -424,6 +474,90 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
     // caller error it is.
     if !matches!(unstable.trust_cg_frontend.as_str(), "mir" | "trust-ir") {
         return Some("invalid callback-injected -Ztrust-cg-frontend value");
+    }
+    // Trust (step 2 increment 5, sub-step 5.4.2): F1's consumer, the same closed domain as
+    // its option parser.
+    if !matches!(unstable.trust_cg_f1_backend.as_str(), "lir" | "compiler") {
+        return Some("invalid callback-injected -Ztrust-cg-f1-backend value");
+    }
+    // Trust: the D17 instance seam is explicitly a diagnostic/test-oracle lane.
+    // Ordinary source admission neither retains nor reads a MIR sibling.
+    if unstable.trust_ir_instance_seam_test {
+        // The frontend option alone does not select F1. Require the explicit backend identity
+        // (authenticated again by rustc_interface after construction) and actual object/link
+        // output. MIR/metadata/dep-info-only and early-exit requests run no instance assembly.
+        if !matches!(unstable.codegen_backend.as_deref(), Some("trust-cg" | "trust_cg"))
+            || !opts
+                .output_types
+                .keys()
+                .any(|kind| matches!(kind, OutputType::Object | OutputType::Exe))
+            || unstable.no_codegen
+            || unstable.no_analysis
+            || unstable.parse_crate_root_only
+            || opts.pretty.is_some()
+            || opts.describe_lints
+            || !opts.prints.is_empty()
+            || !unstable.ls.is_empty()
+        {
+            return Some(
+                "-Ztrust-ir-instance-seam-test requires explicit \
+                         -Zcodegen-backend=trust-cg and object or link output with codegen enabled",
+            );
+        }
+        if unstable.trust_verify.is_on()
+            || !trust_ir_lower_is_requested(opts)
+            || unstable.trust_cg_frontend != "trust-ir"
+        {
+            return Some(
+                "-Ztrust-ir-instance-seam-test requires -Ztrust-verify=off \
+                         -Ztrust-ir-lower -Ztrust-cg-frontend=trust-ir",
+            );
+        }
+        if unstable.trust_dump.paths().next().is_some() {
+            return Some(
+                "-Ztrust-ir-instance-seam-test cannot be combined with any \
+                         -Ztrust-dump artifact sink",
+            );
+        }
+    }
+    if let Some(mutation) = unstable.trust_test_instance_seam_mutation.as_deref() {
+        if !unstable.trust_ir_instance_seam_test {
+            return Some(
+                "-Ztrust-test-instance-seam-mutation requires \
+                         -Ztrust-ir-instance-seam-test",
+            );
+        }
+        if !matches!(mutation, "bool-constant" | "undef-constant") {
+            return Some(
+                "invalid -Ztrust-test-instance-seam-mutation: expected \
+                         bool-constant or undef-constant",
+            );
+        }
+    }
+    // Trust (PKG-C2d2 slice 1): the template-instance TEST-ORACLE rides on the D17 seam-test
+    // lane, whose fence above already requires trust-cg with object or link output, verification
+    // off, lowering, the trust-ir frontend and no dump sink; it also needs the template producer.
+    if unstable.trust_ir_template_instance_oracle
+        && (!unstable.trust_ir_instance_seam_test || !unstable.trust_ir_lower_templates)
+    {
+        return Some(
+            "-Ztrust-ir-template-instance-oracle requires -Ztrust-ir-instance-seam-test \
+                     and -Ztrust-ir-lower-templates",
+        );
+    }
+    if let Some(mutation) = unstable.trust_test_template_oracle_mutation.as_deref() {
+        if !unstable.trust_ir_template_instance_oracle {
+            return Some(
+                "-Ztrust-test-template-oracle-mutation requires \
+                         -Ztrust-ir-template-instance-oracle",
+            );
+        }
+        if !matches!(mutation, "int-constant" | "envelope-byte") {
+            return Some(
+                "invalid -Ztrust-test-template-oracle-mutation: expected \
+                         int-constant or envelope-byte",
+            );
+        }
     }
     // Trust (wall A, instance-flip probe): a MEASUREMENT-ONLY control, same lane
     // discipline as -Ztrust-sat-perturb — never in an evidence policy, and never in
@@ -441,6 +575,33 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
             return Some(
                 "-Ztrust-instance-flip-probe re-runs the frozen differential per instance \
                  and cannot be combined with any -Ztrust-dump artifact sink",
+            );
+        }
+    }
+    // Trust (F3 landing, 2026-09-30): the derived-MIR storage rule's mutation control. It is
+    // TEST-ONLY and repoints an assert-message operand in the derived body the frozen
+    // differential compares, so it is held to the burn-in lane like -Ztrust-sat-perturb (never
+    // inside an evidence policy), kept off every artifact sink like -Ztrust-instance-flip-probe
+    // (a report written from a mutated differential must never exist to be mistaken for a real
+    // one), and refused with the flip on, where `to_mir` ignores it (an inert control must not
+    // look like a measurement).
+    if unstable.trust_test_mutate_derived_assert_msg {
+        if unstable.trust_verify.is_on() || !trust_ir_lower_is_requested(opts) {
+            return Some(
+                "-Ztrust-test-mutate-derived-assert-msg is a test-only control and requires \
+                 -Ztrust-verify=off -Ztrust-ir-lower",
+            );
+        }
+        if unstable.trust_ir_flip {
+            return Some(
+                "-Ztrust-test-mutate-derived-assert-msg is inert while the Trust-IR flip is on \
+                 and requires -Ztrust-ir-flip=no",
+            );
+        }
+        if unstable.trust_dump.paths().next().is_some() {
+            return Some(
+                "-Ztrust-test-mutate-derived-assert-msg mutates the derived MIR the differential \
+                 compares and cannot be combined with any -Ztrust-dump artifact sink",
             );
         }
     }
@@ -540,8 +701,40 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
     if unstable.trust_verify_level > 2 {
         return Some("invalid callback-injected -Ztrust-verify-level value");
     }
+    // Trust (2026-10-03, docs/DECISION_QUEUE.md "L0-CERTIFY"): certify is the
+    // claim of full static discharge; level 0 is a triage level whose filter drops
+    // every `L1Functional` obligation, the D9 termination charge among them. Certify
+    // at level 0 built `pub fn spin() { spin() }` exit 0, and a `flip(true)` binary
+    // that overflowed its stack (MEASURED on stage 1 of `782780ea0d`). Refused here,
+    // before any session exists, rather than silently lifted, so no report names a
+    // level its certify verdict was not judged at. targo reaches it through
+    // `[trust] level = "L0"` with `--certify`, and meets this error at each unit.
+    if rustc_session::trust_verification_enabled_by_flags(unstable.trust_verify)
+        && unstable.trust_policy.requires_full_discharge()
+        && unstable.trust_verify_level == 0
+    {
+        return Some(
+            "-Ztrust-policy=certify requires -Ztrust-verify-level=1 or 2: level 0 is a triage \
+             level that drops the Level 1 obligations a certify verdict claims, termination of \
+             unmeasured recursion among them (targo: `[trust] level = \"L1\"` or `\"L2\"`)",
+        );
+    }
     if unstable.trust_verify_timeout_ms == 0 {
         return Some("invalid callback-injected -Ztrust-verify-timeout-ms value: must be positive");
+    }
+    // Trust (determinism plan §3.2a): the effort scale's domain is the option
+    // parser's (`parse_trust_verify_effort`): 1 through the count's ceiling,
+    // `EffortScale::CEILING`.
+    if !(1..=100_000).contains(&unstable.trust_verify_effort) {
+        return Some(
+            "invalid callback-injected -Ztrust-verify-effort value: must be from 1 through 100000",
+        );
+    }
+    // Trust (determinism plan §3.2): the step budget has no off switch.
+    if unstable.trust_verify_function_budget_steps == 0 {
+        return Some(
+            "invalid callback-injected -Ztrust-verify-function-budget-steps value: must be positive",
+        );
     }
     if unstable.trust_verify_worker_threads > 256 {
         return Some(
@@ -577,11 +770,63 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
     }
     let has_package = unstable.trust_verify_package_name.is_some();
     let has_session = unstable.trust_verify_session.is_some();
+    // Trust: callback mutation must obey the same closed, all-or-none launch contract.
+    let admission = [
+        unstable.trust_admission_run_digest.as_deref(),
+        unstable.trust_admission_unit_digest.as_deref(),
+        unstable.trust_admission_semantics_digest.as_deref(),
+    ];
+    let admission_present = admission.iter().any(|v| v.is_some())
+        || unstable.trust_admission_unit_role.is_some()
+        || unstable.trust_admission_compile_target.is_some();
+    if admission_present {
+        if !has_session
+            || !has_package
+            || unstable.trust_verify_crate_role == "unscoped"
+            || admission.iter().any(|v| {
+                v.is_none_or(|v| {
+                    v.len() != 64
+                        || !v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+            })
+            || !matches!(
+                unstable.trust_admission_unit_role.as_deref(),
+                Some("primary" | "test-execution" | "dependency")
+            )
+            || unstable
+                .trust_admission_compile_target
+                .as_deref()
+                .is_none_or(|value| value.is_empty() || value.len() > 4096)
+        {
+            return Some("invalid or partial Cargo-owned native admission context");
+        }
+    }
     if unstable.trust_targo_test_monitor && !has_session {
         return Some("-Ztrust-targo-test-monitor requires -Ztrust-verify-session");
     }
     if has_package && !has_session {
         return Some("-Ztrust-verify-package-name requires -Ztrust-verify-session");
+    }
+    // Trust (PM-1): the crate-loader proc-macro boundary is Targo's per-unit control;
+    // it means nothing without the session it binds, and an audited path means
+    // nothing without the boundary that reads it.
+    if unstable.trust_proc_macro_boundary && !has_session {
+        return Some("-Ztrust-proc-macro-boundary requires -Ztrust-verify-session");
+    }
+    if !unstable.trust_audited_proc_macro.is_empty() && !unstable.trust_proc_macro_boundary {
+        return Some("-Ztrust-audited-proc-macro requires -Ztrust-proc-macro-boundary");
+    }
+    if unstable.trust_audited_proc_macro.iter().any(|path| path.is_empty()) {
+        return Some("-Ztrust-audited-proc-macro requires a non-empty dylib path");
+    }
+    // Trust (D21): isolation is containment the host must supply. A host without
+    // the sandbox refuses the option; it never expands in process instead, so a
+    // lane that admits only isolated expansion keeps refusing proc macros there.
+    if let Some(refusal) = rustc_session::trust_proc_macro_isolation_refusal_by_flags(
+        unstable.trust_proc_macro_isolation,
+        rustc_session::TRUST_PROC_MACRO_ISOLATION_HOST,
+    ) {
+        return Some(refusal);
     }
     if unstable.trust_verify_crate_role != "unscoped" && !has_package {
         return Some(
@@ -589,12 +834,7 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
              -Ztrust-verify-package-name and -Ztrust-verify-session",
         );
     }
-    for path in
-        [unstable.trust_verify_ay_path.as_ref(), unstable.trust_proof_artifact_root.as_ref()]
-            .into_iter()
-            .flatten()
-            .chain(unstable.trust_dump.paths())
-    {
+    for path in unstable.trust_proof_artifact_root.iter().chain(unstable.trust_dump.paths()) {
         if path.as_os_str().is_empty() || path.to_str().is_some_and(|value| value.trim().is_empty())
         {
             return Some("invalid callback-injected Trust path option: must be non-empty");
@@ -682,6 +922,19 @@ fn raw_post_typed_options_early_exit(matches: &getopts::Matches) -> Option<&'sta
     } else {
         None
     }
+}
+
+// Trust: private producing routing must reach actual native compiler adoption;
+// version/help/pager/backend modes cannot succeed before that owner exists.
+fn private_fixed_pre_session_exit(
+    matches: &getopts::Matches,
+    args: &[String],
+) -> Option<&'static str> {
+    if !matches.opt_present("resource-bootstrap-fixed-v1") {
+        return None;
+    }
+    raw_pre_typed_options_early_exit(matches, args)
+        .or_else(|| raw_post_typed_options_early_exit(matches))
 }
 
 fn raw_pre_session_early_exit(matches: &getopts::Matches, args: &[String]) -> Option<&'static str> {
@@ -911,12 +1164,29 @@ fn authenticated_pre_analysis_exit_message(session: Option<&str>, mode: &str) ->
     })
 }
 
+/// Trust: the diagnostic lane a requested-but-not-run seam test names in its fatal.
+#[allow(rustc::bad_opt_access)]
+fn trust_seam_test_lane(sess: &Session) -> &'static str {
+    if sess.opts.unstable_opts.trust_ir_template_instance_oracle {
+        "-Ztrust-ir-instance-seam-test and -Ztrust-ir-template-instance-oracle require"
+    } else {
+        "-Ztrust-ir-instance-seam-test requires"
+    }
+}
+
 #[allow(rustc::bad_opt_access)]
 fn reject_successful_authenticated_pre_analysis_exit(sess: &Session, mode: &str) {
     // Preserve the original diagnostic for a genuinely failing compile. The
     // Trust-specific fatal applies only to what would otherwise be a successful
     // pre-analysis return with no authenticated coverage.
     sess.dcx().abort_if_errors();
+    // Trust: a callback cannot turn the requested diagnostic oracle into a successful no-run.
+    if sess.opts.unstable_opts.trust_ir_instance_seam_test {
+        // Trust (PKG-C2d2 slice 1): the template-instance TEST-ORACLE rides on this lane.
+        let lane = trust_seam_test_lane(sess);
+        sess.dcx()
+            .fatal(format!("{lane} codegen, but {mode} stopped the compiler before analysis"));
+    }
     if let Some(message) = authenticated_pre_analysis_exit_message(
         sess.opts.unstable_opts.trust_verify_session.as_deref(),
         mode,
@@ -1006,11 +1276,14 @@ fn reject_targo_certified_monitor_local_startup_surface(tcx: TyCtxt<'_>) {
         ));
     }
 
-    if tcx
-        .hir_crate_items(())
-        .definitions()
-        .any(|def_id| tcx.def_kind(def_id) == DefKind::GlobalAsm)
-    {
+    // Trust: CB3 (2026-09-28) — a `clean { … }` island shares `DefKind::GlobalAsm`
+    // (`rustc_resolve::def_collector`) but lowers NO machine code: the mono
+    // collector never roots it, so it cannot add startup code. Keying on the def
+    // kind alone refused every island crate in every `targo trust test` lane.
+    // Only a def that is not an island is the global assembly this rule exists for.
+    if tcx.hir_crate_items(()).definitions().any(|def_id| {
+        tcx.def_kind(def_id) == DefKind::GlobalAsm && !tcx.trust_def_is_clean_island(def_id)
+    }) {
         tcx.dcx().fatal(
             "evidence-grade certified-monitor tests reject unauthenticated global assembly; global_asm! can add startup code outside function MIR",
         );
@@ -1151,7 +1424,12 @@ fn reject_targo_certified_monitor_dependency_symbol_controls(tcx: TyCtxt<'_>) {
         for index in 0..tcx.num_extern_def_ids(cnum) {
             let def_id = DefId { krate: cnum, index: DefIndex::from_usize(index) };
             let def_kind = tcx.def_kind(def_id);
-            if def_kind == DefKind::GlobalAsm {
+            // Trust: CB3 (2026-09-28) — admit a `clean { … }` island (it shares
+            // `DefKind::GlobalAsm` but emitted no code in its crate) by the
+            // dependency's per-def rmeta marker, never by crate: a real
+            // `global_asm!` beside an island in the same crate is still refused.
+            // A missing marker row reads as real assembly (fail closed).
+            if def_kind == DefKind::GlobalAsm && !tcx.trust_def_is_clean_island(def_id) {
                 tcx.dcx().fatal(format!(
                     "evidence-grade certified-monitor tests reject unauthenticated global assembly in dependency crate `{}`",
                     tcx.crate_name(cnum),
@@ -1350,18 +1628,21 @@ impl FrontendTrustPolicy {
 /// typed policy that cannot lower TrustIR or publish Trust evidence.
 ///
 /// This entry point is for Tippy-like lint frontends whose callbacks change
-/// proof-relevant semantics. Every authority-bearing `-Ztrust-*` control and
-/// every compiler-managed dynamic LLVM loading route is rejected. The sole
-/// accepted Trust selection is the exact semantic option/value
-/// `trust-verify=off` (including getopts-equivalent joined, split, and
-/// dash/underscore spellings): it redundantly selects the same evidence-inert
-/// policy and is needed when a build coordinator stamps all Rust units
-/// uniformly. The typed `trust_verify` switch is then forced off and
-/// `trust_ir_lower` forced off before callbacks or artifact target acquisition.
-/// The callback authority snapshot prevents either field or any evidence
-/// output from being re-enabled later. The argument vector itself is not
-/// rewritten, so getopts retains exact response-file, option-value, and `--`
-/// ownership semantics.
+/// proof-relevant semantics. Trust options are judged on the EFFECTIVE
+/// (last-wins, fully parsed) configuration (`frontend_forbidden_option`): an
+/// effective explicit `-Ztrust-verify=on` and every evidence control held away
+/// from its default are rejected, as is every compiler-managed dynamic LLVM
+/// loading route; `-Ztrust-verify=off`, `-Ztrust-ir-lower` and every
+/// verification-posture selector are accepted, because this route runs neither
+/// verification nor lowering, and are neutralized: the typed `trust_verify`
+/// switch and `trust_ir_lower` are forced off and every selector is reset to
+/// its default (`TrustFrontendAuthoritySnapshot::deauthorize`) before callbacks
+/// or artifact target acquisition. This is what lets a build coordinator stamp
+/// a project's committed posture on every Rust unit uniformly and append the
+/// off-switch for this pass. The callback authority snapshot prevents any of
+/// those fields or any evidence output from being re-enabled later. The
+/// argument vector itself is not rewritten, so getopts retains exact
+/// response-file, option-value, and `--` ownership semantics.
 ///
 /// Compiler-owned entry points are process-tracked: this route fails closed if
 /// an earlier compiler invocation could have initialized backend state and
@@ -1402,6 +1683,12 @@ fn trust_verify_override_requested(
 fn apply_trust_verify_override(opts: &mut config::Options, requested: bool) {
     if requested {
         opts.unstable_opts.trust_verify = config::TrustVerify::Off;
+        // No caller-selected policy survives into a run that makes no proof claim. A
+        // deauthorized frontend goes further and neutralizes every verification
+        // selector (`TrustFrontendAuthoritySnapshot::deauthorize`, applied right after
+        // this by `run_compiler_with_argfile_mode`); this reset remains for the
+        // canonical compiler's inherited `TRUST_NO_VERIFY=1` transport.
+        opts.unstable_opts.trust_policy = config::TrustPolicy::default();
     }
 }
 
@@ -1409,7 +1696,50 @@ fn raw_trust_option_name(option: &str) -> String {
     option.split_once('=').map_or(option, |(name, _)| name).replace('-', "_")
 }
 
+/// The Trust controls an evidence-deauthorized frontend refuses, decided on the
+/// EFFECTIVE configuration its argv selects — never on individual occurrences.
+///
+/// These frontends (Tippy's `NoTrustEvidence` route and the embedded
+/// `EmbeddedNoOfficialEvidence` route rustdoc, Miri and `rustc_driver::run_compiler`
+/// callers take) produce NO verification evidence, so the rule they enforce is that
+/// no evidence is claimed and no verified artifact is produced. The option table's
+/// own setters (the ones `build_session_options` runs later) resolve the `-Z` list's
+/// Trust controls to their last-wins values first, and the decision is taken on
+/// those:
+///
+/// * `-Ztrust-verify` — the sole activation control — is refused when it is
+///   EXPLICITLY and EFFECTIVELY `on`: a caller demanding verification from a frontend
+///   that cannot verify must fail loudly, not receive an unverified compile that
+///   reads green. Any explicit spelling whose last value is `off` is accepted, so
+///   `-Ztrust-verify=on … -Ztrust-verify=off` (a committed posture followed by the
+///   off-switch Targo appends for these passes) is the plain `off` it resolves to.
+///   With no explicit spelling the declared default is overridden by construction,
+///   exactly as before. Deauthorization forces the field off either way.
+/// * Every `EvidenceControl` (artifact sinks, session identity, codegen-backend and
+///   runtime-monitor controls, adversarial/measurement controls, the witness lane)
+///   is refused when its effective value is not its declared default: its effect
+///   either does not depend on verification or lowering running, or is an
+///   observable outcome a dropped adversarial/measurement control would fake
+///   (`TrustAuthorityClass::EvidenceControl`), so this frontend could neither honour
+///   it nor drop it silently.
+/// * `-Ztrust-ir-lower` and every `VerificationSelector` (policy, proof level,
+///   profile, dependency scope, budgets, output format, solver path, proof root,
+///   flip switches) is ACCEPTED at any valid value and neutralized by
+///   `TrustFrontendAuthoritySnapshot::deauthorize` — see
+///   `TrustAuthorityClass::VerificationSelector` for why each is inert here.
+///
+/// `NoTrustEvidence` additionally keeps its backend-loading refusals
+/// (`-Zcodegen-backend`, `-Zllvm-plugins`, `-Zautodiff*`, `-Cllvm-args`): those change
+/// the code this frontend itself would emit.
+///
+/// A classified Trust option whose value the option table cannot parse is refused by
+/// that parser (the same fatal `build_session_options` would raise), before any
+/// authority is decided: a frontend cannot establish the effective configuration of
+/// an unparseable one. No other option is parsed here
+/// (`UnstableOptions::build_trust_authority_controls`), so `-Zhelp` and every other
+/// early mode keep their upstream behaviour.
 fn frontend_forbidden_option(
+    early_dcx: &EarlyDiagCtxt,
     frontend_policy: FrontendTrustPolicy,
     matches: &getopts::Matches,
 ) -> Option<String> {
@@ -1417,24 +1747,39 @@ fn frontend_forbidden_option(
         return None;
     }
 
-    let forbidden_z = matches.opt_strs("Z").into_iter().find_map(|option| {
-        let name = raw_trust_option_name(&option);
-        // Both typed deauthorization routes force this value to Off below.
-        // Accepting the caller's identical semantic value is monotonic and
-        // lets a coordinator stamp dependency and workspace units
-        // uniformly. The exact-value check deliberately excludes a bare
-        // selector, malformed values, and every enabling value.
-        let redundant_deauthorization = name == "trust_verify"
-            && option.split_once('=').is_some_and(|(_, value)| value == "off");
-        (name.starts_with("trust_") && !redundant_deauthorization
-            || frontend_policy.requires_evidence_inert_backend()
-                && matches!(
-                    name.as_str(),
-                    "autodiff" | "autodiff_post_passes" | "codegen_backend" | "llvm_plugins"
-                ))
-        .then_some(name)
-    });
-    if let Some(name) = forbidden_z {
+    // The option table's own setters resolve every classified Trust control the argv
+    // spells to its last-wins value; nothing else is parsed here (the full parse still
+    // runs once, for the compilation). The bootstrap-only `-Zno-trust-verify` alias is
+    // resolved by that parser too, onto `trust_verify` with its inverted meaning.
+    let (effective, spelled) =
+        config::UnstableOptions::build_trust_authority_controls(early_dcx, matches);
+    // The typed value cannot tell an explicit `=on` from the declared default, so
+    // explicitness is whether the parser met the field at all; the VALUE is its
+    // last-wins answer.
+    if spelled.contains(&"trust_verify") && effective.trust_verify.is_on() {
+        return Some("-Ztrust-verify".to_string());
+    }
+    // The same generated rule the typed boundary applies
+    // (`TrustFrontendAuthoritySnapshot::first_nondefault_evidence_control`).
+    if let Some(option) = effective.first_nondefault_trust_evidence_control() {
+        return Some(option);
+    }
+
+    // Tippy's backend-loading refusals. Each of these options only ACCUMULATES
+    // (`Some(backend)`, list pushes), so one occurrence already is its effective value.
+    let z_names = matches
+        .opt_strs("Z")
+        .iter()
+        .map(|option| raw_trust_option_name(option))
+        .collect::<Vec<_>>();
+    if frontend_policy.requires_evidence_inert_backend()
+        && let Some(name) = z_names.iter().find(|name| {
+            matches!(
+                name.as_str(),
+                "autodiff" | "autodiff_post_passes" | "codegen_backend" | "llvm_plugins"
+            )
+        })
+    {
         return Some(format!("-Z{}", name.replace('_', "-")));
     }
 
@@ -1454,7 +1799,7 @@ fn validate_frontend_pre_backend_authority(
     matches: &getopts::Matches,
     frontend_policy: FrontendTrustPolicy,
 ) {
-    if let Some(option) = frontend_forbidden_option(frontend_policy, matches) {
+    if let Some(option) = frontend_forbidden_option(early_dcx, frontend_policy, matches) {
         early_dcx.early_fatal(format!(
             "{} compiler frontend rejects semantic, evidence, or backend control `{option}`",
             frontend_policy.diagnostic_name(),
@@ -1485,6 +1830,9 @@ fn run_compiler_with_argfile_mode(
     frontend_policy: FrontendTrustPolicy,
 ) {
     let mut default_early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
+    // Trust: bind the loaded host identity once; proof libraries need no build-ID dependency.
+    clean_elab::oracle_compiler::bind_host_toolchain(option_env!("CFG_VER_HASH"))
+        .unwrap_or_else(|error| default_early_dcx.early_fatal(error.to_string()));
     let compiler_backend_route_guard =
         config::enter_compiler_backend_route(frontend_policy.compiler_backend_route())
             .unwrap_or_else(|error| default_early_dcx.early_fatal(error));
@@ -1530,19 +1878,47 @@ fn run_compiler_with_argfile_mode(
             HandledOptions::HelpOnly(matches) => (matches, true),
         };
 
-    let mut sopts = config::build_session_options(&mut default_early_dcx, &matches);
-    // Trust (loud-when-off): record whether OFF was this caller's own argv
-    // spelling BEFORE the inherited `TRUST_NO_VERIFY=1` override below forces
-    // the same typed state. Only the canonical frontend may claim
-    // explicitness: a deauthorizing frontend announces its policy once at its
-    // boundary, and `TrustFrontendAuthoritySnapshot::deauthorize` clears this
-    // bit again defensively.
+    // For the purposes of checking that an --edition was passed, we only emit a message if the only
+    // argument passed to rustc is a file name.
+    let warn_unspecified_edition = match &args[..] {
+        [] => false,
+        // We explicitly don't emit the note if we're consuming code from stdin, or passing non-file
+        // flags. This can happen on some cargo invocations too.
+        [name] if name.starts_with("-") => false,
+        [_] => true,
+        _ => false,
+    };
+    let mut sopts =
+        config::build_session_options(&mut default_early_dcx, &matches, warn_unspecified_edition);
+    // Trust (loud-when-off): record whether OFF reached this compile through
+    // the caller's own argv spelling OR the inherited `TRUST_NO_VERIFY=1`
+    // transport. Only the canonical frontend may claim explicitness: a
+    // deauthorizing frontend announces its policy once at its boundary, and
+    // `TrustFrontendAuthoritySnapshot::deauthorize` clears this bit again
+    // defensively.
+    //
+    // The env transport used to be EXCLUDED here on the reasoning that its
+    // setter is always a parent that already announced. Measured 2026-09-14:
+    // the only production setters are the two bootstrap shims
+    // (`src/bootstrap/src/bin/{rustc,rustdoc}.rs`), and both run under
+    // bootstrap's `TRUST_VANILLA_ANNOUNCED=1` (`core/builder/cargo.rs`), which
+    // already quiets the note downstream. So excluding the transport here
+    // silenced exactly one caller: a user who exported `TRUST_NO_VERIFY=1` in
+    // their shell and ran bare `trustc`, whose compile then checked nothing and
+    // said nothing — the one silent off-switch the 2026-09-14 audit found
+    // (docs/audits/2026-09-14-four-claims-audit.md §2.6). The bit is now set
+    // for that route too; announced parents stay quiet via the marker, not via
+    // this bit.
     sopts.trust_verify_explicit_off = !frontend_policy.deauthorizes_official_evidence()
-        && !sopts.unstable_opts.trust_verify.is_on();
+        && (!sopts.unstable_opts.trust_verify.is_on() || trust_verify_override);
     apply_trust_verify_override(&mut sopts, trust_verify_override);
     if frontend_policy.deauthorizes_official_evidence() {
-        sopts.unstable_opts.trust_ir_lower = Some(config::TrustIrLower::Off);
-        sopts.trust_solver_content_fingerprint.clear();
+        // The same neutralization the interface boundary applies: verification and
+        // lowering off, every verification selector the pre-backend check accepted
+        // reset to its default (after materializing a profile's SIGPIPE declaration
+        // into `-Zon-broken-pipe`) — before any callback or authority snapshot can
+        // observe the caller's posture.
+        config::TrustFrontendAuthoritySnapshot::deauthorize(&mut sopts);
     }
     let mut artifact_publication_lease = None;
     // A direct artifact request must establish its effective typed Trust
@@ -1562,6 +1938,7 @@ fn run_compiler_with_argfile_mode(
     // fully initialize ice path static once unstable options are available as context
     let (odir, ofile) = make_output(&matches);
     let ice_file = ice_path_with_config(Some(&sopts.unstable_opts), odir.as_deref()).clone();
+    let _ = ICE_COLOR.set(sopts.color);
 
     if let Some(ref code) = matches.opt_str("explain") {
         handle_explain(&default_early_dcx, code, sopts.color);
@@ -1627,6 +2004,14 @@ fn run_compiler_with_argfile_mode(
     // are authority-protected above, but callback code can still introduce an
     // untracked environment variable after the pre-input validation.
     validate_trust_environment(&config.opts);
+    // Trust (CUSTODY-BOUNDED-QUERY-SPELLINGS-1): with no input and nothing but
+    // a bounded print requested, `print_crate_info` below answers and stops. If
+    // native entry admitted this process as that query, the session is answered
+    // on no scheduler: `run_compiler` takes the grant at scheduler setup, and it
+    // is spent when this function returns or unwinds, used or not.
+    let _bounded_query_grant = (!has_input && interface::bounded_metadata_session(&config.opts))
+        .then(rustc_data_structures::jobserver::grant_bounded_query_session)
+        .flatten();
 
     let registered_lints = config.register_lints.is_some();
 
@@ -1715,13 +2100,23 @@ fn run_compiler_with_argfile_mode(
                 return pre_analysis_early_exit("Callbacks::after_expansion");
             }
 
-            passes::write_dep_info(tcx);
+            // Trust: early output modes retain their established publication
+            // timing. Normal opt-in compilation holds owned data past TyCtxt.
+            let only_dep_info = sess.opts.output_types.contains_key(&OutputType::DepInfo)
+                && sess.opts.output_types.len() == 1;
+            let prepared_dep_info = if sess.tool_inputs_requested()
+                && !only_dep_info
+                && !sess.opts.unstable_opts.no_analysis
+            {
+                passes::prepare_dep_info_for_link(tcx)
+            } else {
+                passes::write_dep_info(tcx);
+                None
+            };
 
             passes::write_interface(tcx);
 
-            if sess.opts.output_types.contains_key(&OutputType::DepInfo)
-                && sess.opts.output_types.len() == 1
-            {
+            if only_dep_info {
                 return pre_analysis_early_exit("dep-info-only output");
             }
 
@@ -1739,26 +2134,50 @@ fn run_compiler_with_argfile_mode(
 
             if callbacks.after_analysis(compiler, tcx) == Compilation::Stop {
                 sess.dcx().abort_if_errors();
+                // Trust: the per-instance diagnostic exists only at codegen, not analysis.
+                if sess.opts.unstable_opts.trust_ir_instance_seam_test {
+                    let lane = trust_seam_test_lane(sess);
+                    sess.dcx().fatal(format!(
+                        "{lane} codegen; Callbacks::after_analysis stopped before the oracle ran"
+                    ));
+                }
+                // Trust: custom successful early termination still receives
+                // dep-info, without a terminal linker inventory claim.
+                sess.tool_inputs_unavailable();
+                if let Some(prepared) = prepared_dep_info {
+                    passes::finish_dep_info(sess, prepared);
+                }
                 return None;
             }
 
-            if tcx.sess.opts.output_types.contains_key(&OutputType::Mir) {
+            if sess.opts.output_types.contains_key(&OutputType::Mir) {
                 if let Err(error) = pretty::emit_mir(tcx) {
-                    tcx.dcx().emit_fatal(CantEmitMir { error });
+                    tcx.dcx().emit_fatal(CantEmitMIR { error });
                 }
             }
 
-            let linker = Linker::codegen_and_build_linker(tcx, &*compiler.codegen_backend);
+            let linker = Linker::codegen_and_build_linker(tcx, codegen_backend);
+
+            if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
+                dump_feature_usage_metrics(tcx, metrics_dir);
+            }
 
             tcx.report_unused_features();
 
-            Some(linker)
+            // Trust: retain only owned dep-info outside the query context.
+            Some((linker, prepared_dep_info))
         });
 
         // Linking is done outside the `compiler.enter()` so that the
         // `GlobalCtxt` within `Queries` can be freed as early as possible.
-        if let Some(linker) = linker {
-            linker.link(sess, codegen_backend);
+        if let (Some((linker, prepared_dep_info)), incr_comp_session) = linker {
+            linker.link(sess, incr_comp_session, codegen_backend);
+            if let Some(prepared) = prepared_dep_info {
+                // Trust: a failed terminal phase must not publish reusable
+                // facts. The disabled default retains its existing exit timing.
+                sess.dcx().abort_if_errors();
+                passes::finish_dep_info(sess, prepared);
+            }
         }
     };
     match frontend_policy {
@@ -1815,7 +2234,7 @@ fn make_input(early_dcx: &EarlyDiagCtxt, free_matches: &[String]) -> Option<Inpu
                     .early_fatal("couldn't read from stdin, as it did not contain valid UTF-8");
             }
 
-            let name = match env::var("UNSTABLE_RUSTDOC_TEST_PATH") {
+            match env::var("UNSTABLE_RUSTDOC_TEST_PATH") {
                 Ok(path) => {
                     let line = env::var("UNSTABLE_RUSTDOC_TEST_LINE").expect(
                         "when UNSTABLE_RUSTDOC_TEST_PATH is set \
@@ -1824,12 +2243,13 @@ fn make_input(early_dcx: &EarlyDiagCtxt, free_matches: &[String]) -> Option<Inpu
                     let line = line
                         .parse::<isize>()
                         .expect("UNSTABLE_RUSTDOC_TEST_LINE needs to be a number");
-                    FileName::doc_test_source_code(PathBuf::from(path), line)
+                    Some(Input::DocTestStr { file: PathBuf::from(path), line, input })
                 }
-                Err(_) => FileName::anon_source_code(&input),
-            };
-
-            Some(Input::Str { name, input })
+                Err(_) => {
+                    let name = FileName::anon_source_code(&input);
+                    Some(Input::Str { name, input })
+                }
+            }
         }
         [ifile] => Some(Input::File(PathBuf::from(ifile))),
         [ifile1, ifile2, ..] => early_dcx.early_fatal(format!(
@@ -1940,9 +2360,11 @@ fn show_md_content_with_pager(content: &str, color: ColorConfig) {
     }
 
     // The pager failed. Try to print pretty output to stdout.
-    if let Some((bufwtr, mdbuf)) = &mut pretty_data
+    if matches!(color, ColorConfig::Auto | ColorConfig::Always)
+        && let Some((bufwtr, mdbuf)) = &mut pretty_data
         && bufwtr.write_all(&mdbuf).is_ok()
     {
+        // Colored output was successfully printed to stdout.
         return;
     }
 
@@ -2021,24 +2443,35 @@ fn list_metadata(sess: &Session, metadata_loader: &dyn MetadataLoader) {
     match sess.io.input {
         Input::File(ref path) => {
             let mut v = Vec::new();
-            locator::list_file_metadata(
+            if let Err(error) = locator::list_file_metadata(
                 &sess.target,
                 path,
                 metadata_loader,
                 &mut v,
                 &sess.opts.unstable_opts.ls,
                 sess.cfg_version,
-            )
-            .unwrap();
+            ) {
+                if path.extension().is_some_and(|extension| extension == "rs") {
+                    let mut err = sess
+                        .dcx()
+                        .struct_fatal("`-Zls` takes a `.rmeta` file as input, not a source file");
+                    if rustc_session::utils::was_invoked_from_cargo() {
+                        // Give a Cargo-tailored suggestion if we're coming from Cargo
+                        err.note("use `rustc +nightly -Zls=... path/to/file.rmeta` directly, instead of going through Cargo");
+                    }
+                    err.emit();
+                }
+                sess.dcx().fatal(error.to_string());
+            }
             safe_println!("{}", String::from_utf8(v).unwrap());
         }
-        Input::Str { .. } => {
+        Input::Str { .. } | Input::DocTestStr { .. } => {
             sess.dcx().fatal("cannot list metadata for stdin");
         }
     }
 }
 
-fn print_crate_info(
+pub fn print_crate_info(
     codegen_backend: &dyn CodegenBackend,
     sess: &Session,
     parse_attrs: bool,
@@ -2082,6 +2515,7 @@ fn print_crate_info(
                 println_info!("{}", targets.join("\n"));
             }
             HostTuple => println_info!("{}", rustc_session::config::host_tuple()),
+            WasmProcMacroTuple => println_info!("{}", sess.wasm_proc_macro_tuple),
             Sysroot => println_info!("{}", sess.opts.sysroot.path().display()),
             TargetLibdir => println_info!("{}", sess.target_tlib_path.dir.display()),
             TargetSpecJson => {
@@ -2111,6 +2545,10 @@ fn print_crate_info(
                     sess,
                     &codegen_backend.supported_crate_types(sess),
                     codegen_backend.name(),
+                    // Trust (WS7.10): this is the print-only path Cargo probes
+                    // with; the backend hook answers `false` for it, so the probe
+                    // keeps its warn-and-omit contract.
+                    codegen_backend.unsupported_crate_type_is_fatal(sess),
                     attrs,
                     DUMMY_SP,
                 );
@@ -2136,13 +2574,13 @@ fn print_crate_info(
                 let crate_name = passes::get_crate_name(sess, attrs);
                 let lint_store = crate::unerased_lint_store(sess);
                 let features = rustc_expand::config::features(sess, attrs, crate_name);
-                let registered_tools = rustc_resolve::registered_tools_ast(sess.dcx(), attrs, sess);
+                let registered_lint_tools = rustc_resolve::registered_lint_tools_ast(sess, attrs);
                 let builder = rustc_lint::LintLevelsBuilder::crate_root(
                     sess,
                     &features,
                     true,
                     lint_store,
-                    &registered_tools,
+                    &registered_lint_tools,
                     attrs,
                 );
                 for lint in lint_store.get_lints() {
@@ -2162,9 +2600,7 @@ fn print_crate_info(
                     .iter()
                     .filter_map(|&(name, value)| {
                         // On stable, exclude unstable flags.
-                        if !sess.is_nightly_build()
-                            && find_gated_cfg(|cfg_sym| cfg_sym == name).is_some()
-                        {
+                        if !sess.is_nightly_build() && find_gated_cfg(name).is_some() {
                             return None;
                         }
 
@@ -2406,12 +2842,13 @@ fn version_at_macro_invocation_with_frontend_policy(
     //
     // The number here is deliberately NOT Trust's version. It comes from
     // `src/rust-compat-version` and says which Rust this toolchain is
-    // compatible with; Trust's own `major.minor.dev` version is a separate line
-    // (`src/version` -> CFG_TRUST_VERSION), reported as `trust:` below and by
-    // `targo trust version`. Keeping them apart is what lets Trust be 0.1.0
-    // without a build script concluding the compiler predates Rust 1.0.
+    // compatible with; Trust's own `MAJOR.MINOR.0` version is a separate line
+    // (`src/version` -> CFG_TRUST_VERSION, with `+g<sha>` on a non-stable build;
+    // docs/VERSIONING.md), reported as `trust:` below and by `targo trust
+    // version`. Keeping them apart is what lets Trust be 0.x without a build
+    // script concluding the compiler predates Rust 1.0.
     // The parenthetical carries the toolchain's OWN identity and version
-    // (`(trustc 0.1.0)`) — the leading `rustc` token is untouchable (the
+    // (`(trustc 0.10.0+g1a2b3c4d5)`) — the leading `rustc` token is untouchable (the
     // ecosystem's version-sniffing build scripts assert it; see the block
     // comment above), so this parenthetical is where trustc introduces
     // itself honestly instead of wearing the compat token as its name.
@@ -2542,11 +2979,9 @@ Available lint options:
         lints
     }
 
-    fn sort_lint_groups(
-        lints: Vec<(&'static str, Vec<LintId>, bool)>,
-    ) -> Vec<(&'static str, Vec<LintId>)> {
+    fn sort_lint_groups(lints: Vec<(LintName, Vec<LintId>, bool)>) -> Vec<(LintName, Vec<LintId>)> {
         let mut lints: Vec<_> = lints.into_iter().map(|(x, y, _)| (x, y)).collect();
-        lints.sort_by_key(|l| l.0);
+        lints.sort_by(|left, right| Ord::cmp(&left.0, &right.0));
         lints
     }
 
@@ -2594,7 +3029,7 @@ Available lint options:
         loaded_groups
             .iter()
             .chain(&builtin_groups)
-            .map(|&(s, _)| s.chars().count())
+            .map(|(s, _)| s.name.as_str().chars().count())
             .max()
             .unwrap_or(0),
     );
@@ -2607,7 +3042,7 @@ Available lint options:
 
     safe_println!("Lint groups provided by {compiler}:\n");
 
-    let print_lint_groups = |lints: Vec<(&'static str, Vec<LintId>)>, all_warnings| {
+    let print_lint_groups = |lints: Vec<(LintName, Vec<LintId>)>, all_warnings| {
         safe_println!("    {}  sub-lints", padded("name"));
         safe_println!("    {}  ---------", padded("----"));
 
@@ -2616,7 +3051,7 @@ Available lint options:
         }
 
         for (name, to) in lints {
-            let name = name.to_lowercase().replace('_', "-");
+            let name = name.to_string().to_lowercase().replace('_', "-");
             let desc = to
                 .into_iter()
                 .map(|x| x.to_string().replace('_', "-"))
@@ -2712,6 +3147,9 @@ fn get_backend_from_raw_matches_with_frontend_policy(
     matches: &Matches,
     frontend_policy: FrontendTrustPolicy,
 ) -> Box<dyn CodegenBackend> {
+    if let Some(error) = native_v3_early::refusal(matches, native_v3_early::Phase::Backend) {
+        early_dcx.early_fatal(error);
+    }
     let debug_flags = matches.opt_strs("Z");
     let backend_name = debug_flags
         .iter()
@@ -2874,6 +3312,16 @@ fn handle_options_with_frontend_policy(
     // later typed-options check would execute an attacker-selected backend
     // before a deauthorized frontend could reject it.
     validate_frontend_pre_backend_authority(early_dcx, &matches, frontend_policy);
+    if let Some(error) = native_v3_early::refusal(&matches, native_v3_early::Phase::Options) {
+        early_dcx.early_fatal(error);
+    }
+
+    // Trust: ordinary unmarked help/metadata retain their existing behavior.
+    if let Some(mode) = private_fixed_pre_session_exit(&matches, args) {
+        early_dcx.early_fatal(format!(
+            "private Fixed compiler cannot combine producing custody with {mode}"
+        ));
+    }
 
     if let Some(mode) = authenticated_pre_session_early_exit(&matches, args) {
         early_dcx.early_fatal(format!(
@@ -2934,7 +3382,7 @@ pub fn handle_help(matches: &getopts::Matches, args: &[String]) -> bool {
     let chelp_pos = opt_help_pos("C");
     let print_help = || {
         // Only show unstable options in --help if we accept unstable options.
-        let unstable_enabled = nightly_options::is_unstable_enabled(&matches);
+        let unstable_enabled = nightly_options::unstable_options_enabled(&matches);
         let nightly_build = nightly_options::match_is_nightly_build(&matches);
         usage(matches.opt_present("verbose"), unstable_enabled, nightly_build);
     };
@@ -2984,15 +3432,17 @@ fn warn_on_confusing_output_filename_flag(
             || config::CG_OPTIONS.iter().any(|option| eq_ignore_separators(option.name(), filename))
             || fake_args.iter().any(|arg| eq_ignore_separators(arg, filename))
         {
-            early_dcx.early_warn(
-                "option `-o` has no space between flag name and value, which can be confusing",
-            );
-            early_dcx.early_note(format!(
-                "output filename `-o {name}` is applied instead of a flag named `o{name}`"
-            ));
-            early_dcx.early_help(format!(
-                "insert a space between `-o` and `{name}` if this is intentional: `-o {name}`"
-            ));
+            early_dcx
+                .early_struct_warn(
+                    "option `-o` has no space between flag name and value, which can be confusing",
+                )
+                .with_note(format!(
+                    "output filename `-o {name}` is applied instead of a flag named `o{name}`"
+                ))
+                .with_help(format!(
+                    "insert a space between `-o` and `{name}` if this is intentional: `-o {name}`"
+                ))
+                .emit();
         }
     }
 }
@@ -3002,12 +3452,14 @@ fn parse_crate_attrs<'a>(sess: &'a Session) -> PResult<'a, ast::AttrVec> {
         Input::File(file) => {
             new_parser_from_file(&sess.psess, file, StripTokens::ShebangAndFrontmatter, None)
         }
-        Input::Str { name, input } => new_parser_from_source_str(
-            &sess.psess,
-            name.clone(),
-            input.clone(),
-            StripTokens::ShebangAndFrontmatter,
-        ),
+        instr @ (Input::Str { input, .. } | Input::DocTestStr { input, .. }) => {
+            new_parser_from_source_str(
+                &sess.psess,
+                instr.file_name(sess),
+                input.clone(),
+                StripTokens::ShebangAndFrontmatter,
+            )
+        }
     });
     parser.parse_inner_attributes()
 }
@@ -3021,6 +3473,7 @@ pub fn catch_with_exit_code<T: Termination>(f: impl FnOnce() -> T) -> ExitCode {
     }
 }
 
+static ICE_COLOR: OnceLock<ColorConfig> = OnceLock::new();
 static ICE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static ICE_DEFAULT_COMPILER: OnceLock<&'static str> = OnceLock::new();
 
@@ -3030,7 +3483,7 @@ fn ice_default_compiler() -> &'static str {
 
 // This function should only be called from the ICE hook.
 //
-// The intended behavior is that `run_compiler` will invoke `ice_path_with_config` early in the
+// The intended behavior is that `compiler_entrypoint` will invoke `ice_path_with_config` early in the
 // initialization process to properly initialize the ICE_PATH static based on parsed CLI flags.
 //
 // Subsequent calls to either function will then return the proper ICE path as configured by
@@ -3060,7 +3513,7 @@ fn ice_path_with_config(
                     return None;
                 }
                 if let Some(unstable_opts) = config && unstable_opts.metrics_dir.is_some() {
-                    tracing::warn!("ignoring -Zerror-metrics in favor of RUSTC_ICE for destination of ICE report files");
+                    tracing::warn!("ignoring -Zmetrics-dir in favor of RUSTC_ICE for destination of ICE report files");
                 }
                 PathBuf::from(s)
             }
@@ -3094,7 +3547,7 @@ pub static USING_INTERNAL_FEATURES: AtomicBool = AtomicBool::new(false);
 /// extra_info.
 ///
 /// A custom rustc driver can skip calling this to set up a custom ICE hook.
-pub fn install_ice_hook(bug_report_url: &'static str, extra_info: fn(&DiagCtxt)) {
+pub fn install_ice_hook(bug_report_url: &'static str, extra_info: fn(DiagCtxtHandle<'_>)) {
     install_ice_hook_with_default_compiler(bug_report_url, "trustc", extra_info);
 }
 
@@ -3103,7 +3556,7 @@ pub fn install_ice_hook(bug_report_url: &'static str, extra_info: fn(&DiagCtxt))
 pub fn install_ice_hook_with_default_compiler(
     bug_report_url: &'static str,
     default_compiler: &'static str,
-    extra_info: fn(&DiagCtxt),
+    extra_info: fn(DiagCtxtHandle<'_>),
 ) {
     let _ = ICE_DEFAULT_COMPILER.set(default_compiler);
 
@@ -3188,14 +3641,15 @@ pub fn install_ice_hook_with_default_compiler(
 fn report_ice(
     info: &panic::PanicHookInfo<'_>,
     bug_report_url: &str,
-    extra_info: fn(&DiagCtxt),
+    extra_info: fn(DiagCtxtHandle<'_>),
     using_internal_features: &AtomicBool,
 ) {
+    let color = ICE_COLOR.get().copied().unwrap_or(ColorConfig::Auto);
     let emitter =
         Box::new(rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter::new(
-            stderr_destination(rustc_errors::ColorConfig::Auto),
+            stderr_destination(color),
         ));
-    let dcx = rustc_errors::DiagCtxt::new(emitter);
+    let dcx = DiagCtxt::new(emitter);
     let dcx = dcx.handle();
 
     // a .span_bug or .bug call has already printed what
@@ -3203,17 +3657,17 @@ fn report_ice(
     if !info.payload().is::<rustc_errors::ExplicitBug>()
         && !info.payload().is::<rustc_errors::DelayedBugPanic>()
     {
-        dcx.emit_err(session_diagnostics::Ice);
+        dcx.emit_err(diagnostics::Ice);
     }
 
     if using_internal_features.load(std::sync::atomic::Ordering::Relaxed) {
-        dcx.emit_note(session_diagnostics::IceBugReportInternalFeature);
+        dcx.emit_note(diagnostics::IceBugReportInternalFeature);
     } else {
-        dcx.emit_note(session_diagnostics::IceBugReport { bug_report_url });
+        dcx.emit_note(diagnostics::IceBugReport { bug_report_url });
 
         // Only emit update nightly hint for users on nightly builds.
         if rustc_feature::UnstableFeatures::from_environment(None).is_nightly_build() {
-            dcx.emit_note(session_diagnostics::UpdateNightlyNote);
+            dcx.emit_note(diagnostics::UpdateNightlyNote);
         }
     }
 
@@ -3226,7 +3680,7 @@ fn report_ice(
         // Create the ICE dump target file.
         match crate::fs::File::options().create(true).append(true).open(path) {
             Ok(mut file) => {
-                dcx.emit_note(session_diagnostics::IcePath { path: path.clone() });
+                dcx.emit_note(diagnostics::IcePath { path: path.clone() });
                 if FIRST_PANIC.swap(false, Ordering::SeqCst) {
                     let display_binary = trust_invoked_binary(ice_default_compiler());
                     let _ =
@@ -3236,12 +3690,12 @@ fn report_ice(
             }
             Err(err) => {
                 // The path ICE couldn't be written to disk, provide feedback to the user as to why.
-                dcx.emit_warn(session_diagnostics::IcePathError {
+                dcx.emit_warn(diagnostics::IcePathError {
                     path: path.clone(),
                     error: err.to_string(),
                     env_var: std::env::var_os("RUSTC_ICE")
                         .map(PathBuf::from)
-                        .map(|env_var| session_diagnostics::IcePathErrorEnv { env_var }),
+                        .map(|env_var| diagnostics::IcePathErrorEnv { env_var }),
                 });
                 None
             }
@@ -3250,16 +3704,16 @@ fn report_ice(
         None
     };
 
-    dcx.emit_note(session_diagnostics::IceVersion {
+    dcx.emit_note(diagnostics::IceVersion {
         compiler: trust_invoked_binary(ice_default_compiler()),
         version,
         triple: tuple,
     });
 
     if let Some((flags, excluded_cargo_defaults)) = rustc_session::utils::extra_compiler_flags() {
-        dcx.emit_note(session_diagnostics::IceFlags { flags: flags.join(" ") });
+        dcx.emit_note(diagnostics::IceFlags { flags: flags.join(" ") });
         if excluded_cargo_defaults {
-            dcx.emit_note(session_diagnostics::IceExcludeCargoDefaults);
+            dcx.emit_note(diagnostics::IceExcludeCargoDefaults);
         }
     }
 
@@ -3268,11 +3722,11 @@ fn report_ice(
 
     let limit_frames = if backtrace { None } else { Some(2) };
 
-    interface::try_print_query_stack(dcx, limit_frames, file);
+    interface::try_print_query_stack(limit_frames, file);
 
     // We don't trust this callback not to panic itself, so run it at the end after we're sure we've
     // printed all the relevant info.
-    extra_info(&dcx);
+    extra_info(dcx);
 
     #[cfg(windows)]
     if env::var("RUSTC_BREAK_ON_ICE").is_ok() {
@@ -3365,6 +3819,25 @@ fn main_with_frontend_trust_policy(frontend_policy: FrontendTrustPolicy) -> Exit
 /// boundary. Official proof acceptance must additionally authenticate the
 /// exact executable and runtime image closure that ran it.
 pub fn main() -> ExitCode {
+    // Trust (D21): in the proc-macro worker role this executable is not a
+    // compiler. It reads only its own arguments here; the role closes every
+    // inherited descriptor itself, so it must run before anything captures one.
+    if let Some(code) = rustc_expand::proc_macro::trust_isolated_worker_entry() {
+        return code;
+    }
+    // SAFETY: FIRST native-entry operation, before RSS probes, logging,
+    // signals, argument files or user callbacks can open/reuse descriptors.
+    if let Err(error) = unsafe { rustc_data_structures::jobserver::capture_early() } {
+        eprintln!("error: inherited compiler resource custody unavailable: {error}");
+        return ExitCode::from(75);
+    }
+    // Exact standalone discovery precedes option files, backend loading and
+    // compilation. This is protocol support, never scheduling authority.
+    if std::env::args_os().skip(1).eq([OsStr::new("--resource-capabilities")]) {
+        let workers = cfg!(target_os = "macos");
+        safe_println!("{{\"version\":1,\"cpu_workers\":{workers},\"protocol\":2}}");
+        return ExitCode::SUCCESS;
+    }
     main_with_frontend_trust_policy(FrontendTrustPolicy::CanonicalTrustc)
 }
 

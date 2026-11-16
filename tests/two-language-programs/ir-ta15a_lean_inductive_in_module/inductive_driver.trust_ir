@@ -1,0 +1,28 @@
+; TrustIr text format v1
+; Part A hand-written DRIVER for the general-tier inductive+match body `triRank` (probe p15a).
+; The compiler refuses every Rust-side route to that body (p15b: no Rust carrier; p15c: no
+; selection row), so the only way to EXECUTE the emitted body is a driver linked BY SYMBOL.
+; A `Tri` value is a boxed constructor tag in the emitted spelling (triRank opens with
+; `clean_unbox_uint64` + `switch`), so the driver builds Tri.two as clean_box_uint64(1).
+; Expected if the consumer had the Clean runtime ABI: triRank(Tri.two) = 2.
+module "parta-inductive-driver"
+
+functy.0 = (u64) -> (ptr)
+
+functy.1 = (ptr) -> (u64)
+
+functy.2 = () -> (u64)
+
+fn @clean_box_uint64(functy.0) {
+}
+
+fn @triRank(functy.1) {
+}
+
+rustcc fn @drive(functy.2) {
+bb0:
+    %0 = const u64 1
+    %1 = call @func.0(%0)
+    %2 = call @func.1(%1)
+    ret %2
+}

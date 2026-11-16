@@ -22,7 +22,6 @@ Modes:
   tests   Run that gate and the extended Rust test suites.
 
 Set TRUST_CHECK_ALL_RUN_TESTS=1 to run extended tests from the default mode.
-Set TRUST_CHECK_ALL_RUN_HOST_DIAGNOSTICS=1 to run advisory host Cargo diagnostics.
 Set TRUST_CHECK_ALL_TARGO=/path/to/build/<host>/stage2/bin/targo to select a
 repo-local stage2 Targo executable.
 EOF
@@ -59,6 +58,16 @@ if [ "$#" -gt 1 ]; then
     exit 2
 fi
 
+# The advisory host-Cargo diagnostic was retired on 2026-09-28 (all ALab
+# systems build with Trust). It ran an ambient Cargo; the golden
+# gate already runs `targo --unverified check` over targo-trust. Refuse the old
+# switch loudly rather than let a caller believe it still ran.
+if truthy "${TRUST_CHECK_ALL_RUN_HOST_DIAGNOSTICS:-0}" TRUST_CHECK_ALL_RUN_HOST_DIAGNOSTICS; then
+    echo "TRUST_CHECK_ALL_RUN_HOST_DIAGNOSTICS was retired on 2026-09-28: the host Cargo" >&2
+    echo "diagnostic ran an ambient Cargo; the golden targo gate already checks targo-trust." >&2
+    exit 2
+fi
+
 if [ ! -x "$TRUST_TARGO" ]; then
     echo "Missing repo-local stage2 Trust targo required for golden checks: $TRUST_TARGO" >&2
     echo "DETAIL: ambient Cargo/Targo is never accepted as release-gate evidence." >&2
@@ -74,9 +83,6 @@ fi
 ARGS=(trust gate check-all --repo-root "$REPO_ROOT" --targo "$TRUST_TARGO")
 if truthy "$RUN_TESTS" TRUST_CHECK_ALL_RUN_TESTS; then
     ARGS+=(--run-tests)
-fi
-if truthy "${TRUST_CHECK_ALL_RUN_HOST_DIAGNOSTICS:-0}" TRUST_CHECK_ALL_RUN_HOST_DIAGNOSTICS; then
-    ARGS+=(--host-diagnostics)
 fi
 
 exec "$TRUST_TARGO" "${ARGS[@]}"

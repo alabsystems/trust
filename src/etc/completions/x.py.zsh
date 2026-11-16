@@ -335,6 +335,7 @@ _arguments "${_arguments_options[@]}" : \
 '*--reproducible-artifact=[Additional reproducible artifacts that should be added to the reproducible artifacts archive]:REPRODUCIBLE_ARTIFACT:_default' \
 '*--set=[override options in bootstrap.toml]:section.option=value:' \
 '--ci=[Make bootstrap to behave as it'\''s running on the CI environment or not]:bool:(true false)' \
+'--allow-dirty[Pass \`--allow-dirty\` to \`cargo fix\`, allowing it to run even if the current git checkout has uncommitted changes]' \
 '(-q --quiet)*-v[use verbose output (-vv for very verbose)]' \
 '(-q --quiet)*--verbose[use verbose output (-vv for very verbose)]' \
 '(-v --verbose)-q[use quiet output]' \
@@ -502,8 +503,10 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (test)
 _arguments "${_arguments_options[@]}" : \
+'--trust-repo-wp-installation=[Immutable current Trust installation for the stage-2 first-party/trust-wp selection]:PATH:_files' \
 '*--test-args=[extra arguments to be passed for the test tool being used (e.g. libtest, compiletest or rustdoc)]:ARGS:_default' \
 '*--compiletest-rustc-args=[extra options to pass the compiler when running compiletest tests]:ARGS:_default' \
+'--compiler-test-fixture=[Retain a validated Trust compiler fixture for explicit compiler library tests (no docs)]:SYSROOT:_files -/' \
 '--extra-checks=[comma-separated list of other files types to check (accepts py, py\:lint, py\:fmt, shell, cpp, cpp\:fmt, js, js\:lint, js\:typecheck, spellcheck)]:EXTRA_CHECKS:_default' \
 '--compare-mode=[mode describing what file the actual ui output will be compared to]:COMPARE MODE:_default' \
 '--pass=[force {check,build,run}-pass tests to this mode]:check | build | run:_default' \
@@ -533,8 +536,11 @@ _arguments "${_arguments_options[@]}" : \
 '*--reproducible-artifact=[Additional reproducible artifacts that should be added to the reproducible artifacts archive]:REPRODUCIBLE_ARTIFACT:_default' \
 '*--set=[override options in bootstrap.toml]:section.option=value:' \
 '--ci=[Make bootstrap to behave as it'\''s running on the CI environment or not]:bool:(true false)' \
+'(--no-fail-fast --trust-vanilla --trust-verified --bless --only-modified --compare-mode --pass --run --no-capture --doc --tests --all-targets --test-args --compiletest-rustc-args --extra-checks --record --rerun --rustfix-coverage --bypass-ignore-backends --test-codegen-backend --no-doc)--trust-repo-check[Check compiler targets and one tests/ui/trust file, or qualify first-party/trust-wp. Stores completed execution facts only; makes no proof claim]' \
+'--trust-repo-parent-release-v1[Require the validated native parent'\''s version-1 release handoff]' \
 '--no-fail-fast[run all tests regardless of failure]' \
 '--trust-vanilla[run upstream vanilla compiletest by disabling Trust verification]' \
+'(--trust-vanilla)--trust-verified[run the VERIFIED compiletest lane\: compile every test at the shipping default (\`-Ztrust-verify=on -Ztrust-policy=strict\`) instead of the harness'\''s \`-Ztrust-verify=off\`. Requires a locally-built stage1+ Trust compiler; mutually exclusive with \`--trust-vanilla\`]' \
 '--all-targets[Run all test targets (no doc tests)]' \
 '--doc[Only run doc tests]' \
 '--tests[Only run unit and integration tests]' \
@@ -570,8 +576,10 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (t)
 _arguments "${_arguments_options[@]}" : \
+'--trust-repo-wp-installation=[Immutable current Trust installation for the stage-2 first-party/trust-wp selection]:PATH:_files' \
 '*--test-args=[extra arguments to be passed for the test tool being used (e.g. libtest, compiletest or rustdoc)]:ARGS:_default' \
 '*--compiletest-rustc-args=[extra options to pass the compiler when running compiletest tests]:ARGS:_default' \
+'--compiler-test-fixture=[Retain a validated Trust compiler fixture for explicit compiler library tests (no docs)]:SYSROOT:_files -/' \
 '--extra-checks=[comma-separated list of other files types to check (accepts py, py\:lint, py\:fmt, shell, cpp, cpp\:fmt, js, js\:lint, js\:typecheck, spellcheck)]:EXTRA_CHECKS:_default' \
 '--compare-mode=[mode describing what file the actual ui output will be compared to]:COMPARE MODE:_default' \
 '--pass=[force {check,build,run}-pass tests to this mode]:check | build | run:_default' \
@@ -601,8 +609,11 @@ _arguments "${_arguments_options[@]}" : \
 '*--reproducible-artifact=[Additional reproducible artifacts that should be added to the reproducible artifacts archive]:REPRODUCIBLE_ARTIFACT:_default' \
 '*--set=[override options in bootstrap.toml]:section.option=value:' \
 '--ci=[Make bootstrap to behave as it'\''s running on the CI environment or not]:bool:(true false)' \
+'(--no-fail-fast --trust-vanilla --trust-verified --bless --only-modified --compare-mode --pass --run --no-capture --doc --tests --all-targets --test-args --compiletest-rustc-args --extra-checks --record --rerun --rustfix-coverage --bypass-ignore-backends --test-codegen-backend --no-doc)--trust-repo-check[Check compiler targets and one tests/ui/trust file, or qualify first-party/trust-wp. Stores completed execution facts only; makes no proof claim]' \
+'--trust-repo-parent-release-v1[Require the validated native parent'\''s version-1 release handoff]' \
 '--no-fail-fast[run all tests regardless of failure]' \
 '--trust-vanilla[run upstream vanilla compiletest by disabling Trust verification]' \
+'(--trust-vanilla)--trust-verified[run the VERIFIED compiletest lane\: compile every test at the shipping default (\`-Ztrust-verify=on -Ztrust-policy=strict\`) instead of the harness'\''s \`-Ztrust-verify=off\`. Requires a locally-built stage1+ Trust compiler; mutually exclusive with \`--trust-vanilla\`]' \
 '--all-targets[Run all test targets (no doc tests)]' \
 '--doc[Only run doc tests]' \
 '--tests[Only run unit and integration tests]' \
@@ -760,7 +771,7 @@ _arguments "${_arguments_options[@]}" : \
 '*--reproducible-artifact=[Additional reproducible artifacts that should be added to the reproducible artifacts archive]:REPRODUCIBLE_ARTIFACT:_default' \
 '*--set=[override options in bootstrap.toml]:section.option=value:' \
 '--ci=[Make bootstrap to behave as it'\''s running on the CI environment or not]:bool:(true false)' \
-'--all[Clean the entire build directory (not used by default)]' \
+'(--stage)--all[Clean the entire build directory (not used by default)]' \
 '(-q --quiet)*-v[use verbose output (-vv for very verbose)]' \
 '(-q --quiet)*--verbose[use verbose output (-vv for very verbose)]' \
 '(-v --verbose)-q[use quiet output]' \

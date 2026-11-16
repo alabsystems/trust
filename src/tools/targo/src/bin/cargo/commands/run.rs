@@ -4,12 +4,12 @@ use std::path::Path;
 
 use crate::command_prelude::*;
 use crate::util::restricted_names::is_glob_pattern;
-use cargo::core::Workspace;
-use cargo::ops::{self, CompileFilter, Packages};
-use cargo::util::closest;
 use cargo_util::ProcessError;
 use cargo_util_terminal::Verbosity;
 use itertools::Itertools as _;
+use targo::ops::{self, CompileFilter, Packages};
+use targo::util::closest;
+use targo::workspace::Workspace;
 
 pub fn cli() -> Command {
     subcommand("run")
@@ -21,6 +21,7 @@ pub fn cli() -> Command {
                 .value_name("ARGS")
                 .help("Arguments for the binary or example to run")
                 .value_parser(value_parser!(OsString))
+                .value_hint(clap::ValueHint::AnyPath)
                 .num_args(0..)
                 .trailing_var_arg(true),
         )
@@ -35,7 +36,7 @@ pub fn cli() -> Command {
         .arg_parallel()
         .arg_release("Build artifacts in release mode, with optimizations")
         .arg_profile("Build artifacts with the specified profile")
-        .arg_target_triple("Build for the target triple")
+        .arg_target_tuple("Build for the target tuple")
         .arg_target_dir()
         .arg_manifest_path()
         .arg_ignore_rust_version()
@@ -43,8 +44,8 @@ pub fn cli() -> Command {
         .arg_timings()
         // Trust: the footer names the binary the user actually invoked; see
         // `command_help_footer` in `bin/cargo/main.rs`.
-        .after_help(format!(
-            "{}To pass `--help` to the specified binary, use `-- --help`.\n",
+        .after_help(color_print::cformat!(
+            "{}To pass `--help` to the specified binary, use `<bright-cyan,bold>-- --help</>`.\n",
             crate::command_help_footer("run")
         ))
 }
@@ -192,10 +193,10 @@ pub fn exec_manifest_command(gctx: &mut GlobalContext, cmd: &str, args: &[OsStri
     }
 
     let mut compile_opts =
-        cargo::ops::CompileOptions::new(gctx, cargo::core::compiler::UserIntent::Build)?;
-    compile_opts.spec = cargo::ops::Packages::Default;
+        targo::ops::CompileOptions::new(gctx, targo::compiler::UserIntent::Build)?;
+    compile_opts.spec = targo::ops::Packages::Default;
 
-    cargo::ops::run(&ws, &compile_opts, args).map_err(|err| to_run_error(gctx, err))
+    targo::ops::run(&ws, &compile_opts, args).map_err(|err| to_run_error(gctx, err))
 }
 
 fn suggested_script(cmd: &str) -> Option<String> {
@@ -251,6 +252,8 @@ fn to_run_error(gctx: &GlobalContext, err: anyhow::Error) -> CliError {
     if is_quiet {
         CliError::code(exit_code)
     } else {
+        // Ensure a newline between user and cargo's output, especially with trailing "\r"
+        let _ = writeln!(gctx.shell().err());
         CliError::new(err, exit_code)
     }
 }

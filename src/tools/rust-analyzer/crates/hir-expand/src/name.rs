@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use base_db::SourceDatabase;
 use intern::{Symbol, sym};
 use span::{Edition, SyntaxContext};
 use syntax::utils::is_raw_identifier;
@@ -15,6 +16,8 @@ use syntax::{ast, format_smolstr};
 /// This is because we want to show (in completions etc.) names as raw depending on the needs
 /// of the current crate, for example if it is edition 2021 complete `gen` even if the defining
 /// crate is in edition 2024 and wrote `r#gen`, and the opposite holds as well.
+///
+/// `k#` of forced keywords is *not* stripped, because `Name` is supposed to be used for names and not keywords.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Name {
     symbol: Symbol,
@@ -180,7 +183,7 @@ impl Name {
     #[inline]
     pub fn display<'a>(
         &'a self,
-        db: &dyn crate::db::ExpandDatabase,
+        db: &dyn SourceDatabase,
         edition: Edition,
     ) -> impl fmt::Display + 'a {
         _ = db;
@@ -245,14 +248,14 @@ impl AsName for ast::NameRef {
     fn as_name(&self) -> Name {
         match self.as_tuple_field() {
             Some(idx) => Name::new_tuple_field(idx),
-            None => Name::new_root(&self.text()),
+            None => Name::new_root(self.text()),
         }
     }
 }
 
 impl AsName for ast::Name {
     fn as_name(&self) -> Name {
-        Name::new_root(&self.text())
+        Name::new_root(self.text())
     }
 }
 

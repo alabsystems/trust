@@ -72,6 +72,7 @@ fn slice_receiver_fn(callee: &str) -> VerifiableFunction {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                 },
             }],
@@ -83,6 +84,7 @@ fn slice_receiver_fn(callee: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -157,6 +159,7 @@ fn int_receiver_fn(callee: &str) -> VerifiableFunction {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                 },
             }],
@@ -168,6 +171,7 @@ fn int_receiver_fn(callee: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -231,6 +235,7 @@ fn receiver_only_fn(callee: &str) -> VerifiableFunction {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                 },
             }],
@@ -242,6 +247,7 @@ fn receiver_only_fn(callee: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -329,10 +335,14 @@ fn const_diff_range_fn(
         },
         LocalDecl {
             index: 5,
-            ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-                variants: Vec::new(),
+            ty: Ty::Adt {
+                arbitrary_precision: None,
+                validity_wrapper: None,
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
                 name: "core::ops::Range".into(),
-                fields: vec![],
+                fields: vec![].into(),
                 disc_index_safe: false,
                 faithful_enum_repr: None,
                 enum_layout: None,
@@ -376,6 +386,7 @@ fn const_diff_range_fn(
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                 },
             }],
@@ -387,6 +398,7 @@ fn const_diff_range_fn(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -456,10 +468,14 @@ fn off_plus_8_to_off_plus_16_recovers_length_8() {
         },
         LocalDecl {
             index: 5,
-            ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-                variants: Vec::new(),
+            ty: Ty::Adt {
+                arbitrary_precision: None,
+                validity_wrapper: None,
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
                 name: "core::ops::Range".into(),
-                fields: vec![],
+                fields: vec![].into(),
                 disc_index_safe: false,
                 faithful_enum_repr: None,
                 enum_layout: None,
@@ -524,6 +540,7 @@ fn off_plus_8_to_off_plus_16_recovers_length_8() {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                 },
             }],
@@ -535,6 +552,7 @@ fn off_plus_8_to_off_plus_16_recovers_length_8() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert_eq!(
         range_aggregate_const_len(&func, &Operand::Move(Place::local(5))),

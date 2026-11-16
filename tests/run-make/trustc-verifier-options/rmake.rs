@@ -6,6 +6,10 @@ use run_make_support::{bin_name, cmd, rfs, rustc_path, serde_json};
 
 const TRUST_VANILLA_REAL_RUSTC_ENV: &str = "__COMPILETEST_TRUST_VANILLA_REAL_RUSTC";
 
+/// WS5.2: `Function.name` is the link-time symbol; `ordered` is found by its def
+/// path, which the canonical text carries as its `#display-path` directive.
+const ORDERED_DISPLAY_PATH: &str = "; #display-path: \"ordered\"\n";
+
 fn read_and_assert_direct_ir_artifacts(
     directory: &str,
     crate_name: &str,
@@ -139,6 +143,26 @@ fn main() {
         ("-Ztrust-verify-session=", "a non-empty session identifier"),
         ("-Ztrust-verify-crate-role=workspace", "one of `unscoped`"),
         ("-Ztrust-verify-timeout-ms=0", "a positive integer"),
+        // Trust (determinism plan §3.2a): the effort scale is a count from 1
+        // through ay's own ground allowance, and nothing else.
+        (
+            "-Ztrust-verify-effort=0",
+            "an integer number of SAT conflicts per distinct query term, from 1 through 100000",
+        ),
+        (
+            "-Ztrust-verify-effort=100001",
+            "an integer number of SAT conflicts per distinct query term, from 1 through 100000",
+        ),
+        (
+            "-Ztrust-verify-effort=1,2",
+            "an integer number of SAT conflicts per distinct query term, from 1 through 100000",
+        ),
+        // The step budget is the deterministic preprocessing bound: no value
+        // switches it off.
+        (
+            "-Ztrust-verify-function-budget-steps=0",
+            "a positive integer number of preprocessing steps",
+        ),
         ("-Ztrust-verify-worker-threads=257", "an integer from 0 through 256"),
         ("-Ztrust-cg-output-gate=permissive", "one of `allow-unknown`"),
         // Policy is one domain, so the settings cannot be combined at all:
@@ -151,6 +175,12 @@ fn main() {
             "one of `strict`, `certify`, `advisory`, or `memory-safe`",
         ),
         ("-Ztrust-policy=survey", "one of `strict`, `certify`, `advisory`, or `memory-safe`"),
+        // Trust (2026-10-03, docs/DECISION_QUEUE.md "L0-CERTIFY"): certify claims full
+        // static discharge; level 0 drops the Level 1 obligations it rests on.
+        (
+            "-Ztrust-policy=certify -Ztrust-verify-level=0",
+            "-Ztrust-policy=certify requires -Ztrust-verify-level=1 or 2",
+        ),
         ("-Ztrust-verify", "requires one of `on` or `off`"),
         ("-Ztrust-verify=yes", "one of `on` or `off`"),
         ("-Ztrust-witness=mint", "one of `auto`, `off`, `mint:<dir>`, or `replay:<dir>`"),
@@ -283,6 +313,11 @@ pub fn push_slot(len: usize) -> usize {
                 "coverage diagnostic lacks authenticated identity {expected}: {line}"
             );
         }
+        // Trust (T3 L4, C09w): the row carries its required memory summary.
+        assert!(
+            line.contains(r#"\"memory\":{\"schema\":\"trust-memory-summary/v1\""#),
+            "coverage diagnostic lacks its memory summary: {line}"
+        );
         assert!(
             !line.starts_with("TRUST_JSON:"),
             "coverage was emitted as unauthenticated raw stderr: {line}"
@@ -436,26 +471,25 @@ trust_contract_ensures { result == lane5 }
     lane0 && lane1 && lane2 && lane3 && lane4 && lane5
 }
 
-// `cfg_attr`/macro expansion is permitted to give clause payloads enclosing
-// or source-equal spans. These four typed clauses must remain bound to their
+// `cfg_attr` expansion is permitted to give clause payloads enclosing or
+// source-equal spans. These four typed clauses must remain bound to their
 // exact AST/HIR expression identities, not whichever expression happens to be
-// the first span match in the lowered body.
-macro_rules! define_exact_attribute_identity {
-    () => {
-        #[cfg_attr(all(), core::contracts::requires(first))]
-        #[cfg_attr(all(), core::contracts::ensures({
-            let unrelated = |_: &bool| false;
-            let _ = unrelated;
-            move |ret: &bool| *ret == first
-        }))]
-        #[cfg_attr(all(), core::contracts::requires(second))]
-        #[cfg_attr(all(), core::contracts::ensures(move |ret: &bool| *ret == second))]
-        pub fn exact_attribute_identity(first: bool, second: bool) -> bool {
-            first && second
-        }
-    };
+// the first span match in the lowered body. (The function is written here,
+// not by a `macro_rules!`: since review round 42 a macro-written contracted
+// function is refused, `parameter .. and a contract clause of this function
+// have different macro hygiene`, the measured over-refusal KNOWN_HAZARDS
+// records under "contract and loop-clause names are bound by DISPLAYED NAME".)
+#[cfg_attr(all(), core::contracts::requires(first))]
+#[cfg_attr(all(), core::contracts::ensures({
+    let unrelated = |_: &bool| false;
+    let _ = unrelated;
+    move |ret: &bool| *ret == first
+}))]
+#[cfg_attr(all(), core::contracts::requires(second))]
+#[cfg_attr(all(), core::contracts::ensures(move |ret: &bool| *ret == second))]
+pub fn exact_attribute_identity(first: bool, second: bool) -> bool {
+    first && second
 }
-define_exact_attribute_identity!();
 "#,
     );
 
@@ -476,7 +510,7 @@ define_exact_attribute_identity!();
         .arg("ir-dump-probe")
         .run();
     let first_direct_artifacts =
-        read_and_assert_direct_ir_artifacts("ir-dump", "ir_dump_probe", "fn @ordered(");
+        read_and_assert_direct_ir_artifacts("ir-dump", "ir_dump_probe", ORDERED_DISPLAY_PATH);
     read_and_assert_mir_compat_contract_order(
         "mir-compat-dump",
         "ir_dump_probe::ordered",
@@ -517,7 +551,7 @@ define_exact_attribute_identity!();
         .arg("ir-dump-probe")
         .run();
     let replayed_direct_artifacts =
-        read_and_assert_direct_ir_artifacts("ir-dump", "ir_dump_probe", "fn @ordered(");
+        read_and_assert_direct_ir_artifacts("ir-dump", "ir_dump_probe", ORDERED_DISPLAY_PATH);
     for (suffix, (first, replayed)) in ["trust-ir.bin", "trust-ir.txt", "coverage.json"]
         .into_iter()
         .zip(first_direct_artifacts.iter().zip(&replayed_direct_artifacts))

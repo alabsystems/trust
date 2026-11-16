@@ -1,6 +1,14 @@
 //@ dont-check-compiler-stderr
-//@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ check-fail
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
+// Re-pinned 2026-10-15 (the merge of 2026-10-14 brought WS5.2, 87388a9d3ec and aa2f22aa306):
+// `Function.name` is now the link-time symbol, and a GENERIC definition has none until
+// per-instance lowering (B8), so `-Ztrust-ir-lower=strict` refuses each one by name at crate
+// assembly ("lowered for coverage, never spliced"). Those refusals are pinned below; every
+// other body must still lower, and any other strict error fails this test.
 //! Trust (wave-CP): a THIN raw-pointer -> raw-pointer `as` cast is a pure
 //! RE-TYPING of an already-opaque address, lowered to one
 //! `Inst::Cast { op: PtrToPtr, Ty::Ptr -> Ty::Ptr }` — the identity on the
@@ -32,12 +40,16 @@ pub fn retype(p: *const u8) -> *const u32 {
     p as *const u32
 }
 
-// `*mut T -> *const T` is deliberately NOT pinned here. Measured on the subject
-// build: it never reaches this arm at all — rustc inserts a COERCION for the
-// mut->const direction, so the body refuses earlier with
-// `Coercion(mut->const raw ptr)`. It is pinned as a still-refused shape in
-// `trust_ir_lower_ptr_ptr_cast_refuses.rs` instead. The const->mut direction
-// below IS a real `ExprKind::Cast` and is covered.
+// `*mut T -> *const T` never reaches this arm: rustc inserts a COERCION for the
+// mut->const direction, so it is not an `ExprKind::Cast`. It used to refuse with
+// `Coercion(mut->const raw ptr)` and was pinned in the refusals twin; 94502e4acc6
+// ("lower checked thin raw mutability coercions") admits the thin coercion, so it
+// is pinned here as an admission. The const->mut direction below IS a real
+// `ExprKind::Cast` and is covered.
+
+pub fn constify(p: *mut u32) -> *const u32 {
+    p as *const u32
+}
 
 pub fn mutify(p: *const u32) -> *mut u32 {
     p as *mut u32
@@ -50,6 +62,7 @@ pub fn mutify(p: *const u32) -> *mut u32 {
 
 pub trait Trait {
     fn foo(&self) -> u32 {
+        //~^ ERROR NoLinkTimeSymbol(Trait::foo): no link-time symbol for `Trait::foo`
         0
     }
 }
@@ -77,6 +90,7 @@ pub trait IntoRaw: for<'a> Tag<'a> {
 
 impl<T: for<'a> Tag<'a>> IntoRaw for T {
     fn into_raw(this: *const <Self as Tag<'_>>::Type) -> *mut <Self as Tag<'_>>::Type {
+        //~^ ERROR NoLinkTimeSymbol(<T as IntoRaw>::into_raw): no link-time symbol for `<T as IntoRaw>::into_raw`
         this as *mut T::Type
     }
 }

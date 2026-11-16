@@ -59,12 +59,12 @@
 //! frozen against this lane. If a mutated body ever passes, the defect is in
 //! the emitter or the gate — never in this fixture.
 
-use clean_kernel::{BinderInfo, Declaration, Environment, Expr, Level, Name};
+use clean_kernel::{BinderInfo, Declaration, Environment, Expr, ExprKind, Level, Name};
 use trust_clean_origin::{
     CleanOriginShape, EmitRefusal, GateRefusal, admit_lowering, check_faithful,
     plan_clean_origin_body,
 };
-use trust_types::admissible_body::{ArithOperand, RawBinOpKind};
+use trust_types::admissible_body::{ArithOperand, BeqOperand, RawBinOpKind};
 use trust_types::{
     BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
     Statement, Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
@@ -163,6 +163,7 @@ fn vf(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -215,8 +216,7 @@ fn u64_const(v: u128) -> Operand {
 /// a mutation, bypassing the structural check on purpose so the KERNEL's own
 /// verdict is measured (control_3 half_3's rationale, control_5's spelling).
 fn reflect_expr(env: &Environment, body: &str, n_params: usize) -> Expr {
-    reflect_expr_try(env, body, n_params)
-        .unwrap_or_else(|e| panic!("`{body}` must reflect: {e}"))
+    reflect_expr_try(env, body, n_params).unwrap_or_else(|e| panic!("`{body}` must reflect: {e}"))
 }
 
 /// The same, handing back the FROZEN producer's own refusal — used where the
@@ -392,10 +392,10 @@ fn half_3_SWAPPED_OPERANDS_are_refused_STRUCTURALLY_and_have_no_side_B() {
     assert!(matches!(refusal, EmitRefusal::LoweringShapeMismatch { .. }), "got {refusal:?}");
 
     // Layer 2 — the FROZEN producer, which is not this lane.
-    let producer = reflect_expr_try(&env, "7 % p0", 1)
-        .err()
-        .expect("the FROZEN producer must refuse `7 % p0`: swapping puts a variable in divisor \
-                 position, and a variable divisor has no side B");
+    let producer = reflect_expr_try(&env, "7 % p0", 1).err().expect(
+        "the FROZEN producer must refuse `7 % p0`: swapping puts a variable in divisor \
+                 position, and a variable divisor has no side B",
+    );
     assert!(
         producer.contains("divisor"),
         "the producer's refusal must name the divisor boundary rather than a parse failure, \
@@ -473,7 +473,10 @@ fn half_5_a_SYMBOLIC_DIVISOR_is_refused_at_three_independent_layers() {
         "the refusal must name the total-vs-panicking gap, not a generic boundary: {note}"
     );
     assert!(note.contains("options:"), "v7/D3: {note}");
-    assert!(note.contains("proof position"), "the option that always works must be offered: {note}");
+    assert!(
+        note.contains("proof position"),
+        "the option that always works must be offered: {note}"
+    );
 
     // LAYER 2 — the SEALED PLAN, reached by mutating a body whose plan IS
     // valid. `rem7` plans at `Const(7)`; an emitter that substituted the second
@@ -616,8 +619,9 @@ fn half_8_the_OTHER_FAMILY_S_realization_is_refused() {
                 id: BlockId(0),
                 stmts: Vec::new(),
                 terminator: Terminator::Call {
-                    func: "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add"
-                        .to_owned(),
+                    func:
+                        "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add"
+                            .to_owned(),
                     args: vec![copy_arg(1), u64_const(7)],
                     dest: Place::local(0),
                     target: Some(BlockId(1)),
@@ -627,6 +631,7 @@ fn half_8_the_OTHER_FAMILY_S_realization_is_refused() {
                     is_unsafe_sig: false,
                     unwind: UnwindEdge::Unreachable,
                     callee_identity: None,
+                    callee_key: None,
                 },
             },
             BasicBlock { id: BlockId(1), stmts: Vec::new(), terminator: Terminator::Return },
@@ -676,6 +681,191 @@ fn half_9_a_NON_PRELUDE_instance_is_a_capability_refusal() {
     );
 }
 
+/// `@instHShiftRight.{0} UInt64 <dictionary>`: Lean's `@[default_instance]`
+/// bridge `instance [ShiftRight α] : HShiftRight α α α` over `dictionary`.
+/// Since clean `d2d5868b7` a real island's NUMERAL shift amount elaborates
+/// through it, over the prelude's `instShiftRightUInt64` (`l7_p11` pins that).
+fn shift_bridge_over(dictionary: &str) -> Expr {
+    Expr::apps(
+        Expr::const_(Name::from_string("instHShiftRight"), vec![Level::zero()]),
+        [uint64(), Expr::const_(Name::from_string(dictionary), vec![])],
+    )
+}
+
+/// `HShiftRight.hShiftRight UInt64 UInt64 UInt64 <instance> lhs rhs`, with the
+/// instance an arbitrary term so `half_12` can pass a bridge application.
+fn shr_via(instance: Expr, lhs: Expr, rhs: Expr) -> Expr {
+    let zero3 = vec![Level::zero(), Level::zero(), Level::zero()];
+    Expr::apps(
+        Expr::const_(Name::from_string("HShiftRight.hShiftRight"), zero3),
+        [uint64(), uint64(), uint64(), instance, lhs, rhs],
+    )
+}
+
+#[test]
+fn half_12_the_shift_default_bridge_is_read_over_the_prelude_dictionary_only() {
+    // The reader takes a second spelling of the prelude's `>>>` dictionary:
+    // the default bridge applied to the prelude's own `instShiftRightUInt64`.
+    // A real island produces it for every numeral amount, so refusing it made
+    // the measured `a >>> 3` row unreachable from source (`control_14`'s
+    // `shr-literal` witness, `l7_p12`..`l7_p17`, two `tests/ui/trust` files).
+    //
+    // `half_9`'s boundary still holds one level down: the same bridge over a
+    // user dictionary that is kernel-REDUCIBLE to the prelude one is refused at
+    // recognition, as a capability boundary, never an internal error.
+    let mut env = env_uint();
+    define(
+        &mut env,
+        "myShiftRight",
+        Expr::app(Expr::const_(Name::from_string("ShiftRight"), vec![Level::zero()]), uint64()),
+        Expr::const_(Name::from_string("instShiftRightUInt64"), vec![]),
+    );
+    for (name, dictionary) in
+        [("shr3_via_bridge", "instShiftRightUInt64"), ("shr3_via_my_bridge", "myShiftRight")]
+    {
+        define(
+            &mut env,
+            name,
+            u64_arrows(1),
+            Expr::lam(
+                BinderInfo::Default,
+                uint64(),
+                shr_via(shift_bridge_over(dictionary), Expr::bvar(0), carrier_lit(3)),
+            ),
+        );
+    }
+
+    let plan = plan_clean_origin_body(&env, "shr3_via_bridge").unwrap_or_else(|refusal| {
+        panic!("the bridge over the prelude dictionary must plan: {}", refusal.note())
+    });
+    assert_eq!(
+        plan.shape(),
+        &CleanOriginShape::RawBinOp {
+            op: RawBinOpKind::Shr,
+            left: ArithOperand::Param(0),
+            right: ArithOperand::Const(3),
+        },
+        "`shr3_via_bridge` must read as `a >> 3`"
+    );
+
+    let refusal = plan_clean_origin_body(&env, "shr3_via_my_bridge")
+        .expect_err("the bridge over a user dictionary is outside the measured fragment");
+    assert!(matches!(refusal, EmitRefusal::NotEmittable { .. }), "got {refusal:?}");
+    assert!(!refusal.is_compiler_defect(), "a capability refusal, never an internal error");
+    let note = refusal.note();
+    assert!(note.contains("options:"), "v7/D3: {note}");
+    assert!(
+        note.contains("`instHShiftRightUInt64`") && note.contains("`instShiftRightUInt64`"),
+        "the refusal must name both prelude spellings that ARE in the fragment: {note}"
+    );
+}
+
+/// The dictionary argument of `HShiftRight.hShiftRight C C C <dict> lhs rhs`
+/// in the body of the one-parameter definition `name`, as the island
+/// elaborated it.
+fn shift_dictionary_of(env: &Environment, name: &str) -> Expr {
+    let value = definition_value(env, name);
+    let ExprKind::Lam(_, _, body) = value.kind() else {
+        panic!("`{name}` must be a one-parameter lambda: {value}");
+    };
+    fn strip(mut e: &Expr) -> &Expr {
+        while let ExprKind::MData(_, inner) = e.kind() {
+            e = &**inner;
+        }
+        e
+    }
+    let mut cursor = strip(body);
+    let mut args: Vec<&Expr> = Vec::new();
+    while let ExprKind::App(f, a) = cursor.kind() {
+        args.push(&**a);
+        cursor = strip(f);
+    }
+    args.reverse();
+    assert!(
+        matches!(cursor.kind(), ExprKind::Const(n, _) if *n == Name::from_string("HShiftRight.hShiftRight")),
+        "`{name}`'s body must be a `>>>` application: {body}"
+    );
+    assert_eq!(args.len(), 6, "`{name}`: {body}");
+    strip(args[3]).clone()
+}
+
+#[test]
+fn half_13_a_REAL_user_shift_instance_under_the_bridge_is_refused_at_both_sites() {
+    // `half_12` builds its user dictionary by hand and names it `myShiftRight`,
+    // nothing like the prelude's name. A REAL island names an anonymous user
+    // instance after the prelude's, with a suffix: `instance : ShiftRight
+    // UInt64` registers `instShiftRightUInt64_1`, and the numeral `a >>> 3`
+    // elaborates through the default bridge over it. A dictionary check that
+    // matched by prefix would read that as the prelude's own instance. This
+    // instance ignores the amount, so reading `a >>> 3` through it as `a >> 3`
+    // is a wrong plan. The kernel gate would then fail it as an internal
+    // disagreement, never as a proof, so the refusal is a capability fence,
+    // and the fence must hold on its own.
+    //
+    // The bridge reaches the reader at two sites: the whole body (`shr3u`,
+    // `recognise_raw_binop_expr`) and an operand of `==` (`cmpu`,
+    // `recognise_raw_binop_leaf`). Both refuse. The prelude twin of `cmpu`
+    // plans, so the refusal is the dictionary's and not the shape's.
+    // (Mutants run 2026-11-11 on emit.rs: accepting any bridge at the leaf
+    // site only, and matching the bridge's dictionary by prefix, each passed
+    // every other test in this crate.)
+    let user = island(&[
+        "instance : ShiftRight UInt64 := ⟨fun a _ => a⟩",
+        "def shr3u (a : UInt64) : UInt64 := a >>> 3",
+        "def cmpu (a : UInt64) : UInt64 := if a >>> 3 == 0 then 1 else 2",
+    ]);
+    let dictionary = shift_dictionary_of(&user, "shr3u");
+    assert_eq!(
+        dictionary.to_string(),
+        shift_bridge_over("instShiftRightUInt64_1").to_string(),
+        "the premise: the island elaborates the user's `>>>` through the bridge over the \
+         freshened, prefix-sharing name"
+    );
+    for name in ["shr3u", "cmpu"] {
+        let refusal = plan_clean_origin_body(&user, name).expect_err(
+            "the bridge over a user dictionary is outside the measured fragment at every site",
+        );
+        assert!(matches!(refusal, EmitRefusal::NotEmittable { .. }), "`{name}`: got {refusal:?}");
+        assert!(
+            !refusal.is_compiler_defect(),
+            "`{name}`: a capability refusal, never an internal error"
+        );
+        let note = refusal.note();
+        assert!(
+            note.contains("routes through an instance other than the prelude's homogeneous"),
+            "`{name}`: the refusal must be the dictionary's: {note}"
+        );
+        assert!(note.contains("options:"), "`{name}`: v7/D3: {note}");
+    }
+
+    let prelude = island(&["def cmpz (a : UInt64) : UInt64 := if a >>> 3 == 0 then 1 else 2"]);
+    let plan = plan_clean_origin_body(&prelude, "cmpz").unwrap_or_else(|refusal| {
+        panic!("the prelude twin of `cmpu` must plan: {}", refusal.note())
+    });
+    assert_eq!(
+        plan.shape(),
+        &CleanOriginShape::SelectBeqGeneral {
+            scrutinee: true,
+            cmp_left: BeqOperand::RawBin {
+                op: RawBinOpKind::Shr,
+                left: ArithOperand::Param(0),
+                right: ArithOperand::Const(3),
+            },
+            cmp_right: BeqOperand::Const(0),
+            then_arm: ArithOperand::Const(1),
+            else_arm: ArithOperand::Const(2),
+        },
+        "`cmpz` must read as `if (a >> 3) == 0 {{ 1 }} else {{ 2 }}`"
+    );
+
+    // The fence's other premise: a user declaration cannot take the prelude
+    // instance's own name, so the exact-name check cannot be spoofed.
+    let mut session = trust_certify::clean_island::CleanIslandSession::new();
+    let batch =
+        session.check_all(&["instance instShiftRightUInt64 : ShiftRight UInt64 := ⟨fun a _ => a⟩"]);
+    assert!(batch.is_rejected(), "a user instance may not redeclare the prelude's: {batch:?}");
+}
+
 #[test]
 fn half_10_every_option_is_spelled_in_the_OPERATOR_THAT_WAS_REFUSED() {
     // **A v7/D3 DEFECT, fixed and pinned here.**
@@ -698,10 +888,9 @@ fn half_10_every_option_is_spelled_in_the_OPERATOR_THAT_WAS_REFUSED() {
         "def remv (a : UInt64) (b : UInt64) : UInt64 := a % b",
     ]);
 
-    for (name, op, other, then_arm, zero_case) in [
-        ("divv", "/", "%", "0", "`x / 0 = 0`"),
-        ("remv", "%", "/", "a", "`x % 0 = x`"),
-    ] {
+    for (name, op, other, then_arm, zero_case) in
+        [("divv", "/", "%", "0", "`x / 0 = 0`"), ("remv", "%", "/", "a", "`x % 0 = x`")]
+    {
         let note = plan_clean_origin_body(&env, name)
             .expect_err("a symbolic divisor must NOT plan")
             .note();

@@ -63,6 +63,45 @@ fn make_vc_trivial(kind: VcKind, function: &str) -> VerificationCondition {
     }
 }
 
+/// Publication-gate reason carried by a raw `Proved` row that
+/// `trust_report::build_json_report` refuses to publish as proof credit.
+const NO_REPLAY_REASON: &str = "no live verifier replay capability";
+
+/// Assert that `report` carries exactly `n` obligations and publishes none of
+/// them as proved: `build_json_report` sends every report through the
+/// publication gate (`gate_report_for_publication` ->
+/// `JsonProofReport::sanitize_deserialized`), which turns every raw `Proved`
+/// row into `Unknown`, because a freely constructed `VerificationResult`
+/// carries no live verifier replay capability. Behaviour since 72ada1163c6
+/// (gate added to `build_json_report`) and b6171397b6d (every raw proof
+/// downgraded, even a publication-shaped one). The gate is a deliberate
+/// false-PROVE guard; these expectations pin it end to end.
+fn assert_raw_proved_not_published(report: &trust_types::JsonProofReport, n: usize) {
+    assert_eq!(report.summary.total_obligations, n);
+    assert_eq!(report.summary.total_proved, 0, "a raw Proved row must not be published as proved");
+    assert_eq!(report.summary.total_runtime_checked, 0);
+    assert_eq!(report.summary.total_unknown, n);
+    assert_eq!(report.summary.verdict, trust_types::CrateVerdict::Inconclusive);
+    for func in &report.functions {
+        for ob in &func.obligations {
+            match &ob.outcome {
+                trust_types::ObligationOutcome::Unknown { reason } => assert!(
+                    reason.contains(NO_REPLAY_REASON),
+                    "{}: unexpected downgrade reason: {reason}",
+                    func.function
+                ),
+                other => {
+                    panic!("{}: raw Proved must publish as Unknown, got {other:?}", func.function)
+                }
+            }
+        }
+    }
+    let text = trust_report::format_json_summary(report);
+    assert!(text.contains("Verdict: INCONCLUSIVE"), "text: {text}");
+    assert!(!text.contains("Verdict: VERIFIED"), "text: {text}");
+    assert!(!text.contains("PROVED"), "no row may render as PROVED: {text}");
+}
+
 // ===========================================================================
 // 1. FunctionalCorrectness
 // ===========================================================================
@@ -100,7 +139,7 @@ fn test_functional_correctness_description() {
 // to verify the Report pipeline handles this VcKind correctly.
 
 #[test]
-fn test_functional_correctness_report_proved() {
+fn test_functional_correctness_raw_proved_is_not_published() {
     let vc = make_vc_trivial(
         VcKind::FunctionalCorrectness {
             property: "sort_order".to_string(),
@@ -118,11 +157,11 @@ fn test_functional_correctness_report_proved() {
         solver_warnings: None,
         native_proof_envelope: None,
     };
+    assert!(result.is_proved());
     let results = vec![(vc, result)];
     let report = trust_report::build_json_report("fc_crate", &results);
 
-    assert_eq!(report.summary.total_obligations, 1);
-    assert_eq!(report.summary.total_proved, 1);
+    assert_raw_proved_not_published(&report, 1);
     assert_eq!(report.functions.len(), 1);
     assert_eq!(report.functions[0].function, "sort_check");
 
@@ -138,7 +177,7 @@ fn test_functional_correctness_report_proved() {
     // Verify text summary
     let text = trust_report::format_json_summary(&report);
     assert!(text.contains("sort_check"), "summary should mention function name");
-    assert!(text.contains("PROVED"), "summary should show proved status");
+    assert!(text.contains("functional correctness"), "summary should show the obligation");
 }
 
 #[test]
@@ -223,7 +262,7 @@ fn test_taint_violation_router_unknown() {
 }
 
 #[test]
-fn test_taint_violation_report() {
+fn test_taint_violation_report_raw_proved_is_not_published() {
     let vc = make_vc_trivial(
         VcKind::TaintViolation {
             source_label: "user_input".to_string(),
@@ -235,11 +274,11 @@ fn test_taint_violation_report() {
 
     let router = mock_router();
     let result = router.verify_one(&vc);
+    assert!(result.is_proved(), "constant folder should prove Bool(false): {result:?}");
     let results = vec![(vc, result)];
     let report = trust_report::build_json_report("taint_crate", &results);
 
-    assert_eq!(report.summary.total_obligations, 1);
-    assert_eq!(report.summary.total_proved, 1);
+    assert_raw_proved_not_published(&report, 1);
     assert_eq!(report.functions[0].function, "sanitized_query");
 
     let ob = &report.functions[0].obligations[0];
@@ -305,7 +344,7 @@ fn test_resilience_violation_router_unknown() {
 }
 
 #[test]
-fn test_resilience_violation_report() {
+fn test_resilience_violation_report_raw_proved_is_not_published() {
     let vc = make_vc_trivial(
         VcKind::ResilienceViolation {
             service: "cache_service".to_string(),
@@ -317,11 +356,11 @@ fn test_resilience_violation_report() {
 
     let router = mock_router();
     let result = router.verify_one(&vc);
+    assert!(result.is_proved(), "constant folder should prove Bool(false): {result:?}");
     let results = vec![(vc, result)];
     let report = trust_report::build_json_report("resilience_crate", &results);
 
-    assert_eq!(report.summary.total_obligations, 1);
-    assert_eq!(report.summary.total_proved, 1);
+    assert_raw_proved_not_published(&report, 1);
     assert_eq!(report.functions[0].function, "resilient_cache_get");
 
     let ob = &report.functions[0].obligations[0];
@@ -375,7 +414,7 @@ fn test_non_termination_router_unknown() {
 }
 
 #[test]
-fn test_non_termination_report() {
+fn test_non_termination_report_raw_proved_is_not_published() {
     let vc = make_vc_trivial(
         VcKind::NonTermination { context: "loop".to_string(), measure: "items.len()".to_string() },
         "drain_loop",
@@ -383,11 +422,11 @@ fn test_non_termination_report() {
 
     let router = mock_router();
     let result = router.verify_one(&vc);
+    assert!(result.is_proved(), "constant folder should prove Bool(false): {result:?}");
     let results = vec![(vc, result)];
     let report = trust_report::build_json_report("termination_crate", &results);
 
-    assert_eq!(report.summary.total_obligations, 1);
-    assert_eq!(report.summary.total_proved, 1);
+    assert_raw_proved_not_published(&report, 1);
     assert_eq!(report.functions[0].function, "drain_loop");
 
     let ob = &report.functions[0].obligations[0];
@@ -452,7 +491,7 @@ fn test_translation_validation_router_unknown() {
 }
 
 #[test]
-fn test_translation_validation_report() {
+fn test_translation_validation_report_raw_proved_is_not_published() {
     let vc = make_vc_trivial(
         VcKind::TranslationValidation {
             pass: "constant_folding".to_string(),
@@ -463,11 +502,11 @@ fn test_translation_validation_report() {
 
     let router = mock_router();
     let result = router.verify_one(&vc);
+    assert!(result.is_proved(), "constant folder should prove Bool(false): {result:?}");
     let results = vec![(vc, result)];
     let report = trust_report::build_json_report("tv_crate", &results);
 
-    assert_eq!(report.summary.total_obligations, 1);
-    assert_eq!(report.summary.total_proved, 1);
+    assert_raw_proved_not_published(&report, 1);
     assert_eq!(report.functions[0].function, "fold_constants");
 
     let ob = &report.functions[0].obligations[0];
@@ -487,7 +526,7 @@ fn test_translation_validation_report() {
 // ===========================================================================
 
 #[test]
-fn test_all_five_misc_vcs_multi_function_report() {
+fn test_all_five_misc_vcs_multi_function_report_publishes_no_raw_proof() {
     // Route 4 VcKinds through the Router (FunctionalCorrectness excluded —
     // classify_property() in trust-router lacks an arm for it).
     let routable_vcs = vec![
@@ -561,8 +600,7 @@ fn test_all_five_misc_vcs_multi_function_report() {
 
     let report = trust_report::build_json_report("misc_l1_crate", &results);
     assert_eq!(report.summary.functions_analyzed, 5);
-    assert_eq!(report.summary.total_obligations, 5);
-    assert_eq!(report.summary.total_proved, 5);
+    assert_raw_proved_not_published(&report, 5);
 
     // All function names should appear
     let func_names: Vec<&str> = report.functions.iter().map(|f| f.function.as_str()).collect();
@@ -588,7 +626,7 @@ fn test_all_five_misc_vcs_multi_function_report() {
     let json = serde_json::to_string_pretty(&report).expect("serialize");
     let roundtrip: trust_types::JsonProofReport = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(roundtrip.summary.total_obligations, 5);
-    assert_eq!(roundtrip.summary.total_proved, 5);
+    assert_raw_proved_not_published(&roundtrip, 5);
 
     // Verify text summary mentions all function names
     let text = trust_report::format_json_summary(&report);

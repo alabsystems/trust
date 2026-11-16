@@ -12,5 +12,6 @@ LL | | }
    = note: 2× [assert] runtime-checked: compiler retained the existing assertion because the proof is not yet static
 
  INFO rustc_mir_transform::trust_verify Trust zero-obligation registry gate: fn=zero_obligation_registry_call_gate::indirect calls_authenticated=false accepted=false
+Trust: CONTRACT [global-alloc-dealloc-panic-free] `zero_obligation_registry_call_gate::indirect`: allocation(s) and/or allocation-owning drop(s) rely on `GlobalAlloc::{alloc,dealloc}` never panicking; DISCHARGED vacuously — no `#[global_allocator]` in the crate graph, so every allocation and dealloc is `Global`'s std chain, which has no panic path; the proof remains conditional on the final link registering no other allocator
  INFO rustc_mir_transform::trust_verify Trust zero-obligation registry gate: fn=zero_obligation_registry_call_gate::leaf calls_authenticated=true accepted=true
  INFO rustc_mir_transform::trust_verify Trust zero-obligation registry gate: fn=zero_obligation_registry_call_gate::leaf_wrapper calls_authenticated=true accepted=true

@@ -54,9 +54,16 @@
 //! `recognize_wf_nat_rec`.
 
 use clean_kernel::{BinderInfo, Declaration, Environment, Expr, Level, Name};
+use trust_clean_origin::admission::{
+    DigestMintRefusal, ExportDigestRefusal, VerdictDigest, mint_encoded_digest_for_export,
+};
 use trust_clean_origin::{
-    CleanOriginShape, EmitRefusal, FaithfulnessMethod, GateRefusal, ReflectedWfFunctional,
-    admit_lowering, check_faithful_wf_functional, plan_clean_origin_body, reflect_wf_functional,
+    CleanOriginShape, EmitRefusal, FaithfulnessMethod, GateRefusal, NonExportableNotice,
+    NonExportableReason, ReflectedWfFunctional, admit_lowering, check_faithful_wf_functional,
+    plan_clean_origin_body, reflect_wf_functional,
+};
+use trust_symbols::{
+    AxiomClosure, CicKernelRecheck, KernelAuthority as _, KernelStatus, TermDigest,
 };
 use trust_types::admissible_body::{RecBodyExpr, WfRecBody, recognize_wf_nat_rec};
 use trust_types::{
@@ -291,6 +298,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: Place, target: BlockId) -> Termi
         is_unsafe_sig: false,
         unwind: UnwindEdge::Continue,
         callee_identity: None,
+        callee_key: None,
     }
 }
 
@@ -410,6 +418,7 @@ fn emitted_countdown_sum() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -607,8 +616,13 @@ fn control_8_wrong_branch_value_refused_at_both_layers() {
             ..recognised_body()
         },
     ] {
-        let reflected = reflect_wf_functional(&env, "countdownSum", &wrong, trust_clean_origin::WfLowering::OnParameter)
-            .expect("the wrong-value functional reflects as a term (it is just wrong)");
+        let reflected = reflect_wf_functional(
+            &env,
+            "countdownSum",
+            &wrong,
+            trust_clean_origin::WfLowering::OnParameter,
+        )
+        .expect("the wrong-value functional reflects as a term (it is just wrong)");
         let gate_refusal =
             check_faithful_wf_functional(&env, "countdownSum", &reflected, &nat_carrier())
                 .expect_err("the kernel must refuse a wrong branch value");
@@ -650,10 +664,14 @@ fn control_8_diverging_recursive_argument_refused_at_both_layers() {
     // directly at a non-decreasing argument. Side A's borrowed proof is of
     // `Nat.lt (n - 1) n` and cannot fill a slot at `n`, so the kernel refuses
     // — a TYPING verdict, reported as `DecreaseSlotBorrowRefused`.
-    let diverging =
-        WfRecBody { rec_args: vec![RecBodyExpr::Decreasing], ..recognised_body() };
-    let reflected = reflect_wf_functional(&env, "countdownSum", &diverging, trust_clean_origin::WfLowering::OnParameter)
-        .expect("the diverging reading reflects as a term");
+    let diverging = WfRecBody { rec_args: vec![RecBodyExpr::Decreasing], ..recognised_body() };
+    let reflected = reflect_wf_functional(
+        &env,
+        "countdownSum",
+        &diverging,
+        trust_clean_origin::WfLowering::OnParameter,
+    )
+    .expect("the diverging reading reflects as a term");
     let gate_refusal =
         check_faithful_wf_functional(&env, "countdownSum", &reflected, &nat_carrier())
             .expect_err("a non-decreasing emitted recursion cannot take side A's proof");
@@ -694,8 +712,13 @@ fn control_8_an_emitter_authored_decrease_proof_is_refused() {
     // …and the REAL producer never writes one: the same body, reflected, is
     // admitted. That pairing is what makes the refusal above a statement about
     // authorship rather than about the term.
-    let reflected =
-        reflect_wf_functional(&env, "countdownSum", &recognised_body(), trust_clean_origin::WfLowering::OnParameter).expect("reflects");
+    let reflected = reflect_wf_functional(
+        &env,
+        "countdownSum",
+        &recognised_body(),
+        trust_clean_origin::WfLowering::OnParameter,
+    )
+    .expect("reflects");
     check_faithful_wf_functional(&env, "countdownSum", &reflected, &nat_carrier())
         .expect("the producer's own rendering, with the sentinel, admits");
 }
@@ -988,4 +1011,119 @@ fn control_8_fragment_boundaries_stated_not_blurred() {
     }
     admit_lowering(&env, &plan, &extracted)
         .expect("the emitted `Nat::sub(&n, &1)` body is faithful to the `Nat.pred` spelling");
+}
+
+// ═══════ THE EXPORT SEAM — a library may DEFINE this def; no verdict leaves ═══════
+//
+// 2026-09-16. `mint_encoded_digest_for_export` refuses a WF verdict
+// (`UnencodableFaithfulness` — no wire tag, deliberately), and the compiler
+// used to make that refusal FATAL for the exporting crate. Measured
+// consequence (wf1 probes 36b/36d/18b/18c): a crate that merely CONTAINED a
+// well-founded def could not be built as a library. The seam's refusal now
+// converts — for that ONE variant — into a `NonExportableNotice`, the row the
+// compiler exports in the certificate's place. These two tests pin both halves
+// through the REAL seam over this file's measured emission: the honest body
+// yields a notice that is not evidence, and a mistranslated body yields NO
+// notice, so the fatal stays where it was.
+
+/// A kernel-checked status with an audited-EMPTY closure — the honest status
+/// of `countdownSum`, which rests on nothing.
+fn certified_status() -> KernelStatus {
+    CicKernelRecheck::held_by_kernel_recheck()
+        .kernel_checked(TermDigest::of_bytes(b"control-8-export-seam"), AxiomClosure::audited([]))
+}
+
+#[test]
+fn control_8_the_export_seam_yields_a_notice_and_never_a_certificate() {
+    let env = env_with_cds();
+    let refusal = mint_encoded_digest_for_export(
+        &env,
+        "countdownSum",
+        &certified_status(),
+        &emitted_countdown_sum(),
+    )
+    .expect_err(
+        "A WELL-FOUNDED VERDICT CROSSED THE EXPORT SEAM: the wire has no tag for \
+         `WellFoundedFunctionalDefeq`, so bytes here mean it was relabelled as something else",
+    );
+    assert!(
+        matches!(
+            refusal,
+            ExportDigestRefusal::Mint(DigestMintRefusal::UnencodableFaithfulness {
+                method: FaithfulnessMethod::WellFoundedFunctionalDefeq,
+                ..
+            })
+        ),
+        "the seam must get all the way to the wire spelling and refuse THERE — i.e. after \
+         re-earning a fresh Faithful against the serialized body; got {refusal:?}"
+    );
+    assert!(
+        !refusal.is_compiler_defect(),
+        "a known format boundary is not the pipeline disagreeing with itself — labelling it \
+         `internal: … please report` is the misdirection probe 36b recorded"
+    );
+
+    let notice = refusal
+        .non_exportable_notice()
+        .expect("the ONE refusal that converts into a non-exportable row");
+    assert_eq!(notice.decl(), "countdownSum");
+    assert_eq!(
+        notice.reason(),
+        &NonExportableReason::UnspellableFaithfulness {
+            evidence_form: "WellFoundedFunctionalDefeq".to_owned()
+        },
+        "the evidence form travels as diagnostic TEXT, never as a tag"
+    );
+
+    // The row is NOT a certificate: the digest decoder refuses it on the magic,
+    // so an importer that has never heard of notices fails closed …
+    let row = notice.encode();
+    assert!(
+        VerdictDigest::decode(&row).is_err(),
+        "A NOTICE DECODED AS A VERDICT DIGEST — the importer would proceed to readmission"
+    );
+    // … and one that has recognises it, and can only refuse.
+    assert_eq!(NonExportableNotice::recognize(&row), Some(Ok(notice)));
+}
+
+/// THE CLOSE NEGATIVE TWIN. Same declaration, same status, same seam — but the
+/// serialized body's zero arm materialises 1 where the definition says 0. That
+/// is a wrong binary, not a format boundary, and it must NOT be launderable
+/// into "non-exportable": no notice, still a compiler defect, still fatal at
+/// the compiler's export provider.
+#[test]
+fn control_8_a_mistranslated_body_gets_no_notice_at_the_export_seam() {
+    let env = env_with_cds();
+    let mut mutant = emitted_countdown_sum();
+    if let Terminator::Call { args, .. } = &mut mutant.body.blocks[2].terminator {
+        *args = vec![Operand::Constant(ConstValue::Uint(1, 64))];
+    }
+    let refusal =
+        mint_encoded_digest_for_export(&env, "countdownSum", &certified_status(), &mutant)
+            .expect_err("the seam re-gates the body being serialized; a wrong one must refuse");
+    assert!(
+        matches!(refusal, ExportDigestRefusal::Emit(EmitRefusal::LoweringShapeMismatch { .. })),
+        "expected the structural catch through the seam, got {refusal:?}"
+    );
+    assert!(refusal.is_compiler_defect());
+    assert!(
+        refusal.non_exportable_notice().is_none(),
+        "A WRONG BODY WAS OFFERED A NON-EXPORTABLE ROW: the defining crate would then build \
+         and RUN the mistranslation locally with the export seam's re-gate silenced"
+    );
+
+    // And a status that is not a kernel verdict gets none either — the notice
+    // is for a def that passed everything EXCEPT the wire spelling.
+    let refusal = mint_encoded_digest_for_export(
+        &env,
+        "countdownSum",
+        &KernelStatus::Parsed,
+        &emitted_countdown_sum(),
+    )
+    .expect_err("a parse is not a kernel verdict");
+    assert!(
+        matches!(refusal, ExportDigestRefusal::Mint(DigestMintRefusal::NotKernelChecked { .. })),
+        "got {refusal:?}"
+    );
+    assert!(refusal.non_exportable_notice().is_none());
 }

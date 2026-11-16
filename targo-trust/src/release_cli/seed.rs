@@ -26,25 +26,33 @@ const REQUIRED_PAYLOAD_FAMILIES: &[(&str, &str)] = &[
 pub(super) fn check_seed_freshness(root: &Path, profile: ReleaseProfile) -> GateReport {
     let release = profile.requires_bound_tools();
     let mut findings = Vec::new();
-    let source_text =
-        match read_bounded_utf8_file(&root.join("src/version"), MAX_RELEASE_METADATA_BYTES) {
-            Ok(text) => text,
-            Err(error) => {
-                findings.push(finding(
-                    release,
-                    "seed-source-version-unreadable",
-                    format!("could not read src/version: {error}"),
-                ));
-                return report(findings);
-            }
-        };
+    // The seed's `compiler_version` is on the Rust COMPAT line (`1.96.0-trust`),
+    // so its cadence is judged against `src/rust-compat-version`, never against
+    // Trust's own product version in `src/version` (0.x, a different line).
+    let source_text = match read_bounded_utf8_file(
+        &root.join("src/rust-compat-version"),
+        MAX_RELEASE_METADATA_BYTES,
+    ) {
+        Ok(text) => text,
+        Err(error) => {
+            findings.push(finding(
+                release,
+                "seed-source-version-unreadable",
+                format!("could not read src/rust-compat-version: {error}"),
+            ));
+            return report(findings);
+        }
+    };
     let source_version = match parse_version(source_text.trim()) {
         Some(version) => version,
         None => {
             findings.push(finding(
                 release,
                 "seed-source-version-invalid",
-                format!("src/version is not a complete semantic version: {:?}", source_text.trim()),
+                format!(
+                    "src/rust-compat-version is not a complete semantic version: {:?}",
+                    source_text.trim()
+                ),
             ));
             return report(findings);
         }
@@ -99,7 +107,7 @@ pub(super) fn check_seed_freshness(root: &Path, profile: ReleaseProfile) -> Gate
 
 fn report(findings: Vec<GateFinding>) -> GateReport {
     GateReport::new("seed-freshness", findings).with_evidence_refs([
-        "src/version",
+        "src/rust-compat-version",
         "src/stage0",
         "bootstrap/trust-stage0/dist",
     ])
@@ -571,7 +579,10 @@ mod tests {
     fn metadata_profile_warns_but_publication_requires_payloads() {
         let root = tempfile::tempdir().expect("seed fixture");
         fs::create_dir_all(root.path().join("src")).expect("src");
-        fs::write(root.path().join("src/version"), "1.99.0\n").expect("version");
+        fs::write(root.path().join("src/rust-compat-version"), "1.99.0\n").expect("version");
+        // The product line must NOT be what the cadence reads: a 0.x value here
+        // would fail every seed if it were.
+        fs::write(root.path().join("src/version"), "0.10.0\n").expect("product version");
         let hash = "0".repeat(64);
         let commit = "1".repeat(40);
         fs::write(

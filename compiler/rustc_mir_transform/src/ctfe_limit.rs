@@ -8,11 +8,32 @@ use rustc_middle::mir::{
 use rustc_middle::ty::TyCtxt;
 use tracing::instrument;
 
+use crate::PassPolicy;
+
 pub(super) struct CtfeLimit;
 
 impl<'tcx> crate::MirPass<'tcx> for CtfeLimit {
     #[instrument(skip(self, _tcx, body))]
     fn run_pass(&self, _tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        let may_have_cycle = body
+            .basic_blocks
+            .iter_enumerated()
+            .any(|(node, data)| data.terminator().successors().any(|succ| succ <= node));
+        if !may_have_cycle {
+            for bbdata in body.basic_blocks.as_mut_preserves_cfg() {
+                if matches!(
+                    bbdata.terminator().kind,
+                    TerminatorKind::Call { .. } | TerminatorKind::TailCall { .. }
+                ) {
+                    let source_info = bbdata.terminator().source_info;
+                    bbdata
+                        .statements
+                        .push(Statement::new(source_info, StatementKind::ConstEvalCounter));
+                }
+            }
+            return;
+        }
+
         let doms = body.basic_blocks.dominators();
         let indices: Vec<BasicBlock> = body
             .basic_blocks
@@ -29,6 +50,10 @@ impl<'tcx> crate::MirPass<'tcx> for CtfeLimit {
             })
             .collect();
 
+        if indices.is_empty() {
+            return;
+        }
+
         let basic_blocks = body.basic_blocks.as_mut_preserves_cfg();
         for index in indices {
             let bbdata = &mut basic_blocks[index];
@@ -37,8 +62,9 @@ impl<'tcx> crate::MirPass<'tcx> for CtfeLimit {
         }
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // This is part of CTFE diagnostics rather than an optimization.
+        PassPolicy::optional(true)
     }
 }
 

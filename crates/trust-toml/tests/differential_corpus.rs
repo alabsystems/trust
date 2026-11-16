@@ -49,8 +49,8 @@
 //! `[patch.crates-io]`. Both of those are graph-wide and would capture this
 //! dependency too, so this file would compare `trust-toml` against ITSELF and
 //! report green. That is not hypothetical: it is what happened to the `sha2`
-//! swap, and the finding is written up in `crates/Cargo.toml`'s commented-out
-//! `[patch.crates-io] sha2` block.
+//! swap; the finding remains in the historical workspace's commented-out
+//! `[patch.crates-io] sha2` block (`992ace2954^:crates/Cargo.toml`).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -153,7 +153,9 @@ fn is_dotted_key_line(line: &str) -> bool {
     let key = key.trim();
     !key.is_empty()
         && key.contains('.')
-        && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn is_quoted_key_line(line: &str) -> bool {
@@ -216,10 +218,8 @@ fn trust_toml_agrees_with_the_incumbent_over_the_pinned_corpus() {
                 let mut differences = Vec::new();
                 compare(incumbent, ours, "", &mut differences);
                 if !differences.is_empty() {
-                    disagreements.push(format!(
-                        "TREES DIFFER  {path}\n    {}",
-                        differences.join("\n    ")
-                    ));
+                    disagreements
+                        .push(format!("TREES DIFFER  {path}\n    {}", differences.join("\n    ")));
                 }
             }
             (Err(_), Err(_)) => rejected_by_both += 1,
@@ -247,4 +247,3 @@ fn trust_toml_agrees_with_the_incumbent_over_the_pinned_corpus() {
         disagreements.join("\n")
     );
 }
-

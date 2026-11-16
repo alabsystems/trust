@@ -5,7 +5,7 @@
 // feature, release, configured, or cross-target build can silently remove the
 // very model or harness the gate is meant to inspect.
 
-use std::process::Command;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::bounded_process;
@@ -78,8 +78,20 @@ pub(crate) fn configured_cargo_build_target() -> Result<Option<String>, String> 
         }
     }
 
-    let targo = super::discovery::discover_native_trust_cargo_checked()?;
-    let mut command = Command::new(&targo);
+    let (rustc, targo) = super::discovery::discover_native_trust_toolchain_checked()?;
+    configured_cargo_build_target_with_targo(&targo, &rustc)
+}
+
+/// `configured_cargo_build_target` against an already discovered toolchain.
+/// `config get` runs no compiler, but it is built by
+/// `cargo_selection::selection_probe_command` like every other Targo probe:
+/// the authenticated compiler pinned, no rustc wrapper, no rustflags, and the
+/// `[host]` rustflags refusal first.
+pub(crate) fn configured_cargo_build_target_with_targo(
+    targo: &Path,
+    rustc: &Path,
+) -> Result<Option<String>, String> {
+    let mut command = super::cargo_selection::selection_probe_command(targo, rustc, &[])?;
     command.args([
         "-Z",
         "unstable-options",
@@ -268,7 +280,7 @@ fn required_value(args: &[String], index: &mut usize, option: &str) -> Result<St
     args.get(*index)
         .filter(|value| !value.is_empty() && value.as_str() != "--")
         .cloned()
-        .ok_or_else(|| format!("{option} requires a nonempty value"))
+        .ok_or_else(|| format!("{option} requires a value, and `--` is not one"))
 }
 
 fn optional_value(args: &[String], index: &mut usize) -> Option<String> {

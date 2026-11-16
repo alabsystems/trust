@@ -29,7 +29,7 @@ impl DenseLocationMap {
 
         let mut basic_blocks = IndexVec::with_capacity(num_points);
         for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
-            basic_blocks.extend((0..=bb_data.statements.len()).map(|_| bb));
+            basic_blocks.extend(std::iter::repeat_n(bb, bb_data.statements.len() + 1));
         }
         // Invariant: no block is preceded by more than all statements.
         debug_assert!(*statements_before_block.iter().max().unwrap() < num_points);
@@ -59,6 +59,15 @@ impl DenseLocationMap {
     pub fn entry_point(&self, block: BasicBlock) -> PointIndex {
         let start_index = self.statements_before_block[block];
         PointIndex::new(start_index)
+    }
+
+    /// Returns the `PointIndex` for the terminator in the given `BasicBlock`. O(1).
+    #[inline]
+    pub fn terminator(&self, block: BasicBlock) -> PointIndex {
+        let next_block = BasicBlock::new(block.index() + 1);
+        let next_start_index =
+            *self.statements_before_block.get(next_block).unwrap_or(&self.num_points);
+        PointIndex::new(next_start_index - 1)
     }
 
     /// Return the PointIndex for the block start of this index.

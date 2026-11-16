@@ -49,8 +49,8 @@
 use std::fmt;
 
 use serde::ser::{
-    Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant,
-    SerializeTuple, SerializeTupleStruct, SerializeTupleVariant,
+    Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
+    SerializeTupleStruct, SerializeTupleVariant,
 };
 
 use crate::datetime::{DATETIME_PRIVATE_FIELD, DATETIME_PRIVATE_NAME};
@@ -298,9 +298,7 @@ impl serde::Serializer for NodeSerializer {
     /// nothing can read is the defect this same run found in the key path
     /// below.
     fn serialize_bytes(self, value: &[u8]) -> Produced {
-        Ok(Some(Node::Array(
-            value.iter().map(|byte| Node::Integer(i64::from(*byte))).collect(),
-        )))
+        Ok(Some(Node::Array(value.iter().map(|byte| Node::Integer(i64::from(*byte))).collect())))
     }
 
     fn serialize_none(self) -> Produced {
@@ -403,11 +401,7 @@ impl serde::Serializer for NodeSerializer {
         Ok(SeqBuilder { items: Vec::with_capacity(len) })
     }
 
-    fn serialize_tuple_struct(
-        self,
-        _name: &'static str,
-        len: usize,
-    ) -> Result<SeqBuilder, Error> {
+    fn serialize_tuple_struct(self, _name: &'static str, len: usize) -> Result<SeqBuilder, Error> {
         Ok(SeqBuilder { items: Vec::with_capacity(len) })
     }
 
@@ -418,21 +412,14 @@ impl serde::Serializer for NodeSerializer {
         variant: &'static str,
         len: usize,
     ) -> Result<TupleVariantBuilder, Error> {
-        Ok(TupleVariantBuilder {
-            variant,
-            items: SeqBuilder { items: Vec::with_capacity(len) },
-        })
+        Ok(TupleVariantBuilder { variant, items: SeqBuilder { items: Vec::with_capacity(len) } })
     }
 
     fn serialize_map(self, _len: Option<usize>) -> Result<TableBuilder, Error> {
         Ok(TableBuilder::default())
     }
 
-    fn serialize_struct(
-        self,
-        name: &'static str,
-        _len: usize,
-    ) -> Result<StructBuilder, Error> {
+    fn serialize_struct(self, name: &'static str, _len: usize) -> Result<StructBuilder, Error> {
         // The datetime interception. `serde` has no datetime type, so both this
         // crate and the incumbent smuggle one through as a struct with a
         // reserved name (see `crate::datetime`). Recognising the name here is
@@ -537,10 +524,7 @@ impl SerializeTupleVariant for TupleVariantBuilder {
     }
 
     fn end(self) -> Produced {
-        Ok(Some(Node::Table(vec![(
-            self.variant.to_string(),
-            Node::Array(self.items.items),
-        )])))
+        Ok(Some(Node::Table(vec![(self.variant.to_string(), Node::Array(self.items.items))])))
     }
 }
 
@@ -594,8 +578,10 @@ impl SerializeMap for TableBuilder {
 
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
         let key = self.pending_key.take().ok_or_else(|| {
-            Error::new("a map value was serialized before its key (this is a `serde` protocol \
-                        violation in the caller's `Serialize` impl)")
+            Error::new(
+                "a map value was serialized before its key (this is a `serde` protocol \
+                        violation in the caller's `Serialize` impl)",
+            )
         })?;
         self.set(key, value)
     }
@@ -681,10 +667,7 @@ impl SerializeStructVariant for StructVariantBuilder {
     }
 
     fn end(self) -> Produced {
-        Ok(Some(Node::Table(vec![(
-            self.variant.to_string(),
-            Node::Table(self.fields.entries),
-        )])))
+        Ok(Some(Node::Table(vec![(self.variant.to_string(), Node::Table(self.fields.entries))])))
     }
 }
 
@@ -931,8 +914,8 @@ mod tests {
         let error = to_string(&Fields(&[("k", FieldValue::List(&[]))]));
         assert!(error.is_ok(), "an empty array is fine");
         // An array of `Option` with a `None` in it.
-        let error = to_string(&vec![Some(1), None])
-            .expect_err("a None inside an array cannot be dropped");
+        let error =
+            to_string(&vec![Some(1), None]).expect_err("a None inside an array cannot be dropped");
         assert!(error.message().contains("inside an array"), "{error}");
         assert!(error.message().contains("Options:"), "every refusal names the fix: {error}");
     }
@@ -951,8 +934,7 @@ mod tests {
     #[test]
     fn values_with_no_toml_spelling_are_refused_with_the_fix_named() {
         for value in [FieldValue::Unit, FieldValue::Big(u64::MAX)] {
-            let error =
-                to_string(&Fields(&[("k", value)])).expect_err("no TOML spelling exists");
+            let error = to_string(&Fields(&[("k", value)])).expect_err("no TOML spelling exists");
             assert!(
                 error.message().contains("Options:"),
                 "a refusal with no next step is a defect: {error}"
@@ -983,11 +965,8 @@ mod tests {
     fn struct_field_order_survives_and_is_not_sorted() {
         // The reason the intermediate is an ordered `Vec` and not a `Map`. A
         // sorted intermediate would emit `a` before `z` here.
-        let document = to_string(&Fields(&[
-            ("z", FieldValue::Int(1)),
-            ("a", FieldValue::Int(2)),
-        ]))
-        .unwrap();
+        let document =
+            to_string(&Fields(&[("z", FieldValue::Int(1)), ("a", FieldValue::Int(2))])).unwrap();
         assert_eq!(document, "z = 1\na = 2\n");
     }
 
@@ -1007,7 +986,10 @@ mod tests {
         // table. Silent, and wrong.
         let source = "d = 1979-05-27T07:32:00Z\nld = 1979-05-27\nlt = 07:32:00\n";
         let value: Value = crate::from_str(source).unwrap();
-        assert_eq!(to_string(&value).unwrap(), "d = 1979-05-27T07:32:00Z\nld = 1979-05-27\nlt = 07:32:00\n");
+        assert_eq!(
+            to_string(&value).unwrap(),
+            "d = 1979-05-27T07:32:00Z\nld = 1979-05-27\nlt = 07:32:00\n"
+        );
 
         // And directly, not only through `Value`.
         let mut table = Table::new();
@@ -1131,10 +1113,7 @@ mod tests {
     fn pretty_differs_from_compact_only_in_arrays_of_two_or_more() {
         let value = Fields(&[("k", FieldValue::List(&[1, 2])), ("s", FieldValue::Str("x"))]);
         assert_eq!(to_string(&value).unwrap(), "k = [1, 2]\ns = \"x\"\n");
-        assert_eq!(
-            to_string_pretty(&value).unwrap(),
-            "k = [\n    1,\n    2,\n]\ns = \"x\"\n"
-        );
+        assert_eq!(to_string_pretty(&value).unwrap(), "k = [\n    1,\n    2,\n]\ns = \"x\"\n");
         let single = Fields(&[("k", FieldValue::List(&[1]))]);
         assert_eq!(to_string(&single).unwrap(), to_string_pretty(&single).unwrap());
     }
@@ -1169,8 +1148,9 @@ y = 2
         let value: Value = crate::from_str(source).unwrap();
         for style in [to_string as fn(&Value) -> _, to_string_pretty] {
             let emitted = style(&value).unwrap();
-            let reparsed: Value = crate::from_str(&emitted)
-                .unwrap_or_else(|error| panic!("emitted document does not parse: {error}\n{emitted}"));
+            let reparsed: Value = crate::from_str(&emitted).unwrap_or_else(|error| {
+                panic!("emitted document does not parse: {error}\n{emitted}")
+            });
             assert_eq!(reparsed, value);
         }
     }

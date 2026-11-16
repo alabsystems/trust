@@ -1,0 +1,14 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (local_thm)
+  --> $DIR/clean_citation_not_found_without_dependencies.rs:19:5
+   |
+LL |     theorem local_thm : 0 = 0 := rfl
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: cited theorem `nowhere` is not registered in any Clean island or the prelude
+  --> $DIR/clean_citation_not_found_without_dependencies.rs:23:23
+   |
+LL |     ensures 0 == 0 by nowhere
+   |                       ^^^^^^^
+
+error: aborting due to 1 previous error
+

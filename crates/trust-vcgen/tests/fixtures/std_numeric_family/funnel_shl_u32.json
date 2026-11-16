@@ -1,0 +1,227 @@
+{
+ "name": "funnel_shl_u32",
+ "def_path": "nm::funnel_shl_u32",
+ "span": {
+  "file": "nm.rs",
+  "line_start": 10,
+  "col_start": 0,
+  "line_end": 10,
+  "col_end": 75
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": "a"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": "b"
+   },
+   {
+    "index": 3,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": "n"
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "core::num::<impl u32>::funnel_shl",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       },
+       {
+        "Copy": {
+         "local": 2,
+         "projections": []
+        }
+       },
+       {
+        "Copy": {
+         "local": 3,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 0,
+       "projections": []
+      },
+      "target": 1,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 10,
+       "col_start": 57,
+       "line_end": 10,
+       "col_end": 57
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 4703791156326232143,
+       "def_index": 27606,
+       "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 4703791156326232143,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 3,
+  "return_ty": {
+   "Int": {
+    "width": 32,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": 4294967295
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "b",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "b",
+        "Int"
+       ]
+      },
+      {
+       "Int": 4294967295
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "n",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "n",
+        "Int"
+       ]
+      },
+      {
+       "Int": 4294967295
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

@@ -9,7 +9,7 @@ fn main() {
     // Trust: the placeholder this expands is CURRENT_RUSTC_VERSION, sitting in
     // `#[stable(since = ...)]` attributes that record the RUST release an item
     // stabilized in. That is Rust's version line, so it expands from
-    // `src/rust-compat-version`; Trust's own `major.minor.dev` version in
+    // `src/rust-compat-version`; Trust's own `MAJOR.MINOR.0` version in
     // `src/version` would stamp the stdlib with a number from another scheme.
     let version_path = root_path.join("src").join("rust-compat-version");
     let version_str = t!(std::fs::read_to_string(&version_path), version_path);

@@ -1,0 +1,297 @@
+{
+  "name": "or_join",
+  "def_path": "neg128_guard_stale::or_join",
+  "span": {
+    "file": "neg128_guard_stale.rs",
+    "line_start": 44,
+    "col_start": 0,
+    "line_end": 46,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": true
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": "c"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_stale.rs",
+              "line_start": 45,
+              "col_start": 7,
+              "line_end": 45,
+              "col_end": 8
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ge",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -5
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "neg128_guard_stale.rs",
+                "line_start": 45,
+                "col_start": 12,
+                "line_end": 45,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                5
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_stale.rs",
+              "line_start": 45,
+              "col_start": 12,
+              "line_end": 45,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -170141183460469231731687303715884105728
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "neg128_guard_stale.rs",
+                "line_start": 45,
+                "col_start": 22,
+                "line_end": 45,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "OverflowNeg",
+            "target": 4,
+            "span": {
+              "file": "neg128_guard_stale.rs",
+              "line_start": 45,
+              "col_start": 22,
+              "line_end": 45,
+              "col_end": 24
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Neg",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "neg128_guard_stale.rs",
+                "line_start": 45,
+                "col_start": 22,
+                "line_end": 45,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Int": 0
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_stale.rs",
+                "line_start": 45,
+                "col_start": 34,
+                "line_end": 45,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "StorageDead": 3
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 128,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

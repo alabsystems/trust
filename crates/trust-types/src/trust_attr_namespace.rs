@@ -45,8 +45,12 @@
 //! ```
 //!
 //! — because their consumer, `contract_kind_from_name` in
-//! `crates/trust-mir-extract/src/lib.rs`, keys on `attr.path().last()` and so never
-//! mentions the `trust` namespace at all. Measured on the sealed toolchain:
+//! `crates/trust-mir-extract/src/lib.rs`, keyed on `attr.path().last()` and so never
+//! mentioned the `trust` namespace at all. (That also made `#[clippy::requires = ..]`
+//! a Trust precondition; since CONTRACT-NS-1, 2026-10-03, the reader is
+//! `contract_kind_from_attr`, which reads the WHOLE path through
+//! [`contract_kind_of_attr_path`] below. The six aliases stay claimed: they are
+//! still read, under `trust::` only.) Measured on the sealed toolchain:
 //! `#[trust::contracts_requires(a > 0)]` produces a real lowered precondition
 //! obligation row, while `#[trust::totally_made_up_clause(..)]` beside it produces
 //! `no_obligations`. Every row here therefore carries the consumer that reads it,
@@ -146,31 +150,34 @@ pub const TRUST_ATTR_VOCABULARY: &[ClaimedTrustAttr] = &[
     },
     ClaimedTrustAttr {
         name: "contracts_ensures",
-        consumer: "crates/trust-mir-extract/src/lib.rs — `contract_kind_from_name` via \
-                   `attr.path().last()`; upstream-`core::contracts` alias spelling of `ensures`",
+        consumer: "crates/trust-mir-extract/src/lib.rs — `contract_kind_from_attr` via \
+                   `contract_kind_of_attr_path`; upstream-`core::contracts` alias spelling of \
+                   `ensures`",
     },
     ClaimedTrustAttr {
         name: "contracts_requires",
-        consumer: "crates/trust-mir-extract/src/lib.rs — `contract_kind_from_name` via \
-                   `attr.path().last()`; upstream-`core::contracts` alias spelling of `requires`",
+        consumer: "crates/trust-mir-extract/src/lib.rs — `contract_kind_from_attr` via \
+                   `contract_kind_of_attr_path`; upstream-`core::contracts` alias spelling of \
+                   `requires`",
     },
     ClaimedTrustAttr {
         name: "decreases",
-        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_name` and \
+        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_attr` (via \
+                   `contract_kind_of_attr_path`) and \
                    compiler/rustc_mir_transform/src/trust_verify/dyn_dispatch_reliance.rs \
-                   `def_may_have_contracts`, both via `attr.path().last()`",
+                   `def_may_have_contracts` (via `attr.path().last()`)",
     },
     ClaimedTrustAttr {
         name: "ensures",
         consumer: "compiler/rustc_resolve/src/macros.rs \
                    `trust_spec_contract_builtin_name_from_symbols` maps `ensures` onto \
                    `sym::trust_contracts_ensures`; on the register_tool surface \
-                   crates/trust-mir-extract `contract_kind_from_name` lowers it — measured to \
+                   crates/trust-mir-extract `contract_kind_from_attr` lowers it — measured to \
                    produce a `postcond` obligation row",
     },
     ClaimedTrustAttr {
         name: "invariant",
-        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_name`; also read by \
+        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_attr`; also read by \
                    trust_verify/trait_panic_free.rs `check_declaration` (refuses a conditional \
                    panic-freedom contract) — measured to produce an `invariant` obligation row",
     },
@@ -206,7 +213,7 @@ pub const TRUST_ATTR_VOCABULARY: &[ClaimedTrustAttr] = &[
         consumer: "compiler/rustc_resolve/src/macros.rs \
                    `trust_spec_contract_builtin_name_from_symbols` maps `requires` onto \
                    `sym::trust_contracts_requires`; on the register_tool surface \
-                   crates/trust-mir-extract `contract_kind_from_name` lowers it — measured to \
+                   crates/trust-mir-extract `contract_kind_from_attr` lowers it — measured to \
                    produce a lowered precondition obligation row",
     },
     ClaimedTrustAttr {
@@ -228,26 +235,26 @@ pub const TRUST_ATTR_VOCABULARY: &[ClaimedTrustAttr] = &[
     },
     ClaimedTrustAttr {
         name: "trust_decreases",
-        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_name` via \
-                   `attr.path().last()`; explicit-prefix alias spelling of `decreases`",
+        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_attr` via \
+                   `contract_kind_of_attr_path`; explicit-prefix alias spelling of `decreases`",
     },
     ClaimedTrustAttr {
         name: "trust_ensures",
-        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_name` via \
-                   `attr.path().last()`; explicit-prefix alias — measured to produce a \
+        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_attr` via \
+                   `contract_kind_of_attr_path`; explicit-prefix alias — measured to produce a \
                    `postcond` obligation row",
     },
     ClaimedTrustAttr {
         name: "trust_invariant",
-        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_name` via \
-                   `attr.path().last()`; explicit-prefix alias — measured to produce an \
+        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_attr` via \
+                   `contract_kind_of_attr_path`; explicit-prefix alias — measured to produce an \
                    `invariant` obligation row",
     },
     ClaimedTrustAttr {
         name: "trust_requires",
-        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_name` via \
-                   `attr.path().last()`; explicit-prefix alias — measured to produce a lowered \
-                   precondition obligation row",
+        consumer: "crates/trust-mir-extract/src/lib.rs `contract_kind_from_attr` via \
+                   `contract_kind_of_attr_path`; explicit-prefix alias — measured to produce a \
+                   lowered precondition obligation row",
     },
     ClaimedTrustAttr {
         name: "var",
@@ -343,11 +350,7 @@ pub fn nearest_claimed_name(written: &str) -> Option<&'static str> {
 /// The vocabulary rendered for a diagnostic, comma separated in table order.
 #[must_use]
 pub fn vocabulary_list() -> String {
-    TRUST_ATTR_VOCABULARY
-        .iter()
-        .map(|claimed| claimed.name)
-        .collect::<Vec<_>>()
-        .join(", ")
+    TRUST_ATTR_VOCABULARY.iter().map(|claimed| claimed.name).collect::<Vec<_>>().join(", ")
 }
 
 /// Plain Levenshtein distance over `char`s, two-row DP.
@@ -380,6 +383,81 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[must_use]
 pub fn vocabulary_is_sorted_and_unique() -> bool {
     TRUST_ATTR_VOCABULARY.windows(2).all(|pair| pair[0].name < pair[1].name)
+}
+
+/// The `trust::` attribute names that state a FUNCTION CONTRACT when the extractor
+/// reads them back out of HIR (`trust_mir_extract::extract_contracts` and
+/// `def_owes_caller_precondition`), with the clause each one states. Sorted by name.
+///
+/// Every name here is also a row of [`TRUST_ATTR_VOCABULARY`] (pinned by
+/// `every_contract_attr_name_is_a_claimed_trust_attr`), so the E5 rule and the
+/// contract reader agree on what the namespace means.
+pub const TRUST_CONTRACT_ATTR_NAMES: &[(&str, crate::ContractKind)] = &[
+    ("contracts_ensures", crate::ContractKind::Ensures),
+    ("contracts_requires", crate::ContractKind::Requires),
+    ("decreases", crate::ContractKind::Decreases),
+    ("ensures", crate::ContractKind::Ensures),
+    ("invariant", crate::ContractKind::Invariant),
+    ("requires", crate::ContractKind::Requires),
+    ("trust_decreases", crate::ContractKind::Decreases),
+    ("trust_ensures", crate::ContractKind::Ensures),
+    ("trust_invariant", crate::ContractKind::Invariant),
+    ("trust_requires", crate::ContractKind::Requires),
+];
+
+/// CONTRACT-NS-1 (2026-10-03): the contract an HIR attribute states, decided from
+/// its WHOLE path.
+///
+/// The caller passes the attribute's path segments verbatim. Only the exact
+/// two-segment path `trust::<name>`, with `<name>` in [`TRUST_CONTRACT_ATTR_NAMES`],
+/// is a contract. Everything else is `None`:
+///
+/// * another tool's namespace. The reader used to match the LAST segment only, so
+///   `#[clippy::requires = ".."]` and `#[rustfmt::requires = ".."]` (both tools are
+///   always registered, so both compile silently) were Trust preconditions, assumed
+///   at function entry. Measured on the stage 1 of main + wave 7: with the
+///   compiler-internal lowering prefix in the text, the forged `x < 100` was assumed,
+///   `x + 4_294_967_000` was proved, and its overflow check was elided as
+///   kernel-certified under both the default and the certify policy;
+/// * a single segment (`#[requires(..)]`). No such attribute survives into HIR as an
+///   inert attribute: the spellings that resolve at all are attribute macros (the
+///   `trust-spec` shim, `core::contracts`, the `trust_contracts_*` builtins), which
+///   expansion consumes and rewrites into the contract grammar;
+/// * a longer path (`trust::a::requires`, `trust::requires::x`), which nothing claims.
+///
+/// Fail-closed direction: an attribute that is not read is no contract at all, so the
+/// body is verified without the assumption and no caller is charged for it.
+#[must_use]
+pub fn contract_kind_of_attr_path(segments: &[&str]) -> Option<crate::ContractKind> {
+    let [namespace, name] = segments else {
+        return None;
+    };
+    if *namespace != "trust" {
+        return None;
+    }
+    TRUST_CONTRACT_ATTR_NAMES.iter().find(|entry| entry.0 == *name).map(|entry| entry.1)
+}
+
+/// CONTRACT-NS-1 (2026-10-03): the compiler-internal contract marker, if any, that a
+/// contract body read from SOURCE text carries.
+///
+/// `__trust_lowered_compiler_contract__:` is minted by the compiler's own contract
+/// query on a predicate it has already lowered and typed
+/// (`trust_mir_extract::convert_trust_contract_predicate`); every consumer that sees
+/// it strips it and lowers the rest as a compiler-typed formula. A body scraped from
+/// an attribute's text is the user's, so the marker there is a forgery: honoring it
+/// turned `#[trust::trust_requires = "__trust_lowered_compiler_contract__:x < 100"]`
+/// into an assumed, typed precondition. The unsupported-contract marker is refused
+/// the same way, so source text can carry neither. The extractor makes either one a
+/// hard error.
+#[must_use]
+pub fn compiler_contract_marker_in(body: &str) -> Option<&'static str> {
+    [
+        crate::model::LOWERED_COMPILER_CONTRACT_PREFIX,
+        crate::assumption::UNSUPPORTED_COMPILER_CONTRACT_PREFIX,
+    ]
+    .into_iter()
+    .find(|marker| body.contains(*marker))
 }
 
 #[cfg(test)]
@@ -447,8 +525,10 @@ mod tests {
     }
 
     /// REGRESSION GUARD for the mistake this table actually made. These six are
-    /// claimed by `contract_kind_from_name`, whose match is on `attr.path().last()`
-    /// and therefore never mentions the `trust` namespace — so an enumeration that
+    /// claimed by the extractor's contract reader, whose match was on
+    /// `attr.path().last()` (it is `contract_kind_from_attr` via
+    /// `contract_kind_of_attr_path` since CONTRACT-NS-1) and therefore never
+    /// mentioned the `trust` namespace — so an enumeration that
     /// only looked for exact `[trust, name]` path matches missed all six and would
     /// have rejected six working spellings. Measured: `#[trust::contracts_requires(
     /// a > 0)]` produces a real lowered precondition obligation.
@@ -464,7 +544,7 @@ mod tests {
         ] {
             assert!(
                 claimed(&["trust", alias]),
-                "`trust::{alias}` is read by `contract_kind_from_name`; rejecting it breaks a \
+                "`trust::{alias}` is read by `contract_kind_from_attr`; rejecting it breaks a \
                  working program"
             );
         }
@@ -645,5 +725,103 @@ mod tests {
         assert_eq!(levenshtein("skip", "skipp"), 1);
         assert_eq!(levenshtein("assume_totall", "assume_total"), 1);
         assert_eq!(levenshtein("kitten", "sitting"), 3);
+    }
+
+    // ---- CONTRACT-NS-1: the contract reader's path filter ----
+
+    use crate::ContractKind;
+
+    #[test]
+    fn every_trust_contract_spelling_states_its_clause() {
+        let expected = [
+            ("requires", ContractKind::Requires),
+            ("contracts_requires", ContractKind::Requires),
+            ("trust_requires", ContractKind::Requires),
+            ("ensures", ContractKind::Ensures),
+            ("contracts_ensures", ContractKind::Ensures),
+            ("trust_ensures", ContractKind::Ensures),
+            ("invariant", ContractKind::Invariant),
+            ("trust_invariant", ContractKind::Invariant),
+            ("decreases", ContractKind::Decreases),
+            ("trust_decreases", ContractKind::Decreases),
+        ];
+        assert_eq!(expected.len(), TRUST_CONTRACT_ATTR_NAMES.len());
+        for (name, kind) in expected {
+            assert_eq!(contract_kind_of_attr_path(&["trust", name]), Some(kind), "trust::{name}");
+        }
+    }
+
+    /// The measured defect: `clippy` and `rustfmt` are always-registered tools, so
+    /// `#[clippy::requires = ".."]` compiles without a diagnostic. Another tool's
+    /// attribute is no Trust contract, whatever its last segment says.
+    #[test]
+    fn another_tools_namespace_is_never_a_contract() {
+        for tool in [
+            "clippy",
+            "rustfmt",
+            "diagnostic",
+            "miri",
+            "rust_analyzer",
+            "my_tool",
+            "trustx",
+            "Trust",
+        ] {
+            for &(name, _) in TRUST_CONTRACT_ATTR_NAMES {
+                assert_eq!(contract_kind_of_attr_path(&[tool, name]), None, "{tool}::{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_exact_two_segment_trust_path_is_a_contract() {
+        assert_eq!(contract_kind_of_attr_path(&[]), None);
+        assert_eq!(contract_kind_of_attr_path(&["trust"]), None);
+        for &(name, _) in TRUST_CONTRACT_ATTR_NAMES {
+            // A single segment never survives into HIR as an inert attribute.
+            assert_eq!(contract_kind_of_attr_path(&[name]), None, "bare {name}");
+            assert_eq!(contract_kind_of_attr_path(&["trust", "a", name]), None, "trust::a::{name}");
+            assert_eq!(contract_kind_of_attr_path(&["trust", name, "x"]), None, "trust::{name}::x");
+            assert_eq!(contract_kind_of_attr_path(&["clippy", "trust", name]), None);
+        }
+        // Other claimed `trust::` names are not contracts.
+        for other in ["contract_panic", "skip", "assume_total", "panic_free", "loop_invariant"] {
+            assert_eq!(contract_kind_of_attr_path(&["trust", other]), None, "trust::{other}");
+        }
+        assert_eq!(contract_kind_of_attr_path(&["trust", "requires_x"]), None);
+        assert_eq!(contract_kind_of_attr_path(&["trust", "Requires"]), None);
+    }
+
+    /// The contract reader and the E5 rule must agree: a name the reader treats as a
+    /// contract is one E5 accepts, or a contract the author wrote would be refused as
+    /// an unknown `trust::` attribute.
+    #[test]
+    fn every_contract_attr_name_is_a_claimed_trust_attr() {
+        for &(name, _) in TRUST_CONTRACT_ATTR_NAMES {
+            assert!(claimed(&["trust", name]), "trust::{name} is read as a contract but unclaimed");
+        }
+        assert!(TRUST_CONTRACT_ATTR_NAMES.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    #[test]
+    fn a_compiler_contract_marker_in_source_text_is_found_wherever_it_sits() {
+        let lowered = "__trust_lowered_compiler_contract__:";
+        let unsupported = "__trust_unsupported_compiler_contract__:";
+        assert_eq!(crate::model::LOWERED_COMPILER_CONTRACT_PREFIX, lowered);
+        assert_eq!(crate::assumption::UNSUPPORTED_COMPILER_CONTRACT_PREFIX, unsupported);
+        for body in [
+            "__trust_lowered_compiler_contract__:x < 100",
+            "\"__trust_lowered_compiler_contract__:x < 100\"",
+            "  __trust_lowered_compiler_contract__:x < 100",
+            "x < 100 && __trust_lowered_compiler_contract__:true",
+        ] {
+            assert_eq!(compiler_contract_marker_in(body), Some(lowered), "{body:?}");
+        }
+        assert_eq!(
+            compiler_contract_marker_in("__trust_unsupported_compiler_contract__:x"),
+            Some(unsupported)
+        );
+        for body in ["x < 100", "", "result == x", "__trust_lowered_compiler_contract__ x"] {
+            assert_eq!(compiler_contract_marker_in(body), None, "{body:?}");
+        }
     }
 }

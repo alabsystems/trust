@@ -12,7 +12,8 @@ fn helper(x: u32, divisor: u32) -> u32 { //~ ERROR Level 0 safety verification i
 fn caller_ok() -> u32 {
     helper(10, 5)
 }
-fn caller_bad(d: u32) -> u32 {
+fn caller_bad(d: u32) -> u32 { //~ WARN Trust Level 0 safety verification incomplete
+    //~| WARN Trust verification advisory for
     helper(10, d)
 }
 fn main() { //~ ERROR Trust Level 0 safety verification incomplete

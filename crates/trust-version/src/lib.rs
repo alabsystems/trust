@@ -1,22 +1,48 @@
 //! Trust product version identity for `targo trust version`.
 //!
-//! # The Trust version line
+//! # One version line, one authority
 //!
-//! Trust versions are `major.minor.dev` and have nothing to do with Rust's
-//! version line. Andrew's constellation scheme (`alabsystems/publication`)
-//! gives the three components these meanings:
+//! Trust follows the constellation scheme in `publication/VERSIONING.md`, and
+//! its version has nothing to do with Rust's version line:
 //!
-//! * **major** — the top-level line.
-//! * **minor** — the release counter. A public release is always `X.Y.0`.
-//! * **dev** — the internal iteration counter. `dev == 0` is a public
-//!   version; `dev > 0` marks internal-only work that is never what a public
-//!   release is called. After `X.Y.0` ships, internal work bumps `dev`; the
-//!   next public release bumps `minor` (or `major`) and resets `dev` to 0.
+//! * a **release** is `MAJOR.MINOR.0` — the patch slot is ALWAYS `0`, and
+//!   `MINOR` is the knob that moves;
+//! * a **dev build** is identified by SemVer build metadata on that same line
+//!   (`MAJOR.MINOR.0-dev.<count>+g<sha>`, or `MAJOR.MINOR.0+g<sha>`), computed
+//!   from git when the build is cut. It is never a counter in the patch slot:
+//!   counters collide when two builds are cut at once, and a hash in the patch
+//!   slot makes versions run backwards.
 //!
-//! There are no prerelease or build suffixes: `0.1.0-preview.1` is not a Trust
-//! version, it is a semver habit inherited from elsewhere. The dev counter
-//! already says "not public", so a suffix would be a second, weaker way to say
-//! the same thing.
+//! The ONE authority is the root `Cargo.toml` `[workspace.package] version`
+//! ([`VERSION_AUTHORITY_PATH`]) — the key `pub bump` edits and `pub version`
+//! reads. Every other checked-in statement of the number is a mirror written by
+//! `scripts/trust_version_sync.py --write` and by nothing else:
+//!
+//! * `src/version` — bootstrap: `CFG_TRUST_VERSION` (the `trust:` line of
+//!   `trustc -Vv`) and the dist archive names;
+//! * `release/trust-version.toml` `trust_product_version` — `targo trust
+//!   version` ([`DEFAULT_VERSION_SOURCE_PATH`]);
+//! * `targo-trust/Cargo.toml` `[package] version` — `targo-trust --version`.
+//!
+//! On drift, bootstrap refuses to build (it checks `src/version` and the Targo
+//! crate manifest — the plain source tarball carries no `release/`), the
+//! `every_version_mirror_agrees_with_the_authority` test fails on any of the
+//! three, and `scripts/trust_version_sync.py --check` names each disagreeing file
+//! (lockfiles included).
+//!
+//! The checked-in number never carries a suffix: build identity is computed when
+//! a build is cut, and a suffix written into a file would describe some other
+//! commit. [`TrustVersion::parse`] therefore accepts exactly `MAJOR.MINOR.0`.
+//!
+//! # The channel is derived from the build, not the number
+//!
+//! [`product_channel`] reads the bootstrap channel (`src/ci/channel`) — the same
+//! input that names the distribution archive ([`trust_archive_version`]). Only
+//! the `stable` bootstrap channel produces a bare `MAJOR.MINOR.0` archive, so
+//! only it is [`CHANNEL_RELEASE`]; every other channel, `trust` included, is
+//! [`CHANNEL_DEV`]. The channel and the archive name therefore cannot disagree,
+//! and nothing reports "release" for a build that `publication/VERSIONING.md`
+//! rule 2 would not let carry a bare `.0`.
 //!
 //! # Rust alignment is a record, never an authority
 //!
@@ -33,19 +59,43 @@ use std::fmt::{self, Write as _};
 use serde::{Deserialize, Serialize};
 
 /// Schema marker for `targo trust version --json`.
-pub const VERSION_SCHEMA: &str = "trust.version.v3";
+///
+/// v4: `trust_product_channel` is derived from the bootstrap channel
+/// ([`product_channel`]) instead of a patch-slot counter, and
+/// `trust_product_version` is always `MAJOR.MINOR.0`. A v3 payload's channel
+/// meant something else, so v3 is superseded rather than read.
+pub const VERSION_SCHEMA: &str = "trust.version.v4";
 
 /// Schema marker for the checked-in source file.
 pub const VERSION_SOURCE_SCHEMA: &str = "trust.version-source.v2";
 
-/// Channel name for a public version (`dev == 0`).
+/// Channel name for a release build: one cut on the `stable` bootstrap channel,
+/// whose archive is named by the bare `MAJOR.MINOR.0`.
 pub const CHANNEL_RELEASE: &str = "release";
 
-/// Channel name for an internal iteration (`dev > 0`).
+/// Channel name for every other build — including the `trust` channel.
 pub const CHANNEL_DEV: &str = "dev";
 
 /// Default source path for checked-in Trust product version metadata.
 pub const DEFAULT_VERSION_SOURCE_PATH: &str = "release/trust-version.toml";
+
+/// The ONE authority for Trust's version, relative to the repository root: its
+/// `[workspace.package] version`, which `pub bump` edits. Read it with
+/// [`parse_version_authority`].
+pub const VERSION_AUTHORITY_PATH: &str = "Cargo.toml";
+
+/// The command that rewrites every mirror from [`VERSION_AUTHORITY_PATH`].
+pub const VERSION_SYNC_COMMAND: &str = "python3 scripts/trust_version_sync.py --write";
+
+/// The product channel a build reports, derived from its bootstrap channel.
+///
+/// [`CHANNEL_RELEASE`] exactly when [`trust_archive_version`] names the archive
+/// by the bare product version — the `stable` channel — and [`CHANNEL_DEV`]
+/// otherwise. See the crate docs.
+#[must_use]
+pub fn product_channel(bootstrap_channel: &str) -> &'static str {
+    if bootstrap_channel.trim() == "stable" { CHANNEL_RELEASE } else { CHANNEL_DEV }
+}
 
 /// Spell the Rust-compat release string exactly as bootstrap's `release()`
 /// does (`src/bootstrap/src/lib.rs`).
@@ -70,8 +120,9 @@ pub fn rust_compat_release(rust_compat_version: &str, bootstrap_channel: &str) -
 /// `rust_package_vers()` does.
 ///
 /// Archives, release evidence and the product identity are named from Trust's
-/// OWN version (`src/version`), which is the half of the split that the
-/// `-V` protocol must not see.
+/// OWN version (`src/version`, the bootstrap-side mirror of
+/// [`VERSION_AUTHORITY_PATH`]), which is the half of the split that the `-V`
+/// protocol must not see.
 #[must_use]
 pub fn trust_archive_version(trust_product_version: &str, bootstrap_channel: &str) -> String {
     match bootstrap_channel {
@@ -121,61 +172,64 @@ where
     Ok(schemas)
 }
 
-/// A Trust version: `major.minor.dev`, exactly three numbers, no suffix.
+/// A Trust version: `MAJOR.MINOR.0` — three numbers, the last always `0`, no
+/// suffix.
 ///
-/// See the crate docs for what the three components mean. The only derived
-/// property is the channel: `dev == 0` is [`CHANNEL_RELEASE`], anything else is
-/// [`CHANNEL_DEV`]. Nothing else in the toolchain may author a channel, so a
-/// version and its channel cannot disagree.
+/// The patch slot is not stored because it has exactly one legal value; see the
+/// crate docs for why dev builds are identified by build metadata instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TrustVersion {
     pub major: u32,
     pub minor: u32,
-    pub dev: u32,
 }
 
 impl TrustVersion {
-    /// Parse `major.minor.dev`. Rejects prerelease/build suffixes outright —
-    /// the dev counter is how Trust says "not public".
+    /// Parse `MAJOR.MINOR.0`.
+    ///
+    /// Rejects a nonzero patch slot with [`VersionError::NonzeroPatch`], and a
+    /// suffix, a leading zero, or any other shape with
+    /// [`VersionError::InvalidProductVersion`]: a checked-in version names a
+    /// release line, and build identity is computed when a build is cut.
     pub fn parse(version: &str) -> Result<Self, VersionError> {
-        let invalid =
-            || VersionError::InvalidProductVersion { version: version.trim().to_string() };
         let version = version.trim();
-        if version.contains(['-', '+']) {
-            return Err(invalid());
-        }
+        let invalid = || VersionError::InvalidProductVersion { version: version.to_string() };
         let mut parts = version.split('.');
         let mut next = || -> Result<u32, VersionError> {
             let part = parts.next().ok_or_else(invalid)?;
-            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            let canonical = part == "0" || part.bytes().next().is_some_and(|byte| byte != b'0');
+            if !canonical || !part.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(invalid());
             }
             part.parse().map_err(|_| invalid())
         };
-        let (major, minor, dev) = (next()?, next()?, next()?);
+        let (major, minor, patch) = (next()?, next()?, next()?);
         if parts.next().is_some() {
             return Err(invalid());
         }
-        Ok(Self { major, minor, dev })
-    }
-
-    /// True when this is a version a public release may be called.
-    #[must_use]
-    pub fn is_public(&self) -> bool {
-        self.dev == 0
-    }
-
-    /// [`CHANNEL_RELEASE`] or [`CHANNEL_DEV`], derived from the dev counter.
-    #[must_use]
-    pub fn channel(&self) -> &'static str {
-        if self.is_public() { CHANNEL_RELEASE } else { CHANNEL_DEV }
+        if patch != 0 {
+            return Err(VersionError::NonzeroPatch { version: version.to_string() });
+        }
+        Ok(Self { major, minor })
     }
 }
 
 impl fmt::Display for TrustVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.dev)
+        write!(f, "{}.{}.0", self.major, self.minor)
     }
+}
+
+/// Read the authority: `[workspace.package] version` from the text of the root
+/// manifest ([`VERSION_AUTHORITY_PATH`]), validated as `MAJOR.MINOR.0`.
+pub fn parse_version_authority(root_manifest: &str) -> Result<TrustVersion, VersionError> {
+    let manifest: toml::Value = toml::from_str(root_manifest)?;
+    let version = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(|package| package.get("version"))
+        .and_then(toml::Value::as_str)
+        .ok_or(VersionError::MissingAuthority)?;
+    TrustVersion::parse(version)
 }
 
 /// The upstream `rust-lang/rust` revision Trust last merged.
@@ -501,11 +555,9 @@ pub struct TrustVersionIdentity {
 impl TrustVersionIdentity {
     #[must_use]
     pub fn from_source_and_runtime(source: TrustVersionSource, runtime: VersionRuntime) -> Self {
-        // The channel is derived, never authored: a version and its channel
-        // cannot disagree if only one of them is written down. An unparseable
-        // version cannot reach here — `validate` runs first — but if it somehow
-        // did, `dev` is unknown, so the honest answer is the non-public one.
-        let channel = source.version().map_or(CHANNEL_DEV, |version| version.channel()).to_string();
+        // The channel is derived, never authored: it comes from the same
+        // bootstrap channel that names the archive, so the two cannot disagree.
+        let channel = product_channel(&runtime.bootstrap_channel).to_string();
 
         let mut schemas = source.schemas;
         schemas.insert("version".to_string(), VERSION_SCHEMA.to_string());
@@ -592,6 +644,8 @@ pub enum VersionError {
     InvalidSourceSchema { found: String },
     InvalidRegisteredVersionSchema { found: String },
     InvalidProductVersion { version: String },
+    NonzeroPatch { version: String },
+    MissingAuthority,
     MissingField(&'static str),
     InvalidRustAlignment { field: &'static str, value: String },
 }
@@ -609,11 +663,27 @@ impl fmt::Display for VersionError {
             Self::InvalidProductVersion { version } => {
                 write!(
                     f,
-                    "invalid Trust product version {version:?}: Trust versions are \
-                     major.minor.dev, three numbers and no suffix (dev = 0 is public, \
-                     dev > 0 is internal)"
+                    "invalid Trust product version {version:?}: a checked-in Trust version \
+                     is MAJOR.MINOR.0 — three numbers, no leading zeros, no suffix \
+                     (publication/VERSIONING.md; build identity is computed when a build \
+                     is cut, never written into a file)"
                 )
             }
+            Self::NonzeroPatch { version } => {
+                write!(
+                    f,
+                    "Trust version {version:?} has a nonzero patch slot: releases are \
+                     MAJOR.MINOR.0 and the patch slot is always 0 (publication/VERSIONING.md); \
+                     a dev build is identified by build metadata (+g<sha>), never by a patch \
+                     counter. Bump MINOR in {VERSION_AUTHORITY_PATH} [workspace.package] \
+                     version (`pub bump`), then run `{VERSION_SYNC_COMMAND}`"
+                )
+            }
+            Self::MissingAuthority => write!(
+                f,
+                "{VERSION_AUTHORITY_PATH} states no [workspace.package] version — the one \
+                 authority for Trust's version"
+            ),
             Self::MissingField(field) => write!(f, "missing Trust version source field {field}"),
             Self::InvalidRustAlignment { field, value } => {
                 write!(f, "invalid rust_alignment.{field} {value:?}")
@@ -629,6 +699,8 @@ impl std::error::Error for VersionError {
             Self::InvalidSourceSchema { .. }
             | Self::InvalidRegisteredVersionSchema { .. }
             | Self::InvalidProductVersion { .. }
+            | Self::NonzeroPatch { .. }
+            | Self::MissingAuthority
             | Self::MissingField(_)
             | Self::InvalidRustAlignment { .. } => None,
         }
@@ -691,7 +763,7 @@ revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
 merged_on = "2026-07-08"
 
 [schemas]
-version = "trust.version.v3"
+version = "{VERSION_SCHEMA}"
 release_report = "trust.release-report.v1"
 verifier_api = "trust.verifier-api.v1"
 verifier_run_manifest = "trust.verifier-run-manifest.v1"
@@ -700,42 +772,87 @@ verifier_run_manifest = "trust.verifier-run-manifest.v1"
     }
 
     #[test]
-    fn trust_version_parses_major_minor_dev() {
-        let version = TrustVersion::parse("0.1.0").unwrap();
-        assert_eq!(version, TrustVersion { major: 0, minor: 1, dev: 0 });
-        assert!(version.is_public());
-        assert_eq!(version.channel(), CHANNEL_RELEASE);
-        assert_eq!(version.to_string(), "0.1.0");
+    fn trust_version_parses_major_minor_zero() {
+        let version = TrustVersion::parse("0.10.0").unwrap();
+        assert_eq!(version, TrustVersion { major: 0, minor: 10 });
+        assert_eq!(version.to_string(), "0.10.0");
+        assert_eq!(TrustVersion::parse(" 1.0.0\n").unwrap().to_string(), "1.0.0");
     }
 
     #[test]
-    fn nonzero_dev_component_is_internal_only() {
-        let version = TrustVersion::parse("0.1.7").unwrap();
-        assert!(!version.is_public(), "dev > 0 is never what a public release is called");
-        assert_eq!(version.channel(), CHANNEL_DEV);
+    fn nonzero_patch_is_refused_citing_the_policy() {
+        // The patch slot is always 0 (publication/VERSIONING.md). It used to be
+        // an internal-iteration counter here; counters collide when two builds
+        // are cut at once, which is why the constellation retired them.
+        for rejected in ["0.1.7", "0.10.1", "1.0.99"] {
+            let err = TrustVersion::parse(rejected).unwrap_err();
+            assert!(matches!(err, VersionError::NonzeroPatch { .. }), "{rejected}: {err:?}");
+            let message = err.to_string();
+            assert!(message.contains("VERSIONING.md"), "{message}");
+            assert!(message.contains(VERSION_SYNC_COMMAND), "{message}");
+        }
+        assert!(matches!(
+            parse_version_source(&source_text("0.1.4")),
+            Err(VersionError::NonzeroPatch { .. })
+        ));
     }
 
     #[test]
-    fn prerelease_suffixes_are_not_trust_versions() {
-        // The dev counter is how Trust says "not public"; a suffix would be a
-        // second, weaker way to say the same thing.
-        for rejected in ["0.1.0-preview.1", "0.1.0-rc1", "0.1.0+build", "0.1", "0.1.0.1", "x.y.z"] {
+    fn suffixes_and_noncanonical_numbers_are_not_trust_versions() {
+        // A checked-in version names a release line. Dev-build identity
+        // (`-dev.<count>+g<sha>`) is computed when a build is cut, so it is
+        // refused here even though it is valid SemVer.
+        for rejected in [
+            "0.10.0-dev.2188+g9d1ce1d2",
+            "0.10.0+g9d1ce1d2",
+            "0.1.0-preview.1",
+            "0.1.0-rc1",
+            "0.1",
+            "0.1.0.1",
+            "00.1.0",
+            "0.01.0",
+            "0.1.00",
+            "x.y.z",
+            "",
+        ] {
             assert!(
-                TrustVersion::parse(rejected).is_err(),
+                matches!(
+                    TrustVersion::parse(rejected),
+                    Err(VersionError::InvalidProductVersion { .. })
+                ),
                 "{rejected:?} must not parse as a Trust version"
             );
         }
     }
 
     #[test]
-    fn channel_is_derived_from_the_version_not_authored() {
-        let internal = parse_version_source(&source_text("0.1.4")).unwrap();
-        let identity = TrustVersionIdentity::from_source_and_runtime(internal, runtime());
-        assert_eq!(identity.trust_product_channel, CHANNEL_DEV);
+    fn channel_is_derived_from_the_bootstrap_channel_not_the_number() {
+        let source = || parse_version_source(&source_text("0.10.0")).unwrap();
 
-        let public = parse_version_source(&source_text("0.2.0")).unwrap();
-        let identity = TrustVersionIdentity::from_source_and_runtime(public, runtime());
-        assert_eq!(identity.trust_product_channel, CHANNEL_RELEASE);
+        let trust_channel = TrustVersionIdentity::from_source_and_runtime(source(), runtime());
+        assert_eq!(trust_channel.bootstrap_channel, "trust");
+        assert_eq!(trust_channel.trust_product_channel, CHANNEL_DEV);
+
+        let mut stable = runtime();
+        stable.bootstrap_channel = "stable".to_string();
+        let stable = TrustVersionIdentity::from_source_and_runtime(source(), stable);
+        assert_eq!(stable.trust_product_channel, CHANNEL_RELEASE);
+    }
+
+    #[test]
+    fn the_channel_says_release_exactly_when_the_archive_is_a_bare_release_number() {
+        // publication/VERSIONING.md rule 2: nothing but a release cut carries a
+        // bare `MAJOR.MINOR.0`. The channel and the archive name are derived
+        // from the same bootstrap channel, so they must agree on every one.
+        for channel in ["stable", "trust", "beta", "nightly", "dev", "unknown"] {
+            let archive = trust_archive_version("0.10.0", channel);
+            assert_eq!(
+                product_channel(channel) == CHANNEL_RELEASE,
+                archive == "0.10.0",
+                "channel {channel:?}: product channel {:?} vs archive {archive:?}",
+                product_channel(channel)
+            );
+        }
     }
 
     #[test]
@@ -753,46 +870,99 @@ verifier_run_manifest = "trust.verifier-run-manifest.v1"
         ));
     }
 
+    #[test]
+    fn the_authority_is_read_from_workspace_package_only() {
+        let manifest = "[workspace]\nmembers = []\n\n[workspace.package]\nversion = \"0.10.0\"\n\
+                        edition = \"2024\"\n";
+        assert_eq!(
+            parse_version_authority(manifest).unwrap(),
+            TrustVersion { major: 0, minor: 10 }
+        );
+
+        // A `[package] version` is not the authority, even at the root.
+        let package_only = "[package]\nname = \"x\"\nversion = \"0.10.0\"\n";
+        assert!(matches!(
+            parse_version_authority(package_only),
+            Err(VersionError::MissingAuthority)
+        ));
+
+        let patched = manifest.replace("0.10.0", "0.10.3");
+        assert!(matches!(
+            parse_version_authority(&patched),
+            Err(VersionError::NonzeroPatch { .. })
+        ));
+    }
+
     fn repo_root() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
-    #[test]
-    fn the_checked_in_version_source_is_valid() {
-        let text = std::fs::read_to_string(repo_root().join(DEFAULT_VERSION_SOURCE_PATH))
-            .expect("release/trust-version.toml must exist");
-        let source = parse_version_source(&text).expect("checked-in version source must validate");
-        assert_eq!(source.product, "Trust");
-        source.version().expect("checked-in version must be major.minor.dev");
+    fn read_repo_file(relative: &str) -> String {
+        std::fs::read_to_string(repo_root().join(relative))
+            .unwrap_or_else(|err| panic!("{relative} must be readable: {err}"))
+    }
+
+    fn manifest_string(relative: &str, table: &[&str], key: &str) -> String {
+        let manifest: toml::Value = toml::from_str(&read_repo_file(relative))
+            .unwrap_or_else(|err| panic!("{relative} must parse: {err}"));
+        let mut node = &manifest;
+        for part in table {
+            node = node.get(*part).unwrap_or_else(|| panic!("{relative} has no [{part}]"));
+        }
+        node.get(key)
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("{relative} [{}] has no {key} string", table.join(".")))
+            .to_string()
     }
 
     #[test]
-    fn the_three_checked_in_version_files_agree() {
-        // Trust carries two version lines on purpose, and each has exactly one
-        // file that states it. This test is what stops them drifting:
-        //   src/version              Trust's own major.minor.dev
-        //   src/rust-compat-version  the Rust release the `-V` protocol reports
-        // Both must match what release/trust-version.toml — the authoritative
-        // record — says they are.
-        let root = repo_root();
-        let source = parse_version_source(
-            &std::fs::read_to_string(root.join(DEFAULT_VERSION_SOURCE_PATH)).unwrap(),
-        )
-        .unwrap();
+    fn the_checked_in_version_source_is_valid() {
+        let text = read_repo_file(DEFAULT_VERSION_SOURCE_PATH);
+        let source = parse_version_source(&text).expect("checked-in version source must validate");
+        assert_eq!(source.product, "Trust");
+        source.version().expect("checked-in version must be MAJOR.MINOR.0");
+    }
 
-        let src_version = std::fs::read_to_string(root.join("src/version"))
-            .expect("src/version must exist")
-            .trim()
+    #[test]
+    fn every_version_mirror_agrees_with_the_authority() {
+        // Trust's version has ONE authority — the root Cargo.toml
+        // `[workspace.package] version`, which `pub bump` edits — and every
+        // other checked-in statement of it is a mirror written by
+        // `scripts/trust_version_sync.py --write`. This test, that script's
+        // `--check` (which also covers the lockfiles) and bootstrap's
+        // `trust_version_authority` gate name the same mirrors; keep them in
+        // step when adding one.
+        let authority = parse_version_authority(&read_repo_file(VERSION_AUTHORITY_PATH))
+            .expect("the root Cargo.toml [workspace.package] version must be MAJOR.MINOR.0")
             .to_string();
-        assert_eq!(
-            src_version, source.trust_product_version,
-            "src/version must equal release/trust-version.toml trust_product_version"
+
+        let source = parse_version_source(&read_repo_file(DEFAULT_VERSION_SOURCE_PATH)).unwrap();
+        let mirrors = [
+            ("src/version", read_repo_file("src/version").trim().to_string()),
+            (
+                "release/trust-version.toml trust_product_version",
+                source.trust_product_version.clone(),
+            ),
+            (
+                "targo-trust/Cargo.toml [package] version",
+                manifest_string("targo-trust/Cargo.toml", &["package"], "version"),
+            ),
+        ];
+        let drifted: Vec<String> = mirrors
+            .iter()
+            .filter(|(_, found)| *found != authority)
+            .map(|(mirror, found)| format!("{mirror} = {found:?}"))
+            .collect();
+        assert!(
+            drifted.is_empty(),
+            "version mirrors disagree with {VERSION_AUTHORITY_PATH} [workspace.package] \
+             version = {authority:?}: {drifted:?}; run `{VERSION_SYNC_COMMAND}`"
         );
 
-        let compat = std::fs::read_to_string(root.join("src/rust-compat-version"))
-            .expect("src/rust-compat-version must exist")
-            .trim()
-            .to_string();
+        // The other line, deliberately separate: the Rust release the `-V`
+        // protocol reports. It is NOT a mirror of the authority and must keep
+        // matching the recorded upstream alignment instead.
+        let compat = read_repo_file("src/rust-compat-version").trim().to_string();
         assert_eq!(
             compat, source.rust_alignment.rustc_version,
             "src/rust-compat-version must equal release/trust-version.toml \
@@ -894,7 +1064,7 @@ verifier_run_manifest = "trust.verifier-run-manifest.v1"
     #[test]
     fn rejects_stale_registered_version_schema() {
         let text = source_text("0.1.0")
-            .replace("version = \"trust.version.v3\"", "version = \"trust.version.v2\"");
+            .replace(&format!("version = \"{VERSION_SCHEMA}\""), "version = \"trust.version.v3\"");
         let err = parse_version_source(&text).unwrap_err();
         assert!(matches!(err, VersionError::InvalidRegisteredVersionSchema { .. }));
     }
@@ -967,7 +1137,7 @@ verifier_run_manifest = "trust.verifier-run-manifest.v1"
         // behind the reader's back. Regenerate it instead.
         let source = parse_version_source(&source_text("0.1.0")).unwrap();
         let identity = TrustVersionIdentity::from_source_and_runtime(source, runtime());
-        for superseded in ["trust.version.v1", "trust.version.v2"] {
+        for superseded in ["trust.version.v1", "trust.version.v2", "trust.version.v3"] {
             let mut old = serde_json::to_value(&identity).unwrap();
             old["schema_version"] = superseded.into();
             assert!(

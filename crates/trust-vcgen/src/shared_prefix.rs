@@ -32,7 +32,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::fx::FxHashMap;
+use trust_types::fx::FxHashSet;
 use trust_types::{Formula, VerificationCondition};
 
 /// Flatten the top-level conjunction of a formula into its conjuncts.
@@ -65,10 +65,13 @@ fn push_conjuncts(formula: &Formula, out: &mut Vec<Formula>) {
 /// `And`.
 #[must_use]
 pub fn conjoin(mut conjuncts: Vec<Formula>) -> Formula {
-    match conjuncts.len() {
-        0 => Formula::Bool(true),
-        1 => conjuncts.pop().expect("len checked == 1"),
-        _ => Formula::And(conjuncts),
+    match conjuncts.pop() {
+        None => Formula::Bool(true),
+        Some(only) if conjuncts.is_empty() => only,
+        Some(last) => {
+            conjuncts.push(last);
+            Formula::And(conjuncts)
+        }
     }
 }
 
@@ -102,68 +105,123 @@ pub fn split_shared_prefix(
     // Conjuncts of the first VC define the candidate prefix order. Use the first
     // VC's DISTINCT conjuncts as candidates; a conjunct is in the prefix iff it
     // appears in every VC.
-    let first_conjuncts = flatten_conjuncts(&vcs[0].formula);
+    let mut candidates = Vec::new();
+    let mut prefix_seen: FxHashSet<&Formula> = FxHashSet::default();
+    push_unique_conjunct_refs(&vcs[0].formula, &mut prefix_seen, &mut candidates);
 
-    // Build a per-VC presence set for membership tests. Hashing on the structural
-    // `Formula` (which derives Eq + Hash) keeps the check O(total conjuncts).
-    let presence: Vec<FxHashMap<&Formula, ()>> = vcs
-        .iter()
-        .map(|vc| match &vc.formula {
-            Formula::And(terms) => flat_presence(terms),
-            other => {
-                let mut m = FxHashMap::default();
-                m.insert(other, ());
-                m
-            }
-        })
-        .collect();
-
-    // A candidate is shared iff present in EVERY VC. Preserve first-VC order and
-    // de-duplicate (idempotent conjunction: one copy in the prefix suffices).
-    let mut prefix: Vec<Formula> = Vec::new();
-    let mut prefix_seen: FxHashMap<Formula, ()> = FxHashMap::default();
-    for cand in &first_conjuncts {
-        if prefix_seen.contains_key(cand) {
-            continue;
+    // Intersect candidates across the remaining VCs using a single reusable
+    // presence set, stopping immediately if the candidate set becomes empty.
+    let mut presence: FxHashSet<&Formula> = FxHashSet::default();
+    for vc in &vcs[1..] {
+        if candidates.is_empty() {
+            break;
         }
-        if presence.iter().all(|p| p.contains_key(cand)) {
-            prefix_seen.insert(cand.clone(), ());
-            prefix.push(cand.clone());
+        match &vc.formula {
+            Formula::And(terms) => {
+                presence.clear();
+                register_presence(terms, &mut presence);
+                candidates.retain(|&cand| {
+                    let keep = presence.contains(cand);
+                    if !keep {
+                        prefix_seen.remove(cand);
+                    }
+                    keep
+                });
+            }
+            other => {
+                candidates.retain(|&cand| {
+                    let keep = cand == other;
+                    if !keep {
+                        prefix_seen.remove(cand);
+                    }
+                    keep
+                });
+            }
         }
     }
 
-    // Rewrite each VC to drop the prefix conjuncts. Dropping ALL occurrences is
-    // sound: the prefix re-supplies one copy and `A ∧ A ≡ A`.
+    let prefix: Vec<Formula> = candidates.into_iter().cloned().collect();
+
+    // Rewrite each VC to drop the prefix conjuncts without cloning the dropped
+    // prefix formulas. Dropping ALL occurrences is sound: the prefix re-supplies
+    // one copy and `A ∧ A ≡ A`.
     let bare_vcs: Vec<VerificationCondition> = vcs
         .iter()
         .map(|vc| {
-            let remaining: Vec<Formula> = flatten_conjuncts(&vc.formula)
-                .into_iter()
-                .filter(|c| !prefix_seen.contains_key(c))
-                .collect();
-            let mut bare = vc.clone();
-            bare.formula = conjoin(remaining);
-            bare
+            let formula = if let Formula::And(terms) = &vc.formula {
+                if prefix_seen.is_empty()
+                    && terms.len() > 1
+                    && !terms.iter().any(|t| matches!(t, Formula::And(_)))
+                {
+                    vc.formula.clone()
+                } else {
+                    let mut remaining = Vec::with_capacity(terms.len());
+                    push_remaining_conjuncts(&vc.formula, &prefix_seen, &mut remaining);
+                    conjoin(remaining)
+                }
+            } else if prefix_seen.contains(&vc.formula) {
+                Formula::Bool(true)
+            } else {
+                vc.formula.clone()
+            };
+            VerificationCondition {
+                kind: vc.kind.clone(),
+                function: vc.function,
+                location: vc.location.clone(),
+                formula,
+                contract_metadata: vc.contract_metadata,
+                obligation: vc.obligation.clone(),
+            }
         })
         .collect();
 
     (prefix, bare_vcs)
 }
 
-/// Build a borrowed presence set from a flattened conjunct list. Nested `And`s
-/// are flattened recursively so `And([a, And([b])])` registers both `a` and `b`.
-fn flat_presence(terms: &[Formula]) -> FxHashMap<&Formula, ()> {
-    let mut m = FxHashMap::default();
-    register_presence(terms, &mut m);
-    m
+fn push_unique_conjunct_refs<'a>(
+    formula: &'a Formula,
+    seen: &mut FxHashSet<&'a Formula>,
+    out: &mut Vec<&'a Formula>,
+) {
+    match formula {
+        Formula::And(terms) => {
+            for t in terms {
+                push_unique_conjunct_refs(t, seen, out);
+            }
+        }
+        other => {
+            if seen.insert(other) {
+                out.push(other);
+            }
+        }
+    }
 }
 
-fn register_presence<'a>(terms: &'a [Formula], m: &mut FxHashMap<&'a Formula, ()>) {
+fn push_remaining_conjuncts(
+    formula: &Formula,
+    prefix_seen: &FxHashSet<&Formula>,
+    out: &mut Vec<Formula>,
+) {
+    match formula {
+        Formula::And(terms) => {
+            for t in terms {
+                push_remaining_conjuncts(t, prefix_seen, out);
+            }
+        }
+        other => {
+            if !prefix_seen.contains(other) {
+                out.push(other.clone());
+            }
+        }
+    }
+}
+
+fn register_presence<'a>(terms: &'a [Formula], m: &mut FxHashSet<&'a Formula>) {
     for t in terms {
         match t {
             Formula::And(inner) => register_presence(inner, m),
             other => {
-                m.insert(other, ());
+                m.insert(other);
             }
         }
     }

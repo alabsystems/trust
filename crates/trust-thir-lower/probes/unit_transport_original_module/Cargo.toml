@@ -1,0 +1,10 @@
+[package]
+name = "primitive-unit-transport-original-module-observer"
+version = "0.0.0"
+edition = "2021"
+[workspace]
+[dependencies]
+trust-ir = { path = "../../../../first-party/trust-ir/crates/trust-ir", default-features = false, features = ["binary"] }
+trust-ir-build = { path = "../../../../first-party/trust-ir/crates/trust-ir-build", default-features = false }
+[patch."https://github.com/alabsystems/clean.git"]
+clean-kernel = { path = "../../../../first-party/clean/crates/clean-kernel" }

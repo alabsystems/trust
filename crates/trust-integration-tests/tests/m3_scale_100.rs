@@ -79,12 +79,6 @@ fn lt(name: &str, lit: i128) -> Formula {
     Formula::Lt(Box::new(ivar(name)), Box::new(Formula::Int(lit)))
 }
 
-/// `var >= lit` for a named integer-typed variable.
-#[allow(dead_code)]
-fn ge(name: &str, lit: i128) -> Formula {
-    Formula::Ge(Box::new(ivar(name)), Box::new(Formula::Int(lit)))
-}
-
 /// `var <= lit` for a named integer-typed variable.
 fn le(name: &str, lit: i128) -> Formula {
     Formula::Le(Box::new(ivar(name)), Box::new(Formula::Int(lit)))
@@ -203,6 +197,7 @@ fn make_checked_binop(name: &str, op: BinOp, ty: Ty) -> VerifiableFunction {
         preconditions,
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -256,6 +251,7 @@ fn make_division(name: &str, ty: Ty) -> VerifiableFunction {
         preconditions,
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -307,6 +303,7 @@ fn make_guarded_division(name: &str) -> VerifiableFunction {
         )))],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -352,6 +349,7 @@ fn make_remainder(name: &str) -> VerifiableFunction {
         preconditions: vec![not_eq("m", 0)],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -403,6 +401,7 @@ fn make_array_index(name: &str, len: u64) -> VerifiableFunction {
         preconditions: vec![lt("idx", len_i)],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -488,6 +487,7 @@ fn make_contract_fn(name: &str) -> VerifiableFunction {
             Box::new(Formula::Var("lo".into(), Sort::Int)),
         )],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -519,6 +519,7 @@ fn make_noop(name: &str, ty: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -571,6 +572,7 @@ fn make_bitwise(name: &str, op: BinOp) -> VerifiableFunction {
         preconditions,
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -622,6 +624,7 @@ fn make_cast(name: &str, from_ty: Ty, to_ty: Ty) -> VerifiableFunction {
         preconditions,
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -670,6 +673,7 @@ fn make_negation(name: &str, ty: Ty) -> VerifiableFunction {
         preconditions,
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -706,6 +710,7 @@ fn make_aggregate_tuple(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -749,6 +754,7 @@ fn make_len_check(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -846,6 +852,7 @@ fn make_branching(name: &str) -> VerifiableFunction {
         preconditions,
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -889,6 +896,7 @@ fn make_ref_pattern(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -951,6 +959,7 @@ fn make_comparison_chain(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

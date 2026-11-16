@@ -1,0 +1,54 @@
+note: send census: `main` sends on no std channel over the calls it makes
+  --> $DIR/send_census_places_each_thread.rs:65:1
+   |
+LL | fn main() {
+   | ^^^^^^^^^
+
+note: send census: the thread spawned through this call sends `Wake` (Pumped) via <fn() {pump} as std::ops::FnOnce<()>>::call_once - shim(fn() {pump}) -> pump -> std::sync::mpsc::Sender::<Wake>::send
+  --> $DIR/send_census_places_each_thread.rs:69:16
+   |
+LL |     let near = census_dep::spawn_it(pump);
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: send census: the thread spawned through this call sends `Wake` (Pumped) via <fn() {pump} as std::ops::FnOnce<()>>::call_once - shim(fn() {pump}) -> pump -> std::sync::mpsc::Sender::<Wake>::send
+  --> $DIR/send_census_places_each_thread.rs:70:15
+   |
+LL |     let far = census_dep::spawn_via(pump);
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: send census: the thread spawned here sends `Wake` (A) via outer_a::<u8>::{closure#0} -> std::sync::mpsc::Sender::<Wake>::send
+  --> $DIR/send_census_places_each_thread.rs:28:5
+   |
+LL |     std::thread::spawn(f)
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+note: send census: the thread spawned here sends `Wake` (B) via outer_b::<u8>::{closure#0} -> std::sync::mpsc::Sender::<Wake>::send
+  --> $DIR/send_census_places_each_thread.rs:28:5
+   |
+LL |     std::thread::spawn(f)
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+note: consumer census: `run` drains a channel of `Wake`; its switch gives each of its 3 variants an arm
+  --> $DIR/send_census_places_each_thread.rs:53:1
+   |
+LL | fn run(rx: Receiver<Wake>) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: consumer census: the arm for `Wake::A` in `run` takes it from `outer_a::<u8>::{closure#0}`
+  --> $DIR/send_census_places_each_thread.rs:57:13
+   |
+LL |             Wake::A => n += 1,
+   |             ^^^^^^^
+
+note: consumer census: the arm for `Wake::B` in `run` takes it from `outer_b::<u8>::{closure#0}`
+  --> $DIR/send_census_places_each_thread.rs:58:13
+   |
+LL |             Wake::B => n += 10,
+   |             ^^^^^^^
+
+note: consumer census: the arm for `Wake::Pumped` in `run` takes it from `<fn() {pump} as std::ops::FnOnce<()>>::call_once - shim(fn() {pump})` and `<fn() {pump} as std::ops::FnOnce<()>>::call_once - shim(fn() {pump})`
+  --> $DIR/send_census_places_each_thread.rs:59:13
+   |
+LL |             Wake::Pumped => n += 100,
+   |             ^^^^^^^^^^^^
+

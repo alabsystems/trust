@@ -5,7 +5,8 @@ fn standard_targo_tests_select_every_package_with_a_unit_suite() {
     assert_eq!(
         targo_test_packages(),
         [
-            "cargo",
+            "targo",
+            "targo-core",
             "build-rs-test-lib",
             "cargo-credential",
             "cargo-platform",

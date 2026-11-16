@@ -5,8 +5,7 @@ use rustc_ast::token::Delimiter;
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
 use rustc_ast::{AttrArgs, AttrItem, AttrKind, Attribute, Expr, ExprKind, Path};
 use rustc_errors::Applicability;
-use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{EarlyContext, EarlyLintPass, declare_lint_pass};
 use rustc_span::Symbol;
 
 declare_clippy_lint! {
@@ -142,8 +141,8 @@ impl EarlyLintPass for LegacySpecSugar {
 }
 
 fn check_contracts_attr(cx: &EarlyContext<'_>, attr: &Attribute, item: &AttrItem, clause: &str, placeholder: &str) {
-    let (predicate, has_old_call) = match item.args.unparsed_ref() {
-        Some(AttrArgs::Delimited(delim)) if !delim.tokens.is_empty() => (
+    let (predicate, has_old_call) = match &item.args {
+        AttrArgs::Delimited(delim) if !delim.tokens.is_empty() => (
             // The raw source between the delimiters, so the sketch carries the
             // user's own predicate spelling.
             snippet(cx, delim.dspan.open.between(delim.dspan.close), placeholder).to_string(),

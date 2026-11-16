@@ -65,8 +65,9 @@
 //! and in-range numerals), **`Composed`** (a nested tree of those same ops,
 //! `2..=COMPOSED_MAX_OPS` nodes), **`Select`** (the parameter-select `ite`,
 //! R2/C5a) and **`SelectLiteral`** (the param-vs-const compare
-//! `if a < 10 then a else b`, R2/C9 — numeral strictly on the comparison's
-//! right). Ordinary projection and inductive projection support every exact
+//! `if a ⊲ 10 then a else b` for `<`, `<=` or propositional `=`, R2/C9 —
+//! numeral strictly on the comparison's right). Ordinary projection and
+//! inductive projection support every exact
 //! carrier, including the unbounded `trust_bignum::Nat`; the arithmetic and
 //! select shapes retain their documented restriction that EVERY signature
 //! position sits at one unsigned machine width. All are what
@@ -208,6 +209,7 @@
 
 use std::time::{Duration, Instant};
 
+use clean_kernel::name::NameInner;
 use clean_kernel::{
     ConstantKind, DeclarationVerification, Environment, Expr, ExprKind, Level, Literal, Name,
 };
@@ -216,15 +218,17 @@ use trust_clean_carrier::{
 };
 use trust_spec_elab::{Domain, MachineUIntWidth};
 use trust_types::admissible_body::{
-    AdmissibleBody, ArithBinOp, ArithExpr, ArithOperand, BeqOperand, RawBinOpKind, RecBodyExpr,
-    SelectCmp, StructuralRecBody, WfRecBody, recognize_admissible_body, recognize_raw_binop,
-    recognize_structural_rec, recognize_wf_nat_rec, recognize_wf_sum_measure_rec,
+    AdmissibleBody, ArithBinOp, ArithExpr, ArithOperand, BeqOperand, BoolBinOp, BoolValueBody,
+    RawBinOpKind, RecBodyExpr, SelectCmp, StructuralRecBody, WfRecBody, recognize_admissible_body,
+    recognize_bool_value, recognize_raw_binop, recognize_structural_rec, recognize_wf_nat_rec,
+    recognize_wf_sum_measure_rec,
 };
 use trust_types::{Ty, VerifiableFunction};
 
 use crate::gate::{
-    Faithful, FaithfulnessMethod, GateRefusal, check_faithful, check_faithful_equations,
-    check_faithful_wf_functional, check_faithful_with_deadline,
+    Faithful, FaithfulnessMethod, GateRefusal, check_faithful_equations_for_name,
+    check_faithful_for_name, check_faithful_for_name_with_deadline,
+    check_faithful_wf_functional_for_name,
 };
 use crate::table;
 
@@ -234,6 +238,73 @@ use crate::table;
 const INDUCTIVE_PROJECTION_MAX_ARITY: usize = 8;
 const INDUCTIVE_PROJECTION_MAX_CANDIDATES: usize = 8;
 const INDUCTIVE_PROJECTION_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum operators in a composed Boolean body. This bounds emission work;
+/// the independently authored E6 reader retains its own limits.
+pub const BOOL_EXPRESSION_MAX_OPS: usize = 32;
+const BOOL_EXPRESSION_MAX_DEPTH: usize = 64;
+
+/// A pure, total Boolean expression read from the original Clean declaration.
+/// This is emission data, never the reflected subject of the faithfulness gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoolExpr {
+    /// A zero-based source parameter.
+    Param(usize),
+    /// A Boolean literal inside an expression (not a new constant-body lane).
+    Literal(bool),
+    /// Boolean negation.
+    Not(Box<Self>),
+    /// Strict conjunction; the operands are pure and total.
+    And(Box<Self>, Box<Self>),
+    /// Strict disjunction; the operands are pure and total.
+    Or(Box<Self>, Box<Self>),
+}
+
+impl BoolExpr {
+    fn check_bounds(&self, arity: usize, depth: usize, ops: &mut usize) -> bool {
+        if depth > BOOL_EXPRESSION_MAX_DEPTH {
+            return false;
+        }
+        match self {
+            Self::Param(index) => *index < arity,
+            Self::Literal(_) => true,
+            Self::Not(child) => {
+                *ops += 1;
+                *ops <= BOOL_EXPRESSION_MAX_OPS && child.check_bounds(arity, depth + 1, ops)
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                *ops += 1;
+                *ops <= BOOL_EXPRESSION_MAX_OPS
+                    && left.check_bounds(arity, depth + 1, ops)
+                    && right.check_bounds(arity, depth + 1, ops)
+            }
+        }
+    }
+}
+
+/// Maximum decisions in one Rust-callable unsigned conditional tree.
+pub const UINT_CONDITIONAL_MAX_DECISIONS: usize = 32;
+
+/// Pure unsigned conditional dataflow. All operands use the plan signature's
+/// one exact machine width; source parameter positions are outermost-first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UIntConditional {
+    /// A bare parameter or in-range unsigned numeral.
+    Operand(ArithOperand),
+    /// A propositional comparison followed by two independently checked arms.
+    If {
+        /// Comparison selected by the original proposition.
+        cmp: SelectCmp,
+        /// Source parameter on the comparison's left.
+        left: usize,
+        /// Parameter or numeral on the comparison's right.
+        right: ArithOperand,
+        /// Value when the comparison is true.
+        then_branch: Box<UIntConditional>,
+        /// Value when the comparison is false.
+        else_branch: Box<UIntConditional>,
+    },
+}
 
 /// The body shapes the compiler knows how to originate from a Clean `def`.
 ///
@@ -380,14 +451,16 @@ pub enum CleanOriginShape {
     /// operand, in either numeral spelling on side A; a literal on the LEFT
     /// (`if 10 < a`) is outside the fragment and fails closed, mirroring the
     /// reflected side B (`admit_select_literal_function`), whose signature
-    /// cannot even spell it. Arms remain bare source parameters — constant
-    /// arms stay outside (e6 probe f03's boundary, untouched).
+    /// cannot even spell it. Arms remain bare source parameters in this
+    /// narrow shape; constant arms route through [`Self::SelectOperands`].
     ///
     /// The MIR is the same four-block O0 diamond as [`Self::Select`], with
     /// the comparison's right operand an inline scalar constant. Kernel
-    /// ground: `probe_i_select_literal_admits` — check_faithful ADMITS the
-    /// reflected tree against BOTH side-A numeral spellings, and refuses the
-    /// off-by-one-literal, swapped-arm and Le-for-Lt mutants against both.
+    /// ground: `probe_i_select_literal_admits` plus
+    /// `probe_i5_select_literal_le_and_propositional_eq_real_elaboration_admit`
+    /// — check_faithful ADMITS the reflected trees for `<`, `<=` and
+    /// propositional `=`, while wrong comparison, instance, operand, literal
+    /// and arm mutations refuse.
     SelectLiteral {
         /// The comparison (`<`, `<=`, `==`), as for [`Self::Select`].
         cmp: SelectCmp,
@@ -448,6 +521,14 @@ pub enum CleanOriginShape {
         then_arm: ArithOperand,
         /// The value otherwise.
         else_arm: ArithOperand,
+    },
+    /// A bounded tree of unsigned selects over parameter comparisons and
+    /// parameter/numeral leaves. At least two selects keep this disjoint from
+    /// the existing single-select shapes. Emission is checked against the
+    /// original declaration through the independent E6 emitted-body reader.
+    UnsignedConditional {
+        /// The exact source-side conditional tree; the signature owns its width.
+        expr: UIntConditional,
     },
     /// `fun x0 … x_{n-1} => if xl == <rhs> then <then> else <else>` (§6f
     /// LANDING 6) — the select whose branch condition is written with the
@@ -574,10 +655,12 @@ pub enum CleanOriginShape {
         /// The value otherwise.
         else_arm: ArithOperand,
     },
-    /// `fun x0 … x_{n-1} => xl <op> xr` for `<op>` one of `&&&`, `|||`, `/`,
-    /// `%` at an unsigned machine width (§6f LANDING 7) — the operators whose
-    /// realization is a BARE `Rvalue::BinaryOp` rather than a call to a
-    /// marker-authenticated `core::num` primitive.
+    /// `fun x0 … x_{n-1} => xl <op> xr` for `<op>` one of the raw-binop rows'
+    /// operators — `&&&`, `|||`, `/`, `%` (§6f LANDING 7) and `^^^`, `>>>`
+    /// (clean `bf31976f48`, 2026-09-23) — at an unsigned machine width: the
+    /// operators whose realization is a BARE `Rvalue::BinaryOp` rather than a
+    /// call to a marker-authenticated `core::num` primitive. The authority on
+    /// the set is `table::raw_binop_rows`; this list is a reader's summary.
     ///
     /// # Why it is not a fourth [`ArithBinOp`] on [`Self::WrappingBinOp`]
     ///
@@ -591,9 +674,14 @@ pub enum CleanOriginShape {
     ///   no kernel gate. This lane must widen the CALL direction alone.
     /// * every `ArithBinOp` maps to a [`PrimitiveCallee`] through
     ///   `CalleeSelector::at_width`, a closed match over exactly three wrapping
-    ///   identities. `u{N}`'s `&`, `|`, `/`, `%` are on the `BitAnd`, `BitOr`,
-    ///   `Div` and `Rem` trait impls, not in `core::num`, so a fourth variant
-    ///   would demand a callee that does not exist.
+    ///   identities. `u{N}`'s `&`, `|`, `^`, `/`, `%` and `>>` are on the
+    ///   `BitAnd`, `BitOr`, `BitXor`, `Div`, `Rem` and `Shr` trait impls in
+    ///   `core::ops` (`bitxor_impl!`, `shr_impl_all!` for `^` and `>>`), not
+    ///   in `core::num`, so a fourth variant would demand a callee that does
+    ///   not exist. (`core::num` does carry `wrapping_div`, `wrapping_rem` and
+    ///   `wrapping_shr`, but they are methods the operators do not call, and
+    ///   `RustcTotalPrimitiveMethod::classify` authenticates only
+    ///   `wrapping_{add,sub,mul}` — so none of them is a callee either.)
     ///
     /// # THE DIVISOR RULE — the one soundness constraint in this shape
     ///
@@ -638,6 +726,82 @@ pub enum CleanOriginShape {
         /// `Div`/`Rem` it is a strictly positive numeral, re-checked on the
         /// sealed plan — see THE DIVISOR RULE above.
         right: ArithOperand,
+    },
+    /// **W6 (Rust-calls-Clean, comparison to `Bool`)** — a `def` whose whole
+    /// body is a comparison of two source parameters returned as `Bool`:
+    /// `def lt (a b : UInt64) : Bool := a < b`, whose kernel term is
+    /// `decide (a < b)` (`<`/`<=`) or `BEq.beq {C} … a b` (`==`). The result
+    /// carrier is `Bool`; the MIR is a one-block bare
+    /// [`crate::table::MirShape::ComparisonValue`], `_0 = <cmp>(l, r); return`.
+    ///
+    /// # It is DISJOINT from every select shape
+    ///
+    /// A select's result carrier is `u{w}` and its body is an `ite`; this
+    /// shape's result carrier is `Bool` and its head is `decide`/`BEq.beq`, so
+    /// `recognise_select_ite` and the `==` recognisers all decline it (they
+    /// require a `UInt` result). It is reflected through the SAME shared
+    /// `recognize_admissible_body` chain the projection/constant/arithmetic
+    /// shapes use — side B reads it back as
+    /// [`trust_types::admissible_body::AdmissibleBody::ComparisonBool`], which
+    /// the E6 kernel-import direction ALREADY reads, so routing the CALL lane
+    /// through the shared chain exposes nothing new to E6.
+    ///
+    /// # Operands are PARAMETERS only
+    ///
+    /// A numeral RIGHT operand elaborates with a Nat-reduced Decidable instance
+    /// (`instDecidableNatLt (a.toNat…) 10`), which is NOT definitionally equal
+    /// to the carrier-instance term `admit_comparison_function` mints — measured
+    /// 2026-09-13, `a < 10 : Bool` is refused fail-closed by the gate. So the
+    /// recogniser admits only bare-parameter operands; a literal-operand
+    /// comparison-to-`Bool` is a named residual pending a Nat-reduced-instance
+    /// producer. `!=` (`Bool.not (BEq.beq …)`) is likewise a residual: it has
+    /// no `SelectCmp` and its top-level `Bool.not` is the boolean-connective
+    /// lane's, not this one's.
+    DecideComparison {
+        /// The comparison (`<`, `<=`, `==`).
+        cmp: SelectCmp,
+        /// 0-based source parameter on the comparison's left.
+        cmp_left: usize,
+        /// 0-based source parameter on the comparison's right.
+        cmp_right: usize,
+    },
+    /// **W6 (Rust-calls-Clean, boolean negation)** — `def f (b : Bool) : Bool
+    /// := not b`, whose kernel term is `Bool.not b`. The result and the operand
+    /// carry `Bool`; the MIR is a one-block `_0 = UnaryOp(Not, param); return`
+    /// ([`crate::table::MirShape::BoolNotValue`]). Reflected through the
+    /// AUTHORED `admit_bool_value_function` via the SEPARATE entry point
+    /// `recognize_bool_value` — never the shared `recognize_admissible_body`
+    /// chain, so the gate-free E6 import direction cannot reach it.
+    BoolNot {
+        /// 0-based source parameter negated.
+        param: usize,
+    },
+    /// **W6 (Rust-calls-Clean, boolean connective)** — `def f (a b : Bool) :
+    /// Bool := a && b` / `a || b`, whose kernel terms are `and a b` / `or a b`
+    /// (def-eq to `Bool.and`/`Bool.or`). Both operands are `Bool` parameters;
+    /// the MIR is a one-block `_0 = <BitAnd|BitOr>(l, r); return` at the `bool`
+    /// carrier ([`crate::table::MirShape::BoolConnValue`]). Same reflection lane
+    /// as [`Self::BoolNot`].
+    ///
+    /// DISJOINT from the machine-UInt raw-binop shapes: those return a `UInt`
+    /// and extract a width; this returns `Bool` and has none. The emitted MIR
+    /// is a strict `&`/`|` on `bool`, which computes exactly the total
+    /// `Bool.and`/`Bool.or` — short-circuit is observationally identical for
+    /// pure `bool` operands.
+    BoolConnective {
+        /// The connective (`&&`/`||`).
+        op: BoolBinOp,
+        /// 0-based source parameter on the left.
+        left: usize,
+        /// 0-based source parameter on the right.
+        right: usize,
+    },
+    /// A bounded tree of pure Boolean operators. Primitive bodies keep their
+    /// existing shapes. The emitted body is checked through the pre-existing
+    /// general E6 importer, not a reflection reconstructed from this tree.
+    BoolExpression {
+        /// The original declaration's expression, for emission only.
+        expr: BoolExpr,
     },
     /// Structural single-step `Nat` recursion at the bignum carrier (R1,
     /// §6e AS AMENDED): side A is the island's own recursor spine
@@ -742,6 +906,121 @@ pub enum CleanOriginShape {
         /// layout, both of which are functions of the lowering and the arity.
         lowering: WfLowering,
     },
+    /// **W5 (Lean-calls-Rust), increment 2** — `fun x0 … x_{n-1} => f (g x0) …`:
+    /// a linear chain of applications of RUST CALLEES, the constants the
+    /// compiler declared in the Clean environment for the admissible sibling
+    /// `fn`s of the island (`trust_certify::clean_island::declare_rust_callees`).
+    /// `def twice_inc (x : UInt64) : UInt64 := inc (inc x)` is the acceptance
+    /// program (battery row r18).
+    ///
+    /// Nodes are in POST-ORDER, root last, exactly as [`Self::Composed`]
+    /// flattens its tree, and each node's arguments are source parameters,
+    /// in-range numerals at the callee's parameter carrier, `Bool` literals, or
+    /// EARLIER nodes.
+    ///
+    /// **A node may be read by SEVERAL later nodes** (2026-09-15): that is the
+    /// explicit value temporary — `def dup (x) := let y := dbl x; sub2 y y` is
+    /// ONE `dbl` node read twice, emitted as one `Call` whose temporary is
+    /// copied at each use (`walk_let_spine`, which marks it
+    /// [`RustCallNode::let_binding`]). The control flow stays linear; only the
+    /// dataflow is a DAG. The MIR is the linear call chain
+    /// `recognize_call_chain` was written for, with one `Call` to the
+    /// registered callee `DefId` per node through fresh temporaries typed at
+    /// the CALLEE's result carrier, the root writing `_0`, then `Return`
+    /// ([`crate::table::MirShape::RustCallChain`]).
+    ///
+    /// # What the gate decides, and what it does not
+    ///
+    /// Side B ([`trust_types::admissible_body::recognize_rust_call_chain`], a
+    /// SEPARATE entry point) reads the chain back, reflects it as
+    /// `fun x => inc (inc x)` over the callee CONSTANTS (never their bodies —
+    /// the kernel holds each as a stuck `Opaque`), and [`crate::gate::check_faithful`]
+    /// decides definitional equality of two applications of the same stuck
+    /// head: a swapped argument, a wrong callee, a missing application or a
+    /// literal at the wrong value all refuse
+    /// (`control_23_rust_call_emitter_mutation`).
+    ///
+    /// What the verdict does NOT cover, stated per the design's SOUNDNESS
+    /// charges: the Clean term is total and the binary computes it ONLY IF
+    /// every callee returns. The callee's panic/termination obligations are
+    /// ORDINARY Rust obligations of that `fn`; under verification they are
+    /// charged by increment 3, and until then this shape enters no
+    /// panic-free registry and mints no caller-side summary
+    /// (`trust_verify.rs`'s call model returns `None` for it). The identity
+    /// "constant `inc` DENOTES `fn inc`" is compiler-asserted
+    /// (`docs/TCB.md`).
+    ///
+    /// The callee table is part of the plan ([`CleanOriginPlan::callees`]);
+    /// the node's `callee` indexes it.
+    RustCallChain {
+        /// The calls, post-order, root last. Non-empty.
+        nodes: Vec<RustCallNode>,
+    },
+}
+
+/// One admissible Rust callee as a plan carries it (W5).
+///
+/// `def_path` is the extractor's rendering of the registered callee `DefId`
+/// (`trust_mir_extract::func_operand_name` over `Operand::function_handle`),
+/// which is the string side B reads back from the emitted `Call` — so the
+/// identity check in [`admit_lowering`] compares two renderings of ONE
+/// `DefId`, the same discipline `resolve_bignum_method` documents. Only the
+/// MIR-time session can supply it; the mint seam, which never reaches side
+/// B, passes the empty string, and a plan carrying an empty `def_path` is
+/// REFUSED by [`admit_lowering`] rather than matched by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustCalleeRef {
+    /// The Clean constant name (the callee's bare Rust item name).
+    pub clean_name: String,
+    /// The extractor's rendering of the callee `DefId`; empty at the mint
+    /// seam.
+    pub def_path: String,
+    /// The Rust carrier of every parameter, in order.
+    pub params: Vec<Ty>,
+    /// The Rust carrier of the result.
+    pub result: Ty,
+}
+
+/// One call in a [`CleanOriginShape::RustCallChain`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustCallNode {
+    /// Index into [`CleanOriginPlan::callees`].
+    pub callee: usize,
+    /// The arguments, in call order.
+    pub args: Vec<RustCallArg>,
+    /// W5 increment 7 — `Some(k)`: this node is the value of the `k`-th
+    /// Rust-call `let` on the top-level spine of the `def` body, an explicit
+    /// VALUE TEMPORARY evaluated exactly once, in binding order, before the
+    /// body, whatever its use count (0, 1 or n reads via
+    /// [`RustCallArg::Node`]). `None`: an ordinary post-order operand node,
+    /// read exactly once by a later node (or the root, read never).
+    ///
+    /// The kernel cannot see this distinction — zeta identifies
+    /// `let y := f x; g y y` with `g (f x) (f x)` — so the once-evaluation
+    /// claim rests on the STRUCTURAL chain `check_rust_call_chain` seals
+    /// (`docs/TCB.md`, the let-temp ONCE-EVALUATION row).
+    pub let_binding: Option<usize>,
+}
+
+/// One argument of a [`RustCallNode`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustCallArg {
+    /// A 0-based source parameter.
+    Param(usize),
+    /// The result of an EARLIER node, by index.
+    Node(usize),
+    /// A literal at the callee's parameter carrier.
+    Literal(RustCallLiteral),
+}
+
+/// A literal argument, in the two carrier families this lane admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustCallLiteral {
+    /// An in-range numeral at an unsigned machine width (the width is the
+    /// callee parameter's, re-checked on the sealed plan).
+    UInt(u128),
+    /// `true` / `false`.
+    Bool(bool),
 }
 
 /// The measured cap on wrapping-op NODES in one [`CleanOriginShape::Composed`]
@@ -766,15 +1045,124 @@ pub const COMPOSED_MAX_OPS: usize = 32;
 #[derive(Debug, Clone)]
 pub struct CleanOriginPlan {
     name: String,
+    declaration: Name,
     signature: CarrierSignature,
     shape: CleanOriginShape,
+    /// W5: the Rust callees a [`CleanOriginShape::RustCallChain`] node may
+    /// index. Empty for every other shape and for every plan built without
+    /// a callee table.
+    callees: Vec<RustCalleeRef>,
+    /// See [`Self::source_is_direct`]. Decided once, at planning, from the
+    /// same environment value every downstream consumer reads.
+    source_is_direct: bool,
+}
+
+/// A standalone source-side emission plan, not a faithfulness permission.
+///
+/// Literal bodies may have distinct UInt8/16/32/64 parameter carriers because
+/// standalone reflection reconstructs their complete typed telescope. This
+/// plan cannot be passed to the legacy, single-domain MIR reflection API.
+///
+/// ```compile_fail
+/// use trust_clean_origin::emit::{CleanOriginPlan, StandaloneCleanOriginPlan};
+/// fn cannot_relabel(plan: &StandaloneCleanOriginPlan) {
+///     let _: CleanOriginPlan = plan.clone();
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct StandaloneCleanOriginPlan {
+    inner: StandalonePlanKind,
+}
+
+#[derive(Debug, Clone)]
+enum StandalonePlanKind {
+    Legacy(CleanOriginPlan),
+    Literal {
+        name: String,
+        declaration: Name,
+        signature: CarrierSignature,
+        shape: CleanOriginShape,
+        /// Trust (WS5.20): the source numeral was outside `0..2^w` and `shape`
+        /// carries its residue — disclosed by [`StandaloneCleanOriginPlan::
+        /// reduces_out_of_range_literal`], never hidden in the value.
+        reduced: bool,
+    },
+}
+
+impl StandaloneCleanOriginPlan {
+    /// Exact source identity, independent of its diagnostic rendering.
+    #[must_use]
+    pub fn declaration(&self) -> &Name {
+        match &self.inner {
+            StandalonePlanKind::Legacy(plan) => plan.declaration(),
+            StandalonePlanKind::Literal { declaration, .. } => declaration,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match &self.inner {
+            StandalonePlanKind::Legacy(plan) => plan.name(),
+            StandalonePlanKind::Literal { name, .. } => name,
+        }
+    }
+
+    #[must_use]
+    pub fn signature(&self) -> &CarrierSignature {
+        match &self.inner {
+            StandalonePlanKind::Legacy(plan) => plan.signature(),
+            StandalonePlanKind::Literal { signature, .. } => signature,
+        }
+    }
+
+    #[must_use]
+    pub fn shape(&self) -> &CleanOriginShape {
+        match &self.inner {
+            StandalonePlanKind::Legacy(plan) => plan.shape(),
+            StandalonePlanKind::Literal { shape, .. } => shape,
+        }
+    }
+
+    /// Trust (WS5.20): whether this is a literal return whose source numeral was
+    /// outside `0..2^w` and was planned as its Lean `OfNat` residue — the one
+    /// standalone plan whose emitted literal differs from the source spelling
+    /// (the gate still kernel-checks the residue against that spelling).
+    #[must_use]
+    pub fn reduces_out_of_range_literal(&self) -> bool {
+        matches!(self.inner, StandalonePlanKind::Literal { reduced: true, .. })
+    }
+
+    /// Only a plan actually checked by the legacy planner can be recovered.
+    /// A standalone literal never manufactures a legacy MIR plan, even when
+    /// its particular signature happens to use one width throughout.
+    #[must_use]
+    pub fn legacy_plan(&self) -> Option<&CleanOriginPlan> {
+        match &self.inner {
+            StandalonePlanKind::Legacy(plan) => Some(plan),
+            StandalonePlanKind::Literal { .. } => None,
+        }
+    }
 }
 
 impl CleanOriginPlan {
+    /// Exact source identity used for all source and proof lookups.
+    #[must_use]
+    pub fn declaration(&self) -> &Name {
+        &self.declaration
+    }
+
     /// The Clean declaration being emitted.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// W5: the Rust callee table a [`CleanOriginShape::RustCallChain`] indexes
+    /// — the SAME table the planner was given, carried so the materializer and
+    /// the gate resolve a node's callee against what side A was planned over.
+    #[must_use]
+    pub fn callees(&self) -> &[RustCalleeRef] {
+        &self.callees
     }
 
     /// The total carrier signature: one carrier per argument, one for the
@@ -789,6 +1177,29 @@ impl CleanOriginPlan {
     #[must_use]
     pub fn shape(&self) -> &CleanOriginShape {
         &self.shape
+    }
+
+    /// For a [`CleanOriginShape::WrappingBinOp`] or
+    /// [`CleanOriginShape::Composed`] plan: whether the declaration's OWN
+    /// kernel value is already that wrapping tree — `UIntW` lambdas over
+    /// parameters, in-range literals, `add`/`sub`/`mul` in either spelling and
+    /// `UIntW` lets, with no helper call to unfold and no metadata to strip.
+    /// For a [`CleanOriginShape::Projection`] or
+    /// [`CleanOriginShape::ConstantUint`] plan: whether that value is the same
+    /// `UIntW` telescope returning, after substituting its `UIntW` lets,
+    /// exactly the plan's parameter or numeral. `false` for every other shape.
+    ///
+    /// Recognition may see through a transparent Lean helper
+    /// (`def f a := square (plusOne a)` plans as a composed tree,
+    /// `def g a b := pick a b` as a projection), which is sound for the
+    /// carrier gate — it compares against the original declaration by kernel
+    /// defeq — but the compiler's kernel-TV companion denotes that original
+    /// value syntactically and refuses the helper head. A carrier-gate
+    /// consumer that turns a missing companion into a fatal must therefore not
+    /// target a plan for which this is `false`.
+    #[must_use]
+    pub fn source_is_direct(&self) -> bool {
+        self.source_is_direct
     }
 
     /// The Rust carrier types of the parameters, in order — what the emitted
@@ -830,6 +1241,14 @@ impl CleanOriginPlan {
     /// recognisers to peel the erased proof lambda, which is a separate
     /// increment. Reading this accessor is correct in either state: it reports
     /// what the plan carries.
+    ///
+    /// That increment must also teach the two compiler lanes that route around
+    /// a call site to read this set; today both ask only the Rust contract set
+    /// (`trust_mir_extract::def_owes_caller_precondition`). The MIR inliner's
+    /// keep-call rule (`rustc_mir_transform`'s
+    /// `trust_verify/requires_callee_inlining.rs`) would otherwise inline such a
+    /// def, and the value-use gate (`trust_verify/uncharged_callable.rs`) would
+    /// admit it as a fn value. Either way the call that charges these is gone.
     #[must_use]
     pub fn preconditions(&self) -> Vec<trust_clean_carrier::CleanOriginPrecondition> {
         self.signature.preconditions()
@@ -869,6 +1288,26 @@ pub enum EmitRefusal {
         /// I4's refusal, verbatim — it names the position and the true bound.
         refusal: CarrierRefused,
     },
+    /// Side A carries TOTALLY, but side B has no Clean domain that reflects
+    /// that carrier back to this Clean type, so the emitted body's agreement
+    /// with the declaration could never be re-earned.
+    ///
+    /// This is a CAPABILITY refusal about the compiler's reflection, not about
+    /// what the user wrote, and it is deliberately raised on side A: without
+    /// it the mint would grant a `DefId`, resolve, typeck, and then die inside
+    /// `clean_origin_mir` with the gate's fail-closed correctness refusal —
+    /// the precise fatal that `rustc_resolve::trust_clean_mint::decide`'s
+    /// fourth condition exists to convert into an `E0425` with options.
+    CarrierDomainNotReflectable {
+        /// The declaration name.
+        name: String,
+        /// The position, in the user's terms (`argument 0`, `the result`).
+        position: String,
+        /// The Clean type in that position, as the carrier map names it.
+        clean: String,
+        /// The Rust carrier that position was granted.
+        rust: String,
+    },
     /// The emitted body did not read back as an admissible shape at all.
     ///
     /// The compiler emitted MIR that its own recognizer does not accept. That
@@ -906,6 +1345,53 @@ pub enum EmitRefusal {
         /// The producer's own message.
         detail: String,
     },
+    /// W5 increment 7: the top-level `let` spine binds a Rust call that the
+    /// explicit-value-temporary lane cannot carry to the result.
+    ///
+    /// Raised by `walk_let_spine` (a let-bound call whose residual body is not
+    /// a Rust callee application, a helper or opaque wrapped around a call in
+    /// a `let` value, a Rust `let` nested inside another `let`'s value) and by
+    /// `check_rust_call_chain`'s seal-time re-checks over a let-bearing chain.
+    /// It is returned UNMASKED by the planner: the inductive-projection and
+    /// helper-expansion fallbacks never run over it, because each would
+    /// replace this note with a generic one and the fix would be lost.
+    ///
+    /// `defect` separates the user's refusals (`false`: the note carries the
+    /// options) from the planner's own consistency tripwires (`true`: the
+    /// recognised chain and the environment body disagree about how many
+    /// Rust calls the `def` makes — the once-evaluation cross-check).
+    LetSpine {
+        /// The declaration name.
+        name: String,
+        /// Why, in the user's terms (or the tripwire's, when `defect`).
+        reason: String,
+        /// `true` = a planner defect, never something the user wrote.
+        defect: bool,
+    },
+    /// Trust (Clean R80; `docs/DECISION_QUEUE.md` R80-CONSUMERS-1): compiled
+    /// code does not run the kernel value this lane would emit. The declaration
+    /// carries an `@[implemented_by]` binding, or its value reaches a constant
+    /// that does, or the environment's ORDER record is not empty
+    /// (`clean_compiler::implemented_by_order`). A refusal about what the user
+    /// wrote, never a compiler defect. See `crate::implemented_by`.
+    ImplementedBy {
+        /// The declaration name.
+        name: String,
+        /// Why, in the user's terms, with the options.
+        reason: String,
+    },
+    /// Trust (Clean R80 item 5; `docs/DECISION_QUEUE.md` R80-CONSUMERS-1):
+    /// compiled code calls an external symbol, not the kernel value this lane
+    /// would emit. The declaration carries `@[extern]`, or its value reaches a
+    /// constant that does (clean-compiler's `has_compiler_attr` counts both
+    /// attributes). A refusal about what the user wrote, never a compiler
+    /// defect. See `crate::implemented_by`.
+    Extern {
+        /// The declaration name.
+        name: String,
+        /// Why, in the user's terms, with the options.
+        reason: String,
+    },
     /// The gate refused. See [`GateRefusal`].
     Gate(GateRefusal),
 }
@@ -917,9 +1403,13 @@ impl EmitRefusal {
         match self {
             Self::NotEmittable { name, .. }
             | Self::NoTotalCarrier { name, .. }
+            | Self::CarrierDomainNotReflectable { name, .. }
             | Self::LoweringUnrecognised { name, .. }
             | Self::LoweringShapeMismatch { name, .. }
-            | Self::ReflectionRejected { name, .. } => name,
+            | Self::ReflectionRejected { name, .. }
+            | Self::LetSpine { name, .. }
+            | Self::ImplementedBy { name, .. }
+            | Self::Extern { name, .. } => name,
             Self::Gate(refusal) => refusal.name(),
         }
     }
@@ -934,10 +1424,21 @@ impl EmitRefusal {
     #[must_use]
     pub fn is_compiler_defect(&self) -> bool {
         match self {
-            Self::NotEmittable { .. } | Self::NoTotalCarrier { .. } => false,
+            // A capability refusal: the carrier is exact and the user's
+            // declaration is fine; what is missing is a reflection domain, and
+            // the note names the two concrete ways forward.
+            Self::NotEmittable { .. }
+            | Self::NoTotalCarrier { .. }
+            | Self::CarrierDomainNotReflectable { .. }
+            // Trust (Clean R80): the binding or the late command is the user's.
+            | Self::ImplementedBy { .. }
+            | Self::Extern { .. } => false,
             Self::LoweringUnrecognised { .. }
             | Self::LoweringShapeMismatch { .. }
             | Self::ReflectionRejected { .. } => true,
+            // W5 increment 7: the user's `let`-spine refusals carry options;
+            // the seal's cross-check tripwire is the planner's own.
+            Self::LetSpine { defect, .. } => *defect,
             Self::Gate(refusal) => match refusal {
                 GateRefusal::Disagreement { .. }
                 | GateRefusal::SideANotKernelChecked { .. }
@@ -968,8 +1469,14 @@ impl EmitRefusal {
     #[must_use]
     pub fn note(&self) -> String {
         match self {
-            Self::NotEmittable { name, reason } => format!(
-                "`{name}` is kernel-checked, but its body is not a shape this compiler can \
+            Self::NotEmittable { name, reason } => {
+                // The raw-binop clause is DERIVED from `raw_binop_rows` (via
+                // `raw_binop_vocabulary`), not written out: this paragraph
+                // omitted the whole family through landing 7 and the two rows
+                // after it. The rest of the paragraph is hand-kept prose.
+                let (raw_operators, raw_rules) = raw_binop_vocabulary();
+                format!(
+                    "`{name}` is kernel-checked, but its body is not a shape this compiler can \
                  emit Rust code for yet: {reason}\n\
                  The callable fragment currently includes: a PARAMETER PROJECTION at \
                  exact carriers (`fun x y => x`), plus a bounded INDUCTIVE-PROJECTION \
@@ -981,10 +1488,13 @@ impl EmitRefusal {
                  nested composition of up to {COMPOSED_MAX_OPS} ops — over parameters \
                  and in-range numerals with every signature position at ONE unsigned \
                  machine width (`fun x y => x + y`, `fun x => x - 1`, \
-                 `fun x y => (x + y) * x`); a SELECT `if l ⊲ r then t else e` \
+                 `fun x y => (x + y) * x`); ONE RAW BINARY OPERATOR — one of \
+                 {raw_operators} — over two parameters or in-range numerals at that same \
+                 one width{raw_rules}; a SELECT `if l ⊲ r then t else e` \
                  (`<`/`<=`/`==`) whose arms are bare parameters and whose comparison is \
                  parameter-vs-parameter or parameter-vs-numeral with the numeral strictly \
-                 on the right, at that same one width; a SINGLE-PARAMETER STRUCTURAL \
+                 on the right, at that same one width; a bounded unsigned conditional tree \
+                 with 2..=32 decisions and parameter/numeral leaves; a SINGLE-PARAMETER STRUCTURAL \
                  `Nat` RECURSION in equation form (`def f : Nat -> Nat | 0 => b \
                  | n + 1 => …f n…`, one recursive use, values built from the parameter, \
                  `Nat` numerals, `+` and `*`) at the bignum carrier; or a WELL-FOUNDED \
@@ -1010,7 +1520,8 @@ impl EmitRefusal {
                  - write the computation as a Rust `fn` and prove it agrees with `{name}` \
                    in an `ensures` clause, which is the same guarantee reached from the \
                    other side."
-            ),
+                )
+            }
             Self::NoTotalCarrier { name, refusal } => format!(
                 "`{name}` is kernel-checked, but some position of its type has no TOTAL \
                  Rust carrier, so there is no Rust type that can hold those values without \
@@ -1024,6 +1535,55 @@ impl EmitRefusal {
                  - keep the unbounded type and cite `{name}` from proof position;\n\
                  - introduce a bounded wrapper in Clean with the bound in its type."
             ),
+            Self::CarrierDomainNotReflectable { name, position, clean, rust } => {
+                // `BitVec 8` -> `UInt8`: the structure whose single field is
+                // this exact bit vector, i.e. the type the reflection actually
+                // mints. Spelled from the carrier's own rendering so the note
+                // never names a width the user did not write.
+                let uint = clean
+                    .strip_prefix("BitVec ")
+                    .map_or_else(|| "UInt{N}".to_owned(), |bits| format!("UInt{bits}"));
+                format!(
+                    "`{name}` is kernel-checked and {position} carries TOTALLY and exactly \
+                 (`{clean}` -> `{rust}`), but this compiler cannot make `{name}` CALLABLE \
+                 from Rust, because it has no way to re-earn the emitted body's agreement \
+                 with the declaration at `{clean}`.\n\
+                 Why, precisely: the faithfulness gate reflects the EMITTED MIR back into \
+                 Clean using only the emitted body's own local types — deliberately, so \
+                 that an emitter which typed a local wrongly is caught — and the Clean \
+                 domain it reads off `{rust}` is `{uint}`, never `{clean}`. `{uint}` and \
+                 `{clean}` are DIFFERENT Clean types (`{uint}` is a structure whose one \
+                 field is a `{clean}`), so the reflected term is not definitionally equal \
+                 to the declaration and the gate refuses. Refusing HERE turns that into a \
+                 diagnostic at the call site with options, instead of a fail-closed \
+                 correctness refusal at code generation.\n\
+                 This is a measured boundary of the compiler, not a rule about what you \
+                 may write (ruling v7/D2), and it is NOT a soundness problem: nothing wrong \
+                 is emitted, and `{clean}` still carries everywhere a carrier is only \
+                 READ — contract clauses, citations, and the declared-carrier lane.\n\
+                 options:\n\
+                 - restate `{name}` at `UInt8`/`UInt16`/`UInt32`/`UInt64`, which has the \
+                   SAME Rust carrier at the same width and is emittable today, and keep the \
+                   `{clean}` version alongside for proof position if the bit-level spelling \
+                   is what the proof wants;\n\
+                 - cite `{name}` from `requires`/`ensures` instead of calling it — proof \
+                   position needs no emitted body and no reflection;\n\
+                 - write the computation as a Rust `fn` and prove it agrees with `{name}` \
+                   in an `ensures` clause, which is the same guarantee reached from the \
+                   other side;\n\
+                 - or extend the compiler: side B needs a reflection domain whose Clean \
+                   type is `{clean}` at the Rust carrier `{rust}`, AND a way to SELECT it \
+                   that does not read the declaration. Unsigned `BitVec`-typed domains \
+                   already exist in `trust_spec_elab` (`Domain::U128` at `u128`, \
+                   `Domain::USize` at `usize`), so the missing half is not signedness: it \
+                   is that `ty_to_domain` maps the emitted local's Rust type ALONE — \
+                   deliberately, and pinned by `h_i_the_reflector_never_sees_the_plan` — so \
+                   nothing may tell it that this `{rust}` stands for `{clean}` rather than \
+                   `{uint}`. That is an owner decision with four costed options, written up \
+                   in `docs/design/2026-09-14-bitvec-return-direction.md`; it is not a \
+                   widening someone should just write."
+                )
+            }
             Self::LoweringUnrecognised { name, planned } => format!(
                 "INTERNAL: the body emitted for Clean-origin `{name}` was not recognised by \
                  the compiler's own body recognizer, so it could not be checked against the \
@@ -1046,6 +1606,25 @@ impl EmitRefusal {
                  against and nothing was emitted: {detail}\n\
                  This is a compiler-correctness refusal, not a proof obligation. Please \
                  report it."
+            ),
+            // W5 increment 7. No fragment boilerplate: the reason already
+            // names the binder and the residual, and carries the options.
+            Self::LetSpine { name, reason, defect: false } => format!(
+                "`{name}` is kernel-checked, but its `let`-bound Rust call cannot be emitted \
+                 as a value temporary: {reason}"
+            ),
+            Self::LetSpine { name, reason, defect: true } => format!(
+                "INTERNAL: the Rust-call chain planned for Clean-origin `{name}` failed its \
+                 own once-evaluation cross-check, so nothing was planned and nothing was \
+                 emitted: {reason}\n\
+                 This is a compiler-correctness refusal, not a proof obligation. Please \
+                 report it."
+            ),
+            // Trust (Clean R80): no fragment boilerplate; the reason names the
+            // binding and carries the options.
+            Self::ImplementedBy { name, reason } | Self::Extern { name, reason } => format!(
+                "`{name}` is kernel-checked, but Rust cannot call it through the Clean-origin \
+                 lane: {reason}"
             ),
             Self::Gate(refusal) => refusal.note(),
         }
@@ -1070,11 +1649,531 @@ impl From<GateRefusal> for EmitRefusal {
 /// * [`EmitRefusal::NotEmittable`] — no kernel check, no definition body, or a
 ///   body outside the emittable fragment;
 /// * [`EmitRefusal::NoTotalCarrier`] — some signature position does not carry.
+///
+/// This is the NO-CALLEE entry: a body applying a Rust callee refuses here as
+/// outside the fragment. The three compiler sessions that hold a callee table
+/// plan through [`plan_clean_origin_body_with_rust_callees`]; every control
+/// and consumer that never sees a Rust callee keeps this signature.
 pub fn plan_clean_origin_body(
     env: &Environment,
     name: &str,
 ) -> Result<CleanOriginPlan, EmitRefusal> {
-    let kernel_name = Name::from_string(name);
+    plan_clean_origin_body_with_rust_callees(env, name, &[])
+}
+
+/// Plan an exact structural declaration without parsing a display string.
+pub fn plan_clean_origin_body_for_name(
+    env: &Environment,
+    declaration: &Name,
+) -> Result<CleanOriginPlan, EmitRefusal> {
+    plan_clean_origin_body_with_rust_callees_for_name(env, declaration, &[])
+}
+
+/// Plan standalone literals using the same source numeral reader as the
+/// legacy producer. Nonliteral bodies explicitly use the unchanged legacy
+/// planner; this is not a fallback after a refused legacy plan.
+pub fn plan_standalone_clean_origin_body(
+    env: &Environment,
+    name: &str,
+) -> Result<StandaloneCleanOriginPlan, EmitRefusal> {
+    plan_standalone_clean_origin_body_for_name(env, &Name::from_string(name))
+}
+
+/// Standalone planning preserves every string and numeric Name constructor.
+pub fn plan_standalone_clean_origin_body_for_name(
+    env: &Environment,
+    declaration: &Name,
+) -> Result<StandaloneCleanOriginPlan, EmitRefusal> {
+    let display_name = declaration.to_string();
+    let name = display_name.as_str();
+    let (body, signature) = checked_definition(env, declaration)?;
+    // Eta-contracted recursive bodies are not ordinary literal candidates.
+    // Let their existing raw-body legacy recognizer decide, as before. An
+    // actual numeral-reading error (including range) is never swallowed.
+    let literal = match peel_source_parameters(name, &body, signature.arity()) {
+        Ok(cursor) => recognise_standalone_constant_body(name, cursor, &signature)?,
+        Err(_) => None,
+    };
+    if let Some((shape, reduced)) = literal {
+        let supported =
+            |carrier: &Carrier| matches!(carrier.clean(), CleanType::UInt(8 | 16 | 32 | 64));
+        if !supported(signature.result())
+            || signature.arguments().iter().any(|carrier| !supported(carrier))
+            || !signature.hypotheses().is_empty()
+            || !signature.preconditions().is_empty()
+        {
+            return Err(EmitRefusal::NotEmittable {
+                name: name.to_owned(),
+                reason: "standalone literal returns require exact UInt8/16/32/64 in every signature position and no erased hypotheses".to_owned(),
+            });
+        }
+        return Ok(StandaloneCleanOriginPlan {
+            inner: StandalonePlanKind::Literal {
+                name: name.to_owned(),
+                declaration: declaration.clone(),
+                signature,
+                shape,
+                reduced,
+            },
+        });
+    }
+    Ok(StandaloneCleanOriginPlan {
+        inner: StandalonePlanKind::Legacy(plan_checked_legacy_body(
+            env,
+            declaration,
+            &body,
+            signature,
+            &[],
+        )?),
+    })
+}
+
+/// Trust (WS5.20, F-096): the standalone lane's SCALAR vocabulary beyond the
+/// shared [`CleanOriginShape`] — bodies only the standalone lane plans, emits
+/// and gates, and the MIR lane never sees (no `crate::table` row, no MIR
+/// realization, no E6 import direction). Each is re-decided by the standalone
+/// gate from the ACTUAL SSA; the planner is never trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StandaloneScalarShape {
+    /// `l0 ⊲ r0 && l1 ⊲ r1` (or `||`): two decide-comparisons of parameters,
+    /// returned as `Bool` (`STANDALONE.p20_bool_connective`).
+    ComparisonConnective {
+        /// `&&` or `||`.
+        op: BoolBinOp,
+        /// The left comparison.
+        left: StandaloneComparison,
+        /// The right comparison.
+        right: StandaloneComparison,
+    },
+    /// A tree of `&&&`/`|||` over parameters and in-range numerals, at one
+    /// unsigned machine width (`STANDALONE.p15_bitwise`).
+    Bitwise {
+        /// The tree, as the recogniser reads it.
+        expr: StandaloneBitwiseExpr,
+    },
+    /// `x / y` over two parameters at one unsigned machine width — TOTAL, as
+    /// Lean's `UIntN.div` is (`x / 0 = 0`), so it is emitted with an explicit
+    /// zero guard (`STANDALONE.p13_division`).
+    TotalDivision {
+        /// 0-based source parameter divided.
+        dividend: usize,
+        /// 0-based source parameter dividing (may be zero at run time).
+        divisor: usize,
+    },
+}
+
+/// Trust (WS5.20): one comparison of two 0-based source parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandaloneComparison {
+    /// `<`, `<=` or `==`.
+    pub cmp: SelectCmp,
+    /// Left parameter.
+    pub left: usize,
+    /// Right parameter.
+    pub right: usize,
+}
+
+/// Trust (WS5.20): the bitwise operators of [`StandaloneScalarShape::Bitwise`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandaloneBitwiseOp {
+    /// `&&&`.
+    And,
+    /// `|||`.
+    Or,
+}
+
+/// Trust (WS5.20): a `&&&`/`|||` tree over parameters and in-range numerals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StandaloneBitwiseExpr {
+    /// A parameter or an in-range numeral.
+    Operand(ArithOperand),
+    /// `left op right`.
+    Bin {
+        /// The operator.
+        op: StandaloneBitwiseOp,
+        /// Left subtree.
+        left: Box<StandaloneBitwiseExpr>,
+        /// Right subtree.
+        right: Box<StandaloneBitwiseExpr>,
+    },
+}
+
+/// Trust (WS5.20): the operation budget of a standalone bitwise tree — the
+/// same bound the standalone gate enforces independently.
+pub const STANDALONE_BITWISE_MAX_OPS: usize = 32;
+
+/// Trust (WS5.20): a standalone-only scalar plan
+/// ([`plan_standalone_scalar_body_for_name`]).
+#[derive(Debug, Clone)]
+pub struct StandaloneScalarPlan {
+    name: String,
+    declaration: Name,
+    signature: CarrierSignature,
+    shape: StandaloneScalarShape,
+}
+
+impl StandaloneScalarPlan {
+    /// Exact source identity.
+    #[must_use]
+    pub fn declaration(&self) -> &Name {
+        &self.declaration
+    }
+
+    /// Diagnostic rendering of the declaration.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The checked carrier signature.
+    #[must_use]
+    pub fn signature(&self) -> &CarrierSignature {
+        &self.signature
+    }
+
+    /// The standalone-only shape.
+    #[must_use]
+    pub fn shape(&self) -> &StandaloneScalarShape {
+        &self.shape
+    }
+}
+
+/// Trust (WS5.20): plan a declaration in the standalone SCALAR vocabulary
+/// ([`StandaloneScalarShape`]). Callers consult it only after
+/// [`plan_standalone_clean_origin_body_for_name`] refused, and report THAT
+/// refusal when this one also declines, so no existing refusal text moves.
+///
+/// # Errors
+///
+/// [`EmitRefusal::NotEmittable`] when the body is none of the three shapes, the
+/// signature is not one exact unsigned machine width (the `Bool` result of a
+/// comparison connective aside), or the declaration carries an erased
+/// hypothesis or precondition.
+pub fn plan_standalone_scalar_body_for_name(
+    env: &Environment,
+    declaration: &Name,
+) -> Result<StandaloneScalarPlan, EmitRefusal> {
+    let display_name = declaration.to_string();
+    let name = display_name.as_str();
+    let (body, signature) = checked_definition(env, declaration)?;
+    let refuse = |reason: &str| EmitRefusal::NotEmittable {
+        name: name.to_owned(),
+        reason: format!("standalone scalar planning: {reason}"),
+    };
+    if !signature.hypotheses().is_empty() || !signature.preconditions().is_empty() {
+        return Err(refuse("erased hypotheses or preconditions are not in this vocabulary"));
+    }
+    let arity = signature.arity();
+    let Some(CleanType::UInt(width)) = signature.arguments().first().map(|a| a.clean()) else {
+        return Err(refuse("the first parameter is not an unsigned machine integer"));
+    };
+    if !matches!(width, 8 | 16 | 32 | 64)
+        || signature.arguments().iter().any(|argument| argument.clean() != CleanType::UInt(width))
+    {
+        return Err(refuse("every parameter must share one exact UInt8/16/32/64 carrier"));
+    }
+    let carrier_name = CleanType::UInt(width).name();
+    let body = if expr_contains_let(&body) { zeta_normalize(&body) } else { body };
+    let cursor = peel_source_parameters(name, &body, arity)?;
+    let shape = match signature.result().clean() {
+        CleanType::Bool => recognise_standalone_comparison_connective(cursor, arity, &carrier_name)
+            .ok_or_else(|| refuse("the Bool body is not a connective of two comparisons"))?,
+        CleanType::UInt(result) if result == width => {
+            if let Some(shape) =
+                recognise_standalone_total_division(name, cursor, arity, &carrier_name, width)?
+            {
+                shape
+            } else {
+                let expr = recognise_standalone_bitwise_tree(
+                    name,
+                    cursor,
+                    arity,
+                    &carrier_name,
+                    width,
+                    0,
+                )?
+                .ok_or_else(|| refuse("the body is not a `&&&`/`|||` tree"))?;
+                if bitwise_ops(&expr) < 2 {
+                    // One operator is the shared RawBinOp shape's; never plan it twice.
+                    return Err(refuse("a single `&&&`/`|||` is the shared raw-binop shape"));
+                }
+                StandaloneScalarShape::Bitwise { expr }
+            }
+        }
+        _ => return Err(refuse("the result carrier is neither Bool nor the parameters' UInt")),
+    };
+    Ok(StandaloneScalarPlan {
+        name: name.to_owned(),
+        declaration: declaration.clone(),
+        signature,
+        shape,
+    })
+}
+
+/// One decide-comparison of two parameters at the carrier, in the spellings
+/// [`recognise_decide_comparison`] measured (`decide (LT.lt …)`, `decide
+/// (LE.le …)`, `decide (Eq …)`, `BEq.beq` through `instBEqOfDecidableEq`),
+/// generalised to any arity.
+fn read_standalone_comparison(
+    expr: &Expr,
+    arity: usize,
+    carrier: &str,
+) -> Option<StandaloneComparison> {
+    let bvar_param = |expr: &Expr| -> Option<usize> {
+        match strip_mdata(expr).kind() {
+            &ExprKind::BVar(index) if (index as usize) < arity => Some(arity - 1 - index as usize),
+            _ => None,
+        }
+    };
+    let const_is = |expr: &Expr, name: &str, levels: usize| -> bool {
+        matches!(strip_mdata(expr).kind(), ExprKind::Const(n, ls)
+            if name_display_eq_str(n, name) && ls.len() == levels)
+    };
+    let (head, args) = uncurry(strip_mdata(expr));
+    let ExprKind::Const(head_name, _) = head.kind() else {
+        return None;
+    };
+    if name_display_eq_str(head_name, "decide")
+        || name_display_eq_str(head_name, "Decidable.decide")
+    {
+        let [prop, _instance] = args[..] else {
+            return None;
+        };
+        let (prop_head, prop_args) = uncurry(strip_mdata(prop));
+        let ExprKind::Const(prop_name, _) = prop_head.kind() else {
+            return None;
+        };
+        return match &prop_args[..] {
+            [ty, _, l, r]
+                if name_display_eq_str(prop_name, "LT.lt") && const_is(ty, carrier, 0) =>
+            {
+                Some(StandaloneComparison {
+                    cmp: SelectCmp::Lt,
+                    left: bvar_param(l)?,
+                    right: bvar_param(r)?,
+                })
+            }
+            [ty, _, l, r]
+                if name_display_eq_str(prop_name, "LE.le") && const_is(ty, carrier, 0) =>
+            {
+                Some(StandaloneComparison {
+                    cmp: SelectCmp::Le,
+                    left: bvar_param(l)?,
+                    right: bvar_param(r)?,
+                })
+            }
+            [ty, l, r] if name_display_eq_str(prop_name, "Eq") && const_is(ty, carrier, 0) => {
+                Some(StandaloneComparison {
+                    cmp: SelectCmp::Eq,
+                    left: bvar_param(l)?,
+                    right: bvar_param(r)?,
+                })
+            }
+            _ => None,
+        };
+    }
+    if name_display_eq_str(head_name, "BEq.beq") {
+        let [ty, instance, l, r] = args[..] else {
+            return None;
+        };
+        if !const_is(ty, carrier, 0) {
+            return None;
+        }
+        let (instance_head, instance_args) = uncurry(strip_mdata(instance));
+        let inst_dec_eq_ok = matches!(
+            strip_mdata(instance_args.get(1).copied()?).kind(),
+            ExprKind::Const(n, ls)
+                if ls.is_empty() && name_eq1_concat(n, &["instDecidableEq", carrier])
+        );
+        if !const_is(instance_head, "instBEqOfDecidableEq", 1)
+            || instance_args.len() != 2
+            || !const_is(instance_args[0], carrier, 0)
+            || !inst_dec_eq_ok
+        {
+            return None;
+        }
+        return Some(StandaloneComparison {
+            cmp: SelectCmp::Eq,
+            left: bvar_param(l)?,
+            right: bvar_param(r)?,
+        });
+    }
+    None
+}
+
+/// `and c0 c1` / `or c0 c1` (or the `Bool.and`/`Bool.or` spelling) over two
+/// decide-comparisons of parameters.
+fn recognise_standalone_comparison_connective(
+    cursor: &Expr,
+    arity: usize,
+    carrier: &str,
+) -> Option<StandaloneScalarShape> {
+    let (head, args) = uncurry(cursor);
+    let ExprKind::Const(head_name, _) = head.kind() else {
+        return None;
+    };
+    let op = if name_display_eq_str(head_name, "and") || name_display_eq_str(head_name, "Bool.and")
+    {
+        BoolBinOp::And
+    } else if name_display_eq_str(head_name, "or") || name_display_eq_str(head_name, "Bool.or") {
+        BoolBinOp::Or
+    } else {
+        return None;
+    };
+    let [left, right] = args[..] else {
+        return None;
+    };
+    Some(StandaloneScalarShape::ComparisonConnective {
+        op,
+        left: read_standalone_comparison(left, arity, carrier)?,
+        right: read_standalone_comparison(right, arity, carrier)?,
+    })
+}
+
+/// The head of a raw-binop row at the carrier (`HAnd.hAnd {C} {C} {C}
+/// inst{HAnd}{C} l r`, …), with its operator and operand subterms.
+fn raw_binop_application<'e>(
+    expr: &'e Expr,
+    carrier: &str,
+) -> Option<(RawBinOpKind, &'e Expr, &'e Expr)> {
+    let (head, args) = uncurry(expr);
+    let ExprKind::Const(head_name, _) = head.kind() else {
+        return None;
+    };
+    for (selected, op) in table::raw_binop_rows(table::CarrierClass::MachineUInt) {
+        let Some((class, projection)) = table::surface_class(selected) else {
+            continue;
+        };
+        if !name_eq2(head_name, class, projection) {
+            continue;
+        }
+        let [t1, t2, t3, instance, lhs, rhs] = args[..] else {
+            return None;
+        };
+        let is_carrier =
+            |t: &Expr| matches!(t.kind(), ExprKind::Const(n, _) if name_eq_str(n, carrier));
+        let instance_ok = is_prelude_homogeneous_instance(instance, class, carrier);
+        if !(is_carrier(t1) && is_carrier(t2) && is_carrier(t3) && instance_ok) {
+            return None;
+        }
+        return Some((op, strip_mdata(lhs), strip_mdata(rhs)));
+    }
+    None
+}
+
+/// `x / y` over two parameters (the divisor a VARIABLE — the case the shared
+/// raw-binop shape refuses because Rust's `/` panics at zero).
+fn recognise_standalone_total_division(
+    name: &str,
+    cursor: &Expr,
+    arity: usize,
+    carrier: &str,
+    width: u32,
+) -> Result<Option<StandaloneScalarShape>, EmitRefusal> {
+    let Some((RawBinOpKind::Div, lhs, rhs)) = raw_binop_application(cursor, carrier) else {
+        return Ok(None);
+    };
+    match (
+        recognise_arith_operand(name, lhs, arity, carrier, width)?,
+        recognise_arith_operand(name, rhs, arity, carrier, width)?,
+    ) {
+        (Some(ArithOperand::Param(dividend)), Some(ArithOperand::Param(divisor))) => {
+            Ok(Some(StandaloneScalarShape::TotalDivision { dividend, divisor }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A `&&&`/`|||` tree over parameters and in-range numerals, bounded by
+/// [`STANDALONE_BITWISE_MAX_OPS`] (depth and size).
+fn recognise_standalone_bitwise_tree(
+    name: &str,
+    expr: &Expr,
+    arity: usize,
+    carrier: &str,
+    width: u32,
+    depth: usize,
+) -> Result<Option<StandaloneBitwiseExpr>, EmitRefusal> {
+    if depth > STANDALONE_BITWISE_MAX_OPS {
+        return Ok(None);
+    }
+    if let Some(operand) = recognise_arith_operand(name, expr, arity, carrier, width)? {
+        return Ok(Some(StandaloneBitwiseExpr::Operand(operand)));
+    }
+    let Some((kind, lhs, rhs)) = raw_binop_application(expr, carrier) else {
+        return Ok(None);
+    };
+    let op = match kind {
+        RawBinOpKind::BitAnd => StandaloneBitwiseOp::And,
+        RawBinOpKind::BitOr => StandaloneBitwiseOp::Or,
+        _ => return Ok(None),
+    };
+    let (Some(left), Some(right)) = (
+        recognise_standalone_bitwise_tree(name, lhs, arity, carrier, width, depth + 1)?,
+        recognise_standalone_bitwise_tree(name, rhs, arity, carrier, width, depth + 1)?,
+    ) else {
+        return Ok(None);
+    };
+    let tree = StandaloneBitwiseExpr::Bin { op, left: Box::new(left), right: Box::new(right) };
+    if bitwise_ops(&tree) > STANDALONE_BITWISE_MAX_OPS {
+        return Ok(None);
+    }
+    Ok(Some(tree))
+}
+
+fn bitwise_ops(expr: &StandaloneBitwiseExpr) -> usize {
+    match expr {
+        StandaloneBitwiseExpr::Operand(_) => 0,
+        StandaloneBitwiseExpr::Bin { left, right, .. } => {
+            1 + bitwise_ops(left) + bitwise_ops(right)
+        }
+    }
+}
+
+/// [`plan_clean_origin_body`] with the crate's admissible Rust callee table
+/// (W5, Lean-calls-Rust). `callees` are the constants
+/// `trust_certify::clean_island::declare_rust_callees` put into `env` — the
+/// planner reads a head that names one of them as a
+/// [`CleanOriginShape::RustCallChain`] node. The table is copied into the
+/// plan so the materializer and the gate index the same rows side A was read
+/// over.
+///
+/// The three sessions that elaborate islands (mint, MIR gate, verify pass)
+/// must hand this the SAME table, or their plans disagree about whether a
+/// declaration is emittable at all — which the MIR gate reports as a fatal
+/// self-disagreement. The table travels through `ResolverGlobalCtxt`; it is
+/// never re-derived from HIR.
+pub fn plan_clean_origin_body_with_rust_callees(
+    env: &Environment,
+    name: &str,
+    callees: &[RustCalleeRef],
+) -> Result<CleanOriginPlan, EmitRefusal> {
+    plan_clean_origin_body_with_rust_callees_for_name(env, &Name::from_string(name), callees)
+}
+
+/// Plan a structural declaration against the exact native Rust callee table.
+pub fn plan_clean_origin_body_with_rust_callees_for_name(
+    env: &Environment,
+    declaration: &Name,
+    callees: &[RustCalleeRef],
+) -> Result<CleanOriginPlan, EmitRefusal> {
+    let (body, signature) = checked_definition(env, declaration)?;
+    plan_checked_legacy_body(env, declaration, &body, signature, callees)
+}
+
+fn checked_definition(
+    env: &Environment,
+    declaration: &Name,
+) -> Result<(Expr, CarrierSignature), EmitRefusal> {
+    let kernel_name = declaration.clone();
+    let display_name = declaration.to_string();
+    let name = display_name.as_str();
+
+    // Trust (Clean R80): an environment with an `@[implemented_by]` ORDER
+    // record is refused before anything else, every declaration of it, as
+    // `clean_compiler::constant_to_decl` refuses it (`crate::implemented_by`).
+    crate::implemented_by::refuse_order(env)
+        .map_err(|reason| EmitRefusal::ImplementedBy { name: name.to_owned(), reason })?;
 
     // PROVENANCE FIRST, exactly as the gate does. A structurally-inserted or
     // unchecked declaration is not a kernel verdict, and planning an emission
@@ -1126,10 +2225,70 @@ pub fn plan_clean_origin_body(
         });
     };
 
+    // Trust (Clean R80): every lane plans from this body and the kernel values
+    // it reaches, so an `@[implemented_by]` or `@[extern]` binding on the
+    // declaration or anywhere it reaches means compiled code runs something
+    // else (`crate::implemented_by`).
+    crate::implemented_by::refuse_reached_binding(env, &kernel_name)
+        .map_err(|not_run| not_run.refusal(name))?;
+
     // I4's decision, over the WHOLE signature. `CarrierSignature` cannot exist
     // with a partial position, so a plan implies total carriers everywhere.
     let signature = carrier_signature_for(&constant.type_)
         .map_err(|refusal| EmitRefusal::NoTotalCarrier { name: name.to_owned(), refusal })?;
+
+    Ok((body.clone(), signature))
+}
+
+fn plan_checked_legacy_body(
+    env: &Environment,
+    declaration: &Name,
+    body: &Expr,
+    signature: CarrierSignature,
+    callees: &[RustCalleeRef],
+) -> Result<CleanOriginPlan, EmitRefusal> {
+    let display_name = declaration.to_string();
+    let name = display_name.as_str();
+    // A TOTAL CARRIER IS NOT YET PERMISSION TO EMIT: side B must also be able
+    // to REFLECT that carrier back to this Clean type.
+    //
+    // The gate reflects the emitted MIR using only the emitted body's own local
+    // types (`param_domains_of` -> `ty_to_domain`), which is what lets it catch
+    // an emitter that typed a local wrongly. That map's image does not contain
+    // `BitVec N` at an unsigned carrier: `u64` reads back as `UInt64`, and
+    // `UInt64` is a STRUCTURE whose single field is a `BitVec 64`, not the
+    // `BitVec 64` itself. So a `BitVec`-typed declaration would plan, mint a
+    // `DefId`, resolve, typeck, and then be refused fail-closed inside
+    // `clean_origin_mir` — the exact fatal that
+    // `rustc_resolve::trust_clean_mint::decide`'s fourth condition exists to
+    // convert into an `E0425` carrying options.
+    //
+    // Measured 2026-09-13 on this tree: without this check,
+    // `clean { def bvid (x : BitVec 64) : BitVec 64 := x }` plus a Rust caller
+    // compiles to `error: internal: refusing to emit code for Clean declaration
+    // `bvid` — the emitted body could not be established to agree with the
+    // declaration`. With it, the same program gets the call-site refusal that
+    // names the carrier as GRANTED and the reflection as the missing half.
+    //
+    // This is deliberately keyed on the CLEAN type rather than on the Rust one:
+    // `UInt64` and `BitVec 64` share the carrier `u64`, and it is the Clean side
+    // that decides whether a reflection can be minted for it.
+    for (position, carrier) in signature
+        .arguments()
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (format!("argument {i}"), c))
+        .chain(core::iter::once(("the result".to_owned(), signature.result())))
+    {
+        if matches!(carrier.clean(), trust_clean_carrier::CleanType::BitVec(_)) {
+            return Err(EmitRefusal::CarrierDomainNotReflectable {
+                name: name.to_owned(),
+                position,
+                clean: carrier.clean().name(),
+                rust: carrier.witness().rust_carrier().to_owned(),
+            });
+        }
+    }
 
     // R2 FIRST, and on the RAW body. The well-founded spine has a spelling
     // `recognise_clean_shape` cannot reach: the island emits it
@@ -1145,34 +2304,72 @@ pub fn plan_clean_origin_body(
     // fragment for a specific reason, which is kept in force unless the
     // inductive-projection lane can prove the whole function equal to a
     // parameter (the same fallback order the non-recursive chain uses).
-    let shape = match recognise_wf_nat_rec(name, body, &signature)
-        .and_then(|found| match found {
-            // R3b: the FRAGMENT boundary is decided HERE, inside the same
-            // `Result` the recognizer returns, so that "it is a
-            // `WellFounded.fix` and it is outside R2's fragment" reaches the
-            // inductive-projection fallback below by the identical door that
-            // "this reader cannot read it" already used. Before R3b the two
-            // were indistinguishable in practice because `read_wf_value`
-            // refused first on everything the fragment checks cover; widening
-            // it to general `-` separated them, and `cdsConstMinuend` — a body
-            // that DENOTES the identity and is proved so by induction —
-            // stopped planning. The fallback's contract is about the FUNCTION,
-            // never about which layer noticed.
-            Some(shape) => check_wf_fragment(name, &shape, &signature).map(|()| Some(shape)),
-            None => Ok(None),
-        }) {
+    let shape = match recognise_wf_nat_rec(name, body, &signature).and_then(|found| match found {
+        // R3b: the FRAGMENT boundary is decided HERE, inside the same
+        // `Result` the recognizer returns, so that "it is a
+        // `WellFounded.fix` and it is outside R2's fragment" reaches the
+        // inductive-projection fallback below by the identical door that
+        // "this reader cannot read it" already used. Before R3b the two
+        // were indistinguishable in practice because `read_wf_value`
+        // refused first on everything the fragment checks cover; widening
+        // it to general `-` separated them, and `cdsConstMinuend` — a body
+        // that DENOTES the identity and is proved so by induction —
+        // stopped planning. The fallback's contract is about the FUNCTION,
+        // never about which layer noticed.
+        Some(shape) => check_wf_fragment(name, &shape, &signature).map(|()| Some(shape)),
+        None => Ok(None),
+    }) {
         Ok(Some(shape)) => shape,
-        Ok(None) => match recognise_clean_shape(name, body, &signature) {
+        Ok(None) => match recognise_clean_shape(env, name, body, &signature, callees) {
             Ok(shape) => shape,
-            Err(original) => match recognise_inductive_projection(env, name, &signature) {
+            // W5 increment 7: a `let`-spine refusal is returned UNMASKED.
+            // The two fallbacks below cannot help it — the inductive-
+            // projection lane refuses any body with a Rust call in it, and
+            // the helper expansion's `Let` arm refuses a non-identity Rust
+            // `let` with a generic note — and letting either run would
+            // replace the note that names the binder and the fix.
+            Err(original @ EmitRefusal::LetSpine { .. }) => return Err(original),
+            Err(original) => {
+                if let Some(shape) =
+                    recognise_inductive_projection(env, declaration, &signature, callees)
+                {
+                    shape
+                } else {
+                    // Trust: follow checked Lean helper definitions on side A only.
+                    // The gate still reads the original declaration and frozen R;
+                    // expansion neither changes source identity nor mints evidence.
+                    let expanded =
+                        crate::named_calls::expand_named_calls(env, declaration, body, callees)
+                            .map_err(|reason| EmitRefusal::NotEmittable {
+                                name: name.to_owned(),
+                                reason,
+                            })?;
+                    if let Some(expanded) = expanded {
+                        let shape =
+                            recognise_clean_shape(env, name, &expanded, &signature, callees)?;
+                        if matches!(
+                            shape,
+                            CleanOriginShape::StructuralNatRec { .. }
+                                | CleanOriginShape::WellFoundedNatRec { .. }
+                        ) {
+                            return Err(EmitRefusal::NotEmittable {
+                                name: name.to_owned(),
+                                reason: "a named recursive callee needs an independently gated linked-call realization; whole-term expansion does not supply the per-equation gate's original source spine".to_owned(),
+                            });
+                        }
+                        shape
+                    } else {
+                        return Err(original);
+                    }
+                }
+            }
+        },
+        Err(original) => {
+            match recognise_inductive_projection(env, declaration, &signature, callees) {
                 Some(shape) => shape,
                 None => return Err(original),
-            },
-        },
-        Err(original) => match recognise_inductive_projection(env, name, &signature) {
-            Some(shape) => shape,
-            None => return Err(original),
-        },
+            }
+        }
     };
 
     match &shape {
@@ -1241,6 +2438,24 @@ pub fn plan_clean_origin_body(
                     reason: composed_ops_out_of_range_reason(ops),
                 });
             }
+        }
+        CleanOriginShape::UnsignedConditional { expr } => {
+            let width = check_arith_signature(name, "an unsigned conditional tree", &signature)?;
+            let decisions = check_unsigned_conditional(name, expr, &signature, width, 0)?;
+            if !(2..=UINT_CONDITIONAL_MAX_DECISIONS).contains(&decisions) {
+                return Err(EmitRefusal::NotEmittable {
+                    name: name.to_owned(),
+                    reason: "unsigned conditional tree must contain 2..=32 decisions".into(),
+                });
+            }
+        }
+        // W5 (Lean-calls-Rust): every carrier agreement the emitted chain
+        // depends on, RE-CHECKED on the sealed plan — the plan is the decision
+        // the emitter trusts. The kernel already typed the application when it
+        // accepted the definition, so a failure here means the callee table
+        // and the kernel disagree: refuse rather than emit.
+        CleanOriginShape::RustCallChain { nodes } => {
+            check_rust_call_chain(name, nodes, &signature, callees, Some((env, declaration)))?;
         }
         // R2/C5a: the same single-domain constraint as the arithmetic shapes,
         // for the same reason — `admit_select_function` is single-domain over
@@ -1398,6 +2613,14 @@ pub fn plan_clean_origin_body(
                                 reason: sealed_plan_divisor_reason(*op),
                             });
                         }
+                        if op.right_operand_is_a_shift_amount()
+                            && !shift_amount_has_a_side_b(*right, width)
+                        {
+                            return Err(EmitRefusal::NotEmittable {
+                                name: name.to_owned(),
+                                reason: sealed_plan_shift_amount_reason(),
+                            });
+                        }
                     }
                 }
             }
@@ -1440,6 +2663,130 @@ pub fn plan_clean_origin_body(
                     name: name.to_owned(),
                     reason: sealed_plan_divisor_reason(*op),
                 });
+            }
+            if op.right_operand_is_a_shift_amount() && !shift_amount_has_a_side_b(*right, width) {
+                return Err(EmitRefusal::NotEmittable {
+                    name: name.to_owned(),
+                    reason: sealed_plan_shift_amount_reason(),
+                });
+            }
+        }
+        // W6 (Rust-calls-Clean): the comparison-to-`Bool` invariants, RE-CHECKED
+        // on the sealed plan. The RESULT must be `Bool`, both ARGUMENTS one
+        // unsigned machine width (the reflected `admit_comparison_function` is
+        // single-domain), and both parameter indices in range. The kernel
+        // already typed the comparison when it accepted the definition, so a
+        // failure here means the carrier decision and the kernel disagree.
+        CleanOriginShape::DecideComparison { cmp: _, cmp_left, cmp_right } => {
+            if !matches!(signature.result().clean(), trust_clean_carrier::CleanType::Bool) {
+                return Err(EmitRefusal::NotEmittable {
+                    name: name.to_owned(),
+                    reason: "its body is a comparison returned as a value but its result \
+                             carrier is not `Bool`"
+                        .to_owned(),
+                });
+            }
+            // Unlike the arithmetic shapes, the result carrier is `Bool`, not
+            // the operand width — so `check_arith_signature` (which compares
+            // every position to the RESULT) cannot be used. Every ARGUMENT must
+            // instead share one unsigned machine width, because the reflected
+            // `admit_comparison_function` is single-domain over all parameters.
+            let Some(first) = signature.arguments().first() else {
+                return Err(EmitRefusal::NotEmittable {
+                    name: name.to_owned(),
+                    reason: "a comparison to `Bool` has no operands".to_owned(),
+                });
+            };
+            if !matches!(first.rust(), Ty::Int { width: 8 | 16 | 32 | 64, signed: false }) {
+                return Err(EmitRefusal::NotEmittable {
+                    name: name.to_owned(),
+                    reason: format!(
+                        "its comparison operands carry at `{:?}`, which is not an unsigned \
+                         machine width (u8/u16/u32/u64)",
+                        first.rust()
+                    ),
+                });
+            }
+            if let Some((position, argument)) = signature
+                .arguments()
+                .iter()
+                .enumerate()
+                .find(|(_, argument)| argument.rust() != first.rust())
+            {
+                return Err(EmitRefusal::NotEmittable {
+                    name: name.to_owned(),
+                    reason: format!(
+                        "it is a comparison to `Bool`, but parameter {position} carries at \
+                         `{:?}` while parameter 0 carries at `{:?}`; every operand must share \
+                         one unsigned machine width, because the reflected lowering it is \
+                         checked against is single-domain over all parameters",
+                        argument.rust(),
+                        first.rust()
+                    ),
+                });
+            }
+            for index in [cmp_left, cmp_right] {
+                if *index >= signature.arity() {
+                    return Err(EmitRefusal::NotEmittable {
+                        name: name.to_owned(),
+                        reason: format!(
+                            "its comparison names parameter {index} but the signature has \
+                             only {} parameter(s)",
+                            signature.arity()
+                        ),
+                    });
+                }
+            }
+        }
+        // W6 (Rust-calls-Clean): the boolean-value invariants, RE-CHECKED on the
+        // sealed plan. Result and every parameter must be `Bool` (the reflected
+        // `admit_bool_value_function` is single-domain over `Bool`), and every
+        // named parameter in range.
+        CleanOriginShape::BoolNot { .. }
+        | CleanOriginShape::BoolConnective { .. }
+        | CleanOriginShape::BoolExpression { .. } => {
+            let all_bool =
+                matches!(signature.result().clean(), trust_clean_carrier::CleanType::Bool)
+                    && signature
+                        .arguments()
+                        .iter()
+                        .all(|c| matches!(c.clean(), trust_clean_carrier::CleanType::Bool));
+            if !all_bool {
+                return Err(EmitRefusal::NotEmittable {
+                    name: name.to_owned(),
+                    reason: "its body is a boolean connective/negation but some position does \
+                             not carry `Bool`"
+                        .to_owned(),
+                });
+            }
+            let indices: Vec<usize> = match &shape {
+                CleanOriginShape::BoolNot { param } => vec![*param],
+                CleanOriginShape::BoolConnective { left, right, .. } => vec![*left, *right],
+                CleanOriginShape::BoolExpression { expr } => {
+                    let mut ops = 0;
+                    if !expr.check_bounds(signature.arity(), 0, &mut ops) || ops == 0 {
+                        return Err(EmitRefusal::NotEmittable {
+                            name: name.to_owned(),
+                            reason: "its Boolean expression exceeds the operation/depth bounds, \
+                                     names an invalid parameter, or has no operator"
+                                .to_owned(),
+                        });
+                    }
+                    Vec::new()
+                }
+                _ => unreachable!("outer match arm restricts to Boolean shapes"),
+            };
+            for index in indices {
+                if index >= signature.arity() {
+                    return Err(EmitRefusal::NotEmittable {
+                        name: name.to_owned(),
+                        reason: format!(
+                            "its boolean connective names parameter {index} but the signature \
+                             has only {} parameter(s)",
+                            signature.arity()
+                        ),
+                    });
+                }
             }
         }
         // R1 (§6e as amended): the structural-recursion invariants are
@@ -1504,7 +2851,7 @@ pub fn plan_clean_origin_body(
             }
             // The termination-evidence seam (design §3): only a
             // `Nat.rec`-headed value of a FullKernelCheck declaration passes.
-            require_kernel_termination_evidence(env, name, TerminationEvidence::Structural)?;
+            require_kernel_termination_evidence(env, declaration, TerminationEvidence::Structural)?;
         }
         // R2 (§6e MEASUREMENT NOTE + ESCAPE CLOSED): the same re-checks on the
         // sealed plan, at R2's own denotation. Everything the emitter and the
@@ -1526,11 +2873,46 @@ pub fn plan_clean_origin_body(
             // the typing rule is switchable off by one assumed decrease
             // (probe c1), is the GATE's hard precondition and is deliberately
             // not duplicated here: a plan is not permission to emit.
-            require_kernel_termination_evidence(env, name, TerminationEvidence::WellFounded)?;
+            require_kernel_termination_evidence(
+                env,
+                declaration,
+                TerminationEvidence::WellFounded,
+            )?;
         }
     }
 
-    Ok(CleanOriginPlan { name: name.to_owned(), signature, shape })
+    // The wrapping-arithmetic shapes and the two leaf shapes have a direct
+    // source reading; the value is the environment's, exactly what the
+    // compiler's kernel-TV companion denotes (never the expanded body
+    // recognition may have used).
+    let source_is_direct = {
+        use crate::direct_source::{DirectLeaf, reads_directly, reads_leaf_directly};
+        let value = env.get_const(declaration).and_then(|constant| constant.value.as_ref());
+        let arity = signature.arity();
+        match (&shape, signature.result().clean(), value) {
+            (
+                CleanOriginShape::WrappingBinOp { .. } | CleanOriginShape::Composed { .. },
+                CleanType::UInt(width),
+                Some(value),
+            ) => reads_directly(value, arity, width),
+            (CleanOriginShape::Projection { projected }, CleanType::UInt(width), Some(value)) => {
+                reads_leaf_directly(value, arity, width, DirectLeaf::Param(*projected))
+            }
+            (CleanOriginShape::ConstantUint { value: k }, CleanType::UInt(width), Some(value)) => {
+                reads_leaf_directly(value, arity, width, DirectLeaf::Literal(*k))
+            }
+            _ => false,
+        }
+    };
+
+    Ok(CleanOriginPlan {
+        name: name.to_owned(),
+        declaration: declaration.clone(),
+        signature,
+        shape,
+        callees: callees.to_vec(),
+        source_is_direct,
+    })
 }
 
 /// **The R2 FRAGMENT boundary, as one pure decision.**
@@ -1753,9 +3135,16 @@ fn check_wf_fragment(
 /// failed proof leaves the original capability refusal in force.
 fn recognise_inductive_projection(
     env: &Environment,
-    name: &str,
+    declaration: &Name,
     signature: &CarrierSignature,
+    callees: &[RustCalleeRef],
 ) -> Option<CleanOriginShape> {
+    // Trust: pure equality/induction cannot license eliminating Rust calls.
+    // The projection body contains none, so its source must contain none too.
+    let body = env.get_const(declaration)?.value.as_ref()?;
+    crate::named_calls::check_rust_call_free(env, body, callees).ok()?;
+    let display_name = declaration.to_string();
+    let name = display_name.as_str();
     let deadline = Instant::now() + INDUCTIVE_PROJECTION_TOTAL_TIMEOUT;
     if signature.arity() == 0 || signature.arity() > INDUCTIVE_PROJECTION_MAX_ARITY {
         return None;
@@ -1807,12 +3196,17 @@ fn recognise_inductive_projection(
             return None;
         }
         let Some(side_b) = side_b else { continue };
-        let faithful =
-            match check_faithful_with_deadline(env, name, &side_b, signature.result(), deadline) {
-                Ok(faithful) => faithful,
-                Err(_) if Instant::now() >= deadline => return None,
-                Err(_) => continue,
-            };
+        let faithful = match check_faithful_for_name_with_deadline(
+            env,
+            declaration,
+            &side_b,
+            signature.result(),
+            deadline,
+        ) {
+            Ok(faithful) => faithful,
+            Err(_) if Instant::now() >= deadline => return None,
+            Err(_) => continue,
+        };
         if Instant::now() < deadline && faithful.method() == FaithfulnessMethod::StructuralInduction
         {
             return Some(CleanOriginShape::InductiveProjection { projected });
@@ -1944,10 +3338,12 @@ enum TerminationEvidence {
 /// permission to emit.
 fn require_kernel_termination_evidence(
     env: &Environment,
-    name: &str,
+    declaration: &Name,
     required: TerminationEvidence,
 ) -> Result<(), EmitRefusal> {
-    let kernel_name = Name::from_string(name);
+    let kernel_name = declaration.clone();
+    let display_name = declaration.to_string();
+    let name = display_name.as_str();
     if env.declaration_verification(&kernel_name) != Some(DeclarationVerification::FullKernelCheck)
     {
         return Err(EmitRefusal::NotEmittable {
@@ -1973,24 +3369,21 @@ fn require_kernel_termination_evidence(
     while let ExprKind::Lam(_, _, inner) = cursor.kind() {
         cursor = strip_mdata(inner);
     }
-    let (head, _args) = uncurry(cursor);
-    let head_name = match head.kind() {
-        ExprKind::Const(head_name, _) => head_name.clone(),
-        _ => {
-            return Err(EmitRefusal::NotEmittable {
-                name: name.to_owned(),
-                reason: "its value is not a recursor or fixpoint application, so no \
-                         kernel termination evidence applies to it"
-                    .to_owned(),
-            });
-        }
+    let head = spine_head(cursor);
+    let ExprKind::Const(head_name, _) = head.kind() else {
+        return Err(EmitRefusal::NotEmittable {
+            name: name.to_owned(),
+            reason: "its value is not a recursor or fixpoint application, so no \
+                     kernel termination evidence applies to it"
+                .to_owned(),
+        });
     };
     match required {
         TerminationEvidence::Structural => {
-            if head_name == Name::from_string("Nat.rec") {
+            if name_eq2(head_name, "Nat", "rec") {
                 return Ok(());
             }
-            if head_name == Name::from_string("WellFounded.fix") {
+            if name_eq2(head_name, "WellFounded", "fix") {
                 // The shapes disagree about the same declaration: refuse
                 // rather than let a structural plan ride WF evidence.
                 return Err(EmitRefusal::NotEmittable {
@@ -2010,7 +3403,7 @@ fn require_kernel_termination_evidence(
             })
         }
         TerminationEvidence::WellFounded => {
-            if head_name == Name::from_string("WellFounded.fix") {
+            if name_eq2(head_name, "WellFounded", "fix") {
                 return Ok(());
             }
             Err(EmitRefusal::NotEmittable {
@@ -2242,6 +3635,19 @@ fn sealed_plan_divisor_reason(op: RawBinOpKind) -> String {
     )
 }
 
+/// The sealed-plan restatement of the shift-amount rule — the counterpart of
+/// [`sealed_plan_divisor_reason`], unreachable from anything a user writes for
+/// the same reason.
+fn sealed_plan_shift_amount_reason() -> String {
+    "its right shift (MIR `Shr`) reached the sealed plan with an amount that is not a \
+     numeral strictly below the carrier's width. No such plan has a side B — the frozen \
+     producer mints a shift only at such a literal — so nothing could be put to the kernel \
+     for it. `recognise_raw_binop_expr` is required to have refused it already with the \
+     user-facing options, so reaching here means the recogniser and the plan check have \
+     drifted apart; NOTHING is planned and nothing is emitted"
+        .to_owned()
+}
+
 fn composed_ops_out_of_range_reason(ops: usize) -> String {
     format!(
         "its body reached {ops} composed wrapping operation(s) against a measured \
@@ -2252,30 +3658,13 @@ fn composed_ops_out_of_range_reason(ops: usize) -> String {
     )
 }
 
-/// Peel `arity` lambdas and require the remaining body to be a bound variable
-/// (a projection) or a wrapping-arithmetic expression — a single binary op or
-/// a composed tree of them — at the result carrier.
-///
-/// Fail-closed on everything else, including a body with FEWER lambdas than the
-/// type has arrows (an eta-contracted or partially-applied definition), because
-/// the emitted MIR's parameter list is derived from the arity and a mismatch
-/// would silently mean a different function.
-fn recognise_clean_shape(
+/// Peel exactly the source-order parameter telescope without evaluating away
+/// binders or computational content. Literal and legacy readers share this step.
+fn peel_source_parameters<'a>(
     name: &str,
-    body: &Expr,
-    signature: &CarrierSignature,
-) -> Result<CleanOriginShape, EmitRefusal> {
-    let arity = signature.arity();
-
-    // §6f LANDING 2. Landing 1 refused EVERY nullary body here, with a reason
-    // that named its own diagnosis: *"probe_e3 locates that defect in the
-    // arity-erasing nullary-mint routing, not in kernel definitional
-    // equality"*. Landing 2 measured the repair (l2_p1: the two producers mint
-    // the same term at zero parameters) and the boundary moved to where the
-    // measurement actually is — a nullary body is refused when it is not a
-    // NUMERAL, not because it is nullary. The peel loop below is already a
-    // no-op at arity 0, so the constant recognition needs no special case; only
-    // the blanket early return had to go.
+    body: &'a Expr,
+    arity: usize,
+) -> Result<&'a Expr, EmitRefusal> {
     let mut cursor = strip_mdata(body);
     for _ in 0..arity {
         let ExprKind::Lam(_, _, inner) = cursor.kind() else {
@@ -2291,6 +3680,535 @@ fn recognise_clean_shape(
         };
         cursor = strip_mdata(inner);
     }
+    Ok(cursor)
+}
+
+/// Does `e` contain a `let` binding ANYWHERE inside the emittable-fragment
+/// spine? Used to keep every let-free body on its exact pre-existing path:
+/// [`zeta_normalize`] rebuilds a term (new `Arc`s) even when it changes
+/// nothing, so it is invoked only when this returns `true`.
+///
+/// The exotic mode extensions (cubical / ZFC / SProp) are treated as leaves:
+/// they never appear in a UInt/`Nat` carrier body, and if one somehow held a
+/// `let`, missing it here only makes the recogniser refuse the body — never
+/// emit a wrong one.
+fn expr_contains_let(e: &Expr) -> bool {
+    match e.kind() {
+        ExprKind::Let(..) => true,
+        ExprKind::App(f, a) => expr_contains_let(f) || expr_contains_let(a),
+        ExprKind::Lam(_, ty, b) | ExprKind::Pi(_, ty, b) => {
+            expr_contains_let(ty) || expr_contains_let(b)
+        }
+        ExprKind::Proj(_, _, inner) | ExprKind::MData(_, inner) => expr_contains_let(inner),
+        _ => false,
+    }
+}
+
+/// Replace every `let y := v; b` with `b[y := v]`, bottom-up — the kernel's own
+/// zeta reduction (`tc::whnf`: `Let(_, _, val, body, _) => body.instantiate(val)`).
+///
+/// The result is `let`-free (every binder is discharged into the body via the
+/// de-Bruijn-correct, capture-avoiding [`Expr::instantiate`]), so a nested or
+/// shadowing `let`, a `let` whose bound value is itself a `let`, and a `let`
+/// in operand position all reduce uniformly. On a `let`-free subterm the walk
+/// reproduces the term up to re-allocation, which is why the caller gates it
+/// behind [`expr_contains_let`].
+///
+/// The kernel gate independently checks return-value equality against the
+/// original declaration. It does not check Rust call effects or panic:
+/// [`recognise_clean_shape`] must separately check substitution effects before
+/// invoking this walk. `MData` (transparent to type-checking and to def-eq) is dropped
+/// during the walk, exactly as [`strip_mdata`] drops it at the cursor.
+fn zeta_normalize(e: &Expr) -> Expr {
+    match e.kind() {
+        ExprKind::Let(_, _, val, body, _) => {
+            let val = zeta_normalize(val);
+            zeta_normalize(body).instantiate(&val)
+        }
+        ExprKind::App(f, a) => Expr::app(zeta_normalize(f), zeta_normalize(a)),
+        ExprKind::Lam(bd, ty, b) => Expr::lam(bd.clone(), zeta_normalize(ty), zeta_normalize(b)),
+        ExprKind::Pi(bd, ty, b) => Expr::pi(bd.clone(), zeta_normalize(ty), zeta_normalize(b)),
+        ExprKind::Proj(name, idx, inner) => {
+            Expr::proj_arc(name.clone(), *idx, std::sync::Arc::new(zeta_normalize(inner)))
+        }
+        // `MData` is transparent; drop it rather than re-import `MDataMap`.
+        ExprKind::MData(_, inner) => zeta_normalize(inner),
+        _ => e.clone(),
+    }
+}
+
+/// **W5 increment 7 — the explicit value temporary for a `let`-bound Rust
+/// call.** Walk the top-level `let` spine of the peeled body OUTERMOST-FIRST
+/// and mint one [`RustCallNode`] per `let` whose value is a Rust callee
+/// application, marked [`RustCallNode::let_binding`] `Some(k)`, in scope for
+/// every later `let` value and for the residual body through
+/// [`RustCallScope`]. The residual body MUST itself be a callee application
+/// (the root) — or the LAST temporary itself, by name or through pure
+/// aliases (`let y := f x; let z := y; z`), which is the identity `let`
+/// after the aliases resolve and makes that node the root (review finding
+/// N2, step (iv) below); anything else is a [`EmitRefusal::LetSpine`] naming
+/// the binder and the options.
+///
+/// The semantics this emits is TRUST'S definition, not Lean fidelity: every
+/// such `let` is evaluated exactly once, in binding order, before the body,
+/// whether the binder is read 0, 1 or n times; a dead binding whose callee
+/// panics PANICS (a `let`-bound call is never dropped); arguments evaluate
+/// left-to-right (post-order). Lean's compiler DCEs dead lets and promises
+/// no order for pure code, and the kernel identifies the once-body with the
+/// duplicated and the dropped one (zeta) — so the once/order claim is the
+/// STRUCTURAL chain sealed by [`check_rust_call_chain`] and pinned by
+/// `control_27`, disclosed in `docs/TCB.md`.
+///
+/// What is zeta'd IN PLACE, exactly as today's path does it
+/// ([`zeta_normalize`]'s rule, `inner.instantiate(val)`): an IDENTITY `let`
+/// (`let y := f x; y` stays ONE node — the body's root) and a PURE `let`
+/// (`check_rust_call_free`-clean: it contains no call, so substituting it
+/// changes no evaluation). A `let` nested inside a value or inside the
+/// residual gets today's `check_let_substitutions` + `zeta_normalize`, so a
+/// Rust `let` in operand position is refused with the HOIST option and an
+/// identity one is admitted, exactly as on the zero-binding path.
+///
+/// `Ok(None)` = no Rust-call `let` on the spine: the caller runs today's path
+/// on the ORIGINAL body, byte-for-byte (every pre-existing `let` fixture is
+/// provably unaffected: `control_24`, `named_lean_calls`, `clean_origin_let`).
+/// This is the ONE walk; every planner caller (the mint seam, the MIR gate,
+/// the verify pass) reaches it through [`recognise_clean_shape`] — do not
+/// fork it per caller, or their plans disagree and the MIR gate reports a
+/// fatal self-disagreement.
+fn walk_let_spine(
+    env: &Environment,
+    name: &str,
+    body: &Expr,
+    signature: &CarrierSignature,
+    callees: &[RustCalleeRef],
+) -> Result<Option<CleanOriginShape>, EmitRefusal> {
+    // No callee table, no Rust `let`: the no-callee entry keeps its exact
+    // pre-existing path, refusal texts included.
+    if callees.is_empty() {
+        return Ok(None);
+    }
+    let arity = signature.arity();
+    // A body that does not abstract its telescope is today's path's refusal,
+    // with today's reason; this walk has nothing to add.
+    let Ok(peeled) = peel_source_parameters(name, body, arity) else {
+        return Ok(None);
+    };
+    let mut cursor: Expr = peeled.clone();
+    let mut nodes: Vec<RustCallNode> = Vec::new();
+    // `temps[k]` = the node computing the `k`-th Rust-call `let`; `binders`
+    // its source names, for the notes.
+    let mut temps: Vec<usize> = Vec::new();
+    let mut binders: Vec<String> = Vec::new();
+    let let_refusal =
+        |reason: String| EmitRefusal::LetSpine { name: name.to_owned(), reason, defect: false };
+    loop {
+        let ExprKind::Let(binder, _ty, val, inner, _) = strip_mdata(&cursor).kind() else {
+            break;
+        };
+        let val: &Expr = val;
+        // (i) a `let` nested inside this VALUE: today's rule, in place. A
+        // Rust `let` nested there has one honest fix — hoist it to the spine.
+        let normalized_val;
+        let val: &Expr = if expr_contains_let(val) {
+            crate::named_calls::check_let_substitutions(env, val, callees).map_err(|reason| {
+                let_refusal(format!(
+                    "the value bound by `let {binder}` contains a `let` of its own that binds \
+                     a Rust call, and a `let` nested inside a value is not on the spine this \
+                     compiler evaluates once: {reason}\n\
+                     options:\n\
+                     - hoist the inner `let` up to the top of the `def` body, BEFORE \
+                       `let {binder}` (`let z := f x; let {binder} := g z z; …`), where each \
+                       becomes a value temporary evaluated exactly once in binding order;\n\
+                     - or perform that computation in a Rust `fn` and bind ITS call instead"
+                ))
+            })?;
+            normalized_val = zeta_normalize(val);
+            &normalized_val
+        } else {
+            val
+        };
+        let identity = matches!(strip_mdata(inner).kind(), ExprKind::BVar(0));
+        // (ii) a RUST `let`: one node, marked with its binding ordinal, in
+        // scope for everything after it. (An identity Rust `let` is instead
+        // zeta'd below and becomes the root: one node, today's behaviour.)
+        if !identity && callee_index_of(val, callees).is_some() {
+            let scope = RustCallScope { arity, temps: &temps };
+            // A `NotEmittable` raised INSIDE the spine is re-tagged `LetSpine`
+            // so the planner returns it verbatim: left as `NotEmittable`, the
+            // expansion fallback would replace this accurate note with
+            // `check_let_substitutions`'s "`let`-bind the call at the TOP"
+            // advice — which the user has already followed.
+            let root = read_rust_call_node(name, val, scope, signature, callees, &mut nodes, 0)
+                .map_err(|refusal| match refusal {
+                    EmitRefusal::NotEmittable { reason, .. } => let_refusal(reason),
+                    other => other,
+                })?;
+            nodes[root].let_binding = Some(temps.len());
+            temps.push(root);
+            binders.push(binder.to_string());
+            cursor = inner.as_ref().clone();
+            continue;
+        }
+        // (iii) an IDENTITY or PURE `let`: zeta in place, depth unchanged.
+        if identity {
+            cursor = inner.instantiate(val);
+            continue;
+        }
+        match crate::named_calls::check_rust_call_free(env, val, callees) {
+            Ok(()) => {
+                cursor = inner.instantiate(val);
+                continue;
+            }
+            // A Lean helper, an opaque, an unchecked theorem or an unknown
+            // constant wrapped around a Rust call: neither a callee
+            // application (no temporary can be minted for it) nor pure (it
+            // cannot be substituted). `check_rust_call_free`'s own note
+            // names which, and its options.
+            Err(reason) => {
+                return Err(let_refusal(format!(
+                    "the value bound by `let {binder}` is neither a direct application of a \
+                     Rust callee (which this compiler would evaluate once as a value \
+                     temporary) nor free of Rust calls (which it could substitute): \
+                     {reason}\n\
+                     options:\n\
+                     - `let`-bind the Rust call ITSELF at the top of the `def` body \
+                       (`let t := f x; …`) and pass `t` straight to Rust callees — a Lean \
+                       helper applied to a temporary has no emitted form yet;\n\
+                     - or perform the Lean-side computation in a Rust `fn` and call that"
+                )));
+            }
+        }
+    }
+    if temps.is_empty() {
+        return Ok(None);
+    }
+    // The RESIDUAL body: today's rule for any `let` left inside it (an
+    // identity `let` in operand position is admitted, a Rust `let` there is
+    // refused with the hoist option), then it must be a callee application.
+    let normalized_rest;
+    let rest: &Expr = if expr_contains_let(&cursor) {
+        crate::named_calls::check_let_substitutions(env, &cursor, callees).map_err(|reason| {
+            let_refusal(format!(
+                "after its `let`-bound Rust call(s) {}, the body contains a `let` in operand \
+                 position that binds a Rust call: {reason}\n\
+                 options:\n\
+                 - hoist that `let` up to the top of the `def` body, where it becomes a value \
+                   temporary evaluated exactly once in binding order;\n\
+                 - or perform that computation in a Rust `fn` and call it",
+                spell_binders(&binders)
+            ))
+        })?;
+        normalized_rest = zeta_normalize(&cursor);
+        &normalized_rest
+    } else {
+        &cursor
+    };
+    let rest = strip_mdata(rest);
+    let scope = RustCallScope { arity, temps: &temps };
+    // (iv) THE RESULT IS THE LAST TEMPORARY, by name or through an alias
+    // chain (review finding N2, 2026-09-16): `let y := f x; let z := y; z`.
+    // The alias `let z := y` is pure and was zeta'd in (iii), so the residual
+    // is the binder `y` itself — and `let y := f x; …; y` is the IDENTITY
+    // `let` this walk already zetas in (ii)/(iii) when nothing separates the
+    // binder from the result (`tailLet`, `identityMid`). This is that rule
+    // applied after the alias chain resolved, not a new shape: the node is
+    // un-marked and becomes the root; nothing is minted and nothing dropped.
+    //
+    // SOUNDNESS. The source denotes: every binding on the spine evaluated
+    // once, in order (`y`'s last among them), then `y`'s value returned. The
+    // chain `[nodes[..t] unchanged, nodes[t] un-marked]` emits the same
+    // `Call`s in the same order — the marker is the only edit, and no
+    // consumer reads it (materializer, side-B reader, admission and
+    // reflection are all marker-agnostic; only this walk and the seal are
+    // not) — and node `t`'s `Call` now writes `_0` where the temporary
+    // reading would write `_t` and forward it with `_0 = copy _t`. That copy
+    // is the whole difference, and it is exactly what the identity `let`
+    // elides today. Against the seal: the root is not `let`-bound; `t`
+    // carried the HIGHEST ordinal, so the ordinals that remain are still
+    // `0..k` consecutive in node order; `t` is read never (no node follows
+    // it) and its own reads of earlier nodes are untouched; `t` was the last
+    // node minted (the residual minted none), so post-order holds and is
+    // tripwired below; the node count is unchanged, so the source
+    // cross-check (which runs whenever an EARLIER binding keeps its marker)
+    // holds iff it held for the same spine under a call body. With a single
+    // binding the chain is one ordinary root — byte-identical to the
+    // identity `let`'s plan, cross-check gating included.
+    //
+    // Why an EARLIER temporary stays refused: `let y := f x; let z := g y; y`
+    // must still evaluate `z` (a bound call is never dropped — that IS the
+    // once-evaluation claim), and a chain has one place for its result, the
+    // root's `Call`; returning `y` would need `_0 = copy _y` AFTER `z`'s
+    // call, a statement the materializer does not emit and side B's chain
+    // reader does not read. `let_spine_residual_refusal` names the bindings
+    // after `y` and the reorder/drop options (v7/D3).
+    if let &ExprKind::BVar(index) = rest.kind() {
+        if let Some(RustCallArg::Node(node)) = scope.resolve(index as usize) {
+            if temps.last() == Some(&node) {
+                if node + 1 != nodes.len() {
+                    return Err(EmitRefusal::LetSpine {
+                        name: name.to_owned(),
+                        reason: format!(
+                            "its result is its last `let`-bound Rust call (node {node}), but \
+                             that node is not the last of {} minted; this is a planner \
+                             defect, not something you wrote",
+                            nodes.len()
+                        ),
+                        defect: true,
+                    });
+                }
+                nodes[node].let_binding = None;
+                return Ok(Some(CleanOriginShape::RustCallChain { nodes }));
+            }
+        }
+    }
+    if callee_index_of(rest, callees).is_none() {
+        return Err(let_spine_residual_refusal(name, rest, scope, &binders));
+    }
+    // Same re-tagging as the binding values above: the residual's own
+    // `NotEmittable` (e.g. "argument 1 ... computes (idU x)") must survive to
+    // the user instead of the fallback's `let`-bind advice.
+    let root = read_rust_call_node(name, rest, scope, signature, callees, &mut nodes, 0).map_err(
+        |refusal| match refusal {
+            EmitRefusal::NotEmittable { reason, .. } => let_refusal(reason),
+            other => other,
+        },
+    )?;
+    // The same post-order discipline `recognise_rust_call_chain` asserts:
+    // the root is the LAST node, because `_0`'s writer depends on it.
+    if root + 1 != nodes.len() {
+        return Err(EmitRefusal::LetSpine {
+            name: name.to_owned(),
+            reason: "its Rust-call chain did not read back in post-order after the `let` \
+                     spine; this is a planner defect, not something you wrote"
+                .to_owned(),
+            defect: true,
+        });
+    }
+    Ok(Some(CleanOriginShape::RustCallChain { nodes }))
+}
+
+/// `` `a`, `b` `` for the notes.
+fn spell_binders(binders: &[String]) -> String {
+    binders.iter().map(|binder| format!("`{binder}`")).collect::<Vec<_>>().join(", ")
+}
+
+/// The residual body of a `let` spine is not a Rust callee application: name
+/// what it is instead, in the user's terms, and the ways forward (v7/D3).
+fn let_spine_residual_refusal(
+    name: &str,
+    rest: &Expr,
+    scope: RustCallScope<'_>,
+    binders: &[String],
+) -> EmitRefusal {
+    let bound = spell_binders(binders);
+    let what = match rest.kind() {
+        &ExprKind::BVar(index) => match scope.resolve(index as usize) {
+            Some(RustCallArg::Node(_)) => {
+                // `BVar(j)` under `len` let binders is binding `len-1-j`.
+                let ordinal = scope.temps.len() - 1 - index as usize;
+                let later = &binders[ordinal + 1..];
+                if later.is_empty() {
+                    // The LAST temporary is admitted by the walk before this
+                    // refusal is reached (N2); never render an empty binder
+                    // list into the sentence if that ever regresses.
+                    format!(
+                        "its result is the temporary `{}` bound by its last `let`, which the \
+                         walk should have admitted as the identity case; this is a planner \
+                         defect, not something you wrote",
+                        binders[ordinal]
+                    )
+                } else {
+                    format!(
+                        "its result is the temporary `{}` bound by an EARLIER `let`, so the \
+                         Rust call(s) bound after it by {} are never used by the result",
+                        binders[ordinal],
+                        spell_binders(later)
+                    )
+                }
+            }
+            Some(RustCallArg::Param(i)) => format!(
+                "its result is parameter {i} itself, so the Rust call(s) bound by {bound} are \
+                 never used by the result"
+            ),
+            _ => format!(
+                "its result is a loose bound variable (de Bruijn {index} under {} binders)",
+                scope.binders()
+            ),
+        },
+        _ if is_literal_head(rest) => format!(
+            "its result is a literal, so the Rust call(s) bound by {bound} are never used by \
+             the result"
+        ),
+        _ => format!(
+            "its result is {} (`{}`), which is not an application of a Rust callee; a `let`-\
+             bound Rust call can be consumed only by another Rust call",
+            render_head(rest.kind()),
+            render_spine_head(rest)
+        ),
+    };
+    EmitRefusal::LetSpine {
+        name: name.to_owned(),
+        reason: format!(
+            "{what}. A `let`-bound Rust call is evaluated exactly once as a value temporary \
+             and is never dropped, so its value must reach the result through a Rust call.\n\
+             options:\n\
+             - return the last-bound value itself (`let y := f x; y`), which needs no \
+               temporary and emits one call;\n\
+             - reorder the `let`s so the binding the result returns is the LAST one;\n\
+             - consume the temporaries in a Rust call (`let y := f x; g y y`), the shape the \
+               value temporary exists for — Lean-side arithmetic, comparison or a helper \
+               applied to a temporary has no emitted form yet, so move that computation into \
+               a Rust `fn` and call it;\n\
+             - drop a binding the result never uses, or keep it and return a Rust call that \
+               reads it (a dead binding IS evaluated: the compiler never drops a `let`-bound \
+               call);\n\
+             - or cite `{name}` from proof position instead of calling it, which needs no \
+               emitted body"
+        ),
+        defect: false,
+    }
+}
+
+/// A numeral or `Bool` literal head, in every spelling the operand readers
+/// accept, or a raw kernel literal.
+fn is_literal_head(expr: &Expr) -> bool {
+    let head = spine_head(expr);
+    match head.kind() {
+        ExprKind::Lit(_) => true,
+        ExprKind::Const(head_name, _) => {
+            name_ends_with_of_nat(head_name)
+                || name_display_eq_str(head_name, "Bool.true")
+                || name_display_eq_str(head_name, "Bool.false")
+        }
+        _ => false,
+    }
+}
+
+/// The number of Rust-callee-headed application spines in VALUE position of
+/// `expr` — the count the kernel-stored body makes, read independently of
+/// the spine walk, for [`check_rust_call_chain`]'s once-evaluation
+/// cross-check. Binder TYPES and `Pi`s are not value positions and are not
+/// counted (a callee application in a type is erased and the walk mints no
+/// node for it); everything the admitted fragment can hold is covered:
+/// applications, lambdas, `let` values and bodies, projections, metadata.
+///
+/// `None` = the body exceeded the explicit-stack budget, which the caller
+/// refuses fail-closed rather than guessing a count.
+fn count_callee_spines(expr: &Expr, callees: &[RustCalleeRef]) -> Option<usize> {
+    const BUDGET: usize = 65_536;
+    let mut stack: Vec<&Expr> = vec![expr];
+    let mut count = 0usize;
+    let mut budget = BUDGET;
+    while let Some(expr) = stack.pop() {
+        budget = budget.checked_sub(1)?;
+        let (head, args) = uncurry(expr);
+        stack.extend(args);
+        match head.kind() {
+            ExprKind::Const(..) => {
+                if callee_index_of(head, callees).is_some() {
+                    count += 1;
+                }
+            }
+            ExprKind::Lam(_, _ty, body) => stack.push(body),
+            ExprKind::Let(_, _ty, val, body, _) => {
+                stack.push(val);
+                stack.push(body);
+            }
+            ExprKind::Proj(_, _, inner) => stack.push(inner),
+            _ => {}
+        }
+    }
+    Some(count)
+}
+
+/// Re-check a [`CleanOriginShape::RustCallChain`] node list against the
+/// declaration it claims to realize — the exact seal `plan_…` applies to a
+/// chain before it becomes a plan, exposed so a control can put a HAND-BUILT
+/// chain to it (`control_27` half_9: a shared node without its `let` marker,
+/// ordinals out of binding order, a body-only node placed before a
+/// `let`-bound one, a forward reference, the node cap, the unfold rail, and
+/// a node count the environment body contradicts).
+///
+/// It mints nothing: `Ok(())` is not a plan and not a permission.
+///
+/// # Errors
+///
+/// The seal's refusals ([`EmitRefusal::NotEmittable`] for the carrier and
+/// reference rules, [`EmitRefusal::LetSpine`] for the let-temp rules), or
+/// the declaration's own planning refusal when it is not a kernel-checked
+/// `def` with a total carrier signature.
+pub fn check_rust_call_chain_for(
+    env: &Environment,
+    name: &str,
+    nodes: &[RustCallNode],
+    callees: &[RustCalleeRef],
+) -> Result<(), EmitRefusal> {
+    let declaration = Name::from_string(name);
+    let (_body, signature) = checked_definition(env, &declaration)?;
+    check_rust_call_chain(name, nodes, &signature, callees, Some((env, &declaration)))
+}
+
+/// Recognize the whole peeled body, refusing an incomplete source telescope.
+fn recognise_clean_shape(
+    env: &Environment,
+    name: &str,
+    body: &Expr,
+    signature: &CarrierSignature,
+    callees: &[RustCalleeRef],
+) -> Result<CleanOriginShape, EmitRefusal> {
+    let arity = signature.arity();
+
+    // ── LET-BINDINGS (2026-09-13, W5 widening; increment 7, 2026-09-16) ────
+    //
+    // `let y := v; b` is definitionally `b[y := v]`: the kernel's own zeta step
+    // is `whnf`'s `Let(_, _, val, body, _) => Continue(body.instantiate(val))`.
+    // Two lanes share that rule:
+    //
+    // 1. A `let` whose value is a RUST CALL, on the top-level spine, is an
+    //    explicit VALUE TEMPORARY ([`walk_let_spine`]): one shared
+    //    `RustCallChain` node evaluated exactly once whatever its use count.
+    //    The kernel cannot see once-evaluation — zeta identifies the once-body
+    //    with the duplicated and the dropped one — so that claim is the
+    //    structural chain `check_rust_call_chain` seals (`docs/TCB.md`).
+    //
+    // 2. Every other `let` (pure, or the exact identity) is reduced away with
+    //    exactly the zeta rule, bottom-up ([`zeta_normalize`]), and the
+    //    let-free body flows into the SAME shape recognisers, materializer,
+    //    side-B readers and gate as its let-free equivalent — nothing
+    //    downstream learns the `let` existed. Pure duplication
+    //    (`let y := x+1; y*y` -> `(x+1)*(x+1)`) reaches the kernel gate, which
+    //    compares the proposed shape with the UNTOUCHED declaration.
+    //
+    // Both are invoked ONLY when [`expr_contains_let`] holds, so every
+    // existing control/probe over let-free bodies is byte-for-byte
+    // unaffected; and lane 1 returns `Ok(None)` when no Rust-call `let` is on
+    // the spine, so every pre-existing `let` fixture stays on lane 2. What
+    // neither lane may do is substitute a Rust call: `check_let_substitutions`
+    // refuses that with the hoist option, because the kernel's mathematical
+    // callee model captures neither effects nor panic.
+    let normalized;
+    let body: &Expr = if expr_contains_let(body) {
+        if let Some(shape) = walk_let_spine(env, name, body, signature, callees)? {
+            return Ok(shape);
+        }
+        crate::named_calls::check_let_substitutions(env, body, callees)
+            .map_err(|reason| EmitRefusal::NotEmittable { name: name.to_owned(), reason })?;
+        normalized = zeta_normalize(body);
+        &normalized
+    } else {
+        body
+    };
+
+    // §6f LANDING 2. Landing 1 refused EVERY nullary body here, with a reason
+    // that named its own diagnosis: *"probe_e3 locates that defect in the
+    // arity-erasing nullary-mint routing, not in kernel definitional
+    // equality"*. Landing 2 measured the repair (l2_p1: the two producers mint
+    // the same term at zero parameters) and the boundary moved to where the
+    // measurement actually is — a nullary body is refused when it is not a
+    // NUMERAL, not because it is nullary. The peel loop below is already a
+    // no-op at arity 0, so the constant recognition needs no special case; only
+    // the blanket early return had to go.
+    let cursor = peel_source_parameters(name, body, arity)?;
 
     match cursor.kind() {
         &ExprKind::BVar(index) => {
@@ -2324,6 +4242,17 @@ fn recognise_clean_shape(
             if let Some(shape) = recognise_constant_body(name, cursor, signature)? {
                 return Ok(shape);
             }
+            // W5 (Lean-calls-Rust): a head naming a compiler-declared RUST
+            // CALLEE. Placed BEFORE the nullary boundary and before every op
+            // spine, and disjoint from all of them by construction rather
+            // than by order: a callee is admitted only under a bare name the
+            // environment did not already hold (`declare_rust_callees`
+            // refuses `DuplicateName`), so no prelude head — `ite`,
+            // `HAdd.hAdd`, `Nat.rec`, `{C}.ofNat` — can also be a callee.
+            if let Some(shape) = recognise_rust_call_chain(name, cursor, arity, signature, callees)?
+            {
+                return Ok(shape);
+            }
             // …and the NULLARY boundary stops here, deliberately. Landing 2
             // measured ONE nullary shape and admitted exactly that one. Every
             // reading below is stated over parameters, and letting a nullary
@@ -2341,7 +4270,8 @@ fn recognise_clean_shape(
             if let Some(shape) = recognise_wrapping_expr(name, cursor, arity, signature)? {
                 return Ok(shape);
             }
-            // §6f LANDING 7 — the RAW-BINOP spines (`&&&`, `|||`, `/`, `%`).
+            // §6f LANDING 7 — the RAW-BINOP spines (`&&&`, `|||`, `/`, `%`,
+            // and since 2026-09-23 `^^^`, `>>>`; the set is `raw_binop_rows`).
             //
             // BESIDE `recognise_wrapping_expr`, never inside it, and the
             // placement is the discipline rather than an accident: the two
@@ -2352,14 +4282,34 @@ fn recognise_clean_shape(
             // `TemplateRefusal::RealizationDisagrees` exists to catch, made
             // unreachable instead by keeping the descents apart.
             //
-            // The four heads (`HAnd.hAnd`, `HOr.hOr`, `HDiv.hDiv`,
-            // `HMod.hMod`) are DISJOINT from `HAdd`/`HSub`/`HMul` and from
-            // every leaf head, so the order here is not a tiebreak either.
+            // The six heads (`HAnd.hAnd`, `HOr.hOr`, `HDiv.hDiv`,
+            // `HMod.hMod`, `HXor.hXor`, `HShiftRight.hShiftRight`) are
+            // DISJOINT from `HAdd`/`HSub`/`HMul` and from every leaf head, so
+            // the order here is not a tiebreak either.
             if let Some(shape) = recognise_raw_binop_expr(name, cursor, arity, signature)? {
+                return Ok(shape);
+            }
+            // W6 (Rust-calls-Clean): a comparison of two parameters returned as
+            // `Bool` (`decide (a < b)` / `BEq.beq … a b`). Disjoint from every
+            // shape below by RESULT TYPE — those all require a `UInt` result and
+            // decline a `Bool` one — and by HEAD (`decide`/`BEq.beq` vs `ite`).
+            if let Some(shape) = recognise_decide_comparison(cursor, arity, signature) {
+                return Ok(shape);
+            }
+            // W6 (Rust-calls-Clean): a boolean negation/connective over `Bool`
+            // parameters (`Bool.not b`, `and a b`, `or a b`). Disjoint by HEAD
+            // and by RESULT TYPE (`Bool`) from every shape below.
+            if let Some(shape) = recognise_bool_value(cursor, arity, signature) {
+                return Ok(shape);
+            }
+            if let Some(shape) = recognise_bool_expression(cursor, arity, signature) {
                 return Ok(shape);
             }
             // R2/C5a: the parameter-select ite.
             if let Some(shape) = recognise_select_ite(cursor, arity, signature) {
+                return Ok(shape);
+            }
+            if let Some(shape) = recognise_unsigned_conditional(cursor, arity, signature) {
                 return Ok(shape);
             }
             // R1 (§6e as amended): structural single-step Nat recursion.
@@ -2445,27 +4395,615 @@ fn recognise_clean_shape(
             }
             // §6f landing 1 / ruling v7/D3: the generic fragment prose is kept
             // verbatim (a dozen probes and controls pin substrings of it) and
-            // the MISSING ROW is CITED BY NAME after it. `head_label` names the
-            // kernel head exactly when it is a constant, which is the
-            // coordinate a row is keyed on — so the refusal states the work
-            // item, not just the disappointment.
+            // the ROW is CITED BY NAME after it. `head_label` names the kernel
+            // head exactly when it is a constant, which is the coordinate a row
+            // is keyed on — so the refusal states the work item, not just the
+            // disappointment. WHICH citation is the table's answer, not an
+            // assumption: `whole_body_refusal` asks `rows_selecting_head`, and
+            // a head a whole-body row DOES select (`HOr.hOr` under a nested
+            // `(a &&& b) ||| a`, `ite` with a computed arm) is refused on its
+            // SHAPE, naming the row; "no selection row" is said only when no
+            // row selects the head (`l7_p17` measures all three cases). This
+            // site used to say "no selection row" unconditionally, which was
+            // false for exactly the bodies whose head is served.
+            //
+            // Each row is asked at ITS OWN position (`anchored_carriers`), not
+            // at one carrier assumed for the body: a row's class is a claim
+            // about the result, the compared width, or its `Bool` operands,
+            // depending on the row (`table::CarrierAnchor`). The no-row text is
+            // named at the result's class, exactly as before rows were asked.
+            //
+            // The one clause of the fragment prose that is NOT verbatim is the
+            // raw-binop family's: its operators and operand rules are read from
+            // `raw_binop_rows` by `raw_binop_vocabulary` (the list this text
+            // used to omit entirely), and `l7_p16` pins it against an
+            // independent list.
+            let (raw_operators, raw_rules) = raw_binop_vocabulary();
             Err(EmitRefusal::NotEmittable {
                 name: name.to_owned(),
                 reason: format!(
                     "its body computes (`{}`) outside the emittable fragment: it is \
                      neither a bare parameter projection, nor a single wrapping \
                      `+`/`-`/`*`, nor a nested composition of wrapping `+`/`-`/`*`, \
+                     nor ONE raw binary operator — one of {raw_operators} — with no \
+                     nested operand{raw_rules}, \
                      nor a select (`if x < y then x else y` over bare parameters, or \
                      `if x < 10 then x else y` with an in-range numeral strictly on \
                      the comparison's RIGHT), over parameters and in-range numerals \
-                     at one unsigned machine width, nor a single-parameter structural \
+                     at one unsigned machine width, nor a bounded unsigned conditional tree, \
+                     nor a single-parameter structural \
                      `Nat` recursion.\n{}",
                     render_head(other),
-                    table::no_selection_row(&head_label(cursor), carrier_class_of(signature)),
+                    table::whole_body_refusal(
+                        &head_label(cursor),
+                        anchored_carriers(env, cursor, signature),
+                    ),
                 ),
             })
         }
     }
+}
+
+/// **W5 (Lean-calls-Rust) — the RUST-CALL CHAIN, side A.** Read a fully-peeled
+/// body whose head is a compiler-declared Rust callee as a
+/// [`CleanOriginShape::RustCallChain`].
+///
+/// `Ok(None)` = the head is not a callee constant at all, so the caller goes
+/// on to the op spines and the boundary refusals. `Err` = the head IS a
+/// callee but the application falls outside what this lane emits — a wrong
+/// arity (the kernel would have refused it, so reaching it is a self-
+/// disagreement), an argument outside the operand vocabulary (a computed
+/// value that is not itself a callee application), or a chain past the
+/// measured node cap.
+///
+/// The operand vocabulary: a SOURCE PARAMETER (a bound variable), a NUMERAL
+/// at the callee's parameter carrier (either measured spelling, via the same
+/// [`numeral_leaf`] every arithmetic leaf goes through), a `Bool` literal, or
+/// a NESTED callee application. Carrier agreement is recorded here and
+/// RE-CHECKED on the sealed plan by [`check_rust_call_chain`].
+fn recognise_rust_call_chain(
+    name: &str,
+    body: &Expr,
+    arity: usize,
+    signature: &CarrierSignature,
+    callees: &[RustCalleeRef],
+) -> Result<Option<CleanOriginShape>, EmitRefusal> {
+    if callees.is_empty() || callee_index_of(body, callees).is_none() {
+        return Ok(None);
+    }
+    let mut nodes = Vec::new();
+    // No `let`-bound temporaries in scope: a `let`-bearing body reaches this
+    // reader only through `walk_let_spine`, which passes its own scope.
+    let scope = RustCallScope { arity, temps: &[] };
+    let root = read_rust_call_node(name, body, scope, signature, callees, &mut nodes, 0)?;
+    // The root must be the LAST node (post-order); `read_rust_call_node`
+    // pushes a node after its arguments, so this holds by construction and is
+    // asserted anyway because `_0`'s writer depends on it.
+    if root + 1 != nodes.len() {
+        return Err(EmitRefusal::NotEmittable {
+            name: name.to_owned(),
+            reason: "its Rust-call chain did not read back in post-order; this is a planner \
+                     defect, not something you wrote"
+                .to_owned(),
+        });
+    }
+    Ok(Some(CleanOriginShape::RustCallChain { nodes }))
+}
+
+/// The index into `callees` of the constant at the head of `expr`'s spine,
+/// if it names a declared Rust callee.
+fn callee_index_of(expr: &Expr, callees: &[RustCalleeRef]) -> Option<usize> {
+    let head = spine_head(expr);
+    let ExprKind::Const(head_name, _levels) = head.kind() else {
+        return None;
+    };
+    callees.iter().position(|callee| name_display_eq_str(head_name, &callee.clean_name))
+}
+
+/// The scope a Rust-call operand is read in (W5 increment 7): the `arity`
+/// source parameters under the peeled telescope, plus the `let`-bound VALUE
+/// TEMPORARIES the spine walk has pushed so far — `temps[k]` is the index of
+/// the node computing the `k`-th Rust-call `let`, outermost first.
+///
+/// Under `temps.len()` `let` binders inside `arity` lambda binders, de Bruijn
+/// `j` names temporary `temps[len-1-j]` when `j < len` (innermost `let` is
+/// `BVar(0)`), and source parameter `arity-1-(j-len)` otherwise. The plain
+/// lane passes an empty `temps`, which makes the second arm exactly the
+/// pre-existing `arity-1-j` inversion.
+#[derive(Clone, Copy)]
+struct RustCallScope<'a> {
+    arity: usize,
+    temps: &'a [usize],
+}
+
+impl RustCallScope<'_> {
+    /// Resolve de Bruijn `index`; `None` = loose under every binder in scope.
+    fn resolve(self, index: usize) -> Option<RustCallArg> {
+        let bound_lets = self.temps.len();
+        if index < bound_lets {
+            return Some(RustCallArg::Node(self.temps[bound_lets - 1 - index]));
+        }
+        let under_lambdas = index - bound_lets;
+        (under_lambdas < self.arity).then(|| RustCallArg::Param(self.arity - 1 - under_lambdas))
+    }
+
+    /// Every binder an operand can be read under.
+    fn binders(self) -> usize {
+        self.arity + self.temps.len()
+    }
+}
+
+/// Read one callee application (and, recursively, its nested applications)
+/// into `nodes` in post-order; returns the index of the node pushed for
+/// `expr`.
+///
+/// Recursion depth is bounded by the node count, which is bounded by
+/// [`COMPOSED_MAX_OPS`] — checked as nodes are pushed, so an adversarially
+/// deep term refuses instead of exhausting the stack.
+fn read_rust_call_node(
+    name: &str,
+    expr: &Expr,
+    scope: RustCallScope<'_>,
+    signature: &CarrierSignature,
+    callees: &[RustCalleeRef],
+    nodes: &mut Vec<RustCallNode>,
+    depth: usize,
+) -> Result<usize, EmitRefusal> {
+    // THE DESCENT RAIL. Nodes are pushed AFTER their arguments are read, so
+    // the node cap alone bounds nothing about the descent; the depth is
+    // bounded here, before the recursion, so an adversarially nested term
+    // refuses instead of overflowing the stack.
+    if depth > COMPOSED_MAX_OPS {
+        return Err(EmitRefusal::NotEmittable {
+            name: name.to_owned(),
+            reason: format!(
+                "its Rust-call chain nests deeper than {COMPOSED_MAX_OPS} calls, which is past \
+                 the measured chain depth. options: split the chain across sibling `def`s and \
+                 compose them at the call site"
+            ),
+        });
+    }
+    let Some(callee_index) = callee_index_of(expr, callees) else {
+        return Err(EmitRefusal::NotEmittable {
+            name: name.to_owned(),
+            reason: "its Rust-call chain reached a non-callee head; this is a planner defect"
+                .to_owned(),
+        });
+    };
+    let callee = &callees[callee_index];
+    let (_head, args) = uncurry(expr);
+    if args.len() != callee.params.len() {
+        return Err(EmitRefusal::NotEmittable {
+            name: name.to_owned(),
+            reason: format!(
+                "it applies Rust callee `{}` to {} argument(s), but `fn {}` takes {}; a \
+                 partial application has no Rust body to emit. options: apply `{}` to all \
+                 of its parameters; or restate the definition without the partial \
+                 application",
+                callee.clean_name,
+                args.len(),
+                callee.clean_name,
+                callee.params.len(),
+                callee.clean_name,
+            ),
+        });
+    }
+    // ARGUMENTS ARE READ IN SOURCE ORDER, and each one's calls are pushed
+    // before the next one's, so the emitted chain evaluates them left to
+    // right exactly as written — the property the `let` spine walk above
+    // relies on, and the reason a nested callee application in operand
+    // position is not a reordering.
+    let mut read_args = Vec::with_capacity(args.len());
+    for (position, (arg, param_ty)) in args.iter().zip(&callee.params).enumerate() {
+        let arg = strip_mdata(arg);
+        let read = match arg.kind() {
+            &ExprKind::BVar(index) => {
+                let index = index as usize;
+                // A `let`-bound temporary (innermost `let` first), else a
+                // SOURCE parameter under the `n` lambda binders (`n-1-k`),
+                // else loose — see `RustCallScope::resolve`.
+                let Some(operand) = scope.resolve(index) else {
+                    return Err(EmitRefusal::NotEmittable {
+                        name: name.to_owned(),
+                        reason: format!(
+                            "its body is a loose bound variable (de Bruijn {index} under {} \
+                             binders)",
+                            scope.binders()
+                        ),
+                    });
+                };
+                operand
+            }
+            _ if callee_index_of(arg, callees).is_some() => {
+                let node =
+                    read_rust_call_node(name, arg, scope, signature, callees, nodes, depth + 1)?;
+                RustCallArg::Node(node)
+            }
+            _ => match rust_call_literal(name, arg, param_ty)? {
+                Some(literal) => RustCallArg::Literal(literal),
+                None => {
+                    return Err(EmitRefusal::NotEmittable {
+                        name: name.to_owned(),
+                        reason: format!(
+                            "argument {position} of its call to Rust callee `{}` computes \
+                             ({}) — a Clean-origin call may pass only a parameter, an \
+                             in-range numeral, a `Bool` literal, or the result of another \
+                             Rust callee. options: bind the computation in a sibling Rust \
+                             `fn` and call that; or restate the argument as one of those \
+                             operands",
+                            callee.clean_name,
+                            render_spine_head(arg),
+                        ),
+                    });
+                }
+            },
+        };
+        read_args.push(read);
+    }
+    if nodes.len() >= COMPOSED_MAX_OPS {
+        return Err(EmitRefusal::NotEmittable {
+            name: name.to_owned(),
+            reason: format!(
+                "its Rust-call chain has more than {COMPOSED_MAX_OPS} calls, which is past the \
+                 measured chain depth. options: split the chain across sibling `def`s and \
+                 compose them at the call site"
+            ),
+        });
+    }
+    // An ordinary operand node; `walk_let_spine` marks the `let`-bound ones
+    // AFTER the read, on the root it returns.
+    nodes.push(RustCallNode { callee: callee_index, args: read_args, let_binding: None });
+    Ok(nodes.len() - 1)
+}
+
+/// A literal argument at the callee's parameter carrier: `Bool.true` /
+/// `Bool.false` for a `bool` parameter, or a carrier numeral in either
+/// measured spelling for an unsigned machine parameter. `Ok(None)` = not a
+/// literal at that carrier (the caller refuses with the operand vocabulary);
+/// `Err` = a numeral that does not fit the parameter's width.
+fn rust_call_literal(
+    name: &str,
+    arg: &Expr,
+    param_ty: &Ty,
+) -> Result<Option<RustCallLiteral>, EmitRefusal> {
+    match param_ty {
+        Ty::Bool => {
+            let ExprKind::Const(head_name, _) = strip_mdata(arg).kind() else {
+                return Ok(None);
+            };
+            if name_display_eq_str(head_name, "Bool.true") {
+                Ok(Some(RustCallLiteral::Bool(true)))
+            } else if name_display_eq_str(head_name, "Bool.false") {
+                Ok(Some(RustCallLiteral::Bool(false)))
+            } else {
+                Ok(None)
+            }
+        }
+        Ty::Int { width, signed: false } if matches!(width, 8 | 16 | 32 | 64) => {
+            let Some(carrier_name) = uint_carrier_name(*width) else {
+                return Ok(None);
+            };
+            let Some(reading) = numeral_leaf(arg, carrier_name) else {
+                return Ok(None);
+            };
+            match in_range_numeral(name, reading, *width)? {
+                ArithOperand::Const(value) => Ok(Some(RustCallLiteral::UInt(value))),
+                ArithOperand::Param(_) => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The sealed-plan invariants of a [`CleanOriginShape::RustCallChain`]:
+/// every callee index in the table, every node referenced only by a LATER
+/// node (post-order), every argument at the carrier the callee's parameter
+/// takes, and the root's result at the declaration's result carrier. Each is
+/// re-checked here because the plan is the decision the emitter trusts.
+///
+/// **W5 increment 7 — the chain is a DAG, and this seal is where the
+/// once-evaluation claim is made structural.** An ordinary node is read
+/// exactly once (the root never); a node marked [`RustCallNode::let_binding`]
+/// may be read 0..n times, and the marked nodes carry consecutive ordinals
+/// in node order (binding order = evaluation order); and an ORDINARY node
+/// below the last marked node must be part of some binding's value —
+/// transitively read by a marked node of greater index — or it is a body
+/// call evaluated before a binding, which a strict `let` spine never does
+/// (review finding N3; the walk cannot mint that order, so this rule is the
+/// seal's own defence in depth). Two rails then bound
+/// what side B must do with a shared node: the reflected rendering inlines a
+/// temporary per use, so its unfolded size is capped at the kernel envelope
+/// this lane is measured at (`named_calls::MAX_NODES`); and, when any
+/// binding is present, the node count is CROSS-CHECKED against an
+/// independent syntactic count of callee applications in the KERNEL-STORED
+/// body (`source`) — the term the gate reads — so a walk that minted two
+/// nodes for one `let`, or none for a dead one, is refused as a planner
+/// defect before the kernel (which would agree with either) is consulted.
+/// Exact on the admitted fragment: pure values contain no callee, an
+/// identity `let` contributes exactly its one application, helpers and
+/// `ite` are refused, and a bare callee constant is refused by the arity
+/// check. It is gated on a binding being present because the helper-
+/// expansion path legitimately inlines callee applications out of helper
+/// bodies, and no let-bound node can come from that path.
+fn check_rust_call_chain(
+    name: &str,
+    nodes: &[RustCallNode],
+    signature: &CarrierSignature,
+    callees: &[RustCalleeRef],
+    source: Option<(&Environment, &Name)>,
+) -> Result<(), EmitRefusal> {
+    let refuse = |reason: String| EmitRefusal::NotEmittable { name: name.to_owned(), reason };
+    if nodes.is_empty() || nodes.len() > COMPOSED_MAX_OPS {
+        return Err(refuse(format!(
+            "its Rust-call chain has {} node(s), outside the measured 1..={COMPOSED_MAX_OPS}",
+            nodes.len()
+        )));
+    }
+    let mut referenced = vec![0usize; nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        let Some(callee) = callees.get(node.callee) else {
+            return Err(refuse(format!(
+                "its Rust-call chain names callee #{} but the table has {} entr(y/ies)",
+                node.callee,
+                callees.len()
+            )));
+        };
+        if node.args.len() != callee.params.len() {
+            return Err(refuse(format!(
+                "its call to Rust callee `{}` passes {} argument(s) for {} parameter(s)",
+                callee.clean_name,
+                node.args.len(),
+                callee.params.len()
+            )));
+        }
+        for (position, (arg, param_ty)) in node.args.iter().zip(&callee.params).enumerate() {
+            let actual: &Ty = match arg {
+                RustCallArg::Param(i) => {
+                    let Some(carrier) = signature.arguments().get(*i) else {
+                        return Err(refuse(format!(
+                            "its operand names parameter {i} but the signature has only {} \
+                             parameter(s)",
+                            signature.arity()
+                        )));
+                    };
+                    carrier.rust()
+                }
+                RustCallArg::Node(k) => {
+                    if *k >= index {
+                        return Err(refuse(format!(
+                            "its Rust-call chain node {index} reads node {k}, which is not an \
+                             EARLIER node; the chain is not in post-order"
+                        )));
+                    }
+                    referenced[*k] += 1;
+                    &callees[nodes[*k].callee].result
+                }
+                RustCallArg::Literal(RustCallLiteral::UInt(value)) => {
+                    let Ty::Int { width, signed: false } = param_ty else {
+                        return Err(refuse(format!(
+                            "argument {position} of its call to `{}` is a numeral, but that \
+                             parameter carries at `{param_ty:?}`",
+                            callee.clean_name
+                        )));
+                    };
+                    if !matches!(width, 8 | 16 | 32 | 64) || *value > max_uint_value(*width) {
+                        return Err(refuse(numeral_out_of_range_reason(*value, *width)));
+                    }
+                    continue;
+                }
+                RustCallArg::Literal(RustCallLiteral::Bool(_)) => {
+                    if *param_ty != Ty::Bool {
+                        return Err(refuse(format!(
+                            "argument {position} of its call to `{}` is a `Bool` literal, but \
+                             that parameter carries at `{param_ty:?}`",
+                            callee.clean_name
+                        )));
+                    }
+                    continue;
+                }
+            };
+            if actual != param_ty {
+                return Err(refuse(format!(
+                    "argument {position} of its call to Rust callee `{}` carries at `{actual:?}` \
+                     but `fn {}` takes `{param_ty:?}` there; the compiler will not emit a body \
+                     whose carrier decision disagrees with the kernel's typing",
+                    callee.clean_name, callee.clean_name
+                )));
+            }
+        }
+    }
+    let root = nodes.len() - 1;
+    // ── the reference rule over the DAG (W5 increment 7) ───────────────────
+    let tripwire =
+        |reason: String| EmitRefusal::LetSpine { name: name.to_owned(), reason, defect: true };
+    let mut bound_lets = 0usize;
+    for (index, node) in nodes.iter().enumerate() {
+        let count = referenced[index];
+        match node.let_binding {
+            Some(ordinal) => {
+                if index == root {
+                    return Err(tripwire(format!(
+                        "the root node is marked as the value of `let` #{ordinal}; the root \
+                         is the body's own call and is never `let`-bound"
+                    )));
+                }
+                if ordinal != bound_lets {
+                    return Err(tripwire(format!(
+                        "node {index} is marked as `let` #{ordinal} but the next binding in \
+                         evaluation order is #{bound_lets}; `let`-bound temporaries must \
+                         appear in binding order with consecutive ordinals"
+                    )));
+                }
+                bound_lets += 1;
+                // A value temporary is read 0..n times; every read is a copy
+                // of the ONE local its ONE `Call` wrote.
+            }
+            None => {
+                let expected = usize::from(index != root);
+                if count != expected {
+                    return Err(refuse(format!(
+                        "its Rust-call chain node {index} is read {count} time(s); a chain \
+                         reads every ordinary non-root node exactly once and the root never \
+                         (only a `let`-bound value temporary may be read 0 or many times)"
+                    )));
+                }
+            }
+        }
+    }
+    // ── binding order over BODY nodes (review finding N3, 2026-09-16) ─────
+    //
+    // The ordinal rule above pins `let`-vs-`let` order only. A strict `let`
+    // spine evaluates every binding BEFORE the body, so an ordinary node
+    // (`let_binding: None`) that sits below the last `let`-bound node is
+    // admissible only as part of some binding's VALUE: transitively read,
+    // through ordinary nodes, by a `let`-bound node of greater index (`let y
+    // := inc (dbl x)`: `dbl` is read by `inc`). Otherwise it is a body call
+    // evaluated before a binding — `[h x, dbl x (let #0), sub2 N0 N1]` for
+    // `let y := dbl x; sub2 (h x) y` — the same calls in a different order,
+    // and every other rule here passes it (`h` read once, ordinal 0, root
+    // read never, node count 3 == 3) while the kernel would agree with
+    // either. The walk cannot mint that order (every binding is read before
+    // the residual), so this is the seal's own defence in depth; a chain
+    // that trips it is a planner defect, never something the user wrote.
+    //
+    // A `let`-bound operand stops the descent: it is its own binding's value,
+    // and by the reference rule every node in THAT value has a smaller index
+    // than it, so it covers them itself.
+    if let Some(last_let) = nodes.iter().rposition(|node| node.let_binding.is_some()) {
+        let mut in_a_value = vec![false; nodes.len()];
+        for node in nodes.iter().filter(|node| node.let_binding.is_some()) {
+            let mut pending: Vec<usize> = node
+                .args
+                .iter()
+                .filter_map(|arg| match arg {
+                    RustCallArg::Node(k) => Some(*k),
+                    _ => None,
+                })
+                .collect();
+            while let Some(k) = pending.pop() {
+                if nodes[k].let_binding.is_some() || in_a_value[k] {
+                    continue;
+                }
+                in_a_value[k] = true;
+                pending.extend(nodes[k].args.iter().filter_map(|arg| match arg {
+                    RustCallArg::Node(j) => Some(*j),
+                    _ => None,
+                }));
+            }
+        }
+        if let Some(index) =
+            (0..last_let).find(|&index| nodes[index].let_binding.is_none() && !in_a_value[index])
+        {
+            let ordinal = nodes[last_let].let_binding.unwrap_or_default();
+            return Err(tripwire(format!(
+                "node {index} is an ordinary body call placed before node {last_let}, the \
+                 value of `let` #{ordinal}, and is not part of any binding's value; a strict \
+                 `let` spine evaluates every binding before the body, so the chain is not in \
+                 binding order"
+            )));
+        }
+    }
+    // ── the unfold rail ────────────────────────────────────────────────────
+    //
+    // Side B (`reflect_rust_call::render_node`) renders a shared node once
+    // PER USE, so the term the kernel decides over is the chain unfolded to
+    // a tree; its size is `1 + Σ unfold[args]` at each node. `control_27`
+    // half_13 measures the kernel at this cap.
+    //
+    // Why a SEPARATE rail is needed at all, and what it costs (measured
+    // 2026-09-16, debug build, `render_node` memoized so reflection itself is
+    // linear): while every non-root node was read exactly once, the chain WAS
+    // the term side B reflects, and `nodes.len() <= COMPOSED_MAX_OPS` bounded
+    // it. Sharing severs the two — a chain of `n` nodes each reading its
+    // predecessor twice is `n` calls and `2^n - 1` applications, so at
+    // `n = 32` it passes the node-count rail, the depth rail and every check
+    // above and then costs the compiler its memory instead of producing a
+    // refusal. The whole of side B (recognize, reflect, kernel-check the
+    // minted definition, `is_def_eq` against the `let` chain) is LINEAR in
+    // this weight at ~0.5 µs per unfolded application: weight 2^12 = 4,095 in
+    // 3 ms, 2^14 in 8 ms, 2^16 in 33 ms, 2^18 in 123 ms, 2^20 in 500 ms;
+    // 2^32 was out of memory before any such cap existed. The operative cap
+    // here is the kernel envelope this lane is measured at
+    // (`named_calls::MAX_NODES`, 4,096), which is well inside that curve.
+    //
+    // Saturating on purpose: the weight of a 64-node doubling chain does not
+    // fit a `usize`, and a wrapped sum reading as small would ADMIT the very
+    // chain this refuses. The order invariant above (a node reads only
+    // EARLIER nodes) is what makes a single forward pass exact.
+    let mut unfold = vec![0usize; nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        let mut size = 1usize;
+        for arg in &node.args {
+            if let RustCallArg::Node(k) = arg {
+                size = size.saturating_add(unfold[*k]);
+            }
+        }
+        unfold[index] = size;
+    }
+    let unfold_cap = crate::named_calls::MAX_NODES;
+    if unfold[root] > unfold_cap {
+        return Err(EmitRefusal::LetSpine {
+            name: name.to_owned(),
+            reason: format!(
+                "its reflected side B unfolds every shared `let` temporary once per use, \
+                 into {} applications, past the {unfold_cap}-node kernel envelope this lane \
+                 is measured at (control_27 half_13).\n\
+                 options:\n\
+                 - split the chain across sibling `def`s and compose them at the call \
+                   site;\n\
+                 - or re-read the temporaries fewer times per `def`",
+                unfold[root]
+            ),
+            defect: false,
+        });
+    }
+    // ── the once-evaluation cross-check against the KERNEL-STORED body ─────
+    if bound_lets > 0 {
+        let Some((env, declaration)) = source else {
+            return Err(tripwire(
+                "a `let`-bearing chain was sealed without its source declaration, so its \
+                 node count cannot be cross-checked against the kernel-stored body"
+                    .to_owned(),
+            ));
+        };
+        let Some(stored) = env.get_const(declaration).and_then(|constant| constant.value.as_ref())
+        else {
+            return Err(tripwire(
+                "a `let`-bearing chain was sealed for a declaration whose kernel-stored body \
+                 cannot be read back"
+                    .to_owned(),
+            ));
+        };
+        let Some(occurrences) = count_callee_spines(stored, callees) else {
+            return Err(EmitRefusal::LetSpine {
+                name: name.to_owned(),
+                reason: "its kernel-stored body is too large for the once-evaluation \
+                         cross-check's explicit-stack budget. options: split the definition \
+                         into smaller `def`s and compose them at the call site"
+                    .to_owned(),
+                defect: false,
+            });
+        };
+        if occurrences != nodes.len() {
+            return Err(tripwire(format!(
+                "the plan mints {} Rust-call node(s) but the kernel-stored body of `{name}` \
+                 applies a Rust callee {occurrences} time(s); the spine walk and the \
+                 declaration disagree about how many calls the emitted body must make, and \
+                 the kernel would agree with EITHER (zeta identifies them)",
+                nodes.len()
+            )));
+        }
+    }
+    let root_result = &callees[nodes[root].callee].result;
+    if root_result != signature.result().rust() {
+        return Err(refuse(format!(
+            "its Rust-call chain's root callee `{}` returns `{root_result:?}` but the \
+             declaration's result carries at `{:?}`",
+            callees[nodes[root].callee].clean_name,
+            signature.result().rust()
+        )));
+    }
+    Ok(())
 }
 
 /// **§6f landing 2 — the CONSTANT body.** `fun x0 … x_{n-1} => <numeral>` at an
@@ -2522,6 +5060,49 @@ fn recognise_constant_body(
     }
 }
 
+/// Trust (WS5.20, `STANDALONE.p18_literal_out_of_range`): the STANDALONE lane's
+/// constant-body reading. Identical to [`recognise_constant_body`] except that
+/// a numeral outside `0..2^width` is reduced modulo `2^width` — which is what
+/// Lean's `OfNat` instance for `UInt{width}` computes (`(300 : UInt8)` IS 44) —
+/// instead of refused.
+///
+/// That is NOT a silent reduction: the standalone gate reflects the EMITTED
+/// in-range literal (`UInt{width}.ofNat r`) and the Clean kernel must decide it
+/// definitionally equal to the untouched source numeral at the exact carrier,
+/// so a wrong residue is refused there. The MIR lane keeps
+/// [`recognise_constant_body`]'s refusal unchanged (it has no such kernel check
+/// over the emitted literal). A numeral that does not fit `u64` (the numeral
+/// reader's own bound) stays refused.
+fn recognise_standalone_constant_body(
+    name: &str,
+    cursor: &Expr,
+    signature: &CarrierSignature,
+) -> Result<Option<(CleanOriginShape, bool)>, EmitRefusal> {
+    let CleanType::UInt(width) = signature.result().clean() else {
+        return Ok(None);
+    };
+    if !matches!(width, 8 | 16 | 32 | 64) {
+        return Ok(None);
+    }
+    let Some(reading) = numeral_leaf(cursor, &signature.result().clean().name()) else {
+        return Ok(None);
+    };
+    match reading {
+        NatReading::Fits(value) => {
+            let residue = value % (1u128 << width);
+            Ok(Some((CleanOriginShape::ConstantUint { value: residue }, residue != value)))
+        }
+        NatReading::Oversized => Err(EmitRefusal::NotEmittable {
+            name: name.to_owned(),
+            reason: format!(
+                "its numeral does not fit u64, the numeral reader's bound, so this lane does \
+                 not compute its residue modulo 2^{width}; restate the literal in range \
+                 0..2^{width}"
+            ),
+        }),
+    }
+}
+
 /// The v7/D3 refusal for a NULLARY body that is not a numeral — landing 1's
 /// nullary text, narrowed to what landing 2 left refused.
 fn nullary_non_constant_reason() -> String {
@@ -2550,8 +5131,8 @@ fn nullary_non_constant_reason() -> String {
 
 /// Whether the peeled body is an application headed by the named constant.
 fn spine_head_is(cursor: &Expr, constant: &str) -> bool {
-    let (head, _args) = uncurry(cursor);
-    matches!(head.kind(), ExprKind::Const(n, _) if *n == Name::from_string(constant))
+    let head = spine_head(cursor);
+    matches!(head.kind(), ExprKind::Const(n, _) if name_eq_str(n, constant))
 }
 
 /// The r5 shape: `UInt64.ofNat (Nat.rec … (UInt64.toNat (bvar _)))` — a
@@ -2560,7 +5141,7 @@ fn spine_head_is(cursor: &Expr, constant: &str) -> bool {
 fn is_u64_wrapped_nat_recursor(cursor: &Expr) -> bool {
     let (head, args) = uncurry(cursor);
     let of_nat = matches!(head.kind(), ExprKind::Const(n, _)
-        if n.to_string().ends_with(".ofNat"));
+        if name_ends_with_of_nat(n));
     if !of_nat || args.len() != 1 {
         return false;
     }
@@ -2596,7 +5177,7 @@ fn recognise_structural_nat_rec(
     let ExprKind::Const(head_name, head_levels) = head.kind() else {
         return Ok(None);
     };
-    if *head_name != Name::from_string("Nat.rec") {
+    if !name_eq2(head_name, "Nat", "rec") {
         return Ok(None);
     }
     // From here on the body IS a recursor spine: every failure names its
@@ -2629,10 +5210,7 @@ fn recognise_structural_nat_rec(
             ),
         });
     };
-    let is_nat_const = |expr: &Expr| {
-        matches!(strip_mdata(expr).kind(), ExprKind::Const(n, levels)
-            if *n == Name::from_string("Nat") && levels.is_empty())
-    };
+    let is_nat_const = is_nat_const_expr;
     let ExprKind::Lam(_, motive_param, motive_body) = strip_mdata(motive).kind() else {
         return Err(EmitRefusal::NotEmittable {
             name: name.to_owned(),
@@ -2771,7 +5349,7 @@ fn recognise_wf_nat_rec(
     let ExprKind::Const(head_name, head_levels) = head.kind() else {
         return Ok(None);
     };
-    if *head_name != Name::from_string("WellFounded.fix") {
+    if !name_eq2(head_name, "WellFounded", "fix") {
         return Ok(None);
     }
     // From here the body IS a fix spine: every failure names its boundary.
@@ -2932,7 +5510,7 @@ fn recognise_wf_nat_rec(
     let ExprKind::Const(dite_name, _) = dite_head.kind() else {
         return Err(refuse("its functional's body is not a decidable case split"));
     };
-    if *dite_name != Name::from_string("dite") || dite_args.len() != 5 {
+    if !name_eq1(dite_name, "dite") || dite_args.len() != 5 {
         return Err(refuse(
             "its functional's body is not the `dite (0 < n)` guard this lane emits a \
              bignum zero test for — a well-founded body guarded some other way has no \
@@ -2967,8 +5545,8 @@ fn recognise_wf_nat_rec(
     let (dec_head, dec_args) = uncurry(strip_mdata(dite_args[2]));
     let dec_name_ok = matches!(dec_head.kind(), ExprKind::Const(n, levels)
         if levels.is_empty()
-            && (*n == Name::from_string("Nat.decLt")
-                || *n == Name::from_string("instDecidableNatLt")));
+            && (name_eq2(n, "Nat", "decLt")
+                || name_eq1(n, "instDecidableNatLt")));
     let dec_ok = dec_name_ok
         && dec_args.len() == 2
         && read_wf_numeral(strip_mdata(dec_args[0])) == Some(NatReading::Fits(0))
@@ -3128,7 +5706,7 @@ fn recognise_wf_sum_measure_rec(
     let ExprKind::Const(dite_name, _) = dite_head.kind() else {
         return Err(refuse("its functional's body is not a decidable case split"));
     };
-    if *dite_name != Name::from_string("dite") || dite_args.len() != 5 {
+    if !name_eq1(dite_name, "dite") || dite_args.len() != 5 {
         return Err(refuse(
             "its functional's body is not the `dite (0 < p)` guard this lane emits a bignum zero \
              test for — a well-founded body guarded some other way has no emitted contract here",
@@ -3141,8 +5719,8 @@ fn recognise_wf_sum_measure_rec(
     // WHICH PARAMETER THE GUARD SITS ON — discovered, never assumed. Each
     // candidate is a distinct de Bruijn index, so at most one can answer.
     let candidate = |index: usize| WfLayout { arity, measure_index: index, lowering };
-    let Some(measure_index) =
-        (0..arity).find(|index| is_zero_lt_param(dite_args[1], candidate(*index).measure_at_body()))
+    let Some(measure_index) = (0..arity)
+        .find(|index| is_zero_lt_param(dite_args[1], candidate(*index).measure_at_body()))
     else {
         return Err(refuse(&format!(
             "{}. On the SUM-MEASURE lowering (WF phase 3) the recursion variable is the \
@@ -3160,8 +5738,8 @@ fn recognise_wf_sum_measure_rec(
     let (dec_head, dec_args) = uncurry(strip_mdata(dite_args[2]));
     let dec_name_ok = matches!(dec_head.kind(), ExprKind::Const(n, levels)
         if levels.is_empty()
-            && (*n == Name::from_string("Nat.decLt")
-                || *n == Name::from_string("instDecidableNatLt")));
+            && (name_eq2(n, "Nat", "decLt")
+                || name_eq1(n, "instDecidableNatLt")));
     let dec_ok = dec_name_ok
         && dec_args.len() == 2
         && read_wf_numeral(strip_mdata(dec_args[0])) == Some(NatReading::Fits(0))
@@ -3355,7 +5933,7 @@ fn nat_arrow_tower_label(arrows: usize) -> String {
 /// Whether an expression is the bare constant `Nat`.
 fn is_nat_const_expr(expr: &Expr) -> bool {
     matches!(strip_mdata(expr).kind(), ExprKind::Const(n, levels)
-        if *n == Name::from_string("Nat") && levels.is_empty())
+        if name_eq1(n, "Nat") && levels.is_empty())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3711,13 +6289,15 @@ pub(crate) fn depth_envelope_refusal(subject: &str) -> String {
 /// Whether `expr` is the bare constant `name` at no universe arguments.
 fn is_bare_const(expr: &Expr, name: &str) -> bool {
     matches!(strip_mdata(expr).kind(), ExprKind::Const(n, levels)
-        if *n == Name::from_string(name) && levels.is_empty())
+        if name_eq_str(n, name) && levels.is_empty())
 }
 
 /// `name ARG` for a bare unary constant, or `None`.
 fn read_unary_const_app<'e>(expr: &'e Expr, name: &str) -> Option<&'e Expr> {
-    let (head, args) = uncurry(strip_mdata(expr));
-    (is_bare_const(head, name) && args.len() == 1).then(|| args[0])
+    let ExprKind::App(function, argument) = strip_mdata(expr).kind() else {
+        return None;
+    };
+    is_bare_const(function, name).then(|| strip_mdata(argument))
 }
 
 /// Whether `expr` is `Nat.lt <measure> (BVar bound)` in the raw spelling the
@@ -3730,11 +6310,15 @@ fn read_unary_const_app<'e>(expr: &'e Expr, name: &str) -> Option<&'e Expr> {
 /// `Expr::const_("Nat.lt")`, so there is exactly one spelling to read and
 /// accepting a second would be accepting a term the lowering does not produce.
 fn is_raw_nat_lt_at_bound(expr: &Expr, measure: &Expr, bound: u32) -> bool {
-    let (head, args) = uncurry(strip_mdata(expr));
+    let ExprKind::App(f1, arg1) = strip_mdata(expr).kind() else {
+        return false;
+    };
+    let ExprKind::App(head, arg0) = strip_mdata(f1).kind() else {
+        return false;
+    };
     is_bare_const(head, "Nat.lt")
-        && args.len() == 2
-        && *strip_mdata(args[0]) == *measure
-        && matches!(strip_mdata(args[1]).kind(), &ExprKind::BVar(index) if index == bound)
+        && *strip_mdata(arg0) == *measure
+        && matches!(strip_mdata(arg1).kind(), &ExprKind::BVar(index) if index == bound)
 }
 
 /// **THE PHASE-3 READER.** Read a `WellFounded.fix` body in the SUM-MEASURE
@@ -3813,7 +6397,7 @@ pub fn read_wf_sum_measure_anatomy(body: &Expr) -> Result<WfSumMeasureAnatomy, S
     let ExprKind::Const(head_name, head_levels) = head.kind() else {
         return Err("its body is not an application headed by a constant".to_owned());
     };
-    if *head_name != Name::from_string("WellFounded.fix") {
+    if !name_eq2(head_name, "WellFounded", "fix") {
         return Err(format!("its body is headed by `{head_name}`, not `WellFounded.fix`"));
     }
     if head_levels.len() != 2 {
@@ -3910,10 +6494,12 @@ pub fn read_wf_sum_measure_anatomy(body: &Expr) -> Result<WfSumMeasureAnatomy, S
     };
     let motive_bound = u32::try_from(arity).unwrap_or(u32::MAX);
     if !is_raw_nat_lt_at_bound(hypothesis, &measure, motive_bound) {
-        return Err("its fix motive's hypothesis is not `Nat.lt m n` at the SAME measure its seed \
+        return Err(
+            "its fix motive's hypothesis is not `Nat.lt m n` at the SAME measure its seed \
                     carries; the motive, the seed and the functional's hypothesis binder must \
                     name one measure, or the recursion is not the one the seed starts"
-            .to_owned());
+                .to_owned(),
+        );
     }
     let return_ty = strip_mdata(return_ty);
     if !is_nat_const_expr(return_ty) {
@@ -3966,21 +6552,27 @@ pub fn read_wf_sum_measure_anatomy(body: &Expr) -> Result<WfSumMeasureAnatomy, S
             return Err("its functional does not bind a recursive slot".to_owned());
         };
         if !is_nat_const_expr(k_ty) {
-            return Err("its functional's recursive slot does not take a `Nat` major premise; the \
+            return Err(
+                "its functional's recursive slot does not take a `Nat` major premise; the \
                         sum-measure lowering recurses on the measure's VALUE"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         let ExprKind::Pi(_, k_lt_n, codomain) = strip_mdata(after_k).kind() else {
             return Err("its functional's recursive slot does not demand a decrease proof, so it \
                         is not a well-founded slot at all"
                 .to_owned());
         };
-        let raw_lt = {
-            let (lt_head, lt_args) = uncurry(strip_mdata(k_lt_n));
-            is_bare_const(lt_head, "Nat.lt")
-                && lt_args.len() == 2
-                && matches!(strip_mdata(lt_args[0]).kind(), ExprKind::BVar(0))
-                && matches!(strip_mdata(lt_args[1]).kind(), ExprKind::BVar(1))
+        let raw_lt = match strip_mdata(k_lt_n).kind() {
+            ExprKind::App(f1, arg1) => match strip_mdata(f1).kind() {
+                ExprKind::App(lt_head, arg0) => {
+                    is_bare_const(lt_head, "Nat.lt")
+                        && matches!(strip_mdata(arg0).kind(), ExprKind::BVar(0))
+                        && matches!(strip_mdata(arg1).kind(), ExprKind::BVar(1))
+                }
+                _ => false,
+            },
+            _ => false,
         };
         if !raw_lt {
             return Err("its functional's recursive slot demands something other than \
@@ -4074,8 +6666,8 @@ fn scan_sum_measure_calls(
         | ExprKind::Const(_, _)
         | ExprKind::Lit(_) => Ok(()),
         ExprKind::App(function, argument) => {
-            let (head, args) = uncurry(cursor);
-            if matches!(head.kind(), &ExprKind::BVar(index) if index == rec_index) {
+            if matches!(spine_head(cursor).kind(), &ExprKind::BVar(index) if index == rec_index) {
+                let (_head, args) = uncurry(cursor);
                 if args.len() != call_arity {
                     return Err(format!(
                         "its functional applies the recursive slot to {} argument(s) where the \
@@ -4221,12 +6813,12 @@ fn is_zero_lt_param(expr: &Expr, measure: u32) -> bool {
             && matches!(strip_mdata(param).kind(), &ExprKind::BVar(index) if index == measure)
     };
     // (a) the RAW spelling — side B's rendering, and a source `Nat.lt 0 n`.
-    if *head_name == Name::from_string("Nat.lt") && args.len() == 2 {
+    if name_eq2(head_name, "Nat", "lt") && args.len() == 2 {
         return is_zero_then_param(args[0], args[1]);
     }
     // (b) the SURFACE spelling the elaborator actually mints, with the
     //     ordering instance pinned by name.
-    if *head_name == Name::from_string("LT.lt") && args.len() == 4 {
+    if name_eq2(head_name, "LT", "lt") && args.len() == 4 {
         if head_levels.len() != 1 || !head_levels[0].is_zero() {
             return false;
         }
@@ -4234,7 +6826,7 @@ fn is_zero_lt_param(expr: &Expr, measure: u32) -> bool {
             return false;
         }
         let prelude_instance = matches!(strip_mdata(args[1]).kind(), ExprKind::Const(n, levels)
-            if *n == Name::from_string("instLTNat") && levels.is_empty());
+            if name_eq1(n, "instLTNat") && levels.is_empty());
         return prelude_instance && is_zero_then_param(args[2], args[3]);
     }
     false
@@ -4320,7 +6912,7 @@ fn wf_guard_hint(guard: &Expr, measure: u32) -> String {
             if args.len() == 2
                 && matches!(uncurry(strip_mdata(args[0])), (h, a)
                     if matches!(h.kind(), ExprKind::Const(n, _)
-                        if *n == Name::from_string("Nat.succ"))
+                        if name_eq2(n, "Nat", "succ"))
                         && a.len() == 1
                         && read_wf_numeral(strip_mdata(a[0])) == Some(NatReading::Fits(0))) =>
         {
@@ -4393,10 +6985,10 @@ fn describe_unread_nat_spelling(expr: &Expr) -> Option<&'static str> {
     let ExprKind::Const(head_name, _) = head.kind() else {
         return None;
     };
-    if *head_name == Name::from_string("OfNat.ofNat")
+    if name_eq2(head_name, "OfNat", "ofNat")
         && args.len() == 3
         && matches!(strip_mdata(args[0]).kind(), ExprKind::Const(n, _)
-            if *n == Name::from_string("Nat"))
+            if name_eq1(n, "Nat"))
         && nat_literal(strip_mdata(args[1])).is_none()
     {
         return Some(
@@ -4412,13 +7004,13 @@ fn describe_unread_nat_spelling(expr: &Expr) -> Option<&'static str> {
     // A `Nat.succ` tower is only THIS class if it is a tower over a numeral
     // that ran past the cap. `Nat.succ n` over a parameter is an ordinary
     // out-of-fragment term and must keep the caller's message.
-    if *head_name == Name::from_string("Nat.succ") && args.len() == 1 {
+    if name_eq2(head_name, "Nat", "succ") && args.len() == 1 {
         let mut probe = strip_mdata(args[0]);
         let mut depth: u32 = 1;
         loop {
             let (h, a) = uncurry(probe);
             let is_succ = matches!(h.kind(), ExprKind::Const(n, _)
-                if *n == Name::from_string("Nat.succ"));
+                if name_eq2(n, "Nat", "succ"));
             if !is_succ || a.len() != 1 {
                 return (read_nat_numeral(probe).is_some() && depth > WF_SUCC_TOWER_LIMIT)
                     .then_some(
@@ -4471,14 +7063,16 @@ fn read_wf_numeral(expr: &Expr) -> Option<NatReading> {
                 },
             });
         }
-        let (head, args) = uncurry(cursor);
-        let is_succ = matches!(head.kind(), ExprKind::Const(n, _)
-            if *n == Name::from_string("Nat.succ"));
-        if !is_succ || args.len() != 1 || tower >= u64::from(WF_SUCC_TOWER_LIMIT) {
+        let ExprKind::App(head, arg) = cursor.kind() else {
+            return None;
+        };
+        let is_succ = matches!(strip_mdata(head).kind(), ExprKind::Const(n, _)
+            if name_eq2(n, "Nat", "succ"));
+        if !is_succ || tower >= u64::from(WF_SUCC_TOWER_LIMIT) {
             return None;
         }
         tower += 1;
-        cursor = strip_mdata(args[0]);
+        cursor = strip_mdata(arg);
     }
 }
 
@@ -4668,7 +7262,7 @@ fn read_wf_value(
     };
     if let ExprKind::Const(head_name, _) = head.kind() {
         // The predecessor's unary spelling.
-        if *head_name == Name::from_string("Nat.pred") && args.len() == 1 && is_param(args[0]) {
+        if name_eq2(head_name, "Nat", "pred") && args.len() == 1 && is_param(args[0]) {
             return Ok(RecBodyExpr::Pred);
         }
     }
@@ -4834,7 +7428,7 @@ fn read_case_value(
     // `Nat.succ (bvar k)` — the parameter itself, under the case substitution.
     let (head, args) = uncurry(cursor);
     if let ExprKind::Const(head_name, _) = head.kind() {
-        if *head_name == Name::from_string("Nat.succ") {
+        if name_eq2(head_name, "Nat", "succ") {
             if binders == CaseBinders::Succ
                 && args.len() == 1
                 && matches!(strip_mdata(args[0]).kind(), &ExprKind::BVar(1))
@@ -4914,15 +7508,15 @@ fn read_nat_numeral(expr: &Expr) -> Option<NatReading> {
     let ExprKind::Const(head_name, _) = head.kind() else {
         return None;
     };
-    if *head_name == Name::from_string("Nat.zero") && args.is_empty() {
+    if name_eq2(head_name, "Nat", "zero") && args.is_empty() {
         return Some(NatReading::Fits(0));
     }
-    if *head_name == Name::from_string("OfNat.ofNat") {
+    if name_eq2(head_name, "OfNat", "ofNat") {
         let [ty, literal, _instance] = args[..] else {
             return None;
         };
         if !matches!(strip_mdata(ty).kind(), ExprKind::Const(n, _)
-            if *n == Name::from_string("Nat"))
+            if name_eq1(n, "Nat"))
         {
             return None;
         }
@@ -4944,25 +7538,25 @@ fn read_nat_add<'e>(
     let ExprKind::Const(head_name, _) = head.kind() else {
         return Ok(None);
     };
-    if *head_name == Name::from_string("Nat.add") {
+    if name_eq2(head_name, "Nat", "add") {
         let [lhs, rhs] = args[..] else {
             return Ok(None);
         };
         return Ok(Some((lhs, rhs)));
     }
-    if *head_name == Name::from_string("HAdd.hAdd") {
+    if name_eq2(head_name, "HAdd", "hAdd") {
         let [t1, t2, t3, instance, lhs, rhs] = args[..] else {
             return Ok(None);
         };
         let is_nat = |t: &Expr| {
             matches!(strip_mdata(t).kind(), ExprKind::Const(n, _)
-                if *n == Name::from_string("Nat"))
+                if name_eq1(n, "Nat"))
         };
         if !(is_nat(t1) && is_nat(t2) && is_nat(t3)) {
             return Ok(None);
         }
         if !matches!(strip_mdata(instance).kind(), ExprKind::Const(n, levels)
-            if *n == Name::from_string("instHAddNat") && levels.is_empty())
+            if name_eq1(n, "instHAddNat") && levels.is_empty())
         {
             return Err(EmitRefusal::NotEmittable {
                 name: name.to_owned(),
@@ -5001,25 +7595,25 @@ fn read_nat_mul<'e>(
     let ExprKind::Const(head_name, _) = head.kind() else {
         return Ok(None);
     };
-    if *head_name == Name::from_string("Nat.mul") {
+    if name_eq2(head_name, "Nat", "mul") {
         let [lhs, rhs] = args[..] else {
             return Ok(None);
         };
         return Ok(Some((lhs, rhs)));
     }
-    if *head_name == Name::from_string("HMul.hMul") {
+    if name_eq2(head_name, "HMul", "hMul") {
         let [t1, t2, t3, instance, lhs, rhs] = args[..] else {
             return Ok(None);
         };
         let is_nat = |t: &Expr| {
             matches!(strip_mdata(t).kind(), ExprKind::Const(n, _)
-                if *n == Name::from_string("Nat"))
+                if name_eq1(n, "Nat"))
         };
         if !(is_nat(t1) && is_nat(t2) && is_nat(t3)) {
             return Ok(None);
         }
         if !matches!(strip_mdata(instance).kind(), ExprKind::Const(n, levels)
-            if *n == Name::from_string("instHMulNat") && levels.is_empty())
+            if name_eq1(n, "instHMulNat") && levels.is_empty())
         {
             return Err(EmitRefusal::NotEmittable {
                 name: name.to_owned(),
@@ -5074,13 +7668,13 @@ fn read_nat_rem<'e>(
     let ExprKind::Const(head_name, _) = head.kind() else {
         return Ok(None);
     };
-    if *head_name == Name::from_string("Nat.mod") {
+    if name_eq2(head_name, "Nat", "mod") {
         let [lhs, rhs] = args[..] else {
             return Ok(None);
         };
         return Ok(Some((lhs, rhs)));
     }
-    if *head_name == Name::from_string("HMod.hMod") {
+    if name_eq2(head_name, "HMod", "hMod") {
         let [t1, t2, t3, instance, lhs, rhs] = args[..] else {
             return Ok(None);
         };
@@ -5088,7 +7682,7 @@ fn read_nat_rem<'e>(
             return Ok(None);
         }
         if !matches!(strip_mdata(instance).kind(), ExprKind::Const(n, levels)
-            if *n == Name::from_string("instHModNat") && levels.is_empty())
+            if name_eq1(n, "instHModNat") && levels.is_empty())
         {
             return Err(EmitRefusal::NotEmittable {
                 name: name.to_owned(),
@@ -5149,13 +7743,13 @@ fn read_nat_sub<'e>(
     let ExprKind::Const(head_name, _) = head.kind() else {
         return Ok(None);
     };
-    if *head_name == Name::from_string("Nat.sub") {
+    if name_eq2(head_name, "Nat", "sub") {
         let [lhs, rhs] = args[..] else {
             return Ok(None);
         };
         return Ok(Some((lhs, rhs)));
     }
-    if *head_name == Name::from_string("HSub.hSub") {
+    if name_eq2(head_name, "HSub", "hSub") {
         let [t1, t2, t3, instance, lhs, rhs] = args[..] else {
             return Ok(None);
         };
@@ -5163,7 +7757,7 @@ fn read_nat_sub<'e>(
             return Ok(None);
         }
         if !matches!(strip_mdata(instance).kind(), ExprKind::Const(n, levels)
-            if *n == Name::from_string("instHSubNat") && levels.is_empty())
+            if name_eq1(n, "instHSubNat") && levels.is_empty())
         {
             return Err(EmitRefusal::NotEmittable {
                 name: name.to_owned(),
@@ -5224,21 +7818,298 @@ fn numeral_out_of_range_reason(value: u128, width: u32) -> String {
 /// parameters, and the comparison's LEFT operand too; its RIGHT operand is a
 /// bare bound parameter ([`CleanOriginShape::Select`]) or — R2/C9 — a numeral
 /// in either measured spelling ([`CleanOriginShape::SelectLiteral`];
-/// `probe_i_select_literal_admits` is the kernel ground). Anything else fails
+/// `probe_i_select_literal_admits` and
+/// `probe_i5_select_literal_le_and_propositional_eq_real_elaboration_admit`
+/// are the kernel ground). Anything else fails
 /// closed to `None`: notably e6 f02's `toNat` comparison spelling
 /// (kernel-equal, but a DIFFERENT tree — admitting it here would put an
 /// unmeasured identification on the emit lane), f03's constant arms, and a
 /// literal LEFT operand (`if 10 < a`), which the reflected side B's
 /// vocabulary cannot even spell.
-fn recognise_select_ite(
+/// **W6 (Rust-calls-Clean) — recognise a comparison of two parameters returned
+/// as `Bool`.**
+///
+/// The kernel terms, measured 2026-09-13 at `def f (a b : UInt64) : Bool`:
+///
+/// ```text
+/// a <  b   =>  decide (LT.lt {C} instLT{C} a b) (instDecidable{C}Lt a b)
+/// a <= b   =>  decide (LE.le {C} instLE{C} a b) (instDecidable{C}Le a b)
+/// a == b   =>  BEq.beq {C} (instBEqOfDecidableEq {C} instDecidableEq{C}) a b
+/// ```
+///
+/// (`==` is `BEq.beq`, NOT `decide (Eq …)`; the explicit `decide (a = b)`
+/// spelling is accepted too, since it is definitionally equal.) Both operands
+/// must be bare parameters — see [`CleanOriginShape::DecideComparison`] on why a
+/// numeral operand and `!=` are residuals. `>`/`>=` are expressed by operand
+/// order (`b < a` / `b <= a`).
+///
+/// SOUNDNESS: this recogniser is never trusted. It produces the plan the
+/// emitter builds from, and `crate::gate::check_faithful` re-decides definitional
+/// equality of the EMITTED MIR's reflection against the untouched declaration.
+/// A misread comparison or a swapped operand emits a body that denotes a
+/// different function, whose reflection FAILS def-eq and is refused fail-closed
+/// — never a silently wrong binary. `control_25_clean_comparison_emitter_mutation`
+/// pins exactly those refusals.
+fn recognise_decide_comparison(
     cursor: &Expr,
     arity: usize,
     signature: &CarrierSignature,
 ) -> Option<CleanOriginShape> {
+    // The result carrier is `Bool` — the whole distinction from a select, and
+    // what makes this recogniser disjoint from every `UInt`-result one below.
+    if !matches!(signature.result().clean(), CleanType::Bool) {
+        return None;
+    }
+    // Both operands are the two source parameters, at one unsigned machine
+    // width (the reflected side B, `admit_comparison_function`, is single-domain
+    // over all parameters; re-checked on the sealed plan).
+    if arity != 2 {
+        return None;
+    }
+    let CleanType::UInt(width) = signature.arguments().first()?.clean() else {
+        return None;
+    };
+    let carrier_owned;
+    let carrier: &str = match uint_carrier_name(width) {
+        Some(s) => s,
+        None => {
+            carrier_owned = format!("UInt{width}");
+            &carrier_owned
+        }
+    };
+    let bvar_param = |expr: &Expr| -> Option<usize> {
+        match strip_mdata(expr).kind() {
+            &ExprKind::BVar(index) if (index as usize) < arity => Some(arity - 1 - index as usize),
+            _ => None,
+        }
+    };
+    let const_is = |expr: &Expr, name: &str, levels: usize| -> bool {
+        matches!(strip_mdata(expr).kind(), ExprKind::Const(n, ls)
+            if name_display_eq_str(n, name) && ls.len() == levels)
+    };
+
+    let (head, args) = uncurry(cursor);
+    let ExprKind::Const(head_name, _head_levels) = head.kind() else {
+        return None;
+    };
+    if name_display_eq_str(head_name, "decide")
+        || name_display_eq_str(head_name, "Decidable.decide")
+    {
+        // `decide <prop> <inst>` — the `<`/`<=` spelling (and the explicit
+        // `decide (a = b)`).
+        if args.len() != 2 {
+            return None;
+        }
+        let (prop_head, prop_args) = uncurry(strip_mdata(args[0]));
+        let ExprKind::Const(prop_name, _plevels) = prop_head.kind() else {
+            return None;
+        };
+        let (cmp, cmp_left, cmp_right) = if name_display_eq_str(prop_name, "LT.lt")
+            || name_display_eq_str(prop_name, "LE.le")
+        {
+            // `LT.lt {C} instLT{C} l r` — 4 args at the carrier.
+            if prop_args.len() != 4 || !const_is(prop_args[0], carrier, 0) {
+                return None;
+            }
+            let cmp =
+                if name_display_eq_str(prop_name, "LT.lt") { SelectCmp::Lt } else { SelectCmp::Le };
+            (cmp, bvar_param(prop_args[2])?, bvar_param(prop_args[3])?)
+        } else if name_display_eq_str(prop_name, "Eq") {
+            // `Eq {C} l r` — 3 args at the carrier.
+            if prop_args.len() != 3 || !const_is(prop_args[0], carrier, 0) {
+                return None;
+            }
+            (SelectCmp::Eq, bvar_param(prop_args[1])?, bvar_param(prop_args[2])?)
+        } else {
+            return None;
+        };
+        return Some(CleanOriginShape::DecideComparison { cmp, cmp_left, cmp_right });
+    }
+    if name_display_eq_str(head_name, "BEq.beq") {
+        // `BEq.beq {C} (instBEqOfDecidableEq {C} instDecidableEq{C}) l r` — the
+        // idiomatic `a == b`. The instance is authenticated exactly: a bare
+        // `instBEq{C}` is a DIFFERENT decision procedure, and while the gate
+        // would refuse a mismatch fail-closed, authenticating here keeps the
+        // shape's meaning single.
+        if args.len() != 4 || !const_is(args[0], carrier, 0) {
+            return None;
+        }
+        let (inst_head, inst_args) = uncurry(strip_mdata(args[1]));
+        let inst_dec_eq_ok = matches!(
+            strip_mdata(inst_args.get(1).copied()?).kind(),
+            ExprKind::Const(n, ls)
+                if ls.is_empty() && name_eq1_concat(n, &["instDecidableEq", carrier])
+        );
+        if !const_is(inst_head, "instBEqOfDecidableEq", 1)
+            || inst_args.len() != 2
+            || !const_is(inst_args[0], carrier, 0)
+            || !inst_dec_eq_ok
+        {
+            return None;
+        }
+        let cmp_left = bvar_param(args[2])?;
+        let cmp_right = bvar_param(args[3])?;
+        return Some(CleanOriginShape::DecideComparison {
+            cmp: SelectCmp::Eq,
+            cmp_left,
+            cmp_right,
+        });
+    }
+    None
+}
+
+/// **W6 (Rust-calls-Clean) — recognise a boolean negation or connective over
+/// `Bool` parameters returned as `Bool`.**
+///
+/// The kernel terms, measured 2026-09-13:
+///
+/// ```text
+/// not b    =>  Bool.not (BVar)
+/// a && b   =>  and (BVar) (BVar)      (def-eq to `Bool.and`)
+/// a || b   =>  or  (BVar) (BVar)      (def-eq to `Bool.or`)
+/// ```
+///
+/// The result and every parameter carry `Bool`, and every operand is a bare
+/// parameter. SOUNDNESS: never trusted — `crate::gate::check_faithful` re-decides
+/// definitional equality of the EMITTED body's reflection (minted by
+/// `admit_bool_value_function` as `Bool.not`/`Bool.and`/`Bool.or`) against the
+/// untouched declaration, so a misread connective or operand is refused
+/// fail-closed. `control_26_clean_bool_value_emitter_mutation` pins those
+/// refusals.
+fn recognise_bool_value(
+    cursor: &Expr,
+    arity: usize,
+    signature: &CarrierSignature,
+) -> Option<CleanOriginShape> {
+    if !matches!(signature.result().clean(), CleanType::Bool) {
+        return None;
+    }
+    // Every parameter carries `Bool` (the reflected `admit_bool_value_function`
+    // is single-domain over `Bool`; re-checked on the sealed plan).
+    if !signature.arguments().iter().all(|c| matches!(c.clean(), CleanType::Bool)) {
+        return None;
+    }
+    let bvar_param = |expr: &Expr| -> Option<usize> {
+        match strip_mdata(expr).kind() {
+            &ExprKind::BVar(index) if (index as usize) < arity => Some(arity - 1 - index as usize),
+            _ => None,
+        }
+    };
+    let (head, args) = uncurry(cursor);
+    let ExprKind::Const(head_name, head_levels) = head.kind() else {
+        return None;
+    };
+    if !head_levels.is_empty() {
+        return None;
+    }
+    if name_display_eq_str(head_name, "Bool.not") && args.len() == 1 {
+        Some(CleanOriginShape::BoolNot { param: bvar_param(args[0])? })
+    } else if name_display_eq_str(head_name, "and") && args.len() == 2 {
+        Some(CleanOriginShape::BoolConnective {
+            op: BoolBinOp::And,
+            left: bvar_param(args[0])?,
+            right: bvar_param(args[1])?,
+        })
+    } else if name_display_eq_str(head_name, "or") && args.len() == 2 {
+        Some(CleanOriginShape::BoolConnective {
+            op: BoolBinOp::Or,
+            left: bvar_param(args[0])?,
+            right: bvar_param(args[1])?,
+        })
+    } else {
+        None
+    }
+}
+
+fn recognise_bool_expression(
+    cursor: &Expr,
+    arity: usize,
+    signature: &CarrierSignature,
+) -> Option<CleanOriginShape> {
+    if !matches!(signature.result().clean(), CleanType::Bool)
+        || !signature.arguments().iter().all(|c| matches!(c.clean(), CleanType::Bool))
+    {
+        return None;
+    }
+    fn read(expr: &Expr, arity: usize, depth: usize, ops: &mut usize) -> Option<BoolExpr> {
+        if depth > BOOL_EXPRESSION_MAX_DEPTH {
+            return None;
+        }
+        let expr = strip_mdata(expr);
+        if let ExprKind::BVar(index) = expr.kind() {
+            return ((*index as usize) < arity)
+                .then(|| BoolExpr::Param(arity - 1 - *index as usize));
+        }
+        let (head, args) = uncurry(expr);
+        let ExprKind::Const(name, levels) = head.kind() else {
+            return None;
+        };
+        if !levels.is_empty() {
+            return None;
+        }
+        match args.as_slice() {
+            [] if name_display_eq_str(name, "Bool.true") => Some(BoolExpr::Literal(true)),
+            [] if name_display_eq_str(name, "Bool.false") => Some(BoolExpr::Literal(false)),
+            [child] if name_display_eq_str(name, "Bool.not") => {
+                *ops += 1;
+                if *ops > BOOL_EXPRESSION_MAX_OPS {
+                    return None;
+                }
+                Some(BoolExpr::Not(Box::new(read(child, arity, depth + 1, ops)?)))
+            }
+            [left, right]
+                if name_display_eq_str(name, "and")
+                    || name_display_eq_str(name, "Bool.and")
+                    || name_display_eq_str(name, "or")
+                    || name_display_eq_str(name, "Bool.or") =>
+            {
+                *ops += 1;
+                if *ops > BOOL_EXPRESSION_MAX_OPS {
+                    return None;
+                }
+                let is_and =
+                    name_display_eq_str(name, "and") || name_display_eq_str(name, "Bool.and");
+                let left = Box::new(read(left, arity, depth + 1, ops)?);
+                let right = Box::new(read(right, arity, depth + 1, ops)?);
+                Some(if is_and { BoolExpr::And(left, right) } else { BoolExpr::Or(left, right) })
+            }
+            _ => None,
+        }
+    }
+    let mut ops = 0;
+    let expr = read(cursor, arity, 0, &mut ops)?;
+    (ops > 0).then_some(CleanOriginShape::BoolExpression { expr })
+}
+
+enum Rhs {
+    Param(usize),
+    Literal(u128),
+}
+
+struct SelectIte<'a> {
+    cmp: SelectCmp,
+    left: usize,
+    right: ArithOperand,
+    then_branch: &'a Expr,
+    else_branch: &'a Expr,
+}
+
+fn read_select_ite<'a>(
+    cursor: &'a Expr,
+    arity: usize,
+    signature: &CarrierSignature,
+) -> Option<SelectIte<'a>> {
     let CleanType::UInt(width) = signature.result().clean() else {
         return None;
     };
-    let carrier = format!("UInt{width}");
+    let carrier_owned;
+    let carrier: &str = match uint_carrier_name(width) {
+        Some(s) => s,
+        None => {
+            carrier_owned = format!("UInt{width}");
+            &carrier_owned
+        }
+    };
     let bvar_param = |expr: &Expr| -> Option<usize> {
         match strip_mdata(expr).kind() {
             &ExprKind::BVar(index) if (index as usize) < arity => Some(arity - 1 - index as usize),
@@ -5247,14 +8118,14 @@ fn recognise_select_ite(
     };
     let is_carrier_const = |expr: &Expr| -> bool {
         matches!(strip_mdata(expr).kind(), ExprKind::Const(n, levels)
-            if n.to_string() == carrier && levels.is_empty())
+            if name_display_eq_str(n, carrier) && levels.is_empty())
     };
 
     let (head, args) = uncurry(cursor);
     let ExprKind::Const(head_name, head_levels) = head.kind() else {
         return None;
     };
-    if head_name.to_string() != "ite"
+    if !name_display_eq_str(head_name, "ite")
         || head_levels.len() != 1
         || head_levels[0] != Level::succ(Level::zero())
         || args.len() != 5
@@ -5268,12 +8139,12 @@ fn recognise_select_ite(
     let ExprKind::Const(prop_name, prop_levels) = prop_head.kind() else {
         return None;
     };
-    let (cmp, dec_inst_name, l_expr, r_expr) = match prop_name.to_string().as_str() {
-        "LT.lt" | "LE.le" => {
+    let (cmp, dec_inst_parts, l_expr, r_expr): (SelectCmp, [&str; 3], &Expr, &Expr) =
+        if name_display_eq_str(prop_name, "LT.lt") || name_display_eq_str(prop_name, "LE.le") {
             if prop_levels.len() != 1 || !prop_levels[0].is_zero() || prop_args.len() != 4 {
                 return None;
             }
-            let (cmp, class) = if prop_name.to_string() == "LT.lt" {
+            let (cmp, class) = if name_display_eq_str(prop_name, "LT.lt") {
                 (SelectCmp::Lt, "LT")
             } else {
                 (SelectCmp::Le, "LE")
@@ -5282,34 +8153,29 @@ fn recognise_select_ite(
                 return None;
             }
             let inst_ok = matches!(strip_mdata(prop_args[1]).kind(), ExprKind::Const(n, levels)
-                if n.to_string() == format!("inst{class}{carrier}") && levels.is_empty());
+                if levels.is_empty() && name_eq1_concat(n, &["inst", class, carrier]));
             if !inst_ok {
                 return None;
             }
             let suffix = if cmp == SelectCmp::Lt { "Lt" } else { "Le" };
-            (cmp, format!("instDecidable{carrier}{suffix}"), prop_args[2], prop_args[3])
-        }
-        "Eq" => {
+            (cmp, ["instDecidable", carrier, suffix], prop_args[2], prop_args[3])
+        } else if name_display_eq_str(prop_name, "Eq") {
             if prop_levels.len() != 1 || prop_args.len() != 3 || !is_carrier_const(prop_args[0]) {
                 return None;
             }
-            (SelectCmp::Eq, format!("instDecidableEq{carrier}"), prop_args[1], prop_args[2])
-        }
-        _ => return None,
-    };
+            (SelectCmp::Eq, ["instDecidableEq", carrier, ""], prop_args[1], prop_args[2])
+        } else {
+            return None;
+        };
     let cmp_left = bvar_param(l_expr)?;
     // R2/C9: the comparison's RIGHT operand — a bare parameter (the C5a
     // param-vs-param select, unchanged) or a numeral in either measured
     // spelling. A literal LEFT operand has no arm: `bvar_param(l_expr)`
     // above already failed the tree closed.
-    enum Rhs {
-        Param(usize),
-        Literal(u128),
-    }
     let rhs = if let Some(param) = bvar_param(r_expr) {
         Rhs::Param(param)
     } else {
-        match numeral_leaf(r_expr, &carrier)? {
+        match numeral_leaf(r_expr, carrier)? {
             NatReading::Fits(value) => Rhs::Literal(value),
             // A multi-limb literal is out of range for every admitted width;
             // fall through to the generic fragment refusal. (A FITTING but
@@ -5327,14 +8193,18 @@ fn recognise_select_ite(
     let (inst_head, inst_args) = uncurry(args[2]);
     let head_is = |name: &str| {
         matches!(inst_head.kind(), ExprKind::Const(n, levels)
-            if n.to_string() == name && levels.is_empty())
+            if name_display_eq_str(n, name) && levels.is_empty())
+    };
+    let head_is_parts = |parts: &[&str]| {
+        matches!(inst_head.kind(), ExprKind::Const(n, levels)
+            if levels.is_empty() && name_eq1_concat(n, parts))
     };
     if inst_args.len() != 2 {
         return None;
     }
     match &rhs {
         Rhs::Param(cmp_right) => {
-            if !head_is(&dec_inst_name)
+            if !head_is_parts(&dec_inst_parts)
                 || bvar_param(inst_args[0]) != Some(cmp_left)
                 || bvar_param(inst_args[1]) != Some(*cmp_right)
             {
@@ -5342,28 +8212,102 @@ fn recognise_select_ite(
             }
         }
         Rhs::Literal(value) => {
-            // ONE measured instance spelling for a literal comparison —
-            // R2/C9 SPELLING-GAP FIX (measured 2026-08-21, the fourth
-            // teaching of the measurement rule): the REAL elaborator does
-            // not use the carrier instance for `a < 10` at all — instance
-            // synthesis resolves by REDUCTION TO NAT, minting
-            // `instDecidableNatLt (a.toNat-as-Proj-chain) 10` — and the
-            // producer now mints the same (the carrier-instance spelling was
-            // a probe fiction nothing real emits, and defeq is intensional
-            // on the stuck ite, so accepting it would plan bodies the gate
-            // must then refuse). Only `<` is measured through the real
-            // island path (`probe_i3_select_literal_real_elaboration_admits`);
-            // `<=`/`==` with a literal stay OUTSIDE until measured.
+            // Measured instance spellings for a literal right operand. The
+            // carrier instance is the spelling the current real island path
+            // produces for `<`, `<=` and propositional `=` at UInt8/16/32/64
+            // (`probe_i5_select_literal_le_and_propositional_eq_real_elaboration_admit`).
+            // A historical Clean range reduced `<` to Nat instead; that
+            // compatibility spelling remains admitted for `<` only. Both
+            // readings are the proposition's OWN comparison on the SAME
+            // operands: THIS parameter on the left and a numeral of THIS
+            // value on the right, never the two exchanged.
+            //
+            // 1. REDUCTION TO NAT — every Clean pin before `c91fa93f5`
+            //    (R2/C9 SPELLING-GAP FIX, measured 2026-08-21, the fourth
+            //    teaching of the measurement rule): instance synthesis
+            //    resolved `a < 10` by reduction to `Nat`, minting
+            //    `instDecidableNatLt (a.toNat-as-Proj-chain) 10`. Kept: a
+            //    Clean pin can move back, and nothing below depends on which
+            //    spelling a given pin produces.
+            //
+            // 2. THE CARRIER INSTANCE — Clean `c91fa93f5` and later
+            //    (measured 2026-09-23 at the superproject's Clean pin
+            //    `dca882b5f`, at UInt8/16/32/64 alike): that commit made the
+            //    carrier's `decLt a b` BE `Nat.decLt a.toNat b.toNat`, and
+            //    the same island source now elaborates to
+            //    `instDecidable{C}Lt a <LIT>`, whose right operand is the
+            //    proposition's `{C}.ofNat LIT` unfolded one δβ step
+            //    ([`carrier_instance_numeral`]). Before this arm existed that
+            //    tree fell to the generic fragment refusal, and every
+            //    driver-level `if a < 10` fixture died at the mint with
+            //    E0425 — the same failure the 2026-08-21 fix repaired in the
+            //    other direction. The retained Clean 4.30 measurement records
+            //    this carrier form for `<`, `<=` and propositional `=` at
+            //    every admitted width.
+            //
+            // SOUNDNESS. Neither reading is trusted. The emitted Rust comparison against an
+            // inline scalar is justified ONLY by `crate::gate::check_faithful`: side B — reflected
+            // by `admit_select_literal_function` / `admit_select_operands_function` from the
+            // EMITTED MIR, never from this plan — must be definitionally equal to the untouched
+            // declaration under the kernel. This reading must MATCH what that check compares —
+            // `admit_lowering` refuses unless the emitted MIR reads back as
+            // this very plan — but widening what this recognizer accepts only
+            // changes which bodies are ATTEMPTED: a body whose side B is not
+            // defeq to side A is still refused fail-closed at the gate,
+            // whatever this arm read. Side B is unchanged. `probe_i3`/`i4`
+            // measure the historical `<` identification and `probe_i5`
+            // measures the real `<=`/`=` trees, including wrong-comparison,
+            // wrong-literal and swapped-arm refusals. Nor can the instance
+            // disagree with the proposition it decides: side A was
+            // FULL-kernel-checked, so the instance's type is the `ite`'s
+            // proposition up to defeq. The operand match below restates that
+            // invariant; it is not the thing enforcing it.
             let nat_reduced = cmp == SelectCmp::Lt
                 && head_is("instDecidableNatLt")
-                && to_nat_projection_param(inst_args[0], &carrier, arity) == Some(cmp_left)
+                && to_nat_projection_param(inst_args[0], carrier, arity) == Some(cmp_left)
                 && nat_literal(inst_args[1]) == Some(NatReading::Fits(*value));
-            if !nat_reduced {
+            // `dec_inst_parts` is derived from the proposition above, so an
+            // Lt/Le/Eq instance can never be read as a different comparison.
+            let carrier_instance = head_is_parts(&dec_inst_parts)
+                && bvar_param(inst_args[0]) == Some(cmp_left)
+                && carrier_instance_numeral(inst_args[1], carrier, width)
+                    == Some(NatReading::Fits(*value));
+            if !(nat_reduced || carrier_instance) {
                 return None;
             }
         }
     }
 
+    Some(SelectIte {
+        cmp,
+        left: cmp_left,
+        right: match rhs {
+            Rhs::Param(param) => ArithOperand::Param(param),
+            Rhs::Literal(value) => ArithOperand::Const(value),
+        },
+        then_branch: args[3],
+        else_branch: args[4],
+    })
+}
+
+fn recognise_select_ite(
+    cursor: &Expr,
+    arity: usize,
+    signature: &CarrierSignature,
+) -> Option<CleanOriginShape> {
+    let selected = read_select_ite(cursor, arity, signature)?;
+    let CleanType::UInt(width) = signature.result().clean() else { return None };
+    let carrier = uint_carrier_name(width)?;
+    let bvar_param = |expr: &Expr| match strip_mdata(expr).kind() {
+        &ExprKind::BVar(index) if (index as usize) < arity => Some(arity - 1 - index as usize),
+        _ => None,
+    };
+    let cmp = selected.cmp;
+    let cmp_left = selected.left;
+    let rhs = match selected.right {
+        ArithOperand::Param(param) => Rhs::Param(param),
+        ArithOperand::Const(value) => Rhs::Literal(value),
+    };
     // §6f LANDING 3: each ARM is a bare bound parameter or a numeral in
     // either measured spelling. The real elaborator mints a constant arm in
     // the CARRIER spelling (`UInt64.ofNat 0`, measured in l3_p2/l3_p3) — the
@@ -5373,7 +8317,7 @@ fn recognise_select_ite(
     let arm = |expr: &Expr| -> Option<ArithOperand> {
         match bvar_param(expr) {
             Some(param) => Some(ArithOperand::Param(param)),
-            None => match numeral_leaf(expr, &carrier)? {
+            None => match numeral_leaf(expr, carrier)? {
                 // A multi-limb literal is out of range for every admitted
                 // width; fall through to the generic fragment refusal, the
                 // same disposition the comparison operand takes.
@@ -5382,8 +8326,8 @@ fn recognise_select_ite(
             },
         }
     };
-    let then_arm = arm(args[3])?;
-    let else_arm = arm(args[4])?;
+    let then_arm = arm(selected.then_branch)?;
+    let else_arm = arm(selected.else_branch)?;
 
     // The two arm vocabularies are DISJOINT by construction: a select whose
     // arms are both bare parameters keeps its pre-landing-3 variant, byte for
@@ -5414,6 +8358,97 @@ fn recognise_select_ite(
         then_arm,
         else_arm,
     })
+}
+
+fn recognise_unsigned_conditional(
+    cursor: &Expr,
+    arity: usize,
+    signature: &CarrierSignature,
+) -> Option<CleanOriginShape> {
+    fn read(
+        expression: &Expr,
+        arity: usize,
+        signature: &CarrierSignature,
+        depth: usize,
+        decisions: &mut usize,
+    ) -> Option<UIntConditional> {
+        if depth > UINT_CONDITIONAL_MAX_DECISIONS {
+            return None;
+        }
+        if let ExprKind::BVar(index) = strip_mdata(expression).kind() {
+            let index = usize::try_from(*index).ok()?;
+            return (index < arity)
+                .then(|| UIntConditional::Operand(ArithOperand::Param(arity - 1 - index)));
+        }
+        let CleanType::UInt(width) = signature.result().clean() else { return None };
+        if let Some(NatReading::Fits(value)) = numeral_leaf(expression, uint_carrier_name(width)?) {
+            return Some(UIntConditional::Operand(ArithOperand::Const(value)));
+        }
+        let selected = read_select_ite(expression, arity, signature)?;
+        *decisions += 1;
+        if *decisions > UINT_CONDITIONAL_MAX_DECISIONS {
+            return None;
+        }
+        Some(UIntConditional::If {
+            cmp: selected.cmp,
+            left: selected.left,
+            right: selected.right,
+            then_branch: Box::new(read(
+                selected.then_branch,
+                arity,
+                signature,
+                depth + 1,
+                decisions,
+            )?),
+            else_branch: Box::new(read(
+                selected.else_branch,
+                arity,
+                signature,
+                depth + 1,
+                decisions,
+            )?),
+        })
+    }
+    let mut decisions = 0;
+    let expr = read(cursor, arity, signature, 0, &mut decisions)?;
+    (decisions >= 2).then_some(CleanOriginShape::UnsignedConditional { expr })
+}
+
+fn check_unsigned_conditional(
+    name: &str,
+    expression: &UIntConditional,
+    signature: &CarrierSignature,
+    width: u32,
+    depth: usize,
+) -> Result<usize, EmitRefusal> {
+    if depth > UINT_CONDITIONAL_MAX_DECISIONS {
+        return Err(EmitRefusal::NotEmittable {
+            name: name.into(),
+            reason: "unsigned conditional depth exceeds its bound".into(),
+        });
+    }
+    match expression {
+        UIntConditional::Operand(operand) => {
+            check_arith_leaf(name, operand, signature, width)?;
+            Ok(0)
+        }
+        UIntConditional::If { left, right, then_branch, else_branch, .. } => {
+            check_arith_leaf(name, &ArithOperand::Param(*left), signature, width)?;
+            check_arith_leaf(name, right, signature, width)?;
+            let then_count =
+                check_unsigned_conditional(name, then_branch, signature, width, depth + 1)?;
+            let else_count =
+                check_unsigned_conditional(name, else_branch, signature, width, depth + 1)?;
+            let count = 1 + then_count + else_count;
+            if count > UINT_CONDITIONAL_MAX_DECISIONS {
+                return Err(EmitRefusal::NotEmittable {
+                    name: name.into(),
+                    reason: "unsigned conditional decisions exceed their bound".into(),
+                });
+            }
+            Ok(count)
+        }
+    }
 }
 
 /// Which `Bool`-level equality spelling a condition was written with.
@@ -5489,10 +8524,12 @@ fn bool_scrutinee_value(expr: &Expr) -> Option<bool> {
     if !levels.is_empty() {
         return None;
     }
-    match name.to_string().as_str() {
-        "Bool.true" | "true" => Some(true),
-        "Bool.false" | "false" => Some(false),
-        _ => None,
+    if name_display_eq_str(name, "Bool.true") || name_display_eq_str(name, "true") {
+        Some(true)
+    } else if name_display_eq_str(name, "Bool.false") || name_display_eq_str(name, "false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -5545,14 +8582,21 @@ fn recognise_bool_decision_ite<'a>(
     let CleanType::UInt(width) = signature.result().clean() else {
         return None;
     };
-    let carrier = format!("UInt{width}");
+    let carrier_owned;
+    let carrier: &str = match uint_carrier_name(width) {
+        Some(s) => s,
+        None => {
+            carrier_owned = format!("UInt{width}");
+            &carrier_owned
+        }
+    };
     let const_is = |expr: &Expr, name: &str, levels: usize| -> bool {
         matches!(strip_mdata(expr).kind(), ExprKind::Const(n, ls)
-            if n.to_string() == name && ls.len() == levels)
+            if name_display_eq_str(n, name) && ls.len() == levels)
     };
 
     let (head, args) = uncurry(cursor);
-    if !const_is(head, "ite", 1) || args.len() != 5 || !const_is(args[0], &carrier, 0) {
+    if !const_is(head, "ite", 1) || args.len() != 5 || !const_is(args[0], carrier, 0) {
         return None;
     }
 
@@ -5592,15 +8636,20 @@ fn recognise_bool_decision_ite<'a>(
     let (beq_head, beq_args) = uncurry(decision);
     if !const_is(beq_head, "BEq.beq", 1)
         || beq_args.len() != 4
-        || !const_is(beq_args[0], &carrier, 0)
+        || !const_is(beq_args[0], carrier, 0)
     {
         return None;
     }
     let (inst_head, inst_args) = uncurry(beq_args[1]);
+    let inst_dec_eq_ok = matches!(
+        strip_mdata(inst_args.get(1).copied()?).kind(),
+        ExprKind::Const(n, ls)
+            if ls.is_empty() && name_eq1_concat(n, &["instDecidableEq", carrier])
+    );
     if !const_is(inst_head, "instBEqOfDecidableEq", 1)
         || inst_args.len() != 2
-        || !const_is(inst_args[0], &carrier, 0)
-        || !const_is(inst_args[1], &format!("instDecidableEq{carrier}"), 0)
+        || !const_is(inst_args[0], carrier, 0)
+        || !inst_dec_eq_ok
     {
         return None;
     }
@@ -5662,7 +8711,14 @@ fn recognise_beq_select_ite(
     let CleanType::UInt(width) = signature.result().clean() else {
         return None;
     };
-    let carrier = format!("UInt{width}");
+    let carrier_owned;
+    let carrier: &str = match uint_carrier_name(width) {
+        Some(s) => s,
+        None => {
+            carrier_owned = format!("UInt{width}");
+            &carrier_owned
+        }
+    };
     let reading = recognise_bool_decision_ite(cursor, signature)?;
     if reading.spelling != BoolDecisionSpelling::Equal {
         return None;
@@ -5708,7 +8764,7 @@ fn recognise_beq_select_ite(
     let operand = |expr: &Expr| -> Option<ArithOperand> {
         match bvar_param(expr) {
             Some(param) => Some(ArithOperand::Param(param)),
-            None => match numeral_leaf(expr, &carrier)? {
+            None => match numeral_leaf(expr, carrier)? {
                 // A multi-limb literal is out of range at every admitted width;
                 // fall through to the refusal, the same disposition every other
                 // select position takes.
@@ -5775,10 +8831,12 @@ fn recognise_beq_general_select_ite(
     let CleanType::UInt(width) = signature.result().clean() else {
         return Ok(None);
     };
+    let Some(carrier) = uint_carrier_name(width) else {
+        return Ok(None);
+    };
     if !matches!(width, 8 | 16 | 32 | 64) {
         return Ok(None);
     }
-    let carrier = signature.result().clean().name();
     let Some(reading) = recognise_bool_decision_ite(cursor, signature) else {
         return Ok(None);
     };
@@ -5801,13 +8859,13 @@ fn recognise_beq_general_select_ite(
         if let Some(param) = bvar_param(expr) {
             return Some(BeqOperand::Param(param));
         }
-        if let Some(reading) = numeral_leaf(expr, &carrier) {
+        if let Some(reading) = numeral_leaf(expr, carrier) {
             return match reading {
                 NatReading::Oversized => None,
                 NatReading::Fits(value) => Some(BeqOperand::Const(value)),
             };
         }
-        match recognise_raw_binop_leaf(name, expr, arity, &carrier, width) {
+        match recognise_raw_binop_leaf(name, expr, arity, carrier, width) {
             Ok(found) => found,
             Err(found) => {
                 refusal.get_or_insert(found);
@@ -5830,7 +8888,7 @@ fn recognise_beq_general_select_ite(
     let arm = |expr: &Expr| -> Option<ArithOperand> {
         match bvar_param(expr) {
             Some(param) => Some(ArithOperand::Param(param)),
-            None => match numeral_leaf(expr, &carrier)? {
+            None => match numeral_leaf(expr, carrier)? {
                 NatReading::Oversized => None,
                 NatReading::Fits(value) => Some(ArithOperand::Const(value)),
             },
@@ -5866,7 +8924,7 @@ fn recognise_beq_general_select_ite(
 /// soundness rule — is the operator vocabulary (read from
 /// [`crate::table::raw_binop_rows`], never from a literal here), the prelude
 /// instance authentication, the leaf vocabulary
-/// ([`recognise_arith_operand`]) and the DIVISOR RULE.
+/// ([`recognise_arith_operand`]), the DIVISOR RULE and the SHIFT-AMOUNT RULE.
 ///
 /// `Ok(None)` = not a raw-binop node, so the caller falls through; `Err` = it
 /// IS one but is outside the fragment for a specific, user-fixable reason.
@@ -5885,34 +8943,22 @@ fn recognise_raw_binop_leaf(
         let Some((class, projection)) = table::surface_class(selected) else {
             continue;
         };
-        if *head_name != Name::from_string(&format!("{class}.{projection}")) {
+        if !name_eq2(head_name, class, projection) {
             continue;
         }
         let [t1, t2, t3, instance, lhs, rhs] = args[..] else {
             return Ok(None);
         };
-        let carrier_const = Name::from_string(carrier_name);
         let is_carrier =
-            |t: &Expr| matches!(t.kind(), ExprKind::Const(n, _) if *n == carrier_const);
+            |t: &Expr| matches!(t.kind(), ExprKind::Const(n, _) if name_eq_str(n, carrier_name));
         if !(is_carrier(t1) && is_carrier(t2) && is_carrier(t3)) {
             return Ok(None);
         }
-        let expected_instance = format!("inst{class}{carrier_name}");
-        match instance.kind() {
-            ExprKind::Const(n, _) if *n == Name::from_string(&expected_instance) => {}
-            _ => {
-                return Err(EmitRefusal::NotEmittable {
-                    name: name.to_owned(),
-                    reason: format!(
-                        "its `{class}.{projection}` at `{carrier_name}` routes through an \
-                         instance other than the prelude's homogeneous `{expected_instance}`; \
-                         only the prelude instance is in the measured emittable fragment \
-                         (a user instance may be kernel-reducible to it, but the compiler \
-                         will not guess — spell the op so it elaborates through the \
-                         prelude instance, or keep the definition for proof position)"
-                    ),
-                });
-            }
+        if !is_prelude_homogeneous_instance(instance, class, carrier_name) {
+            return Err(EmitRefusal::NotEmittable {
+                name: name.to_owned(),
+                reason: non_prelude_instance_reason(class, projection, carrier_name),
+            });
         }
         // LEAVES only. A nested spine is kernel-green and has no realization on
         // this lane — one statement per node is a deeper chain, which is
@@ -5937,6 +8983,15 @@ fn recognise_raw_binop_leaf(
                     });
                 }
             }
+        }
+        // THE SHIFT-AMOUNT RULE, in an operand position — the same rule
+        // `recognise_raw_binop_expr` applies to a whole body, stated once in
+        // `shift_amount_has_a_side_b`.
+        if op.right_operand_is_a_shift_amount() && !shift_amount_has_a_side_b(right, width) {
+            return Err(EmitRefusal::NotEmittable {
+                name: name.to_owned(),
+                reason: shift_amount_reason(class, projection, right, width),
+            });
         }
         return Ok(Some(BeqOperand::RawBin { op, left, right }));
     }
@@ -5999,7 +9054,10 @@ fn beq_boundary_reason(spelling: BoolDecisionSpelling, signature: &CarrierSignat
     // WHY the refusal, which is different for the two spellings: `==` HAS a row
     // and a realization since landing 6 and a computed-operand vocabulary since
     // landing 8, so reaching this text means an operand is outside a vocabulary
-    // this function can NAME; `!=` has none of it.
+    // this function can NAME; `!=` has none of it. The vocabulary is DERIVED
+    // from the rows the operand recogniser reads, never written out here: the
+    // hand-written list went stale the day `uint.xor`/`uint.shr` landed.
+    let (operators, operand_rules) = raw_binop_vocabulary();
     let diagnosis = match spelling {
         BoolDecisionSpelling::Equal => format!(
             "The `==` spelling itself IS emittable — it selects the `select.beq` row, whose \
@@ -6007,7 +9065,7 @@ fn beq_boundary_reason(spelling: BoolDecisionSpelling, signature: &CarrierSignat
              so that what the compiler reads back is the tree the kernel checked — so what is \
              outside the fragment here is an OPERAND, not the operator. Each decision operand \
              must be a source parameter, an in-range `{carrier}` numeral, or ONE raw binary \
-             operator (`&&&`, `|||`, `/`, `%`) over two such leaves; each ARM must be a \
+             operator ({operators}) over two such leaves{operand_rules}; each ARM must be a \
              parameter or an in-range numeral. Three shapes elaborate and kernel-check here and \
              are still refused, each for a realization reason and none for a decidability one: \
              a NESTED operand (`((a &&& b) ||| 1) == 0`) needs a deeper statement chain; a \
@@ -6031,12 +9089,12 @@ fn beq_boundary_reason(spelling: BoolDecisionSpelling, signature: &CarrierSignat
         ),
     };
     let first_option = match spelling {
-        BoolDecisionSpelling::Equal => {
+        BoolDecisionSpelling::Equal => format!(
             "- restate the out-of-fragment position as a parameter, an in-range numeral, or a \
-             single `&&&`/`|||`/`/`/`%` over two of those — `if a == b then a else 0`, \
-             `if a == 10 then a else b` and `if (a &&& 1) == 0 then a else b` are all emitted \
-             and kernel-gated at u8/u16/u32/u64;"
-        }
+             single one of {operators} over two of those{operand_rules} — `if a == b then a \
+             else 0`, `if a == 10 then a else b` and `if (a &&& 1) == 0 then a else b` are all \
+             emitted and kernel-gated at u8/u16/u32/u64;"
+        ),
         BoolDecisionSpelling::NotEqual => {
             "- restate the disequality as `if (a == b) = false then <then> else <else>`, which \
              IS emitted and kernel-gated at u8/u16/u32/u64 since §6f landing 8 — the arms stay \
@@ -6044,6 +9102,7 @@ fn beq_boundary_reason(spelling: BoolDecisionSpelling, signature: &CarrierSignat
              constant and never by swapping them. Or restate the branch positively — \
              `if a = b then <else-value> else <then-value>` — which elaborates to `Eq` at the \
              carrier and selects the `select.eq` row;"
+                .to_owned()
         }
     };
     format!(
@@ -6065,6 +9124,47 @@ fn beq_boundary_reason(spelling: BoolDecisionSpelling, signature: &CarrierSignat
     )
 }
 
+/// The raw-binop vocabulary in the user's syntax — the operator list, and the
+/// operand rules that restrict it as a parenthetical (empty when no row
+/// carries a rule) — DERIVED from [`table::raw_binop_rows`], which is exactly
+/// what BOTH raw-binop readers read: [`recognise_raw_binop_expr`] (the whole
+/// body) and [`recognise_raw_binop_leaf`] (the `==` decision operand).
+///
+/// Every refusal text that LISTS the family reads it from here — the `==`
+/// boundary ([`beq_boundary_reason`]), the generic fall-through in
+/// [`recognise_clean_shape`], and [`EmitRefusal::note`]'s "callable fragment"
+/// paragraph — so none of them can name an operator no row serves, or omit
+/// one a row does: adding or removing a row moves every text with it. Each
+/// rule is read from the operator's own predicate
+/// ([`RawBinOpKind::panics_at_zero_right_operand`],
+/// [`RawBinOpKind::right_operand_is_a_shift_amount`]), the same predicates
+/// both recognisers enforce. `landing7_selection_probes::l7_p15` and `l7_p16`
+/// compare each text's list with an independently written one.
+fn raw_binop_vocabulary() -> (String, String) {
+    let ops: Vec<RawBinOpKind> =
+        table::raw_binop_rows(table::CarrierClass::MachineUInt).map(|(_, op)| op).collect();
+    let quoted = |filter: &dyn Fn(RawBinOpKind) -> bool, separator: &str| {
+        ops.iter()
+            .copied()
+            .filter(|op| filter(*op))
+            .map(|op| format!("`{}`", table::raw_binop_surface_token(op)))
+            .collect::<Vec<_>>()
+            .join(separator)
+    };
+    let operators = quoted(&|_| true, ", ");
+    let mut rules = Vec::new();
+    let divisors = quoted(&RawBinOpKind::panics_at_zero_right_operand, " or ");
+    if !divisors.is_empty() {
+        rules.push(format!("a {divisors} divisor must be a strictly positive numeral"));
+    }
+    let shifts = quoted(&RawBinOpKind::right_operand_is_a_shift_amount, " or ");
+    if !shifts.is_empty() {
+        rules.push(format!("a {shifts} amount must be a numeral below the width"));
+    }
+    let rules = if rules.is_empty() { String::new() } else { format!(" ({})", rules.join("; ")) };
+    (operators, rules)
+}
+
 /// The `toNat` PROJECTION CHAIN the real elaborator spells for a `UIntN`
 /// parameter when it resolves a literal comparison's decidability by
 /// reduction to `Nat`:
@@ -6075,33 +9175,115 @@ fn beq_boundary_reason(spelling: BoolDecisionSpelling, signature: &CarrierSignat
 ///
 /// Measured 2026-08-21 on the elaborated `if a < 10 then a else b` (the C9
 /// driver-level spelling gap): the crate probes hand-built the carrier
-/// instance and admitted, but the REAL island elaboration never produces it
-/// for a literal comparison — this chain under `instDecidableNatLt` is what
-/// actually arrives. Matched exactly, fail-closed: three projections, all at
-/// field 0, in this order, over a bound parameter.
+/// instance and admitted, but the REAL island elaboration of every Clean pin
+/// before `c91fa93f5` never produced it for a literal comparison — this chain
+/// under `instDecidableNatLt` is what arrived. (From `c91fa93f5` on, the
+/// carrier instance IS what arrives; see [`carrier_instance_numeral`]. Both
+/// are read, so the reading does not depend on the pin.) Matched exactly,
+/// fail-closed: three projections, all at field 0, in this order, over a
+/// bound parameter.
 fn to_nat_projection_param(expr: &Expr, carrier: &str, arity: usize) -> Option<usize> {
     let ExprKind::Proj(fin, 0, inner) = strip_mdata(expr).kind() else {
         return None;
     };
-    if fin.to_string() != "Fin" {
+    if !name_display_eq_str(fin, "Fin") {
         return None;
     }
     let ExprKind::Proj(bitvec, 0, inner) = strip_mdata(inner).kind() else {
         return None;
     };
-    if bitvec.to_string() != "BitVec" {
+    if !name_display_eq_str(bitvec, "BitVec") {
         return None;
     }
     let ExprKind::Proj(c, 0, inner) = strip_mdata(inner).kind() else {
         return None;
     };
-    if c.to_string() != carrier {
+    if !name_display_eq_str(c, carrier) {
         return None;
     }
     match strip_mdata(inner).kind() {
         &ExprKind::BVar(index) if (index as usize) < arity => Some(arity - 1 - index as usize),
         _ => None,
     }
+}
+
+/// The RIGHT operand of a CARRIER decision instance for a literal comparison
+/// (`instDecidable{C}Lt a <operand>`), read as the numeral it spells — or
+/// `None`.
+///
+/// Measured 2026-09-23 at the superproject's Clean pin `dca882b5f`, the first
+/// to carry Clean `c91fa93f5`: for `if a < 10 then a else b` the island
+/// elaborates the PROPOSITION's right operand as the carrier numeral
+/// `UInt64.ofNat 10`, but the INSTANCE's right operand as that same numeral
+/// unfolded one δβ step — the value `clean-kernel`'s `init_uint_type` gives
+/// `{C}.ofNat`, applied to the literal:
+///
+/// ```text
+/// {C}.ofBitVec (BitVec.ofFin (@OfNat.ofNat.{0} Nat w (instOfNatNat w))
+///                            (@Fin.ofNat (2^w - 1) LIT))
+/// ```
+///
+/// identically at UInt8/16/32/64 (`Fin.ofNat {n} a : Fin (n + 1)` is
+/// `a % (n + 1)`, so the modulus is `2^w`). The two numeral spellings
+/// [`numeral_leaf`] reads are accepted as well, so an instance applied to the
+/// proposition's own operand term reads too.
+///
+/// Read EXACTLY, fail-closed: THIS carrier's `ofBitVec` constructor, THIS
+/// carrier's width `w` (the width literal is read through
+/// [`read_nat_numeral`]; the kernel already typed side A, which pins it to
+/// `w` anyway), the modulus predecessor `2^w - 1` as a bare literal, and the
+/// value as a bare `Nat` literal. The reading is the RAW literal — the same
+/// convention [`numeral_leaf`] applies to the proposition's operand — and the
+/// modular reduction is NEVER performed here: `Fin.ofNat (2^w - 1) (2^w + 10)`,
+/// which the kernel reduces to `10`, does not read as `10`, so it fails to
+/// match the proposition's `10` and the tree falls to the fragment refusal
+/// (fail-closed costs capability, never soundness); a fitting but over-width
+/// raw value that does match reaches the plan-time range re-check, which
+/// refuses it by name.
+fn carrier_instance_numeral(expr: &Expr, carrier: &str, width: u32) -> Option<NatReading> {
+    if let Some(reading) = numeral_leaf(expr, carrier) {
+        return Some(reading);
+    }
+    // `2^w - 1`, fail-closed on a width no machine carrier has.
+    let modulus_pred = 1u128.checked_shl(width)?.checked_sub(1)?;
+    let is_const = |node: &Expr, name: &str| {
+        matches!(strip_mdata(node).kind(), ExprKind::Const(n, levels)
+            if name_display_eq_str(n, name) && levels.is_empty())
+    };
+    let (ctor, ctor_args) = uncurry(expr);
+    let [bitvec] = ctor_args[..] else {
+        return None;
+    };
+    let ctor_ok = matches!(strip_mdata(ctor).kind(), ExprKind::Const(n, levels)
+        if levels.is_empty()
+            && (name_eq2(n, carrier, "ofBitVec")
+                || matches!(n.inner(), NameInner::Str(p, s)
+                    if p.is_anon()
+                        && s.strip_prefix(carrier)
+                            .and_then(|r| r.strip_prefix('.'))
+                            == Some("ofBitVec"))));
+    if !ctor_ok {
+        return None;
+    }
+    let (of_fin, of_fin_args) = uncurry(bitvec);
+    let [bitvec_width, fin] = of_fin_args[..] else {
+        return None;
+    };
+    if !is_const(of_fin, "BitVec.ofFin")
+        || read_nat_numeral(bitvec_width) != Some(NatReading::Fits(u128::from(width)))
+    {
+        return None;
+    }
+    let (fin_of_nat, fin_args) = uncurry(fin);
+    let [pred, literal] = fin_args[..] else {
+        return None;
+    };
+    if !is_const(fin_of_nat, "Fin.ofNat")
+        || nat_literal(pred) != Some(NatReading::Fits(modulus_pred))
+    {
+        return None;
+    }
+    nat_literal(literal)
 }
 
 /// Uncurry an application spine, stripping metadata between every node:
@@ -6117,6 +9299,172 @@ fn uncurry(expr: &Expr) -> (&Expr, Vec<&Expr>) {
     }
     args.reverse();
     (cursor, args)
+}
+
+#[inline]
+fn spine_head(expr: &Expr) -> &Expr {
+    let mut cursor = strip_mdata(expr);
+    while let ExprKind::App(function, _) = cursor.kind() {
+        cursor = strip_mdata(function);
+    }
+    cursor
+}
+
+#[inline]
+fn name_eq1(name: &Name, s0: &str) -> bool {
+    matches!(name.inner(), NameInner::Str(parent, s) if parent.is_anon() && s.as_ref() == s0)
+}
+
+#[inline]
+fn name_eq2(name: &Name, s0: &str, s1: &str) -> bool {
+    matches!(
+        name.inner(),
+        NameInner::Str(parent, seg1)
+            if seg1.as_ref() == s1
+                && matches!(
+                    parent.inner(),
+                    NameInner::Str(root, seg0) if root.is_anon() && seg0.as_ref() == s0
+                )
+    )
+}
+
+#[inline]
+fn name_eq_str(mut name: &Name, expected: &str) -> bool {
+    if expected.is_empty() || expected == "[anonymous]" {
+        return name.is_anon();
+    }
+    for part in expected.rsplit('.') {
+        if part.is_empty() {
+            continue;
+        }
+        match (name.inner(), part.parse::<u64>()) {
+            (NameInner::Num(parent, n), Ok(num)) if *n == num => {
+                name = parent;
+            }
+            (NameInner::Str(parent, s), Err(_)) if s.as_ref() == part => {
+                name = parent;
+            }
+            _ => return false,
+        }
+    }
+    name.is_anon()
+}
+
+#[inline]
+fn name_display_eq_str(name: &Name, expected: &str) -> bool {
+    name_eq_str(name, expected)
+        || matches!(name.inner(), NameInner::Str(parent, s) if parent.is_anon() && s.as_ref() == expected)
+}
+
+/// The prelude classes whose homogeneous dictionary Clean may also spell
+/// through Lean's `@[default_instance]` bridge, with the homogeneous class
+/// the bridge takes as its premise.
+///
+/// Only `>>>` is here. Since clean `d2d5868b7` (2026-11-10, "require genuine
+/// homogeneous premises for shift numeral defaults") Clean resolves a NUMERAL
+/// shift amount's dictionary the way Lean does: `a >>> 3` elaborates through
+/// `instance [ShiftRight α] : HShiftRight α α α` applied to the prelude's own
+/// `instShiftRight{C}`, while `a >>> b` keeps the direct `instHShiftRight{C}`
+/// (`l7_p11` pins both). `<<<` takes the same bridge, but no raw-binop row
+/// serves it (its demand is `Missing` in `table.rs`), so its bridge is not
+/// admitted here: a widening is an increment with a probe.
+const PRELUDE_DEFAULT_INSTANCE_BRIDGES: [(&str, &str); 1] = [("HShiftRight", "ShiftRight")];
+
+/// Whether `instance` is the prelude's homogeneous `{class}` dictionary at
+/// `carrier`, in one of the two spellings the pinned elaborator produces:
+///
+/// * `inst{class}{carrier}`, the instance Clean registers directly at
+///   `{class} C C C`; or
+/// * for a class in [`PRELUDE_DEFAULT_INSTANCE_BRIDGES`] only,
+///   `@inst{class}.{0} {carrier} inst{premise}{carrier}`: the default bridge
+///   applied to the prelude's own homogeneous instance.
+///
+/// Every other dictionary term is refused, as before: a user instance, a
+/// namespaced name, the bridge over a user `ShiftRight` instance, at another
+/// carrier or another universe. This is the capability fence, not the proof.
+/// Side B is built from the emitted MIR alone, and the kernel still decides
+/// definitional equality against side A's own term.
+fn is_prelude_homogeneous_instance(instance: &Expr, class: &str, carrier: &str) -> bool {
+    if matches!(instance.kind(), ExprKind::Const(n, _) if name_eq1_concat(n, &["inst", class, carrier]))
+    {
+        return true;
+    }
+    let Some(&(_, premise)) =
+        PRELUDE_DEFAULT_INSTANCE_BRIDGES.iter().find(|(bridged, _)| *bridged == class)
+    else {
+        return false;
+    };
+    let (head, args) = uncurry(instance);
+    let ExprKind::Const(bridge, levels) = head.kind() else {
+        return false;
+    };
+    let [carrier_arg, dictionary] = args[..] else {
+        return false;
+    };
+    name_eq1_concat(bridge, &["inst", class])
+        && levels.len() == 1
+        && levels[0].is_zero()
+        && matches!(carrier_arg.kind(), ExprKind::Const(n, l) if l.is_empty() && name_eq_str(n, carrier))
+        && matches!(dictionary.kind(), ExprKind::Const(n, l)
+            if l.is_empty() && name_eq1_concat(n, &["inst", premise, carrier]))
+}
+
+/// The v7/D3 refusal for a raw or wrapping operator whose dictionary is not
+/// one [`is_prelude_homogeneous_instance`] accepts.
+fn non_prelude_instance_reason(class: &str, projection: &str, carrier: &str) -> String {
+    let expected = match PRELUDE_DEFAULT_INSTANCE_BRIDGES.iter().find(|(c, _)| *c == class) {
+        Some((_, premise)) => format!(
+            "`inst{class}{carrier}` (or its default-instance bridge `inst{class}` over the \
+             prelude's `inst{premise}{carrier}`)"
+        ),
+        None => format!("`inst{class}{carrier}`"),
+    };
+    format!(
+        "its `{class}.{projection}` at `{carrier}` routes through an instance other than the \
+         prelude's homogeneous {expected}; only the prelude instance is in the measured \
+         emittable fragment (a user instance may be kernel-reducible to it, but the compiler \
+         will not guess — spell the op so it elaborates through the prelude instance, or keep \
+         the definition for proof position)"
+    )
+}
+
+#[inline]
+fn name_eq1_concat(name: &Name, parts: &[&str]) -> bool {
+    let NameInner::Str(parent, s) = name.inner() else {
+        return false;
+    };
+    if !parent.is_anon() {
+        return false;
+    }
+    let mut rem = s.as_ref();
+    for &part in parts {
+        let Some(next) = rem.strip_prefix(part) else {
+            return false;
+        };
+        rem = next;
+    }
+    rem.is_empty()
+}
+
+#[inline]
+fn name_ends_with_of_nat(name: &Name) -> bool {
+    matches!(
+        name.inner(),
+        NameInner::Str(parent, s)
+            if (!parent.is_anon() && s.as_ref() == "ofNat") || s.ends_with(".ofNat")
+    )
+}
+
+#[inline]
+fn uint_carrier_name(width: u32) -> Option<&'static str> {
+    match width {
+        8 => Some("UInt8"),
+        16 => Some("UInt16"),
+        32 => Some("UInt32"),
+        64 => Some("UInt64"),
+        128 => Some("UInt128"),
+        _ => None,
+    }
 }
 
 /// Attempt to read a fully-peeled body as a wrapping-arithmetic expression at
@@ -6154,11 +9502,12 @@ fn recognise_wrapping_expr(
     if !matches!(width, 8 | 16 | 32 | 64) {
         return Ok(None);
     }
-    let carrier_name = signature.result().clean().name();
+    let Some(carrier_name) = uint_carrier_name(width) else {
+        return Ok(None);
+    };
 
     let mut ops = 0usize;
-    let Some(tree) = recognise_arith_tree(name, body, arity, &carrier_name, width, &mut ops)?
-    else {
+    let Some(tree) = recognise_arith_tree(name, body, arity, carrier_name, width, &mut ops)? else {
         return Ok(None);
     };
     match tree {
@@ -6220,7 +9569,7 @@ fn recognise_arith_tree(
         let Some(suffix) = table::carrier_method_suffix(selected) else {
             continue;
         };
-        if *head_name != Name::from_string(&format!("{carrier_name}.{suffix}")) {
+        if !name_eq2(head_name, carrier_name, suffix) {
             continue;
         }
         let [lhs, rhs] = args[..] else {
@@ -6234,36 +9583,24 @@ fn recognise_arith_tree(
         let Some((class, projection)) = table::surface_class(selected) else {
             continue;
         };
-        if *head_name != Name::from_string(&format!("{class}.{projection}")) {
+        if !name_eq2(head_name, class, projection) {
             continue;
         }
         let [t1, t2, t3, instance, lhs, rhs] = args[..] else {
             return Ok(None);
         };
-        let carrier_const = Name::from_string(carrier_name);
         let is_carrier =
-            |t: &Expr| matches!(t.kind(), ExprKind::Const(n, _) if *n == carrier_const);
+            |t: &Expr| matches!(t.kind(), ExprKind::Const(n, _) if name_eq_str(n, carrier_name));
         if !(is_carrier(t1) && is_carrier(t2) && is_carrier(t3)) {
             // A heterogeneous instantiation. Outside both measured spellings;
             // fall through to the generic fragment refusal.
             return Ok(None);
         }
-        let expected_instance = format!("inst{class}{carrier_name}");
-        match instance.kind() {
-            ExprKind::Const(n, _) if *n == Name::from_string(&expected_instance) => {}
-            _ => {
-                return Err(EmitRefusal::NotEmittable {
-                    name: name.to_owned(),
-                    reason: format!(
-                        "its `{class}.{projection}` at `{carrier_name}` routes through an \
-                         instance other than the prelude's homogeneous `{expected_instance}`; \
-                         only the prelude instance is in the measured emittable fragment \
-                         (a user instance may be kernel-reducible to it, but the compiler \
-                         will not guess — spell the op so it elaborates through the \
-                         prelude instance, or keep the definition for proof position)"
-                    ),
-                });
-            }
+        if !is_prelude_homogeneous_instance(instance, class, carrier_name) {
+            return Err(EmitRefusal::NotEmittable {
+                name: name.to_owned(),
+                reason: non_prelude_instance_reason(class, projection, carrier_name),
+            });
         }
         return recognise_arith_node(name, op, lhs, rhs, arity, carrier_name, width, ops);
     }
@@ -6301,13 +9638,16 @@ fn recognise_arith_node(
 }
 
 /// **§6f LANDING 7 — the RAW-BINOP spine.** `fun x0 … x_{n-1} => xl <op> xr`
-/// for `<op>` one of `&&&`, `|||`, `/`, `%` at an unsigned machine width.
+/// for `<op>` one of the raw-binop rows' operators at an unsigned machine
+/// width — `&&&`, `|||`, `/`, `%` since landing 7, `^^^` and `>>>` since clean
+/// `bf31976f48` (the set is read from `table::raw_binop_rows`, never from this
+/// comment).
 ///
 /// Side A carries ONE spelling — the homogeneous SURFACE class at the prelude
 /// instance:
 ///
 /// ```text
-/// H{And,Or,Div,Mod}.h{And,Or,Div,Mod}.{0,0,0} {C} {C} {C} instH{…}{C} lhs rhs
+/// H{And,Or,Div,Mod,Xor,ShiftRight}.h{…}.{0,0,0} {C} {C} {C} instH{…}{C} lhs rhs
 /// ```
 ///
 /// and that is a MEASUREMENT, not a narrowing. At the clean pin `bad1fd5f8` a
@@ -6360,7 +9700,9 @@ fn recognise_raw_binop_expr(
     if !matches!(width, 8 | 16 | 32 | 64) {
         return Ok(None);
     }
-    let carrier_name = signature.result().clean().name();
+    let Some(carrier_name) = uint_carrier_name(width) else {
+        return Ok(None);
+    };
 
     let (head, args) = uncurry(body);
     let ExprKind::Const(head_name, _levels) = head.kind() else {
@@ -6368,46 +9710,34 @@ fn recognise_raw_binop_expr(
     };
 
     // The operator vocabulary is READ FROM THE TABLE, exactly as the wrapping
-    // descent's is since landing 1 — the four heads are a `raw_binop_rows`
+    // descent's is since landing 1 — the heads are a `raw_binop_rows`
     // filter, never a literal in this function.
     for (selected, op) in table::raw_binop_rows(table::CarrierClass::MachineUInt) {
         let Some((class, projection)) = table::surface_class(selected) else {
             continue;
         };
-        if *head_name != Name::from_string(&format!("{class}.{projection}")) {
+        if !name_eq2(head_name, class, projection) {
             continue;
         }
         let [t1, t2, t3, instance, lhs, rhs] = args[..] else {
             return Ok(None);
         };
-        let carrier_const = Name::from_string(&carrier_name);
         let is_carrier =
-            |t: &Expr| matches!(t.kind(), ExprKind::Const(n, _) if *n == carrier_const);
+            |t: &Expr| matches!(t.kind(), ExprKind::Const(n, _) if name_eq_str(n, carrier_name));
         if !(is_carrier(t1) && is_carrier(t2) && is_carrier(t3)) {
             // A heterogeneous instantiation. Outside the measured spelling;
             // fall through to the generic fragment refusal.
             return Ok(None);
         }
-        let expected_instance = format!("inst{class}{carrier_name}");
-        match instance.kind() {
-            ExprKind::Const(n, _) if *n == Name::from_string(&expected_instance) => {}
-            _ => {
-                return Err(EmitRefusal::NotEmittable {
-                    name: name.to_owned(),
-                    reason: format!(
-                        "its `{class}.{projection}` at `{carrier_name}` routes through an \
-                         instance other than the prelude's homogeneous `{expected_instance}`; \
-                         only the prelude instance is in the measured emittable fragment \
-                         (a user instance may be kernel-reducible to it, but the compiler \
-                         will not guess — spell the op so it elaborates through the \
-                         prelude instance, or keep the definition for proof position)"
-                    ),
-                });
-            }
+        if !is_prelude_homogeneous_instance(instance, class, carrier_name) {
+            return Err(EmitRefusal::NotEmittable {
+                name: name.to_owned(),
+                reason: non_prelude_instance_reason(class, projection, carrier_name),
+            });
         }
         let (Some(left), Some(right)) = (
-            recognise_arith_operand(name, lhs, arity, &carrier_name, width)?,
-            recognise_arith_operand(name, rhs, arity, &carrier_name, width)?,
+            recognise_arith_operand(name, lhs, arity, carrier_name, width)?,
+            recognise_arith_operand(name, rhs, arity, carrier_name, width)?,
         ) else {
             // A nested spine, or an operand outside the leaf vocabulary. Not a
             // shape this row realizes; the generic refusal names the boundary,
@@ -6424,6 +9754,18 @@ fn recognise_raw_binop_expr(
                     });
                 }
             }
+        }
+        // THE SHIFT-AMOUNT RULE. Not a soundness rule — MIR `Shr` and Lean's
+        // `{C}.shiftRight` both reduce the amount modulo the width, so no
+        // amount is a wrong binary — but a CAPABILITY one: the frozen producer
+        // mints side B only for a literal amount strictly below the width, and
+        // a plan it cannot reflect is refused here, with the user's options,
+        // rather than at the gate with the producer's.
+        if op.right_operand_is_a_shift_amount() && !shift_amount_has_a_side_b(right, width) {
+            return Err(EmitRefusal::NotEmittable {
+                name: name.to_owned(),
+                reason: shift_amount_reason(class, projection, right, width),
+            });
         }
         return Ok(Some(CleanOriginShape::RawBinOp { op, left, right }));
     }
@@ -6516,6 +9858,69 @@ fn unsafe_divisor_reason(class: &str, projection: &str, right: ArithOperand) -> 
     reason
 }
 
+/// **The shift-amount rule**: a `>>` is planned only at a NUMERAL amount
+/// strictly below the carrier's width.
+///
+/// Stated once, and read by both raw-binop recognisers and both sealed-plan
+/// checks. It has the divisor rule's SHAPE and not its REASON. Nothing about
+/// the amount can make the emitted body compute a different function: MIR's
+/// `BinOp::Shr` takes it as `RHS.rem_euclid(LHS::BITS)` and Lean's
+/// `{C}.shiftRight` as `Nat.mod b.toNat N`, the same reduction. What the rule
+/// tracks is side B: the frozen `elab_term` mints `x >> k` only for a literal
+/// `k` below the width, so any other amount leaves the kernel nothing to
+/// compare against (`landing7_selection_probes::l7_p14`).
+fn shift_amount_has_a_side_b(amount: ArithOperand, width: u32) -> bool {
+    matches!(amount, ArithOperand::Const(k) if k < u128::from(width))
+}
+
+/// **Ruling v7/D3, on the shift-amount rule.** Names the boundary as what it
+/// is — a missing side B, not a semantic gap — so the user is not told their
+/// program is wrong, and offers the fix that preserves meaning: for an
+/// out-of-range literal the reduced amount `k % N` IS the declared function,
+/// because Lean reduces the amount modulo the width.
+///
+/// It speaks of the EMITTED operation — MIR's `BinOp::Shr`, which reduces the
+/// amount modulo the width and has no overflow case — and says so, because the
+/// Rust SOURCE expression `a >> b` is a different operation at an amount of
+/// `N` or more (it carries a debug-build overflow check), and a reader who
+/// knows only the source operator would otherwise read "agree at every
+/// amount" as false.
+fn shift_amount_reason(class: &str, projection: &str, amount: ArithOperand, width: u32) -> String {
+    let (found, reduced) = match amount {
+        ArithOperand::Const(k) => (
+            format!("the numeral `{k}`, which is not below the width {width}"),
+            Some(k % u128::from(width)),
+        ),
+        ArithOperand::Param(index) => (format!("parameter {index}, a VARIABLE amount"), None),
+    };
+    let mut reason = format!(
+        "its `{class}.{projection}` amount is {found}, and this lane emits the shift — a bare \
+         MIR `Shr` operation — ONLY at a numeral amount strictly below the carrier's width. This \
+         is a capability boundary of the compiler, not a problem with your program: Lean's `>>>` \
+         at `UInt{width}` shifts by the amount modulo {width}, and so does the emitted MIR `Shr`, \
+         which takes its amount as `RHS.rem_euclid({width})`, so the declaration and the emitted \
+         operation AGREE at every amount. (That is the MIR operation, not the Rust source \
+         expression `a >> b`, which carries a debug-build overflow check at an amount of \
+         {width} or more; the emitted body has no such check and needs none.) What is missing \
+         is the independent reflection the kernel checks the emitted body against — the frozen \
+         producer mints a shift only at a literal amount below the width.\n\
+         options:\n"
+    );
+    if let Some(reduced) = reduced {
+        reason.push_str(&format!(
+            "         - write the reduced amount (`a >>> {reduced}`): Lean reduces the amount \
+             modulo {width}, so it is the SAME function, and it is emitted today;\n"
+        ));
+    }
+    reason.push_str(
+        "         - write the computation as a Rust `fn` and prove it agrees with the \
+         declaration in an `ensures` clause;\n\
+         \x20        - cite the declaration from a contract instead of calling it: proof \
+         position needs no emitted body and has no shift-amount restriction.",
+    );
+    reason
+}
+
 /// Read one LEAF of a wrapping-arithmetic expression: a bound parameter, or
 /// an in-range numeral in either measured spelling (`{C}.ofNat n`, or
 /// `OfNat.ofNat {C} n (instOfNat{C} n)` with the two literals equal).
@@ -6562,7 +9967,7 @@ fn numeral_leaf(operand: &Expr, carrier_name: &str) -> Option<NatReading> {
     };
 
     // ── carrier numeral: `{C}.ofNat n` ──────────────────────────────────────
-    if *head_name == Name::from_string(&format!("{carrier_name}.ofNat")) {
+    if name_eq2(head_name, carrier_name, "ofNat") {
         let [literal] = args[..] else {
             return None;
         };
@@ -6570,18 +9975,18 @@ fn numeral_leaf(operand: &Expr, carrier_name: &str) -> Option<NatReading> {
     }
 
     // ── surface numeral: `OfNat.ofNat {C} n (instOfNat{C} n)` ───────────────
-    if *head_name == Name::from_string("OfNat.ofNat") {
+    if name_eq2(head_name, "OfNat", "ofNat") {
         let [ty, literal, instance] = args[..] else {
             return None;
         };
-        if !matches!(ty.kind(), ExprKind::Const(n, _) if *n == Name::from_string(carrier_name)) {
+        if !matches!(ty.kind(), ExprKind::Const(n, _) if name_eq_str(n, carrier_name)) {
             return None;
         }
         let value = nat_literal(literal)?;
         let (instance_head, instance_args) = uncurry(instance);
         if !matches!(
             instance_head.kind(),
-            ExprKind::Const(n, _) if *n == Name::from_string(&format!("instOfNat{carrier_name}"))
+            ExprKind::Const(n, _) if name_eq1_concat(n, &["instOfNat", carrier_name])
         ) {
             return None;
         }
@@ -6644,29 +10049,115 @@ fn in_range_numeral(
 /// The kernel HEAD of a term, spelled exactly when it is a constant.
 ///
 /// This is the coordinate a [`table::SelectionRow`] is keyed on, so it is what
-/// a `no selection row for …` citation must carry (§6f landing 1, ruling
-/// v7/D3). For a non-constant head it falls back to [`render_head`]'s category,
-/// which is still a legible coordinate ("a lambda" has no row either).
+/// the whole-body refusal's row citation must carry (§6f landing 1, ruling
+/// v7/D3) and what [`table::rows_selecting_head`] is asked about. For a
+/// non-constant head it falls back to [`render_head`]'s category, which is
+/// still a legible coordinate ("a lambda" has no row either, and no selector
+/// is keyed on a category).
 fn head_label(cursor: &Expr) -> String {
-    let (head, _args) = uncurry(cursor);
+    let head = spine_head(cursor);
     match head.kind() {
         ExprKind::Const(name, _) => name.to_string(),
         other => render_head(other).to_owned(),
     }
 }
 
-/// The [`table::CarrierClass`] a plan's signature is stated over.
+/// The [`table::CarrierClass`] of a plan's RESULT carrier — the
+/// [`table::CarrierAnchor::Result`] position, and the coordinate a TRUE row
+/// miss is named at (`table::no_selection_row`).
 ///
-/// Derived from the RESULT carrier, which is the position every row's carrier
-/// class is anchored on: the arithmetic and select rows additionally require
-/// every position to share it, and that requirement lives in the recognisers,
-/// not here.
+/// This is the result-only reading this site used before any row was
+/// consulted, restored verbatim: the no-row text must stay byte-identical,
+/// carrier included. A `Bool` result is `AnyExact` HERE, whatever its
+/// arguments; the rows whose class is a claim about another position — the
+/// `comparison.*` rows (the compared width) and the `bool.*` rows (their `Bool`
+/// operands) — are matched at THAT position by [`anchored_carriers`], row by
+/// row, rather than by re-reading this one.
 fn carrier_class_of(signature: &CarrierSignature) -> table::CarrierClass {
-    match signature.result().clean() {
+    carrier_class_of_type(signature.result().clean())
+}
+
+/// The [`table::CarrierClass`] a single Clean carrier falls in.
+fn carrier_class_of_type(clean: CleanType) -> table::CarrierClass {
+    match clean {
         CleanType::UInt(8 | 16 | 32 | 64) => table::CarrierClass::MachineUInt,
         CleanType::Nat => table::CarrierClass::BignumNat,
         _ => table::CarrierClass::AnyExact,
     }
+}
+
+/// The carrier class at each [`table::CarrierAnchor`] position of the body
+/// whose head is `cursor` — what the whole-body refusal matches each row's own
+/// position against (`table::rows_selecting_head`).
+fn anchored_carriers(
+    env: &Environment,
+    cursor: &Expr,
+    signature: &CarrierSignature,
+) -> table::AnchoredCarriers {
+    table::AnchoredCarriers {
+        result: carrier_class_of(signature),
+        compared_operands: compared_operand_carrier(cursor).map(carrier_class_of_type),
+        head_operands: head_operand_carrier(env, cursor).map(carrier_class_of_type),
+    }
+}
+
+/// The carrier a `Bool`-valued head's comparison is STATED AT — the
+/// [`table::CarrierAnchor::ComparedOperands`] position.
+///
+/// It is the position [`recognise_decide_comparison`] checks against the
+/// parameters' width: the type argument of the proposition under `decide`
+/// (`LT.lt {C} …`, `Eq {C} …`), or `BEq.beq`'s own `{C}`. It is read here for
+/// ANY relation stated at a carrier (`GT.gt {C}` and `GE.ge {C}` are what `a >
+/// b` and `a >= b` elaborate to) because the relation is SHAPE — a comparison
+/// the rows do not realize in that spelling is still a comparison at `{C}`, and
+/// its refusal should say the head is served there. A proposition that is not
+/// an application of a relation to a carrier type (`a ≠ b` elaborates to the
+/// arrow `a = b → False`; a conjunction's first argument is a proposition)
+/// has no such position, and `None` makes the comparison rows select nothing.
+fn compared_operand_carrier(cursor: &Expr) -> Option<CleanType> {
+    let (head, args) = uncurry(cursor);
+    let ExprKind::Const(head_name, _) = head.kind() else {
+        return None;
+    };
+    let stated_at = if name_display_eq_str(head_name, "decide")
+        || name_display_eq_str(head_name, "Decidable.decide")
+    {
+        let (_relation, relation_args) = uncurry(args.first()?);
+        *relation_args.first()?
+    } else if name_display_eq_str(head_name, "BEq.beq") {
+        *args.first()?
+    } else {
+        return None;
+    };
+    trust_clean_carrier::recognize(stated_at).filter(|clean| *clean != CleanType::Sort)
+}
+
+/// The carrier the head CONSTANT's explicit operands are declared at — the
+/// [`table::CarrierAnchor::HeadOperands`] position — read from the constant's
+/// kernel type, not from a list: `Bool.not : Bool → Bool` and `and`/`or :
+/// Bool → Bool → Bool` (measured in the island prelude) give `Bool`.
+///
+/// `None` when the head is not a constant of the environment, has no explicit
+/// binder, or its explicit binders do not all sit at ONE modeled carrier —
+/// `decide`'s is a `Prop`, `BEq.beq`'s are the bound `α`.
+fn head_operand_carrier(env: &Environment, cursor: &Expr) -> Option<CleanType> {
+    let head = spine_head(cursor);
+    let ExprKind::Const(head_name, _) = head.kind() else {
+        return None;
+    };
+    let mut ty = &env.get_const(head_name)?.type_;
+    let mut shared: Option<CleanType> = None;
+    while let ExprKind::Pi(binder, domain, body) = strip_mdata(ty).kind() {
+        if binder.info == clean_kernel::BinderInfo::Default {
+            let clean = trust_clean_carrier::recognize(domain)?;
+            if clean == CleanType::Sort || shared.is_some_and(|seen| seen != clean) {
+                return None;
+            }
+            shared = Some(clean);
+        }
+        ty = body;
+    }
+    shared
 }
 
 /// The head constructor of an expression, for a diagnostic that names what was
@@ -6679,7 +10170,7 @@ fn carrier_class_of(signature: &CarrierSignature) -> table::CarrierClass {
 /// this fragment refuses. Where the useful fact is *which* constant is applied,
 /// this says so, and falls back to `render_head` for a non-constant head.
 fn render_spine_head(expr: &Expr) -> String {
-    let (head, _) = uncurry(strip_mdata(expr));
+    let head = spine_head(expr);
     match head.kind() {
         ExprKind::Const(name, _) => format!("`{name}`"),
         other => render_head(other).to_owned(),
@@ -6749,7 +10240,7 @@ fn reflection_name(name: &str) -> String {
 ///    [`trust_spec_elab::admit_select_literal_function`] (select-vs-literal,
 ///    R2/C9) — each FULL-KERNEL-CHECKS the reflected defining equation;
 /// 4. the kernel must identify that term with side A —
-///    [`check_faithful`], **at the carrier type**.
+///    [`crate::gate::check_faithful`], **at the carrier type**.
 ///
 /// # Errors
 ///
@@ -6874,6 +10365,39 @@ pub fn admit_lowering(
     if let CleanOriginShape::RawBinOp { op, left, right } = &plan.shape {
         return admit_raw_binop_lowering(env, plan, extracted, *op, *left, *right);
     }
+    // ── W5 (Lean-calls-Rust): the Rust-call chain ──────────────────────────
+    //
+    // Same accounting as every arm above, and it binds hardest of all here:
+    // this shape's body is "a chain of calls to USER functions", and a
+    // reading of it in `recognize_admissible_body`'s chain would let the
+    // gate-free E6 kernel-import direction import `fn f(x) { g(x) }` as the
+    // defining equation `f = g` with `g` opaque — a false definitional
+    // import. The capability is reached through
+    // `recognize_rust_call_chain`, a SEPARATE entry point that also demands
+    // an explicit allow-list of callee renderings, and
+    // `control_23_rust_call_emitter_mutation::half_7` pins that the same
+    // body still reads back as `None` from the chain.
+    if let CleanOriginShape::RustCallChain { nodes } = &plan.shape {
+        return admit_rust_call_chain_lowering(env, plan, extracted, nodes);
+    }
+    // ── W6 (Rust-calls-Clean): the boolean negation/connective ─────────────
+    //
+    // Same accounting as the select/beq/raw-binop arms above: this shape's
+    // reading is produced ONLY by the separate entry point
+    // `recognize_bool_value`, which is NOT in `recognize_admissible_body`'s
+    // chain, so the gate-free E6 kernel-import direction cannot reach it.
+    if matches!(
+        &plan.shape,
+        CleanOriginShape::BoolNot { .. } | CleanOriginShape::BoolConnective { .. }
+    ) {
+        return admit_bool_value_lowering(env, plan, extracted);
+    }
+    if matches!(&plan.shape, CleanOriginShape::UnsignedConditional { .. }) {
+        return admit_unsigned_conditional_lowering(env, plan, extracted);
+    }
+    if matches!(&plan.shape, CleanOriginShape::BoolExpression { .. }) {
+        return admit_bool_expression_lowering(env, plan, extracted);
+    }
 
     // ── 1. the compiler's own recognizer, on the emitted body ──────────────
     let Some(recognised) = recognize_admissible_body(extracted) else {
@@ -6961,6 +10485,21 @@ pub fn admit_lowering(
             && literal == emitted_lit
             && then_param == emitted_then
             && else_param == emitted_else => {}
+        // W6 (Rust-calls-Clean): the comparison-to-`Bool` value. Side B reads
+        // the one-block `_0 = <cmp>(l, r)` as `ComparisonBool`, whose operands
+        // are `CmpOperand::Param` here (this shape admits no numeral operand).
+        // The `cmp` and both operands must agree; the gate then re-decides
+        // definitional equality of the reflected term against the declaration.
+        (
+            CleanOriginShape::DecideComparison { cmp, cmp_left, cmp_right },
+            AdmissibleBody::ComparisonBool {
+                cmp: emitted_cmp,
+                left: emitted_left,
+                right: emitted_right,
+            },
+        ) if cmp == emitted_cmp
+            && *emitted_left == trust_types::admissible_body::CmpOperand::Param(*cmp_left)
+            && *emitted_right == trust_types::admissible_body::CmpOperand::Param(*cmp_right) => {}
         _ => {
             return Err(EmitRefusal::LoweringShapeMismatch {
                 name: name.to_owned(),
@@ -7079,6 +10618,23 @@ pub fn admit_lowering(
             then_param,
             else_param,
         ),
+        // W6 (Rust-calls-Clean): the comparison-to-`Bool` reflection, through
+        // the FROZEN `admit_comparison_function`. It does its own single-domain
+        // and Machine/Signed guards over `param_domains` — read off the emitted
+        // body's OWN types above — so a mixed-width or non-machine emission
+        // fails closed inside the producer. The minted term is
+        // `Decidable.decide <prop> <inst>`, def-eq to the island's
+        // `decide`/`BEq.beq` (measured 2026-09-13).
+        crate::reflect::ProducerCall::Comparison { cmp, cmp_left, cmp_right } => {
+            trust_spec_elab::admit_comparison_function(
+                &mut scratch,
+                &reflected_name,
+                &param_domains,
+                cmp,
+                cmp_left,
+                cmp_right,
+            )
+        }
         // §6f landing 3: unreachable on THIS lane by construction, and the
         // arm is fail-closed rather than a builder. The general select is a
         // reading produced only by `recognize_select_general`, which is not in
@@ -7136,7 +10692,161 @@ pub fn admit_lowering(
     // Admitted at the RESULT carrier: that is the value a call produces, and
     // the plan's `CarrierSignature` is already the statement that every
     // argument position carries too (it cannot exist otherwise).
-    Ok(check_faithful(env, name, &side_b, plan.result_carrier())?)
+    Ok(check_faithful_for_name(env, plan.declaration(), &side_b, plan.result_carrier())?)
+}
+
+/// **W5 (Lean-calls-Rust) — the RUST-CALL CHAIN round trip**, the same four
+/// fail-closed steps as every other separate-entry-point lane:
+///
+/// 1. the emitted body must be recognised by
+///    [`trust_types::admissible_body::recognize_rust_call_chain`] — trust-types'
+///    reading of the linear call chain, given the ALLOW-LIST of callee
+///    renderings the plan's table carries, and deliberately outside
+///    `recognize_admissible_body`'s chain (see the arm in [`admit_lowering`]);
+/// 2. the recognised body must equal the PLANNED chain node for node — the
+///    structural catch, never a substitute for the kernel one. Identity is
+///    the extractor's rendering of the callee `DefId` against the table's
+///    rendering of the registered `DefId`: two renderings of ONE identity,
+///    never a bare name;
+/// 3. it must reflect through [`crate::reflect_rust_call::reflect_rust_call_chain`]
+///    — a Trust-authored side-B producer (`docs/TCB.md`, the Lean-calls-Rust
+///    row), built from the RECOGNISED dataflow with its binder types read off
+///    the EMITTED body's own locals, and full-kernel-checked in a scratch
+///    clone;
+/// 4. the kernel must identify the two terms — [`crate::gate::check_faithful`], at the
+///    result carrier. Both sides apply the same stuck `Opaque` heads, so
+///    `is_def_eq` is congruence: a swapped argument, a wrong callee, a
+///    missing application or a literal at the wrong value refuses
+///    (`control_23_rust_call_emitter_mutation`).
+fn admit_rust_call_chain_lowering(
+    env: &Environment,
+    plan: &CleanOriginPlan,
+    extracted: &VerifiableFunction,
+    nodes: &[RustCallNode],
+) -> Result<Faithful, EmitRefusal> {
+    use trust_types::admissible_body::{RustCallChainArg, recognize_rust_call_chain};
+    let name = plan.name.as_str();
+
+    // Arity first, exactly as every other lane does it.
+    if extracted.body.arg_count != plan.signature.arity() {
+        return Err(EmitRefusal::LoweringShapeMismatch {
+            name: name.to_owned(),
+            planned: plan.shape.clone(),
+            recognised: format!(
+                "a body over {} parameter(s), not {}",
+                extracted.body.arg_count,
+                plan.signature.arity()
+            ),
+        });
+    }
+
+    // The ALLOW-LIST: the extractor's rendering of every registered callee.
+    // A plan whose table carries an EMPTY rendering was built at the mint
+    // seam, which never reaches side B; refusing it here is what keeps a
+    // name-only match unconstructible.
+    let mut allowed = std::collections::BTreeSet::new();
+    let mut clean_name_of_path = std::collections::BTreeMap::new();
+    for callee in &plan.callees {
+        if callee.def_path.is_empty() {
+            return Err(EmitRefusal::ReflectionRejected {
+                name: name.to_owned(),
+                detail: format!(
+                    "INTERNAL: the plan's Rust callee `{}` carries no `DefId` rendering, so \
+                     side B cannot identify the emitted call with it. A plan built at the \
+                     mint seam reached the gate. Please report it.",
+                    callee.clean_name
+                ),
+            });
+        }
+        allowed.insert(callee.def_path.clone());
+        clean_name_of_path.insert(callee.def_path.clone(), callee.clean_name.clone());
+    }
+
+    // ── 1. trust-types' recognizer, on the emitted body ────────────────────
+    let Some(recognised) = recognize_rust_call_chain(extracted, &allowed) else {
+        return Err(EmitRefusal::LoweringUnrecognised {
+            name: name.to_owned(),
+            planned: plan.shape.clone(),
+        });
+    };
+
+    // ── 2. structural agreement with the plan, node for node ───────────────
+    let mismatch = |detail: String| EmitRefusal::LoweringShapeMismatch {
+        name: name.to_owned(),
+        planned: plan.shape.clone(),
+        recognised: format!("{recognised:?}\n{detail}"),
+    };
+    if recognised.nodes.len() != nodes.len() {
+        return Err(mismatch(format!(
+            "{} call(s) emitted for {} planned",
+            recognised.nodes.len(),
+            nodes.len()
+        )));
+    }
+    for (index, (planned, emitted)) in nodes.iter().zip(&recognised.nodes).enumerate() {
+        let callee = &plan.callees[planned.callee];
+        if emitted.callee != callee.def_path {
+            return Err(mismatch(format!(
+                "node {index} calls `{}` where the plan calls `{}` (`{}`)",
+                emitted.callee, callee.def_path, callee.clean_name
+            )));
+        }
+        if planned.args.len() != emitted.args.len() {
+            return Err(mismatch(format!("node {index} has a different argument count")));
+        }
+        for (position, (planned_arg, emitted_arg)) in
+            planned.args.iter().zip(&emitted.args).enumerate()
+        {
+            let agrees = match (planned_arg, emitted_arg) {
+                (RustCallArg::Param(a), RustCallChainArg::Param(b)) => a == b,
+                (RustCallArg::Node(a), RustCallChainArg::Node(b)) => a == b,
+                (
+                    RustCallArg::Literal(RustCallLiteral::UInt(value)),
+                    RustCallChainArg::UInt { value: emitted_value, width_bits },
+                ) => {
+                    // The emitted scalar must be the planned value AT the
+                    // callee parameter's width — the width is the one fact
+                    // the kernel typing of the reflected literal will also
+                    // decide, and it is checked structurally too so a
+                    // width skew is reported as what it is.
+                    value == emitted_value
+                        && matches!(
+                            callee.params.get(position),
+                            Some(Ty::Int { width, signed: false }) if width == width_bits
+                        )
+                }
+                (
+                    RustCallArg::Literal(RustCallLiteral::Bool(value)),
+                    RustCallChainArg::Bool(emitted_value),
+                ) => value == emitted_value,
+                _ => false,
+            };
+            if !agrees {
+                return Err(mismatch(format!(
+                    "node {index} argument {position}: planned {planned_arg:?}, emitted \
+                     {emitted_arg:?}"
+                )));
+            }
+        }
+    }
+
+    // ── 3. reflect the EMITTED body back into Clean ────────────────────────
+    //
+    // The binder and result types come from the emitted body's OWN locals,
+    // never from the plan; the callee constant names come from the table,
+    // keyed by the RENDERING side B read — which is the compiler-asserted
+    // identity the TCB row discloses.
+    let side_b = crate::reflect_rust_call::reflect_rust_call_chain(
+        env,
+        name,
+        &recognised,
+        extracted,
+        &clean_name_of_path,
+    )
+    .map_err(|detail| EmitRefusal::ReflectionRejected { name: name.to_owned(), detail })?;
+
+    // ── 4. THE GATE ────────────────────────────────────────────────────────
+    Ok(check_faithful_for_name(env, plan.declaration(), &side_b, plan.result_carrier())?)
 }
 
 /// The GENERAL SELECT round trip (§6f landing 3) — the same four fail-closed
@@ -7152,7 +10862,7 @@ pub fn admit_lowering(
 ///    structural catch, never a substitute for the kernel one;
 /// 3. it must reflect through the FROZEN-adjacent general producer, minted
 ///    into a scratch clone, with its domains read off the EMITTED body;
-/// 4. the kernel must identify the two terms — [`check_faithful`], at the
+/// 4. the kernel must identify the two terms — [`crate::gate::check_faithful`], at the
 ///    result carrier.
 #[allow(clippy::too_many_arguments)]
 fn admit_general_select_lowering(
@@ -7273,7 +10983,229 @@ fn admit_general_select_lowering(
     };
 
     // ── 4. THE GATE ────────────────────────────────────────────────────────
-    Ok(check_faithful(env, name, &side_b, plan.result_carrier())?)
+    Ok(check_faithful_for_name(env, plan.declaration(), &side_b, plan.result_carrier())?)
+}
+
+/// **W6 (Rust-calls-Clean) — the boolean-value round trip.** The same four
+/// fail-closed steps as every separate-entry-point lane, for a `Bool`-returning
+/// negation or connective over `Bool` parameters:
+///
+/// 1. the emitted body must be recognised by
+///    [`trust_types::admissible_body::recognize_bool_value`] — trust-types'
+///    reading of the one-block `UnaryOp(Not)`/`BinaryOp(BitAnd|BitOr)`, and
+///    deliberately OUTSIDE `recognize_admissible_body`'s chain so the gate-free
+///    E6 kernel-import direction stays blind to it;
+/// 2. the recognised body must equal the PLANNED vocabulary directly — the
+///    structural catch, never a substitute for the kernel one;
+/// 3. it must reflect through `trust_spec_elab::admit_bool_value_function`,
+///    minted into a scratch clone with its domains read off the EMITTED body
+///    (`Bool.not`/`Bool.and`/`Bool.or`, def-eq to the island's `not`/`and`/`or`);
+/// 4. the kernel must identify the two terms — [`crate::gate::check_faithful`], at the `Bool`
+///    result carrier. A misread connective or operand fails HERE, fail-closed.
+fn admit_bool_value_lowering(
+    env: &Environment,
+    plan: &CleanOriginPlan,
+    extracted: &VerifiableFunction,
+) -> Result<Faithful, EmitRefusal> {
+    let name = plan.name.as_str();
+
+    if extracted.body.arg_count != plan.signature.arity() {
+        return Err(EmitRefusal::LoweringShapeMismatch {
+            name: name.to_owned(),
+            planned: plan.shape.clone(),
+            recognised: format!(
+                "a body over {} parameter(s), not {}",
+                extracted.body.arg_count,
+                plan.signature.arity()
+            ),
+        });
+    }
+
+    // ── 1. trust-types' recognizer, on the emitted body ────────────────────
+    let Some(recognised) = recognize_bool_value(extracted) else {
+        return Err(EmitRefusal::LoweringUnrecognised {
+            name: name.to_owned(),
+            planned: plan.shape.clone(),
+        });
+    };
+
+    // ── 2. structural agreement with the plan ──────────────────────────────
+    let elab_kind = match (&plan.shape, &recognised) {
+        (CleanOriginShape::BoolNot { param }, BoolValueBody::Not { param: emitted })
+            if param == emitted =>
+        {
+            trust_spec_elab::BoolValueKind::Not(*param)
+        }
+        (
+            CleanOriginShape::BoolConnective { op: BoolBinOp::And, left, right },
+            BoolValueBody::And { left: el, right: er },
+        ) if left == el && right == er => trust_spec_elab::BoolValueKind::And(*left, *right),
+        (
+            CleanOriginShape::BoolConnective { op: BoolBinOp::Or, left, right },
+            BoolValueBody::Or { left: el, right: er },
+        ) if left == el && right == er => trust_spec_elab::BoolValueKind::Or(*left, *right),
+        _ => {
+            return Err(EmitRefusal::LoweringShapeMismatch {
+                name: name.to_owned(),
+                planned: plan.shape.clone(),
+                recognised: format!("{recognised:?}"),
+            });
+        }
+    };
+
+    // ── 3. reflect the EMITTED body back into Clean ────────────────────────
+    let Some(param_domains) = param_domains_of(extracted) else {
+        return Err(EmitRefusal::ReflectionRejected {
+            name: name.to_owned(),
+            detail: "a parameter of the emitted body is not a supported machine carrier".to_owned(),
+        });
+    };
+    let mut scratch = env.clone();
+    let reflected_name = reflection_name(name);
+    if let Err(detail) = trust_spec_elab::admit_bool_value_function(
+        &mut scratch,
+        &reflected_name,
+        &param_domains,
+        elab_kind,
+    ) {
+        return Err(EmitRefusal::ReflectionRejected { name: name.to_owned(), detail });
+    }
+    let Some(side_b) =
+        scratch.get_const(&Name::from_string(&reflected_name)).and_then(|c| c.value.clone())
+    else {
+        return Err(EmitRefusal::ReflectionRejected {
+            name: name.to_owned(),
+            detail: "the reflected defining equation was accepted but carries no value".to_owned(),
+        });
+    };
+
+    // ── 4. THE GATE ────────────────────────────────────────────────────────
+    Ok(check_faithful_for_name(env, plan.declaration(), &side_b, plan.result_carrier())?)
+}
+
+/// Reflect the ACTUAL emitted body with the existing opposite-direction E6
+/// importer. Neither its reader nor its term renderer is authored here. In
+/// particular the plan's expression is never passed to the importer. Its
+/// The existing gate must establish definitional equality or kernel-check
+/// an induction proof against the untouched original declaration, or refuse.
+fn admit_unsigned_conditional_lowering(
+    env: &Environment,
+    plan: &CleanOriginPlan,
+    extracted: &VerifiableFunction,
+) -> Result<Faithful, EmitRefusal> {
+    let name = plan.name.as_str();
+    let expected = plan.signature().result().rust();
+    // Inspect the actual emission, never a reflection of the source plan.
+    // Both reachable and unreachable blocks must use this pure vocabulary.
+    let vocabulary_ok = extracted.body.blocks.len() <= 2 * UINT_CONDITIONAL_MAX_DECISIONS + 1
+        && extracted.body.locals.iter().all(|local| local.ty == *expected || local.ty == Ty::Bool)
+        && (0..=plan.signature().arity()).all(|index| {
+            extracted.body.locals.get(index).is_some_and(|local| local.ty == *expected)
+        })
+        && extracted.body.blocks.iter().all(|block| {
+            matches!(block.terminator,
+                trust_types::Terminator::Return | trust_types::Terminator::Goto(_)
+                    | trust_types::Terminator::SwitchInt { .. })
+                && block.stmts.iter().all(|statement| {
+                    matches!(statement, trust_types::Statement::Assign { rvalue, .. }
+                        if matches!(rvalue, trust_types::Rvalue::Use(_)
+                            | trust_types::Rvalue::BinaryOp(
+                                trust_types::BinOp::Lt | trust_types::BinOp::Le | trust_types::BinOp::Eq,
+                                _, _)))
+                })
+        });
+    if extracted.body.arg_count != plan.signature().arity()
+        || extracted.body.return_ty != *expected
+        || !vocabulary_ok
+    {
+        return Err(EmitRefusal::ReflectionRejected {
+            name: name.into(), detail: "unsigned conditional emission has a different signature or contains an operation outside its pure bounded vocabulary".into(),
+        });
+    }
+    let mut scratch = env.clone();
+    let reflected_name = reflection_name(name);
+    match trust_spec_elab::admit_e6_only_body(&mut scratch, extracted, &reflected_name) {
+        Some(Ok(_)) => {}
+        Some(Err(detail)) => {
+            return Err(EmitRefusal::ReflectionRejected { name: name.into(), detail });
+        }
+        None => {
+            return Err(EmitRefusal::LoweringUnrecognised {
+                name: name.into(),
+                planned: plan.shape.clone(),
+            });
+        }
+    }
+    let side_b = scratch
+        .get_const(&Name::from_string(&reflected_name))
+        .and_then(|constant| constant.value.clone())
+        .ok_or_else(|| EmitRefusal::ReflectionRejected {
+            name: name.into(),
+            detail: "the independent emitted-body reader returned no defining value".into(),
+        })?;
+    Ok(check_faithful_for_name(env, plan.declaration(), &side_b, plan.result_carrier())?)
+}
+
+fn admit_bool_expression_lowering(
+    env: &Environment,
+    plan: &CleanOriginPlan,
+    extracted: &VerifiableFunction,
+) -> Result<Faithful, EmitRefusal> {
+    let name = plan.name.as_str();
+    // Keep this emission slice closed even though the unchanged importer can
+    // also read comparisons, XOR and decision trees. This is a vocabulary
+    // check, not a second interpretation of operands or temporary dataflow.
+    let vocabulary_ok = match extracted.body.blocks.as_slice() {
+        [block] => {
+            matches!(block.terminator, trust_types::Terminator::Return)
+                && block.stmts.len() <= BOOL_EXPRESSION_MAX_OPS + 1
+                && block.stmts.iter().all(|stmt| {
+                    matches!(stmt, trust_types::Statement::Assign { rvalue, .. }
+                        if matches!(rvalue,
+                            trust_types::Rvalue::Use(_)
+                            | trust_types::Rvalue::UnaryOp(trust_types::UnOp::Not, _)
+                            | trust_types::Rvalue::BinaryOp(
+                                trust_types::BinOp::BitAnd | trust_types::BinOp::BitOr, _, _)))
+                })
+        }
+        _ => false,
+    };
+    if extracted.body.arg_count != plan.signature.arity()
+        || extracted.body.return_ty != Ty::Bool
+        || !vocabulary_ok
+        || !param_domains_of(extracted)
+            .is_some_and(|domains| domains.iter().all(|domain| *domain == Domain::Bool))
+    {
+        return Err(EmitRefusal::ReflectionRejected {
+            name: name.to_owned(),
+            detail: "the emitted Boolean expression has a different arity/carrier or is \
+                     outside the bounded straight-line Boolean vocabulary"
+                .to_owned(),
+        });
+    }
+    let mut scratch = env.clone();
+    let reflected_name = reflection_name(name);
+    match trust_spec_elab::admit_e6_only_body(&mut scratch, extracted, &reflected_name) {
+        Some(Ok(_)) => {}
+        Some(Err(detail)) => {
+            return Err(EmitRefusal::ReflectionRejected { name: name.to_owned(), detail });
+        }
+        None => {
+            return Err(EmitRefusal::LoweringUnrecognised {
+                name: name.to_owned(),
+                planned: plan.shape.clone(),
+            });
+        }
+    }
+    let Some(side_b) =
+        scratch.get_const(&Name::from_string(&reflected_name)).and_then(|c| c.value.clone())
+    else {
+        return Err(EmitRefusal::ReflectionRejected {
+            name: name.to_owned(),
+            detail: "the E6 importer accepted no defining value".to_owned(),
+        });
+    };
+    Ok(check_faithful_for_name(env, plan.declaration(), &side_b, plan.result_carrier())?)
 }
 
 /// The `==` SELECT round trip (§6f landing 6) — the same four fail-closed steps
@@ -7289,7 +11221,7 @@ fn admit_general_select_lowering(
 ///    structural catch, never a substitute for the kernel one;
 /// 3. it must reflect through `trust_spec_elab::admit_select_beq_function`,
 ///    minted into a scratch clone, with its domains read off the EMITTED body;
-/// 4. the kernel must identify the two terms — [`check_faithful`], at the
+/// 4. the kernel must identify the two terms — [`crate::gate::check_faithful`], at the
 ///    result carrier.
 ///
 /// **Step 4 is where the landing's whole point is cashed.** Because the emitted
@@ -7412,7 +11344,7 @@ fn admit_beq_select_lowering(
     };
 
     // ── 4. THE GATE ────────────────────────────────────────────────────────
-    Ok(check_faithful(env, name, &side_b, plan.result_carrier())?)
+    Ok(check_faithful_for_name(env, plan.declaration(), &side_b, plan.result_carrier())?)
 }
 
 /// **§6f LANDING 8 — the GENERAL `==` SELECT round trip.** The same four
@@ -7433,7 +11365,7 @@ fn admit_beq_select_lowering(
 ///    computed operand elaborated by the FROZEN `elab_term`, which is also
 ///    where the divisor rule is enforced a THIRD time by a program that knows
 ///    nothing about this lane;
-/// 4. the kernel must identify the two terms — [`check_faithful`], at the
+/// 4. the kernel must identify the two terms — [`crate::gate::check_faithful`], at the
 ///    result carrier.
 ///
 /// **Step 4 is where the polarity is finally decided rather than trusted.** The
@@ -7554,7 +11486,7 @@ fn admit_beq_general_select_lowering(
     };
 
     // ── 4. THE GATE ────────────────────────────────────────────────────────
-    Ok(check_faithful(env, name, &side_b, plan.result_carrier())?)
+    Ok(check_faithful_for_name(env, plan.declaration(), &side_b, plan.result_carrier())?)
 }
 
 /// **§6f LANDING 7 — the RAW-BINOP round trip.** The same four fail-closed
@@ -7570,7 +11502,7 @@ fn admit_beq_general_select_lowering(
 ///    structural catch, never a substitute for the kernel one;
 /// 3. it must reflect through the FROZEN `admit_expr_function`, minted into a
 ///    scratch clone, with its domain read off the EMITTED body;
-/// 4. the kernel must identify the two terms — [`check_faithful`], at the
+/// 4. the kernel must identify the two terms — [`crate::gate::check_faithful`], at the
 ///    result carrier.
 ///
 /// # THE DIVISOR IS NOT RE-CHECKED HERE, AND THAT IS THE POINT
@@ -7679,7 +11611,7 @@ fn admit_raw_binop_lowering(
     };
 
     // ── 4. THE GATE ────────────────────────────────────────────────────────
-    Ok(check_faithful(env, name, &side_b, plan.result_carrier())?)
+    Ok(check_faithful_for_name(env, plan.declaration(), &side_b, plan.result_carrier())?)
 }
 
 /// The structural-recursion round trip (R1, §6e as amended) — the same four
@@ -7697,7 +11629,7 @@ fn admit_raw_binop_lowering(
 ///    a scratch clone, the defined constant cited NOWHERE (the s2 vacuity is
 ///    unconstructible);
 /// 4. the kernel must identify every defining equation and the recursive
-///    argument — [`check_faithful_equations`], at the carrier.
+///    argument — [`crate::gate::check_faithful_equations`], at the carrier.
 fn admit_structural_rec_lowering(
     env: &Environment,
     plan: &CleanOriginPlan,
@@ -7744,7 +11676,12 @@ fn admit_structural_rec_lowering(
         .map_err(|detail| EmitRefusal::ReflectionRejected { name: name.to_owned(), detail })?;
 
     // ── 4. THE GATE — per-defining-equation, at the RESULT carrier ─────────
-    Ok(check_faithful_equations(env, name, &reflected, plan.result_carrier())?)
+    Ok(check_faithful_equations_for_name(
+        env,
+        plan.declaration(),
+        &reflected,
+        plan.result_carrier(),
+    )?)
 }
 
 /// The well-founded-recursion round trip (R2) — the same four fail-closed
@@ -7762,7 +11699,7 @@ fn admit_structural_rec_lowering(
 ///    decrease slot left as the sentinel for the gate to borrow;
 /// 4. the kernel must identify the two functionals, after auditing both sides'
 ///    axiom closures and type-checking side B at side A's own functional type
-///    — [`check_faithful_wf_functional`], at the carrier.
+///    — [`crate::gate::check_faithful_wf_functional`], at the carrier.
 ///
 /// Step 3 does NOT kernel-check its output, and that is deliberate rather than
 /// a gap: the term carries the decrease-slot sentinel, which by construction
@@ -7833,7 +11770,12 @@ fn admit_wf_rec_lowering(
         .map_err(|detail| EmitRefusal::ReflectionRejected { name: name.to_owned(), detail })?;
 
     // ── 4. THE GATE — the F layer, at the RESULT carrier ───────────────────
-    Ok(check_faithful_wf_functional(env, name, &reflected, plan.result_carrier())?)
+    Ok(check_faithful_wf_functional_for_name(
+        env,
+        plan.declaration(),
+        &reflected,
+        plan.result_carrier(),
+    )?)
 }
 
 /// The one machine domain every position of the emitted body denotes.

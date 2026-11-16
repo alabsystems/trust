@@ -113,7 +113,7 @@ pub(crate) fn run(root: &Path, policy: GatePolicy) -> Result<()> {
     println!("Targo: {}", targo.display());
 
     let targo_manifest = manifest_str(root, "targo-trust/Cargo.toml")?;
-    let crates_manifest = manifest_str(root, "crates/Cargo.toml")?;
+    let crates_manifest = manifest_str(root, "Cargo.toml")?;
     let cargo_target = tempfile::Builder::new()
         .prefix("trust-binary-gate-target-")
         .tempdir()
@@ -857,12 +857,12 @@ fn materialize_hex_fixture(
 }
 
 fn decode_hex(compact: &str) -> Result<Vec<u8>> {
-    if compact.len() % 2 != 0 {
+    if !compact.len().is_multiple_of(2) {
         bail!("odd number of hex digits");
     }
     let bytes = compact.as_bytes();
     let mut out = Vec::with_capacity(compact.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         out.push((hex_value(pair[0])? << 4) | hex_value(pair[1])?);
     }
     Ok(out)

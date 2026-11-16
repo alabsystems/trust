@@ -19,6 +19,10 @@ def DifferentiatePass : Pass<"enzyme"> {
     "cf::ControlFlowDialect",
     "tensor::TensorDialect",
     "enzyme::EnzymeDialect",
+    "memref::MemRefDialect",
+    "math::MathDialect",
+    "mlir::LLVM::LLVMDialect",
+    "mlir::enzyme::llvm_ext::LLVMExtDialect"
   ];
   let options = [
     Option<
@@ -35,15 +39,30 @@ def DifferentiatePass : Pass<"enzyme"> {
       /*default=*/"true",
       /*description=*/"Whether or not to run verifier for the postpasses pass manager."
     >,
+    Option<
+      /*C++ variable name=*/"dataflowActivity",
+      /*CLI argument=*/"dataflow",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"Whether or not to use the dataflow activity analysis"
+    >,
+    Option<
+      /*C++ variable name=*/"markReadonly",
+      /*CLI argument=*/"markReadonly",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"If using dataflow analysis, this will annotate loads from pointers that are never modified in the function"
+    >,
   ];
 }
 
-def ProbProgPass : Pass<"probprog"> {
-  let summary = "ProbProg Passes";
+def ExpandImpulsePass : Pass<"expand-impulse"> {
+  let summary = "Materialize Impulse ops to probabilistic programming algorithms";
   let dependentDialects = [
     "arith::ArithDialect",
     "complex::ComplexDialect",
     "enzyme::EnzymeDialect",
+    "impulse::ImpulseDialect",
   ];
   let options = [
     Option<
@@ -51,7 +70,7 @@ def ProbProgPass : Pass<"probprog"> {
       /*CLI argument=*/"postpasses",
       /*type=*/"std::string",
       /*default=*/"",
-      /*description=*/"Optimization passes to apply to generated probabilistic programs"
+      /*description=*/"Optimization passes to apply to expanded probabilistic programs"
     >,
     Option<
       /*C++ variable name=*/"debugDump",
@@ -78,13 +97,41 @@ def BatchDiffPass : Pass<"enzyme-diff-batch">{
   ];
 }
 
+def EnzymeActivityOpt : Pass<"enzyme-activity-opt">{
+  let summary = "Optimize activity for differentiation";
+  let dependentDialects = [
+    "enzyme::EnzymeDialect",
+  ];
+  let options = [
+    Option<
+      /*C++ variable name=*/"dataflow",
+      /*CLI argument=*/"dataflow",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"Whether to use the new Dataflow activity analysis"
+    >,
+    Option<
+      /*C++ variable name=*/"printActivityAnalysis",
+      /*CLI argument=*/"print",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"Print the dataflow activity analysis results used by the optimizer"
+    >,
+  ];
+}
+
 def DifferentiateWrapperPass : Pass<"enzyme-wrap"> {
   let summary = "Add wrapper function to be differentiated";
   let dependentDialects = [
     "arith::ArithDialect",
     "complex::ComplexDialect",
     "cf::ControlFlowDialect",
-    "enzyme::EnzymeDialect"
+    "tensor::TensorDialect",
+    "enzyme::EnzymeDialect",
+    "memref::MemRefDialect",
+    "math::MathDialect",
+    "mlir::LLVM::LLVMDialect",
+    "mlir::enzyme::llvm_ext::LLVMExtDialect"
   ];
   let options = [
     Option<
@@ -128,6 +175,41 @@ def DifferentiateWrapperPass : Pass<"enzyme-wrap"> {
       /*default=*/"",
       /*description=*/"The activity of the arguments"
     >,
+    Option<
+      /*C++ variable name=*/"dataflowActivity",
+      /*CLI argument=*/"dataflow",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"Whether or not to use the dataflow activity analysis"
+    >,
+    Option<
+      /*C++ variable name=*/"strongZero",
+      /*CLI argument=*/"strongZero",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"Whether or not to use a strong zero"
+    >,
+    Option<
+      /*C++ variable name=*/"atomicAdd",
+      /*CLI argument=*/"atomicAdd",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"Whether or not to use atomics by default (e.g. if within a parallel context)"
+    >,
+    Option<
+      /*C++ variable name=*/"markReadonly",
+      /*CLI argument=*/"markReadonly",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"If using dataflow analysis, this will annotate loads from pointers that are never modified in the function"
+    >,
+  ];
+}
+
+def SplitMultiResultsPass : Pass<"split-multi-results"> {
+  let summary = "Split region ops that yield multiple results into separate ops";
+  let dependentDialects = [
+    "scf::SCFDialect"
   ];
 }
 
@@ -199,6 +281,14 @@ def PrintAliasAnalysisPass : Pass<"test-print-alias-analysis"> {
   let summary = "Print the results of alias analysis";
 }
 
+def PrintBaseObjectPass : Pass<"test-print-base-object"> {
+  let summary = "Print the base object of each function return operand";
+  let options = [
+    Option<"offsetAllowed", "offset-allowed", "bool", "true",
+           "Look through operations that can change the address">
+  ];
+}
+
 def InlineEnzymeIntoRegionPass : Pass<"inline-enzyme-regions"> {
   let summary = "Inline enzyme.autodiff ops into enzyme.autodiff_region ops.";
 }
@@ -212,8 +302,16 @@ def OutlineEnzymeFromRegionPass : Pass<"outline-enzyme-regions"> {
 
 def HoistEnzymeFromRegionPass : Pass<"hoist-enzyme-regions"> {
   let summary = "Hoist independent primal ops out of autodiff_region.";
-  let dependentDialects = [ 
+  let dependentDialects = [
   "enzyme::EnzymeDialect",
+  ];
+}
+
+def FlattenEnzymeCachesPass : Pass<"flatten-enzyme-caches"> {
+  let summary = "Flatten multi-dimensional enzyme memory ops to 1-D memrefs.";
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "memref::MemRefDialect",
   ];
 }
 
@@ -242,7 +340,7 @@ def AddToOpToSplitPass : Pass<"add-to-op-to-split"> {
 def EnzymeBatchToTensorPass : Pass<"enzyme-batch-to-tensor"> {
   let summary = "Legalize batching specific operations to tensor dialect";
   let dependentDialects = [
-    "tensor::TensorDialect", 
+    "tensor::TensorDialect",
     "arith::ArithDialect",
     "enzyme::EnzymeDialect"
   ];
@@ -265,12 +363,69 @@ def LowerLLVMExtPass : Pass<"lower-llvm-ext"> {
   let dependentDialects = [
     "mlir::enzyme::llvm_ext::LLVMExtDialect",
     "LLVM::LLVMDialect",
+    // Device-space allocations lower through gpu.alloc/gpu.dealloc, sized with
+    // arith index casts.
+    "arith::ArithDialect",
+    "gpu::GPUDialect",
+    "memref::MemRefDialect"
   ];
   let options = [
     Option<"lowerToAllocaThreshold", "lower-to-alloca-threshold", "uint64_t",
            /*default=*/"0",
            "Maximum static size at which an alloc/free is promoted to an alloca (default -1: promotion disabled)">,
   ];
+}
+
+def SinkCheckpointViewsPass : Pass<"sink-checkpoint-views"> {
+  let summary = "Sink pure views of mutable values into checkpointed loops.";
+  let description = [{
+    Checkpointing snapshots every mutable value a loop captures. A view and its
+    source are the same memory, so capturing both produces two snapshots of one
+    buffer and a replay that reads half its state from each. Sinking the view
+    into the loop leaves only the source captured, and the view is re-derived
+    from it inside the body.
+
+    Must run before `enzyme`, which is what reads the captures.
+  }];
+  let dependentDialects = [
+    "scf::SCFDialect"
+  ];
+}
+
+def HoistLoopAllocationsPass : Pass<"hoist-loop-allocations"> {
+  let summary = "Hoist per-iteration scratch buffers out of sequential loops.";
+  let description = [{
+    Lifts an allocation and its matching deallocation out of an `scf.for` or
+    `affine.for`, so a buffer that a loop body allocates and frees on every
+    iteration is allocated once for the whole loop:
+
+    ```mlir
+    scf.for %i = %lb to %ub step %st {   |   %0 = memref.alloc()
+      %0 = memref.alloc()                |   scf.for %i = %lb to %ub step %st {
+      ...                                |     ...
+      memref.dealloc %0                  |   }
+    }                                    |   memref.dealloc %0
+    ```
+
+    Only applies when the buffer is private to one iteration: its size operands
+    are loop invariant, exactly one deallocation frees it, both ops sit
+    directly in the body's entry block, and nothing derived from the buffer
+    escapes the iteration. Parallel loops are never eligible, since the
+    iterations would then share one buffer.
+
+    Note that the allocation becomes unconditional, so a loop that never runs
+    now allocates; `max-hoisted-bytes` bounds how much memory that can cost.
+  }];
+  let options = [
+    Option<
+      /*C++ variable name=*/"maxHoistedBytes",
+      /*CLI argument=*/"max-hoisted-bytes",
+      /*type=*/"uint64_t",
+      /*default=*/"0",
+      /*description=*/"Do not hoist buffers larger than this many bytes (0 = no limit)"
+    >
+  ];
+  // No dialect dependency: the pass only moves ops that are already there.
 }
 
 def RaiseLLVMExtPass : Pass<"raise-llvm-ext"> {
@@ -285,6 +440,14 @@ def LowerAffineAtomicRmwPass : Pass<"lower-affine-atomic-rmw"> {
   let summary = "Lower AffineRmw to MemrefRmw";
   let dependentDialects = [
     "memref::MemRefDialect"
+  ];
+}
+
+def LowerBinomialProgressPass : Pass<"lower-enzyme-binomial-progress"> {
+  let summary = "Lower enzyme.binomial_progress to scf/arith";
+  let dependentDialects = [
+    "scf::SCFDialect",
+    "arith::ArithDialect"
   ];
 }
 

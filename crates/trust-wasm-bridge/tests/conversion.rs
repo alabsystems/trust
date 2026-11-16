@@ -40,6 +40,7 @@ fn constant_return_function(name: &str, value: i128, return_ty: Ty) -> Verifiabl
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -832,6 +833,7 @@ fn accepts_unit_return_as_no_result_wat_without_proof_grade() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let conversion = convert_function_to_wat(&function);

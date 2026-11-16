@@ -92,9 +92,15 @@ fn main() {
     );
 
     let mut at = hits[0] + magic.len();
-    assert_eq!(
-        bytes[at], 1,
-        "wire format version is not v1; the field offsets below no longer hold"
+    // The digest's leading prefix — format u8 · decl · kernel_version — is
+    // byte-identical across wire v1 and v2 (v2 appends env/carrier/faithfulness
+    // records strictly AFTER kernel_version; see admission.rs VerdictDigest::encode,
+    // whose decoder accepts `VERDICT_DIGEST_FORMAT_V1 | V2`). Walk only that shared
+    // prefix: accept either version, fail closed on any future format not re-derived.
+    assert!(
+        matches!(bytes[at], 1 | 2),
+        "wire format version {} is neither v1 nor v2; the field offsets below assume          the v1/v2 shared prefix (format u8 · decl · kernel_version) — re-derive this          patch against admission.rs",
+        bytes[at]
     );
     at += 1;
 

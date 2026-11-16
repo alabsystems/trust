@@ -1,0 +1,477 @@
+{
+  "name": "checked_u8",
+  "def_path": "checked::checked_u8",
+  "span": {
+    "file": "build/aarch64-apple-darwin/test/run-make/trust-e6-computed-arithmetic/rmake_out/checked.rs",
+    "line_start": 3,
+    "col_start": 12,
+    "line_end": 5,
+    "col_end": 13
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "cost"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "limit"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "held"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "left"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-checked-primitive-method::core::num::<impl u8>::checked_sub",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "build/aarch64-apple-darwin/test/run-make/trust-e6-computed-arithmetic/rmake_out/checked.rs",
+              "line_start": 4,
+              "col_start": 22,
+              "line_end": 4,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11347157951328476390,
+              "def_index": 28094,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11347157951328476390,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "build/aarch64-apple-darwin/test/run-make/trust-e6-computed-arithmetic/rmake_out/checked.rs",
+                "line_start": 4,
+                "col_start": 22,
+                "line_end": 4,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ],
+              [
+                1,
+                4
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "build/aarch64-apple-darwin/test/run-make/trust-e6-computed-arithmetic/rmake_out/checked.rs",
+              "line_start": 4,
+              "col_start": 16,
+              "line_end": 4,
+              "col_end": 45
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "build/aarch64-apple-darwin/test/run-make/trust-e6-computed-arithmetic/rmake_out/checked.rs",
+                "line_start": 4,
+                "col_start": 84,
+                "line_end": 4,
+                "col_end": 89
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/aarch64-apple-darwin/test/run-make/trust-e6-computed-arithmetic/rmake_out/checked.rs",
+                "line_start": 4,
+                "col_start": 53,
+                "line_end": 4,
+                "col_end": 57
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Le",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/aarch64-apple-darwin/test/run-make/trust-e6-computed-arithmetic/rmake_out/checked.rs",
+                "line_start": 4,
+                "col_start": 62,
+                "line_end": 4,
+                "col_end": 74
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_5",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_5",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "cost",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "cost",
+                "Int"
+              ]
+            },
+            {
+              "Int": 255
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "limit",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "limit",
+                "Int"
+              ]
+            },
+            {
+              "Int": 255
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "held",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "held",
+                "Int"
+              ]
+            },
+            {
+              "Int": 255
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

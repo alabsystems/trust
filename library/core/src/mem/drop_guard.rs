@@ -11,8 +11,6 @@ use crate::ops::{Deref, DerefMut};
 ///
 /// ```rust
 /// # #![allow(unused)]
-/// #![feature(drop_guard)]
-///
 /// use std::mem::DropGuard;
 ///
 /// {
@@ -28,10 +26,11 @@ use crate::ops::{Deref, DerefMut};
 ///     // "Chashu likes tuna!!!"
 /// }
 /// ```
-#[unstable(feature = "drop_guard", issue = "144426")]
+#[stable(feature = "drop_guard", since = "1.100.0")]
 #[doc(alias = "ScopeGuard")]
 #[doc(alias = "defer")]
-pub struct DropGuard<T, F>
+#[rustc_diagnostic_item = "DropGuard"]
+pub struct DropGuard<#[rustc_assert_variance(covariant)] T, #[rustc_assert_variance(covariant)] F>
 where
     F: FnOnce(T),
 {
@@ -49,14 +48,13 @@ where
     ///
     /// ```rust
     /// # #![allow(unused)]
-    /// #![feature(drop_guard)]
-    ///
     /// use std::mem::DropGuard;
     ///
     /// let value = String::from("Chashu likes tuna");
     /// let guard = DropGuard::new(value, |s| println!("{s}"));
     /// ```
-    #[unstable(feature = "drop_guard", issue = "144426")]
+    #[stable(feature = "drop_guard", since = "1.100.0")]
+    #[rustc_const_unstable(feature = "const_drop_guard", issue = "none")]
     #[must_use]
     pub const fn new(inner: T, f: F) -> Self {
         Self { inner: ManuallyDrop::new(inner), f: ManuallyDrop::new(f) }
@@ -73,15 +71,13 @@ where
     ///
     /// ```rust
     /// # #![allow(unused)]
-    /// #![feature(drop_guard)]
-    ///
     /// use std::mem::DropGuard;
     ///
     /// let value = String::from("Nori likes chicken");
     /// let guard = DropGuard::new(value, |s| println!("{s}"));
     /// assert_eq!(DropGuard::dismiss(guard), "Nori likes chicken");
     /// ```
-    #[unstable(feature = "drop_guard", issue = "144426")]
+    #[stable(feature = "drop_guard", since = "1.100.0")]
     #[rustc_const_unstable(feature = "const_drop_guard", issue = "none")]
     #[inline]
     pub const fn dismiss(guard: Self) -> T
@@ -107,7 +103,7 @@ where
     }
 }
 
-#[unstable(feature = "drop_guard", issue = "144426")]
+#[stable(feature = "drop_guard", since = "1.100.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
 const impl<T, F> Deref for DropGuard<T, F>
 where
@@ -116,22 +112,22 @@ where
     type Target = T;
 
     fn deref(&self) -> &T {
-        &*self.inner
+        &self.inner
     }
 }
 
-#[unstable(feature = "drop_guard", issue = "144426")]
+#[stable(feature = "drop_guard", since = "1.100.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
 const impl<T, F> DerefMut for DropGuard<T, F>
 where
     F: FnOnce(T),
 {
     fn deref_mut(&mut self) -> &mut T {
-        &mut *self.inner
+        &mut self.inner
     }
 }
 
-#[unstable(feature = "drop_guard", issue = "144426")]
+#[stable(feature = "drop_guard", since = "1.100.0")]
 #[rustc_const_unstable(feature = "const_drop_guard", issue = "none")]
 const impl<T, F> Drop for DropGuard<T, F>
 where
@@ -148,7 +144,7 @@ where
     }
 }
 
-#[unstable(feature = "drop_guard", issue = "144426")]
+#[stable(feature = "drop_guard", since = "1.100.0")]
 impl<T, F> Debug for DropGuard<T, F>
 where
     T: Debug,

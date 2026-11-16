@@ -1,0 +1,45 @@
+{
+  "id": "opaque-scalar-identity",
+  "class": "B (OPAQUE-SCALAR-ID-1)",
+  "title": "every opaque scalar of one width was one solver symbol, so two addresses were equal",
+  "origin": [
+    "KH:3208, KH:3319 (B, OPAQUE-SCALAR-ID-1)",
+    "fix cbf29944f0 (+1c1067871e, 7681a5be67)",
+    "crates/trust-vcgen/tests/opaque_scalar_identity_realmir.rs",
+    "crates/trust-vcgen/tests/fixtures/opaque_scalar_identity/cc_rt.rs"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "cc_two_addrs",
+    "obligation": {
+      "kind": "assert",
+      "message": "panic call: core::panicking::panic_fmt"
+    }
+  },
+  "twin": {
+    "function": "cc_one_addr",
+    "obligation": {
+      "kind": "assert",
+      "message": "panic call: core::panicking::panic_fmt"
+    }
+  },
+  "witness": {
+    "input": "two distinct live locals",
+    "observed": "R1 addresses differ",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  },
+  "expect_note": "trustc's claim is the per-panic `assert` row (`panic call: core::panicking::panic_fmt`), whose span is the panic! macro's own (core/src/panic.rs:62), not a line of src.rs; the `panic freedom` row at the fn signature (line 3) is the whole-body summary and is runtime_checked whenever any row is. The twin compares one address with itself, so its panic is unreachable on every run and trustc proves the same row.",
+  "expected_refusal": {
+    "trust-vc-syn": {
+      "reproducer": "Unsupported panic!() in vc_extraction — unsupported macros are rejected",
+      "twin": "Unsupported panic!() in vc_extraction — unsupported macros are rejected"
+    }
+  }
+}

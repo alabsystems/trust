@@ -1,0 +1,75 @@
+# trust-wp probe transcript, 2026-10-14 (r24-wpv-probes/zz_vfy_probe_a.rs). 'A' = trust-wp with aee6e8f2 (D-237).
+## with aee6e8f2
+    TEETH LOST — verified on a case whose contract is false, and not declared by `//@ also-verified:`: mh1, cc1, cc1::{closure#2}, cc2::{closure#2}, cp1; proof_assert verified on a case whose contract is false, and not declared by `//@ also-verified-assertion:`: creusot_test::mh1 (1 verified, 0 declared), creusot_test::li1 (1 verified, 0 declared), creusot_test::mh2 (1 verified, 0 declared)
+trust-wp: verifying proof_assert in creusot_test::mh1 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::mh1 verified ✓
+trust-wp: mh1 verified ✓
+trust-wp: cc1 verified ✓
+trust-wp: cc1::{closure#2} verified ✓
+trust-wp: cc2 error: unsupported formula: final-collapse refused (fail-closed): `^Int(0)` applies a prophecy to a constant carrier, which records the borrowed place's CURRENT value and has no prophecy slot; folding the wrapper away would assert the false equality `^p == *p` (Final-collapse audit Fix A, constant-carrier arm)
+trust-wp: verifying proof_assert in creusot_test::cc2 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::cc2 error: unsupported formula: final-collapse refused (fail-closed): `^Int(0)` applies a prophecy to a constant carrier, which records the borrowed place's CURRENT value and has no prophecy slot; folding the wrapper away would assert the false equality `^p == *p` (Final-collapse audit Fix A, constant-carrier arm)
+trust-wp: cc2::{closure#2} verified ✓
+trust-wp: cp1 verified ✓
+trust-wp: verifying proof_assert in creusot_test::sn1 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::sn1 FAILED ✗
+trust-wp: sn1 FAILED ✗ (proof_assert)
+trust-wp: mp1 unknown (incomplete)
+trust-wp: verifying proof_assert in creusot_test::ma1 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::ma1 FAILED ✗
+trust-wp: ma1 FAILED ✗ (proof_assert)
+trust-wp: li1 vacuous (loop obligations, contradictory premises)
+trust-wp: verifying proof_assert in creusot_test::li1 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::li1 verified ✓
+trust-wp: rs1 FAILED ✗ (postcondition)
+trust-wp: rs2 FAILED ✗ (postcondition)
+trust-wp: verifying proof_assert in creusot_test::fl1 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::fl1 unknown (incomplete)
+trust-wp: fl1 unknown (proof_assert not proved)
+trust-wp: verifying proof_assert in creusot_test::mh2 (0 contract preconditions)
+trust-wp: proof_assert in creusot_test::mh2 verified ✓
+trust-wp: verifying proof_assert in creusot_test::cp1::{closure#1} (0 contract preconditions)
+trust-wp: proof_assert in creusot_test::cp1::{closure#1} FAILED ✗
+trust-wp: verifying proof_assert in creusot_test::le1 (0 contract preconditions)
+trust-wp: proof_assert in creusot_test::le1 FAILED ✗
+trust-wp: 5 verified, 4 failed, 3 errors, 1 vacuous, 1 warnings, encoding-errors unsupported=1 sort-inference=0 solver=0
+trust-wp: proof_assert: 3 verified, 4 failed, 2 errors, encoding-errors unsupported=1 sort-inference=0 solver=0
+TEETH LOST — rejected, but not for the declared reason:
+  zz_vfy_probe_a: TEETH LOST — verified on a case whose contract is false, and not declared by `//@ also-verified:`: mh1, cc1, cc1::{closure#2}, cc2::{closure#2}, cp1; proof_assert verified on a case whose contract is false, and not declared by `//@ also-verified-assertion:`: creusot_test::mh1 (1 verified, 0 declared), creusot_test::li1 (1 verified, 0 declared), creusot_test::mh2 (1 verified, 0 declared)
+## without
+    TEETH LOST — verified on a case whose contract is false, and not declared by `//@ also-verified:`: mh1, cc1, cc1::{closure#2}, cc2::{closure#2}, cp1; proof_assert verified on a case whose contract is false, and not declared by `//@ also-verified-assertion:`: creusot_test::mh1 (1 verified, 0 declared), creusot_test::mh2 (1 verified, 0 declared)
+trust-wp: verifying proof_assert in creusot_test::mh1 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::mh1 verified ✓
+trust-wp: mh1 verified ✓
+trust-wp: cc1 verified ✓
+trust-wp: cc1::{closure#2} verified ✓
+trust-wp: cc2 error: unsupported formula: final-collapse refused (fail-closed): `^Int(0)` applies a prophecy to a constant carrier, which records the borrowed place's CURRENT value and has no prophecy slot; folding the wrapper away would assert the false equality `^p == *p` (Final-collapse audit Fix A, constant-carrier arm)
+trust-wp: verifying proof_assert in creusot_test::cc2 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::cc2 error: unsupported formula: final-collapse refused (fail-closed): `^Int(0)` applies a prophecy to a constant carrier, which records the borrowed place's CURRENT value and has no prophecy slot; folding the wrapper away would assert the false equality `^p == *p` (Final-collapse audit Fix A, constant-carrier arm)
+trust-wp: cc2::{closure#2} verified ✓
+trust-wp: cp1 verified ✓
+trust-wp: verifying proof_assert in creusot_test::sn1 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::sn1 FAILED ✗
+trust-wp: sn1 FAILED ✗ (proof_assert)
+trust-wp: mp1 unknown (incomplete)
+trust-wp: verifying proof_assert in creusot_test::ma1 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::ma1 FAILED ✗
+trust-wp: ma1 FAILED ✗ (proof_assert)
+trust-wp: verifying proof_assert in creusot_test::li1 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::li1 FAILED ✗
+trust-wp: li1 FAILED ✗ (proof_assert)
+trust-wp: rs1 FAILED ✗ (postcondition)
+trust-wp: rs2 FAILED ✗ (postcondition)
+trust-wp: verifying proof_assert in creusot_test::fl1 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::fl1 unknown (incomplete)
+trust-wp: fl1 unknown (proof_assert not proved)
+trust-wp: verifying proof_assert in creusot_test::mh2 (0 contract preconditions)
+trust-wp: proof_assert in creusot_test::mh2 verified ✓
+trust-wp: verifying proof_assert in creusot_test::cp1::{closure#1} (0 contract preconditions)
+trust-wp: proof_assert in creusot_test::cp1::{closure#1} FAILED ✗
+trust-wp: verifying proof_assert in creusot_test::le1 (0 contract preconditions)
+trust-wp: proof_assert in creusot_test::le1 FAILED ✗
+trust-wp: 5 verified, 5 failed, 3 errors, encoding-errors unsupported=1 sort-inference=0 solver=0
+trust-wp: proof_assert: 2 verified, 5 failed, 2 errors, encoding-errors unsupported=1 sort-inference=0 solver=0
+TEETH LOST — rejected, but not for the declared reason:
+  zz_vfy_probe_a: TEETH LOST — verified on a case whose contract is false, and not declared by `//@ also-verified:`: mh1, cc1, cc1::{closure#2}, cc2::{closure#2}, cp1; proof_assert verified on a case whose contract is false, and not declared by `//@ also-verified-assertion:`: creusot_test::mh1 (1 verified, 0 declared), creusot_test::mh2 (1 verified, 0 declared)

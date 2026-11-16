@@ -6,10 +6,11 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use rustc_index::bit_set::MixedBitSet;
-use rustc_middle::mir::visit::Visitor;
+use rustc_middle::mir::visit::{PlaceContext, TyContext, Visitor};
 use rustc_middle::mir::{
-    self, BasicBlock, CallReturnPlaces, Local, Location, Statement, StatementKind, TerminatorEdges,
+    self, BasicBlock, CallReturnPlaces, Local, Location, Statement, StatementKind,
 };
+use rustc_middle::ty::Ty;
 use rustc_mir_dataflow::fmt::DebugWithContext;
 use rustc_mir_dataflow::{Analysis, JoinSemiLattice};
 
@@ -112,13 +113,13 @@ where
 
     /// `&` only allow mutation if the borrowed place is `!Freeze`.
     ///
-    /// This assumes that it is UB to take the address of a struct field whose type is
-    /// `Freeze`, then use pointer arithmetic to derive a pointer to a *different* field of
-    /// that same struct whose type is `!Freeze`. If we decide that this is not UB, we will
-    /// have to check the type of the borrowed **local** instead of the borrowed **place**
-    /// below. See [rust-lang/unsafe-code-guidelines#134].
-    ///
-    /// [rust-lang/unsafe-code-guidelines#134]: https://github.com/rust-lang/unsafe-code-guidelines/issues/134
+    /// This assumes that const-eval will abort when one creates a shared reference to a struct
+    /// field whose type is `Freeze`, then uses pointer arithmetic to derive a pointer to a
+    /// *different* field of that same struct whose type is `!Freeze` and mutates that. It is not
+    /// enough for that to be UB (which we are pretty sure it is, and it would be a breaking change
+    /// to make it non-UB as we'd then have to make const checking more conservative here),
+    /// const-eval also has to reliably detect that UB to ensure we never invoke a destructor after
+    /// such a mutation occurs!
     fn shared_borrow_allows_mutation(&self, place: mir::Place<'tcx>) -> bool {
         !place.ty(self.ccx.body, self.ccx.tcx).ty.is_freeze(self.ccx.tcx, self.ccx.typing_env)
     }
@@ -128,9 +129,13 @@ impl<'tcx, Q> Visitor<'tcx> for TransferFunction<'_, 'tcx, Q>
 where
     Q: Qualif,
 {
-    fn visit_operand(&mut self, operand: &mir::Operand<'tcx>, location: Location) {
-        self.super_operand(operand, location);
+    fn visit_place(&mut self, _: &mir::Place<'tcx>, _: PlaceContext, _: Location) {}
 
+    fn visit_source_info(&mut self, _: &mir::SourceInfo) {}
+
+    fn visit_ty(&mut self, _: Ty<'tcx>, _: TyContext) {}
+
+    fn visit_operand(&mut self, operand: &mir::Operand<'tcx>, _location: Location) {
         if !Q::IS_CLEARED_ON_MOVE {
             return;
         }
@@ -163,11 +168,13 @@ where
 
         // We need to assign qualifs to the left-hand side before visiting `rvalue` since
         // qualifs can be cleared on move.
-        self.super_assign(place, rvalue, location);
+        self.visit_rvalue(rvalue, location);
     }
 
     fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
-        self.super_rvalue(rvalue, location);
+        if Q::IS_CLEARED_ON_MOVE {
+            self.super_rvalue(rvalue, location);
+        }
 
         match rvalue {
             mir::Rvalue::RawPtr(_mt, borrowed_place) => {
@@ -233,7 +240,9 @@ where
 
         // We ignore borrow on drop because custom drop impls are not allowed in consts.
         // FIXME: Reconsider if accounting for borrows in drops is necessary for const drop.
-        self.super_terminator(terminator, location);
+        if Q::IS_CLEARED_ON_MOVE {
+            self.super_terminator(terminator, location);
+        }
     }
 }
 
@@ -247,7 +256,7 @@ impl<'mir, 'tcx, Q> FlowSensitiveAnalysis<'mir, 'tcx, Q>
 where
     Q: Qualif,
 {
-    pub(super) fn new(_: Q, ccx: &'mir ConstCx<'mir, 'tcx>) -> Self {
+    pub(super) fn new(ccx: &'mir ConstCx<'mir, 'tcx>) -> Self {
         FlowSensitiveAnalysis { ccx, _qualif: PhantomData }
     }
 
@@ -309,7 +318,7 @@ impl<C> DebugWithContext<C> for State {
 
         if self.borrow != old.borrow {
             f.write_str("borrow: ")?;
-            self.qualif.fmt_diff_with(&old.borrow, ctxt, f)?;
+            self.borrow.fmt_diff_with(&old.borrow, ctxt, f)?;
             f.write_str("\n")?;
         }
 
@@ -351,14 +360,13 @@ where
         self.transfer_function(state).visit_statement(statement, location);
     }
 
-    fn apply_primary_terminator_effect<'mir>(
+    fn apply_primary_terminator_effect(
         &self,
         state: &mut Self::Domain,
-        terminator: &'mir mir::Terminator<'tcx>,
+        terminator: &mir::Terminator<'tcx>,
         location: Location,
-    ) -> TerminatorEdges<'mir, 'tcx> {
+    ) {
         self.transfer_function(state).visit_terminator(terminator, location);
-        terminator.edges()
     }
 
     fn apply_call_return_effect(

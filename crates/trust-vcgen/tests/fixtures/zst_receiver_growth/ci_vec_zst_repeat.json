@@ -1,0 +1,389 @@
+{
+  "name": "ci_vec_zst_repeat",
+  "def_path": "zst_receiver_growth::ci_vec_zst_repeat",
+  "span": {
+    "file": "zst_receiver_growth.rs",
+    "line_start": 21,
+    "col_start": 0,
+    "line_end": 25,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Seq": {
+                "elem": "Unit"
+              }
+            }
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Seq": {
+                "elem": "Unit"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "core::iter::adapters::take::Take",
+            "fields": [
+              [
+                "iter",
+                {
+                  "Adt": {
+                    "name": "core::iter::sources::repeat::Repeat",
+                    "fields": [
+                      [
+                        "element",
+                        "Unit"
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "n",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::iter::sources::repeat::Repeat",
+            "fields": [
+              [
+                "element",
+                "Unit"
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        100,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "zst_receiver_growth.rs",
+                "line_start": 22,
+                "col_start": 7,
+                "line_end": 22,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                4
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "zst_receiver_growth.rs",
+              "line_start": 22,
+              "col_start": 7,
+              "line_end": 22,
+              "col_end": 14
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::iter::sources::repeat::repeat::<()>",
+            "args": [
+              {
+                "Constant": "Unit"
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "zst_receiver_growth.rs",
+              "line_start": 23,
+              "col_start": 8,
+              "line_end": 23,
+              "col_end": 29
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 10160,
+              "substs_digest": [
+                5840577265060326432,
+                106976006556397167
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<core::iter::sources::repeat::Repeat<()> as core::iter::traits::iterator::Iterator>::take",
+            "args": [
+              {
+                "Constant": "OpaqueConst"
+              },
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "zst_receiver_growth.rs",
+              "line_start": 23,
+              "col_start": 8,
+              "line_end": 23,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 10584,
+              "substs_digest": [
+                15017719056119517797,
+                3567129618180580131
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<core::iter::adapters::take::Take<core::iter::sources::repeat::Repeat<()>> as core::iter::traits::iterator::Iterator>::collect_into::<alloc::vec::Vec<()>>::<__trust_elem_bytes@0>",
+            "args": [
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "zst_receiver_growth.rs",
+              "line_start": 23,
+              "col_start": 8,
+              "line_end": 23,
+              "col_end": 53
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 10607,
+              "substs_digest": [
+                16993143940127097650,
+                10064196522090781714
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

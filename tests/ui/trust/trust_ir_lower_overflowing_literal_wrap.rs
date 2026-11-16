@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // The ConstTypeMismatch-cluster root-fix (full-population frontier,
 // wave-full-0831): integer literals WRAP into their declared width. The old
 // literal lowering assumed "typeck already rejected every out-of-range

@@ -19,6 +19,7 @@ pub fn raw_rustc_output(project: &Project, path: &str, extra: &[&str]) -> String
     }
     let rustc_output = match proc
         .arg("--crate-type=lib")
+        .arg("--edition=2015")
         .args(extra)
         .cwd(project.root())
         .exec_with_output()
@@ -73,7 +74,7 @@ fn deduplicate_messages_basic() {
 [WARNING] `foo` (lib) generated 1 warning[..]
 [WARNING] `foo` (lib test) generated 1 warning (1 duplicate)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[EXECUTABLE] unittests src/lib.rs (target/debug/deps/foo-[HASH][EXE])
+[EXECUTABLE] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 ",
         rustc_message
     );
@@ -122,7 +123,7 @@ fn deduplicate_messages_mismatched_warnings() {
 {}\
 [WARNING] `foo` (lib test) generated 2 warnings (1 duplicate)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[EXECUTABLE] unittests src/lib.rs (target/debug/deps/foo-[HASH][EXE])
+[EXECUTABLE] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 ",
         lib_output, lib_test_output
     );

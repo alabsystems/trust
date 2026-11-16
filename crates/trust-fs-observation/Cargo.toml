@@ -1,0 +1,32 @@
+[package]
+name = "trust-fs-observation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Bounded filesystem content observations and execution-window change detection"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+test-support = ["dep:tempfile"]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+trust-sha2 = { path = "../trust-sha2" }
+tempfile = { version = "3", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"

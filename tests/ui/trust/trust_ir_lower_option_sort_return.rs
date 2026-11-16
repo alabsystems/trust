@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-OS1a: the one-sort agreement's first increment
 // (docs/design/2026-08-31-os1-option-one-sort-entry.md). A body whose
 // declared return is an opaque-lane Option and whose DIRECT TAIL is a bare

@@ -43,7 +43,7 @@ SRC="$REPO_ROOT/crates/trust-widthconv/src/lib.rs"
 CONSUMER_MANIFEST="$REPO_ROOT/crates/trust-vcgen/Cargo.toml"
 CONSUMER_PACKAGE="trust-vcgen"
 CONSUMER_DEP_LINE='trust-widthconv = { workspace = true }'
-WORKSPACE_LOCK="$REPO_ROOT/crates/Cargo.lock"
+WORKSPACE_LOCK="$REPO_ROOT/Cargo.lock"
 # Trust: `build/host` is a symlink to `build/<host-triple>`, so this resolves on
 # every platform. It used to name `aarch64-apple-darwin` literally, which meant
 # that on any non-Apple host this gate could only ever print
@@ -205,9 +205,9 @@ no_rustc_error() { # no_rustc_error <label>
 
 fail() { echo "  FAIL $*"; fails=$((fails+1)); }
 
-run() { # run [policy]; sets RC and LOG
+run() { # run [lane flag]; sets RC and LOG
   LOG="$(mktemp)"
-  ( cd "$REPO_ROOT/crates" && TRUSTFLAGS="${1:-}" "$TARGO" trust check -p trust-widthconv ) > "$LOG" 2>&1
+  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check --all-rows ${1:+"$1"} -p trust-widthconv ) > "$LOG" 2>&1
   RC=$?
   require_env "${STEP:-run}"
   no_rustc_error "${STEP:-run}"
@@ -223,9 +223,9 @@ prepare_consumer_candidate() {
     --materialize-consumer-candidate \
     "$REPO_ROOT" "$CANDIDATE_ROOT" "$CONSUMER_PACKAGE"
   [ "$?" -eq 0 ] || { echo "REFUSE: could not materialize mutation-G candidate" >&2; exit 3; }
-  cmp -s "$WORKSPACE_LOCK" "$CANDIDATE_ROOT/crates/Cargo.lock" \
+  cmp -s "$WORKSPACE_LOCK" "$CANDIDATE_ROOT/Cargo.lock" \
     || { echo "REFUSE: candidate lock does not start byte-identical" >&2; exit 3; }
-  [ ! "$WORKSPACE_LOCK" -ef "$CANDIDATE_ROOT/crates/Cargo.lock" ] \
+  [ ! "$WORKSPACE_LOCK" -ef "$CANDIDATE_ROOT/Cargo.lock" ] \
     || { echo "REFUSE: candidate lock is not inode-independent" >&2; exit 3; }
   [ ! "$CONSUMER_MANIFEST" -ef "$CANDIDATE_MANIFEST" ] \
     || { echo "REFUSE: candidate consumer manifest is not inode-independent" >&2; exit 3; }
@@ -245,7 +245,7 @@ run_consumer_raw() {
   LOG="$(mktemp)"
   ( cd "$CANDIDATE_ROOT/crates" \
     && CARGO_TARGET_DIR="$CANDIDATE_ROOT/target" \
-      "$TARGO" --unverified check --manifest-path "$CANDIDATE_ROOT/crates/Cargo.toml" \
+      "$TARGO" --unverified check --manifest-path "$CANDIDATE_ROOT/Cargo.toml" \
         -p "$CONSUMER_PACKAGE" ) > "$LOG" 2>&1
   RC=$?
   assert_live_candidate_inputs \
@@ -263,7 +263,7 @@ runtests() { # sets RC and LOG
   RC=$?
   require_env "${STEP:-tests}"
 }
-gate_line() { grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$LOG" | tail -1; }
+gate_line() { grep -oE 'Gate: [A-Z-]+ \[[a-z-]+ lane, exit [0-9]+\]' "$LOG" | tail -1; }
 
 # ---------------------------------------------------------------------------
 # G2. `ok` MUST MEAN "THIS SECTION'S OWN CONTENT ASSERTIONS HELD".
@@ -345,20 +345,17 @@ rm -f "$LOG"
 
 mut_end
 # ---------------------------------------------------------------------------
-# 2. THE SAME PASS UNDER `-Ztrust-policy=certify`.
-#    A misspelled TRUSTFLAGS is silently dropped, so first prove the flag path
-#    reaches the compiler by requiring a bogus policy to be REJECTED BY NAME.
+# 2. THE SAME PASS UNDER `--certify` (the compiler's `certify` policy).
+#    The lane flag selects the compiler's `certify` policy, and the Gate line
+#    names the lane that graded the run, so `[certify lane, exit 0]` is the
+#    evidence that certify ran. (A bogus-policy control proved the TRUSTFLAGS
+#    route reached the compiler; it went with that channel, DECISION_QUEUE T7a.)
 # ---------------------------------------------------------------------------
 STEP="CERTIFY"; mut_begin
-run "-Ztrust-policy=bogus_not_a_policy"
-grep -q "incorrect value \`bogus_not_a_policy\` for unstable option \`trust-policy\`" "$LOG" \
-  || fail "TRUSTFLAGS control: a bogus policy was NOT rejected — the flag never reaches the compiler, so the certify run below proves nothing"
-rm -f "$LOG"
-
-run "-Ztrust-policy=certify"
+run "--certify"
 G="$(gate_line)"
 [ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
-case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
+case "$G" in *"PASS [certify lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
 grep -qE 'Summary: 48 proved, 0 failed, .*0 inconclusive \(48 total\)' "$LOG" \
   || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 grep -qE 'Publication boundary: [0-9]+ obligation\(s\) passed the compiler, 48 published, [0-9]+ WITHHELD .*\(0 relabelled unknown' "$LOG" \

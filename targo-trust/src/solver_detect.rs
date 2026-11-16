@@ -48,17 +48,12 @@ const KNOWN_SOLVERS: &[SolverSpec] = &[
         description: "Auto-active SMT proof calculus; mir-memory certificates",
         proof_levels: &["L0"],
     },
-    // Trust (TrustWP verdict-authority retirement): the `L1` level below is a
-    // ROUTING fact, not a capability claim. `TrustWpRouterBackend` is registered
-    // unconditionally (`trust_verify.rs`, `discover_router_backends`) and its
-    // `Deductive` role ranks first for `L1Functional` (`trust-router`
-    // `routing.rs`, `backend_preference_rank`), but the native engine behind it
-    // advertises no obligation kinds, so past canonical constant folding
-    // (`trust_wp_backend.rs`, `verify`) every routed VC fail-closes to `Unknown`.
+    // Trust: body-aware WP accepts supported postconditions only through the
+    // typed TrustIR full-verifier route. The per-VC router creates no WP request.
     SolverSpec {
         name: "trust-wp",
         binary: "trust-wp",
-        description: "Zero-capability: routed for L1 contract VCs, proves only constant folds",
+        description: "Body-aware deductive postconditions over typed TrustIR",
         proof_levels: &["L1"],
     },
     SolverSpec {

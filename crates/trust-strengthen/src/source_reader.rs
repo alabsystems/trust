@@ -9,6 +9,8 @@
 
 use std::path::Path;
 
+use trust_types::fx::FxHashSet;
+
 /// Extracted context from a function's source code.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceContext {
@@ -29,7 +31,7 @@ pub struct SourceContext {
 /// Read a source file and extract the function with the given name.
 ///
 /// Returns `None` if the file cannot be read or the function is not found.
-/// Used only in tests (proposer).
+/// Used by [`crate::run`] when a function's path names a source file.
 #[must_use]
 pub fn read_function(path: impl AsRef<Path>, function_name: &str) -> Option<SourceContext> {
     let source = std::fs::read_to_string(path.as_ref()).ok()?;
@@ -39,13 +41,11 @@ pub fn read_function(path: impl AsRef<Path>, function_name: &str) -> Option<Sour
 /// Extract a function from source text by name (no file I/O).
 ///
 /// Finds `fn <name>(` and extracts the full function including body.
-/// Used only in tests (proposer).
 #[must_use]
 pub fn extract_function(source: &str, function_name: &str) -> Option<SourceContext> {
-    // Find the function declaration: `fn function_name(` or `fn function_name<`
-    let needle_paren = format!("fn {function_name}(");
-    let needle_generic = format!("fn {function_name}<");
-    let fn_start = source.find(&needle_paren).or_else(|| source.find(&needle_generic))?;
+    // Find the function declaration: `fn function_name(` or `fn function_name<` without format! allocations.
+    let fn_start = find_delimited(source, "fn ", function_name, b'(')
+        .or_else(|| find_delimited(source, "fn ", function_name, b'<'))?;
 
     // Walk backward to find any attributes or visibility modifiers on this line
     let decl_start = source[..fn_start].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
@@ -133,9 +133,9 @@ fn find_matching_brace(s: &str) -> Option<usize> {
     let mut escape_next = false;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
-    let chars: Vec<char> = s.chars().collect();
+    let mut iter = s.char_indices().peekable();
 
-    for (i, &ch) in chars.iter().enumerate() {
+    while let Some((i, ch)) = iter.next() {
         if escape_next {
             escape_next = false;
             continue;
@@ -149,18 +149,18 @@ fn find_matching_brace(s: &str) -> Option<usize> {
         }
 
         if in_block_comment {
-            if ch == '*' && chars.get(i + 1) == Some(&'/') {
+            if ch == '*' && iter.peek().is_some_and(|&(_, next)| next == '/') {
                 in_block_comment = false;
             }
             continue;
         }
 
         if ch == '/' && !in_string && !in_char {
-            if chars.get(i + 1) == Some(&'/') {
+            if iter.peek().is_some_and(|&(_, next)| next == '/') {
                 in_line_comment = true;
                 continue;
             }
-            if chars.get(i + 1) == Some(&'*') {
+            if iter.peek().is_some_and(|&(_, next)| next == '*') {
                 in_block_comment = true;
                 continue;
             }
@@ -200,7 +200,7 @@ fn find_matching_brace(s: &str) -> Option<usize> {
 /// Find the position of the matching closing paren for an opening paren at position 0.
 fn find_matching_paren(s: &str) -> Option<usize> {
     let mut depth = 0;
-    for (i, ch) in s.chars().enumerate() {
+    for (i, ch) in s.char_indices() {
         match ch {
             '(' => depth += 1,
             ')' => {
@@ -216,49 +216,112 @@ fn find_matching_paren(s: &str) -> Option<usize> {
 }
 
 /// Split parameter string by commas, respecting nested `<>`, `()`, `[]`.
-fn split_params(s: &str) -> Vec<String> {
+fn split_params(s: &str) -> Vec<&str> {
     let mut result = Vec::new();
-    let mut current = String::new();
+    let mut start = 0;
     let mut depth = 0i32; // tracks <>, (), []
 
-    for ch in s.chars() {
+    for (i, ch) in s.char_indices() {
         match ch {
-            '<' | '(' | '[' => {
-                depth += 1;
-                current.push(ch);
-            }
-            '>' | ')' | ']' => {
-                depth -= 1;
-                current.push(ch);
-            }
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
             ',' if depth == 0 => {
-                result.push(current.clone());
-                current.clear();
+                result.push(&s[start..i]);
+                start = i + 1;
             }
-            _ => current.push(ch),
+            _ => {}
         }
     }
-    if !current.trim().is_empty() {
-        result.push(current);
+    let tail = &s[start..];
+    if !tail.trim().is_empty() {
+        result.push(tail);
     }
     result
+}
+
+/// Zero-allocation search for `{prefix}{mid}{suffix}` in `haystack`, where `prefix` starts
+/// with an ASCII byte and `suffix` is a single ASCII byte.
+fn find_delimited(haystack: &str, prefix: &str, mid: &str, suffix: u8) -> Option<usize> {
+    let total_len = prefix.len() + mid.len() + 1;
+    if haystack.len() < total_len {
+        return None;
+    }
+    let bytes = haystack.as_bytes();
+    let mid_bytes = mid.as_bytes();
+    let mut offset = 0;
+    while let Some(rel) = haystack[offset..].find(prefix) {
+        let pos = offset + rel;
+        let after_prefix = pos + prefix.len();
+        if bytes.len() >= after_prefix + mid_bytes.len() + 1
+            && bytes[after_prefix..].starts_with(mid_bytes)
+            && bytes[after_prefix + mid_bytes.len()] == suffix
+        {
+            return Some(pos);
+        }
+        offset = pos + 1;
+    }
+    None
+}
+
+/// Zero-allocation check for `{prefix}{name}` in `body`, where `prefix` starts with ASCII.
+fn body_contains_prefixed(body: &str, prefix: &str, name: &str) -> bool {
+    let need = prefix.len() + name.len();
+    if body.len() < need {
+        return false;
+    }
+    let bytes = body.as_bytes();
+    let name_bytes = name.as_bytes();
+    let mut offset = 0;
+    while let Some(rel) = body[offset..].find(prefix) {
+        let pos = offset + rel;
+        let after = pos + prefix.len();
+        if bytes[after..].starts_with(name_bytes) {
+            return true;
+        }
+        offset = pos + 1;
+    }
+    false
+}
+
+#[inline]
+fn is_divisor_in_body(body: &str, name: &str) -> bool {
+    body_contains_prefixed(body, "/ ", name) || body_contains_prefixed(body, "% ", name)
+}
+
+#[inline]
+fn is_shift_in_body(body: &str, name: &str) -> bool {
+    body_contains_prefixed(body, "<< ", name) || body_contains_prefixed(body, ">> ", name)
+}
+
+/// Convenience: find the first parameter name that looks like a divisor.
+#[must_use]
+pub(crate) fn find_first_divisor_param(ctx: &SourceContext) -> Option<&str> {
+    ctx.params
+        .iter()
+        .find(|(name, _)| is_divisor_in_body(&ctx.body, name))
+        .map(|(name, _)| name.as_str())
 }
 
 /// Convenience: find parameter names that look like divisors.
 ///
 /// Heuristic: a parameter used as the RHS of `/` or `%` in the body.
+#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 pub(crate) fn find_divisor_params(ctx: &SourceContext) -> Vec<String> {
     ctx.params
         .iter()
-        .filter(|(name, _)| {
-            // Check if this parameter appears as a divisor in the body
-            let div_pattern = format!("/ {name}");
-            let rem_pattern = format!("% {name}");
-            ctx.body.contains(&div_pattern) || ctx.body.contains(&rem_pattern)
-        })
+        .filter(|(name, _)| is_divisor_in_body(&ctx.body, name))
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// Convenience: find the first parameter name used as a SHIFT AMOUNT.
+#[must_use]
+pub(crate) fn find_first_shift_param(ctx: &SourceContext) -> Option<&str> {
+    ctx.params
+        .iter()
+        .find(|(name, _)| is_shift_in_body(&ctx.body, name))
+        .map(|(name, _)| name.as_str())
 }
 
 /// Convenience: find parameter names used as a SHIFT AMOUNT.
@@ -267,17 +330,26 @@ pub(crate) fn find_divisor_params(ctx: &SourceContext) -> Vec<String> {
 /// (`x << k` / `x >> k`). Mirrors `find_divisor_params`; the safe precondition
 /// is `<param> < <operand bit width>` (the width comes from the VC's
 /// `operand_ty`, not the source).
+#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 pub(crate) fn find_shift_params(ctx: &SourceContext) -> Vec<String> {
     ctx.params
         .iter()
-        .filter(|(name, _)| {
-            let shl_pattern = format!("<< {name}");
-            let shr_pattern = format!(">> {name}");
-            ctx.body.contains(&shl_pattern) || ctx.body.contains(&shr_pattern)
-        })
+        .filter(|(name, _)| is_shift_in_body(&ctx.body, name))
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// Convenience: find the first parameter name that looks like an array index.
+#[must_use]
+pub(crate) fn find_first_index_param(ctx: &SourceContext) -> Option<(&str, Option<&str>)> {
+    for (name, _) in &ctx.params {
+        if let Some(pos) = find_delimited(&ctx.body, "[", name, b']') {
+            let array_name = array_before_bracket(&ctx.body, pos);
+            return Some((name.as_str(), array_name));
+        }
+    }
+    None
 }
 
 /// Convenience: find parameter names that look like array indices.
@@ -288,30 +360,24 @@ pub(crate) fn find_index_params(ctx: &SourceContext) -> Vec<(String, Option<Stri
     let mut results = Vec::new();
 
     for (name, _) in &ctx.params {
-        // Check for `something[name]` pattern
-        let bracket_pattern = format!("[{name}]");
-        if ctx.body.contains(&bracket_pattern) {
-            // Try to find the array being indexed: look for `array_name[name]`
-            let array_name = find_array_for_index(&ctx.body, name);
+        // Check for `something[name]` pattern in one pass without format! allocation.
+        if let Some(pos) = find_delimited(&ctx.body, "[", name, b']') {
+            let array_name = array_before_bracket(&ctx.body, pos).map(str::to_string);
             results.push((name.clone(), array_name));
         }
     }
     results
 }
 
-/// Find the array/slice variable being indexed by a given index variable.
-fn find_array_for_index(body: &str, index_name: &str) -> Option<String> {
-    let pattern = format!("[{index_name}]");
-    let pos = body.find(&pattern)?;
-
-    // Walk backward from `[` to find the identifier
+/// Extract the identifier immediately preceding `[` at byte position `pos` in `body`.
+fn array_before_bracket(body: &str, pos: usize) -> Option<&str> {
     let before = &body[..pos];
     let ident_end = before.len();
     let ident_start =
         before.rfind(|c: char| !c.is_alphanumeric() && c != '_').map(|p| p + 1).unwrap_or(0);
 
     let ident = &before[ident_start..ident_end];
-    if ident.is_empty() { None } else { Some(ident.to_string()) }
+    if ident.is_empty() { None } else { Some(ident) }
 }
 
 /// Find the source parameter that most plausibly drives a bulk allocation's
@@ -321,8 +387,8 @@ fn find_array_for_index(body: &str, index_name: &str) -> Option<String> {
 /// constant or otherwise not caller-controllable — in which case NO precondition
 /// can soundly excuse the allocation and the obligation must stand (the guard
 /// that keeps the auto-fix from erasing a ground L0 hard error).
-pub(crate) fn find_size_param(ctx: &SourceContext) -> Option<String> {
-    ctx.params.iter().find(|(_, ty)| is_integer_type(ty)).map(|(name, _)| name.clone())
+pub(crate) fn find_size_param(ctx: &SourceContext) -> Option<&str> {
+    ctx.params.iter().find(|(_, ty)| is_integer_type(ty)).map(|(name, _)| name.as_str())
 }
 
 fn is_integer_type(ty: &str) -> bool {
@@ -344,50 +410,202 @@ fn is_integer_type(ty: &str) -> bool {
     )
 }
 
-/// Find parameter pairs involved in arithmetic operations that could overflow.
-///
-/// Returns pairs of (left_operand, right_operand, operator).
-#[must_use]
-pub(crate) fn find_arithmetic_operands(ctx: &SourceContext) -> Vec<(String, String, char)> {
-    let mut results = Vec::new();
-    let param_names: Vec<&str> = ctx.params.iter().map(|(n, _)| n.as_str()).collect();
+/// An operand pair recovered from a binary arithmetic expression in the body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArithmeticOperands {
+    /// Left operand: a bare variable name bound in the function.
+    pub left: String,
+    /// Right operand: a bare variable name bound in the function.
+    pub right: String,
+    /// The operator (`+`, `-` or `*`).
+    pub op: char,
+    /// Whether BOTH operands are function parameters. Only then may a
+    /// `requires` clause name them; a body local is out of scope in a
+    /// precondition.
+    pub both_params: bool,
+}
 
-    for op in ['+', '-', '*'] {
-        let op_str = format!(" {op} ");
-        for occurrence in ctx.body.match_indices(&op_str) {
-            let pos = occurrence.0;
-            // Look for parameter names on either side
+/// Find the first variable pair involved in `op` (`+`, `-`, or `*`) in the body.
+#[must_use]
+pub(crate) fn find_first_arithmetic_operand_pair(
+    ctx: &SourceContext,
+    op: char,
+) -> Option<ArithmeticOperands> {
+    let op_str = match op {
+        '+' => " + ",
+        '-' => " - ",
+        '*' => " * ",
+        _ => return None,
+    };
+    let mut locals: Option<FxHashSet<&str>> = None;
+    let has_param = |name: &str| ctx.params.iter().any(|(n, _)| n == name);
+
+    for (pos, _) in ctx.body.match_indices(op_str) {
+        let before = &ctx.body[..pos];
+        let after = &ctx.body[pos + op_str.len()..];
+
+        let (Some(l), Some(r)) = (bare_trailing_ident(before), bare_leading_ident(after)) else {
+            continue;
+        };
+        let l_param = has_param(l);
+        if !l_param && !locals.get_or_insert_with(|| find_let_bindings(&ctx.body)).contains(l) {
+            continue;
+        }
+        let r_param = has_param(r);
+        if !r_param && !locals.get_or_insert_with(|| find_let_bindings(&ctx.body)).contains(r) {
+            continue;
+        }
+        return Some(ArithmeticOperands {
+            left: l.to_string(),
+            right: r.to_string(),
+            op,
+            both_params: l_param && r_param,
+        });
+    }
+    None
+}
+
+/// Find variable pairs involved in arithmetic operations that could overflow.
+///
+/// An operand is accepted only when it is a bare identifier (not a field
+/// access, method receiver, call, or index) that the function
+/// actually binds: a parameter or a `let` binding in the body. Nothing is ever
+/// synthesized, so every returned name occurs in the function's source.
+#[must_use]
+pub(crate) fn find_arithmetic_operand_pairs(ctx: &SourceContext) -> Vec<ArithmeticOperands> {
+    let mut results = Vec::new();
+    let param_set: FxHashSet<&str> = ctx.params.iter().map(|(n, _)| n.as_str()).collect();
+    let locals = find_let_bindings(&ctx.body);
+
+    for (op, op_str) in [('+', " + "), ('-', " - "), ('*', " * ")] {
+        for (pos, _) in ctx.body.match_indices(op_str) {
             let before = &ctx.body[..pos];
             let after = &ctx.body[pos + op_str.len()..];
 
-            let left = extract_trailing_ident(before);
-            let right = extract_leading_ident(after);
-
-            if let (Some(l), Some(r)) = (left, right)
-                && (param_names.contains(&l.as_str()) || param_names.contains(&r.as_str()))
-            {
-                results.push((l, r, op));
+            let (Some(l), Some(r)) = (bare_trailing_ident(before), bare_leading_ident(after))
+            else {
+                continue;
+            };
+            let l_param = param_set.contains(l);
+            if !l_param && !locals.contains(l) {
+                continue;
             }
+            let r_param = param_set.contains(r);
+            if !r_param && !locals.contains(r) {
+                continue;
+            }
+            results.push(ArithmeticOperands {
+                left: l.to_string(),
+                right: r.to_string(),
+                op,
+                both_params: l_param && r_param,
+            });
         }
     }
     results
 }
 
+/// Names bound by `let` / `let mut` in a function body (simple identifier
+/// patterns only; destructuring patterns are not recovered).
+fn find_let_bindings(body: &str) -> FxHashSet<&str> {
+    let mut names = FxHashSet::default();
+    for (pos, _) in body.match_indices("let ") {
+        if body[..pos].chars().next_back().is_some_and(is_ident_char) {
+            continue;
+        }
+        let rest = body[pos + "let ".len()..].trim_start();
+        let rest = rest.strip_prefix("mut ").map_or(rest, str::trim_start);
+        if let Some(name) = extract_leading_ident(rest)
+            && is_variable_name(name)
+        {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// A plausible variable name: starts with a letter or `_`, is not a keyword.
+fn is_variable_name(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && name != "_"
+        && !matches!(
+            name,
+            "as" | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "else"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "true"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+        )
+}
+
+/// The identifier ending `s`, only when it stands alone as an operand: not a
+/// field (`x.f`), a path segment (`m::x`), or a lifetime/label.
+fn bare_trailing_ident(s: &str) -> Option<&str> {
+    let trimmed = s.trim_end();
+    let ident = extract_trailing_ident(trimmed)?;
+    let prefix = &trimmed[..trimmed.len() - ident.len()];
+    if matches!(prefix.chars().next_back(), Some('.' | ':' | '\'')) {
+        return None;
+    }
+    is_variable_name(ident).then_some(ident)
+}
+
+/// The identifier starting `s`, only when it stands alone as an operand: not a
+/// method receiver, call, index, path, or macro (`x.f`, `x(..)`, `x[..]`,
+/// `x::y`, `x!`).
+fn bare_leading_ident(s: &str) -> Option<&str> {
+    let trimmed = s.trim_start();
+    let ident = extract_leading_ident(trimmed)?;
+    let suffix = trimmed[ident.len()..].trim_start();
+    if matches!(suffix.chars().next(), Some('.' | '(' | '[' | ':' | '!' | '{')) {
+        return None;
+    }
+    is_variable_name(ident).then_some(ident)
+}
+
 /// Extract the trailing identifier from a string.
-fn extract_trailing_ident(s: &str) -> Option<String> {
+fn extract_trailing_ident(s: &str) -> Option<&str> {
     let trimmed = s.trim_end();
     let start =
         trimmed.rfind(|c: char| !c.is_alphanumeric() && c != '_').map(|p| p + 1).unwrap_or(0);
     let ident = &trimmed[start..];
-    if ident.is_empty() { None } else { Some(ident.to_string()) }
+    if ident.is_empty() { None } else { Some(ident) }
 }
 
 /// Extract the leading identifier from a string.
-fn extract_leading_ident(s: &str) -> Option<String> {
+fn extract_leading_ident(s: &str) -> Option<&str> {
     let trimmed = s.trim_start();
     let end = trimmed.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(trimmed.len());
     let ident = &trimmed[..end];
-    if ident.is_empty() { None } else { Some(ident.to_string()) }
+    if ident.is_empty() { None } else { Some(ident) }
 }
 
 #[cfg(test)]
@@ -508,19 +726,41 @@ mod tests {
         assert_eq!(indices[0].1, Some("arr".to_string()));
     }
 
-    // --- find_arithmetic_operands tests ---
+    // --- find_arithmetic_operand_pairs tests ---
 
     #[test]
     fn test_find_arithmetic_operands_midpoint() {
         let ctx = extract_function(MIDPOINT_SOURCE, "get_midpoint").unwrap();
-        let ops = find_arithmetic_operands(&ctx);
-        assert!(!ops.is_empty());
-        // Should find a + b
-        let add_op = ops.iter().find(|(_, _, op)| *op == '+');
-        assert!(add_op.is_some(), "should find addition of a + b");
-        let (l, r, _) = add_op.unwrap();
-        assert_eq!(l, "a");
-        assert_eq!(r, "b");
+        let ops = find_arithmetic_operand_pairs(&ctx);
+        // Should find a + b, both parameters
+        let add_op = ops.iter().find(|pair| pair.op == '+').expect("should find a + b");
+        assert_eq!(add_op.left, "a");
+        assert_eq!(add_op.right, "b");
+        assert!(add_op.both_params);
+    }
+
+    #[test]
+    fn test_find_arithmetic_operand_pairs_accepts_locals() {
+        let ctx = extract_function(BINARY_SEARCH_SOURCE, "binary_search").unwrap();
+        let pairs = find_arithmetic_operand_pairs(&ctx);
+        let add = pairs.iter().find(|p| p.op == '+').expect("low + high is a local pair");
+        assert_eq!((add.left.as_str(), add.right.as_str()), ("low", "high"));
+        assert!(!add.both_params, "low/high are body locals, not parameters");
+        // `arr.len() - 1` and `mid + 1` name no bound variable pair.
+        assert!(pairs.iter().all(|p| p.left != "len" && p.right != "1"));
+        // No pair here is parameter-only, so no precondition may name one.
+        assert!(pairs.iter().all(|p| !p.both_params));
+    }
+
+    #[test]
+    fn test_find_arithmetic_operand_pairs_rejects_fields_and_unbound_names() {
+        let source = "fn f(s: &S, y: u32) -> u32 {\n    s.x + y + z.len() + w\n}";
+        let ctx = extract_function(source, "f").unwrap();
+        let pairs = find_arithmetic_operand_pairs(&ctx);
+        assert!(
+            pairs.is_empty(),
+            "field `x`, receiver `z` and unbound `w` are not operands: {pairs:?}"
+        );
     }
 
     // --- read_function (file I/O) tests ---
@@ -529,10 +769,6 @@ mod tests {
     fn test_read_function_from_midpoint_example() {
         // This test reads the actual examples/midpoint.rs file
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/midpoint.rs");
-        if !Path::new(path).exists() {
-            // Skip gracefully if examples dir not accessible from test runner
-            return;
-        }
         let ctx =
             read_function(path, "get_midpoint").expect("should read get_midpoint from midpoint.rs");
         assert_eq!(ctx.function_name, "get_midpoint");
@@ -544,9 +780,6 @@ mod tests {
     #[test]
     fn test_read_function_from_binary_search_example() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/binary_search.rs");
-        if !Path::new(path).exists() {
-            return;
-        }
         let ctx = read_function(path, "binary_search")
             .expect("should read binary_search from binary_search.rs");
         assert_eq!(ctx.function_name, "binary_search");
@@ -630,5 +863,29 @@ fn second(b: i32) -> i32 {
         assert_eq!(ctx.params[0].1, "HashMap<String, Vec<u8>>");
         assert_eq!(ctx.params[1].0, "count");
         assert_eq!(ctx.params[1].1, "usize");
+    }
+
+    #[test]
+    fn wave492_zero_alloc_matchers_and_lazy_locals_parity() {
+        let source = r#"
+fn helper_prefix(x: u32) -> u32 { x }
+fn helper<T: Copy>(arr: &[T], idx: usize, shift: u32, div: u32, a: u32) -> u32 {
+    let local = a << shift;
+    let _ = &arr[idx];
+    let sum = local + a;
+    sum / div
+}
+"#;
+        let ctx = extract_function(source, "helper").expect("should find generic helper, not helper_prefix");
+        assert_eq!(find_first_divisor_param(&ctx), Some("div"));
+        assert_eq!(find_divisor_params(&ctx), vec!["div".to_string()]);
+        assert_eq!(find_first_shift_param(&ctx), Some("shift"));
+        assert_eq!(find_shift_params(&ctx), vec!["shift".to_string()]);
+        assert_eq!(find_first_index_param(&ctx), Some(("idx", Some("arr"))));
+        assert_eq!(find_index_params(&ctx), vec![("idx".to_string(), Some("arr".to_string()))]);
+        let pair = find_first_arithmetic_operand_pair(&ctx, '+').expect("should find local + a");
+        assert_eq!(pair.left, "local");
+        assert_eq!(pair.right, "a");
+        assert!(!pair.both_params);
     }
 }

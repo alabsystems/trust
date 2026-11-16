@@ -20,4 +20,8 @@ use std::io::Write as _;
 fn main() {
     use std::collections::BTreeMap as OopsWrongRename;
     //~^ missing_enforced_import_renames
+
+    // A binding-only rewrite would leave these references unresolved.
+    let _ = wrong_exit;
+    let _ = sleep;
 }

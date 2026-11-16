@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-FR: the FAITHFUL RANGE `for` lane. `for <pat> in <a>..<b>` over a bare
 // int/uint element, where the read-only-escape SUMMARY refuses (an effectful
 // body), lowers as a real counting CFG instead of declining at the
@@ -20,10 +20,12 @@
 // ctor through the lang-item `into_iter` identity only — `a..=b`
 // (RangeInclusive, done flag), `a..` (RangeFrom, unbounded), adapter chains
 // (`.rev()`), char/float elements, and promoted/`&mut`-collected item vars
-// all keep today's path. Read-only bodies keep the summary lane (it runs
-// first); this lane owns the effectful residue.
+// all keep today's path. Read-only bodies used to take the wave-ER summary
+// lane, which ran first and erased the loop; that lane was removed on
+// 2026-10-01 (tests/run-make/trust-for-loop-no-erasure), so every range `for`
+// that passes the fences takes this lane.
 
-// Effectful body (non-local write) — the summary refuses, wave-FR lowers.
+// Effectful body (non-local write) — wave-FR lowers.
 pub fn fill(dst: &mut i64, n: i64) -> i64 {
     for i in 0..n {
         *dst = i;

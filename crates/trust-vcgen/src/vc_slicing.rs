@@ -28,6 +28,20 @@ pub fn collect_vars(formula: &Formula) -> FxHashSet<String> {
     formula.free_variables()
 }
 
+fn collect_free_var_refs(formula: &Formula) -> FxHashSet<&str> {
+    let mut out = FxHashSet::default();
+    trust_types::for_each_free_variable_name(formula, &mut |name| {
+        out.insert(name);
+    });
+    out
+}
+
+fn append_free_var_refs<'a>(formula: &'a Formula, out: &mut Vec<&'a str>) {
+    trust_types::for_each_free_variable_name(formula, &mut |name| {
+        out.push(name);
+    });
+}
+
 // Compute the backward dependency cone from a target formula.
 //
 // Starting from the free variables of `target`, iteratively includes
@@ -39,42 +53,70 @@ pub fn collect_vars(formula: &Formula) -> FxHashSet<String> {
 // `target`, preserving original order.
 #[must_use]
 pub fn dependency_cone(target: &Formula, context: &[Formula]) -> Vec<Formula> {
+    dependency_cone_with_extra_capacity(target, context, 0)
+}
+
+fn dependency_cone_with_extra_capacity(
+    target: &Formula,
+    context: &[Formula],
+    extra_capacity: usize,
+) -> Vec<Formula> {
+    if context.is_empty() {
+        return Vec::with_capacity(extra_capacity);
+    }
     // Seed the dependency set with target's free variables.
-    let mut dep_vars: FxHashSet<String> = collect_vars(target);
+    let mut dep_vars: FxHashSet<&str> = collect_free_var_refs(target);
+    if dep_vars.is_empty() {
+        return Vec::with_capacity(extra_capacity);
+    }
 
     // Track which context formulas are already included.
     let mut included = vec![false; context.len()];
+    let mut included_count = 0usize;
 
-    // Pre-compute free variables for each context formula
-    // to avoid redundant traversals in the fixpoint loop.
-    let context_vars: Vec<FxHashSet<String>> = context.iter().map(collect_vars).collect();
+    // Pre-compute free variables for each context formula in a single flat buffer
+    // indexed by ranges to avoid `context.len()` separate heap `Vec` allocations.
+    let mut all_vars: Vec<&str> = Vec::with_capacity(context.len() * 2);
+    let mut var_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(context.len());
+    for formula in context {
+        let start = all_vars.len();
+        append_free_var_refs(formula, &mut all_vars);
+        var_ranges.push(start..all_vars.len());
+    }
 
     // Fixpoint iteration — keep adding context formulas
     // whose variables overlap with the current dependency set until
-    // no new formulas are added.
+    // no new variables are added or all context formulas are included.
     let mut changed = true;
-    while changed {
+    while changed && included_count < context.len() {
         changed = false;
-        for (i, vars) in context_vars.iter().enumerate() {
+        for (i, range) in var_ranges.iter().enumerate() {
             if included[i] {
                 continue;
             }
+            let vars = &all_vars[range.clone()];
             // A context formula is relevant if it shares
             // any variable with the current dependency set.
-            if vars.iter().any(|v| dep_vars.contains(v)) {
+            if vars.iter().any(|&v| dep_vars.contains(v)) {
                 included[i] = true;
-                dep_vars.extend(vars.iter().cloned());
-                changed = true;
+                included_count += 1;
+                for &v in vars {
+                    if dep_vars.insert(v) {
+                        changed = true;
+                    }
+                }
             }
         }
     }
 
     // Collect included formulas in original order.
-    context
-        .iter()
-        .enumerate()
-        .filter_map(|(i, f)| if included[i] { Some(f.clone()) } else { None })
-        .collect()
+    let mut out = Vec::with_capacity(included_count + extra_capacity);
+    for (i, f) in context.iter().enumerate() {
+        if included[i] {
+            out.push(f.clone());
+        }
+    }
+    out
 }
 
 // Slice a verification condition to remove irrelevant conjuncts.
@@ -101,16 +143,14 @@ pub fn slice_vc(vc: &VerificationCondition) -> VerificationCondition {
     };
 
     // Compute the dependency cone of assumptions relevant
-    // to the target formula.
-    let relevant = dependency_cone(target, assumptions);
+    // to the target formula, reserving 1 extra slot for `target`.
+    let mut sliced_conjuncts = dependency_cone_with_extra_capacity(target, assumptions, 1);
 
     // Reconstruct the formula with only relevant assumptions.
-    let mut sliced_conjuncts = relevant;
-    sliced_conjuncts.push(target.clone());
-
-    let sliced_formula = if sliced_conjuncts.len() == 1 {
-        sliced_conjuncts.into_iter().next().expect("invariant: len == 1")
+    let sliced_formula = if sliced_conjuncts.is_empty() {
+        target.clone()
     } else {
+        sliced_conjuncts.push(target.clone());
         Formula::And(sliced_conjuncts)
     };
 
@@ -145,28 +185,101 @@ pub struct SlicingStats {
 // how many conjuncts and variables were removed.
 #[must_use]
 pub fn compute_slicing_stats(vc: &VerificationCondition) -> SlicingStats {
-    let original_conjuncts = match &vc.formula {
-        Formula::And(conjuncts) => conjuncts.len(),
-        _ => 1,
+    let Formula::And(conjuncts) = &vc.formula else {
+        let original_vars = collect_free_var_refs(&vc.formula);
+        return SlicingStats {
+            original_size: 1,
+            sliced_size: 1,
+            vars_kept: original_vars.len(),
+            vars_dropped: 0,
+        };
     };
+    let original_conjuncts = conjuncts.len();
+    if original_conjuncts < 2 {
+        let original_vars = collect_free_var_refs(&vc.formula);
+        return SlicingStats {
+            original_size: original_conjuncts,
+            sliced_size: original_conjuncts,
+            vars_kept: original_vars.len(),
+            vars_dropped: 0,
+        };
+    }
 
-    let original_vars = collect_vars(&vc.formula);
-    let sliced = slice_vc(vc);
-    let sliced_vars = collect_vars(&sliced.formula);
+    let (assumptions, target_slice) = conjuncts.split_at(original_conjuncts - 1);
+    let target = &target_slice[0];
+    let mut dep_vars = collect_free_var_refs(target);
+    if dep_vars.is_empty() {
+        let mut dropped_vars = FxHashSet::default();
+        for assumption in assumptions {
+            trust_types::for_each_free_variable_name(assumption, &mut |name| {
+                dropped_vars.insert(name);
+            });
+        }
+        return SlicingStats {
+            original_size: original_conjuncts,
+            sliced_size: 1,
+            vars_kept: 0,
+            vars_dropped: dropped_vars.len(),
+        };
+    }
 
-    let sliced_conjuncts = match &sliced.formula {
-        Formula::And(conjuncts) => conjuncts.len(),
-        _ => 1,
-    };
+    let mut included = vec![false; assumptions.len()];
+    let mut included_count = 0usize;
+    let mut all_vars: Vec<&str> = Vec::with_capacity(assumptions.len() * 2);
+    let mut var_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(assumptions.len());
+    for formula in assumptions {
+        let start = all_vars.len();
+        append_free_var_refs(formula, &mut all_vars);
+        var_ranges.push(start..all_vars.len());
+    }
 
-    let vars_kept = sliced_vars.len();
-    let vars_dropped = original_vars.difference(&sliced_vars).count();
+    let mut changed = true;
+    while changed && included_count < assumptions.len() {
+        changed = false;
+        for (i, range) in var_ranges.iter().enumerate() {
+            if included[i] {
+                continue;
+            }
+            let vars = &all_vars[range.clone()];
+            if vars.iter().any(|&v| dep_vars.contains(v)) {
+                included[i] = true;
+                included_count += 1;
+                for &v in vars {
+                    if dep_vars.insert(v) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let sliced_conjuncts = included_count + 1;
+    let vars_kept = dep_vars.len();
+    if included_count == assumptions.len() {
+        return SlicingStats {
+            original_size: original_conjuncts,
+            sliced_size: sliced_conjuncts,
+            vars_kept,
+            vars_dropped: 0,
+        };
+    }
+
+    let mut dropped_vars: FxHashSet<&str> = FxHashSet::default();
+    for (i, range) in var_ranges.iter().enumerate() {
+        if !included[i] {
+            for &v in &all_vars[range.clone()] {
+                if !dep_vars.contains(v) {
+                    dropped_vars.insert(v);
+                }
+            }
+        }
+    }
 
     SlicingStats {
         original_size: original_conjuncts,
         sliced_size: sliced_conjuncts,
         vars_kept,
-        vars_dropped,
+        vars_dropped: dropped_vars.len(),
     }
 }
 

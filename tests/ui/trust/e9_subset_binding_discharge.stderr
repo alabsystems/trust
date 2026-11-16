@@ -34,7 +34,7 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL | pub fn p(x: u64, y: u64) -> u64 ensures x >= x by u64_ge_refl { x }
    |                                                   ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `all_ge_self` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `h`, with a clean certification audit
   --> $DIR/e9_subset_binding_discharge.rs:23:58
@@ -42,5 +42,5 @@ note: citation `all_ge_self` kernel-discharges this postcondition statement: the
 LL | pub fn h(x: u64) -> u64 ensures forall i: u64, i >= i by all_ge_self { x }
    |                                                          ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 

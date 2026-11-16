@@ -3,11 +3,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::utils::helpers::{
-    check_cfg_arg, extract_beta_rev, hex_encode, make, set_file_times, submodule_path_of,
-    symlink_dir,
+    check_cfg_arg, envify, extract_beta_rev, hex_encode, make, set_file_times,
+    stage0_release_is_local_rebuild, submodule_path_of_paths, symlink_dir,
 };
 use crate::utils::tests::TestCtx;
-use crate::{Config, Flags};
 
 #[test]
 fn test_make() {
@@ -101,20 +100,77 @@ fn test_set_file_times_sanity_check() {
 
 #[test]
 fn test_submodule_path_of() {
-    let config = TestCtx::new().config("build").create_config();
+    let submodules = vec!["src/tools/cargo".to_string(), "src/llvm-project".to_string()];
 
-    let build = crate::Build::new(config.clone());
-    let builder = crate::core::builder::Builder::new(&build);
-    assert_eq!(submodule_path_of(&builder, "invalid/path"), None);
-    // Targo is vendored as ordinary tracked source in this repository, not a
-    // gitlink. Requiring it as a submodule made bootstrap's discovery tests
-    // assert a topology that does not exist.
-    assert_eq!(submodule_path_of(&builder, "src/tools/targo"), None);
-    assert_eq!(submodule_path_of(&builder, "src/llvm-project"), None);
-    assert_eq!(submodule_path_of(&builder, "first-party/ay"), Some("first-party/ay".to_string()));
+    assert_eq!(submodule_path_of_paths(&submodules, "invalid/path"), None);
+    assert_eq!(
+        submodule_path_of_paths(&submodules, "src/tools/cargo"),
+        Some("src/tools/cargo".to_string())
+    );
+    assert_eq!(
+        submodule_path_of_paths(&submodules, "src/llvm-project"),
+        Some("src/llvm-project".to_string())
+    );
     // Make sure subdirs are handled properly
     assert_eq!(
-        submodule_path_of(&builder, "first-party/ay/random-subdir"),
+        submodule_path_of_paths(&submodules, "src/tools/cargo/random-subdir"),
+        Some("src/tools/cargo".to_string())
+    );
+    // Make sure paths that only share a string prefix with a submodule are not matched.
+    assert_eq!(submodule_path_of_paths(&submodules, "src/tools/cargo-vendor"), None);
+
+    // Trust: Targo and the LLVM tree are vendored as ordinary tracked source in
+    // this repository, not gitlinks, so they never appear in the real submodule
+    // list; the `first-party/*` siblings are the actual submodules. Asserting the
+    // upstream topology here made bootstrap's discovery tests require a topology
+    // that does not exist.
+    let trust_submodules = vec!["first-party/ay".to_string()];
+    assert_eq!(submodule_path_of_paths(&trust_submodules, "src/tools/targo"), None);
+    assert_eq!(submodule_path_of_paths(&trust_submodules, "src/llvm-project"), None);
+    assert_eq!(
+        submodule_path_of_paths(&trust_submodules, "first-party/ay"),
         Some("first-party/ay".to_string())
     );
+    // Make sure subdirs are handled properly
+    assert_eq!(
+        submodule_path_of_paths(&trust_submodules, "first-party/ay/random-subdir"),
+        Some("first-party/ay".to_string())
+    );
+}
+
+#[test]
+fn test_envify() {
+    struct Case {
+        input: &'static str,
+        expected: &'static str,
+    }
+    let cases = &[
+        Case { input: "x86_64-unknown-linux-gnu", expected: "X86_64_UNKNOWN_LINUX_GNU" },
+        // Arbitrary target containing `.` from the tier-3 target list.
+        Case { input: "thumbv8m.base-none-eabi", expected: "THUMBV8M_BASE_NONE_EABI" },
+    ];
+
+    for &Case { input, expected } in cases {
+        let actual = envify(input);
+        assert_eq!(actual, expected, "input = {input:?}");
+    }
+}
+
+// Trust: a stage0 on this tree's Rust line (`src/rust-compat-version`) is a local rebuild; the
+// seed `src/stage0` pins, and Trust's own `src/version` spelling, are not.
+#[test]
+fn test_stage0_release_is_local_rebuild() {
+    let compat = "1.101.0";
+    // A stage0 built from this tree (`build/host/stage1`), and later patch releases.
+    assert!(stage0_release_is_local_rebuild("1.101.0-dev", compat));
+    assert!(stage0_release_is_local_rebuild("1.101.0", compat));
+    assert!(stage0_release_is_local_rebuild("1.101.3-nightly", compat));
+    // The 0.11.0-trust and 1.99.0-trust seeds both report `release: 1.99.0-dev`.
+    assert!(!stage0_release_is_local_rebuild("1.99.0-dev", compat));
+    // Trust's own version line, which no stage0 reports.
+    assert!(!stage0_release_is_local_rebuild("0.11.0", compat));
+    // Minor versions are compared as components, not as string prefixes.
+    assert!(!stage0_release_is_local_rebuild("1.10.0", compat));
+    assert!(!stage0_release_is_local_rebuild("1.1010.0", compat));
+    assert!(!stage0_release_is_local_rebuild("2.101.0", compat));
 }

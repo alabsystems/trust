@@ -16,7 +16,7 @@
 // only measures.
 //
 // Run with:
-//   RUSTC_BOOTSTRAP=1 cargo test -p trust-clean --manifest-path crates/Cargo.toml \
+//   targo --unverified test -p trust-clean --manifest-path crates/Cargo.toml \
 //       --test from_signed_corpus -- --nocapture
 
 use std::path::Path;

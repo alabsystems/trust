@@ -87,7 +87,7 @@ pub(crate) fn fixup_syntax(
                     anchor: SpanAnchor { ast_id: FIXUP_DUMMY_AST_ID, ..span.anchor },
                     ctx: span.ctx,
                 },
-                is_raw: tt::IdentIsRaw::No,
+                kind: tt::IdentKind::Normal,
             });
             append.insert(node.clone().into(), vec![replacement]);
             preorder.skip_subtree();
@@ -103,7 +103,7 @@ pub(crate) fn fixup_syntax(
                             Leaf::Ident(Ident {
                                 sym: sym::__ra_fixup,
                                 span: fake_span(node_range),
-                                is_raw: tt::IdentIsRaw::No
+                                kind: tt::IdentKind::Normal
                             }),
                         ]);
                     }
@@ -142,7 +142,7 @@ pub(crate) fn fixup_syntax(
                             Leaf::Ident(Ident {
                                 sym: sym::__ra_fixup,
                                 span: fake_span(node_range),
-                                is_raw: tt::IdentIsRaw::No
+                                kind: tt::IdentKind::Normal
                             }),
                         ]);
                     }
@@ -172,7 +172,7 @@ pub(crate) fn fixup_syntax(
                             Leaf::Ident(Ident {
                                 sym: sym::__ra_fixup,
                                 span: fake_span(node_range),
-                                is_raw: tt::IdentIsRaw::No
+                                kind: tt::IdentKind::Normal
                             }),
                         ]);
                     }
@@ -217,7 +217,7 @@ pub(crate) fn fixup_syntax(
                             Leaf::Ident(Ident {
                                 sym: sym::__ra_fixup,
                                 span: fake_span(node_range),
-                                is_raw: tt::IdentIsRaw::No
+                                kind: tt::IdentKind::Normal
                             }),
                         ]);
                     }
@@ -251,7 +251,7 @@ pub(crate) fn fixup_syntax(
                         Leaf::Ident(Ident {
                             sym,
                             span: fake_span(node_range),
-                            is_raw: tt::IdentIsRaw::No
+                            kind: tt::IdentKind::Normal
                         }),
                     );
 
@@ -284,7 +284,7 @@ pub(crate) fn fixup_syntax(
                                 Leaf::Ident(Ident {
                                     sym: sym::__ra_fixup,
                                     span: fake_span(node_range),
-                                    is_raw: tt::IdentIsRaw::No
+                                    kind: tt::IdentKind::Normal
                                 })
                             ]);
                         }
@@ -296,7 +296,7 @@ pub(crate) fn fixup_syntax(
                                 Leaf::Ident(Ident {
                                     sym: sym::__ra_fixup,
                                     span: fake_span(node_range),
-                                    is_raw: tt::IdentIsRaw::No
+                                    kind: tt::IdentKind::Normal
                                 })
                             ]);
                         }
@@ -307,7 +307,7 @@ pub(crate) fn fixup_syntax(
                             Leaf::Ident(Ident {
                                 sym: sym::__ra_fixup,
                                 span: fake_span(node_range),
-                                is_raw: tt::IdentIsRaw::No
+                                kind: tt::IdentKind::Normal
                             })
                         ]);
                     }
@@ -343,7 +343,6 @@ pub(crate) fn reverse_fixups(tt: &mut TopSubtree, undo_info: &SyntaxFixupUndoInf
     let top_subtree = tt.top_subtree();
     let open_span = top_subtree.delimiter.open;
     let close_span = top_subtree.delimiter.close;
-    #[allow(deprecated)]
     if never!(
         close_span.anchor.ast_id == FIXUP_DUMMY_AST_ID
             || open_span.anchor.ast_id == FIXUP_DUMMY_AST_ID
@@ -419,9 +418,11 @@ mod tests {
     }
 
     fn check_subtree_eq(a: &tt::TopSubtree, b: &tt::TopSubtree) -> bool {
-        let a = a.view().as_token_trees().iter_flat_tokens();
-        let b = b.view().as_token_trees().iter_flat_tokens();
-        a.len() == b.len() && std::iter::zip(a, b).all(|(a, b)| check_tt_eq(&a, &b))
+        let a = a.view().as_token_trees();
+        let b = b.view().as_token_trees();
+        a.len() == b.len()
+            && std::iter::zip(a.iter_flat_tokens(), b.iter_flat_tokens())
+                .all(|(a, b)| check_tt_eq(&a, &b))
     }
 
     fn check_tt_eq(a: &tt::TokenTree, b: &tt::TokenTree) -> bool {

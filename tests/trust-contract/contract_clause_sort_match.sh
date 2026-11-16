@@ -31,7 +31,10 @@
 #   2. `unique_source_contract_index_for_formula` returned `None`, so the typed
 #      postcondition carried no `source_contract_index`; `trust_verify.rs:32245`
 #      needs that index to build the body link, so the source-clause marker sat
-#      at "awaits sealed private body authorities" forever.
+#      at "awaits sealed private body authorities" forever. (That sentence was
+#      replaced on 2026-09-17 by a reason that NAMES the clause and the body row
+#      which defeated it; the solver symbol `trust-exact-source-clause-discharge`
+#      is the stable handle. See docs/STRICT_VERIFICATION_FRAGMENT.md §19.3.)
 #
 # THE AXIS IS THE SORT, NOT THE NESTING DEPTH. Integer projections already
 # proved AND refuted at depth 1, 2 and 3 before this fix; `bool` failed at

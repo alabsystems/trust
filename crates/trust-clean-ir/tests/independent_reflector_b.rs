@@ -160,20 +160,13 @@ pub enum ReflectRefusal {
     DuplicateDefinition { value: usize },
     /// An instruction appeared after the terminator.
     InstructionAfterTerminator { inst: &'static str },
-    /// An ORDER comparison (`Ult`/`Ule`) with a NUMERAL operand.
-    ///
-    /// This one is not a gap in effort, it is a MEASURED limit of what the IR
-    /// determines — see `order_comparison_against_a_numeral_is_a_real_limit`.
-    /// Clean elaborates `a < b` at `UInt8` to `instDecidableUInt8Lt a b`, but
-    /// `a < 10` to `instDecidableNatLt a.toBitVec.toFin.val 10` — a `Nat`-level
-    /// instance of the SAME proposition — and the kernel does NOT equate the
-    /// two. TrustIR records only "the right operand is the value 10"; it does
-    /// not record whether the Clean source wrote that as a numeral. So no
-    /// function of the IR alone can be relied on to pick the instance the
-    /// declaration used, and this reflector refuses rather than guess. The two
-    /// spellings denote the same function, so this is a limit of the CHECK, not
-    /// evidence against the emitted code.
-    OrderComparisonAgainstNumeral { op: String },
+    // There was an `OrderComparisonAgainstNumeral` refusal here, for an order
+    // comparison with a numeral operand. It existed only because Clean elaborated
+    // `a < 10` to a `Nat`-reduced `Decidable` instance the kernel did not equate
+    // with the uniform `instDecidableUInt8Lt a (UInt8.ofNat 10)`. Clean
+    // `c91fa93f5` made the two kernel-equal, so it was deleted — see
+    // `order_comparison_against_a_numeral_is_no_longer_a_limit`, which fails first,
+    // naming the refusal to restore, if a Clean pin ever separates them again.
 }
 
 /// What a TrustIR SSA value denotes.
@@ -185,22 +178,15 @@ pub enum ReflectRefusal {
 /// refusal instead of a silently wrong coercion.
 #[derive(Debug, Clone)]
 enum Den {
-    /// A `UIntN`-valued Clean term. `numeral` records that the value came from
-    /// an `Inst::Const` — the only thing the `Decidable`-instance question
-    /// above turns on.
-    Value {
-        width: u32,
-        expr: Expr,
-        numeral: bool,
-    },
+    /// A `UIntN`-valued Clean term.
+    Value { width: u32, expr: Expr },
     /// A comparison: the `Prop` it decides, plus the `Decidable` instance.
     Cmp { prop: Expr, decidable: Expr },
 }
 
-/// A `UIntN` operand: its term, and whether it is a numeral.
+/// A `UIntN` operand: its term.
 struct Operand {
     expr: Expr,
-    numeral: bool,
 }
 
 /// The unsigned machine carriers this reflector can spell, and their widths.
@@ -228,10 +214,7 @@ fn levels(ls: Vec<Level>) -> LevelVec {
 
 /// `@UIntN.ofNat n` — the elaboration of a numeral at a `UIntN`.
 fn uint_lit(width: u32, n: u64) -> Expr {
-    Expr::app(
-        Expr::const_str(&format!("UInt{width}.ofNat")),
-        Expr::nat_lit(n),
-    )
+    Expr::app(Expr::const_str(&format!("UInt{width}.ofNat")), Expr::nat_lit(n))
 }
 
 /// `@H<Op>.h<op>.{0,0,0} UIntN UIntN UIntN instH<Op>UIntN lhs rhs`.
@@ -272,12 +255,7 @@ fn lt_decidable(width: u32, lhs: Expr, rhs: Expr) -> Expr {
 fn order_prop(head: &str, inst_prefix: &str, width: u32, lhs: Expr, rhs: Expr) -> Expr {
     Expr::apps(
         Expr::const_(Name::from_string(head), levels(vec![Level::zero()])),
-        [
-            carrier(width),
-            Expr::const_str(&format!("{inst_prefix}{width}")),
-            lhs,
-            rhs,
-        ],
+        [carrier(width), Expr::const_str(&format!("{inst_prefix}{width}")), lhs, rhs],
     )
 }
 
@@ -286,10 +264,7 @@ fn order_prop(head: &str, inst_prefix: &str, width: u32, lhs: Expr, rhs: Expr) -
 /// (`Eq : {α : Sort u} → α → α → Prop`, with `UIntN : Type 0 = Sort 1`).
 fn eq_prop(width: u32, lhs: Expr, rhs: Expr) -> Expr {
     Expr::apps(
-        Expr::const_(
-            Name::from_string("Eq"),
-            levels(vec![Level::succ(Level::zero())]),
-        ),
+        Expr::const_(Name::from_string("Eq"), levels(vec![Level::succ(Level::zero())])),
         [carrier(width), lhs, rhs],
     )
 }
@@ -304,10 +279,7 @@ fn decidable_inst(name: &str, lhs: Expr, rhs: Expr) -> Expr {
 /// Level `1` because the result lives in `Type 0 = Sort 1`.
 fn ite(width: u32, prop: Expr, dec: Expr, then_: Expr, else_: Expr) -> Expr {
     Expr::apps(
-        Expr::const_(
-            Name::from_string("ite"),
-            levels(vec![Level::succ(Level::zero())]),
-        ),
+        Expr::const_(Name::from_string("ite"), levels(vec![Level::succ(Level::zero())])),
         [carrier(width), prop, dec, then_, else_],
     )
 }
@@ -325,9 +297,7 @@ fn ite(width: u32, prop: Expr, dec: Expr, then_: Expr, else_: Expr) -> Expr {
 /// while a guess the kernel accepts costs a wrong binary.
 pub fn reflect_uint_straight_line(func: &Function) -> Result<Expr, ReflectRefusal> {
     if func.blocks.len() != 1 {
-        return Err(ReflectRefusal::NotSingleBlock {
-            blocks: func.blocks.len(),
-        });
+        return Err(ReflectRefusal::NotSingleBlock { blocks: func.blocks.len() });
     }
     let block = &func.blocks[0];
     if block.id != func.entry {
@@ -349,20 +319,8 @@ pub fn reflect_uint_straight_line(func: &Function) -> Result<Expr, ReflectRefusa
         })?;
         binder_tys.push(width);
         let idx = u32::try_from(arity - 1 - i).expect("arity fits in u32");
-        if env
-            .insert(
-                *value,
-                Den::Value {
-                    width,
-                    expr: Expr::bvar(idx),
-                    numeral: false,
-                },
-            )
-            .is_some()
-        {
-            return Err(ReflectRefusal::DuplicateDefinition {
-                value: value.as_usize(),
-            });
+        if env.insert(*value, Den::Value { width, expr: Expr::bvar(idx) }).is_some() {
+            return Err(ReflectRefusal::DuplicateDefinition { value: value.as_usize() });
         }
     }
 
@@ -370,47 +328,34 @@ pub fn reflect_uint_straight_line(func: &Function) -> Result<Expr, ReflectRefusa
     let mut body: Option<Expr> = None;
     for node in &block.body {
         if body.is_some() {
-            return Err(ReflectRefusal::InstructionAfterTerminator {
-                inst: inst_name(&node.inst),
-            });
+            return Err(ReflectRefusal::InstructionAfterTerminator { inst: inst_name(&node.inst) });
         }
         match &node.inst {
             Inst::Const { ty, value } => {
-                let width =
-                    uint_width(ty).ok_or_else(|| ReflectRefusal::UnsupportedCarrier {
-                        ty: format!("{ty:?}"),
-                        position: "const",
-                    })?;
-                let n = constant_as_uint(value, width)?;
-                define(&mut env, node, "Const", Den::Value {
-                    width,
-                    expr: uint_lit(width, n),
-                    numeral: true,
+                let width = uint_width(ty).ok_or_else(|| ReflectRefusal::UnsupportedCarrier {
+                    ty: format!("{ty:?}"),
+                    position: "const",
                 })?;
+                let n = constant_as_uint(value, width)?;
+                define(&mut env, node, "Const", Den::Value { width, expr: uint_lit(width, n) })?;
             }
 
             Inst::Copy { ty, operand } => {
                 // Identity. Honest, and free: the denotation of a copy is the
                 // denotation of its operand.
-                let width =
-                    uint_width(ty).ok_or_else(|| ReflectRefusal::UnsupportedCarrier {
-                        ty: format!("{ty:?}"),
-                        position: "copy",
-                    })?;
-                let den = value_den(&env, *operand, width)?;
-                define(&mut env, node, "Copy", Den::Value {
-                    width,
-                    expr: den.expr,
-                    numeral: den.numeral,
+                let width = uint_width(ty).ok_or_else(|| ReflectRefusal::UnsupportedCarrier {
+                    ty: format!("{ty:?}"),
+                    position: "copy",
                 })?;
+                let den = value_den(&env, *operand, width)?;
+                define(&mut env, node, "Copy", Den::Value { width, expr: den.expr })?;
             }
 
             Inst::BinOp { op, ty, lhs, rhs } => {
-                let width =
-                    uint_width(ty).ok_or_else(|| ReflectRefusal::UnsupportedCarrier {
-                        ty: format!("{ty:?}"),
-                        position: "binop",
-                    })?;
+                let width = uint_width(ty).ok_or_else(|| ReflectRefusal::UnsupportedCarrier {
+                    ty: format!("{ty:?}"),
+                    position: "binop",
+                })?;
                 // The three modular ring operations plus the two bitwise
                 // lattice operations. `interpret.rs` evaluates these five as
                 // `wrapping_{add,sub,mul}` and `&`/`|` on the raw payload
@@ -425,6 +370,9 @@ pub fn reflect_uint_straight_line(func: &Function) -> Result<Expr, ReflectRefusa
                 // shifts are refused for want of a MEASURED Clean counterpart:
                 // this reflector spells only what it has seen the prelude
                 // elaborate, never what it expects the prelude to contain.
+                // (The prelude has elaborated `^^^`/`<<<`/`>>>` at `UIntN`
+                // since Clean `bf31976f48`; this file has not measured them,
+                // and `trust-clean-ir` emits none of them to reflect.)
                 let (class, method, inst) = match op {
                     BinOp::Add => ("HAdd", "hAdd", "instHAdd"),
                     BinOp::Sub => ("HSub", "hSub", "instHSub"),
@@ -432,26 +380,27 @@ pub fn reflect_uint_straight_line(func: &Function) -> Result<Expr, ReflectRefusa
                     BinOp::And => ("HAnd", "hAnd", "instHAnd"),
                     BinOp::Or => ("HOr", "hOr", "instHOr"),
                     other => {
-                        return Err(ReflectRefusal::UnsupportedBinOp {
-                            op: format!("{other:?}"),
-                        });
+                        return Err(ReflectRefusal::UnsupportedBinOp { op: format!("{other:?}") });
                     }
                 };
                 let l = value_den(&env, *lhs, width)?;
                 let r = value_den(&env, *rhs, width)?;
-                define(&mut env, node, "BinOp", Den::Value {
-                    width,
-                    expr: hetero_binop(class, method, inst, width, l.expr, r.expr),
-                    numeral: false,
-                })?;
+                define(
+                    &mut env,
+                    node,
+                    "BinOp",
+                    Den::Value {
+                        width,
+                        expr: hetero_binop(class, method, inst, width, l.expr, r.expr),
+                    },
+                )?;
             }
 
             Inst::ICmp { op, ty, lhs, rhs } => {
-                let width =
-                    uint_width(ty).ok_or_else(|| ReflectRefusal::UnsupportedCarrier {
-                        ty: format!("{ty:?}"),
-                        position: "icmp",
-                    })?;
+                let width = uint_width(ty).ok_or_else(|| ReflectRefusal::UnsupportedCarrier {
+                    ty: format!("{ty:?}"),
+                    position: "icmp",
+                })?;
                 let l = value_den(&env, *lhs, width)?;
                 let r = value_den(&env, *rhs, width)?;
                 // The three UNSIGNED relations whose Clean counterpart has been
@@ -463,59 +412,40 @@ pub fn reflect_uint_straight_line(func: &Function) -> Result<Expr, ReflectRefusa
                 // rearrangement is exactly the sort of "obviously equivalent"
                 // step that turns a reflector into a second, unreviewed
                 // compiler.
-                // The ORDER relations additionally refuse a numeral operand —
-                // see `ReflectRefusal::OrderComparisonAgainstNumeral`. Equality
-                // does NOT: `a = 10` was measured to elaborate through the same
-                // `instDecidableEqUIntN` as `a = b`, so there is no diamond to
-                // fall into.
-                let order_ok = |l: &Operand, r: &Operand, op: &ICmpOp| {
-                    if l.numeral || r.numeral {
-                        Err(ReflectRefusal::OrderComparisonAgainstNumeral {
-                            op: format!("{op:?}"),
-                        })
-                    } else {
-                        Ok(())
-                    }
-                };
+                // A numeral operand takes the SAME uniform instance as any other
+                // operand, at every relation. The ORDER relations used to refuse
+                // one (`OrderComparisonAgainstNumeral`), because Clean elaborated
+                // `a < 10` through a `Nat`-reduced instance the kernel did not
+                // equate with the uniform one; Clean `c91fa93f5` made the two
+                // kernel-equal, and
+                // `order_comparison_against_a_numeral_is_no_longer_a_limit`
+                // measures it. Equality never needed the refusal: `a = 10`
+                // elaborates through the same `instDecidableEqUIntN` as `a = b`.
                 let (prop, decidable) = match op {
-                    ICmpOp::Ult => {
-                        order_ok(&l, &r, op)?;
-                        (
-                            lt_prop(width, l.expr.clone(), r.expr.clone()),
-                            lt_decidable(width, l.expr, r.expr),
-                        )
-                    }
-                    ICmpOp::Ule => {
-                        order_ok(&l, &r, op)?;
-                        (
-                            order_prop("LE.le", "instLEUInt", width, l.expr.clone(), r.expr.clone()),
-                            decidable_inst(&format!("instDecidableUInt{width}Le"), l.expr, r.expr),
-                        )
-                    }
+                    ICmpOp::Ult => (
+                        lt_prop(width, l.expr.clone(), r.expr.clone()),
+                        lt_decidable(width, l.expr, r.expr),
+                    ),
+                    ICmpOp::Ule => (
+                        order_prop("LE.le", "instLEUInt", width, l.expr.clone(), r.expr.clone()),
+                        decidable_inst(&format!("instDecidableUInt{width}Le"), l.expr, r.expr),
+                    ),
                     ICmpOp::Eq => (
                         eq_prop(width, l.expr.clone(), r.expr.clone()),
                         decidable_inst(&format!("instDecidableEqUInt{width}"), l.expr, r.expr),
                     ),
                     other => {
-                        return Err(ReflectRefusal::UnsupportedICmp {
-                            op: format!("{other:?}"),
-                        });
+                        return Err(ReflectRefusal::UnsupportedICmp { op: format!("{other:?}") });
                     }
                 };
                 define(&mut env, node, "ICmp", Den::Cmp { prop, decidable })?;
             }
 
-            Inst::Select {
-                ty,
-                cond,
-                then_val,
-                else_val,
-            } => {
-                let width =
-                    uint_width(ty).ok_or_else(|| ReflectRefusal::UnsupportedCarrier {
-                        ty: format!("{ty:?}"),
-                        position: "select",
-                    })?;
+            Inst::Select { ty, cond, then_val, else_val } => {
+                let width = uint_width(ty).ok_or_else(|| ReflectRefusal::UnsupportedCarrier {
+                    ty: format!("{ty:?}"),
+                    position: "select",
+                })?;
                 let Some(Den::Cmp { prop, decidable }) = env.get(cond) else {
                     return Err(ReflectRefusal::SelectConditionIsNotAComparison {
                         cond: cond.as_usize(),
@@ -524,11 +454,12 @@ pub fn reflect_uint_straight_line(func: &Function) -> Result<Expr, ReflectRefusa
                 let (prop, decidable) = (prop.clone(), decidable.clone());
                 let t = value_den(&env, *then_val, width)?;
                 let e = value_den(&env, *else_val, width)?;
-                define(&mut env, node, "Select", Den::Value {
-                    width,
-                    expr: ite(width, prop, decidable, t.expr, e.expr),
-                    numeral: false,
-                })?;
+                define(
+                    &mut env,
+                    node,
+                    "Select",
+                    Den::Value { width, expr: ite(width, prop, decidable, t.expr, e.expr) },
+                )?;
             }
 
             Inst::Return { values } => {
@@ -543,18 +474,14 @@ pub fn reflect_uint_straight_line(func: &Function) -> Result<Expr, ReflectRefusa
                         });
                     }
                     None => {
-                        return Err(ReflectRefusal::UndefinedOperand {
-                            value: only.as_usize(),
-                        });
+                        return Err(ReflectRefusal::UndefinedOperand { value: only.as_usize() });
                     }
                 };
                 body = Some(value_den(&env, *only, width)?.expr);
             }
 
             other => {
-                return Err(ReflectRefusal::UnsupportedInst {
-                    inst: inst_name(other),
-                });
+                return Err(ReflectRefusal::UnsupportedInst { inst: inst_name(other) });
             }
         }
     }
@@ -579,15 +506,10 @@ fn define(
     den: Den,
 ) -> Result<(), ReflectRefusal> {
     let [result] = node.results.as_slice() else {
-        return Err(ReflectRefusal::UnexpectedResultArity {
-            inst,
-            results: node.results.len(),
-        });
+        return Err(ReflectRefusal::UnexpectedResultArity { inst, results: node.results.len() });
     };
     if env.insert(*result, den).is_some() {
-        return Err(ReflectRefusal::DuplicateDefinition {
-            value: result.as_usize(),
-        });
+        return Err(ReflectRefusal::DuplicateDefinition { value: result.as_usize() });
     }
     Ok(())
 }
@@ -600,24 +522,17 @@ fn value_den(
     expect_width: u32,
 ) -> Result<Operand, ReflectRefusal> {
     match env.get(&value) {
-        Some(Den::Value {
-            width,
-            expr,
-            numeral,
-        }) if *width == expect_width => Ok(Operand {
-            expr: expr.clone(),
-            numeral: *numeral,
-        }),
+        Some(Den::Value { width, expr }) if *width == expect_width => {
+            Ok(Operand { expr: expr.clone() })
+        }
         Some(Den::Value { width, .. }) => Err(ReflectRefusal::UnsupportedCarrier {
             ty: format!("UInt{width} used where UInt{expect_width} was expected"),
             position: "operand",
         }),
-        Some(Den::Cmp { .. }) => Err(ReflectRefusal::ComparisonUsedAsValue {
-            value: value.as_usize(),
-        }),
-        None => Err(ReflectRefusal::UndefinedOperand {
-            value: value.as_usize(),
-        }),
+        Some(Den::Cmp { .. }) => {
+            Err(ReflectRefusal::ComparisonUsedAsValue { value: value.as_usize() })
+        }
+        None => Err(ReflectRefusal::UndefinedOperand { value: value.as_usize() }),
     }
 }
 
@@ -632,9 +547,7 @@ fn constant_as_uint(value: &Constant, width: u32) -> Result<u64, ReflectRefusal>
     let raw = match value {
         Constant::Int(v) => *v,
         other => {
-            return Err(ReflectRefusal::UnsupportedConstant {
-                detail: format!("{other:?}"),
-            });
+            return Err(ReflectRefusal::UnsupportedConstant { detail: format!("{other:?}") });
         }
     };
     if raw < 0 {
@@ -706,9 +619,7 @@ impl Island {
     }
 
     fn env(&self) -> &Environment {
-        self.session
-            .environment()
-            .expect("an untainted session exposes its environment")
+        self.session.environment().expect("an untainted session exposes its environment")
     }
 
     /// Plan + emit: this is the ARTIFACT UNDER TEST. Calling the emitter is
@@ -763,8 +674,7 @@ fn differential_leg(env: &Environment, shape: &Shape, func: &Function, reflected
         let args: Vec<InterpretValue> = point
             .iter()
             .map(|v| {
-                InterpretValue::int(arg_ty.clone(), i128::from(*v))
-                    .expect("in-range argument")
+                InterpretValue::int(arg_ty.clone(), i128::from(*v)).expect("in-range argument")
             })
             .collect();
         let outcome = interpreter
@@ -779,10 +689,8 @@ fn differential_leg(env: &Environment, shape: &Shape, func: &Function, reflected
             .as_unsigned();
         let expected = u64::try_from(expected).expect("fits a u64 carrier");
 
-        let applied = Expr::apps(
-            reflected.clone(),
-            point.iter().map(|v| uint_lit(shape.width, *v)),
-        );
+        let applied =
+            Expr::apps(reflected.clone(), point.iter().map(|v| uint_lit(shape.width, *v)));
         let target = uint_lit(shape.width, expected);
         assert!(
             kernel_accepts(env, &applied, &target),
@@ -812,6 +720,7 @@ def maxU8 (a : UInt8) (b : UInt8) : UInt8 := if a < b then b else a
 def leU8 (a : UInt8) (b : UInt8) : UInt8 := if a <= b then a else b
 def eqU8 (a : UInt8) (b : UInt8) : UInt8 := if a = b then a else b
 def clampU8 (a : UInt8) (b : UInt8) : UInt8 := if a < 10 then a else b
+def leLitU8 (a : UInt8) (b : UInt8) : UInt8 := if a <= 10 then a else b
 def eqLitU8 (a : UInt8) (b : UInt8) : UInt8 := if a = 10 then a else b
 def flagU8 (a : UInt8) (b : UInt8) : UInt8 := if a < b then 1 else 0
 def addU16 (a : UInt16) (b : UInt16) : UInt16 := a + b
@@ -852,8 +761,13 @@ const SHAPES: &[Shape] = &[
     Shape { name: "maxU8", width: 8, points: &[&[3, 5], &[5, 3], &[4, 4], &[200, 100]] },
     Shape { name: "leU8", width: 8, points: &[&[3, 5], &[5, 3], &[4, 4], &[200, 100]] },
     Shape { name: "eqU8", width: 8, points: &[&[4, 4], &[3, 5], &[0, 0], &[255, 254]] },
-    // Literal ARMS, as opposed to a literal comparison operand: no instance is
-    // involved, so nothing here is at risk from the diamond above.
+    // Literal comparison RHS for the two relations added beside the existing
+    // less-than clamp probe. Boundary-adjacent points distinguish the opcodes.
+    Shape { name: "leLitU8", width: 8, points: &[&[9, 5], &[10, 5], &[11, 5], &[255, 1]] },
+    Shape { name: "eqLitU8", width: 8, points: &[&[9, 5], &[10, 5], &[11, 5], &[255, 1]] },
+    // Literal ARMS, as opposed to a literal comparison operand (`clampU8`, pinned
+    // by `order_comparison_against_a_numeral_is_no_longer_a_limit`): no instance
+    // is involved.
     Shape { name: "flagU8", width: 8, points: &[&[3, 5], &[5, 3], &[4, 4]] },
     // the other three carriers.
     Shape { name: "addU16", width: 16, points: &[&[3, 5], &[65535, 1]] },
@@ -944,18 +858,16 @@ fn a_cancelling_round_trip_is_caught_only_by_execution() {
 
     // LEG B IS NOT. Execute the IR: at (3, 5) it wraps to 254, not 8.
     let outcome = Interpreter::new()
-        .execute_function(&wrong_ir, [
-            InterpretValue::int(Ty::U8, 3).expect("in range"),
-            InterpretValue::int(Ty::U8, 5).expect("in range"),
-        ])
+        .execute_function(
+            &wrong_ir,
+            [
+                InterpretValue::int(Ty::U8, 3).expect("in range"),
+                InterpretValue::int(Ty::U8, 5).expect("in range"),
+            ],
+        )
         .expect("interprets");
-    let actual = u64::try_from(
-        outcome.returns[0]
-            .as_int()
-            .expect("integer result")
-            .as_unsigned(),
-    )
-    .expect("fits u64");
+    let actual = u64::try_from(outcome.returns[0].as_int().expect("integer result").as_unsigned())
+        .expect("fits u64");
     assert_eq!(actual, 254, "wrapping 3 - 5 at UInt8");
     let applied = Expr::apps(cancelling, [uint_lit(8, 3), uint_lit(8, 5)]);
     assert!(
@@ -964,92 +876,160 @@ fn a_cancelling_round_trip_is_caught_only_by_execution() {
     );
 }
 
-/// THE ONE SHAPE THIS REFLECTOR REFUSES THAT THE EMITTER HAPPILY EMITS, and the
-/// measurement that says the refusal is right.
+/// THE SHAPE THIS REFLECTOR USED TO REFUSE, and the measurement that retired the
+/// refusal.
 ///
-/// `if a < 10 then a else b` plans, emits, and interprets fine. It is refused
-/// anyway, because kernel agreement for it cannot be a function of the IR:
+/// `if a < 10 then a else b` plans, emits, and interprets fine. Until the Clean
+/// pin carried `c91fa93f5` it was refused here by name
+/// (`ReflectRefusal::OrderComparisonAgainstNumeral`), because kernel agreement
+/// for it could not be a function of the IR:
 ///
-///   1. Clean elaborates `a < b` at `UInt8` to `instDecidableUInt8Lt a b`, but
+///   1. Clean elaborated `a < b` at `UInt8` to `instDecidableUInt8Lt a b`, but
 ///      `a < 10` to `instDecidableNatLt a.toBitVec.toFin.val 10` — a `Nat`-level
-///      instance of the *same* proposition. Measured below, both spellings.
-///   2. Those two `Decidable` terms are NOT definitionally equal in this kernel
-///      (`Decidable` is data, not a `Prop`, so there is no proof irrelevance to
-///      collapse the diamond). Measured below.
-///   3. TrustIR records that the right operand has the VALUE 10. It does not
-///      record that the Clean source WROTE a numeral there — the same
-///      `Const`+`ICmp` pair is what any other route to the value 10 produces.
+///      instance of the *same* proposition.
+///   2. Those two `Decidable` terms were NOT definitionally equal (`Decidable` is
+///      data, not a `Prop`, so there is no proof irrelevance to collapse the
+///      diamond).
+///   3. TrustIR records that the right operand has the VALUE 10, not that the
+///      Clean source WROTE a numeral there.
 ///
-/// So a reflector that greens this shape is applying a rule about the
-/// ELABORATOR ("a literal operand means the `Nat` instance") that the IR does
-/// not justify, and it will be wrong the first time a non-numeral source
-/// produces the same IR. The two spellings denote the same function, so this is
-/// a limit of the CHECK, not a defect in the emitted code — which is exactly
-/// why it must be reported as a refusal and not papered over.
+/// Clean `c91fa93f5` ("kernel(uint): the BitVec-carrier decLe/decLt ARE
+/// Nat.decLe/decLt, so `decide (d < 21)` is the carrier's decision") removed
+/// premise 2: the uniform and `Nat`-reduced instances are now KERNEL-EQUAL, so
+/// the uniform spelling earns agreement whichever instance the elaborator picks,
+/// and premise 3 stops mattering — no rule about the elaborator is needed when
+/// every instance it can pick is one term. Measured with `clean check` at the
+/// superproject pin `dca882b5f`: the elaborator now picks the carrier instance
+/// over the unfolded numeral (`instDecidableUInt8Lt a (UInt8.ofBitVec
+/// (BitVec.ofFin 8 (Fin.ofNat 255 10)))`) for a numeral on the right, still the
+/// `Nat`-reduced `instDecidableNatLt 10 a.toBitVec.toFin.val` for a numeral on
+/// the LEFT, and the uniform reflection is accepted against both, at `<` and
+/// `<=` and at all four widths. On the previous pin (`faf434b73`) every one of
+/// those is rejected.
 ///
-/// `=` is the CONTROL, and it is why the refusal is keyed on ORDER relations
-/// rather than on "a literal operand": a numeral on an equality keeps the
-/// uniform `instDecidableEqUInt8`, so there is no diamond to fall into and
-/// nothing to refuse. Measured at the bottom of this test.
+/// So the refusal is gone, as its own assertion message asked. Dropping it
+/// cannot admit a wrong body: a reflection is evidence only when the kernel
+/// accepts it, and the refusal only ever withheld evidence. What is pinned
+/// instead, so that the new acceptance is not taken on faith:
+///
+///   * leg A — `clampU8` reflects AND the kernel accepts it (`Subject::new`,
+///     the same control the mutation legs rest on);
+///   * leg B — the reflected term computes the interpreter's answer on either
+///     side of the numeral and AT it (`[10, 5]`, where `<` and `<=` part);
+///   * leg D — every mutation operator that applies to this shape is caught BY
+///     THE KERNEL, so the check still discriminates here and is not accepting
+///     anything with an `ite` in it;
+///   * the measurement itself — uniform and `Nat`-reduced instances are
+///     kernel-equal, with the numeral on either side. If a Clean pin ever makes
+///     them distinct again this fails first, and the refusal must come back.
+///
+/// `=` stays the CONTROL: a numeral on an equality keeps the uniform
+/// `instDecidableEqUInt8` on every pin measured, so it never needed a refusal.
 #[test]
-fn order_comparison_against_a_numeral_is_a_real_limit() {
+fn order_comparison_against_a_numeral_is_no_longer_a_limit() {
+    const CLAMP_POINTS: &[&[u64]] = &[&[3, 5], &[9, 5], &[10, 5], &[11, 5], &[255, 1], &[0, 200]];
+    const CLAMP: Shape = Shape { name: "clampU8", width: 8, points: CLAMP_POINTS };
+
     let island = Island::check(SOURCE);
     let env = island.env();
 
-    // The emitter produces it...
-    let func = island.emit("clampU8");
-    // ... the TrustIR interpreter runs it ...
-    Interpreter::new()
-        .execute_function(&func, [
-            InterpretValue::int(Ty::U8, 3).expect("in range"),
-            InterpretValue::int(Ty::U8, 5).expect("in range"),
-        ])
-        .unwrap_or_else(|e| panic!("clampU8 interprets: {e:?}"));
-    // ... and this reflector still refuses, by name.
-    assert!(
-        matches!(
-            reflect_uint_straight_line(&func),
-            Err(ReflectRefusal::OrderComparisonAgainstNumeral { .. })
-        ),
-        "clampU8 must be refused by name, not reflected on a guess"
-    );
+    // Leg A: the emitted body reflects and the kernel accepts it — the
+    // constructor panics otherwise.
+    let subject = Subject::new(&island, "clampU8");
+    let reflected = reflect_uint_straight_line(&subject.pristine).expect("clampU8 reflects");
 
-    // The measurement behind the refusal: the two instances are not def_eq, so
-    // the uniform spelling genuinely cannot earn kernel agreement here.
+    // Leg B: the reflected term agrees with the TrustIR interpreter.
+    differential_leg(env, &CLAMP, &subject.pristine, &reflected);
+
+    // Leg D: each operator that applies here is caught, and by the kernel — the
+    // refusal that used to catch the operand swap is gone.
+    for name in [
+        "select-arms-swapped",
+        "constant-shifted-by-one",
+        "ult-widened-to-ule",
+        "icmp-operands-swapped",
+    ] {
+        assert_eq!(
+            subject.must_catch(mutation(name)),
+            MutationVerdict::CaughtByKernel,
+            "`{name}` on clampU8 must be a kernel rejection of a fully spelled term"
+        );
+    }
+
+    // The newly exposed literal <= and propositional-equality single selects
+    // take the same independent route. Pin their comparison identity rather
+    // than relying only on boundary execution.
+    for (name, expected, wrong) in
+        [("leLitU8", ICmpOp::Ule, ICmpOp::Ult), ("eqLitU8", ICmpOp::Eq, ICmpOp::Ult)]
+    {
+        let subject = Subject::new(&island, name);
+        for mutation_name in ["select-arms-swapped", "constant-shifted-by-one"] {
+            assert!(
+                subject.must_catch(mutation(mutation_name)).caught(),
+                "{mutation_name} must be caught for {name}"
+            );
+        }
+        let mut corrupt = subject.pristine.clone();
+        let node = corrupt.blocks[0]
+            .body
+            .iter_mut()
+            .find(|node| matches!(&node.inst, Inst::ICmp { .. }))
+            .expect("literal select has one emitted comparison");
+        let Inst::ICmp { op, .. } = &mut node.inst else { unreachable!() };
+        assert_eq!(*op, expected);
+        *op = wrong;
+        assert_eq!(
+            subject.verdict_of(&corrupt),
+            MutationVerdict::CaughtByKernel,
+            "wrong comparison on {name} must be a kernel rejection"
+        );
+    }
+
+    // The measurement the refusal rested on, now asserted the other way: the
+    // uniform instance and the `Nat`-reduced one every pre-`c91fa93f5` pin
+    // elaborated are kernel-equal under two open binders.
     let a = Expr::bvar(1);
-    let uniform = decidable_inst("instDecidableUInt8Lt", a.clone(), uint_lit(8, 10));
-    let elaborated = Expr::apps(
-        Expr::const_str("instDecidableNatLt"),
-        [
-            // `a.toBitVec.toFin.val`, read off the elaborated declaration.
-            proj("Fin", 0, proj("BitVec", 0, proj("UInt8", 0, a))),
-            Expr::nat_lit(10),
-        ],
-    );
+    let to_nat = |e: Expr| proj("Fin", 0, proj("BitVec", 0, proj("UInt8", 0, e)));
     let under_two_binders = |e: Expr| {
-        Expr::lam(
-            BinderInfo::Default,
-            carrier(8),
-            Expr::lam(BinderInfo::Default, carrier(8), e),
-        )
+        Expr::lam(BinderInfo::Default, carrier(8), Expr::lam(BinderInfo::Default, carrier(8), e))
     };
+    let uniform = decidable_inst("instDecidableUInt8Lt", a.clone(), uint_lit(8, 10));
+    let nat_reduced =
+        Expr::apps(Expr::const_str("instDecidableNatLt"), [to_nat(a.clone()), Expr::nat_lit(10)]);
     assert!(
-        !kernel_accepts(
-            env,
-            &under_two_binders(uniform),
-            &under_two_binders(elaborated)
+        kernel_accepts(env, &under_two_binders(uniform), &under_two_binders(nat_reduced)),
+        "the uniform and Nat-reduced Decidable instances of `a < 10` are no longer \
+         def_eq: this Clean pin predates c91fa93f5 or reverted it. Restore the \
+         OrderComparisonAgainstNumeral refusal — it existed only because they were not"
+    );
+    // The same with the numeral on the LEFT, where the elaborator still mints
+    // the `Nat`-reduced instance, and against a real declaration: the uniform
+    // reflection is accepted there too.
+    let flipped = decidable_inst("instDecidableUInt8Lt", uint_lit(8, 10), a.clone());
+    let flipped_nat =
+        Expr::apps(Expr::const_str("instDecidableNatLt"), [Expr::nat_lit(10), to_nat(a)]);
+    assert!(
+        kernel_accepts(env, &under_two_binders(flipped.clone()), &under_two_binders(flipped_nat)),
+        "the uniform and Nat-reduced Decidable instances of `10 < a` must be def_eq"
+    );
+    let left =
+        Island::check("def ltLitLeftU8 (a : UInt8) (b : UInt8) : UInt8 := if 10 < a then a else b");
+    let uniform_left_body =
+        ite(8, lt_prop(8, uint_lit(8, 10), Expr::bvar(1)), flipped, Expr::bvar(1), Expr::bvar(0));
+    assert!(
+        kernel_accepts(
+            left.env(),
+            &under_two_binders(uniform_left_body),
+            &left.declared("ltLitLeftU8")
         ),
-        "if these two Decidable instances ever BECOME def_eq, delete the \
-         OrderComparisonAgainstNumeral refusal — it exists only because they are not"
+        "a numeral on the left of `<` must reflect uniformly too"
     );
 
-    // CONTROL, and the reason the refusal is keyed on ORDER relations rather
-    // than on "a literal operand": for `a = 10` the elaborator KEEPS the
-    // uniform `instDecidableEqUInt8`, so the uniform spelling this reflector
-    // would emit is accepted. It is checked against the declaration directly
-    // rather than through the emitter because `if a = 10 …` is currently
-    // outside the emitter's own select fragment (only `<` takes a numeral
-    // there), so no IR for it exists to reflect.
+    // CONTROL: for `a = 10` the elaborator keeps the uniform
+    // `instDecidableEqUInt8`, so the uniform spelling this reflector emits is
+    // accepted — on every pin, which is why the old reflector refusal was
+    // only ever keyed on ORDER relations. The emitter now exposes this exact
+    // term too; `eqLitU8`'s SHAPES row exercises that route independently.
     let uniform_eq_body = ite(
         8,
         eq_prop(8, Expr::bvar(1), uint_lit(8, 10)),
@@ -1058,11 +1038,7 @@ fn order_comparison_against_a_numeral_is_a_real_limit() {
         Expr::bvar(0),
     );
     assert!(
-        kernel_accepts(
-            env,
-            &under_two_binders(uniform_eq_body),
-            &island.declared("eqLitU8")
-        ),
+        kernel_accepts(env, &under_two_binders(uniform_eq_body), &island.declared("eqLitU8")),
         "a numeral on `=` keeps the uniform instance, so nothing needs refusing there"
     );
 }
@@ -1178,14 +1154,7 @@ fn kernel_rejects_wrong_reflections() {
     let off_by_one = Expr::lam(
         BinderInfo::Default,
         carrier(8),
-        hetero_binop(
-            "HAdd",
-            "hAdd",
-            "instHAdd",
-            8,
-            Expr::bvar(0),
-            uint_lit(8, 8),
-        ),
+        hetero_binop("HAdd", "hAdd", "instHAdd", 8, Expr::bvar(0), uint_lit(8, 8)),
     );
     assert!(
         !kernel_accepts(env, &off_by_one, &island.declared("litU8")),
@@ -1232,9 +1201,7 @@ fn unsupported_shapes_are_refused_by_name() {
     // Signed carrier.
     let f = mk(
         vec![(ValueId::new(0), Ty::I32)],
-        vec![InstrNode::new(Inst::Return {
-            values: vec![ValueId::new(0)],
-        })],
+        vec![InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] })],
     );
     assert!(matches!(
         reflect_uint_straight_line(&f),
@@ -1244,9 +1211,7 @@ fn unsupported_shapes_are_refused_by_name() {
     // Target-dependent width.
     let f = mk(
         vec![(ValueId::new(0), Ty::Usize)],
-        vec![InstrNode::new(Inst::Return {
-            values: vec![ValueId::new(0)],
-        })],
+        vec![InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] })],
     );
     assert!(matches!(
         reflect_uint_straight_line(&f),
@@ -1264,16 +1229,12 @@ fn unsupported_shapes_are_refused_by_name() {
                 rhs: ValueId::new(1),
             })
             .with_result(ValueId::new(2)),
-            InstrNode::new(Inst::Return {
-                values: vec![ValueId::new(2)],
-            }),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }),
         ],
     );
     assert_eq!(
         reflect_uint_straight_line(&f),
-        Err(ReflectRefusal::UnsupportedBinOp {
-            op: "UDiv".to_string()
-        })
+        Err(ReflectRefusal::UnsupportedBinOp { op: "UDiv".to_string() })
     );
 
     // Signed comparison.
@@ -1294,16 +1255,12 @@ fn unsupported_shapes_are_refused_by_name() {
                 else_val: ValueId::new(1),
             })
             .with_result(ValueId::new(3)),
-            InstrNode::new(Inst::Return {
-                values: vec![ValueId::new(3)],
-            }),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(3)] }),
         ],
     );
     assert_eq!(
         reflect_uint_straight_line(&f),
-        Err(ReflectRefusal::UnsupportedICmp {
-            op: "Slt".to_string()
-        })
+        Err(ReflectRefusal::UnsupportedICmp { op: "Slt".to_string() })
     );
 
     // A `Select` on a Bool this reflector cannot name a proposition for. THIS
@@ -1311,11 +1268,8 @@ fn unsupported_shapes_are_refused_by_name() {
     let f = mk(
         vec![(ValueId::new(0), Ty::U8), (ValueId::new(1), Ty::U8)],
         vec![
-            InstrNode::new(Inst::Const {
-                ty: Ty::Bool,
-                value: Constant::Bool(true),
-            })
-            .with_result(ValueId::new(2)),
+            InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                .with_result(ValueId::new(2)),
             InstrNode::new(Inst::Select {
                 ty: Ty::U8,
                 cond: ValueId::new(2),
@@ -1323,9 +1277,7 @@ fn unsupported_shapes_are_refused_by_name() {
                 else_val: ValueId::new(1),
             })
             .with_result(ValueId::new(3)),
-            InstrNode::new(Inst::Return {
-                values: vec![ValueId::new(3)],
-            }),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(3)] }),
         ],
     );
     assert!(matches!(
@@ -1347,9 +1299,7 @@ fn unsupported_shapes_are_refused_by_name() {
                 rhs: ValueId::new(1),
             })
             .with_result(ValueId::new(2)),
-            InstrNode::new(Inst::Return {
-                values: vec![ValueId::new(2)],
-            }),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }),
         ],
     );
     assert_eq!(
@@ -1361,14 +1311,9 @@ fn unsupported_shapes_are_refused_by_name() {
     let f = mk(
         vec![],
         vec![
-            InstrNode::new(Inst::Const {
-                ty: Ty::U8,
-                value: Constant::Int(-1),
-            })
-            .with_result(ValueId::new(0)),
-            InstrNode::new(Inst::Return {
-                values: vec![ValueId::new(0)],
-            }),
+            InstrNode::new(Inst::Const { ty: Ty::U8, value: Constant::Int(-1) })
+                .with_result(ValueId::new(0)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }),
         ],
     );
     assert!(matches!(
@@ -1377,18 +1322,10 @@ fn unsupported_shapes_are_refused_by_name() {
     ));
 
     // Multi-block: outside the straight-line fragment.
-    let mut f = mk(
-        vec![],
-        vec![InstrNode::new(Inst::Br {
-            target: BlockId::new(1),
-            args: vec![],
-        })],
-    );
+    let mut f =
+        mk(vec![], vec![InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] })]);
     f.blocks.push(Block::new(BlockId::new(1)));
-    assert_eq!(
-        reflect_uint_straight_line(&f),
-        Err(ReflectRefusal::NotSingleBlock { blocks: 2 })
-    );
+    assert_eq!(reflect_uint_straight_line(&f), Err(ReflectRefusal::NotSingleBlock { blocks: 2 }));
 
     // Memory: not a mathematical function of the block parameters at all.
     let f = mk(
@@ -1401,9 +1338,7 @@ fn unsupported_shapes_are_refused_by_name() {
                 align: None,
             })
             .with_result(ValueId::new(1)),
-            InstrNode::new(Inst::Return {
-                values: vec![ValueId::new(1)],
-            }),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(1)] }),
         ],
     );
     assert!(matches!(
@@ -1490,10 +1425,7 @@ struct Mutation {
 
 /// Swap the two arms of a `Select`. Turns `min` into `max`.
 fn mut_swap_select_arms(inst: &mut Inst) -> bool {
-    if let Inst::Select {
-        then_val, else_val, ..
-    } = inst
-    {
+    if let Inst::Select { then_val, else_val, .. } = inst {
         if then_val == else_val {
             return false;
         }
@@ -1518,13 +1450,7 @@ fn mut_add_to_sub(inst: &mut Inst) -> bool {
 /// mutant is a genuinely different function — an operand swap on `+` would be
 /// a mutant nothing SHOULD catch semantically.
 fn mut_swap_sub_operands(inst: &mut Inst) -> bool {
-    if let Inst::BinOp {
-        op: BinOp::Sub,
-        lhs,
-        rhs,
-        ..
-    } = inst
-    {
+    if let Inst::BinOp { op: BinOp::Sub, lhs, rhs, .. } = inst {
         if lhs == rhs {
             return false;
         }
@@ -1537,11 +1463,7 @@ fn mut_swap_sub_operands(inst: &mut Inst) -> bool {
 /// Shift an integer `Constant` by one. The off-by-one an emitter makes when it
 /// mis-reads a numeral.
 fn mut_shift_constant(inst: &mut Inst) -> bool {
-    if let Inst::Const {
-        value: Constant::Int(v),
-        ..
-    } = inst
-    {
+    if let Inst::Const { value: Constant::Int(v), .. } = inst {
         *v += 1;
         return true;
     }
@@ -1594,34 +1516,13 @@ fn mut_swap_icmp_operands(inst: &mut Inst) -> bool {
 /// The five the assignment names, plus two cheap neighbours that probe the same
 /// machinery from a different side.
 const MUTATIONS: &[Mutation] = &[
-    Mutation {
-        name: "select-arms-swapped",
-        apply: mut_swap_select_arms,
-    },
-    Mutation {
-        name: "add-becomes-sub",
-        apply: mut_add_to_sub,
-    },
-    Mutation {
-        name: "sub-operands-swapped",
-        apply: mut_swap_sub_operands,
-    },
-    Mutation {
-        name: "constant-shifted-by-one",
-        apply: mut_shift_constant,
-    },
-    Mutation {
-        name: "ult-widened-to-ule",
-        apply: mut_widen_ult_to_ule,
-    },
-    Mutation {
-        name: "and-becomes-or",
-        apply: mut_and_to_or,
-    },
-    Mutation {
-        name: "icmp-operands-swapped",
-        apply: mut_swap_icmp_operands,
-    },
+    Mutation { name: "select-arms-swapped", apply: mut_swap_select_arms },
+    Mutation { name: "add-becomes-sub", apply: mut_add_to_sub },
+    Mutation { name: "sub-operands-swapped", apply: mut_swap_sub_operands },
+    Mutation { name: "constant-shifted-by-one", apply: mut_shift_constant },
+    Mutation { name: "ult-widened-to-ule", apply: mut_widen_ult_to_ule },
+    Mutation { name: "and-becomes-or", apply: mut_and_to_or },
+    Mutation { name: "icmp-operands-swapped", apply: mut_swap_icmp_operands },
 ];
 
 /// Clone `func` and apply `m` to its FIRST matching instruction.
@@ -1685,12 +1586,7 @@ impl<'a> Subject<'a> {
              already red."
         );
 
-        Self {
-            name,
-            env,
-            declared,
-            pristine,
-        }
+        Self { name, env, declared, pristine }
     }
 
     /// Put an already-corrupted `Function` through exactly the check the
@@ -1770,7 +1666,10 @@ fn mutation(name: &str) -> &'static Mutation {
 fn mutation_swapping_select_arms_is_caught() {
     let island = Island::check(SOURCE);
     eprintln!("select-arms-swapped:");
-    for shape in ["minU8", "maxU8", "leU8", "eqU8", "flagU8", "minU16", "minU32", "minU64"] {
+    for shape in [
+        "minU8", "maxU8", "leU8", "eqU8", "leLitU8", "eqLitU8", "flagU8", "minU16", "minU32",
+        "minU64",
+    ] {
         Subject::new(&island, shape).must_catch(mutation("select-arms-swapped"));
     }
 }
@@ -1803,7 +1702,7 @@ fn mutation_swapping_sub_operands_is_caught() {
 fn mutation_shifting_a_constant_is_caught() {
     let island = Island::check(SOURCE);
     eprintln!("constant-shifted-by-one:");
-    for shape in ["litU8", "litOnlyU8", "deepU8", "flagU8", "nestU16"] {
+    for shape in ["litU8", "litOnlyU8", "deepU8", "leLitU8", "eqLitU8", "flagU8", "nestU16"] {
         Subject::new(&island, shape).must_catch(mutation("constant-shifted-by-one"));
     }
 }
@@ -1835,10 +1734,13 @@ fn mutation_widening_ult_to_ule_is_caught() {
     for (a, b) in [(3u64, 5u64), (5, 3), (4, 4), (200, 100), (0, 255)] {
         let run = |f: &Function| {
             let out = interpreter
-                .execute_function(f, [
-                    InterpretValue::int(Ty::U8, i128::from(a)).expect("in range"),
-                    InterpretValue::int(Ty::U8, i128::from(b)).expect("in range"),
-                ])
+                .execute_function(
+                    f,
+                    [
+                        InterpretValue::int(Ty::U8, i128::from(a)).expect("in range"),
+                        InterpretValue::int(Ty::U8, i128::from(b)).expect("in range"),
+                    ],
+                )
                 .expect("interprets");
             out.returns[0].as_int().expect("int").as_unsigned()
         };
@@ -1874,14 +1776,10 @@ fn mutation_sweep_over_every_covered_shape() {
         }
     }
 
-    let applied: Vec<_> = rows
-        .iter()
-        .filter(|(_, _, v)| *v != MutationVerdict::NotApplicable)
-        .collect();
-    let survivors: Vec<_> = rows
-        .iter()
-        .filter(|(_, _, v)| *v == MutationVerdict::Survived)
-        .collect();
+    let applied: Vec<_> =
+        rows.iter().filter(|(_, _, v)| *v != MutationVerdict::NotApplicable).collect();
+    let survivors: Vec<_> =
+        rows.iter().filter(|(_, _, v)| *v == MutationVerdict::Survived).collect();
 
     eprintln!("\n=== MUTATION SWEEP ===");
     eprintln!(
@@ -1902,10 +1800,8 @@ fn mutation_sweep_over_every_covered_shape() {
     for m in MUTATIONS {
         let cells: Vec<_> = rows.iter().filter(|(_, n, _)| *n == m.name).collect();
         let count = |want: MutationVerdict| cells.iter().filter(|(_, _, v)| *v == want).count();
-        let applied_here = cells
-            .iter()
-            .filter(|(_, _, v)| *v != MutationVerdict::NotApplicable)
-            .count();
+        let applied_here =
+            cells.iter().filter(|(_, _, v)| *v != MutationVerdict::NotApplicable).count();
         eprintln!(
             "  {:24} applied {:3}  by-kernel {:3}  by-refusal {:3}  SURVIVED {}",
             m.name,
@@ -2012,16 +1908,10 @@ fn the_mutation_harness_can_actually_report_a_survivor() {
     let mut benign = subject.pristine.clone();
     let block = &mut benign.blocks[0];
     block.body.pop().expect("the terminator just read back");
-    block.body.push(
-        InstrNode::new(Inst::Copy {
-            ty: Ty::U8,
-            operand: returned,
-        })
-        .with_result(fresh),
-    );
-    block.body.push(InstrNode::new(Inst::Return {
-        values: vec![fresh],
-    }));
+    block
+        .body
+        .push(InstrNode::new(Inst::Copy { ty: Ty::U8, operand: returned }).with_result(fresh));
+    block.body.push(InstrNode::new(Inst::Return { values: vec![fresh] }));
 
     assert_eq!(
         subject.verdict_of(&benign),
@@ -2048,11 +1938,8 @@ fn the_mutation_harness_can_actually_report_a_survivor() {
 #[test]
 fn the_differential_leg_is_blind_to_an_emitter_mutation() {
     const MUTANT_POINTS: &[&[u64]] = &[&[3, 5], &[200, 100], &[255, 1]];
-    const MUTANT_SHAPE: Shape = Shape {
-        name: "addU8 with Add mutated to Sub",
-        width: 8,
-        points: MUTANT_POINTS,
-    };
+    const MUTANT_SHAPE: Shape =
+        Shape { name: "addU8 with Add mutated to Sub", width: 8, points: MUTANT_POINTS };
 
     let island = Island::check(SOURCE);
     let subject = Subject::new(&island, "addU8");

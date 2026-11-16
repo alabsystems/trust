@@ -31,6 +31,7 @@ fn call(func: &str, args: Vec<Operand>, dest: usize, target: usize) -> Terminato
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(&func.to_string()),
         is_foreign: false,
     }
 }
@@ -136,7 +137,9 @@ fn build_matrix(
         BasicBlock {
             id: BlockId(6),
             stmts: bb6_stmts,
-            terminator: call("std::ops::Index::index", vec![mv(9), cp(10)], 11, 7),
+            // The extractor's spelling of the OUTER `m[r]` (measured on stage1-w10
+            // for `Vec<Vec<u32>>`); IDX-TIE-1 admits std's `Index<usize>` only.
+            terminator: call(OUTER_STD_INDEX, vec![mv(9), cp(10)], 11, 7),
         },
         BasicBlock {
             id: BlockId(7),
@@ -180,8 +183,12 @@ fn build_matrix(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
+
+const OUTER_STD_INDEX: &str =
+    "<alloc::vec::Vec<alloc::vec::Vec<i64>> as core::ops::index::Index<usize>>::index";
 
 fn map_is_empty(func: &VerifiableFunction) -> bool {
     build_push_guard_elem_len_map(func).values().all(|v| v.is_empty())
@@ -245,4 +252,33 @@ fn unguarded_push_fails_closed() {
 fn reassigned_bound_fails_closed() {
     // `n` reassigned between the guard and the read ⇒ the bound is not stable.
     assert!(map_is_empty(&build_matrix(true, false, false, true, false)));
+}
+
+/// IDX-TIE-1 (2026-10-03): the element-length fact says the read row is one of
+/// the pushed rows, which only std's `Index<usize>` guarantees. A user method
+/// named `index` (a user trait on the `Vec`, or a user key type) returns whatever
+/// its body returns, so the fact must not be minted for it.
+#[test]
+fn a_user_method_named_index_gets_no_element_length_fact() {
+    for user in [
+        "<alloc::vec::Vec<alloc::vec::Vec<i64>> as rows::Pick>::index",
+        "<alloc::vec::Vec<alloc::vec::Vec<i64>> as core::ops::index::Index<rows::K>>::index",
+        "std::ops::Index::index",
+    ] {
+        let mut func = build_matrix(true, false, false, false, false);
+        let Terminator::Call { func: callee, .. } = &mut func.body.blocks[6].terminator else {
+            panic!("bb6 is the outer index call");
+        };
+        *callee = user.to_string();
+        assert!(map_is_empty(&func), "{user} must mint no element-length fact");
+    }
+}
+
+/// IDX-TIE-1: `m` must be std's `Vec` by exact path; a user type whose last
+/// segment is `Vec` passed the old last-segment test.
+#[test]
+fn a_user_type_named_vec_gets_no_element_length_fact() {
+    let mut func = build_matrix(true, false, false, false, false);
+    func.body.locals[2].ty = Ty::adt("rows::Vec<std::vec::Vec<i64>>", vec![]);
+    assert!(map_is_empty(&func));
 }

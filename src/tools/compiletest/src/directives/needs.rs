@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use crate::common::{
     Config, KNOWN_CRATE_TYPES, KNOWN_TARGET_HAS_ATOMIC_WIDTHS, Sanitizer, query_rustc_output,
@@ -114,12 +114,30 @@ pub(super) fn handle_needs(
     // the normal `codegen-backends = ["llvm", "trust-cg"]` arrangement where
     // LLVM stays the default.
     if name == "needs-trust-cg-backend" {
-        return if conditions.trust_cg_backend_is_loadable(config) {
+        return if conditions.backend_is_loadable(config, "trust-cg") {
             IgnoreDecision::Continue
         } else {
             IgnoreDecision::Ignore {
                 reason: "ignored when the compiler under test was built without the trust-cg \
                          backend"
+                    .into(),
+            }
+        };
+    }
+
+    // Trust: the same question for the trust-ir -> trust-cg SELF-HOST backend, which
+    // is a different product from the builtin adapter above and a different kind of
+    // artifact: `trust-cg` is linked into `rustc_driver`, while `trust-ir-cg` is a
+    // dylib plugin installed into `<sysroot>/lib/rustlib/<host>/codegen-backends/`
+    // by `Assemble`. So a compiler can carry one and not the other, and the probe —
+    // which asks the real backend loader — is the only honest way to tell.
+    if name == "needs-trust-ir-cg-backend" {
+        return if conditions.backend_is_loadable(config, "trust-ir-cg") {
+            IgnoreDecision::Continue
+        } else {
+            IgnoreDecision::Ignore {
+                reason: "ignored when the compiler under test was built without the \
+                         trust-ir-cg backend plugin"
                     .into(),
             }
         };
@@ -151,30 +169,33 @@ struct Need {
 pub(crate) struct PreparedNeedsConditions {
     /// The `//@ needs-*` conditions that can be treated as a simple name->boolean mapping.
     simple_needs: HashMap<&'static str, Need>,
-    /// Trust: answering `needs-trust-cg-backend` costs a compiler invocation,
-    /// and most suites contain no test that asks. Resolve it on first use and
-    /// keep the answer for the rest of the run.
-    trust_cg_backend: OnceLock<bool>,
+    /// Trust: answering a `needs-<backend>-backend` directive costs a compiler
+    /// invocation, and most suites contain no test that asks. Resolve each backend
+    /// on first use and keep the answer for the rest of the run.
+    loadable_backends: Mutex<HashMap<&'static str, bool>>,
 }
 
 impl PreparedNeedsConditions {
-    fn trust_cg_backend_is_loadable(&self, config: &Config) -> bool {
-        *self.trust_cg_backend.get_or_init(|| {
-            // Backend selection resolves against the builtin table and then the
-            // sysroot loader, and both failures are fatal, so a successful print
-            // request is exactly the evidence wanted. The backend also rejects
-            // target architectures it has not audited, so ask about the target
-            // this suite runs against rather than the host.
-            rustc_query_succeeds(
-                config,
-                &[
-                    "--print=supported-crate-types",
-                    "-Zunstable-options",
-                    "-Zcodegen-backend=trust-cg",
-                    &format!("--target={}", config.target),
-                ],
-            )
-        })
+    fn backend_is_loadable(&self, config: &Config, backend: &'static str) -> bool {
+        if let Some(&answer) = self.loadable_backends.lock().unwrap().get(backend) {
+            return answer;
+        }
+        // Backend selection resolves against the builtin table and then the
+        // sysroot loader, and both failures are fatal, so a successful print
+        // request is exactly the evidence wanted. The backend also rejects
+        // target architectures it has not audited, so ask about the target
+        // this suite runs against rather than the host.
+        let answer = rustc_query_succeeds(
+            config,
+            &[
+                "--print=supported-crate-types",
+                "-Zunstable-options",
+                &format!("-Zcodegen-backend={backend}"),
+                &format!("--target={}", config.target),
+            ],
+        );
+        self.loadable_backends.lock().unwrap().insert(backend, answer);
+        answer
     }
 }
 
@@ -201,6 +222,14 @@ pub(crate) fn prepare_needs_conditions(config: &Config) -> PreparedNeedsConditio
         // Trust: verification tests assert verifier diagnostics; the vanilla
         // replay (`--trust-vanilla`) passes `-Ztrust-verify=off`, so the
         // asserted errors can never fire there.
+        //
+        // Audited for the `--trust-verified` lane and deliberately UNCHANGED:
+        // `trust_vanilla()` and `trust_verified()` are mutually exclusive
+        // (refused in `parse_config`), so on the verified lane this condition is
+        // `true` and these tests RUN. That is not incidental -- they are the
+        // verified lane's POSITIVE CONTROL. A verified run that reports them as
+        // ignored did not have verification on, and none of its rows may be
+        // recorded. See `tests/upstream-rust/VERIFIED-LANE-RUNBOOK.md` step 3.
         Need {
             name: "needs-trust-verify",
             condition: !config.trust_vanilla(),
@@ -422,7 +451,7 @@ pub(crate) fn prepare_needs_conditions(config: &Config) -> PreparedNeedsConditio
         })
         .collect::<HashMap<_, _>>();
 
-    PreparedNeedsConditions { simple_needs, trust_cg_backend: OnceLock::new() }
+    PreparedNeedsConditions { simple_needs, loadable_backends: Mutex::new(HashMap::new()) }
 }
 
 fn find_dlltool(config: &Config) -> bool {

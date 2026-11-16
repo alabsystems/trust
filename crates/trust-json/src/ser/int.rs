@@ -31,10 +31,7 @@ impl Default for IntBuffer {
 impl IntBuffer {
     #[must_use]
     pub const fn new() -> Self {
-        IntBuffer {
-            bytes: [0; CAP],
-            start: CAP,
-        }
+        IntBuffer { bytes: [0; CAP], start: CAP }
     }
 
     pub fn format_u128(&mut self, mut v: u128) -> &str {
@@ -90,14 +87,8 @@ mod tests {
         assert_eq!(b.format_u64(0), "0");
         assert_eq!(b.format_i64(0), "0");
         assert_eq!(b.format_i64(-1), "-1");
-        assert_eq!(
-            b.format_i128(i128::MIN),
-            "-170141183460469231731687303715884105728"
-        );
-        assert_eq!(
-            b.format_u128(u128::MAX),
-            "340282366920938463463374607431768211455"
-        );
+        assert_eq!(b.format_i128(i128::MIN), "-170141183460469231731687303715884105728");
+        assert_eq!(b.format_u128(u128::MAX), "340282366920938463463374607431768211455");
     }
 
     #[test]

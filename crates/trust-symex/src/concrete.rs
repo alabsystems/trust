@@ -314,7 +314,7 @@ impl ConcreteExecutor {
             Operand::Symbolic(_) => {
                 Err(unsupported("SMT Formula operands are not executable by concrete symex"))
             }
-            Operand::Unsupported { kind, detail } => Err(unsupported(format!(
+            Operand::Unsupported { kind, detail, .. } => Err(unsupported(format!(
                 "unsupported MIR operand in concrete symex: {kind}: {detail}"
             ))),
             other => Err(SymexError::UnsupportedOperation(format!(

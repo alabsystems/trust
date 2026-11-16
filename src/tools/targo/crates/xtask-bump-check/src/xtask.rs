@@ -16,16 +16,16 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs;
 
-use cargo::CargoResult;
-use cargo::core::Package;
-use cargo::core::Registry;
-use cargo::core::SourceId;
-use cargo::core::Workspace;
-use cargo::core::dependency::Dependency;
-use cargo::sources::IndexSummary;
-use cargo::sources::source::QueryKind;
-use cargo::util::cache_lock::CacheLockMode;
-use cargo::util::command_prelude::*;
+use targo::CargoResult;
+use targo::sources::IndexSummary;
+use targo::sources::source::QueryKind;
+use targo::util::cache_lock::CacheLockMode;
+use targo::util::command_prelude::*;
+use targo::workspace::Package;
+use targo::workspace::Registry;
+use targo::workspace::SourceId;
+use targo::workspace::Workspace;
+use targo::workspace::dependency::Dependency;
 use cargo_util::ProcessBuilder;
 
 const UPSTREAM_BRANCH: &str = "master";
@@ -69,7 +69,7 @@ pub fn cli() -> clap::Command {
         )
 }
 
-pub fn exec(args: &clap::ArgMatches, gctx: &mut cargo::util::GlobalContext) -> cargo::CliResult {
+pub fn exec(args: &clap::ArgMatches, gctx: &mut targo::util::GlobalContext) -> targo::CliResult {
     global_context_configure(gctx, args)?;
 
     bump_check(args, gctx)?;
@@ -111,7 +111,7 @@ fn global_context_configure(gctx: &mut GlobalContext, args: &ArgMatches) -> CliR
 /// Main entry of `xtask-bump-check`.
 ///
 /// Assumption: version number are incremental. We never have point release for old versions.
-fn bump_check(args: &clap::ArgMatches, gctx: &cargo::util::GlobalContext) -> CargoResult<()> {
+fn bump_check(args: &clap::ArgMatches, gctx: &targo::util::GlobalContext) -> CargoResult<()> {
     let ws = args.workspace(gctx)?;
     let repo = git2::Repository::open(ws.root())?;
     let base_commit = get_base_commit(gctx, args, &repo)?;
@@ -127,7 +127,7 @@ fn bump_check(args: &clap::ArgMatches, gctx: &cargo::util::GlobalContext) -> Car
         // only losing out on checks for patch releases.
         //
         // Note: this is already skipped in `changed`
-        "cargo",
+        "targo",
         // Don't check against beta and stable branches,
         // as the publish of these crates are not tied with Rust release process.
         // See `TO_PUBLISH` in publish.py.
@@ -218,7 +218,7 @@ fn bump_check(args: &clap::ArgMatches, gctx: &cargo::util::GlobalContext) -> Car
     cmd.arg("semver-checks")
         .arg("check-release")
         .arg("--workspace")
-        .args(&["--exclude", "cargo"]);
+        .args(&["--exclude", "targo"]);
     for krate in crates_not_checked {
         cmd.args(&["--exclude", krate]);
     }
@@ -232,7 +232,7 @@ fn bump_check(args: &clap::ArgMatches, gctx: &cargo::util::GlobalContext) -> Car
     let mut cmd = ProcessBuilder::new("cargo");
     cmd.arg("semver-checks")
         .arg("check-release")
-        .args(&["--package", "cargo"])
+        .args(&["--package", "targo"])
         .arg("--default-features")
         .args(&["--features", "all-static"]);
 
@@ -379,7 +379,7 @@ fn changed<'r, 'ws>(
     base_commit: &git2::Commit<'r>,
     head: &git2::Commit<'r>,
 ) -> CargoResult<HashMap<&'ws str, &'ws Package>> {
-    let root_pkg_name = ws.current()?.name(); // `cargo` crate.
+    let root_pkg_name = ws.current()?.name(); // `targo` crate.
     let ws_members = ws
         .members()
         .filter(|pkg| pkg.name() != root_pkg_name) // Only take care of sub crates here.

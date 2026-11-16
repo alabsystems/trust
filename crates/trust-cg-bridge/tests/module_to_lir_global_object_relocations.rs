@@ -39,13 +39,23 @@ fn local_u64(name: &str, value: u64) -> Global {
         linkage: Linkage::Internal,
         tls: None,
         align: None,
+        // v41: a fixture that states no section, visibility or retention.
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     }
 }
 
 fn add_reader(module: &mut Module, id: u32, name: &str, global: GlobalId, reads: usize) {
     assert!(reads == 1 || reads == 2);
-    let ty =
-        module.add_func_type(FuncTy { params: vec![], returns: vec![Ty::U64], is_vararg: false });
+    let ty = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::U64],
+            is_vararg: false,
+            abi: None,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut body = vec![
         InstrNode::new(Inst::GlobalAddr { global }).with_result(ValueId::new(0)),
         InstrNode::new(Inst::Load {
@@ -82,7 +92,7 @@ fn add_reader(module: &mut Module, id: u32, name: &str, global: GlobalId, reads:
 
     let mut function = Function::new(FuncId::new(id), name, ty, BlockId::new(0));
     function.blocks.push(Block { id: BlockId::new(0), params: vec![], body });
-    module.add_function(function);
+    module.try_add_function(function).expect("Module::try_add_function: test fixture");
 }
 
 fn single_reader(value: u64, reads: usize) -> Module {
@@ -324,6 +334,10 @@ fn function_symbol_proxy_remains_separate_from_object_data() {
         linkage: Linkage::External,
         tls: None,
         align: None,
+        // v41: a fixture that states no section, visibility or retention.
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     });
 
     let globals = assembled_internal_object_globals(&module)
@@ -357,8 +371,9 @@ fn clone_disagreement_is_refused_and_allow_unknown_keeps_the_same_global() {
     let module = single_reader(ANSWER, 1);
     let lir = lower_module_to_lir(&module, FuncId::new(0)).expect("lower");
     let source = TrustIrGateSource {
+        abi_cross_check: None,
         symbol: "read_assembled_global".to_string(),
-        module: module.clone(),
+        module: std::sync::Arc::new(module.clone()),
         func_id: FuncId::new(0),
     };
     let compiled = CompiledModule {
@@ -408,14 +423,19 @@ fn clone_disagreement_is_refused_and_allow_unknown_keeps_the_same_global() {
     let lir0 = lower_module_to_lir(&two_function_module, FuncId::new(0)).expect("lower 0");
     let lir1 = lower_module_to_lir(&two_function_module, FuncId::new(1)).expect("lower 1");
     let source0 = TrustIrGateSource {
+        abi_cross_check: None,
         symbol: lir0.name.clone(),
-        module: two_function_module.clone(),
+        module: std::sync::Arc::new(two_function_module.clone()),
         func_id: FuncId::new(0),
     };
     let mut divergent = two_function_module.clone();
     divergent.globals[0].initializer = Some(Constant::Int(OTHER as i128));
-    let source1 =
-        TrustIrGateSource { symbol: lir1.name.clone(), module: divergent, func_id: FuncId::new(1) };
+    let source1 = TrustIrGateSource {
+        abi_cross_check: None,
+        symbol: lir1.name.clone(),
+        module: std::sync::Arc::new(divergent),
+        func_id: FuncId::new(1),
+    };
     let compiled = CompiledModule {
         name: "clone-disagreement.codegen-unit".to_string(),
         lir_functions: vec![lir0, lir1],

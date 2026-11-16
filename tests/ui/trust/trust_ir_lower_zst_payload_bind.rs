@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-ZB: a `Ty::Unit` enum-payload BIND (a genuine drop-free ZST field, or
 // the degraded param-placeholder lane of a generic enum) is SKIPPED at the
 // by-value classifier instead of refusing the body: no bind is pushed, the

@@ -9,17 +9,16 @@
 // errors that only occur once we get past the AST.
 
 #![feature(auto_traits)]
-#![feature(box_patterns)]
-#![feature(builtin_syntax)]
+#![feature(internal_syntax)]
 #![feature(const_trait_impl)]
 #![feature(coroutines)]
 #![feature(decl_macro)]
 #![feature(deref_patterns)]
 #![feature(explicit_tail_calls)]
+#![feature(forced_keywords)]
 #![feature(gen_blocks)]
 #![feature(more_qualified_paths)]
 #![feature(never_patterns)]
-#![feature(never_type)]
 #![feature(pattern_types)]
 #![feature(pattern_type_macro)]
 #![feature(prelude_import)]
@@ -29,7 +28,7 @@
 #![feature(try_blocks)]
 #![feature(try_blocks_heterogeneous)]
 #![feature(yeet_expr)]
-#![allow(incomplete_features)]
+#![allow(incomplete_features, unused_attributes)]
 
 mod prelude {
     pub use std::prelude::rust_2024::*;
@@ -146,7 +145,7 @@ mod expressions {
     /// ExprKind::Type
     fn expr_type() {
         let expr;
-        builtin # type_ascribe(expr, T);
+        k#type_ascribe(expr, T);
     }
 
     /// ExprKind::Let
@@ -635,11 +634,6 @@ mod patterns {
         let ();
         let (true,);
         let (true, false);
-    }
-
-    /// PatKind::Box
-    fn pat_box() {
-        let box pat;
     }
 
     /// PatKind::Deref

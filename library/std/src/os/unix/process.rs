@@ -5,6 +5,7 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use crate::ffi::OsStr;
+use crate::macros::rustdoc_skip_body;
 use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use crate::path::Path;
 #[cfg(doc)]
@@ -101,6 +102,16 @@ pub impl(self) trait CommandExt {
     /// working directory have successfully been changed, so output to these
     /// locations might not appear where intended.
     ///
+    /// In Trust's std every descriptor above stdio is also already marked
+    /// close-on-exec by then, unless [`inherit_all_fds`] was called (see
+    /// [`inherit_fd`]). A descriptor the closure `dup2`s onto another number
+    /// survives the exec (`dup2` clears its target's close-on-exec flag; a
+    /// `dup2` onto the same number changes nothing), as does one whose flag
+    /// the closure clears itself.
+    ///
+    /// [`inherit_fd`]: CommandExt::inherit_fd
+    /// [`inherit_all_fds`]: CommandExt::inherit_all_fds
+    ///
     /// [POSIX fork() specification]:
     ///     https://pubs.opengroup.org/onlinepubs/9799919799/functions/fork.html
     /// [`std::env`]: mod@crate::env
@@ -158,6 +169,14 @@ pub impl(self) trait CommandExt {
     /// file descriptors may have changed. If a "transactional spawn" is
     /// required to gracefully handle errors it is recommended to use the
     /// cross-platform `spawn` instead.
+    ///
+    /// Unlike a spawned child, the program that replaces this process keeps
+    /// every descriptor this process holds without close-on-exec, as upstream
+    /// Rust's does: `exec` replaces this process rather than starting a new
+    /// holder of its descriptors. [`inherit_fd`] still applies, and its
+    /// descriptors stay without close-on-exec if the exec fails.
+    ///
+    /// [`inherit_fd`]: CommandExt::inherit_fd
     #[stable(feature = "process_exec2", since = "1.9.0")]
     #[must_use]
     fn exec(&mut self) -> io::Error;
@@ -188,7 +207,8 @@ pub impl(self) trait CommandExt {
     ///
     /// A process group ID of 0 will use the process ID as the PGID.
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::process::Command;
     /// use std::os::unix::process::CommandExt;
     ///
@@ -212,30 +232,127 @@ pub impl(self) trait CommandExt {
     /// If no directory has been specified with [`process::Command::current_dir`], this will set the
     /// directory to `/`, to avoid leaving the current directory outside the chroot. (This is an
     /// intentional difference from the underlying `chroot` system call.)
+    ///
+    /// This typically requires privileges, such as root or a specific capability.
+    ///
+    /// Note that `chroot` is not guaranteed to be async-signal-safe on all OSes, and functions
+    /// called between `fork` and `exec` must be async-signal-safe. However, in practice, the
+    /// ability to `fork` then `chroot` then `exec` is a capability widely provided by Rust targets
+    /// and relied upon by numerous programs.
+    ///
+    /// `chroot` is not, by itself, a complete security or sandboxing measure. It may form some part
+    /// of a containment mechanism, but fully containing a process requires additional steps.
+    ///
+    /// See the [`chroot`] manual page for more details.
+    ///
+    /// [`chroot`]: https://man7.org/linux/man-pages/man2/chroot.2.html
+    ///
+    /// # Examples
+    ///
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
+    /// #![feature(process_chroot)]
+    /// use std::process::Command;
+    /// use std::os::unix::process::CommandExt;
+    ///
+    /// Command::new("binary-within-new-root")
+    ///    .chroot("/new-root")
+    ///    .spawn()?
+    ///    .wait()?;
+    /// #
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    #[doc = "```"]
     #[unstable(feature = "process_chroot", issue = "141298")]
     fn chroot<P: AsRef<Path>>(&mut self, dir: P) -> &mut process::Command;
 
     #[unstable(feature = "process_setsid", issue = "105376")]
     fn setsid(&mut self, setsid: bool) -> &mut process::Command;
+
+    // Trust: inherit-nothing spawns (docs/DECISION_QUEUE.md, SP-1).
+    /// Hands the descriptor `fd` of this process to the child at the same
+    /// number.
+    ///
+    /// **A spawned child inherits its stdio and nothing else** in Trust's std:
+    /// file descriptors 0, 1 and 2 as [`stdin`], [`stdout`] and [`stderr`]
+    /// configure them, and the descriptors named here. Upstream Rust hands a
+    /// child every descriptor this process holds without close-on-exec at
+    /// the instant of the spawn, including one another thread has just
+    /// created and not yet flagged; Trust's std does that only after
+    /// [`inherit_all_fds`].
+    ///
+    /// `fd` reaches the child whether or not it is close-on-exec here (the
+    /// flag is cleared in the child only). It must be a descriptor this process
+    /// holds when the `Command` is spawned, not one std opens for the spawn
+    /// itself, or the spawn fails with `EBADF`. Numbers 0 to 2
+    /// (and negative numbers) are ignored: stdio is the business of
+    /// [`stdin`], [`stdout`] and [`stderr`]. To hand a descriptor over at
+    /// another number, `dup2` it into place in a [`pre_exec`] closure, which
+    /// runs after the child's other descriptors are marked close-on-exec.
+    ///
+    /// On Darwin a kqueue descriptor never reaches a child, and on Fuchsia
+    /// and VxWorks this setting is ignored (no descriptor beyond stdio is
+    /// handed over there).
+    ///
+    /// ```no_run
+    /// #![feature(trust_process_inherit_fds)]
+    /// use std::os::fd::AsRawFd;
+    /// use std::os::unix::process::CommandExt;
+    /// use std::process::Command;
+    ///
+    /// let (reader, writer) = std::io::pipe()?;
+    /// let status = Command::new("sh")
+    ///     .arg("-c")
+    ///     .arg(format!("echo hello >&{}", writer.as_raw_fd()))
+    ///     .inherit_fd(writer.as_raw_fd())
+    ///     .status()?;
+    /// # drop((reader, status));
+    /// # Ok::<_, std::io::Error>(())
+    /// ```
+    ///
+    /// [`stdin`]: process::Command::stdin
+    /// [`stdout`]: process::Command::stdout
+    /// [`stderr`]: process::Command::stderr
+    /// [`inherit_all_fds`]: CommandExt::inherit_all_fds
+    /// [`pre_exec`]: CommandExt::pre_exec
+    #[unstable(feature = "trust_process_inherit_fds", issue = "none")]
+    fn inherit_fd(&mut self, fd: RawFd) -> &mut process::Command;
+
+    // Trust: inherit-nothing spawns (docs/DECISION_QUEUE.md, SP-1).
+    /// Hands the child every descriptor this process holds without
+    /// close-on-exec at the spawn: upstream Rust's behaviour, which Trust's
+    /// std replaces by default with stdio plus [`inherit_fd`].
+    ///
+    /// Use it only where the child must receive descriptors nobody names (a
+    /// jobserver or socket-activation hand-off passed through by number, for
+    /// example): it also hands over whatever another thread holds unflagged
+    /// at that instant, for the child's whole life.
+    ///
+    /// [`inherit_fd`]: CommandExt::inherit_fd
+    #[unstable(feature = "trust_process_inherit_fds", issue = "none")]
+    fn inherit_all_fds(&mut self) -> &mut process::Command;
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl CommandExt for process::Command {
+    #[rustdoc_skip_body]
     fn uid(&mut self, id: UserId) -> &mut process::Command {
         self.as_inner_mut().uid(id);
         self
     }
 
+    #[rustdoc_skip_body]
     fn gid(&mut self, id: GroupId) -> &mut process::Command {
         self.as_inner_mut().gid(id);
         self
     }
 
+    #[rustdoc_skip_body]
     fn groups(&mut self, groups: &[GroupId]) -> &mut process::Command {
         self.as_inner_mut().groups(groups);
         self
     }
 
+    #[rustdoc_skip_body]
     unsafe fn pre_exec<F>(&mut self, f: F) -> &mut process::Command
     where
         F: FnMut() -> io::Result<()> + Send + Sync + 'static,
@@ -244,12 +361,14 @@ impl CommandExt for process::Command {
         self
     }
 
+    #[rustdoc_skip_body]
     fn exec(&mut self) -> io::Error {
         // NOTE: This may *not* be safe to call after `libc::fork`, because it
         // may allocate. That may be worth fixing at some point in the future.
         self.as_inner_mut().exec(sys::process::Stdio::Inherit)
     }
 
+    #[rustdoc_skip_body]
     fn arg0<S>(&mut self, arg: S) -> &mut process::Command
     where
         S: AsRef<OsStr>,
@@ -258,18 +377,33 @@ impl CommandExt for process::Command {
         self
     }
 
+    #[rustdoc_skip_body]
     fn process_group(&mut self, pgroup: i32) -> &mut process::Command {
         self.as_inner_mut().pgroup(pgroup);
         self
     }
 
+    #[rustdoc_skip_body]
     fn chroot<P: AsRef<Path>>(&mut self, dir: P) -> &mut process::Command {
         self.as_inner_mut().chroot(dir.as_ref());
         self
     }
 
+    #[rustdoc_skip_body]
     fn setsid(&mut self, setsid: bool) -> &mut process::Command {
         self.as_inner_mut().setsid(setsid);
+        self
+    }
+
+    // Trust: inherit-nothing spawns.
+    fn inherit_fd(&mut self, fd: RawFd) -> &mut process::Command {
+        self.as_inner_mut().inherit_fd(fd);
+        self
+    }
+
+    // Trust: inherit-nothing spawns.
+    fn inherit_all_fds(&mut self) -> &mut process::Command {
+        self.as_inner_mut().inherit_all_fds();
         self
     }
 }
@@ -303,7 +437,8 @@ pub impl(self) trait ExitStatusExt {
     /// status. The following example relies on that convention and is therefore not guaranteed to
     /// hold on every target:
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// # if cfg!(target_os = "fuchsia") { return; }
     /// use std::os::unix::process::ExitStatusExt;
     /// use std::process::ExitStatus;
@@ -324,7 +459,8 @@ pub impl(self) trait ExitStatusExt {
     /// 8-bit exit code in bits 8..16, so a status built with `(code & 0xff) << 8` will usually
     /// round-trip back to the original exit code:
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// # if cfg!(target_os = "fuchsia") { return; }
     /// use std::os::unix::process::ExitStatusExt;
     /// use std::process::ExitStatus;
@@ -350,7 +486,8 @@ pub impl(self) trait ExitStatusExt {
     /// In other words, if [`WIFSIGNALED`][`wait`], this returns [`WTERMSIG`][`wait`]. For such a status,
     /// [`ExitStatus::code`] returns `None`:
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// # if cfg!(target_os = "fuchsia") { return; }
     /// use std::os::unix::process::ExitStatusExt;
     /// use std::process::ExitStatus;
@@ -409,26 +546,32 @@ pub impl(self) trait ExitStatusExt {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl ExitStatusExt for process::ExitStatus {
+    #[rustdoc_skip_body]
     fn from_raw(raw: i32) -> Self {
         process::ExitStatus::from_inner(From::from(raw))
     }
 
+    #[rustdoc_skip_body]
     fn signal(&self) -> Option<i32> {
         self.as_inner().signal()
     }
 
+    #[rustdoc_skip_body]
     fn core_dumped(&self) -> bool {
         self.as_inner().core_dumped()
     }
 
+    #[rustdoc_skip_body]
     fn stopped_signal(&self) -> Option<i32> {
         self.as_inner().stopped_signal()
     }
 
+    #[rustdoc_skip_body]
     fn continued(&self) -> bool {
         self.as_inner().continued()
     }
 
+    #[rustdoc_skip_body]
     fn into_raw(self) -> i32 {
         self.as_inner().into_raw().into()
     }
@@ -475,7 +618,8 @@ pub impl(self) trait ChildExt {
     ///
     /// # Examples
     ///
-    /// ```rust
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(unix_send_signal)]
     ///
     /// use std::{io, os::unix::process::ChildExt, process::{Command, Stdio}};
@@ -503,7 +647,8 @@ pub impl(self) trait ChildExt {
     ///
     /// # Examples
     ///
-    /// ```rust
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(unix_send_signal)]
     ///
     /// use std::{io, os::unix::process::{ChildExt, CommandExt}, process::{Command, Stdio}};
@@ -535,7 +680,8 @@ pub impl(self) trait ChildExt {
     ///
     /// # Examples
     ///
-    /// ```rust
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(unix_kill_process_group)]
     ///
     /// use std::{os::unix::process::{ChildExt, CommandExt}, process::{Command, Stdio}};
@@ -557,15 +703,18 @@ pub impl(self) trait ChildExt {
 
 #[unstable(feature = "unix_send_signal", issue = "141975")]
 impl ChildExt for process::Child {
+    #[rustdoc_skip_body]
     fn send_signal(&self, signal: i32) -> io::Result<()> {
         self.handle.send_signal(signal)
     }
 
+    #[rustdoc_skip_body]
     fn send_process_group_signal(&self, signal: i32) -> io::Result<()> {
         self.handle.send_process_group_signal(signal)
     }
 
     #[cfg(not(target_os = "espidf"))]
+    #[rustdoc_skip_body]
     fn kill_process_group(&mut self) -> io::Result<()> {
         self.handle.send_process_group_signal(libc::SIGKILL)
     }
@@ -582,6 +731,7 @@ impl ChildExt for process::Child {
 #[stable(feature = "process_extensions", since = "1.2.0")]
 impl FromRawFd for process::Stdio {
     #[inline]
+    #[rustdoc_skip_body]
     unsafe fn from_raw_fd(fd: RawFd) -> process::Stdio {
         let fd = sys::fd::FileDesc::from_raw_fd(fd);
         let io = sys::process::Stdio::Fd(fd);
@@ -594,6 +744,7 @@ impl From<OwnedFd> for process::Stdio {
     /// Takes ownership of a file descriptor and returns a [`Stdio`](process::Stdio)
     /// that can attach a stream to it.
     #[inline]
+    #[rustdoc_skip_body]
     fn from(fd: OwnedFd) -> process::Stdio {
         let fd = sys::fd::FileDesc::from_inner(fd);
         let io = sys::process::Stdio::Fd(fd);
@@ -604,6 +755,7 @@ impl From<OwnedFd> for process::Stdio {
 #[stable(feature = "process_extensions", since = "1.2.0")]
 impl AsRawFd for process::ChildStdin {
     #[inline]
+    #[rustdoc_skip_body]
     fn as_raw_fd(&self) -> RawFd {
         self.as_inner().as_raw_fd()
     }
@@ -612,6 +764,7 @@ impl AsRawFd for process::ChildStdin {
 #[stable(feature = "process_extensions", since = "1.2.0")]
 impl AsRawFd for process::ChildStdout {
     #[inline]
+    #[rustdoc_skip_body]
     fn as_raw_fd(&self) -> RawFd {
         self.as_inner().as_raw_fd()
     }
@@ -620,6 +773,7 @@ impl AsRawFd for process::ChildStdout {
 #[stable(feature = "process_extensions", since = "1.2.0")]
 impl AsRawFd for process::ChildStderr {
     #[inline]
+    #[rustdoc_skip_body]
     fn as_raw_fd(&self) -> RawFd {
         self.as_inner().as_raw_fd()
     }
@@ -628,6 +782,7 @@ impl AsRawFd for process::ChildStderr {
 #[stable(feature = "into_raw_os", since = "1.4.0")]
 impl IntoRawFd for process::ChildStdin {
     #[inline]
+    #[rustdoc_skip_body]
     fn into_raw_fd(self) -> RawFd {
         self.into_inner().into_inner().into_raw_fd()
     }
@@ -636,6 +791,7 @@ impl IntoRawFd for process::ChildStdin {
 #[stable(feature = "into_raw_os", since = "1.4.0")]
 impl IntoRawFd for process::ChildStdout {
     #[inline]
+    #[rustdoc_skip_body]
     fn into_raw_fd(self) -> RawFd {
         self.into_inner().into_inner().into_raw_fd()
     }
@@ -644,6 +800,7 @@ impl IntoRawFd for process::ChildStdout {
 #[stable(feature = "into_raw_os", since = "1.4.0")]
 impl IntoRawFd for process::ChildStderr {
     #[inline]
+    #[rustdoc_skip_body]
     fn into_raw_fd(self) -> RawFd {
         self.into_inner().into_inner().into_raw_fd()
     }
@@ -652,6 +809,7 @@ impl IntoRawFd for process::ChildStderr {
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl AsFd for crate::process::ChildStdin {
     #[inline]
+    #[rustdoc_skip_body]
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.as_inner().as_fd()
     }
@@ -661,6 +819,7 @@ impl AsFd for crate::process::ChildStdin {
 impl From<crate::process::ChildStdin> for OwnedFd {
     /// Takes ownership of a [`ChildStdin`](crate::process::ChildStdin)'s file descriptor.
     #[inline]
+    #[rustdoc_skip_body]
     fn from(child_stdin: crate::process::ChildStdin) -> OwnedFd {
         child_stdin.into_inner().into_inner()
     }
@@ -673,6 +832,7 @@ impl From<crate::process::ChildStdin> for OwnedFd {
 #[stable(feature = "child_stream_from_fd", since = "1.74.0")]
 impl From<OwnedFd> for process::ChildStdin {
     #[inline]
+    #[rustdoc_skip_body]
     fn from(fd: OwnedFd) -> process::ChildStdin {
         let pipe = ChildPipe::from_inner(fd);
         process::ChildStdin::from_inner(pipe)
@@ -682,6 +842,7 @@ impl From<OwnedFd> for process::ChildStdin {
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl AsFd for crate::process::ChildStdout {
     #[inline]
+    #[rustdoc_skip_body]
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.as_inner().as_fd()
     }
@@ -691,6 +852,7 @@ impl AsFd for crate::process::ChildStdout {
 impl From<crate::process::ChildStdout> for OwnedFd {
     /// Takes ownership of a [`ChildStdout`](crate::process::ChildStdout)'s file descriptor.
     #[inline]
+    #[rustdoc_skip_body]
     fn from(child_stdout: crate::process::ChildStdout) -> OwnedFd {
         child_stdout.into_inner().into_inner()
     }
@@ -703,6 +865,7 @@ impl From<crate::process::ChildStdout> for OwnedFd {
 #[stable(feature = "child_stream_from_fd", since = "1.74.0")]
 impl From<OwnedFd> for process::ChildStdout {
     #[inline]
+    #[rustdoc_skip_body]
     fn from(fd: OwnedFd) -> process::ChildStdout {
         let pipe = ChildPipe::from_inner(fd);
         process::ChildStdout::from_inner(pipe)
@@ -712,6 +875,7 @@ impl From<OwnedFd> for process::ChildStdout {
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl AsFd for crate::process::ChildStderr {
     #[inline]
+    #[rustdoc_skip_body]
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.as_inner().as_fd()
     }
@@ -721,6 +885,7 @@ impl AsFd for crate::process::ChildStderr {
 impl From<crate::process::ChildStderr> for OwnedFd {
     /// Takes ownership of a [`ChildStderr`](crate::process::ChildStderr)'s file descriptor.
     #[inline]
+    #[rustdoc_skip_body]
     fn from(child_stderr: crate::process::ChildStderr) -> OwnedFd {
         child_stderr.into_inner().into_inner()
     }
@@ -733,6 +898,7 @@ impl From<crate::process::ChildStderr> for OwnedFd {
 #[stable(feature = "child_stream_from_fd", since = "1.74.0")]
 impl From<OwnedFd> for process::ChildStderr {
     #[inline]
+    #[rustdoc_skip_body]
     fn from(fd: OwnedFd) -> process::ChildStderr {
         let pipe = ChildPipe::from_inner(fd);
         process::ChildStderr::from_inner(pipe)
@@ -740,6 +906,15 @@ impl From<OwnedFd> for process::ChildStderr {
 }
 
 /// Returns the OS-assigned process identifier associated with this process's parent.
+///
+/// # Example
+///
+#[cfg_attr(target_family = "unix", doc = "```")]
+#[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
+/// use std::os::unix::process;
+/// let parent = process::parent_id();
+/// println!("The parent process has ID {}", parent);
+/// ```
 #[must_use]
 #[stable(feature = "unix_ppid", since = "1.27.0")]
 pub fn parent_id() -> u32 {

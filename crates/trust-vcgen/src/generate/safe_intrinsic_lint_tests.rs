@@ -55,6 +55,7 @@ fn intrinsic_call_fn(callee: &str) -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                         is_foreign: false,
                         func: callee.into(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -74,6 +75,7 @@ fn intrinsic_call_fn(callee: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -371,24 +373,52 @@ const SAFE_BOX_ALLOC_CALLEES: &[&str] = &[
     "alloc::boxed::Box::<u32>::new",
 ];
 
+/// A FALLIBLE allocator — it can return null — whose `[unsafe:sep:alloc]` row is a
+/// real obligation and is still minted. The non-vacuous control of the row-set
+/// tests below since 2026-09-29 (see the next note).
+const FALLIBLE_ALLOC_CALLEE: &str = "alloc::alloc::alloc";
+
+// 2026-09-29: A SAFE `Box::new` NO LONGER MINTS `[unsafe:sep:alloc]` AT ALL.
+//
+// The row it used to mint was `ptr != 0 ∧ ptr == 0` — the allocator's abort-on-OOM
+// premise (docs/TCB.md, "Allocation failure is an abort, not a panic") conjoined
+// onto its own negation. Its proof, kernel-certified or not, checks a tautology:
+// nothing about the allocation the premise does not already assume. And it was an
+// `[unsafe…]` demand charged to SAFE code that `refute_unsafe_demand_findings`
+// forces FAILED whenever the function budget expires first (8 such refutations in
+// `#![forbid(unsafe_code)]` trust-ir-giveback, `time_ms: 3000`, measured on the
+// installed 321aaeda7). The premise is still USED: the allocation's provenance is
+// in `box_good_provs` and every later deref of the box discharges against it.
+//
+// So the 2026-08-28 site-scoping property below now holds with ZERO rows for the
+// box allocator, and its non-vacuous half is carried by the fallible allocator.
+// The gate split itself (the sep engine on `has_unsafe_patterns`, the lint on
+// `has_intrinsic_unsafe_surface`) is unchanged and still pinned.
+
 #[test]
-fn safe_box_alloc_is_an_unsafe_pattern_to_the_sep_engine() {
-    // INNER gate: the engine considers a safe `Box::new` worth analysing and
-    // mints its allocation null-check obligation. If this ever returns empty,
-    // the mechanism below has changed and the companion test is stale.
+fn safe_box_alloc_is_analysed_by_the_sep_engine_but_mints_no_alloc_row() {
+    // INNER gate: the engine still ANALYSES a safe `Box::new` body (the allocation's
+    // provenance is what discharges later derefs of the box) ...
     for callee in SAFE_BOX_ALLOC_CALLEES {
         let func = intrinsic_call_fn(callee);
+        assert!(
+            crate::sep_engine::has_unsafe_patterns(&func),
+            "the sep engine must still analyse the safe allocator `{callee}`"
+        );
+        // ... and mints no allocation null row for it.
         let rows = crate::sep_engine::check_sep_unsafe_blocked(&func);
         assert!(
-            !rows.is_empty(),
-            "the sep engine WOULD mint an obligation for the safe allocator `{callee}`; \
-             it is `is_alloc_call`, which `has_unsafe_patterns` admits"
-        );
-        assert!(
-            rows.iter().any(|(vc, _)| format!("{:?}", vc.kind).contains("unsafe:sep:alloc")),
-            "`{callee}` must mint the `[unsafe:sep:alloc]` allocation null check"
+            !rows.iter().any(|(vc, _)| format!("{:?}", vc.kind).contains("unsafe:sep:alloc")),
+            "`{callee}` must not mint the tautological `[unsafe:sep:alloc]` row: {rows:?}"
         );
     }
+    // The fallible allocator's row is a real obligation and stays.
+    let func = intrinsic_call_fn(FALLIBLE_ALLOC_CALLEE);
+    let rows = crate::sep_engine::check_sep_unsafe_blocked(&func);
+    assert!(
+        rows.iter().any(|(vc, _)| format!("{:?}", vc.kind).contains("unsafe:sep:alloc")),
+        "`{FALLIBLE_ALLOC_CALLEE}` can return null and must keep its row: {rows:?}"
+    );
 }
 
 #[test]
@@ -436,18 +466,22 @@ fn sep_alloc_row_count(func: &VerifiableFunction) -> usize {
 }
 
 #[test]
-fn the_alloc_row_is_emitted_for_a_safe_box_alloc_body() {
-    // THE FIX, stated as the row set. Before the gate split this was ZERO: the
-    // sep engine ran inside the same `if` as the SAFETY-comment lint, whose
-    // gate a safe `Box::new` does not open.
+fn no_alloc_row_for_a_safe_box_alloc_body_and_one_for_a_fallible_allocator() {
+    // Through the REAL public entry point, as the note above requires.
     for callee in SAFE_BOX_ALLOC_CALLEES {
         let func = intrinsic_call_fn(callee);
-        assert!(
-            sep_alloc_row_count(&func) > 0,
-            "`{callee}` must be charged its `[unsafe:sep:alloc]` allocation row \
-             through the unchanged `check_sep_unsafe_blocked` path"
+        assert_eq!(
+            sep_alloc_row_count(&func),
+            0,
+            "`{callee}` must not be charged a tautological `[unsafe:sep:alloc]` row"
         );
     }
+    let func = intrinsic_call_fn(FALLIBLE_ALLOC_CALLEE);
+    assert!(
+        sep_alloc_row_count(&func) > 0,
+        "`{FALLIBLE_ALLOC_CALLEE}` must be charged its `[unsafe:sep:alloc]` row through \
+         the unchanged `check_sep_unsafe_blocked` path"
+    );
 }
 
 #[test]
@@ -461,7 +495,7 @@ fn an_unrelated_raw_pointer_local_does_not_change_the_alloc_row_set() {
     //
     // A proof COUNT on this kind is only a property of the code being proved if
     // this holds.
-    for callee in SAFE_BOX_ALLOC_CALLEES {
+    for callee in SAFE_BOX_ALLOC_CALLEES.iter().copied().chain([FALLIBLE_ALLOC_CALLEE]) {
         let func = intrinsic_call_fn(callee);
         let without = sep_alloc_row_count(&func);
 
@@ -486,23 +520,12 @@ fn an_unrelated_raw_pointer_local_does_not_change_the_alloc_row_set() {
              property of the body's other constructs rather than of the \
              allocation site"
         );
-        assert!(without > 0, "control: the pair must be non-vacuous ({callee})");
-    }
-}
-
-#[test]
-#[ignore = "probe: prints the emitted row set for each allocator callee"]
-fn probe_allocator_row_sets() {
-    for callee in [
-        "alloc::boxed::Box::new",
-        "alloc::vec::Vec::<u32>::new",
-        "alloc::vec::Vec::<u32>::with_capacity",
-        "alloc::alloc::alloc",
-    ] {
-        let func = intrinsic_call_fn(callee);
-        eprintln!("=== {callee}");
-        for m in emitted_messages(&func) {
-            eprintln!("      {m}");
+        // Non-vacuous where a row exists at all: the box allocator mints none
+        // (2026-09-29), the fallible allocator does.
+        if callee == FALLIBLE_ALLOC_CALLEE {
+            assert!(without > 0, "control: the pair must be non-vacuous ({callee})");
+        } else {
+            assert_eq!(without, 0, "`{callee}` mints no allocation row ({callee})");
         }
     }
 }

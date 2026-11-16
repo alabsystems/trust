@@ -1,0 +1,52 @@
+#![feature(rustc_private)]
+#![crate_type = "lib"]
+extern crate libc;
+extern crate fakelibc;
+
+use core::ffi::c_int;
+
+pub fn pid() -> libc::pid_t {
+    // SAFETY: getpid has no preconditions.
+    unsafe { libc::getpid() }
+}
+pub fn pgrp() -> libc::pid_t {
+    // SAFETY: getpgrp has no preconditions.
+    unsafe { libc::getpgrp() }
+}
+pub fn euid() -> libc::uid_t {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
+}
+pub fn sid(p: libc::pid_t) -> libc::pid_t {
+    // SAFETY: any pid is accepted.
+    unsafe { libc::getsid(p) }
+}
+pub fn fg(fd: c_int) -> libc::pid_t {
+    // SAFETY: any fd is accepted.
+    unsafe { libc::tcgetpgrp(fd) }
+}
+pub fn raise_it(sig: c_int) -> c_int {
+    // SAFETY: any signal number is accepted.
+    unsafe { libc::raise(sig) }
+}
+pub fn errno_slot() -> *mut c_int {
+    // SAFETY: always succeeds.
+    unsafe { libc::__error() }
+}
+mod own {
+    unsafe extern "C" {
+        pub fn getpid() -> i32;
+    }
+}
+pub fn own_pid() -> i32 {
+    // SAFETY: negative control, the program's own declaration.
+    unsafe { own::getpid() }
+}
+pub fn fake_pid() -> i32 {
+    // SAFETY: negative control, `#[link_name = "getppid"] fn getpid` in a crate named libc.
+    unsafe { fakelibc::getpid() }
+}
+pub fn fake_sid(p: i32) -> i32 {
+    // SAFETY: negative control, `#[link_name = "getsid"] fn session_of`.
+    unsafe { fakelibc::session_of(p) }
+}

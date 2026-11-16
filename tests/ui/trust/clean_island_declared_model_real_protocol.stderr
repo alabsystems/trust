@@ -1,0 +1,17 @@
+note: Clean island kernel-checked: 12 declaration(s) registered (HarnessPolicy.v, HarnessPolicy.n, HarnessPolicy.c, HarnessPolicy.is, HarnessPolicy.both, HarnessPolicy.either, HarnessPolicy.above, HarnessPolicy.set, HarnessPolicy.act, HarnessPolicy.editsLeft, HarnessPolicy.Protocol, HarnessPolicy.OneWriter)
+  --> $DIR/clean_island_declared_model_real_protocol.rs:9:5
+   |
+LL | /     import Trust.FiniteModel
+LL | |     -- A model taken from a real program: aterm, a terminal whose supervisor
+LL | |     -- approves agent dialogs under a policy written in a config file. The policy
+LL | |     -- has ONE writer, the config watcher. This is the scalar model of that
+...  |
+LL | |     end HarnessPolicy
+   | |_____________________^
+
+note: finite model `HarnessPolicy.OneWriter` proved safe by the kernel: every reachable state satisfies every invariant (`trust_checked_safe.HarnessPolicy.OneWriter : ScalarModel.safetyClaim HarnessPolicy.OneWriter`, state budget 256)
+  --> $DIR/clean_island_declared_model_real_protocol.rs:104:5
+   |
+LL |     def OneWriter : Trust.Temporal.FiniteModel.ScalarModel := Protocol 0
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

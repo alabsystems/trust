@@ -39,6 +39,16 @@ use trust_verifier_api::{
     TrustObligation, ValidatedVerificationRequest, VerificationEngine,
 };
 
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+mod kernel_replay_admission;
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+mod native_bundle_stop;
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+use native_bundle_stop::NativeBundleTransportError;
+
+#[cfg(all(test, feature = "trust-mc-native-trust-ir-bundle"))]
+mod raw_source_stop_tests;
+
 use crate::{TrustMcConfig, TrustMcProofMode};
 
 /// Trust: true once the optional per-function wall-clock deadline has
@@ -122,18 +132,19 @@ const TRUST_MC_TYPED_CHC_SYNTHETIC_CONTRACT_METADATA_KEY: &str =
 // producer-side over-approximation reached the refutation gate wearing a
 // perfectly valid trust_mc-stage exactness attestation.
 //
-// The compiler currently emits only the NEGATIVE value below. Absence is
-// therefore "unattested", never "attested exact". Refutation authority is
-// fail-closed: only the explicit positive value may admit a public
-// counterexample, and the compiler must not emit it until it can attest every
-// source-to-ChcVc fidelity edge. Like the lowering-status key this is
+// The compiler emits the positive value only for its admitted flat typed-VC
+// fragment. It covers that submitted ChcVc, not the separate source-to-native
+// TrustIR translation. Absence is "unattested", never "attested exact". A native
+// bundle needs its own independently checked source correspondence; this flat
+// annotation cannot provide it. Like the lowering-status key this is
 // deliberately NOT in
 // `TRUST_IR_NATIVE_TRANSPORT_METADATA_KEYS`, so it sits inside the obligation's
 // canonical public semantic digest and cannot be detached from the row.
 const TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY: &str =
     "trust-trust-mc.typed-chc-obligation.encoding_fidelity";
 /// Positive producer attestation that the submitted `ChcVc` is exact for the
-/// source obligation. The compiler intentionally does not emit this yet.
+/// source obligation on the admitted flat typed-VC route. It does not attest
+/// source-to-native-TrustIR correspondence.
 #[cfg(feature = "trust-mc-native-solver")]
 const TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT: &str = "exact";
 /// The compiler fell back to the flattened single-formula typed CHC (one
@@ -163,6 +174,9 @@ enum TrustMcChcRefutationAdmissibility {
     Unattested,
     /// The producer explicitly attests the complete source-to-ChcVc edge.
     ProducerAttestedExact,
+    /// Flat typed-VC exactness does not establish the native source relation.
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    FlatExactDoesNotCoverNativeSource,
     /// The producer attests the submitted `ChcVc` over-approximates the body.
     /// A refutation of it is a refutation of the ENCODING, not of the program.
     ProducerAttestedOverApproximation { class: String },
@@ -170,7 +184,7 @@ enum TrustMcChcRefutationAdmissibility {
 
 #[cfg(feature = "trust-mc-native-solver")]
 impl TrustMcChcRefutationAdmissibility {
-    /// Read the attestation off one authenticated public obligation.
+    /// Read the flat typed-VC attestation off one authenticated public obligation.
     ///
     /// Fails closed on an UNRECOGNIZED value: a future producer class this
     /// consumer does not understand is treated as an over-approximation, so a
@@ -206,6 +220,17 @@ impl TrustMcChcRefutationAdmissibility {
         }
     }
 
+    /// The public flat-VC annotation is not a native source-correspondence
+    /// capability. No production issuer currently establishes that separate
+    /// relation, so even an exact flat row must decline native refutation credit.
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn for_native_obligation(obligation: &TrustObligation) -> Self {
+        match Self::for_obligation(obligation) {
+            Self::ProducerAttestedExact => Self::FlatExactDoesNotCoverNativeSource,
+            other => other,
+        }
+    }
+
     /// `Some(reason)` when a `Refuted` verdict on this row must be demoted.
     fn rejection_reason(&self) -> Option<String> {
         match self {
@@ -214,11 +239,44 @@ impl TrustMcChcRefutationAdmissibility {
                     .to_string(),
             ),
             Self::ProducerAttestedExact => None,
+            #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+            Self::FlatExactDoesNotCoverNativeSource => Some(
+                "the exact annotation covers the flat typed ChcVc only; native TrustIR refutation lacks independently checked per-obligation source correspondence, so exact encoded-query replay cannot authorize a Rust counterexample"
+                    .to_string(),
+            ),
             Self::ProducerAttestedOverApproximation { class }
                 if class == TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED =>
             {
+                // The clause "for a body whose CFG has a back edge" used to be
+                // stated here as a FACT about the body. It is not one, and it
+                // misdescribed the common case. The producer sets this class
+                // whenever it cannot establish that the enriched encoding fired
+                // — deliberately, because the disclosure only ever REMOVES
+                // refutation authority, so over-disclosing costs a
+                // counterexample while under-disclosing admits a false
+                // refutation against correct code (see the fail-open removal of
+                // 2026-08-08 in `trust_verify.rs`). A STRAIGHT-LINE body is
+                // disclosed too, and for `double` the disclosure is FALSE — measured
+                // 2026-09-26 on
+                // `fn double(x: i32) -> i32 requires .. ensures result == x * 3
+                // { x * 2 }`, whose MIR is `bb0 -> bb1` with no back edge and whose
+                // genuine refutation this class demoted to Unknown. That `_0` really is
+                // determined is settled by `r06`, the SAME body with the TRUE clause,
+                // which passes `-Ztrust-policy=certify` with "3 proved, 0 unknown,
+                // 0 runtime-checked"; a formula leaving `_0` free cannot prove
+                // `_0 == x * 2`. The producer-side cause is an aliasing deadlock in
+                // `typed_chc_return_depends_on_elided_definition`, and three attempts at
+                // repairing it were measured and reverted — see the comment there before
+                // trying a fourth.
+                //
+                // IT CHANGES NOTHING HERE EITHER WAY. A stamped row and an unstamped row
+                // both demote: absence reads as `Unattested`, which this same match arm
+                // rejects. Only the positive `exact` value admits a refutation, and the
+                // compiler is forbidden to emit it (see this type's header). Battery row
+                // `r07_rust_contract_refuted_strict`,
+                // `docs/issues/2026-09-26-chc-refutation-authority-is-fail-closed-by-design.md`.
                 Some(
-                    "the compiler attests the submitted ChcVc is a loop-elided over-approximation: it fell back to the flattened single-formula typed CHC (one nullary `error` relation, one constraint-only rule) for a body whose CFG has a back edge, so the loop carries no transition relation and its loop-carried locals are free variables with no defining constraint"
+                    "the compiler attests the submitted ChcVc is an over-approximation: it fell back to the flattened single-formula typed CHC (one nullary `error` relation, one constraint-only rule) rather than establishing that the enriched encoding fired. Where the body's CFG has a back edge the loop carries no transition relation and its loop-carried locals are free variables with no defining constraint; the producer also attests this class when it cannot tell, including for a straight-line body, because the attestation only ever removes refutation authority"
                         .to_string(),
                 )
             }
@@ -315,6 +373,16 @@ fn trust_mc_chc_credit_witness(
     Ok(TrustMcChcCreditWitness::PerObligationViolationPredicate)
 }
 
+fn trust_native_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TRUST_NATIVE_DEBUG").is_ok())
+}
+
+fn trust_seal_elig_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRUST_SEAL_ELIG_TRACE").is_some())
+}
+
 /// True only for the compiler's exact counted whole-function panic aggregate.
 ///
 /// This is a shape gate, not authority by itself. The native-bundle caller also
@@ -327,9 +395,22 @@ fn obligation_is_whole_function_panic_freedom(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
 ) -> bool {
+    if !obligation.obligation_id.ends_with(":assertion:panic-freedom:0") {
+        return false;
+    }
     let trust_verifier_api::BundleSubject::Function { crate_name, path } = &bundle.subject else {
         return false;
     };
+    let debug_enabled = trust_native_debug_enabled();
+    if !debug_enabled
+        && (obligation.kind != ObligationKind::Assertion
+            || obligation.contract_id.is_some()
+            || obligation.proof_item_id.is_some()
+            || obligation.required_strength.is_some()
+            || !obligation.summary_facts.is_empty())
+    {
+        return false;
+    }
     let expected_id = format!(
         "vc:{}:assertion:panic-freedom:0",
         trust_types::canonical_artifact_id_component(path)
@@ -338,9 +419,7 @@ fn obligation_is_whole_function_panic_freedom(
     // whole-function panic-freedom aggregate but the strict gate below rejects
     // it, name the offending clause + dump metadata keys so the 339-merge drift
     // (allowlist / schema) is identified without guessing.
-    if obligation.obligation_id.ends_with(":assertion:panic-freedom:0")
-        && std::env::var("TRUST_NATIVE_DEBUG").is_ok()
-    {
+    if debug_enabled {
         let key_allowed = |k: &str| {
             matches!(
                 k,
@@ -409,60 +488,94 @@ fn obligation_is_whole_function_panic_freedom(
             all_keys,
         );
     }
-    if obligation.metadata.iter().any(|entry| {
-        !matches!(
-            entry.key.as_str(),
-            trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY
-                | TRUST_MC_PANIC_FREEDOM_OBLIGATION_METADATA_KEY
-                | "trust.vc.kind"
-                | TRUST_SOURCE_DIGEST_METADATA_KEY
-                | TRUST_VC_DIGEST_METADATA_KEY
-                | TRUST_MC_TYPED_CHC_LOWERING_STATUS_METADATA_KEY
-                | TRUST_MC_TYPED_CHC_UNSUPPORTED_REASON_METADATA_KEY
-                | TRUST_MC_TYPED_CHC_SYNTHETIC_CONTRACT_METADATA_KEY
-                | TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY
-                | TRUST_MC_TYPED_CHC_SOURCE_DIGEST_METADATA_KEY
-                | TRUST_MC_TYPED_CHC_VC_DIGEST_METADATA_KEY
-                | TRUST_MC_TYPED_CHC_SYNTHETIC_DIGEST_METADATA_KEY
-                | TRUST_MC_TYPED_CHC_BINDING_METADATA_KEY
-                | "trust.trust_ir.native.transport_status"
-                | "trust.trust_ir.native.unsupported_reason"
-                | TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY
-                | TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY
-                | TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY
-                | "trust.trust_ir.native.proof_unit.v1"
-                | "trust.trust_ir.native.assertion_id"
-                | "trust.trust_ir.native.trust_ir_module_digest"
-                | "trust.trust_ir.native.request_digest"
-                | "trust.trust_ir.native.compiler_facts_digest"
-                | "trust.trust_ir.native.obligation_source_digest"
-                | "trust.trust_ir.native.replay_engine"
-                | "trust.trust_ir.native.replay_invocation"
-                | "trust.trust_ir.native.replay_transcript_digest"
-                | "trust.trust_ir.native.artifact_fingerprint"
-        )
-    }) || obligation.obligation_id != expected_id
+    if obligation.obligation_id != expected_id
         || obligation.kind != ObligationKind::Assertion
         || obligation.contract_id.is_some()
         || obligation.proof_item_id.is_some()
         || obligation.required_strength.is_some()
         || !obligation.summary_facts.is_empty()
-        || metadata_value(&obligation.metadata, TRUST_MC_PANIC_FREEDOM_OBLIGATION_METADATA_KEY)
-            != Some("enabled")
-        || metadata_value(&obligation.metadata, "trust.vc.kind") != Some("panic_freedom")
-        || !metadata_value(&obligation.metadata, TRUST_SOURCE_DIGEST_METADATA_KEY)
-            .is_some_and(is_lowercase_sha256_hex)
-        || !metadata_value(&obligation.metadata, TRUST_VC_DIGEST_METADATA_KEY)
-            .is_some_and(is_lowercase_sha256_hex)
-        || metadata_value(&obligation.metadata, TRUST_VC_FORMULA_SCHEMA_METADATA_KEY).is_some()
-        || metadata_value(&obligation.metadata, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY).is_some()
     {
         return false;
     }
 
-    let Some(encoded) =
-        metadata_value(&obligation.metadata, trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY)
-    else {
+    #[derive(Clone, Copy)]
+    enum MetaSlot<'a> {
+        Absent,
+        Unique(&'a str),
+        Duplicate,
+    }
+    impl<'a> MetaSlot<'a> {
+        fn record(&mut self, value: &'a str) {
+            *self = match *self {
+                Self::Absent => Self::Unique(value),
+                Self::Unique(_) | Self::Duplicate => Self::Duplicate,
+            };
+        }
+        fn unique(self) -> Option<&'a str> {
+            match self {
+                Self::Unique(v) => Some(v),
+                Self::Absent | Self::Duplicate => None,
+            }
+        }
+    }
+
+    let mut panic_enabled = MetaSlot::Absent;
+    let mut vc_kind = MetaSlot::Absent;
+    let mut src_digest = MetaSlot::Absent;
+    let mut vc_digest = MetaSlot::Absent;
+    let mut ctx_encoded = MetaSlot::Absent;
+    for entry in &obligation.metadata {
+        match entry.key.as_str() {
+            trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY => {
+                ctx_encoded.record(entry.value.as_str());
+            }
+            TRUST_MC_PANIC_FREEDOM_OBLIGATION_METADATA_KEY => {
+                panic_enabled.record(entry.value.as_str());
+            }
+            "trust.vc.kind" => {
+                vc_kind.record(entry.value.as_str());
+            }
+            TRUST_SOURCE_DIGEST_METADATA_KEY => {
+                src_digest.record(entry.value.as_str());
+            }
+            TRUST_VC_DIGEST_METADATA_KEY => {
+                vc_digest.record(entry.value.as_str());
+            }
+            TRUST_MC_TYPED_CHC_LOWERING_STATUS_METADATA_KEY
+            | TRUST_MC_TYPED_CHC_UNSUPPORTED_REASON_METADATA_KEY
+            | TRUST_MC_TYPED_CHC_SYNTHETIC_CONTRACT_METADATA_KEY
+            | TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY
+            | TRUST_MC_TYPED_CHC_SOURCE_DIGEST_METADATA_KEY
+            | TRUST_MC_TYPED_CHC_VC_DIGEST_METADATA_KEY
+            | TRUST_MC_TYPED_CHC_SYNTHETIC_DIGEST_METADATA_KEY
+            | TRUST_MC_TYPED_CHC_BINDING_METADATA_KEY
+            | "trust.trust_ir.native.transport_status"
+            | "trust.trust_ir.native.unsupported_reason"
+            | TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY
+            | TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY
+            | TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY
+            | "trust.trust_ir.native.proof_unit.v1"
+            | "trust.trust_ir.native.assertion_id"
+            | "trust.trust_ir.native.trust_ir_module_digest"
+            | "trust.trust_ir.native.request_digest"
+            | "trust.trust_ir.native.compiler_facts_digest"
+            | "trust.trust_ir.native.obligation_source_digest"
+            | "trust.trust_ir.native.replay_engine"
+            | "trust.trust_ir.native.replay_invocation"
+            | "trust.trust_ir.native.replay_transcript_digest"
+            | "trust.trust_ir.native.artifact_fingerprint" => {}
+            _ => return false,
+        }
+    }
+    if panic_enabled.unique() != Some("enabled")
+        || vc_kind.unique() != Some("panic_freedom")
+        || !src_digest.unique().is_some_and(is_lowercase_sha256_hex)
+        || !vc_digest.unique().is_some_and(is_lowercase_sha256_hex)
+    {
+        return false;
+    }
+
+    let Some(encoded) = ctx_encoded.unique() else {
         return false;
     };
     let Ok(context) =
@@ -500,10 +613,11 @@ const TRUST_VC_DIGEST_METADATA_KEY: &str = "trust.vc.digest.sha256";
 const TRUST_VC_FORMULA_SCHEMA_METADATA_KEY: &str = "trust.vc.formula.schema";
 const TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY: &str = "trust.vc.formula.payload";
 const TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY: &str =
-    "trust.trust_ir.native.proof_obligation_id";
-const TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY: &str = "trust.trust_ir.native.request_id";
+    trust_verifier_api::native_routing_identity::PROOF_KEY;
+const TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY: &str =
+    trust_verifier_api::native_routing_identity::REQUEST_KEY;
 const TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY: &str =
-    "trust.trust_ir.native.verifier_suite";
+    trust_verifier_api::native_routing_identity::SUITE_KEY;
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
 const TRUST_VC_FORMULA_SMTLIB_METADATA_KEY: &str = "trust.vc.formula.smtlib2";
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
@@ -550,15 +664,31 @@ fn is_typed_body_aware_e4_e5_obligation(obligation: &TrustObligation) -> bool {
 /// sealed-authority validation chain (canonical public-digest
 /// reconciliation, affine receipt, bundle seal).
 fn is_typed_body_aware_exact_direct_obligation(obligation: &TrustObligation) -> bool {
-    if !is_seal_eligible_compiler_formula_obligation(obligation) {
+    let Some(predicate) = seal_eligible_compiler_formula_predicate(obligation) else {
         return false;
-    }
+    };
     if matches!(obligation.kind, ObligationKind::Postcondition) {
-        return typed_spec_predicate_envelope(obligation).is_some_and(|predicate| {
-            typed_spec_terminal_negated_clause_references_return_slot(&predicate.root)
-        });
+        return typed_spec_terminal_negated_clause_references_return_slot(&predicate.root);
     }
     true
+}
+
+/// Classify an obligation into `(exact_e4_e5_formula_lane, exact_standalone_formula_fresh_lane)`
+/// with at most one `TrustSpecPredicate` + `ObligationContext` JSON parse.
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+fn classify_direct_formula_lanes(obligation: &TrustObligation) -> (bool, bool) {
+    match obligation.kind {
+        ObligationKind::LoopInvariant | ObligationKind::Termination => {
+            (typed_spec_predicate_envelope(obligation).is_some(), false)
+        }
+        ObligationKind::Assertion
+        | ObligationKind::ArithmeticSafety
+        | ObligationKind::Precondition
+        | ObligationKind::Postcondition => {
+            (false, is_typed_body_aware_exact_direct_obligation(obligation))
+        }
+        _ => (false, false),
+    }
 }
 
 /// Whether the compiler-authenticated terminal negated clause references the
@@ -663,11 +793,25 @@ fn typed_spec_predicate_envelope(
 /// transport substitution — a formula-carrying obligation is `Ok(Some)` on its
 /// own direct CHC, or fails closed to `Unsupported` on `Ok(None)`; it is never
 /// deferrable to the panic-freedom transport.
-fn is_seal_eligible_compiler_formula_obligation(obligation: &TrustObligation) -> bool {
-    let result = is_seal_eligible_compiler_formula_obligation_inner(obligation);
+fn seal_eligible_compiler_formula_predicate(
+    obligation: &TrustObligation,
+) -> Option<trust_verifier_api::TrustSpecPredicate> {
+    let result = if matches!(
+        obligation.kind,
+        ObligationKind::LoopInvariant
+            | ObligationKind::Termination
+            | ObligationKind::Assertion
+            | ObligationKind::ArithmeticSafety
+            | ObligationKind::Precondition
+            | ObligationKind::Postcondition
+    ) {
+        typed_spec_predicate_envelope(obligation)
+    } else {
+        None
+    };
     // DIAGNOSTIC (TRUST_SEAL_ELIG_TRACE): reads only; for the LCG cluster prints
     // the per-check verdict so the exact ineligibility reason is observable.
-    if std::env::var_os("TRUST_SEAL_ELIG_TRACE").is_some() && !result {
+    if trust_seal_elig_trace_enabled() && result.is_none() {
         let ctx = metadata_value(
             &obligation.metadata,
             trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY,
@@ -725,39 +869,9 @@ fn is_seal_eligible_compiler_formula_obligation(obligation: &TrustObligation) ->
     result
 }
 
-fn is_seal_eligible_compiler_formula_obligation_inner(obligation: &TrustObligation) -> bool {
-    if !matches!(
-        obligation.kind,
-        ObligationKind::LoopInvariant
-            | ObligationKind::Termination
-            | ObligationKind::Assertion
-            | ObligationKind::ArithmeticSafety
-            | ObligationKind::Precondition
-            | ObligationKind::Postcondition
-    ) {
-        return false;
-    }
-    let Some(schema) = metadata_value(&obligation.metadata, TRUST_VC_FORMULA_SCHEMA_METADATA_KEY)
-    else {
-        return false;
-    };
-    if schema != trust_verifier_api::TRUST_SPEC_PREDICATE_SCHEMA_VERSION {
-        return false;
-    }
-    let Some(payload) = metadata_value(&obligation.metadata, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
-    else {
-        return false;
-    };
-    let Ok(predicate) =
-        trust_types::json_depth::from_str_deep::<trust_verifier_api::TrustSpecPredicate>(payload)
-    else {
-        return false;
-    };
-    predicate.has_current_schema()
-        && predicate.root_sort == trust_verifier_api::TrustSpecSort::Bool
-        && predicate.root.sort == trust_verifier_api::TrustSpecSort::Bool
-        && predicate.validate().is_ok()
-        && has_current_compiler_vc_origin(obligation)
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_seal_eligible_compiler_formula_obligation(obligation: &TrustObligation) -> bool {
+    seal_eligible_compiler_formula_predicate(obligation).is_some()
 }
 
 fn has_current_compiler_vc_origin(obligation: &TrustObligation) -> bool {
@@ -883,23 +997,38 @@ pub struct FreshExactDirectChcPdrDispatch {
     pub receipt: Option<FreshExactDirectChcPdrReceipt>,
 }
 
-/// Public native-bundle evidence plus live exact-direct receipt sidecars.
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+mod whole_function_receipt;
+
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+mod native_refutation;
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+pub use whole_function_receipt::{
+    FreshWholeFunctionChcPdrBundleSeal, FreshWholeFunctionChcPdrReceipt,
+};
+
+/// Public native-bundle evidence and two distinct affine receipt families.
 ///
 /// Whole-function transport rows never appear in `fresh_exact_direct_receipts`:
-/// without an exact public-row membership receipt they carry only their existing
-/// bundle authority. The map is keyed by the exact public obligation id and can
-/// contain only compiler-authenticated standalone exact-formula rows.
+/// that map contains only standalone exact-formula rows. The separate whole-
+/// function map retains exact aggregate membership and source-authorized native
+/// body/query authority; it can never stand in for a direct formula proof.
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
 #[derive(Debug)]
 pub struct NativeTrustIrBundleEvidenceWithFreshReceipts {
     pub evidence: Vec<ObligationEvidence>,
     pub fresh_exact_direct_receipts: BTreeMap<String, FreshExactDirectChcPdrReceipt>,
+    pub fresh_whole_function_receipts: BTreeMap<String, FreshWholeFunctionChcPdrReceipt>,
 }
 
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
 impl From<Vec<ObligationEvidence>> for NativeTrustIrBundleEvidenceWithFreshReceipts {
     fn from(evidence: Vec<ObligationEvidence>) -> Self {
-        Self { evidence, fresh_exact_direct_receipts: BTreeMap::new() }
+        Self {
+            evidence,
+            fresh_exact_direct_receipts: BTreeMap::new(),
+            fresh_whole_function_receipts: BTreeMap::new(),
+        }
     }
 }
 
@@ -917,21 +1046,55 @@ fn finalize_native_bundle_evidence_with_fresh_receipts(
     // every receipt is quadratic at the bundle inventory limit and lets a
     // large but otherwise valid batch turn the final affine-authority boundary
     // into a denial of service.
-    let mut public_row_summaries = BTreeMap::<&str, (usize, bool)>::new();
-    for row in &evidence {
-        let summary = public_row_summaries.entry(row.obligation_id.as_str()).or_insert((0, false));
-        summary.0 += 1;
-        summary.1 = row.status == EvidenceStatus::Proved;
-    }
-    fresh_exact_direct_receipts.retain(|obligation_id, receipt| {
-        if receipt.public_obligation_id() != obligation_id {
-            return false;
+    if !fresh_exact_direct_receipts.is_empty() {
+        let mut public_row_summaries =
+            std::collections::HashMap::<&str, (usize, bool)>::with_capacity(evidence.len());
+        for row in &evidence {
+            let summary =
+                public_row_summaries.entry(row.obligation_id.as_str()).or_insert((0, false));
+            summary.0 += 1;
+            summary.1 = row.status == EvidenceStatus::Proved;
         }
-        public_row_summaries
-            .get(obligation_id.as_str())
-            .is_some_and(|(count, proved)| *count == 1 && *proved)
-    });
-    NativeTrustIrBundleEvidenceWithFreshReceipts { evidence, fresh_exact_direct_receipts }
+        fresh_exact_direct_receipts.retain(|obligation_id, receipt| {
+            if receipt.public_obligation_id() != obligation_id {
+                return false;
+            }
+            public_row_summaries
+                .get(obligation_id.as_str())
+                .is_some_and(|(count, proved)| *count == 1 && *proved)
+        });
+    }
+    NativeTrustIrBundleEvidenceWithFreshReceipts {
+        evidence,
+        fresh_exact_direct_receipts,
+        fresh_whole_function_receipts: BTreeMap::new(),
+    }
+}
+
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+fn finalize_native_bundle_evidence_with_whole_function_receipts(
+    evidence: Vec<ObligationEvidence>,
+    direct: BTreeMap<String, FreshExactDirectChcPdrReceipt>,
+    mut whole: BTreeMap<String, FreshWholeFunctionChcPdrReceipt>,
+) -> NativeTrustIrBundleEvidenceWithFreshReceipts {
+    let mut outcome = finalize_native_bundle_evidence_with_fresh_receipts(evidence, direct);
+    if !whole.is_empty() {
+        let mut exact_rows =
+            std::collections::HashMap::<&str, Vec<&ObligationEvidence>>::with_capacity(
+                outcome.evidence.len(),
+            );
+        for row in &outcome.evidence {
+            exact_rows.entry(row.obligation_id.as_str()).or_default().push(row);
+        }
+        whole.retain(|id, receipt| {
+            id == receipt.public_obligation_id()
+                && exact_rows.get(id.as_str()).is_some_and(
+                    |rows| matches!(rows.as_slice(), [row] if receipt.matches_native_evidence(row)),
+                )
+        });
+    }
+    outcome.fresh_whole_function_receipts = whole;
+    outcome
 }
 
 #[cfg(feature = "trust-mc-native-solver")]
@@ -1119,6 +1282,14 @@ impl FreshExactDirectChcPdrReceipt {
 pub struct TrustMcVerifierApiAdapter {
     manifest: EngineManifest,
     config: TrustMcConfig,
+    /// Trust (2026-10-17, gate-rca deadline): the native solve cutoff — no solve STARTS
+    /// after it and a running one is clamped to it — while every live receipt stays
+    /// bound to the caller's dispatch deadline ([`Self::with_solve_cutoff`]).
+    #[cfg_attr(
+        not(any(feature = "trust-mc-native-solver", feature = "trust-mc-native-trust-ir-bundle")),
+        allow(dead_code)
+    )]
+    solve_cutoff: Option<std::time::Instant>,
 }
 
 #[cfg(test)]
@@ -1127,11 +1298,82 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+// How many whole-bundle consumer translations this thread ran, so a test can pin
+// that the refuted-row path reuses the pre-solve translation (WS-E step 8d).
+#[cfg(all(test, feature = "trust-mc-native-trust-ir-bundle"))]
+std::thread_local! {
+    static NATIVE_BUNDLE_TRANSLATION_COUNT_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    // Trust (C1, 2026-11-06): how many pre-solve translations and solves this
+    // thread ran through trust-mc's `_with_source_reference_facts` entries, so a
+    // test can pin that BOTH use the facts whenever the facts exist.
+    static NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Trust (C1, 2026-11-06): live source facts for initialized reference pointees,
+/// re-exported so the router and the compiler's single issuer reach trust-mc's
+/// type through this crate's existing edge (no new dependency). Non-cloneable,
+/// non-serializable, borrowed from one exact live bundle and its authority.
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+pub use trust_mc_trust_bmc::{
+    SourceReferenceFacts, SourceReferenceFactsError, SourceReferenceLoadFact,
+    SourceReferenceParameterFact, SourceReferenceValueFact,
+};
+
+/// The live source context of one native-bundle run: the borrowed authority, and
+/// the source reference facts bound to the same bundle and authority when the
+/// compiler issued any. Facts without an authority are unrepresentable.
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+#[derive(Clone, Copy)]
+struct NativeLiveSource<'a> {
+    authority: &'a trust_ir::SourceGenerationAuthority,
+    reference_facts: Option<&'a SourceReferenceFacts<'a>>,
+}
+
+/// The same typed result crosses the authority-only and live-source wrappers.
+/// A non-proving row retains its producer's cause until the per-row consumer;
+/// the test-only diagnostic adapter explicitly projects its reason afterward.
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+type NativeProofTransports = (
+    Vec<NativeTrustIrChcPdrAuthorizedProof>,
+    BTreeMap<String, native_bundle_stop::NativeTransportNotProved>,
+    BTreeMap<String, trust_mc_driver::NativeTrustIrChcPdrRefuted>,
+);
+
 impl TrustMcVerifierApiAdapter {
     /// Create an adapter with an explicit trust_mc configuration.
     #[must_use]
     pub fn new(config: TrustMcConfig) -> Self {
-        Self { manifest: trust_mc_manifest(), config }
+        Self { manifest: trust_mc_manifest(), config, solve_cutoff: None }
+    }
+
+    /// Trust (2026-10-17, gate-rca deadline): bound this adapter's SOLVING by `cutoff`
+    /// as well as by the dispatch deadline its native-bundle entries take.
+    ///
+    /// The compiler gives the native lane a share of the per-function clock so that the
+    /// certifying lanes after it (the in-process ay bridge, the structural and clean-
+    /// kernel promotions, certification and S1) keep the rest. The dispatch deadline is
+    /// what every fresh exact-direct and whole-function receipt freezes and what the
+    /// router's dispatch seal and the compiler's mint compare it with, so it must stay
+    /// the function's own deadline: a receipt carrying the cutoff would be refused at
+    /// mint as deadline-mismatched, and a mint after the cutoff as late. So the cutoff
+    /// is applied only where a solve is started or its clock is set; receipt
+    /// timeliness is still judged against the dispatch deadline. `None` = no cutoff.
+    #[must_use]
+    pub fn with_solve_cutoff(mut self, cutoff: Option<std::time::Instant>) -> Self {
+        self.solve_cutoff = cutoff;
+        self
+    }
+
+    /// The instant solving stops at for a dispatch with `deadline`: the earlier of the
+    /// two. Never a receipt's dispatch deadline.
+    #[cfg(any(feature = "trust-mc-native-solver", feature = "trust-mc-native-trust-ir-bundle"))]
+    fn solve_deadline(&self, deadline: Option<Instant>) -> Option<Instant> {
+        match (deadline, self.solve_cutoff) {
+            (Some(deadline), Some(cutoff)) => Some(deadline.min(cutoff)),
+            (deadline, cutoff) => deadline.or(cutoff),
+        }
     }
 
     /// Return the trust_mc configuration used by this adapter.
@@ -1166,8 +1408,9 @@ impl TrustMcVerifierApiAdapter {
     ) -> ObligationEvidence {
         let mut evidence = self.evidence_with_status(bundle, obligation, EvidenceStatus::Timeout);
         evidence.diagnostics.push(
-            "tracked per-function wall-clock budget (-Ztrust-verify-function-budget-ms) exceeded \
-             before this trust-mc obligation was solved; degraded to Timeout (sound: never Proved)"
+            "tracked per-function wall-clock budget (-Ztrust-verify-function-budget-ms), or the \
+             native lane's share of it (the solve cutoff), exceeded before this trust-mc \
+             obligation was solved; degraded to Timeout (sound: never Proved)"
                 .to_string(),
         );
         evidence
@@ -1377,9 +1620,9 @@ impl TrustMcVerifierApiAdapter {
         deadline: Option<Instant>,
     ) -> Vec<ObligationEvidence> {
         // Public convenience wrapper: not on the live producer chain, so it holds
-        // no source-generation authority. `None` keeps `Inst::Assume` fail-closed;
-        // the live compiler dispatch calls `..._with_deadline_and_fresh_receipts`
-        // directly with the minted authority.
+        // no source-generation authority. MC cannot use `Inst::Assume` as a
+        // trusted premise here. An exactly bound raw clause can still decline
+        // without an encoding; a fallback must establish its own body semantics.
         self.evidence_from_native_trust_ir_bundle_with_deadline_and_fresh_receipts(
             bundle,
             obligations,
@@ -1439,7 +1682,52 @@ impl TrustMcVerifierApiAdapter {
             bundle,
             obligations,
             native_bundle,
-            Some(source_generation_authority),
+            Some(NativeLiveSource { authority: source_generation_authority, reference_facts: None }),
+            deadline,
+        )
+    }
+
+    /// Run the native-bundle path with live source-generation authority AND the
+    /// compiler's live source reference facts for that same bundle (trust-mc DQ
+    /// 2026-10-30). Both the pre-solve translation, whose CHC identities the
+    /// refutation and whole-function receipt checks reuse, and the solve go
+    /// through trust-mc's `_with_source_reference_facts` entries, so they cannot
+    /// disagree. Facts that do not authorize this exact `(native_bundle,
+    /// source_generation_authority)` pair are a caller error: every owned row
+    /// fails closed with that diagnostic, and no fact-free solve is substituted.
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    pub fn evidence_from_native_trust_ir_bundle_with_source_reference_facts_and_deadline_and_fresh_receipts(
+        &self,
+        bundle: &TrustContractBundle,
+        obligations: &[TrustObligation],
+        native_bundle: &trust_ir::NativeVerificationBundle,
+        source_generation_authority: &trust_ir::SourceGenerationAuthority,
+        source_reference_facts: &SourceReferenceFacts<'_>,
+        deadline: Option<Instant>,
+    ) -> NativeTrustIrBundleEvidenceWithFreshReceipts {
+        if !source_reference_facts.authorizes_bundle(native_bundle, source_generation_authority) {
+            return obligations
+                .iter()
+                .map(|obligation| {
+                    let mut evidence = self.unsupported_evidence(bundle, obligation);
+                    evidence.diagnostics.insert(
+                        0,
+                        "native trust_mc source reference facts do not authorize this exact live native bundle and source authority; refusing rather than solving without them"
+                            .to_string(),
+                    );
+                    evidence
+                })
+                .collect::<Vec<_>>()
+                .into();
+        }
+        self.evidence_from_native_trust_ir_bundle_with_optional_source_authority_and_deadline_and_fresh_receipts(
+            bundle,
+            obligations,
+            native_bundle,
+            Some(NativeLiveSource {
+                authority: source_generation_authority,
+                reference_facts: Some(source_reference_facts),
+            }),
             deadline,
         )
     }
@@ -1450,34 +1738,39 @@ impl TrustMcVerifierApiAdapter {
         bundle: &TrustContractBundle,
         obligations: &[TrustObligation],
         native_bundle: &trust_ir::NativeVerificationBundle,
-        source_generation_authority: Option<&trust_ir::SourceGenerationAuthority>,
+        live_source: Option<NativeLiveSource<'_>>,
         deadline: Option<Instant>,
     ) -> NativeTrustIrBundleEvidenceWithFreshReceipts {
+        let source_generation_authority = live_source.map(|source| source.authority);
+        // Trust (2026-10-17, gate-rca deadline): what every solve below is bounded by.
+        // `deadline` itself stays the dispatch deadline the fresh exact-direct and
+        // whole-function receipts freeze ([`Self::with_solve_cutoff`]).
+        let solve_deadline = self.solve_deadline(deadline);
         // Trust: ownership is a property of the authenticated public VC, not
         // of a caller-supplied native bundle or direct contract. Record every
         // unowned row and every owned-but-payloadless E4/E5 row before
         // inspecting either input so an invalid native inventory cannot mask
         // (or bypass) the direct-solve admission rejection.
-        let mut direct_by_id = obligations
-            .iter()
-            .filter_map(|obligation| {
-                let rejection = if !is_trust_mc_owned_obligation(obligation) {
-                    Some(format!(
-                        "native trust_mc TrustIr bundle input rejected before direct solving for unowned {:?} obligation",
-                        obligation.kind
-                    ))
-                } else {
-                    owned_e4_e5_pre_solve_rejection(obligation)
-                }?;
+        let mut any_admissible_for_direct = false;
+        let mut direct_by_id = BTreeMap::new();
+        for obligation in obligations {
+            let rejection = if !is_trust_mc_owned_obligation(obligation) {
+                Some(format!(
+                    "native trust_mc TrustIr bundle input rejected before direct solving for unowned {:?} obligation",
+                    obligation.kind
+                ))
+            } else {
+                owned_e4_e5_pre_solve_rejection(obligation)
+            };
+            if let Some(rejection) = rejection {
                 let mut evidence = self.unsupported_evidence(bundle, obligation);
                 evidence.diagnostics.push(rejection);
-                Some((obligation.obligation_id.clone(), evidence))
-            })
-            .collect::<BTreeMap<_, _>>();
-        if obligations.iter().all(|obligation| {
-            !is_trust_mc_owned_obligation(obligation)
-                || owned_e4_e5_pre_solve_rejection(obligation).is_some()
-        }) {
+                direct_by_id.insert(obligation.obligation_id.clone(), evidence);
+            } else {
+                any_admissible_for_direct = true;
+            }
+        }
+        if !any_admissible_for_direct {
             return obligations
                 .iter()
                 .map(|obligation| {
@@ -1555,9 +1848,11 @@ impl TrustMcVerifierApiAdapter {
         let fresh_exact_bundle_seal =
             FreshExactDirectChcPdrBundleSeal::from_validated_bundle(bundle);
 
-        let translated = match self
-            .native_trust_ir_chc_pdr_translated_obligations(native_bundle, deadline)
-        {
+        let translated = match self.native_trust_ir_chc_pdr_translated_obligations_in_live_source(
+            native_bundle,
+            live_source,
+            solve_deadline,
+        ) {
             Ok(translated) => translated,
             Err(reason) => {
                 return obligations
@@ -1579,7 +1874,13 @@ impl TrustMcVerifierApiAdapter {
 
         let mut translated_by_obligation = BTreeMap::new();
         let mut translated_counts = BTreeMap::<String, usize>::new();
-        for translated in translated {
+        let mut refused_by_obligation = BTreeMap::new();
+        for refused in translated.refused_requests {
+            let lookup_key = native_trust_mc_obligation_lookup_key(&refused.native_obligation_id);
+            *translated_counts.entry(lookup_key.clone()).or_default() += 1;
+            refused_by_obligation.entry(lookup_key).or_insert(refused);
+        }
+        for translated in translated.obligations {
             let lookup_key =
                 native_trust_mc_obligation_lookup_key(&translated.obligation.obligation_id);
             *translated_counts.entry(lookup_key.clone()).or_default() += 1;
@@ -1621,23 +1922,26 @@ impl TrustMcVerifierApiAdapter {
             // canonical public claim; the remaining checks prove that the
             // module, compiler-fact sidecar, replay assertion, and derived CHC
             // marker all refer to that same request/proof/function/source.
-            if let Err(reason) = validate_native_trust_ir_public_claim_binding(
+            let claim = match validate_native_trust_ir_public_claim_binding(
                 bundle,
                 obligation,
                 native_bundle,
                 &public_claim_binding_context,
             ) {
-                let mut evidence = self.unsupported_evidence(bundle, obligation);
-                evidence.diagnostics.insert(
-                    0,
-                    format!("native trust_mc public/TrustIr claim binding rejected: {reason}"),
-                );
-                direct_by_id.insert(obligation.obligation_id.clone(), evidence);
-                continue;
-            }
+                Ok(claim) => claim,
+                Err(reason) => {
+                    let mut evidence = self.unsupported_evidence(bundle, obligation);
+                    evidence.diagnostics.insert(
+                        0,
+                        format!("native trust_mc public/TrustIr claim binding rejected: {reason}"),
+                    );
+                    direct_by_id.insert(obligation.obligation_id.clone(), evidence);
+                    continue;
+                }
+            };
             // Trust: stop solving once the per-function budget is spent;
             // the remaining direct-path obligations degrade to Timeout.
-            if trust_mc_budget_deadline_exceeded(deadline) {
+            if trust_mc_budget_deadline_exceeded(solve_deadline) {
                 direct_by_id.insert(
                     obligation.obligation_id.clone(),
                     self.budget_timeout_evidence(bundle, obligation),
@@ -1655,6 +1959,63 @@ impl TrustMcVerifierApiAdapter {
                 direct_by_id.insert(obligation.obligation_id.clone(), evidence);
                 continue;
             }
+            if let Some(refused) = refused_by_obligation.get(&expected_lookup_key) {
+                let mut evidence = self.unsupported_evidence(bundle, obligation);
+                let reason =
+                    native_bundle_stop::NativeTransportNotProved::from_options_refusal(refused)
+                        .map_or_else(|reason| reason, |row| row.reason);
+                evidence
+                    .diagnostics
+                    .insert(0, format!("native trust_mc request options rejected: {reason}"));
+                direct_by_id.insert(obligation.obligation_id.clone(), evidence);
+                continue;
+            }
+            if let NativePublicClaimKind::RawPostcondition { admission_stop } = claim {
+                let mut evidence = self.unsupported_evidence(bundle, obligation);
+                if let Some(stop) = admission_stop {
+                    // This is the actual typed admission refusal, after ALL
+                    // public/native/replay/CHC identity checks completed. No
+                    // submitted diagnostic string can manufacture this cause.
+                    // The ordinary deadline check above still wins over it.
+                    evidence.diagnostics.insert(
+                        0,
+                        format!(
+                            "native trust_mc raw source admission refused: {}",
+                            stop.diagnostic()
+                        ),
+                    );
+                    evidence
+                        .diagnostics
+                        .push(trust_verifier_api::NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC.into());
+                } else if let Some(translated) = translated_by_obligation
+                    .get(&expected_lookup_key)
+                    .filter(|row| row.diagnostics.iter().any(|diagnostic| {
+                        !matches!(diagnostic.reason,
+                            trust_mc_trust_bmc::TrustIrChcUnsupportedReason::UnsupportedDirectCallSummary)
+                    }))
+                {
+                    evidence.diagnostics.insert(0,
+                        "raw postcondition cannot bypass native body lowering/admission diagnostics".into());
+                    evidence.diagnostics.extend(translated.diagnostics.iter().map(|diagnostic| {
+                        format!("native body lowering diagnostic: {diagnostic:?}")
+                    }));
+                } else {
+                    // This is a validated original clause, not a body violation
+                    // formula or a failed solver result. MC has no encoding for
+                    // it, even when its body contains Assume instructions. No
+                    // MC proof-authority admission or solve has run. A fallback
+                    // must check the same body, without importing assumptions as
+                    // trusted premises. Extra replay premises remain terminal.
+                    // An unsupported MC direct-call summary is likewise an
+                    // encoding limit: WP can compose the actual retained callee.
+                    // Every other typed lowering diagnostic remains terminal.
+                    evidence.decline = Some(trust_verifier_api::DeclineClass::Capability);
+                    evidence.diagnostics.insert(0,
+                        "native trust-mc has no encoding for this exactly bound raw source postcondition".into());
+                }
+                direct_by_id.insert(obligation.obligation_id.clone(), evidence);
+                continue;
+            }
             let Some(translated) = translated_by_obligation.get(&expected_lookup_key) else {
                 let mut evidence = self.unsupported_evidence(bundle, obligation);
                 evidence.diagnostics.push(format!(
@@ -1664,7 +2025,6 @@ impl TrustMcVerifierApiAdapter {
                 continue;
             };
 
-            let exact_e4_e5_formula_lane = is_typed_body_aware_e4_e5_obligation(obligation);
             // Additive standalone-formula fresh lane: compiler-authenticated
             // formula rows outside E4/E5 ATTEMPT the receipt-bearing fresh
             // dispatch, and take its evidence ONLY when the live receipt was
@@ -1676,8 +2036,8 @@ impl TrustMcVerifierApiAdapter {
             // it never starts a second generic solve without the caller's
             // deadline. The E4/E5 terminal Unsupported arms below are
             // deliberately NOT reachable from this lane.
-            let exact_standalone_formula_fresh_lane = !exact_e4_e5_formula_lane
-                && is_typed_body_aware_exact_direct_obligation(obligation);
+            let (exact_e4_e5_formula_lane, exact_standalone_formula_fresh_lane) =
+                classify_direct_formula_lanes(obligation);
             let direct_outcome = if exact_standalone_formula_fresh_lane {
                 let fresh_dispatch = public_claim_binding_context
                     .canonical_public_digests
@@ -1760,9 +2120,13 @@ impl TrustMcVerifierApiAdapter {
                     })
                 })
             } else {
-                self.direct_typed_chc_pdr_evidence_for(bundle, obligation)
+                self.direct_typed_chc_pdr_evidence_for_with_contract_index(
+                    bundle,
+                    obligation,
+                    Some(&public_claim_binding_context.contracts),
+                )
             };
-            if std::env::var("TRUST_NATIVE_DEBUG").is_ok() {
+            if trust_native_debug_enabled() {
                 let tag = match &direct_outcome {
                     Ok(Some(e)) => {
                         format!("direct status={:?} strength={:?}", e.status, e.proof_strength)
@@ -1801,7 +2165,7 @@ impl TrustMcVerifierApiAdapter {
             // row must have an exact standalone direct input.
             let can_defer_to_whole_function_transport =
                 obligation_is_whole_function_panic_freedom(bundle, obligation);
-            if std::env::var("TRUST_NATIVE_DEBUG").is_ok()
+            if trust_native_debug_enabled()
                 && obligation.obligation_id.ends_with(":assertion:panic-freedom:0")
             {
                 eprintln!(
@@ -1869,7 +2233,7 @@ impl TrustMcVerifierApiAdapter {
                 }
             }
         }
-        if std::env::var("TRUST_NATIVE_DEBUG").is_ok() {
+        if trust_native_debug_enabled() {
             eprintln!(
                 "[DEFER_SUM] deferred_ids.len()={} deferred={:?} direct_by_id.len()={}",
                 deferred_ids.len(),
@@ -1896,7 +2260,7 @@ impl TrustMcVerifierApiAdapter {
         // expensive in-process CHC/PDR solve. If the per-function budget is
         // already spent, do not start it; degrade the DEFERRED obligations to
         // Timeout (sound: never Proved) while keeping the direct verdicts.
-        if trust_mc_budget_deadline_exceeded(deadline) {
+        if trust_mc_budget_deadline_exceeded(solve_deadline) {
             let evidence = obligations
                 .iter()
                 .map(|obligation| {
@@ -1911,11 +2275,26 @@ impl TrustMcVerifierApiAdapter {
             );
         }
 
-        let (transports, transport_not_proved, transport_refuted) = match self
-            .native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
+        // Only the existing audited compiler entrypoint may retain a source-
+        // facing whole-function capability. Ordinary module solves keep their
+        // public results, but do not acquire this private family. The content
+        // snapshot and the pre-solve `translated_by_obligation` above come from
+        // the SAME immutable `native_bundle`; no returned proof supplies either.
+        let whole_function_seal = source_generation_authority.and_then(|source| {
+            FreshWholeFunctionChcPdrBundleSeal::from_source_authorized_bundles(
+                bundle,
+                obligations,
                 native_bundle,
-                source_generation_authority,
-                deadline,
+                source,
+            )
+            .ok()
+        });
+        let mut fresh_whole_function_receipts = BTreeMap::new();
+        let (transports, transport_not_proved, transport_refuted) = match self
+            .native_trust_ir_chc_pdr_proof_transports_in_live_source(
+                native_bundle,
+                live_source,
+                solve_deadline,
             ) {
             Ok(transports) => transports,
             Err(reason) => {
@@ -1928,6 +2307,12 @@ impl TrustMcVerifierApiAdapter {
                             return evidence;
                         }
                         let mut evidence = self.unsupported_evidence(bundle, obligation);
+                        if reason.before_solver_dispatch() {
+                            evidence.diagnostics.push(
+                                trust_verifier_api::NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC
+                                    .to_string(),
+                            );
+                        }
                         // insert(0), not push: `unsupported_diagnostics` has already
                         // prepended the generic "missing `trust.vc.formula.schema`"
                         // direct-lane line, which for a row that never uses the direct
@@ -1967,7 +2352,7 @@ impl TrustMcVerifierApiAdapter {
                 // direct verdict and direct-path artifacts; only deferred
                 // obligations consume the transport.
                 if let Some(evidence) = direct_by_id.remove(&obligation.obligation_id) {
-                    if std::env::var("TRUST_NATIVE_DEBUG").is_ok() {
+                    if trust_native_debug_enabled() {
                         eprintln!(
                             "[NATIVE_TRUSTMC_RESULT] obl={} kind={:?} FINAL(direct) status={:?} strength={:?}",
                             obligation.obligation_id, obligation.kind, evidence.status, evidence.proof_strength
@@ -1977,7 +2362,7 @@ impl TrustMcVerifierApiAdapter {
                 }
                 // Trust: the transport solve can exhaust the budget partway
                 // through this obligation set; degrade the remainder to Timeout.
-                if trust_mc_budget_deadline_exceeded(deadline) {
+                if trust_mc_budget_deadline_exceeded(solve_deadline) {
                     return self.budget_timeout_evidence(bundle, obligation);
                 }
                 let expected_native_id = native_trust_ir_expected_trust_mc_obligation_id(obligation)
@@ -1997,21 +2382,41 @@ impl TrustMcVerifierApiAdapter {
                 else {
                     // Witnessed refutation channel (T3): the transport solve
                     // REFUTED this row and attached a machine-checked witness.
-                    // Every binding is revalidated consumer-side (fresh
-                    // translation, recomputed digests, admissibility) before a
-                    // Failed verdict is surfaced; any validation failure
+                    // Every binding is revalidated consumer-side (the consumer's
+                    // own translation, recomputed digests, admissibility) before
+                    // a Failed verdict is surfaced; any validation failure
                     // demotes to the historical Unknown.
+                    //
+                    // The consumer translation is the one retained BEFORE the
+                    // solve (`translated_by_obligation`), of this same immutable
+                    // `native_bundle`; no solver output supplies it. Translating
+                    // the whole bundle again for every refuted row recomputed
+                    // that identical value once per row (WS-E step 8d).
                     if let Some(refuted_row) = transport_refuted.get(&expected_lookup_key) {
-                        return self.native_trust_ir_refuted_row_evidence(
+                        return self.native_trust_ir_refuted_row_evidence_with_deadline(
                             bundle,
                             obligation,
-                            native_bundle,
+                            &native_trust_ir_retained_rows_for(
+                                &translated_by_obligation,
+                                &translated_counts,
+                                &expected_lookup_key,
+                            ),
                             refuted_row,
-                            deadline,
+                            solve_deadline,
                         );
                     }
                     let mut evidence = self.unsupported_evidence(bundle, obligation);
-                    if let Some(reason) = transport_not_proved.get(&expected_lookup_key) {
+                    if let Some(not_proved) = transport_not_proved.get(&expected_lookup_key) {
+                        // Only the live typed Unsafe-to-Unknown branch supplies
+                        // this cause. A generic error or copied human reason
+                        // never establishes why a completed solve was withheld.
+                        if not_proved.refutation_was_demoted() {
+                            evidence.diagnostics.push(
+                                trust_verifier_api::NATIVE_REFUTATION_FIDELITY_DEMOTION_DIAGNOSTIC
+                                    .to_string(),
+                            );
+                        }
+                        let reason = &not_proved.reason;
                         // Trust (T3): the transport solve DID run this row and
                         // did not prove it — surface the row's OWN outcome as
                         // the FIRST diagnostic (the compiler prints only the
@@ -2039,7 +2444,7 @@ impl TrustMcVerifierApiAdapter {
                             ),
                         );
                     }
-                    if std::env::var("TRUST_NATIVE_DEBUG").is_ok() {
+                    if trust_native_debug_enabled() {
                         eprintln!(
                             "[NATIVE_TRUSTMC] obl={} kind={:?} expected_native_id={} -> NO TRANSPORT (not_proved_reason={:?}, available keys: {:?})",
                             obligation.obligation_id, obligation.kind, expected_native_id,
@@ -2049,6 +2454,16 @@ impl TrustMcVerifierApiAdapter {
                     }
                     return evidence;
                 };
+
+                let binding = translated_by_obligation.get(&expected_lookup_key)
+                    .ok_or_else(|| "independent pre-solve request configuration is absent".to_string())
+                    .and_then(|fresh| validate_native_trust_mc_consumer_request_config(
+                        fresh, &transport.evidence.translated));
+                if let Err(reason) = binding {
+                    let mut evidence = self.unsupported_evidence(bundle, obligation);
+                    evidence.diagnostics.insert(0, format!("native trust_mc request configuration binding rejected: {reason}"));
+                    return evidence;
+                }
 
                 let native_trust_ir_context_diagnostic = transport.native_trust_ir_context_diagnostic();
                 let expected_normalized_input = transport.expected_normalized_input.clone();
@@ -2070,17 +2485,44 @@ impl TrustMcVerifierApiAdapter {
                     &expected_normalized_input,
                 );
                 evidence.diagnostics.push(native_trust_ir_context_diagnostic);
-                if std::env::var("TRUST_NATIVE_DEBUG").is_ok() {
+                if trust_native_debug_enabled() {
                     eprintln!(
                         "[NATIVE_TRUSTMC] obl={} kind={:?} FINAL status={:?} strength={:?} diag=[{}]",
                         obligation.obligation_id, obligation.kind, evidence.status,
                         evidence.proof_strength, evidence.diagnostics.join(" | ")
                     );
                 }
+                if evidence.status == EvidenceStatus::Proved
+                    && obligation_is_whole_function_panic_freedom(bundle, obligation)
+                    && let Some(seal) = whole_function_seal.as_ref()
+                    && source_generation_authority.is_some_and(|source| source.authorizes_bundle(native_bundle))
+                {
+                    let receipt = translated_by_obligation.get(&expected_lookup_key)
+                        .ok_or_else(|| "independent pre-solve translation is absent".to_string())
+                        .and_then(|before_solve| FreshWholeFunctionChcPdrReceipt::try_from_native(
+                            seal.clone(), obligation, &evidence, before_solve, transport, deadline,
+                        ));
+                    match receipt {
+                        Ok(receipt) => {
+                            fresh_whole_function_receipts.insert(obligation.obligation_id.clone(), receipt);
+                        }
+                        Err(reason) => {
+                            // Public Proved is not an alternative authority when
+                            // exact aggregate membership/proof replay fails.
+                            let mut rejected = self.unsupported_evidence(bundle, obligation);
+                            rejected.diagnostics.insert(0, format!("whole-function live receipt rejected: {reason}"));
+                            return rejected;
+                        }
+                    }
+                }
                 evidence
             })
             .collect();
-        finalize_native_bundle_evidence_with_fresh_receipts(evidence, fresh_exact_direct_receipts)
+        finalize_native_bundle_evidence_with_whole_function_receipts(
+            evidence,
+            fresh_exact_direct_receipts,
+            fresh_whole_function_receipts,
+        )
     }
 
     /// Per-obligation ay CHC/PDR solve budget: the configured `timeout_ms`, but
@@ -2114,6 +2556,18 @@ impl TrustMcVerifierApiAdapter {
         }
     }
 
+    /// Translate Root's zero-is-unbounded convention once. An explicitly
+    /// supplied zero Duration at the native solver API remains a zero ceiling.
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_solve_options(&self, deadline: Option<Instant>) -> trust_mc_core::ChcPdrSolveOptions {
+        let timeout_ms = self.native_solve_timeout_ms(deadline);
+        let mut options = trust_mc_core::ChcPdrSolveOptions::default()
+            .with_engine(chc_pdr_engine_from_config(self.config.proof_mode))
+            .with_proof_certificate(self.config.produce_proofs);
+        options.timeout = (timeout_ms != 0).then(|| std::time::Duration::from_millis(timeout_ms));
+        options
+    }
+
     #[cfg(all(feature = "trust-mc-native-trust-ir-bundle", test))]
     #[allow(clippy::type_complexity)] // one typed per-outcome channel per T3 delivery lane
     fn native_trust_ir_chc_pdr_proof_transports(
@@ -2137,76 +2591,119 @@ impl TrustMcVerifierApiAdapter {
             None,
             deadline,
         )
+        .map(|(proved, not_proved, refuted)| {
+            (proved, not_proved.into_iter().map(|(id, row)| (id, row.reason)).collect(), refuted)
+        })
+        .map_err(|error| error.to_string())
     }
 
-    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
-    #[allow(clippy::type_complexity)] // one typed per-outcome channel per T3 delivery lane
+    // Trust (C1, 2026-11-06): test-only; production calls `_in_live_source`.
+    #[cfg(all(feature = "trust-mc-native-trust-ir-bundle", test))]
     fn native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
         &self,
         native_bundle: &trust_ir::NativeVerificationBundle,
         source_generation_authority: Option<&trust_ir::SourceGenerationAuthority>,
         deadline: Option<Instant>,
-    ) -> Result<
-        (
-            Vec<NativeTrustIrChcPdrAuthorizedProof>,
-            BTreeMap<String, String>,
-            BTreeMap<String, trust_mc_driver::NativeTrustIrChcPdrRefuted>,
-        ),
-        String,
-    > {
+    ) -> Result<NativeProofTransports, NativeBundleTransportError> {
+        self.native_trust_ir_chc_pdr_proof_transports_in_live_source(
+            native_bundle,
+            source_generation_authority
+                .map(|authority| NativeLiveSource { authority, reference_facts: None }),
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_chc_pdr_proof_transports_in_live_source(
+        &self,
+        native_bundle: &trust_ir::NativeVerificationBundle,
+        live_source: Option<NativeLiveSource<'_>>,
+        deadline: Option<Instant>,
+    ) -> Result<NativeProofTransports, NativeBundleTransportError> {
         validate_trust_mc_native_admission_contract(native_bundle)?;
         let runner = trust_mc_driver::NativeTrustIrChcPdrRunner::with_solve_options(
-            trust_mc_core::ChcPdrSolveOptions::default()
-                .with_engine(chc_pdr_engine_from_config(self.config.proof_mode))
-                .with_timeout(std::time::Duration::from_millis(
-                    self.native_solve_timeout_ms(deadline),
-                ))
-                .with_proof_certificate(self.config.produce_proofs),
+            self.native_solve_options(deadline),
         );
-        let bundle_evidence = match source_generation_authority {
-            Some(source_generation_authority) => runner
-                .solve_bundle_native_proof_grade_with_source_authority(
+        // Trust (C1, 2026-11-06): with live source reference facts the solve goes
+        // through trust-mc's facts entry, a strict superset of the source-authority
+        // entry (it re-checks that the facts authorize this bundle and authority).
+        let bundle_evidence = match live_source {
+            Some(NativeLiveSource { authority, reference_facts: Some(facts) }) => {
+                #[cfg(test)]
+                NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST
+                    .with(|count| count.set((count.get().0, count.get().1 + 1)));
+                runner.solve_bundle_native_proof_grade_with_source_reference_facts(
                     native_bundle,
-                    source_generation_authority,
-                ),
+                    authority,
+                    facts,
+                )
+            }
+            Some(NativeLiveSource { authority, reference_facts: None }) => runner
+                .solve_bundle_native_proof_grade_with_source_authority(native_bundle, authority),
             None => runner.solve_bundle_native_proof_grade(native_bundle),
         }
-        .map_err(native_typed_chc_pdr_error_reason)?;
+        .map_err(NativeBundleTransportError::from_driver)?;
         // Requests whose solve ran but did not produce proof-grade evidence are
         // returned as typed, evidence-free rows. Preserve their exact per-row
         // reason so a failed request cannot be hidden behind a generic missing
         // transport message, while rejecting duplicate/overlapping identities
         // as structural corruption.
-        let proved_ids = bundle_evidence
-            .obligations
-            .iter()
-            .map(|row| {
-                native_trust_mc_obligation_lookup_key(&row.translated.obligation.obligation_id)
-            })
-            .collect::<BTreeSet<_>>();
+        let mut proved_ids =
+            std::collections::HashSet::with_capacity(bundle_evidence.obligations.len());
+        for row in &bundle_evidence.obligations {
+            proved_ids.insert(native_trust_mc_obligation_lookup_key(
+                &row.translated.obligation.obligation_id,
+            ));
+        }
         let mut not_proved = BTreeMap::new();
         for row in bundle_evidence.not_proved {
-            let obligation_id = row.translated.obligation.obligation_id;
+            let obligation_id = row.translated.obligation.obligation_id.clone();
             let lookup_key = native_trust_mc_obligation_lookup_key(&obligation_id);
             if proved_ids.contains(&lookup_key) {
-                return Err(format!(
-                    "native trust_mc bundle returned obligation `{obligation_id}` as both proved and not-proved"
-                ));
+                return Err(
+                    format!(
+                        "native trust_mc bundle returned obligation `{obligation_id}` as both proved and not-proved"
+                    )
+                    .into(),
+                );
             }
             if row.reason.is_empty()
                 || row.reason.trim() != row.reason
                 || row.reason.len() > 16 * 1024
                 || row.reason.chars().any(char::is_control)
             {
-                return Err(format!(
-                    "native trust_mc bundle returned a non-canonical not-proved reason for `{obligation_id}`"
-                ));
+                return Err(
+                    format!(
+                        "native trust_mc bundle returned a non-canonical not-proved reason for `{obligation_id}`"
+                    )
+                    .into(),
+                );
             }
-            if not_proved.insert(lookup_key, row.reason).is_some() {
-                return Err(format!(
-                    "native trust_mc bundle returned duplicate not-proved rows for `{obligation_id}`"
-                ));
+            if not_proved
+                .insert(lookup_key, native_bundle_stop::NativeTransportNotProved::from_driver(row))
+                .is_some()
+            {
+                return Err(
+                    format!(
+                        "native trust_mc bundle returned duplicate not-proved rows for `{obligation_id}`"
+                    )
+                    .into(),
+                );
             }
+        }
+        // An unsupported option is a request-local refusal with no encoded
+        // VC or solve. Preserve it in the evidence-free channel, not as a fake
+        // translated row, and keep the same disjoint-identity guards.
+        for row in bundle_evidence.refused_requests {
+            let obligation_id = &row.native_obligation_id;
+            let lookup_key = native_trust_mc_obligation_lookup_key(obligation_id);
+            if proved_ids.contains(&lookup_key) || not_proved.contains_key(&lookup_key) {
+                return Err(format!(
+                    "native trust_mc bundle returned obligation `{obligation_id}` as refused and as another outcome"
+                ).into());
+            }
+            let refusal = native_bundle_stop::NativeTransportNotProved::from_options_refusal(&row)?;
+            not_proved.insert(lookup_key, refusal);
         }
         // Witnessed refutations are their own typed channel: never proof
         // evidence, never a bare not-proved reason. Identity overlap with the
@@ -2217,14 +2714,18 @@ impl TrustMcVerifierApiAdapter {
             let obligation_id = row.translated.obligation.obligation_id.clone();
             let lookup_key = native_trust_mc_obligation_lookup_key(&obligation_id);
             if proved_ids.contains(&lookup_key) || not_proved.contains_key(&lookup_key) {
-                return Err(format!(
-                    "native trust_mc bundle returned obligation `{obligation_id}` as refuted and as another outcome"
-                ));
+                return Err(
+                    format!(
+                        "native trust_mc bundle returned obligation `{obligation_id}` as refuted and as another outcome"
+                    )
+                    .into(),
+                );
             }
             if refuted.insert(lookup_key, row).is_some() {
                 return Err(format!(
                     "native trust_mc bundle returned duplicate refuted rows for `{obligation_id}`"
-                ));
+                )
+                .into());
             }
         }
         Ok((
@@ -2238,21 +2739,51 @@ impl TrustMcVerifierApiAdapter {
         ))
     }
 
-    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    // Trust (C1, 2026-11-06): test-only; production calls `_in_live_source`.
+    #[cfg(all(feature = "trust-mc-native-trust-ir-bundle", test))]
     fn native_trust_ir_chc_pdr_translated_obligations(
         &self,
         native_bundle: &trust_ir::NativeVerificationBundle,
         deadline: Option<Instant>,
     ) -> Result<Vec<trust_mc_trust_bmc::NativeTrustMcChcPdrObligation>, String> {
+        self.native_trust_ir_chc_pdr_translated_obligations_in_live_source(
+            native_bundle,
+            None,
+            deadline,
+        )
+        .map(|batch| batch.obligations)
+    }
+
+    /// The pre-solve consumer translation. With live source reference facts it is
+    /// trust-mc's `translate_configured_obligations_with_source_reference_facts`, the entry
+    /// its driver documents for producer pre-solve claim/CHC identities, so the
+    /// retained rows are the ones the facts solve translates.
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_chc_pdr_translated_obligations_in_live_source(
+        &self,
+        native_bundle: &trust_ir::NativeVerificationBundle,
+        live_source: Option<NativeLiveSource<'_>>,
+        deadline: Option<Instant>,
+    ) -> Result<trust_mc_trust_bmc::NativeMcConfiguredChcTranslation, String> {
+        #[cfg(test)]
+        NATIVE_BUNDLE_TRANSLATION_COUNT_FOR_TEST.with(|count| count.set(count.get() + 1));
         let runner = trust_mc_driver::NativeTrustIrChcPdrRunner::with_solve_options(
-            trust_mc_core::ChcPdrSolveOptions::default()
-                .with_engine(chc_pdr_engine_from_config(self.config.proof_mode))
-                .with_timeout(std::time::Duration::from_millis(
-                    self.native_solve_timeout_ms(deadline),
-                ))
-                .with_proof_certificate(self.config.produce_proofs),
+            self.native_solve_options(deadline),
         );
-        runner.translate_obligations(native_bundle).map_err(native_typed_chc_pdr_error_reason)
+        match live_source {
+            Some(NativeLiveSource { authority, reference_facts: Some(facts) }) => {
+                #[cfg(test)]
+                NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST
+                    .with(|count| count.set((count.get().0 + 1, count.get().1)));
+                runner.translate_configured_obligations_with_source_reference_facts(
+                    native_bundle,
+                    authority,
+                    facts,
+                )
+            }
+            _ => runner.translate_configured_obligations(native_bundle),
+        }
+        .map_err(native_typed_chc_pdr_error_reason)
     }
 
     /// Turn one witnessed native-bundle refutation into public evidence.
@@ -2263,11 +2794,13 @@ impl TrustMcVerifierApiAdapter {
     /// 1. applies the producer-encoding admissibility gate on the public
     ///    obligation (an attested over-approximate encoding cannot ground a
     ///    refutation, exactly as on the direct lane);
-    /// 2. re-translates its OWN retained native bundle and requires the fresh
-    ///    translation to be free of fail-closed lowering diagnostics (a
+    /// 2. takes its OWN translation of its retained native bundle
+    ///    (`consumer_rows`: in production the rows translated before the solve,
+    ///    of the same immutable bundle, never a solver-returned row) and
+    ///    requires it to be free of fail-closed lowering diagnostics (a
     ///    derivation through an unconditional error rule is an admission
     ///    failure, not a program trap);
-    /// 3. recomputes the encoded-formula digest from that fresh translation
+    /// 3. recomputes the encoded-formula digest from that consumer translation
     ///    (never trusting the producer-threaded translated obligation);
     /// 4. runs the full witness binding validation
     ///    ([`validate_bound_typed_chc_pdr_refutation_witness`]): obligation
@@ -2278,32 +2811,43 @@ impl TrustMcVerifierApiAdapter {
     /// ANY failure demotes to the historical Unknown — never a proof, never a
     /// bare producer-claimed failure.
     ///
-    /// STATUS (recorded so it is not re-derived): this arm cannot reach
-    /// `EvidenceStatus::Failed` on production compiler output today, and step 1
-    /// is why. `TrustMcChcRefutationAdmissibility::for_obligation` answers
-    /// `Unattested` unless the row carries
-    /// `TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY`, and the compiler
-    /// stamps only the NEGATIVE `loop_elided_over_approximation` value (see the
-    /// key's own doc and `annotate_trust_mc_typed_chc_encoding_fidelity` in
-    /// `trust_verify.rs`, which additionally returns early for exactly the
-    /// obligations that route to the structural whole-CFG CHC this lane
-    /// consumes). `Unattested` is rejected, so every native-bundle refutation
-    /// demotes to Unknown.
+    /// The compiler's positive `exact` annotation describes an admitted flat
+    /// typed VC. It is not a source-to-native-TrustIR correspondence premise.
+    /// This native route checks that distinct scope before any witness can
+    /// publish a counterexample. Native source correspondence has no production
+    /// issuer yet; replaying the encoded request cannot substitute for it.
+    /// Unsupported source constructs can become `Inst::Undef` or otherwise
+    /// over-approximate the source, so a complete positive relation and the full
+    /// falsification gate remain required before this route can admit credit.
     ///
-    /// Closing that link is NOT a matter of relaxing this gate: the edge the
-    /// attestation stands for on this lane is MIR -> TrustIr, and trust-ir-bridge
-    /// lowers unsupported constructs to `Inst::Undef`, i.e. a fresh symbolic —
-    /// an over-approximation, which is sound for proofs and exactly what makes a
-    /// counterexample spurious. A positive attestation therefore requires a
-    /// per-obligation bridge-completeness premise that does not exist yet, and
-    /// minting one is a new refutation-authority grant that must be validated by
-    /// the full falsification gate before it can be believed.
+    /// `consumer_rows` must hold EVERY row of the consumer's translation whose
+    /// obligation id could equal the refuted row's (in production: the rows that
+    /// share its lookup key, see [`native_trust_ir_retained_rows_for`]); exactly
+    /// one of them must carry the refuted row's exact obligation id.
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    #[cfg(test)]
     fn native_trust_ir_refuted_row_evidence(
         &self,
         bundle: &TrustContractBundle,
         obligation: &TrustObligation,
-        native_bundle: &trust_ir::NativeVerificationBundle,
+        consumer_rows: &[&trust_mc_trust_bmc::NativeTrustMcChcPdrObligation],
+        row: &trust_mc_driver::NativeTrustIrChcPdrRefuted,
+    ) -> ObligationEvidence {
+        self.native_trust_ir_refuted_row_evidence_with_deadline(
+            bundle,
+            obligation,
+            consumer_rows,
+            row,
+            None,
+        )
+    }
+
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_refuted_row_evidence_with_deadline(
+        &self,
+        bundle: &TrustContractBundle,
+        obligation: &TrustObligation,
+        consumer_rows: &[&trust_mc_trust_bmc::NativeTrustMcChcPdrObligation],
         row: &trust_mc_driver::NativeTrustIrChcPdrRefuted,
         deadline: Option<Instant>,
     ) -> ObligationEvidence {
@@ -2321,64 +2865,18 @@ impl TrustMcVerifierApiAdapter {
             evidence
         };
 
-        let admissibility = TrustMcChcRefutationAdmissibility::for_obligation(obligation);
+        let admissibility = TrustMcChcRefutationAdmissibility::for_native_obligation(obligation);
         if let Some(reason) = admissibility.rejection_reason() {
             return demote(reason);
         }
-        let trust_mc_core::ChcPdrSolveStatus::Refuted { witness: Some(witness) } =
-            &row.verification.outcome.status
-        else {
-            return demote("refuted row carries no witness payload".to_string());
-        };
-
-        let fresh_rows =
-            match self.native_trust_ir_chc_pdr_translated_obligations(native_bundle, deadline) {
-                Ok(rows) => rows,
-                Err(reason) => {
-                    return demote(format!(
-                        "fresh consumer re-translation of the native bundle failed: {reason}"
-                    ));
-                }
-            };
-        let matching: Vec<_> = fresh_rows
-            .into_iter()
-            .filter(|fresh| &fresh.obligation.obligation_id == native_id)
-            .collect();
-        let [fresh_row] = matching.as_slice() else {
-            return demote(format!(
-                "fresh consumer re-translation yielded {} rows for `{native_id}`; expected \
-                 exactly one",
-                matching.len()
-            ));
-        };
-        if !fresh_row.diagnostics.is_empty() {
-            return demote(format!(
-                "fresh consumer re-translation recorded {} fail-closed lowering diagnostic(s); \
-                 a derivation may pass through an unconditional error rule",
-                fresh_row.diagnostics.len()
-            ));
-        }
-        let expected_normalized_input =
-            match trust_mc_driver::normalized_typed_chc_pdr_input(&fresh_row.obligation) {
-                Ok(expected) => expected,
-                Err(error) => {
-                    return demote(format!(
-                        "fresh consumer re-translation could not be normalized: {}",
-                        native_typed_chc_pdr_error_reason(error)
-                    ));
-                }
-            };
-
-        match validate_bound_typed_chc_pdr_refutation_witness(
+        match native_refutation::check_with_options(
             bundle,
-            witness,
             obligation,
-            &fresh_row.obligation,
-            &row.verification,
-            &expected_normalized_input,
-            chc_pdr_engine_from_config(self.config.proof_mode),
+            consumer_rows,
+            row,
+            &self.native_solve_options(deadline),
         ) {
-            Ok(verification_summary) => {
+            Ok((expected_normalized_input, verification_summary)) => {
                 let input_artifact = EvidenceArtifact {
                     kind: EvidenceArtifactKind::EngineInput,
                     uri: format!(
@@ -2401,11 +2899,12 @@ impl TrustMcVerifierApiAdapter {
                     format!(
                         "native trust_mc TrustIr CHC/PDR transport refuted the encoded VC and \
                          its refutation witness validated: obligation identity, \
-                         consumer-recomputed encoded-formula digest (fresh native-bundle \
-                         re-translation), consumer-recomputed semantic-configuration digest, \
-                         and the exact-encoding concreteness attestation (zero translation \
-                         drops / havocs / Undef-diagnostic havocs) all checked; counterexample \
-                         verification: {verification_summary}"
+                         consumer-recomputed encoded-formula digest (the consumer's own \
+                         native-bundle translation), consumer-recomputed \
+                         semantic-configuration digest, and the exact-encoding concreteness \
+                         attestation (zero translation drops / havocs / Undef-diagnostic \
+                         havocs) all checked; counterexample verification: \
+                         {verification_summary}"
                     ),
                 )
             }
@@ -2476,7 +2975,24 @@ impl TrustMcVerifierApiAdapter {
         if let Some(root_reason) =
             metadata_value(&obligation.metadata, TRUST_MC_TYPED_CHC_UNSUPPORTED_REASON_METADATA_KEY)
         {
-            diagnostics.push(format!("typed CHC input unavailable (root cause): {root_reason}"));
+            // Trust: 2026-09-21 — the wording is SCOPED to this adapter on purpose.
+            // "typed CHC input unavailable (root cause): ..." read as a statement
+            // about the OBLIGATION, and it is not: it is this adapter declining to
+            // lower, while another engine may (and routinely does) discharge the
+            // same row. These lines are dumped for EVERY obligation once a
+            // compilation reports any failure, so a reader scanning the evidence
+            // trail of a red build meets "root cause" next to rows that are
+            // PROVED. Measured 2026-09-21: a postcondition row carrying this exact
+            // line is proved 6/7 with `0 unknown` once an unrelated row's budget
+            // suffices — the line never moved, the verdict did. It cost a full
+            // diagnosis cycle chasing a "missing metadata gap" that was this note.
+            // The root-cause surfacing itself is kept: it is what stopped the
+            // 574-row cascade the comment above records.
+            diagnostics.push(format!(
+                "trust-mc has no typed CHC input for this obligation (reason: {root_reason}); \
+                 this is this adapter declining to lower it, not a verdict — another engine \
+                 may still discharge the row"
+            ));
         }
         diagnostics.push(DIRECT_TYPED_CHC_INPUT_REASON.to_string());
         match self.config.proof_mode {
@@ -2577,7 +3093,21 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         bundle: &TrustContractBundle,
         obligation: &TrustObligation,
     ) -> Result<Option<ObligationEvidence>, String> {
-        let Some(input) = self.typed_chc_pdr_obligation_for(bundle, obligation)? else {
+        self.direct_typed_chc_pdr_evidence_for_with_contract_index(bundle, obligation, None)
+    }
+
+    fn direct_typed_chc_pdr_evidence_for_with_contract_index(
+        &self,
+        bundle: &TrustContractBundle,
+        obligation: &TrustObligation,
+        contract_indices: Option<&ContractChcCache>,
+    ) -> Result<Option<ObligationEvidence>, String> {
+        let Some(input) = self.typed_chc_pdr_obligation_for_with_contract_index(
+            bundle,
+            obligation,
+            contract_indices,
+        )?
+        else {
             return Ok(None);
         };
 
@@ -2631,7 +3161,7 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         obligation: &TrustObligation,
         public_semantic_digest: String,
         bundle_seal: FreshExactDirectChcPdrBundleSeal,
-        contract_indices: Option<&BTreeMap<String, Vec<usize>>>,
+        contract_indices: Option<&ContractChcCache>,
         deadline: Option<Instant>,
     ) -> Result<Option<FreshExactDirectChcPdrDispatch>, String> {
         if !is_typed_body_aware_exact_direct_obligation(obligation) {
@@ -2664,6 +3194,7 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         )))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn typed_chc_pdr_obligation_for(
         &self,
         bundle: &TrustContractBundle,
@@ -2686,7 +3217,7 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         &self,
         bundle: &TrustContractBundle,
         obligation: &TrustObligation,
-        contract_indices: Option<&BTreeMap<String, Vec<usize>>>,
+        contract_indices: Option<&ContractChcCache>,
     ) -> Result<Option<DirectTypedChcPdrInput>, String> {
         #[cfg(test)]
         TYPED_CHC_INPUT_LOOKUP_COUNT_FOR_TEST.with(|count| count.set(count.get() + 1));
@@ -2700,9 +3231,8 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         // input only through the ordinary public semantic contract link.
         let native_contract_id = native_trust_ir_synthetic_trust_mc_contract_id(obligation)?;
         let native_contract = if let Some(native_contract_id) = native_contract_id {
-            let contract = if let Some(contract_indices) = contract_indices {
-                let matching =
-                    contract_indices.get(native_contract_id).map_or(&[][..], Vec::as_slice);
+            let (contract, native_idx_opt) = if let Some(contract_indices) = contract_indices {
+                let matching = contract_indices.indices(native_contract_id);
                 let [index] = matching else {
                     return Err(format!(
                         "obligation `{}` names diagnostic native trust-mc synthetic contract `{native_contract_id}`, but the bundle contains {} matching contracts; expected exactly one",
@@ -2710,18 +3240,26 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
                         matching.len()
                     ));
                 };
-                bundle.contracts.get(*index).ok_or_else(|| {
+                let contract = bundle.contracts.get(*index).ok_or_else(|| {
                     "prevalidated native trust-mc contract index is out of bounds".to_string()
-                })?
+                })?;
+                (contract, Some(*index))
             } else {
-                native_trust_ir_synthetic_trust_mc_contract(bundle, obligation, native_contract_id)?
+                (
+                    native_trust_ir_synthetic_trust_mc_contract(
+                        bundle,
+                        obligation,
+                        native_contract_id,
+                    )?,
+                    None,
+                )
             };
             validate_native_trust_ir_synthetic_trust_mc_contract_value(
                 contract,
                 obligation,
                 native_contract_id,
             )?;
-            Some(contract)
+            Some((contract, native_idx_opt))
         } else {
             None
         };
@@ -2739,18 +3277,21 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
             return Ok(None);
         }
 
-        let matching_contracts: Vec<&TrustContract> = if let Some(contract_indices) =
-            contract_indices
-        {
-            contract_indices
-                .get(contract_id)
-                .into_iter()
-                .flatten()
-                .filter_map(|index| bundle.contracts.get(*index))
-                .collect()
-        } else {
-            bundle.contracts.iter().filter(|contract| contract.contract_id == contract_id).collect()
-        };
+        let matching_contracts: Vec<(&TrustContract, Option<usize>)> =
+            if let Some(contract_indices) = contract_indices {
+                contract_indices
+                    .indices(contract_id)
+                    .iter()
+                    .filter_map(|&index| bundle.contracts.get(index).map(|c| (c, Some(index))))
+                    .collect()
+            } else {
+                bundle
+                    .contracts
+                    .iter()
+                    .filter(|contract| contract.contract_id == contract_id)
+                    .map(|c| (c, None))
+                    .collect()
+            };
         if matching_contracts.is_empty() {
             return Err(format!(
                 "obligation {} references contract `{contract_id}`, but the bundle has no matching contract",
@@ -2758,30 +3299,45 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
             ));
         }
 
-        let mut typed_inputs = Vec::new();
-        for contract in matching_contracts {
-            if let Some(input) = trust_mc_typed_chc_input_from_contract(contract)? {
-                typed_inputs.push((contract, input));
+        let mut typed_inputs: Vec<(
+            &TrustContract,
+            Option<usize>,
+            std::borrow::Cow<'_, TrustMcTypedChcObligationInput>,
+        )> = Vec::new();
+        for (contract, idx_opt) in matching_contracts {
+            let parsed = if let (Some(cache), Some(idx)) = (contract_indices, idx_opt) {
+                cache.parsed_input(idx, contract)?.map(std::borrow::Cow::Borrowed)
+            } else {
+                trust_mc_typed_chc_input_from_contract(contract)?.map(std::borrow::Cow::Owned)
+            };
+            if let Some(input) = parsed {
+                typed_inputs.push((contract, idx_opt, input));
             }
         }
 
         match typed_inputs.as_slice() {
             [] => Ok(None),
-            [(contract, input)] => {
+            [(contract, idx_opt, input)] => {
+                let input_ref = input.as_ref();
                 let has_contract_binding = contract
                     .metadata
                     .iter()
                     .any(|entry| entry.key == TRUST_MC_TYPED_CHC_BINDING_METADATA_KEY);
                 let (input, input_digest) = if has_contract_binding
-                    || input.native_metadata.is_some()
+                    || input_ref.native_metadata.is_some()
                 {
                     // Legacy proof-capable typed contracts carry their own
                     // native material and complete binding. If either half is
                     // present, remain on the established admission path so a
                     // missing/malformed other half fails exactly as before.
                     (
-                        input.clone(),
-                        validate_trust_mc_typed_chc_binding(contract, obligation, input)?,
+                        input_ref.clone(),
+                        validate_trust_mc_typed_chc_binding_with_cache(
+                            contract,
+                            obligation,
+                            input_ref,
+                            contract_indices.zip(*idx_opt),
+                        )?,
                     )
                 } else {
                     // Compiler pre-build pivot: public semantics are committed
@@ -2792,46 +3348,61 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
                     // authorize the canonical input only after every semantic
                     // field is proven identical.
                     validate_compiler_canonical_trust_mc_typed_chc_contract(
-                        contract, obligation, input,
+                        contract, obligation, input_ref,
                     )?;
-                    let native_contract = native_contract.ok_or_else(|| {
+                    let (native_contract, native_idx_opt) = native_contract.ok_or_else(|| {
                         format!(
                             "compiler canonical typed trust_mc contract `{}` for public obligation `{}` requires one authenticated native synthetic-contract marker",
                             contract.contract_id, obligation.obligation_id
                         )
                     })?;
-                    let native_input = trust_mc_typed_chc_input_from_contract(native_contract)?
+                    let native_input =
+                        if let (Some(cache), Some(nidx)) = (contract_indices, native_idx_opt) {
+                            cache
+                                .parsed_input(nidx, native_contract)?
+                                .map(std::borrow::Cow::Borrowed)
+                        } else {
+                            trust_mc_typed_chc_input_from_contract(native_contract)?
+                                .map(std::borrow::Cow::Owned)
+                        }
                         .ok_or_else(|| {
                             format!(
                                 "authenticated native trust_mc marker contract `{}` has no typed CHC/PDR input",
                                 native_contract.contract_id
                             )
                         })?;
-                    validate_trust_mc_typed_chc_binding(
+                    validate_trust_mc_typed_chc_binding_with_cache(
                         native_contract,
                         obligation,
-                        &native_input,
+                        native_input.as_ref(),
+                        contract_indices.zip(native_idx_opt),
                     )?;
                     validate_compiler_canonical_trust_mc_semantic_projection(
                         contract,
                         native_contract,
                     )?;
-                    let native_obligation_id = native_input.obligation_id.clone().ok_or_else(|| {
-                        format!(
-                            "authenticated native trust_mc marker contract `{}` is missing its native obligation id",
-                            native_contract.contract_id
-                        )
-                    })?;
+                    let native_obligation_id =
+                        native_input.obligation_id.clone().ok_or_else(|| {
+                            format!(
+                                "authenticated native trust_mc marker contract `{}` is missing its native obligation id",
+                                native_contract.contract_id
+                            )
+                        })?;
                     let native_metadata = native_input.native_metadata.clone().ok_or_else(|| {
                         format!(
                             "authenticated native trust_mc marker contract `{}` is missing native typed CHC obligation metadata",
                             native_contract.contract_id
                         )
                     })?;
-                    let mut reconciled = input.clone();
+                    let mut reconciled = input_ref.clone();
                     reconciled.obligation_id = Some(native_obligation_id);
                     reconciled.native_metadata = Some(native_metadata);
-                    (reconciled, trust_mc_typed_chc_contract_input_digest(contract)?)
+                    let digest = if let (Some(cache), Some(idx)) = (contract_indices, *idx_opt) {
+                        cache.input_digest(idx, contract)?
+                    } else {
+                        trust_mc_typed_chc_contract_input_digest(contract)?
+                    };
+                    (reconciled, digest)
                 };
                 // Trust: a whole-function panic-freedom obligation AND the
                 // per-function trust-mc default-admission obligation each carry a
@@ -2959,7 +3530,11 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
             obligation_id, function_name, kind, stats.relation_count, stats.clause_count
         )];
 
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        // Trust (2026-10-17, gate-rca deadline): the solve is started and clocked by the
+        // solve deadline (the dispatch deadline or the native solve cutoff, whichever is
+        // earlier); its completion and its receipt are judged against `deadline` below.
+        let solve_deadline = self.solve_deadline(deadline);
+        if solve_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             let mut evidence =
                 self.evidence_with_status(bundle, obligation, EvidenceStatus::Timeout);
             evidence.artifacts.push(input.input_artifact);
@@ -2995,7 +3570,7 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         // remaining duration up rather than accidentally turning a positive
         // sub-millisecond budget into an unbounded zero-millisecond request.
         let configured_timeout = std::time::Duration::from_millis(self.config.timeout_ms);
-        let effective_timeout = if let Some(deadline) = deadline {
+        let effective_timeout = if let Some(deadline) = solve_deadline {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 let mut evidence =
                     self.evidence_with_status(bundle, obligation, EvidenceStatus::Timeout);
@@ -3285,7 +3860,7 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
                                 "native trust_mc typed CHC/PDR solver refuted the encoded VC; refutation demoted to unknown: a refutation witness was attached but failed validation ({reason}), so the refutation may reflect over-approximated (havoc'd) semantics or a detached/forged certificate rather than a reachable program failure; counterexample evidence is not a proof"
                             ),
                             TypedChcRefutationRejection::ProducerEncoding(reason) => format!(
-                                "native trust_mc typed CHC/PDR solver refuted the encoded VC; refutation demoted to unknown: {reason}. A refutation of an over-approximating encoding is a refutation of the ENCODING, not of the program — a satisfying model may assign a value the program can never produce — so it is not evidence even when its conclusion happens to be true. The obligation is UNPROVED, not disproved: this row reports a capability gap in the CHC construction (no loop transition relation is emitted), not a defect in the code"
+                                "native trust_mc typed CHC/PDR solver refuted the encoded VC; refutation demoted to unknown: {reason}. A refutation of an over-approximating encoding is a refutation of the ENCODING, not of the program — a satisfying model may assign a value the program can never produce — so it is not evidence even when its conclusion happens to be true. The obligation is UNPROVED, not disproved, by this lane: the demotion reports a gap in the CHC construction's attested fidelity and says nothing about whether the code is correct; another lane's verdict on the same row stands on that lane's own authority"
                             ),
                         };
                         self.typed_chc_pdr_solver_outcome_evidence(
@@ -3416,7 +3991,22 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
     ) -> ObligationEvidence {
         let mut evidence = self.evidence_with_status(bundle, obligation, status);
         evidence.artifacts.push(input_artifact);
-        evidence.artifacts.extend(artifacts);
+        // Trust (DEMOTED REFUTATION carried its counterexample): only a `Failed`
+        // verdict may carry a `Counterexample` artifact. A refutation the soundness
+        // gate DEMOTED reaches here as `Unknown`, and its solver model is a model of
+        // the ENCODING — it may assign a value the program can never produce (measured:
+        // `_2 = 2` for the discriminant of `T<NoExt>`, whose tag-2 variant is
+        // uninhabited). Publishing it under the `Counterexample` kind beside an
+        // `Unknown` status presented that model as a witness against the code while the
+        // same row's diagnostics said "UNPROVED, not disproved". Withheld, and the
+        // withholding is disclosed, so the row reports exactly what this lane knows.
+        let mut withheld_counterexamples = 0usize;
+        evidence.artifacts.extend(artifacts.into_iter().filter(|artifact| {
+            let keep = status == EvidenceStatus::Failed
+                || artifact.kind != EvidenceArtifactKind::Counterexample;
+            withheld_counterexamples += usize::from(!keep);
+            keep
+        }));
         sort_public_artifacts(&mut evidence.artifacts);
         // Only a `Failed` verdict carries a public counterexample record. The
         // typed-CHC Refuted route reaches this branch with `Failed` ONLY after
@@ -3432,6 +4022,12 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         }
         evidence.diagnostics.extend(diagnostics);
         evidence.diagnostics.push(summary);
+        if withheld_counterexamples > 0 {
+            evidence.diagnostics.push(format!(
+                "withheld {withheld_counterexamples} solver counterexample artifact(s): the verdict is {}, not failed, so the solver's model is a model of the encoded VC and is not published as a counterexample to the program",
+                evidence_status_label(status)
+            ));
+        }
         evidence
     }
 
@@ -4193,6 +4789,8 @@ enum TrustMcTypedChcBinaryOpInput {
     BvMul,
     BvUdiv,
     BvUrem,
+    /// Distinct additive v1 value operation; this does not prove definedness.
+    BvSrem,
     BvAnd,
     BvOr,
     BvXor,
@@ -4358,6 +4956,7 @@ fn trust_mc_typed_chc_binary_expr(
         TrustMcTypedChcBinaryOpInput::BvMul => lhs.try_bvmul(rhs),
         TrustMcTypedChcBinaryOpInput::BvUdiv => lhs.try_bvudiv(rhs),
         TrustMcTypedChcBinaryOpInput::BvUrem => lhs.try_bvurem(rhs),
+        TrustMcTypedChcBinaryOpInput::BvSrem => lhs.try_bvsrem(rhs),
         TrustMcTypedChcBinaryOpInput::BvAnd => lhs.try_bvand(rhs),
         TrustMcTypedChcBinaryOpInput::BvOr => lhs.try_bvor(rhs),
         TrustMcTypedChcBinaryOpInput::BvXor => lhs.try_bvxor(rhs),
@@ -4417,7 +5016,8 @@ fn trust_mc_typed_chc_input_from_contract(
     if schema != TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION {
         return Ok(None);
     }
-    serde_json::from_value(value.clone()).map(Some).map_err(|err| {
+    // Trust (T3 L4, C09d): the readers' depth bound, as every contract-predicate reader.
+    trust_types::json_depth::from_value_deep(value).map(Some).map_err(|err| {
         format!(
             "invalid typed trust_mc CHC/PDR input in contract `{}`: {err}",
             contract.contract_id
@@ -4499,41 +5099,94 @@ fn validate_compiler_canonical_trust_mc_typed_chc_contract(
     Ok(())
 }
 
+#[derive(Debug)]
+struct ContractChcCache {
+    by_id: std::collections::HashMap<String, Vec<usize>>,
+    parsed_inputs: Vec<std::sync::OnceLock<Result<Option<TrustMcTypedChcObligationInput>, String>>>,
+    input_digests: Vec<std::sync::OnceLock<Result<String, String>>>,
+}
+
+impl ContractChcCache {
+    #[cfg(any(test, feature = "trust-mc-native-trust-ir-bundle"))]
+    fn new(contracts: &[TrustContract]) -> Self {
+        let mut by_id = std::collections::HashMap::with_capacity(contracts.len());
+        for (index, contract) in contracts.iter().enumerate() {
+            by_id.entry(contract.contract_id.clone()).or_insert_with(Vec::new).push(index);
+        }
+        let parsed_inputs = (0..contracts.len()).map(|_| std::sync::OnceLock::new()).collect();
+        let input_digests = (0..contracts.len()).map(|_| std::sync::OnceLock::new()).collect();
+        Self { by_id, parsed_inputs, input_digests }
+    }
+
+    fn indices(&self, contract_id: &str) -> &[usize] {
+        self.by_id.get(contract_id).map_or(&[][..], Vec::as_slice)
+    }
+
+    fn parsed_input<'a>(
+        &'a self,
+        index: usize,
+        contract: &TrustContract,
+    ) -> Result<Option<&'a TrustMcTypedChcObligationInput>, String> {
+        let Some(slot) = self.parsed_inputs.get(index) else {
+            return Err("prevalidated native trust-mc contract index is out of bounds".to_string());
+        };
+        let cached = slot.get_or_init(|| trust_mc_typed_chc_input_from_contract(contract));
+        match cached {
+            Ok(opt) => Ok(opt.as_ref()),
+            Err(err) => Err(err.clone()),
+        }
+    }
+
+    fn input_digest(&self, index: usize, contract: &TrustContract) -> Result<String, String> {
+        let Some(slot) = self.input_digests.get(index) else {
+            return Err("prevalidated native trust-mc contract index is out of bounds".to_string());
+        };
+        slot.get_or_init(|| trust_mc_typed_chc_contract_input_digest(contract)).clone()
+    }
+}
+
+fn semantic_projection_object<'a>(
+    contract: &'a TrustContract,
+    role: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    let ContractPredicate::MathIr { schema, value } = &contract.predicate else {
+        return Err(format!(
+            "{role} typed trust_mc contract `{}` is not exact MathIr input",
+            contract.contract_id
+        ));
+    };
+    if schema != TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION {
+        return Err(format!(
+            "{role} typed trust_mc contract `{}` has schema `{schema}`, expected `{TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION}`",
+            contract.contract_id
+        ));
+    }
+    value.as_object().ok_or_else(|| {
+        format!(
+            "{role} typed trust_mc contract `{}` payload is not an object",
+            contract.contract_id
+        )
+    })
+}
+
 fn validate_compiler_canonical_trust_mc_semantic_projection(
     canonical_contract: &TrustContract,
     native_contract: &TrustContract,
 ) -> Result<(), String> {
-    let semantic_projection = |contract: &TrustContract, role: &str| {
-        let ContractPredicate::MathIr { schema, value } = &contract.predicate else {
-            return Err(format!(
-                "{role} typed trust_mc contract `{}` is not exact MathIr input",
-                contract.contract_id
-            ));
-        };
-        if schema != TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION {
-            return Err(format!(
-                "{role} typed trust_mc contract `{}` has schema `{schema}`, expected `{TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION}`",
-                contract.contract_id
-            ));
-        }
-        let mut value = value.clone();
-        let object = value.as_object_mut().ok_or_else(|| {
-            format!(
-                "{role} typed trust_mc contract `{}` payload is not an object",
-                contract.contract_id
-            )
-        })?;
-        // These are the only request-local fields. Every semantic field,
-        // including schema_version, origin, function, query, variables,
-        // relations, rules, and any future field, remains in the comparison.
-        object.remove("obligation_id");
-        object.remove("native_metadata");
-        Ok(value)
-    };
-
-    let canonical = semantic_projection(canonical_contract, "compiler canonical")?;
-    let native = semantic_projection(native_contract, "authenticated native marker")?;
-    if canonical != native {
+    let canonical = semantic_projection_object(canonical_contract, "compiler canonical")?;
+    let native = semantic_projection_object(native_contract, "authenticated native marker")?;
+    // These are the only request-local fields. Every semantic field,
+    // including schema_version, origin, function, query, variables,
+    // relations, rules, and any future field, remains in the comparison.
+    let is_semantic_key = |k: &str| k != "obligation_id" && k != "native_metadata";
+    let canonical_semantic_len = canonical.keys().filter(|k| is_semantic_key(k)).count();
+    let native_semantic_len = native.keys().filter(|k| is_semantic_key(k)).count();
+    let semantic_equal = canonical_semantic_len == native_semantic_len
+        && canonical
+            .iter()
+            .filter(|(k, _)| is_semantic_key(k))
+            .all(|(k, v)| native.get(k) == Some(v));
+    if !semantic_equal {
         return Err(format!(
             "compiler canonical typed trust_mc contract `{}` semantic CHC fields differ from authenticated native marker contract `{}` after reconciling only obligation_id and native_metadata",
             canonical_contract.contract_id, native_contract.contract_id
@@ -4560,10 +5213,11 @@ struct TrustMcTypedChcBindingDigest {
     value: String,
 }
 
-fn validate_trust_mc_typed_chc_binding(
+fn validate_trust_mc_typed_chc_binding_with_cache(
     contract: &TrustContract,
     obligation: &TrustObligation,
     input: &TrustMcTypedChcObligationInput,
+    cached_contract: Option<(&ContractChcCache, usize)>,
 ) -> Result<String, String> {
     let input_obligation_id = trust_mc_typed_chc_input_obligation_id(obligation, input);
     let obligation_binding =
@@ -4663,7 +5317,11 @@ fn validate_trust_mc_typed_chc_binding(
         &obligation.obligation_id,
     )?;
 
-    let contract_input_digest = trust_mc_typed_chc_contract_input_digest(contract)?;
+    let contract_input_digest = if let Some((cache, idx)) = cached_contract {
+        cache.input_digest(idx, contract)?
+    } else {
+        trust_mc_typed_chc_contract_input_digest(contract)?
+    };
     if binding.synthetic_chc_digest.value != contract_input_digest {
         return Err(format!(
             "typed trust_mc CHC/PDR binding synthetic digest mismatch: metadata has {}, parsed solver input has {contract_input_digest}",
@@ -4891,19 +5549,18 @@ fn trust_mc_typed_chc_contract_input_digest(contract: &TrustContract) -> Result<
 }
 
 fn trust_mc_typed_chc_value_digest(value: &serde_json::Value) -> Result<String, String> {
+    const DIGEST_PREFIX: &[u8] = b"trust-mc.typed-chc-obligation.digest.v1\0";
     let canonical = trust_types::canonical_json_value(value);
-    let bytes = serde_json::to_vec(&canonical).map_err(|error| {
+    let mut material = Vec::with_capacity(DIGEST_PREFIX.len() + 512);
+    material.extend_from_slice(DIGEST_PREFIX);
+    serde_json::to_writer(&mut material, &canonical).map_err(|error| {
         format!("failed to serialize canonical typed trust_mc CHC/PDR input: {error}")
     })?;
-    let mut material = b"trust-mc.typed-chc-obligation.digest.v1\0".to_vec();
-    material.extend(bytes);
     Ok(stable_sha256_hex(&material))
 }
 
 fn is_lowercase_sha256_hex(value: &str) -> bool {
-    value.len() == 64
-        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && value.bytes().all(|byte| !byte.is_ascii_uppercase())
+    value.len() == 64 && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn trust_mc_typed_chc_engine_input_artifact(
@@ -5528,6 +6185,27 @@ fn validate_bound_typed_chc_pdr_refutation_witness(
     expected_normalized_input: &TrustMcNativeTypedChcPdrNormalizedInput,
     expected_engine: trust_mc_core::ChcPdrEngine,
 ) -> Result<String, String> {
+    validate_bound_typed_chc_pdr_refutation_witness_with_options(
+        bundle,
+        witness,
+        obligation,
+        retained_obligation,
+        solved,
+        expected_normalized_input,
+        &trust_mc_core::ChcPdrSolveOptions::default().with_engine(expected_engine),
+    )
+}
+
+#[cfg(feature = "trust-mc-native-solver")]
+fn validate_bound_typed_chc_pdr_refutation_witness_with_options(
+    bundle: &TrustContractBundle,
+    witness: &trust_mc_core::ChcPdrRefutationWitness,
+    obligation: &TrustObligation,
+    retained_obligation: &trust_mc_core::MirChcPdrObligation,
+    solved: &trust_mc_driver::TypedChcPdrFullVerification,
+    expected_normalized_input: &TrustMcNativeTypedChcPdrNormalizedInput,
+    expected_options: &trust_mc_core::ChcPdrSolveOptions,
+) -> Result<String, String> {
     // The public request and every solver-side identity must agree. The
     // bundle is revalidated here so a detached call cannot reuse a witness
     // against an unauthenticated public row.
@@ -5579,12 +6257,12 @@ fn validate_bound_typed_chc_pdr_refutation_witness(
     if solved.cache_key.parts.obligation_set_hash != expected_normalized_input.obligation_set_hash {
         return Err("refutation cache key is detached from the retained obligation set".to_string());
     }
-    let verification_summary = validate_typed_chc_pdr_refutation_witness(
+    let verification_summary = validate_typed_chc_pdr_refutation_witness_with_options(
         witness,
         obligation,
         &solved.outcome.obligation_id,
         expected_normalized_input,
-        expected_engine,
+        expected_options,
     )?;
 
     // Validate the recognized machine-check kind's materialized payload shape.
@@ -5656,9 +6334,9 @@ fn validate_bound_typed_chc_pdr_refutation_witness(
     // debug traces and every future class fail closed until they expose an
     // equivalent independent replay surface.
     let fresh_replay_summary =
-        trust_mc_driver::independently_replay_typed_chc_pdr_refutation_witness(
+        trust_mc_driver::independently_replay_typed_chc_pdr_refutation_witness_with_options(
             retained_obligation,
-            expected_engine,
+            expected_options,
             witness,
         )
         .map_err(|error| {
@@ -5737,13 +6415,30 @@ fn validate_bound_typed_chc_pdr_refutation_witness(
 /// Production admission additionally calls
 /// [`validate_bound_typed_chc_pdr_refutation_witness`] to bind the solver route,
 /// cache key, payload schema, and materialized verdict artifact.
-#[cfg(feature = "trust-mc-native-solver")]
+#[cfg(all(test, feature = "trust-mc-native-solver"))]
 fn validate_typed_chc_pdr_refutation_witness(
     witness: &trust_mc_core::ChcPdrRefutationWitness,
     obligation: &TrustObligation,
     solver_obligation_id: &str,
     expected_normalized_input: &TrustMcNativeTypedChcPdrNormalizedInput,
     expected_engine: trust_mc_core::ChcPdrEngine,
+) -> Result<String, String> {
+    validate_typed_chc_pdr_refutation_witness_with_options(
+        witness,
+        obligation,
+        solver_obligation_id,
+        expected_normalized_input,
+        &trust_mc_core::ChcPdrSolveOptions::default().with_engine(expected_engine),
+    )
+}
+
+#[cfg(feature = "trust-mc-native-solver")]
+fn validate_typed_chc_pdr_refutation_witness_with_options(
+    witness: &trust_mc_core::ChcPdrRefutationWitness,
+    obligation: &TrustObligation,
+    solver_obligation_id: &str,
+    expected_normalized_input: &TrustMcNativeTypedChcPdrNormalizedInput,
+    expected_options: &trust_mc_core::ChcPdrSolveOptions,
 ) -> Result<String, String> {
     if witness.obligation_id != solver_obligation_id {
         return Err(format!(
@@ -5769,10 +6464,11 @@ fn validate_typed_chc_pdr_refutation_witness(
         ));
     }
 
-    let expected_semantic_config = trust_mc_driver::typed_chc_pdr_semantic_config_sha256(
-        expected_engine,
-        expected_normalized_input.route,
-    );
+    let expected_semantic_config =
+        trust_mc_driver::typed_chc_pdr_semantic_config_sha256_for_options(
+            expected_options,
+            expected_normalized_input.route,
+        );
     if witness.semantic_config_sha256 != expected_semantic_config {
         return Err(format!(
             "witness semantic-configuration digest {} does not match the consumer-recomputed digest {}",
@@ -7547,6 +8243,32 @@ fn trust_mc_obligation_identity_matches(obligation: &TrustObligation, candidate:
     }
 }
 
+/// The rows of the consumer's PRE-SOLVE translation that can carry a refuted
+/// transport row's identity: every retained row whose lookup key is
+/// `lookup_key` (an exact obligation id always shares its lookup key).
+///
+/// `translated_by_obligation` keeps the first row per key and
+/// `translated_counts` counts them all, so the set is complete exactly when the
+/// count is one. That is the only count a deferred obligation reaches the
+/// transport with: a key with two or more rows is refused before solving
+/// ("returned duplicate translated obligations"). Any other count yields no
+/// row, which the refutation gate demotes to Unknown; it never hands the gate a
+/// partial set from which one row could be singled out.
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+fn native_trust_ir_retained_rows_for<'a>(
+    translated_by_obligation: &'a BTreeMap<
+        String,
+        trust_mc_trust_bmc::NativeTrustMcChcPdrObligation,
+    >,
+    translated_counts: &BTreeMap<String, usize>,
+    lookup_key: &str,
+) -> Vec<&'a trust_mc_trust_bmc::NativeTrustMcChcPdrObligation> {
+    match (translated_counts.get(lookup_key), translated_by_obligation.get(lookup_key)) {
+        (Some(1), Some(row)) => vec![row],
+        _ => Vec::new(),
+    }
+}
+
 fn native_trust_mc_obligation_lookup_key(obligation_id: &str) -> String {
     // Compiler metadata uses the crate token `trust-mc`, while trust-mc's
     // native transport IDs use the identifier token `trust_mc`. Request and
@@ -7559,19 +8281,23 @@ fn native_trust_mc_obligation_lookup_key(obligation_id: &str) -> String {
 }
 
 fn native_trust_ir_expected_trust_mc_obligation_id(obligation: &TrustObligation) -> Option<String> {
-    let suite =
-        obligation_metadata_value(obligation, TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY)?;
-    if suite != "trust-mc" {
+    use trust_verifier_api::native_routing_identity::{
+        NativeRoutingIdentityPolicy, SuiteComparison, parse_native_routing_identity,
+    };
+    let identity = parse_native_routing_identity(
+        obligation,
+        NativeRoutingIdentityPolicy {
+            canonical_id_fallback: false,
+            canonical_metadata_numbers: true,
+            suite_comparison: SuiteComparison::VerifierAliases,
+        },
+    )
+    .ok()?;
+    if identity.suite.as_deref()? != "trust-mc" {
         return None;
     }
-    let request_id = canonical_u32_metadata_value(obligation_metadata_value(
-        obligation,
-        TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY,
-    )?)?;
-    let proof_id = canonical_u32_metadata_value(obligation_metadata_value(
-        obligation,
-        TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY,
-    )?)?;
+    let request_id = identity.request_id?;
+    let proof_id = identity.proof_obligation_id?;
     Some(format!("trust_ir-native-trust-mc-request-{request_id}-proof-{proof_id}"))
 }
 
@@ -7586,15 +8312,15 @@ fn native_trust_ir_expected_trust_mc_obligation_id(obligation: &TrustObligation)
 #[derive(Debug)]
 struct NativeTrustIrPublicClaimBindingContext {
     canonical_public_digests: trust_verifier_api::CanonicalObligationSemanticDigestIndex,
-    trust_mc_requests: BTreeMap<u32, Vec<usize>>,
-    request_proof_occurrences: BTreeMap<(usize, u32), usize>,
-    proof_owners: BTreeMap<u32, Vec<u32>>,
-    proofs: BTreeMap<u32, Vec<usize>>,
-    functions: BTreeMap<u32, Vec<usize>>,
-    obligation_sources: BTreeMap<u32, Vec<usize>>,
-    monomorphizations: BTreeMap<u32, Vec<usize>>,
-    replay_assertions: BTreeMap<(usize, u32), Vec<usize>>,
-    contracts: BTreeMap<String, Vec<usize>>,
+    trust_mc_requests: std::collections::HashMap<u32, Vec<usize>>,
+    request_proof_occurrences: std::collections::HashMap<(usize, u32), usize>,
+    proof_owners: std::collections::HashMap<u32, Vec<u32>>,
+    proofs: std::collections::HashMap<u32, Vec<usize>>,
+    functions: std::collections::HashMap<u32, Vec<usize>>,
+    obligation_sources: std::collections::HashMap<u32, Vec<usize>>,
+    monomorphizations: std::collections::HashMap<u32, Vec<usize>>,
+    replay_assertions: std::collections::HashMap<(usize, u32), Vec<usize>>,
+    contracts: ContractChcCache,
 }
 
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
@@ -7614,16 +8340,22 @@ impl NativeTrustIrPublicClaimBindingContext {
                 format!("cannot bind/digest the canonical public-obligation inventory: {reason}")
             })?;
 
-        let mut trust_mc_requests = BTreeMap::<u32, Vec<usize>>::new();
-        let mut request_proof_occurrences = BTreeMap::<(usize, u32), usize>::new();
-        let mut proof_owners = BTreeMap::<u32, Vec<u32>>::new();
-        let mut replay_assertions = BTreeMap::<(usize, u32), Vec<usize>>::new();
+        let req_len = native_bundle.requests.len();
+        let proof_len = native_bundle.module.proof_obligations.len();
+        let mut trust_mc_requests =
+            std::collections::HashMap::<u32, Vec<usize>>::with_capacity(req_len);
+        let mut request_proof_occurrences =
+            std::collections::HashMap::<(usize, u32), usize>::with_capacity(proof_len);
+        let mut proof_owners = std::collections::HashMap::<u32, Vec<u32>>::with_capacity(proof_len);
+        let mut replay_assertions =
+            std::collections::HashMap::<(usize, u32), Vec<usize>>::with_capacity(proof_len);
         for (request_index, request) in native_bundle.requests.iter().enumerate() {
             let trust_ir::NativeVerificationRequest::TrustMc(request) = request else {
                 continue;
             };
             trust_mc_requests.entry(request.id.index()).or_default().push(request_index);
-            let mut owned_proofs = BTreeSet::new();
+            let mut owned_proofs =
+                std::collections::HashSet::with_capacity(request.obligations.len());
             for proof in &request.obligations {
                 *request_proof_occurrences.entry((request_index, proof.index())).or_default() += 1;
                 if owned_proofs.insert(proof.index()) {
@@ -7642,26 +8374,29 @@ impl NativeTrustIrPublicClaimBindingContext {
             }
         }
 
-        let mut proofs = BTreeMap::<u32, Vec<usize>>::new();
+        let mut proofs = std::collections::HashMap::<u32, Vec<usize>>::with_capacity(proof_len);
         for (index, proof) in native_bundle.module.proof_obligations.iter().enumerate() {
             proofs.entry(proof.id.index()).or_default().push(index);
         }
-        let mut functions = BTreeMap::<u32, Vec<usize>>::new();
+        let mut functions = std::collections::HashMap::<u32, Vec<usize>>::with_capacity(
+            native_bundle.module.functions.len(),
+        );
         for (index, function) in native_bundle.module.functions.iter().enumerate() {
             functions.entry(function.id.index()).or_default().push(index);
         }
-        let mut obligation_sources = BTreeMap::<u32, Vec<usize>>::new();
+        let mut obligation_sources = std::collections::HashMap::<u32, Vec<usize>>::with_capacity(
+            native_bundle.compiler_facts.obligation_sources.len(),
+        );
         for (index, source) in native_bundle.compiler_facts.obligation_sources.iter().enumerate() {
             obligation_sources.entry(source.obligation.index()).or_default().push(index);
         }
-        let mut monomorphizations = BTreeMap::<u32, Vec<usize>>::new();
+        let mut monomorphizations = std::collections::HashMap::<u32, Vec<usize>>::with_capacity(
+            native_bundle.compiler_facts.monomorphizations.len(),
+        );
         for (index, fact) in native_bundle.compiler_facts.monomorphizations.iter().enumerate() {
             monomorphizations.entry(fact.id.index()).or_default().push(index);
         }
-        let mut contracts = BTreeMap::<String, Vec<usize>>::new();
-        for (index, contract) in public_bundle.contracts.iter().enumerate() {
-            contracts.entry(contract.contract_id.clone()).or_default().push(index);
-        }
+        let contracts = ContractChcCache::new(&public_bundle.contracts);
 
         Ok(Self {
             canonical_public_digests,
@@ -7679,12 +8414,79 @@ impl NativeTrustIrPublicClaimBindingContext {
 }
 
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativePublicClaimKind {
+    ExistingMcClaim,
+    RawPostcondition { admission_stop: Option<NativeRawPostconditionStop> },
+}
+
+/// An extra replay premise is an admission refusal, not an encoding gap.
+/// An Assume instruction is part of the submitted program instead; the raw
+/// source clause still has no MC encoding, and a fallback must model that body.
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeRawPostconditionStop {
+    ReplayAssumptions,
+}
+
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+impl NativeRawPostconditionStop {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::ReplayAssumptions => {
+                "raw postcondition request carries native replay assumptions"
+            }
+        }
+    }
+}
+
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+fn is_raw_source_postcondition(
+    bundle: &TrustContractBundle,
+    public: &TrustObligation,
+) -> Result<bool, String> {
+    let markers: Vec<_> = public
+        .metadata
+        .iter()
+        .filter(|entry| entry.key == "trust.ir.raw-source-postcondition.v1")
+        .collect();
+    if markers.len() > 1 || markers.first().is_some_and(|entry| entry.value != "query-bound") {
+        return Err("raw source postcondition marker is not unique and exact".into());
+    }
+    if !trust_verifier_api::native_contract_claim::has_raw_source_postcondition_contract(
+        bundle, public,
+    ) {
+        return Ok(false);
+    }
+    if public.metadata.iter().any(|entry| entry.key.starts_with("trust.vc.")) {
+        return Ok(false);
+    }
+    if let Some(encoded) =
+        obligation_metadata_value(public, trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY)
+    {
+        let context: trust_verifier_api::ObligationContext =
+            trust_types::json_depth::from_str_deep(encoded)
+                .map_err(|error| format!("invalid raw postcondition context: {error}"))?;
+        if matches!(
+            context.origin,
+            trust_verifier_api::ObligationOrigin::VerificationCondition { .. }
+        ) {
+            return Ok(false);
+        }
+    }
+    if !public.summary_facts.is_empty() {
+        return Err("raw source postcondition carries unadmitted summary assumptions".into());
+    }
+    Ok(true)
+}
+
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
 fn validate_native_trust_ir_public_claim_binding(
     public_bundle: &TrustContractBundle,
     public_obligation: &TrustObligation,
     native_bundle: &trust_ir::NativeVerificationBundle,
     context: &NativeTrustIrPublicClaimBindingContext,
-) -> Result<(), String> {
+) -> Result<NativePublicClaimKind, String> {
     let canonical_public_digest = context
         .canonical_public_digests
         .get(&public_obligation.obligation_id)
@@ -7827,49 +8629,31 @@ fn validate_native_trust_ir_public_claim_binding(
             proof_id.index()
         )
     })?;
-    if embedded_public.obligation_id != public_obligation.obligation_id {
-        return Err(format!(
+    use trust_verifier_api::native_contract_claim::NativePublicIdentityError;
+    trust_verifier_api::native_contract_claim::validate_native_public_obligation_identity(
+        proof,
+        &public_obligation.obligation_id,
+        canonical_public_digest,
+    )
+    .map_err(|error| match error {
+        NativePublicIdentityError::ObligationIdMismatch { actual } => format!(
             "native TrustIr proof obligation {} embeds public obligation id {:?}, but the verifier requested {:?}",
-            proof_id.index(),
-            embedded_public.obligation_id,
-            public_obligation.obligation_id
-        ));
-    }
-    let expected_embedded_digest = format!("sha256:{canonical_public_digest}");
-    if embedded_public.semantic_digest.algorithm != trust_ir::ProofDigestAlgorithm::Sha256
-        || embedded_public.semantic_digest.is_zero()
-        || embedded_public.semantic_digest.to_string() != expected_embedded_digest
-    {
-        return Err(format!(
-            "native TrustIr proof obligation {} embedded public semantic digest {} does not match canonical public claim {expected_embedded_digest}",
-            proof_id.index(),
-            embedded_public.semantic_digest
-        ));
-    }
+            proof_id.index(), actual, public_obligation.obligation_id
+        ),
+        NativePublicIdentityError::SemanticDigestMismatch { actual } => format!(
+            "native TrustIr proof obligation {} embedded public semantic digest {} does not match canonical public claim sha256:{canonical_public_digest}",
+            proof_id.index(), actual
+        ),
+        other => format!(
+            "native TrustIr proof obligation {} has an invalid public-obligation identity: {other}",
+            proof_id.index()
+        ),
+    })?;
 
-    let expected_source_id = public_obligation
-        .contract_id
-        .as_deref()
-        .or(public_obligation.proof_item_id.as_deref())
-        .unwrap_or(&public_obligation.obligation_id);
-    let expected_assertion_id = format!("trust-assertion:{expected_source_id}");
-    if embedded_source.source_id != expected_source_id
-        || embedded_source.assertion_id != expected_assertion_id
-    {
-        return Err(format!(
-            "native TrustIr proof obligation {} source/assertion identity {:?}/{:?} does not match canonical public projection {:?}/{:?}",
-            proof_id.index(),
-            embedded_source.source_id,
-            embedded_source.assertion_id,
-            expected_source_id,
-            expected_assertion_id
-        ));
-    }
-    validate_native_trust_ir_public_source_range(
+    trust_verifier_api::native_contract_claim::validate_native_public_source_projection(
+        &native_bundle.module,
+        proof,
         public_obligation,
-        native_bundle,
-        proof_id,
-        embedded_source.range,
     )?;
 
     let matching_source_indices =
@@ -7977,12 +8761,37 @@ fn validate_native_trust_ir_public_claim_binding(
             proof_id.index()
         )
     })?;
-    validate_native_trust_ir_public_formula_binding(
-        public_obligation,
-        proof_id,
-        embedded_source,
-        formula,
-    )?;
+    let claim = if is_raw_source_postcondition(public_bundle, public_obligation)? {
+        trust_verifier_api::native_contract_claim::validate_native_public_contract_claim(
+            &native_bundle.module,
+            proof,
+            public_bundle,
+            public_obligation,
+        )?;
+        let admission_stop = if request
+            .provenance
+            .replay_context
+            .atoms
+            .iter()
+            .any(|atom| atom.kind == trust_ir::NativeReplayAtomKind::Assumption)
+        {
+            Some(NativeRawPostconditionStop::ReplayAssumptions)
+        } else {
+            None
+        };
+        // This candidate leaves the validator only after the remaining replay
+        // assertion and CHC marker checks below. A later identity error must
+        // remain an unclassified error, even when the body also has assumptions.
+        NativePublicClaimKind::RawPostcondition { admission_stop }
+    } else {
+        validate_native_trust_ir_public_formula_binding(
+            public_obligation,
+            proof_id,
+            embedded_source,
+            formula,
+        )?;
+        NativePublicClaimKind::ExistingMcClaim
+    };
     let replay_assertion_indices = context
         .replay_assertions
         .get(&(*request_index, proof_id.index()))
@@ -8015,7 +8824,7 @@ fn validate_native_trust_ir_public_claim_binding(
         request_id,
         proof_id.index(),
     )?;
-    Ok(())
+    Ok(claim)
 }
 
 /// The exact inverse of the compiler's `native_trust_ir_route_for_api_obligation`,
@@ -8119,55 +8928,6 @@ fn native_trust_ir_obligation_cause_projection(
 }
 
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
-fn validate_native_trust_ir_public_source_range(
-    public: &TrustObligation,
-    native_bundle: &trust_ir::NativeVerificationBundle,
-    proof_id: trust_ir::ProofId,
-    embedded: Option<trust_ir::ProofObligationSourceRange>,
-) -> Result<(), String> {
-    match (public.source.file.as_deref(), embedded) {
-        (None, None) => Ok(()),
-        (None, Some(range)) => Err(format!(
-            "native TrustIr proof obligation {} embeds source range {range:?}, but public source has no file",
-            proof_id.index()
-        )),
-        (Some(file), None) => Err(format!(
-            "native TrustIr proof obligation {} omits its source range for public file {file:?}",
-            proof_id.index()
-        )),
-        (Some(file), Some(range)) => {
-            let embedded_file = native_bundle.module.file_name(range.file).ok_or_else(|| {
-                format!(
-                    "native TrustIr proof obligation {} source range references missing file index {}",
-                    proof_id.index(),
-                    range.file
-                )
-            })?;
-            let start_line = public.source.line.unwrap_or_default();
-            let start_col = public.source.column.unwrap_or_default();
-            let end_line = public.source.end_line.unwrap_or(start_line);
-            let end_col = public.source.end_column.unwrap_or(start_col);
-            if embedded_file != file
-                || range.start_line != start_line
-                || range.start_col != start_col
-                || range.end_line != end_line
-                || range.end_col != end_col
-            {
-                return Err(format!(
-                    "native TrustIr proof obligation {} embedded source range {embedded_file:?}:{}:{}-{}:{} does not exactly match public source {file:?}:{start_line}:{start_col}-{end_line}:{end_col}",
-                    proof_id.index(),
-                    range.start_line,
-                    range.start_col,
-                    range.end_line,
-                    range.end_col
-                ));
-            }
-            Ok(())
-        }
-    }
-}
-
-#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
 fn validate_native_trust_ir_public_formula_binding(
     public: &TrustObligation,
     proof_id: trust_ir::ProofId,
@@ -8206,10 +8966,13 @@ fn validate_native_trust_ir_public_formula_binding(
             }
             if public.contract_id.is_some() || public.proof_item_id.is_some() {
                 return Err(format!(
-                    "public obligation `{}` references semantic contract/proof-item data but its native TrustIr proof unit carries no public formula metadata",
+                    "public obligation `{}` has no public formula metadata encoding its semantic contract/proof-item goal; source-location identity alone does not encode that goal",
                     public.obligation_id
                 ));
             }
+            // The source.v1 record is closed to these four fields. Public identity
+            // is reconciled separately through the embedded public digest and
+            // compiler facts; duplicating it here changes the producer's schema.
             let expected_payload = serde_json::json!({
                 "source_id": embedded_source.source_id,
                 "assertion_id": embedded_source.assertion_id,
@@ -8223,7 +8986,6 @@ fn validate_native_trust_ir_public_formula_binding(
                     "line_end": public.source.end_line.unwrap_or_else(|| public.source.line.unwrap_or_default()),
                     "col_end": public.source.end_column.unwrap_or_else(|| public.source.column.unwrap_or_default()),
                 },
-                "public_obligation_id": public.obligation_id,
             })
             .to_string();
             if formula.schema != TRUST_IR_OBLIGATION_SOURCE_FORMULA_SCHEMA
@@ -8253,8 +9015,7 @@ fn validate_native_trust_ir_public_chc_marker_binding(
 ) -> Result<(), String> {
     let marker_id = native_trust_ir_synthetic_trust_mc_contract_id(obligation)?;
     let marker = if let Some(marker_id) = marker_id {
-        let matching_marker_indices =
-            context.contracts.get(marker_id).map_or(&[][..], Vec::as_slice);
+        let matching_marker_indices = context.contracts.indices(marker_id);
         let [marker_index] = matching_marker_indices else {
             return Err(format!(
                 "obligation `{}` names diagnostic native trust-mc synthetic contract `{marker_id}`, but the bundle contains {} matching contracts; expected exactly one",
@@ -8262,17 +9023,25 @@ fn validate_native_trust_ir_public_chc_marker_binding(
                 matching_marker_indices.len()
             ));
         };
-        let marker = &bundle.contracts[*marker_index];
-        validate_native_trust_ir_synthetic_trust_mc_contract_value(marker, obligation, marker_id)?;
-        let marker_input = trust_mc_typed_chc_input_from_contract(marker)?.ok_or_else(|| {
-            format!(
-                "authenticated native trust-mc marker contract `{marker_id}` has no typed CHC input"
-            )
+        let marker = bundle.contracts.get(*marker_index).ok_or_else(|| {
+            "prevalidated native trust-mc contract index is out of bounds".to_string()
         })?;
-        validate_trust_mc_typed_chc_binding(marker, obligation, &marker_input)?;
+        validate_native_trust_ir_synthetic_trust_mc_contract_value(marker, obligation, marker_id)?;
+        let marker_input =
+            context.contracts.parsed_input(*marker_index, marker)?.ok_or_else(|| {
+                format!(
+                    "authenticated native trust-mc marker contract `{marker_id}` has no typed CHC input"
+                )
+            })?;
+        validate_trust_mc_typed_chc_binding_with_cache(
+            marker,
+            obligation,
+            marker_input,
+            Some((&context.contracts, *marker_index)),
+        )?;
         validate_native_trust_ir_typed_chc_function_projection(
             marker,
-            &marker_input,
+            marker_input,
             native_function_name,
             native_function_id,
             request_id,
@@ -8287,8 +9056,7 @@ fn validate_native_trust_ir_public_chc_marker_binding(
     let Some(contract_id) = obligation.contract_id.as_deref() else {
         return Ok(());
     };
-    let matching_contract_indices =
-        context.contracts.get(contract_id).map_or(&[][..], Vec::as_slice);
+    let matching_contract_indices = context.contracts.indices(contract_id);
     let [contract_index] = matching_contract_indices else {
         return Err(format!(
             "public obligation `{}` references contract `{contract_id}`, but the bundle contains {} exact matches",
@@ -8296,13 +9064,15 @@ fn validate_native_trust_ir_public_chc_marker_binding(
             matching_contract_indices.len()
         ));
     };
-    let contract = &bundle.contracts[*contract_index];
-    let Some(input) = trust_mc_typed_chc_input_from_contract(contract)? else {
+    let contract = bundle.contracts.get(*contract_index).ok_or_else(|| {
+        "prevalidated native trust-mc contract index is out of bounds".to_string()
+    })?;
+    let Some(input) = context.contracts.parsed_input(*contract_index, contract)? else {
         return Ok(());
     };
     validate_native_trust_ir_typed_chc_function_projection(
         contract,
-        &input,
+        input,
         native_function_name,
         native_function_id,
         request_id,
@@ -8312,11 +9082,16 @@ fn validate_native_trust_ir_public_chc_marker_binding(
     let carries_binding =
         contract.metadata.iter().any(|entry| entry.key == TRUST_MC_TYPED_CHC_BINDING_METADATA_KEY);
     if carries_binding || input.native_metadata.is_some() {
-        validate_trust_mc_typed_chc_binding(contract, obligation, &input)?;
+        validate_trust_mc_typed_chc_binding_with_cache(
+            contract,
+            obligation,
+            input,
+            Some((&context.contracts, *contract_index)),
+        )?;
         return Ok(());
     }
 
-    validate_compiler_canonical_trust_mc_typed_chc_contract(contract, obligation, &input)?;
+    validate_compiler_canonical_trust_mc_typed_chc_contract(contract, obligation, input)?;
     let Some((marker, _)) = marker else {
         return Err(format!(
             "compiler canonical typed trust-mc contract `{contract_id}` has no authenticated native marker"
@@ -8565,6 +9340,7 @@ impl NativeTrustIrChcPdrAuthorizedProof {
     fn try_from_bundle_evidence(
         evidence: trust_mc_driver::NativeTrustIrChcPdrEvidence,
     ) -> Result<Self, String> {
+        validate_native_trust_mc_row_request_config(&evidence.translated)?;
         // Derive proof identity from the exact translated request before
         // consulting any producer-authored verification/cache/transport field.
         let expected_normalized_input =
@@ -8636,6 +9412,34 @@ impl NativeTrustIrChcPdrAuthorizedProof {
             self.translation_diagnostic_count
         )
     }
+}
+
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+fn validate_native_trust_mc_row_request_config(
+    row: &trust_mc_trust_bmc::NativeTrustMcChcPdrObligation,
+) -> Result<(), String> {
+    if row.obligation.native_metadata.as_ref().and_then(|metadata| metadata.request_config.as_ref())
+        != Some(row.request_config.binding())
+    {
+        return Err("native TrustIr pre-solve request configuration differs from its typed obligation binding".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+fn validate_native_trust_mc_consumer_request_config(
+    fresh: &trust_mc_trust_bmc::NativeTrustMcChcPdrObligation,
+    solved: &trust_mc_trust_bmc::NativeTrustMcChcPdrObligation,
+) -> Result<(), String> {
+    validate_native_trust_mc_row_request_config(fresh)?;
+    validate_native_trust_mc_row_request_config(solved)?;
+    if fresh.request_config != solved.request_config {
+        return Err(
+            "solved native request configuration differs from the independent pre-solve request"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
@@ -9092,6 +9896,12 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    mod refutation_scope;
+
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    mod source_envelope;
+
     const TEST_SOURCE_DIGEST: &str =
         "1111111111111111111111111111111111111111111111111111111111111111";
     const TEST_VC_DIGEST: &str = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -9145,9 +9955,9 @@ mod tests {
         ]);
     }
 
-    /// Test-only positive source-fidelity premise. Production compiler output
-    /// deliberately cannot call this helper and currently emits no `exact`
-    /// attestation; these synthetic rows isolate the downstream witness gate.
+    /// Test-only flat typed-VC fidelity premise. The compiler now emits `exact`
+    /// for its admitted flat fragment; this helper is not a native source
+    /// correspondence capability.
     #[cfg(feature = "trust-mc-native-solver")]
     fn attest_synthetic_typed_chc_encoding_exact(obligation: &mut TrustObligation) {
         obligation.metadata.push(MetadataEntry {
@@ -10158,7 +10968,7 @@ mod tests {
             fb.build();
         }
 
-        let mut module = mb.build();
+        let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
         module.target_info = Some(compiler_style_proof_grade_target());
         let trust_mc_function = module
             .functions
@@ -10237,11 +11047,7 @@ mod tests {
             function: trust_mc_function,
             obligations: vec![ProofId::new(0)],
             lineage_roots: vec![ProofLineageId::new(0)],
-            options: {
-                let mut options = trust_ir::TrustMcRequestOptions::default();
-                options.chc.emit_horn_clauses = true;
-                options
-            },
+            options: trust_ir_bridge::trust_mc_chc_request_options(),
             diagnostics: Default::default(),
             provenance: NativeRequestProvenance::trust_mc(
                 NativeToolIdentity::new("trust-mc")
@@ -10349,7 +11155,7 @@ mod tests {
             fb.build();
         }
 
-        let mut module = mb.build();
+        let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
         module.target_info = Some(compiler_style_proof_grade_target());
         let trust_mc_function = module
             .functions
@@ -10426,11 +11232,7 @@ mod tests {
             function: trust_mc_function,
             obligations: vec![ProofId::new(0)],
             lineage_roots: vec![ProofLineageId::new(0)],
-            options: {
-                let mut options = trust_ir::TrustMcRequestOptions::default();
-                options.chc.emit_horn_clauses = true;
-                options
-            },
+            options: trust_ir_bridge::trust_mc_chc_request_options(),
             diagnostics: Default::default(),
             provenance: NativeRequestProvenance::trust_mc(
                 NativeToolIdentity::new("trust-mc")
@@ -10538,7 +11340,7 @@ mod tests {
             fb.build();
         }
 
-        let mut module = mb.build();
+        let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
         module.target_info = Some(compiler_style_proof_grade_target());
         let safe_function = module
             .functions
@@ -10667,11 +11469,7 @@ mod tests {
             function: safe_function,
             obligations: vec![ProofId::new(0)],
             lineage_roots: vec![ProofLineageId::new(0)],
-            options: {
-                let mut options = trust_ir::TrustMcRequestOptions::default();
-                options.chc.emit_horn_clauses = true;
-                options
-            },
+            options: trust_ir_bridge::trust_mc_chc_request_options(),
             diagnostics: Default::default(),
             provenance: NativeRequestProvenance::trust_mc(
                 NativeToolIdentity::new("trust-mc")
@@ -10716,11 +11514,7 @@ mod tests {
             function: failing_function,
             obligations: vec![ProofId::new(1)],
             lineage_roots: vec![ProofLineageId::new(1)],
-            options: {
-                let mut options = trust_ir::TrustMcRequestOptions::default();
-                options.chc.emit_horn_clauses = true;
-                options
-            },
+            options: trust_ir_bridge::trust_mc_chc_request_options(),
             diagnostics: Default::default(),
             provenance: NativeRequestProvenance::trust_mc(
                 NativeToolIdentity::new("trust-mc")
@@ -10835,6 +11629,372 @@ mod tests {
         ]);
         assert!(obligation_is_whole_function_panic_freedom(&bundle, &bundle.obligations[0]));
         bundle
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn whole_function_receipt_survives_the_actual_native_solve() {
+        let bundle = compiler_style_panic_freedom_public_bundle();
+        let mut native =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        // Unit-only model of the existing audited live compiler issuer. This
+        // is not evidence that the real compiler lowering path was executed.
+        let source = trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut native)
+            .expect("valid unit fixture source authority");
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let mut outcome = adapter.evidence_from_native_trust_ir_bundle_with_source_authority_and_deadline_and_fresh_receipts(
+            &bundle, &bundle.obligations, &native, &source,
+            Some(Instant::now() + std::time::Duration::from_secs(10)),
+        );
+        assert_eq!(outcome.evidence.len(), 1);
+        assert_eq!(outcome.evidence[0].status, EvidenceStatus::Proved, "{outcome:#?}");
+        assert!(outcome.fresh_exact_direct_receipts.is_empty(), "not a direct-formula proof");
+        let id = &bundle.obligations[0].obligation_id;
+        assert!(
+            outcome.fresh_whole_function_receipts.remove(id).is_some(),
+            "the real whole-module proof must retain its own affine receipt"
+        );
+        assert!(
+            outcome.fresh_whole_function_receipts.remove(id).is_none(),
+            "one receipt cannot be consumed twice"
+        );
+    }
+
+    /// Trust (C1, 2026-11-06): with live source reference facts, the pre-solve
+    /// translation AND the solve both go through trust-mc's facts entries. The
+    /// whole-function receipt then binds (it compares the pre-solve row with the
+    /// solved one), so the two translations agree.
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn source_reference_facts_reach_both_pre_solve_translation_and_solve() {
+        let bundle = compiler_style_panic_freedom_public_bundle();
+        let mut native =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let source = trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut native)
+            .expect("valid unit fixture source authority");
+        // An exact, empty claim set: the entries are selected by the facts'
+        // presence, never by how many claims they carry.
+        let facts =
+            SourceReferenceFacts::from_live_source_lowering(&native, &source, vec![], vec![])
+                .expect("an empty claim set binds to the exact live bundle");
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST.with(|count| count.set((0, 0)));
+        let mut outcome = adapter
+            .evidence_from_native_trust_ir_bundle_with_source_reference_facts_and_deadline_and_fresh_receipts(
+                &bundle,
+                &bundle.obligations,
+                &native,
+                &source,
+                &facts,
+                Some(Instant::now() + std::time::Duration::from_secs(10)),
+            );
+        let (translated, solved) =
+            NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST.with(std::cell::Cell::get);
+        assert_eq!(translated, 1, "the pre-solve translation must use the facts entry");
+        assert_eq!(solved, 1, "the solve must use the facts entry");
+        assert_eq!(outcome.evidence[0].status, EvidenceStatus::Proved, "{outcome:#?}");
+        let id = &bundle.obligations[0].obligation_id;
+        assert!(
+            outcome.fresh_whole_function_receipts.remove(id).is_some(),
+            "the receipt compares the pre-solve and solved rows; it binds only when both \
+             translations used the same facts"
+        );
+
+        // The authority-only entry still takes neither facts entry.
+        NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST.with(|count| count.set((0, 0)));
+        let _ = adapter
+            .evidence_from_native_trust_ir_bundle_with_source_authority_and_deadline_and_fresh_receipts(
+                &bundle,
+                &bundle.obligations,
+                &native,
+                &source,
+                Some(Instant::now() + std::time::Duration::from_secs(10)),
+            );
+        assert_eq!(
+            NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST.with(std::cell::Cell::get),
+            (0, 0)
+        );
+    }
+
+    /// Trust (C1, 2026-11-06): facts that do not authorize the exact `(bundle,
+    /// authority)` pair are a caller error. Every row fails closed with that
+    /// diagnostic, and no fact-free solve is substituted.
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn source_reference_facts_for_another_bundle_fail_closed_without_a_solve() {
+        let bundle = compiler_style_panic_freedom_public_bundle();
+        let mut native =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let source = trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut native)
+            .expect("valid unit fixture source authority");
+        let mut other =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let other_source = trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut other)
+            .expect("second fixture authority");
+        let foreign_facts =
+            SourceReferenceFacts::from_live_source_lowering(&other, &other_source, vec![], vec![])
+                .expect("facts bound to the other bundle");
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST.with(|count| count.set((0, 0)));
+        NATIVE_BUNDLE_TRANSLATION_COUNT_FOR_TEST.with(|count| count.set(0));
+        let outcome = adapter
+            .evidence_from_native_trust_ir_bundle_with_source_reference_facts_and_deadline_and_fresh_receipts(
+                &bundle,
+                &bundle.obligations,
+                &native,
+                &source,
+                &foreign_facts,
+                Some(Instant::now() + std::time::Duration::from_secs(10)),
+            );
+        assert_ne!(outcome.evidence[0].status, EvidenceStatus::Proved);
+        assert!(
+            outcome.evidence[0].diagnostics[0].contains("source reference facts do not authorize"),
+            "{:?}",
+            outcome.evidence[0].diagnostics
+        );
+        assert!(outcome.fresh_whole_function_receipts.is_empty());
+        assert_eq!(NATIVE_BUNDLE_TRANSLATION_COUNT_FOR_TEST.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST.with(std::cell::Cell::get),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn whole_function_receipt_is_not_minted_by_ordinary_native_entrypoint() {
+        let bundle = compiler_style_panic_freedom_public_bundle();
+        let native =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let outcome = adapter
+            .evidence_from_native_trust_ir_bundle_with_deadline_and_fresh_receipts(
+                &bundle,
+                &bundle.obligations,
+                &native,
+                None,
+                Some(Instant::now() + std::time::Duration::from_secs(10)),
+            );
+        assert_eq!(outcome.evidence[0].status, EvidenceStatus::Proved, "{outcome:#?}");
+        assert!(outcome.fresh_whole_function_receipts.is_empty());
+        assert!(outcome.fresh_exact_direct_receipts.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn whole_function_receipt_preserves_source_authorized_direct_formula_family() {
+        let bundle = compiler_style_exact_formula_public_bundle(
+            ObligationKind::Precondition,
+            add_typed_body_aware_vc_formula,
+        );
+        let mut native =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let source = trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut native)
+            .expect("synthetic unit source issuer");
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let outcome = adapter.evidence_from_native_trust_ir_bundle_with_source_authority_and_deadline_and_fresh_receipts(
+            &bundle, &bundle.obligations, &native, &source,
+            Some(Instant::now() + std::time::Duration::from_secs(10)),
+        );
+        assert_eq!(outcome.evidence[0].status, EvidenceStatus::Proved, "{outcome:#?}");
+        assert_eq!(outcome.fresh_exact_direct_receipts.len(), 1, "direct family is preserved");
+        assert!(outcome.fresh_whole_function_receipts.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn whole_function_receipt_refuses_stale_public_or_native_source() {
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        for case in 0..3 {
+            let mut bundle = compiler_style_panic_freedom_public_bundle();
+            let mut native = bind_compiler_style_native_bundle_to_public(
+                compiler_style_safe_tmir_bundle(),
+                &bundle,
+            );
+            match case {
+                0 => bundle.obligations[0].source = compiler_style_source(99, 7),
+                1 => native.module.functions[0].name = "stale_function".into(),
+                _ => bundle.obligations.push(bundle.obligations[0].clone()),
+            }
+            let outcome = adapter
+                .evidence_from_native_trust_ir_bundle_with_deadline_and_fresh_receipts(
+                    &bundle,
+                    &bundle.obligations,
+                    &native,
+                    None,
+                    Some(Instant::now() + std::time::Duration::from_secs(10)),
+                );
+            assert!(outcome.fresh_whole_function_receipts.is_empty(), "case {case}");
+            assert!(
+                outcome.evidence.iter().all(|row| row.status != EvidenceStatus::Proved),
+                "case {case}: {outcome:#?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn solved_whole_function_receipt_fixture() -> (
+        TrustContractBundle,
+        trust_ir::NativeVerificationBundle,
+        trust_ir::SourceGenerationAuthority,
+        NativeTrustIrBundleEvidenceWithFreshReceipts,
+    ) {
+        let bundle = compiler_style_panic_freedom_public_bundle();
+        let mut native =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        // Synthetic unit fixture only, not a new production source issuer.
+        let source = trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut native)
+            .expect("valid synthetic source fixture");
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let outcome = adapter.evidence_from_native_trust_ir_bundle_with_source_authority_and_deadline_and_fresh_receipts(
+            &bundle, &bundle.obligations, &native, &source,
+            Some(Instant::now() + std::time::Duration::from_secs(30)),
+        );
+        assert_eq!(outcome.evidence[0].status, EvidenceStatus::Proved, "{outcome:#?}");
+        assert_eq!(outcome.fresh_whole_function_receipts.len(), 1, "{outcome:#?}");
+        (bundle, native, source, outcome)
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn whole_function_receipt_exact_rebinding_and_private_mutations() {
+        let (bundle, native, source, mut outcome) = solved_whole_function_receipt_fixture();
+        let receipt = outcome
+            .fresh_whole_function_receipts
+            .remove(&bundle.obligations[0].obligation_id)
+            .unwrap();
+        let strength = receipt.still_authorizes(&bundle, &native, &bundle.obligations[0]).unwrap();
+        assert_eq!(strength.assurance, trust_verifier_api::AssuranceLevel::SmtBacked);
+        assert!(matches!(
+            strength.reasoning,
+            trust_verifier_api::ReasoningKind::Chc | trust_verifier_api::ReasoningKind::Pdr
+        ));
+        let mut wrong_row = bundle.obligations[0].clone();
+        wrong_row
+            .metadata
+            .push(MetadataEntry { key: "changed.transport.metadata".into(), value: "1".into() });
+        assert!(receipt.still_authorizes(&bundle, &native, &wrong_row).is_err());
+        let mut wrong_public = bundle.clone();
+        wrong_public.obligations[0] = wrong_row;
+        assert!(
+            receipt.still_authorizes(&wrong_public, &native, &wrong_public.obligations[0]).is_err()
+        );
+        let mut wrong_native = native.clone();
+        wrong_native.module.functions[0].name = "different_body_owner".into();
+        assert!(receipt.still_authorizes(&bundle, &wrong_native, &bundle.obligations[0]).is_err());
+        let cloned_native = native.clone();
+        assert!(
+            !source.authorizes_bundle(&cloned_native),
+            "content equality cannot recreate source authority"
+        );
+        let (_, _, _, foreign) = solved_whole_function_receipt_fixture();
+        let foreign_seal =
+            foreign.fresh_whole_function_receipts.values().next().unwrap().bundle_seal();
+        assert!(
+            receipt
+                .still_authorizes_under_exact_bundle_seal(&foreign_seal, &bundle.obligations[0])
+                .is_err()
+        );
+        receipt.assert_private_mutation_controls();
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn whole_function_receipt_final_projection_rejects_demotion_mutation_and_duplicates() {
+        for case in 0..3 {
+            let (_, _, _, mut outcome) = solved_whole_function_receipt_fixture();
+            match case {
+                0 => outcome.evidence[0].status = EvidenceStatus::Unknown,
+                1 => outcome.evidence[0].diagnostics.push("post-solve replacement".into()),
+                _ => outcome.evidence.push(outcome.evidence[0].clone()),
+            }
+            let final_outcome = finalize_native_bundle_evidence_with_whole_function_receipts(
+                outcome.evidence,
+                outcome.fresh_exact_direct_receipts,
+                outcome.fresh_whole_function_receipts,
+            );
+            assert!(final_outcome.fresh_whole_function_receipts.is_empty(), "case {case}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn whole_function_receipt_rejects_real_alternate_body_proof_with_same_ids() {
+        let (bundle, native, _, outcome) = solved_whole_function_receipt_fixture();
+        let receipt = outcome.fresh_whole_function_receipts.values().next().unwrap();
+        let mut changed = native.clone();
+        let constant = changed.module.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| block.body.iter_mut())
+            .find_map(|node| match &mut node.inst {
+                trust_ir::Inst::Const { value: trust_ir::Constant::Int(value), .. } => Some(value),
+                _ => None,
+            })
+            .expect("branch threshold constant");
+        *constant += 1; // Both bodies are safe, but the proof belongs to a different body/query.
+        let changed_digest = changed.module.stable_digest();
+        changed.trust_ir_module_digest = changed_digest;
+        for node in &mut changed.lineage.nodes {
+            node.target_module = changed_digest;
+        }
+        changed.validate().expect("different valid same-ID native body");
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let deadline = Some(Instant::now() + std::time::Duration::from_secs(10));
+        let before =
+            adapter.native_trust_ir_chc_pdr_translated_obligations(&changed, deadline).unwrap();
+        let (mut actual_proofs, _, _) =
+            adapter.native_trust_ir_chc_pdr_proof_transports(&changed, None, deadline).unwrap();
+        assert_eq!(actual_proofs.len(), 1, "alternate body must actually earn its own proof");
+        let reason = FreshWholeFunctionChcPdrReceipt::try_from_native(
+            receipt.bundle_seal(),
+            &bundle.obligations[0],
+            &outcome.evidence[0],
+            &before[0],
+            actual_proofs.pop().unwrap(),
+            deadline,
+        )
+        .expect_err(
+            "matching IDs and a real different-body proof cannot authorize the original body",
+        );
+        assert!(reason.contains("different body/source/compiler-fact/lineage digest"), "{reason}");
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn whole_function_receipt_rejects_foreign_source_identity_and_elapsed_dispatch() {
+        let (bundle, native, source, _) = solved_whole_function_receipt_fixture();
+        let (_, _, foreign_source, _) = solved_whole_function_receipt_fixture();
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let cloned = native.clone();
+        for (body, authority, deadline) in [
+            (&native, &foreign_source, Some(Instant::now() + std::time::Duration::from_secs(10))),
+            (&cloned, &source, Some(Instant::now() + std::time::Duration::from_secs(10))),
+            (&native, &source, Some(Instant::now() - std::time::Duration::from_secs(1))),
+        ] {
+            let outcome = adapter.evidence_from_native_trust_ir_bundle_with_source_authority_and_deadline_and_fresh_receipts(
+                &bundle, &bundle.obligations, body, authority, deadline,
+            );
+            assert!(outcome.fresh_whole_function_receipts.is_empty(), "{outcome:#?}");
+        }
     }
 
     /// The compiler's own record that this row's typed-CHC lowering produced no
@@ -11112,6 +12272,8 @@ mod tests {
                     .map(str::to_string),
                 sort: obligation_metadata_value(public, TRUST_VC_FORMULA_SORT_METADATA_KEY)
                     .map(str::to_string),
+                // v41: no clause bindings — an empty table reads as UNBINDABLE, never as a wildcard.
+                bindings: Vec::new(),
             };
         }
         let source_id = public
@@ -11133,11 +12295,12 @@ mod tests {
                     "line_end": public.source.end_line.unwrap_or_else(|| public.source.line.unwrap_or_default()),
                     "col_end": public.source.end_column.unwrap_or_else(|| public.source.column.unwrap_or_default()),
                 },
-                "public_obligation_id": public.obligation_id,
             })
             .to_string(),
             smtlib: None,
             sort: None,
+            // v41: no clause bindings — an empty table reads as UNBINDABLE, never as a wildcard.
+            bindings: Vec::new(),
         }
     }
 
@@ -11176,7 +12339,10 @@ mod tests {
                 })
                 .expect("native fixture request owns public proof id");
             let file_name = public.source.file.as_deref().expect("public fixture source file");
-            let file = native.module.intern_file(file_name.to_string());
+            let file = native
+                .module
+                .intern_file(file_name.to_string())
+                .expect("Module::intern_file: test fixture");
             let start_line = public.source.line.unwrap_or_default();
             let start_col = public.source.column.unwrap_or_default();
             let range = trust_ir::ProofObligationSourceRange {
@@ -11312,6 +12478,7 @@ mod tests {
             native_bundle,
             &context,
         )
+        .map(|_| ())
     }
 
     fn sha256(hex_digit: char) -> TrustMcEvidenceHash {
@@ -11874,13 +13041,47 @@ mod tests {
             .value = encoded;
         assert!(adapter.supports(&deep).is_supported());
 
-        let mut over_limit = trust_verifier_api::TrustSpecExpr::bool_literal(false);
-        for _ in 0..=trust_verifier_api::MAX_CONTRACT_PREDICATE_JSON_DEPTH {
-            over_limit = trust_verifier_api::TrustSpecExpr::unary(
-                trust_verifier_api::TrustSpecUnaryOp::Not,
-                over_limit,
-            );
-        }
+        // Trust (T3 L4, C09d): the public validator's 128-level semantic bound is deleted. A
+        // payload past it, within the bound its readers decode
+        // (`trust_types::json_depth::MAX_DEEP_NESTING` JSON levels, two a Not link), parses
+        // and validates; one past the readers' bound fails closed. The chains are built,
+        // serialized, parsed and dropped on a deep stack, as each of those recurses per level.
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn_scoped(scope, typed_e4_payloads_past_the_old_bound_on_a_deep_stack)
+                .expect("the deep-fixture thread starts")
+                .join()
+                .expect("the deep fixture passes");
+        });
+    }
+
+    fn typed_e4_payloads_past_the_old_bound_on_a_deep_stack() {
+        let chain_payload = |links: usize| {
+            let mut chain = trust_verifier_api::TrustSpecExpr::bool_literal(false);
+            for _ in 0..links {
+                chain = trust_verifier_api::TrustSpecExpr::unary(
+                    trust_verifier_api::TrustSpecUnaryOp::Not,
+                    chain,
+                );
+            }
+            serde_json::to_string(&trust_verifier_api::TrustSpecPredicate::new(chain, Vec::new()))
+                .expect("the chain serializes")
+        };
+        let past_the_old_bound = chain_payload(129);
+        let parsed =
+            trust_types::json_depth::from_str_deep::<trust_verifier_api::TrustSpecPredicate>(
+                &past_the_old_bound,
+            )
+            .expect("the readers decode a payload past the deleted bound");
+        parsed.validate().expect("and the public validator admits it");
+
+        let adapter = TrustMcVerifierApiAdapter::default();
+        let over_limit = chain_payload(trust_types::json_depth::MAX_DEEP_NESTING / 2 + 1);
+        assert!(
+            trust_types::json_depth::json_nesting_depth(&over_limit)
+                > trust_types::json_depth::MAX_DEEP_NESTING
+        );
         let mut over_limit_obligation = obligation(ObligationKind::LoopInvariant, "over-limit-e4");
         add_typed_body_aware_vc_formula(&mut over_limit_obligation);
         over_limit_obligation
@@ -11888,11 +13089,7 @@ mod tests {
             .iter_mut()
             .find(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
             .expect("typed formula payload")
-            .value = serde_json::to_string(&trust_verifier_api::TrustSpecPredicate::new(
-            over_limit,
-            Vec::new(),
-        ))
-        .expect("over-limit fixture serializes");
+            .value = over_limit;
         assert!(adapter.supports(&over_limit_obligation).is_supported());
         let over_limit_bundle = bundle_with(vec![over_limit_obligation]);
         let evidence = adapter.verify(&over_limit_bundle, &over_limit_bundle.obligations);
@@ -13430,9 +14627,10 @@ mod tests {
         // certifies nothing about the encoding's havoc-freedom, so the Refuted
         // branch passes Unknown — never Failed — to
         // `typed_chc_pdr_solver_outcome_evidence` (Failed requires a validated
-        // refutation witness). The solver's counterexample artifacts stay
-        // attached as non-proof diagnostics, but no public counterexample
-        // record is fabricated for a non-Failed status.
+        // refutation witness). No public counterexample record is fabricated for
+        // a non-Failed status, and the solver's `Counterexample` ARTIFACTS are
+        // withheld too (disclosed by a diagnostic): published beside `Unknown`
+        // they presented a model of the encoding as a witness against the code.
         let adapter = TrustMcVerifierApiAdapter::new(
             TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3),
         );
@@ -13475,16 +14673,50 @@ mod tests {
             artifact.kind == EvidenceArtifactKind::EngineInput
                 && artifact.uri.contains("typed-trust-mc-chc")
         }));
-        assert!(evidence.artifacts.iter().any(|artifact| {
-            artifact.kind == EvidenceArtifactKind::Counterexample
-                && artifact.uri.ends_with("/counterexample.json")
-        }));
+        assert!(
+            !evidence
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == EvidenceArtifactKind::Counterexample),
+            "a DEMOTED refutation must not publish a Counterexample artifact; artifacts: {:#?}",
+            evidence.artifacts
+        );
         assert!(
             evidence
                 .diagnostics
                 .iter()
                 .any(|diagnostic| { diagnostic.contains("refutation demoted to unknown") })
         );
+        assert!(
+            evidence.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("withheld 1 solver counterexample artifact(s)")
+                    && diagnostic.contains("the verdict is unknown")
+            }),
+            "the withholding must be disclosed; diagnostics: {:#?}",
+            evidence.diagnostics
+        );
+
+        // The SAME artifacts under a validated (`Failed`) verdict are kept: the
+        // filter is keyed on the status, not on the artifact alone.
+        let failed = adapter.typed_chc_pdr_solver_outcome_evidence(
+            &bundle,
+            &bundle.obligations[0],
+            EvidenceStatus::Failed,
+            trust_mc_typed_chc_engine_input_artifact(
+                &bundle,
+                &bundle.obligations[0],
+                "contract-refuted",
+                &sha256_hex('9'),
+            ),
+            Vec::new(),
+            non_proof_artifacts_from_trust_mc_core_verdict(&verdict),
+            "validated refutation".to_string(),
+        );
+        assert!(failed.artifacts.iter().any(|artifact| {
+            artifact.kind == EvidenceArtifactKind::Counterexample
+                && artifact.uri.ends_with("/counterexample.json")
+        }));
+        assert!(!failed.diagnostics.iter().any(|diagnostic| diagnostic.contains("withheld")));
     }
 
     #[test]
@@ -14178,6 +15410,70 @@ mod tests {
         );
     }
 
+    /// gate-rca deadline (2026-10-17): the solve cutoff clamps the exact-direct solve's
+    /// own clock, while the live receipt keeps the DISPATCH deadline, the one the router's
+    /// dispatch seal and the compiler's mint compare it with. Negative control: without
+    /// a cutoff the same dispatch takes the adapter's configured 10 s clock, so the clamp
+    /// observed above it is the cutoff's.
+    #[cfg(feature = "trust-mc-native-solver")]
+    #[test]
+    fn exact_direct_solve_cutoff_clamps_the_solve_and_the_receipt_keeps_the_dispatch_deadline() {
+        let public_id = "vc:trust-bmc:solve-cutoff:0";
+        let (mut bundle, _canonical_id, _marker_id, _native_id) =
+            compiler_canonical_trust_mc_bundle(public_id, 96, 0);
+        bundle.obligations[0].kind = ObligationKind::LoopInvariant;
+        add_typed_body_aware_vc_formula(&mut bundle.obligations[0]);
+        bundle.validate().expect("solve-cutoff fixture must validate");
+        let config =
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000);
+        let deadline = Instant::now() + std::time::Duration::from_secs(3600);
+        let applied = |adapter: &TrustMcVerifierApiAdapter| {
+            let dispatch = adapter
+                .exact_direct_chc_pdr_evidence_with_fresh_receipt(
+                    &bundle,
+                    &bundle.obligations[0],
+                    Some(deadline),
+                )
+                .expect("exact input validates")
+                .expect("fixture carries exact input");
+            let receipt = dispatch.receipt.expect("a timely exact solve retains its receipt");
+            assert_eq!(
+                receipt.dispatch_deadline(),
+                Some(deadline),
+                "the receipt is bound to the dispatch deadline, never to the cutoff"
+            );
+            let options: serde_json::Value = serde_json::from_slice(
+                receipt
+                    .verification
+                    .cache_key
+                    .parts
+                    .options
+                    .materialized_bytes()
+                    .expect("applied options are materialized"),
+            )
+            .expect("applied options are JSON");
+            std::time::Duration::new(
+                options["timeout"]["secs"].as_u64().expect("timeout seconds"),
+                options["timeout"]["nanos"].as_u64().expect("timeout nanos") as u32,
+            )
+        };
+        let cutoff = Instant::now() + std::time::Duration::from_secs(2);
+        let clamped = applied(
+            &TrustMcVerifierApiAdapter::new(config.clone()).with_solve_cutoff(Some(cutoff)),
+        );
+        assert!(clamped > std::time::Duration::ZERO);
+        assert!(
+            clamped <= std::time::Duration::from_secs(2),
+            "the solve clock {clamped:?} ran past the cutoff"
+        );
+        let unclamped = applied(&TrustMcVerifierApiAdapter::new(config));
+        assert_eq!(
+            unclamped,
+            std::time::Duration::from_secs(10),
+            "control: with no cutoff the configured clock applies under a far deadline"
+        );
+    }
+
     #[cfg(feature = "trust-mc-native-solver")]
     #[test]
     fn bare_e4_and_generic_direct_rows_cannot_request_a_fresh_receipt() {
@@ -14481,8 +15777,10 @@ mod tests {
         );
         assert!(
             gated.diagnostics.iter().any(|diagnostic| {
+                // 302ba178ce0 reworded the reason: it names the attested
+                // over-approximation, no longer the "loop-elided" class.
                 diagnostic.contains("refutation demoted to unknown")
-                    && diagnostic.contains("loop-elided over-approximation")
+                    && diagnostic.contains("attests the submitted ChcVc is an over-approximation")
             }),
             "the demotion must name the producer stage that failed; diagnostics: {:#?}",
             gated.diagnostics
@@ -14605,11 +15903,13 @@ mod tests {
         // The gate lives in the `Refuted` arm only: it must not demote, reject,
         // or otherwise perturb a row the solver did not refute.
         assert_ne!(evidence[0].status, EvidenceStatus::Failed);
+        // Matched on the reason's current wording (302ba178ce0); the old
+        // "loop-elided over-approximation" phrase no longer occurs anywhere, so
+        // checking for it here was vacuous.
         assert!(
-            !evidence[0]
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.contains("loop-elided over-approximation")),
+            !evidence[0].diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("attests the submitted ChcVc is an over-approximation")
+            }),
             "the fidelity gate must not speak on a non-refuted row; diagnostics: {:#?}",
             evidence[0].diagnostics
         );
@@ -16081,6 +17381,137 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_public_claim_binding_catalog_formula_stays_exact_and_non_authoritative() {
+        let mut public = obligation(ObligationKind::Postcondition, "obligation:f:postcondition:1");
+        public.contract_id = Some("authored-ensures".to_string());
+        add_result_referencing_vc_formula(&mut public);
+        replace_formula_context(
+            &mut public,
+            trust_verifier_api::ObligationContext::new(
+                trust_verifier_api::ObligationProducer::CompilerMirExtract,
+                trust_verifier_api::ObligationOrigin::Contract {
+                    contract_id: "authored-ensures".to_string(),
+                    contract_kind: ContractKind::Ensures,
+                    contract_index: 1,
+                    predicate_schema: Some(
+                        trust_verifier_api::TRUST_SPEC_PREDICATE_SCHEMA_VERSION.to_string(),
+                    ),
+                },
+            ),
+        );
+        let source = trust_ir::ProofObligationSourceIdentity::new(
+            "authored-ensures",
+            "trust-assertion:authored-ensures",
+        );
+        let proof_id = trust_ir::ProofId::new(1);
+        let formula = compiler_style_public_formula(&public);
+        validate_native_trust_ir_public_formula_binding(&public, proof_id, &source, &formula)
+            .expect("an exact body-formula projection binds a retained authored catalog row");
+        assert!(
+            !is_typed_body_aware_exact_direct_obligation(&public),
+            "formula identity must not promote a Contract marker to fresh VC proof authority"
+        );
+        let mut missing = public.clone();
+        missing.metadata.retain(|entry| {
+            !matches!(
+                entry.key.as_str(),
+                TRUST_VC_FORMULA_SCHEMA_METADATA_KEY
+                    | TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY
+                    | TRUST_VC_FORMULA_SMTLIB_METADATA_KEY
+                    | TRUST_VC_FORMULA_SORT_METADATA_KEY
+            )
+        });
+        assert!(
+            validate_native_trust_ir_public_formula_binding(&missing, proof_id, &source, &formula)
+                .unwrap_err()
+                .contains("has no public formula metadata")
+        );
+        let mut partial = public.clone();
+        partial.metadata.retain(|entry| entry.key != TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY);
+        assert!(
+            validate_native_trust_ir_public_formula_binding(&partial, proof_id, &source, &formula)
+                .unwrap_err()
+                .contains("partial formula schema/payload pair")
+        );
+        for field in ["schema", "payload", "smtlib", "sort"] {
+            let mut altered = formula.clone();
+            match field {
+                "schema" => altered.schema.push_str(".foreign"),
+                "payload" => altered.payload = "{}".to_string(),
+                "smtlib" => altered.smtlib = Some("false".to_string()),
+                "sort" => altered.sort = Some("Int".to_string()),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_native_trust_ir_public_formula_binding(
+                    &public, proof_id, &source, &altered
+                )
+                .unwrap_err()
+                .contains("does not exactly match canonical public formula metadata"),
+                "{field} substitution must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_semantic_formula_is_not_replaced_by_a_safe_body_or_source_envelope() {
+        let (bundle, _, _) = compiler_style_canonical_public_bundle();
+        assert!(bundle.obligations[0].contract_id.is_some());
+        let native =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        validate_compiler_style_public_claim_for_test(&bundle, &native, 0)
+            .expect("the exact public formula and native identity must bind");
+
+        // Keep the semantic contract, native body, and exact public/native
+        // identities. Only remove the public formula. Rebinding reconstructs
+        // the producer's source-location envelope, not a proof of the claim.
+        let mut missing = bundle.clone();
+        missing.obligations[0].metadata.retain(|entry| {
+            !matches!(
+                entry.key.as_str(),
+                TRUST_VC_FORMULA_SCHEMA_METADATA_KEY
+                    | TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY
+                    | TRUST_VC_FORMULA_SMTLIB_METADATA_KEY
+                    | TRUST_VC_FORMULA_SORT_METADATA_KEY
+            )
+        });
+        let source_only = bind_compiler_style_native_bundle_to_public(
+            compiler_style_safe_tmir_bundle(),
+            &missing,
+        );
+        let reason = validate_compiler_style_public_claim_for_test(&missing, &source_only, 0)
+            .expect_err("a safe native body cannot replace the absent semantic formula");
+        assert!(
+            reason.contains(
+                "has no public formula metadata encoding its semantic contract/proof-item goal",
+            ) && reason.contains("source-location identity alone does not encode that goal"),
+            "unexpected missing-formula refusal: {reason}"
+        );
+
+        // Supplying only half of the original formula is also not a repair.
+        // These cases retain their existing, more specific refusal.
+        for missing_key in
+            [TRUST_VC_FORMULA_SCHEMA_METADATA_KEY, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY]
+        {
+            let mut partial = bundle.clone();
+            partial.obligations[0].metadata.retain(|entry| entry.key != missing_key);
+            let partial_native = bind_compiler_style_native_bundle_to_public(
+                compiler_style_safe_tmir_bundle(),
+                &partial,
+            );
+            let reason =
+                validate_compiler_style_public_claim_for_test(&partial, &partial_native, 0)
+                    .expect_err("a partial formula must not bind");
+            assert!(
+                reason.contains("partial formula schema/payload pair"),
+                "unexpected partial-formula refusal for {missing_key}: {reason}"
+            );
+        }
+    }
+
     /// Build the compiler-style public/native pair for ONE explicit
     /// public-kind/native-kind pairing, so a kind-binding test states the
     /// pairing under test and nothing else. The compiler-fact cause is taken
@@ -17130,10 +18561,9 @@ mod tests {
             panic!("fixture should produce exactly one proof row");
         };
         let query_target = row.translated.obligation.query_target().to_string();
-        let query_rule = row
-            .translated
-            .obligation
-            .vc
+        // The translated VC is shared (`Arc<ChcVc>`, trust-mc 5f805b33): copy it on
+        // write, so the mutation reaches this row and not the seal's pre-solve copy.
+        let query_rule = std::sync::Arc::make_mut(&mut row.translated.obligation.vc)
             .rules
             .iter_mut()
             .find(|rule| rule.head.name.as_str() == query_target)
@@ -17174,6 +18604,11 @@ mod tests {
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
         assert_eq!(evidence[0].proof_strength, None);
         assert!(evidence[0].artifacts.is_empty());
+        assert!(
+            !evidence[0].diagnostics.iter().any(|diagnostic| diagnostic
+                == trust_verifier_api::NATIVE_REFUTATION_FIDELITY_DEMOTION_DIAGNOSTIC),
+            "an ordinary rejected refutation transport has no source-fidelity stop"
+        );
         let diagnostic =
             evidence[0].diagnostics.first().expect("not-proved reason is the primary diagnostic");
         let expected_id = native_trust_ir_expected_trust_mc_obligation_id(&bundle.obligations[0])
@@ -17191,13 +18626,95 @@ mod tests {
         );
     }
 
-    // Trust (bounded-unroll refutation lane, consumer half): a witnessed
-    // k-bounded-unroll refutation delivered on the producer's `refuted`
-    // channel surfaces as a public `Failed` row — but only AFTER this
-    // consumer freshly re-translates its own retained native bundle,
-    // recomputes the encoded-formula digest, and validates every witness
-    // binding. The diagnostics must name the bounded-unroll machine-check so
-    // the verdict is auditable.
+    /// The public integration-test failure: a bodyless cross-crate call has
+    /// no supported direct-call summary. Solving its conservative error rule
+    /// completes, but cannot produce a source-level counterexample.
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_completed_refutation_keeps_typed_source_fidelity_stop() {
+        use trust_ir::ty::Ty;
+        use trust_ir_build::ModuleBuilder;
+
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let public = compiler_style_panic_freedom_public_bundle();
+        let mut native = compiler_style_safe_tmir_bundle();
+        let mut builder = ModuleBuilder::new("native_cross_crate_call");
+        let signature = builder.add_func_type(vec![Ty::I32], vec![]);
+        let external = trust_ir::FuncId::new(1);
+        let mut caller = builder.function("tmir_native_checked_branch", signature);
+        let entry = caller.create_block();
+        caller.switch_to_block(entry);
+        caller.set_entry(entry);
+        let arg = caller.add_block_param(entry, Ty::I32);
+        caller.call_void(external, vec![arg]);
+        caller.ret(vec![]);
+        caller.build();
+        assert_eq!(builder.declare_function("external_fixture::add1", signature), external);
+        let module = builder.build().expect("actual native cross-crate call module");
+        native.module.functions = module.functions;
+        native.module.func_types = module.func_types;
+        // Rebind diagnostic fixture identity; no source-generation authority,
+        // proof artifact, or counterexample is supplied by this test.
+        native = bind_compiler_style_native_bundle_to_public(native, &public);
+        let evidence =
+            adapter.evidence_from_native_trust_ir_bundle(&public, &public.obligations, &native);
+        assert_eq!(evidence.len(), 1);
+        let row = &evidence[0];
+        assert_eq!(row.status, EvidenceStatus::Unsupported);
+        assert!(row.proof_strength.is_none() && row.artifacts.is_empty());
+        assert!(row.counterexample.is_none() && row.decline.is_none());
+        assert!(
+            row.diagnostics.iter().any(|diagnostic| diagnostic
+                == trust_verifier_api::NATIVE_REFUTATION_FIDELITY_DEMOTION_DIAGNOSTIC),
+            "the live per-row cause must survive transport: {:?}",
+            row.diagnostics
+        );
+        assert!(
+            !row.diagnostics.iter().any(|diagnostic| diagnostic
+                == trust_verifier_api::NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC),
+            "a completed query must not claim pre-solve refusal"
+        );
+
+        // The compiler's live-source entry must preserve the same actual
+        // post-solve cause. Empty reference facts are still bound to this
+        // exact live bundle and authority; no fact-free solve may substitute.
+        let authority = trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut native)
+            .expect("live native source authority");
+        let facts =
+            SourceReferenceFacts::from_live_source_lowering(&native, &authority, vec![], vec![])
+                .expect("empty facts bind to this exact live source");
+        NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST.with(|count| count.set((0, 0)));
+        let live = adapter
+            .evidence_from_native_trust_ir_bundle_with_source_reference_facts_and_deadline_and_fresh_receipts(
+                &public,
+                &public.obligations,
+                &native,
+                &authority,
+                &facts,
+                Some(Instant::now() + std::time::Duration::from_secs(10)),
+            );
+        assert_eq!(
+            NATIVE_BUNDLE_SOURCE_REFERENCE_ENTRIES_FOR_TEST.with(std::cell::Cell::get),
+            (1, 1),
+            "both the pre-solve translation and solve must use live source facts"
+        );
+        assert_eq!(live.evidence.len(), 1);
+        let row = &live.evidence[0];
+        assert_eq!(row.status, EvidenceStatus::Unsupported);
+        assert!(row.proof_strength.is_none() && row.artifacts.is_empty());
+        assert!(row.counterexample.is_none() && row.decline.is_none());
+        assert!(row.diagnostics.iter().any(|diagnostic| diagnostic
+            == trust_verifier_api::NATIVE_REFUTATION_FIDELITY_DEMOTION_DIAGNOSTIC));
+        assert!(!row.diagnostics.iter().any(|diagnostic| diagnostic
+            == trust_verifier_api::NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC));
+    }
+
+    // The original bounded-unroll candidate still replays independently, but
+    // flat exactness cannot authorize its publication as a Rust counterexample.
+    // The historical test name is retained; its obsolete public Failed premise
+    // is migrated explicitly to candidate replay plus native source refusal.
     #[test]
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
     fn native_trust_ir_bundle_surfaces_validated_bounded_unroll_refutation_as_failed() {
@@ -17205,45 +18722,40 @@ mod tests {
             TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
         );
         let mut bundle = compiler_style_panic_freedom_public_bundle();
-        // Isolate witness validation from the separately tested producer
-        // fidelity gate.  Without this test-only premise, the sound result is
-        // Unknown and this test never reaches bounded-unroll replay.
         attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
         let native_bundle = bind_compiler_style_native_bundle_to_public(
             compiler_style_loop_overflow_tmir_bundle(),
             &bundle,
         );
+        let (_, _, refuted) = adapter
+            .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None, None)
+            .expect("loop fixture solves");
+        let row = refuted.values().next().expect("real bounded-unroll witness");
+        let rows = adapter
+            .native_trust_ir_chc_pdr_translated_obligations(&native_bundle, None)
+            .expect("loop fixture translates");
+        let (_, summary) = native_refutation::check(
+            &bundle,
+            &bundle.obligations[0],
+            &rows.iter().collect::<Vec<_>>(),
+            row,
+            chc_pdr_engine_from_config(adapter.config.proof_mode),
+        )
+        .expect("the original real candidate still passes all independent witness checks");
+        assert!(summary.contains("bounded-unroll (k="), "actual replay kind: {summary}");
 
         let evidence = adapter.evidence_from_native_trust_ir_bundle(
             &bundle,
             &bundle.obligations,
             &native_bundle,
         );
-
         assert_eq!(evidence.len(), 1);
-        assert_eq!(
-            evidence[0].status,
-            EvidenceStatus::Failed,
-            "validated witnessed refutation must surface as Failed; diagnostics: {:?}",
-            evidence[0].diagnostics
-        );
-        assert!(
-            evidence[0].counterexample.is_some(),
-            "a Failed refutation row carries its public counterexample record"
-        );
-        assert!(
-            evidence[0].proof_strength.is_none(),
-            "a refutation must never carry proof strength"
-        );
-        let summary = evidence[0]
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.contains("refutation witness validated"))
-            .expect("the validation summary is a diagnostic");
-        assert!(
-            summary.contains("bounded-unroll (k="),
-            "the summary names the bounded-unroll machine-check: {summary}"
-        );
+        assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
+        assert!(evidence[0].counterexample.is_none());
+        assert!(evidence[0].proof_strength.is_none());
+        assert!(evidence[0].diagnostics.iter().any(|text| {
+            text.contains("flat typed ChcVc only") && text.contains("source correspondence")
+        }));
     }
 
     // Trust (bounded-unroll refutation lane, fail-closed halves): a REAL
@@ -17276,12 +18788,15 @@ mod tests {
             key: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY.to_string(),
             value: TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_LOOP_ELIDED.to_string(),
         });
+        let consumer_rows = adapter
+            .native_trust_ir_chc_pdr_translated_obligations(&native_bundle, None)
+            .expect("loop fixture translates");
+        let consumer_rows = consumer_rows.iter().collect::<Vec<_>>();
         let evidence = adapter.native_trust_ir_refuted_row_evidence(
             &attested,
             &attested.obligations[0],
-            &native_bundle,
+            &consumer_rows,
             row,
-            None,
         );
         assert_ne!(
             evidence.status,
@@ -17291,8 +18806,10 @@ mod tests {
         assert_ne!(evidence.status, EvidenceStatus::Proved);
         assert!(
             evidence.diagnostics.iter().any(|diagnostic| {
+                // 302ba178ce0 reworded the reason: it names the attested
+                // over-approximation, no longer the "loop-elided" class.
                 diagnostic.contains("refutation witness was not admitted")
-                    && diagnostic.contains("loop-elided")
+                    && diagnostic.contains("attests the submitted ChcVc is an over-approximation")
             }),
             "demotion must say why: {:?}",
             evidence.diagnostics
@@ -17300,18 +18817,33 @@ mod tests {
 
         // (b) the same witness replayed against a DIFFERENT retained native
         // bundle (same request/proof ids, different function body): the
-        // consumer's fresh re-translation recomputes a different
+        // consumer's own translation of that bundle recomputes a different
         // encoded-formula digest, so the detached witness fails binding
         // validation and demotes. This is the forged/detached-witness class:
         // the consumer trusts only digests it recomputes from its OWN bundle.
         let foreign_native =
             bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let foreign_rows = adapter
+            .native_trust_ir_chc_pdr_translated_obligations(&foreign_native, None)
+            .expect("safe fixture translates");
+        let foreign_rows = foreign_rows.iter().collect::<Vec<_>>();
+        let rejection = native_refutation::check(
+            &bundle,
+            &bundle.obligations[0],
+            &foreign_rows,
+            row,
+            chc_pdr_engine_from_config(adapter.config.proof_mode),
+        )
+        .expect_err("the original detached witness attack must fail binding validation");
+        assert!(
+            rejection.contains("detached") || rejection.contains("digest"),
+            "binding rejection: {rejection}"
+        );
         let evidence = adapter.native_trust_ir_refuted_row_evidence(
             &bundle,
             &bundle.obligations[0],
-            &foreign_native,
+            &foreign_rows,
             row,
-            None,
         );
         assert_ne!(
             evidence.status,
@@ -17326,6 +18858,139 @@ mod tests {
                 .any(|diagnostic| { diagnostic.contains("refutation witness was not admitted") }),
             "demotion must say why: {:?}",
             evidence.diagnostics
+        );
+    }
+
+    // WS-E step 8d: a witnessed refutation is revalidated against the
+    // consumer's PRE-SOLVE translation of the same immutable native bundle,
+    // retained by the bundle call, instead of translating the whole bundle
+    // again for every refuted row. Two things are pinned:
+    //   * cost: one whole-bundle consumer translation per bundle call, however
+    //     many rows are refuted (it was 1 + the number of refuted rows);
+    //   * identity: the refuted row's public evidence is byte-for-byte the
+    //     evidence a post-solve re-translation of the whole bundle yields, and
+    //     the retained lookup-key subset admits exactly what the whole
+    //     translation admits.
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_refuted_row_reuses_the_pre_solve_translation() {
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let mut bundle = compiler_style_panic_freedom_public_bundle();
+        attest_synthetic_typed_chc_encoding_exact(&mut bundle.obligations[0]);
+        let native_bundle = bind_compiler_style_native_bundle_to_public(
+            compiler_style_loop_overflow_tmir_bundle(),
+            &bundle,
+        );
+
+        NATIVE_BUNDLE_TRANSLATION_COUNT_FOR_TEST.with(|count| count.set(0));
+        let evidence = adapter.evidence_from_native_trust_ir_bundle(
+            &bundle,
+            &bundle.obligations,
+            &native_bundle,
+        );
+        let translations = NATIVE_BUNDLE_TRANSLATION_COUNT_FOR_TEST.with(std::cell::Cell::get);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].status,
+            EvidenceStatus::Unsupported,
+            "flat exactness must not publish a native source counterexample: {:?}",
+            evidence[0].diagnostics
+        );
+        assert_eq!(
+            translations, 1,
+            "the bundle call translates the bundle once, before the solve; the refuted \
+             row reuses that translation"
+        );
+
+        // The same refutation, revalidated three ways, gives one evidence value.
+        let (_, _, refuted) = adapter
+            .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None, None)
+            .expect("loop fixture solves");
+        let [(lookup_key, row)] = refuted.iter().collect::<Vec<_>>()[..] else {
+            panic!("loop fixture refutes exactly one row, not {}", refuted.len());
+        };
+        let after_solve = adapter
+            .native_trust_ir_chc_pdr_translated_obligations(&native_bundle, None)
+            .expect("loop fixture translates");
+        let from_post_solve_translation = adapter.native_trust_ir_refuted_row_evidence(
+            &bundle,
+            &bundle.obligations[0],
+            &after_solve.iter().collect::<Vec<_>>(),
+            row,
+        );
+        let mut translated_by_obligation = BTreeMap::new();
+        let mut translated_counts = BTreeMap::<String, usize>::new();
+        for translated in adapter
+            .native_trust_ir_chc_pdr_translated_obligations(&native_bundle, None)
+            .expect("loop fixture translates")
+        {
+            let key = native_trust_mc_obligation_lookup_key(&translated.obligation.obligation_id);
+            *translated_counts.entry(key.clone()).or_default() += 1;
+            translated_by_obligation.entry(key).or_insert(translated);
+        }
+        let retained = native_trust_ir_retained_rows_for(
+            &translated_by_obligation,
+            &translated_counts,
+            lookup_key,
+        );
+        assert_eq!(retained.len(), 1, "the refuted row's key has exactly one retained row");
+        let from_retained_translation = adapter.native_trust_ir_refuted_row_evidence(
+            &bundle,
+            &bundle.obligations[0],
+            &retained,
+            row,
+        );
+        assert_eq!(from_retained_translation.status, EvidenceStatus::Unsupported);
+        let check = |rows: &[&trust_mc_trust_bmc::NativeTrustMcChcPdrObligation]| {
+            native_refutation::check(
+                &bundle,
+                &bundle.obligations[0],
+                rows,
+                row,
+                chc_pdr_engine_from_config(adapter.config.proof_mode),
+            )
+            .map(|(input, summary)| (input.normalized_input_hash.value, summary))
+        };
+        let post_solve_checked = check(&after_solve.iter().collect::<Vec<_>>())
+            .expect("the original candidate must still pass full witness replay");
+        assert_eq!(check(&retained).unwrap(), post_solve_checked);
+        assert_eq!(
+            from_retained_translation, from_post_solve_translation,
+            "the retained lookup-key subset must admit exactly what the whole translation admits"
+        );
+        assert_eq!(
+            evidence[0], from_post_solve_translation,
+            "the bundle call's refuted-row evidence must equal a post-solve re-translation's"
+        );
+
+        // A key the retained translation does not hold exactly once yields no
+        // row, and the gate demotes: it never picks one of several rows.
+        let mut doubled_counts = translated_counts.clone();
+        *doubled_counts.get_mut(lookup_key.as_str()).expect("key is counted") = 2;
+        let doubled = native_trust_ir_retained_rows_for(
+            &translated_by_obligation,
+            &doubled_counts,
+            lookup_key,
+        );
+        assert!(doubled.is_empty());
+        assert!(check(&doubled).unwrap_err().contains("yielded 0 rows"));
+        let demoted = adapter.native_trust_ir_refuted_row_evidence(
+            &bundle,
+            &bundle.obligations[0],
+            &doubled,
+            row,
+        );
+        assert_ne!(demoted.status, EvidenceStatus::Failed);
+        assert_ne!(demoted.status, EvidenceStatus::Proved);
+        assert!(
+            demoted.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("refutation witness was not admitted")
+                    && diagnostic.contains("source correspondence")
+            }),
+            "demotion must say why: {:?}",
+            demoted.diagnostics
         );
     }
 
@@ -17380,6 +19045,398 @@ mod tests {
             proved[0].status,
             EvidenceStatus::Proved,
             "without a budget the same obligation must still prove (test is not vacuous)"
+        );
+    }
+
+    /// gate-rca deadline (2026-10-17): a PASSED solve cutoff degrades the native bundle's
+    /// obligation to Timeout while the dispatch deadline is still an hour away: the
+    /// cutoff alone stops the native lane, so the certifying lanes after it keep their
+    /// share of the clock. Control: the same adapter with no cutoff, under the same live
+    /// deadline, proves the obligation.
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_bundle_with_passed_solve_cutoff_degrades_to_timeout_under_a_live_deadline() {
+        let config =
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000);
+        let bundle = compiler_style_panic_freedom_public_bundle();
+        let native_bundle =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let live = Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        let passed = std::time::Instant::now() - std::time::Duration::from_secs(1);
+
+        let cut = TrustMcVerifierApiAdapter::new(config.clone())
+            .with_solve_cutoff(Some(passed))
+            .evidence_from_native_trust_ir_bundle_with_deadline(
+                &bundle,
+                &bundle.obligations,
+                &native_bundle,
+                live,
+            );
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0].status, EvidenceStatus::Timeout, "a passed cutoff never proves");
+        assert!(cut[0].proof_strength.is_none());
+
+        let proved = TrustMcVerifierApiAdapter::new(config)
+            .evidence_from_native_trust_ir_bundle_with_deadline(
+                &bundle,
+                &bundle.obligations,
+                &native_bundle,
+                live,
+            );
+        assert_eq!(proved.len(), 1);
+        assert_eq!(
+            proved[0].status,
+            EvidenceStatus::Proved,
+            "control: without the cutoff the same live dispatch proves (the test is not vacuous)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_request_caller_options_preserve_zero_unbounded_and_finite_deadlines() {
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(0),
+        );
+        let unbounded = adapter.native_solve_options(None);
+        assert_eq!(unbounded.timeout, None);
+        assert_eq!(unbounded.produce_proof_certificate, adapter.config.produce_proofs);
+        assert!(unbounded.native_request.is_none());
+        let finite =
+            adapter.native_solve_options(Some(Instant::now() + std::time::Duration::from_secs(5)));
+        let remaining = finite.timeout.expect("a finite deadline caps Root's unbounded setting");
+        assert!(remaining > std::time::Duration::ZERO);
+        assert!(remaining <= std::time::Duration::from_secs(5));
+        let ordinary = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(20_000),
+        )
+        .native_solve_options(None);
+        assert_eq!(ordinary.timeout, Some(std::time::Duration::from_secs(20)));
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_kernel_replay_scheduling_excludes_only_the_unsupported_option_request() {
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let public = compiler_style_mixed_public_bundle();
+        let mut original = bind_compiler_style_native_bundle_to_public(
+            compiler_style_mixed_tmir_bundle(),
+            &public,
+        );
+        // Unit-only use of the existing audited live issuer. Admission is
+        // scheduling data; even the false sibling needs a real kernel proof
+        // before a caller may omit its ordinary native search.
+        let source =
+            trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut original).unwrap();
+        let baseline = adapter
+            .kernel_replay_admissible_native_obligations(
+                &public,
+                &public.obligations,
+                &original,
+                &source,
+                None,
+                None,
+            )
+            .unwrap();
+        let expected =
+            public.obligations.iter().map(|row| row.obligation_id.clone()).collect::<BTreeSet<_>>();
+        assert_eq!(
+            baseline, expected,
+            "both original claims must pass the non-proving admission gate"
+        );
+        let mut changed = original.clone();
+        let request = changed
+            .requests
+            .iter_mut()
+            .find_map(|request| match request {
+                trust_ir::NativeVerificationRequest::TrustMc(request)
+                    if request.id.index() == 8 =>
+                {
+                    Some(request)
+                }
+                _ => None,
+            })
+            .unwrap();
+        request.options.arithmetic_model = trust_ir::TrustMcArithmeticModel::MathematicalIntegers;
+        let changed_source =
+            trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut changed).unwrap();
+        let admitted = adapter
+            .kernel_replay_admissible_native_obligations(
+                &public,
+                &public.obligations,
+                &changed,
+                &changed_source,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(admitted, BTreeSet::from([public.obligations[0].obligation_id.clone()]));
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_options_refusal_keeps_the_supported_proof_sibling() {
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let public = compiler_style_mixed_public_bundle();
+        let mut native = bind_compiler_style_native_bundle_to_public(
+            compiler_style_mixed_tmir_bundle(),
+            &public,
+        );
+        let refused = native
+            .requests
+            .iter_mut()
+            .find_map(|request| match request {
+                trust_ir::NativeVerificationRequest::TrustMc(request)
+                    if request.id.index() == 8 =>
+                {
+                    Some(request)
+                }
+                _ => None,
+            })
+            .unwrap();
+        refused.options.arithmetic_model = trust_ir::TrustMcArithmeticModel::MathematicalIntegers;
+        native.validate().unwrap();
+        let configured = adapter
+            .native_trust_ir_chc_pdr_translated_obligations_in_live_source(&native, None, None)
+            .unwrap();
+        assert_eq!(configured.obligations.len(), 1);
+        assert_eq!(configured.refused_requests.len(), 1);
+        assert_eq!(configured.refused_requests[0].field, "arithmetic_model");
+        let expected_reason = configured.refused_requests[0].to_string();
+        let (proved, not_proved, refuted) = adapter
+            .native_trust_ir_chc_pdr_proof_transports(&native, None, None)
+            .expect("one option refusal must not discard its supported sibling");
+        assert_eq!(proved.len(), 1);
+        assert_eq!(proved[0].request_id, 7);
+        assert!(refuted.is_empty());
+        assert_eq!(not_proved.len(), 1);
+        let refused_id =
+            native_trust_ir_expected_trust_mc_obligation_id(&public.obligations[1]).unwrap();
+        assert_eq!(
+            not_proved[&native_trust_mc_obligation_lookup_key(&refused_id)],
+            expected_reason
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_options_refusal_prevents_native_proof_credit() {
+        let public = compiler_style_panic_freedom_public_bundle();
+        let original =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &public);
+        for mode in [TrustMcProofMode::Chc, TrustMcProofMode::PdrIc3] {
+            let adapter = TrustMcVerifierApiAdapter::new(
+                TrustMcConfig::new().with_proof_mode(mode).with_timeout(10_000),
+            );
+            let proved = adapter.evidence_from_native_trust_ir_bundle(
+                &public,
+                &public.obligations,
+                &original,
+            );
+            assert_eq!(proved[0].status, EvidenceStatus::Proved, "{proved:#?}");
+            let mut native = original.clone();
+            let request = native
+                .requests
+                .iter_mut()
+                .find_map(|request| match request {
+                    trust_ir::NativeVerificationRequest::TrustMc(request) => Some(request),
+                    _ => None,
+                })
+                .unwrap();
+            request.options.arithmetic_model =
+                trust_ir::TrustMcArithmeticModel::MathematicalIntegers;
+            native.validate().expect("the unsupported encoding selector is structurally valid");
+            let evidence =
+                adapter.evidence_from_native_trust_ir_bundle(&public, &public.obligations, &native);
+            assert_eq!(evidence.len(), 1);
+            let row = &evidence[0];
+            assert_eq!(row.status, EvidenceStatus::Unsupported, "{evidence:#?}");
+            assert!(
+                row.proof_strength.is_none()
+                    && row.artifacts.is_empty()
+                    && row.counterexample.is_none()
+            );
+            assert!(row.decline.is_none());
+            assert!(row.diagnostics[0].contains("request options rejected"));
+            assert!(row.diagnostics[0].contains("arithmetic_model=MathematicalIntegers"));
+            assert!(row.diagnostics[0].contains("the native translator implements bitvectors"));
+
+            // Zero frames is rejected earlier by the canonical IR validator,
+            // not by the configured per-request unsupported-profile channel.
+            let mut zero = original.clone();
+            let request = zero
+                .requests
+                .iter_mut()
+                .find_map(|request| match request {
+                    trust_ir::NativeVerificationRequest::TrustMc(request) => Some(request),
+                    _ => None,
+                })
+                .unwrap();
+            request.options.chc.pdr.max_frames = Some(0);
+            let errors = zero.validate().expect_err("zero frames is structurally invalid");
+            assert_eq!(errors.len(), 1, "only the original zero-frame option changed");
+            assert!(matches!(&errors[0],
+                trust_ir::NativeVerificationBundleError::InvalidTrustMcChcOptions { request, field }
+                    if request.index() == 7 && *field == "chc.pdr.max_frames"));
+            let rejected =
+                adapter.evidence_from_native_trust_ir_bundle(&public, &public.obligations, &zero);
+            assert_eq!(rejected.len(), 1);
+            let row = &rejected[0];
+            assert_eq!(row.status, EvidenceStatus::Unsupported, "{rejected:#?}");
+            assert!(
+                row.proof_strength.is_none()
+                    && row.artifacts.is_empty()
+                    && row.counterexample.is_none()
+            );
+            assert!(row.decline.is_none());
+            assert!(
+                row.diagnostics
+                    .iter()
+                    .any(|reason| reason.contains("native verification bundle validation failed")),
+                "the adapter must retain its original structural validation refusal: {rejected:#?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_proof_rejects_options_only_mutation_and_foreign_live_verification() {
+        let public = compiler_style_safe_public_bundle();
+        let original =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &public);
+        let mut changed = original.clone();
+        let changed_request = changed
+            .requests
+            .iter_mut()
+            .find_map(|request| match request {
+                trust_ir::NativeVerificationRequest::TrustMc(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        changed_request.options.chc.pdr.max_frames = Some(1);
+        let changed_config =
+            trust_mc_trust_bmc::EffectiveNativeMcRequestConfig::from_request(changed_request)
+                .unwrap();
+        changed.validate().unwrap();
+        let runner = trust_mc_driver::NativeTrustIrChcPdrRunner::with_solve_options(
+            trust_mc_core::ChcPdrSolveOptions::default()
+                .with_engine(trust_mc_core::ChcPdrEngine::Pdr)
+                .with_timeout(std::time::Duration::from_secs(10)),
+        );
+        let solve = |native: &trust_ir::NativeVerificationBundle| {
+            runner.solve_bundle_native_proof_grade(native).unwrap().obligations.pop().unwrap()
+        };
+        let mut row = solve(&original);
+        row.verification.authorized_native_proof().expect("real original proof");
+        assert_ne!(row.translated.request_config.request_digest(), changed_config.request_digest());
+        row.translated.request_config = changed_config;
+        let reason = NativeTrustIrChcPdrAuthorizedProof::try_from_bundle_evidence(row).unwrap_err();
+        assert!(reason.contains("request configuration"), "{reason}");
+
+        let mut old_row = solve(&original);
+        let mut changed_row = solve(&changed);
+        old_row.verification.authorized_native_proof().unwrap();
+        changed_row.verification.authorized_native_proof().unwrap();
+        validate_native_trust_mc_consumer_request_config(&old_row.translated, &old_row.translated)
+            .unwrap();
+        assert!(
+            validate_native_trust_mc_consumer_request_config(
+                &old_row.translated,
+                &changed_row.translated
+            )
+            .is_err(),
+            "a coherent foreign profile is not the retained consumer request"
+        );
+        std::mem::swap(&mut old_row.verification, &mut changed_row.verification);
+        std::mem::swap(&mut old_row.transport, &mut changed_row.transport);
+        for row in [old_row, changed_row] {
+            assert!(
+                NativeTrustIrChcPdrAuthorizedProof::try_from_bundle_evidence(row).is_err(),
+                "a coherent foreign live verification cannot answer another request profile"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_refutation_uses_the_fresh_consumers_request_configuration() {
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let mut public = compiler_style_panic_freedom_public_bundle();
+        attest_synthetic_typed_chc_encoding_exact(&mut public.obligations[0]);
+        let original = bind_compiler_style_native_bundle_to_public(
+            compiler_style_loop_overflow_tmir_bundle(),
+            &public,
+        );
+        let (_, _, refuted) =
+            adapter.native_trust_ir_chc_pdr_proof_transports(&original, None, None).unwrap();
+        let row = refuted.values().next().expect("original real false-loop witness");
+        let fresh =
+            adapter.native_trust_ir_chc_pdr_translated_obligations(&original, None).unwrap();
+        let engine = trust_mc_core::ChcPdrEngine::Pdr;
+        native_refutation::check(
+            &public,
+            &public.obligations[0],
+            &fresh.iter().collect::<Vec<_>>(),
+            row,
+            engine,
+        )
+        .expect("original witness independently replays under its own request profile");
+        let mut changed = original.clone();
+        let request = changed
+            .requests
+            .iter_mut()
+            .find_map(|request| match request {
+                trust_ir::NativeVerificationRequest::TrustMc(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        request.options.chc.pdr.max_frames = Some(1);
+        changed.validate().unwrap();
+        let changed_rows =
+            adapter.native_trust_ir_chc_pdr_translated_obligations(&changed, None).unwrap();
+        assert_ne!(
+            fresh[0].request_config.effective_config_digest(),
+            changed_rows[0].request_config.effective_config_digest()
+        );
+        let expected =
+            trust_mc_driver::normalized_typed_chc_pdr_input(&changed_rows[0].obligation).unwrap();
+        let original_normalized =
+            trust_mc_driver::normalized_typed_chc_pdr_input(&fresh[0].obligation).unwrap();
+        assert_eq!(
+            expected.normalized_input, original_normalized.normalized_input,
+            "only request configuration changed, not the encoded program"
+        );
+        let trust_mc_core::ChcPdrSolveStatus::Refuted { witness: Some(witness) } =
+            &row.verification.outcome.status
+        else {
+            panic!("original false loop retains its actual witness");
+        };
+        let options = changed_rows[0]
+            .request_config
+            .solve_options(&trust_mc_core::ChcPdrSolveOptions::default().with_engine(engine));
+        let reason = validate_typed_chc_pdr_refutation_witness_with_options(
+            witness,
+            &public.obligations[0],
+            &row.verification.outcome.obligation_id,
+            &expected,
+            &options,
+        )
+        .unwrap_err();
+        assert!(reason.contains("semantic-configuration digest"), "{reason}");
+        assert!(
+            native_refutation::check(
+                &public,
+                &public.obligations[0],
+                &changed_rows.iter().collect::<Vec<_>>(),
+                row,
+                engine
+            )
+            .is_err()
         );
     }
 
@@ -17474,7 +19531,10 @@ mod tests {
                 None,
             )
             .expect_err("the ordinary root adapter route must default-deny source Assume");
-        assert!(ordinary.contains("unauthenticated Assume"), "unexpected rejection: {ordinary}");
+        assert!(
+            ordinary.to_string().contains("unauthenticated Assume"),
+            "unexpected rejection: {ordinary}"
+        );
 
         let authority =
             trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut native_bundle)
@@ -17496,7 +19556,7 @@ mod tests {
             )
             .expect_err("a cloned bundle must lose source authority");
         assert!(
-            clone_error.contains("unauthenticated Assume"),
+            clone_error.to_string().contains("unauthenticated Assume"),
             "unexpected clone rejection: {clone_error}"
         );
 
@@ -17515,7 +19575,7 @@ mod tests {
             )
             .expect_err("cross-bundle source authority must fail closed");
         assert!(
-            mismatch.contains("unauthenticated Assume"),
+            mismatch.to_string().contains("unauthenticated Assume"),
             "unexpected mismatch rejection: {mismatch}"
         );
     }
@@ -18355,6 +20415,43 @@ mod tests {
     }
 
     #[test]
+    fn typed_chc_signed_bitvector_remainder_deserializes_without_unsigned_reinterpretation() {
+        let source = serde_json::json!({
+            "kind": "binary",
+            "op": "bv_srem",
+            "lhs": { "kind": "var", "name": "x", "sort": { "kind": "bit_vec", "width": 8 } },
+            "rhs": { "kind": "bit_vec_const", "value": 2, "width": 8 },
+        });
+        let input: TrustMcTypedChcExprInput = serde_json::from_value(source.clone()).unwrap();
+        let vars = BTreeMap::from([("x".to_string(), Sort::bitvec(8))]);
+        let signed = input.to_trust_mc_expr(&vars).expect("new producer operation must lower");
+        assert!(matches!(signed.value(), ay_bindings::ExprValue::BvSRem(..)));
+        let expected =
+            Expr::var("x".to_string(), Sort::bitvec(8)).bvsrem(Expr::bitvec_const(2_i128, 8));
+        assert_eq!(signed, expected);
+        let mut unsigned = source.clone();
+        unsigned["op"] = serde_json::json!("bv_urem");
+        let unsigned: TrustMcTypedChcExprInput = serde_json::from_value(unsigned).unwrap();
+        let unsigned = unsigned.to_trust_mc_expr(&vars).unwrap();
+        assert!(matches!(unsigned.value(), ay_bindings::ExprValue::BvURem(..)));
+        assert_ne!(signed, unsigned, "a negative dividend distinguishes these operators");
+
+        for rhs in [
+            serde_json::json!({ "kind": "int_const", "value": "2" }),
+            serde_json::json!({ "kind": "bool_const", "value": true }),
+            serde_json::json!({ "kind": "bit_vec_const", "value": 2, "width": 16 }),
+        ] {
+            let mut malformed = source.clone();
+            malformed["rhs"] = rhs;
+            let input: TrustMcTypedChcExprInput = serde_json::from_value(malformed).unwrap();
+            assert!(input.to_trust_mc_expr(&vars).is_err(), "sort mismatch must fail closed");
+        }
+        let mut division = source;
+        division["op"] = serde_json::json!("bv_sdiv");
+        assert!(serde_json::from_value::<TrustMcTypedChcExprInput>(division).is_err());
+    }
+
+    #[test]
     fn typed_chc_truncating_division_and_remainder_match_rust_signed_semantics() {
         let binary = super::trust_mc_typed_chc_binary_expr;
 
@@ -18619,5 +20716,194 @@ mod tests {
         }))
         .unwrap();
         assert!(missing_width.to_trust_mc_expr(&var_sorts).is_err());
+    }
+
+    #[test]
+    fn wave491_semantic_projection_and_digest_and_contract_cache_match_oracle() {
+        use serde_json::json;
+
+        let make_contract = |id: &str, value: serde_json::Value| TrustContract {
+            contract_id: id.to_string(),
+            kind: ContractKind::Asserts,
+            predicate: ContractPredicate::MathIr {
+                schema: TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION.to_string(),
+                value,
+            },
+            source: SourceLocation::default(),
+            metadata: Vec::new(),
+        };
+
+        let canonical = make_contract(
+            "canon",
+            json!({
+                "schema_version": TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION,
+                "origin": "mir_derived",
+                "function_name": "demo::f",
+                "query": { "target": "bad" },
+                "vars": [{ "name": "x", "sort": { "kind": "int" } }],
+                "relations": [{ "name": "bad", "arg_sorts": [] }],
+                "rules": [{
+                    "head": { "name": "bad", "args": [] },
+                    "body": { "constraints": [{ "kind": "bool_const", "value": false }] }
+                }]
+            }),
+        );
+        let native_matching = make_contract(
+            "marker",
+            json!({
+                "schema_version": TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION,
+                "obligation_id": "trust_ir-native-trust-mc-request-0-proof-0",
+                "native_metadata": {
+                    "native_request_id": 0,
+                    "proof_obligation_ids": [0],
+                    "function_id": 0
+                },
+                "origin": "mir_derived",
+                "function_name": "demo::f",
+                "query": { "target": "bad" },
+                "vars": [{ "name": "x", "sort": { "kind": "int" } }],
+                "relations": [{ "name": "bad", "arg_sorts": [] }],
+                "rules": [{
+                    "head": { "name": "bad", "args": [] },
+                    "body": { "constraints": [{ "kind": "bool_const", "value": false }] }
+                }]
+            }),
+        );
+        assert!(
+            validate_compiler_canonical_trust_mc_semantic_projection(&canonical, &native_matching)
+                .is_ok()
+        );
+
+        let native_extra_semantic = make_contract(
+            "marker-extra",
+            json!({
+                "schema_version": TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION,
+                "obligation_id": "trust_ir-native-trust-mc-request-0-proof-0",
+                "origin": "mir_derived",
+                "function_name": "demo::f",
+                "extra_semantic_field": 1,
+                "query": { "target": "bad" },
+                "vars": [{ "name": "x", "sort": { "kind": "int" } }],
+                "relations": [{ "name": "bad", "arg_sorts": [] }],
+                "rules": []
+            }),
+        );
+        assert!(
+            validate_compiler_canonical_trust_mc_semantic_projection(
+                &canonical,
+                &native_extra_semantic
+            )
+            .is_err()
+        );
+
+        // Digest streaming matches explicit prefix + to_vec reference bytes.
+        let ContractPredicate::MathIr { value, .. } = &native_matching.predicate else {
+            panic!("expected MathIr");
+        };
+        let canonical_json = trust_types::canonical_json_value(value);
+        let mut expected_bytes = b"trust-mc.typed-chc-obligation.digest.v1\0".to_vec();
+        expected_bytes.extend(serde_json::to_vec(&canonical_json).unwrap());
+        let expected_digest = stable_sha256_hex(&expected_bytes);
+        assert_eq!(trust_mc_typed_chc_value_digest(value).unwrap(), expected_digest);
+
+        // ContractChcCache returns identical parsed inputs and digests on repeated lookups.
+        let contracts = vec![canonical.clone(), native_matching.clone()];
+        let cache = ContractChcCache::new(&contracts);
+        assert_eq!(cache.indices("canon"), &[0]);
+        assert_eq!(cache.indices("marker"), &[1]);
+        assert!(cache.indices("missing").is_empty());
+        assert_eq!(cache.input_digest(1, &contracts[1]).unwrap(), expected_digest);
+        assert_eq!(cache.input_digest(1, &contracts[1]).unwrap(), expected_digest);
+        assert!(cache.parsed_input(0, &contracts[0]).unwrap().is_some());
+        assert!(cache.parsed_input(99, &contracts[0]).is_err());
+
+        // Lowercase sha256 validator accepts exact 64-char lowercase hex and rejects uppercase/short.
+        assert!(is_lowercase_sha256_hex(&expected_digest));
+        assert!(!is_lowercase_sha256_hex(&expected_digest.to_ascii_uppercase()));
+        assert!(!is_lowercase_sha256_hex(&expected_digest[..63]));
+    }
+    #[test]
+    fn native_routing_identity_preserves_mc_metadata_policy_and_rejects_conflicts() {
+        fn legacy(row: &TrustObligation) -> Option<String> {
+            let suite =
+                obligation_metadata_value(row, TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY)?;
+            if suite != "trust-mc" {
+                return None;
+            }
+            let request = canonical_u32_metadata_value(obligation_metadata_value(
+                row,
+                TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY,
+            )?)?;
+            let proof = canonical_u32_metadata_value(obligation_metadata_value(
+                row,
+                TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY,
+            )?)?;
+            Some(format!("trust_ir-native-trust-mc-request-{request}-proof-{proof}"))
+        }
+        for request in ["0", "7", "4294967295", "07", "+7", "-1", "4294967296", ""] {
+            for proof in ["0", "2", "02", "bad"] {
+                let mut row = obligation(ObligationKind::Assertion, "public");
+                row.metadata = [
+                    (TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY, "trust-mc"),
+                    (TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY, request),
+                    (TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY, proof),
+                ]
+                .into_iter()
+                .map(|(key, value)| MetadataEntry { key: key.into(), value: value.into() })
+                .collect();
+                assert_eq!(native_trust_ir_expected_trust_mc_obligation_id(&row), legacy(&row));
+            }
+        }
+        let mut row =
+            obligation(ObligationKind::Assertion, "trust_ir-native-trust-mc-request-7-proof-2");
+        row.metadata = [
+            (TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY, "trust-mc"),
+            (TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY, "7"),
+            (TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY, "2"),
+        ]
+        .into_iter()
+        .map(|(key, value)| MetadataEntry { key: key.into(), value: value.into() })
+        .collect();
+        assert_eq!(native_trust_ir_expected_trust_mc_obligation_id(&row), legacy(&row));
+        for key in [
+            TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY,
+            TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY,
+            TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY,
+        ] {
+            let mut duplicate = row.clone();
+            duplicate
+                .metadata
+                .push(duplicate.metadata.iter().find(|entry| entry.key == key).unwrap().clone());
+            assert!(native_trust_ir_expected_trust_mc_obligation_id(&duplicate).is_none());
+            let mut missing = row.clone();
+            missing.metadata.retain(|entry| entry.key != key);
+            assert!(native_trust_ir_expected_trust_mc_obligation_id(&missing).is_none());
+        }
+        for id in [
+            "trust_ir-native-trust_mc-request-7-proof-2",
+            "trust_ir-native-TRUST_MC-request-7-proof-2",
+        ] {
+            row.obligation_id = id.into();
+            assert!(native_trust_ir_expected_trust_mc_obligation_id(&row).is_some());
+        }
+        for suite in ["TRUST-MC", "trust_mc"] {
+            let mut wrong = row.clone();
+            wrong
+                .metadata
+                .iter_mut()
+                .find(|entry| entry.key == TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY)
+                .unwrap()
+                .value = suite.into();
+            assert!(native_trust_ir_expected_trust_mc_obligation_id(&wrong).is_none());
+        }
+        for changed in [
+            "trust_ir-native-trust-mc-request-8-proof-2",
+            "trust_ir-native-trust-mc-request-7-proof-3",
+            "trust_ir-native-trust-vc-request-7-proof-2",
+        ] {
+            row.obligation_id = changed.into();
+            assert!(legacy(&row).is_some(), "old metadata-only reader ignored the conflict");
+            assert!(native_trust_ir_expected_trust_mc_obligation_id(&row).is_none(), "{changed}");
+        }
     }
 }

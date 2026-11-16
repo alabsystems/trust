@@ -1,132 +1,188 @@
-use std::ops::Deref;
-
-use rustc_hir::def::DefKind;
+use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::mir::{
-    Body, Const, ConstValue, Operand, Place, RETURN_PLACE, Rvalue, START_BLOCK, StatementKind,
-    TerminatorKind, UnevaluatedConst,
-};
-use rustc_middle::ty::{Ty, TyCtxt, TypeVisitableExt};
+use rustc_hir::{ExprKind, StmtKind, UnOp};
+use rustc_middle::mir::{Const, ConstValue};
+use rustc_middle::ty::{AnonConstKind, LitToConstInput, Ty, TyCtxt, TypeVisitableExt};
+
+/// Trust: fast pure-HIR syntactic shape filter before querying `clauses_of`
+/// (`has_impossible_clauses`), `opaque_types_defined_by`, or `typeck`.
+/// Any non-trivial const expression (calls, binary ops, structs, arrays, blocks
+/// with non-item statements, etc.) returns `false` immediately without touching
+/// query tables or allocating an `InferCtxt`.
+#[inline]
+fn is_syntactically_trivial_hir(mut expr: &rustc_hir::Expr<'_>) -> bool {
+    loop {
+        match expr.kind {
+            ExprKind::Lit(_) | ExprKind::Path(_) => return true,
+            ExprKind::Unary(UnOp::Neg, inner) => return matches!(inner.kind, ExprKind::Lit(_)),
+            ExprKind::Cast(source_expr, _cast_ty) => expr = source_expr,
+            ExprKind::Block(block, _label) => {
+                if block.targeted_by_break {
+                    return false;
+                }
+                if matches!(
+                    block.rules,
+                    rustc_hir::BlockCheckMode::UnsafeBlock(rustc_hir::UnsafeSource::UserProvided)
+                ) {
+                    return false;
+                }
+                if block.stmts.iter().any(|stmt| !matches!(stmt.kind, StmtKind::Item(..))) {
+                    return false;
+                }
+                let Some(block_expr) = block.expr else {
+                    return true;
+                };
+                expr = block_expr;
+            }
+            _ => return false,
+        }
+    }
+}
 
 /// If the given def is a trivial const, returns the value and type the const evaluates to.
 ///
 /// A "trivial const" is a const which can be easily proven to evaluate successfully, and the value
-/// that it evaluates to can be easily found without going through the usual MIR phases for a const.
+/// that it evaluates to can be easily found from HIR without building THIR or MIR or going through
+/// the usual MIR phases for a const.
 ///
-/// Currently, we support two forms of trivial const.
+/// Currently, we support two forms of trivial const:
 ///
-/// The base case is this:
+/// 1. Literal (optionally negated, or unit `{}` block, or wrapped in no-op coercion casts / blocks
+///    containing only item declarations):
 /// ```
 /// const A: usize = 0;
 /// ```
-/// which has this MIR:
-/// ```text
-/// const A: usize = {
-///     let mut _0: usize;
-///
-///     bb0: {
-///         _0 = const 0_usize;
-///         return;
-///     }
-/// }
-/// ```
-/// Which we recognize by looking for a Body which has a single basic block with a return
-/// terminator and a single statement which assigns an `Operand::Constant(Const::Val)` to the
-/// return place.
-/// This scenario meets the required criteria because:
-/// * Control flow cannot panic, we don't have any calls or assert terminators
-/// * The value of the const is already computed, so it cannot fail
-///
-/// In addition to assignment of literals, assignments of trivial consts are also considered
-/// trivial consts. In this case, both `A` and `B` are trivial:
+/// 2. Path referencing another trivial const:
 /// ```
 /// const A: usize = 0;
 /// const B: usize = A;
 /// ```
-pub(crate) fn trivial_const<'a, 'tcx: 'a, F, B>(
+///
+/// Being conservative is essential:
+/// - False negatives are fine: the ordinary path builds and analyzes THIR/MIR as normal.
+/// - False positives are unsound: they would skip borrowck, unsafety checking, and const qualif.
+pub(crate) fn trivial_const<'tcx>(
     tcx: TyCtxt<'tcx>,
     def: LocalDefId,
-    body_provider: F,
-) -> Option<(ConstValue, Ty<'tcx>)>
-where
-    F: FnOnce() -> B,
-    B: Deref<Target = Body<'tcx>>,
-{
+) -> Option<(ConstValue, Ty<'tcx>)> {
     match tcx.def_kind(def) {
-        DefKind::AssocConst { .. } | DefKind::Const { .. } | DefKind::AnonConst => (),
-        DefKind::InlineConst if tcx.is_type_system_inline_const(def) => (),
+        DefKind::AssocConst | DefKind::Const => (),
+        DefKind::AnonConst if tcx.anon_const_kind(def) != AnonConstKind::NonTypeSystemInline => (),
         _ => return None,
     }
 
-    let body = body_provider();
+    let body = tcx.hir_maybe_body_owned_by(def)?;
 
-    // Trust: the cheap structural shape checks run FIRST — any const whose
-    // body is not literally `_0 = const X; return` (arithmetic, calls,
-    // multiple statements) bails here without paying the
-    // impossible-predicates evaluation (fresh InferCtxt + ObligationCtxt per
-    // call) or the opaque_types_defined_by query below. This path runs for
-    // every const-like def (array lengths, enum discriminants, const generic
-    // args) at all opt levels. Both call paths have mir_built computed
-    // already, so forcing the body first costs nothing extra.
-    if body.basic_blocks.len() != 1 {
+    // Bail if there are arg patterns.
+    if !body.params.is_empty() {
         return None;
     }
 
-    let block = &body.basic_blocks[START_BLOCK];
-    if block.statements.len() != 1 {
+    // Trust: cheap syntactic HIR shape check runs FIRST so non-trivial consts
+    // (calls, arithmetic, aggregates, etc.) bail out in O(1) without querying
+    // `has_impossible_clauses`, `opaque_types_defined_by`, or `typeck`.
+    if !is_syntactically_trivial_hir(body.value) {
         return None;
     }
 
-    if block.terminator().kind != TerminatorKind::Return {
-        return None;
-    }
-
-    let StatementKind::Assign((place, rvalue)) = &block.statements[0].kind else {
-        return None;
-    };
-
-    if *place != Place::from(RETURN_PLACE) {
-        return None;
-    }
-
-    let Rvalue::Use(Operand::Constant(c), _) = rvalue else {
-        return None;
-    };
-
-    if body.has_opaque_types() {
-        return None;
-    }
-
-    // If there are impossible predicates then MIR passes will replace the body with
+    // If there are impossible clauses then MIR passes will replace the body with
     // `unreachable` causing const eval errors when trying to evaluate the body. For
     // now we avoid using trivial consts for such bodies so that the behaviour doesn't
     // change.
-    if crate::impossible_predicates::has_impossible_predicates(tcx, def.into()) {
+    if crate::impossible_clauses::has_impossible_clauses(tcx, def.into()) {
         return None;
     }
 
     if !tcx.opaque_types_defined_by(def).is_empty() {
         return None;
     }
-    match c.const_ {
-        Const::Ty(..) => None,
-        Const::Unevaluated(UnevaluatedConst { def, args, .. }, _ty) => {
-            if !args.is_empty() {
-                return None;
-            }
-            tcx.trivial_const(def)
-        }
-        Const::Val(v, ty) => Some((v, ty)),
-    }
-}
 
-// The query provider is based on calling the free function trivial_const, which calls mir_built,
-// which internally has a fast-path for trivial consts so it too calls trivial_const. This isn't
-// recursive, but we are checking if the const is trivial twice. A better design might detect
-// trivial consts before getting to MIR, which would hopefully straighten this out.
-pub(crate) fn trivial_const_provider<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def: LocalDefId,
-) -> Option<(ConstValue, Ty<'tcx>)> {
-    trivial_const(tcx, def, || tcx.mir_built(def).borrow())
+    // Bail if there are any type errors, to let MIR build produce an error body.
+    let typeck_results = tcx.typeck(def);
+    if typeck_results.tainted_by_errors.is_some() {
+        return None;
+    }
+
+    let mut expr = body.value;
+    let (lit, neg) = loop {
+        // Don't allow adjustments, e.g. coercions, derefs.
+        if !typeck_results.expr_adjustments(expr).is_empty() {
+            return None;
+        }
+
+        match expr.kind {
+            ExprKind::Lit(lit) => break (lit, false),
+            ExprKind::Unary(UnOp::Neg, inner) => match inner.kind {
+                ExprKind::Lit(lit) if !typeck_results.is_method_call(expr) => {
+                    break (lit, true);
+                }
+                _ => return None,
+            },
+            ExprKind::Cast(source_expr, cast_ty) => {
+                // Coercion casts are effectively no-ops.
+                if !typeck_results.is_coercion_cast(source_expr.hir_id) {
+                    return None;
+                }
+                if typeck_results.user_provided_types().get(cast_ty.hir_id).is_some() {
+                    // Gets wrapped in `thir::ExprKind::ValueTypeAscription`.
+                    return None;
+                }
+                expr = source_expr;
+            }
+            ExprKind::Path(qpath) => {
+                let res = typeck_results.qpath_res(&qpath, expr.hir_id);
+                let Res::Def(DefKind::Const | DefKind::AssocConst, def_id) = res else {
+                    return None;
+                };
+                if !typeck_results.node_args(expr.hir_id).is_empty() {
+                    return None;
+                }
+                if tcx.is_direct_const(def_id) {
+                    return None;
+                }
+                return tcx.trivial_const(def_id);
+            }
+            ExprKind::Block(block, _label) => {
+                if block.targeted_by_break {
+                    return None;
+                }
+                if matches!(
+                    block.rules,
+                    rustc_hir::BlockCheckMode::UnsafeBlock(rustc_hir::UnsafeSource::UserProvided)
+                ) {
+                    return None;
+                }
+                for stmt in block.stmts {
+                    // Allow items; THIR discards them.
+                    let StmtKind::Item(..) = stmt.kind else {
+                        return None;
+                    };
+                }
+                if let Some(block_expr) = block.expr {
+                    expr = block_expr;
+                } else {
+                    let ty = typeck_results.expr_ty(expr);
+                    return if ty.is_unit() { Some((ConstValue::ZeroSized, ty)) } else { None };
+                }
+            }
+            _ => return None,
+        }
+    };
+
+    let ty = typeck_results.expr_ty(expr);
+    if ty.references_error() {
+        return None;
+    }
+
+    if ty.has_opaque_types() || tcx.type_of(def).instantiate_identity().has_opaque_types() {
+        return None;
+    }
+
+    let input = LitToConstInput { lit: lit.node, ty: Some(ty), neg };
+    let const_ = rustc_mir_build::lit_to_mir_constant(tcx, input);
+    match const_ {
+        Const::Ty(..) => None,
+        Const::Val(v, ty) => Some((v, ty)),
+        Const::Unevaluated(..) => unreachable!(),
+    }
 }

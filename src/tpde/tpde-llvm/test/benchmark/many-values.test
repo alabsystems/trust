@@ -1,0 +1,22 @@
+# NOTE: Do not autogenerate
+# SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# RUN: python3 %s 2000 | tpde-llc --target=x86_64 | %objdump | FileCheck %s
+# RUN: python3 %s 2000 | tpde-llc --target=aarch64 | %objdump | FileCheck %s
+
+# Test for a function with many values that are live at the same time.
+
+# CHECK: <f>:
+
+import sys
+
+n = int(sys.argv[1])
+print("define void @f(ptr %p) {")
+for j in range(2):
+    for i in range(n):
+        print(f'  %a{j}_{i} = load volatile i32, ptr %p')
+    for i in range(n):
+        print(f'  store volatile i32 %a{j}_{i}, ptr %p')
+print('  ret void')
+print('}')

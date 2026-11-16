@@ -51,6 +51,7 @@ fn setter_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -98,7 +99,14 @@ fn caller_fn() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
-                        callee_identity: None,
+                        callee_identity: Some(trust_types::CalleeIdentity {
+                            // A concrete call: the compiler gives it an identity, and a body-derived
+                            // summary applies only to a call to its own body (`crate::call_reaches_summarized_body`).
+                            stable_crate_id: 1,
+                            def_index: 1,
+                            substs_digest: [0, 0],
+                        }),
+                        callee_key: crate::sep_engine::tests::fixture_key(&SETTER.to_string()),
                         is_foreign: false,
                     },
                 },
@@ -112,6 +120,7 @@ fn caller_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -121,9 +130,12 @@ fn post_call_guards_with(
     funcs: &[VerifiableFunction],
     caller: &VerifiableFunction,
 ) -> Vec<Formula> {
+    let summaries = compute_trivial_setter_summaries(funcs);
+    let ids = crate::test_summary_body_identities(summaries.keys().cloned());
     let _summary_scope = crate::enter_test_callee_summaries(
         crate::CalleeSummaryContext::default()
-            .with_setter_summaries(compute_trivial_setter_summaries(funcs)),
+            .with_setter_summaries(summaries)
+            .with_summary_body_identities(ids),
     );
     build_semantic_guard_map(caller).get(&BlockId(1)).cloned().unwrap_or_default()
 }
@@ -316,6 +328,7 @@ fn rejects_call_and_assert_terminators() {
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key("other"),
         is_foreign: false,
     };
     assert!(compute_trivial_setter_summaries(&[with_call]).is_empty());

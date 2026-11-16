@@ -3,6 +3,7 @@
 //! > crate may make major changes to its APIs or be deprecated without warning.
 
 #![allow(clippy::print_stderr)]
+#![allow(clippy::disallowed_types)]
 
 pub mod helpers;
 pub mod sat;
@@ -13,16 +14,17 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::time::Instant;
 
-use cargo::core::Resolve;
-use cargo::core::ResolveVersion;
-use cargo::core::SourceId;
-use cargo::core::dependency::DepKind;
-use cargo::core::resolver::{self, ResolveOpts, VersionOrdering, VersionPreferences};
-use cargo::core::{Dependency, PackageId, Registry, Summary};
-use cargo::sources::IndexSummary;
-use cargo::sources::source::QueryKind;
-use cargo::util::interning::InternedString;
-use cargo::util::{CargoResult, GlobalContext};
+use targo::resolver::Resolve;
+use targo::resolver::ResolveVersion;
+use targo::resolver::{self, ResolveOpts, VersionOrdering, VersionPreferences};
+use targo::sources::IndexSummary;
+use targo::sources::source::QueryKind;
+use targo::util::VersionReqMatchMode;
+use targo::util::interning::InternedString;
+use targo::util::{CargoResult, GlobalContext};
+use targo::workspace::SourceId;
+use targo::workspace::dependency::DepKind;
+use targo::workspace::{Dependency, PackageId, Registry, Summary};
 
 use crate::helpers::{ToPkgId, dep_req, dep_req_kind, pkg_dep, pkg_id};
 use crate::sat::SatResolver;
@@ -86,7 +88,7 @@ pub fn resolve_and_validated_raw(
                     }
                     stack.extend(resolve.deps(p).map(|(dp, deps)| {
                         for d in deps {
-                            assert!(d.matches_id(dp));
+                            assert!(d.matches_id(dp, VersionReqMatchMode::Default));
                         }
                         dp
                     }));
@@ -142,8 +144,10 @@ pub fn resolve_with_global_context_raw(
         ) -> CargoResult<()> {
             for summary in self.list.iter() {
                 let matched = match kind {
-                    QueryKind::Exact => dep.matches(summary),
-                    QueryKind::RejectedVersions => dep.matches(summary),
+                    QueryKind::Exact => dep.matches(summary, VersionReqMatchMode::Default),
+                    QueryKind::RejectedVersions => {
+                        dep.matches(summary, VersionReqMatchMode::Default)
+                    }
                     QueryKind::AlternativeNames => true,
                     QueryKind::Normalized => true,
                 };
@@ -203,7 +207,7 @@ pub fn resolve_with_global_context_raw(
         &mut registry,
         &version_prefs,
         ResolveVersion::with_rust_version(None),
-        Some(gctx),
+        gctx,
     );
 
     // The largest test in our suite takes less then 30 secs.

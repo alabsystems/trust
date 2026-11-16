@@ -15,7 +15,7 @@
 // prove.rs/mirsem.rs/clean_ground.rs from here — it only measures.
 //
 // Run with:
-//   RUSTC_BOOTSTRAP=1 cargo test -p trust-clean --manifest-path crates/Cargo.toml \
+//   targo --unverified test -p trust-clean --manifest-path crates/Cargo.toml \
 //       --test either_discriminant_guard -- --nocapture
 
 use std::path::Path;

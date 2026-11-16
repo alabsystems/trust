@@ -4,10 +4,9 @@
 // Many safety VCs emitted for a single function (or across functions) are
 // structurally identical up to bound-variable renaming — e.g. dozens of
 // `index out of bounds` obligations whose formula is the same alpha-equivalent
-// shape. The parallel cache path already coalesces duplicate cache *misses* by
-// formula hash (`solver_cache::pending_miss_by_key`); the sequential path
-// (`Router::verify_all_with_deadline`) did not, so it re-solved each duplicate
-// 1:1.
+// shape. Without this, `Router::verify_all_with_deadline` re-solved each
+// duplicate 1:1. The dedup is within one batch: nothing is carried from one
+// batch, or one function, to the next.
 //
 // This module provides the alpha-equivalence machinery (ported here so
 // `trust-router` need not depend on the downstream `trust-vcgen` crate, which
@@ -39,9 +38,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 
-use trust_types::fx::FxHashMap;
+use trust_types::fx::{FxHashMap, FxHasher};
 use trust_types::{Formula, Sort, VcKind, VerificationCondition};
 
 /// One group of structurally-equivalent VCs that share a single solve.
@@ -71,43 +71,52 @@ pub(crate) struct DedupGroup {
 ///     bound-variable renaming AND their plan signatures are equal.
 pub(crate) fn dedup_groups<K, F>(
     vcs: &[VerificationCondition],
-    plan_signature: F,
+    mut plan_signature: F,
 ) -> Vec<DedupGroup>
 where
     K: Eq + Hash,
-    F: Fn(usize) -> K,
+    F: FnMut(usize) -> K,
 {
     // Bucket candidate matches by a cheap composite hash so the exact
     // equivalence check only runs against plausible peers. The bucket key folds
     // the plan-signature hash, the VC-kind description, and the alpha-normalized
-    // formula fingerprint together.
-    let mut buckets: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-    let mut groups: Vec<DedupGroup> = Vec::new();
-    // group_of[i] = index into `groups` for the group VC i was assigned to.
-    let mut group_of: Vec<Option<usize>> = vec![None; vcs.len()];
+    // formula fingerprint together. Each bucket entry stores
+    // `(group_idx, sig, kind_desc, normalized_formula)` for a group representative
+    // so `plan_signature`, `VcKind::description`, and `normalize_alpha_cow` are
+    // evaluated at most once per VC.
+    let mut buckets: FxHashMap<u64, Vec<(usize, K, String, Cow<'_, Formula>)>> =
+        FxHashMap::default();
+    let mut groups: Vec<DedupGroup> = Vec::with_capacity(vcs.len());
 
-    for i in 0..vcs.len() {
+    for (i, vc) in vcs.iter().enumerate() {
+        // Automaton-bearing obligations are never merged with any other VC;
+        // skip signature evaluation, normalization, and bucketing altogether.
+        if carries_unmodeled_machine(&vc.kind) {
+            groups.push(DedupGroup { representative: i, members: vec![i] });
+            continue;
+        }
+
         let sig = plan_signature(i);
         let sig_hash = {
-            let mut h = std::hash::DefaultHasher::new();
+            let mut h = FxHasher::default();
             sig.hash(&mut h);
             h.finish()
         };
-        let bucket_key = bucket_hash(sig_hash, &vcs[i]);
+        let kind_desc = vc.kind.description();
+        let norm_i = normalize_alpha_cow(&vc.formula);
+        let bucket_key = bucket_hash(sig_hash, &kind_desc, &norm_i);
 
         // Look for an existing representative in this bucket that is exactly
         // equivalent to vcs[i] AND shares the same plan signature.
         let mut merged_into: Option<usize> = None;
         if let Some(bucket) = buckets.get(&bucket_key) {
-            for &candidate in bucket.iter() {
-                let group_idx = group_of[candidate].expect("bucket member must have a group");
-                let rep = groups[group_idx].representative;
-                // Same routing requirements?
-                if plan_signature(rep) != sig {
+            for &(group_idx, ref rep_sig, ref rep_desc, ref rep_norm) in bucket.iter() {
+                if *rep_sig != sig || *rep_desc != kind_desc {
                     continue;
                 }
+                let rep = groups[group_idx].representative;
                 // Same obligation up to bound-variable renaming?
-                if vcs_equivalent(&vcs[rep], &vcs[i]) {
+                if vcs[rep].contract_metadata == vc.contract_metadata && **rep_norm == *norm_i {
                     merged_into = Some(group_idx);
                     break;
                 }
@@ -117,19 +126,13 @@ where
         match merged_into {
             Some(group_idx) => {
                 groups[group_idx].members.push(i);
-                group_of[i] = Some(group_idx);
             }
             None => {
                 let group_idx = groups.len();
                 groups.push(DedupGroup { representative: i, members: vec![i] });
-                group_of[i] = Some(group_idx);
+                buckets.entry(bucket_key).or_default().push((group_idx, sig, kind_desc, norm_i));
             }
         }
-        // Record `i` as a probe target for future matches regardless of
-        // whether it started a new group: keeping the bucket populated keeps
-        // future lookups cheap. The representative is what equivalence is
-        // actually checked against.
-        buckets.entry(bucket_key).or_default().push(i);
     }
 
     groups
@@ -138,13 +141,12 @@ where
 /// Composite bucket hash: plan-signature hash + VC-kind description + the
 /// alpha-normalized formula fingerprint. Two VCs that can possibly be merged
 /// always land in the same bucket; the reverse need not hold (collisions are
-/// resolved by `vcs_equivalent`).
-fn bucket_hash(sig_hash: u64, vc: &VerificationCondition) -> u64 {
-    let mut h = std::hash::DefaultHasher::new();
+/// resolved by exact metadata + normalized-formula equality).
+fn bucket_hash(sig_hash: u64, kind_desc: &str, normalized: &Formula) -> u64 {
+    let mut h = FxHasher::default();
     sig_hash.hash(&mut h);
-    vc.kind.description().hash(&mut h);
-    let normalized = normalize_alpha(&vc.formula);
-    hash_formula(&normalized, &mut h);
+    kind_desc.hash(&mut h);
+    hash_formula(normalized, &mut h);
     h.finish()
 }
 
@@ -196,6 +198,7 @@ fn carries_unmodeled_machine(kind: &VcKind) -> bool {
 /// representative. We bail (return `false`) for every automaton-carrying kind
 /// routed to the temporal backend (`Temporal`, `Deadlock`, `DeadState`,
 /// `Liveness`, `Fairness`).
+#[cfg(test)]
 fn vcs_equivalent(a: &VerificationCondition, b: &VerificationCondition) -> bool {
     // Never share a verdict between automaton-bearing obligations: their model
     // is not faithfully captured by `description()` + `formula`.
@@ -208,7 +211,7 @@ fn vcs_equivalent(a: &VerificationCondition, b: &VerificationCondition) -> bool 
     if a.contract_metadata != b.contract_metadata {
         return false;
     }
-    normalize_alpha(&a.formula) == normalize_alpha(&b.formula)
+    normalize_alpha_cow(&a.formula) == normalize_alpha_cow(&b.formula)
 }
 
 // ---------------------------------------------------------------------------
@@ -220,14 +223,34 @@ fn vcs_equivalent(a: &VerificationCondition, b: &VerificationCondition) -> bool 
 // left untouched.
 // ---------------------------------------------------------------------------
 
+fn needs_alpha_normalization(f: &Formula) -> bool {
+    trust_types::any_formula_node(f, &mut |node| {
+        matches!(node, Formula::Forall(..) | Formula::Exists(..) | Formula::SymVar(..))
+    })
+}
+
+fn normalize_alpha_cow(f: &Formula) -> Cow<'_, Formula> {
+    if !needs_alpha_normalization(f) {
+        return Cow::Borrowed(f);
+    }
+    Cow::Owned(normalize_alpha_slow(f))
+}
+
+#[cfg(test)]
 /// Normalize bound variables to canonical names for alpha-equivalence.
 fn normalize_alpha(f: &Formula) -> Formula {
+    normalize_alpha_cow(f).into_owned()
+}
+
+fn normalize_alpha_slow(f: &Formula) -> Formula {
     let mut counter = 0usize;
-    let mut env: FxHashMap<String, String> = FxHashMap::default();
+    let free_vars = f.free_variables();
+    let mut env: FxHashMap<String, String> =
+        FxHashMap::with_capacity_and_hasher(free_vars.len(), Default::default());
     // Generated canonical names must never capture a free program variable.
     // Installing free names as identity mappings both preserves them and lets
     // `normalize_quantifier` skip every occupied canonical candidate.
-    for name in f.free_variables() {
+    for name in free_vars {
         env.insert(name.clone(), name);
     }
     normalize_inner(f, &mut env, &mut counter)
@@ -263,8 +286,8 @@ fn normalize_quantifier(
     env: &mut FxHashMap<String, String>,
     counter: &mut usize,
 ) -> Formula {
-    let mut saved: Vec<(String, Option<String>)> = Vec::new();
-    let mut new_bindings = Vec::new();
+    let mut saved: Vec<(String, Option<String>)> = Vec::with_capacity(bindings.len());
+    let mut new_bindings = Vec::with_capacity(bindings.len());
 
     for (name, sort) in bindings {
         let canonical = loop {
@@ -276,9 +299,9 @@ fn normalize_quantifier(
             }
         };
         let name_str = name.to_string();
-        saved.push((name_str.clone(), env.get(&name_str).cloned()));
-        env.insert(name_str, canonical.clone());
         new_bindings.push((trust_types::Symbol::intern(&canonical), sort.clone()));
+        let old_val = env.insert(name_str.clone(), canonical);
+        saved.push((name_str, old_val));
     }
 
     let new_body = normalize_inner(body, env, counter);
@@ -559,6 +582,7 @@ const TAG_FORALL: u8 = 45;
 const TAG_EXISTS: u8 = 46;
 const TAG_SELECT: u8 = 47;
 const TAG_STORE: u8 = 48;
+const TAG_CONST_ARRAY: u8 = 49;
 
 fn hash_formula(f: &Formula, h: &mut impl Hasher) {
     match f {
@@ -782,6 +806,12 @@ fn hash_formula(f: &Formula, h: &mut impl Hasher) {
             TAG_SELECT.hash(h);
             hash_formula(arr, h);
             hash_formula(idx, h);
+        }
+        Formula::ConstArray { index_sort, elem_sort, value } => {
+            TAG_CONST_ARRAY.hash(h);
+            index_sort.hash(h);
+            elem_sort.hash(h);
+            hash_formula(value, h);
         }
         Formula::Forall(bindings, body) => {
             TAG_FORALL.hash(h);

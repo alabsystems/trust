@@ -136,13 +136,13 @@ run_test() {
 
     local output
     local exit_code=0
-    output=$(cd "$REPO_ROOT" && cargo test -p "$pkg" --test "*" -- "$test_name" --exact 2>&1) || exit_code=$?
+    output=$(cd "$REPO_ROOT" && targo --unverified test -p "$pkg" --test "*" -- "$test_name" --exact 2>&1) || exit_code=$?
 
     if [ $exit_code -eq 0 ]; then
         # Check if test actually ran (not filtered out)
         if echo "$output" | grep -q "test result:.*0 passed"; then
             # Try without --exact in case the test file name is needed
-            output=$(cd "$REPO_ROOT" && cargo test -p "$pkg" -- "$test_name" 2>&1) || exit_code=$?
+            output=$(cd "$REPO_ROOT" && targo --unverified test -p "$pkg" -- "$test_name" 2>&1) || exit_code=$?
             if [ $exit_code -eq 0 ] && echo "$output" | grep -q "test result:.*0 passed"; then
                 print_skip "test not found"
                 return
@@ -180,7 +180,7 @@ run_test_filter() {
 
     local output
     local exit_code=0
-    output=$(cd "$REPO_ROOT" && cargo test -p "$pkg" -- "$filter" 2>&1) || exit_code=$?
+    output=$(cd "$REPO_ROOT" && targo --unverified test -p "$pkg" -- "$filter" 2>&1) || exit_code=$?
 
     if [ $exit_code -eq 0 ]; then
         # Extract test count from output
@@ -421,15 +421,17 @@ main() {
 
     # Environment check
     echo -e "  ${BOLD}Environment:${RESET}"
-    echo -e "  Rust:      $(rustc --version 2>/dev/null || echo 'not found')"
-    echo -e "  Cargo:     $(cargo --version 2>/dev/null || echo 'not found')"
+    # The demo drives `targo --unverified`, so report THAT toolchain — never
+    # whatever stock rustc/cargo happens to be on PATH.
+    echo -e "  Trustc:    $(trustc --version 2>/dev/null || echo 'not found')"
+    echo -e "  Targo:     $(targo --unverified --version 2>/dev/null || echo 'not found (or cargo in disguise: rejects --unverified)')"
     check_ay
     echo ""
 
     # Build first to ensure compilation is cached
     echo -e "  ${DIM}Building trust-integration-tests (first run may take a moment)...${RESET}"
-    if ! (cd "$REPO_ROOT" && cargo test -p trust-integration-tests --no-run 2>&1 | tail -1); then
-        echo -e "  ${RED}Build failed. Run 'cargo check -p trust-integration-tests' for details.${RESET}"
+    if ! (cd "$REPO_ROOT" && targo --unverified test -p trust-integration-tests --no-run 2>&1 | tail -1); then
+        echo -e "  ${RED}Build failed. Run 'targo --unverified check -p trust-integration-tests' for details.${RESET}"
         exit 1
     fi
     echo ""

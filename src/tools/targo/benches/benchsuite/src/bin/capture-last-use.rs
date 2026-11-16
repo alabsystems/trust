@@ -11,10 +11,11 @@
 //!
 //! The database is kept in git. It usually shouldn't need to be re-generated
 //! unless there is a change in the schema or the benchmark.
+#![allow(clippy::disallowed_types)]
 
-use cargo::GlobalContext;
-use cargo::core::global_cache_tracker::{self, DeferredGlobalLastUse, GlobalCacheTracker};
-use cargo::util::cache_lock::CacheLockMode;
+use targo::GlobalContext;
+use targo::util::cache_lock::CacheLockMode;
+use targo::workspace::global_cache_tracker::{self, DeferredGlobalLastUse, GlobalCacheTracker};
 use rand::prelude::*;
 use std::collections::HashMap;
 use std::fs;
@@ -51,7 +52,7 @@ fn main() {
     let mut deferred = DeferredGlobalLastUse::new();
     let mut tracker = GlobalCacheTracker::new(&gctx).unwrap();
 
-    let real_home = cargo::util::homedir(&std::env::current_dir().unwrap()).unwrap();
+    let real_home = targo::util::homedir(&std::env::current_dir().unwrap()).unwrap();
 
     let cache_dir = real_home.join("registry/cache");
     for dir_ent in fs::read_dir(cache_dir).unwrap() {

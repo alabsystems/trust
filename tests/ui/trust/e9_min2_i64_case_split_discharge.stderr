@@ -37,7 +37,7 @@ note: citation `min2_i64_le_left` kernel-discharges this postcondition statement
 LL |     ensures result <= a by min2_i64_le_left
    |                            ^^^^^^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `min2_i64_le_left` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `caller`, with a clean certification audit
   --> $DIR/e9_min2_i64_case_split_discharge.rs:37:69
@@ -45,5 +45,5 @@ note: citation `min2_i64_le_left` kernel-discharges this postcondition statement
 LL | pub fn caller(x: i64, y: i64) -> i64 ensures min2_i64(x, y) <= x by min2_i64_le_left { x }
    |                                                                     ^^^^^^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 

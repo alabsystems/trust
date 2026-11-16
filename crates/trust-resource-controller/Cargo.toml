@@ -1,0 +1,42 @@
+[workspace]
+
+[package]
+name = "trust-resource-controller"
+version = "0.13.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Private native resource member proxy protocol"
+
+[features]
+default = ["channel"]
+# DTO/codec consumers disable defaults and retain a std-only leaf.
+channel = ["dep:libc", "dep:jobserver_utils", "dep:sha2"]
+# Native final-image reception has no helper spawning or unstable std API.
+bootstrap-receiver = ["channel", "dep:trust-resource-provenance"]
+client = ["bootstrap-receiver", "dep:jobserver_utils", "dep:sha2"]
+# Fixed probes and serialized child commands retain the caller's existing execution.
+probe-scheduler = ["client", "jobserver_utils/client", "dep:tempfile"]
+# A separately packaged command owner; ordinary protocol/SDK builds do not enable it.
+serial-command = ["client", "jobserver_utils/client"]
+
+[dependencies]
+tempfile = { version = "3", optional = true }
+libc = { version = "0.2", optional = true }
+trust-resource-provenance = { path = "../trust-resource-provenance", optional = true }
+jobserver_utils = { path = "../../src/jobserver_utils", default-features = false, optional = true }
+sha2 = { package = "trust-sha2", path = "../trust-sha2", default-features = false, optional = true }
+
+[[example]]
+name = "probe-scheduler-control"
+path = "examples/probe-scheduler-control.rs"
+required-features = ["probe-scheduler"]
+[[bin]]
+name = "trust-serial-command"
+path = "src/bin/trust-serial-command.rs"
+required-features = ["serial-command"]
+test = false
+
+[package.metadata.atpkg]
+expose = ["trust-serial-command"]
+build-args = ["--locked", "--features", "serial-command", "--bin", "trust-serial-command"]

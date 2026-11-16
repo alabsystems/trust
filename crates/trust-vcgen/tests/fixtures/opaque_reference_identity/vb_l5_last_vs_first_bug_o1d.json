@@ -1,0 +1,1918 @@
+{
+  "name": "vb_l5_last_vs_first_bug",
+  "def_path": "vbprobe::vb_l5_last_vs_first_bug",
+  "span": {
+    "file": "vb.rs",
+    "line_start": 70,
+    "col_start": 0,
+    "line_end": 84,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "xs"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "first"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "last"
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 12,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": "Never",
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Adt": {
+            "name": "core::fmt::Arguments",
+            "fields": [
+              [
+                "template",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "args",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Adt": {
+                                "name": "core::fmt::rt::Argument",
+                                "fields": [
+                                  [
+                                    "ty",
+                                    {
+                                      "Adt": {
+                                        "name": "core::fmt::rt::ArgumentType",
+                                        "fields": [
+                                          [
+                                            "__tag",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": true
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "__v0_value",
+                                            {
+                                              "Adt": {
+                                                "name": "core::ptr::non_null::NonNull",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "RawPtr": {
+                                                        "mutable": false,
+                                                        "pointee": "Unit"
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false,
+                                                "faithful_enum_repr": null,
+                                                "layout": null,
+                                                "enum_layout": null,
+                                                "adt_kind": "Struct"
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "__v0_formatter",
+                                            {
+                                              "FnPtr": {
+                                                "sig": {
+                                                  "params": [
+                                                    {
+                                                      "Adt": {
+                                                        "name": "core::ptr::non_null::NonNull",
+                                                        "fields": [
+                                                          [
+                                                            "pointer",
+                                                            {
+                                                              "RawPtr": {
+                                                                "mutable": false,
+                                                                "pointee": "Unit"
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false,
+                                                        "faithful_enum_repr": null,
+                                                        "layout": null,
+                                                        "enum_layout": null,
+                                                        "adt_kind": "Struct"
+                                                      }
+                                                    },
+                                                    {
+                                                      "Ref": {
+                                                        "mutable": true,
+                                                        "inner": {
+                                                          "Adt": {
+                                                            "name": "core::fmt::Formatter",
+                                                            "fields": [
+                                                              [
+                                                                "options",
+                                                                {
+                                                                  "Adt": {
+                                                                    "name": "core::fmt::FormattingOptions",
+                                                                    "fields": [
+                                                                      [
+                                                                        "flags",
+                                                                        {
+                                                                          "Int": {
+                                                                            "width": 32,
+                                                                            "signed": false
+                                                                          }
+                                                                        }
+                                                                      ],
+                                                                      [
+                                                                        "width",
+                                                                        {
+                                                                          "Int": {
+                                                                            "width": 16,
+                                                                            "signed": false
+                                                                          }
+                                                                        }
+                                                                      ],
+                                                                      [
+                                                                        "precision",
+                                                                        {
+                                                                          "Int": {
+                                                                            "width": 16,
+                                                                            "signed": false
+                                                                          }
+                                                                        }
+                                                                      ]
+                                                                    ],
+                                                                    "variants": [],
+                                                                    "disc_index_safe": false,
+                                                                    "faithful_enum_repr": null,
+                                                                    "layout": null,
+                                                                    "enum_layout": null,
+                                                                    "adt_kind": "Struct"
+                                                                  }
+                                                                }
+                                                              ],
+                                                              [
+                                                                "buf",
+                                                                {
+                                                                  "Ref": {
+                                                                    "mutable": true,
+                                                                    "inner": {
+                                                                      "Dynamic": {
+                                                                        "trait_name": "core::fmt::Write",
+                                                                        "principal_key": "core::fmt::Write"
+                                                                      }
+                                                                    }
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false,
+                                                            "faithful_enum_repr": null,
+                                                            "layout": null,
+                                                            "enum_layout": null,
+                                                            "adt_kind": "Struct"
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  ],
+                                                  "ret": {
+                                                    "Adt": {
+                                                      "name": "core::result::Result",
+                                                      "fields": [
+                                                        [
+                                                          "__tag",
+                                                          {
+                                                            "Int": {
+                                                              "width": 64,
+                                                              "signed": true
+                                                            }
+                                                          }
+                                                        ],
+                                                        [
+                                                          "__v0_0",
+                                                          "Unit"
+                                                        ],
+                                                        [
+                                                          "__v1_0",
+                                                          {
+                                                            "Adt": {
+                                                              "name": "core::fmt::Error",
+                                                              "fields": [],
+                                                              "variants": [],
+                                                              "disc_index_safe": false,
+                                                              "faithful_enum_repr": null,
+                                                              "layout": null,
+                                                              "enum_layout": null,
+                                                              "adt_kind": "Struct"
+                                                            }
+                                                          }
+                                                        ]
+                                                      ],
+                                                      "variants": [
+                                                        {
+                                                          "name": "Ok",
+                                                          "discriminant": 0,
+                                                          "fields": [
+                                                            [
+                                                              "0",
+                                                              "Unit"
+                                                            ]
+                                                          ]
+                                                        },
+                                                        {
+                                                          "name": "Err",
+                                                          "discriminant": 1,
+                                                          "fields": [
+                                                            [
+                                                              "0",
+                                                              {
+                                                                "Adt": {
+                                                                  "name": "core::fmt::Error",
+                                                                  "fields": [],
+                                                                  "variants": [],
+                                                                  "disc_index_safe": false,
+                                                                  "faithful_enum_repr": null,
+                                                                  "layout": null,
+                                                                  "enum_layout": null,
+                                                                  "adt_kind": "Struct"
+                                                                }
+                                                              }
+                                                            ]
+                                                          ]
+                                                        }
+                                                      ],
+                                                      "disc_index_safe": true,
+                                                      "faithful_enum_repr": null,
+                                                      "layout": null,
+                                                      "enum_layout": null,
+                                                      "adt_kind": "Enum"
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "__v0__lifetime",
+                                            {
+                                              "Adt": {
+                                                "name": "core::marker::PhantomData",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false,
+                                                "faithful_enum_repr": null,
+                                                "layout": null,
+                                                "enum_layout": null,
+                                                "adt_kind": "Struct"
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "__v1_0",
+                                            {
+                                              "Int": {
+                                                "width": 16,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [
+                                          {
+                                            "name": "Placeholder",
+                                            "discriminant": 0,
+                                            "fields": [
+                                              [
+                                                "value",
+                                                {
+                                                  "Adt": {
+                                                    "name": "core::ptr::non_null::NonNull",
+                                                    "fields": [
+                                                      [
+                                                        "pointer",
+                                                        {
+                                                          "RawPtr": {
+                                                            "mutable": false,
+                                                            "pointee": "Unit"
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false,
+                                                    "faithful_enum_repr": null,
+                                                    "layout": null,
+                                                    "enum_layout": null,
+                                                    "adt_kind": "Struct"
+                                                  }
+                                                }
+                                              ],
+                                              [
+                                                "formatter",
+                                                {
+                                                  "FnPtr": {
+                                                    "sig": {
+                                                      "params": [
+                                                        {
+                                                          "Adt": {
+                                                            "name": "core::ptr::non_null::NonNull",
+                                                            "fields": [
+                                                              [
+                                                                "pointer",
+                                                                {
+                                                                  "RawPtr": {
+                                                                    "mutable": false,
+                                                                    "pointee": "Unit"
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false,
+                                                            "faithful_enum_repr": null,
+                                                            "layout": null,
+                                                            "enum_layout": null,
+                                                            "adt_kind": "Struct"
+                                                          }
+                                                        },
+                                                        {
+                                                          "Ref": {
+                                                            "mutable": true,
+                                                            "inner": {
+                                                              "Adt": {
+                                                                "name": "core::fmt::Formatter",
+                                                                "fields": [
+                                                                  [
+                                                                    "options",
+                                                                    {
+                                                                      "Adt": {
+                                                                        "name": "core::fmt::FormattingOptions",
+                                                                        "fields": [
+                                                                          [
+                                                                            "flags",
+                                                                            {
+                                                                              "Int": {
+                                                                                "width": 32,
+                                                                                "signed": false
+                                                                              }
+                                                                            }
+                                                                          ],
+                                                                          [
+                                                                            "width",
+                                                                            {
+                                                                              "Int": {
+                                                                                "width": 16,
+                                                                                "signed": false
+                                                                              }
+                                                                            }
+                                                                          ],
+                                                                          [
+                                                                            "precision",
+                                                                            {
+                                                                              "Int": {
+                                                                                "width": 16,
+                                                                                "signed": false
+                                                                              }
+                                                                            }
+                                                                          ]
+                                                                        ],
+                                                                        "variants": [],
+                                                                        "disc_index_safe": false,
+                                                                        "faithful_enum_repr": null,
+                                                                        "layout": null,
+                                                                        "enum_layout": null,
+                                                                        "adt_kind": "Struct"
+                                                                      }
+                                                                    }
+                                                                  ],
+                                                                  [
+                                                                    "buf",
+                                                                    {
+                                                                      "Ref": {
+                                                                        "mutable": true,
+                                                                        "inner": {
+                                                                          "Dynamic": {
+                                                                            "trait_name": "core::fmt::Write",
+                                                                            "principal_key": "core::fmt::Write"
+                                                                          }
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  ]
+                                                                ],
+                                                                "variants": [],
+                                                                "disc_index_safe": false,
+                                                                "faithful_enum_repr": null,
+                                                                "layout": null,
+                                                                "enum_layout": null,
+                                                                "adt_kind": "Struct"
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      ],
+                                                      "ret": {
+                                                        "Adt": {
+                                                          "name": "core::result::Result",
+                                                          "fields": [
+                                                            [
+                                                              "__tag",
+                                                              {
+                                                                "Int": {
+                                                                  "width": 64,
+                                                                  "signed": true
+                                                                }
+                                                              }
+                                                            ],
+                                                            [
+                                                              "__v0_0",
+                                                              "Unit"
+                                                            ],
+                                                            [
+                                                              "__v1_0",
+                                                              {
+                                                                "Adt": {
+                                                                  "name": "core::fmt::Error",
+                                                                  "fields": [],
+                                                                  "variants": [],
+                                                                  "disc_index_safe": false,
+                                                                  "faithful_enum_repr": null,
+                                                                  "layout": null,
+                                                                  "enum_layout": null,
+                                                                  "adt_kind": "Struct"
+                                                                }
+                                                              }
+                                                            ]
+                                                          ],
+                                                          "variants": [
+                                                            {
+                                                              "name": "Ok",
+                                                              "discriminant": 0,
+                                                              "fields": [
+                                                                [
+                                                                  "0",
+                                                                  "Unit"
+                                                                ]
+                                                              ]
+                                                            },
+                                                            {
+                                                              "name": "Err",
+                                                              "discriminant": 1,
+                                                              "fields": [
+                                                                [
+                                                                  "0",
+                                                                  {
+                                                                    "Adt": {
+                                                                      "name": "core::fmt::Error",
+                                                                      "fields": [],
+                                                                      "variants": [],
+                                                                      "disc_index_safe": false,
+                                                                      "faithful_enum_repr": null,
+                                                                      "layout": null,
+                                                                      "enum_layout": null,
+                                                                      "adt_kind": "Struct"
+                                                                    }
+                                                                  }
+                                                                ]
+                                                              ]
+                                                            }
+                                                          ],
+                                                          "disc_index_safe": true,
+                                                          "faithful_enum_repr": null,
+                                                          "layout": null,
+                                                          "enum_layout": null,
+                                                          "adt_kind": "Enum"
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              ],
+                                              [
+                                                "_lifetime",
+                                                {
+                                                  "Adt": {
+                                                    "name": "core::marker::PhantomData",
+                                                    "fields": [],
+                                                    "variants": [],
+                                                    "disc_index_safe": false,
+                                                    "faithful_enum_repr": null,
+                                                    "layout": null,
+                                                    "enum_layout": null,
+                                                    "adt_kind": "Struct"
+                                                  }
+                                                }
+                                              ]
+                                            ]
+                                          },
+                                          {
+                                            "name": "Count",
+                                            "discriminant": 1,
+                                            "fields": [
+                                              [
+                                                "0",
+                                                {
+                                                  "Int": {
+                                                    "width": 16,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ]
+                                          }
+                                        ],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Enum"
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 2
+          },
+          {
+            "StorageLive": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 71,
+                "col_start": 7,
+                "line_end": 71,
+                "col_end": 15
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 71,
+                "col_start": 7,
+                "line_end": 71,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "vb.rs",
+              "line_start": 71,
+              "col_start": 7,
+              "line_end": 71,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 3
+          },
+          {
+            "StorageDead": 2
+          }
+        ],
+        "terminator": {
+          "Goto": 12
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageDead": 3
+          },
+          {
+            "StorageDead": 2
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 74,
+                "col_start": 20,
+                "line_end": 74,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 74,
+                "col_start": 17,
+                "line_end": 74,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 74,
+                "col_start": 17,
+                "line_end": 74,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 9,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 3,
+            "span": {
+              "file": "vb.rs",
+              "line_start": 74,
+              "col_start": 17,
+              "line_end": 74,
+              "col_end": 22
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 7
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 74,
+                "col_start": 16,
+                "line_end": 74,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 6,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 74,
+                "col_start": 16,
+                "line_end": 74,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "OpaqueScalar": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 74,
+                "col_start": 16,
+                "line_end": 74,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageLive": 10
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 75,
+                "col_start": 19,
+                "line_end": 75,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "StorageLive": 11
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      1,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 76,
+                "col_start": 16,
+                "line_end": 76,
+                "col_end": 17
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "StorageLive": 12
+          },
+          {
+            "StorageLive": 13
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 11,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 77,
+                "col_start": 10,
+                "line_end": 77,
+                "col_end": 11
+              }
+            }
+          },
+          {
+            "StorageLive": 14
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 77,
+                "col_start": 14,
+                "line_end": 77,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 77,
+                "col_start": 10,
+                "line_end": 77,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 12,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                8
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "vb.rs",
+              "line_start": 77,
+              "col_start": 10,
+              "line_end": 77,
+              "col_end": 22
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "StorageDead": 14
+          },
+          {
+            "StorageDead": 13
+          },
+          {
+            "StorageLive": 15
+          },
+          {
+            "StorageLive": 16
+          },
+          {
+            "StorageLive": 17
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 11,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 78,
+                "col_start": 19,
+                "line_end": 78,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 78,
+                "col_start": 16,
+                "line_end": 78,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 17,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 18,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 78,
+                "col_start": 16,
+                "line_end": 78,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 19,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 6,
+            "span": {
+              "file": "vb.rs",
+              "line_start": 78,
+              "col_start": 16,
+              "line_end": 78,
+              "col_end": 21
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 17
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 78,
+                "col_start": 15,
+                "line_end": 78,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 16,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 78,
+                "col_start": 15,
+                "line_end": 78,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "OpaqueScalar": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 78,
+                "col_start": 8,
+                "line_end": 78,
+                "col_end": 43
+              }
+            }
+          },
+          {
+            "StorageDead": 15
+          },
+          {
+            "StorageDead": 17
+          },
+          {
+            "StorageDead": 16
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 79,
+                "col_start": 8,
+                "line_end": 79,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 20,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 7,
+            "span": {
+              "file": "vb.rs",
+              "line_start": 79,
+              "col_start": 8,
+              "line_end": 79,
+              "col_end": 14
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 20,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 79,
+                "col_start": 8,
+                "line_end": 79,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "StorageDead": 12
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "StorageDead": 14
+          },
+          {
+            "StorageDead": 13
+          },
+          {
+            "StorageDead": 12
+          },
+          {
+            "StorageLive": 21
+          },
+          {
+            "StorageLive": 22
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 10,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 81,
+                "col_start": 7,
+                "line_end": 81,
+                "col_end": 11
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Move": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "vb.rs",
+                "line_start": 81,
+                "col_start": 7,
+                "line_end": 81,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 21,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                10
+              ]
+            ],
+            "otherwise": 9,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "vb.rs",
+              "line_start": 81,
+              "col_start": 7,
+              "line_end": 81,
+              "col_end": 20
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "StorageDead": 22
+          },
+          {
+            "StorageLive": 24
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::fmt::Arguments::<'_>::from_str",
+            "args": [
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      76,
+                      53,
+                      32,
+                      108,
+                      97,
+                      115,
+                      116,
+                      32,
+                      33,
+                      61,
+                      32,
+                      102,
+                      105,
+                      114,
+                      115,
+                      116
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 24,
+              "projections": []
+            },
+            "target": 11,
+            "span": {
+              "file": "<repo>/library/core/src/panic.rs",
+              "line_start": 62,
+              "col_start": 37,
+              "line_end": 62,
+              "col_end": 71
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 6692626837626329215,
+              "def_index": 13330,
+              "substs_digest": [
+                13503156978159448136,
+                2716896576507566245
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 6692626837626329215,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "StorageDead": 22
+          },
+          {
+            "StorageDead": 21
+          },
+          {
+            "StorageDead": 11
+          },
+          {
+            "StorageDead": 10
+          },
+          {
+            "StorageDead": 4
+          }
+        ],
+        "terminator": {
+          "Goto": 12
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::panicking::panic_fmt",
+            "args": [
+              {
+                "Move": {
+                  "local": 24,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 23,
+              "projections": []
+            },
+            "target": null,
+            "span": {
+              "file": "<repo>/library/core/src/panic.rs",
+              "line_start": 62,
+              "col_start": 8,
+              "line_end": 62,
+              "col_end": 72
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 6692626837626329215,
+              "def_index": 11819,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 6692626837626329215,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

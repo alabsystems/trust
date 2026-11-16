@@ -1,0 +1,38 @@
+#![feature(rustc_private)]
+#![crate_type = "lib"]
+extern crate libc;
+
+use core::ffi::c_int;
+
+/// The self-pipe signal handler shape: one byte, the result of a call, written whole.
+pub fn sig_byte(fd: c_int, sig: c_int) -> isize {
+    let byte = u8::try_from(sig).unwrap_or(0);
+    // SAFETY: one byte on this frame.
+    unsafe { libc::write(fd, (&raw const byte).cast(), 1) }
+}
+
+/// Negative: two bytes from a one-byte call result.
+pub fn sig_byte_two(fd: c_int, sig: c_int) -> isize {
+    let byte = u8::try_from(sig).unwrap_or(0);
+    // SAFETY: deliberately over-long (negative control).
+    unsafe { libc::write(fd, (&raw const byte).cast(), 2) }
+}
+
+/// A four-byte call result written whole.
+pub fn sig_word(fd: c_int, sig: c_int) -> isize {
+    let word = u32::try_from(sig).unwrap_or(0);
+    // SAFETY: four bytes on this frame.
+    unsafe { libc::write(fd, (&raw const word).cast(), 4) }
+}
+
+#[inline(never)]
+fn pair(sig: c_int) -> (u32, u32) {
+    (sig as u32, 0)
+}
+
+/// Negative: a call result whose layout the extent lane does not size.
+pub fn sig_pair(fd: c_int, sig: c_int) -> isize {
+    let p = pair(sig);
+    // SAFETY: deliberately unsized for the lane (negative control).
+    unsafe { libc::write(fd, (&raw const p).cast(), 8) }
+}

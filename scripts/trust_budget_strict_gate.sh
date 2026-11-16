@@ -11,9 +11,12 @@
 # subject is verdict-neutral resource accounting rather than an integer-domain
 # decision. Its consumer, `trust-router`, requires a decomposed retry not to
 # multiply the caller's per-obligation timeout and thereby change later
-# verdicts. `split_budget_ms` states that condition directly as
-# `result <= total_ms`; mutation E and the exhaustive oracle pin the dangerous
-# sentinel that this clause deliberately cannot exclude.
+# verdicts. CORRECTION 2026-10-20: `result <= total_ms` bounds ONE component's
+# numeric timeout, not aggregate neutrality. Returning the whole timeout per
+# component still satisfies it; the 1 ms floor can also make nominal sums
+# exceed a tiny whole budget. Router deadline tests cover aggregate dispatch.
+# Mutations E0 and E and the unit oracle pin the dangerous zero/unbounded sentinel.
+# Historical proof counts below remain measurements of the original clause.
 #
 # The other load-bearing assertions are (a) that memory splits and process
 # ceilings stay on their documented side of the machine budget, and (b) that
@@ -38,14 +41,24 @@
 # EVERY NUMBER ABOVE WAS RECOMPUTED FOR THIS CRATE. None is transplanted from
 # another strict gate; these crates share no peak.
 #
+# The strengthened conditional-nonzero contract adds four postcondition rows.
+# Measured 2026-10-20 on the actual production package with native210:
+#   28 published kernel-rechecked rows, 0 failed/unknown, coverage 6/6;
+#   postcondition=25, division_by_zero=1, hardened_panic_boundary=2.
+# All thirteen original unit tests pass. Historical counts above describe only
+# the weaker original clause; the current checks below require all 28 rows.
+# These local proofs remain conditional on the foundational TCB and excluded
+# build-script units. A report is not an independent exact-VC replay.
+#
 # Usage:  scripts/trust_budget_strict_gate.sh
 set -uo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 SRC="$REPO_ROOT/crates/trust-budget/src/lib.rs"
 CONSUMER_MANIFEST="$REPO_ROOT/crates/trust-router/Cargo.toml"
 CONSUMER_PACKAGE="trust-router"
+COORDINATOR_MANIFEST="$REPO_ROOT/crates/trust-coordinator/Cargo.toml"
 CONSUMER_DEP_LINE='trust-budget = { workspace = true }'
-WORKSPACE_LOCK="$REPO_ROOT/crates/Cargo.lock"
+WORKSPACE_LOCK="$REPO_ROOT/Cargo.lock"
 # Trust: `build/host` is a symlink to `build/<host-triple>`, so this resolves on
 # every platform. It used to name `aarch64-apple-darwin` literally, which meant
 # that on any non-Apple host this gate could only ever print
@@ -140,6 +153,9 @@ PRISTINE_SHA="$(shasum -a 256 "$SRC" | cut -d' ' -f1)" \
   || { echo "REFUSE: could not hash $SRC"; exit 2; }
 PRISTINE_CSHA="$(shasum -a 256 "$CONSUMER_MANIFEST" | cut -d' ' -f1)" \
   || { echo "REFUSE: could not hash $CONSUMER_MANIFEST"; exit 2; }
+PRISTINE_ROUTER_CSHA="$PRISTINE_CSHA"
+PRISTINE_COORDINATOR_CSHA="$(shasum -a 256 "$COORDINATOR_MANIFEST" | cut -d' ' -f1)" \
+  || { echo "REFUSE: could not hash $COORDINATOR_MANIFEST"; exit 2; }
 PRISTINE_LOCK_SHA="$(shasum -a 256 "$WORKSPACE_LOCK" | cut -d' ' -f1)" \
   || { echo "REFUSE: could not hash $WORKSPACE_LOCK"; exit 2; }
 
@@ -207,9 +223,9 @@ no_rustc_error() { # no_rustc_error <label>
 
 fail() { echo "  FAIL $*"; fails=$((fails+1)); }
 
-run() { # run [policy]; sets RC and LOG
+run() { # run [lane flag]; sets RC and LOG
   LOG="$(mktemp)"
-  ( cd "$REPO_ROOT/crates" && TRUSTFLAGS="${1:-}" "$TARGO" trust check -p trust-budget ) > "$LOG" 2>&1
+  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check --all-rows ${1:+"$1"} -p trust-budget ) > "$LOG" 2>&1
   RC=$?
   require_env "${STEP:-run}"
   no_rustc_error "${STEP:-run}"
@@ -225,9 +241,9 @@ prepare_consumer_candidate() {
     --materialize-consumer-candidate \
     "$REPO_ROOT" "$CANDIDATE_ROOT" "$CONSUMER_PACKAGE"
   [ "$?" -eq 0 ] || { echo "REFUSE: could not materialize mutation-G candidate" >&2; exit 3; }
-  cmp -s "$WORKSPACE_LOCK" "$CANDIDATE_ROOT/crates/Cargo.lock" \
+  cmp -s "$WORKSPACE_LOCK" "$CANDIDATE_ROOT/Cargo.lock" \
     || { echo "REFUSE: candidate lock does not start byte-identical" >&2; exit 3; }
-  [ ! "$WORKSPACE_LOCK" -ef "$CANDIDATE_ROOT/crates/Cargo.lock" ] \
+  [ ! "$WORKSPACE_LOCK" -ef "$CANDIDATE_ROOT/Cargo.lock" ] \
     || { echo "REFUSE: candidate lock is not inode-independent" >&2; exit 3; }
   [ ! "$CONSUMER_MANIFEST" -ef "$CANDIDATE_MANIFEST" ] \
     || { echo "REFUSE: candidate consumer manifest is not inode-independent" >&2; exit 3; }
@@ -247,7 +263,7 @@ run_consumer_raw() {
   LOG="$(mktemp)"
   ( cd "$CANDIDATE_ROOT/crates" \
     && CARGO_TARGET_DIR="$CANDIDATE_ROOT/target" \
-      "$TARGO" --unverified check --manifest-path "$CANDIDATE_ROOT/crates/Cargo.toml" \
+      "$TARGO" --unverified check --manifest-path "$CANDIDATE_ROOT/Cargo.toml" \
         -p "$CONSUMER_PACKAGE" ) > "$LOG" 2>&1
   RC=$?
   assert_live_candidate_inputs \
@@ -265,7 +281,7 @@ runtests() { # sets RC and LOG
   RC=$?
   require_env "${STEP:-tests}"
 }
-gate_line() { grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$LOG" | tail -1; }
+gate_line() { grep -oE 'Gate: [A-Z-]+ \[[a-z-]+ lane, exit [0-9]+\]' "$LOG" | tail -1; }
 
 # ---------------------------------------------------------------------------
 # G2. `ok` MUST MEAN "THIS SECTION'S OWN CONTENT ASSERTIONS HELD".
@@ -317,12 +333,12 @@ case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "pristine: Gate is '$G'"
 if grep -qE '^error(\[|:)' "$LOG"; then fail "pristine: rustc reported errors; obligations for unlowered code are ABSENT, not proved"; fi
 grep -q 'Coverage: 6/6 eligible function bodies verified (complete)' "$LOG" \
   || fail "pristine: coverage is not 6/6 complete — $(grep -oE 'Coverage: [^)]*\)' "$LOG" | tail -1)"
-grep -qE 'Summary: 24 proved, 0 failed, 0 runtime-checked, 0 assumed, .*0 inconclusive \(24 total\)' "$LOG" \
+grep -qE 'Summary: 28 proved, 0 failed, 0 runtime-checked, 0 assumed, .*0 inconclusive \(28 total\)' "$LOG" \
   || fail "pristine: summary moved — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 # NON-VACUITY. `VcKind::Unreachable`'s formula is literally `Bool(true)`.
 KINDS="$(grep -oE 'proved by kind: [a-z_=0-9, ]+' "$LOG" | tail -1)"
 case "$KINDS" in *unreachable*) fail "pristine: an 'unreachable' row appeared — $KINDS";; esac
-case "$KINDS" in *"postcondition=21"*) ;; *) fail "pristine: expected postcondition=21 — got: $KINDS";; esac
+case "$KINDS" in *"postcondition=25"*) ;; *) fail "pristine: expected postcondition=25 — got: $KINDS";; esac
 # The one non-postcondition PROVED row this crate has, and mutation F's subject.
 case "$KINDS" in *"division_by_zero=1"*) ;; *) fail "pristine: the division_by_zero row is gone — mutation F cannot discriminate. $KINDS";; esac
 grep -q 'verification failed for' "$LOG" \
@@ -338,28 +354,25 @@ for absent in 'verification failed for `trust_budget::per_job_bytes`' \
   grep -qF "$absent" "$LOG" \
     && fail "pristine: '$absent' is ALREADY present — the mutation that asserts it cannot discriminate"
 done
-mut_ok "pristine  $G  [21 postcondition + 1 division_by_zero + 2 hardened_panic_boundary, 0 unreachable]"
+mut_ok "pristine  $G  [25 postcondition + 1 division_by_zero + 2 hardened_panic_boundary, 0 unreachable]"
 rm -f "$LOG"
 
 mut_end
 # ---------------------------------------------------------------------------
-# 2. THE SAME PASS UNDER `-Ztrust-policy=certify`.
-#    A misspelled TRUSTFLAGS is silently dropped, so first prove the flag path
-#    reaches the compiler by requiring a bogus policy to be REJECTED BY NAME.
+# 2. THE SAME PASS UNDER `--certify` (the compiler's `certify` policy).
+#    The lane flag selects the compiler's `certify` policy, and the Gate line
+#    names the lane that graded the run, so `[certify lane, exit 0]` is the
+#    evidence that certify ran. (A bogus-policy control proved the TRUSTFLAGS
+#    route reached the compiler; it went with that channel, DECISION_QUEUE T7a.)
 # ---------------------------------------------------------------------------
 STEP="CERTIFY"; mut_begin
-run "-Ztrust-policy=bogus_not_a_policy"
-grep -q "incorrect value \`bogus_not_a_policy\` for unstable option \`trust-policy\`" "$LOG" \
-  || fail "TRUSTFLAGS control: a bogus policy was NOT rejected — the flag never reaches the compiler, so the certify run below proves nothing"
-rm -f "$LOG"
-
-run "-Ztrust-policy=certify"
+run "--certify"
 G="$(gate_line)"
 [ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
-case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
-grep -qE 'Summary: 24 proved, 0 failed, .*0 inconclusive \(24 total\)' "$LOG" \
+case "$G" in *"PASS [certify lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
+grep -qE 'Summary: 28 proved, 0 failed, .*0 inconclusive \(28 total\)' "$LOG" \
   || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
-grep -qE 'Publication boundary: [0-9]+ obligation\(s\) passed the compiler, 24 published, [0-9]+ WITHHELD .*\(0 relabelled unknown' "$LOG" \
+grep -qE 'Publication boundary: [0-9]+ obligation\(s\) passed the compiler, 28 published, [0-9]+ WITHHELD .*\(0 relabelled unknown' "$LOG" \
   || fail "certify: a favorable compiler row was RELABELLED at the publication boundary — $(grep -oE '^Publication boundary: .*' "$LOG" | tail -1)"
 mut_ok "certify   $G  [0 relabelled at the publication boundary]"
 rm -f "$LOG"
@@ -470,7 +483,7 @@ G="$(gate_line)"
 [ "$RC" -eq 0 ] \
   && mut_ok "mutation D (mebibyte divisor off by one)  the strict lane still PASSES  $G" \
   || fail "mutation D: the lane FAILED on a wrong VALUE (rc=$RC) — §4.6 no longer holds and the tests are no longer the only thing checking values; re-read this section"
-grep -qE 'Summary: 24 proved, 0 failed' "$LOG" \
+grep -qE 'Summary: 28 proved, 0 failed' "$LOG" \
   || fail "mutation D: the row count moved on a value-only change — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 rm -f "$LOG"
 runtests
@@ -483,15 +496,43 @@ rm -f "$LOG"; restore_or_refuse
 
 mut_end
 # ---------------------------------------------------------------------------
-# 7. MUTATION E — THE SENTINEL DIRECTION (§15.5, §16.1). `split_budget_ms`'s
-#    1 ms floor is flipped to `0`. In `trust-router`'s convention `0` means
-#    UNBOUNDED, so this hands every component of a decomposed retry an
-#    unlimited budget — exactly the verdict-changing behaviour the clause
-#    exists to prevent — and the clause `result <= total_ms` CANNOT SEE IT,
-#    because `0` is below every bound.
-#
-#    This is the crate's own instance of the §15.5 sentinel trap and the reason
-#    its doc says `0` is the WIDE end for this one function.
+# 7a. MUTATION E0 — retain the original weaker-clause control (§17.4).
+#     Remove only the new conditional clause, then flip the floor to zero.
+#     The numeric upper bound still holds and the lane must pass; the named
+#     original unit oracle must fail. This pins the old specification gap.
+# ---------------------------------------------------------------------------
+STEP="MUTATION E0"; mut_begin
+mutate "$SRC" 'clauses [ensures result <= total_ms ensures total_ms > 0 ==> result > 0]' \
+  'clauses [ensures result <= total_ms]'
+mutate "$SRC" '    if share == 0 {
+        return 1;
+    }' '    if share == 0 {
+        return 0;
+    }'
+run
+G="$(gate_line)"
+[ "$RC" -eq 0 ] \
+  && mut_ok "mutation E0 (upper bound alone admits the zero/unbounded sentinel)  $G" \
+  || fail "mutation E0: the original weaker contract no longer passes (rc=$RC)  $G"
+case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "mutation E0: expected strict PASS, got '$G'";; esac
+grep -qE 'Summary: 24 proved, 0 failed, 0 runtime-checked, 0 assumed, .*0 inconclusive \(24 total\)' "$LOG" \
+  || fail "mutation E0: weaker-contract denominator moved — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
+rm -f "$LOG"
+runtests
+no_rustc_error "mutation E0 unit oracle"
+[ "$RC" -ne 0 ] || fail "mutation E0: the wrong zero sentinel escaped every unit oracle"
+grep -qE '^test tests::split_budget_ms_is_never_zero_for_a_bounded_caller \.\.\. FAILED$' "$LOG" \
+  || fail "mutation E0: the original nonzero oracle did not fail by name"
+mut_ok "            original nonzero unit oracle rejects the weakened-contract mutant"
+rm -f "$LOG"; restore_or_refuse
+
+mut_end
+# ---------------------------------------------------------------------------
+# 7b. MUTATION E — the strengthened contract rejects the SAME floor break.
+#     Keep total_ms > 0 ==> result > 0. The false postcondition must publish
+#     one failed row and a counterexample, with all 28 obligations retained;
+#     a setup error, an unknown row or an unrelated failure is insufficient.
+#     Retain the named unit oracle as an independent negative control.
 # ---------------------------------------------------------------------------
 STEP="MUTATION E"; mut_begin
 mutate "$SRC" '    if share == 0 {
@@ -501,16 +542,22 @@ mutate "$SRC" '    if share == 0 {
     }'
 run
 G="$(gate_line)"
-[ "$RC" -eq 0 ] \
-  && mut_ok "mutation E (a bounded caller gets an UNBOUNDED component budget)  lane still PASSES  $G" \
-  || fail "mutation E: the lane FAILED on the sentinel direction (rc=$RC) — if the verifier can now see this, §16.1 and the module doc need correcting"
+[ "$RC" -ne 0 ] || fail "mutation E: the strengthened contract admitted the zero/unbounded sentinel"
+case "$G" in *"FAIL [strict lane, exit 1]"*) ;; *) fail "mutation E: expected strict FAIL, got '$G'";; esac
+grep -qF 'verification failed for `trust_budget::split_budget_ms`' "$LOG" \
+  || fail "mutation E: the changed timeout helper was not refused"
+grep -qE 'Summary: 27 proved, 1 failed, 0 runtime-checked, 0 assumed, .*0 inconclusive \(28 total\)' "$LOG" \
+  || fail "mutation E: expected the complete 28 rows with one failed postcondition — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
+grep -qE '\[postcondition\].*FAILED.*counterexample:' "$LOG" \
+  || fail "mutation E: no failed postcondition counterexample was published"
+mut_ok "mutation E (conditional nonzero clause rejects the broken floor)  $G"
 rm -f "$LOG"
 runtests
-[ "$RC" -eq 0 ] \
-  && fail "mutation E: the sentinel was flipped to the UNSOUND direction and every test passed — split_budget_ms_is_never_zero_for_a_bounded_caller is not doing its job" \
-  || mut_ok "          and the tests go RED  rc=$RC"
-grep -q 'split_budget_ms_is_never_zero_for_a_bounded_caller' "$LOG" \
-  || fail "mutation E: the sentinel-direction test did not name itself — it may not have run"
+no_rustc_error "mutation E unit oracle"
+[ "$RC" -ne 0 ] || fail "mutation E: the same wrong sentinel escaped every unit oracle"
+grep -qE '^test tests::split_budget_ms_is_never_zero_for_a_bounded_caller \.\.\. FAILED$' "$LOG" \
+  || fail "mutation E: the original nonzero oracle did not fail by name"
+mut_ok "           original nonzero unit oracle also rejects the strengthened-contract mutant"
 rm -f "$LOG"; restore_or_refuse
 
 mut_end
@@ -544,11 +591,20 @@ rm -f "$LOG"; restore_or_refuse
 mut_end
 # ---------------------------------------------------------------------------
 # 9. MUTATION G — THE DEPENDENCY EDGE IS LOAD-BEARING.
-#    `trust-router`'s per-job memory split, per-component timeout split and
-#    per-process RSS floor were DELETED from three files and rebuilt on this
-#    crate; remove the edge and the consumer must not COMPILE.
+#    The per-job memory split now lives in trust-coordinator; the per-component
+#    timeout split and per-process RSS floor remain in trust-router. Remove
+#    each direct edge independently: all five calls must still fail to compile.
 # ---------------------------------------------------------------------------
 STEP="MUTATION G"; mut_begin
+for CONSUMER_PACKAGE in trust-router trust-coordinator; do
+CONSUMER_MANIFEST="$REPO_ROOT/crates/$CONSUMER_PACKAGE/Cargo.toml"
+if [ "$CONSUMER_PACKAGE" = trust-router ]; then
+  PRISTINE_CSHA="$PRISTINE_ROUTER_CSHA"
+  EXPECTED_UNRESOLVED=3
+else
+  PRISTINE_CSHA="$PRISTINE_COORDINATOR_CSHA"
+  EXPECTED_UNRESOLVED=2
+fi
 prepare_consumer_candidate
 python3 - "$CANDIDATE_MANIFEST" "$CONSUMER_DEP_LINE" <<'PY'
 import sys
@@ -559,17 +615,18 @@ PY
 [ $? -eq 0 ] || fail "mutation G could not be applied — the consumer manifest moved under the gate"
 run_consumer_raw
 if [ "$RC" -eq 0 ]; then
-  fail "mutation G: trust-router still built with no trust-budget dependency — the edge is DECORATIVE and the extraction claim is void"
+  fail "mutation G: $CONSUMER_PACKAGE still built with no trust-budget dependency — the edge is DECORATIVE and the extraction claim is void"
 else
-  mut_ok "mutation G (delete trust-budget from trust-router)  rc=$RC"
+  mut_ok "mutation G (delete trust-budget from $CONSUMER_PACKAGE)  rc=$RC"
 fi
 grep -qE '^error\[E0433\]' "$LOG" \
   || fail "mutation G: the build did not fail with E0433 (unresolved crate) — it failed for some other reason, so this run does not show the edge is load-bearing. $(grep -oE '^error(\[E[0-9]{4}\])?: .*' "$LOG" | head -1)"
 N="$(grep -cE '^error\[E0433\]' "$LOG")"
-[ "$N" -ge 4 ] \
-  || fail "mutation G: only $N unresolved-crate errors — a load-bearing edge should break every call site (expected >= 4, across three files)"
+[ "$N" -ge "$EXPECTED_UNRESOLVED" ] \
+  || fail "mutation G: only $N unresolved-crate errors in $CONSUMER_PACKAGE — expected >= $EXPECTED_UNRESOLVED at its remaining call sites"
 mut_ok "          $N call sites went unresolved — the consumer genuinely depends on this crate"
 rm -f "$LOG"; restore_or_refuse
+done
 
 mut_end
 # ---------------------------------------------------------------------------
@@ -615,6 +672,8 @@ NOW_SHA="$(shasum -a 256 "$SRC" | cut -d' ' -f1)"
 [ "$NOW_SHA" = "$PRISTINE_SHA" ] || fail "src was NOT restored ($NOW_SHA != $PRISTINE_SHA)"
 NOW_CSHA="$(shasum -a 256 "$CONSUMER_MANIFEST" | cut -d' ' -f1)"
 [ "$NOW_CSHA" = "$PRISTINE_CSHA" ] || fail "consumer manifest was NOT restored ($NOW_CSHA != $PRISTINE_CSHA)"
+NOW_ROUTER_CSHA="$(shasum -a 256 "$REPO_ROOT/crates/trust-router/Cargo.toml" | cut -d' ' -f1)"
+[ "$NOW_ROUTER_CSHA" = "$PRISTINE_ROUTER_CSHA" ] || fail "router consumer manifest changed ($NOW_ROUTER_CSHA != $PRISTINE_ROUTER_CSHA)"
 NOW_LOCK_SHA="$(shasum -a 256 "$WORKSPACE_LOCK" | cut -d' ' -f1)"
 [ "$NOW_LOCK_SHA" = "$PRISTINE_LOCK_SHA" ] || fail "workspace lock changed ($NOW_LOCK_SHA != $PRISTINE_LOCK_SHA)"
 

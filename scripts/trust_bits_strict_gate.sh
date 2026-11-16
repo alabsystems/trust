@@ -32,9 +32,9 @@
 #     is asserted and `unreachable` is asserted ABSENT.
 #  3. A pass never seen to fail is not evidence. Twelve mutations run: ten that
 #     must refute, and TWO that must NOT (H and I below).
-#  4. `TRUSTFLAGS` is silently dropped if misspelled, so the certify lane can
-#     look like it ran when it did not. The flag path is proved by feeding it a
-#     bogus policy and requiring the compiler to reject it BY NAME.
+#  4. The certify lane must be seen to run, not assumed. `--certify` selects
+#     it (TRUSTFLAGS is not read since T7a), and the Gate line names the lane
+#     that graded the run, so the certify step requires `[certify lane`.
 #  5. Proofs cover overflow and discharged contracts — NOT whether the answer is
 #     right.
 #
@@ -157,26 +157,11 @@ TARGO="${TARGO:-$REPO_ROOT/build/host/stage1/bin/targo}"
 [ -x "$(dirname "$TARGO")/trustc" ] \
   || { echo "REFUSE: no sibling trustc beside $TARGO — the stage1 sysroot is not assembled"; exit 2; }
 
-# PREFLIGHT: `crates/Cargo.toml` must LOAD. A workspace member listed without a
-# manifest on disk makes every `targo trust check` in this workspace exit 2 with
-# no `Gate:` line — indistinguishable, to every assertion below, from the §9.2
-# seal failure and from a real crate regression. Name the real cause instead.
-MISSING_MEMBERS="$(python3 - "$REPO_ROOT/crates" <<'PY'
-import os, re, sys
-root = sys.argv[1]
-s = open(os.path.join(root, "Cargo.toml")).read()
-m = re.search(r'^members\s*=\s*\[(.*?)^\]', s, re.S | re.M)
-if m:
-    for name in re.findall(r'^\s*"([^"]+)",\s*$', m.group(1), re.M):
-        if not os.path.exists(os.path.join(root, name, "Cargo.toml")):
-            print(name)
-PY
-)"
-[ -z "$MISSING_MEMBERS" ] || {
-  echo "REFUSE: crates/Cargo.toml lists member(s) with no manifest on disk:"
-  echo "$MISSING_MEMBERS" | sed 's/^/          /'
-  echo "        Every targo run in this workspace exits 2 with no Gate: line until"
-  echo "        that is fixed. This is NOT a trust-bits result."
+# Ask Targo to load the canonical workspace before attributing a load failure
+# to the contract under test. Native metadata resolves members and manifests.
+"$TARGO" metadata --locked --no-deps --format-version 1 \
+  --manifest-path "$REPO_ROOT/Cargo.toml" >/dev/null || {
+  echo "REFUSE: Targo cannot load the canonical workspace"
   exit 2
 }
 
@@ -187,9 +172,9 @@ trap 'restore; rm -f "$BACKUP"' EXIT INT TERM
 
 fails=0
 LOG=""
-run() { # run [policy]; sets RC and LOG
+run() { # run [lane flag]; sets RC and LOG
   LOG="$(mktemp)"
-  ( cd "$REPO_ROOT/crates" && TRUSTFLAGS="${1:-}" "$TARGO" trust check -p trust-bits ) > "$LOG" 2>&1
+  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check --all-rows ${1:+"$1"} -p trust-bits ) > "$LOG" 2>&1
   RC=$?
   require_env "${STEP:-run}"
   no_rustc_error "${STEP:-run}"
@@ -204,7 +189,7 @@ runtests() { # sets RC and LOG
   RC=$?
   require_env "${STEP:-tests}"
 }
-gate_line() { grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$LOG" | tail -1; }
+gate_line() { grep -oE 'Gate: [A-Z-]+ \[[a-z-]+ lane, exit [0-9]+\]' "$LOG" | tail -1; }
 kinds() { grep -oE 'proved by kind: [a-z_=0-9, ]+' "$LOG" | tail -1; }
 fail() { echo "  FAIL $*"; fails=$((fails+1)); }
 
@@ -329,23 +314,18 @@ rm -f "$LOG"
 mut_end
 
 # ---------------------------------------------------------------------------
-# 2. THE SAME PASS UNDER `-Ztrust-policy=certify`.
-#    A misspelled TRUSTFLAGS is dropped, so first prove the flag path reaches
-#    the compiler by requiring a bogus policy to be REJECTED BY NAME. Without
-#    this control, "certify passed" is indistinguishable from "certify never
-#    ran".
+# 2. THE SAME PASS UNDER `--certify` (the compiler's `certify` policy).
+#    The lane flag selects the compiler's `certify` policy, and the Gate line
+#    names the lane that graded the run, so `[certify lane, exit 0]` is the
+#    evidence that certify ran. (A bogus-policy control proved the TRUSTFLAGS
+#    route reached the compiler; it went with that channel, DECISION_QUEUE T7a.)
 # ---------------------------------------------------------------------------
-STEP="THE SAME PASS UNDER '-Ztrust-policy=certify'"; mut_begin
-run "-Ztrust-policy=bogus_not_a_policy"
-grep -q "incorrect value \`bogus_not_a_policy\` for unstable option \`trust-policy\`" "$LOG" \
-  || fail "TRUSTFLAGS control: a bogus policy was NOT rejected — the flag never reaches the compiler, so the certify run below proves nothing"
-rm -f "$LOG"
-
-run "-Ztrust-policy=certify"
+STEP="THE SAME PASS UNDER '--certify'"; mut_begin
+run "--certify"
 G="$(gate_line)"
 [ -n "$G" ] || fail "certify: no Gate: line"
 [ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
-case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
+case "$G" in *"PASS [certify lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
 grep -qE 'Summary: 114 proved, 0 failed, .*0 inconclusive \(114 total\)' "$LOG" \
   || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 [ "$(kinds)" = "$PRISTINE_KINDS" ] || fail "certify: the kind split differs from the default policy"

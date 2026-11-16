@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // stderr parsing: drive the compiler's JSON transport (trust_types::TRANSPORT_PREFIX)
 // out of stderr lines and into VerificationResult records, with a lossy fallback for
 // schema drift and a small diagnostic-level classifier for non-transport lines.
@@ -14,13 +14,69 @@ use sha2::{Digest, Sha256};
 use trust_types::{Counterexample, SourceSpan};
 
 use crate::input_limits::{
-    MAX_AUTHENTICATED_CARGO_TRANSPORT_BYTES, MAX_CARGO_JSON_LINE_BYTES,
-    MAX_COMPILER_STDERR_LINE_BYTES, read_bounded_utf8_line,
+    MAX_CARGO_JSON_LINE_BYTES, MAX_COMPILER_STDERR_LINE_BYTES,
+    max_authenticated_cargo_transport_bytes, read_bounded_utf8_line,
 };
 use crate::report::CompilerDiagnostic;
 use crate::types::{
     VerificationOutcome, VerificationResult, parse_trust_note, transport_to_verification_result,
 };
+
+#[cfg(unix)]
+pub(crate) mod paired;
+
+// Independent resource allowance: exhaustion withholds only resource availability.
+// The pre-existing proof transport aggregate and outer framing limits are unchanged.
+const MAX_NATIVE_ADMISSION_TRANSPORT_BYTES: usize = 64 * 1024 * 1024;
+
+fn charge_native_admission_bytes(
+    total: &mut usize,
+    amount: usize,
+    limit: usize,
+) -> Result<(), String> {
+    *total = total.saturating_add(amount);
+    if *total > limit {
+        Err("native admission transport exceeded its resource evidence allowance".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn is_native_admission_payload(json: &str) -> bool {
+    // Classification observes each root tag, including duplicate tags and a
+    // tag before truncation. It does not accept or normalize the payload: the
+    // later direct typed parse still rejects all duplicate and unknown fields.
+    // A malformed resource message must not consume the proof byte allowance.
+    struct Tags<'a>(&'a mut bool);
+    impl<'de> serde::de::Visitor<'de> for Tags<'_> {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a transport object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "type" {
+                    if map.next_value::<serde_json::Value>()?.as_str()
+                        == Some("native_admission_census")
+                    {
+                        *self.0 = true;
+                    }
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut native = false;
+    let _ = serde::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_str(json),
+        Tags(&mut native),
+    );
+    native
+}
 
 const TARGO_TRUST_PROOF_UNIT_SCHEMA_V2: &str = "targo.trust-proof-unit.v2";
 const TARGO_TRUST_PROOF_INVENTORY_SCHEMA_V2: &str = "targo.trust-proof-inventory.v2";
@@ -31,31 +87,22 @@ pub(crate) const TARGO_TRUST_EXCLUSION_DEFERRED_DOCTEST: &str = "deferred-doctes
 pub(crate) const TARGO_TRUST_EXCLUSION_COMPILE_TIME_DEPS_FILTERED: &str =
     "compile-time-deps-filtered";
 pub(crate) const TARGO_TRUST_EXCLUSION_DOCUMENTATION: &str = "documentation-generation";
-/// A Unit no requested root reaches without crossing a build script: a
-/// build-script target, a `[build-dependencies]` library, or their transitive
-/// closure. Such a Unit contributes no code to a verified artifact, so its
-/// obligations are trusted rather than discharged. Valid only under
-/// include-dependencies — without that flag the dependency-policy reason owns
-/// every excluded dependency.
+// Retired compiler-unit exclusions are recognized only to fail closed on an
+// older producer. Include-dependencies requires these units' ordinary evidence.
 pub(crate) const TARGO_TRUST_EXCLUSION_BUILD_SUPPORT_ONLY: &str = "build-support-only";
-/// The audited Trust spec proc-macro provider: a `proc-macro` Unit whose exact
-/// (package, version) is on Targo's audited allowlist and whose manifest and
-/// `src/lib.rs` sha256 match the pinned digests.
-///
-/// Deliberately a DISTINCT reason from build-support-only, because the argument
-/// is different and weaker. A build-support Unit contributes no code to the
-/// artifact; a proc macro shapes the tokens of the units it annotates and runs
-/// inside the verifying compiler. It is trusted because its source bytes are
-/// pinned and audited to expand to the identity, not because it is absent from
-/// the artifact. Separate spellings keep the exclusion ledger honest about which
-/// argument was used.
-///
-/// This side cannot re-check the audit: the allowlist and the hashes live in
-/// authenticated Targo. What is checked here is that the reason names a Unit
-/// SHAPE the audit could apply to (a proc-macro compile carrying the dependency
-/// graph role, under include-dependencies), so the spelling cannot become a
-/// general-purpose way to trust an ordinary library away.
 pub(crate) const TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC: &str = "audited-trust-spec";
+/// Trust (D2d, 2026-09-28): a doctest Unit that Targo's authenticated doctest
+/// census showed to contain ZERO doctests. `targo trust test` never executes
+/// doctests (phase B selects `--tests`), so such a Unit defers nothing, and the
+/// proof frontier must not read INCOMPLETE because of it.
+///
+/// Targo's inventory never DECLARES this reason — it declares every doctest
+/// Unit `deferred-doctest-execution`, and a declared `empty-doctest-unit` is
+/// refused. Only [`apply_doctest_census`] assigns it, to the exact declared
+/// Unit a complete census names, and only for a count of zero: a Unit holding a
+/// real doctest, or one whose census failed, stays deferred and disclosed.
+pub(crate) const TARGO_TRUST_EXCLUSION_EMPTY_DOCTEST: &str = "empty-doctest-unit";
+const TARGO_TRUST_DOCTEST_CENSUS_SCHEMA_V1: &str = "targo.trust-doctest-census.v1";
 
 #[derive(Default)]
 pub(crate) struct ParsedCompilerOutput {
@@ -74,6 +121,18 @@ pub(crate) struct ParsedCompilerOutput {
     /// rejects this absence for strict policy and permits it only in explicit
     /// compatibility/advisory lanes.
     pub(crate) coverage_rows: Vec<trust_types::CoverageTransportSummary>,
+    /// Diagnostic memory counters paired with the exact authenticated Cargo
+    /// envelope. Crate names alone cannot distinguish lib/bin or feature units.
+    pub(crate) compiler_memory_observations: Vec<crate::compiler_memory::CompilerMemoryObservation>,
+    pub(crate) native_admission_observations: Vec<crate::compiler_admission::Observation>,
+    pub(crate) native_admission_problems: Vec<String>,
+    /// Coverage rows the compiler DID emit that an advisory lane dropped, each
+    /// with the defect that dropped it (2026-10-17). Without this record a dropped
+    /// row was reported exactly like an absent one — "compiler emitted no
+    /// coverage_summary transport row; older toolchain?" — which sent aterm-serde's
+    /// identity defect (seven uncallable bodies credited without an envelope)
+    /// looking for an old toolchain.
+    pub(crate) dropped_coverage: Vec<String>,
     /// Exact per-function envelopes retained before obligation rows are
     /// flattened. Coverage authentication reconciles these identities against
     /// the compiler's versioned eligible/processed sets.
@@ -114,7 +173,7 @@ pub(crate) struct ParsedCompilerOutput {
 /// Cargo-authenticated identity for one proof-subject rustc unit. Package names
 /// and normalized crate names are not unique: package IDs distinguish package
 /// instances, while target kind distinguishes same-name lib/bin targets.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub(crate) struct CargoTargetIdentity {
     pub(crate) package_id: String,
     pub(crate) package_name: String,
@@ -174,7 +233,7 @@ impl CargoTargetIdentity {
         )
     }
 
-    fn crate_name(&self) -> String {
+    pub(crate) fn crate_name(&self) -> String {
         normalize_cargo_crate_name(&self.target_name)
     }
 
@@ -492,7 +551,8 @@ impl ParsedCompilerOutput {
             if required {
                 return Err(format!("raw Trust compiler transport lifecycle violation: {defect}"));
             }
-            self.coverage_rows.clear();
+            let defect = format!("raw Trust compiler transport lifecycle violation: {defect}");
+            self.drop_coverage(defect);
         }
         if let Some(session) =
             self.raw_function_sessions.iter().find(|session| session.as_str() != expected_session)
@@ -511,13 +571,14 @@ impl ParsedCompilerOutput {
             ));
         }
         if self.coverage_rows.len() > 1 {
+            let defect = format!(
+                "raw Trust compiler carried {} coverage summaries; exactly one compiler-unit coverage inventory is required",
+                self.coverage_rows.len()
+            );
             if required {
-                return Err(format!(
-                    "raw Trust compiler carried {} coverage summaries; exactly one compiler-unit coverage inventory is required",
-                    self.coverage_rows.len()
-                ));
+                return Err(defect);
             }
-            self.coverage_rows.clear();
+            self.drop_coverage(defect);
             return Ok(self);
         }
         if let Some(row) = self.coverage_rows.iter().find(|row| {
@@ -525,13 +586,14 @@ impl ParsedCompilerOutput {
                 || row.primary_package
                 || row.verification_session != expected_session
         }) {
+            let defect = format!(
+                "raw Trust coverage row carried unauthenticated scope/session for crate {:?}",
+                row.crate_name
+            );
             if required {
-                return Err(format!(
-                    "raw Trust coverage row carried unauthenticated scope/session for crate {:?}",
-                    row.crate_name
-                ));
+                return Err(defect);
             }
-            self.coverage_rows.clear();
+            self.drop_coverage(defect);
         }
         self.require_coverage_function_identity_authentication(required)
     }
@@ -549,16 +611,26 @@ impl ParsedCompilerOutput {
         let Some(defect) = self.coverage_function_identity_defect() else {
             return Ok(self);
         };
+        let defect = format!("Trust coverage function identity authentication failed: {defect}");
         if required {
-            return Err(format!(
-                "Trust coverage function identity authentication failed: {defect}"
-            ));
+            return Err(defect);
         }
         // Advisory compatibility may retain the function outcomes, but the
         // defective/legacy coverage row becomes coverage-unknown and earns no
-        // whole-target completeness credit.
-        self.coverage_rows.clear();
+        // whole-target completeness credit. It is recorded as DROPPED, with its
+        // defect, so the report never calls it absent.
+        self.drop_coverage(defect);
         Ok(self)
+    }
+
+    /// Drop every coverage row of this compiler output for `defect`, keeping the
+    /// record that rows were emitted and why they earn no credit. A drop with no
+    /// row to drop records nothing: there was nothing emitted to misreport.
+    fn drop_coverage(&mut self, defect: String) {
+        if !self.coverage_rows.is_empty() {
+            self.coverage_rows.clear();
+            self.dropped_coverage.push(defect);
+        }
     }
 
     fn coverage_function_identity_defect(&self) -> Option<String> {
@@ -717,6 +789,12 @@ impl ParsedCompilerOutput {
             0 => {}
             1 => {
                 self.coverage_proof_targets.insert(target.clone());
+                self.compiler_memory_observations.push(
+                    crate::compiler_memory::CompilerMemoryObservation::cargo(
+                        target,
+                        &target_output.coverage_rows[0],
+                    ),
+                );
                 if target_output.coverage_rows[0].eligible == 0 {
                     self.zero_eligible_coverage_targets.insert(target.clone());
                 }
@@ -729,6 +807,12 @@ impl ParsedCompilerOutput {
             }
         }
         self.coverage_rows.extend(target_output.coverage_rows);
+        self.dropped_coverage.extend(
+            target_output
+                .dropped_coverage
+                .into_iter()
+                .map(|defect| format!("{}: {defect}", target.report_label())),
+        );
         self.function_envelopes.extend(target_output.function_envelopes);
         self.raw_transport_ordering_defects.extend(target_output.raw_transport_ordering_defects);
         self.saw_structured_transport |= target_output.saw_structured_transport;
@@ -889,6 +973,7 @@ pub(crate) struct CargoCompilerEvidence {
     /// authenticated compile-only phase.  The outer driver hashes these bytes
     /// before authorizing a separate fresh-only execution phase.
     pub(crate) test_executables: BTreeSet<CargoTestExecutable>,
+    pub(crate) prepared_tests: Option<trust_test_execution::PreparedTestsReceipt>,
     /// Cargo's terminal status as declared by its unique `build-finished`
     /// machine message. A successful process without this boundary is not a
     /// complete canonical evidence stream.
@@ -902,6 +987,41 @@ pub(crate) struct CargoCompilerEvidence {
     /// never rescan Cargo/build-script stderr for transport-looking text.
     pub(crate) authenticated_transport_messages:
         Vec<(CargoTargetIdentity, trust_types::TransportMessage)>,
+    /// Every `compiler-message` of level `error` Cargo reported, in the
+    /// package its `package_id` names (`crate::obligations::CompileError`).
+    /// Disclosure for the records and the changed-only view: no verdict,
+    /// gate or exit reads it, and a failed build is judged by
+    /// `build_succeeded` and the compiler's exit as before.
+    pub(crate) compile_errors: Vec<crate::obligations::CompileError>,
+}
+
+/// The package name a Cargo package ID names: the selected package's own
+/// name when the run selected it; otherwise read from the ID, in either of
+/// Cargo's spellings — `<name> <version> (<source>)`, or
+/// `<source>#[<name>@]<version>`, where a missing `<name>@` means the name is
+/// the source path's last segment.
+fn cargo_package_name(package_id: &str, selected_packages: &BTreeMap<String, String>) -> String {
+    if let Some(name) = selected_packages.get(package_id) {
+        return name.clone();
+    }
+    if let Some((name, _)) = package_id.split_once(' ') {
+        return name.to_string();
+    }
+    match package_id.rsplit_once('#') {
+        Some((_, fragment)) if fragment.contains('@') => {
+            fragment.split_once('@').map(|(name, _)| name.to_string()).unwrap_or_default()
+        }
+        Some((source, _)) => source
+            .split('?')
+            .next()
+            .unwrap_or(source)
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(source)
+            .to_string(),
+        None => package_id.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1063,16 +1183,17 @@ pub(crate) fn parse_cargo_json_stdout<R: BufRead>(
     expected_session: &str,
     require_authenticated_coverage: bool,
 ) -> Result<CargoCompilerEvidence, String> {
-    parse_cargo_json_stdout_impl(
+    parse_cargo_json_stdout_impl(CargoJsonParseInput {
         reader,
         selected_packages,
         expected_session,
         require_authenticated_coverage,
-        false,
-        false,
-        MAX_CARGO_JSON_LINE_BYTES,
-        MAX_AUTHENTICATED_CARGO_TRANSPORT_BYTES,
-    )
+        retain_authenticated_messages: false,
+        allow_post_build_test_output: false,
+        require_prepared_tests: false,
+        max_line_bytes: MAX_CARGO_JSON_LINE_BYTES,
+        max_authenticated_transport_bytes: max_authenticated_cargo_transport_bytes(),
+    })
 }
 
 /// Parse Cargo's authenticated compile-time evidence while passing through
@@ -1086,16 +1207,68 @@ pub(crate) fn parse_cargo_json_stdout_for_test<R: BufRead>(
     expected_session: &str,
     require_authenticated_coverage: bool,
 ) -> Result<CargoCompilerEvidence, String> {
-    parse_cargo_json_stdout_impl(
+    parse_cargo_json_stdout_impl(CargoJsonParseInput {
         reader,
         selected_packages,
         expected_session,
         require_authenticated_coverage,
-        false,
-        true,
-        MAX_CARGO_JSON_LINE_BYTES,
-        MAX_AUTHENTICATED_CARGO_TRANSPORT_BYTES,
-    )
+        retain_authenticated_messages: false,
+        allow_post_build_test_output: true,
+        require_prepared_tests: false,
+        max_line_bytes: MAX_CARGO_JSON_LINE_BYTES,
+        max_authenticated_transport_bytes: max_authenticated_cargo_transport_bytes(),
+    })
+}
+
+fn parse_prepared_tests_receipt(
+    line: &str,
+    session: &str,
+) -> Result<trust_test_execution::PreparedTestsReceipt, String> {
+    use trust_test_execution::{PreparedTestsReceipt, RECEIPT_SCHEMA};
+    let mut value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|_| "invalid prepared-test receipt after build completion")?;
+    if value
+        .as_object_mut()
+        .and_then(|object| object.remove("reason"))
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .as_deref()
+        != Some("trust-test-execution-plan")
+    {
+        return Err("expected native prepared-test receipt after build completion".into());
+    }
+    let receipt: PreparedTestsReceipt = serde_json::from_value(value)
+        .map_err(|error| format!("invalid prepared-test receipt: {error}"))?;
+    if receipt.schema != RECEIPT_SCHEMA
+        || receipt.session != session
+        || !std::path::Path::new(&receipt.path).is_absolute()
+        || receipt.sha256.len() != 64
+        || !receipt
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("mismatched native prepared-test receipt".into());
+    }
+    Ok(receipt)
+}
+
+pub(crate) fn parse_cargo_json_stdout_for_prepared_tests<R: BufRead>(
+    reader: R,
+    selected_packages: &BTreeMap<String, String>,
+    expected_session: &str,
+    require_authenticated_coverage: bool,
+) -> Result<CargoCompilerEvidence, String> {
+    parse_cargo_json_stdout_impl(CargoJsonParseInput {
+        reader,
+        selected_packages,
+        expected_session,
+        require_authenticated_coverage,
+        retain_authenticated_messages: false,
+        allow_post_build_test_output: false,
+        require_prepared_tests: true,
+        max_line_bytes: MAX_CARGO_JSON_LINE_BYTES,
+        max_authenticated_transport_bytes: max_authenticated_cargo_transport_bytes(),
+    })
 }
 
 /// Self-verification additionally needs the original typed messages to build
@@ -1108,45 +1281,76 @@ pub(crate) fn parse_cargo_json_stdout_with_authenticated_messages<R: BufRead>(
     expected_session: &str,
     require_authenticated_coverage: bool,
 ) -> Result<CargoCompilerEvidence, String> {
-    parse_cargo_json_stdout_impl(
+    parse_cargo_json_stdout_impl(CargoJsonParseInput {
         reader,
         selected_packages,
         expected_session,
         require_authenticated_coverage,
-        true,
-        false,
-        MAX_CARGO_JSON_LINE_BYTES,
-        MAX_AUTHENTICATED_CARGO_TRANSPORT_BYTES,
-    )
+        retain_authenticated_messages: true,
+        allow_post_build_test_output: false,
+        require_prepared_tests: false,
+        max_line_bytes: MAX_CARGO_JSON_LINE_BYTES,
+        max_authenticated_transport_bytes: max_authenticated_cargo_transport_bytes(),
+    })
 }
 
-fn parse_cargo_json_stdout_impl<R: BufRead>(
-    mut reader: R,
-    selected_packages: &BTreeMap<String, String>,
-    expected_session: &str,
+struct CargoJsonParseInput<'a, R: BufRead> {
+    reader: R,
+    selected_packages: &'a BTreeMap<String, String>,
+    expected_session: &'a str,
     require_authenticated_coverage: bool,
     retain_authenticated_messages: bool,
     allow_post_build_test_output: bool,
+    require_prepared_tests: bool,
     max_line_bytes: usize,
     max_authenticated_transport_bytes: usize,
+}
+
+fn parse_cargo_json_stdout_impl<R: BufRead>(
+    input: CargoJsonParseInput<'_, R>,
 ) -> Result<CargoCompilerEvidence, String> {
+    let CargoJsonParseInput {
+        mut reader,
+        selected_packages,
+        expected_session,
+        require_authenticated_coverage,
+        retain_authenticated_messages,
+        allow_post_build_test_output,
+        require_prepared_tests,
+        max_line_bytes,
+        max_authenticated_transport_bytes,
+    } = input;
     let mut transport_lines = BTreeMap::<CargoTargetIdentity, Vec<String>>::new();
     let mut proof_unit_lifecycles = BTreeMap::<CargoTargetIdentity, CargoProofUnitPhase>::new();
     let mut compiled_targets = BTreeSet::new();
     let mut test_executables = BTreeSet::new();
+    let mut prepared_tests = None;
     let mut primary_compile_targets = BTreeSet::new();
     let mut proof_unit_identities = BTreeMap::<u64, CargoTargetIdentity>::new();
     let mut authenticated_transport_messages = Vec::new();
+    let mut native_admission_observations = Vec::new();
+    let mut native_admission_problems = Vec::new();
+    let mut native_admission_seen = BTreeSet::new();
+    let mut native_admission_bytes = 0;
     let mut authenticated_transport_bytes = 0usize;
     let mut line_index = 0usize;
     let mut build_succeeded = None;
     let mut declared_inventory = None;
+    let mut censused_doctest_units = BTreeSet::<u64>::new();
+    let mut compile_errors = Vec::new();
 
     while let Some(line) = read_bounded_utf8_line(&mut reader, max_line_bytes).map_err(|error| {
         format!("could not safely read Cargo JSON output line {}: {error}", line_index + 1)
     })? {
         line_index += 1;
         if build_succeeded.is_some() {
+            if require_prepared_tests {
+                if prepared_tests.is_some() {
+                    return Err("duplicate native prepared-test receipt".into());
+                }
+                prepared_tests = Some(parse_prepared_tests_receipt(&line, expected_session)?);
+                continue;
+            }
             if allow_post_build_test_output {
                 // Cargo test harness output is an untrusted user stream.
                 // Preserve it for normal test UX, but never feed it back into
@@ -1262,15 +1466,63 @@ fn parse_cargo_json_stdout_impl<R: BufRead>(
                 let text =
                     message.get("message").and_then(serde_json::Value::as_str).unwrap_or_default();
                 if let Some(json) = text.strip_prefix(trust_types::TRANSPORT_PREFIX) {
+                    // Resource transport is authenticated against the same envelope,
+                    // but defects invalidate only resource availability, never proof rows.
+                    if is_native_admission_payload(json) {
+                        let checked = (|| {
+                            charge_native_admission_bytes(
+                                &mut native_admission_bytes,
+                                text.len(),
+                                MAX_NATIVE_ADMISSION_TRANSPORT_BYTES,
+                            )?;
+                            validate_transport_diagnostic_tag(message)?;
+                            let package = value
+                                .get("package_id")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or("native admission envelope omitted package_id")?;
+                            let target = cargo_target_identity(&value, package, selected_packages)?
+                                .ok_or("native admission unit is outside the proof inventory")?;
+                            require_declared_proof_target(declared_inventory.as_ref(), &target)?;
+                            if !matches!(
+                                proof_unit_lifecycles.get(&target),
+                                None | Some(CargoProofUnitPhase::FunctionRows)
+                            ) {
+                                return Err(
+                                    "native admission census arrived after coverage/terminal"
+                                        .into(),
+                                );
+                            }
+                            if !native_admission_seen.insert(target.clone()) {
+                                return Err("duplicate native admission census".into());
+                            }
+                            let trust_types::TransportMessage::NativeAdmissionCensus(census) =
+                                trust_types::parse_transport_payload(json)
+                                    .map_err(|e| e.to_string())?
+                            else {
+                                return Err("invalid native admission payload".into());
+                            };
+                            crate::compiler_admission::authenticate(
+                                &census,
+                                &target,
+                                expected_session,
+                            )?;
+                            native_admission_observations.push(
+                                crate::compiler_admission::Observation {
+                                    cargo_target: target,
+                                    census,
+                                },
+                            );
+                            Ok::<(), String>(())
+                        })();
+                        if let Err(error) = checked {
+                            native_admission_problems.push(error);
+                        }
+                        continue;
+                    }
                     authenticated_transport_bytes = authenticated_transport_bytes
                         .checked_add(text.len())
                         .filter(|bytes| *bytes <= max_authenticated_transport_bytes)
-                        .ok_or_else(|| {
-                            format!(
-                                "authenticated Cargo Trust transport exceeds the {}-byte aggregate safety limit",
-                                max_authenticated_transport_bytes
-                            )
-                        })?;
+                        .ok_or_else(|| format!("authenticated Cargo Trust transport exceeds the {}-byte aggregate safety limit", max_authenticated_transport_bytes))?;
                     validate_transport_diagnostic_tag(message)?;
                     let Some((target, authenticated_message)) = validate_cargo_transport_envelope(
                         &value,
@@ -1282,6 +1534,15 @@ fn parse_cargo_json_stdout_impl<R: BufRead>(
                     else {
                         continue;
                     };
+                    if native_admission_seen.contains(&target)
+                        && matches!(
+                            &authenticated_message,
+                            trust_types::TransportMessage::FunctionResult(_)
+                        )
+                    {
+                        native_admission_problems
+                            .push("function transport followed native admission census".into());
+                    }
                     admit_proof_unit_identity(&mut proof_unit_identities, &target)?;
                     admit_primary_compile_target(&mut primary_compile_targets, &target)?;
                     require_declared_proof_target(declared_inventory.as_ref(), &target)?;
@@ -1302,11 +1563,30 @@ fn parse_cargo_json_stdout_impl<R: BufRead>(
                         .entry(target)
                         .or_default()
                         .push(format!("{}{authenticated_json}", trust_types::TRANSPORT_PREFIX));
-                } else if let Some(rendered) =
-                    message.get("rendered").and_then(serde_json::Value::as_str)
-                {
-                    eprint!("{rendered}");
+                } else {
+                    if let Some(package_id) =
+                        value.get("package_id").and_then(serde_json::Value::as_str)
+                    {
+                        compile_errors.extend(
+                            crate::obligations::CompileError::of_cargo_diagnostic(
+                                &cargo_package_name(package_id, selected_packages),
+                                message,
+                            ),
+                        );
+                    }
+                    if let Some(rendered) =
+                        message.get("rendered").and_then(serde_json::Value::as_str)
+                    {
+                        eprint!("{rendered}");
+                    }
                 }
+            }
+            Some("trust-doctest-census") => {
+                apply_doctest_census(
+                    declared_inventory.as_mut(),
+                    &value,
+                    &mut censused_doctest_units,
+                )?;
             }
             Some("build-finished") => {
                 let Some(success) = value.get("success").and_then(serde_json::Value::as_bool)
@@ -1343,25 +1623,131 @@ fn parse_cargo_json_stdout_impl<R: BufRead>(
         )?;
     }
 
+    if build_succeeded != Some(true) {
+        native_admission_problems
+            .push("Cargo run has no successful build-finished boundary".into());
+    }
     let mut parsed = ParsedCompilerOutput::default();
     for (target, lines) in transport_lines {
         let target_output = parse_compiler_stderr(Cursor::new(lines.join("\n")), false)
             .require_coverage_function_identity_authentication(require_authenticated_coverage)?;
+        if let Some(resource) =
+            native_admission_observations.iter().find(|resource| resource.cargo_target == target)
+        {
+            let mut functions: Vec<_> =
+                resource.census.bodies.iter().map(|b| b.function.clone()).collect();
+            functions.sort();
+            let expected = target_output
+                .coverage_rows
+                .first()
+                .and_then(|c| c.function_identities.as_ref())
+                .map(|i| &i.eligible_functions);
+            if expected != Some(&functions) {
+                native_admission_problems.push(format!(
+                    "native admission body inventory differs from coverage: {}",
+                    target.report_label()
+                ));
+            }
+        }
         parsed.merge_cargo_target(target_output, &target)?;
     }
+    parsed.native_admission_observations = native_admission_observations;
+    parsed.native_admission_problems = native_admission_problems;
+    if require_prepared_tests && build_succeeded == Some(true) && prepared_tests.is_none() {
+        return Err("native Targo omitted the prepared-test receipt".into());
+    }
     let evidence = CargoCompilerEvidence {
+        prepared_tests,
         parsed,
         compiled_targets,
         test_executables,
         build_succeeded,
         declared_inventory,
         authenticated_transport_messages,
+        compile_errors,
     };
     if evidence.build_succeeded == Some(true) {
         evidence
             .require_successful_selected_roots(selected_packages, require_authenticated_coverage)?;
     }
     Ok(evidence)
+}
+
+/// Trust (D2d): bind one `trust-doctest-census` message to the exact excluded
+/// doctest Unit the declared inventory names by index AND identity digest, and
+/// refine that Unit to [`TARGO_TRUST_EXCLUSION_EMPTY_DOCTEST`] only when the
+/// census counted zero doctests. Anything else about the message — a census
+/// before the inventory, an unknown field, a second census for one Unit, a
+/// Unit that is not a deferred doctest — is a transport violation.
+fn apply_doctest_census(
+    inventory: Option<&mut CargoProofInventory>,
+    census: &serde_json::Value,
+    censused: &mut BTreeSet<u64>,
+) -> Result<(), String> {
+    let inventory = inventory.ok_or_else(|| {
+        "Targo doctest census appeared before its declared proof inventory".to_string()
+    })?;
+    let fields = census
+        .as_object()
+        .ok_or_else(|| "Targo doctest census was not a JSON object".to_string())?;
+    if let Some(field) = fields.keys().find(|field| {
+        !matches!(
+            field.as_str(),
+            "reason" | "schema" | "index" | "trust_unit_identity_sha256" | "doctests"
+        )
+    }) {
+        return Err(format!("Targo doctest census carried unexpected field {field:?}"));
+    }
+    if census.get("schema").and_then(serde_json::Value::as_str)
+        != Some(TARGO_TRUST_DOCTEST_CENSUS_SCHEMA_V1)
+    {
+        return Err("Targo doctest census omitted its exact schema".to_string());
+    }
+    let index = census
+        .get("index")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "Targo doctest census omitted its Cargo Unit index".to_string())?;
+    let identity = census
+        .get("trust_unit_identity_sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|digest| canonical_sha256_hex(digest))
+        .ok_or_else(|| {
+            "Targo doctest census omitted a canonical Trust unit-identity SHA-256".to_string()
+        })?;
+    let doctests = census
+        .get("doctests")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "Targo doctest census omitted its doctest count".to_string())?;
+    if !censused.insert(index) {
+        return Err(format!("Targo emitted more than one doctest census for Cargo Unit {index}"));
+    }
+    let target = inventory
+        .excluded_targets
+        .iter()
+        .find(|target| target.proof_unit_index == index)
+        .cloned()
+        .ok_or_else(|| {
+            format!("Targo doctest census named Cargo Unit {index}, which is not a declared excluded Unit")
+        })?;
+    if target.unit_identity_sha256 != identity {
+        return Err(format!(
+            "Targo doctest census identity did not match the declared Unit: {}",
+            target.report_label()
+        ));
+    }
+    if target.proof_unit_mode != "doctest"
+        || inventory.excluded_reasons.get(&target).map(String::as_str)
+            != Some(TARGO_TRUST_EXCLUSION_DEFERRED_DOCTEST)
+    {
+        return Err(format!(
+            "Targo doctest census named a Unit that is not a declared deferred doctest: {}",
+            target.report_label()
+        ));
+    }
+    if doctests == 0 {
+        inventory.excluded_reasons.insert(target, TARGO_TRUST_EXCLUSION_EMPTY_DOCTEST.to_string());
+    }
+    Ok(())
 }
 
 fn validate_cargo_artifact_semantics(
@@ -1650,6 +2036,12 @@ fn parse_cargo_proof_inventory(
                 })?;
         validate_cargo_unit_semantics_for_target(&semantics, &target)?;
         validate_cargo_excluded_graph_role_scope(&target, graph_role, selected_packages)?;
+        if exclusion_reason == TARGO_TRUST_EXCLUSION_EMPTY_DOCTEST {
+            return Err(format!(
+                "Targo inventory declared doctest Unit `{}` empty; only its authenticated doctest census can establish that",
+                target.report_label()
+            ));
+        }
         validate_cargo_exclusion_reason(
             include_dependencies,
             &target,
@@ -2110,7 +2502,7 @@ fn validate_cargo_exclusion_reason(
                 ));
             }
         }
-        TARGO_TRUST_EXCLUSION_DEFERRED_DOCTEST => {
+        TARGO_TRUST_EXCLUSION_DEFERRED_DOCTEST | TARGO_TRUST_EXCLUSION_EMPTY_DOCTEST => {
             if target.proof_unit_mode != "doctest"
                 || target.target_kinds.iter().any(|kind| kind == "custom-build")
             {
@@ -2140,72 +2532,11 @@ fn validate_cargo_exclusion_reason(
                 ));
             }
         }
-        TARGO_TRUST_EXCLUSION_BUILD_SUPPORT_ONLY => {
-            // Unlike the dependency-policy reason, this one is valid ONLY under
-            // include-dependencies: without that flag every excluded dependency
-            // is owned by the dependency-policy reason instead.
-            if !include_dependencies {
-                return Err(format!(
-                    "Targo excluded Cargo unit `{}` as build-support-only without include-dependencies=true",
-                    target.report_label()
-                ));
-            }
-            // A build-support unit is a real rustc job that simply was not asked
-            // to verify — not a Cargo control job. Naming a non-compiler mode
-            // here would be redundant with an intrinsic mode reason.
-            if !cargo_unit_mode_emits_queued_compiler_evidence(&target.proof_unit_mode) {
-                return Err(format!(
-                    "Targo build-support-only exclusion redundantly named a non-proof Cargo mode: {}",
-                    target.report_label()
-                ));
-            }
-            // Fail-closed anti-scope-collapse check: a resolved root or a
-            // test-execution subject can never be trusted away as build support.
-            if graph_role != "dependency" {
-                return Err(format!(
-                    "Targo build-support-only exclusion carried Cargo graph role {graph_role:?} instead of dependency: {}",
-                    target.report_label()
-                ));
-            }
-        }
-        TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC => {
-            // Like build-support-only, this reason exists only under
-            // include-dependencies: without that flag the dependency-policy
-            // reason already owns every excluded dependency, and a second
-            // spelling for the same exclusion would be a second thing to audit.
-            if !include_dependencies {
-                return Err(format!(
-                    "Targo excluded Cargo unit `{}` as an audited trust-spec proc macro without include-dependencies=true",
-                    target.report_label()
-                ));
-            }
-            // Anti-scope-collapse, on the Unit's own shape: only a proc-macro
-            // compile can carry this reason. `ny-cert` and the `num-*` crates
-            // are `lib`/`rlib` Units and would be rejected here if this reason
-            // were ever stamped onto them, whatever the producer believed.
-            if target.target_kinds.as_slice() != ["proc-macro"] {
-                return Err(format!(
-                    "Targo audited trust-spec exclusion did not name a proc-macro Unit: {}",
-                    target.report_label()
-                ));
-            }
-            // A proc macro is a real rustc job that simply was not asked to
-            // verify, not a Cargo control job.
-            if !cargo_unit_mode_emits_queued_compiler_evidence(&target.proof_unit_mode) {
-                return Err(format!(
-                    "Targo audited trust-spec exclusion redundantly named a non-proof Cargo mode: {}",
-                    target.report_label()
-                ));
-            }
-            // Anti-scope-collapse, on the graph role: a resolved root or a
-            // test-execution subject can never be trusted away as a spec
-            // provider, even if the root itself is a proc-macro crate.
-            if graph_role != "dependency" {
-                return Err(format!(
-                    "Targo audited trust-spec exclusion carried Cargo graph role {graph_role:?} instead of dependency: {}",
-                    target.report_label()
-                ));
-            }
+        TARGO_TRUST_EXCLUSION_BUILD_SUPPORT_ONLY | TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC => {
+            return Err(format!(
+                "Targo excluded compiler unit `{}` using retired exclusion reason {reason:?}; compiler dependencies require ordinary proof evidence when include-dependencies=true",
+                target.report_label()
+            ));
         }
         TARGO_TRUST_EXCLUSION_COMPILE_TIME_DEPS_FILTERED => {
             if !cargo_unit_mode_emits_queued_compiler_evidence(&target.proof_unit_mode) {
@@ -2617,12 +2948,12 @@ pub(crate) fn parse_untrusted_cargo_stderr<R: BufRead>(
             }
         };
         total_bytes = total_bytes.saturating_add(line.len().saturating_add(1));
-        if total_bytes > MAX_AUTHENTICATED_CARGO_TRANSPORT_BYTES {
+        let stderr_ceiling = max_authenticated_cargo_transport_bytes();
+        if total_bytes > stderr_ceiling {
             diagnostics.push(CompilerDiagnostic {
                 level: "error".to_string(),
                 message: format!(
-                    "Cargo stderr exceeded the {}-byte invocation limit",
-                    MAX_AUTHENTICATED_CARGO_TRANSPORT_BYTES
+                    "Cargo stderr exceeded the {stderr_ceiling}-byte invocation limit"
                 ),
             });
             break;
@@ -2751,11 +3082,12 @@ pub(crate) fn parse_compiler_stderr<R: BufRead>(reader: R, echo: bool) -> Parsed
         };
 
         total_bytes = total_bytes.saturating_add(line.len().saturating_add(1));
-        if total_bytes > MAX_AUTHENTICATED_CARGO_TRANSPORT_BYTES {
+        let stderr_ceiling = max_authenticated_cargo_transport_bytes();
+        if total_bytes > stderr_ceiling {
             has_structured = true;
             structured_results.push(malformed_transport_result(&format!(
                 "targo-trust-total-input-rejection: compiler stderr exceeded the {}-byte invocation limit",
-                MAX_AUTHENTICATED_CARGO_TRANSPORT_BYTES
+                stderr_ceiling
             )));
             break;
         }
@@ -2771,10 +3103,16 @@ pub(crate) fn parse_compiler_stderr<R: BufRead>(reader: R, echo: bool) -> Parsed
                     trust_types::TransportMessage::FunctionResult(func_result) => {
                         raw_function_sessions.push(func_result.verification_session.clone());
                         let mut function_results = Vec::new();
-                        for r in &func_result.results {
-                            function_results
-                                .push(transport_to_verification_result(&func_result.function, r));
+                        let identities = crate::types::envelope_identities(&func_result);
+                        for (r, identity) in func_result.results.iter().zip(identities) {
+                            function_results.push(transport_to_verification_result(
+                                &func_result.function,
+                                r,
+                                func_result.runtime_checks,
+                                identity,
+                            ));
                         }
+                        refuse_shared_test_harness_exclusion_envelope(&mut function_results);
                         let scope = function_transport_scope(&func_result);
                         function_envelopes.push(FunctionEnvelopeIdentity {
                             scope: scope.clone(),
@@ -2801,7 +3139,19 @@ pub(crate) fn parse_compiler_stderr<R: BufRead>(reader: R, echo: bool) -> Parsed
                             &mut observed.obligations,
                             &func_result.results,
                         );
-                        if let Some(reason) =
+                        // Trust (TRANSPORT-LINE-BUDGET-1): the compiler's statement that
+                        // it fitted this report under the transport line budget must
+                        // agree with the rows it travels with. A disagreeing one makes
+                        // the whole report malformed: none of its rows is admitted, and
+                        // the function is one genuine unknown that says why.
+                        if let Some(reason) = func_result
+                            .transport_budget
+                            .as_ref()
+                            .and_then(|disclosure| disclosure.defect(&func_result.results))
+                        {
+                            function_results =
+                                vec![transport_budget_defect_result(&func_result.function, reason)];
+                        } else if let Some(reason) =
                             function_transport_summary_defect(&func_result, &function_results)
                         {
                             function_results
@@ -2885,6 +3235,10 @@ pub(crate) fn parse_compiler_stderr<R: BufRead>(reader: R, echo: bool) -> Parsed
         compiler_diagnostics,
         cached_obligations,
         coverage_rows,
+        compiler_memory_observations: Vec::new(),
+        native_admission_observations: Vec::new(),
+        native_admission_problems: Vec::new(),
+        dropped_coverage: Vec::new(),
         function_envelopes,
         raw_function_sessions,
         raw_crate_summary_sessions,
@@ -2988,6 +3342,13 @@ struct FunctionTransportCounts {
     skipped: usize,
     runtime_checked: usize,
     total: usize,
+    /// Trust (OD-1 phase 1): how many of the rows in `skipped` are `proved`
+    /// instance-discharge rows — the compiler's `assumed_discharge`
+    /// ([`compiler_tallies_row_as_assumed_discharge`]). No summary declares
+    /// this number and nothing is compared with it. It only says that the
+    /// summary beside these rows is no legacy summary
+    /// ([`push_legacy_unknown_subset_count_defect`]).
+    assumed_discharge: usize,
 }
 
 #[derive(Clone, Default)]
@@ -3035,6 +3396,56 @@ fn aggregate_crate_summary(
     }
 }
 
+/// Trust (OD-1 phase 1): whether the compiler's summary counts this RAW row in
+/// `skipped` — and so, by the JSON's legacy aggregate, in `unknown` — and in no
+/// other bucket.
+///
+/// Two shapes, exactly the compiler's (`PublishedRowTally::of` and
+/// `json_counts`, compiler/rustc_mir_transform/src/trust_verify.rs): a row whose
+/// outcome is `skipped`, and a `proved` instance-DISCHARGE row
+/// ([`trust_types::assumption::is_instance_hypothesis_discharge_row`], the one
+/// predicate the compiler's tally and this crate's gate partition read). A
+/// discharge row reports the resolved callee's verdict and carries no proof of
+/// its own, so the compiler tallies a `proved` one "assumed (instance
+/// discharge)", JSON `skipped`, never `proved` — while the row itself still
+/// travels with outcome `proved`. Counting it by that outcome disagreed with
+/// the compiler by one row per proved discharge row: every function carrying
+/// one, and its crate, got an accounting row (`proved rows=N+1 summary=N,
+/// unknown rows=M summary=M+1, skipped rows=K summary=K+1`), an accounting row
+/// has no stable key, and a keyless row makes the unit could-not-run (T9): every
+/// crate with a proved discharge row was refused.
+///
+/// Nothing else is admitted, so the cross-check is as closed as it was: the
+/// same kind from another solver, a discharge row with any other outcome, and
+/// every other `proved` row are counted by their outcome, as the compiler
+/// counts them. An envelope that counts a `proved` discharge row `proved` is
+/// now the accounting defect: its producer credits the callee's proof twice.
+fn compiler_summary_counts_row_as_skipped(row: &trust_types::TransportObligationResult) -> bool {
+    row.outcome.is_skipped() || compiler_tallies_row_as_assumed_discharge(row)
+}
+
+/// Trust (OD-1 phase 1): the second shape of
+/// [`compiler_summary_counts_row_as_skipped`] by itself — the row the
+/// compiler's tally files under `assumed_discharge`: outcome `proved`, and the
+/// shared predicate for an instance-discharge row.
+fn compiler_tallies_row_as_assumed_discharge(row: &trust_types::TransportObligationResult) -> bool {
+    row.outcome.is_proved()
+        && trust_types::assumption::is_instance_hypothesis_discharge_row(&row.kind, &row.solver)
+}
+
+/// Tally one row that [`compiler_summary_counts_row_as_skipped`] names, as the
+/// compiler's summary does: `skipped`, and so `unknown`.
+fn add_summary_skipped_row(
+    counts: &mut FunctionTransportCounts,
+    row: &trust_types::TransportObligationResult,
+) {
+    counts.unknown += 1;
+    counts.skipped += 1;
+    if compiler_tallies_row_as_assumed_discharge(row) {
+        counts.assumed_discharge += 1;
+    }
+}
+
 fn add_transport_result_counts(
     counts: &mut FunctionTransportCounts,
     transport_rows: &[trust_types::TransportObligationResult],
@@ -3042,9 +3453,11 @@ fn add_transport_result_counts(
 ) {
     counts.total += rows.len();
     for (index, result) in rows.iter().enumerate() {
-        if transport_rows.get(index).is_some_and(|transport| transport.outcome.is_skipped()) {
-            counts.unknown += 1;
-            counts.skipped += 1;
+        if let Some(transport) = transport_rows
+            .get(index)
+            .filter(|transport| compiler_summary_counts_row_as_skipped(transport))
+        {
+            add_summary_skipped_row(counts, transport);
             continue;
         }
         add_verification_result_count(counts, result);
@@ -3062,9 +3475,8 @@ fn add_raw_transport_result_counts(
 ) {
     counts.total += transport_rows.len();
     for result in transport_rows {
-        let Some(bucket) = raw_transport_bucket(result.outcome) else {
-            counts.unknown += 1;
-            counts.skipped += 1;
+        let Some(bucket) = raw_transport_bucket(result) else {
+            add_summary_skipped_row(counts, result);
             continue;
         };
         add_summary_count(counts, bucket);
@@ -3087,15 +3499,19 @@ fn add_verification_result_count(
     }
 }
 
-/// Map a compiler-emitted transport outcome to the `VerificationOutcome` bucket
-/// the compiler's summary counted it in. Returns `None` for `skipped` rows,
-/// which `add_transport_result_counts` already accounts for identically from the
-/// raw outcome on both sides, so they never contribute a normalization shift.
-fn raw_transport_bucket(raw_outcome: trust_types::Outcome) -> Option<VerificationOutcome> {
-    if raw_outcome.is_skipped() {
+/// Map a compiler-emitted transport row to the `VerificationOutcome` bucket
+/// the compiler's summary counted it in. Returns `None` for the rows that
+/// summary counts `skipped` ([`compiler_summary_counts_row_as_skipped`]: a
+/// `skipped` row, and a `proved` instance-discharge row), which
+/// `add_transport_result_counts` already accounts for identically from the raw
+/// row on both sides, so they never contribute a normalization shift.
+fn raw_transport_bucket(
+    row: &trust_types::TransportObligationResult,
+) -> Option<VerificationOutcome> {
+    if compiler_summary_counts_row_as_skipped(row) {
         return None;
     }
-    Some(raw_outcome.into())
+    Some(row.outcome.into())
 }
 
 /// Remove one obligation of `bucket` from `counts`, the inverse of
@@ -3159,9 +3575,10 @@ fn normalization_adjusted_expected(
         skipped: func_result.skipped,
         runtime_checked: func_result.runtime_checked,
         total: func_result.total,
+        assumed_discharge: 0,
     };
     for (transport, result) in func_result.results.iter().zip(rows) {
-        let Some(raw_bucket) = raw_transport_bucket(transport.outcome) else {
+        let Some(raw_bucket) = raw_transport_bucket(transport) else {
             continue;
         };
         let normalized_bucket = result.outcome;
@@ -3173,6 +3590,31 @@ fn normalization_adjusted_expected(
         }
     }
     expected
+}
+
+/// Trust (CB4): the reason written onto a test-harness exclusion row that
+/// arrived in an envelope together with any other row.
+const SHARED_EXCLUSION_ENVELOPE_DEFECT: &str = "transport defect: a test-harness exclusion row \
+     shared its function envelope with another row; an excluded body is excluded whole (the \
+     compiler writes exactly one row for it), so this exclusion is refused";
+
+/// Trust (CB4, defense in depth): an exclusion names a WHOLE body. The compiler
+/// writes exactly one row for an excluded body — the exclusion — so an
+/// envelope that carries an exclusion row beside anything else is not one the
+/// compiler produces. Every exclusion row in it loses the compiler's exact
+/// reason, so it fails the exact-shape check
+/// (`crate::types::test_harness_exclusion_of`) and the gate's partition counts
+/// it as a genuine unknown instead of excluding it. The sibling rows are left
+/// exactly as they are.
+fn refuse_shared_test_harness_exclusion_envelope(rows: &mut [VerificationResult]) {
+    if rows.len() <= 1 {
+        return;
+    }
+    for row in rows.iter_mut() {
+        if trust_types::exclusion::is_test_harness_exclusion_row_kind(&row.kind) {
+            row.reason = Some(SHARED_EXCLUSION_ENVELOPE_DEFECT.to_string());
+        }
+    }
 }
 
 fn function_transport_summary_defect(
@@ -3195,6 +3637,7 @@ fn function_transport_summary_defect(
         expected.timed_out,
         observed.unknown,
         expected.unknown,
+        observed.assumed_discharge == 0,
     );
     push_legacy_unknown_subset_count_defect(
         &mut defects,
@@ -3203,6 +3646,7 @@ fn function_transport_summary_defect(
         expected.skipped,
         observed.unknown,
         expected.unknown,
+        observed.assumed_discharge == 0,
     );
     push_count_defect(
         &mut defects,
@@ -3248,6 +3692,7 @@ fn crate_transport_summary_defect(
         summary.total_timed_out,
         observed.obligations.unknown,
         summary.total_unknown,
+        observed.obligations.assumed_discharge == 0,
     );
     push_legacy_unknown_subset_count_defect(
         &mut defects,
@@ -3256,6 +3701,7 @@ fn crate_transport_summary_defect(
         summary.total_skipped,
         observed.obligations.unknown,
         summary.total_unknown,
+        observed.obligations.assumed_discharge == 0,
     );
     push_count_defect(
         &mut defects,
@@ -3279,6 +3725,22 @@ fn push_count_defect(defects: &mut Vec<String>, label: &str, observed: usize, ex
     }
 }
 
+/// A split of `unknown` (`timed_out`, `skipped`). A summary that declares none
+/// (`0`) under an agreeing `unknown` is the JSON's legacy aggregate, written
+/// before the split existed, and is not held to it — while
+/// `legacy_summary_possible`.
+///
+/// Trust (OD-1 phase 1): it is not possible once a `proved` instance-discharge
+/// row is among the rows (`FunctionTransportCounts::assumed_discharge`). The
+/// compiler that publishes that row writes both splits into every summary
+/// (`PublishedRowTally::json_counts`), and `skipped` is where its tally counts
+/// the row (`unknown` only as the aggregate over it), so a zero beside it is a
+/// miscount, not an old format.
+/// Without this, tallying the row as the compiler does would have let more
+/// through than the compiler's own counters: a summary that counts the row
+/// `unknown` and nowhere else, or one that drops a timeout beside it. No
+/// compiler writes either, and this check refused both while it still counted
+/// the row `proved`.
 fn push_legacy_unknown_subset_count_defect(
     defects: &mut Vec<String>,
     label: &str,
@@ -3286,8 +3748,9 @@ fn push_legacy_unknown_subset_count_defect(
     expected: usize,
     observed_unknown: usize,
     expected_unknown: usize,
+    legacy_summary_possible: bool,
 ) {
-    if expected == 0 && expected_unknown == observed_unknown {
+    if legacy_summary_possible && expected == 0 && expected_unknown == observed_unknown {
         return;
     }
     push_count_defect(defects, label, observed, expected);
@@ -3305,6 +3768,24 @@ fn transport_summary_result(function: &str, reason: String) -> VerificationResul
         counterexample: None,
         reason: Some(reason),
         raw_line: "targo-trust-transport-summary-accounting".to_string(),
+    }
+}
+
+/// Trust (TRANSPORT-LINE-BUDGET-1): the one row a function's report becomes when its
+/// transport budget disclosure disagrees with its rows
+/// (`trust_types::transport_budget::TransportBudgetDisclosure::defect`).
+fn transport_budget_defect_result(function: &str, reason: String) -> VerificationResult {
+    VerificationResult {
+        function: function.to_string(),
+        kind: "transport:line-budget-disclosure".to_string(),
+        message: "function transport budget disclosure does not match its result rows".to_string(),
+        outcome: VerificationOutcome::Unknown,
+        backend: "targo-trust".to_string(),
+        time_ms: None,
+        location: None,
+        counterexample: None,
+        reason: Some(reason),
+        raw_line: "targo-trust-transport-line-budget-disclosure".to_string(),
     }
 }
 
@@ -3441,7 +3922,28 @@ fn is_native_full_verifier_diagnostic_line(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod compiler_scope;
+    mod line_budget;
+
     use super::*;
+
+    /// A compile error's package is the selected package's name, or the name
+    /// an unselected package's ID spells in either of Cargo's forms.
+    #[test]
+    fn a_compile_errors_package_is_named_from_its_cargo_package_id() {
+        let selected: BTreeMap<String, String> =
+            [("path+file:///w/app#0.1.0".to_string(), "app".to_string())].into_iter().collect();
+        for (id, name) in [
+            ("path+file:///w/app#0.1.0", "app"),
+            ("path+file:///w/crates/helper#0.2.0", "helper"),
+            ("path+file:///w/crates/dir#helper@0.2.0", "helper"),
+            ("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0", "serde"),
+            ("git+https://example.com/x/tool?branch=main#0.3.0", "tool"),
+            ("helper 0.2.0 (path+file:///w/crates/helper)", "helper"),
+        ] {
+            assert_eq!(cargo_package_name(id, &selected), name, "{id}");
+        }
+    }
 
     const TEST_SESSION: &str = "transport-test-session";
     const TEST_COMPILE_TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -3990,11 +4492,14 @@ mod tests {
             verification_session: TEST_SESSION.to_string(),
             eligible: 1,
             processed: 1,
+            noted_stops: Vec::new(),
+            degraded_anchors: 0,
             function_identities: Some(trust_types::CoverageFunctionIdentityInventory {
                 schema: trust_types::COVERAGE_FUNCTION_IDENTITY_SCHEMA_V1.to_string(),
                 eligible_functions: vec![function.to_string()],
                 processed_functions: vec![function.to_string()],
             }),
+            memory: trust_types::MemorySummary::default(),
         })
     }
 
@@ -4006,11 +4511,14 @@ mod tests {
             verification_session: TEST_SESSION.to_string(),
             eligible: 0,
             processed: 0,
+            noted_stops: Vec::new(),
+            degraded_anchors: 0,
             function_identities: Some(trust_types::CoverageFunctionIdentityInventory {
                 schema: trust_types::COVERAGE_FUNCTION_IDENTITY_SCHEMA_V1.to_string(),
                 eligible_functions: Vec::new(),
                 processed_functions: Vec::new(),
             }),
+            memory: trust_types::MemorySummary::default(),
         })
     }
 
@@ -4020,11 +4528,16 @@ mod tests {
         function: &str,
     ) -> trust_types::TransportMessage {
         trust_types::TransportMessage::FunctionResult(trust_types::FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: function.to_string(),
             package_name: Some(package.to_string()),
             crate_name: Some(krate.to_string()),
             primary_package: true,
             verification_session: TEST_SESSION.to_string(),
+            runtime_checks: None,
             results: vec![transport_row(trust_types::Outcome::Unknown)],
             proved: 0,
             failed: 0,
@@ -4034,6 +4547,7 @@ mod tests {
             runtime_checked: 0,
             cached: 0,
             total: 1,
+            transport_budget: None,
         })
     }
 
@@ -4058,11 +4572,14 @@ mod tests {
             verification_session: TEST_SESSION.to_string(),
             eligible: eligible_functions.len(),
             processed: processed_functions.len(),
+            noted_stops: Vec::new(),
+            degraded_anchors: 0,
             function_identities: Some(trust_types::CoverageFunctionIdentityInventory {
                 schema: trust_types::COVERAGE_FUNCTION_IDENTITY_SCHEMA_V1.to_string(),
                 eligible_functions,
                 processed_functions,
             }),
+            memory: trust_types::MemorySummary::default(),
         })
     }
 
@@ -4197,6 +4714,366 @@ mod tests {
 
     fn successful_cargo_input(lines: Vec<serde_json::Value>) -> String {
         cargo_input_with_inventory(lines, true)
+    }
+
+    fn native_resource_fixture() -> (BTreeMap<String, String>, Vec<serde_json::Value>) {
+        use trust_types::native_admission::*;
+        let package = "path+file:///fixture#demo@0.1.0";
+        let binding = NativeAdmissionBinding {
+            run_digest: run_digest(TEST_SESSION),
+            unit_digest: TEST_UNIT_IDENTITY_SHA256.into(),
+            semantics_digest: fixture_semantics_sha256(&fixture_unit_semantics("test")),
+            role: "primary".into(),
+            target: TEST_COMPILE_TARGET.into(),
+        };
+        let body = NativeAdmissionBody { function: "demo::f".into(), body_digest: "c".repeat(64) };
+        let census = NativeAdmissionCensus {
+            transport_type: None,
+            schema: SCHEMA.into(),
+            package_name: "demo".into(),
+            crate_name: "demo".into(),
+            bodies: vec![body.clone()],
+            auxiliary_bodies: vec![],
+            attempts: vec![NativeAdmissionAttempt {
+                work_digest: work_digest(&binding, &body),
+                request_digest: body.body_digest.clone(),
+                body,
+                attempt: 1,
+                outcome: NativeAdmissionOutcome::CacheReuse,
+                terminal: true,
+            }],
+            binding,
+            complete: true,
+            problems: vec![],
+        };
+        let messages = [
+            one_unknown_primary_function("demo", "demo", "demo::f"),
+            trust_types::TransportMessage::NativeAdmissionCensus(census),
+            complete_coverage("demo", "demo"),
+            one_unknown_primary_summary("demo", "demo"),
+        ];
+        let mut lines: Vec<_> =
+            messages.iter().map(|m| cargo_transport_envelope(package, "demo", m)).collect();
+        lines.push(cargo_artifact_with_kind(package, "demo", "lib", false));
+        ([(package.into(), "demo".into())].into_iter().collect(), lines)
+    }
+
+    #[test]
+    fn native_census_joins_the_full_cargo_unit_without_changing_proof_rows() {
+        let (selected, lines) = native_resource_fixture();
+        let evidence = parse_cargo_json_stdout(
+            Cursor::new(successful_cargo_input(lines)),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .unwrap();
+        assert_eq!(evidence.parsed.native_admission_observations.len(), 1);
+        assert!(evidence.parsed.native_admission_problems.is_empty());
+        assert_eq!(evidence.parsed.verification_results.len(), 1);
+    }
+
+    #[test]
+    fn well_formed_native_root_mismatch_is_incomplete_without_changing_proof_rows() {
+        let (selected, mut lines) = native_resource_fixture();
+        let baseline = parse_cargo_json_stdout(
+            Cursor::new(successful_cargo_input(lines.clone())),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .unwrap();
+        assert_eq!(baseline.parsed.verification_results.len(), 1);
+        assert!(baseline.parsed.native_admission_problems.is_empty());
+
+        let payload = lines[1]["message"]["message"].as_str().unwrap();
+        let trust_types::TransportMessage::NativeAdmissionCensus(mut census) =
+            trust_types::parse_transport_payload(
+                payload.strip_prefix(trust_types::TRANSPORT_PREFIX).unwrap(),
+            )
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        // Keep the census internally consistent and its run/unit binding intact.
+        // Only the claimed root population differs from the authenticated proof
+        // coverage, which still names demo::f.
+        census.bodies[0].function = "demo::other".into();
+        census.attempts[0].body = census.bodies[0].clone();
+        census.attempts[0].work_digest = trust_types::native_admission::request_work_digest(
+            &census.binding,
+            &census.attempts[0].body,
+            &census.attempts[0].request_digest,
+        );
+        census.validate().unwrap();
+        lines[1] = cargo_transport_envelope(
+            selected.keys().next().unwrap(),
+            "demo",
+            &trust_types::TransportMessage::NativeAdmissionCensus(census),
+        );
+        let evidence = parse_cargo_json_stdout(
+            Cursor::new(successful_cargo_input(lines)),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .unwrap();
+        assert_eq!(evidence.parsed.native_admission_observations.len(), 1);
+        assert_eq!(evidence.parsed.native_admission_problems.len(), 1);
+        assert!(
+            evidence.parsed.native_admission_problems[0]
+                .contains("native admission body inventory differs from coverage")
+        );
+        assert_eq!(
+            serde_json::to_value(&evidence.parsed.verification_results).unwrap(),
+            serde_json::to_value(&baseline.parsed.verification_results).unwrap(),
+            "resource population mismatch must not change proof rows"
+        );
+        let resources = crate::compiler_admission::Report::new(
+            &evidence.declared_inventory.as_ref().unwrap().proof_targets,
+            &evidence.compiled_targets,
+            evidence.parsed.native_admission_observations,
+            evidence.parsed.native_admission_problems,
+        );
+        assert_eq!(serde_json::to_value(resources).unwrap()["availability"], "incomplete");
+    }
+
+    #[test]
+    fn empty_native_unit_can_close_before_its_first_proof_message() {
+        let (selected, mut lines) = native_resource_fixture();
+        let package = selected.keys().next().unwrap();
+        let payload = lines[1]["message"]["message"].as_str().unwrap();
+        let trust_types::TransportMessage::NativeAdmissionCensus(mut census) =
+            trust_types::parse_transport_payload(
+                payload.strip_prefix(trust_types::TRANSPORT_PREFIX).unwrap(),
+            )
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        census.bodies.clear();
+        census.attempts.clear();
+        // An empty library may accompany a nonempty selected root, but an
+        // executable test harness must independently cover a body.
+        census.binding.semantics_digest =
+            fixture_semantics_sha256(&fixture_unit_semantics("build"));
+        lines[1] = cargo_transport_envelope(
+            package,
+            "demo",
+            &trust_types::TransportMessage::NativeAdmissionCensus(census),
+        );
+        lines[2] =
+            cargo_transport_envelope(package, "demo", &empty_complete_coverage("demo", "demo"));
+        lines[3] =
+            cargo_transport_envelope(package, "demo", &empty_primary_summary("demo", "demo"));
+        lines.remove(0);
+        for line in &mut lines {
+            set_envelope_proof_unit(line, 0, "build", "primary", "demo");
+        }
+        let error = parse_cargo_json_stdout(
+            Cursor::new(successful_cargo_input(lines.clone())),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .err()
+        .expect("an empty library alone cannot satisfy selected-package coverage");
+        assert!(error.contains("zero coverage-eligible bodies across every primary"), "{error}");
+
+        let companion_start = lines.len();
+        append_complete_proof_unit(
+            &mut lines,
+            package,
+            "demo",
+            "companion",
+            "bin",
+            1,
+            "build",
+            "primary",
+            true,
+        );
+        let companion_digest = "d".repeat(64);
+        assert_ne!(companion_digest, TEST_UNIT_IDENTITY_SHA256);
+        for line in &mut lines[companion_start..] {
+            line["trust_unit_identity_sha256"] = serde_json::json!(companion_digest);
+        }
+        let evidence = parse_cargo_json_stdout(
+            Cursor::new(successful_cargo_input(lines)),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .unwrap();
+        assert_eq!(evidence.parsed.native_admission_observations.len(), 1);
+        assert!(evidence.parsed.native_admission_problems.is_empty());
+        let empty = &evidence.parsed.native_admission_observations[0];
+        assert_eq!(empty.cargo_target.target_name, "demo");
+        assert_eq!(empty.cargo_target.proof_unit_index, 0);
+        assert_eq!(empty.cargo_target.proof_unit_mode, "build");
+        assert!(empty.census.bodies.is_empty());
+        assert!(empty.census.auxiliary_bodies.is_empty());
+        assert!(empty.census.attempts.is_empty());
+        assert_eq!(evidence.parsed.verification_results.len(), 1);
+        assert!(
+            evidence.parsed.verification_results[0].function.ends_with("::companion::f"),
+            "only the nonempty companion contributes a proof row: {:?}",
+            evidence.parsed.verification_results
+        );
+    }
+
+    #[test]
+    fn native_resource_defects_only_withhold_resource_completeness() {
+        for variant in 0..5 {
+            let (selected, mut lines) = native_resource_fixture();
+            match variant {
+                0 => {
+                    lines.insert(2, lines[1].clone());
+                }
+                1 => {
+                    lines.swap(1, 2);
+                } // census after coverage
+                2 => {
+                    lines.remove(1);
+                } // missing census
+                3 | 4 => {
+                    let payload = lines[1]["message"]["message"].as_str().unwrap();
+                    let mut value: serde_json::Value = serde_json::from_str(
+                        payload.strip_prefix(trust_types::TRANSPORT_PREFIX).unwrap(),
+                    )
+                    .unwrap();
+                    value["binding"][if variant == 3 { "unit_digest" } else { "run_digest" }] =
+                        serde_json::json!("0".repeat(64));
+                    lines[1]["message"]["message"] =
+                        serde_json::json!(format!("{}{}", trust_types::TRANSPORT_PREFIX, value));
+                }
+                _ => unreachable!(),
+            }
+            let evidence = parse_cargo_json_stdout(
+                Cursor::new(successful_cargo_input(lines)),
+                &selected,
+                TEST_SESSION,
+                true,
+            )
+            .unwrap();
+            let resources = crate::compiler_admission::Report::new(
+                &evidence.declared_inventory.as_ref().unwrap().proof_targets,
+                &evidence.compiled_targets,
+                evidence.parsed.native_admission_observations,
+                evidence.parsed.native_admission_problems,
+            );
+            let value = serde_json::to_value(resources).unwrap();
+            assert_eq!(value["availability"], "incomplete", "variant {variant}");
+            assert_eq!(
+                evidence.parsed.verification_results.len(),
+                1,
+                "resource errors cannot rewrite proof rows"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_cargo_terminal_boundary_withholds_native_resource_completeness() {
+        let (selected, lines) = native_resource_fixture();
+        let evidence = parse_cargo_json_stdout(
+            Cursor::new(cargo_input_with_inventory(lines, false)),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .unwrap();
+        assert!(!evidence.parsed.native_admission_problems.is_empty());
+    }
+
+    #[test]
+    fn native_bytes_do_not_spend_the_unchanged_proof_transport_budget() {
+        let (selected, lines) = native_resource_fixture();
+        let proof_bytes = lines
+            .iter()
+            .filter_map(|line| line.pointer("/message/message")?.as_str())
+            .filter(|text| {
+                !is_native_admission_payload(
+                    text.strip_prefix(trust_types::TRANSPORT_PREFIX).unwrap(),
+                )
+            })
+            .map(str::len)
+            .sum();
+        let input = successful_cargo_input(lines);
+        let evidence = parse_cargo_json_stdout_impl(CargoJsonParseInput {
+            reader: Cursor::new(input),
+            selected_packages: &selected,
+            expected_session: TEST_SESSION,
+            require_authenticated_coverage: true,
+            retain_authenticated_messages: false,
+            allow_post_build_test_output: false,
+            require_prepared_tests: false,
+            max_line_bytes: MAX_CARGO_JSON_LINE_BYTES,
+            max_authenticated_transport_bytes: proof_bytes,
+        })
+        .unwrap();
+        assert!(evidence.parsed.native_admission_problems.is_empty());
+        assert_eq!(evidence.parsed.verification_results.len(), 1);
+        let mut resource_bytes = 0;
+        assert!(charge_native_admission_bytes(&mut resource_bytes, 10, 10).is_ok());
+        assert!(charge_native_admission_bytes(&mut resource_bytes, 1, 10).is_err());
+    }
+
+    #[test]
+    fn truncated_inner_resource_is_incomplete_but_outer_framing_stays_strict() {
+        let (selected, mut lines) = native_resource_fixture();
+        let mut text = lines[1]["message"]["message"].as_str().unwrap().to_string();
+        text.pop();
+        lines[1]["message"]["message"] = serde_json::json!(text);
+        let input = successful_cargo_input(lines);
+        let evidence =
+            parse_cargo_json_stdout(Cursor::new(&input), &selected, TEST_SESSION, true).unwrap();
+        assert!(!evidence.parsed.native_admission_problems.is_empty());
+        assert_eq!(evidence.parsed.verification_results.len(), 1);
+        // An unparseable outer Cargo frame has no safely recoverable boundary.
+        // It is a transport failure; no unchanged-proof claim is made for it.
+        assert!(
+            parse_cargo_json_stdout(
+                Cursor::new(&input[..input.len() / 2]),
+                &selected,
+                TEST_SESSION,
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nonleading_duplicate_native_tags_are_resource_defects_not_proof_failures() {
+        for duplicate in ["native_admission_census", "crate_summary"] {
+            let (selected, mut lines) = native_resource_fixture();
+            let original = lines[1]["message"]["message"].as_str().unwrap();
+            let json = original.strip_prefix(trust_types::TRANSPORT_PREFIX).unwrap();
+            let prefix = format!(
+                r#"{{"type":"native_admission_census","schema":"{}","#,
+                trust_types::native_admission::SCHEMA
+            );
+            let rest = json.strip_prefix(&prefix).unwrap();
+            // Keep every original field. Adding a leading field makes the native
+            // tag non-leading, and duplicate tags must reach the typed rejection.
+            let malformed = format!(
+                r#"{{"schema":"{}","type":"native_admission_census","type":"{}",{}"#,
+                trust_types::native_admission::SCHEMA,
+                duplicate,
+                rest
+            );
+            assert!(is_native_admission_payload(&malformed));
+            lines[1]["message"]["message"] =
+                serde_json::json!(format!("{}{}", trust_types::TRANSPORT_PREFIX, malformed));
+            let evidence = parse_cargo_json_stdout(
+                Cursor::new(successful_cargo_input(lines)),
+                &selected,
+                TEST_SESSION,
+                true,
+            )
+            .unwrap();
+            assert!(evidence.parsed.native_admission_observations.is_empty());
+            assert!(!evidence.parsed.native_admission_problems.is_empty());
+            assert_eq!(evidence.parsed.verification_results.len(), 1);
+        }
     }
 
     #[test]
@@ -4378,16 +5255,17 @@ mod tests {
     #[test]
     fn cargo_json_parser_caps_escaped_wire_line_before_serde() {
         let input = format!("{{\"reason\":\"{}\"}}\n", "\\u0061".repeat(16));
-        let error = match parse_cargo_json_stdout_impl(
-            Cursor::new(input),
-            &BTreeMap::new(),
-            TEST_SESSION,
-            true,
-            false,
-            false,
-            32,
-            1024,
-        ) {
+        let error = match parse_cargo_json_stdout_impl(CargoJsonParseInput {
+            reader: Cursor::new(input),
+            selected_packages: &BTreeMap::new(),
+            expected_session: TEST_SESSION,
+            require_authenticated_coverage: true,
+            retain_authenticated_messages: false,
+            allow_post_build_test_output: false,
+            require_prepared_tests: false,
+            max_line_bytes: 32,
+            max_authenticated_transport_bytes: 1024,
+        }) {
             Ok(_) => panic!("raw escaped Cargo JSON must be capped before deserialization"),
             Err(error) => error,
         };
@@ -4408,16 +5286,17 @@ mod tests {
         let transport_len =
             envelope["message"]["message"].as_str().expect("transport message").len();
         let input = format!("{envelope}\n");
-        let error = match parse_cargo_json_stdout_impl(
-            Cursor::new(input),
-            &selected,
-            TEST_SESSION,
-            true,
-            false,
-            false,
-            1024 * 1024,
-            transport_len - 1,
-        ) {
+        let error = match parse_cargo_json_stdout_impl(CargoJsonParseInput {
+            reader: Cursor::new(input),
+            selected_packages: &selected,
+            expected_session: TEST_SESSION,
+            require_authenticated_coverage: true,
+            retain_authenticated_messages: false,
+            allow_post_build_test_output: false,
+            require_prepared_tests: false,
+            max_line_bytes: 1024 * 1024,
+            max_authenticated_transport_bytes: transport_len - 1,
+        }) {
             Ok(_) => panic!("aggregate authenticated transport must have a finite bound"),
             Err(error) => error,
         };
@@ -4555,6 +5434,81 @@ mod tests {
                 && target.proof_unit_mode == "build"
                 && target.proof_unit_role == "test-execution"
         }));
+    }
+
+    #[test]
+    fn prepared_plan_receipt_is_confined_to_the_compile_only_boundary() {
+        let package = "path+file:///fixture#demo@0.1.0";
+        let selected = [(package.to_owned(), "demo".to_owned())].into_iter().collect();
+        let mut lines = Vec::new();
+        append_complete_proof_unit(
+            &mut lines,
+            package,
+            "demo",
+            "integration",
+            "test",
+            43,
+            "test",
+            "primary",
+            true,
+        );
+        let artifact = lines.last_mut().unwrap();
+        artifact["executable"] = serde_json::json!("/workspace/target/integration");
+        artifact["trust_executable_sha256"] = serde_json::json!("a".repeat(64));
+        let input = successful_cargo_input(lines);
+        let receipt = serde_json::json!({
+            "reason": "trust-test-execution-plan", "schema": trust_test_execution::RECEIPT_SCHEMA,
+            "session": TEST_SESSION, "path": "/private/prepared-tests.json", "sha256": "b".repeat(64)
+        });
+        let with_plan = format!("{input}{receipt}\n");
+        let parsed = parse_cargo_json_stdout_for_prepared_tests(
+            Cursor::new(&with_plan),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .unwrap();
+        assert_eq!(parsed.prepared_tests.unwrap().path, "/private/prepared-tests.json");
+        assert!(
+            parse_cargo_json_stdout_for_prepared_tests(
+                Cursor::new(&input),
+                &selected,
+                TEST_SESSION,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            parse_cargo_json_stdout_for_prepared_tests(
+                Cursor::new(format!("{with_plan}{receipt}\n")),
+                &selected,
+                TEST_SESSION,
+                true
+            )
+            .is_err()
+        );
+        let mut wrong = receipt.clone();
+        wrong["session"] = serde_json::json!("another-session");
+        assert!(
+            parse_cargo_json_stdout_for_prepared_tests(
+                Cursor::new(format!("{input}{wrong}\n")),
+                &selected,
+                TEST_SESSION,
+                true
+            )
+            .is_err()
+        );
+        let runtime = parse_cargo_json_stdout_for_test(
+            Cursor::new(&with_plan),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .unwrap();
+        assert!(
+            runtime.prepared_tests.is_none(),
+            "runtime stdout must never authorize an execution plan"
+        );
     }
 
     #[test]
@@ -4826,6 +5780,66 @@ mod tests {
                 "{name}: {error}"
             );
         }
+    }
+
+    /// T7c-5: one `--workspace` call over two members publishes their units in
+    /// one canonical order (their Cargo unit identity), whichever order Cargo
+    /// finished them in: the same rows, coverage rows and completed targets,
+    /// in the same order, either way.
+    #[test]
+    fn a_workspace_streams_units_in_one_order_whatever_order_they_finish() {
+        let alpha_id = "path+file:///fixture/alpha#0.1.0";
+        let beta_id = "path+file:///fixture/beta#0.1.0";
+        let selected = [
+            (alpha_id.to_string(), "alpha".to_string()),
+            (beta_id.to_string(), "beta".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let parse = |finished: [(&str, &str, u64); 2]| {
+            let mut lines = Vec::new();
+            for (package_id, name, index) in finished {
+                append_complete_proof_unit(
+                    &mut lines, package_id, name, name, "lib", index, "build", "primary", true,
+                );
+            }
+            parse_cargo_json_stdout(
+                Cursor::new(successful_cargo_input(lines)),
+                &selected,
+                TEST_SESSION,
+                true,
+            )
+            .expect("two complete workspace members")
+        };
+        let alpha_first = parse([(alpha_id, "alpha", 1), (beta_id, "beta", 2)]);
+        let beta_first = parse([(beta_id, "beta", 2), (alpha_id, "alpha", 1)]);
+
+        let rows = |evidence: &CargoCompilerEvidence| {
+            evidence
+                .parsed
+                .verification_results
+                .iter()
+                .map(|row| row.function.clone())
+                .collect::<Vec<_>>()
+        };
+        let coverage = |evidence: &CargoCompilerEvidence| {
+            evidence
+                .parsed
+                .coverage_rows
+                .iter()
+                .map(|row| row.package_name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&alpha_first), rows(&beta_first));
+        assert_eq!(rows(&alpha_first).len(), 2);
+        assert!(rows(&alpha_first)[0].ends_with("::alpha::f"), "{:?}", rows(&alpha_first));
+        assert!(rows(&alpha_first)[1].ends_with("::beta::f"), "{:?}", rows(&alpha_first));
+        assert_eq!(coverage(&alpha_first), ["alpha", "beta"]);
+        assert_eq!(coverage(&beta_first), ["alpha", "beta"]);
+        assert_eq!(
+            alpha_first.parsed.completed_proof_targets,
+            beta_first.parsed.completed_proof_targets
+        );
     }
 
     #[test]
@@ -5165,20 +6179,16 @@ mod tests {
                 serde_json::json!(TARGO_TRUST_EXCLUSION_COMPILE_TIME_DEPS_FILTERED),
                 "redundantly named a non-proof Cargo mode",
             ),
-            // Build-support-only is a scoping decision that exists only under
-            // include-dependencies. Without that flag, every excluded dependency
-            // belongs to the dependency-policy reason, so this spelling must not
-            // become a second way to trust a unit away.
+            // Retired producer exemptions are never accepted, even when the
+            // current dependency policy could exclude the same compiler unit.
             (
                 serde_json::json!(TARGO_TRUST_EXCLUSION_BUILD_SUPPORT_ONLY),
-                "as build-support-only without include-dependencies=true",
+                "retired exclusion reason",
             ),
-            // Same for the audited spec provider: it is a scoping decision that
-            // exists only under include-dependencies, and the audit that
-            // justifies it applies to a proc-macro Unit, never to this `lib`.
+            // Macro admission is not an exemption from compiler-unit proof.
             (
                 serde_json::json!(TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC),
-                "as an audited trust-spec proc macro without include-dependencies=true",
+                "retired exclusion reason",
             ),
         ];
         for (reason, expected) in mutations {
@@ -5204,6 +6214,138 @@ mod tests {
                 .expect("excluded graph role is required and reason-bound");
             assert!(error.contains(expected), "expected {expected:?}, got {error:?}");
         }
+    }
+
+    /// D2d (2026-09-28): Targo's doctest census refines EXACTLY the declared
+    /// deferred doctest Unit it names (index and identity digest), and only for
+    /// a zero count. A Unit holding a doctest, or with no census at all, stays
+    /// `deferred-doctest-execution`; a census that names anything else, repeats,
+    /// or carries extra fields is a transport violation, and the inventory can
+    /// never declare the census-only reason itself.
+    #[test]
+    fn doctest_census_refines_only_the_declared_empty_doctest_unit() {
+        let package_id = "path+file:///fixture#demo@0.1.0";
+        let selected = [(package_id.to_string(), "demo".to_string())].into_iter().collect();
+        let mut lines = Vec::new();
+        append_complete_proof_unit(
+            &mut lines, package_id, "demo", "demo", "lib", 85, "build", "primary", true,
+        );
+        let mut values = successful_cargo_input(lines)
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let mut excluded = serde_json::json!({
+            "index": 1,
+            "mode": "doctest",
+            "package_id": package_id,
+            "package_name": "demo",
+            "target_name": "demo",
+            "target_kinds": ["lib"],
+            "compile_target": TEST_COMPILE_TARGET,
+            "exclusion_reason": TARGO_TRUST_EXCLUSION_DEFERRED_DOCTEST,
+            "graph_role": "primary",
+        });
+        set_excluded_unit_semantics(&mut excluded, "doctest");
+        values[0]["excluded_units"] = serde_json::json!([excluded]);
+        let census = |index: u64, identity: &str, doctests: u64| {
+            serde_json::json!({
+                "reason": "trust-doctest-census",
+                "schema": TARGO_TRUST_DOCTEST_CENSUS_SCHEMA_V1,
+                "index": index,
+                "trust_unit_identity_sha256": identity,
+                "doctests": doctests,
+            })
+        };
+        // The census is emitted inside the job queue: after the inventory,
+        // before Cargo's terminal `build-finished`.
+        let stream_of = |values: &[serde_json::Value], censuses: &[serde_json::Value]| {
+            let mut lines = values.to_vec();
+            let finished = lines.pop().expect("build-finished");
+            lines.extend(censuses.iter().cloned());
+            lines.push(finished);
+            lines.iter().map(|line| format!("{line}\n")).collect::<String>()
+        };
+        let stream = |censuses: &[serde_json::Value]| stream_of(&values, censuses);
+        let doctest_reason = |censuses: &[serde_json::Value]| {
+            let evidence = parse_cargo_json_stdout(
+                Cursor::new(stream(censuses)),
+                &selected,
+                TEST_SESSION,
+                true,
+            )
+            .expect("census stream parses");
+            let inventory = evidence.declared_inventory.expect("declared inventory");
+            let reason = inventory
+                .excluded_reasons
+                .iter()
+                .find(|(target, _)| target.proof_unit_index == 1)
+                .map(|(_, reason)| reason.clone())
+                .expect("doctest Unit keeps a reason");
+            // The refined inventory must still project into a valid report.
+            cargo_proof_inventory_report(Some(&inventory), &BTreeSet::new(), &BTreeSet::new())
+                .expect("refined inventory projects into the report");
+            reason
+        };
+
+        assert_eq!(doctest_reason(&[]), TARGO_TRUST_EXCLUSION_DEFERRED_DOCTEST);
+        assert_eq!(
+            doctest_reason(&[census(1, TEST_UNIT_IDENTITY_SHA256, 0)]),
+            TARGO_TRUST_EXCLUSION_EMPTY_DOCTEST,
+            "a doctest Unit with zero doctests defers nothing"
+        );
+        assert_eq!(
+            doctest_reason(&[census(1, TEST_UNIT_IDENTITY_SHA256, 1)]),
+            TARGO_TRUST_EXCLUSION_DEFERRED_DOCTEST,
+            "a real doctest keeps its Unit deferred and disclosed"
+        );
+
+        let mut extra_field = census(1, TEST_UNIT_IDENTITY_SHA256, 0);
+        extra_field["exclusion_reason"] = serde_json::json!(TARGO_TRUST_EXCLUSION_EMPTY_DOCTEST);
+        let mut wrong_schema = census(1, TEST_UNIT_IDENTITY_SHA256, 0);
+        wrong_schema["schema"] = serde_json::json!("targo.trust-doctest-census.v0");
+        for (censuses, expected) in [
+            (vec![census(1, &"d".repeat(64), 0)], "identity did not match the declared Unit"),
+            (vec![census(0, TEST_UNIT_IDENTITY_SHA256, 0)], "not a declared excluded Unit"),
+            (vec![census(7, TEST_UNIT_IDENTITY_SHA256, 0)], "not a declared excluded Unit"),
+            (
+                vec![
+                    census(1, TEST_UNIT_IDENTITY_SHA256, 1),
+                    census(1, TEST_UNIT_IDENTITY_SHA256, 0),
+                ],
+                "more than one doctest census",
+            ),
+            (vec![extra_field], "unexpected field"),
+            (vec![wrong_schema], "exact schema"),
+        ] {
+            let error = parse_cargo_json_stdout(
+                Cursor::new(stream(&censuses)),
+                &selected,
+                TEST_SESSION,
+                true,
+            )
+            .err()
+            .expect("a mis-bound census must fail closed");
+            assert!(error.contains(expected), "expected {expected:?}, got {error:?}");
+        }
+
+        let mut censused = BTreeSet::new();
+        let error =
+            apply_doctest_census(None, &census(1, TEST_UNIT_IDENTITY_SHA256, 0), &mut censused)
+                .expect_err("no inventory, nothing to refine");
+        assert!(error.contains("before its declared proof inventory"), "{error}");
+
+        let mut declared_empty = values.clone();
+        declared_empty[0]["excluded_units"][0]["exclusion_reason"] =
+            serde_json::json!(TARGO_TRUST_EXCLUSION_EMPTY_DOCTEST);
+        let error = parse_cargo_json_stdout(
+            Cursor::new(stream_of(&declared_empty, &[])),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .err()
+        .expect("the inventory cannot declare the census-only reason");
+        assert!(error.contains("only its authenticated doctest census"), "{error}");
     }
 
     #[test]
@@ -5281,10 +6423,9 @@ mod tests {
     }
 
     #[test]
-    fn audited_trust_spec_exclusion_is_shape_bound_and_include_dependencies_only() {
+    fn retired_compiler_exclusions_are_rejected_in_every_dependency_policy() {
         let package_id = "path+file:///fixture#demo@0.1.0";
-        let selected: BTreeMap<String, String> =
-            [(package_id.to_string(), "demo".to_string())].into_iter().collect();
+        let selected = [(package_id.to_string(), "demo".to_string())].into_iter().collect();
         let mut lines = Vec::new();
         append_complete_proof_unit(
             &mut lines, package_id, "demo", "demo", "lib", 86, "build", "primary", true,
@@ -5293,104 +6434,33 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        // The audited spec provider exactly as authenticated Targo reports it: a
-        // `proc-macro` Unit whose lib target is named `trust`, compiled as an
-        // ordinary rustc `build` job, carrying the `dependency` graph role.
-        let mut spec_provider = serde_json::json!({
-            "index": 1,
-            "mode": "build",
-            "package_id": "path+file:///fixture/ny-contracts#ny-contracts@0.2.0",
-            "package_name": "ny-contracts",
-            "target_name": "trust",
-            "target_kinds": ["proc-macro"],
-            "compile_target": TEST_COMPILE_TARGET,
-            "exclusion_reason": TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC,
-            "graph_role": "dependency",
-        });
-        set_excluded_unit_semantics(&mut spec_provider, "build");
-        values[0]["excluded_units"] = serde_json::json!([spec_provider]);
-        values[0]["include_dependencies"] = serde_json::json!(true);
-        let baseline = values;
-        let render =
-            |values: &[serde_json::Value]| -> String {
-                values.iter().map(|line| format!("{line}\n")).collect()
-            };
-
-        let evidence = parse_cargo_json_stdout(
-            Cursor::new(render(&baseline)),
-            &selected,
-            TEST_SESSION,
-            true,
-        )
-        .expect("the audited spec provider is admitted as an explicitly reasoned exclusion");
-        let inventory = evidence.declared_inventory.expect("inventory");
-        assert_eq!(inventory.excluded_targets.len(), 1);
-        let excluded = inventory.excluded_targets.iter().next().expect("excluded target");
-        assert_eq!(excluded.package_name, "ny-contracts");
-        assert_eq!(
-            inventory.excluded_reasons.get(excluded).map(String::as_str),
-            Some(TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC),
-            "the provider must be trusted under its OWN reason, not folded into build-support-only"
-        );
-        // Scope-collapse guard on the whole envelope: the selected root is still
-        // a declared proof subject, and the provider is not.
-        assert_eq!(inventory.proof_targets.len(), 1);
-        assert_eq!(
-            inventory.proof_targets.iter().next().expect("proof target").package_name,
-            "demo"
-        );
-
-        let mutations: [(&str, fn(&mut Vec<serde_json::Value>), &str); 5] = [
-            // Without the flag, the dependency-policy reason already owns every
-            // excluded dependency; this spelling must not become a second way to
-            // trust a Unit away.
-            (
-                "include-dependencies off",
-                |values| values[0]["include_dependencies"] = serde_json::json!(false),
-                "as an audited trust-spec proc macro without include-dependencies=true",
-            ),
-            // SCOPE COLLAPSE guard: this is exactly what stamping the reason
-            // onto `ny-cert` or a `num-*` library would look like on the wire.
-            // The audit admits a proc macro and nothing else.
-            (
-                "ordinary library shape",
-                |values| values[0]["excluded_units"][0]["target_kinds"] = serde_json::json!(["lib"]),
-                "did not name a proc-macro Unit",
-            ),
-            (
-                "proc macro mixed with a linkable crate type",
-                |values| {
-                    values[0]["excluded_units"][0]["target_kinds"] =
-                        serde_json::json!(["proc-macro", "rlib"])
-                },
-                "did not name a proc-macro Unit",
-            ),
-            // A Cargo control job has its own intrinsic reason; naming this one
-            // would be redundant and would hide the real exclusion.
-            (
-                "non-compiler Cargo mode",
-                |values| {
-                    values[0]["excluded_units"][0]["mode"] = serde_json::json!("doc");
-                    set_excluded_unit_semantics(&mut values[0]["excluded_units"][0], "doc");
-                },
-                "redundantly named a non-proof Cargo mode",
-            ),
-            // Anti-scope-collapse on the graph role: only a dependency can be
-            // trusted away here, never a root or an execution subject.
-            (
-                "non-dependency graph role",
-                |values| values[0]["excluded_units"][0]["graph_role"] = serde_json::json!("control"),
-                "carried Cargo graph role \"control\" instead of dependency",
-            ),
-        ];
-        for (label, mutate, expected) in mutations {
-            let mut mutated = baseline.clone();
-            mutate(&mut mutated);
-            let error =
-                parse_cargo_json_stdout(Cursor::new(render(&mutated)), &selected, TEST_SESSION, true)
-                    .err()
-                    .unwrap_or_else(|| panic!("{label} must fail closed"));
-            assert!(error.contains(expected), "{label}: expected {expected:?}, got {error:?}");
+        for include_dependencies in [false, true] {
+            for (kind, reason) in [
+                ("custom-build", TARGO_TRUST_EXCLUSION_BUILD_SUPPORT_ONLY),
+                ("lib", TARGO_TRUST_EXCLUSION_BUILD_SUPPORT_ONLY),
+                ("proc-macro", TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC),
+            ] {
+                let mut excluded = serde_json::json!({
+                    "index": 1,
+                    "mode": "build",
+                    "package_id": "path+file:///fixture/support#support@1.0.0",
+                    "package_name": "support",
+                    "target_name": "support",
+                    "target_kinds": [kind],
+                    "compile_target": TEST_COMPILE_TARGET,
+                    "exclusion_reason": reason,
+                    "graph_role": "dependency",
+                });
+                set_excluded_unit_semantics(&mut excluded, "build");
+                values[0]["excluded_units"] = serde_json::json!([excluded]);
+                values[0]["include_dependencies"] = serde_json::json!(include_dependencies);
+                let input = values.iter().map(|line| format!("{line}\n")).collect::<String>();
+                let error =
+                    parse_cargo_json_stdout(Cursor::new(input), &selected, TEST_SESSION, true)
+                        .err()
+                        .expect("retired compiler exemptions must not shrink the proof frontier");
+                assert!(error.contains("retired exclusion reason"), "{error}");
+            }
         }
     }
 
@@ -5998,7 +7068,7 @@ mod tests {
     }
 
     #[test]
-    fn non_primary_legacy_and_wrong_session_coverage_cannot_fill_root_target() {
+    fn non_primary_unauthenticated_and_wrong_session_coverage_cannot_fill_root_target() {
         let package_id = "path+file:///fixture#demo@0.1.0";
         let selected = [(package_id.to_string(), "demo".to_string())].into_iter().collect();
 
@@ -6010,7 +7080,10 @@ mod tests {
                 verification_session: TEST_SESSION.to_string(),
                 eligible: 1,
                 processed: 1,
+                noted_stops: Vec::new(),
+                degraded_anchors: 0,
                 function_identities: None,
+                memory: trust_types::MemorySummary::default(),
             });
         let non_primary = cargo_transport_envelope(package_id, "demo", &non_primary);
         assert!(
@@ -6032,28 +7105,37 @@ mod tests {
         .expect("advisory mode should discard unauthenticated coverage");
         assert!(advisory.parsed.coverage_rows.is_empty());
 
-        let legacy = trust_types::parse_transport_payload(
-            r#"{"type":"coverage_summary","crate_name":"demo","eligible":1,"processed":1}"#,
+        // Trust (T3 L4, C09w): a row with no `memory` summary is refused at the parse; one
+        // that carries it but no package, session or identities parses and stays
+        // unauthenticated.
+        assert!(
+            trust_types::parse_transport_payload(
+                r#"{"type":"coverage_summary","crate_name":"demo","eligible":1,"processed":1}"#,
+            )
+            .is_err()
+        );
+        let unauthenticated = trust_types::parse_transport_payload(
+            r#"{"type":"coverage_summary","crate_name":"demo","eligible":1,"processed":1,"memory":{"schema":"trust-memory-summary/v1","counters":{}}}"#,
         )
-        .expect("legacy coverage remains parseable for advisory compatibility");
-        let legacy = cargo_transport_envelope(package_id, "demo", &legacy);
+        .expect("an unauthenticated coverage row parses");
+        let unauthenticated = cargo_transport_envelope(package_id, "demo", &unauthenticated);
         assert!(
             parse_cargo_json_stdout(
-                Cursor::new(format!("{legacy}\n")),
+                Cursor::new(format!("{unauthenticated}\n")),
                 &selected,
                 TEST_SESSION,
                 true,
             )
             .is_err(),
-            "a legacy unauthenticated coverage row must carry no proof-grade credit"
+            "an unauthenticated coverage row must carry no proof-grade credit"
         );
         let advisory = parse_cargo_json_stdout(
-            Cursor::new(format!("{legacy}\n")),
+            Cursor::new(format!("{unauthenticated}\n")),
             &selected,
             TEST_SESSION,
             false,
         )
-        .expect("legacy JSON remains usable as advisory transport");
+        .expect("unauthenticated JSON remains usable as advisory transport");
         assert!(advisory.parsed.coverage_rows.is_empty());
 
         let wrong_session =
@@ -6064,7 +7146,10 @@ mod tests {
                 verification_session: "another-session".to_string(),
                 eligible: 1,
                 processed: 1,
+                noted_stops: Vec::new(),
+                degraded_anchors: 0,
                 function_identities: None,
+                memory: trust_types::MemorySummary::default(),
             });
         let wrong_session = cargo_transport_envelope(package_id, "demo", &wrong_session);
         assert!(
@@ -6151,11 +7236,14 @@ mod tests {
             verification_session: TEST_SESSION.to_string(),
             eligible: 1,
             processed: 1,
+            noted_stops: Vec::new(),
+            degraded_anchors: 0,
             function_identities: Some(trust_types::CoverageFunctionIdentityInventory {
                 schema: trust_types::COVERAGE_FUNCTION_IDENTITY_SCHEMA_V1.to_string(),
                 eligible_functions: vec!["demo::f".to_string()],
                 processed_functions: vec!["demo::f".to_string()],
             }),
+            memory: trust_types::MemorySummary::default(),
         };
         let current =
             serde_json::to_string(&trust_types::TransportMessage::CoverageSummary(current))
@@ -6204,7 +7292,7 @@ mod tests {
         assert!(parsed.coverage_rows.is_empty());
 
         let legacy = trust_types::parse_transport_payload(
-            r#"{"type":"coverage_summary","crate_name":"demo","eligible":1,"processed":1}"#,
+            r#"{"type":"coverage_summary","crate_name":"demo","eligible":1,"processed":1,"memory":{"schema":"trust-memory-summary/v1","counters":{}}}"#,
         )
         .unwrap();
         let legacy = serde_json::to_string(&legacy).unwrap();
@@ -6273,6 +7361,143 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must fail exact coverage authentication"));
             assert!(error.contains(expected), "{name}: {error}");
         }
+    }
+
+    /// 2026-10-17: the shape aterm-serde reached on the 2026-10-16 candidate gate
+    /// — a body the compiler credited as processed (an uncallable
+    /// `Impossible::end(self)`) with no function envelope. Strict refuses it, and
+    /// advisory drops the row but RECORDS that it was emitted and why, so the
+    /// report says "dropped" instead of "compiler emitted no coverage_summary".
+    #[test]
+    fn a_dropped_coverage_row_keeps_its_defect() {
+        let messages = || {
+            [
+                raw_unknown_function("demo::f"),
+                raw_exact_coverage(
+                    vec!["demo::end".into(), "demo::f".into()],
+                    vec!["demo::end".into(), "demo::f".into()],
+                ),
+            ]
+        };
+        let strict = parse_raw_messages(messages())
+            .require_raw_coverage_authentication(TEST_SESSION, true)
+            .err()
+            .expect("a credited body without an envelope must fail strict authentication");
+        assert!(strict.contains(r#"not emitted as envelopes=["demo::end"]"#), "{strict}");
+
+        let advisory = parse_raw_messages(messages())
+            .require_raw_coverage_authentication(TEST_SESSION, false)
+            .expect("advisory keeps the function rows");
+        assert!(advisory.coverage_rows.is_empty(), "no completeness credit");
+        assert_eq!(advisory.dropped_coverage.len(), 1, "{:?}", advisory.dropped_coverage);
+        assert!(
+            advisory.dropped_coverage[0].contains("identity authentication failed")
+                && advisory.dropped_coverage[0].contains("demo::end"),
+            "{:?}",
+            advisory.dropped_coverage
+        );
+
+        // NEGATIVE CONTROL: an exact inventory drops nothing, and a stream with no
+        // coverage row at all records no drop (absence stays absence).
+        let exact = parse_raw_messages([
+            raw_unknown_function("demo::f"),
+            raw_exact_coverage(vec!["demo::f".into()], vec!["demo::f".into()]),
+        ])
+        .require_raw_coverage_authentication(TEST_SESSION, false)
+        .expect("exact inventory");
+        assert_eq!(exact.coverage_rows.len(), 1);
+        assert!(exact.dropped_coverage.is_empty());
+        let absent = parse_raw_messages([raw_unknown_function("demo::f")])
+            .require_raw_coverage_authentication(TEST_SESSION, false)
+            .expect("no coverage row");
+        assert!(absent.coverage_rows.is_empty() && absent.dropped_coverage.is_empty());
+    }
+
+    /// 2026-10-17: the same defect on the channel a `targo trust` run actually
+    /// reads — Cargo's compiler-message envelopes, authenticated per Cargo target
+    /// before the targets merge. The record survives the merge and names the
+    /// target it was dropped from.
+    #[test]
+    fn a_dropped_cargo_target_coverage_row_keeps_its_defect_and_its_target() {
+        let package_id = "path+file:///fixture#demo@0.1.0";
+        let selected: BTreeMap<String, String> =
+            [(package_id.to_string(), "demo".to_string())].into_iter().collect();
+        let input = |coverage: &trust_types::TransportMessage| {
+            successful_cargo_input(vec![
+                cargo_transport_envelope(
+                    package_id,
+                    "demo",
+                    &one_unknown_primary_function("demo", "demo", "demo::f"),
+                ),
+                cargo_transport_envelope(package_id, "demo", coverage),
+                cargo_transport_envelope(
+                    package_id,
+                    "demo",
+                    &one_unknown_primary_summary("demo", "demo"),
+                ),
+                cargo_artifact(package_id, "demo", false),
+            ])
+        };
+        // `demo::end` is credited as processed and has no envelope: the shape of
+        // aterm-serde's seven `Impossible::end(self)` bodies on the candidate.
+        let credited_without_envelope =
+            trust_types::TransportMessage::CoverageSummary(trust_types::CoverageTransportSummary {
+                crate_name: "demo".to_string(),
+                package_name: "demo".to_string(),
+                primary_package: true,
+                verification_session: TEST_SESSION.to_string(),
+                eligible: 2,
+                processed: 2,
+                noted_stops: Vec::new(),
+                degraded_anchors: 0,
+                function_identities: Some(trust_types::CoverageFunctionIdentityInventory {
+                    schema: trust_types::COVERAGE_FUNCTION_IDENTITY_SCHEMA_V1.to_string(),
+                    eligible_functions: vec!["demo::end".to_string(), "demo::f".to_string()],
+                    processed_functions: vec!["demo::end".to_string(), "demo::f".to_string()],
+                }),
+                memory: trust_types::MemorySummary::default(),
+            });
+
+        let strict = parse_cargo_json_stdout(
+            Cursor::new(input(&credited_without_envelope)),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .err()
+        .expect("strict refuses a credited body without an envelope");
+        assert!(strict.contains("identity authentication failed"), "{strict}");
+
+        let advisory = parse_cargo_json_stdout(
+            Cursor::new(input(&credited_without_envelope)),
+            &selected,
+            TEST_SESSION,
+            false,
+        )
+        .expect("advisory keeps the function rows")
+        .parsed;
+        assert!(advisory.coverage_rows.is_empty(), "no completeness credit");
+        assert_eq!(advisory.dropped_coverage.len(), 1, "{:?}", advisory.dropped_coverage);
+        let dropped = &advisory.dropped_coverage[0];
+        assert!(
+            dropped.contains(": Trust coverage function identity authentication failed")
+                && dropped.contains("demo::end")
+                && !dropped.starts_with("Trust coverage"),
+            "the record carries its defect behind the Cargo target's label: {dropped}"
+        );
+
+        // NEGATIVE CONTROL: the exact inventory on the same channel keeps its row
+        // and records no drop.
+        let exact = parse_cargo_json_stdout(
+            Cursor::new(input(&complete_coverage("demo", "demo"))),
+            &selected,
+            TEST_SESSION,
+            false,
+        )
+        .expect("exact inventory")
+        .parsed;
+        assert_eq!(exact.coverage_rows.len(), 1);
+        assert!(exact.dropped_coverage.is_empty(), "{:?}", exact.dropped_coverage);
     }
 
     #[test]
@@ -6417,15 +7642,25 @@ mod tests {
         let package_id = "path+file:///fixture#demo@0.1.0";
         let selected = [(package_id.to_string(), "demo".to_string())].into_iter().collect();
         let function = one_unknown_primary_function("demo", "demo", "demo::f");
-        let coverage = complete_coverage("demo", "demo");
+        let mut lib_coverage = complete_coverage("demo", "demo");
+        let mut bin_coverage = complete_coverage("demo", "demo");
+        for (coverage, count) in [(&mut lib_coverage, 7), (&mut bin_coverage, 11)] {
+            let trust_types::TransportMessage::CoverageSummary(coverage) = coverage else {
+                panic!("fixture must carry a compiler coverage summary");
+            };
+            coverage.memory = trust_types::MemorySummary::new([(
+                trust_types::MemorySummary::SLOTS_COMPACTED.to_string(),
+                count,
+            )]);
+        }
         let summary = one_unknown_primary_summary("demo", "demo");
         let input = cargo_input_with_inventory(
             vec![
                 cargo_transport_envelope_with_kind(package_id, "demo", "lib", &function),
-                cargo_transport_envelope_with_kind(package_id, "demo", "lib", &coverage),
+                cargo_transport_envelope_with_kind(package_id, "demo", "lib", &lib_coverage),
                 cargo_transport_envelope_with_kind(package_id, "demo", "lib", &summary),
                 cargo_transport_envelope_with_kind(package_id, "demo", "bin", &function),
-                cargo_transport_envelope_with_kind(package_id, "demo", "bin", &coverage),
+                cargo_transport_envelope_with_kind(package_id, "demo", "bin", &bin_coverage),
                 cargo_transport_envelope_with_kind(package_id, "demo", "bin", &summary),
                 cargo_artifact_with_kind(package_id, "demo", "lib", false),
                 cargo_artifact_with_kind(package_id, "demo", "bin", false),
@@ -6437,6 +7672,23 @@ mod tests {
             .expect("both target-local exact identity inventories must authenticate");
         assert_eq!(evidence.parsed.coverage_rows.len(), 2);
         assert_eq!(evidence.parsed.function_envelopes.len(), 2);
+        let memory = serde_json::to_value(&evidence.parsed.compiler_memory_observations)
+            .expect("serialize per-unit memory observations");
+        let memory_by_kind = memory
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|unit| {
+                (
+                    unit["cargo_target"]["target_kinds"][0].as_str().unwrap(),
+                    unit["memory"]["counters"][trust_types::MemorySummary::SLOTS_COMPACTED]
+                        .as_u64()
+                        .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(memory_by_kind, [("bin", 11), ("lib", 7)].into_iter().collect());
+        assert!(!memory.to_string().contains(TEST_SESSION));
 
         let envelope_functions = evidence
             .parsed
@@ -6929,9 +8181,12 @@ mod tests {
 
     fn transport_row(outcome: trust_types::Outcome) -> trust_types::TransportObligationResult {
         trust_types::TransportObligationResult {
+            assumes: Vec::new(),
+            gap_class: None,
             obligation_id: None,
             claim_digest_sha256: None,
             kind: "assertion".to_string(),
+            original_vc_snapshot: None,
             typed_kind: None,
             description: "assertion holds".to_string(),
             location: None,
@@ -6945,6 +8200,7 @@ mod tests {
             native_trust_ir: None,
             proof_evidence: None,
             monitor: None,
+            grade: None,
         }
     }
 
@@ -6952,17 +8208,78 @@ mod tests {
         function: &str,
         transport_rows: &[trust_types::TransportObligationResult],
     ) -> Vec<VerificationResult> {
-        transport_rows.iter().map(|row| transport_to_verification_result(function, row)).collect()
+        transport_rows
+            .iter()
+            .map(|row| transport_to_verification_result(function, row, None, None))
+            .collect()
+    }
+
+    /// Trust (CB4): the one row the compiler writes for an excluded harness
+    /// body, as it crosses the wire.
+    fn exclusion_transport_row() -> trust_types::TransportObligationResult {
+        trust_types::TransportObligationResult {
+            assumes: Vec::new(),
+            kind: trust_types::exclusion::TEST_HARNESS_ROW_KIND.to_string(),
+            description: trust_types::exclusion::TEST_HARNESS_ROW_DESCRIPTION.to_string(),
+            solver: trust_types::exclusion::TEST_HARNESS_ROW_SOLVER.to_string(),
+            time_ms: 0,
+            reason: trust_types::exclusion::test_harness_exclusion_reason(
+                trust_types::exclusion::TestHarnessExclusionItem::HarnessMain,
+                None,
+            ),
+            ..transport_row(trust_types::Outcome::Skipped)
+        }
+    }
+
+    #[test]
+    fn a_lone_exclusion_row_keeps_its_exact_reason() {
+        let mut rows = verification_rows("crate::main", &[exclusion_transport_row()]);
+        let before = rows[0].reason.clone();
+        refuse_shared_test_harness_exclusion_envelope(&mut rows);
+        assert_eq!(rows[0].reason, before);
+        assert!(trust_types::exclusion::is_exact_test_harness_exclusion_row(
+            &rows[0].kind,
+            &rows[0].backend,
+            &rows[0].message,
+            rows[0].reason.as_deref(),
+        ));
+    }
+
+    #[test]
+    fn an_exclusion_row_sharing_its_envelope_is_refused() {
+        let mut rows = verification_rows(
+            "crate::main",
+            &[exclusion_transport_row(), transport_row(trust_types::Outcome::Proved)],
+        );
+        let sibling = serde_json::to_string(&rows[1]).expect("row serializes");
+        refuse_shared_test_harness_exclusion_envelope(&mut rows);
+        assert_eq!(rows[0].reason.as_deref(), Some(SHARED_EXCLUSION_ENVELOPE_DEFECT));
+        assert!(!trust_types::exclusion::is_exact_test_harness_exclusion_row(
+            &rows[0].kind,
+            &rows[0].backend,
+            &rows[0].message,
+            rows[0].reason.as_deref(),
+        ));
+        assert_eq!(
+            serde_json::to_string(&rows[1]).expect("row serializes"),
+            sibling,
+            "the sibling row is left exactly as it arrived"
+        );
     }
 
     #[test]
     fn function_summary_accepts_legacy_timeout_in_unknown_aggregate() {
         let func_result = trust_types::FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::timeout_case".to_string(),
             package_name: None,
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
+            runtime_checks: None,
             results: vec![transport_row(trust_types::Outcome::Timeout)],
             proved: 0,
             failed: 0,
@@ -6972,6 +8289,7 @@ mod tests {
             runtime_checked: 0,
             cached: 0,
             total: 1,
+            transport_budget: None,
         };
         let rows = verification_rows(&func_result.function, &func_result.results);
 
@@ -6981,11 +8299,16 @@ mod tests {
     #[test]
     fn function_summary_defect_compares_timeout_and_skipped_splits() {
         let func_result = trust_types::FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::split_case".to_string(),
             package_name: None,
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
+            runtime_checks: None,
             results: vec![
                 transport_row(trust_types::Outcome::Timeout),
                 transport_row(trust_types::Outcome::Skipped),
@@ -6998,6 +8321,7 @@ mod tests {
             runtime_checked: 0,
             cached: 0,
             total: 2,
+            transport_budget: None,
         };
         let rows = verification_rows(&func_result.function, &func_result.results);
 
@@ -7034,11 +8358,16 @@ mod tests {
         // -> Unknown fix that missed `failed` -> Unknown and `proved` -> Failed
         // (observed live on examples/midpoint.rs and full_verifier_three_suite.rs).
         let func_result = trust_types::FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::reclassified".to_string(),
             package_name: None,
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
+            runtime_checks: None,
             results: vec![
                 transport_row(trust_types::Outcome::Failed),
                 transport_row(trust_types::Outcome::Proved),
@@ -7051,6 +8380,7 @@ mod tests {
             runtime_checked: 0,
             cached: 0,
             total: 2,
+            transport_budget: None,
         };
         let rows = vec![
             normalized_row(VerificationOutcome::Unknown),
@@ -7067,11 +8397,16 @@ mod tests {
         // normalizes to Unknown. The single proved->Unknown shift is absorbed, yet
         // the leftover `proved` over-count still surfaces a defect.
         let func_result = trust_types::FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::miscount".to_string(),
             package_name: None,
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
+            runtime_checks: None,
             results: vec![transport_row(trust_types::Outcome::Proved)],
             proved: 2,
             failed: 0,
@@ -7081,6 +8416,7 @@ mod tests {
             runtime_checked: 0,
             cached: 0,
             total: 1,
+            transport_budget: None,
         };
         let rows = vec![normalized_row(VerificationOutcome::Unknown)];
 
@@ -7115,11 +8451,16 @@ mod tests {
         // still (correctly) reports its raw proved=1, failed=1, unknown=0.
         let function =
             trust_types::TransportMessage::FunctionResult(trust_types::FunctionTransportResult {
+                stable_ids: Vec::new(),
+                source_sha256: None,
+                expanded_function_identity: None,
+                modeled_facts: Vec::new(),
                 function: "demo::reclassified".to_string(),
                 package_name: Some("demo".to_string()),
                 crate_name: Some("demo".to_string()),
                 primary_package: true,
                 verification_session: TEST_SESSION.to_string(),
+                runtime_checks: None,
                 results: vec![
                     full_verifier_row(
                         trust_types::Outcome::Failed,
@@ -7138,6 +8479,7 @@ mod tests {
                 runtime_checked: 0,
                 cached: 0,
                 total: 2,
+                transport_budget: None,
             });
         let summary = trust_types::CrateTransportSummary {
             crate_name: "demo".to_string(),
@@ -7258,5 +8600,782 @@ mod tests {
         let reason = crate_transport_summary_defect(&summary, &observed)
             .expect("every emitted function row must be counted as analyzed");
         assert!(reason.contains("functions_analyzed rows=1 summary=0"), "{reason}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Trust (OD-1 phase 1; 2026-10-12): the compiler counts a `proved`
+    // instance-discharge row `skipped`, and this reconciler must count it the
+    // same way. The three tests below read the compiler's own bytes.
+    // -----------------------------------------------------------------------
+
+    /// Verbatim transport of bare `trustc` — the stage 1 of the T3 L4 merge `fd4cee44ece`
+    /// (recaptured 2026-10-21; first captured on trust main `5a2d23c537`), run in
+    /// `tests/fixtures/instance-discharge` as `trustc
+    /// --edition 2024 --crate-type=lib --crate-name
+    /// trust_instance_discharge_fixture --emit=metadata -Ztrust-verify=on
+    /// -Ztrust-verify-output=both -Ztrust-policy=advisory src/lib.rs` (the flags
+    /// of `tests/ui/trust/instance_hypothesis/discharge_row_per_instance.rs`,
+    /// advisory revision) — reduced to the `TRUST_JSON:` lines of its stderr:
+    /// three function envelopes, the coverage summary (with its `memory` summary), the crate
+    /// summary.
+    ///
+    /// `use_good` names the instance `f::<Good>`. Its envelope carries two rows,
+    /// BOTH with outcome `proved` — its panic-freedom assertion and the
+    /// instance-discharge row — and declares `proved: 1, unknown: 1, skipped: 1,
+    /// total: 2`: the compiler's tally (`PublishedRowTally::of`) counts a
+    /// `proved` discharge row "assumed (instance discharge)", which
+    /// `json_counts` folds into `skipped` and so into `unknown`, never into
+    /// `proved`. The crate summary sums the same counters.
+    const INSTANCE_DISCHARGE_PROVED_TRANSPORT: &str =
+        include_str!("../fixtures/instance_discharge_proved_transport.jsonl");
+
+    fn instance_discharge_messages() -> Vec<trust_types::TransportMessage> {
+        let messages: Vec<_> = INSTANCE_DISCHARGE_PROVED_TRANSPORT
+            .lines()
+            .map(|line| {
+                trust_types::parse_transport_line(line)
+                    .unwrap_or_else(|| panic!("the pinned transport line must parse: {line:.120}"))
+            })
+            .collect();
+        assert_eq!(messages.len(), 5, "three functions, one coverage summary, one crate summary");
+        messages
+    }
+
+    fn instance_discharge_envelopes() -> Vec<trust_types::FunctionTransportResult> {
+        instance_discharge_messages()
+            .into_iter()
+            .filter_map(|message| match message {
+                trust_types::TransportMessage::FunctionResult(envelope) => Some(envelope),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn instance_discharge_crate_summary() -> trust_types::CrateTransportSummary {
+        instance_discharge_messages()
+            .into_iter()
+            .find_map(|message| match message {
+                trust_types::TransportMessage::CrateSummary(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("the pinned transport ends with its crate summary")
+    }
+
+    /// The compiler's own test for the row its tally sets aside.
+    fn is_proved_instance_discharge(row: &trust_types::TransportObligationResult) -> bool {
+        row.outcome.is_proved()
+            && trust_types::assumption::is_instance_hypothesis_discharge_row(&row.kind, &row.solver)
+    }
+
+    /// `use_good`'s envelope and the index of its discharge row.
+    fn proved_instance_discharge_envelope() -> (trust_types::FunctionTransportResult, usize) {
+        let mut carriers = instance_discharge_envelopes()
+            .into_iter()
+            .filter(|envelope| envelope.results.iter().any(is_proved_instance_discharge));
+        let envelope = carriers.next().expect("the pinned transport has a proved discharge row");
+        assert!(carriers.next().is_none(), "one instance, so one discharge row");
+        let index = envelope
+            .results
+            .iter()
+            .position(is_proved_instance_discharge)
+            .expect("the carrier has the row");
+        (envelope, index)
+    }
+
+    /// The report rows `parse_compiler_stderr` builds for one envelope.
+    fn pipeline_rows(envelope: &trust_types::FunctionTransportResult) -> Vec<VerificationResult> {
+        let identities = crate::types::envelope_identities(envelope);
+        envelope
+            .results
+            .iter()
+            .zip(identities)
+            .map(|(row, identity)| {
+                transport_to_verification_result(
+                    &envelope.function,
+                    row,
+                    envelope.runtime_checks,
+                    identity,
+                )
+            })
+            .collect()
+    }
+
+    /// `[proved, failed, unknown, timed_out, skipped, runtime_checked, total]`.
+    fn tally(counts: &FunctionTransportCounts) -> [usize; 7] {
+        [
+            counts.proved,
+            counts.failed,
+            counts.unknown,
+            counts.timed_out,
+            counts.skipped,
+            counts.runtime_checked,
+            counts.total,
+        ]
+    }
+
+    /// The envelope's declared counters, in [`tally`]'s order.
+    fn declared(envelope: &trust_types::FunctionTransportResult) -> [usize; 7] {
+        [
+            envelope.proved,
+            envelope.failed,
+            envelope.unknown,
+            envelope.timed_out,
+            envelope.skipped,
+            envelope.runtime_checked,
+            envelope.total,
+        ]
+    }
+
+    fn with_declared(
+        envelope: &trust_types::FunctionTransportResult,
+        counters: [usize; 7],
+    ) -> trust_types::FunctionTransportResult {
+        let [proved, failed, unknown, timed_out, skipped, runtime_checked, total] = counters;
+        trust_types::FunctionTransportResult {
+            proved,
+            failed,
+            unknown,
+            timed_out,
+            skipped,
+            runtime_checked,
+            total,
+            ..envelope.clone()
+        }
+    }
+
+    /// The accounting rows of a parsed transport: `(kind, reason)`.
+    fn accounting_rows(parsed: &ParsedCompilerOutput) -> Vec<(String, String)> {
+        parsed
+            .verification_results
+            .iter()
+            .filter(|row| row.kind.starts_with("transport:"))
+            .map(|row| (row.kind.clone(), row.reason.clone().unwrap_or_default()))
+            .collect()
+    }
+
+    /// What the compiler declares for `use_good`: the discharge row is in
+    /// `skipped` and `unknown`, the assertion alone is `proved`.
+    const DISCHARGE_TALLY: [usize; 7] = [1, 0, 1, 0, 1, 0, 2];
+
+    /// `add_transport_result_counts` and the per-function check it feeds: the
+    /// compiler's real envelope reconciles; every lookalike is counted by its
+    /// outcome, as before and as the compiler counts it; a real miscount is
+    /// still a defect.
+    #[test]
+    fn function_summary_counts_a_proved_instance_discharge_row_as_the_compiler_does() {
+        let (envelope, discharge) = proved_instance_discharge_envelope();
+        // The case, exactly as the compiler wrote it.
+        assert_eq!(envelope.results.len(), 2);
+        assert!(envelope.results.iter().all(|row| row.outcome.is_proved()), "both travel proved");
+        assert_eq!(declared(&envelope), DISCHARGE_TALLY);
+
+        let rows = pipeline_rows(&envelope);
+        let mut observed = FunctionTransportCounts::default();
+        add_transport_result_counts(&mut observed, &envelope.results, &rows);
+        assert_eq!(
+            tally(&observed),
+            DISCHARGE_TALLY,
+            "a proved instance-discharge row is tallied unknown + skipped, never proved"
+        );
+        assert_eq!(function_transport_summary_defect(&envelope, &rows), None);
+        // Every envelope of the pinned transport reconciles.
+        for envelope in instance_discharge_envelopes() {
+            assert_eq!(
+                function_transport_summary_defect(&envelope, &pipeline_rows(&envelope)),
+                None,
+                "{}",
+                envelope.function
+            );
+        }
+
+        // Lookalikes: the discharge row with one thing changed. The third field
+        // is what the compiler's tally declares for the assertion plus that row.
+        let lookalike = |edit: &dyn Fn(&mut trust_types::TransportObligationResult)| {
+            let mut envelope = envelope.clone();
+            edit(&mut envelope.results[discharge]);
+            assert!(!is_proved_instance_discharge(&envelope.results[discharge]));
+            envelope
+        };
+        let cases: [(&str, trust_types::FunctionTransportResult, [usize; 7]); 9] = [
+            (
+                "the kind from the SMT solver",
+                lookalike(&|row| row.solver = "ay-smtlib".to_string()),
+                [2, 0, 0, 0, 0, 0, 2],
+            ),
+            (
+                "the kind from the full verifier",
+                lookalike(&|row| row.solver = "trust-full-verifier".to_string()),
+                [2, 0, 0, 0, 0, 0, 2],
+            ),
+            (
+                "another kind from the classifier",
+                lookalike(&|row| row.kind = "assert".to_string()),
+                [2, 0, 0, 0, 0, 0, 2],
+            ),
+            (
+                "the hypothesis kind claiming proof",
+                lookalike(&|row| row.kind = "assumption:instance-hypothesis".to_string()),
+                [2, 0, 0, 0, 0, 0, 2],
+            ),
+            (
+                "a failed discharge",
+                lookalike(&|row| row.outcome = trust_types::Outcome::Failed),
+                [1, 1, 0, 0, 0, 0, 2],
+            ),
+            (
+                "an unknown discharge",
+                lookalike(&|row| row.outcome = trust_types::Outcome::Unknown),
+                [1, 0, 1, 0, 0, 0, 2],
+            ),
+            (
+                "a runtime-checked discharge",
+                lookalike(&|row| row.outcome = trust_types::Outcome::RuntimeChecked),
+                [1, 0, 0, 0, 0, 1, 2],
+            ),
+            (
+                "a timed-out discharge",
+                lookalike(&|row| row.outcome = trust_types::Outcome::Timeout),
+                [1, 0, 1, 1, 0, 0, 2],
+            ),
+            (
+                "a skipped discharge",
+                lookalike(&|row| row.outcome = trust_types::Outcome::Skipped),
+                DISCHARGE_TALLY,
+            ),
+        ];
+        for (name, case, counted) in &cases {
+            let rows = pipeline_rows(case);
+            // Accepted under the counters the compiler would declare for it.
+            assert_eq!(
+                function_transport_summary_defect(&with_declared(case, *counted), &rows),
+                None,
+                "{name}"
+            );
+            let mut observed = FunctionTransportCounts::default();
+            add_transport_result_counts(&mut observed, &case.results, &rows);
+            if *counted == DISCHARGE_TALLY {
+                // A raw `skipped` row: unknown + skipped, as it always was.
+                assert_eq!(tally(&observed), DISCHARGE_TALLY, "{name}");
+                continue;
+            }
+            // Counted by its report outcome, as every row but a raw `skipped`
+            // one was before; never as a skipped row, and never accepted
+            // under the proved-discharge tally.
+            let mut by_outcome =
+                FunctionTransportCounts { total: rows.len(), ..FunctionTransportCounts::default() };
+            for row in &rows {
+                add_verification_result_count(&mut by_outcome, row);
+            }
+            assert_eq!(tally(&observed), tally(&by_outcome), "{name}: counted by its outcome");
+            assert_eq!(observed.skipped, 0, "{name}");
+            assert!(
+                function_transport_summary_defect(case, &rows).is_some(),
+                "{name}: must not be counted as a proved instance discharge"
+            );
+        }
+
+        // Real miscounts over the compiler's real rows are still defects. A
+        // producer that counts the discharge row as proof (the compiler's tally
+        // before 79212a4c78, and the only one this reconciler used to accept):
+        let reason = function_transport_summary_defect(
+            &with_declared(&envelope, [2, 0, 0, 0, 0, 0, 2]),
+            &rows,
+        )
+        .expect("a discharge row counted as proof is a miscount");
+        assert!(reason.contains("proved rows=1 summary=2"), "{reason}");
+        assert!(reason.contains("unknown rows=1 summary=0"), "{reason}");
+        assert!(reason.contains("skipped rows=1 summary=0"), "{reason}");
+        // One proof too many, one row too many, a failure nobody published, a
+        // skip nobody published:
+        for (counters, expected) in [
+            ([2, 0, 1, 0, 1, 0, 2], "proved rows=1 summary=2"),
+            ([1, 0, 1, 0, 1, 0, 3], "total rows=2 summary=3"),
+            ([1, 1, 1, 0, 1, 0, 2], "failed rows=0 summary=1"),
+            ([1, 0, 2, 0, 2, 0, 2], "skipped rows=1 summary=2"),
+        ] {
+            let reason =
+                function_transport_summary_defect(&with_declared(&envelope, counters), &rows)
+                    .unwrap_or_else(|| panic!("{counters:?} is a miscount"));
+            assert!(reason.contains(expected), "{counters:?}: {reason}");
+        }
+        // The discharge row withheld while the counters still count it:
+        let mut withheld = envelope.clone();
+        withheld.results.remove(discharge);
+        withheld.stable_ids.remove(discharge);
+        let reason = function_transport_summary_defect(&withheld, &pipeline_rows(&withheld))
+            .expect("a counted row that was not published is a miscount");
+        assert!(reason.contains("total rows=1 summary=2"), "{reason}");
+        assert!(reason.contains("unknown rows=0 summary=1"), "{reason}");
+    }
+
+    /// `add_raw_transport_result_counts` (through `raw_transport_bucket`) and
+    /// the crate-summary check it feeds, over the whole pinned transport as
+    /// `parse_compiler_stderr` reads it: no accounting row, every row keyed, a
+    /// unit that is not could-not-run.
+    #[test]
+    fn crate_summary_counts_a_proved_instance_discharge_row_as_the_compiler_does() {
+        let summary = instance_discharge_crate_summary();
+        let declared_totals = [
+            summary.total_proved,
+            summary.total_failed,
+            summary.total_unknown,
+            summary.total_timed_out,
+            summary.total_skipped,
+            summary.total_runtime_checked,
+            summary.total_obligations,
+        ];
+        assert_eq!(declared_totals, [2, 0, 4, 0, 4, 0, 6], "the compiler's own crate summary");
+        let mut observed = FunctionTransportCounts::default();
+        for envelope in instance_discharge_envelopes() {
+            add_raw_transport_result_counts(&mut observed, &envelope.results);
+        }
+        assert_eq!(tally(&observed), declared_totals);
+
+        let parsed = parse_compiler_stderr(Cursor::new(INSTANCE_DISCHARGE_PROVED_TRANSPORT), false);
+        let defects = accounting_rows(&parsed);
+        assert!(defects.is_empty(), "the compiler's real transport is no defect: {defects:?}");
+        assert_eq!(parsed.verification_results.len(), 6, "the six rows the compiler published");
+        // T9: a keyless row makes the unit could-not-run. Every compiler row is
+        // keyed, and no synthesized row is left to be keyless.
+        let unit =
+            crate::determinism_report::UnitDeterminism::of_rows(&parsed.verification_results, &[]);
+        assert_eq!(unit.unkeyed_functions, Vec::<String>::new());
+        assert_eq!(unit.could_not_run_line(), None);
+
+        // The pinned transport with one thing changed, re-read whole.
+        let reread = |edit: &dyn Fn(&mut trust_types::TransportMessage)| {
+            let mut messages = instance_discharge_messages();
+            for message in &mut messages {
+                edit(message);
+            }
+            parse_raw_messages(messages)
+        };
+        // A lookalike (the kind from another solver) under the compiler's
+        // counters: a raw `proved` row those counters do not count `proved`, in
+        // its function and in its crate.
+        let other_solver = |message: &mut trust_types::TransportMessage| {
+            if let trust_types::TransportMessage::FunctionResult(envelope) = message {
+                for row in &mut envelope.results {
+                    if is_proved_instance_discharge(row) {
+                        row.solver = "ay-smtlib".to_string();
+                    }
+                }
+            }
+        };
+        let defects = accounting_rows(&reread(&other_solver));
+        assert_eq!(
+            defects.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>(),
+            ["transport:summary-accounting", "transport:crate-summary-accounting"],
+            "{defects:?}"
+        );
+        assert!(defects[0].1.contains("skipped rows=0 summary=1"), "{defects:?}");
+        assert!(defects[1].1.contains("proved rows=3 summary=2"), "{defects:?}");
+        assert!(defects[1].1.contains("unknown rows=3 summary=4"), "{defects:?}");
+        assert!(defects[1].1.contains("skipped rows=3 summary=4"), "{defects:?}");
+        // The same lookalike under counters that count it `proved`, as the
+        // compiler would: accepted, exactly as before.
+        let defects = accounting_rows(&reread(&|message| {
+            let carrier = matches!(
+                message,
+                trust_types::TransportMessage::FunctionResult(envelope)
+                    if envelope.results.iter().any(is_proved_instance_discharge)
+            );
+            other_solver(message);
+            match message {
+                trust_types::TransportMessage::FunctionResult(envelope) if carrier => {
+                    (envelope.proved, envelope.unknown, envelope.skipped) = (2, 0, 0);
+                }
+                trust_types::TransportMessage::CrateSummary(summary) => {
+                    summary.functions_verified = 2;
+                    (summary.total_proved, summary.total_unknown, summary.total_skipped) =
+                        (3, 3, 3);
+                }
+                _ => {}
+            }
+        }));
+        assert!(defects.is_empty(), "a lookalike counted by its outcome reconciles: {defects:?}");
+
+        // Real drift in the terminal counters is still a defect: a crate
+        // summary that counts the discharge row as proof.
+        let defects = accounting_rows(&reread(&|message| {
+            if let trust_types::TransportMessage::CrateSummary(summary) = message {
+                (summary.total_proved, summary.total_unknown, summary.total_skipped) = (3, 3, 3);
+            }
+        }));
+        assert_eq!(defects.len(), 1, "{defects:?}");
+        assert_eq!(defects[0].0, "transport:crate-summary-accounting");
+        assert!(defects[0].1.contains("proved rows=2 summary=3"), "{defects:?}");
+        assert!(defects[0].1.contains("unknown rows=4 summary=3"), "{defects:?}");
+        assert!(defects[0].1.contains("skipped rows=4 summary=3"), "{defects:?}");
+        // And an accounting row still makes the unit could-not-run (T9).
+        let drifted = reread(&|message| {
+            if let trust_types::TransportMessage::CrateSummary(summary) = message {
+                summary.total_obligations += 1;
+            }
+        });
+        let unit =
+            crate::determinism_report::UnitDeterminism::of_rows(&drifted.verification_results, &[]);
+        assert_eq!(unit.unkeyed_functions, ["<crate:trust_instance_discharge_fixture>"]);
+        assert!(unit.could_not_run_line().is_some());
+    }
+
+    /// `normalization_adjusted_expected` (through `raw_transport_bucket`): the
+    /// compiler never counted the discharge row `proved`, so whatever its
+    /// report row becomes, no `proved` budget is moved on its account — it is
+    /// tallied from its raw outcome on both sides, like a `skipped` row.
+    #[test]
+    fn normalization_leaves_a_proved_instance_discharge_row_where_the_compiler_counted_it() {
+        let (envelope, discharge) = proved_instance_discharge_envelope();
+        let assertion = 1 - discharge;
+        let rows = pipeline_rows(&envelope);
+        assert_eq!(tally(&normalization_adjusted_expected(&envelope, &rows)), DISCHARGE_TALLY);
+
+        for outcome in [
+            VerificationOutcome::Unknown,
+            VerificationOutcome::Failed,
+            VerificationOutcome::RuntimeChecked,
+            VerificationOutcome::Timeout,
+        ] {
+            let mut reclassified = rows.clone();
+            reclassified[discharge].outcome = outcome;
+            assert_eq!(
+                tally(&normalization_adjusted_expected(&envelope, &reclassified)),
+                DISCHARGE_TALLY,
+                "{outcome:?}: the assertion's `proved` is not the discharge row's to move"
+            );
+            assert_eq!(
+                function_transport_summary_defect(&envelope, &reclassified),
+                None,
+                "{outcome:?}"
+            );
+        }
+
+        // Control: the existing normalization is untouched. The sibling
+        // assertion's report row demoted to unknown still moves its own bucket.
+        let mut reclassified = rows.clone();
+        reclassified[assertion].outcome = VerificationOutcome::Unknown;
+        assert_eq!(
+            tally(&normalization_adjusted_expected(&envelope, &reclassified)),
+            [0, 0, 2, 0, 1, 0, 2]
+        );
+        assert_eq!(function_transport_summary_defect(&envelope, &reclassified), None);
+        // And a lookalike is an ordinary `proved` row to it: counted `proved` by
+        // the compiler, demoted here, its bucket moves.
+        let mut lookalike = with_declared(&envelope, [2, 0, 0, 0, 0, 0, 2]);
+        lookalike.results[discharge].solver = "ay-smtlib".to_string();
+        let mut reclassified = pipeline_rows(&lookalike);
+        reclassified[discharge].outcome = VerificationOutcome::Unknown;
+        assert_eq!(
+            tally(&normalization_adjusted_expected(&lookalike, &reclassified)),
+            [1, 0, 1, 0, 0, 0, 2]
+        );
+        assert_eq!(function_transport_summary_defect(&lookalike, &reclassified), None);
+    }
+
+    /// The two sites that read `raw_transport_bucket` — the crate tally
+    /// (`add_raw_transport_result_counts`) and
+    /// `normalization_adjusted_expected` — set aside the `proved` discharge row
+    /// and no other. A discharge row with any other outcome is counted, and
+    /// moved when its report row is reclassified, by that outcome: as before,
+    /// and as the compiler counts it. (The per-function site is held to the
+    /// same nine lookalikes by
+    /// `function_summary_counts_a_proved_instance_discharge_row_as_the_compiler_does`.)
+    #[test]
+    fn crate_summary_and_normalization_count_an_unproved_instance_discharge_row_by_its_outcome() {
+        let (carrier, discharge) = proved_instance_discharge_envelope();
+        // Where the compiler's own tally stands: `use_good`, then the crate.
+        const CRATE_TALLY: [usize; 7] = [2, 0, 4, 0, 4, 0, 6];
+        assert_eq!(declared(&carrier), DISCHARGE_TALLY);
+
+        // The discharge row's outcome; what the compiler's tally declares for
+        // `use_good` and for the crate with that row in place; the outcome its
+        // report row is reclassified to below; and where that moves the
+        // function's expected counters.
+        struct Case {
+            outcome: trust_types::Outcome,
+            function: [usize; 7],
+            krate: [usize; 7],
+            reclassified: VerificationOutcome,
+            moved: [usize; 7],
+        }
+        let cases = [
+            Case {
+                outcome: trust_types::Outcome::Failed,
+                function: [1, 1, 0, 0, 0, 0, 2],
+                krate: [2, 1, 3, 0, 3, 0, 6],
+                reclassified: VerificationOutcome::Unknown,
+                moved: [1, 0, 1, 0, 0, 0, 2],
+            },
+            Case {
+                outcome: trust_types::Outcome::Unknown,
+                function: [1, 0, 1, 0, 0, 0, 2],
+                krate: [2, 0, 4, 0, 3, 0, 6],
+                reclassified: VerificationOutcome::Failed,
+                moved: [1, 1, 0, 0, 0, 0, 2],
+            },
+            Case {
+                outcome: trust_types::Outcome::RuntimeChecked,
+                function: [1, 0, 0, 0, 0, 1, 2],
+                krate: [2, 0, 3, 0, 3, 1, 6],
+                reclassified: VerificationOutcome::Unknown,
+                moved: [1, 0, 1, 0, 0, 0, 2],
+            },
+            Case {
+                outcome: trust_types::Outcome::Timeout,
+                function: [1, 0, 1, 1, 0, 0, 2],
+                krate: [2, 0, 4, 1, 3, 0, 6],
+                reclassified: VerificationOutcome::Unknown,
+                moved: [1, 0, 1, 0, 0, 0, 2],
+            },
+            // A raw `skipped` row: set aside like the `proved` discharge row,
+            // as it always was, so nothing moves on its account.
+            Case {
+                outcome: trust_types::Outcome::Skipped,
+                function: DISCHARGE_TALLY,
+                krate: CRATE_TALLY,
+                reclassified: VerificationOutcome::Failed,
+                moved: DISCHARGE_TALLY,
+            },
+        ];
+
+        for case in &cases {
+            let name = format!("a discharge row with outcome {:?}", case.outcome);
+            let outcome = case.outcome;
+            // The pinned transport with that one outcome changed. `counted`
+            // says whether the counters are moved to what the compiler would
+            // declare for it, or left at the `proved` discharge row's tally.
+            let transport = |counted: bool| {
+                let mut messages = instance_discharge_messages();
+                for message in &mut messages {
+                    match message {
+                        trust_types::TransportMessage::FunctionResult(envelope)
+                            if envelope.results.iter().any(is_proved_instance_discharge) =>
+                        {
+                            for row in &mut envelope.results {
+                                if is_proved_instance_discharge(row) {
+                                    row.outcome = outcome;
+                                }
+                            }
+                            if counted {
+                                *envelope = with_declared(envelope, case.function);
+                            }
+                        }
+                        trust_types::TransportMessage::CrateSummary(summary) if counted => {
+                            [
+                                summary.total_proved,
+                                summary.total_failed,
+                                summary.total_unknown,
+                                summary.total_timed_out,
+                                summary.total_skipped,
+                                summary.total_runtime_checked,
+                                summary.total_obligations,
+                            ] = case.krate;
+                        }
+                        _ => {}
+                    }
+                }
+                messages
+            };
+
+            // The crate tally counts the row by its outcome.
+            let mut observed = FunctionTransportCounts::default();
+            for message in transport(true) {
+                if let trust_types::TransportMessage::FunctionResult(envelope) = message {
+                    add_raw_transport_result_counts(&mut observed, &envelope.results);
+                }
+            }
+            assert_eq!(tally(&observed), case.krate, "{name}: the crate tally");
+
+            // Counted by its outcome in the function and in the crate, the
+            // whole transport reconciles; under the `proved` discharge row's
+            // counters it is the accounting defect in both.
+            let defects = accounting_rows(&parse_raw_messages(transport(true)));
+            assert!(defects.is_empty(), "{name}: counted by its outcome: {defects:?}");
+            let defects = accounting_rows(&parse_raw_messages(transport(false)));
+            if case.krate == CRATE_TALLY {
+                assert!(defects.is_empty(), "{name}: the same tally: {defects:?}");
+            } else {
+                assert_eq!(
+                    defects.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>(),
+                    ["transport:summary-accounting", "transport:crate-summary-accounting"],
+                    "{name}: must not be counted as a proved instance discharge: {defects:?}"
+                );
+            }
+
+            // The normalization moves the row's own bucket when its report row
+            // is reclassified, and only a set-aside row's bucket stays.
+            let mut envelope = with_declared(&carrier, case.function);
+            envelope.results[discharge].outcome = outcome;
+            let mut reclassified = pipeline_rows(&envelope);
+            reclassified[discharge].outcome = case.reclassified;
+            assert_eq!(
+                tally(&normalization_adjusted_expected(&envelope, &reclassified)),
+                case.moved,
+                "{name}: reclassified to {:?}",
+                case.reclassified
+            );
+            assert_eq!(
+                function_transport_summary_defect(&envelope, &reclassified),
+                None,
+                "{name}: reclassified to {:?}",
+                case.reclassified
+            );
+        }
+    }
+
+    /// No split of `unknown` is excused as a legacy summary's once a `proved`
+    /// instance-discharge row is among the rows: the compiler that publishes
+    /// that row declares `skipped` and `timed_out` (its tally counts the row
+    /// `skipped`, and `unknown` only as the aggregate over it). So tallying
+    /// the row as the compiler does lets exactly the compiler's counters
+    /// through, and not also a summary that counts the row `unknown` and
+    /// nowhere else — a shape this check refused while it counted the row
+    /// `proved`. Where the excuse applied before, it still does.
+    #[test]
+    fn a_legacy_split_is_not_excused_beside_a_proved_instance_discharge_row() {
+        let (envelope, discharge) = proved_instance_discharge_envelope();
+        let assertion = 1 - discharge;
+        let rows = pipeline_rows(&envelope);
+        let mut observed = FunctionTransportCounts::default();
+        add_transport_result_counts(&mut observed, &envelope.results, &rows);
+        assert_eq!(observed.assumed_discharge, 1, "the function tally knows the row");
+
+        // `skipped: 0` under an agreeing `unknown`, in the function.
+        let reason = function_transport_summary_defect(
+            &with_declared(&envelope, [1, 0, 1, 0, 0, 0, 2]),
+            &rows,
+        )
+        .expect("a proved discharge row counted `unknown` and not `skipped` is a miscount");
+        assert!(
+            reason.ends_with("does not match result rows: skipped rows=1 summary=0"),
+            "{reason}"
+        );
+
+        // `timed_out: 0` under an agreeing `unknown`, in a function that also
+        // carries the row: the assertion timed out. The compiler's counters
+        // reconcile; the legacy aggregate does not.
+        let mut timed_out = envelope.clone();
+        timed_out.results[assertion].outcome = trust_types::Outcome::Timeout;
+        let timed_out_rows = pipeline_rows(&timed_out);
+        assert_eq!(
+            function_transport_summary_defect(
+                &with_declared(&timed_out, [0, 0, 2, 1, 1, 0, 2]),
+                &timed_out_rows
+            ),
+            None
+        );
+        let reason = function_transport_summary_defect(
+            &with_declared(&timed_out, [0, 0, 2, 0, 1, 0, 2]),
+            &timed_out_rows,
+        )
+        .expect("the compiler that publishes a discharge row declares its timeouts");
+        assert!(
+            reason.ends_with("does not match result rows: timed_out rows=1 summary=0"),
+            "{reason}"
+        );
+
+        // The same two shapes in the crate summary, the transport re-read whole.
+        let reread = |edit: &dyn Fn(&mut trust_types::TransportMessage)| {
+            let mut messages = instance_discharge_messages();
+            for message in &mut messages {
+                edit(message);
+            }
+            parse_raw_messages(messages)
+        };
+        let mut crate_observed = FunctionTransportCounts::default();
+        for envelope in instance_discharge_envelopes() {
+            add_raw_transport_result_counts(&mut crate_observed, &envelope.results);
+        }
+        assert_eq!(crate_observed.assumed_discharge, 1, "the crate tally knows the row");
+        let defects = accounting_rows(&reread(&|message| {
+            if let trust_types::TransportMessage::CrateSummary(summary) = message {
+                summary.total_skipped = 0;
+            }
+        }));
+        assert_eq!(defects.len(), 1, "{defects:?}");
+        assert_eq!(defects[0].0, "transport:crate-summary-accounting");
+        assert!(
+            defects[0].1.ends_with("does not match function result rows: skipped rows=4 summary=0"),
+            "{defects:?}"
+        );
+        let assertion_times_out = |message: &mut trust_types::TransportMessage| match message {
+            trust_types::TransportMessage::FunctionResult(envelope)
+                if envelope.results.iter().any(is_proved_instance_discharge) =>
+            {
+                for row in &mut envelope.results {
+                    if !is_proved_instance_discharge(row) {
+                        row.outcome = trust_types::Outcome::Timeout;
+                    }
+                }
+                *envelope = with_declared(envelope, [0, 0, 2, 1, 1, 0, 2]);
+            }
+            trust_types::TransportMessage::CrateSummary(summary) => {
+                (summary.total_proved, summary.total_unknown, summary.total_timed_out) = (1, 5, 1);
+            }
+            _ => {}
+        };
+        let defects = accounting_rows(&reread(&assertion_times_out));
+        assert!(defects.is_empty(), "the compiler's counters for it reconcile: {defects:?}");
+        let defects = accounting_rows(&reread(&|message| {
+            assertion_times_out(message);
+            if let trust_types::TransportMessage::CrateSummary(summary) = message {
+                summary.total_timed_out = 0;
+            }
+        }));
+        assert_eq!(defects.len(), 1, "{defects:?}");
+        assert_eq!(defects[0].0, "transport:crate-summary-accounting");
+        assert!(
+            defects[0]
+                .1
+                .ends_with("does not match function result rows: timed_out rows=1 summary=0"),
+            "{defects:?}"
+        );
+        // And an accounting row still makes the unit could-not-run (T9).
+        let refused = reread(&|message| {
+            if let trust_types::TransportMessage::CrateSummary(summary) = message {
+                summary.total_skipped = 0;
+            }
+        });
+        let unit =
+            crate::determinism_report::UnitDeterminism::of_rows(&refused.verification_results, &[]);
+        assert!(unit.could_not_run_line().is_some());
+
+        // Controls: the excuse is where it was. A raw `skipped` row in the
+        // discharge row's place is no `proved` discharge row, and a summary
+        // without the split is excused for it, in the function and the crate.
+        let skipped_instead = |message: &mut trust_types::TransportMessage| {
+            if let trust_types::TransportMessage::FunctionResult(envelope) = message {
+                let carrier = envelope.results.iter().any(is_proved_instance_discharge);
+                for row in &mut envelope.results {
+                    if is_proved_instance_discharge(row) {
+                        row.outcome = trust_types::Outcome::Skipped;
+                    }
+                }
+                if carrier {
+                    envelope.skipped = 0;
+                }
+            }
+        };
+        let mut legacy = with_declared(&envelope, [1, 0, 1, 0, 0, 0, 2]);
+        legacy.results[discharge].outcome = trust_types::Outcome::Skipped;
+        let legacy_rows = pipeline_rows(&legacy);
+        let mut observed = FunctionTransportCounts::default();
+        add_transport_result_counts(&mut observed, &legacy.results, &legacy_rows);
+        assert_eq!((observed.skipped, observed.assumed_discharge), (1, 0));
+        assert_eq!(function_transport_summary_defect(&legacy, &legacy_rows), None);
+        let defects = accounting_rows(&reread(&|message| {
+            skipped_instead(message);
+            if let trust_types::TransportMessage::CrateSummary(summary) = message {
+                summary.total_skipped = 0;
+            }
+        }));
+        assert!(
+            defects.is_empty(),
+            "a summary without the split, and no discharge row: {defects:?}"
+        );
+        // A timeout in a function with no discharge row, likewise.
+        let mut plain = with_declared(&envelope, [1, 0, 1, 0, 0, 0, 2]);
+        plain.results[discharge].outcome = trust_types::Outcome::Timeout;
+        assert_eq!(function_transport_summary_defect(&plain, &pipeline_rows(&plain)), None);
     }
 }

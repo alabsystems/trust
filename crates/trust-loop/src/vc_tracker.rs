@@ -9,7 +9,9 @@
 
 use std::collections::BTreeMap;
 
-use trust_types::{SourceSpan, VerificationCondition, VerificationResult};
+use trust_types::{VerificationCondition, VerificationResult};
+
+use crate::vc_slot_key;
 
 /// Status of a single verification condition in one iteration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +84,7 @@ impl VcTracker {
     }
 
     /// Record the status of a VC for a given iteration.
+    #[cfg(test)]
     pub(crate) fn record(&mut self, iteration: u32, vc_key: &str, status: VcStatus) {
         self.statuses.entry(vc_key.to_string()).or_default().push((iteration, status));
     }
@@ -95,7 +98,7 @@ impl VcTracker {
         for (vc, result) in results {
             let key = vc_slot_key(vc);
             let status = VcStatus::from_result(result);
-            self.record(iteration, &key, status);
+            self.statuses.entry(key).or_default().push((iteration, status));
         }
     }
 
@@ -108,18 +111,15 @@ impl VcTracker {
         let mut regressions = Vec::new();
 
         for (key, history) in &self.statuses {
-            if history.len() < 2 {
+            let len = history.len();
+            if len < 2 {
                 continue;
             }
 
-            let current = history.last();
-            let previous = history.iter().rev().nth(1);
+            let (curr_iter, curr_status) = history[len - 1];
+            let (_, prev_status) = history[len - 2];
 
-            if let (Some(&(curr_iter, curr_status)), Some(&(_, prev_status))) = (current, previous)
-                && curr_iter == iteration
-                && prev_status.is_proved()
-                && !curr_status.is_proved()
-            {
+            if curr_iter == iteration && prev_status.is_proved() && !curr_status.is_proved() {
                 regressions.push(RegressionEvent {
                     vc_key: key.clone(),
                     iteration,
@@ -138,43 +138,40 @@ impl VcTracker {
         let mut delta = VcDelta::default();
 
         for history in self.statuses.values() {
-            if history.is_empty() {
+            let len = history.len();
+            if len == 0 {
                 continue;
             }
 
-            let current = history.last();
-            let previous = history.iter().rev().nth(1);
+            let (curr_iter, curr_status) = history[len - 1];
+            if curr_iter != iteration {
+                delta.unchanged += 1;
+                continue;
+            }
 
-            match (current, previous) {
-                (Some(&(curr_iter, curr_status)), Some(&(_, prev_status)))
-                    if curr_iter == iteration =>
-                {
-                    if curr_status == prev_status {
-                        delta.unchanged += 1;
-                    } else if curr_status.is_proved() && !prev_status.is_proved() {
-                        delta.newly_proved += 1;
-                        delta.improvements += 1;
-                    } else if !curr_status.is_proved() && prev_status.is_proved() {
-                        delta.regressions += 1;
-                        if matches!(curr_status, VcStatus::Failed) {
-                            delta.newly_failed += 1;
-                        }
-                    } else if status_ordinal(curr_status) > status_ordinal(prev_status) {
-                        delta.improvements += 1;
-                    } else {
-                        delta.newly_failed += 1;
-                    }
-                }
-                (Some(&(curr_iter, curr_status)), None) if curr_iter == iteration => {
-                    // First observation for this VC.
-                    if curr_status.is_proved() {
-                        delta.newly_proved += 1;
-                    } else if matches!(curr_status, VcStatus::Failed) {
-                        delta.newly_failed += 1;
-                    }
-                }
-                _ => {
+            if len >= 2 {
+                let (_, prev_status) = history[len - 2];
+                if curr_status == prev_status {
                     delta.unchanged += 1;
+                } else if curr_status.is_proved() && !prev_status.is_proved() {
+                    delta.newly_proved += 1;
+                    delta.improvements += 1;
+                } else if !curr_status.is_proved() && prev_status.is_proved() {
+                    delta.regressions += 1;
+                    if matches!(curr_status, VcStatus::Failed) {
+                        delta.newly_failed += 1;
+                    }
+                } else if status_ordinal(curr_status) > status_ordinal(prev_status) {
+                    delta.improvements += 1;
+                } else {
+                    delta.newly_failed += 1;
+                }
+            } else {
+                // First observation for this VC.
+                if curr_status.is_proved() {
+                    delta.newly_proved += 1;
+                } else if matches!(curr_status, VcStatus::Failed) {
+                    delta.newly_failed += 1;
                 }
             }
         }
@@ -194,21 +191,9 @@ fn status_ordinal(status: VcStatus) -> u8 {
     }
 }
 
-/// Compute the slot key for a VC (matches the key format in lib.rs).
-pub(crate) fn vc_slot_key(vc: &VerificationCondition) -> String {
-    format!("{}|{}|{}", vc.function, span_key(&vc.location), vc.kind.description())
-}
-
-fn span_key(span: &SourceSpan) -> String {
-    format!(
-        "{}:{}:{}:{}:{}",
-        span.file, span.line_start, span.col_start, span.line_end, span.col_end
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use trust_types::{Formula, ProofStrength, Sort, VcKind};
+    use trust_types::{Formula, ProofStrength, Sort, SourceSpan, VcKind};
 
     use super::*;
 

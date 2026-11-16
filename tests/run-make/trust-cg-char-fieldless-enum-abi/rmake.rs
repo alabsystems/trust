@@ -26,12 +26,13 @@
 //! widening past the extension contract fails here rather than being mistaken
 //! for "enums are not supported yet".
 //!
-//! THE GENERIC CLAUSE. `trust_ir_of` lowers a body PRE-monomorphization, so an
-//! instance carrying type or const arguments is refused. A REGION argument
-//! substitutes nothing that exists at runtime — codegen erases regions, and
-//! rustc mangles one symbol for the whole family — so a lifetime-only instance
-//! is that body's only IR and is admitted. One type argument and the refusal is
-//! back.
+//! THE GENERIC CLAUSE. `trust_ir_of` lowers a body PRE-monomorphization. A
+//! REGION argument substitutes nothing that exists at runtime — codegen erases
+//! regions, and rustc mangles one symbol for the whole family — so a
+//! lifetime-only instance is that body's only IR and is admitted. One type
+//! argument is a real monomorphization: since step 2 increment 3 the instance
+//! lane lowers it at its arguments (keyed on `ty::Instance`) instead of
+//! refusing it, and step (4) pins that too.
 //!
 //! APPLE-ONLY / AARCH64-ONLY for the same reason as
 //! `trust-cg-abi-extension-refusal`: `arg_ext` is written for AArch64 only under
@@ -187,10 +188,20 @@ fn main() {
     f1.assert_stderr_contains("1 [PROVED]");
     f1.assert_stderr_contains("0 refuted");
 
-    // ... while ONE TYPE ARGUMENT, on the SAME shape, is a real
-    // monomorphization again and stays refused for the pre-monomorphization
-    // reason and nothing vaguer. `S<'a>` and `G<T>` differ only in what the
-    // parameter is, so this contrast isolates region-vs-type.
+    // ... and ONE TYPE ARGUMENT, on the SAME shape, is a real monomorphization.
+    // `S<'a>` and `G<T>` differ only in what the parameter is, so this contrast
+    // isolates region-vs-type.
+    //
+    // RE-PINNED 2026-09-29 (step 2 increment 3), and the pin FLIPPED on purpose.
+    // Until then this step pinned the REFUSAL: `[generic-instance]` for
+    // `G::<u32>::tag` (args [u32]) — the identity body lowered
+    // pre-monomorphization was not this instance's IR — plus a
+    // `[converter-refused]` `Call` for `force`, whose assembled body called a
+    // bodyless declaration. The instance lane now lowers `G::<u32>::tag` AT ITS
+    // ARGUMENTS (keyed on `ty::Instance`), splices it into the codegen module,
+    // and relinks `force`'s call edge to it, so both functions complete and
+    // both ship `[PROVED]` under the default strict gate. The lifetime twin
+    // above still completes for its own, unrelated reason.
     rfs::write(
         "gt.rs",
         "#![crate_name = \"gt\"]\n\
@@ -201,25 +212,31 @@ fn main() {
          pub fn force(g: &G<u32>) -> u32 { g.tag() }\n",
     );
 
-    let refused = trust_ir_frontend("gt.rs", "out_gt_f1").run_fail();
-    refused.assert_stderr_contains("instance carries generic arguments `[u32]`");
-    refused.assert_stderr_contains("lowers the body pre-monomorphization");
+    let spliced = trust_ir_frontend("gt.rs", "out_gt_f1").run();
+    spliced.assert_stderr_contains("trust-cg trust-ir frontend: 2/2 reachable function(s) completed");
+    spliced.assert_stderr_contains("2 [PROVED]");
+    spliced.assert_stderr_contains("0 refuted");
+    spliced.assert_stderr_not_contains("[generic-instance]");
+    spliced.assert_stderr_not_contains("[converter-refused]");
 
     // ---------------------------------------------------------------------
     // (5) THE OBJECTS ARE REAL. A gate verdict about bytes nobody executes
     //     proves the gate agrees with itself and nothing else. Link the
-    //     F1-emitted char library and the F1-emitted enum library into one
-    //     executable and RUN it.
+    //     F1-emitted char library, the F1-emitted enum library and the
+    //     F1-emitted generic-instance library (`G::<u32>::tag` reached through
+    //     `force`, the shape row (4) now ships) into one executable and RUN it.
     // ---------------------------------------------------------------------
     rfs::write(
         "driver.rs",
         "extern crate charm;\n\
          extern crate three;\n\
+         extern crate gt;\n\
          fn main() {\n\
          \x20   println!(\"{}\", charm::cval('A'));\n\
          \x20   println!(\"{}\", charm::cid('\\u{1f600}') as u32);\n\
          \x20   println!(\"{}\", three::three_z() as u32);\n\
          \x20   println!(\"{}\", three::three_id(three::Three::Y) as u32);\n\
+         \x20   println!(\"{}\", gt::force(&gt::G(5u32)));\n\
          }\n",
     );
     let mut link = rustc();
@@ -230,16 +247,43 @@ fn main() {
         .arg("-Ztrust-verify=off")
         .extern_("charm", "out_char_f1/libcharm.rlib")
         .extern_("three", "out_three_f1/libthree.rlib")
+        .extern_("gt", "out_gt_f1/libgt.rlib")
         .library_search_path("out_char_f1")
         .library_search_path("out_three_f1")
+        .library_search_path("out_gt_f1")
         .output("driver");
     link.run();
 
     let ran = run_make_support::cmd("./driver").run();
     assert_eq!(
         ran.stdout_utf8().lines().collect::<Vec<_>>(),
-        // 'A' == 65; U+1F600 == 128512; Three::Z == 2; Three::Y == 1.
-        vec!["65", "128512", "2", "1"],
-        "the F1-emitted char/enum functions returned the wrong values when actually executed"
+        // 'A' == 65; U+1F600 == 128512; Three::Z == 2; Three::Y == 1; G::<u32>::tag == 7.
+        vec!["65", "128512", "2", "1", "7"],
+        "the F1-emitted char/enum/generic-instance functions returned the wrong values when \
+         actually executed"
     );
+
+    // ---------------------------------------------------------------------
+    // (6) A generic `&self` method that READS the field through the reference
+    //     is NOT shipped today: `G::<u32>::tag` above ignores `self`, so row (5)
+    //     cannot see a mishandled `&self`, and the shape that would see it is
+    //     refused fail-closed by the instance-keyed producer. Pinned as a NAMED
+    //     refusal, so the day it ships this row flips to executing `force_h(&H(5))`
+    //     and expecting 6.
+    // ---------------------------------------------------------------------
+    rfs::write(
+        "ht.rs",
+        "#![crate_name = \"ht\"]\n\
+         pub struct H<T>(pub T);\n\
+         impl<T: Copy> H<T> {\n\
+         \x20   pub fn get(&self) -> T { self.0 }\n\
+         }\n\
+         pub fn force_h(h: &H<u64>) -> u64 { h.get() ^ 3 }\n",
+    );
+    let refused = trust_ir_frontend("ht.rs", "out_ht_f1").run_fail();
+    refused.assert_stderr_contains("0/2 reachable function(s) completed");
+    refused.assert_stderr_contains("1HyE3getB2_`: instance producer refused");
+    refused.assert_stderr_contains("ProducerDeclined");
+    refused.assert_stderr_contains("[instance-assembly]");
+    assert!(!std::path::Path::new("out_ht_f1/libht.rlib").exists(), "nothing ships");
 }

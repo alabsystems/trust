@@ -9,8 +9,10 @@ download-rustc = false
 
 [build]
 # Trust: tools contributors need the same linked local toolchain surface.
+# `rust-src` is install.rs's selector for the standard-library source
+# component; upstream 162423 retired `src`, which now selects nothing.
 extended = true
-tools = ["targo", "targo-trust", "trustdoc", "tippy", "trustfmt", "trust-analyzer", "trust-miri", "trustc-dev", "src", "trust-llvm-tools", "clean", "ty"]
+tools = ["targo", "targo-trust", "trustdoc", "tippy", "trustfmt", "trust-analyzer", "trust-miri", "trustc-dev", "rust-src", "trust-llvm-tools", "clean", "ty"]
 # cargo and clippy tests don't pass on stage 1
 test-stage = 2
 # Document with the in-tree rustdoc by default, since `download-rustc` makes it quick to compile.

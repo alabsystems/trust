@@ -12,5 +12,6 @@ use trust_prime_boundary::emit_distinct_native_parameters;
 // one exact HIR identity, so the whole contract bundle must be rejected.
 emit_distinct_native_parameters!();
 //~^ ERROR parameters named `bound` have distinct hygienic identities
+//~| ERROR parameter `bound` and a contract clause of this function have different macro hygiene
 
 fn main() {}

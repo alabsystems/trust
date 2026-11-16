@@ -254,9 +254,13 @@ impl CertificateRegistry {
 
         // Collect aged-out certificates
         if policy.max_age_secs > 0 {
-            // We use a simple ordering comparison on timestamps
+            // Trust: Use actual system time instead of hardcoded reference epoch.
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             for (id, cert) in &self.certificates {
-                if is_expired(&cert.timestamp, policy.max_age_secs) {
+                if is_expired_at(&cert.timestamp, policy.max_age_secs, now_epoch) {
                     to_remove.insert(id.clone());
                 }
             }
@@ -352,13 +356,21 @@ impl CertificateRegistry {
         let storage_bytes =
             self.certificates.values().filter_map(|c| c.to_json().ok()).map(|j| j.len()).sum();
 
-        // Find oldest and newest timestamps
-        let mut timestamps: Vec<&str> =
-            self.certificates.values().map(|c| c.timestamp.as_str()).collect();
-        timestamps.sort();
+        // Find oldest and newest timestamps in a single pass
+        let mut oldest: Option<&str> = None;
+        let mut newest: Option<&str> = None;
+        for cert in self.certificates.values() {
+            let ts = cert.timestamp.as_str();
+            if oldest.is_none_or(|o| ts < o) {
+                oldest = Some(ts);
+            }
+            if newest.is_none_or(|n| ts > n) {
+                newest = Some(ts);
+            }
+        }
 
-        let oldest_timestamp = timestamps.first().map(|s| (*s).to_string());
-        let newest_timestamp = timestamps.last().map(|s| (*s).to_string());
+        let oldest_timestamp = oldest.map(str::to_string);
+        let newest_timestamp = newest.map(str::to_string);
 
         RegistryStats {
             total_certificates,
@@ -383,9 +395,7 @@ impl CertificateRegistry {
 
     /// Get all unique function names in the registry.
     pub fn function_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.fn_index.keys().cloned().collect();
-        names.sort();
-        names
+        self.fn_index.keys().cloned().collect()
     }
 
     /// Internal: remove an entry by registry ID string, cleaning up all indexes.
@@ -422,14 +432,9 @@ impl Default for CertificateRegistry {
     }
 }
 
-/// Check if a timestamp is older than max_age_secs from the current system time.
-fn is_expired(timestamp: &str, max_age_secs: u64) -> bool {
+/// Check if a timestamp is older than max_age_secs from `now_epoch`.
+fn is_expired_at(timestamp: &str, max_age_secs: u64, now_epoch: u64) -> bool {
     let epoch = parse_timestamp_epoch(timestamp).unwrap_or(0);
-    // Trust: Use actual system time instead of hardcoded reference epoch.
-    let now_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     now_epoch.saturating_sub(epoch) > max_age_secs
 }
 

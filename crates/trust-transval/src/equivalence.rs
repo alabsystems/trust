@@ -74,16 +74,21 @@ impl EquivalenceVcGenerator {
         source_block_id: BlockId,
         target_block_id: BlockId,
     ) -> Result<Vec<VerificationCondition>, TransvalError> {
-        let all_vcs = self.generate(source, target, relation)?;
+        let refinement_vcs = generate_refinement_vcs(source, target, relation)?;
+        let source_pat = format!("{source_block_id:?}");
+        let target_pat = format!("{target_block_id:?}");
 
-        let filtered: Vec<VerificationCondition> = all_vcs
-            .into_iter()
-            .filter(|vc| {
-                // Filter by the block pair encoded in the VC description.
-                let desc = vc.kind.description();
-                desc.contains(&format!("{source_block_id:?}"))
-                    && desc.contains(&format!("{target_block_id:?}"))
+        let filtered: Vec<VerificationCondition> = refinement_vcs
+            .iter()
+            .filter(|rvc| {
+                if self.skip_termination && rvc.check.kind == CheckKind::Termination {
+                    return false;
+                }
+                // Filter by the block pair encoded in the VC description before allocating the VC.
+                rvc.check.description.contains(&source_pat)
+                    && rvc.check.description.contains(&target_pat)
             })
+            .map(|rvc| rvc.to_vc())
             .collect();
 
         Ok(filtered)
@@ -94,7 +99,13 @@ impl EquivalenceVcGenerator {
     pub fn classify_vcs(vcs: &[VerificationCondition]) -> VcClassification {
         let mut classification = VcClassification::default();
         for vc in vcs {
-            let desc = vc.kind.description();
+            let desc_cow: std::borrow::Cow<'_, str> = match &vc.kind {
+                VcKind::TranslationValidation { check, .. } => {
+                    std::borrow::Cow::Borrowed(check.as_str())
+                }
+                _ => std::borrow::Cow::Owned(vc.kind.description()),
+            };
+            let desc = desc_cow.as_ref();
             if desc.contains("ControlFlow") {
                 classification.control_flow += 1;
             } else if desc.contains("DataFlow") {
@@ -153,6 +164,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

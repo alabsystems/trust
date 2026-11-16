@@ -1,0 +1,617 @@
+{
+  "name": "f",
+  "def_path": "x1_preexisting::f",
+  "span": {
+    "file": "build/tmp/fix101/p/x1_preexisting.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 4,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": "c"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "k"
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "build/tmp/fix101/p/x1_preexisting.rs",
+              "line_start": 2,
+              "col_start": 15,
+              "line_end": 2,
+              "col_end": 16
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<u8>::len",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "build/tmp/fix101/p/x1_preexisting.rs",
+              "line_start": 2,
+              "col_start": 19,
+              "line_end": 2,
+              "col_end": 26
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 14479688825502407834,
+              "def_index": 8821,
+              "substs_digest": [
+                608817584483453383,
+                7912895214975474668
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 14479688825502407834,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix101/p/x1_preexisting.rs",
+                "line_start": 2,
+                "col_start": 36,
+                "line_end": 2,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix101/p/x1_preexisting.rs",
+                "line_start": 3,
+                "col_start": 7,
+                "line_end": 3,
+                "col_end": 8
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix101/p/x1_preexisting.rs",
+                "line_start": 3,
+                "col_start": 7,
+                "line_end": 3,
+                "col_end": 12
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "build/tmp/fix101/p/x1_preexisting.rs",
+              "line_start": 3,
+              "col_start": 7,
+              "line_end": 3,
+              "col_end": 12
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix101/p/x1_preexisting.rs",
+                "line_start": 3,
+                "col_start": 17,
+                "line_end": 3,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix101/p/x1_preexisting.rs",
+                "line_start": 3,
+                "col_start": 17,
+                "line_end": 3,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 10,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 5,
+            "span": {
+              "file": "build/tmp/fix101/p/x1_preexisting.rs",
+              "line_start": 3,
+              "col_start": 17,
+              "line_end": 3,
+              "col_end": 22
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 10,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix101/p/x1_preexisting.rs",
+                "line_start": 3,
+                "col_start": 17,
+                "line_end": 3,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<alloc::vec::Vec<u8> as core::ops::index::Index<usize>>::index",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 8,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 7,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "build/tmp/fix101/p/x1_preexisting.rs",
+              "line_start": 3,
+              "col_start": 16,
+              "line_end": 3,
+              "col_end": 23
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 39089,
+              "substs_digest": [
+                7195365915503386891,
+                11136072340493136461
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 7,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix101/p/x1_preexisting.rs",
+                "line_start": 3,
+                "col_start": 15,
+                "line_end": 3,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 8
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix101/p/x1_preexisting.rs",
+                "line_start": 3,
+                "col_start": 33,
+                "line_end": 3,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 8
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

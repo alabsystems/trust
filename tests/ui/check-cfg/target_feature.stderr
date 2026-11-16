@@ -28,7 +28,6 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `amx-fp8`
 `amx-int8`
 `amx-movrs`
-`amx-tf32`
 `amx-tile`
 `apxf`
 `atomics`
@@ -212,6 +211,8 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `miscsr`
 `mops`
 `movbe`
+`movdir64b`
+`movdiri`
 `movrs`
 `movw`
 `mp`
@@ -411,6 +412,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `vector-packed-decimal-enhancement-2`
 `vector-packed-decimal-enhancement-3`
 `vfp2`
+`vfp2sp`
 `vfp3`
 `vfp4`
 `vh`
@@ -480,6 +482,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `zksed`
 `zksh`
 `zkt`
+`zmmul`
 `zreg`
 `ztso`
 `zvbb`

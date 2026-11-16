@@ -1,0 +1,14 @@
+error: Clean-origin definition `clean_origin_wf_lib_aux::m::countdownSum` cannot be called from another crate: `clean_origin_wf_lib_aux` exported no certificate for `countdownSum`
+  --> $DIR/auxiliary/clean_origin_wf_lib_aux.rs:40:9
+   |
+LL |         def countdownSum (n : Nat) : Nat := if h : 0 < n then n + countdownSum (n - 1) else 0
+   |         ^^^
+   |
+   = note: `countdownSum` is callable inside the crate that defines it — the faithfulness gate admitted its emitted body there, by WellFoundedFunctionalDefeq — but that evidence form has no wire tag in the Clean-origin certificate format yet. It rests on facts taken in the defining crate's own Clean environment (a per-equation or functional-layer judgment, the declaration's own decrease proofs, an axiom-closure audit) that the certificate has no field for, and spelling it as whole-term definitional equality or induction would tell this crate a judgment happened that never did. The defining crate therefore exported a non-exportable notice instead of a certificate, and without a certificate this compiler serves no body for `countdownSum`: it cannot be called, const-evaluated or linked from here. This is a measured boundary of the compiler, not a rule about what you may write (ruling v7/D2).
+           options:
+           - call `countdownSum` from an ordinary `pub fn` in its defining crate and call that wrapper from here — the wrapper is compiled where the local gate already admitted `countdownSum` (keep the wrapper non-generic and without `#[inline]`, or its body is instantiated in this crate and lands here again);
+           - restate `countdownSum` in a shape whose evidence has a wire tag: a non-recursive body, or a structural recursion the induction lane proves — both export today;
+           - keep `countdownSum` proof-only and cite it from theorems and contracts in its defining crate, which needs no certificate.
+
+error: aborting due to 1 previous error
+

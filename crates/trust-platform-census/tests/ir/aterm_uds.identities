@@ -1,0 +1,25 @@
+# Identities for aterm_uds.trust_ir (the measurement's dump of aterm-uds at
+# aterm 4ba80b2b6, stage1 trustc 771983b92). Name-only identities except:
+# local foreign items the producer minted rustcc (increment S2), and local
+# bodies the producer refused (they appear as bodyless declarations).
+foreign process::kill_self_now::getpid getpid
+foreign process::kill_self_now::kill kill
+foreign process::pid_alive::kill kill
+foreign peer::our_uid::geteuid geteuid
+foreign process::boot_clock_now::mach_absolute_time mach_absolute_time
+refused spawnfd::darwin_strip::mark_listed
+refused spawnfd::descriptor_bound
+refused spawnfd::LaneChild::reap
+refused spawnfd::kill
+refused holders::read_table
+refused hangup::fd_peer_closed
+refused control_socket_dir_inner
+refused fdpass::scm::recv_with_fds
+refused fdpass::scm::abi::peer_pid
+# The HIR sites of the product spawn bodies, read from aterm-uds's source at
+# 4ba80b2b6 (the producer refused every one of these bodies). Not a full HIR
+# site census: the descriptor-number sites of the spliced bodies are not
+# listed, so they read PC-CENSUS-SKEW.
+site spawnfd::platform::spawn 709:25=posix_spawn 718:21=posix_spawn
+site pspawn::spawn_cloexec_default 118:12=posix_spawn
+site spawnfd::darwin_strip::mark_listed 1101:20=fcntl

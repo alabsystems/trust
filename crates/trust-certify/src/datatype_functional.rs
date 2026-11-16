@@ -377,39 +377,41 @@ pub fn wrong_rhs_refl_proof() -> Expr {
 /// the correspondence drift away from the typed VC actually emitted.
 #[must_use]
 pub fn sort_arm_functional_vc_formula() -> trust_types::Formula {
-    use trust_types::{Formula, Sort};
+    use trust_types::{Formula, Sort, datatype_selector_name as sel};
 
+    // Selector names are variant-qualified exactly as `Sort::from_ty` declares
+    // them (`Succ.0`, not the `0` every tuple variant shares).
     let level_ref = Sort::Datatype { name: "Level".to_string(), constructors: Vec::new() };
     let exprkind_ref = Sort::Datatype { name: "ExprKind".to_string(), constructors: Vec::new() };
     let level_sort = Sort::Datatype {
         name: "Level".to_string(),
         constructors: vec![
             ("Zero".to_string(), vec![]),
-            ("Succ".to_string(), vec![("0".to_string(), level_ref.clone())]),
+            ("Succ".to_string(), vec![(sel("Succ", "0"), level_ref.clone())]),
             (
                 "Max".to_string(),
-                vec![("0".to_string(), level_ref.clone()), ("1".to_string(), level_ref.clone())],
+                vec![(sel("Max", "0"), level_ref.clone()), (sel("Max", "1"), level_ref.clone())],
             ),
             (
                 "IMax".to_string(),
-                vec![("0".to_string(), level_ref.clone()), ("1".to_string(), level_ref.clone())],
+                vec![(sel("IMax", "0"), level_ref.clone()), (sel("IMax", "1"), level_ref.clone())],
             ),
-            ("Param".to_string(), vec![("0".to_string(), Sort::BitVec(64))]),
+            ("Param".to_string(), vec![(sel("Param", "0"), Sort::BitVec(64))]),
         ],
     };
     let exprkind_sort = Sort::Datatype {
         name: "ExprKind".to_string(),
         constructors: vec![
-            ("BVar".to_string(), vec![("0".to_string(), Sort::BitVec(32))]),
-            ("Sort".to_string(), vec![("0".to_string(), level_ref)]),
-            ("Const".to_string(), vec![("0".to_string(), Sort::BitVec(64))]),
+            ("BVar".to_string(), vec![(sel("BVar", "0"), Sort::BitVec(32))]),
+            ("Sort".to_string(), vec![(sel("Sort", "0"), level_ref)]),
+            ("Const".to_string(), vec![(sel("Const", "0"), Sort::BitVec(64))]),
         ],
     };
     let expr_sort = Sort::Datatype {
         name: "Expr".to_string(),
         constructors: vec![(
             "Expr".to_string(),
-            vec![("kind".to_string(), exprkind_ref), ("meta".to_string(), Sort::BitVec(64))],
+            vec![(sel("Expr", "kind"), exprkind_ref), (sel("Expr", "meta"), Sort::BitVec(64))],
         )],
     };
     let meta_sort = Sort::BitVec(64);
@@ -459,7 +461,8 @@ fn build_functional_env() -> Option<Environment> {
 /// Full kernel re-check (`infer_only = false`) that `term : goal` in the empty
 /// closed context.
 fn kernel_checks_goal(env: &Environment, term: &Expr, goal: &Expr) -> bool {
-    TypeChecker::with_context(env, LocalContext::new()).check_type(term, goal).is_ok()
+    crate::kernel_stop::check_type(TypeChecker::with_context(env, LocalContext::new()), term, goal)
+        .is_ok()
 }
 
 /// SHA-256 lineage digest binding the term, the empty closed context, and the

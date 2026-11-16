@@ -894,7 +894,9 @@ LINKED_TRUSTC="$(isolated_rustup which --toolchain "$TOOLCHAIN_NAME" trustc)"
 
 if [ "$SET_DEFAULT" = "1" ]; then
     isolated_rustup default "$TOOLCHAIN_NAME"
-    DEFAULT_SYSROOT="$(isolated_env "$PROXY_BIN/rustc" --print sysroot)"
+    # From / : in the checkout the root rust-toolchain.toml (channel = "trust",
+    # 2026-09-28) would answer this probe, not the default under test.
+    DEFAULT_SYSROOT="$(cd / && isolated_env "$PROXY_BIN/rustc" --print sysroot)"
     [ "$(canonical_dir "$DEFAULT_SYSROOT")" = "$INSTALLED_SYSROOT" ] \
         || fail "isolated default rustc proxy escaped installed sysroot: $DEFAULT_SYSROOT"
 fi

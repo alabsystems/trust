@@ -22,17 +22,17 @@ non_snake_case_packages = "warn"
         .file("src/lib.rs", "")
         .build();
 
-    foo.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints", "test-dummy-unstable"])
+    foo.cargo("fetch")
+        .masquerade_as_nightly_cargo(&["test-dummy-unstable"])
         .with_stderr_data(str![[r#"
-[WARNING] packages should have a snake-case name
+[WARNING] package `foo-bar` should have a snake-case name
  --> Cargo.toml:3:8
   |
 3 | name = "foo-bar"
   |        ^^^^^^^^^
   |
   = [NOTE] `cargo::non_snake_case_packages` is set to `warn` in `[lints]`
-[HELP] to change the package name to snake case, convert `package.name`
+[HELP] to change the package name to `foo_bar`, convert `package.name`
   |
 3 - name = "foo-bar"
 3 + name = "foo_bar"
@@ -58,15 +58,16 @@ fn main() {}"#,
         )
         .build();
 
-    p.cargo("fetch -Zcargo-lints -Zscript --manifest-path foo-bar")
-        .masquerade_as_nightly_cargo(&["cargo-lints", "script"])
+    p.cargo("fetch --manifest-path foo-bar")
+        .arg("-Zscript")
+        .masquerade_as_nightly_cargo(&["script"])
         .with_stderr_data(str![[r#"
 [WARNING] `package.edition` is unspecified, defaulting to the latest edition (currently `[..]`)
 [HELP] to pin the edition, run `cargo fix --manifest-path [ROOT]/foo/foo-bar`
-[WARNING] packages should have a snake-case name
+[WARNING] package `foo-bar` should have a snake-case name
  --> foo-bar
   = [NOTE] `cargo::non_snake_case_packages` is set to `warn` in `[lints]`
-[HELP] to change the package name to snake case, convert the file stem
+[HELP] to change the package name to `foo_bar`, convert the file stem
   |
 1 - [ROOT]/foo/foo-bar
 1 + [ROOT]/foo/foo_bar

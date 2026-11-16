@@ -4,13 +4,12 @@ use std::ops::{Range, RangeFrom};
 use std::{debug_assert_matches, iter};
 
 use rustc_abi::{ExternAbi, FieldIdx};
-use rustc_data_structures::thin_vec::ThinVec;
-use rustc_hir::attrs::{InlineAttr, OptimizeAttr};
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_attr_ir::{InlineAttr, OptimizeAttr};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_index::Idx;
 use rustc_index::bit_set::DenseBitSet;
-use rustc_middle::bug;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
@@ -18,13 +17,13 @@ use rustc_middle::ty::{
     self, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TypeFlags, TypeVisitableExt, Unnormalized,
 };
 use rustc_session::config::{DebugInfo, OptLevel};
-use rustc_span::Spanned;
+use rustc_span::{Spanned, bug};
 use tracing::{debug, instrument, trace, trace_span};
 
 use crate::cost_checker::{CostChecker, is_call_like};
 use crate::simplify::{UsedInStmtLocals, simplify_cfg};
 use crate::validate::validate_types;
-use crate::{check_inline, util};
+use crate::{PassPolicy, check_inline, util};
 
 pub(crate) mod cycle;
 
@@ -44,18 +43,21 @@ struct CallSite<'tcx> {
 pub struct Inline;
 
 impl<'tcx> crate::MirPass<'tcx> for Inline {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        if let Some(enabled) = sess.opts.unstable_opts.inline_mir {
-            return enabled;
-        }
-
-        match sess.mir_opt_level() {
-            0 | 1 => false,
-            2 => {
-                (sess.opts.optimize == OptLevel::More || sess.opts.optimize == OptLevel::Aggressive)
-                    && sess.opts.incremental == None
-            }
-            _ => true,
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        match ctx.opts.unstable_opts.inline_mir {
+            Some(enabled) => PassPolicy::optional(enabled),
+            None => PassPolicy::optional(match ctx.mir_opt_level() {
+                0 | 1 => false,
+                // Only inline for `-Copt-level >= 2`, and don't inline
+                // in incremental mode to increase incremental effectiveness.
+                // FIXME: This should be cleaned up to not rely on inspecting the global opt level.
+                2 => {
+                    (ctx.opts.optimize == OptLevel::More
+                        || ctx.opts.optimize == OptLevel::Aggressive)
+                        && ctx.opts.incremental.is_none()
+                }
+                _ => true,
+            }),
         }
     }
 
@@ -66,10 +68,6 @@ impl<'tcx> crate::MirPass<'tcx> for Inline {
             debug!("running simplify cfg on {:?}", body.source);
             simplify_cfg(tcx, body);
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -82,16 +80,9 @@ impl ForceInline {
 }
 
 impl<'tcx> crate::MirPass<'tcx> for ForceInline {
-    fn is_enabled(&self, _: &rustc_session::Session) -> bool {
-        true
-    }
-
-    fn can_be_overridden(&self) -> bool {
-        false
-    }
-
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Forced inlining is part of MIR semantics.
+        PassPolicy::Required
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -354,11 +345,7 @@ impl<'tcx> Inliner<'tcx> for NormalInliner<'tcx> {
         // Avoid inlining into coroutines, since their `optimized_mir` is used for layout computation,
         // which can create a cycle, even when no attempt is made to inline the function in the other
         // direction.
-        if body.coroutine.is_some() {
-            return false;
-        }
-
-        true
+        body.coroutine.is_none()
     }
 
     #[instrument(level = "debug", skip(self, callee_body))]
@@ -532,6 +519,13 @@ fn process_blocks<'tcx, I: Inliner<'tcx>>(
             }
             Ok(new_blocks) => {
                 debug!("inlined {}", callsite.callee);
+                // Trust: `TRUST_MIR_INLINE_TRACE=1` prints each inline of a verifying
+                // session (observability only; `trust_verify/requires_callee_inlining.rs`).
+                crate::trust_verify::requires_callee_inlining::trace_inlined(
+                    inliner.tcx(),
+                    caller_body,
+                    callsite.callee,
+                );
                 inliner.on_inline_success(&callsite, caller_body, new_blocks);
             }
         }
@@ -552,6 +546,11 @@ fn resolve_callsite<'tcx, I: Inliner<'tcx>>(
     if let TerminatorKind::Call { ref func, fn_span, .. } = terminator.kind {
         let func_ty = func.ty(caller_body, tcx);
         if let ty::FnDef(def_id, args) = *func_ty.kind() {
+            if !inliner.should_inline_for_callee(def_id) {
+                debug!("not enabled");
+                return None;
+            }
+
             // Trust (E6 S3/S4 release parity): verification consumes the exact
             // compiler-authenticated identity of core integer `wrapping_*`
             // calls. MIR inlining erases that identity and leaves an ordinary
@@ -562,22 +561,94 @@ fn resolve_callsite<'tcx, I: Inliner<'tcx>>(
             // no proof authority to excluded operations/carriers: they remain
             // calls and fail closed downstream. LLVM may still inline them
             // after verification.
-            if crate::trust_verify::verification_enabled(tcx.sess)
-                && trust_mir_extract::tcx_is_authenticated_core_integer_wrapping_method(tcx, def_id)
+            // Trust (TG14): declared kernel obligations are mandatory with
+            // verification off as well. Preserve modeled checked calls too:
+            // inlining can otherwise expose unchecked arithmetic guarded by
+            // library control flow and erase the Option producer identity.
+            if trust_mir_extract::tcx_is_authenticated_e6_arithmetic_method(tcx, def_id)
+                || (crate::trust_verify::verification_enabled(tcx.sess)
+                    && trust_mir_extract::tcx_is_authenticated_core_integer_wrapping_method(
+                        tcx, def_id,
+                    ))
             {
                 debug!("preserving authenticated core wrapping call for Trust verification");
                 return None;
             }
 
-            if !inliner.should_inline_for_callee(def_id) {
-                debug!("not enabled");
+            // Trust (W5, 2026-10-01): a callee that carries a Trust `requires` is never
+            // MIR-inlined in a verifying session. Its precondition is charged at the
+            // `Call`, and its own body may have had runtime checks elided because they
+            // were proved UNDER that `requires`; inlining dropped both, so
+            // `callee(200)` against `requires x < 100` compiled and returned 44 at
+            // `-Zinline-mir=yes`, at `-Copt-level=2 -Zmir-opt-level=2` and at
+            // `-Zmir-opt-level=3` (MEASURED on stage 1 `30387be11`; docs/KNOWN_HAZARDS.md,
+            // "under explicit `-Zinline-mir`"). Checked on the static callee here and
+            // on the resolved instance below. LLVM may still inline it after
+            // verification, once the call site has been checked.
+            //
+            // Trust (2026-10-02): except a `#[rustc_force_inline]` callee, which falls
+            // through to `try_inlining` and its L3 guard `keep_call_owing_requires`.
+            // `None` here hid the site from `ForceInliner`, which reports a failure only
+            // for a site `try_inlining` refuses, so the forced call was kept with no
+            // error and `validate.rs` ICEd on it ("`#[rustc_force_inline]`-annotated
+            // function not inlined") whenever the caller's verification raised no error
+            // first. The L3 guard reads the same bundle's `requires` clauses (and a local
+            // def's HIR clause attributes), so it keeps the call too, with `ForceInline`'s
+            // error under every proof-claiming policy; under advisory it warns and lets
+            // the forced inline proceed (`trust_verify/requires_callee_inlining.rs`).
+            if crate::trust_verify::verification_enabled(tcx.sess)
+                && crate::trust_verify::callee_carries_trust_requires(tcx, def_id)
+                && !ForceInline::should_run_pass_for_callee(tcx, def_id)
+            {
+                debug!("preserving a call to a Trust `requires` callee for verification");
+                // Trust (2026-09-30, L3, merged): `TRUST_MIR_INLINE_TRACE=1` names the
+                // kept call when this inliner would otherwise have considered it
+                // (observability only; `trust_verify/requires_callee_inlining.rs`).
+                crate::trust_verify::requires_callee_inlining::trace_kept_call(
+                    tcx,
+                    caller_body,
+                    def_id,
+                );
+                return None;
+            }
+
+            // Trust (plan step 3.3, docs/design/2026-10-02-step3-lean-through-trust-ir.md §5.4):
+            // under `-Ztrust-cg-frontend=trust-ir` (F1) a Clean-origin body is never MIR-inlined
+            // into its Rust caller, so at `-O` the Clean def stays a call in the caller's MIR and
+            // its own mono item, which F1 refuses by name (`[clean-below-gate]`) and whose
+            // neighbours the collector reads from its published trust-ir row. Without this the
+            // inliner copies the def's `clean_origin_mir` body (and the `u64::wrapping_add` it
+            // calls, inlined in turn) into the caller's MIR: the def drops out of the inventory,
+            // and F1, which lowers the caller from THIR where the call remains, refuses the
+            // caller only for a callee with no handoff body (measured at `-Copt-level=2` by the
+            // step-3 review). F1 lowers this crate's bodies from THIR, never from this MIR, so
+            // the guard changes which items F1 sees, not its bytes. Two other effects, both the
+            // path `-Copt-level=0` always takes: `TrustVerify` runs after `Inline`, so where the
+            // inliner runs in a verifying session (an explicit `-Zinline-mir` or
+            // `-Zmir-opt-level`; the default is capped at 1) a Rust caller is verified against a
+            // call to the Clean def instead of its inlined copy; and the optimized MIR this crate
+            // exports in metadata keeps the call. `-Ztrust-cg-frontend` is a TRACKED option. It
+            // reads only the flag: an LLVM-backend compile given it keeps the call too
+            // (performance only). Without the flag nothing changes. The guard is LOCAL-ONLY (`as_local`): an IMPORTED Clean-origin
+            // def is still inlined into a local caller at `-O`, which makes that caller a
+            // cross-crate-inlinable leaf, so F1 may reach no item at all (measured by the step-3
+            // review: 0/0 completed, rc=0, no code emitted); a downstream F1 compile on
+            // `-Ztrust-ir-upstream-mir` refuses that inlined body by name (`CleanRole::Inlines`).
+            // Cross-crate Clean bodies are increment 6.
+            if tcx.sess.trust_cg_frontend_is_trust_ir()
+                && let Some(local) = def_id.as_local()
+                && crate::clean_origin_mir::is_clean_origin(tcx, local)
+            {
+                debug!("preserving a call to a Clean-origin def on the F1 lane");
                 return None;
             }
 
             // To resolve an instance its args have to be fully normalized.
             let args = tcx
                 .try_normalize_erasing_regions(inliner.typing_env(), Unnormalized::new_wip(args))
-                .ok()?;
+                .ok()?
+                .no_bound_vars()
+                .unwrap();
             let mut callee =
                 Instance::try_resolve(tcx, inliner.typing_env(), def_id, args).ok().flatten()?;
 
@@ -595,6 +666,26 @@ fn resolve_callsite<'tcx, I: Inliner<'tcx>>(
                 // The callee is the fallback body.
                 debug!("callsite is fallback body: {def_id:?}");
                 callee = ty::Instance { def: ty::InstanceKind::Item(def_id), args: callee.args };
+            }
+
+            // Trust (W5): the resolved instance too — a trait method's `requires` may sit
+            // on the impl the call resolves to rather than on the static callee.
+            // Trust (2026-10-02): a `#[rustc_force_inline]` static callee (what
+            // `ForceInliner` and `validate.rs` key on) falls through here too, for the
+            // reason above; `keep_call_owing_requires` also asks the resolved item.
+            if callee.def_id() != def_id
+                && crate::trust_verify::verification_enabled(tcx.sess)
+                && crate::trust_verify::callee_carries_trust_requires(tcx, callee.def_id())
+                && !ForceInline::should_run_pass_for_callee(tcx, def_id)
+            {
+                debug!("preserving a call to a resolved Trust `requires` callee for verification");
+                // Trust (2026-09-30, L3, merged): see the static-callee site above.
+                crate::trust_verify::requires_callee_inlining::trace_kept_call(
+                    tcx,
+                    caller_body,
+                    callee.def_id(),
+                );
+                return None;
             }
 
             if inliner.history().contains(&callee.def_id()) {
@@ -636,6 +727,19 @@ fn try_inlining<'tcx, I: Inliner<'tcx>>(
     let callee_attrs = tcx.codegen_instance_attrs(callsite.callee.def);
     let callee_attrs = callee_attrs.as_ref();
     check_inline::is_inline_valid_on_fn(tcx, callsite.callee.def_id())?;
+    // Trust (2026-09-30, L3): a verifying session keeps a call whose callee owes its
+    // caller a `requires`. The clause is charged only at a call that names the
+    // callee, and the callee's `optimized_mir` (what would be copied here) has
+    // checks elided under it. Inert with `-Ztrust-verify=off`; `ForceInline` reports
+    // the reason as its failure, except under advisory, which warns and inlines.
+    // See `trust_verify/requires_callee_inlining.rs`.
+    crate::trust_verify::requires_callee_inlining::keep_call_owing_requires(
+        tcx,
+        caller_body,
+        callsite.block,
+        callsite.callee,
+        matches!(callee_attrs.inline, InlineAttr::Force { .. }),
+    )?;
     check_codegen_attributes(inliner, callsite, callee_attrs)?;
 
     let terminator = caller_body[callsite.block].terminator.as_ref().unwrap();
@@ -747,7 +851,7 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
             }
         }
         // These have no own callable MIR.
-        InstanceKind::Intrinsic(_) | InstanceKind::Virtual(..) => {
+        InstanceKind::Intrinsic(_) | InstanceKind::LlvmIntrinsic(_) | InstanceKind::Virtual(..) => {
             debug!("instance without MIR (intrinsic / virtual)");
             return Err("implementation limitation -- cannot inline intrinsic");
         }
@@ -791,7 +895,8 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
         | InstanceKind::Shim(ShimKind::DropGlue(..))
         | InstanceKind::Shim(ShimKind::Clone(..))
         | InstanceKind::Shim(ShimKind::ThreadLocal(..))
-        | InstanceKind::Shim(ShimKind::FnPtrAddr(..)) => return Ok(()),
+        | InstanceKind::Shim(ShimKind::FnPtrAsPtr(..))
+        | InstanceKind::Shim(ShimKind::FnPtrFromPtr(..)) => return Ok(()),
     }
 
     if inliner.tcx().is_constructor(callee_def_id) {
@@ -801,9 +906,7 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
     }
 
     if let Some(callee_def_id) = callee_def_id.as_local()
-        && !inliner
-            .tcx()
-            .is_lang_item(inliner.tcx().parent(caller_def_id), rustc_hir::LangItem::FnOnce)
+        && !inliner.tcx().is_lang_item(inliner.tcx().parent(caller_def_id), LangItem::FnOnce)
     {
         // If we know for sure that the function we're calling will itself try to
         // call us, then we avoid inlining that function.
@@ -899,8 +1002,7 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
         let data = BasicBlockData::new(
             Some(Terminator {
                 source_info: terminator.source_info,
-                kind: TerminatorKind::Goto { target: block },
-                attributes: ThinVec::new(),
+                kind: TerminatorKind::goto(block),
             }),
             caller_body[block].is_cleanup,
         );
@@ -914,24 +1016,13 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
     // Place could result in two different locations if `f`
     // writes to `i`. To prevent this we need to create a temporary
     // borrow of the place and pass the destination as `*temp` instead.
-    fn dest_needs_borrow(place: Place<'_>) -> bool {
-        for elem in place.projection.iter() {
-            match elem {
-                ProjectionElem::Deref | ProjectionElem::Index(_) => return true,
-                _ => {}
-            }
-        }
-
-        false
-    }
-
-    let dest = if dest_needs_borrow(destination) {
+    //
+    // This must be a raw pointer: a mutable reference could be invalidated by
+    // reading the arguments later, and would be invalid if the destination type
+    // is uninhabited.
+    let dest = if !destination.is_stable_offset() {
         trace!("creating temp for return destination");
-        let dest = Rvalue::Ref(
-            tcx.lifetimes.re_erased,
-            BorrowKind::Mut { kind: MutBorrowKind::Default },
-            destination,
-        );
+        let dest = Rvalue::RawPtr(RawPtrKind::Mut, destination);
         let dest_ty = dest.ty(caller_body, tcx);
         let temp = Place::from(new_call_temp(caller_body, callsite, dest_ty, return_block));
         caller_body[callsite.block].statements.push(Statement::new(
@@ -1038,8 +1129,7 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
 
     caller_body[callsite.block].terminator = Some(Terminator {
         source_info: callsite.source_info,
-        kind: TerminatorKind::Goto { target: integrator.map_block(START_BLOCK) },
-        attributes: ThinVec::new(),
+        kind: TerminatorKind::goto(integrator.map_block(START_BLOCK)),
     });
 
     // Copy required constants from the callee_body into the caller_body. Although we are only
@@ -1200,7 +1290,7 @@ fn new_call_temp<'tcx>(
  * Integrates blocks from the callee function into the calling function.
  * Updates block indices, references to locals and other control flow
  * stuff.
-*/
+ */
 struct Integrator<'a, 'tcx> {
     args: &'a [Local],
     new_locals: RangeFrom<Local>,
@@ -1324,7 +1414,7 @@ impl<'tcx> MutVisitor<'tcx> for Integrator<'_, 'tcx> {
 
         match terminator.kind {
             TerminatorKind::CoroutineDrop | TerminatorKind::Yield { .. } => bug!(),
-            TerminatorKind::Goto { ref mut target } => {
+            TerminatorKind::Goto { ref mut target, .. } => {
                 *target = self.map_block(*target);
             }
             TerminatorKind::SwitchInt { ref mut targets, .. } => {
@@ -1352,14 +1442,14 @@ impl<'tcx> MutVisitor<'tcx> for Integrator<'_, 'tcx> {
             }
             TerminatorKind::Return => {
                 terminator.kind = if let Some(tgt) = self.return_block {
-                    TerminatorKind::Goto { target: tgt }
+                    TerminatorKind::goto(tgt)
                 } else {
                     TerminatorKind::Unreachable
                 }
             }
             TerminatorKind::UnwindResume => {
                 terminator.kind = match self.cleanup_block {
-                    UnwindAction::Cleanup(tgt) => TerminatorKind::Goto { target: tgt },
+                    UnwindAction::Cleanup(tgt) => TerminatorKind::goto(tgt),
                     UnwindAction::Continue => TerminatorKind::UnwindResume,
                     UnwindAction::Unreachable => TerminatorKind::Unreachable,
                     UnwindAction::Terminate(reason) => TerminatorKind::UnwindTerminate(reason),
@@ -1397,7 +1487,7 @@ fn try_instance_mir<'tcx>(
     {
         let fields = def.all_fields();
         for field in fields {
-            let field_ty = field.ty(tcx, args);
+            let field_ty = field.ty(tcx, *args);
             if field_ty.has_param() && field_ty.has_aliases() {
                 return Err("cannot build drop shim for polymorphic type");
             }

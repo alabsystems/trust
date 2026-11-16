@@ -11,18 +11,28 @@
 #  A backdoor in one toolchain cannot survive into the other's output unless the
 #  SAME backdoor independently exists in both — which disjoint lineages preclude.
 #
-#  This script wires up the MECHANISM: take two rustc paths A and B, build Trust
-#  source with each, diff the stage2 outputs. It is a reusable harness.
+#  This script wires up the MECHANISM: take two seed compilers A and B, build
+#  Trust source with each (`x.py build --stage 2 --set build.rustc=...`), diff
+#  the stage2 outputs. It is a reusable harness.
 #
-#  IT IS *NOT* A THOMPSON RESULT ON THIS HOST.
-#  A genuinely lineage-disjoint toolchain B does NOT exist on this single
-#  arm64-apple-darwin machine: the only seed is the Homebrew rustc 1.96.0, and the
-#  Trust toolchain was itself built from that same seed. Running A=Trust-stage0,
-#  B=Homebrew is therefore a MECHANISM REHEARSAL ONLY — it proves the harness
-#  works and surfaces nondeterminism; it does NOT close the Thompson loop because
-#  B shares A's lineage. Closing the loop requires a disjoint toolchain B (e.g. an
-#  upstream rust-lang nightly that never passed through Homebrew/Trust, or a
-#  Mes -> tinycc -> rustc bootstrap chain) and ideally a second machine / CI.
+#  COMPILER B IS A STOCK-AS-ORACLE (docs/DECISION_QUEUE.md
+#  D16: keep it, pinned; it gates nothing yet, a defect). B must not be of
+#  Trust's lineage, so a stock rustc is this harness's purpose, not a migration
+#  target. The token `upstream` is the ONE pinned oracle, rustup's `1.97.1`
+#  (below src/stage0's floor since 2026-10-19, so x.py refuses it), found with
+#  RUSTUP_AUTO_INSTALL=0 so a missing toolchain is never downloaded. When it is
+#  absent the script prints `SKIPPED: NOT RUN: oracle 1.97.1 not installed` and
+#  exits 0, which the comprehensive harness grades SKIP: never a pass, never a
+#  block. The token `seed` is the stage0 bootstrap is configured with, a Trust
+#  snapshot (src/stage0) since 2026-07-13.
+#
+#  IT IS *NOT* A THOMPSON RESULT BY ITSELF. `upstream` is an official rust-lang
+#  build that never passed through a Trust build, but every rustc descends from
+#  rust-lang's bootstrap chain, so disjointness further back is the operator's
+#  claim (--disjoint), not this script's. Without it the output is labeled a
+#  MECHANISM REHEARSAL: it proves the harness works and surfaces
+#  nondeterminism. A Mes -> tinycc -> rustc chain and a second machine would
+#  strengthen B.
 #
 #  This script REFUSES to print "Thompson defeated" under any circumstances. The
 #  strongest claim it will emit is "mechanism rehearsal: A and B produced
@@ -34,22 +44,31 @@
 #   scripts/ddc_compare.sh <rustc-A> <rustc-B> [--disjoint] [--dry-run]
 #                          [--artifact PATH] [--log DIR]
 #
-#   <rustc-A>, <rustc-B>  paths to two rustc executables, or a token:
-#                           "homebrew"      -> /opt/homebrew/bin/rustc
-#                           "config-stage0" -> config.toml [build].rustc seed
-#                           "trust-stage2"  -> build/host/stage2/bin/trustc
-#                         (On this host config-stage0 == homebrew: same lineage.)
+#   <rustc-A>, <rustc-B>  a path to a rustc executable (its toolchain's `cargo`
+#                         must sit beside it), or a token:
+#                           "seed"     -> the configured stage0; no override
+#                           "upstream" -> the pinned stock oracle, rustup 1.97.1
 #   --disjoint            ASSERT (operator's responsibility) that A and B are
 #                         lineage-disjoint. Without it, output is labeled
 #                         "mechanism rehearsal (NOT lineage-disjoint)".
 #   --dry-run             print the plan + the two build commands, build nothing.
-#   --artifact PATH       which stage2 artifact to diff (default: the trustc
-#                         driver binary). May be repeated.
+#                         It prints `SKIPPED: NOT RUN: --dry-run ...`: a plan is
+#                         not a comparison, so the harness never grades it PASS.
+#   --artifact PATH       which stage2 artifact to diff; a glob is expanded after
+#                         each build. May be repeated. Default: the trustc driver,
+#                         librustc_driver-*.dylib (the compiler itself) and std's
+#                         rlib.
+#
+#  Both builds hold a native Targo build-tree lease (build/ is exclusive): the lock
+#  spans each `rm -rf` of stage2 and its x.py, which re-enters it through
+#  TRUST_BUILD_LOCK_TOKEN. A held tree refuses with exit 2 before anything is
+#  deleted.
 #
 # ==========================================================================
 #  EXIT CODES
 # ==========================================================================
-#   0  the two stage2 outputs were byte-identical
+#   0  the two stage2 outputs were byte-identical -- or, with a line
+#      `SKIPPED: NOT RUN: ...`, the pinned oracle is absent and nothing ran
 #   1  they differed (expected unless source build is fully deterministic AND
 #      the two toolchains agree)
 #   2  setup / build failure
@@ -75,23 +94,23 @@ DRY_RUN=0
 DISJOINT=0
 declare -a ARTIFACTS
 
+# The one stock oracle compiler B may name (docs/DECISION_QUEUE.md D16).
+STOCK_ORACLE=1.97.1
+
+# Prints the seed rustc for a token or path; empty for `seed` (no override).
+# Returns 1 when `upstream` is not installed. `rustup which` installs a missing
+# toolchain unless RUSTUP_AUTO_INSTALL=0 (docs/KNOWN_HAZARDS.md, the seal-9192
+# entry, item (e)).
 resolve_rustc() {
   case "$1" in
-    homebrew)      echo "/opt/homebrew/bin/rustc" ;;
-    # The configured stage0 (bring-your-own seed) — on this host that is the
-    # Homebrew rustc, see config.toml [build].rustc. Read it live rather than
-    # hard-coding so the token stays correct if the seed changes.
-    config-stage0) grep -E '^[[:space:]]*rustc[[:space:]]*=' "${REPO_ROOT}/config.toml" \
-                     | head -1 | sed -E 's/.*=[[:space:]]*"?([^"]*)"?.*/\1/' ;;
-    # The Trust-built stage2 compiler (Trust lineage, but built FROM the seed —
-    # still NOT lineage-disjoint from it).
-    trust-stage2)  echo "${REPO_ROOT}/build/host/stage2/bin/trustc" ;;
-    *)             echo "$1" ;;
+    seed)     echo "" ;;
+    upstream) RUSTUP_AUTO_INSTALL=0 rustup which --toolchain "$STOCK_ORACLE" rustc 2>/dev/null ;;
+    *)        echo "$1" ;;
   esac
 }
 
 if [ $# -lt 2 ]; then
-  sed -n '2,70p' "$0"; exit 2
+  sed -n '2,83p' "$0"; exit 2
 fi
 RUSTC_A_RAW="$1"; RUSTC_B_RAW="$2"; shift 2
 while [ $# -gt 0 ]; do
@@ -100,16 +119,26 @@ while [ $# -gt 0 ]; do
     --dry-run)  DRY_RUN=1; shift ;;
     --artifact) ARTIFACTS+=("$2"); shift 2 ;;
     --log)      LOGDIR="$2"; shift 2 ;;
-    -h|--help)  sed -n '2,70p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,83p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
+for raw in "$RUSTC_A_RAW" "$RUSTC_B_RAW"; do
+  if [ "$raw" = upstream ] && ! resolve_rustc upstream >/dev/null; then
+    echo "SKIPPED: NOT RUN: oracle $STOCK_ORACLE not installed (rustup toolchain $STOCK_ORACLE)"
+    exit 0
+  fi
+done
 RUSTC_A="$(resolve_rustc "$RUSTC_A_RAW")"
 RUSTC_B="$(resolve_rustc "$RUSTC_B_RAW")"
 
 if [ "${#ARTIFACTS[@]}" -eq 0 ]; then
-  ARTIFACTS=("build/${HOST_TRIPLE}/stage2/bin/trustc")
+  # trustc is a thin driver; the compiler is librustc_driver, and std is what
+  # every program links. A backdoor would live in the last two.
+  ARTIFACTS=("build/${HOST_TRIPLE}/stage2/bin/trustc"
+             "build/${HOST_TRIPLE}/stage2/lib/librustc_driver-*.dylib"
+             "build/${HOST_TRIPLE}/stage2/lib/rustlib/${HOST_TRIPLE}/lib/libstd-*.rlib")
 fi
 
 mkdir -p "$LOGDIR"
@@ -126,18 +155,16 @@ fi
 log "=================================================================="
 log " ${CLAIM_BANNER}"
 log "=================================================================="
-log "rustc A : ${RUSTC_A_RAW} -> ${RUSTC_A}"
-log "rustc B : ${RUSTC_B_RAW} -> ${RUSTC_B}"
+log "rustc A : ${RUSTC_A_RAW} -> ${RUSTC_A:-<configured stage0>}"
+log "rustc B : ${RUSTC_B_RAW} -> ${RUSTC_B:-<configured stage0>}"
 log "host    : ${HOST_TRIPLE}"
 log "epoch   : ${EPOCH}"
 log "artifacts to diff:"; for a in "${ARTIFACTS[@]}"; do log "    ${a}"; done
 log ""
 if [ "$DISJOINT" -eq 0 ]; then
-  log "NOTE: On this host the only rustc lineage is the Homebrew 1.96.0 seed and the"
-  log "      Trust toolchain built from it. A and B therefore share lineage; a"
-  log "      matching result here proves the HARNESS + build determinism, NOT that"
-  log "      Thompson trusting-trust is defeated. Closing the loop needs a disjoint B"
-  log "      (upstream rust-lang nightly, or Mes->tinycc->rustc) and ideally a 2nd host."
+  log "NOTE: A and B are not asserted lineage-disjoint. A matching result proves"
+  log "      the HARNESS + build determinism, NOT that Thompson trusting-trust is"
+  log "      defeated (see the header)."
   log ""
 fi
 
@@ -147,43 +174,76 @@ export RUSTFLAGS="--remap-path-prefix=${REPO_ROOT}=/trust-source --remap-path-pr
 export RUSTC_BOOTSTRAP=1
 export LIBRARY_PATH="${LIBRARY_PATH:-/opt/homebrew/lib}"
 
+# build/ is EXCLUSIVE (CLAUDE.md): hold the build lock across both rm + x.py
+# pairs. x.py re-enters it through TRUST_BUILD_LOCK_TOKEN; a token inherited
+# from a caller stays the caller's to release.
+take_build_lock() {
+  local inherited="${TRUST_BUILD_LOCK_TOKEN:-}" token
+  token="$("${TARGO:-targo}" trust repo lock acquire --repo-root "$REPO_ROOT" --kind build --purpose "ddc_compare.sh: two stage2 rebuilds" \
+             --pid $$ --contract "ddc_compare.sh deletes and rebuilds stage2 twice")" || true
+  if [ -z "$token" ]; then
+    log "ERROR: native build-tree acquisition refused; nothing deleted"
+    exit 2
+  fi
+  export TRUST_BUILD_LOCK_TOKEN="$token"
+  if [ "$token" != "$inherited" ]; then
+    release_ddc_lock() {
+      "${TARGO:-targo}" trust repo lock release "$TRUST_BUILD_LOCK_TOKEN" --repo-root "$REPO_ROOT" >/dev/null 2>&1
+    }
+    trap release_ddc_lock EXIT
+  fi
+}
+
 build_with() {
-  # $1 = rustc path, $2 = tag
+  # $1 = seed rustc path (empty: the configured stage0), $2 = tag
   local rustc="$1" tag="$2"
-  log "--- [${tag}] clean stage2 outputs, build Trust with rustc=${rustc} ---"
+  log "--- [${tag}] clean stage2 outputs, build Trust with rustc=${rustc:-<configured stage0>} ---"
   local cmd=(python3 x.py build --stage 2)
-  log "    RUSTC=${rustc} SOURCE_DATE_EPOCH=${EPOCH} \\"
+  if [ -n "$rustc" ]; then
+    # bootstrap reads the seed from build.rustc/build.cargo; an exported RUSTC
+    # reaches it only in bootstrap's own unit tests (config.rs, cfg!(test)).
+    cmd+=(--set "build.rustc=${rustc}" --set "build.cargo=$(dirname "$rustc")/cargo")
+  fi
+  log "    SOURCE_DATE_EPOCH=${EPOCH} \\"
   log "    RUSTFLAGS='${RUSTFLAGS}' \\"
   log "    ${cmd[*]}"
   if [ "$DRY_RUN" -eq 1 ]; then
     log "    [dry-run] not executed"
     return 0
   fi
-  if [ ! -x "$rustc" ]; then
-    log "    ERROR: rustc not executable: ${rustc}"; exit 2
+  if [ -n "$rustc" ] && { [ ! -x "$rustc" ] || [ ! -x "$(dirname "$rustc")/cargo" ]; }; then
+    log "    ERROR: rustc or its sibling cargo not executable: ${rustc}"; exit 2
   fi
   # Full stage2 rebuild from the given seed compiler.
   rm -rf "build/${HOST_TRIPLE}/stage2" "build/${HOST_TRIPLE}/stage2-rustc" \
          "build/${HOST_TRIPLE}/stage2-codegen"
-  if ! RUSTC="$rustc" "${cmd[@]}" >>"${LOG}.build-${tag}" 2>&1; then
+  if ! "${cmd[@]}" >>"${LOG}.build-${tag}" 2>&1; then
     log "    BUILD ${tag} FAILED — see ${LOG}.build-${tag}"; exit 2
   fi
 }
 
+# The snapshot name of an artifact pattern: its basename with `*` spelled `_`.
+artifact_key() { basename "$1" | tr '*' '_'; }
+
 snapshot() {
-  # $1 = tag; copies the artifacts under LOGDIR with the tag.
-  local tag="$1" a base
+  # $1 = tag; copies the artifacts under LOGDIR with the tag. A glob must match
+  # exactly one file (stage2 was deleted before the build).
+  local tag="$1" a key
+  local -a hits
   for a in "${ARTIFACTS[@]}"; do
-    base="$(basename "$a")"
-    if [ -f "$a" ]; then
-      cp "$a" "${LOGDIR}/${base}.${tag}.${STAMP}"
-      log "    snapshot ${tag}: ${base} sha256=$(shasum -a 256 "$a" | awk '{print $1}')"
+    key="$(artifact_key "$a")"
+    hits=()
+    while IFS= read -r hit; do hits+=("$hit"); done < <(compgen -G "$a" || true)
+    if [ "${#hits[@]}" -eq 1 ] && [ -f "${hits[0]}" ]; then
+      cp "${hits[0]}" "${LOGDIR}/${key}.${tag}.${STAMP}"
+      log "    snapshot ${tag}: ${hits[0]} sha256=$(shasum -a 256 "${hits[0]}" | awk '{print $1}')"
     else
-      log "    snapshot ${tag}: MISSING ${a}"
+      log "    snapshot ${tag}: ${#hits[@]} files match ${a} (want 1)"
     fi
   done
 }
 
+[ "$DRY_RUN" -eq 0 ] && take_build_lock
 build_with "$RUSTC_A" A
 [ "$DRY_RUN" -eq 0 ] && snapshot A
 build_with "$RUSTC_B" B
@@ -192,6 +252,7 @@ build_with "$RUSTC_B" B
 if [ "$DRY_RUN" -eq 1 ]; then
   log ""
   log "[dry-run] plan printed; no builds run, no comparison performed."
+  echo "SKIPPED: NOT RUN: --dry-run (plan only; no build, no comparison)"
   exit 0
 fi
 
@@ -199,7 +260,7 @@ log ""
 log "=== STAGE2 OUTPUT COMPARISON ==="
 RC=0
 for a in "${ARTIFACTS[@]}"; do
-  base="$(basename "$a")"
+  base="$(artifact_key "$a")"
   fa="${LOGDIR}/${base}.A.${STAMP}"
   fb="${LOGDIR}/${base}.B.${STAMP}"
   if [ ! -f "$fa" ] || [ ! -f "$fb" ]; then

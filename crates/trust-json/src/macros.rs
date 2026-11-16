@@ -230,10 +230,7 @@ mod tests {
     #[test]
     fn literals_and_nesting() {
         let v = json!({"b": 1, "a": [1, 2, {"z": null}], "c": {}, "d": [], "e": "x"});
-        assert_eq!(
-            v.to_string(),
-            r#"{"a":[1,2,{"z":null}],"b":1,"c":{},"d":[],"e":"x"}"#
-        );
+        assert_eq!(v.to_string(), r#"{"a":[1,2,{"z":null}],"b":1,"c":{},"d":[],"e":"x"}"#);
         assert_eq!(json!(null), Value::Null);
         assert_eq!(json!(true).to_string(), "true");
         assert_eq!(json!(1.0).to_string(), "1.0");

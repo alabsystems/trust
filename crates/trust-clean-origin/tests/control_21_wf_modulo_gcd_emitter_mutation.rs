@@ -189,6 +189,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Termina
         is_unsafe_sig: false,
         unwind: UnwindEdge::Continue,
         callee_identity: None,
+        callee_key: None,
     }
 }
 
@@ -264,6 +265,7 @@ fn emitted_gcd() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -327,10 +329,7 @@ fn admits_end_to_end() {
         admit_lowering(&env, &plan, &extracted).expect("the emission must pass the F-layer gate");
     assert_eq!(faithful.name(), "gcd");
     assert_eq!(faithful.admitted_at(), &Ty::BignumNat);
-    eprintln!(
-        "CONTROL-21 admit | textbook modulo gcd FAITHFUL by {:?}",
-        faithful.method()
-    );
+    eprintln!("CONTROL-21 admit | textbook modulo gcd FAITHFUL by {:?}", faithful.method());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -344,9 +343,7 @@ fn admits_end_to_end() {
 fn a_wrong_operator_at_the_remainder_is_refused() {
     let env = gcd_env();
     let plan = plan_clean_origin_body(&env, "gcd").expect("plans");
-    for (tag, callee) in
-        [("sub", BIGNUM_SUB), ("add", BIGNUM_ADD), ("mul", BIGNUM_MUL)]
-    {
+    for (tag, callee) in [("sub", BIGNUM_SUB), ("add", BIGNUM_ADD), ("mul", BIGNUM_MUL)] {
         let refusal = admit_lowering(&env, &plan, &with_callee(emitted_gcd(), 3, callee))
             .expect_err("a wrong operator must never emit");
         assert!(
@@ -411,10 +408,7 @@ fn c_the_sibling_div_is_not_even_an_authenticated_callee() {
          classify every real extracted body"
     );
     // The co-located spelling too, per `bignum_callee`'s note.
-    assert_eq!(
-        PrimitiveCallee::classify("trust_bignum::Nat::rem"),
-        Some(PrimitiveCallee::NatRem)
-    );
+    assert_eq!(PrimitiveCallee::classify("trust_bignum::Nat::rem"), Some(PrimitiveCallee::NatRem));
     // Round-trip, the discipline every row carries.
     assert_eq!(
         PrimitiveCallee::classify(&PrimitiveCallee::NatRem.canonical_path()),

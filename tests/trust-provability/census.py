@@ -67,7 +67,6 @@ def bucket(row):
 def run_file(path, extra):
     d = tempfile.mkdtemp(prefix="census_")
     env = dict(os.environ)
-    env["TRUST_SEED_STAIRCASE"] = "1"
     cmd = [TRUSTC, "-Zthreads=1", "-Ztrust-verify=on", "-Ztrust-policy=advisory",
            "-Ztrust-verify-output=json", "-Coverflow-checks=on", "--edition=2021",
            "--crate-type=lib", "--emit=metadata", "--out-dir", d, path] + extra

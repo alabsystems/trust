@@ -49,14 +49,38 @@ fn guarded_mut_vec_index_length_is_canonicalized_and_provable() {
 
 #[test]
 fn resized_mut_vec_index_stays_refutable() {
-    // SOUNDNESS: `let n = v.len(); v.push(9); v[n]` — the push reborrows `&mut *v`, so
-    // the length tie DECLINES: there is NO `n == v` equality, so the obligation `n >= v`
-    // is satisfiable (refutable) — never a vacuous false-PROVE.
-    let dbg = bounds_formula("mv_resized");
+    // SOUNDNESS: `let n = v.len(); v.push(9); v[n]` must never PROVE.
+    // Trust (VEC-LEN-PARAM-COPY-1, 2026-10-07): real MIR hands the `&mut Vec` parameter
+    // to `push` as `copy _1`, with NO `&mut *v` reborrow, so the old gate (which saw only
+    // reborrows) called the length stable and minted the bounds row; only the
+    // path-definition kill kept it refutable. The length oracle now counts that copy
+    // as a resize: NO bounds row carries the parameter's length at all, and the index
+    // is the fail-honest `container-index-unstable-len` Unknown.
+    let json = std::fs::read_to_string("tests/fixtures/mv_resized.json").unwrap();
+    let f: VerifiableFunction = serde_json::from_str(&json).unwrap();
     assert!(
-        !dbg.contains("Eq(Var(\"n\", Int), Var(\"v\", Int))"),
-        "a RESIZED `&mut Vec` must NOT tie the stored length `n` to `coll_len` `v` (that \
-         would false-PROVE an out-of-bounds index): {dbg}"
+        f.body.blocks.iter().any(|b| matches!(&b.terminator,
+            Terminator::Call { func, args, .. }
+                if func.ends_with("::push")
+                    && matches!(args.first(), Some(Operand::Copy(p) | Operand::Move(p))
+                        if p.local == 1 && p.projections.is_empty()))),
+        "vacuity guard: `push` receives the `&mut Vec` parameter `_1` whole"
+    );
+    let v = generate_vcs(&f);
+    for vc in &v {
+        if matches!(vc.kind, VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck) {
+            let dbg = format!("{:?}", vc.formula);
+            assert!(
+                !dbg.contains("Eq(Var(\"n\", Int), Var(\"v\", Int))"),
+                "a RESIZED `&mut Vec` must NOT tie the stored length `n` to `coll_len` `v` \
+                 (that would false-PROVE an out-of-bounds index): {dbg}"
+            );
+        }
+    }
+    assert!(
+        v.iter().any(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
+            if kind == "container-index-unstable-len")),
+        "the resized index must surface as the fail-honest Unknown, never vanish"
     );
 }
 

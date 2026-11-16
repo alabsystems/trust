@@ -34,11 +34,14 @@ pub(crate) fn proved_result(
     let strength = trust_types::ProofStrength::deductive();
 
     trust_types::TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         obligation_id: Some(owner),
         claim_digest_sha256: Some(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         ),
         kind,
+        original_vc_snapshot: None,
         typed_kind: Some(Box::new(typed_kind)),
         description,
         location: None,
@@ -63,6 +66,7 @@ pub(crate) fn proved_result(
             diagnostics: Vec::new(),
         }),
         monitor: None,
+        grade: None,
     }
 }
 
@@ -78,9 +82,12 @@ pub(crate) fn failed_result(
     let owner = format!("{kind}:{function}:0");
     let native_id = format!("trust_ir-native-trust-mc-request-{request_id}-proof-{proof_id}");
     trust_types::TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         obligation_id: Some(owner),
         claim_digest_sha256: None,
         kind: kind.to_string(),
+        original_vc_snapshot: None,
         typed_kind: None,
         description: description.to_string(),
         location: None,
@@ -94,6 +101,7 @@ pub(crate) fn failed_result(
         native_trust_ir: Some(native_evidence(request_id, proof_id, &native_id)),
         proof_evidence: None,
         monitor: None,
+        grade: None,
     }
 }
 

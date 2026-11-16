@@ -53,7 +53,8 @@ impl SortFromTy for Sort {
 /// type — it introduces no facts. Field sorts use the normal `Sort::from_ty`
 /// mapping so a scalar field keeps its exact bitvector/Int/Bool sort; only the
 /// datatype back-edges are abstracted to by-name references (the standard,
-/// natively-recursive SMT-LIB datatype encoding).
+/// natively-recursive SMT-LIB datatype encoding). Constructors keep their Rust
+/// variant names; each FIELD is declared under its [`datatype_selector_name`].
 fn datatype_sort_from_ty(ty: &Ty) -> Sort {
     datatype_sort_from_ty_with_defs(ty, &DatatypeDefs::new())
 }
@@ -142,13 +143,55 @@ fn datatype_sort_from_ty_with_defs(ty: &Ty, defs: &DatatypeDefs) -> Sort {
                         }
                         other => Sort::from_ty(other),
                     };
-                    (fname.clone(), fsort)
+                    (datatype_selector_name(ctor, fname), fsort)
                 })
                 .collect();
             (ctor.clone(), field_sorts)
         })
         .collect();
     Sort::Datatype { name: name.clone(), constructors }
+}
+
+/// The SMT selector symbol a datatype declaration lowered from a `Ty::Datatype`
+/// gives field `field` of constructor `ctor`: `"{ctor}.{field}"`
+/// (`Succ.0`, `Param.0`, `CubicalPath.ty`, `Expr.kind`).
+///
+/// WHY THE CONSTRUCTOR IS PART OF THE NAME (TRUST-04). SMT-LIB selectors are
+/// function symbols of the whole DATATYPE, one per name, while a Rust field
+/// name is only unique within its VARIANT: every tuple variant calls its first
+/// field `0`, and two struct-like variants may share a field name. Copying the
+/// Rust names verbatim declared the kernel `Level` with four selectors spelled
+/// `0` — `Succ.0`, `Max.0`, `IMax.0` (each a `Level`) and `Param.0` (a `Name`).
+/// Measured on the pinned ay: the declaration was ACCEPTED, the name `0` then
+/// resolved to a single one of the four fields, and reads of the others were
+/// refused as sort mismatches — by the router's datatype-term gate or by ay's
+/// own selector check (Unknown either way). A consumer that resolved the name
+/// without that check would read all four fields as ONE function, and `l.Max.0
+/// != l.IMax.0` would become `t != t` — a false PROVE of a satisfiable formula.
+///
+/// The qualification has to happen HERE, where the constructor is known. A
+/// `Formula::Sel` names only its datatype and its field, so no later stage —
+/// the router's ay namespace included — can recover which variant's field a
+/// bare `0` meant. Every builder that turns a `Downcast(v)` + `Field(i)` read
+/// of a `Ty::Datatype` into a `Sel` spells the field with this same function,
+/// so the term and the declaration agree.
+///
+/// INJECTIVE within one datatype: a constructor name is a Rust identifier and
+/// never contains `.`, so the first `.` of the result recovers `(ctor, field)`;
+/// and every selector name contains a `.`, so none equals a constructor name.
+/// Declarations built elsewhere (a hand-written `Sort`, a decoded VC) are not
+/// covered by this argument, which is why the router ALSO declines any
+/// declaration that lists one member name twice
+/// (`ay_symbol_namespace::datatype_member_collision`).
+///
+/// Constructor names are left as the Rust variant names: they are unique within
+/// a type already, and the datatype qualification that keeps constructors and
+/// selectors apart ACROSS types is done at the ay boundary
+/// (`trust-router`'s `ay_symbol_namespace`, applied by both ay-facing
+/// renderers), which qualifies every datatype member by its datatype.
+#[must_use]
+pub fn datatype_selector_name(ctor: &str, field: &str) -> String {
+    format!("{ctor}.{field}")
 }
 
 #[cfg(test)]
@@ -238,7 +281,7 @@ mod tests {
         let i64_ty = || Ty::Int { width: 64, signed: true };
         let tree_adt = Ty::Adt {
             name: "Tree".into(),
-            fields: vec![("__tag".into(), i64_ty()), ("__v1_0".into(), i64_ty())],
+            fields: vec![("__tag".into(), i64_ty()), ("__v1_0".into(), i64_ty())].into(),
             variants: vec![
                 VariantDef { name: "Leaf".into(), discriminant: 0, fields: vec![] },
                 VariantDef {
@@ -246,13 +289,15 @@ mod tests {
                     discriminant: 1,
                     fields: vec![("0".into(), i64_ty())],
                 },
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             adt_kind: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
         let mut defs = DatatypeDefs::new();
         assert!(insert_datatype_def(&mut defs, tree_adt.clone()));
@@ -274,5 +319,84 @@ mod tests {
             sort_from_ty_with_defs(&marker("Tree"), &DatatypeDefs::new()),
             Sort::Datatype { name: "Tree".to_string(), constructors: Vec::new() },
         );
+    }
+
+    /// The kernel universe `Level` as trust-mir-extract's
+    /// `lower_adt_as_datatype` extracts it: raw Rust member names, so every
+    /// tuple-variant field is `0`/`1` in EVERY variant that has one.
+    fn producer_level() -> Ty {
+        let level_ref = || Ty::Datatype { name: "Level".into(), variants: vec![] };
+        let name_ref = || Ty::Datatype { name: "Name".into(), variants: vec![] };
+        Ty::Datatype {
+            name: "Level".into(),
+            variants: vec![
+                ("Zero".into(), vec![]),
+                ("Succ".into(), vec![("0".into(), level_ref())]),
+                ("Max".into(), vec![("0".into(), level_ref()), ("1".into(), level_ref())]),
+                ("IMax".into(), vec![("0".into(), level_ref()), ("1".into(), level_ref())]),
+                ("Param".into(), vec![("0".into(), name_ref())]),
+            ],
+        }
+    }
+
+    /// TRUST-04: the SMT declaration lowered from a `Ty::Datatype` gives every
+    /// member its own symbol. SMT-LIB selectors are per-DATATYPE function
+    /// symbols (not per-constructor), so copying the Rust field names verbatim
+    /// declared four selectors spelled `0` for `Level` — `Succ.0`, `Max.0` and
+    /// `IMax.0` (all `Level`) and `Param.0` (a `Name`) collapsed onto one
+    /// symbol at two different sorts. The same holds for named fields shared
+    /// by two variants (`CubicalPath { ty, .. }` / `CubicalTransp { ty, .. }`).
+    #[test]
+    fn a_lowered_datatype_declares_each_member_once() {
+        use std::collections::BTreeSet;
+
+        let Sort::Datatype { constructors, .. } = Sort::from_ty(&producer_level()) else {
+            panic!("Level lowers to a datatype sort")
+        };
+        let ctors: Vec<&str> = constructors.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            ctors,
+            ["Zero", "Succ", "Max", "IMax", "Param"],
+            "constructors keep their names"
+        );
+        let selectors: Vec<&str> = constructors
+            .iter()
+            .flat_map(|(_, fields)| fields.iter().map(|(f, _)| f.as_str()))
+            .collect();
+        assert_eq!(selectors.len(), 6, "Succ 1 + Max 2 + IMax 2 + Param 1");
+        assert_eq!(
+            selectors,
+            ["Succ.0", "Max.0", "Max.1", "IMax.0", "IMax.1", "Param.0"],
+            "each field is declared under `datatype_selector_name(ctor, field)`"
+        );
+        let mut members: BTreeSet<&str> = ctors.iter().copied().collect();
+        for selector in &selectors {
+            assert!(
+                members.insert(selector),
+                "selector `{selector}` is declared twice (or shadows a constructor) in one \
+                 datatype: constructors {ctors:?}, selectors {selectors:?}"
+            );
+        }
+
+        // Named fields repeated across variants are the same defect.
+        let expr_ref = || Ty::Datatype { name: "Expr".into(), variants: vec![] };
+        let cubical = Ty::Datatype {
+            name: "ExprKind".into(),
+            variants: vec![
+                (
+                    "CubicalPath".into(),
+                    vec![("ty".into(), expr_ref()), ("left".into(), expr_ref())],
+                ),
+                ("CubicalTransp".into(), vec![("ty".into(), expr_ref())]),
+            ],
+        };
+        let Sort::Datatype { constructors, .. } = Sort::from_ty(&cubical) else {
+            panic!("ExprKind lowers to a datatype sort")
+        };
+        let selectors: BTreeSet<&str> = constructors
+            .iter()
+            .flat_map(|(_, fields)| fields.iter().map(|(f, _)| f.as_str()))
+            .collect();
+        assert_eq!(selectors.len(), 3, "`ty` of two variants needs two selectors: {selectors:?}");
     }
 }

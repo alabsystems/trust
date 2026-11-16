@@ -166,7 +166,7 @@ build_stage1() {
         log "Stage 1 build complete in ${minutes}m ${seconds}s."
         # Show compiler location
         local compiler
-        compiler=$(find "${REPO_ROOT}/build" -name trustc -type f -perm +111 2>/dev/null | head -1)
+        compiler=$(find -H "${REPO_ROOT}/build" -name trustc -type f -perm +111 2>/dev/null | head -1)
         if [[ -n "$compiler" ]]; then
             log "Compiler: ${compiler}"
         fi

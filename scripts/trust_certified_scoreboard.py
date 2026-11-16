@@ -74,6 +74,15 @@ def main():
     ap.add_argument("--out")
     a = ap.parse_args()
 
+    # A ratchet with no floor cannot fail: refuse a named baseline that is
+    # absent instead of silently running as a non-gating scoreboard.
+    if a.baseline and not os.path.exists(a.baseline):
+        print(f"REFUSED: --baseline {a.baseline} does not exist; a ratchet with no floor "
+              f"cannot fail. Options: (1) mint it once from a stage2 run: "
+              f"trust_certified_scoreboard.py --out {a.baseline}; "
+              f"(2) run without --baseline for a non-gating scoreboard.", file=sys.stderr)
+        return 2
+
     board, totals = {}, dict(obligations=0, proved=0, failed=0, unknown=0,
                              timed_out=0, runtime_checked=0, kernel_certified=0, smt_backed=0)
     for crate in DEFAULT_CRATES:

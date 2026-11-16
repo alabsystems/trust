@@ -23,9 +23,7 @@ fn get_token_test() -> (Project, TestRegistry) {
     // API server that checks that the token is included correctly.
     let server = registry::RegistryBuilder::new()
         .no_configure_token()
-        .token(cargo_test_support::registry::Token::Plaintext(
-            "sekrit".to_string(),
-        ))
+        .token("sekrit".to_string())
         .alternative()
         .http_api()
         .http_index()
@@ -417,6 +415,9 @@ fn multiple_providers() {
         .replace_crates_io(server.index_url())
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ * [new ref]         HEAD       -> origin/HEAD
 [CREDENTIAL] [..]url_not_supported[..] login crates-io
 {"v":1,"registry":{"index-url":"https://github.com/rust-lang/crates.io-index","name":"crates-io"},"kind":"login","token":"abcdefg","login-url":"[ROOTURL]/api/me"}
 [CREDENTIAL] [..]success_provider[..] login crates-io
@@ -428,17 +429,18 @@ fn multiple_providers() {
 
 #[cargo_test]
 fn both_token_and_provider() {
+    let provider = build_provider("test-cred", r#"{"Ok":{"kind":"login"}}"#);
     let server = registry::RegistryBuilder::new()
-        .credential_provider(&["cargo:paseto"])
+        .credential_provider(&[&provider])
         .build();
 
-    cargo_process("login -Z asymmetric-token")
-        .masquerade_as_nightly_cargo(&["asymmetric-token"])
+    cargo_process("login")
+        .with_stdin("abcdefg")
         .replace_crates_io(server.index_url())
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
-[WARNING] registry `crates-io` has a token configured in [ROOT]/home/.cargo/credentials.toml that will be ignored because this registry is configured to use credential-provider `cargo:paseto`
-k3.public[..]
+[WARNING] registry `crates-io` has a token configured in [ROOT]/home/.cargo/credentials.toml that will be ignored because this registry is configured to use credential-provider `[..]test-cred[..]`
+{"v":1,"registry":{"index-url":"https://github.com/rust-lang/crates.io-index","name":"crates-io"},"kind":"login","token":"abcdefg","login-url":"[ROOTURL]/api/me"}
 
 "#]])
         .run();
@@ -465,6 +467,9 @@ fn registry_provider_overrides_global() {
         .replace_crates_io(server.index_url())
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ * [new ref]         HEAD       -> origin/HEAD
 [CREDENTIAL] cargo:token login crates-io
 [LOGIN] token for `crates-io` saved
 
@@ -476,42 +481,11 @@ fn registry_provider_overrides_global() {
 }
 
 #[cargo_test]
-fn both_asymmetric_and_token() {
-    let server = registry::RegistryBuilder::new().build();
-    cargo_util::paths::append(
-        &paths::home().join(".cargo/config.toml"),
-        format!(
-            r#"
-                [registry]
-                token = "foo"
-                secret-key = "bar"
-            "#,
-        )
-        .as_bytes(),
-    )
-    .unwrap();
-
-    cargo_process("login -Zasymmetric-token -v").with_stdin("abcdefg")
-        .masquerade_as_nightly_cargo(&["asymmetric-token"])
-        .replace_crates_io(server.index_url())
-        .with_stderr_data(str![[r#"
-[UPDATING] crates.io index
-[WARNING] registry `crates-io` has a `secret_key` configured in [..]config.toml that will be ignored because a `token` is also configured, and the `cargo:token` provider is configured with higher precedence
-[CREDENTIAL] cargo:token login crates-io
-[LOGIN] token for `crates-io` saved
-
-"#]])
-        .run();
-}
-
-#[cargo_test]
 fn token_caching() {
     let server = registry::RegistryBuilder::new()
         .no_configure_token()
         .no_configure_registry()
-        .token(cargo_test_support::registry::Token::Plaintext(
-            "sekrit".to_string(),
-        ))
+        .token("sekrit".to_string())
         .alternative()
         .http_api()
         .http_index()
@@ -641,9 +615,7 @@ fn basic_provider() {
             "cargo:token-from-stdout",
             &toml_bin(&cred_proj, "test-cred"),
         ])
-        .token(cargo_test_support::registry::Token::Plaintext(
-            "sekrit".to_string(),
-        ))
+        .token("sekrit".to_string())
         .alternative()
         .http_api()
         .auth_required()
@@ -661,6 +633,9 @@ fn basic_provider() {
                 [dependencies.bar]
                 version = "0.0.1"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -670,7 +645,7 @@ fn basic_provider() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 CARGO=Some([..])
 CARGO_REGISTRY_NAME_OPT=Some("alternative")
 CARGO_REGISTRY_INDEX_URL=Some("[ROOTURL]/alternative-registry")
@@ -700,9 +675,7 @@ fn basic_provider_crlf() {
             "cargo:token-from-stdout",
             &toml_bin(&cred_proj, "test-cred"),
         ])
-        .token(cargo_test_support::registry::Token::Plaintext(
-            "sekrit".to_string(),
-        ))
+        .token("sekrit".to_string())
         .alternative()
         .http_api()
         .http_index()
@@ -721,6 +694,9 @@ fn basic_provider_crlf() {
                 [dependencies.bar]
                 version = "0.0.1"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -730,7 +706,7 @@ fn basic_provider_crlf() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
 [CHECKING] bar v0.0.1 (registry `alternative`)

@@ -1,0 +1,48 @@
+{
+  "id": "path-guard-value",
+  "class": "A (PATH-GUARD-VALUE-1)",
+  "title": "a loop-head guard spelled by the reaching-definition set pinned a value written after it",
+  "origin": [
+    "KH:3130 (A, PATH-GUARD-VALUE-1)",
+    "fix e14f42e8e3",
+    "crates/trust-vcgen/tests/path_guard_value_identity_realmir.rs",
+    "crates/trust-vcgen/tests/fixtures/path_guard_value/cf.rs"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "gs_one_arm_scalar_bug",
+    "obligation": {
+      "kind": "bounds",
+      "at": "acc ^= buf[len]"
+    }
+  },
+  "twin": {
+    "function": "gs_guard_after_write_ctl",
+    "obligation": {
+      "kind": "bounds",
+      "at": "acc ^= buf[len]"
+    }
+  },
+  "witness": {
+    "input": "xs = [true], m = 3, n = 100",
+    "observed": "index out of bounds: the len is 8 but the index is 100",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  },
+  "opt_levels": [
+    "0",
+    "1"
+  ],
+  "expected_refusal": {
+    "trust-vc-syn": {
+      "reproducer": "has ambiguous multi-path return extraction (loop explicit return path) — postconditions referencing `result` would be unsound",
+      "twin": "has ambiguous multi-path return extraction (loop explicit return path) — postconditions referencing `result` would be unsound"
+    }
+  }
+}

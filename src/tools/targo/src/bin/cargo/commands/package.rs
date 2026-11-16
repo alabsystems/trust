@@ -1,9 +1,9 @@
 use crate::command_prelude::*;
 
-use cargo::ops;
-use cargo::ops::PackageMessageFormat;
-use cargo::ops::PackageOpts;
 use clap_complete::ArgValueCandidates;
+use targo::ops;
+use targo::ops::PackageMessageFormat;
+use targo::ops::PackageOpts;
 
 pub fn cli() -> Command {
     subcommand("package")
@@ -48,7 +48,7 @@ pub fn cli() -> Command {
             ArgValueCandidates::new(get_ws_member_candidates),
         )
         .arg_features()
-        .arg_target_triple("Build for the target triple")
+        .arg_target_tuple("Build for the target tuple")
         .arg_target_dir()
         .arg_parallel()
         .arg_manifest_path()

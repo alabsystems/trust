@@ -165,7 +165,13 @@ fn divisor_is_nonzero_constant(divisor: &Operand) -> bool {
 }
 
 fn is_float_operand(operand: &Operand, func: &VerifiableFunction) -> bool {
-    matches!(operand_ty_owned(operand, func), Ty::Float { .. })
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => {
+            matches!(crate::local_ty_ref(func, place.local), Some(Ty::Float { .. }))
+        }
+        Operand::Constant(ConstValue::Float(_) | ConstValue::FloatBits { .. }) => true,
+        _ => false,
+    }
 }
 
 fn signed_binary_overflow_kind(
@@ -184,7 +190,7 @@ fn signed_binary_overflow_kind(
 fn operand_ty_owned(operand: &Operand, func: &VerifiableFunction) -> Ty {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => {
-            func.body.locals.get(place.local).map(|decl| decl.ty.clone()).unwrap_or(Ty::Unit)
+            crate::local_ty_ref(func, place.local).cloned().unwrap_or(Ty::Unit)
         }
         Operand::Constant(cv) => match cv {
             ConstValue::Bool(_) => Ty::Bool,

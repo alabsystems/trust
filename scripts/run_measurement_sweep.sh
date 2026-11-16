@@ -29,8 +29,8 @@
 # Everything above stayed true and stayed insufficient: the sentinel is ADVISORY. It made
 # conflicts visible to whoever looked, and nothing made anyone look. Four more measurement
 # runs were destroyed in one session. So this script now also takes
-# `scripts/trust_build_lock.sh` — the same lock `x.py` takes before it builds — which is the
-# half a sentinel cannot be. Read that file for why `mkdir(2)` and not flock/shlock/lockf.
+# a native Targo build-tree lease — the same ownership Bootstrap takes before it builds.
+# The native manager owns acquisition, holder identity, recovery and release.
 #
 # `.trust-measurement-in-flight` is STILL published, with the same fields, because other
 # lanes are reading it right now and a flag day mid-session would be worse than the problem.
@@ -58,7 +58,6 @@ SENTINEL=$REPO/.trust-measurement-in-flight
 # non-Apple host (measured 2026-08-31 on aarch64-unknown-linux-gnu, where that
 # directory does not exist). The env/arg override above is unchanged.
 RUSTC=${TRUST_RUSTC:-$REPO/build/host/stage1/bin/rustc}
-LOCK=$REPO/scripts/trust_build_lock.sh
 
 FORCE=0
 if [ "${1:-}" = "--force" ]; then
@@ -81,16 +80,19 @@ LOCK_ARGS=(acquire --kind measurement --purpose "$PURPOSE -> $OUT_NAME" --pid $$
 if [ "$FORCE" = 1 ]; then
   LOCK_ARGS+=(--break --reason "run_measurement_sweep.sh --force by $(id -un)")
 fi
-if [ ! -x "$LOCK" ] && [ ! -f "$LOCK" ]; then
-  echo "REFUSING: $LOCK is missing; this sweep would run unprotected"; exit 3
-fi
-LOCK_TOKEN=$(sh "$LOCK" "${LOCK_ARGS[@]}") || exit 3
+INHERITED_LOCK_TOKEN=${TRUST_BUILD_LOCK_TOKEN:-}
+LOCK_TOKEN=$("${TARGO:-targo}" trust repo lock "${LOCK_ARGS[@]}" --repo-root "$REPO") || exit 3
 [ -n "$LOCK_TOKEN" ] || { echo "REFUSING: the build lock returned no token"; exit 3; }
 
 # THE TRAP, installed the instant the lock is held: every exit path from here on releases
 # both artifacts. Explicit `exit` in the signal arms because a zsh trap body that falls
 # through resumes the script, which would release the lock and then keep sweeping.
-cleanup() { rm -f "$SENTINEL"; sh "$LOCK" release "$LOCK_TOKEN" >/dev/null 2>&1; }
+cleanup() {
+  rm -f "$SENTINEL"
+  if [ "$LOCK_TOKEN" != "$INHERITED_LOCK_TOKEN" ]; then
+    "${TARGO:-targo}" trust repo lock release "$LOCK_TOKEN" --repo-root "$REPO" >/dev/null 2>&1
+  fi
+}
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 trap cleanup EXIT
@@ -140,7 +142,7 @@ rm -rf "$TMP"
   echo "expected_minutes=~37"
   echo "lock_token=$LOCK_TOKEN"
   echo "contract=DO NOT run x.py while this file exists; it deletes stage1/bin/rustc"
-  echo "enforced_by=scripts/trust_build_lock.sh (x.py takes the same lock)"
+  echo "enforced_by=targo trust repo lock (x.py takes the same lock)"
 } > "$SENTINEL"
 
 echo "=== measurement sentinel published (and the build lock is HELD):"

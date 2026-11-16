@@ -2,18 +2,15 @@
 #
 # Author: Andrew Yates. Copyright 2026 Andrew Yates. License: Apache-2.0 OR MIT.
 #
-# This is a census of silence, not a permission list. Every row is a revert
-# whose entire commit body was the generated "This reverts commit <sha>." line
-# and nothing else — measured 2026-08-20, 11 of 15 reverts in the whole history.
+# A census of silence, not a permission list. Every row is a published revert
+# whose commit body was only the generated "This reverts commit <sha>." line.
 # They are listed so that pushing a branch which carries them does not fail on
-# somebody else's old omission.
+# an old omission.
 #
-# THIS FILE MAY ONLY EVER SHRINK. A row here for a NEW revert is not a waiver,
-# it is a deletion of the gate: the gate exists precisely because the reason is
-# the part of a revert that does not survive in the diff. Fix the message
-# (`git commit --amend`, or reword during a rebase) instead. There is no
-# expiry date and no owner column on purpose — a row is not something to
-# maintain, it is something to have made impossible.
+# THIS FILE MAY ONLY EVER SHRINK. A row for a new revert deletes the gate: the
+# reason is the part of a revert that does not survive in the diff. Reword the
+# message of an unpushed revert (`git commit --amend`) instead. There is no
+# expiry date and no owner column on purpose.
 #
 # One full 40-character sha per line. `#` starts a comment.
 
@@ -51,3 +48,78 @@ c13b8cc366c705d4b01c48ad8236a90b5d87d54d
 921841f19c733b6d2bea3694378dd750542c0e3d
 # Revert "fix(rustc): debox native proof snapshots"
 a34e2c180578759d476d82e39212e3c3a6695d08
+
+# --- bare reverts published after this gate existed --------------------------
+# Each was pushed from a machine whose hook did not refuse it. A published
+# commit's message cannot be reworded without rewriting a shared branch, so
+# each is recorded with the reason recovered from the repository, or says
+# plainly that none could be found.
+
+# Revert "fix(bridge): R73 — lifetime-normalized known_functions key (measured 15-row desync)"
+# (origin/b62-merge-redo, 2026-08-25 06:19:37 -0700) reverts f874288085.
+# WHY, recorded one minute later in the sibling measurement repo: first-party/ny
+# commit ca78062bf (2026-08-25 06:20:37 -0700, on ny `main`, an ancestor of the
+# ny pin 72e0d38c3), "measure(R74): R73 flat AND wrong -- a retired fix
+# re-added; reverted". FLAT: with the driver landed, the `Parser::<'_>` rows
+# stayed 15/15 and the absent-callee census 225/225. WRONG PRODUCER: it edited
+# `function_id_map`, while `ctx.known_functions` is built by
+# `register_function_name`. DECISIVE: `register_function_name` carries a
+# gravestone for `normalize_lifetime_spelling` — the same fix for the same
+# desync, retired because a string-keyed callee decision is forgeable (FALSE
+# PROOF #14); readable at f874288085:crates/trust-ir-bridge/src/lower.rs:27476
+# ("RETIRED: LIFETIME-SPELLING NORMALIZATION"). The first attempt is 756c3a7d96,
+# its retirement 75d4eceee3 ("DefId+substs callee identity — retire the string
+# key at the root"), the sanctioned route. The R73 helper (`strip_lifetime_args`)
+# was never re-landed on any branch. The measurement script is
+# first-party/ny `.gatelogs/R74-lifetime-key.sh` at ca78062bf.
+f1987758f1a7ff228c23dcd4dfecca7160352eb4
+
+# Revert "wip: step1 obligation site inheritance" (3ad863c769, 2026-08-29
+# 00:40:16 -0700) and its reapplication, Reapply "wip: step1 obligation site
+# inheritance" (b6a8e0c5d0, 01:02:07 -0700), both by m107@ferrite.space on
+# `land/toolchain-build`; both reached `main` by merge (the first first-parent
+# commit of main that contains them is a854245808, 2026-08-29 14:14 -0700).
+# WHY: NOT ESTABLISHED. The repository does not record it, and this row says so
+# rather than inventing one. What IS established: f074102412 (00:17:20) was
+# committed on `land/toolchain-build` one second before that branch's merge of
+# origin/main (055096411a, 00:17:21); 3ad863c769 removes exactly its three
+# files (compiler/rustc_mir_transform/src/trust_verify.rs,
+# docs/design/DIRECT-LANE-PROOF-AUTHORITY.md,
+# tests/run-make/trust-native-bundle-obligation-site/rmake.rs); b6a8e0c5d0 puts
+# them back, and its tree (4ee09af494) is byte-identical to 055096411a's, so the
+# pair's NET EFFECT IS NIL — the tree lacked the change for 21m51s on that
+# branch, and no ref in this store holds the revert without its reapplication.
+# The content stood and was accepted afterwards:
+# docs/design/DIRECT-LANE-PROOF-AUTHORITY.md marks "the `step1 obligation site
+# inheritance` commits" as the route TAKEN, amended by 3c5aa3a845 (2026-08-29
+# 19:12, "the obligation-site lookup must not mutate the module it is reading",
+# which measured the run-make test 1 passed / 0 failed on a rebuilt stage2).
+# CHECKED, and silent: the bodies of all three commits (the generated line
+# only; no trailer, no session link); every commit on every ref between
+# 2026-08-28 20:00 and 2026-08-30 12:00 whose message names a revert, reapply,
+# wip or any of the three shas; origin/main's docs/, reports/, coordination/,
+# data/, scripts/, CLAUDE.md and AGENTS.md for the shas and for "obligation site
+# inheritance" (one hit: the TAKEN note above, which does not mention the
+# revert); the nine first-party submodule histories in that window; first-party/ny
+# `.gatelogs`; and the reflogs of ~/trust and its linked worktrees on this
+# machine (the commits were made on a different machine; no reflog holds them).
+3ad863c769ef7cfe4618a5cf607b0d3f000c0274
+b6a8e0c5d06a87c6b80719ddf667c0e0bbb394cb
+
+# Revert "pin(ay): bump to origin/main — the int<->bitvector bridge fix and the panic fixes"
+# (main, 7869d3b29c, 2026-09-10 16:32:36 -0700) reverts 7ede17485a (16:07:35).
+# WHY, recorded by the same session (Claude-Session session_01D9tZm5..., the
+# trailer on 7ede17485a) twenty minutes later in 84ebc9c39d,
+# docs/campaigns/2026-09-10-selfhost-trust-ir-cg.md, "Three breaks, all mine",
+# item 1, "A pin move without its consumer updates": bumping first-party/ay to
+# its main for the int<->bv fix broke `targo-trust`'s `--locked` build; updating
+# that lockfile then resolved `ay` from GIT REVS alongside the path copy, so
+# `trust-bmc` saw two `ay_bindings` versions and failed with a type mismatch
+# three build attempts deep — "Reverted." The same file's standing-gaps list
+# says landing the fix "needs the coordinated pin move that break 1 got wrong";
+# docs/audits/2026-09-10-prove-all-trust-audit.md:295 records the revert as
+# having no reason in its body. RE-LANDED with its consumer updates: the first
+# main commit whose ay pin contains ay 76d4e23ad (the int<->bv fix) is
+# ebea0f5fb8 (2026-09-12, "pins: nine-submodule cohort forward to the ay-0.26
+# boundary; locks, bridge and cohort waivers follow").
+7869d3b29c2f403ab9ed317b1700704dc00285de

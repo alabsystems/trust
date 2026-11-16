@@ -45,7 +45,7 @@ fn override_simple() {
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] bar v0.1.0 ([ROOTURL]/override#[..])
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -93,7 +93,7 @@ fn override_with_features() {
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [WARNING] unused field in replacement for `bar`: `features`
   |
   = [NOTE] configure `features` in the `dependencies` entry
@@ -144,7 +144,7 @@ fn override_with_setting_default_features() {
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [WARNING] unused field in replacement for `bar`: `features`, `default-features`
   |
   = [NOTE] configure `features`, `default-features` in the `dependencies` entry
@@ -284,6 +284,9 @@ fn transitive() {
 
                     [replace]
                     "bar:0.1.0" = {{ git = '{}' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
                 foo.url()
             ),
@@ -295,7 +298,7 @@ fn transitive() {
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] baz v0.2.0 (registry `dummy-registry`)
 [CHECKING] bar v0.1.0 ([ROOTURL]/override#[..])
@@ -353,7 +356,7 @@ fn persists_across_rebuilds() {
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] bar v0.1.0 ([ROOTURL]/override#[..])
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -405,7 +408,7 @@ fn replace_registry_with_path() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] bar v0.1.0 ([ROOT]/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -473,7 +476,7 @@ fn use_a_spec_to_select() {
             str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 4 packages to latest compatible versions
+[LOCKING] 4 packages to highest compatible versions
 [ADDING] baz v0.1.1 (available: v0.2.0)
 [DOWNLOADING] crates ...
 [DOWNLOADED] baz v0.1.1 (registry `dummy-registry`)
@@ -507,6 +510,9 @@ fn override_adds_some_deps() {
 
                 [dependencies]
                 baz = "0.1"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -528,6 +534,9 @@ fn override_adds_some_deps() {
 
                     [replace]
                     "bar:0.1.0" = {{ git = '{}' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
                 foo.url()
             ),
@@ -539,7 +548,7 @@ fn override_adds_some_deps() {
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] baz v0.1.1 (registry `dummy-registry`)
 [CHECKING] baz v0.1.1
@@ -563,7 +572,7 @@ fn override_adds_some_deps() {
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/override`
 [UPDATING] `dummy-registry` index
-[LOCKING] 0 packages to latest compatible versions
+[LOCKING] 0 packages to highest compatible versions
 [NOTE] pass `--verbose` to see 1 unchanged dependencies behind latest
 
 "#]])
@@ -571,7 +580,7 @@ fn override_adds_some_deps() {
     p.cargo("update  https://github.com/rust-lang/crates.io-index#bar")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 0 packages to latest compatible versions
+[LOCKING] 0 packages to highest compatible versions
 [NOTE] pass `--verbose` to see 1 unchanged dependencies behind latest
 
 "#]])
@@ -604,6 +613,9 @@ fn locked_means_locked_yes_no_seriously_i_mean_locked() {
 
                 [dependencies]
                 baz = "*"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -626,6 +638,9 @@ fn locked_means_locked_yes_no_seriously_i_mean_locked() {
 
                     [replace]
                     "bar:0.1.0" = {{ git = '{}' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
                 foo.url()
             ),
@@ -867,7 +882,7 @@ fn test_override_dep() {
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [ERROR] specification `bar` is ambiguous
 [HELP] re-run this command with one of the following specifications
   registry+https://github.com/rust-lang/crates.io-index#bar@0.1.0
@@ -914,7 +929,7 @@ fn update() {
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 0 packages to latest compatible versions
+[LOCKING] 0 packages to highest compatible versions
 
 "#]])
         .run();
@@ -1098,6 +1113,9 @@ fn overriding_nonexistent_no_spurious() {
 
                 [dependencies]
                 baz = { path = "baz" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "pub fn bar() {}")
@@ -1122,6 +1140,9 @@ fn overriding_nonexistent_no_spurious() {
                     [replace]
                     "bar:0.1.0" = {{ git = '{url}' }}
                     "baz:0.1.0" = {{ git = '{url}' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
                 url = bar.url()
             ),
@@ -1166,6 +1187,9 @@ fn no_warnings_when_replace_is_used_in_another_workspace_member() {
 
                 [dependencies]
                 bar = "0.1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("first_crate/src/lib.rs", "")
@@ -1183,7 +1207,7 @@ fn no_warnings_when_replace_is_used_in_another_workspace_member() {
         .with_stdout_data("")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] bar v0.1.0 ([ROOT]/foo/local_bar)
 [CHECKING] first_crate v0.1.0 ([ROOT]/foo/first_crate)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1449,7 +1473,7 @@ fn override_respects_spec_metadata() {
 
     p.cargo("check").with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [WARNING] package replacement is not used: https://github.com/rust-lang/crates.io-index#bar@0.1.0+notTheBuild
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0+a (registry `dummy-registry`)
@@ -1501,7 +1525,7 @@ fn override_spec_metadata_is_optional() {
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
 [UPDATING] git repository `[ROOTURL]/override`
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] bar v0.1.0+a ([ROOTURL]/override#[..])
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1535,6 +1559,9 @@ fn yanked_candidates_are_skipped() {
 
                 [replace]
                 "bar:1.0.0" = { path = "../bar" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1543,7 +1570,7 @@ fn yanked_candidates_are_skipped() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [WARNING] package replacement is not used: https://github.com/rust-lang/crates.io-index#bar@1.0.0
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v1.1.0 (registry `dummy-registry`)

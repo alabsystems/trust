@@ -1,0 +1,2 @@
+error: incorrect value `lock-release` for unstable option `trust-platform-properties` - a comma-separated list of platform properties: `fd-inherit` (`lock-release` and `fd-identity` are not supported by this trustc) was expected
+

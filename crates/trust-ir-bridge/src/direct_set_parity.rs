@@ -131,8 +131,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use trust_types::{
-    AdtAuth, ArbPrecKind, AssertMessage, BasicBlock, BinOp, ConstValue, LocalDecl, Operand,
-    Rvalue, Statement, Terminator, Ty, VerifiableFunction,
+    AdtAuth, ArbPrecKind, AssertMessage, BasicBlock, BinOp, ConstValue, LocalDecl, Operand, Rvalue,
+    Statement, Terminator, Ty, VerifiableFunction,
 };
 
 use crate::direct_formula_dump::{DIRECT_FORMULA_DUMP_VERSION, DumpedDirectRecord, DumpedOutcome};
@@ -696,10 +696,7 @@ pub fn classify_mir_assert_set(
             }
             census.six_class += 1;
             *census.per_class.entry(class_label(msg)).or_default() += 1;
-            let site = format!(
-                "{} L{}C{}",
-                func.def_path, span.line_start, span.col_start
-            );
+            let site = format!("{} L{}C{}", func.def_path, span.line_start, span.col_start);
             match const_index_bounds_shape(func, block, cond, msg) {
                 Some(ConstIndexShape::InBounds { k, n }) => {
                     census.const_index_in_bounds.push(format!("{site}: {k}<{n}"));
@@ -720,10 +717,7 @@ pub fn classify_mir_assert_set(
                 *target,
                 msg,
             ) {
-                *census
-                    .discharge_annotated
-                    .entry(DISCHARGE_ARBITRARY_PRECISION)
-                    .or_default() += 1;
+                *census.discharge_annotated.entry(DISCHARGE_ARBITRARY_PRECISION).or_default() += 1;
             }
         }
     }
@@ -781,8 +775,7 @@ pub fn set_parity(
     let mut index: BTreeMap<(String, String, u32, u32), BTreeMap<u32, usize>> = BTreeMap::new();
     for (i, record) in records.iter().enumerate() {
         let scope = format!("{}::{}", record.krate, record.def_path);
-        let group =
-            index.entry((scope, record.slug.clone(), record.line, record.col)).or_default();
+        let group = index.entry((scope, record.slug.clone(), record.line, record.col)).or_default();
         if group.insert(record.occ, i).is_some() {
             errors.push(format!(
                 "duplicate dumped identity: two records at ({}::{}, {}, L{}C{}, o{})",
@@ -904,18 +897,12 @@ pub fn set_parity(
                     };
                     for (mir_occ, block) in asserts.iter().enumerate() {
                         let mir_occ = u32::try_from(mir_occ).expect("occ fits u32");
-                        let Terminator::Assert { cond, msg, target, .. } = &block.terminator
-                        else {
+                        let Terminator::Assert { cond, msg, target, .. } = &block.terminator else {
                             continue;
                         };
                         let shape = const_index_bounds_shape(func, block, cond, msg);
-                        let discharge = discharge_annotation(
-                            locals,
-                            &func.body.blocks,
-                            block.id,
-                            *target,
-                            msg,
-                        );
+                        let discharge =
+                            discharge_annotation(locals, &func.body.blocks, block.id, *target, msg);
                         if body.clean_and_spliced() {
                             match shape {
                                 Some(ConstIndexShape::InBounds { k, n }) => rows.push(SiteRow {
@@ -1001,10 +988,8 @@ pub fn set_parity(
 
     let mut card = tally_site_rows(&rows);
     card.direct_rows = records.len();
-    card.direct_not_minted = records
-        .iter()
-        .filter(|r| matches!(r.outcome, DumpedOutcome::NotMinted(_)))
-        .count();
+    card.direct_not_minted =
+        records.iter().filter(|r| matches!(r.outcome, DumpedOutcome::NotMinted(_))).count();
     Ok((card, rows))
 }
 
@@ -1108,6 +1093,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1230,10 +1216,7 @@ mod tests {
         let corpus = corpus_of(vec![const_index_read_func(9, 7)]);
         let census = clean_census(&["m2crate::cpick"]);
         let errs = set_parity(&[], &corpus, &census).expect_err("must refuse");
-        assert!(
-            errs.iter().any(|e| e.contains("the #191 OOB refusal did not fire")),
-            "{errs:?}"
-        );
+        assert!(errs.iter().any(|e| e.contains("the #191 OOB refusal did not fire")), "{errs:?}");
     }
 
     /// FAIL-CLOSED ON NEW CLASSES: a six-class assert with no record in a
@@ -1300,8 +1283,8 @@ mod tests {
     #[test]
     fn missing_census_row_fails_closed() {
         let corpus = corpus_of(vec![const_index_read_func(3, 7)]);
-        let errs = set_parity(&[], &corpus, &DirectFunctionCensus::default())
-            .expect_err("must refuse");
+        let errs =
+            set_parity(&[], &corpus, &DirectFunctionCensus::default()).expect_err("must refuse");
         assert!(errs.iter().any(|e| e.contains("no census body row")), "{errs:?}");
     }
 
@@ -1311,8 +1294,8 @@ mod tests {
         let corpus = corpus_of(vec![coroutine_func()]);
         // Deliberately NO census row for coro: B-class classification is by
         // KIND and must not require one.
-        let (card, rows) = set_parity(&[], &corpus, &DirectFunctionCensus::default())
-            .expect("classifies");
+        let (card, rows) =
+            set_parity(&[], &corpus, &DirectFunctionCensus::default()).expect("classifies");
         assert_eq!(card.noncoverage.get(NONCOVERAGE_COROUTINE_RESUME), Some(&1));
         assert_eq!(card.mir_asserts_total, 1);
         assert_eq!(rows.len(), 1);
@@ -1353,9 +1336,10 @@ mod tests {
                             span: span(5, 9),
                         }],
                         terminator: Terminator::Assert {
-                            cond: Operand::Move(Place { local: 2, projections: vec![
-                                trust_types::Projection::Field(1),
-                            ] }),
+                            cond: Operand::Move(Place {
+                                local: 2,
+                                projections: vec![trust_types::Projection::Field(1)],
+                            }),
                             expected: false,
                             msg: AssertMessage::Overflow(BinOp::Shl),
                             target: BlockId(1),
@@ -1373,6 +1357,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let corpus = corpus_of(vec![func]);
         // A record exists (the direct lane does NOT discharge literal
@@ -1391,11 +1376,8 @@ mod tests {
     /// The census-mode enumeration over the same synthetic bodies.
     #[test]
     fn census_mode_enumerates_shapes_and_kinds() {
-        let corpus = corpus_of(vec![
-            const_index_read_func(3, 7),
-            dynamic_index_func(),
-            coroutine_func(),
-        ]);
+        let corpus =
+            corpus_of(vec![const_index_read_func(3, 7), dynamic_index_func(), coroutine_func()]);
         let census = classify_mir_assert_set(&corpus).expect("enumerates");
         assert_eq!(census.asserts_total, 3);
         assert_eq!(census.six_class, 2);
@@ -1435,8 +1417,7 @@ mod tests {
     /// NOT exercise the C1 class (the probe artifacts do).
     #[test]
     fn m2_corpus_census_ratchet() {
-        let dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../trust-vcgen/tests/data");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../trust-vcgen/tests/data");
         let corpus = load_corpus_dir(&dir);
         let census = classify_mir_assert_set(&corpus).expect("the corpus must enumerate");
         print_mir_set_census("61-fixture vcgen corpus", &census);
@@ -1490,29 +1471,34 @@ mod tests {
 
     /// Env-keyed driver: TRUST_DIRECT_SET_RECORDS_JSONL +
     /// TRUST_DIRECT_SET_MIR_CORPUS + TRUST_DIRECT_SET_COVERAGE_JSON run the
-    /// full set-parity comparison over real artifacts; skips LOUDLY when
-    /// unset.
+    /// full set-parity comparison over real artifacts. `#[ignore]`d, and it
+    /// panics when any of the three is unset, so a bare `--ignored` run cannot
+    /// pass having compared nothing.
     #[test]
+    #[ignore = "measurement driver: set TRUST_DIRECT_SET_RECORDS_JSONL, \
+                TRUST_DIRECT_SET_MIR_CORPUS and TRUST_DIRECT_SET_COVERAGE_JSON and run with \
+                --ignored --nocapture"]
     fn set_parity_env_driver() {
+        const RECIPE: &str = "TRUST_DIRECT_SET_RECORDS_JSONL=<a *.direct-formulas.jsonl> \
+             TRUST_DIRECT_SET_MIR_CORPUS=<dir of VerifiableFunction json> \
+             TRUST_DIRECT_SET_COVERAGE_JSON=<the same compilation's coverage.json> \
+             targo --unverified test --manifest-path crates/Cargo.toml -p trust-ir-bridge \
+             --lib -- --ignored --exact direct_set_parity::tests::set_parity_env_driver \
+             --nocapture";
+        fn unset(var: &str) -> ! {
+            panic!(
+                "set_parity_env_driver is a measurement driver and {var} is unset, so it \
+                 compared nothing. Run: {RECIPE}"
+            )
+        }
         let Some(records_path) = std::env::var_os("TRUST_DIRECT_SET_RECORDS_JSONL") else {
-            eprintln!(
-                "SKIPPED (loudly): TRUST_DIRECT_SET_RECORDS_JSONL unset — set it to a \
-                 *.direct-formulas.jsonl, TRUST_DIRECT_SET_MIR_CORPUS to a dir of \
-                 VerifiableFunction json, and TRUST_DIRECT_SET_COVERAGE_JSON to the same \
-                 compilation's coverage.json, to run set parity over real artifacts"
-            );
-            println!("SKIPPED (loudly): TRUST_DIRECT_SET_RECORDS_JSONL unset");
-            return;
+            unset("TRUST_DIRECT_SET_RECORDS_JSONL");
         };
         let Some(corpus_dir) = std::env::var_os("TRUST_DIRECT_SET_MIR_CORPUS") else {
-            eprintln!("SKIPPED (loudly): TRUST_DIRECT_SET_MIR_CORPUS unset");
-            println!("SKIPPED (loudly): TRUST_DIRECT_SET_MIR_CORPUS unset");
-            return;
+            unset("TRUST_DIRECT_SET_MIR_CORPUS");
         };
         let Some(coverage_path) = std::env::var_os("TRUST_DIRECT_SET_COVERAGE_JSON") else {
-            eprintln!("SKIPPED (loudly): TRUST_DIRECT_SET_COVERAGE_JSON unset");
-            println!("SKIPPED (loudly): TRUST_DIRECT_SET_COVERAGE_JSON unset");
-            return;
+            unset("TRUST_DIRECT_SET_COVERAGE_JSON");
         };
         let text = std::fs::read_to_string(PathBuf::from(&records_path))
             .expect("TRUST_DIRECT_SET_RECORDS_JSONL must be readable");

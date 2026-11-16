@@ -1,0 +1,46 @@
+{
+  "entrypoint_sha256": {
+    "cargo": "937d9c8852a76dae34a98bc907ef8f8abc620cc3df17be6fc384c61067cc25dc",
+    "rustc": "5d505579da7eeaac54868d794d5e7fb4c142de28ebf06c35d3dbb92d07a3671e",
+    "targo": "937d9c8852a76dae34a98bc907ef8f8abc620cc3df17be6fc384c61067cc25dc",
+    "trustc": "5d505579da7eeaac54868d794d5e7fb4c142de28ebf06c35d3dbb92d07a3671e",
+    "trustdoc": "0be5a5a83f9e2711e2aa3727a192b237388b49fc66ccd6ebed882ccf5ef316fb",
+    "trustfmt": "6b7e6b843296a9dc87eb557dcda4eb1e9014285b2b308d2aaa3e61ba8f7a0f41"
+  },
+  "host": "aarch64-apple-darwin",
+  "mint": {
+    "ddc_seed_commit": "fd8e211ae301c84a86d13cf52a6d3ce08c589e2e",
+    "ddc_seed_lineage": "stock",
+    "ddc_seed_relation": "lineage-disjoint",
+    "lineage_disjoint_anchor": "82bb867eddb94599f68194f701c766f2b6f5a02f",
+    "pinned_seed_commit": "29ebb403de7a102850d6cb10a62d5cc3baf723ed",
+    "self_host_proof": "pass",
+    "stage2_tree_sha256_ddc_seed": "6bff6fd144f5da4b804a311969bc0ad260150e5705611f7547f9a36449debcdf",
+    "stage2_tree_sha256_pinned_seed": "6bff6fd144f5da4b804a311969bc0ad260150e5705611f7547f9a36449debcdf"
+  },
+  "payloads": {
+    "dist/2026-11-07/targo-0.13.0-trust-aarch64-apple-darwin.tar.xz": "9daef404105f86603cb670e9c885cf68289dd494e3ab15cf607593772eab4514",
+    "dist/2026-11-07/targo-trust-0.13.0-trust-aarch64-apple-darwin.tar.xz": "148fd4fe60a96545addf6192eb5b1913878b5a4b80993a92616c8cc4f36e35ce",
+    "dist/2026-11-07/tippy-0.13.0-trust-aarch64-apple-darwin.tar.xz": "0c0ef8f7929855f66f56e8f7548be362ba035ae71ebbe57eaedb7b72a17a0724",
+    "dist/2026-11-07/trust-analyzer-0.13.0-trust-aarch64-apple-darwin.tar.xz": "6070ceaaefdc81e84a25b440308ef34452de678f088a3a32d83a69f0066e8d31",
+    "dist/2026-11-07/trust-src-0.13.0-trust.tar.xz": "17a4c26ef376dc739db147263e82b04bd0e290fd1e3cd6e219d0e7b40edc7689",
+    "dist/2026-11-07/trust-std-0.13.0-trust-aarch64-apple-darwin.tar.xz": "9ed1059a7bbb2914da06b3d9fa5d4faecede52362560659123c5ab6c792120eb",
+    "dist/2026-11-07/trustc-0.13.0-trust-aarch64-apple-darwin.tar.xz": "c81028808506a0c9b4fdca33ceaabf4ffdab45b23c4169de44596209ac573505",
+    "dist/2026-11-07/trustc-dev-0.13.0-trust-aarch64-apple-darwin.tar.xz": "12fd22868dfe622d40d5a9a4ded9ec35dc96dbbfe51d3d5db027de2ad4847e7f",
+    "dist/2026-11-07/trustfmt-0.13.0-trust-aarch64-apple-darwin.tar.xz": "04a7bed03547504084235b7a294d9bf7834e35e7f2fea35245e1a6da5824262d"
+  },
+  "pinned_seed_date": "2026-10-28",
+  "receipt_path": "host-proofs/aarch64-apple-darwin/SEED-MINT",
+  "receipt_sha256": "864b0eff17f8ab7ce49aedb8d760f47ebc7c47f33c77575de7868f2f1551f20b",
+  "reported_product_identities": {
+    "targo": "targo 1.101.0-dev (82bb867ed 2026-11-07) (targo 0.13.0+g82bb867ed)",
+    "trustc": "rustc 1.101.0-dev (82bb867ed 2026-11-07) (trustc 0.13.0+g82bb867ed)",
+    "trustfmt": "trustfmt 1.12.0-trust (82bb867edd 2026-11-07)"
+  },
+  "schema": "trust-seed-host-record-v1",
+  "source_commit": "82bb867eddb94599f68194f701c766f2b6f5a02f",
+  "source_commit_date": "2026-11-07",
+  "source_version": "0.13.0",
+  "surface_path": "host-proofs/aarch64-apple-darwin/seed-surface.json",
+  "surface_sha256": "5d4a045319f2812ebc66ab1beb60818ae05bc75a8ed4616844beedb497eda214"
+}

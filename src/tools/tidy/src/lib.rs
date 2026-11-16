@@ -4,6 +4,7 @@
 //! to be used by tools.
 
 use std::ffi::OsStr;
+use std::num::NonZeroUsize;
 use std::process::Command;
 
 macro_rules! static_regex {
@@ -119,6 +120,7 @@ pub mod mir_opt_tests;
 pub mod pal;
 pub mod rustdoc_css_themes;
 pub mod rustdoc_gui_tests;
+pub mod rustdoc_html_tests;
 pub mod rustdoc_json;
 pub mod rustdoc_templates;
 pub mod seed_freshness; // Trust: re-seed cadence invariant
@@ -139,3 +141,49 @@ pub mod walk;
 // Trust: `[workspace.lints]` is only policy once members opt in.
 pub mod workspace_lints;
 pub mod x_version;
+
+pub struct Semaphore {
+    sem: std::sync::Mutex<usize>,
+    cond: std::sync::Condvar,
+}
+
+impl Semaphore {
+    pub fn new(count: NonZeroUsize) -> Self {
+        Self { sem: std::sync::Mutex::new(count.get()), cond: std::sync::Condvar::new() }
+    }
+
+    pub fn acquire(&self) -> Guard<'_> {
+        let mut count = self.sem.lock().unwrap();
+        while *count == 0 {
+            count = self.cond.wait(count).unwrap();
+        }
+        *count -= 1;
+        Guard { sem: self }
+    }
+
+    // Trust: nested checks already hold a permit and must be able to run inline.
+    pub fn try_acquire(&self) -> Option<Guard<'_>> {
+        let mut count = self.sem.lock().unwrap();
+        if *count == 0 {
+            return None;
+        }
+        *count -= 1;
+        Some(Guard { sem: self })
+    }
+
+    fn release(&self) {
+        let mut count = self.sem.lock().unwrap();
+        *count += 1;
+        self.cond.notify_one();
+    }
+}
+
+pub struct Guard<'a> {
+    sem: &'a Semaphore,
+}
+
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        self.sem.release();
+    }
+}

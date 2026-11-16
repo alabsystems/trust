@@ -247,8 +247,13 @@ fn probe_p3_raw_nat_sub_predecessor_still_plans() {
 fn probe_p4_canonical_fixture_passes_the_gate() {
     let env = island(&[COUNTDOWN_SUM]);
     let plan = plan_clean_origin_body(&env, "countdownSum").expect("p1");
-    let CleanOriginShape::WellFoundedNatRec { zero_value, nonzero_value, rec_args, measure_index, lowering: _ } =
-        plan.shape()
+    let CleanOriginShape::WellFoundedNatRec {
+        zero_value,
+        nonzero_value,
+        rec_args,
+        measure_index,
+        lowering: _,
+    } = plan.shape()
     else {
         panic!("p1 pins the shape");
     };
@@ -262,9 +267,13 @@ fn probe_p4_canonical_fixture_passes_the_gate() {
         rec_args: rec_args.clone(),
         measure_index: *measure_index,
     };
-    let reflected =
-        trust_clean_origin::reflect_wf::reflect_wf_functional(&env, "countdownSum", &body, trust_clean_origin::WfLowering::OnParameter)
-            .expect("the frozen producer must render the planned reading");
+    let reflected = trust_clean_origin::reflect_wf::reflect_wf_functional(
+        &env,
+        "countdownSum",
+        &body,
+        trust_clean_origin::WfLowering::OnParameter,
+    )
+    .expect("the frozen producer must render the planned reading");
 
     let faithful = trust_clean_origin::gate::check_faithful_wf_functional(
         &env,

@@ -24,33 +24,35 @@
 //! `trusted_external`; otherwise the caller fails closed. So both closures are
 //! sound: an unknown external callee never silently confers a facet.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::call_graph::CallGraph;
+use crate::fx::{FxHashMap, FxHashSet};
 
 /// A resolved callee: an in-graph function (by def-path) or an external name.
-enum Callee {
-    Internal(String),
-    External(String),
+enum Callee<'a> {
+    Internal(&'a str),
+    External(&'a str),
 }
 
 /// For each node def-path, its callees (resolved to in-graph def-paths or kept
 /// as external names). Edges whose caller is not a node are ignored.
-fn callees_by_caller(cg: &CallGraph) -> HashMap<String, Vec<Callee>> {
-    let node_paths: HashSet<&str> = cg.nodes.iter().map(|n| n.def_path.as_str()).collect();
-    let mut map: HashMap<String, Vec<Callee>> = HashMap::new();
+fn callees_by_caller(cg: &CallGraph) -> FxHashMap<&str, Vec<Callee<'_>>> {
+    let resolver = cg.callee_resolver();
+    let mut map: FxHashMap<&str, Vec<Callee<'_>>> =
+        FxHashMap::with_capacity_and_hasher(cg.nodes.len(), Default::default());
     for n in &cg.nodes {
-        map.entry(n.def_path.clone()).or_default();
+        map.entry(n.def_path.as_str()).or_default();
     }
     for e in &cg.edges {
-        if !node_paths.contains(e.caller.as_str()) {
+        let Some(callees) = map.get_mut(e.caller.as_str()) else {
             continue;
-        }
-        let callee = match cg.resolve_unique_callee(&e.callee) {
-            Some(def_path) => Callee::Internal(def_path.to_string()),
-            None => Callee::External(e.callee.clone()),
         };
-        map.entry(e.caller.clone()).or_default().push(callee);
+        let callee = match resolver.resolve(&e.callee) {
+            Some(def_path) => Callee::Internal(def_path),
+            None => Callee::External(e.callee.as_str()),
+        };
+        callees.push(callee);
     }
     map
 }
@@ -58,13 +60,13 @@ fn callees_by_caller(cg: &CallGraph) -> HashMap<String, Vec<Callee>> {
 /// Whether every callee of `caller` currently satisfies the facet: an internal
 /// callee must be in `have`, an external callee must be in `trusted_external`.
 fn all_callees_satisfy(
-    callees: &[Callee],
-    have: &HashSet<String>,
+    callees: &[Callee<'_>],
+    have: &FxHashSet<&str>,
     trusted_external: &HashSet<String>,
 ) -> bool {
     callees.iter().all(|c| match c {
-        Callee::Internal(dp) => have.contains(dp),
-        Callee::External(name) => trusted_external.contains(name),
+        Callee::Internal(dp) => have.contains(*dp),
+        Callee::External(name) => trusted_external.contains(*name),
     })
 }
 
@@ -79,23 +81,34 @@ pub fn greatest_facet_closure(
     trusted_external: &HashSet<String>,
 ) -> HashSet<String> {
     let callees = callees_by_caller(cg);
-    let node_paths: HashSet<String> = cg.nodes.iter().map(|n| n.def_path.clone()).collect();
+    let cap = cg.nodes.len().min(base.len());
     // Start from every intrinsically-satisfying node and shrink.
-    let mut have: HashSet<String> = base.intersection(&node_paths).cloned().collect();
-    loop {
-        let doomed: Vec<String> = have
-            .iter()
-            .filter(|f| {
-                let cs = callees.get(f.as_str()).map(Vec::as_slice).unwrap_or(&[]);
-                !all_callees_satisfy(cs, &have, trusted_external)
-            })
-            .cloned()
-            .collect();
-        if doomed.is_empty() {
-            return have;
+    let mut have: FxHashSet<&str> = FxHashSet::with_capacity_and_hasher(cap, Default::default());
+    let mut active: Vec<(&str, &[Callee<'_>])> = Vec::with_capacity(cap);
+    for n in &cg.nodes {
+        if base.contains(&n.def_path) {
+            let f = n.def_path.as_str();
+            if have.insert(f) {
+                let cs = callees.get(f).map(Vec::as_slice).unwrap_or(&[]);
+                active.push((f, cs));
+            }
         }
-        for f in doomed {
-            have.remove(&f);
+    }
+    let mut doomed: Vec<&str> = Vec::new();
+    loop {
+        active.retain(|&(f, cs)| {
+            if all_callees_satisfy(cs, &have, trusted_external) {
+                true
+            } else {
+                doomed.push(f);
+                false
+            }
+        });
+        if doomed.is_empty() {
+            return have.into_iter().map(str::to_owned).collect();
+        }
+        for f in doomed.drain(..) {
+            have.remove(f);
         }
     }
 }
@@ -110,22 +123,32 @@ pub fn least_facet_closure(
     trusted_external: &HashSet<String>,
 ) -> HashSet<String> {
     let callees = callees_by_caller(cg);
-    let mut have: HashSet<String> = HashSet::new();
+    let cap = cg.nodes.len().min(base.len());
+    let mut have: FxHashSet<&str> = FxHashSet::with_capacity_and_hasher(cap, Default::default());
+    let mut pending: Vec<(&str, &[Callee<'_>])> = Vec::with_capacity(cap);
+    for n in &cg.nodes {
+        if base.contains(&n.def_path) {
+            let f = n.def_path.as_str();
+            let cs = callees.get(f).map(Vec::as_slice).unwrap_or(&[]);
+            pending.push((f, cs));
+        }
+    }
     loop {
         let mut added = false;
-        for n in &cg.nodes {
-            let f = &n.def_path;
-            if have.contains(f) || !base.contains(f) {
-                continue;
+        pending.retain(|&(f, cs)| {
+            if have.contains(f) {
+                return false;
             }
-            let cs = callees.get(f.as_str()).map(Vec::as_slice).unwrap_or(&[]);
             if all_callees_satisfy(cs, &have, trusted_external) {
-                have.insert(f.clone());
+                have.insert(f);
                 added = true;
+                false
+            } else {
+                true
             }
-        }
+        });
         if !added {
-            return have;
+            return have.into_iter().map(str::to_owned).collect();
         }
     }
 }

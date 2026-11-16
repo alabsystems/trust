@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-EC): a FIELDLESS enum cast to an integer is its discriminant —
 //! `ExtractField(0)` of the enum aggregate (the registered tag, in the
 //! canonical repr) followed by the ordinary int→int cast, so a canonical `I8`

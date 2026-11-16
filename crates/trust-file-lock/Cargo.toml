@@ -1,0 +1,14 @@
+[package]
+name = "trust-file-lock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Stable local file ownership without daemon or proof dependencies"
+
+[lints]
+workspace = true
+
+[dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }

@@ -12,7 +12,7 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use std::collections::BTreeMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -27,6 +27,19 @@ use crate::formula::{Formula, Sort};
 /// compatibility decoder may accept the historical hyphen spelling, but that
 /// tolerance is not part of the producer contract or this common ingress.
 pub const TRUST_WP_TRUST_FORMULA_SCHEMA_VERSION: &str = "trust_wp.trust-formula.v1";
+
+/// Encode one exact integer in the native replay decoder's i64/u64 JSON range.
+/// This changes no sort or arithmetic semantics and never converts via f64.
+pub fn trust_formula_v1_integer_literal(value: &str) -> Result<serde_json::Number, String> {
+    if let Ok(value) = value.parse::<i64>() {
+        return Ok(value.into());
+    }
+    value.parse::<u64>().map(Into::into).map_err(|error| {
+        format!(
+            "integer literal `{value}` is outside the exact i64/u64 TrustFormulaV1 range: {error}"
+        )
+    })
+}
 
 /// Return whether `name` is one opaque identifier token in trust-wp's contract
 /// parser and cannot be reinterpreted as parser syntax.
@@ -70,9 +83,11 @@ pub fn trust_wp_pure_expr_v1_opaque_identifier(name: &str) -> bool {
 /// This is the common ingress check for the compiler and the trust-wp adapter.
 /// It deliberately lives below both so a prebuilt JSON envelope cannot bypass
 /// the arithmetic refusal enforced by their source-AST lowering paths.
+/// Object keys use the common recursive canonicalizer, independently of
+/// serde_json's map feature. Array order and the caller's value stay intact.
 pub fn canonical_arithmetic_free_trust_formula_v1_payload(value: &Value) -> Result<String, String> {
     validate_arithmetic_free_trust_formula_v1(value)?;
-    serde_json::to_string(value)
+    serde_json::to_string(&crate::digest::canonical_json_value(value))
         .map_err(|err| format!("could not serialize canonical TrustFormulaV1 predicate: {err}"))
 }
 
@@ -152,8 +167,7 @@ pub fn reject_trust_wp_pure_expr_v1_text_arithmetic(payload: &str) -> Result<(),
                     {
                         index += 1;
                     }
-                    let name = std::str::from_utf8(&bytes[start..index])
-                        .expect("ASCII identifier bytes are valid UTF-8");
+                    let name = &payload[start..index];
                     if !matches!(name, "true" | "false")
                         && !trust_wp_pure_expr_v1_opaque_identifier(name)
                     {
@@ -230,11 +244,23 @@ fn consume_stable_text_integer(
 ) -> Result<(), String> {
     let start = *index;
     let mut previous_was_underscore = false;
-    while let Some(byte) = bytes.get(*index) {
+    let mut magnitude = 0u128;
+    let mut overflow = false;
+    while let Some(&byte) = bytes.get(*index) {
         if byte.is_ascii_digit() {
             previous_was_underscore = false;
+            if !overflow {
+                if let Some(next) = magnitude
+                    .checked_mul(10)
+                    .and_then(|acc| acc.checked_add(u128::from(byte - b'0')))
+                {
+                    magnitude = next;
+                } else {
+                    overflow = true;
+                }
+            }
             *index += 1;
-        } else if *byte == b'_' && !previous_was_underscore {
+        } else if byte == b'_' && !previous_was_underscore {
             previous_was_underscore = true;
             *index += 1;
         } else {
@@ -244,16 +270,8 @@ fn consume_stable_text_integer(
     if *index == start || previous_was_underscore {
         return Err(format!("TrustWpPureExprV1 integer literal at byte {start} is malformed"));
     }
-    let magnitude: String = bytes[start..*index]
-        .iter()
-        .filter(|byte| **byte != b'_')
-        .map(|byte| char::from(*byte))
-        .collect();
-    let magnitude = magnitude
-        .parse::<u128>()
-        .map_err(|_| format!("TrustWpPureExprV1 integer literal at byte {start} is outside i64"))?;
     let max_magnitude = if negative { i64::MAX as u128 + 1 } else { i64::MAX as u128 };
-    if magnitude > max_magnitude {
+    if overflow || magnitude > max_magnitude {
         return Err(format!("TrustWpPureExprV1 integer literal at byte {start} is outside i64"));
     }
     Ok(())
@@ -306,14 +324,17 @@ fn validate_arithmetic_free_trust_formula_v1(value: &Value) -> Result<(), String
         }
     }
 
-    let mut env = BTreeMap::new();
+    let mut env: BTreeMap<&str, TrustFormulaV1Sort> = BTreeMap::new();
+    let mut path = String::with_capacity(64);
     if let Some(variables) = object.get("variables") {
         let variables = variables
             .as_array()
             .ok_or_else(|| "TrustFormulaV1 `variables` must be an array".to_string())?;
         for (index, binding) in variables.iter().enumerate() {
-            let (name, sort) = validate_binding(binding, &format!("variables[{index}]"), false)?;
-            if env.insert(name.clone(), sort).is_some() {
+            path.clear();
+            let _ = write!(path, "variables[{index}]");
+            let (name, sort) = validate_binding(binding, &path, false)?;
+            if env.insert(name, sort).is_some() {
                 return Err(format!("duplicate TrustFormulaV1 binding `{name}`"));
             }
         }
@@ -321,7 +342,7 @@ fn validate_arithmetic_free_trust_formula_v1(value: &Value) -> Result<(), String
 
     let result_name = if let Some(result) = object.get("result") {
         let (name, sort) = validate_binding(result, "result", true)?;
-        if env.insert(name.clone(), sort).is_some() {
+        if env.insert(name, sort).is_some() {
             return Err(format!("duplicate TrustFormulaV1 binding `{name}`"));
         }
         Some(name)
@@ -332,8 +353,10 @@ fn validate_arithmetic_free_trust_formula_v1(value: &Value) -> Result<(), String
     let body = object.get("body").ok_or_else(|| {
         "typed TrustFormulaV1 predicate is missing required field `body`".to_string()
     })?;
-    let body_sort = validate_arithmetic_free_expr(body, &env, result_name.as_deref(), "body")?;
-    require_formula_sort(&body_sort, &TrustFormulaV1Sort::Bool, "body")?;
+    path.clear();
+    path.push_str("body");
+    let body_sort = validate_arithmetic_free_expr(body, &mut env, result_name, &mut path)?;
+    require_formula_sort(&body_sort, &TrustFormulaV1Sort::Bool, &path)?;
     Ok(())
 }
 
@@ -350,7 +373,7 @@ fn validate_binding<'a>(
     value: &'a Value,
     path: &str,
     optional_name: bool,
-) -> Result<(String, TrustFormulaV1Sort), String> {
+) -> Result<(&'a str, TrustFormulaV1Sort), String> {
     let object = value.as_object().ok_or_else(|| format!("{path} must be an object"))?;
     reject_unknown_fields(object, path, &["name", "sort"])?;
     let name = match object.get("name") {
@@ -359,20 +382,40 @@ fn validate_binding<'a>(
         None if optional_name => "result",
         None => return Err(format!("{path} is missing required field `name`")),
     };
-    validate_name(name, &format!("{path}.name"))?;
+    validate_name(name, path, ".name")?;
     let sort = object
         .get("sort")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{path}.sort must be a string"))?;
-    let sort = decode_trust_formula_v1_sort(sort, &format!("{path}.sort"))?;
-    Ok((name.to_string(), sort))
+    let sort = decode_trust_formula_v1_sort(sort, path, ".sort")?;
+    Ok((name, sort))
 }
 
-fn validate_arithmetic_free_expr(
-    value: &Value,
-    env: &BTreeMap<String, TrustFormulaV1Sort>,
+fn validate_child_expr<'a>(
+    value: &'a Value,
+    env: &mut BTreeMap<&'a str, TrustFormulaV1Sort>,
     result_name: Option<&str>,
-    path: &str,
+    path: &mut String,
+    suffix: &str,
+    expected_sort: Option<&TrustFormulaV1Sort>,
+) -> Result<TrustFormulaV1Sort, String> {
+    let len = path.len();
+    path.push_str(suffix);
+    let result = validate_arithmetic_free_expr(value, env, result_name, path).and_then(|sort| {
+        if let Some(expected) = expected_sort {
+            require_formula_sort(&sort, expected, path)?;
+        }
+        Ok(sort)
+    });
+    path.truncate(len);
+    result
+}
+
+fn validate_arithmetic_free_expr<'a>(
+    value: &'a Value,
+    env: &mut BTreeMap<&'a str, TrustFormulaV1Sort>,
+    result_name: Option<&str>,
+    path: &mut String,
 ) -> Result<TrustFormulaV1Sort, String> {
     let object = value.as_object().ok_or_else(|| format!("{path} must be an object"))?;
 
@@ -387,8 +430,12 @@ fn validate_arithmetic_free_expr(
         reject_unknown_fields(object, path, &["int"])?;
         return value
             .as_i64()
+            .map(|_| ())
+            .or_else(|| value.as_u64().map(|_| ()))
             .map(|_| TrustFormulaV1Sort::Int)
-            .ok_or_else(|| format!("{path}.int must be a signed 64-bit integer"));
+            .ok_or_else(|| {
+                format!("{path}.int must be an exact signed or unsigned 64-bit integer")
+            });
     }
     if let Some(value) = object.get("var") {
         reject_unknown_fields(object, path, &["var"])?;
@@ -411,7 +458,7 @@ fn validate_arithmetic_free_expr(
     }
     if let Some(inner) = object.get("old") {
         reject_unknown_fields(object, path, &["old"])?;
-        return validate_arithmetic_free_expr(inner, env, result_name, &format!("{path}.old"));
+        return validate_child_expr(inner, env, result_name, path, ".old", None);
     }
 
     let op = object
@@ -426,9 +473,14 @@ fn validate_arithmetic_free_expr(
         "not" => {
             reject_unknown_fields(object, path, &["op", "expr"])?;
             let expr = object.get("expr").ok_or_else(|| format!("{path}.expr is required"))?;
-            let sort =
-                validate_arithmetic_free_expr(expr, env, result_name, &format!("{path}.expr"))?;
-            require_formula_sort(&sort, &TrustFormulaV1Sort::Bool, &format!("{path}.expr"))?;
+            validate_child_expr(
+                expr,
+                env,
+                result_name,
+                path,
+                ".expr",
+                Some(&TrustFormulaV1Sort::Bool),
+            )?;
             Ok(TrustFormulaV1Sort::Bool)
         }
         "let" => {
@@ -438,13 +490,12 @@ fn validate_arithmetic_free_expr(
                 return Err(format!("{path}.name shadows existing binding `{name}`"));
             }
             let value = object.get("value").ok_or_else(|| format!("{path}.value is required"))?;
-            let value_sort =
-                validate_arithmetic_free_expr(value, env, result_name, &format!("{path}.value"))?;
-            require_formula_sort(&value_sort, &declared_sort, &format!("{path}.value"))?;
+            validate_child_expr(value, env, result_name, path, ".value", Some(&declared_sort))?;
             let body = object.get("body").ok_or_else(|| format!("{path}.body is required"))?;
-            let mut scoped = env.clone();
-            scoped.insert(name.to_string(), declared_sort);
-            validate_arithmetic_free_expr(body, &scoped, result_name, &format!("{path}.body"))
+            env.insert(name, declared_sort);
+            let result = validate_child_expr(body, env, result_name, path, ".body", None);
+            env.remove(name);
+            result
         }
         "forall" | "exists" => {
             reject_unknown_fields(object, path, &["op", "name", "sort", "body"])?;
@@ -453,63 +504,57 @@ fn validate_arithmetic_free_expr(
                 return Err(format!("{path}.name shadows existing binding `{name}`"));
             }
             let body = object.get("body").ok_or_else(|| format!("{path}.body is required"))?;
-            let mut scoped = env.clone();
-            scoped.insert(name.to_string(), declared_sort);
-            let body_sort =
-                validate_arithmetic_free_expr(body, &scoped, result_name, &format!("{path}.body"))?;
-            require_formula_sort(&body_sort, &TrustFormulaV1Sort::Bool, &format!("{path}.body"))?;
+            env.insert(name, declared_sort);
+            let result = validate_child_expr(
+                body,
+                env,
+                result_name,
+                path,
+                ".body",
+                Some(&TrustFormulaV1Sort::Bool),
+            );
+            env.remove(name);
+            result?;
             Ok(TrustFormulaV1Sort::Bool)
         }
-        "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "and" | "or" | "implies" => {
+        "eq" | "ne" => {
             reject_unknown_fields(object, path, &["op", "lhs", "rhs"])?;
             let lhs = object.get("lhs").ok_or_else(|| format!("{path}.lhs is required"))?;
             let rhs = object.get("rhs").ok_or_else(|| format!("{path}.rhs is required"))?;
-            let lhs_sort =
-                validate_arithmetic_free_expr(lhs, env, result_name, &format!("{path}.lhs"))?;
-            let rhs_sort =
-                validate_arithmetic_free_expr(rhs, env, result_name, &format!("{path}.rhs"))?;
-            match op {
-                // Equality is the sole operation retained for downstream
-                // Seq/ref/type-parameter sorts; both sides must still agree.
-                "eq" | "ne" => {
-                    require_formula_sort(&rhs_sort, &lhs_sort, &format!("{path}.rhs"))?;
-                    // The downstream native-sort inference has no general Seq
-                    // sort. It accepts Seq equality only through its structural
-                    // reflexivity escape hatch (`lhs == rhs`), so mirror that
-                    // exact restriction here instead of admitting a claim that
-                    // the advertised common ingress later demotes.
-                    if lhs_sort == TrustFormulaV1Sort::Seq && lhs != rhs {
-                        return Err(format!(
-                            "{path} compares distinct Seq expressions; native TrustFormulaV1 replay supports only structurally reflexive Seq equality"
-                        ));
-                    }
-                }
-                "lt" | "le" | "gt" | "ge" => {
-                    require_formula_sort(
-                        &lhs_sort,
-                        &TrustFormulaV1Sort::Int,
-                        &format!("{path}.lhs"),
-                    )?;
-                    require_formula_sort(
-                        &rhs_sort,
-                        &TrustFormulaV1Sort::Int,
-                        &format!("{path}.rhs"),
-                    )?;
-                }
-                "and" | "or" | "implies" => {
-                    require_formula_sort(
-                        &lhs_sort,
-                        &TrustFormulaV1Sort::Bool,
-                        &format!("{path}.lhs"),
-                    )?;
-                    require_formula_sort(
-                        &rhs_sort,
-                        &TrustFormulaV1Sort::Bool,
-                        &format!("{path}.rhs"),
-                    )?;
-                }
-                _ => unreachable!("operator match is exhaustive"),
+            let lhs_sort = validate_child_expr(lhs, env, result_name, path, ".lhs", None)?;
+            // Equality is the sole operation retained for downstream
+            // Seq/ref/type-parameter sorts; both sides must still agree.
+            validate_child_expr(rhs, env, result_name, path, ".rhs", Some(&lhs_sort))?;
+            // The downstream native-sort inference has no general Seq
+            // sort. It accepts Seq equality only through its structural
+            // reflexivity escape hatch (`lhs == rhs`), so mirror that
+            // exact restriction here instead of admitting a claim that
+            // the advertised common ingress later demotes.
+            if lhs_sort == TrustFormulaV1Sort::Seq && lhs != rhs {
+                return Err(format!(
+                    "{path} compares distinct Seq expressions; native TrustFormulaV1 replay supports only structurally reflexive Seq equality"
+                ));
             }
+            Ok(TrustFormulaV1Sort::Bool)
+        }
+        "lt" | "le" | "gt" | "ge" => {
+            reject_unknown_fields(object, path, &["op", "lhs", "rhs"])?;
+            let lhs = object.get("lhs").ok_or_else(|| format!("{path}.lhs is required"))?;
+            let rhs = object.get("rhs").ok_or_else(|| format!("{path}.rhs is required"))?;
+            let lhs_sort = validate_child_expr(lhs, env, result_name, path, ".lhs", None)?;
+            let rhs_sort = validate_child_expr(rhs, env, result_name, path, ".rhs", None)?;
+            require_formula_sort_with_suffix(&lhs_sort, &TrustFormulaV1Sort::Int, path, ".lhs")?;
+            require_formula_sort_with_suffix(&rhs_sort, &TrustFormulaV1Sort::Int, path, ".rhs")?;
+            Ok(TrustFormulaV1Sort::Bool)
+        }
+        "and" | "or" | "implies" => {
+            reject_unknown_fields(object, path, &["op", "lhs", "rhs"])?;
+            let lhs = object.get("lhs").ok_or_else(|| format!("{path}.lhs is required"))?;
+            let rhs = object.get("rhs").ok_or_else(|| format!("{path}.rhs is required"))?;
+            let lhs_sort = validate_child_expr(lhs, env, result_name, path, ".lhs", None)?;
+            let rhs_sort = validate_child_expr(rhs, env, result_name, path, ".rhs", None)?;
+            require_formula_sort_with_suffix(&lhs_sort, &TrustFormulaV1Sort::Bool, path, ".lhs")?;
+            require_formula_sort_with_suffix(&rhs_sort, &TrustFormulaV1Sort::Bool, path, ".rhs")?;
             Ok(TrustFormulaV1Sort::Bool)
         }
         unsupported => Err(format!(
@@ -526,52 +571,54 @@ fn required_name_and_sort<'a>(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{path}.name must be a string"))?;
-    validate_name(name, &format!("{path}.name"))?;
+    validate_name(name, path, ".name")?;
     let sort = object
         .get("sort")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{path}.sort must be a string"))?;
-    let sort = decode_trust_formula_v1_sort(sort, &format!("{path}.sort"))?;
+    let sort = decode_trust_formula_v1_sort(sort, path, ".sort")?;
     Ok((name, sort))
 }
 
-fn decode_trust_formula_v1_sort(sort: &str, path: &str) -> Result<TrustFormulaV1Sort, String> {
+fn decode_trust_formula_v1_sort(
+    sort: &str,
+    path: &str,
+    suffix: &str,
+) -> Result<TrustFormulaV1Sort, String> {
     let sort = sort.trim();
     if let Some(inner) = sort.strip_prefix("&mut ") {
         return Ok(TrustFormulaV1Sort::Ref {
             mutable: true,
-            inner: Box::new(decode_trust_formula_v1_sort(inner, path)?),
+            inner: Box::new(decode_trust_formula_v1_sort(inner, path, suffix)?),
         });
     }
     if let Some(inner) = sort.strip_prefix('&') {
         return Ok(TrustFormulaV1Sort::Ref {
             mutable: false,
-            inner: Box::new(decode_trust_formula_v1_sort(inner, path)?),
+            inner: Box::new(decode_trust_formula_v1_sort(inner, path, suffix)?),
         });
     }
     if sort.starts_with('[') && sort.ends_with(']') {
         let inner = sort[1..sort.len() - 1].trim();
         if inner.is_empty() {
-            return Err(format!("{path} slice element type is empty"));
+            return Err(format!("{path}{suffix} slice element type is empty"));
         }
-        let _ = decode_trust_formula_v1_sort(inner, path)?;
+        let _ = decode_trust_formula_v1_sort(inner, path, suffix)?;
         return Ok(TrustFormulaV1Sort::Seq);
     }
-    let type_param = || -> Option<char> {
-        let mut chars = sort.chars();
-        match (chars.next(), chars.next()) {
-            (Some(ch), None) if ch.is_ascii_uppercase() => Some(ch),
-            _ => None,
-        }
-    };
     match sort {
         "int" | "Int" => Ok(TrustFormulaV1Sort::Int),
         "bool" | "Bool" => Ok(TrustFormulaV1Sort::Bool),
         "seq" | "Seq" => Ok(TrustFormulaV1Sort::Seq),
-        _ if type_param().is_some() => {
-            Ok(TrustFormulaV1Sort::TypeParam(type_param().expect("guard checked type parameter")))
+        _ => {
+            let mut chars = sort.chars();
+            if let (Some(ch), None) = (chars.next(), chars.next())
+                && ch.is_ascii_uppercase()
+            {
+                return Ok(TrustFormulaV1Sort::TypeParam(ch));
+            }
+            Err(format!("{path}{suffix} `{sort}` is outside the TrustFormulaV1 sort fragment"))
         }
-        _ => Err(format!("{path} `{sort}` is outside the TrustFormulaV1 sort fragment")),
     }
 }
 
@@ -580,27 +627,38 @@ fn require_formula_sort(
     expected: &TrustFormulaV1Sort,
     path: &str,
 ) -> Result<(), String> {
+    require_formula_sort_with_suffix(actual, expected, path, "")
+}
+
+fn require_formula_sort_with_suffix(
+    actual: &TrustFormulaV1Sort,
+    expected: &TrustFormulaV1Sort,
+    path: &str,
+    suffix: &str,
+) -> Result<(), String> {
     if actual == expected {
         Ok(())
     } else {
-        Err(format!("{path} has sort {actual:?}, expected {expected:?} in TrustFormulaV1"))
+        Err(format!("{path}{suffix} has sort {actual:?}, expected {expected:?} in TrustFormulaV1"))
     }
 }
 
-fn validate_name(name: &str, path: &str) -> Result<(), String> {
+fn validate_name(name: &str, path: &str, suffix: &str) -> Result<(), String> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
-        return Err(format!("{path} is empty"));
+        return Err(format!("{path}{suffix} is empty"));
     };
     if !(first == '_' || first.is_ascii_alphabetic()) {
-        return Err(format!("{path} must start with `_` or an ASCII letter"));
+        return Err(format!("{path}{suffix} must start with `_` or an ASCII letter"));
     }
     if !chars.all(|ch| {
         ch == '_'
             || ch.is_ascii_alphanumeric()
             || matches!(ch, '#' | '.' | '[' | ']' | '*' | '@' | '-' | ';' | '=')
     }) {
-        return Err(format!("{path} contains characters outside the supported SMT-symbol set"));
+        return Err(format!(
+            "{path}{suffix} contains characters outside the supported SMT-symbol set"
+        ));
     }
     Ok(())
 }
@@ -746,7 +804,7 @@ impl<'de> Visitor<'de> for UniqueJsonVisitor {
 ///
 /// This is a *fail-closed* lowering. It returns `Err` for any formula construct
 /// outside trust-wp's native comparison/boolean replay fragment: bitvectors,
-/// arrays, conditionals, quantifiers, non-`i64` integer literals, non-int/bool
+/// arrays, conditionals, quantifiers, integer literals outside i64/u64, non-int/bool
 /// variable sorts, and — since Trust #29 (blueprint amendment 1) — ALL integer
 /// arithmetic (`Add`/`Sub`/`Mul`/`Div`/`Rem`/`Neg`). Arithmetic is refused
 /// because machine-integer predicates modeled as unbounded Int are a confirmed
@@ -768,7 +826,7 @@ pub fn formula_to_trust_formula_v1_envelope(formula: &Formula) -> Result<String,
     // subsequent free-variable walk only ever traverses supported nodes.
     let body = formula_to_body(formula)?;
 
-    let mut variables: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut variables: BTreeMap<&str, &'static str> = BTreeMap::new();
     collect_free_vars(formula, &mut variables)?;
 
     let variables_json: Vec<serde_json::Value> = variables
@@ -813,39 +871,52 @@ fn sort_label(sort: &Sort) -> Result<&'static str, String> {
 
 /// Recursively collect free `Var`/`SymVar` names (with sort labels) into `out`.
 /// Errors if the same name is used with conflicting sorts.
-fn collect_free_vars(
-    formula: &Formula,
-    out: &mut BTreeMap<String, &'static str>,
+fn collect_free_vars<'a>(
+    formula: &'a Formula,
+    out: &mut BTreeMap<&'a str, &'static str>,
 ) -> Result<(), String> {
     match formula {
-        Formula::Var(name, sort) => insert_var(out, name.clone(), sort_label(sort)?),
-        Formula::SymVar(sym, sort) => insert_var(out, sym.as_str().to_string(), sort_label(sort)?),
+        Formula::Var(name, sort) => insert_var(out, name.as_str(), sort_label(sort)?),
+        Formula::SymVar(sym, sort) => insert_var(out, sym.as_str(), sort_label(sort)?),
         Formula::Bool(_) | Formula::Int(_) | Formula::UInt(_) => Ok(()),
         _ => {
             // `formula_to_body` already rejected unsupported nodes, so this walk
-            // only sees supported nodes. Recursing over `children()` keeps the
-            // two walks structurally aligned.
-            for child in formula.children() {
-                collect_free_vars(child, out)?;
+            // only sees supported nodes. Recursing over direct children keeps the
+            // two walks structurally aligned without allocating per-node Vecs.
+            let mut err = None;
+            let _ =
+                crate::all_formula_children(formula, |child| match collect_free_vars(child, out) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        err = Some(e);
+                        false
+                    }
+                });
+            if let Some(e) = err {
+                return Err(e);
             }
             Ok(())
         }
     }
 }
 
-fn insert_var(
-    out: &mut BTreeMap<String, &'static str>,
-    name: String,
+fn insert_var<'a>(
+    out: &mut BTreeMap<&'a str, &'static str>,
+    name: &'a str,
     label: &'static str,
 ) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("trust_wp.trust-formula.v1 variable name is empty".to_string());
     }
-    match out.insert(name.clone(), label) {
-        Some(previous) if previous != label => Err(format!(
+    match out.get(name) {
+        Some(&previous) if previous == label => Ok(()),
+        Some(&previous) => Err(format!(
             "trust_wp.trust-formula.v1 variable `{name}` is used with conflicting sorts `{previous}` and `{label}`"
         )),
-        _ => Ok(()),
+        None => {
+            out.insert(name, label);
+            Ok(())
+        }
     }
 }
 
@@ -856,17 +927,11 @@ fn formula_to_body(formula: &Formula) -> Result<serde_json::Value, String> {
         // --- Literals ---
         Formula::Bool(value) => Ok(serde_json::json!({ "bool": value })),
         Formula::Int(value) => {
-            let value = i64::try_from(*value).map_err(|_| {
-                format!("integer literal `{value}` is outside i64 for trust_wp.trust-formula.v1")
-            })?;
+            let value = trust_formula_v1_integer_literal(&value.to_string())?;
             Ok(serde_json::json!({ "int": value }))
         }
         Formula::UInt(value) => {
-            let value = i64::try_from(*value).map_err(|_| {
-                format!(
-                    "unsigned integer literal `{value}` is outside i64 for trust_wp.trust-formula.v1"
-                )
-            })?;
+            let value = trust_formula_v1_integer_literal(&value.to_string())?;
             Ok(serde_json::json!({ "int": value }))
         }
 
@@ -965,6 +1030,7 @@ fn node_label(formula: &Formula) -> &'static str {
         Formula::Exists(..) => "exists",
         Formula::Select(..) => "array-select",
         Formula::Store(..) => "array-store",
+        Formula::ConstArray { .. } => "array-const",
         Formula::BitVec { .. } => "bitvec-literal",
         _ if formula.has_bitvectors() => "bitvector-op",
         _ => "unsupported",
@@ -1082,6 +1148,21 @@ mod tests {
             });
             assert!(canonical_arithmetic_free_trust_formula_v1_payload(&value).is_err());
         }
+    }
+
+    #[test]
+    fn arithmetic_free_payload_is_canonical_across_json_map_features() {
+        let expected = r#"{"body":{"lhs":{"result":true},"op":"eq","rhs":{"var":"x"}},"result":{"name":"result","sort":"bool"},"schema":"trust_wp.trust-formula.v1","variables":[{"name":"x","sort":"bool"}]}"#;
+        let insertion_order = r#"{"schema":"trust_wp.trust-formula.v1","variables":[{"sort":"bool","name":"x"}],"result":{"sort":"bool","name":"result"},"body":{"op":"eq","rhs":{"var":"x"},"lhs":{"result":true}}}"#;
+        assert_eq!(
+            parse_arithmetic_free_trust_formula_v1_payload(insertion_order).unwrap(),
+            expected
+        );
+        assert_eq!(parse_arithmetic_free_trust_formula_v1_payload(expected).unwrap(), expected);
+        let value = parse_unique_proof_json_payload(insertion_order).unwrap();
+        let original = value.clone();
+        assert_eq!(canonical_arithmetic_free_trust_formula_v1_payload(&value).unwrap(), expected);
+        assert_eq!(value, original);
     }
 
     #[test]
@@ -1405,11 +1486,30 @@ mod tests {
     }
 
     #[test]
-    fn integer_literal_outside_i64_is_rejected() {
-        let f = Formula::Ge(
-            Box::new(Formula::Int(i128::from(i64::MAX) + 1)),
-            Box::new(Formula::Int(0)),
-        );
-        assert!(formula_to_trust_formula_v1_envelope(&f).is_err());
+    fn unsigned_high_half_literals_remain_exact_and_arithmetic_free() {
+        for value in [1_u64 << 63, u64::MAX] {
+            for literal in [Formula::Int(i128::from(value)), Formula::UInt(u128::from(value))] {
+                let f = Formula::Ge(Box::new(literal), Box::new(Formula::Int(0)));
+                let encoded = formula_to_trust_formula_v1_envelope(&f).unwrap();
+                let parsed: Value = serde_json::from_str(&encoded).unwrap();
+                assert_eq!(parsed["body"]["lhs"]["int"].as_u64(), Some(value));
+                assert_eq!(
+                    parse_arithmetic_free_trust_formula_v1_payload(&encoded).unwrap(),
+                    encoded
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integer_literal_outside_exact_json_range_is_rejected() {
+        for literal in [
+            Formula::Int(i128::from(i64::MIN) - 1),
+            Formula::Int(i128::from(u64::MAX) + 1),
+            Formula::UInt(u128::from(u64::MAX) + 1),
+        ] {
+            let f = Formula::Ge(Box::new(literal), Box::new(Formula::Int(0)));
+            assert!(formula_to_trust_formula_v1_envelope(&f).is_err());
+        }
     }
 }

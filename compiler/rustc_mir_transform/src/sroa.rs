@@ -1,22 +1,22 @@
 use rustc_abi::FieldIdx;
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
-use rustc_hir::LangItem;
 use rustc_index::IndexVec;
 use rustc_index::bit_set::{DenseBitSet, GrowableBitSet};
-use rustc_middle::bug;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_mir_dataflow::value_analysis::{excluded_locals, iter_fields};
+use rustc_span::bug;
 use tracing::{debug, instrument};
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 pub(super) struct ScalarReplacementOfAggregates;
 
 impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 2
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 2)
     }
 
     #[instrument(level = "debug", skip(self, tcx, body))]
@@ -24,7 +24,18 @@ impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
         debug!(def_id = ?body.source.def_id());
 
         // Avoid query cycles (coroutines require optimized MIR for layout).
-        if tcx.type_of(body.source.def_id()).instantiate_identity().skip_norm_wip().is_coroutine() {
+        if tcx.is_coroutine(body.source.def_id()) {
+            return;
+        }
+
+        // Fast path: if no non-arg, non-return local has a flattenable aggregate type,
+        // `compute_flattening` cannot produce any replacements.
+        if !body
+            .local_decls
+            .iter()
+            .skip(body.arg_count + 1)
+            .any(|decl| is_flattenable_ty(tcx, decl.ty))
+        {
             return;
         }
 
@@ -34,24 +45,36 @@ impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
             debug!(?excluded);
             let escaping = escaping_locals(tcx, &excluded, body);
             debug!(?escaping);
+            if escaping.count() == body.local_decls.len() {
+                break;
+            }
             let replacements = compute_flattening(tcx, typing_env, body, escaping);
             debug!(?replacements);
             let all_dead_locals = replace_flattened_locals(tcx, body, replacements);
             if !all_dead_locals.is_empty() {
                 excluded.union(&all_dead_locals);
-                excluded = {
-                    let mut growable = GrowableBitSet::from(excluded);
-                    growable.ensure(body.local_decls.len());
-                    growable.into()
-                };
             } else {
                 break;
             }
         }
     }
+}
 
-    fn is_required(&self) -> bool {
-        false
+/// Returns `true` when `ty` is an aggregate type that `compute_flattening` can decompose into
+/// at least one non-downcast field local.
+fn is_flattenable_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    match ty.kind() {
+        ty::Tuple(list) => !list.is_empty(),
+        ty::Adt(def, _) => {
+            def.is_struct()
+                && !def.non_enum_variant().fields.is_empty()
+                && !ty.is_like_maybe_dangling()
+                && def.can_project_fields(tcx)
+        }
+        ty::Closure(_, args) => !args.as_closure().upvar_tys().is_empty(),
+        ty::Coroutine(_, args) => !args.as_coroutine().upvar_tys().is_empty(),
+        ty::CoroutineClosure(_, args) => !args.as_coroutine_closure().upvar_tys().is_empty(),
+        _ => false,
     }
 }
 
@@ -64,34 +87,18 @@ impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
 ///   client code.
 fn escaping_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
-    excluded: &DenseBitSet<Local>,
+    excluded: &GrowableBitSet<Local>,
     body: &Body<'tcx>,
 ) -> DenseBitSet<Local> {
-    let is_excluded_ty = |ty: Ty<'tcx>| {
-        if ty.is_union() || ty.is_enum() {
-            return true;
-        }
-        if let ty::Adt(def, _args) = ty.kind()
-            && (def.repr().simd() || tcx.is_lang_item(def.did(), LangItem::DynMetadata))
-        {
-            // Exclude #[repr(simd)] types so that they are not de-optimized into an array
-            // (MCP#838 banned projections into SIMD types, but if the value is unused
-            // this pass sees "all the uses are of the fields" and expands it.)
-
-            // codegen wants to see the `DynMetadata<T>`,
-            // not the inner reference-to-opaque-type.
-            return true;
-        }
-        // Default for non-ADTs
-        false
-    };
-
     let mut set = DenseBitSet::new_empty(body.local_decls.len());
     set.insert_range(RETURN_PLACE..Local::arg(body.arg_count));
-    for (local, decl) in body.local_decls().iter_enumerated() {
-        if excluded.contains(local) || is_excluded_ty(decl.ty) {
+    for (local, decl) in body.local_decls().iter_enumerated().skip(body.arg_count + 1) {
+        if excluded.contains(local) || !is_flattenable_ty(tcx, decl.ty) {
             set.insert(local);
         }
+    }
+    if set.count() == body.local_decls.len() {
+        return set;
     }
     let mut visitor = EscapeVisitor { set };
     visitor.visit_body(body);
@@ -213,9 +220,11 @@ fn replace_flattened_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &mut Body<'tcx>,
     replacements: ReplacementMap<'tcx>,
-) -> DenseBitSet<Local> {
-    let mut all_dead_locals = DenseBitSet::new_empty(replacements.fragments.len());
-    for (local, replacements) in replacements.fragments.iter_enumerated() {
+) -> GrowableBitSet<Local> {
+    // Start with an empty GrowableBitSet, to avoid allocation if nothing is dead.
+    // Then fill the set in descending order so that it allocates at most once.
+    let mut all_dead_locals = GrowableBitSet::new_empty();
+    for (local, replacements) in replacements.fragments.iter_enumerated().rev() {
         if replacements.is_some() {
             all_dead_locals.insert(local);
         }
@@ -230,7 +239,7 @@ fn replace_flattened_locals<'tcx>(
         local_decls: &body.local_decls,
         replacements: &replacements,
         all_dead_locals,
-        patch: MirPatch::new(body),
+        patch: MirPatch::new_without_block_cache(body),
     };
     for (bb, data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated_mut() {
         visitor.visit_basic_block_data(bb, data);
@@ -254,7 +263,7 @@ struct ReplacementVisitor<'tcx, 'll> {
     /// Work to do.
     replacements: &'ll ReplacementMap<'tcx>,
     /// This is used to check that we are not leaving references to replaced locals behind.
-    all_dead_locals: DenseBitSet<Local>,
+    all_dead_locals: GrowableBitSet<Local>,
     patch: MirPatch<'tcx>,
 }
 

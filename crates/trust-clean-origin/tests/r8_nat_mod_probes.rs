@@ -388,19 +388,31 @@ fn q5_a_guard_that_does_not_dominate_the_division_is_refused() {
 /// stronger here — it is that the emitted callee is `trust_bignum::Nat::rem`,
 /// which agrees with the total kernel function, where the emitted `u{N}` op is
 /// a `Rvalue::BinaryOp` that does not.
+///
+/// The row ASSERTS the measured state (2026-10-09; until then both outcomes only
+/// printed, so it passed whichever way the kernel decided).
 #[test]
 fn q6_the_machine_width_divergence_is_still_real() {
     let total = "theorem t : (7 : UInt64) % 0 = 7 := rfl";
-    match island(total) {
-        Ok(_) => eprintln!(
+    let outcome = island(total);
+    if outcome.is_ok() {
+        eprintln!(
             "ROW q6 | `UInt64` `%` at a zero divisor is TOTAL at the kernel (= 7), while \
              Rust's `%` PANICS — fa788aab89's divergence, unchanged"
-        ),
-        Err(why) => eprintln!(
-            "ROW q6 | the `UInt64` zero-divisor statement did not close by `rfl` at this \
-             pin: {} (the divergence claim rests on `first-party/clean`'s `UInt` model; \
-             the plan-lane refusal measured in q7 is what actually protects the lane)",
-            first_line(&why)
-        ),
+        );
     }
+    assert!(
+        outcome.is_ok(),
+        "ROW q6 | the `UInt64` zero-divisor statement no longer closes by `rfl` at this \
+         pin: {}. This row re-measures fa788aab89's divergence (Clean's `UInt{{N}}.mod` \
+         is TOTAL at a zero divisor where Rust's `%` PANICS, and the faithfulness gate \
+         cannot see the difference), and the `nat.mod` row in \
+         crates/trust-clean-origin/src/table.rs and `NatRem`'s doc in \
+         crates/trust-types/src/admissible_body.rs cite it as live. The divergence claim \
+         rests on `first-party/clean`'s `UInt` model: re-measure the machine-width lane \
+         and correct those citations before changing this expectation. What protects \
+         the lane is the plan-lane refusal of a symbolic machine-width divisor, pinned by \
+         control_21_wf_modulo_gcd_emitter_mutation::h_the_machine_width_symbolic_divisor_is_still_refused",
+        outcome.as_ref().err().map(|why| first_line(why)).unwrap_or_default()
+    );
 }

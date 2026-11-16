@@ -4,15 +4,15 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 use rustc_data_structures::AtomicRef;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hash::{
-    RawDefId, RawDefPathHash, StableHash, StableHashCtxt, StableHasher, StableOrd, ToStableHashKey,
+    RawDefId, StableHash, StableHashCtxt, StableHasher, StableOrd, ToStableHashKey,
 };
 use rustc_data_structures::unhash::Unhasher;
 use rustc_hashes::Hash64;
 use rustc_index::Idx;
 use rustc_macros::{BlobDecodable, Decodable, Encodable, StableHash};
-use rustc_serialize::{Decodable, Encodable};
+use rustc_serialize::{ContextOrd, Decodable, Encodable};
 
-use crate::{SpanDecoder, SpanEncoder, Symbol};
+use crate::{BlobDecoder, SpanEncoder, Symbol};
 
 pub type StableCrateIdMap =
     indexmap::IndexMap<StableCrateId, CrateNum, BuildHasherDefault<Unhasher>>;
@@ -21,6 +21,13 @@ rustc_index::newtype_index! {
     #[orderable]
     #[debug_format = "crate{}"]
     pub struct CrateNum {}
+}
+
+impl<E: SpanEncoder> ContextOrd<&E> for CrateNum {
+    fn stable_cmp_with_context(context: &E) -> impl FnMut(&Self, &Self) -> std::cmp::Ordering {
+        let hasher = context.def_path_hasher();
+        move |id1, id2| hasher(id1.as_def_id()).cmp(&hasher(id2.as_def_id()))
+    }
 }
 
 /// Item definitions in the currently-compiled crate would have the `CrateNum`
@@ -40,8 +47,8 @@ impl CrateNum {
     }
 
     #[inline]
-    pub fn as_mod_def_id(self) -> ModDefId {
-        ModDefId::new_unchecked(DefId { krate: self, index: CRATE_DEF_INDEX })
+    pub fn as_mod_id(self) -> ModId {
+        ModId::new_unchecked(DefId { krate: self, index: CRATE_DEF_INDEX })
     }
 }
 
@@ -116,16 +123,6 @@ impl DefPathHash {
     pub fn new(stable_crate_id: StableCrateId, local_hash: Hash64) -> DefPathHash {
         DefPathHash(Fingerprint::new(stable_crate_id.0, local_hash))
     }
-
-    #[inline]
-    pub fn to_raw_def_path_hash(self) -> RawDefPathHash {
-        RawDefPathHash(self.0.to_le_bytes())
-    }
-
-    #[inline]
-    pub fn from_raw_def_path_hash(RawDefPathHash(a): RawDefPathHash) -> DefPathHash {
-        DefPathHash(Fingerprint::from_le_bytes(a))
-    }
 }
 
 impl Default for DefPathHash {
@@ -195,18 +192,35 @@ impl StableCrateId {
         //
         // RUSTC_FORCE_RUSTC_VERSION is used to inject rustc version information
         // during testing.
-        if let Some(val) = std::env::var_os("RUSTC_FORCE_RUSTC_VERSION") {
-            hasher.write(val.to_string_lossy().into_owned().as_bytes())
-        } else {
-            hasher.write(cfg_version.as_bytes())
-        }
+        hasher.write(effective_rustc_version(cfg_version).as_bytes());
 
         StableCrateId(hasher.finish())
     }
 
     #[inline]
+    pub fn as_hash(self) -> Hash64 {
+        self.0
+    }
+
+    #[inline]
     pub fn as_u64(self) -> u64 {
         self.0.as_u64()
+    }
+}
+
+/// Trust: the rustc version that crate IDENTITY is keyed on.
+///
+/// `RUSTC_FORCE_RUSTC_VERSION` is used to inject rustc version information during
+/// testing, and anything that must agree with [`StableCrateId`] has to honour it
+/// too. It is exposed because the proc-macro dylib install name is keyed on the
+/// same value (`rustc_codegen_ssa::back::linker`): if the two ever disagreed, two
+/// builds could share a dyld install name while exporting different
+/// `__rustc_proc_macro_decls_*` symbols, which is precisely the aliasing that
+/// install name is there to prevent.
+pub fn effective_rustc_version(cfg_version: &'static str) -> String {
+    match std::env::var_os("RUSTC_FORCE_RUSTC_VERSION") {
+        Some(val) => val.to_string_lossy().into_owned(),
+        None => cfg_version.to_string(),
     }
 }
 
@@ -377,6 +391,7 @@ impl !Ord for LocalDefId {}
 impl !PartialOrd for LocalDefId {}
 
 pub const CRATE_DEF_ID: LocalDefId = LocalDefId { local_def_index: CRATE_DEF_INDEX };
+pub const CRATE_MOD_ID: LocalModId = LocalModId::new_unchecked(CRATE_DEF_ID);
 
 impl Idx for LocalDefId {
     #[inline]
@@ -408,14 +423,21 @@ impl fmt::Debug for LocalDefId {
 }
 
 impl<E: SpanEncoder> Encodable<E> for LocalDefId {
-    fn encode(&self, s: &mut E) {
-        self.to_def_id().encode(s);
+    fn encode(&self, e: &mut E) {
+        e.encode_local_def_id(*self);
     }
 }
 
-impl<D: SpanDecoder> Decodable<D> for LocalDefId {
+impl<D: BlobDecoder> Decodable<D> for LocalDefId {
     fn decode(d: &mut D) -> LocalDefId {
-        DefId::decode(d).expect_local()
+        d.decode_local_def_id()
+    }
+}
+
+impl<E: SpanEncoder> ContextOrd<&E> for LocalDefId {
+    fn stable_cmp_with_context(context: &E) -> impl FnMut(&Self, &Self) -> std::cmp::Ordering {
+        let hasher = context.def_path_hasher();
+        move |id1, id2| hasher(id1.to_def_id()).cmp(&hasher(id2.to_def_id()))
     }
 }
 
@@ -425,6 +447,13 @@ rustc_data_structures::define_id_collections!(
     LocalDefIdMapEntry,
     LocalDefId
 );
+
+impl<E: SpanEncoder> ContextOrd<&E> for DefId {
+    fn stable_cmp_with_context(context: &E) -> impl FnMut(&Self, &Self) -> std::cmp::Ordering {
+        let hasher = context.def_path_hasher();
+        move |id1, id2| hasher(*id1).cmp(&hasher(*id2))
+    }
+}
 
 impl StableHash for DefId {
     #[inline]
@@ -452,7 +481,7 @@ impl ToStableHashKey for DefId {
 
     #[inline]
     fn to_stable_hash_key<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx) -> DefPathHash {
-        DefPathHash::from_raw_def_path_hash(hcx.def_path_hash(self.to_raw_def_id()))
+        DefPathHash(hcx.def_path_hash(self.to_raw_def_id()))
     }
 }
 
@@ -465,102 +494,98 @@ impl ToStableHashKey for LocalDefId {
     }
 }
 
-macro_rules! typed_def_id {
-    ($Name:ident, $LocalName:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
-        pub struct $Name(DefId);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
+pub struct ModId(DefId);
 
-        impl $Name {
-            #[inline]
-            pub const fn new_unchecked(def_id: DefId) -> Self {
-                Self(def_id)
-            }
+impl ModId {
+    #[inline]
+    pub const fn new_unchecked(def_id: DefId) -> Self {
+        Self(def_id)
+    }
 
-            #[inline]
-            pub fn to_def_id(self) -> DefId {
-                self.into()
-            }
+    #[inline]
+    pub fn to_def_id(self) -> DefId {
+        self.into()
+    }
 
-            #[inline]
-            pub fn is_local(self) -> bool {
-                self.0.is_local()
-            }
+    #[inline]
+    pub fn is_local(self) -> bool {
+        self.0.is_local()
+    }
 
-            #[inline]
-            pub fn as_local(self) -> Option<$LocalName> {
-                self.0.as_local().map($LocalName::new_unchecked)
-            }
-        }
+    #[inline]
+    pub fn as_local(self) -> Option<LocalModId> {
+        self.0.as_local().map(LocalModId::new_unchecked)
+    }
 
-        impl From<$LocalName> for $Name {
-            #[inline]
-            fn from(local: $LocalName) -> Self {
-                Self(local.0.to_def_id())
-            }
-        }
+    pub fn expect_local(self) -> LocalModId {
+        LocalModId::new_unchecked(self.0.expect_local())
+    }
 
-        impl From<$Name> for DefId {
-            #[inline]
-            fn from(typed: $Name) -> Self {
-                typed.0
-            }
-        }
+    pub fn is_crate_root(self) -> bool {
+        self.0.is_crate_root()
+    }
 
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
-        pub struct $LocalName(LocalDefId);
-
-        impl !Ord for $LocalName {}
-        impl !PartialOrd for $LocalName {}
-
-        impl $LocalName {
-            #[inline]
-            pub const fn new_unchecked(def_id: LocalDefId) -> Self {
-                Self(def_id)
-            }
-
-            #[inline]
-            pub fn to_def_id(self) -> DefId {
-                self.0.into()
-            }
-
-            #[inline]
-            pub fn to_local_def_id(self) -> LocalDefId {
-                self.0
-            }
-        }
-
-        impl From<$LocalName> for LocalDefId {
-            #[inline]
-            fn from(typed: $LocalName) -> Self {
-                typed.0
-            }
-        }
-
-        impl From<$LocalName> for DefId {
-            #[inline]
-            fn from(typed: $LocalName) -> Self {
-                typed.0.into()
-            }
-        }
-    };
-}
-
-// N.B.: when adding new typed `DefId`s update the corresponding trait impls in
-// `rustc_middle::dep_graph::dep_node_key` for `DepNodeKey`.
-typed_def_id! { ModDefId, LocalModDefId }
-
-impl LocalModDefId {
-    pub const CRATE_DEF_ID: Self = Self::new_unchecked(CRATE_DEF_ID);
-}
-
-impl ModDefId {
     pub fn is_top_level_module(self) -> bool {
         self.0.is_top_level_module()
     }
 }
 
-impl LocalModDefId {
+impl From<LocalModId> for ModId {
+    #[inline]
+    fn from(local: LocalModId) -> Self {
+        Self(local.0.to_def_id())
+    }
+}
+
+impl From<ModId> for DefId {
+    #[inline]
+    fn from(typed: ModId) -> Self {
+        typed.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
+pub struct LocalModId(LocalDefId);
+
+impl !Ord for LocalModId {}
+impl !PartialOrd for LocalModId {}
+
+impl LocalModId {
+    #[inline]
+    pub const fn new_unchecked(def_id: LocalDefId) -> Self {
+        Self(def_id)
+    }
+
     pub fn is_top_level_module(self) -> bool {
         self.0.is_top_level_module()
+    }
+
+    #[inline]
+    pub fn to_def_id(self) -> DefId {
+        self.0.into()
+    }
+
+    pub fn to_mod_id(self) -> ModId {
+        ModId::new_unchecked(self.0.to_def_id())
+    }
+
+    #[inline]
+    pub fn to_local_def_id(self) -> LocalDefId {
+        self.0
+    }
+}
+
+impl From<LocalModId> for LocalDefId {
+    #[inline]
+    fn from(typed: LocalModId) -> Self {
+        typed.0
+    }
+}
+
+impl From<LocalModId> for DefId {
+    #[inline]
+    fn from(typed: LocalModId) -> Self {
+        typed.0.into()
     }
 }

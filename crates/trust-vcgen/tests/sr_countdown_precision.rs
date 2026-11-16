@@ -15,8 +15,7 @@ fn load(name: &str) -> VerifiableFunction {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
     let text = std::fs::read_to_string(format!("{path}{name}.json"))
         .unwrap_or_else(|e| panic!("fixture `{name}` must be readable: {e}"));
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("fixture `{name}` must deserialize: {e}"))
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("fixture `{name}` must deserialize: {e}"))
 }
 
 fn backstopped(func: &VerifiableFunction) -> Vec<String> {
@@ -125,9 +124,7 @@ fn sr_countdown_full_u32_still_carries_its_bounds_obligations() {
     let vcs = trust_vcgen::generate_vcs(&func);
     let bounds = vcs
         .iter()
-        .filter(|vc| {
-            matches!(vc.kind, VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck)
-        })
+        .filter(|vc| matches!(vc.kind, VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck))
         .count();
     let overflow =
         vcs.iter().filter(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { .. })).count();

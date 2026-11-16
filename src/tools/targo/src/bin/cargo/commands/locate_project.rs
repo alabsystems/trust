@@ -1,7 +1,7 @@
 use crate::command_prelude::*;
 use anyhow::bail;
-use cargo::{CargoResult, drop_println};
 use serde::Serialize;
+use targo::{CargoResult, drop_println};
 
 pub fn cli() -> Command {
     subcommand("locate-project")
@@ -38,7 +38,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
             root_manifest = args.root_manifest(gctx)?;
             // Try fast path first - only works when package is explicitly listed in members
             if let Some(ws_root) =
-                cargo::core::find_workspace_root_with_membership_check(&root_manifest, gctx)?
+                targo::workspace::find_workspace_root_with_membership_check(&root_manifest, gctx)?
             {
                 workspace_root = ws_root;
                 &workspace_root

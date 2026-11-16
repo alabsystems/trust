@@ -1,0 +1,23 @@
+{
+  "id": "wp-d237-shadowed-param-copy",
+  "class": "trust-wp D-237 (pa2)",
+  "title": "a copy of the parameter `x` was read against the `x` that shadows it",
+  "origin": [
+    "trust-wp aee6e8f2 (D-237), tests/adversarial/cases/v25_shadowed_parameter_and_clone_reads.rs (pa2)",
+    "trust-wp aee6e8f2 (D-237), tests/adversarial/cases/v25_shadowed_binding_control.rs (va1)"
+  ],
+  "lang": "creusot",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "pa2"
+  },
+  "twin": {
+    "function": "va1"
+  },
+  "witness": {
+    "input": "x = 5",
+    "observed": "proof_assert!(y == x) is false",
+    "exit": 101,
+    "main": "witness.rs"
+  }
+}

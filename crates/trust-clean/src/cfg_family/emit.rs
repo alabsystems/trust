@@ -780,6 +780,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "measurement instrument: prints the emitted Lean for diffing and asserts nothing \
+                (plan.rs pins the plan); run with --ignored --nocapture"]
     fn dump_gen_block_add_lean() {
         let plan = plan_family(&GEN_BLOCK_ADD).expect("plan");
         let e = emit_family(&plan);

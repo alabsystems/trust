@@ -1,0 +1,67 @@
+#![feature(prelude_import)]
+//@ only-apple
+//@ edition: 2021
+//@ proc-macro: serde_shaped.rs
+//@ revisions: in_process isolated
+//@ compile-flags: -Zunpretty=expanded
+//@[isolated] compile-flags: -Ztrust-proc-macro-isolation
+//@ check-pass
+//! Trust (D21): a serde-shaped derive (helper attributes, generics, an impl built
+//! from token trees and from parsed text) expands to the same program whether its
+//! dylib is loaded into rustc (`in_process`) or only into the sandboxed worker
+//! (`isolated`). Each revision's expansion is its own expected file, and
+//! `expansions_are_identical.rs` requires the two files to be byte-identical.
+extern crate std;
+#[prelude_import]
+use std::prelude::rust_2021::*;
+
+#[macro_use]
+extern crate serde_shaped;
+
+pub trait Shape {
+    const NAME: &'static str;
+    const SKIPPED: usize;
+    fn fields(&self)
+    -> Vec<(&'static str, String)>;
+}
+
+pub struct Point<T> {
+    #[shape(rename = "ex")]
+    pub x: T,
+    y: u32,
+    #[shape(skip)]
+    cache: Vec<Option<T>>,
+    r#type: &'static str,
+}
+impl<T: ::core::fmt::Debug> Shape for Point<T> {
+    const NAME: &'static str = "Point";
+    const SKIPPED: usize = 1usize;
+    fn fields(&self)
+        -> ::std::vec::Vec<(&'static str, ::std::string::String)> {
+
+
+        ::alloc::boxed::box_assume_init_into_vec_unsafe(::alloc::intrinsics::write_box_via_move(::alloc::boxed::Box::new_uninit(),
+                [("ex",
+                            ::alloc::__export::must_use({
+                                    ::alloc::fmt::format(format_args!("{0:?}", &self.x))
+                                })),
+                        ("y",
+                            ::alloc::__export::must_use({
+                                    ::alloc::fmt::format(format_args!("{0:?}", &self.y))
+                                })),
+                        ("r#type",
+                            ::alloc::__export::must_use({
+                                    ::alloc::fmt::format(format_args!("{0:?}", &self.r#type))
+                                }))]))
+    }
+}
+struct Empty {}
+impl Shape for Empty<> {
+    const NAME: &'static str = "Empty";
+    const SKIPPED: usize = 0usize;
+    fn fields(&self)
+        -> ::std::vec::Vec<(&'static str, ::std::string::String)> {
+        ::alloc::vec::Vec::new()
+    }
+}
+fn main() {}

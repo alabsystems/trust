@@ -10,7 +10,7 @@
 //! root anchored, no stamp consulted. So an ORDINARY crate — no impersonation, no
 //! `--crate-name` trick — bought the grant by naming a function `map`:
 //!
-//! ```ignore
+//! ```ignore (illustrative)
 //! pub struct Endless { pub i: u64 }
 //! impl Iterator for Endless {
 //!     type Item = u8;
@@ -91,7 +91,7 @@ const REAL_SLICE_ITER_TY: &str = "core::slice::iter::Iter<'_, u8>";
 /// bundle the compiler produced for the exploit source.
 const USER_ADT_COLLECT_SINK: &str = "<mycrate::vec::Endless as \
      core::iter::traits::iterator::Iterator>::collect::<alloc::vec::Vec<u8>>\
-     ::<__trust_elem_bytes@8>";
+     ::<__trust_elem_bytes@1>";
 
 /// The same file, local 2: the user iterator ADT's rendered type name.
 const USER_ADT_ITER_TY: &str = "mycrate::vec::Endless";
@@ -127,6 +127,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: Option<BlockId>) 
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
         is_foreign: false,
     }
 }
@@ -203,6 +204,7 @@ fn exploit_bundle(adaptor: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -212,7 +214,7 @@ fn exploit_bundle(adaptor: &str) -> VerifiableFunction {
 /// recoverable. A `collect` over an opaque source takes the second road — the row
 /// the shipped compiler reported for the measured control run.
 fn unbounded_alloc_rows(func: &VerifiableFunction) -> usize {
-    generate_unbounded_allocation_vcs(func)
+    generate_unbounded_allocation_vcs_on_64_bit(func)
         .iter()
         .filter(|vc| match &vc.kind {
             VcKind::UnsupportedMir { kind, .. } => kind.contains("UnboundedAllocation"),
@@ -279,7 +281,7 @@ fn a_user_fn_whose_last_segment_is_map_no_longer_deletes_the_obligation() {
 /// A user adaptor returning a GENUINE std iterator type which happens to be
 /// unbounded.
 ///
-/// ```ignore
+/// ```ignore (illustrative)
 /// impl Adapt {
 ///     pub fn map(s: core::slice::Iter<'_, u8>, _f: u8) -> core::iter::Cycle<core::slice::Iter<'_, u8>> {
 ///         s.cycle()
@@ -425,6 +427,7 @@ fn a_user_adaptor_over_a_real_range_no_longer_supplies_the_count() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let sound = bundle(REAL_STD_MAP_GENERIC);
@@ -514,14 +517,15 @@ fn the_walks_closure_property_is_enforced_not_assumed() {
 // ======================================================================
 
 /// `term::Context::new` = `s.iter().map(f).collect()`, an UNMODIFIED production
-/// dump (`trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/`). It takes the
-/// bounded-source skip on pristine `main` and must keep taking it: the leaf is
+/// dump (`trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/`). The leaf is
 /// `core::slice::<impl [T]>::iter`, the adaptor is `std::iter::Iterator::map`, and
-/// the iterator locals are typed `std::slice::Iter` / `std::iter::Map`. Both
-/// authenticators are satisfied by the compiler's own bytes — nothing here was
-/// adjusted to make them pass.
+/// the iterator locals are typed `std::slice::Iter` / `std::iter::Map`, so both
+/// provenance authenticators are satisfied by the compiler's own bytes. It took
+/// the bounded-source skip until 2026-09-25; its slice element is a type
+/// PARAMETER, and the skip now also requires a non-zero-sized element (F3), so it
+/// no longer does — see the note in the body.
 #[test]
-fn the_real_production_slice_iter_map_collect_keeps_its_bounded_source_skip() {
+fn the_real_production_generic_slice_iter_map_collect_withholds_the_bounded_source_skip() {
     let func = fixture(include_str!(
         "../../../trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/term__Context__new.json"
     ));
@@ -539,10 +543,19 @@ fn the_real_production_slice_iter_map_collect_keeps_its_bounded_source_skip() {
     assert!(callees.contains(&REAL_STD_MAP_GENERIC), "{callees:?}");
     assert!(callees.iter().any(|c| callee_tail(c) == "collect"), "{callees:?}");
 
+    // Trust (2026-09-25, F3): this bundle is GENERIC — the slice element is
+    // `TyKind::Param` (`s: &[S]`), and it collects `String`s. "An existing
+    // collection bounds the count" holds only for a non-zero-sized element, and
+    // `S` may be instantiated at a zero-sized type (`vec![Z; 1 << 61]` of a unit
+    // struct is a real, cheap value, and its 24-byte `String` destination then
+    // capacity-overflows). The grant is therefore withheld and the collect is a
+    // visible `count-not-derivable` Unknown. A MONOMORPHIC element keeps the grant
+    // (`tests/s1_false_accepts_2026_09_25.rs`, `a_zero_sized_source_loses_the_bounded_source_grant_and_a_sized_one_keeps_it`).
     assert_eq!(
         unbounded_alloc_rows(&func),
-        0,
-        "a genuine `slice::iter().map(f).collect()` must stay free of the obligation"
+        1,
+        "a `slice::iter().map(f).collect()` over a GENERIC element must not take the \
+         bounded-source grant: the element may be zero-sized"
     );
 }
 
@@ -556,14 +569,24 @@ fn the_real_production_range_map_collect_keeps_its_recovered_count() {
     let func = fixture(include_str!(
         "../../../trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/term__auto_generate_context.json"
     ));
-    let counted = generate_unbounded_allocation_vcs(&func)
-        .iter()
-        .filter(|vc| !matches!(&vc.kind, VcKind::UnsupportedMir { .. }))
-        .count();
-    let unknown = generate_unbounded_allocation_vcs(&func)
+    // Since `1b5061bbe0` a recovered count over an element of unknown layout is
+    // charged as the `element-size-not-derivable` Unknown, which is reached only
+    // AFTER the count was recovered; the count-not-derivable Unknown is the loss.
+    let rows = generate_unbounded_allocation_vcs_on_64_bit(&func);
+    let counted = rows
         .iter()
         .filter(|vc| match &vc.kind {
-            VcKind::UnsupportedMir { kind, .. } => kind.contains("UnboundedAllocation"),
+            VcKind::UnsupportedMir { kind, .. } => kind.ends_with("::element-size-not-derivable"),
+            _ => true,
+        })
+        .count();
+    let unknown = rows
+        .iter()
+        .filter(|vc| match &vc.kind {
+            VcKind::UnsupportedMir { kind, .. } => {
+                kind.contains("UnboundedAllocation")
+                    && !kind.ends_with("::element-size-not-derivable")
+            }
             _ => false,
         })
         .count();
@@ -584,9 +607,14 @@ fn the_real_production_take_capped_chain_keeps_its_recovered_count() {
     let func = fixture(include_str!(
         "../../../trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/term__generate_binder_names.json"
     ));
-    let rows = generate_unbounded_allocation_vcs(&func);
+    let rows = generate_unbounded_allocation_vcs_on_64_bit(&func);
+    // The element-size Unknown (`1b5061bbe0`) is reached only after the count was
+    // recovered; any OTHER Unknown is the degradation this test guards against.
     assert_eq!(
-        rows.iter().filter(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { .. })).count(),
+        rows.iter()
+            .filter(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
+                if !kind.ends_with("::element-size-not-derivable")))
+            .count(),
         0,
         "the `take(n)` count must still be recoverable, not degrade to an Unknown"
     );
@@ -648,6 +676,7 @@ fn a_user_adt_named_like_a_range_no_longer_buys_a_count() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // Non-vacuity: the genuine exclusive Range still yields the derivable count 3,
@@ -816,6 +845,7 @@ fn single_producer_collect_bundle(producer: &str, count_arg_idx: usize) -> Verif
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1004,6 +1034,7 @@ fn into_iter_collect_bundle(producer: &str, iter_ty: &str) -> VerifiableFunction
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1135,7 +1166,7 @@ fn the_qualified_producer_spellings_main_granted_are_granted_and_the_forgeries_a
 /// accident: reading the RECEIVER instead of the whole callee closes a false
 /// proof that `main` has.
 ///
-/// ```ignore
+/// ```ignore (illustrative)
 /// let it = my_endless.chain(v.iter());   // core::iter::adapters::chain::Chain<Endless, Iter<'_, u8>>
 /// let out: Vec<u8> = it.into_iter().collect();
 /// ```
@@ -1202,11 +1233,20 @@ fn the_str_view_producer_reads_its_receiver_too() {
     // the genuine inherent spelling, measured in the corpus
     assert!(is_str_view_iter_producer("core::str::<impl str>::chars", "chars"));
     assert!(is_str_view_iter_producer("core::str::<impl str>::bytes", "bytes"));
-    // a qualified spelling on a std String receiver
-    assert!(is_str_view_iter_producer(
+    // No trait-qualified spelling on a std String receiver: a USER trait's `split`
+    // can return anything (trip-count lane review, 2026-09-29), in a crate named `std`
+    // its trait path reads as std (`review6/auth` `e5_std`), and no genuine producer
+    // is spelled this way.
+    for qualified in [
+        "<alloc::string::String as mycrate::MySplit>::split",
+        "<alloc::string::String as std::MySplit>::split",
         "<alloc::string::String as core::ops::deref::Deref>::chars",
-        "chars"
-    ));
+    ] {
+        assert!(
+            !is_str_view_iter_producer(qualified, callee_tail(qualified)),
+            "a trait-qualified spelling must not be a str-view producer: {qualified}"
+        );
+    }
     // …and the crate-free forgery this campaign closed, in both spellings
     assert!(
         "mycrate::str::Endless::chars".contains("::str::"),
@@ -1275,6 +1315,7 @@ fn range_collect_bundle(adt_name: &str, ops: Vec<Operand>) -> VerifiableFunction
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1419,6 +1460,7 @@ fn a_symbolic_inclusive_range_adds_one_to_the_span() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let end = Operand::Copy(Place::local(1));
 
@@ -1592,10 +1634,21 @@ fn the_real_inclusive_range_reaches_this_lane_as_a_constructor_call_not_an_aggre
             )),
             "{name}: a RangeInclusive aggregate appeared; the reachability note is stale"
         );
+        // Trust (2026-09-25): `iter_collect_count` now counts the constructor
+        // call too (`is_range_inclusive_new_call`, `end - start + 1`). The
+        // constant `0..=5` is therefore a derived count below the ceiling (no
+        // row), while the symbolic end stays an obligation — a real count row now,
+        // no longer the `count-not-derivable` Unknown this note used to pin.
+        let rows = generate_unbounded_allocation_vcs_on_64_bit(&func);
+        let unsupported = rows
+            .iter()
+            .filter(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. } if kind.contains("UnboundedAllocation")))
+            .count();
+        assert_eq!(unsupported, 0, "{name}: the `RangeInclusive::new` count is derivable now");
         assert_eq!(
             unbounded_alloc_rows(&func),
-            1,
-            "{name}: no count is derivable from a `RangeInclusive::new` call, in any tree"
+            usize::from(name == "inclusive_at_ceiling"),
+            "{name}: a constant `0..=5` is bounded; a symbolic end stays an obligation"
         );
     }
     // The exclusive sibling IS an aggregate, and is the arm's live shape.
@@ -1611,4 +1664,115 @@ fn the_real_inclusive_range_reaches_this_lane_as_a_constructor_call_not_an_aggre
         "`a..b` no longer renders as a two-operand Range aggregate"
     );
     assert_eq!(unbounded_alloc_rows(&excl), 1);
+}
+
+/// Trust (2026-09-27): the bounded-source grant is a 64-bit address-space claim.
+///
+/// The same granted shape (`v.into_iter().collect::<Vec<u8>>()`) is charged when
+/// the verified target is 32-bit, where amortized doubling, element growth,
+/// `chain` and `extend` each reach the capacity-overflow panic from an ordinary
+/// input. Both widths are observed, so the zero at 64 is a decision.
+#[test]
+fn the_bounded_source_grant_is_withheld_off_64_bit() {
+    let bundle = into_iter_collect_bundle(VEC_INTO_ITER_QUALIFIED, VEC_INTO_ITER_TY);
+    let rows_at = |bits: u32| {
+        super::alloc_vcs::generate_unbounded_allocation_vcs_at(&bundle, bits)
+            .iter()
+            .filter(|vc| match &vc.kind {
+                VcKind::UnsupportedMir { kind, .. } => kind.contains("UnboundedAllocation"),
+                other => format!("{other:?}").contains("UnboundedAllocation"),
+            })
+            .count()
+    };
+    assert_eq!(rows_at(64), 0, "64-bit keeps the grant (premise: docs/DECISION_QUEUE.md D12)");
+    assert_eq!(rows_at(32), 1, "a 32-bit target must charge the collect");
+}
+
+// ======================================================================
+// 2026-10-03 — the slice SUB-SLICE producers
+// ======================================================================
+//
+// `v.chunks(3).map(..).collect()` reported `count-not-derivable` while
+// `v.iter().map(..).collect()` was granted: `windows`/`chunks`/`chunks_exact`/
+// `rchunks`/`rchunks_exact` yield at most `len` items, exactly as `iter()` does.
+// Spellings below are the extractor's (measured on stage1, 2026-10-03).
+
+#[test]
+fn slice_subslice_producers_are_bounded_like_iter() {
+    for tail in ["windows", "chunks", "chunks_exact", "rchunks", "rchunks_exact"] {
+        let real = format!("core::slice::<impl [i32]>::{tail}");
+        assert!(is_std_collection_iter_producer(&real, callee_tail(&real)), "{real}");
+    }
+}
+
+#[test]
+fn slice_subslice_producers_refuse_every_other_spelling() {
+    for spelling in [
+        // A user trait implemented for a core type: a core receiver, a user body.
+        "<core::slice::iter::Iter<'_, i32> as mycrate::Chunky>::chunks",
+        "<[i32] as mycrate::Chunky>::chunks",
+        // Not a slice receiver.
+        "alloc::vec::Vec::<i32>::chunks",
+        "std::collections::HashMap::<i32, i32>::windows",
+        // A user crate's module of the same name.
+        "mycrate::slice::<impl mycrate::slice::S>::chunks",
+        // An unauthenticated crate stamped as `core`.
+        "__trust_crate@1973d11b2baa21fa::core::slice::<impl [i32]>::chunks",
+    ] {
+        assert!(
+            !is_std_collection_iter_producer(spelling, callee_tail(spelling)),
+            "must stay gated: {spelling}"
+        );
+    }
+}
+
+/// Review round 54: only `Extend<char>`/`Extend<&char>` reserve one byte per item.
+#[test]
+fn a_string_extend_is_one_byte_per_item_only_for_chars() {
+    for yes in [
+        "<alloc::string::String as core::iter::traits::collect::Extend<char>>::extend::<I>",
+        "<alloc::string::String as core::iter::traits::collect::Extend<&char>>::extend::<I>",
+        "<alloc::string::String as core::iter::traits::collect::Extend<&'a char>>::extend::<I>",
+    ] {
+        assert!(extend_item_is_char(yes), "{yes}");
+    }
+    for no in [
+        "<alloc::string::String as core::iter::traits::collect::Extend<&str>>::extend::<[&str; 3]>",
+        "<alloc::string::String as core::iter::traits::collect::Extend<&'a str>>::extend::<I>",
+        "<alloc::string::String as core::iter::traits::collect::Extend<alloc::string::String>>::extend::<I>",
+        "core::iter::traits::collect::Extend::extend",
+        "<alloc::string::String as core::iter::traits::collect::Extend<mycrate::char>>::extend::<I>",
+    ] {
+        assert!(!extend_item_is_char(no), "{no}");
+    }
+}
+
+/// Review round 55: a `String` reserves nothing upfront for string items, except a
+/// by-value `[&str; N]` (`SpecExtendStr`), and one byte per `char`.
+#[test]
+fn a_string_extend_reserves_by_item_and_source_shape() {
+    const S: &str = "<alloc::string::String as core::iter::traits::collect::Extend<";
+    let case = |item: &str, src: &str| format!("{S}{item}>>::extend::<{src}>");
+    assert_eq!(
+        string_extend_reserved_bytes_per_item(&case("char", "core::str::Chars<'_>")),
+        Some(1)
+    );
+    assert_eq!(
+        string_extend_reserved_bytes_per_item(&case(
+            "&'a str",
+            "core::iter::adapters::copied::Copied<core::slice::iter::Iter<'_, &str>>"
+        )),
+        Some(0)
+    );
+    assert_eq!(
+        string_extend_reserved_bytes_per_item(&case(
+            "alloc::string::String",
+            "alloc::vec::Vec<alloc::string::String>"
+        )),
+        Some(0)
+    );
+    assert_eq!(string_extend_reserved_bytes_per_item(&case("&'a str", "[&str; 3]")), None);
+    assert_eq!(string_extend_reserved_bytes_per_item(&case("&'a str", "&[&str]")), None);
+    assert_eq!(string_extend_reserved_bytes_per_item(&case("mycrate::Foo", "I")), None);
+    assert_eq!(string_extend_reserved_bytes_per_item(&format!("{S}&'a str>>::extend")), None);
 }

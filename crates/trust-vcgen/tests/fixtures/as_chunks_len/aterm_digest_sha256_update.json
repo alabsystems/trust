@@ -1,0 +1,3792 @@
+{
+  "name": "update",
+  "def_path": "repro::sha256::Sha256::update",
+  "span": {
+    "file": "aterm-digest-848d791bd/src/sha256.rs",
+    "line_start": 97,
+    "col_start": 4,
+    "line_end": 129,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "repro::sha256::Sha256",
+                "fields": [
+                  [
+                    "state",
+                    {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        },
+                        "len": 8
+                      }
+                    }
+                  ],
+                  [
+                    "buf",
+                    {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        },
+                        "len": 64
+                      }
+                    }
+                  ],
+                  [
+                    "buf_len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter impl AsRef<[u8]>/#0 needs monomorphization"
+          }
+        },
+        "name": "bytes"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "data"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Unsupported": {
+                "kind": "TyKind::Param",
+                "detail": "generic parameter impl AsRef<[u8]>/#0 needs monomorphization"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "take"
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeTo",
+            "fields": [
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeFrom",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": "Never",
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 39,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 40,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                },
+                "len": 8
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 41,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 42,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Array": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    },
+                    "len": 64
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "blocks"
+      },
+      {
+        "index": 43,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "rest"
+      },
+      {
+        "index": 44,
+        "ty": {
+          "Tuple": [
+            {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        },
+                        "len": 64
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 45,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 46,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Array": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                },
+                                "len": 64
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        },
+                        "len": 64
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 47,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Array": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                },
+                                "len": 64
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        },
+                        "len": 64
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "iter"
+      },
+      {
+        "index": 48,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        },
+                        "len": 64
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Array": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            },
+                            "len": 64
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 49,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::slice::iter::Iter",
+                "fields": [
+                  [
+                    "ptr",
+                    {
+                      "Adt": {
+                        "name": "core::ptr::non_null::NonNull",
+                        "fields": [
+                          [
+                            "pointer",
+                            {
+                              "RawPtr": {
+                                "mutable": false,
+                                "pointee": {
+                                  "Array": {
+                                    "elem": {
+                                      "Int": {
+                                        "width": 8,
+                                        "signed": false
+                                      }
+                                    },
+                                    "len": 64
+                                  }
+                                }
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ],
+                  [
+                    "end_or_len",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Array": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            },
+                            "len": 64
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "_marker",
+                    {
+                      "Adt": {
+                        "name": "core::marker::PhantomData",
+                        "fields": [],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 50,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 51,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 52,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 53,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                },
+                "len": 8
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 54,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 55,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 56,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 57,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeTo",
+            "fields": [
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 58,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 59,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 98,
+                "col_start": 23,
+                "line_end": 98,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<impl AsRef<[u8]> as core::convert::AsRef<[u8]>>::as_ref",
+            "args": [
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 98,
+              "col_start": 23,
+              "line_end": 98,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 99,
+                "col_start": 19,
+                "line_end": 99,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 99,
+                "col_start": 41,
+                "line_end": 99,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 99,
+                "col_start": 41,
+                "line_end": 99,
+                "col_end": 51
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 99,
+                "col_start": 41,
+                "line_end": 99,
+                "col_end": 58
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 99,
+              "col_start": 19,
+              "line_end": 99,
+              "col_end": 59
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 27856,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 3
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 5,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 99,
+                "col_start": 8,
+                "line_end": 99,
+                "col_end": 59
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 103,
+                "col_start": 11,
+                "line_end": 103,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 103,
+                "col_start": 11,
+                "line_end": 103,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                18
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 103,
+              "col_start": 11,
+              "line_end": 103,
+              "col_end": 27
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 104,
+                "col_start": 36,
+                "line_end": 104,
+                "col_end": 48
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 104,
+                "col_start": 23,
+                "line_end": 104,
+                "col_end": 49
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 15,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 4,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 104,
+              "col_start": 23,
+              "line_end": 104,
+              "col_end": 49
+            },
+            "unwind": {
+              "Cleanup": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 15,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 104,
+                "col_start": 23,
+                "line_end": 104,
+                "col_end": 49
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 104,
+                "col_start": 54,
+                "line_end": 104,
+                "col_end": 58
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 17,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 104,
+                "col_start": 54,
+                "line_end": 104,
+                "col_end": 64
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<usize as core::cmp::Ord>::min",
+            "args": [
+              {
+                "Move": {
+                  "local": 13,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 16,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 12,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 104,
+              "col_start": 23,
+              "line_end": 104,
+              "col_end": 65
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 3570,
+              "substs_digest": [
+                14472905155864919619,
+                5837942336132216210
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 105,
+                "col_start": 12,
+                "line_end": 105,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 105,
+                "col_start": 21,
+                "line_end": 105,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 105,
+                "col_start": 35,
+                "line_end": 105,
+                "col_end": 47
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 24,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 105,
+                "col_start": 35,
+                "line_end": 105,
+                "col_end": 54
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 25,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 6,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 105,
+              "col_start": 35,
+              "line_end": 105,
+              "col_end": 54
+            },
+            "unwind": {
+              "Cleanup": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 25,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 105,
+                "col_start": 35,
+                "line_end": 105,
+                "col_end": 54
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 22,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 23,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 105,
+                "col_start": 21,
+                "line_end": 105,
+                "col_end": 54
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8; 64] as core::ops::index::IndexMut<core::ops::range::Range<usize>>>::index_mut",
+            "args": [
+              {
+                "Move": {
+                  "local": 20,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 21,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 19,
+              "projections": []
+            },
+            "target": 7,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 105,
+              "col_start": 20,
+              "line_end": 105,
+              "col_end": 55
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 4524,
+              "substs_digest": [
+                14450106600928918777,
+                10772248289640540759
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 105,
+                "col_start": 73,
+                "line_end": 105,
+                "col_end": 77
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeTo",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeTo<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 12,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 105,
+                "col_start": 78,
+                "line_end": 105,
+                "col_end": 84
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8] as core::ops::index::Index<core::ops::range::RangeTo<usize>>>::index",
+            "args": [
+              {
+                "Move": {
+                  "local": 27,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 28,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 26,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 105,
+              "col_start": 77,
+              "line_end": 105,
+              "col_end": 85
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 39089,
+              "substs_digest": [
+                14999498245697476694,
+                13178887325731907840
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::copy_from_slice",
+            "args": [
+              {
+                "Copy": {
+                  "local": 19,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 26,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 18,
+              "projections": []
+            },
+            "target": 9,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 105,
+              "col_start": 12,
+              "line_end": 105,
+              "col_end": 86
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15583,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": [
+                        "Deref",
+                        {
+                          "Field": 2
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 106,
+                "col_start": 12,
+                "line_end": 106,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 29,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 10,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 106,
+              "col_start": 12,
+              "line_end": 106,
+              "col_end": 32
+            },
+            "unwind": {
+              "Cleanup": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 2
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 29,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 106,
+                "col_start": 12,
+                "line_end": 106,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 31,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 107,
+                "col_start": 20,
+                "line_end": 107,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeFrom",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeFrom<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 12,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 107,
+                "col_start": 25,
+                "line_end": 107,
+                "col_end": 31
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8] as core::ops::index::Index<core::ops::range::RangeFrom<usize>>>::index",
+            "args": [
+              {
+                "Move": {
+                  "local": 31,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 32,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 30,
+              "projections": []
+            },
+            "target": 11,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 107,
+              "col_start": 24,
+              "line_end": 107,
+              "col_end": 32
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 39089,
+              "substs_digest": [
+                13895456231481184179,
+                1711512104488250017
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 30,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 107,
+                "col_start": 12,
+                "line_end": 107,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 108,
+                "col_start": 15,
+                "line_end": 108,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 33,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 34,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 108,
+                "col_start": 15,
+                "line_end": 108,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 33,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                16
+              ]
+            ],
+            "otherwise": 12,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 108,
+              "col_start": 15,
+              "line_end": 108,
+              "col_end": 39
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 112,
+                "col_start": 30,
+                "line_end": 112,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::is_empty",
+            "args": [
+              {
+                "Move": {
+                  "local": 36,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 35,
+              "projections": []
+            },
+            "target": 13,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 112,
+              "col_start": 30,
+              "line_end": 112,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15387,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 35,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                14
+              ]
+            ],
+            "otherwise": 15,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 112,
+              "col_start": 30,
+              "line_end": 112,
+              "col_end": 45
+            }
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::panicking::panic",
+            "args": [
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      97,
+                      115,
+                      115,
+                      101,
+                      114,
+                      116,
+                      105,
+                      111,
+                      110,
+                      32,
+                      102,
+                      97,
+                      105,
+                      108,
+                      101,
+                      100,
+                      58,
+                      32,
+                      100,
+                      97,
+                      116,
+                      97,
+                      46,
+                      105,
+                      115,
+                      95,
+                      101,
+                      109,
+                      112,
+                      116,
+                      121,
+                      40,
+                      41
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 37,
+              "projections": []
+            },
+            "target": null,
+            "span": {
+              "file": "<home>/toolchains/trust-b58a105d/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+              "line_start": 290,
+              "col_start": 12,
+              "line_end": 290,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 11819,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core",
+              "diverging_entry": "PanicOrAbort"
+            }
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 28,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 129,
+              "col_start": 4,
+              "line_end": 129,
+              "col_end": 5
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 38,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 115,
+                "col_start": 24,
+                "line_end": 115,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 40,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 116,
+                "col_start": 21,
+                "line_end": 116,
+                "col_end": 36
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 41,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 38,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 116,
+                "col_start": 38,
+                "line_end": 116,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "repro::sha256::compress",
+            "args": [
+              {
+                "Copy": {
+                  "local": 40,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 41,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 39,
+              "projections": []
+            },
+            "target": 17,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 116,
+              "col_start": 12,
+              "line_end": 116,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 3410588637815928769,
+              "def_index": 49,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3410588637815928769,
+              "krate_name": "repro"
+            }
+          }
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 2
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 117,
+                "col_start": 12,
+                "line_end": 117,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 18
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 45,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 121,
+                "col_start": 29,
+                "line_end": 121,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::as_chunks::<64>",
+            "args": [
+              {
+                "Move": {
+                  "local": 45,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 44,
+              "projections": []
+            },
+            "target": 19,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 121,
+              "col_start": 29,
+              "line_end": 121,
+              "col_end": 58
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15453,
+              "substs_digest": [
+                17237315474143100291,
+                9210827381861508542
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 42,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 44,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 121,
+                "col_start": 13,
+                "line_end": 121,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 43,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 44,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 121,
+                "col_start": 21,
+                "line_end": 121,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<&[[u8; 64]] as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Copy": {
+                  "local": 42,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 46,
+              "projections": []
+            },
+            "target": 20,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 122,
+              "col_start": 21,
+              "line_end": 122,
+              "col_end": 27
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 10349,
+              "substs_digest": [
+                6759760256080298991,
+                8733734292706000650
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 47,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 46,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 122,
+                "col_start": 21,
+                "line_end": 122,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 21
+        }
+      },
+      {
+        "id": 21,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 49,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 47,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 122,
+                "col_start": 21,
+                "line_end": 122,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::Iter<'_, [u8; 64]> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Copy": {
+                  "local": 49,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 48,
+              "projections": []
+            },
+            "target": 22,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 122,
+              "col_start": 21,
+              "line_end": 122,
+              "col_end": 27
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 10530,
+              "substs_digest": [
+                5644436537362756833,
+                9578843993921528807
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 50,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 48,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 122,
+                "col_start": 21,
+                "line_end": 122,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 50,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                25
+              ],
+              [
+                1,
+                24
+              ]
+            ],
+            "otherwise": 23,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 122,
+              "col_start": 21,
+              "line_end": 122,
+              "col_end": 27
+            }
+          }
+        }
+      },
+      {
+        "id": 23,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 24,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 51,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 48,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 122,
+                "col_start": 12,
+                "line_end": 122,
+                "col_end": 17
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 53,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 123,
+                "col_start": 21,
+                "line_end": 123,
+                "col_end": 36
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "repro::sha256::compress",
+            "args": [
+              {
+                "Copy": {
+                  "local": 53,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 51,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 52,
+              "projections": []
+            },
+            "target": 31,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 123,
+              "col_start": 12,
+              "line_end": 123,
+              "col_end": 44
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 3410588637815928769,
+              "def_index": 49,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3410588637815928769,
+              "krate_name": "repro"
+            }
+          }
+        }
+      },
+      {
+        "id": 25,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 56,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 127,
+                "col_start": 8,
+                "line_end": 127,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 58,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 43,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 127,
+                "col_start": 19,
+                "line_end": 127,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 57,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeTo",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeTo<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 58,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 127,
+                "col_start": 17,
+                "line_end": 127,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8; 64] as core::ops::index::IndexMut<core::ops::range::RangeTo<usize>>>::index_mut",
+            "args": [
+              {
+                "Move": {
+                  "local": 56,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 57,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 55,
+              "projections": []
+            },
+            "target": 26,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 127,
+              "col_start": 16,
+              "line_end": 127,
+              "col_end": 30
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 4524,
+              "substs_digest": [
+                2615380716891496146,
+                15510137349872662531
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 26,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::copy_from_slice",
+            "args": [
+              {
+                "Copy": {
+                  "local": 55,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 43,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 54,
+              "projections": []
+            },
+            "target": 27,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 127,
+              "col_start": 8,
+              "line_end": 127,
+              "col_end": 52
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 29
+            },
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15583,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 27,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 59,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 43,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 128,
+                "col_start": 23,
+                "line_end": 128,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 2
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 59,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 128,
+                "col_start": 8,
+                "line_end": 128,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 28,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 129,
+              "col_start": 4,
+              "line_end": 129,
+              "col_end": 5
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 28,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 29,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 30,
+            "span": {
+              "file": "aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 129,
+              "col_start": 4,
+              "line_end": 129,
+              "col_end": 5
+            },
+            "unwind": "Terminate"
+          }
+        }
+      },
+      {
+        "id": 30,
+        "stmts": [],
+        "terminator": "Resume"
+      },
+      {
+        "id": 31,
+        "stmts": [],
+        "terminator": {
+          "Goto": 21
+        }
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_50",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_50",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

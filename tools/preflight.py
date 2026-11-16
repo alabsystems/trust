@@ -1,5 +1,33 @@
-#!/usr/bin/env python3
-"""Trust build preflight checker.
+#!/bin/sh
+""":"
+# Trust: python floor. POSIX sh runs this block when the file is EXECUTED and
+# re-execs under a >=3.11 interpreter; Python reads it as a string.
+for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -I -S -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null; then
+        exec "$candidate" -I -S "$0" "$@"
+    fi
+done
+echo "preflight.py requires Python 3.11+ (tomllib)" >&2
+exit 2
+":"""
+from __future__ import annotations
+
+import os as _floor_os
+import shutil as _floor_shutil
+import sys as _floor_sys
+
+# Trust: python floor, second half. `python3 preflight.py` reads the sh block above
+# as a string, so an old `python3` (3.9 on macOS CommandLineTools) re-execs here.
+if __name__ == "__main__" and _floor_sys.version_info < (3, 11):
+    for _floor_candidate in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        _floor_path = _floor_shutil.which(_floor_candidate)
+        if _floor_path:
+            _floor_argv = [_floor_path, "-I", "-S", _floor_os.path.abspath(__file__), *_floor_sys.argv[1:]]
+            _floor_os.execv(_floor_path, _floor_argv)
+    _floor_sys.exit("preflight.py requires Python 3.11+ (tomllib); none found on PATH")
+
+__doc__ = """Trust build preflight checker.
 
 Fails fast, in seconds, on the failure classes that have historically only
 surfaced *after* paying for a full `x.py build` (up to 60 minutes each):
@@ -22,8 +50,6 @@ Design rules this file obeys:
   * Every finding carries a copy-pasteable fix.
 """
 
-from __future__ import annotations
-
 import argparse
 import copy
 import concurrent.futures
@@ -31,10 +57,12 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,10 +77,18 @@ except ModuleNotFoundError:  # pragma: no cover - the .sh launcher prevents this
 FAIL, WARN, INFO, OK = "FAIL", "WARN", "INFO", "OK"
 _ORDER = {FAIL: 0, WARN: 1, INFO: 2, OK: 3}
 
-PRUNE_DIRS = {".git", "build", "target", "node_modules", ".cargo", "__pycache__"}
+# `build.noindex` is the Spotlight-excluded home that `build` may link to
+# (docs/BUILD_AND_INSTALL.md). os.walk never follows the `build` link, but it
+# WOULD descend the real directory beside it: hundreds of GiB of build output.
+PRUNE_DIRS = {".git", "build", "build.noindex", "target", "node_modules", ".cargo", "__pycache__"}
 DEP_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
 TOOL_RS = "src/bootstrap/src/core/build_steps/tool.rs"
+# The only submodule repair preflight prints. A blanket `git submodule update`
+# cannot tell a BEHIND worktree from an AHEAD one and moves off unlanded work;
+# the sync script moves only the provably lossless modules and names the rest.
+SUBMODULE_RESTORE = "bash scripts/submodule_sync.sh --fetch --restore"
 DIST_RS = "src/bootstrap/src/core/build_steps/dist.rs"
+INSTALL_RS = "src/bootstrap/src/core/build_steps/install.rs"
 
 # The function that actually decides which binaries a finished sysroot carries.
 SYSROOT_BINS_FN = "restored_sysroot_bins_for_tool_settings"
@@ -188,10 +224,11 @@ class Report:
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
-def run(cmd: list[str], cwd: Path | None = None, timeout: int = 60) -> tuple[int, str, str]:
+def run(cmd: list[str], cwd: Path | None = None, timeout: int = 60,
+        env: dict[str, str] | None = None) -> tuple[int, str, str]:
     try:
         p = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False, env=env
         )
         return p.returncode, p.stdout, p.stderr
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
@@ -651,6 +688,15 @@ class BootstrapFacts:
     sysroot_bins_modelled: bool = False
     compat_aliases: set[str] = field(default_factory=set)
     dist_components: list[str] = field(default_factory=list)
+    # `[build] tools` entries that install.rs consults directly: an `install!`
+    # step gated by `Self::should_build` (which matches its alias, e.g.
+    # `trustc-dev`), and literal `tools.contains("rust-src")` gates. Neither is
+    # a sysroot binary, so without these the audit called the committed
+    # `compiler`/`tools` profiles' `trustc-dev` and `rust-src` entries typos.
+    # Both are read from install.rs, never listed here: when upstream 162423
+    # renamed `src` to `rust-src`, a profile still naming `src` drew the typo
+    # warning because `src` had stopped selecting anything.
+    install_selectors: list[str] = field(default_factory=list)
     src: str = ""
 
 
@@ -697,6 +743,20 @@ def read_bootstrap_facts(root: Path) -> BootstrapFacts:
             )
         )
 
+    install_src = root / INSTALL_RS
+    install_selectors: list[str] = []
+    if install_src.exists():
+        ins = strip_line_comments(install_src.read_text(errors="replace"))
+        install_selectors = sorted(
+            set(
+                re.findall(
+                    r'\b[A-Z]\w*,\s*(?:alias|path)\s*=\s*"([^"]+)",\s*Self::should_build\(_config\)',
+                    ins,
+                )
+            )
+            | set(re.findall(r'tools\.as_ref\(\)[^;{]*?\.contains\("([^"]+)"\)', ins))
+        )
+
     return BootstrapFacts(
         gated_tools=gated,
         l2_backends=l2,
@@ -710,6 +770,7 @@ def read_bootstrap_facts(root: Path) -> BootstrapFacts:
         sysroot_bins_modelled=bins_ok,
         compat_aliases=compat,
         dist_components=dist_components,
+        install_selectors=install_selectors,
         src=s,
     )
 
@@ -875,6 +936,7 @@ class ToolModel:
         """Every string a `[build] tools` entry could legitimately be."""
         known = set(self.all_install_names()) | set(self.f.gated_tools)
         known |= set(self.f.l2_backends) | set(self.f.dist_components)
+        known |= set(self.f.install_selectors)
         for tbl in (self.f.user_sel, self.f.step_sel):
             if tbl:
                 known |= tbl.entries | tbl.targets
@@ -886,27 +948,61 @@ class ToolModel:
 # --------------------------------------------------------------------------
 # CHECK 1 - submodule drift
 # --------------------------------------------------------------------------
-def check_submodules(root: Path, rep: Report) -> None:
+def check_submodules(root: Path, rep: Report, *, deferred_first_party: bool = False) -> None:
     check = "1. SUBMODULE DRIFT"
-    rc, out, err = run(["git", "submodule", "status"], cwd=root)
+    rc, out, err = run(["git", "submodule", "status", "--recursive"], cwd=root)
     if rc != 0:
-        rep.add(WARN, check, "could not run `git submodule status`", [err.strip()[:200]])
+        rep.add(FAIL, check, "could not enumerate recursive submodule status",
+                [err.strip()[:200]])
         return
 
     drifted: list[str] = []
     uninit: list[str] = []
     conflicted: list[str] = []
+    unresolved: list[str] = []
+    records: list[tuple[str, str, str, str]] = []
+    paths: set[str] = set()
 
     for line in out.splitlines():
         if not line.strip():
             continue
         prefix, rest = line[0], line[1:]
         parts = rest.split()
-        if len(parts) < 2:
+        if (len(parts) < 2 or prefix not in " +-U"
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", parts[0]) is None):
+            rep.add(FAIL, check, "malformed recursive submodule status", [line[:200]])
+            unresolved.append(line)
             continue
         sha, path = parts[0], parts[1]
         described = " ".join(parts[2:]).strip("()") if len(parts) > 2 else ""
+        relative = Path(path)
+        if (relative.is_absolute() or any(part in (".", "..") for part in path.split("/"))
+                or relative.as_posix() != path or path in paths
+                or (len(parts) > 2 and not (parts[2].startswith("(") and parts[-1].endswith(")")))):
+            rep.add(FAIL, check, "ambiguous recursive submodule path", [line[:200]])
+            unresolved.append(path)
+            continue
+        paths.add(path)
+        records.append((prefix, sha, path, described))
+
+    for prefix, sha, path, described in records:
+        if deferred_first_party and prefix == "-" and path.startswith("first-party/"):
+            rep.add(INFO, check, f"{path}: unrelated source deferred for standalone tool only", [])
+            continue
         sub = root / path
+        # A nested gitlink belongs to its immediate repository, not to the
+        # outer tree: HEAD:first-party/parent/child cannot cross a gitlink.
+        parent_path = next(
+            (parent for parent in Path(path).parents if parent.as_posix() in paths),
+            Path("."),
+        )
+        parent = root / parent_path
+        pin_path = Path(path).relative_to(parent_path).as_posix()
+        if parent_path != Path(".") and not (parent / ".git").exists():
+            unresolved.append(path)
+            rep.add(FAIL, check, f"{path} has an uninitialised pin-owning repository",
+                    [parent_path.as_posix()])
+            continue
 
         # `git submodule status` diffs the worktree against the INDEX, not HEAD.
         # `git add -A` on a drifted tree stages the stale gitlink and the `+`
@@ -914,7 +1010,7 @@ def check_submodules(root: Path, rep: Report) -> None:
         # committed pin - which is exactly the shape of the E0599/E0432 hunt.
         # So the committed pin is compared explicitly, prefix or no prefix.
         pinned = ""
-        prc, pout, _ = run(["git", "rev-parse", f"HEAD:{path}"], cwd=root)
+        prc, pout, _ = run(["git", "rev-parse", f"HEAD:{pin_path}"], cwd=parent)
         if prc == 0:
             pinned = pout.strip()
         # Only ask git about the submodule if it really is one. On an emptied or
@@ -926,6 +1022,14 @@ def check_submodules(root: Path, rep: Report) -> None:
             arc, aout, _ = run(["git", "rev-parse", "HEAD"], cwd=sub)
             if arc == 0:
                 actual = aout.strip()
+        if (re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", pinned) is None
+                or (prefix != "-" and
+                    (not initialised or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", actual) is None))):
+            unresolved.append(path)
+            rep.add(FAIL, check, f"{path} has unreadable committed pin or checkout identity",
+                    [f"pin owner: {parent_path.as_posix()} (HEAD:{pin_path})",
+                     f"pinned: {pinned or '<unknown>'}; actual: {actual or '<none>'}"])
+            continue
         staged_drift = bool(pinned and actual and actual != pinned and prefix == " ")
 
         if prefix == " " and not staged_drift:
@@ -945,7 +1049,7 @@ def check_submodules(root: Path, rep: Report) -> None:
             f"checked out   : {actual or '<none>' if not initialised else actual or sha}"
             f" ({described or 'n/a'})",
             f"parked on     : {branch}",
-            f"pinned by repo: {pinned or '<unknown>'}  (HEAD:{path})",
+            f"pinned by repo: {pinned}  ({parent_path.as_posix()}:HEAD:{pin_path})",
         ]
 
         if staged_drift:
@@ -956,12 +1060,12 @@ def check_submodules(root: Path, rep: Report) -> None:
                 f"{path} is off the COMMITTED pin, and the drift is STAGED "
                 f"(git submodule status shows no `+`)",
                 detail + [
-                    "the stale gitlink is in the index, so `git submodule update`",
-                    "alone would re-apply the STALE sha. Unstage it first.",
+                    "the stale gitlink is in the index, so a restore to the index",
+                    "would re-apply the STALE sha. Unstage it first.",
                 ],
                 [
-                    f"git restore --staged -- {path}",
-                    "git submodule update --init --recursive",
+                    f"git -C {parent_path.as_posix()} restore --staged -- {pin_path}",
+                    f"{SUBMODULE_RESTORE}   # moves only lossless modules; prints the rest",
                 ],
             )
         elif prefix == "+":
@@ -971,16 +1075,16 @@ def check_submodules(root: Path, rep: Report) -> None:
                 check,
                 f"{path} is AHEAD/BEHIND its pin (`+`) - stale APIs will look like source bugs",
                 detail,
-                ["git submodule update --init --recursive"],
+                [f"{SUBMODULE_RESTORE}   # BEHIND moves; AHEAD/DIVERGENT is someone's work: it says"],
             )
         elif prefix == "-":
             uninit.append(path)
             rep.add(
                 FAIL,
                 check,
-                f"{path} is NOT INITIALISED (`-`) - its crates cannot build",
+                f"{path} is NOT INITIALISED (`-`) - the pinned source closure is incomplete",
                 detail,
-                ["git submodule update --init --recursive"],
+                [SUBMODULE_RESTORE],
             )
         elif prefix == "U":
             conflicted.append(path)
@@ -990,7 +1094,7 @@ def check_submodules(root: Path, rep: Report) -> None:
                 f"{path} has MERGE CONFLICTS (`U`) - resolve before any build",
                 detail,
                 [f"git -C {path} status", "# resolve conflicts, then:",
-                 "git submodule update --init --recursive"],
+                 SUBMODULE_RESTORE],
             )
 
     # The measured trap: dirty tracked files inside a submodule make
@@ -1009,14 +1113,13 @@ def check_submodules(root: Path, rep: Report) -> None:
             rep.add(
                 FAIL,
                 check,
-                f"{path} has LOCAL CHANGES that will BLOCK `git submodule update`",
+                f"{path} has LOCAL CHANGES that will BLOCK restoring its pin",
                 [f"dirty: {f}" for f in files]
                 + ["('local changes to the following files would be overwritten')"],
                 [
-                    f"git -C {path} diff > /tmp/{Path(path).name}-local.patch   "
-                    f"# keep a copy first",
-                    f"git -C {path} checkout -- .",
-                    "git submodule update --init --recursive",
+                    f"git -C {path} status   # these edits may be someone's work: "
+                    "commit or stash them there, never discard them",
+                    SUBMODULE_RESTORE,
                 ],
             )
 
@@ -1024,13 +1127,9 @@ def check_submodules(root: Path, rep: Report) -> None:
     # loaded gun: the day drift appears, `git submodule update` refuses with
     # "local changes would be overwritten" and the correct fix is unavailable
     # until the edit is rescued. Surface it while it is still cheap.
-    for line in out.splitlines():
-        if not line.strip():
+    for _, _, path, _ in records:
+        if path in drifted + conflicted:
             continue
-        parts = line[1:].split()
-        if len(parts) < 2 or parts[1] in drifted + conflicted:
-            continue
-        path = parts[1]
         if not (root / path / ".git").exists():
             continue
         drc, dout, _ = run(["git", "status", "--porcelain", "--untracked-files=no",
@@ -1047,9 +1146,70 @@ def check_submodules(root: Path, rep: Report) -> None:
                  "   # review, then commit in the submodule"],
             )
 
-    if not (drifted or uninit or conflicted):
-        n = len([ln for ln in out.splitlines() if ln.strip()])
-        rep.add(INFO, check, f"all {n} submodules match their pinned gitlink SHA")
+    if not (drifted or uninit or conflicted or unresolved):
+        rep.add(INFO, check, f"all {len(records)} recursive submodules match their pinned gitlink SHA")
+
+
+def build_pin_ranges(root: Path) -> tuple[str, list[str], list[str]]:
+    """Snapshot build ancestry, not the net change of a hypothetical push.
+
+    A newer remote tip is not an ancestor of a historical build. Comparing its
+    pins directly against HEAD mistakes unchanged old pins for a rollback.
+    Resolve refs once, then judge every best common ancestor against that exact
+    build commit. Publication still uses check_pin_regression.sh's destination
+    range; this function does not select or authorize a push range.
+    """
+    def git(*args: str, absent_ok: bool = False) -> str | None:
+        proc = subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True, timeout=30,
+        )
+        if absent_ok and proc.returncode == 1:
+            return None
+        proc.check_returncode()
+        return proc.stdout.strip()
+
+    def oid(value: str | None) -> str:
+        if value is None or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None:
+            raise ValueError(f"invalid Git commit identity: {value!r}")
+        return value
+
+    tip = oid(git("rev-parse", "--verify", "HEAD^{commit}"))
+    # --quiet distinguishes a missing ref (1) from a Git failure; non-quiet
+    # `show-ref --verify` instead exits 128 for absence. Read the identity only
+    # after that distinction, and never pass a moving ref into a comparison.
+    remote_present = git("show-ref", "--verify", "--quiet", "refs/remotes/origin/main",
+                         absent_ok=True)
+    remote = (None if remote_present is None else
+              oid(git("rev-parse", "--verify", "refs/remotes/origin/main^{commit}")))
+    notes = [f"build commit: {tip}"]
+    shallow = git("rev-parse", "--is-shallow-repository")
+    if shallow not in ("true", "false"):
+        raise ValueError("cannot determine whether build history is shallow")
+    if shallow == "true":
+        notes.append("shallow history: ancestry comparisons cover only available commits")
+    bases: list[str] = []
+    if remote is not None:
+        notes.append(f"observed origin/main: {remote}")
+        common = git("merge-base", "--all", tip, remote, absent_ok=True)
+        if common is not None:
+            bases = [oid(base) for base in common.splitlines()]
+            if not bases:
+                raise ValueError("Git returned no best common ancestors with a success exit")
+        else:
+            notes.append("origin/main has no common ancestry; checking available build parents")
+    else:
+        notes.append("origin/main is absent; checking available build parents (no fetch required)")
+    if not bases:
+        parents = git("rev-list", "--parents", "--max-count=1", tip)
+        if not parents or parents.split()[0] != tip:
+            raise ValueError("cannot enumerate build parents")
+        bases = [oid(parent) for parent in parents.split()[1:]]
+        if not bases:
+            notes.append("no available parent: no build-ancestry pin transition to compare")
+    ranges = [f"{base}..{tip}" for base in sorted(set(bases))]
+    notes.extend(f"build ancestry range: {span}" for span in ranges)
+    notes.append("publication is separate: the push guard compares the actual destination tip")
+    return tip, ranges, notes
 
 
 def check_pin_regression(root: Path, rep: Report) -> None:
@@ -1069,43 +1229,245 @@ def check_pin_regression(root: Path, rep: Report) -> None:
     the tree failed with three E0599s in the PARSER — nowhere near the change under
     test — after a full 90-minute build had already been spent.
 
-    `scripts/check_pin_regression.sh` was written for exactly this and was on no
-    path that runs. It is now.
+    Use the build's own ancestry, never a newer remote tip as the build's base.
+    The standalone script's default and actual pre-push semantics are unchanged.
     """
     check = "pin_regression"
     script = root / "scripts" / "check_pin_regression.sh"
     if not script.is_file():
+        rep.add(FAIL, check, "pin regression checker is missing", [str(script)])
         return
     try:
-        proc = subprocess.run(
-            ["bash", str(script)],
-            cwd=root, capture_output=True, text=True, timeout=60,
-        )
+        tip, ranges, notes = build_pin_ranges(root)
+        rep.add(INFO, check, "checking build ancestry, not a proposed publication", notes)
+        for span in ranges:
+            proc = subprocess.run(
+                ["bash", str(script), span],
+                cwd=root, capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode == 0:
+                continue
+            detail = (proc.stdout + proc.stderr).strip().splitlines()
+            rep.add(
+                FAIL, check,
+                ("a first-party pin regression was refused in the build ancestry"
+                 if proc.returncode == 1 else "pin regression checker did not complete"),
+                [f"range: {span}", f"checker exit: {proc.returncode}", *detail[:12]],
+                [f"bash scripts/check_pin_regression.sh {span}",
+                 "# inspect the reported pin and reconcile it with its consumers"],
+            )
+        after = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=root, capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.strip()
+        if after != tip:
+            raise ValueError(f"build HEAD changed during pin audit: {tip} -> {after}")
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        rep.add(FAIL, check, "pin regression ancestry check could not be completed",
+                [str(error)], ["git status", "git log --oneline --parents -5"])
+
+
+def _pin_rollback_disclosed(root: Path, path: str, since: str) -> str:
+    """Return the `pin-rollback:` line that DISCLOSES a backward move, or "".
+
+    `scripts/check_pin_regression.sh` states the repo's convention for this in
+    full: "THE ESCAPE HATCH IS DISCLOSURE, NOT SUPPRESSION" — a deliberate
+    rollback is legitimate, you just have to say so in the commit message as
+
+        pin-rollback: <path> <why>
+
+    and there is deliberately no env-var off switch. `check_pin_behind_history`
+    shipped without that hatch, which made a deliberate rollback INEXPRESSIBLE:
+    the check hard-FAILs and prints, as its fix, the very checkout that restores
+    the pin whose adoption broke the build. Measured 2026-08-28: `first-party/clean`
+    at ac4874697 requires ay 0.18.0 while six sibling first-party repos require
+    0.17.0 through the same patched source URL, so adopting it splits every ay
+    crate in two and stage2 stops compiling — and the only in-repo repair is a
+    backward walk of that one pin. Without a hatch the repair could not be built
+    at all, and following the printed fix re-breaks the tree.
+
+    The window searched is `<since>..HEAD` restricted to this gitlink, where
+    `<since>` is the commit that recorded the NEWER pin. That is exactly the set
+    of commits that could have performed or re-affirmed the rollback, so a
+    disclosure written once keeps holding as later commits land, and a pin that
+    walks backward again LATER — past a newer high-water mark, with no fresh
+    disclosure — still fails.
+    """
+    try:
+        msgs = subprocess.run(
+            ["git", "--literal-pathspecs", "log", "--format=%B", f"{since}..HEAD", "--", path],
+            cwd=root, capture_output=True, text=True, timeout=30,
+        ).stdout
     except Exception:
-        return  # never let the guard itself block a build
-    if proc.returncode == 0:
-        return
-    detail = (proc.stdout or "").strip().splitlines()
-    rep.add(
-        FAIL,
-        check,
-        "a first-party pin moves BACKWARD in this range - the tree may not build, "
-        "and a merge reports no conflict for a gitlink",
-        detail[:12],
-        [
-            "# inspect which pin regressed:",
-            "./scripts/check_pin_regression.sh",
-            "# then restore it, e.g.:",
-            "git -C first-party/<sub> checkout <intended-sha> && git add first-party/<sub>",
-        ],
+        return ""
+    pat = re.compile(
+        rf"^[ \t]*pin-rollback:[ \t]*.*{re.escape(path)}.*$",
+        re.IGNORECASE | re.MULTILINE,
     )
+    m = pat.search(msgs)
+    return m.group(0).strip() if m else ""
+
+
+PIN_HISTORY_LIMIT = 40
+
+
+def _history_git_objects(repo: Path, specs: list[str], *, contents: bool = True
+                         ) -> list[tuple[str, bytes, bytes] | None]:
+    """Bounded native object reads; requests contain only Git object identities."""
+    if not specs:
+        return []
+    if any(re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})(?:\^\{(?:tree|commit)\})?", spec)
+           is None for spec in specs):
+        raise ValueError("invalid Git batch object identity")
+    proc = subprocess.run(
+        ["git", "cat-file", "--batch" if contents else "--batch-check"], cwd=repo,
+        input="".join(f"{spec}\n" for spec in specs).encode("ascii"),
+        capture_output=True, timeout=30,
+    )
+    proc.check_returncode()
+    result = []
+    position = 0
+    for _spec in specs:
+        end = proc.stdout.index(b"\n", position)
+        fields = proc.stdout[position:end].split()
+        position = end + 1
+        if len(fields) == 2 and fields[1] == b"missing":
+            result.append(None)
+            continue
+        if (len(fields) != 3 or not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", fields[0])
+                or not fields[2].isdigit()):
+            raise ValueError("invalid Git batch object header")
+        size = int(fields[2]) if contents else 0
+        body = proc.stdout[position:position + size]
+        if contents:
+            if len(body) != size or proc.stdout[position + size:position + size + 1] != b"\n":
+                raise ValueError("incomplete Git batch object body")
+            position += size + 1
+        result.append((fields[0].decode("ascii"), fields[1], body))
+    if position != len(proc.stdout):
+        raise ValueError("unexpected trailing Git batch output")
+    return result
+
+
+def _history_tree_pins(root: Path, queries: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """Read exact gitlinks, batching immutable trees instead of spawning per pin."""
+    if not queries:
+        return {}
+    result = {query: "" for query in queries}
+
+    def native(query):
+        rev, path = query
+        if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", rev) is None:
+            return ""
+        try:
+            proc = subprocess.run(
+                ["git", "--literal-pathspecs", "ls-tree", "-z", rev, "--", path],
+                cwd=root, capture_output=True, timeout=30,
+            )
+            fields = proc.stdout.partition(b"\t")[0].split()
+            return fields[2].decode("ascii") if len(fields) == 3 and fields[0] == b"160000" else ""
+        except Exception:
+            return ""
+
+    try:
+        revisions = sorted({rev for rev, _path in queries})
+        roots = dict(zip(revisions, _history_git_objects(
+            root, [f"{rev}^{{tree}}" for rev in revisions])))
+        trees = {}
+
+        def remember(record):
+            oid, kind, body = record
+            if kind != b"tree":
+                raise ValueError("Git returned a non-tree for a tree request")
+            entries = {}
+            position = 0
+            width = len(oid) // 2
+            while position < len(body):
+                space = body.index(b" ", position)
+                end = body.index(b"\0", space)
+                last = end + 1 + width
+                if last > len(body):
+                    raise ValueError("incomplete Git tree entry")
+                entries[body[space + 1:end]] = (int(body[position:space], 8), body[end + 1:last].hex())
+                position = last
+            trees[oid] = entries
+
+        for record in roots.values():
+            if record is not None:
+                remember(record)
+        pending = {}
+        for query in result:
+            parts = os.fsencode(query[1]).split(b"/")
+            if any(part in (b"", b".", b"..") for part in parts):
+                result[query] = native(query)  # retain Git's unusual path-shape behavior
+            elif roots[query[0]] is not None:
+                pending[query] = (roots[query[0]][0], parts)
+        while pending:
+            needed = sorted({oid for oid, _parts in pending.values()} - trees.keys())
+            for oid, record in zip(needed, _history_git_objects(root, needed)):
+                if record is None:
+                    raise ValueError(f"missing Git tree {oid}")
+                remember(record)
+            following = {}
+            for query, (oid, parts) in pending.items():
+                mode, child = trees[oid].get(parts[0], (0, ""))
+                if len(parts) == 1:
+                    if mode == 0o160000:
+                        result[query] = child
+                elif mode == 0o40000:
+                    following[query] = (child, parts[1:])
+            pending = following
+        return result
+    except Exception:
+        # A batch failure must not lose independently readable historical pins.
+        return {query: native(query) for query in result}
+
+
+def _historical_descendants(repo: Path, current: str, candidates: list[str]) -> set[str]:
+    """Native ancestry-path membership equals current<=candidate, including tags."""
+    if not candidates:
+        return set()
+    try:
+        names = [current, *dict.fromkeys(candidates)]
+        records = _history_git_objects(repo, [f"{oid}^{{commit}}" for oid in names], contents=False)
+        peeled = {name: record[0] for name, record in zip(names, records)
+                  if record is not None and record[1] == b"commit"}
+        if current not in peeled:
+            return set()
+        bottom = peeled[current]
+        tips = sorted(set(peeled.values()) - {bottom})
+        descendants = set()
+        if tips:
+            proc = subprocess.run(
+                ["git", "rev-list", "--ancestry-path", "--stdin"], cwd=repo,
+                input="".join(f"{oid}\n" for oid in [*tips, f"^{bottom}"]),
+                capture_output=True, text=True, timeout=30,
+            )
+            proc.check_returncode()
+            descendants = set(proc.stdout.split())
+        return {old for old in candidates if old in peeled
+                and (peeled[old] == bottom or peeled[old] in descendants)}
+    except Exception:
+        result = set()
+        for old in candidates:
+            try:
+                proc = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", current, old],
+                    cwd=repo, capture_output=True, timeout=30,
+                )
+                if proc.returncode == 0:
+                    result.add(old)
+            except Exception:
+                continue
+        return result
 
 
 def check_pin_behind_history(root: Path, rep: Report) -> None:
     """Refuse a pin that is STRICTLY OLDER than one this repo already recorded.
 
-    This is the half `check_pin_regression` cannot see. That guard judges
-    `origin/main..HEAD`, so it catches a regression a branch INTRODUCES and is
+    This is the half `check_pin_regression` cannot see. The build guard judges
+    the branch's net change since its common ancestry, so it catches a
+    regression a branch INTRODUCES and is
     blind to one it INHERITS — and on 2026-08-26 `origin/main` itself carried the
     stale `first-party/clean` gitlink, so nothing fired while the tree did not
     build.
@@ -1122,48 +1484,62 @@ def check_pin_behind_history(root: Path, rep: Report) -> None:
     check = "pin_behind_history"
     try:
         paths = subprocess.run(
-            ["git", "config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
-            cwd=root, capture_output=True, text=True, timeout=30,
-        ).stdout.split()
+            ["git", "config", "-z", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
+            cwd=root, capture_output=True, timeout=30,
+        ).stdout.split(b"\0")
+        subs = [os.fsdecode(record.partition(b"\n")[2]) for record in paths
+                if record.partition(b"\n")[2].startswith(b"first-party/")]
+        if not subs:
+            return
+        tip = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=root, capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.strip()
     except Exception:
         return
-    subs = [p for p in paths if p.startswith("first-party/")]
-
-    def pin_at(rev: str, path: str) -> str:
-        try:
-            out = subprocess.run(
-                ["git", "ls-tree", rev, "--", path],
-                cwd=root, capture_output=True, text=True, timeout=30,
-            ).stdout.split()
-            return out[2] if len(out) >= 3 and out[0] == "160000" else ""
-        except Exception:
-            return ""
-
+    current = _history_tree_pins(root, [(tip, path) for path in subs])
+    histories = {}
     for path in subs:
-        cur = pin_at("HEAD", path)
+        cur = current[tip, path]
         if not cur or not (root / path / ".git").exists():
             continue
         try:
-            revs = subprocess.run(
-                ["git", "log", "-40", "--format=%H", "--", path],
+            histories[path] = subprocess.run(
+                ["git", "--literal-pathspecs", "log", f"-{PIN_HISTORY_LIMIT}",
+                 "--format=%H", tip, "--", path],
                 cwd=root, capture_output=True, text=True, timeout=30,
             ).stdout.split()
         except Exception:
             continue
+    historical = _history_tree_pins(root, [(rev, path) for path, revs in histories.items() for rev in revs])
+    for path in subs:
+        if path not in histories:
+            continue
+        revs = histories[path]
+        cur = current[tip, path]
+        candidates = list(dict.fromkeys(historical[rev, path] for rev in revs
+                                        if historical[rev, path] not in ("", cur)))
+        descendants = _historical_descendants(root / path, cur, candidates)
         seen: set[str] = set()
         for rev in revs:
-            old = pin_at(rev, path)
+            old = historical[rev, path]
             if not old or old == cur or old in seen:
                 continue
             seen.add(old)
-            try:
-                anc = subprocess.run(
-                    ["git", "-C", path, "merge-base", "--is-ancestor", cur, old],
-                    cwd=root, capture_output=True, timeout=30,
-                )
-            except Exception:
-                continue
-            if anc.returncode == 0:
+            if old in descendants:
+                disclosure = _pin_rollback_disclosed(root, path, rev)
+                if disclosure:
+                    rep.add(
+                        INFO,
+                        check,
+                        f"{path} pin {cur[:10]} is behind {old[:10]} DELIBERATELY - disclosed",
+                        [
+                            f"current : {cur}",
+                            f"earlier : {old}  (recorded by {rev[:10]})",
+                            disclosure,
+                        ],
+                    )
+                    break
                 rep.add(
                     FAIL,
                     check,
@@ -1175,7 +1551,13 @@ def check_pin_behind_history(root: Path, rep: Report) -> None:
                         "a gitlink has no textual content, so a merge picks a side and",
                         "reports NO CONFLICT while the consumer source merges forward",
                     ],
-                    [f"git -C {path} checkout {old[:12]} && git add {path}"],
+                    [
+                        f"git -C {shlex.quote(path)} checkout {old[:12]} && git add {shlex.quote(path)}",
+                        "# ...unless the rollback is DELIBERATE. Then say so, in the",
+                        "# commit message that moves the pin (same convention as",
+                        "# scripts/check_pin_regression.sh - disclosure, not suppression):",
+                        f"#     pin-rollback: {path} <why>",
+                    ],
                 )
                 break
 
@@ -1485,6 +1867,63 @@ def _workspace_manifests(ws: Path) -> list[Path]:
     return sorted((m / "Cargo.toml") for m in members if m not in excluded)
 
 
+def locked_config_path_patch(ws: Path, url: str, name: str, req,
+                             owner: str | None, packages: list[dict]) -> bool:
+    """Whether this member's locked edge uses its workspace-local config patch.
+
+    A second Git version of the same crate can legitimately remain in the lock
+    through a transitive dependency. Require the actual member edge to resolve
+    uniquely to the path package; the presence of a patch or local package alone
+    is insufficient. Unknown version syntax retains the existing finding.
+    This is a textual consistency check, not a replacement for --locked replay.
+    """
+    if not isinstance(req, str) or not all(
+        re.fullmatch(r"\s*(?:\^|~|>=|<=|=|>|<)?\s*\d+(?:\.\d+){0,2}\s*", part)
+        for part in req.split(",")
+    ):
+        return False
+    # Cargo gives the legacy extensionless file precedence when both exist.
+    config = ws / ".cargo/config"
+    if not config.exists():
+        config = ws / ".cargo/config.toml"
+    content, _ = load_toml(config)
+    candidates = []
+    for source, table in ((content or {}).get("patch") or {}).items():
+        if canon_git(source) != url or not isinstance(table, dict):
+            continue
+        for key, entry in table.items():
+            if isinstance(entry, dict) and entry.get("package", key) == name:
+                candidates.append(entry)
+    if len(candidates) != 1 or not isinstance(candidates[0].get("path"), str):
+        return False
+    try:
+        target = (ws / candidates[0]["path"]).resolve()
+    except (OSError, ValueError):
+        return False
+    manifest, _ = load_toml(target / "Cargo.toml")
+    if ((manifest or {}).get("package") or {}).get("name") != name:
+        return False
+    version = crate_version(target)
+    if version is None or _semver(version) is None or not req_allows(req, version):
+        return False
+    owners = [package for package in packages
+              if owner and package.get("name") == owner and "source" not in package]
+    if len(owners) != 1:
+        return False
+    for dependency in owners[0].get("dependencies") or []:
+        if not isinstance(dependency, str):
+            continue
+        fields = dependency.split()
+        if not fields or fields[0] != name or len(fields) > 2:
+            continue  # an explicit source cannot denote our local path package
+        matches = [package for package in packages if package.get("name") == name
+                   and (len(fields) == 1 or package.get("version") == fields[1])]
+        if (len(matches) == 1 and "source" not in matches[0]
+                and matches[0].get("version") == version):
+            return True
+    return False
+
+
 def check_lockfiles_fast(root: Path, workspaces: list[Path], rep: Report) -> None:
     check = "2. LOCKFILE SKEW (non-mutating)"
     clean = 0
@@ -1558,6 +1997,9 @@ def check_lockfiles_fast(root: Path, workspaces: list[Path], rep: Report) -> Non
                     revv = spec.get("rev")
                     if real in patches.get(url, set()):
                         continue  # redirected to a local path by [patch]
+                    if locked_config_path_patch(ws, url, real, spec.get("version"),
+                                                name, pkgs):
+                        continue  # this member's locked edge uses a config path patch
                     if revv:
                         if (url, revv) not in lock_git:
                             git_bad.setdefault((url, revv), set()).add(real)
@@ -2051,6 +2493,271 @@ def check_git_pin_cascade(root: Path, workspaces: list[Path], rep: Report) -> No
             f"(path deps followed THROUGH workspace and submodule boundaries)")
 
 
+# The VERSION half of the same cascade. `check_git_pin_cascade` compares only
+# the git revs a graph manifest pins, and the fast tier compares versions only
+# for workspace MEMBERS, so a submodule crate that this lock resolves from a
+# local path - a path dependency outside the workspace, or a `[patch]` target -
+# could bump its `package.version` with no textual finding anywhere. The lock
+# records that version, so `--locked` refuses the moved one.
+#
+# Measured 2026-09-17: first-party pins moved ay 0.22->0.26, clean 0.8->0.9,
+# ty 0.14->0.15 and trust-ir 0.13->0.14, and the standalone
+# `crates/trust-spec-temporal` lock still recorded the old versions. The fast
+# tier said "39/40 textually consistent" and counted it clean; only the
+# network-bound deep tier noticed.
+def crate_version_candidates(d: Path, repo_root: Path) -> set[str]:
+    """Every version cargo could give crate `d`.
+
+    A literal `package.version` is one answer. `version.workspace = true` is
+    ambiguous for crates that overlapping workspaces both build: the repository
+    root resolves `crates/trust-budget` against ITS `[workspace.package]`
+    (0.9.0), not against `crates/Cargo.toml` (0.1.0) above the crate. So every
+    ancestor workspace's version is accepted, and the caller reports only when
+    NONE of them is in the lock; an unsure answer stays quiet.
+    """
+    man, _ = load_toml(d / "Cargo.toml")
+    v = ((man or {}).get("package") or {}).get("version")
+    if isinstance(v, str):
+        return {v}
+    if not (isinstance(v, dict) and v.get("workspace") is True):
+        return set()
+    out: set[str] = set()
+    one = crate_version(d)
+    if one is not None:
+        out.add(one)
+    cur = d.parent
+    while True:
+        wm, _ = load_toml(cur / "Cargo.toml")
+        wv = (((wm or {}).get("workspace") or {}).get("package") or {}).get("version")
+        if isinstance(wv, str):
+            out.add(wv)
+        if cur == repo_root or cur.parent == cur:
+            break
+        cur = cur.parent
+    return out
+
+
+def declared_local_dependency_names(root: Path, directory: Path, manifest: dict) -> set[str] | None:
+    """A conservative union, not a resolved dependency graph.
+
+    Include optional/dev/all-target declarations even when this invocation does not select them.
+    A name absent from this superset cannot be a direct Cargo dependency. Missing or ambiguous
+    workspace inheritance stays unknown rather than manufacturing an orphan finding.
+    """
+    if not isinstance(manifest, dict):
+        return None
+    package = manifest.get("package", {})
+    if not isinstance(package, dict):
+        return None
+    tables = [manifest]
+    targets = manifest.get("target", {})
+    if not isinstance(targets, dict) or not all(isinstance(value, dict) for value in targets.values()):
+        return None
+    tables.extend(targets.values())
+    names: set[str] = set()
+    for table in tables:
+        for kind in ("dependencies", "build-dependencies", "dev-dependencies",
+                     "build_dependencies", "dev_dependencies"):
+            deps = table.get(kind, {})
+            if not isinstance(deps, dict):
+                return None
+            for alias, spec in deps.items():
+                if not isinstance(alias, str) or not isinstance(spec, (str, dict)):
+                    return None
+                if isinstance(spec, dict) and spec.get("workspace") is True:
+                    # Overlapping workspaces can supply different inherited specs. Only a
+                    # complete, unanimous package-name association supports this fast finding.
+                    explicit = package.get("workspace")
+                    if explicit is not None and not isinstance(explicit, str):
+                        return None
+                    owners = []
+                    if isinstance(explicit, str):
+                        owners = [(directory / explicit).resolve()]
+                    else:
+                        current = directory
+                        while True:
+                            content, _ = load_toml(current / "Cargo.toml")
+                            if isinstance((content or {}).get("workspace"), dict):
+                                owners.append(current)
+                            if current == root or current.parent == current:
+                                break
+                            current = current.parent
+                    inherited_names = set()
+                    if not owners:
+                        return None
+                    for owner in owners:
+                        content, _ = load_toml(owner / "Cargo.toml")
+                        workspace = content.get("workspace") if isinstance(content, dict) else None
+                        if not isinstance(workspace, dict):
+                            return None
+                        dependencies = workspace.get("dependencies", {})
+                        if not isinstance(dependencies, dict):
+                            return None
+                        inherited = dependencies.get(alias)
+                        if isinstance(inherited, str):
+                            inherited_names.add(alias)
+                        elif isinstance(inherited, dict) and isinstance(inherited.get("package", alias), str):
+                            inherited_names.add(inherited.get("package", alias))
+                        else:
+                            return None
+                    if len(inherited_names) != 1:
+                        return None
+                    names.update(inherited_names)
+                else:
+                    name = spec.get("package", alias) if isinstance(spec, dict) else alias
+                    if not isinstance(name, str):
+                        return None
+                    names.add(name)
+    # Cargo accepts underscore/hyphen spellings in several name contexts. Equating them here
+    # only widens the declared superset; it cannot invent an orphan refusal.
+    return {name.replace("_", "-") for name in names}
+
+
+def orphaned_local_lock_edges(root: Path, ws: Path, lock: dict) -> list[tuple[str, str, str]]:
+    """Definite extra direct edges of unambiguously associated local package rows only.
+
+    Reuse the conservative resolver-input walk (optional paths and config patches included).
+    An incomplete walk or conflicting local owner is unknown. Sourced package rows are never
+    judged from a local manifest. This does not establish overall lock freshness or replace
+    Cargo's deep/--frozen resolution.
+    """
+    try:
+        paths = _resolver_manifests(ws, _resolver_configs(ws))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+    candidates: dict[tuple[str, str], dict[Path, set[str] | None]] = {}
+    for path in paths:
+        manifest, _ = load_toml(path)
+        package = (manifest or {}).get("package") or {}
+        if not isinstance(package, dict):
+            continue
+        name = package.get("name")
+        if not isinstance(name, str):
+            continue
+        directory = path.parent.resolve()
+        declared = declared_local_dependency_names(root, directory, manifest)
+        for version in crate_version_candidates(directory, root):
+            candidates.setdefault((name, version), {})[directory] = declared
+    bad = []
+    for package in lock.get("package") or []:
+        if not isinstance(package, dict) or "source" in package:
+            continue
+        owners = candidates.get((package.get("name"), package.get("version")), {})
+        if len(owners) != 1:
+            continue
+        directory, declared = next(iter(owners.items()))
+        edges = package.get("dependencies", [])
+        if declared is None or not isinstance(edges, list) or not all(isinstance(edge, str) for edge in edges):
+            continue
+        for edge in edges:
+            parts = edge.split()
+            if parts and parts[0].replace("_", "-") not in declared:
+                bad.append((package["name"], edge, rel(root, directory)))
+    return sorted(set(bad))
+
+
+def check_path_version_cascade(root: Path, workspaces: list[Path], rep: Report) -> None:
+    check = "2a. GIT-PIN CASCADE (submodule manifest -> parent lock)"
+
+    for ws in workspaces:
+        wsname = rel(root, ws) or "."
+        lock, _ = load_toml(ws / "Cargo.lock")
+        if lock is None:
+            continue  # already a FAIL from the fast tier
+        lock_local: dict[str, set[str]] = {}
+        lock_sourced: set[str] = set()
+        for p in lock.get("package") or []:
+            if "source" in p:
+                lock_sourced.add(p.get("name", ""))
+            else:
+                lock_local.setdefault(p.get("name", ""), set()).add(p.get("version", ""))
+        unused: dict[str, set[str]] = {}
+        for p in ((lock.get("patch") or {}).get("unused") or []):
+            if isinstance(p, dict) and "source" not in p:
+                unused.setdefault(p.get("name", ""), set()).add(p.get("version", ""))
+
+        members = {Path(m).parent.resolve() for m in workspace_manifests(ws)}
+        # (crate, local version, lock versions, declared at, how it is reached)
+        bad: set[tuple[str, str, str, str, str]] = set()
+
+        # (1) Non-optional path dependencies reached from outside the workspace.
+        for d, _is_member in graph_manifests(ws):
+            if d.resolve() in members:
+                continue  # the fast tier owns member versions
+            man, _ = load_toml(d / "Cargo.toml")
+            name = ((man or {}).get("package") or {}).get("name")
+            vers = crate_version_candidates(d, root)
+            if not isinstance(name, str) or not vers:
+                continue
+            have = lock_local.get(name)
+            if have is None or vers & have:
+                continue  # absent: not provably in this graph; present: consistent
+            bad.add((name, "/".join(sorted(vers)), "/".join(sorted(have)), rel(root, d),
+                     "path dependency"))
+
+        # (2) Path `[patch]` targets. A patch that cargo APPLIED leaves the name
+        # only as a source-less package, and an unused one leaves a
+        # `[[patch.unused]]` row; either records the target's version. A name
+        # that also has a git/registry package may be a DECLINED patch, whose
+        # local version legitimately differs, so it is left alone.
+        rman, _ = load_toml(ws / "Cargo.toml")
+        for _src, tbl in ((rman or {}).get("patch") or {}).items():
+            if not isinstance(tbl, dict):
+                continue
+            for key, entry in tbl.items():
+                if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                    continue
+                real = entry.get("package", key)
+                if not isinstance(real, str) or real in lock_sourced:
+                    continue
+                try:
+                    target = (ws / entry["path"]).resolve()
+                except (ValueError, OSError):
+                    continue
+                vers = crate_version_candidates(target, root)
+                if not vers:
+                    continue
+                for have, how in ((lock_local.get(real), "[patch] target"),
+                                  (unused.get(real), "unused [patch] target")):
+                    if have is not None and not vers & have:
+                        bad.add((real, "/".join(sorted(vers)), "/".join(sorted(have)),
+                                 rel(root, target), how))
+
+        orphaned = orphaned_local_lock_edges(root, ws, lock)
+        if orphaned:
+            sev, why = lock_severity(root, ws)
+            rep.add(sev, check,
+                    f"{wsname}: lock records {len(orphaned)} ORPHANED local-package dependency edge(s)",
+                    [f"edge     : {name} -> {edge}  ({where})" for name, edge, where in orphaned[:8]]
+                    + [why, "no normal/build/dev/target declaration or unambiguous inherited alias names this dependency; "
+                       "this is a definite stale edge, not a complete lock-freshness proof"],
+                    [f"targo metadata --offline --manifest-path {wsname}/Cargo.toml --format-version 1 >/dev/null",
+                     f"git -C {root} diff -- {wsname}/Cargo.lock  # inspect the minimal local dependency-edge change"])
+        if not bad:
+            continue
+
+        sev, why = lock_severity(root, ws)
+        detail = [f"version  : {name} local={ver} lock={have}  ({how}, {where})"
+                  for name, ver, have, where, how in sorted(bad)[:8]]
+        if len(bad) > 8:
+            detail.append(f"... and {len(bad) - 8} more")
+        detail.append(why)
+        detail.append("the crate that moved is resolved from a local path but is NOT a "
+                      "member of this workspace, so the member-version check cannot see it.")
+        rep.add(sev, check,
+                f"{wsname}: lock records a STALE version for {len(bad)} local-path crate(s) "
+                f"({'--locked WILL fail' if sev == FAIL else 'not on any build path'})",
+                detail,
+                [f"targo metadata --offline --manifest-path {wsname}/Cargo.toml "
+                 f"--format-version 1 >/dev/null   # MINIMAL resolve",
+                 f"git -C {root} diff --stat -- {wsname}/Cargo.lock"
+                 f"   # CONFIRM only local-path versions/edges moved",
+                 "# an `unused [patch] target` row is better deleted from the manifest "
+                 "(docs/KNOWN_HAZARDS.md, `[[patch.unused]]`)",
+                 "# NEVER a bare `targo update` / `cargo update`: it downgraded ay "
+                 "0.4.0->0.3.0 and manufactured a futures-core conflict."])
+
+
 # --------------------------------------------------------------------------
 # deep-tier result cache
 #
@@ -2058,9 +2765,8 @@ def check_git_pin_cascade(root: Path, workspaces: list[Path], rep: Report) -> No
 # ~2s for the fast tier, and it needs the network. Paying that on every
 # `x.py build` is how `TRUST_SKIP_PREFLIGHT=1` ends up exported in a shell
 # profile, at which point the checker protects nothing at all. So the verdict
-# is cached against the exact inputs that determine it - each lockfile's
-# CONTENT hash plus the size+mtime of every member manifest - and a hit costs
-# a few hundred stat(2)s.
+# is cached against resolver lockfiles, local manifests and Cargo configuration
+# contents. Explicit --deep always re-probes; only --deep-if-cached replays.
 #
 # Two deliberate restrictions:
 #   * INCONCLUSIVE results (cold registry, no network) are never cached. They
@@ -2095,7 +2801,14 @@ def check_git_pin_cascade(root: Path, workspaces: list[Path], rep: Report) -> No
 #
 # The version bump is load-bearing: it retires every v2 entry, including the
 # stale ones this fixes.
-DEEP_CACHE_VERSION = 3
+# v4: include Cargo's discovered configuration and local patch/dependency
+# closure, including virtual/inherited workspace manifests and optional paths.
+# Hash contents: preserved timestamps must not preserve an obsolete verdict.
+# v5: compiled native Targo now discovers home config through TARGO_HOME when
+# the compatibility spelling is absent. Match that input/precedence contract.
+# v6: the selected resolver may still be an older seed or the Cargo identity.
+# With no explicit CARGO_HOME, key both default and native home candidates.
+DEEP_CACHE_VERSION = 6
 
 
 def _deep_cache_path(root: Path) -> Path:
@@ -2130,6 +2843,119 @@ def _resolver_locks(ws: Path) -> list[Path]:
     return sorted(out)
 
 
+def _resolver_configs(ws: Path) -> list[Path]:
+    """Conservative cwd/home discovery across seed and native frontends."""
+    home_value = os.environ.get("CARGO_HOME")
+    if home_value is None:
+        # Older seeds and the compatibility identity ignore TARGO_HOME, while
+        # the current native frontend honors it. Neither interpretation may
+        # reuse a verdict after one of its resolver inputs has changed.
+        homes = [Path.home() / ".cargo"]
+        native_home = os.environ.get("TARGO_HOME")
+        if native_home:
+            homes.append(Path(native_home))
+    else:
+        # Presence wins, including empty: it selects the default OS home and
+        # suppresses the native spelling for every supported generation.
+        homes = [Path(home_value) if home_value else Path.home() / ".cargo"]
+    directories = [d / ".cargo" for d in (ws, *ws.parents)] + [
+        home if home.is_absolute() else ws / home for home in homes
+    ]
+    found: set[Path] = set()
+
+    def visit(path: Path, active: set[Path]) -> None:
+        # Cargo keeps the discovered filename as the relative-value anchor,
+        # even when the configuration itself is a symlink.
+        path = Path(os.path.abspath(path))
+        if path in active:
+            raise ValueError("incomplete Cargo config walk")
+        if path in found:
+            return
+        if len(found) >= GRAPH_CAP:
+            raise ValueError("incomplete Cargo config walk")
+        content, error = load_toml(path)
+        if error:
+            raise ValueError(error)
+        found.add(path)
+        includes = content.get("include", [])
+        if not isinstance(includes, list):
+            raise ValueError("unknown Cargo config include")
+        for entry in includes:
+            name = entry.get("path") if isinstance(entry, dict) else entry
+            if not isinstance(name, str):
+                raise ValueError("unknown Cargo config include path")
+            target = path.parent / name
+            if isinstance(entry, dict) and entry.get("optional") is True and not target.exists():
+                continue
+            visit(target, active | {path})
+
+    for directory in directories:
+        legacy = directory / "config"
+        path = legacy if legacy.exists() else directory / "config.toml"
+        if path.exists():
+            visit(path, set())
+    return sorted(found)
+
+
+def _resolver_manifests(ws: Path, configs: list[Path]) -> set[Path]:
+    """Conservative local resolver inputs, separate from textual-check coverage."""
+    owner = nearest_workspace_root(ws) or ws
+    members = {m.parent.resolve() for m in workspace_manifests(owner)}
+    queue = [ws, owner, *members]
+    found: set[Path] = set()
+    seen: set[Path] = set()
+
+    def patches(content: dict, base: Path) -> None:
+        patch = content.get("patch") or {}
+        if not isinstance(patch, dict):
+            raise ValueError("unknown Cargo patch table")
+        tables = list(patch.values())
+        tables.append(content.get("replace") or {})
+        for table in tables:
+            if not isinstance(table, dict):
+                raise ValueError("unknown Cargo patch/replace table")
+            for entry in table.values():
+                if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                    queue.append((base / entry["path"]).resolve())
+
+    for path in configs:
+        content, _ = load_toml(path)
+        # Cargo's Definition::root resolves config values from its grandparent,
+        # including values introduced by an included configuration file.
+        patches(content, path.parent.parent)
+        overrides = content.get("paths", [])
+        if not isinstance(overrides, list):
+            raise ValueError("unknown Cargo path overrides")
+        for override in overrides:
+            if not isinstance(override, str):
+                raise ValueError("unknown Cargo path override")
+            queue.append((path.parent.parent / override).resolve())
+
+    while queue:
+        d = queue.pop().resolve()
+        if d in seen:
+            continue
+        if len(seen) >= GRAPH_CAP:
+            raise ValueError("incomplete local resolver manifest walk")
+        seen.add(d)
+        path = d / "Cargo.toml"
+        content, error = load_toml(path)
+        if error:
+            raise ValueError(error)
+        found.add(path)
+        inherited = nearest_workspace_root(d)
+        if inherited is not None:
+            found.add(inherited / "Cargo.toml")
+        patches(content, d)
+        for name, spec in iter_graph_dep_specs(content, with_dev=d in members):
+            base, spec = inherit_dep(d, name, spec)
+            if isinstance(spec, dict) and isinstance(spec.get("path"), str):
+                if "base" in spec:
+                    raise ValueError("unmodeled Cargo path base")
+                queue.append((base / spec["path"]).resolve())
+    return found
+
+
 def _deep_cache_key(ws: Path, targo: str) -> str:
     h = hashlib.sha256()
     h.update(f"v{DEEP_CACHE_VERSION}\0{targo}\0".encode())
@@ -2137,21 +2963,18 @@ def _deep_cache_key(ws: Path, targo: str) -> str:
         locks = _resolver_locks(ws)
         if not locks:
             return ""
-        for lp in locks:
-            h.update(f"{lp}\0".encode())
-            h.update(hashlib.sha256(lp.read_bytes()).digest())
+        configs = _resolver_configs(ws)
+        inputs = set(locks) | set(configs) | _resolver_manifests(ws, configs)
+        for path in sorted(inputs):
+            h.update(f"{path}\0".encode())
+            h.update(hashlib.sha256(path.read_bytes()).digest())
         if targo:
             st = Path(targo).stat()
             h.update(f"{st.st_size}:{st.st_mtime_ns}\0".encode())
-    except OSError:
+    except (OSError, ValueError, TypeError, AttributeError):
+        # An incomplete/unrecognized input walk may cost a fresh deep probe,
+        # never authorize replay of an incompletely keyed verdict.
         return ""
-    for d, _is_member in sorted(graph_manifests(ws)):
-        mp = d / "Cargo.toml"
-        try:
-            ms = mp.stat()
-        except OSError:
-            return ""
-        h.update(f"{mp}\0{ms.st_size}\0{ms.st_mtime_ns}\0".encode())
     return h.hexdigest()
 
 
@@ -2193,7 +3016,7 @@ def check_lockfiles_deep(
     todo: list[Path] = []
     for ws in workspaces:
         ent = cache.get(rel(root, ws) or ".")
-        if (keys[ws] and isinstance(ent, dict) and ent.get("key") == keys[ws]
+        if (cached_only and keys[ws] and isinstance(ent, dict) and ent.get("key") == keys[ws]
                 and ent.get("verdict") in ("clean", "skew")):
             hits[ws] = ent
         else:
@@ -2216,7 +3039,7 @@ def check_lockfiles_deep(
         rep.add(sev, check,
                 f"{wsname}: resolver CONFIRMS the lock must change  [cached verdict]",
                 [str(ent.get("msg", ""))[:200], why,
-                 "cached: lockfile content and every member manifest are unchanged",
+                 "cached: resolver locks, local manifests and Cargo configs are unchanged",
                  "since the probe that produced this. Re-run with --deep to re-probe."],
                 [f"targo update --manifest-path {wsname}/Cargo.toml -p <only-the-moved-crate>",
                  "# identify it from the error above; do not re-resolve the whole graph"])
@@ -2244,7 +3067,7 @@ def check_lockfiles_deep(
         rc, _out, err = run(
             [targo, "metadata", "--locked", "--format-version", "1",
              "--manifest-path", str(ws / "Cargo.toml")],
-            cwd=ws, timeout=timeout,
+            cwd=ws, timeout=timeout, env=env,
         )
         return ws, rc, err, time.time() - t0
 
@@ -2253,7 +3076,7 @@ def check_lockfiles_deep(
         for r in pool.map(probe, workspaces):
             results.append(r)
 
-    inconclusive: list[str] = []
+    inconclusive: list[list[str]] = []
     clean = 0
     for ws, rc, err, dt in results:
         wsname = rel(root, ws) or "."
@@ -2280,17 +3103,23 @@ def check_lockfiles_deep(
             if keys[ws]:
                 cache[wsname] = {"key": keys[ws], "verdict": "skew", "msg": first.strip()}
         else:
-            head = err.strip().splitlines()
-            head = [ln for ln in head if ln.startswith("error")][:1] or head[-1:]
-            inconclusive.append(f"{wsname}: rc={rc} {(head[0] if head else '')[:110]}")
-            # NOT cached: "the registry was cold" is a property of the moment.
+            # A wrapper's first error may only name the failed command. Keep
+            # the final cause too, without guessing that every failure was a
+            # network problem or claiming that lock coherence was established.
+            diagnostic = err.strip() or "metadata probe returned no stderr"
+            if len(diagnostic) > 4096:
+                diagnostic = (diagnostic[:2048] + "\n... stderr middle omitted ...\n"
+                              + diagnostic[-2048:])
+            inconclusive.append([f"{wsname}: rc={rc} ({dt:.1f}s)"]
+                                + [f"  {line}" for line in diagnostic.splitlines()])
+            # NOT cached: a failed probe establishes neither clean nor skewed.
             cache.pop(wsname, None)
 
     if inconclusive:
         rep.add(WARN, check,
-                f"{len(inconclusive)} workspace(s) INCONCLUSIVE (not skew: network/registry)",
-                inconclusive[:10],
-                ["# warm the cache, then re-run; --offline reliably false-positives here"])
+                f"{len(inconclusive)} workspace(s) INCONCLUSIVE (metadata probe failed)",
+                [line for workspace in inconclusive[:10] for line in workspace],
+                ["# resolve the reported error, then re-run tools/preflight.sh --deep"])
     rep.add(INFO, check, f"{clean}/{len(workspaces)} workspaces resolve clean under --locked")
 
     after = {ws: sha256(ws / "Cargo.lock") for ws in workspaces}
@@ -2391,8 +3220,7 @@ def check_tools_allowlist(root: Path, cfg: dict, facts: BootstrapFacts, rep: Rep
         man_rel = facts.source_manifests.get(backend)
         fix = []
         if man_rel and not (root / man_rel).exists():
-            fix.append("git submodule update --init --recursive"
-                       f"   # materialise {man_rel}")
+            fix.append(f"{SUBMODULE_RESTORE}   # materialise {man_rel}")
         if isinstance(tools, list) and not model.selected(backend):
             fix.append(f'$EDITOR {rel(root, cfg_path)}   # add "{backend}" to [build] tools')
         rep.add(
@@ -2522,6 +3350,28 @@ def check_model_vs_sysroot(root: Path, facts: BootstrapFacts, model: ToolModel,
 # --------------------------------------------------------------------------
 # CHECK 4 - cheap guards
 # --------------------------------------------------------------------------
+def names_this_checkout(cmd: str, root: Path) -> bool:
+    """True when `cmd` names `root` itself or a path INSIDE it.
+
+    A bare substring test (`str(root) in cmd`) also matched every SIBLING
+    checkout whose path merely starts with this one: with worktrees named
+    `trust-wt` and `trust-wt-b2`, a `.../trust-wt-b2/build/bootstrap/debug/bootstrap
+    test ...` running in the sibling was reported as a build of `trust-wt`, and
+    `x.py build` in `trust-wt` refused with "AN x.py BUILD IS ALREADY RUNNING"
+    although the two checkouts share no build directory (measured 2026-09-23).
+
+    The root is named when the line ends after it or the next character is one
+    a directory NAME cannot continue with -- anything but `[A-Za-z0-9._-]`. That
+    is `/`, whitespace and quotes, and equally `=`, `:` and `,`
+    (`--remap-path-prefix=<root>=/src`, `native=<root>:/opt/lib`,
+    `<root>,/elsewhere`), which a LIST of separators misses (review 2026-09-29,
+    the same boundary as `scripts/submodule_sync.sh`). A sibling checkout never
+    matches: its path continues the root with a name character (`-b2`, `.old`,
+    `_old`, `x`).
+    """
+    return re.search(re.escape(str(root)) + r"(?![A-Za-z0-9._-])", cmd) is not None
+
+
 def check_concurrent_build(root: Path, rep: Report, for_build: bool) -> None:
     check = "4. BUILD ENVIRONMENT"
     rc, out, _ = run(["ps", "-axo", "pid=,ppid=,command="], timeout=20)
@@ -2593,7 +3443,13 @@ def check_concurrent_build(root: Path, rep: Report, for_build: bool) -> None:
         )
         looks_like_bootstrap = exe_is_bootstrap or exe_is_python_running_bootstrap
         subcmd = re.search(r"\b(build|check|test|dist|install|doc)\b", cmd)
-        if looks_like_bootstrap and str(root) in cmd and subcmd:
+        # The root must appear as a WHOLE path component (`names_this_checkout`).
+        # A bare substring test matched every sibling checkout whose path merely
+        # starts with this one (2026-09-24: a stage-2 build in `<home>/
+        # trust-land/toolchain-build` — its own build dir and lock — blocked every
+        # build of `<home>/trust`; 2026-09-23: `trust-wt-b2` blocked
+        # `trust-wt`).
+        if looks_like_bootstrap and names_this_checkout(cmd, root) and subcmd:
             hits.append(f"pid {pid}: {cmd[:120]}")
     if hits:
         rep.add(
@@ -2715,7 +3571,7 @@ def check_config_drift(root: Path, cfg: dict, rep: Report) -> None:
              "   # regenerate (rewrites machine paths too - re-check them after)"])
 
 
-def check_misc(root: Path, cfg: dict, rep: Report) -> None:
+def check_misc(root: Path, cfg: dict, rep: Report, *, standalone_tool: bool = False) -> None:
     check = "4. BUILD ENVIRONMENT"
     build = cfg.get("build") or {}
     py = build.get("python")
@@ -2728,9 +3584,9 @@ def check_misc(root: Path, cfg: dict, rep: Report) -> None:
         rep.add(INFO, check, "`deny-warnings = false` - warnings will not stop the build", [])
 
     for backend in (rust.get("codegen-backends") or []):
-        if backend == "trust-cg" and not (root / "first-party/trust-cg/Cargo.toml").exists():
+        if not standalone_tool and backend == "trust-cg" and not (root / "first-party/trust-cg/Cargo.toml").exists():
             rep.add(FAIL, check, "codegen-backends lists trust-cg but its source is absent", [],
-                    ["git submodule update --init --recursive"])
+                    [SUBMODULE_RESTORE])
 
     free = shutil.disk_usage(root).free / 1e9
     if free < 25:
@@ -2758,6 +3614,30 @@ def check_lock_mtimes(root: Path, workspaces: list[Path], rep: Report) -> None:
 
 
 # --------------------------------------------------------------------------
+@contextmanager
+def build_phase(name: str, enabled: bool):
+    """Disclose build-check latency without changing a check's verdict."""
+    if not enabled:
+        yield
+        return
+
+    def progress(message: str) -> None:
+        try:
+            print(f"preflight: phase {name} {message}", file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            # Progress is best effort, including when stderr has been closed.
+            # It must neither change a verdict nor mask the check's exception.
+            pass
+
+    started = time.monotonic()
+    progress("start")
+    try:
+        yield
+    finally:
+        # END is a timing boundary, not a successful-check verdict.
+        progress(f"end elapsed={time.monotonic() - started:.3f}s")
+
+
 def find_targo(root: Path, override: str | None) -> str:
     if override:
         return override
@@ -2767,6 +3647,53 @@ def find_targo(root: Path, override: str | None) -> str:
         if c.is_file() and os.access(c, os.X_OK):
             return str(c)
     return shutil.which("targo") or ""
+
+
+
+def validate_standalone_tool_sources(root: Path, rep: Report) -> bool:
+    """Reinspect locked selected graphs; a saved preparation verdict grants nothing."""
+    check = "SELECTED STANDALONE TOOL SOURCES"
+    try:
+        state = json.loads((root / "build/tool-source-preparation/targo-build-tool.json").read_text())
+        if (state["schema"] != "trust.tool-source-preparation.v1"
+                or state["tool"] != "targo-build-tool" or state["scope"] != "tool-only"
+                or state["compiler_sources_ready"] is not False or state["first_party"] != "deferred"):
+            raise ValueError("invalid deferred tool-source scope")
+        inspector = Path(state["inspector_path"])
+        if not inspector.is_absolute() or inspector.resolve(strict=True) != inspector:
+            raise ValueError("source inspector must be a physical absolute executable")
+        if hashlib.sha256(inspector.read_bytes()).hexdigest() != state["inspector_sha256"]:
+            raise ValueError("source inspector changed")
+        expected = ["src/bootstrap/Cargo.toml", "src/tools/targo/Cargo.toml"]
+        if [g["manifest"] for g in state["graphs"]] != expected:
+            raise ValueError("selected source graph census differs")
+        for graph in state["graphs"]:
+            manifest = root / graph["manifest"]
+            inputs = (manifest, manifest.with_name("Cargo.lock"))
+            before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}
+            if before != graph["inputs_sha256"]:
+                raise ValueError("selected manifest/lock changed since preparation")
+            command = [str(inspector), "metadata", "--locked", "--offline", "--format-version", "1",
+                       "--manifest-path", str(manifest)]
+            environment = os.environ.copy()
+            environment["RUSTC"] = str(inspector.with_name("trustc"))
+            result = subprocess.run(command, cwd=root, env=environment, capture_output=True, timeout=120)
+            if result.returncode:
+                raise ValueError("selected locked metadata refused: " + result.stderr.decode(errors="replace")[:500])
+            document = json.loads(result.stdout)
+            if document.get("version") != 1 or not document.get("packages"):
+                raise ValueError("unsupported or empty selected graph")
+            for package in document["packages"]:
+                actual = Path(package["manifest_path"]).resolve(strict=True)
+                if actual.is_relative_to(root / "first-party"):
+                    raise ValueError("selected tool requires deferred first-party source")
+            if before != {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}:
+                raise ValueError("selected inputs changed during inspection")
+        rep.add(OK, check, "locked bootstrap/frontend graphs inspected; full compiler sources remain deferred", [])
+        return True
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+        rep.add(FAIL, check, "standalone tool-source validation refused", [str(error)])
+        return False
 
 
 def main() -> int:
@@ -2796,6 +3723,8 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--targo", default=None)
     ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--selected-tool", choices=("targo-build-tool",), default=None,
+                    help="Standalone build-tool graph only; never compiler/sysroot readiness")
     ap.add_argument("--only", default=None,
                     help="comma-separated subset: submodules,lockfiles,tools,env")
     args = ap.parse_args()
@@ -2808,54 +3737,79 @@ def main() -> int:
     only = set(args.only.split(",")) if args.only else {"submodules", "lockfiles", "tools", "env"}
     checks_run: list[str] = []
 
-    bootstrap_cwd = Path(args.bootstrap_cwd).resolve() if args.bootstrap_cwd else Path.cwd()
-    cfg, cfg_path, cfg_err = resolve_bootstrap_config(
-        root,
-        args.bootstrap_toml,
-        args.bootstrap_set,
-        bootstrap_cwd,
-    )
+    standalone_tool = False
+    if args.selected_tool:
+        checks_run.append("SELECTED STANDALONE TOOL SOURCES")
+        standalone_tool = validate_standalone_tool_sources(root, rep)
 
-    facts = read_bootstrap_facts(root)
+    bootstrap_cwd = Path(args.bootstrap_cwd).resolve() if args.bootstrap_cwd else Path.cwd()
+    with build_phase("bootstrap-config", args.for_build):
+        cfg, cfg_path, cfg_err = resolve_bootstrap_config(
+            root,
+            args.bootstrap_toml,
+            args.bootstrap_set,
+            bootstrap_cwd,
+        )
+
+    with build_phase("bootstrap-facts", args.for_build):
+        facts = read_bootstrap_facts(root)
 
     if "submodules" in only:
         checks_run.append("1. SUBMODULE DRIFT")
-        check_submodules(root, rep)
-        check_bootstrap_submodule_policy(root, cfg, rep)
-        check_pin_regression(root, rep)
-        check_pin_behind_history(root, rep)
+        with build_phase("submodules", args.for_build):
+            check_submodules(root, rep, deferred_first_party=standalone_tool)
+        with build_phase("bootstrap-submodule-policy", args.for_build):
+            check_bootstrap_submodule_policy(root, cfg, rep)
+        with build_phase("pin-regression", args.for_build):
+            check_pin_regression(root, rep)
+        with build_phase("pin-behind-history", args.for_build):
+            check_pin_behind_history(root, rep)
 
     workspaces: list[Path] = []
     if "lockfiles" in only:
         checks_run.append("2. LOCKFILE SKEW (non-mutating)")
-        workspaces = discover_workspaces(root, facts, args.depth, args.all_workspaces)
-        check_lockfiles_fast(root, workspaces, rep)
+        with build_phase("workspace-discovery", args.for_build):
+            workspaces = discover_workspaces(root, facts, args.depth, args.all_workspaces)
+        with build_phase("lockfiles-fast", args.for_build):
+            check_lockfiles_fast(root, workspaces, rep)
         checks_run.append("2a. GIT-PIN CASCADE (submodule manifest -> parent lock)")
-        check_git_pin_cascade(root, workspaces, rep)
-        check_lock_mtimes(root, workspaces, rep)
+        with build_phase("git-pin-cascade", args.for_build):
+            check_git_pin_cascade(root, workspaces, rep)
+        with build_phase("path-version-cascade", args.for_build):
+            check_path_version_cascade(root, workspaces, rep)
+        with build_phase("lock-mtimes", args.for_build):
+            check_lock_mtimes(root, workspaces, rep)
         if args.deep or args.deep_if_cached:
             checks_run.append("2b. LOCKFILE SKEW (deep, `metadata --locked`)")
-            check_lockfiles_deep(root, workspaces, rep,
-                                 find_targo(root, args.targo), args.timeout, args.jobs,
-                                 cached_only=not args.deep)
+            with build_phase("lockfiles-deep", args.for_build):
+                check_lockfiles_deep(root, workspaces, rep,
+                                     find_targo(root, args.targo), args.timeout, args.jobs,
+                                     cached_only=not args.deep)
 
-    if "tools" in only:
+    if "tools" in only and not standalone_tool:
         checks_run.append("3. TOOLS ALLOWLIST AUDIT")
         if cfg_err:
             rep.add(FAIL, "3. TOOLS ALLOWLIST AUDIT",
                     f"cannot read {cfg_path}: {cfg_err}", [],
                     ["cp bootstrap.example.toml bootstrap.toml  # then edit"])
         else:
-            model = build_tool_model(root, cfg, facts)
-            check_tools_allowlist(root, cfg, facts, rep, cfg_path, model)
-            check_model_vs_sysroot(root, facts, model, rep)
+            with build_phase("tool-model", args.for_build):
+                model = build_tool_model(root, cfg, facts)
+            with build_phase("tools-allowlist", args.for_build):
+                check_tools_allowlist(root, cfg, facts, rep, cfg_path, model)
+            with build_phase("model-vs-sysroot", args.for_build):
+                check_model_vs_sysroot(root, facts, model, rep)
 
     if "env" in only:
         checks_run.append("4. BUILD ENVIRONMENT")
-        check_concurrent_build(root, rep, args.for_build)
-        check_existing_sysroot(root, cfg, facts, rep)
-        check_config_drift(root, cfg, rep)
-        check_misc(root, cfg, rep)
+        with build_phase("concurrent-build", args.for_build):
+            check_concurrent_build(root, rep, args.for_build)
+        with build_phase("existing-sysroot", args.for_build):
+            check_existing_sysroot(root, cfg, facts, rep)
+        with build_phase("config-drift", args.for_build):
+            check_config_drift(root, cfg, rep)
+        with build_phase("misc", args.for_build):
+            check_misc(root, cfg, rep, standalone_tool=standalone_tool)
 
     rc = rep.emit(time.time() - t0, checks_run)
     if args.verdict_file:

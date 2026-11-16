@@ -118,6 +118,12 @@ pub fn read_source_static() -> u64 {
 }
 "#,
     );
+    // Trust: reachable statics are WIRED into trust-cg object emission since
+    // 408a792439 (relocation-free, non-thread-local, default-visibility statics
+    // materialize as object data), so this lane no longer pins the retired
+    // "reachable static … is not wired" refusal. Under `allow-unknown` the unit
+    // now compiles with its one function emitted UNCERTIFIED — the GlobalAddr
+    // read is an honest unknown, never a hidden unproven claim.
     rustc()
         .input("source-static.rs")
         .crate_name("source_static")
@@ -131,9 +137,59 @@ pub fn read_source_static() -> u64 {
         .arg("-Ztrust-cg-frontend=trust-ir")
         .arg("-Ztrust-cg-output-gate=allow-unknown")
         .out_dir("static-out")
+        .run()
+        .assert_stderr_contains("1/1 reachable function(s) completed")
+        .assert_stderr_contains("1 uncertified (emitted unproven under AllowUnknown)");
+    // The soundness half: the SAME unit under the strict gate is still REFUSED —
+    // an unproven GlobalAddr read never reaches an object.
+    rustc()
+        .input("source-static.rs")
+        .crate_name("source_static")
+        .crate_type("lib")
+        .edition("2024")
+        .arg("-Cpanic=abort")
+        .arg("-Zunstable-options")
+        .arg("-Zcodegen-backend=trust-cg")
+        .arg("-Ztrust-verify=off")
+        .arg("-Ztrust-ir-lower")
+        .arg("-Ztrust-cg-frontend=trust-ir")
+        .arg("-Ztrust-cg-output-gate=strict")
+        .out_dir("static-strict")
         .run_fail()
-        .assert_stderr_contains("reachable static")
-        .assert_stderr_contains("is not wired into trust-cg object emission");
+        .assert_stderr_contains("proven-output gate rejected it");
+    assert!(
+        !std::path::Path::new(&format!("static-strict/{}", rust_lib_name("source_static")))
+            .exists(),
+        "strict refusal of a static-reading unit must not leave a shippable rlib"
+    );
+    // And the residual that IS still unwired keeps its refusal, by name: a static
+    // whose initializer embeds a pointer needs relocated data the backend does not
+    // emit.
+    rfs::write(
+        "pointer-static.rs",
+        r#"pub static POINTER_STATIC: &u64 = &0x1122_3344_5566_7788;
+
+pub fn read_pointer_static() -> u64 {
+    *POINTER_STATIC
+}
+"#,
+    );
+    rustc()
+        .input("pointer-static.rs")
+        .crate_name("pointer_static")
+        .crate_type("lib")
+        .edition("2024")
+        .arg("-Cpanic=abort")
+        .arg("-Zunstable-options")
+        .arg("-Zcodegen-backend=trust-cg")
+        .arg("-Ztrust-verify=off")
+        .arg("-Ztrust-ir-lower")
+        .arg("-Ztrust-cg-frontend=trust-ir")
+        .arg("-Ztrust-cg-output-gate=allow-unknown")
+        .out_dir("pointer-static-out")
+        .run_fail()
+        .assert_stderr_contains("reachable static `POINTER_STATIC` embeds 1 pointer(s)")
+        .assert_stderr_contains("not wired into trust-cg object");
 }
 
 fn assert_promoted_ir(text: &str) -> String {
@@ -230,6 +286,11 @@ fn link_and_run(crate_name: &str, rlib: &str, source: &str, output: &str) {
         .input(source)
         .edition("2024")
         .arg("-Cpanic=abort")
+        // Trust: this driver is the end-to-end EXECUTION OBSERVER — the producer,
+        // object and IR claims above are the subjects; it is built and run only to
+        // check the linked runtime answer, so it must not itself be a verification
+        // subject (same rule as the sibling observer binaries).
+        .arg("-Ztrust-verify=off")
         .extern_(crate_name, rlib)
         .output(bin_name(output))
         .run();

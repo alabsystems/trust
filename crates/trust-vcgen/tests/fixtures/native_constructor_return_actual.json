@@ -1,0 +1,763 @@
+[
+  {
+    "name": "new",
+    "def_path": "native_bundle_member_link_symbols_distinct::A::new",
+    "span": {
+      "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+      "line_start": 30,
+      "col_start": 4,
+      "line_end": 32,
+      "col_end": 5
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": {
+            "Adt": {
+              "name": "native_bundle_member_link_symbols_distinct::A",
+              "fields": [
+                [
+                  "0",
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [],
+              "disc_index_safe": false,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Struct"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Int": {
+              "width": 32,
+              "signed": false
+            }
+          },
+          "name": "x"
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "native_bundle_member_link_symbols_distinct::A",
+                        "variant": 0,
+                        "active_field": null,
+                        "args": "native_bundle_member_link_symbols_distinct::A"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+                  "line_start": 32,
+                  "col_start": 5,
+                  "line_end": 32,
+                  "col_end": 5
+                }
+              }
+            }
+          ],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": {
+        "Adt": {
+          "name": "native_bundle_member_link_symbols_distinct::A",
+          "fields": [
+            [
+              "0",
+              {
+                "Int": {
+                  "width": 32,
+                  "signed": false
+                }
+              }
+            ]
+          ],
+          "variants": [],
+          "disc_index_safe": false,
+          "faithful_enum_repr": null,
+          "layout": null,
+          "enum_layout": null,
+          "adt_kind": "Struct"
+        }
+      }
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "x",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "x",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 4294967295
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "new",
+    "def_path": "native_bundle_member_link_symbols_distinct::B::new",
+    "span": {
+      "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+      "line_start": 36,
+      "col_start": 4,
+      "line_end": 38,
+      "col_end": 5
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": {
+            "Adt": {
+              "name": "native_bundle_member_link_symbols_distinct::B",
+              "fields": [
+                [
+                  "0",
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [],
+              "disc_index_safe": false,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Struct"
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Int": {
+              "width": 32,
+              "signed": false
+            }
+          },
+          "name": "x"
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "native_bundle_member_link_symbols_distinct::B",
+                        "variant": 0,
+                        "active_field": null,
+                        "args": "native_bundle_member_link_symbols_distinct::B"
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+                  "line_start": 38,
+                  "col_start": 5,
+                  "line_end": 38,
+                  "col_end": 5
+                }
+              }
+            }
+          ],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": {
+        "Adt": {
+          "name": "native_bundle_member_link_symbols_distinct::B",
+          "fields": [
+            [
+              "0",
+              {
+                "Int": {
+                  "width": 32,
+                  "signed": false
+                }
+              }
+            ]
+          ],
+          "variants": [],
+          "disc_index_safe": false,
+          "faithful_enum_repr": null,
+          "layout": null,
+          "enum_layout": null,
+          "adt_kind": "Struct"
+        }
+      }
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "x",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "x",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 4294967295
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  {
+    "name": "make",
+    "def_path": "native_bundle_member_link_symbols_distinct::make",
+    "span": {
+      "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+      "line_start": 41,
+      "col_start": 0,
+      "line_end": 48,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": {
+            "Int": {
+              "width": 32,
+              "signed": false
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Int": {
+              "width": 32,
+              "signed": false
+            }
+          },
+          "name": "x"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "native_bundle_member_link_symbols_distinct::A",
+              "fields": [
+                [
+                  "0",
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [],
+              "disc_index_safe": false,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Struct"
+            }
+          },
+          "name": "a"
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Adt": {
+              "name": "native_bundle_member_link_symbols_distinct::B",
+              "fields": [
+                [
+                  "0",
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [],
+              "disc_index_safe": false,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Struct"
+            }
+          },
+          "name": "b"
+        },
+        {
+          "index": 4,
+          "ty": "Bool",
+          "name": null
+        },
+        {
+          "index": 5,
+          "ty": {
+            "Int": {
+              "width": 32,
+              "signed": false
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 6,
+          "ty": {
+            "Int": {
+              "width": 32,
+              "signed": false
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 7,
+          "ty": "Never",
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [],
+          "terminator": {
+            "Call": {
+              "func": "native_bundle_member_link_symbols_distinct::A::new",
+              "args": [
+                {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 2,
+                "projections": []
+              },
+              "target": 1,
+              "span": {
+                "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+                "line_start": 42,
+                "col_start": 12,
+                "line_end": 42,
+                "col_end": 21
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 13830405972067426825,
+                "def_index": 10,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 13830405972067426825,
+                "krate_name": "native_bundle_member_link_symbols_distinct"
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": {
+            "Call": {
+              "func": "native_bundle_member_link_symbols_distinct::B::new",
+              "args": [
+                {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 3,
+                "projections": []
+              },
+              "target": 2,
+              "span": {
+                "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+                "line_start": 43,
+                "col_start": 12,
+                "line_end": 43,
+                "col_end": 21
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 13830405972067426825,
+                "def_index": 12,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 13830405972067426825,
+                "krate_name": "native_bundle_member_link_symbols_distinct"
+              }
+            }
+          }
+        },
+        {
+          "id": 2,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 5,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Copy": {
+                      "local": 2,
+                      "projections": [
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  }
+                },
+                "span": {
+                  "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+                  "line_start": 44,
+                  "col_start": 7,
+                  "line_end": 44,
+                  "col_end": 10
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 6,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Copy": {
+                      "local": 3,
+                      "projections": [
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  }
+                },
+                "span": {
+                  "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+                  "line_start": 44,
+                  "col_start": 14,
+                  "line_end": 44,
+                  "col_end": 17
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 4,
+                  "projections": []
+                },
+                "rvalue": {
+                  "BinaryOp": [
+                    "Ne",
+                    {
+                      "Move": {
+                        "local": 5,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 6,
+                        "projections": []
+                      }
+                    }
+                  ]
+                },
+                "span": {
+                  "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+                  "line_start": 44,
+                  "col_start": 7,
+                  "line_end": 44,
+                  "col_end": 17
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "SwitchInt": {
+              "discr": {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              "targets": [
+                [
+                  0,
+                  4
+                ]
+              ],
+              "otherwise": 3,
+              "exhaustive_enum_unreachable": false,
+              "span": {
+                "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+                "line_start": 44,
+                "col_start": 7,
+                "line_end": 44,
+                "col_end": 17
+              }
+            }
+          }
+        },
+        {
+          "id": 3,
+          "stmts": [],
+          "terminator": {
+            "Call": {
+              "func": "core::panicking::panic_default_msg",
+              "args": [],
+              "dest": {
+                "local": 7,
+                "projections": []
+              },
+              "target": null,
+              "span": {
+                "file": "library/core/src/panic.rs",
+                "line_start": 52,
+                "col_start": 8,
+                "line_end": 52,
+                "col_end": 46
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 17337428890813659749,
+                "def_index": 12474,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": true,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 17337428890813659749,
+                "krate_name": "core",
+                "diverging_entry": "PanicOrAbort"
+              }
+            }
+          }
+        },
+        {
+          "id": 4,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Copy": {
+                      "local": 2,
+                      "projections": [
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  }
+                },
+                "span": {
+                  "file": "tests/ui/trust/native_bundle_member_link_symbols_distinct.rs",
+                  "line_start": 47,
+                  "col_start": 4,
+                  "line_end": 47,
+                  "col_end": 7
+                }
+              }
+            }
+          ],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": {
+        "Int": {
+          "width": 32,
+          "signed": false
+        }
+      }
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "And": [
+          {
+            "Ge": [
+              {
+                "Var": [
+                  "x",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Le": [
+              {
+                "Var": [
+                  "x",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 4294967295
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  }
+]

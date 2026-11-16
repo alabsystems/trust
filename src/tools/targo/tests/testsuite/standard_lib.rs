@@ -329,7 +329,7 @@ fn simple_lib_std() {
         .target_host()
         .with_stderr_data(str![[r#"
 ...
-[FRESH] std v0.1.0 ([..]/tests/testsuite/mock-std/library/std)
+[FRESH] std v0.0.0 ([..]/tests/testsuite/mock-std/library/std)
 ...
 "#]])
         .run();
@@ -412,15 +412,18 @@ fn build_std_with_no_arg_for_core_only_target() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ * [new ref]         HEAD       -> origin/HEAD
 [DOWNLOADING] crates ...
 [DOWNLOADED] registry-dep-using-std v1.0.0 (registry `dummy-registry`)
 [DOWNLOADED] registry-dep-using-core v1.0.0 (registry `dummy-registry`)
 [DOWNLOADED] registry-dep-using-alloc v1.0.0 (registry `dummy-registry`)
 [COMPILING] compiler_builtins v0.1.0 ([..]/library/compiler_builtins)
-[COMPILING] core v0.1.0 ([..]/library/core)
+[COMPILING] core v0.0.0 ([..]/library/core)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [RUNNING] `[..] rustc --crate-name build_script_build [..]/compiler_builtins/build.rs [..]`
-[RUNNING] `[ROOT]/foo/target/debug/build/compiler_builtins-[HASH]/build-script-build`
+[RUNNING] `[ROOT]/foo/target/debug/build/compiler_builtins/[HASH]/out/build_script_build`
 [RUNNING] `[..] rustc --crate-name compiler_builtins [..]--target aarch64-unknown-none[..]`
 [RUNNING] `[..] rustc --crate-name core [..]--target aarch64-unknown-none[..]`
 [RUNNING] `[..] rustc --crate-name foo [..]--target aarch64-unknown-none[..]`
@@ -446,7 +449,10 @@ fn build_std_with_no_arg_for_core_only_target() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[COMPILING] core v0.1.0 ([..]/library/core)
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ = [up to date]      HEAD       -> origin/HEAD
+[COMPILING] core v0.0.0 ([..]/library/core)
 [COMPILING] dep_test v0.1.0 ([..]/dep_test)
 [COMPILING] compiler_builtins v0.1.0 ([..]/library/compiler_builtins)
 [COMPILING] proc_macro v0.1.0 ([..]/library/proc_macro)
@@ -454,13 +460,13 @@ fn build_std_with_no_arg_for_core_only_target() {
 [COMPILING] rustc-std-workspace-core v1.9.0 ([..]/library/rustc-std-workspace-core)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [COMPILING] registry-dep-using-core v1.0.0
-[COMPILING] alloc v0.1.0 ([..]/library/alloc)
+[COMPILING] alloc v0.0.0 ([..]/library/alloc)
 [COMPILING] rustc-std-workspace-alloc v1.9.0 ([..]/library/rustc-std-workspace-alloc)
 [COMPILING] registry-dep-using-alloc v1.0.0
-[COMPILING] std v0.1.0 ([..]/library/std)
+[COMPILING] std v0.0.0 ([..]/library/std)
 [RUNNING] `[..] rustc --crate-name build_script_build [..]/compiler_builtins/build.rs [..]`
-[RUNNING] `[ROOT]/foo/target/debug/build/compiler_builtins-[HASH]/build-script-build`
-[RUNNING] `[ROOT]/foo/target/debug/build/compiler_builtins-[HASH]/build-script-build`
+[RUNNING] `[ROOT]/foo/target/debug/build/compiler_builtins/[HASH]/out/build_script_build`
+[RUNNING] `[ROOT]/foo/target/debug/build/compiler_builtins/[HASH]/out/build_script_build`
 [RUNNING] `[..]rustc --crate-name compiler_builtins [..]--target aarch64-unknown-none[..]`
 [RUNNING] `[..]rustc --crate-name core [..]--target aarch64-unknown-none[..]`
 [RUNNING] `[..]rustc --crate-name foo [..]--target aarch64-unknown-none[..]`

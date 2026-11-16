@@ -86,6 +86,8 @@ impl Tool {
             nightly_branch,
             compiler_dist_channel,
             rustfmt_dist_channel,
+            min_stage0_rustc_version,
+            min_stage0_cargo_version,
         } = &self.config;
 
         file_content.push_str(&format!("dist_server={}\n", dist_server));
@@ -98,6 +100,8 @@ impl Tool {
         file_content.push_str(&format!("nightly_branch={}\n", nightly_branch));
         file_content.push_str(&format!("compiler_dist_channel={}\n", compiler_dist_channel));
         file_content.push_str(&format!("rustfmt_dist_channel={}\n", rustfmt_dist_channel));
+        file_content.push_str(&format!("min_stage0_rustc_version={}\n", min_stage0_rustc_version));
+        file_content.push_str(&format!("min_stage0_cargo_version={}\n", min_stage0_cargo_version));
 
         file_content.push_str("\n");
         file_content.push_str(COMMENTS);

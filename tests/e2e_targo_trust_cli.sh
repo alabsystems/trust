@@ -56,7 +56,7 @@ find_standalone_targo() {
             printf '%s\n' "$candidate"
             return 0
         fi
-    done < <(find "$TRUST_ROOT/build" -path "*/stage2/bin/targo" -type f -perm -111 -print 2>/dev/null | sort -r)
+    done < <(find -H "$TRUST_ROOT/build" -path "*/stage2/bin/targo" -type f -perm -111 -print 2>/dev/null | sort -r)
 
     return 1
 }
@@ -240,15 +240,12 @@ VERSION_STDOUT="$TMP_DIR/version.stdout"
 RELEASE_METADATA_STDOUT="$TMP_DIR/release_metadata.stdout"
 RELEASE_PRODUCT_PROOF_STDOUT="$TMP_DIR/release_product_proof.stdout"
 REPORT_STDOUT="$TMP_DIR/report.stdout"
-DIFF_STDOUT="$TMP_DIR/diff.stdout"
 INIT_STDOUT="$TMP_DIR/init.stdout"
 BUILD_STDERR="$TMP_DIR/build.stderr"
 LOOP_STDERR="$TMP_DIR/loop.stderr"
 SURFACE_INPUT="$TMP_DIR/surface_midpoint.rs"
 INIT_INPUT="$TMP_DIR/init_sample.rs"
 BUILD_INPUT="$TMP_DIR/build_ok.rs"
-BASELINE_JSON="$TMP_DIR/baseline.json"
-CURRENT_JSON="$TMP_DIR/current.json"
 
 cp "$INPUT" "$SURFACE_INPUT"
 cat > "$INIT_INPUT" <<'RUST'
@@ -260,12 +257,6 @@ cat > "$BUILD_INPUT" <<'RUST'
 fn main() {
 }
 RUST
-cat > "$BASELINE_JSON" <<'JSON'
-{"results":[{"kind":"overflow","message":"surface","outcome":"Failed","backend":"trust","time_ms":1}]}
-JSON
-cat > "$CURRENT_JSON" <<'JSON'
-{"results":[{"kind":"overflow","message":"surface","outcome":"Proved","backend":"trust","time_ms":1}]}
-JSON
 
 run_public_cli help >"$HELP_STDOUT" 2>"$TMP_DIR/help.stderr"
 for subcommand in check build version release verify deps report loop diff init solvers doctor help; do
@@ -443,16 +434,6 @@ if not isinstance(report["functions"], list) or not report["functions"]:
     raise AssertionError("standalone report did not include analyzed functions")
 PY
 
-run_public_cli diff --baseline "$BASELINE_JSON" --current "$CURRENT_JSON" --format json >"$DIFF_STDOUT" 2>"$TMP_DIR/diff.stderr"
-python3 - "$DIFF_STDOUT" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    report = json.load(fh)
-if report.get("improvements", 0) < 1:
-    raise AssertionError("diff output did not report the expected improvement")
-PY
 
 run_public_cli init "$INIT_INPUT" >"$INIT_STDOUT" 2>"$TMP_DIR/init.stderr"
 if ! grep -q "increment" "$INIT_STDOUT"; then
@@ -575,6 +556,107 @@ if grep -q "TRUST_JSON:" "$JSON_STDOUT" "$JSON_STDERR"; then
     exit 1
 fi
 echo "  PASS: json mode emits canonical JSON report"
+
+echo "--- committed obligation baseline (T9)"
+# A copy of the fixture crate, so its target directory stays out of the tree.
+BASELINE_CRATE="$TMP_DIR/obligation-ids"
+cp -R "$TRUST_ROOT/tests/fixtures/obligation-ids" "$BASELINE_CRATE"
+rm -rf "$BASELINE_CRATE/target"
+BASELINE_ONE="$TMP_DIR/trust.baseline.1"
+BASELINE_TWO="$TMP_DIR/trust.baseline.2"
+
+baseline_exit=0
+run_public_cli check --manifest-path "$BASELINE_CRATE/Cargo.toml" --lib \
+    --save-baseline "$BASELINE_ONE" >"$TMP_DIR/save1.stdout" 2>"$TMP_DIR/save1.stderr" || baseline_exit=$?
+if [ "$baseline_exit" -ne 0 ] || [ ! -f "$BASELINE_ONE" ]; then
+    echo "FAIL: check --save-baseline exited $baseline_exit or wrote no baseline"
+    cat "$TMP_DIR/save1.stderr"
+    exit 1
+fi
+run_public_cli check --manifest-path "$BASELINE_CRATE/Cargo.toml" --lib \
+    --save-baseline "$BASELINE_TWO" >"$TMP_DIR/save2.stdout" 2>"$TMP_DIR/save2.stderr" || baseline_exit=$?
+if [ "$baseline_exit" -ne 0 ] || ! cmp -s "$BASELINE_ONE" "$BASELINE_TWO"; then
+    echo "FAIL: two --save-baseline runs of one source wrote different bytes"
+    diff "$BASELINE_ONE" "$BASELINE_TWO" || true
+    exit 1
+fi
+if ! head -1 "$BASELINE_ONE" | grep -qx "trust-baseline v1" \
+    || ! grep -q "trust_obligation_ids_fixture::checked_div" "$BASELINE_ONE"; then
+    echo "FAIL: the baseline is not a trust-baseline v1 file naming checked_div"
+    cat "$BASELINE_ONE"
+    exit 1
+fi
+if ! ls "$BASELINE_CRATE"/target/trust/obligations/*.ndjson >/dev/null 2>&1; then
+    echo "FAIL: check wrote no compact obligation record under the target directory"
+    exit 1
+fi
+# T7c: the fixture's own trust.package.v1 record beside its obligation record,
+# agreeing with its header; the two measured runs above wrote it twice. Only
+# the fixture's record is read: a record another check left in this target
+# directory (a verified dependency, say) is that check's.
+if ! python3 - "$BASELINE_CRATE/target/trust" trust-obligation-ids-fixture <<'PY'
+import json, pathlib, sys
+root, package = pathlib.Path(sys.argv[1]), sys.argv[2]
+record_path = root / "packages" / (package + ".json")
+assert record_path.is_file(), "no package record " + str(record_path)
+text = record_path.read_text()
+record = json.loads(text)
+assert text == json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n", record_path
+assert record["schema"] == "trust.package.v1", record_path
+assert record["package"] == package, record
+assert record["outcome"] == "measured", record
+assert record["coverage"]["complete"] is True, record
+assert record["seal"]["absent"] == "A8", record
+assert record["result_key"]["absent"] == "T10", record
+header = json.loads((root / "obligations" / (package + ".ndjson")).read_text().splitlines()[0])
+for field in ("outcome", "vector", "profile", "seal", "targo_trust_commit", "lane", "policy", "selection"):
+    assert header[field] == record[field], (field, header, record)
+PY
+then
+    echo "FAIL: the package record is missing, not canonical, or disagrees with its obligation header"
+    exit 1
+fi
+
+diff_exit=0
+run_public_cli diff --baseline "$BASELINE_ONE" --manifest-path "$BASELINE_CRATE/Cargo.toml" \
+    >"$TMP_DIR/diff_same.stdout" 2>"$TMP_DIR/diff_same.stderr" || diff_exit=$?
+if [ "$diff_exit" -ne 0 ]; then
+    echo "FAIL: diff --baseline on the unchanged source exited $diff_exit, not 0"
+    cat "$TMP_DIR/diff_same.stdout" "$TMP_DIR/diff_same.stderr"
+    exit 1
+fi
+
+# The planted loss: without its `requires`, `checked_div`'s division is no
+# longer proved, under the same key.
+cp -R "$BASELINE_CRATE" "$TMP_DIR/obligation-ids-lost"
+sed -i.orig '/requires d > 0/d' "$TMP_DIR/obligation-ids-lost/src/lib.rs"
+diff_exit=0
+run_public_cli diff --baseline "$BASELINE_ONE" --manifest-path "$TMP_DIR/obligation-ids-lost/Cargo.toml" \
+    >"$TMP_DIR/diff_lost.stdout" 2>"$TMP_DIR/diff_lost.stderr" || diff_exit=$?
+if [ "$diff_exit" -ne 1 ] || ! grep -q "^LOST .*checked_div #" "$TMP_DIR/diff_lost.stdout"; then
+    echo "FAIL: a lost proof must exit 1 and name its key (exit $diff_exit)"
+    cat "$TMP_DIR/diff_lost.stdout" "$TMP_DIR/diff_lost.stderr"
+    exit 1
+fi
+
+# New code only: a proved function added is a gain, not a failure.
+cp -R "$BASELINE_CRATE" "$TMP_DIR/obligation-ids-gain"
+cat >>"$TMP_DIR/obligation-ids-gain/src/lib.rs" <<'RUST'
+
+/// Added: proves, like `midpoint`.
+pub fn halves(a: u32, b: u32) -> u32 {
+    a / 2 + b / 2
+}
+RUST
+diff_exit=0
+run_public_cli diff --baseline "$BASELINE_ONE" --manifest-path "$TMP_DIR/obligation-ids-gain/Cargo.toml" \
+    >"$TMP_DIR/diff_gain.stdout" 2>"$TMP_DIR/diff_gain.stderr" || diff_exit=$?
+if [ "$diff_exit" -ne 0 ] || ! grep -q "^GAINED .*halves#" "$TMP_DIR/diff_gain.stdout"; then
+    echo "FAIL: added proved code must exit 0 and list its gains (exit $diff_exit)"
+    cat "$TMP_DIR/diff_gain.stdout" "$TMP_DIR/diff_gain.stderr"
+    exit 1
+fi
+echo "  PASS: the committed baseline is byte-deterministic and diff fails only on a lost proof"
 
 echo
 echo "=== targo trust public CLI test: PASS ==="

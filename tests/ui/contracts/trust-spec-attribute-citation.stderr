@@ -46,7 +46,7 @@ note: citation `self_le` kernel-discharges this postcondition statement: the cit
 LL |     ensures result <= x by self_le
    |                            ^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `self_le` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `keep_attribute`, with a clean certification audit
   --> $DIR/trust-spec-attribute-citation.rs:43:33
@@ -54,7 +54,7 @@ note: citation `self_le` kernel-discharges this postcondition statement: the cit
 LL | #[trust::ensures(result <= x by self_le)]
    |                                 ^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `self_le` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `keep_gated`, with a clean certification audit
   --> $DIR/trust-spec-attribute-citation.rs:54:56
@@ -62,5 +62,5 @@ note: citation `self_le` kernel-discharges this postcondition statement: the cit
 LL | #[cfg_attr(trust_verify, trust::ensures(result <= x by self_le))]
    |                                                        ^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 

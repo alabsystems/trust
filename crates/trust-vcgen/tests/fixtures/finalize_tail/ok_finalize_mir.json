@@ -1,0 +1,2322 @@
+{
+  "name": "ok_finalize",
+  "def_path": "repro::Pad::ok_finalize",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+    "line_start": 30,
+    "col_start": 4,
+    "line_end": 46,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "repro::Pad",
+            "fields": [
+              [
+                "state",
+                {
+                  "Array": {
+                    "elem": {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    },
+                    "len": 8
+                  }
+                }
+              ],
+              [
+                "buf",
+                {
+                  "Array": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    },
+                    "len": 64
+                  }
+                }
+              ],
+              [
+                "buf_len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "bit_len"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeFrom",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 64
+          }
+        },
+        "name": "block"
+      },
+      {
+        "index": 19,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                },
+                "len": 8
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeFrom",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 8
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 8
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 31,
+                "col_start": 11,
+                "line_end": 31,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ge",
+                  {
+                    "Move": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 31,
+                "col_start": 11,
+                "line_end": 31,
+                "col_end": 36
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 31,
+              "col_start": 11,
+              "line_end": 31,
+              "col_end": 36
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 32,
+                "col_start": 19,
+                "line_end": 32,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 19
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 34,
+                "col_start": 22,
+                "line_end": 34,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_mul",
+            "args": [
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    8,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 34,
+              "col_start": 22,
+              "line_end": 34,
+              "col_end": 46
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 27860,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 35,
+                "col_start": 17,
+                "line_end": 35,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 35,
+                "col_start": 8,
+                "line_end": 35,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 4,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 35,
+              "col_start": 8,
+              "line_end": 35,
+              "col_end": 30
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  {
+                    "Field": 1
+                  },
+                  {
+                    "Index": 6
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      128,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 35,
+                "col_start": 8,
+                "line_end": 35,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": [
+                        {
+                          "Field": 2
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 36,
+                "col_start": 8,
+                "line_end": 36,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 8,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 5,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 36,
+              "col_start": 8,
+              "line_end": 36,
+              "col_end": 25
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  {
+                    "Field": 2
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 8,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 36,
+                "col_start": 8,
+                "line_end": 36,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 37,
+                "col_start": 11,
+                "line_end": 37,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 37,
+                "col_start": 26,
+                "line_end": 37,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 12,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 6,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 37,
+              "col_start": 26,
+              "line_end": 37,
+              "col_end": 39
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 12,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 37,
+                "col_start": 26,
+                "line_end": 37,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 37,
+                "col_start": 11,
+                "line_end": 37,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 9,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                11
+              ]
+            ],
+            "otherwise": 7,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 37,
+              "col_start": 11,
+              "line_end": 37,
+              "col_end": 39
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 38,
+                "col_start": 12,
+                "line_end": 38,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 38,
+                "col_start": 21,
+                "line_end": 38,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeFrom",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeFrom<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 17,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 38,
+                "col_start": 21,
+                "line_end": 38,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8; 64] as core::ops::index::IndexMut<core::ops::range::RangeFrom<usize>>>::index_mut",
+            "args": [
+              {
+                "Move": {
+                  "local": 15,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 16,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 14,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 38,
+              "col_start": 20,
+              "line_end": 38,
+              "col_end": 36
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 4524,
+              "substs_digest": [
+                7685911593046415622,
+                15791885237918717175
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::fill",
+            "args": [
+              {
+                "Copy": {
+                  "local": 14,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    0,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 13,
+              "projections": []
+            },
+            "target": 9,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 38,
+              "col_start": 12,
+              "line_end": 38,
+              "col_end": 44
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15579,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 39,
+                "col_start": 24,
+                "line_end": 39,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 40,
+                "col_start": 21,
+                "line_end": 40,
+                "col_end": 36
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 18,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 40,
+                "col_start": 38,
+                "line_end": 40,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "repro::compress",
+            "args": [
+              {
+                "Copy": {
+                  "local": 20,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 21,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 19,
+              "projections": []
+            },
+            "target": 10,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 40,
+              "col_start": 12,
+              "line_end": 40,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3410588637815928769,
+              "def_index": 11,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3410588637815928769,
+              "krate_name": "repro"
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  {
+                    "Field": 2
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 41,
+                "col_start": 12,
+                "line_end": 41,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 11
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 43,
+                "col_start": 8,
+                "line_end": 43,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 43,
+                "col_start": 17,
+                "line_end": 43,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 43,
+                "col_start": 31,
+                "line_end": 43,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 28,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 12,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 43,
+              "col_start": 31,
+              "line_end": 43,
+              "col_end": 44
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 28,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 43,
+                "col_start": 31,
+                "line_end": 43,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 26,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 27,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 43,
+                "col_start": 17,
+                "line_end": 43,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8; 64] as core::ops::index::IndexMut<core::ops::range::Range<usize>>>::index_mut",
+            "args": [
+              {
+                "Move": {
+                  "local": 24,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 25,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 23,
+              "projections": []
+            },
+            "target": 13,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 43,
+              "col_start": 16,
+              "line_end": 43,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 4524,
+              "substs_digest": [
+                14450106600928918777,
+                10772248289640540759
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::fill",
+            "args": [
+              {
+                "Copy": {
+                  "local": 23,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    0,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 22,
+              "projections": []
+            },
+            "target": 14,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 43,
+              "col_start": 8,
+              "line_end": 43,
+              "col_end": 53
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15579,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 31,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 44,
+                "col_start": 8,
+                "line_end": 44,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 44,
+                "col_start": 17,
+                "line_end": 44,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 34,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 15,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 44,
+              "col_start": 17,
+              "line_end": 44,
+              "col_end": 30
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 33,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 34,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 44,
+                "col_start": 17,
+                "line_end": 44,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeFrom",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeFrom<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 33,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 44,
+                "col_start": 17,
+                "line_end": 44,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8; 64] as core::ops::index::IndexMut<core::ops::range::RangeFrom<usize>>>::index_mut",
+            "args": [
+              {
+                "Move": {
+                  "local": 31,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 32,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 30,
+              "projections": []
+            },
+            "target": 16,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 44,
+              "col_start": 16,
+              "line_end": 44,
+              "col_end": 33
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 4524,
+              "substs_digest": [
+                7685911593046415622,
+                15791885237918717175
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl u64>::to_be_bytes",
+            "args": [
+              {
+                "Copy": {
+                  "local": 4,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 37,
+              "projections": []
+            },
+            "target": 17,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 44,
+              "col_start": 51,
+              "line_end": 44,
+              "col_end": 72
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 27902,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 37,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 44,
+                "col_start": 50,
+                "line_end": 44,
+                "col_end": 72
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 35,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 36,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Ref": {
+                      "mutable": false,
+                      "inner": {
+                        "Slice": {
+                          "elem": {
+                            "Int": {
+                              "width": 8,
+                              "signed": false
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 44,
+                "col_start": 50,
+                "line_end": 44,
+                "col_end": 72
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::copy_from_slice",
+            "args": [
+              {
+                "Copy": {
+                  "local": 30,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 35,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 29,
+              "projections": []
+            },
+            "target": 18,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+              "line_start": 44,
+              "col_start": 8,
+              "line_end": 44,
+              "col_end": 73
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15583,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/finalize_tail.rs",
+                "line_start": 45,
+                "col_start": 8,
+                "line_end": 45,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 19
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Array": {
+        "elem": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "len": 64
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

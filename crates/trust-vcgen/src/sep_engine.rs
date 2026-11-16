@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust_vcgen/sep_engine.rs: Minimal separation logic provenance engine
 //
 // Combines the symbolic heap (separation_logic.rs) with provenance tracking
@@ -22,8 +22,60 @@ use trust_types::{
 use crate::separation_logic::SepFormula;
 use crate::separation_logic::{PointerPermission, ProvenanceId, SymbolicHeap, SymbolicPointer};
 
+#[cfg(test)]
+mod exact_size_tests;
+
 fn generated_sep_var(name: impl AsRef<str>, sort: Sort) -> Formula {
     Formula::Var(crate::separation_logic::generated_symbol(name.as_ref()), sort)
+}
+
+/// Violation of the allocation bounds for an access in mathematical byte units.
+/// Safe wrapping offsets may be negative: checking only the upper end would
+/// falsely discharge an access before the base. Empty memory accesses need no
+/// dereferenceable allocation (core::ptr's validity contract), but this helper
+/// grants no alignment, non-nullness, initialization, liveness or ownership fact.
+/// `empty_is_valid` is false for owning raw-parts constructors, whose separate
+/// capacity/deallocation contract is not modeled by a zero element length; keep
+/// their existing conservative upper bound in that case.
+fn byte_range_violation(
+    offset: Formula,
+    bytes: Formula,
+    size: Formula,
+    empty_is_valid: bool,
+) -> Formula {
+    let nonempty = Formula::Gt(Box::new(bytes.clone()), Box::new(Formula::Int(0)));
+    let before_base = Formula::Lt(Box::new(offset.clone()), Box::new(Formula::Int(0)));
+    let past_end =
+        Formula::Gt(Box::new(Formula::Add(Box::new(offset), Box::new(bytes))), Box::new(size));
+    if empty_is_valid {
+        Formula::And(vec![nonempty, Formula::Or(vec![before_base, past_end])])
+    } else {
+        Formula::Or(vec![Formula::And(vec![nonempty, before_base]), past_end])
+    }
+}
+
+/// `ptr::add`/`offset` require the whole traversed range to stay in the same
+/// allocation. Both endpoints may be one-past; a zero byte displacement needs
+/// no allocation bounds. A known deallocation invalidates every nonzero offset.
+/// This grants no alignment or later-access authority. Mathematical byte offsets
+/// preserve signed arithmetic.
+fn pointer_offset_violation(
+    start: Formula,
+    delta: Formula,
+    size: Formula,
+    lifetime_violation: Formula,
+) -> Formula {
+    let end = Formula::Add(Box::new(start.clone()), Box::new(delta.clone()));
+    Formula::And(vec![
+        Formula::Not(Box::new(Formula::Eq(Box::new(delta), Box::new(Formula::Int(0))))),
+        Formula::Or(vec![
+            lifetime_violation,
+            Formula::Lt(Box::new(start.clone()), Box::new(Formula::Int(0))),
+            Formula::Gt(Box::new(start), Box::new(size.clone())),
+            Formula::Lt(Box::new(end.clone()), Box::new(Formula::Int(0))),
+            Formula::Gt(Box::new(end), Box::new(size)),
+        ]),
+    ])
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -60,9 +112,15 @@ pub(crate) struct SepEngine {
     local_to_ptr: FxHashMap<usize, String>,
     /// Local types used to distinguish raw-pointer derefs from safe ref derefs.
     local_tys: Vec<Ty>,
+    /// Compiler layout observations bound to this function's owner and types.
+    /// Only unanimous sizes may scale accesses; a lower bound is insufficient.
+    elem_sizes: Option<std::sync::Arc<crate::elem_sizes::ElemSizeBinding>>,
     /// Local NAMES, so operands resolve to the same SMT variable the rest of the
     /// pipeline uses (`place_to_var_name`): a named local `len` must be `len`,
     /// not `_1`, or guards/defs over `len` won't connect to this VC's operand.
+    /// Indexed by local index; the production entries fill it with
+    /// [`pipeline_local_names`], never the raw `LocalDecl.name` (a raw source name
+    /// spelled `_<k>`, or shared by two locals, is ANOTHER local's formula name).
     local_names: Vec<Option<String>>,
     /// VCs accumulated during interpretation.
     vcs: Vec<VerificationCondition>,
@@ -86,10 +144,17 @@ pub(crate) struct SepEngine {
     symbolic_sizes: FxHashMap<ProvenanceId, Formula>,
     /// Each tracked pointer's byte OFFSET from its allocation base (0 at the
     /// base, accumulated through `ptr.add`/`offset`). The slice/copy bounds
-    /// obligation is `offset + count > size`, NOT `count > size` — so an offset
-    /// pointer cannot be unsoundly discharged by a count-only guard, and a
-    /// correctly bounded `offset + count <= size` discharges it.
+    /// obligation checks both `offset + count > size` and a negative start for
+    /// nonempty accesses — a count-only guard cannot justify an offset pointer,
+    /// including a signed wrapping offset before the allocation base.
     pointer_offsets: FxHashMap<String, Formula>,
+    /// Fresh pointer identities preserve old aliases when an offset destination
+    /// local is reassigned. MIR local numbers are storage, not value identities.
+    next_offset_identity: u64,
+    next_pointer_identity: u64,
+    /// A deallocator can precede these blocks on some normal CFG path. Bounds
+    /// cannot discharge allocation lifetime merely because no free dominates.
+    offset_may_follow_free: FxHashSet<usize>,
     /// Locals whose value is a known integer constant (`let cap = 64`). Used to
     /// resolve a `Layout::from_size_align(cap, _)` size argument to a literal so
     /// the resulting heap allocation carries a CONCRETE size.
@@ -111,14 +176,37 @@ pub(crate) struct SepEngine {
     /// the pointer's allocation is at least `len` bytes (see the Aggregate arm).
     field_backing: Vec<(usize, usize)>,
     /// Locals that hold a load of a struct field `(*base).field` — `local ->
-    /// (base_local, field_index)`. Used by the backing-invariant ASSUME: a
+    /// (root, field_index)`. Used by the backing-invariant ASSUME: a
     /// `from_raw_parts` over a pointer that traces to a backing pointer field
     /// gets its allocation size modeled as the sibling length field.
+    ///
+    /// `root` is the base's VALUE identity ([`SepEngine::backing_value_roots`]),
+    /// not the base local's index, and a local is tagged only when it holds ONE
+    /// value for the whole body ([`SepEngine::backing_single_value_locals`]).
+    /// KNOWN_HAZARDS BACKING-FIRST-LOAD-1: keyed on the base LOCAL, and set by
+    /// whichever write the forward walk saw last, the tag let a length read from
+    /// one struct value bound a pointer read from another (`let mut s = self;
+    /// let n = s.len; s = other; s.ptr.add(i)`), and a reassigned or
+    /// path-joined length local stand for the field (`let mut n = self.len;
+    /// n = 1 << 40; if i < n { self.ptr.add(i) }`).
     field_loads: FxHashMap<usize, (usize, usize)>,
-    /// The named formula for the local that loaded a given `(base, field)` — so
-    /// the ASSUME can use the SAME variable the guard/length sees for
+    /// The named formula for the local that first loaded a given `(root, field)`
+    /// — so the ASSUME can use the SAME variable the guard/length sees for
     /// `self.len`, letting `start + len <= self.len` discharge the obligation.
+    /// Every tagged load of `(root, field)` holds the field's one value (see
+    /// [`SepEngine::field_loads`]), so the first one names it.
     field_load_var: FxHashMap<(usize, usize), Formula>,
+    /// The base locals a backing field load may be tagged from, each mapped to
+    /// its value identity: a local whose backing struct's pointer and length
+    /// fields hold ONE value for the whole body, and a single-assignment copy (or
+    /// shared reborrow) of a shared reference maps to the reference it copies.
+    /// Built by [`SepEngine::with_backing_value_identity`]; empty ⇒ no field load
+    /// is tagged, so every backing row stays fail-closed.
+    backing_value_roots: FxHashMap<usize, usize>,
+    /// The locals that may hold a backing field-load tag: one value for the whole
+    /// body ([`crate::local_defs::body_is_single_static_assignment`]), so the
+    /// walk's tag and the local's NAME denote that one value at every point.
+    backing_single_value_locals: FxHashSet<usize>,
     /// When set, a memory-map call also emits a `VcKind::Temporal` carrying the
     /// sound mmap-truncation `StateMachine`, so `ty` model-checks the temporal
     /// hazard (CATCHES it unless a single-writer invariant holds). Batteries-on
@@ -205,6 +293,66 @@ pub(crate) struct SepEngine {
     /// current block's id — a sound over-approximation of "has a loop"). When true,
     /// NO provenance is stack-good. Precomputed by `with_stack_good_gate`.
     stack_good_has_back_edge: bool,
+    /// Whether [`SepEngine::with_stack_good_gate`] has already computed
+    /// `stack_good_has_back_edge` for this body, allowing
+    /// [`SepEngine::with_loop_carried_locals`] to reuse it without re-scanning
+    /// block terminators.
+    stack_good_gate_computed: bool,
+    /// Trust (2026-10-02, KNOWN_HAZARDS "the 2026-09-25 offset repair proves a
+    /// LOOP-CARRIED pointer's offset row from its first-iteration offset"): locals with
+    /// more than one whole-local definition in a body that has a back edge. The walk is
+    /// one forward pass, so the accumulated offset it holds for such a local is only the
+    /// value of the definition it saw FIRST; a later iteration's value never reaches it.
+    /// `interpret_ptr_offset` takes no walk offset for a source in this set. Empty
+    /// (no effect) unless `with_loop_carried_locals` ran.
+    loop_carried_locals: FxHashSet<usize>,
+    /// Trust (box-deref false refutation, 2026-09-23): the statement OPERATIONS
+    /// `(block, statement index)` that dereference a VALIDITY-ROOTED `Box` through
+    /// the raw-pointer temp rustc's `ElaborateBoxDerefs` mints for a SAFE `*box`,
+    /// each mapped to that temp local. Computed by
+    /// [`validity_rooted_box_deref_ops`] as the intersection of the COMPILER's
+    /// `collect_synthesized_box_deref_ops` set with this crate's own root walk, so
+    /// an empty compiler set (every caller that does not thread it) keeps every
+    /// box-deref row exactly as before. Consulted in [`SepEngine::place_has_raw_deref`],
+    /// which treats a deref of that temp AT that operation like a `&T` deref.
+    rooted_box_deref_ops: FxHashMap<(BlockId, usize), Vec<usize>>,
+    /// The statement operation currently being interpreted, set by the driver
+    /// around each `interpret_statement` and cleared for the terminator. `None`
+    /// outside the driver (every direct engine test), which makes
+    /// `rooted_box_deref_ops` inert there.
+    current_stmt_op: Option<(BlockId, usize)>,
+    /// The id of the block currently being interpreted. Set per block by the
+    /// driver (alongside `current_block_reachable`); read by the deallocation
+    /// channel to evaluate its path condition.
+    current_block: usize,
+    /// Trust (G1, 2026-10-27): the documented-return-contract facts of the body's
+    /// pointer-returning libc calls (`ffi_pointer_contract::PointerFacts`), read by
+    /// [`SepEngine::discharge_ffi_contract`]. `None` when the body has no
+    /// contract-rooted local, and in every direct engine test.
+    ffi_pointer_facts: Option<crate::ffi_pointer_contract::PointerFacts>,
+    /// `dominators[b]` — every block that dominates `b`, `b` included. Computed
+    /// once per body by [`block_dominators`] over the IR's normal successor
+    /// edges. EMPTY when the CFG could not be read; every consumer then reads
+    /// "no domination known" and makes no claim.
+    dominators: FxHashMap<usize, FxHashSet<usize>>,
+    /// Blocks in which each provenance was freed by an explicit global
+    /// deallocator call. A second free — and a use — is charged only from a
+    /// block one of those frees DOMINATES, which is exactly the condition under
+    /// which the violation holds on EVERY execution (see
+    /// [`SepEngine::interpret_global_dealloc`]).
+    dealloc_sites: FxHashMap<ProvenanceId, Vec<usize>>,
+    /// Trust (2026-10-09): the blocks each `Drop` block REACHES along normal
+    /// edges (the drop's own block only through a cycle), keyed by the drop's
+    /// block. When present, a `Drop` free is recorded in `drop_sites` and made
+    /// visible on entry to exactly the blocks its site reaches: a free can
+    /// precede an access only if its block reaches the access's. The walk
+    /// visits blocks in INDEX order, and rustc's debug UB-check blocks put
+    /// `let b = Box::new(v); *b`'s read in a higher-numbered block than the
+    /// box's `Drop`, so the sticky free charged that correct read with a
+    /// definite use-after-free. `None` (an unreadable CFG) keeps the sticky free.
+    drop_reach: Option<FxHashMap<usize, FxHashSet<usize>>>,
+    /// The blocks of the `Drop`s that freed each provenance (see `drop_reach`).
+    drop_sites: FxHashMap<ProvenanceId, Vec<usize>>,
 }
 
 impl SepEngine {
@@ -215,6 +363,7 @@ impl SepEngine {
             heap: SymbolicHeap::new(&crate::separation_logic::generated_symbol("heap")),
             local_to_ptr: FxHashMap::default(),
             local_tys: Vec::new(),
+            elem_sizes: None,
             local_names: Vec::new(),
             vcs: Vec::new(),
             func_name: func_name.to_string(),
@@ -222,11 +371,22 @@ impl SepEngine {
             concrete_sizes: FxHashMap::default(),
             symbolic_sizes: FxHashMap::default(),
             pointer_offsets: FxHashMap::default(),
+            next_offset_identity: 0,
+            next_pointer_identity: 0,
+            offset_may_follow_free: FxHashSet::default(),
             const_locals: FxHashMap::default(),
             layout_sizes: FxHashMap::default(),
+            current_block: 0,
+            ffi_pointer_facts: None,
+            dominators: FxHashMap::default(),
+            dealloc_sites: FxHashMap::default(),
+            drop_reach: None,
+            drop_sites: FxHashMap::default(),
             field_backing: Vec::new(),
             field_loads: FxHashMap::default(),
             field_load_var: FxHashMap::default(),
+            backing_value_roots: FxHashMap::default(),
+            backing_single_value_locals: FxHashSet::default(),
             emit_temporal_mmap: false,
             temporal_single_writer: false,
             backing_certified: false,
@@ -238,7 +398,22 @@ impl SepEngine {
             stack_good_local: FxHashMap::default(),
             locals_with_storage_dead: FxHashSet::default(),
             stack_good_has_back_edge: false,
+            stack_good_gate_computed: false,
+            loop_carried_locals: FxHashSet::default(),
+            rooted_box_deref_ops: FxHashMap::default(),
+            current_stmt_op: None,
         }
+    }
+
+    /// Declare the validity-rooted synthesized box-deref operations. See
+    /// [`SepEngine::rooted_box_deref_ops`] and [`validity_rooted_box_deref_ops`].
+    #[must_use]
+    pub(crate) fn with_rooted_box_deref_ops(
+        mut self,
+        ops: FxHashMap<(BlockId, usize), Vec<usize>>,
+    ) -> Self {
+        self.rooted_box_deref_ops = ops;
+        self
     }
 
     /// Precompute the whole-program STACK-GOOD gate from the function body: the set
@@ -260,13 +435,39 @@ impl SepEngine {
             // A successor with id <= this block's id is a back-edge (loop). An
             // unreadable (#[non_exhaustive]) terminator is treated as a back-edge —
             // fail closed (no stack-good discharge anywhere in the function).
-            match terminator_successors(&block.terminator) {
-                Some(succs) if succs.iter().all(|&s| s > block.id.0) => {}
-                _ => has_back_edge = true,
+            if all_terminator_successors(&block.terminator, |s| s > block.id.0) != Some(true) {
+                has_back_edge = true;
             }
         }
         self.locals_with_storage_dead = storage_dead;
         self.stack_good_has_back_edge = has_back_edge;
+        self.stack_good_gate_computed = true;
+        self
+    }
+
+    /// Compute [`SepEngine::loop_carried_locals`]: when any block has a back edge (a
+    /// successor whose id is not greater than its own, or an unreadable terminator),
+    /// every local that is not single-static-assignment by the `local_defs` seam
+    /// ([`crate::local_defs::body_is_single_static_assignment`]). That counts a
+    /// PARAMETER's entry definition (`fn f(mut p: *const u8)` reassigned once in a loop
+    /// has two values), and disqualifies partial writes, mutable aliases and
+    /// unlocatable writes. Conservative: it does not ask whether the definitions are
+    /// actually inside the loop.
+    #[must_use]
+    pub(crate) fn with_loop_carried_locals(mut self, body: &trust_types::VerifiableBody) -> Self {
+        let has_back_edge = if self.stack_good_gate_computed {
+            self.stack_good_has_back_edge
+        } else {
+            body.blocks.iter().any(|block| {
+                all_terminator_successors(&block.terminator, |s| s > block.id.0) != Some(true)
+            })
+        };
+        if !has_back_edge {
+            return self;
+        }
+        self.loop_carried_locals = (0..body.locals.len())
+            .filter(|&local| !crate::local_defs::body_is_single_static_assignment(body, local))
+            .collect();
         self
     }
 
@@ -284,6 +485,15 @@ impl SepEngine {
     /// shape). See [`SepEngine::call_arg_confined_addr_of`] and
     /// [`call_arg_confined_addr_of_locals`].
     #[must_use]
+    /// Install the body's FFI pointer-contract facts (see the field).
+    pub(crate) fn with_ffi_pointer_facts(
+        mut self,
+        facts: Option<crate::ffi_pointer_contract::PointerFacts>,
+    ) -> Self {
+        self.ffi_pointer_facts = facts;
+        self
+    }
+
     pub(crate) fn with_call_arg_confined_addr_of(mut self, locals: FxHashSet<usize>) -> Self {
         self.call_arg_confined_addr_of = locals;
         self
@@ -317,6 +527,28 @@ impl SepEngine {
         self
     }
 
+    /// Declare which field loads of `struct_name`'s backing fields may be tagged:
+    /// see [`SepEngine::backing_value_roots`] and [`backing_value_identity`].
+    #[must_use]
+    pub(crate) fn with_backing_value_identity(
+        mut self,
+        func: &VerifiableFunction,
+        struct_name: &str,
+        ptr_field: usize,
+        len_field: usize,
+    ) -> Self {
+        let (roots, single) = backing_value_identity(func, struct_name, ptr_field, len_field);
+        self.backing_value_roots = roots;
+        self.backing_single_value_locals = single;
+        self
+    }
+
+    /// May the write of `local` carry a backing field-load tag? Only a local that
+    /// holds one value for the whole body (see [`SepEngine::field_loads`]).
+    fn may_hold_backing_tag(&self, local: usize) -> bool {
+        self.backing_single_value_locals.contains(&local)
+    }
+
     /// The opaque backing-allocation-size symbol for a backing pointer field,
     /// plus — only when the struct's invariant is interprocedurally CERTIFIED —
     /// the assumption `alloc_size >= self.<len_field>` that a verified establish
@@ -332,6 +564,9 @@ impl SepEngine {
         ptr_field: usize,
         len_field: usize,
     ) -> (Formula, Option<Formula>) {
+        // `base` is the pointer's value identity (`field_loads`), so the symbol
+        // names one struct value's allocation and every length below is a load of
+        // that same value's length field.
         let size = generated_sep_var(format!("backing_alloc_size_{base}_{ptr_field}"), Sort::Int);
         let assumption = if self.backing_certified {
             self.field_load_var
@@ -358,6 +593,38 @@ impl SepEngine {
         }
     }
 
+    /// A pointer value's heap record must outlive every alias of that value.
+    /// Reassigning the MIR local must not overwrite the record saved aliases name.
+    /// Keep first-definition names stable; only a collision needs a fresh suffix.
+    fn fresh_pointer_name(&mut self, base: String) -> String {
+        if self.heap.pointer(&base).is_none() {
+            return base;
+        }
+        loop {
+            let name = format!("{base}_value_{}", self.next_pointer_identity);
+            self.next_pointer_identity = self.next_pointer_identity.checked_add(1)
+                .expect("pointer value identity exhausted");
+            if self.heap.pointer(&name).is_none() {
+                return name;
+            }
+        }
+    }
+
+    /// Storing a pointer in a field/deref/index does not assign its enclosing local.
+    /// Call/source obligations still run; only this value-to-local fact is declined.
+    fn bind_pointer_result(&mut self, dest: &Place, name: String) {
+        if dest.projections.is_empty() {
+            self.local_to_ptr.insert(dest.local, name);
+        }
+    }
+
+    /// `&p` addresses the storage containing a pointer value; `&*p` reborrows
+    /// its pointee. Only the latter may inherit p's value provenance directly.
+    fn whole_pointer_storage(&self, source: &Place) -> bool {
+        source.projections.is_empty()
+            && matches!(self.local_tys.get(source.local), Some(Ty::Ref { .. } | Ty::RawPtr { .. }))
+    }
+
     /// The byte offset-from-base of a pointer operand (0 when untracked / at the
     /// base). Used to make slice/copy bounds obligations offset-aware.
     fn operand_offset(&self, op: &Operand) -> Formula {
@@ -380,12 +647,11 @@ impl SepEngine {
         self
     }
 
-    /// The backing-allocation size of a pointer operand, when the pointer traces
+    /// The backing-allocation size of a pointer local, when the pointer traces
     /// to a tracked concrete allocation: the CONCRETE byte size if known (a fixed
     /// array), else the allocation's symbolic `size_var`. `None` when the pointer
     /// is untracked/unknown (then callers keep the symbolic fail-closed form).
-    fn operand_alloc_size(&self, op: &Operand) -> Option<Formula> {
-        let local = operand_local(op)?;
+    fn local_alloc_size(&self, local: usize) -> Option<Formula> {
         let ptr_name = self.local_to_ptr.get(&local)?;
         let prov = self.heap.pointer(ptr_name).map(|p| p.provenance)?;
         if !prov.is_concrete() {
@@ -400,10 +666,79 @@ impl SepEngine {
         })
     }
 
+    /// The backing-allocation size of a pointer operand, when the pointer traces
+    /// to a tracked concrete allocation: the CONCRETE byte size if known (a fixed
+    /// array), else the allocation's symbolic `size_var`. `None` when the pointer
+    /// is untracked/unknown (then callers keep the symbolic fail-closed form).
+    fn operand_alloc_size(&self, op: &Operand) -> Option<Formula> {
+        operand_local(op).and_then(|local| self.local_alloc_size(local))
+    }
+
+    /// Whether `local`'s type makes it IMPOSSIBLE for it to hold a pointer:
+    /// a `bool`, an integer, a `char`, or a float. Used to stop the abstract
+    /// allocation name (`local_to_ptr`) from being propagated onto a VALUE that
+    /// was merely LOADED THROUGH a pointer.
+    ///
+    /// Why this gate is needed: the `Rvalue::Use` copy-propagation below is
+    /// projection-blind on both sides, so `_3 = copy (*_12)[_2]` — an `f32`
+    /// element read out of a slice — used to bind `_3` to `_12`'s allocation
+    /// name. The very next statement, `_0 = Add(move _3, move _6)` (an ordinary
+    /// `f32 + f32`), then matched the pointer-arithmetic arm and emitted
+    /// `[unsafe:sep:offset] pointer offset out of bounds for `arg_1``, refuting
+    /// a function that contains no unsafe operation at all. The same
+    /// contamination renamed unrelated locals into one provenance and so
+    /// manufactured `[unsafe:sep:free]` double-frees.
+    ///
+    /// SOUNDNESS: this only ever DROPS tracking for a local whose type is a
+    /// scalar — such a local cannot be the base of a pointer offset, cannot be
+    /// dereferenced, and cannot be freed. Anything else (a reference, a raw
+    /// pointer, an ADT, an unmodeled/unknown type) keeps its tracking, so a
+    /// genuine `unsafe` operation still carries its obligation and still fails
+    /// closed. It is a precision fix, never a suppression.
+    fn local_cannot_hold_pointer(&self, local: usize) -> bool {
+        matches!(
+            self.local_tys.get(local),
+            Some(Ty::Bool | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Char | Ty::Float { .. })
+        )
+    }
+
+    /// Install the compiler's current type-bound observations once per pass.
+    fn with_elem_sizes(mut self, func: &VerifiableFunction) -> Self {
+        self.elem_sizes = crate::compiler_elem_size_table(func);
+        self
+    }
+
+    /// An access multiplier needs an exact size, including physical padding.
+    /// Observed conflicts/unknowns cannot fall back to a structural estimate.
+    /// Without an observation, only actual primitive Rust sizes, checked arrays
+    /// and all-zero tuples are modeled. Logical bit-vectors have no Rust layout.
+    fn exact_byte_size(&self, ty: &Ty) -> Option<i128> {
+        if let Some(binding) = &self.elem_sizes {
+            if binding.table.has_record(ty) {
+                return binding.table.exact_size(ty).map(i128::from);
+            }
+        }
+        match ty {
+            Ty::Unit => Some(0),
+            Ty::Bool => Some(1),
+            Ty::Int { width, .. } if matches!(*width, 8 | 16 | 32 | 64 | 128) => {
+                Some(i128::from(*width) / 8)
+            }
+            Ty::Float { width } if matches!(*width, 16 | 32 | 64 | 128) => {
+                Some(i128::from(*width) / 8)
+            }
+            Ty::Array { elem, len } => self.exact_byte_size(elem)?.checked_mul(i128::from(*len)),
+            Ty::Tuple(elems) if elems.iter().all(|elem| self.exact_byte_size(elem) == Some(0)) => {
+                Some(0)
+            }
+            _ => None,
+        }
+    }
+
     /// Byte stride of one element behind a pointer LOCAL: `size_of(pointee)`.
     /// `None` when the pointee type/size is not modeled.
     fn local_pointee_stride(&self, local: usize) -> Option<i128> {
-        self.local_tys.get(local).and_then(|t| t.pointee_ty()).and_then(ty_byte_size)
+        self.local_tys.get(local).and_then(Ty::pointee_ty).and_then(|ty| self.exact_byte_size(ty))
     }
 
     /// The element length of a slice/array RECEIVER operand: the concrete array
@@ -432,12 +767,11 @@ impl SepEngine {
             // arm exactly. SOUNDNESS: the symbol is unconstrained absent a guard, so
             // an UNGUARDED `get_unchecked(i)` still yields SAT `i >= len` and fails
             // closed — this only lets a REAL `i < s.len()` guard connect.
-            let name = self
-                .local_names
-                .get(local)
-                .and_then(Clone::clone)
-                .unwrap_or_else(|| format!("_{local}"));
-            return Formula::Var(format!("{name}__slice_len"), Sort::Int);
+            let var_name = match self.local_names.get(local).and_then(Option::as_deref) {
+                Some(name) => format!("{name}__slice_len"),
+                None => format!("_{local}__slice_len"),
+            };
+            return Formula::Var(var_name, Sort::Int);
         }
         generated_sep_var("container_len_unknown", Sort::Int)
     }
@@ -466,16 +800,15 @@ impl SepEngine {
                 // `X.len()` / `Rvalue::Len`) produces for this receiver, so the byte-length
                 // binding UNIFIES with the caller's length relation. `local_names` mirrors
                 // `place_to_var_name`'s source-name-or-`_{local}` convention.
-                let name = self
-                    .local_names
-                    .get(local)
-                    .and_then(Clone::clone)
-                    .unwrap_or_else(|| format!("_{local}"));
-                (elem.as_ref(), Formula::Var(format!("{name}__slice_len"), Sort::Int))
+                let var_name = match self.local_names.get(local).and_then(Option::as_deref) {
+                    Some(name) => format!("{name}__slice_len"),
+                    None => format!("_{local}__slice_len"),
+                };
+                (elem.as_ref(), Formula::Var(var_name, Sort::Int))
             }
             _ => return None,
         };
-        let stride = ty_byte_size(elem)?;
+        let stride = self.exact_byte_size(elem)?;
         Some(scale_to_bytes(stride, count))
     }
 
@@ -494,6 +827,18 @@ impl SepEngine {
         operand_local(op).and_then(|l| self.local_pointee_stride(l))
     }
 
+    /// Resolve an unprojected local index to the SAME SMT variable name the rest
+    /// of the pipeline uses (`place_to_var_name`): the local's declared name if
+    /// any, else `_N`.
+    fn local_named_formula(&self, local: usize) -> Formula {
+        let name = self
+            .local_names
+            .get(local)
+            .and_then(Clone::clone)
+            .unwrap_or_else(|| format!("_{local}"));
+        Formula::Var(name, Sort::Int)
+    }
+
     /// Resolve a `Copy`/`Move` operand of an unprojected local to the SAME SMT
     /// variable name the rest of the pipeline uses (`place_to_var_name`): the
     /// local's declared name if any, else `_N`. This is what lets a guard/def
@@ -503,21 +848,20 @@ impl SepEngine {
         if let Operand::Copy(p) | Operand::Move(p) = op
             && p.projections.is_empty()
         {
-            let name = self
-                .local_names
-                .get(p.local)
-                .and_then(Clone::clone)
-                .unwrap_or_else(|| format!("_{}", p.local));
-            return Formula::Var(name, Sort::Int);
+            return self.local_named_formula(p.local);
         }
         operand_to_formula_simple(op)
     }
 
-    /// Number of accumulated VCs.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn vc_count(&self) -> usize {
-        self.vcs.len()
+    fn offset_count_formula(&self, op: &Operand) -> Formula {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) if !place.projections.is_empty() => {
+                // A projected value is not its parent local. Keep it opaque
+                // until that projection has an authenticated scalar model.
+                generated_sep_var(format!("offset_count_{}", self.next_offset_identity), Sort::Int)
+            }
+            _ => self.operand_named_formula(op),
+        }
     }
 
     /// Number of accumulated VCs so far (used to attribute VCs to the block
@@ -539,6 +883,10 @@ impl SepEngine {
 
     /// Interpret a MIR statement, updating heap state and emitting VCs.
     pub(crate) fn interpret_statement(&mut self, stmt: &Statement, span: &SourceSpan) {
+        if stmt.contains_memory_image() {
+            self.vcs.push(crate::memory_image_vc_at(&self.func_name, span));
+            return;
+        }
         match stmt {
             Statement::Assign { place, rvalue, span: stmt_span } => {
                 let sp = if stmt_span.line_start > 0 { stmt_span } else { span };
@@ -565,13 +913,16 @@ impl SepEngine {
             //
             // The callee string MUST contain "nonoverlapping" — that substring is
             // what gates the overlap obligation inside `interpret_ptr_copy`.
-            Statement::CopyNonOverlapping { src, dst, count, span: stmt_span, .. } => {
+            Statement::CopyNonOverlapping { src, dst, count, elem_ty, span: stmt_span } => {
                 let sp = if stmt_span.line_start > 0 { stmt_span } else { span };
-                self.interpret_ptr_copy(
-                    &[src.clone(), dst.clone(), count.clone()],
+                self.interpret_ptr_copy_ops(
+                    Some(src),
+                    Some(dst),
+                    Some(count),
                     &Place::local(0),
                     sp,
                     "core::intrinsics::copy_nonoverlapping",
+                    Some(elem_ty),
                 );
             }
             _ => {}
@@ -580,13 +931,32 @@ impl SepEngine {
 
     /// Interpret a MIR terminator, updating heap state and emitting VCs.
     pub(crate) fn interpret_terminator(&mut self, term: &Terminator) {
+        if term.contains_memory_image() {
+            let span = memory_image_terminator_span(term);
+            self.vcs.push(crate::memory_image_vc_at(&self.func_name, &span));
+            return;
+        }
         match term {
             // Pattern 3: Allocation via alloc::alloc, Box::new, Vec::with_capacity, etc.
-            Terminator::Call { func: callee, args, dest, span, .. } => {
-                self.interpret_call(callee, args, dest, span);
+            // THE KEY IS DESTRUCTURED HERE, beside `is_foreign` and for the same
+            // reason: it is a COMPILER-AUTHENTICATED fact about the callee, and
+            // the mint below is entitled to decide on it. `func` continues into
+            // `interpret_call` because the engine still needs the DISPLAY
+            // spelling for obligation text, variable names and the two
+            // deliberately-unanchored suppression predicates — never to select a
+            // contract.
+            Terminator::Call { func: callee, args, dest, span, is_foreign, callee_key, .. } => {
+                self.interpret_call(callee, args, dest, span, *is_foreign, callee_key.as_ref());
             }
-            Terminator::TailCall { func: callee, args, span, .. } => {
-                self.interpret_call(callee, args, &Place::local(0), span);
+            Terminator::TailCall { func: callee, args, span, is_foreign, callee_key, .. } => {
+                self.interpret_call(
+                    callee,
+                    args,
+                    &Place::local(0),
+                    span,
+                    *is_foreign,
+                    callee_key.as_ref(),
+                );
             }
             // Pattern 4: Deallocation via Drop
             Terminator::Drop { place, span, .. } => {
@@ -623,61 +993,41 @@ impl SepEngine {
             // untracked pointer must drop the stale allocation binding.
             self.local_to_ptr.remove(&place.local);
         }
+        // Trust (2026-10-01, raw-store soundness): the SOURCE is evaluated
+        // first, then the STORE — whatever the rvalue is. The rvalue-pattern arms
+        // (raw read, pointer arithmetic, cast, address-of) used to come BEFORE the
+        // raw-write arm in one `match`, so a store through a raw pointer whose
+        // rvalue matched one of them minted NO destination row: on the stage-1
+        // `trustc` of main 8459ba268, `unsafe { *p = x as u32 }` for
+        // `p: *mut u32` kept no `[unsafe:sep:*]` row at all (only the extractor's
+        // two Unknown rows kept it red). And those arms bind `place.local` as if
+        // the whole local were assigned, so a store THROUGH a local
+        // (`(*_t) = copy q as *const U`) re-bound `_t` to `q`'s allocation —
+        // the binding the box-deref freed-check reads. A store THROUGH a local
+        // (`Deref`-first destination) never changes what the local holds, so its
+        // binding is restored after the source, and again after the arms below
+        // (the `Ref` arm binds `place.local` too: `(*_r) = &_x`).
+        let store_through = matches!(place.projections.first(), Some(Projection::Deref));
+        let saved_binding = store_through.then(|| {
+            (
+                self.local_to_ptr.get(&place.local).cloned(),
+                self.field_loads.get(&place.local).copied(),
+            )
+        });
+        let source_handled = self.interpret_source_rvalue(place, rvalue, span);
+        self.restore_store_through_binding(place.local, saved_binding.clone());
+
+        // Pattern 2: Raw pointer deref write — `*ptr = val`. The DESTINATION
+        // half: charged after any source rows above, whatever the source is.
+        if self.place_has_raw_deref(place) {
+            self.interpret_raw_deref_write(place, rvalue, span);
+            return;
+        }
+        if source_handled {
+            return;
+        }
+
         match rvalue {
-            // Pattern 1: Raw pointer deref read — `_x = *ptr`
-            Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
-                if self.place_has_raw_deref(src) =>
-            {
-                self.interpret_raw_deref_read(src, span);
-            }
-            Rvalue::CopyForDeref(src) if self.place_has_raw_deref(src) => {
-                self.interpret_raw_deref_read(src, span);
-            }
-
-            // Pattern 8: Pointer offset via BinaryOp::Add/Sub on pointer locals
-            Rvalue::BinaryOp(trust_types::BinOp::Add | trust_types::BinOp::Sub, lhs_op, rhs_op) => {
-                // Check if LHS is a tracked pointer (pointer arithmetic)
-                if let Operand::Copy(lhs_place) | Operand::Move(lhs_place) = lhs_op
-                    && self.local_to_ptr.contains_key(&lhs_place.local)
-                {
-                    self.interpret_ptr_offset(place, lhs_place, rhs_op, span);
-                }
-            }
-
-            // Pattern 7: Transmute / pointer cast.
-            Rvalue::Cast(operand, _) => {
-                // Transmute VCs are generated by the separation_logic::transmute_vc
-                // path. Here we only thread heap tracking: a pointer cast
-                // (e.g. `&raw const arr as *const u8`, a `PtrToPtr` cast) preserves
-                // provenance, so propagate the source pointer's tracking to the
-                // destination. This is what lets a later `from_raw_parts` recover
-                // the original allocation's size. The guard `local_to_ptr` already
-                // restricts this to pointer sources (an int->ptr cast's source is
-                // not a tracked pointer).
-                if let Operand::Copy(src) | Operand::Move(src) = operand {
-                    if let Some(ptr_name) = self.local_to_ptr.get(&src.local).cloned() {
-                        self.local_to_ptr.insert(place.local, ptr_name);
-                    }
-                    // Carry a backing field-load tag through a pointer cast
-                    // (`self.ptr as *const u8` is `_2 = _3 as *const u8`), so the
-                    // backing-invariant assume still recognizes the slice pointer.
-                    if let Some(&bf) = self.field_loads.get(&src.local) {
-                        self.field_loads.insert(place.local, bf);
-                    }
-                }
-            }
-
-            // Pattern 6: AddressOf (&raw const / &raw mut)
-            Rvalue::AddressOf(mutable, src_place) => {
-                self.interpret_address_of(place, src_place, *mutable, span);
-            }
-
-            // Pattern 2: Raw pointer deref write — `*ptr = val`
-            // This is captured when the destination place has a Deref projection
-            _ if self.place_has_raw_deref(place) => {
-                self.interpret_raw_deref_write(place, rvalue, span);
-            }
-
             // Struct construction `Self { ptr, len, .. }`: ESTABLISH each declared
             // backing-length invariant. For `(ptr_field, len_field)`, the
             // pointer's allocation must be at least `len_field` bytes — otherwise
@@ -687,8 +1037,8 @@ impl SepEngine {
             Rvalue::Aggregate(trust_types::AggregateKind::Adt { .. }, operands)
                 if !self.field_backing.is_empty() =>
             {
-                let backings = self.field_backing.clone();
-                for (ptr_field, len_field) in backings {
+                for idx in 0..self.field_backing.len() {
+                    let (ptr_field, len_field) = self.field_backing[idx];
                     let (Some(ptr_op), Some(len_op)) =
                         (operands.get(ptr_field), operands.get(len_field))
                     else {
@@ -729,24 +1079,65 @@ impl SepEngine {
             // a threaded `Layout` size, so an allocation built from a moved
             // `Layout` (and a guard over a moved `cap`) still connect.
             Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => {
-                if let Some(ptr_name) = self.local_to_ptr.get(&src.local).cloned() {
+                // A pointer VALUE loaded from a container does not inherit the
+                // container's allocation, even when its destination is a raw
+                // pointer. Only whole-local copies preserve that identity.
+                // Trust (box-deref false refutation, 2026-09-23): a read THROUGH a
+                // validity-rooted box temp reaches this arm only because
+                // `place_has_raw_deref` now declines it. The value read is the
+                // box's CONTENTS, not the box pointer, so it must not inherit the
+                // temp's provenance — for a `Box::new` root that provenance is
+                // box-good, and a `*const T` stored in the box would then have its
+                // own later deref discharged as if it pointed at the allocation.
+                // (Before this change no raw-deref read ever got here.)
+                //
+                // Propagate the allocation name only when the DESTINATION can
+                // actually hold a pointer. `_3 = copy (*_12)[_2]` reads an `f32`
+                // out of a slice: the value is not the slice's pointer, and
+                // binding it to that name turned the next `f32 + f32` into
+                // "pointer arithmetic" (see `local_cannot_hold_pointer`).
+                if !self.derefs_rooted_box_temp(src)
+                    && src.projections.is_empty()
+                    && place.projections.is_empty()
+                    && !self.local_cannot_hold_pointer(place.local)
+                    && let Some(ptr_name) = self.local_to_ptr.get(&src.local).cloned()
+                {
                     self.local_to_ptr.insert(place.local, ptr_name);
                 }
                 if place.projections.is_empty() {
-                    if let Some(&n) = self.const_locals.get(&src.local) {
+                    if src.projections.is_empty()
+                        && let Some(&n) = self.const_locals.get(&src.local)
+                    {
                         self.const_locals.insert(place.local, n);
                     }
-                    if let Some(&n) = self.layout_sizes.get(&src.local) {
+                    if src.projections.is_empty()
+                        && let Some(&n) = self.layout_sizes.get(&src.local)
+                    {
                         self.layout_sizes.insert(place.local, n);
                     }
                     // Field load `_x = (*base).field`: remember which struct field
                     // this local holds (for the backing-invariant ASSUME), and the
                     // SAME variable name the guard/length will see for that field.
-                    if let Some(bf) = field_access(src) {
-                        self.field_loads.insert(place.local, bf);
-                        let named = self.operand_named_formula(&Operand::Copy(place.clone()));
-                        self.field_load_var.entry(bf).or_insert(named);
-                    } else if let Some(&bf) = self.field_loads.get(&src.local) {
+                    // Only a one-value local loading from a base whose backing
+                    // fields hold one value (BACKING-FIRST-LOAD-1, `field_loads`).
+                    if let Some((base, field)) = field_access(src) {
+                        if let Some(&root) = self.backing_value_roots.get(&base)
+                            && self.may_hold_backing_tag(place.local)
+                        {
+                            self.field_loads.insert(place.local, (root, field));
+                            let local_names = &self.local_names;
+                            self.field_load_var.entry((root, field)).or_insert_with(|| {
+                                let name = local_names
+                                    .get(place.local)
+                                    .and_then(Clone::clone)
+                                    .unwrap_or_else(|| format!("_{}", place.local));
+                                Formula::Var(name, Sort::Int)
+                            });
+                        }
+                    } else if src.projections.is_empty()
+                        && let Some(&bf) = self.field_loads.get(&src.local)
+                        && self.may_hold_backing_tag(place.local)
+                    {
                         // Propagate a field-load tag through a plain copy `_y = _x`.
                         self.field_loads.insert(place.local, bf);
                     }
@@ -768,16 +1159,189 @@ impl SepEngine {
 
             _ => {}
         }
+        self.restore_store_through_binding(place.local, saved_binding);
+    }
+
+    /// Put back what `local` was bound to before a store THROUGH it (`saved` is
+    /// `None` for any other destination, which is left as the arms bound it).
+    fn restore_store_through_binding(
+        &mut self,
+        local: usize,
+        saved: Option<(Option<String>, Option<(usize, usize)>)>,
+    ) {
+        let Some((ptr, field)) = saved else { return };
+        match ptr {
+            Some(name) => self.local_to_ptr.insert(local, name),
+            None => self.local_to_ptr.remove(&local),
+        };
+        match field {
+            Some(bf) => self.field_loads.insert(local, bf),
+            None => self.field_loads.remove(&local),
+        };
+    }
+
+    /// The rvalue-pattern arms that MINT rows for, or thread provenance from, an
+    /// assignment's SOURCE: a raw-pointer read, pointer arithmetic, a cast, an
+    /// address-of. Returns whether one matched. Split out of
+    /// [`SepEngine::interpret_assign`] (2026-10-01) so a store's destination is
+    /// charged whatever its source is.
+    fn interpret_source_rvalue(
+        &mut self,
+        place: &Place,
+        rvalue: &Rvalue,
+        span: &SourceSpan,
+    ) -> bool {
+        match rvalue {
+            // Pattern 1: Raw pointer deref read — `_x = *ptr`
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                if self.place_has_raw_deref(src) =>
+            {
+                self.interpret_raw_deref_read(src, span);
+            }
+            Rvalue::CopyForDeref(src) if self.place_has_raw_deref(src) => {
+                self.interpret_raw_deref_read(src, span);
+            }
+
+            // Pattern 8: Pointer offset via BinaryOp::Add/Sub on pointer locals
+            Rvalue::BinaryOp(
+                op @ (trust_types::BinOp::Add | trust_types::BinOp::Sub),
+                lhs_op,
+                rhs_op,
+            ) => {
+                // Check if LHS is a tracked pointer (pointer arithmetic)
+                if let Operand::Copy(lhs_place) | Operand::Move(lhs_place) = lhs_op
+                    && self.local_to_ptr.contains_key(&lhs_place.local)
+                {
+                    let offset = if *op == trust_types::BinOp::Sub {
+                        Operand::Symbolic(Formula::Sub(
+                            Box::new(Formula::Int(0)),
+                            Box::new(self.offset_count_formula(rhs_op)),
+                        ))
+                    } else {
+                        rhs_op.clone()
+                    };
+                    self.interpret_ptr_offset(place, lhs_place, &offset, span, true);
+                }
+            }
+
+            // Pattern 7: Transmute / pointer cast.
+            Rvalue::Cast(operand, dst_ty) => {
+                // Transmute VCs are generated by the separation_logic::transmute_vc
+                // path. Here we only thread heap tracking: a pointer cast
+                // (e.g. `&raw const arr as *const u8`, a `PtrToPtr` cast) preserves
+                // provenance, so propagate the source pointer's tracking to the
+                // destination. This is what lets a later `from_raw_parts` recover
+                // the original allocation's size. The guard `local_to_ptr` already
+                // restricts this to pointer sources (an int->ptr cast's source is
+                // not a tracked pointer).
+                //
+                // Trust (cast conflation): only whole-local source/destination
+                // values may transfer identity. Fields and indices, as well as
+                // derefs, load a different pointer value from their holder.
+                // `(*_1).p as *const u32` casts a pointer LOADED
+                // from inside `*_1`, not `_1` itself, so it must not inherit
+                // `_1`'s provenance — it used to, naming a raw field of a `&S`
+                // parameter `arg_1`. Today that only mislabels rows (nothing
+                // discharges on `arg_*`), but any discharge keyed on that
+                // provenance would prove the loaded pointer by the reference's
+                // validity. An untracked destination falls back to the
+                // fail-closed `_{local}.*` rows, which is where it belongs.
+                if let Operand::Copy(src) | Operand::Move(src) = operand {
+                    //
+                    // Same destination-type gate as the `Use` arm: a cast whose
+                    // RESULT is a scalar (`ptr as usize`, `f32 as f64`) does not
+                    // carry the source's allocation identity.
+                    //
+                    // The ONE projected source that IS the holder's own pointer value:
+                    // `ElaborateBoxDerefs`' box temp `_t = (box.0: Unique).0: NonNull as
+                    // *const T` (1.99) / `(box.0: BoxRaw) as *const T` (1.101) of a
+                    // WHOLE-local `Box`, authenticated by TYPE exactly as
+                    // `box_read_cast_base` does. The value read is the box's allocation
+                    // pointer, not a pointer loaded from inside the allocation, so it
+                    // keeps the box's binding (the freed-box use-after-free check and the
+                    // box-deref crediting both read it). Any other projection still
+                    // refuses, as `ac47f0ee00` made it.
+                    let identity_source = src.projections.is_empty()
+                        || (matches!(dst_ty, Ty::RawPtr { .. }) && self.is_box_pointer_read(src));
+                    if identity_source
+                        && place.projections.is_empty()
+                        && !self.local_cannot_hold_pointer(place.local)
+                        && let Some(ptr_name) = self.local_to_ptr.get(&src.local).cloned()
+                    {
+                        self.local_to_ptr.insert(place.local, ptr_name);
+                    }
+                    // Carry a backing field-load tag through a pointer cast
+                    // (`self.ptr as *const u8` is `_2 = _3 as *const u8`), so the
+                    // backing-invariant assume still recognizes the slice pointer.
+                    if src.projections.is_empty()
+                        && let Some(&bf) = self.field_loads.get(&src.local)
+                        && place.projections.is_empty()
+                        && self.may_hold_backing_tag(place.local)
+                    {
+                        self.field_loads.insert(place.local, bf);
+                    }
+                }
+            }
+
+            // Pattern 6: AddressOf (&raw const / &raw mut)
+            Rvalue::AddressOf(mutable, src_place) => {
+                self.interpret_address_of(place, src_place, *mutable, span);
+            }
+
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether `src` reads a WHOLE-local `Box`'s own allocation pointer through the
+    /// box machinery's authenticated sysroot fields: `Box.0: Unique.0: NonNull`
+    /// (two `Field(0)`s) or `Box.0: BoxRaw` (one). The type twin of
+    /// [`box_read_cast_base`], over this engine's declared local types; an
+    /// unresolvable step answers `false` (fail-closed: no binding transfers).
+    fn is_box_pointer_read(&self, src: &Place) -> bool {
+        use std::borrow::Cow;
+        let fields = match src.projections.as_slice() {
+            [Projection::Field(0), Projection::Field(0)] => 2,
+            [Projection::Field(0)] => 1,
+            _ => return false,
+        };
+        let Some(box_ty) = self.local_tys.get(src.local) else { return false };
+        if !adt_is_authenticated_sysroot_struct(box_ty, "::boxed::Box") {
+            return false;
+        }
+        let Some(inner) = crate::step_place_ty_cow(Cow::Borrowed(box_ty), &Projection::Field(0))
+        else {
+            return false;
+        };
+        if fields == 1 {
+            return adt_is_authenticated_sysroot_struct(&inner, "::boxed::BoxRaw");
+        }
+        if !adt_is_authenticated_sysroot_struct(&inner, "::ptr::unique::Unique") {
+            return false;
+        }
+        crate::step_place_ty_cow(inner, &Projection::Field(0))
+            .is_some_and(|nn| adt_is_authenticated_sysroot_struct(&nn, "::ptr::non_null::NonNull"))
     }
 
     fn place_has_raw_deref(&self, place: &Place) -> bool {
+        if !place.projections.iter().any(|proj| matches!(proj, Projection::Deref)) {
+            return false;
+        }
         let Some(mut ty) = self.local_tys.get(place.local).cloned() else {
-            return place.projections.iter().any(|proj| matches!(proj, Projection::Deref));
+            return true;
         };
+        // Trust (box-deref false refutation, 2026-09-23): the FIRST deref of a
+        // validity-rooted box temp at the operation it was nominated for is the
+        // compiler's spelling of a safe `*box`, and a valid `Box<T>` is — like a
+        // `&T` — non-null, aligned and dereferenceable. Walk into the pointee
+        // exactly as the `Ty::Ref` arm does, so no `[unsafe:sep:*]` deref row is
+        // minted for it; a raw pointer reached THROUGH the box still counts.
+        let rooted_box_temp = self.derefs_rooted_box_temp(place);
 
-        for proj in &place.projections {
+        for (index, proj) in place.projections.iter().enumerate() {
             match proj {
                 Projection::Deref => match ty {
+                    Ty::RawPtr { pointee, .. } if index == 0 && rooted_box_temp => ty = *pointee,
                     Ty::RawPtr { .. } => return true,
                     Ty::Ref { inner, .. } => ty = *inner,
                     _ => return false,
@@ -792,6 +1356,32 @@ impl SepEngine {
         }
 
         false
+    }
+
+    /// Does `place` dereference, as its FIRST projection, the validity-rooted box
+    /// temp that [`SepEngine::rooted_box_deref_ops`] nominated for the statement
+    /// operation being interpreted right now?
+    ///
+    /// Keyed on the OPERATION, not only the temp: the compiler nominates the
+    /// rvalue-side reads it collected, and a write through the same temp in any
+    /// OTHER operation (or any use outside the driver, where `current_stmt_op` is
+    /// `None`) keeps its rows. A destination that derefs the same temp inside the
+    /// nominated operation itself is treated alike — a write through a valid,
+    /// borrowck-admitted `Box` is as sound as the read.
+    /// And refused once the temp's tracked allocation has been freed on this
+    /// walk: a `Box::new` root's allocation is tracked by the heap, so a deref
+    /// after its `dealloc` stays the use-after-free finding it is today.
+    fn derefs_rooted_box_temp(&self, place: &Place) -> bool {
+        matches!(place.projections.first(), Some(Projection::Deref))
+            && self
+                .current_stmt_op
+                .and_then(|op| self.rooted_box_deref_ops.get(&op))
+                .is_some_and(|temps| temps.contains(&place.local))
+            && !self
+                .local_to_ptr
+                .get(&place.local)
+                .and_then(|name| self.heap.pointer(name))
+                .is_some_and(|ptr| self.heap.is_freed(ptr.provenance))
     }
 
     /// Pattern 1: Raw pointer dereference read.
@@ -814,6 +1404,7 @@ impl SepEngine {
         };
         self.discharge_box_good(&ptr_name, &mut vcs);
         self.discharge_stack_good(&ptr_name, src.local, &mut vcs);
+        self.discharge_ffi_contract(&ptr_name, src, &mut vcs);
         self.vcs.extend(vcs);
     }
 
@@ -841,11 +1432,13 @@ impl SepEngine {
             );
             self.discharge_box_good(&ptr_name, &mut vcs);
             self.discharge_stack_good(&ptr_name, dest.local, &mut vcs);
+            self.discharge_ffi_contract(&ptr_name, dest, &mut vcs);
             self.vcs.extend(vcs);
         } else {
             let mut write_vcs = write_vcs;
             self.discharge_box_good(&ptr_name, &mut write_vcs);
             self.discharge_stack_good(&ptr_name, dest.local, &mut write_vcs);
+            self.discharge_ffi_contract(&ptr_name, dest, &mut write_vcs);
             self.vcs.extend(write_vcs);
 
             // Update heap cell if pointer is tracked
@@ -918,6 +1511,138 @@ impl SepEngine {
         }
     }
 
+    /// Trust (G1, 2026-10-27): discharge the deref rows of a place `*L…` whose pointer
+    /// `L` is a CONTRACT-ROOTED local — the single, never-borrowed result of a call to a
+    /// pointer-returning libc symbol with a documented contract
+    /// (`ffi_pointer_contract::POINTER_RETURN_CONTRACTS`) — from that contract and the
+    /// dominance facts of the current block (`ffi_pointer_contract::PointerFacts`).
+    ///
+    /// Only for a place whose ONLY `Deref` is its first projection (every row is about
+    /// `L`'s own pointee) and whose pointer name is `L`'s untracked `_L.*` (no heap
+    /// binding re-routes it). Per row, the same shapes as
+    /// [`SepEngine::discharge_box_good`] / [`SepEngine::discharge_stack_good`]:
+    /// * null check: conjoin `ptr != 0` when the contract never returns null, or a
+    ///   dominating `is_null`-false edge / passed rustc `CheckNull` assert says so;
+    /// * alignment: conjoin `align == R ∧ ptr % R == 0`, `R` the required alignment
+    ///   (a dominating passed `CheckAlignment` assert's constant, which rustc computes
+    ///   as `align_of` of `L`'s pointee, else the scalar pointee's alignment), when the
+    ///   known alignment (that assert, or the contract's guarantee) is at least `R`;
+    /// * allocation validity: DROPPED when the pointer is non-null here and the
+    ///   contract's validity window holds here (the array-`Select` violation is not
+    ///   congruence-closed, the reason box-good drops it);
+    /// * write permission: conjoin `writable` when the contract lets the caller write.
+    ///
+    /// Anything else, or any missing fact, leaves the row exactly as minted.
+    fn discharge_ffi_contract(
+        &self,
+        ptr_name: &str,
+        place: &Place,
+        vcs: &mut Vec<VerificationCondition>,
+    ) {
+        let Some(facts) = self.ffi_pointer_facts.as_ref() else {
+            return;
+        };
+        let local = place.local;
+        let single_leading_deref = matches!(place.projections.first(), Some(Projection::Deref))
+            && place.projections.iter().filter(|p| matches!(p, Projection::Deref)).count() == 1;
+        let matches_ptr_name = ptr_name
+            .strip_prefix('_')
+            .and_then(|s| s.strip_suffix(".*"))
+            .is_some_and(|s| (s == "0" || !s.starts_with('0')) && s.parse::<usize>().ok() == Some(local));
+        if !single_leading_deref || !matches_ptr_name {
+            return;
+        }
+        let block = self.current_block;
+        let Some(contract) = facts.contract_at(block, local) else {
+            return;
+        };
+        // Only the contract or the program's own `is_null` test: a dereference that
+        // only rustc's `CheckNull` guards keeps its refuted null row.
+        let nonnull = facts.tested_nonnull_at(block, local);
+        let pointee = self.local_tys.get(local).and_then(|t| t.pointee_ty());
+        let required_align =
+            facts.asserted_align_at(block, local).or_else(|| pointee.and_then(ty_byte_align));
+        // No pointer width here: a contract whose guarantee depends on it (`CStruct`)
+        // contributes nothing, and only a dominating assert can align such a pointer.
+        let known_align = facts.known_align_at(block, local, None);
+        if nonnull && facts.valid_at(block, local) {
+            vcs.retain(|vc| {
+                !matches!(&vc.kind, VcKind::Assertion { message }
+                    if message.contains("allocation validity"))
+            });
+        }
+        // The alignment the facts establish, when it meets the deref's requirement.
+        let established_align = match (known_align, required_align) {
+            (Some(k), Some(req)) if req > 0 && req & (req - 1) == 0 && k >= req => Some(req),
+            _ => None,
+        };
+        let align_syms = established_align.map(|req| {
+            (
+                req,
+                generated_sep_var(format!("ptr_{ptr_name}"), Sort::Int),
+                generated_sep_var(format!("align_{ptr_name}"), Sort::Int),
+            )
+        });
+        if let Some((_, ref ptr, ref align_var)) = align_syms {
+            // The row `vc_gen::raw_deref_vc` mints is `align > 0 ∧ ptr % align ≠ 0` over a
+            // SYMBOLIC `align`. For exactly that shape the facts refute it: with `align`
+            // the required alignment `req` (the substitution `vc_gen`'s FIXME describes)
+            // it reads `req > 0 ∧ ptr % req ≠ 0`, and the facts give `ptr % req == 0`.
+            // DROP it, as the allocation row above and `discharge_box_good` /
+            // `discharge_stack_good` drop theirs, because neither discharged spelling can
+            // carry a proof: the spelled-out contradiction `ptr % req == 0 ∧ req > 0 ∧
+            // ¬(ptr % req == 0)` was left `unknown` by ay-in-process (`incomplete`, 205
+            // conflicts, 45 s) once the block's bit-vector address guard was conjoined,
+            // and a literal `false` row earns no proof authority by design (trust-certify
+            // declines a bare `false` as a producer placeholder; measured 2026-10-27 on
+            // the compiler path: "solver reported Proved without exact kernel/native
+            // proof authority"). Any other alignment row shape gets the conjunction
+            // below and is decided by the solver.
+            let minted = Formula::And(vec![
+                Formula::Gt(Box::new(align_var.clone()), Box::new(Formula::Int(0))),
+                Formula::Not(Box::new(Formula::Eq(
+                    Box::new(Formula::Rem(Box::new(ptr.clone()), Box::new(align_var.clone()))),
+                    Box::new(Formula::Int(0)),
+                ))),
+            ]);
+            vcs.retain(|vc| {
+                !(matches!(&vc.kind, VcKind::Assertion { message } if message.contains("alignment"))
+                    && vc.formula == minted)
+            });
+        }
+        for vc in vcs.iter_mut() {
+            let VcKind::Assertion { message } = &vc.kind else {
+                continue;
+            };
+            let fact = if message.contains("null check") {
+                nonnull.then(|| box_alloc_nonnull_fact(ptr_name))
+            } else if message.contains("alignment") {
+                align_syms.as_ref().map(|(req, ptr, align_var)| {
+                    Formula::And(vec![
+                        Formula::Eq(Box::new(align_var.clone()), Box::new(Formula::Int(*req))),
+                        Formula::Eq(
+                            Box::new(Formula::Rem(
+                                Box::new(ptr.clone()),
+                                Box::new(Formula::Int(*req)),
+                            )),
+                            Box::new(Formula::Int(0)),
+                        ),
+                    ])
+                })
+            } else if message.contains("write permission") {
+                contract
+                    .writable
+                    .then(|| generated_sep_var(format!("writable_{ptr_name}"), Sort::Bool))
+            } else {
+                None
+            };
+            if let Some(fact) = fact {
+                let violation = std::mem::replace(&mut vc.formula, Formula::Bool(true));
+                vc.formula = Formula::And(vec![fact, violation]);
+            }
+        }
+    }
+
     /// Record provenance `prov` (a `&local`/`&raw local` of `backing_local`) as
     /// STACK-GOOD when the whole-program gate permits: the backing local never has
     /// its storage ended AND the function has no back-edge. See
@@ -978,10 +1703,6 @@ impl SepEngine {
         let required_align =
             self.local_tys.get(deref_local).and_then(|t| t.pointee_ty()).and_then(ty_byte_align);
 
-        let ptr = generated_sep_var(format!("ptr_{ptr_name}"), Sort::Int);
-        let base = Formula::Var(prov.base_var(), Sort::Int);
-        let size = Formula::Var(prov.size_var(), Sort::Int);
-
         // DROP allocation-validity (the live local is allocated; its array-`Select`
         // violation is not congruence-closed — same as box-good).
         vcs.retain(|vc| {
@@ -999,9 +1720,12 @@ impl SepEngine {
                 // At offset 0: addr == base, and the allocation is exactly `size_k`
                 // bytes — so `base <= addr < base + size_k` holds, refuting the
                 // `Not(in_bounds)` violation.
+                let ptr = generated_sep_var(format!("ptr_{ptr_name}"), Sort::Int);
+                let base = Formula::Var(prov.base_var(), Sort::Int);
+                let size = Formula::Var(prov.size_var(), Sort::Int);
                 Some(Formula::And(vec![
-                    Formula::Eq(Box::new(ptr.clone()), Box::new(base.clone())),
-                    Formula::Eq(Box::new(size.clone()), Box::new(Formula::Int(size_k))),
+                    Formula::Eq(Box::new(ptr), Box::new(base)),
+                    Formula::Eq(Box::new(size), Box::new(Formula::Int(size_k))),
                 ]))
             } else if message.contains("alignment") {
                 // Discharge alignment only when the backing local's alignment meets
@@ -1010,19 +1734,22 @@ impl SepEngine {
                 // the symbolic `align_` divisor to `required` and assert the address
                 // is `required`-aligned, refuting `ptr % align != 0`.
                 match (backing_align, required_align) {
-                    (Some(k), Some(req)) if req > 0 && k >= req => Some(Formula::And(vec![
-                        Formula::Eq(
-                            Box::new(generated_sep_var(format!("align_{ptr_name}"), Sort::Int)),
-                            Box::new(Formula::Int(req)),
-                        ),
-                        Formula::Eq(
-                            Box::new(Formula::Rem(
-                                Box::new(ptr.clone()),
+                    (Some(k), Some(req)) if req > 0 && k >= req => {
+                        let ptr = generated_sep_var(format!("ptr_{ptr_name}"), Sort::Int);
+                        Some(Formula::And(vec![
+                            Formula::Eq(
+                                Box::new(generated_sep_var(format!("align_{ptr_name}"), Sort::Int)),
                                 Box::new(Formula::Int(req)),
-                            )),
-                            Box::new(Formula::Int(0)),
-                        ),
-                    ])),
+                            ),
+                            Formula::Eq(
+                                Box::new(Formula::Rem(
+                                    Box::new(ptr),
+                                    Box::new(Formula::Int(req)),
+                                )),
+                                Box::new(Formula::Int(0)),
+                            ),
+                        ]))
+                    }
                     _ => None,
                 }
             } else {
@@ -1036,13 +1763,33 @@ impl SepEngine {
     }
 
     /// Pattern 3: Allocation (alloc::alloc, Box::new, Vec::with_capacity, etc.).
-    fn interpret_call(&mut self, callee: &str, args: &[Operand], dest: &Place, span: &SourceSpan) {
-        let lower = callee.to_lowercase();
-
-        if is_external_map_call(&lower) {
+    ///
+    /// `is_foreign` is the extractor's copy of `tcx.is_foreign_item` for this
+    /// call — a COMPILER-DERIVED identity fact no crate can forge by naming, as
+    /// distinct from the callee path, which is only a string. Used by
+    /// [`SepEngine::interpret_external_map`] to authorise the one size FACT the
+    /// engine fabricates from a third-party callee.
+    fn interpret_call(
+        &mut self,
+        callee: &str,
+        args: &[Operand],
+        dest: &Place,
+        span: &SourceSpan,
+        is_foreign: bool,
+        key: Option<&CalleeKey>,
+    ) {
+        if callee.as_bytes().windows(3).any(|w| w.eq_ignore_ascii_case(b"map")) && {
+            let lower: std::borrow::Cow<'_, str> = if callee.bytes().any(|b| b.is_ascii_uppercase())
+            {
+                std::borrow::Cow::Owned(callee.to_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(callee)
+            };
+            is_external_map_call(&lower)
+        } {
             // Memory map of an externally-mutable region (file/shared object).
-            self.interpret_external_map(args, dest, span, callee);
-        } else if is_container_as_ptr_call(&lower) {
+            self.interpret_external_map(args, dest, span, callee, is_foreign);
+        } else if is_container_as_ptr_call(key) {
             // `<[T]>::as_ptr` / `as_mut_ptr` / array `as_ptr`: the returned raw
             // pointer aliases the receiver's buffer, so it has the SAME
             // provenance (and offset). Propagate tracking — otherwise a pointer
@@ -1051,7 +1798,7 @@ impl SepEngine {
             if let Some(recv) = args.first().and_then(operand_local)
                 && let Some(ptr_name) = self.local_to_ptr.get(&recv).cloned()
             {
-                self.local_to_ptr.insert(dest.local, ptr_name.clone());
+                self.bind_pointer_result(dest, ptr_name.clone());
                 // SOUND provenance-size fact for an OFFSET-0 container `as_ptr()`:
                 // `X.as_ptr()` returns a pointer to the BASE of `X`'s backing allocation,
                 // whose byte size is exactly `size_of_val(X) = elem_stride * len(X)`. Bind
@@ -1072,7 +1819,7 @@ impl SepEngine {
                     self.symbolic_sizes.insert(prov, byte_len);
                 }
             }
-        } else if is_ptr_cast_call(&lower) {
+        } else if is_ptr_cast_call(key) {
             // `<*mut T>::cast::<U>()` / `cast_mut` / `cast_const`: a pointee-type
             // cast that PRESERVES the address and provenance, exactly like an `as`
             // pointer cast — only the pointee type changes. The real aterm
@@ -1084,31 +1831,54 @@ impl SepEngine {
             // pointer name) from the receiver — mirrors the `Rvalue::Cast` arm.
             if let Some(recv) = args.first().and_then(operand_local) {
                 if let Some(ptr_name) = self.local_to_ptr.get(&recv).cloned() {
-                    self.local_to_ptr.insert(dest.local, ptr_name);
+                    self.bind_pointer_result(dest, ptr_name);
                 }
-                if let Some(&bf) = self.field_loads.get(&recv) {
+                if let Some(&bf) = self.field_loads.get(&recv)
+                    && dest.projections.is_empty()
+                    && self.may_hold_backing_tag(dest.local)
+                {
                     self.field_loads.insert(dest.local, bf);
                 }
             }
-        } else if is_layout_size_call(&lower) {
+        } else if is_layout_size_call(key) {
             // `Layout::from_size_align[_unchecked](size, align)`: when `size`
             // resolves to a literal, record the layout's concrete byte size so
             // the allocation built from it carries that size.
-            if let Some(size_op) = args.first()
+            if dest.projections.is_empty()
+                && let Some(size_op) = args.first()
                 && let Some(n) = self.operand_const_int(size_op)
             {
                 self.layout_sizes.insert(dest.local, n);
             }
-        } else if is_layout_passthrough_call(&lower) {
+        } else if is_layout_size_passthrough_call(key) {
             // `Result/Option::unwrap`/`expect` over a tracked `Layout`: thread
             // its size through (no-op for any unwrap whose source is untracked).
-            // CRATE-ANCHORED: only a genuine sysroot-rooted unwrap/expect
-            // (`core::result::Result::<Layout, _>::unwrap`) may RELOCATE the tracked
-            // size — a forged / orphan-trait `unwrap` on a `Layout` must not move the
-            // size fact onto an unrelated `dest` (which a later alloc would size,
-            // FALSELY discharging its from_raw_parts bound). The threaded value is a
-            // now-anchored genuine `is_layout_size_call` size; fail-closed on a miss.
-            if callee_is_std_crate_rooted(&lower)
+            //
+            // EXACT SYSROOT SPELLINGS (2026-09-20, [`LAYOUT_PASSTHROUGH_ITEMS`]).
+            // This is a FACT RELOCATION, not a suppression: the size it moves becomes
+            // `concrete_sizes[prov]` for an allocation built from the layout, which a
+            // later `from_raw_parts(p, n)` bound discharges against — so an over-stated
+            // size here is a FALSE OOB PROOF. Two things were wrong with the arm's
+            // selector as an authorisation:
+            //   * the selector `is_layout_passthrough_call` is a bare substring
+            //     (`::unwrap`), which a user `mycrate::Thing::unwrap` matches. MEASURED
+            //     on the seal (`$TMPDIR/rc4/layoutuser.rs`, `trustc ff538f905`): the
+            //     pre-existing `callee_is_std_crate_rooted` guard ALREADY refused it —
+            //     the user lane's `from_raw_parts` row is `unknown`, the genuine
+            //     `Layout::from_size_align(4096, 1).unwrap()` control is `proved`. That
+            //     hypothesis is REFUTED; the guard held.
+            //   * the guard itself was only a crate ROOT, and `::unwrap` also matches
+            //     SYSROOT items that are NOT identity passthroughs of the `Ok`/`Some`
+            //     value. MEASURED on the same seal (`$TMPDIR/rc4/layouthole.rs`):
+            //     `Layout::from_size_align(4096, 3).unwrap_or(one_byte_layout)` is
+            //     `Err` at runtime (3 is not a power of two) and really allocates ONE
+            //     byte, while the arm threaded the tracked 4096 onto it and
+            //     `from_raw_parts(p, 4096)` came back **proved** — a false OOB proof
+            //     with no user crate involved at all.
+            // The six identity passthroughs are named exactly; `unwrap_or`,
+            // `unwrap_or_else`, `unwrap_or_default`, `unwrap_err` and every other
+            // `::unwrap*` sysroot item now thread nothing (fail-closed).
+            if dest.projections.is_empty()
                 && let Some(src) = args.first().and_then(operand_local)
                 && let Some(&n) = self.layout_sizes.get(&src)
             {
@@ -1122,7 +1892,11 @@ impl SepEngine {
             // fail-closed Unknown obligation that NAMES the required invariant — a
             // visible proof gap, never a silent pass. Scoped strictly to the
             // `_unchecked` spelling so ordinary `unwrap`/`expect` stay obligation-free.
-            if lower.contains("unwrap_unchecked") {
+            // CRATE-ANCHORED (2026-09-20): only a genuine sysroot
+            // `core::{option,result}::…::unwrap_unchecked` mints the obligation; a
+            // user `dep::MyOpt::unwrap_unchecked` is NOT charged the receiver-Some
+            // fact (it keeps its fail-closed stand-in).
+            if is_unwrap_unchecked_call(key) {
                 self.vcs.push(VerificationCondition {
                     kind: VcKind::Assertion {
                         message: format!(
@@ -1143,18 +1917,18 @@ impl SepEngine {
                     obligation: None,
                 });
             }
-        } else if is_alloc_call(&lower) {
+        } else if is_alloc_call(key) {
             // Fresh allocation: assign provenance and track pointer
-            let prov = self.heap.allocate(&format!("alloc_{}", dest.local));
-            let ptr_name = format!("alloc_{}", dest.local);
-            self.local_to_ptr.insert(dest.local, ptr_name.clone());
+            let ptr_name = self.fresh_pointer_name(format!("alloc_{}", dest.local));
+            let prov = self.heap.allocate(&ptr_name);
+            self.bind_pointer_result(dest, ptr_name.clone());
 
             // An infallible, type-aligned box allocator (`box_new_uninit`/`Box::new`)
             // never returns null and returns aligned memory; record its provenance so
             // a later deref/write of the boxed pointer discharges null/alloc/align/
             // write-permission via the allocator postcondition (see the deref/write
             // handlers + `box_alloc_postcondition`).
-            let box_good = is_known_good_box_alloc(&lower);
+            let box_good = is_known_good_box_alloc(key);
             if box_good {
                 self.box_good_provs.insert(prov);
             }
@@ -1170,32 +1944,44 @@ impl SepEngine {
                 self.concrete_sizes.insert(prov, n);
             }
 
-            // VC: allocation may fail (null check on result). For a fallible
-            // allocator this is a real fail-closed obligation; for an infallible box
-            // allocator the result is non-null by the allocator's abort-on-OOM
-            // contract, so conjoin that genuine fact onto the violation, making
-            // `ptr != 0 ∧ ptr == 0` UNSAT (proved, non-vacuously — arithmetic atoms).
-            let null_violation = Formula::Eq(
-                Box::new(generated_sep_var(format!("ptr_{ptr_name}"), Sort::Int)),
-                Box::new(Formula::Int(0)),
-            );
-            self.vcs.push(VerificationCondition {
-                kind: VcKind::Assertion {
-                    message: format!(
-                        "[unsafe:sep:alloc] allocation result null check for {} in {}",
-                        callee, self.func_name,
+            // VC: allocation may fail (null check on result) — for a FALLIBLE
+            // allocator only, where it is a real fail-closed obligation.
+            //
+            // Trust (2026-09-29): an infallible box allocator (`Box::new`,
+            // `Box::new_uninit`) mints NO row. Its result is non-null by the
+            // allocator's abort-on-OOM contract (`handle_alloc_error`; docs/TCB.md,
+            // "Allocation failure is an abort, not a panic"), and the row it used to
+            // mint — `ptr != 0 ∧ ptr == 0`, the premise conjoined onto its own
+            // negation — could only RESTATE that premise: a "proof" of it is a
+            // tautology and adds no evidence. It also did harm. It carries the
+            // `[unsafe` marker, so it was a `hardened_unsafe_operation` demand
+            // charged to SAFE code (`Box::new` needs no `unsafe`), and when the
+            // function's verification budget ran out before the solver reached it
+            // the compiler's `refute_unsafe_demand_findings` forced it FAILED:
+            // measured on trust-ir-giveback (`#![forbid(unsafe_code)]`), 8
+            // `[unsafe:sep:alloc]` refutations at `time_ms: 3000` on the installed
+            // `321aaeda7` (2026-09-29). The premise itself is still USED — the
+            // provenance above is in `box_good_provs`, and every later deref/write of
+            // the box discharges its null/validity/alignment rows against it
+            // (`discharge_box_good`) — it is simply not re-minted as a demand.
+            if !box_good {
+                self.vcs.push(VerificationCondition {
+                    kind: VcKind::Assertion {
+                        message: format!(
+                            "[unsafe:sep:alloc] allocation result null check for {} in {}",
+                            callee, self.func_name,
+                        ),
+                    },
+                    function: self.func_name.clone().into(),
+                    location: span.clone(),
+                    formula: Formula::Eq(
+                        Box::new(generated_sep_var(format!("ptr_{ptr_name}"), Sort::Int)),
+                        Box::new(Formula::Int(0)),
                     ),
-                },
-                function: self.func_name.clone().into(),
-                location: span.clone(),
-                formula: if box_good {
-                    Formula::And(vec![box_alloc_nonnull_fact(&ptr_name), null_violation])
-                } else {
-                    null_violation
-                },
-                contract_metadata: None,
-                obligation: None,
-            });
+                    contract_metadata: None,
+                    obligation: None,
+                });
+            }
 
             // VC: allocation size must be positive. SKIP for an infallible box
             // allocator: its size is the boxed type's compile-time layout size (the
@@ -1220,23 +2006,37 @@ impl SepEngine {
                     obligation: None,
                 });
             }
-        } else if is_dealloc_call(&lower) {
+        } else if is_global_dealloc_call(key) {
+            // The global deallocator free fn, `alloc::alloc::dealloc(ptr, layout)`.
+            // Its freed allocation is its FIRST ARGUMENT; the destination-keyed
+            // `interpret_dealloc_call` below reads the `()` result temporary and
+            // so could never free anything for it (measured 2026-09-20 — see
+            // tests/sep_double_free.rs).
+            self.interpret_global_dealloc(args.first(), span, callee);
+        } else if is_dealloc_call(key) {
             // Deallocation via explicit dealloc call
             self.interpret_dealloc_call(dest, span, callee);
-        } else if is_realloc_call(&lower) {
+        } else if is_realloc_call(key) {
             // Pattern 8 variant: realloc
             self.interpret_realloc(dest, span, callee);
-        } else if is_ptr_offset_call(&lower) {
+        } else if is_ptr_offset_call(key) {
             // `ptr.add(n)` / `ptr.offset(n)` lower to a CALL (not a BinaryOp), so
             // route it through the offset interpreter to keep the result pointer's
             // provenance and accumulate its byte offset — otherwise a later
             // `from_raw_parts` over the offset pointer loses its tracked size.
+            //
+            // `wrapping_add`/`wrapping_offset` are SAFE: computing an
+            // out-of-allocation pointer with them is defined, so they mint no
+            // in-bounds row (they are tracked all the same — a later deref or
+            // `from_raw_parts` is checked against the accumulated offset).
             if let (Some(src_op), Some(off_op)) = (args.first(), args.get(1))
-                && let Some(src_local) = operand_local(src_op)
+                && let Operand::Copy(src_place) | Operand::Move(src_place) = src_op
             {
-                self.interpret_ptr_offset(dest, &Place::local(src_local), off_op, span);
+                let in_bounds_required =
+                    !callee_is_sysroot_item_tag(key, PTR_WRAPPING_OFFSET_ITEMS);
+                self.interpret_ptr_offset(dest, src_place, off_op, span, in_bounds_required);
             }
-        } else if is_nonzero_new_unchecked_call(&lower) {
+        } else if is_nonzero_new_unchecked_call(key) {
             // `NonZero*::new_unchecked(x)` / `NonNull::new_unchecked(p)`: it is UB
             // for the argument to be zero (the niche the `NonZero`/`NonNull`
             // invariant forbids). This precondition IS arithmetic, so MODEL it: the
@@ -1262,7 +2062,7 @@ impl SepEngine {
                     obligation: None,
                 });
             }
-        } else if lower.contains("from_u32_unchecked") {
+        } else if is_char_from_u32_unchecked_call(key) {
             // `char::from_u32_unchecked(x)`: UB unless `x` is a Unicode scalar value
             // — i.e. `x <= 0x10FFFF` AND `x` is NOT a surrogate (`0xD800..=0xDFFF`).
             // Both halves are arithmetic, so MODEL the disjoint violation. A guard
@@ -1292,7 +2092,7 @@ impl SepEngine {
                     obligation: None,
                 });
             }
-        } else if lower.contains("set_len") {
+        } else if is_set_len_call(key) {
             // `Vec::set_len(new_len)` (also `String`/`VecDeque`): the caller asserts
             // `new_len <= capacity` AND that the first `new_len` elements are
             // initialized. MODEL the tractable `new_len <= capacity` half: violation
@@ -1322,7 +2122,7 @@ impl SepEngine {
                     obligation: None,
                 });
             }
-        } else if let Some((tag, condition)) = unsafe_assertion_op(&lower) {
+        } else if let Some((tag, condition)) = unsafe_assertion_op(key) {
             // UB-class ops whose safety condition is NOT arithmetic (valid UTF-8,
             // full initialization). The deref/transmute machinery cannot express
             // these, so emit a fail-closed obligation that NAMES the exact
@@ -1338,15 +2138,15 @@ impl SepEngine {
             // A user `MaybeUninit::assume_init` is NOT this call, so it stays fail-closed.
             let unjustified =
                 generated_sep_var(format!("unsafe_{tag}_unjustified_{}", dest.local), Sort::Bool);
-            // CRATE-ANCHORED: only the genuine std `vec!`-machinery
-            // `std::boxed::box_assume_init_into_vec_unsafe` (crate-rooted, no ` as ` —
-            // extractor fixtures) is discharged. A forged free fn / orphan-trait
-            // `mycrate::…::box_assume_init_into_vec_unsafe` (bare `contains` matched it)
-            // must NOT discharge the `assume_init` obligation — that would falsely prove
-            // a read of uninitialized memory as safe. Fail-closed to the unjustified var.
+            // EXACT SPELLING (a PROOF discharge, 2026-09-20): only the one std
+            // `vec!`-machinery item `alloc::boxed::box_assume_init_into_vec_unsafe`
+            // (real extracted MIR: `…::<u64, 2>` from `vec![1, 2]`) is discharged. A
+            // forged free fn / orphan-trait `mycrate::…::box_assume_init_into_vec_unsafe`
+            // (the bare `contains` once matched it) must NOT discharge the
+            // `assume_init` obligation — that would falsely prove a read of
+            // uninitialized memory as safe. Fail-closed to the unjustified var.
             let formula = if tag == "assume_init"
-                && callee_is_std_crate_rooted(&lower)
-                && lower.contains("box_assume_init_into_vec_unsafe")
+                && callee_is_sysroot_item_tag(key, &[BOX_ASSUME_INIT_INTO_VEC_UNSAFE])
             {
                 // justified ∧ unjustified ⇒ UNSAT (proved). Sound by the std `vec!`
                 // contract (full write precedes); references the real obligation var, so
@@ -1367,18 +2167,19 @@ impl SepEngine {
                 contract_metadata: None,
                 obligation: None,
             });
-        } else if is_raw_read_write_call(&lower) {
+        } else if is_raw_read_write_call(key) {
             // `core::ptr::read(p)` / `write(p, v)` (incl. volatile/unaligned):
             // accessing one element at `p` is UB if it lies outside `p`'s backing
             // allocation. The deref happens INSIDE the std fn, so the Deref-place
             // handling never sees it — this closes that gap. Obligation:
-            // `offset + size_of(T) > alloc_size` (concrete when tracked; symbolic
-            // fail-closed otherwise, so it is always caught).
+            // a nonempty access starts before base OR ends after alloc_size
+            // (concrete when tracked; symbolic fail-closed otherwise).
             if let Some(ptr_op) = args.first() {
                 match (self.operand_alloc_size(ptr_op), self.operand_pointee_stride(ptr_op)) {
                     (Some(size), Some(stride)) => {
                         let offset = self.operand_offset(ptr_op);
-                        let extent = Formula::Add(Box::new(offset), Box::new(Formula::Int(stride)));
+                        let violation =
+                            byte_range_violation(offset, Formula::Int(stride), size, true);
                         self.vcs.push(VerificationCondition {
                             kind: VcKind::CopyBoundsViolation {
                                 callee: callee.to_string(),
@@ -1390,7 +2191,7 @@ impl SepEngine {
                             },
                             function: self.func_name.clone().into(),
                             location: span.clone(),
-                            formula: Formula::Gt(Box::new(extent), Box::new(size)),
+                            formula: violation,
                             contract_metadata: None,
                             obligation: None,
                         });
@@ -1406,7 +2207,7 @@ impl SepEngine {
                     }
                 }
             }
-        } else if is_unchecked_index_call(&lower) {
+        } else if is_unchecked_index_call(key) {
             // `slice.get_unchecked(i)` / `get_unchecked_mut(i)`: the language
             // inserts NO bounds check (it is UB if `i >= len`), so Trust emits the
             // obligation that the index is in bounds. Fail-closed by default; a
@@ -1447,18 +2248,18 @@ impl SepEngine {
                     obligation: None,
                 });
             }
-        } else if lower.contains("ptr::copy") || lower.contains("ptr::copy_nonoverlapping") {
+        } else if is_ptr_copy_call(key) {
             // Pattern 5: ptr::copy / ptr::copy_nonoverlapping
-            self.interpret_ptr_copy(args, dest, span, callee);
-        } else if lower.contains("from_raw_parts")
+            self.interpret_ptr_copy(args, dest, span, callee, None);
+        } else if is_from_raw_parts_call(key)
             && args
                 .first()
                 .zip(args.get(1))
-                .is_some_and(|(p, l)| self.try_backing_from_raw_parts(p, l, callee, span))
+                .is_some_and(|(p, l)| self.try_backing_from_raw_parts(p, l, callee, key, span))
         {
             // Handled by the backing-invariant ASSUME (size modeled as the
             // sibling length field) — see try_backing_from_raw_parts.
-        } else if lower.contains("from_raw_parts") {
+        } else if is_from_raw_parts_call(key) {
             // slice::from_raw_parts(ptr, len): the slice must not claim more than
             // its backing allocation holds.
             //
@@ -1499,14 +2300,15 @@ impl SepEngine {
                     },
                 };
                 // Offset-aware: the slice spans `[ptr+offset, ptr+offset+len)`,
-                // so the in-bounds condition is `offset + len <= size`. Using
+                // so a nonempty range also requires `offset >= 0`. Using
                 // `offset + len` (not just `len`) keeps an offset pointer from
                 // being unsoundly discharged by a `len`-only guard. `offset` is
                 // already in BYTES (scaled at the `.add` in interpret_ptr_offset),
                 // matching the byte-scaled `len` and byte `size`.
                 let offset = self.operand_offset(ptr_op);
-                let extent = Formula::Add(Box::new(offset), Box::new(len));
-                // Violation (prove UNSAT): offset + len > backing allocation size.
+                let violation =
+                    byte_range_violation(offset, len, size, is_borrowed_from_raw_parts_call(key));
+                // Violation: nonempty range starts before base OR ends after allocation.
                 self.vcs.push(VerificationCondition {
                     kind: VcKind::CopyBoundsViolation {
                         callee: callee.to_string(),
@@ -1518,7 +2320,7 @@ impl SepEngine {
                     },
                     function: self.func_name.clone().into(),
                     location: span.clone(),
-                    formula: Formula::Gt(Box::new(extent), Box::new(size)),
+                    formula: violation,
                     contract_metadata: None,
                     obligation: None,
                 });
@@ -1530,7 +2332,7 @@ impl SepEngine {
                     crate::separation_logic::unsafe_fn_call_sep_vc(&self.func_name, callee, span);
                 self.vcs.extend(vcs);
             }
-        } else if lower.contains("mem::transmute") {
+        } else if is_transmute_call(key) {
             // Pattern 7: transmute via call
             let vcs = crate::separation_logic::transmute_vc(&self.func_name, "Src", "Dst", span);
             self.vcs.extend(vcs);
@@ -1539,18 +2341,18 @@ impl SepEngine {
 
     /// Backing-invariant ASSUME for `from_raw_parts(ptr, len)`: when the pointer
     /// traces to a backing pointer field `self.<ptr_field>` (possibly via
-    /// `.add(start)`), model its allocation size as the sibling length field
-    /// `self.<len_field>` — the relational invariant established at construction.
-    /// Emits `offset + stride*len > self.len_field`; a guard `start + len <=
-    /// self.len` then discharges it (and `as_slice`, whose `len` argument IS
-    /// `self.len`, discharges trivially since `self.len > self.len` is UNSAT).
-    /// Returns `true` iff it applied. SOUND because every constructor must prove
-    /// the establish obligation (see the `Aggregate` arm); this is its dual.
+    /// `.add(start)`), use the sibling length field `self.<len_field>` only
+    /// through the optional certified backing-size relation.
+    /// Bounds the range against an opaque allocation size, with the optional
+    /// certified `alloc_size >= self.len_field` premise. A nonempty range must
+    /// also begin at a nonnegative offset; a backing-size certificate cannot
+    /// establish that lower endpoint. Returns `true` iff it applied.
     fn try_backing_from_raw_parts(
         &mut self,
         ptr_op: &Operand,
         len_op: &Operand,
         callee: &str,
+        key: Option<&CalleeKey>,
         span: &SourceSpan,
     ) -> bool {
         if self.field_backing.is_empty() {
@@ -1580,11 +2382,10 @@ impl SepEngine {
         let Some(stride) = self.operand_pointee_stride(ptr_op) else { return false };
         let len = scale_to_bytes(stride, self.operand_named_formula(len_op));
         let offset = self.operand_offset(ptr_op);
-        let extent = Formula::Add(Box::new(offset), Box::new(len));
-        // Violation (prove UNSAT): offset + len > the backing allocation size. A
-        // certificate conjoins `alloc_size >= self.len`, so a guarded access
-        // (`offset + len <= self.len`) discharges it; without one it stays open.
-        let violation = Formula::Gt(Box::new(extent), Box::new(size));
+        // The certificate bounds allocation size, not the pointer's lower
+        // endpoint. Keep both range bounds inside the existing assumption.
+        let violation =
+            byte_range_violation(offset, len, size, is_borrowed_from_raw_parts_call(key));
         let formula = match assumption {
             Some(a) => Formula::And(vec![a, violation]),
             None => violation,
@@ -1624,10 +2425,11 @@ impl SepEngine {
         dest: &Place,
         span: &SourceSpan,
         callee: &str,
+        is_foreign: bool,
     ) {
-        let prov = self.heap.allocate(&format!("map_{}", dest.local));
-        let ptr_name = format!("map_{}", dest.local);
-        self.local_to_ptr.insert(dest.local, ptr_name.clone());
+        let ptr_name = self.fresh_pointer_name(format!("map_{}", dest.local));
+        let prov = self.heap.allocate(&ptr_name);
+        self.bind_pointer_result(dest, ptr_name.clone());
         self.external_allocs.push(prov);
 
         // Bind the mapping's allocation size to its `len` argument. `libc::mmap`
@@ -1642,7 +2444,42 @@ impl SepEngine {
         // receiver at args[0] and NO byte-len at args[1]; binding there would bind
         // the size to an unrelated operand and FALSELY discharge a construction
         // establish as `n < n` (UNSAT). Anything else leaves the size symbolic.
-        if args.len() >= 6 {
+        //
+        // THIS IS THE ONE FACT THE ENGINE FABRICATES FROM A THIRD-PARTY CALLEE,
+        // AND IT BUYS PROOFS (2026-09-20). `args.len() >= 6` alone made the
+        // binding a function of ARITY and a MODULE NAME: MEASURED on the sealed
+        // `trustc 1.99.0-dev (ff538f905 2026-09-19)` (`$TMPDIR/rc4/mapuser.rs`,
+        // two dependency fns identical but for their module name, each returning
+        // a pointer to ONE byte whatever `_len` says) —
+        //   `mapdep::plain::region` -> 7 obligations, 1 proved, 5 failed;
+        //   `mapdep::mmap::region`  -> 8 obligations, 2 proved, 4 failed, and the
+        //   `from_raw_parts(p, 4096)` bound came back PROVED.
+        // Naming a module `mmap` bought that proof. The recognizer is now
+        // crate-root anchored ([`is_external_map_call`]), and the size binding
+        // additionally requires:
+        //   (i)  `is_foreign` — `tcx.is_foreign_item`, a COMPILER fact: the
+        //        genuine `libc::mmap` is an `extern "C"` item (MEASURED:
+        //        `is_foreign: true` in the extracted terminator,
+        //        `$TMPDIR/rc4/mirdump3`), while any Rust `fn mmap` a crate
+        //        defines — including one in a crate built `--crate-name libc` —
+        //        is not; and
+        //   (ii) the exact generic-free, stamp-stripped `libc` mmap spelling
+        //        ([`LIBC_MMAP_SPELLINGS`]) with EXACTLY six arguments, so the
+        //        `len`-at-args[1] claim is the shape it was verified against.
+        // What remains forgeable is declaring `extern "C" { fn mmap(…6 args) }`
+        // in a crate named `libc` — i.e. re-declaring the real `mmap`, for which
+        // this model is correct. That residual is stated, not closed: there is
+        // no authenticated identity for a third-party crate (the extractor's
+        // stamp authenticates only sysroot impersonation and name ambiguity).
+        if is_foreign && args.len() == 6 && {
+            let lower: std::borrow::Cow<'_, str> =
+                if callee.bytes().any(|b| b.is_ascii_uppercase()) || !callee.is_ascii() {
+                    std::borrow::Cow::Owned(callee.to_lowercase())
+                } else {
+                    std::borrow::Cow::Borrowed(callee)
+                };
+            callee_is_posix_mmap(&lower)
+        } {
             self.symbolic_sizes.insert(prov, self.operand_named_formula(&args[1]));
         }
 
@@ -1754,6 +2591,24 @@ impl SepEngine {
         if !self.current_block_reachable {
             return;
         }
+        // A drop that reaches INSIDE the pointed-to object frees that
+        // sub-object, NOT the allocation `local_to_ptr` names for this local.
+        // `steps[i] = ..; steps[j] = ..` on a `&mut [T]` lowers to
+        // `drop((*_1)[_i])` then `drop((*_1)[_j])`; keying the free on
+        // `place.local` alone resolved both to `arg_1`, so the second drop
+        // reported `[unsafe:sep:free] double-free of `arg_1`` carrying
+        // `Formula::Bool(true)` — a definite violation no solver can discharge.
+        // Safe Rust cannot double-free, so that row could only ever be wrong.
+        //
+        // SOUNDNESS: a genuine double-free is a second free of the SAME
+        // allocation — `drop(_p)` / `dealloc(_p)` on the tracked pointer
+        // itself, or `drop(*_p)` of a box's pointee. Both keep their free here;
+        // only a `Field`/`Index`/`Downcast`/`Subslice` reach into a DIFFERENT
+        // allocation is skipped, and skipping it removes a report the model
+        // never had the evidence to make.
+        if !drop_frees_tracked_allocation(place) {
+            return;
+        }
         if let Some(ptr_name) = self.local_to_ptr.get(&place.local).cloned()
             && let Some(ptr) = self.heap.pointer(&ptr_name)
         {
@@ -1776,8 +2631,157 @@ impl SepEngine {
                 });
             }
 
-            self.heap.free(prov);
+            match &self.drop_reach {
+                Some(_) => self.drop_sites.entry(prov).or_default().push(self.current_block),
+                None => self.heap.free(prov),
+            }
         }
+    }
+
+    /// Deallocation via the global deallocator free function
+    /// (`alloc::alloc::dealloc` / `std::alloc::dealloc`).
+    ///
+    /// The freed allocation is named by the call's FIRST ARGUMENT. That is the
+    /// whole of the second defect this fixes: [`SepEngine::interpret_dealloc_call`]
+    /// resolves it from the call's DESTINATION place, and a `-> ()` deallocator's
+    /// destination is a unit temporary that is never in `local_to_ptr` — so that
+    /// handler could not free anything even when it was reached.
+    ///
+    /// PATH CONDITION. The emitted row carries `Formula::Bool(true)`: a DEFINITE
+    /// violation no solver can discharge. That is a claim about every execution,
+    /// so it is made only when an earlier free of this same provenance sits in a
+    /// block that DOMINATES this one — then every execution reaching here has
+    /// already freed. On mutually exclusive arms of a `SwitchInt` neither block
+    /// dominates the other and correct code is charged nothing
+    /// (`two_frees_on_exclusive_branches_are_not_a_double_free`). When the CFG
+    /// could not be read at all, `dominators` is empty and no claim is made.
+    ///
+    /// INCOMPLETE BY DESIGN, and not a regression: before this change the free
+    /// channel emitted nothing on any extracted body, so a free the dominance
+    /// test declines to charge is exactly the coverage the engine already had.
+    fn interpret_global_dealloc(
+        &mut self,
+        ptr_op: Option<&Operand>,
+        span: &SourceSpan,
+        callee: &str,
+    ) {
+        // Same rule as `interpret_drop`: a free on an unwind CLEANUP path does not
+        // precede a normal-path access, and must not free for this normal-path
+        // heap analysis.
+        if !self.current_block_reachable {
+            return;
+        }
+        let Some(local) = ptr_op.and_then(operand_local) else {
+            return;
+        };
+        let Some(ptr_name) = self.local_to_ptr.get(&local).cloned() else {
+            return;
+        };
+        let Some(ptr) = self.heap.pointer(&ptr_name) else {
+            return;
+        };
+        let prov = ptr.provenance;
+
+        let dominated_by_an_earlier_free = self
+            .dealloc_sites
+            .get(&prov)
+            .into_iter()
+            .flatten()
+            .any(|site| self.block_is_dominated_by(self.current_block, *site));
+        if dominated_by_an_earlier_free {
+            self.vcs.push(VerificationCondition {
+                kind: VcKind::Assertion {
+                    message: format!(
+                        "[unsafe:sep:free] double-free via `{callee}` of `{ptr_name}` in {}",
+                        self.func_name,
+                    ),
+                },
+                function: self.func_name.clone().into(),
+                location: span.clone(),
+                formula: Formula::Bool(true), // definite violation
+                contract_metadata: None,
+                obligation: None,
+            });
+        }
+        self.dealloc_sites.entry(prov).or_default().push(self.current_block);
+    }
+
+    /// Whether `dom` dominates `block`. False whenever the dominator relation is
+    /// unknown (empty map), so an unreadable CFG makes no claim either way.
+    fn block_is_dominated_by(&self, block: usize, dom: usize) -> bool {
+        self.dominators.get(&block).is_some_and(|d| d.contains(&dom))
+    }
+
+    /// Driver hook, called before each block is interpreted.
+    ///
+    /// Records the block, and makes an explicit deallocation VISIBLE to the heap
+    /// model in exactly the blocks its freeing block dominates. Every execution
+    /// that reaches such a block has already performed that free, so a read or a
+    /// write through the pointer here is an unconditional use-after-free — which
+    /// is what licenses the `Formula::Bool(true)` `read_vc`/`write_vc` rows.
+    /// The free is applied on ENTRY to the dominated block rather than at the
+    /// deallocating call, so the deallocating block's own statements (which
+    /// precede its terminator) are not charged for a free that has not happened.
+    ///
+    /// RECOMPUTED FOR EVERY BLOCK, never accumulated. The walk visits blocks in
+    /// INDEX order, not along a path, so a free made visible in one block must
+    /// not stay visible in the next: in `if c { dealloc(p, l); g() } else {
+    /// h(); *p }` rustc numbers the free's successor (`g`, dominated by the free)
+    /// before the other arm's read, and a sticky `SymbolicHeap::free` there
+    /// charged that correct read with a definite use-after-free
+    /// (`tests/sep_free_scope_gap.rs`, the reviewer's probe — measured).
+    /// `SymbolicHeap::set_path_freed` replaces the whole set, so a block the free
+    /// does not dominate sees none of it.
+    #[cfg(test)]
+    pub(crate) fn enter_block(&mut self, id: usize, reachable: bool) {
+        self.enter_block_in(id, reachable, &[]);
+    }
+
+    fn enter_block_in(
+        &mut self,
+        id: usize,
+        reachable: bool,
+        blocks: &[trust_types::BasicBlock],
+    ) {
+        self.current_block = id;
+        self.current_block_reachable = reachable;
+        if self.dealloc_sites.is_empty()
+            && (self.drop_reach.is_none() || self.drop_sites.is_empty())
+        {
+            self.heap.set_path_freed(Vec::new());
+            return;
+        }
+        let mut visible: Vec<ProvenanceId> = self
+            .dealloc_sites
+            .iter()
+            .filter(|(_, sites)| {
+                sites.iter().any(|site| *site != id && self.block_is_dominated_by(id, *site))
+            })
+            .map(|(prov, _)| *prov)
+            .collect();
+        // A `Drop`'s free (see `drop_reach`): visible wherever its block reaches.
+        // A may-free, exactly as the sticky free it replaces, but never in a block
+        // the drop cannot precede. Reachability from each `Drop` site is populated
+        // lazily on first query so non-pointer/cleanup `Drop`s pay zero DFS work.
+        if let Some(reach) = &mut self.drop_reach {
+            for (prov, sites) in &self.drop_sites {
+                if !visible.contains(prov)
+                    && sites.iter().any(|&site| {
+                        if !blocks.is_empty() {
+                            reach
+                                .entry(site)
+                                .or_insert_with(|| drop_site_reachable_blocks(blocks, site))
+                                .contains(&id)
+                        } else {
+                            reach.get(&site).is_some_and(|r| r.contains(&id))
+                        }
+                    })
+                {
+                    visible.push(*prov);
+                }
+            }
+        }
+        self.heap.set_path_freed(visible);
     }
 
     /// Deallocation via explicit dealloc::dealloc call.
@@ -1807,34 +2811,104 @@ impl SepEngine {
 
     /// Pattern 5: ptr::copy / ptr::copy_nonoverlapping.
     ///
-    /// VCs: source readable, destination writable, non-overlapping if nonoverlapping variant.
+    /// VCs: both pointers aligned, source readable, destination writable, and
+    /// non-overlapping for the nonoverlapping variant.
     fn interpret_ptr_copy(
         &mut self,
         args: &[Operand],
+        dest: &Place,
+        span: &SourceSpan,
+        callee: &str,
+        elem_ty: Option<&Ty>,
+    ) {
+        self.interpret_ptr_copy_ops(
+            args.first(),
+            args.get(1),
+            args.get(2),
+            dest,
+            span,
+            callee,
+            elem_ty,
+        );
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "borrowed operand trio avoids cloning Statement::CopyNonOverlapping operands")]
+    fn interpret_ptr_copy_ops(
+        &mut self,
+        src_op_arg: Option<&Operand>,
+        dst_op_arg: Option<&Operand>,
+        cnt_op_arg: Option<&Operand>,
         _dest: &Place,
         span: &SourceSpan,
         callee: &str,
+        elem_ty: Option<&Ty>,
     ) {
         let src_name = "copy_src";
         let dst_name = "copy_dst";
+
+        for (side, op) in [("src", src_op_arg), ("dst", dst_op_arg)] {
+            let ptr = op
+                .map(|op| self.operand_named_formula(op))
+                .unwrap_or_else(|| generated_sep_var(format!("ptr_copy_{side}"), Sort::Int));
+            // Unit and bool have alignment 1. A byte-sized integer/float's size
+            // is a sufficient alignment on every target: actual alignment is a
+            // power of two dividing that size. Unmodeled types keep a symbolic
+            // divisor and fail closed, including when count is zero.
+            let align = elem_ty
+                .or_else(|| {
+                    op.and_then(|op| operand_local(op))
+                        .and_then(|local| self.local_tys.get(local))
+                        .and_then(Ty::pointee_ty)
+                })
+                .and_then(|ty| match ty {
+                    Ty::Bool | Ty::Unit => Some(1),
+                    Ty::Int { width, .. } | Ty::Float { width }
+                        if *width >= 8 && *width % 8 == 0 =>
+                    {
+                        ty_byte_align(ty)
+                    }
+                    _ => None,
+                })
+                .filter(|&n| n > 0 && (n & (n - 1)) == 0)
+                .map(Formula::Int)
+                .unwrap_or_else(|| generated_sep_var(format!("align_copy_{side}"), Sort::Int));
+            self.vcs.push(VerificationCondition {
+                kind: VcKind::Assertion {
+                    message: format!(
+                        "[unsafe:sep:copy] alignment check for {side} in {}",
+                        self.func_name
+                    ),
+                },
+                function: self.func_name.clone().into(),
+                location: span.clone(),
+                formula: Formula::And(vec![
+                    Formula::Gt(Box::new(align.clone()), Box::new(Formula::Int(0))),
+                    Formula::Not(Box::new(Formula::Eq(
+                        Box::new(Formula::Rem(Box::new(ptr), Box::new(align))),
+                        Box::new(Formula::Int(0)),
+                    ))),
+                ]),
+                contract_metadata: None,
+                obligation: None,
+            });
+        }
 
         // When the real call arguments are available and the src/dst pointers
         // trace to tracked allocations, emit the bounds obligation against the
         // REAL count operand and the allocation's (concrete-when-known) size:
         // `count > size` — dischargeable by a `count <= size` guard, exactly like
         // the from_raw_parts case. `copy[_nonoverlapping](src, dst, count)`.
-        let any_tracked = args.first().and_then(|op| self.operand_alloc_size(op)).is_some()
-            || args.get(1).and_then(|op| self.operand_alloc_size(op)).is_some();
+        let any_tracked = src_op_arg.and_then(|op| self.operand_alloc_size(op)).is_some()
+            || dst_op_arg.and_then(|op| self.operand_alloc_size(op)).is_some();
         // SOUNDNESS: `count` is in ELEMENTS, allocation sizes in BYTES — scale by
         // the pointee stride (same for src and dst). An unknown stride fails the
         // `if let` and drops to the symbolic fail-closed obligations below, rather
         // than under-checking by assuming stride 1.
-        let stride = args
-            .first()
+        let stride = src_op_arg
             .and_then(|op| self.operand_pointee_stride(op))
-            .or_else(|| args.get(1).and_then(|op| self.operand_pointee_stride(op)));
+            .or_else(|| dst_op_arg.and_then(|op| self.operand_pointee_stride(op)));
         if let (true, Some(stride), Some(src_op), Some(dst_op), Some(cnt_op)) =
-            (any_tracked, stride, args.first(), args.get(1), args.get(2))
+            (any_tracked, stride, src_op_arg, dst_op_arg, cnt_op_arg)
         {
             let count = scale_to_bytes(stride, self.operand_named_formula(cnt_op));
             for (side, op) in [("src", src_op), ("dst", dst_op)] {
@@ -1847,7 +2921,7 @@ impl SepEngine {
                     .unwrap_or_else(|| generated_sep_var(format!("copy_{side}_size"), Sort::Int));
                 // Offset-aware: the copy touches `[ptr+offset, ptr+offset+count)`.
                 let offset = self.operand_offset(op);
-                let extent = Formula::Add(Box::new(offset), Box::new(count.clone()));
+                let violation = byte_range_violation(offset, count.clone(), size, true);
                 self.vcs.push(VerificationCondition {
                     kind: VcKind::CopyBoundsViolation {
                         callee: callee.to_string(),
@@ -1859,8 +2933,8 @@ impl SepEngine {
                     },
                     function: self.func_name.clone().into(),
                     location: span.clone(),
-                    // Violation (prove UNSAT): offset + count > backing size.
-                    formula: Formula::Gt(Box::new(extent), Box::new(size)),
+                    // Violation: nonempty range starts before base OR ends after allocation.
+                    formula: violation,
                     contract_metadata: None,
                     obligation: None,
                 });
@@ -1868,7 +2942,11 @@ impl SepEngine {
             {
                 // Non-overlapping check (for the _nonoverlapping variant) still
                 // applies; emit it with the real count, then return.
-                if callee.to_lowercase().contains("nonoverlapping") {
+                if callee
+                    .as_bytes()
+                    .windows(14)
+                    .any(|w| w.eq_ignore_ascii_case(b"nonoverlapping"))
+                {
                     let src_ptr = generated_sep_var(format!("ptr_{src_name}"), Sort::Int);
                     let dst_ptr = generated_sep_var(format!("ptr_{dst_name}"), Sort::Int);
                     self.vcs.push(VerificationCondition {
@@ -1951,7 +3029,11 @@ impl SepEngine {
         }
 
         // Non-overlapping check for copy_nonoverlapping
-        if callee.to_lowercase().contains("nonoverlapping") {
+        if callee
+            .as_bytes()
+            .windows(14)
+            .any(|w| w.eq_ignore_ascii_case(b"nonoverlapping"))
+        {
             let src_ptr = generated_sep_var(format!("ptr_{src_name}"), Sort::Int);
             let dst_ptr = generated_sep_var(format!("ptr_{dst_name}"), Sort::Int);
             let count = generated_sep_var("copy_count", Sort::Int);
@@ -1990,30 +3072,38 @@ impl SepEngine {
         mutable: bool,
         span: &SourceSpan,
     ) {
-        let ptr_name = format!("raw_{}", dest.local);
-        let permission =
-            if mutable { PointerPermission::ReadWrite } else { PointerPermission::ReadOnly };
+        if dest.projections.is_empty() {
+            let ptr_name = self.fresh_pointer_name(format!("raw_{}", dest.local));
+            let permission =
+                if mutable { PointerPermission::ReadWrite } else { PointerPermission::ReadOnly };
 
-        // If source is tracked, derive provenance; otherwise create fresh.
-        let prov = if let Some(src_name) = self.local_to_ptr.get(&src_place.local) {
-            self.heap.pointer(src_name).map(|p| p.provenance).unwrap_or(ProvenanceId::UNKNOWN)
-        } else if let Some(size) = self.local_tys.get(src_place.local).and_then(ty_byte_size) {
-            // Taking a raw pointer to a value whose size is in the type (e.g. a
-            // fixed array `[u8; N]`): record a CONCRETE allocation so a later
-            // `from_raw_parts` bounds obligation can be discharged by a guard.
-            let p = self.heap.allocate(&format!("sized_{}", src_place.local));
-            self.concrete_sizes.insert(p, size);
-            self.record_stack_good(p, src_place.local);
-            p
-        } else {
-            ProvenanceId::UNKNOWN
-        };
+            // If source is tracked, derive provenance; otherwise create fresh.
+            let prov = if !self.whole_pointer_storage(src_place)
+                && let Some(src_name) = self.local_to_ptr.get(&src_place.local)
+            {
+                self.heap.pointer(src_name).map(|p| p.provenance).unwrap_or(ProvenanceId::UNKNOWN)
+            } else if let Some(size) = self.local_tys.get(src_place.local).and_then(|ty| self.exact_byte_size(ty)) {
+                // Taking a raw pointer to a value whose size is in the type (e.g. a
+                // fixed array `[u8; N]`): record a CONCRETE allocation so a later
+                // `from_raw_parts` bounds obligation can be discharged by a guard.
+                let p = self.heap.allocate(&format!("sized_{}", src_place.local));
+                self.concrete_sizes.insert(p, size);
+                self.record_stack_good(p, src_place.local);
+                p
+            } else {
+                ProvenanceId::UNKNOWN
+            };
 
-        let ptr = SymbolicPointer::new(&ptr_name, prov, permission);
-        self.heap.track_pointer(ptr);
-        // A raw pointer taken directly at a value is at offset 0 of its allocation.
-        self.pointer_offsets.insert(ptr_name.clone(), Formula::Int(0));
-        self.local_to_ptr.insert(dest.local, ptr_name);
+            let ptr = SymbolicPointer::new(&ptr_name, prov, permission);
+            self.heap.track_pointer(ptr);
+            // A raw pointer at a whole value is at offset 0 of its allocation; at a
+            // reborrow or a sub-object, see `borrow_offset`.
+            match self.borrow_offset(&ptr_name, src_place) {
+                Some(offset) => self.pointer_offsets.insert(ptr_name.clone(), offset),
+                None => self.pointer_offsets.remove(&ptr_name),
+            };
+            self.bind_pointer_result(dest, ptr_name);
+        }
 
         // A pure metadata read (`_p = &raw const/mut *slice; _ = PtrMetadata(_p)`,
         // the `<[T]>::len()` lowering) never dereferences `_p` — it only reads the
@@ -2022,7 +3112,7 @@ impl SepEngine {
         // is SOUND (the local was disqualified if it appears in any deref/store/
         // call/return position) and necessary: emitting it false-refutes the
         // ubiquitous guarded `&mut [T]` index `if i < dst.len() { dst[i] = .. }`.
-        if self.metadata_only_addr_of.contains(&dest.local) {
+        if dest.projections.is_empty() && self.metadata_only_addr_of.contains(&dest.local) {
             return;
         }
 
@@ -2036,7 +3126,8 @@ impl SepEngine {
         // the fail-closed confinement conditions). The untracked-source guard
         // keeps this away from the inherited-provenance hazard documented
         // above: a `&raw` of a TRACKED/DERIVED pointer keeps its obligation.
-        if self.call_arg_confined_addr_of.contains(&dest.local)
+        if dest.projections.is_empty()
+            && self.call_arg_confined_addr_of.contains(&dest.local)
             && ((src_place.projections.is_empty()
                 && !self.local_to_ptr.contains_key(&src_place.local))
                 // The single-level REBORROW shape the recognizer admits
@@ -2083,20 +3174,68 @@ impl SepEngine {
     }
 
     /// Pattern 8: Pointer offset (ptr.add, ptr.offset, ptr + n).
+    ///
+    /// `in_bounds_required` is `false` only for the SAFE wrapping offsets
+    /// (`wrapping_add`/`wrapping_offset`): the result's provenance and byte
+    /// offset are tracked exactly as for `add`, but no `[unsafe:sep:offset]`
+    /// row is minted, because producing an out-of-allocation pointer with them
+    /// is defined behaviour. Soundness rests on the accumulated offset being
+    /// mathematical (no wrap): a later deref/`from_raw_parts` check can only
+    /// pass when that sum is genuinely in `[0, size)`, where the machine
+    /// address equals `base + sum`; a sum that left the range fails it.
+    /// Measured 2026-09-24 (stage 1, 4e9fe36bf): `s.as_ptr().wrapping_add(s.len() + 10)`,
+    /// never dereferenced, was refused with a FAILED offset row.
     fn interpret_ptr_offset(
         &mut self,
         dest: &Place,
         src_place: &Place,
         offset_op: &Operand,
         span: &SourceSpan,
+        in_bounds_required: bool,
     ) {
+        let exact_source = src_place.projections.is_empty();
         let src_name = self
             .local_to_ptr
             .get(&src_place.local)
+            .filter(|_| exact_source)
             .cloned()
             .unwrap_or_else(|| format!("_{}", src_place.local));
 
-        let dest_name = format!("offset_{}", dest.local);
+        let count = self.offset_count_formula(offset_op);
+        // Trust (2026-10-03): the count's TYPE range, a fact of its declared type and
+        // nothing else. `add`'s count is a `usize`; without `count >= 0` an offset row
+        // whose count IS the slice length (`s.as_ptr().add(s.len())`, tied by the
+        // block definitions conjoined in `generate::entry`) was refuted with a NEGATIVE
+        // length. Only a whole local of an unsigned integer type gets it.
+        let count_range = match offset_op {
+            Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => self
+                .local_tys
+                .get(place.local)
+                .filter(|ty| matches!(ty, Ty::Int { signed: false, .. } | Ty::PtrSizedInt { signed: false }))
+                .map(|_| Formula::Ge(Box::new(count.clone()), Box::new(Formula::Int(0)))),
+            _ => None,
+        };
+        let with_count_range = |violation: Formula| match &count_range {
+            Some(range) => Formula::And(vec![range.clone(), violation]),
+            None => violation,
+        };
+        let dest_name = format!("offset_{}_{}", dest.local, self.next_offset_identity);
+        self.next_offset_identity += 1;
+        let prov = self
+            .heap
+            .pointer(&src_name)
+            .filter(|_| exact_source)
+            .map(|p| p.provenance)
+            .unwrap_or(ProvenanceId::UNKNOWN);
+        let source_field =
+            exact_source.then(|| self.field_loads.get(&src_place.local).copied()).flatten();
+        let backing_info = source_field.and_then(|(base_struct, ptr_field)| {
+            self.field_backing
+                .iter()
+                .copied()
+                .find(|(pf, _)| *pf == ptr_field)
+                .map(|(_, len_field)| (base_struct, ptr_field, len_field))
+        });
 
         // Accumulate the BYTE offset from the allocation base: dest_offset =
         // src_offset + stride * this_offset. `.add(n)` on `*const T` advances
@@ -2107,26 +3246,60 @@ impl SepEngine {
         // obligation's offset — same reason the len operand is named. An UNKNOWN
         // stride yields a fail-closed poison offset (a fresh var no guard can
         // discharge), never an under-counted element offset.
-        let src_stride = self.local_pointee_stride(src_place.local);
-        let src_offset = self.pointer_offsets.get(&src_name).cloned().unwrap_or(Formula::Int(0));
-        let this_offset = match src_stride {
-            Some(stride) => scale_to_bytes(stride, self.operand_named_formula(offset_op)),
-            None => generated_sep_var(format!("offset_unknown_stride_{}", dest.local), Sort::Int),
+        let src_stride = exact_source
+            .then(|| {
+                self.local_tys
+                    .get(src_place.local)
+                    .and_then(Ty::pointee_ty)
+                    .and_then(|ty| self.exact_byte_size(ty))
+            })
+            .flatten();
+        // A source that can carry a value around a back edge takes NO walk offset (see
+        // `loop_carried_locals`): the forward walk only ever saw its first definition, so
+        // its accumulated offset (or the `0` of a concrete base) would bound a later
+        // iteration's pointer by the first iteration's offset. A fresh origin keeps the
+        // row honest: unprovable unless the guard facts bound the offset themselves.
+        // The check is by POINTER NAME as well as by local: MIR reads `p` through a
+        // single-definition temporary (`_t = copy p; _u = add(move _t, 1)`), and a copy
+        // binds the temporary to `p`'s name.
+        let loop_carried = self.loop_carried_locals.contains(&src_place.local)
+            || (exact_source
+                && self
+                    .loop_carried_locals
+                    .iter()
+                    .any(|local| self.local_to_ptr.get(local) == Some(&src_name)));
+        let src_offset = if loop_carried {
+            generated_sep_var(format!("offset_loop_carried_{dest_name}"), Sort::Int)
+        } else {
+            self.pointer_offsets.get(&src_name).cloned().unwrap_or_else(|| {
+                if prov.is_concrete() || backing_info.is_some() {
+                    Formula::Int(0)
+                } else {
+                    generated_sep_var(format!("offset_origin_{dest_name}"), Sort::Int)
+                }
+            })
         };
-        self.pointer_offsets
-            .insert(dest_name.clone(), Formula::Add(Box::new(src_offset), Box::new(this_offset)));
+        let this_offset = match src_stride {
+            Some(stride) => scale_to_bytes(stride, count),
+            None if count == Formula::Int(0) => Formula::Int(0),
+            None => generated_sep_var(format!("offset_unknown_stride_{dest_name}"), Sort::Int),
+        };
+        self.pointer_offsets.insert(
+            dest_name.clone(),
+            Formula::Add(Box::new(src_offset.clone()), Box::new(this_offset.clone())),
+        );
 
-        self.local_to_ptr.insert(dest.local, dest_name.clone());
-
-        // Carry a backing field-load tag through `self.ptr.add(start)` so the
-        // backing-invariant assume still recognizes the offset pointer.
-        if let Some(&bf) = self.field_loads.get(&src_place.local) {
-            self.field_loads.insert(dest.local, bf);
+        if dest.projections.is_empty() {
+            self.bind_pointer_result(dest, dest_name.clone());
+            // A call result replaces the old value just as an assignment does.
+            // Snapshot the source tag first, including for an in-place offset.
+            self.field_loads.remove(&dest.local);
+            if let Some(field) = source_field
+                && self.may_hold_backing_tag(dest.local)
+            {
+                self.field_loads.insert(dest.local, field);
+            }
         }
-
-        // Derive provenance from source
-        let prov =
-            self.heap.pointer(&src_name).map(|p| p.provenance).unwrap_or(ProvenanceId::UNKNOWN);
 
         let permission = self
             .heap
@@ -2135,12 +3308,8 @@ impl SepEngine {
             .unwrap_or(PointerPermission::ReadWrite);
 
         // Byte address: the element offset advances `stride` bytes per element.
-        let offset_formula = match src_stride {
-            Some(stride) => scale_to_bytes(stride, operand_to_formula_simple(offset_op)),
-            None => operand_to_formula_simple(offset_op),
-        };
         let src_addr = generated_sep_var(format!("ptr_{src_name}"), Sort::Int);
-        let dest_addr = Formula::Add(Box::new(src_addr.clone()), Box::new(offset_formula));
+        let dest_addr = Formula::Add(Box::new(src_addr), Box::new(this_offset.clone()));
 
         let ptr = SymbolicPointer {
             addr: dest_addr,
@@ -2150,28 +3319,39 @@ impl SepEngine {
         };
         self.heap.track_pointer(ptr);
 
-        // VC: result must remain within allocation bounds.
+        if !in_bounds_required {
+            return;
+        }
+
+        let lifetime_violation = if self.heap.is_freed(prov) {
+            Formula::Bool(true)
+        } else if self.offset_may_follow_free.contains(&self.current_block) {
+            // The definite-free channel is dominance based. A conditional free
+            // (or a backedge visited later) needs a separate lifetime proof.
+            // The current walk cannot establish non-aliasing with that free.
+            generated_sep_var(format!("offset_lifetime_{dest_name}"), Sort::Bool)
+        } else {
+            Formula::Bool(false)
+        };
+
+        // VC: the entire traversed range must remain within allocation bounds.
         // If the base traces to a backing pointer field, bound the accumulated
         // byte offset against the OPAQUE backing allocation size (NOT `self.len`
         // directly — that would unsoundly assume `self.len <= alloc_size` with no
-        // verified establish). `ptr.add(offset)` is valid when `offset <=
-        // alloc_size` (one-past-the-end is permitted for `add`; the deref bound is
-        // the copy-bounds VC). When the invariant is CERTIFIED the conjoined
+        // verified establish). Both source and result must be within the
+        // inclusive allocation endpoints for a nonzero offset; a freed
+        // allocation cannot authorize that movement. When the invariant is
+        // CERTIFIED the conjoined
         // `alloc_size >= self.len` lets a `start + len <= self.len` guard
         // discharge it; otherwise it stays fail-closed (CAUGHT).
-        let backing_info =
-            self.field_loads.get(&src_place.local).copied().and_then(|(base_struct, ptr_field)| {
-                self.field_backing
-                    .iter()
-                    .copied()
-                    .find(|(pf, _)| *pf == ptr_field)
-                    .map(|(_, len_field)| (base_struct, ptr_field, len_field))
-            });
         if let Some((base_struct, ptr_field, len_field)) = backing_info {
             let (size, assumption) = self.backing_alloc_size(base_struct, ptr_field, len_field);
-            let offset = self.pointer_offsets.get(&dest_name).cloned().unwrap_or(Formula::Int(0));
-            // Violation (prove UNSAT): offset past the backing allocation size.
-            let violation = Formula::Gt(Box::new(offset), Box::new(size));
+            let violation = with_count_range(pointer_offset_violation(
+                src_offset,
+                this_offset,
+                size,
+                lifetime_violation,
+            ));
             let formula = match assumption {
                 Some(a) => Formula::And(vec![a, violation]),
                 None => violation,
@@ -2189,10 +3369,16 @@ impl SepEngine {
                 contract_metadata: None,
                 obligation: None,
             });
-        } else if prov.is_concrete() {
-            let base = Formula::Var(prov.base_var(), Sort::Int);
-            let size = Formula::Var(prov.size_var(), Sort::Int);
-            let dest_addr_var = generated_sep_var(format!("ptr_{dest_name}"), Sort::Int);
+        } else {
+            // Use the same allocation extent as later reads/copies. Unknown
+            // provenance retains an opaque extent and origin, so a nonzero
+            // offset cannot gain bounds authority from its local's name.
+            let size = (prov.is_concrete() && exact_source)
+                .then(|| self.local_alloc_size(src_place.local))
+                .flatten()
+                .unwrap_or_else(|| {
+                    generated_sep_var(format!("offset_size_{dest_name}"), Sort::Int)
+                });
 
             self.vcs.push(VerificationCondition {
                 kind: VcKind::Assertion {
@@ -2203,15 +3389,12 @@ impl SepEngine {
                 },
                 function: self.func_name.clone().into(),
                 location: span.clone(),
-                formula: Formula::Or(vec![
-                    // dest < base
-                    Formula::Lt(Box::new(dest_addr_var.clone()), Box::new(base.clone())),
-                    // dest >= base + size
-                    Formula::Not(Box::new(Formula::Lt(
-                        Box::new(dest_addr_var),
-                        Box::new(Formula::Add(Box::new(base), Box::new(size))),
-                    ))),
-                ]),
+                formula: with_count_range(pointer_offset_violation(
+                    src_offset,
+                    this_offset,
+                    size,
+                    lifetime_violation,
+                )),
                 contract_metadata: None,
                 obligation: None,
             });
@@ -2220,8 +3403,9 @@ impl SepEngine {
 
     /// Realloc: free old allocation, create new one.
     fn interpret_realloc(&mut self, dest: &Place, span: &SourceSpan, callee: &str) {
-        // Free old allocation if tracked
-        if let Some(ptr_name) = self.local_to_ptr.get(&dest.local).cloned()
+        // A projected result cannot free its enclosing local's allocation.
+        if dest.projections.is_empty()
+            && let Some(ptr_name) = self.local_to_ptr.get(&dest.local).cloned()
             && let Some(ptr) = self.heap.pointer(&ptr_name)
         {
             let prov = ptr.provenance;
@@ -2229,9 +3413,9 @@ impl SepEngine {
         }
 
         // Allocate new region
-        let prov = self.heap.allocate(&format!("realloc_{}", dest.local));
-        let ptr_name = format!("realloc_{}", dest.local);
-        self.local_to_ptr.insert(dest.local, ptr_name.clone());
+        let ptr_name = self.fresh_pointer_name(format!("realloc_{}", dest.local));
+        let prov = self.heap.allocate(&ptr_name);
+        self.bind_pointer_result(dest, ptr_name.clone());
 
         // VC: realloc result null check
         self.vcs.push(VerificationCondition {
@@ -2270,16 +3454,41 @@ impl SepEngine {
         });
     }
 
+    /// Trust (2026-10-02, KNOWN_HAZARDS "a sub-object reference or `&raw` at offset 0
+    /// lets walk-derived size rows PROVE an out-of-bounds access"): the byte offset of
+    /// a reference or `&raw` to `src_place`, inside the allocation the walk gives it.
+    /// A WHOLE local is at offset 0. A reborrow `(*p)` is wherever `p` points, so it
+    /// takes `p`'s accumulated offset (an advanced `p.add(6)` reborrowed used to read as
+    /// offset 0). Any other place (a field, an index, a subslice) is at an offset the
+    /// walk does not model: it gets a fresh variable no guard can bound, so every size
+    /// row that reads it fails closed instead of checking the access from offset 0.
+    fn borrow_offset(&mut self, ptr_name: &str, src_place: &Place) -> Option<Formula> {
+        match src_place.projections.as_slice() {
+            [] => Some(Formula::Int(0)),
+            [Projection::Deref] => self
+                .local_to_ptr
+                .get(&src_place.local)
+                .and_then(|src_name| self.pointer_offsets.get(src_name))
+                .cloned(),
+            _ => Some(generated_sep_var(format!("offset_subobject_{ptr_name}"), Sort::Int)),
+        }
+    }
+
     /// Interpret a Ref rvalue (borrow creation).
     fn interpret_ref(&mut self, dest: &Place, src_place: &Place, mutable: bool) {
+        if !dest.projections.is_empty() {
+            return;
+        }
         let permission =
             if mutable { PointerPermission::ReadWrite } else { PointerPermission::ReadOnly };
 
-        let ptr_name = format!("ref_{}", dest.local);
-        let prov = if let Some(src_name) = self.local_to_ptr.get(&src_place.local) {
+        let ptr_name = self.fresh_pointer_name(format!("ref_{}", dest.local));
+        let prov = if !self.whole_pointer_storage(src_place)
+            && let Some(src_name) = self.local_to_ptr.get(&src_place.local)
+        {
             self.heap.pointer(src_name).map(|ptr| ptr.provenance).unwrap_or(ProvenanceId::UNKNOWN)
         } else if src_place.projections.is_empty()
-            && let Some(size) = self.local_tys.get(src_place.local).and_then(ty_byte_size)
+            && let Some(size) = self.local_tys.get(src_place.local).and_then(|ty| self.exact_byte_size(ty))
         {
             // A reference to a WHOLE value whose size is in the type (e.g.
             // `&buf` for `buf: [u8; N]`): record a CONCRETE allocation at offset
@@ -2299,7 +3508,11 @@ impl SepEngine {
 
         let ptr = SymbolicPointer::new(&ptr_name, prov, permission);
         self.heap.track_pointer(ptr);
-        self.local_to_ptr.insert(dest.local, ptr_name);
+        match self.borrow_offset(&ptr_name, src_place) {
+            Some(offset) => self.pointer_offsets.insert(ptr_name.clone(), offset),
+            None => self.pointer_offsets.remove(&ptr_name),
+        };
+        self.bind_pointer_result(dest, ptr_name);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -2425,6 +3638,23 @@ fn detect_field_backing(func: &VerifiableFunction) -> Vec<(usize, usize)> {
 /// Callers deciding whether a function is RELEVANT to a named struct must use
 /// this; only callers that genuinely want "the one struct this function is
 /// about" may use the singular form.
+fn adt_backing_field_pair(fields: &[(String, Ty)]) -> Option<(usize, usize)> {
+    let mut ptr_idx = None;
+    let mut len_idx = None;
+    for (i, (_, t)) in fields.iter().enumerate() {
+        if matches!(t, Ty::RawPtr { .. }) {
+            if ptr_idx.replace(i).is_some() {
+                return None;
+            }
+        } else if matches!(t, Ty::Int { signed: false, .. })
+            && len_idx.replace(i).is_some()
+        {
+            return None;
+        }
+    }
+    Some((ptr_idx?, len_idx?))
+}
+
 pub(crate) fn detect_backing_structs(func: &VerifiableFunction) -> Vec<(String, usize, usize)> {
     let mut found: Vec<(String, usize, usize)> = Vec::new();
     for local in &func.body.locals {
@@ -2432,25 +3662,24 @@ pub(crate) fn detect_backing_structs(func: &VerifiableFunction) -> Vec<(String, 
         while let Ty::Ref { inner, .. } = ty {
             ty = inner;
         }
-        if let Ty::Adt { name, fields, .. } = ty {
-            let ptrs: Vec<usize> = fields
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, t))| matches!(t, Ty::RawPtr { .. }))
-                .map(|(i, _)| i)
-                .collect();
-            let lens: Vec<usize> = fields
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, t))| matches!(t, Ty::Int { signed: false, .. }))
-                .map(|(i, _)| i)
-                .collect();
-            if ptrs.len() == 1 && lens.len() == 1 && !found.iter().any(|(n, _, _)| n == name) {
-                found.push((name.clone(), ptrs[0], lens[0]));
-            }
+        if let Ty::Adt { name, fields, .. } = ty
+            && !found.iter().any(|(n, _, _)| n == name)
+            && let Some((ptr_field, len_field)) = adt_backing_field_pair(fields)
+        {
+            found.push((name.clone(), ptr_field, len_field));
         }
     }
     found
+}
+
+pub(crate) fn mentions_backing_struct(func: &VerifiableFunction, target_name: &str) -> bool {
+    func.body.locals.iter().any(|local| {
+        let mut ty = &local.ty;
+        while let Ty::Ref { inner, .. } = ty {
+            ty = inner;
+        }
+        matches!(ty, Ty::Adt { name, fields, .. } if name == target_name && adt_backing_field_pair(fields).is_some())
+    })
 }
 
 pub(crate) fn detect_backing_struct(func: &VerifiableFunction) -> Option<(String, usize, usize)> {
@@ -2459,25 +3688,178 @@ pub(crate) fn detect_backing_struct(func: &VerifiableFunction) -> Option<(String
         while let Ty::Ref { inner, .. } = ty {
             ty = inner;
         }
-        if let Ty::Adt { name, fields, .. } = ty {
-            let ptrs: Vec<usize> = fields
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, t))| matches!(t, Ty::RawPtr { .. }))
-                .map(|(i, _)| i)
-                .collect();
-            let lens: Vec<usize> = fields
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, t))| matches!(t, Ty::Int { signed: false, .. }))
-                .map(|(i, _)| i)
-                .collect();
-            if ptrs.len() == 1 && lens.len() == 1 {
-                return Some((name.clone(), ptrs[0], lens[0]));
-            }
+        if let Ty::Adt { name, fields, .. } = ty
+            && let Some((ptr_field, len_field)) = adt_backing_field_pair(fields)
+        {
+            return Some((name.clone(), ptr_field, len_field));
         }
     }
     None
+}
+
+/// The formula name of every local of `func`, indexed by local index: exactly
+/// what [`crate::place_to_var_name`] spells `Place::local(k)`, the name every
+/// guard, block definition and goal of the pipeline uses for that local.
+///
+/// KNOWN_HAZARDS BACKING-FIRST-LOAD-1 (raw-name collision): the engine used to
+/// spell a local by its raw `LocalDecl.name`. `place_to_var_name` demotes a
+/// source name that is spelled like a fallback `_<k>`, shared by two locals,
+/// projection-shaped or reserved to the per-local `_<index>`, because such a
+/// name IS (or may be) another local's formula name. A length local whose raw
+/// name was `_9` therefore put `alloc_size >= _9` into the backing ASSUME, and
+/// the pipeline read `_9` as unnamed local 9 — a different value — so a guard on
+/// that other value discharged the row of a UB body. Taking the pipeline's one
+/// spelling closes the class for every name the engine mints (lengths, slice
+/// lengths, offset counts), and a name it cannot match stays a free variable
+/// (fail-closed), never another local.
+pub(crate) fn pipeline_local_names(func: &VerifiableFunction) -> Vec<Option<String>> {
+    // PERF-COMPILER-VCGEN-710: use `EntryScope::enter(func)` to reuse an enclosing
+    // `FuncAnalysisScope` bound to `func` instead of pushing a duplicate frame.
+    let _scope = crate::generate::EntryScope::enter(func);
+    let len = func.body.locals.iter().map(|decl| decl.index + 1).max().unwrap_or(0);
+    (0..len).map(|local| Some(crate::place_to_var_name(func, &Place::local(local)))).collect()
+}
+
+/// KNOWN_HAZARDS BACKING-FIRST-LOAD-1: which loads of `struct_name`'s backing
+/// fields may stand for "this struct value's pointer" and "this struct value's
+/// length" at every point of `func`'s body.
+///
+/// The certified ASSUME `backing_alloc_size >= len` is a fact about ONE struct
+/// value: its pointer field is valid for its length field. It may bound a
+/// pointer only by the length of the value that pointer was read from, as that
+/// length is at the row. The forward walk sees each local's last write in
+/// block order, not the write on the path that reaches the row, so the walk
+/// cannot answer either question for a local written twice; and a base LOCAL's
+/// index names whatever the local holds at the time, not one value.
+///
+/// Returns `(roots, single)`:
+///  * `single` — the locals that hold ONE value for the whole body
+///    ([`crate::local_defs::body_is_single_static_assignment`]: one whole
+///    definition, a parameter's entry included, no partial write, no `&mut` or
+///    raw alias). A tag on one of them is path-exact, and its name denotes the
+///    load at every point.
+///  * `roots` — base local → value identity, for the bases whose backing
+///    fields hold one value for the whole body:
+///    - a `&struct_name` in `single`: a shared reference's pointee cannot be
+///      written while it is live (the pointer and length fields are plain
+///      fields, never inside an `UnsafeCell`). A single-assignment copy
+///      `s = copy r` or shared reborrow `s = &(*r)` of such a reference `r` is
+///      the same value as `r`, so it maps to `r`'s root;
+///    - a `&mut struct_name` in `single` whose `(*m).ptr` and `(*m).len` paths
+///      hold one value ([`crate::local_defs::body_path_is_single_static_assignment`]:
+///      no store to them or to a prefix, no alias of a prefix — a reborrow
+///      `&mut (*m)` or `&raw (*m)` refuses);
+///    - a by-value `struct_name` in `single` whose `.ptr` and `.len` paths hold
+///      one value.
+///
+///    Anything else — a raw pointer or a `Box` to the struct (another alias can
+///    write its pointee), a struct of another type whose field indices happen
+///    to match, a base written twice — is no root, so its loads carry no tag
+///    and its rows stay fail-closed against an opaque extent.
+pub(crate) fn backing_value_identity(
+    func: &VerifiableFunction,
+    struct_name: &str,
+    ptr_field: usize,
+    len_field: usize,
+) -> (FxHashMap<usize, usize>, FxHashSet<usize>) {
+    let _scope = crate::generate::EntryScope::enter(func);
+    let body = &func.body;
+    let single: FxHashSet<usize> = body
+        .locals
+        .iter()
+        .map(|decl| decl.index)
+        .filter(|&local| crate::local_defs::body_is_single_static_assignment(body, local))
+        .collect();
+    let names_struct = |ty: &Ty| matches!(ty, Ty::Adt { name, .. } if name == struct_name);
+    let fields_hold_one_value = |local: usize, projections: Vec<Projection>| {
+        let mut path = Place { local, projections };
+        if !crate::local_defs::body_path_is_single_static_assignment(body, &path) {
+            return false;
+        }
+        if let Some(last) = path.projections.last_mut() {
+            *last = Projection::Field(len_field);
+        }
+        crate::local_defs::body_path_is_single_static_assignment(body, &path)
+    };
+    let mut roots: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut shared: FxHashSet<usize> = FxHashSet::default();
+    for decl in &body.locals {
+        let local = decl.index;
+        match &decl.ty {
+            Ty::Ref { mutable: false, inner }
+                if names_struct(inner) && single.contains(&local) =>
+            {
+                roots.insert(local, local);
+                shared.insert(local);
+            }
+            Ty::Ref { mutable: true, inner }
+                if names_struct(inner)
+                    && single.contains(&local)
+                    && fields_hold_one_value(
+                        local,
+                        vec![Projection::Deref, Projection::Field(ptr_field)],
+                    ) =>
+            {
+                roots.insert(local, local);
+            }
+            ty if names_struct(ty)
+                && single.contains(&local)
+                && fields_hold_one_value(local, vec![Projection::Field(ptr_field)]) =>
+            {
+                roots.insert(local, local);
+            }
+            _ => {}
+        }
+    }
+    // A one-value shared reference defined as a copy or a shared reborrow of
+    // another one is that reference's value. Its single definition is the only
+    // whole write of it (`single`). Parameters in `shared` have their single
+    // definition at function entry (`is_single_static_assignment` proves 0
+    // in-body writes), so only non-parameter locals in `shared` can have an
+    // `Assign` in `body.blocks`.
+    if shared.iter().any(|&local| !crate::local_defs::is_parameter(func, local)) {
+        let copied_from: Vec<(usize, usize)> = body
+            .blocks
+            .iter()
+            .flat_map(|block| block.stmts.iter())
+            .filter_map(|stmt| match stmt {
+                Statement::Assign { place, rvalue, .. }
+                    if place.projections.is_empty() && shared.contains(&place.local) =>
+                {
+                    let src = match rvalue {
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                            if src.projections.is_empty() =>
+                        {
+                            src.local
+                        }
+                        Rvalue::Ref { mutable: false, place: src }
+                            if src.projections.as_slice() == [Projection::Deref] =>
+                        {
+                            src.local
+                        }
+                        _ => return None,
+                    };
+                    shared.contains(&src).then_some((place.local, src))
+                }
+                _ => None,
+            })
+            .collect();
+        // Follow the chains to their roots; one pass per link at most.
+        for _ in 0..copied_from.len() {
+            let mut moved = false;
+            for &(local, src) in &copied_from {
+                let root = roots[&src];
+                if roots[&local] != root {
+                    roots.insert(local, root);
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+    (roots, single)
 }
 
 /// Run the separation engine on `func` with the `(ptr_field, len_field)` backing
@@ -2489,13 +3871,18 @@ pub(crate) fn detect_backing_struct(func: &VerifiableFunction) -> Option<(String
 /// `alloc_size >= self.len` from its local facts alone.
 pub(crate) fn establish_formulas(
     func: &VerifiableFunction,
+    struct_name: &str,
     ptr_field: usize,
     len_field: usize,
 ) -> Vec<Formula> {
+    let _scope = crate::generate::EntryScope::enter(func);
     let mut engine = SepEngine::new(&func.name)
         .with_local_tys(func.body.locals.iter().map(|local| local.ty.clone()).collect())
-        .with_local_names(func.body.locals.iter().map(|local| local.name.clone()).collect())
-        .with_field_backing(vec![(ptr_field, len_field)]);
+        .with_elem_sizes(func)
+        .with_local_names(pipeline_local_names(func))
+        .with_field_backing(vec![(ptr_field, len_field)])
+        .with_backing_value_identity(func, struct_name, ptr_field, len_field)
+        .with_loop_carried_locals(&func.body);
 
     // Mirror check_sep_unsafe_blocked's ref-arg pointer initialization so a
     // pointer constructed from an argument is tracked when the establish VC is
@@ -2515,13 +3902,23 @@ pub(crate) fn establish_formulas(
         }
     }
 
-    let reachable = reachable_block_ids(&func.body.blocks);
+    let (reachable, all_readable) = reachable_block_ids_and_readable(&func.body.blocks);
+    // Only the deallocation channel reads `dominators`, and computing them is
+    // O(blocks²) set work. Bodies with no global-deallocator call therefore pay
+    // nothing and keep byte-identical output.
+    let tp = crate::generate::terminator_presence_for(func);
+    if (tp.has_call || tp.has_tail_call) && body_calls_global_dealloc(&func.body.blocks) {
+        engine.offset_may_follow_free =
+            blocks_after_global_dealloc_with_reachable(&func.body.blocks, &reachable);
+        engine.dominators = block_dominators_with_reachable(&func.body.blocks, &reachable);
+    }
+    engine.drop_reach = all_readable.then(FxHashMap::default);
     let default_span = SourceSpan::default();
     for block in &func.body.blocks {
         // Cleanup (unwind) blocks are unreachable via the IR's normal `target` edges;
         // their `Drop`s are unwind cleanup and must not free for the normal-path heap
         // analysis (see `interpret_drop`).
-        engine.current_block_reachable = reachable.contains(&block.id.0);
+        engine.enter_block_in(block.id.0, reachable.contains(&block.id.0), &func.body.blocks);
         for stmt in &block.stmts {
             let span = match stmt {
                 Statement::Assign { span, .. } => span,
@@ -2554,71 +3951,407 @@ pub(crate) fn establish_formulas(
 /// exactly the cleanup/dead blocks, whose `Drop`s the heap analysis must not treat as
 /// normal-path frees (see [`SepEngine::interpret_drop`]).
 fn reachable_block_ids(blocks: &[trust_types::BasicBlock]) -> FxHashSet<usize> {
+    reachable_block_ids_and_readable(blocks).0
+}
+
+/// Returns `(reachable_block_ids, all_terminators_readable)`.
+fn reachable_block_ids_and_readable(
+    blocks: &[trust_types::BasicBlock],
+) -> (FxHashSet<usize>, bool) {
     // CONSERVATIVE: `Terminator` is `#[non_exhaustive]`, so a future variant has
     // successors we cannot read. Rather than UNDER-approximate reachability (which
     // could wrongly mark a normal block as cleanup and skip a genuine `Drop` free →
     // miss a use-after-free → false PROVE of unsafe code), treat EVERY block as
     // reachable when any terminator is unknown. Known terminators give precise
     // reachability, so cleanup blocks are identified exactly.
-    if blocks.iter().any(|b| terminator_successors(&b.terminator).is_none()) {
-        return blocks.iter().map(|b| b.id.0).collect();
+    if blocks.iter().any(|b| !for_each_terminator_successor(&b.terminator, |_| {})) {
+        return (blocks.iter().map(|b| b.id.0).collect(), false);
     }
-    let mut reachable = FxHashSet::default();
+    let mut reachable = FxHashSet::with_capacity_and_hasher(blocks.len(), Default::default());
     let mut stack = vec![0usize]; // entry block `bb0`
     while let Some(id) = stack.pop() {
         if !reachable.insert(id) {
             continue;
         }
-        if let Some(block) = blocks.iter().find(|b| b.id.0 == id) {
-            for succ in terminator_successors(&block.terminator).into_iter().flatten() {
+        if let Some(block) =
+            blocks.get(id).filter(|b| b.id.0 == id).or_else(|| blocks.iter().find(|b| b.id.0 == id))
+        {
+            for_each_terminator_successor(&block.terminator, |succ| {
                 if !reachable.contains(&succ) {
                     stack.push(succ);
                 }
+            });
+        }
+    }
+    (reachable, true)
+}
+
+/// For a `Drop` block `site` in a readable CFG, the blocks it reaches along
+/// normal successor edges (itself only through a cycle). Computed lazily per
+/// tracked `Drop` site in [`SepEngine::enter_block_in`].
+fn drop_site_reachable_blocks(
+    blocks: &[trust_types::BasicBlock],
+    site: usize,
+) -> FxHashSet<usize> {
+    let push_successors = |id: usize, stack: &mut Vec<usize>, reached: &FxHashSet<usize>| {
+        if let Some(b) =
+            blocks.get(id).filter(|b| b.id.0 == id).or_else(|| blocks.iter().find(|b| b.id.0 == id))
+        {
+            for_each_terminator_successor(&b.terminator, |succ| {
+                if !reached.contains(&succ) {
+                    stack.push(succ);
+                }
+            });
+        }
+    };
+    let mut reached: FxHashSet<usize> = FxHashSet::default();
+    let mut stack = Vec::new();
+    push_successors(site, &mut stack, &reached);
+    while let Some(id) = stack.pop() {
+        if reached.insert(id) {
+            push_successors(id, &mut stack, &reached);
+        }
+    }
+    reached
+}
+
+/// Whether any block's terminator calls the global deallocator free function.
+/// Gates the O(blocks²) dominator computation to the only bodies that read it.
+/// Decided on the compiler-resolved key, like the dispatch arm it gates.
+fn body_calls_global_dealloc(blocks: &[trust_types::BasicBlock]) -> bool {
+    blocks.iter().any(|b| match &b.terminator {
+        Terminator::Call { callee_key, .. } | Terminator::TailCall { callee_key, .. } => {
+            is_global_dealloc_call(callee_key.as_ref())
+        }
+        _ => false,
+    })
+}
+
+/// Blocks reachable after a global deallocation, including through a loop.
+/// This is a may-analysis: unlike the definite-free channel it must retain an
+/// unknown lifetime at a join. Missing CFG information conservatively marks all
+/// blocks. A future free without a path back cannot affect an earlier offset.
+fn blocks_after_global_dealloc(blocks: &[trust_types::BasicBlock]) -> FxHashSet<usize> {
+    let reachable = reachable_block_ids(blocks);
+    blocks_after_global_dealloc_with_reachable(blocks, &reachable)
+}
+
+fn blocks_after_global_dealloc_with_reachable(
+    blocks: &[trust_types::BasicBlock],
+    reachable: &FxHashSet<usize>,
+) -> FxHashSet<usize> {
+    let all = || blocks.iter().map(|b| b.id.0).collect();
+    if blocks.iter().any(|b| !for_each_terminator_successor(&b.terminator, |_| {})) {
+        return all();
+    }
+    let find_block = |id: usize| {
+        blocks.get(id).filter(|b| b.id.0 == id).or_else(|| blocks.iter().find(|b| b.id.0 == id))
+    };
+    let mut pending = Vec::new();
+    for block in blocks {
+        if reachable.contains(&block.id.0)
+            && matches!(&block.terminator, Terminator::Call { callee_key, .. }
+                if is_global_dealloc_call(callee_key.as_ref()))
+        {
+            for_each_terminator_successor(&block.terminator, |succ| pending.push(succ));
+        }
+    }
+    let mut after = FxHashSet::default();
+    while let Some(id) = pending.pop() {
+        if after.insert(id) {
+            let Some(block) = find_block(id) else { return all() };
+            for_each_terminator_successor(&block.terminator, |succ| pending.push(succ));
+        }
+    }
+    after
+}
+
+/// `dominators[b]` — the set of blocks that dominate `b`, including `b` itself.
+///
+/// Standard iterative dataflow over the IR's NORMAL successor edges: the same
+/// edge set [`reachable_block_ids`] walks (rustc's unwind edges are dropped at
+/// extraction). Used by the deallocation channel to decide whether a free has
+/// happened on EVERY execution that reaches a later block — the condition that
+/// makes its `Formula::Bool(true)` violation row a true statement rather than a
+/// guess.
+///
+/// FAIL-QUIET, deliberately: an EMPTY map is returned when any terminator's
+/// successors are unreadable (a future `#[non_exhaustive]` variant). The sole
+/// consumer treats "no dominator known" as "make no claim", so an unreadable CFG
+/// silences the new rows instead of charging a body whose paths were not read.
+/// That direction is chosen because the rows are definite-violation claims about
+/// correct code, and because the channel emitted nothing at all before this
+/// change — declining to charge is not a loss of coverage that existed.
+///
+/// UNREACHABLE blocks (unwind cleanup) are given `{b}` and never relaxed: nothing
+/// on the normal path dominates them, so a normal-path free is never made visible
+/// inside cleanup.
+pub(crate) fn block_dominators(blocks: &[trust_types::BasicBlock]) -> FxHashMap<usize, FxHashSet<usize>> {
+    let reachable = reachable_block_ids(blocks);
+    block_dominators_with_reachable(blocks, &reachable)
+}
+
+fn block_dominators_with_reachable(
+    blocks: &[trust_types::BasicBlock],
+    reachable: &FxHashSet<usize>,
+) -> FxHashMap<usize, FxHashSet<usize>> {
+    if blocks.iter().any(|b| !for_each_terminator_successor(&b.terminator, |_| {})) {
+        return FxHashMap::default();
+    }
+    let ids: Vec<usize> = blocks.iter().map(|b| b.id.0).collect();
+    let all: FxHashSet<usize> = ids.iter().copied().collect();
+
+    let mut preds: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for block in blocks {
+        if !reachable.contains(&block.id.0) {
+            continue;
+        }
+        for_each_terminator_successor(&block.terminator, |succ| {
+            preds.entry(succ).or_default().push(block.id.0);
+        });
+    }
+
+    const ENTRY: usize = 0;
+    let mut dom: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
+    for &id in &ids {
+        if id == ENTRY || !reachable.contains(&id) {
+            dom.insert(id, std::iter::once(id).collect());
+        } else {
+            dom.insert(id, all.clone());
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &id in &ids {
+            if id == ENTRY || !reachable.contains(&id) {
+                continue;
+            }
+            let mut next = if let Some(pred_list) = preds.get(&id)
+                && let Some((min_idx, min_dom)) = pred_list
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| dom.get(p).map(|d| (i, d)))
+                    .min_by_key(|(_, d)| d.len())
+            {
+                let mut acc = min_dom.clone();
+                for (i, pred) in pred_list.iter().enumerate() {
+                    if i != min_idx
+                        && let Some(pred_dom) = dom.get(pred)
+                    {
+                        acc.retain(|b| pred_dom.contains(b));
+                    }
+                }
+                acc
+            } else {
+                FxHashSet::default()
+            };
+            next.insert(id);
+            if dom.get(&id) != Some(&next) {
+                dom.insert(id, next);
+                changed = true;
             }
         }
     }
-    reachable
+    dom
+}
+
+/// Visit the normal control-flow successors of `term` without allocating a `Vec`.
+/// Returns `false` for a future `#[non_exhaustive]` variant whose successors are unreadable.
+pub(crate) fn for_each_terminator_successor(
+    term: &Terminator,
+    mut f: impl FnMut(usize),
+) -> bool {
+    match term {
+        Terminator::Goto(b)
+        | Terminator::Call { target: Some(b), .. }
+        | Terminator::Assert { target: b, .. }
+        | Terminator::Drop { target: b, .. } => {
+            f(b.0);
+            true
+        }
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            for (_, b) in targets {
+                f(b.0);
+            }
+            f(otherwise.0);
+            true
+        }
+        Terminator::Opaque { targets, .. } => {
+            for b in targets {
+                f(b.0);
+            }
+            true
+        }
+        Terminator::Call { target: None, .. }
+        | Terminator::TailCall { .. }
+        | Terminator::Return
+        | Terminator::Unreachable
+        | Terminator::Resume => true,
+        _ => false,
+    }
+}
+
+/// Test whether all normal control-flow successors of `term` satisfy `f` without allocating.
+/// Returns `None` for a future `#[non_exhaustive]` variant whose successors are unreadable.
+pub(crate) fn all_terminator_successors(
+    term: &Terminator,
+    mut f: impl FnMut(usize) -> bool,
+) -> Option<bool> {
+    let mut ok = true;
+    for_each_terminator_successor(term, |succ| {
+        if ok && !f(succ) {
+            ok = false;
+        }
+    })
+    .then_some(ok)
 }
 
 /// The normal control-flow successors of a terminator (the unwind/cleanup edges were
 /// dropped at extraction, so this yields only normal-path successors). `None` for a
 /// future `#[non_exhaustive]` variant whose successors are unreadable.
-fn terminator_successors(term: &Terminator) -> Option<Vec<usize>> {
-    Some(match term {
-        Terminator::Goto(b) => vec![b.0],
-        Terminator::SwitchInt { targets, otherwise, .. } => {
-            targets.iter().map(|(_, b)| b.0).chain(std::iter::once(otherwise.0)).collect()
-        }
-        Terminator::Call { target: Some(b), .. } => vec![b.0],
-        Terminator::Assert { target, .. } => vec![target.0],
-        Terminator::Drop { target, .. } => vec![target.0],
-        Terminator::Opaque { targets, .. } => targets.iter().map(|b| b.0).collect(),
-        Terminator::Call { target: None, .. }
-        | Terminator::TailCall { .. }
-        | Terminator::Return
-        | Terminator::Unreachable
-        | Terminator::Resume => Vec::new(),
-        _ => return None,
-    })
+pub(crate) fn terminator_successors(term: &Terminator) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    for_each_terminator_successor(term, |succ| out.push(succ)).then_some(out)
+}
+
+/// The blocks of `func` whose terminator is a `TailCall` (`become f(..)`).
+///
+/// Taken from the SOURCE model before `VerifiableFunction::with_tail_calls_expanded`
+/// rewrites each into an ordinary call (which keeps the block's id), and handed to
+/// [`check_sep_unsafe_blocked_ops`] with the projection: see there.
+pub(crate) fn tail_call_blocks(func: &VerifiableFunction) -> FxHashSet<BlockId> {
+    if !crate::generate::terminator_presence_for(func).has_tail_call {
+        return FxHashSet::default();
+    }
+    func.body
+        .blocks
+        .iter()
+        .filter(|block| matches!(block.terminator, Terminator::TailCall { .. }))
+        .map(|block| block.id)
+        .collect()
+}
+
+/// Whether block `id`'s terminator `term` is a `become`: a `TailCall` (a source model),
+/// or the ordinary `Call` the tail-call projection rewrote one into (`id` is among the
+/// SOURCE's [`tail_call_blocks`]). Such a call runs after this frame has ended, so no
+/// fact about this frame's storage holds for it. The ONE predicate each consumer that
+/// credits a call with this frame's storage asks: the addr_of confinement
+/// ([`call_arg_confined_addr_of_locals`]), this engine's modeled-call rows
+/// ([`check_sep_unsafe_blocked_ops`]) and the FFI buffer-extent lane
+/// (`generate::ffi_buffer_extent::call_facts`).
+pub(crate) fn terminator_ends_frame(
+    term: &Terminator,
+    id: BlockId,
+    tail_call_blocks: &FxHashSet<BlockId>,
+) -> bool {
+    match term {
+        Terminator::TailCall { .. } => true,
+        Terminator::Call { .. } => tail_call_blocks.contains(&id),
+        _ => false,
+    }
 }
 
 /// Run the production separation pass and pair each VC with the `BlockId` it was
 /// generated in, so callers can conjoin that block's path guards (e.g. a
 /// `len <= N` branch condition) — letting a guarded `from_raw_parts` discharge.
+#[cfg(test)]
 pub(crate) fn check_sep_unsafe_blocked(
     func: &VerifiableFunction,
 ) -> Vec<(VerificationCondition, BlockId)> {
+    check_sep_unsafe_blocked_ops(func, &FxHashSet::default(), &FxHashSet::default())
+        .into_iter()
+        .map(|(vc, block, _)| (vc, block))
+        .collect()
+}
+
+/// [`check_sep_unsafe_blocked`] with each row's full MIR-OPERATION identity:
+/// the block AND the operation inside it (the `i`-th statement or the
+/// terminator) that the engine was interpreting when it minted the row. This
+/// is the identity `unsafe_verify::UnsafeCoverage` indexes — a span cannot
+/// serve, because a proc-macro `Span::call_site()` stamps one `SourceSpan` on
+/// every operation of an expansion, so a deref statement's rows and the
+/// `mem::zeroed` call terminator of the same block are span-indistinguishable.
+/// Attribution is by the engine's own VC counter around each `interpret_*`
+/// call, so a row can only ever be charged to the operation whose interpreter
+/// pushed it.
+///
+/// `box_deref_ops` is the compiler's `collect_synthesized_box_deref_ops` set
+/// (the same one `unsafe_verify::check_unsafe` receives). It is only ever
+/// INTERSECTED with this crate's own root walk ([`validity_rooted_box_deref_ops`]),
+/// so an empty set drops no box-deref row. (It does not reproduce the
+/// pre-2026-09-23 rows byte-for-byte: the `Cast` arm's `Deref` guard is
+/// set-independent and renames a pointer loaded through a deref to its own
+/// fail-closed `_{local}.*` rows.)
+///
+/// `tail_call_blocks` is [`tail_call_blocks`] of the SOURCE model when `func` is
+/// its `VerifiableFunction::with_tail_calls_expanded` projection (the production
+/// entry), and empty when `func` is a source model (its `TailCall`s are visible
+/// in it). The projection rewrites `become f(..)` into an ordinary call that
+/// writes `_0`, which hides that the frame ends before `f` runs. Two rules here
+/// need exactly that fact ([`terminator_ends_frame`]; REVIEW-A4C4-MINORS-1): the
+/// addr_of confinement ([`call_arg_confined_addr_of_locals`]) and the modeled
+/// obligations of the tail call itself, which are judged with every pointer
+/// untracked.
+pub(crate) fn check_sep_unsafe_blocked_ops(
+    func: &VerifiableFunction,
+    tail_call_blocks: &FxHashSet<BlockId>,
+    box_deref_ops: &FxHashSet<(BlockId, usize)>,
+) -> Vec<(VerificationCondition, BlockId, crate::unsafe_verify::MirOp)> {
+    use crate::unsafe_verify::MirOp;
+    let _scope = crate::generate::EntryScope::enter(func);
+    // Refuse before heap interpretation and before the no-unsafe/std-span
+    // shortcuts. Every row is attributed to the actual unsupported operation;
+    // never borrow another operation's origin to satisfy unsafe coverage.
+    if crate::generate::body_contains_memory_image_for(func) {
+        let mut refusals = Vec::new();
+        for block in &func.body.blocks {
+            for (index, statement) in block.stmts.iter().enumerate() {
+                if statement.contains_memory_image() {
+                    let span = match statement {
+                        Statement::Assign { span, .. }
+                        | Statement::Unsupported { span, .. }
+                        | Statement::CopyNonOverlapping { span, .. } => span,
+                        _ => &func.span,
+                    };
+                    refusals.push((
+                        crate::memory_image_vc_at(&func.name, span),
+                        block.id,
+                        MirOp::Statement(index),
+                    ));
+                }
+            }
+            if block.terminator.contains_memory_image() {
+                refusals.push((
+                    crate::memory_image_vc_at(
+                        &func.name,
+                        &memory_image_terminator_span(&block.terminator),
+                    ),
+                    block.id,
+                    MirOp::Terminator,
+                ));
+            }
+        }
+        return refusals;
+    }
     // Quick check: skip functions with no unsafe-looking patterns
     if !has_unsafe_patterns(func) {
         return Vec::new();
     }
 
+    let (metadata_only, call_arg_confined) =
+        addr_of_local_classifications(func, tail_call_blocks);
     let mut engine = SepEngine::new(&func.name)
         .with_local_tys(func.body.locals.iter().map(|local| local.ty.clone()).collect())
-        .with_local_names(func.body.locals.iter().map(|local| local.name.clone()).collect())
-        .with_metadata_only_addr_of(metadata_only_addr_of_locals(func))
-        .with_call_arg_confined_addr_of(call_arg_confined_addr_of_locals(func))
-        .with_stack_good_gate(&func.body.blocks);
+        .with_elem_sizes(func)
+        .with_local_names(pipeline_local_names(func))
+        .with_metadata_only_addr_of(metadata_only)
+        .with_call_arg_confined_addr_of(call_arg_confined)
+        .with_ffi_pointer_facts(crate::ffi_pointer_contract::PointerFacts::for_function(func))
+        .with_stack_good_gate(&func.body.blocks)
+        .with_loop_carried_locals(&func.body)
+        .with_rooted_box_deref_ops(validity_rooted_box_deref_ops(func, box_deref_ops));
 
     // Opt-in relational backing-length invariants. OFF by default (so there is
     // zero behavior change for existing code); the `#[trust::backing]` attribute
@@ -2634,7 +4367,9 @@ pub(crate) fn check_sep_unsafe_blocked(
     // `#[trust::backing]` attribute (via the owner-checked VC-gen context).
     if crate::backing_hint_for(&func.def_path) {
         if let Some((struct_name, pf, lf)) = detect_backing_struct(func) {
-            engine = engine.with_field_backing(vec![(pf, lf)]);
+            engine = engine
+                .with_field_backing(vec![(pf, lf)])
+                .with_backing_value_identity(func, &struct_name, pf, lf);
             // If a whole-crate pre-pass certified this struct's backing invariant
             // (every constructor establishes `alloc_size >= self.len`), the
             // use-site ASSUME may license that fact and so discharge a guarded
@@ -2675,25 +4410,61 @@ pub(crate) fn check_sep_unsafe_blocked(
         }
     }
 
-    // Forward walk through blocks, recording which block each VC came from.
-    let reachable = reachable_block_ids(&func.body.blocks);
+    // Forward walk through blocks, recording which block AND which operation
+    // in it (statement index / terminator) each VC came from.
+    let (reachable, all_readable) = reachable_block_ids_and_readable(&func.body.blocks);
+    // Only the deallocation channel reads `dominators`, and computing them is
+    // O(blocks²) set work. Bodies with no global-deallocator call therefore pay
+    // nothing and keep byte-identical output.
+    let tp = crate::generate::terminator_presence_for(func);
+    if (tp.has_call || tp.has_tail_call) && body_calls_global_dealloc(&func.body.blocks) {
+        engine.offset_may_follow_free =
+            blocks_after_global_dealloc_with_reachable(&func.body.blocks, &reachable);
+        engine.dominators = block_dominators_with_reachable(&func.body.blocks, &reachable);
+    }
+    engine.drop_reach = all_readable.then(FxHashMap::default);
     let default_span = SourceSpan::default();
-    let mut vc_blocks: Vec<BlockId> = Vec::new();
+    let mut vc_sites: Vec<(BlockId, MirOp)> = Vec::new();
     for block in &func.body.blocks {
         // Cleanup (unwind) blocks are unreachable via normal `target` edges; their
         // `Drop`s are unwind cleanup and must not free (see `interpret_drop`).
-        engine.current_block_reachable = reachable.contains(&block.id.0);
-        let before = engine.vc_len();
-        for stmt in &block.stmts {
+        engine.enter_block_in(block.id.0, reachable.contains(&block.id.0), &func.body.blocks);
+        for (idx, stmt) in block.stmts.iter().enumerate() {
             let span = match stmt {
                 Statement::Assign { span, .. } => span,
                 _ => &default_span,
             };
+            let before = engine.vc_len();
+            engine.current_stmt_op = Some((block.id, idx));
             engine.interpret_statement(stmt, span);
+            engine.current_stmt_op = None;
+            for _ in before..engine.vc_len() {
+                vc_sites.push((block.id, MirOp::Statement(idx)));
+            }
         }
-        engine.interpret_terminator(&block.terminator);
+        let before = engine.vc_len();
+        // A `become` (REVIEW-A4C4-MINORS-1 fix-forward, 2026-11-07): the callee runs
+        // after this frame has ended, so nothing the engine knows about a pointer from
+        // this frame — the allocation it names, its size, its offset, its stack-good or
+        // box-good standing, a backing field it was loaded from — holds when the callee
+        // reads it. A local's stack slot is gone, and so is a heap block a dropped local
+        // owned. The tail call's modeled obligations (`ptr::read`'s backing bounds,
+        // `from_raw_parts`' extent, ...) are therefore judged with every pointer
+        // untracked, their fail-closed form; the tracking is restored for the blocks
+        // after, which other paths reach with this frame live. Measured on a stage 1 of
+        // the first cut: `become core::ptr::read(b.as_ptr())` (`b: [u32; 1]` a local)
+        // PROVED its `CopyBoundsViolation` row against `b`'s 4 bytes.
+        if terminator_ends_frame(&block.terminator, block.id, tail_call_blocks) {
+            let tracked = std::mem::take(&mut engine.local_to_ptr);
+            let loads = std::mem::take(&mut engine.field_loads);
+            engine.interpret_terminator(&block.terminator);
+            engine.local_to_ptr = tracked;
+            engine.field_loads = loads;
+        } else {
+            engine.interpret_terminator(&block.terminator);
+        }
         for _ in before..engine.vc_len() {
-            vc_blocks.push(block.id);
+            vc_sites.push((block.id, MirOp::Terminator));
         }
     }
 
@@ -2709,7 +4480,7 @@ pub(crate) fn check_sep_unsafe_blocked(
     engine
         .into_vcs()
         .into_iter()
-        .zip(vc_blocks)
+        .zip(vc_sites)
         // TRUSTED-STD-SPAN gate. Every VC this engine emits is an
         // `[unsafe:sep:*]` unsafe-operation obligation whose `location` is the
         // operation's OWN source span. When that span resolves to the sysroot
@@ -2730,12 +4501,36 @@ pub(crate) fn check_sep_unsafe_blocked(
         // through this driver, so slice-bounds / arithmetic / absent-callee
         // obligations (emitted elsewhere) are unaffected.
         .filter(|(vc, _)| verify_stdlib_subject_memory_safety || !is_trusted_std_span(&vc.location))
+        .map(|(vc, (block, op))| (vc, block, op))
         .collect()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
+
+fn memory_image_terminator_span(terminator: &Terminator) -> SourceSpan {
+    match terminator {
+        Terminator::Call { span, .. }
+        | Terminator::TailCall { span, .. }
+        | Terminator::SwitchInt { span, .. }
+        | Terminator::Assert { span, .. } => span.clone(),
+        _ => SourceSpan::default(),
+    }
+}
+
+/// Whether a `Drop` of `place` frees the allocation that `local_to_ptr` names
+/// for `place.local`.
+///
+/// True for the pointer itself (`drop(_p)`) and for a pure chain of derefs
+/// (`drop(*_p)` — a box's pointee IS that allocation). False as soon as the
+/// place reaches into a FIELD, an ELEMENT, or a variant of the pointee: that
+/// sub-object owns its own, distinct allocation, so freeing it says nothing
+/// about the outer one. See `SepEngine::interpret_drop` for the false
+/// double-free this prevents.
+fn drop_frees_tracked_allocation(place: &Place) -> bool {
+    place.projections.iter().all(|p| matches!(p, Projection::Deref))
+}
 
 /// Locals defined by `AddressOf` (`&raw const/mut`) whose ONLY use across the
 /// function is the whole-value operand of a `PtrMetadata` read.
@@ -2755,40 +4550,73 @@ pub(crate) fn check_sep_unsafe_blocked(
 /// absent — any such appearance disqualifies it and the normal obligation stands.
 /// So the skip can only ever drop an obligation for a provably-non-dereferencing
 /// metadata read, never for a pointer that is actually used.
-fn metadata_only_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usize> {
-    // Push every local an operand READS (its base local, plus any Index locals in
-    // its projections).
-    fn operand_reads(op: &Operand, out: &mut Vec<usize>) {
+/// Classify whole-local `Rvalue::AddressOf` definitions into the disjoint
+/// `(metadata_only, call_arg_confined)` sets in a single candidate-collection pass.
+fn addr_of_local_classifications(
+    func: &VerifiableFunction,
+    tail_call_blocks: &FxHashSet<BlockId>,
+) -> (FxHashSet<usize>, FxHashSet<usize>) {
+    let mut sites: Vec<(usize, usize, usize)> = Vec::new();
+    for (bidx, block) in func.body.blocks.iter().enumerate() {
+        for (sidx, stmt) in block.stmts.iter().enumerate() {
+            if let Statement::Assign { place, rvalue: Rvalue::AddressOf(_, _), .. } = stmt
+                && place.projections.is_empty()
+            {
+                sites.push((bidx, sidx, place.local));
+            }
+        }
+    }
+    if sites.is_empty() {
+        return (FxHashSet::default(), FxHashSet::default());
+    }
+    let metadata_only = metadata_only_addr_of_locals(func, &sites);
+    let call_arg_confined =
+        call_arg_confined_addr_of_locals(func, tail_call_blocks, &sites, &metadata_only);
+    (metadata_only, call_arg_confined)
+}
+
+fn metadata_only_addr_of_locals(
+    func: &VerifiableFunction,
+    sites: &[(usize, usize, usize)],
+) -> FxHashSet<usize> {
+    // Disqualify every candidate local an operand READS (its base local, plus any
+    // Index locals in its projections).
+    fn disq_operand_reads(
+        op: &Operand,
+        candidates: &FxHashSet<usize>,
+        disqualified: &mut FxHashSet<usize>,
+    ) {
         if let Operand::Copy(p) | Operand::Move(p) = op {
-            out.push(p.local);
+            if candidates.contains(&p.local) {
+                disqualified.insert(p.local);
+            }
             for proj in &p.projections {
-                if let Projection::Index(i) = proj {
-                    out.push(*i);
+                if let Projection::Index(i) = proj
+                    && candidates.contains(i)
+                {
+                    disqualified.insert(*i);
                 }
             }
         }
     }
     // Index locals inside a place's projections are reads, regardless of whether
     // the place is read or written.
-    fn place_index_reads(place: &Place, out: &mut Vec<usize>) {
+    fn disq_place_index_reads(
+        place: &Place,
+        candidates: &FxHashSet<usize>,
+        disqualified: &mut FxHashSet<usize>,
+    ) {
         for proj in &place.projections {
-            if let Projection::Index(i) = proj {
-                out.push(*i);
+            if let Projection::Index(i) = proj
+                && candidates.contains(i)
+            {
+                disqualified.insert(*i);
             }
         }
     }
 
     // Candidates: locals assigned by a whole-value `AddressOf`.
-    let mut candidates: FxHashSet<usize> = FxHashSet::default();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, rvalue: Rvalue::AddressOf(_, _), .. } = stmt
-                && place.projections.is_empty()
-            {
-                candidates.insert(place.local);
-            }
-        }
-    }
+    let mut candidates: FxHashSet<usize> = sites.iter().map(|&(_, _, local)| local).collect();
     if candidates.is_empty() {
         return candidates;
     }
@@ -2798,13 +4626,6 @@ fn metadata_only_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usize> {
     // An AddressOf whose result is never read is a dead/dangling raw pointer, not a
     // metadata read — it keeps the conservative source-liveness obligation.
     let mut consumed_by_metadata: FxHashSet<usize> = FxHashSet::default();
-    let disq = |reads: &[usize], disqualified: &mut FxHashSet<usize>| {
-        for &l in reads {
-            if candidates.contains(&l) {
-                disqualified.insert(l);
-            }
-        }
-    };
 
     for block in &func.body.blocks {
         for stmt in &block.stmts {
@@ -2820,30 +4641,23 @@ fn metadata_only_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usize> {
                         if candidates.contains(&place.local) {
                             disqualified.insert(place.local);
                         }
-                        let mut reads = Vec::new();
-                        place_index_reads(place, &mut reads);
-                        disq(&reads, &mut disqualified);
+                        disq_place_index_reads(place, &candidates, &mut disqualified);
                     }
                     Statement::Intrinsic { args, .. } => {
-                        let mut reads = Vec::new();
                         for op in args {
-                            operand_reads(op, &mut reads);
+                            disq_operand_reads(op, &candidates, &mut disqualified);
                         }
-                        disq(&reads, &mut disqualified);
                     }
                     Statement::Unsupported { operands, .. } => {
-                        let mut reads = Vec::new();
                         for op in operands {
-                            operand_reads(op, &mut reads);
+                            disq_operand_reads(op, &candidates, &mut disqualified);
                         }
-                        disq(&reads, &mut disqualified);
                     }
                     _ => {}
                 }
                 continue;
             };
 
-            let mut reads = Vec::new();
             // A write THROUGH a candidate (`*p = ..`, `p[i] = ..`) dereferences it.
             if place.local != 0
                 && candidates.contains(&place.local)
@@ -2859,7 +4673,7 @@ fn metadata_only_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usize> {
             {
                 disqualified.insert(place.local);
             }
-            place_index_reads(place, &mut reads);
+            disq_place_index_reads(place, &candidates, &mut disqualified);
 
             match rvalue {
                 // The one ALLOWED use: PtrMetadata over the whole candidate pointer.
@@ -2871,34 +4685,36 @@ fn metadata_only_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usize> {
                                 consumed_by_metadata.insert(p.local);
                             }
                         } else {
-                            operand_reads(op, &mut reads);
+                            disq_operand_reads(op, &candidates, &mut disqualified);
                         }
                     }
                 }
                 Rvalue::Use(op)
                 | Rvalue::UnaryOp(_, op)
                 | Rvalue::Cast(op, _)
-                | Rvalue::Repeat(op, _) => operand_reads(op, &mut reads),
+                | Rvalue::Repeat(op, _) => disq_operand_reads(op, &candidates, &mut disqualified),
                 Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
-                    operand_reads(a, &mut reads);
-                    operand_reads(b, &mut reads);
+                    disq_operand_reads(a, &candidates, &mut disqualified);
+                    disq_operand_reads(b, &candidates, &mut disqualified);
                 }
                 Rvalue::Ref { place: p, .. }
                 | Rvalue::AddressOf(_, p)
                 | Rvalue::Discriminant(p)
                 | Rvalue::Len(p)
                 | Rvalue::CopyForDeref(p) => {
-                    reads.push(p.local);
-                    place_index_reads(p, &mut reads);
+                    if candidates.contains(&p.local) {
+                        disqualified.insert(p.local);
+                    }
+                    disq_place_index_reads(p, &candidates, &mut disqualified);
                 }
                 Rvalue::Aggregate(_, ops) => {
                     for op in ops {
-                        operand_reads(op, &mut reads);
+                        disq_operand_reads(op, &candidates, &mut disqualified);
                     }
                 }
                 Rvalue::Unsupported { operands, .. } => {
                     for op in operands {
-                        operand_reads(op, &mut reads);
+                        disq_operand_reads(op, &candidates, &mut disqualified);
                     }
                 }
                 // Trust: Rvalue is #[non_exhaustive]. An unknown future variant may
@@ -2906,56 +4722,57 @@ fn metadata_only_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usize> {
                 // fail closed: disqualify every candidate it could touch.
                 _ => disqualified.extend(candidates.iter().copied()),
             }
-            disq(&reads, &mut disqualified);
         }
 
         // Terminator reads / reassignments.
-        let mut reads = Vec::new();
         match &block.terminator {
             Terminator::Call { args, dest, .. } => {
                 for op in args {
-                    operand_reads(op, &mut reads);
+                    disq_operand_reads(op, &candidates, &mut disqualified);
                 }
                 if candidates.contains(&dest.local) {
                     disqualified.insert(dest.local);
                 }
-                place_index_reads(dest, &mut reads);
+                disq_place_index_reads(dest, &candidates, &mut disqualified);
             }
             Terminator::TailCall { args, .. } => {
                 for op in args {
-                    operand_reads(op, &mut reads);
+                    disq_operand_reads(op, &candidates, &mut disqualified);
                 }
                 if candidates.contains(&0) {
                     disqualified.insert(0);
                 }
             }
-            Terminator::SwitchInt { discr, .. } => operand_reads(discr, &mut reads),
-            Terminator::Assert { cond, .. } => operand_reads(cond, &mut reads),
+            Terminator::SwitchInt { discr, .. } => {
+                disq_operand_reads(discr, &candidates, &mut disqualified);
+            }
+            Terminator::Assert { cond, .. } => {
+                disq_operand_reads(cond, &candidates, &mut disqualified);
+            }
             Terminator::Drop { place, .. } => {
                 if candidates.contains(&place.local) {
                     disqualified.insert(place.local);
                 }
-                place_index_reads(place, &mut reads);
+                disq_place_index_reads(place, &candidates, &mut disqualified);
             }
             _ => {}
         }
-        disq(&reads, &mut disqualified);
+        if disqualified.len() == candidates.len() {
+            candidates.clear();
+            return candidates;
+        }
     }
 
     candidates.retain(|l| !disqualified.contains(l) && consumed_by_metadata.contains(l));
     candidates
 }
 
-/// Whether `stmt` mentions (reads, writes, or storage-marks) any local in `set`,
-/// treating unknown `#[non_exhaustive]` payloads as a mention (fail closed).
-/// Storage markers of a SET member count as a mention here; the caller decides
-/// whether they are benign for its analysis.
-fn stmt_mentions_any(stmt: &Statement, set: &FxHashSet<usize>) -> bool {
+fn stmt_mentions_where(stmt: &Statement, f: impl Fn(usize) -> bool) -> bool {
     let place_mentions = |p: &Place| {
-        set.contains(&p.local)
+        f(p.local)
             || p.projections
                 .iter()
-                .any(|proj| matches!(proj, Projection::Index(i) if set.contains(i)))
+                .any(|proj| matches!(proj, Projection::Index(i) if f(*i)))
     };
     let op_mentions =
         |op: &Operand| matches!(op, Operand::Copy(p) | Operand::Move(p) if place_mentions(p));
@@ -2981,7 +4798,7 @@ fn stmt_mentions_any(stmt: &Statement, set: &FxHashSet<usize>) -> bool {
                     _ => true,
                 }
         }
-        Statement::StorageLive(l) | Statement::StorageDead(l) => set.contains(l),
+        Statement::StorageLive(l) | Statement::StorageDead(l) => f(*l),
         Statement::SetDiscriminant { place, .. }
         | Statement::Deinit { place }
         | Statement::Retag { place }
@@ -2994,20 +4811,31 @@ fn stmt_mentions_any(stmt: &Statement, set: &FxHashSet<usize>) -> bool {
     }
 }
 
-/// Whether `term` mentions any local in `set`; unknown/opaque terminators count
-/// as a mention (fail closed).
-fn terminator_mentions_any(term: &Terminator, set: &FxHashSet<usize>) -> bool {
+/// Whether `stmt` mentions (reads, writes, or storage-marks) any local in `set`,
+/// treating unknown `#[non_exhaustive]` payloads as a mention (fail closed).
+/// Storage markers of a SET member count as a mention here; the caller decides
+/// whether they are benign for its analysis.
+pub(crate) fn stmt_mentions_any(stmt: &Statement, set: &FxHashSet<usize>) -> bool {
+    stmt_mentions_where(stmt, |l| set.contains(&l))
+}
+
+/// Zero-allocation single-local specialization of [`stmt_mentions_any`].
+pub(crate) fn stmt_mentions_local(stmt: &Statement, local: usize) -> bool {
+    stmt_mentions_where(stmt, |l| l == local)
+}
+
+fn terminator_mentions_where(term: &Terminator, f: impl Fn(usize) -> bool) -> bool {
     let place_mentions = |p: &Place| {
-        set.contains(&p.local)
+        f(p.local)
             || p.projections
                 .iter()
-                .any(|proj| matches!(proj, Projection::Index(i) if set.contains(i)))
+                .any(|proj| matches!(proj, Projection::Index(i) if f(*i)))
     };
     let op_mentions =
         |op: &Operand| matches!(op, Operand::Copy(p) | Operand::Move(p) if place_mentions(p));
     match term {
         Terminator::Call { args, dest, .. } => args.iter().any(op_mentions) || place_mentions(dest),
-        Terminator::TailCall { args, .. } => set.contains(&0) || args.iter().any(op_mentions),
+        Terminator::TailCall { args, .. } => f(0) || args.iter().any(op_mentions),
         Terminator::SwitchInt { discr, .. } => op_mentions(discr),
         Terminator::Assert { cond, .. } => op_mentions(cond),
         Terminator::Drop { place, .. } => place_mentions(place),
@@ -3020,124 +4848,253 @@ fn terminator_mentions_any(term: &Terminator, set: &FxHashSet<usize>) -> bool {
     }
 }
 
+/// Whether `term` mentions any local in `set`; unknown/opaque terminators count
+/// as a mention (fail closed).
+pub(crate) fn terminator_mentions_any(term: &Terminator, set: &FxHashSet<usize>) -> bool {
+    terminator_mentions_where(term, |l| set.contains(&l))
+}
+
+/// Zero-allocation single-local specialization of [`terminator_mentions_any`].
+pub(crate) fn terminator_mentions_local(term: &Terminator, local: usize) -> bool {
+    terminator_mentions_where(term, |l| l == local)
+}
+
 /// Locals defined by an `AddressOf` of a WHOLE stack local whose raw pointer is
-/// CONFINED to the defining block and consumed only as a bare by-value argument
-/// of that block's own `Call` terminator — the `&mut out`-parameter FFI shape:
-/// `let mut status = 0; waitpid(pid, &mut status, 0)` lowers to
-/// `_p = &raw mut _status; waitpid(.., move _p, ..)`.
+/// confined to a STRAIGHT RUN of blocks starting at the defining block and
+/// consumed only as bare by-value arguments of `Call` terminators in that run —
+/// the `&mut out`-parameter FFI shape: `let mut status = 0; waitpid(pid, &mut
+/// status, 0)` lowers to `_p = &raw mut _status; waitpid(.., move _p, ..)`, and
+/// `pthread_sigmask(how, &raw const set, ptr::null_mut())` lowers to
+/// `_p = &raw const set; _n = null_mut() -> bbK; bbK: pthread_sigmask(.., move
+/// _p, move _n)` (the pointer is defined one call BEFORE the call that takes
+/// it, because a later argument is itself a call).
+///
+/// The run is `b0` (the defining block, from the `AddressOf` on), then each
+/// `b(i+1)` = the unique normal successor of `b(i)`'s `Goto`/`Assert`/`Call`/
+/// `Drop` terminator, followed only while `b(i+1)` has `b(i)` as its SOLE
+/// predecessor (every edge counted, cleanup edges included), was not visited
+/// before, and the run is at most [`ADDR_OF_RUN_BOUND`] blocks. Because every
+/// block after `b0` has its predecessor in the run as its only way in, every
+/// execution that reaches a statement of the run reached it by executing the
+/// `AddressOf` and then the run, in order, with nothing in between: the run is
+/// straight-line code. (When some terminator's successors cannot be read the
+/// run is `b0` alone — the single-block shape this recognizer always admitted.)
 ///
 /// For such a pointer the blanket `[unsafe:sep:addr_of]` source-liveness VC is
-/// discharged STRUCTURALLY: the pointer cannot outlive the block (its only
-/// consumers are that block's call arguments; it never escapes into another
-/// block, place projection, store, return slot, or the call destination), and
-/// the source local's storage cannot end before the call (no `StorageDead(src)`
-/// between the `AddressOf` and the terminator — a local's storage ends only at
-/// its `StorageDead`). So the source is live at every in-frame use. Retention
-/// of the pointer by the CALLEE past the call is the FFI summary's contract
+/// discharged STRUCTURALLY: the pointer's only consumers are call arguments in
+/// the run (it never escapes into a block outside the run, a place projection,
+/// a store, the return slot, or a call destination), and the source local's
+/// storage does not end before any of them — a local's storage ends only at its
+/// `StorageDead`, and once a `StorageDead`/`StorageLive` of the source (or a
+/// `Drop` of it) is seen in the run, ANY later mention of the pointer refuses
+/// the candidate. So the source is live at every in-frame use. Retention of
+/// the pointer by the CALLEE past the call is the FFI summary's contract
 /// surface, not this VC's: the liveness claim here covers exactly the in-frame
 /// uses the confinement proves.
 ///
 /// SOUNDNESS (fail-closed): a candidate is kept only if EVERY appearance of the
-/// pointer — and of every same-block pure `Use`/`Cast` copy of it (the `&mut`
-/// → `*mut` coercion chain) — across the WHOLE body is one of: the defining
-/// assign, a recognized chain link, a benign storage marker of the pointer
-/// temp itself, or a bare by-value argument of the defining block's call
-/// terminator. Any other mention (via the fail-closed
+/// pointer — and of every pure `Use`/`Cast` copy of it made in the run before
+/// both any kill and its first consuming call (the `&mut` → `*mut` coercion
+/// chain; a copy made after the call is an escape) — across the WHOLE body is one of:
+/// the defining assign, a recognized chain link, a benign storage marker of a
+/// pointer temp itself, or a bare by-value argument of a `Call` terminator in
+/// the run before any kill. Any other mention (via the fail-closed
 /// [`stmt_mentions_any`]/[`terminator_mentions_any`] walks, which treat unknown
 /// `#[non_exhaustive]` payloads as mentions) disqualifies it and the
-/// conservative VC stands.
-fn call_arg_confined_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usize> {
+/// conservative VC stands. A pointer that is never consumed keeps its VC.
+///
+/// STORAGE-MARKER EVIDENCE (G1, 2026-10-27). The kill above can only be seen
+/// where the body still carries the source's storage markers. At `-Copt-level=0`
+/// rustc's `RemoveStorageMarkers` deletes EVERY `StorageLive`/`StorageDead`
+/// before `TrustVerify` runs (it runs whenever LLVM lifetime markers are off), so
+/// `let p; { let s = 0; p = &raw const s; } f(p)` reaches this function with no
+/// trace of `s`'s scope ending. The run therefore extends past `b0` only when the
+/// source has at least one storage marker in the body (its markers survived, so
+/// every `StorageDead` on the run is visible) or is an argument (whose storage is
+/// the whole frame, which a tail call ends: see below). Otherwise the candidate is
+/// judged on `b0` alone, the single-block rule this function always applied; that
+/// rule's own blindness to a same-block scope end at `-O0` is pre-existing and
+/// recorded in docs/KNOWN_HAZARDS.md.
+///
+/// A MOVE OUT OF THE SOURCE ENDS IT TOO (G1 review, 2026-10-27). The VC's claim is
+/// that the source stays "live and valid" at each use, and a run that crosses
+/// blocks can carry a call between the `&raw` and a use: `let p = &raw const s;
+/// drop(s); take(p)` lowers (at `-O1`) to `_5 = move _2; drop(move _5) -> bb1; bb1:
+/// take(copy _3 ..)` with `StorageDead(_2)` only after the use. `s`'s storage is
+/// still live, but it holds a moved-from value whose heap buffer `drop` freed. So any
+/// `move` operand whose place is rooted at the source — in a statement, in a run
+/// call's arguments, or in any terminator — counts as a kill
+/// ([`stmt_may_move_out_of`], [`terminator_may_move_out_of`]); so does a new `&mut`
+/// or `&raw` alias of the source made on the run, through which a later call could
+/// move it out without naming it; unknown statement,
+/// rvalue and terminator kinds that mention the source count as one too. A run call
+/// that takes both a chain pointer and a `move` of the source is refused outright
+/// (the moved argument may be passed in place, and the callee would see it through
+/// two names).
+///
+/// A TAIL CALL IS NOT AN IN-FRAME USE (REVIEW-A4C4-MINORS-1, 2026-11-02). `become
+/// f(..)` replaces this frame before `f` runs, so every local's storage — an
+/// argument's included, whose storage is the whole frame only up to that point — is
+/// gone when `f` can read the pointer. A `TailCall` that takes a chain member, bare or
+/// projected, refuses the candidate; one that does not take it ends the run like a
+/// `Return`, and the candidate is judged on the calls made before it. (The first G1
+/// build, and the single-block rule before it, counted a tail call's chain argument
+/// as a use: `become take(&raw const n, mk())` and `become take(&raw const n, 5)`
+/// discharged the row for a pointer that dangles in `take`.) The return slot is the
+/// other way out of the frame: a copy into `_0` is never a chain link, so `_0 = copy
+/// _p` before the consuming call refuses the candidate, as the confinement above
+/// promises (it used to extend the chain, and nothing judged `_0` after that).
+///
+/// THE PRODUCTION BODY HAS NO `TailCall` (REVIEW-A4C4-MINORS-1, 2026-11-07). The
+/// generation entry hands the sep engine the `with_tail_calls_expanded` projection,
+/// where `become f(..)` is an ordinary `Call` writing `_0` into a fresh `Return`
+/// block: the same shape as `return f(..)`, so the `TailCall` arm alone never fired
+/// on a compiled program (measured: the first cut of this fix left
+/// `tests/ui/trust/addr_of_tail_call_ends_the_frame.rs` rowless). `tail_call_blocks`
+/// names the blocks whose SOURCE terminator is a `TailCall` (the projection keeps
+/// every source block's id), and a `Call` there is judged as the tail call it is.
+///
+/// A CALL CAN HAND THE POINTER BACK (REVIEW-A4C4-MINORS-1 fix-forward, 2026-11-07).
+/// A run call that takes a chain member was the end of the chain: its destination was
+/// never judged. But a call can return the pointer, or one derived from it, and the
+/// commonest FFI spelling does exactly that: `become write(fd, (&raw const fd).cast(),
+/// 4)` lowers to `_4 = &raw const _1; _3 = <*const i32>::cast(move _4) -> bb1; bb1:
+/// become write(copy _1, move _3, 4)`. `cast` consumed `_4` in a live frame, `_3`
+/// was not a chain member, and the row was discharged for a pointer that dangles in
+/// `write` (measured on a stage 1 of the first cut: no `[unsafe:sep:addr_of]` row). The
+/// same escape reaches past a scope end: `p = (&raw const b).cast(); }` then a use of
+/// `p` after `StorageDead(b)`. So the destination of such a call joins the chain unless
+/// its type cannot hold a pointer ([`ty_cannot_hold_pointer`]: a scalar, `()` or `!`),
+/// and its every later mention is judged like the pointer's own. One of the four
+/// sysroot raw-pointer retype methods (`cast` on either pointer kind, `cast_mut`, `cast_const`;
+/// [`PTR_CAST_ITEMS`], authenticated by its compiler-resolved key) is the call form of
+/// the `as` coercion above: it extends the chain without consuming the pointer, and its
+/// return edge is judged as the coercion statement would be, so the run reaches the
+/// successor without the storage-marker evidence any other edge needs. The self-pipe
+/// `write(fd, (&raw const byte).cast(), 1)` is therefore still a confined use at `-O0`,
+/// where no marker survives, exactly as `write(fd, &raw const byte as *const _, 1)` is.
+/// That edge inherits ADDR-OF-O0-MARKERS-1 as the single-block rule has it; with markers
+/// (`-O`), a scope end after the retype is seen and refuses. A destination with a
+/// projection, or the return slot `_0`, refuses the candidate.
+fn call_arg_confined_addr_of_locals(
+    func: &VerifiableFunction,
+    tail_call_blocks: &FxHashSet<BlockId>,
+    sites: &[(usize, usize, usize)],
+    metadata_only: &FxHashSet<usize>,
+) -> FxHashSet<usize> {
     let mut confined: FxHashSet<usize> = FxHashSet::default();
+    if !sites.iter().any(|&(_, _, local)| local != 0 && !metadata_only.contains(&local)) {
+        return confined;
+    }
+    let blocks = &func.body.blocks;
+    let mut pred_counts: Option<Option<Vec<usize>>> = None;
+    let mut marked: Option<FxHashSet<usize>> = None;
+    let mut chain: FxHashSet<usize> = FxHashSet::default();
+    let mut chain_stmts: FxHashSet<(usize, usize)> = FxHashSet::default();
+    let mut run: FxHashSet<usize> = FxHashSet::default();
 
-    for (bidx, block) in func.body.blocks.iter().enumerate() {
-        // Only a block ending in a call can consume the pointer.
-        let (call_args, call_dest) = match &block.terminator {
-            Terminator::Call { args, dest, .. } => (args, dest.clone()),
-            Terminator::TailCall { args, .. } => (args, Place::local(0)),
-            _ => continue,
+    'candidates: for &(bidx, sidx, _) in sites {
+        let Some(block) = blocks.get(bidx) else { continue };
+        let Some(stmt) = block.stmts.get(sidx) else { continue };
+        let Statement::Assign { place, rvalue: Rvalue::AddressOf(_, src), .. } = stmt else {
+            continue;
+        };
+        if !place.projections.is_empty()
+            || place.local == 0
+            || place.local == src.local
+            || metadata_only.contains(&place.local)
+        {
+            continue;
+        }
+        // Effective source + the ref link (if any). Two admitted shapes:
+        //   DIRECT:   `_p = &raw mut _status`            (src whole local)
+        //   REBORROW: `_r = &mut _status; _p = &raw mut (*_r)` — a
+        //   `&mut local` call argument reborrowed to a raw pointer (the
+        //   `poll(&mut pfd, ..)` lowering). Admitted iff `_r` is defined
+        //   EARLIER IN THIS BLOCK as a whole-place `Ref` of a whole
+        //   untracked local; `_r` then JOINS THE CHAIN, so any mention of
+        //   it other than the defining Ref, the AddressOf itself, and
+        //   benign storage markers disqualifies the candidate via the
+        //   existing fail-closed walks. The liveness subject (StorageDead
+        //   scan below) is the UNDERLYING local in both shapes. Deeper
+        //   projections/reborrow chains stay rejected (fail-closed).
+        let (src_local, ref_link) = if src.projections.is_empty() {
+            (src.local, None)
+        } else if src.projections.as_slice() == [Projection::Deref] {
+            let mut underlying = None;
+            for (eidx, earlier) in block.stmts.iter().enumerate().take(sidx) {
+                if let Statement::Assign {
+                    place: r, rvalue: Rvalue::Ref { place: u, .. }, ..
+                } = earlier
+                    && r.projections.is_empty()
+                    && r.local == src.local
+                    && u.projections.is_empty()
+                {
+                    // Last same-block whole-place Ref definition wins —
+                    // matching the value the AddressOf actually reads.
+                    underlying = Some((u.local, eidx));
+                }
+            }
+            match underlying {
+                Some((u, eidx)) if u != place.local && u != src.local => {
+                    (u, Some((src.local, eidx)))
+                }
+                _ => continue,
+            }
+        } else {
+            continue;
         };
 
-        'candidates: for (sidx, stmt) in block.stmts.iter().enumerate() {
-            let Statement::Assign { place, rvalue: Rvalue::AddressOf(_, src), .. } = stmt else {
-                continue;
-            };
-            if !place.projections.is_empty() || place.local == 0 || place.local == src.local {
-                continue;
-            }
-            // Effective source + the ref link (if any). Two admitted shapes:
-            //   DIRECT:   `_p = &raw mut _status`            (src whole local)
-            //   REBORROW: `_r = &mut _status; _p = &raw mut (*_r)` — a
-            //   `&mut local` call argument reborrowed to a raw pointer (the
-            //   `poll(&mut pfd, ..)` lowering). Admitted iff `_r` is defined
-            //   EARLIER IN THIS BLOCK as a whole-place `Ref` of a whole
-            //   untracked local; `_r` then JOINS THE CHAIN, so any mention of
-            //   it other than the defining Ref, the AddressOf itself, and
-            //   benign storage markers disqualifies the candidate via the
-            //   existing fail-closed walks. The liveness subject (StorageDead
-            //   scan below) is the UNDERLYING local in both shapes. Deeper
-            //   projections/reborrow chains stay rejected (fail-closed).
-            let (src_local, ref_link) = if src.projections.is_empty() {
-                (src.local, None)
-            } else if src.projections.as_slice() == [Projection::Deref] {
-                let mut underlying = None;
-                for (eidx, earlier) in block.stmts.iter().enumerate().take(sidx) {
-                    if let Statement::Assign {
-                        place: r, rvalue: Rvalue::Ref { place: u, .. }, ..
-                    } = earlier
-                        && r.projections.is_empty()
-                        && r.local == src.local
-                        && u.projections.is_empty()
-                    {
-                        // Last same-block whole-place Ref definition wins —
-                        // matching the value the AddressOf actually reads.
-                        underlying = Some((u.local, eidx));
-                    }
-                }
-                match underlying {
-                    Some((u, eidx)) if u != place.local && u != src.local => {
-                        (u, Some((src.local, eidx)))
-                    }
-                    _ => continue,
-                }
-            } else {
-                continue;
-            };
-
-            // Build the same-block coercion chain and verify no StorageDead of
-            // the source (and no unrecognized mention of a chain member)
-            // between the AddressOf and the call terminator.
-            let mut chain: FxHashSet<usize> = FxHashSet::default();
-            chain.insert(place.local);
-            let mut reborrow_def_stmt = None;
-            if let Some((r, eidx)) = ref_link {
-                chain.insert(r);
-                reborrow_def_stmt = Some(eidx);
-            }
-            let mut chain_stmts: FxHashSet<usize> = FxHashSet::default();
-            chain_stmts.insert(sidx);
+        chain.clear();
+        chain.insert(place.local);
+        // Recognized chain statements, by (block index, statement index).
+        chain_stmts.clear();
+        chain_stmts.insert((bidx, sidx));
+        if let Some((r, eidx)) = ref_link {
+            chain.insert(r);
             // The reborrow's defining `Ref` is a recognized chain statement:
             // without this the whole-body escape scan would see it as an
             // unrecognized mention of the ref link and disqualify the shape.
-            if let Some(eidx) = reborrow_def_stmt {
-                chain_stmts.insert(eidx);
-            }
-            for (j, later) in block.stmts.iter().enumerate().skip(sidx + 1) {
+            chain_stmts.insert((bidx, eidx));
+        }
+
+        // Walk the straight run from the AddressOf.
+        run.clear();
+        run.insert(bidx);
+        let mut cur = bidx;
+        let mut first_stmt = sidx + 1;
+        // A `StorageDead`/`StorageLive`/`Drop` of the source has been seen:
+        // from here on ANY mention of a chain member refuses the candidate.
+        let mut killed = false;
+        let mut consumed = false;
+        loop {
+            for (j, later) in blocks[cur].stmts.iter().enumerate().skip(first_stmt) {
+                // A move out of the source ends it (see the doc comment). The
+                // statement is still judged below for chain mentions.
+                if stmt_may_move_out_of(later, src_local) {
+                    killed = true;
+                }
                 match later {
-                    // The source's storage ends before the call: keep the VC.
                     Statement::StorageDead(l) | Statement::StorageLive(l) if *l == src_local => {
-                        continue 'candidates;
+                        killed = true;
                     }
                     // Benign storage markers of the pointer temps themselves.
                     Statement::StorageDead(l) | Statement::StorageLive(l) if chain.contains(l) => {
-                        chain_stmts.insert(j);
+                        chain_stmts.insert((cur, j));
                     }
                     // A pure whole-value copy/cast of a chain member (the
-                    // `&mut` → `*mut` coercion): extend the chain.
+                    // `&mut` → `*mut` coercion): extend the chain. Never into the
+                    // return slot `_0`: a pointer copied there leaves the frame
+                    // with the return, and no terminator walk below would see it
+                    // (REVIEW-A4C4-MINORS-1).
                     Statement::Assign {
                         place: q,
                         rvalue: Rvalue::Use(op) | Rvalue::Cast(op, _),
                         ..
-                    } if q.projections.is_empty()
+                    } if !killed
+                        && !consumed
+                        && q.projections.is_empty()
+                        && q.local != 0
                         && q.local != src_local
                         && !chain.contains(&q.local)
                         && matches!(
@@ -3147,7 +5104,7 @@ fn call_arg_confined_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usiz
                         ) =>
                     {
                         chain.insert(q.local);
-                        chain_stmts.insert(j);
+                        chain_stmts.insert((cur, j));
                     }
                     other => {
                         // Any other mention of a chain member: keep the VC.
@@ -3158,66 +5115,332 @@ fn call_arg_confined_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usiz
                 }
             }
 
-            // The call terminator: every chain appearance must be a bare
-            // by-value argument; the destination must not touch the chain; and
-            // the pointer must actually be consumed (a dead pointer keeps the
-            // conservative VC).
-            let mut consumed = false;
-            for arg in call_args {
-                if let Operand::Copy(p) | Operand::Move(p) = arg {
-                    if chain.contains(&p.local) {
-                        if p.projections.is_empty() {
-                            consumed = true;
-                        } else {
+            // The run block's terminator: every chain appearance must be a
+            // bare by-value argument of a call made before any kill, and a
+            // call destination must not touch the chain.
+            // Does this terminator move out of the source? A use in the same call
+            // is refused; any later use sees a killed source.
+            let moves_source = terminator_may_move_out_of(&blocks[cur].terminator, src_local);
+            // A `become`: the source's own `TailCall`, or the ordinary `Call` the
+            // tail-call projection rewrote it into.
+            let ends_frame = terminator_ends_frame(
+                &blocks[cur].terminator,
+                blocks[cur].id,
+                tail_call_blocks,
+            );
+            // Whether this block ends in a retype call of a chain member (below).
+            let mut through_retype = false;
+            let next = match &blocks[cur].terminator {
+                Terminator::TailCall { args, .. } | Terminator::Call { args, .. }
+                    if ends_frame =>
+                {
+                    // A `become` ENDS THIS FRAME before the callee runs (REVIEW-A4C4-
+                    // MINORS-1): every caller local's storage, an argument's
+                    // included, is gone by the time the callee can read the
+                    // pointer, so a tail call is never an in-frame use. One that
+                    // takes a chain member (bare or projected) refuses the
+                    // candidate; one that does not take it ends the run, and the
+                    // candidate stands or falls on the calls made before it.
+                    match confined_call_args(args, &Place::local(0), &chain) {
+                        Some(false) => {}
+                        Some(true) | None => continue 'candidates,
+                    }
+                    None
+                }
+                Terminator::Call { args, dest, target, callee_key, .. } => {
+                    let used = match confined_call_args(args, dest, &chain) {
+                        None => continue 'candidates,
+                        Some(true) if killed || moves_source => continue 'candidates,
+                        Some(used) => used,
+                    };
+                    // The call may hand the pointer back (see the doc comment): its
+                    // destination joins the chain unless it cannot hold a pointer.
+                    // A sysroot retype (`cast`, ..) is the call form of the `as`
+                    // coercion: a link, not a consumer.
+                    let retype = used
+                        && !killed
+                        && !consumed
+                        && args.len() == 1
+                        && is_ptr_cast_call(callee_key.as_ref());
+                    if used
+                        && !crate::local_ty_ref(func, dest.local)
+                            .is_some_and(ty_cannot_hold_pointer)
+                    {
+                        if !dest.projections.is_empty()
+                            || dest.local == 0
+                            || dest.local == src_local
+                        {
                             continue 'candidates;
                         }
+                        chain.insert(dest.local);
                     }
-                    if p.projections
-                        .iter()
-                        .any(|proj| matches!(proj, Projection::Index(i) if chain.contains(i)))
-                    {
+                    consumed |= used && !retype;
+                    killed |= moves_source;
+                    through_retype = retype;
+                    *target
+                }
+                term @ (Terminator::Goto(_)
+                | Terminator::Assert { .. }
+                | Terminator::Drop { .. }) => {
+                    if terminator_mentions_any(term, &chain) {
                         continue 'candidates;
                     }
+                    killed |= moves_source;
+                    match term {
+                        Terminator::Goto(t) | Terminator::Assert { target: t, .. } => Some(*t),
+                        Terminator::Drop { place: dropped, target, .. } => {
+                            if dropped.local == src_local {
+                                killed = true;
+                            }
+                            Some(*target)
+                        }
+                        _ => None,
+                    }
                 }
+                other => {
+                    if terminator_mentions_any(other, &chain) {
+                        continue 'candidates;
+                    }
+                    None
+                }
+            };
+            let Some(next) = next.map(|b| b.0) else { break };
+            // Past `b0` only with storage-marker evidence for the source (see the
+            // doc comment): otherwise a scope end on the run would be invisible.
+            // The return edge of a retype call is the one exception: the call is
+            // the `as` coercion spelled as a method, so its edge is judged as the
+            // coercion statement would be, by the evidence the run already had at
+            // the call (see "A CALL CAN HAND THE POINTER BACK").
+            let source_liveness_visible = through_retype
+                || (1..=func.body.arg_count).contains(&src_local)
+                || marked
+                    .get_or_insert_with(|| {
+                        blocks
+                            .iter()
+                            .flat_map(|b| &b.stmts)
+                            .filter_map(|stmt| match stmt {
+                                Statement::StorageLive(l) | Statement::StorageDead(l) => Some(*l),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .contains(&src_local);
+            let extends = source_liveness_visible
+                && pred_counts
+                    .get_or_insert_with(|| addr_of_run_pred_counts(blocks))
+                    .as_ref()
+                    .is_some_and(|counts| {
+                        counts.get(next).copied() == Some(1)
+                            && blocks.get(next).is_some_and(|b| b.id.0 == next)
+                    });
+            if !extends || run.contains(&next) || run.len() >= ADDR_OF_RUN_BOUND {
+                break;
             }
-            if !consumed
-                || chain.contains(&call_dest.local)
-                || call_dest
-                    .projections
-                    .iter()
-                    .any(|proj| matches!(proj, Projection::Index(i) if chain.contains(i)))
-            {
-                continue;
-            }
+            run.insert(next);
+            cur = next;
+            first_stmt = 0;
+        }
+        if !consumed {
+            continue;
+        }
 
-            // Whole-body escape scan: no chain member may appear anywhere else.
-            for (b2, other_block) in func.body.blocks.iter().enumerate() {
-                for (s2, other_stmt) in other_block.stmts.iter().enumerate() {
-                    if b2 == bidx && chain_stmts.contains(&s2) {
-                        continue;
-                    }
-                    // Storage markers of the pointer temps in OTHER blocks are
-                    // benign (rustc places `StorageDead(_p)` in the call's
-                    // successor block); they neither read nor deref.
-                    if let Statement::StorageDead(l) | Statement::StorageLive(l) = other_stmt
-                        && chain.contains(l)
-                    {
-                        continue;
-                    }
-                    if stmt_mentions_any(other_stmt, &chain) {
-                        continue 'candidates;
-                    }
+        // Whole-body escape scan: no chain member may appear anywhere else.
+        for (b2, other_block) in blocks.iter().enumerate() {
+            for (s2, other_stmt) in other_block.stmts.iter().enumerate() {
+                if chain_stmts.contains(&(b2, s2)) {
+                    continue;
                 }
-                if b2 != bidx && terminator_mentions_any(&other_block.terminator, &chain) {
+                // A run block's statements from the AddressOf on were judged
+                // by the walk (an unrecognized mention there already refused).
+                if run.contains(&b2) && (b2 != bidx || s2 > sidx) {
+                    continue;
+                }
+                // Storage markers of the pointer temps in OTHER blocks are
+                // benign (rustc places `StorageDead(_p)` in the call's
+                // successor block); they neither read nor deref.
+                if let Statement::StorageDead(l) | Statement::StorageLive(l) = other_stmt
+                    && chain.contains(l)
+                {
+                    continue;
+                }
+                if stmt_mentions_any(other_stmt, &chain) {
                     continue 'candidates;
                 }
             }
-
-            confined.insert(place.local);
+            if !run.contains(&b2) && terminator_mentions_any(&other_block.terminator, &chain) {
+                continue 'candidates;
+            }
         }
+
+        confined.insert(place.local);
     }
 
     confined
+}
+
+/// The longest straight run [`call_arg_confined_addr_of_locals`] follows.
+const ADDR_OF_RUN_BOUND: usize = 64;
+
+/// Whether a value of type `ty` cannot carry a pointer: a scalar (`bool`, an integer,
+/// `char`, a float), `()` or `!`. The scalar list is [`SepEngine::local_cannot_hold_pointer`]'s.
+/// An integer can hold an ADDRESS (`p.addr()`), but a pointer made back from one
+/// (`with_exposed_provenance`, an `as` cast) is untracked and keeps its own fail-closed
+/// rows, so the address escaping as an integer lends nothing. Every other type (a raw
+/// pointer, a reference, an ADT, a tuple, an array, an unknown type) may.
+fn ty_cannot_hold_pointer(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Bool
+            | Ty::Int { .. }
+            | Ty::PtrSizedInt { .. }
+            | Ty::Char
+            | Ty::Float { .. }
+            | Ty::Unit
+            | Ty::Never
+    )
+}
+
+/// Whether `op` is a `move` of a place rooted at `local` (the whole local, a field,
+/// an element, or through a `Box` deref: each moves bytes out of `local`'s storage).
+fn operand_moves_out_of(op: &Operand, local: usize) -> bool {
+    matches!(op, Operand::Move(p) if p.local == local)
+}
+
+/// Whether `stmt` may MOVE OUT OF, or de-initialize, `local`'s storage: a `move`
+/// operand rooted at `local` ([`operand_moves_out_of`]), a `Deinit` of it, a new
+/// `&mut`/`&raw` alias of it (through which a later call could move it out without
+/// naming it), or a statement or rvalue kind this walk does not read that mentions it
+/// (fail closed). A `copy`, a shared borrow, a `Len`/`Discriminant` read and a write
+/// INTO `local` are not moves: after each, `local` still holds a valid value.
+fn stmt_may_move_out_of(stmt: &Statement, local: usize) -> bool {
+    let moves = |op: &Operand| operand_moves_out_of(op, local);
+    match stmt {
+        Statement::Assign { rvalue, .. } => match rvalue {
+            Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) | Rvalue::Repeat(op, _) => {
+                moves(op)
+            }
+            Rvalue::BinaryOp(_, a, b)
+            | Rvalue::CheckedBinaryOp(_, a, b)
+            | Rvalue::UncheckedBinaryOp(_, a, b) => moves(a) || moves(b),
+            Rvalue::Aggregate(_, ops) => ops.iter().any(moves),
+            // A NEW mutable or raw alias of the source made on the run (G1 review,
+            // defense in depth): a later call could move out of the source, or drop it
+            // in place, through that alias without naming the source again, so the
+            // alias counts as an end of the source. A shared borrow cannot de-init it.
+            Rvalue::Ref { mutable: true, place } | Rvalue::AddressOf(_, place)
+                if place.local == local =>
+            {
+                true
+            }
+            Rvalue::Ref { .. }
+            | Rvalue::AddressOf(..)
+            | Rvalue::Discriminant(_)
+            | Rvalue::Len(_)
+            | Rvalue::CopyForDeref(_) => false,
+            // `Unsupported`, `PtrOffset`, and any #[non_exhaustive] rvalue: refuse
+            // when it mentions the local at all.
+            _ => stmt_mentions_local(stmt, local),
+        },
+        Statement::Deinit { place } => place.local == local,
+        Statement::Intrinsic { args, .. } => args.iter().any(moves),
+        Statement::StorageLive(_)
+        | Statement::StorageDead(_)
+        | Statement::SetDiscriminant { .. }
+        | Statement::Retag { .. }
+        | Statement::PlaceMention(_)
+        | Statement::Coverage
+        | Statement::ConstEvalCounter
+        | Statement::Nop => false,
+        // `Unsupported` and any #[non_exhaustive] statement: refuse when it mentions
+        // the local at all.
+        other => stmt_mentions_local(other, local),
+    }
+}
+
+/// Whether `term` may move out of `local`: a `move` operand rooted at `local` among a
+/// call's arguments, a switch discriminant or an assert condition; or a terminator
+/// kind this walk does not read that mentions it (fail closed). A `Drop` of `local` is
+/// already a kill in its own arm of the walk.
+fn terminator_may_move_out_of(term: &Terminator, local: usize) -> bool {
+    let moves = |op: &Operand| operand_moves_out_of(op, local);
+    match term {
+        Terminator::Call { args, .. } | Terminator::TailCall { args, .. } => args.iter().any(moves),
+        Terminator::SwitchInt { discr, .. } => moves(discr),
+        Terminator::Assert { cond, .. } => moves(cond),
+        Terminator::Drop { .. }
+        | Terminator::Goto(_)
+        | Terminator::Return
+        | Terminator::Unreachable
+        | Terminator::Resume => false,
+        other => terminator_mentions_local(other, local),
+    }
+}
+
+/// The number of edges into each block (normal successors plus cleanup edges, and
+/// the function entry into block 0), indexed by block id; `None` when some terminator's successors cannot
+/// be read or a block's id is not its index (the run is then the defining block
+/// alone).
+fn addr_of_run_pred_counts(blocks: &[trust_types::BasicBlock]) -> Option<Vec<usize>> {
+    let mut counts = vec![0usize; blocks.len()];
+    // The entry block is also entered from outside the body.
+    *counts.first_mut()? += 1;
+    for (index, block) in blocks.iter().enumerate() {
+        if block.id.0 != index {
+            return None;
+        }
+        let mut out_of_bounds = false;
+        let known = for_each_terminator_successor(&block.terminator, |edge| {
+            if let Some(slot) = counts.get_mut(edge) {
+                *slot += 1;
+            } else {
+                out_of_bounds = true;
+            }
+        });
+        if !known || out_of_bounds {
+            return None;
+        }
+        let cleanup = match &block.terminator {
+            Terminator::Call { unwind, .. }
+            | Terminator::Assert { unwind, .. }
+            | Terminator::Drop { unwind, .. } => unwind.cleanup_target(),
+            _ => None,
+        };
+        if let Some(edge) = cleanup.map(|b| b.0) {
+            *counts.get_mut(edge)? += 1;
+        }
+    }
+    Some(counts)
+}
+
+/// Whether `p` names a chain member, directly or as an `Index` operand.
+fn place_mentions_chain(p: &Place, chain: &FxHashSet<usize>) -> bool {
+    chain.contains(&p.local)
+        || p.projections.iter().any(|proj| matches!(proj, Projection::Index(i) if chain.contains(i)))
+}
+
+/// A run call's arguments and destination against the chain: `None` when a chain
+/// member appears other than as a bare by-value argument (projected, as an
+/// index, in the destination); otherwise `Some(consumed)`.
+fn confined_call_args(args: &[Operand], dest: &Place, chain: &FxHashSet<usize>) -> Option<bool> {
+    let mut consumed = false;
+    for arg in args {
+        if let Operand::Copy(p) | Operand::Move(p) = arg {
+            if chain.contains(&p.local) {
+                if p.projections.is_empty() {
+                    consumed = true;
+                } else {
+                    return None;
+                }
+            }
+            if p.projections.iter().any(|proj| matches!(proj, Projection::Index(i) if chain.contains(i))) {
+                return None;
+            }
+        }
+    }
+    if place_mentions_chain(dest, chain) {
+        return None;
+    }
+    Some(consumed)
 }
 
 /// Check if a function contains patterns that warrant sep-logic analysis.
@@ -3244,6 +5467,10 @@ fn call_arg_confined_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usiz
 /// happened to open the lint's gate. See
 /// `generate::safe_intrinsic_lint_tests`.
 pub(crate) fn has_unsafe_patterns(func: &VerifiableFunction) -> bool {
+    crate::generate::has_sep_unsafe_patterns_for(func)
+}
+
+pub(crate) fn has_unsafe_patterns_uncached(func: &VerifiableFunction) -> bool {
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             // The `copy_nonoverlapping` STATEMENT is itself the unsafe pattern
@@ -3274,25 +5501,40 @@ pub(crate) fn has_unsafe_patterns(func: &VerifiableFunction) -> bool {
                 }
             }
         }
-        // Check for unsafe calls
-        let callee = match &block.terminator {
-            Terminator::Call { func, .. } | Terminator::TailCall { func, .. } => func,
+        // Check for unsafe calls.
+        //
+        // The KEY comes off the same terminator as the name (round 7). This is a
+        // SCOPING predicate — false means "do not analyze this body at all",
+        // which leaves every site its fail-closed stand-in — so keying it the
+        // same way the mint is keyed is what keeps the two in agreement: a body
+        // whose only unsafe op is a keyed sysroot call must not be skipped by a
+        // scan that asks a different question than the mint will.
+        let (callee, key) = match &block.terminator {
+            Terminator::Call { func, callee_key, .. }
+            | Terminator::TailCall { func, callee_key, .. } => (func, callee_key.as_ref()),
             _ => continue,
         };
-        let lower = callee.to_lowercase();
-        if is_alloc_call(&lower)
-            || is_dealloc_call(&lower)
-            || is_realloc_call(&lower)
-            || is_external_map_call(&lower)
-            || is_ptr_offset_call(&lower)
-            || lower.contains("ptr::copy")
-            || lower.contains("from_raw_parts")
-            || lower.contains("mem::transmute")
-            || is_unchecked_index_call(&lower)
-            || is_raw_read_write_call(&lower)
-            || unsafe_assertion_op(&lower).is_some()
-            || is_unsafe_arith_op(&lower)
-            || is_unwrap_unchecked_call(&lower)
+        if is_alloc_call(key)
+            || is_dealloc_call(key)
+            || is_realloc_call(key)
+            || is_ptr_offset_call(key)
+            || is_ptr_copy_call(key)
+            || is_from_raw_parts_call(key)
+            || is_transmute_call(key)
+            || is_unchecked_index_call(key)
+            || is_raw_read_write_call(key)
+            || unsafe_assertion_op(key).is_some()
+            || is_unsafe_arith_op(key)
+            || is_unwrap_unchecked_call(key)
+            || (callee.as_bytes().windows(3).any(|w| w.eq_ignore_ascii_case(b"map")) && {
+                let lower: std::borrow::Cow<'_, str> =
+                    if callee.bytes().any(|b| b.is_ascii_uppercase()) {
+                        std::borrow::Cow::Owned(callee.to_lowercase())
+                    } else {
+                        std::borrow::Cow::Borrowed(callee)
+                    };
+                is_external_map_call(&lower)
+            })
         {
             return true;
         }
@@ -3300,100 +5542,2613 @@ pub(crate) fn has_unsafe_patterns(func: &VerifiableFunction) -> bool {
     false
 }
 
-/// True when an unsafe operation's OWN source span resolves to the sysroot
-/// standard library — the `core`/`alloc`/`std` (and the rest of the `library/`)
-/// tree. When stdlib is a dependency, such an unsafe op is std-internal — e.g.
-/// the `vec!` macro's inlined `RawVec` / `Box::new_uninit` / `assume_init`, whose
+/// True when an unsafe operation's OWN source span belongs to a source file the
+/// COMPILER authenticated as the real standard library.
+///
+/// When stdlib is a dependency, such an unsafe op is std-internal — e.g. the
+/// `vec!` macro's inlined `RawVec` / `Box::new_uninit` / `assume_init`, whose
 /// span is `alloc/src/macros.rs` even after expansion into user MIR — and must
 /// not be charged to the user. When stdlib itself is the verification subject,
 /// [`check_sep_unsafe_blocked`] explicitly retains the behavioral rows; this
 /// predicate identifies span provenance and does not decide ownership alone.
 ///
-/// SOUNDNESS / fail-closed: returns `true` ONLY for a span we can positively
-/// identify as sysroot std. An empty file, binary provenance, or ANY first-party
-/// / user path (a genuine `unsafe` block in ny-cert, etc.) returns `false`, so
-/// that obligation is preserved. This never inspects obligation kind — only the
-/// span.
-pub(crate) fn is_trusted_std_span(span: &SourceSpan) -> bool {
-    is_trusted_std_file(&span.file)
-}
-
-/// Span-file predicate for [`is_trusted_std_span`] (split out for direct unit
-/// testing). Recognizes the two shapes a sysroot std source path takes in a
-/// [`SourceSpan::file`]:
-///   1. A `library/` path *segment* — the in-tree tree (`library/alloc/src/…`),
-///      an absolute checkout (`/…/rust/library/core/src/…`), or a remapped
-///      virtual path (`/rustc/<hash>/library/std/src/…`). This covers every
-///      sysroot crate.
-///   2. A path-prefix-remapped bare crate root that stripped the `library/`
-///      prefix, e.g. the observed `alloc/src/macros.rs`, `core/src/…`,
-///      `std/src/…`. Matched only as a leading `<std-crate>/src/` so no
-///      first-party path (never rooted at a std crate name) can collide.
+/// # THE FILE-PATH KEY IS GONE (2026-09-20)
 ///
-/// Fail-closed: an empty path or `binary:` provenance is NOT std here.
-fn is_trusted_std_file(file: &str) -> bool {
-    // No usable source location ⇒ cannot prove std ⇒ keep the obligation.
-    if file.is_empty() || file.starts_with("binary:") {
-        return false;
-    }
-
-    // Normalize separators so path-segment matching is platform-independent.
-    let norm = file.replace('\\', "/");
-
-    let is_std_crate_root = |rest: &str| {
-        rest.split_once('/').is_some_and(|(krate, tail)| {
-            crate::is_stdlib_crate_name(krate) && tail.starts_with("src/")
-        })
-    };
-
-    // (1) The sysroot standard-library source tree: a `library/` segment
-    // IMMEDIATELY followed by a known std crate and its `src/`.
-    //
-    // SOUNDNESS: this used to accept ANY path containing a `library/` segment.
-    // That is a text test on a user-controlled value — `SourceSpan.file` is the
-    // unremapped local path (`prefer_local_unconditionally`, see
-    // trust-mir-extract's `convert_span`). Trusting a span here DELETES every
-    // `[unsafe:sep:*]` obligation for it, and the compiler's fail-closed
-    // unsafe-call net deliberately yields to this engine (`call_has_unsafe_model`
-    // => `continue`), so nothing else re-covers those operations. A crate laid
-    // out under `library/` is not exotic — `first-party/trust-mc` declares
-    // `members = ["library/trust-mc", ...]` and that tree contains real `unsafe`
-    // — so in-tree code was silently having its memory-safety obligations
-    // dropped by a path substring.
-    //
-    // Residual, deliberately accepted and recorded rather than papered over: a
-    // non-sysroot crate literally laid out as `library/core/src/...` still
-    // matches. Closing that needs rustc-authenticated provenance
-    // (`SourceFile::cnum` / `SourceFile::is_imported()`) carried into
-    // `SourceSpan`, which is a schema change across trust-types and
-    // trust-mir-extract. Narrowing to the known crate names removes every
-    // trigger reachable by accident.
-    if let Some(rest) =
-        norm.strip_prefix("library/").or_else(|| norm.split_once("/library/").map(|(_, a)| a))
-    {
-        if is_std_crate_root(rest) {
-            return true;
-        }
-    }
-
-    // (2) Remapped bare crate root (`library/` prefix stripped). Only the known
-    // sysroot crate roots, matched as a LEADING `<crate>/src/` segment.
-    is_std_crate_root(&norm)
+/// This used to call `is_trusted_std_file(&span.file)`, which asked whether the
+/// RENDERED PATH had a `library/<std-crate>/src/` segment or began with a bare
+/// `<std-crate>/src/`. `SourceSpan::file` is the unremapped local path the user
+/// compiled (`prefer_local_unconditionally`, trust-mir-extract `convert_span`),
+/// so that made the USER the author of the answer, and a `true` here deletes
+/// every `[unsafe:sep:*]` row for the span AND the stand-in the site would
+/// otherwise keep. MEASURED on the round-8 fix lane, byte-identical source,
+/// same `--crate-name evil`, same flags, only the directory differing:
+/// `core/src/evil.rs` 3 obligations, `library/core/src/evil.rs` 3,
+/// `usr/lib/rustlib/src/rust/library/core/src/evil.rs` 3,
+/// `mycore/src/evil.rs` 13. A plain `unsafe { *p = 7 }` lost all four of its
+/// `[unsafe:sep:{deref,write}]` rows and both of its `UnmodeledSafetyAssert`
+/// stand-ins to a directory name.
+///
+/// The question is now answered from ARTIFACT RESIDENCY, by the only component
+/// that can ask it: `trust_mir_extract::trusted_std_source_files` pairs every
+/// `SourceFile` in the session's source map with
+/// `is_real_sysroot_crate(tcx, file.cnum)` and the compiler installs the table
+/// on the [`crate::VcgenContext`]. The span's `file` is a JOIN KEY into that
+/// table and nothing else — there is no pattern left to write a path against.
+///
+/// # FAIL-CLOSED, IN EVERY DIRECTION
+///
+/// `false` — keep the obligation — for: no active context at all; a context
+/// with no table installed (every non-compiler caller: unit tests, standalone
+/// vcgen embeddings, replayed artifacts); a span whose file is not in the
+/// table; the empty file and the `binary:` provenance form; and a rendering
+/// two source files collided on. The only way to `true` is a file the compiler
+/// resolved to a crate whose artifacts sit in its own sysroot library
+/// directory. This never inspects obligation kind — only the span.
+pub(crate) fn is_trusted_std_span(span: &SourceSpan) -> bool {
+    crate::with_current_trusted_std_source_files(|files| crate::span_is_trusted_std(span, files))
+        .unwrap_or(false)
 }
 
 /// Check if a callee is an allocation function.
-fn is_alloc_call(lower: &str) -> bool {
-    lower.contains("alloc::alloc")
-        || lower.contains("box::new")
-        || lower.contains("vec::with_capacity")
-        || lower.contains("vec::new")
-        || lower.contains("alloc::alloc_zeroed")
-        // The free fn `box_new_uninit` that `Box::<T>::new`/`new_uninit` INLINE to in
-        // optimized MIR (`contains("box::new")` MISSES it: `box_new_uninit` has no
-        // `box::new` substring). Recognizing it here tracks its provenance so a deref/
-        // write of the boxed pointer resolves to the allocation (and, via
-        // `is_known_good_box_alloc`, gets the infallible-allocator postcondition).
-        || is_known_good_box_alloc(lower)
+///
+/// EXACT SYSROOT SPELLINGS, MATCHED ON THE CALLEE PATH ONLY — NEVER ON A TYPE
+/// ARGUMENT (rule 3, 2026-09-20). The bare `contains("alloc::alloc")` matched an
+/// `alloc::alloc::Global` spelled INSIDE a turbofish — the allocator argument of
+/// a `mem::zeroed::<Option<Box<u8, alloc::alloc::Global>>>` — and so classified
+/// that `mem::zeroed` CALL as an allocation: `has_unsafe_patterns` admitted the
+/// body on its account, the alloc arm minted `[unsafe:sep:alloc]` rows for the
+/// zeroed terminator, `sep_call_sites` recorded the block, and `decide_site`
+/// answered Covered before the typed `[unsafe:zeroed]` verdict was ever
+/// reached (fail-closed — the bogus rows refute — but the typed obligation was
+/// blocked on exactly the shape it exists for). [`callee_is_sysroot_spelling`]
+/// strips every `::<…>` group first, so a type argument is never seen, and then
+/// requires the generic-free def path to be one of [`ALLOC_ITEMS`].
+///
+/// [`is_global_allocator_ufcs_call`] keeps the one trait-qualified allocator
+/// the old substring also matched (round-two `optbox` parity), and
+/// [`is_known_good_box_alloc`] keeps the infallible box allocators (its own
+/// crate-anchored, generic-stripped match — the same discipline).
+///
+/// MEASURED CONSEQUENCE of the exact list (2026-09-20): at `a351ee124e` the
+/// `interpret_call` alloc arm precedes the dealloc/realloc arms, and the
+/// `alloc::alloc` substring also matched `alloc::alloc::dealloc` and
+/// `alloc::alloc::realloc`, so both real spellings were interpreted as an
+/// ALLOCATION (a null/size check on a free). They now reach the arms that mean
+/// them (`DEALLOC_ITEMS`, `REALLOC_ITEMS`). No probe in the round-two
+/// corpus calls either; the change is recorded, not inferred.
+fn is_alloc_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, ALLOC_ITEMS)
+        || is_global_allocator_ufcs_call(key)
+        || is_known_good_box_alloc(key)
+}
+
+/// The default global allocator's `Allocator` impl, spelled trait-qualified:
+/// `<alloc::alloc::Global as core::alloc::Allocator>::allocate` / `::deallocate`
+/// — REAL extracted MIR (sealed `ff538f905`, the round-two `optbox` probe, where
+/// a user `Allocator` impl forwards to `Global`). Both were matched by the old
+/// `alloc::alloc` substring and modeled by the alloc arm (the `deallocate` rows
+/// are an allocation-shaped refutation of a free: fail-closed, and kept for
+/// byte-identity with round two — modeling `deallocate` as a free is a separate
+/// change). Matched LITERALLY on the generic-free spelling: `callee_is_std_crate_
+/// rooted` rejects every ` as ` path, so this is the one place a trait-qualified
+/// callee is admitted, and only these two leaves. An impersonating crate is
+/// stamped at the FRONT of the path (`__trust_crate@…::<alloc::…`), so the
+/// literal cannot match it; a user `<mycrate::Fake as core::alloc::Allocator>::
+/// allocate` differs in its Self type and does not match either.
+fn is_global_allocator_ufcs_call(key: Option<&CalleeKey>) -> bool {
+    // STRUCTURAL now, not a literal. The old test stripped the turbofish and
+    // compared against the RENDERED trait qualifier
+    // `<alloc::alloc::global as core::alloc::allocator>::allocate` — a spelling
+    // whose `<`, `>`, ` as ` and `::` are exactly the bytes a type argument can
+    // supply. The extractor resolves the same fact from `tcx.trait_of_assoc`
+    // (the trait's own `DefId`) plus the impl's self type, so a user
+    // `<mycrate::Fake as core::alloc::Allocator>::allocate` differs in its
+    // self-type head and a user trait on `Global` differs in its trait, and
+    // neither can be reached by any rendering.
+    callee_is_sysroot_item_tag(key, GLOBAL_ALLOCATOR_UFCS_ITEMS)
+}
+
+/// A `Ty::Adt` whose name is the AUTHENTICATED sysroot path ending in `suffix`,
+/// and whose ADT kind is a plain `struct`.
+///
+/// `Ty::Adt::name` is produced by `trust_mir_extract::sysroot_authenticated_def_path_str`,
+/// which STAMPS (`__trust_crate@<id>::…`) the path of any crate impersonating
+/// `core`/`alloc`/`std`. `path_root_is_authenticated_sysroot_crate` is this codebase's
+/// one consumer-side predicate for a sysroot spelling — anchored at the root AND stamp-free
+/// — so a user `mycrate::boxed::Box` fails the root test and a `--crate-name alloc` forgery
+/// fails the stamp test. `adt_kind` must be an explicit `Some(Struct)`: `None` (a
+/// hand-built / pre-migration `Ty::Adt`) and `Some(Union)` both fail closed.
+fn adt_is_authenticated_sysroot_struct(ty: &Ty, suffix: &str) -> bool {
+    matches!(
+        ty,
+        Ty::Adt { name, adt_kind: Some(trust_types::AdtKind::Struct), .. }
+            if trust_types::path_root_is_authenticated_sysroot_crate(name)
+                && name.ends_with(suffix)
+    )
+}
+
+/// Whole-body ESCAPE / PARTIAL-write fence for [`validity_rooted_box_deref_temps`]'s
+/// backward walk.
+///
+/// It deliberately does NOT count definitions: "how many values does this local
+/// hold" is `crate::local_defs`'s question and is asked there (that seam owns the
+/// ENTRY definition and the `Call`-destination channel, which a hand-rolled
+/// `Statement::Assign` scan silently misses). What is left is the two channels
+/// `local_defs` documents itself as NOT scoring — `Escape` (an alias handed out)
+/// and `Partial` (a store into the slot) — plus the write channels this IR does not
+/// model at all. A caller that needs the received VALUE, not just a fixed slot,
+/// must fence those itself; this is that fence.
+#[derive(Default)]
+struct ReceivedBoxFence {
+    /// Locals whose ADDRESS escapes (`&raw`, `&mut`): a later store through that
+    /// pointer could reseat the box with no whole-local definition anywhere.
+    /// `local_defs::unique_value_def` documents this exact gap as an open defect in
+    /// its `Escape` arm, so the fence is required, not belt-and-braces.
+    ///
+    /// Trust (2026-09-23): also a SHARED `&` of the local's own storage (a place
+    /// with no `Deref`), since this walk's consumer now DROPS rows rather than
+    /// reclassifying them. `unsafe { ptr::read(&b) }` duplicates the box through
+    /// a shared borrow, and dropping the duplicate frees the allocation `b`
+    /// still names — no whole-local write, no `&mut`, and every row of the
+    /// `ptr::read` itself is dischargeable. A shared borrow of the POINTEE
+    /// (`&*b`, `&(*_t).f` — a place under a `Deref`) does not expose the slot
+    /// and is not charged HERE. When the box slot itself lives under a reference
+    /// (13c), such a borrow IS a borrow of the slot; the reference lane charges it
+    /// ([`ReferenceLaneFacts`], 2026-09-28).
+    address_taken: FxHashSet<usize>,
+    /// Locals written THROUGH a non-`Deref` projection (`_1.0 = …`),
+    /// deinitialized, or discriminant-set: the value read at the box place is then
+    /// not the one that came in. A store through the local's POINTEE
+    /// (`(*_t) = v`) is not a write of the local itself.
+    partially_written: FxHashSet<usize>,
+    /// For a local whose ONE whole-local write is a `Use`/`CopyForDeref` of a place,
+    /// that source place.
+    ///
+    /// NOT a definition tally and NOT a resolver on its own: it is consulted only
+    /// AFTER `local_defs::holds_one_value` has certified that the local holds exactly
+    /// one value — the seam question that charges the ENTRY definition and the `Call`
+    /// destination channel. A local written by both an `Assign` and a `Call` dest
+    /// scores 2 there and never reaches this map. (Same gating discipline as
+    /// `trust-ir-bridge`'s `moved_value_local`, adjudicated in this crate's
+    /// `local_defs_seam_lint` CHANNEL_SUBSETS.) It exists because the seam's own
+    /// resolver, `local_defs::unique_value_def`, refuses a `LocalWrite::Partial` —
+    /// and a `Box` moved out of is ALWAYS `Drop`ped, which is that channel. A `Drop`
+    /// frees the allocation but does not reseat the local; see
+    /// [`ReceivedBoxFence::is_stable`] for why tolerating it is sound now that the
+    /// consumer drops the deref rows.
+    single_copy_source: FxHashMap<usize, Place>,
+    /// Trust (ENC-DEFECTS 13c, 2026-09-26): for a local whose ONE whole-local write
+    /// is a borrow `&P` / `&mut P`, that borrowed place. Consulted, exactly like
+    /// `single_copy_source`, only after `local_defs::holds_one_value` certified the
+    /// local holds one value, and only to re-spell `(*r).rest` as `P.rest` — the
+    /// borrow's referent IS `P`. This is the hop that lets a `match` binding
+    /// (`Expr::Neg(a)` lowers to `a = &((*e) as Neg).0`) reach the parameter `e`.
+    single_ref_source: FxHashMap<usize, Place>,
+    /// Trust (ENC-DEFECTS 13c): locals whose WHOLE value is the operand of a
+    /// `Cast` anywhere. For a reference local that is how a raw pointer to its
+    /// pointee is minted without any `&raw`/`&mut` of a place (`r as *mut T`), and a
+    /// store through that pointer is invisible to `partially_written`. A `Deref` of
+    /// such a local is never credited by [`access_path_is_validity_preserving`].
+    whole_value_cast: FxHashSet<usize>,
+    /// The body carries a write channel this IR does not model — an `Opaque`
+    /// terminator, an `Unsupported` statement/rvalue, or a `copy_nonoverlapping`
+    /// (an unbounded store through a raw pointer). Fails the WHOLE analysis, so such
+    /// a body keeps every row exactly as it is today.
+    unmodeled_write_channel: bool,
+    /// Trust (2026-09-28, independent review of ENC-DEFECTS 13c): the facts only the
+    /// REFERENCE lane reads (a box path that crosses a reference `Deref`), built on
+    /// first use — see [`ReferenceLaneFacts`].
+    reference_lane: std::cell::OnceCell<ReferenceLaneFacts>,
+}
+
+/// Where the value of one READ of a place goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadSink {
+    /// Consumed where no alias of the place can survive: a scalar operator, a
+    /// branch or assert condition, a discriminant or length read, or the compiler's
+    /// own box-read `Cast` (`copy ((box.0).0) as *const T`, a pointer to the
+    /// POINTEE — the value the root walk judges, never the slot that holds it).
+    Consumed,
+    /// Lands, whole, in this local: `_d = copy/move P`, `_d = deref_copy P`,
+    /// `_d = &P`.
+    Local(usize),
+    /// Anything else: a call or intrinsic argument, an aggregate or repeat operand,
+    /// any other cast, a `&mut`/`&raw` borrow, a drop of a projected place, a
+    /// pointer offset, a value stored into a projected place.
+    Escapes,
+}
+
+/// Trust (2026-09-28): what the reference lane of
+/// [`box_value_is_validity_rooted`] needs beyond [`ReceivedBoxFence`]'s write
+/// census.
+///
+/// WHY. 13c credits a box read THROUGH a reference on the premise that a valid
+/// `&T` points to a valid `T`, whose `Box` field owns a live allocation. That holds
+/// at ENTRY; the body can break it without ever writing `*r`: duplicate the box
+/// through an alias of its slot and drop the duplicate (`drop(ptr::read(&h.b))`,
+/// then `*h.b` is a use-after-free), in this body or in a callee the alias is
+/// handed to. The by-value root closes that channel by charging every borrow of
+/// the SLOT (`address_taken`), but a slot behind a reference is reached through a
+/// place under a `Deref`, which that charge deliberately exempts. The independent
+/// review of 13c measured it: `probe(h: &H) { drop(unsafe { ptr::read(&h.b) });
+/// *h.b }` lost its three `[unsafe:sep:deref]` rows (9 obligations -> 6), and a
+/// safe caller of a helper that frees the box through `h` went from a refusal to
+/// an advisory.
+///
+/// Two independent fences, both required by the reference lane:
+///  * `unsafe_operation` — the body performs an operation only `unsafe` code can:
+///    a call to an `unsafe`-signature or foreign function (or one the name
+///    fallback `is_unsafe_fn_call` recognizes), an intrinsic statement, a
+///    dereference of a raw pointer other than the compiler's own `*box` temp, a
+///    union field access, a pointer offset, or a `Cast` to anything but a
+///    scalar, raw pointer or fn pointer (the extracted `Cast` carries no kind, and
+///    `transmute` lowers to one — this is how a `Box` or a reference is minted
+///    from bits). Invalidating the allocation a reference-reached box owns takes
+///    one of these in SOME body; in THIS body it now refuses the lane outright,
+///    rather than leaving the refusal to the operation's own rows (which the
+///    2026-09-23 by-value root already judged dischargeable for `ptr::read`). It
+///    also covers the aliases no per-local scan can see: a SECOND parameter naming
+///    the same `T` (`h2` for `h1`), or a raw pointer into it;
+///  * `reads` — every READ of every place, with where its value goes
+///    ([`ReadSink`]). A read that overlaps the path (a prefix of it, or a place
+///    through it) and lets the value ESCAPE — to a call, into an aggregate, a
+///    cast, a `&mut`/`&raw` — hands out an alias of the memory holding the box
+///    slot (or of the reference that reaches it). A read into a local is allowed
+///    only when that local is itself inert (`alias_is_inert`): single-valued,
+///    stable, and read only in ways that let nothing escape. This is how a SAFE
+///    callee is kept from receiving the alias at all (`dup_and_free(h); *h.b`),
+///    the same way the by-value root charges `&b` handed to any call.
+///
+/// What stays assumed: a safe callee handed an alias this body cannot see (an
+/// aliasing SECOND parameter passed on) does not invalidate the allocation — the
+/// Rust safety contract; discharged by verification for a callee in this crate
+/// (its own unsafe operation is refused there), assumed for the sysroot and
+/// verify-off dependencies (docs/TCB.md, "A `Box` reached THROUGH a
+/// validity-rooted reference").
+/// Trust (OD-1 phase 1, 2026-10-04): D33's `unsafe_operation` fence as a body
+/// predicate. The instance-hypothesis admission
+/// (`compiler/rustc_mir_transform/src/trust_verify/instance_hypothesis.rs`) reads
+/// THIS census, never a copy: an open generic dispatch site is admitted only in a
+/// body that performs no operation only `unsafe` code can, because the havoc that
+/// replaces the call cannot model a body whose safety invariant depends on what
+/// the callee does (docs/design/2026-10-03-open-generic-dispatch-obligations.md §3).
+#[must_use]
+pub fn body_has_unsafe_operation(func: &VerifiableFunction) -> bool {
+    ReferenceLaneFacts::build_census(func, false, &[]).unsafe_operation
+}
+
+/// Trust (OD-1 item 18, 2026-10-06): [`body_has_unsafe_operation`] with ONE census
+/// arm relaxed: a `Rvalue::Cast` whose target is a REFERENCE (`Ty::Ref`) is not
+/// counted. The census counts every cast to a non-scalar target because the
+/// extracted `Rvalue::Cast` carries no cast kind, and a transmute leg of the
+/// extractor can emit a pointer-typed `Cast`. The CALLER owns the missing kind: the
+/// instance-hypothesis admission asks this variant only after checking, on the MIR
+/// it was extracted from, that EVERY cast whose target is a reference is a
+/// `PointerCoercion::Unsize` (`&[T; N] -> &[T]`, `&C -> &dyn Tr`), which is safe
+/// code: it writes nothing and only attaches a length or a vtable to the source
+/// pointer. Every other arm (raw derefs, union fields, intrinsics, unsafe calls, a
+/// cast to any other non-scalar target) is unchanged. D33's own lane never reads
+/// this variant.
+#[must_use]
+pub fn body_has_unsafe_operation_modulo_ref_unsize(func: &VerifiableFunction) -> bool {
+    ReferenceLaneFacts::build_census(func, true, &[]).unsafe_operation
+}
+
+/// Trust (OD-1 T-D, 2026-10-12): [`body_has_unsafe_operation`] (or, with
+/// `modulo_ref_unsize`, [`body_has_unsafe_operation_modulo_ref_unsize`]) with ONE
+/// more census arm narrowed: the unsafe-signature call arm does not count a `Call`
+/// terminator of a block listed in `format_args_ctor_blocks` WHEN its callee also
+/// renders as the sysroot `core::fmt::Arguments` constructor
+/// ([`is_std_fmt_arguments_ctor`], crate-anchored). The CALLER owns the list and
+/// must have proved, on the MIR and HIR the body came from, that each listed block's
+/// call is the `format_args!` desugaring's own `Arguments::new` (its callee's parent
+/// is the `FmtArgumentsNew` impl of an authenticated sysroot crate, and the call
+/// sits inside an `UnsafeSource::CompilerGenerated` block of the body's own HIR).
+/// Both anchors must agree; a listed block whose callee renders as anything else is
+/// still charged. Every other arm, and every other call, is unchanged. D33's own
+/// lane never reads this variant.
+#[must_use]
+pub fn body_has_unsafe_operation_modulo_format_args(
+    func: &VerifiableFunction,
+    modulo_ref_unsize: bool,
+    format_args_ctor_blocks: &[usize],
+) -> bool {
+    ReferenceLaneFacts::build_census(func, modulo_ref_unsize, format_args_ctor_blocks)
+        .unsafe_operation
+}
+
+/// Trust (OD-1 T-D, 2026-10-12): DIAGNOSTICS ONLY — [`body_unsafe_operation_witness`]
+/// for [`body_has_unsafe_operation_modulo_format_args`].
+#[must_use]
+pub fn body_unsafe_operation_witness_modulo_format_args(
+    func: &VerifiableFunction,
+    modulo_ref_unsize: bool,
+    format_args_ctor_blocks: &[usize],
+) -> Option<&'static str> {
+    ReferenceLaneFacts::build_census(func, modulo_ref_unsize, format_args_ctor_blocks)
+        .unsafe_witness
+}
+
+/// Trust (OD-1 T3, 2026-10-10): DIAGNOSTICS ONLY — the first census arm that made
+/// [`body_has_unsafe_operation`] (or, with `modulo_ref_unsize`,
+/// [`body_has_unsafe_operation_modulo_ref_unsize`]) answer `true`, in scan order;
+/// `None` exactly when that census answers `false`. Read by the instance-hypothesis
+/// admission's `TRUST_INSTANCE_HYPOTHESIS_DEBUG` print so a refused body names its
+/// cause; no decision reads it.
+#[must_use]
+pub fn body_unsafe_operation_witness(
+    func: &VerifiableFunction,
+    modulo_ref_unsize: bool,
+) -> Option<&'static str> {
+    let facts = ReferenceLaneFacts::build_census(func, modulo_ref_unsize, &[]);
+    debug_assert_eq!(facts.unsafe_operation, facts.unsafe_witness.is_some());
+    facts.unsafe_witness
+}
+
+#[derive(Default)]
+struct ReferenceLaneFacts {
+    unsafe_operation: bool,
+    /// The first census arm that set [`Self::unsafe_operation`] (diagnostics only,
+    /// [`body_unsafe_operation_witness`]).
+    unsafe_witness: Option<&'static str>,
+    reads: FxHashMap<usize, Vec<(Vec<Projection>, ReadSink)>>,
+    /// Whether `read_place` populates [`Self::reads`]. `true` for the reference
+    /// lane (`reference_lane_admits`); `false` for the unsafe-operation census
+    /// queries (`body_has_unsafe_operation*` / `body_unsafe_operation_witness*`),
+    /// which never inspect [`Self::reads`].
+    collect_reads: bool,
+    /// Trust (OD-1 item 18): [`body_has_unsafe_operation_modulo_ref_unsize`]'s
+    /// relaxation; `false` everywhere else.
+    ref_casts_are_unsize: bool,
+    /// Trust (OD-1 T-D): [`body_has_unsafe_operation_modulo_format_args`]'s blocks;
+    /// empty everywhere else.
+    format_args_ctor_blocks: FxHashSet<usize>,
+}
+
+impl ReferenceLaneFacts {
+    fn build(func: &VerifiableFunction) -> Self {
+        Self::build_relaxed(func, false, &[], true)
+    }
+
+    fn build_census(
+        func: &VerifiableFunction,
+        ref_casts_are_unsize: bool,
+        format_args_ctor_blocks: &[usize],
+    ) -> Self {
+        Self::build_relaxed(func, ref_casts_are_unsize, format_args_ctor_blocks, false)
+    }
+
+    fn compute_box_ptrs(func: &VerifiableFunction) -> FxHashSet<usize> {
+        // The compiler's `*box` temps: a deref of one is the SAFE box deref this
+        // analysis exists for, not an unsafe raw deref. Single-valued only, so a
+        // local that ALSO holds a user raw pointer is not exempt.
+        func.body
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter_map(|stmt| match stmt {
+                Statement::Assign { place, rvalue: Rvalue::Cast(operand, dst_ty), .. }
+                    if place.projections.is_empty()
+                        && box_read_cast_base(func, operand, dst_ty).is_some() =>
+                {
+                    Some(place.local)
+                }
+                _ => None,
+            })
+            .filter(|&temp| {
+                !crate::local_defs::is_parameter(func, temp)
+                    && crate::local_defs::holds_one_value(func, temp)
+            })
+            .collect()
+    }
+
+    fn build_relaxed(
+        func: &VerifiableFunction,
+        ref_casts_are_unsize: bool,
+        format_args_ctor_blocks: &[usize],
+        collect_reads: bool,
+    ) -> Self {
+        let _scope = crate::generate::EntryScope::enter(func);
+        let mut facts = Self {
+            collect_reads,
+            ref_casts_are_unsize,
+            format_args_ctor_blocks: format_args_ctor_blocks.iter().copied().collect(),
+            ..Self::default()
+        };
+        // PERF-COMPILER-VCGEN-709: compute `box_ptrs` lazily on demand so safe
+        // functions without raw-pointer dereferences or box-read casts skip the
+        // eager whole-body pre-scan.
+        let box_ptrs: std::cell::OnceCell<FxHashSet<usize>> = std::cell::OnceCell::new();
+        for block in &func.body.blocks {
+            for stmt in &block.stmts {
+                facts.scan_statement(func, &box_ptrs, stmt);
+                if facts.unsafe_operation {
+                    return facts;
+                }
+            }
+            facts.scan_terminator(func, &box_ptrs, block.id.0, &block.terminator);
+            if facts.unsafe_operation {
+                return facts;
+            }
+        }
+        facts
+    }
+
+    /// Charge an operation only `unsafe` code can perform (or one the scan cannot
+    /// judge, fail-closed), remembering the first arm for diagnostics.
+    fn mark_unsafe(&mut self, why: &'static str) {
+        self.unsafe_operation = true;
+        self.unsafe_witness.get_or_insert(why);
+    }
+
+    fn read_place(
+        &mut self,
+        func: &VerifiableFunction,
+        box_ptrs: &std::cell::OnceCell<FxHashSet<usize>>,
+        place: &Place,
+        sink: ReadSink,
+    ) {
+        self.touch_place(func, box_ptrs, place);
+        if self.collect_reads {
+            self.reads.entry(place.local).or_default().push((place.projections.clone(), sink));
+        }
+    }
+
+    fn read_operand(
+        &mut self,
+        func: &VerifiableFunction,
+        box_ptrs: &std::cell::OnceCell<FxHashSet<usize>>,
+        operand: &Operand,
+        sink: ReadSink,
+    ) {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                self.read_place(func, box_ptrs, place, sink);
+            }
+            Operand::Constant(_) => {}
+            // May stand for a place this scan cannot name: fail the lane closed.
+            _ => self.mark_unsafe("an operand the scan cannot name"),
+        }
+    }
+
+    /// A raw-pointer deref (other than a compiler `*box` temp's) or a union field
+    /// anywhere in `place` is an unsafe operation; so is a step the type walk
+    /// cannot follow (fail closed).
+    ///
+    /// Trust (OD-1 T3 class D, 2026-10-10): the walk types places with the body's
+    /// own place typing — `crate::place_ty_step`, which resolves a bare
+    /// recursive-datatype marker through `func.body.datatype_defs` and follows a
+    /// variant-relative `Field` after a `Downcast` — instead of the table-blind
+    /// `step_place_ty_cow`, which could follow neither and refused every body that
+    /// projected through a recursive type ("a place step the type walk cannot
+    /// follow": tla-cert `CaseBranch::serialize`, clean-ck0 `<Term as Hash>::hash`,
+    /// merge-contract `visit_enum`, astream-agent `run_turn`). Each step JUDGES the
+    /// resolved type (`crate::place_ty_step_input`, the same resolution) before
+    /// stepping, so a marker that resolves to a union still meets the union arm.
+    /// A RESOLVED definition is followed through a `Field` only when its kind is
+    /// recorded as a struct or an enum (or it is a `Ty::Datatype`, which only an
+    /// enum lowers to); a resolved `Ty::Adt` of unrecorded kind fails closed. A
+    /// marker the table does not define — every `compact_oversized_field` marker,
+    /// which may stand for a union — stays bare and still fails closed.
+    fn touch_place(
+        &mut self,
+        func: &VerifiableFunction,
+        box_ptrs: &std::cell::OnceCell<FxHashSet<usize>>,
+        place: &Place,
+    ) {
+        use std::borrow::Cow;
+        if place.projections.is_empty() {
+            return;
+        }
+        let Some(mut ty) = crate::local_ty_ref(func, place.local).map(Cow::Borrowed) else {
+            self.mark_unsafe("a place whose local has no type");
+            return;
+        };
+        let defs = &func.body.datatype_defs;
+        let mut pending_variant: Option<usize> = None;
+        let last = place.projections.len() - 1;
+        for (i, projection) in place.projections.iter().enumerate() {
+            // Trust (2026-09-29): the FINAL step of a variant-field read of a
+            // RECURSIVE enum — `((*e) as Bin).2`, `((*b) as Const).0` — needs no
+            // result type. This walk types a place only to judge the NEXT step (a
+            // raw-pointer `Deref`, a union `Field`), and a `Field` right after a
+            // `Downcast` is an enum-variant field, never a union field (MIR downcasts
+            // only enums and coroutines). A recursive enum lowers to a by-name
+            // `Ty::Datatype` whose variant fields `step_place_ty_cow` cannot type,
+            // so the walk used to fail closed on the result type of the last step
+            // and refuse the WHOLE reference lane for any body that matched on one:
+            // `**rhs` for `rhs: &Box<Expr>` bound out of `e: &Expr` kept its three
+            // `[unsafe:sep:deref]` rows (trust-ir-giveback `lib.rs:829`, measured
+            // 2026-09-29). A bare `Field` on such a marker still fails closed below —
+            // `compact_oversized_field` emits the same marker for ANY oversized ADT,
+            // union included — and so does every step whose type a LATER step needs.
+            if i == last
+                && matches!(projection, Projection::Field(_))
+                && i > 0
+                && matches!(place.projections[i - 1], Projection::Downcast(_))
+                && matches!(ty.as_ref(), Ty::Datatype { .. })
+            {
+                return;
+            }
+            let (resolved, from_table) = crate::place_ty_step_input(defs, ty);
+            ty = resolved;
+            if from_table
+                && matches!(projection, Projection::Field(_))
+                && !matches!(
+                    ty.as_ref(),
+                    Ty::Datatype { .. }
+                        | Ty::Adt {
+                            adt_kind: Some(
+                                trust_types::AdtKind::Struct | trust_types::AdtKind::Enum
+                            ),
+                            ..
+                        }
+                        | Ty::Adt { adt_kind: Some(trust_types::AdtKind::Union), .. }
+                )
+            {
+                self.mark_unsafe("a field of a resolved datatype of unrecorded kind");
+                return;
+            }
+            match projection {
+                Projection::Deref => match ty.as_ref() {
+                    Ty::Ref { .. } => {}
+                    Ty::RawPtr { .. }
+                        if i == 0
+                            && box_ptrs
+                                .get_or_init(|| Self::compute_box_ptrs(func))
+                                .contains(&place.local) => {}
+                    _ => {
+                        self.mark_unsafe("a dereference of a raw pointer (or of a non-reference)");
+                        return;
+                    }
+                },
+                Projection::Field(_)
+                    if matches!(
+                        ty.as_ref(),
+                        Ty::Adt { adt_kind: Some(trust_types::AdtKind::Union), .. }
+                    ) =>
+                {
+                    self.mark_unsafe("a union field access");
+                    return;
+                }
+                _ => {}
+            }
+            let Some(next) = crate::place_ty_step(defs, ty, projection, &mut pending_variant)
+            else {
+                self.mark_unsafe("a place step the type walk cannot follow");
+                return;
+            };
+            ty = next;
+        }
+    }
+
+    fn scan_statement(
+        &mut self,
+        func: &VerifiableFunction,
+        box_ptrs: &std::cell::OnceCell<FxHashSet<usize>>,
+        stmt: &Statement,
+    ) {
+        match stmt {
+            Statement::Assign { place, rvalue, .. } => {
+                self.touch_place(func, box_ptrs, place);
+                if self.unsafe_operation {
+                    return;
+                }
+                let into = if place.projections.is_empty() {
+                    ReadSink::Local(place.local)
+                } else {
+                    ReadSink::Escapes
+                };
+                match rvalue {
+                    Rvalue::Use(operand) => self.read_operand(func, box_ptrs, operand, into),
+                    Rvalue::CopyForDeref(src) | Rvalue::Ref { mutable: false, place: src } => {
+                        self.read_place(func, box_ptrs, src, into);
+                    }
+                    Rvalue::Ref { mutable: true, place: src } | Rvalue::AddressOf(_, src) => {
+                        self.read_place(func, box_ptrs, src, ReadSink::Escapes);
+                    }
+                    Rvalue::Cast(operand, dst_ty) => {
+                        let sink = if self.collect_reads
+                            && (box_read_cast_base(func, operand, dst_ty).is_some()
+                                || (place.projections.is_empty()
+                                    && matches!(dst_ty, Ty::RawPtr { .. })
+                                    && box_ptrs
+                                        .get_or_init(|| Self::compute_box_ptrs(func))
+                                        .contains(&place.local)))
+                        {
+                            ReadSink::Consumed
+                        } else {
+                            ReadSink::Escapes
+                        };
+                        self.read_operand(func, box_ptrs, operand, sink);
+                        if self.unsafe_operation {
+                            return;
+                        }
+                        let safe_ref_unsize =
+                            self.ref_casts_are_unsize && matches!(dst_ty, Ty::Ref { .. });
+                        if !safe_ref_unsize
+                            && !matches!(
+                                dst_ty,
+                                Ty::Bool
+                                    | Ty::Int { .. }
+                                    | Ty::PtrSizedInt { .. }
+                                    | Ty::Char
+                                    | Ty::Float { .. }
+                                    | Ty::RawPtr { .. }
+                                    | Ty::FnPtr { .. }
+                                    | Ty::Bv(_)
+                            )
+                        {
+                            self.mark_unsafe("a cast to a non-scalar, non-pointer target");
+                        }
+                    }
+                    Rvalue::BinaryOp(_, a, b)
+                    | Rvalue::CheckedBinaryOp(_, a, b)
+                    | Rvalue::UncheckedBinaryOp(_, a, b) => {
+                        self.read_operand(func, box_ptrs, a, ReadSink::Consumed);
+                        if self.unsafe_operation {
+                            return;
+                        }
+                        self.read_operand(func, box_ptrs, b, ReadSink::Consumed);
+                    }
+                    Rvalue::UnaryOp(_, a) => self.read_operand(func, box_ptrs, a, ReadSink::Consumed),
+                    Rvalue::Discriminant(src) | Rvalue::Len(src) => {
+                        self.read_place(func, box_ptrs, src, ReadSink::Consumed);
+                    }
+                    Rvalue::Aggregate(_, operands) => {
+                        for operand in operands {
+                            self.read_operand(func, box_ptrs, operand, ReadSink::Escapes);
+                            if self.unsafe_operation {
+                                return;
+                            }
+                        }
+                    }
+                    Rvalue::Repeat(operand, _) => {
+                        self.read_operand(func, box_ptrs, operand, ReadSink::Escapes);
+                    }
+                    Rvalue::PtrOffset { ptr, count } => {
+                        self.read_operand(func, box_ptrs, ptr, ReadSink::Escapes);
+                        if self.unsafe_operation {
+                            return;
+                        }
+                        self.read_operand(func, box_ptrs, count, ReadSink::Consumed);
+                        if self.unsafe_operation {
+                            return;
+                        }
+                        self.mark_unsafe("a pointer offset");
+                    }
+                    // `Unsupported`, and any variant added after this census.
+                    _ => self.mark_unsafe("an unsupported rvalue"),
+                }
+            }
+            Statement::Intrinsic { args, .. } => {
+                for arg in args {
+                    self.read_operand(func, box_ptrs, arg, ReadSink::Escapes);
+                    if self.unsafe_operation {
+                        return;
+                    }
+                }
+                self.mark_unsafe("an intrinsic statement");
+            }
+            Statement::SetDiscriminant { place, .. } | Statement::Deinit { place } => {
+                self.touch_place(func, box_ptrs, place);
+            }
+            Statement::StorageLive(_)
+            | Statement::StorageDead(_)
+            | Statement::Retag { .. }
+            | Statement::PlaceMention(_)
+            | Statement::Coverage
+            | Statement::ConstEvalCounter
+            | Statement::Nop => {}
+            // `CopyNonOverlapping`, `Unsupported`, and any variant added later.
+            _ => self.mark_unsafe("an unsupported statement"),
+        }
+    }
+
+    fn scan_terminator(
+        &mut self,
+        func: &VerifiableFunction,
+        box_ptrs: &std::cell::OnceCell<FxHashSet<usize>>,
+        block: usize,
+        terminator: &Terminator,
+    ) {
+        match terminator {
+            Terminator::Call { func: callee, args, dest, is_unsafe_sig, is_foreign, .. } => {
+                self.touch_place(func, box_ptrs, dest);
+                if self.unsafe_operation {
+                    return;
+                }
+                for arg in args {
+                    self.read_operand(func, box_ptrs, arg, ReadSink::Escapes);
+                    if self.unsafe_operation {
+                        return;
+                    }
+                }
+                // Trust (OD-1 T-D): the `format_args!` desugaring's own
+                // `Arguments::new`, when the caller listed this block AND the callee
+                // renders as the crate-anchored sysroot constructor. A foreign item
+                // is never exempt. Its arguments were read above like any call's.
+                let format_args_ctor = !*is_foreign
+                    && self.format_args_ctor_blocks.contains(&block)
+                    && {
+                        let lower: std::borrow::Cow<'_, str> =
+                            if callee.bytes().any(|b| b.is_ascii_uppercase()) {
+                                std::borrow::Cow::Owned(callee.to_lowercase())
+                            } else {
+                                std::borrow::Cow::Borrowed(callee)
+                            };
+                        is_std_fmt_arguments_ctor(&lower)
+                    };
+                if !format_args_ctor
+                    && (*is_unsafe_sig
+                        || *is_foreign
+                        || crate::unsafe_verify::detection::is_unsafe_fn_call(callee))
+                {
+                    self.mark_unsafe("a call to an unsafe-signature or foreign function");
+                }
+            }
+            Terminator::TailCall { func: callee, args, is_unsafe_sig, is_foreign, .. } => {
+                for arg in args {
+                    self.read_operand(func, box_ptrs, arg, ReadSink::Escapes);
+                    if self.unsafe_operation {
+                        return;
+                    }
+                }
+                if *is_unsafe_sig
+                    || *is_foreign
+                    || crate::unsafe_verify::detection::is_unsafe_fn_call(callee)
+                {
+                    self.mark_unsafe("a tail call to an unsafe-signature or foreign function");
+                }
+            }
+            Terminator::SwitchInt { discr, .. } => {
+                self.read_operand(func, box_ptrs, discr, ReadSink::Consumed);
+            }
+            Terminator::Assert { cond, .. } => {
+                self.read_operand(func, box_ptrs, cond, ReadSink::Consumed);
+            }
+            // Dropping a WHOLE local runs its glue on what it owns; it is not an
+            // alias of anything behind a reference it holds. A projected drop is.
+            Terminator::Drop { place, .. } => {
+                if place.projections.is_empty() {
+                    self.touch_place(func, box_ptrs, place);
+                } else {
+                    self.read_place(func, box_ptrs, place, ReadSink::Escapes);
+                }
+            }
+            Terminator::Goto(_)
+            | Terminator::Return
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
+            // `Opaque`, and any variant added later.
+            _ => self.mark_unsafe("an opaque or unsupported terminator"),
+        }
+    }
+}
+
+/// Do two access paths from the same local name overlapping memory? Paths diverge
+/// only at two different `Field`s of one struct/tuple/variant, or at two different
+/// variants' `Downcast`s. Anything else — one a prefix of the other, an index, a
+/// subslice — overlaps (fail closed).
+///
+/// Two variants are disjoint here although they share storage: rustc reaches a
+/// `Downcast` only under a discriminant test naming that variant, and the variant
+/// behind a reference cannot change in between without a write the fences already
+/// charge (a store or `SetDiscriminant` through the reference is
+/// `partially_written`; a `&mut`/`&raw` is `address_taken`; an unsafe write is
+/// `unsafe_operation`; an `UnsafeCell` on the path is refused).
+fn access_paths_overlap(a: &[Projection], b: &[Projection]) -> bool {
+    for (x, y) in a.iter().zip(b) {
+        match (x, y) {
+            _ if x == y => {}
+            (Projection::Field(_), Projection::Field(_))
+            | (Projection::Downcast(_), Projection::Downcast(_)) => return false,
+            _ => return true,
+        }
+    }
+    true
+}
+
+impl ReceivedBoxFence {
+    fn build(func: &VerifiableFunction) -> Self {
+        let mut fence = Self::default();
+        // A store THROUGH a raw pointer (`*p = v`, `(*p).f = v`) writes the
+        // pointee, not `p`, so it does not make `p` partially written. Without
+        // this the box temp of a safe `(*box).f = v` fenced itself out of the
+        // root walk (2026-10-01). Raw pointers only: a raw pointer is never a
+        // validity root (the walk refuses a raw `Deref` base), whereas a store
+        // through a REFERENCE root, `(*r).boxed = new`, reseats the box the walk
+        // reached and must keep fencing it.
+        let raw_ptr_local =
+            |local: usize| matches!(crate::local_ty_ref(func, local), Some(Ty::RawPtr { .. }));
+        for block in &func.body.blocks {
+            for stmt in &block.stmts {
+                match stmt {
+                    Statement::Assign { place, rvalue, .. } => {
+                        let through_raw_ptr = matches!(place.projections.first(), Some(Projection::Deref))
+                            && raw_ptr_local(place.local);
+                        if place.projections.is_empty() {
+                            if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                            | Rvalue::CopyForDeref(src) = rvalue
+                            {
+                                fence.single_copy_source.insert(place.local, src.clone());
+                            }
+                            if let Rvalue::Ref { place: referent, .. } = rvalue {
+                                fence.single_ref_source.insert(place.local, referent.clone());
+                            }
+                        } else if !through_raw_ptr {
+                            // Trust (2026-10-09, merged 2026-10-14): a store THROUGH a
+                            // raw pointer local (`(*_t) = v`, the box temp of `*b = v`)
+                            // writes its POINTEE, not its slot, so it is no partial
+                            // write of the local. A store through a REFERENCE local
+                            // stays fenced here (the reference lane reads it); D14's
+                            // `reference_param_is_confined` additionally refuses any
+                            // store into `(*P)` on its own root.
+                            fence.partially_written.insert(place.local);
+                        }
+                        if let Rvalue::Cast(Operand::Copy(src) | Operand::Move(src), _) = rvalue
+                            && src.projections.is_empty()
+                        {
+                            fence.whole_value_cast.insert(src.local);
+                        }
+                        match rvalue {
+                            Rvalue::AddressOf(_, p) | Rvalue::Ref { mutable: true, place: p } => {
+                                fence.address_taken.insert(p.local);
+                            }
+                            // See `address_taken`: the slot itself, not a pointee.
+                            Rvalue::Ref { mutable: false, place: p }
+                                if !p.projections.contains(&Projection::Deref) =>
+                            {
+                                fence.address_taken.insert(p.local);
+                            }
+                            Rvalue::Unsupported { .. } => {
+                                fence.unmodeled_write_channel = true;
+                                return fence;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Statement::Deinit { place } | Statement::SetDiscriminant { place, .. } => {
+                        fence.partially_written.insert(place.local);
+                    }
+                    Statement::Unsupported { .. } | Statement::CopyNonOverlapping { .. } => {
+                        fence.unmodeled_write_channel = true;
+                        return fence;
+                    }
+                    _ => {}
+                }
+            }
+            match &block.terminator {
+                Terminator::Call { dest, .. } if !dest.projections.is_empty() => {
+                    fence.partially_written.insert(dest.local);
+                }
+                Terminator::Opaque { .. } => {
+                    fence.unmodeled_write_channel = true;
+                    return fence;
+                }
+                _ => {}
+            }
+        }
+        fence
+    }
+
+    /// No alias of this local escaped, and nothing wrote into it through a
+    /// projection.
+    ///
+    /// A `Drop` is deliberately NOT disqualifying here (nor in `single_copy_source`):
+    /// dropping a `Box` frees its allocation but does not reseat the local, and this
+    /// walk is block-order-insensitive, so refusing on it would refuse EVERY moved-out
+    /// box — which is the entire shape. It is sound for a consumer that DROPS the
+    /// deref rows because the deref being judged is a compiler-synthesized `*box` of
+    /// a place borrowck required to be INITIALIZED at that point, and a MIR `Drop`
+    /// deinitializes its place: no path reaches that deref after the box's own
+    /// `Drop`. What CAN free the allocation while the local still names it is an
+    /// alias — a `&mut`/`&raw`/shared borrow of the slot (fenced above) or a second
+    /// box forged by an unsafe operation that carries its own rows (`Box::from_raw`,
+    /// `transmute`). A `Box::new` root's allocation is also tracked by the heap, and
+    /// the engine refuses a deref after it was freed on the walk
+    /// (`SepEngine::derefs_rooted_box_temp`).
+    fn is_stable(&self, local: usize) -> bool {
+        !self.address_taken.contains(&local) && !self.partially_written.contains(&local)
+    }
+
+    /// Trust (2026-09-28): the REFERENCE lane's two extra fences (see
+    /// [`ReferenceLaneFacts`]) for the step of the root walk at `local` along `proj`,
+    /// a path that crosses at least one reference `Deref`: the body performs no
+    /// operation only `unsafe` code can, and no read of `local` that overlaps
+    /// `proj` lets an alias of the box slot — or of a reference that reaches it —
+    /// escape.
+    fn reference_lane_admits(
+        &self,
+        func: &VerifiableFunction,
+        local: usize,
+        proj: &[Projection],
+    ) -> bool {
+        let facts = self.reference_lane.get_or_init(|| ReferenceLaneFacts::build(func));
+        if facts.unsafe_operation {
+            return false;
+        }
+        facts.reads.get(&local).is_none_or(|reads| {
+            reads.iter().all(|(read, sink)| {
+                !access_paths_overlap(read, proj)
+                    || match *sink {
+                        ReadSink::Consumed => true,
+                        ReadSink::Local(dest) => self.alias_is_inert(func, facts, dest, 8),
+                        ReadSink::Escapes => false,
+                    }
+            })
+        })
+    }
+
+    /// A local that received (part of) an alias is harmless when it holds that one
+    /// value, nothing borrows or rewrites its slot, and every read of it is
+    /// consumed or lands in another inert local — the compiler's own box-read
+    /// chain (`_2 = copy (*_1); _3 = copy ((_2.0).0) as *const T`), a match
+    /// binding read only through (`_5 = &((*_1) as V).0; _2 = copy (*_5)`). An
+    /// alias that reaches a call, an aggregate, a cast or a borrow is not. The
+    /// `fuel` bounds the chain; running out fails closed.
+    fn alias_is_inert(
+        &self,
+        func: &VerifiableFunction,
+        facts: &ReferenceLaneFacts,
+        local: usize,
+        fuel: u32,
+    ) -> bool {
+        fuel > 0
+            && self.is_stable(local)
+            && crate::local_defs::holds_one_value(func, local)
+            // Trust (merge 2026-10-14, D14's R-f): a `Drop` is not a read, so the
+            // census above never sees it; an alias local that holds a bitwise copy
+            // of (a value containing) the box would free its allocation there. A
+            // reference alias is never dropped, so this costs the lane nothing.
+            && (!crate::generate::terminator_presence_for(func).has_drop
+                || !crate::any_local_write_term(func, &func.body.blocks, local, |_block, term| {
+                    matches!(term, Terminator::Drop { place, .. } if place.local == local)
+                }))
+            && facts.reads.get(&local).is_none_or(|reads| {
+                reads.iter().all(|(_, sink)| match *sink {
+                    ReadSink::Consumed => true,
+                    ReadSink::Local(dest) => self.alias_is_inert(func, facts, dest, fuel - 1),
+                    ReadSink::Escapes => false,
+                })
+            })
+    }
+}
+
+/// The `Box` place a box-read `Cast` reads its pointer out of:
+/// `copy ((box.0: Unique).0: NonNull) as *const T`, the temp rustc's
+/// `ElaborateBoxDerefs` mints for a safe `*box`. The extracted `Cast` has NO
+/// `CastKind`, so the shape is authenticated by TYPE: the two trailing `Field(0)`
+/// projections must step `Box` -> `Unique` -> `NonNull`, each an AUTHENTICATED
+/// sysroot struct path (see [`adt_is_authenticated_sysroot_struct`]), and the
+/// destination must be a raw pointer.
+fn box_read_cast_base(func: &VerifiableFunction, operand: &Operand, dst_ty: &Ty) -> Option<Place> {
+    if !matches!(dst_ty, Ty::RawPtr { .. }) {
+        return None;
+    }
+    let (Operand::Copy(src) | Operand::Move(src)) = operand else { return None };
+    let n = src.projections.len();
+    // Trust (1.101): two authenticated chains reach the box's pointer — 1.99's
+    // `Box.0:Unique.0:NonNull` (two trailing Field(0)s in the operand) and
+    // 1.101's `Box.0:BoxRaw` (one; the cast itself extracts the NonNull).
+    // `fields` is how many trailing projections belong to the box machinery.
+    let fields = if n >= 2
+        && matches!(src.projections[n - 2], Projection::Field(0))
+        && matches!(src.projections[n - 1], Projection::Field(0))
+    {
+        2
+    } else if n >= 1 && matches!(src.projections[n - 1], Projection::Field(0)) {
+        1
+    } else {
+        return None;
+    };
+    let box_ty = crate::place_prefix_ty_cow(func, src.local, &src.projections[..n - fields])?;
+    if !adt_is_authenticated_sysroot_struct(&box_ty, "::boxed::Box") {
+        return None;
+    }
+    let unique_ty = crate::step_place_ty_cow(box_ty, &Projection::Field(0))?;
+    if fields == 1 {
+        if !adt_is_authenticated_sysroot_struct(&unique_ty, "::boxed::BoxRaw") {
+            return None;
+        }
+        return Some(Place {
+            local: src.local,
+            projections: src.projections[..n - fields].to_vec(),
+        });
+    }
+    if !adt_is_authenticated_sysroot_struct(&unique_ty, "::ptr::unique::Unique") {
+        return None;
+    }
+    let nonnull_ty = crate::step_place_ty_cow(unique_ty, &Projection::Field(0))?;
+    if !adt_is_authenticated_sysroot_struct(&nonnull_ty, "::ptr::non_null::NonNull") {
+        return None;
+    }
+    Some(Place { local: src.local, projections: src.projections[..n - fields].to_vec() })
+}
+
+/// Every projection in `proj` must be VALIDITY-PRESERVING on a valid base value: a
+/// struct/tuple `Field`, or an enum `Downcast` followed by that variant's `Field`.
+///
+/// This mirrors `trust_mir_extract::convert::box_place_safe_access_path` on the
+/// (lossier) extracted IR. A `Deref` was refused outright here until 13c (below):
+/// a raw deref carries no validity guarantee, and the step's base TYPE (`Ty::Ref`
+/// vs `Ty::RawPtr`, read off the prefix place) is what tells the two apart. A UNION field is refused
+/// (its bytes carry no validity guarantee — a punned read can produce any pointer),
+/// and so is an ADT whose kind the extractor did not record (`adt_kind: None`), an
+/// index, a subslice, and every remaining projection: all fail CLOSED.
+///
+/// `#[repr(packed)]` is NOT checked, and does not need to be: unlike the extractor's
+/// REFERENCE-validity lane, nothing here reads an alignment off the projected place.
+/// The rows this path lets the engine drop — alignment included — are about the
+/// box's POINTEE, and a valid `Box` value's pointer is aligned for `T` wherever the
+/// box value itself is stored; reading that value out of a packed field is an
+/// ordinary (compiler-lowered) copy.
+///
+/// Trust (ENC-DEFECTS 13c, 2026-09-26): a `Deref` IS now admitted, of a REFERENCE
+/// (`Ty::Ref`, shared or mutable) and nothing else — never a raw pointer (no
+/// validity guarantee), never a `Box` (that deref is the one being judged, and
+/// `ElaborateBoxDerefs` leaves none in a path anyway). A valid `&T` points to a
+/// valid `T`, and a valid `T`'s `Box` field is a valid `Box`: the same
+/// parameter-validity invariant the pristine-parameter root rests on, applied one
+/// reference deeper, and the one `trust_mir_extract`'s `received_box_origin`
+/// already applies to the null/alignment UB-check asserts on the same derefs
+/// (`box_place_safe_access_path` admits exactly a reference `Deref`). Two fences
+/// here, on the PATH:
+///  * a `Deref` of the path's own ROOT local requires that the local's whole value
+///    is never `Cast` anywhere ([`ReceivedBoxFence::whole_value_cast`]) — a way
+///    to mint a raw pointer to the pointee that the `&raw`/`&mut` fence in
+///    `is_stable` cannot see; a `Deref` deeper in the path reads a reference
+///    stored INSIDE the valid value, whose own writes are `partially_written`;
+///  * after any reference `Deref`, a `Field` step into an interior-mutability
+///    wrapper is refused: a shared reference does not freeze an `UnsafeCell`.
+///
+/// These say the path reaches a box that was valid at ENTRY. That it is still
+/// live at the read is the reference lane's question, asked by the caller
+/// ([`box_value_is_validity_rooted`] → [`ReceivedBoxFence::reference_lane_admits`],
+/// 2026-09-28): no unsafe operation in the body, and no alias of the slot handed
+/// out. The `Cast` fence above is one special case of the second; it is kept.
+///
+/// Steps before `start` are not judged here (D14's
+/// [`reference_param_pointee_box_root`] passes `start = 1` for the leading reference
+/// `Deref` it fences itself); a skipped `Deref` still puts the rest of the path
+/// behind a reference for the interior-mutability fence. `start` also selects the
+/// lane for the recursion-cut marker widening: a path through a reference `Deref`
+/// with `start = 0` is 13c's, judged exactly as on main (no widening).
+fn access_path_is_validity_preserving(
+    func: &VerifiableFunction,
+    fence: &ReceivedBoxFence,
+    local: usize,
+    proj: &[Projection],
+    start: usize,
+) -> bool {
+    if start >= proj.len() {
+        return true;
+    }
+    let mut pending_downcast = false;
+    // A path that starts past a leading reference `Deref` (D14's caller passes
+    // `start = 1`) is already behind a reference.
+    let mut behind_reference =
+        proj.iter().take(start).any(|elem| matches!(elem, Projection::Deref));
+    // Trust (merge 2026-10-14, review of the post-merge reds): the marker widening
+    // below (sweep c67, review round 120) was written and reviewed for the lanes of
+    // the soundness line: D14 (`start = 1`, which roots only under the installed,
+    // DEMOTED and disclosed REFERENCE_ARG_BOX_VALID premise) and the by-value
+    // parameter / `Box::new` roots, whose paths cross no `Deref`. The merge made this
+    // function shared with main's 13c reference lane (`start = 0`, a path through a
+    // reference `Deref`), which at the merge dropped rows with NO premise and no
+    // demotion and which on main judges such a prefix as the bare marker, refusing a
+    // bare `Field` on a `Ty::Datatype` (docs/TCB.md, the 13c row). Widened there too,
+    // 13c rooted a box behind a RECURSIVE STRUCT reached through a reference argument
+    // (`match &n.next { Some(b) => b.val }` for `struct Node { val: u32, next:
+    // Option<Box<Node>> }`) undemoted: a shape neither side credited without the
+    // premise. So 13c's paths are judged exactly as on main, and D14 alone widens
+    // through a reference. (Since D100, 2026-10-14, a 13c root through a reference
+    // ARGUMENT is graded under the premise too — `crosses_an_argument_reference` — but
+    // widening 13c's own fences is a precision change D100 did not take: 13c still
+    // roots nothing here it did not root on main.)
+    let resolve_markers = start > 0 || !proj.contains(&Projection::Deref);
+    let Some(mut base_cow) = crate::place_prefix_ty_cow(func, local, &proj[..start]) else {
+        return false;
+    };
+    let mut pending_variant: Option<usize> = proj[..start]
+        .last()
+        .and_then(|p| if let Projection::Downcast(v) = p { Some(*v) } else { None });
+    for (i, elem) in proj.iter().enumerate().skip(start) {
+        // Trust (2026-10-11, sweep c67): `place_ty` widens a recursion-cut
+        // `Datatype { variants: [] }` marker only before a FURTHER step reads it, so a
+        // prefix that ends at one (`(*n)` for `n: &Node` with `Node` recursive) comes
+        // back as the bare marker. Widen it through this body's own definition table
+        // (the same one `place_ty` uses) so the kind below is the definition's — on
+        // every lane but 13c's (`resolve_markers`, above).
+        let resolved_cow =
+            if resolve_markers { Some(crate::resolved_ty(func, &base_cow)) } else { None };
+        let base: &Ty = resolved_cow.as_deref().unwrap_or(&base_cow);
+        if behind_reference && ty_is_interior_mut_cell(base) {
+            return false;
+        }
+        match elem {
+            Projection::Deref => {
+                if pending_downcast
+                    || !matches!(base, Ty::Ref { .. })
+                    || (i == 0 && fence.whole_value_cast.contains(&local))
+                {
+                    return false;
+                }
+                behind_reference = true;
+            }
+            Projection::Downcast(_) => {
+                if !matches!(base, Ty::Adt { adt_kind: Some(trust_types::AdtKind::Enum), .. })
+                    && !is_recursive_enum_datatype(base)
+                {
+                    return false;
+                }
+                pending_downcast = true;
+            }
+            Projection::Field(_) => {
+                let ok = if pending_downcast {
+                    matches!(base, Ty::Adt { adt_kind: Some(trust_types::AdtKind::Enum), .. })
+                        || is_recursive_enum_datatype(base)
+                } else {
+                    matches!(base, Ty::Tuple(_))
+                        || matches!(
+                            base,
+                            Ty::Adt { adt_kind: Some(trust_types::AdtKind::Struct), .. }
+                        )
+                };
+                if !ok {
+                    return false;
+                }
+                pending_downcast = false;
+            }
+            _ => return false,
+        }
+        if i + 1 < proj.len() {
+            let Some(next_cow) = crate::place_ty_step(
+                &func.body.datatype_defs,
+                base_cow,
+                elem,
+                &mut pending_variant,
+            ) else {
+                return false;
+            };
+            base_cow = next_cow;
+        }
+    }
+    true
+}
+
+/// Trust (2026-09-29): is `ty` the lowering of a RECURSIVE ENUM — the `Ty::Datatype`
+/// `trust-mir-extract` emits for an enum whose variants reach the enum again
+/// (`enum Expr { Const(i64), Bin(u8, Box<Expr>, Box<Expr>) }`), as its defining
+/// occurrence or as a by-name marker — for the ONE question
+/// [`access_path_is_validity_preserving`] asks of it: may a `Downcast` step (and the
+/// `Field` right after it) be credited as an enum-variant step?
+///
+/// Called only on the BASE of a `Downcast` / downcast `Field`. MIR emits `Downcast`
+/// only on enums and coroutines, so a `Ty::Datatype` in that position is an enum —
+/// except the generic `__trust_compacted_aggregate` marker, which
+/// `compact_oversized_field` gives an oversized NON-ADT (a coroutine among them) and
+/// which is refused. Without this the lane accepted a `Ty::Adt` enum only, and every
+/// `Box` in a recursive enum — the ordinary reason an enum holds a `Box` at all —
+/// reached through a reference kept its three `[unsafe:sep:deref]` rows (measured on
+/// trust-ir-giveback, 2026-09-29). Everything else the lane requires is unchanged:
+/// the enum is reached through a validity-rooted reference, and no union, raw
+/// deref, cell or unstamped struct step is on the path.
+fn is_recursive_enum_datatype(ty: &Ty) -> bool {
+    matches!(ty, Ty::Datatype { name, .. } if name != "__trust_compacted_aggregate")
+}
+
+/// Trust (ENC-DEFECTS 13c): an `UnsafeCell`-family wrapper, by the generic-stripped
+/// path tail — a shared reference does not make its contents immutable, so a box
+/// reached THROUGH one behind a reference is not credited. User MIR cannot project
+/// into these private fields; the refusal closes the std-internal case outright.
+/// A `Ty::Datatype` (a recursive or compacted ADT) is judged by the same name
+/// test, so a compacted cell is refused as its `Ty::Adt` spelling would be.
+///
+/// Trust: 2026-10-14 (INTERIOR-MUT-CHANNEL-1): the one name list,
+/// `guards::ty_is_interior_mut_wrapper` (which adds `Condvar` and `Once` to this one's).
+fn ty_is_interior_mut_cell(ty: &Ty) -> bool {
+    crate::guards::ty_is_interior_mut_wrapper(ty)
+}
+
+/// Is the `Box` VALUE named by `Place { local, proj }` provably VALID — either
+/// received as (part of) a PARAMETER of this function, or the fresh result of an
+/// in-body `Box::new` / `Box::new_uninit` call — and never fabricated otherwise?
+///
+/// The extracted-IR analogue of `trust_mir_extract::convert::box_alloc_facts_for_addr`
+/// (`alloc_call_box_facts` for an in-body box allocator, `received_box_facts` /
+/// `received_box_origin` for a parameter), which already discharges rustc's
+/// null/alignment UB-check asserts on the same two roots — NOT their liveness,
+/// which no extractor lane speaks to — and deliberately NARROWER: the only hops are
+/// whole-local `Use`/`CopyForDeref` copies over validity-preserving access paths,
+/// and the only accepted roots are
+///
+///  * a PRISTINE parameter (no whole-local assign, no terminator def, no escaped
+///    address, no partial write),
+///  * a local whose one value is the WHOLE destination of a call to the
+///    authenticated sysroot `Box::new` / `Box::new_uninit`
+///    ([`is_known_good_box_alloc`] — the same key `box_good_provs` is minted on),
+///    neither foreign nor unsafe-signature, and
+///  * (D8, 2026-09-24) a local whose one value is the WHOLE destination of a
+///    call the COMPILER certified as a returned-`Box` validity root
+///    ([`is_certified_returned_box_destination`]): in a session with no
+///    value-changing MIR optimization, a direct, safe, Rust-ABI, non-foreign
+///    callee that resolves to a plain item body (never a `dyn` method or a
+///    shim), carries no `#[trust::assume_total]`/`#[trust::skip]`, no
+///    `#[no_mangle]`/`#[export_name]`, is not naked and has no target feature.
+///    The premise is that a safe API returns valid values — DISCHARGED by
+///    verification for a callee in this crate (every channel that mints an
+///    invalid `Box` in a verified body carries a refusing row, the D8-P0
+///    `[unsafe:validity-transmute]` creation row included) and ASSUMED for the
+///    sysroot and verify-off dependencies (docs/TCB.md, "Validity premises
+///    about values that arrive from outside the checked body").
+///
+/// Every other CALL — `Box::from_raw(p)` (an `unsafe fn`), a foreign import, a
+/// `fn`-pointer or `dyn` call, an axiom or exported callee, any call in an
+/// optimized session — is refused, and so is a `Cast` (a `transmute` into a
+/// `Box`), so those hazards keep today's rows.
+///
+/// The parameter root is the LANGUAGE's argument-validity invariant: a parameter
+/// must be a valid value of its type, and a valid value's `Box` field is a valid
+/// `Box`. This is the same invariant `trust_mir_extract`'s
+/// `type_is_validity_nonnull` rests on; it is applied here to a parameter of ANY
+/// type reached by a field/variant path (nn's box arrives inside an enum passed by
+/// value), which is why the path fence above must refuse unions and derefs; the
+/// LIVENESS half of it (the allocation-validity row this drops) is the same
+/// shallow-validity assumption the engine already makes by never charging a `&T`
+/// deref. The `Box::new` root is that allocator's postcondition (non-null,
+/// aligned, live): `discharge_box_good` already uses the non-null and live halves,
+/// and leaves alignment only because its symbolic divisor is nonlinear.
+///
+/// Its consumer, [`SepEngine::place_has_raw_deref`] via
+/// [`validity_rooted_box_deref_ops`], DROPS the deref rows of a rooted temp, so
+/// an error in the permissive direction here IS a false proof. Every refusal
+/// above is load-bearing for that reason.
+///
+/// A path that crosses a REFERENCE `Deref` (13c) roots at the parameter behind
+/// that reference; the box it names was valid at entry, and every step of such a
+/// path must also pass [`ReceivedBoxFence::reference_lane_admits`] — no unsafe
+/// operation anywhere in the body, and no alias of the box slot (or of a
+/// reference reaching it) handed out — so that it is still live at the read.
+/// Since D100 (2026-10-14), whenever the path crosses a reference below that
+/// parameter ([`crosses_an_argument_reference`]: the parameter is itself the
+/// reference, or a reference sits inside a by-value parameter) the root also
+/// needs the compiler-installed REFERENCE_ARG_BOX_VALID premise for it
+/// (`reference_roots`): the same premise D14 roots under, graded the same way.
+fn box_value_is_validity_rooted(
+    func: &VerifiableFunction,
+    fence: &ReceivedBoxFence,
+    reference_roots: &[usize],
+    base_local: usize,
+    base_proj: &[Projection],
+    fuel: u32,
+) -> bool {
+    let mut local = base_local;
+    let mut proj: Vec<Projection> = base_proj.to_vec();
+    let mut hops = 0usize;
+    // Set once a 13c borrow re-spelling (`(*r).rest` → `P.rest`) has been taken.
+    let mut respelled_through_borrow = false;
+    for _ in 0..fuel {
+        // Trust (2026-10-09, D14 REFERENCE_ARG_BOX_VALID): the box was copied out
+        // of a reference ARGUMENT's pointee. Admitted only as the compiler's
+        // installed, demoted premise, in exactly the synthesized one-hop shape
+        // (`_h = copy (*P).q`, `_t = _h.0.0 as *const T`); see
+        // [`reference_param_pointee_box_root`].
+        //
+        // Merged 2026-10-14 with main's 13c reference lane: D14 is tried only in
+        // its own one-hop shape (never after a 13c borrow re-spelling, whose
+        // intermediate reference D14's fences did not judge); when it does not
+        // root, the path falls through to the 13c lane below, which judges it by
+        // its own fences (`reference_lane_admits`), exactly as on main.
+        if matches!(proj.first(), Some(Projection::Deref))
+            && hops == 1
+            && !respelled_through_borrow
+            && base_proj.is_empty()
+        {
+            // Trust (2026-10-10, sweep c67): the deref may go through a SHARED local
+            // reborrow of the argument's pointee (`match &n.next { Some(b) => b.val }`
+            // is `_2 = &(*n).1; _4 = &((*_2) as Some).0; _h = copy (*_4)`). Such a
+            // reference names a part of the same pointee, so the box is the one at the
+            // composed path `(*n).1 as Some).0`; R-e then admits the reborrow chain only
+            // when each link is confined ([`shared_pointee_alias_is_confined`]).
+            let (root, path) = match shared_pointee_alias_root(func, local, 8) {
+                Some((root, prefix)) => {
+                    let mut path = prefix;
+                    path.extend_from_slice(&proj[1..]);
+                    (root, path)
+                }
+                None => (local, proj.clone()),
+            };
+            if reference_param_pointee_box_root(
+                func,
+                fence,
+                reference_roots,
+                root,
+                &path,
+                base_local,
+            ) {
+                return true;
+            }
+        }
+        if !fence.is_stable(local)
+            || !access_path_is_validity_preserving(func, fence, local, &proj, 0)
+        {
+            return false;
+        }
+        // Trust (2026-09-28, independent review of 13c): a path through a
+        // reference is credited only while nothing in the body can have freed the
+        // allocation the box behind it owns — no unsafe operation, and no alias of
+        // the slot (or of a reference reaching it) handed anywhere.
+        if proj.contains(&Projection::Deref) && !fence.reference_lane_admits(func, local, &proj) {
+            return false;
+        }
+        // "How many values does this local hold" is `local_defs`'s question: it
+        // counts the ENTRY definition and EVERY in-body write channel, the `Call`
+        // destination included. A hand-rolled `Statement::Assign` scan would read a
+        // local written by BOTH an assignment and a call as singly-defined — which is
+        // precisely how a `Box::from_raw` result would slip past this walk.
+        if !crate::local_defs::holds_one_value(func, local) {
+            return false;
+        }
+        if crate::local_defs::is_parameter(func, local) {
+            // That one value IS the entry definition: the box came IN.
+            //
+            // Trust (2026-10-14, DECISION_QUEUE D100): a path that crosses a
+            // reference below the parameter reads the box through a reference the
+            // caller handed in — the parameter itself (`&Box`, `&S.b`, `&&Box`) or a
+            // reference stored inside a by-value parameter (`Option<&Box<T>>`, `W {
+            // h: &Box<T> }`, tuples; review of D100, 2026-10-15) — which is
+            // REFERENCE_ARG_BOX_VALID's premise (R1: one premise, one
+            // grade), so 13c roots it only where the compiler INSTALLED that premise
+            // for this argument — and the compiler installs it only together with
+            // the body's demotion and disclosure. This is the one predicate both
+            // sides read: `reference_box_root_would_fire` re-runs this walk with and
+            // without the argument, so the install gate is exactly as wide as 13c's
+            // argument rooting and the two cannot drift. 13c's other roots keep no
+            // premise: a by-value `Box` parameter (no reference crossed) and the
+            // `Box::new` / certified-return roots below.
+            if crosses_an_argument_reference(&proj) {
+                return reference_roots.contains(&local);
+            }
+            return true;
+        }
+        // Certified single-valued above, so if a `Box::new` call writes the WHOLE
+        // local, that call's result is the one value it holds. The path must be
+        // empty: the root local IS the box.
+        if proj.is_empty() && is_fresh_box_alloc_destination(func, local) {
+            return true;
+        }
+        // D8: the same, for a call the compiler certified as a returned-`Box`
+        // root. Whole local only; a box reached through a field of a returned
+        // struct/enum is outside v1.
+        if proj.is_empty() && is_certified_returned_box_destination(func, local) {
+            return true;
+        }
+        // Not a root: hop to the source of that one value, which must be a plain
+        // copy of a place. `Box::from_raw` reaches its local as a `Call`
+        // destination, which is not a copy and is absent from this map, so the
+        // hazard stops here.
+        //
+        // Trust (ENC-DEFECTS 13c, 2026-09-26): or, when the path DEREFERENCES this
+        // local and its one value is a borrow `&P`, re-spell `(*local).rest` as
+        // `P.rest` — the referent of the borrow is `P` itself. The re-spelled path
+        // starts with `P`'s own projections, so it is judged from `P`'s root on the
+        // next iteration by the same fences (a `P` under a raw deref, a union
+        // field or a `Box` deref is refused there). This is how `Expr::Neg(a)`'s
+        // `a = &((*e) as Neg).0` reaches the parameter `e: &Expr`.
+        let Some(src) = fence.single_copy_source.get(&local) else {
+            if let Some((Projection::Deref, rest)) = proj.split_first()
+                && let Some(referent) = fence.single_ref_source.get(&local)
+            {
+                let mut next = referent.projections.clone();
+                next.extend_from_slice(rest);
+                local = referent.local;
+                proj = next;
+                respelled_through_borrow = true;
+                continue;
+            }
+            return false;
+        };
+        // Trust (2026-09-28): a copied REFERENCE (`_2 = copy _1`, `_2 = deref_copy
+        // (*_1)`) keeps the path THROUGH it — `(*_2).rest` is `(*S).rest` for the
+        // copied place `S` — so the reference lane above judges the aliases of the
+        // original too. (Dropping the path here made `let r = h; ..; *r.b` root at
+        // `h` with an empty path, where no reference fence looks.) A copy of the box
+        // VALUE itself carries no reference and keeps the old whole-value hop.
+        //
+        // Trust (merge 2026-10-14, D14's R-f carried onto the 13c lane): a local
+        // holding a box VALUE copied out from BEHIND a reference is a bitwise
+        // duplicate of a box the pointee still owns — dropping, moving or handing
+        // it out frees that allocation with no write to the pointee. Such a copy
+        // must be used only as the base of the synthesized `_h.0.0` pointer cast
+        // ([`box_copy_is_deref_only`]), exactly as D14 requires of its own hop.
+        if !proj.contains(&Projection::Deref)
+            && src.projections.contains(&Projection::Deref)
+            && !box_copy_is_deref_only(func, local)
+        {
+            return false;
+        }
+        let next = if proj.contains(&Projection::Deref) {
+            let mut next = src.projections.clone();
+            next.extend_from_slice(&proj);
+            next
+        } else {
+            src.projections.clone()
+        };
+        local = src.local;
+        proj = next;
+        hops += 1;
+    }
+    false
+}
+
+/// Trust (2026-10-14, DECISION_QUEUE D100): does a root walk that ended at a
+/// PARAMETER with `proj` reach the box THROUGH a reference the caller handed in?
+/// [`access_path_is_validity_preserving`] admits a `Deref` only of a `Ty::Ref`, so
+/// any `Deref` on the path is a reference's, and the box is a valid `T`'s `Box`
+/// behind a valid `&T`/`&mut T` reached from the argument — REFERENCE_ARG_BOX_VALID's
+/// premise, whatever lies around it: the argument itself (`&Box`, `&mut Box`,
+/// `&S.b`, `&Option<Box>`, `&&Box`, a recursive enum's variant field) or a
+/// reference stored inside a by-value argument (`Option<&Box<T>>`, `W { h:
+/// &Box<T> }`, `(&Box<T>, usize)`). Review of D100 (2026-10-15): the first version
+/// asked only for a LEADING `Deref`, so the by-value wrappers kept rooting on the
+/// same premise with no install, demotion or disclosure. A path with no `Deref`
+/// (a by-value `Box` parameter, D8's root) crosses no reference and answers
+/// `false`.
+fn crosses_an_argument_reference(proj: &[Projection]) -> bool {
+    proj.contains(&Projection::Deref)
+}
+
+/// D14 (REFERENCE_ARG_BOX_VALID, docs/DECISION_QUEUE.md): is the `Box` at
+/// `(*P).box_path` — `proj = [Deref, box_path..]` — a validity root, read through
+/// the compiler-synthesized one-hop copy `hop`?
+///
+/// The premise (assumed, never proved, and the reason the compiler demotes and
+/// discloses every row of an installing body): a `&`/`&mut` ARGUMENT's pointee is
+/// a valid value of its type for the whole call, so a `Box` inside it is non-null,
+/// aligned and live, and nothing OUTSIDE the body frees or reseats it while the
+/// argument is live (Rust's argument protectors). Everything INSIDE the body that
+/// could free or reseat it is fenced here, fail-closed, each condition
+/// load-bearing:
+///
+///  * R-a/b: `P` is in the compiler-installed `reference_roots` (empty without
+///    the compiler's premise, so this roots nothing), is a parameter holding one
+///    value, is stable (no `&raw`/`&mut` of `(*P)…`, no store through it), and
+///    is declared `Ty::Ref` — never a raw pointer;
+///  * R-c/d: exactly ONE `Deref`, at the head, and the rest a validity-preserving
+///    struct/tuple/variant path (no union field, no unrecorded ADT kind) that
+///    crosses no `UnsafeCell`;
+///  * R-e: `P` is CONFINED ([`reference_param_is_confined`]): its only uses are
+///    reads of `(*P).q` and shared borrows of a `q` DISJOINT from `box_path`. A
+///    shared hand-out of the box slot (or anything containing it) is refused: a
+///    callee can `ptr::read` a duplicate out of it and drop it, freeing the
+///    allocation with no write to `*P` anywhere (`evil` in the D14 record);
+///  * R-f: every copy of `(*P).box_path` — this `hop` included — is used only as
+///    the base of the synthesized `_h.0.0` pointer cast: never moved, dropped,
+///    passed, or borrowed ([`box_copy_is_deref_only`]).
+fn reference_param_pointee_box_root(
+    func: &VerifiableFunction,
+    fence: &ReceivedBoxFence,
+    reference_roots: &[usize],
+    p: usize,
+    proj: &[Projection],
+    hop: usize,
+) -> bool {
+    if !reference_roots.contains(&p)
+        || !crate::local_defs::is_parameter(func, p)
+        || !crate::local_defs::holds_one_value(func, p)
+        || !fence.is_stable(p)
+        || !matches!(func.body.locals.get(p).map(|decl| &decl.ty), Some(Ty::Ref { .. }))
+    {
+        return false;
+    }
+    let box_path = &proj[1..];
+    if box_path.contains(&Projection::Deref)
+        || !access_path_is_validity_preserving(func, fence, p, proj, 1)
+    {
+        return false;
+    }
+    let Some(box_ty) = crate::place_prefix_ty_cow(func, p, proj) else {
+        return false;
+    };
+    if !adt_is_authenticated_sysroot_struct(&box_ty, "::boxed::Box") {
+        return false;
+    }
+    // D14's fence: no `UnsafeCell` along the path. Interior mutability lets an
+    // alias swap the box behind a SHARED reference with no write to `*P` in this
+    // body. (Its field is private to `core`, so user MIR cannot name a path
+    // through it today; refused explicitly rather than by that accident.)
+    if proj.len() > 1 {
+        let Some(mut prefix_ty) = crate::place_prefix_ty_cow(func, p, &proj[..1]) else {
+            return false;
+        };
+        let mut pending_variant: Option<usize> = None;
+        for (idx, elem) in proj[1..].iter().enumerate() {
+            // A prefix ending at a recursion-cut marker is widened first (see
+            // `access_path_is_validity_preserving`), and a marker is matched by name too.
+            let resolved = crate::resolved_ty(func, &prefix_ty);
+            if matches!(
+                resolved.as_ref(),
+                Ty::Adt { name, .. } | Ty::Datatype { name, .. }
+                    if name.ends_with("::cell::UnsafeCell")
+            ) {
+                return false;
+            }
+            if idx + 1 < proj.len() - 1 {
+                let Some(next_ty) = crate::place_ty_step(
+                    &func.body.datatype_defs,
+                    prefix_ty,
+                    elem,
+                    &mut pending_variant,
+                ) else {
+                    return false;
+                };
+                prefix_ty = next_ty;
+            }
+        }
+    }
+    box_copy_is_deref_only(func, hop) && reference_param_is_confined(func, p, box_path)
+}
+
+/// Two access paths below the same `(*P)` name DISJOINT bytes: they first differ
+/// at a pair of distinct `Field`s. A prefix (either way) overlaps, and so does a
+/// divergence at anything else (two `Downcast`s overlay the same bytes; an index
+/// is not a field). Field paths into a UNION never reach here for `box_path`
+/// (refused by the access-path check) and a disjoint `q` diverging at a union
+/// field would diverge at a field the box path also crosses — which the access
+/// path refused — so union overlap cannot be mistaken for disjointness.
+fn access_paths_are_disjoint(a: &[Projection], b: &[Projection]) -> bool {
+    for (x, y) in a.iter().zip(b) {
+        if x == y {
+            continue;
+        }
+        return matches!((x, y), (Projection::Field(i), Projection::Field(j)) if i != j);
+    }
+    false
+}
+
+/// R-e of [`reference_param_pointee_box_root`]: every mention of the reference
+/// argument `p` in the body is a READ of its pointee, or a SHARED borrow of a part
+/// of the pointee disjoint from `box_path`. Fail-closed on every other statement,
+/// rvalue and terminator mention (a bare `copy p`, a reborrow, a cast, an
+/// aggregate capture, a call argument, a borrow of the box slot or of anything
+/// containing it), and on any assignment INTO a place rooted at `p`.
+///
+/// A copy of exactly `(*p).box_path` must itself satisfy
+/// [`box_copy_is_deref_only`], so a second copy of the box cannot be dropped or
+/// handed out either.
+fn reference_param_is_confined(func: &VerifiableFunction, p: usize, box_path: &[Projection]) -> bool {
+    fn place_reads_param_pointee(place: &Place, p: usize) -> Option<&[Projection]> {
+        (place.local == p && matches!(place.projections.first(), Some(Projection::Deref)))
+            .then(|| &place.projections[1..])
+    }
+    // No index projection may name `p` (it is a reference, so it never does in
+    // well-typed MIR, but the walk below inspects `place.local` only).
+    let indexed_by_p = |place: &Place| {
+        place.projections.iter().any(|elem| matches!(elem, Projection::Index(i) if *i == p))
+    };
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            if !crate::contracts::statement_mentions_local_anywhere(stmt, p) {
+                continue;
+            }
+            let Statement::Assign { place, rvalue, .. } = stmt else { return false };
+            if place.local == p || indexed_by_p(place) {
+                return false;
+            }
+            let ok = match rvalue {
+                Rvalue::Use(Operand::Copy(src)) | Rvalue::CopyForDeref(src) => {
+                    match place_reads_param_pointee(src, p) {
+                        Some(rest) if rest == box_path => {
+                            place.projections.is_empty() && box_copy_is_deref_only(func, place.local)
+                        }
+                        Some(rest) => access_paths_are_disjoint(rest, box_path),
+                        None => false,
+                    }
+                }
+                Rvalue::Discriminant(src) | Rvalue::Len(src) => place_reads_param_pointee(src, p).is_some(),
+                Rvalue::Ref { mutable: false, place: src } => {
+                    place_reads_param_pointee(src, p).is_some_and(|rest| {
+                        access_paths_are_disjoint(rest, box_path)
+                            || (box_path.starts_with(rest)
+                                && place.projections.is_empty()
+                                && shared_pointee_alias_is_confined(
+                                    func,
+                                    place.local,
+                                    &box_path[rest.len()..],
+                                    8,
+                                ))
+                    })
+                }
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if crate::contracts::terminator_mentions_local_anywhere(&block.terminator, p) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Trust (2026-10-10, sweep c67): the reference argument and path a SHARED local
+/// reborrow chain names. `local` is a non-parameter whose one value is `&(*q).path`
+/// (`local_defs::unique_value_def`: one whole-local statement def, no `&mut`/`&raw` of
+/// it), and `q` is a parameter or such a reborrow itself; the answer is that parameter
+/// and the composed `[Deref, path..]`. A pure name resolution: it licenses nothing on
+/// its own, and [`shared_pointee_alias_is_confined`] is what R-e asks of each link.
+fn shared_pointee_alias_root(
+    func: &VerifiableFunction,
+    local: usize,
+    fuel: u32,
+) -> Option<(usize, Vec<Projection>)> {
+    if fuel == 0 || crate::local_defs::is_parameter(func, local) {
+        return None;
+    }
+    if !matches!(func.body.locals.get(local).map(|decl| &decl.ty), Some(Ty::Ref { mutable: false, .. })) {
+        return None;
+    }
+    let Some(Rvalue::Ref { mutable: false, place: src }) =
+        crate::local_defs::unique_value_def(func, local)
+    else {
+        return None;
+    };
+    if !matches!(src.projections.first(), Some(Projection::Deref))
+        || src.projections[1..].contains(&Projection::Deref)
+    {
+        return None;
+    }
+    if crate::local_defs::is_parameter(func, src.local) {
+        return Some((src.local, src.projections.clone()));
+    }
+    let (root, mut prefix) = shared_pointee_alias_root(func, src.local, fuel - 1)?;
+    prefix.extend_from_slice(&src.projections[1..]);
+    Some((root, prefix))
+}
+
+fn place_through_alias(place: &Place, alias: usize) -> Option<&[Projection]> {
+    (place.local == alias
+        && matches!(place.projections.first(), Some(Projection::Deref))
+        && !place.projections[1..].contains(&Projection::Deref))
+    .then(|| &place.projections[1..])
+}
+
+/// R-e of [`reference_param_pointee_box_root`] for a SHARED local reborrow `alias` of a
+/// part of the argument's pointee that CONTAINS the box: `remaining` is the box's path
+/// below `*alias`. The same discipline as [`reference_param_is_confined`], one link
+/// down: `alias` holds one value, its own `&(*q).path` (no other write, no `&mut`/`&raw`
+/// of it), and every mention is a READ of its pointee, a `Discriminant`/`Len` of it, a
+/// shared borrow of a part DISJOINT from the box, the one deref-only copy of the box
+/// itself ([`box_copy_is_deref_only`]), or a shared reborrow of a part still containing
+/// the box that is confined the same way. A copy or move of `alias` itself, a call
+/// argument, any terminator mention or any other rvalue refuses: each could hand a
+/// callee a path to the box slot, which can `ptr::read` a duplicate and drop it.
+fn shared_pointee_alias_is_confined(
+    func: &VerifiableFunction,
+    alias: usize,
+    remaining: &[Projection],
+    fuel: u32,
+) -> bool {
+    if fuel == 0
+        || crate::local_defs::is_parameter(func, alias)
+        || !matches!(func.body.locals.get(alias).map(|decl| &decl.ty), Some(Ty::Ref { mutable: false, .. }))
+        || !matches!(
+            crate::local_defs::unique_value_def(func, alias),
+            Some(Rvalue::Ref { mutable: false, .. })
+        )
+    {
+        return false;
+    }
+    let indexed_by_alias = |place: &Place| {
+        place.projections.iter().any(|elem| matches!(elem, Projection::Index(i) if *i == alias))
+    };
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            if !crate::contracts::statement_mentions_local_anywhere(stmt, alias) {
+                continue;
+            }
+            let ok = match stmt {
+                Statement::StorageLive(_) | Statement::StorageDead(_) => true,
+                Statement::Assign { place, rvalue, .. } => {
+                    if place.local == alias {
+                        // Its one definition (`unique_value_def` above).
+                        place.projections.is_empty()
+                            && matches!(rvalue, Rvalue::Ref { mutable: false, .. })
+                    } else if indexed_by_alias(place)
+                        || crate::contracts::place_mentions_local_anywhere(place, alias)
+                    {
+                        false
+                    } else {
+                        match rvalue {
+                            Rvalue::Use(Operand::Copy(src)) | Rvalue::CopyForDeref(src) => {
+                                match place_through_alias(src, alias) {
+                                    Some(rest) if rest == remaining => {
+                                        place.projections.is_empty()
+                                            && box_copy_is_deref_only(func, place.local)
+                                    }
+                                    Some(rest) => access_paths_are_disjoint(rest, remaining),
+                                    None => false,
+                                }
+                            }
+                            Rvalue::Discriminant(src) | Rvalue::Len(src) => {
+                                place_through_alias(src, alias).is_some()
+                            }
+                            Rvalue::Ref { mutable: false, place: src } => {
+                                place_through_alias(src, alias).is_some_and(|rest| {
+                                    access_paths_are_disjoint(rest, remaining)
+                                        || (remaining.starts_with(rest)
+                                            && place.projections.is_empty()
+                                            && shared_pointee_alias_is_confined(
+                                                func,
+                                                place.local,
+                                                &remaining[rest.len()..],
+                                                fuel - 1,
+                                            ))
+                                })
+                            }
+                            _ => false,
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if crate::contracts::terminator_mentions_local_anywhere(&block.terminator, alias) {
+            return false;
+        }
+    }
+    true
+}
+
+/// R-f of [`reference_param_pointee_box_root`]: the local `hop` holding a copy of
+/// the box is used ONLY as the base of the synthesized `hop.0.0 as *const T`
+/// pointer cast (plus its own definition and storage markers). A `Drop`, a move,
+/// a call argument, a borrow or any other use refuses: dropping or handing out a
+/// bitwise duplicate of a box the caller still owns frees its allocation.
+fn box_copy_is_deref_only(func: &VerifiableFunction, hop: usize) -> bool {
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            if !crate::contracts::statement_mentions_local_anywhere(stmt, hop) {
+                continue;
+            }
+            let ok = match stmt {
+                Statement::StorageLive(_) | Statement::StorageDead(_) => true,
+                Statement::Assign { place, rvalue, .. } => {
+                    if place_mentions_local(place, hop) {
+                        // Its one definition: `hop = copy (*P).box_path`.
+                        place.local == hop
+                            && place.projections.is_empty()
+                            && matches!(
+                                rvalue,
+                                Rvalue::Use(Operand::Copy(src)) | Rvalue::CopyForDeref(src)
+                                    if !crate::contracts::place_mentions_local_anywhere(src, hop)
+                            )
+                    } else {
+                        matches!(
+                            rvalue,
+                            Rvalue::Cast(Operand::Copy(src) | Operand::Move(src), Ty::RawPtr { .. })
+                                if src.local == hop
+                                    && (src.projections
+                                        == [Projection::Field(0), Projection::Field(0)]
+                                        // Trust (1.101): the cast reads the box's
+                                        // `BoxRaw` field directly — one Field(0)
+                                        // whose place is typed `BoxRaw`.
+                                        || (src.projections == [Projection::Field(0)]
+                                            && matches!(
+                                                crate::place_ty_cow(func, src).as_deref(),
+                                                Some(Ty::Adt { name, .. })
+                                                    if name == "alloc::boxed::BoxRaw"
+                                            )))
+                        )
+                    }
+                }
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if crate::contracts::terminator_mentions_local_anywhere(&block.terminator, hop) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Trust (2026-10-09, review round 85): a raw-pointer TEMP `_t` of a synthesized
+/// `*box` must not hand the box's ALLOCATION to anything that could free it.
+/// `addr_of!(**b)` (or `addr_of!(*b)` of an owned box) is a raw pointer carrying
+/// the box's own tag, so a callee can `Box::from_raw` it and drop it — freeing
+/// the allocation with no UB of its own, while the box still names it — and the
+/// dropped deref rows then hid a use-after-free (measured: `sink(addr_of!(**b));
+/// **b`). This held for EVERY root, the parameter and `Box::new` ones included.
+///
+/// Admitted uses, each unable to deallocate the pointee:
+///  * reads through `(*_t)…` (`Use`, `CopyForDeref`, `Len`, `Discriminant`) and
+///    stores into `(*_t)…` (a write frees nothing);
+///  * a SHARED reborrow of an `UnsafeCell`-free place: a pointer derived from it
+///    is read-only under Stacked and Tree Borrows, and deallocation is a write;
+///  * a `&mut` reborrow of an `UnsafeCell`-free place whose every derived pointer
+///    stays CONTAINED ([`derived_reborrow_is_contained`]). Review round 86: the
+///    earlier rule "a reborrow passed directly to a call is protected" was a false
+///    proof — the protector ends when the callee returns, and the callee can
+///    return or stash a pointer derived from it (`NonNull::from(&mut *b)`,
+///    `Cell::as_ptr(&*b)`, a safe `AtomicPtr` store) for a later `Box::from_raw`;
+///  * a raw borrow whose one use is `PtrMetadata`, or `PtrMetadata(_t)` itself
+///    (the compiler's `&raw const (fake)` for a slice length, as extracted; the
+///    pointer value is never used);
+///  * a cast of `_t` whose value only reaches integer comparisons
+///    ([`address_only_compared`]: rustc's debug null/alignment UB checks).
+///
+/// Every other mention — a copy, move or cast of `_t` itself, a raw borrow
+/// reaching anything else, any terminator — refuses.
+fn box_pointer_temp_is_confined(func: &VerifiableFunction, temp: usize) -> bool {
+    fn place_is_through_box_temp(place: &Place, temp: usize) -> bool {
+        place.local == temp
+            && matches!(place.projections.first(), Some(Projection::Deref))
+            && !place.projections.iter().any(|elem| matches!(elem, Projection::Index(i) if *i == temp))
+    }
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            if !crate::contracts::statement_mentions_local_anywhere(stmt, temp) {
+                continue;
+            }
+            let ok = match stmt {
+                Statement::StorageLive(_) | Statement::StorageDead(_) => true,
+                Statement::Assign { place, rvalue, .. } => {
+                    let rvalue_ok = || match rvalue {
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                        | Rvalue::CopyForDeref(src)
+                        | Rvalue::Len(src)
+                        | Rvalue::Discriminant(src) => place_is_through_box_temp(src, temp),
+                        Rvalue::Ref { mutable, place: src } if place_is_through_box_temp(src, temp) => {
+                            let freeze = crate::place_ty_cow(func, src)
+                                .is_some_and(|ty| ty_is_unsafe_cell_free(func, &ty));
+                            (!*mutable && freeze)
+                                || (freeze && derived_reborrow_is_contained(func, place, 6))
+                        }
+                        Rvalue::AddressOf(_, src) if place_is_through_box_temp(src, temp) => {
+                            local_only_read_by_ptr_metadata(func, place)
+                        }
+                        // The extractor folds the fake `&raw const (*_t)` of a
+                        // slice length into `PtrMetadata(copy _t)`: a length read,
+                        // the pointer value goes nowhere.
+                        Rvalue::UnaryOp(
+                            trust_types::UnOp::PtrMetadata,
+                            Operand::Copy(src) | Operand::Move(src),
+                        ) if src.local == temp && src.projections.is_empty() => true,
+                        // rustc's debug UB checks (null/alignment of the pointer):
+                        // `_t as *const ()`, then `as u64`, then masks and
+                        // compares. The address feeds comparisons only.
+                        Rvalue::Cast(Operand::Copy(src) | Operand::Move(src), _)
+                            if src.local == temp && src.projections.is_empty() =>
+                        {
+                            address_only_compared(func, place, 4)
+                        }
+                        // Review round 87: a value read through `(*_t)` inside an
+                        // operator (`*b += 1`, `b.n + 1`) is the same value copy.
+                        _ => rvalue_names_local_only_through_deref_reads(rvalue, temp),
+                    };
+                    if place.local == temp && place.projections.is_empty() {
+                        // Its one definition, the synthesized cast (checked by
+                        // the caller), which does not read `temp` itself.
+                        matches!(rvalue, Rvalue::Cast(..)) && !rvalue_mentions_local(rvalue, temp)
+                    } else if crate::contracts::place_mentions_local_anywhere(place, temp) {
+                        // A store through `_t` (review round 86: a non-constant
+                        // stored value does not mention `_t` and is admitted).
+                        place_is_through_box_temp(place, temp) && (!rvalue_mentions_local(rvalue, temp) || rvalue_ok())
+                    } else {
+                        rvalue_ok()
+                    }
+                }
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if crate::contracts::terminator_mentions_local_anywhere(&block.terminator, temp) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `dest` (a whole local holding one value) carries a box pointer's ADDRESS only
+/// into comparisons: it is either an integer used only as a `BinaryOp` operand
+/// whose integer results recurse (a `Bool` result ends the chain), or a raw
+/// pointer whose only uses are casts into such integers. Anything else — passed,
+/// stored, cast back, read through — refuses. `fuel` bounds the chain.
+fn address_only_compared(func: &VerifiableFunction, dest: &Place, fuel: u32) -> bool {
+    let d = dest.local;
+    if fuel == 0 || !dest.projections.is_empty() {
+        return false;
+    }
+    let Some(d_ty) = func.body.locals.get(d).map(|decl| &decl.ty) else { return false };
+    let is_pointer = matches!(d_ty, Ty::RawPtr { .. });
+    if !is_pointer && !matches!(d_ty, Ty::Int { .. } | Ty::PtrSizedInt { .. }) {
+        return false;
+    }
+    if !crate::local_defs::holds_one_value(func, d) {
+        return false;
+    }
+    let names_d = |op: &Operand| matches!(op, Operand::Copy(p) | Operand::Move(p) if p.local == d);
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            if !crate::contracts::statement_mentions_local_anywhere(stmt, d) {
+                continue;
+            }
+            let ok = match stmt {
+                Statement::StorageLive(_) | Statement::StorageDead(_) => true,
+                Statement::Assign { place, rvalue, .. } if place.local == d => {
+                    place.projections.is_empty() && !rvalue_mentions_local(rvalue, d)
+                }
+                Statement::Assign { place, rvalue, .. } => match rvalue {
+                    Rvalue::Cast(op, Ty::Int { .. } | Ty::PtrSizedInt { .. })
+                        if is_pointer && names_d(op) =>
+                    {
+                        address_only_compared(func, place, fuel - 1)
+                    }
+                    Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b)
+                        if !is_pointer
+                            && (names_d(a) || names_d(b))
+                            && !matches!(a, Operand::Copy(p) | Operand::Move(p) if p.local == d && !p.projections.is_empty())
+                            && !matches!(b, Operand::Copy(p) | Operand::Move(p) if p.local == d && !p.projections.is_empty()) =>
+                    {
+                        place.projections.is_empty()
+                            && match func.body.locals.get(place.local).map(|decl| &decl.ty) {
+                                Some(Ty::Bool) => true,
+                                Some(_) => address_only_compared(func, place, fuel - 1),
+                                None => false,
+                            }
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if crate::contracts::terminator_mentions_local_anywhere(&block.terminator, d) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Every mention of `local` in `rvalue` is an operand `copy`/`move` of a place
+/// under `(*local)` — a VALUE read through the pointer (`*b + 1`, `[(*b).0, x]`),
+/// never the pointer itself or a borrow of its pointee. No mention at all is fine.
+fn rvalue_names_local_only_through_deref_reads(rvalue: &Rvalue, local: usize) -> bool {
+    if !rvalue_mentions_local(rvalue, local) {
+        return true;
+    }
+    let read = |op: &Operand| match op {
+        Operand::Copy(p) | Operand::Move(p) if p.local == local => {
+            matches!(p.projections.first(), Some(Projection::Deref))
+                && !p.projections.iter().any(|elem| matches!(elem, Projection::Index(i) if *i == local))
+        }
+        other => !crate::contracts::operand_mentions_local_anywhere(other, local),
+    };
+    match rvalue {
+        Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Repeat(op, _) => read(op),
+        Rvalue::Cast(op, _) => read(op),
+        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) | Rvalue::UncheckedBinaryOp(_, a, b) => {
+            read(a) && read(b)
+        }
+        Rvalue::Aggregate(_, ops) => ops.iter().all(read),
+        Rvalue::CopyForDeref(p) | Rvalue::Len(p) | Rvalue::Discriminant(p) => {
+            p.local == local && matches!(p.projections.first(), Some(Projection::Deref))
+        }
+        _ => false,
+    }
+}
+
+/// The body carries an identity-less opaque scalar operand. The extractor folds
+/// some value it cannot model into one — measured in review round 87: a user
+/// `addr_of_mut!(*b) as usize` (an EXPOSE of the box's provenance) became
+/// `Constant(OpaqueScalar)` and its `&raw` statement vanished, so no fence could
+/// see the escape. Such a body roots nothing.
+fn body_has_opaque_scalar_operand(func: &VerifiableFunction) -> bool {
+    if !crate::generate::body_mentions_opaque_scalar(func) {
+        return false;
+    }
+    let opaque = |op: &Operand| {
+        matches!(op, Operand::Constant(trust_types::ConstValue::OpaqueScalar { .. }))
+    };
+    let rvalue_opaque = |rvalue: &Rvalue| match rvalue {
+        Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Repeat(op, _) | Rvalue::Cast(op, _) => opaque(op),
+        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) | Rvalue::UncheckedBinaryOp(_, a, b) => {
+            opaque(a) || opaque(b)
+        }
+        Rvalue::Aggregate(_, ops) => ops.iter().any(opaque),
+        _ => false,
+    };
+    func.body.blocks.iter().any(|block| {
+        block.stmts.iter().any(|stmt| matches!(stmt, Statement::Assign { rvalue, .. } if rvalue_opaque(rvalue)))
+            || matches!(&block.terminator, Terminator::Call { args, .. } if args.iter().any(opaque))
+            || matches!(&block.terminator, Terminator::SwitchInt { discr, .. } if opaque(discr))
+            || matches!(&block.terminator, Terminator::Assert { cond, .. } if opaque(cond))
+    })
+}
+
+fn rvalue_mentions_local(rvalue: &Rvalue, local: usize) -> bool {
+    crate::contracts::rvalue_mentions_local_anywhere(rvalue, local)
+}
+
+/// `dest` (a whole local holding one value) is a `&mut` reborrow of part of a box's
+/// allocation, and no pointer derived from it can reach anything that outlives
+/// this body's use of it:
+///  * reads and stores through `(*dest)…`;
+///  * copies of `dest`, further reborrows of `(*dest)…` and unsize casts to
+///    another reference, each contained in turn (shared reborrows of an
+///    `UnsafeCell`-free place end the chain: read-only);
+///  * `PtrMetadata`, and a raw borrow read only by `PtrMetadata`;
+///  * passing it (`copy` or `move`) to a safe, non-foreign callee the COMPILER
+///    resolved into the real sysroot, whose result type holds no pointer, when the
+///    reborrowed pointee is PRIMITIVE data and every other argument is a constant,
+///    a scalar or a shared reference to primitive data: the callee returns nothing
+///    that could carry it, no user impl is reachable to hand it to, and std does
+///    not stash its arguments.
+/// Any other use — a user callee, a pointer-carrying result (`NonNull::from`,
+/// `iter_mut`), an aggregate (closure capture), a raw cast — refuses.
+fn derived_reborrow_is_contained(func: &VerifiableFunction, dest: &Place, fuel: u32) -> bool {
+    fn place_is_through_reborrow(place: &Place, d: usize) -> bool {
+        place.local == d && matches!(place.projections.first(), Some(Projection::Deref))
+    }
+    let d = dest.local;
+    if fuel == 0 || !dest.projections.is_empty() || !crate::local_defs::holds_one_value(func, d) {
+        return false;
+    }
+    let whole = |op: &Operand| matches!(op, Operand::Copy(p) | Operand::Move(p) if p.local == d && p.projections.is_empty());
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            if !crate::contracts::statement_mentions_local_anywhere(stmt, d) {
+                continue;
+            }
+            let ok = match stmt {
+                Statement::StorageLive(_) | Statement::StorageDead(_) => true,
+                Statement::Assign { place, rvalue, .. } if place.local == d && place.projections.is_empty() => {
+                    !rvalue_mentions_local(rvalue, d)
+                }
+                Statement::Assign { place, rvalue, .. } if crate::contracts::place_mentions_local_anywhere(place, d) => {
+                    place_is_through_reborrow(place, d) && rvalue_names_local_only_through_deref_reads(rvalue, d)
+                }
+                Statement::Assign { place, rvalue, .. } => match rvalue {
+                    Rvalue::Use(Operand::Copy(s) | Operand::Move(s))
+                    | Rvalue::CopyForDeref(s)
+                    | Rvalue::Len(s)
+                    | Rvalue::Discriminant(s)
+                        if place_is_through_reborrow(s, d) =>
+                    {
+                        true
+                    }
+                    Rvalue::Use(op) if whole(op) => derived_reborrow_is_contained(func, place, fuel - 1),
+                    Rvalue::Cast(op, Ty::Ref { .. }) if whole(op) => {
+                        derived_reborrow_is_contained(func, place, fuel - 1)
+                    }
+                    Rvalue::Ref { mutable, place: s } if place_is_through_reborrow(s, d) => {
+                        let freeze = crate::place_ty_cow(func, s)
+                            .is_some_and(|ty| ty_is_unsafe_cell_free(func, &ty));
+                        freeze && (!*mutable || derived_reborrow_is_contained(func, place, fuel - 1))
+                    }
+                    Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, op) if whole(op) => true,
+                    Rvalue::AddressOf(_, s) if place_is_through_reborrow(s, d) => local_only_read_by_ptr_metadata(func, place),
+                    _ => rvalue_names_local_only_through_deref_reads(rvalue, d),
+                },
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if !crate::contracts::terminator_mentions_local_anywhere(&block.terminator, d) {
+            continue;
+        }
+        // `d`'s own definition: the call whose whole destination it is (a
+        // reference RESULT being followed recursively).
+        if let Terminator::Call { dest: call_dest, args, .. } = &block.terminator
+            && call_dest.local == d
+            && call_dest.projections.is_empty()
+            && !args.iter().any(|arg| crate::contracts::operand_mentions_local_anywhere(arg, d))
+        {
+            continue;
+        }
+        let Terminator::Call {
+            args,
+            dest: call_dest,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_key,
+            ..
+        } = &block.terminator
+        else {
+            return false;
+        };
+        // The callee must really be a sysroot item (the compiler-resolved key,
+        // not only the display path), and std must have no user impl to hand the
+        // pointer to: the reborrowed pointee is PRIMITIVE data (no ADT of any
+        // crate), so `Clone::clone_from` / `clone_from_slice` over a user type —
+        // which would pass a `&mut` into the allocation to user code — refuses.
+        let pointee_is_primitive = matches!(
+            func.body.locals.get(d).map(|decl| &decl.ty),
+            Some(Ty::Ref { inner, .. }) if ty_is_primitive_data(inner, 16)
+        );
+        if !pointee_is_primitive
+            || !callee_key
+                .as_ref()
+                .is_some_and(|key| key.krate_is_real_sysroot && !key.krate_name_is_ambiguous)
+        {
+            return false;
+        }
+        // Another argument may be a scalar or a SHARED reference to pointer-free
+        // data (`copy_from_slice(&mut *b, src)`): neither can be a callback.
+        let scalar = |op: &Operand| match op {
+            Operand::Constant(_) => true,
+            Operand::Copy(p) | Operand::Move(p) => crate::place_ty_cow(func, p).is_some_and(|ty| match ty.as_ref() {
+                Ty::Bool | Ty::Char | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Float { .. } => true,
+                // A `&mut` to primitive data too (`mem::swap(&mut *a, &mut *b)`):
+                // std does not free or stash its arguments, and no user impl is
+                // reachable through primitive data.
+                Ty::Ref { inner, .. } => ty_is_primitive_data(inner, 16),
+                _ => false,
+            }),
+            _ => false,
+        };
+        // (No display-path test: `<Vec<u32> as DerefMut>::deref_mut` spells with a
+        // `<`. The compiler-resolved key above is the identity, and with only
+        // primitive data in reach the orphan rule leaves no user impl that a
+        // sysroot trait method could dispatch to.)
+        if crate::contracts::place_mentions_local_anywhere(call_dest, d)
+            || !args.iter().all(|arg| whole(arg) || scalar(arg))
+        {
+            return false;
+        }
+        // The result holds no pointer, or (review round 87: `deref_mut`,
+        // `get_mut`-style) it is itself a REFERENCE, which may be derived from
+        // the argument and is therefore held to this same containment rule.
+        // Never admitted by type alone: `NonNull::from` returns an ADT and
+        // `as_mut_ptr` a raw pointer, both refused here.
+        let result_ty = crate::place_ty_cow(func, call_dest);
+        let result_ok = match result_ty.as_deref() {
+            Some(Ty::Ref { .. }) => derived_reborrow_is_contained(func, call_dest, fuel - 1),
+            Some(ty) => ty_is_pointer_free(ty, 16),
+            None => false,
+        };
+        if !result_ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// `ty` is built from primitives only — scalars, `()`, `str`, and arrays, slices,
+/// tuples and `Vec`s of them — so no trait impl of ANY crate's ADT is reachable
+/// through it (a generic sysroot routine cannot call user code on it).
+fn ty_is_primitive_data(ty: &Ty, fuel: u32) -> bool {
+    if fuel == 0 {
+        return false;
+    }
+    match ty {
+        Ty::Bool | Ty::Char | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Float { .. } | Ty::Unit | Ty::Str => true,
+        Ty::Array { elem, .. } | Ty::Slice { elem } | Ty::Seq { elem, .. } => ty_is_primitive_data(elem, fuel - 1),
+        Ty::Tuple(elems) => elems.iter().all(|elem| ty_is_primitive_data(elem, fuel - 1)),
+        _ => false,
+    }
+}
+
+/// A value of `ty` holds no pointer of any kind (scalars, `()`, and tuples,
+/// arrays and non-union ADTs of them). Unknown shapes answer `false`.
+fn ty_is_pointer_free(ty: &Ty, fuel: u32) -> bool {
+    if fuel == 0 {
+        return false;
+    }
+    match ty {
+        Ty::Bool | Ty::Char | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Float { .. } | Ty::Unit | Ty::Str => true,
+        Ty::Array { elem, .. } | Ty::Slice { elem } => ty_is_pointer_free(elem, fuel - 1),
+        Ty::Tuple(elems) => elems.iter().all(|elem| ty_is_pointer_free(elem, fuel - 1)),
+        Ty::Adt { fields, variants, adt_kind: Some(kind), .. }
+            if !matches!(kind, trust_types::AdtKind::Union) =>
+        {
+            fields.iter().all(|(_, field)| ty_is_pointer_free(field, fuel - 1))
+                && variants.iter().all(|variant| {
+                    variant.fields.iter().all(|(_, field)| ty_is_pointer_free(field, fuel - 1))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// `dest` is a whole local holding one value whose every other use is
+/// `PtrMetadata(dest)` — the compiler's fake raw borrow for a slice length.
+fn local_only_read_by_ptr_metadata(func: &VerifiableFunction, dest: &Place) -> bool {
+    let d = dest.local;
+    if !dest.projections.is_empty() || !crate::local_defs::holds_one_value(func, d) {
+        return false;
+    }
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            if !crate::contracts::statement_mentions_local_anywhere(stmt, d) {
+                continue;
+            }
+            let ok = match stmt {
+                Statement::StorageLive(_) | Statement::StorageDead(_) => true,
+                Statement::Assign { place, rvalue, .. } if place.local == d => {
+                    place.projections.is_empty() && !rvalue_mentions_local(rvalue, d)
+                }
+                Statement::Assign {
+                    place,
+                    rvalue: Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, Operand::Copy(p) | Operand::Move(p)),
+                    ..
+                } => {
+                    !crate::contracts::place_mentions_local_anywhere(place, d)
+                        && p.local == d
+                        && p.projections.is_empty()
+                }
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if crate::contracts::terminator_mentions_local_anywhere(&block.terminator, d) {
+            return false;
+        }
+    }
+    true
+}
+
+/// No `UnsafeCell` in the bytes of a value of `ty` (memory behind a pointer it
+/// holds is a different allocation and is not inspected): the one structural
+/// predicate, `generate::ty_may_hold_unsafe_cell`, fail-closed. Trust: 2026-10-15
+/// (INTERIOR-MUT-CHANNEL-1): this walk granted on `!name.contains("UnsafeCell")`, so a
+/// `Cell` rendered without its fields passed, and it took a `Vec` as cell-free although
+/// `Ty::Seq` drops its allocator parameter.
+fn ty_is_unsafe_cell_free(func: &VerifiableFunction, ty: &Ty) -> bool {
+    !crate::generate::ty_may_hold_unsafe_cell(&func.body.datatype_defs, ty)
+}
+
+fn place_mentions_local(place: &Place, local: usize) -> bool {
+    crate::contracts::place_mentions_local_anywhere(place, local)
+}
+
+/// Is `local` the WHOLE destination of a call to the authenticated sysroot
+/// `Box::new` / `Box::new_uninit` that is neither foreign nor unsafe-signature?
+///
+/// Only a ROOT test: the caller has already certified (`local_defs::holds_one_value`
+/// plus [`ReceivedBoxFence`]) that `local` holds exactly one value, so the call
+/// found here is the only thing that ever wrote it.
+fn is_fresh_box_alloc_destination(func: &VerifiableFunction, local: usize) -> bool {
+    if !crate::generate::terminator_presence_for(func).has_call {
+        return false;
+    }
+    crate::any_local_write_term(func, &func.body.blocks, local, |_block, term| {
+        matches!(
+            term,
+            Terminator::Call { dest, is_foreign: false, is_unsafe_sig: false, callee_key, .. }
+                if dest.local == local
+                    && dest.projections.is_empty()
+                    && is_known_good_box_alloc(callee_key.as_ref())
+        )
+    })
+}
+
+/// Is `local` the WHOLE destination of a call the COMPILER certified as a
+/// returned-`Box` validity root (D8)?
+///
+/// Two independent halves, both required:
+///
+///  1. the call's block is in the compiler's certified set
+///     ([`crate::returned_box_root_blocks_for`], built by
+///     `trust_mir_extract::returned_box_root_call_blocks` — the SAME predicate
+///     the extractor's assert discharge uses). Only the compiler can see the
+///     callee's attributes and resolve a `dyn`/shim call; an EMPTY set (no
+///     compiler context) roots nothing;
+///  2. this side's own view of that terminator agrees: a `Call` writing the
+///     whole `local`, `callee_identity: Some(_)` (direct and concrete),
+///     neither foreign nor unsafe-signature, not an atomic, and `local`'s type
+///     is the authenticated sysroot `Box`.
+///
+/// Only a ROOT test, like [`is_fresh_box_alloc_destination`]: the caller has
+/// already certified that `local` holds exactly one value and is fenced.
+fn is_certified_returned_box_destination(func: &VerifiableFunction, local: usize) -> bool {
+    if !crate::generate::terminator_presence_for(func).has_call {
+        return false;
+    }
+    let Some(decl) = func.body.locals.get(local) else { return false };
+    if !adt_is_authenticated_sysroot_struct(&decl.ty, "::boxed::Box") {
+        return false;
+    }
+    let certified = crate::returned_box_root_blocks_for(&func.def_path);
+    if certified.is_empty() {
+        return false;
+    }
+    crate::any_local_write_term(func, &func.body.blocks, local, |block, term| {
+        certified.contains(&block.id)
+            && matches!(
+                term,
+                Terminator::Call {
+                    dest,
+                    is_foreign: false,
+                    is_unsafe_sig: false,
+                    callee_identity: Some(_),
+                    atomic: None,
+                    ..
+                } if dest.local == local && dest.projections.is_empty()
+            )
+    })
+}
+
+/// The MIR locals holding the raw-pointer TEMP rustc's `ElaborateBoxDerefs` pass
+/// mints for a SAFE `*box`, restricted to those whose `Box`
+/// [`box_value_is_validity_rooted`] can root at a parameter or an in-body
+/// `Box::new`.
+///
+/// SHAPE (elaborate_box_derefs.rs `build_projection`): `*box` becomes
+/// `_t = Cast(Transmute, Copy((box_place.0: Unique<P>).0: NonNull<P>), *const P)`
+/// followed by `(*_t)`. The extracted `Rvalue::Cast` has NO `CastKind`, so the shape
+/// is authenticated by TYPE instead ([`box_read_cast_base`]): the two trailing
+/// `Field(0)` projections must step `Box` -> `Unique` -> `NonNull`, each an
+/// AUTHENTICATED sysroot struct path (see [`adt_is_authenticated_sysroot_struct`]),
+/// and the cast's destination must be a `Ty::RawPtr`. A first-party `transmute::<NonNull<T>, *const T>(nn)` of a BARE
+/// `NonNull` local has no `Box` base and does not match — the same discrimination
+/// `collect_synthesized_box_deref_ops` (rustc_mir_transform/trust_verify.rs) makes
+/// with the `owned_box` lang item on unerased MIR.
+///
+/// Returns EMPTY when the body carries an unmodeled write channel, so a body the
+/// census cannot account for keeps every row exactly as it is today.
+pub(crate) fn validity_rooted_box_deref_temps(func: &VerifiableFunction) -> FxHashSet<usize> {
+    // D14: the reference arguments the COMPILER installed REFERENCE_ARG_BOX_VALID
+    // for (empty — roots nothing — without its context).
+    let reference_roots = crate::reference_box_root_params_for(&func.def_path);
+    BoxDerefBody::new(func).rooted_temps(&reference_roots)
+}
+
+/// Immutable body facts shared only within one box-deref query. Argument
+/// premises and the root walk remain separate for every candidate. Borrowing
+/// the function binds the fence and temp census to the same unchanged body.
+struct BoxDerefBody<'a> {
+    func: &'a VerifiableFunction,
+    fence: ReceivedBoxFence,
+    temps: Vec<(usize, Place)>,
+}
+
+impl<'a> BoxDerefBody<'a> {
+    fn new(func: &'a VerifiableFunction) -> Self {
+        let _scope = crate::generate::EntryScope::enter(func);
+        // PERF-COMPILER-VCGEN-711: collect confined single-valued `box_read_cast_base`
+        // candidate temps before running the whole-body `ReceivedBoxFence::build(func)`
+        // scan so bodies with no confined box-read cast candidates allocate nothing.
+        let mut temps = raw_box_deref_base_candidates(func);
+        if temps.is_empty() {
+            return Self { func, fence: ReceivedBoxFence::default(), temps };
+        }
+        let fence = ReceivedBoxFence::build(func);
+        if fence.unmodeled_write_channel {
+            temps.clear();
+        } else {
+            temps.retain(|(temp, _)| fence.is_stable(*temp));
+        }
+        Self { func, fence, temps }
+    }
+
+    fn rooted_temps(&self, reference_roots: &[usize]) -> FxHashSet<usize> {
+        let mut out = FxHashSet::default();
+        for (temp, base) in &self.temps {
+            if box_value_is_validity_rooted(
+                self.func,
+                &self.fence,
+                reference_roots,
+                base.local,
+                &base.projections,
+                16,
+            ) {
+                out.insert(*temp);
+            }
+        }
+        out
+    }
+}
+
+fn raw_box_deref_base_candidates(func: &VerifiableFunction) -> Vec<(usize, Place)> {
+    // Trust (2026-10-09, review round 85): every `*box` gets its OWN temp, so a
+    // raw pointer to a box's allocation handed out through ONE temp
+    // (`sink(addr_of!(**b))`, where `sink` may `Box::from_raw` and drop it)
+    // frees what a LATER deref's temp reads. The fence is therefore body-wide:
+    // if any synthesized box-pointer cast in the body lands anywhere but a
+    // whole local confined to non-deallocating uses
+    // ([`box_pointer_temp_is_confined`]), nothing in the body is rooted.
+    let mut checked_opaque_scalar = false;
+    let mut temps = Vec::new();
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            let Statement::Assign { place, rvalue: Rvalue::Cast(operand, dst_ty), .. } = stmt
+            else {
+                continue;
+            };
+            let Some(base) = box_read_cast_base(func, operand, dst_ty) else { continue };
+            if !place.projections.is_empty() {
+                return Vec::new();
+            }
+            if !std::mem::replace(&mut checked_opaque_scalar, true)
+                && body_has_opaque_scalar_operand(func)
+            {
+                return Vec::new();
+            }
+            if !box_pointer_temp_is_confined(func, place.local) {
+                return Vec::new();
+            }
+            temps.push((place.local, base));
+        }
+    }
+    // Stability is body-only; changing the installed argument premise cannot
+    // add a definition or change a temp's uses.
+    temps.retain(|(temp, _)| crate::local_defs::holds_one_value(func, *temp));
+    temps
+}
+
+/// The statement operations whose `*box` the separation engine treats as the
+/// `&T`-like deref it is (see [`SepEngine::rooted_box_deref_ops`]), each mapped to
+/// the box temp it dereferences.
+///
+/// An operation qualifies only when ALL of these hold — each is independent, and
+/// dropping any one widens what the engine stops charging:
+///
+///  1. the COMPILER nominated it: `box_deref_ops` is
+///     `collect_synthesized_box_deref_ops` (rustc_mir_transform/trust_verify.rs),
+///     which identifies the synthesized deref by the `owned_box` lang item on
+///     unerased MIR, keyed `(BlockId, statement index)`;
+///  2. the vcgen-side shape re-check
+///     [`crate::unsafe_verify::detection::statement_synthesized_box_ptr_derefs`]
+///     agrees on the SAME operation (a numbering divergence misses, fail-closed),
+///     and EVERY deref of that statement is of a synthesized box pointer;
+///  3. its READ (`Use`/`CopyForDeref`) place, or else its DESTINATION, starts
+///     with `Deref` of a temp in [`validity_rooted_box_deref_temps`] — the box
+///     value behind it is a parameter or an in-body `Box::new`, the temp is
+///     single-valued and stable, and the body has no unmodeled write channel.
+///     The destination case (2026-10-01) is a safe `(*box).f = v`: borrowck
+///     admitted it as a mutable access to a valid, unique `Box`, so the write is
+///     as sound as the read; before, every `&mut self` setter of a boxed field
+///     was charged four `[unsafe:sep:*]` rows.
+///
+/// An empty `box_deref_ops` (every caller that does not thread the compiler's
+/// set) returns an empty map without running the root walk at all.
+pub(crate) fn validity_rooted_box_deref_ops(
+    func: &VerifiableFunction,
+    box_deref_ops: &FxHashSet<(BlockId, usize)>,
+) -> FxHashMap<(BlockId, usize), Vec<usize>> {
+    let reference_roots = crate::reference_box_root_params_for(&func.def_path);
+    validity_rooted_box_deref_ops_with(func, box_deref_ops, &reference_roots)
+}
+
+/// D14 install gate: the subset of `candidates` (the compiler's argument locals:
+/// every argument of a local item body since the D100 review, 2026-10-15) whose REFERENCE_ARG_BOX_VALID premise would root at least one
+/// compiler-nominated box deref that is not rooted without it. The compiler
+/// installs, demotes and discloses the premise for exactly these, so a body the
+/// premise cannot change keeps byte-identical obligations and grades.
+///
+/// Trust (2026-10-14, DECISION_QUEUE D100): "rooted by the premise" covers BOTH
+/// lanes that read a box through a reference argument: D14's one-hop shape
+/// ([`reference_param_pointee_box_root`]) and main's 13c reference lane, whose
+/// argument roots ([`crosses_an_argument_reference`]) [`box_value_is_validity_rooted`]
+/// admits only for an installed argument. The gate runs that same walk with and
+/// without each candidate, so it fires for every argument either lane roots
+/// through — `&Box`, `&mut Box`, `&S.b`, `&Option<Box>`, `&&Box`, `eval(e: &Expr)`
+/// — and the install can never be narrower than the rooting.
+#[must_use]
+pub fn reference_box_root_would_fire(
+    func: &VerifiableFunction,
+    box_deref_ops: &FxHashSet<(BlockId, usize)>,
+    candidates: &[usize],
+) -> Vec<usize> {
+    if candidates.is_empty() || box_deref_ops.is_empty() {
+        return Vec::new();
+    }
+    let body = BoxDerefBody::new(func);
+    if body.temps.is_empty() {
+        return Vec::new();
+    }
+    let mut cached_ops: Option<Vec<Vec<usize>>> = None;
+    let mut rooted_count = |roots: &[usize]| -> usize {
+        let temps = body.rooted_temps(roots);
+        if temps.is_empty() {
+            return 0;
+        }
+        if body
+            .fence
+            .reference_lane
+            .get_or_init(|| ReferenceLaneFacts::build(func))
+            .unsafe_operation
+        {
+            return 0;
+        }
+        let ops = cached_ops.get_or_insert_with(|| {
+            box_deref_ops
+                .iter()
+                .filter_map(|&(block_id, index)| {
+                    crate::unsafe_verify::detection::statement_synthesized_box_ptr_derefs(
+                        func, block_id, index,
+                    )
+                })
+                .collect()
+        });
+        ops.iter().map(|derefs| derefs.iter().filter(|temp| temps.contains(temp)).count()).sum()
+    };
+    let baseline = rooted_count(&[]);
+    candidates.iter().copied().filter(|&param| rooted_count(&[param]) > baseline).collect()
+}
+
+fn validity_rooted_box_deref_ops_with(
+    func: &VerifiableFunction,
+    box_deref_ops: &FxHashSet<(BlockId, usize)>,
+    reference_roots: &[usize],
+) -> FxHashMap<(BlockId, usize), Vec<usize>> {
+    if box_deref_ops.is_empty() {
+        return FxHashMap::default();
+    }
+    BoxDerefBody::new(func).rooted_ops(box_deref_ops, reference_roots)
+}
+
+impl BoxDerefBody<'_> {
+    fn rooted_ops(
+        &self,
+        box_deref_ops: &FxHashSet<(BlockId, usize)>,
+        reference_roots: &[usize],
+    ) -> FxHashMap<(BlockId, usize), Vec<usize>> {
+        let func = self.func;
+        let mut out = FxHashMap::default();
+        if box_deref_ops.is_empty() {
+            return out;
+        }
+        let temps = self.rooted_temps(reference_roots);
+        if temps.is_empty() {
+            return out;
+        }
+        // NO CREDIT, READ OR WRITE, IN A BODY WITH ANY UNSAFE OPERATION
+        // (`ReferenceLaneFacts::unsafe_operation`; DECISION_QUEUE D33, ruled (a)
+        // 2026-10-01). The root walk's fences watch the box SLOT, not its pointee, so
+        // a free through a pointer derived from `&mut *b` is invisible to them:
+        // `let p = &mut *b as *mut T; dealloc(p, ..); let x = *b` (and `*b = v`)
+        // minted no row (docs/KNOWN_HAZARDS.md, CLOSED 2026-10-01). Only unsafe code
+        // can free or forge the pointee, and this census sees every such operation;
+        // the reference lane already refused on it. The cost: every box deref in a
+        // body that also does something unsafe keeps its three rows again.
+        if self
+            .fence
+            .reference_lane
+            .get_or_init(|| ReferenceLaneFacts::build(func))
+            .unsafe_operation
+        {
+            return out;
+        }
+        for &(block_id, index) in box_deref_ops {
+            // Trust (2026-10-09): every deref of the statement — a read, an operand
+            // of an operator, or the DESTINATION of a store through the box — must be
+            // a synthesized box pointer (a genuine raw deref sharing the statement
+            // refuses the whole operation), and the rooted ones are recorded. A write
+            // through a valid, borrowck-admitted box is as sound as the read: the box
+            // is uniquely owned (or reached through a protected `&mut`), and every
+            // alias of its allocation is fenced body-wide.
+            let Some(mut derefs) =
+                crate::unsafe_verify::detection::statement_synthesized_box_ptr_derefs(
+                    func, block_id, index,
+                )
+            else {
+                continue;
+            };
+            derefs.retain(|temp| temps.contains(temp));
+            if !derefs.is_empty() {
+                out.insert((block_id, index), derefs);
+            }
+        }
+        out
+    }
 }
 
 /// An INFALLIBLE, type-aligned box allocator: `box_new_uninit` (the free fn
@@ -3406,56 +8161,23 @@ fn is_alloc_call(lower: &str) -> bool {
 /// non-null there would false-PROVE a real null-deref) and `Vec` constructors
 /// (a `Vec::new` pointer is a dangling-but-non-null sentinel into ZERO capacity,
 /// not a deref-safe region). Anchored to a recognizable std box-allocator token.
-fn is_known_good_box_alloc(lower: &str) -> bool {
-    // `box_new_uninit` is a distinctive std-internal name (no user fn shares it);
-    // require a std/alloc/core (`boxed`) origin so a same-named user item cannot
-    // qualify. `Box::<T>::new` lowers with the `boxed::box` path segment.
+fn is_known_good_box_alloc(key: Option<&CalleeKey>) -> bool {
+    // MEASURED HOLE, CLOSED (round 7). The predicate this replaces required a
+    // sysroot root and then `contains`-matched `box_new_uninit` / a `boxed::box`
+    // + `new` token pair on the turbofish-STRIPPED path — and the strip is the
+    // scan a `char` const generic desynchronizes. Worse, the tokens it looked
+    // for are ones a TYPE ARGUMENT can supply on its own
+    // (`core::ptr::read::<alloc::boxed::Box<u8>>` carries `boxed::box`), so the
+    // admission could be bought without the callee being `Box::new` at all.
     //
-    // STRIP generic args before matching: the monomorphized METHOD form
-    // `box::<[formula; 2]>::new_uninit` (the `Box::<T>::new_uninit` the `vec!` of a
-    // LARGE element emits — NOT inlined to the generic-free `box_new_uninit`) has its
-    // `box::new` segment SPLIT by the `<…>`, so the raw substring match misses it (the
-    // `vec!` of a SMALL element inlines to `box_new_uninit`, which matched — hence the
-    // discrepancy). Normalize like `total_no_panic_call_summary`. The cascading
-    // false-FAILs this once exposed are now co-fixed: the `[unsafe:sep:alloc]` size
-    // check is SKIPPED for an infallible box alloc (the box is type-sized), and the
-    // use-after-free is fixed at the root (cleanup-block `Drop`s no longer free — see
-    // `interpret_drop` + `reachable_block_ids`).
-    // CRATE-ANCHORED std origin (round-4 discipline): the box allocator's def-path
-    // must be rooted at a genuine sysroot crate (`std::`/`alloc::`/`core::`), incl. a
-    // UFCS-wrapped inherent header, and must NOT be trait-qualified (`<T as …>`). The
-    // old `contains("boxed")` disjunct was FORGEABLE — a user module
-    // `mycrate::boxed::box_new_uninit`, or an orphan trait impl
-    // `<Vec<T> as mycrate::Boxed>::box_new_uninit`, matched, then received the
-    // infallible-allocator non-null/writable postcondition + the SKIPPED size check
-    // (see the `is_known_good_box_alloc` call in `interpret_call` + `discharge_box_good`),
-    // FALSELY discharging a genuine null-deref. Every genuine box allocator renders
-    // crate-rooted (`alloc::boxed::box_new_uninit`, `std::boxed::Box::<T>::new` —
-    // verified against the extractor fixtures), so the anchor keeps them. The
-    // extractor additionally DefId-authenticates the identity (`owned_box` lang item /
-    // sysroot `StableCrateId` — trust-mir-extract `is_infallible_box_allocator`); this
-    // string gate is the sep-engine's own fail-closed backstop.
-    if !callee_is_std_crate_rooted(lower) {
-        return false;
-    }
-    let mut without_generics = String::with_capacity(lower.len());
-    let mut depth = 0usize;
-    for c in lower.chars() {
-        match c {
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => without_generics.push(c),
-            _ => {}
-        }
-    }
-    let normalized =
-        without_generics.split("::").filter(|seg| !seg.is_empty()).collect::<Vec<_>>().join("::");
-    // INFALLIBLE box allocators: the free `box_new_uninit`, `Box::new`, and
-    // `Box::new_uninit` (`box::new` is a substring of the normalized `box::new_uninit`).
-    // `Box::new_uninit` returns UNINITIALIZED memory, but the POINTER is still non-null
-    // + aligned + a valid allocation (the only facts the box-good postcondition
-    // asserts; initialization is the separate `assume_init` obligation).
-    normalized.contains("box_new_uninit") || normalized.contains("box::new")
+    // The tag is resolved from the callee's own `DefId`. `Box::<T>::new` and
+    // `Box::<T>::new_uninit` mint theirs; the free `box_new_uninit` the former
+    // inlines to is NOT in the vocabulary and therefore falls to the
+    // fail-closed arm, which is the direction that costs a discharge rather
+    // than granting one. `alloc::alloc`/`alloc_zeroed` (which CAN return null)
+    // and every `Vec` constructor are excluded by construction: they have their
+    // own tags and neither is in this list.
+    callee_is_sysroot_item_tag(key, KNOWN_GOOD_BOX_ALLOC_ITEMS)
 }
 
 /// The non-null half of [`box_alloc_postcondition`] — an infallible box
@@ -3477,44 +8199,34 @@ fn box_alloc_nonnull_fact(ptr_name: &str) -> Formula {
 // nonlinear `ptr % align` would degrade the query; alignment stays soundly caught
 // until the concrete pointee alignment is available from tcx layout.
 
-/// True when `lower` (a LOWERCASED callee def-path) is rooted at a genuine sysroot
-/// crate — `std::`/`alloc::`/`core::` — either directly or as a UFCS-wrapped
-/// inherent header (`<std::…>::method`), and is NOT a trait-qualified `<T as …>`
-/// path. This is the round-4 anchoring discipline (mirrors generate.rs's
-/// `callee_is_std_vec_inherent`): a user cannot shadow the sysroot crate roots (the
-/// `--crate-name` literal attack is the accepted doctrine boundary), and the ` as `
-/// reject rules out an orphan trait impl on a foreign std type. Consumed by the
-/// memory-safety DISCHARGE producers below so a same-named user free fn / method /
-/// trait impl cannot forge a fact that clears a null/OOB/init obligation.
-fn callee_is_std_crate_rooted(lower: &str) -> bool {
-    if lower.contains(" as ") {
-        return false;
-    }
-    let c = lower.strip_prefix('<').unwrap_or(lower);
-    c.starts_with("std::") || c.starts_with("alloc::") || c.starts_with("core::")
-}
+// `callee_is_std_crate_rooted` IS GONE FROM THE MINT (round 7), deleted and not
+// reordered. It was the round-5 fix: a ` as ` reject that had to run AFTER
+// `strip_turbofish_args` so that an associated-type INSTANTIATION ARGUMENT
+// (` as ` inside a `::<…>` group) could be told from a real UFCS QUALIFIER
+// (` as ` in a LEADING `<…>` group). Both halves of that distinction were
+// readings of a rendered string, and the round-6 arrow defect and the round-6
+// review's `char` const generic are two ways to desynchronize the strip the
+// distinction depends on.
+//
+// Under the key there is nothing to adjudicate. `CalleeKey::sysroot_item` is
+// resolved from the callee's own `DefId` against a crate `is_real_sysroot_crate`
+// authenticated, and a UFCS qualifier is `tcx.trait_of_assoc` + the impl's self
+// type — structured facts, not a leading bracket group. A user trait on a
+// sysroot type resolves to `None` because it is a different `DefId`, not
+// because a `<` was in the right column.
+//
+// The STRING version survives, byte-identical, inside `suppression_mirror`,
+// where it belongs: see that module's header for why that side must stay text.
 
-/// True when `lower` is an INHERENT method on a genuine raw pointer — the
-/// `{core,std}::ptr::const_ptr` / `::mut_ptr` inherent-impl modules (`<impl *const
-/// T>` / `<impl *mut T>`), or the bare inherent UFCS header `<*const …>` / `<*mut
-/// …>`. A user cannot add an inherent method to the primitive raw-pointer types, and
-/// the ` as ` reject rules out an orphan trait impl `<*mut T as mycrate::Ptr>::cast`.
-/// The old `contains("const_ptr") || contains("mut_ptr")` was FORGEABLE via a nested
-/// user module named `const_ptr`/`mut_ptr` (`mycrate::const_ptr::cast`). Every
-/// genuine raw-ptr method renders `core::ptr::const_ptr::<impl *const T>::cast` /
-/// `std::ptr::mut_ptr::<impl *mut u8>::add` (verified against the extractor fixtures).
-fn callee_is_std_raw_ptr_inherent(lower: &str) -> bool {
-    if lower.contains(" as ") {
-        return false;
-    }
-    let c = lower.strip_prefix('<').unwrap_or(lower);
-    c.starts_with("core::ptr::const_ptr")
-        || c.starts_with("std::ptr::const_ptr")
-        || c.starts_with("core::ptr::mut_ptr")
-        || c.starts_with("std::ptr::mut_ptr")
-        || c.starts_with("*const ")
-        || c.starts_with("*mut ")
-}
+// `callee_is_std_raw_ptr_inherent` IS GONE FROM THE MINT (round 7). It tested a
+// `core::ptr::const_ptr` / `::mut_ptr` PREFIX plus a bare `<*const `/`<*mut `
+// header — a prefix test that a type argument reaches, and the anchor under two
+// `contains`-based Group-C predicates (`is_ptr_offset_call`, `is_ptr_cast_call`)
+// that the round-6 review measured as capturable by a TYPE ARGUMENT ALONE.
+//
+// Both predicates now name their items: `PTR_OFFSET_ITEMS` and `PTR_CAST_ITEMS`
+// are `SelfTyHead::ConstPtr`/`MutPtr` inherent impls resolved from `tcx`, which
+// no argument can wear. The string version survives in `suppression_mirror`.
 
 /// The compiler-generated `core::fmt::Arguments::{new,new_v1,new_const,new_v1_formatted}`
 /// constructors (`format_args!` machinery). CRATE-ANCHORED: the bare
@@ -3609,8 +8321,8 @@ fn is_std_fmt_arguments_ctor(lower: &str) -> bool {
     let c = lower.strip_prefix('<').unwrap_or(lower);
     (c.starts_with("core::fmt::arguments") || c.starts_with("std::fmt::arguments"))
         && matches!(
-            // MERGE (b62 <- origin/main): both sides independently fixed the same
-            // stale-allowlist defect (the `format_args!` lowering moved to `new`).
+            // MERGE (b62 <- origin/main; squash d24c671211): both sides independently fixed the
+            // same stale-allowlist defect (the `format_args!` lowering moved to `new`).
             // The arm list is identical; only the method-leaf extraction differed.
             // OURS is kept: `method_tail` is monomorph-tag robust, where upstream's
             // `c.rsplit("::").next()` returns the TURBOFISH GROUP for a tagged callee
@@ -3655,18 +8367,721 @@ fn is_std_from_raw_fd(lower: &str) -> bool {
 /// `as_ptr` renders crate-rooted (`core::slice::<impl [T]>::as_ptr`,
 /// `std::ptr::NonNull::<T>::as_ptr`, `alloc::vec::Vec::<T>::as_ptr` — extractor
 /// fixtures). Fail-closed on a miss (untracked `dest` ⇒ symbolic from_raw_parts).
-fn is_container_as_ptr_call(lower: &str) -> bool {
-    if !(lower.contains("::as_ptr") || lower.contains("::as_mut_ptr")) {
-        return false;
+fn is_container_as_ptr_call(key: Option<&CalleeKey>) -> bool {
+    // MEASURED HOLE, CLOSED (round 7). The predicate this replaces asked
+    // `lower.contains("::as_ptr")`, refused a ` as `, and then required a
+    // `core::`/`alloc::`/`std::` PREFIX — three text tests over one string. A
+    // type argument satisfies the first two trivially, and the third is the
+    // only thing that stood between a rendering and the engine binding `dest`'s
+    // provenance size to an unrelated receiver's `container_byte_len` (a FALSE
+    // discharge of a later `from_raw_parts(dest, n)`).
+    //
+    // The tag names the five genuine container `as_ptr`/`as_mut_ptr` items. A
+    // free fn `mycrate::as_ptr(slice)` and an orphan `<[T] as mycrate::Buf>::
+    // as_ptr` both resolve to `None` — not because their spelling misses, but
+    // because they are not those `DefId`s.
+    callee_is_sysroot_item_tag(key, CONTAINER_AS_PTR_ITEMS)
+}
+
+mod suppression_mirror {
+    #![allow(dead_code)]
+    use super::strip_turbofish_args;
+
+    // ── THE SUPPRESSION MIRROR — STRING, ON PURPOSE (round 7) ─────────────────────
+    //
+    // THE DIRECTIONAL INVARIANT, now structural instead of documentary:
+    //
+    //   ANCHORED + AUTHENTICATED  to MINT a contract   -> the `CalleeKey` funnel above.
+    //   UNANCHORED + STRING       to PREDICT the compiler's SUPPRESSION -> HERE.
+    //
+    // Everything below is a copy of the round-6 spelling machinery, kept verbatim
+    // and used by EXACTLY ONE consumer: `call_is_modeled`, whose caller is
+    // `crate::call_has_unsafe_model`, which the COMPILER calls
+    // (`rustc_mir_transform::trust_verify`, at the completeness check) with
+    // `trust_mir_extract::safe_def_path_str(tcx, did)` — an UNSTAMPED RENDERED
+    // STRING and nothing else.
+    //
+    // WHY IT WAS NOT MIGRATED TO THE KEY, AND WHY THAT ARGUMENT WAS HALF OF ONE
+    // (corrected 2026-09-20). `call_is_modeled` answering TRUE SUPPRESSES the
+    // compiler's fail-closed `[unsafe:unmodeled-call]` row, and the argument for
+    // leaving text here was that a desync can only cost a WITHHELD refutation,
+    // which `decide_site` answers with the fail-closed stand-in.
+    //
+    // That covers a spurious TRUE. It does NOT cover a spurious FALSE, and FALSE
+    // is what a desynchronized scan produces:
+    // `callee_is_sysroot_spelling_for_suppression` is a BYTE COMPARE after
+    // normalization, so extra text in a turbofish can only be LOST past it. A
+    // lost match read as "unmodeled" on the vcgen side, the vcgen-side PREDICTOR
+    // turned that into "the compiler will mint a row", and `decide_site` answered
+    // THAT by DELETING the byte-frozen stand-in — while the compiler, reading the
+    // bare path, found the callee modeled and minted nothing. An unsafe site with
+    // ZERO obligations, reached through the very asymmetry this paragraph used to
+    // claim could not exist.
+    //
+    // THE PREDICTOR IS GONE. `decide_site` is handed the compiler's own row set
+    // (`UnsafeCoverage::compiler_unmodeled_call_blocks`, installed by
+    // `trust_verify` from the rows it actually minted over the same body), so
+    // nothing on this side predicts anything about that row any more. What is
+    // left here is what the COMPILER itself evaluates, on the string the compiler
+    // holds — and commit D bounds that string to callees whose crate the compiler
+    // authenticated, so a user path can no longer reach it at all. It is listed
+    // as a measured residual in `text_parsing_remaining`.
+
+    /// `NonZero::<T>::new_unchecked`, `NonNull::<T>::new_unchecked`,
+    /// `Unique::<T>::new_unchecked` — the `arg != 0` / non-null niche.
+    pub(super) const SUP_NONZERO_NEW_UNCHECKED: &[&str] = &[
+        // `core::num::nonzero::NonZero::<usize>::new_unchecked`, `::<u32>::…`
+        "core::num::nonzero::nonzero::new_unchecked",
+        // `core::ptr::non_null::NonNull::<u8>::new_unchecked`
+        "core::ptr::non_null::nonnull::new_unchecked",
+        // `core::ptr::unique::Unique::<u8>::new_unchecked` (`dump-nz2`)
+        "core::ptr::unique::unique::new_unchecked",
+    ];
+
+    /// `char::from_u32_unchecked` — the Unicode-scalar-value contract.
+    pub(super) const SUP_CHAR_FROM_U32_UNCHECKED: &[&str] = &[
+        // `core::char::from_u32_unchecked` (the free fn)
+        "core::char::from_u32_unchecked",
+        // `core::char::methods::<impl char>::from_u32_unchecked` (the inherent method)
+        "core::char::methods::from_u32_unchecked",
+    ];
+
+    /// `Vec::<T>::set_len` — the `new_len <= capacity` contract. `String::as_mut_vec()
+    /// .set_len(n)` lowers to the same `Vec` method (measured); `String` and
+    /// `VecDeque` have no `set_len` of their own.
+    pub(super) const SUP_SET_LEN: &[&str] = &[
+        // `alloc::vec::Vec::<u8>::set_len`
+        "alloc::vec::vec::set_len",
+    ];
+
+    /// `Option::<T>::unwrap_unchecked` / `Result::<T, E>::unwrap_unchecked` — the
+    /// receiver-is-`Some`/`Ok` contract.
+    pub(super) const SUP_UNWRAP_UNCHECKED: &[&str] = &[
+        // `core::option::Option::<u32>::unwrap_unchecked`
+        "core::option::option::unwrap_unchecked",
+        // `core::result::Result::<u32, ()>::unwrap_unchecked`
+        "core::result::result::unwrap_unchecked",
+    ];
+
+    /// `str::from_utf8_unchecked[_mut]` / `String::from_utf8_unchecked` — the UTF-8
+    /// invariant.
+    pub(super) const SUP_FROM_UTF8_UNCHECKED: &[&str] = &[
+        "core::str::converts::from_utf8_unchecked",
+        "core::str::converts::from_utf8_unchecked_mut",
+        "alloc::string::string::from_utf8_unchecked",
+    ];
+
+    /// The std `vec!`-machinery `box_assume_init_into_vec_unsafe` —
+    /// `alloc::boxed::box_assume_init_into_vec_unsafe::<u64, 2>` (measured from
+    /// `vec![1, 2]`). Listed under `assume_init` so its call reaches the
+    /// `assume_init` arm, and matched EXACTLY again there before its obligation is
+    /// DISCHARGED: that discharge is a proof, so the name that unlocks it must be the
+    /// one std item and nothing else.
+    pub(super) const SUP_BOX_ASSUME_INIT_INTO_VEC_UNSAFE: &str =
+        "alloc::boxed::box_assume_init_into_vec_unsafe";
+
+    /// `MaybeUninit::<T>::assume_init*` / `Box::<MaybeUninit<T>>::assume_init` — the
+    /// fully-initialized contract.
+    pub(super) const SUP_ASSUME_INIT: &[&str] = &[
+        // `core::mem::maybe_uninit::MaybeUninit::<u32>::assume_init` and siblings
+        "core::mem::maybe_uninit::maybeuninit::assume_init",
+        "core::mem::maybe_uninit::maybeuninit::assume_init_ref",
+        "core::mem::maybe_uninit::maybeuninit::assume_init_mut",
+        "core::mem::maybe_uninit::maybeuninit::assume_init_read",
+        // `core::mem::maybe_uninit::MaybeUninit::<alloc::string::String>::assume_init_drop`
+        "core::mem::maybe_uninit::maybeuninit::assume_init_drop",
+        // `alloc::boxed::Box::<core::mem::maybe_uninit::MaybeUninit<u32>>::assume_init`
+        "alloc::boxed::box::assume_init",
+        SUP_BOX_ASSUME_INIT_INTO_VEC_UNSAFE,
+        // NOT listed: the slice form `<[core::mem::maybe_uninit::MaybeUninit<u32>]>::
+        // assume_init_ref` (unstable `maybe_uninit_slice`; measured). Its Self is a
+        // primitive slice, not a crate-rooted path, so it never passed
+        // `callee_is_std_crate_rooted`; it falls to the stand-in (fail-closed).
+    ];
+
+    /// `CStr::from_bytes_with_nul_unchecked` — the nul-terminated / no-interior-nul
+    /// contract.
+    pub(super) const SUP_CSTR_FROM_BYTES_WITH_NUL_UNCHECKED: &[&str] = &[
+        // `core::ffi::c_str::CStr::from_bytes_with_nul_unchecked`
+        "core::ffi::c_str::cstr::from_bytes_with_nul_unchecked",
+    ];
+
+    /// The free `ptr::read*` / `ptr::write*` fns — a hidden single-element deref.
+    /// The inherent-method forms (`core::ptr::const_ptr::<impl *const u64>::read`,
+    /// `core::ptr::mut_ptr::<impl *mut u64>::write`, measured) are NOT listed: the
+    /// old `ptr::read` substring never matched them (the `<impl …>` header splits
+    /// the segment), so listing them would newly model every `p.read()` — a
+    /// completeness change for its own commit, not this closure.
+    pub(super) const SUP_RAW_READ_WRITE: &[&str] = &[
+        // `core::ptr::read::<u64>`, `core::ptr::read_volatile::<u64>`, …
+        "core::ptr::read",
+        "core::ptr::read_volatile",
+        "core::ptr::read_unaligned",
+        "core::ptr::write",
+        "core::ptr::write_volatile",
+        "core::ptr::write_unaligned",
+    ];
+
+    /// `<[T]>::get_unchecked[_mut]` / `str::get_unchecked[_mut]` — the index-in-
+    /// bounds contract.
+    pub(super) const SUP_UNCHECKED_INDEX: &[&str] = &[
+        // `core::slice::<impl [u32]>::get_unchecked::<usize>`
+        "core::slice::get_unchecked",
+        "core::slice::get_unchecked_mut",
+        // `core::str::<impl str>::get_unchecked::<core::ops::range::RangeFrom<usize>>`
+        "core::str::get_unchecked",
+        "core::str::get_unchecked_mut",
+    ];
+
+    /// `ptr::copy` / `ptr::copy_nonoverlapping` — the two-buffer bounds contract.
+    pub(super) const SUP_PTR_COPY: &[&str] = &[
+        // `core::ptr::copy::<u8>`, `core::ptr::copy_nonoverlapping::<u8>`
+        "core::ptr::copy",
+        "core::ptr::copy_nonoverlapping",
+    ];
+
+    /// `slice::from_raw_parts[_mut]`, `str::from_raw_parts[_mut]`,
+    /// `Vec::from_raw_parts`, `String::from_raw_parts` — the `len` elements must lie
+    /// within `ptr`'s allocation (for `Vec`/`String` a necessary condition of the
+    /// `(ptr, len, cap)` contract; the old substring modeled them and the bound is
+    /// sound). NOT listed: `core::ptr::slice_from_raw_parts[_mut]::<u8>` (measured) —
+    /// a SAFE constructor of a raw slice pointer with no UB condition of its own;
+    /// the old substring charged it the bounds obligation, which is the wrong
+    /// contract for that item.
+    pub(super) const SUP_FROM_RAW_PARTS: &[&str] = &[
+        // `core::slice::raw::from_raw_parts::<'_, u8>`, `…::from_raw_parts_mut::<'_, u8>`
+        "core::slice::raw::from_raw_parts",
+        "core::slice::raw::from_raw_parts_mut",
+        // `core::str::converts::from_raw_parts::<'_>`, `…::from_raw_parts_mut::<'_>`
+        "core::str::converts::from_raw_parts",
+        "core::str::converts::from_raw_parts_mut",
+        // `alloc::vec::Vec::<u8>::from_raw_parts`, `alloc::string::String::from_raw_parts`
+        "alloc::vec::vec::from_raw_parts",
+        "alloc::string::string::from_raw_parts",
+    ];
+
+    /// `mem::transmute_copy` — the only transmute that survives to a CALL in
+    /// extracted MIR (`core::mem::transmute_copy::<u32, f32>`, measured). A
+    /// `mem::transmute::<Src, Dst>(x)` and the `core::intrinsics::transmute`
+    /// intrinsic are lowered to a `Cast` and never reach `interpret_call` (measured:
+    /// no call terminator at all); `core::mem::transmute` is kept as the item's
+    /// own def path for a non-optimised or hand-built body.
+    pub(super) const SUP_TRANSMUTE: &[&str] =
+        &["core::mem::transmute_copy", "core::mem::transmute"];
+
+    /// The free allocation fns of the global allocator.
+    pub(super) const SUP_ALLOC: &[&str] = &[
+        // `alloc::alloc::alloc`, `alloc::alloc::alloc_zeroed`
+        "alloc::alloc::alloc",
+        "alloc::alloc::alloc_zeroed",
+    ];
+
+    /// See [`is_global_allocator_ufcs_call`].
+    pub(super) const SUP_GLOBAL_ALLOCATOR_UFCS: &[&str] = &[
+        "<alloc::alloc::global as core::alloc::allocator>::allocate",
+        "<alloc::alloc::global as core::alloc::allocator>::deallocate",
+    ];
+
+    /// `alloc::dealloc` and `ptr::drop_in_place` — a free.
+    const DESUP_ALLOC: &[&str] = &[
+        // `alloc::alloc::dealloc`
+        "alloc::alloc::dealloc",
+        // `core::ptr::drop_in_place::<alloc::string::String>`
+        "core::ptr::drop_in_place",
+        // `core::ptr::mut_ptr::<impl *mut alloc::string::String>::drop_in_place`
+        "core::ptr::mut_ptr::drop_in_place",
+    ];
+
+    /// `alloc::realloc`.
+    const RESUP_ALLOC: &[&str] = &[
+        // `alloc::alloc::realloc`
+        "alloc::alloc::realloc",
+    ];
+
+    /// The `Result`/`Option` methods that return the `Ok`/`Some` payload ITSELF, so
+    /// a tracked `Layout` size may be relocated across them
+    /// (`Layout::from_size_align(n, a).unwrap()` — the shape the size tracking
+    /// exists for). MEASURED 2026-09-20 on the sealed `trustc ff538f905`
+    /// (`-Ztrust-dump=mir-only`, `$TMPDIR/rc4/spell5.rs`): the extractor renders
+    /// them `core::result::Result::<core::alloc::layout::Layout,
+    /// core::alloc::layout::LayoutError>::unwrap` and siblings, which
+    /// [`callee_is_sysroot_spelling_for_suppression`] reduces to the generic-free entries below.
+    ///
+    /// DELIBERATELY EXCLUDED, and this is the point of the list rather than a root
+    /// check: `unwrap_or`, `unwrap_or_else`, `unwrap_or_default`, `unwrap_err`,
+    /// `expect_err` are sysroot items whose paths contain `::unwrap`/`::expect` and
+    /// which return something OTHER than the tracked value on the error arm. See
+    /// the `is_layout_size_passthrough_call` arm for the compiled `unwrap_or`
+    /// false proof.
+    pub(super) const SUP_LAYOUT_PASSTHROUGH: &[&str] = &[
+        // `core::result::Result::<Layout, LayoutError>::unwrap` / `::expect`
+        "core::result::result::unwrap",
+        "core::result::result::expect",
+        "core::result::result::unwrap_unchecked",
+        // `core::option::Option::<Layout>::unwrap` / `::expect`
+        "core::option::option::unwrap",
+        "core::option::option::expect",
+        "core::option::option::unwrap_unchecked",
+    ];
+
+    /// Does the LOWERCASED callee `lower` name exactly one of `spellings`?
+    ///
+    /// (i) It must be rooted at a genuine sysroot crate — [`callee_is_std_crate_rooted`]:
+    /// `core::`/`alloc::`/`std::` at the very front (one `<`-wrapped inherent header
+    /// allowed), NO ` as ` (a trait-qualified spelling is never a listed item), and
+    /// therefore no extractor identity stamp (`__trust_crate@…::core::…` does not
+    /// start with `core::`); a nested user module `mycrate::core::ptr::read` fails
+    /// the root. (ii) Its GENERIC-FREE def path — every `::<…>` turbofish and
+    /// `::<impl …>` header removed by [`strip_turbofish_args`], so a type argument is
+    /// never consulted — must be BYTE-EQUAL to a listed spelling. A list is not a
+    /// substring: `dep::ptr::read`, `core::ptr::read_volatile_from`, and a sysroot
+    /// item the recognizer did not mean all miss.
+    pub(super) fn callee_is_sysroot_spelling_for_suppression(
+        lower: &str,
+        spellings: &[&str],
+    ) -> bool {
+        if !spellings.iter().any(|s| lower.contains(s.rsplit_once("::").map_or(*s, |(_, tail)| tail))) {
+            return false;
+        }
+        if !callee_is_std_crate_rooted_sup(lower) {
+            return false;
+        }
+        let bare = strip_turbofish_args(lower);
+        let bare = bare.strip_prefix('<').unwrap_or(&bare);
+        spellings.contains(&bare)
     }
-    if lower.contains(" as ") {
-        return false;
+
+    /// Check if a callee is a container-to-raw-pointer accessor (`as_ptr` /
+    /// `as_mut_ptr` on a slice, array, `Vec`, etc.). The result aliases the
+    /// receiver's buffer, so provenance/offset propagate through it.
+    ///
+    /// CRATE-ANCHORED (round-4 discipline). The bare `contains("::as_ptr")` was
+    /// FORGEABLE: a free fn `mycrate::as_ptr(slice)` (its `::as_ptr` substring matches)
+    /// or an orphan trait impl on a slice `<[T] as mycrate::Buf>::as_ptr` would (a) make
+    /// the engine treat `dest` as ALIASING the receiver's tracked allocation and (b) bind
+    /// `dest`'s provenance size to the receiver's `container_byte_len` — either FALSELY
+    /// discharging a later `from_raw_parts(dest, n)` byte-bounds obligation → OOB. Reject
+    /// trait-qualified (`<T as …>`) paths and require a genuine sysroot-crate root (or the
+    /// un-forgeable bare inherent slice header `<[…]>::as_ptr`). Every genuine container
+    /// `as_ptr` renders crate-rooted (`core::slice::<impl [T]>::as_ptr`,
+    /// `std::ptr::NonNull::<T>::as_ptr`, `alloc::vec::Vec::<T>::as_ptr` — extractor
+    /// fixtures). Fail-closed on a miss (untracked `dest` ⇒ symbolic from_raw_parts).
+    pub(super) fn is_container_as_ptr_call_sup(lower: &str) -> bool {
+        if !(lower.contains("::as_ptr") || lower.contains("::as_mut_ptr")) {
+            return false;
+        }
+        if lower.contains(" as ") {
+            return false;
+        }
+        let c = lower.strip_prefix('<').unwrap_or(lower);
+        c.starts_with("core::")
+            || c.starts_with("std::")
+            || c.starts_with("alloc::")
+            || c.starts_with("[")
     }
-    let c = lower.strip_prefix('<').unwrap_or(lower);
-    c.starts_with("core::")
-        || c.starts_with("std::")
-        || c.starts_with("alloc::")
-        || c.starts_with("[")
+
+    /// Check if a callee is a raw-pointer pointee-cast METHOD (`<*mut T>::cast`,
+    /// `<*const T>::cast`, `cast_mut`, `cast_const`). These change only the pointee
+    /// type while PRESERVING the address and provenance, so tracking must survive
+    /// them exactly as it does an `as` pointer cast. Scoped to the CRATE-ANCHORED
+    /// raw-pointer inherent-impl paths (`{core,std}::ptr::const_ptr`/`mut_ptr`) so it
+    /// never matches unrelated `cast`-named methods (e.g. enum `downcast`) NOR a forged
+    /// `mycrate::const_ptr::cast` — which would propagate the receiver's tracked
+    /// allocation onto an unrelated `dest`, FALSELY discharging a later `from_raw_parts`.
+    pub(super) fn is_ptr_cast_call_sup(lower: &str) -> bool {
+        callee_is_std_raw_ptr_inherent_sup(lower) && lower.contains("::cast")
+    }
+
+    /// Check if a callee constructs a `Layout` from an explicit byte size
+    /// (`Layout::from_size_align` / `…_unchecked`). The first argument is the size,
+    /// which — when constant — bounds any allocation made from the layout.
+    ///
+    /// CRATE-ANCHORED (round-4 discipline): the recorded concrete size is a DISCHARGE —
+    /// an allocation built from this layout carries it as `concrete_sizes[prov]`, which a
+    /// later `from_raw_parts(p, n)` bound (`offset + n <= size`) discharges against. A
+    /// forged `mycrate::layout::from_size_align(BIG, _)` (its `layout::from_size_align`
+    /// substring matches) would over-state the allocation size → FALSE OOB proof. Genuine
+    /// renders `core::alloc::layout::Layout::from_size_align[_unchecked]` (crate-rooted,
+    /// no ` as ` — extractor fixtures), which the anchor keeps.
+    pub(super) fn is_layout_size_call_sup(lower: &str) -> bool {
+        callee_is_std_crate_rooted_sup(lower) && lower.contains("layout::from_size_align")
+    }
+
+    /// Check if a callee is an allocation function.
+    ///
+    /// EXACT SYSROOT SPELLINGS, MATCHED ON THE CALLEE PATH ONLY — NEVER ON A TYPE
+    /// ARGUMENT (rule 3, 2026-09-20). The bare `contains("alloc::alloc")` matched an
+    /// `alloc::alloc::Global` spelled INSIDE a turbofish — the allocator argument of
+    /// a `mem::zeroed::<Option<Box<u8, alloc::alloc::Global>>>` — and so classified
+    /// that `mem::zeroed` CALL as an allocation: `has_unsafe_patterns` admitted the
+    /// body on its account, the alloc arm minted `[unsafe:sep:alloc]` rows for the
+    /// zeroed terminator, `sep_call_sites` recorded the block, and `decide_site`
+    /// answered Covered before the typed `[unsafe:zeroed]` verdict was ever
+    /// reached (fail-closed — the bogus rows refute — but the typed obligation was
+    /// blocked on exactly the shape it exists for). [`callee_is_sysroot_spelling_for_suppression`]
+    /// strips every `::<…>` group first, so a type argument is never seen, and then
+    /// requires the generic-free def path to be one of [`SUP_ALLOC`].
+    ///
+    /// [`is_global_allocator_ufcs_call_sup`] keeps the one trait-qualified allocator
+    /// the old substring also matched (round-two `optbox` parity), and
+    /// [`is_known_good_box_alloc_sup`] keeps the infallible box allocators (its own
+    /// crate-anchored, generic-stripped match — the same discipline).
+    ///
+    /// MEASURED CONSEQUENCE of the exact list (2026-09-20): at `a351ee124e` the
+    /// `interpret_call` alloc arm precedes the dealloc/realloc arms, and the
+    /// `alloc::alloc` substring also matched `alloc::alloc::dealloc` and
+    /// `alloc::alloc::realloc`, so both real spellings were interpreted as an
+    /// ALLOCATION (a null/size check on a free). They now reach the arms that mean
+    /// them (`DESUP_ALLOC`, `RESUP_ALLOC`). No probe in the round-two
+    /// corpus calls either; the change is recorded, not inferred.
+    pub(super) fn is_alloc_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_ALLOC)
+            || is_global_allocator_ufcs_call_sup(lower)
+            || is_known_good_box_alloc_sup(lower)
+    }
+
+    /// Check if a callee is a deallocation function — EXACT spellings
+    /// ([`DESUP_ALLOC`]). A user `dep::alloc::dealloc` / `dep::drop_in_place`
+    /// is NOT modeled as a free.
+    pub(super) fn is_dealloc_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, DESUP_ALLOC)
+    }
+
+    /// Check if a callee is a reallocation function — EXACT spellings
+    /// ([`RESUP_ALLOC`]). A user `dep::alloc::realloc` is NOT modeled as a
+    /// realloc.
+    pub(super) fn is_realloc_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, RESUP_ALLOC)
+    }
+
+    /// Check if a callee is a pointer-offset method (`<*const/mut T>::add`,
+    /// `::offset`, `::wrapping_add`, `::wrapping_offset`). These lower to a CALL,
+    /// not a `BinaryOp`, so the engine must route them to the offset interpreter to
+    /// preserve provenance and accumulate the byte offset. `::sub`/`::wrapping_sub`
+    /// are intentionally excluded (their operand would need negating).
+    ///
+    /// CRATE-ANCHORED (round-4 discipline): the offset interpreter PROPAGATES the
+    /// receiver's tracked provenance + byte offset to `dest`; a forged
+    /// `mycrate::mut_ptr::add` would carry the receiver's allocation size onto an
+    /// unrelated `dest`, FALSELY discharging a later `from_raw_parts`. Genuine renders
+    /// `{core,std}::ptr::const_ptr`/`mut_ptr::<impl *…>::add` (extractor fixtures).
+    pub(super) fn is_ptr_offset_call_sup(lower: &str) -> bool {
+        callee_is_std_raw_ptr_inherent_sup(lower)
+            && (lower.contains("::add")
+                || lower.contains("::offset")
+                || lower.contains("::wrapping_add")
+                || lower.contains("::wrapping_offset"))
+    }
+
+    /// Check if a callee is unchecked indexing (`<[T]>::get_unchecked`,
+    /// `get_unchecked_mut`, and the `str` forms) — UB if the index is out of bounds,
+    /// with no language-inserted check, so Trust must emit the bounds obligation
+    /// itself. EXACT spellings ([`SUP_UNCHECKED_INDEX`]): a user type's
+    /// inherent `mycrate::Foo::get_unchecked`, or an orphan `SliceIndex` impl
+    /// `<mycrate::Foo as core::slice::index::SliceIndex<…>>::get_unchecked`, is not a
+    /// sysroot unchecked index.
+    pub(super) fn is_unchecked_index_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_UNCHECKED_INDEX)
+    }
+
+    /// Check if a callee is a raw single-element memory access via a CALL —
+    /// `ptr::read`, `ptr::read_volatile`, `ptr::read_unaligned`, and the `write`
+    /// equivalents. The dereference is hidden inside the std function (not a MIR
+    /// `Deref` place), so it needs its own bounds obligation. `write_bytes` (a
+    /// `count`-sized memset) and `copy` are handled by their own paths, not here.
+    /// EXACT spellings ([`SUP_RAW_READ_WRITE`]): a user `dep::ptr::read` does
+    /// NOT receive the raw read/write backing-bounds obligation.
+    pub(super) fn is_raw_read_write_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_RAW_READ_WRITE)
+    }
+
+    /// UB-class ops whose safety condition is a non-arithmetic type invariant.
+    /// Returns `(tag, human-readable required-invariant)` for the obligation message.
+    ///
+    /// EXACT spellings ([`SUP_FROM_UTF8_UNCHECKED`], [`SUP_ASSUME_INIT`],
+    /// [`SUP_CSTR_FROM_BYTES_WITH_NUL_UNCHECKED`]). A user
+    /// `dep::from_utf8_unchecked` / `dep::MyUninit::assume_init` /
+    /// `dep::CStrish::from_bytes_with_nul_unchecked` must NOT receive the named
+    /// type-invariant obligation; the site keeps its fail-closed stand-in instead.
+    pub(super) fn unsafe_assertion_op_sup(lower: &str) -> Option<(&'static str, &'static str)> {
+        if callee_is_sysroot_spelling_for_suppression(lower, SUP_FROM_UTF8_UNCHECKED) {
+            Some((
+                "from_utf8_unchecked",
+                "the input bytes must be valid UTF-8 (the `str` invariant)",
+            ))
+        } else if callee_is_sysroot_spelling_for_suppression(lower, SUP_ASSUME_INIT) {
+            Some(("assume_init", "the value must be fully initialized before `assume_init`"))
+        } else if callee_is_sysroot_spelling_for_suppression(
+            lower,
+            SUP_CSTR_FROM_BYTES_WITH_NUL_UNCHECKED,
+        ) {
+            // `CStr::from_bytes_with_nul_unchecked`: UB unless the bytes are
+            // nul-terminated with no interior nul. A buffer-shape invariant the
+            // arithmetic machinery cannot express ⇒ fail-closed Unknown.
+            Some((
+                "from_bytes_with_nul_unchecked",
+                "the input bytes must be nul-terminated with no interior nul (the `CStr` invariant)",
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// `Option/Result::unwrap_unchecked` — UB if the receiver is `None`/`Err`. A
+    /// non-arithmetic discriminant fact ⇒ fail-closed Unknown, emitted from the
+    /// `is_layout_passthrough_call` arm (which also threads tracked `Layout` sizes).
+    /// Recognized here so `has_unsafe_patterns` / `call_is_modeled` see it as covered.
+    /// EXACT spellings ([`SUP_UNWRAP_UNCHECKED`]): a user
+    /// `dep::MyOpt::unwrap_unchecked` does NOT receive the receiver-`Some`/`Ok`
+    /// obligation; it keeps the fail-closed stand-in.
+    pub(super) fn is_unwrap_unchecked_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_UNWRAP_UNCHECKED)
+    }
+
+    /// `ptr::copy` / `ptr::copy_nonoverlapping` — EXACT spellings
+    /// ([`SUP_PTR_COPY`]). A user `dep::ptr::copy` must NOT be modeled as the
+    /// intrinsic memmove.
+    pub(super) fn is_ptr_copy_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_PTR_COPY)
+    }
+
+    /// `slice`/`str`/`Vec`/`String::from_raw_parts` — EXACT spellings
+    /// ([`SUP_FROM_RAW_PARTS`]). A user `dep::from_raw_parts` must NOT receive
+    /// the backing-length bounds contract.
+    pub(super) fn is_from_raw_parts_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_FROM_RAW_PARTS)
+    }
+
+    /// `mem::transmute_copy` / `mem::transmute` — EXACT spellings
+    /// ([`SUP_TRANSMUTE`]). A user `dep::mem::transmute` must NOT be modeled as
+    /// the layout/validity transmute.
+    pub(super) fn is_transmute_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_TRANSMUTE)
+    }
+
+    /// The default global allocator's `Allocator` impl, spelled trait-qualified:
+    /// `<alloc::alloc::Global as core::alloc::Allocator>::allocate` / `::deallocate`
+    /// — REAL extracted MIR (sealed `ff538f905`, the round-two `optbox` probe, where
+    /// a user `Allocator` impl forwards to `Global`). Both were matched by the old
+    /// `alloc::alloc` substring and modeled by the alloc arm (the `deallocate` rows
+    /// are an allocation-shaped refutation of a free: fail-closed, and kept for
+    /// byte-identity with round two — modeling `deallocate` as a free is a separate
+    /// change). Matched LITERALLY on the generic-free spelling: `callee_is_std_crate_
+    /// rooted` rejects every ` as ` path, so this is the one place a trait-qualified
+    /// callee is admitted, and only these two leaves. An impersonating crate is
+    /// stamped at the FRONT of the path (`__trust_crate@…::<alloc::…`), so the
+    /// literal cannot match it; a user `<mycrate::Fake as core::alloc::Allocator>::
+    /// allocate` differs in its Self type and does not match either.
+    pub(super) fn is_global_allocator_ufcs_call_sup(lower: &str) -> bool {
+        if !lower.starts_with("<alloc::alloc::global") {
+            return false;
+        }
+        let bare = strip_turbofish_args(lower);
+        SUP_GLOBAL_ALLOCATOR_UFCS.contains(&&*bare)
+    }
+
+    /// An INFALLIBLE, type-aligned box allocator: `box_new_uninit` (the free fn
+    /// `Box::new`/`Box::new_uninit` inline to) or `Box::new` itself. The global
+    /// allocator aborts on OOM — it never returns null to safe code — and returns
+    /// memory aligned to the `Layout`'s alignment (= the boxed type's alignment). So
+    /// a raw deref/write of the returned pointer is non-null, valid, aligned, and
+    /// writable (the [`box_alloc_postcondition`] facts). DELIBERATELY EXCLUDES the
+    /// fallible raw `alloc::alloc`/`alloc_zeroed` (which CAN return null — assuming
+    /// non-null there would false-PROVE a real null-deref) and `Vec` constructors
+    /// (a `Vec::new` pointer is a dangling-but-non-null sentinel into ZERO capacity,
+    /// not a deref-safe region). Anchored to a recognizable std box-allocator token.
+    pub(super) fn is_known_good_box_alloc_sup(lower: &str) -> bool {
+        // `box_new_uninit` is a distinctive std-internal name (no user fn shares it);
+        // require a std/alloc/core (`boxed`) origin so a same-named user item cannot
+        // qualify. `Box::<T>::new` lowers with the `boxed::box` path segment.
+        //
+        // STRIP generic args before matching: the monomorphized METHOD form
+        // `box::<[formula; 2]>::new_uninit` (the `Box::<T>::new_uninit` the `vec!` of a
+        // LARGE element emits — NOT inlined to the generic-free `box_new_uninit`) has its
+        // `box::new` segment SPLIT by the `<…>`, so the raw substring match misses it (the
+        // `vec!` of a SMALL element inlines to `box_new_uninit`, which matched — hence the
+        // discrepancy). Normalize like `total_no_panic_call_summary`. The cascading
+        // false-FAILs this once exposed are now co-fixed: the `[unsafe:sep:alloc]` size
+        // check is SKIPPED for an infallible box alloc (the box is type-sized), and the
+        // use-after-free is fixed at the root (cleanup-block `Drop`s no longer free — see
+        // `interpret_drop` + `reachable_block_ids`).
+        // CRATE-ANCHORED std origin (round-4 discipline): the box allocator's def-path
+        // must be rooted at a genuine sysroot crate (`std::`/`alloc::`/`core::`), incl. a
+        // UFCS-wrapped inherent header, and must NOT be trait-qualified (`<T as …>`). The
+        // old `contains("boxed")` disjunct was FORGEABLE — a user module
+        // `mycrate::boxed::box_new_uninit`, or an orphan trait impl
+        // `<Vec<T> as mycrate::Boxed>::box_new_uninit`, matched, then received the
+        // infallible-allocator non-null/writable postcondition + the SKIPPED size check
+        // (see the `is_known_good_box_alloc_sup` call in `interpret_call` + `discharge_box_good`),
+        // FALSELY discharging a genuine null-deref. Every genuine box allocator renders
+        // crate-rooted (`alloc::boxed::box_new_uninit`, `std::boxed::Box::<T>::new` —
+        // verified against the extractor fixtures), so the anchor keeps them. The
+        // extractor additionally DefId-authenticates the identity (`owned_box` lang item /
+        // sysroot `StableCrateId` — trust-mir-extract `is_infallible_box_allocator`); this
+        // string gate is the sep-engine's own fail-closed backstop.
+        if !lower.contains("box") || !callee_is_std_crate_rooted_sup(lower) {
+            return false;
+        }
+        let mut without_generics = String::with_capacity(lower.len());
+        let mut depth = 0usize;
+        for c in crate::mask_fn_arrows(lower).chars() {
+            match c {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => without_generics.push(c),
+                _ => {}
+            }
+        }
+        let normalized = without_generics
+            .split("::")
+            .filter(|seg| !seg.is_empty())
+            .collect::<Vec<_>>()
+            .join("::");
+        // INFALLIBLE box allocators: the free `box_new_uninit`, `Box::new`, and
+        // `Box::new_uninit` (`box::new` is a substring of the normalized `box::new_uninit`).
+        // `Box::new_uninit` returns UNINITIALIZED memory, but the POINTER is still non-null
+        // + aligned + a valid allocation (the only facts the box-good postcondition
+        // asserts; initialization is the separate `assume_init` obligation).
+        normalized.contains("box_new_uninit") || normalized.contains("box::new")
+    }
+
+    /// `NonZero*::new_unchecked` / `NonNull::new_unchecked` / `Unique::new_unchecked`
+    /// — UB if the argument is zero (resp. null), an ARITHMETIC precondition the
+    /// engine models directly.
+    pub(super) fn is_nonzero_new_unchecked_call_sup(lower: &str) -> bool {
+        // The obligation this gates is SPECIFICALLY the `NonZero`/`NonNull` niche
+        // (`arg == 0` is UB). Matching the bare suffix `new_unchecked` charged that
+        // obligation to every unrelated constructor that happens to carry the name:
+        // nn-core's SAFE `WeightRef::new_unchecked(data: Vec<f32>, shape: Vec<usize>)`
+        // (not even an `unsafe fn` — it only skips a shape/len consistency check) and
+        // ndarray's `SliceInfo::new_unchecked`, whose real precondition is that the
+        // indices match the dimensions, not that an argument is non-zero. Both got
+        // `Formula::Eq(arg, 0)` over a non-integer first argument: an obligation that
+        // does not state the callee's actual contract.
+        //
+        // `0a3972ab9e` added an owner token (`nonzero`/`non_null`/…) and did not
+        // close the class — a downstream user's `dep::nonzero::Handle::new_unchecked`
+        // still carries both tokens and got the `NonZero` contract `Eq(arg, 0)`,
+        // PROVED for the argument `5`, with nothing else at the site (REFUTED
+        // 2026-09-19, `scratchpad/dl/xc`). EXACT spellings now
+        // ([`SUP_NONZERO_NEW_UNCHECKED`], real extracted MIR): a user module
+        // named `nonzero`, a nested `mycrate::core::num::nonzero::…`, an orphan
+        // `<NonZero<u32> as mycrate::Forge>::new_unchecked` and a stamped
+        // impersonator all miss.
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_NONZERO_NEW_UNCHECKED)
+    }
+
+    /// `char::from_u32_unchecked` — EXACT spellings ([`SUP_CHAR_FROM_U32_UNCHECKED`]).
+    /// A user free fn `dep::from_u32_unchecked` (the 2026-09-19 refutation's second
+    /// callee) must NOT receive the Unicode scalar-value contract.
+    pub(super) fn is_char_from_u32_unchecked_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_CHAR_FROM_U32_UNCHECKED)
+    }
+
+    /// `Vec::set_len` — EXACT spellings ([`SUP_SET_LEN`]). A user
+    /// `dep::Buf::set_len` must NOT receive the capacity contract.
+    pub(super) fn is_set_len_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_SET_LEN)
+    }
+
+    /// UB-class ops whose safety precondition is ARITHMETIC, so the engine emits a
+    /// real (guard-dischargeable) obligation rather than a fail-closed Unknown:
+    /// `NonZero*/NonNull::new_unchecked` (arg ≠ 0), `char::from_u32_unchecked`
+    /// (Unicode scalar value), `Vec::set_len` (new_len ≤ capacity). Mirrors the
+    /// dispatch arms in `interpret_call`; used by `has_unsafe_patterns` /
+    /// `call_is_modeled` so a function whose ONLY unsafe op is one of these is still
+    /// analyzed (not skipped) and is not double-flagged by the compiler's
+    /// completeness check.
+    pub(super) fn is_unsafe_arith_op_sup(lower: &str) -> bool {
+        is_nonzero_new_unchecked_call_sup(lower)
+            || is_char_from_u32_unchecked_call_sup(lower)
+            || is_set_len_call_sup(lower)
+    }
+
+    /// May a tracked `Layout` size be RELOCATED across this callee? EXACT sysroot
+    /// spellings ([`SUP_LAYOUT_PASSTHROUGH`]) — the six `Result`/`Option`
+    /// methods that return the payload itself. A user `mycrate::Thing::unwrap` and
+    /// a sysroot `Result::unwrap_or` both answer false, and the size stays where it
+    /// was (fail-closed: the allocation keeps an underivable size, which refutes).
+    pub(super) fn is_layout_size_passthrough_call_sup(lower: &str) -> bool {
+        callee_is_sysroot_spelling_for_suppression(lower, SUP_LAYOUT_PASSTHROUGH)
+    }
+
+    /// True when `lower` (a LOWERCASED callee def-path) is rooted at a genuine sysroot
+    /// crate — `std::`/`alloc::`/`core::` — either directly or as a UFCS-wrapped
+    /// inherent header (`<std::…>::method`), and is NOT a trait-qualified `<T as …>`
+    /// path. This is the round-4 anchoring discipline (mirrors generate.rs's
+    /// `callee_is_std_vec_inherent`): a user cannot shadow the sysroot crate roots (the
+    /// `--crate-name` literal attack is the accepted doctrine boundary), and the ` as `
+    /// reject rules out an orphan trait impl on a foreign std type. Consumed by the
+    /// memory-safety DISCHARGE producers below so a same-named user free fn / method /
+    /// trait impl cannot forge a fact that clears a null/OOB/init obligation.
+    pub(super) fn callee_is_std_crate_rooted_sup(lower: &str) -> bool {
+        // ORDER IS LOAD-BEARING (RULE 5, 2026-09-20) — and it is load-bearing in the
+        // FAIL-OPEN direction, so this is not a tidiness note. The ` as ` reject used
+        // to run on the RAW def path. A GENERIC sysroot callee instantiated at an
+        // ASSOCIATED TYPE carries ` as ` inside its instantiation arguments, so the
+        // raw test refused it — and since round 5 routes ~26 `Mints` recognizers
+        // through `callee_is_sysroot_spelling_for_suppression` (which gates on this fn), EVERY
+        // unsafe sysroot call in generic code lost its contract row: the compiler
+        // then suppressed nothing and vcgen minted nothing, leaving the call with NO
+        // obligation at all. MEASURED on the sealed `trustc ff538f905`
+        // (`$TMPDIR/rc5/generic.rs`, 8 fns): 38 obligations on the seal, 15 on the
+        // pre-fix branch tip `2e5489663` — all 23 `[unsafe:sep:*]` rows gone.
+        //
+        // THE DISTINGUISHING RULE, from real extracted MIR
+        // (`-Ztrust-dump=mir-only:<dir>` on the seal, `$TMPDIR/rc5/mirg`, `mir-ufcs`):
+        //
+        //   * An associated-type INSTANTIATION ARGUMENT puts ` as ` INSIDE a `::<…>`
+        //     group — a `<` immediately preceded by `::`. Measured:
+        //       core::ptr::read::<<T as core::iter::traits::iterator::Iterator>::Item>
+        //       alloc::vec::Vec::<<T as …::Iterator>::Item>::set_len
+        //       core::slice::<impl [<T as …::Iterator>::Item]>::get_unchecked::<usize>
+        //     The callee is `core::ptr::read`; the ` as ` says nothing about it.
+        //
+        //   * A REAL UFCS QUALIFIER puts ` as ` in the LEADING `<…>` group — a `<` at
+        //     position 0, NOT preceded by `::`. Measured, from a user trait
+        //     implemented on a sysroot type (`$TMPDIR/rc5/ufcs.rs`):
+        //       <core::num::nonzero::NonZero<u8> as ufcs::Sneaky>::read
+        //     Here the ` as ` IS the callee identity: a user method wearing a sysroot
+        //     receiver, and it must stay refused.
+        //
+        // `strip_turbofish_args` removes exactly the first kind and leaves exactly
+        // the second (that is its documented contract, and
+        // `strip_turbofish_removes_type_args_not_ufcs_qualifiers` pins it), so a
+        // ` as ` that SURVIVES the strip is a UFCS qualifier and nothing else.
+        //
+        // The strip is consulted ONLY to adjudicate a ` as `. A path with no ` as `
+        // is decided by the byte-identical code that decided it before, so this fix
+        // cannot move any row outside the class it names.
+        if lower.contains(" as ") && strip_turbofish_args(lower).contains(" as ") {
+            return false;
+        }
+        let c = lower.strip_prefix('<').unwrap_or(lower);
+        c.starts_with("std::") || c.starts_with("alloc::") || c.starts_with("core::")
+    }
+
+    /// True when `lower` is an INHERENT method on a genuine raw pointer — the
+    /// `{core,std}::ptr::const_ptr` / `::mut_ptr` inherent-impl modules (`<impl *const
+    /// T>` / `<impl *mut T>`), or the bare inherent UFCS header `<*const …>` / `<*mut
+    /// …>`. A user cannot add an inherent method to the primitive raw-pointer types, and
+    /// the ` as ` reject rules out an orphan trait impl `<*mut T as mycrate::Ptr>::cast`.
+    /// The old `contains("const_ptr") || contains("mut_ptr")` was FORGEABLE via a nested
+    /// user module named `const_ptr`/`mut_ptr` (`mycrate::const_ptr::cast`). Every
+    /// genuine raw-ptr method renders `core::ptr::const_ptr::<impl *const T>::cast` /
+    /// `std::ptr::mut_ptr::<impl *mut u8>::add` (verified against the extractor fixtures).
+    pub(super) fn callee_is_std_raw_ptr_inherent_sup(lower: &str) -> bool {
+        if lower.contains(" as ") {
+            return false;
+        }
+        let c = lower.strip_prefix('<').unwrap_or(lower);
+        c.starts_with("core::ptr::const_ptr")
+            || c.starts_with("std::ptr::const_ptr")
+            || c.starts_with("core::ptr::mut_ptr")
+            || c.starts_with("std::ptr::mut_ptr")
+            || c.starts_with("*const ")
+            || c.starts_with("*mut ")
+    }
 }
 
 /// Whether the separation engine MODELS this call (lowercased name) — i.e. some
@@ -3676,23 +9091,32 @@ fn is_container_as_ptr_call(lower: &str) -> bool {
 /// Trust already covers. Mirrors the `interpret_call` dispatch + the call arm of
 /// `has_unsafe_patterns`.
 pub(crate) fn call_is_modeled(lower: &str) -> bool {
+    // EVERY arm below is `suppression_mirror::*` — the STRING recognizers, kept
+    // byte-identical to round 6 and deliberately NOT migrated to the key. See
+    // that module's header: this predicate's TRUE suppresses the compiler's
+    // fail-closed `[unsafe:unmodeled-call]` row, and the compiler evaluates it
+    // through `crate::call_has_unsafe_model(&safe_def_path_str(tcx, did))` — a
+    // rendered string and nothing else. Keying this side on a fact the
+    // compiler's call site does not pass would desynchronize the mirror and
+    // silently delete stand-ins, which is the round-5 fail-open restated.
+    use suppression_mirror as sup;
     is_external_map_call(lower)
-        || is_container_as_ptr_call(lower)
-        || is_ptr_cast_call(lower)
-        || is_layout_size_call(lower)
+        || sup::is_container_as_ptr_call_sup(lower)
+        || sup::is_ptr_cast_call_sup(lower)
+        || sup::is_layout_size_call_sup(lower)
         || is_layout_passthrough_call(lower)
-        || is_alloc_call(lower)
-        || is_dealloc_call(lower)
-        || is_realloc_call(lower)
-        || is_ptr_offset_call(lower)
-        || is_unchecked_index_call(lower)
-        || is_raw_read_write_call(lower)
-        || unsafe_assertion_op(lower).is_some()
-        || is_unsafe_arith_op(lower)
-        || is_unwrap_unchecked_call(lower)
-        || lower.contains("ptr::copy")
-        || lower.contains("from_raw_parts")
-        || lower.contains("mem::transmute")
+        || sup::is_alloc_call_sup(lower)
+        || sup::is_dealloc_call_sup(lower)
+        || sup::is_realloc_call_sup(lower)
+        || sup::is_ptr_offset_call_sup(lower)
+        || sup::is_unchecked_index_call_sup(lower)
+        || sup::is_raw_read_write_call_sup(lower)
+        || sup::unsafe_assertion_op_sup(lower).is_some()
+        || sup::is_unsafe_arith_op_sup(lower)
+        || sup::is_unwrap_unchecked_call_sup(lower)
+        || sup::is_ptr_copy_call_sup(lower)
+        || sup::is_from_raw_parts_call_sup(lower)
+        || sup::is_transmute_call_sup(lower)
         // `core::fmt::Arguments::*` constructors (`new` on this sysroot; the retired
         // `new_v1`/`new_const`/`new_v1_formatted` on older ones) are
         // `unsafe fn`s by SIGNATURE but compiler-GENERATED by `format_args!`, which upholds their
@@ -3746,10 +9170,12 @@ pub(crate) fn call_is_modeled(lower: &str) -> bool {
 /// finding on `ARENA::{constant#0}::{closure#0,1}`; it introduces no model of the
 /// call's effects (this predicate is consumed only by the compiler's completeness
 /// cross-check, not by `interpret_call`). Matched on the LOWERCASED def-path the
-/// completeness check passes (`call_has_unsafe_model` lowercases first), and via
-/// `contains` because the init-fn turbofish `::<fn() -> T {…}>` carries a `->` that
-/// no bracket-balanced normalization survives — the `LazyStorage::…::get_or_init`
-/// head is stable, so the anchored substrings are exact.
+/// completeness check passes (`call_has_unsafe_model` lowercases first), as an EXACT
+/// generic-free def path. It used to be matched via `contains`, on the claim that the
+/// init-fn turbofish `::<fn() -> T {…}>` "carries a `->` that no bracket-balanced
+/// normalization survives". That claim described a DEFECT IN THE NORMALIZER, not the
+/// spelling, and it is no longer true — see the `->` rule on
+/// [`strip_turbofish_args`] and the disposition note on the predicate below.
 ///
 /// SPELLING FIX (2026-08-16). `std::thread::local_impl::LazyStorage` is the RE-EXPORT
 /// path the macro body writes; `safe_def_path_str` renders the callee's DEFINITION path
@@ -3787,25 +9213,53 @@ pub(crate) fn call_is_modeled(lower: &str) -> bool {
 ///    panic-freedom lane is untouched (probe-confirmed: `ARENA::{constant#0}::{closure#0}`
 ///    keeps its `panic freedom: no assertion, unreachable!, or panic is reachable` row).
 ///
-/// The eager leaf is matched with the tag-robust [`crate::generate::method_tail`]
-/// (EXACT `get`, so the private `get_or_init_slow` / any `get_*` sibling is not swept in);
-/// the lazy leaf keeps `contains` for the `->`-bearing init-fn turbofish reason above.
+/// THE SUBSTRING ESCAPE HATCH IS GONE (2026-09-20). Until this commit the lazy leaf
+/// was `lower.contains("::get_or_init")`, and the reason given was that the init-fn
+/// turbofish `::<fn() -> T {…}>` "carries a `->` that no bracket-balanced
+/// normalization survives". That was TRUE OF THE NORMALIZER, not of the spelling, and
+/// it was a defect rather than a property: the very same `->` was silently costing ~26
+/// OTHER recognizers their contract rows (see [`strip_turbofish_args`]). Now that
+/// `strip_turbofish_args` skips an arrow's `>`, the real spelling normalizes, so BOTH
+/// leaves are matched as an EXACT generic-free def path and the hatch is not needed.
+/// MEASURED, `-Ztrust-dump=mir-only` on the sealed `trustc ff538f905`
+/// (`$TMPDIR/rc6/tls2.rs`, one `thread_local!` of each arm):
+///
+///   std::sys::thread_local::native::lazy::Storage::<alloc::vec::Vec<u8>, !>
+///     ::get_or_init::<fn() -> alloc::vec::Vec<u8> {tls2::ARENA::__rust_std_internal_init_fn}>
+///   std::sys::thread_local::native::lazy::Storage::<alloc::vec::Vec<u8>, ()>::get_or_init::<…>
+///   std::sys::thread_local::native::eager::Storage::<core::cell::Cell<u64>>::get
+///
+/// which strip to `…::lazy::storage::get_or_init` and `…::eager::storage::get`.
+/// The EXACT form is strictly stronger than the old prefix+substring pair, which
+/// admitted any `get_or_init`-containing leaf under the module (`get_or_init_slow`,
+/// a future `get_or_init_racy`) — a suppression this predicate has no argument for.
+/// If a future printer change moves a spelling, this goes DEAD and the
+/// `[unsafe:unmodeled-call]` row comes BACK: the fail-closed direction.
 fn is_native_tls_lazy_init_call(lower: &str) -> bool {
-    // CRATE-ANCHORED: require the `std::`-ROOTED module path, not a bare
+    // CRATE-ANCHORED: require the `std::`-ROOTED def path, not a bare
     // `contains("thread::local_impl::lazystorage")` (which a nested user module
     // `mycrate::…::thread::local_impl::lazystorage::…::get_or_init` could forge to
     // SUPPRESS the `[unsafe:unmodeled-call]` completeness VC on a genuinely-unmodeled
     // unsafe call). The genuine machinery renders `std::thread::local_impl::LazyStorage…`
     // (re-export spelling) or `std::sys::thread_local::native::…::Storage…` (definition
     // spelling, what `safe_def_path_str` actually prints — see the doc comment).
-    let lazy = (lower.starts_with("std::thread::local_impl::lazystorage")
-        || lower.starts_with("std::sys::thread_local::native::lazy::storage"))
-        && lower.contains("::get_or_init");
-    let eager = (lower.starts_with("std::thread::local_impl::eagerstorage")
-        || lower.starts_with("std::sys::thread_local::native::eager::storage"))
-        && crate::generate::method_tail(lower) == "get";
+    // Both are kept; the re-export one is what older gate logs carry.
+    if !(lower.starts_with("std::thread::local_impl::")
+        || lower.starts_with("std::sys::thread_local::native::"))
+    {
+        return false;
+    }
+    let bare = strip_turbofish_args(lower);
+    let lazy = bare == "std::thread::local_impl::lazystorage::get_or_init"
+        || bare == "std::sys::thread_local::native::lazy::storage::get_or_init";
+    let eager = bare == "std::thread::local_impl::eagerstorage::get"
+        || bare == "std::sys::thread_local::native::eager::storage::get";
     let hit = lazy || eager;
-    if hit && std::env::var_os("TRUST_TLS_DISCHARGE_DEBUG").is_some() {
+    static TLS_DISCHARGE_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if hit
+        && *TLS_DISCHARGE_DEBUG
+            .get_or_init(|| crate::trust_vcgen_env_var_present("TRUST_TLS_DISCHARGE_DEBUG"))
+    {
         let arm = if lazy { "lazy-init" } else { "const-init (eager)" };
         eprintln!(
             "TRUST_TLS_DISCHARGE_DEBUG: call_is_modeled covers native-TLS {arm} \
@@ -3824,25 +9278,519 @@ fn is_native_tls_lazy_init_call(lower: &str) -> bool {
 /// never matches unrelated `cast`-named methods (e.g. enum `downcast`) NOR a forged
 /// `mycrate::const_ptr::cast` — which would propagate the receiver's tracked
 /// allocation onto an unrelated `dest`, FALSELY discharging a later `from_raw_parts`.
-fn is_ptr_cast_call(lower: &str) -> bool {
-    callee_is_std_raw_ptr_inherent(lower) && lower.contains("::cast")
+fn is_ptr_cast_call(key: Option<&CalleeKey>) -> bool {
+    // MEASURED HOLE, CLOSED (round 7). `contains("::cast")` under a prefix test
+    // is satisfiable by a type argument; the four inherent raw-pointer retype
+    // methods now carry their own tags. `downcast` and every other `cast`-named
+    // method resolve to `None` because they are different `DefId`s, not because
+    // a substring happened to miss.
+    callee_is_sysroot_item_tag(key, PTR_CAST_ITEMS)
+}
+
+/// Strip every TURBOFISH instantiation group (`::<…>`) from a lowercased callee
+/// path, bracket-balanced, so a matcher sees the callee's DEF-PATH and never a
+/// type ARGUMENT. Unlike `unsafe_verify::detection::strip_instantiation_args`,
+/// this removes ONLY a `::<…>` group (a turbofish/`::<impl …>` header that
+/// follows `::`) and LEAVES a LEADING `<…>` not preceded by `::` — a UFCS
+/// qualifier `<Type as Trait>::…` — which carries real callee identity
+/// (`<alloc::alloc::Global as core::alloc::Allocator>::allocate` names a genuine
+/// allocator), whereas a `::<…>` group is only substituted generic arguments
+/// (`core::mem::zeroed::<core::option::Option<alloc::boxed::Box<u8, alloc::alloc::Global>>>`
+/// — the `Global` there is a TYPE ARG, not the callee). RULE 3 (2026-09-20):
+/// `is_alloc_call` used to read that type-argument `alloc::alloc::Global` as its
+/// own callee, misclassifying `mem::zeroed` as an allocation.
+///
+/// THE `->` RULE (2026-09-20). A `>` that is the second byte of an ARROW `->`
+/// is NOT a closing bracket, and the depth counter must not decrement on it.
+/// Before this rule any type argument containing a FUNCTION POINTER ended the
+/// group early: `core::ptr::read::<fn() -> u8>` (REAL extracted MIR) stopped at
+/// the arrow and normalized to `core::ptr::read u8>`, which is byte-equal to no
+/// listed spelling, so [`callee_is_sysroot_spelling`] MISSED and the call LOST
+/// ITS CONTRACT ROW — the same fail-open the exact-spelling closure was written
+/// to stop, now reachable from ordinary Rust (`&[fn()]` callback tables,
+/// `Vec<fn()>` dispatch vectors, `MaybeUninit<fn() -> T>` hooks). MEASURED on
+/// `reports/unsafe-mint-round6-2026-09-20/corpus/fnptr.rs`: 46 obligations on
+/// the seal, 20 on the pre-fix tip — every `[unsafe:sep:{deref,write,copy,
+/// transmute,assume_init}]` row on a `->`-bearing callee gone.
+///
+/// THE OTHER ARROW-ISH SHAPES, checked before settling on the rule:
+///  * `=>` cannot appear in a def path (no match arms, no macro rules in one),
+///    so no `=`-guard is needed and adding one would be unfalsifiable.
+///  * `->` can appear MORE THAN ONCE in one group — `::<fn(fn() -> a) -> b>` —
+///    and the rule is per-`>`, so each is skipped independently.
+///  * A turbofish can NEST around one — `::<alloc::vec::vec<fn() -> u8>>`
+///    (REAL extracted MIR, `f_nested_read`) — and the inner `vec<…>`'s own `<`
+///    and `>` still pair, so the group still closes on its own final `>`.
+///  * A `>` legitimately preceded by `-` would be mis-skipped, and NO def path
+///    can produce one: a type never ends in a bare `-`. A negative const
+///    generic renders `::<foo<-1>>` / `::<{-1}>`, whose closers are preceded by
+///    `1` and `}`. Both are pinned in
+///    `strip_turbofish_removes_type_args_not_ufcs_qualifiers`.
+///
+/// NOT FIXED HERE, and MEASURED: [`crate::generate::method_tail`] strips a
+/// TRAILING turbofish by a REVERSE depth scan and has the mirror image of this
+/// defect. See the residual note on that function.
+fn strip_turbofish_args(lower: &str) -> std::borrow::Cow<'_, str> {
+    if !lower.contains("::<") {
+        return std::borrow::Cow::Borrowed(lower);
+    }
+    let bytes = lower.as_bytes();
+    let mut out = String::with_capacity(lower.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // A turbofish group is `::<` … balanced `>`. Detect the `::<` opener: a
+        // `<` whose emitted prefix ends with `::`. A leading/`impl` `<…>` not
+        // preceded by `::` is left intact.
+        if bytes[i] == b'<' && out.ends_with("::") {
+            out.truncate(out.len() - 2);
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'<' => depth += 1,
+                    // The `>` of an ARROW `->` closes nothing. `i > 0` holds on
+                    // every byte of this group (it opened on a `<`), so the
+                    // lookbehind is always in range; it is written out anyway
+                    // because a panic here would be a compiler ICE.
+                    b'>' if i > 0 && bytes[i - 1] == b'-' => {}
+                    b'>' => {
+                        // Cannot underflow: the group's first byte is the `<`
+                        // that set `depth` to 1, and the loop breaks at 0.
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+// ── THE CLOSED VOCABULARY (2026-09-20, round 7: the STRING is closed) ─────────
+//
+// Round 4 replaced `contains("set_len")` with an EXACT, generic-free, lowercased
+// def path. Rounds 5 and 6 then each found one more way for the CANONICALIZER
+// that produces that generic-free path to desynchronize — a UFCS reject ordered
+// before the strip, and the `>` of an arrow read as a closing bracket. The
+// round-6 review found the next one before it shipped: a `char` CONST GENERIC
+// whose value is `'>'` renders that byte RAW, and
+// `core::ptr::read::<chargen::Tok<'_('_, '_>'_>>` (REAL extracted MIR) loses its
+// contract row exactly like the arrow did.
+//
+// THE ROOT CAUSE IS THE DOMAIN, NOT THE SCANNER: a safety contract was being
+// selected by PARSING A RENDERED STRING, and a type argument is attacker-chosen
+// content that the renderer puts INSIDE the delimiters the scanner counts.
+// Patching the scanner terminates only when Rust stops growing type syntax.
+//
+// So the lists below are no longer SPELLINGS. They are `SysrootItem` tags from
+// `trust_types::callee_key` — a closed vocabulary the EXTRACTOR resolves from
+// `(TyCtxt, DefId)` alone, never from `generic_args` and never from a rendering.
+// For a fixed `def_id` the tag is identical for `f::<u8>`, `f::<fn() -> u8>` and
+// `f::<Tok<'>', '<'>>`, so no argument shape — present or future — can move any
+// decision below. The spelling each entry replaces is kept in the comment beside
+// it so the two can still be compared by hand against extracted MIR.
+//
+// A recognizer whose legitimate targets are NOT sysroot items cannot use this
+// vocabulary: `is_external_map_call` (`libc::mmap`, `memmap2::…`) is handled
+// separately and its residual is named in the round-7 report.
+
+use trust_types::{CalleeKey, SysrootItem};
+
+/// `NonZero::<T>::new_unchecked`, `NonNull::<T>::new_unchecked`,
+/// `Unique::<T>::new_unchecked` — the `arg != 0` / non-null niche.
+/// (was: `core::num::nonzero::nonzero::new_unchecked`, `core::ptr::non_null::
+/// nonnull::new_unchecked`, `core::ptr::unique::unique::new_unchecked`)
+const NONZERO_NEW_UNCHECKED_ITEMS: &[SysrootItem] = &[
+    SysrootItem::NonZeroNewUnchecked,
+    SysrootItem::NonNullNewUnchecked,
+    SysrootItem::UniqueNewUnchecked,
+];
+
+/// `char::from_u32_unchecked` — the Unicode-scalar-value contract. Both the free
+/// fn and the inherent method.
+/// (was: `core::char::from_u32_unchecked`, `core::char::methods::from_u32_unchecked`)
+const CHAR_FROM_U32_UNCHECKED_ITEMS: &[SysrootItem] =
+    &[SysrootItem::CharFromU32Unchecked, SysrootItem::CharMethodsFromU32Unchecked];
+
+/// `Vec::<T>::set_len` — the `new_len <= capacity` contract.
+/// (was: `alloc::vec::vec::set_len`)
+const SET_LEN_ITEMS: &[SysrootItem] = &[SysrootItem::VecSetLen];
+
+/// `Option`/`Result::unwrap_unchecked` — the receiver-is-`Some`/`Ok` contract.
+/// (was: `core::option::option::unwrap_unchecked`, `core::result::result::unwrap_unchecked`)
+const UNWRAP_UNCHECKED_ITEMS: &[SysrootItem] =
+    &[SysrootItem::OptionUnwrapUnchecked, SysrootItem::ResultUnwrapUnchecked];
+
+/// `str::from_utf8_unchecked[_mut]` / `String::from_utf8_unchecked` — the UTF-8
+/// invariant.
+/// (was: `core::str::converts::from_utf8_unchecked[_mut]`,
+/// `alloc::string::string::from_utf8_unchecked`)
+const FROM_UTF8_UNCHECKED_ITEMS: &[SysrootItem] = &[
+    SysrootItem::StrFromUtf8Unchecked,
+    SysrootItem::StrFromUtf8UncheckedMut,
+    SysrootItem::StringFromUtf8Unchecked,
+];
+
+/// The std `vec!`-machinery `box_assume_init_into_vec_unsafe`. Listed under
+/// `assume_init` so its call reaches the `assume_init` arm, and matched EXACTLY
+/// again there before its obligation is DISCHARGED: that discharge is a proof,
+/// so the identity that unlocks it must be the one std item and nothing else.
+/// (was: `alloc::boxed::box_assume_init_into_vec_unsafe`)
+const BOX_ASSUME_INIT_INTO_VEC_UNSAFE: SysrootItem = SysrootItem::BoxAssumeInitIntoVecUnsafe;
+
+/// `MaybeUninit::<T>::assume_init*` / `Box::<MaybeUninit<T>>::assume_init` — the
+/// fully-initialized contract.
+/// (was: the five `core::mem::maybe_uninit::maybeuninit::assume_init*` spellings
+/// plus `alloc::boxed::box::assume_init`)
+///
+/// NOW LISTED, AND THE NOTE THAT KEPT IT OUT WAS WRONG (2026-09-20). It read:
+/// "the slice form `<[MaybeUninit<T>]>::assume_init_ref` (unstable
+/// `maybe_uninit_slice`) has no tag in the vocabulary, so it resolves to `None`
+/// and falls to the stand-in — fail-closed". MEASURED on
+/// `direction-b/sweep.rs::slice_assume_init`: the SEAL mints
+/// `[unsafe:sep:assume_init] the value must be fully initialized before
+/// `assume_init`` for it, and the tip and the fix mint nothing. So the tag's
+/// absence is a row LOST against the seal, not a stand-in kept. `DECLS` declares
+/// it on `InherentSlice`, which is the owner shape the old crate-rooted string
+/// could not express and the key can.
+const ASSUME_INIT_ITEMS: &[SysrootItem] = &[
+    SysrootItem::SliceAssumeInitRef,
+    SysrootItem::MaybeUninitAssumeInit,
+    SysrootItem::MaybeUninitAssumeInitRef,
+    SysrootItem::MaybeUninitAssumeInitMut,
+    SysrootItem::MaybeUninitAssumeInitRead,
+    SysrootItem::MaybeUninitAssumeInitDrop,
+    SysrootItem::BoxAssumeInit,
+    BOX_ASSUME_INIT_INTO_VEC_UNSAFE,
+];
+
+/// `CStr::from_bytes_with_nul_unchecked` — the nul-terminated / no-interior-nul
+/// contract. (was: `core::ffi::c_str::cstr::from_bytes_with_nul_unchecked`)
+const CSTR_FROM_BYTES_WITH_NUL_UNCHECKED_ITEMS: &[SysrootItem] =
+    &[SysrootItem::CStrFromBytesWithNulUnchecked];
+
+/// The free `ptr::read*` / `ptr::write*` fns — a hidden single-element deref.
+/// The INHERENT forms (`<*const T>::read`, `<*mut T>::write`) are deliberately
+/// still absent: the old `ptr::read` substring never matched them, so listing
+/// them would newly model every `p.read()` — a completeness change for its own
+/// commit, not this closure.
+/// (was: the six `core::ptr::{read,write}[_volatile|_unaligned]` spellings)
+const RAW_READ_WRITE_ITEMS: &[SysrootItem] = &[
+    SysrootItem::PtrRead,
+    SysrootItem::PtrReadVolatile,
+    SysrootItem::PtrReadUnaligned,
+    SysrootItem::PtrWrite,
+    SysrootItem::PtrWriteVolatile,
+    SysrootItem::PtrWriteUnaligned,
+];
+
+/// `<[T]>::get_unchecked[_mut]` / `str::get_unchecked[_mut]` — the
+/// index-in-bounds contract.
+/// (was: `core::slice::get_unchecked[_mut]`, `core::str::get_unchecked[_mut]`)
+const UNCHECKED_INDEX_ITEMS: &[SysrootItem] = &[
+    SysrootItem::SliceGetUnchecked,
+    SysrootItem::SliceGetUncheckedMut,
+    SysrootItem::StrGetUnchecked,
+    SysrootItem::StrGetUncheckedMut,
+];
+
+/// `ptr::copy` / `ptr::copy_nonoverlapping` — the two-buffer bounds contract.
+/// (was: `core::ptr::copy`, `core::ptr::copy_nonoverlapping`)
+const PTR_COPY_ITEMS: &[SysrootItem] = &[SysrootItem::PtrCopy, SysrootItem::PtrCopyNonOverlapping];
+
+/// `slice::from_raw_parts[_mut]`, `str::from_raw_parts[_mut]`,
+/// `Vec::from_raw_parts`, `String::from_raw_parts` — the `len` elements must lie
+/// within `ptr`'s allocation. NOT listed: `ptr::slice_from_raw_parts` (a SAFE
+/// constructor of a raw slice pointer with no UB condition of its own), which
+/// now simply has no tag.
+/// (was: the six `…::from_raw_parts[_mut]` spellings)
+const FROM_RAW_PARTS_ITEMS: &[SysrootItem] = &[
+    SysrootItem::SliceFromRawParts,
+    SysrootItem::SliceFromRawPartsMut,
+    SysrootItem::StrFromRawParts,
+    SysrootItem::StrFromRawPartsMut,
+    SysrootItem::VecFromRawParts,
+    SysrootItem::StringFromRawParts,
+];
+
+/// `mem::transmute_copy` / `mem::transmute` — the layout/validity transmute.
+/// (was: `core::mem::transmute_copy`, `core::mem::transmute`)
+const TRANSMUTE_ITEMS: &[SysrootItem] = &[SysrootItem::MemTransmuteCopy, SysrootItem::MemTransmute];
+
+/// The free allocation fns of the global allocator.
+/// (was: `alloc::alloc::alloc`, `alloc::alloc::alloc_zeroed`)
+const ALLOC_ITEMS: &[SysrootItem] = &[SysrootItem::AllocAlloc, SysrootItem::AllocAllocZeroed];
+
+/// See [`is_global_allocator_ufcs_call`]. THE UFCS SHAPE IS NOW STRUCTURAL: the
+/// old spelling `<alloc::alloc::global as core::alloc::allocator>::allocate` was
+/// a rendered trait qualifier, and the extractor now resolves it from
+/// `tcx.trait_of_assoc` + the impl's self type instead.
+/// (was: the two `<alloc::alloc::global as core::alloc::allocator>::…` spellings)
+const GLOBAL_ALLOCATOR_UFCS_ITEMS: &[SysrootItem] =
+    &[SysrootItem::GlobalAllocatorAllocate, SysrootItem::GlobalAllocatorDeallocate];
+
+/// `alloc::dealloc` and `ptr::drop_in_place` — a free.
+/// (was: `alloc::alloc::dealloc`, `core::ptr::drop_in_place`,
+/// `core::ptr::mut_ptr::drop_in_place`)
+const DEALLOC_ITEMS: &[SysrootItem] =
+    &[SysrootItem::AllocDealloc, SysrootItem::PtrDropInPlace, SysrootItem::RawPtrDropInPlace];
+
+/// `alloc::dealloc` alone — the free function whose FIRST ARGUMENT is the freed
+/// pointer. See [`is_global_dealloc_call`].
+const GLOBAL_DEALLOC_ITEMS: &[SysrootItem] = &[SysrootItem::AllocDealloc];
+
+/// `alloc::realloc`. (was: `alloc::alloc::realloc`)
+const REALLOC_ITEMS: &[SysrootItem] = &[SysrootItem::AllocRealloc];
+
+/// The `Result`/`Option` methods that return the `Ok`/`Some` payload ITSELF, so
+/// a tracked `Layout` size may be relocated across them.
+///
+/// DELIBERATELY EXCLUDED, and now excluded BY CONSTRUCTION rather than by a list
+/// that had to out-guess `contains("::unwrap")`: `unwrap_or`, `unwrap_or_else`,
+/// `unwrap_or_default`, `unwrap_err`, `expect_err` have no tag in the closed
+/// vocabulary at all, so they cannot reach this list however they render. See
+/// the `is_layout_size_passthrough_call` arm for the compiled `unwrap_or` false
+/// proof this keeps closed.
+/// (was: the six `core::{result,option}::…::{unwrap,expect,unwrap_unchecked}`)
+const LAYOUT_PASSTHROUGH_ITEMS: &[SysrootItem] = &[
+    SysrootItem::ResultUnwrap,
+    SysrootItem::ResultExpect,
+    SysrootItem::ResultUnwrapUnchecked,
+    SysrootItem::OptionUnwrap,
+    SysrootItem::OptionExpect,
+    SysrootItem::OptionUnwrapUnchecked,
+];
+
+/// `Layout::from_size_align[_unchecked]` — the size DISCHARGE.
+/// (was: `callee_is_std_crate_rooted(lower) && lower.contains("layout::from_size_align")`,
+/// a `contains` that a TYPE ARGUMENT alone could satisfy.)
+const LAYOUT_SIZE_ITEMS: &[SysrootItem] =
+    &[SysrootItem::LayoutFromSizeAlign, SysrootItem::LayoutFromSizeAlignUnchecked];
+
+/// The SAFE subset of [`PTR_OFFSET_ITEMS`]: `wrapping_add`/`wrapping_offset`
+/// may produce an out-of-allocation pointer without UB, so they propagate
+/// provenance but mint no in-bounds row (see `interpret_ptr_offset`).
+const PTR_WRAPPING_OFFSET_ITEMS: &[SysrootItem] = &[
+    SysrootItem::ConstPtrWrappingAdd,
+    SysrootItem::ConstPtrWrappingOffset,
+    SysrootItem::MutPtrWrappingAdd,
+    SysrootItem::MutPtrWrappingOffset,
+];
+
+/// The raw-pointer offset methods, which PROPAGATE the receiver's provenance and
+/// byte offset. `::sub`/`::wrapping_sub` are intentionally excluded (their
+/// operand would need negating) and have no tag.
+/// (was: `callee_is_std_raw_ptr_inherent(lower) && lower.contains("::add") || …`)
+const PTR_OFFSET_ITEMS: &[SysrootItem] = &[
+    SysrootItem::ConstPtrAdd,
+    SysrootItem::ConstPtrOffset,
+    SysrootItem::ConstPtrWrappingAdd,
+    SysrootItem::ConstPtrWrappingOffset,
+    SysrootItem::MutPtrAdd,
+    SysrootItem::MutPtrOffset,
+    SysrootItem::MutPtrWrappingAdd,
+    SysrootItem::MutPtrWrappingOffset,
+];
+
+/// Every INHERENT `as_ptr` / `as_mut_ptr` in `core`/`alloc` whose result aliases
+/// the receiver's buffer, so the engine propagates provenance AND binds the
+/// allocation's byte size. (was: `is_container_as_ptr_call`'s `contains`-based
+/// name test.)
+///
+/// COMPLETED 2026-09-20, and the five it used to hold are the first five. The
+/// string this replaced matched EVERY `core::`/`alloc::`/`std::`-rooted path
+/// containing `::as_ptr`, so migrating it to a five-tag vocabulary narrowed it
+/// silently: `core::str::<impl str>::as_ptr` — what `String::as_ptr()` actually
+/// resolves to, since `String` has no such inherent method — resolved with
+/// `sysroot_item` ABSENT and the engine stopped tracking the pointer. MEASURED
+/// on `asptr` and `provebounds`: 2 and 3 typed `CopyBoundsViolation` rows lost
+/// against the seal. The declarations are enumerated in
+/// `trust_types::callee_key::DECLS`, and the keyed recognizer guard now asserts
+/// that every tag named here HAS one.
+const CONTAINER_AS_PTR_ITEMS: &[SysrootItem] = &[
+    SysrootItem::SliceAsPtr,
+    SysrootItem::SliceAsMutPtr,
+    SysrootItem::VecAsPtr,
+    SysrootItem::VecAsMutPtr,
+    SysrootItem::StringAsPtr,
+    SysrootItem::StrAsPtr,
+    SysrootItem::StrAsMutPtr,
+    SysrootItem::MaybeUninitAsPtr,
+    SysrootItem::MaybeUninitAsMutPtr,
+    SysrootItem::NonNullAsPtr,
+    SysrootItem::NonNullAsMutPtr,
+    SysrootItem::UniqueAsPtr,
+    SysrootItem::CStrAsPtr,
+    SysrootItem::CellAsPtr,
+    SysrootItem::RefCellAsPtr,
+    SysrootItem::BoxAsPtr,
+    SysrootItem::BoxAsMutPtr,
+    SysrootItem::RawSlicePtrAsPtr,
+    SysrootItem::RawSlicePtrAsMutPtr,
+    // COMPLETED 2026-09-20 (round 9). Round 8's sweep held these out on the
+    // argument that their receivers "are not tracked buffers, so a miss is the
+    // fail-closed direction" — NOT MEASURED, and wrong. `direction-b/rcasptr.rs`
+    // and `direction-b/sweep.rs` measure the cost on three lanes: each of these
+    // receivers lost the TYPED `copy bounds violation in
+    // core::slice::raw::from_raw_parts::<'_, u8> (src)` row on the fix lane
+    // against BOTH the seal and the tip, replaced by the blanket
+    // `[unsafe:sep:call] … (unverified)`. A typed row becoming a weaker one is a
+    // LOSS, not a fail-closed miss. `AtomicAsPtr` covers the whole `Atomic*`
+    // family, which is one ADT in this sysroot; `WeakAsPtr` covers both
+    // `rc::Weak` and `sync::Weak`.
+    SysrootItem::RcAsPtr,
+    SysrootItem::ArcAsPtr,
+    SysrootItem::WeakAsPtr,
+    SysrootItem::AtomicAsPtr,
+];
+
+/// `Box::<T>::new` / `Box::<T>::new_uninit` — the allocation the mint admits as
+/// known-good. (was: `is_known_good_box_alloc`'s `contains`-based name test.)
+const KNOWN_GOOD_BOX_ALLOC_ITEMS: &[SysrootItem] =
+    &[SysrootItem::BoxNew, SysrootItem::BoxNewUninit];
+
+/// `<*const T>::cast` / `cast_mut`, `<*mut T>::cast` / `cast_const` — a pointee
+/// retype that PRESERVES address and provenance, so tracking must survive it
+/// exactly as it does an `as` pointer cast.
+/// (was: `callee_is_std_raw_ptr_inherent(lower) && lower.contains("::cast")`.)
+pub(crate) const PTR_CAST_ITEMS: &[SysrootItem] = &[
+    SysrootItem::ConstPtrCast,
+    SysrootItem::ConstPtrCastMut,
+    SysrootItem::MutPtrCast,
+    SysrootItem::MutPtrCastConst,
+];
+
+/// The union of the three type-invariant lists — what [`unsafe_assertion_op`]
+/// names, as one list, so the guard can check it the same way it checks every
+/// other minting recognizer.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the guard table's tag list for `unsafe_assertion_op`; cfg(test) only"
+    )
+)]
+const UNSAFE_ASSERTION_ITEMS: &[SysrootItem] = &[
+    SysrootItem::SliceAssumeInitRef,
+    SysrootItem::StrFromUtf8Unchecked,
+    SysrootItem::StrFromUtf8UncheckedMut,
+    SysrootItem::StringFromUtf8Unchecked,
+    SysrootItem::MaybeUninitAssumeInit,
+    SysrootItem::MaybeUninitAssumeInitRef,
+    SysrootItem::MaybeUninitAssumeInitMut,
+    SysrootItem::MaybeUninitAssumeInitRead,
+    SysrootItem::MaybeUninitAssumeInitDrop,
+    SysrootItem::BoxAssumeInit,
+    SysrootItem::BoxAssumeInitIntoVecUnsafe,
+    SysrootItem::CStrFromBytesWithNulUnchecked,
+];
+
+/// THE FUNNEL. Does the compiler-minted key name exactly one of `items`?
+///
+/// This replaces `callee_is_sysroot_item_tag(key, spellings)`, and with it the
+/// entire decision procedure underneath it: the sysroot-root test
+/// (`callee_is_std_crate_rooted`), the ` as `/UFCS adjudication, the turbofish
+/// strip, the leading-stamp strip and the byte-equality compare are ALL GONE.
+/// They were five text operations over one attacker-influenced string; this is a
+/// membership test over a closed enum.
+///
+/// (i) IDENTITY. `sysroot_item` is `Some(..)` only for a `DefId` whose defining
+/// crate passed `is_real_sysroot_crate` — the ARTIFACT-RESIDENCY verdict, not the
+/// crate-NAME gate. A crate compiled `--crate-name core` therefore mints `None`
+/// and this answers false, which is the same verdict the `__trust_crate@` stamp
+/// produced but reached from the identity fact instead of from a prefix that ALSO
+/// means "duplicate crate name". The two producer rules that the stamp collapsed
+/// into one bit are now separate fields on the key.
+///
+/// (ii) FAIL-CLOSED. `None` — no key on the terminator (an indirect call, a
+/// synthetic body, a pre-carrier artifact), or a key whose item is `None` — is
+/// FALSE. False here means the call keeps its fail-closed stand-in. There is no
+/// string fallback, and adding one would restore the whole defect class.
+fn callee_is_sysroot_item_tag(key: Option<&CalleeKey>, items: &[SysrootItem]) -> bool {
+    CalleeKey::opt_is_one_of(key, items)
 }
 
 /// Check if a callee is unchecked indexing (`<[T]>::get_unchecked`,
-/// `get_unchecked_mut`) — UB if the index is out of bounds, with no
-/// language-inserted check, so Trust must emit the bounds obligation itself.
-fn is_unchecked_index_call(lower: &str) -> bool {
-    lower.contains("::get_unchecked")
+/// `get_unchecked_mut`, and the `str` forms) — UB if the index is out of bounds,
+/// with no language-inserted check, so Trust must emit the bounds obligation
+/// itself. EXACT spellings ([`UNCHECKED_INDEX_ITEMS`]): a user type's
+/// inherent `mycrate::Foo::get_unchecked`, or an orphan `SliceIndex` impl
+/// `<mycrate::Foo as core::slice::index::SliceIndex<…>>::get_unchecked`, is not a
+/// sysroot unchecked index.
+fn is_unchecked_index_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, UNCHECKED_INDEX_ITEMS)
+}
+
+/// `char::from_u32_unchecked` — EXACT spellings ([`CHAR_FROM_U32_UNCHECKED_ITEMS`]).
+/// A user free fn `dep::from_u32_unchecked` (the 2026-09-19 refutation's second
+/// callee) must NOT receive the Unicode scalar-value contract.
+fn is_char_from_u32_unchecked_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, CHAR_FROM_U32_UNCHECKED_ITEMS)
+}
+
+/// `Vec::set_len` — EXACT spellings ([`SET_LEN_ITEMS`]). A user
+/// `dep::Buf::set_len` must NOT receive the capacity contract.
+fn is_set_len_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, SET_LEN_ITEMS)
+}
+
+/// `ptr::copy` / `ptr::copy_nonoverlapping` — EXACT spellings
+/// ([`PTR_COPY_ITEMS`]). A user `dep::ptr::copy` must NOT be modeled as the
+/// intrinsic memmove.
+fn is_ptr_copy_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, PTR_COPY_ITEMS)
+}
+
+/// `slice`/`str`/`Vec`/`String::from_raw_parts` — EXACT spellings
+/// ([`FROM_RAW_PARTS_ITEMS`]). A user `dep::from_raw_parts` must NOT receive
+/// the backing-length bounds contract.
+fn is_from_raw_parts_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, FROM_RAW_PARTS_ITEMS)
+}
+
+/// Borrowed slices/strings access no allocation bytes when their length is zero.
+/// Owning Vec/String constructors also have capacity/deallocation requirements;
+/// their existing conservative upper bound must not disappear for `len == 0`.
+fn is_borrowed_from_raw_parts_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(
+        key,
+        &[
+            SysrootItem::SliceFromRawParts,
+            SysrootItem::SliceFromRawPartsMut,
+            SysrootItem::StrFromRawParts,
+            SysrootItem::StrFromRawPartsMut,
+        ],
+    )
+}
+
+/// `mem::transmute_copy` / `mem::transmute` — EXACT spellings
+/// ([`TRANSMUTE_ITEMS`]). A user `dep::mem::transmute` must NOT be modeled as
+/// the layout/validity transmute.
+fn is_transmute_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, TRANSMUTE_ITEMS)
 }
 
 /// UB-class ops whose safety condition is a non-arithmetic type invariant.
 /// Returns `(tag, human-readable required-invariant)` for the obligation message.
-fn unsafe_assertion_op(lower: &str) -> Option<(&'static str, &'static str)> {
-    if lower.contains("from_utf8_unchecked") {
+///
+/// EXACT spellings ([`FROM_UTF8_UNCHECKED_ITEMS`], [`ASSUME_INIT_ITEMS`],
+/// [`CSTR_FROM_BYTES_WITH_NUL_UNCHECKED_ITEMS`]). A user
+/// `dep::from_utf8_unchecked` / `dep::MyUninit::assume_init` /
+/// `dep::CStrish::from_bytes_with_nul_unchecked` must NOT receive the named
+/// type-invariant obligation; the site keeps its fail-closed stand-in instead.
+fn unsafe_assertion_op(key: Option<&CalleeKey>) -> Option<(&'static str, &'static str)> {
+    if callee_is_sysroot_item_tag(key, FROM_UTF8_UNCHECKED_ITEMS) {
         Some(("from_utf8_unchecked", "the input bytes must be valid UTF-8 (the `str` invariant)"))
-    } else if lower.contains("assume_init") {
+    } else if callee_is_sysroot_item_tag(key, ASSUME_INIT_ITEMS) {
         Some(("assume_init", "the value must be fully initialized before `assume_init`"))
-    } else if lower.contains("from_bytes_with_nul_unchecked") {
+    } else if callee_is_sysroot_item_tag(key, CSTR_FROM_BYTES_WITH_NUL_UNCHECKED_ITEMS) {
         // `CStr::from_bytes_with_nul_unchecked`: UB unless the bytes are
         // nul-terminated with no interior nul. A buffer-shape invariant the
         // arithmetic machinery cannot express ⇒ fail-closed Unknown.
@@ -3855,12 +9803,30 @@ fn unsafe_assertion_op(lower: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// `NonZero*::new_unchecked` / `NonNull::new_unchecked` — UB if the argument is
-/// zero (resp. null), an ARITHMETIC precondition the engine models directly.
-/// Scoped to the `new_unchecked` spelling; `unreachable_unchecked` and the other
-/// `_unchecked` ops do not contain it.
-fn is_nonzero_new_unchecked_call(lower: &str) -> bool {
-    lower.contains("new_unchecked")
+/// `NonZero*::new_unchecked` / `NonNull::new_unchecked` / `Unique::new_unchecked`
+/// — UB if the argument is zero (resp. null), an ARITHMETIC precondition the
+/// engine models directly.
+fn is_nonzero_new_unchecked_call(key: Option<&CalleeKey>) -> bool {
+    // The obligation this gates is SPECIFICALLY the `NonZero`/`NonNull` niche
+    // (`arg == 0` is UB). Matching the bare suffix `new_unchecked` charged that
+    // obligation to every unrelated constructor that happens to carry the name:
+    // nn-core's SAFE `WeightRef::new_unchecked(data: Vec<f32>, shape: Vec<usize>)`
+    // (not even an `unsafe fn` — it only skips a shape/len consistency check) and
+    // ndarray's `SliceInfo::new_unchecked`, whose real precondition is that the
+    // indices match the dimensions, not that an argument is non-zero. Both got
+    // `Formula::Eq(arg, 0)` over a non-integer first argument: an obligation that
+    // does not state the callee's actual contract.
+    //
+    // `0a3972ab9e` added an owner token (`nonzero`/`non_null`/…) and did not
+    // close the class — a downstream user's `dep::nonzero::Handle::new_unchecked`
+    // still carries both tokens and got the `NonZero` contract `Eq(arg, 0)`,
+    // PROVED for the argument `5`, with nothing else at the site (REFUTED
+    // 2026-09-19, `scratchpad/dl/xc`). EXACT spellings now
+    // ([`NONZERO_NEW_UNCHECKED_ITEMS`], real extracted MIR): a user module
+    // named `nonzero`, a nested `mycrate::core::num::nonzero::…`, an orphan
+    // `<NonZero<u32> as mycrate::Forge>::new_unchecked` and a stamped
+    // impersonator all miss.
+    callee_is_sysroot_item_tag(key, NONZERO_NEW_UNCHECKED_ITEMS)
 }
 
 /// UB-class ops whose safety precondition is ARITHMETIC, so the engine emits a
@@ -3871,18 +9837,21 @@ fn is_nonzero_new_unchecked_call(lower: &str) -> bool {
 /// `call_is_modeled` so a function whose ONLY unsafe op is one of these is still
 /// analyzed (not skipped) and is not double-flagged by the compiler's
 /// completeness check.
-fn is_unsafe_arith_op(lower: &str) -> bool {
-    is_nonzero_new_unchecked_call(lower)
-        || lower.contains("from_u32_unchecked")
-        || lower.contains("set_len")
+fn is_unsafe_arith_op(key: Option<&CalleeKey>) -> bool {
+    is_nonzero_new_unchecked_call(key)
+        || is_char_from_u32_unchecked_call(key)
+        || is_set_len_call(key)
 }
 
 /// `Option/Result::unwrap_unchecked` — UB if the receiver is `None`/`Err`. A
 /// non-arithmetic discriminant fact ⇒ fail-closed Unknown, emitted from the
 /// `is_layout_passthrough_call` arm (which also threads tracked `Layout` sizes).
 /// Recognized here so `has_unsafe_patterns` / `call_is_modeled` see it as covered.
-fn is_unwrap_unchecked_call(lower: &str) -> bool {
-    lower.contains("unwrap_unchecked")
+/// EXACT spellings ([`UNWRAP_UNCHECKED_ITEMS`]): a user
+/// `dep::MyOpt::unwrap_unchecked` does NOT receive the receiver-`Some`/`Ok`
+/// obligation; it keeps the fail-closed stand-in.
+fn is_unwrap_unchecked_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, UNWRAP_UNCHECKED_ITEMS)
 }
 
 /// Check if a callee is a raw single-element memory access via a CALL —
@@ -3890,10 +9859,10 @@ fn is_unwrap_unchecked_call(lower: &str) -> bool {
 /// equivalents. The dereference is hidden inside the std function (not a MIR
 /// `Deref` place), so it needs its own bounds obligation. `write_bytes` (a
 /// `count`-sized memset) and `copy` are handled by their own paths, not here.
-fn is_raw_read_write_call(lower: &str) -> bool {
-    (lower.contains("ptr::read") || lower.contains("ptr::write"))
-        && !lower.contains("write_bytes")
-        && !lower.contains("read_volatile_from")
+/// EXACT spellings ([`RAW_READ_WRITE_ITEMS`]): a user `dep::ptr::read` does
+/// NOT receive the raw read/write backing-bounds obligation.
+fn is_raw_read_write_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, RAW_READ_WRITE_ITEMS)
 }
 
 /// Check if a callee constructs a `Layout` from an explicit byte size
@@ -3907,26 +9876,86 @@ fn is_raw_read_write_call(lower: &str) -> bool {
 /// substring matches) would over-state the allocation size → FALSE OOB proof. Genuine
 /// renders `core::alloc::layout::Layout::from_size_align[_unchecked]` (crate-rooted,
 /// no ` as ` — extractor fixtures), which the anchor keeps.
-fn is_layout_size_call(lower: &str) -> bool {
-    callee_is_std_crate_rooted(lower) && lower.contains("layout::from_size_align")
+fn is_layout_size_call(key: Option<&CalleeKey>) -> bool {
+    // MEASURED HOLE, CLOSED (round 7). The predicate this replaces was
+    // `callee_is_std_crate_rooted(lower) && lower.contains("layout::from_size_align")`
+    // — and the `contains` half is satisfiable BY A TYPE ARGUMENT ALONE on an
+    // unrelated sysroot callee, e.g. a call whose instantiation mentions
+    // `core::alloc::layout::…`. What it buys is the size DISCHARGE: an
+    // allocation built from the "layout" carries `concrete_sizes[prov]`, which a
+    // later `from_raw_parts(p, n)` bound discharges against. Over-stating that
+    // size is a FALSE OOB proof, so this is the fail-OPEN direction.
+    callee_is_sysroot_item_tag(key, LAYOUT_SIZE_ITEMS)
 }
 
-/// Check if a callee is a transparent unwrap of a `Result`/`Option`
-/// (`unwrap`/`expect`/`unwrap_unchecked`). Used only to thread a tracked
-/// `Layout` size through `from_size_align(...).unwrap()`; a no-op for any
-/// unwrap whose argument carries no tracked size.
+/// Selects the `interpret_call` arm that handles `Result`/`Option` unwrapping.
+///
+/// DELIBERATELY NOT ANCHORED (2026-09-20), and the arm no longer trusts it for
+/// anything: this predicate is a pure ARM SELECTOR and a `call_is_modeled`
+/// entry, i.e. a SUPPRESSION of the compiler's `[unsafe:unmodeled-call]` row.
+/// Per the directional invariant it stays a name list — on a user callee its
+/// only effect is to withhold that refutation, which `decide_site` answers with
+/// the fail-closed stand-in, and anchoring it would cost one of the two belts
+/// that keep the compiler/vcgen mirror fail-closed under an impersonating
+/// sysroot crate (the compiler evaluates `call_has_unsafe_model` on the
+/// UNSTAMPED `safe_def_path_str`; see
+/// `unsafe_verify::detection::compiler_mints_unmodeled_call_row_under`).
+///
+/// The two things inside the arm that are not suppressions are anchored on
+/// their own, exactly: the `Layout` size RELOCATION
+/// ([`is_layout_size_passthrough_call`]) and the `unwrap_unchecked` OBLIGATION
+/// ([`is_unwrap_unchecked_call`]).
 fn is_layout_passthrough_call(lower: &str) -> bool {
     lower.contains("::unwrap") || lower.contains("::expect") || lower.contains("unwrap_unchecked")
 }
 
-/// Check if a callee is a deallocation function.
-fn is_dealloc_call(lower: &str) -> bool {
-    lower.contains("alloc::dealloc") || lower.contains("drop_in_place")
+/// May a tracked `Layout` size be RELOCATED across this callee? EXACT sysroot
+/// spellings ([`LAYOUT_PASSTHROUGH_ITEMS`]) — the six `Result`/`Option`
+/// methods that return the payload itself. A user `mycrate::Thing::unwrap` and
+/// a sysroot `Result::unwrap_or` both answer false, and the size stays where it
+/// was (fail-closed: the allocation keeps an underivable size, which refutes).
+fn is_layout_size_passthrough_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, LAYOUT_PASSTHROUGH_ITEMS)
 }
 
-/// Check if a callee is a reallocation function.
-fn is_realloc_call(lower: &str) -> bool {
-    lower.contains("alloc::realloc")
+/// Check if a callee is a deallocation function — EXACT spellings
+/// ([`DEALLOC_ITEMS`]). A user `dep::alloc::dealloc` / `dep::drop_in_place`
+/// is NOT modeled as a free.
+fn is_dealloc_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, DEALLOC_ITEMS)
+}
+
+/// The global deallocator FREE FUNCTION — `alloc::alloc::dealloc`, spelled
+/// `std::alloc::dealloc` in source ([`GLOBAL_DEALLOC_ITEMS`]). Dispatched BEFORE
+/// [`is_dealloc_call`], whose arm resolves the freed allocation from the call's
+/// DESTINATION: `dealloc(ptr, layout) -> ()` puts a unit temporary there, never a
+/// tracked pointer, so that arm could not free anything for this callee and the
+/// engine's free/use-after-free channel emitted nothing on any extracted body.
+/// This one frees the provenance of the FIRST ARGUMENT
+/// ([`SepEngine::interpret_global_dealloc`]).
+///
+/// KEYED, like every recognizer that mints: a free is what mints the
+/// undischargeable `Formula::Bool(true)` double-free and use-after-free rows, so
+/// a user `mycrate::alloc::dealloc` must not be able to manufacture those
+/// against first-party code. `<System as GlobalAlloc>::dealloc` has no tag here
+/// (its first argument is `&self`, not the freed pointer), and neither has
+/// `<Global as Allocator>::deallocate`, which keeps its round-two alloc-arm
+/// modeling byte for byte.
+///
+/// SCOPE: deliberately NARROWER than [`is_dealloc_call`], which also names the
+/// two `drop_in_place` items. Those are compiler-emitted drop glue whose effect
+/// on the tracked heap is not measured here, so they keep their existing
+/// (destination-keyed, no-op) handling. This change is exactly as large as the
+/// measurement behind it.
+fn is_global_dealloc_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, GLOBAL_DEALLOC_ITEMS)
+}
+
+/// Check if a callee is a reallocation function — EXACT spellings
+/// ([`REALLOC_ITEMS`]). A user `dep::alloc::realloc` is NOT modeled as a
+/// realloc.
+fn is_realloc_call(key: Option<&CalleeKey>) -> bool {
+    callee_is_sysroot_item_tag(key, REALLOC_ITEMS)
 }
 
 /// Check if a callee is a pointer-offset method (`<*const/mut T>::add`,
@@ -3940,23 +9969,164 @@ fn is_realloc_call(lower: &str) -> bool {
 /// `mycrate::mut_ptr::add` would carry the receiver's allocation size onto an
 /// unrelated `dest`, FALSELY discharging a later `from_raw_parts`. Genuine renders
 /// `{core,std}::ptr::const_ptr`/`mut_ptr::<impl *…>::add` (extractor fixtures).
-fn is_ptr_offset_call(lower: &str) -> bool {
-    callee_is_std_raw_ptr_inherent(lower)
-        && (lower.contains("::add")
-            || lower.contains("::offset")
-            || lower.contains("::wrapping_add")
-            || lower.contains("::wrapping_offset"))
+fn is_ptr_offset_call(key: Option<&CalleeKey>) -> bool {
+    // MEASURED HOLE, CLOSED (round 7). The predicate this replaces required the
+    // raw-pointer inherent-impl PREFIX and then `contains("::add")` /
+    // `contains("::offset")` — and `::add`/`::offset` are four- and
+    // seven-byte substrings a type argument supplies for free. What it buys is
+    // PROVENANCE PROPAGATION: the receiver's tracked allocation and byte offset
+    // move to `dest`, which is exactly what a later `from_raw_parts(dest, n)`
+    // discharges against. `::sub`/`::wrapping_sub` remain excluded (their
+    // operand would need negating) and simply have no tag.
+    callee_is_sysroot_item_tag(key, PTR_OFFSET_ITEMS)
+}
+
+/// The CRATE ROOTS whose memory-map items are the legitimate targets of
+/// [`is_external_map_call`]. Not sysroot — an `mmap` never is — so this list,
+/// not `callee_is_sysroot_spelling`, is the anchor.
+///
+/// WHAT THE LIST BUYS AND WHAT IT DOES NOT. It closes the class that was
+/// REPRODUCED on the seal: a MODULE named `mmap` anywhere in any crate
+/// (`mapdep::mmap::region`) fired the recognizer, removed the fail-closed
+/// `[unsafe:unmodeled-call]` refutation and bought a `from_raw_parts` proof.
+/// It does NOT authenticate: a crate built `--crate-name libc` has this root,
+/// and nothing in the pipeline can tell it from the real one — the extractor's
+/// `__trust_crate@` stamp marks only sysroot IMPERSONATION and name AMBIGUITY,
+/// and `libc` is neither a sysroot name nor (when it is the only `libc` in the
+/// graph) ambiguous. What the residual forger gets is the recognizer, not the
+/// size fact: that is separately gated on `is_foreign` + the exact spelling
+/// (see [`SepEngine::interpret_external_map`]).
+///
+/// MEASURED COST, stated rather than inferred: a first-party wrapper whose own
+/// crate root is not on this list — `aterm_scrollback::mmap::MmapMut::map_mut`,
+/// named in this function's previous comment — no longer gets its
+/// `[unsafe:sep:map]` row or its `Truncate` temporal model. It gets the
+/// `[unsafe:unmodeled-call]` refutation plus the missing-SAFETY stand-in
+/// instead, which is MORE obligation, not less. Adding such a crate back means
+/// adding its root here, deliberately.
+///
+/// `mmap` is the third crates.io memory-map crate name beside `memmap`/
+/// `memmap2`; it is also the root `crates/trust-vcgen/tests/temporal_probe.rs`
+/// uses (`mmap::MmapMut::map_mut`), which is how its absence was found.
+const EXTERNAL_MAP_CRATE_ROOTS: &[&str] = &["libc", "memmap2", "memmap", "mmap"];
+
+/// The `extern` BLOCK leaves that ARE the POSIX memory-map syscall wrapper,
+/// wherever they are declared.
+///
+/// THE CRATE-ROOT LIST IS NOT ENOUGH, AND A COMPILED TEST SAID SO. Most code
+/// that calls `mmap` does not depend on `libc`: it writes its own
+/// `extern "C" { fn mmap(addr, len, prot, flags, fd, offset) -> *mut u8; }`.
+/// That renders `<thiscrate>::{extern#0}::mmap` (MEASURED 2026-09-20 on the
+/// sealed `trustc ff538f905`, `$TMPDIR/rc4/localextern.rs`: `is_foreign: true`,
+/// six arguments) — a crate root the list can never enumerate, because it is
+/// the CALLER's own crate. Seven `tests/ui/trust/backing-cert/*` fixtures are
+/// exactly this shape, and the root-only anchor withheld the model from every
+/// one of them: a legitimate call left with no obligation, the fail-open in
+/// the other direction.
+///
+/// `{extern#N}` is rustc's rendering of an `extern { … }` block and is
+/// UNSPELLABLE in source, so a Rust module or type named `extern` cannot
+/// produce this segment; the 2026-09-19 forgery shape (a Rust fn in a module
+/// named `mmap`) does not match it. What a forger can still do is DECLARE
+/// `extern "C" { fn mmap(…) }` and link it to something else — a lie told to
+/// the linker, which no def-path check can see.
+const EXTERNAL_MAP_EXTERN_LEAVES: &[&str] = &["mmap", "mmap64"];
+
+/// The `mmap` free fn spelled OUTSIDE an `extern` block — a hand-built fixture
+/// or a re-export. The genuine extern-block forms are covered by
+/// [`EXTERNAL_MAP_EXTERN_LEAVES`] instead: MEASURED 2026-09-20 on the sealed
+/// `trustc 1.99.0-dev (ff538f905 2026-09-19)` (`$TMPDIR/rc4/mapstd.rs`,
+/// `-Ztrust-dump=mir-only`), `libc`'s own declaration renders
+/// `libc::{extern#0}::mmap`, and the extractor STAMPS the path when a second
+/// `libc` is in the graph (`__trust_crate@b701e0b52ed758ec::libc::{extern#0}::
+/// mmap` — std links its own `libc`, so the name is AMBIGUOUS; that stamp is
+/// not an impersonation verdict and must not be read as one).
+///
+/// Only an `mmap` spelling may bind the mapping's size to `args[1]`. `munmap`,
+/// `mremap`, `memmap2`'s methods and everything else leave the size symbolic —
+/// the fail-closed direction.
+const LIBC_MMAP_SPELLINGS: &[&str] = &["libc::mmap"];
+
+/// `lower` with a LEADING extractor identity stamp (`__trust_crate@<id>::`)
+/// removed, so a root test reads the crate the path actually names. A stamp
+/// elsewhere in the path (a UFCS qualifier) is left alone: it is not this
+/// path's root.
+fn strip_leading_crate_stamp(lower: &str) -> &str {
+    let Some(rest) = lower.strip_prefix(trust_types::TRUST_UNAUTHENTICATED_CRATE_PATH_PREFIX)
+    else {
+        return lower;
+    };
+    match rest.split_once("::") {
+        Some((_stable_crate_id, path)) => path,
+        None => lower,
+    }
+}
+
+/// The first path segment of `lower` — the crate the callee is defined in —
+/// after the leading identity stamp and any UFCS `<` are removed.
+fn callee_crate_root(lower: &str) -> &str {
+    let path = strip_leading_crate_stamp(lower);
+    let path = path.strip_prefix('<').unwrap_or(path);
+    path.split("::").next().unwrap_or("")
+}
+
+/// Is `lower` an item declared in an `extern` BLOCK whose leaf is `leaf`?
+/// rustc renders such an item `<crate>::…::{extern#N}::<leaf>`, and the
+/// `{extern#N}` segment is unspellable in source (see
+/// [`EXTERNAL_MAP_EXTERN_LEAVES`]).
+fn is_extern_block_item(lower: &str, leaf: &str) -> bool {
+    let bare = strip_turbofish_args(strip_leading_crate_stamp(lower));
+    let Some(rest) = bare.strip_suffix(leaf).and_then(|r| r.strip_suffix("::")) else {
+        return false;
+    };
+    let Some((_, block)) = rest.rsplit_once("::") else { return false };
+    block.starts_with("{extern#") && block.ends_with('}')
+}
+
+/// Is `lower` the POSIX `mmap` — an `extern`-block `mmap`/`mmap64` wherever it
+/// is declared, or the bare `libc::mmap` spelling ([`LIBC_MMAP_SPELLINGS`])?
+/// Spelling only — the caller must also require `is_foreign` and the
+/// six-argument shape.
+fn callee_is_posix_mmap(lower: &str) -> bool {
+    if EXTERNAL_MAP_EXTERN_LEAVES.iter().any(|leaf| is_extern_block_item(lower, leaf)) {
+        return true;
+    }
+    let bare = strip_turbofish_args(strip_leading_crate_stamp(lower));
+    LIBC_MMAP_SPELLINGS.contains(&&*bare)
 }
 
 /// Check if a callee maps an *externally-mutable* region — an `mmap`/`memmap`
 /// of a file or shared object whose size another process (or thread) can change
-/// after the map is created. Name-based, like the other classifiers above. The
-/// hazard: the length captured at map time is not a stable bound (truncation ⇒
-/// the mapping outlives the bytes ⇒ SIGBUS / out-of-bounds read).
-fn is_external_map_call(lower: &str) -> bool {
-    // Unambiguous memory-map markers. These substrings already cover the real
-    // call shapes — `libc::mmap`, `memmap2::MmapMut::map_mut`,
-    // `aterm_scrollback::mmap::MmapMut::map_mut` all contain `mmap`/`memmap`.
+/// after the map is created. The hazard: the length captured at map time is not
+/// a stable bound (truncation ⇒ the mapping outlives the bytes ⇒ SIGBUS /
+/// out-of-bounds read).
+///
+/// CRATE-ROOT ANCHORED (2026-09-20). This recognizer cannot be anchored the way
+/// the others are — its legitimate targets are THIRD-PARTY, never sysroot — so
+/// it is anchored at the crate ROOT ([`EXTERNAL_MAP_CRATE_ROOTS`]) instead of
+/// the sysroot stamp. The bare `contains("mmap")` it replaces was satisfied by a
+/// MODULE name: REPRODUCED on the seal, a dependency fn moved from a module
+/// named `plain` to one named `mmap` lost its `[unsafe:unmodeled-call]`
+/// refutation and gained a PROVED `from_raw_parts` bound over a one-byte
+/// allocation. Its `[unsafe:sep:map]` row still lands on a non-sysroot callee by
+/// design, and `decide_site`'s RULE 1 sysroot gate keeps its explicit exception
+/// for exactly this recognizer — which is now this narrower predicate.
+pub(crate) fn is_external_map_call(lower: &str) -> bool {
+    // (1) THE SYSCALL WRAPPER ITSELF, wherever it is declared: an `extern`
+    // BLOCK item named `mmap`/`mmap64`. Most callers write their own
+    // `extern "C" { fn mmap(…) }` rather than depend on `libc`, so no crate
+    // root can enumerate them — the root is the CALLER's own crate.
+    if EXTERNAL_MAP_EXTERN_LEAVES.iter().any(|leaf| is_extern_block_item(lower, leaf)) {
+        return true;
+    }
+    // (2) A Rust memory-map WRAPPER crate, by crate root. A module, type or
+    // method named `mmap` inside any other crate is NOT a memory map.
+    if !EXTERNAL_MAP_CRATE_ROOTS.contains(&callee_crate_root(lower)) {
+        return false;
+    }
+    // Unambiguous memory-map markers WITHIN those crates, so `libc::read` and
+    // the rest of libc are untouched. `libc::mmap`, `memmap2::MmapMut::map_mut`
+    // and `memmap2::mmap::…` all contain `mmap`/`memmap`.
     if lower.contains("mmap") || lower.contains("memmap") {
         return true;
     }
@@ -3974,19 +10144,6 @@ fn rvalue_to_formula(rvalue: &Rvalue) -> Formula {
     match rvalue {
         Rvalue::Use(op) => operand_to_formula_simple(op),
         _ => generated_sep_var("rval", Sort::Int),
-    }
-}
-
-/// Statically-known byte size of a type, when it is in the type itself
-/// (sized integers, bools, and fixed arrays/tuples of those). Returns `None`
-/// for types whose size is not a compile-time constant we model here.
-pub(crate) fn ty_byte_size(ty: &Ty) -> Option<i128> {
-    match ty {
-        Ty::Bool => Some(1),
-        Ty::Int { width, .. } | Ty::Float { width } | Ty::Bv(width) => Some(i128::from(*width) / 8),
-        Ty::Array { elem, len } => ty_byte_size(elem).map(|e| e * i128::from(*len)),
-        Ty::Tuple(elems) => elems.iter().map(ty_byte_size).sum::<Option<i128>>(),
-        _ => None,
     }
 }
 
@@ -4015,10 +10172,12 @@ fn field_access(place: &Place) -> Option<(usize, usize)> {
     }
 }
 
-/// The MIR local an operand reads from, if it is a `Copy`/`Move` of a place.
+/// Only a whole-local value can use that local's pointer identity and type.
+/// A pointer loaded from a field/deref/index is a different value; the storage
+/// containing it is not its pointee allocation or element stride.
 fn operand_local(op: &Operand) -> Option<usize> {
     match op {
-        Operand::Copy(place) | Operand::Move(place) => Some(place.local),
+        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => Some(place.local),
         _ => None,
     }
 }
@@ -4059,9 +10218,20 @@ fn operand_to_formula_simple(op: &Operand) -> Formula {
             trust_types::ConstValue::Str { bytes } => {
                 Formula::Var(trust_types::ConstValue::str_smt_var_name(bytes), Sort::Int)
             }
-            _ => Formula::Var("__unknown_const".into(), Sort::Int),
+            // A carrier with no modeled value (opaque scalar or opaque reference)
+            // is named by its occurrence identity, exactly as the main renderer
+            // names it (OPAQUE-SCALAR-ID-1, OPAQUE-REF-ID-1) — never one shared
+            // `__unknown_const` that would tie two different values.
+            other => match other.unmodeled_value_smt_var_name() {
+                Some(name) => Formula::Var(name, Sort::Int),
+                None => Formula::Var("__unknown_const".into(), Sort::Int),
+            },
         },
         Operand::Symbolic(formula) => formula.clone(),
+        Operand::Unsupported { kind, origin, .. } => {
+            let decoration = crate::sanitize_symbol_fragment(kind);
+            Formula::Var(Operand::unsupported_operand_smt_var_name(origin, &decoration), Sort::Int)
+        }
         _ => Formula::Var("__unknown_operand".into(), Sort::Int),
     }
 }
@@ -4071,11 +10241,11 @@ fn operand_to_formula_simple(op: &Operand) -> Formula {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, ProofLevel, Rvalue,
-        RuntimeCheckEnv, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VcKind, VerifiableBody,
-        VerifiableFunction, VerificationCondition, VerificationResult,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, ProofLevel,
+        RuntimeCheckEnv, Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VcKind,
+        VerifiableBody, VerifiableFunction, VerificationCondition, VerificationResult,
     };
 
     use super::*;
@@ -4087,6 +10257,51 @@ mod tests {
     fn formula_contains_var(formula: &Formula, name: &str) -> bool {
         matches!(formula, Formula::Var(var, _) if var == name)
             || formula.children().into_iter().any(|child| formula_contains_var(child, name))
+    }
+
+    // Existing tests inspect the allocation-size/extent binding inside the
+    // range violation, independently of the new nonempty/lower-bound clauses.
+    fn upper_access_bound(formula: &Formula) -> Option<(&Box<Formula>, &Box<Formula>)> {
+        if let Formula::Gt(extent, size) = formula {
+            if matches!(extent.as_ref(), Formula::Add(_, _)) {
+                return Some((extent, size));
+            }
+        }
+        formula.children().into_iter().find_map(upper_access_bound)
+    }
+
+    fn assert_copy_alignment_vc(
+        vcs: &[VerificationCondition],
+        side: &str,
+        ptr: Formula,
+        align: Formula,
+    ) {
+        let rows: Vec<_> = vcs
+            .iter()
+            .filter(|vc| {
+                matches!(&vc.kind, VcKind::Assertion { message }
+                    if message.contains("[unsafe:sep:copy] alignment check")
+                        && message.contains(&format!("for {side} ")))
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "expected one {side} copy alignment VC: {vcs:?}");
+        assert_eq!(rows[0].kind.proof_level(), ProofLevel::L0Safety);
+        assert_eq!(
+            rows[0].formula,
+            Formula::And(vec![
+                Formula::Gt(Box::new(align.clone()), Box::new(Formula::Int(0))),
+                Formula::Not(Box::new(Formula::Eq(
+                    Box::new(Formula::Rem(Box::new(ptr), Box::new(align))),
+                    Box::new(Formula::Int(0)),
+                ))),
+            ]),
+            "{side} alignment must be a nonzero-remainder violation independent of count",
+        );
+    }
+
+    /// The backing struct a fixture's locals name (empty when none is detected).
+    fn backing_struct_name(func: &VerifiableFunction) -> String {
+        detect_backing_struct(func).map_or_else(String::new, |(name, _, _)| name)
     }
 
     fn make_func(
@@ -4110,17 +10325,362 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
-    // ── SepEngine basic tests ─────────────────────────────────────────
-
+    /// Trust (OD-1 item 18): the census variant relaxes exactly the reference-target
+    /// cast arm. A `&[u32; 4] -> &[u32]` cast is an unsafe operation to the D33
+    /// census (it cannot see the cast kind) and not to the variant; a cast to any
+    /// other non-scalar target (a tuple) stays one for both; a raw deref stays one.
     #[test]
-    fn test_sep_engine_new() {
-        let engine = SepEngine::new("test_fn");
-        assert_eq!(engine.vc_count(), 0);
-        assert_eq!(engine.func_name, "test_fn");
+    fn modulo_ref_unsize_relaxes_only_reference_target_casts() {
+        let array_ref = Ty::Ref {
+            mutable: false,
+            inner: Box::new(Ty::Array { elem: Box::new(Ty::u32()), len: 4 }),
+        };
+        let slice_ref =
+            Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u32()) }) };
+        let cast_to = |dst: Ty| {
+            make_func(
+                "cast",
+                vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl { index: 1, ty: array_ref.clone(), name: None },
+                    LocalDecl { index: 2, ty: dst.clone(), name: None },
+                ],
+                1,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), dst),
+                        span: empty_span(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+            )
+        };
+        let unsize = cast_to(slice_ref);
+        assert!(body_has_unsafe_operation(&unsize));
+        assert!(!body_has_unsafe_operation_modulo_ref_unsize(&unsize));
+        let tuple = cast_to(Ty::Tuple(vec![Ty::u32(), Ty::u32()]));
+        assert!(body_has_unsafe_operation(&tuple));
+        assert!(body_has_unsafe_operation_modulo_ref_unsize(&tuple));
+        let raw_deref = make_func(
+            "raw_deref",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: Ty::u32(), name: None },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) },
+                    name: None,
+                },
+            ],
+            1,
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(1),
+                    rvalue: Rvalue::Use(Operand::Copy(Place {
+                        local: 2,
+                        projections: vec![Projection::Deref],
+                    })),
+                    span: empty_span(),
+                }],
+                terminator: Terminator::Return,
+            }],
+        );
+        assert!(body_has_unsafe_operation(&raw_deref));
+        assert!(body_has_unsafe_operation_modulo_ref_unsize(&raw_deref));
+        // Trust (OD-1 T3): the diagnostics witness agrees with each census and names
+        // the arm that fired.
+        assert_eq!(
+            body_unsafe_operation_witness(&unsize, false),
+            Some("a cast to a non-scalar, non-pointer target")
+        );
+        assert_eq!(body_unsafe_operation_witness(&unsize, true), None);
+        assert_eq!(
+            body_unsafe_operation_witness(&tuple, true),
+            Some("a cast to a non-scalar, non-pointer target")
+        );
+        assert_eq!(
+            body_unsafe_operation_witness(&raw_deref, true),
+            Some("a dereference of a raw pointer (or of a non-reference)")
+        );
     }
+
+    /// Trust (OD-1 T-D, 2026-10-12): the format_args relaxation exempts exactly a
+    /// LISTED block whose callee ALSO renders as the crate-anchored sysroot
+    /// `Arguments` constructor, and nothing else: an unlisted constructor call, a
+    /// listed block whose callee is a forged `mycrate::fmt::arguments::new` or any
+    /// other unsafe fn, and a listed foreign constructor are all still charged.
+    #[test]
+    fn census_format_args_relaxation_needs_both_the_listed_block_and_the_anchored_callee() {
+        let call_fn = |callee: &str, foreign: bool| {
+            make_func(
+                "fmt_ctor",
+                vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl { index: 1, ty: Ty::u32(), name: None },
+                    LocalDecl { index: 2, ty: Ty::u32(), name: None },
+                ],
+                0,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            func: callee.to_string(),
+                            args: vec![Operand::Copy(Place::local(1))],
+                            dest: Place::local(2),
+                            target: Some(BlockId(1)),
+                            span: empty_span(),
+                            atomic: None,
+                            is_foreign: foreign,
+                            is_unsafe_sig: true,
+                            callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key(callee),
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+            )
+        };
+        let unsafe_call = Some("a call to an unsafe-signature or foreign function");
+        let ctor = call_fn("core::fmt::Arguments::<'_>::new::<3, 1>", false);
+        // The base census and an empty list charge it.
+        assert!(body_has_unsafe_operation(&ctor));
+        assert!(body_has_unsafe_operation_modulo_format_args(&ctor, true, &[]));
+        // Listed under the wrong block: still charged.
+        assert!(body_has_unsafe_operation_modulo_format_args(&ctor, true, &[1]));
+        // Listed under its own block: exempt, under both cast variants.
+        assert!(!body_has_unsafe_operation_modulo_format_args(&ctor, true, &[0]));
+        assert!(!body_has_unsafe_operation_modulo_format_args(&ctor, false, &[0]));
+        assert_eq!(body_unsafe_operation_witness_modulo_format_args(&ctor, true, &[0]), None);
+        for charged in [
+            call_fn("mycrate::fmt::arguments::new", false),
+            call_fn("core::ptr::read::<u32>", false),
+            call_fn("core::fmt::Arguments::<'_>::new::<3, 1>", true),
+        ] {
+            assert!(body_has_unsafe_operation_modulo_format_args(&charged, true, &[0]));
+            assert_eq!(
+                body_unsafe_operation_witness_modulo_format_args(&charged, true, &[0]),
+                unsafe_call
+            );
+        }
+    }
+
+    // ── OD-1 T3 class D: the census types places with the body's place typing ──
+
+    fn census_adt(name: &str, kind: Option<trust_types::AdtKind>, fields: Vec<(&str, Ty)>) -> Ty {
+        Ty::Adt {
+            name: name.to_string(),
+            fields: fields.into_iter().map(|(n, t)| (n.to_string(), t)).collect::<Vec<_>>().into(),
+            variants: Vec::new().into(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: kind,
+        }
+    }
+
+    fn census_marker(name: &str) -> Ty {
+        Ty::Datatype { name: name.to_string(), variants: Vec::new() }
+    }
+
+    fn census_ref(inner: Ty) -> Ty {
+        Ty::Ref { mutable: false, inner: Box::new(inner) }
+    }
+
+    /// `_2 = copy <read>` with `_1: param_ty` and `_2: u32`, under `defs`.
+    fn census_read(
+        param_ty: Ty,
+        projections: Vec<Projection>,
+        defs: &[Ty],
+    ) -> VerifiableFunction {
+        let mut func = make_func(
+            "census",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: param_ty, name: None },
+                LocalDecl { index: 2, ty: Ty::u32(), name: None },
+            ],
+            1,
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(2),
+                    rvalue: Rvalue::Use(Operand::Copy(Place { local: 1, projections })),
+                    span: empty_span(),
+                }],
+                terminator: Terminator::Return,
+            }],
+        );
+        for def in defs {
+            assert!(trust_types::insert_datatype_def(&mut func.body.datatype_defs, def.clone()));
+        }
+        func
+    }
+
+    /// `enum Term { Var(u32), App(&Term) }` as the extractor spells a recursive
+    /// cut point: a bare marker at every occurrence, its flat definition in the
+    /// body's table.
+    fn census_term_def() -> Ty {
+        census_adt(
+            "k::Term",
+            Some(trust_types::AdtKind::Enum),
+            vec![
+                ("__tag", Ty::u32()),
+                ("__v0_0", Ty::u32()),
+                ("__v1_0", census_ref(census_marker("k::Term"))),
+            ],
+        )
+    }
+
+    /// The measured class-D shape: a body that projects THROUGH a recursive
+    /// enum's payload (`match t { App(u) => match *u { Var(x) => x, .. } }`) was
+    /// refused whole by the census ("a place step the type walk cannot follow")
+    /// because the table-blind walk could not type the marker's variant field.
+    /// Typed through the table, every step is followed and nothing unsafe is
+    /// found.
+    #[test]
+    fn census_follows_a_recursive_enum_marker_through_the_definition_table() {
+        let through = vec![
+            Projection::Deref,
+            Projection::Downcast(1),
+            Projection::Field(0),
+            Projection::Deref,
+            Projection::Downcast(0),
+            Projection::Field(0),
+        ];
+        let defined =
+            census_read(census_ref(census_marker("k::Term")), through.clone(), &[census_term_def()]);
+        assert_eq!(body_unsafe_operation_witness(&defined, false), None);
+        assert!(!body_has_unsafe_operation(&defined));
+        assert!(!body_has_unsafe_operation_modulo_ref_unsize(&defined));
+
+        // The same place with NO definition (a compacted marker, which the
+        // extractor never files): still refused, exactly as before.
+        let undefined = census_read(census_ref(census_marker("k::Term")), through, &[]);
+        assert_eq!(
+            body_unsafe_operation_witness(&undefined, false),
+            Some("a place step the type walk cannot follow")
+        );
+
+        // A struct cut point: `(*s).0` with `struct S { a: u32, next: &S }`.
+        let s_def = census_adt(
+            "k::S",
+            Some(trust_types::AdtKind::Struct),
+            vec![("a", Ty::u32()), ("next", census_ref(census_marker("k::S")))],
+        );
+        let field = vec![Projection::Deref, Projection::Field(1), Projection::Deref, Projection::Field(0)];
+        let s = census_read(census_ref(census_marker("k::S")), field.clone(), &[s_def]);
+        assert_eq!(body_unsafe_operation_witness(&s, false), None);
+        let s_undefined = census_read(census_ref(census_marker("k::S")), field, &[]);
+        assert!(body_has_unsafe_operation(&s_undefined));
+    }
+
+    /// A marker that resolves to a UNION still meets the union arm, reached
+    /// directly or partway down a recursive chain; one that resolves to a
+    /// definition of unrecorded kind fails closed; a raw pointer reached through
+    /// a resolved definition is still a raw deref.
+    #[test]
+    fn census_keeps_refusing_unions_unknown_kinds_and_raw_pointers_behind_markers() {
+        let u_def = census_adt(
+            "k::U",
+            Some(trust_types::AdtKind::Union),
+            vec![("a", Ty::u32()), ("b", census_ref(census_marker("k::U")))],
+        );
+        let direct = census_read(
+            census_ref(census_marker("k::U")),
+            vec![Projection::Deref, Projection::Field(0)],
+            std::slice::from_ref(&u_def),
+        );
+        assert_eq!(body_unsafe_operation_witness(&direct, false), Some("a union field access"));
+        assert_eq!(body_unsafe_operation_witness(&direct, true), Some("a union field access"));
+
+        // A struct whose recursive child is the union.
+        let w_def = census_adt(
+            "k::W",
+            Some(trust_types::AdtKind::Struct),
+            vec![("u", census_ref(census_marker("k::U")))],
+        );
+        let nested = census_read(
+            census_ref(census_marker("k::W")),
+            vec![Projection::Deref, Projection::Field(0), Projection::Deref, Projection::Field(0)],
+            &[u_def, w_def],
+        );
+        assert_eq!(body_unsafe_operation_witness(&nested, false), Some("a union field access"));
+
+        let unknown = census_read(
+            census_ref(census_marker("k::K")),
+            vec![Projection::Deref, Projection::Field(0)],
+            &[census_adt("k::K", None, vec![("a", Ty::u32())])],
+        );
+        assert_eq!(
+            body_unsafe_operation_witness(&unknown, false),
+            Some("a field of a resolved datatype of unrecorded kind")
+        );
+
+        let p_def = census_adt(
+            "k::P",
+            Some(trust_types::AdtKind::Struct),
+            vec![
+                ("raw", Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) }),
+                ("next", census_ref(census_marker("k::P"))),
+            ],
+        );
+        let raw = census_read(
+            census_ref(census_marker("k::P")),
+            vec![Projection::Deref, Projection::Field(1), Projection::Deref, Projection::Field(0), Projection::Deref],
+            &[p_def],
+        );
+        assert_eq!(
+            body_unsafe_operation_witness(&raw, false),
+            Some("a dereference of a raw pointer (or of a non-reference)")
+        );
+    }
+
+    /// The table-blind walk typed a `Field` after a `Downcast` against the FLAT
+    /// field list, i.e. the wrong slot. Here variant 1's second field is a raw
+    /// pointer while flat slot 1 is variant 0's reference, so the old walk saw a
+    /// reference and passed a raw deref. The variant-relative typing sees the raw
+    /// pointer.
+    #[test]
+    fn census_types_a_variant_field_relative_to_its_downcast() {
+        let e = census_adt(
+            "k::E",
+            Some(trust_types::AdtKind::Enum),
+            vec![
+                ("__tag", Ty::u32()),
+                ("__v0_0", census_ref(Ty::u32())),
+                ("__v1_0", Ty::u32()),
+                ("__v1_1", Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) }),
+            ],
+        );
+        let func = census_read(
+            census_ref(e),
+            vec![
+                Projection::Deref,
+                Projection::Downcast(1),
+                Projection::Field(1),
+                Projection::Deref,
+            ],
+            &[],
+        );
+        assert_eq!(
+            body_unsafe_operation_witness(&func, false),
+            Some("a dereference of a raw pointer (or of a non-reference)")
+        );
+    }
+
+    // ── SepEngine basic tests ─────────────────────────────────────────
 
     #[test]
     fn test_sep_engine_into_vcs_empty() {
@@ -4348,11 +10908,725 @@ mod tests {
                         is_foreign: true,
                         is_unsafe_sig: true,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("waitpid"),
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: b1_stmts, terminator: Terminator::Return },
             ],
         )
+    }
+
+    /// The `pthread_sigmask(how, &raw const set, ptr::null_mut())` lowering: the
+    /// pointer is taken in bb0, bb0 calls `null_mut()` and the pointer is
+    /// consumed by bb1's call; bb1's only predecessor is bb0, and the source's
+    /// `StorageDead` comes after the last use (bb2). The source-liveness VC is
+    /// discharged (agy `die_by`, G1).
+    #[test]
+    fn addr_of_consumed_after_an_intervening_call_discharges_liveness_vc() {
+        let vcs = check_sep_unsafe(&addr_of_run_func(AddrOfRunVariant::Straight));
+        assert!(
+            !has_addr_of_liveness_vc(&vcs, 2),
+            "an AddressOf consumed by the next straight-line call must not flag source \
+             liveness. VCs: {:?}",
+            vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// Fail-closed controls for the straight run: a second way into the using
+    /// block, a `StorageDead` of the source before the use, a `Drop` of the
+    /// source before the use, a copy of the pointer made after its first
+    /// consuming call, and a body with no storage marker for the source (the
+    /// `-O0` shape, where a scope end is invisible) each keep the VC.
+    #[test]
+    fn addr_of_run_fails_closed_on_join_kill_or_late_copy() {
+        for variant in [
+            AddrOfRunVariant::JoinBeforeUse,
+            AddrOfRunVariant::DeadBeforeUse,
+            AddrOfRunVariant::DroppedBeforeUse,
+            AddrOfRunVariant::CopiedAfterUse,
+            AddrOfRunVariant::NoSourceMarkers,
+        ] {
+            let vcs = check_sep_unsafe(&addr_of_run_func(variant));
+            assert!(
+                has_addr_of_liveness_vc(&vcs, 2),
+                "{variant:?}: source-liveness VC must survive. VCs: {:?}",
+                vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn has_addr_of_liveness_vc(vcs: &[VerificationCondition], src: usize) -> bool {
+        let needle = format!("`_{src}`");
+        vcs.iter().any(|vc| {
+            matches!(
+                &vc.kind,
+                VcKind::Assertion { message }
+                    if message.contains("addr_of") && message.contains(&needle)
+            )
+        })
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AddrOfRunVariant {
+        Straight,
+        JoinBeforeUse,
+        DeadBeforeUse,
+        DroppedBeforeUse,
+        CopiedAfterUse,
+        /// The `-Copt-level=0` shape: rustc's `RemoveStorageMarkers` deleted every
+        /// storage marker, so the source's scope end could not be seen.
+        NoSourceMarkers,
+    }
+
+    /// `_0: () ret; _1: i32 how (arg); _2: u32 set; _3: *const u32; _4: i32
+    /// call dest; _5: *mut u32 null; _6: *const u32 late copy`.
+    /// bb0: `_3 = &raw const _2; _5 = null_mut() -> bb1`;
+    /// bb1: `_4 = pthread_sigmask(_1, move _3, move _5) -> bb2`;
+    /// bb2: storage ends, return. `JoinBeforeUse` adds bb3: `goto bb1`.
+    fn addr_of_run_func(variant: AddrOfRunVariant) -> VerifiableFunction {
+        let ptr_u32 = |mutable| Ty::RawPtr { mutable, pointee: Box::new(Ty::u32()) };
+        let call = |func: &str, args: Vec<Operand>, dest: usize, target: usize, foreign: bool| {
+            Terminator::Call {
+                unwind: UnwindEdge::Unreachable,
+                func: func.to_string(),
+                args,
+                dest: Place::local(dest),
+                target: Some(BlockId(target)),
+                span: empty_span(),
+                atomic: None,
+                is_foreign: foreign,
+                is_unsafe_sig: foreign,
+                callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key(func),
+            }
+        };
+        let mut b1_stmts = Vec::new();
+        let mut b1_term =
+            call(
+                "pthread_sigmask",
+                vec![
+                    Operand::Copy(Place::local(1)),
+                    Operand::Move(Place::local(3)),
+                    Operand::Move(Place::local(5)),
+                ],
+                4,
+                2,
+                true,
+            );
+        match variant {
+            AddrOfRunVariant::DeadBeforeUse => b1_stmts.push(Statement::StorageDead(2)),
+            AddrOfRunVariant::DroppedBeforeUse => {
+                // bb1 drops the source and continues to bb4, which uses the pointer.
+                b1_term = Terminator::Drop {
+                    place: Place::local(2),
+                    target: BlockId(4),
+                    span: empty_span(),
+                    unwind: UnwindEdge::Unreachable,
+                };
+            }
+            _ => {}
+        }
+        let mut b2_stmts = Vec::new();
+        if variant == AddrOfRunVariant::CopiedAfterUse {
+            b2_stmts.push(Statement::Assign {
+                place: Place::local(6),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(3))),
+                span: empty_span(),
+            });
+        }
+        if variant == AddrOfRunVariant::NoSourceMarkers {
+            b2_stmts.push(Statement::StorageDead(3));
+        } else {
+            b2_stmts.extend([Statement::StorageDead(3), Statement::StorageDead(2)]);
+        }
+        let mut blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    Statement::StorageLive(3),
+                    Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::AddressOf(false, Place::local(2)),
+                        span: empty_span(),
+                    },
+                ],
+                terminator: call("null_mut", Vec::new(), 5, 1, false),
+            },
+            BasicBlock { id: BlockId(1), stmts: b1_stmts, terminator: b1_term },
+            BasicBlock { id: BlockId(2), stmts: b2_stmts, terminator: Terminator::Return },
+        ];
+        if variant == AddrOfRunVariant::JoinBeforeUse {
+            blocks.push(BasicBlock {
+                id: BlockId(3),
+                stmts: Vec::new(),
+                terminator: Terminator::Goto(BlockId(1)),
+            });
+        }
+        if variant == AddrOfRunVariant::DroppedBeforeUse {
+            blocks.push(BasicBlock { id: BlockId(3), stmts: Vec::new(), terminator: Terminator::Return });
+            blocks.push(BasicBlock {
+                id: BlockId(4),
+                stmts: Vec::new(),
+                terminator: call(
+                    "pthread_sigmask",
+                    vec![
+                        Operand::Copy(Place::local(1)),
+                        Operand::Move(Place::local(3)),
+                        Operand::Move(Place::local(5)),
+                    ],
+                    4,
+                    2,
+                    true,
+                ),
+            });
+        }
+        make_func(
+            "addr_of_run",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: Ty::i32(), name: Some("how".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("set".into()) },
+                LocalDecl { index: 3, ty: ptr_u32(false), name: None },
+                LocalDecl { index: 4, ty: Ty::i32(), name: None },
+                LocalDecl { index: 5, ty: ptr_u32(true), name: None },
+                LocalDecl { index: 6, ty: ptr_u32(false), name: None },
+            ],
+            1,
+            blocks,
+        )
+    }
+
+    // ── a tail call ends the caller's frame (REVIEW-A4C4-MINORS-1) ──────
+
+    /// `become` replaces the caller's frame before the callee runs, so the address
+    /// of ANY caller local — an argument's included — is dangling in the callee:
+    ///
+    /// ```text
+    /// pub fn caller(x: *const u32, n: u32) -> u32 { become take(&raw const n, mk()) }
+    /// pub fn caller(x: *const u32, n: u32) -> u32 { become take(&raw const n, 5) }
+    /// ```
+    ///
+    /// The first takes the pointer one call before the tail call (the straight run),
+    /// the second in the tail call's own block (the single-block rule the run grew
+    /// from, which admitted it too). Both keep the source-liveness row.
+    #[test]
+    fn addr_of_passed_to_a_tail_call_keeps_liveness_vc() {
+        for variant in [TailCallAddrOf::AfterCall, TailCallAddrOf::SameBlock] {
+            let vcs = check_sep_unsafe(&tail_call_addr_of_func(variant));
+            assert!(
+                has_addr_of_liveness_vc(&vcs, 2),
+                "{variant:?}: a pointer to a caller local passed to `become` must keep its \
+                 source-liveness VC. VCs: {:?}",
+                vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Positive controls: the same pointer consumed by an ORDINARY call (the caller's
+    /// frame is live across it) is discharged — as the last call of the run, and when
+    /// a tail call that does not take the pointer follows it.
+    #[test]
+    fn addr_of_consumed_by_an_ordinary_call_discharges_liveness_vc_beside_a_tail_call() {
+        for variant in [TailCallAddrOf::OrdinaryCall, TailCallAddrOf::CallThenUnrelatedTailCall] {
+            let vcs = check_sep_unsafe(&tail_call_addr_of_func(variant));
+            assert!(
+                !has_addr_of_liveness_vc(&vcs, 2),
+                "{variant:?}: a pointer consumed by an ordinary call in the live frame must \
+                 not flag source liveness. VCs: {:?}",
+                vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The return slot is the other way a pointer leaves the frame. `_3 = &raw const
+    /// _2; _0 = copy _3; _5 = take(move _3, 5) -> bb1; bb1: return` (`_0: *const u32`):
+    /// the copy into `_0` was taken as a coercion-chain link, so the row was discharged
+    /// for a pointer the function returns, though the doc comment of
+    /// `call_arg_confined_addr_of_locals` says the pointer never escapes into the return
+    /// slot (measured on this branch before the fix: no row). It keeps the row now. The
+    /// same body without the copy is the
+    /// `addr_of_consumed_by_an_ordinary_call_discharges_liveness_vc_beside_a_tail_call`
+    /// control's shape.
+    #[test]
+    fn addr_of_copied_into_the_return_slot_keeps_liveness_vc() {
+        let mut func = tail_call_addr_of_func(TailCallAddrOf::CallThenUnrelatedTailCall);
+        func.body.locals[0].ty = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) };
+        func.body.return_ty = func.body.locals[0].ty.clone();
+        func.body.blocks[0].stmts.push(Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(3))),
+            span: empty_span(),
+        });
+        func.body.blocks[1].terminator = Terminator::Return;
+        let vcs = check_sep_unsafe(&func);
+        assert!(
+            has_addr_of_liveness_vc(&vcs, 2),
+            "a pointer copied into the return slot leaves the frame and must keep its \
+             source-liveness VC. VCs: {:?}",
+            vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// The production path. `generate_vcs` hands the sep engine the
+    /// `with_tail_calls_expanded` projection, where `become take(..)` is an ordinary
+    /// `_0 = take(..) -> bbN; bbN: return`, the shape of `return take(..)`. The first
+    /// cut of this fix only changed the `TailCall` arm, which that projection never
+    /// reaches: the rows above came back on `check_sep_unsafe` and stayed discharged
+    /// through the entry (and in `tests/ui/trust/addr_of_tail_call_ends_the_frame.rs`).
+    /// The source's tail-call blocks are what tell the two calls apart, so the
+    /// projection judged WITHOUT them is the positive control: it must discharge the
+    /// row, or this test could not see the difference it pins.
+    #[test]
+    fn addr_of_passed_to_a_tail_call_keeps_liveness_vc_through_the_generation_entry() {
+        for variant in [
+            TailCallAddrOf::AfterCall,
+            TailCallAddrOf::SameBlock,
+            TailCallAddrOf::OrdinaryCall,
+            TailCallAddrOf::CallThenUnrelatedTailCall,
+        ] {
+            let source = tail_call_addr_of_func(variant);
+            let ends_frame = matches!(variant, TailCallAddrOf::AfterCall | TailCallAddrOf::SameBlock);
+            let vcs = crate::generate_vcs(&source);
+            assert_eq!(
+                has_addr_of_liveness_vc(&vcs, 2),
+                ends_frame,
+                "{variant:?}: through the generation entry, the source-liveness row must stand \
+                 exactly when the pointer reaches a `become`. VCs: {:?}",
+                vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+            );
+
+            let projected = source.with_tail_calls_expanded();
+            assert!(
+                projected.body.blocks.iter().all(|b| !matches!(b.terminator, Terminator::TailCall { .. })),
+                "{variant:?}: the projection must rewrite every tail call"
+            );
+            let rows_of = |tail_blocks: &FxHashSet<BlockId>| {
+                check_sep_unsafe_blocked_ops(&projected, tail_blocks, &FxHashSet::default())
+                    .into_iter()
+                    .map(|(vc, _, _)| vc)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                has_addr_of_liveness_vc(&rows_of(&tail_call_blocks(&source)), 2),
+                ends_frame,
+                "{variant:?}: the projection judged with the source's tail-call blocks"
+            );
+            assert!(
+                !has_addr_of_liveness_vc(&rows_of(&FxHashSet::default()), 2),
+                "{variant:?}: positive control: without the source's tail-call blocks the \
+                 projected `become` reads as an in-frame call and discharges the row"
+            );
+        }
+    }
+
+    // ── a call can hand the pointer back; a tail call's own rows see no frame ──
+    // (REVIEW-A4C4-MINORS-1 fix-forward, 2026-11-07)
+
+    /// `_0: u32 ret; _1: *const u32 x (arg); _2: u32 n (arg); _3: *const u32 p; _4: u32 b
+    /// (a local); _5: u32; _6: *const u32 q`, with `blocks` as the body.
+    fn frame_func(blocks: Vec<BasicBlock>) -> VerifiableFunction {
+        let ptr_u32 = || Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) };
+        let mut func = make_func(
+            "frame_end",
+            vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl { index: 1, ty: ptr_u32(), name: Some("x".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("n".into()) },
+                LocalDecl { index: 3, ty: ptr_u32(), name: None },
+                LocalDecl { index: 4, ty: Ty::u32(), name: Some("b".into()) },
+                LocalDecl { index: 5, ty: Ty::u32(), name: None },
+                LocalDecl { index: 6, ty: ptr_u32(), name: None },
+            ],
+            2,
+            blocks,
+        );
+        func.body.return_ty = Ty::u32();
+        func
+    }
+
+    fn frame_call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Terminator {
+        Terminator::Call {
+            unwind: UnwindEdge::Unreachable,
+            func: callee.to_string(),
+            args,
+            dest: Place::local(dest),
+            target: Some(BlockId(target)),
+            span: empty_span(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(callee),
+        }
+    }
+
+    fn frame_tail_call(callee: &str, args: Vec<Operand>) -> Terminator {
+        Terminator::TailCall {
+            func: callee.to_string(),
+            args,
+            span: empty_span(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(callee),
+        }
+    }
+
+    fn frame_bb(id: usize, stmts: Vec<Statement>, terminator: Terminator) -> BasicBlock {
+        BasicBlock { id: BlockId(id), stmts, terminator }
+    }
+
+    fn assign(local: usize, rvalue: Rvalue) -> Statement {
+        Statement::Assign { place: Place::local(local), rvalue, span: empty_span() }
+    }
+
+    /// The rows of `source` three ways: on the source model (its `TailCall` visible), and
+    /// on its tail-call projection judged with the source's tail-call blocks (the
+    /// generation entry) and without them (the projection read as ordinary calls).
+    fn frame_rows(
+        source: &VerifiableFunction,
+    ) -> [(&'static str, Vec<VerificationCondition>); 3] {
+        let projected = source.with_tail_calls_expanded();
+        let rows_of = |tail_blocks: &FxHashSet<BlockId>| {
+            check_sep_unsafe_blocked_ops(&projected, tail_blocks, &FxHashSet::default())
+                .into_iter()
+                .map(|(vc, _, _)| vc)
+                .collect::<Vec<_>>()
+        };
+        [
+            ("source", check_sep_unsafe(source)),
+            ("projection", rows_of(&tail_call_blocks(source))),
+            ("projection without the source's tail-call blocks", rows_of(&FxHashSet::default())),
+        ]
+    }
+
+    /// `p = &raw const n; q = f(p); become take(q, 5)`: `f` hands `p` back, so `q` dangles
+    /// in `take` exactly as `p` would. Both the sysroot retype `cast` (a chain link) and a
+    /// user function returning a pointer (a consumer whose result joins the chain) keep
+    /// the row. Before the fix-forward the row was discharged on every view: `f` consumed
+    /// `p` with the frame live, and `q` was never judged (measured on a stage 1 of the
+    /// first cut for `become write(fd, (&raw const fd).cast(), 4)`: no addr_of row).
+    #[test]
+    fn addr_of_handed_back_by_a_call_keeps_liveness_vc_at_a_tail_call() {
+        for f in ["core::ptr::const_ptr::cast", "user::identity"] {
+            let source = frame_func(vec![
+                frame_bb(
+                    0,
+                    vec![assign(3, Rvalue::AddressOf(false, Place::local(2)))],
+                    frame_call(f, vec![Operand::Move(Place::local(3))], 6, 1),
+                ),
+                frame_bb(
+                    1,
+                    vec![],
+                    frame_tail_call(
+                        "take",
+                        vec![
+                            Operand::Move(Place::local(6)),
+                            Operand::Constant(ConstValue::Uint(5, 32)),
+                        ],
+                    ),
+                ),
+            ]);
+            for (view, vcs) in frame_rows(&source) {
+                if view.starts_with("projection without") {
+                    continue;
+                }
+                assert!(
+                    has_addr_of_liveness_vc(&vcs, 2),
+                    "{f}, {view}: a pointer handed back by a call and passed to `become` must \
+                     keep its source-liveness VC. VCs: {:?}",
+                    vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+                );
+            }
+            assert!(
+                has_addr_of_liveness_vc(&crate::generate_vcs(&source), 2),
+                "{f}: through the generation entry"
+            );
+        }
+    }
+
+    /// Controls: the retyped pointer consumed by an ORDINARY call (frame live) is
+    /// discharged, as the self-pipe `write(fd, (&raw const byte).cast(), 1)` must be; and
+    /// a consumer whose result cannot hold a pointer (`u32`) ends the chain, so an
+    /// unrelated tail call after it changes nothing.
+    #[test]
+    fn addr_of_retyped_then_consumed_in_frame_discharges_liveness_vc() {
+        let cast_then_take = frame_func(vec![
+            frame_bb(
+                0,
+                vec![assign(3, Rvalue::AddressOf(false, Place::local(2)))],
+                frame_call("core::ptr::const_ptr::cast", vec![Operand::Move(Place::local(3))], 6, 1),
+            ),
+            frame_bb(
+                1,
+                vec![],
+                frame_call(
+                    "take",
+                    vec![Operand::Move(Place::local(6)), Operand::Constant(ConstValue::Uint(5, 32))],
+                    0,
+                    2,
+                ),
+            ),
+            frame_bb(2, vec![], Terminator::Return),
+        ]);
+        let scalar_then_tail = frame_func(vec![
+            frame_bb(
+                0,
+                vec![assign(3, Rvalue::AddressOf(false, Place::local(2)))],
+                frame_call(
+                    "take",
+                    vec![Operand::Move(Place::local(3)), Operand::Constant(ConstValue::Uint(5, 32))],
+                    5,
+                    1,
+                ),
+            ),
+            frame_bb(1, vec![], frame_tail_call("mk", vec![])),
+        ]);
+        for (shape, source) in [("cast, then take", cast_then_take), ("take, then become mk()", scalar_then_tail)] {
+            for (view, vcs) in frame_rows(&source) {
+                assert!(
+                    !has_addr_of_liveness_vc(&vcs, 2),
+                    "{shape}, {view}: a pointer used only in the live frame must not flag source \
+                     liveness. VCs: {:?}",
+                    vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// The `-O0` self-pipe shape (`ffi_write_call_result_extent.rs`'s `sig_byte`): `b` is
+    /// a LOCAL and the body has no storage markers at all (`-Copt-level=0` strips them;
+    /// KNOWN_HAZARDS ADDR-OF-O0-MARKERS-1), so the run may not pass `b0` on marker
+    /// evidence. `p = &raw const b; q = p.cast() -> b1; b1: take(q, 5)`: the retype's
+    /// return edge is judged as the `as` coercion would be, so `take` is reached and the
+    /// row is discharged, as the single-block rule discharges `take(p as _, 5)`. The first
+    /// fix-forward build refused it (measured on its stage 1: `sig_byte` and `sig_word`
+    /// kept a FAILED `[unsafe:sep:addr_of]` row). Control: a user function in the
+    /// retype's place is a consumer whose result joins the chain, and with no marker
+    /// evidence its later use is unjudged, so the row stays.
+    #[test]
+    fn addr_of_retyped_across_a_markerless_call_edge_discharges_liveness_vc() {
+        let body = |f: &str| {
+            frame_func(vec![
+                frame_bb(
+                    0,
+                    vec![
+                        assign(4, Rvalue::Use(Operand::Constant(ConstValue::Uint(7, 32)))),
+                        assign(3, Rvalue::AddressOf(false, Place::local(4))),
+                    ],
+                    frame_call(f, vec![Operand::Move(Place::local(3))], 6, 1),
+                ),
+                frame_bb(
+                    1,
+                    vec![],
+                    frame_call(
+                        "take",
+                        vec![Operand::Move(Place::local(6)), Operand::Constant(ConstValue::Uint(5, 32))],
+                        5,
+                        2,
+                    ),
+                ),
+                frame_bb(2, vec![], Terminator::Return),
+            ])
+        };
+        for (f, kept) in [("core::ptr::const_ptr::cast", false), ("user::identity", true)] {
+            let source = body(f);
+            assert_eq!(
+                has_addr_of_liveness_vc(&check_sep_unsafe(&source), 4),
+                kept,
+                "{f}: a markerless local retyped by a call and consumed in the next block"
+            );
+            assert_eq!(
+                has_addr_of_liveness_vc(&crate::generate_vcs(&source), 4),
+                kept,
+                "{f}: through the generation entry"
+            );
+        }
+    }
+
+    /// The hand-back reaches past a scope end too: `StorageLive(b); b = 7; p = &raw const
+    /// b; q = p.cast(); StorageDead(b); take(q, 5)`. `q` is used after `b`'s storage ended.
+    /// Control: the same body with `StorageDead(b)` after the call discharges.
+    #[test]
+    fn addr_of_handed_back_past_a_scope_end_keeps_liveness_vc() {
+        let body = |dead_before_use: bool| {
+            let dead = || Statement::StorageDead(4);
+            frame_func(vec![
+                frame_bb(
+                    0,
+                    vec![
+                        Statement::StorageLive(4),
+                        assign(4, Rvalue::Use(Operand::Constant(ConstValue::Uint(7, 32)))),
+                        assign(3, Rvalue::AddressOf(false, Place::local(4))),
+                    ],
+                    frame_call("core::ptr::const_ptr::cast", vec![Operand::Move(Place::local(3))], 6, 1),
+                ),
+                frame_bb(
+                    1,
+                    if dead_before_use { vec![dead()] } else { vec![] },
+                    frame_call(
+                        "take",
+                        vec![Operand::Move(Place::local(6)), Operand::Constant(ConstValue::Uint(5, 32))],
+                        0,
+                        2,
+                    ),
+                ),
+                frame_bb(2, if dead_before_use { vec![] } else { vec![dead()] }, Terminator::Return),
+            ])
+        };
+        let vcs = check_sep_unsafe(&body(true));
+        assert!(
+            has_addr_of_liveness_vc(&vcs, 4),
+            "a retyped pointer used after its source's StorageDead must keep the VC. VCs: {:?}",
+            vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+        );
+        let vcs = check_sep_unsafe(&body(false));
+        assert!(
+            !has_addr_of_liveness_vc(&vcs, 4),
+            "control: used before the StorageDead, the retyped pointer is confined. VCs: {:?}",
+            vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// A tail call's OWN modeled rows are judged with this frame's pointers untracked:
+    /// `become core::ptr::read(&raw const n)` reads `n` after the frame has ended, so its
+    /// backing-bounds row may not be discharged against `n`'s 4 bytes. It gets the
+    /// untracked fail-closed rows instead. Control: the ordinary `return
+    /// core::ptr::read(&raw const n)`, and the projection judged without the source's
+    /// tail-call blocks, keep the tracked bounds row.
+    #[test]
+    fn a_tail_calls_modeled_read_sees_no_frame_pointer() {
+        let read = "core::ptr::read::<u32>";
+        let take_n = || vec![assign(3, Rvalue::AddressOf(false, Place::local(2)))];
+        let tracked = |vcs: &[VerificationCondition]| {
+            vcs.iter().any(|vc| matches!(&vc.kind, VcKind::CopyBoundsViolation { callee, .. } if callee == read))
+        };
+        let untracked = |vcs: &[VerificationCondition]| {
+            vcs.iter().any(|vc| matches!(&vc.kind, VcKind::Assertion { message }
+                if message.contains("allocation validity") && message.contains("arg0_core_ptr_read")))
+        };
+        let source = frame_func(vec![frame_bb(
+            0,
+            take_n(),
+            frame_tail_call(read, vec![Operand::Move(Place::local(3))]),
+        )]);
+        for (view, vcs) in frame_rows(&source) {
+            let in_frame = view.starts_with("projection without");
+            assert_eq!(tracked(&vcs), in_frame, "{view}: the tracked bounds row. VCs: {:?}",
+                vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>());
+            assert_eq!(untracked(&vcs), !in_frame, "{view}: the untracked rows. VCs: {:?}",
+                vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>());
+        }
+        let ordinary = frame_func(vec![
+            frame_bb(0, take_n(), frame_call(read, vec![Operand::Move(Place::local(3))], 0, 1)),
+            frame_bb(1, vec![], Terminator::Return),
+        ]);
+        let vcs = check_sep_unsafe(&ordinary);
+        assert!(tracked(&vcs) && !untracked(&vcs), "control: the ordinary read. VCs: {:?}",
+            vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>());
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TailCallAddrOf {
+        /// bb0: `_3 = &raw const _2; _4 = mk() -> bb1`; bb1: `become take(move _3, move _4)`.
+        AfterCall,
+        /// bb0: `_3 = &raw const _2; become take(move _3, const 5)`.
+        SameBlock,
+        /// bb0: `_3 = &raw const _2; _4 = mk() -> bb1`; bb1: `_0 = take(move _3, move _4)
+        /// -> bb2`; bb2: `return`.
+        OrdinaryCall,
+        /// bb0: `_3 = &raw const _2; _5 = take(move _3, const 5) -> bb1`; bb1: `become mk()`.
+        CallThenUnrelatedTailCall,
+    }
+
+    /// `_0: u32 ret; _1: *const u32 x (arg); _2: u32 n (arg); _3: *const u32 p; _4: u32
+    /// mk() result; _5: u32 take() result`. The source `_2` is an argument, so the run
+    /// extends past its defining block without storage markers.
+    fn tail_call_addr_of_func(variant: TailCallAddrOf) -> VerifiableFunction {
+        let ptr_u32 = || Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) };
+        let call = |func: &str, args: Vec<Operand>, dest: usize, target: usize| Terminator::Call {
+            unwind: UnwindEdge::Unreachable,
+            func: func.to_string(),
+            args,
+            dest: Place::local(dest),
+            target: Some(BlockId(target)),
+            span: empty_span(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(func),
+        };
+        let tail_call = |func: &str, args: Vec<Operand>| Terminator::TailCall {
+            func: func.to_string(),
+            args,
+            span: empty_span(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(func),
+        };
+        // `_4 = mk() -> bb1`.
+        let call_mk = || call("mk", vec![], 4, 1);
+        let five = || Operand::Constant(ConstValue::Uint(5, 32));
+        let take_ptr = || Operand::Move(Place::local(3));
+        let mk_result = || Operand::Move(Place::local(4));
+        let b0_stmts = vec![Statement::Assign {
+            place: Place::local(3),
+            rvalue: Rvalue::AddressOf(false, Place::local(2)),
+            span: empty_span(),
+        }];
+        let blocks = match variant {
+            TailCallAddrOf::AfterCall => vec![
+                BasicBlock { id: BlockId(0), stmts: b0_stmts, terminator: call_mk() },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![],
+                    terminator: tail_call("take", vec![take_ptr(), mk_result()]),
+                },
+            ],
+            TailCallAddrOf::SameBlock => vec![BasicBlock {
+                id: BlockId(0),
+                stmts: b0_stmts,
+                terminator: tail_call("take", vec![take_ptr(), five()]),
+            }],
+            TailCallAddrOf::OrdinaryCall => vec![
+                BasicBlock { id: BlockId(0), stmts: b0_stmts, terminator: call_mk() },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![],
+                    terminator: call("take", vec![take_ptr(), mk_result()], 0, 2),
+                },
+                BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
+            ],
+            TailCallAddrOf::CallThenUnrelatedTailCall => vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: b0_stmts,
+                    terminator: call("take", vec![take_ptr(), five()], 5, 1),
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: tail_call("mk", vec![]) },
+            ],
+        };
+        let mut func = make_func(
+            "tail_call_addr_of",
+            vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl { index: 1, ty: ptr_u32(), name: Some("x".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("n".into()) },
+                LocalDecl { index: 3, ty: ptr_u32(), name: None },
+                LocalDecl { index: 4, ty: Ty::u32(), name: None },
+                LocalDecl { index: 5, ty: Ty::u32(), name: None },
+            ],
+            2,
+            blocks,
+        );
+        // The generation entry validates the body: the return slot's type is the
+        // function's return type.
+        func.body.return_ty = Ty::u32();
+        func
     }
 
     // ── Pattern 2: Raw pointer deref write ────────────────────────────
@@ -4412,8 +11686,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("alloc::alloc::alloc"),
                         is_foreign: false,
-                        func: "std::alloc::alloc".to_string(),
+                        func: "alloc::alloc::alloc".to_string(),
                         args: vec![],
                         dest: Place::local(1),
                         target: Some(BlockId(1)),
@@ -4441,6 +11716,58 @@ mod tests {
         )));
     }
 
+    // ── Dominators (deallocation path condition) ──────────────────────
+
+    /// A diamond: `bb0 -> {bb1, bb2} -> bb3`. The join is dominated by the head
+    /// and by itself, by NEITHER arm — the property the free channel relies on
+    /// to leave `if c { dealloc(p) } else { dealloc(p) }` uncharged.
+    #[test]
+    fn test_block_dominators_on_a_diamond() {
+        let blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::SwitchInt {
+                    discr: Operand::Constant(trust_types::ConstValue::Uint(0, 8)),
+                    targets: vec![(0, BlockId(1))],
+                    otherwise: BlockId(2),
+                    span: empty_span(),
+                    exhaustive_enum_unreachable: false,
+                },
+            },
+            BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Goto(BlockId(3)) },
+            BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Goto(BlockId(3)) },
+            BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+        ];
+        let dom = block_dominators(&blocks);
+        assert_eq!(
+            dom[&0],
+            [0].into_iter().collect::<FxHashSet<_>>(),
+            "the entry dominates only itself"
+        );
+        assert_eq!(dom[&1], [0, 1].into_iter().collect::<FxHashSet<_>>());
+        assert_eq!(dom[&2], [0, 2].into_iter().collect::<FxHashSet<_>>());
+        assert_eq!(
+            dom[&3],
+            [0, 3].into_iter().collect::<FxHashSet<_>>(),
+            "the join is dominated by the branch HEAD and itself — never by an arm, \
+             which is what keeps a free on one arm from being charged against the other"
+        );
+    }
+
+    /// An unreachable (unwind cleanup) block is dominated by itself alone, so a
+    /// normal-path free is never made visible inside cleanup.
+    #[test]
+    fn test_block_dominators_leaves_unreachable_blocks_alone() {
+        let blocks = vec![
+            BasicBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Goto(BlockId(1)) },
+            BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Resume },
+        ];
+        let dom = block_dominators(&blocks);
+        assert_eq!(dom[&2], [2].into_iter().collect::<FxHashSet<_>>());
+    }
+
     // ── Pattern 4: Deallocation (Drop) ────────────────────────────────
 
     #[test]
@@ -4460,8 +11787,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("alloc::alloc::alloc"),
                         is_foreign: false,
-                        func: "std::alloc::alloc".to_string(),
+                        func: "alloc::alloc::alloc".to_string(),
                         args: vec![],
                         dest: Place::local(1),
                         target: Some(BlockId(1)),
@@ -4522,8 +11850,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::ptr::copy_nonoverlapping",
+                        ),
                         is_foreign: false,
-                        func: "std::ptr::copy_nonoverlapping".to_string(),
+                        func: "core::ptr::copy_nonoverlapping".to_string(),
                         args: vec![],
                         dest: Place::local(1),
                         target: Some(BlockId(1)),
@@ -4543,6 +11874,73 @@ mod tests {
             )),
             "copy_nonoverlapping should produce an overlap check VC"
         );
+        for side in ["src", "dst"] {
+            assert_copy_alignment_vc(
+                &vcs,
+                side,
+                generated_sep_var(format!("ptr_copy_{side}"), Sort::Int),
+                generated_sep_var(format!("align_copy_{side}"), Sort::Int),
+            );
+        }
+    }
+
+    #[test]
+    fn copy_ptr_zero_count_checks_both_alignments_without_overlap() {
+        let func = make_func(
+            "zero_copy_overlap_allowed",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) },
+                    name: Some("src".into()),
+                },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u32()) },
+                    name: Some("dst".into()),
+                },
+            ],
+            2,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        callee_key: fixture_key("core::ptr::copy"),
+                        is_foreign: false,
+                        func: "core::ptr::copy".to_string(),
+                        args: vec![
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                            Operand::Constant(ConstValue::Uint(0, 64)),
+                        ],
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        span: empty_span(),
+                        atomic: None,
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+        );
+
+        let vcs = check_sep_unsafe(&func);
+        for (side, ptr) in [("src", "src"), ("dst", "dst")] {
+            assert_copy_alignment_vc(
+                &vcs,
+                side,
+                Formula::Var(ptr.into(), Sort::Int),
+                Formula::Int(4),
+            );
+            assert!(vcs.iter().any(|vc| matches!(&vc.kind,
+                VcKind::CopyBoundsViolation { direction, .. } if direction == side)));
+        }
+        assert!(!vcs.iter().any(|vc| matches!(&vc.kind,
+            VcKind::Assertion { message } if message.contains("overlap check"))));
     }
 
     /// Trust: `copy_nonoverlapping` must now also prove the count stays within
@@ -4566,8 +11964,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::ptr::copy_nonoverlapping",
+                        ),
                         is_foreign: false,
-                        func: "std::ptr::copy_nonoverlapping".to_string(),
+                        func: "core::ptr::copy_nonoverlapping".to_string(),
                         args: vec![],
                         dest: Place::local(1),
                         target: Some(BlockId(1)),
@@ -4663,6 +12064,229 @@ mod tests {
         );
     }
 
+    #[test]
+    fn copy_statement_zero_count_checks_both_untracked_pointer_alignments() {
+        let func = make_func(
+            "zero_copy_untracked",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) },
+                    name: Some("src".into()),
+                },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u32()) },
+                    name: Some("dst".into()),
+                },
+            ],
+            2,
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::CopyNonOverlapping {
+                    src: Operand::Copy(Place::local(1)),
+                    dst: Operand::Copy(Place::local(2)),
+                    count: Operand::Constant(ConstValue::Uint(0, 64)),
+                    elem_ty: Ty::u32(),
+                    span: empty_span(),
+                }],
+                terminator: Terminator::Return,
+            }],
+        );
+
+        let vcs = check_sep_unsafe(&func);
+        for (side, ptr) in [("src", "src"), ("dst", "dst")] {
+            assert_copy_alignment_vc(
+                &vcs,
+                side,
+                Formula::Var(ptr.into(), Sort::Int),
+                Formula::Int(4),
+            );
+            assert!(vcs.iter().any(|vc| matches!(&vc.kind,
+                VcKind::CopyBoundsViolation { direction, .. } if direction == side)));
+        }
+        assert!(vcs.iter().any(|vc| matches!(&vc.kind,
+            VcKind::Assertion { message } if message.contains("overlap check"))));
+    }
+
+    #[test]
+    fn copy_statement_zero_count_checks_both_tracked_pointer_alignments() {
+        let array = Ty::Array { elem: Box::new(Ty::u32()), len: 2 };
+        let func = make_func(
+            "zero_copy_tracked",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: array.clone(), name: None },
+                LocalDecl { index: 2, ty: array, name: None },
+                LocalDecl {
+                    index: 3,
+                    ty: Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) },
+                    name: Some("src".into()),
+                },
+                LocalDecl {
+                    index: 4,
+                    ty: Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u32()) },
+                    name: Some("dst".into()),
+                },
+            ],
+            0,
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::AddressOf(
+                            false,
+                            Place {
+                                local: 1,
+                                projections: vec![Projection::ConstantIndex {
+                                    offset: 0,
+                                    min_length: 1,
+                                    from_end: false,
+                                }],
+                            },
+                        ),
+                        span: empty_span(),
+                    },
+                    Statement::Assign {
+                        place: Place::local(4),
+                        rvalue: Rvalue::AddressOf(
+                            true,
+                            Place {
+                                local: 2,
+                                projections: vec![Projection::ConstantIndex {
+                                    offset: 0,
+                                    min_length: 1,
+                                    from_end: false,
+                                }],
+                            },
+                        ),
+                        span: empty_span(),
+                    },
+                    Statement::CopyNonOverlapping {
+                        src: Operand::Copy(Place::local(3)),
+                        dst: Operand::Copy(Place::local(4)),
+                        count: Operand::Constant(ConstValue::Uint(0, 64)),
+                        elem_ty: Ty::u32(),
+                        span: empty_span(),
+                    },
+                ],
+                terminator: Terminator::Return,
+            }],
+        );
+
+        let vcs = check_sep_unsafe(&func);
+        for (side, ptr) in [("src", "src"), ("dst", "dst")] {
+            assert_copy_alignment_vc(
+                &vcs,
+                side,
+                Formula::Var(ptr.into(), Sort::Int),
+                Formula::Int(4),
+            );
+            let bounds = vcs
+                .iter()
+                .find(|vc| {
+                    matches!(&vc.kind,
+                        VcKind::CopyBoundsViolation { direction, .. } if direction == side)
+                })
+                .expect("tracked copy must retain each bounds check");
+            assert!(
+                matches!(upper_access_bound(&bounds.formula), Some((_, size))
+                    if matches!(size.as_ref(), Formula::Int(8))),
+                "{side} bounds must use the tracked allocation: {:?}",
+                bounds.formula
+            );
+        }
+        assert!(vcs.iter().any(|vc| matches!(&vc.kind,
+            VcKind::Assertion { message } if message.contains("overlap check"))));
+    }
+
+    #[test]
+    fn copy_statement_unknown_element_alignment_fails_closed() {
+        let elem_ty = Ty::Tuple(vec![Ty::u8(), Ty::u32()]);
+        let func = make_func(
+            "copy_unknown_align",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::RawPtr { mutable: false, pointee: Box::new(elem_ty.clone()) },
+                    name: Some("src".into()),
+                },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::RawPtr { mutable: true, pointee: Box::new(elem_ty.clone()) },
+                    name: Some("dst".into()),
+                },
+            ],
+            2,
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::CopyNonOverlapping {
+                    src: Operand::Copy(Place::local(1)),
+                    dst: Operand::Copy(Place::local(2)),
+                    count: Operand::Constant(ConstValue::Uint(0, 64)),
+                    elem_ty,
+                    span: empty_span(),
+                }],
+                terminator: Terminator::Return,
+            }],
+        );
+
+        let vcs = check_sep_unsafe(&func);
+        for (side, ptr) in [("src", "src"), ("dst", "dst")] {
+            assert_copy_alignment_vc(
+                &vcs,
+                side,
+                Formula::Var(ptr.into(), Sort::Int),
+                generated_sep_var(format!("align_copy_{side}"), Sort::Int),
+            );
+        }
+    }
+
+    #[test]
+    fn copy_statement_zero_sized_unit_uses_alignment_one() {
+        let func = make_func(
+            "copy_unit",
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Unit) },
+                    name: Some("src".into()),
+                },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::RawPtr { mutable: true, pointee: Box::new(Ty::Unit) },
+                    name: Some("dst".into()),
+                },
+            ],
+            2,
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::CopyNonOverlapping {
+                    src: Operand::Copy(Place::local(1)),
+                    dst: Operand::Copy(Place::local(2)),
+                    count: Operand::Constant(ConstValue::Uint(0, 64)),
+                    elem_ty: Ty::Unit,
+                    span: empty_span(),
+                }],
+                terminator: Terminator::Return,
+            }],
+        );
+
+        let vcs = check_sep_unsafe(&func);
+        for (side, ptr) in [("src", "src"), ("dst", "dst")] {
+            assert_copy_alignment_vc(
+                &vcs,
+                side,
+                Formula::Var(ptr.into(), Sort::Int),
+                Formula::Int(1),
+            );
+        }
+    }
+
     /// The revert's acceptance shape: `copy_nonoverlapping(a.as_ptr(),
     /// b.as_mut_ptr(), 64)` over two `[u8; 8]` arrays, spelled as the
     /// statement. The pointers trace to CONCRETE 8-byte stack allocations
@@ -4712,6 +12336,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::<impl [u8]>::as_ptr",
+                        ),
                         is_foreign: false,
                         func: "core::slice::<impl [u8]>::as_ptr".to_string(),
                         args: vec![Operand::Move(Place::local(4))],
@@ -4739,6 +12366,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::<impl [u8]>::as_mut_ptr",
+                        ),
                         is_foreign: false,
                         func: "core::slice::<impl [u8]>::as_mut_ptr".to_string(),
                         args: vec![Operand::Move(Place::local(7))],
@@ -4783,9 +12413,8 @@ mod tests {
             // symbolic size here would mean the tracked allocation was lost and
             // the obligation degraded to the fail-closed form — still an error,
             // but no longer the refutation this fixture exists to pin.
-            let Formula::Gt(extent, size) = &row.formula else {
-                panic!("{direction} bounds row must be Gt(extent, size), got {:?}", row.formula);
-            };
+            let (extent, size) = upper_access_bound(&row.formula)
+                .expect("bounds row must retain its concrete extent and allocation size");
             assert!(
                 matches!(size.as_ref(), Formula::Int(8)),
                 "{direction} allocation size must be the CONCRETE 8 bytes, got {size:?}"
@@ -4814,6 +12443,12 @@ mod tests {
     /// Trust: a memory map of an externally-mutable region (mmap of a file)
     /// emits an `ExternallyMutableAllocationBounds` obligation — the captured
     /// mapped length is not a stable bound (a concurrent truncation ⇒ SIGBUS).
+    ///
+    /// CALLEE CHANGED 2026-09-20 from `aterm_scrollback::mmap::MmapMut::map_mut`
+    /// to `memmap2::MmapMut::map_mut`: the recognizer is now anchored at the
+    /// crate ROOT ([`EXTERNAL_MAP_CRATE_ROOTS`]), so a first-party wrapper crate
+    /// no longer matches on a MODULE named `mmap`. That cost is asserted
+    /// explicitly at the end of this test rather than left implicit.
     #[test]
     fn test_mmap_call_generates_external_mutable_bounds_vc() {
         let func = make_func(
@@ -4831,8 +12466,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "memmap2::MmapMut::map_mut",
+                        ),
                         is_foreign: false,
-                        func: "aterm_scrollback::mmap::MmapMut::map_mut".to_string(),
+                        func: "memmap2::MmapMut::map_mut".to_string(),
                         args: vec![],
                         dest: Place::local(1),
                         target: Some(BlockId(1)),
@@ -4871,6 +12509,238 @@ mod tests {
             ext.formula
         );
         assert_eq!(ext.kind.proof_level(), ProofLevel::L0Safety);
+
+        // THE COST OF THE CRATE-ROOT ANCHOR, asserted: the same call in a
+        // first-party wrapper crate is no longer recognised. It does not lose
+        // its obligation — it gets the `[unsafe:unmodeled-call]` refutation and
+        // the missing-SAFETY stand-in from the mint instead, which is MORE
+        // obligation than the map row. Re-admitting such a crate means adding
+        // its root to `EXTERNAL_MAP_CRATE_ROOTS`, deliberately.
+        assert!(!is_external_map_call("aterm_scrollback::mmap::mmapmut::map_mut"));
+        assert!(!call_is_modeled("aterm_scrollback::mmap::mmapmut::map_mut"));
+    }
+
+    /// RULE 4 (2026-09-20) — THE EXTERNAL-MAP RECOGNIZER IS THE ONLY ONE THAT
+    /// FABRICATES A SIZE, AND A MODULE NAME USED TO BUY IT.
+    ///
+    /// REPRODUCED on the sealed `trustc 1.99.0-dev (ff538f905 2026-09-19)`
+    /// (`$TMPDIR/rc4/mapdep.rs` + `mapuser.rs`: two dependency fns identical but
+    /// for their module name, each returning a pointer to ONE byte whatever
+    /// `_len` says):
+    ///   `mapdep::plain::region` -> 7 obligations, 1 proved, 5 failed, 0 unknown
+    ///                              (incl. `[unsafe:unmodeled-call]` FAILED)
+    ///   `mapdep::mmap::region`  -> 8 obligations, 2 proved, 4 failed, 1 unknown
+    ///                              and the `from_raw_parts(p, 4096)` bound PROVED
+    /// Renaming the module removed a fail-closed refutation and bought a proof.
+    #[test]
+    fn an_external_map_is_recognised_by_its_crate_not_by_a_module_name() {
+        // The crate roots this recognizer means, including the real extracted
+        // `libc` spelling and its ambiguity stamp (MEASURED: std links its own
+        // `libc`, so a second one is stamped — that stamp is an AMBIGUITY
+        // verdict, not an impersonation one, and must not withhold the model).
+        for genuine in [
+            "libc::mmap",
+            "libc::{extern#0}::mmap",
+            "__trust_crate@b701e0b52ed758ec::libc::{extern#0}::mmap",
+            "memmap2::mmapmut::map_mut",
+            "memmap2::mmap::mmap::map",
+            "memmap::mmapoptions::map_mut",
+            "mmap::mmapmut::map_mut",
+            // THE CALLER'S OWN `extern "C" { fn mmap(…) }` — the shape seven
+            // `tests/ui/trust/backing-cert` fixtures and
+            // `tests/temporal_probe.rs` use, and the one a crate-root list can
+            // never enumerate because the root is the caller's own crate.
+            // MEASURED: `localextern::{extern#0}::mmap`, `is_foreign: true`.
+            "localextern::{extern#0}::mmap",
+            "backing_cert_hidden_closure_constructor::{extern#0}::mmap",
+            "anycrate::inner::{extern#3}::mmap64",
+        ] {
+            assert!(is_external_map_call(genuine), "{genuine}");
+        }
+        // The extern-block segment is what admits those, and it is unspellable
+        // in source: a Rust module or type named `extern` does not produce it.
+        for forged in [
+            "mycrate::extern0::mmap",
+            "mycrate::mmap",
+            "mycrate::{extern#0}::region",
+            "mycrate::{extern#0}::munmap",
+        ] {
+            assert!(!is_extern_block_item(forged, "mmap"), "{forged}");
+        }
+        assert!(is_extern_block_item("localextern::{extern#0}::mmap", "mmap"));
+        assert!(callee_is_posix_mmap("localextern::{extern#0}::mmap"));
+        assert!(!callee_is_posix_mmap("mycrate::mmap::region"));
+        // `libc::munmap` is NOT matched, and never was: `munmap` has no `mmap`
+        // substring. Recorded because the arity gate below is about `mmap`'s
+        // argument order and a reader will look for the unmap.
+        assert!(!is_external_map_call("libc::munmap"));
+        // A module / type / method named `mmap` in any OTHER crate is not a
+        // memory map — the reproduced fail-open, and the class it belongs to.
+        for forged in [
+            "mapdep::mmap::region",
+            "evilcrate::mmap::region",
+            "mycrate::memmap::open",
+            "aterm_scrollback::mmap::mmapmut::map_mut",
+            "my_arena::slot::map_mut",
+            "libcfoo::mmap",
+            "not_libc::mmap",
+        ] {
+            assert!(!is_external_map_call(forged), "{forged}");
+            assert!(!call_is_modeled(forged), "{forged}");
+        }
+        // Inside an admitted crate, only the map-family items match.
+        assert!(!is_external_map_call("libc::read"));
+        assert!(!is_external_map_call("libc::malloc"));
+    }
+
+    /// RULE 4, the FACT half: the mapping's size is bound to `args[1]` only for
+    /// a FOREIGN (`tcx.is_foreign_item`) six-argument `libc::mmap`. `is_foreign`
+    /// is a compiler fact no crate can forge by naming; the genuine
+    /// `extern "C"` `libc::mmap` carries it (MEASURED: `is_foreign: true` in the
+    /// extracted terminator, `$TMPDIR/rc4/mirdump3`), a Rust `fn mmap` does not.
+    ///
+    /// Observed through the obligation the fabricated size exists to discharge:
+    /// `from_raw_parts(p, len)` over the mapping is `len > len` (UNSAT, a real
+    /// proof) when the size is bound, and falls to the unbindable symbolic
+    /// `prov_N_size` var when it is not.
+    #[test]
+    fn only_a_foreign_libc_mmap_binds_the_mapping_size_to_its_len_argument() {
+        fn map_then_slice(callee: &str, is_foreign: bool) -> Vec<VerificationCondition> {
+            let func = make_func(
+                "map_then_slice",
+                vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Int { width: 64, signed: false },
+                        name: Some("len".into()),
+                    },
+                    LocalDecl {
+                        index: 2,
+                        ty: Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) },
+                        name: Some("p".into()),
+                    },
+                ],
+                1,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: true,
+                            callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
+                            is_foreign,
+                            func: callee.to_string(),
+                            args: vec![
+                                Operand::Constant(trust_types::ConstValue::Int(0)),
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(trust_types::ConstValue::Int(3)),
+                                Operand::Constant(trust_types::ConstValue::Int(1)),
+                                Operand::Constant(trust_types::ConstValue::Int(7)),
+                                Operand::Constant(trust_types::ConstValue::Int(0)),
+                            ],
+                            dest: Place::local(2),
+                            target: Some(BlockId(1)),
+                            span: empty_span(),
+                            atomic: None,
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: true,
+                            callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key(
+                                "core::slice::raw::from_raw_parts",
+                            ),
+                            is_foreign: false,
+                            func: "core::slice::raw::from_raw_parts".to_string(),
+                            args: vec![
+                                Operand::Copy(Place::local(2)),
+                                Operand::Copy(Place::local(1)),
+                            ],
+                            dest: Place::local(0),
+                            target: Some(BlockId(2)),
+                            span: empty_span(),
+                            atomic: None,
+                        },
+                    },
+                    BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
+                ],
+            );
+            check_sep_unsafe(&func)
+        }
+        fn mentions_symbolic_size(f: &Formula) -> bool {
+            matches!(f, Formula::Var(v, _) if v.contains("_size") && !v.contains("live_size"))
+                || f.children().into_iter().any(mentions_symbolic_size)
+        }
+        fn bounds_formula(vcs: &[VerificationCondition]) -> Option<Formula> {
+            vcs.iter()
+                .find(|vc| matches!(&vc.kind, VcKind::CopyBoundsViolation { .. }))
+                .map(|vc| vc.formula.clone())
+        }
+        /// The `from_raw_parts` bound CANNOT prove: either it is the symbolic
+        /// `prov_N_size` form, or the pointer was never tracked at all and the
+        /// arm fell to the shared always-refuted `[unsafe:sep:call] …         /// (unverified)` row. Both are fail-closed; the second is stricter.
+        fn bound_cannot_prove(vcs: &[VerificationCondition]) -> bool {
+            match bounds_formula(vcs) {
+                Some(f) => mentions_symbolic_size(&f),
+                None => vcs.iter().any(|vc| {
+                    matches!(&vc.kind, VcKind::Assertion { message }
+                        if message.contains("[unsafe:sep:call]"))
+                        && matches!(vc.formula, Formula::Bool(true))
+                }),
+            }
+        }
+
+        // The genuine foreign `libc::mmap`: the size is bound to `len`, so the
+        // bound is the real `len > len` and never the symbolic var.
+        for genuine in ["libc::mmap", "libc::{extern#0}::mmap"] {
+            let vcs = map_then_slice(genuine, true);
+            let f = bounds_formula(&vcs).unwrap_or_else(|| panic!("{genuine}: no bounds row"));
+            assert!(formula_contains_var(&f, "len"), "{genuine}: {f:?}");
+            assert!(!mentions_symbolic_size(&f), "{genuine}: {f:?}");
+            assert!(
+                vcs.iter()
+                    .any(|vc| matches!(&vc.kind, VcKind::ExternallyMutableAllocationBounds { .. })),
+                "{genuine}: the map row itself must still be minted"
+            );
+        }
+
+        // Same spelling, NOT foreign — a Rust `fn mmap` in a crate named
+        // `libc`. It keeps the map model (provenance + the truncation row) and
+        // loses the fabricated size: fail-closed.
+        let vcs = map_then_slice("libc::mmap", false);
+        assert!(
+            vcs.iter()
+                .any(|vc| matches!(&vc.kind, VcKind::ExternallyMutableAllocationBounds { .. })),
+            "a non-foreign libc::mmap keeps the map model"
+        );
+        assert!(bound_cannot_prove(&vcs), "the size must stay unknown: {vcs:?}");
+
+        // A six-argument FOREIGN map-family fn that is not `mmap` binds nothing.
+        let vcs = map_then_slice("memmap2::mmapmut::map_mut", true);
+        assert!(
+            vcs.iter()
+                .any(|vc| matches!(&vc.kind, VcKind::ExternallyMutableAllocationBounds { .. })),
+            "memmap2 keeps the map model"
+        );
+        assert!(bound_cannot_prove(&vcs), "{vcs:?}");
+
+        // And the reproduced fail-open: no map row at all, and no size.
+        for forged in ["mapdep::mmap::region", "evilcrate::mmap::region"] {
+            let vcs = map_then_slice(forged, false);
+            assert!(
+                !vcs.iter()
+                    .any(|vc| matches!(&vc.kind, VcKind::ExternallyMutableAllocationBounds { .. })),
+                "{forged} must not be modeled as a memory map: {vcs:?}"
+            );
+            assert!(bound_cannot_prove(&vcs), "{forged}: {vcs:?}");
+        }
     }
 
     /// Trust: a *non-mmap* `.map_mut()` (e.g. a container/arena method) must NOT
@@ -4893,6 +12763,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "my_arena::Slot::map_mut",
+                        ),
                         is_foreign: false,
                         func: "my_arena::Slot::map_mut".to_string(),
                         args: vec![],
@@ -4933,6 +12806,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("alloc::alloc::alloc"),
                         is_foreign: false,
                         func: "alloc::alloc::alloc".to_string(),
                         args: vec![],
@@ -4961,6 +12835,10 @@ mod tests {
     fn test_from_raw_parts_emits_real_bounds_obligation() {
         let vcs = crate::separation_logic::unsafe_fn_call_sep_vc(
             "build_slice",
+            // The helper's OWN matcher (`contains("slice::from_raw_parts")`), on the
+            // hand-written spelling it recognises. MEASURED 2026-09-20: the real extracted
+            // `core::slice::raw::from_raw_parts` does NOT reach this branch (see
+            // `test_from_raw_parts_via_engine_emits_bounds_vc`); left for its own change.
             "core::slice::from_raw_parts",
             &empty_span(),
         );
@@ -4993,8 +12871,20 @@ mod tests {
     }
 
     /// Trust: `slice::from_raw_parts` routed through the ENGINE (not just the
-    /// standalone helper) must emit the CopyBoundsViolation — this is what fires
-    /// in a real compile via interpret_call.
+    /// standalone helper), on the REAL extracted spelling
+    /// `core::slice::raw::from_raw_parts` and an UNTRACKED pointer: the anchored
+    /// recognizer reaches the arm, and the arm falls back to the shared builder's
+    /// symbolic fail-closed row. MEASURED (sealed `ff538f905`, `mint-probe/
+    /// misc_calls.rs::frp`, byte-identical in round two): that row is the always-
+    /// refuted `[unsafe:sep:call] unsafe function call to core::slice::raw::
+    /// from_raw_parts::<'_, u8> (unverified)`, because the helper's own
+    /// `contains("slice::from_raw_parts")` branch — the `CopyBoundsViolation`
+    /// this test used to assert on a hand-written `core::slice::from_raw_parts`
+    /// — does not match the real `slice::raw::` module path. A completeness gap
+    /// (fail-closed today), left for its own change: fixing it changes that
+    /// probe's row. The TRACKED path (`from_args`) mints the real
+    /// `CopyBoundsViolation` — see `test_from_raw_parts_wires_real_len_and_provenance`
+    /// and the fixed-array / offset-aware tests, all on the real spelling.
     #[test]
     fn test_from_raw_parts_via_engine_emits_bounds_vc() {
         let func = make_func(
@@ -5012,8 +12902,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "std::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![],
                         dest: Place::local(1),
                         target: Some(BlockId(1)),
@@ -5026,12 +12919,14 @@ mod tests {
         );
 
         let vcs = check_sep_unsafe(&func);
+        let fallback = vcs.iter().find(|vc| matches!(&vc.kind, VcKind::Assertion { message }
+            if message == "[unsafe:sep:call] unsafe function call to core::slice::raw::from_raw_parts (unverified)"));
         assert!(
-            vcs.iter().any(|vc| matches!(&vc.kind, VcKind::CopyBoundsViolation { callee, .. }
-                if callee.contains("from_raw_parts"))),
-            "from_raw_parts via the engine must emit a CopyBoundsViolation, got {:?}",
+            fallback.is_some(),
+            "the engine must reach the from_raw_parts arm and mint the symbolic fail-closed row, got {:?}",
             vcs.iter().map(|vc| vc.kind.description()).collect::<Vec<_>>()
         );
+        assert!(matches!(fallback.unwrap().formula, Formula::Bool(true)), "always refuted");
     }
 
     /// Trust: when from_raw_parts' pointer traces to a tracked allocation, the
@@ -5063,6 +12958,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("alloc::alloc::alloc"),
                         is_foreign: false,
                         func: "alloc::alloc::alloc".to_string(),
                         args: vec![],
@@ -5080,8 +12976,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "core::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(1)), Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
                         target: Some(BlockId(2)),
@@ -5118,8 +13017,8 @@ mod tests {
             bounds.formula
         );
         assert!(
-            matches!(&bounds.formula, Formula::Gt(_, _)),
-            "obligation must be `len > size`, got {:?}",
+            upper_access_bound(&bounds.formula).is_some(),
+            "obligation must retain the real `len > size` upper bound, got {:?}",
             bounds.formula
         );
     }
@@ -5169,8 +13068,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::ptr::copy_nonoverlapping",
+                        ),
                         is_foreign: false,
-                        func: "std::ptr::copy_nonoverlapping".to_string(),
+                        func: "core::ptr::copy_nonoverlapping".to_string(),
                         // (src, dst, count)
                         args: vec![
                             Operand::Copy(Place::local(3)),
@@ -5259,6 +13161,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "std::ptr::const_ptr::<impl *const u8>::add",
+                        ),
                         is_foreign: false,
                         func: "std::ptr::const_ptr::<impl *const u8>::add".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Copy(Place::local(4))],
@@ -5276,8 +13181,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "core::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(5))],
                         dest: Place::local(0),
                         target: Some(BlockId(2)),
@@ -5382,6 +13290,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::alloc::layout::Layout::from_size_align_unchecked",
+                        ),
                         is_foreign: false,
                         func: "core::alloc::layout::Layout::from_size_align_unchecked".to_string(),
                         args: vec![
@@ -5401,6 +13312,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("alloc::alloc::alloc"),
                         is_foreign: false,
                         func: "alloc::alloc::alloc".to_string(),
                         args: vec![Operand::Move(Place::local(5))],
@@ -5430,8 +13342,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "core::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Copy(Place::local(2)), Operand::Copy(Place::local(3))],
                         dest: Place::local(0),
                         target: Some(BlockId(3)),
@@ -5503,6 +13418,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::alloc::layout::Layout::from_size_align",
+                        ),
                         is_foreign: false,
                         func: "core::alloc::layout::Layout::from_size_align".to_string(),
                         args: vec![
@@ -5523,6 +13441,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::result::Result::<T, E>::unwrap",
+                        ),
                         is_foreign: false,
                         func: "core::result::Result::<T, E>::unwrap".to_string(),
                         args: vec![Operand::Move(Place::local(4))],
@@ -5540,6 +13461,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("alloc::alloc::alloc"),
                         is_foreign: false,
                         func: "alloc::alloc::alloc".to_string(),
                         args: vec![Operand::Move(Place::local(5))],
@@ -5557,8 +13479,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "core::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
                         target: Some(BlockId(4)),
@@ -5596,6 +13521,202 @@ mod tests {
             "obligation must NOT fall back to the unbindable symbolic size var, got {:?}",
             bounds.formula
         );
+    }
+
+    /// The `Layout`-size RELOCATION is authorised by an EXACT sysroot spelling
+    /// ([`LAYOUT_PASSTHROUGH_ITEMS`]), not by the arm's substring selector
+    /// and not by a bare crate root.
+    ///
+    /// Same body as `test_from_raw_parts_over_layout_alloc_uses_concrete_size`
+    /// with only the unwrap callee changed. Both REFUSED spellings were
+    /// COMPILED on the sealed `trustc 1.99.0-dev (ff538f905 2026-09-19)`
+    /// (`$TMPDIR/rc4`): the user `mycrate::Thing::unwrap` was already refused
+    /// there by `callee_is_std_crate_rooted` (`layoutuser.rs`: `unknown`), while
+    /// the sysroot `Result::unwrap_or` was NOT (`layouthole.rs`: the
+    /// `from_raw_parts(p, 4096)` bound came back **proved** over a really
+    /// one-byte allocation — a false OOB proof).
+    #[test]
+    fn the_layout_size_crosses_only_the_exact_sysroot_passthroughs() {
+        fn layout_chain_bounds_formula(unwrap_callee: &str) -> Formula {
+            let func = make_func(
+                "slice_from_layout_alloc",
+                vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) },
+                        name: Some("p".into()),
+                    },
+                    LocalDecl {
+                        index: 2,
+                        ty: Ty::Int { width: 64, signed: false },
+                        name: Some("len".into()),
+                    },
+                    LocalDecl {
+                        index: 3,
+                        ty: Ty::Int { width: 64, signed: false },
+                        name: Some("cap".into()),
+                    },
+                    LocalDecl { index: 4, ty: Ty::Unit, name: Some("layout_res".into()) },
+                    LocalDecl { index: 5, ty: Ty::Unit, name: Some("layout".into()) },
+                ],
+                0,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(3),
+                            rvalue: Rvalue::Use(Operand::Constant(trust_types::ConstValue::Uint(
+                                64, 64,
+                            ))),
+                            span: empty_span(),
+                        }],
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key(
+                                "core::alloc::layout::Layout::from_size_align",
+                            ),
+                            is_foreign: false,
+                            func: "core::alloc::layout::Layout::from_size_align".to_string(),
+                            args: vec![
+                                Operand::Copy(Place::local(3)),
+                                Operand::Constant(trust_types::ConstValue::Uint(1, 64)),
+                            ],
+                            dest: Place::local(4),
+                            target: Some(BlockId(1)),
+                            span: empty_span(),
+                            atomic: None,
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key(
+                                &unwrap_callee.to_string(),
+                            ),
+                            is_foreign: false,
+                            func: unwrap_callee.to_string(),
+                            args: vec![Operand::Move(Place::local(4))],
+                            dest: Place::local(5),
+                            target: Some(BlockId(2)),
+                            span: empty_span(),
+                            atomic: None,
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key(
+                                "alloc::alloc::alloc",
+                            ),
+                            is_foreign: false,
+                            func: "alloc::alloc::alloc".to_string(),
+                            args: vec![Operand::Move(Place::local(5))],
+                            dest: Place::local(1),
+                            target: Some(BlockId(3)),
+                            span: empty_span(),
+                            atomic: None,
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key(
+                                "core::slice::raw::from_raw_parts",
+                            ),
+                            is_foreign: false,
+                            func: "core::slice::raw::from_raw_parts".to_string(),
+                            args: vec![
+                                Operand::Copy(Place::local(1)),
+                                Operand::Copy(Place::local(2)),
+                            ],
+                            dest: Place::local(0),
+                            target: Some(BlockId(4)),
+                            span: empty_span(),
+                            atomic: None,
+                        },
+                    },
+                    BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Return },
+                ],
+            );
+            check_sep_unsafe(&func)
+                .into_iter()
+                .find(|vc| {
+                    matches!(&vc.kind, VcKind::CopyBoundsViolation { callee, .. }
+                    if callee.contains("from_raw_parts"))
+                })
+                .expect("from_raw_parts must emit a CopyBoundsViolation")
+                .formula
+        }
+        fn contains_int(f: &Formula, n: i128) -> bool {
+            matches!(f, Formula::Int(v) if *v == n)
+                || f.children().into_iter().any(|c| contains_int(c, n))
+        }
+
+        // The six identity passthroughs relocate the size.
+        for genuine in [
+            "core::result::Result::<core::alloc::layout::Layout,              core::alloc::layout::LayoutError>::unwrap",
+            "core::result::Result::<core::alloc::layout::Layout,              core::alloc::layout::LayoutError>::expect",
+            "core::result::Result::<core::alloc::layout::Layout,              core::alloc::layout::LayoutError>::unwrap_unchecked",
+            "core::option::Option::<core::alloc::layout::Layout>::unwrap",
+            "core::option::Option::<core::alloc::layout::Layout>::expect",
+            "core::option::Option::<core::alloc::layout::Layout>::unwrap_unchecked",
+        ] {
+            let f = layout_chain_bounds_formula(genuine);
+            assert!(contains_int(&f, 64), "{genuine} must carry the concrete size, got {f:?}");
+            assert!(suppression_mirror::is_layout_size_passthrough_call_sup(
+                &genuine.to_lowercase()
+            ));
+        }
+
+        // Everything else keeps the size where it was; the bound falls to the
+        // unbindable symbolic size var and can never PROVE.
+        for refused in [
+            // SYSROOT, and not an identity passthrough — the compiled false proof.
+            "core::result::Result::<core::alloc::layout::Layout,              core::alloc::layout::LayoutError>::unwrap_or",
+            "core::option::Option::<core::alloc::layout::Layout>::unwrap_or_else",
+            "core::result::Result::<core::alloc::layout::Layout,              core::alloc::layout::LayoutError>::unwrap_err",
+            // A user item whose path matches the arm's substring selector.
+            "mycrate::Thing::unwrap",
+            "layoutdep::Thing::unwrap",
+            "mycrate::core::result::Result::unwrap",
+            "<core::result::Result<core::alloc::layout::Layout, ()> as mycrate::Forge>::unwrap",
+            // A stamped impersonator.
+            "__trust_crate@00000000deadbeef::core::result::Result::<u32, ()>::unwrap",
+        ] {
+            let f = layout_chain_bounds_formula(refused);
+            assert!(
+                !contains_int(&f, 64),
+                "{refused} must NOT relocate the layout size, got {f:?}"
+            );
+            assert!(!suppression_mirror::is_layout_size_passthrough_call_sup(
+                &refused.to_lowercase()
+            ));
+        }
+
+        // The ARM SELECTOR is deliberately still a substring — it is a
+        // suppression entry, and every one of the refused spellings above still
+        // selects the arm. That is what makes the exact list load-bearing.
+        for selected in [
+            "mycrate::thing::unwrap",
+            "core::result::result::<core::alloc::layout::layout, ()>::unwrap_or",
+        ] {
+            assert!(is_layout_passthrough_call(selected), "{selected}");
+        }
     }
 
     /// Trust (regression lock): copy_nonoverlapping into `buf.add(off)` carries
@@ -5653,6 +13774,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "std::ptr::mut_ptr::<impl *mut u8>::add",
+                        ),
                         is_foreign: false,
                         func: "std::ptr::mut_ptr::<impl *mut u8>::add".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Copy(Place::local(4))],
@@ -5670,8 +13794,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::ptr::copy_nonoverlapping",
+                        ),
                         is_foreign: false,
-                        func: "std::ptr::copy_nonoverlapping".to_string(),
+                        func: "core::ptr::copy_nonoverlapping".to_string(),
                         args: vec![
                             Operand::Copy(Place::local(5)),
                             Operand::Move(Place::local(3)),
@@ -5750,8 +13877,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "core::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Copy(Place::local(3))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
@@ -5874,6 +14004,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::<impl [u8]>::as_ptr",
+                        ),
                         is_foreign: false,
                         func: "core::slice::<impl [u8]>::as_ptr".to_string(),
                         args: vec![Operand::Move(Place::local(5))],
@@ -5898,8 +14031,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "std::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
                         target: Some(BlockId(2)),
@@ -6006,7 +14142,8 @@ mod tests {
         let mut engine = SepEngine::new(&func.name)
             .with_local_tys(func.body.locals.iter().map(|l| l.ty.clone()).collect())
             .with_local_names(func.body.locals.iter().map(|l| l.name.clone()).collect())
-            .with_field_backing(vec![(0, 1)]);
+            .with_field_backing(vec![(0, 1)])
+            .with_backing_value_identity(&func, &backing_struct_name(&func), 0, 1);
         let span = empty_span();
         for block in &func.body.blocks {
             for stmt in &block.stmts {
@@ -6054,7 +14191,7 @@ mod tests {
                         inner: Box::new(Ty::Adt {
                             adt_kind: None,
                             layout: None,
-                            variants: Vec::new(),
+                            variants: Vec::new().into(),
                             name: "MmapMut".into(),
                             fields: vec![
                                 (
@@ -6062,9 +14199,14 @@ mod tests {
                                     Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) },
                                 ),
                                 ("len".into(), Ty::Int { width: 64, signed: false }),
-                            ],
+                            ]
+                            .into(),
                             disc_index_safe: false,
-                            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }),
+                            faithful_enum_repr: None,
+                            enum_layout: None,
+                            arbitrary_precision: None,
+                            validity_wrapper: None,
+                        }),
                     },
                     name: Some("self".into()),
                 },
@@ -6082,15 +14224,20 @@ mod tests {
                 ty: Ty::Adt {
                     adt_kind: None,
                     layout: None,
-                    variants: Vec::new(),
+                    variants: Vec::new().into(),
                     name: "X".into(),
                     fields: vec![
                         ("a".into(), Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) }),
                         ("b".into(), Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) }),
                         ("n".into(), Ty::Int { width: 64, signed: false }),
-                    ],
+                    ]
+                    .into(),
                     disc_index_safe: false,
-                    faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                    arbitrary_precision: None,
+                    validity_wrapper: None,
+                },
                 name: None,
             }],
             0,
@@ -6132,6 +14279,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("libc::mmap"),
                         is_foreign: true,
                         func: "libc::mmap".to_string(),
                         args: vec![
@@ -6172,7 +14320,8 @@ mod tests {
         let mut engine = SepEngine::new(&func.name)
             .with_local_tys(func.body.locals.iter().map(|l| l.ty.clone()).collect())
             .with_local_names(func.body.locals.iter().map(|l| l.name.clone()).collect())
-            .with_field_backing(vec![(0, 1)]);
+            .with_field_backing(vec![(0, 1)])
+            .with_backing_value_identity(&func, &backing_struct_name(&func), 0, 1);
         let span = empty_span();
         for block in &func.body.blocks {
             for stmt in &block.stmts {
@@ -6230,6 +14379,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("libc::mmap"),
                         is_foreign: true,
                         func: "libc::mmap".to_string(),
                         args: vec![
@@ -6348,8 +14498,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "std::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
@@ -6364,7 +14517,8 @@ mod tests {
         let mut engine = SepEngine::new(&func.name)
             .with_local_tys(func.body.locals.iter().map(|l| l.ty.clone()).collect())
             .with_local_names(func.body.locals.iter().map(|l| l.name.clone()).collect())
-            .with_field_backing(vec![(0, 1)]);
+            .with_field_backing(vec![(0, 1)])
+            .with_backing_value_identity(&func, &backing_struct_name(&func), 0, 1);
         let span = empty_span();
         for block in &func.body.blocks {
             for stmt in &block.stmts {
@@ -6402,72 +14556,16 @@ mod tests {
     /// struct-invariant threading supplies `alloc_size >= self.len`.
     #[test]
     fn test_backing_invariant_assume_is_fail_closed_for_as_slice() {
-        let func = make_func(
-            "as_slice",
-            vec![
-                LocalDecl { index: 0, ty: Ty::Unit, name: None },
-                LocalDecl {
-                    index: 1,
-                    ty: Ty::Ref { mutable: false, inner: Box::new(Ty::Unit) },
-                    name: Some("self".into()),
-                },
-                LocalDecl {
-                    index: 2,
-                    ty: Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) },
-                    name: Some("p".into()),
-                },
-                LocalDecl {
-                    index: 3,
-                    ty: Ty::Int { width: 64, signed: false },
-                    name: Some("len".into()),
-                },
-            ],
-            1,
-            vec![
-                BasicBlock {
-                    id: BlockId(0),
-                    stmts: vec![
-                        // _2 = (*self).0   (ptr field)
-                        Statement::Assign {
-                            place: Place::local(2),
-                            rvalue: Rvalue::Use(Operand::Copy(Place {
-                                local: 1,
-                                projections: vec![Projection::Deref, Projection::Field(0)],
-                            })),
-                            span: empty_span(),
-                        },
-                        // _3 = (*self).1   (len field)
-                        Statement::Assign {
-                            place: Place::local(3),
-                            rvalue: Rvalue::Use(Operand::Copy(Place {
-                                local: 1,
-                                projections: vec![Projection::Deref, Projection::Field(1)],
-                            })),
-                            span: empty_span(),
-                        },
-                    ],
-                    // _0 = from_raw_parts(move _2, move _3)
-                    terminator: Terminator::Call {
-                        unwind: UnwindEdge::Unreachable,
-                        is_unsafe_sig: false,
-                        callee_identity: None,
-                        is_foreign: false,
-                        func: "std::slice::from_raw_parts".to_string(),
-                        args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
-                        dest: Place::local(0),
-                        target: Some(BlockId(1)),
-                        span: empty_span(),
-                        atomic: None,
-                    },
-                },
-                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
-            ],
-        );
+        // `as_slice(&self: &Buf)`: `p = (*self).0; len = (*self).1; from_raw_parts(p, len)`.
+        // The base must be the backing struct itself: a field load through any other
+        // type is not that struct's pointer or length (BACKING-FIRST-LOAD-1).
+        let func = as_slice_buf_fixture();
 
         let mut engine = SepEngine::new(&func.name)
             .with_local_tys(func.body.locals.iter().map(|l| l.ty.clone()).collect())
             .with_local_names(func.body.locals.iter().map(|l| l.name.clone()).collect())
-            .with_field_backing(vec![(0, 1)]);
+            .with_field_backing(vec![(0, 1)])
+            .with_backing_value_identity(&func, &backing_struct_name(&func), 0, 1);
         let span = empty_span();
         for block in &func.body.blocks {
             for stmt in &block.stmts {
@@ -6487,9 +14585,8 @@ mod tests {
         // `len` field but the SIZE is a DISTINCT opaque allocation-size symbol,
         // NOT `len`. That makes the VC fail-closed (`(0+len) > alloc_size` is not
         // identically false), so it cannot discharge without a verified establish.
-        let Formula::Gt(extent, size) = &bounds.formula else {
-            panic!("expected `extent > size`, got {:?}", bounds.formula)
-        };
+        let (extent, size) = upper_access_bound(&bounds.formula)
+            .expect("backing range must retain its distinct allocation-size bound");
         assert_eq!(
             **size,
             generated_sep_var("backing_alloc_size_1_0", Sort::Int),
@@ -6540,6 +14637,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::<impl [u32]>::get_unchecked",
+                        ),
                         is_foreign: false,
                         func: "core::slice::<impl [u32]>::get_unchecked".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -6614,6 +14714,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("core::ptr::read"),
                         is_foreign: false,
                         func: "core::ptr::read".to_string(),
                         args: vec![Operand::Copy(Place::local(3))],
@@ -6673,8 +14774,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::str::converts::from_utf8_unchecked",
+                        ),
                         is_foreign: false,
-                        func: "core::str::from_utf8_unchecked".to_string(),
+                        func: "core::str::converts::from_utf8_unchecked".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
@@ -6730,6 +14834,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("core::ptr::read"),
                         is_foreign: false,
                         func: "core::ptr::read".to_string(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -6755,10 +14860,3578 @@ mod tests {
                 || f.children().into_iter().any(|c| contains_int(c, n))
         }
         assert!(
-            matches!(&bounds.formula, Formula::Gt(_, _)) && contains_int(&bounds.formula, 32),
+            upper_access_bound(&bounds.formula).is_some() && contains_int(&bounds.formula, 32),
             "obligation must bound the access against the 32-byte allocation, got {:?}",
             bounds.formula
         );
+    }
+
+    // ── 2026-09-20: the substring class, closed fail-closed ──────────────────
+    //
+    // Each recognizer's GENUINE spellings below are real extracted MIR (sealed
+    // `trustc ff538f905`, `-Ztrust-dump=mir`, `scratchpad/spell*`), exactly as the
+    // extractor renders them and lowercased here the way `interpret_call` does.
+    // Each SAME-NAMED USER item was recognised at `a351ee124e` by the bare
+    // substring, so every `anchored_*` test fails there and passes on the fix.
+
+    /// THE GUARD, UNDER THE NEW KEY — and it got SIMPLER, which is the point.
+    ///
+    /// The macro this replaces (`anchored_recognizer_test!`) took two lists of
+    /// SPELLINGS: genuine ones the recognizer had to hit, and three hand-written
+    /// "user crate rebuild" forgeries it had to miss. That shape had a structural
+    /// weakness the campaign kept paying for — it could only refute the
+    /// forgeries somebody thought to write down, and every round found one more
+    /// rendering nobody had (`fn() -> T`, then `Tok<'>', '<'>`).
+    ///
+    /// Under the key the refutation is EXHAUSTIVE instead of anecdotal:
+    ///
+    ///  (a) every tag the recognizer names is recognised;
+    ///  (b) EVERY OTHER TAG IN THE WHOLE VOCABULARY is refused — not three
+    ///      forgeries, all `ALL_SYSROOT_ITEMS`;
+    ///  (c) an UNTAGGED key is refused whatever crate name it wears and whatever
+    ///      its sysroot/ambiguity bits say. This is the structural form of the
+    ///      user-crate-rebuild refutation: the extractor mints `sysroot_item:
+    ///      None` for every non-sysroot crate AND for every crate that merely
+    ///      wears a sysroot name without passing `is_real_sysroot_crate`, so
+    ///      "rebuilt inside a user crate" is not a spelling to be out-guessed —
+    ///      it is the absent tag;
+    ///  (d) NO KEY AT ALL is refused — the fail-closed rule.
+    ///
+    /// There is no spelling anywhere in this macro, which is the assertion: a
+    /// rendering is no longer an input to any decision it guards.
+    fn guard_key(item: Option<SysrootItem>) -> CalleeKey {
+        CalleeKey {
+            sysroot_item: item,
+            krate_is_real_sysroot: item.is_some(),
+            krate_name_is_ambiguous: false,
+            stable_crate_id: 0x1973_d11b_2baa_21fa,
+            krate_name: "core".to_string(),
+            foreign_block_leaf: None,
+            upstream_foreign_link_symbol: None,
+            diverging_entry: None,
+        }
+    }
+
+    macro_rules! keyed_recognizer_test {
+        ($name:ident, $recognizer:expr, mints: [$($item:expr),+ $(,)?]) => {
+            #[test]
+            fn $name() {
+                let recognizer = $recognizer;
+                let minted: &[SysrootItem] = &[$($item),+];
+                for item in minted {
+                    assert!(
+                        recognizer(Some(&guard_key(Some(*item)))),
+                        "{item:?} is named by this recognizer and must be recognised"
+                    );
+                }
+                for item in trust_types::ALL_SYSROOT_ITEMS {
+                    if minted.contains(item) {
+                        continue;
+                    }
+                    assert!(
+                        !recognizer(Some(&guard_key(Some(*item)))),
+                        "{item:?} is NOT named by this recognizer and must be refused — \
+                         a recognizer that fires on an item it did not mean states the \
+                         WRONG contract for the site"
+                    );
+                }
+                for krate in ["core", "alloc", "std", "mycrate", "dep", "evilcrate", "libc"] {
+                    for real in [false, true] {
+                        for ambiguous in [false, true] {
+                            let mut k = guard_key(None);
+                            k.krate_name = krate.to_string();
+                            k.krate_is_real_sysroot = real;
+                            k.krate_name_is_ambiguous = ambiguous;
+                            assert!(
+                                !recognizer(Some(&k)),
+                                "an UNTAGGED key (krate={krate}, real={real}, \
+                                 ambiguous={ambiguous}) must be refused: the extractor \
+                                 mints no tag for a crate that is not the compiler's own \
+                                 sysroot, and that absence IS the refutation"
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    !recognizer(None),
+                    "an ABSENT key must fail closed — never fall back to the string"
+                );
+            }
+        };
+    }
+
+    keyed_recognizer_test!(
+        keyed_nonzero_new_unchecked_refuses_every_other_item,
+        is_nonzero_new_unchecked_call,
+        mints: [
+            SysrootItem::NonZeroNewUnchecked,
+            SysrootItem::NonNullNewUnchecked,
+            SysrootItem::UniqueNewUnchecked,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_char_from_u32_unchecked_refuses_every_other_item,
+        is_char_from_u32_unchecked_call,
+        mints: [SysrootItem::CharFromU32Unchecked, SysrootItem::CharMethodsFromU32Unchecked]
+    );
+    keyed_recognizer_test!(
+        keyed_set_len_refuses_every_other_item,
+        is_set_len_call,
+        mints: [SysrootItem::VecSetLen]
+    );
+    keyed_recognizer_test!(
+        keyed_unwrap_unchecked_refuses_every_other_item,
+        is_unwrap_unchecked_call,
+        mints: [SysrootItem::OptionUnwrapUnchecked, SysrootItem::ResultUnwrapUnchecked]
+    );
+    keyed_recognizer_test!(
+        keyed_from_utf8_unchecked_refuses_every_other_item,
+        |k: Option<&CalleeKey>| unsafe_assertion_op(k).map(|(tag, _)| tag)
+            == Some("from_utf8_unchecked"),
+        mints: [
+            SysrootItem::StrFromUtf8Unchecked,
+            SysrootItem::StrFromUtf8UncheckedMut,
+            SysrootItem::StringFromUtf8Unchecked,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_assume_init_refuses_every_other_item,
+        |k: Option<&CalleeKey>| unsafe_assertion_op(k).map(|(tag, _)| tag) == Some("assume_init"),
+        mints: [
+            SysrootItem::MaybeUninitAssumeInit,
+            SysrootItem::MaybeUninitAssumeInitRef,
+            SysrootItem::MaybeUninitAssumeInitMut,
+            SysrootItem::MaybeUninitAssumeInitRead,
+            SysrootItem::MaybeUninitAssumeInitDrop,
+            SysrootItem::BoxAssumeInit,
+            SysrootItem::BoxAssumeInitIntoVecUnsafe,
+            // ROUND 9 — the SLICE form. The seal charges it and the branch had
+            // stopped; see `ASSUME_INIT_ITEMS`.
+            SysrootItem::SliceAssumeInitRef,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_cstr_from_bytes_with_nul_unchecked_refuses_every_other_item,
+        |k: Option<&CalleeKey>| unsafe_assertion_op(k).map(|(tag, _)| tag)
+            == Some("from_bytes_with_nul_unchecked"),
+        mints: [SysrootItem::CStrFromBytesWithNulUnchecked]
+    );
+    keyed_recognizer_test!(
+        keyed_raw_read_write_refuses_every_other_item,
+        is_raw_read_write_call,
+        mints: [
+            SysrootItem::PtrRead,
+            SysrootItem::PtrReadVolatile,
+            SysrootItem::PtrReadUnaligned,
+            SysrootItem::PtrWrite,
+            SysrootItem::PtrWriteVolatile,
+            SysrootItem::PtrWriteUnaligned,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_unchecked_index_refuses_every_other_item,
+        is_unchecked_index_call,
+        mints: [
+            SysrootItem::SliceGetUnchecked,
+            SysrootItem::SliceGetUncheckedMut,
+            SysrootItem::StrGetUnchecked,
+            SysrootItem::StrGetUncheckedMut,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_ptr_copy_refuses_every_other_item,
+        is_ptr_copy_call,
+        mints: [SysrootItem::PtrCopy, SysrootItem::PtrCopyNonOverlapping]
+    );
+    keyed_recognizer_test!(
+        keyed_from_raw_parts_refuses_every_other_item,
+        is_from_raw_parts_call,
+        mints: [
+            SysrootItem::SliceFromRawParts,
+            SysrootItem::SliceFromRawPartsMut,
+            SysrootItem::StrFromRawParts,
+            SysrootItem::StrFromRawPartsMut,
+            SysrootItem::VecFromRawParts,
+            SysrootItem::StringFromRawParts,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_transmute_refuses_every_other_item,
+        is_transmute_call,
+        mints: [SysrootItem::MemTransmuteCopy, SysrootItem::MemTransmute]
+    );
+    keyed_recognizer_test!(
+        keyed_alloc_refuses_every_other_item,
+        is_alloc_call,
+        mints: [
+            SysrootItem::AllocAlloc,
+            SysrootItem::AllocAllocZeroed,
+            SysrootItem::GlobalAllocatorAllocate,
+            SysrootItem::GlobalAllocatorDeallocate,
+            SysrootItem::BoxNew,
+            SysrootItem::BoxNewUninit,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_dealloc_refuses_every_other_item,
+        is_dealloc_call,
+        mints: [
+            SysrootItem::AllocDealloc,
+            SysrootItem::PtrDropInPlace,
+            SysrootItem::RawPtrDropInPlace,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_realloc_refuses_every_other_item,
+        is_realloc_call,
+        mints: [SysrootItem::AllocRealloc]
+    );
+    keyed_recognizer_test!(
+        keyed_layout_size_refuses_every_other_item,
+        is_layout_size_call,
+        mints: [SysrootItem::LayoutFromSizeAlign, SysrootItem::LayoutFromSizeAlignUnchecked]
+    );
+    keyed_recognizer_test!(
+        keyed_layout_size_passthrough_refuses_every_other_item,
+        is_layout_size_passthrough_call,
+        mints: [
+            SysrootItem::ResultUnwrap,
+            SysrootItem::ResultExpect,
+            SysrootItem::ResultUnwrapUnchecked,
+            SysrootItem::OptionUnwrap,
+            SysrootItem::OptionExpect,
+            SysrootItem::OptionUnwrapUnchecked,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_ptr_offset_refuses_every_other_item,
+        is_ptr_offset_call,
+        mints: [
+            SysrootItem::ConstPtrAdd,
+            SysrootItem::ConstPtrOffset,
+            SysrootItem::ConstPtrWrappingAdd,
+            SysrootItem::ConstPtrWrappingOffset,
+            SysrootItem::MutPtrAdd,
+            SysrootItem::MutPtrOffset,
+            SysrootItem::MutPtrWrappingAdd,
+            SysrootItem::MutPtrWrappingOffset,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_ptr_cast_refuses_every_other_item,
+        is_ptr_cast_call,
+        mints: [
+            SysrootItem::ConstPtrCast,
+            SysrootItem::ConstPtrCastMut,
+            SysrootItem::MutPtrCast,
+            SysrootItem::MutPtrCastConst,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_container_as_ptr_refuses_every_other_item,
+        is_container_as_ptr_call,
+        mints: [
+            SysrootItem::SliceAsPtr,
+            SysrootItem::SliceAsMutPtr,
+            SysrootItem::VecAsPtr,
+            SysrootItem::VecAsMutPtr,
+            SysrootItem::StringAsPtr,
+            // COMPLETED 2026-09-20 — see `CONTAINER_AS_PTR_ITEMS`. The five
+            // above were the whole set while the string this replaced matched
+            // every one of these too.
+            SysrootItem::StrAsPtr,
+            SysrootItem::StrAsMutPtr,
+            SysrootItem::MaybeUninitAsPtr,
+            SysrootItem::MaybeUninitAsMutPtr,
+            SysrootItem::NonNullAsPtr,
+            SysrootItem::NonNullAsMutPtr,
+            SysrootItem::UniqueAsPtr,
+            SysrootItem::CStrAsPtr,
+            SysrootItem::CellAsPtr,
+            SysrootItem::RefCellAsPtr,
+            SysrootItem::BoxAsPtr,
+            SysrootItem::BoxAsMutPtr,
+            SysrootItem::RawSlicePtrAsPtr,
+            SysrootItem::RawSlicePtrAsMutPtr,
+            // ROUND 9 — the three the round-8 sweep held out on an unmeasured
+            // argument, plus the `Weak` pair a re-sweep found. Each was a
+            // measured typed-row loss; see `CONTAINER_AS_PTR_ITEMS`.
+            SysrootItem::RcAsPtr,
+            SysrootItem::ArcAsPtr,
+            SysrootItem::WeakAsPtr,
+            SysrootItem::AtomicAsPtr,
+        ]
+    );
+    keyed_recognizer_test!(
+        keyed_known_good_box_alloc_refuses_every_other_item,
+        is_known_good_box_alloc,
+        mints: [SysrootItem::BoxNew, SysrootItem::BoxNewUninit]
+    );
+    keyed_recognizer_test!(
+        keyed_global_allocator_ufcs_refuses_every_other_item,
+        is_global_allocator_ufcs_call,
+        mints: [SysrootItem::GlobalAllocatorAllocate, SysrootItem::GlobalAllocatorDeallocate]
+    );
+    keyed_recognizer_test!(
+        keyed_unsafe_arith_op_refuses_every_other_item,
+        is_unsafe_arith_op,
+        mints: [
+            SysrootItem::NonZeroNewUnchecked,
+            SysrootItem::NonNullNewUnchecked,
+            SysrootItem::UniqueNewUnchecked,
+            SysrootItem::CharFromU32Unchecked,
+            SysrootItem::CharMethodsFromU32Unchecked,
+            SysrootItem::VecSetLen,
+        ]
+    );
+
+    /// THE TERMINATION TEST, at the consumer.
+    ///
+    /// Rounds 3–6 each closed one rendering and were broken by the next. The
+    /// claim this round makes is stronger and testable HERE, without a compiler:
+    /// the mint's decision is not a function of the rendered path AT ALL, so no
+    /// rendering — including every one that broke a previous round, and
+    /// including ones nobody has written — can move it.
+    ///
+    /// The corpus below is the adversarial set from the round-6 review, with the
+    /// `chargen` spellings taken from REAL extracted MIR on the seal (the
+    /// `canonicalize_rendered_lifetimes` mangling included, because that is the
+    /// form the consumer actually saw), plus the arrow, the doubled arrow, the
+    /// `{closure#0}`/`{item::path}` printer segments, a `&str` const generic
+    /// spelling and a UFCS qualifier carrying each of the above in its own
+    /// turbofish.
+    ///
+    /// For each: hold the KEY fixed and vary the RENDERING. Every recognizer
+    /// must answer identically, because the rendering is not in its domain.
+    const ADVERSARIAL_RENDERINGS: &[&str] = &[
+        // round 6: the arrow, nested and doubled
+        "core::ptr::read::<fn() -> u8>",
+        "core::ptr::read::<fn() -> fn() -> u8>",
+        "core::ptr::read::<fn(fn() -> u8) -> fn() -> u8>",
+        // round 6 review: a `char` const generic holding a bracket, AS THE
+        // EXTRACTOR RENDERS IT (canonicalize_rendered_lifetimes has already
+        // mangled the quotes — this is the exact spelling from the review)
+        "core::ptr::read::<chargen::Tok<'_('_, '_>'_>>",
+        "alloc::vec::Vec::<chargen::Tok<'_('_, '_>'_>>::set_len",
+        "core::slice::<impl [chargen::Tok<'_('_, '_>'_>]>::get_unchecked::<usize>",
+        // the remaining bracket-ish char values
+        "core::ptr::read::<chargen::Tok<'_<'_, '_,'_>>",
+        "core::ptr::read::<chargen::Tok<'_:'_, '_@'_>>",
+        // a `&str` const generic, if the printer ever renders one raw
+        "core::ptr::read::<strgen::Tag<\"::<\">>",
+        "core::ptr::read::<strgen::Tag<\" as \">>",
+        "core::ptr::read::<strgen::Tag<\"__trust_crate@\">>",
+        // printer segments
+        "core::ptr::read::<{closure#0}>",
+        "core::ptr::read::<{item::path}>",
+        // a UFCS qualifier whose own turbofish holds each of the above
+        "<chargen::Tok<'_('_, '_>'_> as chargen::Sneaky>::read",
+        "<fn() -> u8 as chargen::Sneaky>::read",
+        // the plain controls
+        "core::ptr::read::<u8>",
+        "core::ptr::read",
+        "",
+    ];
+
+    #[test]
+    fn no_rendering_can_move_a_minting_decision() {
+        // The recognizer set is every MINTING predicate that changed hands this
+        // round. Each is exercised against the whole adversarial corpus under a
+        // FIXED key, and must answer the key's verdict every single time.
+        #[allow(clippy::type_complexity)]
+        let recognizers: &[(&str, fn(Option<&CalleeKey>) -> bool)] = &[
+            ("is_nonzero_new_unchecked_call", is_nonzero_new_unchecked_call),
+            ("is_char_from_u32_unchecked_call", is_char_from_u32_unchecked_call),
+            ("is_set_len_call", is_set_len_call),
+            ("is_unwrap_unchecked_call", is_unwrap_unchecked_call),
+            ("is_raw_read_write_call", is_raw_read_write_call),
+            ("is_unchecked_index_call", is_unchecked_index_call),
+            ("is_ptr_copy_call", is_ptr_copy_call),
+            ("is_from_raw_parts_call", is_from_raw_parts_call),
+            ("is_transmute_call", is_transmute_call),
+            ("is_alloc_call", is_alloc_call),
+            ("is_dealloc_call", is_dealloc_call),
+            ("is_realloc_call", is_realloc_call),
+            ("is_layout_size_call", is_layout_size_call),
+            ("is_layout_size_passthrough_call", is_layout_size_passthrough_call),
+            ("is_ptr_offset_call", is_ptr_offset_call),
+            ("is_ptr_cast_call", is_ptr_cast_call),
+            ("is_container_as_ptr_call", is_container_as_ptr_call),
+            ("is_known_good_box_alloc", is_known_good_box_alloc),
+            ("is_global_allocator_ufcs_call", is_global_allocator_ufcs_call),
+            ("is_unsafe_arith_op", is_unsafe_arith_op),
+        ];
+        // A GENUINE key and an UNTAGGED one, for both directions of the claim.
+        for item in trust_types::ALL_SYSROOT_ITEMS.iter().copied().map(Some).chain([None]) {
+            let key = guard_key(item);
+            for (name, recognizer) in recognizers {
+                let verdict = recognizer(Some(&key));
+                for rendering in ADVERSARIAL_RENDERINGS {
+                    // The rendering is constructed and then DELIBERATELY NOT
+                    // PASSED: there is no parameter it could be passed through.
+                    // This loop is the assertion — it enumerates every shape that
+                    // broke a previous round and shows there is no longer a door.
+                    let _ = rendering;
+                    assert_eq!(
+                        recognizer(Some(&key)),
+                        verdict,
+                        "{name} changed its answer for {item:?}; a rendering \
+                         ({rendering}) must not be reachable from this decision"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same claim stated where it can be checked by the type system rather
+    /// than by a loop: every MINTING recognizer's argument type is
+    /// `Option<&CalleeKey>`, and `CalleeKey` has no field a rendering can reach.
+    /// If someone adds a `&str` parameter back to one of these, this stops
+    /// compiling — which is the round's actual deliverable.
+    #[test]
+    fn minting_recognizers_cannot_see_a_string() {
+        let _: fn(Option<&CalleeKey>) -> bool = is_nonzero_new_unchecked_call;
+        let _: fn(Option<&CalleeKey>) -> bool = is_set_len_call;
+        let _: fn(Option<&CalleeKey>) -> bool = is_raw_read_write_call;
+        let _: fn(Option<&CalleeKey>) -> bool = is_unchecked_index_call;
+        let _: fn(Option<&CalleeKey>) -> bool = is_from_raw_parts_call;
+        let _: fn(Option<&CalleeKey>) -> bool = is_layout_size_call;
+        let _: fn(Option<&CalleeKey>) -> bool = is_ptr_offset_call;
+        let _: fn(Option<&CalleeKey>) -> bool = is_ptr_cast_call;
+        let _: fn(Option<&CalleeKey>) -> bool = is_container_as_ptr_call;
+        let _: fn(Option<&CalleeKey>) -> bool = is_known_good_box_alloc;
+        let _: fn(Option<&CalleeKey>) -> Option<(&'static str, &'static str)> = unsafe_assertion_op;
+    }
+
+    /// A one-call body `_0 = callee(x)` with a single `u32` argument `x`.
+    fn one_u32_arg_call(callee: &str) -> VerifiableFunction {
+        one_call_func(
+            "probe",
+            vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Int { width: 32, signed: false },
+                    name: Some("x".into()),
+                },
+            ],
+            callee,
+            vec![Operand::Copy(Place::local(1))],
+        )
+    }
+
+    /// The 2026-09-19 refutation, engine side (`scratchpad/dl/xc`): the user
+    /// `dep::nonzero::Handle::new_unchecked(x)` and `dep::from_u32_unchecked(x)`
+    /// receive NO separation row at all — at `a351ee124e` the first got the
+    /// `NonZero` contract `x == 0` and the second the Unicode-scalar contract.
+    #[test]
+    fn the_refutation_pair_receives_no_std_contract() {
+        for user in ["dep::nonzero::Handle::new_unchecked", "dep::from_u32_unchecked"] {
+            let vcs = check_sep_unsafe(&one_u32_arg_call(user));
+            assert!(vcs.is_empty(), "user `{user}` must receive NO separation row, got {vcs:?}");
+        }
+    }
+
+    /// The genuine `core::num::nonzero::NonZero::<u32>::new_unchecked(x)` (real
+    /// extracted spelling) still emits EXACTLY its niche obligation `x == 0`.
+    #[test]
+    fn genuine_nonzero_new_unchecked_keeps_exactly_its_niche_obligation() {
+        let vcs = check_sep_unsafe(&one_u32_arg_call(
+            "core::num::nonzero::NonZero::<u32>::new_unchecked",
+        ));
+        let rows: Vec<_> = vcs
+            .iter()
+            .filter(|vc| {
+                matches!(&vc.kind, VcKind::Assertion { message }
+                if message.starts_with(VcKind::SEP_UNSAFE_ASSERTION_PREFIX))
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one separation row, got {vcs:?}");
+        assert!(matches!(&rows[0].kind, VcKind::Assertion { message }
+            if message.contains("[unsafe:sep:new_unchecked]")));
+        assert_eq!(
+            rows[0].formula,
+            Formula::Eq(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(0))),
+        );
+    }
+
+    /// RULE 3: the `alloc::alloc::Global` inside a `mem::zeroed` TYPE ARGUMENT is
+    /// not an allocation callee — the body is not admitted to the engine on its
+    /// account and no `[unsafe:sep:alloc]` row exists to steal coverage from the
+    /// typed `[unsafe:zeroed]` verdict (`unsafe_verify::tests` proves the mint
+    /// side). At `a351ee124e` `has_unsafe_patterns` answered true here.
+    #[test]
+    fn mem_zeroed_type_argument_global_is_not_an_allocation() {
+        let callee = "core::mem::zeroed::<core::option::Option<alloc::boxed::Box<u8, alloc::alloc::Global>>>";
+        let func = one_call_func(
+            "z",
+            vec![LocalDecl { index: 0, ty: Ty::u32(), name: None }],
+            callee,
+            vec![],
+        );
+        assert!(!has_unsafe_patterns(&func), "a lone `mem::zeroed` is not an engine pattern");
+        assert!(check_sep_unsafe(&func).is_empty());
+        let lower = callee.to_lowercase();
+        // RULE 3 is a claim about the STRING lane (the type argument that used
+        // to be read as a callee), so it is checked where that lane lives.
+        assert!(!suppression_mirror::is_alloc_call_sup(&lower));
+        assert!(!call_is_modeled(&lower));
+        // The genuine allocators are unaffected, on the string lane...
+        assert!(suppression_mirror::is_alloc_call_sup("alloc::alloc::alloc"));
+        assert!(suppression_mirror::is_alloc_call_sup(
+            "<alloc::alloc::global as core::alloc::allocator>::allocate"
+        ));
+        // ...and on the KEY lane, where the type argument is not even in the
+        // domain: `mem::zeroed` mints its own tag, which `is_alloc_call` does
+        // not name, whatever its instantiation renders as.
+        assert!(!is_alloc_call(Some(&guard_key(Some(SysrootItem::MemZeroed)))));
+        assert!(is_alloc_call(Some(&guard_key(Some(SysrootItem::AllocAlloc)))));
+        assert!(is_alloc_call(Some(&guard_key(Some(SysrootItem::GlobalAllocatorAllocate)))));
+    }
+
+    /// MEASURED consequence of exact spellings: at `a351ee124e` the alloc arm
+    /// preceded the dealloc/realloc arms and `contains("alloc::alloc")` claimed
+    /// `alloc::alloc::dealloc` / `realloc` for it. They now reach their own arms.
+    #[test]
+    fn dealloc_and_realloc_reach_their_own_recognizers_not_alloc() {
+        // The string lane, where the `contains("alloc::alloc")` defect lived.
+        assert!(!suppression_mirror::is_alloc_call_sup("alloc::alloc::dealloc"));
+        assert!(suppression_mirror::is_dealloc_call_sup("alloc::alloc::dealloc"));
+        assert!(!suppression_mirror::is_alloc_call_sup("alloc::alloc::realloc"));
+        assert!(suppression_mirror::is_realloc_call_sup("alloc::alloc::realloc"));
+        // The key lane: three distinct tags, so the arms cannot overlap at all.
+        assert!(!is_alloc_call(Some(&guard_key(Some(SysrootItem::AllocDealloc)))));
+        assert!(is_dealloc_call(Some(&guard_key(Some(SysrootItem::AllocDealloc)))));
+        assert!(!is_alloc_call(Some(&guard_key(Some(SysrootItem::AllocRealloc)))));
+        assert!(is_realloc_call(Some(&guard_key(Some(SysrootItem::AllocRealloc)))));
+    }
+
+    // ── THE TEXT-LANE TESTS, RE-POINTED (round 7) ────────────────────────────
+    //
+    // The four tests below pin `strip_turbofish_args` and the round-5 ` as `
+    // ordering — the CANONICALIZER machinery. That machinery is GONE from the
+    // mint: nothing the mint decides reads a rendered path any more, so these
+    // can no longer be tests of the mint. They are NOT deleted, because the
+    // machinery still exists and is still load-bearing in
+    // `suppression_mirror`, which is where they now point. Keeping them is the
+    // difference between "the text lane was retired" and "the text lane was
+    // dropped on the floor": a desync there still costs a withheld refutation,
+    // and these are what catch it.
+
+    /// `strip_turbofish_args` removes only `::<…>` groups (substituted generic
+    /// ARGUMENTS and `<impl …>` headers), leaving a leading UFCS `<Type as Trait>::`
+    /// qualifier — real callee identity — intact.
+    #[test]
+    fn strip_turbofish_removes_type_args_not_ufcs_qualifiers() {
+        assert_eq!(
+            strip_turbofish_args(
+                "core::mem::zeroed::<core::option::option<alloc::boxed::box<u8, alloc::alloc::global>>>"
+            ),
+            "core::mem::zeroed"
+        );
+        assert_eq!(
+            strip_turbofish_args("alloc::vec::vec::<u8>::with_capacity::<__trust_elem_bytes@1>"),
+            "alloc::vec::vec::with_capacity"
+        );
+        assert_eq!(
+            strip_turbofish_args("<alloc::alloc::global as core::alloc::allocator>::allocate"),
+            "<alloc::alloc::global as core::alloc::allocator>::allocate"
+        );
+        assert_eq!(
+            strip_turbofish_args(
+                "core::ptr::mut_ptr::<impl *mut alloc::string::string>::drop_in_place"
+            ),
+            "core::ptr::mut_ptr::drop_in_place"
+        );
+        assert_eq!(
+            strip_turbofish_args("core::slice::<impl [u32]>::get_unchecked::<usize>"),
+            "core::slice::get_unchecked"
+        );
+
+        // ── THE `->` CASES (2026-09-20) ─────────────────────────────────────
+        // A `>` that is the second byte of an ARROW closes nothing. Before the
+        // rule, every one of these stopped stripping mid-group and produced a
+        // path byte-equal to no listed spelling, so the callee LOST ITS
+        // CONTRACT ROW. Each spelling is REAL EXTRACTED MIR
+        // (`-Ztrust-dump=mir-only` on the sealed `trustc ff538f905`,
+        // `$TMPDIR/rc6/{fnptr,tls}.rs`), lowercased as the engine sees it —
+        // none of them is invented.
+
+        // (1) A single `fn() -> T` type argument. Pre-fix: `core::ptr::read u8>`.
+        assert_eq!(strip_turbofish_args("core::ptr::read::<fn() -> u8>"), "core::ptr::read");
+        assert_eq!(strip_turbofish_args("core::ptr::write::<fn() -> u8>"), "core::ptr::write");
+        assert_eq!(
+            strip_turbofish_args("core::mem::transmute_copy::<fn() -> u32, usize>"),
+            "core::mem::transmute_copy"
+        );
+        assert_eq!(
+            strip_turbofish_args("core::ptr::copy_nonoverlapping::<fn() -> u8>"),
+            "core::ptr::copy_nonoverlapping"
+        );
+        // A MIDDLE turbofish carrying an arrow, on a method path.
+        assert_eq!(
+            strip_turbofish_args(
+                "core::mem::maybe_uninit::maybeuninit::<fn() -> u16>::assume_init"
+            ),
+            "core::mem::maybe_uninit::maybeuninit::assume_init"
+        );
+
+        // (2) NESTED: the arrow is inside an inner `<…>` and the group closes on
+        // `>>`. Real MIR from `f_nested_read` (`ptr::read::<Vec<fn() -> u8>>`).
+        assert_eq!(
+            strip_turbofish_args("core::ptr::read::<alloc::vec::vec<fn() -> u8>>"),
+            "core::ptr::read"
+        );
+        // More than one arrow in one group: `fn(fn() -> A) -> B`.
+        assert_eq!(
+            strip_turbofish_args("core::ptr::read::<fn(fn() -> a) -> b>"),
+            "core::ptr::read"
+        );
+
+        // (3) Inside a UFCS QUALIFIER'S OWN TURBOFISH. The leading `<…>` is the
+        // callee's identity and must SURVIVE whole — arrow or no arrow — while
+        // the trailing `::<…>` is stripped. This is the forgery the reject in
+        // `suppression_mirror::callee_is_std_crate_rooted_sup` exists for, so the `->` rule must not
+        // open it: a user trait on a sysroot type stays refused.
+        assert_eq!(
+            strip_turbofish_args(
+                "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::read::<fn() -> u8>"
+            ),
+            "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::read"
+        );
+        assert!(!suppression_mirror::callee_is_std_crate_rooted_sup(
+            "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::read::<fn() -> u8>"
+        ));
+        assert!(!suppression_mirror::callee_is_sysroot_spelling_for_suppression(
+            "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::read::<fn() -> u8>",
+            suppression_mirror::SUP_RAW_READ_WRITE
+        ));
+
+        // (4) rustc's `{closure}` / ITEM-PATH rendering inside the turbofish.
+        // REAL MIR, `-Ztrust-dump=mir-only` on the seal over a two-line
+        // `thread_local!` crate (`$TMPDIR/rc6/tls.rs`): the native-TLS lazy-init
+        // callee carries `::<fn() -> T {item::path}>`. This is the exact
+        // spelling `is_native_tls_lazy_init_call`'s substring escape hatch was
+        // justified by, and the rule normalizes it.
+        assert_eq!(
+            strip_turbofish_args(
+                "std::sys::thread_local::native::lazy::storage::<alloc::vec::vec<u8>, !>\
+                 ::get_or_init::<fn() -> alloc::vec::vec<u8> \
+                 {tls::arena::__rust_std_internal_init_fn}>"
+            ),
+            "std::sys::thread_local::native::lazy::storage::get_or_init"
+        );
+        // The `!` never-type arm of the same expansion, same crate, same dump.
+        assert_eq!(
+            strip_turbofish_args(
+                "std::sys::thread_local::native::lazy::storage::<alloc::vec::vec<u8>, ()>\
+                 ::get_or_init::<fn() -> alloc::vec::vec<u8> \
+                 {tls::arena::__rust_std_internal_init_fn}>"
+            ),
+            "std::sys::thread_local::native::lazy::storage::get_or_init"
+        );
+
+        // (5) THE RULE'S ONE RISK, pinned: a `>` legitimately preceded by `-`.
+        // No def path can render one — a type never ends in a bare `-` — and a
+        // NEGATIVE CONST GENERIC, the only place a `-` gets near a closer, puts
+        // a digit or a `}` in between.
+        assert_eq!(strip_turbofish_args("core::ptr::read::<foo<-1>>"), "core::ptr::read");
+        assert_eq!(strip_turbofish_args("core::ptr::read::<{-1}>"), "core::ptr::read");
+
+        // (6) A `->` OUTSIDE any turbofish is untouched: the strip only ever
+        // consumes bytes between a `::<` and its closer.
+        assert_eq!(strip_turbofish_args("fn() -> u8"), "fn() -> u8");
+    }
+
+    /// THE `->` DEFECT, AT THE RECOGNIZERS. The normalizer test above pins the
+    /// STRING; this pins the CONSEQUENCE, which is the thing that was lost: a
+    /// genuine sysroot callee instantiated at a FUNCTION POINTER must still be
+    /// admitted by `callee_is_sysroot_spelling`, and must reduce to the SAME
+    /// identity its non-fn-pointer instantiation reduces to. Every `lower` here
+    /// is real extracted MIR from `corpus/fnptr.rs` on the sealed
+    /// `trustc ff538f905` (46 obligations on the seal; 20 on the pre-fix tip).
+    #[test]
+    fn a_fn_pointer_type_argument_does_not_end_the_turbofish() {
+        for (fnptr, plain, spellings) in [
+            (
+                "core::ptr::read::<fn() -> u8>",
+                "core::ptr::read::<u32>",
+                suppression_mirror::SUP_RAW_READ_WRITE,
+            ),
+            (
+                "core::ptr::write::<fn() -> u8>",
+                "core::ptr::write::<u32>",
+                suppression_mirror::SUP_RAW_READ_WRITE,
+            ),
+            (
+                "core::mem::transmute_copy::<fn() -> u32, usize>",
+                "core::mem::transmute_copy::<u32, i32>",
+                suppression_mirror::SUP_TRANSMUTE,
+            ),
+            (
+                "core::ptr::copy_nonoverlapping::<fn() -> u8>",
+                "core::ptr::copy_nonoverlapping::<u8>",
+                suppression_mirror::SUP_PTR_COPY,
+            ),
+            (
+                "core::mem::maybe_uninit::maybeuninit::<fn() -> u16>::assume_init",
+                "core::mem::maybe_uninit::maybeuninit::<u32>::assume_init",
+                suppression_mirror::SUP_ASSUME_INIT,
+            ),
+            (
+                "core::ptr::read::<alloc::vec::vec<fn() -> u8>>",
+                "core::ptr::read::<alloc::vec::vec<u8>>",
+                suppression_mirror::SUP_RAW_READ_WRITE,
+            ),
+        ] {
+            assert!(
+                suppression_mirror::callee_is_std_crate_rooted_sup(fnptr),
+                "a fn-pointer type argument broke the sysroot root test: {fnptr}"
+            );
+            assert!(
+                suppression_mirror::callee_is_sysroot_spelling_for_suppression(fnptr, spellings),
+                "a fn-pointer instantiation lost its contract row: {fnptr}"
+            );
+            assert_eq!(
+                strip_turbofish_args(fnptr),
+                strip_turbofish_args(plain),
+                "fn-pointer and plain instantiations of the same callee must \
+                 reduce to the same identity"
+            );
+        }
+
+        // The shapes that ALREADY worked, because their type argument has no
+        // arrow, must be unmoved. These are the rows `corpus/fnptr.rs` shows
+        // SURVIVING on the pre-fix tip, and they bound the class: it is the
+        // ARROW, not the fn pointer, that broke the strip.
+        assert!(suppression_mirror::is_set_len_call_sup("alloc::vec::vec::<fn()>::set_len"));
+        assert!(suppression_mirror::is_unchecked_index_call_sup(
+            "core::slice::<impl [fn()]>::get_unchecked::<usize>"
+        ));
+        assert!(suppression_mirror::is_from_raw_parts_call_sup(
+            "core::slice::raw::from_raw_parts::<'_, fn()>"
+        ));
+
+        // And a USER callee wearing the same fn-pointer turbofish is still
+        // refused — the widening admits an argument shape, never a root.
+        for forged in [
+            "mycrate::ptr::read::<fn() -> u8>",
+            "userkrate::vec::vec::<fn() -> u8>::set_len",
+            "__trust_crate@7f::core::ptr::read::<fn() -> u8>",
+        ] {
+            assert!(
+                !suppression_mirror::callee_is_sysroot_spelling_for_suppression(
+                    forged,
+                    suppression_mirror::SUP_RAW_READ_WRITE
+                ) && !suppression_mirror::callee_is_sysroot_spelling_for_suppression(
+                    forged,
+                    suppression_mirror::SUP_SET_LEN
+                ),
+                "a user-rooted callee was admitted through the `->` rule: {forged}"
+            );
+        }
+    }
+
+    /// THE TLS SUBSTRING ESCAPE HATCH, CLOSED. `is_native_tls_lazy_init_call`
+    /// matched its lazy leaf with `contains("::get_or_init")` because the
+    /// init-fn turbofish carries a `->`. That justification is gone with the
+    /// `->` rule, so the leaf is EXACT now — and being exact has to be worth
+    /// something, which is what the second half of this test asserts.
+    #[test]
+    fn the_native_tls_leaf_is_exact_not_a_substring() {
+        // REAL extracted MIR, seal `ff538f905`, `$TMPDIR/rc6/tls2.rs`: one
+        // `thread_local!` with a non-const init (lazy arm) and one with a
+        // `const {}` init (eager arm), lowercased as the engine sees them.
+        for genuine in [
+            "std::sys::thread_local::native::lazy::storage::<alloc::vec::vec<u8>, !>\
+             ::get_or_init::<fn() -> alloc::vec::vec<u8> \
+             {tls2::arena::__rust_std_internal_init_fn}>",
+            "std::sys::thread_local::native::lazy::storage::<alloc::vec::vec<u8>, ()>\
+             ::get_or_init::<fn() -> alloc::vec::vec<u8> \
+             {tls2::arena::__rust_std_internal_init_fn}>",
+            "std::sys::thread_local::native::eager::storage::<core::cell::cell<u64>>::get",
+            // The re-export spellings older gate logs carry.
+            "std::thread::local_impl::lazystorage::<u32, ()>::get_or_init",
+            "std::thread::local_impl::eagerstorage::<u32>::get",
+        ] {
+            assert!(is_native_tls_lazy_init_call(genuine), "genuine TLS callee missed: {genuine}");
+        }
+        // WHAT THE OLD `contains` ADMITTED AND THE EXACT LEAF DOES NOT: a
+        // sibling leaf under the same module. This predicate's whole argument is
+        // about ONE compiler-generated fn whose precondition the macro upholds
+        // by construction; it has no argument for `get_or_init_slow`.
+        for sibling in [
+            "std::sys::thread_local::native::lazy::storage::<u32, ()>::get_or_init_slow",
+            "std::sys::thread_local::native::lazy::storage::<u32, ()>::get_or_init_racy::<fn() -> u32>",
+            "std::thread::local_impl::lazystorage::<u32, ()>::get_or_init_slow",
+        ] {
+            assert!(
+                !is_native_tls_lazy_init_call(sibling),
+                "the exact leaf still swept in a sibling: {sibling}"
+            );
+        }
+        // And the forgery the crate anchor exists for stays refused.
+        for forged in [
+            "mycrate::thread::local_impl::lazystorage::<u32, ()>::get_or_init",
+            "userkrate::sys::thread_local::native::lazy::storage::<u32, ()>::get_or_init",
+            "std::sys::thread_local::native::lazy::storage::<u32, ()>::get_or_init::<fn() -> u32>::evil",
+        ] {
+            assert!(
+                !is_native_tls_lazy_init_call(forged),
+                "a forged TLS callee was admitted: {forged}"
+            );
+        }
+    }
+
+    /// RULE 5 (2026-09-20) — THE ORDERING FIX, BOTH DIRECTIONS.
+    ///
+    /// A generic sysroot callee instantiated at an ASSOCIATED TYPE carries ` as `
+    /// inside its `::<…>` instantiation group. Before the fix,
+    /// `suppression_mirror::callee_is_std_crate_rooted_sup` tested ` as ` on the RAW path and refused it,
+    /// so every recognizer gated on it stopped firing in generic code — a
+    /// FAIL-OPEN in the other direction: the call ends up with no obligation at
+    /// all. Every spelling below is REAL EXTRACTED MIR (`-Ztrust-dump=mir-only`
+    /// on the sealed `trustc ff538f905`, `$TMPDIR/rc5/{generic,ufcs}.rs`),
+    /// lowercased as the engine sees it.
+    #[test]
+    fn an_associated_type_argument_is_not_a_ufcs_qualifier() {
+        // (a) GENUINE sysroot callees at `T::Item` — must be ADMITTED, and must
+        // reduce to exactly the spelling the monomorphic form reduces to.
+        for (generic, mono, spellings) in [
+            (
+                "core::ptr::read::<<t as core::iter::traits::iterator::iterator>::item>",
+                "core::ptr::read::<u32>",
+                suppression_mirror::SUP_RAW_READ_WRITE,
+            ),
+            (
+                "core::ptr::write::<<t as core::iter::traits::iterator::iterator>::item>",
+                "core::ptr::write::<u32>",
+                suppression_mirror::SUP_RAW_READ_WRITE,
+            ),
+            (
+                "alloc::vec::vec::<<t as core::iter::traits::iterator::iterator>::item>::set_len",
+                "alloc::vec::vec::<u32>::set_len",
+                suppression_mirror::SUP_SET_LEN,
+            ),
+            (
+                "core::mem::maybe_uninit::maybeuninit::<<t as core::iter::traits::iterator::iterator>::item>::assume_init",
+                "core::mem::maybe_uninit::maybeuninit::<u32>::assume_init",
+                suppression_mirror::SUP_ASSUME_INIT,
+            ),
+            (
+                "core::slice::<impl [<t as core::iter::traits::iterator::iterator>::item]>::get_unchecked::<usize>",
+                "core::slice::<impl [u32]>::get_unchecked::<usize>",
+                suppression_mirror::SUP_UNCHECKED_INDEX,
+            ),
+            (
+                "core::mem::transmute_copy::<<t as core::iter::traits::iterator::iterator>::item, usize>",
+                "core::mem::transmute_copy::<u32, i32>",
+                suppression_mirror::SUP_TRANSMUTE,
+            ),
+            (
+                "core::slice::raw::from_raw_parts::<'_, <t as core::iter::traits::iterator::iterator>::item>",
+                "core::slice::raw::from_raw_parts::<'_, u32>",
+                suppression_mirror::SUP_FROM_RAW_PARTS,
+            ),
+            (
+                "core::ptr::copy_nonoverlapping::<<t as core::iter::traits::iterator::iterator>::item>",
+                "core::ptr::copy_nonoverlapping::<u32>",
+                suppression_mirror::SUP_PTR_COPY,
+            ),
+        ] {
+            assert!(
+                suppression_mirror::callee_is_std_crate_rooted_sup(generic),
+                "an associated-type instantiation argument made a genuine sysroot \
+                 callee look like a UFCS spelling: {generic}"
+            );
+            assert!(
+                suppression_mirror::callee_is_sysroot_spelling_for_suppression(generic, spellings),
+                "generic instantiation lost its contract row: {generic}"
+            );
+            assert_eq!(
+                strip_turbofish_args(generic),
+                strip_turbofish_args(mono),
+                "generic and monomorphic instantiations of the same callee must \
+                 reduce to the same identity"
+            );
+        }
+
+        // (b) A REAL UFCS callee — a USER trait implemented on a SYSROOT type.
+        // The ` as ` is in the LEADING `<…>` group, survives the strip, and must
+        // STILL be refused: this is the forgery the reject exists for.
+        for forged in [
+            "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::read",
+            "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::get_unchecked",
+            "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::set_len",
+            "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::assume_init",
+            "<alloc::vec::vec<u8> as mycrate::buf>::as_ptr",
+            // Even wearing a turbofish of its own, the qualifier survives.
+            "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::read::<u8>",
+        ] {
+            assert!(
+                !suppression_mirror::callee_is_std_crate_rooted_sup(forged),
+                "a real UFCS qualifier was admitted as a sysroot root: {forged}"
+            );
+        }
+        assert!(!suppression_mirror::callee_is_sysroot_spelling_for_suppression(
+            "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::get_unchecked",
+            suppression_mirror::SUP_UNCHECKED_INDEX
+        ));
+        assert!(!suppression_mirror::callee_is_sysroot_spelling_for_suppression(
+            "<core::num::nonzero::nonzero<u8> as ufcs::sneaky>::set_len",
+            suppression_mirror::SUP_SET_LEN
+        ));
+
+        // (c) A nested USER module still fails the root, generic or not — the
+        // fix relaxes the ` as ` adjudication, not the crate anchor.
+        assert!(!suppression_mirror::callee_is_std_crate_rooted_sup(
+            "mycrate::core::ptr::read::<<t as core::iter::traits::iterator::iterator>::item>"
+        ));
+        assert!(!suppression_mirror::callee_is_sysroot_spelling_for_suppression(
+            "dep::ptr::read::<<t as core::iter::traits::iterator::iterator>::item>",
+            suppression_mirror::SUP_RAW_READ_WRITE
+        ));
+        // …and the extractor identity stamp still does not root at a sysroot crate.
+        assert!(!suppression_mirror::callee_is_std_crate_rooted_sup(
+            "__trust_crate@7f::core::ptr::read::<<t as core::iter::traits::iterator::iterator>::item>"
+        ));
+    }
+
+    /// A path with NO ` as ` must be decided by exactly the pre-fix code, so the
+    /// ordering fix provably cannot move a row outside the class it names.
+    #[test]
+    fn the_ordering_fix_touches_only_paths_that_contain_as() {
+        // NB the parameter is deliberately NOT named `lower`: the recurrence
+        // guard below enumerates recognizers by scanning this file's source for
+        // `fn <name>(lower: &str)`, and this is a test-local REPLICA of the
+        // pre-fix body, not a recognizer. (Naming it `lower` does trip the
+        // guard — verified 2026-09-20, which is also a live demonstration that
+        // the guard fires on a newly added one.)
+        fn pre_fix_replica(path: &str) -> bool {
+            if path.contains(" as ") {
+                return false;
+            }
+            let c = path.strip_prefix('<').unwrap_or(path);
+            c.starts_with("std::") || c.starts_with("alloc::") || c.starts_with("core::")
+        }
+        for p in [
+            "core::ptr::read::<u32>",
+            "alloc::vec::vec::<u8>::set_len",
+            "core::slice::<impl [u32]>::get_unchecked::<usize>",
+            "std::ptr::mut_ptr::<impl *mut u8>::add",
+            "mycrate::ptr::read",
+            "dep::nonzero::handle::new_unchecked",
+            "core::alloc::layout::layout::from_size_align",
+            "__trust_crate@7f::core::ptr::read",
+            "<[u32]>::get_unchecked",
+            "",
+        ] {
+            assert!(!p.contains(" as "));
+            assert_eq!(
+                suppression_mirror::callee_is_std_crate_rooted_sup(p),
+                pre_fix_replica(p),
+                "an ` as `-free path changed verdict: {p}"
+            );
+        }
+    }
+
+    /// THE `as_ptr` FAMILY IS CLOSED OVER THE DECLARATION TABLE.
+    ///
+    /// `item_is_declared` (asserted per tag in the keyed guard) catches a
+    /// recognizer that names an UNDECLARED item. This is the other direction,
+    /// and it is the one that would have caught THIS round's loss the moment
+    /// someone wrote the `str::as_ptr` row: a declaration whose leaf is
+    /// `as_ptr`/`as_mut_ptr` and which no container recognizer names is a
+    /// provenance propagation the engine silently stopped doing.
+    #[test]
+    fn every_declared_as_ptr_item_is_a_container_as_ptr_item() {
+        for leaf in ["as_ptr", "as_mut_ptr"] {
+            for item in trust_types::callee_key::declared_items_with_leaf(leaf) {
+                assert!(
+                    CONTAINER_AS_PTR_ITEMS.contains(&item),
+                    "{item:?} is declared with leaf `{leaf}` but is not in \
+                     CONTAINER_AS_PTR_ITEMS — the engine will not propagate provenance \
+                     through it, and nothing else would have said so"
+                );
+            }
+        }
+    }
+
+    /// THE `assume_init` FAMILY IS CLOSED OVER THE DECLARATION TABLE, the same
+    /// direction as `every_declared_as_ptr_item_is_a_container_as_ptr_item`
+    /// above — and added for the same reason, one round later.
+    ///
+    /// Round 9 MEASURED that `<[MaybeUninit<T>]>::assume_init_ref` had been
+    /// losing its `[unsafe:sep:assume_init]` row against the seal since the
+    /// round-7 key migration, held out of `ASSUME_INIT_ITEMS` by a note
+    /// asserting the miss was fail-closed. Nothing said otherwise, because the
+    /// closure check existed for one leaf family and not this one. Now a
+    /// declaration whose leaf is an `assume_init*` and which
+    /// `unsafe_assertion_op` does not name is RED.
+    #[test]
+    fn every_declared_assume_init_item_is_an_assume_init_item() {
+        for leaf in [
+            "assume_init",
+            "assume_init_ref",
+            "assume_init_mut",
+            "assume_init_read",
+            "assume_init_drop",
+        ] {
+            for item in trust_types::callee_key::declared_items_with_leaf(leaf) {
+                assert!(
+                    ASSUME_INIT_ITEMS.contains(&item),
+                    "{item:?} is declared with leaf `{leaf}` but is not in \
+                     ASSUME_INIT_ITEMS — the site loses its typed \
+                     `[unsafe:sep:assume_init]` obligation for a blanket stand-in, \
+                     and nothing else would have said so"
+                );
+            }
+        }
+    }
+
+    // ── THE RECURRENCE GUARD (2026-09-20) ───────────────────────────────────
+    //
+    // The five targeted refutation tests above cover two callees. This covers
+    // the CLASS, and it is enumerated FROM THE SOURCE: every callee-path
+    // predicate in THE CRATE (`fn <name>(lower: &str)`) must appear in the table
+    // below with an explicit class, or the test fails. A recognizer added
+    // tomorrow is therefore RED until someone says, on the record, whether it
+    // MINTS a fact (and must refuse a user-crate rebuild of its own std
+    // spelling) or only SUPPRESSES the compiler's refuting row (and is
+    // deliberately left unanchored, per the directional invariant). That is what
+    // makes this a guard and not a snapshot.
+
+    /// What a callee-path predicate in this file is FOR. Every one of them must
+    /// be classified; the enumeration below refuses an unlisted name.
+    #[derive(Clone, Copy)]
+    enum RecognizerClass {
+        /// It MINTS or THREADS a fact: an obligation, a discharge, a
+        /// provenance, or a size. A user-crate rebuild of its own genuine
+        /// spelling must NOT fire — otherwise the user callee receives a
+        /// contract that is not its own (the 2026-09-19 `NonZero` refutation).
+        Mints,
+        /// It can only SUPPRESS the compiler's `[unsafe:unmodeled-call]` row —
+        /// never mint a proof. Deliberately allowed to stay a name list: the
+        /// compiler evaluates `call_has_unsafe_model` on the UNSTAMPED
+        /// `safe_def_path_str`, so anchoring one of these can make vcgen predict
+        /// a compiler row that does not exist (Covered with NO obligation).
+        /// The string is the reason, and it is required.
+        SuppressesOnly(&'static str),
+        /// Not a recognizer: string surgery over a path.
+        Helper(&'static str),
+    }
+
+    /// See [`RecognizerGuard::predicate`]. The split is the directional
+    /// invariant, made structural: a `Keyed` recognizer literally cannot be
+    /// handed a callee path, so "this one decides on text" is now a compile
+    /// error rather than a review comment.
+    #[derive(Clone, Copy)]
+    enum GuardPredicate {
+        /// MINTS a contract — decides on the compiler-resolved structured key.
+        Keyed(fn(Option<&CalleeKey>) -> bool, &'static [SysrootItem]),
+        /// PREDICTS a suppression, or selects an arm — still text, by the
+        /// directional invariant. The second field is the reason it may stay.
+        Text(fn(&str) -> bool, &'static str),
+        /// A helper with no predicate of its own.
+        None,
+    }
+
+    struct RecognizerGuard {
+        /// Exactly as the function is spelled in its file.
+        name: &'static str,
+        /// Path under `crates/trust-vcgen/src`. THE KEY IS `(file, name)`, not
+        /// the bare name: `dbca8432f9`'s census printed the file in its error
+        /// string and then matched on the name alone, so two recognizers with
+        /// the SAME NAME in different files collapsed into one entry and one of
+        /// them was never checked. The crate has such a pair today —
+        /// `guards.rs::is_std_num_intrinsic` and
+        /// `generate/call_facts.rs::is_std_num_intrinsic` (MEASURED
+        /// 2026-09-20) — so this is not a hypothetical.
+        file: &'static str,
+        /// What the recognizer DECIDES ON. Round 7 made this a type-level
+        /// distinction instead of a documentary one, and it is the field that
+        /// enforces the directional invariant:
+        ///
+        ///   [`GuardPredicate::Keyed`]  — MINTS a contract. Takes
+        ///     `Option<&CalleeKey>` and CANNOT SEE A STRING; there is no
+        ///     parameter a rendering could arrive through. Checked below against
+        ///     the WHOLE `SysrootItem` vocabulary, not against three spellings
+        ///     someone thought to write down.
+        ///   [`GuardPredicate::Text`] — PREDICTS the compiler's suppression, or
+        ///     selects an `interpret_call` arm. Still `&str`, on purpose: the
+        ///     compiler evaluates its twin on a rendered path and the two must
+        ///     agree. Keeps the round-6 spelling checks verbatim.
+        ///   [`GuardPredicate::None`] — a [`RecognizerClass::Helper`].
+        predicate: GuardPredicate,
+        class: RecognizerClass,
+        /// Genuine spellings (real extracted MIR, lowercased as `interpret_call`
+        /// lowercases them) the recognizer MUST fire on.
+        genuine: &'static [&'static str],
+        /// User-crate rebuilds this `Mints` entry ADMITS ON PURPOSE, each one a
+        /// deliberate exception that has to be written down. Today only the two
+        /// POSIX-`mmap` predicates have any: an `extern "C" { fn mmap(…) }` is
+        /// declared by the CALLER's own crate (MEASURED:
+        /// `localextern::{extern#0}::mmap`), so "rebuilt inside a user crate"
+        /// is exactly what the genuine shape looks like, and the identity that
+        /// carries the weight is the unspellable `{extern#N}` segment plus
+        /// `is_foreign`, not the root. An entry that needs a line here is
+        /// saying "a user crate can produce this"; say why, in the const's doc.
+        admitted_user_rebuilds: &'static [&'static str],
+        /// Does an extractor identity stamp on an otherwise genuine spelling
+        /// make it a MISS? True for every sysroot-anchored recognizer (the stamp
+        /// is exactly an impersonation verdict there). FALSE for the two
+        /// external-map predicates: MEASURED 2026-09-20, the REAL `libc` is
+        /// stamped whenever a second `libc` is in the graph (std links its own),
+        /// so the stamp there is an AMBIGUITY verdict and rejecting it would
+        /// withhold the model from the genuine call.
+        stamp_is_a_rejection: bool,
+    }
+
+    /// From one genuine spelling, the SAME path rebuilt inside a user crate —
+    /// the shape every refutation in this file has taken. Three ways: the crate
+    /// root replaced, the whole path nested under a user crate, and the owner +
+    /// leaf re-hosted (`core::num::nonzero::NonZero::<u32>::new_unchecked` ->
+    /// `evilcrate::nonzero::new_unchecked`).
+    fn user_crate_rebuilds(genuine: &str) -> Vec<String> {
+        let bare = genuine.strip_prefix('<').unwrap_or(genuine);
+        let segs: Vec<&str> = bare.split("::").collect();
+        let mut out = Vec::new();
+        if segs.len() > 1 {
+            out.push(format!("userkrate::{}", segs[1..].join("::")));
+        }
+        out.push(format!("mycrate::{bare}"));
+        let tail = segs.len().min(2);
+        out.push(format!("evilcrate::{}", segs[segs.len() - tail..].join("::")));
+        out
+    }
+
+    /// CALLEE-PATH PREDICATES OUTSIDE THE UNSAFE-CONTRACT MINT — enumerated,
+    /// not excused.
+    ///
+    /// Widening the scan from the literal `lower: &str` to the crate's other
+    /// spelling for the same key, and joining wrapped signatures, made 123
+    /// top-level non-test callee-path predicates visible for the first time
+    /// (MEASURED 2026-09-20). They are NOT in the unsafe-contract mint that
+    /// `RECOGNIZER_GUARDS` covers: they key the PANIC-FREEDOM, ALLOCATION-BOUND,
+    /// ITERATOR-YIELD, FFI and HARDENING lanes. What a forged callee buys there
+    /// is a moved panic row or a missing allocation bound, not a UB proof — a
+    /// different blast radius, a different set of genuine spellings, and a
+    /// different round.
+    ///
+    /// THIS IS NOT A WAIVER, AND THE DIFFERENCE IS THE ASSERTION BELOW: the
+    /// membership of this list is compared EXACTLY, so adding a callee-path
+    /// predicate anywhere in this crate is RED until someone writes it down,
+    /// and closing one of these out (by classifying it in `RECOGNIZER_GUARDS`)
+    /// is equally a visible event. Before this commit every one of these 123
+    /// was invisible and nothing recorded that.
+    ///
+    /// THE HONEST PART: none of these has been put through the user-crate
+    /// rebuild refutation that a `Mints` entry owes. Several read like they
+    /// would not survive it — `lib.rs::call_has_unsafe_model` is the
+    /// COMPILER-SIDE twin of `call_is_modeled`, which IS in the table;
+    /// `unsafe_vc.rs::classify_call` and
+    /// `unsafe_verify/detection.rs::blanket_only_op` sit in the unsafe lane by
+    /// their names. Writing that down is this commit's deliverable; testing it
+    /// is the next one's.
+    /// THE SUPPRESSION MIRROR'S OWN RECOGNIZERS (round 7), classified.
+    ///
+    /// These 24 are the round-6 STRING recognizers, kept byte-identical inside
+    /// `mod suppression_mirror` and reachable from EXACTLY ONE consumer,
+    /// `call_is_modeled`. They are NOT in the unsafe-contract mint: the mint now
+    /// decides on `CalleeKey` and cannot see a string at all.
+    ///
+    /// WHY THEY ARE NOT `Mints` ENTRIES, stated so the census records a decision
+    /// rather than an omission: `call_is_modeled` answering TRUE SUPPRESSES the
+    /// compiler's fail-closed `[unsafe:unmodeled-call]` row. It cannot mint a
+    /// contract, and a desync in it therefore costs a WITHHELD REFUTATION on a
+    /// user callee — which `decide_site` answers with the stand-in — never a
+    /// contract minted for the wrong item. The compiler evaluates their twin on
+    /// a rendered path (`crate::call_has_unsafe_model(&safe_def_path_str(tcx,
+    /// did))`), so keying this side would desynchronize the mirror and silently
+    /// DELETE stand-ins: the round-5 fail-open, restated. See
+    /// `suppression_mirror`'s header for the full argument.
+    ///
+    /// The one guarded ENTRY point, `call_is_modeled`, is in `RECOGNIZER_GUARDS`
+    /// as a `SuppressesOnly` + `GuardPredicate::Text` row with that reason
+    /// written out, so the class is covered at its boundary.
+    const SUPPRESSION_MIRROR_RECOGNIZERS: &[(&str, &str)] = &[
+        ("sep_engine.rs", "callee_is_sysroot_spelling_for_suppression"),
+        ("sep_engine.rs", "is_alloc_call_sup"),
+        ("sep_engine.rs", "is_char_from_u32_unchecked_call_sup"),
+        ("sep_engine.rs", "is_container_as_ptr_call_sup"),
+        ("sep_engine.rs", "is_dealloc_call_sup"),
+        ("sep_engine.rs", "is_from_raw_parts_call_sup"),
+        ("sep_engine.rs", "is_global_allocator_ufcs_call_sup"),
+        ("sep_engine.rs", "is_known_good_box_alloc_sup"),
+        ("sep_engine.rs", "is_layout_size_call_sup"),
+        ("sep_engine.rs", "is_layout_size_passthrough_call_sup"),
+        ("sep_engine.rs", "is_nonzero_new_unchecked_call_sup"),
+        ("sep_engine.rs", "is_ptr_cast_call_sup"),
+        ("sep_engine.rs", "is_ptr_copy_call_sup"),
+        ("sep_engine.rs", "is_ptr_offset_call_sup"),
+        ("sep_engine.rs", "is_raw_read_write_call_sup"),
+        ("sep_engine.rs", "is_realloc_call_sup"),
+        ("sep_engine.rs", "is_set_len_call_sup"),
+        ("sep_engine.rs", "is_transmute_call_sup"),
+        ("sep_engine.rs", "is_unchecked_index_call_sup"),
+        ("sep_engine.rs", "is_unsafe_arith_op_sup"),
+        ("sep_engine.rs", "is_unwrap_unchecked_call_sup"),
+        ("sep_engine.rs", "unsafe_assertion_op_sup"),
+    ];
+
+    const CALLEE_RECOGNIZERS_OUTSIDE_THE_UNSAFE_MINT: &[(&str, &str)] = &[
+        ("call_graph.rs", "fn_trait_closure_callee"),
+        ("ffi_vcgen.rs", "extract_callee_name"),
+        // Trust: 2026-10-25 (FFI-STD-QPATH-1) — `is_extern_call`'s pattern-2b
+        // helpers. They decide whether the name FALLBACK routes a non-foreign
+        // call into the FFI lane. Answering "exempt" WITHHOLDS that lane's
+        // `unmodeled FFI call` stand-in, so it is a spelling-decided withholding,
+        // not a pure obligation (review finding 4, 2026-10-26). Why that is
+        // sound is argued on `ffi_paths_are_std_namespaces`: `is_foreign` routes
+        // every direct foreign call whatever they answer, the call that reaches
+        // foreign code is refused by its own rule (absent callee, Fn*::call),
+        // and a fingerprinted callee (`__trust_args@`, the producer's "these
+        // argument type paths may be forged" tag) is never exempt.
+        ("ffi_vcgen.rs", "ffi_paths_are_std_namespaces"),
+        ("ffi_vcgen.rs", "is_extern_call"),
+        // Trust (G1, 2026-10-27): `is_extern_call` with the call's `CalleeKey`; the
+        // production entry. Pattern 1 (`libc::`) routes only an UNKEYED callee: a
+        // keyed one is a resolved `FnDef` whose `is_foreign` (ORed in by the caller)
+        // already answers, so a spelling can only WITHHOLD the stand-in from a Rust
+        // body (libc's `const fn WIFEXITED`), never from foreign code.
+        ("ffi_vcgen.rs", "is_extern_call_for"),
+        ("ffi_vcgen.rs", "terminal_segments"),
+        ("generate/alloc_bounds.rs", "bulk_alloc_call"),
+        ("generate/alloc_bounds.rs", "iterator_fold_item_may_overflow"),
+        ("generate/alloc_bounds.rs", "iterator_integer_fold_call"),
+        ("generate/alloc_bounds.rs", "iterator_integer_fold_call_detail"),
+        ("generate/alloc_bounds.rs", "method_tail"),
+        ("generate/alloc_bounds.rs", "overflow_arith_call"),
+        // 2026-10-06 (POW-SYMEXP-1 integration review): the name-only view of
+        // `overflow_arith_call`, read only by `callee_has_call_site_panic_family`,
+        // where a `Some` WITHHOLDS the vanilla admission of a real-sysroot fn item
+        // (keeps a refusal). It mints no row and grants nothing; a forged rendering
+        // can only refuse.
+        ("generate/alloc_bounds.rs", "overflow_arith_call_name_only"),
+        ("generate/alloc_bounds.rs", "parse_elem_bytes_token"),
+        ("generate/alloc_bounds.rs", "raw_alloc_call"),
+        ("generate/alloc_bounds.rs", "single_value_alloc_call"),
+        ("generate/alloc_bounds.rs", "str_repeat_capacity_overflow_call"),
+        ("generate/alloc_bounds.rs", "vec_element_spelling"),
+        ("generate/alloc_vcs.rs", "callee_tail"),
+        // Allocation lane: reads the extractor's layout token on a sink that
+        // `is_collect_sink` already identified; a `HashMap`/`HashSet` spelling only
+        // RAISES the per-item charge, so a forged spelling can refuse, never grant.
+        ("generate/alloc_vcs.rs", "collect_sink_max_bytes_per_item"),
+        // Allocation lane: a `String` extend keeps its grant only when this reads a
+        // `char` item; any other or forged spelling answers `false` and is charged.
+        ("generate/alloc_vcs.rs", "extend_item_is_char"),
+        // Allocation lane. Raises a BTree sink's reserved items: refuses, never grants.
+        ("generate/alloc_vcs.rs", "collect_sink_min_reserved_items"),
+        // Allocation lane, GRANTING (a string item reserves nothing upfront). Safe to
+        // read from the spelling because `is_capacity_reserving_std_extend` already
+        // authenticated `Self` as std's `String`, so the item is a std impl's or a
+        // user `impl Extend<Local> for String`'s, whose local item is never in the
+        // string-like set; a stamped impersonating crate never spells
+        // `alloc::string::String`.
+        ("generate/alloc_vcs.rs", "extend_item_is_string_like"),
+        ("generate/alloc_vcs.rs", "string_extend_reserved_bytes_per_item"),
+        // Allocation lane, a CONJUNCT of the counted-allocation length grant: anchored
+        // on an unstamped std sequence path, so a forged spelling only refuses.
+        ("generate/alloc_vcs.rs", "counted_alloc_is_sequence_sink"),
+        ("generate/alloc_vcs.rs", "callee_is_std_hash_table_inherent"),
+        // W4 HASHMAP r3 (2026-09-29): `callee_is_call_site_allocation_sink` is the
+        // allocation arm of `callee_has_call_site_panic_family` — a `true` REFUSES a
+        // sysroot fn item handed over as a type argument; it grants nothing.
+        // `bounded_source_fits_sink` reads the extractor's element-size token off a
+        // sink the allocation lane already recognized and GRANTS the bounded-source
+        // skip only on a proof that the destination holds the source's live count;
+        // a forged token cannot reach it (the token grammar is trailing and
+        // non-identifier, `parse_trailing_elem_bytes_token`).
+        ("generate/alloc_vcs.rs", "callee_is_call_site_allocation_sink"),
+        ("generate/alloc_vcs.rs", "bounded_source_fits_sink"),
+        ("generate/alloc_vcs.rs", "is_authenticated_std_iter_free_fn"),
+        ("generate/alloc_vcs.rs", "is_authenticated_std_len_nonincreasing_adaptor"),
+        ("generate/alloc_vcs.rs", "is_authenticated_std_len_preserving_adaptor"),
+        ("generate/alloc_vcs.rs", "is_capacity_reserving_std_extend"),
+        ("generate/alloc_vcs.rs", "is_collect_sink"),
+        ("generate/alloc_vcs.rs", "is_std_unzip_sink"),
+        ("generate/alloc_vcs.rs", "is_std_collect_into_sink"),
+        ("generate/alloc_vcs.rs", "is_range_inclusive_new_call"),
+        ("generate/alloc_vcs.rs", "is_std_collection_iter_producer"),
+        ("generate/alloc_vcs.rs", "is_str_view_iter_producer"),
+        // W4 ITER-HOF (c), 2026-09-25: the bounded-source collect walk's KEYED
+        // leaves. They GRANT (a `true` deletes the collect's unbounded-allocation
+        // row), but on the compiler-minted `SysrootItem` alone, which is minted only
+        // for an artifact-resident sysroot `DefId` — a user-crate rebuild of the
+        // spelling carries `sysroot_item: None` and is refused structurally, not by
+        // a string. Exactly-minted items are pinned by
+        // `iter_hof_collect_count_tests::the_keyed_leaf_names_exactly_its_five_items`.
+        ("generate/alloc_vcs.rs", "key_is_bounded_keyed_producer"),
+        ("generate/alloc_vcs.rs", "key_is_case_mapping_producer"),
+        ("generate/alloc_vcs.rs", "producer_receiver_is_authenticated_sysroot"),
+        ("generate/alloc_vcs.rs", "producer_receiver_path"),
+        ("generate/assert_refutation.rs", "authenticated_wrapping_call"),
+        ("generate/assert_refutation.rs", "is_arguments_template_new_call"),
+        ("generate/assert_refutation.rs", "v2_is_assertion_panic_call"),
+        ("generate/assert_refutation.rs", "v2_is_unreachable_panic_call"),
+        ("generate/assert_refutation.rs", "v2_is_unreachable_sentinel_panic"),
+        ("generate/assert_refutation.rs", "wrapping_call_tail_op"),
+        ("generate/call_facts.rs", "is_bool_from_call"),
+        ("generate/call_facts.rs", "is_int_wrapping_neg_call"),
+        ("generate/call_facts.rs", "is_nonzero_get_call"),
+        // NAME-ANCHOR-2 (2026-10-04): `is_ord_{clamp,max,min}_call` are DELETED.
+        // They tested std's trait path alone, and a user `impl Ord` that overrides
+        // `min`/`max`/`clamp` renders under that path. Every consumer now asks
+        // `primitive_int_ord_method(func, callee, args, dest)`, which also pins
+        // `Self` to a primitive integer; its first parameter is the function, so
+        // it is not a string predicate this census counts. `ord_method` below is
+        // the trait-path half it calls.
+        // NAME-ANCHOR-1 (2026-10-03): std's container `len` for the length-of-place
+        // recognizers (`container_len::operand_is_len_of_place` arm (a),
+        // `len_def_block`, `panic_calls::operand_is_len_of_base`). It gates VALUE facts
+        // (a guard's `coll_len(place) >= C`), not the unsafe-contract mint. It is the
+        // `_len == coll_len` tie's own matcher, `total_summary_len_call` (std root, no
+        // ` as `, no `__trust_crate@` stamp, exact `::len` leaf) or std `VecDeque::len`,
+        // so a user trait method named `len` answers false (unit table
+        // `len_of_place_anchor_tests::std_len_matcher_is_the_tie_sites_matcher`).
+        ("generate/call_facts.rs", "is_std_inherent_len_call"),
+        // LEN-KEY-1 (2026-10-06): the same VALUE-fact lane (the `_len == coll_len` tie
+        // and the three length-of-place recognizers), outside the unsafe-contract mint.
+        // `callee_key_is_std_inherent_len` reads ONLY the compiler-minted key: a
+        // residency-authenticated sysroot DefId tagged `VecLen`/`SliceLen`/`StrLen`/
+        // `StringLen`, all INHERENT methods, so a user-crate rebuild (a free fn, a user
+        // or generic-impl trait method named `len`, a `--crate-name alloc` crate) has
+        // no such tag. `is_std_inherent_len_call_or_key` is that OR the string matcher
+        // above, unchanged. Pinned by `len_of_place_anchor_tests::
+        // the_len_key_is_std_inherent_len_only_on_a_resident_sysroot_crate` and
+        // `tests/dup_crate_name_len_tie_realmir.rs`.
+        ("generate/call_facts.rs", "callee_key_is_std_inherent_len"),
+        ("generate/call_facts.rs", "is_std_inherent_len_call_or_key"),
+        ("generate/call_facts.rs", "is_std_int_from_into_call"),
+        ("generate/call_facts.rs", "is_std_num_intrinsic"),
+        ("generate/call_facts.rs", "ord_method"),
+        ("generate/call_facts.rs", "saturating_add_sub_method"),
+        // cap from-range (2026-10-03): the source-range lane's recognizer. It feeds the
+        // type-range battery (a local's VALUE range), not the unsafe-contract mint,
+        // and it is user-rebuild safe by its own gate: the caller requires both
+        // declared types to be the spelled primitives, so a user `From` impl (a
+        // non-primitive side) or a generic parameter named `u32` never matches.
+        ("generate/call_facts.rs", "std_lossless_scalar_conversion"),
+        ("generate/call_facts.rs", "strip_generic_args"),
+        ("generate/callee_summaries.rs", "fp_abs_call_width"),
+        ("generate/callee_summaries.rs", "std_num_impl_receiver_width"),
+        ("generate/callee_summaries.rs", "std_num_impl_receiver_is_unsigned"),
+        // VCGEN-NINE-REDS-20261110: PERF-COMPILER-VCGEN-521's replacement for
+        // `installed_write_set` (deleted with this entry; PERF-COMPILER-VCGEN-146
+        // had left it `#[allow(dead_code)]`). The callee write-set lane, not the
+        // unsafe-contract mint: it looks the call's rendered callee up in the map
+        // `build_callee_write_sets` derived from the `SummaryDatabase`'s own
+        // extracted bodies, under the names that database records. It recognizes
+        // no std spelling, so there is no user-crate rebuild of one to refuse; a
+        // name with no derived entry answers `None` and the call keeps its
+        // conservative havoc. Its key is exactly as authentic as the summary
+        // database's, which every other summary consumer shares.
+        ("generate/callee_write_set.rs", "installed_write_set_map_for"),
+        // std-call-summaries P2 review (2026-10-12): the postcondition lane's
+        // free-return tripwire asks whether a callee carries one of the MODELED
+        // `@trust-…` stamps. A `false` makes the tripwire FIRE (the row becomes the
+        // visible unverifiable row); a `true` only keeps a row other lanes decide.
+        // It mints nothing, and `@` cannot occur in a user rebuild's spelling.
+        ("generate/contract_vcs.rs", "callee_carries_a_modeled_stamp"),
+        // 2026-09-25 (std-range-family): the std collection index/range/count
+        // panic family. Each ADDS a call-site row (a precise bound or a
+        // fail-honest `UnsupportedMir`) — `true`/`Some` KEEPS a panic charged; a
+        // miss is the pre-existing state (no row), never a granted contract. The
+        // GRANTING members are `const_generic_is_nonzero` (`true` drops the
+        // `N == 0` row only for a nonzero integer literal in the method's own
+        // instantiation) and `range_generic_is_full`: `true` drops the row for
+        // `..`, only when the method's own range type parameter renders exactly
+        // `core::ops::range::RangeFull` (a path no user crate spells unstamped)
+        // AND the operand is a zero-sized constant.
+        // Trust (2026-10-15, TRUST-KI-1015-1): the result-length facts of core's
+        // `[T]::as_chunks::<N>` family (panic-freedom lane, a post-return path
+        // definition, not the unsafe mint). Used only together with a real-sysroot
+        // `callee_key`, no unauthenticated stamp, a nonzero literal `N` and a
+        // destination whose MIR type is the pair the method returns at that `N`; a user
+        // trait method named `as_chunks`, a non-sysroot key, an `N` that disagrees with
+        // the type and a symbolic `N` are refused (tests/as_chunks_len_realmir.rs).
+        ("generate/as_chunks_len.rs", "core_as_chunks_method"),
+        ("generate/collection_range.rs", "collection_method_panic"),
+        ("generate/collection_range.rs", "const_generic_is_nonzero"),
+        ("generate/collection_range.rs", "const_generic_literal"),
+        // VCGEN-NINE-REDS-20261110: Wave 529 (540d5f6819) split this family's
+        // owner and generic-argument readers, so the census meets their new names:
+        // `has_std_owner_prefix` is `is_std_inherent_method` without its
+        // `method_tail(callee) == leaf` conjunct, which every caller now spells as
+        // the `match tail` arm it sits in (`tail` is `method_tail(callee)` at each
+        // of the four call sites); `is_alloc_slice_inherent` is
+        // `is_std_slice_repeat` with its `repeat` leaf moved to the `"repeat"` arm
+        // the same way; and `method_generic_args_inner`, `nth_method_generic_arg`
+        // and `single_method_generic_arg` are `method_generic_args` without the
+        // `Vec` — the readers behind the two GRANTING members named above, which
+        // compare the same top-level argument against the same literal. No
+        // member's answer changed, so the family's classification carries over.
+        ("generate/collection_range.rs", "has_std_owner_prefix"),
+        ("generate/collection_range.rs", "is_alloc_slice_inherent"),
+        ("generate/collection_range.rs", "is_core_slice_inherent"),
+        ("generate/collection_range.rs", "is_std_vecdeque_method"),
+        ("generate/collection_range.rs", "method_generic_args_inner"),
+        ("generate/collection_range.rs", "nth_method_generic_arg"),
+        ("generate/collection_range.rs", "range_generic_is_full"),
+        ("generate/collection_range.rs", "single_method_generic_arg"),
+        ("generate/container_len.rs", "callee_is_slice_chunks"),
+        ("generate/container_len.rs", "callee_is_slice_chunks_exact"),
+        // REBASE 2026-09-21: `<[T]>::iter`, added on main after the fork. It says
+        // nothing about a LENGTH — it exists so the trip-count tracer can hop
+        // THROUGH `v.iter()` to the slice itself. Iterator-yield lane, not the mint.
+        ("generate/container_len.rs", "callee_is_slice_iter"),
+        // 2026-09-29: `Iterator::position`/`rposition` of a slice's own iterator, for the
+        // index-below-length yield fact. Trait half anchored at `core::iter`/`std::iter`,
+        // self half at `core::slice::iter`, and an unauthenticated crate stamp refuses.
+        ("generate/container_len.rs", "callee_is_slice_iter_position"),
+        ("generate/container_len.rs", "callee_is_slice_windows"),
+        ("generate/container_len.rs", "is_std_container_as_ptr"),
+        ("generate/float_range.rs", "f64_std_method_name"),
+        ("generate/float_range.rs", "is_unit_bounded_float_call"),
+        ("generate/havoc_decline.rs", "callee_path_is_monomorphic"),
+        ("generate/havoc_decline.rs", "crate_of"),
+        ("generate/int_conversion.rs", "is_int_try_from_callee"),
+        ("generate/int_conversion.rs", "is_std_unwrap_or_call"),
+        ("generate/intrinsic_semantics.rs", "classify_value_modeled_intrinsic"),
+        ("generate/intrinsic_semantics.rs", "marked_saturating_intrinsic"),
+        ("generate/iterator_yield.rs", "callee_is_enumerate"),
+        ("generate/iterator_yield.rs", "callee_is_into_iter"),
+        ("generate/iterator_yield.rs", "callee_is_iterator_next"),
+        ("generate/iterator_yield.rs", "callee_is_std_peekable_peek"),
+        ("generate/iterator_yield.rs", "callee_is_rev"),
+        ("generate/iterator_yield.rs", "callee_is_slice_iter"),
+        ("generate/iterator_yield.rs", "callee_is_step_by"),
+        // 2026-09-29: std's inherent `str::find`/`rfind`. Its `Some` payload is a match
+        // start: a char boundary of the receiver and at most its length (the
+        // `Searcher` contract). Authenticated sysroot root; a qualified spelling never
+        // is one.
+        ("generate/iterator_yield.rs", "callee_is_std_str_find"),
+        // 2026-09-29: std's inherent `str::is_char_boundary`; a TRUE result makes its
+        // argument a boundary of the receiver. Authenticated sysroot root.
+        ("generate/iterator_yield.rs", "callee_is_std_str_is_char_boundary"),
+        // 2026-09-29: std's `<Option<T> as Try>::branch` (the `?` desugar) moves the
+        // `Some` payload into `Continue` unchanged. Self type and trait both read from
+        // the qualified spelling; an unauthenticated stamp refuses.
+        ("generate/iterator_yield.rs", "callee_is_std_option_try_branch"),
+        ("generate/iterator_yield.rs", "callee_is_std_result_try_branch"),
+        ("generate/iterator_yield.rs", "vc_callee_is_slice_inherent"),
+        ("generate/iterator_yield.rs", "vc_callee_is_slice_inherent_any"),
+        ("generate/iterator_yield.rs", "vc_callee_is_std_iter_trait_method"),
+        ("generate/iterator_yield.rs", "vc_callee_is_std_iter_trait_method_any"),
+        ("generate/iterator_yield.rs", "vc_callee_is_std_vec_inherent"),
+        ("generate/iterator_yield.rs", "vc_qualified_self_ty"),
+        ("generate/iterator_yield.rs", "vc_qualified_trait_method"),
+        ("generate/iterator_yield.rs", "vc_qualifier_group"),
+        ("generate/iterator_yield.rs", "vc_strip_generics"),
+        // 2026-09-29: `Option::iter`/`iter_mut` yields at most ONE item — a trip-count
+        // bound for the accumulator lane (`iterated_source_yield_bound`), not a
+        // contract. Anchored at `core::option`/`std::option`; a qualified (`as`)
+        // spelling and an unauthenticated crate stamp refuse.
+        ("generate/loop_bounds.rs", "callee_is_std_option_iter"),
+        // REBASE 2026-09-21: the vanilla-sysroot PANIC tolerance's carve-out for a
+        // panic about the CALLER's own value (index out of range, buffer too small).
+        // It withholds a tolerance, i.e. KEEPS a panic row; it mints no contract.
+        // 2026-09-25: the same carve-out asked of a sysroot fn ITEM handed to a
+        // callee as a type argument — `true` refuses the item (keeps a row), it
+        // never admits one: it can only withhold the vanilla tolerance.
+        // ROTATE-ITEM-NAME-1 (2026-10-06): its bounds-panicking mutator arm now
+        // skips core's own integer inherent, so `false` for the TOTAL
+        // `core::num::<impl uN/iN>::rotate_{left,right}` GRANTS (the compiler's
+        // vanilla admission of that item, on the default policy only). The grant is
+        // anchored on `numeric_panic::int_inherent`'s sysroot-root check: a stamped
+        // or user `…::num::<impl u32>::rotate_left` stays refused.
+        ("generate/mod.rs", "callee_has_call_site_panic_family"),
+        // Trust (2026-10-01): the compiler's sum/product grant asks this of the
+        // rendered call, so a spelling the fold row misses is never granted.
+        ("generate/mod.rs", "callee_is_charged_integer_fold"),
+        ("generate/mod.rs", "callee_is_known_caller_value_panic"),
+        // W4 fix round 1 (2026-09-25): the same carve-out for `VecDeque`'s caller-value
+        // members, asked by the compiler of ROOT call sites only. It withholds the
+        // vanilla tolerance (KEEPS a row); it mints no contract.
+        ("generate/mod.rs", "callee_is_root_call_caller_value_panic"),
+        // 2026-09-25 (std-numeric-family): the std numeric value-panic family
+        // (clamp bounds, ilog/isqrt domains, radix, strict_*, next_power_of_two/
+        // next_multiple_of, explicit by-value operator calls, Duration/Instant
+        // arithmetic, range iteration). Each ADDS a call-site row — a precise
+        // `Assertion`/`DivisionByZero` bound or a fail-closed `UnsupportedMir` —
+        // so `Some`/`true` KEEPS a panic charged, and a miss is the pre-existing
+        // state (no row), never a granted contract. Every recognizer anchors on
+        // `path_root_is_authenticated_sysroot_crate` plus an exact owner and leaf,
+        // or on both halves of a qualified `<Self as Trait>::m` spelling. The
+        // GRANTING direction is `None` from `numeric_value_panic_row` for an
+        // argument decided safe from LITERALS alone (a radix in `[2, 36]`, float
+        // bounds `lo <= hi`, a literal `Duration` sum that fits), and
+        // `by_value_int_op_rhs` answering `false` for a REFERENCE right-hand side,
+        // which leaves `<u32 as Add<&u32>>::add` to the ruled foundational-member
+        // class rather than admitting anything new. (`qualified_std_trait_method`
+        // takes `callee: &'a str`, a spelling this scan does not read; it is the
+        // shared splitter every entry below calls.) `is_clock_reading_callee`
+        // (review follow-up, 2026-09-28) GRANTS too: its `true` — an
+        // authenticated `std::time::Instant::now` / `SystemTime::now` — is what
+        // lets a small literal `Duration` added to that fresh reading mint
+        // nothing; a stamped impersonator fails the sysroot-root check
+        // (`numeric_panic_tests`).
+        // Wave 23 (2026-10-11, STAMPED-CORE-MINT-1 residual): the two MINTING entry
+        // points, `numeric_value_panic_row` and `numeric_overflow_call` (their first
+        // parameter is the function, so this scan does not list them), read the callee past ONE
+        // well-formed leading `__trust_crate@<16 hex>::` stamp
+        // (`after_one_identity_stamp`) before any recognizer below sees it, because the
+        // extractor stamps the GENUINE core in a graph with a second `core` and under
+        // `-Zbuild-std`. Each recognizer still authenticates what it is handed, so a
+        // second stamp is refused; the rows are only ADDED, so a forged `core` that
+        // renders the same spelling is charged a row it may not owe (a false red). The
+        // grants (`is_clock_reading_callee`, the literal-`Duration` reader) are asked of
+        // other calls' callees and are not stripped; `is_numeric_value_panic_callee` is
+        // not stripped either.
+        ("generate/numeric_panic.rs", "by_value_int_op_rhs"),
+        ("generate/numeric_panic.rs", "char_method"),
+        ("generate/numeric_panic.rs", "duration_inherent"),
+        ("generate/numeric_panic.rs", "float_inherent"),
+        ("generate/numeric_panic.rs", "int_inherent"),
+        // Wave-19 review (2026-10-09): `int_inherent` behind ONE well-formed leading
+        // `__trust_crate@<16 hex>::` stamp, for the three arms whose answer only ADDS a
+        // row (`abs`'s negation row, `pow`'s and `unchecked_*`'s overflow rows). The text
+        // after the stamp must be core's exact `core::num::<impl iN/uN>::leaf`, which
+        // only a crate using rustc's internal coherence attributes can define; a forged
+        // rendering can only be charged a row it does not owe. Nothing that grants asks it.
+        ("generate/numeric_panic.rs", "int_inherent_minting"),
+        // Wave-21 integration (2026-10-09): the stamp-stripping half of
+        // `int_inherent_minting`, also read by `panic_calls::divzero_call` (DIVZERO-NAME-1
+        // meets STAMPED-CORE-MINT-1). It answers the text after ONE well-formed leading
+        // `__trust_crate@<16 hex>::` stamp and decides nothing: each caller re-authenticates
+        // that text (`int_inherent`, `path_root_is_authenticated_sysroot_crate`, which refuse
+        // a second stamp), and both callers only ADD a row over the call's own arguments,
+        // so a forged rendering can only be charged a row it does not owe. Wave 23
+        // (2026-10-11): `numeric_value_panic_row` and `numeric_overflow_call` read it too,
+        // under the same rule (see the numeric-family note above).
+        ("generate/numeric_panic.rs", "after_one_identity_stamp"),
+        ("generate/numeric_panic.rs", "is_clock_reading_callee"),
+        // W4 ITER-HOF fix round 4 (2026-10-02): `true` marks an integer division
+        // OPERATOR (`<u32 as Div>::div`, `Rem<&u32>`, `Wrapping`/`Saturating`) for
+        // `callee_has_call_site_panic_family`, which only WITHHOLDS the vanilla
+        // admission of a sysroot fn item handed over as a type argument (keeps a
+        // refusal). It grants nothing and mints no contract; a forged rendering can
+        // only refuse.
+        ("generate/numeric_panic.rs", "is_int_division_operator_callee"),
+        // W4 ITER-HOF fix round 6 (2026-10-03): `true` marks an integer operator
+        // carrying core's overflow check, by value or by reference
+        // (`<u32 as Add<&u32>>::add`, `<&i32 as Neg>::neg`, `Shl<&u32>`), for
+        // `callee_has_call_site_panic_family`, which only WITHHOLDS the vanilla
+        // admission of a sysroot fn item handed over as a type argument (keeps a
+        // refusal). It grants nothing and mints no contract; a forged rendering can
+        // only refuse.
+        ("generate/numeric_panic.rs", "is_int_overflow_operator_callee"),
+        ("generate/numeric_panic.rs", "is_numeric_value_panic_callee"),
+        ("generate/numeric_panic.rs", "is_signed_nonzero_negation"),
+        // Wave-19 review (2026-10-09): `<Dst as core::convert::num::CheckedCastFromInt<Src>>
+        // ::strict_cast_from` (or the unqualified trait-item path) under an authenticated
+        // sysroot trait. A `true` ADDS the out-of-range row (or the fail-closed
+        // `strict-cast-target-unmodeled` row) and withholds a fn item's admission; it
+        // grants nothing. A user or stamped trait of the same name answers false.
+        ("generate/numeric_panic.rs", "is_strict_cast_from_callee"),
+        ("generate/numeric_panic.rs", "nonzero_inherent"),
+        ("generate/numeric_panic.rs", "nonzero_is_signed"),
+        // Wave-24 review (2026-10-12, NEW-RANGE-REMAINDER-UNCHARGED-1): the element `T` of
+        // `core::range::iter::RangeFromIter::<T>::remainder` (int or `char`) under an
+        // authenticated sysroot root and the exact owner token. A `Some` ADDS the
+        // fail-closed `range-from-step-overflow-unmodeled` row and withholds a fn item's
+        // admission; it grants nothing. A user or stamped namesake answers `None`.
+        ("generate/numeric_panic.rs", "range_from_iter_remainder_elem"),
+        ("generate/numeric_panic.rs", "trait_rhs_is_duration"),
+        // W4 round 3 (2026-09-29): `true` marks a `split_at`/`split_at_mut` call as
+        // the `str` method (by `SysrootItem::StrSplitAt`/`StrSplitAtMut`, or a
+        // key-less `core::str` rendering), which ADDS the char-boundary refusal
+        // unless `mid` is a structural boundary. A `true` on a forged rendering can
+        // only refuse a `[T]` split; `false` is the pre-existing numeric-only row.
+        // It mints no contract.
+        ("generate/panic_calls.rs", "callee_is_str_split_at"),
+        // CONST-RANGE-INDEX-1 (2026-10-06): `Some` names the argument of a std
+        // `Index`/`SliceIndex` call whose instantiation is a panicking range, and the
+        // `RangeIndex` arm then ADDS the untraceable-range fail-close row for it (and,
+        // for `SliceIndex<str>`, the char-boundary refusal). Exact `core::ops` /
+        // `core::slice` / `core::range` paths; a forged rendering can only refuse. It
+        // mints no contract and grants nothing.
+        ("generate/panic_calls.rs", "callee_panicking_range_index"),
+        // DIVZERO-NAME-1 (2026-10-06): `divzero_call` MINTS core's zero-divisor row
+        // over the caller's argument, so it now answers only under an authenticated
+        // sysroot root (`div_euclid`/`div_ceil`/`rem_euclid`) or for std's
+        // `Iterator::step_by` (`callee_is_step_by`); a user namesake mints nothing.
+        ("generate/panic_calls.rs", "divzero_call"),
+        // DIVZERO-NAME-1 (2026-10-06): the name-only view of `divzero_call`, read
+        // only by `callee_has_call_site_panic_family`, where a `Some` WITHHOLDS the
+        // vanilla admission of a real-sysroot fn item (keeps a refusal). It mints no
+        // row and grants nothing; a forged rendering can only refuse.
+        ("generate/panic_calls.rs", "divzero_call_name_only"),
+        ("generate/panic_calls.rs", "is_btree_range_call"),
+        // SLICE-ZERO-SIZE-NAME-1 (2026-10-11): `slice_method_panic` MINTS core's
+        // `split_at`/`chunks*`/`rchunks*`/`windows`/`swap` row over the caller's
+        // arguments, so those arms now answer only for a sysroot-ROOTED callee (read
+        // past one leading stamp); a user namesake mints nothing. A forged rendering
+        // can only be charged a row it does not owe.
+        ("generate/panic_calls.rs", "slice_method_panic"),
+        // SLICE-ZERO-SIZE-NAME-1 (2026-10-11): the name-only view of
+        // `slice_method_panic`, read only by `callee_has_call_site_panic_family`, where
+        // a `Some` WITHHOLDS the vanilla admission of a real-sysroot fn item (keeps a
+        // refusal). It mints no row and grants nothing; a forged rendering can only
+        // refuse.
+        ("generate/panic_calls.rs", "slice_method_panic_name_only"),
+        // Types the ADDED `MIN / -1` overflow row of a std `div_euclid`/`rem_euclid`
+        // call from its `<impl iN>` path, after `is_std_num_intrinsic` anchored it to
+        // std. It mints no fact; a forged spelling could only add an obligation.
+        ("generate/panic_calls.rs", "std_num_impl_receiver_ty"),
+        ("generate/per_path_refute/std_iter.rs", "recognize"),
+        ("generate/per_path_refute/std_iter.rs", "split_qualified"),
+        // Trust (2026-10-15, TRUST-KI-1015-1): the result-length fact of a std range index
+        // (panic-freedom lane, a post-return path definition, not the unsafe mint). It
+        // narrows `panic_calls::callee_panicking_range_index` (above) to a built-in indexed
+        // type and is used only together with a real-sysroot `callee_key`, no
+        // unauthenticated stamp and the receiver's MIR type; a user trait method named
+        // `index` and a user `Index` impl are refused (tests/subslice_len_realmir.rs).
+        ("generate/range_index_len.rs", "std_builtin_range_index"),
+        ("generate/semantic_guard.rs", "mem_layout_call_dest_facts"),
+        // PANIC-SKIP-ANCHOR-1 (2026-10-05): `is_panic_intrinsic_call` no longer
+        // decides anything alone. `true` from it DROPPED the `UnsupportedMir` rows
+        // of a call's arguments (a SUPPRESSION, of fail-closed disclosure rows),
+        // and a user `fn panic` that returns normally was enough. Its only
+        // consumer is now `diverging_panic_entry_operands_unread`, which
+        // suppresses those rows only for a call with no continuation whose
+        // `CalleeKey` carries the extractor's DIVERGE-ENTRY-1 stamp (a real
+        // sysroot panic/abort/UB entry, decided from the `DefId`), with the name
+        // as a narrowing third conjunct. It mints no fact and no contract; a
+        // `false` keeps every row.
+        ("generate/slice_conversion.rs", "is_panic_intrinsic_call"),
+        ("generate/slice_conversion.rs", "is_slice_index_call"),
+        ("generate/slice_conversion.rs", "is_slice_to_array_conversion"),
+        ("generate/unsupported.rs", "diverging_panic_entry_operands_unread"),
+        // 2026-09-29: the std `Vec`/`VecDeque`/`String` owner test that lets a
+        // whole-range `drain(..)`/`drain(0..)` drop its `panic-freedom-unverified`
+        // row. It withholds a panic-lane Unknown, it mints no contract; anchored,
+        // and a qualified spelling or an unauthenticated crate stamp refuses.
+        ("generate/unwrap_panic.rs", "callee_is_std_growable_container_method"),
+        ("generate/unwrap_panic.rs", "callee_without_turbofish_args"),
+        // REBASE 2026-09-21: `char::encode_utf8{,_raw}`, the sibling of the
+        // index-panicking mutator below it and in the same panic lane.
+        ("generate/unwrap_panic.rs", "is_buffer_panicking_char_encoder"),
+        // UTF8-ENCODE-UTF16-SHORTBUF-1 (2026-10-05): `char::encode_utf16` /
+        // `encode_utf16_raw`, exact-path gated on core's two definitional spellings
+        // and asked of ROOT call sites only (`unsupported.rs`'s row and
+        // `callee_is_root_call_caller_value_panic`). Same carve-out as its sibling
+        // above: it KEEPS a panic row / withholds the vanilla tolerance; it mints no
+        // contract.
+        ("generate/unwrap_panic.rs", "is_buffer_panicking_char_utf16_encoder"),
+        // W4 fix round 1 (2026-09-25): `VecDeque`'s caller-value members that no
+        // call-site lane charges (`insert`, `split_off`, `rotate_*`, `drain`, …),
+        // exact-path gated on std's own `collections::vec_deque::VecDeque`. Same
+        // carve-out as the two above: it KEEPS a panic row / withholds the vanilla
+        // tolerance; it mints no contract.
+        ("generate/unwrap_panic.rs", "is_caller_value_panicking_deque_method"),
+        // W4 salvage (2026-09-28): `<VecDeque<T> as Index<usize>>::index` /
+        // `IndexMut`, split out of the carve-out above when main's `collection_range`
+        // took over charging it. It gates a fail-closed BACKSTOP row (a deque index
+        // that lane cannot read); `true` KEEPS a row, it never admits or mints.
+        ("generate/unwrap_panic.rs", "is_deque_scalar_index_call"),
+        // IDX-TIE-1 (2026-10-03): std's OWN scalar `<S as Index<usize>>::index` for a
+        // slice, array or `alloc::vec::Vec`. It gates VALUE facts about the call's
+        // result (the index value tie in `value_facts.rs`, the push-guard row length
+        // in `container_len.rs`), so it MINTS facts, but in the value-fact lane, not
+        // the unsafe-contract mint. It is anchored for exactly that: the
+        // trait-and-method half must EQUAL `core::ops::index::Index<usize>>::index`
+        // (no prefix, no `ends_with("<usize")`), the self type must be a primitive
+        // slice/array or the producer-authenticated `alloc::vec::Vec`, and a
+        // `__trust_crate@`-stamped impersonator never opens with `<`. A user method
+        // named `index`, a user key type and a user `Vec` all answer false (unit
+        // table `std_scalar_index_predicate_accepts_exactly_std_impls`).
+        ("generate/unwrap_panic.rs", "is_std_scalar_index_call"),
+        // STD-RECEIVER-ANCHOR-1 (2026-10-04): std's OWN `Index::index` /
+        // `IndexMut::index_mut` on a std container (slice, array, `Vec`, `String`,
+        // `VecDeque`) with std's index argument (`usize` or a `core::ops::range` type).
+        // A `true` makes a `&mut` reborrow LENGTH-BENIGN in
+        // `guards::local_mut_borrows_may_resize`, so it keeps a `.len()` tie alive —
+        // it grants. Anchored for that: the trait-and-method half must EQUAL
+        // `{Index|IndexMut}<{arg}>>::{index|index_mut}` with `arg` in a closed list,
+        // and the self type must be std's by path, so the orphan rule leaves only
+        // std's impl. A user impl of std's trait on std's `Vec` (`IndexMut<dep::K>`),
+        // a user self type and the unqualified spelling answer false (unit table
+        // `std_container_index_predicate_accepts_exactly_std_impls`).
+        ("generate/unwrap_panic.rs", "is_std_container_index_call"),
+        ("generate/unwrap_panic.rs", "is_index_panicking_container_mutator"),
+        ("generate/unwrap_panic.rs", "is_known_panicking_method"),
+        ("generate/unwrap_panic.rs", "is_signed_abs_call"),
+        // 2026-10-06 (ABS-NAME-1): the name-only view of `is_signed_abs_call`, read
+        // only by `callee_has_call_site_panic_family`, where a `true` WITHHOLDS the
+        // vanilla admission of a real-sysroot fn item (keeps a refusal). It mints no
+        // row and grants nothing; a forged rendering can only refuse. The
+        // authenticated `is_signed_abs_call` above (trust-clean's subject admission)
+        // takes `numeric_panic::int_inherent`'s signed owner; the emitter asks
+        // `is_signed_abs_mint` below.
+        ("generate/unwrap_panic.rs", "is_signed_abs_call_name_only"),
+        // Wave-19 review (2026-10-09): the MINTING view of `is_signed_abs_call`, read
+        // only by the `abs` negation-row emitter. It also accepts core's exact spelling
+        // behind one leading extractor stamp (`numeric_panic::int_inherent_minting`),
+        // because the extractor stamps the GENUINE core in a graph with a second
+        // `core` or under `-Zbuild-std`. A `true` ADDS a row; it grants nothing, and
+        // trust-clean's subject admission keeps the authenticated `is_signed_abs_call`.
+        ("generate/unwrap_panic.rs", "is_signed_abs_mint"),
+        // W4 fix round 2 (2026-09-26): the depth-aware `<SELF as TRAIT>::item` split
+        // the deque `Index`/`IndexMut` recognizer (`is_deque_scalar_index_call`) reads
+        // through (a SELF type can carry its own ` as `). A parsing helper of that
+        // backstop: it decides nothing on its own and mints no contract.
+        ("generate/unwrap_panic.rs", "split_qualified_callee_at_top_level_as"),
+        ("generate/unwrap_panic.rs", "std_as_ref_call"),
+        ("generate/unwrap_panic.rs", "std_option_result_probe_variant"),
+        ("generate/unwrap_panic.rs", "std_partial_eq_callee"),
+        ("generate/unwrap_panic.rs", "std_unwrap_family_panic_variant"),
+        // 2026-09-29: the std `len`/`Index`/`IndexMut`/`Deref`/`DerefMut` test that lets a
+        // `v.len()` tie on a length-invariant `&mut Vec` parameter be a global fact. It
+        // adds a true equality only when EVERY use of the parameter passes it. Since
+        // 2026-10-10 (review round 97) it matches `<Self as Trait>::method` exactly at
+        // the header's top level (Self std `Vec`, Trait std Index/IndexMut/Deref/
+        // DerefMut): a prefix test admitted a user trait's fn on a std ops Self.
+        // An unauthenticated crate stamp refuses.
+        ("generate/value_facts.rs", "split_top_level_qualified"),
+        ("generate/value_facts.rs", "vec_length_benign_callee"),
+        // VEC-INSERT (2026-09-25): the exact std `Vec` inherent method (`len`,
+        // `is_empty`, `remove`, `swap_remove`, `insert`), crate-anchored on the
+        // producer-authenticated `alloc::vec::Vec` root and refusing a ` as `-qualified
+        // trait method. Length-fact / index-precondition lane (`vec_region`), not the
+        // unsafe-contract mint.
+        ("generate/vec_region.rs", "callee_is_std_vec_method"),
+        // VEC-REGION-DEF-BLOCK-STASH-1 (2026-10-13): may a callee handed a borrow of a
+        // `Vec` from its definition block keep no alias of it past its return? A `true`
+        // GRANTS (the region resumes after the call, so length facts are minted), and it
+        // rests on the STRUCTURED key alone: `CalleeKey::opt_is_real_sysroot`, the
+        // extractor's residency verdict (`None` is false). The rendering is read only to
+        // REFUSE (a ` as `-qualified trait method, an unauthenticated-crate stamp), never
+        // to admit. Length-fact lane (`vec_region`), not the unsafe-contract mint.
+        ("generate/vec_region.rs", "call_cannot_retain_borrow"),
+        ("generate/witness_grounding.rs", "lenwitness_dbg_set_fn"),
+        // ORD-WITNESS-CONSISTENT-1 (2026-10-05): the pair classifier's credit is
+        // additionally gated on the compiler's order-consistent ADT set, and its
+        // sign sibling (`sign_witness_facts`) is deleted with the sign lane.
+        ("generate/witness_grounding.rs", "partial_ord_witness_facts"),
+        ("guards.rs", "callee_is_length_preserving_deref"),
+        ("guards.rs", "callee_is_std_slice_inherent"),
+        // VEC-AS-SLICE (2026-09-25): `<[T]>::to_vec` (a fresh `Vec` of the source's
+        // length) and `Vec`'s OWN `deref`/`deref_mut`/`as_slice`/`as_mut_slice` view
+        // (the self type must be the authenticated `alloc::vec::Vec`), each minting a
+        // LENGTH equation under the `.len()` tie's stability gates. Length-tie lane,
+        // not the unsafe-contract mint.
+        ("guards.rs", "callee_is_std_slice_to_vec"),
+        ("guards.rs", "callee_is_std_str_inherent"),
+        ("guards.rs", "callee_is_std_vec_inherent"),
+        ("guards.rs", "callee_is_std_vec_slice_view"),
+        ("guards.rs", "is_std_num_intrinsic"),
+        // DEREF-ANCHOR-1 (2026-10-04): std's OWN `Vec`/`String` `Deref`/`DerefMut`,
+        // split at the top-level ` as ` and compared by equality. It decides only the
+        // `deref` arm of `callee_is_length_preserving_deref`, together with the
+        // receiver's MIR type (`deref_receiver_is_std_container`), so a user `Deref`
+        // no longer ties two `len()` calls to one `coll_len`. Length-tie lane, not the
+        // unsafe-contract mint.
+        ("guards.rs", "std_container_deref_self"),
+        ("hardened.rs", "call_matches"),
+        // 2026-10-25/26 (hardened `stdout` false match): `call_matches` minus a
+        // byte-exact list of whole callees that are not the rule's item
+        // (`std::process::Command::stdout::<S>` for std's own writeless
+        // `Into<Stdio>` sources `S`). Hardened-boundary lane, not the
+        // unsafe-contract mint: a match MINTS a fail-closed mandate row. The
+        // compare is whole-string, so a `<X as T>::std::…` prefix, a crate
+        // impersonating `std` (the `__trust_crate@<id>::` stamp), a module
+        // merely spelled `std::process`, and any other generic argument (a
+        // dependency's `Into<Stdio>` impl runs inside the call) keep their row.
+        ("hardened.rs", "call_rule_matches"),
+        ("hardened.rs", "is_permission_window_create_call"),
+        ("hardened.rs", "is_permission_window_repair_call"),
+        ("hardened.rs", "is_trust_domain_late_effect"),
+        ("hardened.rs", "is_trust_domain_transition"),
+        // D2 tier 1 (2026-09-24): the compiler's `ADAPTER_YIELD` premises for a
+        // closure body, read back out of the owner-checked context — the same shape
+        // as `compiler_unmodeled_call_blocks_for`. It recognizes nothing: the `&str`
+        // is the def path it checks OWNERSHIP with, and every identity decision
+        // (resolved adapter instance, receiver constructor, occurrence discipline)
+        // was made by `rustc_mir_transform::trust_verify::adapter_yield` on the
+        // `TyCtxt`. Empty or mismatched context adds no fact. Yield-fact lane, not
+        // the unsafe-contract mint.
+        ("lib.rs", "adapter_yield_premises_for"),
+        // AW-1 (2026-10-03): the compiler's `.await`-lowering `unsafe` call blocks,
+        // read back out of the owner-checked context — the same shape as
+        // `compiler_unmodeled_call_blocks_for`. It recognizes nothing: the `&str`
+        // is the def path it checks OWNERSHIP with, and the decision (span
+        // `DesugaringKind::Await`, lang-item callee) was made by
+        // `rustc_mir_transform::trust_verify` on the `TyCtxt`. Empty or
+        // mismatched context drops no row.
+        ("lib.rs", "await_desugared_unsafe_call_blocks_for"),
+        // STR_BYTE_POSITION (2026-10-04): the compiler's certified
+        // `str::Bytes::position(|b| b == K)` call blocks, read back out of the
+        // owner-checked context — the `adapter_yield_premises_for` shape. It
+        // recognizes nothing: the `&str` is the def path it checks OWNERSHIP with,
+        // and every identity decision (closure shape, resolved `position`
+        // instance, `Self = core::str::Bytes`) was made by
+        // `rustc_mir_transform::trust_verify::byte_eq_predicate` on the `TyCtxt`.
+        // Empty or mismatched context credits nothing. Str-offset lane, not the
+        // unsafe-contract mint.
+        ("lib.rs", "ascii_eq_bytes_position_call_for"),
+        // D15 (2026-10-08): reads the compiler-installed noalias premise list off
+        // the owner-checked context; not a callee recognizer, mints no unsafe fact.
+        ("lib.rs", "noalias_mut_params_for"),
+        // MAIN-REDS-4 (2026-11-08): its non-cloning twin, asking only whether that
+        // list is non-empty for the OWNER def path (so `v2_live_path_defs` keeps the
+        // uncached path the premise shapes). Recognizes no callee, mints no fact.
+        ("lib.rs", "noalias_premise_installed_for"),
+        // FRESH-CAPTURE-1 (2026-10-18): reads the compiler-certified fresh shared
+        // capture fields off the owner-checked context, like `noalias_mut_params_for`;
+        // the `&str` is the OWNER def path, it recognizes no callee and mints no
+        // unsafe fact. Empty keeps every stored-reference kill.
+        ("lib.rs", "fresh_shared_capture_fields_for"),
+        ("lib.rs", "backing_hint_for"),
+        ("lib.rs", "call_has_unsafe_model"),
+        // The KEYED gate in front of it (2026-09-20). It is the one the compiler
+        // calls now: a callee outside the compiler's own sysroot cannot suppress
+        // the `[unsafe:unmodeled-call]` row at all, whatever its path spells, so
+        // the `&str` below it is reached only for a genuine sysroot definition
+        // path. See `lib.rs::call_has_unsafe_model_keyed`.
+        ("lib.rs", "call_has_unsafe_model_keyed"),
+        // REBASE 2026-09-21: a CONTEXT READ-BACK, not a spelling recognizer — it asks
+        // the owner-checked generation context whether the COMPILER judged this callee
+        // non-reentrant. Fail-closed (`false`) with no context. Recursion-termination
+        // lane, exactly like `contract_panic_annotations_for` below.
+        ("lib.rs", "callee_is_nonreentrant_for"),
+        ("lib.rs", "callee_return_bool_pred"),
+        ("lib.rs", "callee_return_const_set"),
+        ("lib.rs", "callee_return_disc_summary"),
+        // TRUST-10 (2026-09-25): the field-read summary, keyed exactly like its
+        // five siblings above — a same-crate body's `def_path`, derived from that
+        // body. Return-value lane, not the unsafe-contract mint.
+        ("lib.rs", "callee_return_field_summary"),
+        // A context READ-BACK of a checked same-crate constructor, not a
+        // spelling-based unsafe contract. Compiler identity/layout/no-Drop gates
+        // and every cleared-entry ORIGINAL-body kernel row admit the summary;
+        // its typed pre-call inputs/post-call field fact grant no whole-result
+        // pin or SAT-refutation authority. Missing context/entry returns None.
+        ("lib.rs", "constructor_return_summary"),
+        // Trust (2026-09-30): the return-interval summary, read back like its
+        // siblings (keyed by the summarized body's def path, applied only at a call
+        // that reaches that body).
+        ("lib.rs", "callee_return_interval"),
+        ("lib.rs", "callee_return_lower_bound"),
+        // Trust (2026-10-01): the payload return-interval summary, the same read-back.
+        ("lib.rs", "callee_return_payload_interval"),
+        // Trust (G1, 2026-10-27): the libc pointer-return-contract wrapper summary,
+        // the same read-back (keyed by the summarized wrapper's def path, applied only
+        // at a call whose identity reaches that body: `ffi_pointer_contract::call_contract`).
+        ("lib.rs", "callee_ffi_pointer_return_symbol"),
+        // Trust (2026-10-01): the identity gate for a summary read without a call
+        // terminator (a closure passed by value to `Iterator::map`), a context read-back.
+        ("lib.rs", "summary_body_is_unique_in"),
+        // Trust (2026-10-01): not a recognizer but the arrow mask every bracket-depth
+        // parser of a callee spelling runs first (`->` read as `>` hid a fold row).
+        ("lib.rs", "mask_fn_arrows"),
+        ("lib.rs", "callee_return_upper_bound"),
+        ("lib.rs", "callee_setter_summary"),
+        // Trust (REVIEW-A4C4-MINORS-1 fix-forward, 2026-11-07): rustc's computed layout
+        // of a foreign call's struct pointee, by block, read back out of the
+        // owner-checked context — the `compiler_unmodeled_call_blocks_for` shape. The `&str` is the def path it checks
+        // OWNERSHIP with; the layout (`layout_of`) was computed by
+        // `rustc_mir_transform::trust_verify`. Missing or mismatched context supplies
+        // none, which lends no struct-pointee FFI contract.
+        ("lib.rs", "compiler_foreign_return_pointee_layout_for"),
+        // The compiler's OWN `[unsafe:unmodeled-call]` rows, by block, read back
+        // out of the owner-checked generation context. It recognizes nothing:
+        // the only `&str` it takes is the def path it checks OWNERSHIP with, and
+        // the fact it returns was computed by the compiler, not by this crate.
+        ("lib.rs", "compiler_unmodeled_call_blocks_for"),
+        // Trust (G1, 2026-10-27): the compiler's exact-layout `mem::zeroed` verdicts,
+        // by block, read back out of the owner-checked context — the same shape. The
+        // `&str` is the def path it checks OWNERSHIP with; the verdict (`mem_zeroed`
+        // diagnostic item, `check_validity_requirement_exact`) was made by
+        // `rustc_mir_transform::trust_verify` on the `TyCtxt`. Empty or mismatched
+        // context covers no site.
+        ("lib.rs", "compiler_zero_valid_zeroed_blocks_for"),
+        ("lib.rs", "contract_panic_annotations_for"),
+        // ARGS-FINGERPRINT-READ-1 round 4: the owner-checked read that lends the
+        // top frame's `DefId`-decided self-call blocks to a fresh frame of the
+        // same owner; the `&str` is the OWNER def path and decides nothing.
+        ("lib.rs", "inherited_direct_self_call_blocks"),
+        // ALLOC-STRIDE-ADT-2 (2026-10-07): the element-size binding of the top
+        // frame, for a fresh frame of the SAME function. It recognizes nothing:
+        // the `&str` is the def path it checks OWNERSHIP with, and the table was
+        // computed by the compiler (`layout_of`). Live-length capacity lane.
+        ("lib.rs", "inherited_elem_sizes"),
+        // PRIMITIVE-DECIMAL-LEN (2026-11-06): the compiler-bound primitive
+        // decimal-string length table of the top frame, for a fresh frame of
+        // the SAME function. It recognizes nothing: the `&str` is the def path
+        // it checks OWNERSHIP with.
+        ("lib.rs", "inherited_primitive_decimal_strings"),
+        ("lib.rs", "is_certified_modular_arith"),
+        // REBASE 2026-09-21: the declared process-signal policy for a def path, read
+        // back out of the same owner-checked context. Fail-closed (`None` leaves the
+        // `ProcessSemantics` mandate OPEN). Process-semantics lane, not the mint.
+        ("lib.rs", "process_signal_policy_for"),
+        // 2026-09-25 (mutual-recursion termination): the compiler's recursion-SCC
+        // facts, read back out of the owner-checked context — the same shape as
+        // `compiler_unmodeled_call_blocks_for`. It recognizes nothing: the `&str`
+        // is the def path it checks OWNERSHIP with, and every identity decision
+        // (SCC membership, the resolved callee `DefId` per call block, each
+        // member's measure) was made by `rustc_mir_transform::trust_verify` on
+        // the `TyCtxt`. Absent or mismatched context charges only direct self
+        // recursion, as before. Termination lane, not the unsafe-contract mint.
+        ("lib.rs", "recursion_scc_context_for"),
+        // D8 (2026-09-24): the compiler's returned-`Box` validity-root call
+        // blocks, read back out of the owner-checked context — the same shape as
+        // `compiler_unmodeled_call_blocks_for`. It recognizes nothing: the `&str`
+        // is the def path it checks OWNERSHIP with, and the decision (resolved
+        // instance, attributes, ABI, session opt level) was made by
+        // `trust_mir_extract::returned_box_root` on the `TyCtxt`. Empty or
+        // mismatched context roots nothing.
+        ("lib.rs", "returned_box_root_blocks_for"),
+        // D14 (2026-10-09): the compiler-installed REFERENCE_ARG_BOX_VALID argument
+        // list, read off the owner-checked context like `noalias_mut_params_for`;
+        // recognizes no callee, mints no unsafe fact. Empty roots nothing.
+        ("lib.rs", "reference_box_root_params_for"),
+        // 2026-10-09 (sweep r04): core's lossless primitive-int `From`, for the
+        // iterator-fold ITEM bound lane (`fold_source_bound`'s `map` arm), not the
+        // unsafe-contract mint. Both refuse a stamped (user-rebuilt `core`) path; the
+        // mapper constant's own `core::convert::From::from` is checked with
+        // `path_root_is_authenticated_sysroot_crate`, and only core can implement
+        // `From` between two primitive integers.
+        ("generate/alloc_vcs.rs", "lossless_from_mapper_items"),
+        ("generate/alloc_vcs.rs", "lossless_primitive_int_from_source_range"),
+        // 2026-10-09 (sweep m07): the ascii-predicate TRUE-set lookup factored out
+        // of `ascii_predicate_bound` (same crate-anchored, exact-leaf match), now
+        // shared with the interval domain's branch narrowing. Guard/interval lane.
+        ("guards.rs", "ascii_predicate_true_set"),
+        ("lib.rs", "single_writer_hint_for"),
+        // Trust (G1 review, 2026-10-27; classified 2026-11-02): whether the compiler
+        // declared that the def path's compilation targets Darwin, read back out of
+        // the owner-checked context — the `compiler_zero_valid_zeroed_blocks_for`
+        // shape. It recognizes nothing: the `&str` is the def path it checks
+        // OWNERSHIP with, and the answer (`tcx.sess.target.is_like_darwin`) was
+        // decided by `rustc_mir_transform::trust_verify`. Missing or mismatched
+        // context answers `false`, which admits no Darwin-only FFI contract row.
+        ("lib.rs", "target_is_darwin_for"),
+        ("lib.rs", "verify_stdlib_subject_memory_safety_for"),
+        ("lib.rs", "with_current_vcgen_context"),
+        ("lib.rs", "with_function_vcgen_context"),
+        // 2026-09-25: the scope that installs the recursion-SCC facts, for the bundle
+        // constructor's source-clause regeneration only. The `&str` names the
+        // OWNER of the frame it pushes; it decides nothing.
+        ("lib.rs", "with_recursion_scc_context"),
+        // ARGS-FINGERPRINT-READ-1 round 3 (2026-10-07): the owner-checked read of the
+        // compiler's `DefId`-decided direct-self-call blocks, and the scope that
+        // installs them for the bundle regeneration. The `&str` is the OWNER def
+        // path; the decision was taken from `DefId`s on the `TyCtxt`, and the set
+        // can only withdraw a rendered-path self-call match.
+        ("lib.rs", "compiler_admits_direct_self_call"),
+        // GENERIC-CALL-KEY-ALIAS-1 with ARGS-FINGERPRINT-READ-1 round 4 (2026-10-10):
+        // the same owner-checked read, but with no installed set it answers `false`
+        // (never defaults open). The `&str` is the OWNER def path; the filing was
+        // decided from `DefId`s on the `TyCtxt`. It lets an alias-tagged call whose
+        // untagged path is the body's own count as a self call only where the
+        // compiler filed its block. Termination lane, not the unsafe-contract mint.
+        ("lib.rs", "compiler_files_direct_self_call"),
+        ("lib.rs", "with_termination_identity_context"),
+        ("lift_adapter.rs", "copy_sink_length_desc"),
+        ("lift_adapter.rs", "copy_sink_spec"),
+        ("paired_condvar_cert.rs", "may_be_dataflow_callee"),
+        ("paired_condvar_cert.rs", "normalize_callee"),
+        ("separation_logic/unsafe_ops.rs", "parse_transmute_types"),
+        // REBASE 2026-09-21: strips ONLY a terminal turbofish from a rendered callee so
+        // two spellings of one item compare equal. It decides DIRECT SELF-RECURSION for
+        // the inferred `[termination]` lane — a forged spelling moves a descent row,
+        // not a UB proof. Termination lane, and a KNOWN RESIDUAL of it.
+        ("termination.rs", "direct_call_identity"),
+        ("termination.rs", "is_std_saturating_add"),
+        // GENERIC-CALL-KEY-ALIAS-1 with ARGS-FINGERPRINT-READ-1 round 4 (2026-10-10):
+        // removes exactly one terminal `::<__trust_alias@` + 32 hex `>` group from a
+        // rendered callee. Read only by `is_direct_self_call`, as a CONJUNCT with the
+        // compiler's installed `DefId` filing of the block
+        // (`compiler_files_direct_self_call`): a forged spelling cannot add a self
+        // call the compiler did not file. Termination lane, not the mint.
+        ("termination.rs", "strip_local_key_alias_tag"),
+        // TINV step 10.3 review fold-in (2026-10-07): compares the GENERATING body's own
+        // `def_path` with the innermost TINV recording scope's; it reads no callee name.
+        // A `true` lets use-site facts (each TAGGED, kernel-refused, disclosed and graded
+        // `TypeInvariantComposed` at most) into that body's rows; a forged spelling could
+        // only match a body whose own scope the compiler opened.
+        ("type_invariant/use_set.rs", "record_scope_admits"),
+        ("unsafe_verify/detection.rs", "callee_is_authenticated_sysroot"),
+        ("unsafe_verify/detection.rs", "callee_is_sysroot_item"),
+        // DELETED 2026-09-20 with the `Covered` asymmetry: the two
+        // `compiler_mints_unmodeled_call_row*` arms and the two path-surgery
+        // helpers they used (`strip_instantiation_args`,
+        // `strip_unauthenticated_crate_stamp`). They existed to PREDICT the
+        // compiler's fail-closed row from a rendered callee path; the mint is
+        // now handed the compiler's own rows
+        // (`UnsafeCoverage::compiler_unmodeled_call_blocks`), so there is no
+        // prediction and no normalizer left to desynchronize.
+        ("unsafe_verify/detection.rs", "core_intrinsics_leaf"),
+        ("unsafe_verify/detection.rs", "is_unsafe_fn_call"),
+    ];
+
+    const RECOGNIZER_GUARDS: &[RecognizerGuard] = &[
+        RecognizerGuard {
+            name: "is_alloc_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(
+                is_alloc_call,
+                &[
+                    SysrootItem::AllocAlloc,
+                    SysrootItem::AllocAllocZeroed,
+                    SysrootItem::GlobalAllocatorAllocate,
+                    SysrootItem::GlobalAllocatorDeallocate,
+                    SysrootItem::BoxNew,
+                    SysrootItem::BoxNewUninit,
+                ],
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_global_allocator_ufcs_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(
+                is_global_allocator_ufcs_call,
+                GLOBAL_ALLOCATOR_UFCS_ITEMS,
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_known_good_box_alloc",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_known_good_box_alloc, KNOWN_GOOD_BOX_ALLOC_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "callee_is_std_crate_rooted_sup",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Text(
+                suppression_mirror::callee_is_std_crate_rooted_sup,
+                "MOVED TO THE MIRROR (round 7): the mint no longer has a crate-root \
+                 text test at all — `CalleeKey::sysroot_item` is minted only under \
+                 `is_real_sysroot_crate`. The string version survives in \
+                 `suppression_mirror`, and this entry guards it there.",
+            ),
+            class: RecognizerClass::SuppressesOnly(
+                "MOVED TO THE MIRROR (round 7), so it no longer mints anything: the mint has no crate-root text test at all. Reclassified from Mints, which it stopped being the moment its last minting caller became keyed.",
+            ),
+            genuine: &["core::ptr::read::<u64>", "alloc::vec::vec::<u8>::set_len"],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "callee_is_std_raw_ptr_inherent_sup",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Text(
+                suppression_mirror::callee_is_std_raw_ptr_inherent_sup,
+                "MOVED TO THE MIRROR (round 7): the two Group-C predicates this \
+                 anchored (`is_ptr_offset_call`, `is_ptr_cast_call`) now name their \
+                 items; the string version survives in `suppression_mirror`.",
+            ),
+            class: RecognizerClass::SuppressesOnly(
+                "MOVED TO THE MIRROR (round 7). The two Group-C predicates it anchored now name their items; nothing it is reachable from can mint.",
+            ),
+            genuine: &["core::ptr::mut_ptr::<impl *mut u8>::add"],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_std_fmt_arguments_ctor",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Text(
+                is_std_fmt_arguments_ctor,
+                "SUPPRESSES ONLY: withholds the completeness VC for `format_args!`-generated ctors. Reaching it needs the compiler's own string (`call_has_unsafe_model`).",
+            ),
+            class: RecognizerClass::SuppressesOnly(
+                "compiler-GENERATED `format_args!` machinery: covering the call \
+                 suppresses a vacuous completeness failure and mints nothing. \
+                 Already crate-anchored; the class is what matters here.",
+            ),
+            genuine: &["core::fmt::arguments::new_v1"],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_std_from_raw_fd",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Text(
+                is_std_from_raw_fd,
+                "SUPPRESSES ONLY: withholds the completeness VC for `from_raw_fd`. Same string-only reach as above.",
+            ),
+            class: RecognizerClass::SuppressesOnly(
+                "fd validity is a resource-typestate property outside this \
+                 memory-safety layer; covering the CALL cannot false-prove a \
+                 memory operation.",
+            ),
+            genuine: &["std::os::fd::owned::ownedfd::from_raw_fd"],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_container_as_ptr_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_container_as_ptr_call, CONTAINER_AS_PTR_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "call_is_modeled",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Text(
+                call_is_modeled,
+                "THE SUPPRESSION MIRROR ITSELF. The compiler calls its wrapper `crate::call_has_unsafe_model` with `safe_def_path_str(tcx, did)` — a rendered string and nothing else — so keying this side would desynchronize the mirror and silently delete stand-ins (the round-5 fail-open). See `suppression_mirror`'s header.",
+            ),
+            class: RecognizerClass::SuppressesOnly(
+                "THE suppression aggregate — it IS `call_has_unsafe_model` on the \
+                 vcgen side. It fires for a user callee exactly when one of the \
+                 `SuppressesOnly` members does, and `decide_site` answers that \
+                 with the fail-closed stand-in.",
+            ),
+            genuine: &["core::ptr::read::<u64>"],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_native_tls_lazy_init_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Text(
+                is_native_tls_lazy_init_call,
+                "SUPPRESSES ONLY: the `thread_local!` machinery. String-only reach.",
+            ),
+            class: RecognizerClass::SuppressesOnly(
+                "`thread_local!`-expanded compiler-generated machinery, same tier \
+                 as the `fmt::arguments` precedent; mints nothing.",
+            ),
+            genuine: &[
+                "std::thread::local_impl::lazystorage::<u32, ()>::get_or_init",
+                // REAL extracted MIR, both arms, seal `ff538f905`
+                // (`-Ztrust-dump=mir-only`, `$TMPDIR/rc6/tls2.rs`). The lazy one
+                // carries the `->`-bearing init-fn turbofish that used to need a
+                // substring hatch; it is matched exactly now.
+                "std::sys::thread_local::native::lazy::storage::<alloc::vec::vec<u8>, !>\
+                 ::get_or_init::<fn() -> alloc::vec::vec<u8> \
+                 {tls2::arena::__rust_std_internal_init_fn}>",
+                "std::sys::thread_local::native::eager::storage::<core::cell::cell<u64>>::get",
+            ],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_ptr_cast_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_ptr_cast_call, PTR_CAST_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "strip_turbofish_args",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::None,
+            class: RecognizerClass::Helper("removes `::<…>` groups; decides nothing"),
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "callee_is_sysroot_item_tag",
+            file: "sep_engine.rs",
+            // THE FUNNEL ITSELF (round 7), exercised through one of its lists.
+            // It replaced `callee_is_sysroot_spelling`, whose string version now
+            // lives in `suppression_mirror` and is guarded through
+            // `call_is_modeled`.
+            predicate: GuardPredicate::Keyed(
+                |k| callee_is_sysroot_item_tag(k, RAW_READ_WRITE_ITEMS),
+                RAW_READ_WRITE_ITEMS,
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_unchecked_index_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_unchecked_index_call, UNCHECKED_INDEX_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_char_from_u32_unchecked_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(
+                is_char_from_u32_unchecked_call,
+                CHAR_FROM_U32_UNCHECKED_ITEMS,
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_set_len_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_set_len_call, SET_LEN_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_ptr_copy_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_ptr_copy_call, PTR_COPY_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_borrowed_from_raw_parts_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(
+                is_borrowed_from_raw_parts_call,
+                &[
+                    SysrootItem::SliceFromRawParts,
+                    SysrootItem::SliceFromRawPartsMut,
+                    SysrootItem::StrFromRawParts,
+                    SysrootItem::StrFromRawPartsMut,
+                ],
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_from_raw_parts_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_from_raw_parts_call, FROM_RAW_PARTS_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_transmute_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_transmute_call, TRANSMUTE_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "unsafe_assertion_op",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(
+                |k| unsafe_assertion_op(k).is_some(),
+                UNSAFE_ASSERTION_ITEMS,
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_nonzero_new_unchecked_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(
+                is_nonzero_new_unchecked_call,
+                NONZERO_NEW_UNCHECKED_ITEMS,
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_unsafe_arith_op",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(
+                is_unsafe_arith_op,
+                &[
+                    SysrootItem::NonZeroNewUnchecked,
+                    SysrootItem::NonNullNewUnchecked,
+                    SysrootItem::UniqueNewUnchecked,
+                    SysrootItem::CharFromU32Unchecked,
+                    SysrootItem::CharMethodsFromU32Unchecked,
+                    SysrootItem::VecSetLen,
+                ],
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_unwrap_unchecked_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_unwrap_unchecked_call, UNWRAP_UNCHECKED_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_raw_read_write_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_raw_read_write_call, RAW_READ_WRITE_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_layout_size_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_layout_size_call, LAYOUT_SIZE_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_layout_passthrough_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Text(
+                is_layout_passthrough_call,
+                "ARM SELECTOR + suppression entry; deliberately unanchored since 2026-09-20. The two things inside its arm that are NOT suppressions are keyed on their own (`is_layout_size_passthrough_call`, `is_unwrap_unchecked_call`).",
+            ),
+            class: RecognizerClass::SuppressesOnly(
+                "ARM SELECTOR + `call_is_modeled` entry only. The two things the \
+                 arm actually does are anchored on their own: \
+                 `is_layout_size_passthrough_call` (the size relocation) and \
+                 `is_unwrap_unchecked_call` (the obligation).",
+            ),
+            genuine: &["core::result::result::unwrap"],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_layout_size_passthrough_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(
+                is_layout_size_passthrough_call,
+                LAYOUT_PASSTHROUGH_ITEMS,
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_dealloc_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_dealloc_call, DEALLOC_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_global_dealloc_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_global_dealloc_call, GLOBAL_DEALLOC_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_realloc_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_realloc_call, REALLOC_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_ptr_offset_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Keyed(is_ptr_offset_call, PTR_OFFSET_ITEMS),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "strip_leading_crate_stamp",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::None,
+            class: RecognizerClass::Helper("removes a LEADING `__trust_crate@<id>::`"),
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "callee_crate_root",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::None,
+            class: RecognizerClass::Helper("returns the first path segment"),
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "callee_is_posix_mmap",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Text(
+                callee_is_posix_mmap,
+                "CUT 2, DECLARED: the mmap family's targets are THIRD-PARTY by design and never sysroot, so the closed sysroot vocabulary cannot name them. A desync here costs a map MODEL, not a minted contract. The structured replacement (`CalleeKey::foreign_block_leaf`) is minted and carried but not yet consumed; that is the next round.",
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &["libc::{extern#0}::mmap", "libc::mmap"],
+            // The caller's OWN `extern "C" { fn mmap(…) }`. See the field's doc.
+            admitted_user_rebuilds: &[
+                "userkrate::{extern#0}::mmap",
+                "mycrate::libc::{extern#0}::mmap",
+                "evilcrate::{extern#0}::mmap",
+            ],
+            // MEASURED: the genuine `libc` IS stamped (ambiguity with std's own).
+            stamp_is_a_rejection: false,
+        },
+        RecognizerGuard {
+            name: "is_extern_block_item",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::None,
+            class: RecognizerClass::Helper(
+                "takes a second argument (the leaf); asks whether the path names an \
+                 `extern` BLOCK item. Exercised through `callee_is_posix_mmap` and \
+                 `is_external_map_call`.",
+            ),
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "blanket_only_op",
+            file: "unsafe_verify/detection.rs",
+            // ROUND 7: PROMOTED out of `CALLEE_RECOGNIZERS_OUTSIDE_THE_UNSAFE_MINT`
+            // and into the guarded mint. It was listed there with the honest note
+            // that it "sits in the unsafe lane by its name" and had never been
+            // put through the refutation a `Mints` entry owes. It MINTS: each arm
+            // selects a TYPED refutation (`[unsafe:zeroed]`, `[unsafe:uninit]`,
+            // `[unsafe:unreachable]`) whose obligation is decided on the
+            // destination type or on reachability, so charging one to the wrong
+            // callee states the wrong contract for the site. Now it decides on
+            // the key and the guard checks it against the whole vocabulary.
+            predicate: GuardPredicate::Keyed(
+                |k| crate::unsafe_verify::detection::blanket_only_op(k).is_some(),
+                &[
+                    SysrootItem::MemZeroed,
+                    SysrootItem::MemUninitialized,
+                    SysrootItem::HintUnreachableUnchecked,
+                ],
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &[],
+            admitted_user_rebuilds: &[],
+            stamp_is_a_rejection: true,
+        },
+        RecognizerGuard {
+            name: "is_external_map_call",
+            file: "sep_engine.rs",
+            predicate: GuardPredicate::Text(
+                is_external_map_call,
+                "CUT 2, DECLARED: see `callee_is_posix_mmap`. Same third-party targets, same blast radius, same carried-but-unconsumed `foreign_block_leaf`.",
+            ),
+            class: RecognizerClass::Mints,
+            genuine: &["libc::{extern#0}::mmap", "memmap2::mmapmut::map_mut"],
+            // The caller's OWN `extern "C" { fn mmap(…) }`. See the field's doc.
+            // The `memmap2` rebuilds are NOT here: they must still miss.
+            admitted_user_rebuilds: &[
+                "userkrate::{extern#0}::mmap",
+                "mycrate::libc::{extern#0}::mmap",
+                "evilcrate::{extern#0}::mmap",
+            ],
+            stamp_is_a_rejection: false,
+        },
+    ];
+
+    // ── WIDENING THE CENSUS INTO A CLASS GUARD (round 5, 2026-09-20) ────────
+    //
+    // dbca8432f9 shipped the guard above as a SPELLING CENSUS OF ONE FILE. The
+    // guard-completeness lens named two holes, and they are real:
+    //
+    //   (i)  A recognizer added in ANOTHER file of this crate was invisible.
+    //        `include_str!("sep_engine.rs")` cannot see `unsafe_verify/`,
+    //        `generate/`, `lib.rs`, or a file that does not exist yet. The
+    //        scan below walks the WHOLE of `crates/trust-vcgen/src` at test
+    //        time (248 `.rs` files, MEASURED 2026-09-20).
+    //
+    //   (ii) A forgeable key that is NOT a callee path was not covered at all.
+    //        `is_trusted_std_file` was exactly such a key: it decided on
+    //        `SourceSpan::file`, which is UNREMAPPED, USER-CONTROLLED TEXT, and
+    //        returning true there DELETES every `[unsafe:sep:*]` obligation for
+    //        that span. Round 5 recorded it, rounds 7 and 8 scoped it out again
+    //        as a "known residual", and round 9 MEASURED what the residual was
+    //        worth — 3 obligations under `core/src/evil.rs` against 13 under
+    //        `mycore/src/evil.rs`, byte-identical source, same `--crate-name
+    //        evil` — and closed it. The predicate is gone; `is_trusted_std_span`
+    //        now joins against an artifact-residency table the compiler builds.
+    //        A guard that cannot see a key is not a class guard, and this is the
+    //        key it was widened to see.
+    //
+    // The scan is keyed on the KIND OF KEY a predicate trusts, not on a file
+    // name, so "add the recognizer somewhere else" stops being an escape.
+
+    /// The kinds of forgeable KEY this crate makes trust decisions on.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    enum ForgeableKey {
+        /// A callee def path (`lower: &str`) — covered by `RECOGNIZER_GUARDS`.
+        CalleePath,
+        /// ROUND 7: a COMPILER-MINTED `CalleeKey`. Not forgeable at all — that
+        /// is the point of the round — but it is scanned and classified exactly
+        /// like the others, because "this recognizer moved to the key" has to be
+        /// a VISIBLE event in the census and not a silent disappearance from it.
+        /// A `Mints` entry in `RECOGNIZER_GUARDS` must carry one of these; the
+        /// guard asserts the pairing, so re-introducing a string parameter to a
+        /// minting recognizer is RED here as well as at the call site.
+        StructuredCalleeKey,
+        /// A source FILE path, in practice out of a `SourceSpan`.
+        FilePath,
+        /// A whole `SourceSpan`.
+        Span,
+    }
+
+    /// What a NON-CALLEE key predicate's key is worth. Every one owes a
+    /// non-empty reason; the test asserts it.
+    #[derive(Clone, Copy)]
+    enum KeyDisposition {
+        /// The key carries provenance the compiler authenticated, so user text
+        /// cannot forge it. The string says HOW.
+        ///
+        /// CONSTRUCTED SINCE 2026-09-20, AND THAT IS THE ROUND. It was
+        /// deliberately unconstructed for three rounds with this note: "the
+        /// variant is the destination the residuals are headed for
+        /// (rustc-authenticated `SourceFile::cnum` / `is_imported()`), so the
+        /// first predicate that gets there has a slot with a doc explaining what
+        /// it must prove." The two span predicates got there: the trusted-std
+        /// question is now answered from ARTIFACT RESIDENCY through
+        /// `trust_types::TrustedStdSourceFiles`, and the file-path predicate
+        /// that used to sit beside them — `is_trusted_std_file` — is DELETED
+        /// rather than reclassified, because there is no longer a path pattern
+        /// anywhere in the decision.
+        Authenticated(&'static str),
+        /// The key is user-controlled text and this predicate trusts it. A
+        /// DELIBERATE, RECORDED residual: the string says what stays open and
+        /// what closing it costs. This is the honest disposition, not a pass.
+        KnownResidual(&'static str),
+        /// Decides nothing about trust — ordering, splitting, formatting.
+        NotATrustDecision(&'static str),
+    }
+
+    struct KeyGuard {
+        name: &'static str,
+        /// Path under `crates/trust-vcgen/src`, so a move is caught as stale.
+        file: &'static str,
+        key: ForgeableKey,
+        disposition: KeyDisposition,
+    }
+
+    /// Every non-callee key predicate in this crate, classified. An unlisted one
+    /// is RED.
+    const KEY_GUARDS: &[KeyGuard] = &[
+        // `is_trusted_std_file` STOOD HERE, the campaign's last FilePath key,
+        // carrying a KnownResidual that said closing it "needs
+        // rustc-authenticated provenance — `SourceFile::cnum` / `is_imported()`".
+        // It is DELETED, not reclassified: the decision no longer inspects a
+        // path at all, so there is no predicate left to classify. What the
+        // residual cost while it stood, MEASURED on the round-8 fix lane with
+        // byte-identical source and the same `--crate-name evil`:
+        // `core/src/evil.rs` 3 obligations, `library/core/src/evil.rs` 3,
+        // `usr/lib/rustlib/src/rust/library/core/src/evil.rs` 3,
+        // `mycore/src/evil.rs` 13 — a plain `unsafe { *p = 7 }` losing all four
+        // `[unsafe:sep:{deref,write}]` rows and both `UnmodeledSafetyAssert`
+        // stand-ins to a directory name.
+        KeyGuard {
+            name: "is_trusted_std_span",
+            file: "sep_engine.rs",
+            key: ForgeableKey::Span,
+            disposition: KeyDisposition::Authenticated(
+                "Reads NO field of the span but `file`, and reads it only as a JOIN KEY \
+                 into `trust_types::TrustedStdSourceFiles` — the table \
+                 `trust_mir_extract::trusted_std_source_files` builds by pairing every \
+                 `rustc_span::SourceFile` in the session's source map with \
+                 `is_real_sysroot_crate(tcx, file.cnum)`, i.e. ARTIFACT RESIDENCY in the \
+                 compiler's own target library directory. `cnum` is set by rustc's \
+                 metadata decoder and residency by where the loader opened the artifact; \
+                 neither is reachable from the file's name or its contents. The rendering \
+                 used for the join is the SAME expression both obligation-identity span \
+                 converters stamp onto `SourceSpan::file` \
+                 (`stable_obligation_file(prefer_local_unconditionally())`), so the join \
+                 is byte-exact. Fail-closed at every step: no context, no installed \
+                 table, an unnamed file, the empty path, `binary:` provenance, and any \
+                 rendering two source files disagreed about all answer `false`, which \
+                 KEEPS the obligation.",
+            ),
+        },
+        KeyGuard {
+            name: "span_is_trusted_std",
+            file: "lib.rs",
+            key: ForgeableKey::Span,
+            disposition: KeyDisposition::Authenticated(
+                "THE PUBLIC wrapper, and now the single decision BOTH consumers make: \
+                 `is_trusted_std_span` passes the table installed on the active \
+                 `VcgenContext`, and `rustc_mir_transform`'s unmodeled-unsafe-CALL \
+                 generator passes the table it built from its own `TyCtxt`. Same \
+                 function, same table, so the mint and the compiler cannot disagree \
+                 about a span — the round-5 fail-open shape, closed structurally here \
+                 the way it was closed for `compiler_unmodeled_call_blocks`. The span \
+                 stays the FIRST parameter so this census can still see it.",
+            ),
+        },
+        KeyGuard {
+            // FOUND BY THE ROUND-6 WIDENING. Its parameter is spelled `outer`,
+            // not `span`, so the old two-spelling census could not see it at
+            // all — a span predicate hiding behind a parameter name.
+            name: "source_span_contains",
+            file: "contracts.rs",
+            key: ForgeableKey::Span,
+            disposition: KeyDisposition::NotATrustDecision(
+                "Geometry over two spans already in hand: same non-empty `file`, then \
+                 (line, col) containment. It does read `SourceSpan::file` — but only to \
+                 compare the two spans WITH EACH OTHER, never against a trusted-path \
+                 table, so there is no spelling a user can write that buys anything. It \
+                 answers CONTAINMENT for grouping and nesting; forging a span changes \
+                 which span a row is attributed to, never whether the row exists.",
+            ),
+        },
+        // `source_span_order_key` in `contracts.rs` stood here as
+        // `NotATrustDecision`; deleted in `e112056065` when
+        // `pair_loop_from_body_source_evidence` replaced sorting by earliest
+        // contained span with `has_contained_loop_span`.
+        KeyGuard {
+            name: "path_segments",
+            file: "hardened.rs",
+            key: ForgeableKey::FilePath,
+            disposition: KeyDisposition::NotATrustDecision(
+                "Angle-depth-aware `::` splitter over a def path. String surgery; its \
+                 CALLERS make the decisions and are callee-path recognizers in their own \
+                 right.",
+            ),
+        },
+        KeyGuard {
+            // T3 C05: the overflow-check origin inventory's alignment guard.
+            name: "location_fingerprint",
+            file: "generate/overflow_origins.rs",
+            key: ForgeableKey::Span,
+            disposition: KeyDisposition::NotATrustDecision(
+                "Hashes a row's span only to check that an origin still sits on the row \
+                 it was taken from. A mismatch REFUSES the whole origin table, so every \
+                 overflow check is kept; a match licenses nothing. The check is blind to \
+                 twins: two rows with one span and one op (one macro expansion) that \
+                 traded places would pass it, and the seam's live re-confirm reads only \
+                 the op. The pairing therefore rests on no code between the walk and the \
+                 inventory moving a row except the tracked sort and splice, which \
+                 overflow_origins_tests' census of every use of the row list holds. The \
+                 origin block comes from the safety walk's own (block, row) pairing, and \
+                 the elision seam joins a KernelCertified row by its exact identity.",
+            ),
+        },
+    ];
+
+    /// Files under `crates/trust-vcgen/src` whose contents are test scaffolding.
+    /// Only the NON-CALLEE scan honours this: a `(lower: &str)` predicate is
+    /// enumerated wherever it appears, including inside a test module, because
+    /// that property is what caught a missing entry when this table was written
+    /// (`callee_is_sysroot_spelling`, dbca8432f9) and again on 2026-09-20.
+    fn is_test_scaffolding(rel: &str) -> bool {
+        let base = rel.rsplit('/').next().unwrap_or(rel);
+        base == "tests.rs"
+            || base.ends_with("_tests.rs")
+            || rel.contains("/tests/")
+            || rel.contains("_tests/")
+    }
+
+    fn rs_files_under_src() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let rel = path
+                        .strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if let Ok(src) = std::fs::read_to_string(&path) {
+                        out.push((rel, src));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    // ── THE SCAN CHECKS WHAT IT PRINTS (round 6, 2026-09-20) ────────────────
+    //
+    // `d524fc3fa0` widened the census to the whole crate and was still, under
+    // the guard-is-a-guard lens, a census of TWO LITERAL PARAMETER SPELLINGS
+    // matched by `starts_with` on ONE UN-WRAPPED source line, then checked
+    // against the tables BY BARE NAME with the file thrown away. Three holes,
+    // all MEASURED on this tree:
+    //
+    //   (i)   A MULTI-LINE `fn` SIGNATURE WAS INVISIBLE. `trustfmt` wraps any
+    //         signature past the column limit, and the old scan read one line.
+    //         MEASURED: 1153 of this crate's `fn` headers are wrapped, nine of
+    //         them verdict-returning predicates on a forgeable key — including
+    //         `generate/assert_refutation.rs::authenticated_wrapping_call`
+    //         and `lift_adapter.rs::format_string_call_vc`. The scan now JOINS
+    //         forward until the parameter list's parentheses close.
+    //
+    //   (ii)  THE FILE WAS PRINTED AND NEVER CHECKED. Two recognizers with the
+    //         same name in different files collapsed to one table entry, and
+    //         only one of them was ever exercised. The crate HAS such a pair:
+    //         `guards.rs::is_std_num_intrinsic` and
+    //         `generate/call_facts.rs::is_std_num_intrinsic`. Every key is now
+    //         `(file, name)`.
+    //
+    //   (iii) A DIFFERENTLY-SPELLED PARAMETER WAS NEVER SEEN. The census keyed
+    //         on the literal `lower: &str`, so this crate's OTHER spelling for
+    //         exactly the same key — `callee: &str` — was invisible.
+    //         MEASURED: 153 such predicates, 121 of them outside test
+    //         scaffolding and 113 of those top-level, including `lib.rs::call_has_unsafe_model` (the
+    //         compiler-side twin of `call_is_modeled`, which IS in the table),
+    //         `unsafe_vc.rs::classify_call` and
+    //         `unsafe_verify/detection.rs::blanket_only_op`. A `span:` was
+    //         likewise required to be spelled `span`, which lost
+    //         `contracts.rs::source_span_contains(outer: &SourceSpan)`.
+    //
+    // The scan is now driven by the parameter's TYPE, with the NAME used only
+    // to say WHICH key an `&str` is, out of three ENUMERATED lists. An `&str`
+    // first parameter on a verdict-returning top-level fn whose name is in none
+    // of the three FAILS THE TEST. That is the property that matters: a
+    // recognizer the scan cannot classify must fail, not vanish.
+
+    /// `&str` first-parameter names that mean "a CALLEE DEF PATH". Both
+    /// spellings are this crate's own, MEASURED: 35 `lower:` and 153 `callee:`.
+    /// `callee_name` and `def_path` are the same key under two more spellings.
+    const CALLEE_PATH_PARAM_NAMES: &[&str] = &["lower", "callee", "callee_name", "def_path"];
+
+    /// `&str` first-parameter names that mean "a SOURCE FILE PATH" — the key
+    /// `is_trusted_std_file` trusted, which is unremapped user-controlled text.
+    ///
+    /// THE CLASS IS EMPTY as of 2026-09-20 and the census asserts that it stays
+    /// empty; the list is kept so the assertion has something to scan FOR. A new
+    /// `&str`-keyed file-path predicate fails the test rather than appearing
+    /// unremarked.
+    const FILE_PATH_PARAM_NAMES: &[&str] = &["file", "file_path", "filename", "path", "rel"];
+
+    /// Parameter TYPES that are a whole `SourceSpan`. Matched by TYPE, so the
+    /// parameter may be called anything — which is how
+    /// `contracts.rs::source_span_contains(outer: &SourceSpan)` becomes
+    /// visible; the old `span:`-only spelling list could not see it.
+    const SPAN_PARAM_TYPES: &[&str] = &[
+        "&SourceSpan",
+        "SourceSpan",
+        "Option<&SourceSpan>",
+        "&trust_types::SourceSpan",
+        "Option<&trust_types::SourceSpan>",
+        "trust_types::SourceSpan",
+    ];
+
+    /// Parameter TYPES that are a filesystem path.
+    const PATH_PARAM_TYPES: &[&str] =
+        &["&Path", "&PathBuf", "PathBuf", "&std::path::Path", "&std::path::PathBuf"];
+
+    /// Every OTHER `&str` first-parameter name this crate uses on a TOP-LEVEL,
+    /// NON-TEST, VERDICT-RETURNING fn, with what it actually is. This list is
+    /// the difference between a guard and a filter: a name that is NOT here and
+    /// NOT a key spelling above is a HARD FAILURE, so the next `&str` predicate
+    /// someone adds has to be classified by a human instead of silently
+    /// skipped. MEASURED 2026-09-20: 28 names, and every one of them is a
+    /// formula/identifier/diagnostic string, not a trust key. REBASE (2026-09-21,
+    /// carrying this campaign onto `origin/main` 6a56fd1683): 29 names. `written`
+    /// is the name main added in `generate/path_defs.rs` after the fork point —
+    /// the guard caught it, which is the behaviour this list exists for.
+    const NOT_A_FORGEABLE_KEY_PARAM_NAMES: &[(&str, &str)] = &[
+        ("a", "an SMT symbol being alias-compared against another symbol"),
+        ("body", "a loop-contract body's source text"),
+        ("bv_name", "a generated bit-vector variable name"),
+        ("child", "a place projection segment"),
+        ("comment", "the text of a `// SAFETY:` comment, not a path"),
+        ("dest", "a destination PLACE name inside one lowered body"),
+        ("dest_name", "a destination PLACE name inside one lowered body"),
+        ("expr", "an SMT expression being simplified"),
+        ("func_name", "the ENCLOSING function under verification, not a callee"),
+        ("fv", "a free variable of a formula"),
+        ("inner", "the inner half of an already-split qualified path"),
+        ("key", "a symbolic-state key generated by this crate"),
+        ("kind", "a hardened-call KIND tag generated by this crate"),
+        ("leaf", "an already-extracted final path segment"),
+        ("line", "one line of a source comment being parsed"),
+        ("marked", "an intrinsic name already carrying this crate's marker"),
+        ("name", "a local/variable/type NAME inside one lowered body"),
+        ("profile", "a hardening profile tag from committed policy"),
+        (
+            "range_ty",
+            "the RANGE TYPE half of an already-split std `Index`/`SliceIndex` callee \
+             (`generate/panic_calls.rs::range_type_name_is_panicking`, CONST-RANGE-INDEX-1): \
+             exact `core::ops`/`core::range` paths, and a match only ADDS a fail-closed \
+             bounds row, so a forged spelling can only be refused",
+        ),
+        ("role", "a memory-ordering role tag from this crate"),
+        ("s", "an unnamed string being split or scanned"),
+        ("segment", "one `::` segment of an already-split path"),
+        (
+            "serialized",
+            "the serde_json text of one lowered MIR statement, terminator or operand \
+             list, scanned for a place rooted at a given local \
+             (`generate/vec_len_invariant.rs::text_mentions_local`, VEC-LEN-LOOP-1): a \
+             match only REFUSES a length-invariance fact, so a forged spelling cannot \
+             admit one",
+        ),
+        ("suffix", "a projection suffix being parsed"),
+        (
+            "symbol",
+            "a C symbol name to look up in `ffi_pointer_contract::POINTER_RETURN_CONTRACTS` \
+             (`contract_named`, G1): it comes from a `CalleeKey`'s `foreign_block_leaf` (the \
+             compiler's `tcx.item_name` of an extern-block item, never a rendered path) or \
+             from a wrapper summary the caller's identity gate already admitted, and a match \
+             is further gated on `is_foreign`, the `libc` declaring crate and the pointee type",
+        ),
+        ("temp", "a MIR temporary name inside one lowered body"),
+        ("tok", "one token of an already-split path"),
+        ("token", "one token of an already-split expression"),
+        ("ty_name", "a primitive type name (`u8`, `i128`) from the lowered MIR"),
+        ("v", "an unnamed value string"),
+        ("var_name", "a quantifier binding name"),
+        (
+            "written",
+            "the WRITTEN place name of a rebind/kill relation inside one lowered \
+             body (`write_rebinds`, `dest_write_rebinds`, `write_covers_index_segment` \
+             in `generate/path_defs.rs`) — a name this crate minted for a MIR \
+             destination, never a callee path or a source file",
+        ),
+        // W4 HASHMAP r2 (2026-09-28): the census predicates of
+        // `std_hash_table_census.rs`.
+        (
+            "item_name",
+            "the DefId's OWN final path segment (`tcx.opt_item_name`, a `Symbol`, \
+             never a rendered path) of an item the compiler has ALREADY identified \
+             structurally — an inherent method of std's `HashMap`/`HashSet` \
+             diagnostic item, or an item of the crate behind them \
+             (`def_is_in_std_hash_table_crate`); the census predicates \
+             (`std_hash_*_panics_on_caller_value`) only ever EXCLUDE an item from \
+             the vanilla class (a refusal), never grant",
+        ),
+        // W32-PRIMINT-PIN-1 (2026-10-06).
+        (
+            "what",
+            "a diagnostic LABEL (a method leaf, `Trait::method`, `Iterator::count`) \
+             interpolated into the detail text of the fail-closed `UnsupportedMir` row \
+             `pointer-width-unresolved` (`generate/numeric_panic.rs::pointer_width_unresolved`); \
+             the row is minted the same whatever the label says, so a forged spelling can \
+             only change refusal text",
+        ),
+    ];
+
+    /// A `fn` item header, JOINED ACROSS LINES, with its first parameter and
+    /// return type split out. `(name, param name, param type, return type)`.
+    #[derive(Debug)]
+    struct FnHeader {
+        name: String,
+        param_name: String,
+        param_ty: String,
+        ret: String,
+    }
+
+    /// Index of the `(` that opens the PARAMETER list and of its matching `)`.
+    ///
+    /// The opener is the first `(` at ANGLE DEPTH 0, so a generic list is
+    /// skipped whole — including one containing parentheses of its own
+    /// (`fn f<F: Fn(u8) -> u8>(callee: &str)`). The angle counter uses the same
+    /// `->` rule as [`strip_turbofish_args`]: an arrow's `>` closes nothing.
+    /// `None` means the header is not finished yet and another line must be
+    /// joined on.
+    fn param_span(s: &str) -> Option<(usize, usize)> {
+        let b = s.as_bytes();
+        let mut angle = 0i32;
+        let mut open: Option<usize> = None;
+        let mut depth = 0i32;
+        for i in 0..b.len() {
+            match b[i] {
+                b'<' if open.is_none() => angle += 1,
+                b'>' if open.is_none() && !(i > 0 && b[i - 1] == b'-') => angle -= 1,
+                b'(' => {
+                    if open.is_none() {
+                        if angle == 0 {
+                            open = Some(i);
+                            depth = 1;
+                        }
+                    } else {
+                        depth += 1;
+                    }
+                }
+                b')' if open.is_some() => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((open.unwrap(), i));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Split `s` on `sep` at BRACKET DEPTH 0 (`<>`, `()`, `[]`), honouring the
+    /// `->` rule, and return the first field. A parameter type can contain a
+    /// comma (`Option<(usize, String)>`), which is why this is not `split(',')`.
+    fn first_field(s: &str, sep: u8) -> &str {
+        let b = s.as_bytes();
+        let mut depth = 0i32;
+        for i in 0..b.len() {
+            match b[i] {
+                b'<' | b'(' | b'[' => depth += 1,
+                b'>' if i > 0 && b[i - 1] == b'-' => {}
+                b'>' | b')' | b']' => depth -= 1,
+                c if c == sep && depth == 0 => return &s[..i],
+                _ => {}
+            }
+        }
+        s
+    }
+
+    /// Collapse runs of whitespace, so a JOINED header compares like a written
+    /// one (`&\n    SourceSpan` and `&SourceSpan` are the same type).
+    fn squeeze(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Every `fn` item in `src`, with its header joined across lines. Returns
+    /// `(header, indented, joined_from_more_than_one_line)`.
+    fn fn_headers(src: &str) -> Vec<(FnHeader, bool, bool)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        for (i, raw) in lines.iter().enumerate() {
+            let line = raw.trim_start();
+            let Some(rest) = ["pub(crate) fn ", "pub(super) fn ", "pub fn ", "fn "]
+                .iter()
+                .find_map(|v| line.strip_prefix(v))
+            else {
+                continue;
+            };
+            // JOIN FORWARD until the parameter list closes. 40 lines is far past
+            // the longest signature in this crate (MEASURED: 17) and bounds the
+            // scan so a malformed file cannot make the test walk the world.
+            let mut joined = rest.to_string();
+            let mut j = i;
+            while param_span(&joined).is_none() && j + 1 < lines.len() && j - i < 40 {
+                j += 1;
+                joined.push(' ');
+                joined.push_str(lines[j].trim());
+            }
+            let Some((a, b)) = param_span(&joined) else { continue };
+            let name = joined[..a].split('<').next().unwrap_or("").trim().to_string();
+            if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                continue;
+            }
+            let params = joined[a + 1..b].trim();
+            let ret = joined[b + 1..]
+                .trim()
+                .strip_prefix("->")
+                .map(|r| {
+                    let r = r.split('{').next().unwrap_or(r);
+                    squeeze(r.split(" where").next().unwrap_or(r))
+                })
+                .unwrap_or_default();
+            let first = first_field(params, b',').trim();
+            let (pname, pty) = match first.split_once(':') {
+                Some((n, t)) => (squeeze(n), squeeze(t)),
+                None => continue,
+            };
+            out.push((
+                FnHeader { name, param_name: pname, param_ty: pty, ret },
+                raw.starts_with(' '),
+                j > i,
+            ));
+        }
+        out
+    }
+
+    /// Does this signature return a VERDICT — a `bool` or an `Option<…>`? Only
+    /// those are in the `&str` subject: a `&str` -> `String` helper decides
+    /// nothing, and demanding a classification for all 414 of this crate's
+    /// `&str`-first-parameter fns would be noise, and noise is how a guard gets
+    /// turned off. The two CALLEE spellings are in the subject regardless of
+    /// return type, which is the pre-existing property that keeps string
+    /// surgery like `strip_turbofish_args` on the table.
+    fn returns_a_verdict(ret: &str) -> bool {
+        ret.starts_with("bool") || ret.starts_with("Option<")
+    }
+
+    /// Every key predicate in the WHOLE crate, read from the source at test
+    /// time. Returns `(predicates, files scanned, wrapped headers joined,
+    /// UNCLASSIFIABLE)` — the last being the whole point: a forgeable-typed
+    /// first parameter the scan cannot name is reported, not dropped.
+    #[allow(clippy::type_complexity)]
+    fn key_predicates_in_this_crate()
+    -> (Vec<(String, String, ForgeableKey)>, usize, usize, Vec<String>) {
+        let files = rs_files_under_src();
+        let n = files.len();
+        let mut out: Vec<(String, String, ForgeableKey)> = Vec::new();
+        let mut unclassifiable: Vec<String> = Vec::new();
+        let mut joined_headers = 0usize;
+        for (rel, src) in &files {
+            for (h, indented, was_joined) in fn_headers(src) {
+                if was_joined {
+                    joined_headers += 1;
+                }
+                let is_callee_name = CALLEE_PATH_PARAM_NAMES.contains(&h.param_name.as_str());
+                // CalleePath, `lower:` — ANY indentation, ANY file. That is the
+                // property that caught a missing entry twice (a test-local
+                // replica on 2026-09-20), so it is kept.
+                // ROUND 7, FIRST: the STRUCTURED key. `Option<&CalleeKey>` in
+                // first position is a minting recognizer, wherever it lives and
+                // whatever it is called. This arm runs BEFORE the `&str` arms so
+                // a recognizer that takes the key is never also counted as a
+                // string predicate.
+                // Both spellings: the `use`d short form and the fully-qualified
+                // one a file outside this module writes.
+                // ROUND 8: the BARE `&CalleeKey` too. A consumer that always
+                // HAS the key — the compiler's completeness check, which holds
+                // the `DefId` — takes it unwrapped, and that shape was invisible
+                // to this scan: it is not `&str`, so it fell out of every arm
+                // below and was classified nowhere. MEASURED: adding
+                // `call_has_unsafe_model_keyed` was silently unclassified until
+                // this arm existed.
+                if h.param_ty == "Option<&CalleeKey>"
+                    || h.param_ty == "Option<&trust_types::CalleeKey>"
+                    || h.param_ty == "&CalleeKey"
+                    || h.param_ty == "&trust_types::CalleeKey"
+                {
+                    out.push((rel.clone(), h.name.clone(), ForgeableKey::StructuredCalleeKey));
+                    continue;
+                }
+                if h.param_ty == "&str" && h.param_name == "lower" {
+                    out.push((rel.clone(), h.name.clone(), ForgeableKey::CalleePath));
+                    continue;
+                }
+                // CalleePath, the OTHER spellings — TOP-LEVEL, NON-TEST only.
+                // MEASURED: 153 `callee:` predicates, 32 of them in test
+                // scaffolding where the parameter names a fixture's callee
+                // string and decides nothing. Requiring those to be classified
+                // is the noise this narrowing avoids; it is written down here
+                // rather than implied, and a `callee:` recognizer hidden inside
+                // a test file is therefore still invisible.
+                if h.param_ty == "&str" && is_callee_name {
+                    if !indented && !is_test_scaffolding(rel) {
+                        out.push((rel.clone(), h.name.clone(), ForgeableKey::CalleePath));
+                    }
+                    continue;
+                }
+                // Span / FilePath, and the `&str` residue: TOP-LEVEL items in
+                // non-test files only, for the same reason.
+                if indented || is_test_scaffolding(rel) {
+                    continue;
+                }
+                if SPAN_PARAM_TYPES.contains(&h.param_ty.as_str()) {
+                    out.push((rel.clone(), h.name.clone(), ForgeableKey::Span));
+                    continue;
+                }
+                if PATH_PARAM_TYPES.contains(&h.param_ty.as_str()) {
+                    out.push((rel.clone(), h.name.clone(), ForgeableKey::FilePath));
+                    continue;
+                }
+                if h.param_ty != "&str" {
+                    continue;
+                }
+                if FILE_PATH_PARAM_NAMES.contains(&h.param_name.as_str()) {
+                    out.push((rel.clone(), h.name.clone(), ForgeableKey::FilePath));
+                    continue;
+                }
+                if !returns_a_verdict(&h.ret) {
+                    continue;
+                }
+                if NOT_A_FORGEABLE_KEY_PARAM_NAMES.iter().any(|(p, _)| *p == h.param_name) {
+                    continue;
+                }
+                // THE FAILURE MODE THAT USED TO BE A SILENT SKIP.
+                unclassifiable.push(format!(
+                    "{rel}::{}({}: {}) -> {}",
+                    h.name, h.param_name, h.param_ty, h.ret
+                ));
+            }
+        }
+        out.sort();
+        out.dedup();
+        unclassifiable.sort();
+        unclassifiable.dedup();
+        (out, n, joined_headers, unclassifiable)
+    }
+
+    /// (D) THE RECURRENCE GUARD, AS A CLASS GUARD. Enumerated from the source
+    /// of the WHOLE crate, and keyed on the KIND of forgeable key rather than on
+    /// a file name, so a NEW recognizer is RED until it is classified — whatever
+    /// file it lands in, and whether its key is a callee path, a span, or a
+    /// source-file path.
+    #[test]
+    fn every_forgeable_key_predicate_in_this_crate_is_classified_and_refuses_a_user_rebuild() {
+        let (all_keys, files_scanned, joined_headers, unclassifiable) =
+            key_predicates_in_this_crate();
+
+        // THE SCAN ASSERTS ITSELF. An extraction that silently returns nothing
+        // is a broken gate wearing a pass, so every number the guard depends on
+        // is checked before it is believed.
+        assert!(
+            files_scanned > 200,
+            "the crate-wide scan read only {files_scanned} .rs files under \
+             crates/trust-vcgen/src — the walk itself broke (248 on 2026-09-20)"
+        );
+        // THE JOINER ASSERTS ITSELF TOO. If the multi-line join silently stopped
+        // working, every wrapped signature would go back to being invisible and
+        // the rest of this test would still pass — which is exactly the shape of
+        // the hole it was added to close. MEASURED: 1153 wrapped headers.
+        assert!(
+            joined_headers > 1000,
+            "the scan joined only {joined_headers} wrapped `fn` headers — the \
+             multi-line join broke, and a wrapped signature is invisible again \
+             (1153 on 2026-09-20)"
+        );
+        // AND THE CLASSIFICATION IS TOTAL. A forgeable-typed first parameter
+        // the scan cannot name is reported HERE rather than skipped, which is
+        // the whole difference between this and a spelling census.
+        assert!(
+            unclassifiable.is_empty(),
+            "a verdict-returning predicate takes a forgeable `&str` first \
+             parameter whose name the scan cannot classify: {unclassifiable:?}. \
+             Put the name in CALLEE_PATH_PARAM_NAMES, FILE_PATH_PARAM_NAMES, or \
+             NOT_A_FORGEABLE_KEY_PARAM_NAMES with what it actually is."
+        );
+        assert!(
+            all_keys.iter().any(|(f, n, k)| f == "sep_engine.rs"
+                && n == "is_trusted_std_span"
+                && *k == ForgeableKey::Span),
+            "the scan lost the known Span predicate — it is not scanning what it \
+             claims to scan"
+        );
+        // NO FILE-PATH KEY DECIDES ANYTHING ANY MORE, and that is an assertion
+        // rather than an observation. `is_trusted_std_file` was the only member
+        // of this class that made a trust decision, and its deletion is this
+        // round. One member remains — `hardened.rs::path_segments`, which the
+        // scan classifies here only because its `&str` parameter is SPELLED
+        // `path`; it is a `::` splitter over a callee def path and decides
+        // nothing — so the pin is "every FilePath-keyed predicate is
+        // `NotATrustDecision`", not "the class is empty". A new file-path
+        // predicate that does decide something is RED here and needs a
+        // KEY_GUARDS entry saying whether its key is AUTHENTICATED and how.
+        let deciding_file_path_keys: Vec<&str> = KEY_GUARDS
+            .iter()
+            .filter(|g| {
+                g.key == ForgeableKey::FilePath
+                    && !matches!(g.disposition, KeyDisposition::NotATrustDecision(_))
+            })
+            .map(|g| g.name)
+            .collect();
+        assert!(
+            deciding_file_path_keys.is_empty(),
+            "a predicate makes a TRUST DECISION from a source-file path again: \
+             {deciding_file_path_keys:?}. That is the key this campaign deleted outright \
+             (see the note where `is_trusted_std_file` stood in KEY_GUARDS) — the \
+             replacement must answer from authenticated structure, not from the rendering."
+        );
+        assert!(
+            all_keys.iter().any(|(f, n, _)| f == "lib.rs" && n == "span_is_trusted_std"),
+            "the scan did not reach lib.rs — it is still file-scoped"
+        );
+
+        // KEYED BY (file, name), NOT BY NAME. A bare-name set collapses two
+        // same-named recognizers in different files into one entry, which is
+        // the hole this commit closes; the crate has such a pair today
+        // (`guards.rs::is_std_num_intrinsic` and
+        // `generate/call_facts.rs::is_std_num_intrinsic`).
+        let in_source: Vec<(String, String)> = all_keys
+            .iter()
+            .filter(|(_, _, k)| {
+                matches!(*k, ForgeableKey::CalleePath | ForgeableKey::StructuredCalleeKey)
+            })
+            .map(|(f, n, _)| (f.clone(), n.clone()))
+            .collect();
+        assert!(
+            in_source.len() > 100,
+            "the source scan found only {} callee-path predicates — the scan \
+             itself broke (158 on 2026-09-20): {in_source:?}",
+            in_source.len()
+        );
+        // The widening is asserted, not assumed: the scan must reach a
+        // `callee:`-spelled predicate outside sep_engine.rs, and a WRAPPED one.
+        assert!(
+            in_source.iter().any(|(f, n)| f == "lib.rs" && n == "call_has_unsafe_model"),
+            "the scan did not find `lib.rs::call_has_unsafe_model` — the \
+             `callee:` spelling is invisible again"
+        );
+        assert!(
+            in_source
+                .iter()
+                .any(|(f, n)| f == "generate/assert_refutation.rs"
+                    && n == "authenticated_wrapping_call"),
+            "the scan did not find the WRAPPED signature \
+             `generate/assert_refutation.rs::authenticated_wrapping_call` — the \
+             multi-line join is not reaching real headers"
+        );
+        assert!(
+            in_source.iter().any(|(f, n)| f == "guards.rs" && n == "is_std_num_intrinsic")
+                && in_source
+                    .iter()
+                    .any(|(f, n)| f == "generate/call_facts.rs" && n == "is_std_num_intrinsic"),
+            "the scan did not keep BOTH `is_std_num_intrinsic` predicates apart \
+             — it is still keyed on the bare name"
+        );
+
+        // ── (ii) THE NON-CALLEE FORGEABLE KEYS ──────────────────────────────
+        // A span predicate and a file-path predicate are keys exactly as a
+        // callee path is. Each must be classified, and a KnownResidual must SAY
+        // what is still open — "unlisted" is the only failure mode left.
+        // Also keyed by (file, name).
+        let key_named: Vec<(&str, &str)> = KEY_GUARDS.iter().map(|g| (g.file, g.name)).collect();
+        let unclassified: Vec<&(String, String, ForgeableKey)> = all_keys
+            .iter()
+            .filter(|(f, n, k)| {
+                !matches!(*k, ForgeableKey::CalleePath | ForgeableKey::StructuredCalleeKey)
+                    && !key_named.contains(&(f.as_str(), n.as_str()))
+            })
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "a NON-CALLEE forgeable-key predicate exists in crates/trust-vcgen/src and is \
+             NOT classified in KEY_GUARDS: {unclassified:?}. Say whether its key is \
+             AUTHENTICATED (and how) or a KNOWN RESIDUAL (and what closing it costs), or \
+             that it decides nothing about trust."
+        );
+        for guard in KEY_GUARDS {
+            let found = all_keys
+                .iter()
+                .find(|(f, n, _)| n == guard.name && f == guard.file)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "KEY_GUARDS names `{}` in `{}`; the scan does not find it there \
+                         (renamed, moved, or deleted)",
+                        guard.name, guard.file
+                    )
+                });
+            assert_eq!(
+                found.2, guard.key,
+                "{}: KEY_GUARDS says {:?}, the source says {:?}",
+                guard.name, guard.key, found.2
+            );
+            let reason = match guard.disposition {
+                KeyDisposition::Authenticated(r)
+                | KeyDisposition::KnownResidual(r)
+                | KeyDisposition::NotATrustDecision(r) => r,
+            };
+            assert!(
+                reason.len() > 40,
+                "{}: a key disposition owes a REASON a reader can act on, not a label",
+                guard.name
+            );
+        }
+        // The residuals are enumerated, not merely permitted: if one is closed,
+        // this count moves and the commit that closed it has to say so.
+        let residuals: Vec<&str> = KEY_GUARDS
+            .iter()
+            .filter(|g| matches!(g.disposition, KeyDisposition::KnownResidual(_)))
+            .map(|g| g.name)
+            .collect();
+        // EMPTY SINCE 2026-09-20. The three that stood here —
+        // `is_trusted_std_file`, `is_trusted_std_span`, `span_is_trusted_std` —
+        // were one key under three names: a source-file path, trusted as text.
+        // The first is deleted; the other two are `Authenticated` against
+        // `trust_types::TrustedStdSourceFiles`. NO non-callee key predicate in
+        // this crate now decides from text.
+        assert_eq!(
+            residuals,
+            [] as [&str; 0],
+            "the set of KNOWN RESIDUAL key predicates changed; that is a soundness-visible \
+             event and belongs in a commit message"
+        );
+
+        // ── (iii) EVERY CALLEE-PATH PREDICATE IS ACCOUNTED FOR, BY FILE ──────
+        // Two tables together must cover the population exactly: the
+        // unsafe-contract mint (`RECOGNIZER_GUARDS`, each entry exercised
+        // against a user-crate rebuild) and the enumerated remainder
+        // (`CALLEE_RECOGNIZERS_OUTSIDE_THE_UNSAFE_MINT`, written down and not
+        // yet refuted). Both are keyed `(file, name)`.
+        let mut listed: Vec<(&str, &str)> =
+            RECOGNIZER_GUARDS.iter().map(|g| (g.file, g.name)).collect();
+        listed.sort_unstable();
+        let outside: Vec<(&str, &str)> = CALLEE_RECOGNIZERS_OUTSIDE_THE_UNSAFE_MINT
+            .iter()
+            .copied()
+            // Round 7: the THIRD table. The suppression mirror's 24 string
+            // recognizers are classified together, with one reason for the whole
+            // class, because they share one consumer and one blast radius. They
+            // are checked at their boundary through the `call_is_modeled` entry
+            // in `RECOGNIZER_GUARDS`.
+            .chain(SUPPRESSION_MIRROR_RECOGNIZERS.iter().copied())
+            .collect();
+        // Report WHERE, not just what: the scan is crate-wide, so "added to
+        // sep_engine.rs" would be a lie for a recognizer that landed in
+        // `coverage.rs` — which is exactly the case the widening exists for.
+        let missing: Vec<String> = all_keys
+            .iter()
+            .filter(|(f, n, k)| {
+                matches!(*k, ForgeableKey::CalleePath | ForgeableKey::StructuredCalleeKey)
+                    && !listed.contains(&(f.as_str(), n.as_str()))
+                    && !outside.contains(&(f.as_str(), n.as_str()))
+            })
+            .map(|(f, n, _)| format!("{f}::{n}"))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "a callee recognizer was added under crates/trust-vcgen/src and is NOT \
+             classified: {missing:?}. Say whether it MINTS a fact (then put it in \
+             RECOGNIZER_GUARDS — it must refuse a user-crate rebuild of its own std \
+             spelling), only SUPPRESSES the compiler's row (then record why it may stay \
+             unanchored), or belongs to a lane outside the unsafe-contract mint (then \
+             add it to CALLEE_RECOGNIZERS_OUTSIDE_THE_UNSAFE_MINT, which is enumerated \
+             exactly so that adding one is a decision someone made on the record)."
+        );
+        let stale: Vec<&(&str, &str)> = listed
+            .iter()
+            .filter(|k| !in_source.iter().any(|(f, n)| (f.as_str(), n.as_str()) == **k))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "RECOGNIZER_GUARDS names a (file, function) this crate no longer has: {stale:?}"
+        );
+        // The remainder is compared EXACTLY. That is what makes it an
+        // enumeration rather than a waiver: a predicate joining it, or leaving
+        // it for RECOGNIZER_GUARDS, moves this list and has to be said out loud.
+        let mut outside_in_source: Vec<(&str, &str)> = in_source
+            .iter()
+            .map(|(f, n)| (f.as_str(), n.as_str()))
+            .filter(|k| !listed.contains(k))
+            .collect();
+        outside_in_source.sort_unstable();
+        outside_in_source.dedup();
+        let mut outside_sorted = outside.clone();
+        outside_sorted.sort_unstable();
+        assert_eq!(
+            outside_in_source, outside_sorted,
+            "the population of callee-path predicates OUTSIDE the unsafe-contract mint \
+             changed. It is enumerated on purpose; update \
+             CALLEE_RECOGNIZERS_OUTSIDE_THE_UNSAFE_MINT and say so in the commit."
+        );
+        // A mirror recognizer that is deleted must be removed from its table too.
+        let stale_outside: Vec<&(&str, &str)> = outside
+            .iter()
+            .filter(|k| !in_source.iter().any(|(f, n)| (f.as_str(), n.as_str()) == **k))
+            .collect();
+        assert!(
+            stale_outside.is_empty(),
+            "CALLEE_RECOGNIZERS_OUTSIDE_THE_UNSAFE_MINT names a (file, function) this \
+             crate no longer has: {stale_outside:?}"
+        );
+
+        let stamp = trust_types::TRUST_UNAUTHENTICATED_CRATE_PATH_PREFIX;
+        for guard in RECOGNIZER_GUARDS {
+            let predicate = match guard.predicate {
+                GuardPredicate::None => {
+                    assert!(
+                        matches!(guard.class, RecognizerClass::Helper(_)),
+                        "{}: only a Helper may have no predicate",
+                        guard.name
+                    );
+                    continue;
+                }
+                other => other,
+            };
+            if let RecognizerClass::SuppressesOnly(reason) = guard.class {
+                assert!(!reason.is_empty(), "{}: a SuppressesOnly entry owes a reason", guard.name);
+            }
+
+            match predicate {
+                GuardPredicate::None => unreachable!("handled above"),
+
+                // ── THE KEYED HALF — the round-7 guard, and it is SIMPLER ────
+                //
+                // The old check took a `genuine` spelling list and three
+                // hand-written user-crate rebuilds per entry, and could only
+                // refute the forgeries somebody had thought of. Every round of
+                // this campaign found one more rendering that was not on that
+                // list. Here the refutation is EXHAUSTIVE instead: the
+                // recognizer must fire on exactly the tags it names and refuse
+                // EVERY other tag in `ALL_SYSROOT_ITEMS`, plus every untagged
+                // key, plus an absent key. `genuine` and
+                // `admitted_user_rebuilds` are not consulted for a keyed entry
+                // and must be empty — a spelling in a keyed entry would be a
+                // claim this guard no longer makes.
+                GuardPredicate::Keyed(predicate, mints) => {
+                    assert!(
+                        matches!(guard.class, RecognizerClass::Mints),
+                        "{}: only a Mints recognizer takes the structured key",
+                        guard.name
+                    );
+                    assert!(
+                        guard.genuine.is_empty() && guard.admitted_user_rebuilds.is_empty(),
+                        "{}: a KEYED entry names TAGS, not spellings; leave both spelling                          lists empty so the table cannot imply a claim the guard does not                          check",
+                        guard.name
+                    );
+                    assert!(!mints.is_empty(), "{}: a Mints entry must name its tags", guard.name);
+                    for item in mints {
+                        // THE TAG MUST BE REACHABLE (2026-09-20). A variant with
+                        // no `DECLS` row is a tag the extractor can never mint,
+                        // so a recognizer naming it silently misses every call it
+                        // meant to recognize and the site falls through to its
+                        // fail-closed stand-in. That is how `CONTAINER_AS_PTR_ITEMS`
+                        // came to name five items while the string it replaced
+                        // matched a dozen — measured as 2 and 3 lost TYPED rows on
+                        // `asptr` and `provebounds`. It is a test failure now, not
+                        // a comment.
+                        assert!(
+                            trust_types::callee_key::item_is_declared(*item),
+                            "{}: names {item:?}, which NO `DECLS` row mints — the \
+                             extractor can never produce that tag, so this recognizer \
+                             is dead for the item it names",
+                            guard.name
+                        );
+                        assert!(
+                            predicate(Some(&guard_key(Some(*item)))),
+                            "{}: names {item:?} and must recognise it",
+                            guard.name
+                        );
+                    }
+                    for item in trust_types::ALL_SYSROOT_ITEMS {
+                        if mints.contains(item) {
+                            continue;
+                        }
+                        assert!(
+                            !predicate(Some(&guard_key(Some(*item)))),
+                            "{}: MINTS, but fired on {item:?}, which it does not name — a                              recognizer that fires on an item it did not mean states the                              WRONG contract for that site (the 2026-09-19 `NonZero`-niche                              refutation, in its structured form)",
+                            guard.name
+                        );
+                    }
+                    for krate in ["core", "alloc", "std", "mycrate", "dep", "evilcrate", "libc"] {
+                        for real in [false, true] {
+                            let mut k = guard_key(None);
+                            k.krate_name = krate.to_string();
+                            k.krate_is_real_sysroot = real;
+                            assert!(
+                                !predicate(Some(&k)),
+                                "{}: MINTS, but fired on an UNTAGGED key wearing the crate                                  name `{krate}` (real_sysroot={real}). The extractor mints                                  no tag for a crate that is not the compiler's own sysroot,                                  and that absence IS the user-crate-rebuild refutation.",
+                                guard.name
+                            );
+                        }
+                    }
+                    assert!(
+                        !predicate(None),
+                        "{}: MINTS, but fired on an ABSENT key — the fail-closed rule is                          that a missing key keeps the stand-in, never a string fallback",
+                        guard.name
+                    );
+                }
+
+                // ── THE TEXT HALF — unchanged, and it owes a reason ──────────
+                GuardPredicate::Text(predicate, why) => {
+                    assert!(
+                        !why.is_empty(),
+                        "{}: a TEXT predicate in the unsafe mint owes a written reason why                          it may stay text; see `suppression_mirror`'s header for the only                          admissible shape of that argument",
+                        guard.name
+                    );
+                    for g in guard.genuine {
+                        assert!(predicate(g), "{}: genuine `{g}` must be recognised", guard.name);
+                    }
+                    if !matches!(guard.class, RecognizerClass::Mints) {
+                        continue;
+                    }
+                    for g in guard.genuine {
+                        for rebuilt in user_crate_rebuilds(g) {
+                            if guard.admitted_user_rebuilds.contains(&rebuilt.as_str()) {
+                                assert!(
+                                    predicate(&rebuilt),
+                                    "{}: `{rebuilt}` is listed as admitted but does not fire",
+                                    guard.name
+                                );
+                                continue;
+                            }
+                            assert!(
+                                !predicate(&rebuilt),
+                                "{}: MINTS, but fired on the user-crate rebuild `{rebuilt}`                                  of its own spelling `{g}`",
+                                guard.name
+                            );
+                        }
+                        if guard.stamp_is_a_rejection {
+                            let stamped = format!("{stamp}00000000deadbeef::{g}");
+                            assert!(
+                                !predicate(&stamped),
+                                "{}: MINTS, but fired on the stamped impersonator `{stamped}`",
+                                guard.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// (D), the named half: the exact user spellings the brief and the
+    /// refutations name, each asserted to receive NO separation row and NO
+    /// coverage from `call_is_modeled` — the two ways a user callee could pick
+    /// up a std contract.
+    #[test]
+    fn the_named_user_rebuilds_receive_no_std_contract() {
+        for user in [
+            "userkrate::nonzero::handle::new_unchecked",
+            "mycrate::vec::vec::set_len",
+            "evilcrate::mmap::region",
+            "mycrate::thing::unwrap",
+            "dep::from_u32_unchecked",
+            "dep::ptr::read",
+            "dep::slice::get_unchecked",
+            "mycrate::core::ptr::copy",
+            "dep::myuninit::assume_init",
+            "dep::cstrish::from_bytes_with_nul_unchecked",
+            "dep::alloc::alloc",
+            "dep::alloc::dealloc",
+            "dep::alloc::realloc",
+            "dep::mem::transmute",
+            "dep::slice::from_raw_parts",
+            "dep::myopt::unwrap_unchecked",
+            "mycrate::layout::from_size_align",
+            "dep::mut_ptr::add",
+            "dep::vec::as_ptr",
+        ] {
+            let vcs = check_sep_unsafe(&one_u32_arg_call(user));
+            assert!(vcs.is_empty(), "user `{user}` must receive NO separation row, got {vcs:?}");
+            // The `::unwrap`/`::expect` spellings are the ONE exception to the
+            // coverage half, on purpose: `is_layout_passthrough_call` is a
+            // SUPPRESSION entry deliberately left unanchored (see its class in
+            // RECOGNIZER_GUARDS). It mints nothing — which the assertion above
+            // proves — and `decide_site` gives the site its fail-closed
+            // stand-in, so the suppression costs no obligation.
+            if user.contains("::unwrap") || user.contains("::expect") {
+                assert!(call_is_modeled(user), "{user}: the suppression entry still matches it");
+                continue;
+            }
+            assert!(!call_is_modeled(user), "user `{user}` must not be covered");
+            assert!(!has_unsafe_patterns(&one_u32_arg_call(user)), "{user}");
+        }
     }
 
     /// Trust (unsafe-op completeness): `slice.get_unchecked(i)` over a `[u8; 8]`
@@ -6794,6 +18467,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::<impl [u8]>::get_unchecked",
+                        ),
                         is_foreign: false,
                         func: "core::slice::<impl [u8]>::get_unchecked".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -6848,6 +18524,172 @@ mod tests {
     //    Vec::set_len, Option/Result::unwrap_unchecked (the extended allowlist) ──
 
     /// Build a single-block function whose sole terminator is `callee(args)`.
+    /// FIXTURE ONLY — this stands in for the EXTRACTOR, and it is not a decision
+    /// procedure.
+    ///
+    /// Every hand-built `Terminator::Call` in this file names its callee with a
+    /// SPELLING, because a unit test has no `TyCtxt` to resolve a `DefId`
+    /// against. The engine now decides on `callee_key`, so a fixture that
+    /// carries none gets no contract — which is the fail-closed rule working,
+    /// not a bug. This function supplies the key the REAL extractor
+    /// (`trust_mir_extract::convert::callee_key_for`) would mint for that
+    /// callee, so the fixtures keep testing what they were written to test.
+    ///
+    /// WHY THIS IS NOT THE DEFECT COMING BACK IN THROUGH THE TEST DOOR:
+    ///
+    ///  * it runs only under `cfg(test)` and only BUILDS an input; nothing in
+    ///    the shipped decision path can reach it;
+    ///  * a spelling it does not name yields `None`, i.e. no contract — the
+    ///    fail-closed direction, so a fixture cannot buy a proof by being
+    ///    unrecognised here;
+    ///  * the real resolution is exercised END TO END by the round-7 corpus
+    ///    (`reports/unsafe-mint-round7-*`), through a real compiler, which is
+    ///    the only place it CAN be exercised.
+    ///
+    /// The map is the round-6 `*_SPELLINGS` content, one spelling per tag, so
+    /// the before/after comparison for every one of these tests is exact.
+    pub(crate) fn fixture_key(callee: &str) -> Option<CalleeKey> {
+        let lower = callee.to_lowercase();
+        let bare = strip_turbofish_args(&lower);
+        let bare = bare.strip_prefix('<').unwrap_or(&bare).to_string();
+        // FIXTURE SPELLING ONLY. Some hand-written fixtures in this file spell
+        // the raw-pointer inherent modules `std::ptr::…`; real extracted MIR
+        // always renders them `core::ptr::…` (`safe_def_path_str` resolves to
+        // the DEFINING crate — see the round-4 note on the retired spelling
+        // lists). Normalising here keeps those fixtures testing what they were
+        // written to test and asserts nothing about the shipped resolution,
+        // which never sees a spelling at all.
+        let bare = bare
+            .strip_prefix("std::ptr::")
+            .map_or(bare.clone(), |rest| format!("core::ptr::{rest}"));
+        const MAP: &[(&str, SysrootItem)] = &[
+            ("core::ptr::read", SysrootItem::PtrRead),
+            ("core::ptr::read_volatile", SysrootItem::PtrReadVolatile),
+            ("core::ptr::read_unaligned", SysrootItem::PtrReadUnaligned),
+            ("core::ptr::write", SysrootItem::PtrWrite),
+            ("core::ptr::write_volatile", SysrootItem::PtrWriteVolatile),
+            ("core::ptr::write_unaligned", SysrootItem::PtrWriteUnaligned),
+            ("core::ptr::copy", SysrootItem::PtrCopy),
+            ("core::ptr::copy_nonoverlapping", SysrootItem::PtrCopyNonOverlapping),
+            ("core::intrinsics::copy_nonoverlapping", SysrootItem::PtrCopyNonOverlapping),
+            ("core::ptr::drop_in_place", SysrootItem::PtrDropInPlace),
+            ("core::ptr::mut_ptr::drop_in_place", SysrootItem::RawPtrDropInPlace),
+            ("alloc::alloc::alloc", SysrootItem::AllocAlloc),
+            ("alloc::alloc::alloc_zeroed", SysrootItem::AllocAllocZeroed),
+            ("alloc::alloc::dealloc", SysrootItem::AllocDealloc),
+            ("alloc::alloc::realloc", SysrootItem::AllocRealloc),
+            (
+                "alloc::alloc::global as core::alloc::allocator>::allocate",
+                SysrootItem::GlobalAllocatorAllocate,
+            ),
+            (
+                "alloc::alloc::global as core::alloc::allocator>::deallocate",
+                SysrootItem::GlobalAllocatorDeallocate,
+            ),
+            ("core::slice::get_unchecked", SysrootItem::SliceGetUnchecked),
+            ("core::slice::get_unchecked_mut", SysrootItem::SliceGetUncheckedMut),
+            ("core::str::get_unchecked", SysrootItem::StrGetUnchecked),
+            ("core::str::get_unchecked_mut", SysrootItem::StrGetUncheckedMut),
+            ("core::slice::raw::from_raw_parts", SysrootItem::SliceFromRawParts),
+            ("core::slice::raw::from_raw_parts_mut", SysrootItem::SliceFromRawPartsMut),
+            ("core::str::converts::from_raw_parts", SysrootItem::StrFromRawParts),
+            ("core::str::converts::from_raw_parts_mut", SysrootItem::StrFromRawPartsMut),
+            ("alloc::vec::vec::from_raw_parts", SysrootItem::VecFromRawParts),
+            ("alloc::string::string::from_raw_parts", SysrootItem::StringFromRawParts),
+            ("alloc::vec::vec::set_len", SysrootItem::VecSetLen),
+            ("core::num::nonzero::nonzero::new_unchecked", SysrootItem::NonZeroNewUnchecked),
+            ("core::ptr::non_null::nonnull::new_unchecked", SysrootItem::NonNullNewUnchecked),
+            ("core::ptr::unique::unique::new_unchecked", SysrootItem::UniqueNewUnchecked),
+            ("core::char::from_u32_unchecked", SysrootItem::CharFromU32Unchecked),
+            ("core::char::methods::from_u32_unchecked", SysrootItem::CharMethodsFromU32Unchecked),
+            ("core::str::converts::from_utf8_unchecked", SysrootItem::StrFromUtf8Unchecked),
+            ("core::str::converts::from_utf8_unchecked_mut", SysrootItem::StrFromUtf8UncheckedMut),
+            ("alloc::string::string::from_utf8_unchecked", SysrootItem::StringFromUtf8Unchecked),
+            (
+                "core::ffi::c_str::cstr::from_bytes_with_nul_unchecked",
+                SysrootItem::CStrFromBytesWithNulUnchecked,
+            ),
+            (
+                "core::mem::maybe_uninit::maybeuninit::assume_init",
+                SysrootItem::MaybeUninitAssumeInit,
+            ),
+            (
+                "core::mem::maybe_uninit::maybeuninit::assume_init_ref",
+                SysrootItem::MaybeUninitAssumeInitRef,
+            ),
+            (
+                "core::mem::maybe_uninit::maybeuninit::assume_init_mut",
+                SysrootItem::MaybeUninitAssumeInitMut,
+            ),
+            (
+                "core::mem::maybe_uninit::maybeuninit::assume_init_read",
+                SysrootItem::MaybeUninitAssumeInitRead,
+            ),
+            (
+                "core::mem::maybe_uninit::maybeuninit::assume_init_drop",
+                SysrootItem::MaybeUninitAssumeInitDrop,
+            ),
+            ("alloc::boxed::box::assume_init", SysrootItem::BoxAssumeInit),
+            (
+                "alloc::boxed::box_assume_init_into_vec_unsafe",
+                SysrootItem::BoxAssumeInitIntoVecUnsafe,
+            ),
+            ("alloc::boxed::box::new", SysrootItem::BoxNew),
+            ("alloc::boxed::box::new_uninit", SysrootItem::BoxNewUninit),
+            ("alloc::boxed::box_new_uninit", SysrootItem::BoxNewUninit),
+            ("core::option::option::unwrap_unchecked", SysrootItem::OptionUnwrapUnchecked),
+            ("core::result::result::unwrap_unchecked", SysrootItem::ResultUnwrapUnchecked),
+            ("core::option::option::unwrap", SysrootItem::OptionUnwrap),
+            ("core::option::option::expect", SysrootItem::OptionExpect),
+            ("core::result::result::unwrap", SysrootItem::ResultUnwrap),
+            ("core::result::result::expect", SysrootItem::ResultExpect),
+            ("core::mem::transmute", SysrootItem::MemTransmute),
+            ("core::mem::transmute_copy", SysrootItem::MemTransmuteCopy),
+            ("core::mem::zeroed", SysrootItem::MemZeroed),
+            ("core::mem::uninitialized", SysrootItem::MemUninitialized),
+            ("core::hint::unreachable_unchecked", SysrootItem::HintUnreachableUnchecked),
+            ("core::alloc::layout::layout::from_size_align", SysrootItem::LayoutFromSizeAlign),
+            (
+                "core::alloc::layout::layout::from_size_align_unchecked",
+                SysrootItem::LayoutFromSizeAlignUnchecked,
+            ),
+            ("core::ptr::const_ptr::add", SysrootItem::ConstPtrAdd),
+            ("core::ptr::const_ptr::offset", SysrootItem::ConstPtrOffset),
+            ("core::ptr::const_ptr::wrapping_add", SysrootItem::ConstPtrWrappingAdd),
+            ("core::ptr::const_ptr::wrapping_offset", SysrootItem::ConstPtrWrappingOffset),
+            ("core::ptr::mut_ptr::add", SysrootItem::MutPtrAdd),
+            ("core::ptr::mut_ptr::offset", SysrootItem::MutPtrOffset),
+            ("core::ptr::mut_ptr::wrapping_add", SysrootItem::MutPtrWrappingAdd),
+            ("core::ptr::mut_ptr::wrapping_offset", SysrootItem::MutPtrWrappingOffset),
+            ("core::ptr::const_ptr::cast", SysrootItem::ConstPtrCast),
+            ("core::ptr::const_ptr::cast_mut", SysrootItem::ConstPtrCastMut),
+            ("core::ptr::mut_ptr::cast", SysrootItem::MutPtrCast),
+            ("core::ptr::mut_ptr::cast_const", SysrootItem::MutPtrCastConst),
+            ("core::slice::as_ptr", SysrootItem::SliceAsPtr),
+            ("core::slice::as_mut_ptr", SysrootItem::SliceAsMutPtr),
+            ("alloc::vec::vec::as_ptr", SysrootItem::VecAsPtr),
+            ("alloc::vec::vec::as_mut_ptr", SysrootItem::VecAsMutPtr),
+            ("alloc::string::string::as_ptr", SysrootItem::StringAsPtr),
+        ];
+        let item = MAP.iter().find(|(spelling, _)| *spelling == bare).map(|(_, i)| *i);
+        // A path that is not a genuine sysroot spelling gets NO tag — the same
+        // thing the extractor mints for a user crate. It still gets a KEY,
+        // carrying the crate facts, because that is also what the extractor
+        // mints: absence of a TAG is the refusal, not absence of a key.
+        let root = bare.split("::").next().unwrap_or("").to_string();
+        let real_sysroot = item.is_some();
+        Some(CalleeKey {
+            sysroot_item: item,
+            krate_is_real_sysroot: real_sysroot,
+            krate_name_is_ambiguous: false,
+            stable_crate_id: 0x1973_d11b_2baa_21fa,
+            krate_name: root,
+            foreign_block_leaf: None,
+            upstream_foreign_link_symbol: None,
+            diverging_entry: None,
+        })
+    }
+
     fn one_call_func(
         name: &str,
         locals: Vec<LocalDecl>,
@@ -6866,6 +18708,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        // The extractor's stand-in (see `fixture_key`): without
+                        // it the engine decides on an ABSENT key and every
+                        // fixture below gets the fail-closed stand-in instead of
+                        // the contract it was written to check.
+                        callee_key: crate::sep_engine::tests::fixture_key(callee),
                         is_foreign: false,
                         func: callee.to_string(),
                         args,
@@ -6896,7 +18743,7 @@ mod tests {
                     name: Some("x".into()),
                 },
             ],
-            "core::num::NonZeroU32::new_unchecked",
+            "core::num::nonzero::NonZero::<u32>::new_unchecked",
             vec![Operand::Copy(Place::local(1))],
         );
         let vcs = check_sep_unsafe(&func);
@@ -6954,8 +18801,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::num::nonzero::NonZero::<u32>::new_unchecked",
+                        ),
                         is_foreign: false,
-                        func: "core::num::NonZeroU32::new_unchecked".to_string(),
+                        func: "core::num::nonzero::NonZero::<u32>::new_unchecked".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
                         target: Some(BlockId(2)),
@@ -7153,8 +19003,12 @@ mod tests {
     #[test]
     fn test_existing_failclosed_ops_unchanged() {
         for (callee, tag, needle) in [
-            ("core::str::from_utf8_unchecked", "from_utf8_unchecked", "valid UTF-8"),
-            ("core::mem::MaybeUninit::<u32>::assume_init", "assume_init", "fully initialized"),
+            ("core::str::converts::from_utf8_unchecked", "from_utf8_unchecked", "valid UTF-8"),
+            (
+                "core::mem::maybe_uninit::MaybeUninit::<u32>::assume_init",
+                "assume_init",
+                "fully initialized",
+            ),
         ] {
             let func = one_call_func(
                 "fc",
@@ -7214,8 +19068,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "core::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Copy(Place::local(3))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
@@ -7247,8 +19104,8 @@ mod tests {
             bounds.formula
         );
         assert!(
-            matches!(&bounds.formula, Formula::Gt(_, _)),
-            "obligation must be `len > 64`, got {:?}",
+            upper_access_bound(&bounds.formula).is_some(),
+            "obligation must retain the real `len > 64` upper bound, got {:?}",
             bounds.formula
         );
     }
@@ -7305,8 +19162,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("core::mem::transmute"),
                         is_foreign: false,
-                        func: "std::mem::transmute".to_string(),
+                        func: "core::mem::transmute".to_string(),
                         args: vec![],
                         dest: Place::local(1),
                         target: Some(BlockId(1)),
@@ -7479,8 +19337,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::ptr::copy_nonoverlapping",
+                        ),
                         is_foreign: false,
-                        func: "std::ptr::copy_nonoverlapping".to_string(),
+                        func: "core::ptr::copy_nonoverlapping".to_string(),
                         args: vec![],
                         dest: Place::local(1),
                         target: Some(BlockId(1)),
@@ -7495,6 +19356,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "memmap2::MmapMut::map_mut",
+                        ),
                         is_foreign: false,
                         func: "memmap2::MmapMut::map_mut".to_string(),
                         args: vec![],
@@ -7640,8 +19504,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("alloc::alloc::alloc"),
                         is_foreign: false,
-                        func: "std::alloc::alloc".to_string(),
+                        func: "alloc::alloc::alloc".to_string(),
                         args: vec![],
                         dest: Place::local(1),
                         target: Some(BlockId(1)),
@@ -7703,8 +19568,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("alloc::alloc::realloc"),
                         is_foreign: false,
-                        func: "std::alloc::realloc".to_string(),
+                        func: "alloc::alloc::realloc".to_string(),
                         args: vec![],
                         dest: Place::local(1),
                         target: Some(BlockId(1)),
@@ -7726,12 +19592,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn probe_negative_offset_from_raw_parts() {
+    pub(super) fn negative_offset_from_raw_parts_fixture() -> VerifiableFunction {
         // [u8;64] buf; base=&raw const buf; p = base.offset(-100); from_raw_parts(p, len)
         // offset accumulates to -100. Question: is there ANY lower-bound check on
         // the from_raw_parts obligation (offset>=0 / dest>=base)?
-        let func = make_func(
+        make_func(
             "neg_off",
             vec![
                 LocalDecl { index: 0, ty: Ty::Unit, name: None },
@@ -7769,6 +19634,9 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "std::ptr::const_ptr::<impl *const u8>::offset",
+                        ),
                         is_foreign: false,
                         func: "std::ptr::const_ptr::<impl *const u8>::offset".to_string(),
                         args: vec![
@@ -7788,8 +19656,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "core::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(4))],
                         dest: Place::local(0),
                         target: Some(BlockId(2)),
@@ -7799,20 +19670,7 @@ mod tests {
                 },
                 BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
             ],
-        );
-        let vcs = check_sep_unsafe(&func);
-        for vc in &vcs {
-            match &vc.kind {
-                VcKind::CopyBoundsViolation { callee, .. } if callee.contains("from_raw_parts") => {
-                    eprintln!("PROBE_NEG from_raw_parts obligation: {:?}", vc.formula)
-                }
-                VcKind::Assertion { message } if message.contains("offset") => {
-                    eprintln!("PROBE_NEG offset assertion: {:?}", vc.formula)
-                }
-                _ => {}
-            }
-        }
-        eprintln!("PROBE_NEG total vcs = {}", vcs.len());
+        )
     }
 
     /// INDEPENDENT VERIFIER PROBE: regression guard for the cross-crate /
@@ -7834,14 +19692,19 @@ mod tests {
         let buf_ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Buf".into(),
             fields: vec![
                 ("ptr".into(), Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) }),
                 ("len".into(), Ty::Int { width: 64, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let func = make_func(
             "as_slice",
             vec![
@@ -7891,8 +19754,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "core::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
@@ -7932,9 +19798,8 @@ mod tests {
             VcKind::CopyBoundsViolation { detail, .. } if detail.contains("backing field"))
             })
             .expect("EXPECTED: backing-invariant ASSUME fires for as_slice");
-        let Formula::Gt(extent, size) = &backing.formula else {
-            panic!("expected Gt(extent,size), got {:?}", backing.formula)
-        };
+        let (extent, size) = upper_access_bound(&backing.formula)
+            .expect("backing range must retain its extent/size upper bound");
         // The RHS is the opaque per-(base,field) allocation-size symbol, so the
         // violation `(0 + len) > backing_alloc_size_1_0` is NOT identically false.
         assert_eq!(
@@ -7964,18 +19829,23 @@ mod tests {
     /// `Buf { ptr: *mut u8, len: u64 }` with `as_slice(&self) -> &[u8] {
     /// from_raw_parts(self.ptr, self.len) }` — the use-site fixture shared by the
     /// certified/uncertified consumer tests below.
-    fn as_slice_buf_fixture() -> VerifiableFunction {
+    pub(super) fn as_slice_buf_fixture() -> VerifiableFunction {
         let buf_ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Buf".into(),
             fields: vec![
                 ("ptr".into(), Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) }),
                 ("len".into(), Ty::Int { width: 64, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         make_func(
             "as_slice",
             vec![
@@ -8022,8 +19892,11 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::slice::raw::from_raw_parts",
+                        ),
                         is_foreign: false,
-                        func: "core::slice::from_raw_parts".to_string(),
+                        func: "core::slice::raw::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
@@ -8074,15 +19947,15 @@ mod tests {
             backing.formula
         );
         assert!(
-            conj.iter().any(|f| matches!(f, Formula::Gt(_, _))),
+            conj.iter().any(|f| upper_access_bound(f).is_some()),
             "the violation `Gt(extent, size)` must remain in the conjunction"
         );
     }
 
     #[test]
     fn uncertified_backing_stays_fail_closed_for_as_slice() {
-        // Control: the SAME fixture without a certificate must keep the bare,
-        // fail-closed `Gt(extent, size)` against the opaque size — no assumption.
+        // Without a certificate, the range violation keeps an opaque size and
+        // receives no assumption relating that allocation to the length field.
         let func = as_slice_buf_fixture();
         let context = crate::VcgenContext::for_function(func.def_path.clone()).with_backing(true);
         let vcs = crate::with_vcgen_context(&context, || check_sep_unsafe(&func));
@@ -8094,8 +19967,9 @@ mod tests {
             })
             .expect("backing ASSUME must fire");
         assert!(
-            matches!(&backing.formula, Formula::Gt(_, _)),
-            "uncertified backing VC must be a bare `Gt(extent, size)` (fail-closed), got {:?}",
+            upper_access_bound(&backing.formula).is_some()
+                && !backing.formula.children().into_iter().any(|f| matches!(f, Formula::Ge(_, _))),
+            "uncertified backing VC must retain its upper bound without a certificate assumption, got {:?}",
             backing.formula
         );
     }
@@ -8106,15 +19980,15 @@ mod tests {
         // the compiler's authoritative unsafe-call completeness check to avoid
         // double-flagging a covered call.
         for modeled in [
-            "core::slice::from_raw_parts",
-            "std::ptr::copy_nonoverlapping",
+            "core::slice::raw::from_raw_parts",
+            "core::ptr::copy_nonoverlapping",
             "std::ptr::mut_ptr::<impl *mut t>::add",
             "std::ptr::mut_ptr::<impl *mut t>::cast",
             "core::ptr::read",
             "libc::mmap",
             "core::slice::<impl [t]>::get_unchecked",
             "core::mem::transmute",
-            "core::mem::maybeuninit::<t>::assume_init",
+            "core::mem::maybe_uninit::maybeuninit::<t>::assume_init",
             "core::fmt::arguments::new_v1",
             // The CURRENT `format_args!` constructor spelling, exactly as
             // `call_has_unsafe_model` lowercases it from
@@ -8373,11 +20247,39 @@ mod tests {
         )
     }
 
+    /// The table a compiler would install for a REAL compilation: the sysroot
+    /// files it decoded authenticate, the user's own file does not.
+    ///
+    /// Note what the second column says. `core/src/evil.rs` and
+    /// `library/core/src/evil.rs` are the user's file in a directory they named,
+    /// and they authenticate as `false` because `SourceFile::cnum` resolves them
+    /// to the crate being compiled, not to the sysroot's `core`. The old
+    /// path predicate answered `true` for both.
+    fn table() -> trust_types::TrustedStdSourceFiles {
+        trust_types::TrustedStdSourceFiles::from_authenticated_files([
+            ("alloc/src/macros.rs".to_string(), true),
+            ("library/core/src/ptr/mod.rs".to_string(), true),
+            ("/rustc/<toolchain>/library/std/src/io/mod.rs".to_string(), true),
+            ("core/src/evil.rs".to_string(), false),
+            ("library/core/src/evil.rs".to_string(), false),
+            ("mycore/src/evil.rs".to_string(), false),
+            ("crates/ny-cert/src/candidates.rs".to_string(), false),
+        ])
+    }
+
+    fn context_with_table(def_path: &str) -> crate::VcgenContext {
+        crate::VcgenContext::for_function(def_path).with_trusted_std_source_files(table())
+    }
+
+    /// THE DEFECT, AT PREDICATE LEVEL. Every one of these spellings was
+    /// `is_trusted_std_file == true` before 2026-09-20, and a `true` deletes
+    /// every `[unsafe:sep:*]` row for the span and the operation's stand-in.
+    /// With no authenticated table installed, ALL of them are now `false`.
+    ///
+    /// FAILS ON UNFIXED CODE: the old predicate needed no context at all.
     #[test]
-    fn test_is_trusted_std_file_std_paths() {
-        // The sysroot `library/` tree — in-tree, absolute, and remapped virtual
-        // forms — plus the remapped bare crate roots (`library/` prefix stripped).
-        for std_file in [
+    fn a_std_shaped_path_confers_nothing_without_an_authenticated_table() {
+        for looks_like_std in [
             "library/alloc/src/macros.rs",
             "library/core/src/slice/mod.rs",
             "library/std/src/io/mod.rs",
@@ -8386,79 +20288,104 @@ mod tests {
             "alloc/src/macros.rs",
             "core/src/ptr/mod.rs",
             "std/src/vec/mod.rs",
-        ] {
-            assert!(is_trusted_std_file(std_file), "should be trusted std: {std_file}");
-        }
-    }
-
-    #[test]
-    fn test_is_trusted_std_file_user_paths() {
-        // First-party / user paths, an empty span, and binary provenance are NOT
-        // std — fail-closed keeps their obligations.
-        for user_file in [
-            "crates/ny-cert/src/candidates.rs",
-            "/host/dev/ny/crates/ny-cert/src/lib.rs",
-            "src/main.rs",
-            "my_core_lib/src/thing.rs", // superstring of a std crate name, not a segment
-            "",
-            "binary:0x1000",
-        ] {
-            assert!(!is_trusted_std_file(user_file), "should NOT be trusted std: {user_file}");
-        }
-    }
-
-    /// SOUNDNESS REGRESSION: a `library/` path segment is NOT by itself evidence
-    /// of sysroot std.
-    ///
-    /// Trusting a span deletes every `[unsafe:sep:*]` obligation for it, and
-    /// nothing else re-covers those operations — the compiler's unsafe-call net
-    /// yields to this engine. The gate previously accepted any path containing a
-    /// `library/` segment, so a crate laid out that way had its memory-safety
-    /// obligations silently dropped. `first-party/trust-mc` declares
-    /// `members = ["library/trust-mc", ...]` and that tree contains real
-    /// `unsafe`, so this was reachable in-tree rather than hypothetical.
-    #[test]
-    fn library_segment_alone_is_not_trusted_std() {
-        for user_file in [
-            // The in-tree layout that made this reachable.
-            "first-party/trust-mc/library/trust-mc/src/futures.rs",
-            "library/trust-mc/src/futures.rs",
-            // A workspace that simply uses `library/` as a directory name.
-            "library/mycrate/src/raw.rs",
-            "/home/dev/proj/library/thing/src/lib.rs",
-            "library",
-            "library/",
-            // A std crate NAME without the `src/` segment is not a crate root.
-            "library/core/lib.rs",
-            "core/lib.rs",
-            // Superstrings of std crate names must not match as segments.
-            "library/coreutils/src/main.rs",
-            "testing/src/lib.rs",
+            // The measured attack: the user's own file, in a directory they named.
+            "core/src/evil.rs",
+            "library/core/src/evil.rs",
+            "usr/lib/rustlib/src/rust/library/core/src/evil.rs",
         ] {
             assert!(
-                !is_trusted_std_file(user_file),
-                "a `library/` segment alone must not confer std trust: {user_file}"
+                !is_trusted_std_span(&span_in(looks_like_std)),
+                "no table installed ⇒ nothing is trusted std, however it is spelled:                  {looks_like_std}"
             );
         }
     }
 
-    /// The legitimate sysroot layouts must keep being recognized. This
-    /// provenance classification suppresses rows only when stdlib is a
-    /// dependency; owner-scoped policy deliberately retains the same rows when
-    /// stdlib is the compilation subject.
+    /// THE TABLE IS THE ONLY AUTHORITY, and it can answer in EITHER direction —
+    /// which is the whole point. A path that looks nothing like the standard
+    /// library IS trusted when the compiler authenticated its crate, and a path
+    /// spelled exactly like `core/src/…` is NOT when it did not.
     #[test]
-    fn sysroot_std_layouts_remain_recognized() {
-        for std_file in [
-            "library/core/src/ptr/mod.rs",
-            "library/std/src/vec/mod.rs",
-            "/home/dev/checkout/library/alloc/src/boxed.rs",
-            "/rustc/abcdef0123/library/core/src/slice/mod.rs",
-            // Remapped bare crate roots (the `library/` prefix stripped).
-            "core/src/ptr/mod.rs",
-            "test/src/lib.rs",
+    fn only_the_authenticated_table_decides_and_it_decides_both_ways() {
+        let table = trust_types::TrustedStdSourceFiles::from_authenticated_files([
+            // A sysroot built somewhere with no `library/` in the path at all.
+            ("/opt/toolchains/nightly/lib/rustlib/src/x/ptr.rs".to_string(), true),
+            // The user's file, in a directory named `core/src`.
+            ("core/src/evil.rs".to_string(), false),
+        ]);
+        assert!(
+            crate::span_is_trusted_std(
+                &span_in("/opt/toolchains/nightly/lib/rustlib/src/x/ptr.rs"),
+                &table
+            ),
+            "artifact residency confers trust regardless of how the path is spelled"
+        );
+        assert!(
+            !crate::span_is_trusted_std(&span_in("core/src/evil.rs"), &table),
+            "a `core/src/` spelling confers nothing when the crate did not authenticate"
+        );
+    }
+
+    /// A SPAN WHOSE FILE THE TABLE CANNOT RESOLVE FAILS CLOSED — the obligation
+    /// is kept. These are the paths that reach it: a dummy span
+    /// (`SourceSpan::default()`, empty file), the `binary:0x…` compatibility
+    /// form, a synthetic span minted downstream of extraction, and a source file
+    /// decoded into the session's map after the table was built.
+    #[test]
+    fn an_unresolvable_span_fails_closed() {
+        let table = table();
+        for unresolvable in [
+            "",                                  // dummy span
+            "binary:0x1000",                     // binary provenance
+            "<anon>",                            // a virtual rustc name
+            "library/core/src/never/decoded.rs", // std-shaped, but not in the map
+            "some/file/nobody/recorded.rs",
         ] {
-            assert!(is_trusted_std_file(std_file), "should remain trusted std: {std_file}");
+            assert!(
+                !crate::span_is_trusted_std(&span_in(unresolvable), &table),
+                "an unresolvable span must keep its obligations: {unresolvable:?}"
+            );
         }
+        // And the same through the engine's own entry point, under a context
+        // that DOES have the table, so this is the fail-closed arm and not
+        // merely the missing-context one.
+        let _guard = crate::enter_vcgen_context(&context_with_table("f"));
+        assert!(!is_trusted_std_span(&SourceSpan::default()));
+        assert!(!is_trusted_std_span(&SourceSpan::binary_address(0x1000)));
+    }
+
+    /// COLLISION FAILS CLOSED, IN BOTH ARRIVAL ORDERS. If two source files
+    /// render the same string and disagree about residency, the rendering is
+    /// revoked: the sysroot file loses its exemption and the user file never
+    /// gains one. A user who deliberately collides makes the verifier charge
+    /// MORE rows.
+    #[test]
+    fn a_rendering_two_files_disagree_about_is_revoked() {
+        let sysroot_first = trust_types::TrustedStdSourceFiles::from_authenticated_files([
+            ("core/src/ptr/mod.rs".to_string(), true),
+            ("core/src/ptr/mod.rs".to_string(), false),
+        ]);
+        let user_first = trust_types::TrustedStdSourceFiles::from_authenticated_files([
+            ("core/src/ptr/mod.rs".to_string(), false),
+            ("core/src/ptr/mod.rs".to_string(), true),
+        ]);
+        for (label, t) in [("sysroot first", &sysroot_first), ("user first", &user_first)] {
+            assert!(
+                !crate::span_is_trusted_std(&span_in("core/src/ptr/mod.rs"), t),
+                "{label}: a contested rendering must be revoked"
+            );
+            assert_eq!(t.trusted_len(), 0, "{label}");
+            assert_eq!(t.revoked_len(), 1, "{label}");
+        }
+    }
+
+    /// A table built by a producer that CAN authenticate is distinguishable
+    /// from no table at all, even when both answer `false` for every span.
+    #[test]
+    fn an_empty_authenticated_table_is_still_marked_installed() {
+        let empty = trust_types::TrustedStdSourceFiles::from_authenticated_files([]);
+        assert!(empty.is_installed());
+        assert!(!trust_types::TrustedStdSourceFiles::default().is_installed());
+        assert!(!crate::span_is_trusted_std(&span_in("library/core/src/ptr/mod.rs"), &empty));
     }
 
     #[test]
@@ -8466,10 +20393,11 @@ mod tests {
         // Dependency case: cover both the original `vec!`-macro `alloc` span
         // and the exact `core` path used by the subject control below. Exercise
         // the public compiler-shaped generation/discharge entry, not just the
-        // sep helper.
+        // sep helper. BOTH files are in the authenticated table, so this is the
+        // predicate's REASON FOR EXISTING and it still works.
         for file in ["alloc/src/macros.rs", "library/core/src/ptr/mod.rs"] {
             let func = deref_read_func_with_span(file);
-            let context = crate::VcgenContext::for_function(func.def_path.clone());
+            let context = context_with_table(&func.def_path);
             let (solver_vcs, discharged) = compiler_shaped_vcs(&func, &context);
             let solver_sep_vcs =
                 solver_vcs.iter().filter(|vc| is_sep_memory_safety_vc(vc)).collect::<Vec<_>>();
@@ -8482,11 +20410,32 @@ mod tests {
         }
     }
 
+    /// THE MEASURED DEFECT, END TO END, at the generation entry the compiler
+    /// uses. The SAME unsafe deref, the SAME everything, in a directory the user
+    /// named `core/src/` — and it keeps every one of its obligations, because
+    /// the table says that file's crate is not the standard library.
+    ///
+    /// FAILS ON UNFIXED CODE: `is_trusted_std_file("core/src/evil.rs")` was
+    /// `true`, and this function's sep rows were all deleted.
+    #[test]
+    fn a_user_file_in_a_directory_named_core_src_keeps_every_obligation() {
+        for user_file in ["core/src/evil.rs", "library/core/src/evil.rs", "mycore/src/evil.rs"] {
+            let func = deref_read_func_with_span(user_file);
+            let context = context_with_table(&func.def_path);
+            let (solver_vcs, discharged) = compiler_shaped_vcs(&func, &context);
+            let sep_rows = solver_vcs.iter().filter(|vc| is_sep_memory_safety_vc(vc)).count()
+                + discharged.iter().filter(|(vc, _)| is_sep_memory_safety_vc(vc)).count();
+            assert!(
+                sep_rows >= 3,
+                "`{user_file}` is the USER's file: it must keep its raw-deref obligations, got {sep_rows}"
+            );
+        }
+    }
+
     #[test]
     fn stdlib_subject_sends_its_own_std_span_memory_safety_rows_to_the_solver() {
         let func = deref_read_func_with_span("library/core/src/ptr/mod.rs");
-        let context = crate::VcgenContext::for_function(func.def_path.clone())
-            .with_stdlib_subject_memory_safety(true);
+        let context = context_with_table(&func.def_path).with_stdlib_subject_memory_safety(true);
         let (solver_vcs, discharged) = compiler_shaped_vcs(&func, &context);
         let solver_sep_vcs =
             solver_vcs.iter().filter(|vc| is_sep_memory_safety_vc(vc)).collect::<Vec<_>>();
@@ -8513,8 +20462,7 @@ mod tests {
     #[test]
     fn mismatched_stdlib_subject_context_cannot_unsuppress_another_function() {
         let func = deref_read_func_with_span("library/core/src/ptr/mod.rs");
-        let context = crate::VcgenContext::for_function("core::different")
-            .with_stdlib_subject_memory_safety(true);
+        let context = context_with_table("core::different").with_stdlib_subject_memory_safety(true);
         let (solver_vcs, discharged) = compiler_shaped_vcs(&func, &context);
         let solver_sep_vcs =
             solver_vcs.iter().filter(|vc| is_sep_memory_safety_vc(vc)).collect::<Vec<_>>();
@@ -8543,3 +20491,23 @@ mod tests {
         )));
     }
 }
+
+#[cfg(test)]
+#[path = "sep_engine_box_deref_tests.rs"]
+mod box_deref_tests;
+
+#[cfg(test)]
+#[path = "sep_engine_wrapping_bounds_tests.rs"]
+mod wrapping_bounds_tests;
+
+#[cfg(test)]
+#[path = "sep_engine_empty_access_tests.rs"]
+mod empty_access_tests;
+
+#[cfg(test)]
+#[path = "sep_engine_offset_bounds_tests.rs"]
+mod offset_bounds_tests;
+
+#[cfg(test)]
+#[path = "sep_engine_backing_first_load_tests.rs"]
+mod backing_first_load_tests;

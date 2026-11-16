@@ -1,0 +1,22 @@
+# The dispatch-cost probe (docs/STATUS.md "Dispatch cost"), driven by scripts/dispatch_cost.py.
+#
+# A standalone package: it links Metal, so it builds only on macOS and stays out
+# of every workspace. It has no dependencies. Build it with
+# `targo --unverified build --release`: its body is Objective-C runtime calls,
+# which the verified lane refuses, and a measurement claims no proof.
+
+[package]
+name = "dispatch-cost-probe"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "dispatch-cost-probe"
+path = "src/main.rs"
+
+[workspace]
+
+[profile.release]
+debug = false

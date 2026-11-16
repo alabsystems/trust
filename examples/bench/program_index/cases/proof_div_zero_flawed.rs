@@ -3,7 +3,10 @@
 // The benchmark keeps this case free of formatting and allocation so the
 // trust-verify slot measures the arithmetic proof surface rather than std I/O.
 
-fn divide_unchecked(x: u32, y: u32) -> u32 {
+// An exported entry can be called with y = 0 outside this binary's safe main.
+// This keeps the flaw real even when closed-world caller propagation is enabled.
+#[unsafe(no_mangle)]
+pub fn divide_unchecked(x: u32, y: u32) -> u32 {
     x / y
 }
 

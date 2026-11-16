@@ -1,10 +1,10 @@
 use benchsuite::fixtures;
-use cargo::GlobalContext;
-use cargo::core::compiler::{CompileKind, RustcTargetData};
-use cargo::core::resolver::features::{FeatureOpts, FeatureResolver};
-use cargo::core::resolver::{CliFeatures, ForceAllTargets, HasDevUnits, ResolveBehavior};
-use cargo::core::{PackageIdSpec, Workspace};
-use cargo::ops::WorkspaceResolve;
+use targo::GlobalContext;
+use targo::compiler::{CompileKind, RustcTargetData};
+use targo::ops::WorkspaceResolve;
+use targo::resolver::features::{FeatureOpts, FeatureResolver};
+use targo::resolver::{CliFeatures, ForceAllTargets, HasDevUnits, ResolveBehavior};
+use targo::workspace::{PackageIdSpec, Workspace};
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::path::Path;
 
@@ -27,14 +27,14 @@ fn do_resolve<'gctx>(gctx: &'gctx GlobalContext, ws_root: &Path) -> ResolveInfo<
     let ws = Workspace::new(&ws_root.join("Cargo.toml"), gctx).unwrap();
     let mut target_data = RustcTargetData::new(&ws, &requested_kinds).unwrap();
     let cli_features = CliFeatures::from_command_line(&[], false, true).unwrap();
-    let pkgs = cargo::ops::Packages::Default;
+    let pkgs = targo::ops::Packages::Default;
     let specs = pkgs.to_package_id_specs(&ws).unwrap();
     let has_dev_units = HasDevUnits::Yes;
     let force_all_targets = ForceAllTargets::No;
     // Do an initial run to download anything necessary so that it does
     // not confuse criterion's warmup.
     let dry_run = false;
-    let ws_resolve = cargo::ops::resolve_ws_with_opts(
+    let ws_resolve = targo::ops::resolve_ws_with_opts(
         &ws,
         &mut target_data,
         &requested_kinds,
@@ -86,7 +86,7 @@ fn resolve_ws(c: &mut Criterion) {
                 ..
             } = lazy_info.get_or_insert_with(|| do_resolve(&gctx, &ws_root));
             b.iter(|| {
-                cargo::ops::resolve_ws_with_opts(
+                targo::ops::resolve_ws_with_opts(
                     ws,
                     target_data,
                     requested_kinds,

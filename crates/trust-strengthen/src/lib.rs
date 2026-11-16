@@ -125,7 +125,9 @@ pub use pattern_library::{
 pub use patterns::{
     CodePattern, PatternLibrary, PatternMatch, pattern_matches_to_proposals, recognize_patterns,
 };
-pub use proposer::{Proposal, ProposalKind, strengthen, strengthen_with_context};
+pub use proposer::{
+    Proposal, ProposalKind, strengthen, strengthen_for_function, strengthen_with_context,
+};
 pub use scoring::{
     ScoringWeights, SpecScore, rank_by_score, rank_by_score_weighted, score_proposal,
     score_proposal_weighted,
@@ -151,6 +153,7 @@ pub use template_match::{
     proposal_from_template,
 };
 pub use templates::{SpecTemplate, SpecTemplateKind, instantiate_template, standard_templates};
+use trust_types::fx::FxHashMap;
 use trust_types::{CrateVerificationResult, VerificationResult};
 #[cfg(feature = "trust-wp")]
 pub use trust_wp_oracle::{
@@ -189,31 +192,42 @@ pub struct StrengthenOutput {
 /// This is the main entry point. It:
 /// 1. Analyzes which VCs failed and why
 /// 2. Classifies failures into patterns (overflow, div-by-zero, OOB, etc.)
-/// 3. Proposes specs that would make the VCs provable
+/// 3. Proposes specs that would make the VCs provable, using the function's
+///    source (read from `function_path` when that is a file) for variable names
 pub fn run(results: &CrateVerificationResult, config: &StrengthenConfig) -> StrengthenOutput {
     let mut all_proposals = Vec::new();
     let mut total_failures = 0;
+    let mut source_cache: FxHashMap<&str, Option<String>> = FxHashMap::default();
 
     for func in &results.functions {
-        let failures: Vec<_> = func
+        // Analyze failure patterns in a single pass without intermediate failure Vec allocation.
+        let analyses: Vec<_> = func
             .results
             .iter()
-            .filter(|(_, result)| matches!(result, VerificationResult::Failed { .. }))
+            .filter_map(|(vc, result)| {
+                matches!(result, VerificationResult::Failed { .. })
+                    .then(|| analyzer::analyze_failure(vc, result))
+            })
             .collect();
 
-        if failures.is_empty() {
+        if analyses.is_empty() {
             continue;
         }
 
-        total_failures += failures.len();
+        total_failures += analyses.len();
 
-        // Analyze failure patterns
-        let analyses: Vec<_> =
-            failures.iter().map(|(vc, result)| analyzer::analyze_failure(vc, result)).collect();
-
-        // Generate pattern-based proposals
-        let mut proposals =
-            proposer::strengthen(&func.function_path, &func.function_name, &analyses);
+        // Generate pattern-based proposals, reading each source file at most once per run
+        // when `function_path` names a file so proposals use real names.
+        let source_text = source_cache
+            .entry(func.function_path.as_str())
+            .or_insert_with(|| std::fs::read_to_string(&func.function_path).ok())
+            .as_deref();
+        let mut proposals = proposer::strengthen_for_function_in_source(
+            &func.function_path,
+            &func.function_name,
+            &analyses,
+            source_text,
+        );
 
         // Filter by confidence and limit
         proposals.retain(|p| p.confidence >= config.min_confidence);
@@ -285,29 +299,238 @@ mod tests {
         (vc, result)
     }
 
-    #[test]
-    fn test_strengthen_proposes_overflow_precondition() {
-        let results = CrateVerificationResult {
+    /// A source file in the temp dir, removed on drop.
+    struct TempSource(std::path::PathBuf);
+
+    impl TempSource {
+        fn new(tag: &str, source: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "trust_strengthen_{tag}_{}_{:?}.rs",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, source).expect("write temp source");
+            Self(path)
+        }
+
+        fn path(&self) -> String {
+            self.0.display().to_string()
+        }
+    }
+
+    impl Drop for TempSource {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn one_function(
+        path: String,
+        name: &str,
+        failure: (VerificationCondition, VerificationResult),
+    ) -> CrateVerificationResult {
+        CrateVerificationResult {
             crate_name: "test".into(),
             functions: vec![FunctionVerificationResult {
-                function_path: "test::get_midpoint".into(),
-                function_name: "get_midpoint".into(),
-                results: vec![make_overflow_failure()],
+                function_path: path,
+                function_name: name.into(),
+                results: vec![failure],
                 from_notes: 0,
                 with_assumptions: 0,
             }],
             total_from_notes: 0,
             total_with_assumptions: 0,
-        };
+        }
+    }
+
+    const MIDPOINT_SOURCE: &str =
+        "pub fn get_midpoint(a: usize, b: usize) -> usize {\n    (a + b) / 2\n}\n";
+
+    #[test]
+    fn test_strengthen_proposes_overflow_precondition() {
+        let file = TempSource::new("midpoint", MIDPOINT_SOURCE);
+        let results = one_function(file.path(), "get_midpoint", make_overflow_failure());
 
         let output = run(&results, &StrengthenConfig::default());
         assert!(output.has_proposals);
         assert_eq!(output.failures_analyzed, 1);
-        assert!(!output.proposals.is_empty());
 
         let proposal = &output.proposals[0];
-        assert!(matches!(proposal.kind, ProposalKind::AddPrecondition { .. }));
+        assert_eq!(
+            proposal.kind,
+            ProposalKind::AddPrecondition { spec_body: "a <= 18446744073709551615 - b".into() }
+        );
         assert!(proposal.confidence > 0.0);
+    }
+
+    #[test]
+    fn test_strengthen_overflow_without_source_proposes_nothing() {
+        // A module path is not a file: no operand names can be recovered, so
+        // nothing is proposed (previously the placeholder `a + b >= a`).
+        let results =
+            one_function("test::get_midpoint".into(), "get_midpoint", make_overflow_failure());
+        let output = run(&results, &StrengthenConfig::default());
+        assert_eq!(output.failures_analyzed, 1);
+        assert!(!output.has_proposals, "{:?}", output.proposals);
+    }
+
+    /// Identifiers a proposal text names as variables: skips string literals,
+    /// method/field names after `.`, keywords and numeric literals.
+    fn named_variables(text: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut chars = text.char_indices().peekable();
+        let mut prev = ' ';
+        while let Some((start, c)) = chars.next() {
+            if c == '"' {
+                for (_, d) in chars.by_ref() {
+                    if d == '"' {
+                        break;
+                    }
+                }
+                prev = '"';
+                continue;
+            }
+            if c.is_alphabetic() || c == '_' {
+                let mut end = start + c.len_utf8();
+                while let Some(&(i, d)) = chars.peek() {
+                    if d.is_alphanumeric() || d == '_' {
+                        end = i + d.len_utf8();
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let word = &text[start..end];
+                if prev != '.' && !matches!(word, "true" | "false") {
+                    names.push(word.to_string());
+                }
+                prev = 'x';
+                continue;
+            }
+            if c.is_ascii_digit() {
+                while chars.peek().is_some_and(|&(_, d)| d.is_alphanumeric() || d == '_') {
+                    chars.next();
+                }
+                prev = '0';
+                continue;
+            }
+            if !c.is_whitespace() {
+                prev = c;
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn test_run_never_names_variables_absent_from_the_function() {
+        use std::collections::BTreeMap;
+
+        use trust_types::{Sort, SourceContractClause, validate_source_spec_expr};
+
+        let cases = [
+            (
+                "midpoint_lo_hi",
+                "midpoint",
+                "pub fn midpoint(lo: usize, hi: usize) -> usize {\n    (lo + hi) / 2\n}\n",
+            ),
+            (
+                "binary_search",
+                "binary_search",
+                "pub fn binary_search(arr: &[i32], target: i32) -> Option<usize> {\n    \
+                 let mut low: usize = 0;\n    let mut high: usize = arr.len() - 1;\n    \
+                 while low <= high {\n        let mid = (low + high) / 2;\n        \
+                 if arr[mid] == target { return Some(mid); }\n        \
+                 else if arr[mid] < target { low = mid + 1; } else { high = mid - 1; }\n    \
+                 }\n    None\n}\n",
+            ),
+            ("scale", "scale", "pub fn scale(n: u32, k: u32) -> u32 {\n    n * k\n}\n"),
+            ("field", "field", "pub fn field(p: &Pair) -> u64 {\n    p.x + p.y\n}\n"),
+            ("noop", "noop", "pub fn noop(x: u64) -> u64 {\n    x\n}\n"),
+        ];
+
+        for (tag, name, source) in cases {
+            let file = TempSource::new(tag, source);
+            let ctx = extract_function(source, name).expect("fixture parses");
+            let mut bound: Vec<String> = ctx.params.iter().map(|(n, _)| n.clone()).collect();
+            bound.extend(named_variables(&ctx.full_source));
+            let sorts: BTreeMap<String, Sort> = ctx
+                .params
+                .iter()
+                .map(|(n, ty)| (n.clone(), if ty == "bool" { Sort::Bool } else { Sort::Int }))
+                .collect();
+
+            for (op, results) in [BinOp::Add, BinOp::Sub, BinOp::Mul].map(|op| {
+                let (mut vc, result) = make_overflow_failure();
+                vc.kind = VcKind::ArithmeticOverflow {
+                    op,
+                    operand_tys: (
+                        Ty::Int { width: 64, signed: false },
+                        Ty::Int { width: 64, signed: false },
+                    ),
+                };
+                (op, one_function(file.path(), name, (vc, result)))
+            }) {
+                let output = run(&results, &StrengthenConfig::default());
+                for proposal in &output.proposals {
+                    let texts: Vec<&str> = match &proposal.kind {
+                        ProposalKind::AddPrecondition { spec_body }
+                        | ProposalKind::AddPostcondition { spec_body }
+                        | ProposalKind::AddInvariant { spec_body } => vec![spec_body],
+                        ProposalKind::SafeArithmetic { original, replacement } => {
+                            assert!(
+                                source.contains(original.as_str()),
+                                "{tag}/{op:?}: rewrite target `{original}` is not in the source"
+                            );
+                            vec![original, replacement]
+                        }
+                        ProposalKind::AddBoundsCheck { check_expr }
+                        | ProposalKind::AddNonZeroCheck { check_expr } => vec![check_expr],
+                    };
+                    for text in texts {
+                        for var in named_variables(text) {
+                            assert!(
+                                bound.contains(&var),
+                                "{tag}/{op:?}: `{var}` in `{text}` is not in the function"
+                            );
+                        }
+                    }
+                    if let ProposalKind::AddPrecondition { spec_body } = &proposal.kind {
+                        validate_source_spec_expr(
+                            spec_body,
+                            SourceContractClause::Requires,
+                            &sorts,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("{tag}/{op:?}: `requires {spec_body}` is invalid: {error}")
+                        });
+                    }
+                }
+            }
+        }
+
+        // The pairs that must still be found: parameters get a precondition,
+        // body locals only a checked rewrite.
+        let file = TempSource::new(
+            "midpoint_pin",
+            "pub fn midpoint(lo: usize, hi: usize) -> usize {\n    (lo + hi) / 2\n}\n",
+        );
+        let output = run(
+            &one_function(file.path(), "midpoint", make_overflow_failure()),
+            &StrengthenConfig::default(),
+        );
+        let kinds: Vec<_> = output.proposals.iter().map(|p| p.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ProposalKind::AddPrecondition {
+                    spec_body: "lo <= 18446744073709551615 - hi".into()
+                },
+                ProposalKind::SafeArithmetic {
+                    original: "lo + hi".into(),
+                    replacement: "lo.checked_add(hi).expect(\"addition overflow\")".into(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -391,18 +614,9 @@ mod tests {
 
     #[test]
     fn test_strengthen_respects_confidence_threshold() {
-        let results = CrateVerificationResult {
-            crate_name: "test".into(),
-            functions: vec![FunctionVerificationResult {
-                function_path: "test::get_midpoint".into(),
-                function_name: "get_midpoint".into(),
-                results: vec![make_overflow_failure()],
-                from_notes: 0,
-                with_assumptions: 0,
-            }],
-            total_from_notes: 0,
-            total_with_assumptions: 0,
-        };
+        let file = TempSource::new("threshold", MIDPOINT_SOURCE);
+        let results = one_function(file.path(), "get_midpoint", make_overflow_failure());
+        assert!(run(&results, &StrengthenConfig::default()).has_proposals);
 
         let config = StrengthenConfig {
             min_confidence: 1.0, // impossibly high
@@ -440,5 +654,75 @@ mod tests {
         assert!(output.has_proposals);
         assert_eq!(output.failures_analyzed, 2);
         assert!(output.proposals.len() >= 2);
+    }
+
+    #[test]
+    fn wave492_run_reuses_source_file_for_multiple_functions_in_same_file() {
+        let shared = TempSource::new(
+            "wave492_shared",
+            r#"
+fn add_counts(lhs: usize, rhs: usize) -> usize {
+    lhs + rhs
+}
+
+fn divide_counts(numer: usize, denom: usize) -> usize {
+    numer / denom
+}
+
+fn read_slot(items: &[u64], slot: usize) -> u64 {
+    items[slot]
+}
+"#,
+        );
+        let path = shared.path();
+        let results = CrateVerificationResult {
+            crate_name: "wave492".into(),
+            functions: vec![
+                FunctionVerificationResult {
+                    function_path: path.clone(),
+                    function_name: "add_counts".into(),
+                    results: vec![make_overflow_failure()],
+                    from_notes: 0,
+                    with_assumptions: 0,
+                },
+                FunctionVerificationResult {
+                    function_path: path.clone(),
+                    function_name: "divide_counts".into(),
+                    results: vec![make_div_zero_failure()],
+                    from_notes: 0,
+                    with_assumptions: 0,
+                },
+                FunctionVerificationResult {
+                    function_path: path,
+                    function_name: "read_slot".into(),
+                    results: vec![make_oob_failure()],
+                    from_notes: 0,
+                    with_assumptions: 0,
+                },
+            ],
+            total_from_notes: 0,
+            total_with_assumptions: 0,
+        };
+
+        let output = run(&results, &StrengthenConfig::default());
+        assert_eq!(output.failures_analyzed, 3);
+        assert!(output.proposals.iter().any(|p| {
+            p.function_name == "add_counts"
+                && p.kind
+                    == ProposalKind::AddPrecondition {
+                        spec_body: "lhs <= 18446744073709551615 - rhs".into(),
+                    }
+        }));
+        assert!(output.proposals.iter().any(|p| {
+            p.function_name == "divide_counts"
+                && p.kind == ProposalKind::AddPrecondition { spec_body: "denom != 0".into() }
+        }));
+        assert!(output.proposals.iter().any(|p| {
+            p.function_name == "read_slot"
+                && p.kind
+                    == ProposalKind::AddPrecondition {
+                        spec_body: "slot < items.len()".into(),
+                    }
+        }));
     }
 }

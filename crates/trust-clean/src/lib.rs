@@ -13,6 +13,9 @@
 // success metric for the Clean-dependent-types program is "modulo 3 axioms";
 // this module computes it. See docs/PLAN-clean-dependent-type-reflection.md.
 pub mod axioms;
+/// Raw external module census only; never import or proof authority.
+pub mod olean_census;
+pub mod olean_replay;
 // Trust: WHOLE-ENVIRONMENT axiom census — the complement to the per-decl residue
 // gates: asserts every ConstantKind::Axiom in a pipeline environment is one of the
 // 3 foundational axioms + the 4 Quot kernel primitives, catching a 4th axiom even
@@ -224,8 +227,9 @@ mod e2e_tests;
 
 // Trust: `clean axioms` instrument — transitive axiom closure + foundational gate
 pub use axioms::{
-    AxiomReport, AxiomViolation, FOUNDATIONAL_AXIOMS, axiom_closure, is_foundational,
-    require_axioms_subset, require_foundational,
+    AxiomReport, AxiomViolation, FOUNDATIONAL_AXIOMS, SuppliedContextEntry, SuppliedObligation,
+    axiom_closure, build_supplied_context, is_foundational, require_axioms_subset,
+    require_foundational,
 };
 pub use bundle::{
     TRUST_CERT_BUNDLE_FORMAT_VERSION, TrustProofCertificateBundle,
@@ -299,8 +303,9 @@ pub use float_class::{
 pub use integration::{CertificationBridge, PipelineOutput, RecordVerification};
 // Trust: Clean kernel proof checking interface
 pub use kernel_check::{
-    ContextEntry, KernelContext, KernelQuery, KernelResult, ProofTerm, check_proof, infer_type,
-    is_definitionally_equal, substitute,
+    ContextEntry, KernelContext, KernelQuery, KernelResult, ProofTerm, ReservedKernelName,
+    check_proof, infer_type, is_definitionally_equal, reserved_declaration_refusal,
+    reserved_kernel_name, substitute,
 };
 // Trust: Logic classification for Alethe→clean certification scoping
 pub use logic_classification::{
@@ -586,6 +591,7 @@ pub use trustir_anchor::{
 // Trust: the Lean↔Clean bridge gate surface (§6 `bridge_agreement` citation).
 pub use trustir_bridge::{
     ArmForm, BridgeAgreement, BridgeGateConfig, BridgeGateError, BridgeGateMode, run_bridge_gate,
+    run_bridge_gate_with_step_budget,
 };
 // Trust: §6 driver — run the pipeline over real MIR-extracted VerifiableFunctions
 pub mod prove;
@@ -593,7 +599,7 @@ pub mod prove;
 // vs safety-VC), for the rung-6 diagnosis-first cluster table. Rung B adds the
 // sibling-bodies-threaded variant (P-STACK trampoline resolution).
 pub use prove::{
-    FullyFaithfulDiagnosis, ProveScorecard, diagnose_expr_fold_scc,
+    FullyFaithfulDiagnosis, ProveScorecard, bridge_step_budget_secs, diagnose_expr_fold_scc,
     diagnose_expr_fold_scc_for_function, diagnose_fully_faithful_gate,
     diagnose_fully_faithful_gate_with_bodies, prove_dump_dir, prove_dump_dir_with_budget,
     prove_dump_dir_with_budget_and_bodies,
@@ -641,6 +647,13 @@ pub mod vc_refute;
 // false-proof channels (see the module banner).
 #[cfg(test)]
 mod decline_gate_tests;
+// TRUST-22 — the LIVE ay-proof -> trust-clean replay measurement (div/mod by a numeral).
+#[cfg(test)]
+mod live_ay_replay_tests;
+// CALLEE CREDIT — a call, tail call or drop is not an empty obligation set at the
+// certification tier (see `whole_program::first_unresolved_effect`).
+#[cfg(test)]
+mod callee_credit_gate_tests;
 // Trust: AY proof bridge — translates ay proof certificates to SolverProof
 pub use ay_proof_bridge::translate_ay_proof;
 // Trust: v1 clean proof reuse — indexes and matches v1 theorems

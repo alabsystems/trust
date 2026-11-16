@@ -7,12 +7,12 @@
 
 
 #![macro_export]
-//~^ ERROR:  `#[macro_export]` attribute cannot be used on crates
+//~^ ERROR: the `macro_export` attribute cannot be used on crates
 #![rustc_main]
-//~^ ERROR: `#[rustc_main]` attribute cannot be used on crates
+//~^ ERROR: the `rustc_main` attribute cannot be used on crates
 //~| ERROR: use of an internal attribute [E0658]
-//~| NOTE: the `#[rustc_main]` attribute is an internal implementation detail that will never be stable
-//~| NOTE: the `#[rustc_main]` attribute is used internally to specify test entry point function
+//~| NOTE: the `rustc_main` attribute is an internal implementation detail that will never be stable
+//~| NOTE: the `rustc_main` attribute is used internally to specify test entry point function
 #![repr()]
 //~^ ERROR: attribute cannot be used
 //~| WARN unused attribute
@@ -28,7 +28,11 @@
 //~| WARN cannot be used on crates
 //~| WARN previously accepted
 #![no_link]
-//~^ ERROR: `#[no_link]` attribute cannot be used on crates
+//~^ ERROR: the `no_link` attribute cannot be used on crates
+//~| ERROR use of deprecated `no_link` attribute
+//~| WARN this was previously accepted by the compiler
+//~| NOTE `#[deny(no_link_attributes)]` (part of `#[deny(future_incompatible)]`) on by default
+//~| NOTE for more information, see issue #164032 <https://github.com/rust-lang/rust/issues/164032>
 #![export_name = "2200"]
 //~^ ERROR: attribute cannot be used on
 //~| NOTE takes precedence
@@ -57,39 +61,66 @@ mod inline {
 }
 
 #[no_link]
-//~^ ERROR `#[no_link]` attribute cannot be used on modules
+//~^ ERROR the `no_link` attribute cannot be used on modules
+//~| ERROR use of deprecated `no_link` attribute
+//~| WARN this was previously accepted by the compiler
+//~| NOTE for more information, see issue #164032 <https://github.com/rust-lang/rust/issues/164032>
 mod no_link {
     mod inner { #![no_link] }
-    //~^ ERROR `#[no_link]` attribute cannot be used on modules
+    //~^ ERROR the `no_link` attribute cannot be used on modules
+    //~| ERROR use of deprecated `no_link` attribute
+    //~| WARN this was previously accepted by the compiler
+    //~| NOTE for more information, see issue #164032 <https://github.com/rust-lang/rust/issues/164032>
 
     #[no_link] fn f() {
-        //~^ ERROR `#[no_link]` attribute cannot be used on functions
+        //~^ ERROR the `no_link` attribute cannot be used on functions
+        //~| ERROR use of deprecated `no_link` attribute
+        //~| WARN this was previously accepted by the compiler
+        //~| NOTE for more information, see issue #164032 <https://github.com/rust-lang/rust/issues/164032>
         match () {
             #[no_link]
-            //~^ WARN `#[no_link]` attribute cannot be used on match arms [unused_attributes]
+            //~^ WARN the `no_link` attribute cannot be used on match arms [unused_attributes]
             //~| WARN this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+            //~| ERROR use of deprecated `no_link` attribute
+            //~| WARN this was previously accepted by the compiler
+            //~| NOTE for more information, see issue #164032 <https://github.com/rust-lang/rust/issues/164032>
             _ => ()
         }
     }
 
     #[no_link]
-    //~^ ERROR `#[no_link]` attribute cannot be used on structs
+    //~^ ERROR the `no_link` attribute cannot be used on structs
+    //~| ERROR use of deprecated `no_link` attribute
+    //~| WARN this was previously accepted by the compiler
+    //~| NOTE for more information, see issue #164032 <https://github.com/rust-lang/rust/issues/164032>
     struct S {
         #[no_link]
-        //~^ WARN `#[no_link]` attribute cannot be used on struct fields [unused_attributes]
+        //~^ WARN the `no_link` attribute cannot be used on struct fields [unused_attributes]
         //~| WARN this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+        //~| ERROR use of deprecated `no_link` attribute
+        //~| WARN this was previously accepted by the compiler
+        //~| NOTE for more information, see issue #164032 <https://github.com/rust-lang/rust/issues/164032>
         field: ()
     }
 
     #[no_link]type T = S;
-    //~^ ERROR `#[no_link]` attribute cannot be used on type aliases
+    //~^ ERROR the `no_link` attribute cannot be used on type aliases
+    //~| ERROR use of deprecated `no_link` attribute
+    //~| WARN this was previously accepted by the compiler
+    //~| NOTE for more information, see issue #164032 <https://github.com/rust-lang/rust/issues/164032>
 
     #[no_link] impl S { }
-    //~^ ERROR `#[no_link]` attribute cannot be used on inherent impl blocks
+    //~^ ERROR the `no_link` attribute cannot be used on inherent impl blocks
+    //~| ERROR use of deprecated `no_link` attribute
+    //~| WARN this was previously accepted by the compiler
+    //~| NOTE for more information, see issue #164032 <https://github.com/rust-lang/rust/issues/164032>
 
     #[no_link]
-    //~^ WARN `#[no_link]` attribute cannot be used on macro defs
+    //~^ WARN the `no_link` attribute cannot be used on macro defs
     //~| WARN this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    //~| ERROR use of deprecated `no_link` attribute
+    //~| WARN this was previously accepted by the compiler
+    //~| NOTE for more information, see issue #164032 <https://github.com/rust-lang/rust/issues/164032>
     macro_rules! m{() => {}}
 }
 

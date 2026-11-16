@@ -34,6 +34,9 @@ fn permit_additional_workspace_fields() {
 
             [workspace.dependencies]
             dep = "0.1"
+
+            [workspace.lints.cargo]
+            default = "allow"
         "#,
         )
         .file(
@@ -45,6 +48,9 @@ fn permit_additional_workspace_fields() {
               edition = "2015"
               authors = []
               workspace = ".."
+
+              [lints.cargo]
+              default = "allow"
               "#,
         )
         .file("bar/src/main.rs", "fn main() {}")
@@ -286,6 +292,9 @@ fn inherit_own_dependencies() {
             dep = "0.1"
             dep-build = "0.8"
             dep-dev = "0.5.2"
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -300,7 +309,7 @@ fn inherit_own_dependencies() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep v0.1.2 (registry `dummy-registry`)
 [DOWNLOADED] dep-build v0.8.2 (registry `dummy-registry`)
@@ -435,6 +444,9 @@ version = "0.5.2"
 [build-dependencies.dep-build]
 version = "0.8"
 
+[lints.cargo]
+default = "allow"
+
 "##]],
         )],
     );
@@ -461,6 +473,9 @@ fn inherit_own_detailed_dependencies() {
 
             [workspace.dependencies]
             dep = { version = "0.1.2", features = ["testing"] }
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -473,7 +488,7 @@ fn inherit_own_detailed_dependencies() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep v0.1.2 (registry `dummy-registry`)
 [CHECKING] dep v0.1.2
@@ -580,6 +595,9 @@ path = "src/main.rs"
 version = "0.1.2"
 features = ["testing"]
 
+[lints.cargo]
+default = "allow"
+
 "##]],
         )],
     );
@@ -653,6 +671,9 @@ fn inherited_dependencies_union_features() {
             members = []
             [workspace.dependencies]
             dep = { version = "0.1", features = ["fancy"] }
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -662,7 +683,7 @@ fn inherited_dependencies_union_features() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] fancy_dep v0.2.4 (registry `dummy-registry`)
 [DOWNLOADED] dep v0.1.0 (registry `dummy-registry`)
@@ -890,6 +911,9 @@ fn inherit_dependencies() {
             dep-build.workspace = true
             [dev-dependencies]
             dep-dev.workspace = true
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("bar/src/main.rs", "fn main() {}")
@@ -904,7 +928,7 @@ fn inherit_dependencies() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep v0.1.2 (registry `dummy-registry`)
 [DOWNLOADED] dep-build v0.8.2 (registry `dummy-registry`)
@@ -1040,6 +1064,9 @@ version = "0.5.2"
 [build-dependencies.dep-build]
 version = "0.8"
 
+[lints.cargo]
+default = "allow"
+
 "##]],
         )],
     );
@@ -1070,6 +1097,9 @@ fn inherit_target_dependencies() {
             dep.workspace = true
             [target.'cfg(windows)'.dependencies]
             dep.workspace = true
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("bar/src/main.rs", "fn main() {}")
@@ -1080,7 +1110,7 @@ fn inherit_target_dependencies() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep v0.1.2 (registry `dummy-registry`)
 [CHECKING] dep v0.1.2
@@ -1127,7 +1157,7 @@ fn inherit_dependency_override_optional() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.2.0 ([ROOT]/foo/bar)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1162,6 +1192,9 @@ fn inherit_dependency_features() {
             members = []
             [workspace.dependencies]
             dep = "0.1"
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -1171,7 +1204,7 @@ fn inherit_dependency_features() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] fancy_dep v0.2.4 (registry `dummy-registry`)
@@ -1235,6 +1268,9 @@ fn inherit_detailed_dependencies() {
             authors = []
             [dependencies]
             detailed.workspace = true
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("bar/src/main.rs", "fn main() {}")
@@ -1243,7 +1279,7 @@ fn inherit_detailed_dependencies() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/detailed`
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] detailed v0.5.0 ([ROOTURL]/detailed?branch=branchy#[..])
 [CHECKING] bar v0.2.0 ([ROOT]/foo/bar)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1275,6 +1311,9 @@ fn inherit_path_dependencies() {
             authors = []
             [dependencies]
             dep.workspace = true
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("bar/src/main.rs", "fn main() {}")
@@ -1533,16 +1572,19 @@ fn warn_inherit_def_feat_true_member_def_feat_false() {
             members = []
             [workspace.dependencies]
             dep = { version = "0.1.0", default-features = true }
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
 
     p.cargo("check").with_stderr_data(str![[r#"
-[WARNING] Cargo.toml: `default-features` is ignored for dep, since `default-features` was true for `workspace.dependencies.dep`, this could become a hard error in the future
+[WARNING] Cargo.toml: `default-features` is ignored for dep, since `default-features` was true for `workspace.dependencies.dep`; overriding workspace `default-features` to false requires Rust 1.99+ and the 2024 edition
 [WARNING] `bar` (manifest) generated 1 warning
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] fancy_dep v0.2.4 (registry `dummy-registry`)
@@ -1555,7 +1597,7 @@ fn warn_inherit_def_feat_true_member_def_feat_false() {
 }
 
 #[cargo_test]
-fn warn_inherit_def_feat_true_member_def_feat_false_2024_edition() {
+fn inherit_def_feat_true_member_def_feat_false_2024_edition() {
     Package::new("dep", "0.1.0")
         .feature("default", &["fancy_dep"])
         .add_dep(Dependency::new("fancy_dep", "0.2").optional(true))
@@ -1580,21 +1622,23 @@ fn warn_inherit_def_feat_true_member_def_feat_false_2024_edition() {
             members = []
             [workspace.dependencies]
             dep = { version = "0.1.0", default-features = true }
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
 
     p.cargo("check")
-        .with_status(101)
         .with_stderr_data(str![[r#"
-[ERROR] failed to parse manifest at `[ROOT]/foo/Cargo.toml`
-
-Caused by:
-  error inheriting `dep` from workspace root manifest's `workspace.dependencies.dep`
-
-Caused by:
-  `default-features = false` cannot override workspace's `default-features`
+[UPDATING] `dummy-registry` index
+[LOCKING] 1 package to highest Rust [..] compatible version
+[DOWNLOADING] crates ...
+[DOWNLOADED] dep v0.1.0 (registry `dummy-registry`)
+[CHECKING] dep v0.1.0
+[CHECKING] bar v0.2.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -1626,16 +1670,19 @@ fn warn_inherit_simple_member_def_feat_false() {
             members = []
             [workspace.dependencies]
             dep = "0.1.0"
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
 
     p.cargo("check").with_stderr_data(str![[r#"
-[WARNING] Cargo.toml: `default-features` is ignored for dep, since `default-features` was not specified for `workspace.dependencies.dep`, this could become a hard error in the future
+[WARNING] Cargo.toml: `default-features` is ignored for dep, since `default-features` was not specified for `workspace.dependencies.dep`; overriding workspace `default-features` to false requires Rust 1.99+ and the 2024 edition
 [WARNING] `bar` (manifest) generated 1 warning
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] fancy_dep v0.2.4 (registry `dummy-registry`)
@@ -1648,7 +1695,7 @@ fn warn_inherit_simple_member_def_feat_false() {
 }
 
 #[cargo_test]
-fn warn_inherit_simple_member_def_feat_false_2024_edition() {
+fn inherit_simple_member_def_feat_false_2024_edition() {
     Package::new("dep", "0.1.0")
         .feature("default", &["fancy_dep"])
         .add_dep(Dependency::new("fancy_dep", "0.2").optional(true))
@@ -1673,21 +1720,23 @@ fn warn_inherit_simple_member_def_feat_false_2024_edition() {
             members = []
             [workspace.dependencies]
             dep = "0.1.0"
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
 
     p.cargo("check")
-        .with_status(101)
         .with_stderr_data(str![[r#"
-[ERROR] failed to parse manifest at `[ROOT]/foo/Cargo.toml`
-
-Caused by:
-  error inheriting `dep` from workspace root manifest's `workspace.dependencies.dep`
-
-Caused by:
-  `default-features = false` cannot override workspace's `default-features`
+[UPDATING] `dummy-registry` index
+[LOCKING] 1 package to highest Rust [..] compatible version
+[DOWNLOADING] crates ...
+[DOWNLOADED] dep v0.1.0 (registry `dummy-registry`)
+[CHECKING] dep v0.1.0
+[CHECKING] bar v0.2.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -1719,6 +1768,9 @@ fn inherit_def_feat_false_member_def_feat_true() {
             members = []
             [workspace.dependencies]
             dep = { version = "0.1.0", default-features = false }
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -1728,7 +1780,7 @@ fn inherit_def_feat_false_member_def_feat_true() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] fancy_dep v0.2.4 (registry `dummy-registry`)
@@ -1806,6 +1858,9 @@ fn warn_inherit_unused_manifest_key_dep() {
 
             [dependencies]
             dep = { workspace = true, wxz = "wxz" }
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -1817,7 +1872,7 @@ fn warn_inherit_unused_manifest_key_dep() {
 [WARNING] Cargo.toml: unused manifest key: dependencies.dep.wxz
 [WARNING] `bar` (manifest) generated 2 warnings
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep v0.1.0 (registry `dummy-registry`)
 [CHECKING] dep v0.1.0
@@ -1844,6 +1899,12 @@ fn warn_unused_workspace_package_field() {
             [package]
             name = "foo"
             edition = "2015"
+
+            [workspace.lints.cargo]
+            default = "allow"
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("src/main.rs", "fn main() {}")

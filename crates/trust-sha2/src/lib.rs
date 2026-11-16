@@ -96,7 +96,7 @@ pub use output::{Digest28, Digest32, Digest48, Digest64};
 // and its value depends on sharing nothing with the implementation.
 #[doc(hidden)]
 pub use sha256::spec_tables as sha256_spec_tables;
-pub use sha256::{Sha224, Sha256};
+pub use sha256::{NativeSha256, Sha224, Sha256};
 #[doc(hidden)]
 pub use sha512::spec_tables as sha512_spec_tables;
 pub use sha512::{Sha384, Sha512};

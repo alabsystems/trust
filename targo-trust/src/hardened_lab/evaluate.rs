@@ -33,7 +33,7 @@ pub(super) fn evaluate_claims(
                     vc.function == claim.source_example
                         && claim
                             .required_fragment
-                            .map_or(true, |fragment| vc.description.contains(fragment))
+                            .is_none_or(|fragment| vc.description.contains(fragment))
                 })
                 .map(|vc| ClaimMatch {
                     function: vc.function.clone(),
@@ -89,8 +89,7 @@ fn evaluate_claim_walkthrough_evidence(
                             walkthrough_name,
                             requirement.key,
                         )
-                        .iter()
-                        .any(|value| *value == requirement.value),
+                        .contains(&requirement.value),
                     })
                     .collect::<Vec<_>>();
                 let missing = requirements

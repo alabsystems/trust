@@ -1,10 +1,6 @@
 // Test that borrowck handles functions with many local variables without
 // quadratic compile-time blowup in EverInitializedPlaces analysis.
 // Regression test for rust-lang#144635.
-//
-// Trust: When init count exceeds 4096, EverInitializedPlaces falls back to
-// conservative "all initialized" approximation to avoid O(inits * blocks)
-// quadratic behavior.
 
 //@ check-pass
 //@ compile-flags: -C opt-level=0
@@ -27,7 +23,7 @@ fn many_locals() -> u64 {
 
     // 200 locals is enough to generate many init indices (each Box creates
     // multiple MIR locals for the allocation), while keeping the test file
-    // reasonably sized. The actual cap is 4096 init indices.
+    // reasonably sized.
     make_locals!(
         a001, a002, a003, a004, a005, a006, a007, a008, a009, a010,
         a011, a012, a013, a014, a015, a016, a017, a018, a019, a020,

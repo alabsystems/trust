@@ -9,12 +9,39 @@
 // Trust: This pass uses two complementary strategies:
 // Trust: 1. Condition-based: If two Assert terminators share the same condition
 // Trust:    local and expected value, and the first dominates the second, the
-// Trust:    second is redundant.
+// Trust:    second is redundant, PROVIDED the first is a MANDATORY check (below).
 // Trust: 2. BoundsCheck-specific: If two BoundsCheck asserts reference the same
 // Trust:    index and length locals, the dominated one is redundant.
 //
 // Trust: Strategy 1 benefits from running after GVN, which merges identical
 // Trust: computations into the same SSA local.
+//
+// Trust: RULE (RBCE-OPTIONAL-DOMINATOR-1): an assert whose message is an
+// Trust: optional overflow check (`AssertKind::is_optional_overflow_check`:
+// Trust: `OverflowNeg` and `Overflow(Add|Sub|Mul|Shl|Shr)`) never dominates.
+// Trust: Codegen erases such an assert whenever the session that codegens the
+// Trust: body has overflow checks off (`codegen_assert_terminator` in
+// Trust: rustc_codegen_ssa/src/mir/block.rs), and that session need not be this
+// Trust: one: a checks-off crate codegens the `#[inline]` or generic MIR this
+// Trust: crate encodes. An erased assert guarantees nothing, so a check it
+// Trust: "dominated" must stay. An optional assert may still be the DOMINATED
+// Trust: one: a mandatory dominator on the same condition always runs. Strategy
+// Trust: 2 needs no rule, because a BoundsCheck is always mandatory.
+// Trust:
+// Trust: The miscompile this closed: in `let n = x.neg(); n.wrapping_add(x / -1)`
+// Trust: GVN gave the inlined core `Neg::neg`'s `OverflowNeg` condition
+// Trust: `Eq(x, i32::MIN)` and the `/ -1` overflow condition
+// Trust: (`Eq(-1, -1) & Eq(x, MIN)`, folded) one local. The mandatory "attempt
+// Trust: to divide with overflow" assert was deleted under the optional negate
+// Trust: assert; at -O with overflow checks off, codegen erased that one too, and
+// Trust: `x / -1` at `i32::MIN` ran an unguarded `sdiv`, UB in safe Rust (`% -1`
+// Trust: the same). A dependency built with checks ON deleted it in the MIR it
+// Trust: encoded, so a checks-off consumer was hit at any opt-level.
+// Trust:
+// Trust: Cost, accepted: two optional asserts on one condition are no longer
+// Trust: deduplicated. That dedup was sound (one session erases both or keeps
+// Trust: both), but the rule above does not depend on how codegen erases, and
+// Trust: in a checks-off session both asserts are erased anyway.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 
@@ -33,8 +60,8 @@ impl<'tcx> crate::MirPass<'tcx> for RedundantBoundsCheckElim {
         "RedundantBoundsCheckElim"
     }
 
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 2
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> crate::PassPolicy {
+        crate::PassPolicy::optional(ctx.mir_opt_level() >= 2)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -45,26 +72,32 @@ impl<'tcx> crate::MirPass<'tcx> for RedundantBoundsCheckElim {
         // SsaLocals analysis for assert-free bodies, single-assert bodies (a
         // lone bounds check — the common case in post-GVN release MIR), and
         // multi-assert bodies whose keys are all distinct.
-        let mut raw_cond: FxHashMap<(Local, bool), u32> = FxHashMap::default();
-        let mut raw_bounds: FxHashMap<(Local, Local), u32> = FxHashMap::default();
+        let mut raw_cond: SmallVec<[(Local, bool); 8]> = SmallVec::new();
+        let mut raw_bounds: SmallVec<[(Local, Local); 8]> = SmallVec::new();
         let mut has_candidate = false;
         for block in body.basic_blocks.iter() {
             if let TerminatorKind::Assert { ref cond, expected, ref msg, .. } =
                 block.terminator().kind
             {
                 if let Some(cond_local) = operand_as_plain_local(cond) {
-                    let n = raw_cond.entry((cond_local, expected)).or_default();
-                    *n += 1;
-                    has_candidate |= *n >= 2;
+                    let key = (cond_local, expected);
+                    if raw_cond.contains(&key) {
+                        has_candidate = true;
+                        break;
+                    }
+                    raw_cond.push(key);
                 }
                 if expected {
                     if let AssertKind::BoundsCheck { ref len, ref index } = **msg {
                         if let (Some(idx), Some(ln)) =
                             (operand_as_plain_local(index), operand_as_plain_local(len))
                         {
-                            let n = raw_bounds.entry((idx, ln)).or_default();
-                            *n += 1;
-                            has_candidate |= *n >= 2;
+                            let key = (idx, ln);
+                            if raw_bounds.contains(&key) {
+                                has_candidate = true;
+                                break;
+                            }
+                            raw_bounds.push(key);
                         }
                     }
                 }
@@ -83,12 +116,13 @@ impl<'tcx> crate::MirPass<'tcx> for RedundantBoundsCheckElim {
         let ssa = SsaLocals::new(tcx, body, body.typing_env(tcx));
         let dominators = body.basic_blocks.dominators();
 
-        // Trust: Phase 1 — Index all Assert(cond, true, ...) terminators, keyed by
-        // (cond_local, expected) for condition-based dedup and (index, len) locals
-        // for BoundsCheck-specific dedup. Keyed buckets (not a flat list) keep
-        // phase 2 at O(bucket) per assert — a flat list made assert-heavy bodies
-        // quadratic. Unreachable blocks are skipped: `dominates` never holds from
-        // an unreachable block, and unreachable asserts are not worth rewriting.
+        // Trust: Phase 1 — Index the MANDATORY Assert terminators, keyed by
+        // (cond_local, expected) for condition-based dedup, and the BoundsCheck
+        // asserts by (index, len) locals for BoundsCheck-specific dedup. Keyed
+        // buckets (not a flat list) keep phase 2 at O(bucket) per assert — a flat
+        // list made assert-heavy bodies quadratic. Unreachable blocks are skipped:
+        // `dominates` never holds from an unreachable block, and unreachable
+        // asserts are not worth rewriting.
         let mut assert_cond_blocks: FxHashMap<(Local, bool), SmallVec<[BasicBlock; 4]>> =
             FxHashMap::default();
         let mut bounds_check_blocks: FxHashMap<(Local, Local), SmallVec<[BasicBlock; 4]>> =
@@ -100,7 +134,14 @@ impl<'tcx> crate::MirPass<'tcx> for RedundantBoundsCheckElim {
             }
             let terminator = block.terminator();
             if let TerminatorKind::Assert { ref cond, expected, ref msg, .. } = terminator.kind {
-                if let Some(cond_local) = operand_as_ssa_local(&ssa, cond) {
+                // Trust: RBCE-OPTIONAL-DOMINATOR-1 — only a MANDATORY assert is
+                // indexed as a strategy-1 dominator. An optional overflow check
+                // can be erased by whichever session codegens this body (see the
+                // module header), so it guarantees nothing about its condition.
+                // It still reaches phase 2 as a candidate to be removed.
+                if !msg.is_optional_overflow_check()
+                    && let Some(cond_local) = operand_as_ssa_local(&ssa, cond)
+                {
                     assert_cond_blocks.entry((cond_local, expected)).or_default().push(bb);
                 }
                 if expected {
@@ -135,7 +176,8 @@ impl<'tcx> crate::MirPass<'tcx> for RedundantBoundsCheckElim {
             };
 
             // Trust: Strategy 1 — Same condition local, same expected value,
-            // dominating block. Works for any Assert, not just BoundsCheck.
+            // dominating MANDATORY assert (phase 1 indexes no optional overflow
+            // check). The dominated assert may be of any kind.
             let redundant_by_cond =
                 assert_cond_blocks.get(&(cond_local, expected)).is_some_and(|doms| {
                     doms.iter().any(|&dom_bb| dom_bb != bb && dominators.dominates(dom_bb, bb))
@@ -180,12 +222,9 @@ impl<'tcx> crate::MirPass<'tcx> for RedundantBoundsCheckElim {
         );
         let blocks = body.basic_blocks.as_mut();
         for (bb, target) in rewrites {
-            blocks[bb].terminator_mut().kind = TerminatorKind::Goto { target };
+            blocks[bb].terminator_mut().kind =
+                TerminatorKind::Goto { target, loop_hint_attrs: Default::default() };
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 

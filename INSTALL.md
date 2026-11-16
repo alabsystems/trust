@@ -1,40 +1,34 @@
 # Install Trust
 
-> **Boundary as last reviewed 2026-08-29:** Trust has public, ledger-attested
-> source releases (signed `SHA256SUMS`/`SHA256SUMS.sig`) with an anonymous
-> public build lane — `scripts/fetch-first-party.sh` plus a stock-nightly check
-> scoped to the upstream-Rust crates — and a private seed-first source-build
-> path for `aarch64-apple-darwin`. The self-hosting toolchain build remains
-> that private/self-hosted lane; there is no packaged binary install and no
-> demonstrated Linux/Windows install. A produced Stage2 sysroot is usable only
-> after current-commit inventory and acceptance gates pass; this document does
-> not assert that those gates have passed.
+Trust has public, ledger-attested source releases (signed
+`SHA256SUMS`/`SHA256SUMS.sig`) with an anonymous public build lane
+(`scripts/fetch-first-party.sh`), a private seed-first source-build path for
+`aarch64-apple-darwin`, and one packaged binary install: on Apple-silicon macOS,
+install [aterm](https://github.com/alabsystems/aterm#install) and its package
+manager, atpkg, installs Trust from this repository's signed
+`atpkg-trust-<build>` releases and links rustup's `trust` toolchain to it
+(`aterm pkg install trust` does it by hand). There is no Linux or Windows
+install. A Stage 2 sysroot you build is usable only after the current commit's
+inventory and acceptance gates pass; this page does not claim they have.
 
 Trust descends from `rust-lang/rust`, but its canonical tool names are
 `trustc`, `targo`, `targo-trust`, `trustd`, `trustdoc`, `trustfmt`, `tippy`, and
 `trust-analyzer`. Same-sysroot Rust-compatible names are compatibility surface,
 not independent Trust evidence.
 
-Publishing is gated by credential, not by a human in the loop: releases are
-promoted by automation that holds the separate release credential and names
-`PUBLISH_RELEASE_REMOTE` explicitly, with the content guards
-(forbidden-content, private-refs, gitleaks) passing in every release mode.
-Local dist and install rehearsals may prepare and validate artifacts, but
-nothing reaches the release tier without that credential and that explicit
-remote.
+Publishing a toolchain needs the release credential and runs only after the cut's gates pass.
 
 ## Authoritative references
 
 - [README.md](README.md): product boundary and source-build quick start
 - [bootstrap/trust-stage0/README.md](bootstrap/trust-stage0/README.md): exact
-  private seed identity, authenticated acquisition, and genesis fallback
+  private seed identity, authenticated acquisition, and why a stock stage0 is
+  not supported (it used to document a genesis fallback)
 - [patches/README.md](patches/README.md): building the external LLVM this
   snapshot links against, and the one patch Trust requires in it
 - Internal maintainer documents, named here because they are not part of the
   published snapshot: `install.md` (detailed maintainer/install evidence
-  model), `testing-strategy.md` (what each gate proves), and
-  `DAILY_DRIVER_LAUNCH.md` (the current simulated HN-comment disposition
-  ledger).
+  model) and `testing-strategy.md` (what each gate proves).
 
 ## What this snapshot does and does not carry
 
@@ -59,9 +53,13 @@ and both have a documented substitute:
   ```
 
   Run it once after cloning; afterwards both Cargo workspaces resolve
-  (`cargo metadata`, a `--locked` re-lock), and the stock nightly pinned at
-  the snapshot root checks the 50 upstream-Rust crates — the release gate's
-  scoped `-p` list, recorded in the internal `publish/config.sh`. Two crate
+  (`targo metadata`; a `--locked` re-lock). The 50 upstream-Rust crates of the
+  release gate's scoped `-p` list (recorded in the internal
+  `publish/config.sh`) are meant to check with the Trust toolchain (the aterm
+  install above): the release gate runs `targo trust check --allow-l0-gaps
+  --manifest-path crates/Cargo.toml --locked -p …`, and `targo --unverified
+  check …` is the compile-only pass. Neither has been run on the
+  published pack yet. Two crate
   families build only through the self-hosted lane below: `trust-hex`,
   `trust-ratio`, and `trust-utf` are Trust-language source (grammar `ensures`
   clauses stock rustc cannot parse), and
@@ -72,7 +70,7 @@ and both have a documented substitute:
 
 ```bash
 # with an LLVM built and patched per patches/README.md
-python3 scripts/recreate_bootstrap.py \
+python3 scripts/recreate_bootstrap.py --require-seed --fresh-seed \
   --llvm-config /path/to/llvm-project/build/bin/llvm-config --stage 2
 ```
 
@@ -80,6 +78,14 @@ python3 scripts/recreate_bootstrap.py \
 `ninja` are not needed for the Trust build itself. The same setting can be
 written by hand into `bootstrap.toml` as `[target.<host-triple>] llvm-config`
 with `[llvm] download-ci-llvm = false`.
+
+The two seed flags matter here. The seed release is private, so on a public
+clone the seed fetch fails. Without the flags, the recreator then uses an installed atpkg `trust`
+pack if there is one, which is not the pinned seed. Otherwise it falls back to
+its stock-Rust genesis mode, which wraps the `rustc`/`cargo` already installed.
+Neither is the supported stage0, the pinned seed described next. With both
+flags, a clone that cannot fetch the seed stops with an error, so a public
+clone cannot build the compiler from source yet.
 
 ## Supported private source-build path
 
@@ -96,7 +102,10 @@ repository and all nine HTTPS first-party submodules:
 
 ```bash
 # one-time host setup; Python 3.11+ is mandatory
-brew install gh cmake ninja python@3.14 rustup libgit2 coreutils
+brew install gh cmake ninja python@3.14 rustup coreutils
+# a Stage 2 build also binds the Xcode Command Line Tools and a `pkg-config`,
+# which neither macOS nor the line above provides: see "Native tools of the
+# Stage 2 build" below
 
 # authenticate before the private clone, submodules, and seed-release fetch
 gh auth login
@@ -130,6 +139,49 @@ These commands are the evidence bar, not a statement that the current checkout
 has already passed it. The source-build registration points rustup at a mutable
 build tree and is not immutable installed-toolchain or dist evidence.
 
+### Native tools of the Stage 2 build
+
+A Stage 2 build binds its native build tools into its provenance receipt and
+refuses to start unless each one resolves: `cc`, `c++`, `ar`, `ld`, `nm`,
+`ranlib`, `strip`, `make` and `git` (Xcode Command Line Tools:
+`xcode-select --install`), `perl` and `sh` (ship with macOS), `cmake`, `ninja`,
+`python` (the interpreter running the recreator), and a `pkg-config`. On macOS
+the same capture also resolves `xcrun` and `xcode-select` and binds what they
+select inside the active developer directory (`clang`, `clang++`, `otool`,
+`python3`, and that directory's own `ar`, `ld`, `nm`, `ranlib`, `strip`, `git`,
+`make`) together with the SDK; the Command Line Tools provide all of those. It
+refuses ambient build overrides as well (`CC`, `RUSTFLAGS`, every
+`PKG_CONFIG_*`, `HOST_PKG_CONFIG*` and `TARGET_PKG_CONFIG*` variable, and the
+rest of its list) and Cargo configuration in a directory above the checkout.
+
+`--check` with the build's flags runs that capture read-only and prints its
+answer first, before it looks for a stage0: whenever the build would be
+refused there it exits 1 with the capture's own reasons, and the build itself
+is refused at the same point, before it fetches anything.
+`--check --require-seed --fresh-seed --stage 2`, the build command above with
+`--check`, is its report: it selects the stage0 as that build does, from the
+pinned archives and never from an installed atpkg pack, and sets nothing aside.
+`--check` never fetches, so on a
+new clone it goes on to report the pinned seed unavailable; the table above that
+line is the answer. With the archives on disk a failing report ends with the
+stage0 it would use: `--check: prerequisites NOT met (stage0 mode: seed).`
+
+macOS ships no `pkg-config`, and neither do the Command Line Tools or the
+`brew install` line of the host setup. `brew install pkgconf` supplies one
+that searches Homebrew's .pc files, so a build script that probes can resolve,
+and link, a Homebrew library. To satisfy the binding without them, build
+pkgconf with a private prefix and link it yourself, because its install
+creates `bin/pkgconf` and no file named `pkg-config`:
+
+```bash
+./configure --prefix="$P" --disable-shared && make && make install
+mkdir "$P/pathbin" && ln -s ../bin/pkgconf "$P/pathbin/pkg-config"
+PATH="$PATH:$P/pathbin" python3 scripts/recreate_bootstrap.py --check --require-seed --no-atpkg
+```
+
+Keep `$P/pathbin` LAST on PATH, for the recreator only, and in place for
+`--verify-stage-provenance`, which binds the same file at the same path again.
+
 ### Register the toolchain: link rustup at a SEALED artifact (default)
 
 A stage2 under `build/` is a LIVE build directory: every `x.py` run empties
@@ -138,12 +190,28 @@ every repo pinning `channel = "trust"` fail intermittently with
 `error[E0463]` / `'rustc' is not installed` whenever a rebuild is in flight.
 A plain link also loses the `rustc-private-sysroots` pairing that out-of-tree
 `rustc_private` driver tools (trust-wp) resolve beside the compiler's sysroot.
-Seal first, then link:
+Seal first, then link. The seal's gates start the compiler and every shipped tool
+through one small program, `trust-serial-command`, and that program starts nothing
+for a caller that holds no build slot. Build it with the stage2 you are sealing,
+then seal inside a slot:
 
 ```bash
 # after the stage2 build above
-scripts/promote-toolchain.sh
+STAGE2="$PWD/build/host/stage2"
+HELPER="$HOME/.cache/trust-serial-command"      # any directory outside the checkout
+(cd crates/trust-resource-controller && PATH="$STAGE2/bin:$PATH" CARGO_TARGET_DIR="$HELPER" \
+    targo --unverified build --locked --release --features serial-command --bin trust-serial-command)
+TRUST_TOOLCHAIN_SERIAL_COMMAND="$HELPER/release/trust-serial-command" \
+    python3 scripts/build-slot --cpus 1 -- bash scripts/promote-toolchain.sh
 ```
+
+`TRUST_TOOLCHAIN_SERIAL_COMMAND` is the absolute path of a regular executable, not
+a symlink. Every form that runs a gate needs it and the slot: a seal, `--no-flip`
+and `--gate-only`. `--provenance` and `--help` need neither. A slot is held by
+running under `scripts/build-slot`; never set `BUILD_SLOT_HELD` by hand. Without
+either, the script refuses before any gate runs, says which is missing and prints
+these commands. On a Linux host, `scripts/linux_refresh_toolchain.py --seal` does
+both itself.
 
 `promote-toolchain.sh` copies the finished stage2 into an immutable artifact
 under `$TRUST_TOOLCHAIN_HOME` (default `~/toolchains`), seals the byte-matched
@@ -196,8 +264,10 @@ build/aarch64-apple-darwin/stage2/bin/targo --unverified test
 ```
 
 Those commands emit an `UNVERIFIED` warning and make no proof claim. Bootstrap
-also disables verification explicitly for stability; Stage2 self-hosting is not
-self-proof.
+builds the compiler with verification off (`-Ztrust-verify=off`). That is not
+on yet: a defect, not policy. The owner, 2026-11-09: "what check-waiving? that
+sounds wrong. we want verification on and for it to work." Stage2
+self-hosting is not self-proof.
 
 ## Packaging status
 
@@ -213,12 +283,12 @@ evidence. Verified third-party proc macros,
 Linux/Windows seeds, public distribution, and strict-superiority evidence remain
 open boundaries.
 
-The stock-Rust genesis adapter remains available only as an explicit developer
-fallback:
-
-```bash
-python3 scripts/recreate_bootstrap.py --genesis --stage 2
-```
-
-Anything produced through that fallback must identify genesis lineage and must
-not be described as Trust-from-Trust or release evidence.
+The recreator still has a stock-Rust genesis mode (`--genesis`). Without
+`--require-seed`, with no seed-mode `bootstrap.toml` already present and no
+usable atpkg pack, it falls back to that mode on its own when the seed cannot
+be materialized, printing one line. It is not a supported lane: no stock Rust
+is in the Trust toolchain. Pass `--require-seed --fresh-seed`. `x.py build`
+does not refuse a genesis or other stock stage0 yet.
+`scripts/check_seed_freshness.py` refuses it in tidy and in the fast profile;
+the push profile does not run it yet, and it stops no build. The seals built
+through one on a maintainer host record no stage0 in their `PROVENANCE`.

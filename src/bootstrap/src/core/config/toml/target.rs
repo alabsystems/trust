@@ -10,15 +10,16 @@
 //!   build target, which is is stored in the main `Config` structure.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
 
+use crate::core::backend::CodegenBackendKind;
+use crate::core::config::macros::define_config;
 use crate::core::config::{
-    CompilerBuiltins, CompressDebuginfo, LlvmLibunwind, Merge, ReplaceOpt, SplitDebuginfo,
-    StringOrBool,
+    Allocator, CompilerBuiltins, CompressDebuginfo, LlvmLibunwind, SplitDebuginfo, StringOrBool,
 };
-use crate::{CodegenBackendKind, HashSet, PathBuf, define_config, exit};
 
 define_config! {
     /// TOML representation of how each build target is configured.
@@ -32,6 +33,7 @@ define_config! {
         linker: Option<String> = "linker",
         split_debuginfo: Option<String> = "split-debuginfo",
         llvm_config: Option<String> = "llvm-config",
+        llvm_zstd_pkg_config_dir: Option<PathBuf> = "llvm-zstd-pkg-config-dir",
         llvm_has_rust_patches: Option<bool> = "llvm-has-rust-patches",
         llvm_filecheck: Option<String> = "llvm-filecheck",
         llvm_libunwind: Option<String> = "llvm-libunwind",
@@ -48,6 +50,7 @@ define_config! {
         codegen_backends: Option<Vec<String>> = "codegen-backends",
         runner: Option<String> = "runner",
         optimized_compiler_builtins: Option<CompilerBuiltins> = "optimized-compiler-builtins",
+        allocator: Option<Allocator> = "allocator",
         jemalloc: Option<bool> = "jemalloc",
     }
 }
@@ -57,6 +60,8 @@ define_config! {
 pub struct Target {
     /// Some(path to llvm-config) if using an external LLVM.
     pub llvm_config: Option<PathBuf>,
+    /// Explicit libzstd.pc dependency directory for the selected external LLVM.
+    pub llvm_zstd_pkg_config_dir: Option<PathBuf>,
     pub llvm_has_rust_patches: Option<bool>,
     /// Some(path to FileCheck) if one was specified.
     pub llvm_filecheck: Option<PathBuf>,
@@ -83,7 +88,7 @@ pub struct Target {
     pub no_std: bool,
     pub codegen_backends: Option<Vec<CodegenBackendKind>>,
     pub optimized_compiler_builtins: Option<CompilerBuiltins>,
-    pub jemalloc: Option<bool>,
+    pub allocator: Option<Allocator>,
 }
 
 impl Target {
@@ -128,9 +133,20 @@ impl<'de> Deserialize<'de> for DefaultLinuxLinkerOverride {
 
 /// Set of linker overrides for selected Linux targets.
 #[cfg(not(test))]
-pub fn default_linux_linker_overrides() -> HashMap<String, DefaultLinuxLinkerOverride> {
-    [("x86_64-unknown-linux-gnu".to_string(), DefaultLinuxLinkerOverride::SelfContainedLldCc)]
-        .into()
+pub fn default_linux_linker_overrides(
+    channel: &str,
+) -> HashMap<String, DefaultLinuxLinkerOverride> {
+    let mut overrides = HashMap::from([(
+        "x86_64-unknown-linux-gnu".to_string(),
+        DefaultLinuxLinkerOverride::SelfContainedLldCc,
+    )]);
+    if channel == "nightly" || channel == "dev" {
+        overrides.insert(
+            "loongarch64-unknown-linux-gnu".to_string(),
+            DefaultLinuxLinkerOverride::SelfContainedLldCc,
+        );
+    }
+    overrides
 }
 
 #[cfg(test)]
@@ -139,7 +155,9 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub fn default_linux_linker_overrides() -> HashMap<String, DefaultLinuxLinkerOverride> {
+pub fn default_linux_linker_overrides(
+    _channel: &str,
+) -> HashMap<String, DefaultLinuxLinkerOverride> {
     TEST_LINUX_LINKER_OVERRIDES.with(|cell| cell.borrow().clone()).unwrap_or_default()
 }
 

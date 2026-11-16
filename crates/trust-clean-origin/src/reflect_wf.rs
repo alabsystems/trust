@@ -168,7 +168,7 @@ use crate::gate::{DECREASE_SLOT_SENTINEL, MEASURE_SLOT_SENTINEL, ReflectedWfFunc
 use crate::reflect::{RecCall, RecFamily, Site, cnst, render_rec_node};
 
 fn nat() -> Expr {
-    Expr::const_(Name::from_string("Nat"), vec![])
+    Expr::const_(Name::interned("Nat"), vec![])
 }
 
 fn lvl1() -> Level {
@@ -292,7 +292,7 @@ pub fn reflect_wf_functional(
     // type-check an UNBORROWED slot, which is the one thing the borrow exists
     // to prevent.
     for sentinel in [DECREASE_SLOT_SENTINEL, MEASURE_SLOT_SENTINEL] {
-        if env.get_const(&Name::from_string(sentinel)).is_some() {
+        if env.get_const(&Name::interned(sentinel)).is_some() {
             return Err(format!(
                 "cannot reflect the well-founded recursion emitted for `{name}`: the borrow \
                  sentinel `{sentinel}` resolves to a real declaration in this environment, so a \
@@ -305,12 +305,7 @@ pub fn reflect_wf_functional(
     // ── 3. Render, recording every constant the terms name ─────────────────
     //
     // `Nat` is seeded because the binder types below always name it.
-    let ctx = RecCall {
-        args: &body.rec_args,
-        arity,
-        measure_index: body.measure_index,
-        lowering,
-    };
+    let ctx = RecCall { args: &body.rec_args, arity, measure_index: body.measure_index, lowering };
     let mut named = BTreeSet::from(["Nat"]);
     let nonzero = render(name, &body.nonzero_value, Site::WfNonzero, ctx, &mut named)?;
     let zero = render(name, &body.zero_value, Site::WfZero, ctx, &mut named)?;
@@ -338,14 +333,14 @@ pub fn reflect_wf_functional(
         }
     };
     let guard_at_body = guard(&mut named, Expr::bvar(measure_at_body));
-    let decidable = Expr::apps(cnst("Nat.decLt", &mut named), [
-        cnst("Nat.zero", &mut named),
-        Expr::bvar(measure_at_body),
-    ]);
+    let decidable = Expr::apps(
+        cnst("Nat.decLt", &mut named),
+        [cnst("Nat.zero", &mut named), Expr::bvar(measure_at_body)],
+    );
     let not_guard = Expr::app(cnst("Not", &mut named), guard_at_body.clone());
     let dite = {
         named.insert("dite");
-        Expr::const_(Name::from_string("dite"), vec![lvl1()])
+        Expr::const_(Name::interned("dite"), vec![lvl1()])
     };
 
     // The `dite` sits under the WHOLE telescope, which is the ONE thing the
@@ -353,14 +348,17 @@ pub fn reflect_wf_functional(
     // Built directly rather than through `cnst`, whose `&'static str` parameter
     // is the mechanism that makes the DECLARATION's name unrenderable; the
     // sentinel is recorded in `named` explicitly at its one use site below.
-    let measure_sentinel = || Expr::const_(Name::from_string(MEASURE_SLOT_SENTINEL), vec![]);
-    let dite_app = Expr::apps(dite, [
-        nat(),
-        guard_at_body.clone(),
-        decidable,
-        Expr::lam(BinderInfo::Default, guard_at_body, nonzero),
-        Expr::lam(BinderInfo::Default, not_guard, zero),
-    ]);
+    let measure_sentinel = || Expr::const_(Name::interned(MEASURE_SLOT_SENTINEL), vec![]);
+    let dite_app = Expr::apps(
+        dite,
+        [
+            nat(),
+            guard_at_body.clone(),
+            decidable,
+            Expr::lam(BinderInfo::Default, guard_at_body, nonzero),
+            Expr::lam(BinderInfo::Default, not_guard, zero),
+        ],
+    );
     let functional = match lowering {
         // PHASE 2 — `fun (x : Nat) (rec : (y : Nat) → Nat.lt y x → Nat^(N-1) →
         // Nat) (threaded : Nat)^(N-1) => dite …`. The threaded binders are
@@ -408,8 +406,7 @@ pub fn reflect_wf_functional(
         // this is a fixed four-position borrow and not a licence.
         WfLowering::OnMeasureValue => {
             named.insert(MEASURE_SLOT_SENTINEL);
-            let mut functional =
-                Expr::lam(BinderInfo::Default, measure_sentinel(), dite_app);
+            let mut functional = Expr::lam(BinderInfo::Default, measure_sentinel(), dite_app);
             for _ in 0..arity {
                 functional = Expr::lam(BinderInfo::Default, nat(), functional);
             }
@@ -433,7 +430,7 @@ pub fn reflect_wf_functional(
         if constant == DECREASE_SLOT_SENTINEL || constant == MEASURE_SLOT_SENTINEL {
             continue;
         }
-        if env.get_const(&Name::from_string(constant)).is_none() {
+        if env.get_const(&Name::interned(constant)).is_none() {
             return Err(format!(
                 "cannot reflect the well-founded recursion emitted for `{name}`: the kernel \
                  environment has no `{constant}`, which the rendering names. This is a \
@@ -472,14 +469,13 @@ mod tests {
 
     #[test]
     fn the_countdown_sum_body_reflects() {
-        let reflected =
-            reflect_wf_functional(
-                &Environment::with_prelude(),
-                "countdownSum",
-                &cds_body(),
-                WfLowering::OnParameter,
-            )
-                .expect("the in-fragment body must reflect");
+        let reflected = reflect_wf_functional(
+            &Environment::with_prelude(),
+            "countdownSum",
+            &cds_body(),
+            WfLowering::OnParameter,
+        )
+        .expect("the in-fragment body must reflect");
         // The rendered functional binds exactly two binders before the `dite`.
         assert!(matches!(reflected.functional.kind(), clean_kernel::ExprKind::Lam(..)));
     }
@@ -514,14 +510,13 @@ mod tests {
             RecBodyExpr::Pred,
             RecBodyExpr::Add(Box::new(RecBodyExpr::NatConst(1)), Box::new(RecBodyExpr::Pred)),
         ] {
-            let detail =
-                reflect_wf_functional(
-                    &env,
-                    "f",
-                    &WfRecBody { zero_value: zero, ..cds_body() },
-                    WfLowering::OnParameter,
-                )
-                    .expect_err("no zero-arm reading exists for either node");
+            let detail = reflect_wf_functional(
+                &env,
+                "f",
+                &WfRecBody { zero_value: zero, ..cds_body() },
+                WfLowering::OnParameter,
+            )
+            .expect_err("no zero-arm reading exists for either node");
             assert!(detail.contains("zero-arm value"), "must name the position: {detail}");
         }
     }

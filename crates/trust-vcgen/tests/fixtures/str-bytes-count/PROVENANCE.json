@@ -1,0 +1,56 @@
+{
+  "schema": "trust.frontend-capture-provenance.v1",
+  "scope": "Real front-end MIR captures only; mir-only skips proof dispatch. The generator/solver/kernel and native runtime tests separately qualify the narrow repair. No P5 comparison replacement.",
+  "compiler_version": "rustc 1.101.0-dev (29ebb403d 2026-10-28) (trustc 0.12.0+g29ebb403d)\nbinary: trustc\ncommit-hash: 29ebb403de7a102850d6cb10a62d5cc3baf723ed\ncommit-date: 2026-10-28\nhost: aarch64-apple-darwin\nrelease: 1.101.0-dev\ntrust: 0.12.0+g29ebb403d\nLLVM version: 23.1.4\n",
+  "compiler_sha256": "0acc4862fe98d55f71585dd2e651ad166ce789f049d77b78dfe3d11112889c34",
+  "source_file": "count_bytes.rs",
+  "source_sha256": "243ea5d8a2a2deefca0bd91ee556c646d2af53f0bd5f189837717343944a1953",
+  "argv": [
+    "trustc",
+    "--edition",
+    "2021",
+    "--crate-type",
+    "lib",
+    "-Copt-level=0",
+    "-Ztrust-verify=on",
+    "-Ztrust-policy=advisory",
+    "-Ztrust-dump=mir-only:<capture-dir>",
+    "count_bytes.rs",
+    "--out-dir",
+    "<output-dir>"
+  ],
+  "capture_exit": 0,
+  "initial_default_policy_refusal": {
+    "exit": 1,
+    "reason": "mir-only skips proof dispatch and requires advisory",
+    "log_sha256": "c6e030179ca448804e35b2ceb6fc0511b3606cfec15f4e8873659aa223b8f67b"
+  },
+  "capture_log_sha256": "63341defb9cb55c2ea2892f409fdd13ca12d08dd59aca901b7fffb66d6e5339e",
+  "captures": [
+    {
+      "name": "split_count_not_bounded_by_bytes",
+      "sha256": "ea1260b422d93bbff3552fd44d904169477a79d12ec1b8ab553c62b8beedffd6",
+      "original_capture": "trust-mir-ec4f372c0980430-db9f5f5221c8c16d.json"
+    },
+    {
+      "name": "reassigned_root",
+      "sha256": "83ac2315fbc5622569a7f0015317b83769837be85f7eed652b01e5aab5853ed7",
+      "original_capture": "trust-mir-738a519cbfdc7e61-9e245e9d680eb495.json"
+    },
+    {
+      "name": "custom_count_must_overflow",
+      "sha256": "6076bcaf3bc9e96d97bd7333fcff2c1cae98e04573b75c5f74ae645480975a7c",
+      "original_capture": "trust-mir-ff2128722699393-e094d11524a51dcc.json"
+    },
+    {
+      "name": "bytes_count",
+      "sha256": "a62a95541f47aa3e5d981cc803213f7119cc2566972e22b4d56990d240879784",
+      "original_capture": "trust-mir-10df6c6fa98b350b-3d942d1150933a1.json"
+    },
+    {
+      "name": "bytes_count_underflow",
+      "sha256": "4ae0e541666146c38a34e6e51634a12f50a94391389ee45798025d6700266f70",
+      "original_capture": "trust-mir-465298d97a0bfe4f-6233e8a97144e0ae.json"
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength (Trust: the -Z trust-* options)
 use std::collections::BTreeMap;
 use std::num::{IntErrorKind, NonZero};
 use std::path::PathBuf;
@@ -11,10 +12,11 @@ use rustc_data_structures::stable_hash::StableHasher;
 use rustc_errors::{ColorConfig, TerminalUrl};
 use rustc_feature::UnstableFeatures;
 use rustc_hashes::Hash64;
-use rustc_hir::attrs::CollapseMacroDebuginfo;
 use rustc_macros::{BlobDecodable, Encodable};
+use rustc_span::edit_distance::edit_distance;
 use rustc_span::edition::Edition;
 use rustc_span::{RealFileName, RemapPathScopeComponents, SourceFileHashAlgorithm};
+use rustc_structures::{CollapseMacroDebuginfo, CrateType};
 use rustc_target::spec::{
     CodeModel, FramePointer, LinkerFlavorCli, MergeFunctions, OnBrokenPipe, PanicStrategy,
     RelocModel, RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, SymbolVisibility,
@@ -89,14 +91,20 @@ pub mod mitigation_coverage;
 
 mod target_modifier_consistency_check {
     use super::*;
-    pub(super) fn sanitizer(l: &TargetModifier, r: Option<&TargetModifier>) -> bool {
-        let mut lparsed: SanitizerSet = Default::default();
+    pub(super) fn sanitizer(
+        sess: &Session,
+        l: &TargetModifier,
+        r: Option<&TargetModifier>,
+    ) -> bool {
+        let mut lparsed: SanitizerSet = SanitizerSet::empty();
         let lval = if l.value_name.is_empty() { None } else { Some(l.value_name.as_str()) };
         parse::parse_sanitizers(&mut lparsed, lval);
+        let lparsed = lparsed.combine_with_defaults(sess.target.options.default_sanitizers);
 
-        let mut rparsed: SanitizerSet = Default::default();
+        let mut rparsed: SanitizerSet = SanitizerSet::empty();
         let rval = r.filter(|v| !v.value_name.is_empty()).map(|v| v.value_name.as_str());
         parse::parse_sanitizers(&mut rparsed, rval);
+        let rparsed = rparsed.combine_with_defaults(sess.target.options.default_sanitizers);
 
         // Some sanitizers need to be target modifiers, and some do not.
         // For now, we should mark all sanitizers as target modifiers except for these:
@@ -130,6 +138,43 @@ mod target_modifier_consistency_check {
         }
         true
     }
+    pub(super) fn sanitizer_cfi_minimal_runtime(
+        sess: &Session,
+        l: &TargetModifier,
+        r: Option<&TargetModifier>,
+    ) -> bool {
+        // For CFI, the helper flag -Zsanitizer-cfi-minimal-runtime should also be a target modifier
+        if sess.sanitizers().contains(SanitizerSet::CFI) {
+            if let Some(r) = r {
+                return l.extend().tech_value == r.extend().tech_value;
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+    pub(super) fn target_cpu(
+        sess: &Session,
+        l: &TargetModifier,
+        r: Option<&TargetModifier>,
+    ) -> bool {
+        if !sess.target.requires_consistent_cpu {
+            return true;
+        }
+        let l_tech_value = l.extend().tech_value;
+        let r_tech_value = match r {
+            Some(r) => r.extend().tech_value,
+            // If only one of the two compared crates specifies the CPU
+            // explicitly we compare against the target's default CPU.
+            None => {
+                // We reuse the same parsing logic.
+                CodegenOptionsTargetModifiers::TargetCpu
+                    .reparse(sess.target.cpu.as_ref())
+                    .tech_value
+            }
+        };
+        l_tech_value == r_tech_value
+    }
 }
 
 impl TargetModifier {
@@ -143,16 +188,25 @@ impl TargetModifier {
         match self.opt {
             OptionsTargetModifiers::UnstableOptions(unstable) => match unstable {
                 UnstableOptionsTargetModifiers::Sanitizer => {
-                    return target_modifier_consistency_check::sanitizer(self, other);
+                    return target_modifier_consistency_check::sanitizer(sess, self, other);
                 }
                 UnstableOptionsTargetModifiers::SanitizerCfiNormalizeIntegers => {
                     return target_modifier_consistency_check::sanitizer_cfi_normalize_integers(
                         sess, self, other,
                     );
                 }
+                UnstableOptionsTargetModifiers::SanitizerCfiMinimalRuntime => {
+                    return target_modifier_consistency_check::sanitizer_cfi_minimal_runtime(
+                        sess, self, other,
+                    );
+                }
                 _ => {}
             },
-            _ => {}
+            OptionsTargetModifiers::CodegenOptions(codegen) => match codegen {
+                CodegenOptionsTargetModifiers::TargetCpu => {
+                    return target_modifier_consistency_check::target_cpu(sess, self, other);
+                }
+            },
         };
         match other {
             Some(other) => self.extend().tech_value == other.extend().tech_value,
@@ -339,16 +393,14 @@ top_level_options!(
         /// diagnostics from being reused across compiler processes.
         untracked_state_hash: Hash64 [TRACKED_NO_CRATE_HASH],
 
-        /// Content identity of the immutable external Trust solver snapshot
-        /// selected for this Session. This is compiler-populated (not a CLI
-        /// option) and participates in the downstream crate hash because solver
-        /// verdicts may enable certified-check elision and therefore change MIR.
-        trust_solver_content_fingerprint: String [TRACKED],
-
-        /// Trust (loud-when-off): set when `-Ztrust-verify=off` arrived as the
-        /// caller's own argv spelling on the canonical frontend — never by
-        /// embedded/doctest frontend deauthorization or by the inherited
-        /// `TRUST_NO_VERIFY=1` nested-process transport. Drives only the
+        /// Trust (loud-when-off): set when OFF reached the canonical frontend
+        /// through the caller's own `-Ztrust-verify=off` argv spelling OR the
+        /// inherited `TRUST_NO_VERIFY=1` nested-process transport — never by
+        /// embedded/doctest frontend deauthorization. An announced parent
+        /// (bootstrap, compiletest) quiets the downstream note with the
+        /// `TRUST_VANILLA_ANNOUNCED=1` marker, not by leaving this bit clear;
+        /// a bare-shell `TRUST_NO_VERIFY=1 trustc x.rs` therefore announces
+        /// (it used to check nothing and say nothing). Drives only the
         /// once-per-crate "compiled WITHOUT Trust verification" note, so it is
         /// untracked.
         trust_verify_explicit_off: bool [UNTRACKED],
@@ -425,10 +477,16 @@ top_level_options!(
         /// The (potentially remapped) working directory
         #[rustc_lint_opt_deny_field_access("use `SourceMap::working_dir` instead of this field")]
         working_dir: RealFileName [TRACKED],
-
         color: ColorConfig [UNTRACKED],
-
         verbose: bool [TRACKED_NO_CRATE_HASH],
+        jobs: Jobs [UNTRACKED],
+        // Trust: mandatory per-unit runtime CPU ownership handshake.
+        resource_worker_v2: bool [UNTRACKED],
+        resource_worker_v3: bool [UNTRACKED],
+        resource_subgroups_v3: bool [UNTRACKED],
+        // Trust: routing DATA; only the actual private native issuer admits it.
+        resource_bootstrap_fixed_v1: bool [UNTRACKED],
+        recommended_stack_size: usize [UNTRACKED],
     }
 );
 
@@ -481,14 +539,48 @@ pub enum TrustAuthorityClass {
     /// the field outright rather than trusting the incoming value.
     AuthorityOnly,
     /// Additionally: a deauthorized embedded frontend may not inherit a
-    /// non-default value, because a caller that set one has already claimed
-    /// authority over the evidence this compilation produces.
+    /// non-default EFFECTIVE value, because a caller that set one has already
+    /// claimed authority over the evidence or the code this compilation
+    /// produces, and a frontend that produces no evidence can neither honour it
+    /// nor silently drop it. Either its effect does NOT depend on verification
+    /// or lowering running (an artifact sink, a session identity, a
+    /// codegen-backend or runtime-monitor control, the Clean-origin emitter
+    /// mutation, the typeck-witness lane), or it is an adversarial or
+    /// measurement control whose entire purpose is an observable outcome — a
+    /// refusal, a warning, a probe line — that dropping it would fake.
     EvidenceControl,
+    /// A selector of the verification POSTURE: every effect it has is
+    /// conditional on an ACTIVE verification run or on ACTIVE direct Trust-IR
+    /// lowering (`Session::trust_ir_lower_enabled`), both of which an
+    /// evidence-deauthorized frontend forces off. It produces no artifact,
+    /// obligation, verdict or emitted-code change of its own. A
+    /// compiler callback may not change it (the authority snapshot compares
+    /// every classified field), and an evidence-deauthorized frontend — which
+    /// forces verification and lowering off — ACCEPTS any caller value and
+    /// resets it to its declared default
+    /// ([`crate::config::TrustFrontendAuthoritySnapshot::deauthorize`]), so nothing
+    /// downstream can read a posture (a `certify` policy, a proof level, a
+    /// hardened profile) that such a frontend cannot honour. This is how a
+    /// project's committed posture (`-Ztrust-verify=on -Ztrust-policy=certify
+    /// -Ztrust-verify-level=2 …`) can reach `tippy-driver` and `trustdoc`
+    /// alongside the effective `-Ztrust-verify=off` Targo appends for them.
+    ///
+    /// A selector that ALSO carries a non-verification effect may only be
+    /// classified here if deauthorization first materializes that effect into
+    /// the upstream option that owns it, so the neutralized configuration
+    /// compiles exactly what the caller's did: `-Ztrust-verify-profile`'s
+    /// declared SIGPIPE disposition becomes `-Zon-broken-pipe`
+    /// ([`crate::trust_effective_on_broken_pipe_by_flags`]).
+    VerificationSelector,
 }
 
 impl TrustAuthorityClass {
     pub const fn is_evidence_control(self) -> bool {
         matches!(self, Self::EvidenceControl)
+    }
+
+    pub const fn is_verification_selector(self) -> bool {
+        matches!(self, Self::VerificationSelector)
     }
 }
 
@@ -559,7 +651,7 @@ macro_rules! options {
                 $( { MITIGATION: $mitigation_variant:ident } )?
                 $( { TRUST_AUTHORITY: $trust_authority:ident } )?
                 ,
-                $desc:literal
+                $desc:expr
                 $(, removed: $removed:ident )?
             ),
         )*
@@ -634,6 +726,48 @@ macro_rules! options {
                 target_modifiers: &mut CollectedOptions,
             ) -> $struct_name {
                 build_options(early_dcx, matches, target_modifiers, $stat, $prefix, $outputname)
+            }
+
+            /// Trust: the EFFECTIVE values of exactly the frontend-authority
+            /// controls (`TRUST_AUTHORITY_CONTROLS`) that `matches` spells —
+            /// parsed by this table's own setters in argv order, so a later
+            /// occurrence overrides an earlier one precisely as in [`Self::build`]
+            /// — together with the fields that were spelled at all. Every other
+            /// option is neither parsed nor diagnosed here and stays at its
+            /// default: the full [`Self::build`] still runs, once, for the
+            /// compilation, so an unrelated option (`-Zhelp`, a removed option's
+            /// warning) is not answered twice or ahead of its own early mode. A
+            /// malformed value of a classified option is the same fatal error the
+            /// full parse raises.
+            ///
+            /// An evidence-deauthorized frontend decides its Trust options on this
+            /// answer instead of on individual occurrences
+            /// (`rustc_driver_impl::frontend_forbidden_option`).
+            pub fn build_trust_authority_controls(
+                early_dcx: &EarlyDiagCtxt,
+                matches: &getopts::Matches,
+            ) -> ($struct_name, Vec<&'static str>) {
+                let mut spelled = Vec::new();
+                let effective = build_options_selected(
+                    early_dcx,
+                    matches,
+                    &mut CollectedOptions::default(),
+                    $stat,
+                    $prefix,
+                    $outputname,
+                    |name| {
+                        let control = Self::TRUST_AUTHORITY_CONTROLS
+                            .iter()
+                            .find(|control| control.field == name);
+                        if let Some(control) = control
+                            && !spelled.contains(&control.field)
+                        {
+                            spelled.push(control.field);
+                        }
+                        control.is_some()
+                    },
+                );
+                (effective, spelled)
             }
 
             fn dep_tracking_hash(
@@ -727,6 +861,42 @@ macro_rules! options {
                     )?
                 )*
                 None
+            }
+
+            /// Trust: the first VERIFICATION-SELECTOR control this
+            /// configuration holds away from its declared default — i.e. one a
+            /// deauthorized frontend has not (or no longer) neutralized.
+            pub fn first_live_trust_verification_selector(&self) -> Option<String> {
+                $(
+                    $(
+                        if TrustAuthorityClass::$trust_authority.is_verification_selector()
+                            && self.$opt != $init
+                        {
+                            return Some(
+                                trust_authority_spelling($prefix, stringify!($opt))
+                            );
+                        }
+                    )?
+                )*
+                None
+            }
+
+            /// Trust: reset every VERIFICATION-SELECTOR control to its declared
+            /// default. Generated from the table, so a selector cannot be
+            /// classified at the declaration and forgotten here. Only
+            /// [`crate::config::TrustFrontendAuthoritySnapshot::deauthorize`] calls
+            /// this, after materializing the one non-verification effect a
+            /// selector carries; see [`TrustAuthorityClass::VerificationSelector`].
+            /// Public only so the `-C` table's (empty) instance is not dead
+            /// code; it can only lower authority.
+            pub fn neutralize_trust_verification_selectors(&mut self) {
+                $(
+                    $(
+                        if TrustAuthorityClass::$trust_authority.is_verification_selector() {
+                            self.$opt = $init;
+                        }
+                    )?
+                )*
             }
         }
 
@@ -833,6 +1003,31 @@ fn build_options<O: Default>(
     prefix: &str,
     outputname: &str,
 ) -> O {
+    // Trust: every option; the selector exists for `build_trust_authority_controls`.
+    build_options_selected(
+        early_dcx,
+        matches,
+        collected_options,
+        descrs,
+        prefix,
+        outputname,
+        |_| true,
+    )
+}
+
+// Trust: `build_options` restricted to the options `selected` admits, by their
+// canonical (underscore) field name AFTER the bootstrap alias below is resolved.
+// Skipped options are neither parsed nor diagnosed; admitted ones go through the
+// same setter, in the same order, with the same errors.
+fn build_options_selected<O: Default>(
+    early_dcx: &EarlyDiagCtxt,
+    matches: &getopts::Matches,
+    collected_options: &mut CollectedOptions,
+    descrs: OptionDescrs<O>,
+    prefix: &str,
+    outputname: &str,
+    mut selected: impl FnMut(&str) -> bool,
+) -> O {
     let mut op = O::default();
     for (index, option) in matches.opt_strs_pos(prefix) {
         let (key, value) = match option.split_once('=') {
@@ -913,6 +1108,10 @@ fn build_options<O: Default>(
         };
 
         let option_to_lookup = key.replace('-', "_");
+        // Trust: see `build_options_selected`.
+        if !selected(&option_to_lookup) {
+            continue;
+        }
         match descrs.iter().find(|opt_desc| opt_desc.name == option_to_lookup) {
             Some(OptionDesc { name: _, setter, type_desc, desc, removed, tmod, mitigation }) => {
                 if let Some(removed) = removed {
@@ -967,7 +1166,27 @@ fn build_options<O: Default>(
                     collected_options.mitigations.reset_mitigation(*mitigation, index);
                 }
             }
-            None => early_dcx.early_fatal(format!("unknown {outputname} option: `{key}`")),
+            None => {
+                let mut error =
+                    early_dcx.early_struct_fatal(format!("unknown {outputname} option: `{key}`"));
+                let max_dist = option_to_lookup.chars().count().max(3) / 3;
+                if let Some(option) = descrs
+                    .iter()
+                    .filter(|option| option.removed.is_none())
+                    .filter_map(|option| {
+                        edit_distance(&option_to_lookup, option.name, max_dist)
+                            .map(|dist| (dist, option))
+                    })
+                    .min_by_key(|(dist, _)| *dist)
+                    .map(|(_, option)| option)
+                {
+                    let name = option.name.replace('_', "-");
+                    let value =
+                        if option.type_desc == desc::parse_no_value { "" } else { "=<value>" };
+                    error.help(format!("you might have meant to use `-{prefix} {name}{value}`"));
+                }
+                error.emit()
+            }
         }
     }
     op
@@ -987,19 +1206,20 @@ mod desc {
     pub(crate) const parse_list: &str = "a space-separated list of strings";
     pub(crate) const parse_list_with_polarity: &str =
         "a comma-separated list of strings, with elements beginning with + or -";
+    pub(crate) const parse_pointer_authentication_list_with_polarity: &str = "a comma-separated list of options, each of the form `+<name>` or `-<name>`, where `<name>` is one of: `aarch64-jump-table-hardening`, `auth-traps`, `calls`, `elf-got`, `function-pointer-type-discrimination`, `indirect-gotos`, `init-fini`, `init-fini-address-discrimination`, `intrinsics`, `return-addresses`, `typeinfo-vt-ptr-discrimination`, `vt-ptr-addr-discrimination` or `vt-ptr-type-discrimination`";
     pub(crate) const parse_autodiff: &str = "a comma separated list of settings: `Enable`, `PrintSteps`, `PrintTA`, `PrintTAFn`, `PrintAA`, `PrintPerf`, `PrintModBefore`, `PrintModAfter`, `PrintModFinal`, `PrintPasses`, `NoPostopt`, `LooseTypes`, `Inline`, `NoTT`";
-    pub(crate) const parse_offload: &str =
-        "a comma separated list of settings: `Host=<Absolute-Path>`, `Device`, `Test`";
+    pub(crate) const parse_offload: &str = "a comma separated list of settings: `Host=<Absolute-Path>`, `HostMetadata=<Absolute-Path>`, `Device` (empty manifest) or `Device=<Absolute-Path>`, `Test`";
     pub(crate) const parse_comma_list: &str = "a comma-separated list of strings";
     pub(crate) const parse_opt_comma_list: &str = parse_comma_list;
     pub(crate) const parse_number: &str = "a number";
     pub(crate) const parse_opt_number: &str = parse_number;
     pub(crate) const parse_frame_pointer: &str = "one of `true`/`yes`/`on`, `false`/`no`/`off`, or (with -Zunstable-options) `non-leaf` or `always`";
-    pub(crate) const parse_threads: &str = "a number or `sync`";
     pub(crate) const parse_time_passes_format: &str = "`text` (default) or `json`";
     // Trust (F1): which producer supplies the trust-cg backend's per-function
     // input. `mir` is the shipped path; `trust-ir` is the source-first one.
     pub(crate) const parse_trust_cg_frontend: &str = "one of `mir` or `trust-ir`";
+    // Trust (step 2 increment 5, sub-step 5.4.2): which consumer compiles F1's trust-ir.
+    pub(crate) const parse_trust_cg_f1_backend: &str = "one of `lir` or `compiler`";
     // Trust: keep the compiler transport's finite verifier domains honest at
     // option-parsing time instead of silently coercing typos later in MIR.
     pub(crate) const parse_trust_cg_output_gate: &str =
@@ -1007,6 +1227,17 @@ mod desc {
     pub(crate) const parse_trust_verify: &str = "one of `on` or `off`";
     pub(crate) const parse_trust_ir_lower: &str =
         "one of `off`, `on`, or `strict` (the boolean spellings and a bare flag still mean `on`)";
+    pub(crate) const parse_trust_spawn_census_shadow: &str = "one of `off`, `report`, or `check`";
+    // Trust (platform protocols, plan L1a): the description IS the refusal text. An unknown
+    // spelling and a property this trustc cannot check end in the same parse error, and this
+    // sentence is what tells the two apart for the reader (FC-7). A unit test pins that it names
+    // every supported and every refused spelling.
+    pub(crate) const parse_trust_platform_properties: &str = "a comma-separated list of platform \
+         properties: `fd-inherit` (`lock-release` and `fd-identity` are not supported by this \
+         trustc)";
+    pub(crate) const parse_trust_platform_unanalysed: &str = "one of `warn` or `deny`";
+    pub(crate) const parse_trust_platform_budget: &str = "a positive number of states";
+    pub(crate) const parse_trust_platform_report: &str = "one of `summary` or `verbose`";
     pub(crate) const parse_trust_policy: &str =
         "one of `strict`, `certify`, `advisory`, or `memory-safe`";
     pub(crate) const parse_trust_witness: &str =
@@ -1023,10 +1254,20 @@ mod desc {
     pub(crate) const parse_trust_verify_package_name: &str = "a non-empty package name";
     pub(crate) const parse_trust_verify_profile: &str = "a non-empty Trust profile name";
     pub(crate) const parse_trust_verify_session: &str = "a non-empty session identifier";
+    pub(crate) const parse_trust_admission_digest: &str =
+        "one canonical SHA-256 digest (no duplicate option)";
+    pub(crate) const parse_trust_admission_role: &str =
+        "one of primary, test-execution, dependency (no duplicate option)";
+    pub(crate) const parse_trust_admission_target: &str =
+        "one exact Cargo compile target string (no duplicate option)";
     pub(crate) const parse_trust_verify_target_spec_sha256: &str =
         "exactly 64 lowercase hexadecimal SHA-256 digits";
     pub(crate) const parse_trust_verify_timeout_ms: &str =
         "a positive integer number of milliseconds";
+    pub(crate) const parse_trust_verify_effort: &str =
+        "an integer number of SAT conflicts per distinct query term, from 1 through 100000";
+    pub(crate) const parse_trust_verify_function_budget_steps: &str =
+        "a positive integer number of preprocessing steps";
     pub(crate) const parse_trust_verify_worker_threads: &str = "an integer from 0 through 256";
     pub(crate) const parse_passes: &str = "a space-separated list of passes, or `all`";
     pub(crate) const parse_panic_strategy: &str = "either `unwind`, `abort`, or `immediate-abort`";
@@ -1051,13 +1292,12 @@ mod desc {
     pub(crate) const parse_coverage_options: &str = "`block` | `branch` | `condition`";
     pub(crate) const parse_codegen_retag_options: &str =
         "either no value or a comma-separated list of settings: `no-precise-im`, `no-precise-pin`";
-    pub(crate) const parse_instrument_mcount: &str =
-        "either a boolean (`yes`, `no`, `on`, `off`, etc), or `fentry` on supported targets.";
+    pub(crate) const parse_instrument_mcount: &str = "either a boolean (`yes`, `no`, `on`, `off`, etc), or `fentry`, `fentry-record`, `fentry-nop-record` on supported targets";
     pub(crate) const parse_instrument_xray: &str = "either a boolean (`yes`, `no`, `on`, `off`, etc), or a comma separated list of settings: `always` or `never` (mutually exclusive), `ignore-loops`, `instruction-threshold=N`, `skip-entry`, `skip-exit`";
     pub(crate) const parse_unpretty: &str = "`string` or `string=string`";
     pub(crate) const parse_treat_err_as_bug: &str = "either no value or a non-negative number";
     pub(crate) const parse_next_solver_config: &str =
-        "either `globally` (when used without an argument), `coherence` (default) or `no`";
+        "either `globally` (when used without an argument), or `coherence` (default)";
     pub(crate) const parse_lto: &str =
         "either a boolean (`yes`, `no`, `on`, `off`, etc), `thin`, `fat`, or omitted";
     pub(crate) const parse_linker_plugin_lto: &str =
@@ -1093,7 +1333,8 @@ mod desc {
         components: `crto`, `libc`, `unwind`, `linker`, `sanitizers`, `mingw`";
     pub(crate) const parse_linker_features: &str =
         "a list of enabled (`+` prefix) and disabled (`-` prefix) features: `lld`";
-    pub(crate) const parse_polonius: &str = "either no value or `legacy` (the default), or `next`";
+    pub(crate) const parse_polonius: &str =
+        "either no value or one of `legacy` (the default), `off`, or `next`";
     pub(crate) const parse_annotate_moves: &str =
         "either a boolean (`yes`, `no`, `on`, `off`, etc.), or a size limit in bytes";
     pub(crate) const parse_stack_protector: &str =
@@ -1121,7 +1362,6 @@ pub mod parse {
     use std::str::FromStr;
 
     pub(crate) use super::*;
-    pub(crate) const MAX_THREADS_CAP: usize = 256;
 
     /// Ignore the value. Used for removed options where we don't actually want to store
     /// anything in the session.
@@ -1186,6 +1426,10 @@ pub mod parse {
             }
             Some("next") => {
                 *slot = Polonius::Next;
+                true
+            }
+            Some("off") | Some("no") => {
+                *slot = Polonius::Off;
                 true
             }
             _ => false,
@@ -1283,6 +1527,37 @@ pub mod parse {
         }
     }
 
+    pub(crate) fn parse_pointer_authentication_list_with_polarity(
+        slot: &mut Vec<(PointerAuthOption, bool)>,
+        v: Option<&str>,
+    ) -> bool {
+        let Some(s) = v else {
+            return false;
+        };
+
+        let mut map = BTreeMap::<PointerAuthOption, bool>::new();
+
+        for item in s.split(',') {
+            let Some(name) = item.strip_prefix(&['+', '-'][..]) else {
+                return false;
+            };
+
+            let Some(opt) = PointerAuthOption::parse(name) else {
+                return false;
+            };
+
+            let enabled = item.starts_with('+');
+
+            // Last occurrence wins.
+            map.insert(opt, enabled);
+        }
+
+        slot.clear();
+        slot.extend(map);
+
+        true
+    }
+
     pub(crate) fn parse_fmt_debug(opt: &mut FmtDebug, v: Option<&str>) -> bool {
         *opt = match v {
             Some("full") => FmtDebug::Full,
@@ -1337,25 +1612,6 @@ pub mod parse {
             }
             None => false,
         }
-    }
-
-    pub(crate) fn parse_threads(slot: &mut Option<usize>, v: Option<&str>) -> bool {
-        let Some(s) = v else { return false };
-        if s == "sync" {
-            // Enable synchronization despite only using one thread.
-            *slot = Some(1);
-            return true;
-        }
-        let n = match s.parse().ok() {
-            Some(0) => std::thread::available_parallelism().map_or(1, NonZero::<usize>::get),
-            Some(i) => i,
-            None => return false,
-        };
-        // We want to cap the number of threads here to avoid large numbers like 999999 and compiler panics.
-        // This solution was suggested here https://github.com/rust-lang/rust/issues/117638#issuecomment-1800925067
-        let n = n.min(MAX_THREADS_CAP);
-        *slot = (n > 1).then_some(n); // Enable synchronization if we're using more than one thread.
-        true
     }
 
     /// Use this for any numeric option that has a static default.
@@ -1701,6 +1957,19 @@ pub mod parse {
         }
     }
 
+    // Trust (step 2 increment 5, sub-step 5.4.2): F1's CONSUMER. A typo must fail here rather
+    // than silently leave the default `lir` consumer selected: the option says which compiler
+    // and which output gate produced the object.
+    pub(crate) fn parse_trust_cg_f1_backend(slot: &mut String, v: Option<&str>) -> bool {
+        match v {
+            Some(value @ ("lir" | "compiler")) => {
+                *slot = value.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
     // Trust: structured transport is a compiler/frontend protocol. A typo must
     // fail during argument parsing, not silently fall back to human output and
     // leave the frontend believing the compiler emitted no evidence.
@@ -1723,6 +1992,37 @@ pub mod parse {
         let Some(value) = v.map(str::trim).filter(|value| !value.is_empty()) else {
             return false;
         };
+        *slot = Some(value.to_string());
+        true
+    }
+
+    // Trust: unlike an ordinary last-wins option, duplicate resource bindings are ambiguous.
+    pub(crate) fn parse_trust_admission_digest(slot: &mut Option<String>, v: Option<&str>) -> bool {
+        slot.is_none() && parse_trust_verify_target_spec_sha256(slot, v)
+    }
+
+    pub(crate) fn parse_trust_admission_role(slot: &mut Option<String>, v: Option<&str>) -> bool {
+        if slot.is_some() {
+            return false;
+        }
+        match v {
+            Some(value @ ("primary" | "test-execution" | "dependency")) => {
+                *slot = Some(value.to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn parse_trust_admission_target(slot: &mut Option<String>, v: Option<&str>) -> bool {
+        let Some(value) = v.filter(|value| !value.is_empty() && value.len() <= 4096) else {
+            return false;
+        };
+        if slot.is_some() {
+            return false;
+        }
+        // This may be a canonical Unicode path. Keep its exact bytes, including
+        // spaces; trimming or lossy path conversion changes the Cargo identity.
         *slot = Some(value.to_string());
         true
     }
@@ -1875,6 +2175,84 @@ pub mod parse {
         true
     }
 
+    pub(crate) fn parse_trust_spawn_census_shadow(
+        slot: &mut TrustSpawnCensusShadow,
+        v: Option<&str>,
+    ) -> bool {
+        *slot = match v {
+            Some("off") => TrustSpawnCensusShadow::Off,
+            Some("report") => TrustSpawnCensusShadow::Report,
+            Some("check") => TrustSpawnCensusShadow::Check,
+            _ => return false,
+        };
+        true
+    }
+
+    /// Trust (platform protocols, plan L1a; FC-7): one comma-separated list of exact
+    /// spellings. Every element must be a property this trustc checks; an unknown spelling, a
+    /// property the design names but this trustc cannot check yet (`lock-release`,
+    /// `fd-identity`), an empty value and an empty element are all refused, so neither a typo
+    /// nor an older compiler can turn a policy off by having it quietly ignored. Duplicates are
+    /// harmless and kept once. Repeating the option adds to the set and never removes from it
+    /// (union, the monotone rule targo's workspace merge applies, OD-3). The slot is changed
+    /// only when the whole value parses.
+    pub(crate) fn parse_trust_platform_properties(
+        slot: &mut TrustPlatformProperties,
+        v: Option<&str>,
+    ) -> bool {
+        let Some(value) = v.filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        let mut parsed = Vec::new();
+        for spelling in value.split(',') {
+            match TrustPlatformProperty::from_spelling(spelling) {
+                Ok(property) => parsed.push(property),
+                Err(_) => return false,
+            }
+        }
+        for property in parsed {
+            slot.insert(property);
+        }
+        true
+    }
+
+    pub(crate) fn parse_trust_platform_unanalysed(
+        slot: &mut TrustPlatformUnanalysed,
+        v: Option<&str>,
+    ) -> bool {
+        *slot = match v {
+            Some("warn") => TrustPlatformUnanalysed::Warn,
+            Some("deny") => TrustPlatformUnanalysed::Deny,
+            _ => return false,
+        };
+        true
+    }
+
+    /// Trust (platform protocols, plan L1a): the derivation budget, in STATES (D-15(D5)): a
+    /// count, never a clock, so a verdict cannot depend on the machine. `0` is refused: a
+    /// budget that explores nothing is not a budget, and no value switches the bound off.
+    pub(crate) fn parse_trust_platform_budget(slot: &mut usize, v: Option<&str>) -> bool {
+        let Some(value) =
+            v.and_then(|value| value.parse::<usize>().ok()).filter(|value| *value > 0)
+        else {
+            return false;
+        };
+        *slot = value;
+        true
+    }
+
+    pub(crate) fn parse_trust_platform_report(
+        slot: &mut TrustPlatformReport,
+        v: Option<&str>,
+    ) -> bool {
+        *slot = match v {
+            Some("summary") => TrustPlatformReport::Summary,
+            Some("verbose") => TrustPlatformReport::Verbose,
+            _ => return false,
+        };
+        true
+    }
+
     pub(crate) fn parse_trust_policy(slot: &mut TrustPolicy, v: Option<&str>) -> bool {
         *slot = match v {
             Some("strict") => TrustPolicy::Strict,
@@ -1888,8 +2266,8 @@ pub mod parse {
 
     // Trust: lane and store parse together. `mint`/`replay` without a store are
     // rejected rather than defaulted, because the managed store is only correct
-    // for the managed lane — silently pointing an explicit mint at
-    // `<out-dir>/trust-witness` would overwrite the auto lane's own evidence.
+    // for the managed lane — silently pointing an explicit mint at the managed
+    // store in `<out-dir>` would overwrite the auto lane's own evidence.
     pub(crate) fn parse_trust_witness(slot: &mut TrustWitness, v: Option<&str>) -> bool {
         *slot = match v {
             Some("auto") => TrustWitness::Auto,
@@ -1914,6 +2292,47 @@ pub mod parse {
         true
     }
 
+    /// Trust: the one solver-effort count's SCALE `k` (plan
+    /// `docs/design/2026-09-29-incremental-deterministic-trust-results.md` §3.2a):
+    /// each ay query gets `min(100000, max(1, k · size))` SAT conflicts per SAT
+    /// solve, `size` being its count of distinct terms. `k` is from 1 through
+    /// 100,000 — `C`, `trust_types::determinism::EffortScale::CEILING`, P2's
+    /// flat per-query count and below ay's own ground allowance, which an
+    /// explicit `:rlimit` REPLACES — and nothing else: `0` would give every
+    /// query the one-conflict floor, and a list is not a scale. Mirrors
+    /// `trust_types::determinism::EffortScale::parse`, which this crate cannot
+    /// name.
+    pub(crate) fn parse_trust_verify_effort(slot: &mut u64, v: Option<&str>) -> bool {
+        let Some(value) = v
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=100_000).contains(value))
+        else {
+            return false;
+        };
+        *slot = value;
+        true
+    }
+
+    /// Trust: the per-function preprocessing STEP budget (plan §3.2). A positive
+    /// count, and nothing else: the step budget is the deterministic bound on
+    /// preprocessing (a strictly decreasing count every instrumented loop
+    /// polls), and there is no value that switches it off. The former `0 =
+    /// disabled` arm left the wall clock as the only bound, and a clock stop is
+    /// not reproducible (owner direction 2026-09-29: no switch that bypasses an
+    /// important check; `trust_types::verify_budget::VerifyBudgetGuard::install`
+    /// takes the count literally).
+    pub(crate) fn parse_trust_verify_function_budget_steps(
+        slot: &mut u64,
+        v: Option<&str>,
+    ) -> bool {
+        let Some(value) = v.and_then(|value| value.parse::<u64>().ok()).filter(|value| *value > 0)
+        else {
+            return false;
+        };
+        *slot = value;
+        true
+    }
+
     pub(crate) fn parse_trust_verify_crate_role(slot: &mut String, v: Option<&str>) -> bool {
         let Some(value @ ("unscoped" | "primary" | "dependency" | "build-script")) = v else {
             return false;
@@ -1922,10 +2341,14 @@ pub mod parse {
         true
     }
 
+    // Trust: upstream's shared `MAX_THREADS_CAP` constant is gone in 1.101;
+    // the verifier worker cap keeps the same bound locally.
+    pub(crate) const MAX_TRUST_VERIFY_WORKER_THREADS_CAP: usize = 256;
+
     pub(crate) fn parse_trust_verify_worker_threads(slot: &mut usize, v: Option<&str>) -> bool {
         let Some(value) = v
             .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value <= MAX_THREADS_CAP)
+            .filter(|value| *value <= MAX_TRUST_VERIFY_WORKER_THREADS_CAP)
         else {
             return false;
         };
@@ -1970,12 +2393,17 @@ pub mod parse {
                         return false;
                     }
                 }
-                "Device" => {
-                    if let Some(_) = arg {
-                        // Device does not accept a value
+                "HostMetadata" => {
+                    if let Some(p) = arg {
+                        Offload::HostMetadata(p.to_string())
+                    } else {
                         return false;
                     }
-                    Offload::Device
+                }
+                "Device" => {
+                    // Without an argument, `Device` uses an empty manifest and all kernel
+                    // instantiations are discovered via monomorphization.
+                    Offload::Device(arg.unwrap_or_default().to_string())
                 }
                 "Test" => {
                     if let Some(_) = arg {
@@ -2108,15 +2536,33 @@ pub mod parse {
 
     pub(crate) fn parse_instrument_mcount(slot: &mut InstrumentMcount, v: Option<&str>) -> bool {
         let mut use_mcount = false;
+        let mut opts = InstrumentMcountOpts::default();
         if parse_bool(&mut use_mcount, v) {
-            *slot = if use_mcount { InstrumentMcount::Mcount } else { InstrumentMcount::Disabled };
-            true
-        } else if let Some("fentry") = v {
-            *slot = InstrumentMcount::Fentry;
-            true
-        } else {
-            false
+            *slot = if use_mcount {
+                InstrumentMcount::Mcount(opts)
+            } else {
+                InstrumentMcount::Disabled
+            };
+            return true;
         }
+        match v {
+            Some("fentry") => {
+                *slot = InstrumentMcount::Fentry(opts);
+            }
+            Some("fentry-record") => {
+                opts.record = true;
+                *slot = InstrumentMcount::Fentry(opts);
+            }
+            Some("fentry-nop-record") => {
+                opts.record = true;
+                opts.no_call = true;
+                *slot = InstrumentMcount::Fentry(opts);
+            }
+            _ => {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) fn parse_instrument_xray(
@@ -2206,13 +2652,12 @@ pub mod parse {
     pub(crate) fn parse_next_solver_config(slot: &mut NextSolverConfig, v: Option<&str>) -> bool {
         if let Some(config) = v {
             *slot = match config {
-                "no" => NextSolverConfig { coherence: false, globally: false },
-                "coherence" => NextSolverConfig { coherence: true, globally: false },
-                "globally" => NextSolverConfig { coherence: true, globally: true },
+                "no" | "coherence" => NextSolverConfig::Coherence,
+                "globally" => NextSolverConfig::Globally,
                 _ => return false,
             };
         } else {
-            *slot = NextSolverConfig { coherence: true, globally: true };
+            *slot = NextSolverConfig::Globally;
         }
 
         true
@@ -2454,6 +2899,10 @@ pub mod parse {
                     match opt {
                         "bti" => slot.bti = true,
                         "pac-ret" if slot.pac_ret.is_none() => {
+                            // Note: some targets only support certain keys (Windows on Arm only
+                            // supports Key B) and this possible discrepancy is handled by the
+                            // session's `branch_protection` accessor, when we have both the target
+                            // tuple and branch protection information available.
                             slot.pac_ret = Some(PacRet { leaf: false, pc: false, key: PAuthKey::A })
                         }
                         "leaf" => match slot.pac_ret.as_mut() {
@@ -2659,6 +3108,8 @@ options! {
         "version of DWARF debug information to emit (default: 2 or 4, depending on platform)"),
     embed_bitcode: bool = (true, parse_bool, [TRACKED],
         "emit bitcode in rlibs (default: yes)"),
+    embed_metadata: Option<bool> = (None, parse_opt_bool, [TRACKED],
+        "embed metadata in rlibs and dylibs (default: yes)"),
     extra_filename: String = (String::new(), parse_string, [UNTRACKED],
         "extra data to put in each output filename"),
     force_frame_pointers: FramePointer = (FramePointer::MayOmit, parse_frame_pointer, [TRACKED],
@@ -2732,6 +3183,8 @@ options! {
     profile_generate: SwitchWithOptPath = (SwitchWithOptPath::Disabled,
         parse_switch_with_opt_path, [TRACKED],
         "compile the program with profiling instrumentation"),
+    profile_sample_use: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
+        "use the given `.prof` file for sample-based profile-guided optimization"),
     profile_use: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
         "use the given `.profdata` file for profile-guided optimization"),
     #[rustc_lint_opt_deny_field_access("use `Session::relocation_model` instead of this field")]
@@ -2758,11 +3211,13 @@ options! {
     symbol_mangling_version: Option<SymbolManglingVersion> = (None,
         parse_symbol_mangling_version, [TRACKED],
         "which mangling version to use for symbol names ('legacy', 'v0' (default), or 'hashed')"),
-    target_cpu: Option<String> = (None, parse_opt_string, [TRACKED],
-        "select target processor (`rustc --print target-cpus` for details)"),
+    target_cpu: Option<String> = (None, parse_opt_string, [TRACKED] { TARGET_MODIFIER: TargetCpu },
+        "select target processor (`rustc --print target-cpus` for details) \
+        The resulting binary must only be executed on CPUs that have all the features \
+        of the given CPU."),
     target_feature: String = (String::new(), parse_target_feature, [TRACKED],
-        "target specific attributes. (`rustc --print target-features` for details). \
-        This feature is unsafe."),
+        "target-specific attributes (`rustc --print target-features` for details). \
+        The resulting binary must only be executed on CPUs that have all the given features."),
     unsafe_allow_abi_mismatch: Vec<String> = (Vec::new(), parse_comma_list, [UNTRACKED],
         "Allow incompatible target modifiers in dependency crates (comma separated list)"),
     // tidy-alphabetical-end
@@ -2771,6 +3226,12 @@ options! {
     // - compiler/rustc_interface/src/tests.rs
     // - src/doc/rustc/src/codegen-options/index.md
 }
+
+const POLONIUS_HELP: &str = match Polonius::DEFAULT {
+    Polonius::Off => "enable polonius-based borrow-checker (default: no)",
+    Polonius::Next => "enable polonius-based borrow-checker (default: next)",
+    Polonius::Legacy => panic!("Polonius::Legacy is not a valid default value"),
+};
 
 options! {
     UnstableOptions, UnstableOptionsTargetModifiers, Z_OPTIONS, dbopts, "Z", "unstable",
@@ -2797,7 +3258,10 @@ options! {
     assume_incomplete_release: bool = (false, parse_bool, [TRACKED],
         "make cfg(version) treat the current version as incomplete (default: no)"),
     assumptions_on_binders: bool = (false, parse_bool, [TRACKED],
-        "allow deducing higher-ranked outlives assumptions from all binders (`for<'a>`)"),
+        "allow deducing higher-ranked outlives assumptions from all binders (`for<'a>`); \
+         implies `-Znext-solver=globally`"),
+    async_panic: bool = (true, parse_bool, [TRACKED],
+        "let async blocks and functions panic when polled after completion"),
     autodiff: Vec<crate::config::AutoDiff> = (Vec::new(), parse_autodiff, [TRACKED],
         "a list of autodiff flags to enable
         Mandatory setting:
@@ -2823,6 +3287,7 @@ options! {
         (default: no)"),
     box_noalias: bool = (true, parse_bool, [TRACKED],
         "emit noalias metadata for box (default: yes)"),
+    #[rustc_lint_opt_deny_field_access("use `Session::branch_protection` instead of this field")]
     branch_protection: Option<BranchProtection> = (None, parse_branch_protection, [TRACKED] { TARGET_MODIFIER: BranchProtection },
         "set options for branch target identification and pointer authentication on AArch64"),
     build_sdylib_interface: bool = (false, parse_bool, [UNTRACKED],
@@ -2858,7 +3323,7 @@ options! {
     debuginfo_compression: DebugInfoCompression = (DebugInfoCompression::None, parse_debuginfo_compression, [TRACKED],
         "compress debug info sections (none, zlib, zstd, default: none)"),
     debuginfo_for_profiling: bool = (false, parse_bool, [TRACKED],
-        "emit discriminators and other data necessary for AutoFDO"),
+        "emit extra debug info to make sample profile more accurate"),
     deduplicate_diagnostics: bool = (true, parse_bool, [UNTRACKED],
         "deduplicate identical diagnostics (default: yes)"),
     default_visibility: Option<SymbolVisibility> = (None, parse_opt_symbol_visibility, [TRACKED],
@@ -2874,10 +3339,12 @@ options! {
         "disable various performance optimizations in trait solving"),
     disable_incr_comp_backend_caching: bool = (false, parse_bool, [TRACKED],
         "disable caching of compiled objects by the codegen backend during incremental compilation"),
+    disable_param_env_normalization_hack: bool = (false, parse_bool, [TRACKED],
+        "do not treat all aliases in the environment as rigid with `-Znext-solver`"),
     dual_proc_macros: bool = (false, parse_bool, [TRACKED],
         "load proc macros for both target and host, but only link to the target (default: no)"),
     dump_dep_graph: bool = (false, parse_bool, [UNTRACKED],
-        "dump the dependency graph to $RUST_DEP_GRAPH (default: /tmp/dep_graph.gv) \
+        "dump the dependency graph to `$RUST_DEP_GRAPH` as both a text file and a GraphViz dot file (default: ./dep_graph.{dot, txt}) \
         (default: no)"),
     dump_mir: Option<String> = (None, parse_opt_string, [UNTRACKED],
         "dump MIR state to file.
@@ -2912,7 +3379,8 @@ options! {
         them only if an error has not been emitted"),
     ehcont_guard: bool = (false, parse_bool, [TRACKED],
         "generate Windows EHCont Guard tables"),
-    embed_metadata: bool = (true, parse_bool, [TRACKED],
+    // FIXME(kobzol): remove in 2027
+    embed_metadata: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "embed metadata in rlibs and dylibs (default: yes)"),
     embed_source: bool = (false, parse_bool, [TRACKED],
         "embed source text in DWARF debug sections (default: no)"),
@@ -2971,6 +3439,8 @@ options! {
         "display unnamed regions as `'<id>`, using a non-ident unique id (default: no)"),
     ignore_directory_in_diagnostics_source_blocks: Vec<String> = (Vec::new(), parse_string_push, [UNTRACKED],
         "do not display the source code block in diagnostics for files in the directory"),
+    implicit_sysroot_deps: bool = (true, parse_bool, [TRACKED],
+        "allows rust to search sysroot for a crate's dependencies (default: yes)"),
     incremental_ignore_spans: bool = (false, parse_bool, [TRACKED],
         "ignore spans during ICH computation -- used for testing (default: no)"),
     incremental_info: bool = (false, parse_bool, [UNTRACKED],
@@ -3037,6 +3507,10 @@ options! {
         "a list of module flags to pass to LLVM (space separated)"),
     llvm_plugins: Vec<String> = (Vec::new(), parse_list, [TRACKED],
         "a list LLVM plugins to enable (space separated)"),
+    llvm_target_feature: String = (String::new(), parse_target_feature, [TRACKED] { TARGET_MODIFIER: LlvmTargetFeature },
+        "enable/disable LLVM-level target features. \
+        This feature is unsafe and can cause ABI issues and compiler crashes, \
+        because LLVM does not support all target feature combinations."),
     llvm_time_trace: bool = (false, parse_bool, [UNTRACKED],
         "generate JSON tracing data file from LLVM data (default: no)"),
     llvm_writable: bool = (false, parse_bool, [TRACKED],
@@ -3055,11 +3529,15 @@ options! {
     maximal_hir_to_mir_coverage: bool = (false, parse_bool, [TRACKED],
         "save as much information as possible about the correspondence between MIR and HIR \
         as source scopes (default: no)"),
+    #[rustc_lint_opt_deny_field_access("use `Session::merge_functions` instead of this field")]
     merge_functions: Option<MergeFunctions> = (None, parse_merge_functions, [TRACKED],
         "control the operation of the MergeFunctions LLVM pass, taking \
         the same values as the target option of the same name"),
     meta_stats: bool = (false, parse_bool, [UNTRACKED],
         "gather metadata statistics (default: no)"),
+    metadata_crate_hash: bool = (true, parse_bool, [TRACKED],
+        "compute the crate hash (SVH) from the encoded crate metadata; set to `no` to \
+         revert to computing it from the HIR (default: yes)"),
     metrics_dir: Option<PathBuf> = (None, parse_opt_pathbuf, [UNTRACKED],
         "the directory metrics emitted by rustc are dumped into (implicitly enables default set of metrics)"),
     min_function_alignment: Option<Align> = (None, parse_align, [TRACKED],
@@ -3074,6 +3552,8 @@ options! {
     mir_include_spans: MirIncludeSpans = (MirIncludeSpans::default(), parse_mir_include_spans, [UNTRACKED],
         "include extra comments in mir pretty printing, like line numbers and statement indices, \
          details about types, etc. (boolean for all passes, 'nll' to enable in NLL MIR only, default: 'nll')"),
+    mir_move_elimination: bool = (false, parse_bool, [TRACKED],
+        "enable the experimental MIR semantics for the move elimination optimization (default: no)"),
     mir_opt_bisect_limit: Option<usize> = (None, parse_opt_number, [TRACKED],
         "limit the number of MIR optimization pass executions (global across all bodies). \
         Pass executions after this limit are skipped and reported. (default: no limit)"),
@@ -3087,8 +3567,6 @@ options! {
         "Whether to remove some of the MIR debug info from methods.  Default: None"),
     move_size_limit: Option<usize> = (None, parse_opt_number, [TRACKED],
         "the size at which the `large_assignments` lint starts to be emitted"),
-    mutable_noalias: bool = (true, parse_bool, [TRACKED],
-        "emit noalias metadata for mutable references (default: yes)"),
     namespaced_crates: bool = (false, parse_bool, [TRACKED],
         "allow crates to be namespaced by other crates (default: no)"),
     next_solver: NextSolverConfig = (NextSolverConfig::default(), parse_next_solver_config, [TRACKED],
@@ -3110,7 +3588,7 @@ options! {
     no_link: bool = (false, parse_no_value, [TRACKED],
         "compile without linking"),
     no_parallel_backend: bool = (false, parse_no_value, [UNTRACKED],
-        "run LLVM in non-parallel mode (while keeping codegen-units and ThinLTO)"),
+        "use `--jobs-backend=1` instead"),
     no_profiler_runtime: bool = (false, parse_no_value, [TRACKED],
         "prevent automatic injection of the profiler_builtins crate"),
     no_steal_thir: bool = (false, parse_bool, [UNTRACKED],
@@ -3147,8 +3625,28 @@ options! {
         "whether to use the PLT when calling into shared libraries;
         only has effect for PIC code on systems with ELF binaries
         (default: PLT is disabled if full relro is enabled on x86_64)"),
+    pointer_authentication: Vec<(PointerAuthOption, bool)> = (
+        Vec::new(),
+        parse_pointer_authentication_list_with_polarity,
+        [TRACKED]
+        { TARGET_MODIFIER: PointerAuthentication },
+        "A comma-separated list of pointer authentication options, each prefixed with `+` (enable) or `-` (disable). Available options:
+        `aarch64-jump-table-hardening` - enable hardened lowering for jump-table dispatch
+        `auth-traps` - trap immediately on pointer authentication failure
+        `calls` - enable signing and authentication of all indirect calls
+        `elf-got` - enable authentication of pointers from GOT (ELF only)
+        `function-pointer-type-discrimination` - enable type discrimination on C function pointers
+        `indirect-gotos` - enable signing and authentication of indirect goto targets
+        `init-fini` - enable signing of function pointers in init/fini arrays
+        `init-fini-address-discrimination` - enable address discrimination in init/fini arrays
+        `intrinsics` - pointer authentication intrinsics
+        `return-addresses` - enable signing and authentication of return addresses
+        `typeinfo-vt-ptr-discrimination - incorporate type and address discrimination in authenticated vtable pointers for std::type_info
+        `vt-ptr-addr-discrimination - incorporate address discrimination in authenticated vtable pointers
+        `vt-ptr-type-discrimination - incorporate type discrimination in authenticated vtable pointers
+        Example: `-Zpointer-authentication=+calls,-init-fini`."),
     polonius: Polonius = (Polonius::default(), parse_polonius, [TRACKED],
-        "enable polonius-based borrow-checker (default: no)"),
+        POLONIUS_HELP),
     pre_link_arg: (/* redirected to pre_link_args */) = ((), parse_string_push, [UNTRACKED],
         "a single extra argument to prepend the linker invocation (can be used several times)"),
     pre_link_args: Vec<String> = (Vec::new(), parse_list, [UNTRACKED],
@@ -3176,11 +3674,8 @@ options! {
         "how to run proc-macro code (default: same-thread)"),
     profile_closures: bool = (false, parse_no_value, [UNTRACKED],
         "profile size of closures"),
-    profile_sample_use: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
-        "use the given `.prof` file for sampled profile-guided optimization (also known as AutoFDO)"),
     profiler_runtime: String = (String::from("profiler_builtins"), parse_string, [TRACKED],
         "name of the profiler runtime crate to automatically inject (default: `profiler_builtins`)"),
-    ptrauth_elf_got: bool = (false, parse_bool, [TRACKED], "enable signing of ELF GOT entries"),
     query_dep_graph: bool = (false, parse_bool, [UNTRACKED],
         "enable queries of the dependency graph for regression testing (default: no)"),
     randomize_layout: bool = (false, parse_bool, [TRACKED],
@@ -3194,7 +3689,7 @@ options! {
         \"C\", \"cdecl\", and \"stdcall\" fn.\
         It is UNSOUND to link together crates that use different values for this flag!"),
     relax_elf_relocations: Option<bool> = (None, parse_opt_bool, [TRACKED],
-        "whether ELF relocations can be relaxed"),
+        "whether ELF relocations can be relaxed (x86 only)"),
     remap_cwd_prefix: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
         "remap paths under the current working directory to this path prefix"),
     remark_dir: Option<PathBuf> = (None, parse_opt_pathbuf, [UNTRACKED],
@@ -3210,12 +3705,20 @@ written to standard error output)"),
     #[rustc_lint_opt_deny_field_access("use `Session::sanitizers()` instead of this field")]
     sanitizer: SanitizerSet = (SanitizerSet::empty(), parse_sanitizers, [TRACKED] { TARGET_MODIFIER: Sanitizer },
         "use a sanitizer"),
+    sanitizer_ignorelist: Vec<String> = (vec![], parse_list, [TRACKED],
+        "list of files providing ignorelists for sanitizers"),
     sanitizer_cfi_canonical_jump_tables: Option<bool> = (Some(true), parse_opt_bool, [TRACKED],
         "enable canonical jump tables (default: yes)"),
     sanitizer_cfi_generalize_pointers: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "enable generalizing pointer types (default: no)"),
     sanitizer_cfi_normalize_integers: Option<bool> = (None, parse_opt_bool, [TRACKED] { TARGET_MODIFIER: SanitizerCfiNormalizeIntegers },
         "enable normalizing integer types (default: no)"),
+    sanitizer_cfi_diag: Option<bool> = (None, parse_opt_bool, [TRACKED],
+        "enable CFI diagnostics (default: no)"),
+    sanitizer_cfi_recover: Option<bool> = (None, parse_opt_bool, [TRACKED],
+        "enable CFI recovery (default: no)"),
+    sanitizer_cfi_minimal_runtime: Option<bool> = (None, parse_opt_bool, [TRACKED] { TARGET_MODIFIER: SanitizerCfiMinimalRuntime },
+        "enable minimal UBSan runtime for CFI (default: no)"),
     sanitizer_dataflow_abilist: Vec<String> = (Vec::new(), parse_comma_list, [TRACKED],
         "additional ABI list files that control how shadow parameters are passed (comma separated)"),
     sanitizer_kcfi_arity: Option<bool> = (None, parse_opt_bool, [TRACKED],
@@ -3224,9 +3727,6 @@ written to standard error output)"),
         "enable origins tracking in MemorySanitizer"),
     sanitizer_recover: SanitizerSet = (SanitizerSet::empty(), parse_sanitizers, [TRACKED],
         "enable recovery for selected sanitizers"),
-    saturating_float_casts: Option<bool> = (None, parse_opt_bool, [TRACKED],
-        "make float->int casts UB-free: numbers outside the integer type's range are clipped to \
-        the max/min integer respectively, and NaN is mapped to 0 (default: yes)"),
     self_profile: SwitchWithOptPath = (SwitchWithOptPath::Disabled,
         parse_switch_with_opt_path, [UNTRACKED],
         "run the self profiler and output the raw event data"),
@@ -3236,12 +3736,15 @@ written to standard error output)"),
         `instructions:u` (retired instructions, userspace-only)
         `instructions-minus-irqs:u` (subtracting hardware interrupt counts for extra accuracy)"
     ),
-    /// keep this in sync with the event filter names in librustc_data_structures/profiling.rs
+    /// keep this in sync with the event filter names and defaults in rustc_data_structures/src/profiling.rs
     self_profile_events: Option<Vec<String>> = (None, parse_opt_comma_list, [UNTRACKED],
         "specify the events recorded by the self profiler;
         for example: `-Z self-profile-events=default,query-keys`
-        all options: none, all, default, generic-activity, query-provider, query-cache-hit
-                     query-blocked, incr-cache-load, incr-result-hashing, query-keys, function-args, args, llvm, artifact-sizes"),
+        all option groups: none, all, default, args
+          `default` contains: generic-activity, query-provider, query-cache-hit-count, \
+                            query-blocked, incr-cache-load, incr-result-hashing, artifact-sizes
+             `args` contains: query-keys, function-args
+        remaining (ungrouped) options: query-cache-hit, llvm"),
     share_generics: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "make the current crate share its generic instantiations"),
     shell_argfiles: bool = (false, parse_bool, [UNTRACKED],
@@ -3299,13 +3802,11 @@ written to standard error output)"),
     #[rustc_lint_opt_deny_field_access("use `Session::lto` instead of this field")]
     thinlto: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "enable ThinLTO when possible"),
-    /// We default to None here since we want to behave like
-    /// a sequential compiler for now. This'll likely be adjusted
-    /// in the future. Note that -Zthreads=0 is the way to get
-    /// the num_cpus behavior.
-    #[rustc_lint_opt_deny_field_access("use `Session::threads` instead of this field")]
-    threads: Option<usize> = (None, parse_threads, [UNTRACKED],
-        "use a thread pool with N threads"),
+    /// Trust (T4.3): a proof session runs one front-end thread whatever this
+    /// asks (`trust_frontend_threads_by_flags`; DECISION_QUEUE
+    /// FRONTEND-THREADS-1), so read it through `Session::threads`.
+    threads: Option<String> = (None, parse_opt_string, [UNTRACKED],
+        "use `--jobs-frontend` instead (a Trust proof session runs one thread)"),
     time_llvm_passes: bool = (false, parse_bool, [UNTRACKED],
         "measure time of each LLVM pass (default: no)"),
     time_passes: bool = (false, parse_bool, [UNTRACKED],
@@ -3358,7 +3859,7 @@ written to standard error output)"),
     // build (Targo injects the workspace-internal dependency units it compiled
     // itself) is not a claim the callee makes about itself.
     trust_bundle_foreign_crate: Vec<String> = (Vec::<String>::new(), parse_trust_bundle_foreign_crate, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
+        { TRUST_AUTHORITY: VerificationSelector },
         "declare, as one comma-separated list, the crates whose foreign bodies may be bundled \
          into a caller's lowered verification bundle and re-derived there, on the same footing as \
          `std`/`core`/`alloc`. This carries no foreign verdict: every obligation over an admitted \
@@ -3391,24 +3892,97 @@ written to standard error output)"),
          whole crate. It IS verified by the proven-output gate (the spec is derived from the \
          trust-ir module rather than from MIR) and needs no gate relaxation: it emits under the \
          default `strict`"),
-    trust_ir_upstream_mir: bool = (false, parse_bool, [TRACKED]
+    // Trust (step 2 increment 5, sub-step 5.4.2; docs/design/2026-10-08-step2-inc5-step4-
+    // compiler-lane-plan.md §2): WHICH CONSUMER compiles F1's trust-ir. `lir` is today's lane
+    // (`lower_module_to_lir` per function, the module-to-LIR gate); `compiler` is the opt-in
+    // compiler lane: one codegen module per crate (`codegen_module.rs`), trust-cg's
+    // `Compiler::compile`, and the call-event refinement gate over the shipped object, which is
+    // F1's only shipping authority on that lane (owner rulings D30-D32). [TRACKED] in the
+    // TRUST_AUTHORITY inventory for the same reason as `trust_cg_frontend`: it changes which
+    // machine code and which evidence a compilation produces.
+    trust_cg_f1_backend: String = ("lir".to_string(), parse_trust_cg_f1_backend, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
-        "with -Ztrust-cg-frontend=trust-ir, additionally admit UPSTREAM-CRATE instances by \
-         bridging their monomorphized MIR into trust-ir (MIR -> VerifiableFunction -> \
-         trust_ir::Module) and feeding the SAME converter and proven-output gate as the \
-         source-first artifacts. Off by default: the default trust-ir lane refuses every \
-         upstream body by name. This is not a fallback for local items — a local body still \
-         comes only from `trust_ir_of`, and a refused item still refuses the crate; only the \
-         IR's recorded provenance differs (MIR-derived rather than source-first) for bodies \
-         that HAVE no source-first artifact"),
+        "with -Ztrust-cg-frontend=trust-ir, which consumer compiles the trust-ir: `lir` (the \
+         default — each function lowered to LIR and gated by the module-to-LIR proven-output \
+         gate) or `compiler` (opt-in, step 2 increment 5 — one codegen module per crate compiled \
+         by trust-cg's `Compiler::compile` with real calls, shipped only when the call-event \
+         refinement gate's closure report allows it under the output-gate policy). `compiler` \
+         refuses, by name, what it does not yet carry: targets other than aarch64-apple-darwin \
+         and aarch64-unknown-linux-gnu, `-Ztrust-cg-output-gate=off`, and -Ztrust-ir-crate-module"),
+    trust_ir_crate_module: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "with -Ztrust-cg-frontend=trust-ir, take the lowering context from the crate module the \
+         producer PUBLISHES and bind the trust-ir v41 CODEGEN LICENSE \
+         (`Function.body_gate`) as a whole-module negative gate, instead of selecting each body \
+         through the per-instance assembled handoff. Off by default, and the default is not a \
+         weaker gate: the handoff lane selects a body by exact (DefIndex, DefPathHash) identity, \
+         while this lane resolves it by the producer's DISPLAY path, so a collision-renamed body \
+         is refused here and admitted there. What this lane adds is the license: every body in \
+         the lowering context must carry a positive gate from a RECOGNIZED authority, which \
+         makes an appended below-tier definition refuse the whole crate rather than be reachable \
+         by inlining"),
     trust_cg_output_gate: String = ("strict".to_string(), parse_trust_cg_output_gate, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "set the trust-cg output-preservation gate: `strict` (the default) rejects an unknown \
          output-preservation outcome, `allow-unknown` records it, `off` disables the gate; \
          batteries-on strict verification pins this to `strict` and rejects `off`"),
+    // Trust: the ONE channel through which the out-of-tree trust-ir → trust-cg
+    // backend (`-Zcodegen-backend=trust-ir-cg`, built from
+    // first-party/trust-cg/crates/rustc-codegen-trust-cg by bootstrap) receives
+    // its knobs. That backend used to read ~30 `TCG_*` environment variables
+    // (proof-certificate opt-out, structured JSON diagnostics, batching and
+    // trace switches). trustc refuses every `TCG_*`/`TRUST_CG_*` variable as an
+    // untracked codegen control (`UNTRACKED_TRUST_CODEGEN_ENV_PREFIXES`), and
+    // rightly so: an environment variable is not part of the crate hash, so a
+    // knob that changes emitted code or the evidence attached to it would make
+    // incremental reuse and evidence provenance lie. A TRACKED option is what
+    // the refusal message tells the user to use instead; this is it. The value
+    // is a space-separated list of `key` / `key=value` items the backend parses
+    // in its own `init`; rustc assigns them no meaning. EvidenceControl because
+    // `no-proof-certs` and friends change what the artifact can claim.
+    trust_ir_cg_args: Vec<String> = (Vec::<String>::new(), parse_list, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "a space-separated list of `key` / `key=value` knobs for the trust-ir → trust-cg codegen \
+         backend (`-Zcodegen-backend=trust-ir-cg`); the backend parses them, rustc does not. \
+         This is the tracked replacement for that backend's former `TCG_*` environment \
+         variables, which trustc refuses as untracked codegen controls"),
     trust_certified_test_monitors: bool = (false, parse_bool, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "reserved internal Targo phase-A fingerprint for a non-`--test` monitor subject; it has no independent authority and requires the paired -Ztrust-targo-test-monitor session-consistency selector"),
+    trust_body_census: Option<PathBuf> = (None, parse_trust_nonempty_path, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "write a diagnostic HIR body-owner census to a NEW JSONL file, independently of direct \
+         lowering; requires -Zchecksum-hash-algorithm=sha256; missing completion footer is \
+         incomplete evidence, and HIR owners are not the reachable-instance/runtime census"),
+    // Trust: opt-in schema extension; the default body census remains v2.
+    trust_body_census_calls: bool = (false, parse_bool, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "include diagnostic post-typecheck HIR call observations in body-census v3; requires \
+         -Ztrust-body-census; does not establish complete inputs, runtime calls, or proof authority"),
+    trust_instance_census: Option<PathBuf> = (None, parse_trust_nonempty_path, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "write a diagnostic concrete mono-item/root/usage/CGU census to a NEW JSONL file; \
+         requires -Zchecksum-hash-algorithm=sha256; observes normal collection without \
+         forcing codegen, and explicitly leaves non-collected runtime/linker items unmeasured"),
+    trust_lean_census: Option<PathBuf> = (None, parse_trust_nonempty_path, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "write a diagnostic census of actual HIR-admitted Lean island checks to a NEW JSONL file; \
+         requires -Zchecksum-hash-algorithm=sha256; preserves sequential and header-first \
+         checking semantics, and does not claim a complete runtime-body denominator"),
+    // Trust (spawn census P4): the trust-ir lane of the spawn census, in SHADOW. It runs at
+    // the analysis seam after whole-crate verification, reads `trust_ir_of` for every fn-like
+    // body the MIR lane answers for (unsafety checking keeps THIR for it), and prints the
+    // differential; it changes no verdict, row or diagnostic. TRACKED_NO_CRATE_HASH, like
+    // `-Ztrust-dump`: evidence production that changes no emitted byte.
+    trust_spawn_census_shadow: TrustSpawnCensusShadow = (TrustSpawnCensusShadow::Off,
+        parse_trust_spawn_census_shadow, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "MEASUREMENT ONLY: run the spawn census's trust-ir lane in shadow beside the MIR lane that \
+         decides every verdict, and print, per fn-like body, both lanes' verdicts, their \
+         agreement and what keeps the trust-ir lane from deciding (`report`); `check` also fails \
+         the build when the trust-ir lane is QUIET where the MIR lane refuses, or reaches a spawn \
+         where it is QUIET, and when the MIR lane's census fell back so nothing was compared. \
+         Needs verification (default: off)"),
     // Trust (lane CTFE): a MEASUREMENT probe, never a code path. `mir_built`
     // returns early for a trivial const, so the CTFE flip seam
     // (`try_flip_ctfe`, the single call site of the CTFE flip) is never
@@ -3423,6 +3997,20 @@ written to standard error output)"),
          const in the crate (a body `mir_built` fast-paths, so the seam is never demanded for \
          it) and log what it WOULD decide, discarding the derived body; installs nothing and \
          changes no emitted code (default: no)"),
+    // Trust: EW18-DROPIN-1 (2026-11-05), the explicit opt-in to EW-18's Darwin rule
+    // (`darwin_rlib_objects_are_archive_members` in rustc_codegen_ssa's link.rs). By
+    // default an rlib-only compilation with unpacked split debuginfo keeps its objects
+    // beside the rlib, as upstream does: which files a compilation leaves is something
+    // a valid tool can see, so the drop-in rule keeps upstream's default. UNTRACKED,
+    // like `-Csave-temps`: it decides only what is deleted after the link, never a
+    // byte of an output. AuthorityOnly: deauthorization resets it to `false`, so an
+    // embedded frontend (tippy, trustdoc, a driver that links) given it in shared
+    // RUSTFLAGS keeps what upstream's would keep.
+    trust_drop_rlib_objects: bool = (false, parse_bool, [UNTRACKED]
+        { TRUST_AUTHORITY: AuthorityOnly },
+        "on Apple targets with `-Csplit-debuginfo=unpacked`, delete an rlib-only compilation's \
+         object files once the rlib holds them as members, which is what a debug map names; \
+         upstream keeps them (default: no)"),
     trust_dump: TrustDump = (TrustDump::default(), parse_trust_dump, [TRACKED_NO_CRATE_HASH]
         { TRUST_AUTHORITY: EvidenceControl },
         "publish one Trust verification artifact to a non-empty directory: `mir:<dir>` writes each \
@@ -3439,7 +4027,7 @@ written to standard error output)"),
     // artifact identity. `=no` is the lane's negative control (the "delete the seam" arm of the
     // mutation matrix): the registry still records nothing, and nothing installs.
     trust_instance_flip: bool = (true, parse_bool, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
+        { TRUST_AUTHORITY: VerificationSelector },
         "allow the Trust-IR flip to install derived MIR PER INSTANCE at the codegen seam, for \
          generic bodies the DefId seam cannot flip, after a per-instance differential proof \
          (default: yes; requires -Ztrust-ir-lower and -Ztrust-ir-flip)"),
@@ -3456,10 +4044,11 @@ written to standard error output)"),
          wrong return anchor (which bites every signature whose Module HAS a return value); \
          `abi-arg0` derives at a wrong FIRST-ARGUMENT anchor, which bites every signature that \
          takes one; `incumbent-args` instantiates the \
-         incumbent at the wrong args; `lineage` corrupts the recorded lineage digest. Any value \
-         makes flips fail closed, never wrong"),
+         incumbent at the wrong args; `lineage` corrupts the recorded lineage digest. Only those \
+         six spellings are matched: any other value is not rejected and runs the ordinary, \
+         un-mutated flip"),
     trust_ir_flip: bool = (true, parse_bool, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
+        { TRUST_AUTHORITY: VerificationSelector },
         "allow the direct Trust-IR frontend to derive compatibility/codegen MIR after an exact differential proof (default: yes)"),
     // Trust (wall A, instance-flip probe): MEASUREMENT ONLY — stashes nothing but
     // Session-local clones, installs no body, changes no emitted code. UNTRACKED for
@@ -3486,7 +4075,7 @@ written to standard error output)"),
     // driver option-domain validation).
     trust_sat_perturb: Option<String> = (None, parse_opt_string, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
-        "burn-in SAT control: deliberately perturb one shim lowering class          (enum-reshape|enum-case-value|enum-ctor|enum-disc-index|switch-map|enum-payload|payload-tramp|dr-tramp|dr-retire|mc-plan|cf-lit-order|chain-ret-order|cf-field-drop|cf-unit-late|cf-pair-order|cf-ret-late|cf-post-late|sw-tramp|swr-tramp|g25-hoist|seq-unit-late|g21-ret-order|uc-unit-late) so the          flip comparator must reject it; requires -Ztrust-verify=off -Ztrust-ir-lower"),
+        "burn-in SAT control: deliberately perturb one shim lowering class          (enum-reshape|enum-case-value|enum-ctor|enum-disc-index|switch-map|enum-payload|marker-order|marker-drop|agg-field-order|marker-arm|payload-tramp|dr-tramp|dr-retire|mc-plan|cf-lit-order|chain-ret-order|cf-field-drop|cf-unit-late|cf-pair-order|cf-ret-late|cf-post-late|sw-tramp|swr-tramp|g25-hoist|seq-unit-late|g21-ret-order|uc-unit-late) so the          flip comparator must reject it; requires -Ztrust-verify=off -Ztrust-ir-lower"),
     // Trust: tri-state because no single static default is true of this option.
     // The direct frontend is not optional under verification, so an unset
     // request follows verification; only the explicit `-Ztrust-verify=off`
@@ -3502,10 +4091,138 @@ written to standard error output)"),
          unset, meaning follow verification; batteries-on verification always runs it, so an \
          explicit value only takes effect in the -Ztrust-verify=off compatibility lane, where the \
          default is off). `strict` additionally makes a body the producer cannot fully lower a \
-         compile error instead of a coverage-only skip"),
-    trust_no_r1: bool = (false, parse_bool, [TRACKED]
+         compile error instead of a coverage-only skip, and so is a body whose trust-ir does not \
+         carry every effect of its built MIR or models a value by abstraction (the \
+         effect-conservation gate, docs/DECISION_QUEUE.md D28) — under verification only: \
+         -Ztrust-verify=off is the master off-switch, so there `strict` degrades to `on` and \
+         never fails a build"),
+    // Trust (memory): the verifier's retained-memory notes — `trust: memory
+    // checkpoint` each time the resident size read at a body boundary crosses
+    // another 4 GiB, and `trust: memory census` at crate end. OPT-IN, default
+    // off, because both report the HOST's resident size: left on by default they
+    // made a compile's diagnostics depend on the machine and its allocator (main's
+    // 5aa81ac168 measured tests/ui/borrowck/ever-init-many-locals.rs at 4858 MB
+    // max RSS, over the first checkpoint), so a ui test's stderr would too. A flag,
+    // never an environment variable: a semantic `TRUST_*` variable is refused.
+    // TRACKED_NO_CRATE_HASH, like `-Ztrust-verify-output`: it adds diagnostics, so
+    // incremental reuse must not replay a session compiled without it, and it
+    // changes no emitted byte, so the crate hash stays put.
+    // A VerificationSelector: both readers are in the verification pass (the
+    // per-body compaction guard and the crate-end census after the
+    // -Ztrust-verify=off early return), so an evidence-deauthorized frontend,
+    // which runs no verification, accepts it and resets it.
+    trust_memory_notes: bool = (false, parse_bool, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: VerificationSelector },
+        "MEASUREMENT ONLY: emit the Trust verifier's retained-memory notes — a `trust: memory \
+         checkpoint` note each time the resident size read at a body boundary crosses another \
+         4 GiB, and a `trust: memory census` note at crate end (artifact slots compacted, \
+         compacted slots recomputed, resident sizes); host-dependent by nature, never a verdict \
+         (default: no)"),
+    // Trust (temporal P3, the send census): for every thread the spawn census
+    // finds, a note naming each std channel send the thread can reach, with the
+    // message type and a shortest call path (the actors a derived model would
+    // have, and what each posts). OPT-IN and diagnostics only, like
+    // `-Ztrust-memory-notes`: TRACKED_NO_CRATE_HASH, since it adds notes and
+    // changes no emitted byte. It forces the spawn census, which reads only
+    // standard MIR queries, so it reports in either lane.
+    trust_send_census: bool = (false, parse_bool, [TRACKED_NO_CRATE_HASH]
         { TRUST_AUTHORITY: EvidenceControl },
+        "report, for every spawned thread (and `main`), each std channel send it can reach: \
+         the message type and a shortest call path, as notes at the spawn site (either lane; \
+         default: no)"),
+    // Trust (temporal P3, design 2026-09-29 §3c.2): the writer census. For a
+    // field path on a message consumer's `self` (`config.harness` names
+    // `App::config.harness` when `App::user_event` consumes the message), a note
+    // at every write that may overlap it and the consumer arm or thread that
+    // reaches it. Diagnostics only, like `-Ztrust-send-census`, whose censuses it
+    // runs (silently unless that flag is set too); either lane.
+    trust_writer_census: Option<String> = (None, parse_opt_string, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "report every write that may overlap this field path of a message consumer's `self` \
+         (`config.harness`), with the consumer arm or thread that reaches it, as notes (either \
+         lane; default: none)"),
+    // Trust (D2 tier 1): the negative control for the ADAPTER_YIELD modeled
+    // fact. Setting it can only LOSE proofs (no premise is ever installed).
+    trust_no_adapter_yield: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: VerificationSelector },
+        "disable the ADAPTER_YIELD modeled fact (a closure handed to a core iterator adapter \
+         over a traced std receiver is otherwise verified assuming it only receives items \
+         that receiver yields)"),
+    // Trust (STR_BYTE_POSITION, 2026-10-04).
+    trust_no_str_byte_position: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "disable the STR_BYTE_POSITION modeled fact (the index `s.bytes().position(|b| b == K)` \
+         returns for an ASCII `K` is otherwise credited as a char boundary of `s`)"),
+    // Trust (TINV step 10.0, 2026-10-07): the inferred type-invariant pre-pass
+    // (candidates, census role, Houdini mint). Replaces the untracked
+    // `TRUST_TINV=1` env read (decision TINV-10), which was acceptable only while
+    // nothing could consume the result. Tracked: the certificates it mints are
+    // the premise of the step-10 use-site lane.
+    trust_tinv: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "run the inferred type-invariant (TINV) pre-pass: synthesize candidate invariants of \
+         eligible private structs and certify them by a whole-crate Houdini induction \
+         (docs/design/2026-10-04-type-invariant-tinv.md); the certified conjuncts become \
+         use-site premises, and a row proved with one is graded `TypeInvariantComposed`, \
+         conditional on the certificate (never kernel-`Certified`) and disclosed as \
+         `assumes type_invariant(S)#k`"),
+    trust_no_r1: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: VerificationSelector },
         "disable kernel-certified whole-program R1 caller-propagation strengthening"),
+    // Trust: changes the Bool/Unit spelling of declined Option lanes during active Trust-IR
+    // lowering, so both incremental reuse and the crate hash must track it. Like
+    // trust_ir_flip, it has no effect when verification and direct lowering are off.
+    trust_option_flag_lanes: bool = (true, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: VerificationSelector },
+        "represent opaque Option lanes by their discriminant during Trust-IR lowering \
+         (default: yes)"),
+    // Trust (platform protocols: design 2026-10-01 Part 3 §3.2, plan L1a = design PR 8).
+    // The five controls of the platform-protocol pass. THIS TRUSTC DOES NOT RUN THAT PASS
+    // YET (plan L1d wires it): every value below is parsed, validated and tracked, and
+    // changes no diagnostic and no emitted byte. Nothing prints a coverage claim for them
+    // either; aterm's gate refuses a member whose policy produced no platform summary row
+    // (E6, `PLATFORM DID NOT RUN`), which is what keeps an inert flag from passing as a
+    // check.
+    //
+    // FC-7: an unknown spelling is a hard error in every one of them, and a property this
+    // trustc cannot check (`lock-release`, `fd-identity`, until plan L4c) is refused rather
+    // than accepted inertly.
+    //
+    // EvidenceControl: each one changes which platform verdicts a compilation can produce.
+    // TRACKED_NO_CRATE_HASH, the spawn-census precedent (`-Ztrust-spawn-census-shadow`,
+    // `-Ztrust-send-census`): the pass adds diagnostics and changes no emitted byte, so a
+    // change invalidates incremental reuse and leaves the crate hash alone.
+    trust_platform_properties: TrustPlatformProperties = (TrustPlatformProperties::default(),
+        parse_trust_platform_properties, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "the platform protocol properties to check, as a comma-separated list (repeating the \
+         option adds to the set): `fd-inherit` (no descriptor other than 0, 1 and 2 reaches a \
+         spawned child's image). Refutation-only: a property can fail the build and never proves \
+         anything; it applies only with verification on. Not yet checked by this trustc: the \
+         pass is not wired, so the policy is validated and nothing is analysed \
+         (default: none)"),
+    trust_platform_unanalysed: TrustPlatformUnanalysed = (TrustPlatformUnanalysed::Warn,
+        parse_trust_platform_unanalysed, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "how the platform pass reports a policy site it cannot analyse: `warn` (the default) \
+         names it in a warning, `deny` makes it an error"),
+    trust_platform_budget: usize = (1_000_000, parse_trust_platform_budget, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "the platform pass's exploration budget per derived model, counted in states and never \
+         in time; a model that exceeds it leaves its sites unanalysed (`PC-BUDGET`), never \
+         not refuted (default: 1000000)"),
+    trust_platform_report: TrustPlatformReport = (TrustPlatformReport::Summary,
+        parse_trust_platform_report, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "how much the platform pass prints: `summary` (the default) is every refutation, every \
+         unanalysed site and the crate summary note; `verbose` adds a note per site that is not \
+         refuted, with its premises"),
+    trust_platform_dump_facts: Option<PathBuf> = (None, parse_trust_nonempty_path,
+        [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "TEST AND MEASUREMENT ONLY: write the host facts the platform pass gives the census \
+         (effects, drops, bodies, refused and foreign callees, closures) to this file, in the \
+         census sidecar grammar (default: none)"),
     // Trust: policy is a single domain because the three settings are mutually
     // exclusive answers to one question. Encoded as separate booleans they were
     // an enum with an invalid state, which only a hand-written cross-check
@@ -3517,7 +4234,7 @@ written to standard error output)"),
     // a memory-safe run previously kept stable, which is the correct direction
     // for an option that changes which verdicts a build accepts.
     trust_policy: TrustPolicy = (TrustPolicy::default(), parse_trust_policy, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
+        { TRUST_AUTHORITY: VerificationSelector },
         "set how an active verification run enforces its verdicts: `strict` (the default) fails \
          the build on a refutation and on any unproved obligation that has NO runtime fallback, \
          while reporting — not failing on — a completeness gap whose operation rustc still checks \
@@ -3528,8 +4245,28 @@ written to standard error output)"),
          records reachable Rust panic refutations and supported capability gaps as explicit \
          assumptions in functions with no source or inlined `unsafe` while UB, hardened, \
          contract, functional, and unmarked failures stay strict"),
-    trust_proof_artifact_root: Option<PathBuf> = (None, parse_trust_nonempty_path, [UNTRACKED]
+    trust_audited_proc_macro: Vec<String> = (Vec::<String>::new(), parse_string_push, [TRACKED_NO_CRATE_HASH]
         { TRUST_AUTHORITY: EvidenceControl },
+        "one audited proc-macro dylib path that -Ztrust-proc-macro-boundary admits (repeatable); \
+         requires -Ztrust-proc-macro-boundary. Targo passes one per audited provider it resolved"),
+    trust_proc_macro_boundary: bool = (false, parse_bool, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "Targo's per-unit in-process proc-macro boundary (PM-1): rustc's crate loader refuses, \
+         before loading it, every proc-macro crate whose dylib no -Ztrust-audited-proc-macro \
+         names (an advisory-policy session reports it and forfeits instead); requires \
+         -Ztrust-verify-session and verification"),
+    trust_proc_macro_isolation: bool = (false, parse_bool, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "expand every proc macro loaded from a proc-macro crate in a sandboxed worker process \
+         (D21; the compiler's own `proc_macro::quote!` still expands in rustc): the worker is \
+         the only process that loads a proc-macro dylib, shares no stdout or stderr with rustc, \
+         holds no descriptor but its protocol socket and the null device, and runs under a \
+         deny-default policy that denies file writes outside its private temporary directory \
+         and the null device. Refused on a host without that sandbox (today every host but \
+         macOS); where macOS cannot install the sandbox, each expansion fails; never falls \
+         back to in-process expansion"),
+    trust_proof_artifact_root: Option<PathBuf> = (None, parse_trust_nonempty_path, [UNTRACKED]
+        { TRUST_AUTHORITY: VerificationSelector },
         "write externalized proof materializations beneath this explicit private root; without it proof bytes remain inline and rustc never writes an ambient working-directory store"),
     trust_clean_origin_mutate_emitter: bool = (false, parse_bool, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
@@ -3537,44 +4274,140 @@ written to standard error output)"),
          faithfulness gate's fatal refusal is exercisable end-to-end from a ui fixture; \
          mutates side A (the emission) only, never the recognizer/admitters/extractor, \
          and can only make a build FAIL that would have passed — never the reverse"),
+    // Trust (2026-09-17): the finalization ROUTING probe; see
+    // `trust_thir_lower::finalization_probe`.
+    trust_ir_lower_mutate_finalization: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "TEST-ONLY: hand the crate finalizer the refusals of a SEPARATE one-declaration \
+         Trust-IR module the validator rejects by construction (a `CallingConv::Rust` \
+         declaration spelled `params: [] + is_vararg: true`), so the advisory-warning / \
+         fail-closed-error routing of an invalid module is exercisable from a ui fixture \
+         without riding a live producer gap; the crate's own module is untouched, and the \
+         knob can only make a build FAIL that would have passed — never the reverse"),
+    // Trust (2026-10-01): the effect-conservation gate's MUTATION probe; see
+    // `trust_thir_lower::effect_conservation` and `LowerCx::lower_for_effects`.
+    trust_ir_lower_mutate_rhs_effects: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "TEST-ONLY: disable the direct producer's field-store right-hand-side effect lowering \
+         (`lower_for_effects` claims success without lowering, the lane as it was before \
+         ec8b51bb3b), so that the effect-conservation gate's refusal of a body that lost a call \
+         is exercisable from a fixture; the knob can only make a build FAIL that would have \
+         passed — never the reverse"),
+    // Trust (step 2 increment 6, step 6.5.1; INC6.5-SWITCH in docs/DECISION_QUEUE.md): the
+    // level-S template lane; see `trust_thir_lower::template_lowering`. TRACKED for the reason
+    // the other controls are: it changes what rmeta's trust-ir header records for a generic
+    // definition, so a session with it on must not share an artifact or incremental identity
+    // with one without it.
+    trust_ir_lower_templates: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        // Trust (PKG-C2d2 slice 1): corrected — the authenticated rows are written since 6.5.4.
+        "TEST-ONLY (step 6.5): run the level-S template lowering and write its authenticated \
+         rows (since 6.5.4); no consumer admits a level-S row, and the only reader is the \
+         diagnostic template-instance TEST-ORACLE; `no` can only make rmeta carry fewer entries, \
+         never more"),
+    // Trust (R8-SEAM, docs/DECISION_QUEUE.md): the crate-seam differential's CROSS-CHECK hook;
+    // see `trust_thir_lower::crate_module::seam_reference`. A tracked option rather than the
+    // environment variable it first landed as: env vars are banned ambient inputs (see
+    // LEGACY_TRUST_SEMANTIC_ENV_VARS), and a hooked compile can fail finalization where an
+    // unhooked one would not, so the two must not share an artifact or incremental identity.
+    // Trust: D17-SEAM-1 is a default-off diagnostic oracle, never production input.
+    trust_ir_instance_seam_test: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "TEST-ONLY: compare each locally appended generic instance's actual source-produced \
+         trust-ir against independently retained built MIR at its concrete args; requires \
+         verification off, explicit trust-cg backend with object/link output, and the trust-ir \
+         frontend; mismatch or unsupported refuses"),
+    trust_test_instance_seam_mutation: Option<String> = (None, parse_opt_string, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "TEST-ONLY negative control for trust-ir-instance-seam-test: bool-constant or \
+         undef-constant; mutates only the oracle's private copy and must refuse"),
+    // Trust (PKG-C2d2 slice 1; INC6.5-NO-AUTHORITY in docs/DECISION_QUEUE.md): the
+    // template-instance equivalence TEST-ORACLE (`trust_thir_lower`'s `template_metadata::oracle`).
+    // Default off and fenced by the driver to the D17 seam-test lane it chains to; TRACKED like
+    // that lane, since a session with it on can fail where one without it would not.
+    trust_ir_template_instance_oracle: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "TEST-ORACLE ONLY: compare each D17 local generic instance whose MIR seam oracle agreed \
+         with its construction from this crate's own level-S template; no output, admission or \
+         proof authority"),
+    trust_test_template_oracle_mutation: Option<String> = (None, parse_opt_string, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "TEST-ONLY negative control for trust-ir-template-instance-oracle: int-constant or \
+         envelope-byte; mutates only the oracle's private copy and must fail the session"),
+    trust_ir_seam_reference: Option<PathBuf> = (None, parse_trust_nonempty_path, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "TEST-ONLY (R8-SEAM): beside the crate-seam differential, also run the pre-R8-SEAM seam \
+         over the pre-R8-SEAM differential (kept verbatim), compare every seam verdict and every \
+         row-1 UC probe outcome, write the comparison's report to this path, and fail crate \
+         finalization on any difference; the knob can only make a build FAIL that would have \
+         passed — never the reverse"),
     trust_targo_test_monitor: bool = (false, parse_bool, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "reserved internal Targo per-unit session-consistency selector (direct use is rejected): \
          install kernel-certified test monitors; requires a matching -Ztrust-verify-session, \
          does not authenticate a direct rustc caller, and never enables static verification"),
+    // Trust (2026-09-30): the F3 storage rule's mutation control; see
+    // `trust_thir_lower::to_mir::mutate_derived_assert_msg_for_test`. TRACKED for the reason
+    // the other controls are: a knob that changes a verdict must change the crate hash.
+    trust_test_mutate_derived_assert_msg: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "TEST-ONLY: in the derived MIR the Trust-IR differential builds, repoint one overflow-assert \
+         message operand to a same-typed local its block has already retired (`StorageDead`), so \
+         the storage rule `compare_derived` applies to the real derived body is exercisable from a \
+         test; requires -Ztrust-verify=off -Ztrust-ir-lower -Ztrust-ir-flip=no and refuses every \
+         -Ztrust-dump sink (with the flip on it would be inert, so that is refused too), so the \
+         mutated body feeds only the differential's report and can never be installed or compiled"),
+    // Trust: plain dependency data. This neither enables nor grades verification.
+    trust_tool_inputs: bool = (false, parse_bool, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "record bounded local native tool inputs in dep-info after successful compilation (no proof or execution claim)"),
     trust_verify: TrustVerify = (TrustVerify::default(), parse_trust_verify, [TRACKED]
         { TRUST_AUTHORITY: AuthorityOnly },
         "run the batteries-on Trust typed verification pipeline (`on`, the default) or compile as \
          vanilla Rust (`off`); this is the sole verification activation control, used by the \
          vanilla-comparison and bootstrap compiler lanes"),
-    // The configured location is transport only. `rustc_interface` snapshots
-    // and hashes the exact bytes before dependency hashes are observed, then
-    // records that content identity in the TRACKED top-level
-    // `trust_solver_content_fingerprint`. Tracking both would spuriously rotate
-    // crate/incremental hashes when identical solver bytes merely move.
-    trust_verify_ay_path: Option<PathBuf> = (None, parse_trust_nonempty_path, [UNTRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
-        "use the executable at this non-empty path as the AY verification solver; exact solver contents, not this location, are dependency-tracked"),
     trust_verify_crate_role: String = ("unscoped".to_string(), parse_trust_verify_crate_role, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "reserved Targo reporting metadata: record this compiler unit's role (`unscoped`, \
          `primary`, `dependency`, or `build-script`); every non-`unscoped` role requires both \
          `-Ztrust-verify-package-name` and `-Ztrust-verify-session`; this value never changes \
          verifier scope (use the explicit `-Ztrust-verify=off` switch)"),
+    // Trust (determinism plan §3.2a, 2026-10-08): the ONE solver-effort count's
+    // scale `k`: every ay query is bounded by `min(100000, max(1, k · size))`
+    // SAT conflicts per SAT solve, `size` its count of distinct terms, sent as
+    // `(set-option :rlimit N)` before each check-sat, the same N on every host
+    // at every load. TRACKED because it decides where a search stops (where
+    // the count, and not one of ay's residual clocks, ends it). No per-function
+    // count stands beside it. The default mirrors
+    // `trust_types::determinism::EffortScale::BUILTIN` (rustc_session cannot
+    // name that crate); `targo trust` passes the workspace root's
+    // `[trust] effort` explicitly.
+    trust_verify_effort: u64 = (384, parse_trust_verify_effort, [TRACKED]
+        { TRUST_AUTHORITY: VerificationSelector },
+        "set the solver effort scale: each ay query is bounded by min(100000, max(1, k * size)) SAT conflicts per SAT solve (ay `:rlimit`), size being its count of distinct terms; the one deterministic solver count, 1 through 100000"),
+    // Trust (determinism plan §3.2/§3.6): the step budget stands in front of
+    // this clock for preprocessing and the one effort count for each ay query.
+    // The native CHC/PDR engine, kernel certification and the structural
+    // promotions have no count yet (plan P4a), so for them this deadline is
+    // still the bound, and its value does not move until they do (review rule
+    // 2026-09-30: no clock becomes a backstop until a count stands in front of
+    // all the work it bounds). `targo trust` derives it from `[trust]
+    // backstop`. A function this clock stops is recorded with stop cause
+    // `wall-backstop`.
     trust_verify_function_budget_ms: u64 = (120_000, parse_number, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
-        "set the cooperative per-function verification wall-clock budget in milliseconds; no new proof work starts and late proof results are rejected after expiry (0 disables the budget)"),
-    trust_verify_function_budget_steps: u64 = (64_000_000, parse_number, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
-        "set the DEADLINE-INDEPENDENT per-function preprocessing step budget: every instrumented pre-dispatch loop iteration decrements it, and reaching zero fails the function closed (never Proved). Unlike the wall-clock budget this is a provable monotone-decreasing bound that guarantees termination even with the clock disabled (0 disables the step budget)"),
+        { TRUST_AUTHORITY: VerificationSelector },
+        "set the cooperative per-function verification wall-clock budget in milliseconds; no new proof work starts and late proof results are rejected after expiry, recorded as stop cause `wall-backstop`; the step budget and the effort count stand in front of it, and it still bounds the work with no count (0 disables the budget)"),
+    trust_verify_function_budget_steps: u64 = (64_000_000, parse_trust_verify_function_budget_steps, [TRACKED]
+        { TRUST_AUTHORITY: VerificationSelector },
+        "set the positive DEADLINE-INDEPENDENT per-function preprocessing step budget: every instrumented pre-dispatch loop iteration decrements it, and reaching zero fails the function closed (never Proved). Unlike the wall-clock backstop this is a provable monotone-decreasing bound that guarantees termination even with the clock disabled, and a stop on it is reproducible; it cannot be disabled"),
     trust_verify_include_dependencies: bool = (false, parse_bool, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
+        { TRUST_AUTHORITY: VerificationSelector },
         "include authenticated dependency-crate MIR in the Trust verification scope"),
     trust_verify_level: usize = (2, parse_trust_verify_level, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
+        { TRUST_AUTHORITY: VerificationSelector },
         "set the Trust verification proof level (0 = safety, 1 = functional, 2 = domain)"),
     trust_verify_output: String = ("human".to_string(), parse_trust_verify_output, [TRACKED_NO_CRATE_HASH]
-        { TRUST_AUTHORITY: EvidenceControl },
+        { TRUST_AUTHORITY: VerificationSelector },
         "set Trust verification output mode (`human`, `json`, or `both`)"),
     trust_verify_package_name: Option<String> = (None, parse_trust_verify_package_name, [TRACKED_NO_CRATE_HASH]
         { TRUST_AUTHORITY: EvidenceControl },
@@ -3585,34 +4418,87 @@ written to standard error output)"),
     // could disagree with it: with two carriers the compiler default and the
     // `targo trust` default were free to diverge, and they had.
     trust_verify_profile: Option<String> = (None, parse_trust_verify_profile, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
+        { TRUST_AUTHORITY: VerificationSelector },
         "set the Trust verification profile that selects proof obligations; the registered \
          hardened profiles (`hardened`, `unix_hardened`, `coreutils_hardened`) additionally emit \
-         fail-closed hardened boundary verification conditions"),
+         fail-closed hardened boundary verification conditions; `unix_hardened` and \
+         `coreutils_hardened` also DECLARE the Unix process-signal policy (`main` installs \
+         SIGPIPE -> SIG_DFL, as `-Zon-broken-pipe=kill`; an explicit `-Zon-broken-pipe` wins), \
+         which discharges their `process_semantics` stdout mandate"),
     trust_verify_session: Option<String> = (None, parse_trust_verify_session, [TRACKED_NO_CRATE_HASH]
         { TRUST_AUTHORITY: EvidenceControl },
         "set a non-empty proof-build freshness identity that invalidates incremental reuse without \
          changing the downstream crate hash; Targo pairs it with package metadata for non-`unscoped` \
          roles, while a raw `unscoped` compile may use a session-only nonce"),
+    // Trust: launch-only resource correlation, supplied by the resolved Cargo unit.
+    trust_admission_run_digest: Option<String> = (None, parse_trust_admission_digest, [UNTRACKED]
+        { TRUST_AUTHORITY: EvidenceControl }, "reserved native admission public run digest"),
+    trust_admission_unit_digest: Option<String> = (None, parse_trust_admission_digest, [UNTRACKED]
+        { TRUST_AUTHORITY: EvidenceControl }, "reserved native admission exact Cargo unit digest"),
+    trust_admission_semantics_digest: Option<String> = (None, parse_trust_admission_digest, [UNTRACKED]
+        { TRUST_AUTHORITY: EvidenceControl }, "reserved native admission Cargo semantics digest"),
+    trust_admission_unit_role: Option<String> = (None, parse_trust_admission_role, [UNTRACKED]
+        { TRUST_AUTHORITY: EvidenceControl }, "reserved native admission exact Cargo graph role"),
+    trust_admission_compile_target: Option<String> = (None, parse_trust_admission_target, [UNTRACKED]
+        { TRUST_AUTHORITY: EvidenceControl }, "reserved native admission exact Cargo compile target"),
     trust_verify_target_spec_sha256: Option<String> = (None, parse_trust_verify_target_spec_sha256, [UNTRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "bind a session-scoped custom JSON target to the exact SHA-256 bytes parsed by rustc; reserved for Targo"),
-    trust_verify_timeout_ms: u64 = (5_000, parse_trust_verify_timeout_ms, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
-        "set the positive per-obligation verifier timeout in milliseconds"),
+    // Trust: 2026-09-21 — RAISED 5_000 -> 20_000, and the reason is a measurement,
+    // not a preference. The native typed-CHC lane derives its hard wall-clock
+    // watchdog as `timeout + 2s`, so 5_000 gave a 7s ceiling. A 64-bit `decreases`
+    // ranking VC (`while i < n invariant i <= n decreases n - i`) costs a MEASURED
+    // 3.3s of PDR on an idle machine — 47% of that ceiling — so the margin was
+    // consumed by ordinary parallel load and the row reported UNKNOWN.
+    //
+    // MEASURED, and this is the decisive pair: `tests/ui/trust/
+    // native_loop_collection_semantics.rs#slice_progress` PASSES when run alone
+    // (`2 passed; 0 failed`) and FAILS inside the full `tests/ui/trust` suite,
+    // which compiletest runs in parallel. Same compiler, same source, same
+    // obligation; only the machine load differs. A budget whose verdict depends on
+    // what else is running is not a budget, it is a race — and it fails in the
+    // direction that turns a provable obligation into a coverage gap.
+    //
+    // 20s is 6x the idle cost, chosen so the verdict survives the load a full
+    // suite or a busy workstation produces. It is a WALL-CLOCK backstop for phases
+    // that ignore ay's internal budget (the 23h orca-core hang this watchdog was
+    // built for); raising it costs time only on obligations that were going to
+    // fail anyway, and buys back rows that were always provable.
+    //
+    // `crates/trust-router/.../engines/native_trust_mc.rs`'s
+    // `DEFAULT_PER_OBLIGATION_TIMEOUT_MS` mirrors this value for session-less
+    // callers and MUST be kept in sync; it is updated in the same commit.
+    //
+    // Trust (determinism plan §3.2a, 2026-09-30): on the ay lanes a COUNT,
+    // `trust_verify_effort`, usually ends an undecided ay search first, at the
+    // same point on every host (at most 100,000 conflicts per SAT solve, about
+    // 1.6 s idle). Not always: a check-sat can run several SAT solves, and ay's
+    // residual clocks spend time no count reaches. The trust-mc CHC/PDR
+    // lane has no count of its own yet (plan P4a), so there this clock is
+    // still the bound; its value therefore does not move (review rule
+    // 2026-09-30: no clock becomes a backstop until a count stands in front of
+    // all the work it bounds). `targo trust` passes the value its budget
+    // profile's backstop derives (`trust_types::determinism::Backstop::
+    // vc_clock_ms`, 5,000 ms at the built-in) explicitly; this default serves
+    // a bare `trustc`. A solve this clock ends
+    // is recorded with stop cause `wall-backstop`, and the unit that carries it
+    // is not reproducible.
+    trust_verify_timeout_ms: u64 = (20_000, parse_trust_verify_timeout_ms, [TRACKED]
+        { TRUST_AUTHORITY: VerificationSelector },
+        "set the positive per-obligation wall-clock timeout in milliseconds: a backstop behind `-Ztrust-verify-effort` on the ay lanes, and still the bound of the native CHC/PDR engine, which has no count yet"),
     trust_verify_worker_threads: usize = (0, parse_trust_verify_worker_threads, [TRACKED]
-        { TRUST_AUTHORITY: EvidenceControl },
-        "set verifier worker threads (0 = default serial dispatch, maximum 256)"),
+        { TRUST_AUTHORITY: VerificationSelector },
+        "cap verifier worker threads (1 = serial dispatch; 0, the default, = no cap: engine batches run in parallel; maximum 256)"),
     // Trust (typeck-moonshot P1): the warm-replay witness lane. [UNTRACKED] (like
     // `incremental`), so the crate hash is unperturbed and no-flag lanes are
     // byte-identical to upstream.
     trust_witness: TrustWitness = (TrustWitness::default(), parse_trust_witness, [UNTRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "select the typeck-witness lane: `auto` (the default) mints and replays through \
-         `<out-dir>/trust-witness`, router-gated to bodies where replay beats fresh typeck and \
-         inert without an `--out-dir`; `off` disables it; `mint:<dir>` mints every eligible root \
-         into an explicit store without replaying; `replay:<dir>` replays every stored root from \
-         an explicit store without minting"),
+         a `<StableCrateId>.twit` file in the `--out-dir`, router-gated to bodies where replay \
+         beats fresh typeck and inert without an `--out-dir`; `off` disables it; `mint:<dir>` \
+         mints every eligible root into an explicit store without replaying; `replay:<dir>` \
+         replays every stored root from an explicit store without minting"),
     // Shadow-mint measurement for the PRECISE per-referenced-def key (A1-A3 edit-loop
     // key). Deliberately NOT part of the `trust_witness` lane domain: it selects the
     // witness KEY, not which lane runs, and its own disposition
@@ -3627,9 +4513,6 @@ written to standard error output)"),
         "EXPERIMENTAL: shadow-mint parity measurement of the precise edit-loop witness key (never trusted)"),
     tune_cpu: Option<String> = (None, parse_opt_string, [TRACKED],
         "select processor to schedule for (`rustc --print target-cpus` for details)"),
-    #[rustc_lint_opt_deny_field_access("use `TyCtxt::use_typing_mode_post_typeck` instead of this field")]
-    typing_mode_post_typeck_until_borrowck: bool = (false, parse_bool, [TRACKED],
-        "enable `TypingMode::PostTypeckUntilBorrowck`, changing the way opaque types are handled during MIR borrowck"),
     #[rustc_lint_opt_deny_field_access("use `Session::ub_checks` instead of this field")]
     ub_checks: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "emit runtime checks for Undefined Behavior (default: -Cdebug-assertions)"),
@@ -3689,6 +4572,8 @@ written to standard error output)"),
     // FIXME remove this after a couple releases
     wasm_c_abi: () = ((), parse_wasm_c_abi, [TRACKED],
         "use spec-compliant C ABI for `wasm32-unknown-unknown` (deprecated, always enabled)"),
+    wasm_proc_macros: bool = (false, parse_bool, [TRACKED],
+        "enable support for compiling and loading wasm proc macros"),
     write_long_types_to_disk: bool = (true, parse_bool, [UNTRACKED],
         "whether long type names should be written to files instead of being printed in errors"),
     // tidy-alphabetical-end

@@ -8,6 +8,29 @@ use crate::{
     Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction, VerificationCondition,
 };
 
+/// Synthetic storage-carrier sample for REFUSAL tests, never compiler evidence.
+pub fn make_memory_image_constant(bits: u128) -> ConstValue {
+    ConstValue::MemoryImage(Box::new(crate::ConstantMemoryImage {
+        schema_version: 1,
+        owner: crate::ConstantImageOwner {
+            def_path: "test::memory_image".into(),
+            def_path_hash: crate::CallableDefPathHash::new(1, 2),
+            mir_phase: "synthetic-test".into(),
+        },
+        target: crate::ConstantImageTarget {
+            triple: "synthetic-test".into(),
+            data_layout: "e-p:64:64".into(),
+            pointer_size_bytes: 8,
+            little_endian: true,
+        },
+        ty: Ty::Int { width: 64, signed: false },
+        ty_fingerprint: [3, 4],
+        layout: crate::ConstantImageLayout { size_bytes: 8, align_bytes: 8 },
+        root: crate::ConstantImageRoot::ScalarBits { bits, size_bytes: 8 },
+        nodes: Default::default(),
+    }))
+}
+
 /// Default test SourceSpan.
 pub fn test_source_span() -> SourceSpan {
     SourceSpan { file: "test.rs".to_string(), line_start: 1, col_start: 1, line_end: 1, col_end: 1 }
@@ -45,6 +68,7 @@ pub fn make_test_function(name: &str, body: VerifiableBody) -> VerifiableFunctio
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

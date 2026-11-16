@@ -12,5 +12,6 @@ use trust_prime_boundary::emit_distinct_native_collision;
 // contexts, that same-spelled binding set must fail closed as ambiguous.
 emit_distinct_native_collision!();
 //~^ ERROR invalid `invariant` clause: source-contract variable `bound` is not in scope
+//~| ERROR invalid `decreases` clause: source-contract variable `n` is not in scope
 
 fn main() {}

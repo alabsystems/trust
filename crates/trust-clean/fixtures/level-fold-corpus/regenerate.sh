@@ -126,12 +126,14 @@ if [[ -d /opt/homebrew/lib && -z "${LIBRARY_PATH:-}" ]]; then
 fi
 
 cp -R "$EXTRACT" "$SCRATCH/extract"
+# targo, not raw `cargo`: its unverified lane keeps
+# every unit's verification off (the job RUSTFLAGS=-Ztrust-verify=off did), and
+# the wrapper still re-enables it, last, for the extraction target only.
 (cd "$SCRATCH/extract" && \
   CARGO_TARGET_DIR="$SCRATCH/target" \
   RUSTC="$TRUSTC" \
   RUSTC_WRAPPER="$WRAPPER" \
-  RUSTFLAGS="-Ztrust-verify=off" \
-  cargo rustc --offline --lib -- \
+  targo --unverified rustc --offline --lib -- \
     \
     -Ztrust-dump=mir-only:"$SCRATCH/dump" \
     -Ztrust-policy=advisory)

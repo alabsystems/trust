@@ -81,8 +81,8 @@ fn env_with(decl: &str) -> Environment {
 /// checked nothing would otherwise be indistinguishable from a passing one.
 fn kernel_agrees_everywhere(decl: &str, name: &str, arity: usize) -> usize {
     let env = env_with(decl);
-    let plan = plan_clean_origin_body(&env, name)
-        .unwrap_or_else(|e| panic!("`{decl}` must plan: {e:?}"));
+    let plan =
+        plan_clean_origin_body(&env, name).unwrap_or_else(|e| panic!("`{decl}` must plan: {e:?}"));
     let f = emit_clean_origin_function(&plan, FuncId::new(0), FuncTyId::new(0))
         .unwrap_or_else(|e| panic!("`{decl}` must emit: {e}"));
     let interp = Interpreter::new();

@@ -1,0 +1,45 @@
+{
+  "schema": "trust.contract-carry.shadow/v1",
+  "crate": "trust_widthconv",
+  "authority": "NONE: a staged carry installed on a CLONE of the published module; the published module, its artifacts and every verdict are unchanged",
+  "published": true,
+  "staged_marker": "contract-bound-v3",
+  "live_marker": "obligation-bearing-pending-v2",
+  "duplicate_registrations": [],
+  "resolution": [
+    {"def_index":3,"def_path":"shift_mask","function":0}
+  ],
+  "outcome": {"bodies_installed":1,"bodies_skipped_unspliced":0,"bodies_withheld":0,"summaries_installed":1,"rows_installed":2,"loop_rows_withheld":0,"clauses_typed":2,"clauses_opaque":0,"opaque":[]},
+  "install_errors": [],
+  "validate_module": [],
+  "validate_module_with_authority": [],
+  "validate_linked_module": [],
+  "text_losses": [],
+  "binary_round_trip": true,
+  "staged_rung_errors": [],
+  "live_tier_refuses": true,
+  "live_tier_errors": 3,
+  "summaries": [
+    {"function":0,"name":"_RNvCsfqy6wQHQ0qm_15trust_widthconv10shift_mask","display_path":"shift_mask","params":[
+    "target_width"
+  ],"proved":false,"backed_by":null,"requires":[],"ensures":[
+    {"schema":"trust.contract-clause@1","payload":"{\"le\":[{\"var\":{\"name\":\"_0\",\"domain\":\"MachineInt { width: 32, signed: false }\"}},{\"int\":\"127\"}]}","smtlib":"(bvule _0 (_ bv127 32))","bindings":[
+    {"name":"_0","sort":"BitVec(32)","place":{"result":0}}
+  ]},
+    {"schema":"trust.contract-clause@1","payload":"{\"le\":[{\"var\":{\"name\":\"_0\",\"domain\":\"MachineInt { width: 32, signed: false }\"}},{\"var\":{\"name\":\"target_width\",\"domain\":\"MachineInt { width: 32, signed: false }\"}}]}","smtlib":"(bvule _0 target_width)","bindings":[
+    {"name":"_0","sort":"BitVec(32)","place":{"result":0}},
+    {"name":"target_width","sort":"BitVec(32)","place":{"param":0}}
+  ]}
+  ],"decreases":[]}
+  ],
+  "rows": [
+    {"id":0,"kind":"Postcondition","status":"pending","function":0,"assertion_id":"trust_widthconv::shift_mask#ensures#c0","site":null,"formula":{"schema":"trust.contract-clause@1","payload":"{\"le\":[{\"var\":{\"name\":\"_0\",\"domain\":\"MachineInt { width: 32, signed: false }\"}},{\"int\":\"127\"}]}","smtlib":"(bvule _0 (_ bv127 32))","bindings":[
+    {"name":"_0","sort":"BitVec(32)","place":{"result":0}}
+  ]}},
+    {"id":1,"kind":"Postcondition","status":"pending","function":0,"assertion_id":"trust_widthconv::shift_mask#ensures#c1","site":null,"formula":{"schema":"trust.contract-clause@1","payload":"{\"le\":[{\"var\":{\"name\":\"_0\",\"domain\":\"MachineInt { width: 32, signed: false }\"}},{\"var\":{\"name\":\"target_width\",\"domain\":\"MachineInt { width: 32, signed: false }\"}}]}","smtlib":"(bvule _0 target_width)","bindings":[
+    {"name":"_0","sort":"BitVec(32)","place":{"result":0}},
+    {"name":"target_width","sort":"BitVec(32)","place":{"param":0}}
+  ]}}
+  ],
+  "interpreted": []
+}

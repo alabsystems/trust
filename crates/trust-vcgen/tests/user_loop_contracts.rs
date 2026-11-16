@@ -83,6 +83,7 @@ fn counted_loop() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -250,6 +251,7 @@ fn nested_spanless_header_loops() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -931,6 +933,7 @@ fn exact_loop_path_limit_fails_the_whole_e4_lane_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(
         bind_compiler_loop_contracts(

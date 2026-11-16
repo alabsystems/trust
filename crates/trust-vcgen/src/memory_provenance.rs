@@ -310,6 +310,7 @@ impl Default for ProvenanceTracker {
 pub fn check_provenance(func: &VerifiableFunction) -> Vec<VerificationCondition> {
     let mut tracker = ProvenanceTracker::new();
     let mut vcs = Vec::new();
+    let mut fn_sym: Option<Symbol> = None;
 
     // Initialize: ref-typed arguments get fresh allocations.
     for local in &func.body.locals {
@@ -326,15 +327,15 @@ pub fn check_provenance(func: &VerifiableFunction) -> Vec<VerificationCondition>
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             if let Statement::Assign { place, rvalue, span } = stmt {
-                process_assignment(&mut tracker, func, place, rvalue, span, &mut vcs);
+                process_assignment(&mut tracker, func, &mut fn_sym, place, rvalue, span, &mut vcs);
             }
         }
 
         // Handle Drop terminators (deallocation).
         if let Terminator::Drop { place, span, .. } = &block.terminator
-            && let Some(&(region_tag, _)) = tracker.local_provenance.get(&place.local).as_ref()
+            && let Some(&(region_tag, _)) = tracker.local_provenance.get(&place.local)
         {
-            tracker.free_region(*region_tag, span.clone());
+            tracker.free_region(region_tag, span.clone());
         }
     }
 
@@ -345,6 +346,7 @@ pub fn check_provenance(func: &VerifiableFunction) -> Vec<VerificationCondition>
 fn process_assignment(
     tracker: &mut ProvenanceTracker,
     func: &VerifiableFunction,
+    fn_sym: &mut Option<Symbol>,
     place: &Place,
     rvalue: &Rvalue,
     span: &SourceSpan,
@@ -358,9 +360,8 @@ fn process_assignment(
             let kind = if *mutable { BorrowKind::MutableRef } else { BorrowKind::SharedRef };
 
             // If the source is tracked, create a derived borrow.
-            if let Some(&(region_tag, _)) = tracker.local_provenance.get(&src_place.local).as_ref()
-            {
-                tracker.create_borrow(dest, *region_tag, kind, span.clone());
+            if let Some(&(region_tag, _)) = tracker.local_provenance.get(&src_place.local) {
+                tracker.create_borrow(dest, region_tag, kind, span.clone());
             } else {
                 // Source not tracked yet -- create a new allocation.
                 let region_tag = tracker.new_allocation(kind);
@@ -375,11 +376,9 @@ fn process_assignment(
             if has_deref {
                 // Dereferencing: this is a read access through the pointer.
                 let violations = tracker.read_through(src.local, span);
-                emit_provenance_vcs(func, &violations, vcs);
-            } else if let Some(&(region_tag, tag)) =
-                tracker.local_provenance.get(&src.local).as_ref()
-            {
-                tracker.bind_local(dest, *region_tag, *tag);
+                emit_provenance_vcs(func, fn_sym, &violations, vcs);
+            } else if let Some(&(region_tag, tag)) = tracker.local_provenance.get(&src.local) {
+                tracker.bind_local(dest, region_tag, tag);
             }
         }
 
@@ -388,7 +387,7 @@ fn process_assignment(
             let has_deref = place.projections.iter().any(|p| matches!(p, Projection::Deref));
             if has_deref {
                 let violations = tracker.write_through(place.local, span);
-                emit_provenance_vcs(func, &violations, vcs);
+                emit_provenance_vcs(func, fn_sym, &violations, vcs);
             }
         }
     }
@@ -397,16 +396,22 @@ fn process_assignment(
 /// Convert provenance violations into verification conditions.
 fn emit_provenance_vcs(
     func: &VerifiableFunction,
+    fn_sym: &mut Option<Symbol>,
     violations: &[ProvenanceViolation],
     vcs: &mut Vec<VerificationCondition>,
 ) {
+    if violations.is_empty() {
+        return;
+    }
+    let fn_sym = *fn_sym.get_or_insert_with(|| func.name.as_str().into());
+    vcs.reserve(violations.len());
     for violation in violations {
         let kind_label = violation.kind.label();
         vcs.push(VerificationCondition {
             kind: VcKind::Assertion {
                 message: format!("[provenance] {kind_label}: {}", violation.message),
             },
-            function: func.name.as_str().into(),
+            function: fn_sym,
             location: violation.span.clone(),
             formula: Formula::Bool(true), // definite violation
             contract_metadata: None,
@@ -593,6 +598,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let vcs = check_provenance(&func);
@@ -637,6 +643,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let vcs = check_provenance(&func);
@@ -677,6 +684,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let vcs = check_provenance(&func);
@@ -724,6 +732,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let vcs = check_provenance(&func);
@@ -763,6 +772,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let vcs = check_provenance(&func);

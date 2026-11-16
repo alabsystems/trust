@@ -25,4 +25,8 @@ rustc-build-sysroot = "0.5.13"
 serde = { version = "1.0.185", features = ["derive"] }
 
 [build-dependencies]
-rustc_tools_util = "0.4"
+# Trust: this build script must query the RUSTC Cargo selected, rather than a
+# bare ambient rustc. Name Tippy's existing implementation at the consumer;
+# a global patch is unused in the crates workspace and the pinned bootstrap
+# Cargo serializes different unused patches in nondeterministic order.
+rustc_tools_util = { version = "0.4", path = "../../tippy/rustc_tools_util" }

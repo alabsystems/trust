@@ -66,7 +66,6 @@ def run(source, certify=False):
     with open(path, "w") as fh:
         fh.write(source + "\n")
     env = dict(os.environ)
-    env["TRUST_SEED_STAIRCASE"] = "1"
     cmd = [TRUSTC, *BASE] + (["-Ztrust-policy=certify"] if certify else []) + \
           ["--out-dir", d, path]
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)

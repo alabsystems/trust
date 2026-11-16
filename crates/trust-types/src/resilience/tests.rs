@@ -166,6 +166,7 @@ fn test_extract_failure_model() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "redis::Commands::get".to_string(),
                         args: vec![],
@@ -189,6 +190,7 @@ fn test_extract_failure_model() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "sqlx::query".to_string(),
                         args: vec![],
@@ -215,6 +217,7 @@ fn test_extract_failure_model() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let model = extract_failure_model(&func);
@@ -250,6 +253,7 @@ fn test_extract_failure_model_no_externals() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let model = extract_failure_model(&func);
@@ -367,6 +371,7 @@ fn make_simple_return_func(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -429,6 +434,7 @@ fn test_analyze_function_with_overflow_assert() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let report = ResilienceAnalysis::analyze_function(&func);
@@ -459,6 +465,7 @@ fn test_analyze_function_with_unwrap_call() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::result::Result::unwrap".to_string(),
                         args: vec![],
@@ -484,6 +491,7 @@ fn test_analyze_function_with_unwrap_call() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let report = ResilienceAnalysis::analyze_function(&func);
@@ -529,6 +537,7 @@ fn test_analyze_function_with_unchecked_arithmetic() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let report = ResilienceAnalysis::analyze_function(&func);
@@ -573,6 +582,7 @@ fn test_analyze_function_detects_division_risk() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let report = ResilienceAnalysis::analyze_function(&func);
@@ -615,6 +625,7 @@ fn test_analyze_function_detects_commutative() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let report = ResilienceAnalysis::analyze_function(&func);
@@ -644,6 +655,7 @@ fn test_analyze_function_with_external_deps_and_unwrap() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "redis::Commands::get".to_string(),
                         args: vec![],
@@ -660,6 +672,7 @@ fn test_analyze_function_with_external_deps_and_unwrap() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "core::result::Result::unwrap".to_string(),
                         args: vec![Operand::Move(Place::local(1))],
@@ -679,6 +692,7 @@ fn test_analyze_function_with_external_deps_and_unwrap() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let report = ResilienceAnalysis::analyze_function(&func);
@@ -769,6 +783,7 @@ fn test_error_handling_swallowing_detected() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "get_data".to_string(),
                         args: vec![],
@@ -788,6 +803,7 @@ fn test_error_handling_swallowing_detected() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let report = ResilienceAnalysis::analyze_function(&func);
@@ -820,6 +836,7 @@ fn test_unreachable_terminator_detected_as_panic() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let report = ResilienceAnalysis::analyze_function(&func);
@@ -958,6 +975,7 @@ fn test_classify_achieved_level_fragile_with_panics() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "core::result::Result::unwrap".to_string(),
                         args: vec![],
@@ -977,6 +995,7 @@ fn test_classify_achieved_level_fragile_with_panics() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let report = ResilienceAnalysis::analyze_function(&func);
     assert_eq!(FaultAssumptions::classify_achieved_level(&report), ResilienceLevel::Fragile);
@@ -1023,6 +1042,7 @@ fn test_classify_achieved_level_tolerant_with_unchecked_arith() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let report = ResilienceAnalysis::analyze_function(&func);
     assert_eq!(FaultAssumptions::classify_achieved_level(&report), ResilienceLevel::Tolerant);

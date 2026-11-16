@@ -133,10 +133,14 @@ pub fn kernel_admit(
 /// island theorem, a `Eq.refl` the elaborator constructed. Wherever it came
 /// from, the kernel is what decides: this returns `true` only when
 /// `check_type` accepts the term against the goal, so a frontend cannot buy
-/// belief with a term the kernel rejects.
+/// belief with a term the kernel rejects. The re-check goes through the
+/// crate's one entry for a certificate's re-check (`kernel_stop`), so a
+/// decline the kernel's heartbeat count ended is also recorded as an `effort`
+/// stop. This still answers `false` for it, and no certify run's scope reads
+/// the stop here today, so a caller reads that decline as a rejection.
 #[must_use]
 pub fn discharge_with_kernel_proof(env: &Environment, goal: &FrontendGoal, proof: &Expr) -> bool {
-    TypeChecker::new(env).check_type(proof, goal.statement()).is_ok()
+    crate::kernel_stop::check_type(TypeChecker::new(env), proof, goal.statement()).is_ok()
 }
 
 #[cfg(test)]

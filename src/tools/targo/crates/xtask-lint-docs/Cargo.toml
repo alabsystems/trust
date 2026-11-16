@@ -6,9 +6,9 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-cargo.workspace = true
 clap.workspace = true
 itertools.workspace = true
+targo.workspace = true
 
 [lints]
 workspace = true

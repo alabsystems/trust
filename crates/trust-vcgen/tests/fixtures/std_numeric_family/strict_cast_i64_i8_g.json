@@ -1,0 +1,297 @@
+{
+ "name": "strict_cast_i64_i8_g",
+ "def_path": "nm::strict_cast_i64_i8_g",
+ "span": {
+  "file": "nm.rs",
+  "line_start": 22,
+  "col_start": 0,
+  "line_end": 22,
+  "col_end": 107
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 8,
+      "signed": true
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": true
+     }
+    },
+    "name": "a"
+   },
+   {
+    "index": 2,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 3,
+    "ty": "Bool",
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 2,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Ge",
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Int": -128
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 22,
+        "col_start": 47,
+        "line_end": 22,
+        "col_end": 56
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "SwitchInt": {
+      "discr": {
+       "Move": {
+        "local": 2,
+        "projections": []
+       }
+      },
+      "targets": [
+       [
+        0,
+        3
+       ]
+      ],
+      "otherwise": 1,
+      "exhaustive_enum_unreachable": false,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 22,
+       "col_start": 47,
+       "line_end": 22,
+       "col_end": 56
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 3,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Le",
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Int": 127
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 22,
+        "col_start": 60,
+        "line_end": 22,
+        "col_end": 68
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "SwitchInt": {
+      "discr": {
+       "Move": {
+        "local": 3,
+        "projections": []
+       }
+      },
+      "targets": [
+       [
+        0,
+        3
+       ]
+      ],
+      "otherwise": 2,
+      "exhaustive_enum_unreachable": false,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 22,
+       "col_start": 60,
+       "line_end": 22,
+       "col_end": 68
+      }
+     }
+    }
+   },
+   {
+    "id": 2,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "core::num::<impl i64>::strict_cast::<i8>",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 0,
+       "projections": []
+      },
+      "target": 4,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 22,
+       "col_start": 71,
+       "line_end": 22,
+       "col_end": 92
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 4703791156326232143,
+       "def_index": 26855,
+       "substs_digest": [
+        17636721706011404533,
+        4008858382403516025
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 4703791156326232143,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 3,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 0,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Constant": {
+          "Int": 0
+         }
+        }
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 22,
+        "col_start": 102,
+        "line_end": 22,
+        "col_end": 103
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Goto": 4
+    }
+   },
+   {
+    "id": 4,
+    "stmts": [],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 1,
+  "return_ty": {
+   "Int": {
+    "width": 8,
+    "signed": true
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": -9223372036854775808
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": 9223372036854775807
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

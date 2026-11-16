@@ -38,14 +38,44 @@
 // control (`+ 1` spec) so no certificate is vacuous, plus concrete value diffs
 // (i64: 3_000_000_000 + 1; a large mul; -7 / 2 = -3).
 //
+// TRAP ARMS. Since trust-cg b80b958f5 a LIR `Trap` selects to AArch64 `BRK #1`
+// (as LLVM does for llvm.trap), no longer `call abort`. The no-trap
+// precondition is therefore NOT derived from which emitted arm reaches a trap:
+// it is each shape's INDEPENDENT source domain (`source_domain`), bound to the
+// original argument registers before any emitted instruction executes. The
+// replay omits an arm only when ay proves its path condition UNSAT under that
+// domain; a feasible BRK still reaches the unchanged Aarch64Semantics refusal,
+// and a call is never read as a trap. The BRK / call / domain-boundary /
+// corrupted-guard controls at the end of this file pin that behaviour.
+// These are bounded development solver checks, not kernel certificates.
+//
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#![cfg(feature = "ay-proofs")]
+// Trust (2026-09-30, plan §5 fail-open item 1): every shipping `module_to_lir`
+// entry point now refuses an `Assert`-bearing body as
+// `ModuleLirError::ImplicitPanicUnfaithful` — the `Brif`/`Trap` lowering this
+// file proves is a bare `brk`, not Rust's panic. The proofs stay under test
+// for plan §5 item P through the trap oracle, which exists only under the
+// non-default `test-hooks` feature (never enabled by the compiler); this file
+// moved from the `ay-proofs` lane to `test-hooks` with it (`test-hooks`
+// implies `ay-proofs`).
+#![cfg(feature = "test-hooks")]
 
-use ay::{BigInt, Logic, Solver, Term};
+use std::time::Duration;
+
+use ay::{BigInt, Logic, Solver, SolverConfig, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
-use trust_cg_bridge::lower_trust_ir_function_to_lir;
+use trust_cg_bridge::module_to_lir::lower_trust_ir_function_to_lir_trap_assert_oracle;
+
+/// The trap oracle under the name this file always used (see the note at the
+/// top): `Assert` lowers to `Brif`/`Trap` here and is refused everywhere else.
+fn lower_trust_ir_function_to_lir(
+    module: &trust_ir::Module,
+    function: &trust_ir::Function,
+) -> Result<trust_cg_lower::function::Function, trust_cg_bridge::ModuleLirError> {
+    lower_trust_ir_function_to_lir_trap_assert_oracle(module, function, false)
+}
 use trust_disasm::{Opcode, decode_aarch64};
 use trust_ir::Module;
 use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
@@ -326,6 +356,7 @@ fn make_bridge_module(shape: Shape) -> Module {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     trust_ir_bridge::lower_to_trust_ir(&vf).expect("bridge lower_to_trust_ir failed (i64)")
@@ -410,10 +441,34 @@ fn has_conditional_branch(code: &[u8], base: u64) -> bool {
     false
 }
 
+/// Decode all emitted words. Unknown words or a truncated instruction refuse
+/// the structural check rather than being omitted from the call/trap counts.
+fn count_opcode(code: &[u8], base: u64, wanted: &[Opcode]) -> usize {
+    assert_eq!(code.len() % 4, 0, "AArch64 text must contain complete instructions");
+    code.chunks_exact(4)
+        .enumerate()
+        .filter(|(index, bytes)| {
+            let bytes: [u8; 4] = (*bytes).try_into().unwrap();
+            let insn = decode_aarch64(&bytes, base + (*index * 4) as u64)
+                .expect("every emitted word must decode for structural accounting");
+            wanted.contains(&insn.opcode)
+        })
+        .count()
+}
+
 // ===========================================================================
-// BOUNDED SYMBOLIC PATH-MERGING EXECUTOR (identical to the i32 slices, but the
-// Ret reads the full 64-bit X0). The trapping guard arm (a `Call` abort)
-// diverges, accumulating the no-trap precondition.
+// BOUNDED SYMBOLIC RETURN-PATH EXECUTOR (the design of the inline-multiblock
+// harness, 7a1034b5c1; here the Ret reads the full 64-bit X0). The arithmetic
+// input assumption is supplied independently of emitted control flow, per
+// shape. An arm is omitted only when AY establishes that its accumulated path
+// condition is UNSAT. Reachable BRK, calls, and unknown feasibility remain
+// refusals; no trap semantics is invented.
+//
+// This replaces a path-MERGING executor that read the Assert trap block's
+// `call abort` (an `Effect::Call`) as "this arm diverges" and conjoined the
+// other arm's condition into the precondition. That trap block is retired: a
+// LIR `Trap` now emits `BRK #1`, which Aarch64Semantics refuses fail-closed
+// (blocker_code=aarch64-brk-debug-trap-not-proof-consumed).
 // ===========================================================================
 
 const MAX_STEPS: u32 = 4096;
@@ -423,7 +478,6 @@ const MAX_DEPTH: u32 = 16;
 enum ExecError {
     Loop { at: u64 },
     BudgetExceeded,
-    Trapped,
     Unsupported(String),
     Decode(String),
 }
@@ -433,12 +487,11 @@ struct Executor<'a> {
     code: &'a [u8],
     base: u64,
     steps: u32,
-    precondition: Vec<Formula>,
 }
 
 impl<'a> Executor<'a> {
     fn new(code: &'a [u8], base: u64) -> Self {
-        Executor { sem: Aarch64Semantics, code, base, steps: 0, precondition: Vec::new() }
+        Executor { sem: Aarch64Semantics, code, base, steps: 0 }
     }
 
     fn decode_at(&self, pc: u64) -> Result<trust_disasm::Instruction, ExecError> {
@@ -459,6 +512,7 @@ impl<'a> Executor<'a> {
         mut state: MachineState,
         mut visited: Vec<u64>,
         depth: u32,
+        path_condition: Formula,
     ) -> Result<Formula, ExecError> {
         if depth > MAX_DEPTH {
             return Err(ExecError::BudgetExceeded);
@@ -497,11 +551,11 @@ impl<'a> Executor<'a> {
                     }
                     Effect::Branch { target } => uncond_target = Some(target.clone()),
                     Effect::PcUpdate { .. } => {}
-                    // The Assert trap block begins with `call abort`: the abort
-                    // call IS the trap/panic path, so this arm diverges — the
-                    // no-trap precondition excludes it.
+                    // A call is not a proved diverging branch. (The retired
+                    // Assert trap block began with `call abort`; the trap is now
+                    // a BRK, refused by the semantics above if reachable.)
                     Effect::Call { .. } => {
-                        return Err(ExecError::Trapped);
+                        return Err(ExecError::Unsupported(format!("call at {pc:#x}")));
                     }
                     Effect::Aarch64SyncBoundary { .. } | Effect::Aarch64AtomicAccess { .. } => {
                         return Err(ExecError::Unsupported(format!("atomic/sync at {pc:#x}")));
@@ -528,10 +582,30 @@ impl<'a> Executor<'a> {
                     return Err(ExecError::Loop { at: pc });
                 }
 
-                let taken = self.run(target_pc, state.clone(), visited.clone(), depth + 1);
-                let fall = self.run(fall_pc, state.clone(), visited.clone(), depth + 1);
-
-                return self.merge(path_cond, taken, fall);
+                let taken_path = Formula::And(vec![path_condition.clone(), path_cond.clone()]);
+                let fall_path = Formula::And(vec![
+                    path_condition.clone(),
+                    Formula::Not(Box::new(path_cond.clone())),
+                ]);
+                // Do not even decode an infeasible destination. In particular,
+                // a BRK may only be avoided by proving its path impossible;
+                // a feasible BRK still reaches the unchanged Semantics refusal.
+                return match (path_is_feasible(&taken_path)?, path_is_feasible(&fall_path)?) {
+                    (true, true) => {
+                        let taken = self.run(
+                            target_pc,
+                            state.clone(),
+                            visited.clone(),
+                            depth + 1,
+                            taken_path,
+                        )?;
+                        let fall = self.run(fall_pc, state, visited, depth + 1, fall_path)?;
+                        Ok(Formula::Ite(Box::new(path_cond), Box::new(taken), Box::new(fall)))
+                    }
+                    (true, false) => self.run(target_pc, state, visited, depth + 1, taken_path),
+                    (false, true) => self.run(fall_pc, state, visited, depth + 1, fall_path),
+                    (false, false) => Err(ExecError::Unsupported("no feasible return path".into())),
+                };
             }
 
             if let Some(target) = uncond_target {
@@ -547,26 +621,30 @@ impl<'a> Executor<'a> {
             pc += 4;
         }
     }
+}
 
-    fn merge(
-        &mut self,
-        path_cond: Formula,
-        taken: Result<Formula, ExecError>,
-        fall: Result<Formula, ExecError>,
-    ) -> Result<Formula, ExecError> {
-        match (taken, fall) {
-            (Ok(t), Ok(f)) => Ok(Formula::Ite(Box::new(path_cond), Box::new(t), Box::new(f))),
-            (Err(ExecError::Trapped), Ok(f)) => {
-                self.precondition.push(Formula::Not(Box::new(path_cond)));
-                Ok(f)
-            }
-            (Ok(t), Err(ExecError::Trapped)) => {
-                self.precondition.push(path_cond);
-                Ok(t)
-            }
-            (Err(ExecError::Trapped), Err(ExecError::Trapped)) => Err(ExecError::Trapped),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
+/// Unknown (including the finite solver deadline) is never an infeasibility
+/// certificate. This is a test oracle, not a kernel-certified proof artifact.
+/// The path is first put through the same meaning-preserving `fold_consts`
+/// the discharge uses, so a pinned operand reaches ay as a literal (the
+/// emitted SMULH is a 128-bit product; unfolded, the pinned constant stays
+/// wrapped in extension bookkeeping and ay bit-blasts a full multiplier).
+fn path_is_feasible(path: &Formula) -> Result<bool, ExecError> {
+    let path = fold_consts(path);
+    let config = SolverConfig::default().with_timeout(Duration::from_secs(30));
+    let mut solver = Solver::try_new_with_config(Logic::QfAbv, config)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility solver: {e:?}")))?;
+    let condition = formula_to_term(&mut solver, &path);
+    solver
+        .try_assert_term(condition)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility assertion: {e:?}")))?;
+    let result = solver.check_sat();
+    if result.is_unsat() {
+        Ok(false)
+    } else if result.is_sat() {
+        Ok(true)
+    } else {
+        Err(ExecError::Unsupported(format!("unknown branch feasibility: {result:?}")))
     }
 }
 
@@ -578,11 +656,16 @@ fn const_addr(f: &Formula) -> Option<u64> {
 }
 
 /// FULLY symbolic (both operands range over all 2^64). Used for add/sub.
-fn symbolic_machine_output(code: &[u8], base: u64) -> Result<(Formula, Formula), ExecError> {
-    run_machine_output(code, base, MachineState::symbolic())
+/// `shape` names the source whose independent domain is the precondition.
+fn symbolic_machine_output(
+    code: &[u8],
+    base: u64,
+    shape: Shape,
+) -> Result<(Formula, Formula), ExecError> {
+    run_machine_output(code, base, shape, MachineState::symbolic())
 }
 
-/// Path-merge with the SECOND argument register (X1 == `b`) pinned to a concrete
+/// Replay with the SECOND argument register (X1 == `b`) pinned to a concrete
 /// 64-bit literal `c`. X0 (== `a`) stays FULLY SYMBOLIC, so the result is an
 /// infinite-domain statement over ALL 2^64 values of `a` for that fixed `c`.
 /// Pinning turns the emitted 64-bit MUL / SDIV / LSLV into a by-constant op that
@@ -590,27 +673,39 @@ fn symbolic_machine_output(code: &[u8], base: u64) -> Result<(Formula, Formula),
 fn symbolic_machine_output_b_const(
     code: &[u8],
     base: u64,
+    shape: Shape,
     c: i64,
 ) -> Result<(Formula, Formula), ExecError> {
     let mut state = MachineState::symbolic();
     state.gpr[1] = Formula::BitVec { value: i128::from(c), width: 64 };
-    run_machine_output(code, base, state)
+    run_machine_output(code, base, shape, state)
 }
 
+/// Bind the source precondition to the ORIGINAL argument registers (X0 == `a`,
+/// X1 == `b`) before any emitted instruction executes; decoded branches cannot
+/// redefine this domain.
 fn run_machine_output(
     code: &[u8],
     base: u64,
+    shape: Shape,
     state: MachineState,
 ) -> Result<(Formula, Formula), ExecError> {
-    let mut exec = Executor::new(code, base);
-    let out = exec.run(base, state, Vec::new(), 0)?;
-    let pre = if exec.precondition.is_empty() {
-        Formula::Bool(true)
-    } else if exec.precondition.len() == 1 {
-        exec.precondition.pop().unwrap()
-    } else {
-        Formula::And(exec.precondition.clone())
-    };
+    let pre = source_domain(shape, state.read_gpr(0, 64), state.read_gpr(1, 64));
+    run_under_domain(code, base, state, pre)
+}
+
+/// The replay under an explicit domain. Only `run_machine_output` (the source
+/// domain) and the BRK controls (a deliberately vacuous domain) call it.
+fn run_under_domain(
+    code: &[u8],
+    base: u64,
+    state: MachineState,
+    pre: Formula,
+) -> Result<(Formula, Formula), ExecError> {
+    if !path_is_feasible(&pre)? {
+        return Err(ExecError::Unsupported("empty input domain".into()));
+    }
+    let out = Executor::new(code, base).run(base, state, Vec::new(), 0, pre.clone())?;
     Ok((out, pre))
 }
 
@@ -884,25 +979,93 @@ fn bv64(value: i128) -> Formula {
 }
 
 // ---------------------------------------------------------------------------
-// Concrete byte-execution oracle (the emitted bytes are the value oracle for the
-// aggregate-undef checked idiom; run with concrete registers).
+// INDEPENDENT SOURCE DOMAINS: the inputs on which each bridge body's own
+// `Assert`s pass, read off the SOURCE (`make_bridge_module`), never off the
+// emitted bytes. `a` / `b` are the 64-bit argument registers X0 / X1 as the
+// caller left them. The exact-boundary control below pins each one.
 // ---------------------------------------------------------------------------
 
-enum ConcreteOutcome {
-    Trapped,
-    Value(Formula),
+fn sext128(v: Formula) -> Formula {
+    Formula::BvSignExt(Box::new(v), 64)
 }
 
-fn concrete_run(code: &[u8], base: u64, a: i64, b: i64) -> ConcreteOutcome {
+/// A 128-bit two's-complement value lies in [i64::MIN, i64::MAX] iff it is the
+/// sign extension of its own low 64 bits. This is the same set as the two
+/// signed comparisons (`i64_range_predicates_agree` proves it for a free
+/// 128-bit value), spelled so ay does not have to push 128-bit comparators
+/// through the SMULH product: with the comparator spelling the checked-mul
+/// trap arm is `Unknown` at the 30 s deadline for c = 1_000_000 / 3_000_000_000.
+fn in_i64_range(v128: Formula) -> Formula {
+    let low = Formula::BvExtract { inner: Box::new(v128.clone()), high: 63, low: 0 };
+    Formula::Eq(Box::new(v128), Box::new(sext128(low)))
+}
+
+/// The textbook spelling of the same range, kept only as the reference the
+/// `in_i64_range` spelling is proven equal to.
+fn in_i64_range_by_comparison(v128: Formula) -> Formula {
+    let bound = |value: i64| Formula::BitVec { value: i128::from(value), width: 128 };
+    Formula::And(vec![
+        Formula::BvSLe(Box::new(bound(i64::MIN)), Box::new(v128.clone()), 128),
+        Formula::BvSLe(Box::new(v128), Box::new(bound(i64::MAX)), 128),
+    ])
+}
+
+/// Checked i64 `a - b` passes its overflow assert iff the exact difference of
+/// the sign-extended i128 operands lies in [i64::MIN, i64::MAX]. Two
+/// sign-extended i64 values cannot overflow i128.
+fn no_signed_i64_sub_overflow(a: Formula, b: Formula) -> Formula {
+    in_i64_range(Formula::BvSub(Box::new(sext128(a)), Box::new(sext128(b)), 128))
+}
+
+/// Checked i64 `a * b` passes its overflow assert iff the exact product of the
+/// sign-extended i128 operands lies in [i64::MIN, i64::MAX]. |a * b| <= 2^126
+/// cannot overflow i128.
+fn no_signed_i64_mul_overflow(a: Formula, b: Formula) -> Formula {
+    in_i64_range(Formula::BvMul(Box::new(sext128(a)), Box::new(sext128(b)), 128))
+}
+
+/// The div body's two asserts exactly as written: `!(b == 0)` and `!(b == -1)`.
+/// The second traps on `b == -1` for EVERY dividend, not only `i64::MIN`.
+fn signed_div_guards_pass(b: Formula) -> Formula {
+    Formula::And(vec![
+        Formula::Not(Box::new(Formula::Eq(Box::new(b.clone()), Box::new(bv64(0))))),
+        Formula::Not(Box::new(Formula::Eq(Box::new(b), Box::new(bv64(-1))))),
+    ])
+}
+
+/// The shift amount `b` is a `u32` (Rust's shift-count type, passed in W1); the
+/// body asserts `!(b >= 64)`, i.e. `b <u 64` over those 32 bits only.
+fn shift_amount_in_range(b: Formula) -> Formula {
+    let amount = Formula::BvExtract { inner: Box::new(b), high: 31, low: 0 };
+    Formula::BvULt(Box::new(amount), Box::new(Formula::BitVec { value: 64, width: 32 }), 32)
+}
+
+fn source_domain(shape: Shape, a: Formula, b: Formula) -> Formula {
+    match shape {
+        // Bare wrapping add: the body has no assert, so every input is admitted.
+        Shape::Add => Formula::Bool(true),
+        Shape::CheckedSub => no_signed_i64_sub_overflow(a, b),
+        Shape::CheckedMul => no_signed_i64_mul_overflow(a, b),
+        Shape::SignedDiv => signed_div_guards_pass(b),
+        Shape::Shl => shift_amount_in_range(b),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Concrete byte-execution oracle (the emitted bytes are the value oracle for the
+// bridge's checked pair, one `make_aggregate` since BMC-LANE-1 and an `Undef`
+// seed before it; run with concrete registers).
+// ---------------------------------------------------------------------------
+
+fn concrete_run(code: &[u8], base: u64, a: i64, b: i64) -> Result<Formula, ExecError> {
     let mut state = MachineState::symbolic();
     state.gpr[0] = Formula::BitVec { value: i128::from(a), width: 64 };
     state.gpr[1] = Formula::BitVec { value: i128::from(b), width: 64 };
-    let mut exec = Executor::new(code, base);
-    match exec.run(base, state, Vec::new(), 0) {
-        Ok(out) => ConcreteOutcome::Value(out),
-        Err(ExecError::Trapped) => ConcreteOutcome::Trapped,
-        Err(e) => panic!("concrete run failed: {e:?}"),
-    }
+    // The concrete inputs ARE the precondition: with constant argument
+    // registers every branch condition is ground, so feasibility prunes exactly
+    // the side these inputs do not take. Concrete runs are NOT restricted to the
+    // source domain: a trapping input must reach the unchanged BRK refusal.
+    Executor::new(code, base).run(base, state, Vec::new(), 0, Formula::Bool(true))
 }
 
 fn concrete_equals(out: &Formula, expected: i64) -> bool {
@@ -916,11 +1079,13 @@ fn concrete_equals(out: &Formula, expected: i64) -> bool {
     solver.check_sat().is_unsat()
 }
 
+/// Every value witness below is a no-trap input, so its run must return. (It
+/// used to report `false` on the retired `call abort` arm; a trapping input now
+/// reaches the BRK refusal, which is a failure here, not a value.)
 fn bytes_value_equals(code: &[u8], base: u64, a: i64, b: i64, expected: i64) -> bool {
-    match concrete_run(code, base, a, b) {
-        ConcreteOutcome::Value(out) => concrete_equals(&out, expected),
-        ConcreteOutcome::Trapped => false,
-    }
+    let out = concrete_run(code, base, a, b)
+        .unwrap_or_else(|e| panic!("concrete no-trap run ({a}, {b}) must return: {e:?}"));
+    concrete_equals(&out, expected)
 }
 
 // ===========================================================================
@@ -1205,7 +1370,7 @@ fn sub_spec() -> Formula {
 fn i64_add_bytes_compute_a_plus_b_for_all_inputs() {
     let (code, base) = emit_text(&make_bridge_module(Shape::Add));
     let (machine_out, precondition) =
-        symbolic_machine_output(&code, base).expect("add path-merge failed");
+        symbolic_machine_output(&code, base, Shape::Add).expect("add path-merge failed");
     // Bare add: no guard, so the precondition is trivially true (allowed here —
     // there is no trap arm to explore).
     let proven = discharge_equal_under(Logic::QfBv, &precondition, &machine_out, &add_spec());
@@ -1216,8 +1381,11 @@ fn i64_add_bytes_compute_a_plus_b_for_all_inputs() {
 fn i64_checked_sub_bytes_compute_a_minus_b_on_no_overflow_path() {
     let (code, base) = emit_text(&make_bridge_module(Shape::CheckedSub));
     let (machine_out, precondition) =
-        symbolic_machine_output(&code, base).expect("sub path-merge failed");
-    // The overflow guard must be explored: a non-trivial no-overflow precondition.
+        symbolic_machine_output(&code, base, Shape::CheckedSub).expect("sub path-merge failed");
+    // The precondition is now the explicit independent source no-overflow
+    // domain (it used to be derived from the retired `call abort` trap arm); it
+    // must be non-trivial. That the emitted guard is lowered, reachable, and
+    // not weakened is checked by the BRK / boundary / corrupted-guard controls.
     assert!(
         !matches!(precondition, Formula::Bool(true)),
         "expected a non-trivial no-overflow precondition for checked i64 sub"
@@ -1250,10 +1418,12 @@ fn i64_checked_mul_bytes_compute_a_times_c_on_no_overflow_path() {
     // and the signed extremes (each exercises the CheckedSmul overflow check).
     let cs: &[i64] = &[0, 1, -1, 7, -6, 1_000_000, 3_000_000_000, i64::MAX, i64::MIN];
     for &c in cs {
-        let (machine_out, precondition) = symbolic_machine_output_b_const(&code, base, c)
-            .unwrap_or_else(|e| panic!("mul path-merge failed for c={c}: {e:?}"));
-        // c==0 never overflows -> the executor may not record a trap arm; every
-        // other c must be guarded (non-trivial no-overflow precondition).
+        let (machine_out, precondition) =
+            symbolic_machine_output_b_const(&code, base, Shape::CheckedMul, c)
+                .unwrap_or_else(|e| panic!("mul path-merge failed for c={c}: {e:?}"));
+        // c==0 never overflows; every other c must be guarded (non-trivial
+        // no-overflow precondition). The precondition is now the independent
+        // source domain, not the retired `call abort` trap arm's negation.
         if c != 0 {
             assert!(
                 !matches!(precondition, Formula::Bool(true)),
@@ -1280,8 +1450,13 @@ fn i64_signed_div_bytes_compute_a_div_c_on_no_trap_path() {
     // plus a magnitude beyond i32 range and the signed extreme.
     let cs: &[i64] = &[1, 2, 3, 7, -2, -3, 3_000_000_000, i64::MAX];
     for &c in cs {
-        let (machine_out, precondition) = symbolic_machine_output_b_const(&code, base, c)
-            .unwrap_or_else(|e| panic!("div path-merge failed for c={c}: {e:?}"));
+        let (machine_out, precondition) =
+            symbolic_machine_output_b_const(&code, base, Shape::SignedDiv, c)
+                .unwrap_or_else(|e| panic!("div path-merge failed for c={c}: {e:?}"));
+        // The independent source domain replaces the retired `call abort` trap
+        // arm's negation. For a pinned in-domain divisor it is a ground formula
+        // (so this is a syntactic check, as it was before); the BRK controls show
+        // the div guards are really lowered and reachable.
         assert!(
             !matches!(precondition, Formula::Bool(true)),
             "expected a non-trivial no-trap precondition for c={c}; got `true`"
@@ -1303,8 +1478,11 @@ fn i64_shl_bytes_compute_a_shl_c_on_no_trap_path() {
     // for a 64-bit value (63) — the 40 case is only meaningful at i64.
     let cs: &[i64] = &[0, 1, 7, 40, 63];
     for &c in cs {
-        let (machine_out, precondition) = symbolic_machine_output_b_const(&code, base, c)
-            .unwrap_or_else(|e| panic!("shl path-merge failed for c={c}: {e:?}"));
+        let (machine_out, precondition) =
+            symbolic_machine_output_b_const(&code, base, Shape::Shl, c)
+                .unwrap_or_else(|e| panic!("shl path-merge failed for c={c}: {e:?}"));
+        // As for div: the independent source domain (ground for a pinned
+        // amount) replaces the retired `call abort` trap arm's negation.
         assert!(
             !matches!(precondition, Formula::Bool(true)),
             "expected a non-trivial no-trap precondition for c={c}; got `true`"
@@ -1321,7 +1499,8 @@ fn i64_shl_bytes_compute_a_shl_c_on_no_trap_path() {
 
 // ===========================================================================
 // MANDATORY NEGATIVE CONTROLS (SAT) — the SAME bytes against a `+ 1` spec MUST
-// be SAT under the same precondition, or the positive certificate is vacuous.
+// be SAT under the same (independent source) precondition, or the positive
+// check is vacuous.
 // ===========================================================================
 
 fn plus_one(spec: Formula) -> Formula {
@@ -1332,7 +1511,7 @@ fn plus_one(spec: Formula) -> Formula {
 fn negative_control_i64_add_vs_plus_one_is_sat() {
     let (code, base) = emit_text(&make_bridge_module(Shape::Add));
     let (machine_out, precondition) =
-        symbolic_machine_output(&code, base).expect("add path-merge failed");
+        symbolic_machine_output(&code, base, Shape::Add).expect("add path-merge failed");
     let proven =
         discharge_equal_under(Logic::QfBv, &precondition, &machine_out, &plus_one(add_spec()));
     assert!(!proven, "VACUITY CHECK FAILED: i64 add bytes were 'proven' equal to a+b+1");
@@ -1342,7 +1521,7 @@ fn negative_control_i64_add_vs_plus_one_is_sat() {
 fn negative_control_i64_checked_sub_vs_plus_one_is_sat() {
     let (code, base) = emit_text(&make_bridge_module(Shape::CheckedSub));
     let (machine_out, precondition) =
-        symbolic_machine_output(&code, base).expect("sub path-merge failed");
+        symbolic_machine_output(&code, base, Shape::CheckedSub).expect("sub path-merge failed");
     let proven =
         discharge_equal_under(Logic::QfBv, &precondition, &machine_out, &plus_one(sub_spec()));
     assert!(!proven, "VACUITY CHECK FAILED: i64 sub bytes were 'proven' equal to a-b+1");
@@ -1353,8 +1532,9 @@ fn negative_control_i64_checked_mul_vs_plus_one_is_sat() {
     let (code, base) = emit_text(&make_bridge_module(Shape::CheckedMul));
     let cs: &[i64] = &[1, -1, 7, -6, 1_000_000, 3_000_000_000, i64::MAX, i64::MIN];
     for &c in cs {
-        let (machine_out, precondition) = symbolic_machine_output_b_const(&code, base, c)
-            .unwrap_or_else(|e| panic!("mul path-merge failed for c={c}: {e:?}"));
+        let (machine_out, precondition) =
+            symbolic_machine_output_b_const(&code, base, Shape::CheckedMul, c)
+                .unwrap_or_else(|e| panic!("mul path-merge failed for c={c}: {e:?}"));
         let proven = discharge_equal_under(
             Logic::QfAbv,
             &precondition,
@@ -1370,8 +1550,9 @@ fn negative_control_i64_signed_div_vs_plus_one_is_sat() {
     let (code, base) = emit_text(&make_bridge_module(Shape::SignedDiv));
     let cs: &[i64] = &[2, 3, 7, -2, 3_000_000_000];
     for &c in cs {
-        let (machine_out, precondition) = symbolic_machine_output_b_const(&code, base, c)
-            .unwrap_or_else(|e| panic!("div path-merge failed for c={c}: {e:?}"));
+        let (machine_out, precondition) =
+            symbolic_machine_output_b_const(&code, base, Shape::SignedDiv, c)
+                .unwrap_or_else(|e| panic!("div path-merge failed for c={c}: {e:?}"));
         let proven = discharge_equal_under(
             Logic::QfBv,
             &precondition,
@@ -1387,8 +1568,9 @@ fn negative_control_i64_shl_vs_plus_one_is_sat() {
     let (code, base) = emit_text(&make_bridge_module(Shape::Shl));
     let cs: &[i64] = &[0, 1, 7, 40, 63];
     for &c in cs {
-        let (machine_out, precondition) = symbolic_machine_output_b_const(&code, base, c)
-            .unwrap_or_else(|e| panic!("shl path-merge failed for c={c}: {e:?}"));
+        let (machine_out, precondition) =
+            symbolic_machine_output_b_const(&code, base, Shape::Shl, c)
+                .unwrap_or_else(|e| panic!("shl path-merge failed for c={c}: {e:?}"));
         let proven = discharge_equal_under(
             Logic::QfBv,
             &precondition,
@@ -1396,5 +1578,211 @@ fn negative_control_i64_shl_vs_plus_one_is_sat() {
             &plus_one(shl_by_const_spec(c)),
         );
         assert!(!proven, "VACUITY CHECK FAILED for c={c}: shl bytes 'proven' equal to (a<<{c})+1");
+    }
+}
+
+// ===========================================================================
+// TRAP / DOMAIN CONTROLS. The replay above avoids a BRK only by proving its
+// path UNSAT under the independent source domain. These pin that the pruning
+// cannot swallow a reachable trap, invent a trap, or shrink the domain.
+// ===========================================================================
+
+const GUARDED: [Shape; 4] = [Shape::CheckedSub, Shape::CheckedMul, Shape::SignedDiv, Shape::Shl];
+
+fn assert_brk_refused(result: Result<Formula, ExecError>) {
+    assert!(
+        matches!(result, Err(ExecError::Decode(ref message))
+        if message.contains("effects Brk")
+        && message.contains("aarch64-brk-debug-trap-not-proof-consumed")),
+        "reachable BRK must remain the exact semantics refusal: {result:?}"
+    );
+}
+
+/// The retired premise, pinned structurally: every guarded shape's shared trap
+/// block is ONE `BRK #1` and nothing emits a call (the trap used to be a
+/// `call abort`); the bare add carries no trap at all.
+#[test]
+fn i64_trap_block_is_one_brk_and_no_shape_emits_a_call() {
+    for shape in [Shape::Add, Shape::CheckedSub, Shape::CheckedMul, Shape::SignedDiv, Shape::Shl] {
+        let (code, base) = emit_text(&make_bridge_module(shape));
+        assert_eq!(
+            count_opcode(&code, base, &[Opcode::Bl, Opcode::Blr]),
+            0,
+            "{shape:?} must have no emitted call edge"
+        );
+        let brks = if shape == Shape::Add { 0 } else { 1 };
+        assert_eq!(
+            count_opcode(&code, base, &[Opcode::Brk]),
+            brks,
+            "{shape:?} must carry exactly {brks} BRK (its lowered trap block)"
+        );
+    }
+}
+
+/// A FEASIBLE trap is never pruned: each input that fails its body's assert
+/// reaches the exact BRK refusal, as does a BRK at entry with no branch at all.
+#[test]
+fn feasible_trap_inputs_and_entry_brk_remain_refused() {
+    let cases: [(Shape, &[(i64, i64)]); 4] = [
+        (Shape::CheckedSub, &[(i64::MIN, 1), (i64::MAX, -1), (0, i64::MIN)]),
+        (Shape::CheckedMul, &[(i64::MAX, 2), (i64::MIN, -1), (1 << 32, 1 << 31)]),
+        (Shape::SignedDiv, &[(7, 0), (7, -1), (i64::MIN, -1)]),
+        (Shape::Shl, &[(1, 64), (1, i64::from(u32::MAX))]),
+    ];
+    for (shape, inputs) in cases {
+        let (code, base) = emit_text(&make_bridge_module(shape));
+        for &(a, b) in inputs {
+            assert!(
+                !path_is_feasible(&source_domain(shape, bv64(a.into()), bv64(b.into()))).unwrap(),
+                "fixture: ({a}, {b}) must be outside the {shape:?} source domain"
+            );
+            assert_brk_refused(concrete_run(&code, base, a, b));
+        }
+    }
+    assert_brk_refused(concrete_run(&0xd420_0020u32.to_le_bytes(), 0, 2, 3));
+}
+
+/// The pruning is the independent domain's doing, not the executor's: the SAME
+/// symbolic replays under the vacuous domain `true` admit trapping inputs, so
+/// the BRK arm is feasible and must reach the refusal.
+#[test]
+fn symbolic_replay_without_the_source_domain_reaches_brk_refusal() {
+    // (shape, pinned X1 or fully symbolic). Mul pins X1 so the query stays a
+    // by-constant 128-bit product.
+    for (shape, pinned_b) in [
+        (Shape::CheckedSub, None),
+        (Shape::CheckedMul, Some(2)),
+        (Shape::SignedDiv, None),
+        (Shape::Shl, None),
+    ] {
+        let (code, base) = emit_text(&make_bridge_module(shape));
+        let mut state = MachineState::symbolic();
+        if let Some(c) = pinned_b {
+            state.gpr[1] = bv64(i128::from(c));
+        }
+        assert_brk_refused(
+            run_under_domain(&code, base, state, Formula::Bool(true)).map(|(out, _)| out),
+        );
+    }
+}
+
+#[test]
+fn arbitrary_call_is_not_treated_as_a_trap() {
+    let result = concrete_run(&0x9400_0000u32.to_le_bytes(), 0, 2, 3);
+    assert!(
+        matches!(result, Err(ExecError::Unsupported(ref message))
+        if message.starts_with("call at ")),
+        "a call is not a proved diverging branch: {result:?}"
+    );
+}
+
+#[test]
+fn independent_source_domains_have_exact_boundaries() {
+    let admits = |shape: Shape, a: i64, b: i64| {
+        path_is_feasible(&source_domain(shape, bv64(a.into()), bv64(b.into()))).unwrap()
+    };
+    for (a, b, fits) in [
+        (i64::MIN, 0, true),
+        (i64::MIN, 1, false),
+        (i64::MAX, 0, true),
+        (i64::MAX, -1, false),
+        (-1, i64::MAX, true),
+        (-2, i64::MAX, false),
+        (-1, i64::MIN, true),
+        (0, i64::MIN, false),
+    ] {
+        assert_eq!(admits(Shape::CheckedSub, a, b), fits, "sub domain for {a} - {b}");
+    }
+    for (a, b, fits) in [
+        (i64::MAX, 1, true),
+        (i64::MAX, 2, false),
+        (i64::MIN, 1, true),
+        (i64::MIN, -1, false),
+        (-1, i64::MIN, false),
+        (0, i64::MIN, true),
+        (1 << 31, 1 << 31, true),
+        (1 << 32, 1 << 31, false),
+        (-(1 << 32), 1 << 31, true),
+        (3_000_000_000, 3_000_000_000, true),
+        (3_100_000_000, 3_000_000_000, false),
+    ] {
+        assert_eq!(admits(Shape::CheckedMul, a, b), fits, "mul domain for {a} * {b}");
+    }
+    for (a, b, fits) in [
+        (7, 0, false),
+        (7, -1, false),
+        (i64::MIN, -1, false),
+        (i64::MIN, 1, true),
+        (i64::MIN, -2, true),
+        (-7, 2, true),
+    ] {
+        assert_eq!(admits(Shape::SignedDiv, a, b), fits, "div domain for {a} / {b}");
+    }
+    // Only W1 (the u32 amount) is read; upper X1 bits are the caller's garbage.
+    for (b, fits) in
+        [(0, true), (63, true), (64, false), (i64::from(u32::MAX), false), ((1 << 32) | 5, true)]
+    {
+        assert_eq!(admits(Shape::Shl, 1, b), fits, "shl domain for amount {b:#x}");
+    }
+    assert!(admits(Shape::Add, i64::MAX, 1), "bare add has no assert; it admits every input");
+}
+
+/// The sub/mul domains' `in_i64_range` is exactly the signed-comparison range:
+/// equal for EVERY 128-bit value (UNSAT of their disagreement), and non-vacuous
+/// at the four i64 boundary values on either side.
+#[test]
+fn i64_range_predicates_agree() {
+    let v = Formula::Var("R128".into(), Sort::BitVec(128));
+    let disagree = Formula::Not(Box::new(Formula::Eq(
+        Box::new(in_i64_range(v.clone())),
+        Box::new(in_i64_range_by_comparison(v)),
+    )));
+    assert!(!path_is_feasible(&disagree).unwrap(), "range spellings must agree everywhere");
+    let min = i128::from(i64::MIN);
+    let max = i128::from(i64::MAX);
+    for (value, fits) in [(min, true), (min - 1, false), (max, true), (max + 1, false)] {
+        let v = Formula::BitVec { value, width: 128 };
+        assert_eq!(path_is_feasible(&in_i64_range(v)).unwrap(), fits, "in_i64_range({value})");
+    }
+}
+
+/// Inverting an actual emitted guard must turn in-domain inputs into a
+/// reachable BRK — never into a silently smaller admitted domain.
+#[test]
+fn corrupted_guard_cannot_shrink_the_input_domain() {
+    // (shape, in-domain concrete (a, b), pinned X1 for the symbolic replay).
+    let cases = [
+        (Shape::CheckedSub, (2, 3), None),
+        (Shape::CheckedMul, (6, 7), Some(7)),
+        (Shape::SignedDiv, (7, 2), Some(2)),
+        (Shape::Shl, (1, 4), Some(4)),
+    ];
+    assert_eq!(cases.map(|(shape, ..)| shape), GUARDED, "cover every guarded shape");
+    for (shape, (a, b), pinned_b) in cases {
+        let (code, base) = emit_text(&make_bridge_module(shape));
+        assert!(concrete_run(&code, base, a, b).is_ok(), "{shape:?}: uncorrupted run returns");
+        let guards: Vec<_> = code
+            .chunks_exact(4)
+            .enumerate()
+            .filter_map(|(index, bytes)| {
+                let bytes: [u8; 4] = bytes.try_into().unwrap();
+                (decode_aarch64(&bytes, base + (index * 4) as u64).unwrap().opcode == Opcode::BCond)
+                    .then_some(index * 4)
+            })
+            .collect();
+        let expected = if shape == Shape::SignedDiv { 2 } else { 1 };
+        assert_eq!(guards.len(), expected, "{shape:?} fixture: actual guard branch count");
+        for offset in guards {
+            let mut corrupted = code.clone();
+            // Flip B.cond bit 0: the condition is inverted (NE <-> EQ).
+            let word = u32::from_le_bytes(corrupted[offset..offset + 4].try_into().unwrap()) ^ 1;
+            corrupted[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            assert_brk_refused(concrete_run(&corrupted, base, a, b));
+            let symbolic = match pinned_b {
+                None => symbolic_machine_output(&corrupted, base, shape),
+                Some(c) => symbolic_machine_output_b_const(&corrupted, base, shape, c),
+            };
+            assert_brk_refused(symbolic.map(|(out, _)| out));
+        }
     }
 }

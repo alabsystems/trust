@@ -9,6 +9,7 @@ use_field_init_shorthand = true
 # Files to ignore. Each entry uses gitignore syntax, but `!` prefixes aren't allowed.
 ignore = [
     "/build/",
+    "/build.noindex/", # Trust: the Spotlight-excluded home `build` links to.
     "/*-build/",
     "/build-*/",
     "/vendor/",
@@ -43,16 +44,277 @@ ignore = [
     # not made to parse. Measured 2026-08-23; `decreases` itself compiles fine
     # under `trustc` in both signature forms.
     #
-    # ALL the Trust-grammar fixture trees are listed, not just the one that
-    # happened to fail: `x.py fmt` checks only files MODIFIED against the base,
-    # so which of these trips the gate depends on what a given branch touched.
-    # Enumerated by scanning for signature-position clauses
-    # (`decreases`/`requires`/`ensures`/`invariant`) across `tests/`.
+    # The Trust-grammar fixture trees are listed, because `x.py fmt` checks only
+    # files MODIFIED against the base, so which of them trips the gate depends on
+    # what a given branch touched.
+    #
+    # CORRECTED 2026-09-27: this comment used to open "ALL the Trust-grammar
+    # fixture trees are listed", and that was FALSE in two ways. The enumeration
+    # it describes scanned `tests/` only, so it never looked at `crates/`,
+    # `targo-trust/` or `examples/` — where 20 tracked files use the grammar, 16 of
+    # them PRODUCTION `crates/trust-*/src/lib.rs` — and it also missed four `tests/`
+    # subtrees. Both sets are listed further down now. The claim went unchallenged
+    # because `fmt check` could not run at all on the maintainer box (see
+    # docs/issues/2026-09-27-fmt-check-is-inert-and-731-files-have-drifted.md), so
+    # nothing ever contradicted it. Do not restore the word "ALL" without a scan
+    # that covers every tracked tree.
+    # Trust: `reports/` is EVIDENCE, not code this repo owns. Measured 2026-09-27:
+    # 69 `.rs` files under it are unformatted, and 30 of those are
+    # `reports/2026-09-17-consolidation-checkpoint/ay-tip-97911-review01/tip-blobs/`
+    # — verbatim captures of another repo's tip, taken so a review could be
+    # re-read later (that archive has since been deleted with the other
+    # 2026-09-17/18 session archives; `git show 3a8b044122:<path>` reads it).
+    # Formatting a capture does not tidy it, it falsifies it:
+    # the file stops being what was captured. Same disposition as the pinned
+    # fixture SOURCE trees below, and for the same reason. A report may also
+    # quote a deliberately malformed program.
+    "/reports/",
     "/tests/two-language-battery/",
     "/tests/e6-fragment-probe/probes/",
     "/tests/run-make/trust-certified-loop-monitors/",
     "/tests/run-make/trust-certified-tailcall-monitor/",
+    # Trust (T9): `checked_div`'s `requires` is the planted loss of the
+    # committed-baseline acceptance.
+    "/tests/fixtures/obligation-ids/",
     "/tests/trust-provability/directions/",
+
+    # ---------------------------------------------------------------------
+    # Trust: A GATE READS THESE EXACT BYTES. Added 2026-09-27, after the
+    # formatter was made to run again and the trees it would have rewritten were
+    # enumerated for the first time.
+    # ---------------------------------------------------------------------
+
+    # The 19 strict-lane gates MUTATE these files by verbatim source anchor and
+    # exit 3 when an anchor no longer matches exactly once (the helper is
+    # scripts/trust_hex_strict_gate.sh). 131 anchors across the 19 gates, several
+    # of which include a contract clause itself. Every one of these files also
+    # uses the Trust spec grammar in signature or loop position, which is reason
+    # enough on its own — stock rustfmt cannot parse them.
+    "crates/trust-align/src/lib.rs",
+    "crates/trust-bitfield/src/lib.rs",
+    "crates/trust-bits/src/lib.rs",
+    "crates/trust-budget/src/lib.rs",
+    "crates/trust-checksum/src/lib.rs",
+    "crates/trust-endian/src/lib.rs",
+    "crates/trust-fixed/src/lib.rs",
+    "crates/trust-floatbits/src/lib.rs",
+    "crates/trust-hex/src/lib.rs",
+    "crates/trust-index/src/lib.rs",
+    "crates/trust-intbound/src/lib.rs",
+    "crates/trust-interval/src/lib.rs",
+    "crates/trust-modular/src/lib.rs",
+    "crates/trust-radix64/src/lib.rs",
+    "crates/trust-ratio/src/lib.rs",
+    "crates/trust-timearith/src/lib.rs",
+    "crates/trust-utf/src/lib.rs",
+    "crates/trust-varint/src/lib.rs",
+    "crates/trust-widthconv/src/lib.rs",
+
+    # Read as TEXT by an `include_str!` scan whose needles are code spans — e.g.
+    # `"fat_shape(inner_rty"` and an `ends_with("if ")` — so a line break INSIDE a
+    # needle deletes it, and the pin then either fails or, worse, passes
+    # vacuously. `crates/trust-thir-lower/src/lib.rs` alone holds 56 such scan
+    # sites. (The four already-listed `crates/trust-thir-lower/src/*.rs` and
+    # `crates/trust-clean/src/*reflect.rs` rows above are the same class.)
+    "crates/trust-thir-lower/src/lib.rs",
+    "crates/trust-thir-lower/src/source_scan.rs",
+    "crates/trust-thir-lower/src/flip.rs",
+    "crates/trust-thir-lower/src/instance_flip.rs",
+    "crates/trust-thir-lower/src/to_mir.rs",
+    "crates/trust-thir-lower/src/remap_certificate.rs",
+    "crates/trust-thir-lower/src/clean_origin_join.rs",
+    "crates/trust-clean/src/prove.rs",
+    "crates/trust-symbols/src/lib.rs",
+    "crates/trust-report/src/report_builder.rs",
+    "crates/trust-vcgen/src/sep_engine.rs",
+    "crates/trust-spec-temporal/src/lib.rs",
+    "crates/trust-spec-temporal/src/r5_parity.rs",
+    "crates/trust-cg-bridge/src/verify_output.rs",
+    "crates/trust-cg-bridge/src/verify_output_trust_ir.rs",
+    "crates/trust-clean-ir-gate/src/lib.rs",
+    "crates/trust-clean-ir/src/lib.rs",
+    "crates/trust-strengthen/src/trust_wp_oracle.rs",
+    "compiler/rustc_mir_transform/src/clean_origin_ir.rs",
+    "targo-trust/src/lean_build.rs",
+    "targo-trust/src/temporal_cli.rs",
+
+    # A fixture is an INPUT whose committed OUTPUT was captured from these exact
+    # bytes: the dumps beside them record `"file": "SOURCE.rs"` together with
+    # `"line": N`. Same disposition as the `crates/trust-clean/fixtures/*/SOURCE/`
+    # row above, one level wider so the next fixture tree is covered on arrival
+    # rather than after it breaks.
+    "crates/*/fixtures/",
+    "crates/*/tests/fixtures/",
+    "targo-trust/tests/fixtures/",
+
+    # Trust-grammar / Clean-island trees the `tests/`-only enumeration missed.
+    # Same one-line reason as `/tests/two-language-battery/`: a not-formattable
+    # fixture is ignored, not made to parse.
+    "/tests/two-language-programs/",
+    "/tests/self-proof/",
+    "/tests/run-make/trust-*/",
+    "/tests/daily-driver-realistic/lean/",
+    "/examples/contracts/",
+
+    # ---------------------------------------------------------------------
+    # Trust: A GATE READS THESE EXACT BYTES — second pass, 2026-09-27, over the
+    # 527 files the first pass left. It turned up FIVE mechanisms the first
+    # scan did not look for, so treat this list as "what has been measured",
+    # never as "what exists". Two are verified here by direct measurement; the
+    # rest carry the citation that established them.
+    # ---------------------------------------------------------------------
+
+    # THE VERIFIED BUILD RE-HASHES THIS FILE AND REFUSES ON MISMATCH. It is
+    # digest-pinned in the proc-macro TCB allowlist
+    # (src/tools/targo/src/cargo/core/compiler/mod.rs:1245,
+    # `lib_sha256: "853603e0…"`), and mod.rs:1128 returns
+    # `does not match its audited source identity` when the re-hash differs.
+    # MEASURED 2026-09-27: the live file hashes to exactly that value at 8220
+    # bytes. So a `cargo fmt` over `crates/` would break EVERY verified build,
+    # not one test. Moving that pin is a TCB audit, never a formatting side
+    # effect.
+    "crates/trust-spec/src/lib.rs",
+
+    # FROZEN SEMANTICS: docs/trust-core/semantics-retirement.toml pins these
+    # trees' content digest AND LINE COUNT. MEASURED 2026-09-27: the
+    # `Trust.MirSem` row carries `freeze = "design"`,
+    # `own_paths = ["crates/trust-clean/src/mirsem/"]` and
+    # `baseline = { files = 35, lines = 78248, digest = "2fed6873…" }`. A reformat
+    # changes the line count, so it breaks the freeze by construction, and no
+    # sanctioned `change_class` admits one. Whole trees rather than the drifted
+    # files, because the digest covers every member.
+    "crates/trust-clean/src/mirsem/",
+    "crates/trust-clean/src/trustir_*.rs",
+
+    # A committed ledger records an EXACT LINE into these and the checker slices
+    # the file at that line (`scripts/trust_core/common.py`'s `Resolver.check`
+    # does `cited = lines[start-1:end]` then matches the quote).
+    "crates/trust-certify/src/finite_dfa_from_ir.rs",
+    "crates/trust-types/src/admissible_body.rs",
+
+    # Read as TEXT by a harness. `admissible_body.rs` above is also read through a
+    # FIXED BYTE-OFFSET WINDOW (`&reader[chain_start..chain_start + 1_200]` in
+    # crates/trust-clean-origin/tests/table_controls.rs), which is the silent
+    # variant of class 3: no needle has to break for the window to stop covering
+    # what it was cut to cover.
+    "crates/trust-certify/src/checker_core_is_whnf.rs",
+    "crates/trust-clean-origin/src/reflect.rs",
+    "crates/trust-mir-extract/src/lib.rs",
+    "crates/trust-types/src/model.rs",
+    "crates/trust-thir-lower/probes/",
+
+    # Trust spec grammar inside a `macro_rules!` invocation body rather than a
+    # bare item — the grammar class, in a spelling a scan for signature-position
+    # clauses does not find.
+    "crates/trust-spec-elab/src/lib.rs",
+
+    # A `fixtures/` directory NESTED UNDER `src/`, which neither
+    # `crates/*/fixtures/` nor `crates/*/tests/fixtures/` matches: archived
+    # live-compiler ICE reproductions. A glob gap that reads as covered.
+    "crates/trust-thir-lower/src/generated_coroutine/fixtures/",
+
+    # `tests/data/` holds inputs whose committed outputs record a line into them,
+    # and it is not `fixtures/`, so the existing globs miss it.
+    "crates/*/tests/data/",
+
+    # FIFTH MECHANISM (tests/): a shell driver `sed`s each row's expectation out
+    # of the fixture's OWN header — `sed -n 's|^//@ trust-ladder: *||p'` in
+    # scripts/open_dispatch_ladder.sh — and then `[ -n "$exp" ] || continue`. A
+    # directive that moves does not fail the row, it DELETES it, and the lane
+    # pins no denominator, so losing every directive prints
+    # `0 as recorded, 0 diverged` and exits 0. The same needle-search-that-fails-
+    # OPEN shape covers the next three trees.
+    "/tests/open-dispatch-ladder/",
+    "/tests/closure-slice-facts/",
+    "/tests/fn-pointer-witness/",
+    "/tests/vec-literal-lowering/",
+
+    # Committed artifacts record line AND column into these fixtures.
+    "/tests/trust-falsification/",
+
+    # SIXTH MECHANISM: a production file quotes a fixture's source VERBATIM as
+    # the record of a measurement and cites it by path
+    # (compiler/rustc_mir_transform/src/trust_verify/fmt_writer_relative.rs
+    # renders this tree's `i01_error_enum_with_debug.rs` inside a fence). No
+    # harness reads it, no artifact records a line, nothing goes red — the quote
+    # just becomes silently untrue, which is why none of the earlier classes
+    # could catch it.
+    "/tests/idiomatic-rust-sample/",
+
+    # One file, not the tree: crates/trust-certify/tests/
+    # unbounded_allocation_scaled_count_certification.rs pins
+    # `SourceSpan { file: "s20.rs", line_start: 1, col_start: 38, … }`, and s20.rs
+    # is a single line whose subject expression starts at column 38. The rest of
+    # the sweep is mechanical.
+    "/tests/ordinary-rust-sweep/s20.rs",
+
+    # ---------------------------------------------------------------------
+    # Trust: AN ENFORCED LINE CITATION POINTS INTO THESE (third pass,
+    # 2026-09-27, organised by MECHANISM rather than by tree). The ledgers under
+    # `docs/trust-core/` cite a source line and a quote, and
+    # `scripts/trust_core/common.py`'s `Resolver.check` slices `lines[start-1:end]`
+    # and requires the quote INSIDE that slice. Move the line, break the gate.
+    #
+    # This is not hypothetical and it is not someone else's mistake: the
+    # 38-file reformat in `c028cfd8cef` MOVED a cited line and shipped it.
+    # `docs/trust-core/mir-constructor-table.toml:1413` and `:1432` cited
+    # `by_move_body.rs:259` for
+    # `body_def.mir_built(tcx.arena.alloc(Steal::new(by_move_body)));`; the
+    # reformat reflowed the call above it from one line to six and moved the
+    # statement to 262, leaving `&by_move_body,` at 259.
+    #
+    # RESOLVED BY RE-BLESSING, NOT BY REVERTING — and by the other lane, not here.
+    # This entry first went in alongside a revert of that file's formatting, which
+    # restored the cited bytes. Concurrently, the trust-core lane re-pinned the
+    # ledger to `c028cfd8ce` and moved both citations to `:262`
+    # (`2db97a27bf2`). Their resolution was already published, so the revert was
+    # dropped on the merge and the file stays formatted; the citations resolve at
+    # 262. The entry stays, because what it prevents is the NEXT move.
+    #
+    # WHY A POST-HOC "IS ANYTHING AT RISK?" CHECK SAID NO: every line-cited file
+    # is formatter-CLEAN once it has been formatted, so a scan run AFTER a reformat
+    # reports zero files at risk while being blind to the one just broken. Ask
+    # before, not after.
+    "compiler/rustc_mir_transform/src/coroutine/by_move_body.rs",
+    "crates/trust-clean/tests/lean_clean_bridge.rs",
+    "crates/trust-machine-sem/src/lib.rs",
+    "crates/trust-symex/src/lib.rs",
+    "crates/trust-transval/src/lib.rs",
+    "crates/trust-vcgen/src/range.rs",
+    "targo-trust/src/main.rs",
+    "targo-trust/src/script_cli.rs",
+
+    # A SECOND FROZEN-SEMANTICS TREE, same class as `crates/trust-clean/src/mirsem/`
+    # above and missed by the previous pass. VERIFIED 2026-09-27 by recomputing
+    # `files_digest` (sha256 over sorted `repo:path NUL sha256(content)` lines):
+    # row S5 is `freeze = "design"`, `own_paths = ["crates/trust-semantics/"]`,
+    # `baseline = { files = 1, lines = 840, digest = "7b86c8f7ab1c…" }`, and the live
+    # tree reproduces that digest EXACTLY at 840 lines. A freeze breaks on any
+    # content change, not merely a line move, so this is build/gate-breaking rather
+    # than a red test. Five enforced citations point into it as well.
+    "crates/trust-semantics/",
+
+    # A third sweep found ~56 candidate patterns; only the ones above are listed,
+    # because only they were verified here by reading the reader and, where the
+    # claim was build-breaking, by recomputing the pin. The rest are recorded in
+    # docs/issues/2026-09-27-fmt-check-is-inert-and-731-files-have-drifted.md
+    # rather than pasted in. In particular the sweep proposed ignoring whole
+    # UPSTREAM trees (`library/core/src/`, `compiler/rustc_middle/src/mir/`,
+    # `compiler/rustc_mir_transform/src/`, …) because ledger citations point into
+    # them. That is refused for the same reason `/tests/mir-opt/` is refused just
+    # below: exempting an upstream tree diverges the fork from a discipline it
+    # inherits. A citation into upstream text is re-blessed, not protected by
+    # switching the formatter off.
+
+    # NOT ignored, deliberately, though their layout IS load-bearing:
+    # `/tests/mir-opt/` (the `.mir` goldens embed `$DIR/<file>.rs:LINE:COL`),
+    # `/tests/coverage/` and `/tests/coverage-run-rustdoc/` (the `.coverage`
+    # goldens reproduce the source verbatim, line by line), and
+    # `/tests/run-make/rustdoc-error-lines/` (pins `input.rs:8:15` in its own
+    # recipe). These are UPSTREAM trees where upstream enforces rustfmt, so
+    # ignoring them here would silently diverge the fork from the discipline it
+    # inherits. Reformatting them requires re-blessing their goldens in the same
+    # commit, which is a separate, sequenced job — not a mechanical sweep.
 
     # Do not format submodules.
     # Trust: first-party siblings own their own formatting — each is a separate
@@ -87,6 +349,17 @@ ignore = [
     "crates/trust-thir-lower/src/flip_registry.rs",
     "crates/trust-thir-lower/src/crate_module.rs",
     "crates/trust-thir-lower/src/differential.rs",
+    # Trust (R8-SEAM): verbatim copies of the pre-R8-SEAM text of the two frozen files above, kept
+    # as the cross-check oracles of their rewrite; a reformat would break "verbatim".
+    "crates/trust-thir-lower/src/differential/compare_entries_reference.rs",
+    "crates/trust-thir-lower/src/crate_module/seam_reference.rs",
+    # Trust (2026-10-14): frozen BYTE-IDENTICAL in scripts/frozen-files.txt after this list was
+    # last swept (moved out of crate_module.rs), and NOT formatter-clean at their pinned blobs
+    # (measured: 39, 4 and 2 trustfmt hunks). A `fmt` pass would move each blob and fail the
+    # oracle-freeze push lane. The other 20 frozen `.rs` files are formatter-clean or listed.
+    "crates/trust-thir-lower/src/direct_obligations.rs",
+    "crates/trust-thir-lower/src/lineage.rs",
+    "crates/trust-thir-lower/src/uniform_array_spelling.rs",
     "library/backtrace",
     "library/compiler-builtins",
     "library/portable-simd",

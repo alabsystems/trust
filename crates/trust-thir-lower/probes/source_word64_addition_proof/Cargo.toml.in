@@ -1,0 +1,17 @@
+[package]
+name="actual-thir-word64-addition-proof"
+version="0.0.0"
+edition="2021"
+[workspace]
+[dependencies]
+clean-kernel={path="../clean-source/crates/clean-kernel"}
+clean-verify={path="../clean-source/crates/clean-verify",features=["source-ir-word64-addition"]}
+clean-rust-sem={path="../clean-source/crates/clean-rust-sem"}
+trust-ir={path="../ir-source/crates/trust-ir",default-features=false,features=["serde","parser","fmt","binary"]}
+trust-ir-build={path="../ir-source/crates/trust-ir-build",default-features=false,features=["source-addition-data"]}
+serde_json={version="1.0",features=["unbounded_depth"]}
+serde="1.0"
+[patch."https://github.com/alabsystems/clean.git"]
+clean-kernel={path="../clean-source/crates/clean-kernel"}
+clean-mathverse={path="../clean-source/crates/clean-mathverse"}
+clean-olean={path="../clean-source/crates/clean-olean"}

@@ -21,7 +21,7 @@ fn assert_ptr_metadata_malformed_fails_closed(func: &VerifiableFunction) {
 /// unconditional bound false-PROVEs `len + k`). Pins the gate.
 #[test]
 fn slice_len_upper_bound_gate_excludes_zst() {
-    use super::ty_is_definitely_non_zst;
+    use trust_types::alloc_model::ty_is_definitely_nonzero_sized as ty_is_definitely_non_zst;
     // Provably non-ZST (>= 1 byte): upper bound is sound.
     assert!(ty_is_definitely_non_zst(&Ty::Int { width: 8, signed: false }));
     assert!(ty_is_definitely_non_zst(&Ty::Int { width: 32, signed: false })); // char
@@ -31,10 +31,15 @@ fn slice_len_upper_bound_gate_excludes_zst() {
     assert!(ty_is_definitely_non_zst(&Ty::Ref { mutable: false, inner: Box::new(Ty::Bool) }));
     // Struct/tuple with a non-ZST field is non-ZST (no regression on &[Struct]).
     assert!(ty_is_definitely_non_zst(&Ty::Tuple(vec![Ty::Unit, Ty::Bool])));
-    assert!(ty_is_definitely_non_zst(&Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-        variants: Vec::new(),
+    assert!(ty_is_definitely_non_zst(&Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
         name: "S".into(),
-        fields: vec![("a".into(), Ty::Unit), ("b".into(), Ty::Int { width: 8, signed: false })],
+        fields: vec![("a".into(), Ty::Unit), ("b".into(), Ty::Int { width: 8, signed: false })]
+            .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -43,10 +48,14 @@ fn slice_len_upper_bound_gate_excludes_zst() {
     assert!(!ty_is_definitely_non_zst(&Ty::Unit));
     assert!(!ty_is_definitely_non_zst(&Ty::Tuple(vec![])));
     assert!(!ty_is_definitely_non_zst(&Ty::Tuple(vec![Ty::Unit, Ty::Unit])));
-    assert!(!ty_is_definitely_non_zst(&Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-        variants: Vec::new(),
+    assert!(!ty_is_definitely_non_zst(&Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
         name: "Z".into(),
-        fields: vec![],
+        fields: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -55,6 +64,289 @@ fn slice_len_upper_bound_gate_excludes_zst() {
         elem: Box::new(Ty::Int { width: 8, signed: false }),
         len: 0,
     }));
+}
+
+// ZST-ENUM-SLICE-LEN-1 (2026-10-11). The extractor renders an enum with a
+// flattened `fields` view whose FIRST entry is a synthetic `__tag: isize`, plus a
+// per-variant `variants` list. The old predicate read only `fields`, so the
+// `__tag` made EVERY enum non-ZST and a `&[One]` (`enum One { A }`, a ZST) took the
+// `len <= isize::MAX` ceiling: `a.len() * 2` was proved, kernel-certified and its
+// overflow check elided. These helpers build the extractor's own shape
+// (`trust_mir_extract::ty_convert::lower_enum_adt`: `__tag` first, then
+// `__v{variant}_{field}`, `adt_kind: Some(Enum)`, `layout: None` on the verifier
+// lane). The table below is mirrored row for row in
+// `trust_ir_bridge::lower::native_len_bound_tests::non_zst_table_mirrors_trust_vcgen`.
+
+fn zst_enum_adt(name: &str, variants: Vec<(&str, Vec<Ty>)>) -> Ty {
+    let mut fields = vec![("__tag".to_string(), Ty::Int { width: 64, signed: true })];
+    let mut defs = Vec::new();
+    for (v_idx, (v_name, v_fields)) in variants.into_iter().enumerate() {
+        let named: Vec<(String, Ty)> =
+            v_fields.into_iter().enumerate().map(|(i, t)| (i.to_string(), t)).collect();
+        for (f_name, t) in &named {
+            fields.push((format!("__v{v_idx}_{f_name}"), t.clone()));
+        }
+        defs.push(trust_types::VariantDef {
+            name: v_name.to_string(),
+            discriminant: v_idx as i128,
+            fields: named,
+        });
+    }
+    Ty::Adt {
+        name: name.into(),
+        fields: fields.into(),
+        variants: defs.into(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        layout: None,
+        enum_layout: None,
+        adt_kind: Some(trust_types::AdtKind::Enum),
+    }
+}
+
+fn zst_struct_adt(name: &str, fields: Vec<(&str, Ty)>) -> Ty {
+    Ty::Adt {
+        name: name.into(),
+        fields: fields.into_iter().map(|(n, t)| (n.to_string(), t)).collect::<Vec<_>>().into(),
+        variants: Vec::new().into(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        layout: None,
+        enum_layout: None,
+        adt_kind: Some(trust_types::AdtKind::Struct),
+    }
+}
+
+fn with_layout_size(ty: Ty, size: u64) -> Ty {
+    let Ty::Adt {
+        name,
+        fields,
+        variants,
+        disc_index_safe,
+        faithful_enum_repr,
+        arbitrary_precision,
+        validity_wrapper,
+        enum_layout,
+        adt_kind,
+        ..
+    } = ty
+    else {
+        panic!("with_layout_size takes a Ty::Adt");
+    };
+    Ty::Adt {
+        name,
+        fields,
+        variants,
+        disc_index_safe,
+        faithful_enum_repr,
+        arbitrary_precision,
+        validity_wrapper,
+        layout: Some(Box::new(trust_types::AdtLayoutInfo {
+            size,
+            align: 1,
+            field_offsets: Vec::new(),
+            repr: "rust".into(),
+        })),
+        enum_layout,
+        adt_kind,
+    }
+}
+
+/// `core::convert::Infallible` as the extractor renders it: an enum with no
+/// variant, whose flattened view is the lone `__tag`.
+fn zst_infallible() -> Ty {
+    zst_enum_adt("core::convert::Infallible", vec![])
+}
+
+/// `(label, ty, expected ty_is_definitely_non_zst)`. Every `false` row is a ZST
+/// (or, for `repr_u8_one_variant_unstamped`, a shape the verifier lane cannot
+/// size); every `true` row is at least one byte.
+fn zst_enum_non_zst_table() -> Vec<(&'static str, Ty, bool)> {
+    let u8_ = Ty::Int { width: 8, signed: false };
+    let u32_ = Ty::Int { width: 32, signed: false };
+    let param = Ty::Unsupported {
+        kind: "TyKind::Param".into(),
+        detail: "generic parameter T/#0 needs monomorphization".into(),
+    };
+    let one = zst_enum_adt("One", vec![("A", vec![])]);
+    let rep = zst_enum_adt("Rep", vec![("A", vec![])]);
+    let wrap = zst_struct_adt("Wrap", vec![("x", one.clone())]);
+    vec![
+        // ZSTs. Each was `true` before the fix (the `__tag` field).
+        ("one_variant", one.clone(), false),
+        ("one_variant_unit_payload", zst_enum_adt("OneP", vec![("A", vec![Ty::Unit])]), false),
+        (
+            "uninhabited_second",
+            zst_enum_adt("Two", vec![("A", vec![]), ("B", vec![zst_infallible()])]),
+            false,
+        ),
+        (
+            "option_infallible",
+            zst_enum_adt(
+                "core::option::Option<core::convert::Infallible>",
+                vec![("None", vec![]), ("Some", vec![zst_infallible()])],
+            ),
+            false,
+        ),
+        (
+            "option_generic",
+            zst_enum_adt("core::option::Option<T>", vec![("None", vec![]), ("Some", vec![param])]),
+            false,
+        ),
+        ("wrapped", wrap.clone(), false),
+        ("tuple_of_zst_enum", Ty::Tuple(vec![one.clone(), Ty::Unit]), false),
+        ("array_of_zst_enum", Ty::Array { elem: Box::new(one.clone()), len: 4 }, false),
+        ("infallible", zst_infallible(), false),
+        (
+            "unstamped_variantless",
+            Ty::Adt {
+                name: "Void".into(),
+                fields: vec![("__tag".to_string(), Ty::Int { width: 64, signed: true })].into(),
+                variants: Vec::new().into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+                layout: None,
+                enum_layout: None,
+                adt_kind: None,
+            },
+            false,
+        ),
+        ("wrapped_layout_zero", with_layout_size(wrap, 0), false),
+        // The accepted capability cost: `#[repr(u8)] enum Rep { A }` is one byte,
+        // but the verifier lane stamps no enum layout, so it is not provably sized.
+        ("repr_u8_one_variant_unstamped", rep.clone(), false),
+        ("zero_width_bv", Ty::Bv(0), false),
+        // At least one byte.
+        ("two_variant_fieldless", zst_enum_adt("Real", vec![("A", vec![]), ("B", vec![])]), true),
+        (
+            "three_variant_fieldless",
+            zst_enum_adt(
+                "core::cmp::Ordering",
+                vec![("Less", vec![]), ("Equal", vec![]), ("Greater", vec![])],
+            ),
+            true,
+        ),
+        (
+            "option_u32",
+            zst_enum_adt("core::option::Option<u32>", vec![("None", vec![]), ("Some", vec![u32_])]),
+            true,
+        ),
+        ("repr_u8_one_variant_stamped", with_layout_size(rep, 1), true),
+        (
+            "struct_with_sized_field",
+            zst_struct_adt("S", vec![("a", Ty::Unit), ("b", u8_.clone())]),
+            true,
+        ),
+        ("tuple_of_zst_enum_and_u8", Ty::Tuple(vec![one, u8_.clone()]), true),
+        ("vec", Ty::Seq { elem: Box::new(Ty::Unit), drop_auth: None }, true),
+        ("u8", u8_, true),
+    ]
+}
+
+#[test]
+fn slice_len_upper_bound_gate_excludes_zst_enums() {
+    use super::ty_is_definitely_non_zst;
+    let mut wrong = Vec::new();
+    for (label, ty, expected) in zst_enum_non_zst_table() {
+        if ty_is_definitely_non_zst(&ty) != expected {
+            wrong.push(format!("{label}: expected {expected}"));
+        }
+    }
+    assert!(wrong.is_empty(), "ty_is_definitely_non_zst disagrees on: {wrong:#?}");
+}
+
+/// `fn f(a: &[elem]) -> usize { let n = PtrMetadata(a); n }`.
+fn zst_enum_slice_len_read(elem: Ty) -> VerifiableFunction {
+    VerifiableFunction {
+        name: "f".into(),
+        def_path: "test::f".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::usize(), name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref {
+                        mutable: false,
+                        inner: Box::new(Ty::Slice { elem: Box::new(elem) }),
+                    },
+                    name: Some("a".into()),
+                },
+                LocalDecl { index: 2, ty: Ty::usize(), name: Some("n".into()) },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(2),
+                    rvalue: Rvalue::UnaryOp(UnOp::PtrMetadata, Operand::Copy(Place::local(1))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// The consumer, end to end: `conjoin_slice_len_bounds` over the overflow goal
+/// of `a.len() * 2` must attach `a__slice_len <= isize::MAX` for a sized element
+/// and must NOT attach it for `&[One]`. Before the fix the `&[One]` arm attached
+/// it, which is what let the solver prove `len * 2` cannot overflow.
+#[test]
+fn zst_enum_slice_len_takes_no_isize_ceiling() {
+    let ceiling_attached = |elem: Ty| -> bool {
+        let func = zst_enum_slice_len_read(elem);
+        let Some(len @ Formula::Var(..)) =
+            crate::slice_len_formula(&func, &Operand::Copy(Place::local(1)))
+        else {
+            panic!("a slice place must mint a `__slice_len` var");
+        };
+        // `len * 2 > usize::MAX`, the overflow witness the mul row asks about.
+        let goal = Formula::Gt(
+            Box::new(Formula::Mul(Box::new(len.clone()), Box::new(Formula::Int(2)))),
+            Box::new(Formula::Int(u64::MAX as i128)),
+        );
+        let ceiling = Formula::Le(Box::new(len), Box::new(Formula::Int(i64::MAX as i128)));
+        match super::conjoin_slice_len_bounds(&func, goal.clone()) {
+            Formula::And(conjuncts) => {
+                assert_eq!(conjuncts.last(), Some(&goal), "the goal stays the last conjunct");
+                conjuncts.contains(&ceiling)
+            }
+            other => {
+                assert_eq!(other, goal, "no bound at all must leave the goal unchanged");
+                false
+            }
+        }
+    };
+    assert!(ceiling_attached(Ty::Int { width: 8, signed: false }), "control: &[u8] is bounded");
+    assert!(
+        ceiling_attached(zst_enum_adt("Real", vec![("A", vec![]), ("B", vec![])])),
+        "control: a two-variant fieldless enum is one byte"
+    );
+    assert!(
+        !ceiling_attached(zst_enum_adt("One", vec![("A", vec![])])),
+        "`&[One]` (enum One {{ A }}, a ZST) can be usize::MAX long"
+    );
+    assert!(
+        !ceiling_attached(zst_enum_adt(
+            "core::option::Option<core::convert::Infallible>",
+            vec![("None", vec![]), ("Some", vec![zst_infallible()])],
+        )),
+        "`&[Option<Infallible>]` is a ZST slice"
+    );
 }
 
 /// Build `fn f(p: <operand_ty>) { let _2 = PtrMetadata(Copy(_1)); }` so the
@@ -101,6 +393,7 @@ fn ptr_metadata_fn(operand_ty: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -162,6 +455,7 @@ fn recursive_adt_return_and_params_emit_no_unsupported_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let unsupported = unsupported_mir_vcs(&func)
         .into_iter()
@@ -207,6 +501,7 @@ fn non_recursive_unsupported_type_still_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let unsupported = unsupported_mir_vcs(&func)
         .into_iter()
@@ -264,6 +559,7 @@ fn recursive_adt_constructor_with_inner_overflow_still_emits_overflow_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = generate_vcs(&func);
     assert!(
@@ -316,6 +612,7 @@ fn generic_param_declaration_emits_no_unsupported_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let unsupported = unsupported_mir_vcs(&func)
         .into_iter()
@@ -371,6 +668,7 @@ fn generic_param_relaxation_is_param_specific() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let markers: Vec<String> = unsupported_mir_vcs(&func)
         .into_iter()
@@ -435,6 +733,7 @@ fn generic_function_inner_overflow_still_emits_overflow_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = generate_vcs(&func);
     assert!(
@@ -485,6 +784,7 @@ fn unmodeled_array_declaration_emits_no_unsupported_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let unsupported = unsupported_mir_vcs(&func)
         .into_iter()
@@ -530,6 +830,7 @@ fn unmodeled_array_relaxation_is_array_specific() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let markers: Vec<String> = unsupported_mir_vcs(&func)
         .into_iter()
@@ -683,10 +984,14 @@ fn try_into_unwrap_fn(start: u128, end: u128, arr_len: u64, result_ty: Ty) -> Ve
     let arr = Ty::Array { elem: Box::new(Ty::Int { width: 8, signed: false }), len: arr_len };
     let slice_ref =
         Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
-    let range_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-        variants: Vec::new(),
+    let range_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
         name: "core::ops::Range".into(),
-        fields: vec![],
+        fields: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -730,6 +1035,9 @@ fn try_into_unwrap_fn(start: u128, end: u128, arr_len: u64, result_ty: Ty) -> Ve
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::ops::index::Index::index",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -746,6 +1054,9 @@ fn try_into_unwrap_fn(start: u128, end: u128, arr_len: u64, result_ty: Ty) -> Ve
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::convert::TryInto::try_into",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -762,6 +1073,9 @@ fn try_into_unwrap_fn(start: u128, end: u128, arr_len: u64, result_ty: Ty) -> Ve
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::result::Result::<T, E>::unwrap",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -775,17 +1089,23 @@ fn try_into_unwrap_fn(start: u128, end: u128, arr_len: u64, result_ty: Ty) -> Ve
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
 fn result_array(n: u64) -> Ty {
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-        variants: Vec::new(),
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
         name: "core::result::Result".into(),
         fields: vec![
             ("0".into(), Ty::Array { elem: Box::new(Ty::u8()), len: n }),
             ("1".into(), Ty::Unit),
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -858,10 +1178,14 @@ fn arbitrary_result_unwrap_is_still_flagged() {
                 LocalDecl { index: 0, ty: Ty::u64(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-                        variants: Vec::new(),
+                    ty: Ty::Adt {
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                        adt_kind: None,
+                        layout: None,
+                        variants: Vec::new().into(),
                         name: "core::result::Result".into(),
-                        fields: vec![("0".into(), Ty::u64()), ("1".into(), Ty::Unit)],
+                        fields: vec![("0".into(), Ty::u64()), ("1".into(), Ty::Unit)].into(),
                         disc_index_safe: false,
                         faithful_enum_repr: None,
                         enum_layout: None,
@@ -884,6 +1208,7 @@ fn arbitrary_result_unwrap_is_still_flagged() {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("mycrate::fallible"),
                         is_foreign: false,
                     },
                 },
@@ -900,6 +1225,9 @@ fn arbitrary_result_unwrap_is_still_flagged() {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::result::Result::<T, E>::unwrap",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -913,6 +1241,7 @@ fn arbitrary_result_unwrap_is_still_flagged() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert_eq!(
         unwrap_panic_freedom_count(&func),
@@ -933,10 +1262,14 @@ fn user_index_impl_const_range_try_into_unwrap_is_flagged() {
     // Retype the index RECEIVER local `_1` from `&[u8]` to a user ADT `&MyWrap`.
     func.body.locals[1].ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-            variants: Vec::new(),
+        inner: Box::new(Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
             name: "mycrate::MyWrap".into(),
-            fields: vec![],
+            fields: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -972,19 +1305,27 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
     let arr = Ty::Array { elem: Box::new(Ty::u8()), len: arr_len };
     let slice_ref =
         Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
-    let rangefrom_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-        variants: Vec::new(),
+    let rangefrom_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
         name: "core::ops::RangeFrom".into(),
-        fields: vec![],
+        fields: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
     };
     let usize_ty = Ty::Int { width: 64, signed: false };
-    let checked_sub_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-        variants: Vec::new(),
+    let checked_sub_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
         name: "(usize, bool)".into(),
-        fields: vec![("0".into(), usize_ty.clone()), ("1".into(), Ty::Bool)],
+        fields: vec![("0".into(), usize_ty.clone()), ("1".into(), Ty::Bool)].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -1064,6 +1405,9 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::ops::index::Index::index",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -1080,6 +1424,9 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::convert::TryInto::try_into",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -1096,6 +1443,9 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::result::Result::<T, E>::unwrap",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -1113,6 +1463,7 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1243,10 +1594,14 @@ fn arbitrary_result_unwrap_fn() -> VerifiableFunction {
                 LocalDecl { index: 0, ty: Ty::u64(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-                        variants: Vec::new(),
+                    ty: Ty::Adt {
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                        adt_kind: None,
+                        layout: None,
+                        variants: Vec::new().into(),
                         name: "core::result::Result".into(),
-                        fields: vec![("0".into(), Ty::u64()), ("1".into(), Ty::Unit)],
+                        fields: vec![("0".into(), Ty::u64()), ("1".into(), Ty::Unit)].into(),
                         disc_index_safe: false,
                         faithful_enum_repr: None,
                         enum_layout: None,
@@ -1269,6 +1624,7 @@ fn arbitrary_result_unwrap_fn() -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("mycrate::fallible"),
                         is_foreign: false,
                     },
                 },
@@ -1285,6 +1641,9 @@ fn arbitrary_result_unwrap_fn() -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::result::Result::<T, E>::unwrap",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -1298,5 +1657,6 @@ fn arbitrary_result_unwrap_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }

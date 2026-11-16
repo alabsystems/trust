@@ -26,17 +26,17 @@ non_kebab_case_features = "warn"
         .file("src/lib.rs", "")
         .build();
 
-    foo.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints", "test-dummy-unstable"])
+    foo.cargo("fetch")
+        .masquerade_as_nightly_cargo(&["test-dummy-unstable"])
         .with_stderr_data(str![[r#"
-[WARNING] features should have a kebab-case name
+[WARNING] feature `foo_bar` should have a kebab-case name
  --> Cargo.toml:9:1
   |
 9 | foo_bar = []
   | ^^^^^^^
   |
   = [NOTE] `cargo::non_kebab_case_features` is set to `warn` in `[lints]`
-[HELP] to change the feature name to kebab case, convert the `features` key
+[HELP] to change the feature name to `foo-bar`, convert the `features` key
   |
 9 - foo_bar = []
 9 + foo-bar = []
@@ -72,10 +72,10 @@ non_kebab_case_features = "warn"
         .file("src/lib.rs", "")
         .build();
 
-    foo.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints", "test-dummy-unstable"])
+    foo.cargo("fetch")
+        .masquerade_as_nightly_cargo(&["test-dummy-unstable"])
         .with_stderr_data(str![[r#"
-[WARNING] features should have a kebab-case name
+[WARNING] feature `foo_bar` should have a kebab-case name
  --> Cargo.toml:9:1
   |
 9 | foo_bar = { version = "0.0.1", optional = true }
@@ -85,7 +85,7 @@ non_kebab_case_features = "warn"
   = [NOTE] `cargo::non_kebab_case_features` is set to `warn` in `[lints]`
 [WARNING] `foo` (manifest) generated 1 warning
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 ...
 

@@ -1,0 +1,18 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[workspace]
+
+[package]
+name = "trust-cmake"
+version = "0.13.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>", "Alex Crichton <alex@alexcrichton.com>"]
+publish = false
+description = "Trust-owned opt-in resolved input support for cmake-rs"
+
+[lib]
+name = "cmake"
+
+[dependencies]
+cc = "=1.2.62"

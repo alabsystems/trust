@@ -132,7 +132,7 @@ fn downcast_field_payload_declines_non_flattened_dump() {
     // Strip the flattened `__v..` field metadata (a legacy / non-flattened dump lacks
     // it). Without a flattened position there is no VARIANT-DISJOINT key: fail closed.
     if let trust_types::Ty::Adt { fields, .. } = &mut func.body.locals[1].ty {
-        fields.retain(|(name, _)| !name.starts_with("__v"));
+        fields.make_mut().retain(|(name, _)| !name.starts_with("__v"));
     }
     let pidx = param_index_of(&func);
     assert_eq!(downcast_field_payload(&func.body, &op, &pidx, Some(0)), None);

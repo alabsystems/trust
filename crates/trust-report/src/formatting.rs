@@ -6,7 +6,9 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use trust_types::grade::{
     AxiomClosure, CoverageBound, Executability, ProofValidation, ReflectionTier,
@@ -56,19 +58,31 @@ pub fn format_json_summary(report: &JsonProofReport) -> String {
                         ob.time_ms
                     )
                 }
-                ObligationOutcome::Failed { counterexample } => {
+                ObligationOutcome::Failed { counterexample, basis } => {
                     let cex_str = counterexample
                         .as_ref()
                         .map(|c| {
-                            let vars: Vec<String> = c
-                                .variables
-                                .iter()
-                                .map(|v| format!("{} = {}", v.name, v.display))
-                                .collect();
-                            format!(" counterexample: {}", vars.join(", "))
+                            let mut s = String::from(" counterexample: ");
+                            for (i, v) in c.variables.iter().enumerate() {
+                                if i > 0 {
+                                    s.push_str(", ");
+                                }
+                                let _ = write!(s, "{} = {}", v.name, v.display);
+                            }
+                            s
                         })
                         .unwrap_or_default();
-                    format!("    [{}] {} FAILED ({}){cex_str}", ob.kind, ob.description, ob.solver)
+                    // Nothing refuted a fail-closed row: say so instead of
+                    // letting a bare FAILED read as a found violation.
+                    let basis_str = if basis.is_refuted() {
+                        String::new()
+                    } else {
+                        format!(": {}", basis.human_label())
+                    };
+                    format!(
+                        "    [{}] {} FAILED ({}){basis_str}{cex_str}",
+                        ob.kind, ob.description, ob.solver
+                    )
                 }
                 ObligationOutcome::Unknown { reason } => {
                     format!(
@@ -95,6 +109,11 @@ pub fn format_json_summary(report: &JsonProofReport) -> String {
                 _ => format!("    [{}] {} UNKNOWN ({})", ob.kind, ob.description, ob.solver),
             };
             lines.push(status_line);
+            // Trust (TINV step 10.7): every premise the row rests on, on its own line,
+            // whatever the outcome (a withheld row keeps its disclosure too).
+            for premise in &ob.assumes {
+                lines.push(format!("      {premise}"));
+            }
             if !matches!(&ob.outcome, ObligationOutcome::Proved { .. })
                 && let Some(monitor) = monitor
             {
@@ -124,9 +143,9 @@ pub fn format_json_summary(report: &JsonProofReport) -> String {
     }
     lines.extend(crate_breakdown.lines("  "));
 
-    // Trust: session-end Trust Surface — what Trust proved/checked/assumed on top
-    // of code that vanilla rustc already accepts, split by strength of basis so
-    // the blended `total_proved` above is never read as a single assurance claim.
+    // Trust: session-end Trust Surface — reported verification outcomes, split by
+    // strength of basis so the blended `total_proved` above is never read as a
+    // single assurance claim.
     for line in trust_surface_lines(&report.functions) {
         lines.push(format!("  {line}"));
     }
@@ -148,8 +167,20 @@ pub fn format_json_summary(report: &JsonProofReport) -> String {
         // Trust (T9 contract-panic): the contract-panic count is rendered
         // UNCONDITIONALLY — a pass conditional on an intentional panic must
         // never be visually indistinguishable from an all-proved pass.
+        // Trust (CB4): bodies EXCLUDED from the proof inventory (rustc's libtest
+        // harness code) are outside `total`; the count is appended only when
+        // there are any, so every non-test Gate line is byte-identical.
+        let excluded = if gate.counts.excluded > 0 {
+            format!(
+                "; {} excluded: {}",
+                gate.counts.excluded,
+                trust_types::exclusion::TEST_HARNESS_EXCLUSION_TAG
+            )
+        } else {
+            String::new()
+        };
         lines.push(format!(
-            "  Gate: {} [{} lane, exit {}] ({} proved, {} failed, {} runtime-checked, {} assumed, {} mandated, {} contract-panic, {} unknown / {} total)",
+            "  Gate: {} [{} lane, exit {}] ({} proved, {} failed, {} runtime-checked, {} assumed, {} mandated, {} contract-panic, {} unknown / {} total{excluded})",
             gate.decision.to_ascii_uppercase(),
             gate.lane,
             gate.exit_code,
@@ -162,6 +193,14 @@ pub fn format_json_summary(report: &JsonProofReport) -> String {
             gate.counts.unknown,
             gate.counts.total,
         ));
+        // Ramp: a pass that stands on unproved obligations must never read
+        // like a verified one. Say so on its own line, with the count.
+        if gate.conditional_on_unknown_rows {
+            lines.push(format!(
+                "  Gate note: {} obligation(s) UNPROVED and carried as conditions of the pass (the {} lane reports L0 gaps instead of failing on them); a verified result needs the strict or certify lane",
+                gate.counts.unknown, gate.lane,
+            ));
+        }
     }
 
     lines.join("\n")
@@ -200,7 +239,11 @@ impl KindBreakdown {
                 ObligationOutcome::DesignRequirement { .. } => continue,
                 _ => &mut self.unknown,
             };
-            *bucket.entry(ob.kind.clone()).or_insert(0) += 1;
+            if let Some(count) = bucket.get_mut(ob.kind.as_str()) {
+                *count += 1;
+            } else {
+                bucket.insert(ob.kind.clone(), 1);
+            }
         }
     }
 
@@ -221,11 +264,10 @@ impl KindBreakdown {
     }
 }
 
-/// Trust: render the per-compile "Trust Surface" — the deviation from what
-/// vanilla rustc accepts unchanged. Vanilla rustc compiles this crate with none
-/// of these obligations; Trust adds them and this section states, by strength of
-/// basis, exactly what that bought. The classification is derived from the
-/// obligation lists (the source of truth) via [`TrustSurface::from_functions`],
+/// Trust: render the per-compile "Trust Surface" — reported verification
+/// obligations split by strength of basis. These reports contain no evidence
+/// that another compiler accepts the source. The classification is derived from
+/// the obligation lists (the source of truth) via [`TrustSurface::from_functions`],
 /// so it always reconciles with the per-obligation detail and never inflates a
 /// blended `proved` total into an assurance claim it cannot support.
 ///
@@ -236,9 +278,9 @@ pub(crate) fn trust_surface_lines(functions: &[FunctionProofReport]) -> Vec<Stri
         return Vec::new();
     }
     let mut out = Vec::new();
-    out.push("Trust Surface (deviation from vanilla rustc):".to_string());
+    out.push("Trust Surface (reported verification obligations):".to_string());
     out.push(format!(
-        "vanilla rustc accepts this unchanged; Trust added {} obligation{}",
+        "Trust reported {} obligation{}",
         surface.total_obligations,
         plural(surface.total_obligations),
     ));
@@ -271,8 +313,14 @@ fn format_kind_map(label: &str, map: &BTreeMap<String, usize>) -> Option<String>
     if map.is_empty() {
         return None;
     }
-    let parts: Vec<String> = map.iter().map(|(kind, count)| format!("{kind}={count}")).collect();
-    Some(format!("{label} by kind: {}", parts.join(", ")))
+    let mut out = format!("{label} by kind: ");
+    for (i, (kind, count)) in map.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{kind}={count}");
+    }
+    Some(out)
 }
 
 fn pending_summary(pending: usize, timed_out: usize) -> String {
@@ -372,18 +420,18 @@ pub fn proof_evidence_label_with_monitor(
         ProofValidation::Pending => "pending",
         _ => "unknown",
     };
-    let closure = match &grade.axiom_closure {
-        AxiomClosure::Empty => "empty".to_string(),
-        AxiomClosure::Named(names) => format!("named:{}", names.len()),
-        AxiomClosure::Unrecorded => "unrecorded".to_string(),
-        _ => "unknown".to_string(),
+    let closure: Cow<'static, str> = match &grade.axiom_closure {
+        AxiomClosure::Empty => Cow::Borrowed("empty"),
+        AxiomClosure::Named(names) => Cow::Owned(format!("named:{}", names.len())),
+        AxiomClosure::Unrecorded => Cow::Borrowed("unrecorded"),
+        _ => Cow::Borrowed("unknown"),
     };
-    let coverage = match &grade.coverage {
-        CoverageBound::Unbounded => "unbounded".to_string(),
-        CoverageBound::UnwindBounded { depth } => format!("unwind:{depth}"),
-        CoverageBound::ModelBounded { size } => format!("model:{size}"),
-        CoverageBound::Unrecorded => "unrecorded".to_string(),
-        _ => "unknown".to_string(),
+    let coverage: Cow<'static, str> = match &grade.coverage {
+        CoverageBound::Unbounded => Cow::Borrowed("unbounded"),
+        CoverageBound::UnwindBounded { depth } => Cow::Owned(format!("unwind:{depth}")),
+        CoverageBound::ModelBounded { size } => Cow::Owned(format!("model:{size}")),
+        CoverageBound::Unrecorded => Cow::Borrowed("unrecorded"),
+        _ => Cow::Borrowed("unknown"),
     };
     let execution = match grade.executability {
         Executability::Monitored => "monitored",
@@ -483,6 +531,7 @@ mod kind_breakdown_tests {
 
     fn ob(kind: &str, outcome: ObligationOutcome) -> ObligationReport {
         ObligationReport {
+            assumes: Vec::new(),
             obligation_id: None,
             description: kind.to_string(),
             kind: kind.to_string(),
@@ -509,7 +558,13 @@ mod kind_breakdown_tests {
             ob("bounds_check", proved()),
             ob("custom", ObligationOutcome::Unknown { reason: "unsupported MIR".to_string() }),
             ob("custom", ObligationOutcome::Unknown { reason: "unsupported MIR".to_string() }),
-            ob("arithmetic_overflow", ObligationOutcome::Failed { counterexample: None }),
+            ob(
+                "arithmetic_overflow",
+                ObligationOutcome::Failed {
+                    counterexample: None,
+                    basis: trust_types::FailureBasis::Refuted,
+                },
+            ),
         ];
         let mut breakdown = KindBreakdown::default();
         breakdown.add(&obligations);

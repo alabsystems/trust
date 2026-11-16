@@ -5,17 +5,9 @@ error: fn_abi_of(i8) = FnAbi {
                        ty: i8,
                        layout: Layout {
                            size: Size(1 bytes),
-                           align: AbiAlign {
-                               abi: Align(1 bytes),
-                           },
+                           align: Align(1 bytes),
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I8,
-                                       true,
-                                   ),
-                                   valid_range: 0..=255,
-                               },
+                               i8 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -25,6 +17,7 @@ error: fn_abi_of(i8) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: Align(1 bytes),
+                           repr_c: false,
                            randomization_seed: 71776123356184577,
                        },
                    },
@@ -43,17 +36,9 @@ error: fn_abi_of(i8) = FnAbi {
                    ty: i8,
                    layout: Layout {
                        size: Size(1 bytes),
-                       align: AbiAlign {
-                           abi: Align(1 bytes),
-                       },
+                       align: Align(1 bytes),
                        backend_repr: Scalar(
-                           Initialized {
-                               value: Int(
-                                   I8,
-                                   true,
-                               ),
-                               valid_range: 0..=255,
-                           },
+                           i8 is ..,
                        ),
                        fields: Primitive,
                        largest_niche: None,
@@ -63,6 +48,7 @@ error: fn_abi_of(i8) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: Align(1 bytes),
+                       repr_c: false,
                        randomization_seed: 71776123356184577,
                    },
                },
@@ -94,17 +80,9 @@ error: fn_abi_of(u8) = FnAbi {
                        ty: u8,
                        layout: Layout {
                            size: Size(1 bytes),
-                           align: AbiAlign {
-                               abi: Align(1 bytes),
-                           },
+                           align: Align(1 bytes),
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I8,
-                                       false,
-                                   ),
-                                   valid_range: 0..=255,
-                               },
+                               u8 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -114,6 +92,7 @@ error: fn_abi_of(u8) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: Align(1 bytes),
+                           repr_c: false,
                            randomization_seed: 71776127651151873,
                        },
                    },
@@ -132,17 +111,9 @@ error: fn_abi_of(u8) = FnAbi {
                    ty: u8,
                    layout: Layout {
                        size: Size(1 bytes),
-                       align: AbiAlign {
-                           abi: Align(1 bytes),
-                       },
+                       align: Align(1 bytes),
                        backend_repr: Scalar(
-                           Initialized {
-                               value: Int(
-                                   I8,
-                                   false,
-                               ),
-                               valid_range: 0..=255,
-                           },
+                           u8 is ..,
                        ),
                        fields: Primitive,
                        largest_niche: None,
@@ -152,6 +123,7 @@ error: fn_abi_of(u8) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: Align(1 bytes),
+                       repr_c: false,
                        randomization_seed: 71776127651151873,
                    },
                },
@@ -183,17 +155,9 @@ error: fn_abi_of(i16) = FnAbi {
                        ty: i16,
                        layout: Layout {
                            size: Size(2 bytes),
-                           align: AbiAlign {
-                               abi: Align(2 bytes),
-                           },
+                           align: Align(2 bytes),
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I16,
-                                       true,
-                                   ),
-                                   valid_range: 0..=65535,
-                               },
+                               i16 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -203,6 +167,7 @@ error: fn_abi_of(i16) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: Align(2 bytes),
+                           repr_c: false,
                            randomization_seed: 18446462603027808258,
                        },
                    },
@@ -221,17 +186,9 @@ error: fn_abi_of(i16) = FnAbi {
                    ty: i16,
                    layout: Layout {
                        size: Size(2 bytes),
-                       align: AbiAlign {
-                           abi: Align(2 bytes),
-                       },
+                       align: Align(2 bytes),
                        backend_repr: Scalar(
-                           Initialized {
-                               value: Int(
-                                   I16,
-                                   true,
-                               ),
-                               valid_range: 0..=65535,
-                           },
+                           i16 is ..,
                        ),
                        fields: Primitive,
                        largest_niche: None,
@@ -241,6 +198,7 @@ error: fn_abi_of(i16) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: Align(2 bytes),
+                       repr_c: false,
                        randomization_seed: 18446462603027808258,
                    },
                },
@@ -272,17 +230,9 @@ error: fn_abi_of(u16) = FnAbi {
                        ty: u16,
                        layout: Layout {
                            size: Size(2 bytes),
-                           align: AbiAlign {
-                               abi: Align(2 bytes),
-                           },
+                           align: Align(2 bytes),
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I16,
-                                       false,
-                                   ),
-                                   valid_range: 0..=65535,
-                               },
+                               u16 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -292,6 +242,7 @@ error: fn_abi_of(u16) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: Align(2 bytes),
+                           repr_c: false,
                            randomization_seed: 18446462607322775554,
                        },
                    },
@@ -310,17 +261,9 @@ error: fn_abi_of(u16) = FnAbi {
                    ty: u16,
                    layout: Layout {
                        size: Size(2 bytes),
-                       align: AbiAlign {
-                           abi: Align(2 bytes),
-                       },
+                       align: Align(2 bytes),
                        backend_repr: Scalar(
-                           Initialized {
-                               value: Int(
-                                   I16,
-                                   false,
-                               ),
-                               valid_range: 0..=65535,
-                           },
+                           u16 is ..,
                        ),
                        fields: Primitive,
                        largest_niche: None,
@@ -330,6 +273,7 @@ error: fn_abi_of(u16) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: Align(2 bytes),
+                       repr_c: false,
                        randomization_seed: 18446462607322775554,
                    },
                },
@@ -361,17 +305,9 @@ error: fn_abi_of(i32) = FnAbi {
                        ty: i32,
                        layout: Layout {
                            size: Size(4 bytes),
-                           align: AbiAlign {
-                               abi: Align(4 bytes),
-                           },
+                           align: Align(4 bytes),
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I32,
-                                       true,
-                                   ),
-                                   valid_range: 0..=4294967295,
-                               },
+                               i32 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -381,6 +317,7 @@ error: fn_abi_of(i32) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: Align(4 bytes),
+                           repr_c: false,
                            randomization_seed: 18446462603027873795,
                        },
                    },
@@ -399,17 +336,9 @@ error: fn_abi_of(i32) = FnAbi {
                    ty: i32,
                    layout: Layout {
                        size: Size(4 bytes),
-                       align: AbiAlign {
-                           abi: Align(4 bytes),
-                       },
+                       align: Align(4 bytes),
                        backend_repr: Scalar(
-                           Initialized {
-                               value: Int(
-                                   I32,
-                                   true,
-                               ),
-                               valid_range: 0..=4294967295,
-                           },
+                           i32 is ..,
                        ),
                        fields: Primitive,
                        largest_niche: None,
@@ -419,6 +348,7 @@ error: fn_abi_of(i32) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: Align(4 bytes),
+                       repr_c: false,
                        randomization_seed: 18446462603027873795,
                    },
                },
@@ -450,17 +380,9 @@ error: fn_abi_of(u32) = FnAbi {
                        ty: u32,
                        layout: Layout {
                            size: Size(4 bytes),
-                           align: AbiAlign {
-                               abi: Align(4 bytes),
-                           },
+                           align: Align(4 bytes),
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I32,
-                                       false,
-                                   ),
-                                   valid_range: 0..=4294967295,
-                               },
+                               u32 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -470,6 +392,7 @@ error: fn_abi_of(u32) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: Align(4 bytes),
+                           repr_c: false,
                            randomization_seed: 18446462607322841091,
                        },
                    },
@@ -488,17 +411,9 @@ error: fn_abi_of(u32) = FnAbi {
                    ty: u32,
                    layout: Layout {
                        size: Size(4 bytes),
-                       align: AbiAlign {
-                           abi: Align(4 bytes),
-                       },
+                       align: Align(4 bytes),
                        backend_repr: Scalar(
-                           Initialized {
-                               value: Int(
-                                   I32,
-                                   false,
-                               ),
-                               valid_range: 0..=4294967295,
-                           },
+                           u32 is ..,
                        ),
                        fields: Primitive,
                        largest_niche: None,
@@ -508,6 +423,7 @@ error: fn_abi_of(u32) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: Align(4 bytes),
+                       repr_c: false,
                        randomization_seed: 18446462607322841091,
                    },
                },

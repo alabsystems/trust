@@ -8,12 +8,12 @@ description = "Benchmarking suite for Cargo."
 publish = false
 
 [dependencies]
-cargo.workspace = true
 cargo-util.workspace = true
 cargo-util-terminal.workspace = true
 flate2.workspace = true
 rand.workspace = true
 tar.workspace = true
+targo.workspace = true
 url.workspace = true
 
 [dev-dependencies]

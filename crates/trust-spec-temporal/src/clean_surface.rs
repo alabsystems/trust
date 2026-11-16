@@ -9,6 +9,7 @@
 //! exact authored `□`/`◇` countdown claims is layered on this surface by
 //! `clean_ty_lane`.
 
+use std::cell::OnceCell;
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -244,26 +245,45 @@ pub(crate) fn elaborate_suffix_with_parser_prelude(
 /// environment would force every authored check to parse and elaborate the
 /// prelude again. Both values are persistent/cloneable; callers receive owned
 /// clones and cannot leak declarations or parser state into another check.
+///
+/// Trust (Clean R80 item 2; `docs/DECISION_QUEUE.md` R80-CONSUMERS-1): the
+/// context is handed out as a `FileContext::fork_run` copy, never a plain
+/// clone. A clone stays in the prelude's elaboration run, so a consumer's
+/// `attribute [implemented_by]` / `attribute [extern]` command could bind a
+/// prelude declaration, which Lean refuses as imported ("... because it is in
+/// an imported module"); a fork is a new run, to which the prelude's
+/// declarations are imported, and two consumers are two runs.
 pub(crate) fn fresh_temporal_prelude_context()
 -> Result<(Environment, FileContext), CleanTemporalCertificateError> {
-    static TEMPORAL_PRELUDE: OnceLock<
-        Result<(Environment, FileContext), CleanTemporalCertificateError>,
-    > = OnceLock::new();
-    TEMPORAL_PRELUDE
-        .get_or_init(|| {
-            let mut environment = fresh_kernel_prelude_environment();
-            let mut context = FileContext::new();
-            context.disable_external_import_search();
-            elaborate_unit(
-                &mut environment,
-                &mut context,
-                CLEAN_TEMPORAL_PRELUDE,
-                "temporal prelude",
-                None,
-            )?;
-            Ok((environment, context))
-        })
-        .clone()
+    // Keep the current worker-local cache policy. Pinned Clean's FileContext
+    // and Environment are Send + Sync; global sharing is a separate change.
+    // This build uses only compile-time sources with external import search
+    // disabled, so each worker builds the same frontier and callers receive
+    // owned, isolated run forks.
+    thread_local! {
+        static TEMPORAL_PRELUDE: OnceCell<
+            Result<(Environment, FileContext), CleanTemporalCertificateError>,
+        > = const { OnceCell::new() };
+    }
+    TEMPORAL_PRELUDE.with(|cache| {
+        cache
+            .get_or_init(|| {
+                let mut environment = fresh_kernel_prelude_environment();
+                let mut context = FileContext::new();
+                context.disable_external_import_search();
+                elaborate_unit(
+                    &mut environment,
+                    &mut context,
+                    CLEAN_TEMPORAL_PRELUDE,
+                    "temporal prelude",
+                    None,
+                )?;
+                Ok((environment, context))
+            })
+            .as_ref()
+            .map(|(environment, context)| (environment.clone(), context.fork_run()))
+            .map_err(Clone::clone)
+    })
 }
 
 /// Reject parser-state mutations from the authored suffix of the combined
@@ -597,6 +617,45 @@ end TrustTemporalCacheIsolation
                 .is_some(),
             "canonical temporal notation must remain available after a rejected attack",
         );
+    }
+
+    /// Trust (Clean R80 item 2; Clean R151 consumer (2); `docs/DECISION_QUEUE.md`
+    /// R80-CONSUMERS-1): a consumer of the cached temporal prelude is a NEW
+    /// elaboration run, so the prelude's declarations are imported to it and
+    /// the command form of `[implemented_by]` on one is refused with Lean's
+    /// text. Before the fix the cache handed out a plain `FileContext` clone,
+    /// which stays in the prelude's run, and the command bound
+    /// `Trust.Temporal.drop`.
+    #[test]
+    fn temporal_prelude_consumer_cannot_rebind_a_prelude_declaration() {
+        const SOURCE: &str = "def myDrop {State : Type} (b : Trust.Temporal.Behavior State) \
+                              (n : Nat) : Trust.Temporal.Behavior State := b\n\
+                              attribute [implemented_by myDrop] Trust.Temporal.drop\n";
+        assert_eq!(
+            elaborate_temporal_definitions(SOURCE).map(|_| ()),
+            Err(CleanTemporalCertificateError::Elaborate {
+                unit: "authored source",
+                detail: "Cannot add attribute `[implemented_by]` to declaration \
+                         `Trust.Temporal.drop` because it is in an imported module"
+                    .to_owned(),
+            })
+        );
+    }
+
+    /// The control: the consumer's own declarations are its run's, so the same
+    /// command on one of them binds.
+    #[test]
+    fn temporal_prelude_consumer_may_bind_its_own_declaration() {
+        const SOURCE: &str = "def mySlow (n : Nat) : Nat := n + 2\n\
+                              def myFast (n : Nat) : Nat := n + 1\n\
+                              attribute [implemented_by myFast] mySlow\n";
+        let environment = elaborate_temporal_definitions(SOURCE)
+            .expect("a consumer may bind its own declaration");
+        assert_eq!(
+            environment.get_implemented_by(&Name::from_string("mySlow")),
+            Some(&Name::from_string("myFast"))
+        );
+        assert_eq!(environment.get_implemented_by(&Name::from_string("Trust.Temporal.drop")), None);
     }
 
     #[test]

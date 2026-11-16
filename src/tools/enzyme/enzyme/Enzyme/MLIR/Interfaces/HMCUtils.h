@@ -11,6 +11,7 @@
 #ifndef ENZYME_MLIR_INTERFACES_HMC_UTILS_H
 #define ENZYME_MLIR_INTERFACES_HMC_UTILS_H
 
+#include "Dialect/Impulse/Impulse.h"
 #include "Dialect/Ops.h"
 #include "Interfaces/TransformUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -22,17 +23,16 @@
 #include "mlir/IR/Value.h"
 
 namespace mlir {
-namespace enzyme {
-namespace MCMC {
+namespace impulse {
 
 struct SupportInfo {
   int64_t offset;
   int64_t traceOffset;
   int64_t size;
-  enzyme::SupportAttr support;
+  impulse::SupportAttr support;
 
   SupportInfo(int64_t offset, int64_t traceOffset, int64_t size,
-              enzyme::SupportAttr support)
+              impulse::SupportAttr support)
       : offset(offset), traceOffset(traceOffset), size(size), support(support) {
   }
 };
@@ -64,6 +64,8 @@ struct MCMCKernelResult {
   Value grad;        // Gradient at new position
   Value U;           // Potential energy at new position
   Value accepted;    // Whether proposal was accepted
+  Value divergent;   // Whether step was divergent (NUTS only; currently always
+                     // false for HMC)
   Value accept_prob; // Mean acceptance probability
   Value rng;         // Updated RNG state
 };
@@ -109,26 +111,31 @@ struct HMCContext {
   int64_t positionSize;
   SmallVector<SupportInfo> supports;
   FlatSymbolRefAttr logpdfFn;
+  DictionaryAttr autodiffAttrs;
 
   HMCContext(FlatSymbolRefAttr fn, ArrayRef<Value> fnInputs,
              ArrayRef<Type> fnResultTypes, Value originalTrace,
              ArrayAttr selection, ArrayAttr allAddresses, Value invMass,
              Value massMatrixSqrt, Value stepSize, Value trajectoryLength,
-             int64_t positionSize, ArrayRef<SupportInfo> supports)
+             int64_t positionSize, ArrayRef<SupportInfo> supports,
+             DictionaryAttr autodiffAttrs = {})
       : fn(fn), fnInputs(fnInputs),
         fnResultTypes(fnResultTypes.begin(), fnResultTypes.end()),
         originalTrace(originalTrace), selection(selection),
         allAddresses(allAddresses), invMass(invMass),
         massMatrixSqrt(massMatrixSqrt), stepSize(stepSize),
         trajectoryLength(trajectoryLength), positionSize(positionSize),
-        supports(supports.begin(), supports.end()) {}
+        supports(supports.begin(), supports.end()),
+        autodiffAttrs(autodiffAttrs) {}
 
   HMCContext(FlatSymbolRefAttr logpdfFn, ArrayRef<Value> fnInputs,
              Value invMass, Value massMatrixSqrt, Value stepSize,
-             Value trajectoryLength, int64_t positionSize)
+             Value trajectoryLength, int64_t positionSize,
+             DictionaryAttr autodiffAttrs = {})
       : fnInputs(fnInputs), invMass(invMass), massMatrixSqrt(massMatrixSqrt),
         stepSize(stepSize), trajectoryLength(trajectoryLength),
-        positionSize(positionSize), logpdfFn(logpdfFn) {}
+        positionSize(positionSize), logpdfFn(logpdfFn),
+        autodiffAttrs(autodiffAttrs) {}
 
   bool hasCustomLogpdf() const { return logpdfFn != nullptr; }
 
@@ -151,7 +158,7 @@ struct HMCContext {
 
   bool hasConstrainedSupports() const {
     for (const auto &info : supports) {
-      if (info.support && info.support.getKind() != enzyme::SupportKind::REAL)
+      if (info.support && info.support.getKind() != impulse::SupportKind::REAL)
         return true;
     }
     return false;
@@ -174,19 +181,20 @@ struct NUTSContext : public HMCContext {
               ArrayAttr selection, ArrayAttr allAddresses, Value invMass,
               Value massMatrixSqrt, Value stepSize, int64_t positionSize,
               ArrayRef<SupportInfo> supports, Value H0, Value maxDeltaEnergy,
-              int64_t maxTreeDepth)
+              int64_t maxTreeDepth, DictionaryAttr autodiffAttrs = {})
       : HMCContext(fn, fnInputs, fnResultTypes, originalTrace, selection,
                    allAddresses, invMass, massMatrixSqrt, stepSize,
                    /* Unused trajectoryLength */ Value(), positionSize,
-                   supports),
+                   supports, autodiffAttrs),
         H0(H0), maxDeltaEnergy(maxDeltaEnergy), maxTreeDepth(maxTreeDepth) {}
 
   NUTSContext(FlatSymbolRefAttr logpdfFn, ArrayRef<Value> fnInputs,
               Value invMass, Value massMatrixSqrt, Value stepSize,
               int64_t positionSize, Value H0, Value maxDeltaEnergy,
-              int64_t maxTreeDepth)
+              int64_t maxTreeDepth, DictionaryAttr autodiffAttrs = {})
       : HMCContext(logpdfFn, fnInputs, invMass, massMatrixSqrt, stepSize,
-                   /* Unused trajectoryLength */ Value(), positionSize),
+                   /* Unused trajectoryLength */ Value(), positionSize,
+                   autodiffAttrs),
         H0(H0), maxDeltaEnergy(maxDeltaEnergy), maxTreeDepth(maxTreeDepth) {}
 
   NUTSContext withH0(Value newH0) const {
@@ -380,7 +388,7 @@ struct DualAveragingConfig {
 
 /// Initialize dual averaging state from initial step size.
 DualAveragingState initDualAveraging(OpBuilder &builder, Location loc,
-                                     Value stepSize);
+                                     Value stepSize, bool logOfProduct = false);
 
 /// Update dual averaging state with observed acceptance probability.
 DualAveragingState updateDualAveraging(OpBuilder &builder, Location loc,
@@ -454,8 +462,7 @@ Value constrainPosition(OpBuilder &builder, Location loc, Value unconstrained,
 Value computeTotalJacobianCorrection(OpBuilder &builder, Location loc,
                                      Value unconstrained,
                                      ArrayRef<SupportInfo> supports);
-} // namespace MCMC
-} // namespace enzyme
+} // namespace impulse
 } // namespace mlir
 
 #endif // ENZYME_MLIR_INTERFACES_HMC_UTILS_H

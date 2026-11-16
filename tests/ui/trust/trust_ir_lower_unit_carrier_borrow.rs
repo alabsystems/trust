@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-CBU: a SHARED borrow of an UNBOUND local whose pointee maps to
 // `Ty::Unit` — a wave-ZB-skipped param-degraded payload binding
 // (`E::A(a) => sink(&a)` in a generic body) or a genuine `()` local, both

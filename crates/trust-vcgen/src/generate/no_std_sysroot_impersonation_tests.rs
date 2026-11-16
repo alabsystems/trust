@@ -140,7 +140,7 @@ fn into_iter_shape(stamps: &[Stamp]) -> VerifiableFunction {
 /// solvable `UnboundedAllocation` bound, or the visible `UnsupportedMir` row it
 /// raises when the element count is not recoverable.
 fn unbounded_alloc_vc_count(func: &VerifiableFunction) -> usize {
-    generate_unbounded_allocation_vcs(func)
+    generate_unbounded_allocation_vcs_on_64_bit(func)
         .iter()
         .filter(|vc| match &vc.kind {
             VcKind::UnsupportedMir { kind, .. } => kind.contains("UnboundedAllocation"),

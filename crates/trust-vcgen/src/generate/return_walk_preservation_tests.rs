@@ -77,6 +77,7 @@ fn i64_ty() -> Ty {
 fn std_result_ty() -> Ty {
     Ty::Adt {
         arbitrary_precision: None,
+        validity_wrapper: None,
         adt_kind: None,
         layout: None,
         name: "core::result::Result".into(),
@@ -84,11 +85,17 @@ fn std_result_ty() -> Ty {
             ("__tag".into(), i64_ty()),
             ("__v0_0".into(), i64_ty()),
             ("__v1_0".into(), i64_ty()),
-        ],
+        ]
+        .into(),
         variants: vec![
             VariantDef { name: "Ok".into(), discriminant: 0, fields: vec![("0".into(), i64_ty())] },
-            VariantDef { name: "Err".into(), discriminant: 1, fields: vec![("0".into(), i64_ty())] },
-        ],
+            VariantDef {
+                name: "Err".into(),
+                discriminant: 1,
+                fields: vec![("0".into(), i64_ty())],
+            },
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -124,6 +131,7 @@ fn call_into(dest: usize, target: usize) -> Terminator {
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key("test::inner"),
         unwind: Default::default(),
     }
 }
@@ -176,6 +184,7 @@ fn func_with(blocks: Vec<BasicBlock>, ensures: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -224,8 +233,12 @@ fn assert_refused(func: &VerifiableFunction, vc_block: usize, ret_block: usize) 
 //   bb3:  return
 // ===========================================================================
 
-fn stale_then_write(variant: usize, payload: i128, real_write: Terminator, ensures: &str)
--> VerifiableFunction {
+fn stale_then_write(
+    variant: usize,
+    payload: i128,
+    real_write: Terminator,
+    ensures: &str,
+) -> VerifiableFunction {
     func_with(
         vec![
             bb(0, vec![assign_variant(variant, payload)], Terminator::Goto(BlockId(1))),
@@ -286,6 +299,7 @@ fn a_tail_call_never_counts_as_return_place_preserving() {
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key("test::inner"),
     };
     assert!(
         !super::terminator_preserves_return_place(&tail),
@@ -305,8 +319,11 @@ fn a_tail_call_never_counts_as_return_place_preserving() {
 // function used to ship a STRICT-GREEN vacuous PROVE with no backstop at all.
 // ===========================================================================
 
-fn def_holder_overwrites_its_own_def(variant: usize, payload: i128, ensures: &str)
--> VerifiableFunction {
+fn def_holder_overwrites_its_own_def(
+    variant: usize,
+    payload: i128,
+    ensures: &str,
+) -> VerifiableFunction {
     func_with(
         vec![
             bb(0, vec![assign_variant(variant, payload)], call_into(0, 1)),
@@ -390,12 +407,9 @@ fn the_walk_still_steps_past_a_genuine_drop_elaboration_join() {
         ],
         "result.is_ok()",
     );
-    let (kind, variant, _ops, def_block) = resolve_enum_return_aggregate_with_block(
-        &func,
-        &func.body.blocks[2],
-        &func.body.blocks[3],
-    )
-    .expect("the drop-elaboration join must still resolve — this is why the walk exists");
+    let (kind, variant, _ops, def_block) =
+        resolve_enum_return_aggregate_with_block(&func, &func.body.blocks[2], &func.body.blocks[3])
+            .expect("the drop-elaboration join must still resolve — this is why the walk exists");
     assert_eq!(def_block, BlockId(0), "the aggregate is found two joins back");
     assert_eq!(variant, 0);
     assert_eq!(format!("{kind:?}"), "Result");
@@ -429,12 +443,9 @@ fn calls_and_drops_that_do_not_name_the_return_slot_still_pass() {
         ],
         "result.is_ok()",
     );
-    let (_k, _v, _ops, def_block) = resolve_enum_return_aggregate_with_block(
-        &func,
-        &func.body.blocks[2],
-        &func.body.blocks[3],
-    )
-    .expect("a call/drop naming another local must not stop the walk");
+    let (_k, _v, _ops, def_block) =
+        resolve_enum_return_aggregate_with_block(&func, &func.body.blocks[2], &func.body.blocks[3])
+            .expect("a call/drop naming another local must not stop the walk");
     assert_eq!(def_block, BlockId(0));
     assert!(!enum_return_grounded_model_vars(&func).is_empty());
 }
@@ -472,9 +483,7 @@ fn the_no_value_write_terminators_are_all_still_admitted() {
         );
     }
     // ...and the fail-closed default really is closed.
-    assert!(!super::terminator_preserves_return_place(
-        &opaque_indirect_call_into_ret(1)
-    ));
+    assert!(!super::terminator_preserves_return_place(&opaque_indirect_call_into_ret(1)));
     assert!(!super::terminator_preserves_return_place(&call_into(0, 1)));
     assert!(super::terminator_preserves_return_place(&call_into(9, 1)));
 }
@@ -537,7 +546,8 @@ fn return_walk_grounding_corpus_ab() {
     assert!(!files.is_empty(), "no MIR dumps under {root}");
 
     let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let chunks: Vec<&[std::path::PathBuf]> = files.chunks(files.len().div_ceil(n_threads)).collect();
+    let chunks: Vec<&[std::path::PathBuf]> =
+        files.chunks(files.len().div_ceil(n_threads)).collect();
     let out: Vec<(usize, usize, usize, Vec<String>)> = std::thread::scope(|scope| {
         let handles: Vec<_> =
             chunks.into_iter().map(|chunk| scope.spawn(move || scan(chunk))).collect();
@@ -569,7 +579,8 @@ fn scan(files: &[std::path::PathBuf]) -> (usize, usize, usize, Vec<String>) {
         let Ok(text) = std::fs::read_to_string(path) else { continue };
         let Ok(func) = serde_json::from_str::<VerifiableFunction>(&text) else { continue };
         bodies += 1;
-        let mut credited: Vec<String> = enum_return_grounded_model_vars(&func).into_iter().collect();
+        let mut credited: Vec<String> =
+            enum_return_grounded_model_vars(&func).into_iter().collect();
         credited.sort();
         let mut paths = Vec::new();
         for block in &func.body.blocks {
@@ -646,10 +657,11 @@ fn collect_json(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 fn std_option_ty() -> Ty {
     Ty::Adt {
         arbitrary_precision: None,
+        validity_wrapper: None,
         adt_kind: None,
         layout: None,
         name: "core::option::Option".into(),
-        fields: vec![("__tag".into(), i64_ty()), ("__v1_0".into(), i64_ty())],
+        fields: vec![("__tag".into(), i64_ty()), ("__v1_0".into(), i64_ty())].into(),
         variants: vec![
             VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
             VariantDef {
@@ -657,7 +669,8 @@ fn std_option_ty() -> Ty {
                 discriminant: 1,
                 fields: vec![("0".into(), i64_ty())],
             },
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -717,6 +730,7 @@ fn dead_store_then_live_def(dead_variant: usize, ensures: &str) -> VerifiableFun
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("@trust_indirect_callee"),
                         unwind: Default::default(),
                     },
                 ),
@@ -734,6 +748,7 @@ fn dead_store_then_live_def(dead_variant: usize, ensures: &str) -> VerifiableFun
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -811,7 +826,6 @@ fn a_later_aggregate_overrides_an_earlier_one() {
     assert_eq!(ops.len(), 1);
 }
 
-
 // ===========================================================================
 // PIN 4 — the gate must refuse an exit it cannot inspect.
 //
@@ -841,6 +855,7 @@ fn a_tail_call_exit_grounds_nothing() {
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key("test::inner"),
     });
     assert!(
         enum_return_grounded_model_vars(&func).is_empty(),
@@ -869,6 +884,7 @@ fn a_body_with_no_return_block_grounds_nothing() {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("core::panicking::panic"),
             unwind: Default::default(),
         },
     ] {
@@ -1004,11 +1020,7 @@ fn assert_region_refused(func: &VerifiableFunction, why: &str) {
 #[track_caller]
 fn assert_region_grounds(func: &VerifiableFunction, why: &str) {
     let got = super::resolve_forwarded_call_return_variant(func, FWD_CALL_DEST, FWD_BLOCK);
-    assert_eq!(
-        got.map(|(k, v)| (format!("{k:?}"), v)),
-        Some(("Result".to_string(), 1)),
-        "{why}"
-    );
+    assert_eq!(got.map(|(k, v)| (format!("{k:?}"), v)), Some(("Result".to_string(), 1)), "{why}");
 }
 
 /// THE CONTROL, and the reason every negative below is worth having. With `bb3`
@@ -1059,8 +1071,7 @@ fn a_deinit_on_the_forwarded_local_refuses_the_region() {
 /// write the region check must see. The old scan named `Terminator::Call` only.
 #[test]
 fn a_drop_of_the_forwarded_local_refuses_the_region() {
-    let func =
-        forwarded_err_region(vec![], drop_in_region(FWD_CALL_DEST));
+    let func = forwarded_err_region(vec![], drop_in_region(FWD_CALL_DEST));
     assert_region_refused(&func, "drop glue takes `&mut call_dest`");
 }
 
@@ -1149,10 +1160,7 @@ fn the_same_perturbations_on_another_local_still_ground() {
         (
             "_9.0 = 7",
             vec![Statement::Assign {
-                place: Place {
-                    local: OTHER,
-                    projections: vec![trust_types::Projection::Field(0)],
-                },
+                place: Place { local: OTHER, projections: vec![trust_types::Projection::Field(0)] },
                 rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(7))),
                 span: SourceSpan::default(),
             }],
@@ -1580,7 +1588,10 @@ fn the_same_chain_perturbations_on_another_local_still_ground() {
             chain_with_err_arm_stmts(vec![Statement::StorageDead(OTHER)]),
         ),
     ] {
-        assert_chain_grounds(&func, &format!("{what} does not touch `_3` and must not stop the hop"));
+        assert_chain_grounds(
+            &func,
+            &format!("{what} does not touch `_3` and must not stop the hop"),
+        );
     }
 }
 

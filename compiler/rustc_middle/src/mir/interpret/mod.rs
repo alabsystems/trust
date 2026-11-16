@@ -21,6 +21,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_serialize::{Decodable, Encodable};
+use rustc_span::bug;
 use tracing::{debug, trace};
 // Also make the error macros available from this module.
 pub use {
@@ -37,8 +38,8 @@ pub use self::error::{
     BadBytesAccess, CheckAlignMsg, CheckInAllocMsg, ErrorHandled, EvalStaticInitializerRawResult,
     EvalToAllocationRawResult, EvalToConstValueResult, EvalToValTreeResult, InterpErrorInfo,
     InterpErrorKind, InterpResult, InvalidMetaKind, InvalidProgramInfo, MachineStopType,
-    Misalignment, ReportedErrorInfo, ResourceExhaustionInfo, ScalarSizeMismatch,
-    UndefinedBehaviorInfo, UnsupportedOpInfo, ValTreeCreationError, interp_ok,
+    Misalignment, ReportedErrorInfo, ResourceExhaustionInfo, UndefinedBehaviorInfo,
+    UnsupportedOpInfo, ValTreeCreationError, interp_ok,
 };
 pub use self::pointer::{CtfeProvenance, Pointer, PointerArithmetic, Provenance};
 pub use self::value::Scalar;
@@ -383,10 +384,8 @@ impl<'tcx> GlobalAlloc<'tcx> {
 
                     // Take over-alignment from attributes into account.
                     let align = match tcx.codegen_fn_attrs(def_id).alignment {
-                        Some(align_from_attribute) => {
-                            Ord::max(align_from_attribute, layout.align.abi)
-                        }
-                        None => layout.align.abi,
+                        Some(align_from_attribute) => Ord::max(align_from_attribute, layout.align),
+                        None => layout.align,
                     };
 
                     (layout.size, align)
@@ -399,7 +398,7 @@ impl<'tcx> GlobalAlloc<'tcx> {
             GlobalAlloc::Function { .. } => (Size::ZERO, Align::ONE),
             GlobalAlloc::VTable(..) => {
                 // No data to be accessed here. But vtables are pointer-aligned.
-                (Size::ZERO, tcx.data_layout.pointer_align().abi)
+                (Size::ZERO, tcx.data_layout.pointer_align())
             }
             // Fake allocation, there's nothing to access here.
             GlobalAlloc::TypeId { .. } => (Size::ZERO, Align::ONE),

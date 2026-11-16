@@ -2,11 +2,33 @@
 """Fail-closed check for parent-pinned submodule commit reachability.
 
 This release gate verifies that each commit recorded by the parent checkout's
-submodule gitlinks is contained in at least one fetched remote-tracking branch
-or durable ``refs/pins/<sha>`` archival ref in the corresponding submodule. It
-does not fetch or push. If a parent points at a local-only submodule commit, a
-fresh recursive clone may fail to reproduce that pin; this script reports that
-condition and exits non-zero.
+submodule gitlinks is contained in at least one branch or durable
+``refs/pins/<sha>`` archival ref that the submodule's remote PUBLISHES, read
+with ``git ls-remote`` during this run. If a parent points at a local-only
+submodule commit, a fresh recursive clone may fail to reproduce that pin; this
+script reports that condition and exits 1. It never pushes and never writes a
+ref; exit 2 is COULD NOT RUN (a remote could not be read), never a pass.
+
+THE REMOTE IS READ, NOT THIS STORE'S MEMORY OF IT (2026-10-15)
+--------------------------------------------------------------
+Until 2026-10-15 the predicate was ``for-each-ref --contains <sha>
+refs/remotes refs/pins`` in the local store. Those refs are only as fresh as
+the store's last fetch, so a pin newer than a stale ``origin/main`` read as
+unpublished: four pushes to Trust main from ~/trust-b1 went RED on
+2026-10-14/15 while the remote served every pin, and the remedy each time was
+a fetch that WRITES refs in module stores several worktrees share. It was also
+wrong the other way: a stale remote-tracking ref for a branch the forge had
+deleted, or a refs/pins/<sha> created locally and never pushed, made a pin
+"durable" that no fresh clone could fetch.
+
+Now the remote's own inventory (heads and refs/pins, one ``ls-remote`` per
+remote per run) is the authority, and ancestry is walked from THOSE tips. When
+that needs objects this store lacks (the pinned commit, or a remote tip it may
+sit under), they are fetched BY SHA with no destination --- no ref and no
+FETCH_HEAD is written. A remote that cannot be read is COULD NOT RUN
+(``remote-unreadable``), never a pass and never a finding. The shared
+mechanism is ``scripts/lib/remote_tips.py``; the decision is
+docs/DECISION_QUEUE.md "HOOKS-PIN-REMOTE-TIPS-1".
 
 ``refs/pins/*`` is the repository's branch-free retention namespace. The
 historical-pin audit fetches that namespace explicitly and anchors orphaned
@@ -31,6 +53,22 @@ was on a single deletable topic branch.
 So the subject is now parameterised by revision, and ``--push-context`` points
 it at what is actually being published. See ``select_subjects``.
 
+A PUSH PUBLISHES EVERY COMMIT IT INTRODUCES, NOT ONLY ITS TIP
+-------------------------------------------------------------
+Until 2026-09-27 ``--push-context`` judged only the tip tree of each pushed
+ref. A push publishes every commit in ``<remote sha>..<local sha>``, so a
+range whose middle commit pins a local-only submodule commit and whose last
+commit moves the pin back passed, while the published history kept a
+superproject commit no one else can reproduce --- and a consumer's plain
+``git pull`` (on-demand submodule recursion) then aborts fetching it. That is
+the mechanism behind the unrecoverable pins in docs/first-party-pin-ledger.md.
+The subject is now each pushed TIP TREE (every pin, as before) PLUS every
+gitlink that any commit the push introduces (one not already on the old
+remote tip or a fetched remote-tracking ref) adds or changes, merges included.
+A pin only an introduced commit names, at a path with no worktree (renamed or
+removed later in the same push), is judged in the object store that holds
+it. See ``introduced_commits`` and ``changed_gitlinks``.
+
 NESTED PINS COME FROM THE PINNED TREE, NOT THE SUBMODULE WORKTREE
 -----------------------------------------------------------------
 ``submodule status --recursive`` can only descend into a submodule that is
@@ -39,6 +77,34 @@ the work set. This reads every gitlink out of the PINNED tree instead --- for
 children, out of the submodule's own object store via ``--git-dir``, which
 survives a ``submodule deinit`` --- so the work set is a property of the
 revision under audit and not of what happens to be checked out.
+
+Git keys that store by submodule NAME (``modules/<name>``), not by path, and a
+module registered over an existing clone keeps an embedded ``.git`` directory
+with no ``modules/`` entry at all. So the store is looked up by name from the
+judged tree's ``.gitmodules``, then from the worktree's real git dir, then by
+path, with the common Git directory's module stores as fallbacks for linked
+worktrees. The first candidate that HOLDS the pinned commit is read (a commit id
+names its tree, so any store holding it gives the same answer). When no store
+can be found, or none can list the pinned tree, the pin is REFUSED
+(``nested-store-unresolved`` / ``nested-pins-unreadable``) rather than
+silently leaving its nested subtree out of the work set.
+
+ONE ANCESTRY READ PER REF HELD A PUSH FOR 1H41M (2026-11-13)
+-----------------------------------------------------------
+Each (pin, remote ref) question was its own ``agh repo commit-ancestry``
+process, asked serially over the remote's whole inventory until one ref
+contained the pin, with no total bound: a one-commit docs push waited 1h41m.
+Now (``rt.RemoteTips.judge_many``) the pins of a store are asked against main
+in one read and against the other refs in reads of up to 128 questions (Agh's
+cap); the store itself answers what it proves; answers are remembered by
+commit ids under ``<git common dir>/trust-land/commit-ancestry/<FORMAT>``
+(immutable; ``rt.AncestryMemory.FORMAT`` names the answer sources' version and
+Agh's native reply contract, so a fix to a source or a new contract retires the
+old answers, see docs/DECISION_QUEUE.md REACH-MEMO-1; check_ir_cohort.py reads
+the same answers). The remote's refs, and whether it serves a commit, are still
+read every run: they can change. Every remote read shares one bound
+(``--time-bound``), and a transient failure is retried inside it; past it a
+pin is COULD NOT RUN (exit 2) with the command to rerun, never a pass.
 
 A ZERO-SIZE WORK SET IS A FAILURE
 ---------------------------------
@@ -63,7 +129,14 @@ from typing import Iterable, Mapping, Optional, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+
+import remote_tips as rt  # noqa: E402  (scripts/lib/remote_tips.py)
+
 DEFAULT_REMOTE = "origin"
+# A status in this set means the pin was NOT JUDGED: the remote, or an object
+# it named, could not be read. It blocks like a failure, and exits 2, not 1.
+COULD_NOT_RUN_STATUSES = frozenset({"remote-unreadable"})
 GITLINK_MODE = "160000"
 NULL_SHA = "0" * 40
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -73,6 +146,11 @@ SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # This mirrors fast.revert-rationale / fast.measurement-provenance /
 # fast.pin-regression / fast.dependency-constellation.
 PUSH_REFS_ENV = "TRUST_PUSHED_REFS"
+# The whole row's remote reads share this bound (scripts/lib/remote_tips.py
+# RemoteTips.time_bound). Past it a pin is COULD NOT RUN (exit 2): until
+# 2026-11-13 there was none, and the row once waited 1h41m on serial ancestry
+# reads and once 37 minutes on a GitHub rate limit.
+DEFAULT_TIME_BOUND_S = 900.0
 
 
 @dataclass(frozen=True)
@@ -80,6 +158,12 @@ class SubmodulePin:
     path: str
     sha: str
     state: str
+    # Why this pin's own nested gitlinks could not be enumerated ("" when they
+    # were). A pin whose subtree is unknown is never judged complete.
+    nested_status: str = ""
+    nested_detail: str = ""
+    # The object store that holds ``sha`` (None when none was found).
+    store: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +182,10 @@ class PinCheck:
     @property
     def ok(self) -> bool:
         return self.status == "reachable"
+
+    @property
+    def could_not_run(self) -> bool:
+        return self.status in COULD_NOT_RUN_STATUSES
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -140,6 +228,22 @@ class AuditResult:
     def ok(self) -> bool:
         return not self.failed and not self.empty
 
+    @property
+    def unjudged(self) -> bool:
+        """Not ok ONLY because a remote could not be read: COULD NOT RUN.
+
+        One definite finding beside an unreadable remote is still a finding,
+        so this is false then and the exit is 1.
+        """
+        failed = self.failed
+        return bool(failed) and all(check.could_not_run for check in failed)
+
+    @property
+    def exit_code(self) -> int:
+        if self.ok:
+            return 0
+        return 2 if self.unjudged else 1
+
     def as_dict(self) -> dict[str, object]:
         failed = self.failed
         return {
@@ -149,6 +253,7 @@ class AuditResult:
                 "checked": len(self.pins),
                 "reachable": len(self.pins) - len(failed),
                 "failed": len(failed),
+                "could_not_run": sum(1 for check in failed if check.could_not_run),
                 "empty_work_set": self.empty,
             },
             "pins": [pin.as_dict() for pin in self.pins],
@@ -165,12 +270,14 @@ def run_git(
     *,
     check: bool = True,
     extra_config: Sequence[str] = (),
+    input_text: Optional[str] = None,
 ) -> subprocess.CompletedProcess[str]:
     command = ["git", *extra_config, *args]
     completed = subprocess.run(
         command,
         cwd=repo,
         text=True,
+        input=input_text,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -189,7 +296,7 @@ def run_git_dir(
 
     Children are read through ``--git-dir`` rather than ``-C <worktree>`` so a
     ``submodule deinit`` --- which removes the worktree and leaves
-    ``modules/<path>`` intact --- cannot silently remove that module's nested
+    ``modules/<name>`` intact --- cannot silently remove that module's nested
     pins from the work set.
     """
     command = ["git", "--git-dir", str(git_dir), *args]
@@ -249,28 +356,55 @@ def tree_gitlinks(repo_root: Path, revision: str) -> list[tuple[str, str]]:
     return _parse_gitlinks(listed.stdout, sha_field=2, origin=f"tree {revision}")
 
 
-def tree_gitlinks_in_store(git_dir: Path, revision: str) -> list[tuple[str, str]]:
-    listed = run_git_dir(
-        git_dir, ["ls-tree", "-r", "-z", "--full-tree", revision], check=False
-    )
-    if listed.returncode != 0:
-        # The pinned commit is not in this store, so its nested gitlinks cannot
-        # be enumerated. That is never silently absorbed: the pin itself is in
-        # the work set and check_pin refuses it as missing-commit-object.
-        return []
-    return _parse_gitlinks(listed.stdout, sha_field=2, origin=f"tree {revision}")
+def gitmodules_names(
+    completed: subprocess.CompletedProcess[str],
+) -> dict[str, list[str]]:
+    """path -> submodule NAME(s), from ``git config -z --blob <.gitmodules>``.
+
+    A non-zero exit (no ``.gitmodules`` in that tree, or no ``path`` key) is an
+    empty mapping, and that is safe here rather than fail-open: a name only
+    proposes a CANDIDATE store. Whether a store is used is decided by whether
+    it holds the pinned commit, and a pin with no usable store is refused by
+    ``list_nested``.
+    """
+    names: dict[str, list[str]] = {}
+    if completed.returncode != 0:
+        return names
+    prefix, suffix = "submodule.", ".path"
+    for record in completed.stdout.split("\0"):
+        key, sep, value = record.partition("\n")
+        if not sep or not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        name = key[len(prefix) : -len(suffix)]
+        if name:
+            names.setdefault(value, []).append(name)
+    return names
 
 
-def top_level_git_dir(repo_root: Path, path: str) -> Optional[Path]:
-    """Git's per-worktree object store for a first-level submodule.
+def gitmodules_query(blob: str) -> list[str]:
+    return ["config", "-z", "--blob", blob, "--get-regexp", r"^submodule\..*\.path$"]
+
+
+def top_level_names(repo_root: Path, subject: "Subject") -> dict[str, list[str]]:
+    blob = ":.gitmodules" if subject.kind == "index" else f"{subject.rev}:.gitmodules"
+    return gitmodules_names(run_git(repo_root, gitmodules_query(blob), check=False))
+
+
+def nested_names(store: Path, sha: str) -> dict[str, list[str]]:
+    query = gitmodules_query(f"{sha}:.gitmodules")
+    return gitmodules_names(run_git_dir(store, query, check=False))
+
+
+def git_path(repo_root: Path, relative: str) -> Optional[Path]:
+    """Resolve ``$GIT_DIR/<relative>`` the way Git does.
 
     A linked worktree has a ``.git`` FILE, so asking Git to resolve
-    ``modules/<path>`` matters --- spelling it ``repo/.git/modules/<path>``
+    ``modules/<name>`` matters --- spelling it ``repo/.git/modules/<name>``
     classifies every submodule in a linked worktree as absent.
     """
     resolved = run_git(
         repo_root,
-        ["rev-parse", "--path-format=absolute", "--git-path", f"modules/{path}"],
+        ["rev-parse", "--path-format=absolute", "--git-path", relative],
         check=False,
     )
     if resolved.returncode != 0:
@@ -279,35 +413,254 @@ def top_level_git_dir(repo_root: Path, path: str) -> Optional[Path]:
     return Path(text) if text else None
 
 
-def collect_pins(repo_root: Path, subject: "Subject") -> tuple[SubmodulePin, ...]:
+def git_common_dir(repo: Path, *, is_store: bool = False) -> Optional[Path]:
+    """Ask Git for the common directory of a worktree or selected object store.
+
+    A linked worktree's ``--git-path modules/...`` is private to that worktree,
+    while an existing submodule clone may live in the common directory.
+    """
+    runner = run_git_dir if is_store else run_git
+    resolved = runner(
+        repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"], check=False
+    )
+    text = resolved.stdout.strip()
+    return Path(text) if resolved.returncode == 0 and text else None
+
+
+def worktree_git_dir(repo_root: Path, path: str) -> Optional[Path]:
+    """The real git dir of a materialized submodule worktree, absorbed or not.
+
+    Only when ``<path>`` is itself a worktree TOPLEVEL: an empty directory
+    inside the superproject would otherwise answer with the superproject's
+    own git dir.
+    """
+    worktree = repo_root / path
+    if not worktree.is_dir() or not git_dir_exists(worktree):
+        return None
+    resolved = run_git(worktree, ["rev-parse", "--absolute-git-dir"], check=False)
+    text = resolved.stdout.strip()
+    if resolved.returncode != 0 or not text:
+        return None
+    return Path(text)
+
+
+@dataclass(frozen=True)
+class NestedListing:
+    """The gitlinks a pinned commit's own tree carries, or why they are unknown."""
+
+    store: Optional[Path]
+    gitlinks: tuple[tuple[str, str], ...]
+    status: str = ""  # "" | "nested-store-unresolved" | "nested-pins-unreadable"
+    detail: str = ""
+
+
+def _existing_stores(candidates: Sequence[Optional[Path]]) -> list[Path]:
+    stores: list[Path] = []
+    for candidate in candidates:
+        if candidate is not None and candidate.is_dir() and candidate not in stores:
+            stores.append(candidate)
+    return stores
+
+
+def _fetch_store(
+    stores: Sequence[Path], tips: "rt.RemoteTips"
+) -> Optional[Path]:
+    """The first candidate store that is a repository with a remote to ask."""
+    for store in stores:
+        remote = tips.remote(store)
+        if remote.git_dir is not None and not remote.error:
+            return store
+    return None
+
+
+def _list_from(store: Path, sha: str) -> Optional[NestedListing]:
+    """``sha``'s gitlinks from ``store``, or None when the store lacks it."""
+    present = run_git_dir(store, ["cat-file", "-e", f"{sha}^{{commit}}"], check=False)
+    if present.returncode != 0:
+        return None
+    listed = run_git_dir(store, ["ls-tree", "-r", "-z", "--full-tree", sha], check=False)
+    if listed.returncode != 0:
+        return NestedListing(
+            store=store,
+            gitlinks=(),
+            status="nested-pins-unreadable",
+            detail=(
+                f"git ls-tree {sha} failed in {store}: "
+                f"{listed.stderr.strip() or listed.stdout.strip()}"
+            ),
+        )
+    return NestedListing(
+        store=store,
+        gitlinks=tuple(_parse_gitlinks(listed.stdout, sha_field=2, origin=f"tree {sha}")),
+    )
+
+
+def list_nested(
+    path: str,
+    sha: str,
+    candidates: Sequence[Optional[Path]],
+    cache: dict[tuple[str, str, tuple[str, ...]], NestedListing],
+    tips: Optional["rt.RemoteTips"] = None,
+) -> NestedListing:
+    """Read ``sha``'s gitlinks from the first candidate store that holds it.
+
+    Every way this can come up empty is a REFUSAL, never ``[]``: this used to
+    treat an unlocatable store and a failing ``ls-tree`` as "no nested pins",
+    with a comment claiming check_pin would refuse the pin instead. check_pin
+    probes the WORKTREE, which is a different repository whenever the store
+    was located by the wrong key, so a whole nested subtree left the work set
+    under a PASS.
+
+    When no store holds the commit and ``tips`` is given, the commit is
+    fetched by sha into the first store that has a remote (no ref written)
+    and read from there. A store that merely has not fetched is not a
+    finding; a remote that will not serve the commit still is, and a remote
+    that cannot be read is ``remote-unreadable`` (COULD NOT RUN).
+    """
+    stores = _existing_stores(candidates)
+    key = (path, sha, tuple(str(store) for store in stores))
+    if key in cache:
+        return cache[key]
+    listing: Optional[NestedListing] = None
+    if not stores:
+        tried = ", ".join(str(c) for c in candidates if c is not None) or "none"
+        listing = NestedListing(
+            store=None,
+            gitlinks=(),
+            status="nested-store-unresolved",
+            detail=(
+                f"no object store was found for {path} (tried: {tried}), so the "
+                "gitlinks its pinned commit carries were not enumerated"
+            ),
+        )
+    for store in stores:
+        if listing is not None:
+            break
+        listing = _list_from(store, sha)
+    fetch_note = ""
+    if listing is None and tips is not None:
+        target = _fetch_store(stores, tips)
+        if target is not None:
+            failed = tips.ensure(target, [sha])
+            if not failed:
+                listing = _list_from(target, sha)
+            else:
+                kind, why = failed[sha]
+                if kind == "error":
+                    listing = NestedListing(
+                        store=None,
+                        gitlinks=(),
+                        status="remote-unreadable",
+                        detail=(
+                            f"no local store holds {sha} and it could not be fetched, so "
+                            f"the gitlinks it pins were not enumerated: {why}"
+                        ),
+                    )
+                else:
+                    fetch_note = f"; and its remote does not serve it either ({why})"
+    if listing is None:
+        listing = NestedListing(
+            store=None,
+            gitlinks=(),
+            status="nested-pins-unreadable",
+            detail=(
+                f"none of the object stores found for {path} "
+                f"({', '.join(str(store) for store in stores)}) holds {sha}, so "
+                f"the gitlinks it pins were not enumerated{fetch_note}"
+            ),
+        )
+    cache[key] = listing
+    return listing
+
+
+def collect_pins(
+    repo_root: Path,
+    subject: "Subject",
+    cache: Optional[dict[tuple[str, str, tuple[str, ...]], NestedListing]] = None,
+    tips: Optional["rt.RemoteTips"] = None,
+) -> tuple[SubmodulePin, ...]:
     """Every gitlink the subject names, recursively, read from PINNED trees.
 
-    The recursion carries each module's object store so children are read from
-    ``<parent git dir>/modules/<relpath>`` --- git's real on-disk layout --- and
-    a cycle cannot spin: a path is expanded at most once.
+    Each pin's children are read from the store that holds the pinned commit,
+    located by NAME first --- ``modules/<name>`` from the judged tree's
+    ``.gitmodules``, Git's real on-disk key --- then by the worktree's own git
+    dir, then by path. Common-directory name/path fallbacks cover existing
+    stores shared with another linked worktree. A pin whose subtree cannot be
+    enumerated carries
+    ``nested_status`` so ``audit`` refuses it. A cycle cannot spin: a path is
+    expanded at most once per subject.
+
+    With ``tips``, the top-level pinned commits a store lacks are fetched
+    first, one fetch per store and all stores at once, together with each
+    remote's main tip (the containment check's first question).
     """
+    listings = {} if cache is None else cache
     if subject.kind == "index":
         top = index_gitlinks(repo_root)
+    elif subject.kind == "introduced":
+        top = list(subject.gitlinks)
     else:
         top = tree_gitlinks(repo_root, subject.rev)
 
+    names = top_level_names(repo_root, subject) if top else {}
+    common = git_common_dir(repo_root) if top else None
     pins: list[SubmodulePin] = []
     seen: set[str] = set()
-    queue: list[tuple[str, str, Optional[Path]]] = [
-        (path, sha, top_level_git_dir(repo_root, path)) for path, sha in top
-    ]
+    queue: list[tuple[str, str, list[Optional[Path]]]] = []
+    for path, sha in top:
+        candidates: list[Optional[Path]] = [
+            git_path(repo_root, f"modules/{name}") for name in names.get(path, [])
+        ]
+        candidates.append(worktree_git_dir(repo_root, path))
+        candidates.append(git_path(repo_root, f"modules/{path}"))
+        if common is not None:
+            candidates.extend(common / "modules" / name for name in names.get(path, []))
+            candidates.append(common / "modules" / path)
+        queue.append((path, sha, candidates))
+    if tips is not None:
+        by_store: dict[Path, list[str]] = {}
+        for _, sha, candidates in queue:
+            target = _fetch_store(_existing_stores(candidates), tips)
+            if target is not None:
+                by_store.setdefault(target, []).append(sha)
+        rt.parallel_map(lambda item: tips.warm(item[0], item[1]), list(by_store.items()))
     while queue:
-        path, sha, git_dir = queue.pop(0)
+        path, sha, candidates = queue.pop(0)
         if path in seen:
             continue
         seen.add(path)
-        pins.append(SubmodulePin(path=path, sha=sha, state=" "))
-        if git_dir is None or not git_dir.is_dir():
-            continue
-        for relpath, nested_sha in tree_gitlinks_in_store(git_dir, sha):
-            queue.append(
-                (f"{path}/{relpath}", nested_sha, git_dir / "modules" / relpath)
+        listing = list_nested(path, sha, candidates, listings, tips)
+        pins.append(
+            SubmodulePin(
+                path=path,
+                sha=sha,
+                state=" ",
+                nested_status=listing.status,
+                nested_detail=listing.detail,
+                store=listing.store,
             )
+        )
+        store = listing.store
+        if store is None or listing.status:
+            continue
+        child_names = nested_names(store, sha) if listing.gitlinks else {}
+        common = git_common_dir(store, is_store=True) if listing.gitlinks else None
+        for relpath, nested_sha in listing.gitlinks:
+            child_path = f"{path}/{relpath}"
+            child: list[Optional[Path]] = [
+                store / "modules" / name for name in child_names.get(relpath, [])
+            ]
+            child.append(worktree_git_dir(repo_root, child_path))
+            child.append(store / "modules" / relpath)
+            if common is not None:
+                child.extend(common / "modules" / name for name in child_names.get(relpath, []))
+                child.append(common / "modules" / relpath)
+            queue.append((child_path, nested_sha, child))
+            if tips is not None:
+                # Read the nested store's remote while the walk goes on.
+                nested_store = _fetch_store(_existing_stores(child), tips)
+                if nested_store is not None:
+                    tips.prefetch([nested_store], wait=False)
     return tuple(pins)
 
 
@@ -342,24 +695,6 @@ def remote_url(path: Path, remote: str) -> str:
     return result.stdout.strip()
 
 
-def durable_refs_containing(path: Path, sha: str) -> tuple[str, ...]:
-    result = run_git(
-        path,
-        [
-            "for-each-ref",
-            "--contains",
-            sha,
-            "--format=%(refname:short)",
-            "refs/remotes",
-            "refs/pins",
-        ],
-        check=False,
-    )
-    if result.returncode != 0:
-        raise GitError(result.stderr.strip() or result.stdout.strip())
-    return tuple(ref for ref in result.stdout.splitlines() if ref)
-
-
 def shell_join(parts: Iterable[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
@@ -372,41 +707,37 @@ def publish_command(path: str, remote: str, sha: str) -> str:
     return shell_join(["git", "-C", path, "push", remote, f"{sha}:{pin_ref(sha)}"])
 
 
-def fetch_anchor_command(path: str, remote: str, sha: str) -> str:
-    """Retrieve an anchor that already exists on the remote.
+def check_pin(
+    repo_root: Path,
+    pin: SubmodulePin,
+    store: Optional[Path] = None,
+    tips: Optional["rt.RemoteTips"] = None,
+) -> PinCheck:
+    """Judge one pin in the repository that owns it.
 
-    NOT ``fetch --all``. That expands each remote's DEFAULT refspec, which is
-    ``+refs/heads/*:refs/remotes/<remote>/*`` — branches. ``refs/pins/*`` is a
-    branch-free namespace by construction, so the one fetch a reader is most
-    likely to reach for is the one that provably cannot help.
+    That is the submodule WORKTREE at ``<repo_root>/<path>``. ``store`` is used
+    only when that path does not exist at all: a pin named solely by a commit
+    the push introduces, at a path the same push later renames or removes, has
+    no worktree, so it is judged in the object store that holds it (located by
+    name, see ``collect_pins``). ``audit`` never passes a store for a pin a
+    pushed tip or the index names, so a missing tip worktree still refuses.
+
+    The verdict is the REMOTE's (``rt.RemoteTips.judge``): contained in a
+    branch or refs/pins anchor the remote publishes this run. No local ref is
+    consulted, and none is written.
     """
-    return shell_join(
-        ["git", "-C", path, "fetch", remote, f"+{pin_ref(sha)}:{pin_ref(sha)}"]
-    )
-
-
-def remote_has_pin_anchor(path: Path, remote: str, sha: str) -> Optional[bool]:
-    """Does the remote already carry ``refs/pins/<sha>``?
-
-    ``ls-remote`` is a READ: it neither fetches nor pushes, so this keeps the
-    module's stated contract while letting a failure name the ONE command that
-    fixes it. Returns None when the remote cannot be reached, so an offline run
-    degrades to offering both options rather than asserting the wrong one.
-    """
-    result = run_git(path, ["ls-remote", remote, pin_ref(sha)], check=False)
-    if result.returncode != 0:
-        return None
-    return bool(result.stdout.strip())
-
-
-def check_pin(repo_root: Path, pin: SubmodulePin) -> PinCheck:
+    tips = rt.RemoteTips() if tips is None else tips
     submodule_path = repo_root / pin.path
-    remote = preferred_remote(submodule_path) if submodule_path.exists() else DEFAULT_REMOTE
-    url = remote_url(submodule_path, remote) if submodule_path.exists() else ""
+    in_store = store is not None and not submodule_path.exists()
+    repo = store if in_store and store is not None else submodule_path
+    where = str(repo) if in_store else pin.path
+    present = in_store or submodule_path.exists()
+    remote = preferred_remote(repo) if present else DEFAULT_REMOTE
+    url = remote_url(repo, remote) if present else ""
     publish_ref = pin_ref(pin.sha)
-    command = publish_command(pin.path, remote, pin.sha)
+    command = publish_command(where, remote, pin.sha)
 
-    if not submodule_path.exists():
+    if not present:
         return PinCheck(
             path=pin.path,
             sha=pin.sha,
@@ -425,7 +756,7 @@ def check_pin(repo_root: Path, pin: SubmodulePin) -> PinCheck:
             detail="submodule path is missing; initialize it before checking remote reachability",
         )
 
-    if not git_dir_exists(submodule_path):
+    if not in_store and not git_dir_exists(submodule_path):
         return PinCheck(
             path=pin.path,
             sha=pin.sha,
@@ -444,12 +775,21 @@ def check_pin(repo_root: Path, pin: SubmodulePin) -> PinCheck:
             detail="submodule path is not a Git worktree",
         )
 
-    object_check = run_git(
-        submodule_path,
-        ["cat-file", "-e", f"{pin.sha}^{{commit}}"],
-        check=False,
-    )
-    if object_check.returncode != 0:
+    verdict = tips.judge(repo, pin.sha, scope="durable")
+
+    if verdict.state == rt.CONTAINED:
+        return PinCheck(
+            path=pin.path,
+            sha=pin.sha,
+            status="reachable",
+            remote_refs=verdict.refs,
+            remote=remote,
+            remote_url=url,
+        )
+
+    if verdict.state == rt.ABSENT:
+        # No local store holds it AND the remote refused it by sha: only the
+        # clone that authored the commit can repair this, by publishing it.
         return PinCheck(
             path=pin.path,
             sha=pin.sha,
@@ -457,128 +797,111 @@ def check_pin(repo_root: Path, pin: SubmodulePin) -> PinCheck:
             remote=remote,
             remote_url=url,
             publish_ref=publish_ref,
-            # NOT `fetch --all --tags --prune`: that expands the default
-            # refspec (branches) plus tags, and a pin that lands here is
-            # characteristically on neither — an anchored pin lives only under
-            # `refs/pins/*`. Fetch the sha itself, which works whether the
-            # commit is on a branch, on an anchor ref, or reachable only by
-            # identity.
-            suggested_command=shell_join(["git", "-C", pin.path, "fetch", remote, pin.sha]),
-            detail="pinned commit object is not present in the initialized submodule",
+            suggested_command=f"{command}   # from the clone that has the commit",
+            detail=(
+                "pinned commit object is not present in the initialized submodule, "
+                f"and {remote} does not serve it either: {verdict.detail}"
+            ),
         )
 
-    try:
-        refs = durable_refs_containing(submodule_path, pin.sha)
-    except GitError as error:
+    if verdict.state == rt.NOT_CONTAINED:
+        # The remote's whole inventory was read, so this is decided: the
+        # anchor does not exist (an existing one is a reachable verdict
+        # above), and publishing it is the repair.
         return PinCheck(
             path=pin.path,
             sha=pin.sha,
-            status="remote-reachability-error",
+            status="not-reachable-from-remote",
             remote=remote,
             remote_url=url,
             publish_ref=publish_ref,
             suggested_command=command,
-            detail=str(error),
+            detail=verdict.detail,
         )
 
-    if refs:
-        return PinCheck(
-            path=pin.path,
-            sha=pin.sha,
-            status="reachable",
-            remote_refs=refs,
-            remote=remote,
-            remote_url=url,
-        )
-
-    # The commit IS in the local object store; it is simply not named by any
-    # local durable ref. There are TWO different worlds behind that one symptom
-    # and they need opposite commands:
-    #
-    #   * the anchor does not exist yet          -> PUBLISH it (push)
-    #   * the anchor exists but was never fetched -> RETRIEVE it (fetch)
-    #
-    # This used to always advise the push. Measured 2026-08-31 on
-    # `first-party/ay b851ff38`: the anchor had been on the remote the whole
-    # time and only the local clone lacked it, because `refs/pins/*` is outside
-    # the default fetch refspec and nothing fetches it. Being told to publish an
-    # anchor that already exists reads as "someone pushed a gitlink for an
-    # unpublished commit" — a false accusation about another author's push
-    # discipline, produced by the tool that was supposed to settle the question.
-    # One read-only `ls-remote` distinguishes them.
-    anchored_remotely = remote_has_pin_anchor(submodule_path, remote, pin.sha)
-    if anchored_remotely is True:
-        fix = fetch_anchor_command(pin.path, remote, pin.sha)
-        detail = (
-            "pinned commit is present locally and ALREADY ANCHORED at "
-            f"{publish_ref} on {remote}; this clone has not fetched that ref "
-            "(refs/pins/* is outside the default fetch refspec)"
-        )
-    elif anchored_remotely is False:
-        fix = command
-        detail = (
-            "pinned commit is present locally, is not contained in refs/remotes/* "
-            f"or refs/pins/*, and {remote} does not carry {publish_ref} either"
-        )
-    else:
-        fix = f"{fetch_anchor_command(pin.path, remote, pin.sha)}   # if it is already anchored; otherwise: {command}"
-        detail = (
-            "pinned commit is present locally but not contained in refs/remotes/* "
-            f"or refs/pins/*; {remote} could not be read, so it is unknown whether "
-            f"{publish_ref} already exists"
-        )
-
+    # UNJUDGED: COULD NOT RUN. Not a pass, and not a claim about the pin.
     return PinCheck(
         path=pin.path,
         sha=pin.sha,
-        status="not-reachable-from-fetched-remotes",
+        status="remote-unreadable",
         remote=remote,
         remote_url=url,
         publish_ref=publish_ref,
-        suggested_command=fix,
-        detail=detail,
+        suggested_command=(
+            f"{shell_join(['git', '-C', where, 'ls-remote', remote, 'refs/heads/main'])}"
+            "   # check the network and credentials, then push again"
+        ),
+        detail=verdict.detail,
     )
 
 
 @dataclass(frozen=True)
 class Subject:
-    """One revision (or the index) whose gitlinks this run must judge."""
+    """One revision (or the index) whose gitlinks this run must judge.
 
-    kind: str  # "index" | "revision"
+    ``kind`` is ``index`` (the staged gitlinks), ``revision`` (every gitlink in
+    that commit's tree), or ``introduced`` (only the gitlinks that commit adds
+    or changes relative to a parent, carried in ``gitlinks``; ``rev`` is still
+    the commit, whose ``.gitmodules`` names the stores).
+    """
+
+    kind: str  # "index" | "revision" | "introduced"
     rev: str  # "" for the index
     label: str
+    gitlinks: tuple[tuple[str, str], ...] = ()
 
 
 INDEX_SUBJECT = Subject(kind="index", rev="", label="index (git ls-files -s)")
 
 
-def pushed_revisions(env: Mapping[str, str]) -> Optional[list[tuple[str, str]]]:
-    """The (local sha, local ref) pairs a push in flight would publish.
+@dataclass(frozen=True)
+class PushedUpdate:
+    """One non-deletion line git handed the pre-push hook."""
+
+    local_ref: str
+    local_sha: str
+    remote_ref: str
+    remote_sha: str  # NULL_SHA for a new ref, or when git gave none
+
+
+def _is_null_sha(sha: str) -> bool:
+    return not sha or set(sha) == {"0"}
+
+
+def pushed_updates(env: Mapping[str, str]) -> Optional[list[PushedUpdate]]:
+    """The ref updates a push in flight would publish.
 
     ``None`` means no push is in flight --- the variable is UNSET, so the
     caller widens to its historical reading. An empty LIST means a push that
     updates no ref that publishes a tree (empty-but-set, or all deletions),
     which also has nothing narrower to judge. Set-vs-unset is the test, not
     empty-vs-nonempty: an empty-but-set variable is a REAL push.
+
+    The REMOTE sha is kept, not discarded: it bounds the commits the push
+    introduces (``introduced_commits``), and every one of those is published.
     """
     raw = env.get(PUSH_REFS_ENV)
     if raw is None:
         return None
-    revisions: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    updates: list[PushedUpdate] = []
+    seen: set[tuple[str, str]] = set()
     for line in raw.splitlines():
         fields = line.split()
         if len(fields) < 2:
             continue
         local_ref, local_sha = fields[0], fields[1]
         # A deletion publishes no tree; its local sha is all zeroes.
-        if not local_sha or set(local_sha) == {"0"}:
+        if _is_null_sha(local_sha):
             continue
-        if local_sha in seen:
+        remote_ref = fields[2] if len(fields) > 2 else ""
+        # A missing remote sha is read as a new ref, which only WIDENS the
+        # introduced range (to everything no remote-tracking ref has).
+        remote_sha = fields[3] if len(fields) > 3 else NULL_SHA
+        if (local_sha, remote_sha) in seen:
             continue
-        seen.add(local_sha)
-        revisions.append((local_sha, local_ref))
-    return revisions
+        seen.add((local_sha, remote_sha))
+        updates.append(PushedUpdate(local_ref, local_sha, remote_ref, remote_sha))
+    return updates
 
 
 def resolve_revision(repo_root: Path, revision: str, label: str) -> str:
@@ -598,6 +921,99 @@ def resolve_revision(repo_root: Path, revision: str, label: str) -> str:
     return resolved.lower()
 
 
+def introduced_commits(repo_root: Path, local_sha: str, remote_sha: str) -> list[str]:
+    """Every commit this ref update publishes that was not already published.
+
+    ``rev-list <local> --not <remote sha> --remotes``: the old remote tip
+    bounds the range, and a commit already on a fetched remote-tracking ref
+    was published by an earlier push (a ``Merge origin/main into topic`` push
+    would otherwise re-judge a thousand commits of main). With a new ref, or a
+    remote sha this clone does not have (a force push over unfetched work),
+    only ``--remotes`` bounds it, which WIDENS the range rather than guessing.
+    A rev-list failure raises: an empty list here must mean "introduces
+    nothing", never "could not tell".
+    """
+    exclude = ["--remotes"]
+    if not _is_null_sha(remote_sha):
+        known = run_git(
+            repo_root, ["cat-file", "-e", f"{remote_sha}^{{commit}}"], check=False
+        )
+        if known.returncode == 0:
+            exclude.insert(0, remote_sha)
+    listed = run_git(repo_root, ["rev-list", local_sha, "--not", *exclude])
+    commits = [line.strip().lower() for line in listed.stdout.splitlines() if line.strip()]
+    for commit in commits:
+        if not SHA_RE.match(commit):
+            raise GitError(f"could not parse rev-list output for {local_sha}: {commit!r}")
+    return commits
+
+
+def changed_gitlinks(
+    repo_root: Path, commits: Sequence[str]
+) -> dict[str, list[tuple[str, str]]]:
+    """commit -> the gitlinks it adds or changes against any parent.
+
+    One ``diff-tree --stdin`` for the whole range. ``-m`` diffs a merge
+    against EACH parent, so a pin a merge resolution introduces is seen;
+    ``--root`` diffs a root commit against the empty tree. A gitlink equal to
+    one parent's is inherited from it, and that parent is either introduced
+    too (and listed there) or already published. Submodule-ignore
+    configuration is overridden twice over (``diff.ignoreSubmodules`` and
+    ``--ignore-submodules=none``): this clone sets ``ignore = all``, under
+    which a porcelain diff drops every gitlink row. ``-z`` so a non-ASCII
+    path is not C-quoted into a path that does not exist.
+    """
+    found: dict[str, list[tuple[str, str]]] = {}
+    if not commits:
+        return found
+    listed = run_git(
+        repo_root,
+        [
+            "diff-tree",
+            "--stdin",
+            "-r",
+            "-z",
+            "-m",
+            "--root",
+            "--no-renames",
+            "--ignore-submodules=none",
+        ],
+        extra_config=["-c", "diff.ignoreSubmodules=none"],
+        input_text="".join(f"{commit}\n" for commit in commits),
+    )
+    tokens = listed.stdout.split("\0")
+    current = ""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if not token.strip():
+            continue
+        if token.startswith(":"):
+            if index >= len(tokens) or not current:
+                raise GitError(f"could not parse diff-tree row: {token!r}")
+            path = tokens[index]
+            index += 1
+            fields = token[1:].split()
+            if len(fields) < 5:
+                raise GitError(f"could not parse diff-tree row: {token!r}")
+            dst_mode, dst_sha, status = fields[1], fields[3], fields[4]
+            if dst_mode != GITLINK_MODE or status.startswith("D"):
+                continue
+            if not SHA_RE.match(dst_sha):
+                raise GitError(f"could not parse diff-tree gitlink sha: {token!r}")
+            entry = (path, dst_sha.lower())
+            rows = found.setdefault(current, [])
+            if entry not in rows:
+                rows.append(entry)
+            continue
+        header = token.split()[0].lower()
+        if not SHA_RE.match(header):
+            raise GitError(f"could not parse diff-tree commit header: {token!r}")
+        current = header
+    return found
+
+
 def select_subjects(
     repo_root: Path,
     *,
@@ -610,9 +1026,13 @@ def select_subjects(
     """Which revisions this invocation judges, announcing the choice.
 
     Every path here either NARROWS to something strictly more relevant than the
-    index (an actual pushed revision) or WIDENS back to the index. It never
-    narrows to nothing --- an empty subject list would pass vacuously, which is
-    the failure mode this whole lane exists to refuse.
+    index (what a push actually publishes) or WIDENS back to the index. It
+    never narrows to nothing --- an empty subject list would pass vacuously,
+    which is the failure mode this whole lane exists to refuse.
+
+    A push is judged as each pushed TIP tree (every pin it names) plus every
+    gitlink added or changed by a commit the push introduces: an intermediate
+    commit is published exactly as much as the tip is.
     """
     environ = os.environ if env is None else env
     out = sys.stdout if stream is None else stream
@@ -625,7 +1045,7 @@ def select_subjects(
             ),
         )
     if push_context:
-        pushed = pushed_revisions(environ)
+        pushed = pushed_updates(environ)
         if pushed is None:
             if emit:
                 print(
@@ -644,52 +1064,141 @@ def select_subjects(
                     file=out,
                 )
             return (INDEX_SUBJECT,)
-        if emit:
-            print(f"SUBJECT: push ({len(pushed)} ref update(s))", file=out)
-        return tuple(
-            Subject(
-                kind="revision",
-                rev=resolve_revision(repo_root, sha, f"pushed ref {ref}"),
-                label=f"pushed {ref} [{sha[:12]}]",
+        tips: list[Subject] = []
+        tip_shas: set[str] = set()
+        introduced_by: dict[str, list[str]] = {}
+        introduced_order: list[str] = []
+        for update in pushed:
+            resolved = resolve_revision(
+                repo_root, update.local_sha, f"pushed ref {update.local_ref}"
             )
-            for sha, ref in pushed
-        )
+            if resolved not in tip_shas:
+                tip_shas.add(resolved)
+                tips.append(
+                    Subject(
+                        kind="revision",
+                        rev=resolved,
+                        label=f"pushed {update.local_ref} [{update.local_sha[:12]}]",
+                    )
+                )
+            for commit in introduced_commits(repo_root, resolved, update.remote_sha):
+                if commit not in introduced_by:
+                    introduced_by[commit] = []
+                    introduced_order.append(commit)
+                if update.local_ref not in introduced_by[commit]:
+                    introduced_by[commit].append(update.local_ref)
+        # A pushed tip's whole tree is already judged; its diff adds nothing.
+        intermediate = [c for c in introduced_order if c not in tip_shas]
+        changed = changed_gitlinks(repo_root, intermediate)
+        introduced = [
+            Subject(
+                kind="introduced",
+                rev=commit,
+                label=f"{', '.join(introduced_by[commit])} introduces {commit[:12]}",
+                gitlinks=tuple(changed[commit]),
+            )
+            for commit in intermediate
+            if changed.get(commit)
+        ]
+        if emit:
+            print(
+                f"SUBJECT: push ({len(pushed)} ref update(s); "
+                f"{len(introduced_order)} introduced commit(s), "
+                f"{len(introduced)} intermediate one(s) changing a gitlink)",
+                file=out,
+            )
+        return (*tips, *introduced)
     if emit:
         print("SUBJECT: index/HEAD (no push context requested)", file=out)
     return (INDEX_SUBJECT,)
 
 
 def audit(
-    repo_root: Path, subjects: Sequence[Subject] = (INDEX_SUBJECT,)
+    repo_root: Path,
+    subjects: Sequence[Subject] = (INDEX_SUBJECT,),
+    tips: Optional["rt.RemoteTips"] = None,
 ) -> AuditResult:
     """Judge every distinct (path, sha) pin any subject names.
 
     A pin named by several pushed revisions is checked once and reports all of
-    them, so a failure says which ref would publish it.
+    them, so a failure says which ref --- or which introduced commit --- would
+    publish it. A pin whose own nested gitlinks could not be enumerated is
+    refused even when its reachability passes: its subtree was never judged.
+
+    One ``RemoteTips`` serves the whole run, so each remote is listed once;
+    the pins are judged concurrently (each remote read is network latency).
     """
+    tips = rt.RemoteTips() if tips is None else tips
     order: list[tuple[str, str]] = []
     named_by: dict[tuple[str, str], list[str]] = {}
+    unenumerated: dict[tuple[str, str], tuple[str, str]] = {}
+    # A pin named by a tip tree or the index is judged in its worktree only.
+    # A pin named ONLY by an introduced commit may be at a path the same push
+    # renamed away, so check_pin may judge it in the store that holds it.
+    tip_named: set[tuple[str, str]] = set()
+    stores: dict[tuple[str, str], Path] = {}
+    cache: dict[tuple[str, str, tuple[str, ...]], NestedListing] = {}
     for subject in subjects:
-        for pin in collect_pins(repo_root, subject):
+        for pin in collect_pins(repo_root, subject, cache, tips):
             key = (pin.path, pin.sha)
             if key not in named_by:
                 named_by[key] = []
                 order.append(key)
             if subject.label not in named_by[key]:
                 named_by[key].append(subject.label)
+            if subject.kind != "introduced":
+                tip_named.add(key)
+            if pin.store is not None and key not in stores:
+                stores[key] = pin.store
+            if pin.nested_status and key not in unenumerated:
+                unenumerated[key] = (pin.nested_status, pin.nested_detail)
+
+    def judge(key: tuple[str, str]) -> PinCheck:
+        path, sha = key
+        return check_pin(
+            repo_root,
+            SubmodulePin(path=path, sha=sha, state=" "),
+            store=None if key in tip_named else stores.get(key),
+            tips=tips,
+        )
+
+    # Ask each store's remote about all of its pins together (one inventory,
+    # and the ancestry questions batched across pins: ``judge_many``), so the
+    # per-pin judging below reads this run's verdicts instead of the network.
+    by_repo: dict[str, tuple[Path, list[str]]] = {}
+    for key in order:
+        store = None if key in tip_named else stores.get(key)
+        worktree = repo_root / key[0]
+        repo = store if store is not None and not worktree.exists() else worktree
+        by_repo.setdefault(str(repo), (repo, []))[1].append(key[1])
+    rt.parallel_map(lambda item: tips.judge_many(item[0], item[1], scope="durable"),
+                    list(by_repo.values()))
 
     checks: list[PinCheck] = []
-    for path, sha in order:
-        check = check_pin(repo_root, SubmodulePin(path=path, sha=sha, state=" "))
+    for (path, sha), check in zip(order, rt.parallel_map(judge, order)):
+        nested = unenumerated.get((path, sha))
+        if nested is not None:
+            status, detail = nested
+            if check.ok:
+                check = replace(check, status=status, detail=detail)
+            else:
+                check = replace(
+                    check, detail=f"{check.detail}; nested pins not enumerated: {detail}"
+                )
         checks.append(replace(check, named_by=tuple(named_by[(path, sha)])))
+    tips = [subject.label for subject in subjects if subject.kind != "introduced"]
+    introduced = len(subjects) - len(tips)
+    source = "; ".join(tips)
+    if introduced:
+        source += f"; + {introduced} introduced commit(s) changing a gitlink"
     return AuditResult(
         repo_root=repo_root,
         pins=tuple(checks),
-        source="; ".join(subject.label for subject in subjects),
+        source=source,
     )
 
 
-def render_text(result: AuditResult) -> str:
+def render_text(result: AuditResult, rerun: str = "") -> str:
     lines: list[str] = []
     lines.append(f"Submodule remote reachability check: {result.repo_root}")
     lines.append(f"source: {result.source}")
@@ -731,15 +1240,23 @@ def render_text(result: AuditResult) -> str:
 
     if result.ok:
         lines.append(
-            "PASS: every parent-pinned submodule commit is reachable from fetched "
-            "remote branches or durable pin refs"
+            "PASS: every parent-pinned submodule commit is contained in a branch or "
+            "refs/pins/* anchor its remote publishes (read with ls-remote this run)"
         )
         return "\n".join(lines)
 
-    lines.append(
-        "FAIL: parent-pinned submodule commit(s) are not reproducible from fetched "
-        "remote branches or durable pin refs"
-    )
+    if result.unjudged:
+        lines.append(
+            "COULD NOT RUN: a remote could not be read, so the pin(s) below were not "
+            "judged. This is not a pass, and it is not a finding about any pin."
+        )
+        if rerun:
+            lines.append(f"Rerun with: {rerun}")
+    else:
+        lines.append(
+            "FAIL: parent-pinned submodule commit(s) are not reproducible from the "
+            "branches and refs/pins/* anchors their remotes publish"
+        )
     for check in result.failed:
         lines.append("")
         lines.append(f"- {check.path} @ {check.sha}")
@@ -757,9 +1274,10 @@ def render_text(result: AuditResult) -> str:
 
     lines.append("")
     lines.append(
-        "This audit does not emit a recursive fetch/update command. Materialize missing "
-        "gitlinks through the canonical recreator; inspect and fetch any stale existing "
-        "repository explicitly so local work is not reset."
+        "This audit judged the remotes' own refs, not this clone's, and wrote no ref; "
+        "a local fetch cannot change its verdict. It does not emit a recursive "
+        "fetch/update command: materialize missing gitlinks through the canonical "
+        "recreator."
     )
     return "\n".join(lines)
 
@@ -778,6 +1296,18 @@ def self_git(repo: Path, args: Sequence[str], *, allow_file: bool = False) -> No
     if allow_file:
         config.extend(["-c", "protocol.file.allow=always"])
     run_git(repo, args, extra_config=config)
+
+
+def ref_state(repo: Path) -> str:
+    """Every ref in ``repo``'s store, plus its FETCH_HEAD: what the audit
+    must leave exactly as it found it."""
+    refs = run_git(repo, ["for-each-ref", "--format=%(objectname) %(refname)"]).stdout
+    fetch_head = git_path(repo, "FETCH_HEAD")
+    if fetch_head is not None and fetch_head.exists():
+        head = fetch_head.read_text(encoding="utf-8", errors="replace")
+    else:
+        head = "<no FETCH_HEAD>"
+    return f"{refs}--- FETCH_HEAD ---\n{head}"
 
 
 def write_file(path: Path, text: str) -> None:
@@ -948,7 +1478,7 @@ def _scenario_subject_selection(cases: list[dict[str, object]]) -> None:
         refused = (
             not push_result.ok
             and len(push_result.failed) == 1
-            and push_result.failed[0].status == "not-reachable-from-fetched-remotes"
+            and push_result.failed[0].status == "not-reachable-from-remote"
             and push_result.failed[0].sha == local_only_sha
         )
         record_case(
@@ -1077,6 +1607,540 @@ def _scenario_nested_pins(cases: list[dict[str, object]]) -> None:
         )
 
 
+def _refuses(result: AuditResult, path: str, sha: str, label_part: str = "") -> bool:
+    """``result`` is red and names exactly this (path, sha) among its failures."""
+    return not result.ok and any(
+        pin.path == path
+        and pin.sha == sha
+        and (not label_part or any(label_part in label for label in pin.named_by))
+        for pin in result.failed
+    )
+
+
+def _scenario_introduced_commits(cases: list[dict[str, object]]) -> None:
+    """A push publishes EVERY commit it introduces, not only its tip.
+
+    The shape that used to pass: BASE -> B (pins a local-only submodule commit)
+    -> C (moves the pin back to a published one). The tip tree of C is clean,
+    but B is published by the same push and a consumer's on-demand submodule
+    fetch of B aborts. The clone also sets ``ignore = all`` on the submodule and
+    ``diff.ignoreSubmodules = all``, under which a porcelain diff shows no
+    gitlink row at all, so the introduced-gitlink reading must override both.
+    """
+    with tempfile.TemporaryDirectory(prefix="trust-submodule-introduced-") as tmp:
+        root = Path(tmp)
+        source = root / "sub-source"
+        bare = root / "submodule.git"
+        super_bare = root / "super.git"
+        super_repo = root / "super"
+
+        source.mkdir()
+        self_git(source, ["init", "-b", "main"])
+        commit_file(source, "README.md", "reachable\n", "initial submodule commit")
+        self_git(root, ["clone", "--bare", str(source), str(bare)])
+        self_git(root, ["init", "--bare", "-b", "main", str(super_bare)])
+
+        super_repo.mkdir()
+        self_git(super_repo, ["init", "-b", "main"])
+        commit_file(super_repo, "README.md", "super\n", "root")
+        self_git(super_repo, ["submodule", "add", str(bare), "deps/sub"], allow_file=True)
+        self_git(super_repo, ["config", "-f", ".gitmodules", "submodule.deps/sub.ignore", "all"])
+        self_git(super_repo, ["config", "diff.ignoreSubmodules", "all"])
+        # Under ignore=all, git 2.54 (Apple Git-157) SKIPS a plain `git add` of the
+        # gitlink ("Skipping submodule due to ignore=all"), so the pin below would never
+        # be staged and `commit` would find nothing to commit. `--force` stages it on
+        # every git, which is what this scenario means to do.
+        self_git(super_repo, ["add", ".gitmodules"])
+        self_git(super_repo, ["commit", "-m", "BASE: pin a published commit"])
+        base = run_git(super_repo, ["rev-parse", "HEAD"]).stdout.strip()
+        self_git(super_repo, ["remote", "add", "origin", str(super_bare)])
+        self_git(super_repo, ["push", "-q", "origin", "main"])
+        self_git(super_repo, ["fetch", "-q", "origin"])
+
+        submodule = super_repo / "deps" / "sub"
+        safe = run_git(submodule, ["rev-parse", "HEAD"]).stdout.strip()
+        commit_file(submodule, "LOCAL_ONLY.txt", "local-only\n", "local-only commit")
+        local_only = run_git(submodule, ["rev-parse", "HEAD"]).stdout.strip()
+        self_git(super_repo, ["add", "--force", "deps/sub"])
+        self_git(super_repo, ["commit", "-m", "B: pin the local-only commit"])
+        b_rev = run_git(super_repo, ["rev-parse", "HEAD"]).stdout.strip()
+        self_git(submodule, ["checkout", "-q", safe])
+        self_git(super_repo, ["add", "--force", "deps/sub"])
+        self_git(super_repo, ["commit", "-m", "C: move the pin back"])
+        c_rev = run_git(super_repo, ["rev-parse", "HEAD"]).stdout.strip()
+
+        def push(line: str, tips: Optional[rt.RemoteTips] = None) -> AuditResult:
+            subjects = select_subjects(
+                super_repo, push_context=True, env={PUSH_REFS_ENV: line}, emit=False
+            )
+            return audit(super_repo, subjects, tips)
+
+        ranged_tips = rt.RemoteTips()
+        ranged = push(f"refs/heads/main {c_rev} refs/heads/main {base}", ranged_tips)
+        record_case(
+            cases,
+            "push range: an INTERMEDIATE commit's local-only pin is refused and named",
+            _refuses(ranged, "deps/sub", local_only, b_rev[:12]),
+            observed_ok=ranged.ok,
+            observed=[pin.as_dict() for pin in ranged.pins],
+            expected_sha=local_only,
+            expected_named_by=b_rev[:12],
+        )
+        record_case(
+            cases,
+            "one ls-remote per remote per run, however many subjects and pins ask it",
+            len(ranged.pins) == 2 and ranged_tips.ls_remote_calls == 1,
+            pins=len(ranged.pins),
+            ls_remote_calls=ranged_tips.ls_remote_calls,
+        )
+
+        new_ref = push(f"refs/heads/topic {c_rev} refs/heads/topic {NULL_SHA}")
+        record_case(
+            cases,
+            "new-ref push: introduced commits bounded by --remotes, intermediate pin refused",
+            _refuses(new_ref, "deps/sub", local_only, b_rev[:12]),
+            observed_ok=new_ref.ok,
+            observed=[pin.as_dict() for pin in new_ref.pins],
+        )
+
+        unknown_remote = push(f"refs/heads/main {c_rev} refs/heads/main {'e' * 40}")
+        record_case(
+            cases,
+            "remote sha this clone lacks: range widens to --remotes, never to nothing",
+            _refuses(unknown_remote, "deps/sub", local_only, b_rev[:12]),
+            observed_ok=unknown_remote.ok,
+            observed=[pin.as_dict() for pin in unknown_remote.pins],
+        )
+
+        # Control: B is already on the remote side of this update, so the push
+        # introduces only C, whose tree is clean. Over-judging is not the fix.
+        published_b = push(f"refs/heads/main {c_rev} refs/heads/main {b_rev}")
+        record_case(
+            cases,
+            "control: a push that does not introduce B passes",
+            published_b.ok,
+            observed_ok=published_b.ok,
+            observed=[pin.as_dict() for pin in published_b.pins],
+        )
+
+        # A merge whose RESOLUTION sets the local-only pin (no parent has it),
+        # followed by a commit that restores the published one. diff-tree skips
+        # merges unless told otherwise, so this proves the -m reading.
+        self_git(super_repo, ["checkout", "-q", "-b", "side"])
+        commit_file(super_repo, "SIDE.md", "side\n", "side work")
+        self_git(super_repo, ["checkout", "-q", "main"])
+        commit_file(super_repo, "MAIN.md", "main\n", "main work")
+        self_git(super_repo, ["merge", "--no-ff", "--no-commit", "side"])
+        self_git(submodule, ["checkout", "-q", local_only])
+        self_git(super_repo, ["add", "--force", "deps/sub"])
+        self_git(super_repo, ["commit", "-m", "merge side, resolving the pin to local-only"])
+        merge_rev = run_git(super_repo, ["rev-parse", "HEAD"]).stdout.strip()
+        self_git(submodule, ["checkout", "-q", safe])
+        self_git(super_repo, ["add", "--force", "deps/sub"])
+        self_git(super_repo, ["commit", "-m", "D: restore"])
+        d_rev = run_git(super_repo, ["rev-parse", "HEAD"]).stdout.strip()
+        merged = push(f"refs/heads/main {d_rev} refs/heads/main {c_rev}")
+        record_case(
+            cases,
+            "push range: a MERGE resolution's local-only pin is refused and named",
+            _refuses(merged, "deps/sub", local_only, merge_rev[:12]),
+            observed_ok=merged.ok,
+            observed=[pin.as_dict() for pin in merged.pins],
+        )
+
+        # Control: history ALREADY on a remote is not re-judged. Main (with B
+        # and the merge in it) is published; a topic push that merges it
+        # introduces only the topic's own commits. Without --remotes in the
+        # exclusion every such merge would re-refuse main's published past.
+        self_git(super_repo, ["push", "-q", "origin", f"{d_rev}:refs/heads/main"])
+        self_git(super_repo, ["push", "-q", "origin", f"{base}:refs/heads/topic"])
+        self_git(super_repo, ["fetch", "-q", "origin"])
+        self_git(super_repo, ["checkout", "-q", "-b", "topic", base])
+        commit_file(super_repo, "TOPIC.md", "topic\n", "topic work")
+        self_git(super_repo, ["merge", "-q", "--no-ff", "-m", "merge origin/main", "origin/main"])
+        topic_rev = run_git(super_repo, ["rev-parse", "HEAD"]).stdout.strip()
+        topic = push(f"refs/heads/topic {topic_rev} refs/heads/topic {base}")
+        record_case(
+            cases,
+            "control: merging already-published history does not re-judge it",
+            topic.ok,
+            observed_ok=topic.ok,
+            observed=[pin.as_dict() for pin in topic.pins],
+        )
+
+        # Control: bump then RENAME a submodule in one push, every pin
+        # published. The bump commit names a path with no worktree at the tip,
+        # so it is judged in the store that holds it instead of refused as a
+        # missing worktree.
+        self_git(super_repo, ["checkout", "-q", "main"])
+        commit_file(submodule, "PUBLISHED.txt", "published\n", "published bump")
+        self_git(submodule, ["push", "-q", "origin", "HEAD:refs/heads/bump"])
+        self_git(submodule, ["fetch", "-q", "origin"])
+        self_git(super_repo, ["add", "--force", "deps/sub"])
+        self_git(super_repo, ["commit", "-m", "bump to a published commit"])
+        self_git(super_repo, ["mv", "deps/sub", "deps/renamed"])
+        self_git(super_repo, ["commit", "-m", "rename the submodule path"])
+        renamed_rev = run_git(super_repo, ["rev-parse", "HEAD"]).stdout.strip()
+        renamed = push(f"refs/heads/main {renamed_rev} refs/heads/main {d_rev}")
+        record_case(
+            cases,
+            "control: bump then rename a submodule in one push passes",
+            renamed.ok and any(pin.path == "deps/sub" for pin in renamed.pins),
+            observed_ok=renamed.ok,
+            observed=[pin.as_dict() for pin in renamed.pins],
+        )
+
+
+def _scenario_store_by_name(cases: list[dict[str, object]]) -> None:
+    """Nested pins are enumerated from the store that holds the pinned commit.
+
+    Git keys ``modules/`` by submodule NAME. Reading it by PATH lost the whole
+    nested subtree after a ``git mv``, for any name != path, and for a module
+    registered over an existing clone (embedded ``.git``, no ``modules/``
+    entry) --- each time under a PASS. A store that cannot list the pinned tree
+    used to read as "no nested pins" as well.
+    """
+    with tempfile.TemporaryDirectory(prefix="trust-submodule-byname-") as tmp:
+        root = Path(tmp)
+        inner_source = root / "inner-source"
+        inner_bare = root / "inner.git"
+        outer_source = root / "outer-source"
+        outer_bare = root / "outer.git"
+
+        inner_source.mkdir()
+        self_git(inner_source, ["init", "-b", "main"])
+        commit_file(inner_source, "README.md", "inner\n", "inner commit")
+        self_git(root, ["clone", "--bare", str(inner_source), str(inner_bare)])
+        outer_source.mkdir()
+        self_git(outer_source, ["init", "-b", "main"])
+        commit_file(outer_source, "README.md", "outer\n", "outer commit")
+        self_git(
+            outer_source, ["submodule", "add", str(inner_bare), "nested"], allow_file=True
+        )
+        self_git(outer_source, ["commit", "-m", "outer pins inner"])
+        self_git(root, ["clone", "--bare", str(outer_source), str(outer_bare)])
+
+        # Each fixture publishes its outer commit on its OWN branch: a main
+        # that pins a local-only inner commit cannot be cloned recursively.
+        def publish_outer_pinning_local_only_inner(outer: Path, branch: str) -> str:
+            nested = outer / "nested"
+            commit_file(nested, "LOCAL_ONLY.txt", str(outer) + "\n", "inner local-only")
+            sha = run_git(nested, ["rev-parse", "HEAD"]).stdout.strip()
+            self_git(outer, ["add", "nested"])
+            self_git(outer, ["commit", "-m", "outer pins a local-only inner commit"])
+            self_git(outer, ["push", "-q", "origin", f"HEAD:refs/heads/{branch}"])
+            self_git(outer, ["fetch", "-q", "origin"])
+            return sha
+
+        # (1) RENAME: `git mv` keeps the name, so the store stays modules/deps/outer.
+        renamed = root / "renamed"
+        renamed.mkdir()
+        self_git(renamed, ["init", "-b", "main"])
+        self_git(renamed, ["submodule", "add", str(outer_bare), "deps/outer"], allow_file=True)
+        self_git(renamed, ["commit", "-m", "pin outer"])
+        self_git(renamed, ["submodule", "update", "-q", "--init", "--recursive"], allow_file=True)
+        inner_local = publish_outer_pinning_local_only_inner(
+            renamed / "deps" / "outer", "renamed"
+        )
+        self_git(renamed, ["add", "deps/outer"])
+        self_git(renamed, ["commit", "-m", "bump outer"])
+        self_git(renamed, ["mv", "deps/outer", "deps/moved"])
+        self_git(renamed, ["commit", "-m", "rename the submodule path"])
+        result = audit(renamed, select_subjects(renamed, rev="HEAD", emit=False))
+        record_case(
+            cases,
+            "renamed submodule (store keyed by NAME): nested local-only pin refused",
+            _refuses(result, "deps/moved/nested", inner_local),
+            observed_ok=result.ok,
+            observed=[pin.as_dict() for pin in result.pins],
+        )
+
+        # (2) NAME != PATH with a stale store at the path-derived location that
+        # does not hold the pinned commit (``ls-tree`` fails there).
+        stale = root / "stale"
+        stale.mkdir()
+        self_git(stale, ["init", "-b", "main"])
+        self_git(
+            stale,
+            ["submodule", "add", "--name", "alpha", str(outer_bare), "deps/outer"],
+            allow_file=True,
+        )
+        self_git(stale, ["commit", "-m", "pin outer under the name alpha"])
+        leftover = git_path(stale, "modules/deps/outer")
+        if leftover is not None:
+            self_git(root, ["init", "-q", "--bare", str(leftover)])
+        result = audit(stale, select_subjects(stale, rev="HEAD", emit=False))
+        record_case(
+            cases,
+            "name != path over a stale path-keyed store: nested pin stays in the work set",
+            any(pin.path == "deps/outer/nested" for pin in result.pins) and not result.ok,
+            observed_ok=result.ok,
+            observed=[pin.as_dict() for pin in result.pins],
+        )
+
+        # (3) EMBEDDED .git: registered over an existing clone, never absorbed.
+        embedded = root / "embedded"
+        embedded.mkdir()
+        self_git(embedded, ["init", "-b", "main"])
+        commit_file(embedded, "README.md", "super\n", "root")
+        self_git(
+            embedded,
+            ["clone", "-q", "--recurse-submodules", str(outer_bare), "deps/outer"],
+            allow_file=True,
+        )
+        embedded_local = publish_outer_pinning_local_only_inner(
+            embedded / "deps" / "outer", "embedded"
+        )
+        self_git(embedded, ["submodule", "add", str(outer_bare), "deps/outer"], allow_file=True)
+        self_git(embedded, ["commit", "-m", "register the existing clone"])
+        result = audit(embedded, select_subjects(embedded, rev="HEAD", emit=False))
+        record_case(
+            cases,
+            "embedded-.git submodule: nested local-only pin refused",
+            (embedded / "deps" / "outer" / ".git").is_dir()
+            and _refuses(result, "deps/outer/nested", embedded_local),
+            observed_ok=result.ok,
+            observed=[pin.as_dict() for pin in result.pins],
+        )
+
+        # (4) The store HOLDS the pinned commit but cannot list its tree (a
+        # commit whose tree object is absent). Its reachability passes, so only
+        # the enumeration can refuse it --- this used to read as "no nested pins".
+        treeless = root / "treeless"
+        treeless.mkdir()
+        self_git(treeless, ["init", "-b", "main"])
+        self_git(treeless, ["submodule", "add", str(inner_bare), "deps/sub"], allow_file=True)
+        self_git(treeless, ["commit", "-m", "pin inner"])
+        module = treeless / "deps" / "sub"
+        body = (
+            f"tree {'d' * 40}\n"
+            "author T <t@example.invalid> 0 +0000\n"
+            "committer T <t@example.invalid> 0 +0000\n\n"
+            "commit whose tree is absent\n"
+        )
+        broken = run_git(
+            module,
+            ["hash-object", "-t", "commit", "-w", "--literally", "--stdin"],
+            input_text=body,
+        ).stdout.strip()
+        # Reachability must PASS so only the enumeration can refuse, and the
+        # remote is the authority for reachability: the REMOTE advertises it.
+        run_git(
+            root,
+            ["--git-dir", str(inner_bare), "hash-object", "-t", "commit", "-w", "--literally", "--stdin"],
+            input_text=body,
+        )
+        run_git(root, ["--git-dir", str(inner_bare), "update-ref", "refs/heads/broken", broken])
+        self_git(treeless, ["update-index", "--cacheinfo", f"160000,{broken},deps/sub"])
+        self_git(treeless, ["commit", "-m", "pin a commit whose tree cannot be read"])
+        result = audit(treeless, select_subjects(treeless, rev="HEAD", emit=False))
+        record_case(
+            cases,
+            "store holds the pin but cannot list its tree: nested-pins-unreadable",
+            not result.ok
+            and [pin.status for pin in result.pins if pin.path == "deps/sub"]
+            == ["nested-pins-unreadable"],
+            observed_ok=result.ok,
+            observed=[pin.as_dict() for pin in result.pins],
+        )
+
+
+def _scenario_common_module_stores(cases: list[dict[str, object]]) -> None:
+    """Linked worktrees can reuse existing stores without relaxing tip checks."""
+    with tempfile.TemporaryDirectory(prefix="trust-submodule-common-") as tmp:
+        root = Path(tmp)
+        inner_source = root / "inner-source"
+        inner_bare = root / "inner.git"
+        outer_source = root / "outer-source"
+        outer_bare = root / "outer.git"
+        primary = root / "primary"
+        linked_tip = root / "linked-tip"
+        removal = root / "removal"
+        linked_removed = root / "linked-removed"
+
+        inner_source.mkdir()
+        self_git(inner_source, ["init", "-b", "main"])
+        commit_file(inner_source, "README.md", "inner\n", "inner commit")
+        self_git(root, ["clone", "--bare", str(inner_source), str(inner_bare)])
+        outer_source.mkdir()
+        self_git(outer_source, ["init", "-b", "main"])
+        commit_file(outer_source, "README.md", "outer\n", "outer commit")
+        self_git(
+            outer_source,
+            ["submodule", "add", "--name", "inner-name", str(inner_bare), "nested/leaf"],
+            allow_file=True,
+        )
+        self_git(outer_source, ["commit", "-m", "outer pins inner"])
+        self_git(root, ["clone", "--bare", str(outer_source), str(outer_bare)])
+        primary.mkdir()
+        self_git(primary, ["init", "-b", "main"])
+        self_git(
+            primary,
+            ["submodule", "add", "--name", "outer-name", str(outer_bare), "deps/outer"],
+            allow_file=True,
+        )
+        self_git(primary, ["commit", "-m", "super pins outer"])
+        self_git(primary, ["submodule", "update", "--init", "--recursive"], allow_file=True)
+        pinned_rev = run_git(primary, ["rev-parse", "HEAD"]).stdout.strip()
+        outer_pin = run_git(primary / "deps/outer", ["rev-parse", "HEAD"]).stdout.strip()
+        outer_store = worktree_git_dir(primary, "deps/outer")
+        inner_store = worktree_git_dir(primary, "deps/outer/nested/leaf")
+        assert outer_store is not None and inner_store is not None
+
+        # Even a materialized outer module can itself be a linked worktree:
+        # its nested modules remain under the outer repository's common dir.
+        self_git(primary, ["worktree", "add", "--detach", str(linked_tip), pinned_rev])
+        self_git(
+            primary / "deps/outer",
+            ["worktree", "add", "--detach", str(linked_tip / "deps/outer"), outer_pin],
+        )
+        selected_outer = worktree_git_dir(linked_tip, "deps/outer")
+        assert selected_outer is not None and selected_outer != outer_store
+        linked_pins = collect_pins(linked_tip, INDEX_SUBJECT)
+        record_case(
+            cases,
+            "linked submodule gitdir recovers nested common-name store",
+            any(
+                pin.path == "deps/outer/nested/leaf"
+                and pin.store == inner_store
+                and not pin.nested_status
+                for pin in linked_pins
+            ),
+            observed=[pin.path for pin in linked_pins],
+        )
+        tip_result = audit(linked_tip)
+        record_case(
+            cases,
+            "common nested store does not replace a tip-named child checkout",
+            not tip_result.ok
+            and any(
+                pin.path == "deps/outer/nested/leaf"
+                and pin.status in {"missing-submodule-worktree", "uninitialized-submodule"}
+                for pin in tip_result.failed
+            ),
+            observed=[pin.as_dict() for pin in tip_result.pins],
+        )
+
+        # Remove the path at the current tip, while an introduced historical
+        # commit still names it. No clone exists in this new linked worktree.
+        self_git(primary, ["worktree", "add", "--detach", str(removal), pinned_rev])
+        self_git(removal, ["rm", "-f", "deps/outer"])
+        self_git(removal, ["commit", "-m", "remove outer from current tip"])
+        removed_rev = run_git(removal, ["rev-parse", "HEAD"]).stdout.strip()
+        self_git(primary, ["worktree", "add", "--detach", str(linked_removed), removed_rev])
+        local_candidate = git_path(linked_removed, "modules/outer-name")
+        assert local_candidate is not None and not local_candidate.exists()
+        history = Subject(
+            kind="introduced",
+            rev=pinned_rev,
+            label="historical add before removal",
+            gitlinks=(("deps/outer", outer_pin),),
+        )
+        def store_state(store: Path) -> tuple[str, bytes]:
+            refs = run_git_dir(store, ["for-each-ref", "--format=%(objectname) %(refname)"])
+            fetch = store / "FETCH_HEAD"
+            return refs.stdout, fetch.read_bytes() if fetch.exists() else b"<no FETCH_HEAD>"
+
+        before = (store_state(outer_store), store_state(inner_store))
+        historical = audit(linked_removed, (history,))
+        record_case(
+            cases,
+            "historical removed pin in linked worktree uses common stores without cloning",
+            historical.ok
+            and {pin.path for pin in historical.pins}
+            == {"deps/outer", "deps/outer/nested/leaf"}
+            and before == (store_state(outer_store), store_state(inner_store))
+            and not local_candidate.exists(),
+            observed=[pin.as_dict() for pin in historical.pins],
+        )
+        missing_tip = audit(
+            linked_removed,
+            (Subject(kind="revision", rev=pinned_rev, label="tip still names outer"),),
+        )
+        record_case(
+            cases,
+            "common stores do not replace a missing tip-named outer checkout",
+            not missing_tip.ok
+            and len(missing_tip.pins) == 2
+            and any(
+                pin.path == "deps/outer" and pin.status == "missing-submodule-worktree"
+                for pin in missing_tip.failed
+            ),
+            observed=[pin.as_dict() for pin in missing_tip.pins],
+        )
+
+
+def _scenario_bounded_and_remembered(cases: list[dict[str, object]]) -> None:
+    """Remember only what cannot change, and bound the rest honestly.
+
+    Until 2026-11-13 every (pin, remote ref) ancestry question was a fresh
+    network read, one per ref, with no total bound: the row ran 1h41m on a
+    docs-only push. Ancestry between two ids is now remembered
+    (``rt.AncestryMemory``), the remote's refs are still read every run, and a
+    spent time bound is COULD NOT RUN with a rerun command, never a pass.
+    Batching against a GitHub remote is pinned in
+    scripts/tests/remote_tips_agh_test.py.
+    """
+    with tempfile.TemporaryDirectory(prefix="trust-submodule-memory-") as tmp:
+        root = Path(tmp)
+        source = root / "sub-source"
+        bare = root / "submodule.git"
+        super_repo = root / "super"
+        memory = root / "memory"
+
+        source.mkdir()
+        self_git(source, ["init", "-b", "main"])
+        commit_file(source, "README.md", "main\n", "main commit")
+        self_git(source, ["checkout", "-q", "-b", "side"])
+        commit_file(source, "SIDE.md", "pinned\n", "pinned side commit")
+        pinned = run_git(source, ["rev-parse", "HEAD"]).stdout.strip()
+        commit_file(source, "SIDE.md", "later\n", "later side commit")
+        self_git(source, ["checkout", "-q", "main"])
+        self_git(root, ["clone", "--bare", str(source), str(bare)])
+
+        super_repo.mkdir()
+        self_git(super_repo, ["init", "-b", "main"])
+        self_git(super_repo, ["submodule", "add", str(bare), "deps/sub"], allow_file=True)
+        self_git(super_repo / "deps" / "sub", ["checkout", "-q", pinned])
+        self_git(super_repo, ["add", "--force", "deps/sub"])
+        self_git(super_repo, ["commit", "-m", "pin a commit only refs/heads/side contains"])
+
+        first_tips = rt.RemoteTips(memory=memory)
+        first = audit(super_repo, (INDEX_SUBJECT,), first_tips)
+        second_tips = rt.RemoteTips(memory=memory)
+        second = audit(super_repo, (INDEX_SUBJECT,), second_tips)
+        record_case(
+            cases,
+            "a second run asks no ancestry it already knows, and still reads the refs",
+            first.ok and second.ok and first_tips.remembered == 0
+            and second_tips.remembered == 2 and second_tips.ls_remote_calls == 1,
+            first_ok=first.ok,
+            second_ok=second.ok,
+            remembered=[first_tips.remembered, second_tips.remembered],
+            ls_remote_calls=second_tips.ls_remote_calls,
+        )
+
+        bounded = audit(super_repo, (INDEX_SUBJECT,), rt.RemoteTips(memory=memory, time_bound=0))
+        text = render_text(bounded, rerun="RERUN-COMMAND")
+        record_case(
+            cases,
+            "a spent time bound is COULD NOT RUN with a rerun command, never PASS",
+            bounded.exit_code == 2 and "Rerun with: RERUN-COMMAND" in text and "PASS" not in text,
+            exit_code=bounded.exit_code,
+            text=text,
+        )
+
+        self_git(bare, ["branch", "-D", "side"])
+        gone = audit(super_repo, (INDEX_SUBJECT,), rt.RemoteTips(memory=memory))
+        record_case(
+            cases,
+            "remembered ancestry never outlives the ref: a deleted anchor is a finding",
+            _refuses(gone, "deps/sub", pinned) and gone.exit_code == 1,
+            exit_code=gone.exit_code,
+            observed=[pin.as_dict() for pin in gone.pins],
+        )
+
+
 def self_check(*, json_output: bool = False) -> int:
     cases: list[dict[str, object]] = []
     with tempfile.TemporaryDirectory(prefix="trust-submodule-reachability-") as tmp:
@@ -1114,41 +2178,150 @@ def self_check(*, json_output: bool = False) -> int:
             cases=cases,
             name="local-only parent pin",
             result=unreachable,
-            expected_status="not-reachable-from-fetched-remotes",
+            expected_status="not-reachable-from-remote",
             expected_ok=False,
             expected_publish_ref=pin_ref(
                 run_git(submodule, ["rev-parse", "HEAD"]).stdout.strip()
             ),
         )
 
+        initial_sha = run_git(submodule, ["rev-parse", "HEAD~1"]).stdout.strip()
         pinned_sha = run_git(submodule, ["rev-parse", "HEAD"]).stdout.strip()
         self_git(submodule, ["push", "origin", f"{pinned_sha}:{pin_ref(pinned_sha)}"])
 
-        # ANCHORED REMOTELY, NOT FETCHED HERE — the state that cost a real push.
-        # Still not reachable (correct: no local durable ref names it), but the
-        # fix is to RETRIEVE the anchor, not to publish one that already exists.
+        # ANCHORED REMOTELY, NEVER FETCHED HERE — the state that cost real
+        # pushes. Until 2026-10-15 this was RED with "fetch the anchor" advice,
+        # because only a LOCAL refs/pins ref counted. The remote's own
+        # inventory is the authority now, and judging it copies no ref here.
+        before = ref_state(submodule)
         anchored_not_fetched = audit(super_repo)
         assert_self_check_case(
             cases=cases,
-            name="anchored on the remote but not fetched into this clone",
+            name="anchored on the remote, never fetched here: reachable (the remote is the authority)",
             result=anchored_not_fetched,
-            expected_status="not-reachable-from-fetched-remotes",
-            expected_ok=False,
-            expected_command_contains=f"+{pin_ref(pinned_sha)}:{pin_ref(pinned_sha)}",
-            # decided, not hedged: no push, and not the both-options fallback
-            expected_command_excludes="push",
-        )
-
-        self_git(submodule, ["fetch", "origin", f"+{pin_ref(pinned_sha)}:{pin_ref(pinned_sha)}"])
-        pinned = audit(super_repo)
-        assert_self_check_case(
-            cases=cases,
-            name="branch-free durable pin ref",
-            result=pinned,
             expected_status="reachable",
             expected_ok=True,
-            expected_ref_prefix="pins/",
+            expected_ref_prefix="refs/pins/",
         )
+        record_case(
+            cases,
+            "judging the remote anchor wrote no ref and no FETCH_HEAD in the store",
+            ref_state(submodule) == before,
+            before=before,
+            after=ref_state(submodule),
+        )
+
+        # The converse, which the local predicate PASSED: a refs/pins ref
+        # created here and never pushed, and a remote-tracking ref for a
+        # branch the forge no longer has. Neither is fetchable by anyone else.
+        commit_file(submodule, "LOCAL_TWO.txt", "local-two\n", "second local-only commit")
+        local_two = run_git(submodule, ["rev-parse", "HEAD"]).stdout.strip()
+        self_git(submodule, ["update-ref", pin_ref(local_two), local_two])
+        self_git(submodule, ["update-ref", "refs/remotes/origin/deleted-topic", local_two])
+        self_git(super_repo, ["add", "deps/sub"])
+        self_git(super_repo, ["commit", "-m", "pin a commit only LOCAL refs name"])
+        local_refs_only = audit(super_repo)
+        assert_self_check_case(
+            cases=cases,
+            name="a local refs/pins ref and a stale remote-tracking ref are not durable",
+            result=local_refs_only,
+            expected_status="not-reachable-from-remote",
+            expected_ok=False,
+        )
+
+        # STALE origin/main: the remote's main moved past the pin's commit and
+        # this store's refs/remotes/origin/main never followed. GREEN, and the
+        # stale ref is left exactly as it was.
+        self_git(submodule, ["checkout", "-q", "--detach", initial_sha])
+        commit_file(submodule, "ON_MAIN.txt", "on main\n", "published on main")
+        on_main = run_git(submodule, ["rev-parse", "HEAD"]).stdout.strip()
+        self_git(submodule, ["push", "-q", "origin", "HEAD:refs/heads/main"])
+        self_git(submodule, ["update-ref", "refs/remotes/origin/main", initial_sha])
+        self_git(super_repo, ["add", "deps/sub"])
+        self_git(super_repo, ["commit", "-m", "pin a commit the remote's main carries"])
+        before = ref_state(submodule)
+        stale_main = audit(super_repo)
+        assert_self_check_case(
+            cases=cases,
+            name="stale local origin/main, the remote's main has the pin: reachable",
+            result=stale_main,
+            expected_status="reachable",
+            expected_ok=True,
+            expected_ref_prefix="refs/heads/main",
+        )
+        record_case(
+            cases,
+            "the stale-origin/main verdict moved no ref (origin/main is still stale)",
+            ref_state(submodule) == before
+            and run_git(submodule, ["rev-parse", "refs/remotes/origin/main"]).stdout.strip()
+            == initial_sha,
+            before=before,
+            after=ref_state(submodule),
+        )
+
+        # The pinned commit is not in this store AT ALL (another clone pushed
+        # it and nothing here fetched). It used to be missing-commit-object.
+        other = root / "other-clone"
+        self_git(root, ["clone", "-q", str(bare), str(other)])
+        commit_file(other, "ELSEWHERE.txt", "elsewhere\n", "pushed by another clone")
+        elsewhere = run_git(other, ["rev-parse", "HEAD"]).stdout.strip()
+        self_git(other, ["push", "-q", "origin", "HEAD:refs/heads/main"])
+        self_git(super_repo, ["update-index", "--cacheinfo", f"160000,{elsewhere},deps/sub"])
+        self_git(super_repo, ["commit", "-m", "pin a commit this store has never seen"])
+        before = ref_state(submodule)
+        never_seen = audit(super_repo)
+        assert_self_check_case(
+            cases=cases,
+            name="pin absent from this store, on the remote's main: fetched by sha, reachable",
+            result=never_seen,
+            expected_status="reachable",
+            expected_ok=True,
+        )
+        record_case(
+            cases,
+            "fetching the absent pin by sha brought its objects and wrote no ref",
+            ref_state(submodule) == before
+            and run_git(submodule, ["cat-file", "-e", f"{elsewhere}^{{commit}}"], check=False).returncode
+            == 0,
+            before=before,
+            after=ref_state(submodule),
+        )
+
+        # THE NETWORK IS DOWN: the remote cannot be read. COULD NOT RUN (exit
+        # 2), never a pass and never a finding, for a present pin and for an
+        # absent one alike.
+        away = root / "submodule.git.unreachable"
+        bare.rename(away)
+        try:
+            offline = audit(super_repo)
+            assert_self_check_case(
+                cases=cases,
+                name="remote unreadable: remote-unreadable, not a pass",
+                result=offline,
+                expected_status="remote-unreadable",
+                expected_ok=False,
+            )
+            record_case(
+                cases,
+                "remote unreadable: exit 2 and COULD NOT RUN, never PASS",
+                offline.exit_code == 2
+                and "COULD NOT RUN" in render_text(offline)
+                and "PASS" not in render_text(offline),
+                observed_exit=offline.exit_code,
+                rendered=render_text(offline),
+            )
+            self_git(super_repo, ["update-index", "--cacheinfo", f"160000,{'2' * 40},deps/sub"])
+            self_git(super_repo, ["commit", "-m", "pin an absent commit while offline"])
+            offline_absent = audit(super_repo)
+            assert_self_check_case(
+                cases=cases,
+                name="remote unreadable, pin absent: remote-unreadable, not missing-commit-object",
+                result=offline_absent,
+                expected_status="remote-unreadable",
+                expected_ok=False,
+            )
+        finally:
+            away.rename(bare)
 
         missing_object_sha = "1" * 40
         self_git(
@@ -1178,6 +2351,10 @@ def self_check(*, json_output: bool = False) -> int:
 
     _scenario_subject_selection(cases)
     _scenario_nested_pins(cases)
+    _scenario_introduced_commits(cases)
+    _scenario_store_by_name(cases)
+    _scenario_common_module_stores(cases)
+    _scenario_bounded_and_remembered(cases)
 
     report = render_self_check_report(cases)
     failed = report["summary"]["failed"]  # type: ignore[index]
@@ -1196,12 +2373,51 @@ def self_check(*, json_output: bool = False) -> int:
     return 0 if not failed else 1
 
 
+def ancestry_memory_dir(repo_root: Path) -> Optional[Path]:
+    """Where answers to "is A an ancestor of B?" are remembered across runs.
+
+    ``<git common dir>/trust-land/commit-ancestry``, beside the landing
+    gate's own cache, shared by every worktree of the clone. Keyed by the two
+    commit ids under a format version (``rt.AncestryMemory.FORMAT``), it is
+    never invalidated: the answer cannot change; a fix to an answer source, or
+    a new native reply contract, changes the version instead. Remote
+    inventories are never stored there. check_ir_cohort.py computes the same
+    directory (``ancestry_memory_dir`` there) and shares these answers.
+    """
+    common = git_common_dir(repo_root)
+    return None if common is None else common / "trust-land" / "commit-ancestry"
+
+
+def run_tips(repo_root: Path, time_bound: Optional[float]) -> "rt.RemoteTips":
+    return rt.RemoteTips(memory=ancestry_memory_dir(repo_root), time_bound=time_bound)
+
+
+def rerun_command(repo_root: Path, args: argparse.Namespace) -> str:
+    """The command that asks the same question again (exit 2's next step)."""
+    parts = ["python3", "scripts/check_submodule_remote_reachability.py"]
+    if args.repo_root.resolve() != REPO_ROOT:
+        parts += ["--repo-root", str(repo_root)]
+    if args.rev is not None:
+        parts += ["--rev", args.rev]
+    if args.push_context:
+        parts.append("--push-context")
+    if args.time_bound != DEFAULT_TIME_BOUND_S:
+        parts += ["--time-bound", f"{args.time_bound:g}"]
+    command = shell_join(parts)
+    pushed = os.environ.get(PUSH_REFS_ENV)
+    if args.push_context and pushed is not None:
+        command = f"{PUSH_REFS_ENV}={shlex.quote(pushed)} {command}"
+    return command
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="targo trust repo submodule-reachability",
         description=(
             "Fail closed when parent-pinned submodule commits are not contained "
-            "in fetched refs/remotes/* or durable refs/pins/*."
+            "in a branch or durable refs/pins/* anchor the submodule's remote "
+            "publishes (read with ls-remote; no ref is written). Exit 1 is a "
+            "finding, exit 2 is COULD NOT RUN (a remote could not be read)."
         )
     )
     parser.add_argument(
@@ -1220,9 +2436,21 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--push-context",
         action="store_true",
         help=(
-            f"judge the revision(s) the push in flight would publish, read from "
+            f"judge what the push in flight would publish (each pushed tip tree "
+            f"plus every gitlink its introduced commits change), read from "
             f"${PUSH_REFS_ENV} (exported by scripts/hooks/pre-push); with the "
             f"variable unset the subject widens to the index"
+        ),
+    )
+    parser.add_argument(
+        "--time-bound",
+        type=float,
+        default=DEFAULT_TIME_BOUND_S,
+        metavar="SECONDS",
+        help=(
+            "bound every remote read of this run together; a pin still unjudged "
+            "when it is spent is COULD NOT RUN (exit 2), never a pass "
+            f"(default {DEFAULT_TIME_BOUND_S:.0f})"
         ),
     )
     parser.add_argument(
@@ -1246,7 +2474,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         subjects = select_subjects(
             repo_root, rev=args.rev, push_context=args.push_context
         )
-        result = audit(repo_root, subjects)
+        result = audit(repo_root, subjects, run_tips(repo_root, args.time_bound))
     except GitError as error:
         payload = {
             "repo_root": str(repo_root),
@@ -1262,12 +2490,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.json:
         print(render_json(result))
     else:
-        output = render_text(result)
+        output = render_text(result, rerun_command(repo_root, args))
         if result.ok:
             print(output)
         else:
             print(output, file=sys.stderr)
-    return 0 if result.ok else 1
+    return result.exit_code
 
 
 if __name__ == "__main__":

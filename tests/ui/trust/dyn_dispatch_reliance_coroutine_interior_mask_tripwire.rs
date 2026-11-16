@@ -4,6 +4,7 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
+//@ forbid-output: this function has no obligation of its own
 //! TRIPWIRE, not a differential. This file exists because
 //! `dyn_principals_in_ty`'s coroutine-interior walk is **UNREACHABLE TODAY**,
 //! and somebody has to find out on the day it stops being.
@@ -94,6 +95,33 @@
 //! `//!` comment is parsed as a real expectation on that comment's own line — a
 //! silently broken fixture. See `src/tools/compiletest/src/errors.rs`.)
 //!
+//! ## 2026-09-29: MASK B lifted, and a third mask stands in its place
+//!
+//! MASK B was not a decline of `drive` itself. It was the crate-level abort
+//! described under "why this is two files": `drive::{closure#0}`'s refusal was
+//! emitted inside `run_required_analyses` — the coroutine's layout was read from
+//! its `optimized_mir`, which ran TrustVerify there — so `analysis` took it for a
+//! FRONT-END error and skipped the whole-crate walk, and `drive` was never
+//! verified. The layout is now read from pre-steal elaborated MIR
+//! (`trust_local_coroutine_layout`), the coroutine is verified by the walk, and
+//! `drive` IS verified: it is refused, and that refusal is now pinned on `drive`.
+//!
+//! It is still NOT the differential this file asks for. Measured on stage 1 at
+//! 21eb33ef5e: `drive`'s only row is the whole-function panic-freedom `[assert]`,
+//! RUNTIME-CHECKED — an absent-callee assumption-panic row (the generic class,
+//! so strict keeps it fail-closed), with native lowering refusing `drive`'s
+//! first `Alloca` ("without an internally bound extent, pointee-type, and
+//! alignment derivation"). No dyn-dispatch reliance row appears, so the
+//! coroutine-interior arms are still not what refuses it. Call that MASK C: the
+//! error pinned on `drive` goes away when MASK C lifts, and that is the day to
+//! re-cut this file into the differential (refusal ABSENT with the arms
+//! reverted, PRESENT with them in place).
+//!
+//! The same abort was the premise of "why this is two files": a coroutine
+//! whose native lowering fails no longer cuts the walk short, so controls placed
+//! here would now be reached. The files stay split anyway; merging them buys
+//! nothing and would re-tie the controls to this file's masks.
+//!
 //! ## The residual, stated rather than hidden
 //!
 //! If a mask lifts AND the coroutine arms have been reverted, this file stays
@@ -129,9 +157,11 @@ impl Emit for Good {
 /// complete recipe for the fail-open — a mixed bundle where the enumeration
 /// looks complete and one vtable came from a place the walk could not see.
 ///
-/// It carries NO annotation because it produces NO diagnostic: measured, it is
-/// not verified at all. An error appearing here is the signal, not a failure.
+/// Until 2026-09-29 it carried NO annotation because it produced NO diagnostic:
+/// it was not verified at all (MASK B). It is verified now, and refused by
+/// MASK C — see the section above. If this refusal disappears, MASK C lifted.
 pub fn drive() -> impl Future<Output = u32> {
+//~^ ERROR Trust strict verification failed for `dyn_dispatch_reliance_coroutine_interior_mask_tripwire::drive`: 1 obligation(s) were not fully verified
     let mut g = Good;
     // WITNESSED: the coercion the walker sees. It is what would make the
     // enumeration look complete instead of vacuous, if this body were verified.
@@ -140,10 +170,14 @@ pub fn drive() -> impl Future<Output = u32> {
     // The coroutine below IS a separate verified root, and it refuses on two
     // counts that have nothing to do with this slice: the executor-protocol
     // premise of `5e6b929e1b`, and MASK A. Both are pinned so that lifting
-    // either one is visible here.
+    // either one is visible here. (Until 2026-10-03 it also carried a `Trust
+    // Level 0 safety verification incomplete` error, whose only failed Level 0
+    // row was the `[unsafe] missing SAFETY comment` stand-in on the
+    // `Pin::new_unchecked` of rustc's own `.await` lowering. AW-1, `d46ddcc8b2`,
+    // stopped charging it; that pin was removed 2026-10-04, measured on a stage 1
+    // of `1ab78ed8e8` and one with AW-1, and neither refusal below moved.)
     async move {
-        //~^ ERROR Trust Level 0 safety verification incomplete
-        //~| ERROR coroutine executor-protocol premise is unproved
+        //~^ ERROR coroutine executor-protocol premise is unproved
         //~| ERROR native typed-TrustIr lowering did not complete
         let mut h = Good;
         // NEVER WITNESSED BY `drive`'S BUNDLE. This coercion is in the
@@ -158,3 +192,7 @@ pub fn drive() -> impl Future<Output = u32> {
         s.emit(2).wrapping_add(a)
     }
 }
+
+// ZERO-ROW-GATE (2026-10-10): this rail must refuse for its OWN reason; a refusal by the
+// zero-row gate (whose note is forbidden here) would mean the gate under test regressed
+// into discharging and the zero-row gate masked it.

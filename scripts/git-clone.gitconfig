@@ -1,0 +1,38 @@
+# The git client tuning a Trust clone converges to, as data
+# (docs/DECISION_QUEUE.md GIT-CLIENT-TUNING-1, Continuum EW-13).
+#
+# Author: Andrew Yates. Copyright 2026 Andrew Yates. License: Apache-2.0 OR MIT.
+#
+# Two readers, both with `git config`, neither running anything from this repository:
+#   * scripts/hooks/_git_client_tuning.sh, which both hook installers source, reads
+#     the worktree's copy with `git config --file`;
+#   * aterm's clone converge reads the default branch's copy as last fetched, with
+#     `git config --blob <branch>:scripts/git-clone.gitconfig --no-includes`, and
+#     applies only the keys its own allowlist names (docs there).
+# This path is the fleet's: any repository that commits a file here declares its
+# tuning. It is never included into a real config, so these keys tune nothing by
+# being read; each reader applies them.
+#
+# Tuning only. Hooks (core.hooksPath) and the ssh keepalive (core.sshCommand) are the
+# installers' own work, never declared here, and the library refuses either as a key.
+#
+# tuning.superproject  a key the clone's own config gets (`git config --local`, which
+#                      every linked worktree reads), set to true
+# tuning.submodule     a key each populated submodule's own config gets, set to true.
+#                      first-party/trust-cg's --attest host boundary
+#                      (scripts/host_boundary.py, LOCAL_DATA_KEYS) refuses any key of
+#                      its repository's config it does not list, and it lists
+#                      core.untrackedCache but not feature.manyFiles
+# tuning.indexVersion  the index format a repository's current index is moved to
+#                      where feature.manyFiles is in effect (git creates every later
+#                      index at 4 under it); an explicit index.version keeps its own
+# tuning.never         a key no reader ever sets. The completion gate, G2's checker
+#                      and recreate_bootstrap.py refuse a checkout whose own config
+#                      names core.fsmonitor with any value but false or empty, so the
+#                      installers name such a value in their report
+[tuning]
+	superproject = core.untrackedCache
+	superproject = feature.manyFiles
+	submodule = core.untrackedCache
+	indexVersion = 4
+	never = core.fsmonitor

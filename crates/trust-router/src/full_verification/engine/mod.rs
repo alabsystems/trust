@@ -1,10 +1,12 @@
 //! `FullVerificationEngine` orchestration and per-batch dispatch.
 
 mod batch;
-
+mod kernel_replay;
+mod native_stop;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
+pub use kernel_replay::CurrentKernelProofReplay;
 use rayon::prelude::*;
 use trust_ir_bridge::{NativeVerificationBundle, SourceGenerationAuthority};
 use trust_verifier_api::{
@@ -26,34 +28,43 @@ use super::evidence_policy::{
     select_evidence,
 };
 use super::native_trust_ir::{
-    DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt, LiveVerificationDispatchSeal,
-    NativeTrustIrEvidenceIndex, is_native_trust_ir_engine, native_trust_ir_artifact_match,
+    CheckedNativeWpProof, DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt,
+    FreshWholeFunctionChcPdrReceipt, LiveVerificationDispatchSeal, NativeLiveSource,
+    NativeSourceReferenceFacts, NativeTrustIrEvidenceIndex, is_native_trust_ir_engine,
+    is_native_trust_mc_trust_bmc_engine, native_trust_ir_artifact_match,
     native_trust_ir_bundle_evidence, native_trust_ir_bundle_evidence_is_incomplete,
 };
 use super::policy::FullVerificationPolicy;
-use super::routing::{ObligationRoute, PrimaryEngine, REQUIRED_PRIMARY_ENGINES, obligation_route};
+use super::routing::{
+    FallbackEligibility, ObligationRoute, PrimaryEngine, REQUIRED_PRIMARY_ENGINES,
+    fallback_eligibility, fallback_route, obligation_route,
+};
 use super::util::{append_unique_artifacts, status_label, support_description, worker_threads};
 
-/// A live full-verification result and its affine native proof sidecars.
+/// A live full-verification result, checked proof facts and affine sidecars.
 ///
 /// This type is intentionally not cloneable or serializable. The ordinary
-/// full-verifier entry points discard the sidecars; only the explicit live API
-/// can move them into a compiler-owned final authority boundary.
+/// full-verifier entry points discard these private values; the explicit live
+/// API carries them into the compiler's final authority boundary. A checked WP
+/// fact can be cloned for identical inputs; transient source receipts cannot.
 #[derive(Debug)]
 pub struct FullVerificationRunWithFreshReceipts {
     result: VerificationRunResult,
     live_receipts: LiveVerificationReceiptBatch,
+    kernel_proof_replays: Vec<CurrentKernelProofReplay>,
 }
 
-/// Opaque, affine receipt package for one exact live verifier dispatch.
+/// Opaque package of checked proof facts and live dispatch receipts.
 ///
 /// The private dispatch seal, source run, and both receipt maps remain coupled
 /// inside this non-cloneable, non-serializable value. Callers may move receipts
 /// out for compiler consumption, but can authorize them only through the same
 /// package; there is no independent seal/source argument that can be swapped
-/// with a byte-identical result from another dispatch.
+/// with a byte-identical result from another dispatch. The separately checked
+/// WP facts bind content and do not depend on this transient dispatch seal.
 #[derive(Debug)]
 pub struct LiveVerificationReceiptBatch {
+    checked_native_wp_proofs: BTreeMap<String, CheckedNativeWpProof>,
     // `None` is the ordinary, zero-authority case. Avoid minting the seal in
     // that case: minting snapshots the complete source run, so doing it for
     // every result would impose an unnecessary O(run-size) clone on callers
@@ -61,9 +72,27 @@ pub struct LiveVerificationReceiptBatch {
     dispatch_seal: Option<LiveVerificationDispatchSeal>,
     direct_trust_vc_receipts: BTreeMap<String, DirectTrustVcProofReceipt>,
     fresh_exact_direct_chc_pdr_receipts: BTreeMap<String, FreshExactDirectChcPdrReceipt>,
+    fresh_whole_function_chc_pdr_receipts: BTreeMap<String, FreshWholeFunctionChcPdrReceipt>,
 }
 
+mod whole_function_receipts;
+use whole_function_receipts::{
+    finalize_whole_receipts_at_publication_boundary, whole_receipt_authorizes_final_evidence,
+    whole_receipt_bundle_is_coherent,
+};
+
 impl LiveVerificationReceiptBatch {
+    /// Checked proof facts may be reused for identical content. Unlike the
+    /// source-generation receipts, they carry no transient dispatch authority.
+    #[must_use]
+    pub fn checked_native_wp_proofs(&self) -> &BTreeMap<String, CheckedNativeWpProof> {
+        &self.checked_native_wp_proofs
+    }
+
+    pub fn take_checked_native_wp_proofs(&mut self) -> BTreeMap<String, CheckedNativeWpProof> {
+        std::mem::take(&mut self.checked_native_wp_proofs)
+    }
+
     /// Exact router source run privately bound to every receipt in this batch.
     #[must_use]
     pub fn source_run(&self) -> Option<&VerificationRunResult> {
@@ -106,10 +135,12 @@ impl LiveVerificationReceiptBatch {
         let dispatch_seal = self.dispatch_seal.as_ref()?.fork();
         let receipt = self.direct_trust_vc_receipts.remove(obligation_id)?;
         Some(Self {
+            checked_native_wp_proofs: BTreeMap::new(),
             dispatch_seal: Some(dispatch_seal),
             direct_trust_vc_receipts: std::iter::once((obligation_id.to_string(), receipt))
                 .collect(),
             fresh_exact_direct_chc_pdr_receipts: BTreeMap::new(),
+            fresh_whole_function_chc_pdr_receipts: BTreeMap::new(),
         })
     }
 
@@ -128,6 +159,7 @@ impl LiveVerificationReceiptBatch {
         let dispatch_seal = self.dispatch_seal.as_ref()?.fork();
         let receipt = self.fresh_exact_direct_chc_pdr_receipts.remove(obligation_id)?;
         Some(Self {
+            checked_native_wp_proofs: BTreeMap::new(),
             dispatch_seal: Some(dispatch_seal),
             direct_trust_vc_receipts: BTreeMap::new(),
             fresh_exact_direct_chc_pdr_receipts: std::iter::once((
@@ -135,6 +167,7 @@ impl LiveVerificationReceiptBatch {
                 receipt,
             ))
             .collect(),
+            fresh_whole_function_chc_pdr_receipts: BTreeMap::new(),
         })
     }
 
@@ -189,6 +222,11 @@ impl LiveVerificationReceiptBatch {
 }
 
 impl FullVerificationRunWithFreshReceipts {
+    #[must_use]
+    pub fn checked_native_wp_proofs(&self) -> &BTreeMap<String, CheckedNativeWpProof> {
+        self.live_receipts.checked_native_wp_proofs()
+    }
+
     /// Borrow the ordinary public run result.
     #[must_use]
     pub fn result(&self) -> &VerificationRunResult {
@@ -210,6 +248,12 @@ impl FullVerificationRunWithFreshReceipts {
         &self.live_receipts.fresh_exact_direct_chc_pdr_receipts
     }
 
+    /// Move checked proof facts out of this actual dispatch once. They remain
+    /// non-serializable and require exact current-row admission by a consumer.
+    pub fn take_current_kernel_proof_replays(&mut self) -> Vec<CurrentKernelProofReplay> {
+        std::mem::take(&mut self.kernel_proof_replays)
+    }
+
     /// Move the public result and its still-coupled affine receipt package into
     /// the caller's final authority boundary.
     #[must_use]
@@ -220,9 +264,13 @@ impl FullVerificationRunWithFreshReceipts {
     fn into_result(self) -> VerificationRunResult {
         let result =
             discard_live_receipt_sidecars(self.result, self.live_receipts.direct_trust_vc_receipts);
-        discard_live_receipt_sidecars(
+        let result = discard_live_receipt_sidecars(
             result,
             self.live_receipts.fresh_exact_direct_chc_pdr_receipts,
+        );
+        discard_live_receipt_sidecars(
+            result,
+            self.live_receipts.fresh_whole_function_chc_pdr_receipts,
         )
     }
 }
@@ -236,10 +284,29 @@ struct FinishedPrimaryEvidence {
 pub struct FullVerificationEngine {
     manifest: EngineManifest,
     policy: FullVerificationPolicy,
+    /// Trust (2026-09-18): the session's `-Z trust-verify-timeout-ms`, carried so the
+    /// NATIVE TRUST-IR BUNDLE path gets the budget the user asked for.
+    ///
+    /// The engines vector already honours it — `NativeTrustMcTrustIrEngine::with_timeout_ms`
+    /// configures its adapter — but `native_trust_ir_bundle_evidence` does not use that
+    /// adapter: it builds its own from `production_trust_mc_native_trust_ir_adapter`, which
+    /// hardcoded a mirror of the 5s DEFAULT. So on the one route a `[termination]` obligation
+    /// actually takes, raising the flag bought nothing and the run still reported
+    /// `exceeded the 7s wall-clock ceiling` at every value (measured 1ms, 1s, 9s, 20s and 60s
+    /// — identical message). That is the exact failure mode
+    /// `NativeTrustMcTrustIrEngine::with_timeout_ms` documents on itself and warns against;
+    /// this is the same bug in a second place.
+    ///
+    /// SOUND: the budget bounds only how long a sound solver lane may RUN. A larger budget can
+    /// turn Unknown into a definite verdict; it can never turn an unproved obligation into a
+    /// proof. `new` keeps the session-less default so the 57 existing constructors are
+    /// unchanged.
+    per_obligation_timeout_ms: u64,
     engines: Vec<Box<dyn VerificationEngine + Send + Sync>>,
     invalid_engine_manifests: Vec<String>,
     duplicate_primary_engines: Vec<&'static str>,
     missing_required_engines: Vec<&'static str>,
+    kernel_replay: Option<std::sync::Arc<kernel_replay::KernelReplayInputs>>,
 }
 
 impl FullVerificationEngine {
@@ -263,10 +330,12 @@ impl FullVerificationEngine {
         let mut verifier = Self {
             manifest,
             policy,
+            per_obligation_timeout_ms: super::engines::DEFAULT_PER_OBLIGATION_TIMEOUT_MS,
             engines,
             invalid_engine_manifests: Vec::new(),
             duplicate_primary_engines: Vec::new(),
             missing_required_engines: Vec::new(),
+            kernel_replay: None,
         };
         // Engine manifests and registrations are immutable after construction.
         // Audit them once instead of rescanning every capability for every
@@ -275,6 +344,107 @@ impl FullVerificationEngine {
         verifier.duplicate_primary_engines = verifier.collect_duplicate_primary_engine_names();
         verifier.missing_required_engines = verifier.collect_missing_required_engine_names();
         verifier
+    }
+
+    /// Supply candidate mathematics for freshly generated compiler VCs. This
+    /// association is not program-to-VC authority: native rows remain pending,
+    /// and consumers must independently validate their exact current binding.
+    #[must_use]
+    pub fn with_kernel_proof_replay_candidates(
+        mut self,
+        bundle: &TrustContractBundle,
+        candidates: Vec<(TrustObligation, trust_types::VerificationCondition)>,
+        root: std::path::PathBuf,
+        context: &VerifierExecutionContext,
+    ) -> Self {
+        self.kernel_replay =
+            kernel_replay::KernelReplayInputs::new(bundle, candidates, root, context)
+                .map(std::sync::Arc::new);
+        self
+    }
+
+    fn replay_before_primary_search(
+        &self,
+        bundle: &TrustContractBundle,
+        obligations: &[TrustObligation],
+        obligation: &TrustObligation,
+        primary: &EngineManifest,
+        context: Option<&VerifierExecutionContext>,
+        native_bundle: Option<&NativeVerificationBundle>,
+        native_index: Option<&NativeTrustIrEvidenceIndex>,
+        live_source: Option<NativeLiveSource<'_>>,
+        replay: Option<&mut kernel_replay::KernelReplaySession>,
+    ) -> bool {
+        let Some(context) = context else { return false };
+        // This per-call guard precedes the session's admission memo. A generic
+        // sibling must not populate a memo that authorizes a native row, and
+        // absent required native/source inputs never reach kernel replay.
+        if (is_native_trust_ir_engine(primary) || native_bundle.is_some())
+            && (!is_native_trust_mc_trust_bmc_engine(primary)
+                || native_bundle.is_none()
+                || native_index.is_none()
+                || live_source.is_none())
+        {
+            return false;
+        }
+        replay.is_some_and(|session| {
+            session.replay(bundle, obligation, context, || {
+                // A native request/source/refusal cannot disappear behind a
+                // valid proof for mathematical bytes supplied by a caller.
+                if is_native_trust_ir_engine(primary) || native_bundle.is_some() {
+                    let Some(native) = native_bundle else { return Default::default() };
+                    let Some(source) = live_source else { return Default::default() };
+                    let Some(index) = native_index else { return Default::default() };
+                    if !is_native_trust_mc_trust_bmc_engine(primary) {
+                        // Other suites keep their ordinary consumer until they
+                        // expose an equally complete no-solve admission seam.
+                        return Default::default();
+                    }
+                    let requested = obligations
+                        .iter()
+                        .filter(|row| {
+                            obligation_route(row)
+                                .is_some_and(|route| route.primary == PrimaryEngine::TrustMc)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if requested.iter().any(|row| {
+                        let Some(route) = obligation_route(row) else { return true };
+                        index.artifact_match(route, row).ok().flatten().is_none()
+                    }) {
+                        return Default::default();
+                    }
+                    #[cfg(feature = "trust-build")]
+                    {
+                        let adapter = trust_bmc::TrustMcVerifierApiAdapter::new(
+                            trust_bmc::TrustMcConfig::new()
+                                .with_proof_mode(trust_bmc::TrustMcProofMode::PdrIc3)
+                                .with_timeout(self.per_obligation_timeout_ms),
+                        )
+                        .with_solve_cutoff(context.native_solve_cutoff);
+                        adapter
+                            .kernel_replay_admissible_native_obligations(
+                                bundle,
+                                &requested,
+                                native,
+                                source.authority,
+                                source.reference_facts,
+                                context.deadline,
+                            )
+                            .unwrap_or_default()
+                    }
+                    #[cfg(not(feature = "trust-build"))]
+                    {
+                        let _ = (native, source);
+                        Default::default()
+                    }
+                } else {
+                    // Non-native component engines carry no typed request or
+                    // live-source claim. This branch creates no public proof.
+                    obligations.iter().map(|row| row.obligation_id.clone()).collect()
+                }
+            })
+        })
     }
 
     /// Build a verifier with the required native trust-vc/trust-mc/TY
@@ -296,10 +466,13 @@ impl FullVerificationEngine {
     /// an unproved obligation into a proof.
     #[must_use]
     pub fn with_required_native_engines_timeout_ms(timeout_ms: u64) -> Self {
-        Self::new(
+        let mut verifier = Self::new(
             super::engines::required_native_engines_with_timeout_ms(timeout_ms),
             FullVerificationPolicy::default(),
-        )
+        );
+        // Carry it for the native trust-ir BUNDLE path too — see the field's note.
+        verifier.per_obligation_timeout_ms = timeout_ms;
+        verifier
     }
 
     /// Run full verification and return the fail-closed run envelope.
@@ -447,7 +620,36 @@ impl FullVerificationEngine {
             obligations,
             context,
             Some(native_bundle),
-            Some(source_generation_authority),
+            Some(NativeLiveSource::authority_only(source_generation_authority)),
+        )
+    }
+
+    /// Trust (C1, 2026-11-06): [`Self::verify_obligations_with_native_trust_ir_bundle_and_source_authority_and_live_receipts`]
+    /// plus the compiler's live source reference facts for the SAME bundle and
+    /// authority. The native TrustMC lane then runs its pre-solve translation and
+    /// its solve through trust-mc's `_with_source_reference_facts` entries; facts
+    /// that do not authorize the exact pair fail that lane closed (trust-bmc's
+    /// facts entry), never silently fact-free. The facts are borrowed, never
+    /// cloned, cached or serialized.
+    #[must_use]
+    pub fn verify_obligations_with_native_trust_ir_bundle_and_source_reference_facts_and_live_receipts(
+        &self,
+        bundle: &TrustContractBundle,
+        obligations: &[TrustObligation],
+        native_bundle: &NativeVerificationBundle,
+        source_generation_authority: &SourceGenerationAuthority,
+        source_reference_facts: &NativeSourceReferenceFacts<'_>,
+        context: &VerifierExecutionContext,
+    ) -> FullVerificationRunWithFreshReceipts {
+        self.verify_with_context_and_native_trust_ir_bundle_with_fresh_receipts(
+            bundle,
+            obligations,
+            context,
+            Some(native_bundle),
+            Some(NativeLiveSource {
+                authority: source_generation_authority,
+                reference_facts: Some(source_reference_facts),
+            }),
         )
     }
 
@@ -458,7 +660,8 @@ impl FullVerificationEngine {
         context: Option<&VerifierExecutionContext>,
         native_trust_ir: Option<&NativeTrustIrEvidenceIndex>,
         native_bundle: Option<&NativeVerificationBundle>,
-        source_generation_authority: Option<&SourceGenerationAuthority>,
+        live_source: Option<NativeLiveSource<'_>>,
+        mut replay: Option<&mut kernel_replay::KernelReplaySession>,
     ) -> FullVerificationBatchResult {
         let mut results = vec![None; obligations.len()];
         if let Err(error) = bundle.validate_requested_obligations(obligations) {
@@ -607,6 +810,40 @@ impl FullVerificationEngine {
                 continue;
             }
 
+            if let Some(reason) = native_trust_mc_solve_cannot_publish(
+                self.policy,
+                route,
+                primary.manifest(),
+                obligation,
+                native_trust_ir,
+            ) {
+                results[index] = Some(self.policy_unsupported(obligation, reason));
+                continue;
+            }
+
+            // Trust: only after every existing routing/support/native-input
+            // refusal, try current-kernel replay. Keep the complete request and
+            // a pending public row; the actual proof travels separately to the
+            // compiler's exact final-row authority gate. Unresolved siblings
+            // still enter their ordinary batch (including whole-body work).
+            if self.replay_before_primary_search(
+                bundle,
+                obligations,
+                obligation,
+                primary.manifest(),
+                context,
+                native_bundle,
+                native_trust_ir,
+                live_source,
+                replay.as_deref_mut(),
+            ) {
+                results[index] = Some(self.not_attempted(
+                    obligation,
+                    "native search omitted after current-kernel proof replay; exact compiler row admission remains pending",
+                ));
+                continue;
+            }
+
             if batches[engine_index].is_empty() {
                 batch_order.push(engine_index);
             }
@@ -626,15 +863,14 @@ impl FullVerificationEngine {
             .collect::<Vec<_>>();
 
         let mut diagnostics = Vec::new();
+        let mut checked_native_wp_proofs = BTreeMap::new();
         let mut direct_trust_vc_receipts = BTreeMap::new();
         let mut fresh_exact_direct_chc_pdr_receipts = BTreeMap::new();
-        for completed in self.execute_engine_batches(
-            bundle,
-            engine_batches,
-            context,
-            native_bundle,
-            source_generation_authority,
-        ) {
+        let mut fresh_whole_function_chc_pdr_receipts = BTreeMap::new();
+        let mut duplicate_whole_receipt_ids = std::collections::BTreeSet::new();
+        for completed in
+            self.execute_engine_batches(bundle, engine_batches, context, native_bundle, live_source)
+        {
             diagnostics.push(engine_batch_diagnostic(&completed, context));
             let CompletedEngineBatch {
                 batch,
@@ -643,6 +879,7 @@ impl FullVerificationEngine {
                 elapsed_ms: _,
                 direct_trust_vc_receipts: mut batch_direct_receipts,
                 fresh_exact_direct_chc_pdr_receipts: mut batch_fresh_receipts,
+                fresh_whole_function_chc_pdr_receipts: mut batch_whole_receipts,
             } = completed;
             // Every direct receipt in a native batch must share the same exact
             // immutable bundle snapshot. Perform the one deep comparison here
@@ -654,6 +891,14 @@ impl FullVerificationEngine {
             if !fresh_receipt_bundle_is_coherent(&batch_fresh_receipts, bundle) {
                 batch_fresh_receipts.clear();
             }
+            if !whole_receipt_bundle_is_coherent(
+                &batch_whole_receipts,
+                bundle,
+                native_bundle,
+                live_source.map(|source| source.authority),
+            ) {
+                batch_whole_receipts.clear();
+            }
             // Build the obligation join once. Primary selection, hard-conflict
             // detection, rejection priority, and receipt binding then inspect
             // only the rows for the current public identity instead of
@@ -664,7 +909,7 @@ impl FullVerificationEngine {
                 let unique_child_row =
                     child_evidence_index.unique_row(item.obligation.obligation_id.as_str());
                 let direct_receipt = batch_direct_receipts.remove(&item.obligation.obligation_id);
-                let finished = if context.is_some_and(|context| context.budget_exceeded()) {
+                let mut finished = if context.is_some_and(|context| context.budget_exceeded()) {
                     FinishedPrimaryEvidence {
                         evidence: self.timed_out(
                             &item.obligation,
@@ -683,6 +928,119 @@ impl FullVerificationEngine {
                         direct_receipt.as_ref(),
                     )
                 };
+                if let Some(fallback) = fallback_route(&item.obligation) {
+                    let fallback_engine = self
+                        .engines
+                        .iter()
+                        .position(|engine| fallback.0.primary.matches_manifest(engine.manifest()));
+                    let budget_exceeded = context.is_some_and(|context| {
+                        context.budget_exceeded()
+                            || context.is_cancelled()
+                            || context
+                                .solve_deadline()
+                                .is_some_and(|deadline| Instant::now() >= deadline)
+                    });
+                    let definitive = child_rows.iter().any(|row| {
+                        matches!(row.status, EvidenceStatus::Proved | EvidenceStatus::Failed)
+                    });
+                    let primary_engine = self
+                        .engines
+                        .iter()
+                        .position(|engine| item.route.primary.matches_manifest(engine.manifest()));
+                    // A missing primary or fallback index means no fallback
+                    // attempt: eligibility already refuses a `None` fallback,
+                    // and a `None` primary (unreachable for a routed batch
+                    // item) fails closed the same way instead of panicking.
+                    let eligible = match (primary_engine, fallback_engine) {
+                        (Some(primary_engine), Some(_)) => {
+                            fallback_eligibility(
+                                finished.accepted,
+                                finished.evidence.status,
+                                finished.evidence.decline,
+                                definitive,
+                                Some(fallback),
+                                primary_engine,
+                                fallback_engine,
+                                budget_exceeded,
+                            ) == FallbackEligibility::Eligible
+                        }
+                        _ => false,
+                    };
+                    if let (true, Some(fallback_engine)) = (eligible, fallback_engine) {
+                        let alternative_started = Instant::now();
+                        let alternative = self.execute_engine_batch(
+                            bundle,
+                            EngineBatch {
+                                engine_index: fallback_engine,
+                                batch: vec![RoutedObligation {
+                                    index: item.index,
+                                    obligation: item.obligation.clone(),
+                                    route: fallback.0,
+                                }],
+                            },
+                            context,
+                            native_bundle,
+                            live_source,
+                        );
+                        diagnostics.push(engine_batch_diagnostic(&alternative, context));
+                        let alternative_rows = alternative.evidence.iter().collect::<Vec<_>>();
+                        let mut alternative_finished = if let Some(evidence) =
+                            self.fallback_stop_evidence(&item.obligation, context)
+                        {
+                            FinishedPrimaryEvidence { evidence, accepted: false }
+                        } else {
+                            self.finish_primary_evidence(
+                                bundle,
+                                &item.obligation,
+                                fallback.0,
+                                &alternative_rows,
+                                &alternative.manifest,
+                                native_trust_ir,
+                                None,
+                            )
+                        };
+                        // Certificate checking is part of this attempt too.
+                        // Recheck after it, before any proof can be published.
+                        if let Some(evidence) =
+                            self.fallback_stop_evidence(&item.obligation, context)
+                        {
+                            alternative_finished =
+                                FinishedPrimaryEvidence { evidence, accepted: false };
+                        } else if alternative_started.elapsed()
+                            >= std::time::Duration::from_millis(self.per_obligation_timeout_ms)
+                        {
+                            alternative_finished = FinishedPrimaryEvidence {
+                                evidence: self.timed_out(
+                                    &item.obligation,
+                                    "deductive fallback budget expired during certificate checking",
+                                ),
+                                accepted: false,
+                            };
+                        }
+                        if alternative_finished.accepted
+                            || matches!(
+                                alternative_finished.evidence.status,
+                                EvidenceStatus::Failed
+                                    | EvidenceStatus::Canceled
+                                    | EvidenceStatus::Timeout
+                            )
+                        {
+                            let original = finished.evidence;
+                            finished = alternative_finished;
+                            finished.evidence.diagnostics.push(format!(
+                                "deductive fallback followed {} from {}; primary diagnostics: {}",
+                                status_label(original.status),
+                                item.route.primary.name(),
+                                original.diagnostics.join("; "),
+                            ));
+                        } else {
+                            finished.evidence.diagnostics.push(format!(
+                                "deductive fallback did not discharge the obligation: {}",
+                                alternative_finished.evidence.diagnostics.join("; "),
+                            ));
+                        }
+                    }
+                }
                 if let Some(receipt) = direct_receipt
                     && direct_receipt_authorizes_final_evidence(
                         &receipt,
@@ -701,6 +1059,13 @@ impl FullVerificationEngine {
                     // capabilities. Drop both rather than selecting by batch
                     // order.
                     direct_trust_vc_receipts.remove(&item.obligation.obligation_id);
+                }
+                if finished.accepted
+                    && let Some(proof) = native_trust_ir.and_then(|index| {
+                        index.checked_wp_proof(bundle, &item.obligation, &finished.evidence)
+                    })
+                {
+                    checked_native_wp_proofs.insert(item.obligation.obligation_id.clone(), proof);
                 }
                 if let Some(receipt) = batch_fresh_receipts.remove(&item.obligation.obligation_id)
                     && fresh_receipt_authorizes_final_evidence(
@@ -721,6 +1086,25 @@ impl FullVerificationEngine {
                     // ordinary evidence remains available for diagnostics only.
                     fresh_exact_direct_chc_pdr_receipts.remove(&item.obligation.obligation_id);
                 }
+                if let Some(receipt) = batch_whole_receipts.remove(&item.obligation.obligation_id)
+                    && !duplicate_whole_receipt_ids.contains(&item.obligation.obligation_id)
+                    && whole_receipt_authorizes_final_evidence(
+                        &receipt,
+                        &item.obligation,
+                        unique_child_row,
+                        &finished,
+                        context,
+                    )
+                    && let Some(receipt) = receipt.bind_to_accepted_evidence(&finished.evidence)
+                    && fresh_whole_function_chc_pdr_receipts
+                        .insert(item.obligation.obligation_id.clone(), receipt)
+                        .is_some()
+                {
+                    // Retain the ambiguity tombstone: a third duplicate cannot
+                    // resurrect a capability discarded by the first collision.
+                    duplicate_whole_receipt_ids.insert(item.obligation.obligation_id.clone());
+                    fresh_whole_function_chc_pdr_receipts.remove(&item.obligation.obligation_id);
+                }
                 results[item.index] = Some(finished.evidence);
             }
         }
@@ -740,18 +1124,27 @@ impl FullVerificationEngine {
         FullVerificationBatchResult {
             evidence,
             diagnostics,
+            checked_native_wp_proofs,
             direct_trust_vc_receipts,
             fresh_exact_direct_chc_pdr_receipts,
+            fresh_whole_function_chc_pdr_receipts,
         }
     }
 
+    /// Run the per-engine batches serially, on a pool of the worker-thread
+    /// limit, or on rayon's global pool. Which one is a scheduling choice that
+    /// decides no verdict, so the budget profile id leaves the worker count out
+    /// (`trust_types::determinism::BudgetProfile::worker_threads`). Batch work
+    /// therefore reads no thread-local budget (`trust_types::verify_budget`),
+    /// which on a pool thread would not be the function's, and consults no
+    /// per-process cache, whose fill order would follow the schedule.
     fn execute_engine_batches(
         &self,
         bundle: &TrustContractBundle,
         engine_batches: Vec<EngineBatch>,
         context: Option<&VerifierExecutionContext>,
         native_bundle: Option<&NativeVerificationBundle>,
-        source_generation_authority: Option<&SourceGenerationAuthority>,
+        live_source: Option<NativeLiveSource<'_>>,
     ) -> Vec<CompletedEngineBatch> {
         if engine_batches.len() <= 1 || worker_threads(context).is_some_and(|limit| limit <= 1) {
             return self.execute_engine_batches_serial(
@@ -759,7 +1152,7 @@ impl FullVerificationEngine {
                 engine_batches,
                 context,
                 native_bundle,
-                source_generation_authority,
+                live_source,
             );
         }
 
@@ -772,7 +1165,7 @@ impl FullVerificationEngine {
                         engine_batches,
                         context,
                         native_bundle,
-                        source_generation_authority,
+                        live_source,
                     )
                 });
             }
@@ -781,7 +1174,7 @@ impl FullVerificationEngine {
                 engine_batches,
                 context,
                 native_bundle,
-                source_generation_authority,
+                live_source,
             );
         }
 
@@ -790,7 +1183,7 @@ impl FullVerificationEngine {
             engine_batches,
             context,
             native_bundle,
-            source_generation_authority,
+            live_source,
         )
     }
 
@@ -800,18 +1193,12 @@ impl FullVerificationEngine {
         engine_batches: Vec<EngineBatch>,
         context: Option<&VerifierExecutionContext>,
         native_bundle: Option<&NativeVerificationBundle>,
-        source_generation_authority: Option<&SourceGenerationAuthority>,
+        live_source: Option<NativeLiveSource<'_>>,
     ) -> Vec<CompletedEngineBatch> {
         engine_batches
             .into_iter()
             .map(|engine_batch| {
-                self.execute_engine_batch(
-                    bundle,
-                    engine_batch,
-                    context,
-                    native_bundle,
-                    source_generation_authority,
-                )
+                self.execute_engine_batch(bundle, engine_batch, context, native_bundle, live_source)
             })
             .collect()
     }
@@ -822,18 +1209,12 @@ impl FullVerificationEngine {
         engine_batches: Vec<EngineBatch>,
         context: Option<&VerifierExecutionContext>,
         native_bundle: Option<&NativeVerificationBundle>,
-        source_generation_authority: Option<&SourceGenerationAuthority>,
+        live_source: Option<NativeLiveSource<'_>>,
     ) -> Vec<CompletedEngineBatch> {
         engine_batches
             .into_par_iter()
             .map(|engine_batch| {
-                self.execute_engine_batch(
-                    bundle,
-                    engine_batch,
-                    context,
-                    native_bundle,
-                    source_generation_authority,
-                )
+                self.execute_engine_batch(bundle, engine_batch, context, native_bundle, live_source)
             })
             .collect()
     }
@@ -844,7 +1225,7 @@ impl FullVerificationEngine {
         engine_batch: EngineBatch,
         context: Option<&VerifierExecutionContext>,
         native_bundle: Option<&NativeVerificationBundle>,
-        source_generation_authority: Option<&SourceGenerationAuthority>,
+        live_source: Option<NativeLiveSource<'_>>,
     ) -> CompletedEngineBatch {
         let primary = self.engines[engine_batch.engine_index].as_ref();
         let requested =
@@ -855,6 +1236,11 @@ impl FullVerificationEngine {
         // elapses, the engines below degrade remaining obligations to
         // `Timeout` (sound: never `Proved`) rather than solving unbounded.
         let deadline = context.and_then(|ctx| ctx.deadline());
+        // Trust (2026-10-17, gate-rca deadline): the native lane stops SOLVING at the
+        // context's native solve cutoff — its share of the function clock — while every
+        // receipt it mints stays bound to `deadline` (see
+        // `VerifierExecutionContext::native_solve_cutoff`).
+        let native_solve_cutoff = context.and_then(|ctx| ctx.native_solve_cutoff);
         // PANIC FIREWALL: a panic inside the native trust-ir / trust-mc CHC
         // translation (e.g. an `Expr::ite` branch-sort-mismatch ICE deep in a
         // call-summary combiner) must NEVER abort the compile. Catch it and
@@ -869,20 +1255,34 @@ impl FullVerificationEngine {
                 bundle,
                 &requested,
                 native_bundle,
-                source_generation_authority,
+                live_source,
                 deadline,
+                native_solve_cutoff,
+                self.per_obligation_timeout_ms,
             )
         }))
         .unwrap_or(None);
-        let (mut evidence, mut direct_trust_vc_receipts, mut fresh_exact_direct_chc_pdr_receipts) =
-            match native_evidence {
-                Some(native_evidence) => (
+        let (
+            mut evidence,
+            mut direct_trust_vc_receipts,
+            mut fresh_exact_direct_chc_pdr_receipts,
+            mut fresh_whole_function_chc_pdr_receipts,
+        ) = match native_evidence {
+            Some(mut native_evidence) => {
+                native_stop::qualify_native_stops(
+                    &mut native_evidence.evidence,
+                    native_bundle.is_some()
+                        && is_native_trust_mc_trust_bmc_engine(primary.manifest()),
+                );
+                (
                     Some(native_evidence.evidence),
                     native_evidence.direct_trust_vc_receipts,
                     native_evidence.fresh_exact_direct_chc_pdr_receipts,
-                ),
-                None => (None, BTreeMap::new(), BTreeMap::new()),
-            };
+                    native_evidence.fresh_whole_function_chc_pdr_receipts,
+                )
+            }
+            None => (None, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
+        };
         let native_trust_ir_bundle_is_authoritative =
             evidence.is_some() && is_native_trust_ir_engine(primary.manifest());
         if !native_trust_ir_bundle_is_authoritative
@@ -893,11 +1293,24 @@ impl FullVerificationEngine {
             // fallback or a merged evidence inventory.
             direct_trust_vc_receipts.clear();
             fresh_exact_direct_chc_pdr_receipts.clear();
+            fresh_whole_function_chc_pdr_receipts.clear();
             let mut primary_evidence = if let Some(context) = context {
-                primary.verify_with_context(bundle, &requested, context).evidence
+                // The fallback primary solve is part of the same native lane: it stops at
+                // the cutoff too. It mints no receipt (its sidecars were cleared above),
+                // and the snapshot does not carry a deadline, so only its solving changes.
+                match context.solve_deadline() {
+                    Some(solve_deadline) if context.native_solve_cutoff.is_some() => {
+                        let solving = context.clone().with_deadline(solve_deadline);
+                        primary.verify_with_context(bundle, &requested, &solving).evidence
+                    }
+                    _ => primary.verify_with_context(bundle, &requested, context).evidence,
+                }
             } else {
                 primary.verify(bundle, &requested)
             };
+            // Generic primary engines cannot claim the built-in native phase,
+            // including through a copied producer or already-qualified marker.
+            native_stop::qualify_native_stops(&mut primary_evidence, false);
             if let Some(native_evidence) = evidence.as_mut() {
                 native_evidence.append(&mut primary_evidence);
             } else {
@@ -914,6 +1327,7 @@ impl FullVerificationEngine {
             elapsed_ms,
             direct_trust_vc_receipts,
             fresh_exact_direct_chc_pdr_receipts,
+            fresh_whole_function_chc_pdr_receipts,
         }
     }
 
@@ -984,6 +1398,31 @@ impl FullVerificationEngine {
 
     fn empty_engine_batches(&self) -> Vec<Vec<RoutedObligation>> {
         (0..self.engines.len()).map(|_| Vec::new()).collect()
+    }
+
+    fn fallback_stop_evidence(
+        &self,
+        obligation: &TrustObligation,
+        context: Option<&VerifierExecutionContext>,
+    ) -> Option<ObligationEvidence> {
+        let context = context?;
+        if context.is_cancelled() {
+            return Some(self.base_evidence(
+                obligation,
+                EvidenceStatus::Canceled,
+                None,
+                vec!["verification canceled before accepting deductive fallback".into()],
+            ));
+        }
+        if context.budget_exceeded()
+            || context.solve_deadline().is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Some(self.timed_out(
+                obligation,
+                "verification budget expired before accepting deductive fallback",
+            ));
+        }
+        None
     }
 
     fn policy_unsupported(
@@ -1109,9 +1548,8 @@ impl FullVerificationEngine {
     }
 
     fn collect_duplicate_primary_engine_names(&self) -> Vec<&'static str> {
-        REQUIRED_PRIMARY_ENGINES
-            .iter()
-            .copied()
+        [PrimaryEngine::TrustWp, PrimaryEngine::TrustVc, PrimaryEngine::TrustMc, PrimaryEngine::Ty]
+            .into_iter()
             .filter(|primary| {
                 self.engines
                     .iter()
@@ -1187,8 +1625,14 @@ impl FullVerificationEngine {
         obligations: &[TrustObligation],
         context: &VerifierExecutionContext,
         native_bundle: Option<&NativeVerificationBundle>,
-        source_generation_authority: Option<&SourceGenerationAuthority>,
+        live_source: Option<NativeLiveSource<'_>>,
     ) -> FullVerificationRunWithFreshReceipts {
+        // Candidate inputs are immutable; checked state belongs to this
+        // invocation, including simultaneous calls on the same engine/context.
+        let mut kernel_replay = self
+            .kernel_replay
+            .as_ref()
+            .map(|inputs| kernel_replay::KernelReplaySession::start(std::sync::Arc::clone(inputs)));
         let effective_context = context_with_wall_time_deadline(context);
         let context = &effective_context;
         let native_trust_ir = native_bundle.map(NativeTrustIrEvidenceIndex::from_bundle);
@@ -1203,15 +1647,18 @@ impl FullVerificationEngine {
                 Some(context),
                 native_trust_ir.as_ref(),
                 native_bundle,
-                source_generation_authority,
+                live_source,
+                kernel_replay.as_mut(),
             )
         };
 
         let FullVerificationBatchResult {
             evidence,
             diagnostics,
+            mut checked_native_wp_proofs,
             direct_trust_vc_receipts,
             fresh_exact_direct_chc_pdr_receipts,
+            fresh_whole_function_chc_pdr_receipts,
         } = batch_result;
         let mut result = VerificationRunResult::from_evidence(
             context.snapshot(),
@@ -1222,52 +1669,107 @@ impl FullVerificationEngine {
         );
         result.diagnostics.extend(native_trust_ir_diagnostics);
         result.diagnostics.extend(diagnostics);
-        let (dispatch_seal, direct_trust_vc_receipts, fresh_exact_direct_chc_pdr_receipts) =
-            if direct_trust_vc_receipts.is_empty() && fresh_exact_direct_chc_pdr_receipts.is_empty()
-                || !publication_boundary_is_live(&result, bundle, obligations, context)
-            {
-                // The overwhelmingly common result-only path must not clone
-                // the complete publication carrier merely to retain an empty
-                // authority package.
-                (None, BTreeMap::new(), BTreeMap::new())
-            } else {
-                let dispatch_seal = LiveVerificationDispatchSeal::mint(&result, bundle, context);
-                let direct_trust_vc_receipts = finalize_direct_receipts_at_publication_boundary(
-                    direct_trust_vc_receipts,
+        if !publication_boundary_is_live(&result, bundle, obligations, context) {
+            checked_native_wp_proofs.clear();
+        } else {
+            // Retain only facts for the exact final public row. This performs
+            // content comparisons, never another solver invocation or replay.
+            let obligations_by_id = obligations
+                .iter()
+                .map(|obligation| (obligation.obligation_id.as_str(), obligation))
+                .collect::<HashMap<_, _>>();
+            let rows = PrimaryEvidenceRowIndex::new(&result.evidence);
+            checked_native_wp_proofs.retain(|id, proof| {
+                let Some(obligation) = obligations_by_id.get(id.as_str()) else { return false };
+                let Some(evidence) = rows.unique_row(id) else { return false };
+                native_bundle
+                    .is_some_and(|native| proof.matches(bundle, native, obligation, evidence))
+            });
+        }
+        let (
+            dispatch_seal,
+            direct_trust_vc_receipts,
+            fresh_exact_direct_chc_pdr_receipts,
+            fresh_whole_function_chc_pdr_receipts,
+        ) = if direct_trust_vc_receipts.is_empty()
+            && fresh_exact_direct_chc_pdr_receipts.is_empty()
+            && fresh_whole_function_chc_pdr_receipts.is_empty()
+            || !publication_boundary_is_live(&result, bundle, obligations, context)
+        {
+            // The overwhelmingly common result-only path must not clone
+            // the complete publication carrier merely to retain an empty
+            // authority package.
+            (None, BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
+        } else {
+            let dispatch_seal = LiveVerificationDispatchSeal::mint(&result, bundle, context);
+            let direct_trust_vc_receipts = finalize_direct_receipts_at_publication_boundary(
+                direct_trust_vc_receipts,
+                &result,
+                bundle,
+                obligations,
+                context,
+                &dispatch_seal,
+            );
+            let fresh_exact_direct_chc_pdr_receipts =
+                finalize_fresh_receipts_at_publication_boundary(
+                    fresh_exact_direct_chc_pdr_receipts,
                     &result,
                     bundle,
                     obligations,
                     context,
                     &dispatch_seal,
                 );
-                let fresh_exact_direct_chc_pdr_receipts =
-                    finalize_fresh_receipts_at_publication_boundary(
-                        fresh_exact_direct_chc_pdr_receipts,
-                        &result,
-                        bundle,
-                        obligations,
-                        context,
-                        &dispatch_seal,
-                    );
-                if !dispatch_seal.is_live()
-                    || direct_trust_vc_receipts.is_empty()
-                        && fresh_exact_direct_chc_pdr_receipts.is_empty()
-                {
-                    (None, BTreeMap::new(), BTreeMap::new())
-                } else {
-                    (
-                        Some(dispatch_seal),
-                        direct_trust_vc_receipts,
-                        fresh_exact_direct_chc_pdr_receipts,
-                    )
-                }
+            let fresh_whole_function_chc_pdr_receipts =
+                finalize_whole_receipts_at_publication_boundary(
+                    fresh_whole_function_chc_pdr_receipts,
+                    &result,
+                    bundle,
+                    obligations,
+                    native_bundle,
+                    live_source.map(|source| source.authority),
+                    context,
+                    &dispatch_seal,
+                );
+            if !dispatch_seal.is_live()
+                || direct_trust_vc_receipts.is_empty()
+                    && fresh_exact_direct_chc_pdr_receipts.is_empty()
+                    && fresh_whole_function_chc_pdr_receipts.is_empty()
+            {
+                (None, BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
+            } else {
+                (
+                    Some(dispatch_seal),
+                    direct_trust_vc_receipts,
+                    fresh_exact_direct_chc_pdr_receipts,
+                    fresh_whole_function_chc_pdr_receipts,
+                )
+            }
+        };
+        // Finalization itself consumes time. Do not export newly checked facts
+        // after cancellation or a wall-time expiry during that bookkeeping.
+        if context.is_cancelled()
+            || context.budget_exceeded()
+            || result.context != context.snapshot()
+        {
+            checked_native_wp_proofs.clear();
+        }
+        let kernel_proof_replays =
+            if publication_boundary_is_live(&result, bundle, obligations, context) {
+                kernel_replay
+                    .as_mut()
+                    .map_or_else(Vec::new, |session| session.take_checked(bundle, context))
+            } else {
+                Vec::new()
             };
         FullVerificationRunWithFreshReceipts {
             result,
+            kernel_proof_replays,
             live_receipts: LiveVerificationReceiptBatch {
+                checked_native_wp_proofs,
                 dispatch_seal,
                 direct_trust_vc_receipts,
                 fresh_exact_direct_chc_pdr_receipts,
+                fresh_whole_function_chc_pdr_receipts,
             },
         }
     }
@@ -1548,6 +2050,65 @@ fn live_receipt_context_is_live(
 fn discard_live_receipt_sidecars<R, T>(result: R, receipts: BTreeMap<String, T>) -> R {
     drop(receipts);
     result
+}
+
+/// The compiler's typed-CHC encoding-fidelity attestation key, and the one value
+/// of it that gives a trust-mc refutation authority. Mirrors
+/// `TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_*` in `trust-bmc`'s `verifier_api.rs`
+/// and in `trust_verify.rs`. Used here only to KEEP dispatching a row, so a
+/// rename that this copy misses makes the skip below miss rows, not drop them:
+/// postconditions, the only kind the compiler attests, are kept regardless.
+pub(super) const TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY: &str =
+    "trust-trust-mc.typed-chc-obligation.encoding_fidelity";
+pub(super) const TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT: &str = "exact";
+
+/// `Some(reason)` when dispatching `obligation` to the native trust-mc lane
+/// cannot change its published verdict, so the solve must not spend the
+/// function's wall-clock budget.
+///
+/// Both of the lane's outcomes that could count are already ruled out before
+/// dispatch:
+///
+/// * **Proved.** Under `require_proof_artifacts`, a proof on a native-bundle
+///   route is accepted only through [`native_trust_ir_artifact_match`], which
+///   refuses every proof while the bundle index carries a validation error
+///   (for example a canonical bundle larger than the inline transport limit,
+///   `MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES`). The index is built from
+///   the same bundle before dispatch, so the refusal is already known.
+/// * **Failed.** trust-bmc demotes every trust-mc refutation to Unknown unless
+///   the row carries the compiler's positive `exact` encoding-fidelity
+///   attestation, and the compiler attests only postconditions. Those rows keep
+///   dispatching, so no refutation that could count is lost.
+///
+/// Measured (fix10, 2026-10-13): two `tla-cert` functions spent 125–150 s each
+/// in 24 native PDR solves whose 9 proofs were all refused here for a >16 MiB
+/// bundle; under the 120 s per-function budget that cost 34 timeout rows and
+/// starved the cheap lanes that decide them. See KNOWN_HAZARDS.
+///
+/// The skipped row is `Unsupported` with this reason: never `Proved`, and
+/// later compiler lanes still see it as unproved.
+pub(super) fn native_trust_mc_solve_cannot_publish(
+    policy: FullVerificationPolicy,
+    route: ObligationRoute,
+    primary: &EngineManifest,
+    obligation: &TrustObligation,
+    native_trust_ir: Option<&NativeTrustIrEvidenceIndex>,
+) -> Option<String> {
+    if !policy.require_proof_artifacts
+        || route.primary != PrimaryEngine::TrustMc
+        || !is_native_trust_mc_trust_bmc_engine(primary)
+        || matches!(obligation.kind, trust_verifier_api::ObligationKind::Postcondition)
+        || obligation.metadata.iter().any(|entry| {
+            entry.key == TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_METADATA_KEY
+                && entry.value == TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT
+        })
+    {
+        return None;
+    }
+    let refusal = native_trust_ir?.proof_authority_refusal(route)?;
+    Some(format!(
+        "native trust-mc solve not dispatched: no outcome could be published ({refusal}; the row carries no exact encoding-fidelity attestation, so a refutation would be demoted to Unknown)"
+    ))
 }
 
 #[cfg(test)]

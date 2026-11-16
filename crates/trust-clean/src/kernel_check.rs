@@ -110,11 +110,156 @@ pub enum ContextEntry {
     },
 }
 
+// ---------------------------------------------------------------------------
+// Kernel-owned names
+// ---------------------------------------------------------------------------
+
+/// A name the Clean kernel itself declares, which a [`KernelContext`] may never
+/// (re)declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReservedKernelName {
+    /// A logical foundation (`propext`, `Quot.sound`, `Classical.choice`) or a
+    /// quotient kernel primitive (`Quot`, `Quot.mk`, `Quot.lift`, `Quot.ind`).
+    Foundation,
+    /// A trust-envelope marker (`sorry`, `sorryAx`, `trustedArith`, `trustedAy`):
+    /// an incomplete proof or an external solver's word.
+    TrustMarker,
+}
+
+/// Classify `name` as kernel-owned, by the Clean kernel's own list
+/// (`clean_kernel::canonical_ambient_axiom_kind`), never a copy of it here.
+///
+/// A `ProofTerm` names a constant by its exact string, so the string is
+/// converted with `Name::from_string` (dots separate components). The pinned
+/// kernel (clean `5390f432b`) compares printed forms; from clean `2618b4347`
+/// the comparison is structural. Either way every string this crate can
+/// spell for a kernel-owned name is classified, and a ProofTerm string that
+/// differs from it is simply a different constant in this context's map.
+#[must_use]
+pub fn reserved_kernel_name(name: &str) -> Option<ReservedKernelName> {
+    use clean_kernel::{CanonicalAmbientAxiomKind, Name, canonical_ambient_axiom_kind};
+    match canonical_ambient_axiom_kind(&Name::from_string(name))? {
+        CanonicalAmbientAxiomKind::CertificationFoundation => Some(ReservedKernelName::Foundation),
+        CanonicalAmbientAxiomKind::TrustMarker => Some(ReservedKernelName::TrustMarker),
+    }
+}
+
+/// Universe arity of each kernel-owned foundation's CANONICAL declaration —
+/// the kernel's `level_params.len()`, pinned against
+/// `clean_kernel::Environment::with_prelude()` by
+/// `canonical_foundation_arities_match_the_kernel_prelude` below, so this copy
+/// cannot drift silently.
+const CANONICAL_FOUNDATION_UNIVERSE_ARITY: [(&str, usize); 7] = [
+    ("propext", 0),
+    ("Classical.choice", 1),
+    ("Quot.sound", 1),
+    ("Quot", 1),
+    ("Quot.mk", 1),
+    ("Quot.lift", 2),
+    ("Quot.ind", 1),
+];
+
+/// Appended to every foundation refusal: what to do instead of declaring it.
+const UNDECLARED_FOUNDATION_NOTE: &str = "; do not declare it — an undeclared reference to \
+     `propext`, `Quot.sound` or `Classical.choice` already denotes the kernel's own axiom";
+
+/// Why declaring `name` (as an axiom when `as_axiom`, else as a definition) in
+/// a [`KernelContext`] is refused, or `None` when `name` is not kernel-owned.
+///
+/// # The canonical-declaration check, in this term language
+///
+/// The Clean kernel admits a foundation only as its exact canonical
+/// declaration: `Axiom` kind, no value, the canonical statement, and the
+/// canonical universe arity (`Environment::validate_canonical_ambient_axiom`;
+/// from clean `2618b4347` also `Environment::is_canonical_foundational_axiom`).
+/// This crate cannot call those on a `KernelContext` — they read a kernel
+/// `Environment` — so the same check is made structurally here, and in this
+/// term language it never succeeds:
+///
+/// * a `Definition` is never the canonical declaration (it has a value, and
+///   the closure walk would unfold its body in place of the kernel's axiom);
+/// * `ProofTerm` has no universe parameters, so every declaration here has
+///   universe arity 0, and `Classical.choice`, `Quot.sound` and the quotient
+///   primitives are canonically universe-polymorphic (arity 1 or 2);
+/// * `propext` has arity 0, but its canonical statement
+///   `∀ {a b : Prop}, Iff a b → @Eq.{1} Prop a b` names the kernel inductives
+///   `Iff` and `Eq.{1}`. `ProofTerm` has no inductives and its `Const` carries
+///   no universe levels, so any `Iff`/`Eq` a context could resolve would be
+///   context-supplied — and a canonical-SHAPED `propext` over a context-defined
+///   `Eq := fun _ _ _ => ∀ P, P` proves `False`.
+///
+/// So every declaration of a kernel-owned name is non-canonical by
+/// construction and is refused. A term that NAMES a foundation needs no
+/// declaration: [`crate::axioms::axiom_closure`] resolves an undeclared
+/// `propext` / `Quot.sound` / `Classical.choice` to the kernel's own axiom.
+/// Trust markers are refused by name in every declaration kind: as an axiom
+/// the context would admit a gap, as a definition it would counterfeit one.
+///
+/// Future simplification: if `ProofTerm` gains universe parameters and
+/// inductives, replace the arity table and this reasoning with a
+/// `ProofTerm -> clean_kernel::Expr` translation checked by the kernel's own
+/// canonical-declaration predicate.
+#[must_use]
+pub fn reserved_declaration_refusal(name: &str, as_axiom: bool) -> Option<String> {
+    let kind = if as_axiom { "an Axiom" } else { "a Definition" };
+    let reason = match reserved_kernel_name(name)? {
+        ReservedKernelName::TrustMarker => format!(
+            "`{name}` is a Clean trust marker (an incomplete-proof or external-solver \
+             envelope); a context may not declare it in any kind, and this is {kind}"
+        ),
+        ReservedKernelName::Foundation if !as_axiom => format!(
+            "`{name}` is a kernel-owned foundation, canonically a value-less Axiom; a \
+             Definition under its name is a counterfeit whose body would stand in for the \
+             kernel's axiom{UNDECLARED_FOUNDATION_NOTE}"
+        ),
+        ReservedKernelName::Foundation => {
+            match CANONICAL_FOUNDATION_UNIVERSE_ARITY.iter().find(|(n, _)| *n == name) {
+                Some((_, arity)) if *arity > 0 => format!(
+                    "`{name}` is a kernel-owned foundation whose canonical declaration has \
+                     universe arity {arity}; a ProofTerm declaration has universe arity 0 (the \
+                     term language has no universe parameters), so it cannot be the canonical \
+                     declaration{UNDECLARED_FOUNDATION_NOTE}"
+                ),
+                Some(_) => format!(
+                    "`{name}` is a kernel-owned foundation whose canonical statement names the \
+                     kernel inductives `Iff` and `Eq.{{1}}`; a ProofTerm context has no \
+                     inductives and no universe-instantiated constants, so any `Iff`/`Eq` it \
+                     resolves is context-supplied and the declaration cannot be the canonical \
+                     one{UNDECLARED_FOUNDATION_NOTE}"
+                ),
+                // The kernel classifies a foundation this table does not know:
+                // fail closed with the generic reason.
+                None => format!(
+                    "`{name}` is a kernel-owned foundation with no known canonical ProofTerm form"
+                ),
+            }
+        }
+    };
+    Some(format!("reserved kernel name: {reason}"))
+}
+
 /// Manages the Clean kernel environment of definitions and axioms.
 ///
 /// The context maps constant names to their types (and optionally values).
 /// It is used during type inference and proof checking to resolve `Const`
 /// references in proof terms.
+///
+/// It never holds a kernel-owned name ([`reserved_declaration_refusal`]):
+/// before 2026-09-28 a context could declare `propext : False` or define
+/// `sorryAx`, and both [`crate::axioms::axiom_closure`] (which classified
+/// foundations by NAME) and [`check_proof`] (which types a `Const` by its
+/// entry) took the counterfeit at its word.
+///
+/// And it never holds a definition the kernel has not checked
+/// ([`definition_refusal`]): before 2026-09-29 `add_definition` stored any
+/// `(ty, value)` pair, so `mySorry : False := Sort 0` — an axiom of `False`
+/// under a name no reserved list knows — or a definition whose value is its own
+/// name read `CLEAN` through [`crate::axioms::axiom_closure`] (which unfolds a
+/// definition instead of counting it) and typed as `False` in [`check_proof`]
+/// (which types a `Const` by its declared type). Each definition is now checked
+/// against the entries added BEFORE it, so the context is built in dependency
+/// order and a self-reference or a cycle is unresolvable by construction.
 #[derive(Debug, Clone, Default)]
 pub struct KernelContext {
     entries: FxHashMap<String, ContextEntry>,
@@ -131,17 +276,26 @@ impl KernelContext {
     ///
     /// # Errors
     ///
-    /// Returns `CertificateError::InvalidProofTerm` if the name is already defined.
+    /// Returns `CertificateError::InvalidProofTerm` if the name is already
+    /// defined, is kernel-owned ([`reserved_declaration_refusal`]), or the
+    /// definition does not kernel-check against the entries added before it
+    /// ([`definition_refusal`]).
     pub fn add_definition(
         &mut self,
         name: &str,
         ty: ProofTerm,
         value: ProofTerm,
     ) -> Result<(), CertificateError> {
+        if let Some(reason) = reserved_declaration_refusal(name, false) {
+            return Err(CertificateError::InvalidProofTerm { reason });
+        }
         if self.entries.contains_key(name) {
             return Err(CertificateError::InvalidProofTerm {
                 reason: format!("duplicate definition: {name}"),
             });
+        }
+        if let Some(reason) = definition_refusal(name, &ty, &value, self) {
+            return Err(CertificateError::InvalidProofTerm { reason });
         }
         self.entries.insert(name.to_string(), ContextEntry::Definition { ty, value });
         Ok(())
@@ -151,12 +305,21 @@ impl KernelContext {
     ///
     /// # Errors
     ///
-    /// Returns `CertificateError::InvalidProofTerm` if the name is already defined.
+    /// Returns `CertificateError::InvalidProofTerm` if the name is already
+    /// defined, is kernel-owned ([`reserved_declaration_refusal`]), or its
+    /// type is not a well-formed CLOSED type over the entries added before it
+    /// ([`axiom_refusal`]).
     pub fn add_axiom(&mut self, name: &str, ty: ProofTerm) -> Result<(), CertificateError> {
+        if let Some(reason) = reserved_declaration_refusal(name, true) {
+            return Err(CertificateError::InvalidProofTerm { reason });
+        }
         if self.entries.contains_key(name) {
             return Err(CertificateError::InvalidProofTerm {
                 reason: format!("duplicate axiom: {name}"),
             });
+        }
+        if let Some(reason) = axiom_refusal(name, &ty, self) {
+            return Err(CertificateError::InvalidProofTerm { reason });
         }
         self.entries.insert(name.to_string(), ContextEntry::Axiom { ty });
         Ok(())
@@ -178,6 +341,87 @@ impl KernelContext {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// Why `def name : ty := value` may not enter `ctx`, or `None` when it
+/// kernel-checks: `ty` is a well-formed type (its type is a `Sort`) and
+/// `value` infers a type definitionally equal to `ty`, both in `ctx` AS IT
+/// STANDS — the entries added before this one, never `name` itself.
+///
+/// Checking against the prefix is what orders a context: a definition may use
+/// only what precedes it, so a self-reference (`x := x`) or a cycle (`a := b`,
+/// `b := a`) names an unknown constant and is refused. A definition over a
+/// kernel foundation (`propext`, …) is refused too: the foundations are never
+/// context entries (their canonical statements need kernel inductives this
+/// term language lacks), so such a value cannot be typed here.
+#[must_use]
+pub fn definition_refusal(
+    name: &str,
+    ty: &ProofTerm,
+    value: &ProofTerm,
+    ctx: &KernelContext,
+) -> Option<String> {
+    if mentions_constant(ty, name) || mentions_constant(value, name) {
+        return Some(format!(
+            "definition `{name}` refers to itself; a context definition may use only the \
+             entries declared before it (no self-reference, no cycle)"
+        ));
+    }
+    if let Err(err) = infer_sort_level(ty, ctx, &[]) {
+        return Some(format!(
+            "the declared type of definition `{name}` is not a well-formed type over the \
+             entries declared before it: {err}"
+        ));
+    }
+    let inferred = match infer_type(value, ctx, &[]) {
+        Ok(inferred) => inferred,
+        Err(err) => {
+            return Some(format!(
+                "the value of definition `{name}` does not type-check over the entries \
+                 declared before it: {err}"
+            ));
+        }
+    };
+    if !is_definitionally_equal(&inferred, ty, ctx) {
+        return Some(format!(
+            "the value of definition `{name}` has type {inferred:?}, not its declared type {ty:?}"
+        ));
+    }
+    None
+}
+
+/// Why `axiom name : ty` may not enter `ctx`, or `None` when `ty` is a
+/// well-formed type (its type a `Sort`) over the entries added before it.
+///
+/// Trust (2026-09-29): the `Const` rule of [`infer_type`] returns a context
+/// type UNSHIFTED under whatever binders surround the use — correct only
+/// because every context type is closed. A definition's type is checked with
+/// no locals ([`definition_refusal`]), so it is; an axiom's type was stored
+/// unchecked, so `ax : Var 0` was accepted and `λP:Prop. ax` typed as
+/// `ΠP:Prop. P` — the free `Var 0` captured by the binder at the use site.
+#[must_use]
+pub fn axiom_refusal(name: &str, ty: &ProofTerm, ctx: &KernelContext) -> Option<String> {
+    infer_sort_level(ty, ctx, &[]).err().map(|err| {
+        format!(
+            "the declared type of axiom `{name}` is not a well-formed closed type over the \
+             entries declared before it: {err}"
+        )
+    })
+}
+
+/// Whether `term` names the constant `name` anywhere.
+fn mentions_constant(term: &ProofTerm, name: &str) -> bool {
+    match term {
+        ProofTerm::Const(constant) => constant == name,
+        ProofTerm::Var(_) | ProofTerm::Sort(_) => false,
+        ProofTerm::App(f, a) => mentions_constant(f, name) || mentions_constant(a, name),
+        ProofTerm::Lambda { binder_type, body, .. } => {
+            mentions_constant(binder_type, name) || mentions_constant(body, name)
+        }
+        ProofTerm::Pi { domain, codomain, .. } => {
+            mentions_constant(domain, name) || mentions_constant(codomain, name)
+        }
     }
 }
 
@@ -203,6 +447,19 @@ pub fn infer_type(
     ctx: &KernelContext,
     locals: &[ProofTerm],
 ) -> Result<ProofTerm, CertificateError> {
+    let mut stack: Vec<&ProofTerm> = if locals.is_empty() {
+        Vec::new()
+    } else {
+        locals.iter().collect()
+    };
+    infer_type_in(term, ctx, &mut stack)
+}
+
+fn infer_type_in<'a>(
+    term: &'a ProofTerm,
+    ctx: &KernelContext,
+    locals: &mut Vec<&'a ProofTerm>,
+) -> Result<ProofTerm, CertificateError> {
     match term {
         ProofTerm::Var(idx) => {
             let depth = locals.len();
@@ -211,8 +468,17 @@ pub fn infer_type(
                     reason: format!("variable index {idx} out of scope (depth {depth})"),
                 });
             }
-            // de Bruijn: index 0 = most recently bound
-            Ok(locals[depth - 1 - idx].clone())
+            // de Bruijn: index 0 = most recently bound. Trust (2026-09-29):
+            // `locals[k]` was pushed when k binders were in scope, so its free
+            // variables count from THAT depth; `Var(idx)` reads entry
+            // `depth - 1 - idx` from `idx + 1` binders deeper, and its type
+            // must be lifted past them (`shift(_, 0, idx + 1)`). Returned
+            // unshifted, `λP:Sort 2. λx:P. λQ:Prop. x` typed as
+            // `ΠP. Πx:P. ΠQ:Prop. Q` — the `x : P` read as `x : Q` — which
+            // applied to `Type` and `Prop` proves `∀Q:Prop, Q`; and the
+            // polymorphic identity `λA:Type. λa:A. a` was refused its true
+            // type `ΠA. Πa:A. A`.
+            Ok(shift(locals[depth - 1 - idx], 0, idx + 1))
         }
         ProofTerm::Const(name) => match ctx.lookup(name) {
             Some(ContextEntry::Definition { ty, .. }) => Ok(ty.clone()),
@@ -222,17 +488,27 @@ pub fn infer_type(
             }),
         },
         ProofTerm::Sort(u) => {
-            // Sort u : Sort (u+1)
-            Ok(ProofTerm::Sort(u.saturating_add(1)))
+            // Sort u : Sort (u+1). Trust (2026-09-29): the top level has no
+            // successor. `saturating_add` typed `Sort MAX : Sort MAX` — Type :
+            // Type, under which Girard's paradox inhabits every type of that
+            // universe — so it is refused, never clamped.
+            u.checked_add(1).map(ProofTerm::Sort).ok_or_else(|| CertificateError::KernelRejected {
+                reason: format!("universe level overflow: Sort {u} has no successor"),
+            })
         }
         ProofTerm::Lambda { binder_name, binder_type, body } => {
-            // Check binder_type is well-typed (must be a sort)
-            let _ = infer_type(binder_type, ctx, locals)?;
+            // Trust (2026-09-29): the binder's type must be a TYPE — its own
+            // type a `Sort`, exactly as the `Pi` rule below demands of a
+            // domain. Before, any well-typed term was accepted here (a proof
+            // as a binder "type"), so a lambda could have a type the kernel
+            // cannot even form.
+            infer_sort_level_in(binder_type, ctx, locals)?;
 
-            // Extend locals with the binder type
-            let mut extended = locals.to_vec();
-            extended.push(*binder_type.clone());
-            let body_type = infer_type(body, ctx, &extended)?;
+            // Push borrowed binder type in O(1) instead of cloning the whole local stack.
+            locals.push(binder_type);
+            let body_res = infer_type_in(body, ctx, locals);
+            locals.pop();
+            let body_type = body_res?;
 
             Ok(ProofTerm::Pi {
                 binder_name: binder_name.clone(),
@@ -241,17 +517,18 @@ pub fn infer_type(
             })
         }
         ProofTerm::Pi { domain, codomain, .. } => {
-            let domain_sort = infer_sort_level(domain, ctx, locals)?;
-            let mut extended = locals.to_vec();
-            extended.push(*domain.clone());
-            let codomain_sort = infer_sort_level(codomain, ctx, &extended)?;
+            let domain_sort = infer_sort_level_in(domain, ctx, locals)?;
+            locals.push(domain);
+            let codomain_res = infer_sort_level_in(codomain, ctx, locals);
+            locals.pop();
+            let codomain_sort = codomain_res?;
             Ok(ProofTerm::Sort(domain_sort.max(codomain_sort)))
         }
         ProofTerm::App(f, a) => {
-            let f_type = infer_type(f, ctx, locals)?;
+            let f_type = infer_type_in(f, ctx, locals)?;
             match f_type {
                 ProofTerm::Pi { domain, codomain, .. } => {
-                    let a_type = infer_type(a, ctx, locals)?;
+                    let a_type = infer_type_in(a, ctx, locals)?;
                     if !is_definitionally_equal(&a_type, &domain, ctx) {
                         return Err(CertificateError::KernelRejected {
                             reason: format!(
@@ -277,7 +554,20 @@ fn infer_sort_level(
     ctx: &KernelContext,
     locals: &[ProofTerm],
 ) -> Result<u32, CertificateError> {
-    let ty = infer_type(term, ctx, locals)?;
+    let mut stack: Vec<&ProofTerm> = if locals.is_empty() {
+        Vec::new()
+    } else {
+        locals.iter().collect()
+    };
+    infer_sort_level_in(term, ctx, &mut stack)
+}
+
+fn infer_sort_level_in<'a>(
+    term: &'a ProofTerm,
+    ctx: &KernelContext,
+    locals: &mut Vec<&'a ProofTerm>,
+) -> Result<u32, CertificateError> {
+    let ty = infer_type_in(term, ctx, locals)?;
     match ty {
         ProofTerm::Sort(u) => Ok(u),
         // Trust: F5 soundness fix — non-Sort types must not silently become Prop
@@ -291,6 +581,46 @@ fn infer_sort_level(
 // Substitution
 // ---------------------------------------------------------------------------
 
+/// Single-pass `O(N)` shift returning `None` when `amount == 0` or `term` has
+/// no free de Bruijn variable `>= cutoff`.
+fn shift_opt(term: &ProofTerm, cutoff: usize, amount: usize) -> Option<ProofTerm> {
+    if amount == 0 {
+        return None;
+    }
+    match term {
+        ProofTerm::Var(idx) => (*idx >= cutoff).then(|| ProofTerm::Var(idx + amount)),
+        ProofTerm::Const(_) | ProofTerm::Sort(_) => None,
+        ProofTerm::App(f, a) => match (shift_opt(f, cutoff, amount), shift_opt(a, cutoff, amount)) {
+            (None, None) => None,
+            (Some(nf), None) => Some(ProofTerm::App(Box::new(nf), a.clone())),
+            (None, Some(na)) => Some(ProofTerm::App(f.clone(), Box::new(na))),
+            (Some(nf), Some(na)) => Some(ProofTerm::App(Box::new(nf), Box::new(na))),
+        },
+        ProofTerm::Lambda { binder_name, binder_type, body } => match (
+            shift_opt(binder_type, cutoff, amount),
+            shift_opt(body, cutoff + 1, amount),
+        ) {
+            (None, None) => None,
+            (nt, nb) => Some(ProofTerm::Lambda {
+                binder_name: binder_name.clone(),
+                binder_type: nt.map_or_else(|| binder_type.clone(), Box::new),
+                body: nb.map_or_else(|| body.clone(), Box::new),
+            }),
+        },
+        ProofTerm::Pi { binder_name, domain, codomain } => match (
+            shift_opt(domain, cutoff, amount),
+            shift_opt(codomain, cutoff + 1, amount),
+        ) {
+            (None, None) => None,
+            (nd, nc) => Some(ProofTerm::Pi {
+                binder_name: binder_name.clone(),
+                domain: nd.map_or_else(|| domain.clone(), Box::new),
+                codomain: nc.map_or_else(|| codomain.clone(), Box::new),
+            }),
+        },
+    }
+}
+
 /// Shift (lift) free variables in `term` by `amount`.
 ///
 /// All variables with de Bruijn index >= `cutoff` are incremented by `amount`.
@@ -301,29 +631,62 @@ fn infer_sort_level(
 /// Reference: Barendregt, "The Lambda Calculus", Chapter 2 (de Bruijn indices).
 #[must_use]
 pub fn shift(term: &ProofTerm, cutoff: usize, amount: usize) -> ProofTerm {
+    shift_opt(term, cutoff, amount).unwrap_or_else(|| term.clone())
+}
+
+/// Single-pass `O(N)` capture-avoiding de Bruijn substitution accumulating
+/// `binder_depth` in `O(1)` across binders and computing `shift(replacement, 0, binder_depth)`
+/// only at matching `Var(target_idx)` leaves (returning `None` when every `Var` in `term`
+/// has `idx < target_idx`).
+fn substitute_opt(
+    term: &ProofTerm,
+    target_idx: usize,
+    replacement: &ProofTerm,
+    binder_depth: usize,
+) -> Option<ProofTerm> {
     match term {
         ProofTerm::Var(idx) => {
-            if *idx >= cutoff {
-                ProofTerm::Var(idx + amount)
+            if *idx == target_idx {
+                Some(shift(replacement, 0, binder_depth))
+            } else if *idx > target_idx {
+                // Shift down since the binder is being removed
+                Some(ProofTerm::Var(idx - 1))
             } else {
-                ProofTerm::Var(*idx)
+                None
             }
         }
-        ProofTerm::App(f, a) => {
-            ProofTerm::App(Box::new(shift(f, cutoff, amount)), Box::new(shift(a, cutoff, amount)))
-        }
-        ProofTerm::Lambda { binder_name, binder_type, body } => ProofTerm::Lambda {
-            binder_name: binder_name.clone(),
-            binder_type: Box::new(shift(binder_type, cutoff, amount)),
-            body: Box::new(shift(body, cutoff + 1, amount)),
+        ProofTerm::Const(_) | ProofTerm::Sort(_) => None,
+        ProofTerm::App(f, a) => match (
+            substitute_opt(f, target_idx, replacement, binder_depth),
+            substitute_opt(a, target_idx, replacement, binder_depth),
+        ) {
+            (None, None) => None,
+            (Some(nf), None) => Some(ProofTerm::App(Box::new(nf), a.clone())),
+            (None, Some(na)) => Some(ProofTerm::App(f.clone(), Box::new(na))),
+            (Some(nf), Some(na)) => Some(ProofTerm::App(Box::new(nf), Box::new(na))),
         },
-        ProofTerm::Pi { binder_name, domain, codomain } => ProofTerm::Pi {
-            binder_name: binder_name.clone(),
-            domain: Box::new(shift(domain, cutoff, amount)),
-            codomain: Box::new(shift(codomain, cutoff + 1, amount)),
+        ProofTerm::Lambda { binder_name, binder_type, body } => match (
+            substitute_opt(binder_type, target_idx, replacement, binder_depth),
+            substitute_opt(body, target_idx + 1, replacement, binder_depth + 1),
+        ) {
+            (None, None) => None,
+            (nt, nb) => Some(ProofTerm::Lambda {
+                binder_name: binder_name.clone(),
+                binder_type: nt.map_or_else(|| binder_type.clone(), Box::new),
+                body: nb.map_or_else(|| body.clone(), Box::new),
+            }),
         },
-        ProofTerm::Const(name) => ProofTerm::Const(name.clone()),
-        ProofTerm::Sort(u) => ProofTerm::Sort(*u),
+        ProofTerm::Pi { binder_name, domain, codomain } => match (
+            substitute_opt(domain, target_idx, replacement, binder_depth),
+            substitute_opt(codomain, target_idx + 1, replacement, binder_depth + 1),
+        ) {
+            (None, None) => None,
+            (nd, nc) => Some(ProofTerm::Pi {
+                binder_name: binder_name.clone(),
+                domain: nd.map_or_else(|| domain.clone(), Box::new),
+                codomain: nc.map_or_else(|| codomain.clone(), Box::new),
+            }),
+        },
     }
 }
 
@@ -336,42 +699,7 @@ pub fn shift(term: &ProofTerm, cutoff: usize, amount: usize) -> ProofTerm {
 /// Reference: Barendregt, "The Lambda Calculus", Chapter 2.
 #[must_use]
 pub fn substitute(term: &ProofTerm, target_idx: usize, replacement: &ProofTerm) -> ProofTerm {
-    match term {
-        ProofTerm::Var(idx) => {
-            if *idx == target_idx {
-                replacement.clone()
-            } else if *idx > target_idx {
-                // Shift down since the binder is being removed
-                ProofTerm::Var(idx - 1)
-            } else {
-                ProofTerm::Var(*idx)
-            }
-        }
-        ProofTerm::App(f, a) => ProofTerm::App(
-            Box::new(substitute(f, target_idx, replacement)),
-            Box::new(substitute(a, target_idx, replacement)),
-        ),
-        ProofTerm::Lambda { binder_name, binder_type, body } => {
-            // Trust: shift replacement by +1 to avoid capture by this binder
-            let shifted = shift(replacement, 0, 1);
-            ProofTerm::Lambda {
-                binder_name: binder_name.clone(),
-                binder_type: Box::new(substitute(binder_type, target_idx, replacement)),
-                body: Box::new(substitute(body, target_idx + 1, &shifted)),
-            }
-        }
-        ProofTerm::Pi { binder_name, domain, codomain } => {
-            // Trust: shift replacement by +1 to avoid capture by this binder
-            let shifted = shift(replacement, 0, 1);
-            ProofTerm::Pi {
-                binder_name: binder_name.clone(),
-                domain: Box::new(substitute(domain, target_idx, replacement)),
-                codomain: Box::new(substitute(codomain, target_idx + 1, &shifted)),
-            }
-        }
-        ProofTerm::Const(name) => ProofTerm::Const(name.clone()),
-        ProofTerm::Sort(u) => ProofTerm::Sort(*u),
-    }
+    substitute_opt(term, target_idx, replacement, 0).unwrap_or_else(|| term.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -393,12 +721,18 @@ pub fn is_definitionally_equal(lhs: &ProofTerm, rhs: &ProofTerm, ctx: &KernelCon
         return true;
     }
 
-    // Try delta reduction (unfold definitions)
-    let lhs_reduced = delta_reduce(lhs, ctx);
-    let rhs_reduced = delta_reduce(rhs, ctx);
-
-    if lhs_reduced != *lhs || rhs_reduced != *rhs {
-        return is_definitionally_equal(&lhs_reduced, &rhs_reduced, ctx);
+    // Try delta/beta reduction without cloning non-reducing subtrees
+    match (delta_reduce_opt(lhs, ctx), delta_reduce_opt(rhs, ctx)) {
+        (Some(l), Some(r)) if l != *lhs || r != *rhs => {
+            return is_definitionally_equal(&l, &r, ctx);
+        }
+        (Some(l), None) if l != *lhs => {
+            return is_definitionally_equal(&l, rhs, ctx);
+        }
+        (None, Some(r)) if r != *rhs => {
+            return is_definitionally_equal(lhs, &r, ctx);
+        }
+        _ => {}
     }
 
     // Structural comparison after reduction
@@ -418,28 +752,32 @@ pub fn is_definitionally_equal(lhs: &ProofTerm, rhs: &ProofTerm, ctx: &KernelCon
     }
 }
 
-/// Perform one step of delta reduction: unfold a `Const` to its definition.
-fn delta_reduce(term: &ProofTerm, ctx: &KernelContext) -> ProofTerm {
+/// Perform one head delta/beta step, returning `None` when `term` does not reduce
+/// (avoiding full-tree `ProofTerm` clones on every non-reducing equality check).
+fn delta_reduce_opt(term: &ProofTerm, ctx: &KernelContext) -> Option<ProofTerm> {
     match term {
         ProofTerm::Const(name) => {
             if let Some(ContextEntry::Definition { value, .. }) = ctx.lookup(name) {
-                value.clone()
+                Some(value.clone())
             } else {
-                term.clone()
+                None
             }
         }
         ProofTerm::App(f, a) => {
-            let f_reduced = delta_reduce(f, ctx);
-            // Beta reduction: (fun x => body) a  =>  body[0 := a]
+            // Direct beta reduction without cloning `f` first
+            if let ProofTerm::Lambda { body, .. } = f.as_ref() {
+                return Some(substitute(body, 0, a));
+            }
+            let f_reduced = delta_reduce_opt(f, ctx)?;
             if let ProofTerm::Lambda { body, .. } = &f_reduced {
-                substitute(body, 0, a)
+                Some(substitute(body, 0, a))
             } else if f_reduced != **f {
-                ProofTerm::App(Box::new(f_reduced), a.clone())
+                Some(ProofTerm::App(Box::new(f_reduced), a.clone()))
             } else {
-                term.clone()
+                None
             }
         }
-        _ => term.clone(),
+        _ => None,
     }
 }
 
@@ -909,5 +1247,349 @@ mod tests {
             result, expected,
             "free variable in replacement must be shifted to avoid capture by Pi binder"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Kernel-owned names (2026-09-28): a context cannot counterfeit a
+    // foundation or declare a trust marker.
+    // -----------------------------------------------------------------------
+
+    /// Every kernel-owned name, as the kernel classifies it.
+    const RESERVED: [(&str, ReservedKernelName); 11] = [
+        ("propext", ReservedKernelName::Foundation),
+        ("Quot.sound", ReservedKernelName::Foundation),
+        ("Classical.choice", ReservedKernelName::Foundation),
+        ("Quot", ReservedKernelName::Foundation),
+        ("Quot.mk", ReservedKernelName::Foundation),
+        ("Quot.lift", ReservedKernelName::Foundation),
+        ("Quot.ind", ReservedKernelName::Foundation),
+        ("sorry", ReservedKernelName::TrustMarker),
+        ("sorryAx", ReservedKernelName::TrustMarker),
+        ("trustedArith", ReservedKernelName::TrustMarker),
+        ("trustedAy", ReservedKernelName::TrustMarker),
+    ];
+
+    #[test]
+    fn kernel_owned_names_are_refused_in_every_declaration_kind() {
+        for (name, class) in RESERVED {
+            assert_eq!(reserved_kernel_name(name), Some(class), "{name}");
+            let mut ctx = KernelContext::new();
+            for (kind, result) in [
+                ("axiom", ctx.add_axiom(name, prop())),
+                ("definition", ctx.add_definition(name, prop(), prop())),
+            ] {
+                let err = result.expect_err(&format!("{name} as {kind} must be refused"));
+                assert!(err.to_string().contains("reserved kernel name"), "{name}: {err}");
+            }
+            assert!(ctx.is_empty(), "a refused declaration must leave nothing behind");
+        }
+    }
+
+    /// The refusal names WHY no ProofTerm declaration is the canonical one.
+    #[test]
+    fn foundation_refusals_state_the_canonical_mismatch() {
+        let arity = reserved_declaration_refusal("Classical.choice", true).unwrap();
+        assert!(arity.contains("universe arity 1"), "{arity}");
+        let lift = reserved_declaration_refusal("Quot.lift", true).unwrap();
+        assert!(lift.contains("universe arity 2"), "{lift}");
+        let propext = reserved_declaration_refusal("propext", true).unwrap();
+        assert!(propext.contains("`Iff` and `Eq.{1}`"), "{propext}");
+        let def = reserved_declaration_refusal("Quot.sound", false).unwrap();
+        assert!(def.contains("counterfeit"), "{def}");
+        let marker = reserved_declaration_refusal("sorryAx", false).unwrap();
+        assert!(marker.contains("trust marker") && marker.contains("a Definition"), "{marker}");
+    }
+
+    /// The boundary: names that merely resemble a kernel-owned one, and the
+    /// historical whitelist entries that are not kernel axioms, stay declarable.
+    #[test]
+    fn near_miss_names_stay_declarable() {
+        for name in [
+            "proofIrrel",
+            "Eq.refl",
+            "funext",
+            "propext.x",
+            "Quot.sound2",
+            "Quot.soundness",
+            "sorryAxiom",
+            "trustedAyx",
+            "Classical",
+            "False",
+            "Trust.Int",
+        ] {
+            assert_eq!(reserved_kernel_name(name), None, "{name}");
+            let mut ctx = KernelContext::new();
+            ctx.add_axiom(name, prop()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    /// The pre-fix attack on the checker itself: with `propext : False` in the
+    /// context, `check_proof` accepted the bare constant as a proof of `False`.
+    /// The declaration is now refused, so the constant is unknown to the local
+    /// checker and the query is a type error.
+    #[test]
+    fn a_counterfeit_foundation_cannot_type_a_proof_of_false() {
+        let mut ctx = KernelContext::new();
+        ctx.add_axiom("False", prop()).expect("an ordinary axiom");
+        let false_ty = ProofTerm::Const("False".to_string());
+        assert!(ctx.add_axiom("propext", false_ty.clone()).is_err());
+        let query =
+            KernelQuery { term: ProofTerm::Const("propext".to_string()), expected_type: false_ty };
+        let result = check_proof(&query, &ctx).expect("check_proof reports, never errors");
+        assert!(matches!(result, KernelResult::TypeError(_)), "{result:?}");
+    }
+
+    /// Pins the local arity table (and the `propext` statement claim) against
+    /// the Clean kernel's OWN canonical declarations, so neither can drift.
+    #[test]
+    fn canonical_foundation_arities_match_the_kernel_prelude() {
+        use clean_kernel::{ConstantKind, Environment, Expr, ExprKind, Name};
+
+        fn consts(expr: &Expr, out: &mut Vec<(String, usize)>) {
+            match expr.kind() {
+                ExprKind::Const(name, levels) => out.push((name.to_string(), levels.len())),
+                ExprKind::App(f, a) => {
+                    consts(f, out);
+                    consts(a, out);
+                }
+                ExprKind::Lam(_, t, b) | ExprKind::Pi(_, t, b) => {
+                    consts(t, out);
+                    consts(b, out);
+                }
+                _ => {}
+            }
+        }
+
+        let env = Environment::with_prelude();
+        for (name, arity) in CANONICAL_FOUNDATION_UNIVERSE_ARITY {
+            assert_eq!(reserved_kernel_name(name), Some(ReservedKernelName::Foundation), "{name}");
+            let info = env
+                .get_const(&Name::from_string(name))
+                .unwrap_or_else(|| panic!("the kernel prelude declares {name}"));
+            assert_eq!(info.kind, ConstantKind::Axiom, "{name} is canonically an Axiom");
+            assert!(info.value.is_none(), "{name} is canonically value-less");
+            assert_eq!(info.level_params.len(), arity, "{name}: canonical universe arity");
+        }
+        let propext = env.get_const(&Name::from_string("propext")).expect("propext");
+        let mut named = Vec::new();
+        consts(&propext.type_, &mut named);
+        assert!(named.contains(&("Iff".to_string(), 0)), "{named:?}");
+        assert!(named.contains(&("Eq".to_string(), 1)), "propext names Eq.{{1}}: {named:?}");
+        // Every kernel foundation is covered by the table.
+        for (name, class) in RESERVED {
+            if class == ReservedKernelName::Foundation {
+                assert!(
+                    CANONICAL_FOUNDATION_UNIVERSE_ARITY.iter().any(|(n, _)| *n == name),
+                    "{name} missing from the arity table"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Definitions are kernel-checked (2026-09-29, cb/track-b review)
+    // -----------------------------------------------------------------------
+
+    fn named(name: &str) -> ProofTerm {
+        ProofTerm::Const(name.to_string())
+    }
+
+    /// The reviewer's `mySorry : False := Sort 0`: `False` is a well-typed
+    /// definition (`Sort 0 : Sort 1`), but `Sort 0` is not a term of it. Before,
+    /// the entry was stored and `check_proof` typed `mySorry` as `False`.
+    #[test]
+    fn an_ill_typed_definition_is_refused_and_cannot_prove_its_type() {
+        let mut ctx = KernelContext::new();
+        ctx.add_definition("False", ProofTerm::Sort(1), prop()).expect("Prop : Type");
+        let err = ctx
+            .add_definition("mySorry", named("False"), prop())
+            .expect_err("`Sort 0` is not a term of `False`");
+        assert!(err.to_string().contains("not its declared type"), "{err}");
+        assert!(ctx.lookup("mySorry").is_none());
+        let query = KernelQuery { term: named("mySorry"), expected_type: named("False") };
+        assert!(!check_proof(&query, &ctx).expect("no kernel error").is_valid());
+    }
+
+    /// A declared type must be a TYPE (its own type a `Sort`), and a value must
+    /// type-check at all; the refusal names which half failed.
+    #[test]
+    fn a_definition_needs_a_well_formed_type_and_a_typeable_value() {
+        let mut ctx = KernelContext::new();
+        ctx.add_axiom("P", prop()).unwrap();
+        ctx.add_axiom("p", named("P")).unwrap();
+        let err = ctx.add_definition("q", named("p"), named("p")).expect_err("`p` is a proof");
+        assert!(err.to_string().contains("declared type of definition `q`"), "{err}");
+        let err = ctx.add_definition("r", named("P"), named("ghost")).expect_err("undeclared");
+        assert!(err.to_string().contains("value of definition `r`"), "{err}");
+        assert!(err.to_string().contains("unknown constant: ghost"), "{err}");
+        // Control: `p : P` is a well-typed definition body.
+        ctx.add_definition("s", named("P"), named("p")).expect("well-typed");
+        // And a later definition may unfold an earlier one through its type.
+        ctx.add_definition("T", ProofTerm::Sort(1), prop()).unwrap();
+        ctx.add_definition(
+            "idT",
+            arrow(named("T"), named("T")),
+            lam("x", named("T"), ProofTerm::Var(0)),
+        )
+        .expect("unfolds nothing it has not seen");
+    }
+
+    /// `Sort MAX` has no successor: `saturating_add` used to type it as itself
+    /// (Type : Type).
+    #[test]
+    fn the_top_universe_has_no_type() {
+        let ctx = KernelContext::new();
+        let err = infer_type(&ProofTerm::Sort(u32::MAX), &ctx, &[]).expect_err("no successor");
+        assert!(err.to_string().contains("universe level overflow"), "{err}");
+        assert_eq!(
+            infer_type(&ProofTerm::Sort(u32::MAX - 1), &ctx, &[]).expect("has a successor"),
+            ProofTerm::Sort(u32::MAX)
+        );
+    }
+
+    /// A lambda's binder type must be a TYPE, as a `Pi`'s domain must.
+    #[test]
+    fn a_lambda_binder_must_be_a_type() {
+        let mut ctx = KernelContext::new();
+        ctx.add_axiom("P", prop()).unwrap();
+        ctx.add_axiom("p", named("P")).unwrap();
+        let err = infer_type(&lam("x", named("p"), ProofTerm::Var(0)), &ctx, &[])
+            .expect_err("`p` is a proof, not a type");
+        assert!(err.to_string().contains("expected Sort(_)"), "{err}");
+        assert!(infer_type(&lam("x", named("P"), ProofTerm::Var(0)), &ctx, &[]).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // de Bruijn: a local's type is lifted past the binders after it
+    // (2026-09-29, cb/track-b round-2 review)
+    // -----------------------------------------------------------------------
+
+    fn pi(name: &str, domain: ProofTerm, codomain: ProofTerm) -> ProofTerm {
+        ProofTerm::Pi {
+            binder_name: name.to_string(),
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
+    }
+
+    fn app(f: ProofTerm, a: ProofTerm) -> ProofTerm {
+        ProofTerm::App(Box::new(f), Box::new(a))
+    }
+
+    fn var(idx: usize) -> ProofTerm {
+        ProofTerm::Var(idx)
+    }
+
+    /// The polymorphic identity `λA:Type. λa:A. a` has type `ΠA:Type. Πa:A. A`
+    /// — `A` is `Var 1` under the `a` binder. Unshifted, the lookup returned
+    /// `a`'s stored type `Var 0` verbatim, `ΠA. Πa:A. a`, and the true type
+    /// was refused.
+    #[test]
+    fn a_locals_type_is_lifted_past_the_binders_after_it() {
+        let ctx = KernelContext::new();
+        let id = lam("A", type_sort(), lam("a", var(0), var(0)));
+        let ty = infer_type(&id, &ctx, &[]).expect("the polymorphic identity types");
+        assert_eq!(ty, pi("A", type_sort(), pi("a", var(0), var(1))));
+        // Directly, at depth 3: `Var 1` reads the entry pushed at depth 1,
+        // whose `Var 0` (the first binder) is `Var 2` at the use site.
+        let locals = [ProofTerm::Sort(2), var(0), prop()];
+        assert_eq!(infer_type(&var(1), &ctx, &locals).unwrap(), var(2));
+        assert_eq!(infer_type(&var(0), &ctx, &locals).unwrap(), prop());
+        assert_eq!(infer_type(&var(2), &ctx, &locals).unwrap(), ProofTerm::Sort(2));
+    }
+
+    /// The reviewer's attack: `(λP:Sort 2. λx:P. λQ:Prop. x) Type Prop` typed as
+    /// `∀Q:Prop, Q` and so passed as a definition of that type. Its true type is
+    /// `ΠQ:Prop. Type`, and `K`'s is `ΠP. Πx:P. ΠQ:Prop. P`, not `… Q`.
+    #[test]
+    fn the_k_combinator_does_not_prove_every_proposition() {
+        let mut ctx = KernelContext::new();
+        let all_props = pi("Q", prop(), var(0));
+        ctx.add_definition("False", type_sort(), all_props.clone()).expect("∀Q:Prop, Q : Type");
+        let k = lam("P", ProofTerm::Sort(2), lam("x", var(0), lam("Q", prop(), var(1))));
+        let k_true = pi("P", ProofTerm::Sort(2), pi("x", var(0), pi("Q", prop(), var(2))));
+        let k_false = pi("P", ProofTerm::Sort(2), pi("x", var(0), pi("Q", prop(), var(0))));
+        assert_eq!(infer_type(&k, &ctx, &[]).unwrap(), k_true);
+        let err = ctx.add_definition("K_bad", k_false, k.clone()).expect_err("not K's type");
+        assert!(err.to_string().contains("not its declared type"), "{err}");
+        ctx.add_definition("K", k_true, k.clone()).expect("K at its true type");
+        let bad = app(app(k, type_sort()), prop());
+        assert_eq!(infer_type(&bad, &ctx, &[]).unwrap(), pi("Q", prop(), type_sort()));
+        let err = ctx.add_definition("bad", named("False"), bad.clone()).expect_err("not False");
+        assert!(err.to_string().contains("not its declared type"), "{err}");
+        let query = KernelQuery { term: bad, expected_type: all_props };
+        assert!(matches!(check_proof(&query, &ctx).unwrap(), KernelResult::Invalid(_)));
+    }
+
+    /// A dependent hypothesis: in `λA. λP:A→Prop. λa:A. λb:A. λh:P a. h`, the
+    /// stored `P a` is `Var 2 Var 1` (spelled at depth 4) and reads
+    /// `Var 3 Var 2` under `h`. Unlifted, `Var 2 Var 1` under `h` names `a b`,
+    /// an application of a non-function.
+    #[test]
+    fn a_dependent_hypothesis_keeps_its_predicate_and_witness() {
+        let ctx = KernelContext::new();
+        let a_to_prop = |a: usize| pi("_", var(a), prop());
+        let body = lam("h", app(var(2), var(1)), var(0));
+        let term =
+            lam("A", type_sort(), lam("P", a_to_prop(0), lam("a", var(1), lam("b", var(2), body))));
+        let ty = infer_type(&term, &ctx, &[]).expect("types");
+        let want = pi(
+            "A",
+            type_sort(),
+            pi(
+                "P",
+                a_to_prop(0),
+                pi("a", var(1), pi("b", var(2), pi("h", app(var(2), var(1)), app(var(3), var(2))))),
+            ),
+        );
+        assert_eq!(ty, want);
+    }
+
+    /// Every context type is closed, because the `Const` rule returns it
+    /// unshifted under any binders: an axiom whose type has a free variable,
+    /// or is not a type at all, is refused like an ill-formed definition type.
+    #[test]
+    fn an_axiom_type_must_be_a_closed_type() {
+        let mut ctx = KernelContext::new();
+        let err = ctx.add_axiom("ax", var(0)).expect_err("free variable");
+        assert!(err.to_string().contains("declared type of axiom `ax`"), "{err}");
+        assert!(err.to_string().contains("out of scope"), "{err}");
+        // Before: `λP:Prop. ax` typed as `ΠP:Prop. P`.
+        assert!(infer_type(&lam("P", prop(), named("ax")), &ctx, &[]).is_err());
+        ctx.add_axiom("P", prop()).unwrap();
+        ctx.add_axiom("p", named("P")).unwrap();
+        let err = ctx.add_axiom("q", named("p")).expect_err("`p` is a proof, not a type");
+        assert!(err.to_string().contains("expected Sort(_)"), "{err}");
+        let err = ctx.add_axiom("r", named("later")).expect_err("declared after");
+        assert!(err.to_string().contains("unknown constant: later"), "{err}");
+        assert_eq!(ctx.len(), 2, "a refused axiom leaves nothing behind");
+    }
+
+    #[test]
+    fn wave493_deep_binder_stack_and_accumulated_shift_substitution_match_oracle() {
+        // Verify `shift(shift(...shift(rep, 0, 1)..., 0, 1), 0, 1) == shift(rep, 0, d)`
+        // and multi-binder capture-avoiding `substitute`.
+        let rep = lam("inner", prop(), app(var(0), app(var(1), var(3))));
+        let mut iter_shifted = rep.clone();
+        for d in 1..=5 {
+            iter_shifted = shift(&iter_shifted, 0, 1);
+            assert_eq!(iter_shifted, shift(&rep, 0, d));
+        }
+        assert!(shift_opt(&prop(), 0, 5).is_none());
+
+        // Under 3 nested binders, Var(3) targets outer `target_idx = 0`, Var(4) shifts down to Var(3),
+        // and bound Vars 0..=2 stay untouched.
+        let nested = lam(
+            "b1",
+            prop(),
+            pi("b2", prop(), lam("b3", prop(), app(app(var(3), var(4)), var(1)))),
+        );
+        let subbed = substitute(&nested, 0, &rep);
+        let expected = lam(
+            "b1",
+            prop(),
+            pi("b2", prop(), lam("b3", prop(), app(app(shift(&rep, 0, 3), var(3)), var(1)))),
+        );
+        assert_eq!(subbed, expected);
     }
 }

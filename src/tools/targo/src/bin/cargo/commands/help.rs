@@ -1,10 +1,10 @@
 use crate::aliased_command;
 use crate::command_prelude::*;
 
-use cargo::drop_println;
-use cargo::util::errors::CargoResult;
 use cargo_util::paths::resolve_executable;
 use flate2::read::GzDecoder;
+use targo::drop_println;
+use targo::util::errors::CargoResult;
 
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -19,7 +19,11 @@ pub fn cli() -> Command {
         // Trust: this text and the errors below name the invoked binary rather
         // than a `cargo` literal; see `frontend_binary_name` in
         // `bin/cargo/main.rs`.
-        .about("Displays help for a Cargo-compatible command")
+        .about(if targo::is_targo_invocation() {
+            "Displays help for a Cargo-compatible command"
+        } else {
+            "Displays help for a cargo command"
+        })
         .arg(
             Arg::new("COMMAND")
                 .num_args(1..)

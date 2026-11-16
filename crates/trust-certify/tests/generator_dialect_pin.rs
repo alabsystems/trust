@@ -89,7 +89,7 @@ fn generator_dialect_forms_register_in_the_island_environment() {
             "bounded_u64_literal",
             "def bwd_pin : Prop := (forall i : Int, (((0 \u{2264} i) \u{2227} (i < 18446744073709551616)) \u{2192} (i = i)))",
         ),
-        // §3 vocabulary layer (owner-ruled OPEN 2026-07-23, Seq→List): the
+        // §3 vocabulary layer (ruled OPEN 2026-07-23, Seq→List): the
         // pearlite sequence vocabulary as kernel-checked aliases over the
         // List theories the island environment already carries. Each future
         // table entry (view functions, further ops) lands with its own

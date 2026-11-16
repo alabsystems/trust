@@ -434,9 +434,7 @@ mod tests_for_is_self_contained_query {
 
     #[test]
     fn a_semicolon_inside_a_string_literal_does_not_hide_the_rest_of_the_line() {
-        assert!(is_self_contained_query(
-            "(assert (= s \"a;b\")) (check-sat)\n"
-        ));
+        assert!(is_self_contained_query("(assert (= s \"a;b\")) (check-sat)\n"));
     }
 }
 

@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-CV): a NON-CAPTURING closure literal in value position is the
 //! unit ZST it is (`Const { Unit, PhantomData }`, the seed the call-arg lane
 //! already mints), its type maps to `Unit` (the oracle's spelling), and a call

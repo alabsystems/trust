@@ -299,13 +299,8 @@ pub fn generate_manifest(
 ) -> CompositionManifest {
     let mut manifest = CompositionManifest::new(crate_id, version);
 
-    for func_name in composition.functions() {
-        let node = match composition.get_node(&func_name) {
-            Some(n) => n,
-            None => continue,
-        };
-
-        let cert = composition.get_certificate(&func_name);
+    for (func_name, node) in &composition.nodes {
+        let cert = composition.get_certificate(func_name);
 
         let spec = FunctionSpec::new(
             Vec::new(), // Populated from contract metadata when available

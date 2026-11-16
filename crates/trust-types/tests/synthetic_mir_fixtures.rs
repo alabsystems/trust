@@ -51,6 +51,7 @@ fn make_func(name: &str, body: VerifiableBody) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -131,6 +132,7 @@ fn fixture_arithmetic_overflow_add_i32() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert_eq!(func.name, "add_i32");
@@ -234,6 +236,7 @@ fn fixture_arithmetic_overflow_sub_u8() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert!(func.body.blocks.iter().any(|bb| matches!(
@@ -505,6 +508,7 @@ fn fixture_division_by_zero() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert!(func.body.blocks.iter().any(|bb| matches!(
@@ -663,6 +667,7 @@ fn fixture_index_out_of_bounds() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert!(func.body.blocks.iter().any(|bb| matches!(
@@ -792,6 +797,7 @@ fn fixture_slice_bounds_check() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // Two bounds-check asserts
@@ -1121,6 +1127,7 @@ fn fixture_precondition() {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::f64::sqrt".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -1148,6 +1155,7 @@ fn fixture_precondition() {
         )],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert_eq!(func.contracts.len(), 1);
@@ -1229,6 +1237,7 @@ fn fixture_postcondition() {
             Box::new(Formula::Int(0)),
         )],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert_eq!(func.contracts.len(), 1);
@@ -1347,6 +1356,7 @@ fn fixture_combined_div_overflow_and_divzero() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // Both asserts present

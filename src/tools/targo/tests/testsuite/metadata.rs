@@ -758,7 +758,8 @@ fn cargo_metadata_public_private_dependencies_enabled() {
     Package::new("foobar", "0.0.2").publish();
     Package::new("baz", "0.0.3").publish();
 
-    p.cargo("metadata -q --format-version 1 -Zpublic-dependency")
+    p.cargo("metadata -q --format-version 1")
+        .arg("-Zpublic-dependency")
         .masquerade_as_nightly_cargo(&["public-dependency"])
         .with_stdout_data(
             str![[r#"
@@ -1453,7 +1454,8 @@ fn workspace_metadata_with_dependencies_and_resolve() {
         .file("non-artifact/src/lib.rs", "")
         .build();
 
-    p.cargo("metadata -Z bindeps")
+    p.cargo("metadata")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stdout_data(
             str![[r#"
@@ -2117,12 +2119,13 @@ fn cargo_metadata_with_invalid_artifact_deps() {
         .file("artifact/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("metadata -Z bindeps")
+    p.cargo("metadata")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_status(101)
         .with_stderr_data(str![[r#"
 [WARNING] please specify `--format-version` flag explicitly to avoid compatibility problems
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] dependency `artifact` in package `foo` requires a `bin:notfound` artifact to be present.
 
 "#]])
@@ -2153,7 +2156,7 @@ fn cargo_metadata_with_invalid_duplicate_renamed_deps() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [WARNING] please specify `--format-version` flag explicitly to avoid compatibility problems
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] the crate `foo v0.5.0 ([ROOT]/foo)` depends on crate `bar v0.5.0 ([ROOT]/foo/bar)` multiple times with different names
 
 "#]])
@@ -3512,7 +3515,7 @@ fn filter_platform() {
             str![[r#"
 [WARNING] please specify `--format-version` flag explicitly to avoid compatibility problems
 [UPDATING] `dummy-registry` index
-[LOCKING] 4 packages to latest compatible versions
+[LOCKING] 4 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] normal-dep v0.0.1 (registry `dummy-registry`)
 [DOWNLOADED] host-dep v0.0.1 (registry `dummy-registry`)
@@ -4349,7 +4352,8 @@ fn workspace_metadata_with_dependencies_no_deps_artifact() {
         .file("artifact/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("metadata --no-deps -Z bindeps")
+    p.cargo("metadata --no-deps")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stdout_data(
             str![[r#"
@@ -4979,4 +4983,78 @@ fn metadata_ignores_build_target_configuration() -> anyhow::Result<()> {
         "metadata should not change when `CARGO_BUILD_TARGET` is set",
     );
     Ok(())
+}
+
+#[cargo_test]
+fn cargo_metadata_features_v2() {
+    Package::new("serde", "1.0.0").publish();
+    Package::new("log", "1.0.0").publish();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                cargo-features = ["feature-metadata"]
+
+                [package]
+                name = "foo"
+                version = "0.5.0"
+                edition = "2015"
+
+                [dependencies]
+                serde = { version = "1.0.0", optional = true }
+                log = { version = "1.0.0", optional = true }
+
+                [features]
+                default = ["serde"]
+                empty = []
+                legacy = ["empty"]
+                serde = { enables = ["dep:serde"], doc = "Enables support for serialization via serde." }
+                table_empty = { enables = [] }
+                table_without_doc = { enables = ["empty"] }
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("metadata --format-version 1")
+        .masquerade_as_nightly_cargo(&["feature-metadata"])
+        .with_stdout_data(
+            str![[r#"
+{
+  "packages": [
+    {
+      "name": "foo",
+      "features": {
+        "default": ["serde"],
+        "empty": [],
+        "legacy": ["empty"],
+        "log": ["dep:log"],
+        "serde": ["dep:serde"],
+        "table_empty": [],
+        "table_without_doc": ["empty"]
+      },
+      "features_v2": {
+        "default": { "enables": ["serde"] },
+        "empty": { "enables": [] },
+        "legacy": { "enables": ["empty"] },
+        "log": { "enables": ["dep:log"] },
+        "serde": {
+          "enables": ["dep:serde"],
+          "doc": "Enables support for serialization via serde."
+        },
+        "table_empty": { "enables": [] },
+        "table_without_doc": { "enables": ["empty"] }
+      },
+      "...": "{...}"
+    },
+    "{...}",
+    "{...}"
+  ],
+  "...": "{...}"
+}
+"#]]
+            .is_json(),
+        )
+        .run();
 }

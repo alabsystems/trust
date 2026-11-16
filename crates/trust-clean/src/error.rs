@@ -37,6 +37,13 @@ pub enum CertificateError {
     #[error("clean kernel rejected proof: {reason}")]
     KernelRejected { reason: String },
 
+    /// The VC may not carry kernel proof authority at all
+    /// (`VerificationCondition::kernel_authority_refusal`: the kind gate, then a TINV
+    /// row's situatedness gate). TINV-8 (2026-10-05): every public certificate entry
+    /// refuses such a VC before it looks at the proof term.
+    #[error("kernel authority refused: {reason}")]
+    AuthorityRefused { reason: String },
+
     /// clean is not available (not compiled in or not reachable).
     #[error("clean backend not available: {reason}")]
     BackendUnavailable { reason: String },

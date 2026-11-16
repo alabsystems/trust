@@ -97,6 +97,7 @@ fn test_use_after_free_mir_buggy() {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = trust_vcgen::memory_provenance::check_provenance(&func);
@@ -143,6 +144,7 @@ fn test_use_after_move_mir_buggy() {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     };
 
     let violations = scan_body(&func);
@@ -239,6 +241,7 @@ fn test_double_free_dangling_ref_mir_buggy() {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     };
 
     let violations = scan_body(&func);
@@ -335,6 +338,7 @@ fn test_aliasing_violation_mir_buggy() {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     };
 
     let violations = scan_body(&func);
@@ -429,6 +433,7 @@ fn test_aliasing_violation_mir_safe() {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     };
 
     let violations = scan_body(&func);

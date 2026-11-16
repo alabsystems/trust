@@ -76,6 +76,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use thiserror::Error;
+use trust_ir::binary::BinaryProjectionError;
 use trust_ir::{
     FuncId, Module, NativeAdapterInput, NativeBundleProducer, NativeCompilerFacts,
     NativeDiagnosticsPolicy, NativeMonomorphizationId, NativeRequestId, NativeRequestProvenance,
@@ -84,14 +85,19 @@ use trust_ir::{
     PROOF_OBLIGATION_SOURCE_TEXT_ID_MAX_BYTES, Producer, ProofDigest, ProofDigestAlgorithm,
     ProofId, ProofLineageId, ProofLineageManifest, ProofLineageNode, ProofObligationSourceRange,
     ProofReplayIdentity, ProofStatus, ProofTransform, ProofTransformStage,
-    PublicObligationIdentity, TrustMcChcOptions, TrustMcNativeRequest, TrustMcRequestOptions,
-    TrustMcVerificationMode,
+    PublicObligationIdentity, TrustMcNativeRequest, TrustMcVerificationMode,
 };
+use trust_types::fx::FxHashMap;
 
 use crate::native_request::{
     NativeVerificationBundleBuildError, native_monomorphization_fact, native_replay_context,
-    obligation_sources_for_owners,
+    native_wp_request, obligation_sources_for_owners, require_native_module_binary_identity,
+    trust_mc_chc_request_options,
 };
+
+#[cfg(test)]
+#[path = "native_shadow_metadata_tests.rs"]
+mod metadata_tests;
 
 /// Transform/contract version for the direct-lane SHADOW planner.
 pub const TRUST_DIRECT_SHADOW_TRANSFORM_VERSION: &str = "direct-shadow-request-v1";
@@ -115,8 +121,7 @@ pub const DIRECT_SHADOW_PUBLIC_ID_PREFIX: &str = "direct:";
 /// request's replay invocation — both digest-framed and serialized — because
 /// the [`DirectShadowBundle`] typestate is in-process only and a deserialized
 /// bundle sheds it entirely.
-pub const DIRECT_SHADOW_WIRE_DISCLOSURE: &str =
-    "SHADOW LANE (lineage-unanchored): input TrustIrModule carries no compiler-source digest, \
+pub const DIRECT_SHADOW_WIRE_DISCLOSURE: &str = "SHADOW LANE (lineage-unanchored): input TrustIrModule carries no compiler-source digest, \
      so bundle.source_digest() is None and every source-digest-keyed lineage check does not \
      apply; verdicts over this bundle are differential evidence only, never proof authority";
 
@@ -179,6 +184,8 @@ impl core::fmt::Display for DirectOwnerIneligibility {
 /// fix (v7/D3): "unsupported" with no next step is a defect.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum DirectShadowBundleBuildError {
+    #[error("direct shadow module has no binary identity: {0}")]
+    ModuleBinaryIdentity(BinaryProjectionError),
     #[error("cannot plan a direct shadow bundle for an empty TrustIr module")]
     EmptyModule,
     #[error(
@@ -373,6 +380,20 @@ pub struct DirectShadowLineageDisclosure {
 pub fn direct_shadow_verification_bundle_from_module(
     module: Module,
 ) -> Result<DirectShadowBundle, DirectShadowBundleBuildError> {
+    direct_shadow_bundle_with_contract_claims(module, &BTreeMap::new())
+}
+
+/// Prepared by the query-bound contract entry, never by a source decoder.
+pub(super) struct DirectShadowContractClaim {
+    pub public: PublicObligationIdentity,
+    pub formula: trust_ir::ProofFormula,
+    pub range: ProofObligationSourceRange,
+}
+
+pub(super) fn direct_shadow_bundle_with_contract_claims(
+    module: Module,
+    contracts: &BTreeMap<ProofId, DirectShadowContractClaim>,
+) -> Result<DirectShadowBundle, DirectShadowBundleBuildError> {
     let mut module = module;
     if module.functions.is_empty() {
         return Err(DirectShadowBundleBuildError::EmptyModule);
@@ -383,9 +404,15 @@ pub fn direct_shadow_verification_bundle_from_module(
     // lane's own `TRust` or a claim-free `Clean` join row. Missing provenance
     // fails closed — this planner cannot infer that an unlabelled function
     // came from the direct path.
+    let mut source_languages = BTreeSet::from([NativeSourceLanguage::TrustIr]);
     for function in &module.functions {
         match function.producer.as_ref() {
-            Some(Producer::TRust) | Some(Producer::Clean) => {}
+            Some(Producer::TRust) => {
+                source_languages.insert(NativeSourceLanguage::Rust);
+            }
+            Some(Producer::Clean) => {
+                source_languages.insert(NativeSourceLanguage::Clean);
+            }
             other => {
                 return Err(DirectShadowBundleBuildError::NonDirectProducer {
                     function: function.id,
@@ -397,6 +424,8 @@ pub fn direct_shadow_verification_bundle_from_module(
     if module.proof_obligations.is_empty() {
         return Err(DirectShadowBundleBuildError::NoDirectObligations);
     }
+    require_native_module_binary_identity(&module)
+        .map_err(DirectShadowBundleBuildError::ModuleBinaryIdentity)?;
     if !module.proof_certificates.is_empty() {
         return Err(DirectShadowBundleBuildError::CertificateBearingModule {
             certificates: module.proof_certificates.len(),
@@ -408,14 +437,18 @@ pub fn direct_shadow_verification_bundle_from_module(
     // Row conformance + owner derivation, fail-closed per row. `owner_state`
     // caches the per-function eligibility verdict so each owner is judged
     // once.
-    let mut owner_state: BTreeMap<FuncId, Result<(), DirectOwnerIneligibility>> = BTreeMap::new();
+    let mut owner_state: FxHashMap<FuncId, Result<(), DirectOwnerIneligibility>> =
+        FxHashMap::default();
     let mut owners: BTreeSet<FuncId> = BTreeSet::new();
     for obligation in &module.proof_obligations {
         let source = obligation
             .source
             .as_ref()
             .ok_or(DirectShadowBundleBuildError::MissingObligationSource(obligation.id))?;
-        if source.source_id != DIRECT_SHADOW_ADMITTED_SOURCE_ID {
+        let contract = contracts.contains_key(&obligation.id);
+        if source.source_id != DIRECT_SHADOW_ADMITTED_SOURCE_ID
+            && !(contract && source.source_id == "trust-thir-lower/contract@1")
+        {
             return Err(DirectShadowBundleBuildError::ForeignObligationSourceId {
                 obligation: obligation.id,
                 source_id: source.source_id.clone(),
@@ -439,16 +472,17 @@ pub fn direct_shadow_verification_bundle_from_module(
         if !matches!(
             obligation.kind,
             ObligationKind::ArithmeticSafety | ObligationKind::BoundsCheck
-        ) {
+        ) && !(contract && obligation.kind == ObligationKind::Postcondition)
+        {
             return Err(DirectShadowBundleBuildError::NonDirectObligationKind {
                 obligation: obligation.id,
                 kind: obligation.kind.clone(),
             });
         }
-        if obligation.formula.is_some() {
+        if obligation.formula.is_some() && !contract {
             return Err(DirectShadowBundleBuildError::FormulaBearingObligation(obligation.id));
         }
-        if obligation.site.is_none() {
+        if obligation.site.is_none() && !contract {
             return Err(DirectShadowBundleBuildError::MissingObligationSite(obligation.id));
         }
         let function = obligation
@@ -473,17 +507,23 @@ pub fn direct_shadow_verification_bundle_from_module(
     // read while the rows are still borrowed.
     let mut minted: Vec<PublicObligationIdentity> =
         Vec::with_capacity(module.proof_obligations.len());
-    let mut public_ids: BTreeMap<String, ProofId> = BTreeMap::new();
+    let mut public_ids: FxHashMap<String, ProofId> =
+        FxHashMap::with_capacity_and_hasher(module.proof_obligations.len(), Default::default());
     for obligation in &module.proof_obligations {
-        let source = obligation.source.as_ref().expect("checked above");
+        let source = obligation
+            .source
+            .as_ref()
+            .ok_or(DirectShadowBundleBuildError::MissingObligationSource(obligation.id))?;
+        if let Some(contract) = contracts.get(&obligation.id) {
+            minted.push(contract.public.clone());
+            continue;
+        }
         let public_obligation_id = shadow_public_obligation_id(&source.assertion_id);
         debug_assert!(
             trust_ir::proof::is_canonical_public_obligation_id(&public_obligation_id),
             "the percent-encoding must yield a canonical public id: {public_obligation_id:?}"
         );
-        if let Some(first) =
-            public_ids.insert(public_obligation_id.clone(), obligation.id)
-        {
+        if let Some(first) = public_ids.insert(public_obligation_id.clone(), obligation.id) {
             return Err(DirectShadowBundleBuildError::PublicObligationIdCollision {
                 public_obligation_id,
                 first,
@@ -498,10 +538,21 @@ pub fn direct_shadow_verification_bundle_from_module(
             &obligation.description,
             source.range.as_ref(),
         )?;
-        minted.push(PublicObligationIdentity { obligation_id: public_obligation_id, semantic_digest });
+        minted.push(PublicObligationIdentity {
+            obligation_id: public_obligation_id,
+            semantic_digest,
+        });
     }
     for (obligation, public) in module.proof_obligations.iter_mut().zip(minted) {
-        obligation.source.as_mut().expect("checked above").public = Some(public);
+        let source = obligation
+            .source
+            .as_mut()
+            .ok_or(DirectShadowBundleBuildError::MissingObligationSource(obligation.id))?;
+        source.public = Some(public);
+        if let Some(contract) = contracts.get(&obligation.id) {
+            obligation.formula = Some(contract.formula.clone());
+            source.range = Some(contract.range);
+        }
     }
 
     let enriched_module_digest = module.stable_digest();
@@ -519,7 +570,9 @@ pub fn direct_shadow_verification_bundle_from_module(
     let owners: Vec<FuncId> = owners.into_iter().collect();
     let owner_indices: BTreeMap<FuncId, usize> =
         owners.iter().enumerate().map(|(index, function)| (*function, index)).collect();
-    let root = *owners.first().expect("at least one obligation row implies at least one owner");
+    let Some(&root) = owners.first() else {
+        return Err(DirectShadowBundleBuildError::EmptyModule);
+    };
     let mut compiler_facts = NativeCompilerFacts::default();
     compiler_facts.monomorphizations = owners
         .iter()
@@ -533,18 +586,11 @@ pub fn direct_shadow_verification_bundle_from_module(
             )
         })
         .collect();
-    compiler_facts.obligation_sources = obligation_sources_for_owners(
-        &module,
-        &owner_indices,
-        root,
-    )
-    .map_err(|error| {
-        debug_assert!(
-            false,
-            "unreachable after the sibling's own row pre-checks: {error:?}"
-        );
-        DirectShadowBundleBuildError::Planner(error)
-    })?;
+    compiler_facts.obligation_sources =
+        obligation_sources_for_owners(&module, &owner_indices, root).map_err(|error| {
+            debug_assert!(false, "unreachable after the sibling's own row pre-checks: {error:?}");
+            DirectShadowBundleBuildError::Planner(error)
+        })?;
 
     // Requestable partition: only rows with a real source range may be
     // requested (a requested row must carry span + assertion downstream);
@@ -552,9 +598,17 @@ pub fn direct_shadow_verification_bundle_from_module(
     let mut requestable_by_owner: BTreeMap<FuncId, Vec<ProofId>> = BTreeMap::new();
     let mut obligations_unrequestable_missing_range = 0usize;
     for obligation in &module.proof_obligations {
-        if obligation.source.as_ref().expect("checked above").range.is_some() {
+        let source = obligation
+            .source
+            .as_ref()
+            .ok_or(DirectShadowBundleBuildError::MissingObligationSource(obligation.id))?;
+        if source.range.is_some() {
             requestable_by_owner
-                .entry(obligation.function.expect("checked above"))
+                .entry(
+                    obligation
+                        .function
+                        .ok_or(DirectShadowBundleBuildError::UnscopedObligation(obligation.id))?,
+                )
                 .or_default()
                 .push(obligation.id);
         } else {
@@ -573,7 +627,7 @@ pub fn direct_shadow_verification_bundle_from_module(
         enriched_module_digest,
         module.proof_obligations.iter().map(|obligation| obligation.id).collect(),
     );
-    let lineage_root = *lineage.roots.first().expect("the shadow lineage has one root");
+    let lineage_root = DIRECT_SHADOW_LINEAGE_ROOT;
 
     // Owner-major, one TrustMc Chc request per obligation — the MIR planner's
     // shape, so the trust-ir validator re-checks per-request function
@@ -596,16 +650,35 @@ pub fn direct_shadow_verification_bundle_from_module(
                 function: *owner,
                 obligations: request_obligations,
                 lineage_roots: vec![lineage_root],
-                options: TrustMcRequestOptions {
-                    chc: TrustMcChcOptions {
-                        emit_horn_clauses: true,
-                        ..TrustMcChcOptions::default()
-                    },
-                    ..TrustMcRequestOptions::default()
-                },
+                options: trust_mc_chc_request_options(),
                 diagnostics: NativeDiagnosticsPolicy::default(),
                 provenance,
             }));
+            next_request_id += 1;
+        }
+    }
+
+    // The staged contract entry appends alternatives after the same primary
+    // inventory. Request construction is shared with the compatibility path.
+    for (owner, owned) in &requestable_by_owner {
+        for obligation in owned.iter().filter(|id| contracts.contains_key(id)) {
+            let replay = ProofReplayIdentity::new(
+                "trust_wp",
+                format!("replay_trust_ir_body_contracts; {DIRECT_SHADOW_WIRE_DISCLOSURE}"),
+            )
+            .with_transcript_digest(shadow_replay_transcript_digest(
+                "trust_wp-direct-contract-shadow",
+                pristine_module_digest,
+                enriched_module_digest,
+                &[*obligation],
+            ));
+            requests.push(native_wp_request(
+                NativeRequestId::new(next_request_id),
+                *owner,
+                *obligation,
+                lineage_root,
+                replay,
+            ));
             next_request_id += 1;
         }
     }
@@ -618,9 +691,11 @@ pub fn direct_shadow_verification_bundle_from_module(
         lineage,
     );
     bundle.provenance.producer_version = env!("CARGO_PKG_VERSION").to_string();
-    // The input artifact IS the trust-ir module; naming a source language
-    // here would imply a source binding the bundle does not have.
+    // The primary artifact is TrustIr; the set covers only actual admitted
+    // function tags, not a compiler-source binding. Imports may not widen the
+    // admitted language set: upstream validation refuses uncovered producers.
     bundle.provenance.source_language = NativeSourceLanguage::TrustIr;
+    bundle.provenance.source_languages = source_languages;
     // Pinned decision: stays None. A stamped Some(non-zero SHA-256) would
     // VALIDATE (the InputDigestMismatch cross-check needs an input digest to
     // fire) while binding nothing — the dishonest spelling.
@@ -650,7 +725,12 @@ fn direct_owner_eligibility(
     module: &Module,
     function: FuncId,
 ) -> Result<(), DirectOwnerIneligibility> {
-    let Some(function) = module.function_by_id(function) else {
+    let Some(function) = module
+        .functions
+        .get(function.index() as usize)
+        .filter(|candidate| candidate.id == function)
+        .or_else(|| module.function_by_id(function))
+    else {
         return Err(DirectOwnerIneligibility::NotInModule);
     };
     if function.producer.as_ref() != Some(&Producer::TRust) {
@@ -668,12 +748,17 @@ fn direct_shadow_tool_identity() -> NativeToolIdentity {
         .with_revision(TRUST_DIRECT_SHADOW_TRANSFORM_VERSION)
 }
 
-/// Percent-encode a direct assertion id into the canonical public-id
-/// alphabet: every byte outside graphic ASCII, plus `%`, `?` and `#`, becomes
-/// `%XX` (uppercase hex). Injective by construction, so distinct assertion
-/// ids stay distinct until (and unless) the byte-cap clamp below applies.
-fn percent_encode_shadow_public_id(assertion_id: &str) -> String {
-    let mut out = String::with_capacity(assertion_id.len() + 8);
+/// `"direct:" + percent-encoded assertion_id`, re-clamped
+/// head-preserving-suffix to the format's byte cap: every byte outside graphic
+/// ASCII, plus `%`, `?` and `#`, becomes `%XX` (uppercase hex), and when the
+/// result exceeds `PROOF_OBLIGATION_SOURCE_TEXT_ID_MAX_BYTES`, leading encoded
+/// bytes are dropped without splitting a `%XX` triple so the `#L..C..#slug#o..`
+/// tail survives verbatim. A post-clamp collision is REFUSED by the caller,
+/// never aliased.
+fn shadow_public_obligation_id(assertion_id: &str) -> String {
+    let prefix_len = DIRECT_SHADOW_PUBLIC_ID_PREFIX.len();
+    let mut out = String::with_capacity(prefix_len + assertion_id.len() + 8);
+    out.push_str(DIRECT_SHADOW_PUBLIC_ID_PREFIX);
     for byte in assertion_id.bytes() {
         if byte.is_ascii_graphic() && !matches!(byte, b'%' | b'?' | b'#') {
             out.push(byte as char);
@@ -681,24 +766,14 @@ fn percent_encode_shadow_public_id(assertion_id: &str) -> String {
             let _ = write!(&mut out, "%{byte:02X}");
         }
     }
-    out
-}
-
-/// `"direct:" + percent-encoded assertion_id`, re-clamped
-/// head-preserving-suffix to the format's byte cap: the distinguishing
-/// `#L..C..#slug#o..` tail rides the END of a direct assertion id, so the
-/// clamp drops LEADING bytes of the encoded form (never splitting a `%XX`
-/// triple) and keeps the tail verbatim. A post-clamp collision is REFUSED by
-/// the caller, never aliased.
-fn shadow_public_obligation_id(assertion_id: &str) -> String {
-    let encoded = percent_encode_shadow_public_id(assertion_id);
     let max = PROOF_OBLIGATION_SOURCE_TEXT_ID_MAX_BYTES;
-    if DIRECT_SHADOW_PUBLIC_ID_PREFIX.len() + encoded.len() <= max {
-        return format!("{DIRECT_SHADOW_PUBLIC_ID_PREFIX}{encoded}");
+    if out.len() <= max {
+        return out;
     }
-    let budget = max - DIRECT_SHADOW_PUBLIC_ID_PREFIX.len();
-    let bytes = encoded.as_bytes();
-    let mut start = bytes.len() - budget;
+    let budget = max - prefix_len;
+    let encoded_len = out.len() - prefix_len;
+    let bytes = &out.as_bytes()[prefix_len..];
+    let mut start = encoded_len - budget;
     // `%` appears only as a triple starter (a literal `%` is itself encoded),
     // so a cut landing inside a triple is detected by looking back two bytes.
     if start >= 1 && bytes[start - 1] == b'%' {
@@ -706,8 +781,9 @@ fn shadow_public_obligation_id(assertion_id: &str) -> String {
     } else if start >= 2 && bytes[start - 2] == b'%' {
         start += 1;
     }
-    let start = start.min(bytes.len());
-    format!("{DIRECT_SHADOW_PUBLIC_ID_PREFIX}{}", &encoded[start..])
+    let start = start.min(encoded_len);
+    out.drain(prefix_len..prefix_len + start);
+    out
 }
 
 /// The pinned semantic-digest recipe (deterministic on purpose: changing any
@@ -808,6 +884,12 @@ fn proof_digest_from_sha256_hex(value: &str) -> Option<ProofDigest> {
 /// `target_module` the enriched module this bundle carries. The typed stage
 /// difference from the MIR lane's `TrustIrLowering` is deliberate: nothing
 /// here lowered MIR, and the stage is part of the node's digest.
+/// The ONE root `direct_shadow_lineage` builds. Named so the planner can use
+/// it directly instead of asserting its way back out of the manifest: the
+/// manifest is constructed four lines below with exactly this root, so
+/// `roots.first().expect(..)` was restating a local literal as a panic.
+const DIRECT_SHADOW_LINEAGE_ROOT: ProofLineageId = ProofLineageId::new(0);
+
 fn direct_shadow_lineage(
     pristine_module_digest: ProofDigest,
     enriched_module_digest: ProofDigest,
@@ -843,7 +925,7 @@ fn direct_shadow_lineage(
     ProofLineageManifest {
         schema_version: ProofLineageManifest::SCHEMA_VERSION,
         nodes: vec![node],
-        roots: vec![ProofLineageId::new(0)],
+        roots: vec![DIRECT_SHADOW_LINEAGE_ROOT],
     }
 }
 
@@ -887,19 +969,31 @@ fn shadow_replay_transcript_digest(
     enriched_module_digest: ProofDigest,
     obligations: &[ProofId],
 ) -> ProofDigest {
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(96 + lane.len() + obligations.len().saturating_mul(4));
     shadow_append_len_prefixed(&mut bytes, lane.as_bytes());
     shadow_append_digest(&mut bytes, pristine_module_digest);
     shadow_append_digest(&mut bytes, enriched_module_digest);
-    bytes.extend_from_slice(
-        &u64::try_from(obligations.len())
-            .expect("shadow replay obligation count exceeds canonical u64 framing")
-            .to_be_bytes(),
-    );
+    bytes.extend_from_slice(&shadow_len_u64(obligations.len()).to_be_bytes());
     for obligation in obligations {
         bytes.extend_from_slice(&obligation.index().to_be_bytes());
     }
     ProofDigest::sha256_domain("trust.direct-shadow.replay-transcript.v1", &bytes)
+}
+
+/// A length into the canonical `u64` wire framing, with NO panic path.
+///
+/// This is total by the compile-time proof below, not by swapping a counted
+/// construct for an uncounted one: on every target where `usize` is no wider
+/// than `u64` there is no truncating case to handle, and the assertion makes
+/// a target where that stopped holding a BUILD failure rather than a silently
+/// wrong digest. The `.expect("exceeds canonical u64 framing")` it replaces
+/// could never fire on any such target, so nothing that could fail moved.
+const _: () = assert!(
+    usize::BITS <= u64::BITS,
+    "shadow wire framing widens a length to u64; a wider usize would truncate"
+);
+fn shadow_len_u64(len: usize) -> u64 {
+    len as u64
 }
 
 fn shadow_append_digest(bytes: &mut Vec<u8>, digest: ProofDigest) {
@@ -911,11 +1005,7 @@ fn shadow_append_digest(bytes: &mut Vec<u8>, digest: ProofDigest) {
 }
 
 fn shadow_append_len_prefixed(bytes: &mut Vec<u8>, value: &[u8]) {
-    bytes.extend_from_slice(
-        &u64::try_from(value.len())
-            .expect("shadow digest field exceeds canonical u64 framing")
-            .to_be_bytes(),
-    );
+    bytes.extend_from_slice(&shadow_len_u64(value.len()).to_be_bytes());
     bytes.extend_from_slice(value);
 }
 
@@ -923,8 +1013,8 @@ fn shadow_append_len_prefixed(bytes: &mut Vec<u8>, value: &[u8]) {
 mod tests {
     use trust_ir::{
         Block, BlockId, Constant, FuncTy, Function, Inst, InstrNode, ObligationSite,
-        ProofAnnotation, ProofEvidence, ProofObligation, ProofObligationSourceIdentity,
-        SourceSpan, Ty, ValueId,
+        ProofAnnotation, ProofEvidence, ProofObligation, ProofObligationSourceIdentity, SourceSpan,
+        Ty, ValueId,
     };
 
     use super::*;
@@ -933,19 +1023,32 @@ mod tests {
         ProofDigest::sha256([seed; 32])
     }
 
-    fn bodied_function(id: FuncId, name: &str, ft: trust_ir::FuncTyId, producer: Producer) -> Function {
+    fn bodied_function(
+        id: FuncId,
+        name: &str,
+        ft: trust_ir::FuncTyId,
+        producer: Producer,
+    ) -> Function {
         let mut function = Function::new(id, name, ft, BlockId::new(0)).with_producer(producer);
         let mut block = Block::new(BlockId::new(0));
         block.body.push(
             InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
                 .with_result(ValueId::new(0)),
         );
-        let mut assert_one =
-            InstrNode::new(Inst::Assert { cond: ValueId::new(0) }).with_proof(ProofAnnotation::NoOverflow);
+        let mut assert_one = InstrNode::new(Inst::Assert {
+            cond: ValueId::new(0),
+            kind: trust_ir::AssertKind::Unspecified,
+            site: None,
+        })
+        .with_proof(ProofAnnotation::NoOverflow);
         assert_one.span = Some(SourceSpan { file: 0, line: 15, col: 4 });
         block.body.push(assert_one);
-        let mut assert_two = InstrNode::new(Inst::Assert { cond: ValueId::new(0) })
-            .with_proof(ProofAnnotation::DivNonZero);
+        let mut assert_two = InstrNode::new(Inst::Assert {
+            cond: ValueId::new(0),
+            kind: trust_ir::AssertKind::Unspecified,
+            site: None,
+        })
+        .with_proof(ProofAnnotation::DivNonZero);
         assert_two.span = Some(SourceSpan { file: 0, line: 15, col: 4 });
         block.body.push(assert_two);
         block.body.push(InstrNode::new(Inst::Return { values: Vec::new() }));
@@ -984,41 +1087,55 @@ mod tests {
     /// direct `{crate}::{def_path}#L{line}C{col}#{slug}#o{occ}` identity
     /// grammar. Row 3 is deliberately rangeless (the dummy-span disclosure
     /// path).
-    fn direct_shadow_module_fixture() -> Module {
+    pub(super) fn direct_shadow_module_fixture() -> Module {
         let mut module = Module::new("shadow_fixture");
-        let file = module.intern_file("src/arith.rs");
-        let ft = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
-        module.add_function(bodied_function(
-            FuncId::new(0),
-            "shadow_fixture::arith::checked_add",
-            ft,
-            Producer::TRust,
-        ));
-        module.add_function(bodied_function(
-            FuncId::new(1),
-            "shadow_fixture::arith::checked_mul",
-            ft,
-            Producer::TRust,
-        ));
-        module.add_function(bodied_function(
-            FuncId::new(2),
-            "shadow_fixture::clean::lemma_ctx",
-            ft,
-            Producer::Clean,
-        ));
-        let decl_ft = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: true,
-        });
-        module.add_function(
-            Function::new(FuncId::new(3), "core::panicking::panic", decl_ft, BlockId::new(0))
-                .with_producer(Producer::TRust),
-        );
+        let file = module.intern_file("src/arith.rs").expect("Module::intern_file: test fixture");
+        let ft = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        module
+            .try_add_function(bodied_function(
+                FuncId::new(0),
+                "shadow_fixture::arith::checked_add",
+                ft,
+                Producer::TRust,
+            ))
+            .expect("Module::try_add_function: test fixture");
+        module
+            .try_add_function(bodied_function(
+                FuncId::new(1),
+                "shadow_fixture::arith::checked_mul",
+                ft,
+                Producer::TRust,
+            ))
+            .expect("Module::try_add_function: test fixture");
+        module
+            .try_add_function(bodied_function(
+                FuncId::new(2),
+                "shadow_fixture::clean::lemma_ctx",
+                ft,
+                Producer::Clean,
+            ))
+            .expect("Module::try_add_function: test fixture");
+        let decl_ft = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: true,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        module
+            .try_add_function(
+                Function::new(FuncId::new(3), "core::panicking::panic", decl_ft, BlockId::new(0))
+                    .with_producer(Producer::TRust),
+            )
+            .expect("Module::try_add_function: test fixture");
 
         let range = ProofObligationSourceRange {
             file,
@@ -1113,11 +1230,8 @@ mod tests {
         // Requests: owner-major, one TrustMc Chc request per RANGED row, the
         // rangeless row in none of them, every invocation disclosure-stamped.
         assert_eq!(bundle.requests.len(), 3);
-        let expected: [(u32, FuncId, u32); 3] = [
-            (0, FuncId::new(0), 0),
-            (1, FuncId::new(0), 1),
-            (2, FuncId::new(1), 2),
-        ];
+        let expected: [(u32, FuncId, u32); 3] =
+            [(0, FuncId::new(0), 0), (1, FuncId::new(0), 1), (2, FuncId::new(1), 2)];
         for (&(id, function, obligation), request) in expected.iter().zip(&bundle.requests) {
             let NativeVerificationRequest::TrustMc(request) = request else {
                 panic!("the shadow planner emits TrustMc requests only, got {request:?}");
@@ -1127,23 +1241,23 @@ mod tests {
             assert_eq!(request.function, function);
             assert_eq!(request.obligations, vec![ProofId::new(obligation)]);
             assert!(request.options.chc.emit_horn_clauses);
+            assert_eq!(request.options, trust_mc_chc_request_options());
             assert_eq!(
                 request.provenance.expected_verifier.version.as_deref(),
                 Some(TRUST_DIRECT_SHADOW_TRANSFORM_VERSION)
             );
             assert!(
-                request
-                    .provenance
-                    .replay
-                    .as_ref()
-                    .is_some_and(|replay| replay.invocation.contains(DIRECT_SHADOW_WIRE_DISCLOSURE)),
+                request.provenance.replay.as_ref().is_some_and(|replay| replay
+                    .invocation
+                    .contains(DIRECT_SHADOW_WIRE_DISCLOSURE)),
                 "every request replay invocation must carry the wire disclosure"
             );
         }
         assert!(
-            bundle.requests.iter().all(|request| {
-                !request.obligations().contains(&ProofId::new(3))
-            }),
+            bundle
+                .requests
+                .iter()
+                .all(|request| { !request.obligations().contains(&ProofId::new(3)) }),
             "the rangeless row must never be requested"
         );
 
@@ -1168,9 +1282,8 @@ mod tests {
                 .expect("every row is enriched");
             assert!(public.obligation_id.starts_with(DIRECT_SHADOW_PUBLIC_ID_PREFIX));
             assert!(trust_ir::proof::is_canonical_public_obligation_id(&public.obligation_id));
-            let sidecar = bundle
-                .obligation_source(obligation.id)
-                .expect("every row has a sidecar entry");
+            let sidecar =
+                bundle.obligation_source(obligation.id).expect("every row has a sidecar entry");
             assert_eq!(sidecar.public_obligation_id, public.obligation_id);
         }
         assert_eq!(
@@ -1262,11 +1375,10 @@ mod tests {
         module.proof_obligations[1].kind = ObligationKind::BoundsCheck;
         module.proof_obligations[1].source.as_mut().unwrap().assertion_id =
             "shadow_fixture::arith::checked_add#L15C4#bounds_check#o0".to_string();
-        module.proof_obligations[1].description =
-            "direct THIR Assert (bounds_check) at L15C4 of \
+        module.proof_obligations[1].description = "direct THIR Assert (bounds_check) at L15C4 of \
              `shadow_fixture::arith::checked_add`: index is in bounds. RECORDED BY THE \
              LOWERING, NOT PROVED."
-                .to_string();
+            .to_string();
 
         let shadow = direct_shadow_verification_bundle_from_module(module)
             .expect("a BoundsCheck row is an admitted direct kind and must plan");
@@ -1404,6 +1516,8 @@ mod tests {
             obligation: ProofId::new(0),
             prover: "trust_vc".to_string(),
             evidence: ProofEvidence::LeanProof("exact sorry_free".into()),
+            // v41: no native evidence bundle to project a coverage assurance from.
+            assurance: None,
         });
         let error = direct_shadow_verification_bundle_from_module(mir_module)
             .expect_err("a MIR-compatibility module must not be re-wrapped as a shadow bundle");
@@ -1527,6 +1641,8 @@ mod tests {
             obligation: ProofId::new(0),
             prover: "manual".to_string(),
             evidence: ProofEvidence::Trusted("manual audit".to_string()),
+            // v41: no native evidence bundle to project a coverage assurance from.
+            assurance: None,
         });
         assert_eq!(
             direct_shadow_verification_bundle_from_module(module)

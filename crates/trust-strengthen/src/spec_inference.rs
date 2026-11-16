@@ -132,13 +132,12 @@ fn infer_arithmetic_overflow(
     };
 
     let type_name = ty_to_rust_name(&operand_tys.0);
-    let max_expr = format!("{type_name}::MAX");
 
     // Build the spec body based on operator
     let spec_body = match op {
-        BinOp::Add => format!("a <= {max_expr} - b"),
+        BinOp::Add => format!("a <= {type_name}::MAX - b"),
         BinOp::Sub => "a >= b".to_string(),
-        BinOp::Mul => format!("a == 0 || b <= {max_expr} / a"),
+        BinOp::Mul => format!("a == 0 || b <= {type_name}::MAX / a"),
         _ => format!("{op_name} does not overflow"),
     };
 
@@ -499,17 +498,31 @@ fn short_name(path: &str) -> String {
     path.rsplit("::").next().unwrap_or(path).to_string()
 }
 
-fn ty_to_rust_name(ty: &trust_types::Ty) -> String {
+fn ty_to_rust_name(ty: &trust_types::Ty) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
     match ty {
-        trust_types::Ty::Int { width, signed } => {
-            let prefix = if *signed { "i" } else { "u" };
-            // width == 0 means pointer-width (usize/isize)
-            if *width == 0 { format!("{prefix}size") } else { format!("{prefix}{width}") }
-        }
-        trust_types::Ty::Float { width } => format!("f{width}"),
-        trust_types::Ty::Bool => "bool".to_string(),
-        trust_types::Ty::Unit => "()".to_string(),
-        _ => "T".to_string(),
+        trust_types::Ty::Int { width, signed } => match (*signed, *width) {
+            (false, 0) => Cow::Borrowed("usize"),
+            (true, 0) => Cow::Borrowed("isize"),
+            (false, 8) => Cow::Borrowed("u8"),
+            (true, 8) => Cow::Borrowed("i8"),
+            (false, 16) => Cow::Borrowed("u16"),
+            (true, 16) => Cow::Borrowed("i16"),
+            (false, 32) => Cow::Borrowed("u32"),
+            (true, 32) => Cow::Borrowed("i32"),
+            (false, 64) => Cow::Borrowed("u64"),
+            (true, 64) => Cow::Borrowed("i64"),
+            (false, 128) => Cow::Borrowed("u128"),
+            (true, 128) => Cow::Borrowed("i128"),
+            (true, w) => Cow::Owned(format!("i{w}")),
+            (false, w) => Cow::Owned(format!("u{w}")),
+        },
+        trust_types::Ty::Float { width: 32 } => Cow::Borrowed("f32"),
+        trust_types::Ty::Float { width: 64 } => Cow::Borrowed("f64"),
+        trust_types::Ty::Float { width } => Cow::Owned(format!("f{width}")),
+        trust_types::Ty::Bool => Cow::Borrowed("bool"),
+        trust_types::Ty::Unit => Cow::Borrowed("()"),
+        _ => Cow::Borrowed("T"),
     }
 }
 

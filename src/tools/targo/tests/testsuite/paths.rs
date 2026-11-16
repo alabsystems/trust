@@ -22,6 +22,9 @@ fn broken_path_override_warns() {
 
                 [dependencies]
                 a = { path = "a1" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -36,6 +39,9 @@ fn broken_path_override_warns() {
 
                 [dependencies]
                 bar = "0.1"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a1/src/lib.rs", "")
@@ -50,6 +56,9 @@ fn broken_path_override_warns() {
 
                 [dependencies]
                 bar = "0.2"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a2/src/lib.rs", "")
@@ -59,7 +68,7 @@ fn broken_path_override_warns() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [WARNING] path override for crate `a` has altered the original list of
 dependencies; the dependency on `bar` was either added or
 modified to not match the previously resolved version
@@ -142,6 +151,9 @@ fn paths_ok_with_optional() {
 
                 [dependencies]
                 bar = { path = "bar" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -156,6 +168,9 @@ fn paths_ok_with_optional() {
 
                 [dependencies]
                 baz = { version = "0.1", optional = true }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/lib.rs", "")
@@ -170,6 +185,9 @@ fn paths_ok_with_optional() {
 
                 [dependencies]
                 baz = { version = "0.1", optional = true }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar2/src/lib.rs", "")
@@ -178,7 +196,7 @@ fn paths_ok_with_optional() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar2)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -203,6 +221,9 @@ fn paths_add_optional_bad() {
 
                 [dependencies]
                 bar = { path = "bar" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -219,6 +240,9 @@ fn paths_add_optional_bad() {
 
                 [dependencies]
                 baz = { version = "0.1", optional = true }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar2/src/lib.rs", "")
@@ -227,7 +251,7 @@ fn paths_add_optional_bad() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [WARNING] path override for crate `bar` has altered the original list of
 dependencies; the dependency on `baz` was either added or
 modified to not match the previously resolved version
@@ -269,6 +293,9 @@ fn env_paths_overrides_not_supported() {
                 file = "0.1.0"
                 cli = "0.1.0"
                 env = "0.1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -289,7 +316,7 @@ fn env_paths_overrides_not_supported() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] env v0.1.0 (registry `dummy-registry`)
 [CHECKING] file v0.2.0 ([ROOT]/foo/file)

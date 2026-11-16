@@ -1,3 +1,5 @@
+note: compiled WITHOUT Trust verification — 0 obligations checked
+
 error: multiple versions for dependency `winapi`: 0.2.8, 0.3.9
   |
   = note: `-D clippy::multiple-crate-versions` implied by `-D warnings`

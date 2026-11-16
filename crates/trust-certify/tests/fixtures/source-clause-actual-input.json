@@ -1,0 +1,142 @@
+{
+  "function": {
+    "name": "constant_false",
+    "def_path": "source_clause_fixture::constant_false",
+    "span": {
+      "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-SOURCE-CLAUSE-PROOF/extractor/source.rs",
+      "line_start": 1,
+      "col_start": 0,
+      "line_end": 1,
+      "col_end": 65
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": "Bool",
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Constant": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "span": {
+                  "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-SOURCE-CLAUSE-PROOF/extractor/source.rs",
+                  "line_start": 1,
+                  "col_start": 58,
+                  "line_end": 1,
+                  "col_end": 63
+                }
+              }
+            }
+          ],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 0,
+      "return_ty": "Bool"
+    },
+    "contracts": [
+      {
+        "kind": "Ensures",
+        "span": {
+          "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-SOURCE-CLAUSE-PROOF/extractor/source.rs",
+          "line_start": 1,
+          "col_start": 40,
+          "line_end": 1,
+          "col_end": 55
+        },
+        "body": "__trust_lowered_compiler_contract__:(result) == (false)"
+      }
+    ],
+    "preconditions": [],
+    "postconditions": [
+      {
+        "Eq": [
+          {
+            "Var": [
+              "_0",
+              "Bool"
+            ]
+          },
+          {
+            "Bool": false
+          }
+        ]
+      }
+    ],
+    "spec": {
+      "requires": [],
+      "ensures": [
+        "(result) == (false)"
+      ],
+      "invariants": []
+    }
+  },
+  "compiler_contracts": {
+    "contracts": [
+      {
+        "kind": "Ensures",
+        "span": {
+          "file": "<home>/release-evidence/trust-forward-recovery-20261029/NOV3-SOURCE-CLAUSE-PROOF/extractor/source.rs",
+          "line_start": 1,
+          "col_start": 40,
+          "line_end": 1,
+          "col_end": 55
+        },
+        "body": "__trust_lowered_compiler_contract__:(result) == (false)"
+      }
+    ],
+    "typed_propositions": [
+      {
+        "source_contract_index": 0,
+        "kind": "Ensures",
+        "body": "__trust_lowered_compiler_contract__:(result) == (false)",
+        "formula": {
+          "Eq": [
+            {
+              "Var": [
+                "_0",
+                "Bool"
+              ]
+            },
+            {
+              "Bool": false
+            }
+          ]
+        },
+        "variable_domains": [
+          {
+            "name": "_0",
+            "domain": "Bool"
+          }
+        ]
+      }
+    ],
+    "loop_contracts": [],
+    "proof_items": [],
+    "loop_clause_source_locals": null
+  },
+  "source_text": "pub fn constant_false() -> bool ensures result == false { false }",
+  "source_text_sha256": "8dca8cdde33c7c6a39fdc93a2dab44d48d8d45ac790103f52b508dfc229da861",
+  "stable_crate_id": 4783772793571581113,
+  "crate_name": "source_clause_fixture",
+  "target": "arm64-apple-macosx;ptr64",
+  "target_pointer_width_bits": 64,
+  "compiler_source": "257b4a678bfee7eca17a5187ca8f855815a60e69",
+  "artifact_compiler_identity": "9794a1ff43466e71120bdaf9e2f2a5da5f909421"
+}

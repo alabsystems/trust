@@ -51,6 +51,8 @@ fn adversarial_callback_cannot_replace_trust_critical_providers() {
     assert_query_swap_rejected!(foreign_modules);
     assert_query_swap_rejected!(hir_attr_map);
     assert_query_swap_rejected!(hir_crate_items);
+    // Trust: an unchanged lowering provider does not authenticate projected HIR.
+    assert_query_swap_rejected!(hir_owner);
     assert_query_swap_rejected!(has_alloc_error_handler);
     assert_query_swap_rejected!(has_global_allocator);
     assert_query_swap_rejected!(has_panic_handler);
@@ -97,6 +99,10 @@ fn adversarial_callback_cannot_replace_trust_critical_providers() {
     assert_query_swap_rejected!(try_normalize_generic_arg_after_erasing_regions);
     assert_query_swap_rejected!(trust_contracts);
     assert_query_swap_rejected!(trust_proof_results);
+    // Trust: D4 increment A (2026-09-24) — the user-`unsafe` source fact.
+    assert_query_swap_rejected!(trust_def_has_user_unsafe_source);
+    // Trust: CB3 (2026-09-28) — the per-def island marker.
+    assert_query_swap_rejected!(trust_def_is_clean_island);
 
     macro_rules! assert_extern_query_swap_rejected {
         ($field:ident) => {{
@@ -128,6 +134,10 @@ fn adversarial_callback_cannot_replace_trust_critical_providers() {
     assert_extern_query_swap_rejected!(panic_in_drop_strategy);
     assert_extern_query_swap_rejected!(required_panic_strategy);
     assert_extern_query_swap_rejected!(used_crate_source);
+    // Trust: D4 increment A (2026-09-24) — the extern half of the source fact.
+    assert_extern_query_swap_rejected!(trust_def_has_user_unsafe_source);
+    // Trust: CB3 (2026-09-28) — the extern half of the island marker.
+    assert_extern_query_swap_rejected!(trust_def_is_clean_island);
 
     let mut changed = canonical;
     changed.hooks.build_mir_inner_impl = |_, _| panic!("adversarial MIR builder");
@@ -187,8 +197,10 @@ fn adversarial_callback_cannot_replace_upstream_trust_ir_inputs() {
 fn unrelated_backend_and_callback_query_overrides_remain_available() {
     let mut providers = *DEFAULT_QUERY_PROVIDERS;
     let defaults = Providers::default();
-    // LLVM/GCC backend customization.
-    providers.queries.global_backend_features = defaults.queries.global_backend_features;
+    // LLVM/GCC backend customization (upstream 1.101 removed the
+    // `global_backend_features` query; the backend optimization level is
+    // the surviving backend-owned provider of the same class).
+    providers.queries.backend_optimization_level = defaults.queries.backend_optimization_level;
     // rustdoc's reduced lint surface.
     providers.queries.lint_mod = defaults.queries.lint_mod;
     providers.queries.used_trait_imports = defaults.queries.used_trait_imports;
@@ -207,4 +219,24 @@ fn canonical_provider_boundary_is_inactive_for_vanilla_rustc_frontends() {
         "-Ztrust-verify=off frontends that do not lower Trust IR retain upstream override authority"
     );
     assert_eq!(trust_critical_provider_violation(&providers, true), Some("mir_built"));
+}
+
+// Trust: codegen backends also supply providers, so the active-policy check
+// must reject projected HIR replacements independently of the callback ban.
+#[test]
+fn hir_owner_override_requires_unverified_semantics() {
+    let mut providers = *DEFAULT_QUERY_PROVIDERS;
+    providers.queries.hir_owner = |_, _| {
+        panic!("adversarial HIR owner provider must never execute in this comparison test")
+    };
+    assert_eq!(
+        trust_critical_provider_violation(&providers, true),
+        Some("hir_owner"),
+        "active Trust semantics require compiler-owned HIR nodes, bodies and trait maps"
+    );
+    assert_eq!(
+        trust_critical_provider_violation(&providers, false),
+        None,
+        "unverified frontends retain their existing HIR projection authority"
+    );
 }

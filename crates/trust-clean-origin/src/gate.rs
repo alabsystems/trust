@@ -149,11 +149,18 @@ pub enum FaithfulnessMethod {
 #[derive(Debug, Clone)]
 pub struct Faithful {
     name: String,
+    declaration: Name,
     admitted_at: Ty,
     method: FaithfulnessMethod,
 }
 
 impl Faithful {
+    /// Exact kernel identity; display text is never an environment lookup key.
+    #[must_use]
+    pub fn declaration(&self) -> &Name {
+        &self.declaration
+    }
+
     /// The declaration whose body was admitted.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -599,30 +606,42 @@ pub fn check_faithful(
     reflected_lowering: &Expr,
     carrier: &Carrier,
 ) -> Result<Faithful, GateRefusal> {
-    check_faithful_impl(env, name, reflected_lowering, carrier, None)
+    check_faithful_for_name(env, &Name::from_string(name), reflected_lowering, carrier)
+}
+
+/// Check the exact structural declaration without reparsing its display text.
+pub fn check_faithful_for_name(
+    env: &Environment,
+    declaration: &Name,
+    reflected_lowering: &Expr,
+    carrier: &Carrier,
+) -> Result<Faithful, GateRefusal> {
+    check_faithful_impl(env, declaration, reflected_lowering, carrier, None)
 }
 
 /// The crate-internal form used by declaration-wide candidate discovery.
 /// Its caller supplies one ABSOLUTE shared deadline, so multiple candidates
 /// and every phase around automation cannot each acquire a fresh allowance.
-pub(crate) fn check_faithful_with_deadline(
+pub(crate) fn check_faithful_for_name_with_deadline(
     env: &Environment,
-    name: &str,
+    declaration: &Name,
     reflected_lowering: &Expr,
     carrier: &Carrier,
     deadline: Instant,
 ) -> Result<Faithful, GateRefusal> {
-    check_faithful_impl(env, name, reflected_lowering, carrier, Some(deadline))
+    check_faithful_impl(env, declaration, reflected_lowering, carrier, Some(deadline))
 }
 
 fn check_faithful_impl(
     env: &Environment,
-    name: &str,
+    declaration: &Name,
     reflected_lowering: &Expr,
     carrier: &Carrier,
     shared_deadline: Option<Instant>,
 ) -> Result<Faithful, GateRefusal> {
-    let kernel_name = Name::from_string(name);
+    let kernel_name = declaration.clone();
+    let display_name = declaration.to_string();
+    let name = display_name.as_str();
 
     let deadline_refusal = || GateRefusal::ResourceExhausted {
         name: name.to_owned(),
@@ -708,7 +727,12 @@ fn check_faithful_impl(
         }
     };
 
-    Ok(Faithful { name: name.to_owned(), admitted_at: carrier.rust().clone(), method })
+    Ok(Faithful {
+        name: name.to_owned(),
+        declaration: declaration.clone(),
+        admitted_at: carrier.rust().clone(),
+        method,
+    })
 }
 
 /// Prove the extensional equality of two closed function bodies by structural
@@ -835,7 +859,7 @@ fn prove_by_structural_induction(
         return Err(DEADLINE);
     }
     let mut goal = Expr::apps(
-        Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
+        Expr::const_(Name::interned("Eq"), vec![Level::succ(Level::zero())]),
         [result_ty.clone(), clean_app, lowered_app],
     );
     for domain in domains.into_iter().rev() {
@@ -1072,9 +1096,14 @@ mod bounded_scan_tests {
         let carrier =
             trust_clean_carrier::carrier_at(&uint64, &Ty::u64()).expect("exact UInt64 carrier");
 
-        let refusal =
-            check_faithful_with_deadline(&env, "identity", &body, &carrier, Instant::now())
-                .expect_err("an expired declaration deadline cannot be refreshed by defeq");
+        let refusal = check_faithful_for_name_with_deadline(
+            &env,
+            &Name::from_string("identity"),
+            &body,
+            &carrier,
+            Instant::now(),
+        )
+        .expect_err("an expired declaration deadline cannot be refreshed by defeq");
         assert!(matches!(refusal, GateRefusal::ResourceExhausted { .. }));
         assert!(refusal.note().contains("fail-closed incomplete decision"));
         assert!(
@@ -1217,7 +1246,18 @@ pub fn check_faithful_equations(
     reflected: &ReflectedStructuralRec,
     carrier: &Carrier,
 ) -> Result<Faithful, GateRefusal> {
-    let kernel_name = Name::from_string(name);
+    check_faithful_equations_for_name(env, &Name::from_string(name), reflected, carrier)
+}
+
+pub(crate) fn check_faithful_equations_for_name(
+    env: &Environment,
+    declaration: &Name,
+    reflected: &ReflectedStructuralRec,
+    carrier: &Carrier,
+) -> Result<Faithful, GateRefusal> {
+    let kernel_name = declaration.clone();
+    let display_name = declaration.to_string();
+    let name = display_name.as_str();
 
     // 1. Side A's PROVENANCE, identical to `check_faithful`.
     match env.declaration_verification(&kernel_name) {
@@ -1251,13 +1291,13 @@ pub fn check_faithful_equations(
     //    source). The inductive and the recursor must agree with each other
     //    (a kernel self-consistency read), and the reflection must pair 1:1,
     //    in order, with the recursor's rules.
-    let inductive = env.get_inductive(&Name::from_string("Nat")).ok_or_else(|| {
+    let inductive = env.get_inductive(&Name::interned("Nat")).ok_or_else(|| {
         GateRefusal::NotStructuralRecursor {
             name: name.to_owned(),
             found: "an environment with no `Nat` inductive declaration".to_owned(),
         }
     })?;
-    let recursor = env.get_recursor(&Name::from_string("Nat.rec")).ok_or_else(|| {
+    let recursor = env.get_recursor(&Name::interned("Nat.rec")).ok_or_else(|| {
         GateRefusal::NotStructuralRecursor {
             name: name.to_owned(),
             found: "an environment with no `Nat.rec` recursor".to_owned(),
@@ -1302,7 +1342,7 @@ pub fn check_faithful_equations(
         });
     }
     for (case, rule) in reflected.cases.iter().zip(recursor.rules.iter()) {
-        if case.constructor != rule.constructor_name.to_string() {
+        if !gate_name_eq_str(&rule.constructor_name, &case.constructor) {
             return Err(GateRefusal::EquationSetMismatch {
                 name: name.to_owned(),
                 reflected: format!("a case claiming `{}`", case.constructor),
@@ -1338,13 +1378,14 @@ pub fn check_faithful_equations(
 
     Ok(Faithful {
         name: name.to_owned(),
+        declaration: declaration.clone(),
         admitted_at: carrier.rust().clone(),
         method: FaithfulnessMethod::PerEquationDefeq,
     })
 }
 
 fn nat_const() -> Expr {
-    Expr::const_(Name::from_string("Nat"), vec![])
+    Expr::const_(Name::interned("Nat"), vec![])
 }
 
 /// The gate's OWN parse of a structural side A: peel exactly one lambda over
@@ -1364,10 +1405,7 @@ fn parse_nat_rec_minors(
 ) -> Result<Vec<Expr>, GateRefusal> {
     let refuse =
         |found: String| GateRefusal::NotStructuralRecursor { name: name.to_owned(), found };
-    let is_nat = |expr: &Expr| {
-        matches!(gate_strip_mdata(expr).kind(), ExprKind::Const(n, levels)
-            if *n == Name::from_string("Nat") && levels.is_empty())
-    };
+    let is_nat = gate_is_nat;
 
     let cursor = gate_strip_mdata(body);
     let ExprKind::Lam(_, param_ty, inner) = cursor.kind() else {
@@ -1389,7 +1427,7 @@ fn parse_nat_rec_minors(
     let ExprKind::Const(head_name, head_levels) = head.kind() else {
         return Err(refuse(format!("a non-constant application head: {head:?}")));
     };
-    if *head_name == Name::from_string("WellFounded.fix") {
+    if gate_name_eq2(head_name, "WellFounded", "fix") {
         return Err(refuse(
             "a `WellFounded.fix` application — well-founded recursion is judged by the \
              F-layer lane `check_faithful_wf_functional` (R2), never by a per-equation \
@@ -1397,7 +1435,7 @@ fn parse_nat_rec_minors(
                 .to_owned(),
         ));
     }
-    if *head_name != Name::from_string("Nat.rec")
+    if !gate_name_eq2(head_name, "Nat", "rec")
         || head_levels.as_slice() != [Level::succ(Level::zero())]
     {
         return Err(refuse(format!("an application headed by `{head_name}`")));
@@ -1405,7 +1443,7 @@ fn parse_nat_rec_minors(
 
     // The KERNEL's minor count decides the spine arity: motive + minors + major.
     let num_minors = env
-        .get_recursor(&Name::from_string("Nat.rec"))
+        .get_recursor(&Name::interned("Nat.rec"))
         .map(|recursor| usize::try_from(recursor.num_minors).unwrap_or(usize::MAX))
         .ok_or_else(|| refuse("an environment with no `Nat.rec` recursor".to_owned()))?;
     if args.len() != 1 + num_minors + 1 {
@@ -1789,7 +1827,18 @@ pub fn check_faithful_wf_functional(
     reflected: &ReflectedWfFunctional,
     carrier: &Carrier,
 ) -> Result<Faithful, GateRefusal> {
-    let kernel_name = Name::from_string(name);
+    check_faithful_wf_functional_for_name(env, &Name::from_string(name), reflected, carrier)
+}
+
+pub(crate) fn check_faithful_wf_functional_for_name(
+    env: &Environment,
+    declaration: &Name,
+    reflected: &ReflectedWfFunctional,
+    carrier: &Carrier,
+) -> Result<Faithful, GateRefusal> {
+    let kernel_name = declaration.clone();
+    let display_name = declaration.to_string();
+    let name = display_name.as_str();
 
     // 1. Side A's PROVENANCE, identical to the other two lanes.
     match env.declaration_verification(&kernel_name) {
@@ -1817,8 +1866,8 @@ pub fn check_faithful_wf_functional(
     let layout = WfBorrowLayout::of(spine.lowering, arity);
 
     // 5. THE BORROW.
-    let decrease_sentinel = Name::from_string(DECREASE_SLOT_SENTINEL);
-    let measure_sentinel = Name::from_string(MEASURE_SLOT_SENTINEL);
+    let decrease_sentinel = Name::interned(DECREASE_SLOT_SENTINEL);
+    let measure_sentinel = Name::interned(MEASURE_SLOT_SENTINEL);
     // BOTH sentinels must be absent, for the one reason: a sentinel that
     // resolves could not be told apart from a term someone declared, and the
     // borrow's whole shape is "this position is provably not side B's".
@@ -1933,6 +1982,7 @@ pub fn check_faithful_wf_functional(
 
     Ok(Faithful {
         name: name.to_owned(),
+        declaration: declaration.clone(),
         admitted_at: carrier.rust().clone(),
         method: FaithfulnessMethod::WellFoundedFunctionalDefeq,
     })
@@ -1992,14 +2042,14 @@ fn parse_wf_fix_spine(env: &Environment, name: &str, body: &Expr) -> Result<WfSp
     let ExprKind::Const(head_name, head_levels) = head.kind() else {
         return Err(refuse("a non-constant application head".to_owned()));
     };
-    if *head_name == Name::from_string("Nat.rec") {
+    if gate_name_eq2(head_name, "Nat", "rec") {
         return Err(refuse(
             "a `Nat.rec` application — structural recursion belongs to the per-defining-equation \
              lane, which needs no decrease proof at all"
                 .to_owned(),
         ));
     }
-    if *head_name != Name::from_string("WellFounded.fix") {
+    if !gate_name_eq2(head_name, "WellFounded", "fix") {
         return Err(refuse(format!("an application headed by `{head_name}`")));
     }
     if head_levels.len() != 2 {
@@ -2167,28 +2217,55 @@ fn parse_wf_fix_spine(env: &Environment, name: &str, body: &Expr) -> Result<WfSp
     // The environment read is the same self-consistency check the structural
     // lane makes: a `WellFounded.fix` the environment does not declare is not
     // a spine, it is a name collision.
-    if env.get_const(&Name::from_string("WellFounded.fix")).is_none() {
+    if env.get_const(&Name::interned("WellFounded.fix")).is_none() {
         return Err(refuse("an environment with no `WellFounded.fix` declaration".to_owned()));
     }
     Ok(WfSpine { f, arity, lowering, measure })
 }
 
+#[inline]
+fn gate_name_eq1(name: &Name, s0: &str) -> bool {
+    matches!(name.inner(), NameInner::Str(parent, s) if parent.is_anon() && s.as_ref() == s0)
+}
+
+#[inline]
+fn gate_name_eq2(name: &Name, s0: &str, s1: &str) -> bool {
+    matches!(name.inner(), NameInner::Str(parent, s) if s.as_ref() == s1 && gate_name_eq1(parent, s0))
+}
+
+#[inline]
+fn gate_name_eq_str(mut name: &Name, expected: &str) -> bool {
+    if expected.is_empty() {
+        return name.is_anon();
+    }
+    for part in expected.rsplit('.') {
+        match name.inner() {
+            NameInner::Str(parent, seg) if seg.as_ref() == part => name = parent,
+            _ => return false,
+        }
+    }
+    name.is_anon()
+}
+
 /// Whether `expr` is the bare constant `Nat` — the gate's own copy, for the
 /// same independence reason [`gate_strip_mdata`] is.
 fn gate_is_nat(expr: &Expr) -> bool {
-    gate_is_bare_const(expr, "Nat")
+    matches!(gate_strip_mdata(expr).kind(), ExprKind::Const(n, levels)
+        if gate_name_eq1(n, "Nat") && levels.is_empty())
 }
 
 /// Whether `expr` is the bare constant `name`, at no universe arguments.
 fn gate_is_bare_const(expr: &Expr, name: &str) -> bool {
     matches!(gate_strip_mdata(expr).kind(), ExprKind::Const(n, levels)
-        if *n == Name::from_string(name) && levels.is_empty())
+        if gate_name_eq_str(n, name) && levels.is_empty())
 }
 
 /// `name ARG` for a bare unary constant, or `None`.
 fn gate_unary_const_app<'e>(expr: &'e Expr, name: &str) -> Option<&'e Expr> {
-    let (head, args) = gate_uncurry(expr);
-    (gate_is_bare_const(head, name) && args.len() == 1).then(|| args[0])
+    let ExprKind::App(function, argument) = gate_strip_mdata(expr).kind() else {
+        return None;
+    };
+    gate_is_bare_const(function, name).then(|| gate_strip_mdata(argument))
 }
 
 /// Whether `expr` is `Nat.lt <measure> (BVar bound)`, in the RAW spelling.
@@ -2199,11 +2276,15 @@ fn gate_unary_const_app<'e>(expr: &'e Expr, name: &str) -> Option<&'e Expr> {
 /// `Expr::const_("Nat.lt")`. There is one spelling to read, and accepting a
 /// second would be accepting a term the lowering does not produce.
 fn gate_is_raw_nat_lt_at(expr: &Expr, measure: &Expr, bound: u32) -> bool {
-    let (head, args) = gate_uncurry(expr);
+    let ExprKind::App(f1, arg1) = gate_strip_mdata(expr).kind() else {
+        return false;
+    };
+    let ExprKind::App(head, arg0) = gate_strip_mdata(f1).kind() else {
+        return false;
+    };
     gate_is_bare_const(head, "Nat.lt")
-        && args.len() == 2
-        && *gate_strip_mdata(args[0]) == *measure
-        && matches!(gate_strip_mdata(args[1]).kind(), &ExprKind::BVar(index) if index == bound)
+        && *gate_strip_mdata(arg0) == *measure
+        && matches!(gate_strip_mdata(arg1).kind(), &ExprKind::BVar(index) if index == bound)
 }
 
 /// **R3e — THE GATE'S OWN READ OF A PHASE-3 SIDE A**, component by component,
@@ -2454,12 +2535,16 @@ fn require_sum_measure_side_a(
                     .to_owned(),
             ));
         };
-        let raw_lt = {
-            let (lt_head, lt_args) = gate_uncurry(gate_strip_mdata(k_lt_n));
-            gate_is_bare_const(lt_head, "Nat.lt")
-                && lt_args.len() == 2
-                && matches!(gate_strip_mdata(lt_args[0]).kind(), ExprKind::BVar(0))
-                && matches!(gate_strip_mdata(lt_args[1]).kind(), ExprKind::BVar(1))
+        let raw_lt = match gate_strip_mdata(k_lt_n).kind() {
+            ExprKind::App(f1, arg1) => match gate_strip_mdata(f1).kind() {
+                ExprKind::App(lt_head, arg0) => {
+                    gate_is_bare_const(lt_head, "Nat.lt")
+                        && matches!(gate_strip_mdata(arg0).kind(), ExprKind::BVar(0))
+                        && matches!(gate_strip_mdata(arg1).kind(), ExprKind::BVar(1))
+                }
+                _ => false,
+            },
+            _ => false,
         };
         if !raw_lt {
             return Err(refuse(
@@ -2717,6 +2802,15 @@ fn collect_decrease_slots(f: &Expr, layout: WfBorrowLayout) -> Result<WfBorrowSo
     Ok(WfBorrowSource { slots, binder_tys })
 }
 
+/// Outermost head of an application spine without allocating a `Vec`.
+fn gate_spine_head(expr: &Expr) -> &Expr {
+    let mut head = gate_strip_mdata(expr);
+    while let ExprKind::App(function, _) = head.kind() {
+        head = gate_strip_mdata(function);
+    }
+    head
+}
+
 /// Uncurry an application spine, outermost head first.
 fn gate_uncurry(expr: &Expr) -> (&Expr, Vec<&Expr>) {
     let mut args: Vec<&Expr> = Vec::new();
@@ -2778,8 +2872,8 @@ fn walk_functional(
             // itself is never visited as a bare occurrence and a PARTIALLY
             // applied `rec` reaches the `BVar(depth)` arm above or the count
             // check below rather than passing silently.
-            let (head, args) = gate_uncurry(cursor);
-            if matches!(head.kind(), ExprKind::BVar(index) if *index == depth) {
+            if matches!(gate_spine_head(cursor).kind(), ExprKind::BVar(index) if *index == depth) {
+                let (_, args) = gate_uncurry(cursor);
                 if args.len() != call_arity {
                     return Err(format!(
                         "the recursive slot is applied to {} argument(s) where a self-call at \
@@ -2980,8 +3074,9 @@ fn rebuild_functional(
         ),
         ExprKind::Const(_, _) => Ok(cursor.clone()),
         ExprKind::App(function, argument) => {
-            let (head, args) = gate_uncurry(cursor);
+            let head = gate_spine_head(cursor);
             if matches!(head.kind(), ExprKind::BVar(i) if *i == depth) {
+                let (_, args) = gate_uncurry(cursor);
                 if args.len() != call_arity {
                     return Err(format!(
                         "side B applies its recursive slot to {} argument(s) where a self-call at \
@@ -3015,9 +3110,7 @@ fn rebuild_functional(
                 // premise — the measure at the enclosing parameters — which
                 // side B likewise cannot author. Same rule, same shape, and
                 // refused the same way when side B writes its own term there.
-                if layout.is_measure_argument(0)
-                    && !is_bare_sentinel(args[0], sentinels.measure)
-                {
+                if layout.is_measure_argument(0) && !is_bare_sentinel(args[0], sentinels.measure) {
                     return Err(format!(
                         "side B supplied its own term as the self-call's major premise, which the \
                          sum-measure lowering states as the `termination_by` MEASURE at the \

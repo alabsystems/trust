@@ -4,9 +4,8 @@ use std::ops::Range;
 
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_data_structures::fx::{FxHashMap, FxIndexSet, StdEntry};
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_index::IndexVec;
-use rustc_index::bit_set::DenseBitSet;
+use rustc_index::bit_set::GrowableBitSet;
 use rustc_middle::mir::visit::{PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt, Unnormalized};
@@ -211,17 +210,6 @@ impl<V: Clone + HasBottom> State<V> {
     {
         self.flood(target, map);
         if let Some(target) = map.find(target) {
-            self.insert_idx(target, result, map);
-        }
-    }
-
-    /// Helper method for assignments to a discriminant.
-    pub fn assign_discr(&mut self, target: PlaceRef<'_>, result: ValueOrPlace<V>, map: &Map<'_>)
-    where
-        V: HasTop,
-    {
-        self.flood_discr(target, map);
-        if let Some(target) = map.find_discr(target) {
             self.insert_idx(target, result, map);
         }
     }
@@ -462,6 +450,10 @@ impl<'tcx> Map<'tcx> {
             }
         }
 
+        if self.projections.is_empty() || assignments.is_empty() {
+            return;
+        }
+
         // This is a fixpoint loop does. While we are still creating places, run through
         // all the assignments, and register places for children.
         let mut num_places = 0;
@@ -594,7 +586,7 @@ impl<'tcx> Map<'tcx> {
         if let Some(tail) = tail {
             let ty = match tail {
                 TrackElem::Discriminant => ty.ty.discriminant_ty(tcx),
-                TrackElem::Variant(..) | TrackElem::Field(..) => todo!(),
+                TrackElem::Variant(..) | TrackElem::Field(..) => unimplemented!(),
                 TrackElem::DerefLen => tcx.types.usize,
             };
             place_index = self.register_place_index(ty, place_index, tail);
@@ -699,7 +691,7 @@ impl<'tcx> Map<'tcx> {
         // We manually iterate instead of using `children` as we need to mutate `self`.
         let mut next_child = self.places[root].first_child;
         while let Some(child) = next_child {
-            ensure_sufficient_stack(|| self.cache_preorder_invoke(child));
+            self.cache_preorder_invoke(child);
             next_child = self.places[child].next_sibling;
         }
 
@@ -723,6 +715,12 @@ impl<'tcx> Visitor<'tcx> for PlaceCollector<'_, 'tcx> {
 
         self.map.register_place_and_discr(self.tcx, self.body, *place);
     }
+
+    fn visit_source_info(&mut self, _: &SourceInfo) {}
+
+    fn visit_ty(&mut self, _: Ty<'tcx>, _: rustc_middle::mir::visit::TyContext) {}
+
+    fn visit_const_operand(&mut self, _: &ConstOperand<'tcx>, _: Location) {}
 }
 
 impl<'tcx> Map<'tcx> {
@@ -798,6 +796,12 @@ impl<'tcx> Map<'tcx> {
         };
         let elems = place.projection.iter().map(|&elem| elem.try_into()).chain(tail_elem.map(Ok));
         for elem in elems {
+            // All fields of a union alias each other.
+            if self.places[index].ty.is_union() {
+                self.for_each_value_inside(index, f);
+                return;
+            }
+
             // A field aliases the parent place.
             if let Some(vi) = self.places[index].value_index {
                 f(vi);
@@ -1017,7 +1021,7 @@ pub fn iter_fields<'tcx>(
             for (v_index, v_def) in def.variants().iter_enumerated() {
                 let variant = if def.is_struct() { None } else { Some(v_index) };
                 for (f_index, f_def) in v_def.fields.iter().enumerate() {
-                    let field_ty = f_def.ty(tcx, args);
+                    let field_ty = f_def.ty(tcx, *args);
                     let field_ty =
                         tcx.try_normalize_erasing_regions(typing_env, field_ty).unwrap_or_else(
                             |_| tcx.erase_and_anonymize_regions(field_ty.skip_norm_wip()),
@@ -1040,9 +1044,9 @@ pub fn iter_fields<'tcx>(
 }
 
 /// Returns all locals with projections that have their reference or address taken.
-pub fn excluded_locals(body: &Body<'_>) -> DenseBitSet<Local> {
+pub fn excluded_locals(body: &Body<'_>) -> GrowableBitSet<Local> {
     struct Collector {
-        result: DenseBitSet<Local>,
+        result: GrowableBitSet<Local>,
     }
 
     impl<'tcx> Visitor<'tcx> for Collector {
@@ -1053,9 +1057,15 @@ pub fn excluded_locals(body: &Body<'_>) -> DenseBitSet<Local> {
                 self.result.insert(place.local);
             }
         }
+
+        fn visit_source_info(&mut self, _: &SourceInfo) {}
+
+        fn visit_ty(&mut self, _: Ty<'tcx>, _: rustc_middle::mir::visit::TyContext) {}
+
+        fn visit_const_operand(&mut self, _: &ConstOperand<'tcx>, _: Location) {}
     }
 
-    let mut collector = Collector { result: DenseBitSet::new_empty(body.local_decls.len()) };
+    let mut collector = Collector { result: GrowableBitSet::new_empty() };
     collector.visit_body(body);
     collector.result
 }

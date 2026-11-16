@@ -547,6 +547,19 @@ fn external_checker_runner_invokes_fixture_and_returns_production_evidence() {
     let entry = manifest.certificates.first().expect("manifest should have one row");
     let script_body = "#!/bin/sh\nprintf 'checker accepted\\n'\nprintf 'mode=%s\\n' \"$TRUST_CHECKER_MODE\"\nprintf 'certificate=%s\\n' \"$2\" >&2\nexit 0\n";
     let script = write_checker_fixture_script(&dir, "checker-fixture-success.sh", script_body);
+    // macOS assesses a file the first time it is executed, one file at a time
+    // machine-wide, and the wait falls after spawn. Behind two fresh copies of
+    // a 490 MB test binary (a push lane starts freshly linked ones side by
+    // side), the timed run below hit its 5 s timeout (measured 2026-10-01).
+    // Pay that first execution here; the script's bytes, and so the digests
+    // asserted below, are unchanged.
+    let warm_up = std::process::Command::new(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run the fresh checker fixture once before timing it");
+    assert!(warm_up.success(), "checker fixture warm-up failed: {warm_up:?}");
     let certificate_path = dir.join(&entry.certificate_path).display().to_string();
     let config_sha256 = trust_types::stable_sha256_hex(b"runner fixture checker config");
     let runner = CheckedBinaryCertificateExternalCheckerRunner::from_command_path(

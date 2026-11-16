@@ -1,8 +1,7 @@
-use super::sealed::Sealed;
 use crate::simd::{Simd, SimdCast, SimdElement, cmp::SimdOrd};
 
 /// Operations on SIMD vectors of unsigned integers.
-pub trait SimdUint: Copy + Sealed {
+pub impl(self) trait SimdUint: Copy {
     /// Scalar type contained by this SIMD vector type.
     type Scalar;
 
@@ -30,12 +29,11 @@ pub trait SimdUint: Copy + Sealed {
     /// # #[cfg(feature = "as_crate")] use core_simd::simd;
     /// # #[cfg(not(feature = "as_crate"))] use core::simd;
     /// # use simd::prelude::*;
-    /// use core::u32::MAX;
-    /// let x = Simd::from_array([2, 1, 0, MAX]);
-    /// let max = Simd::splat(MAX);
+    /// let x = Simd::from_array([2, 1, 0, u32::MAX]);
+    /// let max = Simd::splat(u32::MAX);
     /// let unsat = x + max;
     /// let sat = x.saturating_add(max);
-    /// assert_eq!(unsat, Simd::from_array([1, 0, MAX, MAX - 1]));
+    /// assert_eq!(unsat, Simd::from_array([1, 0, u32::MAX, u32::MAX - 1]));
     /// assert_eq!(sat, max);
     /// ```
     fn saturating_add(self, second: Self) -> Self;
@@ -48,9 +46,8 @@ pub trait SimdUint: Copy + Sealed {
     /// # #[cfg(feature = "as_crate")] use core_simd::simd;
     /// # #[cfg(not(feature = "as_crate"))] use core::simd;
     /// # use simd::prelude::*;
-    /// use core::u32::MAX;
-    /// let x = Simd::from_array([2, 1, 0, MAX]);
-    /// let max = Simd::splat(MAX);
+    /// let x = Simd::from_array([2, 1, 0, u32::MAX]);
+    /// let max = Simd::splat(u32::MAX);
     /// let unsat = x - max;
     /// let sat = x.saturating_sub(max);
     /// assert_eq!(unsat, Simd::from_array([3, 2, 1, 0]));
@@ -67,10 +64,9 @@ pub trait SimdUint: Copy + Sealed {
     /// # #[cfg(feature = "as_crate")] use core_simd::simd;
     /// # #[cfg(not(feature = "as_crate"))] use core::simd;
     /// # use simd::prelude::*;
-    /// use core::u32::MAX;
-    /// let a = Simd::from_array([0, MAX, 100, 20]);
-    /// let b = Simd::from_array([MAX, 0, 80, 200]);
-    /// assert_eq!(a.abs_diff(b), Simd::from_array([MAX, MAX, 20, 180]));
+    /// let a = Simd::from_array([0, u32::MAX, 100, 20]);
+    /// let b = Simd::from_array([u32::MAX, 0, 80, 200]);
+    /// assert_eq!(a.abs_diff(b), Simd::from_array([u32::MAX, u32::MAX, 20, 180]));
     /// ```
     fn abs_diff(self, second: Self) -> Self;
 
@@ -124,8 +120,6 @@ pub trait SimdUint: Copy + Sealed {
 macro_rules! impl_trait {
     { $($ty:ident ($signed:ident)),* } => {
         $(
-        impl<const N: usize> Sealed for Simd<$ty, N> {}
-
         impl<const N: usize> SimdUint for Simd<$ty, N>
         {
             type Scalar = $ty;

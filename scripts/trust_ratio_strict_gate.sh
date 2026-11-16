@@ -105,9 +105,9 @@ trap 'restore; rm -f "$BACKUP"' EXIT INT TERM
 
 fails=0
 LOG=""
-run() { # run [policy]; sets RC and LOG
+run() { # run [lane flag]; sets RC and LOG
   LOG="$(mktemp)"
-  ( cd "$REPO_ROOT/crates" && TRUSTFLAGS="${1:-}" "$TARGO" trust check -p trust-ratio ) > "$LOG" 2>&1
+  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check --all-rows ${1:+"$1"} -p trust-ratio ) > "$LOG" 2>&1
   RC=$?
   require_env "${STEP:-run}"
   no_rustc_error "${STEP:-run}"
@@ -127,7 +127,7 @@ runtests() { # sets RC and LOG
   RC=$?
   require_env "${STEP:-tests}"
 }
-gate_line() { grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$LOG" | tail -1; }
+gate_line() { grep -oE 'Gate: [A-Z-]+ \[[a-z-]+ lane, exit [0-9]+\]' "$LOG" | tail -1; }
 fail() { echo "  FAIL $*"; fails=$((fails+1)); }
 
 # ---------------------------------------------------------------------------
@@ -256,27 +256,22 @@ rm -f "$LOG"
 
 mut_end
 # ---------------------------------------------------------------------------
-# 2. THE SAME PASS UNDER `-Ztrust-policy=certify`.
+# 2. THE SAME PASS UNDER `--certify` (the compiler's `certify` policy).
 #    This is the lane the 2026-08-29 regression actually failed: the four
 #    parameter-bounded per-branch postcondition VCs kept a favorable COMPILER
 #    verdict and lost only their clean-kernel certificate, so nothing but a
 #    certificate-demanding lane could see it.
 #
-#    A misspelled TRUSTFLAGS is silently dropped, so first prove the flag path
-#    reaches the compiler by requiring a bogus policy to be REJECTED BY NAME.
-#    Without this control, "certify passed" is indistinguishable from "certify
-#    never ran".
+#    The lane flag selects the compiler's `certify` policy, and the Gate line
+#    names the lane that graded the run, so `[certify lane, exit 0]` is the
+#    evidence that certify ran. (A bogus-policy control proved the TRUSTFLAGS
+#    route reached the compiler; it went with that channel, DECISION_QUEUE T7a.)
 # ---------------------------------------------------------------------------
-STEP="THE SAME PASS UNDER '-Ztrust-policy=certify'"; mut_begin
-run "-Ztrust-policy=bogus_not_a_policy"
-grep -q "incorrect value \`bogus_not_a_policy\` for unstable option \`trust-policy\`" "$LOG" \
-  || fail "TRUSTFLAGS control: a bogus policy was NOT rejected — the flag never reaches the compiler, so the certify run below proves nothing"
-rm -f "$LOG"
-
-run "-Ztrust-policy=certify"
+STEP="THE SAME PASS UNDER '--certify'"; mut_begin
+run "--certify"
 G="$(gate_line)"
 [ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
-case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
+case "$G" in *"PASS [certify lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
 grep -qE 'Summary: 30 proved, 0 failed, .*0 inconclusive \(30 total\)' "$LOG" \
   || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 # The publication boundary is the seam that broke. Assert that NOTHING is
@@ -378,9 +373,16 @@ G="$(gate_line)"
 if [ "$RC" -eq 0 ]; then fail "mutation B: an unguarded division still passed  $G"; else mut_ok "mutation B (percent loses its den==0 guard)  rc=$RC  $G"; fi
 grep -qE '^\s*\[(FAILED|UNKNOWN)\] \[divzero\]' "$LOG" \
   || fail "mutation B: no unfavorable [divzero] row at all — the obligation was not even emitted"
-grep -q 'solver refuted the encoded VC' "$LOG" \
+# (b) and (c) are asserted as FACTS, not as one lane's sentence. Measured 2026-09-15 on a
+# stage1 built from main 12cf513003: this mutation is still refuted with a real counterexample
+# (`den = 0, num = 0`), but the refutation now comes from the native trust_mc CHC/PDR runner and
+# ay-in-process rather than trust-bmc's typed-CHC lane, whose two sentences below the gate used to
+# grep. Keyed on that wording alone, the gate reported a CAUGHT bug as a capability gap — the
+# unsafe-looking direction. Each lane's evidence is accepted; each pattern is pinned to THIS
+# obligation (percent) and THIS witness (den = 0), and every one reads 0 on the pristine run.
+grep -qE 'solver refuted the encoded VC|vc:trust_ratio__percent:[a-z_]+:[0-9]+`: native trust_mc typed CHC/PDR full-verification runner refuted obligation' "$LOG" \
   || fail "mutation B: no refutation recorded — the gate saw a coverage gap, not a refutation"
-grep -q 'direct SMT confirmed a satisfiable typed query fact' "$LOG" \
+grep -qE 'direct SMT confirmed a satisfiable typed query fact|division by zero FAILED \([a-z-]+\) counterexample: .*\bden = 0\b' "$LOG" \
   || fail "mutation B: the violation was never confirmed satisfiable — no counterexample exists, so this is a capability gap, not a caught bug"
 rm -f "$LOG"; restore
 

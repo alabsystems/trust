@@ -40,6 +40,7 @@
 //! ```
 
 #![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_types)]
 #![allow(clippy::print_stderr)]
 #![allow(clippy::print_stdout)]
 
@@ -104,6 +105,88 @@ pub fn panic_error(what: &str, err: impl Into<anyhow::Error>) -> ! {
 }
 
 pub use cargo_test_macro::cargo_test;
+
+/// Trust: the `cargo` COMPATIBILITY entry point of a built Targo executable.
+///
+/// The Trust Cargo package builds exactly one executable, `targo`. A Trust
+/// toolchain reaches Cargo's compatibility domain through `bin/cargo`, which is
+/// the same file under the stock name (bootstrap's sysroot restoration copies
+/// the `targo` artifact to both), and the frontend takes its identity from the
+/// OS-reported executable name. The inherited testsuite exercises that
+/// compatibility domain, so it runs the alias, materialized beside `targo` the
+/// same way: a hard link named `cargo` (a byte copy where links are
+/// unavailable). Tests that need the branded frontend link `targo` themselves.
+///
+/// The alias is (re)published once per test process with an atomic rename, so a
+/// concurrent test binary never observes a partial file, and a `cargo` left by
+/// an older build of a different executable is replaced rather than trusted.
+pub fn cargo_compat_alias(targo: &Path) -> PathBuf {
+    static ALIAS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    let (aliased, alias) = ALIAS.get_or_init(|| {
+        let alias = materialize_cargo_compat_alias(targo).unwrap_or_else(|error| {
+            panic!(
+                "could not materialize the `cargo` alias of `{}`: {error}",
+                targo.display()
+            )
+        });
+        (targo.to_path_buf(), alias)
+    });
+    assert_eq!(
+        aliased, targo,
+        "one test process materializes the `cargo` alias of exactly one Targo executable"
+    );
+    alias.clone()
+}
+
+fn materialize_cargo_compat_alias(targo: &Path) -> std::io::Result<PathBuf> {
+    let dir = targo.parent().ok_or_else(|| {
+        std::io::Error::other(format!("`{}` has no parent directory", targo.display()))
+    })?;
+    let alias = dir.join(format!("cargo{}", env::consts::EXE_SUFFIX));
+    if is_same_executable(targo, &alias) {
+        return Ok(alias);
+    }
+    let staging = dir.join(format!(
+        ".cargo-compat-alias.{}.tmp{}",
+        std::process::id(),
+        env::consts::EXE_SUFFIX
+    ));
+    match fs::remove_file(&staging) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if fs::hard_link(targo, &staging).is_err() {
+        fs::copy(targo, &staging)?;
+    }
+    if let Err(error) = fs::rename(&staging, &alias) {
+        let _ = fs::remove_file(&staging);
+        // Windows refuses to replace an executable another test process is
+        // running; that is fine only if it already is this Targo's alias.
+        if is_same_executable(targo, &alias) {
+            return Ok(alias);
+        }
+        return Err(error);
+    }
+    Ok(alias)
+}
+
+#[cfg(unix)]
+fn is_same_executable(targo: &Path, alias: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (fs::metadata(targo), fs::metadata(alias)) {
+        (Ok(targo), Ok(alias)) => targo.dev() == alias.dev() && targo.ino() == alias.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_same_executable(targo: &Path, alias: &Path) -> bool {
+    match (fs::read(targo), fs::read(alias)) {
+        (Ok(targo), Ok(alias)) => targo == alias,
+        _ => false,
+    }
+}
 
 pub mod compare;
 pub mod containers;
@@ -350,6 +433,7 @@ impl ProjectBuilder {
                 // see targets as "fresh". Without this, if cargo finishes in
                 // under 1 second, the second call will see the mtime of
                 // source == mtime of output and consider it dirty.
+                // Trust: preserve both times using the early seed-compatible dependency.
                 filetime::set_file_times(&file.path, ftime, ftime).unwrap();
             }
         }
@@ -444,7 +528,7 @@ impl Project {
             .join(&format!("{}{}", b, env::consts::EXE_SUFFIX))
     }
 
-    /// Path to a debug binary for a specific target triple.
+    /// Path to a debug binary for a specific target tuple.
     ///
     /// ex: `$CARGO_TARGET_TMPDIR/cit/t0/foo/target/i686-apple-darwin/debug/foo`
     pub fn target_bin(&self, target: &str, b: &str) -> PathBuf {
@@ -1089,17 +1173,20 @@ impl Execs {
             if is_ci() {
                 panic!("`.stream()` is for local debugging")
             }
-            process.exec_with_streaming(
-                &mut |out| {
-                    println!("{}", out);
-                    Ok(())
-                },
-                &mut |err| {
-                    eprintln!("{}", err);
-                    Ok(())
-                },
-                true,
-            )
+            process
+                .exec_with_streaming(
+                    &mut |out| {
+                        println!("{}", out);
+                        Ok(())
+                    },
+                    &mut |err| {
+                        eprintln!("{}", err);
+                        Ok(())
+                    },
+                    true,
+                    false,
+                )
+                .1
         } else {
             process.exec_with_output()
         };
@@ -1324,7 +1411,7 @@ pub fn rustc_host() -> &'static str {
     &rustc_info().host
 }
 
-/// The host triple suitable for use in a cargo environment variable (uppercased).
+/// The host tuple suitable for use in a cargo environment variable (uppercased).
 pub fn rustc_host_env() -> String {
     rustc_host().to_uppercase().replace('-', "_")
 }
@@ -1382,7 +1469,10 @@ pub trait TestEnvCommandExt: Sized {
         // environment. Our tests all assume a "default configuration" unless
         // specified otherwise.
         for (k, _v) in env::vars() {
-            if k.starts_with("CARGO_") {
+            // Trust: native aliases can recreate CARGO_* in the next Targo
+            // environment snapshot. Isolate both ambient namespaces; authored
+            // command overrides below remain later-wins.
+            if k.starts_with("CARGO_") || k.starts_with("TARGO_") {
                 self = self.env_remove(&k);
             }
         }
@@ -1440,6 +1530,7 @@ pub trait TestEnvCommandExt: Sized {
             .env("CARGO_INCREMENTAL", "0")
             // Don't read the system git config which is out of our control.
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("CI")
             .env_remove("__CARGO_DEFAULT_LIB_METADATA")
             .env_remove("ALL_PROXY")
             .env_remove("EMAIL")
@@ -1478,7 +1569,7 @@ pub trait TestEnvCommandExt: Sized {
         // Deliberate per-test RUSTC or PATH overrides remain later-wins.
         self = configure_trust_cargo_fixture(
             self,
-            env::var_os("TRUST_TARGO_TEST_NO_VERIFY").is_some(),
+            env::var_os("TRUST_TARGO_TEST_NO_VERIFY"),
             env::var_os("TEST_TRUST_SHIM_DIR"),
             Some(inherited_test_path),
             env::vars().map(|(key, _)| key),
@@ -1498,31 +1589,90 @@ pub trait TestEnvCommandExt: Sized {
 /// Trust: bootstrap's compiler shim is driven by these variables, and a
 /// fixture that inherits them compiles under a different policy than the test
 /// intends. `RUSTC_BOOTSTRAP` is deliberately exempt — upstream fixtures set
-/// and clear it on purpose to exercise the unstable-channel gate.
+/// and clear it on purpose to exercise the unstable-channel gate. Likewise,
+/// `TRUST_VANILLA_ANNOUNCED` only records the parent's unverified-lane disclosure;
+/// retaining its exact value does not select a verifier policy.
 fn is_bootstrap_shim_control_env(key: &str) -> bool {
     let key = key.to_ascii_uppercase();
     (key.starts_with("RUSTC_") && key != "RUSTC_BOOTSTRAP")
         || key.starts_with("RUSTDOC_")
-        || key.starts_with("TRUST_")
+        || key.starts_with("TARGO_")
+        || (key.starts_with("TRUST_") && key != "TRUST_VANILLA_ANNOUNCED")
         || matches!(
             key.as_str(),
-            "DUMP_BOOTSTRAP_SHIMS" | "FORCE_ON_BROKEN_PIPE_KILL"
+            "DUMP_BOOTSTRAP_SHIMS"
+                | "FORCE_ON_BROKEN_PIPE_KILL"
+                | "__CARGO_RUSTC_BOOTSTRAP_WS_REMAP"
         )
+}
+
+fn trust_cargo_fixture_directory(
+    marker: Option<OsString>,
+    shim_dir: Option<OsString>,
+) -> Result<Option<OsString>, String> {
+    match (marker, shim_dir) {
+        (None, None) => Ok(None),
+        (Some(marker), Some(directory)) if marker == "1" && !directory.is_empty() => {
+            Ok(Some(directory))
+        }
+        _ => Err(
+            "TEST_TRUST_SHIM_DIR and exact TRUST_TARGO_TEST_NO_VERIFY=1 must accompany each other"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Select the canonical isolated compiler for a direct Rust fixture command.
+///
+/// Bootstrap supplies the complete test-only bundle; without it, preserve the
+/// standalone caller's RUSTC (or Trust's `trustc`). This applies no Cargo-test HOME,
+/// working-directory, arguments, or channel policy. Caller-authored changes
+/// made to the returned command remain later-wins.
+pub fn rustc_fixture_command() -> Result<Command, String> {
+    rustc_fixture_command_for(
+        env::var_os("TRUST_TARGO_TEST_NO_VERIFY"),
+        env::var_os("TEST_TRUST_SHIM_DIR"),
+        env::var_os("RUSTC"),
+        env::var_os("PATH"),
+        env::vars().map(|(key, _)| key),
+    )
+}
+
+fn rustc_fixture_command_for(
+    marker: Option<OsString>,
+    shim_dir: Option<OsString>,
+    standalone_rustc: Option<OsString>,
+    inherited_path: Option<OsString>,
+    inherited_keys: impl IntoIterator<Item = String>,
+) -> Result<Command, String> {
+    let selected = trust_cargo_fixture_directory(marker.clone(), shim_dir.clone())?;
+    let program = match selected {
+        Some(directory) => PathBuf::from(directory)
+            .join(format!("rustc{}", env::consts::EXE_SUFFIX))
+            .into_os_string(),
+        None => standalone_rustc.unwrap_or_else(|| OsString::from("trustc")),
+    };
+    let mut command = Command::new(program);
+    configure_trust_cargo_fixture(
+        &mut command,
+        marker,
+        shim_dir,
+        inherited_path,
+        inherited_keys,
+    )?;
+    Ok(command)
 }
 
 fn configure_trust_cargo_fixture<C: TestEnvCommandExt>(
     mut command: C,
-    isolation_requested: bool,
+    marker: Option<OsString>,
     shim_dir: Option<OsString>,
     inherited_path: Option<OsString>,
     inherited_keys: impl IntoIterator<Item = String>,
 ) -> Result<C, String> {
-    if !isolation_requested {
+    let Some(shim_dir) = trust_cargo_fixture_directory(marker, shim_dir)? else {
         return Ok(command);
-    }
-    let shim_dir = shim_dir.filter(|path| !path.is_empty()).ok_or_else(|| {
-        "TEST_TRUST_SHIM_DIR must accompany TRUST_TARGO_TEST_NO_VERIFY".to_owned()
-    })?;
+    };
     let fixture_path = env::join_paths(
         std::iter::once(PathBuf::from(shim_dir))
             .chain(env::split_paths(&inherited_path.unwrap_or_default())),
@@ -1534,6 +1684,8 @@ fn configure_trust_cargo_fixture<C: TestEnvCommandExt>(
     // canonical private variables are reinstalled in this command's env map.
     // RUSTC_BOOTSTRAP itself remains available because upstream fixtures
     // intentionally inherit or override Rust's unstable-channel escape hatch.
+    // Preserve the parent's diagnostic-only TRUST_VANILLA_ANNOUNCED marker too;
+    // do not invent a value when absent or replace a fixture's later override.
     for key in inherited_keys {
         if is_bootstrap_shim_control_env(&key) {
             command = command.env_remove(&key);
@@ -1556,7 +1708,32 @@ mod trust_targo_test_isolation_tests {
 
     use cargo_util::ProcessBuilder;
 
-    use super::{configure_trust_cargo_fixture, is_bootstrap_shim_control_env};
+    use super::{
+        configure_trust_cargo_fixture, is_bootstrap_shim_control_env, rustc_fixture_command_for,
+        trust_cargo_fixture_directory,
+    };
+
+    #[test]
+    fn inherited_native_config_is_removed_but_fixture_override_survives() {
+        let mut command = cargo_util::ProcessBuilder::new("fixture");
+        configure_trust_cargo_fixture(
+            &mut command,
+            Some("1".into()),
+            Some("/fixture/bin".into()),
+            None,
+            ["TARGO_NET_OFFLINE".to_owned(), "TARGO_PKG_NAME".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(command.get_envs().get("TARGO_NET_OFFLINE"), Some(&None));
+        assert_eq!(command.get_envs().get("TARGO_PKG_NAME"), Some(&None));
+        command.env("TARGO_NET_OFFLINE", "false");
+        assert_eq!(
+            command.get_envs().get("TARGO_NET_OFFLINE"),
+            Some(&Some("false".into()))
+        );
+        command.env_remove("TARGO_NET_OFFLINE");
+        assert_eq!(command.get_envs().get("TARGO_NET_OFFLINE"), Some(&None));
+    }
 
     #[test]
     fn sweeps_bootstrap_mutation_controls_but_preserves_rustc_bootstrap_policy() {
@@ -1571,6 +1748,7 @@ mod trust_targo_test_isolation_tests {
             "TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY",
             "DUMP_BOOTSTRAP_SHIMS",
             "FORCE_ON_BROKEN_PIPE_KILL",
+            "__CARGO_RUSTC_BOOTSTRAP_WS_REMAP",
             "rustc_host_flags",
             "RuStDoC_lIbDiR",
             "trust_bootstrap_shim_no_verify",
@@ -1581,6 +1759,8 @@ mod trust_targo_test_isolation_tests {
         for key in [
             "RUSTC_BOOTSTRAP",
             "rustc_bootstrap",
+            "TRUST_VANILLA_ANNOUNCED",
+            "trust_vanilla_announced",
             "RUSTFLAGS",
             "TEST_RUSTC",
         ] {
@@ -1590,19 +1770,60 @@ mod trust_targo_test_isolation_tests {
     }
 
     #[test]
+    fn fixture_disclosure_marker_preserves_absence_and_exact_values() {
+        for value in [None, Some("0"), Some("1")] {
+            let mut command = ProcessBuilder::new("cargo");
+            if let Some(value) = value {
+                command.env("TRUST_VANILLA_ANNOUNCED", value);
+            } else {
+                command.env_remove("TRUST_VANILLA_ANNOUNCED");
+            }
+            configure_trust_cargo_fixture(
+                &mut command,
+                Some("1".into()),
+                Some(OsString::from("trust-shim-bin")),
+                None,
+                ["TRUST_VANILLA_ANNOUNCED".to_owned()],
+            )
+            .unwrap();
+            assert_eq!(
+                command.get_envs().get("TRUST_VANILLA_ANNOUNCED"),
+                Some(&value.map(OsString::from))
+            );
+
+            command.env("TRUST_VANILLA_ANNOUNCED", "fixture-value");
+            assert_eq!(
+                command.get_env("TRUST_VANILLA_ANNOUNCED"),
+                Some(OsString::from("fixture-value"))
+            );
+            command.env_remove("TRUST_VANILLA_ANNOUNCED");
+            assert_eq!(
+                command.get_envs().get("TRUST_VANILLA_ANNOUNCED"),
+                Some(&None)
+            );
+        }
+    }
+
+    #[test]
     fn fixture_wiring_is_explicit_complete_and_later_overridable() {
         let mut command = ProcessBuilder::new("cargo");
-        configure_trust_cargo_fixture(&mut command, false, None, None, std::iter::empty()).unwrap();
+        configure_trust_cargo_fixture(&mut command, None, None, None, std::iter::empty()).unwrap();
         assert!(!command.get_envs().contains_key("PATH"));
 
-        let err = configure_trust_cargo_fixture(&mut command, true, None, None, std::iter::empty())
-            .unwrap_err();
+        let err = configure_trust_cargo_fixture(
+            &mut command,
+            Some("1".into()),
+            None,
+            None,
+            std::iter::empty(),
+        )
+        .unwrap_err();
         assert!(err.contains("TEST_TRUST_SHIM_DIR"));
 
         let inherited_path = env::join_paths([PathBuf::from("existing-bin")]).unwrap();
         configure_trust_cargo_fixture(
             &mut command,
-            true,
+            Some("1".into()),
             Some(OsString::from("trust-shim-bin")),
             Some(inherited_path),
             ["rustc_host_flags".to_owned(), "TRUST_NO_VERIFY".to_owned()],
@@ -1629,6 +1850,143 @@ mod trust_targo_test_isolation_tests {
             command.get_env("PATH"),
             Some(OsString::from("deliberate-override"))
         );
+    }
+
+    #[test]
+    fn fixture_bundle_refuses_half_empty_and_nonexact_requests() {
+        assert_eq!(trust_cargo_fixture_directory(None, None).unwrap(), None);
+        for (marker, directory) in [
+            (Some("1"), None),
+            (None, Some("fixture-bin")),
+            (Some(""), Some("fixture-bin")),
+            (Some("0"), Some("fixture-bin")),
+            (Some("true"), Some("fixture-bin")),
+            (Some("1"), Some("")),
+        ] {
+            assert!(
+                trust_cargo_fixture_directory(
+                    marker.map(OsString::from),
+                    directory.map(OsString::from),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn direct_fixture_preserves_standalone_compiler_and_has_no_harness_policy() {
+        for rustc in [None, Some(OsString::from("caller-rustc"))] {
+            let command = rustc_fixture_command_for(
+                None,
+                None,
+                rustc.clone(),
+                None,
+                ["TRUST_NO_VERIFY".into()],
+            )
+            .unwrap();
+            assert_eq!(
+                command.get_program(),
+                rustc.as_deref().unwrap_or("trustc".as_ref())
+            );
+            assert_eq!(command.get_envs().count(), 0);
+            assert_eq!(command.get_args().count(), 0);
+            assert_eq!(command.get_current_dir(), None);
+        }
+    }
+
+    #[test]
+    fn direct_fixture_selects_isolated_shim_without_rerooting_or_overriding_authored_changes() {
+        let mut command = rustc_fixture_command_for(
+            Some("1".into()),
+            Some("fixture-bin".into()),
+            Some("ordinary-rustc".into()),
+            Some("existing-bin".into()),
+            [
+                "RUSTC_STAGE".into(),
+                "TRUST_VANILLA_ANNOUNCED".into(),
+                "RUSTC_BOOTSTRAP".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            command.get_program(),
+            PathBuf::from("fixture-bin").join(format!("rustc{}", env::consts::EXE_SUFFIX))
+        );
+        let values = command
+            .get_envs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(values[std::ffi::OsStr::new("RUSTC_STAGE")], None);
+        // The disclosure marker is inherited unchanged, not a compiler-policy override.
+        assert!(!values.contains_key(std::ffi::OsStr::new("TRUST_VANILLA_ANNOUNCED")));
+        for key in ["HOME", "CARGO_HOME", "RUSTC_BOOTSTRAP", "TRUST_NO_VERIFY"] {
+            assert!(!values.contains_key(std::ffi::OsStr::new(key)));
+        }
+        assert_eq!(command.get_current_dir(), None);
+        command
+            .arg("authored.rs")
+            .env("PATH", "authored-path")
+            .env("RUSTC_STAGE", "authored-stage");
+        let values = command
+            .get_envs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            values[std::ffi::OsStr::new("PATH")],
+            Some(std::ffi::OsStr::new("authored-path"))
+        );
+        assert_eq!(
+            values[std::ffi::OsStr::new("RUSTC_STAGE")],
+            Some(std::ffi::OsStr::new("authored-stage"))
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("authored.rs")]
+        );
+    }
+
+    #[test]
+    fn bootstrap_workspace_remap_is_removed_but_fixture_override_survives() {
+        let mut command = ProcessBuilder::new("cargo");
+        command.env(
+            "__CARGO_RUSTC_BOOTSTRAP_WS_REMAP",
+            "/rustc/bootstrap-parent",
+        );
+        configure_trust_cargo_fixture(
+            &mut command,
+            Some("1".into()),
+            Some(OsString::from("trust-shim-bin")),
+            None,
+            ["__CARGO_RUSTC_BOOTSTRAP_WS_REMAP".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(
+            command.get_envs().get("__CARGO_RUSTC_BOOTSTRAP_WS_REMAP"),
+            Some(&None)
+        );
+        command.env("__CARGO_RUSTC_BOOTSTRAP_WS_REMAP", "/rustc/fixture");
+        assert_eq!(
+            command.get_env("__CARGO_RUSTC_BOOTSTRAP_WS_REMAP"),
+            Some(OsString::from("/rustc/fixture"))
+        );
+        command.env_remove("__CARGO_RUSTC_BOOTSTRAP_WS_REMAP");
+        assert_eq!(
+            command.get_envs().get("__CARGO_RUSTC_BOOTSTRAP_WS_REMAP"),
+            Some(&None)
+        );
+    }
+}
+
+impl TestEnvCommandExt for &mut Command {
+    fn current_dir<S: AsRef<std::path::Path>>(self, path: S) -> Self {
+        Command::current_dir(self, path);
+        self
+    }
+    fn env<S: AsRef<std::ffi::OsStr>>(self, key: &str, value: S) -> Self {
+        Command::env(self, key, value);
+        self
+    }
+    fn env_remove(self, key: &str) -> Self {
+        Command::env_remove(self, key);
+        self
     }
 }
 

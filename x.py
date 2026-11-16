@@ -43,11 +43,134 @@ def _trust_preflight_config_args(argv, invocation_cwd):
     return forwarded
 
 
+def _trust_preflight_tool_args(argv, rust_dir):
+    """Only the exact standalone frontend recipe has a deferred source scope.
+
+    Unknown flags, compiler targets, mixed targets and install/dist remain full.
+    This is not a general preflight suppression switch.
+    """
+    import os
+    import re
+    # Trust: a normal full preparation must retain ordinary full preflight,
+    # even when it requests exactly this tool. A present but invalid deferred
+    # record is still sent to the validator and refused, never ignored.
+    marker = os.path.join(rust_dir, "build", "tool-source-preparation", "targo-build-tool.json")
+    if not os.path.lexists(marker):
+        return []
+    if (len(argv) == 6 and argv[:3] == ["build", "--stage", "1"]
+            and argv[3] == "-j" and re.fullmatch(r"[1-9][0-9]*", argv[4])
+            and argv[5] == "targo-build-tool"):
+        return ["--selected-tool", "targo-build-tool"]
+    return []
+
+
+# Trust: the obligatory source-manifest census needs stdlib tomllib. Select its
+# interpreter before preflight, seed extraction or acquisition of the build lease.
+def _trust_ensure_python():
+    import os
+    import sys
+
+    guard = "TRUST_XPY_PYTHON_REEXEC"
+    if sys.version_info >= (3, 11):
+        try:
+            import tomllib
+        except ImportError:
+            pass
+        else:
+            os.environ.pop(guard, None)
+            return
+    message = "x.py: Trust bootstrap requires Python 3.11 or newer with tomllib; install one and retry."
+    if os.environ.get(guard) == "1" or sys.version_info < (3, 5):
+        raise SystemExit(message)
+
+    import shutil
+    import subprocess
+
+    flags = []
+    for name, option in (("dont_write_bytecode", "B"), ("isolated", "I"), ("no_site", "S"),
+                         ("ignore_environment", "E"), ("no_user_site", "s"), ("optimize", "O"),
+                         ("debug", "d"), ("verbose", "v"), ("bytes_warning", "b"), ("quiet", "q")):
+        count = getattr(sys.flags, name, 0)
+        if count:
+            flags.append("-" + option * count)
+    if getattr(sys.stdout, "write_through", False):
+        flags.append("-u")
+    for option in sys.warnoptions:
+        flags.extend(["-W", option])
+    for name, value in getattr(sys, "_xoptions", {}).items():
+        flags.extend(["-X", name if value is True else "%s=%s" % (name, value)])
+
+    candidates = [(name, []) for name in ("python3.14", "python3.13", "python3.12", "python3.11",
+                                        "python3", "python")]
+    if os.name == "nt":
+        candidates.append(("py", ["-3"]))
+    for name, prefix in candidates:
+        path = shutil.which(name)
+        if path is None:
+            continue
+        try:
+            probe = subprocess.run([path] + prefix + ["-I", "-S", "-c",
+                                   "import sys, tomllib; raise SystemExit(sys.version_info < (3, 11))"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=5)
+            if probe.returncode == 0:
+                os.environ[guard] = "1"
+                os.execv(path, [path] + prefix + flags + sys.argv)
+        except (OSError, subprocess.TimeoutExpired):
+            os.environ.pop(guard, None)
+    raise SystemExit(message)
+
+def _trust_namespace_guard(root, descriptor):
+    """Cold-bootstrap syscall compatibility for the inherited facade FD only."""
+    import fcntl
+    import os
+    import stat
+    import time
+
+    fd = int(descriptor)
+    if fd < 3:
+        raise ValueError("invalid namespace guard descriptor")
+    path = os.path.join(os.path.realpath(root), ".trust-build-lock.guard")
+
+    def validate():
+        opened, named = os.fstat(fd), os.lstat(path)
+        if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(named.st_mode)
+                or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+                or opened.st_nlink != 1 or named.st_nlink != 1
+                or opened.st_uid != os.geteuid() or opened.st_mode & 0o022
+                or opened.st_size != 0):
+            raise ValueError("namespace guard must be the persistent owned regular inode")
+
+    validate()
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("build namespace guard is busy")
+            time.sleep(0.01)
+    validate()
+    # No LOCK_UN: the facade retains this same open description after exit.
+
+
 if __name__ == "__main__":
     import os
     import sys
     import warnings
     from inspect import cleandoc
+
+    if sys.argv[1:2] == ["--trust-build-lock-guard"]:
+        try:
+            if len(sys.argv) != 4:
+                raise ValueError("expected root and inherited descriptor")
+            _trust_namespace_guard(sys.argv[2], sys.argv[3])
+            print("trust-build-namespace-held-v1")
+        except Exception as error:
+            sys.stderr.write("x.py: build namespace guard: %s\n" % error)
+            sys.exit(2)
+        sys.exit(0)
 
     major = sys.version_info.major
     minor = sys.version_info.minor
@@ -65,6 +188,9 @@ if __name__ == "__main__":
             except OSError:
                 # Python 3 isn't available, fall back to python 2
                 pass
+
+    # Trust: native bootstrap's dependency census must not inherit an old python3.
+    _trust_ensure_python()
 
     # soft deprecation of old python versions
     skip_check = os.environ.get("RUST_IGNORE_OLD_PYTHON") == "1"
@@ -158,7 +284,8 @@ if __name__ == "__main__":
         if os.name != "nt" and os.path.isfile(script_sh) and os.path.exists("/bin/sh"):
             cmd = ["/bin/sh", script_sh]
         elif os.path.isfile(script_py):
-            cmd = [sys.executable, script_py]
+            # Trust: preflight needs only stdlib; preserve startup isolation.
+            cmd = [sys.executable, "-I", "-S", script_py]
         else:
             return  # no checker in this tree; not a reason to refuse to build
 
@@ -171,6 +298,7 @@ if __name__ == "__main__":
         cmd += ["--for-build", "--verdict-file", verdict_path,
                 "--deep" if sub in deep else "--deep-if-cached"]
         cmd += _trust_preflight_config_args(argv, os.getcwd())
+        cmd += _trust_preflight_tool_args(argv, rust_dir)
         env = dict(os.environ)
         env["TRUST_PREFLIGHT_ACTIVE"] = "1"
 
@@ -240,83 +368,110 @@ if __name__ == "__main__":
                 % rc
             )
 
-    # Trust: BUILD-TREE MUTUAL EXCLUSION (scripts/trust_build_lock.sh).
-    #
-    # The build tree is a single exclusive resource shared by every lane, and a
-    # measurement sweep reading `stage1/bin/rustc` cannot survive a build, because
-    # `x.py build` deletes that binary at start. Measured in one session,
-    # 2026-08-20: four destroyed measurement runs, one of them 4m27s in.
-    #
-    # THE ASYMMETRY. Lanes were told to check for a running BUILD before building.
-    # Nobody checked for a running MEASUREMENT before building, so the sweep side
-    # published an advisory sentinel that nothing was obliged to read. A wait is
-    # not a lock. This is the other half: the SAME lock the sweep takes, taken
-    # here, held for the whole build, released on every exit path.
-    #
-    # WHY HERE. `x.py` is the one choke point every entry point funnels through --
-    # `x`, `x.ps1` and `python3 x.py` alike -- and, decisively, it is what
-    # `scripts/hooks/pre-push` runs when it invokes `x.py check --stage 1`. A PUSH
-    # IS A BUILD for interlock purposes, and putting the lock here means there is
-    # no second place to remember that. bootstrap.py would also work and is merged
-    # from upstream constantly; this file already carries a Trust block, so the
-    # merge surface is one hunk instead of two.
-    #
-    # FAIL-SAFE ABOUT ITSELF, FAIL-CLOSED ABOUT ITS VERDICT -- the same split the
-    # preflight above uses. A missing, crashing or hanging lock script lets the
-    # build proceed with a warning, because a guard that can brick x.py gets
-    # deleted and takes its real findings with it. Only exit code 3, the script's
-    # explicit REFUSED contract, stops a build.
+    # Trust: cold Bootstrap construction must share the same native build-tree
+    # manager as the compiled child and measurements. Ownership, recovery,
+    # waiting and writer discovery are implemented only by the native manager.
     _lock_token = [None]
+    _lock_frontend = [None]
+
+    def _trust_build_lock_frontend(rust_dir):
+        import shutil
+        import subprocess
+
+        if _lock_frontend[0] is not None:
+            return _lock_frontend[0]
+        candidates = []
+        selected_manager = os.environ.get("TRUST_BUILD_TREE_MANAGER_TARGO")
+        if selected_manager is not None:
+            if (not os.path.isabs(selected_manager)
+                    or os.path.realpath(selected_manager) != selected_manager
+                    or not os.path.isfile(selected_manager)
+                    or not os.access(selected_manager, os.X_OK)):
+                raise RuntimeError("explicit build-tree manager must be a physical executable path")
+            candidates.append([selected_manager, "trust", "repo", "lock"])
+        else:
+            # Trust: this tree's own Bootstrap first: the one bootstrap.py
+            # builds under the lease, then the one scripts/build-tree-manager.sh
+            # builds for a tree that has none yet (FRESH-TREE-LOCK-FRONTEND-1).
+            # That script compiles the same Bootstrap source with an installed
+            # Trust Targo, before any x.py run and outside build/, so a fresh
+            # tree gets its native owner without x.py constructing anything.
+            for executable in (
+                os.path.join(rust_dir, "build", "bootstrap", "debug", "bootstrap"),
+                os.path.join(rust_dir, "build", "bootstrap", "release", "bootstrap"),
+                os.path.join(rust_dir, "build-tree-manager.noindex", "debug", "bootstrap"),
+            ):
+                if os.path.isfile(executable) and os.access(executable, os.X_OK):
+                    candidates.append([executable, "--trust-build-tree-lock"])
+            targo = shutil.which("targo")
+            if targo is not None:
+                candidates.append([targo, "trust", "repo", "lock"])
+        for command in candidates:
+            try:
+                probe = subprocess.run(
+                    command + ["--protocol"], cwd=rust_dir, timeout=10,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if probe.returncode == 0 and probe.stdout == b"trust-build-tree-manager-v2\n":
+                _lock_frontend[0] = command
+                return command
+        if selected_manager is not None:
+            raise RuntimeError("explicit build-tree manager refused protocol v2; no fallback")
+        # Trust: current Targo embeds this native owner before project/sidecar
+        # resolution, including for a fresh source tree with no Bootstrap yet.
+        # Never build a second administrative helper from a Python fallback:
+        # x.py refuses here, before any build-tree write, and names the
+        # explicit step that builds this tree's own Bootstrap instead.
+        raise RuntimeError(
+            "native build-tree manager v2 is unavailable; use current Targo or current Bootstrap "
+            "(a tree with no Bootstrap yet: run scripts/build-tree-manager.sh, which builds this "
+            "tree's own Bootstrap with the installed Targo outside build/)"
+        )
 
     def _trust_build_lock_acquire(rust_dir, argv):
         import subprocess
 
-        # Not a build: `fmt`, `setup`, `vendor`, `--help`. `clean` IS in the list
-        # -- it deletes the very stage1 binary a sweep is measuring.
-        lockish = frozenset((
-            "build", "b", "check", "c", "clippy", "fix", "doc", "d",
-            "test", "t", "miri", "bench", "run", "r", "dist", "install", "clean",
-        ))
-        sub = None
-        for arg in argv:
-            if arg == "--":
-                break
-            if arg in lockish:
-                sub = arg
-                break
-        if sub is None:
+        # Every real request can construct Bootstrap before Rust parses its
+        # command kind. Protect that construction, including a bare default
+        # build; the compiled child classifies commands using its typed parser.
+        if argv in (["--help"], ["-h"], ["--version"], ["-V"]):
             return
 
-        script = os.path.join(rust_dir, "scripts", "trust_build_lock.sh")
-        if not os.path.isfile(script) or not os.path.exists("/bin/sh"):
-            return  # no lock in this tree; not a reason to refuse to build
+        frontend = _trust_build_lock_frontend(rust_dir)
+        if os.environ.get("TRUST_BUILD_LOCK_BREAK"):
+            raise RuntimeError(
+                "build-tree recovery requires explicit `targo trust repo lock break --reason TEXT`"
+            )
 
         # A nested x.py (bootstrap's own test suite shells out to one) inherits
         # this and must not block on its own parent. The lock verifies the token
         # against what is actually on disk rather than believing the variable.
-        cmd = [
-            "/bin/sh", script, "acquire", "--kind", "build",
+        inherited_token = os.environ.get("TRUST_BUILD_LOCK_TOKEN")
+        cmd = frontend + [
+            "acquire", "--repo-root", rust_dir, "--kind", "build",
             "--purpose", "x.py %s" % " ".join(argv[:6]),
             "--pid", str(os.getpid()),
             "--wait", os.environ.get("TRUST_BUILD_LOCK_WAIT", "0"),
             "--contract", "a build is rewriting stage1/; do not measure against it",
         ]
-        reason = os.environ.get("TRUST_BUILD_LOCK_BREAK", "")
-        if reason:
-            cmd += ["--break", "--reason", reason]
-
+        proc = None
         try:
             # stderr is inherited so the refusal streams to the terminal as it is
             # produced; stdout carries only the token.
-            proc = subprocess.Popen(cmd, cwd=rust_dir, stdout=subprocess.PIPE)
+            proc = subprocess.Popen(cmd, cwd=rust_dir, stdout=subprocess.PIPE, close_fds=False)
             out, _ = proc.communicate(timeout=86400)
             rc = proc.returncode
         except Exception as _e:
+            if proc is not None:
+                proc.kill()
+                proc.wait()
             sys.stderr.write(
-                "x.py: build lock did not run (%s: %s) -- continuing UNLOCKED.\n"
+                "x.py: build lock did not run (%s: %s) -- refusing unlocked build.\n"
                 % (_e.__class__.__name__, _e)
             )
-            return
+            sys.exit(1)
 
         if rc == 3:
             sys.stderr.write(
@@ -326,12 +481,48 @@ if __name__ == "__main__":
         token = (out or b"").decode("utf-8", "replace").strip()
         if rc != 0 or not token:
             sys.stderr.write(
-                "x.py: build lock did not reach a verdict (exit %s) -- continuing\n"
-                "      UNLOCKED. This is NOT a finding about the tree.\n" % rc
+                "x.py: build lock failed (exit %s) -- refusing unlocked build.\n" % rc
             )
-            return
-        _lock_token[0] = token
+            sys.exit(1)
+        # Trust: a validated inherited token remains the parent's lock. Only a
+        # fresh acquisition owns a release; retain existing ownership on reentry.
+        if token != inherited_token:
+            _lock_token[0] = token
         os.environ["TRUST_BUILD_LOCK_TOKEN"] = token
+        if token != inherited_token:
+            _trust_incremental_reclaim(rust_dir, frontend)
+
+    def _trust_incremental_reclaim(rust_dir, frontend):
+        # Trust: keep the former acquisition hook as a thin native-command
+        # caller. Selection, thresholds, locks and deletion live in Rust.
+        # Redirect all standard streams: token delivery must not wait for the
+        # background deletion's inherited output pipes to close.
+        import glob
+        import subprocess
+
+        if not glob.glob(os.path.join(rust_dir, "crates", "target*", "debug")):
+            return
+        try:
+            protocol = subprocess.run(
+                frontend + ["reclaim-incremental", "--protocol"],
+                cwd=rust_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                close_fds=False, timeout=30,
+            )
+            if protocol.returncode != 0 or protocol.stdout.strip() != b"trust-incremental-reclamation-v1":
+                return
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(os.path.join(rust_dir, ".trust-build-lock.reclaim.log"), flags, 0o600)
+            with os.fdopen(descriptor, "ab") as log:
+                subprocess.Popen(
+                    frontend + ["reclaim-incremental", "--repo-root", rust_dir, "--apply", "--quiet"],
+                    cwd=rust_dir, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True, close_fds=False,
+                )
+        except (OSError, subprocess.SubprocessError):
+            # Optional cache maintenance never releases or bypasses the actual
+            # acquired build-tree holder. An older native frontend may lack it.
+            pass
 
     def _trust_build_lock_release(*_a):
         token = _lock_token[0]
@@ -342,10 +533,9 @@ if __name__ == "__main__":
 
         try:
             subprocess.run(
-                ["/bin/sh", os.path.join(rust_dir, "scripts", "trust_build_lock.sh"),
-                 "release", token],
+                _lock_frontend[0] + ["release", token, "--repo-root", rust_dir],
                 cwd=rust_dir, timeout=60,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=False,
             )
         except Exception:
             pass  # a leaked lock is reclaimable by pid; a crash here is not
@@ -359,7 +549,9 @@ if __name__ == "__main__":
     # channel.rs) never asks whether the working tree was clean at that commit,
     # so an artifact built from a tree carrying uncommitted work is stamped with
     # the commit the work was not yet in. That is the NORMAL state of an active
-    # compiler checkout, not an exception.
+    # compiler checkout, not an exception. (That holds for stage 2, which is what
+    # promote seals. A dev stage-1 build names its sources instead, uncommitted
+    # work included: src/bootstrap/src/utils/trust_source_identity.rs, TB1.)
     #
     # MEASURED, 2026-08-31. `~/toolchains/trust-3ae9948d` reports commit
     # `3ae9948d1f3f...`; `945a8fbff5` (the elision-prefix soundness fix) is NOT
@@ -393,164 +585,67 @@ if __name__ == "__main__":
     # (`git status` is ~1.4s in this repo, ~3.2s counting untracked files); a
     # `check`/`test`/`fmt` run stamps nothing, because it seals nothing.
     #
-    # FAIL-SAFE, ALWAYS. This records evidence; it never blocks. Every failure
-    # path leaves NO record, and no record is a verdict promote knows how to
-    # report (`UNVERIFIED-PROVENANCE`) rather than a green it can mistake for
-    # one. A stamp that can brick x.py would be deleted within the week.
-    _prov = {"path": None, "start_fp": None, "done": False}
-
-    def _trust_prov_git(rust_dir, args, timeout=120):
-        """Run a git command, returning stdout or None. Never raises."""
-        import subprocess
-
-        try:
-            proc = subprocess.run(
-                ["git"] + args, cwd=rust_dir, timeout=timeout,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            return None
-        if proc.returncode != 0:
-            return None
-        return proc.stdout.decode("utf-8", "replace")
-
-    def _trust_prov_facts(rust_dir):
-        """The build tree's state, as facts rather than as a name.
-
-        Returns (fields, status_text) or (None, None). `diff_sha256` digests the
-        actual uncommitted content (`git diff HEAD --binary`, so it covers staged
-        and unstaged tracked edits including binary ones); `status_sha256`
-        digests the porcelain listing, which is what carries UNTRACKED files --
-        a new .rs file compiles into the artifact and appears in no diff.
-        """
-        import hashlib
-
-        head = _trust_prov_git(rust_dir, ["rev-parse", "HEAD"])
-        if not head:
-            return None, None
-        head = head.strip()
-        status = _trust_prov_git(rust_dir, ["status", "--porcelain", "-uall"])
-        diff = _trust_prov_git(rust_dir, ["diff", "HEAD", "--binary"])
-        subs = _trust_prov_git(rust_dir, ["submodule", "status"])
-        if status is None or diff is None:
-            return None, None
-
-        def _sha(text):
-            return hashlib.sha256(
-                text.encode("utf-8", "replace") if isinstance(text, str) else text
-            ).hexdigest()
-
-        lines = [ln for ln in status.splitlines() if ln.strip()]
-        untracked = sum(1 for ln in lines if ln.startswith("??"))
-        fields = {
-            "head": head,
-            "head_short": (_trust_prov_git(rust_dir, ["rev-parse", "--short=9", "HEAD"])
-                           or head[:9] + "\n").strip(),
-            "tree_state": "clean" if not lines else "dirty",
-            "dirty_tracked": str(len(lines) - untracked),
-            "dirty_untracked": str(untracked),
-            "diff_sha256": _sha(diff),
-            "status_sha256": _sha(status),
-            "submodule_sha256": _sha(subs or ""),
-        }
-        # One value that changes if ANY of the above changes, so a comparison
-        # between two builds is a single string compare.
-        fields["tree_fingerprint"] = _sha(
-            "%(head)s\n%(diff_sha256)s\n%(status_sha256)s\n%(submodule_sha256)s\n"
-            % fields
-        )
-        return fields, (status + ("\n--- submodules ---\n" + (subs or "")))
+    # Trust: v2 records explicit recursive scope. Census failure leaves an
+    # incomplete record; inability to invalidate an old completed record stops
+    # the build, because otherwise new output could inherit stale provenance.
+    _prov = {"owner": None}
 
     def _trust_build_provenance_stamp(rust_dir, argv):
-        import time
-
-        # Only what can produce a stage2. `check`/`test`/`clippy` compile, but
-        # they seal nothing, so they must not pay ~3s of `git status`.
+        # Trust: only build-producing commands own a record. Invalidate a prior
+        # completed record before any fallible census; an unrecorded new build
+        # must never inherit its predecessor's source authority.
         buildish = frozenset(("build", "b", "dist", "install"))
-        sub = None
-        for arg in argv:
-            if arg == "--":
+        selected = False
+        for argument in argv:
+            if argument == "--":
                 break
-            if arg in buildish:
-                sub = arg
+            if argument in buildish:
+                selected = True
                 break
-        if sub is None:
+        if not selected or os.environ.get("TRUST_PREFLIGHT_ACTIVE") == "1":
             return
-        if os.environ.get("TRUST_PREFLIGHT_ACTIVE") == "1":
-            return  # nested x.py; the outer invocation owns the record
-
-        fields, status_text = _trust_prov_facts(rust_dir)
-        if fields is None:
-            return  # not a git tree, or git failed -- leave NO record
-
-        build_dir = os.environ.get("TRUST_BUILD_PROVENANCE_DIR") or os.path.join(
-            rust_dir, "build"
-        )
         try:
-            os.makedirs(build_dir, exist_ok=True)
-        except OSError:
-            return
-        path = os.path.join(build_dir, "trust-build-provenance")
+            from pathlib import Path
 
-        now = time.time()
-        head_lines = [
-            "# Trust build-tree provenance, written by x.py at build START.",
-            "# It records what the COMPILER'S OWN version string cannot: whether",
-            "# the tree was clean at the commit the binary will name. Read by",
-            "# scripts/promote-toolchain.sh; see docs/TOOLCHAIN_POSTURE.md 2a.",
-            "record_version=1",
-            "record_kind=build-stamp",
-            "started_at=%d" % int(now),
-            "started_at_iso=%s" % time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
-            "repo=%s" % rust_dir,
-            "argv=%s" % " ".join(argv[:12]).replace("\n", " "),
-        ]
-        for key in ("head", "head_short", "tree_state", "dirty_tracked",
-                    "dirty_untracked", "diff_sha256", "status_sha256",
-                    "submodule_sha256", "tree_fingerprint"):
-            head_lines.append("%s=%s" % (key, fields[key]))
-        try:
-            with open(path, "w") as fh:
-                fh.write("\n".join(head_lines) + "\n")
-            with open(path + ".status", "w") as fh:
-                fh.write(status_text or "")
-        except OSError:
-            return
+            # The record writer lives in this checkout's scripts/ package. A plain
+            # `python x.py` finds it through sys.path[0] (x.py's directory); an
+            # isolated interpreter (`python -I`, as scripts/mint_and_prove_seed.sh
+            # runs x.py) puts no script directory on sys.path, so name the
+            # checkout explicitly, as the `import bootstrap` below does for
+            # src/bootstrap. Measured 2026-10-09: the first real mint stopped here
+            # with "No module named 'scripts'".
+            if rust_dir not in sys.path:
+                sys.path.insert(0, rust_dir)
+            from scripts.lib.trust_build_provenance import BuildStamp
 
-        _prov["path"] = path
-        _prov["start_fp"] = fields["tree_fingerprint"]
+            directory = os.environ.get("TRUST_BUILD_PROVENANCE_DIR") or os.path.join(
+                rust_dir, "build"
+            )
+            owner = BuildStamp(Path(rust_dir), Path(directory), list(argv))
+        except Exception as error:
+            raise SystemExit(
+                "x.py: cannot invalidate the previous build provenance record; "
+                "refusing to build with possible stale authority: %s" % error
+            )
+        _prov["owner"] = owner
+        fields = owner.start()
         if fields["tree_state"] == "dirty":
             sys.stderr.write(
-                "x.py: NOTE -- building from a DIRTY tree at %s.\n"
-                "      %s tracked + %s untracked change(s). The compiler will still\n"
-                "      stamp itself `%s`, so the artifact's name will NOT describe\n"
-                "      what was compiled. Recorded in build/trust-build-provenance;\n"
-                "      a seal made from it is marked BUILD-STAMPED-DIRTY, not clean.\n"
-                % (fields["head_short"], fields["dirty_tracked"],
-                   fields["dirty_untracked"], fields["head_short"])
+                "x.py: NOTE -- building from a DIRTY recursive source tree at %s.\n"
+                "      %s tracked + %s untracked Git-status entries across repositories.\n"
+                "      The build stamp records this as dirty, never clean.\n"
+                % (fields["head_short"], fields["dirty_tracked"], fields["dirty_untracked"])
             )
 
     def _trust_build_provenance_finish(status="unknown"):
-        """Re-read the tree at build END and append the outcome. Idempotent."""
-        import time
-
-        if _prov["done"] or not _prov["path"]:
-            return
-        _prov["done"] = True
-        try:
-            fields, _ = _trust_prov_facts(rust_dir)
-            end_fp = fields["tree_fingerprint"] if fields else "unreadable"
-            changed = "unknown"
-            if fields:
-                changed = "no" if end_fp == _prov["start_fp"] else "YES"
-            with open(_prov["path"], "a") as fh:
-                fh.write(
-                    "completed_at=%d\nexit_status=%s\n"
-                    "end_tree_fingerprint=%s\ntree_changed_during_build=%s\n"
-                    % (int(time.time()), status, end_fp, changed)
-                )
-        except Exception:
-            pass  # a truncated record reads as UNVERIFIED, which is the safe verdict
+        owner = _prov["owner"]
+        if owner is not None:
+            try:
+                owner.finish(status)
+            except Exception:
+                # The atomic start-only record stays incomplete on failure.
+                # It cannot become completed clean evidence by truncation.
+                pass
 
     try:
         _trust_build_lock_acquire(rust_dir, sys.argv[1:])
@@ -558,11 +653,12 @@ if __name__ == "__main__":
         raise
     except KeyboardInterrupt:
         raise
-    except Exception as _e:  # never let the guard itself break the build
+    except Exception as _e:
         sys.stderr.write(
-            "x.py: build lock hook error (%s: %s) -- continuing UNLOCKED.\n"
+            "x.py: build lock hook error (%s: %s) -- refusing unlocked build.\n"
             % (_e.__class__.__name__, _e)
         )
+        sys.exit(1)
 
     try:
         _trust_preflight(rust_dir, sys.argv[1:])
@@ -582,10 +678,13 @@ if __name__ == "__main__":
     # record claiming to describe one.
     try:
         _trust_build_provenance_stamp(rust_dir, sys.argv[1:])
-    except Exception as _e:  # never let the stamp itself break the build
+    except SystemExit:
+        _trust_build_lock_release()
+        raise
+    except Exception as _e:  # incomplete evidence cannot qualify a later seal
         sys.stderr.write(
             "x.py: build provenance stamp error (%s: %s) -- continuing WITHOUT a\n"
-            "      provenance record. A seal made from this build will be marked\n"
+            "      usable provenance record. A seal made from this build is\n"
             "      UNVERIFIED-PROVENANCE.\n" % (_e.__class__.__name__, _e)
         )
 

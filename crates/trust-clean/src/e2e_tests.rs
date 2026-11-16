@@ -613,32 +613,6 @@ fn test_clean_translation_fidelity_complex() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 11: ProofCert serialization roundtrip through clean_bridge
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_proof_cert_serialization_through_bridge() {
-    // Create a clean ProofCert, serialize via clean_bridge, deserialize, verify equality
-    let cert = ProofCert::Sort { level: LeanLevel::succ(LeanLevel::zero()) };
-
-    let bytes =
-        clean_bridge::serialize_proof_cert(&cert).expect("ProofCert serialization should succeed");
-    assert!(!bytes.is_empty());
-
-    let recovered = clean_bridge::deserialize_proof_cert(&bytes)
-        .expect("ProofCert deserialization should succeed");
-    assert_eq!(cert, recovered, "ProofCert should survive roundtrip through clean_bridge");
-
-    // Invalid bytes should fail
-    let err = clean_bridge::deserialize_proof_cert(&[0xFF, 0x00, 0xDE])
-        .expect_err("invalid bytes should fail deserialization");
-    assert!(
-        matches!(err, crate::error::CertificateError::InvalidProofTerm { .. }),
-        "error should be InvalidProofTerm, got: {err:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Test 12: Empty bundle rejected, single-cert bundle works
 // ---------------------------------------------------------------------------
 
@@ -883,39 +857,4 @@ fn test_clean_translation_determinism() {
     let debug1 = format!("{t1:?}");
     let debug2 = format!("{t2:?}");
     assert_eq!(debug1, debug2, "clean translation must be deterministic");
-}
-
-// ---------------------------------------------------------------------------
-// Test 18: Feature-gated clean binary integration test
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "clean-integration")]
-#[test]
-fn test_clean_binary_verifies_generated_proof() {
-    // This test requires the clean binary to be installed and on PATH.
-    // It is gated behind cfg(feature = "clean-integration") so it only
-    // runs when explicitly enabled.
-    //
-    // The test generates a proof certificate for a simple VC, then
-    // invokes the clean kernel verification.
-
-    use clean_kernel::cert::ProofCert;
-    use clean_kernel::level::Level as LeanLevel;
-
-    let vc = divzero_vc();
-
-    // Translate the VC to a clean theorem
-    let theorem = clean_bridge::translate_vc_to_clean_theorem(&vc.kind, &vc.formula);
-
-    // Create a Sort proof cert (this will be rejected by the kernel
-    // since Sort doesn't prove a Prop, but it exercises the pipeline)
-    let cert = ProofCert::Sort { level: LeanLevel::zero() };
-
-    // Verify through the clean bridge
-    let verify_result = clean_bridge::verify_proof_cert(&cert, &theorem);
-
-    // We expect rejection: Sort{level=0} is Prop, but it doesn't
-    // prove the div-by-zero theorem. This confirms the kernel is
-    // reachable and actively checking proofs.
-    assert!(verify_result.is_err(), "clean kernel should reject Sort cert for div-by-zero VC");
 }

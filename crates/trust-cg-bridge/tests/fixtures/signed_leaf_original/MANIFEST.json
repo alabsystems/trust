@@ -1,0 +1,9 @@
+{
+  "scope": "Immutable original v1 packet from real b8 full-eight compiler capture; never rewritten to v2",
+  "provider_report": "<home>/trust-signed-o0-kernel-20261105-nfu/qualification-6/instances/certificates.json",
+  "provider_report_sha256": "21865b9cbca20684328bfd9b80830a7b1be41f25b855a3aa80a873bb8ed0cdcb",
+  "object_sha256": "6f730f51bd83601d193a141525e57bc57524eb4ca3f3a8d4e8c5ba543eb44742",
+  "symbol": "trust_c_i8_store",
+  "fixture": "store-i8-v1.json",
+  "fixture_sha256": "2374beb7e999459900575aacd2a122abb850a13207d1f679ade64835533d469a"
+}

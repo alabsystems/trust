@@ -3,14 +3,15 @@ use crate::command_prelude::*;
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::format_err;
-use cargo::CargoResult;
-use cargo::core::{GitReference, SourceId, Workspace};
-use cargo::ops;
-use cargo::util::IntoUrl;
-use cargo::util::VersionExt;
 use cargo_util_schemas::manifest::PackageName;
+use cargo_util_schemas::manifest::ProfileName;
 use itertools::Itertools;
 use semver::VersionReq;
+use targo::CargoResult;
+use targo::ops;
+use targo::util::IntoUrl;
+use targo::util::VersionExt;
+use targo::workspace::{GitReference, SourceId, Workspace};
 
 use cargo_util::paths;
 
@@ -92,15 +93,13 @@ pub fn cli() -> Command {
         .arg_features()
         .arg_parallel()
         .arg(
-            flag(
-                "debug",
-                "Build in debug mode (with the 'dev' profile) instead of release mode",
-            )
-            .conflicts_with("profile"),
+            flag("debug", "Build in debug mode instead of release mode")
+                .conflicts_with("profile")
+                .help_heading(heading::COMPILATION_OPTIONS),
         )
         .arg_redundant_default_mode("release", "install", "debug")
         .arg_profile("Install artifacts with the specified profile")
-        .arg_target_triple("Build for the target triple")
+        .arg_target_tuple("Build for the target tuple")
         .arg_target_dir()
         .arg_timings()
         // Trust: the footer names the binary the user actually invoked; see
@@ -226,8 +225,13 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
         ProfileChecking::Custom,
     )?;
 
+    let default_profile = gctx.get::<Option<ProfileName>>(["install", "profile"])?;
+    let default_profile = default_profile
+        .as_ref()
+        .map(|p| p.as_ref())
+        .unwrap_or_else(|| "release");
     compile_opts.build_config.requested_profile =
-        args.get_profile_name("release", ProfileChecking::Custom)?;
+        args.get_profile_name(default_profile, ProfileChecking::Custom)?;
     if args.dry_run() {
         gctx.cli_unstable().fail_if_stable_opt("--dry-run", 11123)?;
     }

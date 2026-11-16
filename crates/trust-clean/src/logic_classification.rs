@@ -9,6 +9,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use trust_types::logic_lattice::Theories;
 use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
@@ -263,75 +264,156 @@ pub fn scope_from_logic(logic: &SmtLogic) -> CertificationScope {
 }
 
 // ---------------------------------------------------------------------------
-// Formula feature flags (internal)
-// ---------------------------------------------------------------------------
-
-/// Internal feature flags collected during formula traversal.
-#[derive(Debug, Default)]
-struct FormulaFeatures {
-    has_quantifiers: bool,
-    has_bitvectors: bool,
-    has_arrays: bool,
-    has_nonlinear_arith: bool,
-    has_int_arithmetic: bool,
-    has_int_vars: bool,
-    has_bool_vars: bool,
-    has_uninterpreted: bool,
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Classify a formula into its SMT logic fragment.
 ///
-/// Traverses the formula tree, collecting feature flags, then maps the
-/// combination of features to the most specific SMT logic.
+/// # ONE FEATURE RECORD, SHARED WITH EVERY OTHER SMT LANE
+///
+/// The theory dimensions come from
+/// [`trust_types::logic_lattice::formula_theories`] — the same record the
+/// `(set-logic …)` selectors in `trust_types::smt_logic` and trust-router's
+/// `smt2_export` read, walked over the same sort-position inventory the
+/// declaration emitters use. This function used to own a THIRD private
+/// `FormulaFeatures` struct and a THIRD early-return cascade, and it carried the
+/// defect that shape produces, in its most dangerous form:
+///
+/// * `collect_features` ended in `_ => {}`, so EVERY floating-point node, every
+///   `Rat` (real) literal, every datatype `Ctor`/`Sel`/`IsCtor`, every
+///   `Pred`/`FnApp` application and every interned `SymVar` contributed NOTHING.
+/// * The cascade's fall-through was `QF_UF` — a CERTIFIABLE fragment.
+///
+/// So a floating-point obligation, a real-arithmetic obligation and a datatype
+/// obligation all classified as `QF_UF` and were handed
+/// `CertificationStrategy::FullCertification`: the pipeline claimed full clean
+/// kernel certification for three theories the Alethe replay engine does not
+/// reconstruct at all. (Compare the M1 defect in the logic-line selectors,
+/// which was the same blindness pointing the other way — a logic line too
+/// NARROW for the transcript. Here the blindness pointed at the trust root.)
+///
+/// The record below is total over `Formula`, so the fall-through is gone.
+/// Anything the certifiable fragment does not cover now reaches
+/// [`SmtLogic::Unknown`] or a partial-certification fragment, never `QF_UF` by
+/// omission.
+///
+/// # LINEARITY now comes from the shared record too
+///
+/// This crate used to detect nonlinearity itself, because the shared record had
+/// no linearity dimension — a gap `trust_types::logic_lattice` pinned as a
+/// failing-by-documentation test. That dimension now exists
+/// (`Theories::NONLINEAR`, set by the same `node_theories` every SMT lane
+/// reads), so the private detector is gone and this cascade reads the shared
+/// bit.
+///
+/// THE SWITCH IS STRICTLY MORE CONSERVATIVE HERE, which is the only direction
+/// a certification SCOPE may move on its own. The private detector asked
+/// "does each operand CONTAIN a variable", which UNDER-approximates:
+/// `Mul(x, FnApp(f, [Int(1)]))` is `(* x (f 1))` — genuinely nonlinear, with no
+/// `Var` in the second operand — and was classified as certifiable. The shared
+/// bit asks "is each operand a numeric LITERAL", which over-approximates, and
+/// every formula the old rule called nonlinear the new one does too (a term
+/// containing a variable is not a literal). So the set of obligations reaching
+/// `SmtLogic::Unknown` can only GROW: fewer full-certification claims, never
+/// more.
+///
+/// # The one dimension this crate still keeps of its own
+///
+/// * **BOOLEAN VARIABLES.** A free `Bool` variable needs no theory — every
+///   SMT-LIB logic admits it, so the shared record deliberately ignores it —
+///   but propositional structure is what distinguishes this crate's
+///   `QF_LIA+UF` scope from plain `QF_LIA`. Unlike the old walker, `SymVar` is
+///   counted too.
 #[must_use]
 pub fn classify_formula(formula: &Formula) -> SmtLogic {
-    let mut features = FormulaFeatures::default();
-    collect_features(formula, &mut features);
+    let theories = trust_types::logic_lattice::formula_theories(formula);
+    let extras = CleanExtras::of(formula);
 
-    // Quantifiers → Full logic
-    if features.has_quantifiers {
-        return SmtLogic::Full;
-    }
-
-    // Bitvectors → QF_BV (even if combined with other features)
-    if features.has_bitvectors {
-        return SmtLogic::QfBv;
-    }
-
-    // Arrays → QF_AUFLIA
-    if features.has_arrays {
-        return SmtLogic::QfAuflia;
-    }
-
-    // Non-linear arithmetic → Unknown (no standard QF fragment covers it well)
-    if features.has_nonlinear_arith {
+    // Theories the clean Alethe replay engine has no reconstruction for AND
+    // that no `SmtLogic` variant names. `Unknown` degrades to
+    // `NoCertification`, which is the only honest answer: the previous code
+    // reached `QF_UF` here and claimed FULL certification.
+    if theories.contains(Theories::FLOATS) || theories.contains(Theories::DATATYPES) {
         return SmtLogic::Unknown;
     }
 
-    // Detect combined QF_LIA+UF — formulas that use both
-    // integer arithmetic and Boolean/equality reasoning.
-    let has_lia = features.has_int_arithmetic || features.has_int_vars;
-    let has_uf = features.has_bool_vars || features.has_uninterpreted;
-    if has_lia && has_uf {
-        return SmtLogic::QfLiaUf;
+    // Quantifiers → full first-order logic. Checked first because no
+    // quantifier-free fragment name is truthful once a binder is present.
+    if theories.contains(Theories::QUANTIFIERS) {
+        return SmtLogic::Full;
     }
 
-    // Integer arithmetic (linear) → QF_LIA
-    if has_lia {
-        return SmtLogic::QfLia;
+    // Bitvectors → QF_BV (even combined with other features: the name is used
+    // here to select a DEGRADATION STRATEGY, and the bit-blast one is the
+    // binding constraint whatever else is present).
+    if theories.contains(Theories::BITVECTORS) {
+        return SmtLogic::QfBv;
     }
 
-    // Pure Boolean/equality → QF_UF
-    if has_uf {
-        return SmtLogic::QfUf;
+    // An array sort outside `(Array Int Int)` / `(Array (_ BitVec i) (_ BitVec
+    // j))` (`Theories::WIDE_ARRAY`) is not QF_AUFLIA — that declaration admits
+    // only `(Array Int Int)` — and this enum has no scope for the wider logics.
+    if theories.contains(Theories::WIDE_ARRAY) {
+        return SmtLogic::Unknown;
     }
 
-    // Ground Boolean formula with no variables — trivially QF_UF
-    SmtLogic::QfUf
+    // Arrays → QF_AUFLIA.
+    if theories.contains(Theories::ARRAYS) {
+        return SmtLogic::QfAuflia;
+    }
+
+    // Non-linear arithmetic → Unknown: the replay engine certifies linear
+    // steps. The SMT-LIB name for such a query is now a real one (`QF_NIA` and
+    // its family — see `trust_types::logic_lattice`), but that is a LOGIC LINE;
+    // this enum picks a CERTIFICATION SCOPE, and nothing here reconstructs a
+    // nonlinear step, so `Unknown` stays the honest answer.
+    //
+    // Read from the SHARED record rather than from a private walker. The
+    // cascade position is unchanged (after the BV and ARRAYS short-circuits),
+    // so the only formulas whose verdict moves are the ones the old
+    // under-approximating rule missed, and they move TOWARD `Unknown`.
+    //
+    // DIVISION AND REMAINDER BY A LITERAL ARE IN THIS ARM TOO, since the shared
+    // bit was re-read off `QF_LIA`'s [S1] declaration: `div`/`mod` are excluded
+    // from the linear name by NAME, numeral divisor or not, so `x div 2` heads
+    // `QF_NIA` and reaches `Unknown` here. That is a NARROWING of this crate's
+    // certification scope (it used to answer `QfLia`, i.e. full certification,
+    // for that shape), and it is deliberately NOT undone by a private check.
+    // MEASURED 2026-09-23 by the live harness `live_ay_replay_tests` (the pinned
+    // ay solving under `:produce-proofs`, its Alethe replayed through this
+    // crate's own path): for `x div 2` the pinned ay exports NO proof at all
+    // (its strict self-check rejects its own proof and it answers Unknown), and
+    // for `x mod 2` the strict-verified proof carries the mod lemma as an Alethe
+    // `hole` and this crate's replay does not certify it. The plain QF_LIA
+    // control does not certify through that replay either (the clean kernel
+    // rejects the reconstructed term), so nothing here supports widening the
+    // scope. If that harness ever shows a by-numeral div/mod proof certifying,
+    // the decision to give that shape `QfLia` SCOPE belongs here, by a private
+    // predicate — the logic LINE must still say `QF_NIA`.
+    if theories.contains(Theories::NONLINEAR) {
+        return SmtLogic::Unknown;
+    }
+
+    // Real arithmetic → QF_LIRA (with or without integers beside it). The old
+    // cascade could not reach this variant at all: `Rat` literals and
+    // `Real`-sorted variables were invisible to it, so a real obligation fell
+    // through to `QF_UF` and was declared fully certifiable.
+    if theories.contains(Theories::REALS) {
+        return SmtLogic::QfLira;
+    }
+
+    let has_lia = theories.contains(Theories::INTS);
+    // `Theories::UF` is an APPLIED uninterpreted symbol of arity >= 1, the same
+    // rule the transcript lane charges the UF dimension by; a `Bool` variable
+    // is the propositional half of the same scope for this crate.
+    let has_uf = extras.bool_vars || theories.contains(Theories::UF);
+    match (has_lia, has_uf) {
+        (true, true) => SmtLogic::QfLiaUf,
+        (true, false) => SmtLogic::QfLia,
+        // Pure Boolean/equality, and the ground Boolean formula with no
+        // variables at all, are both genuinely `QF_UF`.
+        (false, _) => SmtLogic::QfUf,
+    }
 }
 
 /// Returns `true` if the given logic can be fully certified by the clean
@@ -393,168 +475,40 @@ pub fn degradation_strategy(logic: &SmtLogic) -> CertificationStrategy {
 // Feature collection (internal)
 // ---------------------------------------------------------------------------
 
-/// Recursively collect feature flags from a formula.
-fn collect_features(formula: &Formula, features: &mut FormulaFeatures) {
-    match formula {
-        // -- Leaves --
-        Formula::Bool(_) => {}
-        Formula::Int(_) | Formula::UInt(_) => {
-            features.has_int_arithmetic = true;
-        }
-        Formula::BitVec { .. } => {
-            features.has_bitvectors = true;
-        }
-        Formula::Var(_, sort) => match sort {
-            Sort::Int => features.has_int_vars = true,
-            Sort::Bool => features.has_bool_vars = true,
-            Sort::BitVec(_) => features.has_bitvectors = true,
-            Sort::Array(..) => features.has_arrays = true,
-            _ => { /* unknown sort variant -- skip */ }
-        },
+/// The ONE dimension [`classify_formula`] needs that the shared theory record
+/// does not carry: the presence of Boolean VARIABLES.
+///
+/// Everything else — LINEARITY included, since `Theories::NONLINEAR` landed —
+/// is read from `trust_types::logic_lattice::formula_theories`, so this crate
+/// no longer maintains a parallel list of `Formula` arms that can fall out of
+/// step with the declaration emitters or with the logic-line selectors.
+#[derive(Debug, Default, Clone, Copy)]
+struct CleanExtras {
+    /// A free or bound `Bool`-sorted `Var`/`SymVar`.
+    bool_vars: bool,
+}
 
-        // -- Boolean connectives (recurse into children) --
-        Formula::Not(a) => collect_features(a, features),
-        Formula::And(terms) | Formula::Or(terms) => {
-            for t in terms {
-                collect_features(t, features);
-            }
+impl CleanExtras {
+    /// Walk `formula` once.
+    ///
+    /// Uses `Formula::visit`, which reaches every node including quantifier
+    /// BODIES, rather than a hand-written recursion with a `_ => {}` arm — the
+    /// arm that made the old walker blind to floats, reals, datatypes,
+    /// applications and interned variables.
+    fn of(formula: &Formula) -> Self {
+        Self {
+            bool_vars: trust_types::any_formula_node(formula, &mut |node| {
+                matches!(node, Formula::Var(_, Sort::Bool) | Formula::SymVar(_, Sort::Bool))
+            }),
         }
-        Formula::Implies(a, b) => {
-            collect_features(a, features);
-            collect_features(b, features);
-        }
-
-        // -- Comparisons --
-        Formula::Eq(a, b)
-        | Formula::Lt(a, b)
-        | Formula::Le(a, b)
-        | Formula::Gt(a, b)
-        | Formula::Ge(a, b) => {
-            collect_features(a, features);
-            collect_features(b, features);
-        }
-
-        // -- Linear integer arithmetic --
-        Formula::Add(a, b) | Formula::Sub(a, b) => {
-            features.has_int_arithmetic = true;
-            collect_features(a, features);
-            collect_features(b, features);
-        }
-        Formula::Neg(a) => {
-            features.has_int_arithmetic = true;
-            collect_features(a, features);
-        }
-
-        // -- Potentially non-linear: Mul is non-linear if both operands
-        //    contain variables. We conservatively flag it. --
-        Formula::Mul(a, b) => {
-            features.has_int_arithmetic = true;
-            if has_variable(a) && has_variable(b) {
-                features.has_nonlinear_arith = true;
-            }
-            collect_features(a, features);
-            collect_features(b, features);
-        }
-        Formula::Div(a, b) | Formula::Rem(a, b) => {
-            features.has_int_arithmetic = true;
-            if has_variable(b) {
-                features.has_nonlinear_arith = true;
-            }
-            collect_features(a, features);
-            collect_features(b, features);
-        }
-
-        // -- Bitvector operations --
-        Formula::BvAdd(a, b, _)
-        | Formula::BvSub(a, b, _)
-        | Formula::BvMul(a, b, _)
-        | Formula::BvUDiv(a, b, _)
-        | Formula::BvSDiv(a, b, _)
-        | Formula::BvURem(a, b, _)
-        | Formula::BvSRem(a, b, _)
-        | Formula::BvAnd(a, b, _)
-        | Formula::BvOr(a, b, _)
-        | Formula::BvXor(a, b, _)
-        | Formula::BvShl(a, b, _)
-        | Formula::BvLShr(a, b, _)
-        | Formula::BvAShr(a, b, _)
-        | Formula::BvULt(a, b, _)
-        | Formula::BvULe(a, b, _)
-        | Formula::BvSLt(a, b, _)
-        | Formula::BvSLe(a, b, _) => {
-            features.has_bitvectors = true;
-            collect_features(a, features);
-            collect_features(b, features);
-        }
-        Formula::BvNot(a, _) => {
-            features.has_bitvectors = true;
-            collect_features(a, features);
-        }
-        Formula::BvToInt(a, _, _) | Formula::IntToBv(a, _) => {
-            features.has_bitvectors = true;
-            collect_features(a, features);
-        }
-        Formula::BvExtract { inner, .. } => {
-            features.has_bitvectors = true;
-            collect_features(inner, features);
-        }
-        Formula::BvConcat(a, b) => {
-            features.has_bitvectors = true;
-            collect_features(a, features);
-            collect_features(b, features);
-        }
-        Formula::BvZeroExt(a, _) | Formula::BvSignExt(a, _) => {
-            features.has_bitvectors = true;
-            collect_features(a, features);
-        }
-
-        // -- Conditional --
-        Formula::Ite(cond, then_br, else_br) => {
-            collect_features(cond, features);
-            collect_features(then_br, features);
-            collect_features(else_br, features);
-        }
-
-        // -- Quantifiers --
-        Formula::Forall(_, body) | Formula::Exists(_, body) => {
-            features.has_quantifiers = true;
-            collect_features(body, features);
-        }
-
-        // -- Arrays --
-        Formula::Select(arr, idx) => {
-            features.has_arrays = true;
-            collect_features(arr, features);
-            collect_features(idx, features);
-        }
-        Formula::Store(arr, idx, val) => {
-            features.has_arrays = true;
-            collect_features(arr, features);
-            collect_features(idx, features);
-            collect_features(val, features);
-        }
-        _ => {} // Unknown Formula variant — no features to collect
     }
 }
 
-/// Check if a formula contains any variable reference (used for
-/// non-linearity detection in Mul/Div/Rem).
-fn has_variable(formula: &Formula) -> bool {
-    let mut found = false;
-    formula.visit(&mut |f| {
-        if !found && let Formula::Var(..) = f {
-            found = true;
-        }
-    });
-    found
-}
-
 // ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
+    use trust_types::Symbol;
+
     use super::*;
 
     // Helpers
@@ -707,6 +661,20 @@ mod tests {
         assert_eq!(classify_formula(&f), SmtLogic::QfAuflia);
     }
 
+    #[test]
+    fn an_array_sort_qf_auflia_does_not_declare_is_no_certification_scope() {
+        // QF_AUFLIA admits only `(Array Int Int)`; a `(Array Bool Bool)` or
+        // `(Array Int Bool)` needs a wider logic this enum has no scope for.
+        for (index, element) in [(Sort::Bool, Sort::Bool), (Sort::Int, Sort::Bool)] {
+            let sort = Sort::Array(Box::new(index), Box::new(element));
+            let a = Formula::Var("a".into(), sort.clone());
+            let b = Formula::Var("b".into(), sort);
+            let f = Formula::Eq(Box::new(a), Box::new(b));
+            assert_eq!(classify_formula(&f), SmtLogic::Unknown, "{f:?}");
+            assert!(!is_certifiable(&classify_formula(&f)));
+        }
+    }
+
     // -----------------------------------------------------------------------
     // classify_formula: Full (quantifiers)
     // -----------------------------------------------------------------------
@@ -775,10 +743,26 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_div_by_constant_is_qf_lia() {
-        // div by constant (no variable in denominator) stays linear
-        let f = Formula::Div(Box::new(int_var("x")), Box::new(Formula::Int(2)));
-        assert_eq!(classify_formula(&f), SmtLogic::QfLia);
+    fn test_classify_div_by_constant_requires_a_broader_fragment() {
+        // A constant divisor does not make the emitted `div` operator a term
+        // of SMT-LIB's linear integer fragment: `QF_LIA`'s declaration excludes
+        // `div`/`mod` by name. The shared record therefore carries NONLINEAR,
+        // and this crate answers the scope it can honestly certify — none.
+        for f in [
+            Formula::Div(Box::new(int_var("x")), Box::new(Formula::Int(2))),
+            Formula::Rem(Box::new(int_var("x")), Box::new(Formula::Int(2))),
+        ] {
+            let logic = classify_formula(&f);
+            assert_eq!(logic, SmtLogic::Unknown, "{f:?}");
+            assert!(!is_certifiable(&logic), "{f:?}");
+            assert!(
+                matches!(
+                    degradation_strategy(&logic),
+                    CertificationStrategy::NoCertification { .. }
+                ),
+                "{f:?}"
+            );
+        }
     }
 
     #[test]
@@ -1184,15 +1168,6 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_theory_classifier_new_and_default() {
-        let c1 = TheoryClassifier::new();
-        let c2 = TheoryClassifier::default();
-        // Both should classify the same formula identically
-        let f = Formula::Bool(true);
-        assert_eq!(c1.classify_logic(&f), c2.classify_logic(&f));
-    }
-
-    #[test]
     fn test_theory_classifier_classify_logic_qf_lia() {
         let classifier = TheoryClassifier::new();
         let f = Formula::Add(Box::new(int_var("x")), Box::new(Formula::Int(1)));
@@ -1274,5 +1249,152 @@ mod tests {
         let logic = classify_formula(&f);
         assert_eq!(logic, SmtLogic::QfLiaUf);
         assert!(is_certifiable(&logic));
+    }
+
+    // -----------------------------------------------------------------------
+    // The blind-spot regressions: theories the old private walker could not
+    // see, which therefore fell through its cascade to `QF_UF` — a CERTIFIABLE
+    // fragment. Each of these must now reach a fragment that does NOT claim
+    // full clean-kernel certification.
+    // -----------------------------------------------------------------------
+
+    /// A FLOATING-POINT obligation used to classify as `QF_UF` and be handed
+    /// `FullCertification`: `collect_features` had no `Fp*` arm at all, and its
+    /// `_ => {}` fall-through swallowed every one of them.
+    #[test]
+    fn floating_point_is_not_silently_certifiable() {
+        let f =
+            Formula::FpIsNaN(Box::new(Formula::Var("g".into(), Sort::Float { eb: 11, sb: 53 })));
+        let logic = classify_formula(&f);
+        assert_eq!(logic, SmtLogic::Unknown, "floating point has no certifiable fragment here");
+        assert!(!is_certifiable(&logic));
+        assert!(degradation_strategy(&logic).is_none());
+    }
+
+    /// A REAL-arithmetic obligation used to classify as `QF_UF` too: `Rat`
+    /// literals and `Real`-sorted variables were invisible. It must reach
+    /// `QF_LIRA`, whose strategy is PARTIAL certification — and which the old
+    /// cascade could not return at all.
+    #[test]
+    fn real_arithmetic_reaches_qf_lira_not_qf_uf() {
+        let f = Formula::Le(
+            Box::new(Formula::Var("x".into(), Sort::Real)),
+            Box::new(Formula::rat_from_int(1)),
+        );
+        let logic = classify_formula(&f);
+        assert_eq!(logic, SmtLogic::QfLira);
+        assert!(!is_certifiable(&logic));
+        assert!(matches!(
+            degradation_strategy(&logic),
+            CertificationStrategy::PartialCertification { .. }
+        ));
+    }
+
+    /// A DATATYPE obligation used to classify as `QF_UF` as well.
+    #[test]
+    fn datatypes_are_not_silently_certifiable() {
+        let sort = Sort::Datatype { name: "Expr".to_string(), constructors: Vec::new() };
+        let f = Formula::Eq(
+            Box::new(Formula::Var("e".into(), sort.clone())),
+            Box::new(Formula::Var("e2".into(), sort)),
+        );
+        let logic = classify_formula(&f);
+        assert_eq!(logic, SmtLogic::Unknown);
+        assert!(!is_certifiable(&logic));
+    }
+
+    /// An APPLIED uninterpreted function is a genuine UF requirement. The old
+    /// walker never set `has_uninterpreted` — nothing assigned it — so a
+    /// formula mixing integer arithmetic with an application classified as
+    /// plain `QF_LIA`. Both remain certifiable, so this is a precision fix, not
+    /// a soundness one, and it is pinned so the dimension cannot go quiet
+    /// again.
+    #[test]
+    fn an_applied_uninterpreted_function_sets_the_uf_dimension() {
+        let f = Formula::And(vec![
+            Formula::Gt(Box::new(int_var("n")), Box::new(Formula::Int(0))),
+            Formula::Pred("p".into(), vec![int_var("n")]),
+        ]);
+        assert_eq!(classify_formula(&f), SmtLogic::QfLiaUf);
+    }
+
+    /// An INTERNED (`SymVar`) variable was invisible to the old walker in every
+    /// position. A `SymVar`-only product is nonlinear, and must classify as
+    /// such rather than as the ground `QF_UF` the old cascade fell through to.
+    #[test]
+    fn interned_variables_are_visible_to_both_dimensions() {
+        let x = Formula::SymVar(Symbol::intern("x"), Sort::Int);
+        let y = Formula::SymVar(Symbol::intern("y"), Sort::Int);
+        let nonlinear = Formula::Gt(
+            Box::new(Formula::Mul(Box::new(x.clone()), Box::new(y))),
+            Box::new(Formula::Int(0)),
+        );
+        assert_eq!(classify_formula(&nonlinear), SmtLogic::Unknown);
+
+        let linear = Formula::Gt(Box::new(x), Box::new(Formula::Int(0)));
+        assert_eq!(classify_formula(&linear), SmtLogic::QfLia);
+    }
+
+    /// The classifier and the workspace's `(set-logic …)` selector now read the
+    /// SAME theory record, so they cannot disagree about which theories a
+    /// formula uses. This checks the two agree on the M1 shape specifically:
+    /// FP mixed with Int is neither `QF_FP` on the transcript side nor a
+    /// certifiable fragment here.
+    #[test]
+    fn the_classifier_and_the_logic_selector_read_one_record() {
+        let f = Formula::And(vec![
+            Formula::Gt(Box::new(int_var("x")), Box::new(Formula::Int(0))),
+            Formula::FpIsNaN(Box::new(Formula::Var("g".into(), Sort::Float { eb: 11, sb: 53 }))),
+        ]);
+        let theories = trust_types::logic_lattice::formula_theories(&f);
+        assert!(theories.contains(Theories::FLOATS) && theories.contains(Theories::INTS));
+        assert_eq!(trust_types::smt_logic::select_logic(&f), "ALL");
+        assert_eq!(classify_formula(&f), SmtLogic::Unknown);
+    }
+
+    /// LINEARITY is read from the shared record now, and that closed an
+    /// UNDER-approximation this crate used to carry.
+    ///
+    /// The old private detector asked whether each operand CONTAINS a variable.
+    /// `(* x (f 1))` is a product of a variable and an uninterpreted
+    /// application with a literal argument: genuinely nonlinear, but the second
+    /// operand holds no `Var`, so it was called linear and handed a
+    /// certification strategy. The shared bit asks whether each operand is a
+    /// numeric LITERAL, which catches it.
+    ///
+    /// The two classifications must also AGREE, which is the point of reading
+    /// one record: the logic line says `QF_UFNIA` and the scope says `Unknown`.
+    #[test]
+    fn a_product_with_an_application_operand_is_nonlinear_here_too() {
+        let application =
+            Formula::FnApp { func: "f".to_string(), args: vec![Formula::Int(1)], sort: Sort::Int };
+        let f = Formula::Gt(
+            Box::new(Formula::Mul(Box::new(int_var("x")), Box::new(application))),
+            Box::new(Formula::Int(0)),
+        );
+        let theories = trust_types::logic_lattice::formula_theories(&f);
+        assert!(theories.contains(Theories::NONLINEAR), "`(* x (f 1))` is nonlinear");
+        assert_eq!(trust_types::smt_logic::select_logic(&f), "QF_UFNIA");
+        assert_eq!(classify_formula(&f), SmtLogic::Unknown);
+    }
+
+    /// The other side of the split, so the switch to the shared bit cannot
+    /// quietly send ordinary linear VCs to `Unknown`: multiplication of a free
+    /// constant by a LITERAL stays certifiable. (Division and remainder by a
+    /// literal do NOT — see `test_classify_div_by_constant_requires_a_broader_
+    /// fragment` — because `QF_LIA`'s declaration excludes `div`/`mod` outright.)
+    #[test]
+    fn multiplication_by_a_literal_is_still_linear_here() {
+        for f in [
+            Formula::Mul(Box::new(Formula::Int(3)), Box::new(int_var("x"))),
+            Formula::Mul(Box::new(int_var("x")), Box::new(Formula::Int(3))),
+            Formula::Mul(Box::new(Formula::Int(-3)), Box::new(int_var("x"))),
+        ] {
+            let goal = Formula::Gt(Box::new(f), Box::new(Formula::Int(0)));
+            assert!(
+                !trust_types::logic_lattice::formula_theories(&goal).contains(Theories::NONLINEAR)
+            );
+            assert_eq!(classify_formula(&goal), SmtLogic::QfLia);
+        }
     }
 }

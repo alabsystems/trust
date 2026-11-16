@@ -1,0 +1,190 @@
+{
+  "name": "tup",
+  "def_path": "byvalue_param_field_write::tup",
+  "span": {
+    "file": "byvalue_param_field_write.rs",
+    "line_start": 25,
+    "col_start": 0,
+    "line_end": 30,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          ]
+        },
+        "name": "t"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "byvalue_param_field_write.rs",
+                "line_start": 28,
+                "col_start": 10,
+                "line_end": 28,
+                "col_end": 13
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  {
+                    "Field": 0
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "byvalue_param_field_write.rs",
+                "line_start": 28,
+                "col_start": 4,
+                "line_end": 28,
+                "col_end": 13
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "byvalue_param_field_write.rs",
+                "line_start": 29,
+                "col_start": 4,
+                "line_end": 29,
+                "col_end": 7
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "byvalue_param_field_write.rs",
+        "line_start": 26,
+        "col_start": 12,
+        "line_end": 26,
+        "col_end": 25
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) == (t.0)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Eq": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Var": [
+            "t.0",
+            "Int"
+          ]
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) == (t.0)"
+    ],
+    "invariants": []
+  }
+}

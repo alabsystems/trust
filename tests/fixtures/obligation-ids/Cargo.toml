@@ -1,0 +1,17 @@
+[package]
+name = "trust-obligation-ids-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The committed-baseline acceptance (tests/e2e_targo_trust_cli.sh, work item
+# T9): `targo trust check --lib --save-baseline` twice must write byte-identical
+# files, `targo trust diff --baseline` must pass on this source, fail naming the
+# lost key when `checked_div` loses its `requires`, and pass reporting gains
+# when a proved function is added. No dependencies: the proofs are a function of
+# this source alone.
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

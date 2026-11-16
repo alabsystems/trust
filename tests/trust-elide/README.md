@@ -40,8 +40,23 @@ It has no opt-in switch — it runs wherever verification runs, and needs
 
 ```bash
 ./x.py build --stage 2
-TRUST_SEED_STAIRCASE=1 python3 tests/trust-elide/elide_regression.py
+python3 tests/trust-elide/elide_regression.py
 ```
+
+To retain the exact verification-pass input/output and its close controls:
+
+```sh
+python3 -B tests/trust-elide/mir_dump_regression.py \
+  --trustc /absolute/path/to/current/stage2/bin/trustc \
+  --out /existing/external/parent/new-dump-regression
+```
+
+The compiler must include the TrustVerify dump-enablement change. The output
+must be new and outside the checkout. This preserves raw commands, diagnostics,
+MIR and hashes; it checks a requested before/after pair, verifier-off assertion
+preservation for both fixtures, absent/nonmatching dump requests, unchanged
+emitted MIR, and an exact unsafe overflow refusal. It is a
+development regression, not a sealed toolchain or source-refinement proof.
 
 ## What it pins
 

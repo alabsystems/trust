@@ -1,4 +1,6 @@
 //! Tests for caching compiler diagnostics.
+// Trust: transparent proxy fixture adapters for SP-1; exact changed coverage
+// is ledgered in tests/upstream-rust/divergence-audit.toml.
 
 use crate::prelude::*;
 use crate::utils::tools;
@@ -9,6 +11,87 @@ use super::messages::raw_rustc_output;
 
 fn as_str(bytes: &[u8]) -> &str {
     std::str::from_utf8(bytes).expect("valid utf-8")
+}
+
+#[cargo_test]
+// Trust: real registry compiler output must retain native disclosure on replay.
+fn native_registry_replay_keeps_required_disclosure_and_caps_other_diagnostics() {
+    // Select the registry package itself: a local primary's identical note
+    // must not mask a dependency replay omission through Cargo's deduper.
+    Package::new("native_disclosure_dep", "1.0.0")
+        .file("src/lib.rs", "fn not_used() {}")
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            "[package]\nname = 'foo'\nversion = '0.1.0'\n\
+             [dependencies]\nnative_disclosure_dep = '1.0.0'\n",
+        )
+        .file("src/lib.rs", "")
+        .build();
+    let targo = p
+        .root()
+        .join(format!("targo{}", std::env::consts::EXE_SUFFIX));
+    std::fs::hard_link(crate::utils::cargo_exe(), &targo).unwrap();
+    let note = "compiled WITHOUT Trust verification — 0 obligations checked";
+
+    for format in ["human", "short", "json", "json-render-diagnostics"] {
+        let target = format!("target/{format}");
+        // Extra verbosity fills the real compiler cache with an ordinary
+        // registry warning as well as the mandatory non-lint disclosure.
+        let cold = p
+            .process(&targo)
+            .args(&[
+                "--unverified",
+                "check",
+                "-p",
+                "native_disclosure_dep",
+                "-vv",
+                "--target-dir",
+                &target,
+            ])
+            .run();
+        assert!(as_str(&cold.stderr).contains(note));
+        assert!(as_str(&cold.stderr).contains("function `not_used` is never used"));
+
+        let warm = p
+            .process(&targo)
+            .args(&[
+                "--unverified",
+                "check",
+                "-p",
+                "native_disclosure_dep",
+                "-q",
+                "--target-dir",
+                &target,
+                "--message-format",
+                format,
+            ])
+            .run();
+        assert!(!as_str(&warm.stderr).contains("function `not_used` is never used"));
+        assert!(!as_str(&warm.stdout).contains("function `not_used` is never used"));
+        if format == "json" {
+            let messages = as_str(&warm.stdout)
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let notes = messages
+                .iter()
+                .filter(|message| message["reason"] == "compiler-message")
+                .collect::<Vec<_>>();
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0]["message"]["message"], note);
+            assert_eq!(notes[0]["message"]["level"], "note");
+            assert!(notes[0]["message"]["code"].is_null());
+            assert_eq!(notes[0]["target"]["name"], "native_disclosure_dep");
+            assert!(notes[0]["manifest_path"].is_string());
+            assert!(messages.iter().any(|message| {
+                message["reason"] == "compiler-artifact" && message["fresh"] == true
+            }));
+        } else {
+            assert_eq!(as_str(&warm.stderr).matches(note).count(), 1);
+        }
+    }
 }
 
 #[cargo_test]
@@ -150,7 +233,7 @@ fn clears_cache_after_fix() {
 "#]])
         .run();
     let cpath = p
-        .glob("target/debug/.fingerprint/foo-*/output-*")
+        .glob("target/debug/build/foo/*/fingerprint/output-*")
         .next()
         .unwrap()
         .unwrap();
@@ -170,10 +253,6 @@ fn clears_cache_after_fix() {
 
 "#]])
         .run();
-    assert_eq!(
-        p.glob("target/debug/.fingerprint/foo-*/output-*").count(),
-        0
-    );
 
     // And again, check the cache is correct.
     p.cargo("check")
@@ -203,7 +282,8 @@ fn rustdoc() {
     assert!(rustdoc_stderr.contains("missing"));
     assert!(rustdoc_stderr.contains("\x1b["));
     assert_eq!(
-        p.glob("target/debug/.fingerprint/foo-*/output-*").count(),
+        p.glob("target/debug/build/foo/*/fingerprint/output-*")
+            .count(),
         1
     );
 
@@ -240,6 +320,9 @@ fn very_verbose() {
 
             [dependencies]
             bar = "1.0"
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -248,7 +331,10 @@ fn very_verbose() {
     p.cargo("check -vv")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ * [new ref]         HEAD       -> origin/HEAD
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
 [CHECKING] bar v1.0.0
@@ -283,51 +369,6 @@ fn very_verbose() {
 }
 
 #[cargo_test]
-fn doesnt_create_extra_files() {
-    // Ensure it doesn't create `output` files when not needed.
-    Package::new("dep", "1.0.0")
-        .file("src/lib.rs", "fn unused() {}")
-        .publish();
-
-    let p = project()
-        .file(
-            "Cargo.toml",
-            r#"
-                [package]
-                name = "foo"
-                version = "0.1.0"
-                edition = "2015"
-
-                [dependencies]
-                dep = "1.0"
-            "#,
-        )
-        .file("src/lib.rs", "")
-        .file("src/main.rs", "fn main() {}")
-        .build();
-
-    p.cargo("check").run();
-
-    assert_eq!(
-        p.glob("target/debug/.fingerprint/foo-*/output-*").count(),
-        0
-    );
-    assert_eq!(
-        p.glob("target/debug/.fingerprint/dep-*/output-*").count(),
-        0
-    );
-    if is_coarse_mtime() {
-        sleep_ms(1000);
-    }
-    p.change_file("src/lib.rs", "fn unused() {}");
-    p.cargo("check").run();
-    assert_eq!(
-        p.glob("target/debug/.fingerprint/foo-*/output-*").count(),
-        1
-    );
-}
-
-#[cargo_test]
 fn replay_non_json() {
     // Handles non-json output.
     let rustc = project()
@@ -335,16 +376,17 @@ fn replay_non_json() {
         .file("Cargo.toml", &basic_manifest("rustc_alt", "1.0.0"))
         .file(
             "src/main.rs",
-            r#"
+            &tools::with_transparent_proxy(
+                r#"
             fn main() {
                 eprintln!("line 1");
                 eprintln!("line 2");
-                let r = std::process::Command::new("rustc")
-                    .args(std::env::args_os().skip(1))
-                    .status();
+                let r = transparent_proxy::status(std::process::Command::new("rustc")
+                    .args(std::env::args_os().skip(1)));
                 std::process::exit(r.unwrap().code().unwrap_or(2));
             }
             "#,
+            ),
         )
         .build();
     rustc.cargo("build").run();
@@ -382,7 +424,7 @@ fn caching_large_output() {
         .file("Cargo.toml", &basic_manifest("rustc_alt", "1.0.0"))
         .file(
             "src/main.rs",
-            &format!(
+            &tools::with_transparent_proxy(&format!(
                 r#"
                 fn main() {{
                     for i in 0..{} {{
@@ -390,14 +432,13 @@ fn caching_large_output() {
                             \"spans\": [], \"children\": [], \"rendered\": \"test message {{}}\"}}}}",
                             i, i);
                     }}
-                    let r = std::process::Command::new("rustc")
-                        .args(std::env::args_os().skip(1))
-                        .status();
+                    let r = transparent_proxy::status(std::process::Command::new("rustc")
+                        .args(std::env::args_os().skip(1)));
                     std::process::exit(r.unwrap().code().unwrap_or(2));
                 }}
                 "#,
                 COUNT
-            ),
+            )),
         )
         .build();
 

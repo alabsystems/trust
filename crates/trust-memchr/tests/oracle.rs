@@ -422,3 +422,153 @@ fn finder_is_clone_and_debug_at_static() {
     assert_eq!(q.0.find(b"a needle here"), Some(2));
     assert!(format!("{p:?}").contains("Prefilter"));
 }
+
+/// Upstream's default prefilter is `Auto`, and `FinderBuilder::default()`
+/// starts from it exactly as `FinderBuilder::new()` does. The derive's
+/// `#[default]` marker is what decides this, so a moved marker fails here.
+#[test]
+fn prefilter_defaults_to_auto() {
+    assert!(matches!(memmem::Prefilter::default(), memmem::Prefilter::Auto));
+    assert_eq!(
+        format!("{:?}", memmem::FinderBuilder::default()),
+        format!("{:?}", memmem::FinderBuilder::new()),
+    );
+}
+
+/// The lint expectations in Rust source `text`: each `expect(` outside a
+/// string in an outer `#[..]` or inner `#![..]` attribute, so an `expect`
+/// attribute and each `expect` a `cfg_attr(..)` applies, nested or not, however
+/// it is spaced, and commented too unless the comment has an unbalanced quote
+/// or bracket. Too high a count only asks for Rust 1.81 where it was not
+/// needed; too low a one lets `rust-version` name a compiler that rejects the
+/// crate.
+fn lint_expectations(text: &str) -> usize {
+    let text: String = text.chars().filter(|character| !character.is_whitespace()).collect();
+    let mut found = 0;
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find('#') {
+        rest = &rest[at + 1..];
+        let inner = rest.strip_prefix('!').unwrap_or(rest);
+        if let Some(attribute) = inner.strip_prefix('[') {
+            found += attribute_expectations(attribute);
+        }
+    }
+    found
+}
+
+/// Each `expect(` outside a string in the attribute at the start of
+/// `attribute`, up to the bracket that closes it. With whitespace gone, a
+/// comment before an applied `expect` runs into it (`all(),//alwaysexpect(`),
+/// so this counts the text wherever it starts, not only after a comma.
+fn attribute_expectations(attribute: &str) -> usize {
+    let (mut found, mut depth, mut string, mut escaped) = (0, 0usize, false, false);
+    for (at, character) in attribute.char_indices() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' if string => escaped = true,
+            '"' => string = !string,
+            _ if string => {}
+            'e' if attribute[at..].starts_with("expect(") => found += 1,
+            '(' | '[' => depth += 1,
+            ')' | ']' if depth == 0 => break,
+            ')' | ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    found
+}
+
+/// The `(major, minor)` a `rust-version` names, spelled as Cargo accepts it:
+/// `MAJOR[.MINOR[.PATCH]]`, each part a `u32` in decimal digits.
+fn rust_version(declared: &str) -> Result<(u32, u32), String> {
+    if declared.is_empty() {
+        return Err("Cargo.toml declares no rust-version (CARGO_PKG_RUST_VERSION is empty), \
+                    so nothing says which compiler this crate's #[expect] needs (Rust 1.81)"
+            .to_owned());
+    }
+    let refused = || {
+        format!(
+            "Cargo.toml's rust-version {declared:?} is not MAJOR[.MINOR[.PATCH]], each a u32 in \
+             decimal digits, so it cannot be compared with the Rust 1.81 that #[expect] needs"
+        )
+    };
+    let mut parts = Vec::new();
+    for part in declared.split('.') {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(refused());
+        }
+        parts.push(part.parse::<u32>().map_err(|_| refused())?);
+    }
+    match parts[..] {
+        [major] => Ok((major, 0)),
+        [major, minor] | [major, minor, _] => Ok((major, minor)),
+        _ => Err(refused()),
+    }
+}
+
+/// The spellings `src/` does not carry today: an inner `#![expect]`, an
+/// `expect` that a `cfg_attr` applies (nested, spaced, commented, beside
+/// others), and what is no expectation, an `expect(` in a string included; and
+/// a `rust-version` that is empty or no version refused with what it is, not a
+/// parse panic.
+#[test]
+fn lint_expectations_and_rust_version_are_read_in_every_spelling() {
+    for (text, count) in [
+        ("#[expect(dead_code)]", 1),
+        ("#![expect(dead_code, reason = \"crate-wide\")]", 1),
+        ("# ! [ expect ( dead_code ) ]", 1),
+        ("#[cfg_attr(test, expect(dead_code))]", 1),
+        ("#![cfg_attr(test, expect(dead_code))]", 1),
+        ("#[cfg_attr(all(test, unix), allow(unused), expect(dead_code))]", 1),
+        ("#[cfg_attr(test, cfg_attr(unix, expect(dead_code)))]", 1),
+        ("#[cfg_attr(feature = \"a,)\\\"\", expect(dead_code))]", 1),
+        ("#[cfg_attr(\n    all(), // always\n    expect(dead_code),\n)]", 1),
+        ("#[cfg_attr(test, /* why */ expect(dead_code))]", 1),
+        ("#[/* why */ expect(dead_code)]", 1),
+        ("#[expect(a)] fn f() {} #![expect(b)] #[cfg_attr(test, expect(c))]", 3),
+        ("#[allow(dead_code)] fn f(x: Option<u8>) -> u8 { x.expect(\"a byte\") }", 0),
+        ("#[cfg_attr(test, allow(dead_code))] #[cfg_attr(expect, allow(x))] #[must_use]", 0),
+        ("#[doc = \"expect(x)\"] #[must_use = \"a\\\"expect(\"]", 0),
+    ] {
+        assert_eq!(lint_expectations(text), count, "{text}");
+    }
+    for (declared, major_minor) in [("1", (1, 0)), ("1.81", (1, 81)), ("1.81.0", (1, 81))] {
+        assert_eq!(rust_version(declared), Ok(major_minor), "{declared}");
+    }
+    let empty = rust_version("").expect_err("an empty rust-version");
+    assert!(empty.contains("declares no rust-version"), "{empty}");
+    let malformed = ["1.x", "1..0", ".81", "1.81.", "+1.81", "1.81-beta", " 1.81", "1.81.0.0"];
+    let past_u32 = "4294967296.0";
+    for declared in malformed.into_iter().chain([past_u32]) {
+        let refused = rust_version(declared).expect_err(declared);
+        assert!(refused.contains(&format!("rust-version {declared:?} is not")), "{refused}");
+    }
+}
+
+/// `#[expect]` and its `reason` need Rust 1.81. While `src/` carries one, in
+/// any spelling, the manifest's `rust-version` must not name an older compiler.
+#[test]
+fn declared_rust_version_covers_lint_expectations() {
+    fn expectations(dir: &std::path::Path) -> usize {
+        let mut found = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found += expectations(&path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found += lint_expectations(&std::fs::read_to_string(&path).unwrap());
+            }
+        }
+        found
+    }
+    let declared = env!("CARGO_PKG_RUST_VERSION");
+    let major_minor = rust_version(declared).unwrap_or_else(|refused| panic!("{refused}"));
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let found = expectations(&source);
+    if found > 0 {
+        assert!(
+            major_minor >= (1, 81),
+            "src/ has {found} #[expect]; rust-version {declared} predates them (Rust 1.81)"
+        );
+    }
+}

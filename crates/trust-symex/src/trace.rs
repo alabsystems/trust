@@ -271,58 +271,89 @@ impl fmt::Display for ConsistencyError {
 pub struct TraceFormatter;
 
 impl TraceFormatter {
+    fn write_step(out: &mut String, step: &TraceStep) {
+        let _ = write!(out, "Block {}, Stmt {}: ", step.block_id, step.stmt_index);
+        if step.variable_snapshot.is_empty() {
+            out.push_str("(empty)");
+            return;
+        }
+        for (idx, (k, v)) in step.variable_snapshot.iter().enumerate() {
+            if idx > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(k);
+            out.push('=');
+            Self::write_value(out, v);
+        }
+    }
+
     /// Format a single trace step as a string.
     #[must_use]
     pub fn format_step(step: &TraceStep) -> String {
-        let mut vars: Vec<_> = step.variable_snapshot.iter().collect();
-        vars.sort_by_key(|(k, _)| (*k).clone());
-
-        let var_str: String = vars
-            .iter()
-            .map(|(k, v)| format!("{k}={}", Self::format_value(v)))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        if var_str.is_empty() {
-            format!("Block {}, Stmt {}: (empty)", step.block_id, step.stmt_index)
-        } else {
-            format!("Block {}, Stmt {}: {}", step.block_id, step.stmt_index, var_str)
-        }
+        let mut out = String::new();
+        Self::write_step(&mut out, step);
+        out
     }
 
     /// Format an entire execution trace as a multi-line string.
     #[must_use]
     pub fn format_trace(trace: &ExecutionTrace) -> String {
-        trace.iter().map(Self::format_step).collect::<Vec<_>>().join("\n")
+        let mut out = String::new();
+        for (idx, step) in trace.iter().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+            Self::write_step(&mut out, step);
+        }
+        out
+    }
+
+    fn write_value(out: &mut String, value: &SymbolicValue) {
+        match value {
+            SymbolicValue::Concrete(n) => {
+                let _ = write!(out, "{n}");
+            }
+            SymbolicValue::Symbol(name) => out.push_str(name),
+            SymbolicValue::BinOp(l, op, r) => {
+                out.push('(');
+                Self::write_value(out, l);
+                let _ = write!(out, " {op:?} ");
+                Self::write_value(out, r);
+                out.push(')');
+            }
+            SymbolicValue::Ite(c, t, e) => {
+                out.push_str("(if ");
+                Self::write_value(out, c);
+                out.push_str(" then ");
+                Self::write_value(out, t);
+                out.push_str(" else ");
+                Self::write_value(out, e);
+                out.push(')');
+            }
+            SymbolicValue::Not(inner) => {
+                out.push_str("(!");
+                Self::write_value(out, inner);
+                out.push(')');
+            }
+            SymbolicValue::BitwiseNot(inner) => {
+                out.push_str("(~");
+                Self::write_value(out, inner);
+                out.push(')');
+            }
+            SymbolicValue::Neg(inner) => {
+                out.push_str("(-");
+                Self::write_value(out, inner);
+                out.push(')');
+            }
+        }
     }
 
     /// Format a symbolic value for display.
     #[must_use]
     pub fn format_value(value: &SymbolicValue) -> String {
-        match value {
-            SymbolicValue::Concrete(n) => n.to_string(),
-            SymbolicValue::Symbol(name) => name.clone(),
-            SymbolicValue::BinOp(l, op, r) => {
-                format!("({} {:?} {})", Self::format_value(l), op, Self::format_value(r))
-            }
-            SymbolicValue::Ite(c, t, e) => {
-                format!(
-                    "(if {} then {} else {})",
-                    Self::format_value(c),
-                    Self::format_value(t),
-                    Self::format_value(e)
-                )
-            }
-            SymbolicValue::Not(inner) => {
-                format!("(!{})", Self::format_value(inner))
-            }
-            SymbolicValue::BitwiseNot(inner) => {
-                format!("(~{})", Self::format_value(inner))
-            }
-            SymbolicValue::Neg(inner) => {
-                format!("(-{})", Self::format_value(inner))
-            }
-        }
+        let mut out = String::new();
+        Self::write_value(&mut out, value);
+        out
     }
 }
 
@@ -401,9 +432,7 @@ impl CounterexampleTrace {
 
         if !self.concrete_assignments.is_empty() {
             out.push_str("Concrete assignments:\n");
-            let mut assignments: Vec<_> = self.concrete_assignments.iter().collect();
-            assignments.sort_by_key(|(k, _)| (*k).clone());
-            for (var, val) in &assignments {
+            for (var, val) in &self.concrete_assignments {
                 let _ = writeln!(out, "  {var} = {val}");
             }
         }
@@ -413,7 +442,9 @@ impl CounterexampleTrace {
         if !self.trace.is_empty() {
             out.push_str("Trace:\n");
             for step in self.trace.iter() {
-                let _ = writeln!(out, "  {}", TraceFormatter::format_step(step));
+                out.push_str("  ");
+                TraceFormatter::write_step(&mut out, step);
+                out.push('\n');
             }
         }
 

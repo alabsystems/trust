@@ -1,6 +1,16 @@
 use super::parse_stage0_content;
 
 #[test]
+fn compiler_and_planner_floors_are_independent_and_missing_is_not_a_fallback() {
+    let parsed =
+        parse_stage0_content("min_stage0_rustc_version=1.100.0\nmin_stage0_cargo_version=1.98.0\n");
+    assert_eq!(parsed.config.min_stage0_rustc_version, "1.100.0");
+    assert_eq!(parsed.config.min_stage0_cargo_version, "1.98.0");
+    let missing = parse_stage0_content("min_stage0_rustc_version=1.100.0\n");
+    assert!(missing.config.min_stage0_cargo_version.is_empty());
+}
+
+#[test]
 fn parses_stage0_dist_channel_overrides() {
     let parsed = parse_stage0_content(
         r#"

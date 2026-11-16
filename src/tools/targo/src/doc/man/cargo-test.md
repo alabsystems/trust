@@ -79,9 +79,103 @@ directory of the package the test belongs to, and is controlled via `rustdoc`'s
 
 {{> options-test }}
 
+### Test Plan Options
+
+These options exist in `targo` only. A test plan is a TOML file that names
+several test requests, each what one `targo test -p` command would select; one
+invocation builds them in one graph and runs every test executable in the
+build's queue. The plan also states the pool its tests run in, what each
+harness is counted for, how long the run may take and which tests are expected
+to fail, so that one command is a whole test lane. The file, and how a run
+is selected, bounded and judged, are described in the test plan reference
+(`src/doc/src/reference/test-plan.md` in the Targo sources).
+
+A plan run names what changed with `--changed-range`, `--changed-pushed-refs`
+or `--changed-paths` (and what the change reaches with `--reached` or `-p`),
+or asks for everything with `--whole-plan`. An invocation that does neither is
+refused.
+
+{{#options}}
+
+{{#option "`--plan` _file_" }}
+Build and run the requests of the test plan _file_. The plan owns package,
+feature, target and harness-argument selection: the options that select those
+are refused beside it. It requires `--unverified`.
+{{/option}}
+
+{{#option "`--changed-range` _range_" }}
+Select the plan's requests from the paths git says _range_ changed. `A..B`
+compares the two trees and `A...B` compares `B` with its merge base with `A`,
+as `git diff` reads them. Targo runs git itself, without rename detection and
+with submodule pointers included, so a renamed file counts as its old path and
+its new one and a deleted file as its path. A range git cannot diff is an
+error, never an empty change. This flag may be specified multiple times. A
+range that changes nothing the plan tests selects nothing: the run exits 0.
+{{/option}}
+
+{{#option "`--changed-pushed-refs` _file_" }}
+Select the plan's requests from the refs being pushed, as git writes them to a
+pre-push hook: one `<local ref> <local sha> <remote ref> <remote sha>` line
+per ref, in _file_, or on standard input for `-`. An updated branch is the
+range from its remote commit to its local one, a new branch is compared with
+the plan's `[select] base`, and a deleted branch pushes no tree. Input that
+names no pushed tree at all (no line, or deletions only) is judged as the
+standing change, `<base>...HEAD`, never as a push that changes nothing: a hook
+that lost its standard input does not exit 0.
+{{/option}}
+
+{{#option "`--changed-paths` _file_" }}
+Select the plan's requests from the changed paths listed in _file_, or on
+standard input for `-`: NUL- or newline-separated, relative to the workspace
+root.
+{{/option}}
+
+{{#option "`--reached` _dir_" }}
+Also test the plan member, or the `[[workspace]]` of the plan, in the directory
+_dir_ (from the workspace root): something the change reaches without touching
+it. A directory the plan does not test is an error. This flag may be specified
+multiple times. With a plan, `-p` names a reached member by package name.
+{{/option}}
+
+{{#option "`--whole-plan`" }}
+Run every request and phase of the plan, whatever changed. It cannot be
+combined with an option that names a change.
+{{/option}}
+
+{{#option "`--run-after` _file_" }}
+Build, and start no test executable until _file_ exists and says `run`. Any
+other content stops the run with exit status 2 and no test run. The plan must
+state `[run] run-after-seconds`, how long the run waits with nothing else to
+do before it ends with exit status 3; that wait is not charged to the run's
+wall bound. A caller that overlaps this run's build with work its tests depend
+on writes the file, whole and by rename, when that work has ended.
+{{/option}}
+
+{{#option "`--run-after-owner` _pid_" }}
+The process that is to write the `--run-after` file. Once it is gone and the
+file is not there, the run stops with exit status 2.
+{{/option}}
+
+{{#option "`--request` _id_" }}
+Narrow the run to the request _id_ of the plan, as a failure's rerun line
+gives it. It never adds a request the selection left out. This flag may be
+specified multiple times.
+{{/option}}
+
+{{/options}}
+
 {{> section-package-selection }}
 
 ### Target Selection
+
+Targo also accepts `--require-test-bin NAME`. It keeps the normal target
+selection and requires exactly one selected binary test harness with that name
+to run and report passing tests. A missing, disabled, feature-ineligible, or
+ambiguous binary is an error, even if other test targets pass. The required
+binary must use the Rust test harness and cannot use a custom target runner.
+This option currently requires Linux or macOS process supervision and a plain
+Rust test-harness summary on stdout. It cannot be combined with `--no-run`;
+authenticated test execution does not yet support its output check.
 
 When no target selection options are given, `cargo test` will build the
 following targets of the selected packages:
@@ -204,6 +298,19 @@ build test binaries separately. For example:
 
 {{> section-exit-status }}
 
+With `--plan` the exit status says how the run ended, and with
+`--message-format=json` the last record, `reason="test-plan-result"`, says the
+same in `outcome` and `exit_status`:
+
+* `0`: Every performed request passed and every requirement of the plan was
+  met; or the selection performs nothing.
+* `101`: Red: a test, a test executable or a build failed, or a test the plan
+  expects to fail passed.
+* `2`: No verdict: the invocation or the plan was refused, a requirement that
+  is no failed test was not met, or a signal interrupted the run.
+* `3`: No verdict: the plan's bound on the run's time, or on the time a test
+  executable prints nothing, ran out, and Targo stopped the run.
+
 ## EXAMPLES
 
 1. Execute all the unit and integration tests of the current package:
@@ -217,6 +324,17 @@ build test binaries separately. For example:
 3. Run only a specific test within a specific integration test:
 
        cargo test --test int_test_name -- modname::test_name
+
+4. Run a test plan over what a commit range changed, as a gate does:
+
+       targo --unverified test --plan tests/test-plans/crates.toml \
+           --changed-range origin/main...HEAD --locked --no-fail-fast
+
+5. Run a test plan from a pre-push hook, which receives the pushed refs on
+   standard input:
+
+       targo --unverified test --plan tests/test-plans/crates.toml \
+           --changed-pushed-refs - --locked --no-fail-fast
 
 ## SEE ALSO
 {{man "cargo" 1}}, {{man "cargo-bench" 1}}, [types of tests](../reference/cargo-targets.html#tests), [how to write tests](https://doc.rust-lang.org/rustc/tests/index.html)

@@ -72,21 +72,21 @@ impl SymbolicFormulaRejectionKind {
     }
 
     #[must_use]
-    fn reason(&self) -> String {
+    fn reason(&self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::UnknownSchema { schema } => {
-                format!("unknown formula schema `{schema}`; expected `{SYMBOLIC_FORMULA_SCHEMA}`")
-            }
-            Self::JsonRoundTripFailed { detail } => {
-                format!("trust-types Formula JSON did not round-trip through schema: {detail}")
-            }
-            Self::MissingStrictSort => {
-                "missing strict SMT sort metadata for trust-types Formula schema".to_string()
-            }
-            Self::UnsupportedTopLevelSort { sort } => format!(
+            Self::UnknownSchema { schema } => std::borrow::Cow::Owned(format!(
+                "unknown formula schema `{schema}`; expected `{SYMBOLIC_FORMULA_SCHEMA}`"
+            )),
+            Self::JsonRoundTripFailed { detail } => std::borrow::Cow::Owned(format!(
+                "trust-types Formula JSON did not round-trip through schema: {detail}"
+            )),
+            Self::MissingStrictSort => std::borrow::Cow::Borrowed(
+                "missing strict SMT sort metadata for trust-types Formula schema",
+            ),
+            Self::UnsupportedTopLevelSort { sort } => std::borrow::Cow::Owned(format!(
                 "unsupported top-level symbolic formula sort {}; supported proof values are Bool, Int, and BitVec",
                 sort.to_smtlib()
-            ),
+            )),
         }
     }
 }
@@ -116,7 +116,12 @@ impl SymbolicFormulaRejection {
     pub fn diagnostic(&self, context: &str) -> String {
         let content = self.content.as_deref().unwrap_or("<unserializable>");
         let digest = self.digest.as_deref().unwrap_or("<unavailable>");
-        let sort = self.sort.as_ref().map_or_else(|| "<unknown>".to_string(), Sort::to_smtlib);
+        let sort = self
+            .sort
+            .as_ref()
+            .map_or(std::borrow::Cow::Borrowed("<unknown>"), |s| {
+                std::borrow::Cow::Owned(s.to_smtlib())
+            });
 
         format!(
             "{context}: trust_symbolic.formula=not-consumed; symbolic-formula-proof-consumer={}; proof-grade=false; formula.schema={}; formula.schema_error={}; formula.schema_error_detail={}; formula_json={}; formula.sha256={}; formula.smtlib2={}; formula.sort={}; formula.debug={}; structured formula payload is preserved but no schema-aware proof consumer accepted it; rejecting instead of Undef",
@@ -220,21 +225,22 @@ pub fn consume_symbolic_formula_with_schema(
             return Err(rejection(
                 schema,
                 formula,
-                Err(detail.clone()),
+                Err(String::new()),
                 Some(sort),
                 SymbolicFormulaRejectionKind::JsonRoundTripFailed { detail },
             ));
         }
     };
 
+    let smtlib_sort = sort.to_smtlib();
     Ok(SymbolicFormulaConsumptionRecord {
         schema: schema.to_string(),
         status: SymbolicFormulaConsumerStatus::Consumed,
         content,
         digest,
         smtlib: formula.to_smtlib(),
-        sort: sort.clone(),
-        smtlib_sort: sort.to_smtlib(),
+        sort,
+        smtlib_sort,
         debug: format!("{formula:?}"),
     })
 }

@@ -6,20 +6,35 @@ identity is `trust`, then writes a candidate `src/stage0` file for rehearsal.
 It does not upload, publish, or contact any remote service.
 """
 
+# ignore-tidy-file-filelength (Trust: one script, run by path and imported whole by its tests)
+
 from __future__ import annotations
 
 import argparse
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import hashlib
 import io
+import importlib.util
 import json
 import os
 import re
 import shlex
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
+
+# Resolve the sibling from this file, including isolated CLI and importlib callers.
+_steps_spec = importlib.util.spec_from_file_location(
+    f"{__name__}._bootstrap_steps", Path(__file__).with_name("bootstrap_steps.py"),
+)
+if _steps_spec is None or _steps_spec.loader is None:
+    raise ImportError("cannot load stage0 Bootstrap step checks")
+_bootstrap_steps = importlib.util.module_from_spec(_steps_spec)
+_steps_spec.loader.exec_module(_bootstrap_steps)
+
 
 try:
     import tomllib
@@ -163,21 +178,10 @@ STAGE0_DIST_PRODUCER_ALIAS_PATTERNS = {
     "trust-src": ('run.alias("trust-src")', "dist::Src"),
     "trust-llvm-tools": ('run.alias("trust-llvm-tools")', "dist::LlvmTools"),
 }
-# These two producers intentionally register a source path and both the owned
-# and compatibility aliases in one returned ShouldRun chain. Whole-file
-# substring checks cannot authenticate that relationship: a matching comment,
-# string, helper, or different Step would otherwise satisfy the audit. Keep the
-# exact Step/body contract here and parse it structurally below.
-STAGE0_DIST_PRODUCER_EXACT_SHOULD_RUN = {
-    "trustc": (
-        "Rustc",
-        'run.path("compiler/rustc").alias("trustc").alias("rustc")',
-    ),
-    "trust-std": (
-        "Std",
-        'run.path("library/std").alias("trust-std").alias("rust-std")',
-    ),
-}
+BOOTSTRAP_COMMAND_LINE_STEP_TRAIT = _bootstrap_steps.BOOTSTRAP_COMMAND_LINE_STEP_TRAIT
+BOOTSTRAP_COMMAND_LINE_STEP_DESCRIPTION = _bootstrap_steps.BOOTSTRAP_COMMAND_LINE_STEP_DESCRIPTION
+BOOTSTRAP_STEP_API_DRIFT_ERROR = _bootstrap_steps.BOOTSTRAP_STEP_API_DRIFT_ERROR
+STAGE0_DIST_PRODUCER_EXACT_SHOULD_RUN = _bootstrap_steps.STAGE0_DIST_PRODUCER_EXACT_SHOULD_RUN
 STAGE0_DIST_PRODUCER_CONFIG_PATTERNS = (
     ("bootstrap.example.toml", "#build.extended = false"),
     ("bootstrap.example.toml", "#build.tools = ["),
@@ -188,7 +192,8 @@ STAGE0_DIST_PRODUCER_CONFIG_PATTERNS = (
     ("bootstrap.example.toml", '"trustfmt"'),
     ("bootstrap.example.toml", '"trust-analyzer"'),
     ("bootstrap.example.toml", '"trust-analysis"'),
-    ("bootstrap.example.toml", '"src"'),
+    # install.rs's `Src` selector; upstream 162423 retired the bare `"src"`.
+    ("bootstrap.example.toml", '"rust-src"'),
     ("bootstrap.example.toml", "#rust.channel = "),
     ("bootstrap.example.toml", "#dist.sign-folder = "),
     ("bootstrap.example.toml", "#dist.upload-addr = "),
@@ -206,6 +211,48 @@ STAGE0_DIST_PRODUCER_ARTIFACT_PATTERNS = (
 STAGE0_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tar.xz")
 STAGE0_ADMISSION_FILENAME = "trust-stage0-admission.json"
 STAGE0_ADMISSION_SCHEMA = "trust.stage0-payload-root-admission.v1"
+# Trust: `--keep-existing-shared` (docs/PLAN.md PKG-S6; docs/DECISION_QUEUE.md
+# SEED-SHARED-BUILDER-CONFIG-1). A second host's run of the same commit
+# pins its own host archives beside the pinned ones and keeps the pinned
+# host-independent (`*`) archive: this run's repack of it is compared member by
+# member with the pinned archive and then discarded, never written to the
+# output root. One member may differ, and only by name, at the package root, as
+# a regular file the installer cannot reach: the dist builder's own bootstrap
+# config. Any other difference refuses.
+KEEP_SHARED_RECORD_FILENAME = "trust-stage0-shared-kept.json"
+KEEP_SHARED_RECORD_SCHEMA = "trust-stage0-shared-kept-v1"
+SHARED_HOST_LOCAL_MEMBER = "builder-config"
+SHARED_HOST_LOCAL_REASON = (
+    "builder-config is the bootstrap config of the host that ran `x.py dist` (its "
+    "absolute paths included), written at the package root beside install.sh. "
+    "install.sh installs only the component directories that `components` names, "
+    "each by its own manifest.in, so no installed file is or carries it; every "
+    "other member of the two archives is identical (docs/OPEN_ISSUES.md "
+    "LINUX-SELF-HOST-1)"
+)
+INSTALLER_DIRECTIVES = ("file:", "dir:")
+# Trust: install.sh splits `components` with `for _component in $_components`
+# (IFS: space, tab and newline, plus pathname expansion), so the file may hold only
+# component-name bytes and those three; any other byte is a split Python reads and
+# install.sh does not.
+INSTALLER_COMPONENTS_BYTES = re.compile(rb"[A-Za-z0-9._\- \t\n]*")
+# Trust: what a shared archive's install.sh may be. rust-installer's generator
+# (src/tools/rust-installer/src/scripter.rs) writes install-template.sh with five
+# slots filled, four single-quoted and the manifest directory bare. This is that
+# template's sha256 at 82bb867edd (unchanged since 60669f9fc2), read for what
+# install.sh can reach; every install.sh of the 82bb867edd cohort is it with plain
+# values (measured 2026-11-13). A template edit changes the digest, and
+# --keep-existing-shared refuses until the edit is read the same way and this
+# digest moved with it.
+INSTALLER_TEMPLATE_SHA256 = "681cbf4f11e8716380a09f997cccaa72c0ecec978a9f4eda93dd43ebf75a965e"
+INSTALLER_TEMPLATE_SLOTS = (
+    ("TEMPLATE_PRODUCT_NAME", r"'[^'$`\\\x00-\x1f\x7f]*'"),
+    ("TEMPLATE_REL_MANIFEST_DIR", r"[A-Za-z0-9][A-Za-z0-9._-]*"),
+    ("TEMPLATE_SUCCESS_MESSAGE", r"'[^'$`\\\x00-\x1f\x7f]*'"),
+    ("TEMPLATE_LEGACY_MANIFEST_DIRS",
+     r"'(?:[A-Za-z0-9][A-Za-z0-9._-]*(?:,[A-Za-z0-9][A-Za-z0-9._-]*)*)?'"),
+    ("TEMPLATE_RUST_INSTALLER_VERSION", r"'[0-9]+'"),
+)
 
 
 class MissingDistTarballs(FileNotFoundError):
@@ -524,6 +571,55 @@ def is_stripped_stage0_secondary_alias(member_name: str) -> bool:
     return member_name in STAGE0_STRIPPED_SECONDARY_ALIASES
 
 
+def stage0_output_member_paths(rebased: str) -> tuple[str, ...]:
+    """Every path the repack emits for the member at `rebased` (already moved to the
+    new top-level prefix): its canonical stage0 path first, then the compatibility
+    aliases emitted beside it, or nothing when the canonical path is stripped.
+
+    The ONE mapping from an input member to output members: `repack_owned_tarball`
+    emits exactly these, and each component's `manifest.in` is rewritten through it
+    (`rewrite_installer_manifest`), so the installer's file list names exactly the
+    files the archive carries.
+    """
+    canonical = rewrite_stage0_tool_member_path(rebased)
+    if is_forbidden_stage0_debugger_bin(canonical) or is_stripped_stage0_secondary_alias(
+        canonical
+    ):
+        return ()
+    return (canonical, *stage0_compat_alias_member_paths(canonical))
+
+
+def rewrite_installer_manifest(manifest_path: str, text: str) -> str:
+    """Rewrite one component's rust-installer `manifest.in` to follow the members.
+
+    `install.sh` copies every `file:` line and fails on one the archive lacks. The
+    repack renames leaves (`bin/rustdoc` onto `bin/trustdoc`, plan T13c's stock
+    names), strips retired aliases and emits compatibility aliases, so each `file:`
+    line is mapped through `stage0_output_member_paths` exactly as its member was:
+    a renamed file is listed under its new name, a stripped one is dropped, an
+    emitted alias is listed, and a duplicate is listed once. `dir:` lines and
+    anything else are kept verbatim (a bulk directory installs whatever it holds).
+    """
+    prefix, component, _ = manifest_path.split("/", 2)
+    base = f"{prefix}/{component}/"
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        if not line.startswith("file:"):
+            if line not in seen:
+                out.append(line)
+                seen.add(line)
+            continue
+        for emitted in stage0_output_member_paths(base + line.removeprefix("file:")):
+            parts = emitted.split("/", 2)
+            entry = "file:" + (parts[2] if len(parts) == 3 else "")
+            if len(parts) != 3 or entry in seen:
+                continue
+            out.append(entry)
+            seen.add(entry)
+    return "".join(f"{line}\n" for line in out)
+
+
 def validate_tippy_repack_sources(
     source_tar: tarfile.TarFile,
     *,
@@ -575,6 +671,12 @@ def rewrite_owned_member_bytes(
 ) -> bytes:
     parts = path.split("/")
     is_installer_components = len(parts) == 2 and parts[-1] == "components"
+    if len(parts) == 3 and parts[-1] == "manifest.in":
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+        return rewrite_installer_manifest(path, text).encode("utf-8")
     should_rewrite = (
         is_installer_components
         or path.endswith("/README.md")
@@ -659,12 +761,12 @@ def repack_owned_tarball(
         for member in source_tar:
             source_member_name = member.name
             fileobj = source_tar.extractfile(member) if member.isfile() else None
-            member.name = rewrite_member_path(member.name, old_prefix, new_prefix)
-            member.name = rewrite_stage0_tool_member_path(member.name)
-            if is_forbidden_stage0_debugger_bin(member.name) or is_stripped_stage0_secondary_alias(
-                member.name
-            ):
+            output_names = stage0_output_member_paths(
+                rewrite_member_path(member.name, old_prefix, new_prefix)
+            )
+            if not output_names:
                 continue
+            member.name = output_names[0]
             if member.linkname and (
                 member.linkname == old_prefix or member.linkname.startswith(old_prefix + "/")
             ):
@@ -687,7 +789,7 @@ def repack_owned_tarball(
                 member.size,
                 hashlib.sha256(data).digest() if data is not None else None,
             )
-            for emitted_name in (member.name, *stage0_compat_alias_member_paths(member.name)):
+            for emitted_name in output_names:
                 if emitted_name in emitted_members:
                     previous_fingerprint, previous_source = emitted_members[emitted_name]
                     if previous_fingerprint != fingerprint:
@@ -1197,373 +1299,69 @@ def file_contains(path: Path, pattern: str) -> bool:
         return False
 
 
-def _rust_tokens(source: str) -> tuple[str, ...] | None:
-    """Tokenize enough Rust to authenticate a small, exact method body.
-
-    Comments and string/character contents must not become executable-looking
-    tokens: producer registration is a fail-closed source audit, so a decoy in
-    either must never satisfy it. This is deliberately not a general Rust
-    parser; malformed or unterminated lexical constructs return ``None``.
-    """
-
-    tokens: list[str] = []
-    index = 0
-    length = len(source)
-    while index < length:
-        char = source[index]
-        if char.isspace():
-            index += 1
-            continue
-
-        if source.startswith("//", index):
-            newline = source.find("\n", index + 2)
-            index = length if newline == -1 else newline + 1
-            continue
-        if source.startswith("/*", index):
-            depth = 1
-            index += 2
-            while index < length and depth:
-                if source.startswith("/*", index):
-                    depth += 1
-                    index += 2
-                elif source.startswith("*/", index):
-                    depth -= 1
-                    index += 2
-                else:
-                    index += 1
-            if depth:
-                return None
-            continue
-
-        raw_prefix = None
-        for prefix in ("br", "cr", "r"):
-            if not source.startswith(prefix, index):
-                continue
-            cursor = index + len(prefix)
-            while cursor < length and source[cursor] == "#":
-                cursor += 1
-            if cursor < length and source[cursor] == '"':
-                raw_prefix = (cursor - index - len(prefix), cursor)
-                break
-        if raw_prefix is not None:
-            hashes, opening_quote = raw_prefix
-            terminator = '"' + "#" * hashes
-            end = source.find(terminator, opening_quote + 1)
-            if end == -1:
-                return None
-            end += len(terminator)
-            tokens.append(source[index:end])
-            index = end
-            continue
-
-        string_prefix = (
-            1
-            if char in {"b", "c"}
-            and index + 1 < length
-            and source[index + 1] == '"'
-            else 0
-        )
-        if char == '"' or string_prefix:
-            start = index
-            index += string_prefix + 1
-            while index < length:
-                if source[index] == "\\":
-                    index += 2
-                    continue
-                if source[index] == '"':
-                    index += 1
-                    tokens.append(source[start:index])
-                    break
-                index += 1
-            else:
-                return None
-            continue
-
-        if char == "'":
-            # Preserve lifetimes as punctuation + identifier, but collapse
-            # character literals so braces/comment markers inside them cannot
-            # perturb structural matching.
-            if index + 2 < length and source[index + 2] == "'":
-                tokens.append(source[index : index + 3])
-                index += 3
-                continue
-            if (
-                index + 3 < length
-                and source[index + 1] == "\\"
-                and source[index + 3] == "'"
-            ):
-                tokens.append(source[index : index + 4])
-                index += 4
-                continue
-
-        if char.isalpha() or char == "_":
-            end = index + 1
-            while end < length and (source[end].isalnum() or source[end] == "_"):
-                end += 1
-            tokens.append(source[index:end])
-            index = end
-            continue
-
-        tokens.append(char)
-        index += 1
-
-    return tuple(tokens)
+# Keep the original helper names and dynamic parser seams available to callers.
+_rust_tokens = _bootstrap_steps._rust_tokens
+_matching_rust_delimiter = _bootstrap_steps._matching_rust_delimiter
+_rust_delimiter_depths = _bootstrap_steps._rust_delimiter_depths
+_rust_comma_separated_items = _bootstrap_steps._rust_comma_separated_items
+_rust_is_simple_path = _bootstrap_steps._rust_is_simple_path
+_rust_block_member_starts = _bootstrap_steps._rust_block_member_starts
 
 
-def _matching_rust_delimiter(tokens: tuple[str, ...], opening: int) -> int | None:
-    pairs = {"(": ")", "[": "]", "{": "}"}
-    if opening >= len(tokens) or tokens[opening] not in pairs:
-        return None
-    stack = [pairs[tokens[opening]]]
-    for index in range(opening + 1, len(tokens)):
-        token = tokens[index]
-        if token in pairs:
-            stack.append(pairs[token])
-        elif token in pairs.values():
-            if token != stack[-1]:
-                return None
-            stack.pop()
-            if not stack:
-                return index
-    return None
+def _rust_root_item_bodies(
+    tokens: tuple[str, ...], depths: tuple[int, ...], header: tuple[str, ...],
+) -> list[tuple[int, int]]:
+    return _bootstrap_steps._rust_root_item_bodies(
+        tokens, depths, header, _matching_rust_delimiter,
+    )
 
 
-def _rust_delimiter_depths(tokens: tuple[str, ...]) -> tuple[int, ...] | None:
-    pairs = {"(": ")", "[": "]", "{": "}"}
-    closing = set(pairs.values())
-    stack: list[str] = []
-    depths: list[int] = []
-    for token in tokens:
-        depths.append(len(stack))
-        if token in pairs:
-            stack.append(pairs[token])
-        elif token in closing:
-            if not stack or token != stack[-1]:
-                return None
-            stack.pop()
-    return None if stack else tuple(depths)
-
-
-def _rust_comma_separated_items(
-    tokens: tuple[str, ...],
-) -> tuple[tuple[str, ...], ...] | None:
-    pairs = {"(": ")", "[": "]", "{": "}"}
-    closing = set(pairs.values())
-    stack: list[str] = []
-    items: list[tuple[str, ...]] = []
-    start = 0
-    for index, token in enumerate(tokens):
-        if token in pairs:
-            stack.append(pairs[token])
-        elif token in closing:
-            if not stack or token != stack[-1]:
-                return None
-            stack.pop()
-        elif token == "," and not stack:
-            item = tokens[start:index]
-            if not item:
-                return None
-            items.append(item)
-            start = index + 1
-    if stack:
-        return None
-    final_item = tokens[start:]
-    if final_item:
-        items.append(final_item)
-    return tuple(items)
-
-
-def _rust_is_simple_path(tokens: tuple[str, ...]) -> bool:
-    if not tokens or not (tokens[0][0].isalpha() or tokens[0][0] == "_"):
-        return False
-    cursor = 1
-    while cursor < len(tokens):
-        if cursor + 2 >= len(tokens) or tokens[cursor : cursor + 2] != (":", ":"):
-            return False
-        segment = tokens[cursor + 2]
-        if not segment or not (segment[0].isalpha() or segment[0] == "_"):
-            return False
-        cursor += 3
-    return True
-
-
-def rust_step_returns_exact_should_run(
-    path: Path,
-    step_type: str,
-    expression: str,
-) -> bool:
-    """Require one Step impl whose should_run body is exactly ``expression``."""
-
+def rust_step_returns_exact_should_run(path: Path, step_type: str, expression: str) -> bool:
+    """Require one root ``impl CommandLineStep for <step_type>`` whose
+    ``should_run`` body is exactly ``expression``."""
     try:
-        source_tokens = _rust_tokens(path.read_text(encoding="utf-8"))
+        source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return False
-    expected_tokens = _rust_tokens(expression)
-    if source_tokens is None or expected_tokens is None:
-        return False
-    delimiter_depths = _rust_delimiter_depths(source_tokens)
-    if delimiter_depths is None:
-        return False
-
-    impl_prefix = ("impl", "Step", "for", step_type, "{")
-    impl_blocks: list[tuple[int, int]] = []
-    for index in range(len(source_tokens) - len(impl_prefix) + 1):
-        if source_tokens[index : index + len(impl_prefix)] != impl_prefix:
-            continue
-        # The producer Step must be a real root item, not tokens nested in a
-        # macro, function, constant, or cfg-disabled attribute. The previous
-        # root token is an item terminator in the concrete source form audited
-        # here; fail closed on qualifiers or attached attributes.
-        if delimiter_depths[index] != 0 or (
-            index > 0 and source_tokens[index - 1] not in {"}", ";"}
-        ):
-            continue
-        opening = index + len(impl_prefix) - 1
-        closing = _matching_rust_delimiter(source_tokens, opening)
-        if closing is not None:
-            impl_blocks.append((opening, closing))
-    if len(impl_blocks) != 1:
-        return False
-
-    impl_open, impl_close = impl_blocks[0]
-    method_prefix = _rust_tokens(
-        "fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {"
+    return _bootstrap_steps.rust_step_returns_exact_should_run(
+        source, step_type, expression, BOOTSTRAP_COMMAND_LINE_STEP_TRAIT,
+        _rust_tokens, _rust_delimiter_depths, _matching_rust_delimiter,
     )
-    assert method_prefix is not None
-    method_blocks: list[tuple[int, int]] = []
-    for index in range(impl_open + 1, impl_close - len(method_prefix) + 1):
-        if source_tokens[index : index + len(method_prefix)] != method_prefix:
-            continue
-        if delimiter_depths[index] != 1 or source_tokens[index - 1] not in {
-            "{",
-            "}",
-            ";",
-        }:
-            continue
-        opening = index + len(method_prefix) - 1
-        closing = _matching_rust_delimiter(source_tokens, opening)
-        if (
-            delimiter_depths[opening] != 1
-            or closing is None
-            or closing > impl_close
-        ):
-            return False
-        method_blocks.append((opening, closing))
-    if len(method_blocks) != 1:
-        return False
-
-    method_open, method_close = method_blocks[0]
-    return source_tokens[method_open + 1 : method_close] == expected_tokens
 
 
 def rust_kind_describes_exact_step(path: Path, kind: str, step_path: str) -> bool:
     """Require an exact step path in Builder's returned ``Kind`` match."""
-
     try:
-        source_tokens = _rust_tokens(path.read_text(encoding="utf-8"))
+        source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return False
-    step_tokens = _rust_tokens(step_path)
-    if source_tokens is None or step_tokens is None:
-        return False
-    delimiter_depths = _rust_delimiter_depths(source_tokens)
-    if delimiter_depths is None or not _rust_is_simple_path(step_tokens):
-        return False
-
-    builder_impl_prefix = _rust_tokens("impl<'a> Builder<'a> {")
-    assert builder_impl_prefix is not None
-    builder_impls: list[tuple[int, int]] = []
-    for index in range(
-        len(source_tokens) - len(builder_impl_prefix) + 1
-    ):
-        if (
-            source_tokens[index : index + len(builder_impl_prefix)]
-            != builder_impl_prefix
-            or delimiter_depths[index] != 0
-        ):
-            continue
-        if index > 0 and source_tokens[index - 1] not in {"}", ";"}:
-            continue
-        opening = index + len(builder_impl_prefix) - 1
-        closing = _matching_rust_delimiter(source_tokens, opening)
-        if closing is not None:
-            builder_impls.append((opening, closing))
-    if len(builder_impls) != 1:
-        return False
-
-    impl_open, impl_close = builder_impls[0]
-    method_prefix = _rust_tokens(
-        "fn get_step_descriptions(kind: Kind) -> Vec<StepDescription> {"
+    return _bootstrap_steps.rust_kind_describes_exact_step(
+        source, kind, step_path, BOOTSTRAP_COMMAND_LINE_STEP_DESCRIPTION,
+        _rust_tokens, _rust_delimiter_depths, _rust_is_simple_path,
+        _matching_rust_delimiter, _rust_comma_separated_items,
     )
-    assert method_prefix is not None
-    method_blocks: list[tuple[int, int]] = []
-    for index in range(impl_open + 1, impl_close - len(method_prefix) + 1):
-        if source_tokens[index : index + len(method_prefix)] != method_prefix:
-            continue
-        if delimiter_depths[index] != 1 or source_tokens[index - 1] not in {
-            "{",
-            "}",
-            ";",
-        }:
-            continue
-        opening = index + len(method_prefix) - 1
-        closing = _matching_rust_delimiter(source_tokens, opening)
-        if closing is not None and closing <= impl_close:
-            method_blocks.append((opening, closing))
-    if len(method_blocks) != 1:
-        return False
 
-    method_open, method_close = method_blocks[0]
-    match_prefix = _rust_tokens("match kind {")
-    assert match_prefix is not None
-    match_blocks: list[tuple[int, int]] = []
-    for index in range(method_open + 1, method_close - len(match_prefix) + 1):
-        if source_tokens[index : index + len(match_prefix)] != match_prefix:
-            continue
-        if delimiter_depths[index] != 2 or source_tokens[index - 1] not in {
-            "{",
-            "}",
-            ";",
-        }:
-            continue
-        opening = index + len(match_prefix) - 1
-        closing = _matching_rust_delimiter(source_tokens, opening)
-        if closing == method_close - 1:
-            match_blocks.append((opening, closing))
-    if len(match_blocks) != 1:
-        return False
 
-    match_open, match_close = match_blocks[0]
-    prefix_tokens = _rust_tokens(f"Kind::{kind} => describe!(")
-    assert prefix_tokens is not None
-    describe_blocks: list[tuple[int, int]] = []
-    for index in range(match_open + 1, match_close - len(prefix_tokens) + 1):
-        if source_tokens[index : index + len(prefix_tokens)] != prefix_tokens:
-            continue
-        if delimiter_depths[index] != 3 or source_tokens[index - 1] not in {
-            "{",
-            ",",
-        }:
-            continue
-        opening = index + len(prefix_tokens) - 1
-        closing = _matching_rust_delimiter(source_tokens, opening)
-        if (
-            closing is not None
-            and closing + 1 < match_close
-            and source_tokens[closing + 1] == ","
-            and delimiter_depths[closing + 1] == 3
-        ):
-            describe_blocks.append((opening, closing))
-    if len(describe_blocks) != 1:
-        return False
+def rust_declares_command_line_step_api(path: Path) -> bool:
+    """Require builder/mod.rs to declare the step API the producer parsers read.
 
-    opening, closing = describe_blocks[0]
-    entries = source_tokens[opening + 1 : closing]
-    items = _rust_comma_separated_items(entries)
-    return (
-        items is not None
-        and all(_rust_is_simple_path(item) for item in items)
-        and items.count(step_tokens) == 1
+    ``rust_step_returns_exact_should_run`` and ``rust_kind_describes_exact_step``
+    match ``impl CommandLineStep for <Step>`` and
+    ``Vec<CommandLineStepDescription>``. Those spellings mean "registered for
+    x.py dist" only while bootstrap still routes ``should_run`` through that
+    trait and that description. Require exactly one root
+    ``trait CommandLineStep`` declaring ``should_run`` and exactly one root
+    ``impl CommandLineStepDescription`` whose ``from`` is bounded by that trait
+    and builds the description from ``S::should_run``.
+    """
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return _bootstrap_steps.rust_declares_command_line_step_api(
+        source, BOOTSTRAP_COMMAND_LINE_STEP_TRAIT, BOOTSTRAP_COMMAND_LINE_STEP_DESCRIPTION,
+        _rust_tokens, _rust_delimiter_depths, _rust_root_item_bodies,
+        _rust_block_member_starts, _matching_rust_delimiter,
     )
 
 
@@ -1598,18 +1396,22 @@ def manifest_target_is_built(entry: object) -> bool:
     )
 
 
-def _manifest_release_identity(manifest: dict[str, object]) -> tuple[object, object]:
+def _manifest_release_identity(manifest: dict[str, object]) -> tuple[object, object, object]:
     date = manifest.get("date")
     if isinstance(date, dt.date):
         date = date.isoformat()
     trust = manifest.get("pkg", {})
     trust = trust.get("trust") if isinstance(trust, dict) else None
     commit = trust.get("git_commit_hash") if isinstance(trust, dict) else None
-    return date, commit
+    version = trust.get("version") if isinstance(trust, dict) else None
+    return date, commit, version
 
 
 def merge_existing_manifest_targets(
-    manifest: dict[str, object], existing_manifest_path: Path
+    manifest: dict[str, object],
+    existing_manifest_path: Path,
+    *,
+    keep_shared: dict[str, dict[str, object]] | None = None,
 ) -> int:
     """Union the *built* per-triple targets of an already-published channel
     manifest into this run's ``manifest`` in place, for a dual-host seed.
@@ -1622,22 +1424,28 @@ def merge_existing_manifest_targets(
     which is exactly what the ``stage0-metadata-coherence-smoke`` bijection gate
     requires. Returns the number of foreign targets adopted.
 
-    Refuses if the existing manifest is a *different* release (top-level ``date``
-    or ``pkg.trust.git_commit_hash`` differ): bootstrap resolves a host's payload
+    Refuses absent or mismatched release date, commit, or version, and mismatched
+    component versions/commits: bootstrap resolves a host's payload
     under the single ``compiler_date`` and would not find it under another date.
+
+    ``keep_shared`` (``--keep-existing-shared``) names, per component, the
+    existing host-independent ``*`` entry that `keep_existing_shared_archives`
+    compared and kept: that entry replaces this run's, and any other existing
+    entry there refuses. Without it the function is unchanged.
     """
     existing = tomllib.loads(existing_manifest_path.read_text(encoding="utf-8"))
-    (new_date, new_commit) = _manifest_release_identity(manifest)
-    (old_date, old_commit) = _manifest_release_identity(existing)
+    (new_date, new_commit, new_version) = _manifest_release_identity(manifest)
+    (old_date, old_commit, old_version) = _manifest_release_identity(existing)
     for label, old, new in (
         ("date", old_date, new_date),
         ("git_commit_hash", old_commit, new_commit),
+        ("version", old_version, new_version),
     ):
-        if old is not None and new is not None and old != new:
+        if not isinstance(old, str) or not old or not isinstance(new, str) or not new or old != new:
             raise ValueError(
                 f"--merge-existing: existing manifest {existing_manifest_path} has "
                 f"{label} {old!r} but this run has {new!r}; both hosts' seeds must be "
-                f"minted from the same committed source (identical date and commit)"
+                f"minted from the same committed source (identical date, commit, and version)"
             )
     existing_pkgs = existing.get("pkg")
     packages = manifest.get("pkg")
@@ -1649,6 +1457,13 @@ def merge_existing_manifest_targets(
             continue
         targets = package.get("target")
         existing_pkg = existing_pkgs.get(component)
+        if isinstance(existing_pkg, dict):
+            for field in ("version", "git_commit_hash"):
+                old, new = existing_pkg.get(field), package.get(field)
+                if (old is not None or new is not None) and old != new:
+                    raise ValueError(
+                        f"--merge-existing: component {component} has mismatched {field}"
+                    )
         existing_targets = existing_pkg.get("target") if isinstance(existing_pkg, dict) else None
         if not isinstance(targets, dict) or not isinstance(existing_targets, dict):
             continue
@@ -1656,10 +1471,435 @@ def merge_existing_manifest_targets(
             if not manifest_target_is_built(existing_entry):
                 continue
             if manifest_target_is_built(targets.get(triple)):
+                if keep_shared is not None and triple == "*" and component in keep_shared:
+                    if existing_entry != keep_shared[component]:
+                        raise ValueError(
+                            f"--keep-existing-shared: the existing {component} '*' entry in "
+                            f"{existing_manifest_path} changed after its archive was compared "
+                            "(it is not the entry that was kept). Nothing was written to the "
+                            "manifest; run prepare.py again"
+                        )
+                    targets[triple] = existing_entry
                 continue  # this run built the same triple -> keep the fresh entry
             targets[triple] = existing_entry
             adopted += 1
     return adopted
+
+
+def archive_member_table(
+    path: Path, prefix: str
+) -> tuple[dict[str, dict[str, object]], dict[str, bytes]]:
+    """Every member of a .tar.xz by name: type, mode, size, sha256 (regular files)
+    and link target; and the bytes of the installer's own files (`components`,
+    `install.sh`, each `<component>/manifest.in`) for `installer_reach_problems`."""
+    table: dict[str, dict[str, object]] = {}
+    texts: dict[str, bytes] = {}
+    with tarfile.open(path, "r:xz") as archive:
+        for member in archive:
+            if member.name in table:
+                raise ValueError(f"{path.name} lists the member {member.name!r} twice")
+            kind = (
+                "file" if member.isfile() else "dir" if member.isdir()
+                else "symlink" if member.issym() else "hardlink" if member.islnk()
+                else f"type-{member.type!r}"
+            )
+            digest = None
+            if member.isfile():
+                handle = archive.extractfile(member)
+                if handle is None:
+                    raise ValueError(f"{path.name}: its member {member.name!r} cannot be read")
+                data = handle.read()
+                digest = hashlib.sha256(data).hexdigest()
+                parts = member.name.split("/")
+                if parts[0] == prefix and (
+                    parts[1:] in (["components"], ["install.sh"])
+                    or (len(parts) == 3 and parts[2] == "manifest.in")
+                ):
+                    texts[member.name] = data
+            table[member.name] = {
+                "type": kind,
+                "mode": member.mode,
+                "size": member.size if member.isfile() else 0,
+                "sha256": digest,
+                "link": member.linkname or None,
+            }
+    return table, texts
+
+
+def installer_line_problem(line: str) -> str | None:
+    """Why install.sh would not install the plain path a `manifest.in` line shows
+    (None: it would). install.sh reads each line with `while read _directive`
+    (no -r), so a backslash is an escape and leading or trailing blanks are
+    dropped: a line with either is not the path it shows (`file:lib/.\\./x` is
+    `lib/../x` to it). The directive is the text before the first ':' and the path
+    the rest; a path is relative, and none of its components is empty, '.' or '..'."""
+    if "\\" in line:
+        return "a backslash, which `read` without -r rewrites"
+    if line != line.strip():
+        return "leading or trailing whitespace, which `read` drops"
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in line) or len(line.splitlines()) > 1:
+        return "a control or line-separator character"
+    directive, colon, listed = line.partition(":")
+    if not colon or directive + colon not in INSTALLER_DIRECTIVES:
+        return "no file: or dir: directive"
+    if not listed:
+        return "an empty path"
+    if listed.startswith("/"):
+        return "an absolute path"
+    if any(part in ("", ".", "..") for part in listed.split("/")):
+        return "an empty, '.' or '..' path component"
+    return None
+
+
+def shared_member_shape_problems(
+    label: str, table: dict[str, dict[str, object]], prefix: str
+) -> list[str]:
+    """Why the member table of a shared archive does not show what its installer
+    can install (empty: it does). install.sh copies with `cp`, which follows a
+    link, so a symlink or hardlink member installs bytes no row holds (a link to
+    '..' or to builder-config reaches the excluded member): every member must be a
+    regular file or a directory, named below the package root with no empty, '.'
+    or '..' component and no backslash. The pinned trust-src of 82bb867edd is
+    4,752 members, every one a regular file or a directory with such a name, and
+    the tarballer writes no hardlinks (measured 2026-11-13)."""
+    problems: list[str] = []
+    links = sorted(name for name, row in table.items() if row["type"] not in ("file", "dir"))
+    if links:
+        shown = ", ".join(
+            f"{name} ({table[name]['type']}"
+            + (f" -> {table[name]['link']}" if table[name]["link"] else "")
+            + ")"
+            for name in links[:5]
+        )
+        problems.append(
+            f"{label} archive has {len(links)} member(s) that are not a regular file or a "
+            f"directory: {shown}{', ...' if len(links) > 5 else ''}"
+        )
+    odd = sorted(
+        name for name in table
+        if name != prefix and (
+            not name.startswith(prefix + "/")
+            or "\\" in name
+            or any(part in ("", ".", "..") for part in name.split("/")[1:])
+        )
+    )
+    if odd:
+        problems.append(
+            f"{label} archive has {len(odd)} member name(s) outside {prefix}/ or with an "
+            f"empty, '.' or '..' component or a backslash: {odd[:5]}"
+        )
+    return problems
+
+
+def installer_template_problem(data: bytes) -> str | None:
+    """Why an install.sh is not rust-installer's install-template.sh (by
+    `INSTALLER_TEMPLATE_SHA256`) with plain values in its five slots (None: it is).
+    Each slot must be one `NAME=<plain value>` line; with the values put back, the
+    script must be the template byte for byte. install.sh is a shell script, so
+    reach is read from what it is, never from what it spells: a glob or a quote
+    split reaches a member without naming it."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return "it is not UTF-8"
+    for slot, value in INSTALLER_TEMPLATE_SLOTS:
+        line = re.compile(rf"^{slot}=(?:{value})$", re.M)
+        found = len(line.findall(text))
+        if found != 1:
+            return f"it has {found} {slot}= line(s) with a plain value, and the template has one"
+        text = line.sub(f"{slot}=%%{slot}%%", text)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if digest != INSTALLER_TEMPLATE_SHA256:
+        return f"with its five slot values put back it has sha256 {digest}"
+    return None
+
+
+def installer_reach_problems(
+    label: str, table: dict[str, dict[str, object]], texts: dict[str, bytes], prefix: str
+) -> list[str]:
+    """Why install.sh could install `<prefix>/builder-config` (empty: it cannot),
+    read from the archive's own installer files: `components` names the component
+    directories as install.sh splits it (`INSTALLER_COMPONENTS_BYTES`), every
+    directory under the package root is one of them, each `<component>/manifest.in`
+    lists `file:`/`dir:` paths inside its directory as install.sh reads them
+    (`installer_line_problem`), and install.sh itself is the reviewed template with
+    plain slot values (`installer_template_problem`) that does not name the member."""
+    member = f"{prefix}/{SHARED_HOST_LOCAL_MEMBER}"
+    problems: list[str] = []
+    row = table.get(member)
+    if row is None or row["type"] != "file":
+        problems.append(
+            f"{label} archive has no regular file {member} (it is "
+            f"{'absent' if row is None else row['type']})"
+        )
+    components_path = f"{prefix}/components"
+    if components_path not in texts:
+        return problems + [f"{label} archive has no regular installer file {components_path}"]
+    raw = texts[components_path]
+    if not INSTALLER_COMPONENTS_BYTES.fullmatch(raw):
+        odd = bytes(sorted({
+            byte for byte in raw if not INSTALLER_COMPONENTS_BYTES.fullmatch(bytes([byte]))
+        }))
+        return problems + [
+            f"{label} archive's {components_path} holds bytes other than letters, digits, "
+            f"'.', '_', '-', space, tab and newline ({odd!r}): install.sh splits it on space, "
+            "tab and newline only, so the components it reads are not the ones another "
+            "split shows"
+        ]
+    # Trust: split as install.sh's `for _component in $_components` does.
+    components = [word.decode("ascii") for word in re.split(rb"[ \t\n]+", raw) if word]
+    if not components:
+        problems.append(f"{label} archive's {components_path} names no component")
+    for component in components:
+        if (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", component)
+            or component == SHARED_HOST_LOCAL_MEMBER
+        ):
+            problems.append(
+                f"{label} archive's {components_path} names {component!r}, which is not "
+                "one component directory below the package root"
+            )
+            continue
+        listing = f"{prefix}/{component}/manifest.in"
+        if listing not in texts:
+            problems.append(f"{label} archive has no regular installer file {listing}")
+            continue
+        try:
+            text = texts[listing].decode("utf-8")
+        except UnicodeDecodeError:
+            problems.append(f"{label} archive's {listing} is not UTF-8")
+            continue
+        # Trust: lines as install.sh's `while read` sees them (split on "\n" only),
+        # each judged by the rule `read` and `${_directive#*:}` apply.
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        for line in lines:
+            why = installer_line_problem(line)
+            if why is not None:
+                problems.append(
+                    f"{label} archive's {listing} has the line {line!r}, which is not a "
+                    f"file: or dir: path inside its component directory ({why})"
+                )
+                break
+    # Trust: a directory components does not name is one whose reach was not read.
+    unlisted = sorted({
+        name.split("/")[1] for name, entry in table.items()
+        if name.startswith(prefix + "/") and (entry["type"] == "dir" or name.count("/") >= 2)
+    } - set(components))
+    if unlisted:
+        problems.append(
+            f"{label} archive has {len(unlisted)} director(ies) directly under {prefix}/ that "
+            f"{components_path} does not name ({unlisted[:5]!r}): only a named component's "
+            "manifest.in says what install.sh installs"
+        )
+    installer = f"{prefix}/install.sh"
+    if installer not in texts:
+        problems.append(f"{label} archive has no regular installer file {installer}")
+    else:
+        if SHARED_HOST_LOCAL_MEMBER.encode() in texts[installer]:
+            problems.append(f"{label} archive's {installer} names {SHARED_HOST_LOCAL_MEMBER}")
+        why = installer_template_problem(texts[installer])
+        if why is not None:
+            problems.append(
+                f"{label} archive's {installer} is not rust-installer's install-template.sh "
+                f"(sha256 {INSTALLER_TEMPLATE_SHA256}) with plain values in its five slots "
+                f"({why}): what another script reaches is not read from its text. An edit "
+                "of the template is read for what install.sh reaches before "
+                "INSTALLER_TEMPLATE_SHA256 moves with it"
+            )
+    return problems
+
+
+def compare_shared_archives(this_run: Path, pinned: Path, prefix: str) -> dict[str, object]:
+    """This run's repack of a shared archive against the pinned archive, member by
+    member (type, mode, size, sha256, link). Refuses any difference but the one
+    `SHARED_HOST_LOCAL_MEMBER` at the package root, and that one only when it is a
+    regular file in both and the installer of each archive cannot reach it; and
+    refuses either archive when a member is a link or another non-regular kind
+    (`shared_member_shape_problems`)."""
+    mine, mine_texts = archive_member_table(this_run, prefix)
+    theirs, theirs_texts = archive_member_table(pinned, prefix)
+    differing = sorted(
+        name for name in mine.keys() | theirs.keys() if mine.get(name) != theirs.get(name)
+    )
+    allowed = f"{prefix}/{SHARED_HOST_LOCAL_MEMBER}"
+    other = [name for name in differing if name != allowed]
+    if other:
+        shown = "; ".join(
+            f"{name}: this run {mine.get(name)}, pinned {theirs.get(name)}" for name in other[:5]
+        )
+        raise ValueError(
+            f"--keep-existing-shared: this run's {this_run.name} and the pinned "
+            f"{pinned} differ in {len(other)} member(s) other than {allowed} "
+            f"({shown}{'; ...' if len(other) > 5 else ''}). Only that one member may "
+            "differ between two hosts' builds of one commit, so the pinned archive "
+            "cannot stand for this run's. Nothing was written to the output root "
+            "or the stage0 file; the pinned archive is untouched and this run's copy "
+            "was discarded"
+        )
+    # Trust: what install.sh installs must be readable from the two tables, so a
+    # link member or an odd name refuses whether or not builder-config differs.
+    problems = shared_member_shape_problems("this run's", mine, prefix)
+    problems += shared_member_shape_problems("the pinned", theirs, prefix)
+    if allowed in differing:
+        problems += installer_reach_problems("this run's", mine, mine_texts, prefix)
+        problems += installer_reach_problems("the pinned", theirs, theirs_texts, prefix)
+    if problems:
+        why = (
+            f"{allowed} differs between this run's {this_run.name} and the pinned {pinned}, "
+            "and it may differ only as a regular file at the package root that install.sh "
+            "cannot install"
+            if allowed in differing else
+            f"the pinned {pinned} stands for this run's {this_run.name} only when install.sh "
+            "can install nothing the member tables do not show"
+        )
+        raise ValueError(
+            f"--keep-existing-shared: {why}: " + "; ".join(problems)
+            + ". Every member must be a regular file or a directory below the package root, "
+            "components and install.sh what rust-installer writes, and every manifest.in "
+            "line a path install.sh reads as written. Nothing was "
+            "written to the output root or the stage0 file; the pinned archive is untouched "
+            "and this run's copy was discarded. Next: rebuild the archive named above (this "
+            "run's from this host's dist, the pinned one by its host) without that member "
+            "or line; until then a second host cannot keep the pinned archive"
+        )
+    excluded: list[dict[str, object]] = []
+    if allowed in differing:
+        excluded.append({
+            "path": SHARED_HOST_LOCAL_MEMBER,
+            "this_run_sha256": mine[allowed]["sha256"],
+            "pinned_sha256": theirs[allowed]["sha256"],
+            "reason": SHARED_HOST_LOCAL_REASON,
+        })
+    canonical = [
+        {"path": name, **theirs[name]} for name in sorted(theirs)
+    ]
+    table_sha256 = hashlib.sha256(
+        "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in canonical)
+        .encode("utf-8")
+    ).hexdigest()
+    return {
+        "members": len(theirs),
+        "pinned_member_table_sha256": table_sha256,
+        "excluded": excluded,
+    }
+
+
+def keep_existing_shared_archives(
+    manifest: dict[str, object],
+    *,
+    existing_manifest_path: Path,
+    input_dist: Path,
+    output_date_dir: Path,
+    date: str,
+    source_channel: str,
+    owned_channel: str,
+    materialized_components: frozenset[str] | None,
+) -> list[dict[str, object]]:
+    """For every host-independent (`*`) target both this run and the existing
+    manifest built: compare this run's repack with the pinned archive, then keep
+    the pinned one. This run's repack is made in a private temporary directory
+    and removed there; nothing of it reaches the output root."""
+    if not existing_manifest_path.is_file() or not existing_manifest_path.read_text(
+        encoding="utf-8"
+    ).strip():
+        raise ValueError(
+            f"--keep-existing-shared: there is no existing manifest at {existing_manifest_path} "
+            "to keep a shared archive from. Nothing was written. Put the pinned channel "
+            "manifest there (with its archives beside it), or run without --keep-existing-shared"
+        )
+    existing = tomllib.loads(existing_manifest_path.read_text(encoding="utf-8"))
+    existing_packages = existing.get("pkg")
+    packages = manifest.get("pkg")
+    if not isinstance(existing_packages, dict) or not isinstance(packages, dict):
+        raise ValueError(
+            f"--keep-existing-shared: {existing_manifest_path} or this run's manifest has no "
+            "[pkg] table. Nothing was written"
+        )
+    kept: list[dict[str, object]] = []
+    for component, package in packages.items():
+        if materialized_components is not None and component not in materialized_components:
+            continue
+        targets = package.get("target") if isinstance(package, dict) else None
+        shared = targets.get("*") if isinstance(targets, dict) else None
+        if not manifest_target_is_built(shared):
+            continue
+        owned = stage0_component_name(component)
+        existing_package = existing_packages.get(owned)
+        existing_targets = (
+            existing_package.get("target") if isinstance(existing_package, dict) else None
+        )
+        existing_entry = existing_targets.get("*") if isinstance(existing_targets, dict) else None
+        if not manifest_target_is_built(existing_entry):
+            print(
+                f"stage0 merge:    {owned} has no pinned '*' archive in "
+                f"{existing_manifest_path}; this run's is pinned"
+            )
+            continue
+        old_name = Path(str(shared["xz_url"])).name
+        new_name = stage0_tarball_filename(
+            old_name, source_channel=source_channel, owned_channel=owned_channel
+        )
+        pinned_name = Path(str(existing_entry["xz_url"])).name
+        if pinned_name != new_name:
+            raise ValueError(
+                f"--keep-existing-shared: {owned} '*' is {new_name} in this run and "
+                f"{pinned_name} in {existing_manifest_path}; one archive cannot stand for "
+                "another. Nothing was written"
+            )
+        pinned = output_date_dir / new_name
+        pinned_hash = existing_entry.get("xz_hash")
+        if pinned.is_symlink() or not pinned.is_file():
+            raise ValueError(
+                f"--keep-existing-shared: the pinned {owned} archive {pinned} is not a regular "
+                f"file there ({existing_manifest_path} pins it with sha256 {pinned_hash}). "
+                "Nothing was written. Put the pinned archive at that path"
+            )
+        actual = sha256_file(pinned)
+        if actual != pinned_hash:
+            raise ValueError(
+                f"--keep-existing-shared: {pinned} has sha256 {actual}, and "
+                f"{existing_manifest_path} pins {pinned_hash}. Nothing was written. Put the "
+                "pinned archive at that path"
+            )
+        source = source_tarball(input_dist, old_name, date)
+        with tempfile.TemporaryDirectory(prefix="trust-stage0-shared-") as side:
+            this_run = Path(side) / new_name
+            repack_owned_tarball(
+                source,
+                this_run,
+                old_filename=old_name,
+                new_filename=new_name,
+                source_channel=source_channel,
+                owned_channel=owned_channel,
+            )
+            this_run_sha256 = sha256_file(this_run)
+            compared = compare_shared_archives(this_run, pinned, tarball_prefix(new_name))
+        if sha256_file(pinned) != pinned_hash:
+            raise ValueError(
+                f"--keep-existing-shared: {pinned} changed while it was compared. Nothing "
+                "was written"
+            )
+        kept.append({
+            "component": owned,
+            "source_component": component,
+            "filename": new_name,
+            "pinned_sha256": pinned_hash,
+            "this_run_sha256": this_run_sha256,
+            "this_run_discarded": True,
+            "existing_entry": existing_entry,
+            **compared,
+        })
+        excluded = ", ".join(str(row["path"]) for row in compared["excluded"]) or "none"
+        print(
+            f"stage0 merge:    kept the pinned {new_name} (sha256 {pinned_hash}); this run's "
+            f"repack (sha256 {this_run_sha256}) has the same {compared['members']} members "
+            f"except: {excluded}; it was discarded"
+        )
+        for row in compared["excluded"]:
+            print(f"stage0 merge:    {row['path']} excluded from the comparison: {row['reason']}")
+    return kept
 
 
 def local_stage0_dist_root(root: Path, dist_server: str) -> Path | None:
@@ -2013,6 +2253,8 @@ def producer_command_preflight_errors(root: Path) -> tuple[str, ...]:
 
     dist_steps = root / "src/bootstrap/src/core/build_steps/dist.rs"
     builder = root / "src/bootstrap/src/core/builder/mod.rs"
+    if builder.is_file() and not rust_declares_command_line_step_api(builder):
+        errors.append(BOOTSTRAP_STEP_API_DRIFT_ERROR)
     for alias, (step_pattern, builder_pattern) in STAGE0_DIST_PRODUCER_ALIAS_PATTERNS.items():
         exact_should_run = STAGE0_DIST_PRODUCER_EXACT_SHOULD_RUN.get(alias)
         if not dist_steps.is_file():
@@ -2071,6 +2313,10 @@ def producer_command_preflight_report_lines(root: Path) -> list[str]:
         ),
         "verified_surface:",
         "  - bootstrap global --dry-run flag is declared",
+        (
+            "  - bootstrap routes should_run through CommandLineStep and "
+            "CommandLineStepDescription"
+        ),
         "  - requested x.py dist aliases are registered or path-addressable",
         "  - requested dist steps are described under Kind::Dist",
         "  - trust-std producer emits a Trust-owned archive name",
@@ -2204,7 +2450,13 @@ def rewrite_manifest(
     archive_format: str,
     materialized_components: frozenset[str] | None = None,
     strict_target_archives: bool = False,
+    jobs: int = 1,
+    keep_targets: frozenset[tuple[str, str]] = frozenset(),
 ) -> None:
+    """`keep_targets` (component, target key) are left as they are: no archive is
+    written for them (`--keep-existing-shared` puts the pinned entry there)."""
+    if type(jobs) is not int or jobs < 1:
+        raise ValueError("archive jobs must be a positive integer")
     packages = manifest.get("pkg")
     if not isinstance(packages, dict):
         raise ValueError("manifest is missing [pkg] table")
@@ -2222,6 +2474,7 @@ def rewrite_manifest(
     )
 
     manifest["date"] = date
+    rewrite_targets: list[dict[str, object]] = []
     for component, package in packages.items():
         if not isinstance(package, dict):
             continue
@@ -2235,22 +2488,86 @@ def rewrite_manifest(
         if not isinstance(targets, dict):
             continue
         for target_key, target in targets.items():
+            if (component, target_key) in keep_targets:
+                continue
             if isinstance(target_key, str) and isinstance(target, dict):
                 if strict_target_archives and not target_archives_match_target_key(
                     target_key, target
                 ):
                     mark_target_unavailable(target)
                     continue
-                rewrite_target_urls(
-                    target,
-                    input_dist=input_dist,
-                    output_date_dir=output_date_dir,
-                    date=date,
-                    dist_server=dist_server,
-                    source_channel=source_channel,
-                    owned_channel=owned_channel,
-                    archive_format=archive_format,
-                )
+                rewrite_targets.append(target)
+
+    # A task owns one target dict and all its output files. Shared targets or
+    # repeated references to the exact same input/output retain serial order;
+    # different producers must never race (or silently overwrite) one output.
+    outputs: dict[Path | tuple[int, int], tuple[Path, str, str]] = {}
+    inputs: set[Path | tuple[int, int]] = set()
+    archives: list[tuple[Path, str, str, Path, tuple[int, int]]] = []
+    serial_aliases = len({id(target) for target in rewrite_targets}) != len(rewrite_targets)
+    output_parent = output_date_dir.resolve()
+    for target in rewrite_targets:
+        for url_key, _ in archive_url_keys(archive_format):
+            value = target.get(url_key)
+            if not isinstance(value, str) or not value:
+                continue
+            old_name = Path(value).name
+            new_name = stage0_tarball_filename(
+                old_name, source_channel=source_channel, owned_channel=owned_channel
+            )
+            src = source_tarball(input_dist, old_name, date).resolve(strict=True)
+            dst = (output_date_dir / new_name).resolve()
+            source_stat = src.stat()
+            source_inode = (source_stat.st_dev, source_stat.st_ino)
+            inputs.update((src, source_inode))
+            archives.append((src, old_name, new_name, dst, source_inode))
+
+    # Collect every selected input before checking any output: an earlier
+    # destination must not truncate a later input through a path or hardlink.
+    for src, old_name, new_name, dst, source_inode in archives:
+        if dst.parent != output_parent or dst == src:
+            # Trust: wrapped to tidy's 100-column limit; the message is unchanged.
+            raise ValueError(
+                "archive destination escapes its output directory or aliases its source: "
+                f"{dst}"
+            )
+        identity = (src, old_name, new_name)
+        destination_keys: list[Path | tuple[int, int]] = [dst]
+        if dst.exists():
+            existing = dst.stat()
+            inode = (existing.st_dev, existing.st_ino)
+            if inode == source_inode:
+                raise ValueError(f"archive destination aliases its source: {dst}")
+            destination_keys.append(inode)
+        if any(key in inputs for key in destination_keys):
+            raise ValueError(f"archive destination aliases a selected input: {dst}")
+        for key in destination_keys:
+            previous = outputs.get(key)
+            if previous is not None and previous != identity:
+                raise ValueError(f"conflicting archive producers share destination {dst}")
+            serial_aliases |= previous is not None
+            outputs[key] = identity
+
+    def rewrite(target: dict[str, object]) -> None:
+        rewrite_target_urls(
+            target,
+            input_dist=input_dist,
+            output_date_dir=output_date_dir,
+            date=date,
+            dist_server=dist_server,
+            source_channel=source_channel,
+            owned_channel=owned_channel,
+            archive_format=archive_format,
+        )
+
+    if jobs == 1 or serial_aliases or len(rewrite_targets) < 2:
+        for target in rewrite_targets:
+            rewrite(target)
+    else:
+        with ThreadPoolExecutor(max_workers=min(jobs, len(rewrite_targets))) as executor:
+            # Consume in manifest order; exceptions propagate before channel
+            # metadata is written, after all owned workers have settled.
+            list(executor.map(rewrite, rewrite_targets))
     rename_stage0_manifest_packages(packages)
     rewrite_stage0_profile_components(manifest)
     rewrite_stage0_renames(manifest)
@@ -2468,6 +2785,19 @@ def component_archive_version(
 
 
 def prepare(args: argparse.Namespace) -> None:
+    if getattr(args, "keep_existing_shared", False):
+        if not args.merge_existing:
+            raise ValueError(
+                "--keep-existing-shared needs --merge-existing: it keeps a shared archive "
+                "that an existing manifest in the output root pins, and only a merge reads "
+                "that manifest. Nothing was written. Give both, or neither"
+            )
+        if args.archive_format != "xz":
+            raise ValueError(
+                f"--keep-existing-shared compares .tar.xz archives, and --archive-format is "
+                f"{args.archive_format}: the seed pins .tar.xz alone. Nothing was written. "
+                "Give --archive-format xz"
+            )
     if args.check_producer_command_only:
         root = repo_root()
         errors = producer_command_preflight_errors(root)
@@ -2605,6 +2935,20 @@ def prepare(args: argparse.Namespace) -> None:
 
     output_dist = output_root / "dist"
     output_date_dir = output_dist / date
+    existing_manifest = output_dist / f"channel-rust-{args.owned_channel}.toml"
+    kept_shared: list[dict[str, object]] = []
+    if getattr(args, "keep_existing_shared", False):
+        # Before anything is written: a refusal here leaves the output root as it was.
+        kept_shared = keep_existing_shared_archives(
+            manifest,
+            existing_manifest_path=existing_manifest,
+            input_dist=input_dist,
+            output_date_dir=output_date_dir,
+            date=date,
+            source_channel=args.source_channel,
+            owned_channel=args.owned_channel,
+            materialized_components=materialized_components,
+        )
     output_date_dir.mkdir(parents=True, exist_ok=True)
     rewrite_manifest(
         manifest,
@@ -2617,14 +2961,23 @@ def prepare(args: argparse.Namespace) -> None:
         archive_format=args.archive_format,
         materialized_components=materialized_components,
         strict_target_archives=args.stage0_seed_only,
+        jobs=args.jobs,
+        keep_targets=frozenset((str(row["source_component"]), "*") for row in kept_shared),
     )
     if args.stage0_seed_only:
         manifest.pop("artifacts", None)
 
     if args.merge_existing:
-        existing_manifest = output_dist / f"channel-rust-{args.owned_channel}.toml"
         if existing_manifest.is_file() and existing_manifest.read_text(encoding="utf-8").strip():
-            adopted = merge_existing_manifest_targets(manifest, existing_manifest)
+            adopted = merge_existing_manifest_targets(
+                manifest,
+                existing_manifest,
+                keep_shared=(
+                    {str(row["component"]): row["existing_entry"] for row in kept_shared}
+                    if getattr(args, "keep_existing_shared", False)
+                    else None
+                ),
+            )
             if adopted:
                 print(
                     f"stage0 merge:    adopted {adopted} foreign-host manifest target(s) "
@@ -2634,6 +2987,16 @@ def prepare(args: argparse.Namespace) -> None:
                     "stage0 merge:    manifest, admission, checksums, and manifest_hash "
                     "now cover both hosts"
                 )
+    for row in kept_shared:
+        packages = manifest.get("pkg")
+        package = packages.get(row["component"]) if isinstance(packages, dict) else None
+        targets = package.get("target") if isinstance(package, dict) else None
+        if not isinstance(targets, dict) or targets.get("*") != row["existing_entry"]:
+            raise ValueError(
+                f"--keep-existing-shared: after the merge, {row['component']} '*' is not the "
+                f"pinned entry for {row['filename']}. Nothing was written to the manifest, "
+                "the admission or the stage0 file"
+            )
 
     manifest_text = dump_toml(manifest)
     manifest_bytes = manifest_text.encode("utf-8")
@@ -2694,13 +3057,45 @@ def prepare(args: argparse.Namespace) -> None:
             encoding="utf-8",
         )
 
+    kept_record = None
+    if getattr(args, "keep_existing_shared", False):
+        kept_record = output_root / KEEP_SHARED_RECORD_FILENAME
+        kept_record.write_text(
+            json.dumps(
+                {
+                    "schema": KEEP_SHARED_RECORD_SCHEMA,
+                    "date": date,
+                    "git_commit_hash": git_commit_hash,
+                    "manifest_hash": manifest_hash,
+                    "kept": [
+                        {key: value for key, value in row.items()
+                         if key not in ("existing_entry", "source_component")}
+                        for row in kept_shared
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
     print(f"trust dist root: {output_root}")
     print(f"trust channel:   {args.owned_channel}")
     print(f"manifest:        {latest_manifest}")
     print(f"admission:       {admission_manifest}")
     print(f"trustc-dev artifacts checked: {len(rustc_dev_artifacts)}")
+    if kept_record is not None:
+        print(f"shared kept:     {kept_record} ({len(kept_shared)} archive(s))")
     if args.stage0_output is not None:
         print(f"stage0 candidate:{args.stage0_output}")
+
+
+def positive_jobs(value: str) -> int:
+    jobs = int(value)
+    if jobs < 1:
+        raise argparse.ArgumentTypeError("archive jobs must be a positive integer")
+    return jobs
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -2709,6 +3104,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=Path("bootstrap/trust-stage0"))
     parser.add_argument("--source-channel", default="trust")
     parser.add_argument("--owned-channel", default="trust")
+    parser.add_argument(
+        "--jobs",
+        type=positive_jobs,
+        default=1,
+        help="Maximum independent archive targets to prepare concurrently (default: 1).",
+    )
     parser.add_argument(
         "--archive-format",
         choices=("xz", "gz", "both"),
@@ -2797,6 +3198,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "payload pins. Use to build a dual-host src/stage0: mint each host's "
             "seed from the SAME committed source, then merge. Refuses if the "
             "existing file's compiler/rustfmt version, date, or commit differ."
+        ),
+    )
+    parser.add_argument(
+        "--keep-existing-shared",
+        action="store_true",
+        help=(
+            "With --merge-existing and --archive-format xz: for every host-independent "
+            "('*') archive both this run and the existing manifest built, keep the "
+            "existing (pinned) archive and entry. This run's repack is compared with it "
+            "member by member (path, type, mode, size, sha256, link) in a temporary "
+            "directory and discarded; any difference but the package-root builder-config "
+            "(a regular file install.sh cannot reach) refuses. Writes "
+            f"{KEEP_SHARED_RECORD_FILENAME} into the output root."
         ),
     )
     return parser.parse_args(argv)

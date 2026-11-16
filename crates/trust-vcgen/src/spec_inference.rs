@@ -169,6 +169,15 @@ impl SpecInferenceEngine {
     #[must_use]
     pub fn infer(&self, func: &VerifiableFunction) -> InferenceResult {
         let mut result = InferenceResult { function_name: func.name.clone(), specs: Vec::new() };
+        if !self.type_based && !self.name_based && !self.assertion_based {
+            return result;
+        }
+        // Do not turn a diagnostic constant into a candidate contract through
+        // the legacy total formula renderer. No specification is inferred for
+        // an unsupported body; ordinary verification emits its refusal row.
+        if crate::generate::body_contains_memory_image_for(func) {
+            return result;
+        }
 
         if self.type_based {
             self.infer_from_types(func, &mut result);
@@ -187,24 +196,19 @@ impl SpecInferenceEngine {
     fn infer_from_types(&self, func: &VerifiableFunction, result: &mut InferenceResult) {
         // Unsigned integer parameters are always >= 0 (trivially true, but useful
         // for downstream analysis that works in mathematical integers).
-        for (idx, local) in func.body.locals.iter().enumerate() {
-            // Skip return value (index 0) and non-argument locals.
-            if idx == 0 || idx > func.body.arg_count {
-                continue;
-            }
-            let var_name = local.name.as_deref().unwrap_or(&format!("_{idx}")).to_string();
-
+        for (idx, local) in
+            func.body.locals.iter().enumerate().take(func.body.arg_count.saturating_add(1)).skip(1)
+        {
             match &local.ty {
                 Ty::Int { width, signed: false } => {
+                    let var_name = local.name.clone().unwrap_or_else(|| format!("_{idx}"));
+                    let param_var = Formula::Var(var_name, Sort::Int);
                     // Unsigned: 0 <= param < 2^width
                     result.specs.push(InferredSpec {
                         formula: Formula::And(vec![
-                            Formula::Ge(
-                                Box::new(Formula::Var(var_name.clone(), Sort::Int)),
-                                Box::new(Formula::Int(0)),
-                            ),
+                            Formula::Ge(Box::new(param_var.clone()), Box::new(Formula::Int(0))),
                             Formula::Le(
-                                Box::new(Formula::Var(var_name, Sort::Int)),
+                                Box::new(param_var),
                                 Box::new(unsigned_max_formula(*width)),
                             ),
                         ]),
@@ -215,15 +219,17 @@ impl SpecInferenceEngine {
                     });
                 }
                 Ty::Int { width, signed: true } => {
+                    let var_name = local.name.clone().unwrap_or_else(|| format!("_{idx}"));
+                    let param_var = Formula::Var(var_name, Sort::Int);
                     // Signed: -2^(width-1) <= param <= 2^(width-1)-1
                     result.specs.push(InferredSpec {
                         formula: Formula::And(vec![
                             Formula::Ge(
-                                Box::new(Formula::Var(var_name.clone(), Sort::Int)),
+                                Box::new(param_var.clone()),
                                 Box::new(signed_min_formula(*width)),
                             ),
                             Formula::Le(
-                                Box::new(Formula::Var(var_name, Sort::Int)),
+                                Box::new(param_var),
                                 Box::new(signed_max_formula(*width)),
                             ),
                         ]),
@@ -248,14 +254,15 @@ impl SpecInferenceEngine {
         // Return type inference.
         match &func.body.return_ty {
             Ty::Int { width, signed: false } => {
+                let ret_var = Formula::var("_0", Sort::Int);
                 result.specs.push(InferredSpec {
                     formula: Formula::And(vec![
                         Formula::Ge(
-                            Box::new(Formula::Var("_0".into(), Sort::Int)),
+                            Box::new(ret_var.clone()),
                             Box::new(Formula::Int(0)),
                         ),
                         Formula::Le(
-                            Box::new(Formula::Var("_0".into(), Sort::Int)),
+                            Box::new(ret_var),
                             Box::new(unsigned_max_formula(*width)),
                         ),
                     ]),
@@ -267,14 +274,15 @@ impl SpecInferenceEngine {
             }
             Ty::Bool => {
                 // Boolean return: result is 0 or 1 (in integer encoding).
+                let ret_var = Formula::var("_0", Sort::Bool);
                 result.specs.push(InferredSpec {
                     formula: Formula::Or(vec![
                         Formula::Eq(
-                            Box::new(Formula::Var("_0".into(), Sort::Bool)),
+                            Box::new(ret_var.clone()),
                             Box::new(Formula::Bool(true)),
                         ),
                         Formula::Eq(
-                            Box::new(Formula::Var("_0".into(), Sort::Bool)),
+                            Box::new(ret_var),
                             Box::new(Formula::Bool(false)),
                         ),
                     ]),
@@ -297,14 +305,15 @@ impl SpecInferenceEngine {
             if matches!(func.body.return_ty, Ty::Bool) {
                 // Already typed as bool — no additional spec needed.
             } else {
+                let ret_var = Formula::var("_0", Sort::Int);
                 result.specs.push(InferredSpec {
                     formula: Formula::Or(vec![
                         Formula::Eq(
-                            Box::new(Formula::Var("_0".into(), Sort::Int)),
+                            Box::new(ret_var.clone()),
                             Box::new(Formula::Int(0)),
                         ),
                         Formula::Eq(
-                            Box::new(Formula::Var("_0".into(), Sort::Int)),
+                            Box::new(ret_var),
                             Box::new(Formula::Int(1)),
                         ),
                     ]),
@@ -324,7 +333,7 @@ impl SpecInferenceEngine {
         {
             result.specs.push(InferredSpec {
                 formula: Formula::Ge(
-                    Box::new(Formula::Var("_0".into(), Sort::Int)),
+                    Box::new(Formula::var("_0", Sort::Int)),
                     Box::new(Formula::Int(0)),
                 ),
                 reason: format!("'{name}' naming convention suggests non-negative return"),
@@ -335,10 +344,9 @@ impl SpecInferenceEngine {
         }
 
         // Parameter naming: "index" or "idx" params should be >= 0.
-        for (idx, local) in func.body.locals.iter().enumerate() {
-            if idx == 0 || idx > func.body.arg_count {
-                continue;
-            }
+        for (_, local) in
+            func.body.locals.iter().enumerate().take(func.body.arg_count.saturating_add(1)).skip(1)
+        {
             if let Some(name) = &local.name
                 && (name == "index"
                     || name == "idx"
@@ -361,6 +369,11 @@ impl SpecInferenceEngine {
 
     /// Assertion-based inference: lift assert conditions to preconditions.
     fn infer_from_assertions(&self, func: &VerifiableFunction, result: &mut InferenceResult) {
+        if crate::generate::cached_terminator_presence_for_body(&func.body)
+            .is_some_and(|tp| !tp.has_assert)
+        {
+            return;
+        }
         for block in &func.body.blocks {
             if let Terminator::Assert { cond, expected, msg, .. } = &block.terminator {
                 // An Assert terminator checks `cond == expected`. If the function
@@ -436,6 +449,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -460,6 +474,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -499,6 +514,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -526,6 +542,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -553,6 +570,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -781,6 +799,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let result = engine.infer(&func);
         assert!(result.is_empty(), "unit -> unit function should have no inferred specs");

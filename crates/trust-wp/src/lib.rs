@@ -4,7 +4,8 @@
 // Target contract architecture:
 // designs/2026-04-25-trust-contracts-first-class-target.md.
 // Preserves standalone TrustWP compatibility APIs and historical wire readers.
-// The compiler/full-verifier owns no TrustWP proof route.
+// This legacy facade grants no proof authority. The full verifier's native
+// body-WP alternative uses first-party trust-wp-lib directly.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -29,7 +30,8 @@
 //!          |
 //!          +--[explicit API]--> standalone compatibility subprocess bridge
 //!
-//! Compiler/full-verifier: no TrustWP route; always Unsupported
+//! This facade: no compiler/full-verifier route; always Unsupported
+//! Native body-WP: first-party trust-wp-lib via trust-router
 //! ```
 //!
 //! ## Feature Flags
@@ -40,8 +42,8 @@
 //! ## Why standalone types?
 //!
 //! By default this crate defines standalone compatibility types without linking
-//! trust_wp internals. With `trust-build`, it also links `trust-wp-core`/`trust-wp-ay`
-//! and retains typed `PureExpr` replay support. The full-verification engine
+//! trust_wp internals. With `trust-build`, it also links `trust-wp-core`
+//! and retains historical typed replay inspection. The full-verification engine
 //! advertises zero TrustWP-owned kinds: the formula-less RustHorn `&mut`
 //! give-back record is not a dischargeable proof obligation.
 //! Consequently neither this CLI compatibility API nor historical replay
@@ -52,7 +54,6 @@ mod cli;
 mod config;
 mod contract;
 mod error;
-mod native;
 mod result;
 mod verifier_api;
 
@@ -61,20 +62,10 @@ pub use cli::CliBackend;
 pub use config::{DiagConfig, TrustWpConfig};
 pub use contract::{Contract, ContractKind, ContractSet};
 pub use error::TrustWpLibError;
-pub use native::{
-    NativeContract, NativeContractBundle, NativeFunctionTarget, NativeLoopContract,
-    NativeLoopContractRole, NativeResultBinding, NativeSnapshot, NativeSummaryRef,
-    NativeTrustWpRequest, NativeTrustWpResult, NativeTrustWpStatus, NativeUnsupportedFeature,
-    NativeUnsupportedKind, verify_native,
-};
-#[cfg(feature = "trust-build")]
-pub use native::{NativePureBody, NativeTrustWpExpr, NativeTrustWpMir};
 pub use result::{
     DiagLevel, DiagnosticMessage, FunctionVerdict, LoopInvariant, TrustWpResult, Verdict,
     VerificationCounts,
 };
-#[cfg(feature = "trust-build")]
-pub use verifier_api::trust_wp_native_replay_metadata_entries_from_trust_ir_bundle;
 pub use verifier_api::{
     TRUST_TRUST_WP_CLAIM_DIGEST_METADATA_KEY, TRUST_TRUST_WP_NATIVE_ORIGIN_METADATA_KEY,
     TRUST_TRUST_WP_NATIVE_REPLAY_METADATA_KEY, TRUST_TRUST_WP_NATIVE_REPLAY_REQUIRED_METADATA_KEYS,
@@ -84,6 +75,11 @@ pub use verifier_api::{
     TRUST_TRUST_WP_TRUST_IR_SOURCE_SPAN_METADATA_KEY, TRUST_WP_ENGINE_NAME,
     TRUST_WP_NATIVE_NOT_WIRED, TrustWpVerificationEngine, is_trust_wp_owned_obligation_kind,
     trust_wp_owned_obligation_kinds,
+};
+#[cfg(feature = "trust-build")]
+pub use verifier_api::{
+    trust_wp_native_formula_from_trust_spec,
+    trust_wp_native_replay_metadata_entries_from_trust_ir_bundle,
 };
 
 /// Run the standalone trust-wp CLI compatibility protocol.
@@ -99,9 +95,9 @@ pub use verifier_api::{
 /// delegates to the subprocess `CliBackend` and derives a verdict from the
 /// parsed `TRUST_WP_RESULT:v1` text protocol. The R4 flip (2026-08-20) retired
 /// this lane from every compiler-reachable verdict path: trustc's per-VC
-/// router backend (`trust_router::trust_wp_backend`) verifies through the
-/// typed in-process [`TrustWpVerificationEngine`] instead, and a trust-router
-/// test pins that the compiler route is invariant to `TRUST_WP_PATH`.
+/// router uses its canonical constant evaluator for formula-only requests;
+/// body-aware WP uses the independent typed TrustIR engine in the full verifier.
+/// A trust-router test pins that its per-VC route is invariant to `TRUST_WP_PATH`.
 /// This API is not registered as a compiler or full-verifier backend. It may be
 /// used by explicit compatibility tooling, but its parsed subprocess verdict is
 /// never proof authority. Compiler/full-verifier paths do not call this API;

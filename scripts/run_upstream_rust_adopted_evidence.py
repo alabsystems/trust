@@ -33,6 +33,23 @@ from typing import Any, Mapping, Sequence
 UTC = timezone.utc
 
 
+def _require_python_311() -> None:
+    if sys.version_info >= (3, 11):
+        return
+    for minor in (14, 13, 12, 11):
+        candidate = shutil.which(f"python3.{minor}")
+        if candidate:
+            os.execv(candidate, [candidate, *sys.argv])
+    raise SystemExit(
+        "run_upstream_rust_adopted_evidence.py requires Python >=3.11 (tomllib); "
+        f"found {sys.version.split()[0]}"
+    )
+
+
+_require_python_311()
+import tomllib  # noqa: E402  (loaded only after the version gate/re-exec)
+
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STAGE2_SYSROOT = REPO_ROOT / "build" / "aarch64-apple-darwin" / "stage2"
 GUARD_SCRIPT = "./scripts/check_upstream_rust_test_toolchain.sh"
@@ -242,13 +259,6 @@ def parse_trustc_verbose(stdout: str) -> dict[str, str]:
 
 
 def load_toml(path: Path) -> dict[str, Any]:
-    try:
-        import tomllib
-    except ModuleNotFoundError as error:
-        raise RuntimeError(
-            "TOML parsing requires Python 3.11+ with tomllib; use python3.11 or newer"
-        ) from error
-
     with path.open("rb") as handle:
         return tomllib.load(handle)
 
@@ -370,53 +380,134 @@ def rebuild_guard_lines(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if pattern.search(line)]
 
 
-def full_suite_commands(stage2_sysroot: Path, baseline: str, tracked: str | None) -> list[dict[str, Any]]:
+def native_stage2_host_triple(
+    stage2_sysroot: Path, trustc: CommandResult, guard: CommandResult
+) -> str | None:
+    if guard.exit_status != 0 or trustc.exit_status != 0 or trustc.timed_out:
+        return None
+    host = parse_trustc_verbose(trustc.stdout_excerpt).get("host")
+    if (
+        stage2_sysroot.name != "stage2"
+        or host != stage2_sysroot.parent.name
+        or re.fullmatch(r"(?:aarch64|x86_64)-[a-z0-9_-]+", host or "") is None
+    ):
+        return None
+    if not (host.endswith("-apple-darwin") or "-linux-" in host):
+        return None
+    return host
+
+
+def full_suite_commands(
+    root: Path,
+    stage2_sysroot: Path,
+    report_dir: Path,
+    baseline: str,
+    tracked: str | None,
+    native_host: str | None,
+    run_id: str,
+) -> list[dict[str, Any]]:
     bin_dir = stage2_sysroot / "bin"
     lib_dir = stage2_sysroot / "lib"
-    env_prefix = [
-        f"DYLD_LIBRARY_PATH={lib_dir}${{DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}}",
-        f"PATH={bin_dir}:$PATH",
-    ]
     commands: list[dict[str, Any]] = []
     for command_id, revision, purpose in [
         (
             "adopted_baseline_release_full",
             baseline,
-            "Full release proof for the adopted upstream Rust baseline.",
+            "Full upstream Rust release scorecard for the adopted baseline.",
         ),
         (
             "tracked_upstream_release_full",
             tracked,
-            "Full release proof for the latest upstream revision reviewed by the upstream-fix ledger.",
+            "Full scorecard for the latest revision reviewed by the upstream-fix ledger; supporting evidence, not a substitute for the adopted baseline.",
         ),
     ]:
         if revision is None:
             continue
-        out_dir = f"reports/upstream-rust/<run-id>/{command_id}"
+        if native_host is None:
+            commands.append(
+                {
+                    "id": command_id,
+                    "kind": "release_recipe_unavailable",
+                    "purpose": purpose,
+                    "command": None,
+                    "argv": [],
+                    "not_run_reason": "native stage2 host/target identity was not established by the toolchain guard and trustc -Vv; no release command or claim is available",
+                    "claim_after_success": "No release claim is available without a verified native stage2 identity.",
+                }
+            )
+            continue
+        arch = native_host.split("-", 1)[0]
+        out_dir = rel(report_dir / command_id, root)
+        summary_out = f"{out_dir}/compat-summary.json"
         argv = [
             str(bin_dir / "targo"),
             "trust",
             "domination",
             "upstream-tests",
             "--release",
+            "--proof-scope",
+            "upstream-rust",
             "--proof-mode",
             "full",
-            "--upstream-revision",
-            revision,
+            "--execute",
+            "--no-apply",
+            "--summary-out",
+            summary_out,
             "--out-dir",
             out_dir,
+            "--run-id",
+            f"{run_id}-{command_id}",
+            "--target-arch",
+            arch,
+            "--target",
+            native_host,
+            "--target-triple",
+            native_host,
+            "--host",
+            arch,
+            "--host-triple",
+            native_host,
+            "--upstream-revision",
+            revision,
+            "--upstream-remote",
+            "https://github.com/rust-lang/rust.git",
         ]
         if is_full_commit_hash(revision_ref(revision)):
             argv.extend(["--no-fetch"])
+        library_var = "DYLD_LIBRARY_PATH" if native_host.endswith("-apple-darwin") else "LD_LIBRARY_PATH"
+        env_prefix = " ".join(
+            [
+                f"TRUST_STAGE2_SYSROOT={shlex.quote(str(stage2_sysroot))}",
+                f"{library_var}={shlex.quote(str(lib_dir))}${{{library_var}:+:${library_var}}}",
+                f"PATH={shlex.quote(str(bin_dir))}:$PATH",
+            ]
+        )
+        validation_command = (
+            f"cd {shlex.quote(str(root))} && "
+            f"TRUST_STAGE2_SYSROOT={shlex.quote(str(stage2_sysroot))} "
+            f"{GUARD_SCRIPT} --target-triple {shlex.quote(native_host)} "
+            f"--compat-summary {shlex.quote(summary_out)}"
+        )
         commands.append(
             {
                 "id": command_id,
-                "kind": "canonical_release_scorecard",
+                "kind": "canonical_release_scorecard"
+                if command_id == "adopted_baseline_release_full"
+                else "tracked_upstream_scorecard",
                 "purpose": purpose,
-                "command": " ".join(env_prefix + [shell_join(argv)]),
+                "command": f"cd {shlex.quote(str(root))} && {env_prefix} {shell_join(argv)}",
                 "argv": argv,
-                "not_run_reason": "full upstream Rust suite is expensive and may apply the ported overlay to tests/ by default; run only with clean worktree, time, disk, and source-change budget",
-                "claim_after_success": "May claim full suite success only if scorecard.json records executed=true, proof_mode=full, execution_exit_status=0, proof_artifacts_complete=true, validation_failures=[], totals.failed=0, and totals.tool_failures=0 except ledger-accounted failures.",
+                "summary_out": summary_out,
+                "out_dir": out_dir,
+                "validation_command": validation_command
+                if command_id == "adopted_baseline_release_full"
+                else None,
+                "not_run_reason": "full upstream Rust suite is expensive and may rebuild stage2; run only with a clean pinned checkout, coherent stage2, and sufficient time and disk budget",
+                "claim_after_success": (
+                    "Adopted-baseline release compatibility is claimable only after validation_command passes against the retained summary, scorecard, and proof artifacts with zero failed, tool-failure, or excepted rows; this is not a G1-G8 completion claim."
+                    if command_id == "adopted_baseline_release_full"
+                    else "Supporting tracked-revision evidence only; the adopted-baseline release validator must pass separately."
+                ),
             }
         )
 
@@ -436,9 +527,13 @@ def full_suite_commands(stage2_sysroot: Path, baseline: str, tracked: str | None
             "id": "current_tree_direct_compiletest_full",
             "kind": "guarded_xpy_compiletest",
             "purpose": "Direct current-checkout compiletest sweep through the stage2 vanilla Trust compiler. This is not an adopted-baseline overlay proof by itself.",
-            "command": f"TRUST_STAGE2_SYSROOT={stage2_sysroot} {shell_join(guarded_xpy)}",
+            "command": (
+                f"cd {shlex.quote(str(root))} && "
+                f"TRUST_STAGE2_SYSROOT={shlex.quote(str(stage2_sysroot))} "
+                f"{shell_join(guarded_xpy)}"
+            ),
             "argv": guarded_xpy,
-            "not_run_reason": "full compiletest sweep is expensive and the representative dry run currently plans stage/tool rebuild work",
+            "not_run_reason": "full compiletest sweep requires separate time and disk budget; the representative batch does not establish full-suite execution",
             "claim_after_success": "Use as supporting current-tree compiletest evidence only; adopted-baseline release proof still requires the canonical upstream-tests scorecard.",
         }
     )
@@ -643,6 +738,17 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     active_exceptions = active_test_exceptions(root, validation_date)
     adopted_counts = upstream_test_counts(root, baseline)
     tracked_counts = upstream_test_counts(root, tracked) if tracked else None
+    native_host = native_stage2_host_triple(stage2, trustc, guard)
+    generated_at = now_utc()
+    full_commands = full_suite_commands(
+        root,
+        stage2,
+        report_dir,
+        baseline,
+        tracked,
+        native_host,
+        "adopted-upstream-" + generated_at.replace("-", "").replace(":", ""),
+    )
 
     passed = []
     failed = []
@@ -706,18 +812,29 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-    for command in full_suite_commands(stage2, baseline, tracked):
-        not_yet_run_due_to_cost.append(
-            {
-                "id": command["id"],
-                "attempted": False,
-                "status": "not_run_due_to_cost",
-                "command": command["command"],
-                "reason": command["not_run_reason"],
-            }
-        )
-
     blocked_by_precondition: list[dict[str, Any]] = []
+    for command in full_commands:
+        if command["kind"] == "release_recipe_unavailable":
+            blocked_by_precondition.append(
+                {
+                    "id": command["id"],
+                    "attempted": False,
+                    "status": "not_run_due_to_missing_native_stage2_identity",
+                    "command": None,
+                    "reason": command["not_run_reason"],
+                }
+            )
+        else:
+            not_yet_run_due_to_cost.append(
+                {
+                    "id": command["id"],
+                    "attempted": False,
+                    "status": "not_run_due_to_cost",
+                    "command": command["command"],
+                    "reason": command["not_run_reason"],
+                }
+            )
+
     if disk["status"] != "passed":
         blocked_by_precondition.append(
             {
@@ -760,7 +877,6 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "not_yet_run_due_to_cost": not_yet_run_due_to_cost,
         "blocked_by_precondition": blocked_by_precondition,
     }
-    generated_at = now_utc()
     report = {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -787,6 +903,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         },
         "preflight": {
             "disk": disk,
+            "native_stage2_host_triple": native_host,
         },
         "stage2_tools": {
             "trustc": {
@@ -833,7 +950,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 "rebuild_guard_lines": representative_rebuild_lines,
                 **command_result_json(representative),
             },
-            "full_suite": full_suite_commands(stage2, baseline, tracked),
+            "full_suite": full_commands,
         },
         "row_counts_by_status": row_counts_by_status(status_buckets),
         "status_buckets": status_buckets,

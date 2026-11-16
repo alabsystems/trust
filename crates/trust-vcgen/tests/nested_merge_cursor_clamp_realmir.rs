@@ -30,7 +30,7 @@
 // assertion below that was measured to FAIL with that lever alone disabled:
 //
 //   1. `guards::nested_switch_branch_merge_definitions` — grounds `clamped`.
-//   2. the per-path split in `generate_full_assert_refutation_vcs_impl` — without
+//   2. the per-path split in `generate_full_assert_refutation_candidates_impl` — without
 //      it the combined formula is `Unknown` ("(incomplete self-check-rejected)").
 //   3. the boolean-discriminant inlining in `guards::nested_switch_route_guard` —
 //      without it the parts still prove but 2 of 3 (and the catch-all residual)
@@ -40,6 +40,9 @@
 // two falsification fixtures, so this is not a hand-built approximation of the
 // lowering.
 use trust_types::{Formula, VerifiableFunction, VerificationResult};
+
+#[path = "support/test_router.rs"]
+mod test_router;
 
 fn load(json: &str) -> VerifiableFunction {
     serde_json::from_str(json).expect("fixture MIR must deserialize")
@@ -158,7 +161,7 @@ fn nested_merge_grounds_and_proves_the_safe_cursor_clamp_assert() {
         );
     }
 
-    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+    let router = test_router::deterministic_test_router();
     for (index, vc) in vcs.iter().enumerate() {
         let results = router.verify_all(std::slice::from_ref(vc));
         let (_, result) = results.into_iter().next().expect("one verdict per VC");
@@ -207,7 +210,7 @@ fn mutant_cursor_clamp_assert_is_still_refuted() {
     // Two paths reach the mutant's failure block (`col < width`, `col >= width`).
     assert_eq!(vcs.len(), 2, "one obligation per path to the failure block; got {}", vcs.len());
 
-    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+    let router = test_router::deterministic_test_router();
     let mut refuted = 0;
     for vc in &vcs {
         let ungrounded = unpinned_free_vars(&func, &vc.formula);

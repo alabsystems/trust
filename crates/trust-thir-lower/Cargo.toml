@@ -6,15 +6,16 @@
 # the retained MIR-compatibility bundle is proof-authoritative in the meantime. See
 # docs/DESIGN-P1-ir-inversion.md.
 #
-# `VerifiableFunction` / MIR are DERIVED views: trust-mir-extract + trust-ir-bridge are pulled in
-# only to produce the MIR-side trust-ir *oracle* the differential gate checks against.
+# `VerifiableFunction` / MIR are DERIVED oracle views. The same packages also
+# provide query-only contract conversion and native request assembly for the
+# explicit diagnostic shadow; that path reads no MIR body.
 #
 # Requires rustc_private — built ONLY via `x.py build --stage 2` (mirrors trust-mir-extract).
 # Author: Andrew Yates <andrewyates.name@gmail.com> | Copyright 2026 | License: MIT OR Apache-2.0
 
 [package]
 name = "trust-thir-lower"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -31,31 +32,44 @@ trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir", features = ["b
 # Differential oracle only: MIR -> VerifiableFunction -> trust_ir Module (the retained
 # proof-authoritative compatibility path, using faithful scalar spellings for parity).
 trust-mir-extract = { path = "../trust-mir-extract" }
-trust-ir-bridge = { path = "../trust-ir-bridge" }
+trust-ir-bridge = { path = "../trust-ir-bridge", features = ["direct-contract-shadow"] }
+# Query-only source projection for the explicit contract-carry diagnostic.
+trust-source-contract = { workspace = true }
+trust-verifier-api = { workspace = true }
+serde_json = { workspace = true }
 # Trust (#181): the producer VALIDATES ITS OWN OUTPUT. Log-only tripwire — see the
 # module-validation block in crate_module.rs. `tracing` carries the per-class counts to the
 # scorecard, the same channel the mir_built hook's coverage events already use.
 trust-ir-build = { path = "../../first-party/trust-ir/crates/trust-ir-build" }
 trust-clean-ir-gate = { path = "../trust-clean-ir-gate" }
+# The append seam now records sealed Clean-to-Rust calls in the actual module.
+trust-clean-ir = { path = "../trust-clean-ir" }
+trust-clean-origin = { path = "../trust-clean-origin" }
 tracing = { workspace = true }
 # Trust: P1.2 slice 1 — the derived-vs-built MIR comparator canonicalizes the
 # trust-mir-extract VerifiableBody (trust-types) of BOTH bodies.
 trust-types = { path = "../trust-types" }
 trust-os = { workspace = true }
+# Opt-in, zero-authority same-Session capture/model observer only. This does
+# not make any direct producer verdict or source-fidelity gate favorable.
+trust-certify = { path = "../trust-certify" }
 # Trust: rustc crates for THIR access (resolved by the bootstrap build).
 rustc_abi = { path = "../../compiler/rustc_abi" }
 rustc_ast = { path = "../../compiler/rustc_ast" }
 rustc_ast_ir = { path = "../../compiler/rustc_ast_ir" }
+rustc_attr_ir = { path = "../../compiler/rustc_attr_ir" }
+rustc_structures = { path = "../../compiler/rustc_structures" }
 rustc_data_structures = { path = "../../compiler/rustc_data_structures" }
 rustc_hir = { path = "../../compiler/rustc_hir" }
 rustc_index = { path = "../../compiler/rustc_index" }
 rustc_middle = { path = "../../compiler/rustc_middle" }
+# Trust (step 2 increment 4b): rustc's drop-elaboration dataflow (`MaybeInitializedPlaces` /
+# `MaybeUninitializedPlaces` over `MoveData`), read by the drop ORACLE (`src/drop_oracle.rs`) on
+# the built MIR. A test oracle only; it feeds nothing.
+rustc_mir_dataflow = { path = "../../compiler/rustc_mir_dataflow" }
 # Trust: P1 item 5 (the flip) — flip_registry names `rustc_session::config::DebugInfo` for the
 # session-level flip gates.
 rustc_session = { path = "../../compiler/rustc_session" }
 rustc_span = { path = "../../compiler/rustc_span" }
-
-[dev-dependencies]
-trust-certify = { path = "../trust-certify" }
-trust-clean-ir = { path = "../trust-clean-ir" }
-trust-clean-origin = { path = "../trust-clean-origin" }
+# Actual source FnAbi custody for unlicensed template construction.
+rustc_target = { path = "../../compiler/rustc_target" }

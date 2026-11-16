@@ -83,10 +83,12 @@ fn block(id: usize, stmts: Vec<Statement>, terminator: Terminator) -> BasicBlock
 /// certification; a test of the disjoint-field lane must therefore build the
 /// REAL shape, or it silently exercises the fail-closed path instead.
 fn struct_ty(name: &str, fields: Vec<(String, Ty)>) -> Ty {
-    Ty::Adt { arbitrary_precision: None,
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
         name: name.to_string(),
-        fields,
-        variants: Vec::new(),
+        fields: fields.into(),
+        variants: Vec::new().into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
@@ -147,6 +149,7 @@ fn func(
         preconditions: vec![],
         postconditions,
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -223,10 +226,21 @@ fn early_return_true_clause_proves_on_both_predecessors() {
          entire reason the early-return path satisfies the clause: {}",
         formulas[0]
     );
+    // Trust (2026-09-30, vac Phase 0 + 1.1): the guard def reads the flag at its OWN
+    // statement, where it is the entry value, so the stale-read seal spells it
+    // `self*.0.0#e`; the widened entry-sentinel tie then equates that spelling with
+    // the bare name the merge pin uses. Same verdict (UNSAT), two conjuncts instead of
+    // one shared spelling.
     assert!(
-        formulas[0].contains(r#"Eq(Var("_2", Bool), Var("self*.0.0", Bool))"#),
+        formulas[0].contains(r#"Eq(Var("_2", Bool), Var("self*.0.0#e", Bool))"#),
         "the block def tying the guard temp to the flag must survive the relevance \
          filter now that the merge pin puts the bare flag name in the body: {}",
+        formulas[0]
+    );
+    assert!(
+        formulas[0].contains(r#"Eq(Var("self*.0.0#e", Bool), Var("self*.0.0", Bool))"#),
+        "the entry-sentinel tie must reconnect the sealed guard read to the bare \
+         entry name the merge pin reads: {}",
         formulas[0]
     );
 
@@ -346,30 +360,53 @@ fn divergent_branch_body(positive_clause: bool) -> VerifiableFunction {
 /// store, and NOTHING ELSE. That it is not `e_s1_0_s2_0_s3_0_s4_0` is half the
 /// fix: the sibling stores to `self.st.g` / `self.st.h` are provably
 /// disjointly-addressable fields and must not re-version the flag.
+///
+/// AMENDED 2026-09-18 — ONE ROW PER ENUMERATED PATH, not per predecessor.
+/// `bb4` (the fall-through exit) is reached by TWO guard paths, `_3` and `¬_3`,
+/// so the postcondition lane now emits one FLAT row for each of them instead of
+/// one `Or` over both (see `per_path_postcondition_tests`). This test's count
+/// moved from 2 to 3 for that reason and for no other: the measured formulas
+/// differ from the old pair ONLY by which of `Gt(_4, 0)` / `Not(Gt(_4, 0))` each
+/// carries, and `divergent_branch_verdicts_discriminate` below shows every row's
+/// SAT verdict is unchanged. This fixture is not the split's own — it is an
+/// independent body that happened to have the shape, which is why it is the
+/// better witness of the two.
 #[test]
 fn divergent_branch_true_clause_pins_the_join_name() {
     let formulas = postcondition_formulas(&divergent_branch_body(false));
-    assert_eq!(formulas.len(), 2, "one VC per return predecessor: {formulas:?}");
+    assert_eq!(
+        formulas.len(),
+        3,
+        "one VC per enumerated return PATH: `bb0` contributes one, `bb4` two: {formulas:?}"
+    );
     for f in &formulas {
         assert!(
             f.contains(r#"Eq(Var("self*.0.0#e_s1_0", Bool), "#),
-            "the join name must be pinned on EVERY return predecessor, including the \
+            "the join name must be pinned on EVERY return path, including the \
              one whose block never touches the flag: {f}"
         );
     }
-    // `bb4` — the fall-through exit. The flag's single reaching definition there
-    // is `bb1`'s store, three blocks upstream and invisible to any lane that
-    // scans only `[predecessor, return block]`; the merge pin plus the store's
-    // own defining equation are what close the gap.
+    // `bb4` — the fall-through exit, now one row per branch arm. The flag's
+    // single reaching definition there is `bb1`'s store, three blocks upstream
+    // and invisible to any lane that scans only `[predecessor, return block]`;
+    // the merge pin plus the store's own defining equation are what close the
+    // gap, and BOTH arms must carry them.
+    for f in &formulas[1..] {
+        assert!(
+            f.contains(r#"Eq(Var("self*.0.0#e_s1_0", Bool), Var("self*.0.0#s1_0", Bool))"#),
+            "the join name must be tied to the reaching store's token: {f}"
+        );
+        assert!(
+            f.contains(r#"Eq(Var("self*.0.0#s1_0", Bool), Bool(false))"#),
+            "and that token must carry the value the BODY stored: {f}"
+        );
+    }
+    // The split separated the arms rather than duplicating one of them.
     assert!(
-        formulas[1].contains(r#"Eq(Var("self*.0.0#e_s1_0", Bool), Var("self*.0.0#s1_0", Bool))"#),
-        "the join name must be tied to the reaching store's token: {}",
-        formulas[1]
-    );
-    assert!(
-        formulas[1].contains(r#"Eq(Var("self*.0.0#s1_0", Bool), Bool(false))"#),
-        "and that token must carry the value the BODY stored: {}",
-        formulas[1]
+        formulas[1..].iter().any(|f| f.contains(r#"Gt(Var("_4", Int), Int(0))"#))
+            && formulas[1..].iter().any(|f| f.contains(r#"Not(Gt(Var("_4", Int), Int(0)))"#)),
+        "each `bb4` row must carry its OWN branch guard — a split that dropped or \
+         duplicated a path would be the one way it could be unsound: {formulas:?}"
     );
 }
 
@@ -486,6 +523,7 @@ fn call_havoc_on_the_return_edge_suppresses_the_merge_pin() {
                     is_foreign: false,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("helper"),
                     unwind: Default::default(),
                 },
             ),
@@ -523,10 +561,23 @@ fn call_havoc_on_the_return_edge_suppresses_the_merge_pin() {
 /// into SAT, so an UNSAT verdict from this evaluator is a genuine UNSAT of the
 /// real formula, and the SAT witnesses it finds are checked to be consistent
 /// assignments of genuinely independent atoms.
+///
+/// `Implies` is interpreted rather than abstracted (2026-09-18) because
+/// `eliminate_term_ites` — the uniform lift the shipped pipeline applies to every
+/// VC — turns a JOIN's `x == Ite(c, t, e)` reaching-value equation into exactly
+/// `(c → x == t) ∧ (¬c → x == e)`. Abstracting THAT to a free atom leaves the
+/// join name unconstrained, so every row of a join body reads spuriously SAT.
+/// Interpreting a connective can only SHRINK the model set (a free atom is a
+/// relaxation of it), so every UNSAT this evaluator reports is still a genuine
+/// UNSAT of the real formula.
 fn atoms(f: &Formula, out: &mut Vec<String>) {
     match f {
         Formula::And(xs) | Formula::Or(xs) => xs.iter().for_each(|x| atoms(x, out)),
         Formula::Not(x) => atoms(x, out),
+        Formula::Implies(a, b) => {
+            atoms(a, out);
+            atoms(b, out);
+        }
         Formula::Bool(_) => {}
         Formula::Eq(a, b)
             if matches!(&**a, Formula::Var(_, Sort::Bool) | Formula::Bool(_))
@@ -560,6 +611,8 @@ fn eval(f: &Formula, env: &[(String, bool)]) -> bool {
         Formula::And(xs) => xs.iter().all(|x| eval(x, env)),
         Formula::Or(xs) => xs.iter().any(|x| eval(x, env)),
         Formula::Not(x) => !eval(x, env),
+        // See `atoms`: the lifted form of a join's reaching-value equation.
+        Formula::Implies(a, b) => !eval(a, env) || eval(b, env),
         Formula::Bool(b) => *b,
         Formula::Eq(a, b)
             if matches!(&**a, Formula::Var(_, Sort::Bool) | Formula::Bool(_))
@@ -614,19 +667,170 @@ fn early_return_verdicts_discriminate() {
 
 /// DIVERGENT BRANCHES with the store three blocks upstream of the exit — the
 /// ladder's top rung, both directions.
+///
+/// AMENDED 2026-09-18: three rows, not two, because `bb4` is reached by two
+/// guard paths and the postcondition lane now emits one row per enumerated path.
+/// **This is the assertion that says the split changed nothing semantic**: every
+/// row of the true clause is still UNSAT (proved) and every row of its exact
+/// negation is still SAT (refuted), so the extra row is a finer partition of the
+/// same executions and not a different question.
 #[test]
 fn divergent_branch_verdicts_discriminate() {
     assert_eq!(
         postcondition_verdicts(&divergent_branch_body(false)),
-        vec![false, false],
+        vec![false, false, false],
         "the flag is stored false before the branch and neither arm touches it, so \
          the clause holds on every exit path"
     );
     assert_eq!(
         postcondition_verdicts(&divergent_branch_body(true)),
-        vec![true, true],
+        vec![true, true, true],
         "the exact negation of a clause the body satisfies must be refuted on every \
          exit path"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE ONE-OF-THREE FALSE PATH, decided by the real oracle.
+//
+//   fn pick(p: bool, q: bool) -> bool ensures result
+//   { if p { true } else if q { true } else { LAST } }
+//
+//   bb0: switchInt(p) -> [0: bb1, otherwise: bb4]
+//   bb1: switchInt(q) -> [0: bb3, otherwise: bb2]
+//   bb2: _3 = true;  goto -> bb5
+//   bb3: _3 = LAST;  goto -> bb5      <- the arm the twin makes FALSE
+//   bb4: _4 = true;  goto -> bb6
+//   bb5: _4 = _3;    goto -> bb6      <- the JOIN: TWO guard paths
+//   bb6: _0 = _4;    return
+//
+// This is the a7 shape (`per_path_postcondition_tests::pick`) rewritten over
+// BOOLEANS so this module's exhaustive `is_sat` can actually decide it. It is
+// the test the a7 split most needed and did not have: every other real-oracle
+// assertion here is all-true or all-false, which a split that DROPPED or
+// DUPLICATED the violating path would still satisfy.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The Boolean a7 body. `last_arm_true` is what the `else` arm stores: `true` is
+/// the correct program, `false` is false on exactly ONE of the three paths.
+fn boolean_three_arm_body(last_arm_true: bool) -> VerifiableFunction {
+    VerifiableFunction {
+        name: "pick".into(),
+        def_path: "pick".into(),
+        span: span(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                LocalDecl { index: 1, ty: Ty::Bool, name: Some("p".into()) },
+                LocalDecl { index: 2, ty: Ty::Bool, name: Some("q".into()) },
+                bool_local(3),
+                bool_local(4),
+            ],
+            blocks: vec![
+                block(0, vec![], switch_on(1, BlockId(1), BlockId(4))),
+                block(1, vec![], switch_on(2, BlockId(3), BlockId(2))),
+                block(
+                    2,
+                    vec![assign(Place::local(3), bool_const(true))],
+                    Terminator::Goto(BlockId(5)),
+                ),
+                block(
+                    3,
+                    vec![assign(Place::local(3), bool_const(last_arm_true))],
+                    Terminator::Goto(BlockId(5)),
+                ),
+                block(
+                    4,
+                    vec![assign(Place::local(4), bool_const(true))],
+                    Terminator::Goto(BlockId(6)),
+                ),
+                block(
+                    5,
+                    vec![assign(Place::local(4), copy_of(Place::local(3)))],
+                    Terminator::Goto(BlockId(6)),
+                ),
+                block(
+                    6,
+                    vec![assign(Place::local(0), copy_of(Place::local(4)))],
+                    Terminator::Return,
+                ),
+            ],
+            arg_count: 2,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![Formula::Var("_0".into(), Sort::Bool)],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// The three-arm rows AS THE BACKEND ACTUALLY SEES THEM.
+///
+/// `generate_v2_contract_vcs_impl` leaves term-level `Ite`s standing: the
+/// central normalization loop lifts every VC's `Ite`s exactly once, uniformly,
+/// on the way out (`entry.rs`, `eliminate_term_ites(.., ITE_ELIM_CASE_CAP)`).
+/// A JOIN body is precisely where that matters — `guards::branch_merge_definitions`
+/// recovers the join's reaching value as `_3#<join token> == Ite(!q, false, true)`,
+/// and until the lift runs that equation is one opaque atom to this module's
+/// propositional oracle, so the join name reads FREE and every row comes back
+/// spuriously SAT. MEASURED here before the lift was applied: `[false, true, true]`
+/// on the twin, i.e. the `!p && q` row (which the body makes TRUE) reported
+/// refuted. Applying the lift is what makes this a measurement of the shipped
+/// formula rather than of an intermediate one.
+fn normalized_three_arm_rows(f: &VerifiableFunction) -> Vec<Formula> {
+    generate_v2_contract_vcs_impl(f, None)
+        .into_iter()
+        .filter(|vc| matches!(vc.kind, trust_types::VcKind::Postcondition))
+        .map(|vc| super::eliminate_term_ites(&vc.formula, super::ITE_ELIM_CASE_CAP))
+        .collect()
+}
+
+/// THE SOUNDNESS CANARY FOR THE SPLIT, judged by satisfiability and not by
+/// string shape: a clause false on exactly ONE of three paths must be REFUTED on
+/// exactly that path and PROVED on the other two.
+///
+/// `[false, false, false]` would mean the violating path was lost or merged away
+/// — the split crediting an execution nothing checked. `[true, true, true]` would
+/// mean the split stopped reading the body. Only one-of-three is the split
+/// working, and it is the one shape every other real-oracle assertion in this
+/// module (all-true / all-false) cannot distinguish from either failure.
+#[test]
+fn one_of_three_paths_false_is_refuted_on_exactly_that_path() {
+    let correct: Vec<bool> =
+        normalized_three_arm_rows(&boolean_three_arm_body(true)).iter().map(is_sat).collect();
+    assert_eq!(
+        correct,
+        vec![false, false, false],
+        "the correct program returns `true` on all three paths, so every per-path \
+         row must be UNSAT (proved)"
+    );
+
+    let rows = normalized_three_arm_rows(&boolean_three_arm_body(false));
+    let twin: Vec<bool> = rows.iter().map(is_sat).collect();
+    assert_eq!(twin.len(), 3, "the twin emits the same three per-path rows");
+    assert_eq!(
+        twin.iter().filter(|refuted| **refuted).count(),
+        1,
+        "EXACTLY ONE row may be SAT — the `!p && !q` path, where the body stores \
+         `false` and the clause is genuinely violated. Zero would mean the split \
+         lost that path; three would mean it stopped reading the body: {twin:?}"
+    );
+
+    // ...and it must be the row that carries that path's own guards, not some
+    // other row that happened to go SAT.
+    let refuted_index = twin.iter().position(|refuted| *refuted).expect("one refuted row");
+    let refuted = format!("{:?}", rows[refuted_index]);
+    assert!(
+        refuted.contains(r#"Not(Var("p", Bool))"#) && refuted.contains(r#"Not(Var("q", Bool))"#),
+        "the refuted row must be the one guarded by `!p && !q`: {refuted}"
+    );
+    assert!(
+        refuted.contains("Bool(false)"),
+        "and it must be refuted from the value the BODY stored on that path, not \
+         from havoc: {refuted}"
     );
 }
 
@@ -715,6 +919,7 @@ fn opaque_call_body(positive_clause: bool) -> VerifiableFunction {
                     is_foreign: false,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("helper"),
                     unwind: Default::default(),
                 },
             ),

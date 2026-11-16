@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-IS: `arr[i] = v` on an SSA-BOUND local array with a DYNAMIC index —
 // pure value surgery, no memory: bounds `icmp ult` + `assert` (the FI-b
 // typed `BoundsCheck` obligation row, `ProofAnnotation::InBounds`) then

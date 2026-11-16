@@ -13,24 +13,49 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::hash::Hash;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::panic::Location;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{
     Child, ChildStderr, ChildStdout, Command, CommandArgs, CommandEnvs, ExitStatus, Output, Stdio,
 };
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use build_helper::drop_bomb::DropBomb;
-use build_helper::exit;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use build_helper::trust_repo_lock::management::{
+    ScopeDispatch, ScopedChild, ScopedReader, WeakScopeDispatch,
+};
 
 use crate::core::config::DryRun;
-use crate::{PathBuf, t};
+use crate::utils::helpers::{self, t};
+
+// Trust: a permanent restriction, installed by the actual in-process owner.
+// A weak sentinel cannot retain/reconstruct the original lease after closure.
+// Expired/sealed installation refuses; it never restores standalone dispatch.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static PROTECTED_SCOPE: OnceLock<WeakScopeDispatch> = OnceLock::new();
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn install_protected_scope(scope: ScopeDispatch) -> io::Result<()> {
+    scope.check_current()?;
+    PROTECTED_SCOPE
+        .set(scope.downgrade())
+        .map_err(|_| io::Error::other("Bootstrap protected scope already installed"))?;
+    scope.check_current()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn protected_scope() -> io::Result<Option<ScopeDispatch>> {
+    PROTECTED_SCOPE.get().map(WeakScopeDispatch::upgrade).transpose()
+}
 
 /// What should be done when the command fails.
 #[derive(Debug, Copy, Clone)]
-pub enum BehaviorOnFailure {
+pub(crate) enum BehaviorOnFailure {
     /// Immediately stop bootstrap.
     Exit,
     /// Delay failure until the end of bootstrap invocation.
@@ -42,7 +67,7 @@ pub enum BehaviorOnFailure {
 /// How should the output of a specific stream of the command (stdout/stderr) be handled
 /// (whether it should be captured or printed).
 #[derive(Debug, Copy, Clone)]
-pub enum OutputMode {
+pub(crate) enum OutputMode {
     /// Prints the stream by inheriting it from the bootstrap process.
     Print,
     /// Captures the stream into memory.
@@ -50,14 +75,14 @@ pub enum OutputMode {
 }
 
 impl OutputMode {
-    pub fn captures(&self) -> bool {
+    pub(crate) fn captures(&self) -> bool {
         match self {
             OutputMode::Print => false,
             OutputMode::Capture => true,
         }
     }
 
-    pub fn stdio(&self) -> Stdio {
+    pub(crate) fn stdio(&self) -> Stdio {
         match self {
             OutputMode::Print => Stdio::inherit(),
             OutputMode::Capture => Stdio::piped(),
@@ -66,11 +91,14 @@ impl OutputMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
-pub struct CommandFingerprint {
+pub(crate) struct CommandFingerprint {
     program: OsString,
     args: Vec<OsString>,
     envs: Vec<(OsString, Option<OsString>)>,
     cwd: Option<PathBuf>,
+    // Trust: a raw command cache entry cannot impersonate a protected query.
+    metadata_scheduler: bool,
+    compiletest_transport: bool,
 }
 
 impl CommandFingerprint {
@@ -104,30 +132,30 @@ impl CommandFingerprint {
 }
 
 #[derive(Default, Clone)]
-pub struct CommandProfile {
-    pub traces: Vec<ExecutionTrace>,
+pub(crate) struct CommandProfile {
+    pub(crate) traces: Vec<ExecutionTrace>,
 }
 
 #[derive(Default)]
-pub struct CommandProfiler {
+pub(crate) struct CommandProfiler {
     stats: Mutex<HashMap<CommandFingerprint, CommandProfile>>,
 }
 
 impl CommandProfiler {
-    pub fn record_execution(&self, key: CommandFingerprint, start_time: Instant) {
+    pub(crate) fn record_execution(&self, key: CommandFingerprint, start_time: Instant) {
         let mut stats = self.stats.lock().unwrap();
         let entry = stats.entry(key).or_default();
         entry.traces.push(ExecutionTrace::Executed { duration: start_time.elapsed() });
     }
 
-    pub fn record_cache_hit(&self, key: CommandFingerprint) {
+    pub(crate) fn record_cache_hit(&self, key: CommandFingerprint) {
         let mut stats = self.stats.lock().unwrap();
         let entry = stats.entry(key).or_default();
         entry.traces.push(ExecutionTrace::CacheHit);
     }
 
     /// Report summary of executed commands file at the specified `path`.
-    pub fn report_summary(&self, path: &Path, start_time: Instant) {
+    pub(crate) fn report_summary(&self, path: &Path, start_time: Instant) {
         let file = t!(File::create(path));
 
         let mut writer = BufWriter::new(file);
@@ -222,7 +250,7 @@ impl CommandProfiler {
 }
 
 #[derive(Clone)]
-pub enum ExecutionTrace {
+pub(crate) enum ExecutionTrace {
     CacheHit,
     Executed { duration: Duration },
 }
@@ -243,36 +271,78 @@ pub enum ExecutionTrace {
 ///
 /// [allow_failure]: BootstrapCommand::allow_failure
 /// [delay_failure]: BootstrapCommand::delay_failure
-pub struct BootstrapCommand {
+pub(crate) struct BootstrapCommand {
     command: Command,
-    pub failure_behavior: BehaviorOnFailure,
+    // Trust: std::Command does not expose env_clear or stdin. Preserve their
+    // actual wrapper provenance before an in-process Full command is routed.
+    original_inputs: OriginalCommandInputs,
+    pub(crate) failure_behavior: BehaviorOnFailure,
     // Run the command even during dry run
-    pub run_in_dry_run: bool,
+    pub(crate) run_in_dry_run: bool,
     // This field makes sure that each command is executed (or disarmed) before it is dropped,
     // to avoid forgetting to execute a command.
     drop_bomb: DropBomb,
     should_cache: bool,
+    // Trust: compiler-metadata constructors explicitly select this transport.
+    metadata_scheduler: bool,
+    compiletest_transport: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct OriginalCommandInputs {
+    pub(crate) environment_cleared: Option<bool>,
+    pub(crate) inherited_stdin: bool,
 }
 
 impl<'a> BootstrapCommand {
     #[track_caller]
-    pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
-        Command::new(program).into()
+    pub(crate) fn new<S: AsRef<OsStr>>(program: S) -> Self {
+        let mut command: Self = Command::new(program).into();
+        command.original_inputs =
+            OriginalCommandInputs { environment_cleared: Some(false), inherited_stdin: true };
+        command
     }
-    pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
+    pub(crate) fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
         self.command.arg(arg.as_ref());
         self
+    }
+
+    // Trust: this is transport selection, never CPU/proof admission. Dispatch
+    // requires the real native capture and retains the exclusive borrower.
+    pub(crate) fn metadata_scheduler(&mut self) {
+        self.metadata_scheduler = true;
+    }
+
+    /// The SDK constructor's known compiler query uses the original borrower,
+    /// with explicit time/output limits rather than the ordinary cached wait.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn bounded_metadata_output(
+        &mut self,
+        deadline: Instant,
+        bytes: u64,
+    ) -> io::Result<Output> {
+        self.drop_bomb.defuse();
+        if !self.metadata_scheduler || self.should_cache {
+            return Err(io::Error::other("bounded query requires uncached metadata transport"));
+        }
+        super::metadata_scheduler::bounded_output(&mut self.command, deadline, bytes)
+    }
+
+    /// Only the maintained Compiletest constructor selects this original
+    /// transport. Protected launches keep their existing registered borrower.
+    pub(crate) fn compiletest_transport(&mut self) {
+        self.compiletest_transport = true;
     }
 
     /// Cache the command. If it will be executed multiple times with the exact same arguments
     /// and environment variables in the same bootstrap invocation, the previous result will be
     /// loaded from memory.
-    pub fn cached(&mut self) -> &mut Self {
+    pub(crate) fn cached(&mut self) -> &mut Self {
         self.should_cache = true;
         self
     }
 
-    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    pub(crate) fn args<I, S>(&mut self, args: I) -> &mut Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -281,7 +351,7 @@ impl<'a> BootstrapCommand {
         self
     }
 
-    pub fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
+    pub(crate) fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
     where
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
@@ -290,44 +360,64 @@ impl<'a> BootstrapCommand {
         self
     }
 
-    pub fn get_envs(&self) -> CommandEnvs<'_> {
+    pub(crate) fn get_envs(&self) -> CommandEnvs<'_> {
         self.command.get_envs()
     }
 
-    pub fn get_args(&self) -> CommandArgs<'_> {
+    pub(crate) fn get_args(&self) -> CommandArgs<'_> {
         self.command.get_args()
     }
 
-    pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
+    // Trust: controls inspect the actual selected executable, including argv0.
+    #[cfg(test)]
+    pub(crate) fn get_program(&self) -> &OsStr {
+        self.command.get_program()
+    }
+
+    pub(crate) fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
         self.command.env_remove(key);
         self
     }
 
-    pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
+    /// A held native metadata image supplies its complete loader environment.
+    pub(crate) fn env_clear(&mut self) -> &mut Self {
+        self.command.env_clear();
+        self.original_inputs.environment_cleared = Some(true);
+        self
+    }
+
+    pub(crate) fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
         self.command.current_dir(dir);
         self
     }
 
-    pub fn stdin(&mut self, stdin: std::process::Stdio) -> &mut Self {
+    // Trust: inspect forwarded Cargo configuration relative to Cargo's real cwd.
+    pub(crate) fn get_current_dir(&self) -> Option<&Path> {
+        self.command.get_current_dir()
+    }
+
+    pub(crate) fn stdin(&mut self, stdin: std::process::Stdio) -> &mut Self {
         self.command.stdin(stdin);
+        // Stdio is opaque. Never infer null/inherit/pipe from Debug or an FD.
+        self.original_inputs.inherited_stdin = false;
         self
     }
 
     #[must_use]
-    pub fn delay_failure(self) -> Self {
+    pub(crate) fn delay_failure(self) -> Self {
         Self { failure_behavior: BehaviorOnFailure::DelayFail, ..self }
     }
 
-    pub fn fail_fast(self) -> Self {
+    pub(crate) fn fail_fast(self) -> Self {
         Self { failure_behavior: BehaviorOnFailure::Exit, ..self }
     }
 
     #[must_use]
-    pub fn allow_failure(self) -> Self {
+    pub(crate) fn allow_failure(self) -> Self {
         Self { failure_behavior: BehaviorOnFailure::Ignore, ..self }
     }
 
-    pub fn run_in_dry_run(&mut self) -> &mut Self {
+    pub(crate) fn run_in_dry_run(&mut self) -> &mut Self {
         self.run_in_dry_run = true;
         self
     }
@@ -335,25 +425,34 @@ impl<'a> BootstrapCommand {
     /// Run the command, while printing stdout and stderr.
     /// Returns true if the command has succeeded.
     #[track_caller]
-    pub fn run(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> bool {
+    pub(crate) fn run(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> bool {
         exec_ctx.as_ref().run(self, OutputMode::Print, OutputMode::Print).is_success()
     }
 
     /// Run the command, while capturing and returning all its output.
     #[track_caller]
-    pub fn run_capture(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> CommandOutput {
+    pub(crate) fn run_capture(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> CommandOutput {
         exec_ctx.as_ref().run(self, OutputMode::Capture, OutputMode::Capture)
     }
 
     /// Run the command, while capturing and returning stdout, and printing stderr.
     #[track_caller]
-    pub fn run_capture_stdout(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> CommandOutput {
+    pub(crate) fn run_capture_stdout(
+        &mut self,
+        exec_ctx: impl AsRef<ExecutionContext>,
+    ) -> CommandOutput {
         exec_ctx.as_ref().run(self, OutputMode::Capture, OutputMode::Print)
+    }
+
+    #[track_caller]
+    pub fn start(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> DeferredCommand<'_> {
+        exec_ctx.as_ref().start(self, OutputMode::Print, OutputMode::Print)
     }
 
     /// Spawn the command in background, while capturing and returning all its output.
     #[track_caller]
-    pub fn start_capture(
+    #[expect(dead_code, reason = "general-purpose, currently unused")]
+    pub(crate) fn start_capture(
         &'a mut self,
         exec_ctx: impl AsRef<ExecutionContext>,
     ) -> DeferredCommand<'a> {
@@ -362,7 +461,7 @@ impl<'a> BootstrapCommand {
 
     /// Spawn the command in background, while capturing and returning stdout, and printing stderr.
     #[track_caller]
-    pub fn start_capture_stdout(
+    pub(crate) fn start_capture_stdout(
         &'a mut self,
         exec_ctx: impl AsRef<ExecutionContext>,
     ) -> DeferredCommand<'a> {
@@ -372,7 +471,7 @@ impl<'a> BootstrapCommand {
     /// Spawn the command in background, while capturing and returning stdout, and printing stderr.
     /// Returns None in dry-mode
     #[track_caller]
-    pub fn stream_capture_stdout(
+    pub(crate) fn stream_capture_stdout(
         &'a mut self,
         exec_ctx: impl AsRef<ExecutionContext>,
     ) -> Option<StreamingCommand> {
@@ -381,16 +480,16 @@ impl<'a> BootstrapCommand {
 
     /// Mark the command as being executed, disarming the drop bomb.
     /// If this method is not called before the command is dropped, its drop will panic.
-    pub fn mark_as_executed(&mut self) {
+    pub(crate) fn mark_as_executed(&mut self) {
         self.drop_bomb.defuse();
     }
 
     /// Returns the source code location where this command was created.
-    pub fn get_created_location(&self) -> std::panic::Location<'static> {
+    pub(crate) fn get_created_location(&self) -> std::panic::Location<'static> {
         self.drop_bomb.get_created_location()
     }
 
-    pub fn fingerprint(&self) -> CommandFingerprint {
+    pub(crate) fn fingerprint(&self) -> CommandFingerprint {
         let command = &self.command;
         CommandFingerprint {
             program: command.get_program().into(),
@@ -400,6 +499,8 @@ impl<'a> BootstrapCommand {
                 .map(|(k, v)| (k.to_os_string(), v.map(|val| val.to_os_string())))
                 .collect(),
             cwd: command.get_current_dir().map(Path::to_path_buf),
+            metadata_scheduler: self.metadata_scheduler,
+            compiletest_transport: self.compiletest_transport,
         }
     }
 }
@@ -417,6 +518,12 @@ impl From<Command> for BootstrapCommand {
         let program = command.get_program().to_owned();
         Self {
             should_cache: false,
+            metadata_scheduler: false,
+            compiletest_transport: false,
+            original_inputs: OriginalCommandInputs {
+                environment_cleared: None,
+                inherited_stdin: false,
+            },
             command,
             failure_behavior: BehaviorOnFailure::Exit,
             run_in_dry_run: false,
@@ -430,6 +537,8 @@ impl From<Command> for BootstrapCommand {
 enum CommandStatus {
     /// The command has started and finished with some status.
     Finished(ExitStatus),
+    /// The actual child exited, but execution ownership is still unresolved.
+    ResourceUnresolved(ExitStatus),
     /// It was not even possible to start the command or wait for it to finish.
     DidNotStartOrFinish,
 }
@@ -438,13 +547,26 @@ enum CommandStatus {
 /// shorter than `BootstrapCommand::new`.
 #[track_caller]
 #[must_use]
-pub fn command<S: AsRef<OsStr>>(program: S) -> BootstrapCommand {
+pub(crate) fn command<S: AsRef<OsStr>>(program: S) -> BootstrapCommand {
     BootstrapCommand::new(program)
+}
+
+/// A trusted SDK tool's read-only compiler/planner metadata command. Darwin's
+/// CoreFoundation can add this process-local text-encoding cache after launch;
+/// it is not an input to the tool's version/print query. Declare its removal on
+/// this command, leaving ordinary source/codegen commands and every other
+/// explicit/inherited input unchanged. Scheduling remains the caller's choice.
+pub(crate) fn tool_metadata_command<S: AsRef<OsStr>>(program: S) -> BootstrapCommand {
+    let mut command = command(program);
+    if cfg!(target_os = "macos") {
+        command.env_remove("__CF_USER_TEXT_ENCODING");
+    }
+    command
 }
 
 /// Represents the output of an executed process.
 #[derive(Clone, PartialEq)]
-pub struct CommandOutput {
+pub(crate) struct CommandOutput {
     status: CommandStatus,
     stdout: Option<Vec<u8>>,
     stderr: Option<Vec<u8>>,
@@ -452,7 +574,7 @@ pub struct CommandOutput {
 
 impl CommandOutput {
     #[must_use]
-    pub fn not_finished(stdout: OutputMode, stderr: OutputMode) -> Self {
+    pub(crate) fn not_finished(stdout: OutputMode, stderr: OutputMode) -> Self {
         Self {
             status: CommandStatus::DidNotStartOrFinish,
             stdout: match stdout {
@@ -467,7 +589,7 @@ impl CommandOutput {
     }
 
     #[must_use]
-    pub fn from_output(output: Output, stdout: OutputMode, stderr: OutputMode) -> Self {
+    pub(crate) fn from_output(output: Output, stdout: OutputMode, stderr: OutputMode) -> Self {
         Self {
             status: CommandStatus::Finished(output.status),
             stdout: match stdout {
@@ -481,28 +603,46 @@ impl CommandOutput {
         }
     }
 
+    fn resource_unresolved(output: Output, stdout: OutputMode, stderr: OutputMode) -> Self {
+        let status = output.status;
+        let mut actual = Self::from_output(output, stdout, stderr);
+        actual.status = CommandStatus::ResourceUnresolved(status);
+        actual
+    }
+
     #[must_use]
-    pub fn is_success(&self) -> bool {
+    pub(crate) fn is_success(&self) -> bool {
         match self.status {
             CommandStatus::Finished(status) => status.success(),
-            CommandStatus::DidNotStartOrFinish => false,
+            CommandStatus::DidNotStartOrFinish | CommandStatus::ResourceUnresolved(_) => false,
         }
     }
 
     #[must_use]
-    pub fn is_failure(&self) -> bool {
+    pub(crate) fn is_failure(&self) -> bool {
         !self.is_success()
     }
 
-    pub fn status(&self) -> Option<ExitStatus> {
+    pub(crate) fn status(&self) -> Option<ExitStatus> {
         match self.status {
             CommandStatus::Finished(status) => Some(status),
+            CommandStatus::DidNotStartOrFinish | CommandStatus::ResourceUnresolved(_) => None,
+        }
+    }
+
+    /// Child-exit DATA only. ResourceUnresolved never earns logical completion,
+    /// command-cache reuse, a fresh GNU borrower or a scope/release capability.
+    pub(crate) fn observed_child_status(&self) -> Option<ExitStatus> {
+        match self.status {
+            CommandStatus::Finished(status) | CommandStatus::ResourceUnresolved(status) => {
+                Some(status)
+            }
             CommandStatus::DidNotStartOrFinish => None,
         }
     }
 
     #[must_use]
-    pub fn stdout(&self) -> String {
+    pub(crate) fn stdout(&self) -> String {
         String::from_utf8(
             self.stdout.clone().expect("Accessing stdout of a command that did not capture stdout"),
         )
@@ -514,22 +654,28 @@ impl CommandOutput {
         self.stdout.as_ref().and_then(|s| String::from_utf8(s.clone()).ok())
     }
 
+    pub fn stderr_if_present(&self) -> Option<String> {
+        self.stderr.as_ref().and_then(|s| String::from_utf8(s.clone()).ok())
+    }
+
+    /// Trust: what the command printed, as bytes, when its stdout was captured. A git
+    /// path need not be UTF-8 (`utils::trust_source_identity`).
     #[must_use]
-    pub fn stdout_if_ok(&self) -> Option<String> {
+    pub fn stdout_bytes_if_present(&self) -> Option<&[u8]> {
+        self.stdout.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn stdout_if_ok(&self) -> Option<String> {
         if self.is_success() { Some(self.stdout()) } else { None }
     }
 
     #[must_use]
-    pub fn stderr(&self) -> String {
+    pub(crate) fn stderr(&self) -> String {
         String::from_utf8(
             self.stderr.clone().expect("Accessing stderr of a command that did not capture stderr"),
         )
         .expect("Cannot parse process stderr as UTF-8")
-    }
-
-    #[must_use]
-    pub fn stderr_if_present(&self) -> Option<String> {
-        self.stderr.as_ref().and_then(|s| String::from_utf8(s.clone()).ok())
     }
 }
 
@@ -544,24 +690,24 @@ impl Default for CommandOutput {
 }
 
 #[derive(Clone, Default)]
-pub struct ExecutionContext {
+pub(crate) struct ExecutionContext {
     dry_run: DryRun,
-    pub verbosity: u8,
-    pub fail_fast: bool,
+    pub(crate) verbosity: u8,
+    fail_fast: bool,
     delayed_failures: Arc<Mutex<Vec<String>>>,
     command_cache: Arc<CommandCache>,
     profiler: Arc<CommandProfiler>,
 }
 
 #[derive(Default)]
-pub struct CommandCache {
+pub(crate) struct CommandCache {
     cache: Mutex<HashMap<CommandFingerprint, CommandOutput>>,
 }
 
 enum CommandState<'a> {
     Cached(CommandOutput),
     Deferred {
-        process: Option<Result<Child, std::io::Error>>,
+        process: Option<Result<CommandProcess, std::io::Error>>,
         command: &'a mut BootstrapCommand,
         stdout: OutputMode,
         stderr: OutputMode,
@@ -573,82 +719,182 @@ enum CommandState<'a> {
     },
 }
 
-pub struct StreamingCommand {
-    child: Child,
-    pub stdout: Option<ChildStdout>,
-    pub stderr: Option<ChildStderr>,
+// Trust: metadata is completely waited while the implicit borrower is held;
+// its deferred result can contain output, never an unguarded live child.
+enum CommandProcess {
+    Spawned(Child),
+    Metadata(std::io::Result<Output>),
+    // Trust: protected starts eagerly join the actual child/readers before
+    // returning. Concurrent deferred starts cannot borrow implicit execution
+    // twice or deadlock the original thread. This contains DATA only.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Protected(std::io::Result<UnresolvedOutput>),
+}
+
+pub(crate) struct UnresolvedOutput {
+    pub(crate) output: Output,
+    pub(crate) reason: String,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl UnresolvedOutput {
+    pub(crate) fn after_join(
+        output: Output,
+        producer: super::metadata_scheduler::ProducerBorrow,
+        joined: io::Result<build_helper::trust_repo_lock::management::JoinedChild>,
+    ) -> Self {
+        Self { output, reason: producer.unresolved_join(joined) }
+    }
+}
+
+enum ObservedCommand {
+    Finished(Output),
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Unresolved(UnresolvedOutput),
+}
+
+impl CommandProcess {
+    fn wait_with_output(self) -> std::io::Result<ObservedCommand> {
+        match self {
+            Self::Spawned(child) => child.wait_with_output().map(ObservedCommand::Finished),
+            Self::Metadata(output) => output.map(ObservedCommand::Finished),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Protected(output) => output.map(ObservedCommand::Unresolved),
+        }
+    }
+}
+
+pub(crate) struct StreamingCommand {
+    child: StreamingChild,
+    pub(crate) stdout: Option<CommandReader>,
+    #[expect(dead_code, reason = "symmetric with `stdout`")]
+    pub(crate) stderr: Option<CommandReader>,
     fingerprint: CommandFingerprint,
     start_time: Instant,
     #[cfg(feature = "tracing")]
     _span_guard: tracing::span::EnteredSpan,
 }
 
+enum StreamingChild {
+    Ordinary(Child),
+    // Trust: the synchronous library already finished all actual work. Its
+    // regular status is DATA; this owner is neither a Child nor retirement.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Original(crate::engine::CompletedCommand),
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Compiletest(super::metadata_scheduler::StreamingBorrow),
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Protected {
+        child: ScopedChild,
+        producer: super::metadata_scheduler::ProducerBorrow,
+    },
+}
+
+// Trust: the actual protected reader has no raw-FD/clone/export operation.
+pub(crate) enum CommandReader {
+    Stdout(ChildStdout),
+    Stderr(ChildStderr),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Original(crate::engine::CompletedReader),
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Protected(ScopedReader),
+}
+impl Read for CommandReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(reader) => reader.read(bytes),
+            Self::Stderr(reader) => reader.read(bytes),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::Original(reader) => reader.read(bytes),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Protected(reader) => reader.read(bytes),
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn protected_output(
+    command: &mut Command,
+    scope: &ScopeDispatch,
+    stdout: bool,
+    stderr: bool,
+    metadata: bool,
+) -> io::Result<UnresolvedOutput> {
+    if metadata {
+        return super::metadata_scheduler::protected_output(command, scope, stdout, stderr);
+    }
+    let registration = scope.register_launch()?;
+    // Final environment/stdio has already been selected. Re-export the SAME
+    // original GNU after command processing; this borrows no fresh resources.
+    let producer =
+        super::metadata_scheduler::prepare_producer(command, &registration, scope.deadline())?;
+    let (output, joined) = registration.spawn(command)?.wait_with_output_observed()?;
+    Ok(UnresolvedOutput::after_join(output, producer, joined))
+}
+
 #[must_use]
-pub struct DeferredCommand<'a> {
+pub(crate) struct DeferredCommand<'a> {
     state: CommandState<'a>,
 }
 
 impl CommandCache {
-    pub fn get(&self, key: &CommandFingerprint) -> Option<CommandOutput> {
+    pub(crate) fn get(&self, key: &CommandFingerprint) -> Option<CommandOutput> {
         self.cache.lock().unwrap().get(key).cloned()
     }
 
-    pub fn insert(&self, key: CommandFingerprint, output: CommandOutput) {
+    pub(crate) fn insert(&self, key: CommandFingerprint, output: CommandOutput) {
         self.cache.lock().unwrap().insert(key, output);
     }
 }
 
 impl ExecutionContext {
-    pub fn new(verbosity: u8, fail_fast: bool) -> Self {
+    pub(crate) fn new(verbosity: u8, fail_fast: bool) -> Self {
         Self { verbosity, fail_fast, ..Default::default() }
     }
 
-    pub fn dry_run(&self) -> bool {
+    pub(crate) fn dry_run(&self) -> bool {
         match self.dry_run {
             DryRun::Disabled => false,
             DryRun::SelfCheck | DryRun::UserSelected => true,
         }
     }
 
-    pub fn profiler(&self) -> &CommandProfiler {
+    pub(crate) fn profiler(&self) -> &CommandProfiler {
         &self.profiler
     }
 
-    pub fn get_dry_run(&self) -> &DryRun {
+    pub(crate) fn get_dry_run(&self) -> &DryRun {
         &self.dry_run
     }
 
-    pub fn do_if_verbose(&self, f: impl Fn()) {
+    pub(crate) fn do_if_verbose(&self, f: impl Fn()) {
         if self.is_verbose() {
             f()
         }
     }
 
-    pub fn is_verbose(&self) -> bool {
+    pub(crate) fn is_verbose(&self) -> bool {
         self.verbosity > 0
     }
 
-    pub fn fail_fast(&self) -> bool {
-        self.fail_fast
-    }
-
-    pub fn set_dry_run(&mut self, value: DryRun) {
+    pub(crate) fn set_dry_run(&mut self, value: DryRun) {
         self.dry_run = value;
     }
 
-    pub fn set_verbosity(&mut self, value: u8) {
+    pub(crate) fn set_verbosity(&mut self, value: u8) {
         self.verbosity = value;
     }
 
-    pub fn set_fail_fast(&mut self, value: bool) {
-        self.fail_fast = value;
-    }
-
-    pub fn add_to_delay_failure(&self, message: String) {
+    pub(crate) fn add_to_delay_failure(&self, message: String) {
         self.delayed_failures.lock().unwrap().push(message);
     }
 
-    pub fn report_failures_and_exit(&self) {
+    // Trust: a workflow cannot publish success before delayed failures are reported.
+    pub(crate) fn has_delayed_failures(&self) -> bool {
+        !self.delayed_failures.lock().unwrap().is_empty()
+    }
+
+    pub(crate) fn report_failures_and_exit(&self) {
         let failures = self.delayed_failures.lock().unwrap();
         if failures.is_empty() {
             return;
@@ -657,22 +903,31 @@ impl ExecutionContext {
         for failure in &*failures {
             eprintln!("  - {failure}");
         }
-        exit!(1);
+        helpers::exit_process(1);
     }
 
     /// Execute a command and return its output.
     /// Note: Ideally, you should use one of the BootstrapCommand::run* functions to
     /// execute commands. They internally call this method.
     #[track_caller]
-    pub fn start<'a>(
+    pub(crate) fn start<'a>(
         &self,
         command: &'a mut BootstrapCommand,
         stdout: OutputMode,
         stderr: OutputMode,
     ) -> DeferredCommand<'a> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let protected = protected_scope();
         let fingerprint = command.fingerprint();
 
-        if let Some(cached_output) = self.command_cache.get(&fingerprint) {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let dispatch_valid = protected.is_ok() && !super::metadata_scheduler::hosted_graph_active();
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let dispatch_valid = true;
+
+        if let Some(cached_output) =
+            dispatch_valid.then(|| self.command_cache.get(&fingerprint)).flatten()
+        {
             command.mark_as_executed();
             self.do_if_verbose(|| println!("Cache hit: {command:?}"));
             self.profiler.record_cache_hit(fingerprint);
@@ -685,7 +940,7 @@ impl ExecutionContext {
         let created_at = command.get_created_location();
         let executed_at = std::panic::Location::caller();
 
-        if self.dry_run() && !command.run_in_dry_run {
+        if dispatch_valid && self.dry_run() && !command.run_in_dry_run {
             return DeferredCommand {
                 state: CommandState::Deferred {
                     process: None,
@@ -705,13 +960,47 @@ impl ExecutionContext {
             println!("running: {command:?} (created at {created_at}, executed at {executed_at})")
         });
 
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let original_inputs = command.original_inputs;
         let cmd = &mut command.command;
         cmd.stdout(stdout.stdio());
         cmd.stderr(stderr.stdio());
 
         let start_time = Instant::now();
 
-        let child = cmd.spawn();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let child = match protected {
+            Err(error) => Err(error),
+            Ok(_) if super::metadata_scheduler::hosted_graph_active() => {
+                Ok(CommandProcess::Metadata(super::metadata_scheduler::projected_output(
+                    cmd,
+                    stdout.captures(),
+                    stderr.captures(),
+                    original_inputs,
+                )))
+            }
+            Ok(Some(scope)) => Ok(CommandProcess::Protected(protected_output(
+                cmd,
+                &scope,
+                stdout.captures(),
+                stderr.captures(),
+                command.metadata_scheduler,
+            ))),
+            Ok(None) if command.metadata_scheduler => Ok(CommandProcess::Metadata(
+                super::metadata_scheduler::output(cmd, stdout.captures(), stderr.captures()),
+            )),
+            Ok(None) => cmd.spawn().map(CommandProcess::Spawned),
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let child = if command.metadata_scheduler {
+            Ok(CommandProcess::Metadata(super::metadata_scheduler::output(
+                cmd,
+                stdout.captures(),
+                stderr.captures(),
+            )))
+        } else {
+            cmd.spawn().map(CommandProcess::Spawned)
+        };
 
         DeferredCommand {
             state: CommandState::Deferred {
@@ -732,7 +1021,7 @@ impl ExecutionContext {
     /// Note: Ideally, you should use one of the BootstrapCommand::run* functions to
     /// execute commands. They internally call this method.
     #[track_caller]
-    pub fn run(
+    pub(crate) fn run(
         &self,
         command: &mut BootstrapCommand,
         stdout: OutputMode,
@@ -747,19 +1036,56 @@ impl ExecutionContext {
         if !self.is_verbose() {
             println!("Command has failed. Rerun with -v to see more details.");
         }
-        exit!(1);
+        helpers::exit_process(1);
     }
 
     /// Spawns the command with configured stdout and stderr handling.
     ///
     /// Returns None if in dry-run mode or Panics if the command fails to spawn.
-    pub fn stream(
+    pub(crate) fn stream(
         &self,
         command: &mut BootstrapCommand,
         stdout: OutputMode,
         stderr: OutputMode,
     ) -> Option<StreamingCommand> {
+        // Trust: hosted commands cannot escape as asynchronous raw children.
+        // The actual advanced Full owner may instead complete its command
+        // synchronously and retain the SAME guards behind immutable readers.
         command.mark_as_executed();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if super::metadata_scheduler::hosted_graph_active() {
+            #[cfg(feature = "tracing")]
+            let span_guard = crate::utils::tracing::trace_cmd(command);
+            let fingerprint = command.fingerprint();
+            let start_time = Instant::now();
+            let completed = super::metadata_scheduler::host_graph::projected_stream(
+                &command.command,
+                stdout.captures(),
+                stderr.captures(),
+                command.original_inputs,
+            )
+            .unwrap_or_else(|| Err(super::metadata_scheduler::host_graph::refuse_streaming()));
+            let mut completed = completed.unwrap_or_else(|error| {
+                panic!("original Bootstrap library streaming refused: {error}")
+            });
+            let stdout =
+                stdout.captures().then(|| CommandReader::Original(completed.take_stdout()));
+            let stderr =
+                stderr.captures().then(|| CommandReader::Original(completed.take_stderr()));
+            return Some(StreamingCommand {
+                child: StreamingChild::Original(completed),
+                stdout,
+                stderr,
+                fingerprint,
+                start_time,
+                #[cfg(feature = "tracing")]
+                _span_guard: span_guard,
+            });
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let protected = protected_scope()
+            .unwrap_or_else(|error| panic!("Bootstrap protected streaming refused: {error}"));
+        assert!(!command.metadata_scheduler, "bootstrap metadata requires synchronous capture");
         if !command.run_in_dry_run && self.dry_run() {
             return None;
         }
@@ -772,14 +1098,53 @@ impl ExecutionContext {
         let cmd = &mut command.command;
         cmd.stdout(stdout.stdio());
         cmd.stderr(stderr.stdio());
-        let child = cmd.spawn();
-        let mut child = match child {
-            Ok(child) => child,
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let child = if let Some(scope) = protected {
+            (|| {
+                let registration = scope.register_launch()?;
+                let producer = super::metadata_scheduler::prepare_producer(
+                    cmd,
+                    &registration,
+                    scope.deadline(),
+                )?;
+                let child = registration.spawn(cmd)?;
+                Ok(StreamingChild::Protected { child, producer })
+            })()
+        } else if command.compiletest_transport {
+            super::metadata_scheduler::stream_original(cmd).map(StreamingChild::Compiletest)
+        } else {
+            cmd.spawn().map(StreamingChild::Ordinary)
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let child = cmd.spawn().map(StreamingChild::Ordinary);
+        let (child, stdout, stderr) = match child {
+            Ok(StreamingChild::Ordinary(mut child)) => {
+                let stdout = child.stdout.take().map(CommandReader::Stdout);
+                let stderr = child.stderr.take().map(CommandReader::Stderr);
+                (StreamingChild::Ordinary(child), stdout, stderr)
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Ok(StreamingChild::Original(mut completed)) => {
+                let stdout =
+                    stdout.captures().then(|| CommandReader::Original(completed.take_stdout()));
+                let stderr =
+                    stderr.captures().then(|| CommandReader::Original(completed.take_stderr()));
+                (StreamingChild::Original(completed), stdout, stderr)
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Ok(StreamingChild::Compiletest(mut child)) => {
+                let stdout = child.take_stdout().map(CommandReader::Stdout);
+                let stderr = child.take_stderr().map(CommandReader::Stderr);
+                (StreamingChild::Compiletest(child), stdout, stderr)
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Ok(StreamingChild::Protected { mut child, producer }) => {
+                let stdout = child.take_stdout().map(CommandReader::Protected);
+                let stderr = child.take_stderr().map(CommandReader::Protected);
+                (StreamingChild::Protected { child, producer }, stdout, stderr)
+            }
             Err(e) => panic!("failed to execute command: {cmd:?}\nERROR: {e}"),
         };
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
         Some(StreamingCommand {
             child,
             stdout,
@@ -799,19 +1164,31 @@ impl AsRef<ExecutionContext> for ExecutionContext {
 }
 
 impl StreamingCommand {
-    pub fn wait(
-        mut self,
+    pub(crate) fn wait(
+        self,
         exec_ctx: impl AsRef<ExecutionContext>,
     ) -> Result<ExitStatus, std::io::Error> {
         let exec_ctx = exec_ctx.as_ref();
-        let output = self.child.wait();
+        let output = match self.child {
+            StreamingChild::Ordinary(mut child) => child.wait(),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            StreamingChild::Original(completed) => completed.wait(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            StreamingChild::Compiletest(child) => child.wait(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            StreamingChild::Protected { mut child, producer } => (|| {
+                let status = child.wait()?;
+                let reason = producer.unresolved_join(child.joined());
+                Err(io::Error::other(format!("actual child {status}; {reason}")))
+            })(),
+        };
         exec_ctx.profiler().record_execution(self.fingerprint, self.start_time);
         output
     }
 }
 
 impl<'a> DeferredCommand<'a> {
-    pub fn wait_for_output(self, exec_ctx: impl AsRef<ExecutionContext>) -> CommandOutput {
+    pub(crate) fn wait_for_output(self, exec_ctx: impl AsRef<ExecutionContext>) -> CommandOutput {
         match self.state {
             CommandState::Cached(output) => output,
             CommandState::Deferred {
@@ -834,10 +1211,11 @@ impl<'a> DeferredCommand<'a> {
                 drop(_span_guard);
 
                 if (!exec_ctx.dry_run() || command.run_in_dry_run)
-                    && output.status().is_some()
-                    && command.should_cache
+                    && output.observed_child_status().is_some()
                 {
-                    exec_ctx.command_cache.insert(fingerprint.clone(), output.clone());
+                    if command.should_cache && output.status().is_some() {
+                        exec_ctx.command_cache.insert(fingerprint.clone(), output.clone());
+                    }
                     exec_ctx.profiler.record_execution(fingerprint, start_time);
                 }
 
@@ -846,8 +1224,9 @@ impl<'a> DeferredCommand<'a> {
         }
     }
 
-    pub fn finish_process(
-        mut process: Option<Result<Child, std::io::Error>>,
+    // Only the deferred command itself consumes this private process state.
+    fn finish_process(
+        mut process: Option<Result<CommandProcess, std::io::Error>>,
         command: &mut BootstrapCommand,
         stdout: OutputMode,
         stderr: OutputMode,
@@ -870,15 +1249,16 @@ impl<'a> DeferredCommand<'a> {
             FailedAtRuntime(ExitStatus),
             FailedToFinish(std::io::Error),
             FailedToStart(std::io::Error),
+            ResourceUnresolved(String),
         }
 
         let (output, fail_reason) = match process {
             Ok(child) => match child.wait_with_output() {
-                Ok(output) if output.status.success() => {
+                Ok(ObservedCommand::Finished(output)) if output.status.success() => {
                     // Successful execution
                     (CommandOutput::from_output(output, stdout, stderr), None)
                 }
-                Ok(output) => {
+                Ok(ObservedCommand::Finished(output)) => {
                     // Command started, but then it failed
                     let status = output.status;
                     (
@@ -886,6 +1266,11 @@ impl<'a> DeferredCommand<'a> {
                         Some(FailureReason::FailedAtRuntime(status)),
                     )
                 }
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Ok(ObservedCommand::Unresolved(actual)) => (
+                    CommandOutput::resource_unresolved(actual.output, stdout, stderr),
+                    Some(FailureReason::ResourceUnresolved(actual.reason)),
+                ),
                 Err(e) => {
                     // Failed to wait for output
                     (
@@ -917,6 +1302,10 @@ impl<'a> DeferredCommand<'a> {
                 FailureReason::FailedToStart(e) => {
                     format!("failed to start: {e:?}")
                 }
+                FailureReason::ResourceUnresolved(reason) => format!(
+                    "child exited {:?}, but execution ownership is unresolved: {reason}",
+                    output.observed_child_status()
+                ),
             };
             writeln!(
                 error_message,
@@ -926,10 +1315,12 @@ Executed at: {executed_at}"#,
             )
             .unwrap();
             if stdout.captures() {
-                writeln!(error_message, "\n--- STDOUT vvv\n{}", output.stdout().trim()).unwrap();
+                let text = String::from_utf8_lossy(output.stdout.as_deref().unwrap_or_default());
+                writeln!(error_message, "\n--- STDOUT vvv\n{}", text.trim()).unwrap();
             }
             if stderr.captures() {
-                writeln!(error_message, "\n--- STDERR vvv\n{}", output.stderr().trim()).unwrap();
+                let text = String::from_utf8_lossy(output.stderr.as_deref().unwrap_or_default());
+                writeln!(error_message, "\n--- STDERR vvv\n{}", text.trim()).unwrap();
             }
             let backtrace = if exec_ctx.verbosity > 1 {
                 Backtrace::force_capture()
@@ -963,3 +1354,42 @@ Executed at: {executed_at}"#,
         output
     }
 }
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+// Trust: out-of-line unit tests, as tidy's `unit_tests` check requires: the file sits
+// under exec/tests/ so the module keeps its `protected_tests` path.
+#[path = "exec/tests/protected_tests.rs"]
+mod protected_tests;
+
+mod thread_scope;
+pub(crate) use thread_scope::scoped_threads;
+
+/// Until a raw subprocess has an original native executor/retirement owner,
+/// installed protected mode must refuse it. Absent installation preserves the
+/// standalone path; expired/sealed installation never becomes that fallback.
+pub(crate) fn require_standalone_process(operation: &str) -> io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if protected_scope()?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("protected Bootstrap has no native process owner for {operation}"),
+        ));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = operation;
+    Ok(())
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+// Trust: out-of-line unit tests, as tidy's `unit_tests` check requires: the file sits
+// under exec/tests/ so the module keeps its `untracked_tests` path.
+#[path = "exec/tests/untracked_tests.rs"]
+mod untracked_tests;
+
+#[cfg(test)]
+#[path = "exec/tests/tool_metadata_tests.rs"]
+mod tool_metadata_tests;
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[path = "exec/tests/full_command_tests.rs"]
+mod full_command_tests;

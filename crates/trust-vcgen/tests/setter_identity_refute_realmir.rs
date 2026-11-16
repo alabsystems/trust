@@ -27,9 +27,29 @@ fn setter_identity_assert_is_grounded_on_real_mir() {
         !summaries.is_empty(),
         "the trivial-setter recognizer must admit `set`; got {summaries:?}"
     );
+    // The compiler records the DefId each summarized body was extracted from; here
+    // that is the identity the extracted call to `set` carries.
+    let set_identity = f
+        .body
+        .blocks
+        .iter()
+        .find_map(|b| match &b.terminator {
+            Terminator::Call { func, callee_identity: Some(id), .. } if *func == set.def_path => {
+                Some(trust_vcgen::SummaryBodyIdentity::Item {
+                    stable_crate_id: id.stable_crate_id,
+                    def_index: id.def_index,
+                })
+            }
+            _ => None,
+        })
+        .expect("the fixture's call to `set` carries an identity");
+    let mut ids = trust_types::fx::FxHashMap::default();
+    ids.insert(set.def_path.clone(), set_identity);
     let context = trust_vcgen::VcgenContext::for_function(f.def_path.clone())
         .with_callee_summaries(
-            trust_vcgen::CalleeSummaryContext::default().with_setter_summaries(summaries),
+            trust_vcgen::CalleeSummaryContext::default()
+                .with_setter_summaries(summaries)
+                .with_summary_body_identities(ids),
         );
     let vcs = trust_vcgen::generate_full_assert_refutation_vcs_with_context(&f, &context);
     assert_eq!(vcs.len(), 1, "one assert/panic block => one refutation VC; got {}", vcs.len());

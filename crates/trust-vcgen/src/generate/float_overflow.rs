@@ -15,11 +15,24 @@ pub(super) fn v2_float_binop_cannot_overflow(
     v2_float_binop_cannot_overflow_at(func, None, None, op, lhs, rhs)
 }
 
-/// True when `a op b` (f64) provably CANNOT overflow to infinity, so its
+/// True when `a op b` provably CANNOT overflow to infinity, so its
 /// `FloatOverflowToInfinity` VC is discharged. SOUND: gated entirely on the
 /// conservative, fail-closed [`float_range`] interval tracer (NaN-tolerant
-/// mode) — the RESULT interval of the op must sit inside
-/// `±FLOAT_OVERFLOW_DISCHARGE_MARGIN`.
+/// mode) — the RESULT interval of the op must sit inside the discharge margin
+/// FOR THIS OPERATION'S IEEE WIDTH.
+///
+/// WIDTH (Trust 2026-09-17): the thresholds are `MAX`-relative, so they are
+/// read from [`float_overflow_discharge_margin`] and
+/// [`float_add_tiny_operand_bound`] per width, never as f64 constants. Using
+/// the f64 figures for a binary32 op is a FALSE PROOF — `2^1020` is
+/// astronomically above `f32::MAX ~ 2^128`, so two f32 operands near `3e38`
+/// read as "tiny" and their sum is infinity. An unmodelled width discharges
+/// NOTHING.
+///
+/// The tracer stores intervals in `f64`, but each intermediate arithmetic
+/// result is enclosed at its own IEEE width before that interval is propagated.
+/// Widening an f32 value is exact; evaluating its arithmetic at f64 precision
+/// alone does not enclose the rounded f32 result.
 ///
 /// NaN case analysis (`FloatNanMode::NanOrBounded`: a clamp of a NaN self
 /// passes NaN through, sin/cos of ±inf is NaN): a `Some` operand interval
@@ -42,31 +55,60 @@ pub(super) fn v2_float_binop_cannot_overflow_at(
     lhs: &Operand,
     rhs: &Operand,
 ) -> bool {
+    // Both operands must describe the same supported IEEE operation.
+    let Some(width) = v2_float_binop_width(func, lhs, rhs) else { return false };
+    let (Some(margin), Some(tiny_bound)) =
+        (float_overflow_discharge_margin(width), float_add_tiny_operand_bound(width))
+    else {
+        return false;
+    };
+
     let ctx = FloatRangeCtx::new(func, summaries);
     let mode = FloatNanMode::NanOrBounded;
     let range = |operand: &Operand| {
         float_range(&ctx, mode, block_id, operand, &mut Vec::new(), FLOAT_EXP_BOUND_FUEL)
     };
-    let within_margin = |(lo, hi): (f64, f64)| {
-        lo.abs() <= FLOAT_OVERFLOW_DISCHARGE_MARGIN && hi.abs() <= FLOAT_OVERFLOW_DISCHARGE_MARGIN
-    };
+    let within_margin = |(lo, hi): (f64, f64)| lo.abs() <= margin && hi.abs() <= margin;
     match op {
         BinOp::Add | BinOp::Sub => {
-            let (ra, rb) = (range(lhs), range(rhs));
-            // One TINY operand alone suffices — see FLOAT_ADD_TINY_OPERAND_BOUND.
-            let tiny = |r: &Option<(f64, f64)>| matches!(r, Some((lo, hi)) if lo.abs().max(hi.abs()) < FLOAT_ADD_TINY_OPERAND_BOUND);
-            if tiny(&ra) || tiny(&rb) {
-                return true;
-            }
-            match (ra, rb) {
-                (Some(a), Some(b)) => float_interval_binop(op, a, b).is_some_and(within_margin),
-                _ => false,
+            // One TINY operand alone suffices — see `float_add_tiny_operand_bound`.
+            // The `<` is STRICT and load-bearing: the bound is exactly
+            // `ulp(MAX) / 2`, the round-to-infinity boundary, so an operand AT
+            // the bound added to `MAX` ties and rounds AWAY to infinity.
+            let tiny = |r: &Option<(f64, f64)>| matches!(r, Some((lo, hi)) if lo.abs().max(hi.abs()) < tiny_bound);
+            if matches!(rhs, Operand::Constant(_)) && !matches!(lhs, Operand::Constant(_)) {
+                let rb = range(rhs);
+                if tiny(&rb) {
+                    return true;
+                }
+                let ra = range(lhs);
+                if tiny(&ra) {
+                    return true;
+                }
+                match (ra, rb) {
+                    (Some(a), Some(b)) => float_interval_binop(op, a, b).is_some_and(within_margin),
+                    _ => false,
+                }
+            } else {
+                let ra = range(lhs);
+                if tiny(&ra) {
+                    return true;
+                }
+                let rb = range(rhs);
+                if tiny(&rb) {
+                    return true;
+                }
+                match (ra, rb) {
+                    (Some(a), Some(b)) => float_interval_binop(op, a, b).is_some_and(within_margin),
+                    _ => false,
+                }
             }
         }
-        BinOp::Mul => match (range(lhs), range(rhs)) {
-            (Some(a), Some(b)) => float_interval_binop(op, a, b).is_some_and(within_margin),
-            _ => false,
-        },
+        BinOp::Mul => {
+            let Some(a) = range(lhs) else { return false };
+            let Some(b) = range(rhs) else { return false };
+            float_interval_binop(op, a, b).is_some_and(within_margin)
+        }
         BinOp::Div => {
             let Some((lo, hi)) = range(lhs) else { return false };
             let magnitude = lo.abs().max(hi.abs());
@@ -83,10 +125,115 @@ pub(super) fn v2_float_binop_cannot_overflow_at(
             // `floor > 0` by the helper's contract; fl-monotone: every IEEE
             // quotient of in-range operands is `<= fl(magnitude / floor)`.
             let bound = magnitude / floor;
-            bound.is_finite() && bound <= FLOAT_OVERFLOW_DISCHARGE_MARGIN
+            bound.is_finite() && bound <= margin
         }
         _ => false,
     }
+}
+
+/// The IEEE bit pattern of the width's tiny-addend bound (`float_add_tiny_operand_bound`),
+/// encoded AT that width: `None` for an unmodelled width or a bound that does not narrow
+/// exactly (both bounds are powers of two, so they do).
+fn float_tiny_operand_bound_bits(width: u32) -> Option<u128> {
+    let bound = float_add_tiny_operand_bound(width)?;
+    match width {
+        64 => Some(u128::from(bound.to_bits())),
+        32 => {
+            let narrow = bound as f32;
+            (f64::from(narrow) == bound).then(|| u128::from(narrow.to_bits()))
+        }
+        _ => None,
+    }
+}
+
+/// Trust (2026-10-17, gate RCA precision T7): `a op b` is an `Add`/`Sub` one of whose
+/// operands is a float CONSTANT strictly below the width's tiny-addend bound `T` — the
+/// case where the interval discharge's tiny-operand rule holds on a ground operand, so
+/// [`float_add_tiny_operand_conjuncts`] carry a conjunct that is false on a ground term.
+///
+/// [`v2_build_float_overflow_vc`] keeps such a row (witness and those conjuncts) even when
+/// the interval discharge holds. Since f559970230 (2026-09-17) the tracer reads binary32
+/// literals, so `self.quiet + 4.0` (f32) is discharged, and a discharge emits NO
+/// obligation: the two `float_overflow_to_infinity` rows of aterm-effects
+/// `kitty_pet.rs:7601/7609`, which the seal (321aaeda75) published PROVED
+/// (kernel-certified), vanished from the report (MISSING on the candidate gate of
+/// 2026-10-16). A discharge whose argument the row can state itself is a proof, so the
+/// row is reported, and proves.
+///
+/// BINARY32 ONLY (2026-10-18, revised from "every width"). The row is kept exactly where
+/// the published seal kept it: before f559970230 the tracer read no binary32 literal, so
+/// the seal emitted (and proved) the binary32 row, while its binary64 discharge already
+/// dropped `x + 0.05` (aterm-types `lighter + 0.05`). Emitting the binary64 row too
+/// changed the row inventory of bodies the seal reported, and a body whose only
+/// obligation was such an add lost the seal's `no_obligations` row (an identity the next
+/// gate, against the same seal, would read MISSING). Either answer is sound: the row
+/// proves, and the discharge it replaces is the same argument.
+fn float_add_witness_refutes_by_constant(
+    func: &VerifiableFunction,
+    op: BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> bool {
+    if !matches!(op, BinOp::Add | BinOp::Sub) {
+        return false;
+    }
+    let Some(width) = v2_float_binop_width(func, lhs, rhs) else { return false };
+    if width != 32 {
+        return false;
+    }
+    let Some(tiny) = float_add_tiny_operand_bound(width) else { return false };
+    [lhs, rhs].into_iter().any(|operand| match operand {
+        Operand::Constant(c) => {
+            super::float_range::f64_const_value(c).is_some_and(|v| v.is_finite() && v.abs() < tiny)
+        }
+        _ => false,
+    })
+}
+
+/// Trust (2026-10-17, gate RCA precision T7): `T <= |a|` and `T <= |b|` for an `Add`/`Sub`
+/// at a modelled width, `T = ulp(MAX) / 2` the width's tiny-addend bound
+/// (`float_add_tiny_operand_bound`: 2^103 binary32, 2^970 binary64), compared as IEEE
+/// magnitude bits at the operation's width, the encoding the witness itself uses
+/// (`v2_float_magnitude_bits`; sign-stripped bit order is magnitude order).
+///
+/// SOUNDNESS: every real overflow satisfies both. With `|b| < T` and `a` finite, the
+/// exact sum (difference, for opposite signs) has magnitude `<= |a| + |b| < MAX +
+/// ulp(MAX) / 2`, strictly below the round-to-nearest-even boundary to infinity, so it
+/// rounds to at most `MAX`: no overflow; symmetrically for `|a| < T`. Conjoined onto the
+/// witness they therefore keep it an over-approximation of the violation set. This is
+/// the argument the interval discharge's tiny-operand rule already makes
+/// (`v2_float_binop_cannot_overflow_at`), stated in the obligation. They are conjoined
+/// ONLY onto the row [`float_add_witness_refutes_by_constant`] keeps; every other float
+/// row's formula is unchanged.
+fn float_add_tiny_operand_conjuncts(
+    func: &VerifiableFunction,
+    op: BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> Option<Vec<Formula>> {
+    if !matches!(op, BinOp::Add | BinOp::Sub) {
+        return None;
+    }
+    let width = match crate::operand_ty_cow(func, lhs)?.as_ref() {
+        Ty::Float { width: width @ (32 | 64) } => *width,
+        _ => return None,
+    };
+    let mag_width = trust_floatbits::magnitude_field_width(width);
+    let magnitude_mask = u128::from(trust_floatbits::magnitude_mask(width));
+    let tiny_bits = float_tiny_operand_bound_bits(width)?;
+    let tiny = Formula::BitVec { value: (tiny_bits & magnitude_mask) as i128, width: mag_width };
+    Some(
+        [lhs, rhs]
+            .into_iter()
+            .map(|operand| {
+                Formula::BvULe(
+                    Box::new(tiny.clone()),
+                    Box::new(v2_float_magnitude_bits(operand_to_formula(func, operand), width)),
+                    mag_width,
+                )
+            })
+            .collect(),
+    )
 }
 
 pub(super) fn v2_build_float_overflow_vc(
@@ -139,14 +286,22 @@ pub(super) fn v2_build_float_overflow_vc(
     // Gated on the conservative, fail-closed `float_range` interval tracer, so an
     // unconstrained operand keeps its obligation (the round-8 fail-closed behaviour
     // above is preserved for everything else).
-    if v2_float_binop_cannot_overflow_at(
+    //
+    // Trust (2026-10-17, gate RCA precision T7): EXCEPT a discharge earned by a tiny
+    // CONSTANT operand (`float_add_witness_refutes_by_constant`): that row is emitted
+    // with the tiny-operand conjuncts (`float_add_tiny_operand_conjuncts`), one of which
+    // is false on a ground term, so it proves, as the seal reported it.
+    let discharged = v2_float_binop_cannot_overflow_at(
         context.func,
         Some(context.block.id),
         context.summaries,
         op,
         lhs,
         rhs,
-    ) {
+    );
+    let tiny_constant_row =
+        discharged && float_add_witness_refutes_by_constant(context.func, op, lhs, rhs);
+    if discharged && !tiny_constant_row {
         return None;
     }
     // Trust 2026-08-03 — do NOT let "no witness shape" masquerade as
@@ -173,6 +328,17 @@ pub(super) fn v2_build_float_overflow_vc(
         // keep the historical behaviour.
         None => return None,
     };
+    let formula = if tiny_constant_row {
+        let Some(mut conjuncts) = float_add_tiny_operand_conjuncts(context.func, op, lhs, rhs)
+        else {
+            // No conjuncts at this width: the discharge stands, as before.
+            return None;
+        };
+        conjuncts.insert(0, formula);
+        Formula::And(conjuncts)
+    } else {
+        formula
+    };
     // F7: conjoin the ENTRY-STABLE contract magnitude bounds on the operands
     // as pure-BV hypotheses, so the typed-CHC/PDR solver lane can discharge
     // the witness from a `#[requires]` bound (previously the witness carried
@@ -190,7 +356,7 @@ pub(super) fn v2_build_float_overflow_vc(
 
     Some(VerificationCondition {
         kind: VcKind::FloatOverflowToInfinity { op, operand_ty },
-        function: context.func.name.clone().into(),
+        function: context.func.name.as_str().into(),
         location: context.span.clone(),
         formula: v2_formula_with_block_defs_before_stmt(
             context.func,
@@ -249,6 +415,9 @@ pub(super) fn v2_float_contract_magnitude_hypotheses(
     lhs: &Operand,
     rhs: &Operand,
 ) -> Vec<Formula> {
+    if func.preconditions.is_empty() {
+        return Vec::new();
+    }
     let mut hypotheses = Vec::new();
     let mut seen: Vec<&Place> = Vec::new();
     for operand in [lhs, rhs] {
@@ -257,10 +426,10 @@ pub(super) fn v2_float_contract_magnitude_hypotheses(
             continue;
         }
         seen.push(place);
-        if !matches!(crate::operand_ty_cow(func, operand).as_deref(), Some(Ty::Float { width: 64 }))
-        {
+        let Some(width) = v2_float_operand_width(func, operand).filter(|w| matches!(w, 32 | 64))
+        else {
             continue;
-        }
+        };
         // Direct param-rooted read (`self.0 * k` with `self` entry-stable), or —
         // the dominant real-MIR shape — a compiler TEMP holding a single stable
         // copy of one (`_3 = ((*_1).0); _5 = Mul(_3, _4)`): resolve the temp
@@ -287,15 +456,21 @@ pub(super) fn v2_float_contract_magnitude_hypotheses(
             // surfaces the param place itself.)
             let mut cur = place.local;
             for _ in 0..8 {
-                if !crate::place_source_is_stable(func, cur) {
+                if (1..=func.body.arg_count).contains(&cur) {
                     return None;
                 }
                 match crate::local_defs::unique_value_def(func, cur)? {
                     Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) => {
                         if (1..=func.body.arg_count).contains(&q.local) {
+                            if !crate::place_source_is_stable(func, cur) {
+                                return None;
+                            }
                             return contract_range(func, q);
                         }
-                        if q.projections.is_empty() && q.local != cur {
+                        if q.projections.is_empty()
+                            && q.local != cur
+                            && crate::place_source_is_stable(func, cur)
+                        {
                             cur = q.local;
                             continue;
                         }
@@ -308,11 +483,35 @@ pub(super) fn v2_float_contract_magnitude_hypotheses(
         });
         let Some((l, u)) = range else { continue };
         let c = l.abs().max(u.abs());
-        let width = 64u32;
+        // The hypothesis is `magnitude_bits(operand) <= C`, and it must be
+        // WEAKER than the contract, never stronger: every value the contract
+        // admits has to satisfy it, or the solver is assuming more than the
+        // user wrote. Magnitude bit patterns are monotone in magnitude, so `C`
+        // must be the pattern of a value at this width that is `>= c`.
+        //
+        // `c` is tracked as f64. At binary32 `c as f32` rounds to NEAREST and
+        // can land BELOW `c`, which would exclude values the contract admits —
+        // the unsound direction. So mint the hypothesis only when the
+        // narrowing is EXACT. That is the real shape anyway: for an f32
+        // operand, `contract_range` derived `c` from f32 literals that widened
+        // to f64 exactly.
+        let c_bits_raw = match width {
+            64 => c.to_bits(),
+            32 => {
+                let narrow = c as f32;
+                if f64::from(narrow) != c {
+                    continue;
+                }
+                u64::from(narrow.to_bits())
+            }
+            _ => continue,
+        };
         // Trust: the magnitude field width and its mask are the VERIFIED
         // `trust-floatbits` table, not a fourth open-coded `(1 << (w-1)) - 1`.
+        // `magnitude_mask(64)` is exactly what `binary64_magnitude_bits` applied,
+        // so the f64 lane is bit-identical to before.
         let mag_width = trust_floatbits::magnitude_field_width(width);
-        let c_bits = i128::from(trust_floatbits::binary64_magnitude_bits(c.to_bits()));
+        let c_bits = i128::from(c_bits_raw & trust_floatbits::magnitude_mask(width));
         hypotheses.push(Formula::BvULe(
             Box::new(v2_float_magnitude_bits(operand_to_formula(func, operand), width)),
             Box::new(Formula::BitVec { value: c_bits, width: mag_width }),
@@ -338,6 +537,19 @@ pub(super) fn float_witness_width_is_supported(width: u32) -> bool {
     // the drift direction that matters is a `true` here for a width whose field
     // accessors all return `0`.
     trust_floatbits::format_supported(width) == 1
+}
+
+/// The common supported IEEE width of a binary operation. A missing, mixed or
+/// unsupported operand width cannot authorize a numerical range or discharge.
+pub(super) fn v2_float_binop_width(
+    func: &VerifiableFunction,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> Option<u32> {
+    match (v2_float_operand_width(func, lhs), v2_float_operand_width(func, rhs)) {
+        (Some(width @ (32 | 64)), Some(other)) if width == other => Some(width),
+        _ => None,
+    }
 }
 
 /// The float width of `operand`, or `None` if it is not a float.
@@ -497,11 +709,8 @@ pub(super) fn v2_float_overflow_witness_formula(
             let exp_width = trust_floatbits::exponent_field_width(width);
             let frac_width = trust_floatbits::fraction_field_width(width);
             let finite_exponent_value = i128::from(trust_floatbits::nonfinite_exponent(width));
-            let one_bits = if width == 32 {
-                1.0f32.to_bits() as u128
-            } else {
-                1.0f64.to_bits() as u128
-            };
+            let one_bits =
+                if width == 32 { 1.0f32.to_bits() as u128 } else { 1.0f64.to_bits() as u128 };
             let magnitude_mask = u128::from(trust_floatbits::magnitude_mask(width));
             let divisor_threshold =
                 Formula::BitVec { value: (one_bits & magnitude_mask) as i128, width: mag_width };

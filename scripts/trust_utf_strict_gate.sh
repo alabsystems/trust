@@ -32,9 +32,9 @@
 #     refuting a DIFFERENT mechanism: a direct contract, the composition that
 #     carries the tier-1 bounds, the SECOND clause of the two-clause contract
 #     (which nothing else in the tree exercises), and a real safety obligation.
-#  4. `TRUSTFLAGS` is silently dropped if misspelled, so the certify lane can
-#     look like it ran when it did not. The flag path is proved by feeding it a
-#     bogus policy and requiring the compiler to reject it by name.
+#  4. The certify lane must be seen to run, not assumed. `--certify` selects
+#     it (TRUSTFLAGS is not read since T7a), and the Gate line names the lane
+#     that graded the run, so the certify step requires `[certify lane`.
 #  5. Proofs cover overflow, underflow and discharged contracts — NOT whether
 #     the answer is right. Two `u32 -> u16` casts in this crate are outside
 #     every obligation it has (a truncating cast is neither an overflow nor a
@@ -80,9 +80,9 @@ trap 'restore; rm -f "$BACKUP"' EXIT INT TERM
 
 fails=0
 LOG=""
-run() { # run [policy]; sets RC and LOG
+run() { # run [lane flag]; sets RC and LOG
   LOG="$(mktemp)"
-  ( cd "$REPO_ROOT/crates" && TRUSTFLAGS="${1:-}" "$TARGO" trust check -p trust-utf ) > "$LOG" 2>&1
+  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check --all-rows ${1:+"$1"} -p trust-utf ) > "$LOG" 2>&1
   RC=$?
   require_env "${STEP:-run}"
   no_rustc_error "${STEP:-run}"
@@ -102,7 +102,7 @@ runtests() { # sets RC and LOG
   RC=$?
   require_env "${STEP:-tests}"
 }
-gate_line() { grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$LOG" | tail -1; }
+gate_line() { grep -oE 'Gate: [A-Z-]+ \[[a-z-]+ lane, exit [0-9]+\]' "$LOG" | tail -1; }
 fail() { echo "  FAIL $*"; fails=$((fails+1)); }
 
 # ---------------------------------------------------------------------------
@@ -232,21 +232,17 @@ rm -f "$LOG"
 
 mut_end
 # ---------------------------------------------------------------------------
-# 2. THE SAME PASS UNDER `-Ztrust-policy=certify`.
-#    A misspelled TRUSTFLAGS is dropped, so first prove the flag path reaches
-#    the compiler by requiring a bogus policy to be REJECTED BY NAME. Without
-#    this control, "certify passed" is indistinguishable from "certify never ran".
+# 2. THE SAME PASS UNDER `--certify` (the compiler's `certify` policy).
+#    The lane flag selects the compiler's `certify` policy, and the Gate line
+#    names the lane that graded the run, so `[certify lane, exit 0]` is the
+#    evidence that certify ran. (A bogus-policy control proved the TRUSTFLAGS
+#    route reached the compiler; it went with that channel, DECISION_QUEUE T7a.)
 # ---------------------------------------------------------------------------
-STEP="THE SAME PASS UNDER '-Ztrust-policy=certify'"; mut_begin
-run "-Ztrust-policy=bogus_not_a_policy"
-grep -q "incorrect value \`bogus_not_a_policy\` for unstable option \`trust-policy\`" "$LOG" \
-  || fail "TRUSTFLAGS control: a bogus policy was NOT rejected — the flag never reaches the compiler, so the certify run below proves nothing"
-rm -f "$LOG"
-
-run "-Ztrust-policy=certify"
+STEP="THE SAME PASS UNDER '--certify'"; mut_begin
+run "--certify"
 G="$(gate_line)"
 [ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
-case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
+case "$G" in *"PASS [certify lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
 grep -qE 'Summary: 70 proved, 0 failed, .*0 inconclusive \(70 total\)' "$LOG" \
   || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 mut_ok "certify   $G"
@@ -413,30 +409,57 @@ mutate '    if hi < 55296 {
 run
 G="$(gate_line)"
 if [ "$RC" -eq 0 ]; then fail "mutation D: an unguarded subtraction still passed  $G"; else mut_ok "mutation D (raw_combine_surrogates loses its hi<55296 guard)  rc=$RC  $G"; fi
-grep -qE '^\s*\[UNKNOWN\] \[overflow:sub\]' "$LOG" \
-  || fail "mutation D: the subtraction row did not go UNKNOWN — $(grep -oE '\[[A-Z]+\] \[overflow:sub\]' "$LOG" | head -3 | tr '\n' ' ')"
+# RE-MEASURED 2026-09-15 on a stage1 built from main 12cf513003, and the ASYMMETRY
+# RECORDED ABOVE IS GONE in the stronger direction: this `u32` subtraction is now
+# REFUTED, not merely unknown — `[FAILED] [overflow:sub] … @ src/lib.rs:466 (ay-in-process)`
+# with `counterexample: … hi = 0 …`. So `[UNKNOWN]`-only failed a correctly-behaving
+# compiler. Either verdict is fail-closed and accepted. A FAILED row must also carry a
+# witness INSIDE the unguarded range (`hi < 55296`); a refutation outside it would be a
+# FALSE refutation, and this arm refuses that rather than counting any FAILED as good.
+grep -qE '^\s*\[(FAILED|UNKNOWN)\] \[overflow:sub\]' "$LOG" \
+  || fail "mutation D: the subtraction row went neither FAILED nor UNKNOWN — $(grep -oE '\[[A-Z]+\] \[overflow:sub\]' "$LOG" | head -3 | tr '\n' ' ')"
+if grep -qE '^\s*\[FAILED\] \[overflow:sub\]' "$LOG"; then
+  HI="$(grep -E 'arithmetic overflow \(Sub\) FAILED \([a-z-]+\) counterexample:' "$LOG" \
+        | grep -oE '(^|[ ,:])hi = [0-9]+' | head -1 | grep -oE '[0-9]+$')"
+  { [ -n "$HI" ] && [ "$HI" -lt 55296 ]; } \
+    || fail "mutation D: a FAILED subtraction row carried no counterexample with hi < 55296 (hi='$HI') — a witness outside the unguarded range is a FALSE refutation"
+fi
 grep -q 'strict verification failed for `trust_utf::raw_combine_surrogates`' "$LOG" \
   || fail "mutation D: raw_combine_surrogates did not hard-error"
-# §11.5 IS LIVE HERE, AND THIS IS THE ONE PLACE IN THIS GATE WHERE IT IS.
-# `raw_combine_surrogates` IS bundled — `combine_surrogates` (lib.rs:295) is its
-# caller — so the audit flagged the by-name assertion above as the shape §11.5
-# warns about: a callee whose rows go unproven stops being bundlable, and the
-# error is then raised against its CALLER.
-#
-# MEASURED 2026-08-29 by running this mutation standalone, both halves happen:
-#   Trust strict verification failed for `trust_utf::raw_combine_surrogates`
-#   Trust full   verification failed for `trust_utf::combine_surrogates`
-#     = note: … refused Assert-bearing member `trust_utf::raw_combine_surrogates`
-#             member has a guarded or non-entry-prefix Assert
-# The callee IS still named in its own right (the `strict` line), which is why
-# the assertion above holds; but the `full`/member-note pair is the §11.5 shape
-# and is the part that does not depend on the attribution level. Assert BOTH, so
-# that if the diagnostic ever moves wholly to the caller this gate keeps its
-# evidence instead of going red for a reason nobody can read.
-grep -q 'verification failed for `trust_utf::combine_surrogates`' "$LOG" \
-  || fail "mutation D: the CALLER combine_surrogates was not refused — per §11.5 an unbundlable member's error is raised against its caller, so this is where the refusal must surface"
-grep -q 'refused Assert-bearing member `trust_utf::raw_combine_surrogates`' "$LOG" \
-  || fail "mutation D: no 'refused Assert-bearing member' note naming raw_combine_surrogates — the unproven-rows refusal §11.5 describes is not what happened, so re-read the member's own row before trusting this mutation's meaning"
+# THE CALLER, RE-MEASURED. `combine_surrogates` (lib.rs:294) calls the mutated helper.
+# 2026-08-29: refused as a bundle, error on the caller (§11.5).
+# 2026-09-15 (main 12cf513003): member REFUTED, 0 refusal notes; the caller still
+#   hard-errored (`Trust strict verification failed for …combine_surrogates`) because
+#   the OLD default-policy gap denier asked the no-fallback question of its two PROVED
+#   postcondition rows ("at least one non-advisory obligation has no runtime fallback").
+# 2026-09-16 (stage1 f405fe0d5, carrying 1db02fe416 = ruling amendment 2026-09-14,
+#   Gap B): the denier asks it of UNPROVED rows only. The caller's one unproved row —
+#   the panic-freedom aggregate the refuted callee costs it — keeps rustc's runtime
+#   check, so the default policy REPORTS it: `warning: Trust verification advisory for
+#   `trust_utf::combine_surrogates`: 3 obligation(s) were not fully verified`, row
+#   `[RUNTIME CHECKED] (3 obligations: 2 proved, 1 runtime-checked, 0 failed, 0 unknown)`,
+#   `[RUNTIME-CHECKED] [assert] assertion: panic freedom … @ src/lib.rs:294`. Under
+#   `-Ztrust-policy=certify` it is still `error: Trust strict verification failed for
+#   `trust_utf::combine_surrogates`` ("runtime-checked obligations lack a static proof
+#   and are not permitted under `-Z trust-policy=certify`"). Pinned at the ROW, which
+#   does not move with the policy; either diagnostic level is accepted; a caller that
+#   reads VERIFIED over a refuted callee is refused as the soundness direction.
+#   Measured against four logs (pristine, 09-15, 09-16 default, 09-16 certify): every
+#   positive grep fails on pristine and the VERIFIED negative fires there.
+grep -qE '::trust_utf::combine_surrogates \[(RUNTIME CHECKED|INCONCLUSIVE)\] \(3 obligations: 2 proved, (1 runtime-checked, 0 failed, 0 unknown|0 runtime-checked, 0 failed, 1 unknown)' "$LOG" \
+  || fail "mutation D: the CALLER combine_surrogates did not lose exactly its panic-freedom row to the refuted callee — $(grep -oE '::trust_utf::combine_surrogates \[[A-Z ]+\] \([^;]*' "$LOG" | head -1)"
+grep -A3 '::trust_utf::combine_surrogates \[' "$LOG" | grep -qE '(runtime-checked|unknown) by kind: assertion=1' \
+  || fail "mutation D: the row the CALLER lost is not the panic-freedom assertion — $(grep -A3 '::trust_utf::combine_surrogates \[' "$LOG" | grep -oE '(runtime-checked|unknown|failed) by kind: [a-z_=0-9, ]+' | tr '\n' ' ')"
+grep -qE 'Trust (strict verification failed|verification advisory) for `trust_utf::combine_surrogates`: 3 obligation\(s\) were not fully verified' "$LOG" \
+  || fail "mutation D: the compiler did not name the CALLER combine_surrogates at all (an error before the 2026-09-14 policy-B denier, an advisory warning after it)"
+grep -q '::trust_utf::combine_surrogates \[VERIFIED\]' "$LOG" \
+  && fail "mutation D: the CALLER reads VERIFIED over a REFUTED callee — that is a soundness regression, not a policy move; re-measure before touching this arm"
+# §11.5's refusal note is the shape for an UNPROVEN member. Since 2026-09-15 the member is
+# REFUTED (its own row reads `[VIOLATIONS]`, 2 failed), and a refuted member reports its own
+# violation rather than becoming unbundlable — measured: 0 refusal notes, both by-name
+# errors above still emitted. Accept either shape; both mean the member was not proved.
+grep -qE 'refused Assert-bearing member `trust_utf::raw_combine_surrogates`|::trust_utf::raw_combine_surrogates \[VIOLATIONS\]' "$LOG" \
+  || fail "mutation D: raw_combine_surrogates was neither refused as an unproven member (§11.5) nor reported with its own VIOLATIONS row — re-read the member's own row before trusting this mutation's meaning"
 # SPECIFICITY. Only the surrogate-combine chain may move; the decode chain, the
 # predicates and the low-surrogate side are all independent of it.
 for f in clamp_scalar clamp_supplementary clamp_low_surrogate \
@@ -448,6 +471,17 @@ for f in clamp_scalar clamp_supplementary clamp_low_surrogate \
   grep -q "verification failed for \`trust_utf::$f\`" "$LOG" \
     && fail "mutation D: $f was refuted by an underflow confined to raw_combine_surrogates — it does not reach that helper, so this run went red for an unrelated reason and its UNKNOWN row is not evidence about the guard"
 done
+# CERTIFY CONTROL: the by-name caller ERROR is still true under certify, where a
+# runtime-checked row is fatal (ruling 2026-09-14). Keep it as a pinned fact there,
+# so the default/certify split is a gate fact rather than a dropped assertion.
+run "--certify"
+[ "$RC" -ne 0 ] || fail "mutation D/certify: rc=0 — certify accepted an unguarded subtraction"
+grep -q 'strict verification failed for `trust_utf::raw_combine_surrogates`' "$LOG" \
+  || fail "mutation D/certify: raw_combine_surrogates did not hard-error under certify"
+grep -q 'Trust strict verification failed for `trust_utf::combine_surrogates`' "$LOG" \
+  || fail "mutation D/certify: certify no longer hard-errors the CALLER of a refuted callee — the 2026-09-14 ruling says a runtime-checked row is fatal under certify"
+grep -q 'not permitted under `-Z trust-policy=certify`' "$LOG" \
+  || fail "mutation D/certify: the certify note naming the runtime-checked row is missing"
 rm -f "$LOG"; restore
 
 mut_end

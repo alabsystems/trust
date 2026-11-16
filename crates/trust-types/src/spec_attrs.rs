@@ -152,9 +152,9 @@ pub fn spec_expr_to_formula(expr: &SpecExpr) -> Formula {
     )
 }
 
-fn spec_expr_to_formula_with_bound_sorts(
-    expr: &SpecExpr,
-    bound_sorts: &mut Vec<(String, Sort)>,
+fn spec_expr_to_formula_with_bound_sorts<'a>(
+    expr: &'a SpecExpr,
+    bound_sorts: &mut Vec<(&'a str, Sort)>,
 ) -> Result<Formula, SpecParseError> {
     match expr {
         SpecExpr::BoolLit(value) => Ok(Formula::Bool(*value)),
@@ -180,7 +180,7 @@ fn spec_expr_to_formula_with_bound_sorts(
             let sort = bound_sorts
                 .iter()
                 .rev()
-                .find_map(|(bound, sort)| (bound == source_name).then(|| sort.clone()))
+                .find_map(|(bound, sort)| (*bound == source_name).then(|| sort.clone()))
                 .unwrap_or(Sort::Int);
             Ok(Formula::Var(name.clone(), sort))
         }
@@ -194,8 +194,10 @@ fn spec_expr_to_formula_with_bound_sorts(
                 SpecBinOp::Mul => Formula::Mul(lhs, rhs),
                 SpecBinOp::Div => Formula::Div(lhs, rhs),
                 SpecBinOp::Mod => Formula::Rem(lhs, rhs),
-                SpecBinOp::Eq => Formula::Eq(lhs, rhs),
-                SpecBinOp::Ne => Formula::Not(Box::new(Formula::Eq(lhs, rhs))),
+                // Rust `PartialEq`: IEEE `FpEq` over a float operand, never
+                // structural `Eq` (SPEC-FLOAT-EQ-STRUCTURAL-1).
+                SpecBinOp::Eq => crate::spec_equality(lhs, rhs),
+                SpecBinOp::Ne => Formula::Not(Box::new(crate::spec_equality(lhs, rhs))),
                 SpecBinOp::Lt => Formula::Lt(lhs, rhs),
                 SpecBinOp::Le => Formula::Le(lhs, rhs),
                 SpecBinOp::Gt => Formula::Gt(lhs, rhs),
@@ -284,12 +286,12 @@ fn spec_expr_to_formula_with_bound_sorts(
     }
 }
 
-fn lower_spec_quantifier(
+fn lower_spec_quantifier<'a>(
     is_forall: bool,
-    var: &str,
+    var: &'a str,
     ty: &str,
-    body: &SpecExpr,
-    bound_sorts: &mut Vec<(String, Sort)>,
+    body: &'a SpecExpr,
+    bound_sorts: &mut Vec<(&'a str, Sort)>,
 ) -> Result<Formula, SpecParseError> {
     let label = if is_forall { "forall" } else { "exists" };
     if !crate::spec_parse::is_plain_source_binding_name(var) {
@@ -303,7 +305,7 @@ fn lower_spec_quantifier(
                 detail: format!("{label}: unsupported binder type `{ty}`"),
             }
         })?;
-    bound_sorts.push((var.to_string(), sort.clone()));
+    bound_sorts.push((var, sort.clone()));
     let lowered_body = spec_expr_to_formula_with_bound_sorts(body, bound_sorts);
     bound_sorts.pop();
     let mut lowered_body = lowered_body?;
@@ -346,7 +348,7 @@ fn parse_spec_expr(input: &str) -> Result<SpecExpr, SpecParseError> {
     // where the measured message pointed away from the cast entirely: `u32::MAX`
     // alone parses here, so "trailing tokens after expression" read as a
     // mystery. Still a refusal — see `SpecParseError::UnsupportedCast`.
-    if parser.peek() == Some(&Token::Ident("as".to_string())) {
+    if matches!(parser.peek(), Some(Token::Ident(s)) if s == "as") {
         return Err(SpecParseError::UnsupportedCast { clause: input.trim().to_string() });
     }
     Err(SpecParseError::TrailingTokens)
@@ -371,13 +373,23 @@ impl SpecExprParser {
     }
 
     fn bump(&mut self) -> Result<Token, SpecParseError> {
-        self.tokens
-            .get(self.index)
-            .cloned()
-            .inspect(|_| {
-                self.index += 1;
-            })
-            .ok_or_else(|| SpecParseError::UnexpectedEof { expected: "token".into() })
+        let Some(slot) = self.tokens.get_mut(self.index) else {
+            return Err(SpecParseError::UnexpectedEof { expected: "token".into() });
+        };
+        self.index += 1;
+        Ok(std::mem::replace(slot, Token::Comma))
+    }
+
+    fn eat_ident(&mut self) -> Option<String> {
+        if !matches!(self.tokens.get(self.index), Some(Token::Ident(_))) {
+            return None;
+        }
+        let slot = self.tokens.get_mut(self.index)?;
+        let Token::Ident(name) = std::mem::replace(slot, Token::Comma) else {
+            return None;
+        };
+        self.index += 1;
+        Some(name)
     }
 
     fn eat(&mut self, expected: &Token) -> bool {
@@ -396,6 +408,20 @@ impl SpecExprParser {
             Err(SpecParseError::UnexpectedEof { expected: label.into() })
         } else {
             Err(SpecParseError::UnexpectedToken { position: self.index, expected: label.into() })
+        }
+    }
+
+    fn expect_with(
+        &mut self,
+        expected: &Token,
+        label: impl FnOnce() -> String,
+    ) -> Result<(), SpecParseError> {
+        if self.eat(expected) {
+            Ok(())
+        } else if self.is_eof() {
+            Err(SpecParseError::UnexpectedEof { expected: label() })
+        } else {
+            Err(SpecParseError::UnexpectedToken { position: self.index, expected: label() })
         }
     }
 
@@ -485,30 +511,32 @@ impl SpecExprParser {
 
         loop {
             if self.eat(&Token::Dot) {
-                let field = match self.bump()? {
-                    Token::Ident(name) => name,
+                match self.bump()? {
+                    Token::Ident(field) => {
+                        if field.bytes().all(|byte| byte.is_ascii_digit()) {
+                            // Numeric tuple fields cannot be invoked as methods.
+                            expr = SpecExpr::Field { base: Box::new(expr), field };
+                        } else if self.eat(&Token::LParen) {
+                            self.expect(&Token::RParen, "')' after field access")?;
+                            expr = SpecExpr::MethodCall { base: Box::new(expr), method: field };
+                        } else {
+                            expr = SpecExpr::Field { base: Box::new(expr), field };
+                        }
+                    }
                     // A numeric tuple-field projection `t.0`, mirroring the
                     // executable formula parser: the MIR names a `Field(i)`
                     // projection `<base>.i`, so `self.0` must survive this AST
                     // to validate the canonicalized float contracts. A numeric
                     // field is never a call (`t.0()` does not exist).
-                    Token::Int(index) => index.to_string(),
+                    Token::Int(index) => {
+                        expr = SpecExpr::Field { base: Box::new(expr), field: index.to_string() };
+                    }
                     _ => {
                         return Err(SpecParseError::UnexpectedToken {
                             position: self.index.saturating_sub(1),
                             expected: "field name or tuple index after '.'".into(),
                         });
                     }
-                };
-
-                if field.bytes().all(|byte| byte.is_ascii_digit()) {
-                    // Numeric tuple fields cannot be invoked as methods.
-                    expr = SpecExpr::Field { base: Box::new(expr), field };
-                } else if self.eat(&Token::LParen) {
-                    self.expect(&Token::RParen, "')' after field access")?;
-                    expr = SpecExpr::MethodCall { base: Box::new(expr), method: field };
-                } else {
-                    expr = SpecExpr::Field { base: Box::new(expr), field };
                 }
                 continue;
             }
@@ -595,7 +623,7 @@ impl SpecExprParser {
     }
 
     fn parse_fn_call(&mut self, name: String) -> Result<SpecExpr, SpecParseError> {
-        self.expect(&Token::LParen, &format!("'(' after function name '{name}'"))?;
+        self.expect_with(&Token::LParen, || format!("'(' after function name '{name}'"))?;
         let mut args = Vec::new();
 
         if !self.eat(&Token::RParen) {
@@ -619,8 +647,7 @@ impl SpecExprParser {
     ) -> Result<SpecExpr, SpecParseError> {
         let label = if is_forall { "forall" } else { "exists" };
         let mut vars = Vec::new();
-        while let Some(Token::Ident(_)) = self.peek() {
-            let Token::Ident(var) = self.bump()? else { unreachable!() };
+        while let Some(var) = self.eat_ident() {
             if !crate::spec_parse::is_plain_source_binding_name(&var) || vars.contains(&var) {
                 return Err(SpecParseError::InvalidQuantifier {
                     detail: format!("{label}: invalid or duplicate binder `{var}`"),
@@ -636,7 +663,10 @@ impl SpecExprParser {
                 detail: format!("{label}: expected a binder name"),
             });
         }
-        self.expect(&Token::Colon, &format!("':' after binders in {label}"))?;
+        self.expect(
+            &Token::Colon,
+            if is_forall { "':' after binders in forall" } else { "':' after binders in exists" },
+        )?;
         let ty = match self.bump()? {
             Token::Ident(name) => name,
             _ => {
@@ -645,7 +675,10 @@ impl SpecExprParser {
                 });
             }
         };
-        self.expect(&Token::Comma, &format!("',' after type in {label}"))?;
+        self.expect(
+            &Token::Comma,
+            if is_forall { "',' after type in forall" } else { "',' after type in exists" },
+        )?;
         let mut body = self.parse_implies()?;
         // `SpecExpr` stores one binder per node. Desugar the ratified grouped
         // spelling to nested binders in source order; this is logically exact
@@ -662,7 +695,10 @@ impl SpecExprParser {
 
     fn parse_quantifier(&mut self, is_forall: bool) -> Result<SpecExpr, SpecParseError> {
         let label = if is_forall { "forall" } else { "exists" };
-        self.expect(&Token::LParen, &format!("'(' after {label}"))?;
+        self.expect(
+            &Token::LParen,
+            if is_forall { "'(' after forall" } else { "'(' after exists" },
+        )?;
 
         let var = match self.bump()? {
             Token::Ident(name) => name,
@@ -688,9 +724,15 @@ impl SpecExprParser {
                 }
             };
 
-            self.expect(&Token::Comma, &format!("',' after type in {label}"))?;
+            self.expect(
+                &Token::Comma,
+                if is_forall { "',' after type in forall" } else { "',' after type in exists" },
+            )?;
             let body = self.parse_implies()?;
-            self.expect(&Token::RParen, &format!("closing ')' for {label}"))?;
+            self.expect(
+                &Token::RParen,
+                if is_forall { "closing ')' for forall" } else { "closing ')' for exists" },
+            )?;
             return Ok(if is_forall {
                 SpecExpr::Forall { var, ty, body: Box::new(body) }
             } else {
@@ -719,9 +761,15 @@ impl SpecExprParser {
             });
         }
         let hi = self.parse_add_sub()?;
-        self.expect(&Token::Comma, &format!("',' after range in {label}"))?;
+        self.expect(
+            &Token::Comma,
+            if is_forall { "',' after range in forall" } else { "',' after range in exists" },
+        )?;
         let body = self.parse_implies()?;
-        self.expect(&Token::RParen, &format!("closing ')' for {label}"))?;
+        self.expect(
+            &Token::RParen,
+            if is_forall { "closing ')' for forall" } else { "closing ')' for exists" },
+        )?;
 
         let bound = SpecExpr::Var(var.clone());
         let range = SpecExpr::BinOp {
@@ -1481,7 +1529,8 @@ mod tests {
         );
         // Lowering: FloatLit -> the binary64 FpConst, bits preserved exactly.
         assert_eq!(
-            spec_expr_to_formula(&SpecExpr::FloatLit(2.5e-3_f64.to_bits())),
+            try_spec_expr_to_formula(&SpecExpr::FloatLit(2.5e-3_f64.to_bits()))
+                .expect("a float literal lowers exactly"),
             Formula::FpConst { bits: u128::from(2.5e-3_f64.to_bits()), eb: 11, sb: 53 },
         );
     }

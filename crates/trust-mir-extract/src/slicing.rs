@@ -770,10 +770,7 @@ mod tests {
     fn test_slice_body_preserves_dead_operand_unsupported() {
         assert_dead_unsupported_stmt_is_preserved(Statement::Assign {
             place: Place::local(1),
-            rvalue: Rvalue::Use(Operand::Unsupported {
-                kind: "ConstValue::Ty".to_string(),
-                detail: "unsupported constant".to_string(),
-            }),
+            rvalue: Rvalue::Use(Operand::unsupported("ConstValue::Ty", "unsupported constant")),
             span: SourceSpan::default(),
         });
     }
@@ -942,6 +939,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "f".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -1171,6 +1169,7 @@ mod tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             is_foreign: false,
             func: "foo".to_string(),
             args: vec![Operand::Copy(Place::local(1)), Operand::Move(Place::local(2))],
@@ -1194,6 +1193,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
         };
         assert_eq!(terminator_reads(&term), vec![1, 2]);
         assert_eq!(terminator_writes(&term), vec![0]);
@@ -1225,6 +1225,7 @@ mod tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             is_foreign: false,
             func: "f".to_string(),
             args: vec![],
@@ -1276,6 +1277,7 @@ mod tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             is_foreign: false,
             func: "f".to_string(),
             args: vec![],
@@ -1293,6 +1295,7 @@ mod tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             is_foreign: false,
             func: "f".to_string(),
             args: vec![],

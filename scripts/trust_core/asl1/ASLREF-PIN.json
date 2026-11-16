@@ -1,0 +1,392 @@
+{
+  "repository": "herd/herdtools7",
+  "commit": "ffad2692c4580538e8db7bf6631aa886edfc7423",
+  "tag": "ASLRefEAC1",
+  "scope": "Pinned redistributable asllib source and BSD standard library with upstream notices and named diet license exceptions; no proprietary Arm package or generated ISA data",
+  "files": [
+    {
+      "path": "AST.mli",
+      "git_blob": "7504116b78c344f0522a8fff259f295171f70666",
+      "sha256": "7406b9ac9123350df52e091013dee8dcca69d1edc7a03826797a6289c55101f2",
+      "bytes": 17552
+    },
+    {
+      "path": "ASTUtils.ml",
+      "git_blob": "bfdf3f3cfd111ef77485e9abc0f9e1b3ed57d5a5",
+      "sha256": "187af38e4e40dcef824de864225d962303b66f3db479abe3caff368446597ec1",
+      "bytes": 34540
+    },
+    {
+      "path": "ASTUtils.mli",
+      "git_blob": "5b68c60769eceea9e8da1a996f743204995782e2",
+      "sha256": "f92c64e07fd8d31f570a0546b58d6c80e318b99467428dcd69176566a2068836",
+      "bytes": 15834
+    },
+    {
+      "path": "DependencyAnalysis.ml",
+      "git_blob": "54e3ff984b8209fbb52821575e4b7710a628cae0",
+      "sha256": "c64f0d1b2843d4cad82b1dd31c52e83b109f532974199cbc06dae910e0c362ba",
+      "bytes": 6903
+    },
+    {
+      "path": "DependencyAnalysis.mli",
+      "git_blob": "cf45a6f2a14d48b181d513447fbb1ba03cba7f5d",
+      "sha256": "67a06ed1842758a6d1c59b92f3ae6531b22f00684642aa2d9b2564279349e768",
+      "bytes": 702
+    },
+    {
+      "path": "Interpreter.ml",
+      "git_blob": "ef6d73c37a30ab46828c5890c50abe0ac4d6eef4",
+      "sha256": "0f0b740d7f350eb5b6ae8e47cd414b64ad4271deb4b26407538c31cfbc6f78d3",
+      "bytes": 63816
+    },
+    {
+      "path": "Interpreter.mli",
+      "git_blob": "8fd8121fd36c7f941578a185fc29e6472571ab23",
+      "sha256": "18398dbca45a1ba3191270e54b8d25fe851a7d00bf8e0f0d2be9de35280fb4e6",
+      "bytes": 3456
+    },
+    {
+      "path": "LICENSE.txt",
+      "git_blob": "e0c9d1f40d2b02bb1b226263b3b499a9cb3d1f51",
+      "sha256": "ee8cb9862b98438568e252ec1a380a3d0582e328d4e691c04b1b457ebbf9ccc8",
+      "bytes": 2152
+    },
+    {
+      "path": "Lexer.mll",
+      "git_blob": "a0fbfed74507f67c710483ac6f28d25b27a51ade",
+      "sha256": "106099be44efdc0e96b65c827add297989dfa859f4201d9cde53e829413ae5f1",
+      "bytes": 19062
+    },
+    {
+      "path": "Native.ml",
+      "git_blob": "67526dcf7fc05b2e5850f6b381ab26c4a1876575",
+      "sha256": "43e062e1f1ace92ec5a9af65ac7afdb30c93cd81857209270d11fd616bd75e19",
+      "bytes": 18093
+    },
+    {
+      "path": "Native.mli",
+      "git_blob": "56302a4a677fd288da4eae30be6ba31c7519a56d",
+      "sha256": "94d2151be95649a40b59130ad2a4f57b6aba11343f2483ea2287eaba574407d1",
+      "bytes": 2317
+    },
+    {
+      "path": "Operations.ml",
+      "git_blob": "80f263727822171b9f3058cca7d5675d0f90d2f6",
+      "sha256": "44257a7f7c9f8e8d19b079f63a97a0978b538b611e3c88c4dcb6082cf91a792a",
+      "bytes": 5903
+    },
+    {
+      "path": "PP.ml",
+      "git_blob": "901a3948078030a38eca9a220fdf79fee6e577c5",
+      "sha256": "c983dbc5f247b92dac89bd51a366dfae17a3abc43d5f801a612240da0d1660c4",
+      "bytes": 19010
+    },
+    {
+      "path": "PP.mli",
+      "git_blob": "1965598c13ba4b847d507f3a0f92ac02223adb00",
+      "sha256": "299bc62a6711e2e7961150b3e7d1948cc62c63cb923cdd56f4cfacd35b45473f",
+      "bytes": 3910
+    },
+    {
+      "path": "Parser.mly",
+      "git_blob": "a15e0ba5e90bcd50b04e6ef2916e6d14fd354dba",
+      "sha256": "f5093d9a974ecd6e570af4bedab1adeaca65a84752e5389c5f7b242c91e06b50",
+      "bytes": 28437
+    },
+    {
+      "path": "Parser0.mly",
+      "git_blob": "af11d201b3ac2b1d1d4569a9ac00fc4768062cc9",
+      "sha256": "e3324dd279f3ef769f9cc062225e64b1e52ee799e57ec1db6a1c5d200f35f3bf",
+      "bytes": 23720
+    },
+    {
+      "path": "ParserConfig.mli",
+      "git_blob": "84fdfc737d3abb7d370380da7f24a8b971549196",
+      "sha256": "36550b891695925b423b6e47f473151ef11efe23d9fed70cb968cb0e69d6b2b1",
+      "bytes": 1624
+    },
+    {
+      "path": "Serialize.ml",
+      "git_blob": "6598b11f153bcbca14a9e3c0ab12718263d8a0d1",
+      "sha256": "294a15ace8ff9f5f5b27131dc187ba5894078ea8dc985888d69260a9f85af6f2",
+      "bytes": 14729
+    },
+    {
+      "path": "Serialize.mli",
+      "git_blob": "11d89af187813300c1421292b860846c1965fd65",
+      "sha256": "e5b57837f9fae3110cd7de074eac5d856584fe61c9128b1ca85a647f931152f5",
+      "bytes": 2118
+    },
+    {
+      "path": "SideEffect.ml",
+      "git_blob": "db0730ae5c688c49f66ef3b0d3a818560e2340f4",
+      "sha256": "5a103a3cd644439b4f5a415546972fa34674ac9e6cfaf0257a31313c84974c06",
+      "bytes": 24111
+    },
+    {
+      "path": "SideEffect.mli",
+      "git_blob": "95371b3ca9e92d7688480634483569c61f4435f7",
+      "sha256": "56397acd39eb9e6c9772eaf574e9e1fcb198947aa445efb7a52c17666ff4098f",
+      "bytes": 3778
+    },
+    {
+      "path": "SimpleLexer0.mll",
+      "git_blob": "8325d44064a6c5367c73fbf44f8017e0f12bd742",
+      "sha256": "cfb0687380fbbc63cb4cf2f6b7631ca746a6cc926734e09bc66bba241738c193",
+      "bytes": 10050
+    },
+    {
+      "path": "StaticEnv.ml",
+      "git_blob": "264c242e44a69d8b2050c331e4943427a0d332e3",
+      "sha256": "630be15afebb5ec47abe223b210bc2fe9a8cfe58ff7b5072f4b4df83eb342f79",
+      "bytes": 8854
+    },
+    {
+      "path": "StaticEnv.mli",
+      "git_blob": "36c80047acac681b0b07cfc9363b68844613c7ad",
+      "sha256": "1ca8155748a074578e50ad5948875aa0490551c731d7720ba535cd517c2009d7",
+      "bytes": 5488
+    },
+    {
+      "path": "StaticInterpreter.ml",
+      "git_blob": "496b4fa402afca74125be53f236add05e5558c3a",
+      "sha256": "66b886a0c6d9cd8c3f431f4478ae1921c6befd2f1307f6512ecdb77aa8b06a9c",
+      "bytes": 3018
+    },
+    {
+      "path": "StaticInterpreter.mli",
+      "git_blob": "7338de49e02f550daed61ca14033e74880bef3d9",
+      "sha256": "ac6c9c746cf264413548eb6927ee5b256a287cd34331082ecb473a36ea0fb9b4",
+      "bytes": 2223
+    },
+    {
+      "path": "StaticModel.ml",
+      "git_blob": "7866ed89ab0ff7e5bfe92e5cc3674be3aab75bf4",
+      "sha256": "ac125a75ab607d2acaf63f06a6044f27a61a8c5e9d601d344b1bbbe21132019b",
+      "bytes": 8662
+    },
+    {
+      "path": "StaticModel.mli",
+      "git_blob": "8b86b1d274b40a47b8641ca3c409ff9297f5d5e6",
+      "sha256": "b2971b40cc1a07c7b63d72dcd73966db7b2f5aa8c4c1269991fe792bc8ec449a",
+      "bytes": 335
+    },
+    {
+      "path": "StaticOperations.ml",
+      "git_blob": "f0db79d077741a37ffd4cbe9491b332cb6def2d2",
+      "sha256": "2303a1a15e0ccef6b311a324f639e6be23b98dfbb5c5a3552294d48c7b4421be",
+      "bytes": 16700
+    },
+    {
+      "path": "StaticOperations.mli",
+      "git_blob": "11ef2903f10e3f4f21ba21b69923e927488cb6a9",
+      "sha256": "9ea4785ca176b9d6e6c3b1756d4e97471aa102c2b60be30aa53729c5c7881ac6",
+      "bytes": 812
+    },
+    {
+      "path": "Tokens.mly",
+      "git_blob": "c0906733e2bf537470b1037a06d357a9b1305f38",
+      "sha256": "157530095cfbb7ac7aa4cf02636849789ede0bed54bdd4c4043d95468d29a0d1",
+      "bytes": 5721
+    },
+    {
+      "path": "TopoSort.ml",
+      "git_blob": "4bc38569460a330ea3e5b78d01b40cc5869bb8b0",
+      "sha256": "365b22405ff92bc2f2a0b69067ef5f655bf2b5381ad25bf2c730f204b4c5058f",
+      "bytes": 6905
+    },
+    {
+      "path": "TopoSort.mli",
+      "git_blob": "ead8151124bacceb6f201226b62367a0cb86d9d0",
+      "sha256": "22a0a7d70e2dfe3f3de9ce35b20c3a2195f2a67fe1014d96ab28318790f67784",
+      "bytes": 2739
+    },
+    {
+      "path": "Typing.ml",
+      "git_blob": "4ad3e67e0e7cb91cad6540a3414c0a069628d494",
+      "sha256": "00ab0d73c595788e458596af26a6393a5a3a4e4ca901e38a57308bcaf3d7c846",
+      "bytes": 177381
+    },
+    {
+      "path": "Typing.mli",
+      "git_blob": "6f5e16ec0b29ea246b228e41e5637ea266ea0c73",
+      "sha256": "54889ad48d75af6eb5205ebd2d1f0ef1971c456aec216004a7c58a4b208a8cb3",
+      "bytes": 3007
+    },
+    {
+      "path": "aslref.ml",
+      "git_blob": "b821ec185b9784893cbb0d229efb3477d0739e47",
+      "sha256": "44051f386c0b72a4c500f4256d141d5eca958b661a4f82c4069c6255e7316b6d",
+      "bytes": 13602
+    },
+    {
+      "path": "backend.mli",
+      "git_blob": "6b53e2a6cfcb15220e43ea71d6f72a34bbb1642f",
+      "sha256": "0508d3fb99fdc074e58cb31123a320a2ca3416c879f011644b4c4f4088a7ffe4",
+      "bytes": 7741
+    },
+    {
+      "path": "bitvector.ml",
+      "git_blob": "0f5668a1f0eff07ba7b23faae40594e18c0e3bdb",
+      "sha256": "7a940790fa3235586b7890e09c06a36b5db61616fcfce95a7f71b096ad3b095e",
+      "bytes": 22924
+    },
+    {
+      "path": "bitvector.mli",
+      "git_blob": "6d2b7ec108b95e9006c86db629ae337f55570983",
+      "sha256": "88140faf97e633713fc3ed7cd97567fd6fa022a3c6e0c0177e45309377221c63",
+      "bytes": 8465
+    },
+    {
+      "path": "builder.ml",
+      "git_blob": "e24b6587771134ac7168df86f89f252227740cfb",
+      "sha256": "9f74b028bc72c6826287a8d1b74a8a08b22ae8e3f99c6dd6cd452b6ed260917d",
+      "bytes": 7305
+    },
+    {
+      "path": "builder.mli",
+      "git_blob": "df31d7031b8fffe249d4566ea7dfb6480821ce08",
+      "sha256": "fcadecd01d2585aa63161331430c0c73a2c4d9b98679d3e5c40844affac7bff0",
+      "bytes": 2793
+    },
+    {
+      "path": "desugar.ml",
+      "git_blob": "e83c60a023f20542fd592ae100e1bbbef5e1078e",
+      "sha256": "982af1f1205df4e66f16ad9250790cc8dd829b3911ade3abddf2f77b6486417a",
+      "bytes": 8863
+    },
+    {
+      "path": "desugar.mli",
+      "git_blob": "3b6a663c2bf4077f28303d9b7fcdbc2a0fdfe424",
+      "sha256": "5bdd07121a0eae682d6d01871644aa7188ef237649e1dfa330bdb96570d44812",
+      "bytes": 6334
+    },
+    {
+      "path": "diet.ml",
+      "git_blob": "f46dc8c8683e36d5d59fa50e2ecd2cb1e2e32733",
+      "sha256": "3184ddc738a08f93160779f00de25275d20d7d7d5ccedccb5724dca83608f553",
+      "bytes": 15963
+    },
+    {
+      "path": "diet.mli",
+      "git_blob": "ec239f81020591d4e4be09c9b1d0566ecd01a64b",
+      "sha256": "577d7fc15977ddd467b299961ed38bedf3784d9addfcc582f972f9b0216a50e1",
+      "bytes": 5476
+    },
+    {
+      "path": "dune",
+      "git_blob": "8a18c1dc6a48dd6aebd9345ab82fddf6f9dde18e",
+      "sha256": "e8f6844773de29ddb6265442789360449345bd8a3afdf2c0bb603c129187ad99",
+      "bytes": 1681
+    },
+    {
+      "path": "dune-project",
+      "git_blob": "2ddf23a8862527797d1d4019ae48fb8cd0503853",
+      "sha256": "02ba96f6cb2e54896c28abb469e7c318efed7326f387fe27c67867a7b456cdf2",
+      "bytes": 1170
+    },
+    {
+      "path": "env.ml",
+      "git_blob": "c379f1e74c65d608ffb8db00dfb4a90c14293808",
+      "sha256": "4201b791b88d209bcc8129c8f3a0d92c19637aa51a84174018b79c40e4dfef56",
+      "bytes": 9294
+    },
+    {
+      "path": "env.mli",
+      "git_blob": "3f1f4ddc1ddbcc374d3b0c542655d58843dd073a",
+      "sha256": "6bda8216a2f5385784b6588b7d25f024d2a6b356e047a95e1372bb3e1d479a9d",
+      "bytes": 7401
+    },
+    {
+      "path": "error.ml",
+      "git_blob": "fde1d53ca73d2f331fb57338ff10d226c07cbb19",
+      "sha256": "f52c8018422f5f48c333a2f2d86420c92a0bf45ab364a06891ea2d9f152e1fcf",
+      "bytes": 29500
+    },
+    {
+      "path": "gparser0.ml",
+      "git_blob": "7d0986a4fafb0770bfe1863a70ffe35031f7b1be",
+      "sha256": "57b92099f208ab87696b7d2ec5aa97f6e8db5b1e65740ac9cf8f0ad7977a8efc",
+      "bytes": 8163
+    },
+    {
+      "path": "instrumentation.ml",
+      "git_blob": "47a22344df0a01c927020af23b1211477ee8baf4",
+      "sha256": "dcbb35a1201ac6029c6d69c81f142de52de63461d6bcfdfe9e2f54390959322b",
+      "bytes": 25320
+    },
+    {
+      "path": "lexer0.ml",
+      "git_blob": "5810af09dfe09f3973f941673d42d4a12dbd5e4e",
+      "sha256": "8420c725e6eee697c4c56adb8f48498784aa7998148974c45584861213cbc95d",
+      "bytes": 3563
+    },
+    {
+      "path": "libdir/stdlib.asl",
+      "sha256": "336504afec5e336039a377d7d9899cef113a29a11243cff9a460730b6ceebfa8",
+      "bytes": 20438,
+      "git_blob": "8ffa1792a6e1bae0049e1462ad1ea8599cdff100"
+    },
+    {
+      "path": "libdir/stdlib0.asl",
+      "sha256": "15bccc5b92fa217793588d550d100ebb5c5d510d2842cb7bf57bca78b6636646",
+      "bytes": 599,
+      "git_blob": "7483a37433e3c1ff8b490adcc0e2d6838031feee"
+    },
+    {
+      "path": "lispobj.ml",
+      "git_blob": "364c50ff916d5e1f6987f468da24a35c37f6df8f",
+      "sha256": "1993f3beb639012d166c5bb6a22426162c5221ea76713377c70bc798d19e214d",
+      "bytes": 6501
+    },
+    {
+      "path": "parser_errors.messages",
+      "git_blob": "f6d8f86d33446dbc8c83aa0d79615fbfc9428766",
+      "sha256": "520d34918c3c47810d3ed2cd70a2710d8ed38b36f0f7d526865abf2456aaf05d",
+      "bytes": 21823
+    },
+    {
+      "path": "primitives_to_ml.ml",
+      "git_blob": "f64aafd2be2c9bc32d52caebe19fe303838f572f",
+      "sha256": "e4d5f504cebbaad1fc71a03bff32a18528a19a872db3bea0e9c024b7954dade1",
+      "bytes": 4869
+    },
+    {
+      "path": "repeatableLexer.ml",
+      "git_blob": "ebef996f5482ef03fb2468519905f96e0cf39e8a",
+      "sha256": "e8f6c98fe277f818001209eb247cd0075dedc9cdf6f4df66d5510b1e18d93f00",
+      "bytes": 2778
+    },
+    {
+      "path": "splitasl.mli",
+      "git_blob": "b9c7717b23ce058bf80e03a0bc9384b9530bfef2",
+      "sha256": "8b469af18caca61a81bf119b10bc03bda0903765ae597460eddff7f13a86f8b3",
+      "bytes": 1680
+    },
+    {
+      "path": "splitasl.mll",
+      "git_blob": "09a16365445082f38ff867e3655c1624b5d659d5",
+      "sha256": "7b302668394392c1c2a4b163fdb8d0eff123ffddd552aa3c48f15f508519d765",
+      "bytes": 2443
+    },
+    {
+      "path": "toLisp.ml",
+      "git_blob": "60c010242b6ef28a6a9ab2257e919c4539b142b1",
+      "sha256": "f2c52e1552d1f24a6a9d51bb5a817d6127fdcbbc2fb5333dbffda185a9257fad",
+      "bytes": 18966
+    },
+    {
+      "path": "types.ml",
+      "git_blob": "40cacd0397ff3f3ff92d711d081bfb886369f88e",
+      "sha256": "6190db8d4effc50dfca3f73dd0f22fd4f81b2a09ddc45151cbe28938ee732344",
+      "bytes": 27096
+    },
+    {
+      "path": "types.mli",
+      "git_blob": "75398b29d75c46560869a248541c50b8b55468c8",
+      "sha256": "936fe8060b3e938ba98728319c644ee767273fb2e5d3df3fc24dca7b088d84ff",
+      "bytes": 3841
+    }
+  ]
+}

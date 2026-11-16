@@ -14,7 +14,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 echo "== 1. Unit tests (includes the previously-rotted trust_verify tests module)"
-"$TARGO" --unverified test --manifest-path crates/Cargo.toml -p trust-types -p trust-report
+"$TARGO" --unverified test --manifest-path Cargo.toml -p trust-types -p trust-report
 "$TARGO" --unverified test --manifest-path targo-trust/Cargo.toml
 python3 x.py test --stage 2 compiler/rustc_mir_transform
 
@@ -49,7 +49,7 @@ EOF
 ! "$TRUSTC" "$TMP/bad.rs" -o "$TMP/bad" 2>/dev/null
 
 echo "== 7. targo strict aborts; allow-l0-gaps conditionally passes with a repeatable ledger"
-cargo new --lib "$TMP/asyncrate" >/dev/null
+"$TARGO" new --lib "$TMP/asyncrate" >/dev/null   # Trust toolchain, never stock cargo
 printf 'pub async fn tick(x: u32) -> u32 { x }\n' > "$TMP/asyncrate/src/lib.rs"
 (
   cd "$TMP/asyncrate"

@@ -2,6 +2,7 @@ use rustc_middle::mir::visit::MutVisitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 pub(super) struct Subtyper;
@@ -33,6 +34,9 @@ impl<'a, 'tcx> MutVisitor<'tcx> for SubTypeChecker<'a, 'tcx> {
         }
         let mut place_ty = place.ty(self.local_decls, self.tcx).ty;
         let mut rval_ty = rvalue.ty(self.local_decls, self.tcx);
+        if place_ty == rval_ty {
+            return;
+        }
         // Not erasing this causes `Free Regions` errors in validator,
         // when rval is `ReStatic`.
         rval_ty = self.tcx.erase_and_anonymize_regions(rval_ty);
@@ -46,6 +50,8 @@ impl<'a, 'tcx> MutVisitor<'tcx> for SubTypeChecker<'a, 'tcx> {
             *rvalue = Rvalue::Cast(CastKind::Subtype, Operand::Move(new_place), place_ty);
         }
     }
+
+    fn visit_terminator(&mut self, _: &mut Terminator<'tcx>, _: Location) {}
 }
 
 // Aim here is to do this kind of transformation:
@@ -56,7 +62,7 @@ impl<'a, 'tcx> MutVisitor<'tcx> for SubTypeChecker<'a, 'tcx> {
 // let place: place_ty = temp as place_ty;
 impl<'tcx> crate::MirPass<'tcx> for Subtyper {
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        let patch = MirPatch::new(body);
+        let patch = MirPatch::new_without_block_cache(body);
         let mut checker = SubTypeChecker { tcx, patcher: patch, local_decls: &body.local_decls };
 
         for (bb, data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated_mut() {
@@ -65,7 +71,8 @@ impl<'tcx> crate::MirPass<'tcx> for Subtyper {
         checker.patcher.apply(body);
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Later MIR phases expect all subtyping to be explicit.
+        PassPolicy::Required
     }
 }

@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-SA2): the CONSTRUCTION twin of wave-SA. A repeat whose array
 //! type is the pre-monomorphization sort — `[a; N]`, `[0; N]`,
 //! `[T::default(); N]` — lowers to the sort's only inhabitant (the empty

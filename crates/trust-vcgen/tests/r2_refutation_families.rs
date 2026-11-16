@@ -40,6 +40,63 @@ fn is_overflow(k: &VcKind) -> bool {
     matches!(k, VcKind::ArithmeticOverflow { .. })
 }
 
+/// The `UnmodeledCalleeReturn` rows: obligations `generate/havoc_decline.rs`
+/// declined to Unknown because their verdict is a value only an unmodelled
+/// callee (here, std `Iterator::next`) decides.
+fn declined_rows(func: &VerifiableFunction) -> Vec<(String, String)> {
+    generate_vcs(func)
+        .into_iter()
+        .filter_map(|vc| match vc.kind {
+            VcKind::UnsupportedMir { kind, detail } if kind == "UnmodeledCalleeReturn" => {
+                Some((detail, format!("{:?}", vc.formula)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A MUTANT's slice obligation must survive in one of its two fail-closed
+/// shapes, and neither may carry a yield contract fact.
+///
+/// Until 4b2f78a544 (2026-09-21) the slice-method panic lane pushed its bounds
+/// row with `obligation: None`, which kept it out of `havoc_decline`'s reach
+/// (that pass folds definitions into the RECORDED violation, condition 2). Once
+/// the row was recorded, a mutant whose endpoint is a bare `CharIndices` yield
+/// with no fold — exactly what these twins are — meets all four decline
+/// conditions: its only value source is the `Some` payload of an unmodelled
+/// std `Iterator::next` (round A5), nothing pins it, and moving it flips the
+/// obligation. So the row is now an Unknown, not a refutation. Both shapes are
+/// fail-closed; what these tests exist for is that the fold never fires on the
+/// wrong string or a re-seated iterator. That is still checked on every bounds
+/// row, and a folded row would keep its bounds kind, because the yield facts pin
+/// the endpoint and the decline does not fire (condition 3).
+/// Measured A/B: with the lane's record dropped again, both twins emit a bounds
+/// row that has no yield fact and no declined row.
+fn assert_mutant_slice_obligation_fails_closed(name: &str, forbidden: &[&str]) {
+    let func = load(name);
+    let bounds = vcs_of_kind(&func, is_bounds);
+    let declined = declined_rows(&func);
+    assert!(
+        !bounds.is_empty() || !declined.is_empty(),
+        "{name}: the mutant slice obligation vanished: no bounds VC and no \
+         UnmodeledCalleeReturn row"
+    );
+    for f in &bounds {
+        for fact in forbidden {
+            assert!(
+                !f.contains(fact),
+                "{name}: a mutant endpoint received the yield fact {fact}: {f}"
+            );
+        }
+    }
+    for (detail, formula) in &declined {
+        assert_eq!(
+            formula, "Bool(true)",
+            "{name}: a declined row must keep the fail-closed formula ({detail})"
+        );
+    }
+}
+
 // ---------------------------------------------------------------- family 1
 
 /// The debug spelling of the VC-local yield fact `i <= s.len() - 1`.
@@ -108,40 +165,55 @@ fn charindices_derived_index_keeps_refutable_violation() {
 #[test]
 fn charindices_cross_string_keeps_refutable_violation() {
     // MUTANT: yield of `s` used to slice `t` — root identity fails, no fold.
-    let func = load("charindices_cross_string_mir");
-    let bounds = vcs_of_kind(&func, is_bounds);
-    assert!(!bounds.is_empty(), "the cross-string slice must carry a bounds VC");
-    for f in &bounds {
-        assert!(
-            !f.contains(YIELD_UPPER_FACT) && !f.contains("Sub(Var(\"t__slice_len\", Int), Int(1))"),
-            "a yield of a DIFFERENT string must never receive the yield contract facts: {f}"
-        );
-    }
+    // The row is refutable or declined to Unknown, never proved (see
+    // `assert_mutant_slice_obligation_fails_closed`).
+    assert_mutant_slice_obligation_fails_closed(
+        "charindices_cross_string_mir",
+        &[YIELD_UPPER_FACT, "Sub(Var(\"t__slice_len\", Int), Int(1))"],
+    );
 }
 
 #[test]
 fn charindices_marked_mutant_twins_fail_closed() {
     // MUTANT twins dumped from the CURRENT (marked-callee) extractor: `&s[i+1..]`
     // (derived index) and `&t[i..]` (cross string). Under the str char-boundary
-    // marker the non-boundary-safe endpoint takes the `Bool(true)` fail-close —
-    // the violation stays ALWAYS-SAT on the reachable path (refuted), and no
-    // yield contract fact may attach.
+    // marker the non-boundary-safe endpoint is REFUSED, and no yield contract fact
+    // may attach.
+    //
+    // Trust (2026-10-02, class 10 — false refutation): the refusal is the declined
+    // `UnsupportedMir { kind: "str-range-char-boundary-unmodeled" }` row (Unknown,
+    // the row `str::split_at` gives the same unmodeled boundary), no longer the
+    // always-violated `Bool(true)` as a refutable `SliceBoundsCheck`, which FAILED on
+    // an arbitrary model whether or not the offset was a boundary. Either way the
+    // obligation is never proved, and no byte-bounds row may stand for it.
     for name in ["charindices_plus_one_marked_mir", "charindices_cross_string_marked_mir"] {
         let func = load(name);
-        let bounds = vcs_of_kind(&func, is_bounds);
-        assert!(!bounds.is_empty(), "{name}: the marked mutant slice must carry a bounds VC");
-        for f in &bounds {
+        let declined: Vec<String> = generate_vcs(&func)
+            .into_iter()
+            .filter_map(|vc| match &vc.kind {
+                VcKind::UnsupportedMir { kind, .. }
+                    if kind == "str-range-char-boundary-unmodeled" =>
+                {
+                    Some(format!("{:?}", vc.formula))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !declined.is_empty(),
+            "{name}: the non-boundary-safe marked-str endpoint must be refused (declined row)"
+        );
+        for f in vcs_of_kind(&func, is_bounds).iter().chain(&declined) {
             assert!(
                 !f.contains(YIELD_UPPER_FACT)
                     && !f.contains("Sub(Var(\"t__slice_len\", Int), Int(1))"),
                 "{name}: a mutant endpoint must never receive the yield contract facts: {f}"
             );
-            assert!(
-                f.contains("Bool(true)"),
-                "{name}: a non-boundary-safe marked-str endpoint must keep the \
-                 char-boundary fail-close: {f}"
-            );
         }
+        assert!(
+            vcs_of_kind(&func, |k| matches!(k, VcKind::SliceBoundsCheck)).is_empty(),
+            "{name}: the str slice must not be stated as a byte-bounds row"
+        );
     }
 }
 
@@ -149,15 +221,8 @@ fn charindices_marked_mutant_twins_fail_closed() {
 fn charindices_swapped_iterator_keeps_refutable_violation() {
     // MUTANT: `mem::swap(&mut ci, &mut cj)` re-seats the iterator onto another
     // string — the conduit discipline (`&mut` feeds only `next`) must decline.
-    let func = load("charindices_swapped_mir");
-    let bounds = vcs_of_kind(&func, is_bounds);
-    assert!(!bounds.is_empty(), "the swapped-iterator slice must carry a bounds VC");
-    for f in &bounds {
-        assert!(
-            !f.contains(YIELD_UPPER_FACT),
-            "a swap-reachable iterator must never receive the yield contract facts: {f}"
-        );
-    }
+    // The row is refutable or declined to Unknown, never proved.
+    assert_mutant_slice_obligation_fails_closed("charindices_swapped_mir", &[YIELD_UPPER_FACT]);
 }
 
 // ---------------------------------------------------------------- family 2

@@ -17,18 +17,19 @@ pub use self::IoError::*;
 impl IoError {
     pub(crate) fn into_ntstatus(self) -> i32 {
         let raw = match self {
-            HostError(e) => match e.kind() {
-                // STATUS_MEDIA_WRITE_PROTECTED
-                ErrorKind::ReadOnlyFilesystem => 0xC00000A2u32,
-                // STATUS_FILE_INVALID
-                ErrorKind::InvalidInput => 0xC0000098,
-                // STATUS_DISK_FULL
-                ErrorKind::QuotaExceeded => 0xC000007F,
-                // STATUS_ACCESS_DENIED
-                ErrorKind::PermissionDenied => 0xC0000022,
-                // For the default error code we arbitrarily pick 0xC0000185, STATUS_IO_DEVICE_ERROR.
-                _ => 0xC0000185,
-            },
+            HostError(e) =>
+                match e.kind() {
+                    // STATUS_MEDIA_WRITE_PROTECTED
+                    ErrorKind::ReadOnlyFilesystem => 0xC00000A2u32,
+                    // STATUS_FILE_INVALID
+                    ErrorKind::InvalidInput => 0xC0000098,
+                    // STATUS_DISK_FULL
+                    ErrorKind::QuotaExceeded => 0xC000007F,
+                    // STATUS_ACCESS_DENIED
+                    ErrorKind::PermissionDenied => 0xC0000022,
+                    // For the default error code we arbitrarily pick 0xC0000185, STATUS_IO_DEVICE_ERROR.
+                    _ => 0xC0000185,
+                },
             // For the default error code we arbitrarily pick 0xC0000185, STATUS_IO_DEVICE_ERROR.
             _ => 0xC0000185,
         };
@@ -78,7 +79,6 @@ const UNIX_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
         ("ENOENT", NotFound),
         ("ENOMEM", OutOfMemory),
         ("ENOSPC", StorageFull),
-        ("ENOSYS", Unsupported),
         ("EMLINK", TooManyLinks),
         ("ENAMETOOLONG", InvalidFilename),
         ("ENETDOWN", NetworkDown),
@@ -94,12 +94,18 @@ const UNIX_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
         ("ETXTBSY", ExecutableFileBusy),
         ("EXDEV", CrossesDevices),
         ("EINPROGRESS", InProgress),
+        ("EIO", InputOutputError),
         // The following have two valid options. We have both for the forwards mapping; only the
         // first one will be used for the backwards mapping.
         ("EPERM", PermissionDenied),
         ("EACCES", PermissionDenied),
         ("EWOULDBLOCK", WouldBlock),
         ("EAGAIN", WouldBlock),
+        ("ENOSYS", Unsupported),
+        ("EOPNOTSUPP", Unsupported),
+        ("ENOTSUP", Unsupported),
+        ("EMFILE", TooManyOpenFiles),
+        ("ENFILE", TooManyOpenFiles),
     ]
 };
 // On Unix hosts are can avoid round-tripping via `ErrorKind`, which can preserve more
@@ -196,8 +202,8 @@ const WINDOWS_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
     &[
         ("WSAEADDRINUSE", AddrInUse),
         ("WSAEADDRNOTAVAIL", AddrNotAvailable),
-        ("ERROR_ALREADY_EXISTS", AlreadyExists),
         ("ERROR_FILE_EXISTS", AlreadyExists),
+        ("ERROR_ALREADY_EXISTS", AlreadyExists),
         ("ERROR_NO_DATA", BrokenPipe),
         ("WSAECONNABORTED", ConnectionAborted),
         ("WSAECONNREFUSED", ConnectionRefused),
@@ -255,6 +261,8 @@ const WINDOWS_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
         ("ERROR_TOO_MANY_LINKS", TooManyLinks),
         ("ERROR_CALL_NOT_IMPLEMENTED", Unsupported),
         ("WSAEWOULDBLOCK", WouldBlock),
+        ("ERROR_TOO_MANY_OPEN_FILES", TooManyOpenFiles),
+        ("ERROR_IO_DEVICE", InputOutputError),
     ]
 };
 
@@ -276,15 +284,20 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
     }
 
-    /// Sets the last error variable.
-    fn set_last_error(&mut self, err: impl Into<IoError>) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-        let errno = match err.into() {
-            HostError(err) => this.io_error_to_errnum(err)?,
+    fn io_error_to_errnum(&self, err: impl Into<IoError>) -> InterpResult<'tcx, Scalar> {
+        let this = self.eval_context_ref();
+        interp_ok(match err.into() {
+            HostError(err) => this.host_error_to_errnum(err)?,
             LibcError(name) => this.eval_libc(name),
             WindowsError(name) => this.eval_windows("c", name),
             Raw(val) => val,
-        };
+        })
+    }
+
+    /// Sets the last error variable.
+    fn set_last_error(&mut self, err: impl Into<IoError>) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let errno = this.io_error_to_errnum(err)?;
         let errno_place = this.last_error_place()?;
         this.write_scalar(errno, &errno_place)
     }
@@ -330,11 +343,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     /// This function converts host errors to target errors. It tries to produce the most similar OS
     /// error from the `std::io::ErrorKind` as a platform-specific errnum.
-    fn io_error_to_errnum(&self, err: std::io::Error) -> InterpResult<'tcx, Scalar> {
+    fn host_error_to_errnum(&self, err: std::io::Error) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_ref();
         let target = &this.tcx.sess.target;
 
         if target.families.iter().any(|f| f == "unix") {
+            // If the host is also Unix, we can use the raw OS error and avoid a potentially lossy
+            // trip through `ErrorKind`.
+            #[cfg(unix)]
+            if let Some(host_errno) = err.raw_os_error() {
+                for &(name, errno) in UNIX_ERRNO_TABLE {
+                    if host_errno == errno {
+                        return interp_ok(this.eval_libc(name));
+                    }
+                }
+            }
+            // For other hosts or other constants, we fall back to translating via `ErrorKind`.
             for &(name, kind) in UNIX_IO_ERROR_TABLE {
                 if err.kind() == kind {
                     return interp_ok(this.eval_libc(name));
@@ -357,6 +381,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     }
 
     /// The inverse of `io_error_to_errnum`: it converts target errors to host errors.
+    /// This is used to render such errors as user-visible strings.
     /// This is done in a best-effort way.
     #[expect(clippy::needless_return)]
     fn try_errnum_to_io_error(

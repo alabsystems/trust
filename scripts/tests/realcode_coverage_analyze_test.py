@@ -13,7 +13,7 @@ from pathlib import Path
 
 ANALYZER = (
     Path(__file__).resolve().parents[2]
-    / "reports/2026-06-29-honest-real-code-coverage/analyze.py"
+    / "scripts/realcode-coverage/analyze.py"
 )
 
 

@@ -65,10 +65,12 @@
 # 0 and there is no reason for it ever to be anything else: a violation is a
 # word the model accepts and the CPU refuses, i.e. a potential false Proven.
 #
-# REQUIREMENTS: aarch64 macOS host; clang (Command Line Tools); cargo +beta.
+# REQUIREMENTS: aarch64 macOS host; clang (Command Line Tools); the Trust toolchain's
+# `targo` (see ../targo.sh).
 # ============================================================================
 set -e
 cd "$(dirname "$0")"
+. ../targo.sh
 HERE=$(pwd)
 
 CLANG=${CLANG:-/Library/Developer/CommandLineTools/usr/bin/clang}
@@ -90,7 +92,7 @@ echo "== building the native executor =="
 
 echo "== building the sweep driver =="
 CFG_RELEASE="1.99.0-dev" CFG_RELEASE_CHANNEL=dev RUSTC_BOOTSTRAP=1 \
-    cargo +beta build --release --quiet
+    "$TARGO" --unverified build --release --quiet
 
 mkdir -p /tmp/natinv
 # STALE RESULTS ARE WORSE THAN NO RESULTS — see the same note in

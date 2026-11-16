@@ -1,0 +1,110 @@
+{
+  "authority": "observational-only; dump-only skipped obligations earn no proof credit",
+  "source": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+  "source_sha256": "9384be0cd1de6d2a426b103ac8650c184dfd70c9615eff748ba04cb509c59a60",
+  "compiler": "<home>/trust-adt-boolean-contracts/build/aarch64-apple-darwin/stage1/bin/trustc",
+  "compiler_sha256": "07895eb5ca1e86e830c29858fce7576558d9d6fae361a52590c8b07e170595cc",
+  "argv": [
+    "<home>/trust-adt-boolean-contracts/build/aarch64-apple-darwin/stage1/bin/trustc",
+    "-Copt-level=3",
+    "--edition",
+    "2024",
+    "--crate-name",
+    "trust_ir_laws",
+    "--crate-type",
+    "lib",
+    "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+    "-Ztrust-policy=advisory",
+    "-Ztrust-dump=mir-only:<home>/trust-formal-entry-correspondence/target/law-entry-diagnostic-mono/mir",
+    "--extern",
+    "trust_ir=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/trust-ir/ac3177f7bb1061bf/out/libtrust_ir-ac3177f7bb1061bf.rlib",
+    "--out-dir",
+    "<home>/trust-formal-entry-correspondence/target/law-entry-diagnostic-mono",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/block-buffer/9ea68d097361395e/out",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/cfg-if/bd922f8682400135/out",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/cpufeatures/f09526a291d792e0/out",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/crypto-common/823cc90176c1a991/out",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/digest/3d8b16bf4ed2084c/out",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/generic-array/c1e5a6e08e68e357/out",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/libc/01bbd72b3efbb669/out",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/sha2/09530a7ba16d8d81/out",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/trust-ir/ac3177f7bb1061bf/out",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/typenum/8bafff0adefe8786/out",
+    "-L",
+    "dependency=<home>/trust-formal-entry-correspondence/target/law-entry-dump/release/build/version_check/2b3e01bce6042713/out"
+  ],
+  "exit_code": 0,
+  "rows": [
+    {
+      "function": "trust_ir::Linkage::is_module_local",
+      "file": "is_module_local.json",
+      "sha256": "76f6006d8f148b339cb1fed0a96338aa51cb331870e85dd722a690bd426f5b32"
+    },
+    {
+      "function": "trust_ir_laws::coverage_supports",
+      "file": "coverage_supports.json",
+      "sha256": "3c4842f4077bf50b44ce9f8db90ab6916ac7de59fb335c2b0fb86acba2786e7c"
+    },
+    {
+      "function": "trust_ir_laws::evidence_admits_kind",
+      "file": "evidence_admits_kind.json",
+      "sha256": "7ce9adb058301530a0e0349e9aa81fbf44db5dc1f130e53dbbac0f8ab2e58e80"
+    },
+    {
+      "function": "trust_ir_laws::laws::ambiguous_precondition",
+      "file": "ambiguous_precondition.json",
+      "sha256": "b11239ec8e2396188eec6b0e584e5f704c8a790523a408133d25979c4edc2b9a"
+    },
+    {
+      "function": "trust_ir_laws::laws::coverage_unwind_is_magnitude_order",
+      "file": "coverage_unwind_is_magnitude_order.json",
+      "sha256": "4653b736907891a7cd71e855398ddc08888848fc1d61cf7de6d737e10d35fc7b"
+    },
+    {
+      "function": "trust_ir_laws::laws::evidence_clean_cic_unconstrained",
+      "file": "evidence_clean_cic_unconstrained.json",
+      "sha256": "3103559aa2cdd3bbc99d4cee234d7546de962b18446235d191237fb0e74095e5"
+    },
+    {
+      "function": "trust_ir_laws::laws::license_gated_admitted_under_any_policy",
+      "file": "license_gated_admitted_under_any_policy.json",
+      "sha256": "d1d8822383f4cb22c131aeec0a118f215461172b41445f6f630b275ce0066424"
+    },
+    {
+      "function": "trust_ir_laws::laws::visibility_external_never_contradicts",
+      "file": "visibility_external_never_contradicts.json",
+      "sha256": "017cd3625c27cadcb03dd922312439954019ef0d6a70e1060fff845606de336f"
+    },
+    {
+      "function": "trust_ir_laws::license_admits_body",
+      "file": "license_admits_body.json",
+      "sha256": "d565d58f6fa5ee3379777fc7af8ae2ecb39d5b7088b1a1dce9f0cd07f0dbb07e"
+    },
+    {
+      "function": "trust_ir_laws::proof_ref_kind_is_ambiguous",
+      "file": "proof_ref_kind_is_ambiguous.json",
+      "sha256": "567db1510e1441b0e33b91fa9f0deb4d38a705f77e67ec5c446fcb779793242f"
+    },
+    {
+      "function": "trust_ir_laws::visibility_contradicts_linkage",
+      "file": "visibility_contradicts_linkage.json",
+      "sha256": "3fea854fd121ab628d4c0d7fdc9516357f13653cf6f35a56d2c3a96e37b26a2c"
+    }
+  ],
+  "sdk_commit": "ffa141252dceb40e74d991218b336ce0f3516e6d",
+  "ir_source_commit": "86dded9472f08a1c10c88eaa2f9a3f439e204558",
+  "callee_dependency_source": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir/src/lib.rs",
+  "callee_dependency_source_sha256": "1b3c53a60942e123710ddb659281a09e37566309a773324a8678691f5ecc7728",
+  "notes": "Original dumps, unchanged serialized bodies. Native supported advisory/mir-only diagnostic (all dispatch skipped/Unknown), monomorphic codegen inventory enabled to retain the actual external inline method. No proof or source-clause query authority. Source/domain tests separately construct no source claims for these helper inputs.",
+  "authored_laws_source_sha256": "f11edde5c1734b37bd907eeeea81e506907e9acf7b2554da1a0e983dcfa15825"
+}

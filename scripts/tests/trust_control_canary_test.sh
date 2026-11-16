@@ -86,8 +86,18 @@ if [ -n "$UNIGNORED_FN" ] && selectable_ignored_test "$UNIGNORED_FN"; then
 fi
 
 # Argument handling: help is free and a typo must not be read as "run it".
-bash "$CANARY" --help >/dev/null 2>&1 || fail "--help exited non-zero"
-printf '%s\n' "$(bash "$CANARY" --help 2>&1)" | grep -qi 'mint-gate canary' \
+HELP_OUT="$(bash "$CANARY" --help 2>&1)"
+HELP_RC=$?
+[ "$HELP_RC" -eq 0 ] || fail "--help exited $HELP_RC"
+# NOT `grep -q`: this file runs under `set -o pipefail`, and `-q` exits at the
+# FIRST match — line 1 of a ~6 KB header — so the `printf` feeding it is still
+# writing when the pipe closes and dies of SIGPIPE (status 141), which pipefail
+# then reports as the pipeline's status. Measured 2026-09-10 on macOS bash 3.2
+# / BSD grep: PIPESTATUS=141 0 on every measured run — a timing race this
+# machine lost every time, read as a false FAIL ("--help printed no header
+# text") with the header fully present on stdout.
+# Reading to EOF (no -q) is what makes the exit status mean "matched".
+printf '%s\n' "$HELP_OUT" | grep -i 'mint-gate canary' >/dev/null \
   || fail "--help printed no header text"
 bash "$CANARY" --definitely-not-a-flag >/dev/null 2>&1
 BOGUS_RC=$?

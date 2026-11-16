@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 //@ edition: 2021
 // Divergence D2's root-fix (full-population frontier, wave-full-0831): a
 // `-> !` fn whose body FALLS THROUGH seals `Unreachable`, never `Return`.

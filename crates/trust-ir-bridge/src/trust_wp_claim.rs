@@ -188,7 +188,7 @@ pub fn trust_wp_result_defining_expr(
     let [returned] = values.as_slice() else {
         return Err(TrustWpClaimError::NoSingleReturn);
     };
-    let resolved = resolve_value(entry, *returned, entry.body.len() - 1, 0)?;
+    let resolved = resolve_value(entry, *returned, entry.body.len() - 1, 0, module.pointer_bits())?;
     if &resolved.ty != return_ty {
         return Err(TrustWpClaimError::MalformedBody(
             "returned value type does not match the function signature",
@@ -232,6 +232,7 @@ fn resolve_value(
     value: ValueId,
     use_index: usize,
     depth: u32,
+    pointer_bits: u32,
 ) -> Result<ResolvedDefiningExpr, TrustWpClaimError> {
     // A Copy chain longer than the block is a cycle; refuse rather than spin.
     if depth as usize > entry.body.len() {
@@ -260,7 +261,9 @@ fn resolve_value(
     }
     match &node.inst {
         Inst::Const { ty, value: constant } => match constant {
-            Constant::Int(raw) if ty.is_integer() && constant.value_matches_ty(ty) => {
+            Constant::Int(raw)
+                if ty.is_integer() && constant.value_matches_ty(ty, pointer_bits) =>
+            {
                 i64::try_from(*raw)
                     .map(|value| ResolvedDefiningExpr {
                         expr: DefiningExpr::IntConst(value),
@@ -279,7 +282,7 @@ fn resolve_value(
             if ty == &Ty::Error {
                 return Err(TrustWpClaimError::MalformedBody("Copy has no concrete type"));
             }
-            let resolved = resolve_value(entry, *operand, producer_index, depth + 1)?;
+            let resolved = resolve_value(entry, *operand, producer_index, depth + 1, pointer_bits)?;
             if &resolved.ty != ty {
                 return Err(TrustWpClaimError::MalformedBody(
                     "Copy type does not match its defining operand",
@@ -540,14 +543,17 @@ mod tests {
         blocks: Vec<Block>,
     ) -> Module {
         let mut module = Module::new("trust_wp_walker");
-        let function_ty = module.add_func_type(FuncTy {
-            params: signature_params,
-            returns: signature_returns,
-            is_vararg: false,
-        });
+        let function_ty = module
+            .add_func_type(FuncTy {
+                params: signature_params,
+                returns: signature_returns,
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function = Function::new(FuncId::new(0), "subject", function_ty, entry);
         function.blocks = blocks;
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module
     }
 

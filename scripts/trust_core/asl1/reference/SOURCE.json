@@ -1,0 +1,50 @@
+{
+  "schema": "trust.asl1.reference.v1",
+  "repository": "herd/herdtools7",
+  "tag": "ASLRefEAC1",
+  "commit": "ffad2692c4580538e8db7bf6631aa886edfc7423",
+  "license": "BSD-3-Clause",
+  "files": [
+    {
+      "path": "reference/aslref/AST.mli",
+      "sha256": "7406b9ac9123350df52e091013dee8dcca69d1edc7a03826797a6289c55101f2",
+      "bytes": 17552
+    },
+    {
+      "path": "reference/aslref/Interpreter.ml",
+      "sha256": "0f0b740d7f350eb5b6ae8e47cd414b64ad4271deb4b26407538c31cfbc6f78d3",
+      "bytes": 63816
+    },
+    {
+      "path": "reference/aslref/LICENSE.txt",
+      "sha256": "ee8cb9862b98438568e252ec1a380a3d0582e328d4e691c04b1b457ebbf9ccc8",
+      "bytes": 2152
+    },
+    {
+      "path": "reference/aslref/Native.ml",
+      "sha256": "43e062e1f1ace92ec5a9af65ac7afdb30c93cd81857209270d11fd616bd75e19",
+      "bytes": 18093
+    },
+    {
+      "path": "reference/aslref/Operations.ml",
+      "sha256": "44257a7f7c9f8e8d19b079f63a97a0978b538b611e3c88c4dcb6082cf91a792a",
+      "bytes": 5903
+    },
+    {
+      "path": "reference/aslref/Typing.ml",
+      "sha256": "00ab0d73c595788e458596af26a6393a5a3a4e4ca901e38a57308bcaf3d7c846",
+      "bytes": 177381
+    },
+    {
+      "path": "reference/aslref/bitvector.ml",
+      "sha256": "7a940790fa3235586b7890e09c06a36b5db61616fcfce95a7f71b096ad3b095e",
+      "bytes": 22924
+    },
+    {
+      "path": "reference/aslref/bitvector.mli",
+      "sha256": "88140faf97e633713fc3ed7cd97567fd6fa022a3c6e0c0177e45309377221c63",
+      "bytes": 8465
+    }
+  ],
+  "licensed_arm_package_ingested": false
+}

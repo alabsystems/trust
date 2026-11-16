@@ -40,8 +40,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::HashMap;
-
+use trust_types::fx::FxHashMap;
 use trust_types::{
     AggregateKind, BlockId, ConstValue, Formula, Operand, Place, Projection, Rvalue, Sort,
     SortFromTy, Statement, Terminator, Ty, VcKind, VerifiableFunction, VerificationCondition,
@@ -52,11 +51,11 @@ use trust_types::{
 #[derive(Clone, Default)]
 struct WalkState {
     /// MIR local index -> the datatype (or scalar) `Formula` term it holds.
-    store: HashMap<usize, Formula>,
+    store: FxHashMap<usize, Formula>,
     /// MIR local index -> the place whose `Discriminant` was read into it
     /// (`_t = Discriminant(P)`), so a `SwitchInt(move _t)` recovers the matched
     /// place `P`.
-    disc_of: HashMap<usize, Place>,
+    disc_of: FxHashMap<usize, Place>,
     /// The match guard accumulated along this arm (`IsCtor(..)` conjuncts).
     guard: Option<Formula>,
 }
@@ -196,7 +195,13 @@ fn walk(
     if depth > 64 {
         return;
     }
-    let Some(block) = func.body.blocks.iter().find(|b| b.id == block_id) else {
+    let Some(block) = func
+        .body
+        .blocks
+        .get(block_id.0)
+        .filter(|b| b.id == block_id)
+        .or_else(|| func.body.blocks.iter().find(|b| b.id == block_id))
+    else {
         return;
     };
 
@@ -207,7 +212,7 @@ fn walk(
     match &block.terminator {
         Terminator::Return => {
             if let Some(term) = resolve_place(func, &state, &Place::local(0)) {
-                arms.push(ReturnArm { guard: state.guard.clone(), return_term: term });
+                arms.push(ReturnArm { guard: state.guard, return_term: term });
             }
         }
         Terminator::Goto(target) => {
@@ -235,7 +240,7 @@ fn walk(
                 return;
             };
             let dt_name = match dt_ty {
-                Ty::Datatype { name, .. } => name.clone(),
+                Ty::Datatype { name, .. } => name.as_str(),
                 _ => return,
             };
             for (tag, target) in targets {
@@ -246,7 +251,7 @@ fn walk(
                     continue;
                 };
                 let is_ctor = Formula::IsCtor {
-                    datatype: dt_name.clone(),
+                    datatype: dt_name.to_string(),
                     ctor,
                     arg: Box::new(matched_term.clone()),
                 };
@@ -366,7 +371,7 @@ fn resolve_place(func: &VerifiableFunction, state: &WalkState, place: &Place) ->
         state.store.get(&place.local).cloned().or_else(|| param_var(func, place.local))?;
     // R0: resolve at every assignment of the walk accumulator so a chain through a
     // recursive child keeps typing. Shallow per step, so it terminates.
-    let mut base_ty = crate::resolved_ty(func, local_ty(func, place.local)?).into_owned();
+    let mut base_ty = crate::resolved_ty(func, local_ty(func, place.local)?);
     let mut pending_variant: Option<usize> = None;
 
     for proj in &place.projections {
@@ -375,25 +380,31 @@ fn resolve_place(func: &VerifiableFunction, state: &WalkState, place: &Place) ->
             Projection::Deref => {}
             Projection::Downcast(v) => pending_variant = Some(*v),
             Projection::Field(idx) => {
-                let Ty::Datatype { name, variants } = &base_ty else {
-                    return None;
+                let next_ty = {
+                    let Ty::Datatype { name, variants } = &*base_ty else {
+                        return None;
+                    };
+                    // Downcast(v)+Field selects variant v's field; a bare Field on a
+                    // single-variant (struct-like) datatype selects variant 0's.
+                    let v = match pending_variant.take() {
+                        Some(v) => v,
+                        None if variants.len() == 1 => 0,
+                        None => return None,
+                    };
+                    let (ctor, fields) = variants.get(v)?;
+                    let (fname, fty) = fields.get(*idx)?;
+                    term = Formula::Sel {
+                        datatype: name.clone(),
+                        // The selector the declaration gives variant v's field
+                        // (`Sort::from_ty` spells it the same way), never the bare
+                        // Rust field name, which every tuple variant shares.
+                        field: trust_types::datatype_selector_name(ctor, fname),
+                        field_sort: functional_sort_for_ty(fty),
+                        arg: Box::new(term),
+                    };
+                    crate::resolved_ty(func, fty).into_owned()
                 };
-                // Downcast(v)+Field selects variant v's field; a bare Field on a
-                // single-variant (struct-like) datatype selects variant 0's.
-                let v = match pending_variant.take() {
-                    Some(v) => v,
-                    None if variants.len() == 1 => 0,
-                    None => return None,
-                };
-                let (_ctor, fields) = variants.get(v)?;
-                let (fname, fty) = fields.get(*idx)?;
-                term = Formula::Sel {
-                    datatype: name.clone(),
-                    field: fname.clone(),
-                    field_sort: functional_sort_for_ty(fty),
-                    arg: Box::new(term),
-                };
-                base_ty = crate::resolved_ty(func, fty).into_owned();
+                base_ty = std::borrow::Cow::Owned(next_ty);
             }
             _ => return None,
         }
@@ -437,7 +448,12 @@ fn const_to_formula(cv: &ConstValue, expected: &Sort) -> Option<Formula> {
 }
 
 fn local_ty(func: &VerifiableFunction, local: usize) -> Option<&Ty> {
-    func.body.locals.iter().find(|d| d.index == local).map(|d| &d.ty)
+    func.body
+        .locals
+        .get(local)
+        .filter(|d| d.index == local)
+        .or_else(|| func.body.locals.iter().find(|d| d.index == local))
+        .map(|d| &d.ty)
 }
 
 fn ctor_name_for_variant(ty: &Ty, variant: usize) -> Option<String> {
@@ -549,6 +565,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -782,8 +799,28 @@ mod tests {
             panic!("expected Sel payload read, got {:?}", args[0]);
         };
         assert_eq!(sd, "ExprKind");
-        assert_eq!(field, "0", "Sort's single (tuple) field");
         assert_eq!(sel_arg.var_name(), Some("e"), "Sel reads the field off the matched param e");
+        // TRUST-04: the payload read names the selector `Sort` declares for its
+        // field 0 — and NO other constructor declares it. `BVar`, `Sort` and
+        // `Const` each have a Rust field `0`; a selector spelled `0` would be
+        // one symbol for three different fields (at three different sorts).
+        let e_sort = &binders[0].1;
+        assert_eq!(
+            selector_owners(e_sort, field),
+            ["Sort"],
+            "the Sel must name a selector only `Sort` declares, got `{field}` in {e_sort:?}"
+        );
+    }
+
+    /// The constructors of `sort`'s declaration that declare a selector named
+    /// `field`.
+    fn selector_owners<'a>(sort: &'a Sort, field: &str) -> Vec<&'a str> {
+        let Sort::Datatype { constructors, .. } = sort else { return Vec::new() };
+        constructors
+            .iter()
+            .filter(|(_, fields)| fields.iter().any(|(name, _)| name == field))
+            .map(|(ctor, _)| ctor.as_str())
+            .collect()
     }
 
     // ── Test 3: gate — ordinary (non-datatype) functions emit nothing ───────────

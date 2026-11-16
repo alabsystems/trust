@@ -1,5 +1,9 @@
-# The verification crates in upstream Rust build on a stock nightly (pinned
-# for reproducibility). Trust-language crates (grammar contracts) and the
-# compiler-internals family need the Trust toolchain itself — see INSTALL.md.
+# Trust-owned workspaces here (crates/, targo-trust/, tools/, examples/) build
+# with the Trust toolchain (the owner, 2026-09-28: "we need to use Trust compiler
+# for all ALab systems", docs/OWNER_RULINGS.md OW-37). `targo` chooses the
+# verified or unverified lane; this pin only steers rustup shims (x.py reads
+# bootstrap.toml's stage0, not this channel). The public snapshot ships this
+# same pin (publication policy rule 3): on Apple-silicon macOS, install aterm
+# and its atpkg installs Trust and links rustup's `trust` toolchain.
 [toolchain]
-channel = "nightly-2026-04-20"
+channel = "trust"

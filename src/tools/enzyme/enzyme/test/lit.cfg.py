@@ -5,6 +5,7 @@ import platform
 import re
 import subprocess
 
+import lit
 import lit.formats
 import lit.util
 from lit.llvm import llvm_config
@@ -18,8 +19,12 @@ config.name = 'Enzyme'
 #
 # For now we require '&&' between commands, until they get globally killed and
 # the test runner updated.
+LLVM_VERSION_MAJOR = lit.__versioninfo__[0]
 execute_external = platform.system() != 'Windows'
-config.test_format = lit.formats.ShTest(execute_external)
+if LLVM_VERSION_MAJOR >= 23:
+    config.test_format = lit.formats.ShTest(execute_external, force_execute_external=True)
+else:
+    config.test_format = lit.formats.ShTest(execute_external)
 
 # suffixes: A list of file extensions to treat as test files.
 config.suffixes = ['.mlir', '.ll', '.c', '.cpp', '.cu', '.f90']
@@ -40,6 +45,17 @@ config.environment['PATH'] = path
 path = os.path.pathsep.join((config.llvm_libs_dir,
                               config.environment.get('LD_LIBRARY_PATH','')))
 config.environment['LD_LIBRARY_PATH'] = path
+
+# libomp.so is often installed in an arch-specific subdirectory of the LLVM
+# libs dir (e.g. lib/x86_64-unknown-linux-gnu/).  Add any such subdirectory
+# that contains libomp.so to LD_LIBRARY_PATH so that OpenMP executables built
+# during tests can find the runtime library.
+import glob as _glob
+for _omp_so in _glob.glob(os.path.join(config.llvm_libs_dir, '*/libomp.so')):
+    _omp_dir = os.path.dirname(_omp_so)
+    config.environment['LD_LIBRARY_PATH'] = \
+        _omp_dir + os.pathsep + config.environment['LD_LIBRARY_PATH']
+    break
 
 #tools = ['opt', 'lli', 'clang', 'clang++']
 #llvm_config.add_tool_substitutions(tools, config.llvm_tools_dir)

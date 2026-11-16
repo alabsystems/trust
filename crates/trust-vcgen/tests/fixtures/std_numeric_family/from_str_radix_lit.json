@@ -1,0 +1,461 @@
+{
+ "name": "from_str_radix_lit",
+ "def_path": "nm::from_str_radix_lit",
+ "span": {
+  "file": "nm.rs",
+  "line_start": 30,
+  "col_start": 0,
+  "line_end": 30,
+  "col_end": 85
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Adt": {
+      "name": "core::option::Option",
+      "fields": [
+       [
+        "__tag",
+        {
+         "Int": {
+          "width": 64,
+          "signed": true
+         }
+        }
+       ],
+       [
+        "__v1_0",
+        {
+         "Int": {
+          "width": 32,
+          "signed": false
+         }
+        }
+       ]
+      ],
+      "variants": [
+       {
+        "name": "None",
+        "discriminant": 0,
+        "fields": []
+       },
+       {
+        "name": "Some",
+        "discriminant": 1,
+        "fields": [
+         [
+          "0",
+          {
+           "Int": {
+            "width": 32,
+            "signed": false
+           }
+          }
+         ]
+        ]
+       }
+      ],
+      "disc_index_safe": true,
+      "faithful_enum_repr": null,
+      "layout": null,
+      "enum_layout": null,
+      "adt_kind": "Enum"
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Ref": {
+      "mutable": false,
+      "inner": {
+       "Slice": {
+        "elem": {
+         "Int": {
+          "width": 8,
+          "signed": false
+         }
+        }
+       }
+      }
+     }
+    },
+    "name": "s"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Adt": {
+      "name": "core::result::Result",
+      "fields": [
+       [
+        "__tag",
+        {
+         "Int": {
+          "width": 64,
+          "signed": true
+         }
+        }
+       ],
+       [
+        "__v0_0",
+        {
+         "Int": {
+          "width": 32,
+          "signed": false
+         }
+        }
+       ],
+       [
+        "__v1_0",
+        {
+         "Adt": {
+          "name": "core::num::error::ParseIntError",
+          "fields": [
+           [
+            "kind",
+            {
+             "Adt": {
+              "name": "core::num::error::IntErrorKind",
+              "fields": [
+               [
+                "__tag",
+                {
+                 "Int": {
+                  "width": 64,
+                  "signed": true
+                 }
+                }
+               ]
+              ],
+              "variants": [
+               {
+                "name": "Empty",
+                "discriminant": 0,
+                "fields": []
+               },
+               {
+                "name": "InvalidDigit",
+                "discriminant": 1,
+                "fields": []
+               },
+               {
+                "name": "PosOverflow",
+                "discriminant": 2,
+                "fields": []
+               },
+               {
+                "name": "NegOverflow",
+                "discriminant": 3,
+                "fields": []
+               },
+               {
+                "name": "Zero",
+                "discriminant": 4,
+                "fields": []
+               },
+               {
+                "name": "NotAPowerOfTwo",
+                "discriminant": 5,
+                "fields": []
+               }
+              ],
+              "disc_index_safe": true,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Enum"
+             }
+            }
+           ]
+          ],
+          "variants": [],
+          "disc_index_safe": false,
+          "faithful_enum_repr": null,
+          "layout": null,
+          "enum_layout": null,
+          "adt_kind": "Struct"
+         }
+        }
+       ]
+      ],
+      "variants": [
+       {
+        "name": "Ok",
+        "discriminant": 0,
+        "fields": [
+         [
+          "0",
+          {
+           "Int": {
+            "width": 32,
+            "signed": false
+           }
+          }
+         ]
+        ]
+       },
+       {
+        "name": "Err",
+        "discriminant": 1,
+        "fields": [
+         [
+          "0",
+          {
+           "Adt": {
+            "name": "core::num::error::ParseIntError",
+            "fields": [
+             [
+              "kind",
+              {
+               "Adt": {
+                "name": "core::num::error::IntErrorKind",
+                "fields": [
+                 [
+                  "__tag",
+                  {
+                   "Int": {
+                    "width": 64,
+                    "signed": true
+                   }
+                  }
+                 ]
+                ],
+                "variants": [
+                 {
+                  "name": "Empty",
+                  "discriminant": 0,
+                  "fields": []
+                 },
+                 {
+                  "name": "InvalidDigit",
+                  "discriminant": 1,
+                  "fields": []
+                 },
+                 {
+                  "name": "PosOverflow",
+                  "discriminant": 2,
+                  "fields": []
+                 },
+                 {
+                  "name": "NegOverflow",
+                  "discriminant": 3,
+                  "fields": []
+                 },
+                 {
+                  "name": "Zero",
+                  "discriminant": 4,
+                  "fields": []
+                 },
+                 {
+                  "name": "NotAPowerOfTwo",
+                  "discriminant": 5,
+                  "fields": []
+                 }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+               }
+              }
+             ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+           }
+          }
+         ]
+        ]
+       }
+      ],
+      "disc_index_safe": true,
+      "faithful_enum_repr": null,
+      "layout": null,
+      "enum_layout": null,
+      "adt_kind": "Enum"
+     }
+    },
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "core::num::<impl u32>::from_str_radix",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       },
+       {
+        "Constant": {
+         "Uint": [
+          16,
+          32
+         ]
+        }
+       }
+      ],
+      "dest": {
+       "local": 2,
+       "projections": []
+      },
+      "target": 1,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 30,
+       "col_start": 52,
+       "line_end": 30,
+       "col_end": 78
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 16308397492346268927,
+       "def_index": 28451,
+       "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 16308397492346268927,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "core::result::Result::<u32, core::num::error::ParseIntError>::ok",
+      "args": [
+       {
+        "Move": {
+         "local": 2,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 0,
+       "projections": []
+      },
+      "target": 2,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 30,
+       "col_start": 52,
+       "line_end": 30,
+       "col_end": 83
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 16308397492346268927,
+       "def_index": 12334,
+       "substs_digest": [
+        11159592346993080563,
+        1845714972746420776
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 16308397492346268927,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 2,
+    "stmts": [],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 1,
+  "return_ty": {
+   "Adt": {
+    "name": "core::option::Option",
+    "fields": [
+     [
+      "__tag",
+      {
+       "Int": {
+        "width": 64,
+        "signed": true
+       }
+      }
+     ],
+     [
+      "__v1_0",
+      {
+       "Int": {
+        "width": 32,
+        "signed": false
+       }
+      }
+     ]
+    ],
+    "variants": [
+     {
+      "name": "None",
+      "discriminant": 0,
+      "fields": []
+     },
+     {
+      "name": "Some",
+      "discriminant": 1,
+      "fields": [
+       [
+        "0",
+        {
+         "Int": {
+          "width": 32,
+          "signed": false
+         }
+        }
+       ]
+      ]
+     }
+    ],
+    "disc_index_safe": true,
+    "faithful_enum_repr": null,
+    "layout": null,
+    "enum_layout": null,
+    "adt_kind": "Enum"
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

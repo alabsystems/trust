@@ -69,6 +69,158 @@ fn test_unsupported_mir_is_unknown_even_with_trivial_formula() {
 }
 
 #[test]
+fn test_data_race_candidate_is_unknown_for_any_placeholder_formula() {
+    let router = Router::with_backends(vec![Box::new(constant_folder::ConstantFolderBackend)]);
+
+    for formula in [Formula::Bool(true), Formula::Bool(false)] {
+        let vc = VerificationCondition {
+            kind: VcKind::UnsupportedMir {
+                kind: "DataRaceCandidate".to_string(),
+                detail:
+                    "location, runtime-thread, and happens-before identities are unauthenticated"
+                        .to_string(),
+            },
+            function: "concurrent_fn".into(),
+            location: SourceSpan::default(),
+            formula,
+            contract_metadata: None,
+            obligation: None,
+        };
+
+        assert!(router.backend_plan(&vc).is_empty());
+        assert!(matches!(
+            router.verify_one(&vc),
+            VerificationResult::Unknown { reason, .. }
+                if reason.contains("DataRaceCandidate") && reason.contains("unauthenticated")
+        ));
+        let results = router.verify_all(&[vc]);
+        assert!(matches!(results[0].1, VerificationResult::Unknown { .. }));
+    }
+}
+
+fn legacy_data_race_vc(formula: Formula) -> VerificationCondition {
+    VerificationCondition {
+        kind: VcKind::DataRace {
+            variable: "shared".to_string(),
+            thread_a: "worker".to_string(),
+            thread_b: "worker".to_string(),
+        },
+        function: "concurrent_fn".into(),
+        location: SourceSpan::default(),
+        formula,
+        contract_metadata: None,
+        obligation: None,
+    }
+}
+
+#[test]
+fn legacy_data_race_is_unknown_with_constant_folder() {
+    let router = Router::with_backends(vec![Box::new(constant_folder::ConstantFolderBackend)]);
+
+    for formula in [Formula::Bool(true), Formula::Bool(false)] {
+        let vc = legacy_data_race_vc(formula);
+        assert!(router.backend_plan(&vc).is_empty());
+        assert!(matches!(
+            router.verify_one(&vc),
+            VerificationResult::Unknown { reason, .. }
+                if reason.contains("data-race VC unsupported")
+                    && reason.contains("unauthenticated")
+        ));
+        let results = router.verify_all(&[vc.clone()]);
+        assert!(matches!(&results[0].1, VerificationResult::Unknown { .. }));
+
+        let machine = trust_temporal::StateMachine::new(trust_temporal::StateId(0));
+        let temporal = router.verify_temporal_vcs(&[(vc, machine)]);
+        assert!(matches!(
+            &temporal[0].1,
+            VerificationResult::Unknown { reason, .. }
+                if reason.contains("data-race VC unsupported")
+        ));
+    }
+}
+
+/// The two `InsufficientOrdering` shapes trust-vcgen can emit: a single-operation
+/// legality row (`check_operation_legality`, the only production producer) and a
+/// cross-thread sufficiency row (`MemoryModelChecker::generate_vcs`).
+fn insufficient_ordering_vcs(formula: Formula) -> [VerificationCondition; 2] {
+    let make = |required: &str| VerificationCondition {
+        kind: VcKind::InsufficientOrdering {
+            variable: "ready_flag".to_string(),
+            actual: "Relaxed".to_string(),
+            required: required.to_string(),
+        },
+        function: "ordering_fn".into(),
+        location: SourceSpan::default(),
+        formula: formula.clone(),
+        contract_metadata: None,
+        obligation: None,
+    };
+    [make("L1: load cannot use Release ordering (loads cannot release)"), make("Acquire")]
+}
+
+/// v6/D2: memory-ordering VCs carry no execution or memory model, so the router
+/// refuses them before dispatch exactly as it refuses `DataRace`
+/// (`backend_trait::unsupported_mir_unknown` + `Router::backend_plan`). Before
+/// this gate the constant folder minted `Proved` for a hardcoded `false`
+/// formula, and a free-boolean legality formula was sent to AY.
+#[test]
+fn insufficient_ordering_is_unknown_for_any_formula() {
+    let reach = Formula::Var("__trust_memory_ordering__reach__1".to_string(), Sort::Bool);
+    let routers = [
+        Router::with_backends(vec![Box::new(constant_folder::ConstantFolderBackend)]),
+        Router::new(),
+    ];
+    for formula in [Formula::Bool(true), Formula::Bool(false), reach] {
+        for vc in insufficient_ordering_vcs(formula) {
+            for router in &routers {
+                assert!(router.backend_plan(&vc).is_empty(), "{vc:?}");
+                let result = router.verify_one(&vc);
+                assert!(
+                    matches!(&result, VerificationResult::Unknown { reason, .. }
+                        if reason.contains("memory-ordering VC unsupported")),
+                    "{vc:?} -> {result:?}"
+                );
+                let results = router.verify_all(std::slice::from_ref(&vc));
+                assert!(matches!(&results[0].1, VerificationResult::Unknown { .. }));
+
+                let machine = trust_temporal::StateMachine::new(trust_temporal::StateId(0));
+                let temporal = router.verify_temporal_vcs(&[(vc.clone(), machine)]);
+                assert!(matches!(
+                    &temporal[0].1,
+                    VerificationResult::Unknown { reason, .. }
+                        if reason.contains("memory-ordering VC unsupported")
+                ));
+            }
+            // Each backend refuses on its own too, so a direct backend caller
+            // cannot bypass the router gate.
+            assert!(matches!(
+                constant_folder::ConstantFolderBackend.verify(&vc),
+                VerificationResult::Unknown { reason, .. }
+                    if reason.contains("memory-ordering VC unsupported")
+            ));
+        }
+    }
+}
+
+/// POSITIVE CONTROL for the gate above: the same `false` formula under an L0
+/// kind still proves, so the refusal discriminates on the kind, not on a broken
+/// router.
+#[test]
+fn insufficient_ordering_gate_discriminates_on_kind() {
+    let router = Router::with_backends(vec![Box::new(constant_folder::ConstantFolderBackend)]);
+    let control = VerificationCondition {
+        kind: VcKind::DivisionByZero,
+        function: "ordering_fn".into(),
+        location: SourceSpan::default(),
+        formula: Formula::Bool(false),
+        contract_metadata: None,
+        obligation: None,
+    };
+    assert!(!router.backend_plan(&control).is_empty());
+    assert!(router.verify_one(&control).is_proved());
+}
+
+#[test]
 fn test_aarch64_atomic_unsupported_mir_is_classified_and_reported() {
     let detail = "opcode=ldar; proof obligation: consume AArch64 acquire ordering event, synchronization edge, thread identity, and happens-before witness; access=Read; ordering=Acquire; exclusive_monitor=None; reports_status=false";
     let vc = VerificationCondition {
@@ -402,90 +554,6 @@ fn test_router_verify_all() {
 
     let results = router.verify_all(&vcs);
     assert_eq!(results.len(), 2);
-}
-
-#[test]
-fn test_router_verify_all_parallel() {
-    let router = Router::with_backends(vec![Box::new(constant_folder::ConstantFolderBackend)]);
-
-    let vcs: Vec<_> = (0..8)
-        .map(|i| VerificationCondition {
-            kind: VcKind::DivisionByZero,
-            function: format!("fn_{i}").into(),
-            location: SourceSpan::default(),
-            formula: Formula::Bool(false),
-            contract_metadata: None,
-            obligation: None,
-        })
-        .collect();
-
-    let results = router.verify_all_parallel(&vcs, 4);
-    assert_eq!(results.len(), 8);
-    for (_, result) in &results {
-        assert!(result.is_proved());
-    }
-}
-
-#[test]
-fn test_router_verify_all_parallel_fallback_single() {
-    let router = Router::new();
-    let vcs = vec![VerificationCondition {
-        kind: VcKind::DivisionByZero,
-        function: "test".into(),
-        location: SourceSpan::default(),
-        formula: Formula::Bool(false),
-        contract_metadata: None,
-        obligation: None,
-    }];
-
-    // Single VC should use sequential path
-    let results = router.verify_all_parallel(&vcs, 4);
-    assert_eq!(results.len(), 1);
-}
-
-#[test]
-fn test_router_verify_all_parallel_panics_preserve_one_result_per_vc() {
-    struct PanickingBackend;
-
-    impl VerificationBackend for PanickingBackend {
-        fn name(&self) -> &str {
-            "panicking"
-        }
-
-        fn can_handle(&self, _vc: &VerificationCondition) -> bool {
-            true
-        }
-
-        fn verify(&self, _vc: &VerificationCondition) -> VerificationResult {
-            panic!("intentional router isolation test panic");
-        }
-    }
-
-    let router = Router::with_backends(vec![Box::new(PanickingBackend)]);
-    let vcs: Vec<_> = (0..6)
-        .map(|i| VerificationCondition {
-            kind: VcKind::DivisionByZero,
-            function: format!("panic_fn_{i}").into(),
-            location: SourceSpan::default(),
-            formula: Formula::Bool(false),
-            contract_metadata: None,
-            obligation: None,
-        })
-        .collect();
-
-    let results = router.verify_all_parallel(&vcs, 3);
-
-    assert_eq!(results.len(), vcs.len());
-    assert!(
-        results.iter().all(|(_, result)| {
-            matches!(
-                result,
-                VerificationResult::Unknown { solver, reason, .. }
-                    if solver.as_str() == "router-parallel" && reason.contains("panicked")
-            )
-        }),
-        "panicking workers must fail closed per VC: {results:?}"
-    );
 }
 
 #[test]
@@ -874,12 +942,6 @@ fn test_fallback_proof_artifacts_survive_materialized_dispatch_paths() {
     for (_, result) in &sequential_results {
         assert_proved_artifacts(result, "evidence-fallback", &[9, 8, 7], &["fallback warning"]);
     }
-
-    let parallel_results = router.verify_all_parallel(&vcs, 2);
-    assert_eq!(parallel_results.len(), vcs.len());
-    for (_, result) in &parallel_results {
-        assert_proved_artifacts(result, "evidence-fallback", &[9, 8, 7], &["fallback warning"]);
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -1259,37 +1321,6 @@ fn test_router_memory_guard_blocks_verify_all() {
 }
 
 #[test]
-fn test_router_memory_guard_blocks_verify_all_parallel() {
-    use crate::memory_guard::MemoryGuard;
-
-    let guard = MemoryGuard::new(1); // 1 MB — will exceed
-    let router = Router::with_backends(vec![Box::new(constant_folder::ConstantFolderBackend)])
-        .with_memory_guard(guard);
-
-    let vcs: Vec<_> = (0..4)
-        .map(|i| VerificationCondition {
-            kind: VcKind::DivisionByZero,
-            function: format!("parallel_guard_fn_{i}").into(),
-            location: SourceSpan::default(),
-            formula: Formula::Bool(false),
-            contract_metadata: None,
-            obligation: None,
-        })
-        .collect();
-
-    let results = router.verify_all_parallel(&vcs, 2);
-
-    assert_eq!(results.len(), vcs.len());
-    for (_, result) in &results {
-        assert_eq!(
-            result.solver_name(),
-            "memory-guard",
-            "parallel dispatch should be blocked by memory guard"
-        );
-    }
-}
-
-#[test]
 fn test_router_memory_guard_peak_tracked_after_dispatch() {
     use crate::memory_guard::MemoryGuard;
 
@@ -1478,4 +1509,34 @@ fn batch_path_skips_unsupported_mir_vcs() {
     assert!(results[2].1.is_proved());
     // Only the two supported VCs were batched; verify() ran twice.
     assert_eq!(single_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn legacy_data_race_never_reaches_proving_batch() {
+    let batch_calls = Arc::new(AtomicUsize::new(0));
+    let single_calls = Arc::new(AtomicUsize::new(0));
+    let router = Router::with_backends(vec![Box::new(BatchProbeBackend {
+        batch_calls: batch_calls.clone(),
+        single_calls: single_calls.clone(),
+        supports_batch: true,
+    })]);
+
+    let vcs = vec![
+        legacy_data_race_vc(Formula::Bool(true)),
+        probe_vc("supported"),
+        legacy_data_race_vc(Formula::Bool(false)),
+    ];
+    for race in [&vcs[0], &vcs[2]] {
+        assert!(router.backend_plan(race).is_empty());
+        assert!(matches!(router.verify_one(race), VerificationResult::Unknown { .. }));
+    }
+    assert!(!router.backend_plan(&vcs[1]).is_empty());
+    assert_eq!(single_calls.load(Ordering::SeqCst), 0);
+
+    let results = router.verify_all(&vcs);
+    assert!(matches!(&results[0].1, VerificationResult::Unknown { .. }));
+    assert!(results[1].1.is_proved());
+    assert!(matches!(&results[2].1, VerificationResult::Unknown { .. }));
+    assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(single_calls.load(Ordering::SeqCst), 1);
 }

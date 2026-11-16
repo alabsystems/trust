@@ -172,16 +172,15 @@ pub fn validate_spec(
     // (heuristic: extract word-like tokens and check against params)
     if !param_names.is_empty() {
         let tokens = extract_identifiers(body);
-        let known: Vec<&str> = param_names.iter().map(|s| s.as_str()).collect();
         // Keywords and common names that are not parameters
         let builtins = [
             "result", "self", "true", "false", "len", "MAX", "MIN", "usize", "u8", "u16", "u32",
             "u64", "u128", "isize", "i8", "i16", "i32", "i64", "i128", "f32", "f64", "bool", "out",
             "forall", "exists", "int", "nat",
         ];
-        for token in &tokens {
-            if !known.contains(&token.as_str())
-                && !builtins.contains(&token.as_str())
+        for token in tokens {
+            if !param_names.iter().any(|p| p == token)
+                && !builtins.contains(&token)
                 && !token.contains("::")
                 && token.len() > 1
             // skip single-char tokens like operators
@@ -195,24 +194,26 @@ pub fn validate_spec(
     errors
 }
 
-/// Extract word-like identifiers from a spec expression.
-fn extract_identifiers(spec: &str) -> Vec<String> {
+/// Extract word-like identifiers from a spec expression as borrowed slices.
+fn extract_identifiers(spec: &str) -> Vec<&str> {
     let mut ids = Vec::new();
-    let mut current = String::new();
+    let mut start: Option<usize> = None;
 
-    for ch in spec.chars() {
+    for (i, ch) in spec.char_indices() {
         if ch.is_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else {
-            if !current.is_empty() && !current.chars().next().unwrap_or('0').is_ascii_digit() {
-                ids.push(std::mem::take(&mut current));
-            } else {
-                current.clear();
+            start.get_or_insert(i);
+        } else if let Some(s) = start.take() {
+            let ident = &spec[s..i];
+            if !ident.as_bytes()[0].is_ascii_digit() {
+                ids.push(ident);
             }
         }
     }
-    if !current.is_empty() && !current.chars().next().unwrap_or('0').is_ascii_digit() {
-        ids.push(current);
+    if let Some(s) = start {
+        let ident = &spec[s..];
+        if !ident.as_bytes()[0].is_ascii_digit() {
+            ids.push(ident);
+        }
     }
 
     ids
@@ -436,25 +437,25 @@ mod tests {
     #[test]
     fn test_extract_identifiers_simple() {
         let ids = extract_identifiers("a <= b + c");
-        assert!(ids.contains(&"a".into()));
-        assert!(ids.contains(&"b".into()));
-        assert!(ids.contains(&"c".into()));
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"b"));
+        assert!(ids.contains(&"c"));
     }
 
     #[test]
     fn test_extract_identifiers_skips_numbers() {
         let ids = extract_identifiers("x > 0 && y < 100");
-        assert!(ids.contains(&"x".into()));
-        assert!(ids.contains(&"y".into()));
-        assert!(!ids.contains(&"0".into()));
-        assert!(!ids.contains(&"100".into()));
+        assert!(ids.contains(&"x"));
+        assert!(ids.contains(&"y"));
+        assert!(!ids.contains(&"0"));
+        assert!(!ids.contains(&"100"));
     }
 
     #[test]
     fn test_extract_identifiers_with_underscores() {
         let ids = extract_identifiers("my_var != other_var");
-        assert!(ids.contains(&"my_var".into()));
-        assert!(ids.contains(&"other_var".into()));
+        assert!(ids.contains(&"my_var"));
+        assert!(ids.contains(&"other_var"));
     }
 
     // --- format_suggestions ---

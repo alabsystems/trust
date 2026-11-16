@@ -1,0 +1,32 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-tl03_let",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (6f70bdb69 2026-09-19) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@4ac1b25c7518 sha256:e38e559a127c245c",
+  "clean": "first-party/clean@4338e7923763 sha256:ece53b053817beaf",
+  "trust-cg": "first-party/trust-cg@5aca5cd4d662 sha256:9db90b2968fc0f50"
+ },
+ "ratchets": {
+  "GENERAL.p03_let.sqLet.emit": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "GENERAL.p03_let.sqLet.obj": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "codegen license: affirmatively ungated (`body_gate: ungated`, trust-ir v41)",
+   "audit": "FAIL",
+   "moved": "the audit had no named class for trust-cg's codegen-license refusal, so it recorded the refusal as an unnamed FAIL (`adapter error` in its detail). The measurement is unchanged — the Clean producer stamps `body_gate: ungated` and trust-cg refuses to lower an affirmatively ungated body by design — and it is now pinned as a producer GAP by that verbatim refusal. Closing it is roadmap WS5.10 (tier-`gate` Clean bodies stamped Gated with an in-module Certified TranslationValidation); when it lands, this row flips and must be re-pinned in the same commit."
+  },
+  "GENERAL.p03_let.sqLet.validate": {
+   "verdict": "PASS",
+   "audit": "FAIL",
+   "moved": "harness defect F-120 (1): the audit ran repair_fndef.py on every GENERAL module and then judged the REWRITTEN copy — the rewrite corrupted this module (its 4-format round trip reads `False (v0)`: no binary was ever produced from the repaired text), so a module that validates AS EMITTED was recorded FAIL. The ported judge rewrites nothing: as emitted the module validates and round-trips all four formats. The mutation test re-enables the unconditional rewrite and turns exactly these 18 rows red again (scripts/tests/two_language_producer_ratchets_test.py)."
+  },
+  "STANDALONE.p03_let": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

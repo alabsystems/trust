@@ -13,25 +13,27 @@ use crate::{
 
 pub(crate) fn backend_plan(
     backends: &[Arc<dyn VerificationBackend>],
+    backend_names: &[Symbol],
     vc: &VerificationCondition,
 ) -> Vec<BackendSelection> {
-    let mut plan: Vec<BackendSelection> = ranked_backends(backends, vc)
+    // Keep the already-ranked plan stable for any tie groups.
+    // The ordering is determined entirely by the index list from ranked_backends.
+    ranked_backends(backends, vc)
         .into_iter()
         .map(|entry| {
             let backend = &backends[entry.index];
+            let name = backend_names
+                .get(entry.index)
+                .copied()
+                .unwrap_or_else(|| Symbol::intern(backend.name()));
             BackendSelection {
                 index: entry.index,
-                name: backend.name().to_string().into(),
+                name,
                 role: backend.role(),
                 can_handle: entry.can_handle,
             }
         })
-        .collect();
-
-    // Keep the already-ranked plan stable for any tie groups.
-    // The ordering is determined entirely by the index list above.
-    plan.shrink_to_fit();
-    plan
+        .collect()
 }
 
 pub(crate) fn eligible_backends<'a>(
@@ -50,6 +52,28 @@ pub(crate) fn eligible_backends<'a>(
         }
         let backend = &backends[entry.index];
         // Skip backends that are invalid for this property kind.
+        let validity = termination_dispatch::validate_dispatch(property, backend.name());
+        if validity.is_invalid() {
+            continue;
+        }
+        eligible.push(backend);
+    }
+    eligible
+}
+
+pub(crate) fn eligible_backends_from_plan<'a>(
+    backends: &'a [Arc<dyn VerificationBackend>],
+    vc: &VerificationCondition,
+    plan: &[BackendSelection],
+) -> Vec<&'a Arc<dyn VerificationBackend>> {
+    let property = termination_dispatch::classify_property(vc);
+    let mut eligible = Vec::new();
+
+    for sel in plan {
+        if !sel.can_handle {
+            continue;
+        }
+        let backend = &backends[sel.index];
         let validity = termination_dispatch::validate_dispatch(property, backend.name());
         if validity.is_invalid() {
             continue;

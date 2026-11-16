@@ -482,12 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_default_is_empty() {
-        let reg = ProofStatusRegistry::default();
-        assert!(reg.is_empty());
-    }
-
-    #[test]
     fn test_registry_register_and_get() {
         let mut reg = ProofStatusRegistry::new();
         reg.register("crate::foo", ProofStatus::Certified);

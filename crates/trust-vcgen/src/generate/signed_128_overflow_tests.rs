@@ -283,18 +283,19 @@ fn i128_sub_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
 /// EXHAUSTIVE w=8 cross-check: the sign-bit overflow predicate
-/// (`signed_bv_addsub_overflow_sign_test`, the pure-QF_BV form that REPLACED the
+/// (`trust_types::signed_bv_addsub_overflow_sign_test`, the pure-QF_BV form that REPLACED the
 /// `w+1`-bit sign-extension/extract form the native lane could not prove) must
 /// agree with REAL two's-complement `i8` add/sub overflow on EVERY `(a, b)` pair.
 /// This pins exactness (no false-PROVE: it never reports "safe" when a real
 /// overflow exists; no false-FAIL: it never reports "overflow" on a safe op).
 #[test]
 fn signed_bv_addsub_overflow_sign_test_matches_real_i8() {
-    use super::signed_bv_addsub_overflow_sign_test;
+    use trust_types::signed_bv_addsub_overflow_sign_test;
     let env = |_: &str| 0u128;
     for op in [BinOp::Add, BinOp::Sub] {
         for a in -128i32..=127 {
@@ -308,9 +309,10 @@ fn signed_bv_addsub_overflow_sign_test_matches_real_i8() {
                 let f = signed_bv_addsub_overflow_sign_test(
                     Formula::BitVec { value: a8 as i128, width: 8 },
                     Formula::BitVec { value: b8 as i128, width: 8 },
-                    op,
+                    matches!(op, BinOp::Add),
                     8,
-                );
+                )
+                .expect("w=8 is in range");
                 assert_eq!(
                     eval_bv_bool(&f, &env),
                     real,
@@ -326,11 +328,13 @@ fn signed_bv_addsub_overflow_sign_test_matches_real_i8() {
 /// adversarial overflows that MUST stay refutable.
 #[test]
 fn signed_bv_addsub_overflow_sign_test_w128_boundaries() {
-    use super::signed_bv_addsub_overflow_sign_test;
+    use trust_types::signed_bv_addsub_overflow_sign_test;
     let env = |_: &str| 0u128;
     let bv = |v: i128| Formula::BitVec { value: v, width: 128 };
     let ov = |a: i128, b: i128, op: BinOp| {
-        eval_bv_bool(&signed_bv_addsub_overflow_sign_test(bv(a), bv(b), op, 128), &env)
+        let f = signed_bv_addsub_overflow_sign_test(bv(a), bv(b), matches!(op, BinOp::Add), 128)
+            .expect("w=128 is in range");
+        eval_bv_bool(&f, &env)
     };
     // Safe (signed_max's `_5 - 1` with `_5 = 1<<126`, and ordinary values).
     assert!(!ov(1i128 << 126, 1, BinOp::Sub), "(1<<126) - 1 must NOT overflow");
@@ -408,6 +412,45 @@ fn i128_sub_overflow_is_modeled_not_unsupported() {
     );
 }
 
+/// The producer/consumer link for the signed add/sub overflow VC: what vcgen emits
+/// for a signed 128-bit sub ASSERTS the shared overflow predicate as top-level
+/// conjuncts, so trust-certify's signed-BV lane and the router's structural twin
+/// (which discharge a row by its operands' bounds ONLY when it asserts that
+/// predicate, via `trust_types::asserted_signed_bv_addsub_overflows`) recognize it.
+/// If the producer's shape drifts from the shared template, this fails before
+/// those lanes silently stop discharging real overflow rows.
+#[test]
+fn i128_sub_overflow_vc_asserts_the_shared_predicate() {
+    fn flatten(f: &Formula) -> Vec<&Formula> {
+        match f {
+            Formula::And(items) => items.iter().flat_map(flatten).collect(),
+            other => vec![other],
+        }
+    }
+    let func = i128_sub_fn();
+    let block = &func.body.blocks[0];
+    let vc = v2_build_overflow_vc_for_operands(
+        &func,
+        block,
+        BinOp::Sub,
+        &Operand::Copy(Place::local(1)),
+        &Operand::Copy(Place::local(2)),
+        &SourceSpan::default(),
+        None,
+    )
+    .expect("i128 sub must emit a VC");
+    let conjuncts = flatten(&vc.formula);
+    let asserted = trust_types::asserted_signed_bv_addsub_overflows(&conjuncts);
+    assert_eq!(
+        asserted.len(),
+        1,
+        "exactly one asserted overflow predicate; formula: {:?}",
+        vc.formula
+    );
+    assert!(!asserted[0].is_add, "the predicate is the sub's");
+    assert_eq!(asserted[0].width, 128);
+}
+
 /// `fn g(x: i128) -> i128 { -x }`: `_2 = Neg(x)` raw rvalue → NegationOverflow VC.
 fn i128_neg_fn() -> VerifiableFunction {
     VerifiableFunction {
@@ -436,6 +479,7 @@ fn i128_neg_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -517,6 +561,7 @@ fn i128_signed_mul_stays_unsupported() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let block = &func.body.blocks[0];
     let vc = v2_build_overflow_vc_for_operands(
@@ -570,6 +615,7 @@ fn u128_add_overflow_still_refutable() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let block = &func.body.blocks[0];
     let vc = v2_build_overflow_vc_for_operands(
@@ -722,6 +768,7 @@ fn signed_max_sub_fixture() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -730,7 +777,10 @@ fn signed_max_sub_fixture() -> VerifiableFunction {
 /// (PROVABLE) over the whole free-variable space.
 #[test]
 fn signed_max_sub_is_provable_unsat() {
-    let func = signed_max_sub_fixture();
+    // Behind `if width >= 1` (see `behind_width_floor`): without the floor the bare
+    // `width - 1` wraps at `width = 0`, a real underflow pinned by
+    // `signed_max_sub_without_a_width_floor_stays_refutable`.
+    let func = behind_width_floor(signed_max_sub_fixture());
     // Build the Sub VC for `_5 - 1` (statement index 2 in block 1: `_6 = width-1`
     // at idx 0, `_5 = 1 << _6` at idx 1 — both taken BEFORE the subtraction).
     let block = &func.body.blocks[1];
@@ -774,6 +824,8 @@ fn signed_max_sub_is_provable_unsat() {
                 width_val
             } else if name == "_2" {
                 bool_true
+            } else if name.starts_with("width_floor") {
+                u128::from(width_val >= 1)
             } else {
                 0
             }
@@ -785,6 +837,27 @@ fn signed_max_sub_is_provable_unsat() {
             vc.formula
         );
     }
+
+    // NOT VACUOUS: at amount 127 (`_5 = i128::MIN`) with every path guard true, the
+    // violation is excluded by the derived amount bound and by nothing else.
+    let at_127 = |name: &str| -> u128 {
+        match name {
+            "__trust_ovf_bv_amt__6" => 127,
+            "__trust_ovf_bv_lhs__5" => 1u128 << 127,
+            "width" => 127,
+            "_6" => 126,
+            "_2" => 1,
+            n if n.starts_with("width_floor") => 1,
+            _ => 0,
+        }
+    };
+    assert!(!eval_bv_bool(&vc.formula, &at_127), "the bound must exclude amount 127");
+    assert!(
+        eval_bv_bool(&without_amt_bound(&vc.formula), &at_127),
+        "without the amount bound amount 127 must be a model (else the sweep is vacuous); \
+         formula: {:?}",
+        vc.formula
+    );
 
     // SANITY: the shift block-def really constrains `_5` — an INCONSISTENT witness (a
     // `_5` that is NOT `1 << _6`, e.g. `_5 = i128::MIN` with _6=5) must fail the
@@ -833,6 +906,7 @@ fn unguarded_i128_sub_one_stays_refutable() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let block = &func.body.blocks[0];
     let vc = v2_build_overflow_vc_for_operands(
@@ -907,6 +981,7 @@ fn shift_def_without_bound_stays_refutable() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let block = &func.body.blocks[0];
     // Build the `_5 - 1` Sub VC at stmt index 1 (after the `_5 = Shl` def at 0).
@@ -970,6 +1045,7 @@ fn unguarded_i128_max_plus_one_stays_refutable() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let block = &func.body.blocks[0];
     let vc = v2_build_overflow_vc_for_operands(
@@ -1032,17 +1108,11 @@ fn unguarded_i128_max_plus_one_stays_refutable() {
     );
 }
 
-/// signed_min's `-(1i128 << (width-1))`: with the shift block-def + `n < 128`, the
-/// negated value `_5` is a power of two in `[1, 2^127]`, NEVER `i128::MIN`, so the
-/// BV neg-overflow VC (`_5 == i128::MIN`) is UNSAT (PROVED). ADVERSARIALLY, an
-/// unconstrained `_5` makes it refutable (covered by
-/// `i128_negation_overflow_is_modeled_and_exact`).
-#[test]
-fn signed_min_neg_shifted_is_provable_unsat() {
-    // Faithful two-step shape (mirrors the real `signed_min` MIR):
-    //   bb0: _2 = (width <= 127); assert(_2, Shl) -> bb1
-    //   bb1: _6 = width - 1; _5 = Shl(1i128, _6); _0 = -_5 (raw neg); return
-    let func = VerifiableFunction {
+/// The `signed_min` shape: `-(1i128 << (width - 1))` under `width <= 127`.
+///   bb0: _2 = (width <= 127); assert(_2, Shl) -> bb1
+///   bb1: _6 = width - 1; _5 = Shl(1i128, _6); _0 = -_5 (raw neg); return
+fn signed_min_neg_fixture() -> VerifiableFunction {
+    VerifiableFunction {
         name: "signed_min_neg".to_string(),
         def_path: "test::signed_min_neg".to_string(),
         span: SourceSpan::default(),
@@ -1106,7 +1176,22 @@ fn signed_min_neg_shifted_is_provable_unsat() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
-    };
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// signed_min's `-(1i128 << (width-1))`: with the shift block-def + `n < 128`, the
+/// negated value `_5` is a power of two in `[1, 2^127]`, NEVER `i128::MIN`, so the
+/// BV neg-overflow VC (`_5 == i128::MIN`) is UNSAT (PROVED). ADVERSARIALLY, an
+/// unconstrained `_5` makes it refutable (covered by
+/// `i128_negation_overflow_is_modeled_and_exact`).
+#[test]
+fn signed_min_neg_shifted_is_provable_unsat() {
+    // `signed_min_neg_fixture` behind `if width >= 1`: the bare `width - 1` cannot
+    // wrap there, so `width <= 127` threads to `_6 <= 126` (see
+    // `behind_width_floor`; without the floor `width = 0` is a real overflow,
+    // pinned by `signed_min_neg_without_a_width_floor_stays_refutable`).
+    let func = behind_width_floor(signed_min_neg_fixture());
     let vcs = generate_v2_safety_vcs(&func);
     let neg = vcs
         .iter()
@@ -1130,6 +1215,7 @@ fn signed_min_neg_shifted_is_provable_unsat() {
                 "_6" => amt,
                 "width" => width_val,
                 "_2" => bool_true,
+                n if n.starts_with("width_floor") => u128::from(width_val >= 1),
                 _ => 0,
             }
         };
@@ -1140,6 +1226,26 @@ fn signed_min_neg_shifted_is_provable_unsat() {
             neg.formula
         );
     }
+    // NOT VACUOUS: at amount 127 with every path guard true, only the derived amount
+    // bound excludes the overflow.
+    let at_127 = |name: &str| -> u128 {
+        match name {
+            "__trust_ovf_bv_amt__6" => 127,
+            "__trust_ovf_bv_neg__5" => 1u128 << 127,
+            "width" => 127,
+            "_6" => 126,
+            "_2" => 1,
+            n if n.starts_with("width_floor") => 1,
+            _ => 0,
+        }
+    };
+    assert!(!eval_bv_bool(&neg.formula, &at_127), "the bound must exclude amount 127");
+    assert!(
+        eval_bv_bool(&without_amt_bound(&neg.formula), &at_127),
+        "without the amount bound amount 127 must be a model (else the sweep is vacuous); \
+         formula: {:?}",
+        neg.formula
+    );
     // The shift block-def must actually constrain `_5` (so the prove is real, not a
     // dropped-def vacuity): an INCONSISTENT `_5 = i128::MIN` with _6=5 must fail the
     // def equality → formula FALSE.
@@ -1157,6 +1263,168 @@ fn signed_min_neg_shifted_is_provable_unsat() {
         "the shift block-def must constrain `_5` (inconsistent witness FALSE), \
          proving the UNSAT is real; formula: {:?}",
         neg.formula
+    );
+}
+
+/// Put a `width`-parameter fixture (`_1: u32`) behind `if width >= 1 { .. } else { 0 }`.
+///
+/// The `signed_max`/`signed_min` hand fixtures compute `_6 = width - 1` with a BARE
+/// `BinaryOp(Sub)`, which wraps: at `width = 0` it is `u32::MAX`, whose masked shift
+/// amount is 127, so `1i128 << _6` is `i128::MIN` and both the `- 1` and the negation
+/// really overflow (2026-11-09, WRAPPING-SUB-AND-INTERVAL-NEG-1). Their designed
+/// proofs hold only where the subtraction cannot wrap; this guard is that premise.
+/// The original entry block moves to the end and keeps its successors, so
+/// `blocks[1]` is still the definitions block.
+pub(crate) fn behind_width_floor(mut func: VerifiableFunction) -> VerifiableFunction {
+    let entry_id = func.body.blocks.len();
+    let exit_id = entry_id + 1;
+    let floor_local = func.body.locals.iter().map(|decl| decl.index).max().unwrap_or(0) + 1;
+    func.body.locals.push(LocalDecl {
+        index: floor_local,
+        ty: Ty::Bool,
+        name: Some("width_floor".into()),
+    });
+    let floor = BasicBlock {
+        id: BlockId(0),
+        stmts: vec![assign(
+            floor_local,
+            Rvalue::BinaryOp(
+                BinOp::Ge,
+                Operand::Copy(Place::local(1)),
+                Operand::Constant(ConstValue::Uint(1, 32)),
+            ),
+        )],
+        terminator: Terminator::SwitchInt {
+            discr: Operand::Move(Place::local(floor_local)),
+            targets: vec![(0, BlockId(exit_id))],
+            otherwise: BlockId(entry_id),
+            exhaustive_enum_unreachable: false,
+            span: SourceSpan::default(),
+        },
+    };
+    let mut entry = std::mem::replace(&mut func.body.blocks[0], floor);
+    entry.id = BlockId(entry_id);
+    func.body.blocks.push(entry);
+    func.body.blocks.push(BasicBlock {
+        id: BlockId(exit_id),
+        stmts: vec![assign(0, Rvalue::Use(Operand::Constant(ConstValue::Int(0))))],
+        terminator: Terminator::Return,
+    });
+    func
+}
+
+/// Is `f` the shift-amount bit-vector var the BV lanes mint (`__trust_ovf_bv_amt_*`)?
+fn is_amt_bv_var(f: &Formula) -> bool {
+    matches!(f, Formula::Var(name, _) if name.starts_with("__trust_ovf_bv_amt_"))
+}
+
+/// `f` with every shift-amount bound `__trust_ovf_bv_amt_* <u K` replaced by `true`:
+/// the formula a proof would face if the derived bound were missing. A floored
+/// proving sweep shows it is NOT vacuous by checking that this weakened formula is
+/// satisfied at the overflowing amount while the real one is not.
+pub(crate) fn without_amt_bound(f: &Formula) -> Formula {
+    f.clone().map(&mut |node| match node {
+        Formula::BvULt(lhs, _, _) if is_amt_bv_var(&lhs) => Formula::Bool(true),
+        other => other,
+    })
+}
+
+/// The `width = 0` execution of the UNFLOORED fixtures: `_6 = 0 - 1` wraps to
+/// `u32::MAX`, the shift masks it to 127, and `_5 = 1i128 << 127 = i128::MIN`.
+/// `_2 = (0 <= 127)` holds, so the only guard on the path is satisfied.
+fn width_zero_witness(name: &str, value_bv: &str) -> u128 {
+    match name {
+        "__trust_ovf_bv_amt__6" => 127,
+        n if n == value_bv => i128::MIN as u128,
+        "_6" => u128::from(u32::MAX),
+        "width" => 0,
+        "_2" => 1,
+        _ => 0,
+    }
+}
+
+/// Without a dominating `width >= 1`, `signed_max`'s `_5 - 1` is a REAL underflow at
+/// `width = 0`; the obligation must stay refutable there (before
+/// WRAPPING-SUB-AND-INTERVAL-NEG-1 the wrapping `width - 1` was read as mathematical
+/// subtraction, giving `_6 <= 126`, and this witness was excluded).
+#[test]
+fn signed_max_sub_without_a_width_floor_stays_refutable() {
+    let func = signed_max_sub_fixture();
+    let block = &func.body.blocks[1];
+    let vc = v2_build_overflow_vc_for_operands(
+        &func,
+        block,
+        BinOp::Sub,
+        &Operand::Copy(Place::local(5)),
+        &Operand::Constant(ConstValue::Int(1)),
+        &SourceSpan::default(),
+        Some(2),
+    )
+    .expect("signed_max `_5 - 1` must emit a VC");
+    assert!(
+        eval_bv_bool(&vc.formula, &|name| width_zero_witness(name, "__trust_ovf_bv_lhs__5")),
+        "width = 0 makes `_5 = i128::MIN` and `_5 - 1` underflow; the violation must be \
+         SAT there. formula: {:?}",
+        vc.formula
+    );
+    let floored = behind_width_floor(signed_max_sub_fixture());
+    let floored_vc = v2_build_overflow_vc_for_operands(
+        &floored,
+        &floored.body.blocks[1],
+        BinOp::Sub,
+        &Operand::Copy(Place::local(5)),
+        &Operand::Constant(ConstValue::Int(1)),
+        &SourceSpan::default(),
+        Some(2),
+    )
+    .expect("floored signed_max `_5 - 1` must emit a VC");
+    assert_eq!(
+        amt_strict_upper_bound(&floored_vc.formula),
+        Some(127),
+        "behind `width >= 1` the shift amount carries `_6 < 127`; formula: {:?}",
+        floored_vc.formula
+    );
+    assert!(
+        amt_strict_upper_bound(&vc.formula).is_none_or(|bound| bound >= 128),
+        "without the floor no amount bound below the shift's own may be derived from \
+         the wrapping `width - 1`; formula: {:?}",
+        vc.formula
+    );
+}
+
+/// The negation twin: without a dominating `width >= 1`, `signed_min`'s `-_5` is a
+/// REAL overflow at `width = 0` and must stay refutable there.
+#[test]
+fn signed_min_neg_without_a_width_floor_stays_refutable() {
+    let func = signed_min_neg_fixture();
+    let vcs = generate_v2_safety_vcs(&func);
+    let neg = vcs
+        .iter()
+        .find(|vc| matches!(vc.kind, VcKind::NegationOverflow { .. }))
+        .expect("signed_min `-_5` must emit a NegationOverflow VC");
+    assert!(
+        eval_bv_bool(&neg.formula, &|name| width_zero_witness(name, "__trust_ovf_bv_neg__5")),
+        "width = 0 makes `_5 = i128::MIN` and `-_5` overflow; the violation must be SAT \
+         there. formula: {:?}",
+        neg.formula
+    );
+    assert!(
+        amt_strict_upper_bound(&neg.formula).is_none_or(|bound| bound >= 128),
+        "without the floor no amount bound below the shift's own may be derived from \
+         the wrapping `width - 1`; formula: {:?}",
+        neg.formula
+    );
+    let floored = behind_width_floor(signed_min_neg_fixture());
+    let floored_vcs = generate_v2_safety_vcs(&floored);
+    let floored_neg = floored_vcs
+        .iter()
+        .find(|vc| matches!(vc.kind, VcKind::NegationOverflow { .. }))
+        .expect("floored signed_min `-_5` must emit a NegationOverflow VC");
+    assert_eq!(
+        amt_strict_upper_bound(&floored_neg.formula),
+        Some(127),
+        "behind `width >= 1` the shift amount carries `_6 < 127`; formula: {:?}",
+        floored_neg.formula
     );
 }
 
@@ -1229,6 +1497,7 @@ fn i128_mul_checked_fn(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1716,6 +1985,7 @@ fn checked_sub_amount_guarded_fixture() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1834,6 +2104,7 @@ fn checked_sub_amount_unguarded_fixture() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1977,6 +2248,99 @@ fn checked_sub_sourced_shift_amount_violation_is_unsat() {
     );
 }
 
+/// Trust: 2026-11-09 (VCGEN-SEAM-PERF-REDS-1) — the `pmod`/`p8` shape for the
+/// shift amount's resolver. The GUARDED fixture gains a second way to the shift:
+/// `width > 127` now calls `pick()` with `_6` as its DESTINATION, checks the shift
+/// assert on that value and joins the Shl block. On that path `_6` is bounded only by
+/// the shift assert (`< 128`), and `-(1i128 << 127)` really overflows. A resolver that
+/// sees the `_6 = _7.0` `Assign` and not the `Call` destination reads `_6` as
+/// `width - 1`, carries the `width <= 127` guard through it and bounds the amount at
+/// `< 127`, proving a reachable overflow. `_6` holds two values, so the derived bound
+/// must be withheld and the violation must stay satisfiable.
+#[test]
+fn a_call_destination_rewrite_of_the_shift_amount_withholds_the_derived_bound() {
+    // Positive control: on the unmodified guarded body the same direct question DOES
+    // derive `< 127`, so a missing bound below is the resolver declining, not an
+    // instrument that cannot see one.
+    let guarded = checked_sub_amount_guarded_fixture();
+    let guarded_shl = guarded.body.blocks.iter().find(|b| b.id == BlockId(6)).expect("bb6");
+    assert_eq!(
+        super::v2_dominating_shift_amount_bound(&guarded, guarded_shl, 0, 6, 128)
+            .as_ref()
+            .and_then(amt_strict_upper_bound),
+        Some(127),
+    );
+    let mut func = checked_sub_amount_guarded_fixture();
+    func.body.locals.push(LocalDecl { index: 10, ty: Ty::Bool, name: None });
+    let Terminator::SwitchInt { targets, .. } = &mut func.body.blocks[3].terminator else {
+        unreachable!("bb3 is the `width <= 127` switch")
+    };
+    *targets = vec![(0, BlockId(10))];
+    func.body.blocks.push(BasicBlock {
+        id: BlockId(10),
+        stmts: vec![],
+        terminator: Terminator::Call {
+            unwind: UnwindEdge::Unreachable,
+            func: "pick".to_string(),
+            args: vec![],
+            dest: Place::local(6),
+            target: Some(BlockId(11)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("pick"),
+            is_foreign: false,
+        },
+    });
+    func.body.blocks.push(BasicBlock {
+        id: BlockId(11),
+        stmts: vec![assign(
+            10,
+            Rvalue::BinaryOp(
+                BinOp::Lt,
+                Operand::Copy(Place::local(6)),
+                Operand::Constant(ConstValue::Uint(128, 32)),
+            ),
+        )],
+        terminator: Terminator::Assert {
+            unwind: UnwindEdge::Continue,
+            cond: Operand::Move(Place::local(10)),
+            expected: true,
+            msg: AssertMessage::Overflow(BinOp::Shl),
+            target: BlockId(6),
+            span: SourceSpan::default(),
+        },
+    });
+    assert!(
+        crate::local_defs::unique_value_def(&func, 6).is_none(),
+        "`_6` is written by an `Assign` AND a `Call` destination: two values"
+    );
+    // The resolver itself: asked directly at the Shl, the amount's derived bound must
+    // not come through `_6 = _7.0`. Only the shift asserts' own `< 128` may bound it.
+    let shl_block = func.body.blocks.iter().find(|b| b.id == BlockId(6)).expect("bb6 is the Shl");
+    if let Some(bound) = super::v2_dominating_shift_amount_bound(&func, shl_block, 0, 6, 128) {
+        assert_ne!(
+            amt_strict_upper_bound(&bound),
+            Some(127),
+            "the `width <= 127` guard dominates only the `_6 = _7.0` definition, not the \
+             `pick()` one; it must not bound the amount. bound: {bound:?}"
+        );
+    }
+    // End to end: `_6` holds two values, so neither a bound on it nor the
+    // `_5 == 1 << _6` definition may enter the negation's formula, and the violation
+    // `_5 == i128::MIN` stays satisfiable (`pick()` may return 127).
+    let (formula, amt) = hardened_neg_formula(&func);
+    assert_eq!(amt_strict_upper_bound(&formula), None, "formula: {formula:?}");
+    assert!(amt.is_none(), "a two-valued amount must not define `_5`; formula: {formula:?}");
+    let neg = neg_result_var(&formula).expect("the violation names the negated operand");
+    assert!(
+        eval_bv_bool(&formula, &|name: &str| if name == neg { 1u128 << 127 } else { 0 }),
+        "`-(1i128 << 127)` overflows, so the violation must stay satisfiable. formula: \
+         {formula:?}"
+    );
+}
+
 /// NEGATIVE control. Delete ONLY the `width <= 127` guard and the very same
 /// encoding must stay refutable, with the witness being the amount the real
 /// program reaches (`width = 128` -> `amt = 127`, `-(1i128 << 127)` panics).
@@ -1998,4 +2362,355 @@ fn unguarded_checked_sub_sourced_shift_amount_stays_refutable() {
          violation must be SAT at exactly amount 127 — the real panicking execution, \
          not an encoding artifact. formula: {formula:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Trust: 2026-11-09 (WRAPPING-SUB-AND-INTERVAL-NEG-1) — a WRAPPING `Sub` is not
+// mathematical subtraction.
+//
+// `v2_amount_sub_source_at_use`'s plain-`Sub` arm read `amt = BinaryOp(Sub, src, c)`
+// as `amt <= src_ub - 1 - c`. A bare MIR `Rvalue::BinaryOp(Sub)` WRAPS mod 2^w
+// (`guards.rs`: "a bare `Rvalue::BinaryOp` IS the wrapping case by construction"):
+// with overflow checks on it is what `core::intrinsics::wrapping_sub` and an inlined
+// `wrapping_sub` leave, with checks off it is all user arithmetic. The real program
+// (`trustc -O -Ztrust-dump=mir:`, found by the 2026-11-09 review of a28391d3d9):
+//
+//     pub fn w(src: u32) -> i128 {
+//         if src < 4294967210 {
+//             let amt = core::intrinsics::wrapping_sub(src, 4294967200); // src + 96 mod 2^32
+//             if amt < 128 { return -(1i128 << amt); }
+//         }
+//         0
+//     }
+//
+// `w(31)`: amt = 127, `1i128 << 127 == i128::MIN`, and `-i128::MIN` PANICS. The
+// derived bound was `amt < 4294967210 - 4294967200 = 10`, so the negation's encoded
+// violation was UNSAT for every amount. The plain arm now needs the cannot-wrap proof
+// the checked arm gets from its assert: a dominating `src >= c` (here absent).
+
+/// The `w` shape: `src_guard` adds the `src < 4294967210` guard whose bound the
+/// wrapping subtraction must NOT carry; `no_wrap_guard` adds a dominating
+/// `src >= 4294967200`, under which the subtraction cannot wrap and the bound IS true.
+fn wrapping_sub_amount_fixture(src_guard: bool, no_wrap_guard: bool) -> VerifiableFunction {
+    let cmp = |op: BinOp, l: usize, k: u128| {
+        Rvalue::BinaryOp(
+            op,
+            Operand::Copy(Place::local(l)),
+            Operand::Constant(ConstValue::Uint(k, 32)),
+        )
+    };
+    let switch = |discr: usize, zero: usize, other: usize| Terminator::SwitchInt {
+        discr: Operand::Move(Place::local(discr)),
+        targets: vec![(0, BlockId(zero))],
+        otherwise: BlockId(other),
+        exhaustive_enum_unreachable: false,
+        span: SourceSpan::default(),
+    };
+    // bb0 -> bb7 (lower guard) -> bb1 (the wrapping Sub) ; every false edge -> bb4.
+    let bb0 = match (src_guard, no_wrap_guard) {
+        (true, _) => BasicBlock {
+            id: BlockId(0),
+            stmts: vec![assign(2, cmp(BinOp::Lt, 1, 4294967210))],
+            terminator: switch(2, 4, 7),
+        },
+        (false, _) => {
+            BasicBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Goto(BlockId(7)) }
+        }
+    };
+    let bb7 = if no_wrap_guard {
+        BasicBlock {
+            id: BlockId(7),
+            stmts: vec![assign(8, cmp(BinOp::Ge, 1, 4294967200))],
+            terminator: switch(8, 4, 1),
+        }
+    } else {
+        BasicBlock { id: BlockId(7), stmts: vec![], terminator: Terminator::Goto(BlockId(1)) }
+    };
+    VerifiableFunction {
+        name: "w".to_string(),
+        def_path: "wrapneg::w".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::i128(), name: None },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("src".into()) },
+                LocalDecl { index: 2, ty: Ty::Bool, name: None },
+                LocalDecl { index: 3, ty: Ty::u32(), name: Some("amt".into()) },
+                LocalDecl { index: 4, ty: Ty::Bool, name: None },
+                LocalDecl { index: 5, ty: Ty::Bool, name: None },
+                LocalDecl { index: 6, ty: Ty::i128(), name: None },
+                LocalDecl { index: 7, ty: Ty::Bool, name: None },
+                LocalDecl { index: 8, ty: Ty::Bool, name: None },
+            ],
+            blocks: vec![
+                bb0,
+                // bb1: the WRAPPING `amt = src - 4294967200`, then `if amt < 128`.
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![
+                        assign(
+                            3,
+                            Rvalue::BinaryOp(
+                                BinOp::Sub,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(4294967200, 32)),
+                            ),
+                        ),
+                        assign(4, cmp(BinOp::Lt, 3, 128)),
+                    ],
+                    terminator: switch(4, 4, 2),
+                },
+                // bb2: the shift's own overflow assert.
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![assign(5, cmp(BinOp::Lt, 3, 128))],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Continue,
+                        cond: Operand::Move(Place::local(5)),
+                        expected: true,
+                        msg: AssertMessage::Overflow(BinOp::Shl),
+                        target: BlockId(3),
+                        span: SourceSpan::default(),
+                    },
+                },
+                // bb3: `_6 = 1i128 << amt`, then the negation-overflow assert.
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![
+                        assign(
+                            6,
+                            Rvalue::BinaryOp(
+                                BinOp::Shl,
+                                Operand::Constant(ConstValue::Int(1)),
+                                Operand::Copy(Place::local(3)),
+                            ),
+                        ),
+                        assign(
+                            7,
+                            Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Copy(Place::local(6)),
+                                Operand::Constant(ConstValue::Int(i128::MIN)),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Continue,
+                        cond: Operand::Move(Place::local(7)),
+                        expected: false,
+                        msg: AssertMessage::OverflowNeg,
+                        target: BlockId(5),
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(4),
+                    stmts: vec![assign(0, Rvalue::Use(Operand::Constant(ConstValue::Int(0))))],
+                    terminator: Terminator::Goto(BlockId(6)),
+                },
+                BasicBlock {
+                    id: BlockId(5),
+                    stmts: vec![assign(
+                        0,
+                        Rvalue::UnaryOp(UnOp::Neg, Operand::Move(Place::local(6))),
+                    )],
+                    terminator: Terminator::Goto(BlockId(6)),
+                },
+                BasicBlock { id: BlockId(6), stmts: vec![], terminator: Terminator::Return },
+                bb7,
+            ],
+            arg_count: 1,
+            return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// The `w` shape with a 128-bit CHECKED ADD consuming the shifted value instead of a
+/// negation: `return (1i128 << amt) + (1i128 << 126);` — `w(30)` reaches `amt = 126`
+/// and `2^126 + 2^126 == 2^127` overflows.
+fn wrapping_sub_amount_add_fixture(src_guard: bool) -> VerifiableFunction {
+    let mut func = wrapping_sub_amount_fixture(src_guard, false);
+    func.body.locals.push(LocalDecl {
+        index: 9,
+        ty: Ty::Tuple(vec![Ty::i128(), Ty::Bool]),
+        name: None,
+    });
+    let bb3 = func.body.blocks.iter_mut().find(|b| b.id == BlockId(3)).expect("bb3");
+    bb3.stmts.truncate(1); // keep `_6 = Shl(1i128, _3)`
+    bb3.stmts.push(assign(
+        9,
+        Rvalue::CheckedBinaryOp(
+            BinOp::Add,
+            Operand::Copy(Place::local(6)),
+            Operand::Constant(ConstValue::Int(1i128 << 126)),
+        ),
+    ));
+    bb3.terminator = Terminator::Assert {
+        unwind: UnwindEdge::Continue,
+        cond: Operand::Copy(Place { local: 9, projections: vec![Projection::Field(1)] }),
+        expected: false,
+        msg: AssertMessage::Overflow(BinOp::Add),
+        target: BlockId(5),
+        span: SourceSpan::default(),
+    };
+    let bb5 = func.body.blocks.iter_mut().find(|b| b.id == BlockId(5)).expect("bb5");
+    bb5.stmts = vec![assign(
+        0,
+        Rvalue::Use(Operand::Copy(Place { local: 9, projections: vec![Projection::Field(0)] })),
+    )];
+    func
+}
+
+fn shl_block(func: &VerifiableFunction) -> &BasicBlock {
+    func.body.blocks.iter().find(|b| b.id == BlockId(3)).expect("bb3 is the Shl")
+}
+
+/// Every routed row's (kind, verdict) through the full pipeline and the deterministic
+/// in-process router, on a big stack.
+fn wrapneg_routed_rows(func: VerifiableFunction) -> Vec<(VcKind, trust_types::VerificationResult)> {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let (solver, _discharged) = crate::generate_vcs_with_discharge(&func);
+            let router = crate::test_router::deterministic_test_router();
+            router
+                .verify_all(&solver)
+                .into_iter()
+                .zip(solver.iter())
+                .map(|((_, result), vc)| (vc.kind.clone(), result))
+                .collect()
+        })
+        .expect("spawn")
+        .join()
+        .expect("solver thread must not panic")
+}
+
+/// THE HOLE, at the resolver and in the formula. Ground truth first: `w(31)` passes
+/// both guards and the shift assert, and its negation overflows.
+#[test]
+fn a_wrapping_sub_carries_no_mathematical_bound_to_the_shift_amount() {
+    let src: u32 = 31;
+    assert!(src < 4294967210);
+    let amt = src.wrapping_sub(4294967200);
+    assert_eq!(amt, 127);
+    assert!((1i128 << amt).checked_neg().is_none(), "-(1i128 << 127) overflows");
+
+    let func = wrapping_sub_amount_fixture(true, false);
+    // The resolver: only the direct `amt < 128` guard may bound the amount.
+    let bound = super::v2_dominating_shift_amount_bound(&func, shl_block(&func), 0, 3, 128);
+    assert_eq!(
+        bound.as_ref().and_then(amt_strict_upper_bound),
+        Some(128),
+        "`amt = src - 4294967200` WRAPS; `src < 4294967210` says nothing about `amt` \
+         without `src >= 4294967200`. bound: {bound:?}"
+    );
+    // The formula: the encoded violation must be satisfiable at the real amount.
+    let (formula, amt_var) = hardened_neg_formula(&func);
+    let amt_var = amt_var.expect("the Shl-defined operand binds the amount");
+    assert_eq!(
+        neg_violation_witness(&formula, &amt_var),
+        Some(127),
+        "w(31) reaches amt = 127 and overflows the negation, so the encoded violation must \
+         be SAT there. formula: {formula:?}"
+    );
+}
+
+/// The same hole through an ADD consumer: the 128-bit `(1i128 << amt) + (1i128 << 126)`
+/// row gets the same shift-amount bound, so it must not see `amt < 10` either.
+#[test]
+fn a_wrapping_sub_carries_no_mathematical_bound_to_an_add_consumer() {
+    let ground: u32 = 30;
+    let amt = ground.wrapping_sub(4294967200);
+    assert_eq!(amt, 126);
+    assert!((1i128 << amt).checked_add(1i128 << 126).is_none());
+    let func = wrapping_sub_amount_add_fixture(true);
+    let vcs = generate_v2_safety_vcs(&func);
+    let add = vcs
+        .iter()
+        .find(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Add, .. }))
+        .expect("the 128-bit checked add must emit an overflow row");
+    let mut bounds = Vec::new();
+    collect_amt_bounds(&add.formula, &mut bounds);
+    assert!(
+        bounds.iter().all(|&k| k >= 127),
+        "no bound below 127 may reach the add's shift amount (amt = 126 overflows the \
+         add): {bounds:?}; formula: {:?}",
+        add.formula
+    );
+}
+
+fn collect_amt_bounds(f: &Formula, out: &mut Vec<i128>) {
+    match f {
+        Formula::BvULt(a, b, _) => {
+            if let (Formula::Var(name, _), Formula::BitVec { value, .. }) = (&**a, &**b)
+                && name.starts_with("__trust_ovf_bv_amt_")
+            {
+                out.push(*value);
+            }
+        }
+        Formula::And(cs) | Formula::Or(cs) => cs.iter().for_each(|c| collect_amt_bounds(c, out)),
+        Formula::Not(c) => collect_amt_bounds(c, out),
+        Formula::Implies(a, b) => {
+            collect_amt_bounds(a, out);
+            collect_amt_bounds(b, out);
+        }
+        _ => {}
+    }
+}
+
+/// End to end through the deterministic router: the guarded negation row is REFUTED
+/// (it was Unknown, saved from a PROVED only by ay's own self-check rejecting the
+/// UNSAT derivation). The unguarded twin is the positive control: the instrument
+/// refutes this shape when no bound is in play.
+#[test]
+fn a_wrapping_sub_sourced_negation_is_refuted_end_to_end() {
+    let refuted = |rows: &[(VcKind, trust_types::VerificationResult)]| {
+        rows.iter().any(|(kind, result)| {
+            matches!(kind, VcKind::NegationOverflow { .. })
+                && matches!(result, trust_types::VerificationResult::Failed { .. })
+        })
+    };
+    let control = wrapping_sub_amount_fixture(false, false);
+    let control_rows = wrapneg_routed_rows(control);
+    assert!(refuted(&control_rows), "positive control: {control_rows:?}");
+    let rows = wrapneg_routed_rows(wrapping_sub_amount_fixture(true, false));
+    assert!(
+        !rows.iter().any(|(kind, result)| matches!(kind, VcKind::NegationOverflow { .. })
+            && matches!(result, trust_types::VerificationResult::Proved { .. })),
+        "FALSE PROOF: w(31) overflows the negation: {rows:?}"
+    );
+    assert!(refuted(&rows), "w(31) overflows the negation, so the row must be refuted: {rows:?}");
+}
+
+/// The designed discharge the fix keeps: under a dominating `src >= 4294967200` the
+/// wrapping subtraction cannot wrap, so `src < 4294967210` DOES bound `amt < 10`, and
+/// the negation's violation is UNSAT for every amount.
+#[test]
+fn a_wrapping_sub_that_cannot_wrap_still_carries_its_bound() {
+    for src in 4294967200u32..4294967210 {
+        assert!(src.wrapping_sub(4294967200) < 10);
+    }
+    let func = wrapping_sub_amount_fixture(true, true);
+    let bound = super::v2_dominating_shift_amount_bound(&func, shl_block(&func), 0, 3, 128);
+    assert_eq!(bound.as_ref().and_then(amt_strict_upper_bound), Some(10), "bound: {bound:?}");
+    let (formula, amt_var) = hardened_neg_formula(&func);
+    let amt_var = amt_var.expect("the Shl-defined operand binds the amount");
+    assert_eq!(
+        neg_violation_witness(&formula, &amt_var),
+        None,
+        "with `src >= 4294967200` the amount is below 10, so `-(1i128 << amt)` cannot \
+         overflow. formula: {formula:?}"
+    );
+    // And the lower guard alone (no upper bound on `src`) gives nothing tighter than
+    // the shift assert's `< 128`.
+    let lower_only = wrapping_sub_amount_fixture(false, true);
+    let bound =
+        super::v2_dominating_shift_amount_bound(&lower_only, shl_block(&lower_only), 0, 3, 128);
+    assert_eq!(bound.as_ref().and_then(amt_strict_upper_bound), Some(128), "bound: {bound:?}");
 }

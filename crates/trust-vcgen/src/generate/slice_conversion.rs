@@ -77,29 +77,25 @@ pub(super) fn unique_whole_local_conversion_call<'a>(
         return None;
     }
     let mut found: Option<(&'a Vec<Operand>, &'a Place)> = None;
-    for block in &func.body.blocks {
+    if crate::any_local_write_candidate(func, &func.body.blocks, local, |block, item| match item {
         // A statement-level whole-local re-def makes `_r` ambiguous: bail.
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, .. } = stmt
-                && place.local == local
+        Some(stmt) => matches!(stmt, Statement::Assign { place, .. } if place.local == local),
+        None => {
+            if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
+                && dest.local == local
             {
-                return None;
+                if !dest.projections.is_empty()
+                    || !is_slice_to_array_conversion(callee)
+                    || found.is_some()
+                {
+                    return true;
+                }
+                found = Some((args, dest));
             }
+            false
         }
-        if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
-            && dest.local == local
-        {
-            if !dest.projections.is_empty() {
-                return None;
-            }
-            if !is_slice_to_array_conversion(callee) {
-                return None;
-            }
-            if found.is_some() {
-                return None; // more than one def — ambiguous
-            }
-            found = Some((args, dest));
-        }
+    }) {
+        return None;
     }
     found
 }
@@ -128,7 +124,7 @@ pub(super) fn array_len_of(func: &VerifiableFunction, place: &Place) -> Option<u
     if !place.projections.is_empty() {
         return None;
     }
-    match &func.body.locals.get(place.local)?.ty {
+    match crate::local_ty_ref(func, place.local)? {
         Ty::Array { len, .. } => Some(*len),
         _ => None,
     }
@@ -141,7 +137,7 @@ pub(super) fn array_len_of_result(func: &VerifiableFunction, place: &Place) -> O
     if !place.projections.is_empty() {
         return None;
     }
-    let Ty::Adt { name, fields, .. } = &func.body.locals.get(place.local)?.ty else {
+    let Ty::Adt { name, fields, .. } = crate::local_ty_ref(func, place.local)? else {
         return None;
     };
     if !name.contains("Result") {
@@ -221,41 +217,49 @@ pub(super) fn slice_arg_static_len(
     // A separate `Statement::Assign` to `local` (the transparent-copy channel
     // below) is allowed only when there is NO index def for this local; if BOTH an
     // index def and a statement def exist, the value is ambiguous and we bail.
-    let mut idx_def: Option<&Vec<Operand>> = None;
-    let mut stmt_def_seen = false;
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, .. } = stmt
-                && place.local == local
-                && place.projections.first() != Some(&trust_types::Projection::Deref)
+    if super::terminator_presence_for(func).has_bare_dest_call {
+        let mut idx_def: Option<&Vec<Operand>> = None;
+        if crate::any_local_write_term(func, &func.body.blocks, local, |_block, term| {
+            if let Terminator::Call { func: callee, args, dest, .. } = term
+                && dest.local == local
+                && dest.projections.is_empty()
+                && is_slice_index_call(callee)
             {
-                stmt_def_seen = true;
+                if idx_def.is_some() {
+                    return true;
+                }
+                idx_def = Some(args);
             }
+            false
+        }) {
+            return None; // more than one index def — ambiguous
         }
-        if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
-            && dest.local == local
-            && dest.projections.is_empty()
-            && is_slice_index_call(callee)
-        {
-            if idx_def.is_some() {
-                return None; // more than one index def — ambiguous
+        if let Some(args) = idx_def {
+            let stmt_def_seen =
+                crate::any_local_write_stmt(func, &func.body.blocks, local, |_block, stmt| {
+                    matches!(
+                        stmt,
+                        Statement::Assign { place, .. }
+                            if place.local == local
+                                && place.projections.first() != Some(&trust_types::Projection::Deref)
+                    )
+                });
+            if stmt_def_seen {
+                return None; // index def co-exists with a statement def — ambiguous
             }
-            idx_def = Some(args);
+            let recv = args.first()?;
+            if !operand_is_builtin_slice_or_array(func, recv) {
+                return None;
+            }
+            // (c) constant / constant-difference `Range` length; then (d) a `RangeFrom`
+            // `s[L-K..]` whose `start` is provably `Len(receiver) - K` (length `K`).
+            return args.iter().find_map(|a| {
+                range_aggregate_const_len(func, a).or_else(|| range_from_const_len(func, recv, a))
+            });
         }
     }
-    if let Some(args) = idx_def {
-        if stmt_def_seen {
-            return None; // index def co-exists with a statement def — ambiguous
-        }
-        let recv = args.first()?;
-        if !operand_is_builtin_slice_or_array(func, recv) {
-            return None;
-        }
-        // (c) constant / constant-difference `Range` length; then (d) a `RangeFrom`
-        // `s[L-K..]` whose `start` is provably `Len(receiver) - K` (length `K`).
-        return args.iter().find_map(|a| {
-            range_aggregate_const_len(func, a).or_else(|| range_from_const_len(func, recv, a))
-        });
+    if crate::local_defs::is_parameter(func, local) {
+        return None;
     }
     // Transparent whole-local copies: `_s = Use(_t)` / `_s = &_t` / deref-copy.
     match crate::local_defs::unique_value_def(func, local)? {
@@ -310,7 +314,7 @@ pub(super) fn range_aggregate_const_len(func: &VerifiableFunction, op: &Operand)
     let (Operand::Copy(p) | Operand::Move(p)) = op else {
         return None;
     };
-    if !p.projections.is_empty() {
+    if !p.projections.is_empty() || crate::local_defs::is_parameter(func, p.local) {
         return None;
     }
     let Rvalue::Aggregate(AggregateKind::Adt { name, variant: 0, .. }, operands) =
@@ -372,7 +376,7 @@ pub(super) fn range_from_const_len(
     let (Operand::Copy(p) | Operand::Move(p)) = op else {
         return None;
     };
-    if !p.projections.is_empty() {
+    if !p.projections.is_empty() || crate::local_defs::is_parameter(func, p.local) {
         return None;
     }
     let Rvalue::Aggregate(AggregateKind::Adt { name, variant: 0, .. }, operands) =
@@ -412,6 +416,9 @@ pub(super) fn local_is_len_of(
     let (Operand::Copy(recv_place) | Operand::Move(recv_place)) = receiver else {
         return false;
     };
+    if crate::local_defs::is_parameter(func, len_local) {
+        return false;
+    }
     let inner_place = match crate::local_defs::unique_value_def(func, len_local) {
         Some(Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, inner)) => {
             if !matches!(crate::ptr_metadata_model(func, inner), crate::PtrMetadataModel::Length(_))
@@ -475,6 +482,9 @@ pub(super) fn range_bound_affine(
         return None;
     }
     // Bare local: a fn param/arg has no in-body def -> it IS the base (offset 0).
+    if crate::local_defs::is_parameter(func, p.local) {
+        return Some((Some(p.local), 0));
+    }
     let Some(def) = crate::local_defs::unique_value_def(func, p.local) else {
         return Some((Some(p.local), 0));
     };
@@ -498,6 +508,9 @@ pub(super) fn range_bound_from_binop_def(
     t: usize,
     fuel: u32,
 ) -> Option<(Option<usize>, i128)> {
+    if crate::local_defs::is_parameter(func, t) {
+        return None;
+    }
     match crate::local_defs::unique_value_def(func, t)? {
         Rvalue::CheckedBinaryOp(op @ (BinOp::Add | BinOp::Sub), a, b)
         | Rvalue::BinaryOp(op @ (BinOp::Add | BinOp::Sub), a, b) => {
@@ -553,6 +566,14 @@ pub(super) fn const_usize_operand(op: &Operand) -> Option<u64> {
 // Trust: recognize calls to the panic intrinsic family. Mirrors
 // `trust_ir_bridge`'s `is_panic_call`; kept in sync so the VC generator and the
 // TrustIr lowering agree on which calls are panic sites.
+//
+// A NAME test over the call's RENDERING, and NOT an identity
+// (PANIC-SKIP-ANCHOR-1, 2026-10-05): a user `fn panic` that returns normally and
+// every fn in a user module named `panicking` match it. It must never decide
+// alone. Its one consumer, `diverging_panic_entry_operands_unread`, takes it as
+// a NARROWING conjunct beside the extractor's DIVERGE-ENTRY-1 stamp and the
+// absence of a continuation, exactly as the bridge's diverging-site arm takes
+// `is_panic_call` beside the same stamp.
 pub(super) fn is_panic_intrinsic_call(callee: &str) -> bool {
     callee.contains("::panicking::")
         || callee.contains("begin_panic")
@@ -566,7 +587,7 @@ pub(super) fn is_panic_intrinsic_call(callee: &str) -> bool {
 
 pub(super) fn collect_aggregate_field_sort_unsupported(
     func: &VerifiableFunction,
-    context: String,
+    context: &dyn std::fmt::Display,
     span: &SourceSpan,
     place: &trust_types::Place,
     kind: &trust_types::AggregateKind,
@@ -614,7 +635,7 @@ pub(super) fn thread_local_ref_thin_address_ty(ty: &Ty) -> bool {
 
 pub(super) fn collect_rvalue_unsupported(
     func: &VerifiableFunction,
-    context: String,
+    context: &dyn std::fmt::Display,
     span: &SourceSpan,
     dest: &trust_types::Place,
     rvalue: &Rvalue,
@@ -622,7 +643,7 @@ pub(super) fn collect_rvalue_unsupported(
 ) {
     match rvalue {
         Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, op) => {
-            collect_operand_unsupported(func, context.clone(), span, op, vcs);
+            collect_operand_unsupported(func, context, span, op, vcs);
             // Slice/str fat pointers carry a modeled length. Pointers to sized
             // pointees (including arrays) are thin and carry unit metadata.
             // Dynamic-vtable and malformed metadata remain fail closed.
@@ -641,13 +662,13 @@ pub(super) fn collect_rvalue_unsupported(
             }
         }
         Rvalue::Use(op) | Rvalue::UnaryOp(_, op) => {
-            collect_operand_unsupported(func, context.clone(), span, op, vcs);
+            collect_operand_unsupported(func, context, span, op, vcs);
         }
         Rvalue::Cast(op, target_ty) => {
-            collect_operand_unsupported(func, context.clone(), span, op, vcs);
+            collect_operand_unsupported(func, context, span, op, vcs);
             collect_type_unsupported(
                 func,
-                format!("{context} cast target type"),
+                &format_args!("{context} cast target type"),
                 target_ty,
                 span,
                 vcs,
@@ -663,14 +684,41 @@ pub(super) fn collect_rvalue_unsupported(
                 ),
                 span.clone(),
             ));
-            collect_operand_unsupported(func, format!("{context} lhs"), span, lhs, vcs);
-            collect_operand_unsupported(func, format!("{context} rhs"), span, rhs, vcs);
+            collect_operand_unsupported(func, &format_args!("{context} lhs"), span, lhs, vcs);
+            collect_operand_unsupported(func, &format_args!("{context} rhs"), span, rhs, vcs);
+        }
+        // `unchecked_shl`/`unchecked_shr` (MIR `ShlUnchecked`/`ShrUnchecked`), now
+        // extracted as the modeled `UncheckedBinaryOp(Shl|Shr)` rather than an
+        // `Rvalue::Unsupported` marker so the trust-ir bridge can lower them exactly
+        // (identity shift plus the asserted amount-range precondition). THIS lane
+        // has no UB-class shift `VcKind` yet — `ShiftOverflow` answers
+        // `has_runtime_fallback` from `overflow_checks`, which an unchecked shift
+        // (LLVM `shl` with no branch) never has, the exact hazard
+        // `UncheckedArithmeticOverflow` exists to avoid — so it keeps the
+        // fail-closed row it always had, under the SAME kind the extractor's old
+        // marker carried: no verdict on this lane moves.
+        Rvalue::UncheckedBinaryOp(op @ (BinOp::Shl | BinOp::Shr), lhs, rhs) => {
+            let kind = if matches!(op, BinOp::Shl) {
+                "BinOp::ShlUnchecked"
+            } else {
+                "BinOp::ShrUnchecked"
+            };
+            vcs.push(unsupported_mir_vc(
+                func,
+                kind.to_string(),
+                format!(
+                    "{context}: an unchecked shift is UB when its amount is outside 0..BITS; the direct VC lane has no UB-class shift obligation kind yet (the trust-ir bridge charges it as an asserted precondition)"
+                ),
+                span.clone(),
+            ));
+            collect_operand_unsupported(func, &format_args!("{context} lhs"), span, lhs, vcs);
+            collect_operand_unsupported(func, &format_args!("{context} rhs"), span, rhs, vcs);
         }
         Rvalue::BinaryOp(_, lhs, rhs)
         | Rvalue::CheckedBinaryOp(_, lhs, rhs)
         | Rvalue::UncheckedBinaryOp(_, lhs, rhs) => {
-            collect_operand_unsupported(func, format!("{context} lhs"), span, lhs, vcs);
-            collect_operand_unsupported(func, format!("{context} rhs"), span, rhs, vcs);
+            collect_operand_unsupported(func, &format_args!("{context} lhs"), span, lhs, vcs);
+            collect_operand_unsupported(func, &format_args!("{context} rhs"), span, rhs, vcs);
         }
         Rvalue::Aggregate(kind, operands) => {
             if let Some((kind, detail)) = unsupported_aggregate_kind(func, kind, operands) {
@@ -684,7 +732,7 @@ pub(super) fn collect_rvalue_unsupported(
             if let trust_types::AggregateKind::RawPtr { pointee_ty, .. } = kind {
                 collect_type_unsupported(
                     func,
-                    format!("{context} raw pointer aggregate pointee"),
+                    &format_args!("{context} raw pointer aggregate pointee"),
                     pointee_ty,
                     span,
                     vcs,
@@ -735,7 +783,7 @@ pub(super) fn collect_rvalue_unsupported(
             }
             collect_operands_unsupported(
                 func,
-                format!("{context} unsupported operands"),
+                &format_args!("{context} unsupported operands"),
                 span,
                 operands,
                 vcs,
@@ -760,8 +808,8 @@ pub(super) fn collect_rvalue_unsupported(
                 ),
                 span.clone(),
             ));
-            collect_operand_unsupported(func, format!("{context} ptr"), span, ptr, vcs);
-            collect_operand_unsupported(func, format!("{context} count"), span, count, vcs);
+            collect_operand_unsupported(func, &format_args!("{context} ptr"), span, ptr, vcs);
+            collect_operand_unsupported(func, &format_args!("{context} count"), span, count, vcs);
         }
         _ => {}
     }
@@ -769,13 +817,13 @@ pub(super) fn collect_rvalue_unsupported(
 
 pub(super) fn collect_cast_relation_unsupported(
     func: &VerifiableFunction,
-    context: String,
+    context: &dyn std::fmt::Display,
     span: &SourceSpan,
     operand: &Operand,
     target_ty: &Ty,
     vcs: &mut Vec<VerificationCondition>,
 ) {
-    let Some(source_ty) = crate::operand_ty(func, operand) else {
+    let Some(source_ty) = crate::operand_ty_cow(func, operand) else {
         vcs.push(unsupported_mir_vc(
             func,
             "Rvalue::Cast".to_string(),
@@ -784,15 +832,19 @@ pub(super) fn collect_cast_relation_unsupported(
         ));
         return;
     };
+    let source_ty = source_ty.as_ref();
 
-    if matches!(&source_ty, Ty::Bool) && target_ty.is_integer() {
+    if matches!(source_ty, Ty::Bool) && target_ty.is_integer() {
         return;
     }
 
-    if crate::is_thin_pointer_identity_cast(&source_ty, target_ty)
-        || crate::is_fn_pointer_identity_cast(&source_ty, target_ty)
-        || crate::is_callable_reification_cast(&source_ty, target_ty)
-        || crate::is_array_to_slice_ref_cast(&source_ty, target_ty)
+    if crate::is_thin_pointer_identity_cast(source_ty, target_ty)
+        || crate::is_fn_pointer_identity_cast(source_ty, target_ty)
+        || crate::is_callable_reification_cast(source_ty, target_ty)
+        // Trust (G1): `fn as *const ()`, an opaque code address (a fresh value in
+        // every lane; see the predicate). Infallible, no obligation.
+        || crate::is_fn_pointer_to_code_address_cast(source_ty, target_ty)
+        || crate::is_array_to_slice_ref_cast(source_ty, target_ty)
         // An array→slice unsize whose source lost its `&[T;N]` type — a promoted
         // array constant (`let t: &[T] = &[a,b,c]`, lowered to OpaqueConst) or a
         // fat-pointer-element array. Metadata-only, no obligation; the slice length
@@ -809,7 +861,7 @@ pub(super) fn collect_cast_relation_unsupported(
         // float `as` casts are infallible (no panic obligation); the dest is left
         // unconstrained (no value-fact), so this is sound and stops one float cast
         // from poisoning the whole function's obligations into Unsupported.
-        || crate::is_float_numeric_cast(&source_ty, target_ty)
+        || crate::is_float_numeric_cast(source_ty, target_ty)
         // A pointer→integer cast (the `*const _ -> usize` address leg of the `vec!`/
         // box-machinery alignment & null checks; `convert.rs` already lowers it to
         // `Rvalue::Cast` and the bridge emits `CastOp::PtrToInt`). Exposing a pointer's
@@ -825,7 +877,30 @@ pub(super) fn collect_cast_relation_unsupported(
         // identity over the collapsed allocation model's address value
         // (`is_modeled_identity_cast`); fat/narrowing/signed/recover shapes
         // fail the predicate's guards and stay on the fail-closed arm below.
-        || crate::is_thin_pointer_address_expose_cast(&source_ty, target_ty)
+        || crate::is_thin_pointer_address_expose_cast(source_ty, target_ty)
+        // Trust (2026-09-12, -O print machinery): the casts std's `format_args!`
+        // emits when inlined into a caller at -Copt-level>=2. THIS LANE IS THE
+        // THIRD cast accept-list (with `chc.rs` and `checked_vcs.rs`), and the
+        // trait-object arm above records what happens when one of them lags: the
+        // coercion poisoned every function reaching it. Keep the three in step.
+        //   * a syntactic no-op, and the `&str -> &[u8]` byte view (`str` IS
+        //     `[u8]` plus a UTF-8 invariant this direction DROPS) — identities;
+        //   * `*const str -> *const u8`, a fat->thin metadata DROP, infallible
+        //     (direction-gated: thin->fat metadata FABRICATION stays refused);
+        //   * `usize -> NonNull<T>`, the fmt-packing transmute `convert.rs`
+        //     already admits (target must be a single-pointer NEWTYPE, so a bare
+        //     `usize -> *const T` provenance recover stays refused).
+        // None asserts a value, so no value-dependent obligation can be falsely
+        // proved; each merely stops one cast poisoning the whole function.
+        || crate::is_syntactic_identity_cast(source_ty, target_ty)
+        || crate::is_str_ref_to_byte_slice_ref_cast(source_ty, target_ty)
+        || crate::is_fat_to_thin_raw_ptr_cast(source_ty, target_ty)
+        || crate::is_ptr_width_int_to_pointer_newtype_transmute(source_ty, target_ty)
+        || crate::is_pointer_wrapper_to_raw_fat_ptr_cast(source_ty, target_ty)
+        // A cast between two inhabited zero-sized types (a ZST transmute
+        // the extractor admits) moves the unique inhabitant — an identity,
+        // in step with the other two cast accept-lists.
+        || crate::is_zst_to_zst_cast(source_ty, target_ty)
     {
         return;
     }
@@ -835,7 +910,7 @@ pub(super) fn collect_cast_relation_unsupported(
         "Rvalue::Cast".to_string(),
         format!(
             "{context}: unsupported cast {source_ty:?} -> {target_ty:?}: {}",
-            crate::unsupported_cast_reason(&source_ty, target_ty)
+            crate::unsupported_cast_reason(source_ty, target_ty)
         ),
         span.clone(),
     ));
@@ -901,6 +976,38 @@ pub(super) fn closure_aggregate_support_error(
     }
 
     for (index, (capture_ty, operand)) in captures.iter().zip(operands).enumerate() {
+        // A callable-item CONSTANT operand names the captured item by its
+        // extraction-vetted identity. Upstream move-elimination const-
+        // propagates a captured fn item into the aggregate as a constant
+        // (`{ g: add1 }`) where the pre-port MIR copied the fn-item local;
+        // vcgen types such constants `Ty::Unit` (opaque unit-sorted), so the
+        // type equality below can never see the `FnDef`/`Closure` the capture
+        // declares. Same kind + same def_path is the same item on both sides
+        // (both strings are rustc-rendered at extraction) — a syntactic
+        // consistency fact only; the value stays unit-sorted downstream and
+        // no solver fact is minted from the path.
+        let callable_identity_matches = match (capture_ty, operand) {
+            (
+                Ty::FnDef { name, .. },
+                Operand::Constant(trust_types::ConstValue::CallableItem {
+                    def_path,
+                    kind: trust_types::CallableKind::FnDef,
+                    ..
+                }),
+            ) => name == def_path,
+            (
+                Ty::Closure { name, .. },
+                Operand::Constant(trust_types::ConstValue::CallableItem {
+                    def_path,
+                    kind: trust_types::CallableKind::Closure,
+                    ..
+                }),
+            ) => name == def_path,
+            _ => false,
+        };
+        if callable_identity_matches {
+            continue;
+        }
         let Some(operand_ty) = crate::operand_ty_cow(func, operand) else {
             continue;
         };
@@ -917,45 +1024,59 @@ pub(super) fn closure_aggregate_support_error(
 
 pub(super) fn collect_operands_unsupported(
     func: &VerifiableFunction,
-    context: String,
+    context: &dyn std::fmt::Display,
     span: &SourceSpan,
     operands: &[Operand],
     vcs: &mut Vec<VerificationCondition>,
 ) {
     for (index, operand) in operands.iter().enumerate() {
-        collect_operand_unsupported(func, format!("{context}[{index}]"), span, operand, vcs);
+        collect_operand_unsupported(
+            func,
+            &format_args!("{context}[{index}]"),
+            span,
+            operand,
+            vcs,
+        );
     }
 }
 
 pub(super) fn collect_operand_unsupported(
     func: &VerifiableFunction,
-    context: String,
+    context: &dyn std::fmt::Display,
     span: &SourceSpan,
     operand: &Operand,
     vcs: &mut Vec<VerificationCondition>,
 ) {
     match operand {
-        Operand::Unsupported { kind, detail } => vcs.push(unsupported_mir_vc(
+        Operand::Constant(value) if value.contains_memory_image() => {
+            vcs.push(unsupported_mir_vc(
+                func,
+                crate::MEMORY_IMAGE_KIND.into(),
+                format!("{context}: {}", crate::MEMORY_IMAGE_DETAIL),
+                span.clone(),
+            ));
+        }
+        Operand::Unsupported { kind, detail, .. } => vcs.push(unsupported_mir_vc(
             func,
             kind.clone(),
             format!("{context}: {detail}"),
             span.clone(),
         )),
-        // `OpaqueScalar` deliberately carries only a type, not an occurrence
-        // identity. Formula conversion therefore cannot distinguish two
-        // same-typed occurrences. Letting any proof-bearing rvalue or
-        // terminator consume one could turn two independent runtime values into
-        // one solver symbol (for example, `MIN / -1` into `S / S`) and create a
-        // false proof. The unsupported collector is the common public-body
-        // boundary for every operand-bearing statement and terminator, so fail
-        // closed here until TrustIR carries stable occurrence identity.
-        // Identity-bearing `ConstParam` remains supported.
-        Operand::Constant(ConstValue::OpaqueScalar { width, signed }) => {
+        // `OpaqueScalar` is a value the model does not know: an unevaluated
+        // constant or a runtime value (an exposed address, transmuted bits).
+        // Since OPAQUE-SCALAR-ID-1 each occurrence renders to its own symbol
+        // (`ConstValue::opaque_scalar_smt_var_name`), so rows that consume it are
+        // sound, but whatever depends on its value stays unproved. This row
+        // discloses that gap at the common public-body boundary for every
+        // operand-bearing statement and terminator, which keeps the function
+        // from being reported fully verified. Identity-bearing `ConstParam`
+        // remains supported.
+        Operand::Constant(ConstValue::OpaqueScalar { width, signed, .. }) => {
             vcs.push(unsupported_mir_vc(
                 func,
                 "ConstValue::OpaqueScalar".to_string(),
                 format!(
-                    "{context}: identity-less opaque {sign}{width}-bit scalar cannot be used as proof input",
+                    "{context}: opaque {sign}{width}-bit scalar has no modeled value",
                     sign = if *signed { "signed " } else { "unsigned " },
                 ),
                 span.clone(),
@@ -969,7 +1090,7 @@ pub(super) fn collect_operand_unsupported(
         vcs.push(unsupported_mir_vc(
             func,
             rejection.unsupported_vc_kind().to_string(),
-            rejection.diagnostic(&context),
+            rejection.diagnostic(&context.to_string()),
             span.clone(),
         ));
     }

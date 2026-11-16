@@ -1,0 +1,1 @@
+ INFO rustc_mir_transform::trust_ir_flip trust-ir-flip: CTFE compiled from trust-ir, did=DefId(0:4 ~ trust_ir_flip_marker_gate_comptime_fn[HASH]::D), asserts=0, lineage=LINEAGE, flipped_so_far=1

@@ -1,7 +1,7 @@
 use crate::command_prelude::*;
 
-use cargo::ops;
-use cargo::util::print_available_packages;
+use targo::ops;
+use targo::util::print_available_packages;
 
 pub fn cli() -> Command {
     subcommand("pkgid")
@@ -25,6 +25,6 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
         .or_else(|| args.get_one::<String>("package"))
         .map(String::as_str);
     let spec = ops::pkgid(&ws, spec)?;
-    cargo::drop_println!(gctx, "{}", spec);
+    targo::drop_println!(gctx, "{}", spec);
     Ok(())
 }

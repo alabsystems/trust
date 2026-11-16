@@ -1,0 +1,53 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta12a_lean_bool_cmp",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (f344fb244 2026-09-21) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@7b9146ba2ab5 sha256:c9692ee58d31e864",
+  "clean": "first-party/clean@faf434b73aac sha256:a9d64ad7f7b7ccde",
+  "trust-cg": "first-party/trust-cg@3f79b19a3d7f sha256:f24a73c879facca4"
+ },
+ "ratchets": {
+  "a.lean.bool_cmp.carried": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_cmp.emit": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_cmp.exec": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_cmp.native": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_cmp.roundtrip": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was a text-PARSE refusal (roundtrip:text-parse:fn-name): the producer's entity names leave the bare-identifier alphabet (`m::dep_clamp`, `m::Pt<u8>`), and text had no spelling for them, so the module did not survive `bin -> text -> bin` at all. trust-ir now prints `@\"escaped\"` and `Parser::read_name` decodes it (WS4.3 identifier half), which closes the PARSE half. Reaching PASS also needed the TRANSPORT to stop canonicalizing: `trust-ir convert --to text` encoded through `format::canonical_checked`, which renumbers SSA values densely and reorders blocks before printing \u2014 a DECLARED rewrite that `text_losses` deliberately does not report, so a non-canonical module came back re-numbered with an EMPTY loss list. trust-ir bef296c7 adds `format::text_checked` (same refusal, module printed AS STORED) and points `convert` at it. MEASURED on this tree, as a control over the 24 producer-emitted modules this lane compiles: 10 of the 24 are NOT canonical, and `bin -> text -> bin` is byte-identical for 24/24 with `text_checked` but only 14/24 with canonicalize-first. So both halves were required and neither alone would have flipped this pin."
+  },
+  "a.lean.bool_cmp.twin.codec.trailing": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_cmp.twin.exec.mutant": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_cmp.twin.validate.site": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_cmp.twin.validate.vararg": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.bool_cmp.validate": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

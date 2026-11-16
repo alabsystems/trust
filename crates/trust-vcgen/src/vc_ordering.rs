@@ -73,8 +73,25 @@ impl SubsumptionGraph {
 /// A non-And formula is treated as a single-element set.
 fn collect_conjuncts(formula: &Formula) -> Vec<&Formula> {
     match formula {
-        Formula::And(terms) => terms.iter().flat_map(collect_conjuncts).collect(),
+        Formula::And(terms) => {
+            let mut out = Vec::with_capacity(terms.len());
+            for term in terms {
+                push_conjuncts(term, &mut out);
+            }
+            out
+        }
         other => vec![other],
+    }
+}
+
+fn push_conjuncts<'a>(formula: &'a Formula, out: &mut Vec<&'a Formula>) {
+    match formula {
+        Formula::And(terms) => {
+            for term in terms {
+                push_conjuncts(term, out);
+            }
+        }
+        other => out.push(other),
     }
 }
 
@@ -97,12 +114,22 @@ pub fn compare_formulas(a: &Formula, b: &Formula) -> VcStrength {
     // Extract conjuncts from both formulas.
     let conjuncts_a = collect_conjuncts(a);
     let conjuncts_b = collect_conjuncts(b);
+    compare_conjunct_slices(&conjuncts_a, &conjuncts_b)
+}
 
-    // Check subset relationships using Vec-based containment.
-    // Formula implements PartialEq + Eq but not Hash, so we use linear scans.
-    // This is acceptable because conjunct lists are typically small (<20).
-    let a_subset_b = conjuncts_a.iter().all(|ca| conjuncts_b.iter().any(|cb| ca == cb));
-    let b_subset_a = conjuncts_b.iter().all(|cb| conjuncts_a.iter().any(|ca| ca == cb));
+fn compare_conjunct_slices(conjuncts_a: &[&Formula], conjuncts_b: &[&Formula]) -> VcStrength {
+    let (a_subset_b, b_subset_a) = if conjuncts_a.len().saturating_mul(conjuncts_b.len()) > 32 {
+        let set_b: FxHashSet<&Formula> = conjuncts_b.iter().copied().collect();
+        let a_in_b = conjuncts_a.iter().all(|ca| set_b.contains(ca));
+        let set_a: FxHashSet<&Formula> = conjuncts_a.iter().copied().collect();
+        let b_in_a = conjuncts_b.iter().all(|cb| set_a.contains(cb));
+        (a_in_b, b_in_a)
+    } else {
+        (
+            conjuncts_a.iter().all(|ca| conjuncts_b.contains(ca)),
+            conjuncts_b.iter().all(|cb| conjuncts_a.contains(cb)),
+        )
+    };
 
     match (a_subset_b, b_subset_a) {
         // A's conjuncts == B's conjuncts: equivalent formulas.
@@ -132,23 +159,74 @@ pub fn compare_formulas(a: &Formula, b: &Formula) -> VcStrength {
 pub fn build_subsumption_graph(vcs: &[VerificationCondition]) -> SubsumptionGraph {
     let vc_count = vcs.len();
     let mut subsumes: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    if vc_count < 2 {
+        return SubsumptionGraph { vc_count, subsumes };
+    }
+
+    let conjuncts_per_vc: Vec<Option<(Vec<&Formula>, FxHashSet<&Formula>)>> = vcs
+        .iter()
+        .map(|vc| {
+            if matches!(vc.kind, VcKind::UnsupportedMir { .. }) {
+                None
+            } else {
+                let raw = collect_conjuncts(&vc.formula);
+                let mut set = FxHashSet::with_capacity_and_hasher(raw.len(), Default::default());
+                let mut unique = Vec::with_capacity(raw.len());
+                for c in raw {
+                    if set.insert(c) {
+                        unique.push(c);
+                    }
+                }
+                Some((unique, set))
+            }
+        })
+        .collect();
 
     for i in 0..vc_count {
-        for j in 0..vc_count {
-            if i == j {
+        let Some((unique_i, set_i)) = conjuncts_per_vc[i].as_ref() else {
+            continue;
+        };
+        for j in (i + 1)..vc_count {
+            let Some((unique_j, set_j)) = conjuncts_per_vc[j].as_ref() else {
                 continue;
-            }
-            if matches!(vcs[i].kind, VcKind::UnsupportedMir { .. })
-                || matches!(vcs[j].kind, VcKind::UnsupportedMir { .. })
-            {
-                continue;
-            }
-            let strength = compare_formulas(&vcs[i].formula, &vcs[j].formula);
+            };
+            let strength = match set_i.len().cmp(&set_j.len()) {
+                std::cmp::Ordering::Equal => {
+                    if vcs[i].formula == vcs[j].formula
+                        || unique_i.iter().all(|c| set_j.contains(c))
+                    {
+                        VcStrength::Equivalent
+                    } else {
+                        VcStrength::Incomparable
+                    }
+                }
+                std::cmp::Ordering::Less => {
+                    if unique_i.iter().all(|c| set_j.contains(c)) {
+                        VcStrength::Weaker
+                    } else {
+                        VcStrength::Incomparable
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    if unique_j.iter().all(|c| set_i.contains(c)) {
+                        VcStrength::Stronger
+                    } else {
+                        VcStrength::Incomparable
+                    }
+                }
+            };
             match strength {
-                VcStrength::Stronger | VcStrength::Equivalent => {
+                VcStrength::Stronger => {
                     subsumes.entry(i).or_default().push(j);
                 }
-                VcStrength::Weaker | VcStrength::Incomparable => {}
+                VcStrength::Weaker => {
+                    subsumes.entry(j).or_default().push(i);
+                }
+                VcStrength::Equivalent => {
+                    subsumes.entry(i).or_default().push(j);
+                    subsumes.entry(j).or_default().push(i);
+                }
+                VcStrength::Incomparable => {}
             }
         }
     }
@@ -165,6 +243,9 @@ pub fn build_subsumption_graph(vcs: &[VerificationCondition]) -> SubsumptionGrap
 /// to find all reachable (transitively subsumed) VCs.
 #[must_use]
 pub fn discharge_subsumed(graph: &SubsumptionGraph, proved_idx: usize) -> Vec<usize> {
+    if graph.subsumed_by(proved_idx).is_empty() {
+        return Vec::new();
+    }
     let mut discharged = Vec::new();
     let mut visited = FxHashSet::default();
     let mut stack = vec![proved_idx];

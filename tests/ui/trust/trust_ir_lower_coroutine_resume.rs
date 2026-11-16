@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // B5 stage 3a: the CALLER half of the coroutine frame protocol.
 // `let mut a = #[coroutine] || { .. yield .. };` mints a caller-owned frame
 // (`Alloca I64`, state seeded 0) ONLY under the whole-body witness — every

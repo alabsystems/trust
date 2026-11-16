@@ -1,0 +1,105 @@
+// INT-RAWCONST-HAVOC-1: a `&raw const` escape is a write channel.
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+// The lie: a SAFE atomic store through `&raw const x as *mut u8`.
+pub fn s2_const(k: u8) -> u8 {
+    let mut x: u8 = 5;
+    let p = &raw const x;
+    let a = unsafe { AtomicU8::from_ptr(p as *mut u8) };
+    a.store(k, Ordering::Relaxed);
+    x + 1
+}
+pub fn s2_mut(k: u8) -> u8 {
+    let mut x: u8 = 5;
+    let p = &raw mut x;
+    let a = unsafe { AtomicU8::from_ptr(p) };
+    a.store(k, Ordering::Relaxed);
+    x + 1
+}
+// The lie: a store through `&raw const x` cast to `*mut u8`.
+pub fn r1_const(k: u8) -> u8 {
+    let mut x: u8 = 5;
+    let p = &raw const x;
+    unsafe { *(p as *mut u8) = k; }
+    x + 1
+}
+pub fn r1_mut(k: u8) -> u8 {
+    let mut x: u8 = 5;
+    let p = &raw mut x;
+    unsafe { *p = k; }
+    x + 1
+}
+// The lie on a bounds row: the index local is written through `&raw const i`.
+pub fn ix_const(k: usize) -> u8 {
+    let a: [u8; 4] = [1, 2, 3, 4];
+    let mut i: usize = 1;
+    let p = &raw const i;
+    let at = unsafe { AtomicUsize::from_ptr(p as *mut usize) };
+    at.store(k, Ordering::Relaxed);
+    a[i]
+}
+pub fn ix_mut(k: usize) -> u8 {
+    let a: [u8; 4] = [1, 2, 3, 4];
+    let mut i: usize = 1;
+    let p = &raw mut i;
+    let at = unsafe { AtomicUsize::from_ptr(p) };
+    at.store(k, Ordering::Relaxed);
+    a[i]
+}
+// Precision control: a `&raw const` in a body with no call and no store anywhere.
+pub fn no_write(_k: u8) -> u8 {
+    let mut x: u8 = 5;
+    let _p = &raw const x;
+    x + 1
+}
+// Precision control: `b.buf.len()` and `b.buf[i]` read the slice length through the
+// extractor's fake-metadata borrow (`&raw const (*(*b).buf)`, read only by
+// `PtrMetadata`), which is not a write channel; a call between guard and index
+// must not cost the bounds proof.
+pub struct B<'a> {
+    pub buf: &'a [u8],
+}
+#[inline(never)]
+pub fn tick() {}
+pub fn field_slice_len(b: &B<'_>, i: usize) -> u8 {
+    if i < b.buf.len() {
+        tick();
+        b.buf[i]
+    } else {
+        0
+    }
+}
+// Precision control: the length is read through a fake-metadata borrow BEFORE the
+// call and again after it; the bounds row needs the two reads to name one length.
+pub fn field_len_then_call(b: &B<'_>, i: usize) -> u8 {
+    let n = b.buf.len();
+    tick();
+    if i < n { b.buf[i] } else { 0 }
+}
+// The cost, pinned: the address escapes into a call (exposed as an integer), and a
+// callee holding an exposed address may write `x` through it. No store is visible,
+// but the row must not be proved: this is the `&raw mut` rule, now applied to
+// `&raw const`.
+pub fn exposed_no_store(_k: u8) -> u8 {
+    let mut x: u8 = 5;
+    let p = &raw const x;
+    let _ = std::hint::black_box(p as usize);
+    x + 1
+}
+// The cost, pinned (wave-19 review, 2026-10-09): the havoc list is per FUNCTION, not
+// per program point, and does not follow the pointer. A `&raw const x` anywhere in
+// the body havocs `x` at EVERY call in it: a call BEFORE the borrow, whose `x + 1`
+// runs before any pointer exists, and a call the pointer never reaches. Both rows
+// were proved before INT-RAWCONST-HAVOC-1 and are true; `&raw mut` costs the same.
+pub fn call_before_borrow(_k: u8) -> u8 {
+    let mut x: u8 = 5;
+    tick();
+    let r = x + 1;
+    let _p = &raw const x;
+    r
+}
+pub fn unused_ptr_then_call(_k: u8) -> u8 {
+    let mut x: u8 = 5;
+    let _p = &raw const x;
+    tick();
+    x + 1
+}

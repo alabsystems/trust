@@ -13,14 +13,32 @@ use trust_types::*;
 
 const I32_MIN: i128 = -2147483648;
 
-fn negation_vc(formula: Formula) -> VerificationCondition {
+/// Trust: 2026-09-19 — the VC now carries the `ObligationRecord` trust-vcgen
+/// really emits, because the interval lane now binds the negation goal to
+/// `subject` rather than taking the first `Eq(_, type_min)` among the conjuncts.
+///
+/// That scan was a FALSE PROVE channel: a HYPOTHESIS can carry that shape, and in
+/// a function with more than one negation it routinely does — `if a >= lim { -a }`
+/// with `lim` folded to `i64::MIN` was proved from the OTHER negation's operand
+/// `_4 == 2^62` while ay refuted the row at `a == i64::MIN`
+/// (`interval_backend::tests::a_foreign_operands_min_comparison_is_not_this_rows_negation_goal`).
+/// Both negation emitters record the negated operand as `subject`, renamed at the
+/// same construction point the body is, so it is byte-identical to the operand's
+/// occurrence in `formula`; a VC built without one is not a shape vcgen produces,
+/// and an unauthenticated goal declines.
+fn negation_vc_for(formula: Formula, subject: Formula) -> VerificationCondition {
     VerificationCondition {
         kind: VcKind::NegationOverflow { ty: Ty::Int { width: 32, signed: true } },
         function: "neg".to_string().into(),
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
-        obligation: None,
+        obligation: Some(ObligationRecord {
+            body: Formula::Bool(true),
+            wrappers: Vec::new(),
+            subject: Some(subject),
+            width: Some(32),
+        }),
     }
 }
 
@@ -50,7 +68,7 @@ fn guarded_negation_assert_path_proves_via_interval() {
         eq(bv("is_min#s1_0"), eq(x.clone(), Formula::Int(I32_MIN))), // is_min := (x == MIN)
         bv("is_min#s1_0"),                                       // GOAL: assert is_min
     ]);
-    let vc = negation_vc(formula);
+    let vc = negation_vc_for(formula, x);
     assert!(
         IntervalBackend.can_handle(&vc),
         "guarded -x (assert path) must prove no negation overflow"
@@ -66,7 +84,7 @@ fn guarded_negation_raw_path_proves_via_interval() {
         gt(x.clone(), Formula::Int(I32_MIN)), // guard x > MIN
         eq(x.clone(), Formula::Int(I32_MIN)), // raw violation goal: x == MIN
     ]);
-    let vc = negation_vc(formula);
+    let vc = negation_vc_for(formula, x);
     assert!(
         IntervalBackend.can_handle(&vc),
         "guarded -x (raw path) must prove no negation overflow"
@@ -84,7 +102,7 @@ fn unguarded_negation_does_not_prove() {
         Formula::Le(Box::new(x.clone()), Box::new(Formula::Int(2147483647))),
         eq(x.clone(), Formula::Int(I32_MIN)), // violation goal: x == MIN
     ]);
-    let vc = negation_vc(formula);
+    let vc = negation_vc_for(formula, x);
     assert!(
         !IntervalBackend.can_handle(&vc),
         "unguarded -x CAN overflow at i32::MIN; must not prove"

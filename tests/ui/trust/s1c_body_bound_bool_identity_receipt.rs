@@ -3,9 +3,14 @@
 //@ compile-flags: --crate-type=lib
 //@ dont-check-compiler-stderr
 //@ check-pass
-//! Retired-TrustWP regression control: this Bool identity is proved through the
-//! active TrustMC/body-aware VC and Clean-kernel authority. No TrustWP request,
-//! carrier, receipt, or private authority variant exists in the compiler.
+//! Regression control for the Bool identity postcondition. The retired TrustWP
+//! receipt/carrier lane stays gone. Since dcf68b84b9f the router may discharge a
+//! postcondition through native trust-wp as the designated deductive ALTERNATIVE to
+//! trust-mc, and 573e62daa69 admits this fresh-Bool body. That evidence carries the
+//! unique trust-wp request's lineage, which the compiler's strict-acceptance check
+//! accepts only for that alternative. Before it did, this file reported a
+//! self-contradictory "not fully verified" advisory for a row the router had
+//! accepted as proved.
 //!
 //! The strict build USED TO still fail on separate fresh rows that remained
 //! Unknown, and this fixture was `check-fail` to pin exactly that. It no longer

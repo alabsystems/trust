@@ -554,3 +554,47 @@ fn a_disjunction_wider_than_the_cap_declines() {
     let paths = (0..64).map(|i| contradictory_path(&format!("_{i}"), 2)).collect();
     assert!(certified(&a3d_shaped(paths)), "a 64-path disjunction is inside the cap");
 }
+
+// ---------------------------------------------------------------------------
+// Trust (2026-09-27, class `v-refuted-unreachable`): a path closed by a UNIT.
+// ---------------------------------------------------------------------------
+
+/// The re-read shape of a tuple `match`: the generator renders a subset switch's
+/// scrutinee through the earlier read of the same field it is tied to, so the path
+/// through that switch's `otherwise` edge carries `_7 = 1` (the edge that tested
+/// the field) and `¬(_7 = 1)` (the subset switch) — a contradiction between a
+/// positive UNIT and its own negation, with no membership `Or` it could resolve.
+/// `membership_witnesses` now reads that as the one-disjunct membership `Or([P])`.
+#[test]
+fn a_path_closed_by_a_unit_and_its_negation_certifies() {
+    let unit_path = Formula::And(vec![
+        eq("_7", 1),
+        eq("_9", 1),
+        neq("_7", 1),
+        member("_7", &[0, 1]),
+        member("_9", &[0, 1]),
+    ]);
+    assert!(
+        certified(&a3d_shaped(vec![contradictory_path("_6", 3), unit_path])),
+        "a path closed by `_7 = 1 ∧ ¬(_7 = 1)` did not certify"
+    );
+}
+
+/// ADVERSARIAL twins of the unit rule. Each disjunction below has a SATISFIABLE path,
+/// so certifying it would be a false proof of unreachability.
+#[test]
+fn a_unit_without_its_own_negation_declines() {
+    // The unit's negation is about ANOTHER tag: `_7 = 1` satisfies the path.
+    let sat_path = Formula::And(vec![eq("_7", 1), neq("_7", 0), member("_7", &[0, 1])]);
+    assert!(
+        !certified(&a3d_shaped(vec![contradictory_path("_6", 3), sat_path])),
+        "a unit paired with a negation of a different atom closed its path"
+    );
+    // The unit's negation sits on a SIBLING path only: the first path is `_7 = 1`.
+    let holds_the_unit = Formula::And(vec![eq("_7", 1), member("_7", &[0, 1])]);
+    let holds_the_negation = Formula::And(vec![neq("_7", 1), neq("_7", 0), member("_7", &[0, 1])]);
+    assert!(
+        !certified(&a3d_shaped(vec![holds_the_unit, holds_the_negation])),
+        "a unit was closed by a negation borrowed from a sibling path"
+    );
+}

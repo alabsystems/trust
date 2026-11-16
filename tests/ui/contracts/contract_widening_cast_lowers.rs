@@ -3,6 +3,7 @@
 //@ check-fail
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: ERROR
+//@ dont-require-annotations: NOTE
 //@ proc-macro: trust.rs
 //@ edition: 2021
 //! Trust D3 (cast half), pointer-sized lane. `u32::MAX as usize` is the real
@@ -24,6 +25,18 @@
 //! WHAT THIS ASSERTS IS THE OBLIGATION. Each precondition is assumed only if
 //! the clause lowered, so each body assert discharges only on that condition,
 //! and `off_by_one` — one tighter than its precondition — must stay REFUTED.
+//!
+//! `main`'s PINS RE-MEASURED 2026-09-16. It carried two WARN annotations —
+//! `Trust Level 0 safety verification incomplete` and `Trust verification
+//! advisory` — recording that the harness body itself had an unproved row. It
+//! does not any more: `main` now reports `1 proved, 0 failed, 0 unknown, 0 timed
+//! out, 0 runtime-checked out of 1 obligation(s)` and emits no warning at all.
+//!
+//! The pins are REPLACED by that line rather than deleted. `main` exists here
+//! only to instantiate the functions above, so a silent `main` is indistinguishable
+//! from a `main` that was never verified; pinning the count keeps the harness
+//! itself measured. Every ERROR this file is actually about is unchanged and
+//! still covered by `dont-require-annotations: ERROR`.
 
 
 // ay's real contract: u32 -> usize, value-preserving on a 64-bit target.
@@ -54,8 +67,7 @@ pub fn unsigned_to_wider_signed(b: u8) -> u8 {
     b
 }
 
-fn main() { //~ WARN Trust Level 0 safety verification incomplete
-    //~| WARN Trust verification advisory
+fn main() { //~ NOTE Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
     let _ = from_index(0);
     let _ = off_by_one(0);
     let _ = pointer_sized_to_fixed(0);

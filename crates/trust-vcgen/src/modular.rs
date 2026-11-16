@@ -110,6 +110,9 @@ pub struct FunctionSummary {
     /// preconditioned summary's clause would be assumed UNCONDITIONALLY, which
     /// is a false PROVE whenever the caller is out of the callee's contract.
     postconditions_guarded_by_own_preconditions: bool,
+    /// Sealed typed entry channels of one checked body-derived enum clause.
+    /// Arbitrary/authored postconditions never receive this authorization.
+    body_inferred_entry_bindings: Option<crate::generate::EntryBindings>,
 }
 
 impl FunctionSummary {
@@ -129,6 +132,7 @@ impl FunctionSummary {
             proof_strength: None,
             postconditions_are_definitional: false,
             postconditions_guarded_by_own_preconditions: false,
+            body_inferred_entry_bindings: None,
         }
     }
 
@@ -285,6 +289,52 @@ impl FunctionSummary {
         self.postconditions_are_definitional = pure;
         self.postconditions_guarded_by_own_preconditions = true;
         self
+    }
+
+    /// Trust (D5-B): attach a BODY-INFERRED return equality `_0 == E(params)`
+    /// ([`crate::infer_return_candidate`]) as a reusable, call-site-assumed
+    /// postcondition, with the candidate's own positional formal names.
+    ///
+    /// # The authority contract, which the caller asserts by calling this
+    ///
+    /// Same reuse bit, and so the same consequence, as
+    /// [`Self::with_definitional_postcondition`]: the clause is rebound
+    /// (formals→actuals, `_0`→dest), version-pinned to the dest's post-call SSA
+    /// token and conjoined onto the caller's VCs. The caller of this builder
+    /// asserts ALL of:
+    ///
+    ///  * EVERY row of `inferred.check_vcs()` was certified by the Clean CIC
+    ///    kernel in THIS compilation (a zero-trust UNSAT of `defs ∧ ¬(_0 == E)`
+    ///    over the callee's own body with every entry hypothesis cleared) — the
+    ///    synthesizer is untrusted, and an uncertified candidate is a guess;
+    ///  * the summary's NAME resolves, at the call sites it will be consulted
+    ///    for, to exactly the callee identity whose body `inferred` was
+    ///    synthesized from (local, identity instantiation, the sole owner of the
+    ///    name in the caller body).
+    ///
+    /// # Never mixed with an authored contract
+    ///
+    /// An inferred clause must never share a summary with an authored `ensures`
+    /// or `requires`: the reuse bit is shared by every clause on a summary, and
+    /// the `contract_skip_ensures_launder` shape is exactly an unproven authored
+    /// clause riding on someone else's authority. So this builder REFUSES (returns
+    /// the summary unchanged) unless the summary carries no precondition and no
+    /// postcondition yet, and any later `with_postcondition` strips the reuse bit
+    /// as it does for every other builder.
+    #[must_use]
+    pub fn with_body_inferred_return(mut self, inferred: &crate::InferredReturn) -> Self {
+        if !self.preconditions.is_empty() || !self.postconditions.is_empty() {
+            return self;
+        }
+        self.param_names = inferred.param_names().to_vec();
+        self.body_inferred_entry_bindings = inferred.entry_bindings().cloned();
+        self.postconditions.push(inferred.postcondition().clone());
+        self.postconditions_are_definitional = true;
+        self
+    }
+
+    pub(crate) fn inferred_entry_bindings(&self) -> Option<&crate::generate::EntryBindings> {
+        self.body_inferred_entry_bindings.as_ref()
     }
 
     /// Trust (postcondition composition, slice 2): whether this summary's
@@ -485,11 +535,11 @@ pub fn clean_origin_wrapping_binop_postconditions(
     // Mirror it exactly — the parity pin covers these clauses too. Each fact is
     // definitional: a `u{width}`-typed value is in `[0, 2^width - 1]` in every
     // execution, and a rebindable free var (the formal) or no free var at all.
-    let ranges = [
+    Some(vec![
+        def,
         crate::range::input_range_constraint(&x, width, false),
         crate::range::input_range_constraint(&y, width, false),
-    ];
-    Some(std::iter::once(def).chain(ranges).collect())
+    ])
 }
 
 /// Trust (Clean-origin caller-side preconditions): the call-site obligations a
@@ -651,6 +701,137 @@ pub fn clean_origin_summary(
     Some(summary)
 }
 
+/// Trust (Clean-origin definitional grounding in the ASSERT-REFUTATION lane):
+/// the refute-lane carrier of a Clean-origin callee's DEFINITIONAL summary,
+/// keyed at the consumer by the call's sealed [`trust_types::CalleeIdentity`]
+/// — never by the rendered callee name.
+///
+/// # Why the refutation lane needs its own carrier
+///
+/// `generate::assert_refutation` consumes SAT as a REAL counterexample and
+/// UNSAT as a REAL proof, so every value it leaves free must be an
+/// unconstrained function input and every computed value must carry an EXACT
+/// definition (see `v2_input_free_locals` and the `3d1446f4c7` /
+/// `e6fae3f5be` requisition recorded there). A `Terminator::Call` destination
+/// is neither: without a callee model its value is opaque and the assert that
+/// reads it is declined as ungrounded (measured 2026-09-13 on `let v =
+/// m::pick(41, 7); assert!(v == 41)`: `[ASSERT_REFUTE] grounded=false
+/// free=["_2#s1_0"]`, the whole-function panic-freedom aggregate stays
+/// UNKNOWN, and the assert's `core::panicking::panic` edge blocks the
+/// interprocedural call gate).
+///
+/// The VC lane already has the exact fact: the compiler's Clean-origin lane
+/// mints `_0 == arg_i` / the single-`Ite` wrapping reduction from the
+/// kernel-gated plan of record (`trust_verify::clean_origin_callee_summary`
+/// -> [`clean_origin_summary`] -> [`FunctionSummary::with_definitional_postcondition`]),
+/// and `build_semantic_guard_map_with_summaries` conjoins it at the call site.
+/// This type carries THAT summary — and only that kind of summary — into the
+/// refutation lane.
+///
+/// # What is admitted, and why each refusal is required in THIS lane
+///
+/// [`Self::from_clean_origin_summary`] returns `None` unless the summary is a
+/// PURE definitional summary:
+///
+///  * `has_reusable_postcondition_evidence()` — every clause arrived through
+///    `with_definitional_postcondition`; a plain `with_postcondition` clause
+///    (an authored contract, PARSED and not necessarily proved) clears the bit
+///    permanently and is refused here exactly as the VC lane refuses to assume
+///    it. **This is the boundary the task names: an ordinary contract
+///    postcondition is a caller-ASSUMED fact, not a definition.**
+///  * NOT `postconditions_guarded_by_own_preconditions()` — a
+///    `with_verified_callee_postcondition` clause is a PROVED `ensures`, which
+///    is true of the callee's result but need not DETERMINE it. In the VC lane
+///    (UNSAT-only) a true-but-partial fact is harmless. In the refutation lane
+///    it is a false REFUTATION waiting to happen: `ensures result <= 100` lets
+///    SAT pick `result = 3` where the callee returns 7. So only a clause set
+///    that restates the callee's COMPLETE value semantics is admissible, and
+///    the definitional bit is the only bit whose authority contract says that
+///    ("restates … the exact semantics of a callee body").
+///  * NO preconditions — the same discipline as
+///    `SummaryDatabase::definitional_precondition_free_subset` (the L0 VC
+///    lane): a value fact is never published without its guard, and this lane
+///    has no way to render the guard. Empty for every plan today (see
+///    `clean_origin_summary`), so this is refuse-not-trust.
+///  * NO `result_range` / `extracted_body` — a Clean-origin summary carries
+///    neither ("the summary carries NO extracted body, contract, or float
+///    range"); their presence means this is some other producer's summary.
+///
+/// Structural exactness is re-checked at the CONSUMER after rebinding
+/// (`assert_refutation::clean_origin_definitional_call_models`): the rebound
+/// clause set must contain exactly ONE `dest == rhs` definition whose `rhs`
+/// does not mention `dest`, so the destination is functionally determined by
+/// the actuals; anything else refuses the model.
+///
+/// # Identity
+///
+/// The carrier holds the rendered callee `name` only as a BELT: the map this
+/// value lives in (`CalleeSummaryContext::clean_origin_definitional_models`)
+/// is keyed by [`trust_types::CalleeIdentity`], the `DefId` + region-erased
+/// substs fingerprint the extractor seals onto every direct-`FnDef`
+/// `Terminator::Call`, and the consumer looks the call's OWN
+/// `callee_identity` up in it. An absent identity admits nothing — never a
+/// fall-back to comparing strings (`CalleeIdentity`'s own rule). The name is
+/// additionally required to equal the terminator's `func` string, so a model
+/// minted under one spelling can never be consumed under another.
+///
+/// The fields are private and the only constructor takes a
+/// [`FunctionSummary`], so the authority argument is the summary's, unchanged:
+/// whoever called `with_definitional_postcondition` asserted the clause is
+/// definitionally true of the emitted body, and this type adds no claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanOriginDefinitionalCallModel {
+    name: String,
+    param_names: Vec<String>,
+    postconditions: Vec<Formula>,
+}
+
+impl CleanOriginDefinitionalCallModel {
+    /// The refute-lane carrier of `summary`, or `None` unless `summary` is a
+    /// PURE definitional summary — see the type doc for each conjunct.
+    #[must_use]
+    pub fn from_clean_origin_summary(summary: &FunctionSummary) -> Option<Self> {
+        if !summary.has_reusable_postcondition_evidence()
+            || summary.postconditions_guarded_by_own_preconditions()
+            || !summary.preconditions.is_empty()
+            || summary.result_range.is_some()
+            || summary.extracted_body.is_some()
+        {
+            return None;
+        }
+        Some(Self {
+            name: summary.name.clone(),
+            param_names: summary.param_names.clone(),
+            postconditions: summary.postconditions.clone(),
+        })
+    }
+
+    /// The rendered callee name this model was minted for (a belt on top of
+    /// the identity key, see the type doc).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Rebuild the definitional [`FunctionSummary`] this carrier was made from,
+    /// so the refutation lane rebinds it through the PRODUCTION injection path
+    /// (`callee_postcondition_is_injectable` + `rebind_callee_postconditions`)
+    /// and the two lanes cannot encode one call two ways.
+    ///
+    /// Crate-private: re-minting the definitional bit is exactly what a
+    /// public constructor must not offer, and the only summaries that reach
+    /// here came through [`Self::from_clean_origin_summary`], which required
+    /// the bit in the first place.
+    pub(crate) fn to_definitional_summary(&self) -> FunctionSummary {
+        let mut summary =
+            FunctionSummary::new(self.name.clone()).with_param_names(self.param_names.clone());
+        for post in &self.postconditions {
+            summary = summary.with_definitional_postcondition(post.clone());
+        }
+        summary
+    }
+}
+
 /// Trust: Database of function summaries for modular verification.
 ///
 /// Stores and retrieves function summaries keyed by `FunctionSummary::name`.
@@ -679,13 +860,24 @@ pub fn clean_origin_summary(
 /// mint loop decides who owns a contested key. See
 /// `generate/summary_key_collision_tests.rs` for what that means at the
 /// injection site.
+static NEXT_SUMMARY_DB_REVISION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_summary_db_revision() -> u64 {
+    NEXT_SUMMARY_DB_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SummaryDatabase {
     summaries: FxHashMap<String, FunctionSummary>,
+    /// Number of entries in `summaries` with `!summary.preconditions.is_empty()`.
+    preconditioned_summary_count: usize,
     /// PRIVATE (I5 cross-authority call modeling, L0 lane): callee name →
     /// precondition count for every summary that [`Self::
     /// definitional_precondition_free_subset`] REFUSED to carry into this DB
-    /// *because it declares preconditions*.
+    /// *and that declares preconditions* — a definitional one refused for its
+    /// guard, and (since 2026-10-03) an ordinary contracted one, whose
+    /// `requires` its callee's verification assumed at entry.
     ///
     /// Only that constructor ever writes this map; `new`/`insert` leave it
     /// empty, so an ordinary DB (the L1 lane, every test DB, every producer)
@@ -696,6 +888,14 @@ pub struct SummaryDatabase {
     /// precondition. A withheld name makes the call sites emit a fail-closed
     /// `UnsupportedMir` row instead (`l0_withheld_summary_vc`).
     l0_withheld_preconditioned: FxHashMap<String, usize>,
+    /// Monotonic revision counter (`0` when empty; bumped on every mutation)
+    /// used to key per-function analysis caches that depend on this DB.
+    revision: u64,
+    /// Lazily-derived callee write-set map for this DB, shared across all caller
+    /// functions verified against it and cleared on [`Self::insert`].
+    callee_write_sets: std::sync::OnceLock<
+        std::sync::Arc<FxHashMap<String, crate::generate::callee_write_set::CalleeWriteSet>>,
+    >,
 }
 
 impl SummaryDatabase {
@@ -707,7 +907,34 @@ impl SummaryDatabase {
 
     /// Insert or replace a function summary.
     pub fn insert(&mut self, summary: FunctionSummary) {
-        self.summaries.insert(summary.name.clone(), summary);
+        let new_has_pre = !summary.preconditions.is_empty();
+        if let Some(old) = self.summaries.insert(summary.name.clone(), summary)
+            && !old.preconditions.is_empty()
+        {
+            self.preconditioned_summary_count -= 1;
+        }
+        if new_has_pre {
+            self.preconditioned_summary_count += 1;
+        }
+        self.revision = next_summary_db_revision();
+        self.callee_write_sets = std::sync::OnceLock::new();
+    }
+
+    pub(crate) fn has_any_preconditions_or_withheld(&self) -> bool {
+        self.preconditioned_summary_count > 0 || !self.l0_withheld_preconditioned.is_empty()
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn callee_write_sets(
+        &self,
+    ) -> &std::sync::Arc<FxHashMap<String, crate::generate::callee_write_set::CalleeWriteSet>> {
+        self.callee_write_sets.get_or_init(|| {
+            let _unmetered = crate::gen_work_scope_unmetered();
+            std::sync::Arc::new(crate::generate::callee_write_set::build_callee_write_sets(self))
+        })
     }
 
     /// Look up a summary by function name.
@@ -727,12 +954,56 @@ impl SummaryDatabase {
         self.summaries.keys().map(String::as_str)
     }
 
+    /// Iterate `(name, summary)` pairs without re-hashing each key.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &FunctionSummary)> {
+        self.summaries.iter().map(|(name, summary)| (name.as_str(), summary))
+    }
+
+    /// The names whose summary could inject a postcondition fact about a call's
+    /// destination at SOME call site
+    /// ([`crate::generate::summary_may_inject_postcondition`], the injector's own
+    /// site-independent test). A callee merely present in the DB is not one.
+    ///
+    /// Injecting is NOT pinning: the D5-A call-destination screen asks
+    /// [`Self::postcondition_pinning_callees`] (2026-09-28).
+    pub fn postcondition_injecting_names(&self) -> impl Iterator<Item = &str> {
+        self.summaries
+            .iter()
+            .filter(|(_, summary)| crate::generate::summary_may_inject_postcondition(summary))
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// The callees whose injected postcondition DETERMINES a call's
+    /// destination ([`crate::generate::summary_pins_result`]: an unguarded,
+    /// precondition-free `_0 == E(formals)`), each with its formal count — all
+    /// the call-site half of the injector's gate
+    /// ([`crate::generate::callee_postcondition_site_admits`]) needs from the
+    /// summary. The D5-A screen leaves such a destination to the solver only at
+    /// a site where that half admits it too.
+    pub fn postcondition_pinning_callees(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.summaries
+            .iter()
+            .filter(|(_, summary)| crate::generate::summary_pins_result(summary))
+            .map(|(name, summary)| (name.as_str(), summary.param_names.len()))
+    }
+
+    pub(crate) fn postcondition_pinning_entry_bindings(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::generate::EntryBindings)> {
+        self.summaries
+            .iter()
+            .filter(|(_, summary)| crate::generate::summary_pins_result(summary))
+            .filter_map(|(name, summary)| {
+                summary.inferred_entry_bindings().map(|binding| (name.as_str(), binding))
+            })
+    }
+
     /// Returns true when this DB carries NOTHING a caller lane must act on.
     ///
     /// A DB holding only WITHHELD names (`l0_withheld_preconditioned`) is NOT
     /// empty: its call sites still owe the fail-closed row below. Consumers
-    /// use `is_empty()` as an "adds nothing to any caller VC" early-out (the
-    /// compiler's VC-artifact cache key, `build_callee_write_sets`), and
+    /// use `is_empty()` as an "adds nothing to any caller VC" early-out
+    /// (`build_callee_write_sets` does), and
     /// answering `true` there would skip generation of exactly the rows this
     /// field exists to guarantee.
     #[must_use]
@@ -754,6 +1025,58 @@ impl SummaryDatabase {
     /// Iterate the withheld callee names (diagnostics).
     pub fn l0_withheld_names(&self) -> impl Iterator<Item = &str> {
         self.l0_withheld_preconditioned.keys().map(String::as_str)
+    }
+
+    /// Trust (2026-10-03, level-0 charges): whether `caller`, verified against
+    /// this DB, owes a call-site `Precondition` row — one of the caller's OWN
+    /// `Call`/`TailCall` terminators names a summary that declares a
+    /// precondition, or a name a withholding is recorded for.
+    ///
+    /// A callee's `requires` is ASSUMED at its entry (the
+    /// `DefinitionEntryAssumption` row), and the checks its verification proves
+    /// under that assumption are elided; the clause moves to every call site as
+    /// a `VcKind::Precondition` row, which is `L1Functional`. So a caller that
+    /// owes one must be verified at `L1Functional` or above, whatever level was
+    /// configured: below it the level filter drops the row, and a call outside
+    /// the callee's `requires` runs the callee with its checks gone (the
+    /// compiler's `effective_max_level` lifts on this bit). It reads the FULL
+    /// DB the caller would verify against at `L1Functional`, before any level
+    /// subset is taken. A precondition Trust DERIVES for a contract-less std
+    /// callee (the `step_by` constructor, a bundled member's entry div/rem) is
+    /// such a row too, and lifts the same way (docs/DECISION_QUEUE.md, L0-REQ).
+    ///
+    /// Why the caller's own calls, and not every summary (review of the fix,
+    /// 2026-10-03): the compiler's DB is not only the caller's direct callees.
+    /// The transitive-trace closure registers the summaries of the callees OF an
+    /// attached callee body (with their authored `requires`) so the float
+    /// tracer can re-trace through them, and no call-site row is ever minted
+    /// for a name the caller does not call. Asked over the whole DB, the bit
+    /// lifted a level-0 caller that owes nothing — measured on the stage 1 of
+    /// `6011b74bad`: `p(b: bool) { if b { p(b) } else { w(3) } }`, with `w`
+    /// calling a `requires` function under its guard, got the level-1
+    /// termination charge at `-Ztrust-verify-level=0`, and under memory-safe a
+    /// body calling only `w` was newly refused. The lookup here is the one
+    /// every call-site producer makes (`generate_callsite_precondition_vcs`,
+    /// its attributed twin, `modular_vcgen`): by the terminator's `func` name.
+    #[must_use]
+    pub fn owes_caller_preconditions(&self, caller: &VerifiableFunction) -> bool {
+        if !self.has_any_preconditions_or_withheld() {
+            return false;
+        }
+        if crate::generate::cached_terminator_presence_for_body(&caller.body)
+            .is_some_and(|tp| !tp.has_call && !tp.has_tail_call)
+        {
+            return false;
+        }
+        caller.body.blocks.iter().any(|block| match &block.terminator {
+            Terminator::Call { func, .. } | Terminator::TailCall { func, .. } => {
+                match self.get(func) {
+                    Some(summary) => !summary.preconditions.is_empty(),
+                    None => self.l0_withheld_precondition_count(func).is_some(),
+                }
+            }
+            _ => false,
+        })
     }
 
     /// Trust (I5 cross-authority call modeling): the subset of summaries that
@@ -796,12 +1119,28 @@ impl SummaryDatabase {
     /// `L1Functional`, where the postcondition assumption and its
     /// `VcKind::Precondition` check survive the level filter together).
     ///
-    /// A summary WITHOUT definitional authority is not recorded, on purpose.
-    /// Those never rode the L0 lane in the first place — an ordinary
-    /// `#[requires]` is an L1 obligation checked on the L1 lane, and minting
-    /// an unknown for every L0 call to a contracted callee would be plain
-    /// over-rejection, not a soundness gain. The recorded set is exactly the
-    /// summaries that L0 WOULD have used but for their guard.
+    /// # An ORDINARY contracted summary is recorded too (2026-10-03)
+    ///
+    /// A summary WITHOUT definitional authority used to be dropped unrecorded,
+    /// on the reasoning that an ordinary `requires` "never rode the L0 lane"
+    /// and that recording it would be over-rejection. That was wrong. The
+    /// callee's own verification ASSUMES its `requires` at entry and elides the
+    /// checks it proves under it (`x + 1` under `requires x < 100`), so a call
+    /// that nothing charges runs the callee outside its clause with those checks
+    /// gone: MEASURED on stage 1 of `782780ea0d`, `p() { add1(u32::MAX) }`
+    /// verified at `-Ztrust-verify-level=0` under certify built exit 0 and
+    /// returned `0` (docs/KNOWN_HAZARDS.md, "at `-Ztrust-verify-level=0` a direct
+    /// call was charged nothing for its callee's `requires`"). The compiler now
+    /// lifts every caller that owes a callee `requires` to `L1Functional`
+    /// ([`Self::owes_caller_preconditions`]), so it never takes this subset for
+    /// one. The subset records EVERY preconditioned summary it does not carry,
+    /// definitional or not, so that a level-0 path that does reach it still
+    /// meets the fail-closed row at each call, never silence.
+    ///
+    /// Not covered here: a GUARDED preconditioned summary (the section below)
+    /// rides the subset, so its call sites mint the ordinary `Precondition` row,
+    /// which an `L0Safety` filter drops. The compiler's lift is what charges
+    /// those calls.
     ///
     /// NOTE (level inversion, unresolved and deliberately not decided here):
     /// `VcKind::Precondition` is hardcoded `L1Functional` while the hazard a
@@ -836,19 +1175,25 @@ impl SummaryDatabase {
     #[must_use]
     pub fn definitional_precondition_free_subset(&self) -> SummaryDatabase {
         let mut subset = SummaryDatabase::new();
-        for summary in self.summaries.values() {
-            if !summary.has_reusable_postcondition_evidence() {
-                continue;
-            }
-            if summary.preconditions.is_empty()
-                || crate::generate::summary_postconditions_ride_with_their_guard(summary)
-            {
-                subset.insert(summary.clone());
-            } else {
+        for (name, summary) in &self.summaries {
+            let rides_l0 = summary.has_reusable_postcondition_evidence()
+                && (summary.preconditions.is_empty()
+                    || crate::generate::summary_postconditions_ride_with_their_guard(summary));
+            if rides_l0 {
+                if !summary.preconditions.is_empty() {
+                    subset.preconditioned_summary_count += 1;
+                }
+                subset.summaries.insert(name.clone(), summary.clone());
+            } else if !summary.preconditions.is_empty() {
+                // Trust (2026-10-03): definitional OR ordinary — every call to it
+                // owes the `requires` its callee assumed at entry.
                 subset
                     .l0_withheld_preconditioned
-                    .insert(summary.name.clone(), summary.preconditions.len());
+                    .insert(name.clone(), summary.preconditions.len());
             }
+        }
+        if !subset.is_empty() {
+            subset.revision = next_summary_db_revision();
         }
         subset
     }
@@ -865,9 +1210,9 @@ impl SummaryDatabase {
 }
 
 /// Trust (I5, L0 lane): the ONE spelling of the fail-closed row a call site
-/// owes when its callee's definitional summary was withheld from the L0 DB
-/// because it declares preconditions
-/// (`SummaryDatabase::definitional_precondition_free_subset`).
+/// owes when its callee's summary was withheld from the L0 DB and declares
+/// preconditions — a definitional one, or (since 2026-10-03) an ordinary
+/// contracted one (`SummaryDatabase::definitional_precondition_free_subset`).
 ///
 /// `UnsupportedMir` (an `L0Safety` kind, so it SURVIVES
 /// `filter_vcs_by_level(_, L0Safety)` — a `VcKind::Precondition` row would
@@ -892,13 +1237,14 @@ pub(crate) fn l0_withheld_summary_vc(
         kind: VcKind::UnsupportedMir {
             kind: "L0WithheldPreconditionedSummary".to_string(),
             detail: format!(
-                "callee `{callee_name}` has a definitional summary carrying \
-                 {preconditions} precondition(s), which cannot be checked at \
-                 L0Safety (`VcKind::Precondition` is L1Functional and is filtered \
-                 out), so neither its value fact nor its guard is applied here; \
-                 options: verify this function at L1Functional or above (a \
-                 contracted caller already is), or give the callee a \
-                 precondition-free definitional summary"
+                "callee `{callee_name}` has a summary carrying {preconditions} \
+                 precondition(s), which cannot be checked at L0Safety \
+                 (`VcKind::Precondition` is L1Functional and is filtered out), so \
+                 neither its value fact nor its guard is applied here, and the \
+                 checks the callee's own verification elided under them would go \
+                 unguarded; options: verify this function at L1Functional or above \
+                 (trustc lifts every caller that owes a callee precondition), or \
+                 give the callee a precondition-free definitional summary"
             ),
         },
         function: caller.name.as_str().into(),
@@ -940,6 +1286,16 @@ pub struct ModularVcResult {
 /// rewritten with callee postconditions.
 #[must_use]
 pub fn modular_vcgen(func: &VerifiableFunction, summaries: &SummaryDatabase) -> ModularVcResult {
+    if let Some(vc) = crate::memory_image_vc(func) {
+        return ModularVcResult {
+            body_vcs: vec![vc],
+            precondition_vcs: Vec::new(),
+            assumptions_injected: 0,
+            havoced_calls: 0,
+        };
+    }
+    let _gen_work_memo = crate::gen_work_memo_scope_if_unscoped();
+    let _analysis_scope = crate::generate::FuncAnalysisScope::enter(func);
     // The summary-aware lane retains the precise rebinding machinery, but its
     // authority gate is closed: public string/label metadata cannot inject a
     // postcondition. Body VCs therefore remain equivalent to the ordinary lane.
@@ -949,62 +1305,73 @@ pub fn modular_vcgen(func: &VerifiableFunction, summaries: &SummaryDatabase) -> 
     let mut precondition_vcs = Vec::new();
     let mut assumptions_injected: usize = 0;
     let mut havoced_calls: usize = 0;
+    let tp = crate::generate::terminator_presence_for(func);
+    if !tp.has_call && !tp.has_tail_call {
+        return ModularVcResult { body_vcs, precondition_vcs, assumptions_injected, havoced_calls };
+    }
 
     // The body lane bails to an EMPTY guard map for over-budget functions, so NO
     // postcondition is actually injected there. Mirror that here so the reported
     // `assumptions_injected` count never claims an injection the body VCs did not
     // receive (audit R2 #5; telemetry consistency).
-    let injection_active = !crate::generate::func_exceeds_vcgen_budget(func);
+    let mut injection_active: Option<bool> = None;
 
     for block in &func.body.blocks {
         match &block.terminator {
             Terminator::Call { func: callee_name, args, dest, target, span, .. } => {
-                let summary = summaries.get(callee_name);
-                // Trust (L0 withholding, fail-closed): the callee's definitional
-                // summary was refused entry to this DB because it declares
-                // preconditions. `summaries.get` therefore answers `None` and the
-                // arms below would emit nothing at all — the fail-OPEN this row
-                // closes. See `l0_withheld_summary_vc`.
-                if summary.is_none()
-                    && let Some(count) = summaries.l0_withheld_precondition_count(callee_name)
-                {
-                    precondition_vcs.push(l0_withheld_summary_vc(func, callee_name, span, count));
+                if !summaries.is_empty() {
+                    if let Some(summary) = summaries.get(callee_name) {
+                        precondition_vcs.extend(callsite_precondition_vcs(
+                            func,
+                            callee_name,
+                            args,
+                            span,
+                            summary,
+                        ));
+                        if target.is_some()
+                            && *injection_active.get_or_insert_with(|| {
+                                !crate::generate::func_exceeds_vcgen_budget(func)
+                            })
+                            && crate::generate::callee_postcondition_is_injectable(
+                                func, dest, summary, args,
+                            )
+                        {
+                            assumptions_injected += 1;
+                        } else {
+                            havoced_calls += 1;
+                        }
+                        continue;
+                    }
+                    // Trust (L0 withholding, fail-closed): the callee's definitional
+                    // summary was refused entry to this DB because it declares
+                    // preconditions. `summaries.get` therefore answers `None` and the
+                    // arms below would emit nothing at all — the fail-OPEN this row
+                    // closes. See `l0_withheld_summary_vc`.
+                    if let Some(count) = summaries.l0_withheld_precondition_count(callee_name) {
+                        precondition_vcs
+                            .push(l0_withheld_summary_vc(func, callee_name, span, count));
+                    }
                 }
-                if let Some(summary) = summary {
-                    precondition_vcs.extend(callsite_precondition_vcs(
-                        func,
-                        callee_name,
-                        args,
-                        span,
-                        summary,
-                    ));
-                }
-                if injection_active
-                    && target.is_some()
-                    && summary.is_some_and(|s| {
-                        crate::generate::callee_postcondition_is_injectable(
-                            func, dest, s, args,
-                        )
-                    })
-                {
-                    assumptions_injected += 1;
-                } else {
-                    havoced_calls += 1;
-                }
+                havoced_calls += 1;
             }
             Terminator::TailCall { func: callee_name, args, span, .. } => {
-                if let Some(summary) = summaries.get(callee_name) {
-                    precondition_vcs.extend(callsite_precondition_vcs(
-                        func,
-                        callee_name,
-                        args,
-                        span,
-                        summary,
-                    ));
-                } else if let Some(count) = summaries.l0_withheld_precondition_count(callee_name) {
-                    // Same withholding row as the `Call` arm — a tail call is
-                    // still a call site that owes the callee's guard.
-                    precondition_vcs.push(l0_withheld_summary_vc(func, callee_name, span, count));
+                if !summaries.is_empty() {
+                    if let Some(summary) = summaries.get(callee_name) {
+                        precondition_vcs.extend(callsite_precondition_vcs(
+                            func,
+                            callee_name,
+                            args,
+                            span,
+                            summary,
+                        ));
+                    } else if let Some(count) =
+                        summaries.l0_withheld_precondition_count(callee_name)
+                    {
+                        // Same withholding row as the `Call` arm — a tail call is
+                        // still a call site that owes the callee's guard.
+                        precondition_vcs
+                            .push(l0_withheld_summary_vc(func, callee_name, span, count));
+                    }
                 }
                 // There is no in-function successor at which a postcondition
                 // assumption could be injected; the requires rows stay public.
@@ -1093,34 +1460,50 @@ pub fn generate_modular_vcs(
     func: &VerifiableFunction,
     summaries: &SummaryDatabase,
 ) -> Vec<VerificationCondition> {
+    if let Some(vc) = crate::memory_image_vc(func) {
+        return vec![vc];
+    }
+    let has_pre_or_withheld = summaries.has_any_preconditions_or_withheld()
+        && !crate::generate::cached_terminator_presence_for_body(&func.body)
+            .is_some_and(|tp| !tp.has_call && !tp.has_tail_call);
+    if !has_pre_or_withheld && func.postconditions.is_empty() {
+        return Vec::new();
+    }
+    let _gen_work_memo = crate::gen_work_memo_scope_if_unscoped();
+    let _analysis_scope = crate::generate::FuncAnalysisScope::enter(func);
     let mut vcs = Vec::new();
 
     // 1. Precondition checks at call sites
-    for block in &func.body.blocks {
-        let (callee_name, args, span) = match &block.terminator {
-            Terminator::Call { func, args, span, .. }
-            | Terminator::TailCall { func, args, span, .. } => (func, args, span),
-            _ => continue,
-        };
-        if let Some(summary) = summaries.get(callee_name) {
-            vcs.extend(callsite_precondition_vcs(func, callee_name, args, span, summary));
-            for i in 0..summary.preconditions.len() {
-                let _check = ContractCheck::PreConditionAtCallSite {
-                    callee: callee_name.clone(),
-                    precondition_index: i,
-                };
+    if has_pre_or_withheld
+        && {
+            let tp = crate::generate::terminator_presence_for(func);
+            tp.has_call || tp.has_tail_call
+        }
+    {
+        for block in &func.body.blocks {
+            let (callee_name, args, span) = match &block.terminator {
+                Terminator::Call { func, args, span, .. }
+                | Terminator::TailCall { func, args, span, .. } => (func, args, span),
+                _ => continue,
+            };
+            if let Some(summary) = summaries.get(callee_name) {
+                vcs.extend(callsite_precondition_vcs(func, callee_name, args, span, summary));
+            } else if let Some(count) = summaries.l0_withheld_precondition_count(callee_name) {
+                // Trust (L0 withholding, fail-closed): identical row to the one
+                // `modular_vcgen` and the two `generate_callsite_precondition_vcs`
+                // producers emit — every lane that reads a summary DB by name has
+                // to answer the withholding the same way. See
+                // `l0_withheld_summary_vc`.
+                vcs.push(l0_withheld_summary_vc(func, callee_name, span, count));
             }
-        } else if let Some(count) = summaries.l0_withheld_precondition_count(callee_name) {
-            // Trust (L0 withholding, fail-closed): identical row to the one
-            // `modular_vcgen` and the two `generate_callsite_precondition_vcs`
-            // producers emit — every lane that reads a summary DB by name has
-            // to answer the withholding the same way. See
-            // `l0_withheld_summary_vc`.
-            vcs.push(l0_withheld_summary_vc(func, callee_name, span, count));
         }
     }
 
     // 2. Postcondition checks at return points
+    if func.postconditions.is_empty() {
+        return vcs;
+    }
+    let func_sym = Symbol::from(func.name.as_str());
     for (i, post) in func.postconditions.iter().enumerate() {
         if crate::contracts::formula_uses_unmodeled_machine_arithmetic_in_function(func, post) {
             vcs.push(crate::contracts::spec_unverifiable_vc(
@@ -1153,7 +1536,7 @@ pub fn generate_modular_vcs(
         }
         vcs.push(VerificationCondition {
             kind: VcKind::Postcondition,
-            function: func.name.as_str().into(),
+            function: func_sym,
             location: func.span.clone(),
             formula: Formula::Not(Box::new(post.clone())),
             contract_metadata: None,
@@ -1179,6 +1562,7 @@ fn callsite_precondition_vcs(
         return Vec::new();
     }
 
+    let caller_sym: Symbol = caller.name.as_str().into();
     if summary.param_names.len() != args.len() {
         return vec![VerificationCondition {
             kind: VcKind::UnsupportedMir {
@@ -1189,7 +1573,7 @@ fn callsite_precondition_vcs(
                     args.len()
                 ),
             },
-            function: caller.name.as_str().into(),
+            function: caller_sym,
             location: span.clone(),
             formula: Formula::Bool(true),
             contract_metadata: None,
@@ -1197,12 +1581,7 @@ fn callsite_precondition_vcs(
         }];
     }
 
-    let replacements: Vec<(String, Formula)> = summary
-        .param_names
-        .iter()
-        .zip(args.iter())
-        .map(|(formal, actual)| (formal.clone(), crate::operand_to_formula(caller, actual)))
-        .collect();
+    let mut replacements: Option<Vec<(String, Formula)>> = None;
 
     summary
         .preconditions
@@ -1219,9 +1598,19 @@ fn callsite_precondition_vcs(
                     None,
                 );
             }
+            let replacements = replacements.get_or_insert_with(|| {
+                summary
+                    .param_names
+                    .iter()
+                    .zip(args.iter())
+                    .map(|(formal, actual)| {
+                        (formal.clone(), crate::operand_to_formula(caller, actual))
+                    })
+                    .collect()
+            });
             VerificationCondition {
                 kind: VcKind::Precondition { callee: callee_name.to_string() },
-                function: caller.name.as_str().into(),
+                function: caller_sym,
                 location: span.clone(),
                 // Use the SINGLE, capture-avoiding rebinding point (audit R2 #1): the
                 // former modular-local `substitute_summary_params` cloned quantifier
@@ -1232,7 +1621,7 @@ fn callsite_precondition_vcs(
                 // alpha-renames colliding binders (`capture_avoiding_rebind`).
                 formula: Formula::Not(Box::new(crate::generate::substitute_summary_params(
                     pre,
-                    &replacements,
+                    replacements,
                 ))),
                 contract_metadata: None,
                 obligation: None,
@@ -1267,6 +1656,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("parse"),
                             is_foreign: false,
                             func: "parse".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],
@@ -1316,6 +1706,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1596,6 +1987,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("validate"),
                             is_foreign: false,
                             func: "validate".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],
@@ -1613,6 +2005,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("validate"),
                             is_foreign: false,
                             func: "unknown_fn".to_string(),
                             args: vec![Operand::Copy(Place::local(2))],
@@ -1662,6 +2055,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2086,6 +2480,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let db = SummaryDatabase::new();
@@ -2211,6 +2606,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![postcond.clone()],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let db = SummaryDatabase::new();
@@ -2262,6 +2658,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![postcond],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let db = SummaryDatabase::new();
@@ -2300,6 +2697,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![postcond.clone()],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let db = SummaryDatabase::new();
@@ -2326,6 +2724,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let db = SummaryDatabase::new();
@@ -2448,6 +2847,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("pick"),
                             is_foreign: false,
                             func: "pick".to_string(),
                             args: vec![
@@ -2470,6 +2870,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2676,6 +3077,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("wsum"),
                             is_foreign: false,
                             func: "wsum".to_string(),
                             args: vec![
@@ -2698,6 +3100,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2827,6 +3230,7 @@ mod tests {
                 is_unsafe_sig: false,
                 // The un-forgeable channel the injection lane never reads.
                 callee_identity: Some(identity),
+                callee_key: crate::sep_engine::tests::fixture_key("k::m::pick"),
                 is_foreign: false,
                 // ONE spelling, TWO functions — what every gate above exists
                 // to make impossible upstream.
@@ -2885,6 +3289,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let mut db = SummaryDatabase::new();
@@ -2916,5 +3321,4 @@ mod tests {
             );
         }
     }
-
 }

@@ -59,19 +59,19 @@ pub(crate) fn synthesize_blanket_impls(
             // FIXME(eddyb) ignoring `obligations` might cause false positives.
             drop(obligations);
 
-            let predicates = tcx
-                .predicates_of(impl_def_id)
+            let clauses = tcx
+                .clauses_of(impl_def_id)
                 .instantiate(tcx, impl_args)
-                .predicates
+                .clauses
                 .into_iter()
                 .map(Unnormalized::skip_norm_wip)
                 .chain(Some(impl_trait_ref.upcast(tcx)));
-            for predicate in predicates {
+            for clause in clauses {
                 let obligation = traits::Obligation::new(
                     tcx,
                     traits::ObligationCause::dummy(),
                     param_env,
-                    predicate,
+                    clause,
                 );
                 match infcx.evaluate_obligation(&obligation) {
                     Ok(eval_result) if eval_result.may_apply() => {}
@@ -89,7 +89,7 @@ pub(crate) fn synthesize_blanket_impls(
                     item_id: clean::ItemId::Blanket { impl_id: impl_def_id, for_: item_def_id },
                     attrs: Default::default(),
                     stability: None,
-                    kind: clean::ImplItem(Box::new(clean::Impl {
+                    kind: clean::ItemKind::Impl(Box::new(clean::Impl {
                         safety: hir::Safety::Safe,
                         generics: clean_ty_generics(cx, impl_def_id),
                         // FIXME(eddyb) compute both `trait_` and `for_` from

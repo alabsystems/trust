@@ -66,10 +66,7 @@ fn vc(kind: VcKind, formula: Formula) -> VerificationCondition {
 /// It is UNSAT, and it is UNSAT for a reason that has nothing to do with any
 /// program: the clause text is a tautology.
 fn tautology_violation() -> Formula {
-    Formula::Not(Box::new(Formula::Eq(
-        Box::new(Formula::Int(1)),
-        Box::new(Formula::Int(1)),
-    )))
+    Formula::Not(Box::new(Formula::Eq(Box::new(Formula::Int(1)), Box::new(Formula::Int(1)))))
 }
 
 /// `¬(x == x)` — the second measured leak. UNSAT over a FREE variable, which is
@@ -111,14 +108,10 @@ fn native_planning_tautology_violation() -> Formula {
 /// so it cannot pass vacuously.
 #[test]
 fn contract_invariant_never_mints_kernel_authority() {
-    for (label, violation) in [
-        ("1 == 1", tautology_violation()),
-        ("x == x", free_var_tautology_violation()),
-    ] {
-        let vc = vc(
-            VcKind::ContractInvariant { expression: label.to_string() },
-            violation,
-        );
+    for (label, violation) in
+        [("1 == 1", tautology_violation()), ("x == x", free_var_tautology_violation())]
+    {
+        let vc = vc(VcKind::ContractInvariant { expression: label.to_string() }, violation);
         assert!(
             trust_certify::certify_vc(&vc).is_none(),
             "item-position `invariant({label})` minted a kernel certificate; UNSAT of its \
@@ -131,8 +124,9 @@ fn contract_invariant_never_mints_kernel_authority() {
 /// The bounded native-planning API is a second whole-VC certificate route and
 /// must enforce the same kind boundary as `certify_vc`.
 ///
-/// The SAME formula is used for every row. Both refused kinds must mint no
-/// artifact; `IndexOutOfBounds` must still mint one. The resource preflight also
+/// The SAME formula is used for every row. Both refused kinds (and a record-less TINV row,
+/// refused by the row gate since step 7.7 admitted the kind) must mint no artifact;
+/// `IndexOutOfBounds` must still mint one. The resource preflight also
 /// restricts the current family to `IndexOutOfBounds`, giving two independent
 /// fail-closed layers; this test pins the public artifact boundary rather than
 /// depending on which one refuses first.
@@ -145,6 +139,7 @@ fn native_planning_certificate_route_obeys_the_kind_gate() {
             variable: "idx".to_string(),
             predicate: "idx <= idx".to_string(),
         },
+        tinv_kind(),
     ] {
         let refused = vc(kind, formula.clone());
         assert!(
@@ -182,10 +177,7 @@ fn native_planning_certificate_route_obeys_the_kind_gate() {
 #[test]
 fn the_same_formula_still_certifies_under_a_program_point_bearing_kind() {
     let faithful = vc(
-        VcKind::LoopInvariantInitiation {
-            invariant: "1 == 1".to_string(),
-            header_block: 0,
-        },
+        VcKind::LoopInvariantInitiation { invariant: "1 == 1".to_string(), header_block: 0 },
         tautology_violation(),
     );
     assert!(
@@ -209,16 +201,10 @@ fn the_same_formula_still_certifies_under_a_program_point_bearing_kind() {
 fn faithful_loop_initiation_shape_is_unaffected() {
     let sum = || Formula::Var("sum".to_string(), Sort::Int);
     let faithful = vc(
-        VcKind::LoopInvariantInitiation {
-            invariant: "sum >= 0".to_string(),
-            header_block: 0,
-        },
+        VcKind::LoopInvariantInitiation { invariant: "sum >= 0".to_string(), header_block: 0 },
         Formula::And(vec![
             Formula::Eq(Box::new(sum()), Box::new(Formula::Int(0))),
-            Formula::Not(Box::new(Formula::Ge(
-                Box::new(sum()),
-                Box::new(Formula::Int(0)),
-            ))),
+            Formula::Not(Box::new(Formula::Ge(Box::new(sum()), Box::new(Formula::Int(0))))),
         ]),
     );
     assert!(
@@ -237,7 +223,7 @@ fn faithful_loop_initiation_shape_is_unaffected() {
 #[test]
 fn postcondition_authority_is_not_withdrawn() {
     assert!(
-        VcKind::Postcondition.kernel_authority_refusal().is_none(),
+        vc(VcKind::Postcondition, tautology_violation()).kernel_authority_refusal().is_none(),
         "the ensures lane is body-aware and measured faithful; refusing it would delete real \
          proofs rather than fake ones"
     );
@@ -257,7 +243,7 @@ fn safety_kinds_keep_kernel_authority() {
         VcKind::Precondition { callee: "callee".to_string() },
     ] {
         assert!(
-            kind.kernel_authority_refusal().is_none(),
+            vc(kind.clone(), tautology_violation()).kernel_authority_refusal().is_none(),
             "{kind:?} is minted from MIR with its reaching path condition; it must keep kernel \
              authority"
         );
@@ -268,9 +254,10 @@ fn safety_kinds_keep_kernel_authority() {
 /// honest refusal is a correct outcome but a silent one is not.
 #[test]
 fn the_refusal_explains_itself() {
-    let reason = VcKind::ContractInvariant { expression: "1 == 1".to_string() }
-        .kernel_authority_refusal()
-        .expect("item-position invariant must be refused");
+    let reason =
+        vc(VcKind::ContractInvariant { expression: "1 == 1".to_string() }, tautology_violation())
+            .kernel_authority_refusal()
+            .expect("item-position invariant must be refused");
     assert!(
         reason.contains("no program point"),
         "the refusal must say WHY, naming the missing program point: {reason}"
@@ -279,4 +266,197 @@ fn the_refusal_explains_itself() {
         reason.contains("tautology"),
         "the refusal must name the failure mode it prevents: {reason}"
     );
+}
+
+/// v6/D2: concurrency obligations carry no concurrency model yet, so the
+/// kernel lane must not certify them around the router's refusal.
+///
+/// MUTATION PROOF: move `DataRace`/`InsufficientOrdering` back to the ADMITTED
+/// arm of `kernel_authority_refusal` and this test fails — the same UNSAT
+/// formulas certify, exactly as `contract_invariant_never_mints_kernel_authority`
+/// shows for its kind.
+#[test]
+fn concurrency_kinds_never_mint_kernel_authority() {
+    for kind in [
+        VcKind::DataRace {
+            variable: "x".to_string(),
+            thread_a: "t0".to_string(),
+            thread_b: "t1".to_string(),
+        },
+        VcKind::InsufficientOrdering {
+            variable: "x".to_string(),
+            actual: "Relaxed".to_string(),
+            required: "Acquire".to_string(),
+        },
+    ] {
+        let reason = vc(kind.clone(), tautology_violation())
+            .kernel_authority_refusal()
+            .unwrap_or_else(|| panic!("{kind:?} must be refused kernel authority (v6/D2)"));
+        assert!(reason.contains("v6/D2"), "the refusal must cite its ruling: {reason}");
+        for violation in [tautology_violation(), free_var_tautology_violation()] {
+            let vc = vc(kind.clone(), violation);
+            assert!(
+                trust_certify::certify_vc(&vc).is_none(),
+                "{kind:?} minted a kernel certificate without a concurrency model"
+            );
+        }
+    }
+}
+
+/// TINV-8 (2026-10-05): `VcKind::TypeInvariant` was refused by kind from step 2 until the
+/// step-7 producer landed; since step 7.7 the kind is ADMITTED and every row goes through the
+/// VC-level situatedness gate (`type_invariant_situatedness_refusal`, TINV-9(j)).
+fn tinv_kind() -> VcKind {
+    tinv_kind_edge(None)
+}
+
+fn tinv_kind_edge(edge: Option<usize>) -> VcKind {
+    VcKind::TypeInvariant {
+        ty: "mycrate::Screen".to_string(),
+        point: trust_types::TypeInvariantPoint::Call,
+        site: trust_types::TypeInvariantSite { block: 1, statement_index: 0 },
+        conjunct: 0,
+        ordinal: 0,
+        edge,
+    }
+}
+
+fn int(name: &str) -> Formula {
+    Formula::Var(name.to_string(), Sort::Int)
+}
+
+/// `¬(i1 <= n)`: the negated core of json-`Parser`'s `i <= len(b)` after the write.
+fn tinv_neg_core() -> Formula {
+    Formula::Not(Box::new(Formula::Le(Box::new(int("i1")), Box::new(int("n")))))
+}
+
+/// The design §9 0(b)(c) linear preservation row `i1 = i0 + 1 ∧ i0 < n ∧ ¬(i1 <= n)`:
+/// the hypotheses bind both core names, and it is UNSAT over ℤ.
+fn tinv_linear_row() -> Formula {
+    Formula::And(vec![
+        Formula::Eq(
+            Box::new(int("i1")),
+            Box::new(Formula::Add(Box::new(int("i0")), Box::new(Formula::Int(1)))),
+        ),
+        Formula::Lt(Box::new(int("i0")), Box::new(int("n"))),
+        tinv_neg_core(),
+    ])
+}
+
+fn exact_record(body: Formula) -> trust_types::ObligationRecord {
+    trust_types::ObligationRecord { body, wrappers: Vec::new(), subject: None, width: None }
+}
+
+fn recorded(kind: VcKind, formula: Formula, body: Formula) -> VerificationCondition {
+    VerificationCondition { obligation: Some(exact_record(body)), ..vc(kind, formula) }
+}
+
+/// TINV step 7.7, THE POSITIVE PIN. A recorded, situated TINV row mints `CleanCic`
+/// evidence through `certify_vc`, and the evidence replays through `recheck_vc_cleancic`
+/// against the same row and no other.
+///
+/// MUTATION PROOF: move `VcKind::TypeInvariant` back to the REFUSED arm of
+/// `VcKind::kind_authority_refusal` (trust-types `vc_kind.rs`) and this test fails at the
+/// first `expect`: the same row then mints nothing.
+#[test]
+fn a_recorded_situated_type_invariant_row_mints_and_replays() {
+    let row = recorded(tinv_kind(), tinv_linear_row(), tinv_linear_row());
+    assert_eq!(row.kernel_authority_refusal(), None);
+    let trust_ir::ProofEvidence::CleanCic { term, context, lineage, .. } =
+        trust_certify::certify_vc(&row).expect("the recorded linear TINV row must mint")
+    else {
+        panic!("expected CleanCic evidence");
+    };
+    assert!(trust_certify::recheck_vc_cleancic(&term, &context, &lineage, &row));
+    // The evidence is bound to the row's identity: another conjunct's row does not replay it.
+    let mut other = row.clone();
+    other.kind = VcKind::TypeInvariant {
+        ty: "mycrate::Screen".to_string(),
+        point: trust_types::TypeInvariantPoint::Call,
+        site: trust_types::TypeInvariantSite { block: 1, statement_index: 0 },
+        conjunct: 1,
+        ordinal: 0,
+        edge: None,
+    };
+    assert!(!trust_certify::recheck_vc_cleancic(&term, &context, &lineage, &other));
+    // The replay obeys the row gate: the same evidence against the record-less row fails.
+    let mut stripped = row.clone();
+    stripped.obligation = None;
+    assert!(!trust_certify::recheck_vc_cleancic(&term, &context, &lineage, &stripped));
+    // The same certificate under an admitted kind with the same formula is not a TINV
+    // identity either (the identity binds the kind).
+    let postcondition = vc(VcKind::Postcondition, tinv_linear_row());
+    assert!(!trust_certify::recheck_vc_cleancic(&term, &context, &lineage, &postcondition));
+}
+
+/// The rows the situatedness gate exists for mint nothing, although every formula below
+/// is UNSAT (each certifies under an admitted kind, asserted first, so the refusal is the
+/// row gate and not the formula).
+#[test]
+fn unsituated_type_invariant_rows_never_mint() {
+    let loop_kind = || VcKind::LoopInvariantInitiation { invariant: "p".into(), header_block: 0 };
+    // The record-less tautology and free-variable rows of TINV step 2.
+    for formula in [tautology_violation(), free_var_tautology_violation(), tinv_linear_row()] {
+        assert!(trust_certify::certify_vc(&vc(loop_kind(), formula.clone())).is_some());
+        assert!(
+            trust_certify::certify_vc(&vc(tinv_kind(), formula)).is_none(),
+            "a record-less TINV row minted kernel evidence"
+        );
+    }
+    // A forged record: it does not replay to the formula it claims to account for.
+    let forged = recorded(tinv_kind(), tinv_linear_row(), tinv_neg_core());
+    assert!(trust_certify::certify_vc(&forged).is_none(), "a forged record minted");
+    let forged_ground = recorded(tinv_kind(), tautology_violation(), tinv_linear_row());
+    assert!(trust_certify::certify_vc(&forged_ground).is_none(), "a forged record minted");
+    // Bare: the core with no hypothesis (`¬(x == x)` is UNSAT, recorded exactly).
+    let bare =
+        recorded(tinv_kind(), free_var_tautology_violation(), free_var_tautology_violation());
+    assert!(trust_certify::certify_vc(&bare).is_none(), "a bare core minted");
+    // Unbound core: the hypothesis names `a`; the core's `x` is bound by nothing.
+    let x = || Box::new(int("x"));
+    let unbound = Formula::And(vec![
+        Formula::Eq(Box::new(int("a")), Box::new(Formula::Int(1))),
+        Formula::Not(Box::new(Formula::Eq(x(), x()))),
+    ]);
+    assert!(trust_certify::certify_vc(&vc(loop_kind(), unbound.clone())).is_some());
+    let unbound_row = recorded(tinv_kind(), unbound.clone(), unbound);
+    assert!(trust_certify::certify_vc(&unbound_row).is_none(), "an unbound core minted");
+    // An edge part (TINV-9(a)) whose core names only its edge guard binds: the guard is a
+    // routing condition, never a binding of program state.
+    let guard_only =
+        Formula::And(vec![Formula::Le(Box::new(int("i1")), Box::new(int("n"))), tinv_neg_core()]);
+    assert!(trust_certify::certify_vc(&vc(loop_kind(), guard_only.clone())).is_some());
+    let part = recorded(tinv_kind_edge(Some(0)), guard_only.clone(), guard_only.clone());
+    assert!(trust_certify::certify_vc(&part).is_none(), "a guard-only edge part minted");
+    // Control: the SAME body on a whole row counts its first conjunct as a hypothesis.
+    let whole = recorded(tinv_kind(), guard_only.clone(), guard_only);
+    assert!(trust_certify::certify_vc(&whole).is_some(), "the whole-row control must mint");
+}
+
+/// Native planning stays closed to TINV after the flip: its resource preflight admits only
+/// `IndexOutOfBounds`, so even the recorded, situated row mints nothing on that route.
+#[test]
+fn native_planning_still_refuses_a_situated_type_invariant_row() {
+    let row = recorded(tinv_kind(), tinv_linear_row(), tinv_linear_row());
+    assert_eq!(row.kernel_authority_refusal(), None);
+    assert!(!trust_certify::vc_fits_native_planning_certification_budget(&row));
+    assert!(trust_certify::certify_vc_for_native_planning(&row).is_none());
+}
+
+/// Certificate identity is bincode of the whole VC, which encodes the variant's
+/// DECLARATION INDEX. `TypeInvariant` is appended last: every earlier variant keeps
+/// its index (so its identity bytes), and the new one sits right after
+/// `FrameConditionViolation`. A mid-enum insert fails this test.
+#[test]
+fn type_invariant_is_appended_after_every_existing_vc_kind() {
+    fn index(kind: &VcKind) -> u32 {
+        let bytes = bincode::serialize(kind).expect("serialize");
+        u32::from_le_bytes(bytes[..4].try_into().expect("variant index"))
+    }
+    let frame =
+        VcKind::FrameConditionViolation { variable: String::new(), function: String::new() };
+    // The declaration indices at `efa8829d7c` (2026-10-05), before TINV existed.
+    assert_eq!(index(&VcKind::DivisionByZero), 3);
+    assert_eq!(index(&frame), 55);
+    assert_eq!(index(&tinv_kind()), 56);
 }

@@ -48,6 +48,7 @@ fn make_contract_function(
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -113,7 +114,7 @@ fn test_pipeline_precondition_vc() {
 
 #[test]
 fn test_pipeline_postcondition_vc() {
-    let func = make_contract_function(
+    let mut func = make_contract_function(
         "postcond_fn",
         vec![Contract {
             kind: ContractKind::Ensures,
@@ -123,6 +124,14 @@ fn test_pipeline_postcondition_vc() {
         single_arg_locals(),
         1,
     );
+    // `result` binds to the return place `_0`; production fail-closes when no
+    // return path establishes its value ("postcondition result has no
+    // established return-path value"), so the body must assign `_0`.
+    func.body.blocks[0].stmts = vec![Statement::Assign {
+        place: Place::local(0),
+        rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+        span: SourceSpan::default(),
+    }];
 
     let vcs = trust_vcgen::generate_vcs(&func);
 
@@ -218,6 +227,7 @@ fn test_pipeline_loop_invariant_generates_the_e4_pair() {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = trust_vcgen::generate_vcs(&func);

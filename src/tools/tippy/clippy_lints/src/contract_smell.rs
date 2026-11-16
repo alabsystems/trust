@@ -4,8 +4,7 @@ use rustc_ast::{
     Block, Expr, ExprKind, FnContract, LoopClause, LoopClauseKind, LoopContract, NodeId, TrustNativeClause,
 };
 use rustc_data_structures::fx::FxHashSet;
-use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{EarlyContext, EarlyLintPass, declare_lint_pass};
 use rustc_span::{Ident, Span};
 
 declare_clippy_lint! {

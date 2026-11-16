@@ -1,0 +1,609 @@
+{
+  "name": "{closure#0}",
+  "def_path": "windows_filter_count::windows2::{closure#0}",
+  "span": {
+    "file": "windows_filter_count.rs",
+    "line_start": 1,
+    "col_start": 58,
+    "line_end": 1,
+    "col_end": 74
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Closure": {
+                "name": "windows_filter_count::windows2::{closure#0}",
+                "upvars": [],
+                "call": {
+                  "kind": "FnMut",
+                  "params": [
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": {
+                              "Slice": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 32,
+                                    "signed": false
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "ret": "Bool"
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "w"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 62,
+                "line_end": 1,
+                "col_end": 66
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 62,
+                "line_end": 1,
+                "col_end": 66
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 62,
+                "line_end": 1,
+                "col_end": 66
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 1,
+            "span": {
+              "file": "windows_filter_count.rs",
+              "line_start": 1,
+              "col_start": 62,
+              "line_end": 1,
+              "col_end": 66
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 62,
+                "line_end": 1,
+                "col_end": 66
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 10,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 0,
+                          "min_length": 1,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 62,
+                "line_end": 1,
+                "col_end": 66
+              }
+            }
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 70,
+                "line_end": 1,
+                "col_end": 74
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 70,
+                "line_end": 1,
+                "col_end": 74
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 70,
+                "line_end": 1,
+                "col_end": 74
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 8,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 2,
+            "span": {
+              "file": "windows_filter_count.rs",
+              "line_start": 1,
+              "col_start": 70,
+              "line_end": 1,
+              "col_end": 74
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 70,
+                "line_end": 1,
+                "col_end": 74
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 12,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 1,
+                          "min_length": 2,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 70,
+                "line_end": 1,
+                "col_end": 74
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Le",
+                  {
+                    "Move": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "windows_filter_count.rs",
+                "line_start": 1,
+                "col_start": 62,
+                "line_end": 1,
+                "col_end": 74
+              }
+            }
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageDead": 3
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

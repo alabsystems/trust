@@ -1,0 +1,16 @@
+{
+  "function": "may_release",
+  "fuel": 64,
+  "cases": [
+    { "arguments": [false, false, false], "expected": false, "permitted": false },
+    { "arguments": [false, false, true], "expected": false, "permitted": false },
+    { "arguments": [false, true, false], "expected": false, "permitted": false },
+    { "arguments": [false, true, true], "expected": true, "permitted": true },
+    { "arguments": [true, false, false], "expected": true, "permitted": true },
+    { "arguments": [true, false, true], "expected": true, "permitted": true },
+    { "arguments": [true, true, false], "expected": true, "permitted": true },
+    { "arguments": [true, true, true], "expected": true, "permitted": true }
+  ],
+  "mutation_from": "else {\n        false\n    }",
+  "mutation_to": "else {\n        true\n    }"
+}

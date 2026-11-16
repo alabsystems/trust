@@ -1,0 +1,46 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta-dep",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (6f70bdb69 2026-09-19) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@4ac1b25c7518 sha256:e38e559a127c245c",
+  "clean": "first-party/clean@4338e7923763 sha256:ece53b053817beaf",
+  "trust-cg": "first-party/trust-cg@5aca5cd4d662 sha256:9db90b2968fc0f50"
+ },
+ "ratchets": {
+  "a.unit.dep.carried.clean_def": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.unit.dep.carried.contract": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "carried:dep_clamp.summary=null:disclosed=['requires', 'ensures']:certificates=0",
+   "audit": "GAP"
+  },
+  "a.unit.dep.emit": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.unit.dep.native": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.unit.dep.roundtrip": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.unit.dep.twin.codec.trailing": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.unit.dep.twin.validate.vararg": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.unit.dep.validate": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

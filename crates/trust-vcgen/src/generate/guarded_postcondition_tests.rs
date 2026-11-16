@@ -62,6 +62,7 @@ fn caller() -> VerifiableFunction {
                         is_unsafe_sig: false,
                         is_foreign: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(&CALLEE.to_string()),
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -74,6 +75,7 @@ fn caller() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

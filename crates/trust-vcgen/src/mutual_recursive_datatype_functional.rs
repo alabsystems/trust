@@ -98,8 +98,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::HashMap;
-
+use trust_types::fx::FxHashMap;
 use trust_types::{
     BlockId, Formula, Place, Projection, Sort, Terminator, Ty, VcKind, VerifiableFunction,
     VerificationCondition,
@@ -451,11 +450,9 @@ fn emit_cluster(
     // Coverage: for each member/reference the step arms — and the base arms,
     // unless the base is a single direct return — cover every payload
     // constructor exactly once, in tag order.
-    let all_tags: Vec<usize> = (0..payload_variants.len()).collect();
     let covered = |arms: &[ArmRec]| -> bool {
-        let mut tags: Vec<usize> = arms.iter().map(|a| a.tag).collect();
-        tags.sort_unstable();
-        tags == all_tags
+        arms.len() == payload_variants.len()
+            && arms.iter().enumerate().all(|(idx, a)| a.tag == idx)
     };
     for mo in outs.iter_mut().chain(ref_outs.iter_mut()) {
         mo.base_arms.sort_by_key(|a| a.tag);
@@ -677,7 +674,13 @@ fn mwalk(
         return false;
     }
     let func = members[member_idx];
-    let Some(block) = func.body.blocks.iter().find(|b| b.id == block_id) else {
+    let Some(block) = func
+        .body
+        .blocks
+        .get(block_id.0)
+        .filter(|b| b.id == block_id)
+        .or_else(|| func.body.blocks.iter().find(|b| b.id == block_id))
+    else {
         return false;
     };
 
@@ -691,7 +694,7 @@ fn mwalk(
                 return false;
             };
             let post = &posts[member_idx];
-            match (fuel, state.ctor.clone()) {
+            match (fuel, state.ctor.take()) {
                 // A return before the fuel match is not a fuel-indexed arm.
                 (FuelLayer::None, _) => false,
                 (FuelLayer::Base, None) => {
@@ -723,7 +726,7 @@ fn mwalk(
                         conclusion
                     } else {
                         Formula::Implies(
-                            Box::new(conjoin_all(state.ih_atoms.clone())),
+                            Box::new(conjoin_all(state.ih_atoms)),
                             Box::new(conclusion),
                         )
                     };
@@ -794,9 +797,7 @@ fn mwalk(
                     };
                     let mut tags: Vec<usize> = targets.iter().map(|(t, _)| *t as usize).collect();
                     tags.sort_unstable();
-                    let mut expected = vec![z_tag, s_tag];
-                    expected.sort_unstable();
-                    if tags != expected {
+                    if tags.as_slice() != [z_tag.min(s_tag), z_tag.max(s_tag)] {
                         return false;
                     }
                     out.fuel_dt = Some(dt.clone());
@@ -877,7 +878,7 @@ fn mwalk(
                     let dt_sort = crate::sort_for_ty(&dt);
                     for (tag, target) in targets {
                         let tag = *tag as usize;
-                        let Some((ctor, fields)) = variants.get(tag).cloned() else {
+                        let Some((ctor, fields)) = variants.get(tag) else {
                             return false;
                         };
                         let mut arm_state = state.clone();
@@ -902,7 +903,7 @@ fn mwalk(
                                 sort: dt_sort.clone(),
                             },
                         );
-                        arm_state.ctor = Some((tag, ctor));
+                        arm_state.ctor = Some((tag, ctor.clone()));
                         if !mwalk(
                             members,
                             posts,
@@ -972,7 +973,8 @@ fn mwalk(
                     state.store.insert(dest.local, ih_var.clone());
                     // IH atom: the CALLEE's postcondition assumed at the
                     // smaller fuel — `P_callee(k, payload_arg, __ih_j)`.
-                    let mut map: HashMap<String, Formula> = HashMap::new();
+                    let mut map: FxHashMap<String, Formula> =
+                        FxHashMap::with_capacity_and_hasher(3, Default::default());
                     map.insert(
                         crate::place_to_var_name(callee_fn, &Place::local(FUEL_LOCAL)),
                         fuel_arg,
@@ -1298,6 +1300,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                         is_foreign: false,
                         func: callee.to_string(),
                         args: vec![Operand::Move(Place::local(9)), Operand::Move(Place::local(10))],
@@ -1335,6 +1338,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![post],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1748,6 +1752,7 @@ mod literal_cluster_tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
             is_foreign: false,
             func: callee.to_string(),
             args: vec![Operand::Move(Place::local(a)), Operand::Move(Place::local(b))],
@@ -1927,6 +1932,7 @@ mod literal_cluster_tests {
             preconditions: vec![],
             postconditions: post,
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

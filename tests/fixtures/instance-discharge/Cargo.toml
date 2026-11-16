@@ -1,0 +1,20 @@
+[package]
+name = "trust-instance-discharge-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The instance-discharge accounting acceptance
+# (tests/e2e_instance_discharge_accounting.sh): `targo trust check --lib
+# --allow-l0-gaps` on this crate must print a `Summary:` line, with no
+# `transport:` accounting row and no COULD NOT RUN. Its one `proved`
+# instance-discharge row is the row the compiler's summary counts `skipped`
+# while it travels with outcome `proved`. No dependencies: the rows are a
+# function of this source alone. The same source, compiled by bare trustc, is
+# the transport pinned in
+# targo-trust/src/fixtures/instance_discharge_proved_transport.jsonl.
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

@@ -1,0 +1,3331 @@
+{
+ "AbstractByte": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Uninit",
+    "unit",
+    []
+   ],
+   [
+    "Init",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "int"
+      ]
+     ],
+     [
+      "1",
+      [
+       "option",
+       [
+        "adt",
+        "ProvenanceFrag"
+       ]
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "Access": {
+  "fields": [
+   [
+    "ty",
+    [
+     "adt",
+     "AccessType"
+    ]
+   ],
+   [
+    "atomicity",
+    [
+     "adt",
+     "Atomicity"
+    ]
+   ],
+   [
+    "addr",
+    [
+     "int"
+    ]
+   ],
+   [
+    "len",
+    [
+     "size"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "AccessType": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Store",
+    "unit",
+    []
+   ],
+   [
+    "Load",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "AllocId": {
+  "fields": [
+   [
+    "0",
+    [
+     "int"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": true,
+  "variants": []
+ },
+ "Allocation": {
+  "fields": [
+   [
+    "data",
+    [
+     "list",
+     [
+      "adt",
+      "AbstractByte"
+     ]
+    ]
+   ],
+   [
+    "addr",
+    [
+     "int"
+    ]
+   ],
+   [
+    "align",
+    [
+     "align"
+    ]
+   ],
+   [
+    "kind",
+    [
+     "adt",
+     "AllocationKind"
+    ]
+   ],
+   [
+    "live",
+    [
+     "bool"
+    ]
+   ],
+   [
+    "extra",
+    [
+     "unit"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "AllocationKind": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Stack",
+    "unit",
+    []
+   ],
+   [
+    "Heap",
+    "unit",
+    []
+   ],
+   [
+    "Global",
+    "unit",
+    []
+   ],
+   [
+    "Function",
+    "unit",
+    []
+   ],
+   [
+    "VTable",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "ArgumentExpr": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "ByValue",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ]
+    ]
+   ],
+   [
+    "InPlace",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "Atomicity": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Atomic",
+    "unit",
+    []
+   ],
+   [
+    "None",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "BasicBlock": {
+  "fields": [
+   [
+    "statements",
+    [
+     "list",
+     [
+      "adt",
+      "Statement"
+     ]
+    ]
+   ],
+   [
+    "terminator",
+    [
+     "adt",
+     "Terminator"
+    ]
+   ],
+   [
+    "kind",
+    [
+     "adt",
+     "BbKind"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "BasicMemory": {
+  "fields": [
+   [
+    "allocations",
+    [
+     "list",
+     [
+      "adt",
+      "Allocation"
+     ]
+    ]
+   ],
+   [
+    "_phantom",
+    [
+     "unit"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "BbKind": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Regular",
+    "unit",
+    []
+   ],
+   [
+    "Cleanup",
+    "unit",
+    []
+   ],
+   [
+    "Catch",
+    "unit",
+    []
+   ],
+   [
+    "Terminate",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "BbName": {
+  "fields": [
+   [
+    "0",
+    [
+     "name"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": true,
+  "variants": []
+ },
+ "BinOp": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Int",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "IntBinOp"
+      ]
+     ]
+    ]
+   ],
+   [
+    "IntWithOverflow",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "IntBinOpWithOverflow"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Rel",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "RelOp"
+      ]
+     ]
+    ]
+   ],
+   [
+    "PtrOffset",
+    "named",
+    [
+     [
+      "inbounds",
+      [
+       "bool"
+      ]
+     ]
+    ]
+   ],
+   [
+    "PtrOffsetFrom",
+    "named",
+    [
+     [
+      "inbounds",
+      [
+       "bool"
+      ]
+     ],
+     [
+      "nonneg",
+      [
+       "bool"
+      ]
+     ]
+    ]
+   ],
+   [
+    "ConstructWidePointer",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "PtrType"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "CallingConvention": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Rust",
+    "unit",
+    []
+   ],
+   [
+    "C",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "CastOp": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "IntToInt",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "IntType"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Transmute",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "Type"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "ConcurrentMemory": {
+  "fields": [
+   [
+    "memory",
+    [
+     "adt",
+     "BasicMemory"
+    ]
+   ],
+   [
+    "accesses",
+    [
+     "list",
+     [
+      "adt",
+      "Access"
+     ]
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "Constant": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Int",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Bool",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "bool"
+      ]
+     ]
+    ]
+   ],
+   [
+    "GlobalPointer",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "Relocation"
+      ]
+     ]
+    ]
+   ],
+   [
+    "FnPointer",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "FnName"
+      ]
+     ]
+    ]
+   ],
+   [
+    "VTablePointer",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "VTableName"
+      ]
+     ]
+    ]
+   ],
+   [
+    "PointerWithoutProvenance",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "Discriminator": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Known",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Invalid",
+    "unit",
+    []
+   ],
+   [
+    "Branch",
+    "named",
+    [
+     [
+      "offset",
+      [
+       "size"
+      ]
+     ],
+     [
+      "value_type",
+      [
+       "adt",
+       "IntType"
+      ]
+     ],
+     [
+      "fallback",
+      [
+       "adt",
+       "Discriminator"
+      ]
+     ],
+     [
+      "children",
+      [
+       "map",
+       [
+        "tuple",
+        [
+         [
+          "int"
+         ],
+         [
+          "int"
+         ]
+        ]
+       ],
+       [
+        "adt",
+        "Discriminator"
+       ]
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "Endianness": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": true,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "LittleEndian",
+    "unit",
+    []
+   ],
+   [
+    "BigEndian",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "FnName": {
+  "fields": [
+   [
+    "0",
+    [
+     "name"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": true,
+  "variants": []
+ },
+ "Function": {
+  "fields": [
+   [
+    "locals",
+    [
+     "map",
+     [
+      "adt",
+      "LocalName"
+     ],
+     [
+      "adt",
+      "Type"
+     ]
+    ]
+   ],
+   [
+    "args",
+    [
+     "list",
+     [
+      "adt",
+      "LocalName"
+     ]
+    ]
+   ],
+   [
+    "ret",
+    [
+     "adt",
+     "LocalName"
+    ]
+   ],
+   [
+    "calling_convention",
+    [
+     "adt",
+     "CallingConvention"
+    ]
+   ],
+   [
+    "blocks",
+    [
+     "map",
+     [
+      "adt",
+      "BbName"
+     ],
+     [
+      "adt",
+      "BasicBlock"
+     ]
+    ]
+   ],
+   [
+    "start",
+    [
+     "adt",
+     "BbName"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "Global": {
+  "fields": [
+   [
+    "bytes",
+    [
+     "list",
+     [
+      "option",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ],
+   [
+    "relocations",
+    [
+     "list",
+     [
+      "tuple",
+      [
+       [
+        "size"
+       ],
+       [
+        "adt",
+        "Relocation"
+       ]
+      ]
+     ]
+    ]
+   ],
+   [
+    "align",
+    [
+     "align"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "GlobalName": {
+  "fields": [
+   [
+    "0",
+    [
+     "name"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": true,
+  "variants": []
+ },
+ "IntBinOp": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Add",
+    "unit",
+    []
+   ],
+   [
+    "AddUnchecked",
+    "unit",
+    []
+   ],
+   [
+    "Sub",
+    "unit",
+    []
+   ],
+   [
+    "SubUnchecked",
+    "unit",
+    []
+   ],
+   [
+    "Mul",
+    "unit",
+    []
+   ],
+   [
+    "MulUnchecked",
+    "unit",
+    []
+   ],
+   [
+    "Div",
+    "unit",
+    []
+   ],
+   [
+    "DivExact",
+    "unit",
+    []
+   ],
+   [
+    "Rem",
+    "unit",
+    []
+   ],
+   [
+    "Shl",
+    "unit",
+    []
+   ],
+   [
+    "ShlUnchecked",
+    "unit",
+    []
+   ],
+   [
+    "Shr",
+    "unit",
+    []
+   ],
+   [
+    "ShrUnchecked",
+    "unit",
+    []
+   ],
+   [
+    "BitAnd",
+    "unit",
+    []
+   ],
+   [
+    "BitOr",
+    "unit",
+    []
+   ],
+   [
+    "BitXor",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "IntBinOpWithOverflow": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Add",
+    "unit",
+    []
+   ],
+   [
+    "Sub",
+    "unit",
+    []
+   ],
+   [
+    "Mul",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "IntPtrCast": {
+  "fields": [
+   [
+    "exposed",
+    [
+     "set",
+     [
+      "tuple",
+      [
+       [
+        "adt",
+        "AllocId"
+       ],
+       [
+        "unit"
+       ]
+      ]
+     ]
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "IntType": {
+  "fields": [
+   [
+    "signed",
+    [
+     "adt",
+     "Signedness"
+    ]
+   ],
+   [
+    "size",
+    [
+     "size"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "IntUnOp": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Neg",
+    "unit",
+    []
+   ],
+   [
+    "BitNot",
+    "unit",
+    []
+   ],
+   [
+    "CountOnes",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "IntrinsicLockOp": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Acquire",
+    "unit",
+    []
+   ],
+   [
+    "Release",
+    "unit",
+    []
+   ],
+   [
+    "Create",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "IntrinsicOp": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Abort",
+    "unit",
+    []
+   ],
+   [
+    "Assume",
+    "unit",
+    []
+   ],
+   [
+    "Exit",
+    "unit",
+    []
+   ],
+   [
+    "PrintStdout",
+    "unit",
+    []
+   ],
+   [
+    "PrintStderr",
+    "unit",
+    []
+   ],
+   [
+    "Allocate",
+    "unit",
+    []
+   ],
+   [
+    "Deallocate",
+    "unit",
+    []
+   ],
+   [
+    "Spawn",
+    "unit",
+    []
+   ],
+   [
+    "Join",
+    "unit",
+    []
+   ],
+   [
+    "RawEq",
+    "unit",
+    []
+   ],
+   [
+    "AtomicStore",
+    "unit",
+    []
+   ],
+   [
+    "AtomicLoad",
+    "unit",
+    []
+   ],
+   [
+    "AtomicCompareExchange",
+    "unit",
+    []
+   ],
+   [
+    "AtomicFetchAndOp",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "IntBinOp"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Lock",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "IntrinsicLockOp"
+      ]
+     ]
+    ]
+   ],
+   [
+    "PointerExposeProvenance",
+    "unit",
+    []
+   ],
+   [
+    "PointerWithExposedProvenance",
+    "unit",
+    []
+   ],
+   [
+    "GetUnwindPayload",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "LayoutStrategy": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Sized",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "size"
+      ]
+     ],
+     [
+      "1",
+      [
+       "align"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Slice",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "size"
+      ]
+     ],
+     [
+      "1",
+      [
+       "align"
+      ]
+     ]
+    ]
+   ],
+   [
+    "TraitObject",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "TraitName"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Tuple",
+    "named",
+    [
+     [
+      "head",
+      [
+       "adt",
+       "TupleHeadLayout"
+      ]
+     ],
+     [
+      "tail",
+      [
+       "adt",
+       "LayoutStrategy"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "LocalName": {
+  "fields": [
+   [
+    "0",
+    [
+     "name"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": true,
+  "variants": []
+ },
+ "LockState": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Unlocked",
+    "unit",
+    []
+   ],
+   [
+    "LockedBy",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "Machine": {
+  "fields": [
+   [
+    "prog",
+    [
+     "adt",
+     "Program"
+    ]
+   ],
+   [
+    "mem",
+    [
+     "adt",
+     "ConcurrentMemory"
+    ]
+   ],
+   [
+    "intptrcast",
+    [
+     "adt",
+     "IntPtrCast"
+    ]
+   ],
+   [
+    "threads",
+    [
+     "list",
+     [
+      "adt",
+      "Thread"
+     ]
+    ]
+   ],
+   [
+    "active_thread",
+    [
+     "int"
+    ]
+   ],
+   [
+    "synchronized_threads",
+    [
+     "set",
+     [
+      "int"
+     ]
+    ]
+   ],
+   [
+    "locks",
+    [
+     "list",
+     [
+      "adt",
+      "LockState"
+     ]
+    ]
+   ],
+   [
+    "global_ptrs",
+    [
+     "map",
+     [
+      "adt",
+      "GlobalName"
+     ],
+     [
+      "adt",
+      "ThinPointer"
+     ]
+    ]
+   ],
+   [
+    "fn_ptrs",
+    [
+     "map",
+     [
+      "adt",
+      "FnName"
+     ],
+     [
+      "adt",
+      "ThinPointer"
+     ]
+    ]
+   ],
+   [
+    "vtable_ptrs",
+    [
+     "map",
+     [
+      "adt",
+      "VTableName"
+     ],
+     [
+      "adt",
+      "ThinPointer"
+     ]
+    ]
+   ],
+   [
+    "stdout",
+    [
+     "dynwrite"
+    ]
+   ],
+   [
+    "stderr",
+    [
+     "dynwrite"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "Mutability": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": true,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Mutable",
+    "unit",
+    []
+   ],
+   [
+    "Immutable",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "Place": {
+  "fields": [
+   [
+    "ptr",
+    [
+     "adt",
+     "Pointer"
+    ]
+   ],
+   [
+    "aligned",
+    [
+     "bool"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "PlaceExpr": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Local",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "LocalName"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Deref",
+    "named",
+    [
+     [
+      "operand",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ],
+     [
+      "ty",
+      [
+       "adt",
+       "Type"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Field",
+    "named",
+    [
+     [
+      "root",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ],
+     [
+      "field",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Index",
+    "named",
+    [
+     [
+      "root",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ],
+     [
+      "index",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Downcast",
+    "named",
+    [
+     [
+      "root",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ],
+     [
+      "discriminant",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "PointeeInfo": {
+  "fields": [
+   [
+    "layout",
+    [
+     "adt",
+     "LayoutStrategy"
+    ]
+   ],
+   [
+    "inhabited",
+    [
+     "bool"
+    ]
+   ],
+   [
+    "unsafe_cells",
+    [
+     "adt",
+     "UnsafeCellStrategy"
+    ]
+   ],
+   [
+    "freeze",
+    [
+     "bool"
+    ]
+   ],
+   [
+    "unpin",
+    [
+     "bool"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "Pointer": {
+  "fields": [
+   [
+    "thin_pointer",
+    [
+     "adt",
+     "ThinPointer"
+    ]
+   ],
+   [
+    "metadata",
+    [
+     "option",
+     [
+      "adt",
+      "PointerMeta"
+     ]
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "PointerMeta": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "ElementCount",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ],
+   [
+    "VTablePointer",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "ThinPointer"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "PointerMetaKind": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "None",
+    "unit",
+    []
+   ],
+   [
+    "ElementCount",
+    "unit",
+    []
+   ],
+   [
+    "VTablePointer",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "TraitName"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "Program": {
+  "fields": [
+   [
+    "functions",
+    [
+     "map",
+     [
+      "adt",
+      "FnName"
+     ],
+     [
+      "adt",
+      "Function"
+     ]
+    ]
+   ],
+   [
+    "start",
+    [
+     "adt",
+     "FnName"
+    ]
+   ],
+   [
+    "globals",
+    [
+     "map",
+     [
+      "adt",
+      "GlobalName"
+     ],
+     [
+      "adt",
+      "Global"
+     ]
+    ]
+   ],
+   [
+    "traits",
+    [
+     "map",
+     [
+      "adt",
+      "TraitName"
+     ],
+     [
+      "set",
+      [
+       "adt",
+       "TraitMethodName"
+      ]
+     ]
+    ]
+   ],
+   [
+    "vtables",
+    [
+     "map",
+     [
+      "adt",
+      "VTableName"
+     ],
+     [
+      "adt",
+      "VTable"
+     ]
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "ProvenanceFrag": {
+  "fields": [
+   [
+    "provenance",
+    [
+     "tuple",
+     [
+      [
+       "adt",
+       "AllocId"
+      ],
+      [
+       "unit"
+      ]
+     ]
+    ]
+   ],
+   [
+    "position",
+    [
+     "int"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "PtrType": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Ref",
+    "named",
+    [
+     [
+      "mutbl",
+      [
+       "adt",
+       "Mutability"
+      ]
+     ],
+     [
+      "pointee",
+      [
+       "adt",
+       "PointeeInfo"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Box",
+    "named",
+    [
+     [
+      "pointee",
+      [
+       "adt",
+       "PointeeInfo"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Raw",
+    "named",
+    [
+     [
+      "meta_kind",
+      [
+       "adt",
+       "PointerMetaKind"
+      ]
+     ]
+    ]
+   ],
+   [
+    "FnPtr",
+    "unit",
+    []
+   ],
+   [
+    "VTablePtr",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "TraitName"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "RelOp": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Lt",
+    "unit",
+    []
+   ],
+   [
+    "Gt",
+    "unit",
+    []
+   ],
+   [
+    "Le",
+    "unit",
+    []
+   ],
+   [
+    "Ge",
+    "unit",
+    []
+   ],
+   [
+    "Eq",
+    "unit",
+    []
+   ],
+   [
+    "Ne",
+    "unit",
+    []
+   ],
+   [
+    "Cmp",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "Relocation": {
+  "fields": [
+   [
+    "name",
+    [
+     "adt",
+     "GlobalName"
+    ]
+   ],
+   [
+    "offset",
+    [
+     "size"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "Signedness": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": true,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Signed",
+    "unit",
+    []
+   ],
+   [
+    "Unsigned",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "StackFrame": {
+  "fields": [
+   [
+    "func",
+    [
+     "adt",
+     "Function"
+    ]
+   ],
+   [
+    "locals",
+    [
+     "map",
+     [
+      "adt",
+      "LocalName"
+     ],
+     [
+      "adt",
+      "ThinPointer"
+     ]
+    ]
+   ],
+   [
+    "stack_pop_action",
+    [
+     "adt",
+     "StackPopAction"
+    ]
+   ],
+   [
+    "next_block",
+    [
+     "adt",
+     "BbName"
+    ]
+   ],
+   [
+    "next_stmt",
+    [
+     "int"
+    ]
+   ],
+   [
+    "extra",
+    [
+     "unit"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "StackPopAction": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "BottomOfStack",
+    "unit",
+    []
+   ],
+   [
+    "BackToCaller",
+    "named",
+    [
+     [
+      "next_block",
+      [
+       "option",
+       [
+        "adt",
+        "BbName"
+       ]
+      ]
+     ],
+     [
+      "unwind_block",
+      [
+       "option",
+       [
+        "adt",
+        "BbName"
+       ]
+      ]
+     ],
+     [
+      "ret_val_ptr",
+      [
+       "adt",
+       "ThinPointer"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "Statement": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Assign",
+    "named",
+    [
+     [
+      "destination",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ],
+     [
+      "source",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ]
+    ]
+   ],
+   [
+    "PlaceMention",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ]
+    ]
+   ],
+   [
+    "SetDiscriminant",
+    "named",
+    [
+     [
+      "destination",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ],
+     [
+      "value",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Validate",
+    "named",
+    [
+     [
+      "place",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ],
+     [
+      "fn_entry",
+      [
+       "bool"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Deinit",
+    "named",
+    [
+     [
+      "place",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ]
+    ]
+   ],
+   [
+    "StorageLive",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "LocalName"
+      ]
+     ]
+    ]
+   ],
+   [
+    "StorageDead",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "LocalName"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "TerminationInfo": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Ub",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "str"
+      ]
+     ]
+    ]
+   ],
+   [
+    "MachineStop",
+    "unit",
+    []
+   ],
+   [
+    "Abort",
+    "unit",
+    []
+   ],
+   [
+    "IllFormed",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "str"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Deadlock",
+    "unit",
+    []
+   ],
+   [
+    "MemoryLeak",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "Terminator": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Goto",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "BbName"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Switch",
+    "named",
+    [
+     [
+      "value",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ],
+     [
+      "cases",
+      [
+       "map",
+       [
+        "int"
+       ],
+       [
+        "adt",
+        "BbName"
+       ]
+      ]
+     ],
+     [
+      "fallback",
+      [
+       "adt",
+       "BbName"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Unreachable",
+    "unit",
+    []
+   ],
+   [
+    "Intrinsic",
+    "named",
+    [
+     [
+      "intrinsic",
+      [
+       "adt",
+       "IntrinsicOp"
+      ]
+     ],
+     [
+      "arguments",
+      [
+       "list",
+       [
+        "adt",
+        "ValueExpr"
+       ]
+      ]
+     ],
+     [
+      "ret",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ],
+     [
+      "next_block",
+      [
+       "option",
+       [
+        "adt",
+        "BbName"
+       ]
+      ]
+     ]
+    ]
+   ],
+   [
+    "Call",
+    "named",
+    [
+     [
+      "callee",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ],
+     [
+      "calling_convention",
+      [
+       "adt",
+       "CallingConvention"
+      ]
+     ],
+     [
+      "arguments",
+      [
+       "list",
+       [
+        "adt",
+        "ArgumentExpr"
+       ]
+      ]
+     ],
+     [
+      "ret",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ],
+     [
+      "next_block",
+      [
+       "option",
+       [
+        "adt",
+        "BbName"
+       ]
+      ]
+     ],
+     [
+      "unwind_block",
+      [
+       "option",
+       [
+        "adt",
+        "BbName"
+       ]
+      ]
+     ]
+    ]
+   ],
+   [
+    "Return",
+    "unit",
+    []
+   ],
+   [
+    "StartUnwind",
+    "named",
+    [
+     [
+      "unwind_payload",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ],
+     [
+      "unwind_block",
+      [
+       "adt",
+       "BbName"
+      ]
+     ]
+    ]
+   ],
+   [
+    "StopUnwind",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "BbName"
+      ]
+     ]
+    ]
+   ],
+   [
+    "ResumeUnwind",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "ThinPointer": {
+  "fields": [
+   [
+    "addr",
+    [
+     "int"
+    ]
+   ],
+   [
+    "provenance",
+    [
+     "option",
+     [
+      "tuple",
+      [
+       [
+        "adt",
+        "AllocId"
+       ],
+       [
+        "unit"
+       ]
+      ]
+     ]
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "Thread": {
+  "fields": [
+   [
+    "stack",
+    [
+     "list",
+     [
+      "adt",
+      "StackFrame"
+     ]
+    ]
+   ],
+   [
+    "state",
+    [
+     "adt",
+     "ThreadState"
+    ]
+   ],
+   [
+    "unwind_payloads",
+    [
+     "list",
+     [
+      "adt",
+      "ThinPointer"
+     ]
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "ThreadState": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Enabled",
+    "unit",
+    []
+   ],
+   [
+    "BlockedOnJoin",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ],
+   [
+    "BlockedOnLock",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Terminated",
+    "unit",
+    []
+   ]
+  ]
+ },
+ "TraitMethodName": {
+  "fields": [
+   [
+    "0",
+    [
+     "name"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": true,
+  "variants": []
+ },
+ "TraitName": {
+  "fields": [
+   [
+    "0",
+    [
+     "name"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": true,
+  "variants": []
+ },
+ "TupleHeadLayout": {
+  "fields": [
+   [
+    "end",
+    [
+     "size"
+    ]
+   ],
+   [
+    "align",
+    [
+     "align"
+    ]
+   ],
+   [
+    "packed_align",
+    [
+     "option",
+     [
+      "align"
+     ]
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "Type": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Int",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "IntType"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Bool",
+    "unit",
+    []
+   ],
+   [
+    "Ptr",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "PtrType"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Tuple",
+    "named",
+    [
+     [
+      "sized_fields",
+      [
+       "list",
+       [
+        "tuple",
+        [
+         [
+          "size"
+         ],
+         [
+          "adt",
+          "Type"
+         ]
+        ]
+       ]
+      ]
+     ],
+     [
+      "sized_head_layout",
+      [
+       "adt",
+       "TupleHeadLayout"
+      ]
+     ],
+     [
+      "unsized_field",
+      [
+       "option",
+       [
+        "adt",
+        "Type"
+       ]
+      ]
+     ]
+    ]
+   ],
+   [
+    "Array",
+    "named",
+    [
+     [
+      "elem",
+      [
+       "adt",
+       "Type"
+      ]
+     ],
+     [
+      "count",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Slice",
+    "named",
+    [
+     [
+      "elem",
+      [
+       "adt",
+       "Type"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Union",
+    "named",
+    [
+     [
+      "fields",
+      [
+       "list",
+       [
+        "tuple",
+        [
+         [
+          "size"
+         ],
+         [
+          "adt",
+          "Type"
+         ]
+        ]
+       ]
+      ]
+     ],
+     [
+      "chunks",
+      [
+       "list",
+       [
+        "tuple",
+        [
+         [
+          "size"
+         ],
+         [
+          "size"
+         ]
+        ]
+       ]
+      ]
+     ],
+     [
+      "size",
+      [
+       "size"
+      ]
+     ],
+     [
+      "align",
+      [
+       "align"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Enum",
+    "named",
+    [
+     [
+      "variants",
+      [
+       "map",
+       [
+        "int"
+       ],
+       [
+        "adt",
+        "Variant"
+       ]
+      ]
+     ],
+     [
+      "discriminant_ty",
+      [
+       "adt",
+       "IntType"
+      ]
+     ],
+     [
+      "discriminator",
+      [
+       "adt",
+       "Discriminator"
+      ]
+     ],
+     [
+      "size",
+      [
+       "size"
+      ]
+     ],
+     [
+      "align",
+      [
+       "align"
+      ]
+     ]
+    ]
+   ],
+   [
+    "TraitObject",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "TraitName"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "UnOp": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Int",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "IntUnOp"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Cast",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "CastOp"
+      ]
+     ]
+    ]
+   ],
+   [
+    "GetThinPointer",
+    "unit",
+    []
+   ],
+   [
+    "GetMetadata",
+    "unit",
+    []
+   ],
+   [
+    "ComputeSize",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "Type"
+      ]
+     ]
+    ]
+   ],
+   [
+    "ComputeAlign",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "Type"
+      ]
+     ]
+    ]
+   ],
+   [
+    "VTableMethodLookup",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "TraitMethodName"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "UnsafeCellStrategy": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Sized",
+    "named",
+    [
+     [
+      "cells",
+      [
+       "list",
+       [
+        "tuple",
+        [
+         [
+          "size"
+         ],
+         [
+          "size"
+         ]
+        ]
+       ]
+      ]
+     ]
+    ]
+   ],
+   [
+    "Slice",
+    "named",
+    [
+     [
+      "element_cells",
+      [
+       "list",
+       [
+        "tuple",
+        [
+         [
+          "size"
+         ],
+         [
+          "size"
+         ]
+        ]
+       ]
+      ]
+     ]
+    ]
+   ],
+   [
+    "TraitObject",
+    "unit",
+    []
+   ],
+   [
+    "Tuple",
+    "named",
+    [
+     [
+      "head_cells",
+      [
+       "list",
+       [
+        "tuple",
+        [
+         [
+          "size"
+         ],
+         [
+          "size"
+         ]
+        ]
+       ]
+      ]
+     ],
+     [
+      "tail_cells",
+      [
+       "adt",
+       "UnsafeCellStrategy"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "VTable": {
+  "fields": [
+   [
+    "trait_name",
+    [
+     "adt",
+     "TraitName"
+    ]
+   ],
+   [
+    "size",
+    [
+     "size"
+    ]
+   ],
+   [
+    "align",
+    [
+     "align"
+    ]
+   ],
+   [
+    "cells",
+    [
+     "list",
+     [
+      "tuple",
+      [
+       [
+        "size"
+       ],
+       [
+        "size"
+       ]
+      ]
+     ]
+    ]
+   ],
+   [
+    "methods",
+    [
+     "map",
+     [
+      "adt",
+      "TraitMethodName"
+     ],
+     [
+      "adt",
+      "FnName"
+     ]
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "VTableName": {
+  "fields": [
+   [
+    "0",
+    [
+     "name"
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": true,
+  "variants": []
+ },
+ "Value": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Int",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "int"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Bool",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "bool"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Ptr",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "Pointer"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Tuple",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "list",
+       [
+        "adt",
+        "Value"
+       ]
+      ]
+     ]
+    ]
+   ],
+   [
+    "Variant",
+    "named",
+    [
+     [
+      "discriminant",
+      [
+       "int"
+      ]
+     ],
+     [
+      "data",
+      [
+       "adt",
+       "Value"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Union",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "list",
+       [
+        "list",
+        [
+         "adt",
+         "AbstractByte"
+        ]
+       ]
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "ValueExpr": {
+  "fields": [],
+  "kind": "enum",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": [
+   [
+    "Constant",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "adt",
+       "Constant"
+      ]
+     ],
+     [
+      "1",
+      [
+       "adt",
+       "Type"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Tuple",
+    "tuple",
+    [
+     [
+      "0",
+      [
+       "list",
+       [
+        "adt",
+        "ValueExpr"
+       ]
+      ]
+     ],
+     [
+      "1",
+      [
+       "adt",
+       "Type"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Union",
+    "named",
+    [
+     [
+      "field",
+      [
+       "int"
+      ]
+     ],
+     [
+      "expr",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ],
+     [
+      "union_ty",
+      [
+       "adt",
+       "Type"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Variant",
+    "named",
+    [
+     [
+      "discriminant",
+      [
+       "int"
+      ]
+     ],
+     [
+      "data",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ],
+     [
+      "enum_ty",
+      [
+       "adt",
+       "Type"
+      ]
+     ]
+    ]
+   ],
+   [
+    "GetDiscriminant",
+    "named",
+    [
+     [
+      "place",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ]
+    ]
+   ],
+   [
+    "Load",
+    "named",
+    [
+     [
+      "source",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ]
+    ]
+   ],
+   [
+    "AddrOf",
+    "named",
+    [
+     [
+      "target",
+      [
+       "adt",
+       "PlaceExpr"
+      ]
+     ],
+     [
+      "ptr_ty",
+      [
+       "adt",
+       "PtrType"
+      ]
+     ]
+    ]
+   ],
+   [
+    "UnOp",
+    "named",
+    [
+     [
+      "operator",
+      [
+       "adt",
+       "UnOp"
+      ]
+     ],
+     [
+      "operand",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ]
+    ]
+   ],
+   [
+    "BinOp",
+    "named",
+    [
+     [
+      "operator",
+      [
+       "adt",
+       "BinOp"
+      ]
+     ],
+     [
+      "left",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ],
+     [
+      "right",
+      [
+       "adt",
+       "ValueExpr"
+      ]
+     ]
+    ]
+   ]
+  ]
+ },
+ "Variant": {
+  "fields": [
+   [
+    "ty",
+    [
+     "adt",
+     "Type"
+    ]
+   ],
+   [
+    "tagger",
+    [
+     "map",
+     [
+      "size"
+     ],
+     [
+      "tuple",
+      [
+       [
+        "adt",
+        "IntType"
+       ],
+       [
+        "int"
+       ]
+      ]
+     ]
+    ]
+   ]
+  ],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ },
+ "x86_64": {
+  "fields": [],
+  "kind": "struct",
+  "prelude": false,
+  "tuple_struct": false,
+  "variants": []
+ }
+}

@@ -1,0 +1,3082 @@
+{
+  "name": "op",
+  "def_path": "fx::op",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+    "line_start": 6,
+    "col_start": 0,
+    "line_end": 13,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                "Bool"
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    "Bool"
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "name"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "args"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Tuple": [
+            {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "set"
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "left"
+      },
+      {
+        "index": 29,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "right"
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "sets"
+      },
+      {
+        "index": 33,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 39,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 40,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 41,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 42,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 43,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 44,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 45,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 46,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 47,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 48,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 49,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 50,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 51,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 7,
+                "col_start": 15,
+                "line_end": 7,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 9,
+                "line_end": 8,
+                "col_end": 17
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "__trust_total_clone",
+            "args": [
+              {
+                "Copy": {
+                  "local": 34,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      115,
+                      101,
+                      116,
+                      95,
+                      105,
+                      110
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 12,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 8,
+              "col_start": 9,
+              "line_end": 8,
+              "col_end": 17
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3453784839249583331,
+              "def_index": 29483,
+              "substs_digest": [
+                3729329806270920139,
+                13985846517268669170
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3453784839249583331,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 35,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 70,
+                "line_end": 9,
+                "col_end": 83
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 35,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 70,
+                "line_end": 9,
+                "col_end": 83
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 70,
+                "line_end": 9,
+                "col_end": 83
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 70,
+                "line_end": 9,
+                "col_end": 83
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 23,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                16
+              ]
+            ],
+            "otherwise": 8,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 9,
+              "col_start": 70,
+              "line_end": 9,
+              "col_end": 83
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 19,
+                "line_end": 8,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 36,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 19,
+                "line_end": 8,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 19,
+                "line_end": 8,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 19,
+                "line_end": 8,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ]
+            ],
+            "otherwise": 22,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 8,
+              "col_start": 19,
+              "line_end": 8,
+              "col_end": 27
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 37,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 32,
+                "line_end": 8,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "__trust_total_clone",
+            "args": [
+              {
+                "Copy": {
+                  "local": 37,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      115,
+                      101,
+                      116,
+                      95,
+                      105,
+                      110,
+                      115,
+                      101,
+                      114,
+                      116
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 11,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 8,
+              "col_start": 32,
+              "line_end": 8,
+              "col_end": 44
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3453784839249583331,
+              "def_index": 29483,
+              "substs_digest": [
+                3729329806270920139,
+                13985846517268669170
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3453784839249583331,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 38,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 46,
+                "line_end": 8,
+                "col_end": 54
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 38,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 46,
+                "line_end": 8,
+                "col_end": 54
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 46,
+                "line_end": 8,
+                "col_end": 54
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 46,
+                "line_end": 8,
+                "col_end": 54
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ]
+            ],
+            "otherwise": 21,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 8,
+              "col_start": 46,
+              "line_end": 8,
+              "col_end": 54
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 8,
+              "col_start": 32,
+              "line_end": 8,
+              "col_end": 44
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 12,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 8,
+              "col_start": 9,
+              "line_end": 8,
+              "col_end": 17
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 11,
+                "col_start": 13,
+                "line_end": 11,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 24
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 39,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 9,
+                "line_end": 9,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "__trust_total_clone",
+            "args": [
+              {
+                "Copy": {
+                  "local": 39,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      115,
+                      101,
+                      116,
+                      95,
+                      117,
+                      110,
+                      105,
+                      111,
+                      110
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 16,
+              "projections": []
+            },
+            "target": 15,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 9,
+              "col_start": 9,
+              "line_end": 9,
+              "col_end": 20
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3453784839249583331,
+              "def_index": 29483,
+              "substs_digest": [
+                3729329806270920139,
+                13985846517268669170
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3453784839249583331,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 40,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 23,
+                "line_end": 9,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "__trust_total_clone",
+            "args": [
+              {
+                "Copy": {
+                  "local": 40,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      115,
+                      101,
+                      116,
+                      95,
+                      100,
+                      105,
+                      102,
+                      102
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 15,
+              "projections": []
+            },
+            "target": 14,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 9,
+              "col_start": 23,
+              "line_end": 9,
+              "col_end": 33
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3453784839249583331,
+              "def_index": 29483,
+              "substs_digest": [
+                3729329806270920139,
+                13985846517268669170
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3453784839249583331,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 41,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 36,
+                "line_end": 9,
+                "col_end": 51
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "__trust_total_clone",
+            "args": [
+              {
+                "Copy": {
+                  "local": 41,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      115,
+                      101,
+                      116,
+                      95,
+                      105,
+                      110,
+                      116,
+                      101,
+                      114,
+                      115,
+                      101,
+                      99,
+                      116
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 14,
+              "projections": []
+            },
+            "target": 13,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 9,
+              "col_start": 36,
+              "line_end": 9,
+              "col_end": 51
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3453784839249583331,
+              "def_index": 29483,
+              "substs_digest": [
+                3729329806270920139,
+                13985846517268669170
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3453784839249583331,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 42,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 54,
+                "line_end": 9,
+                "col_end": 68
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "__trust_total_clone",
+            "args": [
+              {
+                "Copy": {
+                  "local": 42,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      115,
+                      101,
+                      116,
+                      95,
+                      115,
+                      117,
+                      98,
+                      115,
+                      101,
+                      116,
+                      101,
+                      113
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 13,
+              "projections": []
+            },
+            "target": 12,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 9,
+              "col_start": 54,
+              "line_end": 9,
+              "col_end": 68
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3453784839249583331,
+              "def_index": 29483,
+              "substs_digest": [
+                3729329806270920139,
+                13985846517268669170
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3453784839249583331,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ]
+            ],
+            "otherwise": 20,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 9,
+              "col_start": 54,
+              "line_end": 9,
+              "col_end": 68
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 14,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                11
+              ]
+            ],
+            "otherwise": 20,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 9,
+              "col_start": 36,
+              "line_end": 9,
+              "col_end": 51
+            }
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 15,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                10
+              ]
+            ],
+            "otherwise": 20,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 9,
+              "col_start": 23,
+              "line_end": 9,
+              "col_end": 33
+            }
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 16,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                9
+              ]
+            ],
+            "otherwise": 20,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 9,
+              "col_start": 9,
+              "line_end": 9,
+              "col_end": 20
+            }
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 43,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 10,
+                "col_start": 9,
+                "line_end": 10,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "__trust_total_clone",
+            "args": [
+              {
+                "Copy": {
+                  "local": 43,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      115,
+                      101,
+                      116,
+                      95,
+                      98,
+                      105,
+                      103,
+                      95,
+                      117,
+                      110,
+                      105,
+                      111,
+                      110
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 20,
+              "projections": []
+            },
+            "target": 18,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 10,
+              "col_start": 9,
+              "line_end": 10,
+              "col_end": 24
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3453784839249583331,
+              "def_index": 29483,
+              "substs_digest": [
+                3729329806270920139,
+                13985846517268669170
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3453784839249583331,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 44,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 10,
+                "col_start": 26,
+                "line_end": 10,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 44,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 10,
+                "col_start": 26,
+                "line_end": 10,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 17,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 10,
+                "col_start": 26,
+                "line_end": 10,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 18,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 10,
+                "col_start": 26,
+                "line_end": 10,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 19,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ]
+            ],
+            "otherwise": 19,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 10,
+              "col_start": 26,
+              "line_end": 10,
+              "col_end": 32
+            }
+          }
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 20,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ]
+            ],
+            "otherwise": 17,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 10,
+              "col_start": 9,
+              "line_end": 10,
+              "col_end": 24
+            }
+          }
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 45,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 10,
+                "col_start": 27,
+                "line_end": 10,
+                "col_end": 31
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 45,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 0,
+                          "min_length": 1,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 10,
+                "col_start": 27,
+                "line_end": 10,
+                "col_end": 31
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 33,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 32,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 10,
+                "col_start": 40,
+                "line_end": 10,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "fx::f2",
+            "args": [
+              {
+                "Move": {
+                  "local": 33,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 24,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 10,
+              "col_start": 37,
+              "line_end": 10,
+              "col_end": 46
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 14278437073076274772,
+              "def_index": 4,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 14278437073076274772,
+              "krate_name": "fx"
+            }
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 46,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 71,
+                "line_end": 9,
+                "col_end": 75
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 46,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 0,
+                          "min_length": 2,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 71,
+                "line_end": 9,
+                "col_end": 75
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 47,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 77,
+                "line_end": 9,
+                "col_end": 82
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 47,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 1,
+                          "min_length": 2,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 77,
+                "line_end": 9,
+                "col_end": 82
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 30,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 28,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 91,
+                "line_end": 9,
+                "col_end": 96
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 31,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 29,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 9,
+                "col_start": 98,
+                "line_end": 9,
+                "col_end": 104
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "fx::f1",
+            "args": [
+              {
+                "Move": {
+                  "local": 30,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 31,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 24,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 9,
+              "col_start": 88,
+              "line_end": 9,
+              "col_end": 105
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 14278437073076274772,
+              "def_index": 3,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 14278437073076274772,
+              "krate_name": "fx"
+            }
+          }
+        }
+      },
+      {
+        "id": 21,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 48,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 47,
+                "line_end": 8,
+                "col_end": 50
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 48,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 0,
+                          "min_length": 2,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 47,
+                "line_end": 8,
+                "col_end": 50
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 49,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 52,
+                "line_end": 8,
+                "col_end": 53
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 49,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 1,
+                          "min_length": 2,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 52,
+                "line_end": 8,
+                "col_end": 53
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 23
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 50,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 20,
+                "line_end": 8,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 50,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 0,
+                          "min_length": 2,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 20,
+                "line_end": 8,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 51,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 23,
+                "line_end": 8,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 51,
+                    "projections": [
+                      "Deref",
+                      {
+                        "ConstantIndex": {
+                          "offset": 1,
+                          "min_length": 2,
+                          "from_end": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 23,
+                "line_end": 8,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 23
+        }
+      },
+      {
+        "id": 23,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 25,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 62,
+                "line_end": 8,
+                "col_end": 66
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 24,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 8,
+                "col_start": 68,
+                "line_end": 8,
+                "col_end": 70
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "fx::f1",
+            "args": [
+              {
+                "Move": {
+                  "local": 26,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 27,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 24,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+              "line_start": 8,
+              "col_start": 59,
+              "line_end": 8,
+              "col_end": 71
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 14278437073076274772,
+              "def_index": 3,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 14278437073076274772,
+              "krate_name": "fx"
+            }
+          }
+        }
+      },
+      {
+        "id": 24,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::option::Option",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::option::Option<bool>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 3,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/slice_orpat_call_havoc.rs",
+                "line_start": 7,
+                "col_start": 4,
+                "line_end": 12,
+                "col_end": 6
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Adt": {
+        "name": "core::option::Option",
+        "fields": [
+          [
+            "__tag",
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          ],
+          [
+            "__v1_0",
+            "Bool"
+          ]
+        ],
+        "variants": [
+          {
+            "name": "None",
+            "discriminant": 0,
+            "fields": []
+          },
+          {
+            "name": "Some",
+            "discriminant": 1,
+            "fields": [
+              [
+                "0",
+                "Bool"
+              ]
+            ]
+          }
+        ],
+        "disc_index_safe": false,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Enum"
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -72,10 +72,7 @@ fn planned_shape() -> CleanOriginShape {
         nonzero_value: RecBodyExpr::Rec,
         rec_args: vec![
             RecBodyExpr::Pred,
-            RecBodyExpr::Mul(
-                Box::new(RecBodyExpr::Param(1)),
-                Box::new(RecBodyExpr::NatConst(2)),
-            ),
+            RecBodyExpr::Mul(Box::new(RecBodyExpr::Param(1)), Box::new(RecBodyExpr::NatConst(2))),
         ],
         measure_index: 0,
         lowering: trust_clean_origin::WfLowering::OnParameter,
@@ -88,10 +85,7 @@ fn recognised_body() -> WfRecBody {
         nonzero_value: RecBodyExpr::Rec,
         rec_args: vec![
             RecBodyExpr::Pred,
-            RecBodyExpr::Mul(
-                Box::new(RecBodyExpr::Param(1)),
-                Box::new(RecBodyExpr::NatConst(2)),
-            ),
+            RecBodyExpr::Mul(Box::new(RecBodyExpr::Param(1)), Box::new(RecBodyExpr::NatConst(2))),
         ],
         measure_index: 0,
     }
@@ -155,6 +149,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Termina
         is_unsafe_sig: false,
         unwind: UnwindEdge::Continue,
         callee_identity: None,
+        callee_key: None,
     }
 }
 
@@ -273,6 +268,7 @@ fn emitted_dbl() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -285,11 +281,7 @@ fn with_callee(mut body: VerifiableFunction, block: usize, callee: &str) -> Veri
 }
 
 /// Replace the argument list of one block's `Call` terminator.
-fn with_args(
-    mut body: VerifiableFunction,
-    block: usize,
-    args: Vec<Operand>,
-) -> VerifiableFunction {
+fn with_args(mut body: VerifiableFunction, block: usize, args: Vec<Operand>) -> VerifiableFunction {
     if let Terminator::Call { args: slot, .. } = &mut body.body.blocks[block].terminator {
         *slot = args;
     }
@@ -297,8 +289,13 @@ fn with_args(
 }
 
 fn gate_side_b(env: &Environment, body: &WfRecBody) -> Result<(), String> {
-    let reflected = trust_clean_origin::reflect_wf::reflect_wf_functional(env, "dbl", body, trust_clean_origin::WfLowering::OnParameter)
-        .map_err(|detail| format!("reflection refused: {detail}"))?;
+    let reflected = trust_clean_origin::reflect_wf::reflect_wf_functional(
+        env,
+        "dbl",
+        body,
+        trust_clean_origin::WfLowering::OnParameter,
+    )
+    .map_err(|detail| format!("reflection refused: {detail}"))?;
     let plan = plan_clean_origin_body(env, "dbl").expect("dbl plans");
     trust_clean_origin::gate::check_faithful_wf_functional(
         env,
@@ -392,10 +389,7 @@ fn control_16_a_wrong_operator_is_refused_at_both_layers() {
     let wrong_reading = WfRecBody {
         rec_args: vec![
             RecBodyExpr::Pred,
-            RecBodyExpr::Add(
-                Box::new(RecBodyExpr::Param(1)),
-                Box::new(RecBodyExpr::NatConst(2)),
-            ),
+            RecBodyExpr::Add(Box::new(RecBodyExpr::Param(1)), Box::new(RecBodyExpr::NatConst(2))),
         ],
         ..recognised_body()
     };
@@ -434,10 +428,7 @@ fn control_16_b_swapped_operands_are_refused_at_both_layers() {
     let swapped_reading = WfRecBody {
         rec_args: vec![
             RecBodyExpr::Pred,
-            RecBodyExpr::Mul(
-                Box::new(RecBodyExpr::NatConst(2)),
-                Box::new(RecBodyExpr::Param(1)),
-            ),
+            RecBodyExpr::Mul(Box::new(RecBodyExpr::NatConst(2)), Box::new(RecBodyExpr::Param(1))),
         ],
         ..recognised_body()
     };
@@ -520,10 +511,7 @@ fn control_16_d_swapped_self_call_operands_are_refused_at_both_layers() {
     // The kernel half, with the recognizer removed.
     let swapped_reading = WfRecBody {
         rec_args: vec![
-            RecBodyExpr::Mul(
-                Box::new(RecBodyExpr::Param(1)),
-                Box::new(RecBodyExpr::NatConst(2)),
-            ),
+            RecBodyExpr::Mul(Box::new(RecBodyExpr::Param(1)), Box::new(RecBodyExpr::NatConst(2))),
             RecBodyExpr::Pred,
         ],
         ..recognised_body()

@@ -1,8 +1,11 @@
 //! Cross-crate sample for the active v6/D3 full-verifier fleet.
 //!
-//! TrustWP remains a readable historical wire identity, but is not a required
-//! engine and owns no routed obligation. The three active suites are TrustMC,
-//! TrustVC, and TY.
+//! The three primary suites are TrustMC, TrustVC, and TY: every routed
+//! obligation's primary is one of them. Since the 2026-11-03 native WP
+//! reintegration (docs/DECISION_QUEUE.md, "one program semantics; native WP
+//! reintegration") TrustWP is a required engine again, but only as the
+//! body-aware deductive *fallback* for postconditions: it owns no primary
+//! route, and its historical suite metadata cannot claim one.
 
 use trust_router::FullVerificationEngine;
 use trust_router::full_verification::{
@@ -10,8 +13,9 @@ use trust_router::full_verification::{
     TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY, required_native_engines,
 };
 use trust_verifier_api::{
-    BundleSubject, EvidenceStatus, MetadataEntry, ObligationKind, SourceLocation,
-    TrustContractBundle, TrustObligation, VerificationRunStatus, VerifierExecutionContext,
+    BundleSubject, EngineCapability, EngineKind, EvidenceStatus, MetadataEntry, ObligationKind,
+    ReasoningKind, SourceLocation, SupportLevel, TrustContractBundle, TrustObligation,
+    VerificationRunStatus, VerifierExecutionContext,
 };
 
 fn obligation(kind: ObligationKind, id: &str) -> TrustObligation {
@@ -41,13 +45,30 @@ fn bundle(obligations: Vec<TrustObligation>) -> TrustContractBundle {
 }
 
 #[test]
-fn required_native_fleet_is_exactly_trust_vc_trust_mc_and_ty() {
-    let names = required_native_engines()
-        .into_iter()
-        .map(|engine| engine.manifest().name.clone())
-        .collect::<Vec<_>>();
-    assert_eq!(names, ["trust-vc", "trust-mc", "ty"]);
-    assert!(!names.iter().any(|name| name == "trust-wp"));
+fn required_native_fleet_is_the_three_primary_suites_and_the_trust_wp_postcondition_fallback() {
+    let engines = required_native_engines();
+    let names = engines.iter().map(|engine| engine.manifest().name.clone()).collect::<Vec<_>>();
+    assert_eq!(names, ["trust-vc", "trust-mc", "ty", "trust-wp"]);
+
+    // TrustWP is in the fleet only as the postcondition deductive fallback
+    // (`routing::fallback_route`). Its manifest must not advertise any other
+    // obligation kind or reasoning mode: a wider manifest would let it be
+    // offered obligations no fallback route admits. That it is never a
+    // primary is pinned by the routing sample below.
+    let wp = engines
+        .iter()
+        .find(|engine| engine.manifest().name == "trust-wp")
+        .expect("trust-wp is in the required fleet")
+        .manifest();
+    assert_eq!(wp.kind, EngineKind::Deductive);
+    assert_eq!(wp.proof_modes, [ReasoningKind::Deductive]);
+    assert_eq!(
+        wp.capabilities,
+        [EngineCapability {
+            obligation_kind: ObligationKind::Postcondition,
+            support: SupportLevel::Supported,
+        }]
+    );
 }
 
 #[test]

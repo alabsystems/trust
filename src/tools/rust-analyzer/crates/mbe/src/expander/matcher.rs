@@ -347,7 +347,7 @@ struct MatchState<'t> {
 /// Process the matcher positions of `cur_items` until it is empty. In the process, this will
 /// produce more items in `next_items`, `eof_items`, and `bb_items`.
 ///
-/// For more info about the how this happens, see the module-level doc comments and the inline
+/// For more info about how this happens, see the module-level doc comments and the inline
 /// comments of this function.
 ///
 /// # Parameters
@@ -794,7 +794,9 @@ fn match_meta_var<'t>(
             // [1]: https://github.com/rust-lang/rust/blob/f0c4da499/compiler/rustc_expand/src/mbe/macro_parser.rs#L576
             match input.peek() {
                 Some(TtElement::Leaf(tt::Leaf::Ident(it))) => {
-                    let is_err = if it.is_raw.no() && matches!(expr, ExprKind::Expr2021) {
+                    let is_err = if it.kind != tt::IdentKind::Raw
+                        && matches!(expr, ExprKind::Expr2021)
+                    {
                         it.sym == sym::underscore || it.sym == sym::let_ || it.sym == sym::const_
                     } else {
                         it.sym == sym::let_
@@ -842,11 +844,14 @@ fn match_meta_var<'t>(
                 _ => unreachable!(),
             }
             .err();
-            let tt_result = input.from_savepoint(savepoint);
-            return ValueResult {
-                value: Fragment::Tokens { tree: tt_result, origin: TokensOrigin::Raw },
-                err,
+            let value = match err {
+                Some(_) => Fragment::Empty,
+                None => Fragment::Tokens {
+                    tree: input.from_savepoint(savepoint),
+                    origin: TokensOrigin::Raw,
+                },
             };
+            return ValueResult { value, err };
         }
         MetaVarKind::Ty => (parser::PrefixEntryPoint::Ty, TokensOrigin::Ast),
         MetaVarKind::Pat => (parser::PrefixEntryPoint::PatTop, TokensOrigin::Ast),

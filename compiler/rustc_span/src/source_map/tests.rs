@@ -22,7 +22,7 @@ impl SourceMap {
     ///    * the LHS span must start at or before the RHS span.
     fn merge_spans(&self, sp_lhs: Span, sp_rhs: Span) -> Option<Span> {
         // Ensure we're at the same expansion ID.
-        if !sp_lhs.eq_ctxt(sp_rhs) {
+        if sp_lhs.ctxt() != sp_rhs.ctxt() {
             return None;
         }
 
@@ -796,4 +796,101 @@ fn read_binary_file_handles_lying_stat() {
     assert!(len > real.len());
     let bin = RealFileLoader.read_binary_file(kernel_max).unwrap();
     assert_eq!(&real[..], &bin[..]);
+}
+
+/// Trust (WS8.9, F-117): `SourceMap::load_file` refuses a NON-INJECTIVE
+/// `--remap-path-prefix` — two distinct files with different contents rendering as one
+/// virtual name — instead of returning the first file's `SourceFile` for the second
+/// (rustc's stable file id ignores the local path of a fully remapped file, so without the
+/// gate the second file is silently compiled from the first file's text). Same file
+/// twice, and byte-identical twins, stay admitted.
+mod non_injective_remap {
+    use rustc_data_structures::fx::FxHashMap;
+
+    use super::*;
+
+    struct MemLoader(FxHashMap<PathBuf, String>);
+
+    impl FileLoader for MemLoader {
+        fn file_exists(&self, path: &Path) -> bool {
+            self.0.contains_key(path)
+        }
+        fn read_file(&self, path: &Path) -> io::Result<String> {
+            self.0
+                .get(path)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.display().to_string()))
+        }
+        fn read_binary_file(&self, path: &Path) -> io::Result<Arc<[u8]>> {
+            self.read_file(path).map(|s| Arc::from(s.into_bytes().into_boxed_slice()))
+        }
+        fn current_directory(&self) -> io::Result<PathBuf> {
+            Ok(path("/work"))
+        }
+    }
+
+    fn sm(files: &[(&str, &str)]) -> SourceMap {
+        let loader = MemLoader(files.iter().map(|(p, s)| (path(p), s.to_string())).collect());
+        SourceMap::with_inputs(SourceMapInputs {
+            file_loader: Box::new(loader),
+            path_mapping: FilePathMapping::new(
+                vec![(path("/work/x"), path("/src")), (path("/work/y"), path("/src"))],
+                RemapPathScopeComponents::all(),
+            ),
+            hash_kind: SourceFileHashAlgorithm::Md5,
+            checksum_hash_kind: None,
+        })
+    }
+
+    #[test]
+    fn different_contents_are_refused_by_name() {
+        let sm = sm(&[
+            ("/work/x/m.rs", "pub fn m() -> u64 { 1 }"),
+            ("/work/y/m.rs", "pub fn m() -> u64 { 2 }"),
+        ]);
+        let first = sm.load_file(&path("/work/x/m.rs")).expect("first file loads");
+        assert_eq!(first.name.prefer_remapped_unconditionally().to_string(), path_str("/src/m.rs"));
+        let err = sm.load_file(&path("/work/y/m.rs")).expect_err("the colliding twin is refused");
+        let msg = err.to_string();
+        for needle in [
+            "non-injective --remap-path-prefix",
+            &path_str("/work/x/m.rs"),
+            &path_str("/work/y/m.rs"),
+            &format!("both render as `{}`", path_str("/src/m.rs")),
+            "their contents differ",
+        ] {
+            assert!(msg.contains(needle), "refusal does not name `{needle}`: {msg}");
+        }
+        // Fail-closed means nothing was registered for the refused file: the map still
+        // holds exactly the first file, and it is unchanged.
+        assert_eq!(sm.files().len(), 1);
+        assert_eq!(
+            sm.files()[0].src.as_deref().map(String::as_str),
+            Some("pub fn m() -> u64 { 1 }")
+        );
+    }
+
+    #[test]
+    fn identical_twins_and_the_same_file_twice_are_admitted() {
+        let sm = sm(&[
+            ("/work/x/m.rs", "pub fn m() -> u64 { 1 }"),
+            ("/work/y/m.rs", "pub fn m() -> u64 { 1 }"),
+        ]);
+        let a = sm.load_file(&path("/work/x/m.rs")).expect("first file loads");
+        let again =
+            sm.load_file(&path("/work/x/m.rs")).expect("the same file twice is the cached entry");
+        assert!(Arc::ptr_eq(&a, &again));
+        let twin = sm.load_file(&path("/work/y/m.rs")).expect("a byte-identical twin is admitted");
+        assert!(Arc::ptr_eq(&a, &twin), "indistinguishable by construction: one SourceFile");
+        assert_eq!(sm.files().len(), 1);
+    }
+
+    #[test]
+    fn binary_loads_take_the_same_gate() {
+        let sm = sm(&[("/work/x/m.rs", "abc"), ("/work/y/m.rs", "abd")]);
+        sm.load_binary_file(&path("/work/x/m.rs")).expect("first binary load");
+        let err =
+            sm.load_binary_file(&path("/work/y/m.rs")).expect_err("the colliding twin is refused");
+        assert!(err.to_string().contains("non-injective --remap-path-prefix"));
+    }
 }

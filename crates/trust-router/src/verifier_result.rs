@@ -18,7 +18,7 @@ use trust_types::{
     ProofEvidence, ProofStrength, SourceSpan, VcKind, VerificationCondition, VerificationResult,
 };
 
-use crate::mir_router::MirStrategy;
+use crate::MirStrategy;
 
 /// Stable identity for a proof obligation within a function.
 ///
@@ -37,12 +37,12 @@ impl StableObligationId {
     /// Build a stable ID for a VC.
     #[must_use]
     pub fn for_vc(vc: &VerificationCondition, occurrence: u32) -> Self {
+        use fmt::Write as _;
         let mut hasher = Sha256::new();
         hasher.update(b"trust-router-obligation-v1\n");
         hasher.update(vc.function.as_str().as_bytes());
         hasher.update(b"\n");
-        hasher.update(format!("{:?}", vc.kind).as_bytes());
-        hasher.update(b"\n");
+        let _ = write!(DigestWriter(&mut hasher), "{:?}\n", vc.kind);
         hasher.update(vc.formula.to_smtlib().as_bytes());
         let digest = hasher.finalize();
         Self { fingerprint: hex_128(&digest[..16]), occurrence }
@@ -58,15 +58,23 @@ impl StableObligationId {
         strategy: Option<&MirStrategy>,
         kind: &VcKind,
     ) -> Self {
+        use fmt::Write as _;
         let mut hasher = Sha256::new();
         hasher.update(b"trust-router-function-obligation-v1\n");
         hasher.update(def_path.as_bytes());
         hasher.update(b"\n");
-        hasher.update(format!("{strategy:?}").as_bytes());
-        hasher.update(b"\n");
-        hasher.update(format!("{kind:?}").as_bytes());
+        let _ = write!(DigestWriter(&mut hasher), "{strategy:?}\n{kind:?}");
         let digest = hasher.finalize();
         Self { fingerprint: hex_128(&digest[..16]), occurrence: 0 }
+    }
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl fmt::Write for DigestWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.update(s.as_bytes());
+        Ok(())
     }
 }
 
@@ -192,6 +200,7 @@ impl VerifierObligationResult {
     /// Create a new per-obligation result.
     #[must_use]
     pub fn new(obligation: ObligationDescriptor, result: VerificationResult) -> Self {
+        let result = fail_closed_concurrency_result(&obligation.kind, result);
         let evidence = ObligationProofEvidence::from_result(
             result.solver_name(),
             ObligationEvidenceProvenance::RouterAttributed,
@@ -208,6 +217,7 @@ impl VerifierObligationResult {
         result: VerificationResult,
     ) -> Self {
         let verifier = verifier.into();
+        let result = fail_closed_concurrency_result(&obligation.kind, result);
         let evidence = ObligationProofEvidence::from_result(
             verifier.clone(),
             ObligationEvidenceProvenance::NativeBackend { verifier },
@@ -226,6 +236,45 @@ impl VerifierObligationResult {
     #[must_use]
     pub fn is_failed(&self) -> bool {
         self.result.is_failed()
+    }
+}
+
+/// Downgrade any verdict supplied for a v6/D2 concurrency kind to `Unknown`:
+/// neither `DataRace` nor `InsufficientOrdering` has an execution or memory
+/// model, so no engine or adapter can carry proof or refutation authority for them.
+pub(crate) fn fail_closed_concurrency_result(
+    kind: &VcKind,
+    result: VerificationResult,
+) -> VerificationResult {
+    match kind {
+        VcKind::DataRace { .. } => data_race_unknown(),
+        VcKind::InsufficientOrdering { .. } => memory_ordering_unknown(),
+        _ => result,
+    }
+}
+
+/// Fail-closed verdict for an `InsufficientOrdering` row (v6/D2). No lane can
+/// decide it, on any host: its stop cause is `unsupported` (determinism plan
+/// §3.7), not the `unclassified` an unstamped row reads as.
+pub(crate) fn memory_ordering_unknown() -> VerificationResult {
+    VerificationResult::Unknown {
+        solver: "mir-router".into(),
+        time_ms: 0,
+        reason: trust_types::determinism::StopCause::Unsupported
+            .stamp(crate::backend_trait::MEMORY_ORDERING_UNSUPPORTED_REASON),
+    }
+}
+
+/// Fail-closed verdict for a `DataRace` row: `unsupported`, like the
+/// backend-level refusal of the same kind (`unsupported_mir_unknown`).
+pub(crate) fn data_race_unknown() -> VerificationResult {
+    VerificationResult::Unknown {
+        solver: "mir-router".into(),
+        time_ms: 0,
+        reason: trust_types::determinism::StopCause::Unsupported.stamp(
+            "data-race verification unsupported: location alias, runtime-thread, and \
+             happens-before event identities are unauthenticated",
+        ),
     }
 }
 
@@ -263,6 +312,16 @@ impl VerifierFunctionResult {
         def_path: String,
         obligations: Vec<VerifierObligationResult>,
     ) -> Self {
+        let obligations = obligations
+            .into_iter()
+            .map(|mut row| {
+                if crate::backend_trait::is_unmodeled_concurrency_kind(&row.obligation.kind) {
+                    row.result = fail_closed_concurrency_result(&row.obligation.kind, row.result);
+                    row.evidence = None;
+                }
+                row
+            })
+            .collect::<Vec<_>>();
         let function_name = short_name(&def_path);
         let summary = VerifierResultSummary::from_results(&obligations, &[]);
         Self { def_path, function_name, obligations, summary, unattributed: Vec::new() }
@@ -451,12 +510,26 @@ pub fn descriptors_for_vcs<'a>(
     vcs.into_iter()
         .enumerate()
         .map(|(ordinal, vc)| {
-            let base = StableObligationId::for_vc(vc, 0).fingerprint;
-            let occurrence = seen.entry(base).and_modify(|n| *n += 1).or_insert(0);
-            let descriptor = ObligationDescriptor::from_vc(vc, *occurrence, ordinal as u32);
-            match &strategy {
-                Some(strategy) => descriptor.with_strategy(strategy.clone()),
-                None => descriptor,
+            let fingerprint = StableObligationId::for_vc(vc, 0).fingerprint;
+            let occurrence = match seen.get_mut(&fingerprint) {
+                Some(n) => {
+                    *n += 1;
+                    *n
+                }
+                None => {
+                    seen.insert(fingerprint.clone(), 0);
+                    0
+                }
+            };
+            let def_path = vc.function.to_string();
+            ObligationDescriptor {
+                id: StableObligationId { fingerprint, occurrence },
+                function_name: short_name(&def_path),
+                def_path,
+                span: vc.location.clone(),
+                kind: vc.kind.clone(),
+                strategy: strategy.clone(),
+                ordinal: ordinal as u32,
             }
         })
         .collect()
@@ -571,6 +644,128 @@ mod tests {
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.unknown, 1);
         assert!(summary.has_unresolved());
+    }
+
+    #[test]
+    fn data_race_adapters_refuse_external_proof_and_failure() {
+        let race = vc(
+            "m::racy",
+            VcKind::DataRace {
+                variable: "shared".to_string(),
+                thread_a: "worker_a".to_string(),
+                thread_b: "worker_b".to_string(),
+            },
+            Formula::Bool(false),
+        );
+        let descriptor = descriptors_for_vcs([&race], Some(MirStrategy::DataRace)).remove(0);
+        for supplied in [
+            proved(ProofStrength::smt_unsat()),
+            VerificationResult::Failed { solver: "test".into(), time_ms: 7, counterexample: None },
+        ] {
+            let router_row = VerifierObligationResult::new(descriptor.clone(), supplied.clone());
+            let native_row = VerifierObligationResult::new_native(
+                descriptor.clone(),
+                "native-test",
+                supplied.clone(),
+            );
+            let v1 =
+                VerifierFunctionResult::from_v1_results(vec![(race.clone(), supplied.clone())]);
+            let native = VerifierFunctionResult::from_function_level_result(
+                "m::racy".to_string(),
+                "native-test",
+                vec![descriptor.clone()],
+                supplied.clone(),
+            );
+            let mut forged_row =
+                VerifierObligationResult::new(descriptor.clone(), supplied.clone());
+            forged_row.result = supplied.clone();
+            forged_row.evidence = ObligationProofEvidence::from_result(
+                "test",
+                ObligationEvidenceProvenance::RouterAttributed,
+                &supplied,
+            );
+            let assembled = VerifierFunctionResult::from_obligation_results(
+                "m::racy".to_string(),
+                vec![forged_row],
+            );
+
+            for row in [
+                &router_row,
+                &native_row,
+                &v1[0].obligations[0],
+                &native.obligations[0],
+                &assembled.obligations[0],
+            ] {
+                assert!(matches!(&row.result, VerificationResult::Unknown { reason, .. }
+                    if reason.contains("data-race verification unsupported")));
+                assert!(row.evidence.is_none());
+            }
+            for summary in [v1[0].summary, native.summary, assembled.summary] {
+                assert_eq!(summary.proved, 0);
+                assert_eq!(summary.failed, 0);
+                assert_eq!(summary.unknown, 1);
+                assert!(!summary.is_fully_verified());
+            }
+        }
+    }
+
+    /// v6/D2: an `InsufficientOrdering` row has no memory model, so every adapter
+    /// downgrades an externally supplied proof or refutation to `Unknown` and
+    /// drops its evidence, exactly as it does for `DataRace`.
+    #[test]
+    fn insufficient_ordering_adapters_refuse_external_proof_and_failure() {
+        let ordering = vc(
+            "m::consumer",
+            VcKind::InsufficientOrdering {
+                variable: "ready_flag".to_string(),
+                actual: "Relaxed".to_string(),
+                required: "Acquire".to_string(),
+            },
+            Formula::Bool(false),
+        );
+        let descriptor = descriptors_for_vcs([&ordering], Some(MirStrategy::DataRace)).remove(0);
+        for supplied in [
+            proved(ProofStrength::smt_unsat()),
+            VerificationResult::Failed { solver: "test".into(), time_ms: 7, counterexample: None },
+        ] {
+            let router_row = VerifierObligationResult::new(descriptor.clone(), supplied.clone());
+            let native_row = VerifierObligationResult::new_native(
+                descriptor.clone(),
+                "native-test",
+                supplied.clone(),
+            );
+            let v1 =
+                VerifierFunctionResult::from_v1_results(vec![(ordering.clone(), supplied.clone())]);
+            let mut forged_row =
+                VerifierObligationResult::new(descriptor.clone(), supplied.clone());
+            forged_row.result = supplied.clone();
+            forged_row.evidence = ObligationProofEvidence::from_result(
+                "test",
+                ObligationEvidenceProvenance::RouterAttributed,
+                &supplied,
+            );
+            let assembled = VerifierFunctionResult::from_obligation_results(
+                "m::consumer".to_string(),
+                vec![forged_row],
+            );
+
+            for row in [&router_row, &native_row, &v1[0].obligations[0], &assembled.obligations[0]]
+            {
+                assert!(
+                    matches!(&row.result, VerificationResult::Unknown { reason, .. }
+                        if reason.contains("memory-ordering VC unsupported")),
+                    "{:?}",
+                    row.result
+                );
+                assert!(row.evidence.is_none());
+            }
+            for summary in [v1[0].summary, assembled.summary] {
+                assert_eq!(summary.proved, 0);
+                assert_eq!(summary.failed, 0);
+                assert_eq!(summary.unknown, 1);
+                assert!(!summary.is_fully_verified());
+            }
+        }
     }
 
     #[test]

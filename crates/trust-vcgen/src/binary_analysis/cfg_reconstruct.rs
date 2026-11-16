@@ -127,7 +127,7 @@ pub(crate) fn reconstruct_cfg(instructions: &[AbstractInsn]) -> ReconstructedCfg
         .filter_map(|boundary| ordered.iter().position(|insn| insn.address == *boundary))
         .collect();
 
-    let mut nodes = Vec::new();
+    let mut nodes = Vec::with_capacity(boundary_positions.len());
     for (block_index, start_position) in boundary_positions.iter().enumerate() {
         let end_position =
             boundary_positions.get(block_index + 1).copied().unwrap_or(ordered.len());
@@ -237,7 +237,7 @@ fn reconstruct_edges(nodes: &[CfgNode]) -> Vec<CfgEdge> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binary_analysis::{AbstractValue, MemoryAccess};
+    use crate::binary_analysis::lifter::{AbstractValue, MemoryAccess};
 
     fn insn(address: u64, op: AbstractOp) -> AbstractInsn {
         AbstractInsn { address, op, size: 4 }

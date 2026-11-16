@@ -131,7 +131,12 @@ mod tests {
 
     /// Classify a function call as an unsafe operation, if applicable.
     fn classify_call(callee: &str) -> Option<UnsafeOpKind> {
-        let lower = callee.to_lowercase();
+        let lower: std::borrow::Cow<'_, str> =
+            if callee.bytes().any(|b| b.is_ascii_uppercase()) || !callee.is_ascii() {
+                std::borrow::Cow::Owned(callee.to_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(callee)
+            };
 
         // Transmute family
         if lower.contains("mem::transmute") || lower.contains("mem::transmute_copy") {
@@ -171,7 +176,7 @@ mod tests {
             "intrinsics::",
         ];
 
-        if UNSAFE_FN_PATTERNS.iter().any(|p| lower.contains(&p.to_lowercase())) {
+        if UNSAFE_FN_PATTERNS.iter().any(|p| lower.contains(*p)) {
             return Some(UnsafeOpKind::UnsafeFnCall { callee: callee.to_string() });
         }
 
@@ -228,6 +233,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -267,6 +273,7 @@ mod tests {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("std::mem::transmute"),
                 is_foreign: false,
                 func: "std::mem::transmute".to_string(),
                 args: vec![],
@@ -296,6 +303,7 @@ mod tests {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("libc::ffi::malloc"),
                 is_foreign: false,
                 func: "libc::ffi::malloc".to_string(),
                 args: vec![],
@@ -325,6 +333,7 @@ mod tests {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("std::ptr::read"),
                 is_foreign: false,
                 func: "std::ptr::read".to_string(),
                 args: vec![],
@@ -401,6 +410,7 @@ mod tests {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("std::mem::transmute"),
                     is_foreign: false,
                     func: "std::mem::transmute".to_string(),
                     args: vec![],
@@ -432,6 +442,7 @@ mod tests {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("std::ptr::write"),
                 is_foreign: false,
                 func: "std::ptr::write".to_string(),
                 args: vec![],
@@ -457,6 +468,7 @@ mod tests {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("std::vec::Vec::push"),
                 is_foreign: false,
                 func: "std::vec::Vec::push".to_string(),
                 args: vec![],

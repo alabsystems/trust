@@ -102,7 +102,8 @@ pub fn ffi_call_sep_vc(
     callee: &str,
     span: &SourceSpan,
 ) -> Vec<VerificationCondition> {
-    let mut vcs = Vec::new();
+    let mut vcs = Vec::with_capacity(2);
+    let fn_sym: trust_types::Symbol = func_name.into();
 
     // VC 1: FFI pointer argument null check
     let ffi_ptr = Formula::Var(
@@ -113,7 +114,7 @@ pub fn ffi_call_sep_vc(
         kind: VcKind::Assertion {
             message: format!("[unsafe:sep:ffi] null pointer argument check for {callee}"),
         },
-        function: func_name.into(),
+        function: fn_sym.clone(),
         location: span.clone(),
         formula: Formula::Eq(Box::new(ffi_ptr), Box::new(Formula::Int(0))),
         contract_metadata: None,
@@ -125,7 +126,7 @@ pub fn ffi_call_sep_vc(
         kind: VcKind::Assertion {
             message: format!("[unsafe:sep:ffi] heap invariant after {callee} (unverified)"),
         },
-        function: func_name.into(),
+        function: fn_sym,
         location: span.clone(),
         formula: Formula::Bool(true),
         contract_metadata: None,
@@ -143,7 +144,11 @@ pub fn unsafe_fn_call_sep_vc(
     callee: &str,
     span: &SourceSpan,
 ) -> Vec<VerificationCondition> {
-    let lower = callee.to_lowercase();
+    let lower: std::borrow::Cow<'_, str> = if callee.bytes().any(|b| b.is_ascii_uppercase()) {
+        callee.to_ascii_lowercase().into()
+    } else {
+        callee.into()
+    };
     let mut vcs = Vec::new();
 
     if lower.contains("ptr::read") || lower.contains("ptr::copy") {
@@ -157,7 +162,8 @@ pub fn unsafe_fn_call_sep_vc(
         vcs.extend(raw_write_vc(func_name, &ptr_name, &value, span));
     } else if lower.contains("slice::from_raw_parts") {
         // from_raw_parts requires non-null pointer + valid length.
-        let ptr_name = format!("arg0_{}", callee.replace("::", "_"));
+        let suffix = callee.replace("::", "_");
+        let ptr_name = format!("arg0_{suffix}");
         vcs.extend(deref_vc(func_name, &ptr_name, span));
 
         // The slice must not claim more elements than the backing allocation
@@ -167,7 +173,6 @@ pub fn unsafe_fn_call_sep_vc(
         // and therefore never caught anything. The real obligation relates the
         // requested length to the allocation's size. Violation (prove UNSAT):
         //   len > alloc_size.
-        let suffix = callee.replace("::", "_");
         let len = Formula::Var(super::generated_symbol(&format!("len_{suffix}")), Sort::Int);
         let alloc_size =
             Formula::Var(super::generated_symbol(&format!("alloc_size_{suffix}")), Sort::Int);

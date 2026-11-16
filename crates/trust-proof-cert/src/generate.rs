@@ -233,13 +233,13 @@ pub fn generate_certificate_record_with_env(
         }
     })?;
 
-    let (primary_vc, primary_result) = &results[primary_idx];
-    let primary_snapshot = VcSnapshot::from_vc(primary_vc)?;
-    let (solver_name, _, solver_time, _) = extract_result_info(primary_result);
+    let (_, primary_result) = &results[primary_idx];
+    let primary_snapshot = vc_entries[primary_idx].vc_snapshot.clone();
+    let solver_name = vc_entries[primary_idx].solver.clone();
+    let solver_time = vc_entries[primary_idx].time_ms;
 
     // Public result metadata cannot mint Certified assurance on a packaging path.
-    let primary_evidence =
-        primary_result.evidence().map(crate::evidence::cap_unvalidated_certificate_assurance);
+    let primary_evidence = vc_entries[primary_idx].evidence.clone();
 
     let solver_info = match primary_result {
         VerificationResult::Proved { solver, time_ms, strength, .. } => SolverInfo {
@@ -526,6 +526,7 @@ mod tests {
             preconditions: vec![Formula::Bool(true)],
             postconditions: vec![Formula::Bool(true)],
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -673,15 +674,6 @@ mod tests {
         let results = vec![(sample_vc("test"), proved_result())];
 
         let cert = generate_certificate_record(&func, &results).unwrap();
-        assert!(check_generated_record_integrity(&cert).unwrap());
-    }
-
-    #[test]
-    fn test_verify_certificate_integrity_returns_result() {
-        let func = sample_function();
-        let results = vec![(sample_vc("test"), proved_result())];
-        let cert = generate_certificate_record(&func, &results).unwrap();
-
         assert!(check_generated_record_integrity(&cert).unwrap());
     }
 

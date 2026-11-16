@@ -158,7 +158,7 @@ impl<'db> rustc_type_ir::InferCtxtLike for InferCtxt<'db> {
         self.next_const_var(Span::Dummy)
     }
 
-    fn fresh_args_for_item(&self, def_id: SolverDefId) -> GenericArgs<'db> {
+    fn fresh_args_for_item(&self, def_id: SolverDefId<'db>) -> GenericArgs<'db> {
         self.fresh_args_for_item(Span::Dummy, def_id)
     }
 
@@ -348,10 +348,28 @@ impl<'db> rustc_type_ir::InferCtxtLike for InferCtxt<'db> {
 
     fn opaques_with_sub_unified_hidden_type(
         &self,
-        _ty: TyVid,
+        ty_vid: TyVid,
     ) -> Vec<rustc_type_ir::AliasTy<Self::Interner>> {
-        // FIXME: I guess we are okay without this for now since currently r-a lacks of
-        // detailed checks over opaque types. Might need to implement this in future.
-        vec![]
+        let ty_sub_vid = self.sub_unification_table_root_var(ty_vid);
+        let inner = &mut *self.inner.borrow_mut();
+        let mut type_variables = inner.type_variable_storage.with_log(&mut inner.undo_log);
+        inner
+            .opaque_type_storage
+            .iter_opaque_types()
+            .filter_map(|(key, hidden_ty)| {
+                if let TyKind::Infer(InferTy::TyVar(hidden_vid)) = hidden_ty.ty.kind() {
+                    let opaque_sub_vid = type_variables.sub_unification_table_root_var(hidden_vid);
+                    if opaque_sub_vid == ty_sub_vid {
+                        return Some(rustc_type_ir::AliasTy::new_from_args(
+                            self.interner,
+                            rustc_type_ir::Opaque { def_id: key.def_id },
+                            key.args,
+                        ));
+                    }
+                }
+
+                None
+            })
+            .collect()
     }
 }

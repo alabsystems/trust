@@ -2,7 +2,7 @@
 # Check the rustc_private Trust MIR extraction path through bootstrap.
 #
 # `crates/trust-mir-extract` intentionally cannot be checked by the standalone
-# `crates/Cargo.toml` workspace: it depends on in-tree rustc_private crates and
+# `Cargo.toml` workspace: it depends on in-tree rustc_private crates and
 # must be built with the same compiler/bootstrap configuration as rustc itself.
 
 set -euo pipefail

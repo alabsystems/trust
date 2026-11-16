@@ -8,21 +8,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustc_ast::{LitKind, MetaItemKind, token};
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_data_structures::jobserver::{self, Proxy};
+use rustc_data_structures::jobserver;
 use rustc_data_structures::stable_hash::StableHasher;
-use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed};
+use rustc_errors::ErrorGuaranteed;
 use rustc_lint::LintStore;
+use rustc_lint_defs::{Level, LintId};
 use rustc_middle::ty;
 use rustc_middle::ty::CurrentGcx;
 use rustc_middle::util::Providers;
 use rustc_parse::lexer::StripTokens;
 use rustc_parse::new_parser_from_source_str;
 use rustc_parse::parser::Recovery;
-use rustc_parse::parser::attr::AllowLeadingUnsafe;
 use rustc_query_impl::print_query_stack;
 use rustc_session::config::{self, Cfg, CheckCfg, ExpectedValues, Input, OutFileName};
 use rustc_session::parse::ParseSess;
-use rustc_session::{CompilerIO, EarlyDiagCtxt, Session, lint};
+use rustc_session::{CompilerIO, EarlyDiagCtxt, EarlySession, Session};
 use rustc_span::source_map::{FileLoader, RealFileLoader, SourceMapInputs};
 use rustc_span::{FileName, sym};
 use tracing::trace;
@@ -54,14 +54,9 @@ pub(crate) fn finalize_untracked_session_state(
         return;
     }
 
-    // The external solver can affect certified-check elision and therefore
-    // emitted MIR. Snapshot it once, before any dependency hash is consumed,
-    // and bind the exact copied bytes (not merely the configured path) into a
-    // TRACKED top-level option. The verifier later executes this same snapshot.
-    if sess.trust_verification_enabled() {
-        rustc_mir_transform::trust_initialize_ay_solver_identity(sess);
-    }
-
+    // Trust (plan P4, T4.1): there is no external solver to snapshot here any
+    // more. trustc's only SMT solver is the ay linked into this compiler, so
+    // the compiler's own identity already names its bytes.
     if sess.trust_verification_enabled() {
         let mut hasher = StableHasher::new();
         hash_fresh_trust_verifier_invocation(&mut hasher);
@@ -89,14 +84,12 @@ pub struct Compiler {
 
     /// A reference to the current `GlobalCtxt` which we pass on to `GlobalCtxt`.
     pub(crate) current_gcx: CurrentGcx,
-
-    /// A jobserver reference which we pass on to `GlobalCtxt`.
-    pub(crate) jobserver_proxy: Arc<Proxy>,
 }
 
 /// Converts strings provided as `--cfg [cfgspec]` into a `Cfg`.
-pub(crate) fn parse_cfg(dcx: DiagCtxtHandle<'_>, cfgs: Vec<String>) -> Cfg {
-    cfgs.into_iter()
+pub(crate) fn parse_cfg(sess: &Session, cfgs: Vec<String>) -> Cfg {
+    let cfg = cfgs
+        .into_iter()
         .map(|s| {
             let psess = ParseSess::emitter_with_note(format!(
                 "this occurred on the command line: `--cfg={s}`"
@@ -105,7 +98,7 @@ pub(crate) fn parse_cfg(dcx: DiagCtxtHandle<'_>, cfgs: Vec<String>) -> Cfg {
 
             macro_rules! error {
                 ($reason: expr) => {
-                    dcx.fatal(format!("invalid `--cfg` argument: `{s}` ({})", $reason));
+                    sess.dcx().fatal(format!("invalid `--cfg` argument: `{s}` ({})", $reason));
                 };
             }
 
@@ -113,7 +106,7 @@ pub(crate) fn parse_cfg(dcx: DiagCtxtHandle<'_>, cfgs: Vec<String>) -> Cfg {
             {
                 Ok(mut parser) => {
                     parser = parser.recovery(Recovery::Forbidden);
-                    match parser.parse_meta_item(AllowLeadingUnsafe::No) {
+                    match parser.parse_meta_item() {
                         Ok(meta_item)
                             if parser.token == token::Eof
                                 && parser.dcx().has_errors().is_none() =>
@@ -157,11 +150,13 @@ pub(crate) fn parse_cfg(dcx: DiagCtxtHandle<'_>, cfgs: Vec<String>) -> Cfg {
                 error!(r#"expected `key` or `key="value"`"#);
             }
         })
-        .collect::<Cfg>()
+        .collect::<Cfg>();
+
+    config::build_configuration(sess, cfg)
 }
 
 /// Converts strings provided as `--check-cfg [specs]` into a `CheckCfg`.
-pub(crate) fn parse_check_cfg(dcx: DiagCtxtHandle<'_>, specs: Vec<String>) -> CheckCfg {
+pub(crate) fn parse_check_cfg(sess: &Session, specs: Vec<String>) -> CheckCfg {
     // If any --check-cfg is passed then exhaustive_values and exhaustive_names
     // are enabled by default.
     let exhaustive_names = !specs.is_empty();
@@ -178,13 +173,15 @@ pub(crate) fn parse_check_cfg(dcx: DiagCtxtHandle<'_>, specs: Vec<String>) -> Ch
 
         macro_rules! error {
             ($reason:expr) => {{
-                let mut diag = dcx.struct_fatal(format!("invalid `--check-cfg` argument: `{s}`"));
+                let mut diag =
+                    sess.dcx().struct_fatal(format!("invalid `--check-cfg` argument: `{s}`"));
                 diag.note($reason);
                 diag.note(VISIT);
-                diag.emit()
+                diag.emit_fatal()
             }};
             (in $arg:expr, $reason:expr) => {{
-                let mut diag = dcx.struct_fatal(format!("invalid `--check-cfg` argument: `{s}`"));
+                let mut diag =
+                    sess.dcx().struct_fatal(format!("invalid `--check-cfg` argument: `{s}`"));
 
                 let pparg = rustc_ast_pretty::pprust::meta_list_item_to_string($arg);
                 if let Some(lit) = $arg.lit() {
@@ -199,7 +196,7 @@ pub(crate) fn parse_check_cfg(dcx: DiagCtxtHandle<'_>, specs: Vec<String>) -> Ch
 
                 diag.note($reason);
                 diag.note(VISIT);
-                diag.emit()
+                diag.emit_fatal()
             }};
         }
 
@@ -217,7 +214,7 @@ pub(crate) fn parse_check_cfg(dcx: DiagCtxtHandle<'_>, specs: Vec<String>) -> Ch
                 }
             };
 
-        let meta_item = match parser.parse_meta_item(AllowLeadingUnsafe::No) {
+        let meta_item = match parser.parse_meta_item() {
             Ok(meta_item) if parser.token == token::Eof && parser.dcx().has_errors().is_none() => {
                 meta_item
             }
@@ -354,6 +351,8 @@ pub(crate) fn parse_check_cfg(dcx: DiagCtxtHandle<'_>, specs: Vec<String>) -> Ch
         }
     }
 
+    check_cfg.fill_well_known(&sess.target);
+
     check_cfg
 }
 
@@ -377,7 +376,7 @@ pub struct Config {
     /// running rustc without having to save". (See #102759.)
     pub file_loader: Option<Box<dyn FileLoader + Send + Sync>>,
 
-    pub lint_caps: FxHashMap<lint::LintId, lint::Level>,
+    pub lint_caps: FxHashMap<LintId, Level>,
 
     /// This is a callback from the driver that is called when [`ParseSess`] is created.
     pub psess_created: Option<Box<dyn FnOnce(&mut ParseSess) + Send>>,
@@ -411,22 +410,13 @@ pub struct Config {
     ///
     /// Mutually exclusive with an explicit `-Zcodegen-backend`: a callback
     /// factory must not silently replace the backend named by the invocation.
-    pub make_codegen_backend: Option<Box<dyn FnOnce(&Session) -> Box<dyn CodegenBackend> + Send>>,
+    pub make_codegen_backend:
+        Option<Box<dyn FnOnce(&EarlySession) -> Box<dyn CodegenBackend> + Send>>,
 
     /// The inner atomic value is set to true when a feature marked as `internal` is
     /// enabled. Makes it so that "please report a bug" is hidden, as ICEs with
     /// internal features are wontfix, and they are usually the cause of the ICEs.
     pub using_internal_features: &'static std::sync::atomic::AtomicBool,
-}
-
-/// Initialize jobserver before getting `jobserver::client` and `build_session`.
-pub(crate) fn initialize_checked_jobserver(early_dcx: &EarlyDiagCtxt) {
-    jobserver::initialize_checked(|err| {
-        early_dcx
-            .early_struct_warn(err)
-            .with_note("the build environment is likely misconfigured")
-            .emit()
-    });
 }
 
 /// The loader treats any spelling containing `.` as an explicit dylib path;
@@ -537,6 +527,28 @@ pub(crate) fn apply_no_trust_evidence_typed_policy(
     Ok(())
 }
 
+/// Trust (T4.3): pin a proof session to one front-end thread
+/// (`rustc_session::trust_frontend_threads_by_flags`). Applied to the final
+/// options, after every frontend policy has had its say and before the parallel
+/// mode, the thread pool and the `Lock`s it sizes exist, so a request written on
+/// the `Config` after parsing (a driver's `Callbacks::config`, or a direct caller
+/// of the canonical entry) is pinned too, and every reader of `Session::threads`
+/// agrees with the pool. `rustc_session::build_session` refuses a proof session
+/// this was not applied to. Pinned, never refused: the request is replaced, not
+/// reported. tests/ui-fulldeps/trust-frontend-thread-pin.rs pins where it runs.
+#[allow(rustc::bad_opt_access)]
+pub(crate) fn apply_trust_frontend_thread_pin(opts: &mut config::Options) {
+    // Trust (1.101 port): pin `jobs.frontend`, upstream's replacement for
+    // `-Zthreads`; `Session::threads` reads it back.
+    let requested = opts.jobs.frontend.map(|n| n.get());
+    let pinned = rustc_session::trust_frontend_threads_by_flags(
+        requested,
+        opts.unstable_opts.trust_verify,
+        opts.unstable_opts.trust_verify_session.is_some(),
+    );
+    opts.jobs.frontend = pinned.and_then(std::num::NonZero::new);
+}
+
 #[allow(rustc::bad_opt_access)]
 pub(crate) fn no_trust_evidence_typed_backend_control(
     opts: &config::Options,
@@ -634,6 +646,45 @@ fn run_compiler_with_frontend_trust_policy<R: Send>(
     )
 }
 
+/// Trust (CUSTODY-BOUNDED-QUERY-SPELLINGS-1): whether a session's options ask
+/// nothing but a bounded metadata query: every request prints the sysroot or
+/// the target list to standard output, on one front-end thread, with no native
+/// worker mode. The driver also requires that no input was given before it
+/// grants such a session (`jobserver::grant_bounded_query_session`); its
+/// `print_crate_info` then answers the query and stops.
+#[allow(rustc::bad_opt_access)]
+pub fn bounded_metadata_session(opts: &config::Options) -> bool {
+    use rustc_session::config::PrintKind;
+    !opts.resource_worker_v2
+        && !opts.resource_worker_v3
+        && !opts.resource_bootstrap_fixed_v1 // Trust: private compiler always requires its actual owner.
+        && opts.jobs.frontend.is_none()
+        && !opts.prints.is_empty()
+        && opts.prints.iter().all(|request| {
+            matches!(request.kind, PrintKind::Sysroot | PrintKind::TargetList)
+                && request.out == OutFileName::Stdout
+                && request.arg.is_none()
+        })
+}
+
+// Trust: a routing policy only. This never admits a compiler or substitutes for
+// private native adoption of the actual NoFork image and original queued primary.
+#[allow(rustc::bad_opt_access)]
+pub(crate) fn bootstrap_fixed_phase_supported(
+    opts: &config::Options,
+    callback_backend: bool,
+) -> bool {
+    cfg!(target_os = "macos")
+        && opts.target_triple.json_contents().is_none()
+        && opts.target_triple.tuple() == config::host_tuple()
+        && !callback_backend
+        && opts.unstable_opts.codegen_backend.as_deref().is_none_or(|name| name == "llvm")
+        && opts.unstable_opts.llvm_plugins.is_empty()
+        && opts.unstable_opts.offload.is_empty()
+        && !opts.unstable_opts.wasm_proc_macros
+        && opts.cg.llvm_args.is_empty()
+}
+
 // JUSTIFICATION: before session exists, only config
 #[allow(rustc::bad_opt_access)]
 fn run_compiler_after_backend_route_transition<R: Send>(
@@ -668,14 +719,106 @@ fn run_compiler_after_backend_route_transition<R: Send>(
         }
     }
 
-    // Set parallel mode before thread pool creation, which will create `Lock`s.
-    rustc_data_structures::sync::set_dyn_thread_safe_mode(
-        config.opts.unstable_opts.threads.is_some(),
-    );
+    // Trust (T4.3): a proof session runs one front-end thread. Pin it here, on
+    // the options every policy above has settled, before anything below reads
+    // `threads` (the parallel mode, the pool size, the session).
+    apply_trust_frontend_thread_pin(&mut config.opts);
 
-    // Check jobserver before run_in_thread_pool_with_globals, which call jobserver::acquire_thread
+    // Trust (CUSTODY-EMBEDDED-TEST-LOAN-1): a process that lends its compiles
+    // its own execution runs one at a time; an overlapping one refuses before
+    // it sets any process-wide compile state.
+    let _lent_compile = match jobserver::enter_lent_compile() {
+        Ok(lent) => lent,
+        Err(error) => EarlyDiagCtxt::new(config.opts.error_format).early_fatal(error),
+    };
+
+    // Set parallel mode before thread pool creation, which will create `Lock`s.
+    rustc_data_structures::sync::set_dyn_thread_safe_mode(config.opts.jobs.frontend.is_some());
+
+    // Initialize jobserver as early as possible.
     let early_dcx = EarlyDiagCtxt::new(config.opts.error_format);
-    initialize_checked_jobserver(&early_dcx);
+    let jobs = config.opts.jobs;
+    // Trust (CUSTODY-BOUNDED-QUERY-SPELLINGS-1): every session spends the
+    // process's one bounded-query grant here. Only the session the driver
+    // granted it to, still with no input and asking nothing but that query, is
+    // answered on no scheduler.
+    let bounded_query = jobserver::take_bounded_query_session().filter(|_| {
+        matches!(&config.input, Input::File(path) if path.as_os_str().is_empty())
+            && bounded_metadata_session(&config.opts)
+    });
+    if config.opts.resource_worker_v3 != config.opts.resource_subgroups_v3
+        || (config.opts.resource_worker_v3 && config.opts.resource_worker_v2)
+    {
+        early_dcx.early_fatal("native v3 requires both custody markers and excludes v2");
+    }
+    // Trust: private Bootstrap Fixed custody is distinct from both public worker protocols.
+    if config.opts.resource_bootstrap_fixed_v1
+        && (config.opts.resource_worker_v2
+            || config.opts.resource_worker_v3
+            || config.opts.resource_subgroups_v3)
+    {
+        early_dcx.early_fatal("private Bootstrap Fixed compiler excludes other worker protocols");
+    }
+    if (config.opts.resource_worker_v2
+        || config.opts.resource_worker_v3
+        || config.opts.resource_bootstrap_fixed_v1)
+        && rustc_session::trust_verification_enabled_by_flags(
+            config.opts.unstable_opts.trust_verify,
+        )
+    {
+        early_dcx.early_fatal("native elastic worker mode is unavailable in a proof session");
+    }
+    // Trust: this private Full profile supports the built-in host backend, whose
+    // producing helpers and paired Darwin linker use the same retained owner.
+    // The native issuer separately validates the actual registered NoFork image.
+    if config.opts.resource_bootstrap_fixed_v1 {
+        if !bootstrap_fixed_phase_supported(&config.opts, config.make_codegen_backend.is_some()) {
+            early_dcx.early_fatal("private Bootstrap Fixed compiler cannot execute an unqualified target/backend phase");
+        }
+        let limit = jobs.frontend.max(jobs.backend).max(jobs.linker.limit()).map_or(1, |n| n.get());
+        if let Err(error) = jobserver::initialize_bootstrap_fixed(limit) {
+            early_dcx.early_fatal(error);
+        }
+    } else if config.opts.resource_worker_v3 {
+        // This first producing slice supports only the paired built-in host
+        // backend. Unknown target/backend LLVM options can load foreign code
+        // before normal frontend work, so refuse rather than reinterpret them.
+        if config.opts.test
+            || config.opts.crate_types.is_empty()
+            || config.opts.crate_types.iter().any(|kind| *kind != rustc_structures::CrateType::Rlib)
+            || config.opts.target_triple.json_contents().is_some()
+            || config.opts.target_triple.tuple() != config::host_tuple()
+            || config.make_codegen_backend.is_some()
+            || config
+                .opts
+                .unstable_opts
+                .codegen_backend
+                .as_deref()
+                .is_some_and(|name| name != "llvm")
+            || !config.opts.unstable_opts.llvm_plugins.is_empty()
+            || !config.opts.unstable_opts.offload.is_empty()
+            || config.opts.unstable_opts.wasm_proc_macros
+            || !config.opts.cg.llvm_args.is_empty()
+        {
+            early_dcx.early_fatal("native v3 cannot execute an unqualified target/backend phase");
+        }
+        let limit = jobs.frontend.max(jobs.backend).max(jobs.linker.limit()).map_or(1, |n| n.get());
+        if let Err(error) = jobserver::initialize_v3(limit) {
+            early_dcx.early_fatal(error);
+        }
+    } else if (config.opts.resource_worker_v2
+        || jobs.frontend.max(jobs.backend).max(jobs.linker.limit()).is_some())
+        && !bounded_query.is_some_and(jobserver::BoundedQuerySession::withhold_scheduler)
+    {
+        let limit =
+            jobs.frontend.max(jobs.backend).max(jobs.linker.limit()).map_or(1, |limit| limit.get());
+        if let Err(error) = jobserver::initialize(limit, config.opts.resource_worker_v2, |err| {
+            let note = "the build environment is likely misconfigured";
+            early_dcx.early_struct_warn(err).with_note(note).emit()
+        }) {
+            early_dcx.early_fatal(error);
+        }
+    }
 
     if let Some(error) = config::trust_target_spec_binding_error(
         &config.opts.target_triple,
@@ -731,18 +874,68 @@ fn run_compiler_after_backend_route_transition<R: Send>(
     util::run_in_thread_pool_with_globals(
         &early_dcx,
         config.opts.edition,
-        config.opts.unstable_opts.threads.unwrap_or(1),
+        jobs,
         &config.extra_symbols,
         SourceMapInputs { file_loader, path_mapping, hash_kind, checksum_hash_kind },
-        |current_gcx, jobserver_proxy| {
+        |current_gcx| {
             // The previous `early_dcx` can't be reused here because it doesn't
             // impl `Send`. Creating a new one is fine.
             let early_dcx = EarlyDiagCtxt::new(config.opts.error_format);
 
             let temps_dir = config.opts.unstable_opts.temps_dir.as_deref().map(PathBuf::from);
 
+            let early_sess =
+                rustc_session::build_early_session(config.opts, target, config.ice_file);
+            let callback_codegen_backend = config.make_codegen_backend.is_some();
+
+            // Trust (1.101 port): the evidence-inert route must select its
+            // already-linked backend here, where upstream now constructs the
+            // backend from the early session; the typed preflight above has
+            // already rejected callback factories and explicit selections on
+            // this route.
+            let mut codegen_backend = if early_sess.opts.resource_worker_v3
+                || early_sess.opts.resource_bootstrap_fixed_v1
+            {
+                // Trust: both authenticated native routes use only the linked backend.
+                util::get_native_llvm_codegen_backend(
+                    early_sess.opts.unstable_opts.codegen_backend.as_deref(),
+                    &early_sess.target,
+                )
+                .unwrap_or_else(|| {
+                    early_dcx.early_fatal(
+                    "native v3 requires the already-linked LLVM backend; external fallback refused",
+                )
+                })
+            } else if frontend_trust_policy.requires_evidence_inert_backend() {
+                util::get_no_trust_evidence_codegen_backend(
+                        early_sess.opts.unstable_opts.codegen_backend.as_deref(),
+                        &early_sess.target,
+                    )
+                    .unwrap_or_else(|| {
+                        early_dcx.early_fatal(
+                            "NoTrustEvidence backend selection changed after typed preflight; refusing external-backend fallback",
+                        )
+                    })
+            } else {
+                match config.make_codegen_backend {
+                    None => util::get_codegen_backend(
+                        &early_dcx,
+                        &early_sess.opts.sysroot,
+                        early_sess.opts.unstable_opts.codegen_backend.as_deref(),
+                        &early_sess.target,
+                    ),
+                    Some(make_codegen_backend) => {
+                        // N.B. `make_codegen_backend` takes precedence over
+                        // `target.default_codegen_backend`, which is ignored in this case.
+                        make_codegen_backend(&early_sess)
+                    }
+                }
+            };
+            let codegen_backend_init = codegen_backend.init(&early_sess);
+
             let mut sess = rustc_session::build_session(
-                config.opts,
+                early_sess,
+                codegen_backend_init,
                 CompilerIO {
                     input: config.input,
                     output_dir: config.output_dir,
@@ -750,21 +943,38 @@ fn run_compiler_after_backend_route_transition<R: Send>(
                     temps_dir,
                 },
                 config.lint_caps,
-                target,
                 util::rustc_version_str().unwrap_or("unknown"),
-                config.ice_file,
                 config.using_internal_features,
             );
 
+            // Trust: an uninstrumented callback/external backend must never
+            // manufacture a reusable empty terminal tool inventory.
+            if sess.opts.resource_worker_v3
+                || sess.opts.resource_bootstrap_fixed_v1 // Trust: hosted execution has its own held-input checks.
+                || callback_codegen_backend
+                || !util::builtin_tool_input_observer(
+                    sess.opts.unstable_opts.codegen_backend.as_deref(),
+                    &sess.target,
+                )
+            {
+                sess.tool_inputs_unavailable();
+            }
+
             if frontend_trust_policy.deauthorizes_official_evidence() {
+                // A verification selector this frontend accepted must still be
+                // neutralized: no posture it cannot honour may reach a reader.
                 let changed =
                     config::TrustFrontendAuthoritySnapshot::first_nondefault_evidence_control(
                         &sess.opts,
-                    );
+                    )
+                    .or_else(|| {
+                        config::TrustFrontendAuthoritySnapshot::first_live_verification_selector(
+                            &sess.opts,
+                        )
+                    });
                 if changed.is_some()
                     || sess.trust_verification_enabled()
                     || sess.trust_ir_lower_enabled()
-                    || !sess.opts.trust_solver_content_fingerprint.is_empty()
                 {
                     sess.dcx().fatal(format!(
                         "{} frontend deauthorization changed before backend construction{}",
@@ -779,16 +989,8 @@ fn run_compiler_after_backend_route_transition<R: Send>(
                 }
             }
 
-            // Do this immediately after Session construction, before even a
-            // custom codegen backend can observe dependency hashes. The later
-            // untracked-state finalizer is intentionally idempotent and keeps
-            // direct Session tests/custom construction on the same path.
-            if sess.trust_verification_enabled() {
-                rustc_mir_transform::trust_initialize_ay_solver_identity(&mut sess);
-            }
-
             let requested_codegen_backend = sess.opts.unstable_opts.codegen_backend.clone();
-            let callback_codegen_backend = config.make_codegen_backend.is_some();
+            let callback_codegen_backend = callback_codegen_backend;
             if callback_codegen_backend_factory_conflicts(
                 requested_codegen_backend.as_deref(),
                 callback_codegen_backend,
@@ -800,31 +1002,10 @@ fn run_compiler_after_backend_route_transition<R: Send>(
                 );
             }
 
-            let codegen_backend = if frontend_trust_policy.requires_evidence_inert_backend() {
-                util::get_no_trust_evidence_codegen_backend(
-                    sess.opts.unstable_opts.codegen_backend.as_deref(),
-                    &sess.target,
-                )
-                .unwrap_or_else(|| {
-                    sess.dcx().fatal(
-                        "NoTrustEvidence backend selection changed after typed preflight; refusing external-backend fallback",
-                    )
-                })
-            } else {
-                match config.make_codegen_backend {
-                    None => util::get_codegen_backend(
-                        &early_dcx,
-                        &sess.opts.sysroot,
-                        sess.opts.unstable_opts.codegen_backend.as_deref(),
-                        &sess.target,
-                    ),
-                    Some(make_codegen_backend) => {
-                        // N.B. `make_codegen_backend` takes precedence over
-                        // `target.default_codegen_backend`, which is ignored in this case.
-                        make_codegen_backend(&sess)
-                    }
-                }
-            };
+            // Trust (1.101 port): the backend was constructed and `init`ed
+            // from the early session above (upstream's new flow); the init
+            // token already populated the intrinsics/thin-LTO session fields
+            // in `build_session`. Only the identity authentication remains.
             if let Some(requested) = requested_codegen_backend.as_deref()
                 && let Some(expected) =
                     explicit_codegen_backend_name_mismatch(requested, codegen_backend.name())
@@ -834,19 +1015,29 @@ fn run_compiler_after_backend_route_transition<R: Send>(
                     codegen_backend.name(),
                 ));
             }
-            codegen_backend.init(&sess);
-            sess.replaced_intrinsics = FxHashSet::from_iter(codegen_backend.replaced_intrinsics());
-            sess.fallback_intrinsics = FxHashSet::from_iter(codegen_backend.fallback_intrinsics());
-            sess.thin_lto_supported = codegen_backend.thin_lto_supported();
 
-            let cfg = parse_cfg(sess.dcx(), config.crate_cfg);
-            let mut cfg = config::build_configuration(&sess, cfg);
-            util::add_configuration(&mut cfg, &mut sess, &*codegen_backend);
-            sess.config = cfg;
+            // STACK_SIZE is setup in run_in_thread_pool_with_globals, before arriving here.
+            sess.opts.recommended_stack_size = *util::STACK_SIZE.get().unwrap();
 
-            let mut check_cfg = parse_check_cfg(sess.dcx(), config.crate_check_cfg);
-            check_cfg.fill_well_known(&sess.target);
-            sess.check_config = check_cfg;
+            let target_config = codegen_backend.target_config(&sess);
+
+            // Store all of the target features in the session.
+            // Needs to be done before `parse_cfg` because it checks this list.
+            sess.internal_target_features
+                .extend(target_config.internal_target_features.to_sorted_stable_ord());
+
+            sess.config = parse_cfg(&sess, config.crate_cfg);
+            let is_nightly_build = sess.is_nightly_build();
+            let is_crt_static = sess.crt_static(None);
+            util::add_configuration(
+                &mut sess.config,
+                &target_config,
+                &sess.early_sess.target,
+                is_nightly_build,
+                is_crt_static,
+            );
+
+            sess.check_config = parse_check_cfg(&sess, config.crate_check_cfg);
 
             if let Some(psess_created) = config.psess_created {
                 psess_created(&mut sess.psess);
@@ -870,7 +1061,6 @@ fn run_compiler_after_backend_route_transition<R: Send>(
                 codegen_backend,
                 override_queries: config.override_queries,
                 current_gcx,
-                jobserver_proxy,
             };
 
             // There are two paths out of `f`.
@@ -913,11 +1103,7 @@ fn run_compiler_after_backend_route_transition<R: Send>(
     )
 }
 
-pub fn try_print_query_stack(
-    dcx: DiagCtxtHandle<'_>,
-    limit_frames: Option<usize>,
-    file: Option<std::fs::File>,
-) {
+pub fn try_print_query_stack(limit_frames: Option<usize>, file: Option<std::fs::File>) {
     eprintln!("query stack during panic:");
 
     // Be careful relying on global state here: this code is called from
@@ -925,13 +1111,7 @@ pub fn try_print_query_stack(
     // state if it was responsible for triggering the panic.
     let all_frames = ty::tls::with_context_opt(|icx| {
         if let Some(icx) = icx {
-            ty::print::with_no_queries!(print_query_stack(
-                icx.tcx,
-                icx.query,
-                dcx,
-                limit_frames,
-                file,
-            ))
+            ty::print::with_no_queries!(print_query_stack(icx.tcx, icx.query, limit_frames, file))
         } else {
             0
         }

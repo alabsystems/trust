@@ -111,7 +111,7 @@ mod os_impl {
 
     #[cfg(unix)]
     pub fn check(path: &Path, tidy_ctx: TidyCtx) {
-        let mut check = tidy_ctx.start_check("bins");
+        let check = tidy_ctx.start_check("bins");
 
         use std::ffi::OsStr;
 
@@ -123,12 +123,16 @@ mod os_impl {
             ".hooks/commit-msg",
             // Extensionless tool scripts that are intentionally executable.
             "src/tools/miri/miri",
+            // Trust: the machine-wide heavy-job admission gate, invoked by
+            // exact name (`build-slot -- ...`, AGENTS.md "Shared machine").
+            "scripts/build-slot",
             // Trust: git hook sources. Git dispatches hooks by EXACT filename,
             // so these cannot carry a `.sh` extension and cannot be skipped by
             // the extension test above; they must stay executable because
             // `core.hooksPath` runs them directly. Both directories are listed
             // because they are mutually exclusive installs — see CLAUDE.md,
             // "Two hook directories, and which one to install".
+            "scripts/hooks/commit-msg",
             "scripts/hooks/post-checkout",
             "scripts/hooks/post-merge",
             "scripts/hooks/post-rewrite",
@@ -137,11 +141,15 @@ mod os_impl {
             "scripts/hooks-pin/post-merge",
             "scripts/hooks-pin/post-rewrite",
             "scripts/hooks-pin/pre-push",
-            // Trust: the dyld anti-contamination wrapper every measurement lane
-            // copies (`scripts/seal_driver.sh`, and the 2026-08-13 verification
-            // -integrity report). A POSIX shell script, deliberately named
-            // without an extension because lanes invoke it as a bare `tc`.
-            "scratchpad/wave-tr-ledger/tc",
+            // Trust: `pub doctor` runs a repo's `publish/doctor` hook by exact
+            // name (docs/first-party-pin-ledger.md), like the git hooks above.
+            "publish/doctor",
+            // Trust: `scratchpad/wave-tr-ledger/tc` (the old dyld guard wrapper)
+            // was listed here until 6ba5324748 deleted scratchpad/. Nothing
+            // checks that an entry of this list exists, so a stale one reads as
+            // a live exemption without ever failing. The dyld guard is now
+            // `scripts/seal_driver.sh guard`, which carries a `.sh` extension
+            // and needs no entry.
         ];
 
         for p in RI_EXCLUSION_LIST {

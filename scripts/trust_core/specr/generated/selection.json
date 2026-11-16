@@ -1,0 +1,3439 @@
+{
+ "allowed_constructors": {
+  "ArgumentExpr": "all",
+  "BbKind": [
+   "Regular"
+  ],
+  "BinOp": [
+   "Int",
+   "IntWithOverflow",
+   "PtrOffset",
+   "PtrOffsetFrom",
+   "Rel"
+  ],
+  "CallingConvention": "all",
+  "CastOp": [
+   "IntToInt",
+   "Transmute"
+  ],
+  "Constant": [
+   "Bool",
+   "FnPointer",
+   "GlobalPointer",
+   "Int",
+   "PointerWithoutProvenance"
+  ],
+  "IntBinOp": "all",
+  "IntBinOpWithOverflow": "all",
+  "IntUnOp": [
+   "BitNot",
+   "CountOnes",
+   "Neg"
+  ],
+  "IntrinsicOp": [
+   "Abort",
+   "Allocate",
+   "Assume",
+   "Deallocate",
+   "Exit",
+   "PointerExposeProvenance"
+  ],
+  "LayoutStrategy": [
+   "Sized"
+  ],
+  "Mutability": "all",
+  "PlaceExpr": [
+   "Deref",
+   "Field",
+   "Local"
+  ],
+  "PointerMetaKind": [
+   "None"
+  ],
+  "PtrType": [
+   "Box",
+   "FnPtr",
+   "Raw",
+   "Ref"
+  ],
+  "RelOp": "all",
+  "Signedness": "all",
+  "Statement": [
+   "Assign",
+   "Deinit",
+   "PlaceMention",
+   "StorageDead",
+   "StorageLive",
+   "Validate"
+  ],
+  "Terminator": [
+   "Call",
+   "Goto",
+   "Intrinsic",
+   "Return",
+   "Switch",
+   "Unreachable"
+  ],
+  "Type": [
+   "Bool",
+   "Int",
+   "Ptr",
+   "Tuple"
+  ],
+  "UnOp": [
+   "Cast",
+   "Int"
+  ],
+  "UnsafeCellStrategy": [
+   "Sized"
+  ],
+  "ValueExpr": [
+   "AddrOf",
+   "BinOp",
+   "Constant",
+   "Load",
+   "Tuple",
+   "UnOp"
+  ]
+ },
+ "counts": {
+  "in_slice": 122,
+  "tests_recorded": 335
+ },
+ "predicate": "K8 probe: select the minitest tests that exercise only the integer, pointer\nand call slice.\n\nusage: select_slice.py <records.jsonl> <schema.json> <out selection.json>\n\nA test is IN the slice iff it ran at least one MiniRust program through the\nharness and every one of its recorded runs satisfies all of:\n  * entry point `run_program` (stdout-comparing `get_stdout` tests are out:\n    PrintStdout/PrintStderr are not in the slice);\n  * the test asserts one deterministic outcome: stop, ub, ill_formed, abort or\n    memory_leak (`assert_stop_always`, `assert_ub_eventually`, data-race and\n    deadlock probes exercise non-determinism and concurrency);\n  * the program has no traits and no vtables;\n  * every enum value in the program uses a constructor in ALLOWED below, and\n    every tuple type is sized (no unsized tail).\nThe predicate is fixed here, before any conformance run against Clean.\n",
+ "tests": {
+  "tests::abort::abort": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    0
+   ]
+  },
+  "tests::align::addr_of_misaligned_ptr": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    1
+   ]
+  },
+  "tests::align::addr_of_misaligned_ref": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    2
+   ]
+  },
+  "tests::align::deref_misaligned_ref": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    3
+   ]
+  },
+  "tests::align::deref_overaligned": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    4
+   ]
+  },
+  "tests::align::load_place_misaligned": {
+   "excluded_by": [
+    "Type::Array",
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    5
+   ]
+  },
+  "tests::align::manual_align": {
+   "excluded_by": [
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    6
+   ]
+  },
+  "tests::align::store_place_misaligned": {
+   "excluded_by": [
+    "Type::Array",
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    7
+   ]
+  },
+  "tests::assume::assume_false": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    8
+   ]
+  },
+  "tests::assume::assume_true": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    9
+   ]
+  },
+  "tests::assume::assume_wrong_argnum": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    10
+   ]
+  },
+  "tests::assume::assume_wrong_argty": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    11
+   ]
+  },
+  "tests::atomic::atomic_load_arg_count": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicLoad"
+   ],
+   "in_slice": false,
+   "records": [
+    12
+   ]
+  },
+  "tests::atomic::atomic_load_arg_type": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicLoad"
+   ],
+   "in_slice": false,
+   "records": [
+    13
+   ]
+  },
+  "tests::atomic::atomic_load_ret_type_pow": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicLoad"
+   ],
+   "in_slice": false,
+   "records": [
+    14
+   ]
+  },
+  "tests::atomic::atomic_load_ret_type_size": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicLoad",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    15
+   ]
+  },
+  "tests::atomic::atomic_load_success": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicLoad"
+   ],
+   "in_slice": false,
+   "records": [
+    16
+   ]
+  },
+  "tests::atomic::atomic_store_arg_count": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicStore"
+   ],
+   "in_slice": false,
+   "records": [
+    17
+   ]
+  },
+  "tests::atomic::atomic_store_arg_type1": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicStore"
+   ],
+   "in_slice": false,
+   "records": [
+    18
+   ]
+  },
+  "tests::atomic::atomic_store_arg_type_pow": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicStore",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    19
+   ]
+  },
+  "tests::atomic::atomic_store_arg_type_size": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicStore",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    20
+   ]
+  },
+  "tests::atomic::atomic_store_ret_type": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicStore"
+   ],
+   "in_slice": false,
+   "records": [
+    21
+   ]
+  },
+  "tests::atomic::atomic_store_success": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicStore"
+   ],
+   "in_slice": false,
+   "records": [
+    22
+   ]
+  },
+  "tests::atomic_fetch::atomic_fetch_arg_1": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicFetchAndOp"
+   ],
+   "in_slice": false,
+   "records": [
+    23
+   ]
+  },
+  "tests::atomic_fetch::atomic_fetch_arg_2": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicFetchAndOp"
+   ],
+   "in_slice": false,
+   "records": [
+    24
+   ]
+  },
+  "tests::atomic_fetch::atomic_fetch_arg_count": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicFetchAndOp"
+   ],
+   "in_slice": false,
+   "records": [
+    25
+   ]
+  },
+  "tests::atomic_fetch::atomic_fetch_int_size": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicFetchAndOp"
+   ],
+   "in_slice": false,
+   "records": [
+    26
+   ]
+  },
+  "tests::atomic_fetch::atomic_fetch_op": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicFetchAndOp"
+   ],
+   "in_slice": false,
+   "records": [
+    27
+   ]
+  },
+  "tests::atomic_fetch::atomic_fetch_ret_ty": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicFetchAndOp",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    28
+   ]
+  },
+  "tests::atomic_fetch::atomic_fetch_success": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicFetchAndOp",
+    "IntrinsicOp::PrintStdout",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    29
+   ]
+  },
+  "tests::blocks::call_next_block_non_exist": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    30
+   ]
+  },
+  "tests::blocks::call_nextblock_wrong_kind": {
+   "excluded_by": [
+    "BbKind::Terminate"
+   ],
+   "in_slice": false,
+   "records": [
+    31
+   ]
+  },
+  "tests::blocks::call_unwindblock_wrong_kind": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    32
+   ]
+  },
+  "tests::blocks::goto_from_cleanup_to_catch": {
+   "excluded_by": [
+    "BbKind::Catch",
+    "BbKind::Cleanup",
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    33
+   ]
+  },
+  "tests::blocks::goto_wrong_blockkind": {
+   "excluded_by": [
+    "BbKind::Cleanup"
+   ],
+   "in_slice": false,
+   "records": [
+    34
+   ]
+  },
+  "tests::blocks::intrinsic_wrong_blockkind": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "IntrinsicOp::PrintStdout"
+   ],
+   "in_slice": false,
+   "records": [
+    35
+   ]
+  },
+  "tests::blocks::resume_in_regular_block": {
+   "excluded_by": [
+    "Terminator::ResumeUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    36
+   ]
+  },
+  "tests::blocks::return_in_cleanup": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    37
+   ]
+  },
+  "tests::blocks::start_unwind_in_cleanup": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    38
+   ]
+  },
+  "tests::blocks::start_unwind_wrong_nextblock": {
+   "excluded_by": [
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    39
+   ]
+  },
+  "tests::blocks::switch_wrong_blockkind": {
+   "excluded_by": [
+    "BbKind::Cleanup"
+   ],
+   "in_slice": false,
+   "records": [
+    40
+   ]
+  },
+  "tests::blocks::switch_wrong_blockkind_fallback": {
+   "excluded_by": [
+    "BbKind::Cleanup"
+   ],
+   "in_slice": false,
+   "records": [
+    41
+   ]
+  },
+  "tests::blocks::unwind_block_non_exist": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    42
+   ]
+  },
+  "tests::blocks::unwind_in_catch_block": {
+   "excluded_by": [
+    "BbKind::Catch",
+    "BbKind::Cleanup",
+    "IntrinsicOp::PrintStdout",
+    "Terminator::ResumeUnwind",
+    "Terminator::StartUnwind",
+    "Terminator::StopUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    43
+   ]
+  },
+  "tests::bool::bit_and_bool_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    44
+   ]
+  },
+  "tests::bool::bool_or_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    45
+   ]
+  },
+  "tests::bool::bool_xor_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    46
+   ]
+  },
+  "tests::bool::false_to_int_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    47
+   ]
+  },
+  "tests::bool::not_works_both_ways": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    48
+   ]
+  },
+  "tests::bool::true_to_int_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    49
+   ]
+  },
+  "tests::builder_api::arg_and_ret_var": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    50
+   ]
+  },
+  "tests::builder_api::global_var": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    51
+   ]
+  },
+  "tests::builder_api::local_var": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    52
+   ]
+  },
+  "tests::builder_api::switch_int": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    53
+   ]
+  },
+  "tests::builder_api::while_": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    54
+   ]
+  },
+  "tests::call::call_arg_abi": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    55
+   ]
+  },
+  "tests::call::call_arg_count": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    56
+   ]
+  },
+  "tests::call::call_non_exist": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    57
+   ]
+  },
+  "tests::call::call_ret_abi": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    58
+   ]
+  },
+  "tests::call::call_success": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    59
+   ]
+  },
+  "tests::call::ret_mismatch": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    60
+   ]
+  },
+  "tests::calling_convention::call_c_to_rust": {
+   "excluded_by": [
+    "BbKind::Cleanup"
+   ],
+   "in_slice": false,
+   "records": [
+    61
+   ]
+  },
+  "tests::calling_convention::call_rust_to_c": {
+   "excluded_by": [
+    "BbKind::Cleanup"
+   ],
+   "in_slice": false,
+   "records": [
+    62
+   ]
+  },
+  "tests::calling_convention::spawn_wrong_conv": {
+   "excluded_by": [
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    63
+   ]
+  },
+  "tests::catch_unwind::catch_no_unwind": {
+   "excluded_by": [
+    "BbKind::Catch",
+    "IntrinsicOp::PrintStdout",
+    "Terminator::StopUnwind",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    64
+   ]
+  },
+  "tests::catch_unwind::catch_unwind": {
+   "excluded_by": [
+    "BbKind::Catch",
+    "BbKind::Cleanup",
+    "IntrinsicOp::PrintStdout",
+    "Terminator::ResumeUnwind",
+    "Terminator::StartUnwind",
+    "Terminator::StopUnwind",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    65
+   ]
+  },
+  "tests::compare_exchange::compare_exchange_arg_1_type": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicCompareExchange"
+   ],
+   "in_slice": false,
+   "records": [
+    66
+   ]
+  },
+  "tests::compare_exchange::compare_exchange_arg_1_value": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicCompareExchange"
+   ],
+   "in_slice": false,
+   "records": [
+    67
+   ]
+  },
+  "tests::compare_exchange::compare_exchange_arg_2_type": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicCompareExchange"
+   ],
+   "in_slice": false,
+   "records": [
+    68
+   ]
+  },
+  "tests::compare_exchange::compare_exchange_arg_count": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicCompareExchange"
+   ],
+   "in_slice": false,
+   "records": [
+    69
+   ]
+  },
+  "tests::compare_exchange::compare_exchange_arg_size_max": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicCompareExchange"
+   ],
+   "in_slice": false,
+   "records": [
+    70
+   ]
+  },
+  "tests::compare_exchange::compare_exchange_ret_type": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicCompareExchange",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    71
+   ]
+  },
+  "tests::compare_exchange::compare_exchange_success": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicCompareExchange",
+    "IntrinsicOp::PrintStdout",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    72
+   ]
+  },
+  "tests::compute_align::align_of_ints": {
+   "excluded_by": [
+    "UnOp::ComputeAlign"
+   ],
+   "in_slice": false,
+   "records": [
+    73
+   ]
+  },
+  "tests::compute_align::align_of_ptr": {
+   "excluded_by": [
+    "LayoutStrategy::Slice",
+    "UnOp::ComputeAlign",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    74
+   ]
+  },
+  "tests::compute_align::align_of_slice": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "LayoutStrategy::Slice",
+    "Type::Array",
+    "Type::Slice",
+    "UnOp::ComputeAlign",
+    "UnOp::GetMetadata",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    75
+   ]
+  },
+  "tests::compute_align::align_of_struct": {
+   "excluded_by": [
+    "UnOp::ComputeAlign"
+   ],
+   "in_slice": false,
+   "records": [
+    76
+   ]
+  },
+  "tests::compute_align::align_of_zst": {
+   "excluded_by": [
+    "Type::Array",
+    "UnOp::ComputeAlign"
+   ],
+   "in_slice": false,
+   "records": [
+    77
+   ]
+  },
+  "tests::compute_align::mismatched_meta_ill_formed": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "Type::Slice",
+    "UnOp::ComputeAlign"
+   ],
+   "in_slice": false,
+   "records": [
+    78
+   ]
+  },
+  "tests::compute_align::mismatched_meta_ill_formed_sized": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "UnOp::ComputeAlign"
+   ],
+   "in_slice": false,
+   "records": [
+    79
+   ]
+  },
+  "tests::compute_size::mismatched_meta_ill_formed": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "Type::Slice",
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    80
+   ]
+  },
+  "tests::compute_size::mismatched_meta_ill_formed_sized": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    81
+   ]
+  },
+  "tests::compute_size::size_of_ints": {
+   "excluded_by": [
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    82
+   ]
+  },
+  "tests::compute_size::size_of_ptr": {
+   "excluded_by": [
+    "LayoutStrategy::Slice",
+    "UnOp::ComputeSize",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    83
+   ]
+  },
+  "tests::compute_size::size_of_slice": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "LayoutStrategy::Slice",
+    "Type::Array",
+    "Type::Slice",
+    "UnOp::ComputeSize",
+    "UnOp::GetMetadata",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    84
+   ]
+  },
+  "tests::compute_size::size_of_struct": {
+   "excluded_by": [
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    85
+   ]
+  },
+  "tests::compute_size::size_of_zst": {
+   "excluded_by": [
+    "Type::Array",
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    86
+   ]
+  },
+  "tests::concurrency::arbitrary_order": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Lock",
+    "IntrinsicOp::PrintStdout",
+    "IntrinsicOp::Spawn",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    87,
+    88,
+    89,
+    90,
+    91,
+    92,
+    93,
+    94,
+    95,
+    96,
+    97,
+    98,
+    99,
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106
+   ]
+  },
+  "tests::data_race::atomic_load_atomic_load": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicLoad",
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "expect:data_race_probe",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120,
+    121,
+    122,
+    123,
+    124,
+    125,
+    126,
+    127,
+    128,
+    129,
+    130,
+    131,
+    132,
+    133,
+    134,
+    135,
+    136,
+    137,
+    138
+   ]
+  },
+  "tests::data_race::atomic_load_atomic_store": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicLoad",
+    "IntrinsicOp::AtomicStore",
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "expect:data_race_probe",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    139,
+    140,
+    141,
+    142,
+    143,
+    144,
+    145,
+    146,
+    147,
+    148,
+    149,
+    150,
+    151,
+    152,
+    153,
+    154,
+    155,
+    156,
+    157,
+    158,
+    159,
+    160,
+    161,
+    162,
+    163,
+    164,
+    165,
+    166,
+    167,
+    168,
+    169,
+    170
+   ]
+  },
+  "tests::data_race::atomic_load_non_atomic_load": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicLoad",
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "expect:data_race_probe",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    171,
+    172,
+    173,
+    174,
+    175,
+    176,
+    177,
+    178,
+    179,
+    180,
+    181,
+    182,
+    183,
+    184,
+    185,
+    186,
+    187,
+    188,
+    189,
+    190,
+    191,
+    192,
+    193,
+    194,
+    195,
+    196,
+    197,
+    198,
+    199,
+    200,
+    201,
+    202
+   ]
+  },
+  "tests::data_race::atomic_load_non_atomic_store": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicLoad",
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "expect:data_race_probe",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    203,
+    204,
+    205
+   ]
+  },
+  "tests::data_race::atomic_store_atomic_store": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicStore",
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "expect:data_race_probe",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    206,
+    207,
+    208,
+    209,
+    210,
+    211,
+    212,
+    213,
+    214,
+    215,
+    216,
+    217,
+    218,
+    219,
+    220,
+    221,
+    222,
+    223,
+    224,
+    225,
+    226,
+    227,
+    228,
+    229,
+    230,
+    231,
+    232,
+    233,
+    234,
+    235,
+    236,
+    237
+   ]
+  },
+  "tests::data_race::atomic_store_non_atomic_load": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicStore",
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "expect:data_race_probe",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    238,
+    239,
+    240
+   ]
+  },
+  "tests::data_race::atomic_store_non_atomic_store": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicStore",
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "expect:data_race_probe",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    241,
+    242,
+    243,
+    244,
+    245
+   ]
+  },
+  "tests::data_race::non_atomic_load_non_atomic_load": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "expect:data_race_probe",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    246,
+    247,
+    248,
+    249,
+    250,
+    251,
+    252,
+    253,
+    254,
+    255,
+    256,
+    257,
+    258,
+    259,
+    260,
+    261,
+    262,
+    263,
+    264,
+    265,
+    266,
+    267,
+    268,
+    269,
+    270,
+    271,
+    272,
+    273,
+    274,
+    275,
+    276,
+    277
+   ]
+  },
+  "tests::data_race::non_atomic_load_non_atomic_store": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "expect:data_race_probe",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    278,
+    279
+   ]
+  },
+  "tests::data_race::non_atomic_store_non_atomic_store": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "expect:data_race_probe",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    280,
+    281,
+    282,
+    283,
+    284,
+    285,
+    286
+   ]
+  },
+  "tests::dereferenceable::assign_dangling_ref": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    287
+   ]
+  },
+  "tests::dereferenceable::deref_dangling_ptr": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    288
+   ]
+  },
+  "tests::dereferenceable::deref_dangling_ref": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    289
+   ]
+  },
+  "tests::dereferenceable::ref_dangling_ptr": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    290
+   ]
+  },
+  "tests::dereferenceable::validate_dangling_ref": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    291
+   ]
+  },
+  "tests::enum_discriminant::discriminant_get_and_set_work": {
+   "excluded_by": [
+    "Statement::SetDiscriminant",
+    "Type::Enum",
+    "ValueExpr::GetDiscriminant"
+   ],
+   "in_slice": false,
+   "records": [
+    292
+   ]
+  },
+  "tests::enum_discriminant::discriminant_leaves_data_alone": {
+   "excluded_by": [
+    "PlaceExpr::Downcast",
+    "Statement::SetDiscriminant",
+    "Type::Enum",
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    293
+   ]
+  },
+  "tests::enum_discriminant::discriminant_setting_right_value": {
+   "excluded_by": [
+    "Statement::SetDiscriminant",
+    "Type::Enum",
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    294
+   ]
+  },
+  "tests::enum_discriminant::ill_formed_invalid_discriminant_set": {
+   "excluded_by": [
+    "Statement::SetDiscriminant",
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    295
+   ]
+  },
+  "tests::enum_discriminant::space_optimized_enum_works": {
+   "excluded_by": [
+    "PlaceExpr::Downcast",
+    "Statement::SetDiscriminant",
+    "Type::Enum",
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    296
+   ]
+  },
+  "tests::enum_discriminant::ub_cannot_read_invalid_discriminant": {
+   "excluded_by": [
+    "Type::Enum",
+    "Type::Union",
+    "ValueExpr::GetDiscriminant"
+   ],
+   "in_slice": false,
+   "records": [
+    297
+   ]
+  },
+  "tests::enum_discriminant::ub_cannot_read_uninit_discriminant": {
+   "excluded_by": [
+    "PlaceExpr::Downcast",
+    "Type::Enum",
+    "ValueExpr::GetDiscriminant"
+   ],
+   "in_slice": false,
+   "records": [
+    298
+   ]
+  },
+  "tests::enum_discriminant::ub_discriminant_does_not_init": {
+   "excluded_by": [
+    "PlaceExpr::Downcast",
+    "Statement::SetDiscriminant",
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    299
+   ]
+  },
+  "tests::enum_discriminant::ub_get_discriminant_on_misaligned_enum": {
+   "excluded_by": [
+    "Type::Array",
+    "Type::Enum",
+    "ValueExpr::GetDiscriminant"
+   ],
+   "in_slice": false,
+   "records": [
+    300
+   ]
+  },
+  "tests::enum_discriminant::ub_set_discriminant_on_misaligned_enum": {
+   "excluded_by": [
+    "Statement::SetDiscriminant",
+    "Type::Array",
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    301
+   ]
+  },
+  "tests::enum_downcast::downcasts_give_different_place": {
+   "excluded_by": [
+    "PlaceExpr::Downcast",
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    302
+   ]
+  },
+  "tests::enum_downcast::downcasts_give_different_place2": {
+   "excluded_by": [
+    "PlaceExpr::Downcast",
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    303
+   ]
+  },
+  "tests::enum_downcast::out_of_bounds_downcast": {
+   "excluded_by": [
+    "PlaceExpr::Downcast",
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    304
+   ]
+  },
+  "tests::enum_downcast::valid_downcast": {
+   "excluded_by": [
+    "PlaceExpr::Downcast",
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    305
+   ]
+  },
+  "tests::enum_representation::ill_formed_discriminant_value": {
+   "excluded_by": [
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    306
+   ]
+  },
+  "tests::enum_representation::ill_formed_discriminator": {
+   "excluded_by": [
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    307
+   ]
+  },
+  "tests::enum_representation::ill_formed_discriminator_branch": {
+   "excluded_by": [
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    308
+   ]
+  },
+  "tests::enum_representation::ill_formed_discriminator_overlaps": {
+   "excluded_by": [
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    309
+   ]
+  },
+  "tests::enum_representation::ill_formed_discriminator_overlaps_2": {
+   "excluded_by": [
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    310
+   ]
+  },
+  "tests::enum_representation::ill_formed_enum_must_have_maximal_alignment_of_inner": {
+   "excluded_by": [
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    311
+   ]
+  },
+  "tests::enum_representation::ill_formed_variant_constant": {
+   "excluded_by": [
+    "Type::Enum",
+    "ValueExpr::Variant"
+   ],
+   "in_slice": false,
+   "records": [
+    312
+   ]
+  },
+  "tests::enum_representation::ill_formed_variant_constant_data": {
+   "excluded_by": [
+    "Type::Enum",
+    "ValueExpr::Variant"
+   ],
+   "in_slice": false,
+   "records": [
+    313
+   ]
+  },
+  "tests::enum_representation::ill_sized_enum_variant": {
+   "excluded_by": [
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    314
+   ]
+  },
+  "tests::enum_representation::inconsistently_sized_enum_variants": {
+   "excluded_by": [
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    315
+   ]
+  },
+  "tests::enum_representation::larger_sized_tag_works": {
+   "excluded_by": [
+    "Type::Enum",
+    "ValueExpr::Variant"
+   ],
+   "in_slice": false,
+   "records": [
+    316
+   ]
+  },
+  "tests::enum_representation::larger_tag_has_no_alignment": {
+   "excluded_by": [
+    "Type::Enum",
+    "ValueExpr::Variant"
+   ],
+   "in_slice": false,
+   "records": [
+    317
+   ]
+  },
+  "tests::enum_representation::loading_uninhabited_enum_is_ub": {
+   "excluded_by": [
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    318
+   ]
+  },
+  "tests::enum_representation::negative_discriminants_work": {
+   "excluded_by": [
+    "Type::Enum",
+    "ValueExpr::Variant"
+   ],
+   "in_slice": false,
+   "records": [
+    319
+   ]
+  },
+  "tests::enum_representation::simple_two_variant_works": {
+   "excluded_by": [
+    "Type::Enum",
+    "ValueExpr::Variant"
+   ],
+   "in_slice": false,
+   "records": [
+    320
+   ]
+  },
+  "tests::expose::pointer_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    321
+   ]
+  },
+  "tests::expose::requires_pointer": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    322
+   ]
+  },
+  "tests::heap_intrinsics::alloc_align_err": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    323
+   ]
+  },
+  "tests::heap_intrinsics::alloc_argcount": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    324
+   ]
+  },
+  "tests::heap_intrinsics::alloc_size_err": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    325
+   ]
+  },
+  "tests::heap_intrinsics::alloc_wrongarg1": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    326
+   ]
+  },
+  "tests::heap_intrinsics::alloc_wrongarg2": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    327
+   ]
+  },
+  "tests::heap_intrinsics::alloc_wrongreturn": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    328
+   ]
+  },
+  "tests::heap_intrinsics::dealloc_align_err": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    329
+   ]
+  },
+  "tests::heap_intrinsics::dealloc_argcount": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    330
+   ]
+  },
+  "tests::heap_intrinsics::dealloc_size_err": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    331
+   ]
+  },
+  "tests::heap_intrinsics::dealloc_success": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    332
+   ]
+  },
+  "tests::heap_intrinsics::dealloc_wrongarg1": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    333
+   ]
+  },
+  "tests::heap_intrinsics::dealloc_wrongarg2": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    334
+   ]
+  },
+  "tests::heap_intrinsics::dealloc_wrongarg3": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    335
+   ]
+  },
+  "tests::heap_intrinsics::dealloc_wrongreturn": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    336
+   ]
+  },
+  "tests::heap_intrinsics::double_free": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    337
+   ]
+  },
+  "tests::heap_intrinsics::dynamic_memory": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    338
+   ]
+  },
+  "tests::heap_intrinsics::mem_dealloc_inv_ptr": {
+   "excluded_by": [
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    339
+   ]
+  },
+  "tests::heap_intrinsics::mem_dealloc_not_beginning": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    340
+   ]
+  },
+  "tests::heap_intrinsics::mem_dealloc_stack": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    341
+   ]
+  },
+  "tests::heap_intrinsics::mem_dealloc_wrong_align": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    342
+   ]
+  },
+  "tests::heap_intrinsics::mem_dealloc_wrong_size": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    343
+   ]
+  },
+  "tests::heap_intrinsics::memory_leak": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    344
+   ]
+  },
+  "tests::heap_intrinsics::use_after_free": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    345
+   ]
+  },
+  "tests::ill_formed::neg_count_array": {
+   "excluded_by": [
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    346
+   ]
+  },
+  "tests::ill_formed::no_main": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    347
+   ]
+  },
+  "tests::ill_formed::too_large_local": {
+   "excluded_by": [
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    348
+   ]
+  },
+  "tests::ill_formed::type_mismatch": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    349
+   ]
+  },
+  "tests::int::arith_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    350
+   ]
+  },
+  "tests::int::bit_and_int_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    351
+   ]
+  },
+  "tests::int::bit_and_no_int_bool_mixing": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    352
+   ]
+  },
+  "tests::int::bit_and_requires_int": {
+   "excluded_by": [
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    353
+   ]
+  },
+  "tests::int::bit_int_not_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    354
+   ]
+  },
+  "tests::int::bit_or_int_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    355
+   ]
+  },
+  "tests::int::bit_xor_int_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    356
+   ]
+  },
+  "tests::int::cmp_ill_formed_left": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    357
+   ]
+  },
+  "tests::int::cmp_ill_formed_right": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    358
+   ]
+  },
+  "tests::int::cmp_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    359
+   ]
+  },
+  "tests::int::count_ones_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    360
+   ]
+  },
+  "tests::int::div_exact_arith": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    361
+   ]
+  },
+  "tests::int::div_exact_remainder": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    362
+   ]
+  },
+  "tests::int::div_overflow": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    363
+   ]
+  },
+  "tests::int::div_zero": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    364
+   ]
+  },
+  "tests::int::overflow_add_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    365
+   ]
+  },
+  "tests::int::overflow_ill_formed_left": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    366
+   ]
+  },
+  "tests::int::overflow_ill_formed_right": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    367
+   ]
+  },
+  "tests::int::overflow_mul_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    368
+   ]
+  },
+  "tests::int::overflow_sub_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    369
+   ]
+  },
+  "tests::int::rem_overflow": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    370
+   ]
+  },
+  "tests::int::rem_zero": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    371
+   ]
+  },
+  "tests::int::shl_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    372
+   ]
+  },
+  "tests::int::shr_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    373
+   ]
+  },
+  "tests::int::unchecked_add_ub": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    374,
+    375
+   ]
+  },
+  "tests::int::unchecked_add_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    376
+   ]
+  },
+  "tests::int::unchecked_mul_ub": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    377,
+    378
+   ]
+  },
+  "tests::int::unchecked_mul_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    379
+   ]
+  },
+  "tests::int::unchecked_shl_ub": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    380,
+    381,
+    382
+   ]
+  },
+  "tests::int::unchecked_shl_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    383
+   ]
+  },
+  "tests::int::unchecked_shr_ub": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    384,
+    385,
+    386,
+    387
+   ]
+  },
+  "tests::int::unchecked_shr_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    388
+   ]
+  },
+  "tests::int::unchecked_sub_ub": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    389,
+    390
+   ]
+  },
+  "tests::int::unchecked_sub_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    391
+   ]
+  },
+  "tests::locals::assign_dead": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    392
+   ]
+  },
+  "tests::locals::dead_before_live": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    393
+   ]
+  },
+  "tests::locals::double_live": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    394
+   ]
+  },
+  "tests::locks::acquire_arg_count": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    395
+   ]
+  },
+  "tests::locks::acquire_arg_value": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    396
+   ]
+  },
+  "tests::locks::acquire_non_existent": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    397
+   ]
+  },
+  "tests::locks::acquire_wrongreturn": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    398
+   ]
+  },
+  "tests::locks::create_arg_count": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    399
+   ]
+  },
+  "tests::locks::create_wrongreturn": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    400
+   ]
+  },
+  "tests::locks::deadlock": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Lock",
+    "IntrinsicOp::Spawn",
+    "expect:deadlock"
+   ],
+   "in_slice": false,
+   "records": [
+    401
+   ]
+  },
+  "tests::locks::lock_handover": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Lock",
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    402
+   ]
+  },
+  "tests::locks::lock_handover_data_race": {
+   "excluded_by": [
+    "IntrinsicOp::AtomicStore",
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Lock",
+    "IntrinsicOp::Spawn",
+    "expect:none",
+    "expect:stop_always"
+   ],
+   "in_slice": false,
+   "records": [
+    403,
+    404,
+    405,
+    406,
+    407,
+    408,
+    409,
+    410,
+    411,
+    412
+   ]
+  },
+  "tests::locks::release_arg_count": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    413
+   ]
+  },
+  "tests::locks::release_arg_value": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    414
+   ]
+  },
+  "tests::locks::release_non_existent": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    415
+   ]
+  },
+  "tests::locks::release_non_owned": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    416
+   ]
+  },
+  "tests::locks::release_wrongreturn": {
+   "excluded_by": [
+    "IntrinsicOp::Lock"
+   ],
+   "in_slice": false,
+   "records": [
+    417
+   ]
+  },
+  "tests::main::main_returns": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    418
+   ]
+  },
+  "tests::negative_index::negative_index": {
+   "excluded_by": [
+    "PlaceExpr::Index",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    419
+   ]
+  },
+  "tests::no_preserve_padding::no_preserve_padding": {
+   "excluded_by": [
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    420
+   ]
+  },
+  "tests::no_preserve_prov::no_preserve_prov": {
+   "excluded_by": [
+    "PlaceExpr::Index",
+    "Type::Array",
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    421
+   ]
+  },
+  "tests::null::ptr_null": {
+   "excluded_by": [
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    422
+   ]
+  },
+  "tests::null::ptr_null_zst": {
+   "excluded_by": [
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    423
+   ]
+  },
+  "tests::packed::packed_is_not_aligned": {
+   "excluded_by": [
+    "expect:ub_eventually"
+   ],
+   "in_slice": false,
+   "records": [
+    424
+   ]
+  },
+  "tests::packed::packed_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    425
+   ]
+  },
+  "tests::place_mention::place_mention_dangling_pointer": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    426
+   ]
+  },
+  "tests::place_mention::place_mention_not_ignored": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    427
+   ]
+  },
+  "tests::print::print_fail": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout"
+   ],
+   "in_slice": false,
+   "records": [
+    428
+   ]
+  },
+  "tests::print::print_success": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    429
+   ]
+  },
+  "tests::print::print_wrongreturn": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout"
+   ],
+   "in_slice": false,
+   "records": [
+    430
+   ]
+  },
+  "tests::ptr::pointer_partial_overwrite": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    431
+   ]
+  },
+  "tests::ptr::pointer_rel": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    432
+   ]
+  },
+  "tests::ptr_offset::invalid_offset": {
+   "excluded_by": [
+    "PlaceExpr::Index",
+    "Type::Array",
+    "Type::Union"
+   ],
+   "in_slice": false,
+   "records": [
+    433
+   ]
+  },
+  "tests::ptr_offset::ptr_offset_inbounds": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    434
+   ]
+  },
+  "tests::ptr_offset::ptr_offset_no_inbounds": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    435
+   ]
+  },
+  "tests::ptr_offset::ptr_offset_out_of_bounds": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    436
+   ]
+  },
+  "tests::ptr_offset::ptr_offset_success": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    437
+   ]
+  },
+  "tests::ptr_offset_from::inbounds_cross_alloc": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    438
+   ]
+  },
+  "tests::ptr_offset_from::inbounds_cross_alloc_same_addr": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    439
+   ]
+  },
+  "tests::ptr_offset_from::inbounds_success": {
+   "excluded_by": [
+    "PlaceExpr::Index",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    440
+   ]
+  },
+  "tests::ptr_offset_from::nonneg": {
+   "excluded_by": [
+    "PlaceExpr::Index",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    441
+   ]
+  },
+  "tests::ptr_offset_from::oob_success": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    442
+   ]
+  },
+  "tests::raw_eq::false_raw_eq": {
+   "excluded_by": [
+    "IntrinsicOp::RawEq",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    443
+   ]
+  },
+  "tests::raw_eq::invalid_arg_ty_raw_eq": {
+   "excluded_by": [
+    "IntrinsicOp::RawEq"
+   ],
+   "in_slice": false,
+   "records": [
+    444
+   ]
+  },
+  "tests::raw_eq::invalid_ret_ty_raw_eq": {
+   "excluded_by": [
+    "IntrinsicOp::RawEq",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    445
+   ]
+  },
+  "tests::raw_eq::raw_ptr_raw_eq": {
+   "excluded_by": [
+    "IntrinsicOp::RawEq",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    446
+   ]
+  },
+  "tests::raw_eq::true_raw_eq": {
+   "excluded_by": [
+    "IntrinsicOp::RawEq",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    447
+   ]
+  },
+  "tests::raw_eq::unequal_args_ty_raw_eq": {
+   "excluded_by": [
+    "IntrinsicOp::RawEq",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    448
+   ]
+  },
+  "tests::raw_eq::uninit_raw_eq": {
+   "excluded_by": [
+    "IntrinsicOp::RawEq",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    449
+   ]
+  },
+  "tests::return_::return_intrinsic_no_next": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    450
+   ]
+  },
+  "tests::return_::return_no_next": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    451
+   ]
+  },
+  "tests::return_::return_success": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    452
+   ]
+  },
+  "tests::slice::get_metadata_correct": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "LayoutStrategy::Slice",
+    "Type::Array",
+    "UnOp::GetMetadata",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    453
+   ]
+  },
+  "tests::slice::get_thin_pointer_is_first_elem": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "LayoutStrategy::Slice",
+    "PlaceExpr::Index",
+    "Type::Array",
+    "UnOp::GetThinPointer",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    454
+   ]
+  },
+  "tests::slice::ill_load": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "LayoutStrategy::Slice",
+    "Type::Slice",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    455
+   ]
+  },
+  "tests::slice::ill_local": {
+   "excluded_by": [
+    "Type::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    456
+   ]
+  },
+  "tests::slice::ill_slice_ref_unsized_elem": {
+   "excluded_by": [
+    "LayoutStrategy::Slice",
+    "Type::Slice",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    457
+   ]
+  },
+  "tests::slice::ill_transmute": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "PlaceExpr::Index",
+    "Type::Array",
+    "Type::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    458
+   ]
+  },
+  "tests::slice::index_to_slice": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "LayoutStrategy::Slice",
+    "PlaceExpr::Index",
+    "Type::Array",
+    "Type::Slice",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    459
+   ]
+  },
+  "tests::slice::index_to_transmuted_slice": {
+   "excluded_by": [
+    "LayoutStrategy::Slice",
+    "PlaceExpr::Index",
+    "Type::Array",
+    "Type::Slice",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    460
+   ]
+  },
+  "tests::slice::large_raw": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "PointerMetaKind::ElementCount",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    461
+   ]
+  },
+  "tests::slice::ub_invalid_index": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "IntrinsicOp::PrintStdout",
+    "LayoutStrategy::Slice",
+    "PlaceExpr::Index",
+    "Type::Array",
+    "Type::Slice",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    462,
+    463
+   ]
+  },
+  "tests::slice::ub_too_large_slice": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "LayoutStrategy::Slice",
+    "Type::Array",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    464
+   ]
+  },
+  "tests::slice::wf_index": {
+   "excluded_by": [
+    "LayoutStrategy::Slice",
+    "PlaceExpr::Index",
+    "Type::Slice",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    465
+   ]
+  },
+  "tests::slice::wf_slice_ref": {
+   "excluded_by": [
+    "LayoutStrategy::Slice",
+    "PointerMetaKind::ElementCount",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    466
+   ]
+  },
+  "tests::spawn_join::join_arg_count": {
+   "excluded_by": [
+    "IntrinsicOp::Join"
+   ],
+   "in_slice": false,
+   "records": [
+    467
+   ]
+  },
+  "tests::spawn_join::join_arg_value": {
+   "excluded_by": [
+    "IntrinsicOp::Join"
+   ],
+   "in_slice": false,
+   "records": [
+    468
+   ]
+  },
+  "tests::spawn_join::join_no_thread": {
+   "excluded_by": [
+    "IntrinsicOp::Join"
+   ],
+   "in_slice": false,
+   "records": [
+    469
+   ]
+  },
+  "tests::spawn_join::join_wrongreturn": {
+   "excluded_by": [
+    "IntrinsicOp::Join"
+   ],
+   "in_slice": false,
+   "records": [
+    470
+   ]
+  },
+  "tests::spawn_join::spawn_arg_count": {
+   "excluded_by": [
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    471
+   ]
+  },
+  "tests::spawn_join::spawn_arg_value": {
+   "excluded_by": [
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    472
+   ]
+  },
+  "tests::spawn_join::spawn_data_ptr": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    473
+   ]
+  },
+  "tests::spawn_join::spawn_func_no_args": {
+   "excluded_by": [
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    474
+   ]
+  },
+  "tests::spawn_join::spawn_func_returns": {
+   "excluded_by": [
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    475
+   ]
+  },
+  "tests::spawn_join::spawn_success": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    476
+   ]
+  },
+  "tests::spawn_join::spawn_wrongarg": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    477
+   ]
+  },
+  "tests::spawn_join::spawn_wrongreturn": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    478
+   ]
+  },
+  "tests::spawn_join::thread_spawn_spurious_race": {
+   "excluded_by": [
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn"
+   ],
+   "in_slice": false,
+   "records": [
+    479
+   ]
+  },
+  "tests::switch::boolean_switch_is_ill_formed": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    480
+   ]
+  },
+  "tests::switch::else_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    481
+   ]
+  },
+  "tests::switch::if_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    482
+   ]
+  },
+  "tests::switch::switch_enum_works": {
+   "excluded_by": [
+    "Statement::SetDiscriminant",
+    "Type::Enum",
+    "ValueExpr::GetDiscriminant"
+   ],
+   "in_slice": false,
+   "records": [
+    483
+   ]
+  },
+  "tests::switch::switch_int_works": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    484
+   ]
+  },
+  "tests::too_large_alloc::too_large_alloc": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    485
+   ]
+  },
+  "tests::trait_object::dynamic_dispatch": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "Constant::VTablePointer",
+    "LayoutStrategy::TraitObject",
+    "PtrType::VTablePtr",
+    "UnOp::GetMetadata",
+    "UnOp::GetThinPointer",
+    "UnOp::VTableMethodLookup",
+    "UnsafeCellStrategy::TraitObject",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    486
+   ]
+  },
+  "tests::trait_object::ill_const_undef_vtable": {
+   "excluded_by": [
+    "Constant::VTablePointer",
+    "PtrType::VTablePtr",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    487
+   ]
+  },
+  "tests::trait_object::ill_const_wrong_ty": {
+   "excluded_by": [
+    "Constant::VTablePointer",
+    "PointerMetaKind::VTablePointer",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    488
+   ]
+  },
+  "tests::trait_object::ill_lookup_wrong_method": {
+   "excluded_by": [
+    "Constant::VTablePointer",
+    "PtrType::VTablePtr",
+    "UnOp::VTableMethodLookup",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    489
+   ]
+  },
+  "tests::trait_object::ill_lookup_wrong_ty": {
+   "excluded_by": [
+    "PointerMetaKind::VTablePointer",
+    "UnOp::VTableMethodLookup",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    490
+   ]
+  },
+  "tests::trait_object::ill_undef_trait_name": {
+   "excluded_by": [
+    "PtrType::VTablePtr"
+   ],
+   "in_slice": false,
+   "records": [
+    491
+   ]
+  },
+  "tests::trait_object::ill_vtables_unaligned_size": {
+   "excluded_by": [
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    492
+   ]
+  },
+  "tests::trait_object::ill_vtables_wrong_methods": {
+   "excluded_by": [
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    493
+   ]
+  },
+  "tests::trait_object::ill_vtables_wrong_trait": {
+   "excluded_by": [
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    494
+   ]
+  },
+  "tests::trait_object::ub_dangling_standalone_vtable_ptr": {
+   "excluded_by": [
+    "PtrType::VTablePtr",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    495
+   ]
+  },
+  "tests::trait_object::ub_dangling_vtable_in_wide_pointer": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "PointerMetaKind::VTablePointer",
+    "PtrType::VTablePtr",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    496
+   ]
+  },
+  "tests::trait_object::ub_wrong_vtable_ty": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "Constant::VTablePointer",
+    "PointerMetaKind::VTablePointer",
+    "PtrType::VTablePtr",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    497
+   ]
+  },
+  "tests::trait_object::weird_wrong_vtable_right_trait": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "Constant::VTablePointer",
+    "IntrinsicOp::PrintStdout",
+    "PointerMetaKind::VTablePointer",
+    "PtrType::VTablePtr",
+    "UnOp::GetMetadata",
+    "UnOp::GetThinPointer",
+    "UnOp::VTableMethodLookup",
+    "entry:get_stdout",
+    "expect:none",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    498
+   ]
+  },
+  "tests::uninit_read::uninit_read": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    499
+   ]
+  },
+  "tests::unreachable::reach_unreachable": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    500
+   ]
+  },
+  "tests::unsized_struct::ill_aggregate_unsized": {
+   "excluded_by": [
+    "Type::Slice",
+    "Type::Tuple with unsized field"
+   ],
+   "in_slice": false,
+   "records": [
+    501
+   ]
+  },
+  "tests::unsized_struct::ill_align_larger_than_packed": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "Type::Slice",
+    "Type::Tuple with unsized field",
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    502
+   ]
+  },
+  "tests::unsized_struct::ill_negative_field": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    503
+   ]
+  },
+  "tests::unsized_struct::ill_packed_on_sized": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    504
+   ]
+  },
+  "tests::unsized_struct::ill_size_too_small": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    505
+   ]
+  },
+  "tests::unsized_struct::ill_sized_tail": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "Type::Tuple with unsized field",
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    506
+   ]
+  },
+  "tests::unsized_struct::ill_unsized_head": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "Type::Slice",
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    507
+   ]
+  },
+  "tests::unsized_struct::packed_tail": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "Constant::VTablePointer",
+    "LayoutStrategy::TraitObject",
+    "LayoutStrategy::Tuple",
+    "PointerMetaKind::VTablePointer",
+    "PtrType::VTablePtr",
+    "Type::TraitObject",
+    "Type::Tuple with unsized field",
+    "UnOp::ComputeAlign",
+    "UnOp::ComputeSize",
+    "UnOp::GetMetadata",
+    "UnOp::GetThinPointer",
+    "UnsafeCellStrategy::TraitObject",
+    "UnsafeCellStrategy::Tuple",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    508
+   ]
+  },
+  "tests::unsized_struct::size_of_nested_struct": {
+   "excluded_by": [
+    "Type::Slice",
+    "Type::Tuple with unsized field",
+    "UnOp::ComputeAlign",
+    "UnOp::ComputeSize"
+   ],
+   "in_slice": false,
+   "records": [
+    509
+   ]
+  },
+  "tests::unsized_struct::unsized_tail": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "Constant::VTablePointer",
+    "LayoutStrategy::TraitObject",
+    "LayoutStrategy::Tuple",
+    "PtrType::VTablePtr",
+    "Type::TraitObject",
+    "Type::Tuple with unsized field",
+    "UnOp::ComputeAlign",
+    "UnOp::ComputeSize",
+    "UnOp::GetMetadata",
+    "UnOp::GetThinPointer",
+    "UnOp::VTableMethodLookup",
+    "UnsafeCellStrategy::TraitObject",
+    "UnsafeCellStrategy::Tuple",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    510
+   ]
+  },
+  "tests::unwind_payload::basic_test": {
+   "excluded_by": [
+    "BbKind::Catch",
+    "IntrinsicOp::GetUnwindPayload",
+    "Terminator::StartUnwind",
+    "Terminator::StopUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    511
+   ]
+  },
+  "tests::unwind_payload::empty_stack": {
+   "excluded_by": [
+    "BbKind::Catch",
+    "IntrinsicOp::GetUnwindPayload",
+    "Terminator::StartUnwind",
+    "Terminator::StopUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    512
+   ]
+  },
+  "tests::unwind_payload::payload_wrong_ty": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    513
+   ]
+  },
+  "tests::unwind_payload::recursive_payload_test": {
+   "excluded_by": [
+    "BbKind::Catch",
+    "IntrinsicOp::GetUnwindPayload",
+    "IntrinsicOp::PrintStdout",
+    "Terminator::StartUnwind",
+    "Terminator::StopUnwind",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    514
+   ]
+  },
+  "tests::unwind_payload::wrong_ret_ty": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "IntrinsicOp::GetUnwindPayload",
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    515
+   ]
+  },
+  "tests::unwinding::abort_in_cleanup": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    516
+   ]
+  },
+  "tests::unwinding::print_after_unwind": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "IntrinsicOp::PrintStdout",
+    "Terminator::ResumeUnwind",
+    "Terminator::StartUnwind",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    517
+   ]
+  },
+  "tests::unwinding::reach_terminate_block": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "BbKind::Terminate",
+    "Terminator::ResumeUnwind",
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    518
+   ]
+  },
+  "tests::unwinding::resume_in_main": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "Terminator::ResumeUnwind",
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    519
+   ]
+  },
+  "tests::unwinding::resume_in_thread": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "IntrinsicOp::Join",
+    "IntrinsicOp::Spawn",
+    "Terminator::ResumeUnwind",
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    520
+   ]
+  },
+  "tests::unwinding::resume_no_unwind_block": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "Terminator::ResumeUnwind",
+    "Terminator::StartUnwind"
+   ],
+   "in_slice": false,
+   "records": [
+    521
+   ]
+  },
+  "tests::unwinding::start_unwind_in_main": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "IntrinsicOp::PrintStdout",
+    "Terminator::StartUnwind",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    522
+   ]
+  },
+  "tests::unwinding::statements_in_cleanup": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "IntrinsicOp::PrintStdout",
+    "Terminator::ResumeUnwind",
+    "Terminator::StartUnwind",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    523
+   ]
+  },
+  "tests::unwinding::unwind_recursive_func": {
+   "excluded_by": [
+    "BbKind::Cleanup",
+    "IntrinsicOp::PrintStdout",
+    "Terminator::ResumeUnwind",
+    "Terminator::StartUnwind",
+    "entry:get_stdout",
+    "expect:none"
+   ],
+   "in_slice": false,
+   "records": [
+    524
+   ]
+  },
+  "tests::wide_ptr::compare_slice_ptr": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "PlaceExpr::Index",
+    "PointerMetaKind::ElementCount",
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    525
+   ]
+  },
+  "tests::wide_ptr::compare_trait_obj_ptr": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "Constant::VTablePointer",
+    "PlaceExpr::Index",
+    "PointerMetaKind::VTablePointer",
+    "PtrType::VTablePtr",
+    "Type::Array",
+    "program:traits-or-vtables"
+   ],
+   "in_slice": false,
+   "records": [
+    526
+   ]
+  },
+  "tests::wide_ptr::construct_slice": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "LayoutStrategy::Slice",
+    "PlaceExpr::Index",
+    "Type::Array",
+    "Type::Slice",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    527
+   ]
+  },
+  "tests::wide_ptr::construct_thin": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer"
+   ],
+   "in_slice": false,
+   "records": [
+    528
+   ]
+  },
+  "tests::wide_ptr::get_metadata_thin_ptr": {
+   "excluded_by": [
+    "UnOp::GetMetadata"
+   ],
+   "in_slice": false,
+   "records": [
+    529
+   ]
+  },
+  "tests::wide_ptr::get_thin_of_thin_ptr": {
+   "excluded_by": [
+    "UnOp::GetThinPointer"
+   ],
+   "in_slice": false,
+   "records": [
+    530
+   ]
+  },
+  "tests::wide_ptr::ill_compare_wide_thin_ptr": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "PointerMetaKind::ElementCount"
+   ],
+   "in_slice": false,
+   "records": [
+    531
+   ]
+  },
+  "tests::wide_ptr::ill_construct_wide_from_wide_ptr": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "IntrinsicOp::PrintStdout",
+    "LayoutStrategy::Slice",
+    "Type::Array",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    532
+   ]
+  },
+  "tests::wide_ptr::ill_construct_wide_mismatched_meta": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "IntrinsicOp::PrintStdout",
+    "LayoutStrategy::Slice",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    533
+   ]
+  },
+  "tests::wide_ptr::ill_construct_wide_non_ptr": {
+   "excluded_by": [
+    "BinOp::ConstructWidePointer",
+    "IntrinsicOp::PrintStdout",
+    "LayoutStrategy::Slice",
+    "UnsafeCellStrategy::Slice"
+   ],
+   "in_slice": false,
+   "records": [
+    534
+   ]
+  },
+  "tests::wide_ptr::ill_get_metadata_non_ptr": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "UnOp::GetMetadata"
+   ],
+   "in_slice": false,
+   "records": [
+    535
+   ]
+  },
+  "tests::wide_ptr::ill_get_thin_non_ptr": {
+   "excluded_by": [
+    "IntrinsicOp::PrintStdout",
+    "UnOp::GetThinPointer"
+   ],
+   "in_slice": false,
+   "records": [
+    536
+   ]
+  },
+  "tests::wide_ptr::ub_wide_thin_abi_incompatible": {
+   "excluded_by": [
+    "PointerMetaKind::ElementCount"
+   ],
+   "in_slice": false,
+   "records": [
+    537
+   ]
+  },
+  "tests::zst::zst_array": {
+   "excluded_by": [
+    "Type::Array"
+   ],
+   "in_slice": false,
+   "records": [
+    538
+   ]
+  },
+  "tests::zst::zst_enum": {
+   "excluded_by": [
+    "Type::Enum"
+   ],
+   "in_slice": false,
+   "records": [
+    539
+   ]
+  },
+  "tests::zst::zst_tuple": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    540
+   ]
+  },
+  "tests::zst::zst_tuple2": {
+   "excluded_by": [],
+   "in_slice": true,
+   "records": [
+    541
+   ]
+  }
+ }
+}

@@ -117,7 +117,11 @@ impl<'tcx> WitnessEncoder<'tcx> {
             ty::FnDef(did, args) => {
                 b.push(13);
                 self.dph(*did, &mut b);
-                if !self.encode_args(*args, &mut b) {
+                // Upstream 1.101: FnDef args are Binder-wrapped. The witness
+                // format has no bound-var representation, so a binder with
+                // bound vars escapes rather than silently dropping them.
+                let Some(args) = args.no_bound_vars() else { return self.escape(t) };
+                if !self.encode_args(args, &mut b) {
                     return self.escape(t);
                 }
             }
@@ -204,7 +208,7 @@ impl<'tcx> WitnessEncoder<'tcx> {
         self.push_entry(t, b)
     }
 
-    fn encode_args(&mut self, args: ty::GenericArgsRef<'tcx>, b: &mut Vec<u8>) -> bool {
+    fn encode_args(&mut self, args: ty::GenericArgs<'tcx>, b: &mut Vec<u8>) -> bool {
         if args.len() > u8::MAX as usize {
             return false;
         }
@@ -340,7 +344,7 @@ pub fn encode_root<'tcx>(tcx: TyCtxt<'tcx>, tr: &TypeckResults<'tcx>) -> Option<
     }
 
     // node_args (probe every node id; no read-side table accessor)
-    let mut na: Vec<(rustc_hir::ItemLocalId, ty::GenericArgsRef<'tcx>)> = Vec::new();
+    let mut na: Vec<(rustc_hir::ItemLocalId, ty::GenericArgs<'tcx>)> = Vec::new();
     for id in &node_ids {
         let hid = HirId { owner: tr.hir_owner, local_id: *id };
         if let Some(args) = tr.node_args_opt(hid) {

@@ -23,7 +23,12 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 echo "=== bridge.replay: kernel-checking the vendored Lean<->Clean closure ==="
-RUSTC_BOOTSTRAP=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
-  cargo test --manifest-path crates/Cargo.toml -p trust-clean \
-  --test lean_clean_bridge -- --test-threads=1
+# `targo --unverified`, not `cargo`: under the `trust` toolchain stock cargo has
+# no per-unit verification policy, so it verifies every dependency as its own
+# primary crate and dies on obligations unrelated to this lane. `RUSTC_BOOTSTRAP`
+# goes with it — the toolchain targo pins is `channel = "trust"`, which opens the
+# nightly features natively. Converted 2026-09-12 with the gate manifest.
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
+  targo --unverified test --config build.test-jobs=1 --manifest-path Cargo.toml -p trust-clean \
+  --test lean_clean_bridge
 echo "bridge.replay: PASS"

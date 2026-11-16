@@ -2,7 +2,9 @@
 #![cfg(not(miri))]
 #![allow(internal_features)]
 #![feature(iter_next_chunk)]
+#![feature(macro_metavar_expr_concat)]
 #![feature(repr_simd)]
+#![feature(retain_unstable)]
 #![feature(slice_partition_dedup)]
 #![feature(strict_provenance_lints)]
 #![feature(test)]
@@ -12,6 +14,7 @@ extern crate test;
 
 mod binary_heap;
 mod btree;
+mod io;
 mod linked_list;
 mod slice;
 mod str;

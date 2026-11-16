@@ -159,6 +159,8 @@ pub struct CtlModelChecker<'a> {
     all_states: Vec<StateId>,
     /// Predecessor map: state -> set of states that can reach it in one step.
     predecessors: FxHashMap<StateId, Vec<StateId>>,
+    /// Successor map: state -> states reachable from it in one step.
+    successors: FxHashMap<StateId, Vec<StateId>>,
 }
 
 impl<'a> CtlModelChecker<'a> {
@@ -167,16 +169,23 @@ impl<'a> CtlModelChecker<'a> {
     pub fn new(machine: &'a StateMachine) -> Self {
         let all_states: Vec<StateId> = machine.states.iter().map(|s| s.id).collect();
 
-        // Build predecessor map
+        // Build predecessor and successor maps once in a single pass over transitions.
         let mut predecessors: FxHashMap<StateId, Vec<StateId>> = FxHashMap::default();
-        for state in &all_states {
-            predecessors.entry(*state).or_default();
+        let mut successors: FxHashMap<StateId, Vec<StateId>> = FxHashMap::default();
+        for &state in &all_states {
+            predecessors.entry(state).or_default();
+            successors.entry(state).or_default();
         }
         for transition in &machine.transitions {
             predecessors.entry(transition.to).or_default().push(transition.from);
+            successors.entry(transition.from).or_default().push(transition.to);
         }
 
-        Self { machine, all_states, predecessors }
+        Self { machine, all_states, predecessors, successors }
+    }
+
+    fn successors_of(&self, state: StateId) -> &[StateId] {
+        self.successors.get(&state).map_or(&[], Vec::as_slice)
     }
 
     /// Check which states satisfy the given CTL formula.
@@ -240,7 +249,7 @@ impl<'a> CtlModelChecker<'a> {
 
         for &state in &self.all_states {
             let has_phi_successor =
-                self.machine.successors(state).iter().any(|s| phi_states.contains(s));
+                self.successors_of(state).iter().any(|s| phi_states.contains(s));
             if has_phi_successor {
                 result.insert(state);
             }
@@ -285,7 +294,7 @@ impl<'a> CtlModelChecker<'a> {
             let next: FxHashSet<StateId> = current
                 .iter()
                 .copied()
-                .filter(|&state| self.machine.successors(state).iter().any(|s| current.contains(s)))
+                .filter(|&state| self.successors_of(state).iter().any(|s| current.contains(s)))
                 .collect();
 
             if next == current {
@@ -329,8 +338,7 @@ impl<'a> CtlModelChecker<'a> {
         let mut result = FxHashSet::default();
 
         for &state in &self.all_states {
-            let successors = self.machine.successors(state);
-            if successors.iter().all(|s| phi_states.contains(s)) {
+            if self.successors_of(state).iter().all(|s| phi_states.contains(s)) {
                 result.insert(state);
             }
         }
@@ -351,7 +359,7 @@ impl<'a> CtlModelChecker<'a> {
         // Count how many successors of each state are NOT yet in result
         let mut remaining: FxHashMap<StateId, usize> = FxHashMap::default();
         for &state in &self.all_states {
-            remaining.insert(state, self.machine.successors(state).len());
+            remaining.insert(state, self.successors_of(state).len());
         }
 
         while let Some(state) = queue.pop_front() {
@@ -397,7 +405,7 @@ impl<'a> CtlModelChecker<'a> {
 
         let mut remaining: FxHashMap<StateId, usize> = FxHashMap::default();
         for &state in &self.all_states {
-            remaining.insert(state, self.machine.successors(state).len());
+            remaining.insert(state, self.successors_of(state).len());
         }
 
         while let Some(state) = queue.pop_front() {
@@ -475,7 +483,7 @@ impl<'a> CtlModelChecker<'a> {
         queue.push_back(start);
 
         while let Some(current) = queue.pop_front() {
-            for succ in self.machine.successors(current) {
+            for &succ in self.successors_of(current) {
                 if visited.insert(succ) {
                     parent.insert(succ, current);
                     if targets.contains(&succ) {

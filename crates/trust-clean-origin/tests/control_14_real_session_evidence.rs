@@ -74,7 +74,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use clean_kernel::{Environment, Expr, ExprKind};
-use trust_clean_origin::emit::{CleanOriginShape, plan_clean_origin_body};
+use trust_clean_origin::emit::{CleanOriginShape, plan_clean_origin_body_with_rust_callees};
 use trust_clean_origin::table::{KernelSelector, ROWS, RowContext};
 use trust_types::admissible_body::{ArithBinOp, ArithExpr, RecBodyExpr};
 
@@ -93,6 +93,12 @@ struct Witness {
     source: &'static str,
     /// The `def` inside `source` to plan.
     def: &'static str,
+    /// W5 (Lean-calls-Rust): the sibling Rust `fn`s the session declares
+    /// BEFORE the island is checked, as `(bare name, parameter carriers,
+    /// result carrier)` in Rust spelling. The compiler derives these from the
+    /// callee's signature; here they are the witness's own statement of what
+    /// the island calls. Empty for every witness that calls no Rust.
+    rust_callees: &'static [(&'static str, &'static [&'static str], &'static str)],
 }
 
 /// The witness corpus.
@@ -106,12 +112,14 @@ static WITNESSES: &[Witness] = &[
         label: "projection",
         source: "def fst (a : UInt64) (b : UInt64) : UInt64 := a",
         def: "fst",
+        rust_callees: &[],
     },
-    Witness { label: "constant", source: "def six : UInt64 := 6", def: "six" },
+    Witness { label: "constant", source: "def six : UInt64 := 6", def: "six", rust_callees: &[] },
     Witness {
         label: "add",
         source: "def sum (a : UInt64) (b : UInt64) : UInt64 := a + b",
         def: "sum",
+        rust_callees: &[],
     },
     // The `-` witness. Until 2026-08-22 NO real-session source in this crate
     // contained a `-` at all — the phase-1 hazard survey flagged `uint.sub` as
@@ -121,11 +129,13 @@ static WITNESSES: &[Witness] = &[
         label: "sub",
         source: "def dif (a : UInt64) (b : UInt64) : UInt64 := a - b",
         def: "dif",
+        rust_callees: &[],
     },
     Witness {
         label: "mul",
         source: "def prod (a : UInt64) (b : UInt64) : UInt64 := a * b",
         def: "prod",
+        rust_callees: &[],
     },
     // A COMPOSITION, so the composed lane is reached from a source too and not
     // only through the single-op rungs.
@@ -133,6 +143,7 @@ static WITNESSES: &[Witness] = &[
         label: "composed",
         source: "def wmix (a : UInt64) (b : UInt64) : UInt64 := (a + b) * a",
         def: "wmix",
+        rust_callees: &[],
     },
     // A narrower width than the u64 every other arithmetic witness uses: the
     // survey flagged UInt8/16/32 arithmetic as having no real-session source.
@@ -140,11 +151,13 @@ static WITNESSES: &[Witness] = &[
         label: "add-u8",
         source: "def s8 (a : UInt8) (b : UInt8) : UInt8 := a + b",
         def: "s8",
+        rust_callees: &[],
     },
     Witness {
         label: "sub-u32",
         source: "def s32 (a : UInt32) (b : UInt32) : UInt32 := a - b",
         def: "s32",
+        rust_callees: &[],
     },
     // ── §6f landing 7: the raw binary operators ───────────────────────────
     //
@@ -156,11 +169,13 @@ static WITNESSES: &[Witness] = &[
         label: "bitand",
         source: "def band (a : UInt64) (b : UInt64) : UInt64 := a &&& b",
         def: "band",
+        rust_callees: &[],
     },
     Witness {
         label: "bitor",
         source: "def bor (a : UInt64) (b : UInt64) : UInt64 := a ||| b",
         def: "bor",
+        rust_callees: &[],
     },
     // The divisor is a strictly positive NUMERAL, and it has to be: this lane
     // emits `/` and `%` nowhere else, because Clean's `UInt{N}.div`/`.mod` are
@@ -171,11 +186,13 @@ static WITNESSES: &[Witness] = &[
         label: "div-literal",
         source: "def third (a : UInt64) : UInt64 := a / 3",
         def: "third",
+        rust_callees: &[],
     },
     Witness {
         label: "mod-literal",
         source: "def rem3 (a : UInt64) : UInt64 := a % 3",
         def: "rem3",
+        rust_callees: &[],
     },
     // A NARROWER width for the same family, for the reason the `add-u8`
     // witness exists: the phase-1 survey's lesson was that a lane believed
@@ -184,38 +201,70 @@ static WITNESSES: &[Witness] = &[
         label: "bitand-u8",
         source: "def band8 (a : UInt8) (b : UInt8) : UInt8 := a &&& b",
         def: "band8",
+        rust_callees: &[],
+    },
+    // 2026-09-23 — the two rows clean `bf31976f48` unlocked. They are the
+    // evidence that `HXor.hXor` and `HShiftRight.hShiftRight` are spellings a
+    // source PRODUCES, which is what the rows' one side-A selector each rests
+    // on. The shift's amount is a numeral below the width because that is the
+    // only amount the lane plans (`landing7_selection_probes::l7_p14`); a
+    // witness written `a >>> b` would not plan, and `measure()` would say so.
+    Witness {
+        label: "bitxor",
+        source: "def bxor (a : UInt64) (b : UInt64) : UInt64 := a ^^^ b",
+        def: "bxor",
+        rust_callees: &[],
+    },
+    Witness {
+        label: "shr-literal",
+        source: "def eighth (a : UInt64) : UInt64 := a >>> 3",
+        def: "eighth",
+        rust_callees: &[],
+    },
+    // And a narrower width, for the `bitand-u8` witness's reason.
+    Witness {
+        label: "bitxor-u32",
+        source: "def bxor32 (a : UInt32) (b : UInt32) : UInt32 := a ^^^ b",
+        def: "bxor32",
+        rust_callees: &[],
     },
     // ── selects ───────────────────────────────────────────────────────────
     Witness {
         label: "select-lt",
         source: "def lt (a : UInt64) (b : UInt64) : UInt64 := if a < b then a else b",
         def: "lt",
+        rust_callees: &[],
     },
     Witness {
         label: "select-le",
         source: "def le (a : UInt64) (b : UInt64) : UInt64 := if a <= b then a else b",
         def: "le",
+        rust_callees: &[],
     },
     Witness {
         label: "select-eq",
         source: "def eq (a : UInt64) (b : UInt64) : UInt64 := if a = b then a else b",
         def: "eq",
+        rust_callees: &[],
     },
     Witness {
         label: "select-beq",
         source: "def eqbeq (a : UInt64) (b : UInt64) : UInt64 := if a == b then a else b",
         def: "eqbeq",
+        rust_callees: &[],
     },
     Witness {
         label: "select-literal",
         source: "def capped (a : UInt64) (b : UInt64) : UInt64 := if a < 10 then a else b",
         def: "capped",
+        rust_callees: &[],
     },
     // ── recursion ─────────────────────────────────────────────────────────
     Witness {
         label: "structural-rec",
         source: "def tozero : Nat -> Nat\n  | 0 => 0\n  | n + 1 => tozero n",
         def: "tozero",
+        rust_callees: &[],
     },
     // The structural arm vocabulary, from a source: `+`, a literal, the
     // predecessor binder and the recursive occurrence in one body.
@@ -223,6 +272,7 @@ static WITNESSES: &[Witness] = &[
         label: "structural-rec-sum",
         source: "def natsum : Nat -> Nat\n  | 0 => 0\n  | n + 1 => (n + 1) + natsum n",
         def: "natsum",
+        rust_callees: &[],
     },
     // R2's canonical fixture, verbatim from `tests/ui/trust/clean_origin_wf_rec.rs`.
     // This is the row that was marked `Covered` while being unreachable.
@@ -232,6 +282,7 @@ static WITNESSES: &[Witness] = &[
                  if h : 0 < n then n + countdownSum (n - 1) else 0\n\
                  termination_by n",
         def: "countdownSum",
+        rust_callees: &[],
     },
     // The RAW spellings, written out in source. `r2_session_probes` p2/p3
     // measure that these still plan; here they additionally supply the
@@ -243,6 +294,7 @@ static WITNESSES: &[Witness] = &[
                  if h : Nat.lt 0 n then Nat.add n (rawDown (Nat.sub n 1)) else 0\n\
                  termination_by n",
         def: "rawDown",
+        rust_callees: &[],
     },
     // §R6's row — FACTORIAL, verbatim from
     // `tests/ui/trust/clean_origin_wf_rec_mul.rs`. It supplies the SURFACE
@@ -253,6 +305,7 @@ static WITNESSES: &[Witness] = &[
                  if h : 0 < n then n * fact (n - 1) else 1\n\
                  termination_by n",
         def: "fact",
+        rust_callees: &[],
     },
     // And the RAW `Nat.mul` spelling, for the same reason `wf-rec-raw-spellings`
     // exists: the `nat.mul` row's `ConstantHead("Nat.mul")` selector must be
@@ -263,6 +316,7 @@ static WITNESSES: &[Witness] = &[
                  if h : Nat.lt 0 n then Nat.mul n (rawFact (Nat.sub n 1)) else 1\n\
                  termination_by n",
         def: "rawFact",
+        rust_callees: &[],
     },
     // §R8's row — the TEXTBOOK MODULO `gcd`, verbatim from
     // `tests/ui/trust/clean_origin_wf_rec_modulo_gcd.rs`. It supplies the
@@ -278,6 +332,7 @@ static WITNESSES: &[Witness] = &[
                  if h : 0 < b then gcd b (a % b) else a\n\
                  termination_by b + a * 0",
         def: "gcd",
+        rust_callees: &[],
     },
     // And the RAW `Nat.mod` spelling, for the reason `wf-rec-mul-raw` exists:
     // the `nat.mod` row's `ConstantHead("Nat.mod")` selector must be witnessed
@@ -288,8 +343,85 @@ static WITNESSES: &[Witness] = &[
                  if h : Nat.lt 0 b then rawGcd b (Nat.mod a b) else a\n\
                  termination_by b + a * 0",
         def: "rawGcd",
+        rust_callees: &[],
+    },
+    // ── W5 (Lean-calls-Rust) ──────────────────────────────────────────────
+    // Battery row r18's island, verbatim, with the sibling `fn inc(x: u64)
+    // -> u64` declared the way the mint declares it. The lane's whole reason
+    // to exist is that this source did NOT elaborate before increment 1.
+    Witness {
+        label: "rust-call",
+        source: "def twice_inc (x : UInt64) : UInt64 := inc (inc x)",
+        def: "twice_inc",
+        rust_callees: &[("inc", &["u64"], "u64")],
+    },
+    // ── W6 (Rust-calls-Clean) — comparison to `Bool` ──────────────────────
+    Witness {
+        label: "comparison-lt",
+        source: "def ltf (a : UInt64) (b : UInt64) : Bool := a < b",
+        def: "ltf",
+        rust_callees: &[],
+    },
+    Witness {
+        label: "comparison-le",
+        source: "def lef (a : UInt64) (b : UInt64) : Bool := a <= b",
+        def: "lef",
+        rust_callees: &[],
+    },
+    Witness {
+        label: "comparison-eq",
+        source: "def eqf (a : UInt64) (b : UInt64) : Bool := a == b",
+        def: "eqf",
+        rust_callees: &[],
+    },
+    // ── W6 (Rust-calls-Clean) — boolean connectives over `Bool` ───────────
+    Witness {
+        label: "bool-not",
+        source: "def negf (b : Bool) : Bool := not b",
+        def: "negf",
+        rust_callees: &[],
+    },
+    Witness {
+        label: "bool-and",
+        source: "def conjf (a : Bool) (b : Bool) : Bool := a && b",
+        def: "conjf",
+        rust_callees: &[],
+    },
+    Witness {
+        label: "bool-or",
+        source: "def disjf (a : Bool) (b : Bool) : Bool := a || b",
+        def: "disjf",
+        rust_callees: &[],
     },
 ];
+
+/// The Rust carrier a witness spells, in the closed vocabulary the mint
+/// admits. Anything else is a witness authoring error, not a lane fact.
+fn carrier(spelling: &str) -> trust_types::Ty {
+    match spelling {
+        "bool" => trust_types::Ty::Bool,
+        "u8" => trust_types::Ty::u8(),
+        "u16" => trust_types::Ty::u16(),
+        "u32" => trust_types::Ty::u32(),
+        "u64" => trust_types::Ty::u64(),
+        other => panic!("witness names a carrier outside the mint's vocabulary: `{other}`"),
+    }
+}
+
+/// The plan-side callee table a witness's declared callees denote — the
+/// mint seam's table (no `DefId` renderings), which is all planning needs.
+fn callee_table(witness: &Witness) -> Vec<trust_clean_origin::RustCalleeRef> {
+    witness
+        .rust_callees
+        .iter()
+        .map(|(name, params, result)| trust_clean_origin::RustCalleeRef {
+            clean_name: (*name).to_owned(),
+            def_path: String::new(),
+            params: params.iter().map(|p| carrier(p)).collect(),
+            result: carrier(result),
+        })
+        .collect()
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // The one side-A source. Nothing in this file builds a term.
@@ -303,6 +435,20 @@ static WITNESSES: &[Witness] = &[
 /// the exact bookkeeping error this file exists to prevent.
 fn elaborate(witness: &Witness) -> Environment {
     let mut session = trust_certify::clean_island::CleanIslandSession::new();
+    // W5: the sibling Rust callees, declared BEFORE the island is checked —
+    // exactly the mint's order.
+    let callees: Vec<trust_certify::clean_island::RustCallee> = witness
+        .rust_callees
+        .iter()
+        .map(|(name, params, result)| trust_certify::clean_island::RustCallee {
+            clean_name: (*name).to_owned(),
+            params: params.iter().map(|p| carrier(p)).collect(),
+            result: carrier(result),
+        })
+        .collect();
+    session.declare_rust_callees(&callees).unwrap_or_else(|refusal| {
+        panic!("witness `{}` declares a callee the environment refuses: {refusal}", witness.label)
+    });
     let batch = session.check_all(&[witness.source]);
     assert!(
         !batch.is_rejected(),
@@ -462,17 +608,19 @@ fn measure() -> Measurement {
     let mut measured = BTreeMap::new();
     for witness in WITNESSES {
         let env = elaborate(witness);
-        let plan = plan_clean_origin_body(&env, witness.def).unwrap_or_else(|refusal| {
-            panic!(
-                "witness `{}` is declared real-session evidence for a lane but does NOT \
+        let plan =
+            plan_clean_origin_body_with_rust_callees(&env, witness.def, &callee_table(witness))
+                .unwrap_or_else(|refusal| {
+                    panic!(
+                        "witness `{}` is declared real-session evidence for a lane but does NOT \
                  plan. Either the lane is unreachable from source — which is the defect \
                  this control exists to catch, and the fix is the EMITTER moving to meet \
                  the reader — or this witness is wrong and should be replaced with a \
                  source that does plan.\n  refusal: {}",
-                witness.label,
-                refusal.note()
-            )
-        });
+                        witness.label,
+                        refusal.note()
+                    )
+                });
         let mut constants = BTreeSet::new();
         if let Some(value) = definition_value(&env, witness.def) {
             constant_heads(&value, &mut constants);
@@ -490,7 +638,24 @@ fn measure() -> Measurement {
 ///
 /// Raising this number means a lane shipped whose only evidence is a hand-built
 /// term — which is the defect class itself, not a re-pin.
+///
+/// AT ITS FLOOR since 2026-08-22 (see `DECLARED_LANE_GAPS`). A count cannot
+/// fall below zero, so "may fall, never rise" now means "may not move", and
+/// both halves are executable: the `const` assertion below makes raising the
+/// ceiling a compile error, and `every_row_has_a_real_session_witness` requires
+/// the measured gap count to EQUAL it. At the floor, over `usize`, `gaps == 0`
+/// is the same statement as `gaps <= 0`; the check is spelled as the equality
+/// because the `<=` spelling carries a `<` case that can never hold
+/// (`clippy::absurd_extreme_comparisons`, deny by default).
 const LANE_GAP_CEILING: usize = 0;
+
+// The ratchet's floor is the invariant, so a raised ceiling never reaches a run.
+const _: () = assert!(
+    LANE_GAP_CEILING == 0,
+    "LANE_GAP_CEILING is a ratchet at its floor (0): it may fall, never rise. A lane \
+     with no real-session evidence is closed with a `Witness`, never admitted by \
+     raising the ceiling."
+);
 
 /// The named lane gaps, each with the reason no source reaches it.
 ///
@@ -531,10 +696,14 @@ fn every_row_has_a_real_session_witness() {
          the gap in `DECLARED_LANE_GAPS` with the reason and raise nothing."
     );
 
-    assert!(
-        gaps.len() <= LANE_GAP_CEILING,
-        "LANE_GAP_CEILING is a ratchet: {} lanes lack real-session evidence, ceiling is \
-         {LANE_GAP_CEILING}. It may fall, never rise.",
+    // Equality, not `<=`: the ceiling is at its floor (see `LANE_GAP_CEILING`),
+    // where "no more gaps than the ceiling" and "exactly the ceiling's gaps" are
+    // the same statement.
+    assert_eq!(
+        gaps.len(),
+        LANE_GAP_CEILING,
+        "LANE_GAP_CEILING is a ratchet at its floor: {} lanes lack real-session evidence, \
+         ceiling is {LANE_GAP_CEILING}. It may fall, never rise.",
         gaps.len()
     );
 

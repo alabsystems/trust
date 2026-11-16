@@ -42,7 +42,8 @@ pub fn api(x: u32) -> u32 {
 }
 
 pub async fn helper(x: u32) -> u32 {
-    //~^ WARN Trust Level 0 safety verification incomplete for `flip_with_async_present_advisory::helper::{closure#0}`
+    // RE-PINNED 2026-09-14: advisory reports the conditional rows in a NOTE, not the
+    // Level-0 incomplete WARN.
     x
 }
 //~? RAW Trust: ASSUMPTION [coroutine] `flip_with_async_present_advisory::helper::{closure#0}`

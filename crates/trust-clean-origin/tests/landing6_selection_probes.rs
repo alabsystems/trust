@@ -128,6 +128,9 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
     let local_ty = |ty: TemplateTy| match ty {
         TemplateTy::Result | TemplateTy::Param { .. } => result_ty.clone(),
         TemplateTy::Bool => Ty::Bool,
+        TemplateTy::RustCalleeResult { .. } => {
+            panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement")
+        }
         TemplateTy::ResultRef => Ty::Ref { mutable: false, inner: Box::new(result_ty.clone()) },
     };
     let operand = |operand: TemplateOperand| match operand {
@@ -142,6 +145,9 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
         // §6f landing 6. The extractor turns a `bool`-typed MIR constant into
         // `ConstValue::Bool` (`convert_const_operand`'s `TyKind::Bool` arm),
         // never into a one-byte `Uint`.
+        TemplateOperand::UIntScalar { value, width } => {
+            Operand::Constant(ConstValue::Uint(value, width))
+        }
         TemplateOperand::BoolScalar(value) => Operand::Constant(ConstValue::Bool(value)),
     };
     let binop = |cmp: SelectCmp| match cmp {
@@ -182,6 +188,7 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
                         TemplateRvalue::SharedRef(of) => {
                             Rvalue::Ref { mutable: false, place: Place::local(of) }
                         }
+                        TemplateRvalue::BoolNot(_) => panic!("W6: bool negation not exercised by this probe"),
                     },
                     span: SourceSpan::default(),
                 })
@@ -202,6 +209,7 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
                     Terminator::Call {
                         func: match callee {
                             TemplateCallee::Primitive(identity) => identity.canonical_path(),
+                            TemplateCallee::RustFn { .. } => panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement"),
                             TemplateCallee::SelfDef => "crate::m::probe".to_owned(),
                         },
                         args: args.iter().map(|arg| operand(*arg)).collect(),
@@ -216,6 +224,7 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
                             TemplateUnwind::Continue => UnwindEdge::Continue,
                         },
                         callee_identity: None,
+                        callee_key: None,
                     }
                 }
             },
@@ -236,6 +245,7 @@ fn render(template: &BodyTemplate, bits: u32) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -803,25 +813,42 @@ fn l6_p5_the_not_equal_spelling_still_refuses_and_the_blocker_moved() {
         );
     }
 
-    // LAYER 1: no negation in the emitted vocabulary. Asserted by an exhaustive
-    // match, so a future `TemplateRvalue` variant is a review event here.
+    // LAYER 1: the emitted vocabulary, pinned by an exhaustive match so a future
+    // `TemplateRvalue` variant is a review event here.
+    //
+    // W6 UPDATE (2026-09-13): a UNARY negation rvalue now EXISTS —
+    // `TemplateRvalue::BoolNot` — for the WHOLE-BODY `def f (b : Bool) : Bool :=
+    // not b` shape. So the old statement "no negation in the emitted
+    // vocabulary" is retired. But `!=` in a SELECT DECISION (`if a != b then …`)
+    // is still not emittable, and the blocker only moved: the select-beq
+    // realization is a diamond whose decision is a `Bool` COMPARISON, and there
+    // is no realization that COMPOSES a `Bool.not` around that decision. A
+    // standalone `BoolNot` returning `_0` is a different body from a `Bool.not`
+    // wrapping a diamond's scrutinee — LAYER 3 below still measures that the
+    // `==` producer cannot mint the negated select term.
     fn realization_vocabulary(rvalue: &TemplateRvalue) -> &'static str {
         match rvalue {
             TemplateRvalue::Use(_) => "use",
             TemplateRvalue::Compare { .. } => "compare",
-            // §6f landing 7 added a BINARY rvalue at the result carrier. It is
-            // still not a UNARY one, so `!=`'s `Bool.not` node is exactly as
-            // absent from this vocabulary as it was — which is what this arm
-            // records rather than what it changes.
             TemplateRvalue::RawBin { .. } => "raw-bin",
             TemplateRvalue::SharedRef(_) => "shared-ref",
+            // W6: a whole-body boolean negation. Present in the vocabulary now,
+            // but NOT a `Bool.not` composed into a select decision — see the
+            // block comment above.
+            TemplateRvalue::BoolNot(_) => "bool-not",
         }
     }
     assert_eq!(
         realization_vocabulary(&TemplateRvalue::Use(TemplateOperand::BoolScalar(true))),
         "use",
         "the emitted realization vocabulary is pinned BY TYPE: this match is exhaustive with \
-         no wildcard, so the unary rvalue `!=` needs is a compile error here first"
+         no wildcard, so a future `TemplateRvalue` variant is a review event here"
+    );
+    assert_eq!(
+        realization_vocabulary(&TemplateRvalue::BoolNot(TemplateOperand::Copy(1))),
+        "bool-not",
+        "W6 added a whole-body boolean negation; `!=` in a select decision is still not \
+         emittable, for the reason LAYER 3 measures"
     );
 
     // LAYER 2: side B has no `Ne` and no negation arm — `SelectCmp` is three
@@ -943,9 +970,34 @@ fn l6_p6_the_extra_comparison_survives_into_the_binary() {
     let ctfe_gate = ctfe
         .find("clean_origin_mir::clean_origin_mir(tcx, def)")
         .expect("the Clean-origin gate is called from the CTFE arm too");
+    // The gate's `if let Some(body) = … { … }` block, read to its closing brace at the
+    // function's indentation. It was a fixed 120-byte window until plan step 3.5
+    // (f1eb7b1cf2f) put a comment and the reach counter `hook_ran(tcx.sess, true)`
+    // between the gate and its `return`, which moved the `return` past the window
+    // while the body was still returned untouched. So the block is read whole, and
+    // every statement in it must be either that counter (it takes the session and a
+    // flag, never the body) or the `return` itself: anything else that could rewrite
+    // the gated body before it is returned turns this row red.
+    let gate_block_len = ctfe[ctfe_gate..]
+        .find("\n    }\n")
+        .expect("the gate's `if let` block closes inside the window");
+    let statements: Vec<&str> = ctfe[ctfe_gate..ctfe_gate + gate_block_len]
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .collect();
+    assert_eq!(
+        statements.last(),
+        Some(&"return body;"),
+        "the CTFE arm must return the gated body directly as well: {statements:?}"
+    );
     assert!(
-        ctfe[ctfe_gate..ctfe_gate + 120].contains("return body"),
-        "the CTFE arm must return the gated body directly as well"
+        statements[..statements.len() - 1]
+            .iter()
+            .all(|line| line.starts_with("clean_origin_ir::clean_origin_reach::hook_ran(tcx.sess,")),
+        "nothing but the reach counter may run between the CTFE gate and its return: \
+         {statements:?}"
     );
 
     eprintln!(
@@ -1029,6 +1081,7 @@ fn l6_p8_the_bool_constant_is_a_primitive_no_other_scalar_could_spell() {
             TemplateOperand::Move(_) => "move",
             TemplateOperand::ResultScalar { .. } => "scalar at the result carrier",
             TemplateOperand::U64Scalar(_) => "scalar at u64",
+            TemplateOperand::UIntScalar { .. } => "scalar at an explicit width",
             TemplateOperand::BoolScalar(_) => "scalar at bool",
         }
     }

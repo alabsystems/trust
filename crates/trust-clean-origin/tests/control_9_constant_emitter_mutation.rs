@@ -150,6 +150,7 @@ fn vf(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -228,6 +229,7 @@ fn emitted_add_const(name: &str) -> VerifiableFunction {
                     is_unsafe_sig: false,
                     unwind: UnwindEdge::Unreachable,
                     callee_identity: None,
+                    callee_key: None,
                 },
             },
             BasicBlock { id: BlockId(1), stmts: Vec::new(), terminator: Terminator::Return },

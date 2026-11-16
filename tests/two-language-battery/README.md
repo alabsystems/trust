@@ -10,11 +10,21 @@ Run it:
 
 ```bash
 STAGE2=$(cd build/host/stage2 && pwd -P)
+TRUST_BATTERY_OUT=$(mktemp -d "${TMPDIR:-/tmp}/trust-two-language-battery.XXXXXX")
 TRUST_PROBE_TRUSTC="$STAGE2/bin/trustc" \
-  python3 tests/two-language-battery/run.py         # full battery -> results.json
+  python3 tests/two-language-battery/run.py --canonical \
+  --output "$TRUST_BATTERY_OUT/results.json"
 python3 tests/two-language-battery/run.py --filter lane-c \
   --output /tmp/two-language-lane-c.json
 ```
+
+`--canonical` keeps the full reviewed population and all strict toolchain
+checks, while writing a new report outside the source checkout. This avoids
+changing tracked `results.json` and invalidating the compiler's source lineage
+merely by recording a run. Its output directory must already exist; existing
+files and racing publications are never overwritten. The historical default
+without `--output` still updates tracked `results.json`, but dirties the source
+tree after publication. Neither output mode is a G1–G8 acceptance verdict.
 
 ## Why this exists separately from `tests/ui/trust/`
 
@@ -49,19 +59,26 @@ accepting the positive files either.
 
 But a negative control that fails with a *parse error* or an *unresolved name*
 has also proved nothing, while still looking green. So the runner classifies
-every failure into exactly one of three kinds, and only one of them counts:
+every failure by its diagnostic evidence, and only a refutation counts:
 
 | kind | meaning | scores as |
 |---|---|---|
-| `refutation` | the proof was refused | `reject-correct` ✅ |
+| `refutation` | an explicit failed obligation or terminal kernel type mismatch | `reject-correct` ✅ |
 | `frontier` | an `unsupported`/`[unknown]` row — the tool could not MODEL it | never a successful rejection |
 | `malformed` | the compiler could not read the program | `reject-wrong-reason` ❌ |
+| `compiler-failure` | the compiler crashed or failed internally | never a successful rejection |
+| `unclassified` | no recognizable terminal verdict | never a successful rejection |
 
-`frontier` exists because of a trap this battery walked into: an UNKNOWN row
-means the tool declined to model the program, and scoring that as a successful
-rejection lets a **capability gap impersonate a proof**. Frontier beats
-refutation when a build reports both, since the build failed *because of* the
-unsupported row.
+`frontier` exists because an UNKNOWN row or timeout does not refute a program.
+Scoring either as a successful rejection lets a **capability gap impersonate a
+proof**. A reported failed obligation can count as a refutation even if other
+obligations are unresolved; that does not credit those other obligations.
+A generic kernel rejection wrapper is not a verdict: it can contain resource
+exhaustion, missing names or internal failures. Likewise, the word
+"counterexample" alone does not establish successful model validation or replay.
+Without an actual refutation, unknown verdicts,
+timeouts and missing proof authority remain incomplete. A generic "strict
+verification failed" message alone is `unclassified`, never `reject-correct`.
 
 Classification runs over diagnostic prose only — location lines (` --> `) and
 source echoes (`NN | `) are stripped first. That is not fastidiousness: every
@@ -91,17 +108,21 @@ cannot truncate `results.json`. A re-run against a compiler built before the
 fixes under test is the single easiest way to produce impressive, meaningless
 numbers.
 
-The canonical run also requires the reviewed 25-file path/directive manifest,
+The canonical run also requires the reviewed 27-file path/directive manifest,
 compiles read-only snapshots of those exact bytes, and records their digest.
 Trustc and Tippy must be executable siblings in this checkout's physical
 stage2 tree; both binaries are hashed, both version preflights must succeed,
 and checkout, submodule, binary, and fixture identities are rechecked before
 the scorecard is atomically replaced.
+The same requirements apply with `--canonical --output` outside the checkout;
+neither `--filter` nor `--allow-unsealed-toolchain` is permitted in that mode.
+The report records whether it measured the canonical reviewed battery or an
+exploratory selection; the output filename alone does not establish its scope.
 
-## Lanes expected to fail today, by design
+## Target lanes and current implementation boundaries
 
-Two lanes are written against the **target**, not against current behaviour.
-They are specifications, and their failure is the measurement:
+These lanes exercise target behavior. Their current status needs a fresh run
+with the pinned compiler; the archived results below are historical:
 
 - **Lane D** expects tippy's diagnostic to contain the Lean the user should
   write instead. Today `legacy_spec_sugar.rs` suggests *Rust clauses only* and
@@ -110,15 +131,16 @@ They are specifications, and their failure is the measurement:
   which amends §3.2 of the ratified design and is **pending ratification** —
   so this lane is a stated target, not an agreed requirement.
 
-- **Lane E** expects both languages to appear in one `trust_ir::Module`. From
-  source: Rust *does* reach TrustIr directly — `trust_thir_lower` lowers
-  source (THIR) straight to trust-ir under a differential gate against MIR
-  (`compiler/rustc_mir_build/src/builder/mod.rs:92`) — but the `clean { … }`
-  island does not. The module has the slot (`proof_certificates`,
-  `ProofEvidence::LeanProof`); no production path fills it from an island. The
-  expected verdict is therefore `ir-rust-only`, which is the precise statement
-  of what remains to build before "both languages feed the same TrustIr
-  module" is true.
+- **Lane E** expects both languages in one `trust_ir::Module`. Clean-origin
+  bodies now enter that module, and `e2_rust_calls_clean_in_ir.rs` exercises
+  local Rust-to-Clean linkage. Identity and type guards and a narrow UInt
+  arithmetic carrier gate have also landed. Recording or linking a body does
+  not establish general carrier faithfulness, Lean-to-Rust calls, cross-crate
+  Trust-IR transport, or executable codegen. The next integration target is a
+  real `.lean` package plus Rust crate with calls in both directions and full
+  proof evidence, as specified in the project's two-language execution roadmap.
+
+**Latest canonical result (kept out of the tracked `results.json`, as above):** `reports/2026-09-27-new-pack-5ab8dcccfcb-measured/results.json` — stage2 at `5ab8dcccfcb`, 2026-09-27, 23/27 as specified, 0 false accepts, 3 blocking (`a5` and `a8` reject-by-frontier, `b2` reject-wrong-reason); its d1 `tippy-emits-lean` was a classifier false green, since fixed in `run.py`, so lane D is really 0/2.
 
 ## Archived measured result (generated 2026-07-26, toolchain `c6be27eb88`)
 
@@ -153,10 +175,19 @@ refutation of a program believed correct and is worth a look on its own.
 **Two findings the battery produced that are worth more than its score:**
 
 1. *At that snapshot, a false loop invariant was neither proved nor refuted*
-   (`a8`). It landed as `UserLoopContractUnsupported`. This is resolved in the
-   current fixture: both transition bodies are modeled and the bad initiation
-   and bad consecution are genuinely refuted, so `a8` is again an ordinary
-   negative control. The next sealed run will update the scorecard.
+   (`a8`). It landed as `UserLoopContractUnsupported`. **The claim that
+   followed here was false, and it is corrected rather than deleted.** It said
+   the bad initiation and bad consecution are "genuinely refuted", so `a8` is
+   "again an ordinary negative control". Measured on the canonical stage2 run
+   at `5ab8dcccfcb` (2026-09-27), `a8` is `reject-by-frontier` and blocking.
+   trust_mc's CHC/PDR runner refutes all three bad invariant obligations, and
+   each refutation is demoted before it can count: "refutation demoted to
+   unknown: the submitted ChcVc has no positive producer fidelity attestation
+   … (no loop transition relation is emitted)". The row was already
+   unresolved at `6ff31de9b6`
+   (`docs/plans/2026-09-07-two-language-execution-log.md`). The fixture keeps
+   `battery-expect: reject`, so the row stays blocking (fail-closed) until a
+   real refutation lands.
 2. *A fragment gap does not stay contained* (`a12`). When the invariant is
    unmodelled, the obligations depending on it are reported **FAILED**, not
    unknown: binary search's `xs[mid]` is refuted even though `mid < hi <=
@@ -168,8 +199,27 @@ refutation of a program believed correct and is worth a look on its own.
 `results.json` carries, per program: the exact command, exit code, captured
 diagnostics, the verdict, and for rejections the failure classification. The
 summary counts `false_accepts` (soundness breaks) and `reject_wrong_reason`
-(battery integrity breaks) separately — the runner exits non-zero only for
-those two, because a documented unimplemented lane is a measurement rather
-than a runner error.
+(battery integrity breaks) separately. The runner exits non-zero for any
+unexpected semantic row, identity/inventory failure, or publication failure.
+Only the explicitly enumerated current D/E target verdicts are non-blocking
+measurements; that does not make their missing product capabilities complete.
 
-Quote no number from this battery without its toolchain stamp.
+Quote no number from this battery without its toolchain stamp. Classification
+is diagnostic evidence, not independently replayed proof or a G1–G8 verdict.
+
+The 2026-09-07 runner regression suite has 29 tests, including aggregate
+refusals, native UNKNOWN rows, timeouts, absent certificate authority, genuine
+counterexamples, echoed verdict words and compiler crashes after a reported
+refutation, generic kernel wrappers, exhausted kernel budgets and failed
+counterexample replay. A crash, signal or launcher failure cannot satisfy a negative
+control. Warning text and wrong-typed Lean options cannot impersonate a proof
+verdict. Reclassifying the retained diagnostics of all 25 archived rows changes
+no classification compared with the pre-fix classifier. Two truncated rows
+(`a7`/`a12`) still cannot reproduce their recorded historical refutation from
+the retained text; neither classifier repairs those missing bytes. This checks
+reporting stability, not the current compiler.
+The external-canonical controls additionally exercise the exact full fixture
+inventory at both ends, immutable-source output placement, existing/dangling
+output refusal, atomic no-clobber publication, stale/foreign tools, a missing
+fixture and postflight compiler drift. These use mocked compiler results to
+test runner orchestration; they are not a live conformance measurement.

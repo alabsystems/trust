@@ -13,13 +13,14 @@ use std::assert_matches;
 
 use rustc_infer::infer::InferCtxt;
 use rustc_macros::extension;
-use rustc_middle::traits::solve::{Certainty, Goal, GoalSource, NoSolution, QueryResult};
-use rustc_middle::ty::{TyCtxt, VisitorResult, try_visit};
-use rustc_middle::{bug, ty};
+use rustc_middle::traits::solve::{
+    BuiltinImplSource, CandidateSource, Certainty, Goal, GoalSource, NoSolution, QueryResult,
+};
+use rustc_middle::ty;
+use rustc_middle::ty::{RequiredDepth, TyCtxt, TypeVisitableExt, VisitorResult, try_visit};
 use rustc_next_trait_solver::canonical::instantiate_canonical_state;
-use rustc_next_trait_solver::resolve::eager_resolve_vars;
 use rustc_next_trait_solver::solve::{MaybeCause, MaybeInfo, SolverDelegateEvalExt as _, inspect};
-use rustc_span::Span;
+use rustc_span::{Span, bug};
 use tracing::instrument;
 
 use crate::solve::delegate::SolverDelegate;
@@ -30,8 +31,12 @@ pub struct InspectConfig {
 
 pub struct InspectGoal<'a, 'tcx> {
     infcx: &'a SolverDelegate<'tcx>,
+    // Record how deep we are in nested goals from the root goal.
     depth: usize,
+    // Required depth to complete the evaluation of this goal.
+    required_depth: RequiredDepth,
     orig_values: Vec<ty::GenericArg<'tcx>>,
+    prev_universe: ty::UniverseIndex,
     goal: Goal<'tcx, ty::Predicate<'tcx>>,
     result: Result<Certainty, NoSolution>,
     final_revision: &'tcx inspect::Probe<TyCtxt<'tcx>>,
@@ -94,7 +99,6 @@ impl<'a, 'tcx> InspectCandidate<'a, 'tcx> {
     )]
     pub fn instantiate_nested_goals(&self, span: Span) -> Vec<InspectGoal<'a, 'tcx>> {
         let infcx = self.goal.infcx;
-        let param_env = self.goal.goal.param_env;
         let mut orig_values = self.goal.orig_values.clone();
 
         let mut instantiated_goals = vec![];
@@ -102,7 +106,13 @@ impl<'a, 'tcx> InspectCandidate<'a, 'tcx> {
             match **step {
                 inspect::ProbeStep::AddGoal(source, goal) => instantiated_goals.push((
                     source,
-                    instantiate_canonical_state(infcx, span, param_env, &mut orig_values, goal),
+                    instantiate_canonical_state(
+                        infcx,
+                        span,
+                        self.goal.prev_universe,
+                        &mut orig_values,
+                        goal,
+                    ),
                 )),
                 inspect::ProbeStep::RecordImplArgs { .. } => {}
                 inspect::ProbeStep::MakeCanonicalResponse { .. }
@@ -110,8 +120,13 @@ impl<'a, 'tcx> InspectCandidate<'a, 'tcx> {
             }
         }
 
-        let () =
-            instantiate_canonical_state(infcx, span, param_env, &mut orig_values, self.final_state);
+        let () = instantiate_canonical_state(
+            infcx,
+            span,
+            self.goal.prev_universe,
+            &mut orig_values,
+            self.final_state,
+        );
 
         instantiated_goals
             .into_iter()
@@ -127,9 +142,8 @@ impl<'a, 'tcx> InspectCandidate<'a, 'tcx> {
         skip_all,
         fields(goal = ?self.goal.goal, steps = ?self.steps)
     )]
-    pub fn instantiate_impl_args(&self, span: Span) -> ty::GenericArgsRef<'tcx> {
+    pub fn instantiate_impl_args(&self, span: Span) -> ty::GenericArgs<'tcx> {
         let infcx = self.goal.infcx;
-        let param_env = self.goal.goal.param_env;
         let mut orig_values = self.goal.orig_values.clone();
 
         for step in &self.steps {
@@ -138,7 +152,7 @@ impl<'a, 'tcx> InspectCandidate<'a, 'tcx> {
                     let impl_args = instantiate_canonical_state(
                         infcx,
                         span,
-                        param_env,
+                        self.goal.prev_universe,
                         &mut orig_values,
                         impl_args,
                     );
@@ -146,12 +160,12 @@ impl<'a, 'tcx> InspectCandidate<'a, 'tcx> {
                     let () = instantiate_canonical_state(
                         infcx,
                         span,
-                        param_env,
+                        self.goal.prev_universe,
                         &mut orig_values,
                         self.final_state,
                     );
 
-                    return eager_resolve_vars(&**infcx, impl_args);
+                    return infcx.deeply_resolve_via_unification_table(impl_args);
                 }
                 inspect::ProbeStep::AddGoal(..) => {}
                 inspect::ProbeStep::MakeCanonicalResponse { .. }
@@ -213,6 +227,10 @@ impl<'a, 'tcx> InspectGoal<'a, 'tcx> {
 
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    pub fn required_depth(&self) -> RequiredDepth {
+        self.required_depth
     }
 
     pub fn orig_values(&self) -> &[ty::GenericArg<'tcx>] {
@@ -302,6 +320,111 @@ impl<'a, 'tcx> InspectGoal<'a, 'tcx> {
         candidates
     }
 
+    // Trust: the reveal guard must not interpret the diagnostic candidate view's
+    // omissions as an empty, safe set of nested obligations.
+    /// Return candidates only if this tree contains no probes the candidate view omits.
+    /// Unlike [`Self::candidates`], this declines compatibility/shadowing probes, candidates
+    /// that failed before making a canonical response (except the independently inert empty
+    /// builtin Clone noncandidate for concrete ADT Self), and assembly/root probes with goals
+    /// that cannot be attributed to their own response. The scan itself is bounded.
+    ///
+    /// This is an observation boundary, not a proof that a codegen-mode solve is safe.
+    /// Callers must still check every goal/candidate and reject proposed opaque types.
+    pub fn candidates_with_complete_probes(
+        &'a self,
+        max_steps: usize,
+    ) -> Option<Vec<InspectCandidate<'a, 'tcx>>> {
+        // The builtin Clone assembly returns NoSolution immediately for ADT Self,
+        // before constituent goals or a canonical response. Account for that exact
+        // empty noncandidate; it cannot select an impl or contribute a truth fact.
+        // Every effectful, user, compatibility, shadowing and opaque probe retains
+        // the strict scan below. This is observation, never codegen/proof authority.
+        let inert_clone_adt_builtin =
+            self.goal.predicate.kind().no_bound_vars().is_some_and(|kind| {
+                let ty::PredicateKind::Clause(ty::ClauseKind::Trait(pred)) = kind else {
+                    return false;
+                };
+                pred.polarity == ty::ClausePolarity::Positive
+                    && Some(pred.def_id()) == self.infcx.tcx.lang_items().clone_trait()
+                    && pred.trait_ref.args.len() == 1
+                    && matches!(pred.self_ty().kind(), ty::Adt(..))
+                    && !pred.trait_ref.args.has_aliases()
+                    && !pred.trait_ref.args.has_non_region_param()
+                    && !pred.trait_ref.args.has_non_region_infer()
+                    && !pred.trait_ref.args.has_escaping_bound_vars()
+            });
+        fn complete<'tcx>(
+            probe: &inspect::Probe<TyCtxt<'tcx>>,
+            remaining: &mut usize,
+            inert_clone_adt_builtin: bool,
+            root: bool,
+        ) -> bool {
+            let Some(next) = remaining.checked_sub(1) else { return false };
+            *remaining = next;
+            let mut response = false;
+            let mut own_goals = false;
+            for step in &probe.steps {
+                let Some(next) = remaining.checked_sub(1) else { return false };
+                *remaining = next;
+                match step {
+                    inspect::ProbeStep::MakeCanonicalResponse { .. } => response = true,
+                    inspect::ProbeStep::AddGoal(..) | inspect::ProbeStep::RecordImplArgs { .. } => {
+                        own_goals = true
+                    }
+                    inspect::ProbeStep::NestedProbe(nested) => {
+                        // Only this root's direct builtin alternative is accounted
+                        // here; never bypass a probe nested inside another candidate.
+                        let direct_root_builtin = root
+                            && matches!(probe.kind, inspect::ProbeKind::Root { .. })
+                            && inert_clone_adt_builtin;
+                        if !complete(nested, remaining, direct_root_builtin, false) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            if inert_clone_adt_builtin
+                && probe.steps.is_empty()
+                && matches!(
+                    probe.kind,
+                    inspect::ProbeKind::TraitCandidate {
+                        source: CandidateSource::BuiltinImpl(BuiltinImplSource::Misc),
+                        result: Err(_),
+                    }
+                )
+            {
+                return true;
+            }
+            match probe.kind {
+                inspect::ProbeKind::ProjectionCompatibility
+                | inspect::ProbeKind::ShadowedEnvProbing => false,
+                inspect::ProbeKind::TraitCandidate { .. }
+                | inspect::ProbeKind::OpaqueTypeStorageLookup { .. }
+                | inspect::ProbeKind::RigidAlias { .. } => response,
+                inspect::ProbeKind::Root { .. } => response || !own_goals,
+                inspect::ProbeKind::NormalizedSelfTyAssembly
+                | inspect::ProbeKind::UnsizeAssembly => !own_goals,
+            }
+        }
+        let mut remaining = max_steps;
+        if !complete(self.final_revision, &mut remaining, inert_clone_adt_builtin, true) {
+            return None;
+        }
+        let candidates = self.candidates();
+        // Trust: a losing probe may propose a hidden type inside its snapshot. The
+        // caller's final InferCtxt drain cannot see a proposal rolled back with it.
+        // Pending normalization goals are not an already discharged candidate either.
+        if candidates.iter().any(|candidate| {
+            candidate.result.is_ok_and(|r| {
+                !r.value.external_constraints.opaque_types.is_empty()
+                    || !r.value.external_constraints.normalization_nested_goals.is_empty()
+            })
+        }) {
+            return None;
+        }
+        Some(candidates)
+    }
+
     /// Returns the single candidate applicable for the current goal, if it exists.
     ///
     /// Returns `None` if there are either no or multiple applicable candidates.
@@ -320,9 +443,15 @@ impl<'a, 'tcx> InspectGoal<'a, 'tcx> {
         source: GoalSource,
     ) -> Self {
         let infcx = <&SolverDelegate<'tcx>>::from(infcx);
+        let prev_universe = infcx.universe();
 
-        let inspect::GoalEvaluation { uncanonicalized_goal, orig_values, final_revision, result } =
-            root;
+        let inspect::GoalEvaluation {
+            uncanonicalized_goal,
+            orig_values,
+            final_revision,
+            result,
+            required_depth,
+        } = root;
         // If there's a normalizes-to goal, AND the evaluation result with the result of
         // constraining the normalizes-to RHS and computing the nested goals.
         let result = result.map(|ok| ok.value.certainty);
@@ -331,10 +460,12 @@ impl<'a, 'tcx> InspectGoal<'a, 'tcx> {
             infcx,
             depth,
             orig_values,
-            goal: eager_resolve_vars(&**infcx, uncanonicalized_goal),
+            prev_universe,
+            goal: infcx.deeply_resolve_via_unification_table(uncanonicalized_goal),
             result,
             final_revision,
             source,
+            required_depth,
         }
     }
 

@@ -69,6 +69,8 @@ case "$tool:$*" in
     trustc:*|rustc:*) echo 'rustc fixture (trustc)' ;;
     targo:*|cargo:*) echo 'targo 1.99.0-fixture' ;;
     trustdoc:*) echo 'rustdoc fixture (trustdoc)' ;;
+    targo-fmt:*) echo 'trustfmt 1.9.0-fixture' ;;
+    targo-tippy:*|tippy-driver:*) echo 'tippy 0.1.0-fixture' ;;
     *) echo "$tool fixture" ;;
 esac
 SH
@@ -236,9 +238,99 @@ if run_link "$fixture" --name trust-unbranded --sysroot "$external_sysroot" \
     >"$fixture/stdout" 2>"$fixture/stderr"; then
     fail "an unbranded rustc was linked as a Trust toolchain"
 fi
-grep -q "trustc --version must carry the Trust brand" "$fixture/stderr" \
+grep -q "trustc --version does not carry the Trust brand" "$fixture/stderr" \
     || fail "unbranded rejection was not explicit"
 [ ! -e "$fixture/rustup-call.log" ] || fail "rustup ran after an unbranded rejection"
+
+# Every Trust tool with a stock ancestor is held to its own name, not just the
+# compiler: a stock rustfmt, clippy or rust-analyzer installed under the Trust
+# name (a stale tools-directory artifact restored by bootstrap, a hand copy)
+# runs and answers --version, so only the banner tells them apart. Each case
+# swaps ONE tool for a stand-in that prints the stock program's real banner
+# (measured from rustup's stable 1.98.0, 2026-09-30).
+for case in \
+    'trustfmt:rustfmt 1.9.0-stable (88d9e12ae1 2026-08-18)' \
+    'targo-fmt:rustfmt 1.9.0-stable (88d9e12ae1 2026-08-18)' \
+    'tippy:clippy 0.1.98 (88d9e12ae1 2026-08-18)' \
+    'targo-tippy:clippy 0.1.98 (88d9e12ae1 2026-08-18)' \
+    'tippy-driver:clippy 0.1.98 (88d9e12ae1 2026-08-18)' \
+    'trust-analyzer:rust-analyzer 1.98.0 (88d9e12a 2026-08-18)' \
+    'targo:cargo 1.98.0 (797e8a9bc 2026-08-05)' \
+    'trustdoc:rustdoc 1.98.0 (88d9e12ae 2026-08-18)'
+do
+    tool="${case%%:*}"
+    banner="${case#*:}"
+    fixture="$(new_external_stage2_fixture "external-stock-$tool")"
+    external_sysroot="$fixture/external/trust"
+    rm "$external_sysroot/bin/$tool"
+    printf '#!/bin/sh\necho %s\n' "'$banner'" >"$external_sysroot/bin/$tool"
+    chmod +x "$external_sysroot/bin/$tool"
+    # `cargo` is held byte-identical to `targo`; keep that pairing intact so
+    # the identity check is what refuses. (This fixture carries no `rustdoc`.)
+    if [ "$tool" = targo ]; then
+        rm "$external_sysroot/bin/cargo"
+        cp "$external_sysroot/bin/targo" "$external_sysroot/bin/cargo"
+    fi
+    if run_link "$fixture" --name "trust-stock-$tool" --sysroot "$external_sysroot" \
+        >"$fixture/stdout" 2>"$fixture/stderr"; then
+        fail "a stock program under the Trust name $tool was linked as a Trust toolchain"
+    fi
+    grep -qF "/bin/$tool: a stock program under a Trust name" "$fixture/stderr" \
+        || { sed 's/^/    /' "$fixture/stderr" >&2; fail "stock $tool was refused for the wrong reason"; }
+    [ ! -e "$fixture/rustup-call.log" ] || fail "rustup ran after stock $tool was refused"
+done
+
+# Identity is read from standard output alone. A genuine targo prints Cargo's
+# configuration warnings on stderr BEFORE its banner (an unused key in a
+# .cargo/config.toml in the working directory or a parent; a CARGO_HOME holding
+# both `config` and `config.toml`); read merged, that warning was the first line
+# and the real Targo was refused as a stock program.
+fixture="$(new_external_stage2_fixture external-targo-stderr-warning)"
+external_sysroot="$fixture/external/trust"
+sed -e "s|^    targo:\*\|cargo:\*) echo 'targo 1.99.0-fixture' ;;|    targo:*\|cargo:*) echo 'warning: unused config key \`unstable.foo\` in \`/fixture/.cargo/config.toml\`' >\&2; echo 'targo 1.99.0-fixture' ;;|" \
+    "$external_sysroot/bin/tool-dispatch" >"$fixture/tool-dispatch.warning"
+grep -q 'warning: unused config key' "$fixture/tool-dispatch.warning" \
+    || fail "stderr-warning fixture was not constructed"
+cat "$fixture/tool-dispatch.warning" >"$external_sysroot/bin/tool-dispatch"
+if ! run_link "$fixture" --name trust-targo-warning --sysroot "$external_sysroot" \
+    >"$fixture/stdout" 2>"$fixture/stderr"; then
+    sed 's/^/    /' "$fixture/stderr" >&2
+    fail "a targo that warns on stderr before its banner was refused"
+fi
+grep -q '^toolchain link trust-targo-warning .*/external/trust$' "$fixture/rustup-call.log" \
+    || fail "a targo that warns on stderr before its banner was not linked"
+
+# ...and stderr cannot vouch for a stock stdout banner.
+fixture="$(new_external_stage2_fixture external-stderr-vouch)"
+external_sysroot="$fixture/external/trust"
+rm "$external_sysroot/bin/trustfmt"
+cat >"$external_sysroot/bin/trustfmt" <<'SH'
+#!/bin/sh
+echo 'trustfmt 1.9.0-fixture' >&2
+echo 'rustfmt 1.9.0-stable (88d9e12ae1 2026-08-18)'
+SH
+chmod +x "$external_sysroot/bin/trustfmt"
+if run_link "$fixture" --name trust-stderr-vouch --sysroot "$external_sysroot" \
+    >"$fixture/stdout" 2>"$fixture/stderr"; then
+    fail "a Trust banner on stderr vouched for a stock stdout banner"
+fi
+grep -qF 'trustfmt --version does not identify the Trust build' "$fixture/stderr" \
+    || { sed 's/^/    /' "$fixture/stderr" >&2; fail "stderr-vouched trustfmt was refused for the wrong reason"; }
+[ ! -e "$fixture/rustup-call.log" ] || fail "rustup ran after a stderr-vouched trustfmt"
+
+# The same holds at stage1, which used to check no banner at all.
+fixture="$(new_stage1_fixture stage1-stock-trustc)"
+cat >"$fixture/build/host/stage1/bin/trustc" <<'SH'
+#!/bin/sh
+echo 'rustc 1.98.0 (88d9e12ae 2026-08-18)'
+SH
+chmod +x "$fixture/build/host/stage1/bin/trustc"
+if run_link "$fixture" --repair-aliases stage1 >"$fixture/stdout" 2>"$fixture/stderr"; then
+    fail "a stock rustc under the name trustc was linked as trust-stage1"
+fi
+grep -q "trustc --version does not carry the Trust brand" "$fixture/stderr" \
+    || fail "stage1 stock trustc was refused for the wrong reason"
+[ ! -e "$fixture/rustup-call.log" ] || fail "rustup ran after a stage1 stock trustc"
 
 # Closing guidance follows the SYSROOT, not the internal stage forcing.
 # --sysroot sets STAGE=stage2 as a VALIDATION LEVEL (the full same-surface

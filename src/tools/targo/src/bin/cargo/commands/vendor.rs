@@ -1,6 +1,6 @@
 use crate::command_prelude::*;
-use cargo::ops;
 use std::path::PathBuf;
+use targo::ops;
 
 pub fn cli() -> Command {
     subcommand("vendor")
@@ -32,6 +32,46 @@ pub fn cli() -> Command {
             "versioned-dirs",
             "Always include version in subdir name",
         ))
+        .arg(
+            flag(
+                "cohort-plan",
+                "Print the Git-bound source cohort for explicit packages",
+            )
+            .long_help("Print the Git-bound source cohort for explicit packages, including owning-workspace optional, target and dev path dependencies. Requires committed manifests and lockfiles with --locked. Configured paths overrides and configuration-origin patches are unsupported.")
+            .requires("package")
+            .conflicts_with_all([
+                "cohort-check",
+                "path",
+                "no-delete",
+                "tomls",
+                "versioned-dirs",
+                "respect-source-config",
+            ]),
+        )
+        .arg(
+            Arg::new("cohort-check")
+                .long("cohort-check")
+                .value_name("RECORD")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Check a source cohort record against the actual resolved source")
+                .long_help("Check a source cohort record against the actual resolved source. Requires committed manifests and lockfiles with --locked. Configured paths overrides and configuration-origin patches are unsupported.")
+                .conflicts_with_all([
+                    "path",
+                    "no-delete",
+                    "tomls",
+                    "versioned-dirs",
+                    "respect-source-config",
+                ]),
+        )
+        .arg(
+            Arg::new("package")
+                .short('p')
+                .long("package")
+                .value_name("SPEC")
+                .action(ArgAction::Append)
+                .requires("cohort-plan")
+                .help("Explicit root package for source cohort planning"),
+        )
         .arg(unsupported("no-merge-sources"))
         .arg(unsupported("relative-path"))
         .arg(unsupported("only-git-deps"))
@@ -55,6 +95,23 @@ fn unsupported(name: &'static str) -> Arg {
 }
 
 pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
+    if args.flag("cohort-plan") {
+        let ws = args.workspace(gctx)?;
+        let packages = args
+            .get_many::<String>("package")
+            .expect("required cohort packages")
+            .cloned()
+            .collect::<Vec<_>>();
+        let record = ops::vendor_cohort_plan(&ws, &packages)?;
+        targo::drop_println!(gctx, "{}", record);
+        return Ok(());
+    }
+    if let Some(input) = args.get_one::<PathBuf>("cohort-check") {
+        let ws = args.workspace(gctx)?;
+        let status = ops::vendor_cohort_check(&ws, &gctx.cwd().join(input))?;
+        targo::drop_println!(gctx, "{}", status);
+        return Ok(());
+    }
     // We're doing the vendoring operation ourselves, so we don't actually want
     // to respect any of the `source` configuration in Cargo itself. That's
     // intended for other consumers of Cargo, but we want to go straight to the

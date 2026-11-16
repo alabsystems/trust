@@ -143,20 +143,17 @@ pub(crate) fn apply_damping(
 
 /// Check if oscillation amplitude is increasing over time.
 fn is_divergent(history: &[f64], config: &OscillationConfig) -> bool {
-    if history.len() < 4 {
+    let n = history.len();
+    if n < 4 {
         return false;
     }
 
-    // Compute successive absolute differences and check if they are increasing.
-    let diffs: Vec<f64> = history.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
-    if diffs.len() < 3 {
-        return false;
-    }
-
-    // Check the last 3 diffs for a monotonically increasing trend.
-    let n = diffs.len();
-    let tail = &diffs[n.saturating_sub(3)..n];
-    tail.windows(2).all(|w| w[1] > w[0] + config.tolerance)
+    // Check the last 3 successive absolute differences for a monotonically increasing trend.
+    let tail = &history[n - 4..];
+    let d0 = (tail[1] - tail[0]).abs();
+    let d1 = (tail[2] - tail[1]).abs();
+    let d2 = (tail[3] - tail[2]).abs();
+    d1 > d0 + config.tolerance && d2 > d1 + config.tolerance
 }
 
 /// Check for binary (period-2) oscillation in the tail of history.

@@ -118,7 +118,7 @@ find_standalone_targo() {
             printf '%s\n' "$candidate"
             return 0
         fi
-    done < <(find "$TRUST_ROOT/build" -path "*/stage2/bin/targo" -type f -perm -111 -print 2>/dev/null | sort -r)
+    done < <(find -H "$TRUST_ROOT/build" -path "*/stage2/bin/targo" -type f -perm -111 -print 2>/dev/null | sort -r)
 
     return 1
 }

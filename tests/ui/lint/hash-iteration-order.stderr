@@ -1,0 +1,115 @@
+error: iterating a `HashMap` with `into_iter` follows its hash order, which its hasher `RandomState` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:23:14
+   |
+LL |     for _ in &map {}
+   |              ^^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+note: the lint level is defined here
+  --> $DIR/hash-iteration-order.rs:15:9
+   |
+LL | #![deny(hash_iteration_order)]
+   |         ^^^^^^^^^^^^^^^^^^^^
+
+error: iterating a `HashMap` with `iter` follows its hash order, which its hasher `RandomState` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:25:17
+   |
+LL |     let _ = map.iter();
+   |                 ^^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: iterating a `HashMap` with `keys` follows its hash order, which its hasher `RandomState` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:27:17
+   |
+LL |     let _ = map.keys();
+   |                 ^^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: iterating a `HashMap` with `values` follows its hash order, which its hasher `RandomState` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:29:17
+   |
+LL |     let _ = map.values();
+   |                 ^^^^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: iterating a `HashMap` with `values_mut` follows its hash order, which its hasher `RandomState` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:31:22
+   |
+LL |     for value in map.values_mut() {
+   |                      ^^^^^^^^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: iterating a `HashMap` with `retain` follows its hash order, which its hasher `RandomState` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:35:9
+   |
+LL |     map.retain(|_, value| *value > 1);
+   |         ^^^^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: iterating a `HashSet` with `union` follows its hash order, which its hasher `RandomState` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:37:17
+   |
+LL |     let _ = set.union(&other);
+   |                 ^^^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: iterating a `HashSet` with `into_iter` follows its hash order, which its hasher `RandomState` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:41:21
+   |
+LL |     ordered_by_hash.extend(&set);
+   |                     ^^^^^^^^^^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: iterating a `HashMap` with `drain` follows its hash order, which its hasher `RandomState` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:43:18
+   |
+LL |     for _ in map.drain() {}
+   |                  ^^^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: iterating a `HashSet` with `into_iter` follows its hash order, which its hasher `RandomState` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:45:14
+   |
+LL |     for _ in set {}
+   |              ^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: iterating a `HashMap` with `into_iter` follows its hash order, which its hasher `Seeded` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:62:14
+   |
+LL |     for _ in map {}
+   |              ^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: iterating a `HashSet` with `iter` follows its hash order, which its hasher `S` can change from one run to the next
+  --> $DIR/hash-iteration-order.rs:68:18
+   |
+LL |     for _ in set.iter() {}
+   |                  ^^^^
+   |
+   = note: only a hasher builder with no state, a zero-sized one such as `BuildHasherDefault<_>`, builds the same hasher in every process
+   = help: iterate a `BTreeMap` or `BTreeSet`, or sort before the order reaches output; where it cannot reach output, scope `#[allow(hash_iteration_order)]` to the site and say why
+
+error: aborting due to 12 previous errors
+

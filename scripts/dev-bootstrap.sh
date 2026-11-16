@@ -22,7 +22,7 @@ usage() {
         'usage: scripts/dev-bootstrap.sh [--check]' \
         '' \
         '  no args   require the admitted seed and build/audit a fresh Stage2' \
-        '  --check   read-only prerequisite and seed-state report'
+        '  --check   read-only prerequisite and seed-state report for that build'
 }
 
 case "$#:${1:-}" in
@@ -30,7 +30,11 @@ case "$#:${1:-}" in
         exec python3 "$RECREATOR" --require-seed --fresh-seed --stage 2
         ;;
     1:--check)
-        exec python3 "$RECREATOR" --check --require-seed --stage 2
+        # The build's own flags with --check: it selects the stage0 the build
+        # uses (the pinned archives, never an installed atpkg pack). Until
+        # 2026-10-14 it ran without --fresh-seed, which --check then refused,
+        # and so answered for an atpkg pack this build never uses.
+        exec python3 "$RECREATOR" --check --require-seed --fresh-seed --stage 2
         ;;
     1:-h|1:--help)
         usage

@@ -21,14 +21,28 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+trust-proof-session = { path = "../trust-proof-session" }
 trust-types = { workspace = true }
+trust-odt = { workspace = true }
+trust-vcgen = { workspace = true }
+trust-source-contract = { workspace = true }
+trust-verifier-api = { workspace = true }
+trust-file-lock = { workspace = true }
 trust-ir = { workspace = true, features = ["serde"] }
 trust-ir-build = { workspace = true }
 clean-kernel = { workspace = true }
+# The VF5 production base is imported as untrusted data, then rebuilt from
+# EMPTY through the reference entry. Importing alone issues no certificate.
+clean-olean = { path = "../../first-party/clean/crates/clean-olean" }
 clean-auto = { workspace = true }
 clean-verify = { workspace = true }
 clean-parser = { workspace = true }
 clean-elab = { workspace = true }
+# Trust's canonical temporal vocabulary, served to islands that import it.
+trust-temporal-prelude = { workspace = true }
+# ty's explicit-state engine: the untrusted search behind a declared model's
+# check (`model_trace`), whose rows the kernel then checks.
+tla-mc-core = { workspace = true }
 # Trust: E9 citation unification — clause elaboration + the honesty meter.
 trust-cert-meter = { workspace = true }
 trust-spec-elab = { workspace = true }
@@ -41,4 +55,64 @@ trust-spec-elab = { workspace = true }
 trust-symbols = { path = "../trust-symbols" }
 bincode = { workspace = true }
 sha2 = { workspace = true }
-serde_json = { workspace = true }
+# The v1 source-input digest serializes typed inputs including opaque predicate
+# Value objects. Preserve their original key order when decoding certificates;
+# the full compiler already enabled this, while isolated replay did not.
+serde_json = { workspace = true, features = ["preserve_order"] }
+serde = { workspace = true }
+# Real (QF_LRA) lane: exact-rational Farkas replay over the kernel's quotient
+# `Rat`. Literals are arbitrary precision (ny-cert rationals run to hundreds of
+# bits), so the normalizer and Fourier–Motzkin run over `BigRational`.
+num-bigint = { workspace = true }
+num-rational = { workspace = true }
+# The violation dump (`trust_certify::violation` at debug, under RUSTC_LOG):
+# a diagnostic, never an environment switch.
+tracing = { workspace = true }
+
+[features]
+# VF5 test door (`calculus_row::test_support`): a stand-in VF5 family and a pin of
+# its digest, for the compiler's calculus-mint unit tests. Only a dev-dependency
+# turns it on (rustc_mir_transform's), so it reaches test builds only (resolver
+# 2), never the compiler that links this crate.
+calculus-row-test-support = []
+# Explicit real-example subprocess qualification. The selected test refuses
+# without the Cargo-emitted prepare_vf5_inputs executable; no runtime test door.
+vf5-resource-command-tests = []
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Compressed retained compiler certificates are test inputs only.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Read the actual retained compiler artifact; these features do not widen the
+# production certificate reader or confer any source authority.
+trust-ir = { workspace = true, features = ["parser", "binary"] }
+# The row-observation example retains the decoder's real wire provenance and
+# uses the maintained SSA/producer validator. No production feature changes.
+trust-ir-build = { workspace = true, features = ["binary"] }
+# The E6 differential harness deserializes its MIR dumps STRAIGHT into typed
+# structs: through `serde_json::Value` a `switchInt` label above `u64::MAX`
+# (an `i128`/`u128` `match`) becomes an `f64` and no longer deserializes.
+# KR0 switch review (problem 1): `tests/kr0_e9_base_recheck.rs` opens Clean's
+# native-fold authority bypass (`clean_kernel::env::native_fold_mint_bypass`,
+# compiled only under `test-fixtures`) to give a base theorem an `Extended`
+# stamp Lean's theory cannot earn. As a dev-dependency feature it reaches test
+# builds only (resolver 2), never the compiler that links this crate; while the
+# bypass is not open it changes nothing.
+clean-kernel = { workspace = true, features = ["test-fixtures"] }
+
+# VF5: reaches `calculus_row::test_support`, so it builds only with that feature
+# (`--features calculus-row-test-support`); it also needs the real family (see
+# the file's docs) and is a named skip without it.
+[[test]]
+name = "vf5_calculus_rows"
+required-features = ["calculus-row-test-support"]
+
+[[test]]
+name = "vf5_resource_commands"
+required-features = ["vf5-resource-command-tests"]
+
+[target.'cfg(unix)'.dependencies]
+# Descriptor-based ACL observation; POSIX modes alone do not establish privacy.
+trust-resource-provenance = { path = "../trust-resource-provenance" }
+# Safe no-follow/nonblocking reads of untrusted proof hints and audit files.
+nix = { version = "0.31.3", default-features = false, features = ["fs", "user"] }

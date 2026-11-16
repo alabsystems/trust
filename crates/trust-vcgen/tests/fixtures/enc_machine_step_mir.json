@@ -1,0 +1,741 @@
+{
+  "name": "step",
+  "def_path": "enc13m::Machine::step",
+  "span": {
+    "file": "enc13m.rs",
+    "line_start": 20,
+    "col_start": 4,
+    "line_end": 27,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "enc13m::Machine",
+                "fields": [
+                  [
+                    "phase",
+                    {
+                      "Adt": {
+                        "name": "enc13m::Phase",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "Idle",
+                            "discriminant": 0,
+                            "fields": []
+                          },
+                          {
+                            "name": "Busy",
+                            "discriminant": 1,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": true,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "enc13m::Phase",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Idle",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Busy",
+                "discriminant": 1,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": "_b"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "enc13m::Machine",
+                "fields": [
+                  [
+                    "phase",
+                    {
+                      "Adt": {
+                        "name": "enc13m::Phase",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "Idle",
+                            "discriminant": 0,
+                            "fields": []
+                          },
+                          {
+                            "name": "Busy",
+                            "discriminant": 1,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": true,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        255,
+                        8
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "enc13m.rs",
+                "line_start": 21,
+                "col_start": 24,
+                "line_end": 21,
+                "col_end": 31
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "enc13m.rs",
+              "line_start": 21,
+              "col_start": 24,
+              "line_end": 21,
+              "col_end": 31
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "enc13m::Phase",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "enc13m::Phase"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "enc13m.rs",
+                "line_start": 21,
+                "col_start": 34,
+                "line_end": 21,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "enc13m::Phase",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "enc13m::Phase"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "enc13m.rs",
+                "line_start": 21,
+                "col_start": 55,
+                "line_end": 21,
+                "col_end": 66
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 0
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "enc13m.rs",
+                "line_start": 21,
+                "col_start": 8,
+                "line_end": 21,
+                "col_end": 68
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "enc13m.rs",
+                "line_start": 22,
+                "col_start": 17,
+                "line_end": 22,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "enc13m::Machine::is_busy",
+            "args": [
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "enc13m.rs",
+              "line_start": 22,
+              "col_start": 17,
+              "line_end": 22,
+              "col_end": 31
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 9074944297503053802,
+              "def_index": 6,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 9074944297503053802,
+              "krate_name": "enc13m"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": [
+                    "Deref",
+                    {
+                      "Field": 0
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "enc13m.rs",
+                "line_start": 23,
+                "col_start": 14,
+                "line_end": 23,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ],
+              [
+                1,
+                7
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "enc13m.rs",
+              "line_start": 23,
+              "col_start": 8,
+              "line_end": 23,
+              "col_end": 24
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "enc13m.rs",
+                "line_start": 25,
+                "col_start": 27,
+                "line_end": 25,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        8
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "enc13m.rs",
+                "line_start": 24,
+                "col_start": 27,
+                "line_end": 24,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 8,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 8,
+            "span": {
+              "file": "enc13m.rs",
+              "line_start": 24,
+              "col_start": 27,
+              "line_end": 24,
+              "col_end": 32
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 8,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "enc13m.rs",
+                "line_start": 24,
+                "col_start": 27,
+                "line_end": 24,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_7",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_7",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 255
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -5,6 +5,88 @@ use super::resolve_file_url_path;
 use crate::core::config::TargetSelection;
 use crate::utils::helpers::exe;
 
+// Trust: real filesystem controls for the independent Rust extraction owner.
+#[cfg(unix)]
+#[test]
+fn stage0_paired_linker_materializes_exact_distinct_image() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let tmp = tempfile::tempdir().unwrap();
+    let host = "aarch64-apple-darwin";
+    let source = tmp.path().join("lib/rustlib").join(host).join("bin/rust-lld");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::create_dir(tmp.path().join("bin")).unwrap();
+    fs::write(&source, b"archive-bound host image").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    super::materialize_stage0_paired_linker(tmp.path(), host);
+    let selected = tmp.path().join("bin/rust-lld");
+    assert_eq!(fs::read(&selected).unwrap(), fs::read(&source).unwrap());
+    assert_ne!(fs::metadata(&selected).unwrap().ino(), fs::metadata(&source).unwrap().ino());
+    super::materialize_stage0_paired_linker(tmp.path(), host);
+    fs::write(&selected, b"foreign SDK linker").unwrap();
+    assert!(std::panic::catch_unwind(|| super::materialize_stage0_paired_linker(tmp.path(), host)).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn stage0_paired_linker_refuses_links_and_nonexecutable_source() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let tmp = tempfile::tempdir().unwrap();
+    let host = "aarch64-apple-darwin";
+    let source = tmp.path().join("lib/rustlib").join(host).join("bin/rust-lld");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::create_dir(tmp.path().join("bin")).unwrap();
+    fs::write(&source, b"archive-bound host image").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(std::panic::catch_unwind(|| super::materialize_stage0_paired_linker(tmp.path(), host)).is_err());
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    let selected = tmp.path().join("bin/rust-lld");
+    symlink(&source, &selected).unwrap();
+    assert!(std::panic::catch_unwind(|| super::materialize_stage0_paired_linker(tmp.path(), host)).is_err());
+    fs::remove_file(&selected).unwrap();
+    fs::hard_link(&source, &selected).unwrap();
+    assert!(std::panic::catch_unwind(|| super::materialize_stage0_paired_linker(tmp.path(), host)).is_err());
+}
+
+// Trust: dry-run must also work with an immutable externally supplied seed.
+#[cfg(unix)]
+#[test]
+fn dry_run_tippy_leaves_readonly_seed_unchanged_and_unstamped() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ctx = crate::utils::tests::TestCtx::new();
+    let config = ctx.config("check").create_config();
+    assert!(config.dry_run());
+    let fixture = tempfile::tempdir().unwrap();
+    let sysroot = fixture.path().join("readonly-seed");
+    fs::create_dir(&sysroot).unwrap();
+    let sentinel = sysroot.join("existing-payload");
+    fs::write(&sentinel, b"unchanged seed bytes").unwrap();
+    fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::set_permissions(&sysroot, fs::Permissions::from_mode(0o500)).unwrap();
+
+    // Restore only our fixture's directory for cleanup, including on regression
+    // panic; the real immutable compiler prefix is never passed to this test.
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| config.download_tippy(&sysroot)));
+    let unchanged_mode = fs::metadata(&sysroot).unwrap().permissions().mode() & 0o777;
+    fs::set_permissions(&sysroot, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        result.expect("dry-run attempted to mutate a read-only seed"),
+        sysroot.join("bin").join(exe("targo-tippy", config.host_target))
+    );
+    assert_eq!(unchanged_mode, 0o500);
+    assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged seed bytes");
+    let entries: Vec<_> =
+        fs::read_dir(&sysroot).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    assert_eq!(entries, [std::ffi::OsString::from("existing-payload")]);
+    assert!(
+        !crate::utils::build_stamp::BuildStamp::new(&sysroot)
+            .with_prefix("tippy")
+            .add_stamp(&config.stage0_metadata.compiler.date)
+            .is_up_to_date()
+    );
+}
+
 #[test]
 fn dedicated_trustfmt_uses_the_canonical_archive_component_prefix() {
     assert_eq!(super::dedicated_trustfmt_component_prefix(), "trustfmt");
@@ -670,4 +752,237 @@ fn swap_verified_toolchain_installs_fresh_root() {
     assert!(!staging_root.exists(), "staging tree must be promoted away");
 
     fs::remove_dir_all(&tmp).expect("remove temp swap dir");
+}
+
+#[test]
+fn stage0_stamp_is_the_one_bootstrap_py_writes() {
+    // 2026-09-30 regression (m2, seed mode): bootstrap.py materializes the pinned
+    // seed and stamps `<stage0>/.rustc-stamp` with the pin's extraction identity (its
+    // `rustc_stamp()`). This layer must read that same file as up to date. It read
+    // a Trust-only `.trustc-stamp` instead, so every x.py run re-extracted the seed
+    // and swapped the whole root in, which deleted python's stamp, so the next run
+    // re-extracted it again; and the readers of `.rustc-stamp`
+    // (scripts/check_seed_freshness.py, scripts/mint_seed_support.py pinned-stage0)
+    // found no stamp after any build.
+    let stage0 = unique_tmp_dir("stage0-stamp").join("stage0");
+    fs::create_dir_all(&stage0).expect("create temp stage0");
+    // Trust: this fixed vector is independently checked by bootstrap_test.py.
+    let key = "trust-stage0-extraction-v3:3ac64c7fe74e195c373d0d0b32f6cfcad11d660f22f5f05e1d0e807546b40442";
+    fs::write(stage0.join(".rustc-stamp"), key).expect("write bootstrap.py's stamp");
+
+    let stamp = super::toolchain_stamp(&stage0, key);
+    assert_eq!(stamp.path(), stage0.join(".rustc-stamp"));
+    assert!(
+        stamp.is_up_to_date(),
+        "the stamp bootstrap.py wrote must satisfy this layer"
+    );
+    assert!(
+        !super::toolchain_stamp(&stage0, "2026-10-19").is_up_to_date(),
+        "a legacy date is not the extraction identity"
+    );
+
+    fs::write(stage0.join(".rustc-stamp"),
+        "trust-stage0-extraction-v2:f17423e9d0ed69895362418889dee27e09051a9508fdb7163ecb9c624005f02c").unwrap();
+    assert!(
+        !super::toolchain_stamp(&stage0, key).is_up_to_date(),
+        "the metadata-bearing v2 extraction cannot satisfy the v3 seed projection"
+    );
+
+    fs::remove_dir_all(stage0.parent().unwrap()).expect("remove temp stage0");
+}
+
+#[test]
+fn stage0_extraction_identity_matches_python_vectors() {
+    // Trust: date alone misses forward cuts and archive repacks on the same day.
+    let mut pin = build_helper::stage0_parser::Stage0::default();
+    pin.compiler = build_helper::stage0_parser::VersionMetadata {
+        date: "2026-10-19".to_owned(),
+        version: "0.11.0-trust".to_owned(),
+        git_commit_hash: "1".repeat(40),
+        channel_manifest_hash: "a".repeat(64),
+    };
+    pin.rustfmt = Some(pin.compiler.clone());
+    pin.config.compiler_dist_channel = "trust".to_owned();
+    pin.config.rustfmt_dist_channel = "trust".to_owned();
+    let compiler = "dist/2026-10-19/trustc-0.11.0-trust-aarch64-apple-darwin.tar.xz";
+    pin.checksums_sha256.insert(compiler.to_owned(), "b".repeat(64));
+    pin.checksums_sha256.insert(
+        "dist/2026-10-19/targo-0.11.0-trust-aarch64-apple-darwin.tar.xz".to_owned(),
+        "c".repeat(64),
+    );
+    assert_eq!(
+        super::stage0_extraction_stamp(&pin),
+        "trust-stage0-extraction-v3:3ac64c7fe74e195c373d0d0b32f6cfcad11d660f22f5f05e1d0e807546b40442"
+    );
+    pin.compiler.git_commit_hash = "2".repeat(40);
+    assert_eq!(
+        super::stage0_extraction_stamp(&pin),
+        "trust-stage0-extraction-v3:009d583019415ba13fdccd4df8b60059c7d64ac02343545a7f2712d41755c387"
+    );
+    pin.compiler.git_commit_hash = "1".repeat(40);
+    pin.checksums_sha256.insert(compiler.to_owned(), "d".repeat(64));
+    assert_eq!(
+        super::stage0_extraction_stamp(&pin),
+        "trust-stage0-extraction-v3:766ef09828a7e771bf7a75738e1e49d4ad79a6cd115078720caf109bc4432eac"
+    );
+}
+
+// Trust: a bootstrap dry-run must not stamp the external stage0 provider.
+#[test]
+fn dry_run_tippy_download_keeps_external_sysroot_unchanged() {
+    let context = crate::utils::tests::TestCtx::new();
+    let config = context.config("check").create_config();
+    assert!(config.dry_run());
+    let provider = tempfile::TempDir::new().unwrap();
+    let bin = provider.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let names = ["tippy", "targo-tippy", "tippy-driver"];
+    for name in names {
+        fs::write(bin.join(exe(name, config.host_target)), b"owned fixture").unwrap();
+    }
+    assert_eq!(
+        config.download_tippy(provider.path()),
+        bin.join(exe("targo-tippy", config.host_target)),
+    );
+    assert!(
+        !provider.path().join(".tippy-stamp").exists(),
+        "a dry-run cannot claim the external provider has a downloaded component",
+    );
+    for name in names {
+        assert_eq!(fs::read(bin.join(exe(name, config.host_target))).unwrap(), b"owned fixture");
+    }
+    assert_eq!(fs::read_dir(provider.path()).unwrap().count(), 1);
+}
+
+// Trust: these are real owned archives and the production extraction boundary;
+// no CI network/provider is constructed by these controls.
+fn ci_llvm_archive(directory: &Path, corrupt_second_header: bool) -> PathBuf {
+    use std::io::Write;
+    let path = directory.join("rust-dev-fixture.tar.xz");
+    let mut archive = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    let payload = b"replacement provider bytes";
+    header.set_size(payload.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, "rust-dev-fixture/rust-dev/lib/provider", &payload[..])
+        .unwrap();
+    let second = archive.get_ref().len();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(1);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive.append_data(&mut header, "rust-dev-fixture/rust-dev/lib/second", &b"x"[..]).unwrap();
+    archive.finish().unwrap();
+    let mut bytes = archive.into_inner().unwrap();
+    if corrupt_second_header {
+        bytes[second] ^= 1; // Actual checksum failure after the first member was extracted.
+    }
+    let mut encoder = xz2::write::XzEncoder::new(fs::File::create(&path).unwrap(), 1);
+    encoder.write_all(&bytes).unwrap();
+    encoder.finish().unwrap();
+    path
+}
+
+// Trust: exercise the actual Dist and CI projection callers on the same real
+// installer image. Only the Dist seed shape/identity epoch changes here.
+#[test]
+fn installed_seed_projection_excludes_only_the_root_installer_instruction_table() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixture.tar.xz");
+    let mut archive = tar::Builder::new(Vec::new());
+    for (name, bytes) in [
+        ("fixture/trustc/manifest.in", &b"file:bin/trustc\n"[..]),
+        ("fixture/trustc/bin/trustc", &b"compiler"[..]),
+        ("fixture/trustc/share/manifest.in", &b"installed data"[..]),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, name, bytes).unwrap();
+    }
+    archive.finish().unwrap();
+    let bytes = archive.into_inner().unwrap();
+    let mut encoder = xz2::write::XzEncoder::new(fs::File::create(&path).unwrap(), 1);
+    encoder.write_all(&bytes).unwrap();
+    encoder.finish().unwrap();
+    let context = super::ExecutionContext::new(0, false);
+    let seed = dir.path().join("seed");
+    super::unpack_seed_component(&context, &path, &seed, "trustc");
+    assert!(!seed.join("manifest.in").exists());
+    assert_eq!(fs::read(seed.join("bin/trustc")).unwrap(), b"compiler");
+    assert_eq!(
+        fs::read(seed.join("share/manifest.in")).unwrap(),
+        b"installed data"
+    );
+    let raw = dir.path().join("raw");
+    super::unpack(&context, &path, &raw, "trustc");
+    assert_eq!(
+        fs::read(raw.join("manifest.in")).unwrap(),
+        b"file:bin/trustc\n"
+    );
+    assert_eq!(
+        fs::read(raw.join("share/manifest.in")).unwrap(),
+        b"installed data"
+    );
+}
+
+#[test]
+fn ci_llvm_legacy_completion_does_not_satisfy_the_replacement_recipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let sha = "a".repeat(40);
+    let legacy =
+        super::BuildStamp::new(dir.path()).with_prefix("llvm").add_stamp(format!("{sha}false"));
+    legacy.write().unwrap();
+    let selected = super::ci_llvm_stamp(dir.path(), &sha, false);
+    assert!(!selected.is_up_to_date());
+    selected.write().unwrap();
+    assert!(selected.is_up_to_date());
+    assert!(!super::ci_llvm_stamp(dir.path(), &sha, true).is_up_to_date());
+    assert!(!super::ci_llvm_stamp(dir.path(), &"b".repeat(40), false).is_up_to_date());
+}
+
+#[test]
+fn ci_llvm_extraction_invalidates_completion_until_outer_fixups_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ci-llvm");
+    fs::create_dir_all(root.join("lib")).unwrap();
+    fs::write(root.join("lib/provider"), b"old provider").unwrap();
+    let old = super::ci_llvm_stamp(&root, &"a".repeat(40), false);
+    old.write().unwrap();
+    let archive = ci_llvm_archive(dir.path(), false);
+    // Cache/download preparation has not invalidated the still-selected old provider.
+    assert!(old.is_up_to_date());
+    let context = super::ExecutionContext::new(0, false);
+    super::unpack_ci_llvm(&context, &archive, &root, &old);
+    assert_eq!(fs::read(root.join("lib/provider")).unwrap(), b"replacement provider bytes");
+    assert!(!old.path().exists());
+    // The real caller writes only after its existing binary/library fixups.
+    let replacement = super::ci_llvm_stamp(&root, &"b".repeat(40), false);
+    replacement.write().unwrap();
+    assert!(replacement.is_up_to_date());
+    assert!(!old.is_up_to_date());
+}
+
+#[test]
+fn ci_llvm_partial_failed_replacement_cannot_leave_the_old_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ci-llvm");
+    fs::create_dir_all(root.join("lib")).unwrap();
+    fs::write(root.join("lib/provider"), b"old provider").unwrap();
+    let old = super::ci_llvm_stamp(&root, &"a".repeat(40), false);
+    old.write().unwrap();
+    let archive = ci_llvm_archive(dir.path(), true);
+    let context = super::ExecutionContext::new(0, false);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::unpack_ci_llvm(&context, &archive, &root, &old);
+    }));
+    assert!(failed.is_err());
+    assert_eq!(fs::read(root.join("lib/provider")).unwrap(), b"replacement provider bytes");
+    assert!(!old.path().exists());
+    assert!(!old.is_up_to_date());
 }

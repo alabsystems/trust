@@ -18,7 +18,7 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_cg_bridge::BridgeError;
-use trust_types::{VerifiableFunction, VerificationCondition, VerificationResult};
+use trust_types::{Ty, VerifiableFunction, VerificationCondition, VerificationResult};
 
 use crate::{BackendRole, VerificationBackend};
 
@@ -208,10 +208,34 @@ impl TrustCgBackend {
     /// integer scalar shapes) and reports [`CodegenVerdict::RoundTripOnly`] with
     /// the reason outside it, rather than borrowing step 1's success to look like
     /// a proof.
+    ///
+    /// A function outside the fragment [`Self::can_handle_function`] admits (a
+    /// local whose type the bridge cannot map) is refused with
+    /// [`TrustCgBackendError::Unsupported`] before either check runs. The router
+    /// asks `can_handle_function` first, but `#[trust::verified_codegen]`
+    /// (rustc_mir_transform's `verify_codegen_attr`) calls this directly, so the
+    /// guard has to live here: a verdict for such a function would be graded
+    /// work on a function the backend says it cannot handle.
     pub fn verify_codegen(
         &self,
         func: &VerifiableFunction,
     ) -> Result<CodegenVerdict, TrustCgBackendError> {
+        if func.body.contains_memory_image() {
+            return Err(TrustCgBackendError::Unsupported {
+                function: func.name.clone(),
+                reason:
+                    "ConstValue::MemoryImage has no modeled allocation/provenance value semantics"
+                        .into(),
+            });
+        }
+        if let Some((index, ty, error)) = first_unmappable_local(func) {
+            return Err(TrustCgBackendError::Unsupported {
+                function: func.name.clone(),
+                reason: format!(
+                    "local _{index} has type {ty:?}, which trust-cg cannot map: {error}"
+                ),
+            });
+        }
         if !self.config.available {
             return Ok(CodegenVerdict::Unavailable {
                 reason: "trust-cg backend not available".to_string(),
@@ -293,9 +317,23 @@ impl TrustCgBackend {
 
     /// Check whether a function is suitable for trust_cg codegen.
     ///
-    /// The bridge supports scalar functions only: no references, raw pointers,
-    /// slices, arrays, tuples, or ADTs. This method checks the function's
-    /// locals for unsupported types.
+    /// It is when the backend is available and every local's type maps through
+    /// `trust_cg_bridge::map_type`. That admits `bool`, integers and bit-vectors
+    /// of 8, 16, 32, 64 or 128 bits, `f32` and `f64`, references and raw
+    /// pointers, and tuples, ADTs with fields, arrays and slices whose
+    /// components all map. A thin reference or pointer maps as one 64-bit word
+    /// whatever it points to; a reference or pointer to a slice is a fat
+    /// pointer and maps only when the slice's element does. It rejects `()`,
+    /// `!`, a fieldless ADT, an integer or bit-vector of any other width,
+    /// `f16` and `f128`, a type whose byte extent overflows the u32 LIR
+    /// carrier, and every other `Ty` variant (`Char`, `PtrSizedInt` and `Str`
+    /// from the faithful-extraction lane, closures, fn items and fn pointers,
+    /// `dyn`, coroutines, `Unsupported`, ...).
+    ///
+    /// [`Self::verify_codegen`] returns [`TrustCgBackendError::Unsupported`]
+    /// for every function this rejects for a local, so this is also the
+    /// definition of what `#[trust::verified_codegen]` reports as a hard error
+    /// rather than a verdict.
     #[must_use]
     pub fn can_handle_function(&self, func: &VerifiableFunction) -> bool {
         if !self.config.available {
@@ -303,8 +341,20 @@ impl TrustCgBackend {
         }
 
         // Check all locals have types the bridge can map.
-        func.body.locals.iter().all(|local| trust_cg_bridge::map_type(&local.ty).is_ok())
+        first_unmappable_local(func).is_none()
     }
+}
+
+/// The first local of `func` whose type the trust-cg bridge cannot map, with
+/// the bridge's reason, or `None` when every local maps.
+///
+/// This is the one definition of the fragment: [`TrustCgBackend::can_handle_function`]
+/// (the router's dispatch guard) and [`TrustCgBackend::verify_codegen`] (which
+/// callers reach without that guard) both read it, so the two cannot drift.
+fn first_unmappable_local(func: &VerifiableFunction) -> Option<(usize, &Ty, BridgeError)> {
+    func.body.locals.iter().find_map(|local| {
+        trust_cg_bridge::map_type(&local.ty).err().map(|error| (local.index, &local.ty, error))
+    })
 }
 
 /// Name the first structural property on which `lifted` diverges from `func`,
@@ -449,6 +499,58 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn memory_image_direct_codegen_refuses_ignored_intrinsic_arguments() {
+        use trust_types::{
+            CallableDefPathHash, ConstValue, ConstantImageLayout, ConstantImageOwner,
+            ConstantImageRoot, ConstantImageTarget, ConstantMemoryImage,
+        };
+        let image = ConstValue::MemoryImage(Box::new(ConstantMemoryImage {
+            schema_version: 1,
+            owner: ConstantImageOwner {
+                def_path: "fixture".into(),
+                def_path_hash: CallableDefPathHash::new(1, 2),
+                mir_phase: "test".into(),
+            },
+            target: ConstantImageTarget {
+                triple: "test".into(),
+                data_layout: "e-p:64:64".into(),
+                pointer_size_bytes: 8,
+                little_endian: true,
+            },
+            ty: Ty::u8(),
+            ty_fingerprint: [1, 2],
+            layout: ConstantImageLayout { size_bytes: 1, align_bytes: 1 },
+            root: ConstantImageRoot::ScalarBits { bits: 7, size_bytes: 1 },
+            nodes: Default::default(),
+        }));
+        for value in [image.clone(), ConstValue::struct_scalar_fields_ref("Nested", vec![image])] {
+            for dead in [false, true] {
+                let mut func = make_add_function();
+                let statement = Statement::Intrinsic {
+                    name: "diagnostic_fixture".into(),
+                    args: vec![Operand::Constant(value.clone())],
+                };
+                if dead {
+                    func.body.blocks.push(BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![statement],
+                        terminator: Terminator::Unreachable,
+                    });
+                } else {
+                    func.body.blocks[0].stmts.insert(0, statement);
+                }
+                let error = TrustCgBackend::with_defaults().verify_codegen(&func).unwrap_err();
+                assert!(
+                    matches!(error, TrustCgBackendError::Unsupported { ref reason, .. }
+                    if reason.contains("ConstValue::MemoryImage")),
+                    "{error:?}"
+                );
+            }
         }
     }
 
@@ -480,6 +582,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -642,6 +745,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind: Default::default(),
         };
 
@@ -651,18 +755,54 @@ mod tests {
         }
     }
 
+    /// `can_handle_function` is the router's dispatch guard, but
+    /// `#[trust::verified_codegen]` (rustc_mir_transform's
+    /// `verify_codegen_attr`) calls `verify_codegen` with no guard in front of
+    /// it. So the API itself must refuse a function with a local the bridge
+    /// cannot map, and never grade it: the refusal is the compiler's hard error,
+    /// a verdict would be a note or a warning.
+    ///
+    /// Two fixtures. `make_ref_function` is outside the fragment through its
+    /// `()` return local. The second is the scalar `add`, which the byte-level
+    /// gate decides, plus one never-read local of type `!`: the dead local is
+    /// the only thing keeping it out of the fragment. Without the refusal
+    /// (measured 2026-10-09, with and without trust-cg-output-gate) both came
+    /// back `Ok(RoundTripOnly)`, which the compiler reports as a warning on a
+    /// function the backend says it cannot handle.
     #[test]
     fn test_trust_cg_backend_verify_codegen_unsupported_type() {
         let backend = TrustCgBackend::with_defaults();
-        let func = make_ref_function();
+        let mut add_with_dead_never = make_add_function();
+        add_with_dead_never.name = "add_with_dead_never".to_string();
+        add_with_dead_never.body.locals.push(LocalDecl { index: 3, ty: Ty::Never, name: None });
 
-        // Lowering a function with reference types should fail with a bridge error.
-        // Note: the function body has no statements using the ref, so lower_to_lir
-        // may succeed (it only fails when encountering unsupported operations).
-        // The can_handle_function check is the intended guard.
-        let _result = backend.verify_codegen(&func);
-        // Whether it errors or returns Unknown depends on the function body.
-        // The important thing is it does not panic.
+        // Every fixture is judged before the test fails, so a red names each
+        // verdict that was handed out instead of only the first.
+        let mut graded = Vec::new();
+        for (func, local) in
+            [(make_ref_function(), "local _0 has type Unit"), (add_with_dead_never, "local _3")]
+        {
+            assert!(
+                !backend.can_handle_function(&func),
+                "fixture `{}` must be outside the fragment can_handle_function admits",
+                func.name
+            );
+            match backend.verify_codegen(&func) {
+                Err(TrustCgBackendError::Unsupported { ref function, ref reason }) => {
+                    assert_eq!(function, &func.name);
+                    assert!(
+                        reason.contains(local) && reason.contains("cannot map"),
+                        "the refusal must name the unmappable local: {reason}"
+                    );
+                }
+                other => graded.push(format!("`{}`: {other:?}", func.name)),
+            }
+        }
+        assert!(
+            graded.is_empty(),
+            "verify_codegen must refuse a function can_handle_function rejects, not grade it: \
+             {graded:#?}"
+        );
     }
 
     #[test]

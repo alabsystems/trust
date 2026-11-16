@@ -321,10 +321,18 @@ contains_trust_counterexample_verdict() {
 # INCOMPLETENESS: the strict/full scope refused the build because some obligation was not
 # DISCHARGED — no counterexample, nothing caught. Distinct from a refutation, and the
 # distinction is load-bearing (see `classify_verdict`).
+#
+# `certify` (2026-10-06, FALSIF-OD1-VOCAB): the certify policy's own refusals —
+# an OD-1 instance-hypothesis row (c77d7678cf), unmeasured termination, a
+# runtime-checked std member, `main`'s return type — print `Trust certify
+# verification failed`. Each says an obligation was ASSUMED or not measured,
+# never that one was violated, so the word belongs HERE and must never be added
+# to `contains_trust_counterexample_verdict`: that would score an assumption
+# refusal as a refutation and pass the mutant lane on a catch nobody made.
 contains_trust_incompleteness_verdict() {
   local stderr_path=$1
   LC_ALL=C grep -Eq \
-    'Trust (strict|full|memory-safe) verification failed|strict Trust verification requires every Level 0 obligation|obligation\(s\) were not fully verified' \
+    'Trust (strict|full|memory-safe|certify) verification failed|strict Trust verification requires every Level 0 obligation|obligation\(s\) were not fully verified' \
     "$stderr_path"
 }
 
@@ -347,11 +355,51 @@ contains_trust_incompleteness_verdict() {
 # is fail-closed armor so that a future policy or flag drift can never again
 # turn "tolerated at runtime" into a `proved` gate row. A fixture with no
 # report line at all stays `proved` — the zero-obligation acceptance fixtures
-# (README, defined `as` casts) emit no headline by design.
+# (README, defined `as` casts) emit no headline by design (main() refuses a
+# proved lane in which NO fixture printed one: see `stderr_has_summary_line`).
+#
+# WHOLE-LINE GRAMMAR (2026-10-06, FALSIF-ARMOR-ASSUMED). Every line carrying
+# `Trust verification: ` is judged, and it is static only when it is EXACTLY
+#   note: Trust verification: P proved, 0 failed, 0 unknown, 0 timed out,
+#         0 runtime-checked[, A assumed (requires)] out of N obligation(s)
+# with P + A == N. The old armor selected lines by `N proved,` and matched a
+# fixed tail, so it never saw the coroutine label `conditionally discharged (NOT
+# proved)` (a fail-open), and it read the `assumed (requires)` column — which
+# certify itself accepts: a definition-entry premise charged at every in-crate
+# call site — as non-static (a false red). Any other shape — `, N skipped`,
+# `, N assumed (instance discharge)`, the conditional label, another severity,
+# trailing text, counts that do not reach the total, or a column added in
+# future — is NOT static, so format drift fails closed by construction.
+# `assumed (requires)` counted static: docs/DECISION_QUEUE.md FALSIF-ARMOR-ASSUMED.
+#
+# The compiler's own exit-0 "not verified" warnings are not static either, with or
+# without a summary line: an OD-1 instance hypothesis under the default policy
+# prints `warning: Trust verification advisory for …: … ASSUMED per instance, not
+# proved` and NO summary, which the zero-headline rule alone would read as a
+# zero-obligation acceptance (measured on w17 for the two OD-1 mutants with the
+# policy flag dropped; under certify neither warning reaches an exit-0 compile).
 contains_incomplete_static_accept() {
-  local stderr_path=$1
-  LC_ALL=C grep -a 'Trust verification: [0-9]* proved,' "$stderr_path" \
-    | LC_ALL=C grep -Evq ', 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of'
+  local stderr_path=$1 line proved assumed total
+  local static_re='^note: Trust verification: ([0-9]{1,9}) proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked(, ([0-9]{1,9}) assumed \(requires\))? out of ([0-9]{1,9}) obligation\(s\)$'
+  if LC_ALL=C grep -Eaq '^warning: Trust (verification advisory for|Level 0 safety verification incomplete for) ' "$stderr_path"; then
+    return 0
+  fi
+  while IFS= read -r line; do
+    [[ $line =~ $static_re ]] || return 0
+    proved=${BASH_REMATCH[1]}
+    assumed=${BASH_REMATCH[3]:-0}
+    total=${BASH_REMATCH[4]}
+    ((10#$proved + 10#$assumed == 10#$total)) || return 0
+  done < <(LC_ALL=C grep -a 'Trust verification: ' "$stderr_path")
+  return 1
+}
+
+# Whether a compile printed any `Trust verification: ` summary at all. main()
+# requires at least one proved fixture to have printed one: a lane in which no
+# fixture did means the compiler did not verify, or the summary was renamed —
+# and either would let every rc=0 row read as a zero-obligation acceptance.
+stderr_has_summary_line() {
+  LC_ALL=C grep -aq 'Trust verification: ' "$1"
 }
 
 classify_verdict() {
@@ -508,7 +556,7 @@ validate_fixture_path() {
 main() {
   local script_dir repo_root git_root requested_trustc timeout head_before head_after
   local trustc_id_before trustc_sha_before trustc_size_before trustc_dir_before
-  local verdict fixture name failed=0 index=0 proved_count=0 mutant_count=0
+  local verdict fixture name failed=0 index=0 proved_count=0 mutant_count=0 summary_count=0
   local -a proved_files=() mutant_files=()
 
   (($# == 0)) || {
@@ -591,6 +639,9 @@ main() {
     fi
     verify_fixture "$requested_trustc" "$fixture" "proved-$index" "$timeout"
     verdict=$FIXTURE_VERDICT
+    if stderr_has_summary_line "$TMPDIR_GATE/proved-$index.stderr"; then
+      ((summary_count += 1))
+    fi
     if [[ $verdict == proved ]]; then
       printf 'PASS  proved   %s  — verified\n' "$name"
     else
@@ -598,6 +649,12 @@ main() {
       failed=1
     fi
   done
+  # A proved lane in which NO compile printed a summary did not measure anything:
+  # every rc=0 row would read as a zero-obligation acceptance (2026-10-06).
+  if ((summary_count == 0)); then
+    printf 'FAIL  proved   (lane)  — no proved fixture printed a `Trust verification:` summary: the compiler did not verify, or the summary format changed\n'
+    failed=1
+  fi
 
   for fixture in "${mutant_files[@]}"; do
     ((mutant_count += 1, index += 1))

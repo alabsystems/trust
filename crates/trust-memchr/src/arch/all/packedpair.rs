@@ -43,7 +43,7 @@ pub trait HeuristicFrequencyRank {
 
 /// This permits passing any implementation of `HeuristicFrequencyRank` as a
 /// borrowed version of itself.
-impl<'a, R> HeuristicFrequencyRank for &'a R
+impl<R> HeuristicFrequencyRank for &R
 where
     R: HeuristicFrequencyRank,
 {

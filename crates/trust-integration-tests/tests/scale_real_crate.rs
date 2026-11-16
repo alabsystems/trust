@@ -413,6 +413,7 @@ fn noop_fn(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -468,6 +469,7 @@ fn checked_add_fn(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -512,6 +514,7 @@ fn division_fn(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -563,6 +566,7 @@ fn guarded_division_fn(name: &str) -> VerifiableFunction {
         )))],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -610,6 +614,7 @@ fn array_index_fn(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -682,6 +687,7 @@ fn contract_fn(name: &str) -> VerifiableFunction {
             Box::new(Formula::Var("lo".into(), Sort::Int)),
         )],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -737,6 +743,7 @@ fn checked_sub_fn(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -792,6 +799,7 @@ fn checked_mul_fn(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

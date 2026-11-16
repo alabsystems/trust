@@ -1,0 +1,131 @@
+# trust-ir VERIFIER acceptance pins — the verdicts the trust-ir verification path must reproduce.
+#
+# Owner direction 2026-09-29 (accounting invariant, item 2): the regression tests
+# of the 2026-09-28/29 residency, identity, requires and std-member work are
+# registered here as acceptance pins for the trust-ir path. Under R-1/R-2
+# (docs/plans/2026-09-29-trust-ir-sole-compile-path.md) verification moves onto
+# trust-ir and the MIR-derived lanes become test oracles. Before a MIR-derived
+# verification lane is retired, the trust-ir path must give every fixture below
+# the verdict its directives and `//~` annotations demand today. A refusal pin
+# that turns into an accept re-opens a measured false PROVED; a `keeps_*` control
+# that turns into a refusal is a capability loss (docs/DECISION_QUEUE.md first).
+#
+# Format: <fixture> <class> <invariant-tag>
+#   class  accept | refuse | mixed:<passing revisions>/<revisions>, DERIVED from
+#          the fixture's pass-mode directives by the checker; a mismatch fails
+#          --check, so moving a pin's verdict takes an edit here, in the open.
+#   tag    which invariant the fixture pins:
+#          r2-residency    an item's identity is its artifact residency in this
+#                          compiler's sysroot, never a lang/diagnostic item or a
+#                          crate name a dependency can declare
+#          requires-edge   a `requires` is charged at every edge that can call
+#                          the function (fn pointers, items handed to std, trait
+#                          impls), or the edge is refused
+#          std-member      a bundled std member's gap is a runtime_checked ROW,
+#                          only for std's own check, never registry authority
+#          skip-ledger     a skip is an honest, recorded, fail-closed row
+#          e6-admission    a body the E6 reader admits for a Clean-certified
+#                          contract keeps that certificate, and every shape it
+#                          refuses (impure arms, unsupported widths, guards,
+#                          loops, ref-self views) stays refused; the trust-ir
+#                          path must reproduce both directions
+#
+# CHECK (no build):  python3 scripts/trust_ir_verifier_acceptance_pins.py --check
+# DERIVE A CLASS:    python3 scripts/trust_ir_verifier_acceptance_pins.py --derive
+#
+# Adding a pin: any tests/ui/trust fixture whose verdict closes a hole or keeps a
+# capability belongs here. Run --derive for its class. Removing a pin needs the
+# same justification as deleting the fixture.
+
+# ZERO-ROW-GATE (2026-10-10, docs/DECISION_QUEUE.md): six pins below moved toward
+# `refuse` (partialord_sublane_resident_core_keeps_bundling and
+# static_str_write_fmt_..._impostor_refuted to `refuse`; the four requires-edge files
+# lost passing revisions). Each moved revision is a body with zero obligations whose
+# call no authenticated registry discharges: it publishes an `unknown` row and trustc
+# now refuses it. A capability loss, recorded in the DECISION_QUEUE ruling; no refusal
+# pin turned into an accept.
+# D103 (2026-10-15, docs/DECISION_QUEUE.md; the merge 81f9806093 / 1b3365f7e9): four pins
+# below moved toward `accept`, each a capability recovery its fixture's header records:
+# VERIFIED-CALLABLE-ZERO-ROW-PARITY lets ZERO-ROW-GATE read the drive-only consumer
+# lane's decision, so the requires-FREE callables and closures ZERO-ROW-GATE had refused
+# build again (callable_handed_to_std_through_a_reference reqfree_ref_any,
+# reqfree_ref_ref_any, ref_closure_any, refmut_closure_any; requires_callee_handed_to_
+# generic_code reqfree_any_certify); D103(d) credits `count` over a total std receiver
+# (std_member_str_iter_count_capability_loss: all five `*_count` revisions); the kept
+# `<dyn Debug>::fmt` site folds into the std member's runtime_checked aggregate
+# (fmt_member_tolerance_internal_assert_control field_u32, nested_local_clean). Only
+# those twelve revisions changed mode (check-fail -> check-pass); none is an impostor
+# or refutation revision, and no requires-carrying revision moved.
+# --- r2-residency: planted refutations (impostor) and honest controls (resident) ---
+tests/ui/trust/fmt_writer_relative_fmtwrite_core_substitution_impostor_refuted.rs  mixed:1/2  r2-residency
+tests/ui/trust/fmt_writer_relative_string_lang_item_sink_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/no_std_panic_handler_owner_keeps_core_credit.rs  mixed:1/2  r2-residency
+tests/ui/trust/partialord_sublane_no_core_lang_item_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/partialord_sublane_resident_core_keeps_bundling.rs  refuse  r2-residency
+tests/ui/trust/static_str_write_fmt_fmtwrite_core_substitution_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/std_member_tolerance_identity_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/std_print_backend_panic_handler_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/step_by_constructor_no_core_range_lang_item_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/step_by_constructor_resident_core_keeps_candidate.rs  accept  r2-residency
+tests/ui/trust/tls_try_with_local_key_diagnostic_item_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/tls_try_with_resident_std_local_key_keeps_credit.rs  refuse  r2-residency
+tests/ui/trust/to_string_stamp_impersonated_string_refuted.rs  refuse  r2-residency
+tests/ui/trust/to_string_stamp_no_std_diagnostic_item_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/to_string_stamp_reference_peel_stays_closed.rs  refuse  r2-residency
+tests/ui/trust/to_string_stamp_survivors_still_proved.rs  accept  r2-residency
+tests/ui/trust/total_std_iterator_lang_item_foundational_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/total_std_iterator_panic_handler_foundational_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/typed_call_arms_core_substitution_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/typed_call_arms_resident_core_keeps_credit.rs  accept  r2-residency
+tests/ui/trust/typed_self_total_deref_string_lang_item_impostor_refuted.rs  refuse  r2-residency
+tests/ui/trust/typed_self_total_to_string_trait_diagnostic_item_impostor_refuted.rs  refuse  r2-residency
+
+# --- requires-edge: a precondition is charged wherever the function can be called ---
+tests/ui/trust/callable_handed_to_std_through_a_reference.rs  mixed:6/23  requires-edge
+tests/ui/trust/local_item_naming_no_verified_body_as_value.rs  mixed:2/10  requires-edge
+tests/ui/trust/requires_callee_handed_to_generic_code.rs  mixed:4/12  requires-edge
+tests/ui/trust/requires_callee_reified_to_fn_pointer.rs  mixed:1/13  requires-edge
+tests/ui/trust/trait_impl_requires_charged_to_no_caller.rs  mixed:2/8  requires-edge
+tests/ui/trust/w5_requires_callee_not_mir_inlined.rs  refuse  requires-edge
+
+# --- std-member: the bundled std-member runtime_checked disposition and its tolerances ---
+tests/ui/trust/policy_b/fmt_member_tolerance_derive_dep_refused.rs  refuse  std-member
+tests/ui/trust/policy_b/fmt_member_tolerance_internal_assert_control.rs  mixed:5/6  std-member
+tests/ui/trust/policy_b/fmt_member_tolerance_release_std_refused.rs  refuse  std-member
+tests/ui/trust/policy_b/std_member_identity_not_widened.rs  refuse  std-member
+tests/ui/trust/policy_b/std_member_runtime_check_copy_from_slice.rs  accept  std-member
+tests/ui/trust/policy_b/std_member_runtime_check_not_registered.rs  accept  std-member
+tests/ui/trust/policy_b/std_member_runtime_check_println_count_control.rs  accept  std-member
+tests/ui/trust/policy_b/std_member_runtime_check_row_refcell.rs  mixed:2/3  std-member
+# vecdeque: `refuse` since 8ab6333dc4 (W4 vecslice), which this manifest predates: the
+# unguarded `d.insert(i, 1)` root call is refused on its
+# `Call::insert::panic-freedom-unverified` row (VEC-INSERT), so #strict and #default are
+# check-fail like #certify; the runtime_checked std-member rows are unchanged.
+tests/ui/trust/policy_b/std_member_runtime_check_row_vecdeque.rs  refuse  std-member
+tests/ui/trust/policy_b/std_member_runtime_check_withheld.rs  refuse  std-member
+tests/ui/trust/policy_b/std_member_str_iter_count_capability_loss.rs  accept  std-member
+tests/ui/trust/policy_b/std_member_tolerance_hides_charged_division.rs  refuse  std-member
+
+# --- skip-ledger ---
+tests/ui/trust/skip_dedup_orphan_is_fail_closed.rs  refuse  skip-ledger
+tests/ui/trust/skip_error_ledger_claim_follows_output_mode.rs  refuse  skip-ledger
+
+# --- e6-admission: Clean-certified body admission (E6 I0-I4'), admits and refusals ---
+tests/ui/trust/e6_bool_cmp_refusals.rs  refuse  e6-admission
+tests/ui/trust/e6_bool_eq_defeq.rs  accept  e6-admission
+tests/ui/trust/e6_bool_ne_param_view.rs  refuse  e6-admission
+tests/ui/trust/e6_bool_ordering_gate_per_opt_level.rs  refuse  e6-admission
+tests/ui/trust/e6_bool_tree_defeq.rs  accept  e6-admission
+tests/ui/trust/e6_bool_tree_refusals.rs  refuse  e6-admission
+tests/ui/trust/e6_kernel_import_admits.rs  refuse  e6-admission
+tests/ui/trust/e6_param_view_ref_self_is_not_certified.rs  accept  e6-admission
+tests/ui/trust/e6_param_view_refusals_say_why.rs  refuse  e6-admission
+tests/ui/trust/e6_param_view_skips_unsupported_fields.rs  accept  e6-admission
+tests/ui/trust/e6_refusal_names_the_gate.rs  refuse  e6-admission
+tests/ui/trust/e6_requires_field_projection.rs  accept  e6-admission
+tests/ui/trust/e6_requires_field_projection_caller_refused.rs  refuse  e6-admission
+tests/ui/trust/e6_requires_field_projection_mut_receiver_not_assumed.rs  refuse  e6-admission
+tests/ui/trust/e6_requires_field_projection_refused.rs  refuse  e6-admission
+tests/ui/trust/e6_select_match_defeq.rs  mixed:1/2  e6-admission
+tests/ui/trust/e6_select_match_refusals.rs  refuse  e6-admission
+tests/ui/trust/e6_session_facets.rs  refuse  e6-admission

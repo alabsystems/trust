@@ -47,6 +47,22 @@ pub fn lowercase_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+/// Write lowercase hex rendering of arbitrary bytes directly to `out` without
+/// intermediate `String` allocation.
+pub(crate) fn write_lowercase_hex(out: &mut impl std::fmt::Write, bytes: &[u8]) -> std::fmt::Result {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        let pair = [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 0x0f)]];
+        // SAFETY-FREE: `HEX` contains only ASCII bytes (`0..=9`, `a..=f`).
+        let s = match &pair {
+            [hi, lo] => [*hi as char, *lo as char],
+        };
+        out.write_char(s[0])?;
+        out.write_char(s[1])?;
+    }
+    Ok(())
+}
+
 /// Lowercase SHA-256 hex over stable byte material.
 #[must_use]
 pub fn stable_sha256_hex(bytes: &[u8]) -> String {
@@ -62,11 +78,20 @@ pub fn stable_sha256_hex(bytes: &[u8]) -> String {
 /// sequence.
 #[must_use]
 pub fn stable_sha256_hex_parts(parts: &[&[u8]]) -> String {
+    lowercase_hex(&stable_sha256_parts(parts))
+}
+
+/// Raw SHA-256 over concatenated byte material — the bytes
+/// [`stable_sha256_hex_parts`] renders, for a caller that keys or truncates the
+/// digest itself instead of printing it. The same injectivity caveat applies: fix
+/// every part's length or carry a separator.
+#[must_use]
+pub fn stable_sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
     }
-    lowercase_hex(&hasher.finalize())
+    hasher.finalize().into()
 }
 
 /// Lowercase SHA-256 hex over everything `reader` yields.
@@ -185,6 +210,11 @@ mod tests {
         );
         assert_eq!(
             stable_sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+        // The raw form is the bytes the hex form prints.
+        assert_eq!(
+            lowercase_hex(&stable_sha256_parts(&[b"a", b"bc"])),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         );
         // Parts hash exactly the concatenation — no injected separator, which

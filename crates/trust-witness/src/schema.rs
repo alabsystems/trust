@@ -26,7 +26,12 @@
 // the ABI (an `as_packed` byte after the safety byte, decoded via
 // `ExternAbi::from_packed`), re-admitting non-Rust-ABI fn-ptr TYPES that v3
 // conservatively escaped. The byte format changed, so v4 stores must miss cleanly.
-pub const SCHEMA_VERSION: &str = "trust.typeck-witness.v6";
+// v7 (2026-10-21): admission epoch for the exhaustive TypeckResults field
+// census and the previously omitted offloads_to_check empty guard. The byte
+// grammar is unchanged; invalidate v6 witnesses that could have dropped these
+// deferred semantic checks. Pending region goals remain an explicitly excluded
+// error-only diagnostic surface, not newly encoded or proof-bearing state.
+pub const SCHEMA_VERSION: &str = "trust.typeck-witness.v7";
 
 /// Magic prefix on every per-root witness payload (replay-capable form:
 /// full 128-bit `DefPathHash`es, distinct from the size-only P0WF probe).

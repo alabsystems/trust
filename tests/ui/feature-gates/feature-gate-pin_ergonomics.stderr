@@ -298,11 +298,11 @@ LL |         ref pin const w: i32,
    = help: add `#![feature(pin_ergonomics)]` to the crate attributes to enable
    = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
 
-error[E0658]: the `#[pin_v2]` attribute is an experimental feature
-  --> $DIR/feature-gate-pin_ergonomics.rs:5:1
+error[E0658]: the `pin_v2` attribute is an experimental feature
+  --> $DIR/feature-gate-pin_ergonomics.rs:5:3
    |
 LL | #[pin_v2]
-   | ^^^^^^^^^
+   |   ^^^^^^
    |
    = note: see issue #130494 <https://github.com/rust-lang/rust/issues/130494> for more information
    = help: add `#![feature(pin_ergonomics)]` to the crate attributes to enable
@@ -375,6 +375,7 @@ LL |     x.foo();
 note: `Foo::foo` takes ownership of the receiver `self`, which moves `x`
   --> $DIR/feature-gate-pin_ergonomics.rs:9:12
    |
+LL | impl Foo {
 LL |     fn foo(self: Pin<&mut Self>) {}
    |            ^^^^
 help: consider reborrowing the `Pin` instead of moving it

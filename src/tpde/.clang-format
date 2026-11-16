@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2024 Tobias Schwarz <tobias.schwarz@tum.de>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+---
+BasedOnStyle: LLVM
+Language: Cpp
+AlignArrayOfStructures: Right
+#AlignConsecutiveAssignments:
+#  Enabled: true
+#  AcrossEmptyLines: false
+#  AcrossComments: true
+#  AlignCompound: true
+#  # AlignFunctionPointers: false
+#  PadOperators: true
+#AlignConsecutiveBitFields: AcrossComments
+#AlignConsecutiveDeclarations: AcrossComments
+#AlignConsecutiveMacros: AcrossComments
+#AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortEnumsOnASingleLine: false
+AlwaysBreakTemplateDeclarations: Yes
+BinPackArguments: false
+BinPackParameters: false
+IndentPPDirectives: BeforeHash
+IndentWrappedFunctionNames: true
+InsertBraces: true
+InsertNewlineAtEOF: true
+InsertTrailingCommas: Wrapped
+KeepEmptyLinesAtTheStartOfBlocks: false
+LineEnding: LF
+MaxEmptyLinesToKeep: 2
+PackConstructorInitializers: NextLine
+SortUsingDeclarations: Lexicographic

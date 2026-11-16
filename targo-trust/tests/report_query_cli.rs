@@ -223,7 +223,7 @@ fn report_query_cli_preserves_skipped_and_runtime_checked_splits() {
 }
 
 #[test]
-fn report_query_cli_fails_closed_on_legacy_proved_without_structured_evidence() {
+fn report_query_cli_refuses_a_pre_canonical_report_with_proved_rows() {
     let temp = TempDir::new("targo-trust-report-query-legacy-proved");
     let report_path = temp.path().join("legacy-report.json");
     fs::write(
@@ -244,13 +244,12 @@ fn report_query_cli_fails_closed_on_legacy_proved_without_structured_evidence() 
     assert_eq!(
         json_output.status.code(),
         Some(2),
-        "legacy bare Proved rows must fail the saved-report authority gate\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "a pre-canonical report is refused, never converted\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(stdout.trim().is_empty(), "authority gate failures must not render JSON\n{stdout}");
+    assert!(stdout.trim().is_empty(), "a refused report must not render JSON\n{stdout}");
     assert!(
-        stderr.contains("saved report authority gate failed")
-            && stderr.contains("lacked live verifier replay authority"),
-        "legacy authority gate failure should be clear\nstderr:\n{stderr}"
+        stderr.contains("no older saved report format is read"),
+        "the refusal names the format rule\nstderr:\n{stderr}"
     );
 }
 

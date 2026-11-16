@@ -81,7 +81,8 @@ impl ProofChain {
     /// grants proof authority.
     pub fn to_dep_graph(&self) -> DepGraph {
         let present: BTreeSet<String> = self.certificates.keys().cloned().collect();
-        self.to_dep_graph_with_records(&present)
+        let all_functions = self.all_functions();
+        self.to_dep_graph_with_records(&all_functions, &present)
     }
 
     fn all_functions(&self) -> BTreeSet<String> {
@@ -93,11 +94,15 @@ impl ProofChain {
             .collect()
     }
 
-    fn to_dep_graph_with_records(&self, records: &BTreeSet<String>) -> DepGraph {
+    fn to_dep_graph_with_records(
+        &self,
+        all_functions: &BTreeSet<String>,
+        records: &BTreeSet<String>,
+    ) -> DepGraph {
         let mut graph = DepGraph::new();
-        for func in self.all_functions() {
-            let callees = self.call_graph.get(&func).cloned().unwrap_or_default();
-            graph.add_function(&func, callees, records.contains(&func));
+        for func in all_functions {
+            let callees = self.call_graph.get(func).cloned().unwrap_or_default();
+            graph.add_function(func, callees, records.contains(func));
         }
 
         graph
@@ -167,32 +172,32 @@ pub fn verify_proof_chain(chain: &ProofChain) -> ChainVerificationResult {
     // Check each record's public integrity metadata. This deliberately does
     // not imply proof replay or trusted provenance.
     let mut invalid_certs = Vec::new();
+    let mut integrity_valid = BTreeSet::new();
     for (function, cert) in &chain.certificates {
         if cert.function != *function
             || !cert.verify_vc_hash()
             || !ChainValidator::validate(&cert.chain).valid
         {
             invalid_certs.push(function.clone());
+        } else {
+            integrity_valid.insert(function.clone());
         }
     }
-    invalid_certs.sort();
-    let invalid_set: BTreeSet<&str> = invalid_certs.iter().map(String::as_str).collect();
-    let integrity_valid: BTreeSet<String> = chain
-        .certificates
-        .keys()
-        .filter(|function| !invalid_set.contains(function.as_str()))
-        .cloned()
-        .collect();
 
-    let dep_graph = chain.to_dep_graph_with_records(&integrity_valid);
+    let dep_graph = chain.to_dep_graph_with_records(&all_functions, &integrity_valid);
     let sccs = dep_graph.find_sccs();
 
     // Find every absent record, including a root/caller that appears only as a
-    // call-graph key. Build reverse edges once for deterministic diagnostics.
-    let mut depended_on_by: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // call-graph key. Build reverse edges only for callees missing certificates.
+    let mut depended_on_by: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for (caller, callees) in &chain.call_graph {
         for callee in callees {
-            depended_on_by.entry(callee.clone()).or_default().insert(caller.clone());
+            if !chain.certificates.contains_key(callee.as_str()) {
+                depended_on_by
+                    .entry(callee.as_str())
+                    .or_default()
+                    .insert(caller.as_str());
+            }
         }
     }
     let gaps: Vec<ChainGap> = all_functions
@@ -201,8 +206,8 @@ pub fn verify_proof_chain(chain: &ProofChain) -> ChainVerificationResult {
         .map(|function| ChainGap {
             function: function.clone(),
             depended_on_by: depended_on_by
-                .get(function)
-                .map(|callers| callers.iter().cloned().collect())
+                .get(function.as_str())
+                .map(|callers| callers.iter().map(|&s| s.to_string()).collect())
                 .unwrap_or_default(),
         })
         .collect();
@@ -226,6 +231,9 @@ pub fn verify_proof_chain(chain: &ProofChain) -> ChainVerificationResult {
     loop {
         let before = covered.len();
         for function in &integrity_valid {
+            if covered.contains(function) {
+                continue;
+            }
             let callees = chain.call_graph.get(function).map(Vec::as_slice).unwrap_or(&[]);
             if callees.iter().all(|callee| covered.contains(callee)) {
                 covered.insert(function.clone());

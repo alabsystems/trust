@@ -1,13 +1,25 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-PF): a ledgered borrow pointer may be stored into a THIN-ref
 //! struct/tuple FIELD (`Holder { r: &x, .. }`, `(&a, &b)`) and the aggregate
 //! handed on to a call — the measured shape (`AlignedDrop { drop_count:
 //! &drop_count, .. }`, `Droppable(&mut xv, 1)`). The three escape routes
 //! (return, memory, call) are each already closed — see
-//! `borrow_ptr_field_admissible`. Reading the pointer lane back through the
-//! `Field` arm is a separate, still-refused question. Under `strict`.
+//! `borrow_ptr_field_admissible`. Under `strict`.
+//!
+//! UPDATED 2026-09-16. Two sentences this doc used to carry are retired:
+//! "reading the pointer lane back through the `Field` arm is still refused"
+//! (wave-PR admits it, unledgered) and the implicit "only a NAMED local's
+//! snapshot is admitted" — an RVALUE temporary rustc provably cannot promote
+//! (`&f(x)`, a non-`#[rustc_promotable]` `FnDef` call, or an aggregate holding
+//! one) is admitted too, on the same borrowck argument; see
+//! `trust_ir_lower_rvalue_snapshot_field.rs` and the predicate
+//! `rvalue_temp_is_unpromotable`. This file's shapes are all named locals and
+//! are a CONTROL for that landing: byte-identical.
 
 struct Holder<'a> {
     r: &'a u32,

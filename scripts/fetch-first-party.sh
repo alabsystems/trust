@@ -8,9 +8,12 @@
 #
 #     <name> <public-git-url> <40-hex-revision>
 #
-# written at export time by publish/transforms.sh, where every revision is a
-# ledger-attested public release on the same history line as the private
-# development pin. This script clones each sibling at exactly that revision.
+# written at export time by publish/transforms.sh (T5), where every revision
+# is the sibling's newest ledger-attested public release, projected FORWARD
+# from the private development pin (its source descends from, or is, that pin;
+# a release behind the pin is refused, never shipped). This script clones each
+# sibling at exactly that revision. (T5 writes it from the gitlinks of the commit
+# the publication engine exported, named to it as CAPTURED_COMMIT.)
 #
 # In a DEVELOPMENT checkout there is no PINS.txt (first-party/ is populated by
 # real submodules); use `git submodule update --init` there instead.

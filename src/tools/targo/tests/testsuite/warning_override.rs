@@ -102,6 +102,55 @@ fn config() {
         .run();
 }
 
+// Trust: changing diagnostic transport must not change the warning policy.
+#[cargo_test]
+fn json_warning_policy_rejects_cold_lints() {
+    let p = make_project_with_rustc_warning();
+    for format in [
+        "json",
+        "json-diagnostic-rendered-ansi",
+        "json-render-diagnostics",
+    ] {
+        p.cargo("check")
+            .arg(format!("--message-format={format}"))
+            .arg("--target-dir")
+            .arg(p.root().join(format))
+            .env("CARGO_BUILD_WARNINGS", "deny")
+            .with_status(101)
+            .with_stderr_contains("[ERROR] warnings are denied by `build.warnings` configuration")
+            .run();
+    }
+}
+
+// Trust: a Fresh unit replays cached diagnostics through the same policy.
+#[cargo_test]
+fn json_warning_policy_rechecks_cached_lints() {
+    let p = make_project_with_rustc_warning();
+    p.cargo("check --message-format=json")
+        .env("CARGO_BUILD_WARNINGS", "warn")
+        .run();
+    p.cargo("check --message-format=json")
+        .env("CARGO_BUILD_WARNINGS", "deny")
+        .with_status(101)
+        .with_stderr_contains("[ERROR] warnings are denied by `build.warnings` configuration")
+        .run();
+    p.cargo("check --message-format=json")
+        .env("CARGO_BUILD_WARNINGS", "allow")
+        .run();
+}
+
+// Trust: keep-going still refuses after collecting every local target's lints.
+#[cargo_test]
+fn json_warning_policy_keep_going_rejects_all_targets() {
+    let p = make_project_with_rustc_warning();
+    p.cargo("check --all-targets --keep-going --message-format=json")
+        .env("CARGO_BUILD_WARNINGS", "deny")
+        .with_status(101)
+        .with_stderr_contains("[ERROR] warnings are denied by `build.warnings` configuration")
+        .with_stdout_contains(r#"{"reason":"build-finished","success":false}"#)
+        .run();
+}
+
 #[cargo_test]
 fn unknown_value() {
     let p = make_project_with_rustc_warning();
@@ -255,10 +304,9 @@ fn lint_parse_pass() {
         .build();
 
     // Verify the lints fire
-    p.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("fetch")
         .with_stderr_data(str![[r#"
-[WARNING] `package.homepage` is redundant with another manifest field
+[WARNING] `package.homepage` is redundant with `package.repository`
  --> Cargo.toml:8:24
   |
 7 |             repository = "https://github.com/rust-lang/cargo/"
@@ -272,10 +320,9 @@ fn lint_parse_pass() {
 
 "#]])
         .run();
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
-[WARNING] `package.homepage` is redundant with another manifest field
+[WARNING] `package.homepage` is redundant with `package.repository`
  --> Cargo.toml:8:24
   |
 7 |             repository = "https://github.com/rust-lang/cargo/"
@@ -292,14 +339,12 @@ fn lint_parse_pass() {
 "#]])
         .run();
 
-    p.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("fetch")
         .arg("--config")
         .arg("build.warnings='allow'")
         .with_stderr_data(str![""])
         .run();
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .arg("--config")
         .arg("build.warnings='allow'")
         .with_stderr_data(str![[r#"
@@ -308,13 +353,12 @@ fn lint_parse_pass() {
 "#]])
         .run();
 
-    p.cargo("fetch -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("fetch")
         .arg("--config")
         .arg("build.warnings='deny'")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[WARNING] `package.homepage` is redundant with another manifest field
+[WARNING] `package.homepage` is redundant with `package.repository`
  --> Cargo.toml:8:24
   |
 7 |             repository = "https://github.com/rust-lang/cargo/"
@@ -329,13 +373,12 @@ fn lint_parse_pass() {
 
 "#]])
         .run();
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .arg("--config")
         .arg("build.warnings='deny'")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[WARNING] `package.homepage` is redundant with another manifest field
+[WARNING] `package.homepage` is redundant with `package.repository`
  --> Cargo.toml:8:24
   |
 7 |             repository = "https://github.com/rust-lang/cargo/"
@@ -384,31 +427,29 @@ fn lint_build_result_pass() {
         .build();
 
     // Verify the lints fire
-    p.cargo("check --all-targets -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check --all-targets")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] unused v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
 
-    p.cargo("check --all-targets -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check --all-targets")
         .arg("--config")
         .arg("build.warnings='allow'")
         .with_stderr_data(str![[r#"
@@ -417,20 +458,19 @@ fn lint_build_result_pass() {
 "#]])
         .run();
 
-    p.cargo("check --all-targets -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check --all-targets")
         .arg("--config")
         .arg("build.warnings='deny'")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [ERROR] warnings are denied by `build.warnings` configuration
@@ -620,6 +660,9 @@ fn cap_lints_deny() {
 
                 [dependencies]
                 has_warning = "1"
+
+                [lints.cargo]
+                default = "allow"
             "#
             ),
         )
@@ -630,7 +673,10 @@ fn cap_lints_deny() {
     p.cargo("check -vv")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ * [new ref]         HEAD       -> origin/HEAD
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] has_warning v1.0.0 (registry `dummy-registry`)
 [CHECKING] has_warning v1.0.0
@@ -695,6 +741,9 @@ fn cap_lints_allow() {
 
                 [dependencies]
                 has_warning = "1"
+
+                [lints.cargo]
+                default = "allow"
             "#
             ),
         )
@@ -705,7 +754,10 @@ fn cap_lints_allow() {
     p.cargo("check -vv")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ * [new ref]         HEAD       -> origin/HEAD
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] has_warning v1.0.0 (registry `dummy-registry`)
 [CHECKING] has_warning v1.0.0
@@ -743,5 +795,46 @@ fn cap_lints_allow() {
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
+        .run();
+}
+
+#[cargo_test]
+fn warnings_and_errors() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2021"
+            "#
+            ),
+        )
+        .file(
+            "src/main.rs",
+            r#"use std::io;
+
+fn main() {
+    let _a = UnknownType;
+}"#,
+        )
+        .build();
+
+    p.cargo("check")
+        .arg("--config")
+        .arg("build.warnings='deny'")
+        .with_stderr_data(str![[r#"
+[CHECKING] foo v0.0.1 ([ROOT]/foo)
+error[..]
+...
+[WARNING] [..]
+...
+[ERROR] `foo` (bin "foo") generated 1 warning
+[ERROR] could not compile `foo` (bin "foo") due to 1 previous error; 1 warning emitted
+
+"#]])
+        .with_status(101)
         .run();
 }

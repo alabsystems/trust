@@ -1,26 +1,29 @@
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::LangItem;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::TyCtxtInferExt;
-use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::traits::{BuiltinImplSource, CodegenObligationError};
 use rustc_middle::ty::{
-    self, ClosureKind, GenericArgsRef, Instance, PseudoCanonicalInput, TyCtxt, TypeVisitableExt,
+    self, ClosureKind, GenericArgs, Instance, PseudoCanonicalInput, TyCtxt, TypeVisitableExt,
     Unnormalized,
 };
-use rustc_span::sym;
+use rustc_span::{bug, sym};
 use rustc_trait_selection::traits;
 use tracing::debug;
 use traits::translate_args;
 
-use crate::diagnostics::UnexpectedFnPtrAssociatedItem;
-
 fn resolve_instance_raw<'tcx>(
     tcx: TyCtxt<'tcx>,
-    key: ty::PseudoCanonicalInput<'tcx, (DefId, GenericArgsRef<'tcx>)>,
+    key: ty::PseudoCanonicalInput<'tcx, (DefId, GenericArgs<'tcx>)>,
 ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
     let PseudoCanonicalInput { typing_env, value: (def_id, args) } = key;
+
+    // Trust: resolving an instance may upgrade to PostAnalysis or demand MIR.
+    if typing_env.typing_mode().is_opaque_analysis() {
+        return Ok(None);
+    }
 
     let result = if let Some(trait_def_id) = tcx.trait_of_assoc(def_id) {
         debug!(" => associated item, attempting to find impl in typing_env {:#?}", typing_env);
@@ -91,6 +94,12 @@ fn resolve_instance_raw<'tcx>(
         } else if tcx.is_async_drop_in_place_coroutine(def_id) {
             let ty = args.type_at(0);
             ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlue(def_id, ty))
+        } else if tcx.def_kind(def_id) == DefKind::Fn
+            && let Some(name) = tcx.codegen_fn_attrs(def_id).symbol_name
+            && name.as_str().starts_with("llvm.")
+        {
+            debug!(" => LLVM intrinsic");
+            ty::InstanceKind::LlvmIntrinsic(def_id)
         } else {
             debug!(" => free item");
             ty::InstanceKind::Item(def_id)
@@ -107,7 +116,7 @@ fn resolve_associated_item<'tcx>(
     trait_item_id: DefId,
     typing_env: ty::TypingEnv<'tcx>,
     trait_id: DefId,
-    rcvr_args: GenericArgsRef<'tcx>,
+    rcvr_args: GenericArgs<'tcx>,
 ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
     debug!(?trait_item_id, ?typing_env, ?trait_id, ?rcvr_args, "resolve_associated_item");
 
@@ -159,7 +168,10 @@ fn resolve_associated_item<'tcx>(
                 match typing_env.typing_mode().assert_not_erased() {
                     ty::TypingMode::Coherence
                     | ty::TypingMode::Typeck { .. }
-                    | ty::TypingMode::PostTypeckUntilBorrowck { .. }
+                    | ty::TypingMode::OpaqueAnalysis // Trust: retain non-revealing analysis behavior.
+                    | ty::TypingMode::PostTypeckThroughBorrowck { .. }
+                    | ty::TypingMode::OpaqueBoundsOnly
+                    | ty::TypingMode::Reflection
                     | ty::TypingMode::PostBorrowck { .. } => false,
                     ty::TypingMode::PostAnalysis | ty::TypingMode::Codegen => {
                         !trait_ref.still_further_specializable()
@@ -170,7 +182,8 @@ fn resolve_associated_item<'tcx>(
                 return Ok(None);
             }
 
-            let typing_env = typing_env.with_post_analysis_normalized(tcx);
+            let PseudoCanonicalInput { typing_env, value: rcvr_args } =
+                typing_env.with_post_analysis_normalized_invalidating_rigid_aliases(tcx, rcvr_args);
             let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
             let args = rcvr_args.rebase_onto(tcx, trait_def_id, impl_data.args);
             let args = translate_args(
@@ -191,14 +204,12 @@ fn resolve_associated_item<'tcx>(
             // and const-prop (and also some lints).
             let self_ty = rcvr_args.type_at(0);
             if !self_ty.is_known_rigid() {
-                let predicates = tcx
-                    .predicates_of(impl_data.impl_def_id)
-                    .instantiate(tcx, impl_data.args)
-                    .predicates;
+                let clauses =
+                    tcx.clauses_of(impl_data.impl_def_id).instantiate(tcx, impl_data.args).clauses;
                 let sized_def_id = tcx.lang_items().sized_trait();
                 // If we find a `Self: Sized` bound on the item, then we know
                 // that `dyn Trait` can certainly never apply here.
-                if !predicates.into_iter().filter_map(|p| p.as_trait_clause()).any(|clause| {
+                if !clauses.into_iter().filter_map(|p| p.as_trait_clause()).any(|clause| {
                     Some(clause.def_id()) == sized_def_id
                         && clause.skip_binder().self_ty() == self_ty
                 }) {
@@ -251,15 +262,17 @@ fn resolve_associated_item<'tcx>(
                 // We only resolve totally substituted vtable entries.
                 None
             } else {
-                let vtable_base = tcx.first_method_vtable_slot(trait_ref);
-                let offset = tcx
-                    .own_existential_vtable_entries(trait_id)
-                    .iter()
-                    .copied()
-                    .position(|def_id| def_id == trait_item_id);
-                offset.map(|offset| Instance {
-                    def: ty::InstanceKind::Virtual(trait_item_id, vtable_base + offset),
-                    args: rcvr_args,
+                tcx.first_method_vtable_slot(trait_ref).and_then(|vtable_base| {
+                    let offset = tcx
+                        .own_existential_vtable_entries(trait_id)
+                        .iter()
+                        .copied()
+                        .position(|def_id| def_id == trait_item_id);
+
+                    offset.map(|offset| Instance {
+                        def: ty::InstanceKind::Virtual(trait_item_id, vtable_base + offset),
+                        args: rcvr_args,
+                    })
                 })
             }
         }
@@ -291,22 +304,28 @@ fn resolve_associated_item<'tcx>(
                     Some(ty::Instance::new_raw(trait_item_id, args))
                 }
             } else if tcx.is_lang_item(trait_ref.def_id, LangItem::FnPtrTrait) {
-                if tcx.is_lang_item(trait_item_id, LangItem::FnPtrAddr) {
-                    let self_ty = trait_ref.self_ty();
-                    if !matches!(self_ty.kind(), ty::FnPtr(..)) {
-                        return Ok(None);
-                    }
+                let self_ty = trait_ref.self_ty();
+                if !matches!(self_ty.kind(), ty::FnPtr(..)) {
+                    return Ok(None);
+                }
+                if tcx.is_lang_item(trait_item_id, LangItem::FnPtrAsPtr) {
                     Some(Instance {
-                        def: ty::InstanceKind::Shim(ty::ShimKind::FnPtrAddr(
+                        def: ty::InstanceKind::Shim(ty::ShimKind::FnPtrAsPtr(
+                            trait_item_id,
+                            self_ty,
+                        )),
+                        args: rcvr_args,
+                    })
+                } else if tcx.is_lang_item(trait_item_id, LangItem::FnPtrFromPtr) {
+                    Some(Instance {
+                        def: ty::InstanceKind::Shim(ty::ShimKind::FnPtrFromPtr(
                             trait_item_id,
                             self_ty,
                         )),
                         args: rcvr_args,
                     })
                 } else {
-                    tcx.dcx().emit_fatal(UnexpectedFnPtrAssociatedItem {
-                        span: tcx.def_span(trait_item_id),
-                    })
+                    Some(Instance { def: ty::InstanceKind::Item(trait_item_id), args: rcvr_args })
                 }
             } else if let Some(target_kind) = tcx.fn_trait_kind_from_def_id(trait_ref.def_id) {
                 // FIXME: This doesn't check for malformed libcore that defines, e.g.,

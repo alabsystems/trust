@@ -1,0 +1,21 @@
+// Source of the `stamped_genuine_core/*.json` dumps (wave-19 review, 2026-10-09).
+// `fakecore` is a verify-off `--crate-name core -C metadata=fakecore` rlib
+// (`pub fn hello() -> u32 { 7 }`); with it in the graph the extractor stamps the
+// GENUINE core's paths `__trust_crate@414739228a72f04f::core::…`. Built with the
+// stage 1 of `46e9afaf95`: `--edition 2021 -Ztrust-verify=on -Ztrust-policy=advisory
+// --crate-type lib --extern fakecore=<dir>/libcore.rlib -Ztrust-dump=mir-only:<dir>`.
+// A second crate named `core` in the graph makes the extractor stamp the GENUINE core.
+extern crate fakecore as _;
+pub fn abs_unguarded(x: i32) -> i32 {
+    x.abs()
+}
+pub fn abs_guarded(x: i32) -> i32 {
+    if x != i32::MIN { x.abs() } else { 0 }
+}
+pub fn unchecked_add_unguarded(a: u32, b: u32) -> u32 {
+    // SAFETY: none; the row is the point.
+    unsafe { a.unchecked_add(b) }
+}
+pub fn pow_unguarded(a: u32, e: u32) -> u32 {
+    a.pow(e)
+}

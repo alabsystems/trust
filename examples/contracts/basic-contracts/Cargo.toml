@@ -9,5 +9,4 @@ publish = false
 [trust]
 enabled = true
 level = "L2"
-timeout_ms = 5000
 skip_functions = []

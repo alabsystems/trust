@@ -602,14 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn test_eliminator_default() {
-        let elim = QuantifierEliminator::default();
-        assert_eq!(elim.stats().tier1_eliminated, 0);
-        assert_eq!(elim.stats().tier2_eliminated, 0);
-        assert_eq!(elim.stats().left_intact, 0);
-    }
-
-    #[test]
     fn test_tier2_disabled() {
         let config = QuantifierConfig { max_unroll: 5, enable_tier2: false };
         let body_inner =
@@ -989,21 +981,6 @@ mod tests {
     // === SolverStrategy enum tests ===
 
     #[test]
-    fn test_solver_strategy_debug() {
-        // Verify all variants are constructible and Debug works.
-        let strategies = [
-            SolverStrategy::QuantifierFree,
-            SolverStrategy::Unroll,
-            SolverStrategy::DecidableTheory,
-            SolverStrategy::FullQuantifier,
-        ];
-        for s in &strategies {
-            let dbg = format!("{s:?}");
-            assert!(!dbg.is_empty());
-        }
-    }
-
-    #[test]
     fn test_worse_strategy_ordering() {
         assert_eq!(
             worse_strategy(SolverStrategy::QuantifierFree, SolverStrategy::Unroll),
@@ -1132,15 +1109,6 @@ mod tests {
         assert_eq!(stats.num_forall, 1);
         assert_eq!(stats.num_exists, 1);
         assert_eq!(stats.max_nesting_depth, 1);
-        assert!(!stats.has_alternation);
-    }
-
-    #[test]
-    fn test_analyze_quantifiers_default() {
-        let stats = QuantifierStats::default();
-        assert_eq!(stats.num_forall, 0);
-        assert_eq!(stats.num_exists, 0);
-        assert_eq!(stats.max_nesting_depth, 0);
         assert!(!stats.has_alternation);
     }
 

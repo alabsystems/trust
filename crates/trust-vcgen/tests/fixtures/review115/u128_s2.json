@@ -1,0 +1,538 @@
+{
+  "name": "s2",
+  "def_path": "s2::s2",
+  "span": {
+    "file": "s2.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 5,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 128
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Repeat": [
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        8
+                      ]
+                    }
+                  },
+                  128
+                ]
+              },
+              "span": {
+                "file": "s2.rs",
+                "line_start": 2,
+                "col_start": 12,
+                "line_end": 2,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Constant": {
+                      "Int": 121
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "s2.rs",
+                "line_start": 3,
+                "col_start": 12,
+                "line_end": 3,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        128,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "s2.rs",
+                "line_start": 3,
+                "col_start": 12,
+                "line_end": 3,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": {
+              "Overflow": "Shr"
+            },
+            "target": 1,
+            "span": {
+              "file": "s2.rs",
+              "line_start": 3,
+              "col_start": 12,
+              "line_end": 3,
+              "col_end": 22
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Shr",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 121
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "s2.rs",
+                "line_start": 3,
+                "col_start": 12,
+                "line_end": 3,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": true
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "s2.rs",
+                "line_start": 3,
+                "col_start": 12,
+                "line_end": 3,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 64
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "s2.rs",
+                "line_start": 4,
+                "col_start": 6,
+                "line_end": 4,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 9,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 2,
+            "span": {
+              "file": "s2.rs",
+              "line_start": 4,
+              "col_start": 6,
+              "line_end": 4,
+              "col_end": 14
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 9,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "s2.rs",
+                "line_start": 4,
+                "col_start": 6,
+                "line_end": 4,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "s2.rs",
+                "line_start": 4,
+                "col_start": 6,
+                "line_end": 4,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        128,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "s2.rs",
+                "line_start": 4,
+                "col_start": 4,
+                "line_end": 4,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 3,
+            "span": {
+              "file": "s2.rs",
+              "line_start": 4,
+              "col_start": 4,
+              "line_end": 4,
+              "col_end": 24
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      {
+                        "Index": 7
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "s2.rs",
+                "line_start": 4,
+                "col_start": 4,
+                "line_end": 4,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -212,13 +212,8 @@ fn write_header(out: &mut String, path: &[&str], array: bool) {
     if !out.is_empty() {
         out.push('\n');
     }
-    let joined =
-        path.iter().map(|part| render_key(part)).collect::<Vec<_>>().join(".");
-    let _ = if array {
-        writeln!(out, "[[{joined}]]")
-    } else {
-        writeln!(out, "[{joined}]")
-    };
+    let joined = path.iter().map(|part| render_key(part)).collect::<Vec<_>>().join(".");
+    let _ = if array { writeln!(out, "[[{joined}]]") } else { writeln!(out, "[{joined}]") };
 }
 
 /// A value in `key = value` position, inside an array, or inside an inline
@@ -317,8 +312,9 @@ pub(crate) fn render_key(key: &str) -> String {
 /// reasoning that the acceptance gate measures value preservation and every
 /// spelling preserves the value. That reasoning was right and the decision was
 /// wrong: `tests/js262/divergence-audit.toml` — a 23,000-line ledger this
-/// repository's own tooling rewrites — contains a `reason` string holding both
-/// a `"` and a `'`, so the simple rule reprinted it with escapes and turned a
+/// repository's own tooling rewrote until 2026-11-10 — contained a `reason`
+/// string holding both a `"` and a `'`, so the simple rule reprinted it with
+/// escapes and turned a
 /// no-op regeneration into a diff on every entry. Cosmetic differences are
 /// cheap right up until they land in a reviewed file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -581,10 +577,7 @@ mod tests {
         // The rule this crate exists to get right. If `sub` were written first,
         // `scalar = 1` would land INSIDE `[sub]` and the document would parse.
         let doc = document(
-            &table(&[
-                ("sub", Node::Table(table(&[("inner", int(2))]))),
-                ("scalar", int(1)),
-            ]),
+            &table(&[("sub", Node::Table(table(&[("inner", int(2))]))), ("scalar", int(1))]),
             Style::Compact,
         );
         assert_eq!(doc, "scalar = 1\n\n[sub]\ninner = 2\n");
@@ -615,16 +608,13 @@ mod tests {
         );
         // An empty array of tables has no tables to write blocks for. Written as
         // blocks it would disappear; written inline it survives.
-        assert_eq!(
-            document(&table(&[("e", Node::Array(Vec::new()))]), Style::Compact),
-            "e = []\n"
-        );
+        assert_eq!(document(&table(&[("e", Node::Array(Vec::new()))]), Style::Compact), "e = []\n");
     }
 
     #[test]
     fn a_sub_table_of_an_array_element_is_headed_by_the_key_not_the_index() {
         // `[entries.expectation]`, not `[entries[0].expectation]`. This is the
-        // shape `tests/js262/baseline.toml` is written in.
+        // shape the deleted `tests/js262/baseline.toml` ledger was written in.
         let element = Node::Table(table(&[
             ("id", Node::String("x".to_string())),
             ("expectation", Node::Table(table(&[("rule", int(1))]))),
@@ -731,7 +721,10 @@ mod tests {
             "k = [\n    1,\n    2,\n]\n"
         );
         // Length 0 and 1 stay inline in both styles.
-        assert_eq!(document(&table(&[("k", Node::Array(vec![int(1)]))]), Style::Pretty), "k = [1]\n");
+        assert_eq!(
+            document(&table(&[("k", Node::Array(vec![int(1)]))]), Style::Pretty),
+            "k = [1]\n"
+        );
         assert_eq!(document(&table(&[("k", Node::Array(vec![]))]), Style::Pretty), "k = []\n");
         // The outer array does not break, so it adds no indent level.
         assert_eq!(
@@ -745,10 +738,7 @@ mod tests {
     #[test]
     fn a_table_inside_an_array_is_written_inline() {
         let mixed = Node::Array(vec![Node::Table(table(&[("k", int(1))])), int(2)]);
-        assert_eq!(
-            document(&table(&[("m", mixed)]), Style::Compact),
-            "m = [{ k = 1 }, 2]\n"
-        );
+        assert_eq!(document(&table(&[("m", mixed)]), Style::Compact), "m = [{ k = 1 }, 2]\n");
         let empty_inline = Node::Array(vec![Node::Table(Vec::new()), int(2)]);
         assert_eq!(document(&table(&[("m", empty_inline)]), Style::Compact), "m = [{}, 2]\n");
     }

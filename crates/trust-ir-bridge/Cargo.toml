@@ -31,6 +31,9 @@ clean-expr = ["trust-ir/clean-expr"]
 # remains a stable, rustc-private-free translation crate. This edge is acyclic:
 # trust-mir-extract -> trust-vcgen, whose trust-router edge is dev-only.
 compiler-context = ["dep:trust-mir-extract"]
+# Explicit staged diagnostic only. Keep its full semantic validator out of
+# the default translation library's dependency closure.
+direct-contract-shadow = ["dep:trust-ir-build"]
 
 [dependencies]
 # Pure translation layer over trust-types data structures; no use of the
@@ -54,8 +57,8 @@ trust-types = { path = "../trust-types", default-features = false }
 trust-intbound = { workspace = true }
 trust-verifier-api = { workspace = true }
 # `binary` is a pure cfg-gate (`binary = []`, no deps) enabling the ratified
-# stable serializer behind `Module::stable_digest` — the canonical content-hash
-# `cache_key::module_stable_content_hash` exposes for verification caching.
+# stable serializer behind `Module::stable_digest`, which the native request
+# binds as the module digest.
 trust-ir = { workspace = true, features = ["serde", "binary"] }
 thiserror = { workspace = true }
 # `raw_value` (Step 6 increment 2, docs/design/DIRECT-LANE-PROOF-AUTHORITY.md):
@@ -67,8 +70,10 @@ serde_json = { workspace = true, features = ["raw_value"] }
 # in the crate's transitive closure via trust-types/serde_json.
 serde = { workspace = true }
 trust-mir-extract = { path = "../trust-mir-extract", optional = true }
+trust-ir-build = { path = "../../first-party/trust-ir/crates/trust-ir-build", optional = true }
 
 [dev-dependencies]
+trust-wp-lib = { workspace = true, features = ["trust-ir-native"] }
 trust-ir = { workspace = true, features = ["binary", "fmt", "parser", "serde"] }
 trust-ir-build = { path = "../../first-party/trust-ir/crates/trust-ir-build" }
 # Trust-IR spine (dimension B, verification-verdict parity): the parity oracle

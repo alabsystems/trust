@@ -717,12 +717,6 @@ mod tests {
     // --- AuditAction tests ---
 
     #[test]
-    fn test_audit_action_equality() {
-        assert_eq!(AuditAction::SpecInserted, AuditAction::SpecInserted);
-        assert_ne!(AuditAction::SpecInserted, AuditAction::SpecModified);
-    }
-
-    #[test]
     fn test_audit_action_serialization() {
         let action = AuditAction::RewriteRolledBack;
         let json = serde_json::to_string(&action).unwrap();

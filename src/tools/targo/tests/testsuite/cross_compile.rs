@@ -494,7 +494,7 @@ fn linker() {
 please set bin.path in Cargo.toml
 [WARNING] `foo` (manifest) generated 1 warning
 [COMPILING] foo v0.5.0 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo --edition=2015 src/foo.rs [..]--crate-type bin --emit=[..]link[..]-C debuginfo=2 [..] -C metadata=[..] --out-dir [ROOT]/foo/target/[ALT_TARGET]/debug/deps --target [ALT_TARGET] -C linker=my-linker-tool -L dependency=[ROOT]/foo/target/[ALT_TARGET]/debug/deps -L dependency=[ROOT]/foo/target/debug/deps[..]`
+[RUNNING] `rustc --crate-name foo --edition=2015 src/foo.rs [..]--crate-type bin --emit=[..]link[..]-C debuginfo=2 [..] -C metadata=[..] --out-dir [ROOT]/foo/target/[ALT_TARGET]/debug/build/foo/[HASH]/out --target [ALT_TARGET] -C linker=my-linker-tool -L dependency=[ROOT]/foo/target/debug/build/foo/[HASH]/out[..]`
 [ERROR] linker `my-linker-tool` not found
 ...
 "#]])
@@ -560,8 +560,8 @@ fn cross_tests() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/lib.rs (target/[ALT_TARGET]/debug/deps/foo-[HASH][EXE])
-[RUNNING] unittests src/bin/bar.rs (target/[ALT_TARGET]/debug/deps/bar-[HASH][EXE])
+[RUNNING] unittests src/lib.rs (target/[ALT_TARGET]/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[RUNNING] unittests src/bin/bar.rs (target/[ALT_TARGET]/debug/build/foo/[HASH]/out/bar-[HASH][EXE])
 [DOCTEST] foo
 
 "#]])
@@ -644,8 +644,9 @@ fn cross_with_a_build_script() {
                         let mut path = PathBuf::from(env::var_os("OUT_DIR").unwrap());
                         assert_eq!(path.file_name().unwrap().to_str().unwrap(), "out");
                         path.pop();
-                        assert!(path.file_name().unwrap().to_str().unwrap()
-                                    .starts_with("foo-"));
+                        assert_eq!(path.file_name().unwrap().to_str().unwrap().len(), 16);
+                        path.pop();
+                        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "foo");
                         path.pop();
                         assert_eq!(path.file_name().unwrap().to_str().unwrap(), "build");
                         path.pop();
@@ -666,8 +667,8 @@ fn cross_with_a_build_script() {
         .arg(&target)
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
-[RUNNING] `rustc [..] build.rs [..] --out-dir [ROOT]/foo/target/debug/build/foo-[HASH] [..]
-[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
+[RUNNING] `rustc [..] build.rs [..] --out-dir [ROOT]/foo/target/debug/build/foo/[HASH]/out[..]
+[RUNNING] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/build_script_build`
 [RUNNING] `rustc [..] src/main.rs [..] --target [ALT_TARGET] [..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -767,19 +768,19 @@ fn build_script_needed_for_host_and_target() {
     p.cargo("build -v --target")
         .arg(&target)
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [COMPILING] d1 v0.0.0 ([ROOT]/foo/d1)
-[RUNNING] `rustc [..] d1/build.rs [..] --out-dir [ROOT]/foo/target/debug/build/d1-[HASH] [..]
-[RUNNING] `[ROOT]/foo/target/debug/build/d1-[HASH]/build-script-build`
-[RUNNING] `[ROOT]/foo/target/debug/build/d1-[HASH]/build-script-build`
-[RUNNING] `rustc [..] d1/src/lib.rs [..] --out-dir [ROOT]/foo/target/debug/deps [..]
-[RUNNING] `rustc [..] d1/src/lib.rs [..] --out-dir [ROOT]/foo/target/[ALT_TARGET]/debug/deps [..]
+[RUNNING] `rustc [..] d1/build.rs [..] --out-dir [ROOT]/foo/target/debug/build/d1/[HASH]/out[..]
+[RUNNING] `[ROOT]/foo/target/debug/build/d1/[HASH]/out/build_script_build`
+[RUNNING] `[ROOT]/foo/target/debug/build/d1/[HASH]/out/build_script_build`
+[RUNNING] `rustc [..] d1/src/lib.rs [..] --out-dir [ROOT]/foo/target/debug/build/d1/[HASH]/out [..]
+[RUNNING] `rustc [..] d1/src/lib.rs [..] --out-dir [ROOT]/foo/target/[ALT_TARGET]/debug/build/d1/[HASH]/out [..]
 [COMPILING] d2 v0.0.0 ([ROOT]/foo/d2)
-[RUNNING] `rustc [..] d2/src/lib.rs [..] --out-dir [ROOT]/foo/target/debug/deps [..]-L [ROOT]/foo/link-[HOST_TARGET]`
+[RUNNING] `rustc [..] d2/src/lib.rs [..] --out-dir [ROOT]/foo/target/debug/build/d2/[HASH]/out [..]-L [ROOT]/foo/link-[HOST_TARGET]`
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
-[RUNNING] `rustc [..] build.rs [..] --out-dir [ROOT]/foo/target/debug/build/foo-[HASH] [..]-L [ROOT]/foo/link-[HOST_TARGET]`
-[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
-[RUNNING] `rustc [..] src/main.rs [..] --out-dir [ROOT]/foo/target/[ALT_TARGET]/debug/deps --target [ALT_TARGET] [..]-L [ROOT]/foo/link-[ALT_TARGET]`
+[RUNNING] `rustc [..] build.rs [..] --out-dir [ROOT]/foo/target/debug/build/foo/[HASH]/out [..]-L [ROOT]/foo/link-[HOST_TARGET]`
+[RUNNING] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/build_script_build`
+[RUNNING] `rustc [..] src/main.rs [..] --out-dir [ROOT]/foo/target/[ALT_TARGET]/debug/build/foo/[HASH]/out --target [ALT_TARGET] [..]-L [ROOT]/foo/link-[ALT_TARGET]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]].unordered())
@@ -873,7 +874,7 @@ fn build_script_only_host() {
 
                 fn main() {
                     assert!(env::var("OUT_DIR").unwrap().replace("\\", "/")
-                                               .contains("target/debug/build/d1-"),
+                                               .contains("target/debug/build/d1/"),
                             "bad: {:?}", env::var("OUT_DIR"));
                 }
             "#,
@@ -943,14 +944,14 @@ fn build_script_with_platform_specific_dependencies() {
     p.cargo("build -v --target")
         .arg(&target)
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [COMPILING] d2 v0.0.0 ([ROOT]/foo/d2)
 [RUNNING] `rustc [..] d2/src/lib.rs [..]`
 [COMPILING] d1 v0.0.0 ([ROOT]/foo/d1)
 [RUNNING] `rustc [..] d1/src/lib.rs [..]`
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [RUNNING] `rustc [..] build.rs [..]`
-[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
+[RUNNING] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/build_script_build`
 [RUNNING] `rustc [..] src/lib.rs [..] --target [ALT_TARGET] [..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1194,12 +1195,12 @@ fn cross_test_dylib() {
     p.cargo("test --target")
         .arg(&target)
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/lib.rs (target/[ALT_TARGET]/debug/deps/foo-[HASH][EXE])
-[RUNNING] tests/test.rs (target/[ALT_TARGET]/debug/deps/test-[HASH][EXE])
+[RUNNING] unittests src/lib.rs (target/[ALT_TARGET]/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[RUNNING] tests/test.rs (target/[ALT_TARGET]/debug/build/foo/[HASH]/out/test-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -1256,7 +1257,7 @@ fn doctest_xcompile_linker() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo --edition=2015 src/lib.rs [..] --out-dir [ROOT]/foo/target/[ALT_TARGET]/debug/deps --target [ALT_TARGET] [..]
+[RUNNING] `rustc --crate-name foo --edition=2015 src/lib.rs [..] --out-dir [ROOT]/foo/target/[ALT_TARGET]/debug/build/foo/[HASH]/out --target [ALT_TARGET] [..]
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [DOCTEST] foo
 [RUNNING] `rustdoc [..] src/lib.rs [..]
@@ -1320,8 +1321,10 @@ fn host_linker_does_not_apply_to_binary_build() {
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("build -Z target-applies-to-host -Z host-config --target")
+    p.cargo("build --target")
         .arg(&target)
+        .arg("-Ztarget-applies-to-host")
+        .arg("-Zhost-config")
         .masquerade_as_nightly_cargo(&["target-applies-to-host", "host-config"])
         .with_status(101)
         // Need to omit some MSVC-specific diagnostics
@@ -1338,7 +1341,9 @@ fn host_linker_does_not_apply_to_binary_build() {
 
     // with target-applies-to-host=false,
     // host.linker should not be applied but target.linker
-    p.cargo("build -Z target-applies-to-host -Z host-config")
+    p.cargo("build")
+        .arg("-Ztarget-applies-to-host")
+        .arg("-Zhost-config")
         .masquerade_as_nightly_cargo(&["target-applies-to-host", "host-config"])
         .env("CARGO_TARGET_APPLIES_TO_HOST", "false")
         .with_status(101)
@@ -1365,8 +1370,10 @@ fn cross_with_host_config() {
 
     let p = project().file("src/main.rs", "fn main() {}").build();
 
-    p.cargo("build -Z target-applies-to-host -Z host-config --target")
+    p.cargo("build --target")
         .arg(&target)
+        .arg("-Ztarget-applies-to-host")
+        .arg("-Zhost-config")
         .masquerade_as_nightly_cargo(&["target-applies-to-host", "host-config"])
         .with_status(0)
         .run();

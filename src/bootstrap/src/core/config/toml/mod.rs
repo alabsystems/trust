@@ -8,14 +8,20 @@
 //! transformed and applied to the final `Config` struct.
 
 use serde::Deserialize;
-use serde_derive::Deserialize;
+// Trust: preserve standalone derives without colliding with serde/derive in
+// the embedding's unified feature set.
+use serde_derive::Deserialize as DeriveDeserialize;
 pub mod build;
 pub mod change_id;
 pub mod dist;
 pub mod install;
 pub mod llvm;
+pub mod pgo;
 pub mod rust;
 pub mod target;
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use build::Build;
 use change_id::{ChangeId, ChangeIdWrapper};
@@ -25,15 +31,17 @@ use llvm::Llvm;
 use rust::Rust;
 use target::TomlTarget;
 
-use crate::core::config::{Merge, ReplaceOpt};
-use crate::{Config, HashMap, HashSet, Path, PathBuf, exit, fs, t};
+use crate::core::config::toml::pgo::Pgo;
+use crate::core::config::{Config, Merge, ReplaceOpt};
+use crate::utils::change_tracker::{find_recent_config_change_ids, human_readable_changes};
+use crate::utils::helpers::{self, t};
 
 /// Structure of the `bootstrap.toml` file that configuration is read from.
 ///
 /// This structure uses `Decodable` to automatically decode a TOML configuration
 /// file into this format, and then this is traversed and written into the above
 /// `Config` structure.
-#[derive(Deserialize, Default)]
+#[derive(DeriveDeserialize, Default)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub(crate) struct TomlConfig {
     #[serde(flatten)]
@@ -44,6 +52,7 @@ pub(crate) struct TomlConfig {
     pub(super) rust: Option<Rust>,
     pub(super) target: Option<HashMap<String, TomlTarget>>,
     pub(super) dist: Option<Dist>,
+    pub(super) pgo: Option<Pgo>,
     pub(super) profile: Option<String>,
     pub(super) include: Option<Vec<PathBuf>>,
 }
@@ -53,7 +62,18 @@ impl Merge for TomlConfig {
         &mut self,
         parent_config_path: Option<PathBuf>,
         included_extensions: &mut HashSet<PathBuf>,
-        TomlConfig { build, install, llvm, rust, dist, target, profile, change_id, include }: Self,
+        TomlConfig {
+            build,
+            install,
+            llvm,
+            rust,
+            dist,
+            target,
+            pgo,
+            profile,
+            change_id,
+            include,
+        }: Self,
         replace: ReplaceOpt,
     ) {
         fn do_merge<T: Merge>(x: &mut Option<T>, y: Option<T>, replace: ReplaceOpt) {
@@ -74,6 +94,7 @@ impl Merge for TomlConfig {
         do_merge(&mut self.llvm, llvm, replace);
         do_merge(&mut self.rust, rust, replace);
         do_merge(&mut self.dist, dist, replace);
+        do_merge(&mut self.pgo, pgo, replace);
 
         match (self.target.as_mut(), target) {
             (_, None) => {}
@@ -98,14 +119,14 @@ impl Merge for TomlConfig {
         // keep the upper-level configuration to take precedence.
         for include_path in include.clone().unwrap_or_default().iter().rev() {
             let include_path = parent_dir.join(include_path);
-            let include_path = include_path.canonicalize().unwrap_or_else(|e| {
+            let include_path = Config::canonicalize_toml_path(&include_path).unwrap_or_else(|e| {
                 eprintln!("ERROR: Failed to canonicalize '{}' path: {e}", include_path.display());
-                exit!(2);
+                helpers::exit_process(2);
             });
 
             let included_toml = Config::get_toml_inner(&include_path).unwrap_or_else(|e| {
                 eprintln!("ERROR: Failed to parse '{}': {e}", include_path.display());
-                exit!(2);
+                helpers::exit_process(2);
             });
 
             assert!(
@@ -137,6 +158,20 @@ impl Merge for TomlConfig {
 pub const BUILDER_CONFIG_FILENAME: &str = "builder-config";
 
 impl Config {
+    /// Project cache-location DATA through the normal strict Bootstrap parser.
+    /// Includes/profile precedence is resolved by the caller while retaining
+    /// every actual file read; this never parses or constructs build ownership.
+    pub(crate) fn cache_output_fields(
+        contents: &str,
+    ) -> Result<(Option<String>, Vec<PathBuf>, Option<String>), toml::de::Error> {
+        let config = Self::parse_toml_contents(contents)?;
+        Ok((
+            config.build.and_then(|build| build.build_dir),
+            config.include.unwrap_or_default(),
+            config.profile,
+        ))
+    }
+
     pub(crate) fn get_builder_toml(&self, build_name: &str) -> Result<TomlConfig, toml::de::Error> {
         if self.dry_run() {
             return Ok(TomlConfig::default());
@@ -152,8 +187,40 @@ impl Config {
     }
 
     pub(crate) fn get_toml_inner(file: &Path) -> Result<TomlConfig, toml::de::Error> {
+        Self::get_toml_source(file, |_| {})
+    }
+    pub(crate) fn canonicalize_toml_path(file: &Path) -> std::io::Result<PathBuf> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        crate::utils::metadata_scheduler::host_graph::check_original_configuration_path(file)?;
+        file.canonicalize()
+    }
+
+    // The same ordinary parser selects every include/profile. A genuine
+    // original preparation graph, when present, supplies those exact bytes
+    // from its retained source/file issuer before they are interpreted.
+    pub(crate) fn get_toml_source(
+        file: &Path,
+        mut observe: impl FnMut(&str),
+    ) -> Result<TomlConfig, toml::de::Error> {
+        let mut parse = |contents: &str| {
+            observe(contents);
+            Self::parse_toml_contents(contents)
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(result) =
+            t!(crate::utils::metadata_scheduler::host_graph::with_original_configuration(
+                file, &mut parse
+            ))
+        {
+            return result;
+        }
         let contents =
-            t!(fs::read_to_string(file), format!("config file {} not found", file.display()));
+            t!(Self::read_source_text(file), format!("config file {} not found", file.display()));
+        parse(&contents)
+    }
+
+    // Trust: native input binding parses the exact string whose digest it keeps.
+    pub(crate) fn parse_toml_contents(contents: &str) -> Result<TomlConfig, toml::de::Error> {
         // Deserialize to Value and then TomlConfig to prevent the Deserialize impl of
         // TomlConfig and sub types to be monomorphized 5x by toml.
         toml::from_str(&contents)
@@ -163,11 +230,11 @@ impl Config {
                     toml::from_str::<toml::Value>(&contents)
                         .and_then(|table: toml::Value| ChangeIdWrapper::deserialize(table))
                 {
-                    let changes = crate::find_recent_config_change_ids(id);
+                    let changes = find_recent_config_change_ids(id);
                     if !changes.is_empty() {
                         println!(
                             "WARNING: There have been changes to x.py since you last updated:\n{}",
-                            crate::human_readable_changes(changes)
+                            human_readable_changes(changes)
                         );
                     }
                 }

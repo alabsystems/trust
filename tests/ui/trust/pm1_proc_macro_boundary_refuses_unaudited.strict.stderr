@@ -1,0 +1,4 @@
+error: verified Targo refuses to load proc-macro crate `pm1_boundary_derive` ($TEST_BUILD_DIR/auxiliary/libpm1_boundary_derive.DYLIB): it is not an audited provider, and loading it runs third-party code inside the verifying compiler, where it could forge the proof transport (no-proc-macro TCB boundary, PM-1). Remove the dependency that brings it in, or build without a proof claim (`--allow-l0-gaps`, which reports and forfeits)
+
+error: aborting due to 1 previous error
+

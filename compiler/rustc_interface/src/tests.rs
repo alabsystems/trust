@@ -9,34 +9,38 @@ use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::profiling::TimePassesFormat;
 use rustc_errors::ColorConfig;
 use rustc_errors::emitter::HumanReadableErrorType;
-use rustc_hir::attrs::{CollapseMacroDebuginfo, NativeLibKind};
+use rustc_lint_defs::Level;
 use rustc_session::config::{
     AnnotateMoves, AutoDiff, BranchProtection, CFGuard, Cfg, CodegenRetagOptions, CoverageLevel,
-    CoverageOptions, CrateType, DebugInfo, DumpMonoStatsFormat, ErrorOutputType, ExternEntry,
-    ExternLocation, Externs, FmtDebug, FunctionReturn, IncrementalStateAssertion,
-    InliningThreshold, Input, InstrumentCoverage, InstrumentMcount, InstrumentXRay,
-    LinkSelfContained, LinkerPluginLto, LocationDetail, LtoCli, MirIncludeSpans, NextSolverConfig,
-    Offload, Options, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes,
-    PatchableFunctionEntry, Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath,
-    SymbolManglingVersion, TrustIrLower, TrustPolicy, TrustVerify, TrustWitness, WasiExecModel,
-    build_configuration, build_session_options, rustc_optgroups,
+    CoverageOptions, DebugInfo, DumpMonoStatsFormat, ErrorOutputType, ExternEntry, ExternLocation,
+    Externs, FmtDebug, FunctionReturn, IncrementalStateAssertion, InliningThreshold, Input,
+    InstrumentCoverage, InstrumentMcount, InstrumentMcountOpts, InstrumentXRay, LinkSelfContained,
+    LinkerPluginLto, LocationDetail, LtoCli, MirIncludeSpans, NextSolverConfig, Offload, Options,
+    OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes, PatchableFunctionEntry,
+    Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath, SymbolManglingVersion,
+    TrustIrLower, TrustPolicy, TrustVerify, TrustWitness, WasiExecModel, build_configuration,
+    build_session_options, rustc_optgroups,
 };
-use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
 use rustc_session::utils::{CanonicalizedPath, NativeLib};
-use rustc_session::{CompilerIO, EarlyDiagCtxt, Session, build_session, getopts};
+use rustc_session::{
+    CodegenBackendInit, CompilerIO, EarlyDiagCtxt, Session, build_early_session, build_session,
+    getopts,
+};
 use rustc_span::edition::{DEFAULT_EDITION, Edition};
 use rustc_span::source_map::{RealFileLoader, SourceMapInputs};
 use rustc_span::{FileName, RealFileName, RemapPathScopeComponents, SourceFileHashAlgorithm, sym};
+use rustc_structures::{CollapseMacroDebuginfo, CrateType, NativeLibKind};
 use rustc_target::spec::{
     CodeModel, FramePointer, LinkerFlavorCli, MergeFunctions, OnBrokenPipe, PanicStrategy,
     RelocModel, RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, TlsModel,
 };
 
 use crate::interface::{
-    apply_no_trust_evidence_typed_policy, callback_codegen_backend_factory_conflicts,
-    expected_explicit_codegen_backend_name, explicit_codegen_backend_name_mismatch,
-    finalize_untracked_session_state, initialize_checked_jobserver,
+    apply_no_trust_evidence_typed_policy, apply_trust_frontend_thread_pin,
+    bootstrap_fixed_phase_supported, bounded_metadata_session,
+    callback_codegen_backend_factory_conflicts, expected_explicit_codegen_backend_name,
+    explicit_codegen_backend_name_mismatch, finalize_untracked_session_state,
     no_trust_evidence_codegen_backend_error, no_trust_evidence_typed_backend_control, parse_cfg,
 };
 use crate::util::DummyCodegenBackend;
@@ -130,12 +134,15 @@ fn direct_interface_no_trust_evidence_policy_forces_off_and_rejects_outputs() {
     llvm_args.cg.llvm_args.push("-load=/tmp/plugin".to_string());
     assert_eq!(no_trust_evidence_typed_backend_control(&llvm_args), Some("-Cllvm-args"),);
 
-    let mut lowering = Options::default();
-    lowering.unstable_opts.trust_ir_lower = Some(TrustIrLower::On);
-    assert_eq!(
-        apply_no_trust_evidence_typed_policy(&mut lowering),
-        Err("-Ztrust-ir-lower".to_string()),
-    );
+    // A lowering REQUEST is accepted and overwritten, never inherited: this route
+    // runs no lowering, so what the caller asked for cannot reach the compilation.
+    for requested in [TrustIrLower::On, TrustIrLower::Strict] {
+        let mut lowering = Options::default();
+        lowering.unstable_opts.trust_ir_lower = Some(requested);
+        apply_no_trust_evidence_typed_policy(&mut lowering).unwrap();
+        assert_eq!(lowering.unstable_opts.trust_ir_lower, Some(TrustIrLower::Off));
+        assert_eq!(lowering.unstable_opts.trust_verify, TrustVerify::Off);
+    }
 
     let mut output = Options::default();
     output.unstable_opts.trust_dump.ir = Some(PathBuf::from("must-not-publish"));
@@ -148,19 +155,32 @@ fn direct_interface_no_trust_evidence_policy_forces_off_and_rejects_outputs() {
         Err("-Ztrust-verify-session".to_string()),
     );
 
+    // The proof root only says where an ACTIVE verification writes proof bytes;
+    // this route has none to write, so the selector is accepted and reset rather
+    // than left for anything downstream to read.
     let mut artifact = Options::default();
     artifact.unstable_opts.trust_proof_artifact_root = Some(PathBuf::from("/must-not-publish"));
-    assert_eq!(
-        apply_no_trust_evidence_typed_policy(&mut artifact),
-        Err("-Ztrust-proof-artifact-root".to_string()),
-    );
+    apply_no_trust_evidence_typed_policy(&mut artifact).unwrap();
+    assert_eq!(artifact.unstable_opts.trust_proof_artifact_root, None);
 
-    let mut internal_identity = Options::default();
-    internal_identity.trust_solver_content_fingerprint = "ay:sha256:caller".to_string();
-    assert_eq!(
-        apply_no_trust_evidence_typed_policy(&mut internal_identity),
-        Err("compiler-populated Trust solver content fingerprint".to_string()),
-    );
+    // ay's committed verification posture, as an embedded frontend such as rustdoc
+    // receives it after `-Ztrust-verify=off` resolved last: every selector is
+    // accepted and neutralized, and the profile's declared SIGPIPE disposition —
+    // its one effect that holds without verification — survives as the upstream
+    // `-Zon-broken-pipe` the neutralized configuration compiles with.
+    let mut posture = Options::default();
+    posture.unstable_opts.trust_verify = TrustVerify::Off;
+    posture.unstable_opts.trust_policy = TrustPolicy::Certify;
+    posture.unstable_opts.trust_verify_level = 2;
+    posture.unstable_opts.trust_verify_profile = Some("unix_hardened".to_string());
+    posture.unstable_opts.trust_verify_include_dependencies = true;
+    posture.unstable_opts.trust_ir_lower = Some(TrustIrLower::Strict);
+    apply_no_trust_evidence_typed_policy(&mut posture).unwrap();
+    assert_eq!(posture.unstable_opts.trust_policy, TrustPolicy::default());
+    assert_eq!(posture.unstable_opts.trust_verify_profile, None);
+    assert!(!posture.unstable_opts.trust_verify_include_dependencies);
+    assert_eq!(posture.unstable_opts.trust_ir_lower, Some(TrustIrLower::Off));
+    assert_eq!(posture.unstable_opts.on_broken_pipe, OnBrokenPipe::Kill);
 }
 
 #[test]
@@ -176,11 +196,19 @@ fn sess_and_cfg<F>(args: &[&'static str], f: F)
 where
     F: FnOnce(Session, Cfg),
 {
-    let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
-    initialize_checked_jobserver(&early_dcx);
+    sess_and_cfg_with(args, |_| {}, f)
+}
 
+/// [`sess_and_cfg`], with `adjust` applied to the parsed options before the
+/// session is built: the seam `run_compiler` applies its option pins at.
+fn sess_and_cfg_with<F>(args: &[&'static str], adjust: impl FnOnce(&mut Options), f: F)
+where
+    F: FnOnce(Session, Cfg),
+{
+    let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
     let matches = optgroups().parse(args).unwrap();
-    let sessopts = build_session_options(&mut early_dcx, &matches);
+    let mut sessopts = build_session_options(&mut early_dcx, &matches, true);
+    adjust(&mut sessopts);
     let target = rustc_session::config::build_target_config(
         &early_dcx,
         &sessopts.target_triple,
@@ -207,17 +235,16 @@ where
 
         static USING_INTERNAL_FEATURES: AtomicBool = AtomicBool::new(false);
 
+        let sess = build_early_session(sessopts, target, None);
         let sess = build_session(
-            sessopts,
+            sess,
+            CodegenBackendInit::default(),
             io,
             Default::default(),
-            target,
             "",
-            None,
             &USING_INTERNAL_FEATURES,
         );
-        let cfg = parse_cfg(sess.dcx(), matches.opt_strs("cfg"));
-        let cfg = build_configuration(&sess, cfg);
+        let cfg = parse_cfg(&sess, matches.opt_strs("cfg"));
         f(sess, cfg)
     });
 }
@@ -351,6 +378,45 @@ fn trust_verification_gets_fresh_non_crate_incremental_identity() {
     assert_eq!(vanilla_first, vanilla_second, "explicit vanilla rustc stays deterministic");
 }
 
+// Trust: the typeck-witness key's options half drops exactly the per-invocation freshness
+// values the test above pins, and keeps the lint levels the crate hash leaves out.
+#[test]
+fn trust_witness_key_options_ignore_freshness_and_keep_lint_levels() {
+    let witness_hash = |args: &[&'static str]| {
+        let mut hash = None;
+        sess_and_cfg(args, |mut sess, _cfg| {
+            finalize_untracked_session_state(&mut sess, None);
+            hash = Some(sess.opts.witness_tracking_hash());
+        });
+        hash.expect("witness options hash")
+    };
+
+    // Verification on (the default) gives each process a fresh `untracked_state_hash`.
+    let verified = witness_hash(&[]);
+    assert_eq!(verified, witness_hash(&[]), "two verified compiles must share a witness key");
+    // `targo trust` passes a fresh session nonce on every run.
+    assert_eq!(
+        witness_hash(&["-Ztrust-verify-session=first"]),
+        witness_hash(&["-Ztrust-verify-session=second"]),
+        "the per-run verification nonce must not enter the witness key"
+    );
+    assert_eq!(verified, witness_hash(&["-Ztrust-verify-session=first"]));
+
+    for levels in [
+        &["-Dwarnings"][..],
+        &["-Dtrivial_numeric_casts"][..],
+        &["-Atrivial_numeric_casts"][..],
+        &["--force-warn", "deprecated"][..],
+        &["--cap-lints", "allow"][..],
+    ] {
+        assert_ne!(
+            verified,
+            witness_hash(levels),
+            "lint levels {levels:?} must enter the witness key"
+        );
+    }
+}
+
 #[test]
 fn trust_crate_roles_are_reporting_only_and_cannot_weaken_strict_scope() {
     const CASES: &[(&str, &[&str])] = &[
@@ -375,20 +441,6 @@ fn trust_crate_roles_are_reporting_only_and_cannot_weaken_strict_scope() {
     }
 }
 
-#[test]
-fn trust_solver_content_fingerprint_changes_the_crate_hash() {
-    let reference = Options::default();
-    let mut changed = reference.clone();
-    changed.trust_solver_content_fingerprint = "ay:sha256:test-content".to_string();
-
-    assert_ne!(
-        reference.dep_tracking_hash(true),
-        changed.dep_tracking_hash(true),
-        "the exact solver content identity can affect emitted MIR and must be crate-tracked"
-    );
-    assert_ne!(reference.dep_tracking_hash(false), changed.dep_tracking_hash(false));
-}
-
 // Trust: proof/certificate extension state belongs to one compiler invocation;
 // a rustc_driver process may construct multiple Sessions sequentially.
 #[test]
@@ -402,6 +454,119 @@ fn trust_compiler_state_is_isolated_between_sessions() {
     });
     sess_and_cfg(&[], |sess, _cfg| {
         assert_eq!(sess.with_trust_compiler_state::<Probe, _>(|probe| probe.0), 0);
+    });
+}
+
+// Trust (TG4): use the production handoff type in two real Sessions in this
+// process. A previous crate's accepted environment must never discharge a hit.
+#[test]
+fn trust_checked_island_environment_is_isolated_between_sessions() {
+    use trust_certify::clean_island_environment::CheckedIslandEnvironment;
+
+    let sources = vec!["def value : Bool := true".to_owned()];
+    let (checked, _, batch) = CheckedIslandEnvironment::check(&sources, &[], false, None).unwrap();
+    assert!(!batch.is_rejected(), "{batch:?}");
+    sess_and_cfg(&["-Ztrust-verify=off"], |sess, _cfg| {
+        sess.with_trust_compiler_state::<CheckedIslandEnvironment, _>(|state| *state = checked);
+        assert!(sess.with_trust_compiler_state::<CheckedIslandEnvironment, _>(|state| {
+            state.lookup(&sources, &[]).is_some_and(|environment| environment.is_some())
+        }));
+    });
+    sess_and_cfg(&["-Ztrust-verify=off"], |sess, _cfg| {
+        assert!(sess.with_trust_compiler_state::<CheckedIslandEnvironment, _>(|state| {
+            state.lookup(&sources, &[]).is_none()
+        }));
+        assert!(sess.with_trust_compiler_state::<CheckedIslandEnvironment, _>(|state| {
+            state.take_for_reporting(&sources, &[]).is_none()
+        }));
+    });
+}
+
+// Trust (T4.3): a unit of a proof session — verifying, or a verification-off
+// unit carrying `-Ztrust-verify-session` — runs one front-end thread with
+// synchronization off, whatever `-Zthreads` asked; the vanilla lane keeps the
+// request exactly. `parse_threads` yields `None` (one thread), `Some(1)`
+// (`-Zthreads=sync`) or `Some(n)` with `1 < n <= 256`.
+#[test]
+fn trust_proof_sessions_pin_one_frontend_thread_and_vanilla_keeps_the_request() {
+    use rustc_session::trust_frontend_threads_by_flags as threads;
+    for requested in [None, Some(1), Some(2), Some(4), Some(256)] {
+        assert_eq!(threads(requested, TrustVerify::On, false), None, "verifying, {requested:?}");
+        assert_eq!(threads(requested, TrustVerify::On, true), None, "verifying, {requested:?}");
+        assert_eq!(threads(requested, TrustVerify::Off, true), None, "session dep, {requested:?}");
+        assert_eq!(
+            threads(requested, TrustVerify::Off, false),
+            requested,
+            "vanilla, {requested:?}"
+        );
+    }
+}
+
+// Trust (T4.3): the pin, applied to parsed options as `run_compiler` applies
+// it, yields what `Session::threads` (the value every parallel-frontend reader
+// takes) reads, and `build_session` accepts the result. The parser keeps the
+// request in every lane, so each case sees the pin and not a parse that dropped
+// `-Zthreads`. Where `run_compiler` applies it (before the parallel mode and the
+// pool) is pinned by tests/ui-fulldeps/trust-frontend-thread-pin.rs, which
+// runs the canonical route itself.
+#[test]
+fn trust_frontend_thread_pin_reaches_session_threads() {
+    let cases: &[(&[&str], Option<usize>, Option<usize>)] = &[
+        (&["-Zthreads=4", "-Ztrust-verify=on"], Some(4), None),
+        // The batteries-on default is a verifying session.
+        (&["-Zthreads=4"], Some(4), None),
+        // Upstream 1.101: `=sync` additionally requires `-Zunstable-options`.
+        (
+            &[
+                "-Zthreads=sync",
+                "-Zunstable-options",
+                "-Ztrust-verify=on",
+                "-Ztrust-policy=advisory",
+            ],
+            Some(1),
+            None,
+        ),
+        (&["-Zthreads=4", "-Ztrust-verify=off", "-Ztrust-verify-session=s"], Some(4), None),
+        (&["-Zthreads=4", "-Ztrust-verify=off"], Some(4), Some(4)),
+        (&["-Zthreads=sync", "-Zunstable-options", "-Ztrust-verify=off"], Some(1), Some(1)),
+        (&["-Ztrust-verify=off"], None, None),
+    ];
+    for &(args, parsed, expected) in cases {
+        let pin = |opts: &mut Options| {
+            assert_eq!(opts.jobs.frontend.map(|n| n.get()), parsed, "parsed, arguments: {args:?}");
+            apply_trust_frontend_thread_pin(opts);
+        };
+        sess_and_cfg_with(args, pin, |sess, _cfg| {
+            assert_eq!(sess.threads(), expected, "arguments: {args:?}");
+        });
+    }
+}
+
+// Trust (T4.3): `build_session`, the one `Session` constructor, refuses a proof
+// session whose options skipped the pin — an internal compiler error, since only
+// a construction path that bypassed `run_compiler`'s pin can reach it — and
+// builds the same options once pinned, and the vanilla lane's request as is.
+#[test]
+fn trust_build_session_refuses_an_unpinned_proof_session() {
+    let proof_sessions: [&[&str]; 3] = [
+        &["-Zthreads=4", "-Ztrust-verify=on"],
+        &["-Zthreads=sync", "-Zunstable-options", "-Ztrust-verify=on"],
+        &["-Zthreads=4", "-Ztrust-verify=off", "-Ztrust-verify-session=s"],
+    ];
+    for args in proof_sessions {
+        let refused = std::panic::catch_unwind(|| sess_and_cfg(args, |_sess, _cfg| {}))
+            .err()
+            .unwrap_or_else(|| panic!("an unpinned proof session was built, arguments: {args:?}"));
+        assert!(
+            refused.is::<rustc_errors::ExplicitBug>(),
+            "refused by something other than the T4.3 check, arguments: {args:?}"
+        );
+        sess_and_cfg_with(args, apply_trust_frontend_thread_pin, |sess, _cfg| {
+            assert_eq!(sess.threads(), None, "pinned, arguments: {args:?}");
+        });
+    }
+    sess_and_cfg(&["-Zthreads=4", "-Ztrust-verify=off"], |sess, _cfg| {
+        assert_eq!(sess.threads(), Some(4));
     });
 }
 
@@ -884,6 +1049,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(debuginfo, DebugInfo::Limited);
     tracked!(dwarf_version, Some(5));
     tracked!(embed_bitcode, false);
+    tracked!(embed_metadata, Some(false));
     tracked!(force_frame_pointers, FramePointer::Always);
     tracked!(force_unwind_tables, Some(true));
     tracked!(instrument_coverage, InstrumentCoverage::Yes);
@@ -903,6 +1069,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(passes, vec![String::from("1"), String::from("2")]);
     tracked!(prefer_dynamic, true);
     tracked!(profile_generate, SwitchWithOptPath::Enabled(None));
+    tracked!(profile_sample_use, Some(PathBuf::from("abc")));
     tracked!(profile_use, Some(PathBuf::from("abc")));
     tracked!(relocation_model, Some(RelocModel::Pic));
     tracked!(relro_level, Some(RelroLevel::Full));
@@ -1003,15 +1170,16 @@ fn test_unstable_options_tracking_hash() {
     untracked!(span_debug, true);
     untracked!(span_free_formats, true);
     untracked!(temps_dir, Some(String::from("abc")));
-    untracked!(threads, Some(99));
+    untracked!(threads, Some(String::from("99")));
     untracked!(time_llvm_passes, true);
     untracked!(time_passes, true);
     untracked!(time_passes_format, TimePassesFormat::Json);
     untracked!(trace_macros, true);
     untracked!(track_diagnostics, true);
     untracked!(trim_diagnostic_paths, false);
+    // Trust: EW18-DROPIN-1, decides only what is deleted after the link.
+    untracked!(trust_drop_rlib_objects, true);
     untracked!(trust_proof_artifact_root, Some(PathBuf::from("/tmp/trust-proof-root")));
-    untracked!(trust_verify_ay_path, Some(PathBuf::from("/tmp/ay")));
     untracked!(trust_witness, TrustWitness::Off);
     untracked!(trust_witness_precise, true);
     untracked!(ui_testing, true);
@@ -1036,6 +1204,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(always_encode_mir, true);
     tracked!(annotate_moves, AnnotateMoves::Enabled(Some(1234)));
     tracked!(assume_incomplete_release, true);
+    tracked!(async_panic, false);
     tracked!(autodiff, vec![AutoDiff::Enable, AutoDiff::NoTT]);
     tracked!(autodiff_post_passes, Some("function(mem2reg,instsimplify,simplifycfg)".to_string()));
     tracked!(binary_dep_depinfo, true);
@@ -1067,7 +1236,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(direct_access_external_data, Some(true));
     tracked!(dual_proc_macros, true);
     tracked!(dwarf_version, Some(5));
-    tracked!(embed_metadata, false);
+    tracked!(embed_metadata, Some(false));
     tracked!(embed_source, true);
     tracked!(export_executable_symbols, true);
     tracked!(fewer_names, Some(true));
@@ -1079,12 +1248,13 @@ fn test_unstable_options_tracking_hash() {
     tracked!(function_sections, Some(false));
     tracked!(hint_mostly_unused, true);
     tracked!(human_readable_cgu_names, true);
+    tracked!(implicit_sysroot_deps, false);
     tracked!(incremental_ignore_spans, true);
     tracked!(indirect_branch_cs_prefix, true);
     tracked!(inline_mir, Some(true));
     tracked!(inline_mir_hint_threshold, Some(123));
     tracked!(inline_mir_threshold, Some(123));
-    tracked!(instrument_mcount, InstrumentMcount::Mcount);
+    tracked!(instrument_mcount, InstrumentMcount::Mcount(InstrumentMcountOpts::default()));
     tracked!(instrument_xray, Some(InstrumentXRay::default()));
     tracked!(link_directives, false);
     tracked!(link_only, true);
@@ -1098,18 +1268,24 @@ fn test_unstable_options_tracking_hash() {
     tracked!(min_function_alignment, Some(Align::EIGHT));
     tracked!(min_recursion_limit, Some(256));
     tracked!(mir_enable_passes, vec![("DestProp".to_string(), false)]);
+    tracked!(mir_move_elimination, true);
     tracked!(mir_opt_level, Some(4));
     tracked!(mir_preserve_ub, true);
     tracked!(move_size_limit, Some(4096));
-    tracked!(mutable_noalias, false);
-    tracked!(next_solver, NextSolverConfig { coherence: true, globally: true });
+
+    // tidy-alphabetical-end
+    // FIXME(#160895): We don't test this when the next-solver is enabled by default.
+    if option_env!("CFG_DEFAULT_NEXT_SOLVER_GLOBALLY").is_none() {
+        tracked!(next_solver, NextSolverConfig::Globally);
+    }
+    // tidy-alphabetical-start
     tracked!(no_generate_arange_section, true);
     tracked!(no_link, true);
     tracked!(no_profiler_runtime, true);
     tracked!(no_trait_vptr, true);
 
     tracked!(no_unique_section_names, true);
-    tracked!(offload, vec![Offload::Device]);
+    tracked!(offload, vec![Offload::Device(String::new())]);
     tracked!(on_broken_pipe, OnBrokenPipe::Kill);
     tracked!(osx_rpath_install_name, true);
     tracked!(packed_bundled_libs, true);
@@ -1123,7 +1299,6 @@ fn test_unstable_options_tracking_hash() {
     tracked!(plt, Some(true));
     tracked!(polonius, Polonius::Legacy);
     tracked!(precise_enum_drop_elaboration, false);
-    tracked!(profile_sample_use, Some(PathBuf::from("abc")));
     tracked!(profiler_runtime, "abc".to_string());
     tracked!(reg_struct_return, true);
     tracked!(regparm, Some(3));
@@ -1137,7 +1312,6 @@ fn test_unstable_options_tracking_hash() {
     tracked!(sanitizer_kcfi_arity, Some(true));
     tracked!(sanitizer_memory_track_origins, 2);
     tracked!(sanitizer_recover, SanitizerSet::ADDRESS);
-    tracked!(saturating_float_casts, Some(true));
     tracked!(share_generics, Some(true));
     tracked!(simulate_remapped_rust_src_base, Some(PathBuf::from("/rustc/abc")));
     tracked!(small_data_threshold, Some(16));
@@ -1155,14 +1329,31 @@ fn test_unstable_options_tracking_hash() {
     tracked!(treat_err_as_bug, NonZero::new(1));
     tracked!(trust_bundle_foreign_crate, vec!["dep_crate".to_string()]);
     tracked!(trust_certified_test_monitors, true);
+    tracked!(trust_cg_f1_backend, "compiler".to_string());
     tracked!(trust_cg_output_gate, "allow-unknown".to_string());
+    tracked!(trust_ir_cg_args, vec!["no-proof-certs".to_string(), "diag=json".to_string()]);
     tracked!(trust_ir_flip, false);
     tracked!(trust_ir_lower, Some(TrustIrLower::On));
+    // Trust (step 6.5.1, INC6.5-SWITCH): the non-default value while the default is off.
+    tracked!(trust_ir_lower_templates, true);
+    // Trust (PKG-C2d2 slice 1): the template-instance TEST-ORACLE and its negative control.
+    tracked!(trust_ir_template_instance_oracle, true);
+    // Trust (D2 tier 1)
+    tracked!(trust_no_adapter_yield, true);
     tracked!(trust_no_r1, true);
+    // Trust (STR_BYTE_POSITION): an evidence control, so it is tracked.
+    tracked!(trust_no_str_byte_position, true);
+    // Trust: the Option-lane representation participates in both hash domains.
+    tracked!(trust_option_flag_lanes, false);
     tracked!(trust_policy, TrustPolicy::Advisory);
     tracked!(trust_targo_test_monitor, true);
+    tracked!(trust_test_mutate_derived_assert_msg, true);
+    tracked!(trust_test_template_oracle_mutation, Some(String::from("int-constant")));
+    // Trust (TINV step 10.0): the type-invariant pre-pass is tracked.
+    tracked!(trust_tinv, true);
     tracked!(trust_verify, TrustVerify::Off);
     tracked!(trust_verify_crate_role, "dependency".to_string());
+    tracked!(trust_verify_effort, 1);
     tracked!(trust_verify_function_budget_ms, 1);
 
     tracked!(trust_verify_include_dependencies, true);
@@ -1179,6 +1370,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(verify_llvm_ir, true);
     tracked!(virtual_function_elimination, true);
     tracked!(wasi_exec_model, Some(WasiExecModel::Reactor));
+    tracked!(wasm_proc_macros, true);
     // tidy-alphabetical-end
 
     macro_rules! tracked_no_crate_hash {
@@ -1201,6 +1393,12 @@ fn test_unstable_options_tracking_hash() {
         }
     );
 
+    tracked_no_crate_hash!(trust_memory_notes, true);
+    // Trust (PM-1): the crate-loader proc-macro boundary and its audited dylibs.
+    tracked_no_crate_hash!(trust_audited_proc_macro, vec!["libaudited.dylib".to_string()]);
+    tracked_no_crate_hash!(trust_proc_macro_boundary, true);
+    // Trust (D21): where proc macros run changes what a session may claim.
+    tracked_no_crate_hash!(trust_proc_macro_isolation, true);
     tracked_no_crate_hash!(trust_verify_output, "json".to_string());
     tracked_no_crate_hash!(trust_verify_package_name, Some("example-package".to_string()));
     tracked_no_crate_hash!(trust_verify_session, Some("proof-session-1".to_string()));
@@ -1216,6 +1414,106 @@ fn test_edition_parsing() {
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     let matches = optgroups().parse(&["--edition=2018".to_string()]).unwrap();
-    let sessopts = build_session_options(&mut early_dcx, &matches);
+    let sessopts = build_session_options(&mut early_dcx, &matches, false);
     assert!(sessopts.edition == Edition::Edition2018)
+}
+
+#[test]
+fn test_assumptions_on_binders_enables_next_solver_globally() {
+    let globally = NextSolverConfig::Globally;
+    let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
+
+    // `-Zassumptions-on-binders` alone enables the next solver globally.
+    let matches = optgroups().parse(&["-Zassumptions-on-binders".to_string()]).unwrap();
+    let opts = build_session_options(&mut early_dcx, &matches, false);
+    assert!(opts.unstable_opts.assumptions_on_binders);
+    assert_eq!(opts.unstable_opts.next_solver, globally);
+
+    // `-Zassumptions-on-binders` overrides `-Znext-solver=no` regardless of order, since
+    // the assumptions implementation requires the next solver. This also emits an early
+    // warning (covered by the UI test `next-solver-no-overridden`).
+    for args in [
+        ["-Zassumptions-on-binders".to_string(), "-Znext-solver=no".to_string()],
+        ["-Znext-solver=no".to_string(), "-Zassumptions-on-binders".to_string()],
+    ] {
+        let matches = optgroups().parse(&args).unwrap();
+        let opts = build_session_options(&mut early_dcx, &matches, false);
+        assert!(opts.unstable_opts.assumptions_on_binders);
+        assert_eq!(opts.unstable_opts.next_solver, globally);
+    }
+}
+
+/// Trust (CUSTODY-BOUNDED-QUERY-SPELLINGS-1): a session's options qualify to be
+/// answered on no scheduler only when they ask nothing but a bounded print:
+/// the sysroot or the target list, to standard output, on one front-end thread,
+/// with no native worker mode. (The driver also requires no input.)
+#[test]
+fn only_a_bounded_print_session_is_answered_without_a_scheduler() {
+    let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
+    let mut session = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        let matches = optgroups().parse(&args).unwrap();
+        build_session_options(&mut early_dcx, &matches, false)
+    };
+    for args in [
+        &["--print", "sysroot"][..],
+        &["--print=sysroot"],
+        &["--print", "target-list"],
+        &["--print=target-list"],
+    ] {
+        assert!(bounded_metadata_session(&session(args)), "{args:?}");
+    }
+    // No print, another print, a print written to a file, or a parallel front end.
+    for args in [
+        &[][..],
+        &["--print=cfg"],
+        &["--print=sysroot", "--print=cfg"],
+        &["--print=sysroot=out.txt"],
+        &["--print=native-static-libs"],
+        &["--print=sysroot", "-Zthreads=2"],
+    ] {
+        assert!(!bounded_metadata_session(&session(args)), "{args:?}");
+    }
+    // Native worker custody is never a bounded query.
+    let mut worker = session(&["--print=sysroot"]);
+    worker.resource_worker_v2 = true;
+    assert!(!bounded_metadata_session(&worker));
+    // Trust: private Fixed routing also requires its actual original owner.
+    let private = session(&["--print=sysroot", "--resource-bootstrap-fixed-v1"]);
+    assert!(private.resource_bootstrap_fixed_v1);
+    assert!(
+        !private.resource_worker_v2
+            && !private.resource_worker_v3
+            && !private.resource_subgroups_v3
+    );
+    assert!(!bounded_metadata_session(&private));
+}
+
+// Trust: these are policy/parsed-option controls, never native admission fixtures.
+#[test]
+fn private_fixed_backend_policy_rejects_foreign_execution_without_narrowing_crate_kinds() {
+    let base = Options::default();
+    assert_eq!(bootstrap_fixed_phase_supported(&base, false), cfg!(target_os = "macos"));
+    assert!(!bootstrap_fixed_phase_supported(&base, true));
+    let mut options = base.clone();
+    options.unstable_opts.codegen_backend = Some("foreign-backend".into());
+    assert!(!bootstrap_fixed_phase_supported(&options, false));
+    let mut options = base.clone();
+    options.unstable_opts.llvm_plugins.push("foreign-plugin".into());
+    assert!(!bootstrap_fixed_phase_supported(&options, false));
+    let mut options = base.clone();
+    options.cg.llvm_args.push("--load=foreign-plugin".into());
+    assert!(!bootstrap_fixed_phase_supported(&options, false));
+    let mut options = base.clone();
+    options.unstable_opts.wasm_proc_macros = true;
+    assert!(!bootstrap_fixed_phase_supported(&options, false));
+    let mut options = base.clone();
+    options.target_triple = rustc_target::spec::TargetTuple::from_tuple("foreign-unknown-none");
+    assert!(!bootstrap_fixed_phase_supported(&options, false));
+    for kind in [CrateType::Rlib, CrateType::Executable, CrateType::Dylib, CrateType::ProcMacro] {
+        let mut options = base.clone();
+        options.crate_types = vec![kind];
+        options.test = true;
+        assert_eq!(bootstrap_fixed_phase_supported(&options, false), cfg!(target_os = "macos"));
+    }
 }

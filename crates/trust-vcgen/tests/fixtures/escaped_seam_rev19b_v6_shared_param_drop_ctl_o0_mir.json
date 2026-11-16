@@ -1,0 +1,2254 @@
+{
+  "name": "v6_shared_param_drop_ctl",
+  "def_path": "rev19b_pins::v6_shared_param_drop_ctl",
+  "span": {
+    "file": "rev19b_pins.rs",
+    "line_start": 72,
+    "col_start": 0,
+    "line_end": 83,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 4
+              }
+            }
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "j"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "q"
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "r"
+      },
+      {
+        "index": 12,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Seq": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Adt": {
+            "name": "alloc::boxed::Box",
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "core::ptr::unique::Unique",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "Adt": {
+                            "name": "core::ptr::non_null::NonNull",
+                            "fields": [
+                              [
+                                "pointer",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Adt": {
+                                        "name": "core::mem::maybe_uninit::MaybeUninit",
+                                        "fields": [
+                                          [
+                                            "uninit",
+                                            "Unit"
+                                          ],
+                                          [
+                                            "value",
+                                            {
+                                              "Adt": {
+                                                "name": "core::mem::manually_drop::ManuallyDrop",
+                                                "fields": [
+                                                  [
+                                                    "value",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "core::mem::maybe_dangling::MaybeDangling",
+                                                        "fields": [
+                                                          [
+                                                            "0",
+                                                            {
+                                                              "Array": {
+                                                                "elem": {
+                                                                  "Int": {
+                                                                    "width": 8,
+                                                                    "signed": false
+                                                                  }
+                                                                },
+                                                                "len": 3
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false,
+                                                        "faithful_enum_repr": null,
+                                                        "layout": null,
+                                                        "enum_layout": null,
+                                                        "adt_kind": "Struct"
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false,
+                                                "faithful_enum_repr": null,
+                                                "layout": null,
+                                                "enum_layout": null,
+                                                "adt_kind": "Struct"
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Union"
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "core::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "1",
+                {
+                  "Adt": {
+                    "name": "alloc::alloc::Global",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "_n"
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Adt": {
+                "name": "core::mem::maybe_uninit::MaybeUninit",
+                "fields": [
+                  [
+                    "uninit",
+                    "Unit"
+                  ],
+                  [
+                    "value",
+                    {
+                      "Adt": {
+                        "name": "core::mem::manually_drop::ManuallyDrop",
+                        "fields": [
+                          [
+                            "value",
+                            {
+                              "Adt": {
+                                "name": "core::mem::maybe_dangling::MaybeDangling",
+                                "fields": [
+                                  [
+                                    "0",
+                                    {
+                                      "Array": {
+                                        "elem": {
+                                          "Int": {
+                                            "width": 8,
+                                            "signed": false
+                                          }
+                                        },
+                                        "len": 3
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Union"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 39,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 73,
+                "col_start": 7,
+                "line_end": 73,
+                "col_end": 8
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 73,
+                "col_start": 7,
+                "line_end": 73,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 73,
+                "col_start": 7,
+                "line_end": 73,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "rev19b_pins.rs",
+              "line_start": 73,
+              "col_start": 7,
+              "line_end": 73,
+              "col_end": 18
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 73,
+                "col_start": 28,
+                "line_end": 73,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 13
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 74,
+                "col_start": 12,
+                "line_end": 74,
+                "col_end": 13
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 74,
+                "col_start": 12,
+                "line_end": 74,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ge",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 74,
+                "col_start": 7,
+                "line_end": 74,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                4
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "rev19b_pins.rs",
+              "line_start": 74,
+              "col_start": 7,
+              "line_end": 74,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 74,
+                "col_start": 29,
+                "line_end": 74,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 13
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 75,
+                "col_start": 12,
+                "line_end": 75,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 1,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 76,
+                "col_start": 17,
+                "line_end": 76,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 76,
+                "col_start": 17,
+                "line_end": 76,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 76,
+                "col_start": 17,
+                "line_end": 76,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 14,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 5,
+            "span": {
+              "file": "rev19b_pins.rs",
+              "line_start": 76,
+              "col_start": 17,
+              "line_end": 76,
+              "col_end": 21
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 76,
+                "col_start": 12,
+                "line_end": 76,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::boxed::Box::<[u8; 3]>::new_uninit",
+            "args": [],
+            "dest": {
+              "local": 16,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "library/alloc/src/macros.rs",
+              "line_start": 59,
+              "col_start": 51,
+              "line_end": 59,
+              "col_end": 83
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 14949267608306027880,
+              "def_index": 793,
+              "substs_digest": [
+                189787381575032365,
+                12984823181123901574
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 16,
+                      "projections": [
+                        {
+                          "Field": 0
+                        },
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": {
+                        "Adt": {
+                          "name": "core::mem::maybe_uninit::MaybeUninit",
+                          "fields": [
+                            [
+                              "uninit",
+                              "Unit"
+                            ],
+                            [
+                              "value",
+                              {
+                                "Adt": {
+                                  "name": "core::mem::manually_drop::ManuallyDrop",
+                                  "fields": [
+                                    [
+                                      "value",
+                                      {
+                                        "Adt": {
+                                          "name": "core::mem::maybe_dangling::MaybeDangling",
+                                          "fields": [
+                                            [
+                                              "0",
+                                              {
+                                                "Array": {
+                                                  "elem": {
+                                                    "Int": {
+                                                      "width": 8,
+                                                      "signed": false
+                                                    }
+                                                  },
+                                                  "len": 3
+                                                }
+                                              }
+                                            ]
+                                          ],
+                                          "variants": [],
+                                          "disc_index_safe": false,
+                                          "faithful_enum_repr": null,
+                                          "layout": null,
+                                          "enum_layout": null,
+                                          "adt_kind": "Struct"
+                                        }
+                                      }
+                                    ]
+                                  ],
+                                  "variants": [],
+                                  "disc_index_safe": false,
+                                  "faithful_enum_repr": null,
+                                  "layout": null,
+                                  "enum_layout": null,
+                                  "adt_kind": "Struct"
+                                }
+                              }
+                            ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Union"
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 28,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 30,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 29,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 31,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 30,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 31,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 33,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 32,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 14
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 15,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 79,
+                "col_start": 17,
+                "line_end": 79,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<u8>::len",
+            "args": [
+              {
+                "Move": {
+                  "local": 19,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 18,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "rev19b_pins.rs",
+              "line_start": 79,
+              "col_start": 17,
+              "line_end": 79,
+              "col_end": 24
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 14949267608306027880,
+              "def_index": 8821,
+              "substs_digest": [
+                10552527400186531263,
+                12772966926603719284
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 10,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 79,
+                "col_start": 27,
+                "line_end": 79,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 18,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 20,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 79,
+                "col_start": 17,
+                "line_end": 79,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 21,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 9,
+            "span": {
+              "file": "rev19b_pins.rs",
+              "line_start": 79,
+              "col_start": 17,
+              "line_end": 79,
+              "col_end": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 21,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 79,
+                "col_start": 17,
+                "line_end": 79,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 15,
+              "projections": []
+            },
+            "target": 10,
+            "span": {
+              "file": "rev19b_pins.rs",
+              "line_start": 80,
+              "col_start": 4,
+              "line_end": 80,
+              "col_end": 5
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": [
+                  "Deref"
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      3,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 81,
+                "col_start": 4,
+                "line_end": 81,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 1,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 82,
+                "col_start": 6,
+                "line_end": 82,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 24,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 82,
+                "col_start": 6,
+                "line_end": 82,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 25,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 82,
+                "col_start": 6,
+                "line_end": 82,
+                "col_end": 10
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 26,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 11,
+            "span": {
+              "file": "rev19b_pins.rs",
+              "line_start": 82,
+              "col_start": 6,
+              "line_end": 82,
+              "col_end": 10
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 82,
+                "col_start": 6,
+                "line_end": 82,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 23,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 82,
+                "col_start": 6,
+                "line_end": 82,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 82,
+                "col_start": 4,
+                "line_end": 82,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 27,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 12,
+            "span": {
+              "file": "rev19b_pins.rs",
+              "line_start": 82,
+              "col_start": 4,
+              "line_end": 82,
+              "col_end": 20
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 22
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "rev19b_pins.rs",
+                "line_start": 82,
+                "col_start": 4,
+                "line_end": 82,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 13
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 28,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 35,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 34,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        3,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 37,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 35,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 38,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 37,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 36,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 39,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Not",
+                  {
+                    "Copy": {
+                      "local": 38,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 15
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 1
+                  },
+                  {
+                    "Field": 0
+                  },
+                  {
+                    "Field": 0
+                  }
+                ]
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Array",
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          1,
+                          8
+                        ]
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "Uint": [
+                          2,
+                          8
+                        ]
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "Uint": [
+                          3,
+                          8
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "library/alloc/src/macros.rs",
+                "line_start": 59,
+                "col_start": 85,
+                "line_end": 59,
+                "col_end": 94
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::boxed::box_assume_init_into_vec_unsafe::<u8, 3>",
+            "args": [
+              {
+                "Copy": {
+                  "local": 16,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 15,
+              "projections": []
+            },
+            "target": 7,
+            "span": {
+              "file": "library/alloc/src/macros.rs",
+              "line_start": 58,
+              "col_start": 8,
+              "line_end": 60,
+              "col_end": 9
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 14949267608306027880,
+              "def_index": 786,
+              "substs_digest": [
+                13955398724700564373,
+                2840422771606952358
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "j",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "j",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

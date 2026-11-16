@@ -5,12 +5,12 @@
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use sha2::digest::Digest;
-
+// Trust: this module has no codegen-backend-kind use.
 use crate::core::builder::Builder;
+use crate::core::compiler::Compiler;
 use crate::core::config::TargetSelection;
-use crate::utils::helpers::{hex_encode, mtime};
-use crate::{Compiler, Mode, helpers, t};
+use crate::core::session::Mode;
+use crate::utils::helpers::{mtime, t};
 
 #[cfg(test)]
 mod tests;
@@ -31,6 +31,12 @@ impl BuildStamp {
         // Avoid using `is_dir()` as the directory may not exist yet.
         // It is more appropriate to assert that the path is not a file.
         assert!(!dir.is_file(), "can't be a file path");
+        Self::projected(dir)
+    }
+
+    /// Construct requested stamp data without observing the filesystem.
+    /// Callers must validate their output namespace before any write or cleanup.
+    pub(crate) fn projected(dir: &Path) -> Self {
         Self { path: dir.join(".stamp"), stamp: String::new() }
     }
 
@@ -112,7 +118,13 @@ pub fn clear_if_dirty(builder: &Builder<'_>, dir: &Path, input: &Path) -> bool {
     let stamp = BuildStamp::new(dir);
     let mut cleared = false;
     if mtime(stamp.path()) < mtime(input) {
-        builder.do_if_verbose(|| println!("Dirty - {}", dir.display()));
+        builder.do_if_verbose(|| {
+            println!(
+                "Removing dirty directory `{}` because `{}` changed",
+                dir.display(),
+                input.display(),
+            )
+        });
         let _ = fs::remove_dir_all(dir);
         cleared = true;
     } else if stamp.path().exists() {
@@ -121,6 +133,38 @@ pub fn clear_if_dirty(builder: &Builder<'_>, dir: &Path, input: &Path) -> bool {
     t!(fs::create_dir_all(dir));
     t!(fs::File::create(stamp.path()));
     cleared
+}
+
+/// Trust: retain std outputs only for the exact compiler runtime that built them.
+/// An absent/legacy stamp is not a match. Never record a new identity after a
+/// failed removal; Cargo's cached compiler query must disappear with old rmeta.
+pub fn clear_if_identity_changed(dir: &Path, identity: &str) -> io::Result<bool> {
+    if identity.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty compiler runtime identity"));
+    }
+    let exists = match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => return Err(io::Error::other("compiler output is not a real directory")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let stamp = BuildStamp::new(dir).add_stamp(identity);
+    match fs::symlink_metadata(stamp.path()) {
+        Ok(metadata) if metadata.is_file() => {
+            if fs::read(stamp.path())? == identity.as_bytes() {
+                return Ok(false);
+            }
+        }
+        Ok(_) => return Err(io::Error::other("compiler runtime stamp is not a regular file")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if exists {
+        fs::remove_dir_all(dir)?;
+    }
+    fs::create_dir_all(dir)?;
+    stamp.write()?;
+    Ok(true)
 }
 
 /// Cargo's output path for the standard library in a given stage, compiled
@@ -141,52 +185,4 @@ pub fn librustc_stamp(
     target: TargetSelection,
 ) -> BuildStamp {
     BuildStamp::new(&builder.cargo_out(build_compiler, Mode::Rustc, target)).with_prefix("librustc")
-}
-
-/// Computes a hash representing the state of a repository/submodule and additional input.
-///
-/// It uses `git diff` for the actual changes, and `git status` for including the untracked
-/// files in the specified directory. The additional input is also incorporated into the
-/// computation of the hash.
-///
-/// # Parameters
-///
-/// - `dir`: A reference to the directory path of the target repository/submodule.
-/// - `additional_input`: An additional input to be included in the hash.
-///
-/// # Panics
-///
-/// In case of errors during `git` command execution (e.g., in tarball sources), default values
-/// are used to prevent panics.
-pub fn generate_smart_stamp_hash(
-    builder: &Builder<'_>,
-    dir: &Path,
-    additional_input: &str,
-) -> String {
-    let diff = helpers::git(Some(dir))
-        .allow_failure()
-        .arg("diff")
-        .arg(".")
-        .run_capture_stdout(builder)
-        .stdout_if_ok()
-        .unwrap_or_default();
-
-    let status = helpers::git(Some(dir))
-        .allow_failure()
-        .arg("status")
-        .arg(".")
-        .arg("--porcelain")
-        .arg("-z")
-        .arg("--untracked-files=normal")
-        .run_capture_stdout(builder)
-        .stdout_if_ok()
-        .unwrap_or_default();
-
-    let mut hasher = sha2::Sha256::new();
-
-    hasher.update(diff);
-    hasher.update(status);
-    hasher.update(additional_input);
-
-    hex_encode(hasher.finalize().as_slice())
 }

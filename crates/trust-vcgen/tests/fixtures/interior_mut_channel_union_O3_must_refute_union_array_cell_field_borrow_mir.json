@@ -1,0 +1,1422 @@
+{
+  "name": "must_refute_union_array_cell_field_borrow",
+  "def_path": "interior_mut_channel_union::must_refute_union_array_cell_field_borrow",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+    "line_start": 333,
+    "col_start": 0,
+    "line_end": 341,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Adt": {
+                "name": "interior_mut_channel_union::U32",
+                "fields": [
+                  [
+                    "c",
+                    {
+                      "Adt": {
+                        "name": "core::mem::manually_drop::ManuallyDrop",
+                        "fields": [
+                          [
+                            "value",
+                            {
+                              "Adt": {
+                                "name": "core::mem::maybe_dangling::MaybeDangling",
+                                "fields": [
+                                  [
+                                    "0",
+                                    {
+                                      "Adt": {
+                                        "name": "core::cell::Cell",
+                                        "fields": [
+                                          [
+                                            "value",
+                                            {
+                                              "Adt": {
+                                                "name": "core::cell::UnsafeCell",
+                                                "fields": [
+                                                  [
+                                                    "value",
+                                                    {
+                                                      "Int": {
+                                                        "width": 32,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false,
+                                                "faithful_enum_repr": null,
+                                                "layout": null,
+                                                "enum_layout": null,
+                                                "adt_kind": "Struct"
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Struct"
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ],
+                  [
+                    "n",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Union"
+              }
+            },
+            "len": 2
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "interior_mut_channel_union::U32",
+            "fields": [
+              [
+                "c",
+                {
+                  "Adt": {
+                    "name": "core::mem::manually_drop::ManuallyDrop",
+                    "fields": [
+                      [
+                        "value",
+                        {
+                          "Adt": {
+                            "name": "core::mem::maybe_dangling::MaybeDangling",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Adt": {
+                                    "name": "core::cell::Cell",
+                                    "fields": [
+                                      [
+                                        "value",
+                                        {
+                                          "Adt": {
+                                            "name": "core::cell::UnsafeCell",
+                                            "fields": [
+                                              [
+                                                "value",
+                                                {
+                                                  "Int": {
+                                                    "width": 32,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "n",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Union"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "interior_mut_channel_union::U32",
+            "fields": [
+              [
+                "c",
+                {
+                  "Adt": {
+                    "name": "core::mem::manually_drop::ManuallyDrop",
+                    "fields": [
+                      [
+                        "value",
+                        {
+                          "Adt": {
+                            "name": "core::mem::maybe_dangling::MaybeDangling",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Adt": {
+                                    "name": "core::cell::Cell",
+                                    "fields": [
+                                      [
+                                        "value",
+                                        {
+                                          "Adt": {
+                                            "name": "core::cell::UnsafeCell",
+                                            "fields": [
+                                              [
+                                                "value",
+                                                {
+                                                  "Int": {
+                                                    "width": 32,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "n",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Union"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "core::cell::Cell",
+                "fields": [
+                  [
+                    "value",
+                    {
+                      "Adt": {
+                        "name": "core::cell::UnsafeCell",
+                        "fields": [
+                          [
+                            "value",
+                            {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "core::mem::manually_drop::ManuallyDrop",
+                "fields": [
+                  [
+                    "value",
+                    {
+                      "Adt": {
+                        "name": "core::mem::maybe_dangling::MaybeDangling",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Adt": {
+                                "name": "core::cell::Cell",
+                                "fields": [
+                                  [
+                                    "value",
+                                    {
+                                      "Adt": {
+                                        "name": "core::cell::UnsafeCell",
+                                        "fields": [
+                                          [
+                                            "value",
+                                            {
+                                              "Int": {
+                                                "width": 32,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Struct"
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 2
+          },
+          {
+            "StorageLive": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "interior_mut_channel_union::U32",
+                      "variant": 0,
+                      "active_field": 1,
+                      "args": "interior_mut_channel_union::U32"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 334,
+                "col_start": 13,
+                "line_end": 334,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "interior_mut_channel_union::U32",
+                      "variant": 0,
+                      "active_field": 1,
+                      "args": "interior_mut_channel_union::U32"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 334,
+                "col_start": 27,
+                "line_end": 334,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Array",
+                  [
+                    {
+                      "Move": {
+                        "local": 3,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 4,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 334,
+                "col_start": 12,
+                "line_end": 334,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageDead": 3
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 335,
+                "col_start": 18,
+                "line_end": 335,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 335,
+                "col_start": 16,
+                "line_end": 335,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 8,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 1,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+              "line_start": 335,
+              "col_start": 16,
+              "line_end": 335,
+              "col_end": 20
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      {
+                        "Index": 7
+                      },
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 335,
+                "col_start": 16,
+                "line_end": 335,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        100,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 335,
+                "col_start": 7,
+                "line_end": 335,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                8
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+              "line_start": 335,
+              "col_start": 7,
+              "line_end": 335,
+              "col_end": 30
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageLive": 10
+          },
+          {
+            "StorageLive": 11
+          },
+          {
+            "StorageLive": 12
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 336,
+                "col_start": 30,
+                "line_end": 336,
+                "col_end": 31
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 336,
+                "col_start": 28,
+                "line_end": 336,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 3,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+              "line_start": 336,
+              "col_start": 28,
+              "line_end": 336,
+              "col_end": 32
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 2,
+                    "projections": [
+                      {
+                        "Index": 12
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 336,
+                "col_start": 27,
+                "line_end": 336,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::mem::manually_drop::ManuallyDrop<core::cell::Cell<u32>> as core::ops::deref::Deref>::deref",
+            "args": [
+              {
+                "Copy": {
+                  "local": 11,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 10,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+              "line_start": 336,
+              "col_start": 27,
+              "line_end": 336,
+              "col_end": 34
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 4448,
+              "substs_digest": [
+                10606384224257879227,
+                14971751900674321562
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "interior_mut_channel_union::poke_cell",
+            "args": [
+              {
+                "Copy": {
+                  "local": 10,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 9,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+              "line_start": 336,
+              "col_start": 8,
+              "line_end": 336,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 9768748980079679644,
+              "def_index": 16,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 9768748980079679644,
+              "krate_name": "interior_mut_channel_union"
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "StorageDead": 12
+          },
+          {
+            "StorageDead": 11
+          },
+          {
+            "StorageDead": 10
+          },
+          {
+            "StorageLive": 14
+          },
+          {
+            "StorageLive": 15
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 337,
+                "col_start": 20,
+                "line_end": 337,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 15,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 337,
+                "col_start": 18,
+                "line_end": 337,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 16,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 6,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+              "line_start": 337,
+              "col_start": 18,
+              "line_end": 337,
+              "col_end": 22
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      {
+                        "Index": 15
+                      },
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 337,
+                "col_start": 18,
+                "line_end": 337,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 337,
+                "col_start": 8,
+                "line_end": 337,
+                "col_end": 31
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 17,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 7,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+              "line_start": 337,
+              "col_start": 8,
+              "line_end": 337,
+              "col_end": 31
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 17,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 337,
+                "col_start": 8,
+                "line_end": 337,
+                "col_end": 31
+              }
+            }
+          },
+          {
+            "StorageDead": 14
+          },
+          {
+            "StorageDead": 15
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      32
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/interior_mut_channel_union.rs",
+                "line_start": 339,
+                "col_start": 8,
+                "line_end": 339,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 2
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "i",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "i",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,8 +1,9 @@
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::*;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{self, Instance, TyCtxt};
 use tracing::{debug, instrument};
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 /// A pass that removes noop landing pads and replaces jumps to them with
@@ -11,12 +12,14 @@ use crate::patch::MirPatch;
 pub(super) struct RemoveNoopLandingPads;
 
 impl<'tcx> crate::MirPass<'tcx> for RemoveNoopLandingPads {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.panic_strategy().unwinds()
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // FIXME: Should this really run on opt-level 0? Or is the LLVM code so terrible we want this even with
+        // "no" optimizations?
+        PassPolicy::optional(ctx.panic_strategy().unwinds())
     }
 
-    #[instrument(level = "debug", skip(self, _tcx, body))]
-    fn run_pass(&self, _tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    #[instrument(level = "debug", skip(self, tcx, body))]
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let def_id = body.source.def_id();
         debug!(?def_id);
 
@@ -30,20 +33,35 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveNoopLandingPads {
             return;
         }
 
-        let mut nop_landing_pads = DenseBitSet::new_empty(body.basic_blocks.len());
-
-        // This is a post-order traversal, so that if A post-dominates B
-        // then A will be visited before B.
-        for (bb, bbdata) in traversal::postorder(body) {
-            let is_nop_landing_pad = self.is_nop_landing_pad(bbdata, &nop_landing_pads);
-            debug!("is_nop_landing_pad({bb:?}) = {is_nop_landing_pad}");
-            if is_nop_landing_pad {
-                nop_landing_pads.insert(bb);
-            }
-        }
+        let nop_landing_pads = find_noop_landing_pads(tcx, body, None);
 
         if nop_landing_pads.is_empty() {
             debug!("no nop landing pads in MIR");
+            return;
+        }
+
+        // Check whether any block's unwind action or target edge actually needs to be redirected
+        // before running `MirPatch` or invalidating the CFG cache. For a standard function with
+        // only the empty `UnwindResume` block in `nop_landing_pads` and no unwind edges pointing
+        // to it, nothing changes.
+        let needs_rewrite = body.basic_blocks.iter().any(|bbdata| {
+            let term = bbdata.terminator();
+            if let Some(UnwindAction::Cleanup(unwind_bb)) = term.unwind()
+                && nop_landing_pads.contains(*unwind_bb)
+            {
+                return true;
+            }
+            term.successors().any(|target| {
+                nop_landing_pads.contains(target)
+                    && (!body.basic_blocks[target].statements.is_empty()
+                        || !matches!(
+                            body.basic_blocks[target].terminator().kind,
+                            TerminatorKind::UnwindResume
+                        ))
+            })
+        });
+        if !needs_rewrite {
+            debug!("nop landing pads already canonical; no edges to redirect");
             return;
         }
 
@@ -56,7 +74,8 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveNoopLandingPads {
         };
         debug!(?resume_block);
 
-        let basic_blocks = body.basic_blocks.as_mut();
+        let mut cfg_changed = false;
+        let basic_blocks = body.basic_blocks.as_mut_preserves_cfg();
         for (bb, bbdata) in basic_blocks.iter_enumerated_mut() {
             debug!("processing {:?}", bb);
 
@@ -66,27 +85,32 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveNoopLandingPads {
             {
                 debug!("    removing noop landing pad");
                 *unwind = UnwindAction::Continue;
+                cfg_changed = true;
             }
 
             bbdata.terminator_mut().successors_mut(|target| {
                 if *target != resume_block && nop_landing_pads.contains(*target) {
                     debug!("    folding noop jump to {:?} to resume block", target);
                     *target = resume_block;
+                    cfg_changed = true;
                 }
             });
         }
-    }
-
-    fn is_required(&self) -> bool {
-        true
+        if cfg_changed {
+            body.basic_blocks.invalidate_cfg_cache();
+        }
     }
 }
 
 impl RemoveNoopLandingPads {
-    fn is_nop_landing_pad(
+    fn is_nop_landing_pad<'tcx>(
         &self,
-        bbdata: &BasicBlockData<'_>,
+        tcx: TyCtxt<'tcx>,
+        bbdata: &BasicBlockData<'tcx>,
+        body: &Body<'tcx>,
         nop_landing_pads: &DenseBitSet<BasicBlock>,
+        // Extra post-monomorphization info that allows more cases to be identified.
+        extra: Option<(Instance<'tcx>, ty::TypingEnv<'tcx>)>,
     ) -> bool {
         for stmt in &bbdata.statements {
             match &stmt.kind {
@@ -128,6 +152,25 @@ impl RemoveNoopLandingPads {
             | TerminatorKind::FalseUnwind { .. } => {
                 terminator.successors().all(|succ| nop_landing_pads.contains(succ))
             }
+            TerminatorKind::Drop { place, .. } => {
+                if let Some((instance, typing_env)) = extra {
+                    let ty = place.ty(body, tcx).ty;
+                    debug!("monomorphize: instance={instance:?}");
+                    let ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                        tcx,
+                        typing_env,
+                        ty::EarlyBinder::bind(tcx, ty),
+                    );
+                    let drop_fn = Instance::resolve_drop_glue(tcx, ty);
+                    if let ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None)) = drop_fn.def {
+                        // no need to drop anything, if all of our successors are also no-op then we
+                        // can be skipped.
+                        return terminator.successors().all(|succ| nop_landing_pads.contains(succ));
+                    }
+                }
+
+                false
+            }
             TerminatorKind::CoroutineDrop
             | TerminatorKind::Yield { .. }
             | TerminatorKind::Return
@@ -136,8 +179,38 @@ impl RemoveNoopLandingPads {
             | TerminatorKind::Call { .. }
             | TerminatorKind::TailCall { .. }
             | TerminatorKind::Assert { .. }
-            | TerminatorKind::Drop { .. }
             | TerminatorKind::InlineAsm { .. } => false,
         }
     }
+}
+
+/// Hook impl for [`TyCtxt::find_noop_landing_pads_for_instance`].
+pub(crate) fn find_noop_landing_pads_for_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    instance: Instance<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+) -> DenseBitSet<BasicBlock> {
+    find_noop_landing_pads(tcx, body, Some((instance, typing_env)))
+}
+
+fn find_noop_landing_pads<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    extra: Option<(Instance<'tcx>, ty::TypingEnv<'tcx>)>,
+) -> DenseBitSet<BasicBlock> {
+    let mut nop_landing_pads = DenseBitSet::new_empty(body.basic_blocks.len());
+
+    // This is a post-order traversal, so that if A post-dominates B
+    // then A will be visited before B.
+    for (bb, bb_data) in traversal::postorder(body) {
+        let is_nop_landing_pad =
+            RemoveNoopLandingPads.is_nop_landing_pad(tcx, bb_data, body, &nop_landing_pads, extra);
+        if is_nop_landing_pad {
+            nop_landing_pads.insert(bb);
+        }
+        debug!("    is_nop_landing_pad({:?}) = {}", bb, is_nop_landing_pad);
+    }
+
+    nop_landing_pads
 }

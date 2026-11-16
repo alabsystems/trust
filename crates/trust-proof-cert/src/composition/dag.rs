@@ -146,7 +146,7 @@ impl ProofComposition {
             color.insert(key.as_str(), 0);
         }
 
-        let mut path: Vec<String> = Vec::new();
+        let mut path: Vec<&str> = Vec::new();
 
         for key in self.nodes.keys() {
             if color[key.as_str()] == 0
@@ -163,18 +163,19 @@ impl ProofComposition {
         &'a self,
         node: &'a str,
         color: &mut BTreeMap<&'a str, u8>,
-        path: &mut Vec<String>,
+        path: &mut Vec<&'a str>,
     ) -> Option<Vec<String>> {
         color.insert(node, 1); // Gray
-        path.push(node.to_string());
+        path.push(node);
 
         if let Some(n) = self.nodes.get(node) {
             for dep in &n.dependencies {
                 match color.get(dep.as_str()) {
                     Some(1) => {
                         // Found a back edge -> cycle
-                        let start = path.iter().position(|p| p == dep).unwrap_or(0);
-                        let mut cycle: Vec<String> = path[start..].to_vec();
+                        let start = path.iter().position(|&p| p == dep.as_str()).unwrap_or(0);
+                        let mut cycle: Vec<String> =
+                            path[start..].iter().map(|&s| s.to_string()).collect();
                         cycle.push(dep.clone());
                         return Some(cycle);
                     }
@@ -200,35 +201,38 @@ impl ProofComposition {
             return Err(CompositionError::CircularDependency { cycle: cycle.join(" -> ") });
         }
 
-        let mut in_degree: BTreeMap<String, usize> = BTreeMap::new();
-        let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut in_degree: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         // Count in-degrees and index each within-DAG edge once.
         for node in self.nodes.values() {
             let mut count = 0;
             for dependency in &node.dependencies {
                 if self.nodes.contains_key(dependency) {
                     count += 1;
-                    dependents.entry(dependency.clone()).or_default().push(node.function.clone());
+                    dependents
+                        .entry(dependency.as_str())
+                        .or_default()
+                        .push(node.function.as_str());
                 }
             }
-            in_degree.insert(node.function.clone(), count);
+            in_degree.insert(node.function.as_str(), count);
         }
 
-        let mut ready: BTreeSet<String> =
-            in_degree.iter().filter(|(_, deg)| **deg == 0).map(|(name, _)| name.clone()).collect();
+        let mut ready: BTreeSet<&str> =
+            in_degree.iter().filter(|(_, deg)| **deg == 0).map(|(&name, _)| name).collect();
 
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(self.nodes.len());
         while let Some(func) = ready.pop_first() {
-            result.push(func.clone());
-            if let Some(nodes) = dependents.get(&func) {
-                for dependent in nodes {
+            result.push(func.to_string());
+            if let Some(nodes) = dependents.get(func) {
+                for &dependent in nodes {
                     let deg = in_degree
                         .get_mut(dependent)
                         .expect("dependent index must reference a DAG node");
                     assert!(*deg > 0, "dependency index must not underflow");
                     *deg -= 1;
                     if *deg == 0 {
-                        ready.insert(dependent.clone());
+                        ready.insert(dependent);
                     }
                 }
             }
@@ -311,36 +315,46 @@ impl IncrementalComposition {
         }
 
         if change_kind == ChangeKind::SpecChanged {
-            // Build the reverse call index once, then BFS all transitive
-            // callers in O(V + E) rather than rescanning/cloning every node at
-            // every level.
-            let mut callers: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for node in self.dag.nodes.values() {
-                for dependency in &node.dependencies {
-                    callers.entry(dependency.clone()).or_default().push(node.function.clone());
-                }
-            }
-            let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-            queue.push_back(changed_fn.to_string());
-            let mut visited: BTreeSet<String> = BTreeSet::new();
-            visited.insert(changed_fn.to_string());
-
-            while let Some(current) = queue.pop_front() {
-                if let Some(direct_callers) = callers.get(&current) {
-                    for func in direct_callers {
-                        if !visited.insert(func.clone()) {
-                            continue;
-                        }
-                        invalidated.push(func.clone());
-                        self.stale.insert(func.clone());
-                        if let Some(stale_node) = self.dag.nodes.get_mut(func) {
-                            if stale_node.status == CompositionNodeStatus::Valid {
-                                stale_node.status = CompositionNodeStatus::Stale;
-                            }
-                        }
-                        queue.push_back(func.clone());
+            // Build the reverse call index once using borrowed slices, then BFS
+            // all transitive callers in O(V + E).
+            let transitive_callers: Vec<String> = {
+                let mut callers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+                for node in self.dag.nodes.values() {
+                    for dependency in &node.dependencies {
+                        callers
+                            .entry(dependency.as_str())
+                            .or_default()
+                            .push(node.function.as_str());
                     }
                 }
+                let mut queue: std::collections::VecDeque<&str> =
+                    std::collections::VecDeque::new();
+                queue.push_back(changed_fn);
+                let mut visited: BTreeSet<&str> = BTreeSet::new();
+                visited.insert(changed_fn);
+                let mut found = Vec::new();
+
+                while let Some(current) = queue.pop_front() {
+                    if let Some(direct_callers) = callers.get(current) {
+                        for &func in direct_callers {
+                            if visited.insert(func) {
+                                found.push(func.to_string());
+                                queue.push_back(func);
+                            }
+                        }
+                    }
+                }
+                found
+            };
+
+            for func in transitive_callers {
+                self.stale.insert(func.clone());
+                if let Some(stale_node) = self.dag.nodes.get_mut(&func)
+                    && stale_node.status == CompositionNodeStatus::Valid
+                {
+                    stale_node.status = CompositionNodeStatus::Stale;
+                }
+                invalidated.push(func);
             }
         }
 
@@ -400,11 +414,11 @@ impl IncrementalComposition {
     ///
     /// This includes stale records for diagnostics and grants no authority.
     pub fn function_strengths(&self) -> Vec<FunctionStrength> {
-        let mut strengths = Vec::new();
-        for func in self.dag.functions() {
-            if let Some(cert) = self.dag.get_certificate(&func) {
+        let mut strengths = Vec::with_capacity(self.dag.nodes.len());
+        for func in self.dag.nodes.keys() {
+            if let Some(cert) = self.dag.get_certificate(func) {
                 strengths.push(FunctionStrength {
-                    function: func,
+                    function: func.clone(),
                     strength: cert.solver.strength.clone(),
                     status: cert.status,
                 });
@@ -484,11 +498,10 @@ pub fn verify_composition(composition: &ProofComposition) -> CompositionVerifica
         }
     }
 
-    integrity_valid_functions.sort();
+    // `composition.nodes` is a BTreeMap, so `integrity_valid_functions`,
+    // `broken_chains`, and `stale_functions` are already in sorted order.
     missing_functions.sort();
     missing_functions.dedup();
-    broken_chains.sort();
-    stale_functions.sort();
 
     // Check for cycles
     let cycle = composition.detect_cycle();

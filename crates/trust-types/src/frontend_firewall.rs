@@ -13,7 +13,7 @@
 //! kernel lanes that admit them, and the repair loop that writes clauses back
 //! into source, so the two ends of the contract cannot drift apart.
 //!
-//! Three mechanisms, in increasing order of strength:
+//! Two mechanisms, in increasing order of strength:
 //!
 //! 1. [`ClaimProvenance`] is a *tag* every claim carries. It is checked by
 //!    [`admit_role`] at an admission boundary: a frontend-tagged term is
@@ -26,12 +26,12 @@
 //!    `into_hypothesis`, no `into_axiom`, and no `Deref` — a caller cannot
 //!    reach the payload except by first turning it into a goal, so the unsound
 //!    use is unrepresentable rather than merely rejected.
-//! 3. [`FidelityManifest`] fixes the evidence *before* the elaborator runs.
-//!    A frontend that picks its own oracle, shrinks its own input domain, or
-//!    grants itself a waiver has narrowed the evidence that judges it, which
-//!    the doctrine forbids as squarely as asserting a proposition. The manifest
-//!    is parsed from a pinned, digest-checked source that a runtime elaborator
-//!    has no writer for, and the selection accessors take `&self` only.
+//!
+//! The third mechanism, a pinned and digest-checked fidelity manifest that
+//! fixed a frontend's oracle, input domain, corpus and waivers before its
+//! elaborator ran, had one user, `trust-js-autoform`; both were deleted on
+//! 2026-11-10 with the other unused TrustJS crates (`git log` has them). A
+//! frontend that ships again brings its fidelity evidence back with it.
 //!
 //! # What this module is not
 //!
@@ -44,7 +44,6 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::digest::stable_sha256_hex;
 
 /// An untrusted, zero-authority source language.
 ///
@@ -202,17 +201,6 @@ pub enum FirewallRejection {
         /// The role it was offered in.
         role: ProofRole,
     },
-    /// A frontend tried to select fidelity evidence that the pinned manifest
-    /// does not contain — a narrower input domain, a different oracle, or a
-    /// waiver of its own making.
-    EvidenceNarrowed {
-        /// The frontend that attempted the selection.
-        language: FrontendLanguage,
-        /// The selection it asked for.
-        requested: String,
-        /// The manifest that does not offer it.
-        manifest: String,
-    },
 }
 
 impl fmt::Display for FirewallRejection {
@@ -222,12 +210,6 @@ impl fmt::Display for FirewallRejection {
                 f,
                 "frontend firewall: a {language} term may only be a goal, never a {role} \
                  (an untrusted frontend proposes; it never asserts)"
-            ),
-            Self::EvidenceNarrowed { language, requested, manifest } => write!(
-                f,
-                "frontend firewall: {language} requested fidelity selection `{requested}`, \
-                 which the pinned manifest `{manifest}` does not offer \
-                 (a frontend may not narrow the evidence that judges it)"
             ),
         }
     }
@@ -404,244 +386,6 @@ impl<T> ProofGoal<T> {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Fixed fidelity evidence
-// ───────────────────────────────────────────────────────────────────────────
-
-/// The four evidence selections a frontend must not make for itself.
-///
-/// Each is a name resolved against a [`FidelityManifest`]. A selection outside
-/// the manifest is [`FirewallRejection::EvidenceNarrowed`], which is what stops
-/// an elaborator from quietly swapping in a weaker oracle or a smaller domain
-/// when its proposal fails the pinned one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum FidelityAxis {
-    /// The corpus of cases the artifact is checked over.
-    Corpus,
-    /// The independent implementation the artifact is compared against.
-    Oracle,
-    /// The set of inputs each case is exercised with.
-    InputDomain,
-    /// A recorded, expiring exemption from a fidelity requirement.
-    Waiver,
-}
-
-impl FidelityAxis {
-    /// The stable wire name, used as the manifest's section key.
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Corpus => "corpus",
-            Self::Oracle => "oracle",
-            Self::InputDomain => "input_domain",
-            Self::Waiver => "waiver",
-        }
-    }
-}
-
-impl fmt::Display for FidelityAxis {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-/// The wire form of a pinned fidelity manifest.
-///
-/// Deserialized, never constructed field-by-field from a running elaborator:
-/// [`FidelityManifest`] keeps this private and exposes read-only accessors, and
-/// the parse verifies the digest the manifest declares over its own entries.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct FidelityManifestFile {
-    /// Schema tag. Pinned to [`FIDELITY_MANIFEST_SCHEMA`].
-    schema: String,
-    /// The manifest's stable identity, quoted in every rejection.
-    id: String,
-    /// The frontend this manifest fixes evidence for.
-    language: FrontendLanguage,
-    /// Admissible selections per axis, in the order written.
-    entries: Vec<FidelityEntry>,
-    /// sha256 over the canonical rendering of `entries` (see
-    /// [`FidelityManifest::digest_of`]). Self-describing so a tampered manifest
-    /// fails the parse rather than silently taking effect.
-    manifest_sha256: String,
-}
-
-/// One admissible fidelity selection.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FidelityEntry {
-    /// Which axis this entry fixes.
-    pub axis: FidelityAxis,
-    /// The selection's stable name, as the elaborator spells it.
-    pub name: String,
-    /// What the selection is, for a reader auditing the manifest.
-    pub description: String,
-    /// The selection's contents, in whatever shape the owning frontend reads.
-    ///
-    /// Naming an admissible corpus is weaker than *supplying* it: an elaborator
-    /// that resolves a name against the manifest and then builds the corpus
-    /// itself has still built the corpus itself. Putting the values here means
-    /// the sample set, the caps, and the shapes are inside the digest, so
-    /// shrinking any of them is manifest drift rather than a code change nobody
-    /// reviews. Defaults to `null` for an axis whose identity is the whole
-    /// content (an oracle is a named component, not a table).
-    #[serde(default)]
-    pub payload: serde_json::Value,
-}
-
-/// The schema tag every pinned fidelity manifest carries.
-pub const FIDELITY_MANIFEST_SCHEMA: &str = "trust.frontend.fidelity-manifest.v1";
-
-/// A pinned set of admissible fidelity selections.
-///
-/// # Why this exists
-///
-/// "The frontend may not narrow the evidence that judges it" is the half of the
-/// doctrine that is easiest to violate by accident: an elaborator that picks its
-/// corpus at runtime will, under pressure to raise a coverage number, pick a
-/// smaller one. Making the manifest the only source of admissible selections
-/// moves that decision out of the elaborator and into a reviewed file, and
-/// makes a drifted file fail the parse instead of taking effect.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FidelityManifest {
-    file: FidelityManifestFile,
-}
-
-impl FidelityManifest {
-    /// The canonical digest input for a manifest's entries: one
-    /// `axis\nname\ndescription\n<canonical-payload>\n` record per entry, in
-    /// written order.
-    ///
-    /// Order is part of the digest on purpose — a reordered manifest is a
-    /// different manifest, because "the first admissible corpus" is a selection
-    /// an elaborator could otherwise change without changing the contents. The
-    /// payload goes through [`crate::digest::canonical_json_bytes`] so that
-    /// whitespace and key order in the checked-in file cannot change the digest
-    /// while the values stay the same.
-    #[must_use]
-    pub fn digest_of(entries: &[FidelityEntry]) -> String {
-        let mut acc = String::new();
-        for entry in entries {
-            acc.push_str(entry.axis.name());
-            acc.push('\n');
-            acc.push_str(&entry.name);
-            acc.push('\n');
-            acc.push_str(&entry.description);
-            acc.push('\n');
-            match crate::digest::canonical_json_bytes(&entry.payload) {
-                Ok(bytes) => acc.push_str(&String::from_utf8_lossy(&bytes)),
-                // An unserializable payload cannot be digested, so it must not
-                // be digestible as if it were absent either: a distinct marker
-                // keeps it from colliding with a `null` payload.
-                Err(_) => acc.push_str("<uncanonicalizable-payload>"),
-            }
-            acc.push('\n');
-        }
-        stable_sha256_hex(acc.as_bytes())
-    }
-
-    /// Parse a pinned manifest, verifying its schema and its self-declared
-    /// digest.
-    ///
-    /// The intended call is `FidelityManifest::parse(include_str!(...))` from
-    /// the crate that owns the manifest, so the bytes are fixed at compile time
-    /// and a runtime elaborator has no writer for them at all.
-    ///
-    /// # Errors
-    ///
-    /// A string describing the schema mismatch, the parse failure, or the digest
-    /// drift. Every one of them is fail-closed: no manifest, no selections, and
-    /// therefore no admissible fidelity evidence.
-    pub fn parse(source: &str) -> Result<Self, String> {
-        let file: FidelityManifestFile =
-            serde_json::from_str(source).map_err(|e| format!("fidelity manifest parse: {e}"))?;
-        if file.schema != FIDELITY_MANIFEST_SCHEMA {
-            return Err(format!(
-                "fidelity manifest schema is {:?}, want {FIDELITY_MANIFEST_SCHEMA:?}",
-                file.schema
-            ));
-        }
-        let recomputed = Self::digest_of(&file.entries);
-        if recomputed != file.manifest_sha256 {
-            return Err(format!(
-                "fidelity manifest `{}` digest drift: recomputed {recomputed}, declared {}",
-                file.id, file.manifest_sha256
-            ));
-        }
-        Ok(Self { file })
-    }
-
-    /// The manifest's stable identity.
-    #[must_use]
-    pub fn id(&self) -> &str {
-        &self.file.id
-    }
-
-    /// The frontend this manifest fixes evidence for.
-    #[must_use]
-    pub fn language(&self) -> FrontendLanguage {
-        self.file.language
-    }
-
-    /// The verified digest over the manifest's entries.
-    #[must_use]
-    pub fn digest(&self) -> &str {
-        &self.file.manifest_sha256
-    }
-
-    /// Every admissible selection, in written order.
-    #[must_use]
-    pub fn entries(&self) -> &[FidelityEntry] {
-        &self.file.entries
-    }
-
-    /// Resolve a selection an elaborator asked for.
-    ///
-    /// # Errors
-    ///
-    /// [`FirewallRejection::EvidenceNarrowed`] when the manifest does not offer
-    /// the requested selection on that axis.
-    pub fn select(
-        &self,
-        axis: FidelityAxis,
-        name: &str,
-    ) -> Result<&FidelityEntry, FirewallRejection> {
-        self.file.entries.iter().find(|e| e.axis == axis && e.name == name).ok_or_else(|| {
-            FirewallRejection::EvidenceNarrowed {
-                language: self.file.language,
-                requested: format!("{axis}:{name}"),
-                manifest: self.file.id.clone(),
-            }
-        })
-    }
-
-    /// The single admissible selection on an axis, when the manifest fixes
-    /// exactly one.
-    ///
-    /// This is the shape the firewall wants for an oracle or an input domain:
-    /// one entry means the elaborator has no choice to make and therefore no
-    /// choice to get wrong. Zero or several entries is a rejection, not a
-    /// silent pick.
-    ///
-    /// # Errors
-    ///
-    /// [`FirewallRejection::EvidenceNarrowed`] when the axis does not hold
-    /// exactly one entry.
-    pub fn sole(&self, axis: FidelityAxis) -> Result<&FidelityEntry, FirewallRejection> {
-        let mut matching = self.file.entries.iter().filter(|e| e.axis == axis);
-        let first = matching.next();
-        let second = matching.next();
-        match (first, second) {
-            (Some(entry), None) => Ok(entry),
-            _ => Err(FirewallRejection::EvidenceNarrowed {
-                language: self.file.language,
-                requested: format!("{axis}:<sole>"),
-                manifest: self.file.id.clone(),
-            }),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,85 +450,5 @@ mod tests {
             assert!(p.requires_review(), "{lang} proposals must default to review");
             assert_eq!(p.frontend(), Some(lang));
         }
-    }
-
-    fn manifest_json(entries: &[FidelityEntry], tamper_digest: bool) -> String {
-        let digest =
-            if tamper_digest { "0".repeat(64) } else { FidelityManifest::digest_of(entries) };
-        serde_json::json!({
-            "schema": FIDELITY_MANIFEST_SCHEMA,
-            "id": "test.manifest",
-            "language": "JavaScript",
-            "entries": entries,
-            "manifest_sha256": digest,
-        })
-        .to_string()
-    }
-
-    fn entry(axis: FidelityAxis, name: &str) -> FidelityEntry {
-        FidelityEntry {
-            axis,
-            name: name.to_string(),
-            description: format!("{axis} {name}"),
-            payload: serde_json::Value::Null,
-        }
-    }
-
-    #[test]
-    fn manifest_rejects_a_selection_it_does_not_offer() {
-        let entries = vec![
-            entry(FidelityAxis::Oracle, "trust-js-interp"),
-            entry(FidelityAxis::InputDomain, "ieee754-edge-corners"),
-        ];
-        let manifest = FidelityManifest::parse(&manifest_json(&entries, false)).unwrap();
-        assert!(manifest.select(FidelityAxis::Oracle, "trust-js-interp").is_ok());
-        // The elaborator asking for its own, weaker oracle is the attack.
-        let narrowed = manifest.select(FidelityAxis::Oracle, "itself");
-        assert!(matches!(narrowed, Err(FirewallRejection::EvidenceNarrowed { .. })));
-        // No waiver in the manifest means no waiver, not "pick one".
-        assert!(manifest.sole(FidelityAxis::Waiver).is_err());
-        assert_eq!(manifest.sole(FidelityAxis::Oracle).unwrap().name, "trust-js-interp");
-    }
-
-    #[test]
-    fn tampered_manifest_fails_the_parse() {
-        let entries = vec![entry(FidelityAxis::Corpus, "s0")];
-        let err = FidelityManifest::parse(&manifest_json(&entries, true)).unwrap_err();
-        assert!(err.contains("digest drift"), "{err}");
-    }
-
-    #[test]
-    fn manifest_digest_covers_the_payload() {
-        // The whole point of carrying the values: shrinking a corpus must be
-        // manifest drift, not an invisible edit.
-        let mut wide = entry(FidelityAxis::InputDomain, "edges");
-        wide.payload = serde_json::json!({ "samples": [0.0, 1.0, -1.0] });
-        let mut narrow = wide.clone();
-        narrow.payload = serde_json::json!({ "samples": [0.0] });
-        assert_ne!(
-            FidelityManifest::digest_of(std::slice::from_ref(&wide)),
-            FidelityManifest::digest_of(std::slice::from_ref(&narrow))
-        );
-        // A narrowed corpus published under the wide manifest's digest fails
-        // the parse rather than taking effect.
-        let forged = serde_json::json!({
-            "schema": FIDELITY_MANIFEST_SCHEMA,
-            "id": "test.manifest",
-            "language": "JavaScript",
-            "entries": [narrow],
-            "manifest_sha256": FidelityManifest::digest_of(std::slice::from_ref(&wide)),
-        })
-        .to_string();
-        assert!(FidelityManifest::parse(&forged).unwrap_err().contains("digest drift"));
-    }
-
-    #[test]
-    fn manifest_digest_covers_order() {
-        let a = entry(FidelityAxis::Corpus, "a");
-        let b = entry(FidelityAxis::Corpus, "b");
-        assert_ne!(
-            FidelityManifest::digest_of(&[a.clone(), b.clone()]),
-            FidelityManifest::digest_of(&[b, a])
-        );
     }
 }

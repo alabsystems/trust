@@ -115,9 +115,14 @@ impl SimulationRelation {
         }
 
         // Check that all mapped target blocks actually exist.
-        let target_block_ids: Vec<BlockId> = target.body.blocks.iter().map(|bb| bb.id).collect();
         for target_id in self.block_map.values() {
-            if !target_block_ids.contains(target_id) {
+            let exists = target
+                .body
+                .blocks
+                .get(target_id.0 as usize)
+                .is_some_and(|bb| bb.id == *target_id)
+                || target.body.blocks.iter().any(|bb| bb.id == *target_id);
+            if !exists {
                 return Err(TranslationValidationError::InvalidTargetBlock { block: *target_id });
             }
         }
@@ -153,14 +158,13 @@ impl SimulationRelation {
         // Fall back to direct variable mapping.
         if let Some(&target_local) = self.variable_map.get(&source_local) {
             let decl = target.body.locals.get(target_local)?;
-            let fallback = format!("_{}", target_local);
-            let name = decl.name.as_deref().unwrap_or(&fallback);
+            let name = decl.name.clone().unwrap_or_else(|| format!("_{target_local}"));
             let sort = match &decl.ty {
                 Ty::Bool => Sort::Bool,
                 Ty::Int { .. } => Sort::Int,
                 other => Sort::from_ty(other),
             };
-            return Some(Formula::Var(name.to_string(), sort));
+            return Some(Formula::Var(name, sort));
         }
 
         None
@@ -236,11 +240,14 @@ pub fn infer_identity_relation(
 pub fn detect_back_edges(body: &VerifiableBody) -> Vec<(BlockId, BlockId)> {
     let mut edges = Vec::new();
     for block in &body.blocks {
-        for succ in block_successors_list(&block.terminator) {
-            if succ.0 <= block.id.0 && block.id.0 > 0 {
+        if block.id.0 == 0 {
+            continue;
+        }
+        crate::structural_termination::for_each_terminator_successor(&block.terminator, |succ| {
+            if succ.0 <= block.id.0 {
                 edges.push((succ, block.id));
             }
-        }
+        });
     }
     edges
 }

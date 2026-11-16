@@ -1,0 +1,467 @@
+{
+  "name": "vec_extract_if_o",
+  "def_path": "q::vec_extract_if_o",
+  "span": {
+    "file": "q.rs",
+    "line_start": 2,
+    "col_start": 0,
+    "line_end": 2,
+    "col_end": 113
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "alloc::vec::extract_if::ExtractIf",
+            "fields": [
+              [
+                "vec",
+                {
+                  "Ref": {
+                    "mutable": true,
+                    "inner": {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "idx",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "del",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "old_len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "pred",
+                {
+                  "Closure": {
+                    "name": "q::vec_extract_if_o::{closure#0}",
+                    "upvars": [],
+                    "call": {
+                      "kind": "FnMut",
+                      "params": [
+                        {
+                          "Ref": {
+                            "mutable": true,
+                            "inner": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      "ret": "Bool"
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 4
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 3,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "q.rs",
+                "line_start": 2,
+                "col_start": 86,
+                "line_end": 2,
+                "col_end": 90
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::extract_if::ExtractIf::<'_, u32, {closure@q.rs:2:93: 2:96}>::new::<core::ops::range::Range<usize>>",
+            "args": [
+              {
+                "Move": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "CallableItem": {
+                    "def_path": "q::vec_extract_if_o::{closure#0}",
+                    "kind": "closure",
+                    "def_path_hash": {
+                      "stable_crate_id": "3bd478a3fc57ed7e",
+                      "local_hash": "2168b01874831ef6"
+                    }
+                  }
+                }
+              },
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "library/alloc/src/vec/mod.rs",
+              "line_start": 4229,
+              "col_start": 8,
+              "line_end": 4229,
+              "col_end": 43
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 13023756115833718181,
+              "def_index": 8102,
+              "substs_digest": [
+                13737184098105430536,
+                6045590373883422637
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 13023756115833718181,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 5
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<alloc::vec::extract_if::ExtractIf<'_, u32, {closure@q.rs:2:93: 2:96}> as core::iter::traits::iterator::Iterator>::fold::<usize, {closure@<alloc::vec::extract_if::ExtractIf<'_, u32, {closure@q.rs:2:93: 2:96}> as core::iter::traits::iterator::Iterator>::count::{closure#0}}>",
+            "args": [
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    0,
+                    64
+                  ]
+                }
+              },
+              {
+                "Constant": {
+                  "CallableItem": {
+                    "def_path": "core::iter::traits::iterator::Iterator::count::{closure#0}",
+                    "kind": "closure",
+                    "def_path_hash": {
+                      "stable_crate_id": "e37fddd794679f6c",
+                      "local_hash": "baa581a8a8c6bdc1"
+                    }
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "library/core/src/iter/traits/iterator.rs",
+              "line_start": 229,
+              "col_start": 8,
+              "line_end": 233,
+              "col_end": 9
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 16393065086629420908,
+              "def_index": 10653,
+              "substs_digest": [
+                15697133822332616360,
+                3973065262543196195
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 16393065086629420908,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageDead": 4
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "a",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "a",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "b",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "b",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -4,9 +4,8 @@ use std::io;
 use std::io::ErrorKind;
 
 use crate::concurrency::VClock;
-use crate::shims::files::{FdId, FileDescription, FileDescriptionRef, WeakFileDescriptionRef};
+use crate::shims::files::{FileDescription, FileDescriptionRef};
 use crate::shims::unix::UnixFileDescription;
-use crate::shims::unix::linux_like::epoll::{EpollReadiness, EvalContextExt as _};
 use crate::*;
 
 /// Maximum value that the eventfd counter can hold.
@@ -30,6 +29,8 @@ struct EventFd {
     blocked_read_tid: RefCell<Vec<ThreadId>>,
     /// A list of thread ids blocked on eventfd::write.
     blocked_write_tid: RefCell<Vec<ThreadId>>,
+    /// State for being watched by epoll.
+    watched: ReadinessWatched,
 }
 
 impl FileDescription for EventFd {
@@ -39,18 +40,10 @@ impl FileDescription for EventFd {
 
     fn metadata<'tcx>(
         &self,
+        _communicate_allowed: bool,
     ) -> InterpResult<'tcx, Either<io::Result<std::fs::Metadata>, &'static str>> {
         // On Linux, eventfd is an "anonymous inode" reported as S_IFREG.
         interp_ok(Either::Right("S_IFREG"))
-    }
-
-    fn destroy<'tcx>(
-        self,
-        _self_id: FdId,
-        _communicate_allowed: bool,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        interp_ok(Ok(()))
     }
 
     /// Read the counter in the buffer and return the counter if succeeded.
@@ -109,23 +102,27 @@ impl FileDescription for EventFd {
         eventfd_write(buf_place, self, ecx, finish)
     }
 
-    fn as_unix<'tcx>(&self, _ecx: &MiriInterpCx<'tcx>) -> &dyn UnixFileDescription {
+    fn readiness_watched(&self) -> Option<&ReadinessWatched> {
+        Some(&self.watched)
+    }
+
+    fn readiness(&self) -> Readiness {
+        // We only check the "readable" and "writable" readiness for eventfd. If other event flags
+        // need to be supported in the future, the check should be added here.
+
+        Readiness {
+            readable: self.counter.get() != 0,
+            writable: self.counter.get() != MAX_COUNTER,
+            ..Readiness::EMPTY
+        }
+    }
+
+    fn as_unix(self: FileDescriptionRef<Self>) -> FileDescriptionRef<dyn UnixFileDescription> {
         self
     }
 }
 
-impl UnixFileDescription for EventFd {
-    fn epoll_active_events<'tcx>(&self) -> InterpResult<'tcx, EpollReadiness> {
-        // We only check the status of EPOLLIN and EPOLLOUT flags for eventfd. If other event flags
-        // need to be supported in the future, the check should be added here.
-
-        interp_ok(EpollReadiness {
-            epollin: self.counter.get() != 0,
-            epollout: self.counter.get() != MAX_COUNTER,
-            ..EpollReadiness::empty()
-        })
-    }
-}
+impl UnixFileDescription for EventFd {}
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
@@ -146,14 +143,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ///
     /// <https://linux.die.net/man/2/eventfd>
     fn eventfd(&mut self, val: &OpTy<'tcx>, flags: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {
-        let this = self.eval_context_mut();
+        let ecx = self.eval_context_mut();
 
-        let val = this.read_scalar(val)?.to_u32()?;
-        let mut flags = this.read_scalar(flags)?.to_i32()?;
+        let val = ecx.read_scalar(val)?.to_u32()?;
+        let mut flags = ecx.read_scalar(flags)?.to_i32()?;
 
-        let efd_cloexec = this.eval_libc_i32("EFD_CLOEXEC");
-        let efd_nonblock = this.eval_libc_i32("EFD_NONBLOCK");
-        let efd_semaphore = this.eval_libc_i32("EFD_SEMAPHORE");
+        let efd_cloexec = ecx.eval_libc_i32("EFD_CLOEXEC");
+        let efd_nonblock = ecx.eval_libc_i32("EFD_NONBLOCK");
+        let efd_semaphore = ecx.eval_libc_i32("EFD_SEMAPHORE");
 
         if flags & efd_semaphore == efd_semaphore {
             throw_unsup_format!("eventfd: EFD_SEMAPHORE is unsupported");
@@ -174,15 +171,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             throw_unsup_format!("eventfd: encountered unknown unsupported flags {:#x}", flags);
         }
 
-        let fds = &mut this.machine.fds;
+        let fds = &mut ecx.machine.fds;
 
-        let fd_value = fds.insert_new(EventFd {
+        let Some(fd_value) = fds.insert_new(EventFd {
             counter: Cell::new(val.into()),
             is_nonblock,
             clock: RefCell::new(VClock::default()),
             blocked_read_tid: RefCell::new(Vec::new()),
             blocked_write_tid: RefCell::new(Vec::new()),
-        });
+            watched: ReadinessWatched::default(),
+        }) else {
+            return ecx.set_errno_and_return_neg1_i32(LibcError("EMFILE"));
+        };
 
         interp_ok(Scalar::from_i32(fd_value))
     }
@@ -228,7 +228,7 @@ fn eventfd_write<'tcx>(
             // Linux seems to cause spurious wakeups here, and Tokio seems to rely on that
             // (see <https://github.com/rust-lang/miri/pull/4676#discussion_r2510528994>
             // and also <https://www.illumos.org/issues/16700>).
-            ecx.update_epoll_active_events(eventfd, /* force_edge */ true)?;
+            ecx.update_fd_readiness(eventfd, ReadinessUpdateFlags::FORCE_EDGE)?;
 
             // Return how many bytes we consumed from the user-provided buffer.
             return finish.call(ecx, Ok(buf_place.layout.size.bytes_usize()));
@@ -241,7 +241,6 @@ fn eventfd_write<'tcx>(
 
             eventfd.blocked_write_tid.borrow_mut().push(ecx.active_thread());
 
-            let weak_eventfd = FileDescriptionRef::downgrade(&eventfd);
             ecx.block_thread(
                 BlockReason::Eventfd,
                 None,
@@ -250,14 +249,11 @@ fn eventfd_write<'tcx>(
                         num: u64,
                         buf_place: MPlaceTy<'tcx>,
                         finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
-                        weak_eventfd: WeakFileDescriptionRef<EventFd>,
+                        eventfd: FileDescriptionRef<EventFd>,
                     }
                     |this, unblock: UnblockKind| {
                         assert_eq!(unblock, UnblockKind::Ready);
-                        // When we get unblocked, try again. We know the ref is still valid,
-                        // otherwise there couldn't be a `write` that unblocks us.
-                        let eventfd_ref = weak_eventfd.upgrade().unwrap();
-                        eventfd_write(buf_place, eventfd_ref, this, finish)
+                        eventfd_write(buf_place, eventfd, this, finish)
                     }
                 ),
             );
@@ -285,7 +281,6 @@ fn eventfd_read<'tcx>(
 
         eventfd.blocked_read_tid.borrow_mut().push(ecx.active_thread());
 
-        let weak_eventfd = FileDescriptionRef::downgrade(&eventfd);
         ecx.block_thread(
             BlockReason::Eventfd,
             None,
@@ -293,14 +288,11 @@ fn eventfd_read<'tcx>(
                 @capture<'tcx> {
                     buf_place: MPlaceTy<'tcx>,
                     finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
-                    weak_eventfd: WeakFileDescriptionRef<EventFd>,
+                    eventfd: FileDescriptionRef<EventFd>,
                 }
                 |this, unblock: UnblockKind| {
                     assert_eq!(unblock, UnblockKind::Ready);
-                    // When we get unblocked, try again. We know the ref is still valid,
-                    // otherwise there couldn't be a `write` that unblocks us.
-                    let eventfd_ref = weak_eventfd.upgrade().unwrap();
-                    eventfd_read(buf_place, eventfd_ref, this, finish)
+                    eventfd_read(buf_place, eventfd, this, finish)
                 }
             ),
         );
@@ -324,7 +316,7 @@ fn eventfd_read<'tcx>(
         // The state changed; we check and update the status of all supported event
         // types for current file description.
         // Linux seems to always emit do notifications here, even if we were already writable.
-        ecx.update_epoll_active_events(eventfd, /* force_edge */ true)?;
+        ecx.update_fd_readiness(eventfd, ReadinessUpdateFlags::FORCE_EDGE)?;
 
         // Tell userspace how many bytes we put into the buffer.
         return finish.call(ecx, Ok(buf_place.layout.size.bytes_usize()));

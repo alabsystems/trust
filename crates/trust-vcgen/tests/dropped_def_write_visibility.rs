@@ -34,12 +34,14 @@ use trust_types::{
     Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction, VerificationResult,
 };
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn load(name: &str) -> VerifiableFunction {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
     let text = std::fs::read_to_string(format!("{path}{name}.json"))
         .unwrap_or_else(|e| panic!("fixture `{name}` must be readable: {e}"));
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("fixture `{name}` must deserialize: {e}"))
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("fixture `{name}` must deserialize: {e}"))
 }
 
 /// DivisionByZero verdicts through the production composition — the same
@@ -52,7 +54,7 @@ fn divzero_verdicts(func: &VerifiableFunction) -> Vec<VerificationResult> {
         .into_iter()
         .filter(|vc| matches!(vc.kind, VcKind::DivisionByZero))
         .collect();
-    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+    let router = test_router::deterministic_test_router();
     router.verify_all(&vcs).into_iter().map(|(_, verdict)| verdict).collect()
 }
 
@@ -187,6 +189,7 @@ fn sibling() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

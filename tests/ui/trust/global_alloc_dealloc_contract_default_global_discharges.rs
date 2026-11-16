@@ -3,6 +3,14 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
+//@ check-pass
+// UPDATED 2026-09-21 (W3): this fixture is named for the property that the
+// DEFAULT `Global` allocator discharges the dealloc contract, and it did --
+// but the body still failed on a separate gap: a bare `Vec`'s drop glue was
+// refused because `Ty::Seq` never received the `AdtAuth::TotalDrop` stamp its
+// ADT siblings did. With that closed the file compiles clean, which is what
+// its name always claimed, so it is now `check-pass` rather than a fixture
+// that documented its own unrelated blocker.
 //! §5 STEP 5 (`GlobalAlloc::dealloc` caller contract), fixture (a) — the
 //! DEFAULT-`Global` direction. Plan of record:
 //! docs/design/2026-08-19-verified-sysroot-scoping.md §5 step 5.
@@ -34,5 +42,4 @@
 //! never registered in the interprocedural panic-free registry).
 pub fn consume(v: Vec<u8>) -> usize {
     v.len()
-    //~^^ ERROR Trust strict verification failed
 }

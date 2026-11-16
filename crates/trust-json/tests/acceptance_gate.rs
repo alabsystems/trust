@@ -5,7 +5,7 @@
 //!
 //! `differential_json.rs` generates its inputs — float bit patterns, Unicode
 //! sweeps, random trees, byte soup. This file uses inputs that already exist:
-//! the 2954 JSON documents committed to this repository, an enumerated table of
+//! the JSON documents pinned in `corpus_manifest.txt`, an enumerated table of
 //! the byte-exactness hazards, and a `#[derive(Deserialize)]` driven from both
 //! trees. Between them the two binaries cover the surface the phase-2 brief
 //! names.
@@ -111,11 +111,11 @@
 //! file that was already correct on disk. Any revert must bump the mtime.
 
 mod common;
-use common::{agree_on_parse, first_difference, same, to_inc};
+use std::path::{Path, PathBuf};
 
+use common::{agree_on_parse, first_difference, inc_from_slice, inc_from_str, same, to_inc};
 use incumbent_serde::Deserialize;
 use incumbent_serde_json as inc;
-use std::path::{Path, PathBuf};
 use trust_json as tj;
 
 // ===========================================================================
@@ -161,9 +161,7 @@ fn recompute_membership(root: &Path) -> Vec<String> {
         .split('\0')
         .filter(|p| !p.is_empty())
         .filter(|p| !p.starts_with("first-party/") && !p.starts_with("vendor/"))
-        .filter(|p| {
-            std::fs::metadata(root.join(p)).map(|m| m.len() < SIZE_CAP).unwrap_or(false)
-        })
+        .filter(|p| std::fs::metadata(root.join(p)).map(|m| m.len() < SIZE_CAP).unwrap_or(false))
         .map(str::to_owned)
         .collect();
     keep.sort();
@@ -206,6 +204,73 @@ fn corpus_membership_matches_the_pinned_manifest() {
     );
 }
 
+/// The SCOPE pin, and the standing answer to a question that keeps being asked.
+///
+/// `recompute_membership` drops a tracked `*.json` for exactly three documented
+/// reasons: the `first-party/` submodule prefix, the `vendor/` prefix, and the
+/// 1 MiB size cap. This test takes the FULL tracked set and checks that every
+/// path the rule drops is dropped for one of those three — so a fourth
+/// exclusion cannot be slipped into the rule, because it would drop paths this
+/// test cannot account for. It is deliberately NOT written by calling the rule
+/// twice: it re-derives the header's wording against `git ls-files` itself.
+///
+/// It exists because the cheap answer to this gate's churn is "stop sampling
+/// `reports/`", and that answer is wrong. Measured 2026-09-18: dropping that
+/// one directory takes `non-ASCII key` from 4 documents to 1 (floor 2) and
+/// `empty object` from 96 to 47 (floor 50) — the bulk machine-generated
+/// directory is also the rare-construct carrier. The manifest header holds the
+/// full table. Narrowing the sample by directory is the shrinking-corpus hazard
+/// by another name, and it has to be argued, not typed.
+#[test]
+fn the_membership_rule_is_exactly_the_documented_rule() {
+    let root = repo_root();
+    let out = std::process::Command::new("git")
+        .args(["ls-files", "-z", "--", "*.json"])
+        .current_dir(&root)
+        .output()
+        .expect("`git ls-files` must run: the corpus is defined by what is COMMITTED");
+    assert!(out.status.success(), "git ls-files failed: {:?}", out.status);
+    let all: Vec<String> = String::from_utf8(out.stdout)
+        .expect("git printed non-UTF-8 paths")
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    let kept: std::collections::BTreeSet<String> =
+        recompute_membership(&root).into_iter().collect();
+
+    let mut unaccounted: Vec<String> = Vec::new();
+    for p in &all {
+        if kept.contains(p) {
+            continue;
+        }
+        // A tracked path with no readable metadata is counted as dropped by the
+        // size cap, which is what `recompute_membership` does with it too; it
+        // cannot happen in a clean worktree and must not redden this test.
+        let oversized =
+            std::fs::metadata(root.join(p)).map(|m| m.len() >= SIZE_CAP).unwrap_or(true);
+        if !(p.starts_with("first-party/") || p.starts_with("vendor/") || oversized) {
+            unaccounted.push(p.clone());
+        }
+    }
+    println!(
+        "  membership rule: {} tracked *.json, {} sampled, {} excluded",
+        all.len(),
+        kept.len(),
+        all.len() - kept.len()
+    );
+    assert!(
+        unaccounted.is_empty(),
+        "the membership rule drops {} path(s) for a reason the manifest header does \
+         not document. A fourth exclusion narrows the SAMPLE, which is the \
+         shrinking-corpus hazard under another name — argue it in the header and \
+         here, or do not make it:{}",
+        unaccounted.len(),
+        unaccounted.iter().take(20).map(|p| format!("\n    {p}")).collect::<String>(),
+    );
+}
+
 /// The corpus differential. Read the module header for the four legs.
 #[test]
 fn corpus_round_trips_byte_for_byte() {
@@ -228,7 +293,7 @@ fn corpus_round_trips_byte_for_byte() {
         };
         bytes += src.len();
         let ours = tj::from_slice(&src);
-        let theirs = inc::from_slice::<inc::Value>(&src);
+        let theirs = inc_from_slice(&src);
 
         match (&ours, &theirs) {
             (Ok(a), Ok(b)) => {
@@ -440,22 +505,22 @@ fn corpus_still_exercises_every_measured_construct() {
     // Neither file is sufficient alone; do not delete either on the grounds
     // that the other is green.
     let floors: &[(&str, usize)] = &[
-        ("null", 2000),                     // 2593
-        ("bool", 2000),                     // 2730
-        ("float", 60),                      //   89  <- see the note above
-        ("non-integral float", 55),         //   82
-        ("exponent-notation float", 3),     //    5  <- and this one
-        ("negative number", 300),           //  512
-        ("integer beyond 2^53", 200),       //  399
-        ("empty string", 40),               //   54
-        ("control character in a string", 20), // 51
+        ("null", 2000),                         // 2593
+        ("bool", 2000),                         // 2730
+        ("float", 60),                          //   89  <- see the note above
+        ("non-integral float", 55),             //   82
+        ("exponent-notation float", 3),         //    5  <- and this one
+        ("negative number", 300),               //  512
+        ("integer beyond 2^53", 200),           //  399
+        ("empty string", 40),                   //   54
+        ("control character in a string", 20),  // 51
         ("quote or backslash in a string", 50), // 72
-        ("non-ASCII string", 10),           //   29
-        ("non-ASCII key", 2),               //    4
-        ("empty array", 2000),              // 2662
-        ("empty object", 50),               //   79
-        ("empty key", 2),                   //    5
-        ("nesting depth >= 5", 500),        // 2658
+        ("non-ASCII string", 10),               //   29
+        ("non-ASCII key", 2),                   //    4
+        ("empty array", 2000),                  // 2662
+        ("empty object", 50),                   //   79
+        ("empty key", 2),                       //    5
+        ("nesting depth >= 5", 500),            // 2658
     ];
     let mut short = Vec::new();
     for (k, floor) in floors {
@@ -493,15 +558,15 @@ fn the_byte_exactness_hazard_table_round_trips() {
     let cases: &[(&str, &str, &str)] = &[
         // (name, input document, the incumbent's compact re-serialization)
         ("positive exponent carries a SIGN", r#"{"a":1e30}"#, r#"{"a":1e+30}"#),
-        // NOT a typo, and the most instructive row in the table. `1e-30` is not
-        // representable; the correctly-rounded `f64` renders back as `1e-30`.
-        // The incumbent's DEFAULT number parser is deliberately imprecise (the
-        // `float_roundtrip` feature, which nothing in this tree enables, is what
-        // buys correct rounding), lands one ulp away, and the shortest rendering
-        // of THAT value is `9.999999999999999e-31`. Reproducing the imprecision
-        // is a requirement, not a defect: a "more correct" parser here changes
-        // the bytes of every float that goes through a proof bundle.
-        ("negative exponent, no padding", r#"{"a":1e-30}"#, r#"{"a":9.999999999999999e-31}"#),
+        // `1e-30` is not representable; the correctly-rounded `f64` renders
+        // back as `1e-30`. This row used to expect `9.999999999999999e-31`,
+        // the one-ulp-low value of serde_json's imprecise DEFAULT parse. That
+        // stopped being the incumbent when first-party/clean 99ddfe452 enabled
+        // `float_roundtrip` in clean-olean (unified into every `serde_json` in
+        // the graph; trust-json's Cargo.toml now names it on the oracle), and
+        // trust-json's parser became correctly rounded to match. The byte
+        // requirement is unchanged: agree with the incumbent exactly.
+        ("negative exponent, no padding", r#"{"a":1e-30}"#, r#"{"a":1e-30}"#),
         ("exponent is not zero-padded", r#"{"a":1e5}"#, r#"{"a":100000.0}"#),
         ("f64 threshold, low end", r#"[1e-5,1e-6]"#, "[0.00001,1e-6]"),
         ("f64 threshold, high end", r#"[1e15,1e16]"#, "[1000000000000000.0,1e+16]"),
@@ -521,18 +586,26 @@ fn the_byte_exactness_hazard_table_round_trips() {
         // control byte inside a string is malformed JSON and both sides reject
         // it -- which is asserted separately, in the rejection table.
         ("short escapes are the named ones", r#"["\b\t\n\f\r\"\\"]"#, r#"["\b\t\n\f\r\"\\"]"#),
-        ("other controls are lowercase \\u", r#"["\u0000\u0001\u001F"]"#, r#"["\u0000\u0001\u001f"]"#),
+        (
+            "other controls are lowercase \\u",
+            r#"["\u0000\u0001\u001F"]"#,
+            r#"["\u0000\u0001\u001f"]"#,
+        ),
         ("an escaped DEL is UNescaped on the way out", r#"["\u007f"]"#, "[\"\u{7f}\"]"),
         ("a \\u escape of a printable char is folded", r#"["\u0041\u00e9"]"#, "[\"Aé\"]"),
         ("surrogate pairs fold to one char", r#"["\ud834\udd1e"]"#, "[\"𝄞\"]"),
-        ("object keys sort, and sort by BYTES", r#"{"z":0,"a":0,"A":0,"":0,"é":0,"~":0}"#, r#"{"":0,"A":0,"a":0,"z":0,"~":0,"é":0}"#),
+        (
+            "object keys sort, and sort by BYTES",
+            r#"{"z":0,"a":0,"A":0,"":0,"é":0,"~":0}"#,
+            r#"{"":0,"A":0,"a":0,"z":0,"~":0,"é":0}"#,
+        ),
         ("duplicate keys: last wins", r#"{"a":1,"a":2,"a":3}"#, r#"{"a":3}"#),
         ("a key needing escapes is escaped", "{\"a\\nb\":1}", r#"{"a\nb":1}"#),
     ];
 
     let mut bad = Vec::new();
     for (name, src, expect) in cases {
-        let (ours, theirs) = match (tj::from_str(src), inc::from_str::<inc::Value>(src)) {
+        let (ours, theirs) = match (tj::from_str(src), inc_from_str(src)) {
             (Ok(a), Ok(b)) => (a, b),
             // Both rejecting is an error in THIS TABLE, not in the crate, and
             // saying so is the difference between a five-minute fix and an
@@ -606,18 +679,16 @@ fn empty_containers_are_byte_identical_compact_and_pretty() {
     ];
     for src in cases {
         let ours = tj::from_str(src).unwrap_or_else(|e| panic!("we rejected {src:?}: {e}"));
-        let theirs = inc::from_str::<inc::Value>(src)
-            .unwrap_or_else(|e| panic!("incumbent rejected {src:?}: {e}"));
+        let theirs =
+            inc_from_str(src).unwrap_or_else(|e| panic!("incumbent rejected {src:?}: {e}"));
         same(&ours, &theirs).unwrap_or_else(|w| panic!("{src:?}: {w}"));
         assert_eq!(
             tj::to_string(&ours).unwrap(),
             inc::to_string(&theirs).unwrap(),
             "compact {src:?}"
         );
-        let (o, t) = (
-            tj::to_string_pretty(&ours).unwrap(),
-            inc::to_string_pretty(&theirs).unwrap(),
-        );
+        let (o, t) =
+            (tj::to_string_pretty(&ours).unwrap(), inc::to_string_pretty(&theirs).unwrap());
         assert_eq!(o, t, "pretty {src:?}\n     ours: {o:?}\n   theirs: {t:?}");
         assert_eq!(tj::to_vec(&ours).unwrap(), inc::to_vec(&theirs).unwrap(), "to_vec {src:?}");
         assert_eq!(
@@ -670,16 +741,14 @@ fn deep_nesting_agrees_at_and_around_the_limit() {
     }
 
     let mut boundary = Vec::new();
-    for (name, build) in [
-        ("array", arrays as fn(usize) -> String),
-        ("object", objects),
-        ("mixed", mixed),
-    ] {
+    for (name, build) in
+        [("array", arrays as fn(usize) -> String), ("object", objects), ("mixed", mixed)]
+    {
         let mut last_ok = None;
         for d in 1..=200usize {
             let s = build(d);
             let ours = tj::from_str(&s);
-            let theirs = inc::from_str::<inc::Value>(&s);
+            let theirs = inc_from_str(&s);
             assert_eq!(
                 ours.is_ok(),
                 theirs.is_ok(),
@@ -788,32 +857,101 @@ struct Limits {
 /// failure the brief names.
 fn typed_cases() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("everything present", r#"{"name":"trust","channel":"trust","build":42,"tags":["a","b"],"note":"hi","limits":{"max":9,"min":-9},"ratio":0.5,"signed":true}"#),
-        ("optional fields ABSENT", r#"{"name":"trust","channel":"stable","build":1,"ratio":0.5,"signed":false}"#),
-        ("optional fields NULL", r#"{"name":"trust","channel":"stable","build":1,"note":null,"limits":null,"ratio":0.5,"signed":false}"#),
-        ("defaulted field absent", r#"{"name":"trust","channel":"beta","build":1,"note":null,"limits":null,"ratio":0.5,"signed":false}"#),
-        ("defaulted field null", r#"{"name":"trust","channel":"beta","build":1,"tags":null,"ratio":0.5,"signed":false}"#),
-        ("MISSING required scalar", r#"{"name":"trust","channel":"stable","ratio":0.5,"signed":false}"#),
+        (
+            "everything present",
+            r#"{"name":"trust","channel":"trust","build":42,"tags":["a","b"],"note":"hi","limits":{"max":9,"min":-9},"ratio":0.5,"signed":true}"#,
+        ),
+        (
+            "optional fields ABSENT",
+            r#"{"name":"trust","channel":"stable","build":1,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "optional fields NULL",
+            r#"{"name":"trust","channel":"stable","build":1,"note":null,"limits":null,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "defaulted field absent",
+            r#"{"name":"trust","channel":"beta","build":1,"note":null,"limits":null,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "defaulted field null",
+            r#"{"name":"trust","channel":"beta","build":1,"tags":null,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "MISSING required scalar",
+            r#"{"name":"trust","channel":"stable","ratio":0.5,"signed":false}"#,
+        ),
         ("MISSING required string", r#"{"channel":"stable","build":1,"ratio":0.5,"signed":false}"#),
-        ("UNKNOWN field at the top", r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":false,"extra":1}"#),
-        ("UNKNOWN field when nested", r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":false,"limits":{"max":1,"min":2,"mid":3}}"#),
-        ("MISSING field when nested", r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":false,"limits":{"max":1}}"#),
-        ("WRONG type: string for u64", r#"{"name":"t","channel":"stable","build":"1","ratio":0.5,"signed":false}"#),
-        ("WRONG type: negative for u64", r#"{"name":"t","channel":"stable","build":-1,"ratio":0.5,"signed":false}"#),
-        ("WRONG type: float for u64", r#"{"name":"t","channel":"stable","build":1.5,"ratio":0.5,"signed":false}"#),
-        ("WRONG type: string for bool", r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":"true"}"#),
-        ("WRONG type: null for String", r#"{"name":null,"channel":"stable","build":1,"ratio":0.5,"signed":false}"#),
-        ("WRONG type: object for i64", r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":false,"limits":3}"#),
-        ("WRONG type: number in a Vec<String>", r#"{"name":"t","channel":"stable","build":1,"tags":["a",1],"ratio":0.5,"signed":false}"#),
-        ("INT where a float is wanted", r#"{"name":"t","channel":"stable","build":1,"ratio":2,"signed":false}"#),
-        ("UNKNOWN enum variant", r#"{"name":"t","channel":"nightly","build":1,"ratio":0.5,"signed":false}"#),
-        ("enum variant with wrong case", r#"{"name":"t","channel":"Stable","build":1,"ratio":0.5,"signed":false}"#),
-        ("u64 boundary", r#"{"name":"t","channel":"stable","build":18446744073709551615,"ratio":0.5,"signed":false}"#),
-        ("u64 boundary + 1 (overflows)", r#"{"name":"t","channel":"stable","build":18446744073709551616,"ratio":0.5,"signed":false}"#),
+        (
+            "UNKNOWN field at the top",
+            r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":false,"extra":1}"#,
+        ),
+        (
+            "UNKNOWN field when nested",
+            r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":false,"limits":{"max":1,"min":2,"mid":3}}"#,
+        ),
+        (
+            "MISSING field when nested",
+            r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":false,"limits":{"max":1}}"#,
+        ),
+        (
+            "WRONG type: string for u64",
+            r#"{"name":"t","channel":"stable","build":"1","ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "WRONG type: negative for u64",
+            r#"{"name":"t","channel":"stable","build":-1,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "WRONG type: float for u64",
+            r#"{"name":"t","channel":"stable","build":1.5,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "WRONG type: string for bool",
+            r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":"true"}"#,
+        ),
+        (
+            "WRONG type: null for String",
+            r#"{"name":null,"channel":"stable","build":1,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "WRONG type: object for i64",
+            r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":false,"limits":3}"#,
+        ),
+        (
+            "WRONG type: number in a Vec<String>",
+            r#"{"name":"t","channel":"stable","build":1,"tags":["a",1],"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "INT where a float is wanted",
+            r#"{"name":"t","channel":"stable","build":1,"ratio":2,"signed":false}"#,
+        ),
+        (
+            "UNKNOWN enum variant",
+            r#"{"name":"t","channel":"nightly","build":1,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "enum variant with wrong case",
+            r#"{"name":"t","channel":"Stable","build":1,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "u64 boundary",
+            r#"{"name":"t","channel":"stable","build":18446744073709551615,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "u64 boundary + 1 (overflows)",
+            r#"{"name":"t","channel":"stable","build":18446744073709551616,"ratio":0.5,"signed":false}"#,
+        ),
         ("top level is an array", r#"[{"name":"t"}]"#),
         ("top level is a scalar", r#"7"#),
-        ("DUPLICATE required key", r#"{"name":"t","channel":"stable","build":1,"build":2,"ratio":0.5,"signed":false}"#),
-        ("DUPLICATE optional key", r#"{"name":"t","channel":"stable","build":1,"note":"a","note":"b","ratio":0.5,"signed":false}"#),
+        (
+            "DUPLICATE required key",
+            r#"{"name":"t","channel":"stable","build":1,"build":2,"ratio":0.5,"signed":false}"#,
+        ),
+        (
+            "DUPLICATE optional key",
+            r#"{"name":"t","channel":"stable","build":1,"note":"a","note":"b","ratio":0.5,"signed":false}"#,
+        ),
     ]
 }
 
@@ -846,7 +984,7 @@ fn one_derive_two_trees_reach_the_same_verdict() {
                 continue;
             }
         };
-        let theirs_tree = match inc::from_str::<inc::Value>(src) {
+        let theirs_tree = match inc_from_str(src) {
             Ok(v) => v,
             Err(e) => {
                 bad.push(format!("{name}: the incumbent failed to PARSE {src:?}: {e}"));
@@ -868,7 +1006,11 @@ fn one_derive_two_trees_reach_the_same_verdict() {
         // two PARSERS as well, which is a separate claim from the typed one.
         agree_on_parse(src);
     }
-    println!("  typed lens: {} cases — {ok} deserialized, {err} rejected, {} disagreements", typed_cases().len(), bad.len());
+    println!(
+        "  typed lens: {} cases — {ok} deserialized, {err} rejected, {} disagreements",
+        typed_cases().len(),
+        bad.len()
+    );
     assert!(bad.is_empty(), "{} typed disagreement(s):\n{}", bad.len(), bad.join("\n"));
 }
 
@@ -887,7 +1029,10 @@ fn the_typed_verdicts_are_what_the_incumbent_says_they_are() {
         ("defaulted field null", "Err(invalid type: null, expected a sequence)"),
         ("MISSING required scalar", "Err(missing field `build`)"),
         ("MISSING required string", "Err(missing field `name`)"),
-        ("UNKNOWN field at the top", "Err(unknown field `extra`, expected one of `name`, `channel`, `build`, `tags`, `note`, `limits`, `ratio`, `signed`)"),
+        (
+            "UNKNOWN field at the top",
+            "Err(unknown field `extra`, expected one of `name`, `channel`, `build`, `tags`, `note`, `limits`, `ratio`, `signed`)",
+        ),
         ("UNKNOWN field when nested", "Err(unknown field `mid`, expected `max` or `min`)"),
         ("MISSING field when nested", "Err(missing field `min`)"),
         ("WRONG type: string for u64", "Err(invalid type: string \"1\", expected u64)"),
@@ -896,10 +1041,19 @@ fn the_typed_verdicts_are_what_the_incumbent_says_they_are() {
         ("WRONG type: string for bool", "Err(invalid type: string \"true\", expected a boolean)"),
         ("WRONG type: null for String", "Err(invalid type: null, expected a string)"),
         ("WRONG type: object for i64", "Err(invalid type: integer `3`, expected struct Limits)"),
-        ("WRONG type: number in a Vec<String>", "Err(invalid type: integer `1`, expected a string)"),
+        (
+            "WRONG type: number in a Vec<String>",
+            "Err(invalid type: integer `1`, expected a string)",
+        ),
         ("INT where a float is wanted", "Ok"),
-        ("UNKNOWN enum variant", "Err(unknown variant `nightly`, expected one of `stable`, `beta`, `trust`)"),
-        ("enum variant with wrong case", "Err(unknown variant `Stable`, expected one of `stable`, `beta`, `trust`)"),
+        (
+            "UNKNOWN enum variant",
+            "Err(unknown variant `nightly`, expected one of `stable`, `beta`, `trust`)",
+        ),
+        (
+            "enum variant with wrong case",
+            "Err(unknown variant `Stable`, expected one of `stable`, `beta`, `trust`)",
+        ),
         ("u64 boundary", "Ok"),
         // Two rows that were guessed wrong and corrected against the incumbent,
         // both worth keeping for what they reveal:
@@ -910,7 +1064,10 @@ fn the_typed_verdicts_are_what_the_incumbent_says_they_are() {
         //   * `deserialize_struct` accepts a SEQUENCE (the tuple form), so a
         //     top-level array is not rejected as "expected a struct"; it is
         //     accepted as a field list and fails on the first field's type.
-        ("u64 boundary + 1 (overflows)", "Err(invalid type: floating point `1.8446744073709552e+19`, expected u64)"),
+        (
+            "u64 boundary + 1 (overflows)",
+            "Err(invalid type: floating point `1.8446744073709552e+19`, expected u64)",
+        ),
         ("top level is an array", "Err(invalid type: map, expected a string)"),
         ("top level is a scalar", "Err(invalid type: integer `7`, expected struct Release)"),
         ("DUPLICATE required key", "Ok"),
@@ -951,14 +1108,12 @@ fn the_typed_verdicts_are_what_the_incumbent_says_they_are() {
 #[test]
 fn a_missing_field_and_an_explicit_null_are_distinct_in_the_tree() {
     let absent = r#"{"name":"t","channel":"stable","build":1,"ratio":0.5,"signed":false}"#;
-    let explicit = r#"{"name":"t","channel":"stable","build":1,"note":null,"ratio":0.5,"signed":false}"#;
+    let explicit =
+        r#"{"name":"t","channel":"stable","build":1,"note":null,"ratio":0.5,"signed":false}"#;
 
     // Level 1: the tree. Both implementations must draw the same distinction.
     let (oa, ea) = (tj::from_str(absent).unwrap(), tj::from_str(explicit).unwrap());
-    let (ob, eb) = (
-        inc::from_str::<inc::Value>(absent).unwrap(),
-        inc::from_str::<inc::Value>(explicit).unwrap(),
-    );
+    let (ob, eb) = (inc_from_str(absent).unwrap(), inc_from_str(explicit).unwrap());
     assert!(oa.get("note").is_none(), "ours: an absent key must not materialise");
     assert!(ob.get("note").is_none(), "incumbent: an absent key must not materialise");
     assert_eq!(ea.get("note").map(|v| v.is_null()), Some(true), "ours: explicit null");
@@ -976,9 +1131,7 @@ fn a_missing_field_and_an_explicit_null_are_distinct_in_the_tree() {
     );
 
     // Level 3: the derive. The same, and the same on both sides.
-    for (label, ours_tree, theirs_tree) in
-        [("absent", &oa, &ob), ("explicit null", &ea, &eb)]
-    {
+    for (label, ours_tree, theirs_tree) in [("absent", &oa, &ob), ("explicit null", &ea, &eb)] {
         let ours = inc::from_value::<Release>(to_inc(ours_tree)).expect(label);
         let theirs = inc::from_value::<Release>(theirs_tree.clone()).expect(label);
         assert_eq!(ours, theirs, "{label}");
@@ -1007,7 +1160,7 @@ fn duplicate_keys_collapse_in_the_tree_but_are_rejected_by_the_streaming_reader(
 
     // Both PARSERS collapse identically, last wins. This is the claim about us.
     let ours = tj::from_str(src).unwrap();
-    let theirs = inc::from_str::<inc::Value>(src).unwrap();
+    let theirs = inc_from_str(src).unwrap();
     same(&ours, &theirs).unwrap();
     assert_eq!(ours.get("build").unwrap().as_u64(), Some(2));
     assert_eq!(tj::to_string(&ours).unwrap(), inc::to_string(&theirs).unwrap());

@@ -3,6 +3,8 @@ use std::fmt;
 use std::io;
 use std::io::Write;
 
+use similar::{Algorithm, ChangeTag};
+
 use crate::config::{Color, Config, Verbosity};
 
 #[derive(Debug, PartialEq)]
@@ -176,8 +178,79 @@ impl OutputWriter {
     }
 }
 
+/// Largest dense LCS table, in cells, that the legacy `diff::lines` path may
+/// build. `diff` 0.1 trims the common prefix and suffix and then allocates a
+/// `u32` table of `(n + 1) * (m + 1)` cells over the remaining middle, so two
+/// distant edits in a 50k-line file cost gigabytes. 4M cells is 16 MiB.
+const LEGACY_DIFF_MAX_CELLS: usize = 1 << 22;
+
 // Produces a diff between the expected output and actual output of rustfmt.
 pub(crate) fn make_diff(expected: &str, actual: &str, context_size: usize) -> Vec<Mismatch> {
+    make_diff_bounded(expected, actual, context_size, LEGACY_DIFF_MAX_CELLS)
+}
+
+/// Uses the legacy dense-LCS diff when its table fits in `max_legacy_cells`, so
+/// every hunk rustfmt reported before is reported byte-identically (ambiguous
+/// alignments included, which `modified` and `json` output expose). Above the
+/// bound it switches to linear-space Myers, which is also minimal but may
+/// align an ambiguous edit differently.
+fn make_diff_bounded(
+    expected: &str,
+    actual: &str,
+    context_size: usize,
+    max_legacy_cells: usize,
+) -> Vec<Mismatch> {
+    let expected_lines: Vec<_> = expected.lines().collect();
+    let actual_lines: Vec<_> = actual.lines().collect();
+    if legacy_table_cells(&expected_lines, &actual_lines) <= max_legacy_cells {
+        let changes = diff::lines(expected, actual)
+            .into_iter()
+            .map(|change| match change {
+                diff::Result::Left(line) => (ChangeTag::Delete, line),
+                diff::Result::Right(line) => (ChangeTag::Insert, line),
+                diff::Result::Both(line, _) => (ChangeTag::Equal, line),
+            });
+        return make_diff_from_changes(changes, context_size);
+    }
+
+    // Dense LCS tables require quadratic space even when only two distant lines
+    // differ. Myers keeps linear-size frontiers and captures a minimal edit script.
+    let ops = similar::capture_diff_slices(Algorithm::Myers, &expected_lines, &actual_lines);
+    let changes = ops
+        .iter()
+        .flat_map(|op| op.iter_changes(&expected_lines, &actual_lines))
+        .map(|change| (change.tag(), change.value()));
+
+    // Preserve diff::lines' convention: str::lines normalizes CRLF and omits the
+    // final empty item. Append that item after diffing, so it cannot move a hunk.
+    let trailing_newline = match (expected.ends_with('\n'), actual.ends_with('\n')) {
+        (true, true) => Some((ChangeTag::Equal, "")),
+        (true, false) => Some((ChangeTag::Delete, "")),
+        (false, true) => Some((ChangeTag::Insert, "")),
+        (false, false) => None,
+    };
+    make_diff_from_changes(changes.chain(trailing_newline), context_size)
+}
+
+/// The number of cells `diff` 0.1 would allocate for these lines: it trims the
+/// common prefix and suffix exactly like this before building its table.
+fn legacy_table_cells(left: &[&str], right: &[&str]) -> usize {
+    let leading = left.iter().zip(right).take_while(|(l, r)| l == r).count();
+    let trailing = left[leading..]
+        .iter()
+        .rev()
+        .zip(right[leading..].iter().rev())
+        .take_while(|(l, r)| l == r)
+        .count();
+    let rows = left.len() - leading - trailing + 1;
+    let cols = right.len() - leading - trailing + 1;
+    rows.saturating_mul(cols)
+}
+
+fn make_diff_from_changes<'a>(
+    changes: impl Iterator<Item = (ChangeTag, &'a str)>,
+    context_size: usize,
+) -> Vec<Mismatch> {
     let mut line_number = 1;
     let mut line_number_orig = 1;
     let mut context_queue: VecDeque<&str> = VecDeque::with_capacity(context_size);
@@ -185,9 +258,9 @@ pub(crate) fn make_diff(expected: &str, actual: &str, context_size: usize) -> Ve
     let mut results = Vec::new();
     let mut mismatch = Mismatch::new(0, 0);
 
-    for result in diff::lines(expected, actual) {
+    for result in changes {
         match result {
-            diff::Result::Left(str) => {
+            (ChangeTag::Delete, str) => {
                 if lines_since_mismatch >= context_size && lines_since_mismatch > 0 {
                     results.push(mismatch);
                     mismatch = Mismatch::new(
@@ -204,7 +277,7 @@ pub(crate) fn make_diff(expected: &str, actual: &str, context_size: usize) -> Ve
                 line_number_orig += 1;
                 lines_since_mismatch = 0;
             }
-            diff::Result::Right(str) => {
+            (ChangeTag::Insert, str) => {
                 if lines_since_mismatch >= context_size && lines_since_mismatch > 0 {
                     results.push(mismatch);
                     mismatch = Mismatch::new(
@@ -221,7 +294,7 @@ pub(crate) fn make_diff(expected: &str, actual: &str, context_size: usize) -> Ve
                 line_number += 1;
                 lines_since_mismatch = 0;
             }
-            diff::Result::Both(str, _) => {
+            (ChangeTag::Equal, str) => {
                 if context_queue.len() >= context_size {
                     let _ = context_queue.pop_front();
                 }
@@ -282,7 +355,10 @@ where
 #[cfg(test)]
 mod test {
     use super::DiffLine::*;
-    use super::{Mismatch, make_diff};
+    use super::{
+        ChangeTag, LEGACY_DIFF_MAX_CELLS, Mismatch, legacy_table_cells, make_diff,
+        make_diff_bounded, make_diff_from_changes,
+    };
     use super::{ModifiedChunk, ModifiedLines};
 
     #[test]
@@ -364,6 +440,258 @@ mod test {
                 lines: vec![Context("five".to_owned()), Expected("".to_owned())],
             }]
         );
+    }
+
+    // The Myers fallback, forced regardless of input size (every table has at
+    // least one cell). The tests below pin it against the legacy algorithm.
+    fn myers_diff(old: &str, new: &str, context: usize) -> Vec<Mismatch> {
+        make_diff_bounded(old, new, context, 0)
+    }
+
+    // Only tiny cases use the old quadratic implementation. Both algorithms feed
+    // the same unchanged hunk builder, so equality checks include its coordinates,
+    // context and ordering instead of comparing only a changed/not-changed flag.
+    fn legacy_diff(old: &str, new: &str, context: usize) -> Vec<Mismatch> {
+        assert!(old.lines().count() <= 32 && new.lines().count() <= 32);
+        let changes = diff::lines(old, new)
+            .into_iter()
+            .map(|change| match change {
+                diff::Result::Left(line) => (ChangeTag::Delete, line),
+                diff::Result::Right(line) => (ChangeTag::Insert, line),
+                diff::Result::Both(line, _) => (ChangeTag::Equal, line),
+            });
+        make_diff_from_changes(changes, context)
+    }
+
+    // Check the public modified-lines representation against the entire input.
+    // Keep the old final-newline token convention independently of the matcher.
+    fn assert_reconstructs(old: &str, new: &str) {
+        let tokens = |text: &str| {
+            let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            if text.ends_with('\n') {
+                lines.push(String::new());
+            }
+            lines
+        };
+        for diff in [make_diff(old, new, 0), myers_diff(old, new, 0)] {
+            let mut reconstructed = tokens(old);
+            let modified = ModifiedLines::from(diff);
+            for chunk in modified.chunks.iter().rev() {
+                let start = (chunk.line_number_orig - 1) as usize;
+                let end = start + chunk.lines_removed as usize;
+                reconstructed.splice(start..end, chunk.lines.iter().cloned());
+            }
+            assert_eq!(reconstructed, tokens(new), "old={old:?}, new={new:?}");
+        }
+    }
+
+    #[test]
+    fn diff_matches_legacy_unambiguous_cases() {
+        for (old, new) in [
+            ("", ""),
+            ("", "one"),
+            ("one", ""),
+            ("", "\n"),
+            ("\n", ""),
+            ("one", "one\n"),
+            ("one\n", "one"),
+            ("one\n", "one\n"),
+            ("one\ntwo", "zero\none\ntwo"),
+            ("one\ntwo", "one\ntwo\nthree"),
+            ("zero\none\ntwo", "one\ntwo"),
+            ("one\ntwo\nthree", "one\ntwo"),
+            ("old\nbody\nend", "new\nbody\nend"),
+            ("start\nbody\nold", "start\nbody\nnew"),
+            ("one\r\ntwo\r\n", "one\ntwo\n"),
+            ("α\nβ\n終\n", "α\nγ\n終\n"),
+        ] {
+            for context in [0, 1, 3] {
+                assert_eq!(
+                    myers_diff(old, new, context),
+                    legacy_diff(old, new, context)
+                );
+            }
+            assert_reconstructs(old, new);
+        }
+    }
+
+    #[test]
+    fn diff_final_newline_removal_and_crlf() {
+        assert_eq!(
+            myers_diff("one\n", "one", 0),
+            vec![Mismatch {
+                line_number: 2,
+                line_number_orig: 2,
+                lines: vec![Resulting(String::new())],
+            }]
+        );
+        assert!(myers_diff("one\r\ntwo\r\n", "one\ntwo\n", 0).is_empty());
+        assert_reconstructs("one\r\ntwo\r\n", "one\ntwo");
+    }
+
+    #[test]
+    fn diff_repeated_lines_keep_order_and_coordinates() {
+        let old = "start\n{\n\n}\n{\n\n}\nend\n";
+        let new = "start\n{\nchanged\n}\n{\n\n}\nend\n";
+        assert_eq!(
+            myers_diff(old, new, 1),
+            vec![Mismatch {
+                line_number: 2,
+                line_number_orig: 2,
+                lines: vec![
+                    Context("{".to_owned()),
+                    Resulting(String::new()),
+                    Expected("changed".to_owned()),
+                    Context("}".to_owned()),
+                ],
+            }]
+        );
+        assert_eq!(
+            myers_diff("x\nx\nx\n", "x\nx\n", 0),
+            vec![Mismatch {
+                line_number: 3,
+                line_number_orig: 3,
+                lines: vec![Resulting("x".to_owned())],
+            }]
+        );
+        assert_reconstructs(old, new);
+    }
+
+    #[test]
+    fn diff_small_repeated_inputs_are_minimal_and_reconstruct() {
+        let mut inputs = vec![String::new()];
+        for len in 1..=3 {
+            for mask in 0..(1 << len) {
+                inputs.push(
+                    (0..len)
+                        .map(|i| if mask & (1 << i) == 0 { "a" } else { "b" })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        }
+        let base_inputs = inputs.clone();
+        inputs.extend(base_inputs.into_iter().map(|text| format!("{text}\n")));
+        for old in &inputs {
+            for new in &inputs {
+                let diff = myers_diff(old, new, 0);
+                let edit_count = diff
+                    .iter()
+                    .flat_map(|hunk| &hunk.lines)
+                    .filter(|line| !matches!(line, Context(_)))
+                    .count();
+                let minimum = diff::lines(old, new)
+                    .iter()
+                    .filter(|line| !matches!(line, diff::Result::Both(_, _)))
+                    .count();
+                assert_eq!(edit_count, minimum, "old={old:?}, new={new:?}");
+                assert_reconstructs(old, new);
+                assert_eq!(diff, myers_diff(old, new, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn diff_nearby_edits_keep_existing_context_merging() {
+        let old = "zero\none\ntwo\nthree\nfour\nfive\n";
+        let new = "zero\nONE\ntwo\nTHREE\nfour\nfive\n";
+        assert_eq!(myers_diff(old, new, 2), legacy_diff(old, new, 2));
+        assert_eq!(myers_diff(old, new, 2).len(), 1);
+        assert_reconstructs(old, new);
+    }
+
+    #[test]
+    fn diff_all_distinct_lines_roundtrip() {
+        let old = (0..128).map(|i| format!("old-{i}\n")).collect::<String>();
+        let new = (0..128).map(|i| format!("new-{i}\n")).collect::<String>();
+        let diff = myers_diff(&old, &new, 0);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].line_number_orig, 1);
+        assert_eq!(diff[0].line_number, 1);
+        assert_eq!(diff[0].lines.len(), 256);
+        assert!(
+            diff[0].lines[..128]
+                .iter()
+                .all(|line| matches!(line, Resulting(_)))
+        );
+        assert!(
+            diff[0].lines[128..]
+                .iter()
+                .all(|line| matches!(line, Expected(_)))
+        );
+        assert_reconstructs(&old, &new);
+    }
+
+    #[test]
+    fn diff_large_separated_edits_use_two_exact_hunks() {
+        // Two distant edits defeat prefix/suffix trimming in dense LCS. At
+        // 60,000 lines its u32 table would exceed 13 GiB. Never run that oracle
+        // here: the large regression exercises only the production algorithm.
+        let old_lines: Vec<_> = (0..60_000).map(|i| format!("line-{i:05}")).collect();
+        let mut new_lines = old_lines.clone();
+        new_lines[1] = "changed-near-start".to_owned();
+        new_lines[59_998] = "changed-near-end".to_owned();
+        let old = old_lines.join("\n") + "\n";
+        let new = new_lines.join("\n") + "\n";
+        assert_eq!(
+            make_diff(&old, &new, 1),
+            vec![
+                Mismatch {
+                    line_number: 1,
+                    line_number_orig: 1,
+                    lines: vec![
+                        Context("line-00000".to_owned()),
+                        Resulting("line-00001".to_owned()),
+                        Expected("changed-near-start".to_owned()),
+                        Context("line-00002".to_owned()),
+                    ],
+                },
+                Mismatch {
+                    line_number: 59_998,
+                    line_number_orig: 59_998,
+                    lines: vec![
+                        Context("line-59997".to_owned()),
+                        Resulting("line-59998".to_owned()),
+                        Expected("changed-near-end".to_owned()),
+                        Context("line-59999".to_owned()),
+                    ],
+                },
+            ]
+        );
+        assert_reconstructs(&old, &new);
+    }
+
+    #[test]
+    fn small_inputs_keep_the_legacy_alignment() {
+        // An ambiguous edit where the two minimal scripts differ: blank lines
+        // can pair with either neighbour. `make_diff` must report the legacy
+        // alignment (what `modified`/`json` output has always shown).
+        let old = "a\n\nfn\nblah\n()\n{ }\n\n\n#[cfg\n(  a , b\n)]\nfn\nmain() {}\n";
+        let new = "a\n\nfn blah() {}\n\n#[cfg(a, b)]\nfn main() {}\n";
+        for context in [0, 1, 3] {
+            assert_eq!(make_diff(old, new, context), legacy_diff(old, new, context));
+        }
+        // Guard the guard: the fixture must stay one where Myers aligns differently.
+        assert_ne!(myers_diff(old, new, 0), legacy_diff(old, new, 0));
+        assert_reconstructs(old, new);
+    }
+
+    #[test]
+    fn legacy_table_cells_counts_the_trimmed_middle() {
+        assert_eq!(legacy_table_cells(&[], &[]), 1);
+        assert_eq!(legacy_table_cells(&["a", "b", "c"], &["a", "b", "c"]), 1);
+        assert_eq!(
+            legacy_table_cells(&["a", "x", "c"], &["a", "y", "z", "c"]),
+            2 * 3
+        );
+        let old: Vec<String> = (0..60_000).map(|i| format!("{i}")).collect();
+        let mut new = old.clone();
+        new[1] = "start".to_owned();
+        new[59_998] = "end".to_owned();
+        let old: Vec<&str> = old.iter().map(String::as_str).collect();
+        let new: Vec<&str> = new.iter().map(String::as_str).collect();
+        assert_eq!(legacy_table_cells(&old, &new), 59_999 * 59_999);
+        assert!(legacy_table_cells(&old, &new) > LEGACY_DIFF_MAX_CELLS);
     }
 
     #[test]

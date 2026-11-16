@@ -126,10 +126,12 @@ pub fn wrapping_rem_(a: u32, b: u32) -> u32 { //~ ERROR Trust strict verificatio
     a.wrapping_rem(b)
 }
 
-/// THE COST OF THE FIX, pinned. This genuinely cannot panic — the divisor is a
-/// non-zero literal — and it is refused anyway, because the callee is now absent
-/// and its assumption cannot be related to the divisor. If a future planner
-/// change makes this provable, THIS annotation is the one that should fail.
-pub fn safe_literal_divisor(a: u32) -> u32 { //~ ERROR Trust strict verification failed for `wrapping_div_zero_false_proof::safe_literal_divisor`
+/// THE COST OF THE FIX, repaid (2026-09-30). This genuinely cannot panic — the
+/// divisor is a non-zero literal — and it was refused while the call was an absent
+/// callee whose assumption could not be related to the divisor. The bridge now
+/// lowers a division-family call's marker as its exact panic condition
+/// (`lower_div_family_panic_precondition`), and vcgen states the divisor row that
+/// refutes `wrapping` and `wrapping_rem_` above, so this one proves.
+pub fn safe_literal_divisor(a: u32) -> u32 {
     a.wrapping_div(7)
 }

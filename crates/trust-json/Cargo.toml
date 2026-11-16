@@ -68,7 +68,35 @@ workspace = true
 ## float backends (serde_json swapped `ryu` -> `zmij` in the 1.0.15x line, and
 ## the two DISAGREE on notation: `1e30` vs `1e+30`), so a backend change under
 ## us fails loudly with the reason on screen rather than silently.
+##
+## `float_roundtrip` is named HERE, explicitly, because the workspace already
+## turns it on: first-party/clean's `crates/clean-olean/Cargo.toml` enables it
+## (clean 99ddfe452, "metric fractions must survive our own JSON read/write
+## bit-exactly"), and Cargo feature unification switches every `serde_json` in
+## a build graph that contains clean-olean to the correctly-rounded parser. A
+## `-p trust-json` run does NOT contain clean-olean, so without this line the
+## oracle's parse mode would depend on how the test was invoked. Naming it pins
+## the oracle to the parse mode the shipped graph actually has;
+## `oracle_identity` asserts it with a parse sentinel (`1e-30`).
+##
+## `preserve_order` is NOT named, and this line cannot keep it off: features
+## only add. `crates/trust-certify` (f2c4e2ccce) and the compiler's
+## `trust-mc-driver` enable it, so any selection containing either swaps the
+## oracle's key-sorted `BTreeMap` for an insertion-ordered `IndexMap`; naming
+## it here would only push it into every package a run selects alongside these
+## tests. trust-json's `Map` is key-sorted by design (`src/map.rs`), so the gate
+## takes every incumbent tree in key order (`tests/common/mod.rs`
+## `key_sorted`, the identity on the default backing) and `oracle_identity`
+## prints which backing the invocation got. A `-p trust-json` run alone gets
+## the `BTreeMap`; to run the gate on the `IndexMap` backing without selecting
+## another package, ask for the feature on the command line, where it reaches
+## this crate's own dev-dependency and nothing else:
+##     targo --unverified test -p trust-json --features incumbent-serde-json/preserve_order
+## Both backings must pass. `differential_json.rs`'s
+## `the_gates_view_of_the_incumbent_is_key_sorted_at_every_depth` asserts, on
+## the `IndexMap` backing, that the incumbent's raw order really differed.
 incumbent-serde-json = { package = "serde_json", version = "1", features = [
+    "float_roundtrip",
     "unbounded_depth",
 ] }
 

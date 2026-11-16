@@ -39,8 +39,23 @@
 #                           mechanically verified as ancestors of the adopted
 #                           revision (2026-07-08 audit), so every tracked fix
 #                           is present.
+#
+# Drift audit closed out 2026-10-16 by the rust-1.101 content migration
+# (branch migrate/rust-1.101-20261016; plan in
+# docs/plans/2026-10-16-rust-1.101-migration.md):
+#   previous reviewed:      5e91de65d75d3c849c643f5079509b9e5985a5c0
+#   adopted through:        bf9448e42622eaba63ebc171bb4584cea22210b4 (upstream/main)
+#   adoption mode:          wholesale content port (compiler/, library/, src/,
+#                           tests/ aligned by 3-way merge against 5e91de65,
+#                           plus cargo/llvm/enzyme subtree ports), NOT a
+#                           per-commit review — the slice between the two
+#                           revisions is included by construction, so every
+#                           tracked fix below remains present. The 1.99.1
+#                           stable point-release fixes (bool ABI extension,
+#                           compiler-builtins wcslen, LLD rpath) were
+#                           verified present in the adopted revision.
 schema_version = "0.1.0"
-tracked_until_revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+tracked_until_revision = "rust-lang/rust:bf9448e42622eaba63ebc171bb4584cea22210b4"
 
 [[fixes]]
 id = "fix.compiletest.skip_filecheck_directive"

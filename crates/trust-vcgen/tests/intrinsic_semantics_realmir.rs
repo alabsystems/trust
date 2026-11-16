@@ -46,6 +46,9 @@
 // mints a kernel certificate is a separate lane and is NOT claimed here.
 use trust_types::{VcKind, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn load(json: &str) -> VerifiableFunction {
     serde_json::from_str(json).expect("fixture MIR must deserialize")
 }
@@ -70,6 +73,26 @@ const SOLVER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// The `#[ensures]` obligation of `func`, decided by the real in-process ay.
 fn postcondition_verdict(func: &VerifiableFunction) -> VerificationResult {
+    postcondition_verdict_under(func, test_router::deterministic_test_router)
+}
+
+/// The router every row here used before VCGEN-TEST-BACKSTOP-1, with its 30 s
+/// clock. Kept for the SPEED GUARD
+/// `cttz_free_argument_shift_definedness_stays_fast_and_proved` alone: it fails by
+/// timeout if the constant gate widens, so its clock is part of what it checks
+/// (VCGEN-TEST-BACKSTOP-1 lists it among the kept sites).
+fn speed_guard_router() -> trust_router::Router {
+    trust_router::Router::deterministic_in_process_ay(
+        30_000,
+        trust_types::determinism::EffortScale::BUILTIN,
+    )
+}
+
+/// [`postcondition_verdict`] under the router `router` builds on the solver thread.
+fn postcondition_verdict_under(
+    func: &VerifiableFunction,
+    router: fn() -> trust_router::Router,
+) -> VerificationResult {
     // BOTH halves run on the big-stack thread: VC GENERATION overflows the
     // default libtest stack too, not just the solver search (measured — moving
     // only the solver across left the overflow exactly where it was).
@@ -82,7 +105,7 @@ fn postcondition_verdict(func: &VerifiableFunction) -> VerificationResult {
                 vcs.iter().find(|vc| matches!(vc.kind, VcKind::Postcondition)).unwrap_or_else(
                     || panic!("{}: the ensures clause must produce a Postcondition VC", func.name),
                 );
-            let router = trust_router::Router::deterministic_in_process_ay(30_000);
+            let router = router();
             let results = router.verify_all(std::slice::from_ref(post));
             results.into_iter().next().expect("one verdict per VC").1
         })
@@ -92,8 +115,12 @@ fn postcondition_verdict(func: &VerifiableFunction) -> VerificationResult {
 }
 
 fn assert_proved(json: &str) {
+    assert_proved_under(json, test_router::deterministic_test_router);
+}
+
+fn assert_proved_under(json: &str, router: fn() -> trust_router::Router) {
     let func = load(json);
-    let verdict = postcondition_verdict(&func);
+    let verdict = postcondition_verdict_under(&func, router);
     assert!(
         matches!(verdict, VerificationResult::Proved { .. }),
         "{}: the clause is TRUE of the intrinsic and must be proved from its definition; \
@@ -300,7 +327,10 @@ fn ctlz_is_not_cttz_in_disguise() {
 /// is `ctlz_nonzero_upper_bound_is_proved` above.
 #[test]
 fn cttz_free_argument_shift_definedness_stays_fast_and_proved() {
-    assert_proved(include_str!("fixtures/intrinsic_cttz_u32_nonzero_le31_mir.json"));
+    assert_proved_under(
+        include_str!("fixtures/intrinsic_cttz_u32_nonzero_le31_mir.json"),
+        speed_guard_router,
+    );
 }
 
 /// `requires x == 8 ensures result == 3` with a PARAMETER argument (and the
@@ -356,72 +386,76 @@ fn ctlz_nonzero_upper_bound_is_proved() {
     assert_proved(include_str!("fixtures/intrinsic_ctlz_u32_nonzero_lt32_mir.json"));
 }
 
-/// THE RESIDUAL, stated rather than hidden.
+/// THE RESIDUAL, stated rather than hidden — and now EMPTY.
 ///
-/// Two shapes in this corpus are DECIDED by the facts — the ay engine computes
-/// UNSAT — and are then rejected by the mandatory strict UNSAT-proof validation
-/// with `step tN uses unsupported theory lemma kind Generic in strict mode`. The
-/// verdict is `Unknown`, and `Unknown` is the honest answer: an uncertified UNSAT
-/// proves nothing under `-Ztrust-policy=certify`. UNPROVED IS NOT PROVED, so these
-/// rows are asserted in their MEASURED state rather than promoted.
+/// Shapes in this corpus used to be DECIDED by the facts — the ay engine computed
+/// UNSAT — and then rejected by the mandatory strict UNSAT-proof validation with
+/// `step tN uses unsupported theory lemma kind Generic in strict mode`. The
+/// verdict was `Unknown`, and `Unknown` was the honest answer: an uncertified UNSAT
+/// proves nothing under `-Ztrust-policy=certify`. UNPROVED IS NOT PROVED, so those
+/// rows were asserted in their MEASURED state rather than promoted, until each
+/// certified:
 ///
-///   * `sat_add_ge` / `sat_sub_le` — the saturating clamp model.
+///   * `ctlz_u32_nonzero_lt32` — PROMOTED 2026-08-25 (`ctlz_nonzero_upper_bound_is_proved`).
+///   * `sat_add_ge` / `sat_sub_le`, INTRINSIC spelling — PROMOTED 2026-10-07. Measured on
+///     the merge of TINV step 10 with origin/main, three consecutive runs,
+///     `Proved { solver: ay-in-process, strength: Smt, SmtBacked }` every time. Cause
+///     (bisected by the coordinator): ay `d2bc57bb2`, "a proof-tracking solve explains
+///     level-0 lazy theory propagations at delivery", which reached the tree with the
+///     T8 pin train `844510f677`.
+///   * `sat_add_ge` / `sat_sub_le`, METHOD spelling (`core::num::<impl u32>::saturating_add`,
+///     the fixtures `tests/saturating_call_model.rs` covers) — PROMOTED 2026-10-07, after
+///     a FIXTURE fix. This file used to say the method spelling "hits the SAME boundary"
+///     as the intrinsic one. That was wrong: `fixtures/sat_add_ge.json` and
+///     `fixtures/sat_sub_le.json` were captured WITHOUT the u32 parameter-range
+///     preconditions production's extractor adds (`integer_param_range_preconditions`,
+///     trust-mir-extract), so their formula really had the model `x = 1, y = -1` — a
+///     fixture artifact, not a solver defect (it failed the same way at the earlier ay
+///     pin `630e4d62`). With the range facts the extractor emits, both rows certify
+///     (three consecutive runs). The intrinsic fixtures always carried them.
 ///
-/// (`ctlz_u32_nonzero_lt32` was the third; it now certifies and has moved to
-/// `ctlz_nonzero_upper_bound_is_proved` above. That it moved ALONE, while these
-/// did not, is the evidence that the strict layer is still running here.)
-///
-/// THE MISSING PIECE IS NOT IN THIS LANE, and the third row below is the
-/// evidence: `fixtures/sat_add_ge.json` is the ALREADY-SHIPPED METHOD spelling
-/// (`core::num::<impl u32>::saturating_add`, the fixture
-/// `tests/saturating_call_model.rs` covers), which predates this work and hits
-/// the SAME boundary. The intrinsic spelling therefore reaches exactly the same
-/// place the method spelling reaches — which is what "routed into the existing
-/// clamp model" was supposed to mean — and the residual belongs to the strict
-/// proof-certification layer's theory-lemma vocabulary, not to the definitions.
-///
-/// This test FAILS the day that layer learns the lemma kind — deliberately. Move
-/// the row up to `assert_proved` then, on the same evidence the ctlz row required;
-/// do not delete this comment without re-measuring.
+/// Do NOT delete this test: it is the instrument that tells you the boundary moved,
+/// and it now pins every promoted row in the POSITIVE direction — losing one again is
+/// a REGRESSION in the strict-certification layer (or in a fixture), not a return to
+/// a known boundary.
 #[test]
 fn residual_rows_are_decided_by_ay_but_not_strictly_certifiable() {
-    // Trust: `ctlz_u32_nonzero_lt32` was PROMOTED out of this list on 2026-08-25.
-    // The strict-certification layer learned the lemma kind its clause needed, so
-    // the row is now `Proved { strength: ProofStrength { reasoning: Smt, assurance:
-    // SmtBacked } }` — measured, not assumed. This test asked for exactly that
-    // move ("Promote the row to `assert_proved` and update the doc above"), and it
-    // is asserted below rather than merely dropped: a row that silently stopped
-    // being proved again would otherwise go unnoticed.
-    //
-    // The remaining three rows still sit at the boundary. Do NOT delete this test
-    // when the last one is promoted; it is the instrument that tells you the
-    // boundary moved.
-    for (name, json) in [
-        ("sat_add_ge (intrinsic spelling)", include_str!("fixtures/intrinsic_sat_add_ge_mir.json")),
-        ("sat_sub_le (intrinsic spelling)", include_str!("fixtures/intrinsic_sat_sub_le_mir.json")),
-        // The METHOD spelling of the same clause, already in the tree before this
-        // lane existed: the boundary is NOT something the intrinsic lane introduced.
-        ("sat_add_ge (method spelling, pre-existing)", include_str!("fixtures/sat_add_ge.json")),
+    for (name, json, promoted) in [
+        (
+            "ctlz_u32_nonzero_lt32",
+            include_str!("fixtures/intrinsic_ctlz_u32_nonzero_lt32_mir.json"),
+            "2026-08-25",
+        ),
+        (
+            "sat_add_ge (intrinsic spelling)",
+            include_str!("fixtures/intrinsic_sat_add_ge_mir.json"),
+            "2026-10-07",
+        ),
+        (
+            "sat_sub_le (intrinsic spelling)",
+            include_str!("fixtures/intrinsic_sat_sub_le_mir.json"),
+            "2026-10-07",
+        ),
+        ("sat_add_ge (method spelling)", include_str!("fixtures/sat_add_ge.json"), "2026-10-07"),
+        ("sat_sub_le (method spelling)", include_str!("fixtures/sat_sub_le.json"), "2026-10-07"),
     ] {
-        let func = load(json);
-        let verdict = postcondition_verdict(&func);
+        let verdict = postcondition_verdict(&load(json));
         assert!(
-            !matches!(verdict, VerificationResult::Proved { .. }),
-            "{name}: the strict-certification residual is GONE — this is progress, not a \
-             regression. Promote the row to `assert_proved` and update the doc above. \
-             Got {verdict:?}"
+            matches!(verdict, VerificationResult::Proved { .. }),
+            "{name} was promoted on {promoted}. Losing it again is a REGRESSION, not a \
+             return to a known boundary. Got {verdict:?}"
         );
     }
+}
 
-    // The promoted row, now asserted in the POSITIVE direction.
-    let func = load(include_str!("fixtures/intrinsic_ctlz_u32_nonzero_lt32_mir.json"));
-    let verdict = postcondition_verdict(&func);
-    assert!(
-        matches!(verdict, VerificationResult::Proved { .. }),
-        "ctlz_u32_nonzero_lt32 was promoted on 2026-08-25 after the strict-certification \
-         layer learned its lemma kind. Losing it again is a REGRESSION in that layer, not a \
-         return to a known boundary. Got {verdict:?}"
-    );
+/// The saturating rows promoted out of the residual on 2026-10-07 (see the note above),
+/// through the shared `assert_proved` gate.
+#[test]
+fn saturating_bounds_are_proved() {
+    assert_proved(include_str!("fixtures/intrinsic_sat_add_ge_mir.json"));
+    assert_proved(include_str!("fixtures/intrinsic_sat_sub_le_mir.json"));
+    assert_proved(include_str!("fixtures/sat_add_ge.json"));
+    assert_proved(include_str!("fixtures/sat_sub_le.json"));
 }
 
 /// `ensures result > a` — FALSE at `b == 0`. Pins that the clamp model gives the

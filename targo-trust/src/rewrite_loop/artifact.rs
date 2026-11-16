@@ -248,6 +248,33 @@ fn render_repair_markdown(artifact: &RepairArtifact) -> String {
     out
 }
 
+pub(super) fn approval_policy_label(policy: ApprovalPolicy) -> &'static str {
+    match policy {
+        ApprovalPolicy::Auto => "auto",
+        ApprovalPolicy::Review => "review",
+        ApprovalPolicy::Block => "block",
+        _ => "other",
+    }
+}
+
+pub(super) fn pending_status_label(policy: ApprovalPolicy) -> &'static str {
+    match policy {
+        ApprovalPolicy::Auto => "pending_auto",
+        ApprovalPolicy::Review => "pending_review",
+        ApprovalPolicy::Block => "blocked",
+        _ => "pending_other",
+    }
+}
+
+pub(crate) fn decision_label(decision: &LoopDecision) -> String {
+    match decision {
+        LoopDecision::Continue { verdict } => format!("continue:{verdict}"),
+        LoopDecision::Converged { stable_rounds } => format!("converged:{stable_rounds}"),
+        LoopDecision::Regressed { reason } => format!("regressed:{reason}"),
+        LoopDecision::IterationLimitReached => "iteration_limit".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::convergence::ProofFrontier;
@@ -311,32 +338,5 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("original source snapshot is unavailable"))
         );
-    }
-}
-
-pub(super) fn approval_policy_label(policy: ApprovalPolicy) -> &'static str {
-    match policy {
-        ApprovalPolicy::Auto => "auto",
-        ApprovalPolicy::Review => "review",
-        ApprovalPolicy::Block => "block",
-        _ => "other",
-    }
-}
-
-pub(super) fn pending_status_label(policy: ApprovalPolicy) -> &'static str {
-    match policy {
-        ApprovalPolicy::Auto => "pending_auto",
-        ApprovalPolicy::Review => "pending_review",
-        ApprovalPolicy::Block => "blocked",
-        _ => "pending_other",
-    }
-}
-
-pub(crate) fn decision_label(decision: &LoopDecision) -> String {
-    match decision {
-        LoopDecision::Continue { verdict } => format!("continue:{verdict}"),
-        LoopDecision::Converged { stable_rounds } => format!("converged:{stable_rounds}"),
-        LoopDecision::Regressed { reason } => format!("regressed:{reason}"),
-        LoopDecision::IterationLimitReached => "iteration_limit".to_string(),
     }
 }

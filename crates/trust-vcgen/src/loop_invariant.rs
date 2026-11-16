@@ -147,20 +147,20 @@ pub fn infer_invariant_interval(loop_var: &str, init: i128, step: i128, bound: i
 /// patterns.
 #[must_use]
 pub fn classify_loop_pattern(header: &BasicBlock, body: &[Statement]) -> LoopPattern {
+    classify_loop_pattern_iter(header, body.iter())
+}
+
+fn classify_loop_pattern_iter<'a>(
+    header: &BasicBlock,
+    body: impl Iterator<Item = &'a Statement>,
+) -> LoopPattern {
     // Look for counter pattern: header has SwitchInt (loop condition),
     // body has assignment incrementing/decrementing a variable.
 
-    // Extract the discriminant variable from the header's terminator.
-    let cond_var = match &header.terminator {
-        Terminator::SwitchInt { discr, .. } => extract_var_name(discr),
-        Terminator::Assert { cond, .. } => extract_var_name(cond),
-        _ => None,
-    };
-
-    // Look for induction variable patterns in the body.
-    let mut counter_candidates: Vec<(String, i128)> = Vec::new();
-    let mut accumulator_candidates: Vec<(String, bool)> = Vec::new();
-    let mut index_candidates: Vec<(String, String)> = Vec::new();
+    // Look for induction variable patterns in the body by local index,
+    // formatting `_{local}` only once for the winning pattern.
+    let mut counter_candidates: Vec<(usize, i128)> = Vec::new();
+    let mut accumulator_candidate: Option<(usize, bool)> = None;
 
     for stmt in body {
         if let Statement::Assign { place, rvalue, .. } = stmt {
@@ -169,29 +169,25 @@ pub fn classify_loop_pattern(header: &BasicBlock, body: &[Statement]) -> LoopPat
                 Rvalue::BinaryOp(BinOp::Add, lhs, Operand::Constant(ConstValue::Int(step)))
                     if is_same_place_operand(place, lhs) =>
                 {
-                    let var_name = place_var_name(place);
-                    counter_candidates.push((var_name, *step));
+                    counter_candidates.push((place.local, *step));
                 }
                 // var = var + const (counter pattern, unsigned)
                 Rvalue::BinaryOp(BinOp::Add, lhs, Operand::Constant(ConstValue::Uint(step, _)))
                     if is_same_place_operand(place, lhs) =>
                 {
-                    let var_name = place_var_name(place);
                     let step_val = i128::try_from(*step).unwrap_or(1);
-                    counter_candidates.push((var_name, step_val));
+                    counter_candidates.push((place.local, step_val));
                 }
                 Rvalue::BinaryOp(BinOp::Sub, lhs, Operand::Constant(ConstValue::Int(step)))
                     if is_same_place_operand(place, lhs) =>
                 {
-                    let var_name = place_var_name(place);
-                    counter_candidates.push((var_name, -step));
+                    counter_candidates.push((place.local, -step));
                 }
                 Rvalue::BinaryOp(BinOp::Sub, lhs, Operand::Constant(ConstValue::Uint(step, _)))
                     if is_same_place_operand(place, lhs) =>
                 {
-                    let var_name = place_var_name(place);
                     let neg_step = i128::try_from(*step).map(|s| -s).unwrap_or(-1);
-                    counter_candidates.push((var_name, neg_step));
+                    counter_candidates.push((place.local, neg_step));
                 }
 
                 // Checked add/sub patterns (from overflow-checked arithmetic)
@@ -200,33 +196,34 @@ pub fn classify_loop_pattern(header: &BasicBlock, body: &[Statement]) -> LoopPat
                     lhs,
                     Operand::Constant(ConstValue::Int(step)),
                 ) if is_same_place_operand(place, lhs) => {
-                    let var_name = place_var_name(place);
-                    counter_candidates.push((var_name, *step));
+                    counter_candidates.push((place.local, *step));
                 }
                 Rvalue::CheckedBinaryOp(
                     BinOp::Sub,
                     lhs,
                     Operand::Constant(ConstValue::Int(step)),
                 ) if is_same_place_operand(place, lhs) => {
-                    let var_name = place_var_name(place);
-                    counter_candidates.push((var_name, -step));
+                    counter_candidates.push((place.local, -step));
                 }
 
                 // Accumulator pattern: var = var + <expr> (where expr is not a constant
                 // relative to the same variable)
-                Rvalue::BinaryOp(BinOp::Add, lhs, _)
-                    if is_same_place_operand(place, lhs)
-                        && counter_candidates.iter().all(|(n, _)| *n != place_var_name(place)) =>
-                {
-                    accumulator_candidates.push((place_var_name(place), true));
+                Rvalue::BinaryOp(BinOp::Add, lhs, _) if is_same_place_operand(place, lhs) => {
+                    if accumulator_candidate.is_none()
+                        && counter_candidates.iter().all(|(local, _)| *local != place.local)
+                    {
+                        accumulator_candidate = Some((place.local, true));
+                    }
                 }
 
-                // Index pattern: Len(place) suggests array iteration
+                // Index pattern: Len(place) suggests array iteration (highest priority)
                 Rvalue::Len(len_place) => {
-                    let len_var = place_var_name(len_place);
                     // If we have a counter candidate, pair it with this length
-                    if let Some((idx_var, _)) = counter_candidates.first() {
-                        index_candidates.push((idx_var.clone(), len_var));
+                    if let Some(&(idx_local, _)) = counter_candidates.first() {
+                        return LoopPattern::Iterator {
+                            index_var: format!("_{idx_local}"),
+                            length_var: place_var_name(len_place),
+                        };
                     }
                 }
 
@@ -236,38 +233,19 @@ pub fn classify_loop_pattern(header: &BasicBlock, body: &[Statement]) -> LoopPat
     }
 
     // Prioritize classification: Iterator > Counter > Accumulator > Unknown.
-    if let Some((index_var, length_var)) = index_candidates.into_iter().next() {
-        return LoopPattern::Iterator { index_var, length_var };
-    }
-
-    if let Some((var, step)) = counter_candidates.into_iter().next() {
+    if let Some((local, step)) = counter_candidates.into_iter().next() {
         // Try to extract the bound from the header's switch condition.
         let bound = extract_switch_bound(header);
         return LoopPattern::Counter {
-            var,
+            var: format!("_{local}"),
             init: 0, // Conservative default; actual init requires pre-loop analysis.
             step,
             bound: bound.unwrap_or(i128::MAX),
         };
     }
 
-    if let Some((var, monotone_increasing)) = accumulator_candidates.into_iter().next() {
-        return LoopPattern::Accumulator { var, init: 0, monotone_increasing };
-    }
-
-    // If the header has a condition variable, check if we
-    // missed a counter pattern due to indirect assignment.
-    if let Some(cv) = cond_var {
-        // If the condition variable appears in the body at all, it might
-        // be a counter we couldn't recognize. Return Unknown but log the
-        // candidate for future improvements.
-        let _in_body = body.iter().any(|s| {
-            if let Statement::Assign { place, .. } = s {
-                place_var_name(place) == cv
-            } else {
-                false
-            }
-        });
+    if let Some((local, monotone_increasing)) = accumulator_candidate {
+        return LoopPattern::Accumulator { var: format!("_{local}"), init: 0, monotone_increasing };
     }
 
     LoopPattern::Unknown
@@ -329,15 +307,21 @@ impl InvariantInferer {
     /// 4. Filters by confidence threshold.
     #[must_use]
     pub fn infer(&self, func: &VerifiableFunction) -> Vec<LoopInvariant> {
+        if self.min_confidence > 0.9 {
+            return Vec::new();
+        }
         // Detect loop headers (widen points).
         let widen_points = abstract_interp::detect_widen_points(func);
         if widen_points.is_empty() {
             return Vec::new();
         }
 
-        // Compute fixpoint with narrowing for precision recovery.
-        let initial = abstract_interp::type_aware_initial_state(func);
-        let fp = abstract_interp::fixpoint_with_narrowing(func, initial, self.narrowing_passes);
+        // Compute fixpoint with narrowing only when interval invariants (confidence 0.6)
+        // can survive the `min_confidence` filter.
+        let fp = (self.min_confidence <= 0.6).then(|| {
+            let initial = abstract_interp::type_aware_initial_state(func);
+            abstract_interp::fixpoint_with_narrowing(func, initial, self.narrowing_passes)
+        });
 
         let mut invariants = Vec::new();
 
@@ -345,23 +329,29 @@ impl InvariantInferer {
             let header_id = wp.block;
 
             // Find the header block.
-            let Some(header) = func.body.blocks.iter().find(|b| b.id == header_id) else {
+            let Some(header) = func
+                .body
+                .blocks
+                .get(header_id.0)
+                .filter(|b| b.id == header_id)
+                .or_else(|| func.body.blocks.iter().find(|b| b.id == header_id))
+            else {
                 continue;
             };
 
-            // Collect body statements from blocks between header and latch.
-            let body_stmts = collect_loop_body_stmts(func, header_id);
-
-            // Classify the loop pattern.
-            let pattern = classify_loop_pattern(header, &body_stmts);
+            // Classify the loop pattern directly over body statements without cloning.
+            let pattern =
+                classify_loop_pattern_iter(header, collect_loop_body_stmts_iter(func, header_id));
 
             // Generate invariants based on pattern and fixpoint data.
-            let pattern_invs = self.invariants_from_pattern(&pattern, header_id, &fp);
+            let pattern_invs = self.invariants_from_pattern(pattern, header_id);
             invariants.extend(pattern_invs);
 
-            // Also extract interval-based invariants from fixpoint state.
-            let interval_invs = self.invariants_from_intervals(header_id, &fp);
-            invariants.extend(interval_invs);
+            // Also extract interval-based invariants from fixpoint state when enabled.
+            if let Some(ref fp) = fp {
+                let interval_invs = self.invariants_from_intervals(header_id, fp);
+                invariants.extend(interval_invs);
+            }
         }
 
         // Filter by confidence threshold.
@@ -376,17 +366,12 @@ impl InvariantInferer {
     }
 
     /// Generate invariants from a classified loop pattern.
-    fn invariants_from_pattern(
-        &self,
-        pattern: &LoopPattern,
-        header: BlockId,
-        _fp: &FixpointResult,
-    ) -> Vec<LoopInvariant> {
-        match pattern {
+    fn invariants_from_pattern(&self, pattern: LoopPattern, header: BlockId) -> Vec<LoopInvariant> {
+        match &pattern {
             LoopPattern::Counter { var, init, step, bound } => {
                 // Counter bounds invariant.
                 let formula = infer_invariant_interval(var, *init, *step, *bound);
-                vec![LoopInvariant::new(formula, header, pattern.clone(), 0.9)]
+                vec![LoopInvariant::new(formula, header, pattern, 0.9)]
             }
             LoopPattern::Accumulator { var, init, monotone_increasing } => {
                 // Monotonicity invariant for accumulators.
@@ -398,7 +383,7 @@ impl InvariantInferer {
                     // acc <= init (monotonically non-increasing)
                     Formula::Le(Box::new(var_formula), Box::new(Formula::Int(*init)))
                 };
-                vec![LoopInvariant::new(formula, header, pattern.clone(), 0.7)]
+                vec![LoopInvariant::new(formula, header, pattern, 0.7)]
             }
             LoopPattern::Iterator { index_var, length_var } => {
                 // Index-in-bounds invariant: 0 <= i && i <= len.
@@ -407,7 +392,7 @@ impl InvariantInferer {
                 let lo_bound = Formula::Ge(Box::new(idx.clone()), Box::new(Formula::Int(0)));
                 let hi_bound = Formula::Le(Box::new(idx), Box::new(len));
                 let formula = Formula::And(vec![lo_bound, hi_bound]);
-                vec![LoopInvariant::new(formula, header, pattern.clone(), 0.85)]
+                vec![LoopInvariant::new(formula, header, pattern, 0.85)]
             }
             LoopPattern::Unknown => Vec::new(),
         }
@@ -419,6 +404,9 @@ impl InvariantInferer {
         header: BlockId,
         fp: &FixpointResult,
     ) -> Vec<LoopInvariant> {
+        if self.min_confidence > 0.6 {
+            return Vec::new();
+        }
         let Some(state) = fp.block_states.get(&header) else {
             return Vec::new();
         };
@@ -426,44 +414,41 @@ impl InvariantInferer {
             return Vec::new();
         }
 
-        let mut invariants = Vec::new();
+        let mut invariants = Vec::with_capacity(state.vars.len());
 
         for (var_name, interval) in &state.vars {
             if interval.is_bottom() {
                 continue;
             }
 
-            let var_formula = Formula::Var(var_name.clone(), Sort::Int);
-            let mut bounds = Vec::new();
-
-            // Lower bound from interval.
-            if interval.lo != i128::MIN {
-                bounds.push(Formula::Ge(
-                    Box::new(var_formula.clone()),
+            let formula = match (interval.lo != i128::MIN, interval.hi != i128::MAX) {
+                (false, false) => continue,
+                (true, false) => Formula::Ge(
+                    Box::new(Formula::Var(var_name.clone(), Sort::Int)),
                     Box::new(Formula::Int(interval.lo)),
-                ));
-            }
+                ),
+                (false, true) => Formula::Le(
+                    Box::new(Formula::Var(var_name.clone(), Sort::Int)),
+                    Box::new(Formula::Int(interval.hi)),
+                ),
+                (true, true) => {
+                    let var_formula = Formula::Var(var_name.clone(), Sort::Int);
+                    Formula::And(vec![
+                        Formula::Ge(
+                            Box::new(var_formula.clone()),
+                            Box::new(Formula::Int(interval.lo)),
+                        ),
+                        Formula::Le(Box::new(var_formula), Box::new(Formula::Int(interval.hi))),
+                    ])
+                }
+            };
 
-            // Upper bound from interval.
-            if interval.hi != i128::MAX {
-                bounds
-                    .push(Formula::Le(Box::new(var_formula), Box::new(Formula::Int(interval.hi))));
-            }
-
-            if !bounds.is_empty() {
-                let formula = if bounds.len() == 1 {
-                    bounds.into_iter().next().expect("invariant: non-empty bounds vec")
-                } else {
-                    Formula::And(bounds)
-                };
-
-                invariants.push(LoopInvariant::new(
-                    formula,
-                    header,
-                    LoopPattern::Unknown,
-                    0.6, // Interval-only invariants get moderate confidence.
-                ));
-            }
+            invariants.push(LoopInvariant::new(
+                formula,
+                header,
+                LoopPattern::Unknown,
+                0.6, // Interval-only invariants get moderate confidence.
+            ));
         }
 
         invariants
@@ -471,16 +456,6 @@ impl InvariantInferer {
 }
 
 // ── Helper Functions ───────────────────────────────────────────────────────
-
-/// Extract variable name from an operand (Copy or Move of a simple local).
-fn extract_var_name(op: &Operand) -> Option<String> {
-    match op {
-        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
-            Some(place_var_name(place))
-        }
-        _ => None,
-    }
-}
 
 /// Build a variable name string from a Place.
 fn place_var_name(place: &Place) -> String {
@@ -520,12 +495,15 @@ fn extract_switch_bound(header: &BasicBlock) -> Option<i128> {
     None
 }
 
-/// Collect all statements from blocks that form the loop body.
+/// Iterate over all statements from blocks that form the loop body without cloning.
 ///
 /// The loop body consists of blocks with IDs between header and the
 /// latch (highest-numbered block that has a back-edge to the header).
 /// This is a sound over-approximation for MIR's structured layout.
-fn collect_loop_body_stmts(func: &VerifiableFunction, header: BlockId) -> Vec<Statement> {
+fn collect_loop_body_stmts_iter(
+    func: &VerifiableFunction,
+    header: BlockId,
+) -> impl Iterator<Item = &Statement> {
     // Find latch block (highest block that branches back to header).
     let latch_id = func
         .body
@@ -535,17 +513,11 @@ fn collect_loop_body_stmts(func: &VerifiableFunction, header: BlockId) -> Vec<St
         .map(|b| b.id.0)
         .max();
 
-    let Some(latch) = latch_id else {
-        return Vec::new();
-    };
-
-    // Collect statements from all body blocks (header exclusive, through latch).
     func.body
         .blocks
         .iter()
-        .filter(|b| b.id.0 > header.0 && b.id.0 <= latch)
-        .flat_map(|b| b.stmts.clone())
-        .collect()
+        .filter(move |b| latch_id.is_some_and(|latch| b.id.0 > header.0 && b.id.0 <= latch))
+        .flat_map(|b| b.stmts.iter())
 }
 
 /// Check if a terminator has a target that is a specific block.
@@ -650,6 +622,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -749,6 +722,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -780,6 +754,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

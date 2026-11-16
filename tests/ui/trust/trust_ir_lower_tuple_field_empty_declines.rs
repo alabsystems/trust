@@ -1,6 +1,6 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aprivate_interfaces
 //@ edition: 2021
 //! Trust (wave-FTR), the NEGATIVE half: the EMPTY tuple stays refused by the tuple-field head
 //! test. Kept out of `trust_ir_lower_tuple_field_registration.rs` because a deliberate decline

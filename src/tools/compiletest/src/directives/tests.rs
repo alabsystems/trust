@@ -10,7 +10,7 @@ use crate::directives::{
     extract_version_range, has_explicit_trust_verification_config, line_directive, parse_edition,
     parse_normalize_rule, validate_trust_verification_opt_in,
 };
-use crate::executor::{CollectedTestDesc, ShouldFail};
+use crate::executor::{CollectedTestDesc, ShouldFail, TestVariant};
 
 /// All directive handlers should have a name that is also in `KNOWN_DIRECTIVE_NAMES_SET`.
 #[test]
@@ -69,10 +69,13 @@ fn make_test_description(
     filterable_path: &Utf8Path,
     file_contents: &str,
     revision: Option<&str>,
+    debugger: Option<Debugger>,
 ) -> CollectedTestDesc {
     let cache = DirectivesCache::load(config);
     let mut poisoned = false;
     let file_directives = FileDirectives::from_file_contents(path, file_contents);
+
+    let variant = TestVariant { revision: revision.map(str::to_owned), debugger };
 
     let mut aux_props = AuxProps::default();
     let test = crate::directives::make_test_description(
@@ -82,7 +85,7 @@ fn make_test_description(
         path,
         filterable_path,
         &file_directives,
-        revision,
+        &variant,
         &mut poisoned,
         &mut aux_props,
     );
@@ -142,6 +145,7 @@ struct ConfigBuilder {
     rustc_debug_assertions: bool,
     std_debug_assertions: bool,
     std_remap_debuginfo: bool,
+    disable_minification: bool,
 }
 
 impl ConfigBuilder {
@@ -220,6 +224,11 @@ impl ConfigBuilder {
         self
     }
 
+    fn disable_minification(&mut self, is_enabled: bool) -> &mut Self {
+        self.disable_minification = is_enabled;
+        self
+    }
+
     fn build(&mut self) -> Config {
         let args = &[
             "compiletest",
@@ -286,11 +295,14 @@ impl ConfigBuilder {
         if self.std_remap_debuginfo {
             args.push("--with-std-remap-debuginfo".to_owned());
         }
+        if self.disable_minification {
+            args.push("--disable-minification".to_owned());
+        }
 
         args.push("--rustc-path".to_string());
         args.push(std::env::var("TEST_RUSTC").expect("must be configured by bootstrap"));
 
-        crate::parse_config(args)
+        crate::cli::parse_config(args)
     }
 }
 
@@ -306,8 +318,15 @@ fn parse_early_props(config: &Config, contents: &str) -> EarlyProps {
 fn check_ignore(config: &Config, contents: &str) -> bool {
     let tn = String::new();
     let p = Utf8Path::new("a.rs");
-    let d = make_test_description(&config, tn, p, p, contents, None);
-    d.ignore
+    let d = make_test_description(&config, tn, p, p, contents, None, None);
+    d.is_ignored()
+}
+
+fn check_ignore_debugger(config: &Config, contents: &str, debugger: Option<Debugger>) -> bool {
+    let tn = String::new();
+    let p = Utf8Path::new("a.rs");
+    let d = make_test_description(&config, tn, p, p, contents, None, debugger);
+    d.is_ignored()
 }
 
 #[test]
@@ -316,10 +335,19 @@ fn should_fail() {
     let tn = String::new();
     let p = Utf8Path::new("a.rs");
 
-    let d = make_test_description(&config, tn.clone(), p, p, "", None);
+    let d = make_test_description(&config, tn.clone(), p, p, "", None, None);
     assert_eq!(d.should_fail, ShouldFail::No);
-    let d = make_test_description(&config, tn, p, p, "//@ should-fail", None);
+    let d = make_test_description(&config, tn, p, p, "//@ should-fail", None, None);
     assert_eq!(d.should_fail, ShouldFail::Yes);
+}
+
+#[test]
+fn disable_minification_flag() {
+    let config: Config = cfg().build();
+    assert!(!config.disable_minification);
+
+    let config: Config = cfg().disable_minification(true).build();
+    assert!(config.disable_minification);
 }
 
 #[test]
@@ -472,18 +500,11 @@ fn cross_compile() {
 
 #[test]
 fn debugger() {
-    let mut config = cfg().build();
-    config.debugger = None;
-    assert!(!check_ignore(&config, "//@ ignore-cdb"));
-
-    config.debugger = Some(Debugger::Cdb);
-    assert!(check_ignore(&config, "//@ ignore-cdb"));
-
-    config.debugger = Some(Debugger::Gdb);
-    assert!(check_ignore(&config, "//@ ignore-gdb"));
-
-    config.debugger = Some(Debugger::Lldb);
-    assert!(check_ignore(&config, "//@ ignore-lldb"));
+    let config = cfg().build();
+    assert!(!check_ignore_debugger(&config, "//@ ignore-cdb", None));
+    assert!(check_ignore_debugger(&config, "//@ ignore-cdb", Some(Debugger::Cdb)));
+    assert!(check_ignore_debugger(&config, "//@ ignore-gdb", Some(Debugger::Gdb)));
+    assert!(check_ignore_debugger(&config, "//@ ignore-lldb", Some(Debugger::Lldb)));
 }
 
 #[test]
@@ -773,7 +794,7 @@ fn is_big_endian() {
     let endians = [
         ("x86_64-unknown-linux-gnu", false),
         ("bpfeb-unknown-none", true),
-        ("m68k-unknown-linux-gnu", true),
+        ("s390x-unknown-linux-gnu", true),
         ("aarch64_be-unknown-linux-gnu", true),
         ("powerpc64-unknown-linux-gnu", true),
     ];
@@ -782,6 +803,16 @@ fn is_big_endian() {
         assert_eq!(config.is_big_endian(), is_big, "{target} {is_big}");
         assert_eq!(check_ignore(&config, "//@ ignore-endian-big"), is_big);
     }
+    // The endian directive needs target metadata, not an optional LLVM backend.
+    // Keep the original m68k metadata assertion even when external LLVM omits
+    // its MC target; the five full Config/directive cases above still execute.
+    let specs: serde_json::Value = serde_json::from_str(&crate::common::query_rustc_output(
+        &cfg().build(),
+        &["--print=all-target-specs-json", "-Zunstable-options"],
+        Default::default(),
+    ))
+    .unwrap();
+    assert_eq!(specs["m68k-unknown-linux-gnu"]["target-endian"], "big");
 }
 
 #[test]

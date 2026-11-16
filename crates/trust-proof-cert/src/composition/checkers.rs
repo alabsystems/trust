@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::types::{ComposabilityResult, ComposedProof, CompositionError, Property};
-use crate::formula_norm::formula_subsumes;
+use crate::formula_norm::{formula_subsumes_normalized, negate_normalized, normalize};
 use crate::{ChainValidator, ProofCertificate};
 
 /// Check structural compatibility between two certificate records.
@@ -168,8 +168,10 @@ pub(crate) fn check_composability_semantic(
     // Check semantic compatibility: if either subsumes the other,
     // they are logically consistent (not contradictory).
     // Also check if they are not direct negations at the formula level.
-    let a_subsumes_b = formula_subsumes(&formula_a, &formula_b);
-    let b_subsumes_a = formula_subsumes(&formula_b, &formula_a);
+    let norm_a = normalize(&formula_a);
+    let norm_b = normalize(&formula_b);
+    let a_subsumes_b = formula_subsumes_normalized(&norm_a, &norm_b);
+    let b_subsumes_a = formula_subsumes_normalized(&norm_b, &norm_a);
 
     if a_subsumes_b || b_subsumes_a {
         // Formulas are semantically compatible — one implies the other
@@ -183,9 +185,11 @@ pub(crate) fn check_composability_semantic(
         // Cannot determine semantic compatibility; check for contradiction
         // via implication of negation: if fa => NOT fb (or vice versa),
         // they are contradictory.
-        let neg_fb = Formula::Not(Box::new(formula_b.clone()));
-        let neg_fa = Formula::Not(Box::new(formula_a.clone()));
-        if formula_subsumes(&formula_a, &neg_fb) || formula_subsumes(&formula_b, &neg_fa) {
+        let neg_fb = negate_normalized(&norm_b);
+        let neg_fa = negate_normalized(&norm_a);
+        if formula_subsumes_normalized(&norm_a, &neg_fb)
+            || formula_subsumes_normalized(&norm_b, &neg_fa)
+        {
             issues.push(format!(
                 "semantic contradiction detected for function `{}`: formulas are mutually exclusive",
                 a.function

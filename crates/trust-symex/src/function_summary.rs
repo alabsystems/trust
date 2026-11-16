@@ -155,19 +155,27 @@ pub fn apply_summary(
     summary: &FunctionSummary,
     actuals: &BTreeMap<String, SymbolicValue>,
 ) -> AppliedSummary {
-    let return_value = summary.return_value().map(|v| substitute(v, actuals));
+    let mut return_value = None;
+    let mut memory_writes = Vec::new();
+    let mut panic_conditions = Vec::new();
+    for effect in &summary.side_effects {
+        match effect {
+            SideEffect::Return(v) => {
+                if return_value.is_none() {
+                    return_value = Some(substitute(v, actuals));
+                }
+            }
+            SideEffect::MemoryWrite { region, value } => {
+                memory_writes.push((region.clone(), substitute(value, actuals)));
+            }
+            SideEffect::Panic(c) => {
+                panic_conditions.push(substitute(c, actuals));
+            }
+        }
+    }
 
     let constraints =
         summary.postconditions.iter().map(|pc| substitute(&pc.constraint, actuals)).collect();
-
-    let memory_writes = summary
-        .memory_writes()
-        .into_iter()
-        .map(|(region, value)| (region.clone(), substitute(value, actuals)))
-        .collect();
-
-    let panic_conditions =
-        summary.panic_conditions().into_iter().map(|c| substitute(c, actuals)).collect();
 
     AppliedSummary { return_value, constraints, memory_writes, panic_conditions }
 }
@@ -197,6 +205,42 @@ pub fn substitute(value: &SymbolicValue, subst: &BTreeMap<String, SymbolicValue>
     }
 }
 
+fn substitute_single(
+    value: &SymbolicValue,
+    target: &str,
+    replacement: &SymbolicValue,
+) -> SymbolicValue {
+    match value {
+        SymbolicValue::Concrete(_) => value.clone(),
+        SymbolicValue::Symbol(name) => {
+            if name == target {
+                replacement.clone()
+            } else {
+                value.clone()
+            }
+        }
+        SymbolicValue::BinOp(lhs, op, rhs) => SymbolicValue::bin_op(
+            substitute_single(lhs, target, replacement),
+            *op,
+            substitute_single(rhs, target, replacement),
+        ),
+        SymbolicValue::Ite(cond, then_val, else_val) => SymbolicValue::ite(
+            substitute_single(cond, target, replacement),
+            substitute_single(then_val, target, replacement),
+            substitute_single(else_val, target, replacement),
+        ),
+        SymbolicValue::Not(inner) => {
+            SymbolicValue::Not(Box::new(substitute_single(inner, target, replacement)))
+        }
+        SymbolicValue::BitwiseNot(inner) => {
+            SymbolicValue::BitwiseNot(Box::new(substitute_single(inner, target, replacement)))
+        }
+        SymbolicValue::Neg(inner) => {
+            SymbolicValue::Neg(Box::new(substitute_single(inner, target, replacement)))
+        }
+    }
+}
+
 /// Check if a function summary indicates a pure function (no side effects
 /// beyond returning a value).
 #[must_use]
@@ -215,16 +259,17 @@ pub fn compose_summaries(
     callee: &FunctionSummary,
     call_result_name: &str,
 ) -> FunctionSummary {
-    let callee_return = callee.return_value().cloned().unwrap_or(SymbolicValue::Concrete(0));
-
-    let mut subst = BTreeMap::default();
-    subst.insert(call_result_name.to_owned(), callee_return);
+    let default_ret = SymbolicValue::Concrete(0);
+    let callee_return = callee.return_value().unwrap_or(&default_ret);
 
     let mut composed = FunctionSummary::new(caller.function_name.clone(), caller.params.clone());
 
     // Carry over caller preconditions.
     for pre in &caller.preconditions {
-        composed.add_precondition(pre.param.clone(), substitute(&pre.constraint, &subst));
+        composed.add_precondition(
+            pre.param.clone(),
+            substitute_single(&pre.constraint, call_result_name, callee_return),
+        );
     }
 
     // Carry over callee preconditions (they become caller preconditions).
@@ -234,7 +279,10 @@ pub fn compose_summaries(
 
     // Caller postconditions with callee return substituted.
     for post in &caller.postconditions {
-        composed.add_postcondition(post.name.clone(), substitute(&post.constraint, &subst));
+        composed.add_postcondition(
+            post.name.clone(),
+            substitute_single(&post.constraint, call_result_name, callee_return),
+        );
     }
 
     // Callee postconditions carried forward.
@@ -261,10 +309,18 @@ pub fn compose_summaries(
     for effect in &caller.side_effects {
         match effect {
             SideEffect::Return(v) => {
-                composed.add_side_effect(SideEffect::Return(substitute(v, &subst)));
+                composed.add_side_effect(SideEffect::Return(substitute_single(
+                    v,
+                    call_result_name,
+                    callee_return,
+                )));
             }
             SideEffect::Panic(v) => {
-                composed.add_side_effect(SideEffect::Panic(substitute(v, &subst)));
+                composed.add_side_effect(SideEffect::Panic(substitute_single(
+                    v,
+                    call_result_name,
+                    callee_return,
+                )));
             }
             other => composed.add_side_effect(other.clone()),
         }

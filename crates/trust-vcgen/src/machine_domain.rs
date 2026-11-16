@@ -358,10 +358,7 @@ impl DomainScan {
                 Some(joined) => format!("exact widening join at {}", joined.rust_name()),
                 None => "no exact widening join exists".to_string(),
             };
-            parts.push(format!(
-                "declared domains disagree: {} ({recoverable})",
-                names.join(", ")
-            ));
+            parts.push(format!("declared domains disagree: {} ({recoverable})", names.join(", ")));
         }
         if !self.non_machine_leaves.is_empty() {
             let mut names = self.non_machine_leaves.clone();

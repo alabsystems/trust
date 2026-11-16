@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, ExitStatus, Stdio};
 
 use serde::Serialize;
-use trust_upstream_compat::porting::{self, ProofMode};
+use trust_upstream_compat::porting::{self, ProofMode, ProofScope};
 use trust_upstream_compat::{
     AccountingBundle, CompatibilityBaseline, CompatibilityResultSummary, ExceptionLedger,
     ParseError, TestExceptionLedger, TestInventory, TestInventoryEntry, TestKind, TestOutcome,
@@ -36,7 +36,7 @@ trust-upstream-compat
 
 Usage:
   trust-upstream-compat validate --baseline <path> --exceptions <path> --upstream-fixes <path> [--summary <path>] [--current-upstream-revision <rev>]
-  trust-upstream-compat port [--baseline <path>] [--upstream-fixes <path>] [--test-exceptions <path>] [--patch-manifest <path>] [--llm-directives <path>] [--summary-out <path>] [--run-id <id>] [--target-arch <arch>] [--target <target>] [--target-triple <triple>] [--host <host>] [--host-triple <triple>] [--upstream-revision <rev>] [--upstream-remote <url>] [--out-dir <path>] [--execute|--no-execute] [--apply|--no-apply] [--no-fetch] [--scorecard-log <path>] [--bootstrap-args <args>] [--max-files <n>] [--release] [--proof-mode auto|smoke|full]
+  trust-upstream-compat port [--baseline <path>] [--upstream-fixes <path>] [--test-exceptions <path>] [--patch-manifest <path>] [--llm-directives <path>] [--summary-out <path>] [--run-id <id>] [--target-arch <arch>] [--target <target>] [--target-triple <triple>] [--host <host>] [--host-triple <triple>] [--upstream-revision <rev>] [--upstream-remote <url>] [--out-dir <path>] [--execute|--no-execute] [--apply|--no-apply] [--no-fetch] [--scorecard-log <path>] [--bootstrap-args <args>] [--max-files <n>] [--release] [--proof-mode auto|smoke|full] [--proof-scope combined|upstream-rust]
   trust-upstream-compat --help
 
 Canonical release-facing entry point:
@@ -45,11 +45,13 @@ Canonical release-facing entry point:
 Formats are selected by extension: .json parses as JSON; all other paths parse as TOML.
 This binary is an internal compatibility/accounting engine. The run, prove, and
 upstream-port aliases remain accepted for compatibility but are intentionally
-not part of the release-facing help. The port command defaults to the reviewed
-upstream ledger revision with no network fetch, execute+apply, writes porting
+not part of the release-facing help. The port command defaults to the selected
+baseline's upstream revision with no network fetch, execute+apply, writes porting
 scorecards, and uses --proof-mode auto as smoke for --max-files runs and full
-otherwise. Pass --upstream-revision rust-lang/rust:HEAD explicitly to refetch
-current upstream and open a drift review. It also reapplies the default
+otherwise. --proof-scope defaults to combined; upstream-rust requires the full
+upstream suite and omits Trust-added commands. Pass --upstream-revision
+rust-lang/rust:HEAD explicitly to refetch current upstream and open a drift
+review. It also reapplies the default
 deterministic patch manifest and writes an AI-actionable directives artifact
 beside the scorecard.
 ";
@@ -58,8 +60,6 @@ const DEFAULT_PORT_BASELINE: &str = "tests/upstream-rust/baseline.toml";
 const DEFAULT_PORT_UPSTREAM_FIXES: &str = "tests/upstream-rust/upstream-fixes.toml";
 const DEFAULT_PORT_TEST_EXCEPTIONS: &str = "tests/upstream-rust/test-exceptions.toml";
 const DEFAULT_PORT_PATCH_MANIFEST: &str = "tests/upstream-rust/patches.toml";
-const DEFAULT_PORT_UPSTREAM_REVISION: &str =
-    "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0";
 const DEFAULT_PORT_UPSTREAM_REMOTE: &str = "https://github.com/rust-lang/rust.git";
 const DEFAULT_PORT_OUT_DIR: &str = "reports/upstream-rust/porting/current";
 const PORT_BOOTSTRAP_ARGS_ENV: &str = "TRUST_UPSTREAM_RUST_BOOTSTRAP_ARGS";
@@ -216,7 +216,7 @@ struct PortOptions {
     target_triple: Option<String>,
     host: Option<String>,
     host_triple: Option<String>,
-    upstream_revision: String,
+    upstream_revision: Option<String>,
     upstream_remote: String,
     out_dir: PathBuf,
     execute: bool,
@@ -227,6 +227,7 @@ struct PortOptions {
     max_files: Option<usize>,
     release: bool,
     proof_mode: ProofMode,
+    proof_scope: ProofScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -557,6 +558,7 @@ fn parse_port_args(mut args: impl Iterator<Item = OsString>) -> Result<Command, 
     let mut bootstrap_args = None;
     let mut max_files = None;
     let mut proof_mode = None;
+    let mut proof_scope = None;
     let mut execute = None;
     let mut apply = None;
     let mut fetch = true;
@@ -589,6 +591,7 @@ fn parse_port_args(mut args: impl Iterator<Item = OsString>) -> Result<Command, 
                 "--bootstrap-args" => set_string(flag, &mut bootstrap_args, Some(value))?,
                 "--max-files" => set_usize(flag, &mut max_files, Some(value))?,
                 "--proof-mode" => set_proof_mode(flag, &mut proof_mode, Some(value))?,
+                "--proof-scope" => set_proof_scope(flag, &mut proof_scope, Some(value))?,
                 _ => unreachable!("split_port_value_arg returned an unsupported flag"),
             }
         } else if arg == OsStr::new("--baseline") {
@@ -642,6 +645,8 @@ fn parse_port_args(mut args: impl Iterator<Item = OsString>) -> Result<Command, 
             set_flag("--release", &mut release)?;
         } else if arg == OsStr::new("--proof-mode") {
             set_proof_mode("--proof-mode", &mut proof_mode, args.next())?;
+        } else if arg == OsStr::new("--proof-scope") {
+            set_proof_scope("--proof-scope", &mut proof_scope, args.next())?;
         } else {
             return Err(CliError::Usage(format!(
                 "unexpected argument '{}'",
@@ -651,8 +656,6 @@ fn parse_port_args(mut args: impl Iterator<Item = OsString>) -> Result<Command, 
     }
 
     let upstream_revision_was_explicit = upstream_revision.is_some();
-    let upstream_revision =
-        upstream_revision.unwrap_or_else(|| DEFAULT_PORT_UPSTREAM_REVISION.to_string());
     let fetch = if no_fetch_seen { false } else { upstream_revision_was_explicit && fetch };
 
     let options = PortOptions {
@@ -687,6 +690,7 @@ fn parse_port_args(mut args: impl Iterator<Item = OsString>) -> Result<Command, 
         max_files,
         release,
         proof_mode: proof_mode.unwrap_or(ProofMode::Auto),
+        proof_scope: proof_scope.unwrap_or(ProofScope::Combined),
     };
     validate_port_options(&options)?;
 
@@ -716,6 +720,7 @@ fn split_port_value_arg(arg: &OsStr) -> Option<(&'static str, OsString)> {
         "--bootstrap-args" => "--bootstrap-args",
         "--max-files" => "--max-files",
         "--proof-mode" => "--proof-mode",
+        "--proof-scope" => "--proof-scope",
         _ => return None,
     };
 
@@ -810,10 +815,37 @@ fn set_proof_mode(
     Ok(())
 }
 
+fn set_proof_scope(
+    flag: &'static str,
+    target: &mut Option<ProofScope>,
+    value: Option<OsString>,
+) -> Result<(), CliError> {
+    if target.is_some() {
+        return Err(CliError::Usage(format!("duplicate {flag}")));
+    }
+
+    let value = value.ok_or_else(|| CliError::Usage(format!("missing value for {flag}")))?;
+    let display_value = value.to_string_lossy();
+    let proof_scope = ProofScope::parse(&display_value).ok_or_else(|| {
+        CliError::Usage(format!(
+            "invalid value for {flag}: '{display_value}' (expected combined or upstream-rust)"
+        ))
+    })?;
+    *target = Some(proof_scope);
+    Ok(())
+}
+
 fn validate_port_options(options: &PortOptions) -> Result<(), CliError> {
     if options.execute && options.scorecard_log.is_some() {
         return Err(CliError::Usage(
             "--scorecard-log is log-parse mode; pass it without --execute so scorecard evidence cannot be mistaken for a fresh suite run".to_string(),
+        ));
+    }
+
+    if options.proof_scope == ProofScope::UpstreamRust && options.max_files.is_some() {
+        return Err(CliError::Usage(
+            "--proof-scope upstream-rust requires the entire upstream suite; omit --max-files"
+                .to_string(),
         ));
     }
 
@@ -839,6 +871,11 @@ fn resolved_proof_mode(requested: ProofMode, max_files: Option<usize>) -> ProofM
 
 fn execute_port(options: PortOptions) -> Result<CommandOutcome, CliError> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let upstream_revision = resolve_port_upstream_revision(
+        &repo_root,
+        &options.baseline,
+        options.upstream_revision.as_deref(),
+    )?;
     let test_exception_validation_date = test_exception_validation_date();
     let test_exceptions = options
         .test_exceptions
@@ -850,39 +887,55 @@ fn execute_port(options: PortOptions) -> Result<CommandOutcome, CliError> {
             )
         })
         .transpose()?;
-    let report = porting::run_porting(porting::PortOptions {
-        repo_root: repo_root.clone(),
-        baseline: options.baseline,
-        upstream_fixes: options.upstream_fixes,
-        test_exceptions,
-        patch_manifest: options.patch_manifest,
-        llm_directives: options.llm_directives,
-        summary_out: options.summary_out,
-        run_id: options.run_id,
-        target_arch: options.target_arch,
-        target: options.target,
-        target_triple: options.target_triple,
-        host: options.host,
-        host_triple: options.host_triple,
-        test_exception_validation_date: Some(test_exception_validation_date),
-        upstream_revision: options.upstream_revision,
-        upstream_remote: options.upstream_remote,
-        out_dir: options.out_dir,
-        execute: options.execute,
-        apply: options.apply,
-        fetch: options.fetch,
-        scorecard_log: options.scorecard_log,
-        bootstrap_args: options.bootstrap_args,
-        max_files: options.max_files,
-        release: options.release,
-        proof_mode: options.proof_mode,
-    })
+    let report = porting::run_porting_with_scope(
+        porting::PortOptions {
+            repo_root: repo_root.clone(),
+            baseline: options.baseline,
+            upstream_fixes: options.upstream_fixes,
+            test_exceptions,
+            patch_manifest: options.patch_manifest,
+            llm_directives: options.llm_directives,
+            summary_out: options.summary_out,
+            run_id: options.run_id,
+            target_arch: options.target_arch,
+            target: options.target,
+            target_triple: options.target_triple,
+            host: options.host,
+            host_triple: options.host_triple,
+            test_exception_validation_date: Some(test_exception_validation_date),
+            upstream_revision,
+            upstream_remote: options.upstream_remote,
+            out_dir: options.out_dir,
+            execute: options.execute,
+            apply: options.apply,
+            fetch: options.fetch,
+            scorecard_log: options.scorecard_log,
+            bootstrap_args: options.bootstrap_args,
+            max_files: options.max_files,
+            release: options.release,
+            proof_mode: options.proof_mode,
+        },
+        options.proof_scope,
+    )
     .map_err(CliError::Porting)?;
     print!("{}", report.render_terminal(&repo_root));
     if report.exit_code == 0 {
         Ok(CommandOutcome::Success)
     } else {
         Err(CliError::PortingFailure(report.exit_code))
+    }
+}
+
+fn resolve_port_upstream_revision(
+    repo_root: &Path,
+    baseline: &Path,
+    requested: Option<&str>,
+) -> Result<String, CliError> {
+    match requested {
+        Some(revision) => Ok(revision.to_string()),
+        None => {
+            Ok(parse_baseline_file(&repo_relative_path(repo_root, baseline))?.upstream.revision)
+        }
     }
 }
 
@@ -1403,7 +1456,8 @@ fn current_date_string() -> String {
 }
 
 fn current_host() -> Option<String> {
-    let output = ProcessCommand::new("rustc").arg("-vV").output().ok()?;
+    // The Trust compiler by its own name, never a bare `rustc` (see porting.rs).
+    let output = ProcessCommand::new("trustc").arg("-vV").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1504,7 +1558,10 @@ mod tests {
             run(["trust-upstream-compat", "--help"].map(OsString::from), &mut stdout, &mut stderr);
 
         assert_eq!(result, Ok(()));
-        assert!(String::from_utf8(stdout).expect("stdout should be utf-8").contains("Usage:"));
+        let help = String::from_utf8(stdout).expect("stdout should be utf-8");
+        assert!(help.contains("Usage:"));
+        assert!(help.contains("--proof-scope combined|upstream-rust"));
+        assert!(help.contains("--proof-scope defaults to combined"));
         assert!(stderr.is_empty());
     }
 
@@ -1543,7 +1600,7 @@ mod tests {
                 assert_eq!(options.target_triple, None);
                 assert_eq!(options.host, None);
                 assert_eq!(options.host_triple, None);
-                assert_eq!(options.upstream_revision, DEFAULT_PORT_UPSTREAM_REVISION);
+                assert_eq!(options.upstream_revision, None);
                 assert_eq!(options.upstream_remote, DEFAULT_PORT_UPSTREAM_REMOTE);
                 assert_eq!(options.out_dir, PathBuf::from(DEFAULT_PORT_OUT_DIR));
                 assert!(options.execute);
@@ -1557,6 +1614,7 @@ mod tests {
                 assert_eq!(options.max_files, None);
                 assert!(!options.release);
                 assert_eq!(options.proof_mode, ProofMode::Auto);
+                assert_eq!(options.proof_scope, ProofScope::Combined);
                 assert_eq!(
                     resolved_proof_mode(options.proof_mode, options.max_files),
                     ProofMode::Full
@@ -1564,6 +1622,117 @@ mod tests {
             }
             other => panic!("expected port command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn port_default_revision_uses_checked_in_baseline() {
+        let Command::Port(options) = parse_args(["port"].map(OsString::from)).unwrap() else {
+            panic!("expected port options");
+        };
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let expected = parse_baseline_file(&root.join(DEFAULT_PORT_BASELINE)).unwrap();
+        assert_eq!(
+            resolve_port_upstream_revision(&root, &options.baseline, None).unwrap(),
+            expected.upstream.revision
+        );
+        assert!(!options.fetch);
+    }
+
+    #[test]
+    fn port_default_revision_uses_selected_baseline() {
+        let fixture = Fixture::new("selected-baseline-revision");
+        for (name, revision) in [
+            ("first.toml", "rust-lang/rust:1111111111111111111111111111111111111111"),
+            ("second.toml", "rust-lang/rust:2222222222222222222222222222222222222222"),
+        ] {
+            fixture.write(name, &BASELINE_TOML.replace("rust-lang-rust:abc123", revision));
+            let Command::Port(options) =
+                parse_args(["port", "--baseline", name].map(OsString::from)).unwrap()
+            else {
+                panic!("expected port options");
+            };
+            assert_eq!(
+                resolve_port_upstream_revision(
+                    &fixture.root,
+                    &options.baseline,
+                    options.upstream_revision.as_deref(),
+                )
+                .unwrap(),
+                revision
+            );
+            assert!(!options.fetch);
+        }
+    }
+
+    #[test]
+    fn port_explicit_revision_overrides_selected_baseline() {
+        let fixture = Fixture::new("explicit-baseline-revision");
+        fixture.write("selected.toml", BASELINE_TOML);
+        let requested = "rust-lang/rust:3333333333333333333333333333333333333333";
+        let Command::Port(options) = parse_args(
+            ["port", "--baseline", "selected.toml", "--upstream-revision", requested]
+                .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected port options");
+        };
+        assert_eq!(
+            resolve_port_upstream_revision(
+                &fixture.root,
+                &options.baseline,
+                options.upstream_revision.as_deref(),
+            )
+            .unwrap(),
+            requested
+        );
+        assert!(options.fetch);
+    }
+
+    #[test]
+    fn port_invalid_default_baseline_fails_before_output() {
+        let fixture = Fixture::new("invalid-default-baseline");
+        for (name, contents) in [
+            ("malformed.toml", "[not valid TOML".to_string()),
+            (
+                "invalid-schema.toml",
+                BASELINE_TOML.replace("schema_version = \"0.1.0\"", "schema_version = \"99.0.0\""),
+            ),
+        ] {
+            let baseline = fixture.write(name, &contents);
+            let output = fixture.root.join(format!("{name}-output"));
+            let Command::Port(options) = parse_args([
+                OsString::from("port"),
+                OsString::from("--baseline"),
+                baseline.into_os_string(),
+                OsString::from("--out-dir"),
+                output.clone().into_os_string(),
+                OsString::from("--no-execute"),
+                OsString::from("--no-apply"),
+            ])
+            .unwrap() else {
+                panic!("expected port options");
+            };
+            assert!(matches!(execute_port(options), Err(CliError::Parse { kind: "baseline", .. })));
+            assert!(!output.exists(), "invalid baseline must fail before creating port output");
+        }
+    }
+
+    #[test]
+    fn port_missing_default_baseline_fails_before_output() {
+        let fixture = Fixture::new("missing-default-baseline");
+        let output = fixture.root.join("output");
+        let Command::Port(options) = parse_args([
+            OsString::from("port"),
+            OsString::from("--baseline"),
+            fixture.root.join("missing.toml").into_os_string(),
+            OsString::from("--out-dir"),
+            output.clone().into_os_string(),
+        ])
+        .unwrap() else {
+            panic!("expected port options");
+        };
+        assert!(matches!(execute_port(options), Err(CliError::Read { kind: "baseline", .. })));
+        assert!(!output.exists(), "missing baseline must fail before creating port output");
     }
 
     #[test]
@@ -1596,7 +1765,7 @@ mod tests {
                 "--host-triple",
                 "aarch64-unknown-linux-gnu",
                 "--upstream-revision",
-                "rust-lang/rust:feedface",
+                "rust-lang/rust:1111111",
                 "--upstream-remote",
                 "https://example.invalid/rust.git",
                 "--out-dir",
@@ -1633,7 +1802,7 @@ mod tests {
                 assert_eq!(options.target_triple.as_deref(), Some("aarch64-unknown-linux-gnu"));
                 assert_eq!(options.host.as_deref(), Some("aarch64-unknown-linux-gnu"));
                 assert_eq!(options.host_triple.as_deref(), Some("aarch64-unknown-linux-gnu"));
-                assert_eq!(options.upstream_revision, "rust-lang/rust:feedface");
+                assert_eq!(options.upstream_revision.as_deref(), Some("rust-lang/rust:1111111"));
                 assert_eq!(options.upstream_remote, "https://example.invalid/rust.git");
                 assert_eq!(options.out_dir, PathBuf::from("reports/ported"));
                 assert!(options.execute);
@@ -1644,6 +1813,7 @@ mod tests {
                 assert_eq!(options.max_files, Some(12));
                 assert!(options.release);
                 assert_eq!(options.proof_mode, ProofMode::Smoke);
+                assert_eq!(options.proof_scope, ProofScope::Combined);
                 assert_eq!(
                     resolved_proof_mode(options.proof_mode, options.max_files),
                     ProofMode::Smoke
@@ -1680,6 +1850,7 @@ mod tests {
                     assert!(!options.fetch);
                     assert_eq!(options.max_files, Some(1));
                     assert_eq!(options.proof_mode, ProofMode::Smoke);
+                    assert_eq!(options.proof_scope, ProofScope::Combined);
                 }
                 other => panic!("expected port command for {surface}, got {other:?}"),
             }
@@ -1703,13 +1874,14 @@ mod tests {
                 "--target-triple=x86_64-unknown-linux-gnu",
                 "--host=x86_64-unknown-linux-gnu",
                 "--host-triple=x86_64-unknown-linux-gnu",
-                "--upstream-revision=rust-lang/rust:feedface",
+                "--upstream-revision=rust-lang/rust:1111111",
                 "--upstream-remote=https://example.invalid/rust.git",
                 "--out-dir=reports/ported",
                 "--scorecard-log=previous.log",
                 "--bootstrap-args=--set llvm.ninja=false",
                 "--max-files=12",
                 "--proof-mode=smoke",
+                "--proof-scope=combined",
             ]
             .map(OsString::from),
         )
@@ -1732,7 +1904,7 @@ mod tests {
                 assert_eq!(options.target_triple.as_deref(), Some("x86_64-unknown-linux-gnu"));
                 assert_eq!(options.host.as_deref(), Some("x86_64-unknown-linux-gnu"));
                 assert_eq!(options.host_triple.as_deref(), Some("x86_64-unknown-linux-gnu"));
-                assert_eq!(options.upstream_revision, "rust-lang/rust:feedface");
+                assert_eq!(options.upstream_revision.as_deref(), Some("rust-lang/rust:1111111"));
                 assert_eq!(options.upstream_remote, "https://example.invalid/rust.git");
                 assert_eq!(options.out_dir, PathBuf::from("reports/ported"));
                 assert!(!options.execute);
@@ -1741,6 +1913,7 @@ mod tests {
                 assert_eq!(options.bootstrap_args, "--set llvm.ninja=false");
                 assert_eq!(options.max_files, Some(12));
                 assert_eq!(options.proof_mode, ProofMode::Smoke);
+                assert_eq!(options.proof_scope, ProofScope::Combined);
             }
             other => panic!("expected port command, got {other:?}"),
         }
@@ -1811,7 +1984,7 @@ mod tests {
             ("--test-exceptions", "test-exceptions.toml", "other-test-exceptions.toml"),
             ("--patch-manifest", "patches.toml", "other-patches.toml"),
             ("--llm-directives", "llm.md", "other-llm.md"),
-            ("--upstream-revision", "rust-lang/rust:feedface", "rust-lang/rust:cafebabe"),
+            ("--upstream-revision", "rust-lang/rust:1111111", "rust-lang/rust:2222222"),
             (
                 "--upstream-remote",
                 "https://example.invalid/rust.git",
@@ -1822,6 +1995,7 @@ mod tests {
             ("--bootstrap-args", "--set llvm.ninja=false", "--set llvm.ninja=true"),
             ("--max-files", "12", "13"),
             ("--proof-mode", "smoke", "full"),
+            ("--proof-scope", "combined", "upstream-rust"),
         ] {
             let split_then_equals = parse_args([
                 OsString::from("port"),
@@ -1892,6 +2066,55 @@ mod tests {
             CliError::Usage(message) => {
                 assert!(message.contains("--proof-mode"));
                 assert!(message.contains("auto, smoke, or full"));
+            }
+            other => panic!("expected usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_port_args_accepts_explicit_upstream_rust_scope() {
+        for args in [
+            vec!["port", "--proof-scope=upstream-rust"],
+            vec!["trust", "domination", "upstream-tests", "--proof-scope", "upstream-rust"],
+        ] {
+            let command = parse_args(args.into_iter().map(OsString::from))
+                .expect("explicit upstream-rust scope should parse");
+            match command {
+                Command::Port(options) => {
+                    assert_eq!(options.proof_scope, ProofScope::UpstreamRust);
+                    assert_eq!(options.max_files, None);
+                }
+                other => panic!("expected port command, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_port_args_rejects_invalid_or_missing_proof_scope() {
+        for args in [
+            vec!["port", "--proof-scope", "upstream_rust"],
+            vec!["port", "--proof-scope="],
+            vec!["port", "--proof-scope"],
+        ] {
+            let err = parse_args(args.into_iter().map(OsString::from))
+                .expect_err("invalid proof scope should fail");
+            match err {
+                CliError::Usage(message) => assert!(message.contains("--proof-scope")),
+                other => panic!("expected usage error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_port_args_rejects_bounded_upstream_rust_scope() {
+        let err = parse_args(
+            ["port", "--proof-scope", "upstream-rust", "--max-files", "1"].map(OsString::from),
+        )
+        .expect_err("upstream-rust scope must not admit a bounded inventory");
+        match err {
+            CliError::Usage(message) => {
+                assert!(message.contains("--proof-scope upstream-rust"));
+                assert!(message.contains("--max-files"));
             }
             other => panic!("expected usage error, got {other:?}"),
         }
@@ -1987,7 +2210,7 @@ mod tests {
                 OsString::from("--upstream-fixes"),
                 fixes.into_os_string(),
                 OsString::from("--current-upstream-revision"),
-                OsString::from("rust-lang-rust:feedface"),
+                OsString::from("rust-lang-rust:1111111"),
             ],
             &mut stdout,
             &mut stderr,
@@ -2020,7 +2243,7 @@ mod tests {
                 OsString::from("--upstream-fixes"),
                 fixes.into_os_string(),
                 OsString::from("--current-upstream-revision"),
-                OsString::from("rust-lang-rust:feedface"),
+                OsString::from("rust-lang-rust:1111111"),
             ],
             &mut stdout,
             &mut stderr,

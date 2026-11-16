@@ -2,7 +2,7 @@
 
 use hir_def::FindPathConfig;
 use hir_expand::mod_path::ModPath;
-use hir_ty::{
+use hir_ide::{
     db::HirDatabase,
     display::{DisplaySourceCodeError, DisplayTarget, HirDisplay},
 };
@@ -65,7 +65,7 @@ pub enum Expr<'db> {
     /// Static variable
     Static(Static),
     /// Local variable
-    Local(Local),
+    Local(Local<'db>),
     /// Constant generic parameter
     ConstParam(ConstParam),
     /// Well known type (such as `true` for bool)

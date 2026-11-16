@@ -1,0 +1,57 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta13_lean_let",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (f344fb244 2026-09-21) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@7b9146ba2ab5 sha256:c9692ee58d31e864",
+  "clean": "first-party/clean@faf434b73aac sha256:a9d64ad7f7b7ccde",
+  "trust-cg": "first-party/trust-cg@3f79b19a3d7f sha256:f24a73c879facca4"
+ },
+ "ratchets": {
+  "a.lean.let.carried": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "the audit corpus is a FIXED snapshot (stage1 at 5b45b83b8 with the clean/trust-cg it pinned); this tree measures first-party/clean@6f4f2d1de3ca, ~220 commits later. A Lean `let` island body is now RECORDED on the verify-off lane, so `clean_origin.recorded` is true where the audit measured it false. Not attributed to one clean commit: the pin moved as a range, and the flip is what this tree measures."
+  },
+  "a.lean.let.emit": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "the audit corpus is a FIXED snapshot (stage1 at 5b45b83b8 with the clean/trust-cg it pinned); this tree measures first-party/clean@6f4f2d1de3ca, ~220 commits later. The `let` spine now EMITS trust-ir instead of the clean-origin evidence disagreement at semantic finalization that the audit recorded (which fell back to emit-off). Measured, not attributed to a single clean commit."
+  },
+  "a.lean.let.exec": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "the audit corpus is a FIXED snapshot (stage1 at 5b45b83b8 with the clean/trust-cg it pinned); this tree measures first-party/clean@6f4f2d1de3ca, ~220 commits later. The emitted `@m::sq_let` is no longer bodyless on the verify-off lane, so the row executes it. Same range, same caveat."
+  },
+  "a.lean.let.native": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.let.roundtrip": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was a text-PARSE refusal (roundtrip:text-parse:fn-name): the producer's entity names leave the bare-identifier alphabet (`m::dep_clamp`, `m::Pt<u8>`), and text had no spelling for them, so the module did not survive `bin -> text -> bin` at all. trust-ir now prints `@\"escaped\"` and `Parser::read_name` decodes it (WS4.3 identifier half), which closes the PARSE half. Reaching PASS also needed the TRANSPORT to stop canonicalizing: `trust-ir convert --to text` encoded through `format::canonical_checked`, which renumbers SSA values densely and reorders blocks before printing \u2014 a DECLARED rewrite that `text_losses` deliberately does not report, so a non-canonical module came back re-numbered with an EMPTY loss list. trust-ir bef296c7 adds `format::text_checked` (same refusal, module printed AS STORED) and points `convert` at it. MEASURED on this tree, as a control over the 24 producer-emitted modules this lane compiles: 10 of the 24 are NOT canonical, and `bin -> text -> bin` is byte-identical for 24/24 with `text_checked` but only 14/24 with canonicalize-first. So both halves were required and neither alone would have flipped this pin."
+  },
+  "a.lean.let.twin.codec.trailing": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.let.twin.exec.mutant": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "the audit corpus is a FIXED snapshot (stage1 at 5b45b83b8 with the clean/trust-cg it pinned); this tree measures first-party/clean@6f4f2d1de3ca, ~220 commits later. This ratchet has no entry in the audit corpus at all (the mutant twin postdates the snapshot), so there is nothing it moved FROM; it is pinned at what this tree measures."
+  },
+  "a.lean.let.twin.validate.site": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.let.twin.validate.vararg": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.lean.let.validate": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

@@ -8,7 +8,7 @@ use hir_def::{
     src::{HasChildSource, HasSource as _},
 };
 use hir_expand::{EditionedFileId, HirFileId, InFile};
-use hir_ty::{db::InternedClosure, next_solver::AnyImplId};
+use hir_ide::{db::InternedClosure, next_solver::AnyImplId};
 use syntax::{AstNode, ast};
 use tt::TextRange;
 
@@ -265,7 +265,7 @@ impl HasSource for LifetimeParam {
     }
 }
 
-impl HasSource for LocalSource {
+impl HasSource for LocalSource<'_> {
     type Ast = Either<ast::IdentPat, ast::SelfParam>;
 
     fn source(self, _: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
@@ -297,7 +297,7 @@ impl HasSource for Param<'_> {
                 let (_, source_map) =
                     ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
                 let ast @ InFile { file_id, value } = source_map.expr_syntax(expr_id).ok()?;
-                let root = db.parse_or_expand(file_id);
+                let root = file_id.parse_or_expand(db);
                 match value.to_node(&root) {
                     Either::Left(ast::Expr::ClosureExpr(it)) => it
                         .param_list()?

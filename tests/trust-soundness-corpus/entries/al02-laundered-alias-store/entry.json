@@ -1,0 +1,48 @@
+{
+  "id": "al02-laundered-alias-store",
+  "class": "al02 (LAUNDERED-ALIAS-STORE)",
+  "title": "a store through one pointer did not version a read through a laundered alias of it",
+  "origin": [
+    "KH 'FIXED 2026-10-11 ... (LAUNDERED-ALIAS-STORE, LAUNDERED-ALIAS-ELIDE-1)'",
+    "wave24/laundered-alias-versioning",
+    "crates/trust-vcgen/tests/ploss_adv_false_proofs_realmir.rs::laundered_alias_store_is_never_proved",
+    "crates/trust-vcgen/tests/fixtures/ploss_adv/h1_alias.rs (al02)"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "al02_launder_store_read_bug",
+    "obligation": {
+      "kind": "bounds",
+      "at": "buf[x]"
+    }
+  },
+  "twin": {
+    "function": "al18_store_then_read_ctl",
+    "obligation": {
+      "kind": "bounds",
+      "at": "buf[x]"
+    }
+  },
+  "witness": {
+    "input": "m = 100, n = 3",
+    "observed": "index out of bounds: the len is 8 but the index is 100",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  },
+  "opt_levels": [
+    "0",
+    "1"
+  ],
+  "expected_refusal": {
+    "trust-vc-syn": {
+      "reproducer": "assignment through a dereferenced reference is unsupported in vc_extraction",
+      "twin": "assignment through a dereferenced reference is unsupported in vc_extraction"
+    }
+  }
+}

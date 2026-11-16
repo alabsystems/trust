@@ -1,0 +1,52 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta19_lean_calls_rust",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (f344fb244 2026-09-21) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@7b9146ba2ab5 sha256:c9692ee58d31e864",
+  "clean": "first-party/clean@faf434b73aac sha256:a9d64ad7f7b7ccde",
+  "trust-cg": "first-party/trust-cg@3f79b19a3d7f sha256:f24a73c879facca4"
+ },
+ "ratchets": {
+  "a.two_lang.lean_calls_rust.carried": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "closed upstream between the audit compiler (5b45b83b8) and this one: the TrustIR Clean-origin producer now spells the `RustCallChain` body shape (7ff041fcf6 `feat(clean-ir): record sealed Rust calls in the owning module`), so `thrice_rx` is no longer SKIPPED \u2014 it carries a Producer::Clean body (Call+Call+Call+Return) in the crate module. The audit's GAP text ('this TrustIR producer does not spell it yet') no longer describes the producer."
+  },
+  "a.two_lang.lean_calls_rust.emit": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.two_lang.lean_calls_rust.exec": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "same upstream close as a.two_lang.lean_calls_rust.carried: the interpreter no longer traps at a body-less `@thrice_rx` declaration, because the declaration now has a body; `program` executes to 80 and agrees with the native run."
+  },
+  "a.two_lang.lean_calls_rust.native": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.two_lang.lean_calls_rust.roundtrip": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was a text-PARSE refusal (roundtrip:text-parse:fn-name): the producer's entity names leave the bare-identifier alphabet (`m::dep_clamp`, `m::Pt<u8>`), and text had no spelling for them, so the module did not survive `bin -> text -> bin` at all. trust-ir now prints `@\"escaped\"` and `Parser::read_name` decodes it (WS4.3 identifier half), which closes the PARSE half. Reaching PASS also needed the TRANSPORT to stop canonicalizing: `trust-ir convert --to text` encoded through `format::canonical_checked`, which renumbers SSA values densely and reorders blocks before printing \u2014 a DECLARED rewrite that `text_losses` deliberately does not report, so a non-canonical module came back re-numbered with an EMPTY loss list. trust-ir bef296c7 adds `format::text_checked` (same refusal, module printed AS STORED) and points `convert` at it. MEASURED on this tree, as a control over the 24 producer-emitted modules this lane compiles: 10 of the 24 are NOT canonical, and `bin -> text -> bin` is byte-identical for 24/24 with `text_checked` but only 14/24 with canonicalize-first. So both halves were required and neither alone would have flipped this pin."
+  },
+  "a.two_lang.lean_calls_rust.twin.codec.trailing": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.two_lang.lean_calls_rust.twin.exec.mutant": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not measured by the audit at all: its mutation twin only runs once the module EXECUTES, and at 5b45b83b8 the interpreter trapped at the body-less `@thrice_rx`. With the body present the twin is measurable, and a mutated literal (85 -> 86) moves the interpreted result (80 -> 83), so the exec row is not vacuous."
+  },
+  "a.two_lang.lean_calls_rust.twin.validate.vararg": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.two_lang.lean_calls_rust.validate": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

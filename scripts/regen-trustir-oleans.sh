@@ -2,9 +2,9 @@
 # Trust: the Lean↔Clean bridge AUDIT LANE (option (iii) of
 # reports/bridge-assembly-11arms-2026-07-02.md §5, kept as a rebuild tool).
 #
-# Rebuilds trust-ir's Lean semantics (.olean) from the CHECKED-OUT pinned
+# Rebuilds trust-ir's Lean semantics (.olean) from the pinned Git objects
 # sources with the pinned Lean toolchain, computes the minimal module closure
-# of the bridge root (TrustIr.Semantics.Arith), and:
+# of the exported BRIDGE_ROOT_MODULES union, and:
 #
 #   default (--check): verifies the VENDORED artifacts —
 #     crates/trust-clean/fixtures/trustir-oleans (TrustIr modules) and
@@ -20,15 +20,44 @@
 # trust_ir-semantics/lean-toolchain. Provide it either via elan (installed
 # automatically with `elan run --install`) or by setting LEAN_TOOLCHAIN_BIN to
 # the toolchain's bin/ directory (lake + lean). Rust-side closure computation
-# uses the in-tree clean-olean (cargo run --example bridge_closure).
+# uses the in-tree clean-olean (`targo --unverified run -p trust-bridge-closure --bin bridge_closure`).
+# Set TRUST_REGEN_KEEP_WORK=1 to retain the successful producer snapshot for
+# same-source metadata accounting. This changes cleanup only, never the proof roots.
+# TRUST_REGEN_NATIVE_LINKER may name an absolute executable linker for Lake's
+# nativeLinker configuration (for example, a user-prefix Apple toolchain).
 #
 # This is a TOOL anyone can run — the default-on gate itself
 # (crates/trust-clean/tests/lean_clean_bridge.rs) never needs a Lean
 # toolchain; that is the point of vendoring.
 set -euo pipefail
+# Keep every named repository independent of a hook/caller's Git identity.
+unset $(git rev-parse --local-env-vars)
+
+KEEP_WORK="${TRUST_REGEN_KEEP_WORK:-0}"
+case "$KEEP_WORK" in
+    0|1) ;;
+    *) echo "regen-trustir-oleans: TRUST_REGEN_KEEP_WORK must be 0 or 1" >&2; exit 2 ;;
+esac
+
+NATIVE_LINKER="${TRUST_REGEN_NATIVE_LINKER:-}"
+if [[ -n "$NATIVE_LINKER" ]]; then
+    [[ "$NATIVE_LINKER" == /* && -f "$NATIVE_LINKER" && -x "$NATIVE_LINKER" ]] || {
+        echo "regen-trustir-oleans: TRUST_REGEN_NATIVE_LINKER must name an absolute executable file" >&2
+        exit 2
+    }
+fi
 
 MODE="check"
 if [[ "${1:-}" == "--write" ]]; then MODE="write"; fi
+REUSE_ANCHOR=""
+if [[ "${1:-}" == "--reuse-source-inputs" ]]; then
+    [[ "$#" == 2 && "$2" =~ ^[0-9a-f]{40}$ ]] || {
+        echo "usage: scripts/regen-trustir-oleans.sh --reuse-source-inputs <original-artifact-commit>" >&2
+        exit 2
+    }
+    MODE="reuse"
+    REUSE_ANCHOR="$2"
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUB="$ROOT/first-party/trust-ir"
@@ -36,8 +65,17 @@ SRC="$SUB/lean/trust_ir-semantics"
 FIX="$ROOT/crates/trust-clean/fixtures/trustir-oleans"
 VEN="$ROOT/vendor/lean-core-oleans"
 
-[[ -f "$SRC/lean-toolchain" ]] || { echo "ERROR: $SRC/lean-toolchain not found (submodule initialized?)"; exit 1; }
-TOOLCHAIN="$(cat "$SRC/lean-toolchain")"
+# Trust (2026-11-08): name the build target in the environment. atpkg's targo refuses the
+# workspace's `.cargo/config.toml` `target-dir` ("build cache ownership refused: explicit
+# build target is unmanaged or unsupported", exit 75, no build started) and accepts the same
+# directory as CARGO_TARGET_DIR, which is how the land gate's crates legs name it. The
+# olean-audit leg names none, so the audit refused in under a second on every atpkg-managed
+# host (land gate 20261108T022428). A caller's own target keeps its precedence.
+if [[ -z "${CARGO_TARGET_DIR:-}${CARGO_BUILD_TARGET_DIR:-}${TARGO_TARGET_DIR:-}" ]]; then
+    export CARGO_TARGET_DIR="$ROOT/crates/target"
+fi
+
+[[ -e "$SUB/.git" ]] || { echo "ERROR: $SUB is not initialized"; exit 1; }
 COMMIT="$(git -C "$SUB" rev-parse HEAD)"
 # The clean revision the regenerated set is staged against. Clean supplies the
 # olean reader and the kernel on the replay side, so the manifest records both
@@ -51,17 +89,125 @@ if [[ -n "$(git -C "$SUB" status --porcelain -- lean/trust_ir-semantics)" ]]; th
     exit 1
 fi
 
-# --- Locate the pinned Lean toolchain -------------------------------------
+# --- Reserve a fresh producer snapshot -----------------------------------
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/regen-trustir-oleans.XXXXXX")"
+cleanup_bridge_work() {
+    local status=$?
+    trap - EXIT
+    if [[ "$status" -eq 0 && "$KEEP_WORK" -eq 0 ]]; then
+        rm -rf "$WORK" || printf 'bridge producer: cleanup failed; scratch retained: %s\n' "$WORK" >&2
+    elif [[ "$status" -eq 0 ]]; then
+        printf 'bridge producer: successful snapshot retained by TRUST_REGEN_KEEP_WORK=1: %s\n' "$WORK" >&2
+    else
+        printf 'bridge producer: exit %s; failed scratch retained: %s\n' "$status" "$WORK" >&2
+    fi
+    exit "$status"
+}
+trap cleanup_bridge_work EXIT
+WORK="$(cd "$WORK" && pwd -P)"
+
+# --- Resolve the in-tree bridge utility ----------------------------------
+# Trust: resolve the build tool instead of hardcoding one stage layout. The stage2 path is
+# what a fully-bootstrapped mac has; a Linux clone that builds `--stage 1` has only the
+# stage1 tree, and the hardcoded path made the regen fail there with "No such file or
+# directory" — which then wedged a pin bump between fast.bridge-pin (manifest must be
+# regenerated with the pin) and the preflight's pin_behind_history (holding the pin walks
+# it backward). The newest genuine Targo that loads this checkout wins.
+TARGO=""
+genuine_targo() {
+    local version
+    version="$("$1" --unverified --version 2>/dev/null)" || return 1
+    # A compatibility wrapper that strips the flag before invoking cargo must
+    # not authorize an unnamed Rust lane either.
+    [[ "$version" == targo\ * ]]
+}
+# Trust (2026-09-12): a STATED targo wins, then the build tree, then PATH. This
+# machine had only a stage0 `build/` (the toolchain is installed by atpkg, not
+# built here), so the loop below found nothing and the only exit was "build one
+# first" — a refusal with no fix option (v7/D3). The PATH fallback is guarded by
+# the same `--unverified` probe as the build-tree candidates, so a cargo wearing
+# targo's name still cannot slip in as the build tool.
+if [ -n "${TRUST_REGEN_TARGO:-}" ]; then
+  if [ -x "$TRUST_REGEN_TARGO" ]; then
+    if ! genuine_targo "$TRUST_REGEN_TARGO"; then
+      echo "regen-trustir-oleans: TRUST_REGEN_TARGO is not a genuine Targo (--unverified --version must identify targo)" >&2
+      exit 1
+    fi
+    TARGO="$TRUST_REGEN_TARGO"
+  else
+    echo "regen-trustir-oleans: TRUST_REGEN_TARGO='$TRUST_REGEN_TARGO' is not an executable file" >&2
+    exit 1
+  fi
+fi
+# Trust (2026-09-23): the NEWEST candidate that can LOAD this checkout wins, not the
+# first one in a fixed order. The fixed order picked an August `build/host/stage2`
+# targo over this week's, and that one rejects manifest keys the siblings have since
+# adopted (`compiler_timeout_secs`), so a clean pin move died here with
+# "unknown field" while every installed toolchain loaded the workspace fine. Loading
+# `Cargo.toml` is the property this script needs, so it is what is probed.
+if [ -z "$TARGO" ]; then
+  REJECTED=""
+  # `|| true` inside the group: `ls` exits non-zero when ANY operand is missing, and
+  # under `set -o pipefail` that killed this assignment -- and the script, with no
+  # message -- on every host lacking one of the four build paths, so the PATH fallback
+  # above never ran (measured 2026-09-28: the check died right after "computing
+  # closure" on a machine whose only targo is atpkg's).
+  CANDIDATES="$( { ls -t "$ROOT"/build/host/stage2/bin/targo "$ROOT"/build/host/stage1/bin/targo \
+      "$ROOT"/build/*/stage1/bin/targo "$ROOT"/build/*/stage2/bin/targo \
+      "$(command -v targo 2>/dev/null)" 2>/dev/null || true; } | awk '!seen[$0]++')"
+  while IFS= read -r cand; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    if ! genuine_targo "$cand"; then
+      REJECTED="$REJECTED\n  $cand (not a genuine Targo)"
+      continue
+    fi
+    if (cd "$ROOT" && "$cand" metadata --manifest-path Cargo.toml --format-version 1 \
+          --no-deps --offline >/dev/null 2>&1); then
+      TARGO="$cand"; break
+    fi
+    REJECTED="$REJECTED\n  $cand (cannot load Cargo.toml)"
+  done <<< "$CANDIDATES"
+  if [ -n "$TARGO" ] && [ -n "$REJECTED" ]; then
+    printf "regen-trustir-oleans: using %s; skipped newer:%b\n" "$TARGO" "$REJECTED" >&2
+  fi
+fi
+if [ -z "$TARGO" ]; then
+  [ -n "${REJECTED:-}" ] && printf "regen-trustir-oleans: no candidate targo loads this checkout:%b\n" "$REJECTED" >&2
+  echo "regen-trustir-oleans: no targo found under build/*/stage{1,2}/bin and none on PATH." >&2
+  echo "  fix, one of:  export TRUST_REGEN_TARGO=/path/to/targo   # a targo you name" >&2
+  echo "                put a targo on PATH (atpkg installs one)" >&2
+  echo "                ./x.py build --stage 1 targo                # build one here" >&2
+  exit 1
+fi
+# Every candidate has already admitted the genuine unverified frontend. Every
+# Rust invocation below names that lane; a cargo-shaped stale stage is refused.
+
+# A selected revision may reuse the original bytes only when the shared
+# verifier establishes complete input equality from actual Git objects.
+# This preserves the original producer/platform stamps, including their dates.
+# Stage the selected gitlinks first; the updater reads that exact index.
+if [[ "$MODE" == "reuse" ]]; then
+    (cd "$ROOT" && "$TARGO" --unverified run --offline --quiet --locked \
+        --manifest-path Cargo.toml -p trust-bridge-closure --no-default-features --bin bridge_source_reuse \
+        -- --prepare-source-reuse "$ROOT" "$REUSE_ANCHOR")
+    exit 0
+fi
+
+# The compiled utility exports raw blobs at COMMIT. Git archive attributes,
+# checkout filters, ignored files and later live edits cannot change this input.
+SRC="$WORK/trust_ir-semantics"
+(cd "$ROOT" && "$TARGO" --unverified run --quiet --locked --manifest-path Cargo.toml \
+    -p trust-bridge-closure --bin bridge_closure -- --snapshot-lean "$SUB" "$COMMIT" "$SRC")
+TOOLCHAIN="$(cat "$SRC/lean-toolchain")"
+SHIP_LIB="$SRC/.lake/build/lib"
+
+# --- Locate the toolchain named by the immutable producer source ----------
 if [[ -n "${LEAN_TOOLCHAIN_BIN:-}" ]]; then
-    LAKE=("$LEAN_TOOLCHAIN_BIN/lake")
-    LEAN_BIN_DIR="$LEAN_TOOLCHAIN_BIN"
+    # Preserve caller-relative selection before the native build enters ROOT.
+    LEAN_BIN_DIR="$(cd -- "$LEAN_TOOLCHAIN_BIN" && pwd -P)"
 elif command -v elan >/dev/null 2>&1; then
-    LAKE=(elan run --install "$TOOLCHAIN" lake)
-    # `command -v lean` may resolve elan's Homebrew-installed proxy
-    # (`/opt/homebrew/bin/lean`) rather than the selected toolchain binary.  Lean
-    # reports the exact active toolchain root itself; bind both the executable
-    # and core-library lookup to that prefix so the audit cannot silently mix a
-    # proxy installation with the pinned compiler.
+    # Bind both the executable and core-library lookup to Lean's own prefix,
+    # rather than accidentally mixing an elan proxy with another installation.
     LEAN_PREFIX="$(elan run --install "$TOOLCHAIN" lean --print-prefix)"
     LEAN_BIN_DIR="$LEAN_PREFIX/bin"
 else
@@ -69,72 +215,97 @@ else
     echo "Install elan (https://github.com/leanprover/elan) or set LEAN_TOOLCHAIN_BIN=<toolchain>/bin."
     exit 1
 fi
-CORE_LIB="$LEAN_BIN_DIR/../lib/lean"
-[[ -d "$CORE_LIB" ]] || { echo "ERROR: Lean core olean dir not found at $CORE_LIB"; exit 1; }
-LEAN_VERSION="$("$LEAN_BIN_DIR/lean" --version)"
-echo "toolchain: $LEAN_VERSION"
-
-# The platform triple these bytes are built FOR, taken from Lean's own version
-# string ("Lean (version 4.8.0, aarch64-apple-darwin, commit ..., Release)").
-# Deliberately NOT `uname`: what matters is the triple the toolchain reports for
-# the artifacts it just emitted, not the shell's idea of the host.
-TRIPLE="$(printf '%s' "$LEAN_VERSION" | sed -n 's/.*version [^,]*, \([^,]*\),.*/\1/p')"
-if [[ -z "$TRIPLE" ]]; then
-    echo "ERROR: could not parse a platform triple out of: $LEAN_VERSION" >&2
-    echo "       The vendored olean set is platform-partitioned and cannot be" >&2
-    echo "       written without knowing which platform produced these bytes." >&2
-    exit 1
+# The compiled utility queries and admits this exact pair. NUL-framed data
+# preserves paths with spaces/newlines; no report value is shell source.
+TOOL_REPORT="$WORK/toolchain-readback"
+(cd "$ROOT" && "$TARGO" --unverified run --quiet --locked --manifest-path Cargo.toml \
+    -p trust-bridge-closure --bin bridge_closure -- --admit-lean-toolchain "$SRC" "$LEAN_BIN_DIR" "$TOOL_REPORT")
+{
+    if ! {
+        IFS= read -r -d '' TOOL_SCHEMA &&
+        IFS= read -r -d '' TRIPLE &&
+        IFS= read -r -d '' TOOLCHAIN &&
+        IFS= read -r -d '' LEAN_VERSION &&
+        IFS= read -r -d '' LEAN_BIN_DIR &&
+        IFS= read -r -d '' CORE_LIB
+    }; then
+        echo "ERROR: truncated native toolchain readback" >&2
+        exit 1
+    fi
+    if [[ "$TOOL_SCHEMA" != trust.lean-toolchain-readback.v1 ]]; then
+        echo "ERROR: unrecognized native toolchain readback schema" >&2
+        exit 1
+    fi
+    TOOL_EXTRA=""
+    if IFS= read -r -d '' TOOL_EXTRA || [[ -n "$TOOL_EXTRA" ]]; then
+        echo "ERROR: trailing native toolchain readback data" >&2
+        exit 1
+    fi
+} < "$TOOL_REPORT"
+LAKE=("$LEAN_BIN_DIR/lake")
+if [[ -n "$NATIVE_LINKER" ]]; then
+    LAKE+=(-K "nativeLinker=$NATIVE_LINKER")
 fi
+echo "toolchain: $LEAN_VERSION"
 echo "platform: $TRIPLE"
 echo "trust-ir:  $COMMIT"
 
-# --- Rebuild from the pinned sources in a scratch copy --------------------
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/regen-trustir-oleans.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
-cp -R "$SRC" "$WORK/trust_ir-semantics"
-rm -rf "$WORK/trust_ir-semantics/.lake"
-echo "lake build (fresh) ..."
-(cd "$WORK/trust_ir-semantics" && "${LAKE[@]}" build >/dev/null)
-SHIP_LIB="$WORK/trust_ir-semantics/.lake/build/lib"
+# Build the genuine exported roots and their imports, rather than unrelated
+# project targets. The same Rust constant drives the loader below, so adding a
+# root cannot silently leave its olean unbuilt. A whole Lean-project build is
+# separate coverage: Proofs.MemorySafety is outside this bridge's import cone
+# and exhausted a bounded 24 GiB native Linux build before any bridge replay.
+ROOTS="$WORK/root_modules.txt"
+(cd "$ROOT" && "$TARGO" --unverified run --quiet --locked --manifest-path Cargo.toml \
+    -p trust-bridge-closure --bin bridge_closure -- --roots) > "$ROOTS"
+[[ -s "$ROOTS" ]] || { echo "ERROR: the bridge exports no root modules" >&2; exit 1; }
+LAKE_TARGETS=()
+while IFS= read -r module; do
+    [[ "$module" =~ ^TrustIr(\.[A-Za-z][A-Za-z0-9_]*)+$ ]] || {
+        echo "ERROR: invalid exported bridge root module: $module" >&2; exit 1;
+    }
+    LAKE_TARGETS+=("+$module:olean")
+done < "$ROOTS"
+echo "lake build (fresh exported bridge roots + imports) ..."
+(cd "$WORK/trust_ir-semantics" && "${LAKE[@]}" build "${LAKE_TARGETS[@]}")
 
-# --- Compute the minimal closure with the in-tree clean-olean --------------
-echo "computing closure of the bridge root module ..."
+# --- Compute the full union closure with the in-tree clean-olean -----------
+echo "computing closure of the exported bridge root modules ..."
 CLOSURE="$WORK/closure_modules.txt"
-# Trust: resolve the build tool instead of hardcoding one stage layout. The stage2 path is
-# what a fully-bootstrapped mac has; a Linux clone that builds `--stage 1` has only the
-# stage1 tree, and the hardcoded path made the regen fail there with "No such file or
-# directory" — which then wedged a pin bump between fast.bridge-pin (manifest must be
-# regenerated with the pin) and the preflight's pin_behind_history (holding the pin walks
-# it backward). First existing candidate wins; the --unverified probe below still decides
-# how to invoke whichever one is found.
-TARGO=""
-for cand in     "$ROOT/build/host/stage2/bin/targo"     "$ROOT/build/host/stage1/bin/targo"     "$ROOT"/build/*/stage1/bin/targo; do
-  if [ -x "$cand" ]; then TARGO="$cand"; break; fi
-done
-if [ -z "$TARGO" ]; then
-  echo "regen-trustir-oleans: no targo found under build/*/stage{1,2}/bin — build one first" >&2
-  exit 1
-fi
-# `--unverified` is a TARGO flag, and a stage2 that predates the targo rebrand ships a plain
-# cargo under that name — it rejects the flag as an unknown argument and the regen dies with a
-# cargo usage message that says nothing about oleans. Probe instead of assuming. Passing it when
-# it IS supported still matters: this is a build tool, not a proof artifact, and a verified build
-# of the whole `crates/` graph here would be minutes of work for no claim anyone reads.
-# Unquoted below on purpose (bash 3.2: an empty array expansion under `set -u` aborts); the value
-# is a fixed literal, so word-splitting is exactly the intent.
-if "$TARGO" --unverified --version >/dev/null 2>&1; then UNVERIFIED="--unverified"; else UNVERIFIED=""; fi
-(cd "$ROOT" && "$TARGO" $UNVERIFIED run --quiet --manifest-path crates/Cargo.toml \
-    -p trust-clean --example bridge_closure -- "$SHIP_LIB" "$CORE_LIB") > "$CLOSURE"
+(cd "$ROOT" && "$TARGO" --unverified run --quiet --locked --manifest-path Cargo.toml \
+    -p trust-bridge-closure --bin bridge_closure -- "$SHIP_LIB" "$CORE_LIB") > "$CLOSURE"
 N_TOTAL="$(wc -l < "$CLOSURE" | tr -d ' ')"
 N_TRUSTIR="$(grep -c '^TrustIr' "$CLOSURE")"
 echo "closure: $N_TOTAL modules ($N_TRUSTIR TrustIr, $((N_TOTAL - N_TRUSTIR)) Lean-core)"
 
+# --- Reproducibility screen: no bignum in a built closure module ----------
+# Trust (2026-10-13): Lean 4.8.0's compactor writes a bignum (a natural at or
+# above 2^63, an MPZ object) into the .olean with its uninitialised struct
+# padding, so a module holding one gets different bytes on every build of the
+# same source, and its digest can never be reproduced (measured: three fresh
+# builds of trust-ir 3d315a17 gave three `Semantics/Cast.olean` digests). The
+# Lean-core oleans are the toolchain's own files, copied, not rebuilt here.
+CLOSURE_BUILT=()
+while IFS= read -r module; do
+    case "$module" in
+        TrustIr*) CLOSURE_BUILT+=("$SHIP_LIB/${module//.//}.olean") ;;
+    esac
+done < "$CLOSURE"
+if ! python3 "$ROOT/scripts/lean_olean_bignums.py" --refuse "${CLOSURE_BUILT[@]}"; then
+    echo "ERROR: a TrustIr module of the bridge closure persists a bignum (listed above), so"
+    echo "  its .olean is not reproducible under Lean 4.8.0 (scripts/lean_olean_bignums.py says why)."
+    echo "  fix: in trust-ir, keep the value out of the module's environment; for a bound the"
+    echo "  compiler folds into a closed term (\`u < 2 ^ 64\`), name the exponent with a"
+    echo "  \`@[noinline]\` constant, as \`Sem.addrBits\` in TrustIr/Semantics/Cast.lean does."
+    exit 1
+fi
+
 # --- Check or write the vendored trees + manifests -------------------------
-python3 - "$MODE" "$ROOT" "$CLOSURE" "$SHIP_LIB" "$CORE_LIB" "$COMMIT" "$TOOLCHAIN" "$LEAN_VERSION" "$CLEAN_COMMIT" "$TRIPLE" <<'EOF'
+python3 - "$MODE" "$ROOT" "$CLOSURE" "$SHIP_LIB" "$CORE_LIB" "$COMMIT" "$TOOLCHAIN" "$LEAN_VERSION" "$CLEAN_COMMIT" "$TRIPLE" "$ROOTS" <<'EOF'
 import hashlib, os, re, shutil, sys, datetime
 
 (mode, root, closure_file, ship_lib, core_lib, commit, toolchain, lean_version,
- clean_commit, triple) = sys.argv[1:11]
+ clean_commit, triple, roots_file) = sys.argv[1:12]
 fix = os.path.join(root, "crates/trust-clean/fixtures/trustir-oleans")
 ven = os.path.join(root, "vendor/lean-core-oleans")
 
@@ -146,6 +317,7 @@ def sha256(p):
     return h.hexdigest()
 
 modules = [l.strip() for l in open(closure_file) if l.strip()]
+roots = [l.strip() for l in open(roots_file) if l.strip()]
 built = {}   # (tree, rel) -> built source path
 for m in modules:
     rel = m.replace(".", "/") + ".olean"
@@ -185,12 +357,14 @@ def read_existing(path):
         m = re.match(r'^\[platforms\."([^"]+)"\.files\]$', line)
         if m:
             section, cur = "pfiles", platforms.setdefault(
-                m.group(1), {"lean_version": "", "built_on": "", "files": {}})
+                m.group(1), {"lean_version": "", "built_on": "",
+                             "built_from_trustir_commit": "", "files": {}})
             continue
         m = re.match(r'^\[platforms\."([^"]+)"\]$', line)
         if m:
             section, cur = "pmeta", platforms.setdefault(
-                m.group(1), {"lean_version": "", "built_on": "", "files": {}})
+                m.group(1), {"lean_version": "", "built_on": "",
+                             "built_from_trustir_commit": "", "files": {}})
             continue
         if line == "[files]":
             section, cur = "files", None
@@ -204,7 +378,8 @@ def read_existing(path):
         elif m and section == "pfiles":
             cur["files"][m.group(1)] = m.group(2)
         elif section == "pmeta":
-            m2 = re.match(r'^(lean_version|built_on)\s*=\s*"(.*)"$', line)
+            m2 = re.match(
+                r'^(lean_version|built_on|built_from_trustir_commit)\s*=\s*"(.*)"$', line)
             if m2:
                 cur[m2.group(1)] = m2.group(2)
     return shared, platforms
@@ -248,11 +423,12 @@ def manifest_body(tree, shared, platforms):
             "# validated by crates/trust-clean/tests/lean_clean_bridge.rs.",
             f'clean_commit = "{clean_commit}"',
             f'lean_toolchain = "{toolchain}"',
-            'root_module = "TrustIr.Semantics.Arith"',
+            f'root_module = "{roots[0]}"',
+            'root_modules = [' + ', '.join(f'"{root}"' for root in roots) + ']',
             'source_subdir = "lean/trust_ir-semantics"',
-            'build_command = "lake build (unmodified sources at trustir_commit; toolchain pinned by lean-toolchain)"',
-            "# Minimal module closure of root_module: computed by loading the root with",
-            "# clean-olean load_module_with_deps and vendoring exactly the visited TrustIr",
+            'build_command = "lake build ' + ' '.join(f'+{root}:olean' for root in roots) + ' (unmodified sources at trustir_commit; toolchain pinned by lean-toolchain)"',
+            "# Full union import closure of root_modules: computed by loading the roots with",
+            "# clean-olean load_modules_with_deps and vendoring exactly the visited TrustIr",
             "# modules. Regenerate + audit with scripts/regen-trustir-oleans.sh.",
         ]
     else:
@@ -260,9 +436,10 @@ def manifest_body(tree, shared, platforms):
             'schema = "trust.vendor.lean-core-oleans.manifest.v2"', "", "[provenance]",
             f'lean_toolchain = "{toolchain}"',
             f'origin = "elan-installed {toolchain} release toolchain, lib/lean"',
-            'root_module = "TrustIr.Semantics.Arith"',
+            f'root_module = "{roots[0]}"',
+            'root_modules = [' + ', '.join(f'"{root}"' for root in roots) + ']',
             "# FOREIGN vendored artifacts (Lean 4 core Init .oleans) — the transitive",
-            "# Lean-core import closure of the trust-ir arithmetic-semantics root module.",
+            "# Lean-core union import closure of the exported trust-ir bridge roots.",
             "# Consumed by crates/trust-clean/src/trustir_bridge.rs. Regenerate + audit",
             "# with scripts/regen-trustir-oleans.sh.",
         ]
@@ -284,7 +461,10 @@ def manifest_body(tree, shared, platforms):
         "# DISAGREE on its bytes; its on-disk path is platform/<triple>/<key>. A",
         "# consumer must verify the shared set plus its OWN triple, and must fail",
         "# closed on a triple absent here rather than fall back to another",
-        "# platform's bytes.",
+        "# platform's bytes. `built_from_trustir_commit` is the trust-ir revision THAT",
+        "# platform's bytes were built from; a platform whose value differs from",
+        "# [provenance] trustir_commit is carried forward, not rebuilt, and a consumer",
+        "# on that triple must refuse to replay it under trustir_commit's name.",
     ]
     for t in sorted(platforms):
         p = platforms[t]
@@ -294,6 +474,15 @@ def manifest_body(tree, shared, platforms):
             f'lean_version = "{p["lean_version"]}"',
             f'built_on = "{p["built_on"]}"',
         ]
+        # The trust-ir revision THIS platform's bytes were built from. A platform
+        # carried forward by a regeneration elsewhere keeps its OWN value, so the
+        # manifest never labels old bytes with the new commit (2026-09-24: Linux
+        # oleans built from 00180257 were stamped 29744d5f). A carried platform
+        # with no recorded value is written as "unknown", which every consumer
+        # refuses. The Lean-core tree is built from the toolchain alone.
+        if tree == "trustir":
+            lines.append(
+                f'built_from_trustir_commit = "{p.get("built_from_trustir_commit") or "unknown"}"')
         if p["files"]:
             lines.append(f'[platforms."{t}".files]')
             for rel in sorted(p["files"]):
@@ -358,8 +547,14 @@ if mode == "check":
     # 3. Manifest commit must equal the checked-out submodule HEAD.
     manifest = os.path.join(fix, "MANIFEST.toml")
     text = open(manifest).read() if os.path.exists(manifest) else ""
-    if f'trustir_commit = "{commit}"' not in text:
+    if not re.search(rf'^trustir_commit = "{commit}"$', text, re.M):
         print(f"MANIFEST PIN DRIFT: {manifest} does not record trustir_commit = {commit}")
+        failures += 1
+    _, trustir_platforms = read_existing(manifest)
+    built_from = trustir_platforms.get(triple, {}).get("built_from_trustir_commit", "")
+    if built_from != commit:
+        print(f"PLATFORM PROVENANCE DRIFT: {manifest} records {triple} bytes built from "
+              f"trust-ir {built_from or '<nothing>'}, not {commit}")
         failures += 1
     if f'clean_commit = "{clean_commit}"' not in text:
         print(f"MANIFEST PIN DRIFT: {manifest} does not record clean_commit = {clean_commit}")
@@ -439,6 +634,8 @@ else:
             platforms[t] = {
                 "lean_version": lean_version if t == triple else prev.get("lean_version", ""),
                 "built_on": today if t == triple else prev.get("built_on", ""),
+                "built_from_trustir_commit": (
+                    commit if t == triple else prev.get("built_from_trustir_commit", "")),
                 "files": new_spec.get(t, {}),
             }
         with open(os.path.join(d, "MANIFEST.toml"), "w") as f:

@@ -66,8 +66,9 @@ impl CexModel {
     /// Convert back to trust-types `Counterexample` for use with hint extraction.
     #[must_use]
     pub fn to_counterexample(&self) -> Counterexample {
-        let assignments = sorted_cex_values(&self.values)
-            .into_iter()
+        let assignments = self
+            .values
+            .iter()
             .map(|(name, val)| {
                 let cv = match val {
                     CexValue::Integer(i) => CounterexampleValue::Int(*i),
@@ -159,15 +160,9 @@ fn refine_arithmetic_overflow(
     let (bit_width, is_signed) = extract_type_info(&operand_tys.0);
     let max_val = compute_max(bit_width, is_signed);
 
-    let at_max_vars: Vec<&String> = sorted_cex_values(&cex_model.values)
-        .into_iter()
-        .filter(|(_, v)| is_at_max(v, max_val, bit_width))
-        .map(|(name, _)| name)
-        .collect();
-
-    if !at_max_vars.is_empty() {
+    if let Some((var, _)) = cex_model.values.iter().find(|(_, v)| is_at_max(v, max_val, bit_width))
+    {
         // Concrete evidence: variable is at MAX, propose x < TYPE::MAX
-        let var = &at_max_vars[0];
         let (op_name, _) = op_info(op);
         proposals.push(make_cex_proposal(
             target,
@@ -223,8 +218,9 @@ fn refine_division_by_zero(
     let mut proposals = Vec::new();
 
     // Find the zero-valued variable from the cex
-    let zero_var = sorted_cex_values(&cex_model.values)
-        .into_iter()
+    let zero_var = cex_model
+        .values
+        .iter()
         .find(|(_, v)| matches!(v, CexValue::Integer(0) | CexValue::Unsigned(0)));
 
     if let Some((var_name, _)) = zero_var {
@@ -236,31 +232,24 @@ fn refine_division_by_zero(
             "DivisionByZero",
             &format!("Counterexample shows {var_name}=0 causing division by zero"),
         ));
-    } else {
+    } else if let Some(h) = hints.iter().find(|h| matches!(h.kind, HintKind::NonZero)) {
         // Hints found zero but no named variable match; use generic
-        let has_nonzero_hint = hints.iter().any(|h| matches!(h.kind, HintKind::NonZero));
-        if has_nonzero_hint {
-            let var = hints
-                .iter()
-                .find(|h| matches!(h.kind, HintKind::NonZero))
-                .map(|h| h.variable.as_str())
-                .unwrap_or("divisor");
-            proposals.push(make_cex_proposal(
-                target,
-                &format!("requires {var} != 0"),
-                0.96,
-                "DivisionByZero",
-                &format!("Counterexample hints confirm {var} can be zero"),
-            ));
-        } else {
-            proposals.push(make_cex_proposal(
-                target,
-                "requires divisor != 0",
-                0.95,
-                "DivisionByZero",
-                "Division by zero possible (no specific variable identified in cex)",
-            ));
-        }
+        let var = h.variable.as_str();
+        proposals.push(make_cex_proposal(
+            target,
+            &format!("requires {var} != 0"),
+            0.96,
+            "DivisionByZero",
+            &format!("Counterexample hints confirm {var} can be zero"),
+        ));
+    } else {
+        proposals.push(make_cex_proposal(
+            target,
+            "requires divisor != 0",
+            0.95,
+            "DivisionByZero",
+            "Division by zero possible (no specific variable identified in cex)",
+        ));
     }
 
     // Runtime check suggestion
@@ -283,14 +272,13 @@ fn refine_index_out_of_bounds(
     let mut proposals = Vec::new();
 
     // Look for index >= len pattern in the cex values
-    let sorted_values = sorted_cex_values(&cex_model.values);
-    let idx_var = sorted_values
+    let idx_var = cex_model
+        .values
         .iter()
-        .copied()
         .find(|(name, _)| name.contains("index") || name.contains("idx") || name.as_str() == "i");
-    let len_var = sorted_values
+    let len_var = cex_model
+        .values
         .iter()
-        .copied()
         .find(|(name, _)| name.contains("len") || name.contains("length") || name.contains("size"));
 
     if let (Some((idx_name, idx_val)), Some((len_name, len_val))) = (idx_var, len_var) {
@@ -352,8 +340,9 @@ fn refine_negation_overflow(
     let (bit_width, _) = extract_type_info(ty);
     let min_val = -(1i128 << (bit_width - 1));
 
-    let at_min_var = sorted_cex_values(&cex_model.values)
-        .into_iter()
+    let at_min_var = cex_model
+        .values
+        .iter()
         .find(|(_, v)| matches!(v, CexValue::Integer(i) if *i == min_val));
 
     if let Some((var_name, _)) = at_min_var {
@@ -543,16 +532,31 @@ fn short_name(path: &str) -> String {
     path.rsplit("::").next().unwrap_or(path).to_string()
 }
 
-fn ty_to_rust_name(ty: &Ty) -> String {
+fn ty_to_rust_name(ty: &Ty) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
     match ty {
-        Ty::Int { width, signed } => {
-            let prefix = if *signed { "i" } else { "u" };
-            if *width == 0 { format!("{prefix}size") } else { format!("{prefix}{width}") }
-        }
-        Ty::Float { width } => format!("f{width}"),
-        Ty::Bool => "bool".to_string(),
-        Ty::Unit => "()".to_string(),
-        _ => "T".to_string(),
+        Ty::Int { width, signed } => match (*signed, *width) {
+            (false, 0) => Cow::Borrowed("usize"),
+            (true, 0) => Cow::Borrowed("isize"),
+            (false, 8) => Cow::Borrowed("u8"),
+            (true, 8) => Cow::Borrowed("i8"),
+            (false, 16) => Cow::Borrowed("u16"),
+            (true, 16) => Cow::Borrowed("i16"),
+            (false, 32) => Cow::Borrowed("u32"),
+            (true, 32) => Cow::Borrowed("i32"),
+            (false, 64) => Cow::Borrowed("u64"),
+            (true, 64) => Cow::Borrowed("i64"),
+            (false, 128) => Cow::Borrowed("u128"),
+            (true, 128) => Cow::Borrowed("i128"),
+            (true, w) => Cow::Owned(format!("i{w}")),
+            (false, w) => Cow::Owned(format!("u{w}")),
+        },
+        Ty::Float { width: 32 } => Cow::Borrowed("f32"),
+        Ty::Float { width: 64 } => Cow::Borrowed("f64"),
+        Ty::Float { width } => Cow::Owned(format!("f{width}")),
+        Ty::Bool => Cow::Borrowed("bool"),
+        Ty::Unit => Cow::Borrowed("()"),
+        _ => Cow::Borrowed("T"),
     }
 }
 
@@ -612,10 +616,6 @@ fn format_cex_value(val: &CexValue) -> String {
         CexValue::Boolean(b) => format!("{b}"),
         CexValue::Float(f) => format!("{f}"),
     }
-}
-
-fn sorted_cex_values(values: &BTreeMap<String, CexValue>) -> Vec<(&String, &CexValue)> {
-    values.iter().collect()
 }
 
 fn compare_strengthening_proposals(

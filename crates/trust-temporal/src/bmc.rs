@@ -206,9 +206,9 @@ impl<'a> BmcEngine<'a> {
             let mut next_parent = FxHashMap::default();
 
             for &state in prev {
-                for succ in self.machine.successors(state) {
-                    if next.insert(succ) {
-                        next_parent.insert(succ, state);
+                for t in &self.machine.transitions {
+                    if t.from == state && next.insert(t.to) {
+                        next_parent.insert(t.to, state);
                     }
                 }
             }

@@ -1,12 +1,17 @@
 # These defaults are meant for contributors to the compiler who do not modify codegen or LLVM
 [build]
 # Trust: compiler contributors expect a usable linked local toolchain.
+# `rust-src` is install.rs's selector for the standard-library source
+# component; upstream 162423 retired `src`, which now selects nothing.
 extended = true
-tools = ["targo", "targo-trust", "trustdoc", "tippy", "trustfmt", "trust-analyzer", "trust-miri", "trustc-dev", "src", "trust-llvm-tools", "clean", "ty"]
+tools = ["targo", "targo-trust", "trustup", "trustdoc", "tippy", "trustfmt", "trust-analyzer", "trust-miri", "trustc-dev", "rust-src", "trust-llvm-tools", "clean", "ty"]
 # Contributors working on the compiler will probably expect compiler docs to be generated.
 compiler-docs = true
 
 [rust]
+# Native workload linking borrows the compiler's existing CPU unit through the
+# paired LLD. Build it with the SDK rather than depending on a host linker.
+lld = true
 # This enables `RUSTC_LOG=debug`, avoiding confusing situations
 # where adding `debug!()` appears to do nothing.
 # However, it makes running the compiler slightly slower.

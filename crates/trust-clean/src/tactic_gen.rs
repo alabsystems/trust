@@ -385,41 +385,32 @@ fn is_ground(formula: &Formula) -> bool {
     match formula {
         Formula::Bool(_) | Formula::Int(_) | Formula::UInt(_) | Formula::BitVec { .. } => true,
         Formula::Var(_, _) => false,
-        _ => formula.children().iter().all(|c| is_ground(c)),
+        _ => trust_types::all_formula_children(formula, is_ground),
     }
 }
 
 /// Compute the nesting depth of a formula.
 fn formula_depth(formula: &Formula) -> usize {
-    let children = formula.children();
-    if children.is_empty() {
-        0
-    } else {
-        1 + children.iter().map(|c| formula_depth(c)).max().unwrap_or(0)
-    }
+    let mut max_child = None;
+    trust_types::for_each_formula_child(formula, |c| {
+        let d = formula_depth(c);
+        max_child = Some(max_child.map_or(d, |cur: usize| cur.max(d)));
+    });
+    max_child.map_or(0, |d| 1 + d)
 }
 
 /// Check if a formula contains quantifiers (Forall or Exists).
 fn has_quantifiers(formula: &Formula) -> bool {
-    match formula {
-        Formula::Forall(_, _) | Formula::Exists(_, _) => true,
-        _ => formula.children().iter().any(|c| has_quantifiers(c)),
-    }
+    trust_types::any_formula_node(formula, &mut |node| {
+        matches!(node, Formula::Forall(_, _) | Formula::Exists(_, _))
+    })
 }
 
 /// Check if a formula contains non-linear arithmetic (variable * variable).
 fn has_nonlinear_arithmetic(formula: &Formula) -> bool {
-    match formula {
-        Formula::Mul(a, b) => {
-            let a_has_var = contains_variable(a);
-            let b_has_var = contains_variable(b);
-            if a_has_var && b_has_var {
-                return true;
-            }
-            has_nonlinear_arithmetic(a) || has_nonlinear_arithmetic(b)
-        }
-        _ => formula.children().iter().any(|c| has_nonlinear_arithmetic(c)),
-    }
+    trust_types::any_formula_node(formula, &mut |node| {
+        matches!(node, Formula::Mul(a, b) if contains_variable(a) && contains_variable(b))
+    })
 }
 
 /// Check if a formula is linear (no multiplication of variables).
@@ -429,10 +420,7 @@ fn is_linear_formula(formula: &Formula) -> bool {
 
 /// Check if a formula/term contains any variable.
 fn contains_variable(formula: &Formula) -> bool {
-    match formula {
-        Formula::Var(_, _) => true,
-        _ => formula.children().iter().any(|c| contains_variable(c)),
-    }
+    trust_types::any_formula_node(formula, &mut |node| matches!(node, Formula::Var(_, _)))
 }
 
 /// Check if a term is purely arithmetic (integer operations).
@@ -471,14 +459,13 @@ fn find_induction_variable(formula: &Formula) -> Option<String> {
 
 /// Collect integer-sorted variable names from a formula.
 fn collect_int_variables(formula: &Formula, vars: &mut Vec<String>) {
-    if let Formula::Var(name, Sort::Int) = formula
-        && !vars.contains(name)
-    {
-        vars.push(name.clone());
-    }
-    for child in formula.children() {
-        collect_int_variables(child, vars);
-    }
+    trust_types::visit_formula_nodes(formula, &mut |node| {
+        if let Formula::Var(name, Sort::Int) = node
+            && !vars.contains(name)
+        {
+            vars.push(name.clone());
+        }
+    });
 }
 
 /// Sanitize a function name for use as a Clean identifier.

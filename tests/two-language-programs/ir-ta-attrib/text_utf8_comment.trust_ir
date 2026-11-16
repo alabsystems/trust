@@ -1,0 +1,3 @@
+; TrustIr text format v1
+; a comment with one multi-byte character: —
+module "parta-utf8-comment"

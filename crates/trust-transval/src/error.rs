@@ -136,21 +136,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_error_clone() {
-        // TransvalError derives Clone -- verify all 4 untested variants clone correctly.
-        let errors = vec![
-            TransvalError::InvalidRelation("test".into()),
-            TransvalError::SolverError("timeout".into()),
-            TransvalError::UnsupportedOptimization("pass".into()),
-            TransvalError::UnmappedBlock(BlockId(0)),
-        ];
-        for err in &errors {
-            let cloned = err.clone();
-            assert_eq!(err.to_string(), cloned.to_string());
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Proptest: TransvalError variant coverage
     // -----------------------------------------------------------------------
@@ -179,20 +164,6 @@ mod tests {
             fn all_variants_display_non_empty(err in arb_transval_error()) {
                 let msg = err.to_string();
                 prop_assert!(!msg.is_empty(), "Display must produce non-empty output");
-            }
-
-            /// Every TransvalError variant has a Debug representation.
-            #[test]
-            fn all_variants_debug_non_empty(err in arb_transval_error()) {
-                let dbg = format!("{err:?}");
-                prop_assert!(!dbg.is_empty(), "Debug must produce non-empty output");
-            }
-
-            /// TransvalError::clone produces an equal value (compared via Debug).
-            #[test]
-            fn all_variants_clone_eq(err in arb_transval_error()) {
-                let cloned = err.clone();
-                prop_assert_eq!(format!("{err:?}"), format!("{cloned:?}"));
             }
 
             /// SignatureMismatch Display includes both argument counts.

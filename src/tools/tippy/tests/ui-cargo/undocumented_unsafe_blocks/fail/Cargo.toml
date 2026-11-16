@@ -3,10 +3,13 @@
 # will set it up here.
 
 [package]
-name = "undocumented_unsafe_blocks"
+name = "undocumented-unsafe-blocks"
 edition = "2024"
 publish = false
 version = "0.1.0"
 
 [lints.clippy]
 unnecessary_safety_comment = "deny"
+
+# Trust: this standalone UI fixture owns its workspace, independently of Tippy.
+[workspace]

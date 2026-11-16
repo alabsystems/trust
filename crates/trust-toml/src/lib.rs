@@ -132,9 +132,8 @@ pub use crate::value::{Array, Index, Table, Value};
 /// (`crates/trust-version/src/lib.rs:638`), so the path has to exist exactly
 /// here.
 pub mod de {
-    pub use crate::error::Error;
-
     pub use super::from_str;
+    pub use crate::error::Error;
 }
 
 /// Parse a TOML document into `T`.

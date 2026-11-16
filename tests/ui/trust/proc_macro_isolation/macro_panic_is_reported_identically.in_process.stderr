@@ -1,0 +1,18 @@
+error: proc-macro derive panicked
+  --> $DIR/macro_panic_is_reported_identically.rs:11:10
+   |
+LL | #[derive(forger::Explode)]
+   |          ^^^^^^^^^^^^^^^
+   |
+   = help: message: the Explode derive always panics
+
+error: proc-macro derive panicked
+  --> $DIR/macro_panic_is_reported_identically.rs:16:10
+   |
+LL | #[derive(forger::Explode)]
+   |          ^^^^^^^^^^^^^^^
+   |
+   = help: message: the Explode derive always panics
+
+error: aborting due to 2 previous errors
+

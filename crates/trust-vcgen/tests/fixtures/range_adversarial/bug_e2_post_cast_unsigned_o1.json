@@ -1,0 +1,148 @@
+{
+  "name": "bug_e2_post_cast_unsigned",
+  "def_path": "probes::bug_e2_post_cast_unsigned",
+  "span": {
+    "file": "src/probes.rs",
+    "line_start": 83,
+    "col_start": 0,
+    "line_end": 83,
+    "col_end": 89
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "x"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "src/probes.rs",
+                "line_start": 83,
+                "col_start": 79,
+                "line_end": 83,
+                "col_end": 79
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "src/probes.rs",
+        "line_start": 83,
+        "col_start": 56,
+        "line_end": 83,
+        "col_end": 76
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) <= (2147483647)"
+    }
+  ],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": -2147483648
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2147483647
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [
+    {
+      "Le": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": 2147483647
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) <= (2147483647)"
+    ],
+    "invariants": []
+  }
+}

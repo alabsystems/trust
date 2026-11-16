@@ -4,10 +4,12 @@ members = [
 # tidy-alphabetical-start
   "compiler/rustc",
   "src/build_helper",
+  "src/jobserver_utils",
   "src/rustc-std-workspace/rustc-std-workspace-alloc",
   "src/rustc-std-workspace/rustc-std-workspace-core",
   "src/rustc-std-workspace/rustc-std-workspace-std",
   "src/rustdoc-json-types",
+  "src/shim_utils",
   "src/tools/build-manifest",
   "src/tools/bump-stage0",
   "src/tools/cargotest",
@@ -48,53 +50,29 @@ members = [
   "src/tools/wasm-component-ld",
   "src/tools/x",
 # tidy-alphabetical-end
-# trust: verification pipeline crates.
-#
-# These are members here because the compiler links them: rustc_mir_transform
-# depends on trust-router/trust-vcgen/trust-types/..., so their resolution IS
-# the compiler's resolution and this lockfile is what ships inside trustc.
-#
-# They are ALSO members of crates/Cargo.toml, which resolves them a second time
-# against its own lockfile for the dev/test lane. That duplication is the price
-# of keeping a `cargo test` lane that does not have to load the rustc graph; it
-# is not free — the two lockfiles currently disagree on the patch version of
-# ~89 third-party packages, so a unit test proves something about a slightly
-# different build than the one that ships. Anything whose verdict could depend
-# on a dependency version must therefore be gated from the compiler lane, not
-# from `cargo test`.
-#
-# Collapsing the two into this workspace resolves cleanly (measured: adding
-# every crates/ member here pulls in exactly two new packages, ny-cert and
-# ny-contracts, and no version disagreement) — the blocker is not the version
-# graph. It is that `crates/Cargo.toml` is named as a manifest path by 39
-# files — gate rows, harness lanes, fixture regenerators, targo-trust source —
-# and that this workspace cannot answer `cargo check --workspace` at all,
-# because rustc-main is a member and that means "build the compiler". Do not
-# start that migration without moving those call sites in the same change.
+# Trust: compiler dependencies and developer libraries resolve together.
+# The default-member list below preserves the former developer workspace's
+# scope. Explicit package selection (including bootstrap's compiler/tool
+# invocations) remains available without a second dependency graph.
   "crates/trust-backprop",
   "crates/trust-binary-parse",
   "crates/trust-bmc",
-  "crates/trust-buildcache",
+  "crates/trust-bridge-closure",
   "crates/trust-cache",
+  "crates/trust-build-cpu",
   "crates/trust-cg-bridge",
   "crates/trust-convergence",
   "crates/trust-decompile",
-  "crates/trust-deps",
   "crates/trust-disasm",
   # trust: PHASE 1 SUPPLY-CHAIN REPLACEMENT — the Trust-owned crypto primitives.
-  # These are members of BOTH workspaces on purpose. `crates/Cargo.toml` renamed
-  # `sha2`/`hmac`/`ed25519-dalek` onto them first, but the ROOT workspace is the
-  # one the compiler builds from (rustc-main -> rustc_interface ->
-  # rustc_mir_transform -> trust-router -> trust-proof-cert), so a rename that
-  # lands only in `crates/` leaves the shipped `trustc` linking crates.io.
-  # That is not red — it is worse: the same 15 packages get built twice from the
-  # same source against two different hash implementations, and a green
-  # `targo test` in `crates/` becomes evidence about a crate the compiler does
-  # not link. Membership here is what makes the rename below reach the artifact.
+  # These members provide the same primitives to developer tests and the
+  # compiler; a second workspace must not resolve another implementation.
   "crates/trust-ed25519",
-  "crates/trust-hmac",
   "crates/trust-integration-tests",
   "crates/trust-ir-bridge",
+  # Luminal ledger rows met by a trust-ir test against SemR (test-only; not a
+  # default member: its targets need Lean, and each is a row's exit).
+  "crates/trust-luminal-rows",
   "crates/trust-lift",
   "crates/trust-loop",
   "crates/trust-machine-sem",
@@ -106,27 +84,33 @@ members = [
   # Workspace membership keeps their unit suites addressable by `./x test`.
   "crates/trust-mir-extract",
   "crates/trust-os",
+  # trust (platform protocols, plan L1a): the Darwin descriptor/process model, its
+  # derivation and the census over trust-ir. Members here because rustc_mir_transform
+  # links them (the platform-protocol pass, plan L1d), so their resolution is the
+  # compiler's. They are also in default-members for the developer test lane.
+  "crates/trust-platform",
+  "crates/trust-platform-census",
+  "crates/trust-platform-derive",
+  "crates/trust-proc-macro-bridge",
   "crates/trust-proof-cert",
   "crates/trust-rand",
   "crates/trust-ratio",
   "crates/trust-release",
   "crates/trust-report",
   "crates/trust-router",
+  "crates/trust-coordinator",
+  "crates/trust-file-lock",
+  "crates/trust-fs-observation",
   "crates/trust-sha2",
-  # trust: package name is `sha2` v0.10.100 (see its manifest) — the Track B
-  # `[patch.crates-io]` shim. Membership only means it is BUILT and TESTED here;
-  # nothing patches it in yet, and the patch line stays commented out at
-  # `crates/Cargo.toml:89`. Root additionally captures `rustc_span`, `rustdoc`,
-  # `build-manifest`, `bump-stage0` and six `first-party/*` submodules, and
-  # root's `clean-elab`/`clean-kernel` pull `sha2 0.11.0`, which a `0.10.100`
-  # patch is semver-incompatible with and cannot reach. Do not batch that here.
-  "crates/trust-sha2-compat",
   "crates/trust-spec",
   "crates/trust-strengthen",
   "crates/trust-certify",
+  "crates/trust-proof-session",
+  "crates/trust-odt",
   "crates/trust-clean-ir-gate",
   "crates/trust-symex",
   "crates/trust-temporal",
+  "crates/trust-test-execution",
   "crates/trust-thir-lower",
   "crates/trust-toml",
   "crates/trust-transval",
@@ -138,9 +122,140 @@ members = [
   "crates/trust-wasm-bridge",
   "crates/trust-witness",
   "crates/trust-wp",
+  # Trust: all products share this workspace and its lockfile.
+  "crates/trust-align",
+  "crates/trust-bignum",
+  "crates/trust-bitfield",
+  "crates/trust-bits",
+  "crates/trust-budget",
+  "crates/trust-cert-meter",
+  "crates/trust-checksum",
+  "crates/trust-clean",
+  "crates/trust-clean-carrier",
+  "crates/trust-clean-ir",
+  "crates/trust-clean-origin",
+  "crates/trust-endian",
+  "crates/trust-fixed",
+  "crates/trust-floatbits",
+  "crates/trust-hex",
+  "crates/trust-index",
+  "crates/trust-intbound",
+  "crates/trust-interval",
+  "crates/trust-json",
+  "crates/trust-model-prelude",
+  "crates/trust-modular",
+  "crates/trust-radix64",
+  "crates/trust-semantics",
+  "crates/trust-source-contract",
+  "crates/trust-spec-elab",
+  "crates/trust-symbols",
+  "crates/trust-temporal-prelude",
+  "crates/trust-timearith",
+  "crates/trust-upstream-compat",
+  "crates/trust-utf",
+  "crates/trust-varint",
+  "crates/trust-widthconv",
+  "targo-trust",
+]
+
+# Trust: the developer library surface; compiler and tools remain explicit products.
+default-members = [
+  "crates/trust-binary-parse",
+  "crates/trust-cache",
+  "crates/trust-disasm",
+  "crates/trust-loop",
+  "crates/trust-types",
+  "crates/trust-symbols",
+  "crates/trust-upstream-compat",
+  "crates/trust-verifier-api",
+  "crates/trust-version",
+  "crates/trust-vcgen",
+  "crates/trust-os",
+  "crates/trust-router",
+  "crates/trust-coordinator",
+  "crates/trust-file-lock",
+  "crates/trust-fs-observation",
+  "crates/trust-report",
+  "crates/trust-release",
+  "crates/trust-convergence",
+  "crates/trust-temporal",
+  "crates/trust-platform",
+  "crates/trust-platform-derive",
+  "crates/trust-platform-census",
+  "crates/trust-proof-cert",
+  "crates/trust-ratio",
+  "crates/trust-hex",
+  "crates/trust-utf",
+  "crates/trust-endian",
+  "crates/trust-index",
+  "crates/trust-varint",
+  "crates/trust-checksum",
+  "crates/trust-radix64",
+  "crates/trust-fixed",
+  "crates/trust-interval",
+  "crates/trust-timearith",
+  "crates/trust-bits",
+  "crates/trust-modular",
+  "crates/trust-intbound",
+  "crates/trust-widthconv",
+  "crates/trust-budget",
+  "crates/trust-floatbits",
+  "crates/trust-bitfield",
+  "crates/trust-align",
+  "crates/trust-clean",
+  "crates/trust-clean-carrier",
+  "crates/trust-sha2",
+  "crates/trust-rand",
+  "crates/trust-ed25519",
+  "crates/trust-toml",
+  "crates/trust-json",
+  "crates/trust-bignum",
+  "crates/trust-clean-origin",
+  "crates/trust-clean-ir",
+  "crates/trust-clean-ir-gate",
+  "crates/trust-certify",
+  "crates/trust-odt",
+  "crates/trust-temporal-prelude",
+  "crates/trust-model-prelude",
+  "crates/trust-semantics",
+  "crates/trust-decompile",
+  "crates/trust-strengthen",
+  "crates/trust-spec",
+  "crates/trust-backprop",
+  "crates/trust-symex",
+  "crates/trust-transval",
+  "crates/trust-integration-tests",
+  "crates/trust-lift",
+  "crates/trust-machine-sem",
+  "crates/trust-memchr",
+  "crates/trust-bmc",
+  "crates/trust-wp",
+  "crates/trust-vc-bridge",
+  "crates/trust-wasm-bridge",
+  "crates/trust-cg-bridge",
+  "crates/trust-ir-bridge",
+  "crates/trust-cert-meter",
+  "crates/trust-spec-elab",
 ]
 
 exclude = [
+  # Bootstrap-only owned CMake support is independently testable.
+  "crates/trust-cmake",
+  # Trust: stage receipt validation is shared by native qualification consumers.
+  "crates/trust-stage-receipt",
+  # Trust: native guard sharing is a standalone leaf, independent of stage0.
+  "crates/trust-build-tree",
+  # Read-only custodian provenance is shared with standalone native hosts.
+  "crates/trust-resource-provenance",
+  # Git-capable passive source observations stay above native cache provenance.
+  "crates/trust-committed-source",
+  "crates/trust-resource-controller",
+  "crates/trust-exec-policy",
+  # Native paired qualification is independently testable without a compiler build.
+  "crates/trust-qualification",
+  # Trust (D21/PM-1): compiler adapters link B1/B3; retain standalone test workspaces.
+  "crates/trust-process-isolation",
+  "crates/trust-worker-linux",
   "build",
   "src/bootstrap",
   "tests/rustdoc-gui",
@@ -165,14 +280,10 @@ exclude = [
   "first-party/ty",
   # trust: vendored foreign deps that carry their own workspaces.
   # (vendor/rustc_version_0_4_1 is a [patch.crates-io] source below, not a member.)
+  # jobserver_utils names vendor/jobserver by path so standalone fixtures get its
+  # explicit-pipe client; that path would otherwise claim it as a member.
+  "vendor/jobserver",
 ]
-
-[profile.release.package.rustc_thread_pool]
-# The rustc fork of Rayon has deadlock detection code which intermittently
-# causes overflows in the CI (see https://github.com/rust-lang/rust/issues/90227)
-# so we turn overflow checks off for now.
-# FIXME: This workaround should be removed once #90227 is fixed.
-overflow-checks = false
 
 # These are very thin wrappers around executing lld with the right binary name.
 # Basically nothing within them can go wrong without having been explicitly logged anyway.
@@ -185,14 +296,15 @@ strip = true
 debug = 0
 strip = true
 
-# Bigint libraries are slow without optimization, speed up testing
+# Bigint libraries are slow without optimization, speed up testing. Note that this doesn't affect
+# its dependencies, it should still be run in release mode where possible.
 [profile.dev.package.test-float-parse]
 opt-level = 3
 
 # Trust local iteration profile.
 #
-# Match the standalone `crates/` workspace defaults so root-workspace cargo
-# checks/builds do less debug-info work while preserving useful backtraces.
+# One profile governs compiler dependencies, developer libraries and Targo.
+# Preserve useful backtraces without rebuilding a second workspace variant.
 [profile.dev]
 debug = "line-tables-only"
 incremental = true
@@ -222,6 +334,8 @@ codegen-units = 1
 # If you want to use a crate with local modifications, you can set a path or git dependency here.
 # For git dependencies, also add your source to ALLOWED_SOURCES in src/tools/tidy/src/extdeps.rs.
 [patch.crates-io]
+# Trust: explicit checked pipe import after authenticated descendant recovery.
+jobserver = { path = "vendor/jobserver" }
 # memchr is first-party now. Upstream memchr is hand-vectorised over raw
 # pointers and cannot be verified — it is what stops `./x.py build --stage 2`,
 # because the bootstrap graph is the one graph Trust verifies. See
@@ -235,6 +349,7 @@ rustc_version = { path = "vendor/rustc_version_0_4_1" }
 trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
 trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
 trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformance" }
+trust-ir-contract = { path = "first-party/trust-ir/crates/trust-ir-contract" }
 
 # HTTPS *with* .git — the exact source `first-party/ty` and `first-party/trust-cg`
 # declare. Without this entry their trust-ir escapes the patch and re-resolves to
@@ -244,16 +359,19 @@ trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformanc
 trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
 trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
 trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformance" }
+trust-ir-contract = { path = "first-party/trust-ir/crates/trust-ir-contract" }
 
 [patch."ssh://git@github.com/alabsystems/trust-ir.git"]
 trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
 trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
 trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformance" }
+trust-ir-contract = { path = "first-party/trust-ir/crates/trust-ir-contract" }
 
 [patch."ssh://git@github.com:22/alabsystems/trust-ir.git"]
 trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
 trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
 trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformance" }
+trust-ir-contract = { path = "first-party/trust-ir/crates/trust-ir-contract" }
 
 # trust-ir(-build) declare their clean-kernel dep as a git dependency on
 # clean.git (pinned rev) so they stay consumable as plain cargo git
@@ -261,12 +379,12 @@ trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformanc
 # broke every git consumer). Redirect that URL to the vendored
 # first-party/clean so this workspace keeps building the SAME single
 # clean-kernel instance as its own path deps above — no network, no second
-# instance. Only clean-kernel is patched: trust-ir-build's clean-mathverse /
-# clean-olean git deps are optional behind its default-off `slackcertz-anchor`
-# feature, which nothing here activates — patching them would only produce
-# unused-patch warnings. Add them if that feature is ever turned on.
+# instance. The codegen verifier also consumes clean-olean directly for its
+# checked i128 certificate transport. Keep that reader in the same selected
+# Clean source image instead of compiling a second Git-sourced reader.
 [patch."https://github.com/alabsystems/clean.git"]
 clean-kernel = { path = "first-party/clean/crates/clean-kernel" }
+clean-olean = { path = "first-party/clean/crates/clean-olean" }
 
 [patch."https://github.com/alabsystems/ay"]
 ay = { path = "first-party/ay/crates/ay" }
@@ -339,23 +457,19 @@ trust-cg-opt = { path = "first-party/trust-cg/crates/trust-cg-opt" }
 [patch."ssh://git@github.com/alabsystems/trust-vc"]
 trust-vc-merge-contract = { path = "first-party/trust-vc/crates/trust-vc-merge-contract" }
 
-# trust: Carcara (the second, independent Alethe proof checker behind
-# clean-auto's `carcara-verify` N-version UNSAT cross-check) pinned at
-# ufmg-smite/carcara rev fecb4224def3c26f93a5d4f1804ecf58eb979650 (v1.1.0),
-# vendored byte-identical under vendor/carcara_1_1_0 (minus .git and the inert
-# benchmarks.zip) so full-verify seed caches stay registry-only: a git source
-# in any lockfile materializes cargo git checkout/db state, which the
-# cargo-cache materialization gate rejects.
-[patch."https://github.com/ufmg-smite/carcara"]
-carcara = { path = "vendor/carcara_1_1_0/carcara" }
-
 # trust: workspace-level lint policy
 [workspace.lints.rust]
 warnings = "warn"
+# The compiler owns this cfg; declaring its spelling never enables it. Keep
+# helper crates free of executable build scripts that only repeat this fact.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(trust_verify)'] }
+# Trust-owned crates keep the developer lint policy after consolidation.
+env_mutation = "warn"
+unknown_lints = "allow"
 
 # trust: workspace-level package metadata for verification pipeline crates
 [workspace.package]
-version = "0.9.0"
+version = "0.14.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alabsystems/trust"
@@ -364,6 +478,7 @@ authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 # trust: workspace-level dependencies shared by verification pipeline crates
 [workspace.dependencies]
 trust-types = { path = "crates/trust-types" }
+trust-odt = { path = "crates/trust-odt" }
 trust-verifier-api = { path = "crates/trust-verifier-api" }
 # trust: cross-repo shared verification vocabulary, re-exported by
 # trust-types/trust-verifier-api (see first-party/trust-ir/crates/trust-ir-contract).
@@ -374,6 +489,9 @@ trust-ir-contract = { path = "first-party/trust-ir/crates/trust-ir-contract" }
 # are NOT in the TCB — their output is re-checked by the clean kernel; a bad
 # reconstruction fails closed to Trusted.
 trust-certify = { path = "crates/trust-certify" }
+# Trust's canonical temporal vocabulary (Clean source text) that trust-certify
+# serves to islands importing it; text only, no dependencies.
+trust-temporal-prelude = { path = "crates/trust-temporal-prelude" }
 trust-cert-meter = { path = "crates/trust-cert-meter" }
 trust-spec-elab = { path = "crates/trust-spec-elab" }
 # Trust (I5): the two Clean-origin CALL-lane decisions — the gated `DefId` mint
@@ -398,19 +516,28 @@ clean-reflect = { path = "first-party/clean/crates/clean-reflect" }
 # compiler (kernel Expr -> L5CNF -> L5IR -> trust_ir::Module). Its trust-ir /
 # trust-ir-build / trust-ir-conformance git deps are captured by the [patch]
 # tables below; clean-kernel resolves via first-party/clean's own workspace.
-clean-compiler = { path = "first-party/clean/crates/clean-compiler", features = ["trust-ir-backend"] }
+clean-compiler = { path = "first-party/clean/crates/clean-compiler" }
 clean-auto = { path = "first-party/clean/crates/clean-auto" }
 clean-verify = { path = "first-party/clean/crates/clean-verify" }
 clean-parser = { path = "first-party/clean/crates/clean-parser" }
 clean-elab = { path = "first-party/clean/crates/clean-elab" }
 trust-cache = { path = "crates/trust-cache" }
+trust-build-cpu = { path = "crates/trust-build-cpu" }
+trust-build-tree = { path = "crates/trust-build-tree", version = "0.1.0" }
+trust-test-execution = { path = "crates/trust-test-execution" }
 trust-vcgen = { path = "crates/trust-vcgen" }
 trust-os = { path = "crates/trust-os" }
 trust-router = { path = "crates/trust-router" }
+trust-coordinator = { path = "crates/trust-coordinator" }
+trust-file-lock = { path = "crates/trust-file-lock" }
 trust-report = { path = "crates/trust-report" }
 trust-semantics = { path = "crates/trust-semantics" }
 trust-release = { path = "crates/trust-release" }
 trust-temporal = { path = "crates/trust-temporal" }
+# Trust platform protocols (plan L1a).
+trust-platform = { path = "crates/trust-platform" }
+trust-platform-census = { path = "crates/trust-platform-census" }
+trust-platform-derive = { path = "crates/trust-platform-derive" }
 trust-convergence = { path = "crates/trust-convergence" }
 trust-proof-cert = { path = "crates/trust-proof-cert" }
 trust-version = { path = "crates/trust-version" }
@@ -419,6 +546,7 @@ trust-strengthen = { path = "crates/trust-strengthen" }
 trust-spec = { path = "crates/trust-spec" }
 trust-symex = { path = "crates/trust-symex" }
 trust-mir-extract = { path = "crates/trust-mir-extract" }
+trust-source-contract = { path = "crates/trust-source-contract" }
 trust-thir-lower = { path = "crates/trust-thir-lower" }
 trust-witness = { path = "crates/trust-witness" }
 trust-lift = { path = "crates/trust-lift" }
@@ -431,20 +559,17 @@ trust-wp = { path = "crates/trust-wp" }
 trust-vc-bridge = { path = "crates/trust-vc-bridge" }
 trust-loop = { path = "crates/trust-loop" }
 trust-transval = { path = "crates/trust-transval" }
-# trust: PHASE 1 SUPPLY-CHAIN REPLACEMENT — the Trust-owned crypto primitives,
-# mirroring `crates/Cargo.toml:372-379`.
+# trust: PHASE 1 SUPPLY-CHAIN REPLACEMENT — the Trust-owned crypto primitives.
 #
-# `trust-sha2` is MANDATORY here, not cosmetic: `crates/trust-hmac/Cargo.toml`
-# and `crates/trust-ed25519/Cargo.toml` both write `trust-sha2 = { workspace =
-# true }`, and a workspace member that inherits a name this table does not
-# define is a manifest-LOAD failure — "`dependency.trust-sha2` was not found in
-# `workspace.dependencies`" — raised while loading the WORKSPACE, so it reds
-# every root cargo/x.py command, not just those two members. That is why the
-# `members` additions above, these four lines, and the `sha2`/`hmac`/
-# `ed25519-dalek` rewrites below are ONE change: any prefix of them fails to
-# load.
+# `trust-sha2` is MANDATORY here, not cosmetic: `crates/trust-ed25519/Cargo.toml`
+# writes `trust-sha2 = { workspace = true }`, and a workspace member that
+# inherits a name this table does not define is a manifest-LOAD failure —
+# "`dependency.trust-sha2` was not found in `workspace.dependencies`" — raised
+# while loading the WORKSPACE, so it reds every root cargo/x.py command, not
+# just that member. That is why the `members` additions above, these lines, and
+# the `sha2`/`ed25519-dalek` rewrites below are ONE change: any prefix of them
+# fails to load.
 trust-sha2 = { path = "crates/trust-sha2" }
-trust-hmac = { path = "crates/trust-hmac" }
 trust-ed25519 = { path = "crates/trust-ed25519" }
 # The one production consumer is `trust-proof-cert`, which names this directly
 # rather than through a `rand` alias — see the retired `rand` entry below.
@@ -461,29 +586,23 @@ serde_json = "1"
 # trust: PHASE 1a. The name resolves to the Trust-owned crate through Cargo's
 # dependency RENAMING. Every member writing `sha2 = { workspace = true }` and
 # `use sha2::{Digest, Sha256}` compiles verbatim; the crate behind the name is
-# ours. This is the ROOT half of the rename that `crates/Cargo.toml` already
-# carries — and the half that reaches the shipped compiler, since rustc-main ->
+# ours. This also reaches the shipped compiler, since rustc-main ->
 # rustc_interface -> rustc_mir_transform -> trust-router -> trust-proof-cert.
 #
-# The acceptance gates stay REAL: `crates/trust-sha2` and `crates/trust-hmac`
-# dev-depend on the incumbents by EXPLICIT VERSION (`sha2 = "0.10"`, `hmac =
-# "0.12"`), not through this table, so `tests/differential_sha2.rs` and
-# `tests/differential_hmac.rs` keep comparing against crates.io rather than
-# against themselves.
+# The acceptance gate stays REAL: `crates/trust-sha2` dev-depends on the
+# incumbent by EXPLICIT VERSION (`sha2 = "0.10"`), not through this table, so
+# `tests/differential_sha2.rs` keeps comparing against crates.io rather than
+# against itself.
 sha2 = { package = "trust-sha2", path = "crates/trust-sha2" }
 tempfile = "3"
 # trust #837: Deterministic hashing for compilation reproducibility
 rustc-hash = "2.0.0"
 indexmap = "2.7"
-# trust: PHASE 1a, same rename mechanism as `sha2` above. `trust-hmac` depends
-# only on `trust-sha2` — HMAC is defined over a hash — so this edge adds no
-# third-party closure.
-hmac = { package = "trust-hmac", path = "crates/trust-hmac" }
 # trust: PHASE 1e, same rename mechanism as `sha2` above — and, like `sha2`,
-# this is the ROOT half. `trust-deps`, `trust-version`, `trust-bmc` and
-# `trust-router` are members of BOTH workspaces; without this line the same four
-# crates would compile against `trust-toml` under `crates/` and against the
-# incumbent `toml` under the root, i.e. two different TOML implementations
+# this is the ROOT half. `trust-version`, `trust-bmc` and `trust-router` are
+# members of BOTH workspaces (as `trust-deps` was until it was retired); without
+# this line the same crates would compile against `trust-toml` under `crates/`
+# and against the incumbent `toml` under the root, i.e. two different TOML implementations
 # depending on which workspace built them.
 #
 # The acceptance gate stays REAL for the same reason it does in
@@ -491,6 +610,16 @@ hmac = { package = "trust-hmac", path = "crates/trust-hmac" }
 # explicit version, not through this table.
 toml = { package = "trust-toml", path = "crates/trust-toml" }
 num-bigint = "0.4"
+# Trust: mirrors `crates/Cargo.toml`'s entry exactly. `crates/trust-certify`
+# inherits it (`num-rational = { workspace = true }`, added by 7789ff8714) and is in
+# rustc-main's dependency closure through trust-vcgen -> trust-mir-extract ->
+# trust-ir-bridge -> trust-cg-bridge -> rustc_codegen_trust_cg, so the ROOT
+# workspace must define it too. The two workspaces have separate
+# `[workspace.dependencies]` tables and separate lockfiles; adding a member
+# dependency to one of them alone makes the other fail to LOAD its manifest, which
+# is a broken build rather than a version split (measured: `error inheriting
+# `num-rational` from workspace root manifest's `workspace.dependencies`).
+num-rational = { version = "0.4", default-features = false, features = ["num-bigint"] }
 bincode = "1.3"
 proptest = "1.11"
 # trust: PHASE 1d, same rename mechanism. Retires the incumbent's 34-package
@@ -522,7 +651,7 @@ ed25519-dalek = { package = "trust-ed25519", path = "crates/trust-ed25519" }
 # them and this deletion cannot affect their build.
 #
 # Deliberately NOT replaced by `rand = { package = "trust-rand", ... }`:
-# sha2/hmac/ed25519-dalek are drop-ins, so renaming their names is a
+# sha2/ed25519-dalek are drop-ins, so renaming their names is a
 # zero-source-edit swap, but `rand`'s surface is enormous and `trust-rand`
 # implements the one function this tree called. An alias would make every other
 # `rand::` path resolve to nothing and report the error at the CONSUMER.
@@ -551,16 +680,15 @@ ay-core = { path = "first-party/ay/crates/ay-core" }
 # build pulls in via rustc_codegen_trust_cg's `ay-proofs` feature. Without this
 # entry the root workspace manifest fails to load (`error inheriting ay-proof`).
 ay-proof = { path = "first-party/ay/crates/ay-proof" }
-ay-proof-common = { path = "first-party/ay/crates/ay-proof-common" }
 # trust: sealed-authority S3 replay oracle — inherited by crates/trust-bmc
 # (ay-chc.workspace = true, optional, feature trust-mc-native-solver). Same
 # root-workspace-copy rule as ay-core/ay-proof above.
 ay-chc = { path = "first-party/ay/crates/ay-chc" }
-trust-mc-verifier = { path = "first-party/trust-mc", package = "trust-mc" }
 trust-mc-core = { path = "first-party/trust-mc/trust-mc-core" }
 trust-mc-trust-bmc = { path = "first-party/trust-mc/trust-mc-trust-bmc" }
 trust-wp-core = { path = "first-party/trust-wp/crates/trust-wp-core" }
 trust-wp-ay = { path = "first-party/trust-wp/crates/trust-wp-ay" }
+trust-wp-lib = { path = "first-party/trust-wp/crates/trust-wp-lib" }
 trust-vc-core = { path = "first-party/trust-vc/crates/trust-vc-core" }
 trust-cg-ir = { path = "first-party/trust-cg/crates/trust-cg-ir" }
 trust-cg-dialect = { path = "first-party/trust-cg/crates/trust-cg-dialect" }
@@ -596,3 +724,169 @@ trust-wasm-bridge = { path = "crates/trust-wasm-bridge" }
 trust-ir = { path = "first-party/trust-ir/crates/trust-ir", features = ["clean-expr"] }
 trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
 trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformance" }
+
+# Trust: product dependencies formerly declared by the developer workspace.
+anyhow = "1"
+clean-olean = { path = "first-party/clean/crates/clean-olean" }
+dirs = "5"
+trust-align = { path = "crates/trust-align" }
+trust-bignum = { path = "crates/trust-bignum" }
+trust-bitfield = { path = "crates/trust-bitfield" }
+trust-bits = { path = "crates/trust-bits" }
+trust-checksum = { path = "crates/trust-checksum" }
+trust-bridge-closure = { path = "crates/trust-bridge-closure" }
+trust-clean = { path = "crates/trust-clean" }
+trust-endian = { path = "crates/trust-endian" }
+trust-fixed = { path = "crates/trust-fixed" }
+trust-hex = { path = "crates/trust-hex" }
+trust-index = { path = "crates/trust-index" }
+trust-integration-tests = { path = "crates/trust-integration-tests" }
+trust-interval = { path = "crates/trust-interval" }
+trust-json = { path = "crates/trust-json" }
+trust-model-prelude = { path = "crates/trust-model-prelude" }
+trust-modular = { path = "crates/trust-modular" }
+trust-radix64 = { path = "crates/trust-radix64" }
+trust-timearith = { path = "crates/trust-timearith" }
+trust-toml = { path = "crates/trust-toml" }
+trust-utf = { path = "crates/trust-utf" }
+trust-varint = { path = "crates/trust-varint" }
+trust-vc-trust-engine = { path = "first-party/trust-vc/crates/trust-vc-trust-engine" }
+
+
+[profile.dev.package."clean-kernel"]
+opt-level = 2
+
+[profile.dev.package."clean-olean"]
+opt-level = 2
+
+[profile.dev.package."clean-parser"]
+opt-level = 2
+
+[profile.dev.package."clean-elab"]
+opt-level = 2
+
+[profile.dev.package."ay"]
+opt-level = 2
+
+[profile.dev.package."ay-allsat"]
+opt-level = 2
+
+[profile.dev.package."ay-arrays"]
+opt-level = 2
+
+[profile.dev.package."ay-bindings"]
+opt-level = 2
+
+[profile.dev.package."ay-bv"]
+opt-level = 2
+
+[profile.dev.package."ay-cdclt"]
+opt-level = 2
+
+[profile.dev.package."ay-chc"]
+opt-level = 2
+
+[profile.dev.package."ay-core"]
+opt-level = 2
+
+[profile.dev.package."ay-count"]
+opt-level = 2
+
+[profile.dev.package."ay-diff-logic"]
+opt-level = 2
+
+[profile.dev.package."ay-dispatch"]
+opt-level = 2
+
+[profile.dev.package."ay-dpll"]
+opt-level = 2
+
+[profile.dev.package."ay-drat-check"]
+opt-level = 2
+
+[profile.dev.package."ay-dt"]
+opt-level = 2
+
+[profile.dev.package."ay-encode"]
+opt-level = 2
+
+[profile.dev.package."ay-euf"]
+opt-level = 2
+
+[profile.dev.package."ay-fp"]
+opt-level = 2
+
+[profile.dev.package."ay-frontend"]
+opt-level = 2
+
+[profile.dev.package."ay-intsat"]
+opt-level = 2
+
+[profile.dev.package."ay-jit"]
+opt-level = 2
+
+[profile.dev.package."ay-lia"]
+opt-level = 2
+
+[profile.dev.package."ay-lra"]
+opt-level = 2
+
+[profile.dev.package."ay-map"]
+opt-level = 2
+
+[profile.dev.package."ay-milp"]
+opt-level = 2
+
+[profile.dev.package."ay-model-check"]
+opt-level = 2
+
+[profile.dev.package."ay-multiset"]
+opt-level = 2
+
+[profile.dev.package."ay-nia"]
+opt-level = 2
+
+[profile.dev.package."ay-nonlinear-common"]
+opt-level = 2
+
+[profile.dev.package."ay-nra"]
+opt-level = 2
+
+[profile.dev.package."ay-pb-core"]
+opt-level = 2
+
+[profile.dev.package."ay-prefetch"]
+opt-level = 2
+
+[profile.dev.package."ay-proof"]
+opt-level = 2
+
+[profile.dev.package."ay-proof-common"]
+opt-level = 2
+
+[profile.dev.package."ay-sat"]
+opt-level = 2
+
+[profile.dev.package."ay-sat-congruence-core"]
+opt-level = 2
+
+[profile.dev.package."ay-seq"]
+opt-level = 2
+
+[profile.dev.package."ay-set"]
+opt-level = 2
+
+[profile.dev.package."ay-strings"]
+opt-level = 2
+
+[profile.dev.package."ay-sys"]
+opt-level = 2
+
+[profile.dev.package."ay-translate"]
+opt-level = 2
+
+[profile.dev.package."sha2"]
+opt-level = 2
+
+[profile.dev.package."trust-sha2"]
+opt-level = 2

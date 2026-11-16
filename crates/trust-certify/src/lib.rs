@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 // trust-certify: in-process Certified-tier bridge (de Bruijn criterion).
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -54,17 +55,55 @@ use clean_kernel::{
 use sha2::{Digest, Sha256};
 use trust_types::{Formula, Sort, VerificationCondition};
 
+/// D-2 ODT logical-face admission and kernel B1 readmission.
+pub mod odt;
+pub mod odt_e6;
+
 mod branch_clamp;
+mod bv_equality;
+mod checked_once;
+pub mod inferred_return_proof;
+pub mod proof_artifacts;
+pub mod source_clause_proof;
+// VGAPS-G1C: the element-read congruence lane (`certify_lanes`' last lane).
+mod element_congruence;
+// Trust (P4a slice 2, 2026-10-14): the one entry for the clean kernel's
+// re-check, which records a decline the kernel's heartbeat count ended as the
+// run's `effort` stop.
+mod kernel_stop;
+mod large_order_chain;
+mod real_fragment;
+// KR0 switch (proven-core plan increment 2): every Certified payload is
+// re-checked through Clean's fenced reference entry; the compiler's Certified
+// mints require the certificate it yields.
+pub mod reference_mint;
+pub use reference_mint::{ReferenceCertificate, reference_certificate_for};
+// VF5: the certificate behind a "proved (calculus)" row.
+pub mod calculus_row;
+// Trust (W4 ALLOC-LEN adversarial rounds 1-2, 2026-09-25/26): resource gates on
+// the ay -> clean_auto reconstruction lane of `certify_linear_int_fragment`.
+mod reconstruction_scale;
+// Trust: explicit offline saved-payload audit; never restores report authority.
+#[cfg(test)]
+mod native_report_replay_tests;
+// Trust (D5-B follow-up, 2026-09-25): the kernel-checked rewriting lane —
+// alias / Bool-definition elimination justified by `Eq.subst` in the term.
+mod rewrite_eval;
 
 /// Canonical wire encoding used by every closed `CleanCic` lane in this crate.
 /// Recheckers compare bytes, not merely the decoded value: a public lineage hash
 /// is an integrity checksum and cannot authorize attacker-chosen encodings.
+pub(crate) fn canonical_empty_context_slice() -> Option<&'static [u8]> {
+    static BYTES: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    BYTES.get_or_init(|| serialize_context(&ReducedContext { decls: Vec::new() }).ok()).as_deref()
+}
+
 pub(crate) fn canonical_empty_context_bytes() -> Option<Vec<u8>> {
-    serialize_context(&ReducedContext { decls: Vec::new() }).ok()
+    canonical_empty_context_slice().map(<[u8]>::to_vec)
 }
 
 pub(crate) fn is_canonical_empty_context(context_bytes: &[u8]) -> bool {
-    canonical_empty_context_bytes().as_deref() == Some(context_bytes)
+    canonical_empty_context_slice() == Some(context_bytes)
 }
 
 /// Require the exact independently regenerated proof encoding.  This is the
@@ -113,12 +152,31 @@ pub mod checker_core;
 /// input is a positive postcondition envelope rather than a violation formula.
 pub mod body_bound_ensures;
 
+/// Kernel-defined scalar execution model; not a Rust/MIR refinement certificate.
+pub mod scalar_return;
+
+/// Universal execution theorem for the bounded scalar model, not Rust authority.
+pub mod scalar_return_family;
+
+/// Bounded raw-MIR-shaped model; no Rust-source or compiler proof authority.
+pub mod scalar_mir;
+
+/// Diagnostic kernel roster independent of Lean producer admission.
+pub mod clean_census;
+
 /// Trust: `clean { … }` parser-island checking (two-language design E10) —
 /// parse the island text with the real Clean parser, elaborate + register
 /// each declaration (registration IS the kernel gate), and report failures
 /// with island-relative byte offsets for source-accurate Rust diagnostics.
+pub mod clean_fact;
 pub mod clean_island;
 pub mod clean_island_batch;
+
+/// Invocation-local reuse of an immutable, exactly bound checked island environment.
+pub mod clean_island_environment;
+
+/// Fresh, sealed Lean source-batch contexts for standalone carrier admission.
+pub mod lean_source_batch;
 
 /// Trust: the kernel half of the zero-authority frontend firewall. The only
 /// route by which material from an untrusted frontend (TrustJS/TrustPy/
@@ -235,6 +293,13 @@ pub mod fuel_outcome_functional;
 /// NON-AUTHORITATIVE validation artifact — it emits a coherence report, never
 /// `ProofEvidence`, and does not establish the literal-Rust reducer universal
 /// (quarantined; see the 2026-07-16 checker-core closure design note).
+///
+/// Compiled only under `cfg(test)`: it reads the committed fixtures from the
+/// source tree at run time through `env!("CARGO_MANIFEST_DIR")`, so it must not
+/// be compiled into the shipped compiler, which would then carry this
+/// checkout's absolute path (EW-9). It has no caller outside its own tests;
+/// `tests/reducer_universal_composition_test_only.rs` holds the gate.
+#[cfg(test)]
 pub mod reducer_universal_composition;
 
 /// Phase-3 link-3 "auto-sourcing": source a 2D finite-DFA refinement obligation
@@ -274,7 +339,7 @@ impl ObligationIdentity {
     /// Identity for a full obligation: binds every serialized field.
     fn from_vc(vc: &VerificationCondition) -> Option<Self> {
         let mut encoded = b"vc:\0".to_vec();
-        encoded.extend_from_slice(&bincode::serialize(vc).ok()?);
+        bincode::serialize_into(&mut encoded, vc).ok()?;
         Some(Self { encoded })
     }
 
@@ -283,7 +348,7 @@ impl ObligationIdentity {
     /// obligations whose violation formulas differ.
     fn from_violation(violation: &Formula) -> Option<Self> {
         let mut encoded = b"formula:\0".to_vec();
-        encoded.extend_from_slice(&bincode::serialize(violation).ok()?);
+        bincode::serialize_into(&mut encoded, violation).ok()?;
         Some(Self { encoded })
     }
 }
@@ -316,9 +381,11 @@ struct Hyp {
 /// reaching program state conjoined with the negated predicate. For a kind
 /// whose formula is the bare negated clause with its free names unbound, UNSAT
 /// means only that the clause text is VALID, so the provable set is exactly the
-/// tautologies. [`VcKind::kernel_authority_refusal`] carries that judgement for
-/// every kind, with the measured evidence; this function refuses before any
-/// solver or kernel work when it fires.
+/// tautologies. [`VerificationCondition::kernel_authority_refusal`] carries that
+/// judgement for every kind, with the measured evidence, and for a kind admitted
+/// only per row (`VcKind::TypeInvariant`, since TINV step 7.7) also the row's
+/// structural situatedness check; this function refuses before any solver or
+/// kernel work when it fires.
 ///
 /// Placing the check at the certificate entry points rather than at individual
 /// promotion sites is deliberate. Both this general route and
@@ -330,13 +397,94 @@ struct Hyp {
 pub fn certify_vc(vc: &VerificationCondition) -> Option<trust_ir::ProofEvidence> {
     // Fail closed BEFORE any solver or kernel work: a refused kind must not be
     // able to produce a certificate at all, not merely be declined downstream.
-    if vc.kind.kernel_authority_refusal().is_some() {
+    if vc.kernel_authority_refusal().is_some() {
         return None;
+    }
+    // Iterative depth gate FIRST, on the caller's thread: a too-deep obligation
+    // is declined before anything recursive — the identity's serde recursion
+    // included — touches it.
+    let max_depth = vc_max_depth_within_gate(vc)?;
+    if max_depth <= SHALLOW_CALLER_STACK_MAX_DEPTH || ON_CERTIFY_STACK.with(std::cell::Cell::get) {
+        injected_test_stop(vc);
+        let cache_key = build_certify_memo_key(&vc.formula);
+        if let Some(ref key) = cache_key
+            && let Some(cached) = certify_memo_lookup(key)
+        {
+            if let Some(cause) = trust_types::verify_budget::exhaustion_cause() {
+                note_certify_stop(cause);
+            }
+            return match cached {
+                Some(parts) => {
+                    let identity = ObligationIdentity::from_vc(vc)?;
+                    Some(restamp_cleancic(&parts, &identity))
+                }
+                None => None,
+            };
+        }
+        return on_certify_stack_if_needed(move || {
+            let identity = ObligationIdentity::from_vc(vc)?;
+            certify_with_identity_and_key_on_stack(&vc.formula, &identity, cache_key)
+        });
     }
     // Bind every field of the canonical serialized obligation, including
     // contract metadata, so the certificate cannot be swapped onto a different
-    // obligation whose proof-driving formula happens to be identical.
-    certify_with_identity(&vc.formula, &ObligationIdentity::from_vc(vc)?)
+    // obligation whose proof-driving formula happens to be identical. Built on
+    // the large-stack thread: `bincode::serialize` recurses to the depth of
+    // the formula.
+    on_certify_stack_if_needed(|| {
+        injected_test_stop(vc);
+        let identity = ObligationIdentity::from_vc(vc)?;
+        certify_with_identity_on_stack(&vc.formula, &identity)
+    })
+}
+
+/// Test hook (T3 L4, C06a): a stop a test injected for `vc`'s function is recorded on the
+/// certification stack, as a lapsed deadline inside the run would be. A no-op outside this
+/// crate's tests.
+#[cfg(not(test))]
+fn injected_test_stop(_vc: &VerificationCondition) {}
+
+/// Test hook (T3 L4, C06a): the stops tests injected, by function name.
+#[cfg(test)]
+static INJECTED_TEST_STOPS: std::sync::Mutex<Vec<(String, trust_types::determinism::StopCause)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn injected_test_stop(vc: &VerificationCondition) {
+    let injected = INJECTED_TEST_STOPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(function, _)| function == vc.function.as_str())
+        .map(|(_, cause)| *cause);
+    if let Some(cause) = injected {
+        note_certify_stop(cause);
+    }
+}
+
+/// [`certify_vc`], and the stop that reached its run (T3 L4, C06a).
+///
+/// The evidence is exactly [`certify_vc`]'s: this runs it under a fresh stop record
+/// ([`with_stop_scope`]) and reports the least reproducible stop the run saw, nested runs
+/// and the certification stack included, or `None` when no clock or budget stopped any of
+/// it (a memo hit is such a run: only an unstopped run is memoized). The stop stays
+/// recorded in the caller's enclosing record too, as it would after [`certify_vc`].
+/// Measurement: the compiler writes a `CERTIFY-STOP` audit row from it, which lets the
+/// T3 L4 differential tell a certificate a clock withheld from one a change withheld.
+#[must_use]
+pub fn certify_vc_reporting_stop(
+    vc: &VerificationCondition,
+) -> (Option<trust_ir::ProofEvidence>, Option<trust_types::determinism::StopCause>) {
+    with_stop_scope(|| certify_vc(vc))
+}
+
+/// [`certify_vc_for_native_planning`], and the stop that reached its run, as
+/// [`certify_vc_reporting_stop`] reports it.
+#[must_use]
+pub fn certify_vc_for_native_planning_reporting_stop(
+    vc: &VerificationCondition,
+) -> (Option<trust_ir::ProofEvidence>, Option<trust_types::determinism::StopCause>) {
+    with_stop_scope(|| certify_vc_for_native_planning(vc))
 }
 
 // Native-bundle construction runs before the ordinary per-function
@@ -349,6 +497,16 @@ const NATIVE_PLANNING_MAX_CONJUNCTS: usize = 24;
 const NATIVE_PLANNING_MAX_NODE_FANOUT: usize = 24;
 const NATIVE_PLANNING_MAX_STRING_BYTES: usize = 4 * 1024;
 const NATIVE_PLANNING_MAX_IDENTITY_BYTES: u64 = 2 * 1024;
+/// Bounds on EVERY formula the authenticated-obligation record carries (body,
+/// subject, wrapper facts and guards), walked ITERATIVELY before anything
+/// recursive touches the record. The identity-bytes cap alone cannot protect the
+/// caller's stack: `bincode::serialized_size(vc)` recurses through the record
+/// to measure it, and a 300-deep `Add` chain in `obligation.body` overflowed a
+/// 2 MiB thread (measured 2026-09-16) before the 2 KiB verdict was ever
+/// reached. Depth 64 is far below the ~185 levels a 2 MiB stack survives, and
+/// 1024 nodes is well above anything that still fits the 2 KiB identity cap.
+const NATIVE_PLANNING_MAX_RECORD_FORMULA_DEPTH: usize = 64;
+const NATIVE_PLANNING_MAX_RECORD_FORMULA_NODES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativePlanningPreflightFailure {
@@ -361,6 +519,10 @@ enum NativePlanningPreflightFailure {
     NodeFanout,
     StringBytes,
     IdentityBytes,
+    /// A formula inside the authenticated-obligation record (body, subject,
+    /// wrapper facts or guards) exceeds the iterative depth/node bounds, so the
+    /// recursive identity measurement is refused before it can run.
+    ObligationRecordShape,
 }
 
 /// Preflight the exact, small unsigned-BV guarded-index family admitted during
@@ -459,6 +621,31 @@ fn preflight_unsigned_bv_order_vc_for_native_planning(
         }
     }
 
+    // The violation formula is bounded above, but `serialized_size(vc)` ALSO
+    // recurses through the authenticated-obligation record (body, subject,
+    // wrapper facts and guards). Bound each of those iteratively first, so the
+    // measurement below is cheap and shallow for every formula it visits —
+    // never an unbounded recursion on the caller's stack.
+    let mut pending: Vec<(&Formula, usize)> = Vec::new();
+    if !all_vc_formulas(vc, |formula| {
+        let mut nodes = 0usize;
+        pending.clear();
+        pending.push((formula, 1));
+        while let Some((f, depth)) = pending.pop() {
+            nodes += 1;
+            if nodes > NATIVE_PLANNING_MAX_RECORD_FORMULA_NODES
+                || depth > NATIVE_PLANNING_MAX_RECORD_FORMULA_DEPTH
+            {
+                pending.clear();
+                return false;
+            }
+            trust_types::for_each_formula_child(f, |c| pending.push((c, depth + 1)));
+        }
+        true
+    }) {
+        return Err(NativePlanningPreflightFailure::ObligationRecordShape);
+    }
+
     // Formula recursion and all variable-sized identity fields are now bounded,
     // so `serialized_size` itself is cheap and non-recursive beyond the shallow
     // cap. Check it before `ObligationIdentity::from_vc` allocates the bytes.
@@ -503,7 +690,7 @@ pub fn certify_vc_for_native_planning(
     // before normalization, recognition, or kernel work. In particular, an
     // order-shaped tautology under an item invariant fits the unsigned-BV
     // planning grammar and would otherwise mint evidence through this route.
-    if vc.kind.kernel_authority_refusal().is_some() {
+    if vc.kernel_authority_refusal().is_some() {
         return None;
     }
     preflight_unsigned_bv_order_vc_for_native_planning(vc).ok()?;
@@ -523,7 +710,35 @@ pub fn certify_vc_for_native_planning(
 /// full [`VerificationCondition`] is available.
 #[must_use]
 pub fn certify_violation(violation: &Formula) -> Option<trust_ir::ProofEvidence> {
-    certify_with_identity(violation, &ObligationIdentity::from_violation(violation)?)
+    // Iterative depth gate first, on the caller's thread; the identity's serde
+    // recursion and every lane then run on the large-stack thread.
+    let mut pending = Vec::new();
+    let max_depth = formula_depth_within_gate(violation, &mut pending)?;
+    if max_depth <= SHALLOW_CALLER_STACK_MAX_DEPTH || ON_CERTIFY_STACK.with(std::cell::Cell::get) {
+        let cache_key = build_certify_memo_key(violation);
+        if let Some(ref key) = cache_key
+            && let Some(cached) = certify_memo_lookup(key)
+        {
+            if let Some(cause) = trust_types::verify_budget::exhaustion_cause() {
+                note_certify_stop(cause);
+            }
+            return match cached {
+                Some(parts) => {
+                    let identity = ObligationIdentity::from_violation(violation)?;
+                    Some(restamp_cleancic(&parts, &identity))
+                }
+                None => None,
+            };
+        }
+        return on_certify_stack_if_needed(move || {
+            let identity = ObligationIdentity::from_violation(violation)?;
+            certify_with_identity_and_key_on_stack(violation, &identity, cache_key)
+        });
+    }
+    on_certify_stack_if_needed(|| {
+        let identity = ObligationIdentity::from_violation(violation)?;
+        certify_with_identity_on_stack(violation, &identity)
+    })
 }
 
 // ── Trust (perf): certificate memoization ──────────────────────────────────
@@ -551,6 +766,103 @@ pub fn certify_violation(violation: &Formula) -> Option<trust_ir::ProofEvidence>
 // alias distinct formulas. This key is intentionally separate from
 // `ObligationIdentity::encoded`, whose full-VC form also binds source and
 // contract metadata for lineage isolation.
+//
+// PURITY (plan P4, T4.2): the memo is a pure memo — a hit is what a fresh run
+// would compute, whatever was certified before it. It therefore stores only a
+// run that NO clock or budget stopped ([`CertifyOutcome`]): an ay answer that is
+// neither `sat` nor `unsat` (a lapsed deadline, a resource count, a withdrawn
+// verdict, a solver error) anywhere in the run, nested runs included, makes the
+// whole run `Stopped`, and a stopped run is recomputed on every request. It has
+// no capacity cap and no environment switch: the entries are bounded by the
+// distinct formulas one compile certifies.
+
+/// What one uncached certification run produced.
+#[derive(Clone)]
+enum CertifyOutcome {
+    /// Evidence, from a run that no clock or budget stopped.
+    Certified(trust_ir::ProofEvidence),
+    /// No lane certifies, and no clock or budget stopped any of the run.
+    Uncertifiable,
+    /// A clock or budget stopped some of the run's work (`cause`, the least
+    /// reproducible one seen). The run's answer is returned but never
+    /// memoized: another run of the same formula may end differently.
+    Stopped {
+        cause: trust_types::determinism::StopCause,
+        evidence: Option<trust_ir::ProofEvidence>,
+    },
+}
+
+impl CertifyOutcome {
+    fn of(
+        evidence: Option<trust_ir::ProofEvidence>,
+        stop: Option<trust_types::determinism::StopCause>,
+    ) -> Self {
+        match (stop, evidence) {
+            (Some(cause), evidence) => Self::Stopped { cause, evidence },
+            (None, Some(evidence)) => Self::Certified(evidence),
+            (None, None) => Self::Uncertifiable,
+        }
+    }
+
+    fn into_evidence(self) -> Option<trust_ir::ProofEvidence> {
+        match self {
+            Self::Certified(evidence) => Some(evidence),
+            Self::Uncertifiable => None,
+            Self::Stopped { evidence, .. } => evidence,
+        }
+    }
+}
+
+thread_local! {
+    /// The least reproducible stop recorded by the certification work running
+    /// on this thread ([`note_certify_stop`]), scoped by [`with_stop_scope`]
+    /// and carried across [`on_certify_stack`]'s thread hop.
+    static RUN_STOP: std::cell::Cell<Option<trust_types::determinism::StopCause>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Record that a clock or budget stopped some certification work on this
+/// thread. Combined with [`trust_types::determinism::StopCause::combine`], so
+/// the least reproducible stop seen is the one kept.
+fn note_certify_stop(cause: trust_types::determinism::StopCause) {
+    RUN_STOP.with(|stop| {
+        stop.set(Some(match stop.get() {
+            Some(earlier) => trust_types::determinism::StopCause::combine(earlier, cause),
+            None => cause,
+        }));
+    });
+}
+
+/// Record a stop when an ay answer is neither `sat` nor `unsat`. ay's direct
+/// path bounds every solve with a wall deadline and a conflict allowance, and
+/// its `unknown` does not say which ended it, so every such answer is a stop
+/// (`unclassified`): the run it belongs to is never memoized.
+fn note_ay_answer<E>(answer: &Result<AyProofResult, E>) {
+    if !matches!(answer, Ok(AyProofResult::Sat | AyProofResult::Unsat { .. })) {
+        note_certify_stop(trust_types::determinism::StopCause::Unclassified);
+    }
+}
+
+/// Run `work` under a fresh stop record and return its answer with the stop it
+/// recorded. The stop stays recorded in the enclosing scope as well, so a run
+/// that consumed a stopped nested run is itself stopped.
+fn with_stop_scope<T>(
+    work: impl FnOnce() -> T,
+) -> (T, Option<trust_types::determinism::StopCause>) {
+    let outer = RUN_STOP.with(std::cell::Cell::take);
+    let answer = work();
+    // A budget-shaped decline must be classified before the memo can store
+    // it. Waiting until the outer stack hop returns would be too late.
+    if let Some(cause) = trust_types::verify_budget::exhaustion_cause() {
+        note_certify_stop(cause);
+    }
+    let inner = RUN_STOP.with(std::cell::Cell::take);
+    RUN_STOP.with(|stop| stop.set(outer));
+    if let Some(cause) = inner {
+        note_certify_stop(cause);
+    }
+    (answer, inner)
+}
 
 /// Identity-independent payload of a `ProofEvidence::CleanCic`: everything the
 /// producer derives from the violation formula alone. The stored `evidence`'s
@@ -558,21 +870,45 @@ pub fn certify_violation(violation: &Formula) -> Option<trust_ir::ProofEvidence>
 #[derive(Clone)]
 struct CachedCleanCic {
     evidence: trust_ir::ProofEvidence,
+    /// Pre-absorbed SHA-256 mid-state over `LINEAGE_DOMAIN || term || context`,
+    /// cloned on each memo hit so `restamp_cleancic` hashes only `identity`.
+    payload_lineage_hasher: Sha256,
+    term_sha256: [u8; 32],
+    context_sha256: [u8; 32],
+    /// KR0 switch: the reference entry's certificate for the payload, which is
+    /// identity-independent (it binds the closed term, not the lineage), or
+    /// `None` when the entry refused it. Re-registered under each restamped
+    /// lineage, so a hit is exactly as Certified as the fresh run was.
+    reference: Option<ReferenceCertificate>,
+}
+
+/// The memo key prefix: the reference theory and both carrier entries'
+/// environment digests (`reference_mint::memo_key_prefix`).
+fn certify_memo_key_prefix() -> &'static [u8] {
+    static PREFIX: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PREFIX.get_or_init(|| {
+        reference_mint::memo_key_prefix(&[
+            Carrier::Int.reference().map(reference_mint::CarrierReference::env_digest),
+            Carrier::Real.reference().map(reference_mint::CarrierReference::env_digest),
+        ])
+    })
+}
+
+fn build_certify_memo_key(violation: &Formula) -> Option<Vec<u8>> {
+    let prefix = certify_memo_key_prefix();
+    let mut key = Vec::with_capacity(prefix.len() + 128);
+    key.extend_from_slice(prefix);
+    bincode::serialize_into(&mut key, violation).ok()?;
+    Some(key)
 }
 
 #[allow(clippy::type_complexity)]
 fn certify_memo()
--> &'static std::sync::Mutex<std::collections::HashMap<Vec<u8>, Option<CachedCleanCic>>> {
+-> &'static std::sync::Mutex<trust_types::fx::FxHashMap<Vec<u8>, Option<CachedCleanCic>>> {
     static MEMO: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<Vec<u8>, Option<CachedCleanCic>>>,
+        std::sync::Mutex<trust_types::fx::FxHashMap<Vec<u8>, Option<CachedCleanCic>>>,
     > = std::sync::OnceLock::new();
-    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Memoization is ON by default; `TRUST_CERTIFY_MEMO=0` disables it (for A/B
-/// measurement of the win on the same binary).
-fn certify_memo_enabled() -> bool {
-    !std::env::var("TRUST_CERTIFY_MEMO").is_ok_and(|value| value == "0")
+    MEMO.get_or_init(|| std::sync::Mutex::new(trust_types::fx::FxHashMap::default()))
 }
 
 /// Look up the identity-independent payload for a formula key. Outer `None` =
@@ -580,6 +916,70 @@ fn certify_memo_enabled() -> bool {
 /// when this formula is not certifiable (independent of identity).
 fn certify_memo_lookup(key: &[u8]) -> Option<Option<CachedCleanCic>> {
     certify_memo().lock().ok().and_then(|memo| memo.get(key).cloned())
+}
+
+type MemoFlightLock = std::sync::Mutex<()>;
+
+#[allow(clippy::type_complexity)]
+fn memo_flights()
+-> &'static std::sync::Mutex<trust_types::fx::FxHashMap<Vec<u8>, std::sync::Weak<MemoFlightLock>>> {
+    static FLIGHTS: std::sync::OnceLock<
+        std::sync::Mutex<trust_types::fx::FxHashMap<Vec<u8>, std::sync::Weak<MemoFlightLock>>>,
+    > = std::sync::OnceLock::new();
+    FLIGHTS.get_or_init(|| std::sync::Mutex::new(trust_types::fx::FxHashMap::default()))
+}
+
+/// Only active requests keep a per-formula lock alive. A stopped or panicked
+/// producer leaves no cached answer, and the next owner retries normally.
+struct MemoFlight {
+    key: Vec<u8>,
+    serial: std::sync::Arc<MemoFlightLock>,
+}
+
+impl MemoFlight {
+    fn acquire(key: &[u8]) -> Self {
+        let mut flights = memo_flights().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let serial = flights.get(key).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
+            let serial = std::sync::Arc::new(std::sync::Mutex::new(()));
+            flights.insert(key.to_vec(), std::sync::Arc::downgrade(&serial));
+            serial
+        });
+        Self { key: key.to_vec(), serial }
+    }
+}
+
+impl Drop for MemoFlight {
+    fn drop(&mut self) {
+        let mut flights = memo_flights().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::sync::Arc::strong_count(&self.serial) == 1
+            && flights
+                .get(&self.key)
+                .is_some_and(|current| std::ptr::eq(current.as_ptr(), std::sync::Arc::as_ptr(&self.serial)))
+        {
+            flights.remove(&self.key);
+        }
+    }
+}
+
+thread_local! {
+    /// Nested producers never wait for another formula's producer: two proof
+    /// searches can recursively depend on each other. Carried across our stack
+    /// threads below, so a thread hop cannot hide that dependency.
+    static IN_MEMO_PRODUCER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct MemoProducerScope(bool);
+
+impl MemoProducerScope {
+    fn set(active: bool) -> Self {
+        Self(IN_MEMO_PRODUCER.with(|state| state.replace(active)))
+    }
+}
+
+impl Drop for MemoProducerScope {
+    fn drop(&mut self) {
+        IN_MEMO_PRODUCER.with(|state| state.set(self.0));
+    }
 }
 
 /// Recompute the per-obligation lineage over a cached identity-independent
@@ -590,7 +990,16 @@ fn restamp_cleancic(
 ) -> trust_ir::ProofEvidence {
     match &parts.evidence {
         trust_ir::ProofEvidence::CleanCic { term, context, kernel_recheck, .. } => {
-            let lineage = lineage_digest(term, context, identity);
+            let lineage =
+                finish_lineage_digest(parts.payload_lineage_hasher.clone(), identity);
+            if let Some(reference) = parts.reference.clone() {
+                reference_mint::register_digests(
+                    parts.term_sha256,
+                    parts.context_sha256,
+                    &lineage,
+                    reference,
+                );
+            }
             trust_ir::ProofEvidence::CleanCic {
                 term: term.clone(),
                 context: context.clone(),
@@ -604,47 +1013,298 @@ fn restamp_cleancic(
     }
 }
 
-/// Record the identity-independent payload (or `None` = uncertifiable) for a
-/// formula key, without holding the lock across the (already-completed) proof.
-fn certify_memo_store(key: Vec<u8>, result: &Option<trust_ir::ProofEvidence>) {
-    let entry: Option<CachedCleanCic> = match result {
-        None => None,
-        Some(evidence @ trust_ir::ProofEvidence::CleanCic { .. }) => {
-            Some(CachedCleanCic { evidence: evidence.clone() })
+/// Record a run's identity-independent payload for a formula key: `Certified`
+/// and `Uncertifiable` only. A `Stopped` run is never stored, so the next
+/// request for the formula recomputes it.
+fn certify_memo_store(key: Vec<u8>, outcome: &CertifyOutcome) {
+    let entry: Option<CachedCleanCic> = match outcome {
+        CertifyOutcome::Stopped { cause, .. } => {
+            tracing::debug!(target: "trust_certify::memo", %cause, "stopped run: not memoized");
+            return;
         }
+        CertifyOutcome::Uncertifiable => None,
+        CertifyOutcome::Certified(
+            evidence @ trust_ir::ProofEvidence::CleanCic { term, context, .. },
+        ) => Some(CachedCleanCic {
+            payload_lineage_hasher: payload_lineage_hasher(term, context),
+            term_sha256: reference_mint::sha256(term),
+            context_sha256: reference_mint::sha256(context),
+            reference: reference_certificate_for(evidence),
+            evidence: evidence.clone(),
+        }),
         // `Some ⇒ CleanCic` is this crate's documented invariant; if it ever
         // breaks, skip caching rather than poison the key with a wrong `None`.
-        Some(_) => return,
+        CertifyOutcome::Certified(_) => return,
     };
     if let Ok(mut memo) = certify_memo().lock() {
-        // Bound peak memory: the memo holds full reconstructed proof terms, so an
-        // unbounded map on a huge crate (many distinct obligation formulas) is an RSS
-        // vector. Past the cap, keep serving existing entries but stop growing — new
-        // formulas simply recompute (correctness unaffected; only the hit-rate tail
-        // is capped). Override with TRUST_CERTIFY_MEMO_CAP.
-        if memo.len() < certify_memo_cap() || memo.contains_key(&key) {
-            memo.entry(key).or_insert(entry);
-        }
+        memo.entry(key).or_insert(entry);
     }
 }
 
-/// Clear the certificate memo. Used by the compiler's `TRUST_VERIFY_EQUIV_CHECK`
-/// between its serial and parallel harvest runs so the parallel run actually
-/// re-executes the concurrent clean-kernel certification (rather than replaying the
-/// serial run's memo entries as all-hits). Not for production paths.
-pub fn reset_certify_memo() {
+/// Serve `key` from the memo (restamped with this obligation's lineage), or run
+/// `produce`, store its outcome when no stop reached it, and return its
+/// evidence (a fresh run already carries this obligation's lineage).
+fn certify_memoized(
+    key: Vec<u8>,
+    identity: &ObligationIdentity,
+    produce: impl FnOnce() -> CertifyOutcome,
+) -> Option<trust_ir::ProofEvidence> {
+    if let Some(cached) = certify_memo_lookup(&key) {
+        // HIT: reuse the identity-independent payload, recompute this
+        // obligation's lineage. `None` = formula proven un-certifiable.
+        return cached.map(|parts| restamp_cleancic(&parts, identity));
+    }
+    // Serialize top-level misses for this formula only. A waiter rechecks the
+    // memo after acquiring ownership; a pure answer needs no second search.
+    // Recursive searches keep the old non-waiting behavior to avoid cycles.
+    let flight = (!IN_MEMO_PRODUCER.with(std::cell::Cell::get)).then(|| MemoFlight::acquire(&key));
+    let _ownership = flight
+        .as_ref()
+        .map(|flight| flight.serial.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    if let Some(cached) = certify_memo_lookup(&key) {
+        return cached.map(|parts| restamp_cleancic(&parts, identity));
+    }
+    // No global memo or flight-map lock is held while proving. Distinct
+    // formulas can run concurrently, and unwinding releases this ownership.
+    let _producer = MemoProducerScope::set(true);
+    let outcome = produce();
+    certify_memo_store(key, &outcome);
+    outcome.into_evidence()
+}
+
+#[cfg(test)]
+mod memo_concurrency_tests;
+
+/// Clear the certificate memo, so a test can compare a fresh run with a lane.
+#[cfg(test)]
+pub(crate) fn reset_certify_memo() {
     if let Ok(mut memo) = certify_memo().lock() {
         memo.clear();
     }
 }
 
-/// Max number of distinct-formula entries retained by the certificate memo.
-/// Default 200_000; override with `TRUST_CERTIFY_MEMO_CAP=<n>`.
-fn certify_memo_cap() -> usize {
-    std::env::var("TRUST_CERTIFY_MEMO_CAP")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(200_000)
+/// Stack for one certification. The well-sortedness gate, the conjunct
+/// normalizer and several lanes recurse to the depth of the violation, and the
+/// lanes' kernel checks recurse to the depth of their proof terms — a
+/// 40-deep `Add` chain already overflows a 2 MiB thread in a debug build, and
+/// a process abort is not a verdict. Same 256 MiB precedent as the router's
+/// `bvmul` lane; the memory is reserved, not committed.
+const CERTIFY_STACK_BYTES: usize = 256 * 1024 * 1024;
+
+/// Violations nested deeper than this are declined before any recursive gate
+/// touches them — deeper than anything a compiler emits, and far deeper than
+/// a default 8 MiB main thread ever survived, so no previously-certifiable
+/// obligation is affected. Measured iteratively.
+const MAX_VIOLATION_DEPTH: usize = 2048;
+
+/// Maximum formula depth safe to serialize (`bincode`) directly on a default
+/// 2 MiB caller thread (same measured 64-level cap as
+/// [`NATIVE_PLANNING_MAX_RECORD_FORMULA_DEPTH`]).
+pub(crate) const SHALLOW_CALLER_STACK_MAX_DEPTH: usize = NATIVE_PLANNING_MAX_RECORD_FORMULA_DEPTH;
+
+thread_local! {
+    /// True while executing inside an active [`on_certify_stack`] 256 MiB frame.
+    pub(crate) static ON_CERTIFY_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct CertifyStackScope(bool);
+
+impl CertifyStackScope {
+    fn enter() -> Self {
+        Self(ON_CERTIFY_STACK.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for CertifyStackScope {
+    fn drop(&mut self) {
+        ON_CERTIFY_STACK.with(|flag| flag.set(self.0));
+    }
+}
+
+fn formula_depth_within_gate<'a>(
+    formula: &'a Formula,
+    pending: &mut Vec<(&'a Formula, usize)>,
+) -> Option<usize> {
+    let mut deepest = 0usize;
+    pending.clear();
+    pending.push((formula, 1));
+    while let Some((f, depth)) = pending.pop() {
+        if depth > MAX_VIOLATION_DEPTH {
+            pending.clear();
+            return None;
+        }
+        deepest = deepest.max(depth);
+        trust_types::for_each_formula_child(f, |c| pending.push((c, depth + 1)));
+    }
+    Some(deepest)
+}
+
+/// The iterative depth gate for a formula-only entry point. Cheap and
+/// non-recursive, so it is the ONE thing that runs on the caller's (possibly
+/// 2 MiB) thread before [`on_certify_stack`] takes over.
+fn violation_within_depth_gate(violation: &Formula) -> bool {
+    let mut pending = Vec::new();
+    formula_depth_within_gate(violation, &mut pending).is_some()
+}
+
+pub(crate) fn vc_max_depth_within_gate(vc: &VerificationCondition) -> Option<usize> {
+    let mut max_depth = 0usize;
+    let mut pending = Vec::new();
+    all_vc_formulas(vc, |formula| match formula_depth_within_gate(formula, &mut pending) {
+        Some(depth) => {
+            max_depth = max_depth.max(depth);
+            true
+        }
+        None => false,
+    })
+    .then_some(max_depth)
+}
+
+/// The depth gate for a full obligation: every `Formula`
+/// `bincode::serialize(vc)` recurses into — the violation, and the
+/// authenticated-obligation record's body, subject and wrapper facts/guards —
+/// must pass, since [`ObligationIdentity::from_vc`] serializes them all.
+/// Exhaustive over the wrapper vocabulary so a new formula-bearing variant is a
+/// compile error here, not a stack overflow.
+fn vc_within_depth_gate(vc: &VerificationCondition) -> bool {
+    vc_max_depth_within_gate(vc).is_some()
+}
+
+/// Visit every `Formula` a full obligation carries — the violation, and the
+/// authenticated-obligation record's body, subject and wrapper facts/guards:
+/// exactly the set `bincode::serialize(vc)` recurses into — without heap-allocating
+/// a temporary formula list. Exhaustive over the wrapper vocabulary so a new
+/// formula-bearing variant is a compile error here, not a stack overflow in a
+/// caller that forgot to bound it.
+fn all_vc_formulas<'a>(
+    vc: &'a VerificationCondition,
+    mut check: impl FnMut(&'a Formula) -> bool,
+) -> bool {
+    use trust_types::{ObligationWrapper, PathGuardTerm};
+    if !check(&vc.formula) {
+        return false;
+    }
+    if let Some(record) = &vc.obligation {
+        if !check(&record.body) {
+            return false;
+        }
+        if let Some(subject) = &record.subject
+            && !check(subject)
+        {
+            return false;
+        }
+        for wrapper in &record.wrappers {
+            match wrapper {
+                ObligationWrapper::ConjoinFactsLast { facts } => {
+                    if !facts.iter().all(&mut check) {
+                        return false;
+                    }
+                }
+                ObligationWrapper::PathGuardOr { paths } => {
+                    for path in paths {
+                        match path {
+                            PathGuardTerm::Raw | PathGuardTerm::Collapsed => {}
+                            PathGuardTerm::Guarded { guards } => {
+                                if !guards.iter().all(&mut check) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Run `work` on the dedicated [`CERTIFY_STACK_BYTES`] thread and hand back
+/// its answer. EVERY public entry point routes all of its recursive work —
+/// identity construction, normalization, the lanes, the kernel checks, the
+/// consumer-side regeneration — through here, after its iterative depth gate,
+/// so nothing recursive ever runs on a small caller stack. A thread that cannot
+/// be spawned, or one that panics, is a decline (`None`) — fail closed.
+///
+/// A stop the work recorded on its thread ([`note_certify_stop`]) is recorded
+/// on the caller's thread too, so a run that consumed it is never memoized.
+fn on_certify_stack<T: Send>(work: impl FnOnce() -> Option<T> + Send) -> Option<T> {
+    on_stack_carrying_stop("trust-certify", CERTIFY_STACK_BYTES, || {
+        let _on_stack = CertifyStackScope::enter();
+        work()
+    })
+}
+
+/// Run `work` in-place when [`ON_CERTIFY_STACK`] is already active (scoping
+/// [`RUN_STOP`] and propagating budget exhaustion identically to a worker hop),
+/// or hop to [`on_certify_stack`] when called from an ordinary thread.
+pub(crate) fn on_certify_stack_if_needed<T: Send>(
+    work: impl FnOnce() -> Option<T> + Send,
+) -> Option<T> {
+    if ON_CERTIFY_STACK.with(std::cell::Cell::get) {
+        return with_stop_scope(work).0;
+    }
+    on_certify_stack(work)
+}
+
+/// Run `work` on a dedicated thread named `name` with a stack of
+/// `stack_bytes`, and carry the stop it recorded back to this thread.
+///
+/// [`RUN_STOP`] is thread-local, so a stop recorded on a worker thread and not
+/// carried back is lost when the thread exits: the enclosing run would see no
+/// stop and memoize an answer a clock or budget shaped (plan P4, T4.2). Every
+/// certification lane that leaves its thread goes through this function (the
+/// certification stack, the linear-REAL lane, the checker-core kernel stack).
+/// A thread that cannot be spawned, or that panics, finished no run, so it is
+/// recorded as a stop as well (`solver-fault`, which is never reproducible)
+/// and the answer is `None`: a resource failure is never memoized as a
+/// decline. The caller's original verification budget is borrowed across the
+/// synchronous hop, including consumed steps, first trip and nested-function
+/// clock credit; this never renews its deadline or grants a second allowance.
+pub(crate) fn on_stack_carrying_stop<T: Send>(
+    name: &str,
+    stack_bytes: usize,
+    work: impl FnOnce() -> Option<T> + Send,
+) -> Option<T> {
+    let in_memo_producer = IN_MEMO_PRODUCER.with(std::cell::Cell::get);
+    // The test-only heartbeat census rides the same hop as the stop.
+    #[cfg(test)]
+    let census = kernel_stop::census::Hop::leave();
+    let joined = trust_types::verify_budget::with_worker_budget(|budget| {
+        // The caller only spawns/joins while its function budget is borrowed.
+        // RAII returns consumed steps/trips even when the work panics, and a
+        // failed spawn leaves the original absolute deadline/count untouched.
+        std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new()
+                .name(name.to_string())
+                .stack_size(stack_bytes)
+                .spawn_scoped(scope, || {
+                    budget.run(|| {
+                        let _producer = MemoProducerScope::set(in_memo_producer);
+                        #[cfg(test)]
+                        census.arrive();
+                        let answer = work();
+                        if let Some(cause) = trust_types::verify_budget::exhaustion_cause() {
+                            note_certify_stop(cause);
+                        }
+                        #[cfg(test)]
+                        census.depart();
+                        (answer, RUN_STOP.with(std::cell::Cell::take))
+                    })
+                })
+                .ok()?;
+            handle.join().ok()
+        })
+    });
+    #[cfg(test)]
+    census.home();
+    let Some((answer, stop)) = joined else {
+        note_certify_stop(trust_types::determinism::StopCause::SolverFault);
+        return None;
+    };
+    if let Some(cause) = stop {
+        note_certify_stop(cause);
+    }
+    answer
 }
 
 /// Shared body of [`certify_vc`] / [`certify_violation`]: the violation formula
@@ -654,9 +1314,54 @@ fn certify_memo_cap() -> usize {
 /// above. The cache key is the formula's canonical serialization, not the
 /// lineage identity: a full-VC identity deliberately contains fields that do
 /// not affect the proof payload.
+///
+/// Trust (resource discipline): the depth gate and the dedicated large-stack
+/// thread wrap EVERY lane, so a hostile input is a decline, never an abort;
+/// nothing about any certificate's bytes changes. The public entry points do
+/// not call this: they build the identity INSIDE [`on_certify_stack`] too.
+/// This wrapper serves callers that already hold an identity (the synthesized
+/// sub-obligations of the BV/ITE lanes, tests).
 fn certify_with_identity(
     violation: &Formula,
     identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    let mut pending = Vec::new();
+    let max_depth = formula_depth_within_gate(violation, &mut pending)?;
+    if ON_CERTIFY_STACK.with(std::cell::Cell::get) {
+        return with_stop_scope(|| certify_with_identity_on_stack(violation, identity)).0;
+    }
+    if max_depth <= SHALLOW_CALLER_STACK_MAX_DEPTH {
+        let cache_key = build_certify_memo_key(violation);
+        if let Some(ref key) = cache_key
+            && let Some(cached) = certify_memo_lookup(key)
+        {
+            if let Some(cause) = trust_types::verify_budget::exhaustion_cause() {
+                note_certify_stop(cause);
+            }
+            return cached.map(|parts| restamp_cleancic(&parts, identity));
+        }
+        return on_certify_stack(move || {
+            certify_with_identity_and_key_on_stack(violation, identity, cache_key)
+        });
+    }
+    on_certify_stack(|| certify_with_identity_on_stack(violation, identity))
+}
+
+fn certify_with_identity_on_stack(
+    violation: &Formula,
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    if !branch_clamp::formula_is_well_sorted_bool(violation) {
+        return None;
+    }
+    let cache_key = build_certify_memo_key(violation);
+    certify_with_prechecked_bool_and_key_on_stack(violation, identity, cache_key)
+}
+
+fn certify_with_identity_and_key_on_stack(
+    violation: &Formula,
+    identity: &ObligationIdentity,
+    cache_key: Option<Vec<u8>>,
 ) -> Option<trust_ir::ProofEvidence> {
     // Certificate recognizers reason about a typed Boolean proposition.  The
     // ordinary compiler producer emits well-sorted formulas, but this crate's
@@ -667,37 +1372,44 @@ fn certify_with_identity(
     if !branch_clamp::formula_is_well_sorted_bool(violation) {
         return None;
     }
-
-    if !certify_memo_enabled() {
-        return certify_with_identity_uncached(violation, identity);
-    }
-    let Ok(cache_key) = bincode::serialize(violation) else {
-        // Serialization failure must cost only the optimization, never proof
-        // availability. The uncached producer still binds `identity` exactly.
-        return certify_with_identity_uncached(violation, identity);
-    };
-    if let Some(cached) = certify_memo_lookup(&cache_key) {
-        // HIT: reuse the identity-independent payload, recompute this
-        // obligation's lineage. `None` = formula proven un-certifiable.
-        return cached.map(|parts| restamp_cleancic(&parts, identity));
-    }
-    // MISS: run the full producer (no lock held), then record the result.
-    let result = certify_with_identity_uncached(violation, identity);
-    certify_memo_store(cache_key, &result);
-    result
+    certify_with_prechecked_bool_and_key_on_stack(violation, identity, cache_key)
 }
 
-/// The uncached certificate producer. See [`certify_with_identity`] for the
-/// memoization wrapper and its soundness argument.
+fn certify_with_prechecked_bool_and_key_on_stack(
+    violation: &Formula,
+    identity: &ObligationIdentity,
+    cache_key: Option<Vec<u8>>,
+) -> Option<trust_ir::ProofEvidence> {
+    // KR0 switch: the key names the reference theory and the carrier entries'
+    // environment digests, so a cached payload and its reference certificate
+    // are served only under the theory and environments they were checked in.
+    let Some(cache_key) = cache_key else {
+        // Serialization failure must cost only the optimization, never proof
+        // availability. The uncached producer still binds `identity` exactly.
+        return certify_with_identity_uncached(violation, identity).into_evidence();
+    };
+    certify_memoized(cache_key, identity, || certify_with_identity_uncached(violation, identity))
+}
+
+/// The uncached certificate producer, and whether a clock or budget stopped
+/// any of its work. See [`certify_with_identity`] for the memoization wrapper
+/// and its soundness argument.
 fn certify_with_identity_uncached(
     violation: &Formula,
     identity: &ObligationIdentity,
+) -> CertifyOutcome {
+    let (evidence, stop) = with_stop_scope(|| certify_lanes(violation, identity));
+    CertifyOutcome::of(evidence, stop)
+}
+
+/// Every certification lane, in order; the first to certify wins.
+fn certify_lanes(
+    violation: &Formula,
+    identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
-    // Opt-in violation dump (AY_CERT_DUMP=1) for fast certify-shape discovery; the
-    // env gate means zero output in normal verification.
-    if std::env::var("AY_CERT_DUMP").is_ok_and(|v| v == "1") {
-        eprintln!("[CERTDUMP] {violation:?}");
-    }
+    // The violation each certification attempt sees, for certify-shape
+    // discovery (`RUSTC_LOG=trust_certify::violation=debug`).
+    tracing::debug!(target: "trust_certify::violation", "[CERTDUMP] {violation:?}");
     // 1. Normalize the violation into the supported conjunct pool (recursive-And
     //    split, vacuous-`Bool(true)` drop, entailed-atom derivation, spent-
     //    reification drop) — single-sourced with `recheck_cleancic` via
@@ -724,13 +1436,14 @@ fn certify_with_identity_uncached(
         return Some(evidence);
     }
 
-    // Signed wide-BV add/sub no-overflow (`i128`/widened): the BV overflow check
-    // `BvAdd(x,y,w)` / `BvSub(x,y,w)` is bounded by signed-BV guards (`BvSLt`/
-    // `BvSLe`) or by 64→128 sign-extensions, and the carry-bit overflow disjunction
-    // asserts the signed result is outside `[i_w_min, i_w_max]`. Translate the BV
-    // shape into an equivalent linear-Int violation (bounds + `Or([x±y<min,
-    // x±y>max])`) and hand it to the existing disjunctive/additive-lift refutation.
-    // Tried BEFORE the generic disjunctive path: its `Or` operands are BV, not Int.
+    // Signed wide-BV add/sub no-overflow (`i128`/widened): the violation ASSERTS,
+    // as top-level conjuncts, the exact signed overflow predicate of a
+    // `BvAdd(x,y,w)` / `BvSub(x,y,w)` (the sign-bit test trust-vcgen emits), and
+    // the operands are bounded by top-level signed-BV guards (`BvSLt`/`BvSLe`) or
+    // by sign-extensions. Translate into the implied linear-Int violation (bounds +
+    // `Or([x±y<min, x±y>max])`) and hand it to the existing disjunctive/additive-
+    // lift refutation. Tried BEFORE the generic disjunctive path: its `Or`
+    // operands are BV, not Int.
     if let Some(evidence) = certify_signed_bv_overflow_safe(&conjuncts, identity) {
         return Some(evidence);
     }
@@ -854,6 +1567,19 @@ fn certify_with_identity_uncached(
         return Some(evidence);
     }
 
+    // The linear-REAL (QF_LRA) fragment: order atoms over `Sort::Real`
+    // variables with exact-rational `Rat` literals, refuted natively by an
+    // exact-rational Farkas replay over the kernel's quotient `Rat` (see
+    // `real_fragment`). Placed immediately before the Int lane: it returns
+    // `None` before any work unless a kept atom carries a Real leaf, and it
+    // refuses a pool mixing Int-sorted leaves in, so every Int certificate the
+    // producer already mints keeps its exact bytes. The Int lane's integer
+    // tightening must never see a Real system — `2x ≥ 1 ∧ 2x ≤ 1` is
+    // real-feasible — which is why this is a separate lane, not a widening.
+    if let Some(evidence) = real_fragment::certify_linear_real_fragment(&conjuncts, identity) {
+        return Some(evidence);
+    }
+
     // The generic linear-Int fragment path (atom collection, interval / chain /
     // Farkas refutation, then the full ay-solve + zero-trust reconstruction).
     // Extracted verbatim so a LAST-RESORT lane can run after it without
@@ -949,7 +1675,208 @@ fn certify_with_identity_uncached(
         return Some(evidence);
     }
 
+    // LAST OF ALL: the SINGLETON-DISJUNCTION retry — the a7 per-path
+    // postcondition row. See [`certify_singleton_disjunction_retry`] for the
+    // measurement that motivates it and the soundness argument. Runs after every
+    // other lane and only when the pool carries no disjunction at all, so no
+    // certificate this producer already mints changes shape or bytes.
+    if let Some(evidence) = certify_singleton_disjunction_retry(violation, &propositional, identity)
+    {
+        return Some(evidence);
+    }
+
+    // AFTER EVERYTHING: the KERNEL-CHECKED REWRITING lane
+    // ([`rewrite_eval`]). Its hypotheses are the violation's own top-level
+    // conjuncts (no normalization step is read); alias and Bool-definition
+    // conjuncts (`_2 = bit`, `_3 ⟺ a`, `_2 ⟺ b < 64`) are eliminated by
+    // `Eq.subst` INSIDE the re-checked term, and the rewritten facts are closed
+    // by propositional evaluation with a proof for every step. This is the
+    // shape PRE-optimization MIR gives every D5-B helper (measured 2026-09-25:
+    // `guard`'s `_2 = copy _1` temporary declined every lane above). Runs last
+    // and only when every lane above declined, so no certificate this producer
+    // already mints changes shape or bytes.
+    if let Some(evidence) = rewrite_eval::certify_rewrite_evaluation(violation, identity) {
+        return Some(evidence);
+    }
+
+    // AFTER THE REWRITING LANE: a VARIABLE-FREE disjunction (the core of a
+    // constant operand pair's overflow check, `Or([64 - 8 < 0, 64 - 8 > MAX])`)
+    // refuted against the violation's VARIABLE-FREE conjuncts only — the shape
+    // the disjunctive lane above loses once the surrounding type-range facts
+    // push its augmented edge set past the 48-edge cap. See
+    // [`certify_closed_disjunction_in_closed_context`] for the measurement and
+    // the soundness argument. Runs after every lane above and is inert unless an
+    // open conjunct was dropped, so no certificate this producer already mints
+    // changes shape or bytes.
+    if let Some(evidence) = certify_closed_disjunction_in_closed_context(&conjuncts, identity) {
+        return Some(evidence);
+    }
+
+    // AFTER THE CLOSED-CONTEXT LANE: the disjunctive refutation against a context ball
+    // of bounded variable distance — the guard one alias step away whose
+    // connected component is past the 48-edge cap (TRUST-KI-1014-1, aterm-codec
+    // `inflate.rs:911`). See [`certify_disjunctive_contradiction_in_distance_balls`]
+    // and [`context_within_var_distance`]. A variable-free disjunction has no ball, so
+    // the two lanes reach disjoint candidates. Runs after every lane above, so no
+    // certificate this producer already mints changes shape or bytes.
+    if let Some(evidence) =
+        certify_disjunctive_contradiction_in_distance_balls(&conjuncts, identity)
+    {
+        return Some(evidence);
+    }
+
+    // LAST OF ALL: the LARGE-POOL ORDER CHAIN ([`large_order_chain`]). The
+    // exhaustive chain DFS refuses a lifted edge set above
+    // [`CHAIN_DFS_MAX_EDGES`]; this lane selects one conflicting chain from such
+    // a set by a polynomial breadth-first search and folds it with the same
+    // transitivity lemmas. Measured 2026-10-14 (TRUST-KI-1014-1, aterm-codec
+    // `tty.rs:141`): a 66-atom slice-bounds pool whose contradiction is the
+    // three-edge chain `7 ≤ held ≤ _10 ≤ 3` declined every lane above — 69
+    // edges for the DFS, and no closed term from ay's proof even at an
+    // unlimited trust budget. Runs only when every lane above declined and
+    // only on a set the DFS refused, so no certificate this producer already
+    // mints changes shape or bytes.
+    if let Some(evidence) =
+        large_order_chain::certify_large_order_chain_contradiction(&conjuncts, identity)
+    {
+        return Some(evidence);
+    }
+
+    // AFTER THE LARGE-POOL CHAIN: the ELEMENT-READ CONGRUENCE (VGAPS-G1C,
+    // [`element_congruence`]). A row trust-vcgen proved through
+    // `Or([Not(Eq(_8, _12)), Eq(a*[_8], a*[_12])])` is refuted by `Or.rec` over that
+    // fact, the index-disequality branch closed by `Int.le_antisymm` from context
+    // edges. Inert unless a candidate `Or` carries a variable `Not(Eq)` disjunct,
+    // and last, so no certificate this producer already mints changes shape or bytes.
+    if let Some(evidence) =
+        element_congruence::certify_element_congruence_disjunction(&conjuncts, identity)
+    {
+        return Some(evidence);
+    }
+
+    // Final retry: evaluate closed additions exposed by SSA equality rewriting.
+    // All prior lanes keep their position and certificate bytes. This retry
+    // keeps the original hypotheses/encodings and builds a kernel-checked term;
+    // arithmetic evaluation only selects witnesses and equality representatives.
+    if let Some(evidence) =
+        rewrite_eval::certify_rewrite_evaluation_with_closed_additions(violation, identity)
+    {
+        return Some(evidence);
+    }
+
+    // Refute every original path with the existing equality-rewriting engine,
+    // then join the independently constructed branch proofs with Or.rec.
+    // Kept last so previously minted terms and replay contexts remain unchanged.
+    if let Some(evidence) = rewrite_eval::certify_rewrite_path_disjunction(violation, identity) {
+        return Some(evidence);
+    }
+
+    // Equality-only BV abstraction after all existing families: no arithmetic
+    // interpretation and no change to an existing certificate's shape/bytes.
+    if let Some(evidence) = bv_equality::certify(violation, identity) {
+        return Some(evidence);
+    }
+
     None
+}
+
+/// LAST-RESORT: re-present a FLAT violation to the disjunctive engine as a
+/// ONE-ARM disjunction.
+///
+/// # The measurement (2026-09-20, packed `trustc 1.99.0-dev (379912412)`)
+///
+/// `tests/ui/trust/postcondition_composition_at_call_site.rs`'s `clamp_low`
+/// — `if x < 0 { 0 } else if x > 1000000 { 1000000 } else { x }` under
+/// `ensures result >= 0 && result <= 1000000` — was the ONE measured cost of the
+/// a7 per-path postcondition split (`docs/STRICT_VERIFICATION_FRAGMENT.md`
+/// §19.3, RULING C): before the split its merged `Or` row was kernel-certified
+/// and after it no row is.
+///
+/// RULING C names the cause as "trust-mc PDR answers first, so the kernel
+/// re-check never runs". **That is measurably false, and the real cause is
+/// here.** `certify_all` in `trust_verify.rs` calls [`certify_vc`] on EVERY
+/// `Proved` row regardless of which engine proved it, and `TRUST_CERTIFY_TRACE`
+/// shows all three split rows entering this producer and missing. Feeding the
+/// three real emitted formulas to this crate directly:
+///
+/// ```text
+/// row (flat, per-path)     certify_vc = false    certify_violation(Or([f])) = true
+/// row (merged `Or`, cap=1) certify_vc = true
+/// ```
+///
+/// The flat `x < 0` row was ALREADY uncertified before the split (measured at
+/// `POSTCONDITION_PATH_SPLIT_CAP = 1`), so the split did not break a working
+/// lane; it replaced the one shape this producer could reach with three of a
+/// shape it could not.
+///
+/// # Why the wrap is the whole fix
+///
+/// The contradiction in a per-path postcondition row lives in a NEGATED
+/// CONJUNCTION — `Not(And([Ge(_0, 0), Le(_0, 1000000)]))` — whose leaves are not
+/// themselves present in the pool, so `certify_propositional_closure_contradiction`
+/// declines, and which `collect_supported_atoms` drops outright, so
+/// `certify_linear_int_fragment` never sees the contradiction at all. The ONE
+/// lane that can split such a conjunct is `distribute_negated_conjunctions`, and
+/// it is reachable only from [`certify_disjunctive_contradiction`], which returns
+/// `None` at its `or_candidates.is_empty()` gate on a flat pool. The merged `Or`
+/// row cleared that gate; a flat per-path row cannot.
+///
+/// # Soundness
+///
+/// `Or([F])` is `F` — a one-element disjunction, not a weakening. Three facts
+/// make that more than a slogan here:
+///
+/// * The KERNEL STATEMENT carries no wrapper: [`build_or_prop`] returns the arm's
+///   own proposition unchanged for a one-element list, so the term this lane
+///   emits proves `False` from `F`'s own hypotheses, exactly as any other lane's
+///   does. Nothing named `Or` appears in it.
+/// * The engine is unchanged and still fail-closed: every rung inside
+///   [`certify_disjunctive_contradiction`] ends at `finish_certificate`, whose ay
+///   UNSAT gate and clean-kernel re-check a satisfiable violation cannot pass.
+///   A genuinely-false postcondition row stays uncertified — that is the
+///   `false_twin` fixture's job, not this comment's.
+/// * `identity` is the ORIGINAL row's, threaded through untouched, so the
+///   lineage digest binds the certificate to the obligation actually being
+///   discharged and never to the wrapped formula.
+///
+/// `recheck_cleancic_with_identity` regenerates through this same producer from
+/// the same original violation, so producer and consumer stay byte-identical.
+///
+/// # Cost
+///
+/// Two gates keep this off the hot path. It is the LAST rung, so only a row that
+/// every other lane already declined can reach it; and it declines immediately
+/// unless the pool is disjunction-free AND carries a top-level negated
+/// conjunction, which is the only thing the disjunctive engine can do that the
+/// flat lanes cannot. The work it then does is the existing engine's, under the
+/// existing `MAX_ARMS` / `MAX_EDGE_SET` / `MAX_DFS_INSPECTIONS` caps, and the
+/// certify memo means a repeated identical formula pays once.
+fn certify_singleton_disjunction_retry(
+    violation: &Formula,
+    propositional: &[&Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    // A pool that already carries a disjunction was ALREADY offered to
+    // `certify_disjunctive_contradiction` above with that disjunction as the
+    // candidate. Wrapping again would only nest a second `Or` around it, which
+    // the arm parser cannot read — measured: re-wrapping the merged `clamp_low`
+    // row turns a certified row into an uncertified one. Decline, so this lane
+    // can never subtract from what the producer already reaches.
+    if propositional.iter().any(|c| matches!(c, Formula::Or(_))) {
+        return None;
+    }
+    // The negated conjunction is the whole reason to come here. Without one, the
+    // disjunctive engine has no distribution step to offer that the lanes above
+    // have not already tried, and this rung would be pure cost.
+    if !propositional
+        .iter()
+        .any(|c| matches!(c, Formula::Not(inner) if matches!(inner.as_ref(), Formula::And(_))))
+    {
+        return None;
+    }
+    let wrapped = Formula::Or(vec![violation.clone()]);
+    let normalized = normalize_violation(&wrapped)?;
+    certify_disjunctive_contradiction(&normalized.view(), identity)
 }
 
 /// The generic linear-integer fragment certificate path: keep the conjuncts
@@ -992,10 +1919,25 @@ fn certify_linear_int_fragment(
         }
     }
 
-    // 3. Build the kernel environment: Int arithmetic + ordering lemmas, plus an
-    //    axiom per free variable. (init_int_ord_lemmas transitively provides
-    //    False/Not/Eq/Int/LT.lt, mirroring clean-auto's QF_LIA fixture.)
-    let env = build_env(&var_names)?;
+    // 2b. Resource gate 1 of 2 for steps 3–5 (the ay solve and the clean_auto
+    //     reconstruction; see `reconstruction_scale`): a pool whose coefficient
+    //     product could demand a Farkas multiplier past
+    //     `AY_RECONSTRUCTION_MAX_COEFFICIENT` declines here, before the solve.
+    //     Every lane above has already had its turn.
+    let scale = reconstruction_scale::pool_coefficient_scale(&atoms);
+    if scale > reconstruction_scale::AY_RECONSTRUCTION_MAX_COEFFICIENT {
+        reconstruction_scale::note_decline("pool", scale, &var_names);
+        return None;
+    }
+
+    // 3. Pre-validate that every free variable's encoded skolem name is fresh in
+    //    the Int base environment and pairwise distinct before invoking ay;
+    //    defer cloning the full standard-library `Environment` until ay refutes
+    //    the system and reconstruction succeeds (and borrow `&'static` directly
+    //    when `var_names` is empty).
+    if !Carrier::Int.admits_skolems(&var_names) {
+        return None;
+    }
 
     // 4. Drive the in-process ay solver on exactly these assertions.
     let mut backend = AyProofBackend::new_with_proofs(AyLogic::QfLia);
@@ -1027,11 +1969,24 @@ fn certify_linear_int_fragment(
     // drops at the end of this block — BEFORE the clean-kernel reconstruction /
     // re-check below, which is thread-safe by construction and must stay unlocked
     // so it parallelizes across verification threads.
-    match {
+    let answer = {
         let _ay_guard = trust_types::ay_exec_lock().lock().unwrap_or_else(|e| e.into_inner());
         backend.check_sat()
-    } {
-        Ok(AyProofResult::Unsat { .. }) => {}
+    };
+    note_ay_answer(&answer);
+    match answer {
+        Ok(AyProofResult::Unsat { proof, .. }) => {
+            // 4a. Resource gate 2 of 2: ay's own certificate. The clean_auto
+            //     closeout walks `Σ kᵢ·|boundᵢ|` additive leaves for each Farkas
+            //     step; read the multipliers ay chose off its rendering and
+            //     decline past `AY_RECONSTRUCTION_MAX_CLOSEOUT_LEAVES`, before
+            //     the walk can start (`reconstruction_scale`).
+            let leaves = reconstruction_scale::closeout_leaves(proof.as_deref());
+            if leaves > reconstruction_scale::AY_RECONSTRUCTION_MAX_CLOSEOUT_LEAVES {
+                reconstruction_scale::note_decline("certificate", leaves, &var_names);
+                return None;
+            }
+        }
         _ => return None, // SAT / Unknown / solver error → cannot certify
     }
 
@@ -1046,11 +2001,13 @@ fn certify_linear_int_fragment(
         return None;
     }
 
+    let audited_env = AuditedCarrierEnv::build(Carrier::Int, &var_names)?;
+
     // 6. The local context the refutation lives in: one decl per hypothesis.
     let ctx = build_ctx(&hyps);
 
     // Gate (e): full kernel re-check that the reconstructed term : False.
-    if !kernel_checks_false(&env, ctx.clone(), candidate.refutation(), &var_names) {
+    if !audited_env.kernel_checks_false(ctx.clone(), candidate.refutation(), &var_names) {
         return None;
     }
 
@@ -1060,19 +2017,29 @@ fn certify_linear_int_fragment(
     let context_bytes = serialize_context(&reduced).ok()?;
 
     // Defense in depth: the *serialized* payload must independently re-check
-    // after a full round-trip (this is what an external consumer would do).
-    if !payload_roundtrip_rechecks(&var_names, &term_bytes, &context_bytes) {
-        return None;
-    }
+    // after a full round-trip (reusing the immutable `audited_env` and reusing
+    // the decoded `(term, reduced)` for KR0 reference checking).
+    let (roundtrip_term, roundtrip_reduced) =
+        audited_env.recheck_roundtrip(&var_names, &term_bytes, &context_bytes)?;
 
     // 8. Bind term+context+obligation-identity with a lineage digest and emit.
     let lineage = lineage_digest(&term_bytes, &context_bytes, identity);
-    Some(trust_ir::ProofEvidence::CleanCic {
+    register_reference_refutation_decoded(
+        Carrier::Int,
+        &var_names,
+        &term_bytes,
+        &context_bytes,
+        &lineage,
+        &roundtrip_term,
+        roundtrip_reduced,
+    );
+    let evidence = trust_ir::ProofEvidence::CleanCic {
         term: term_bytes,
         context: context_bytes,
         lineage,
         kernel_recheck: None,
-    })
+    };
+    Some(evidence)
 }
 
 /// The conjunct-normalization pipeline shared by the certificate PRODUCER
@@ -1158,6 +2125,113 @@ const NORMALIZATION_STEPS: [fn(&[&Formula]) -> Vec<Formula>; 15] = [
     unfold_asserted_bool_reifications_late,
 ];
 
+/// Shallow top-level conjunct flags tracked incrementally across `base` and
+/// `pool` in [`normalize_violation`] so each of the 15 [`NORMALIZATION_STEPS`]
+/// is skipped in `O(1)` when none of its trigger shapes exist, and the borrowed
+/// `view: Vec<&Formula>` slice is rebuilt only after a step actually emits new
+/// conjuncts.
+#[derive(Default, Clone, Copy)]
+struct NormSurface {
+    has_bool_eq_def: bool,
+    has_bool_var_lit: bool,
+    has_int_var_const_eq: bool,
+    has_int_var_var_eq: bool,
+    has_int_var_var_neq: bool,
+    has_lt_or_gt: bool,
+    has_int_le_or_ge: bool,
+    has_or: bool,
+    has_implies: bool,
+    has_eq_rem: bool,
+    has_eq_div: bool,
+    has_eq_bv_to_int: bool,
+    has_const_arith_redex: bool,
+}
+
+impl NormSurface {
+    fn observe(&mut self, c: &Formula) {
+        if !self.has_const_arith_redex && formula_has_const_arith_redex(c) {
+            self.has_const_arith_redex = true;
+        }
+        match c {
+            Formula::Var(_, Sort::Bool) => self.has_bool_var_lit = true,
+            Formula::Not(inner) => match inner.as_ref() {
+                Formula::Var(_, Sort::Bool) => self.has_bool_var_lit = true,
+                Formula::Eq(a, b)
+                    if matches!(
+                        (a.as_ref(), b.as_ref()),
+                        (Formula::Var(_, Sort::Int), Formula::Var(_, Sort::Int))
+                    ) =>
+                {
+                    self.has_int_var_var_neq = true;
+                }
+                _ => {}
+            },
+            Formula::Eq(a, b) => {
+                if matches!(a.as_ref(), Formula::Var(_, Sort::Bool))
+                    || matches!(b.as_ref(), Formula::Var(_, Sort::Bool))
+                {
+                    self.has_bool_eq_def = true;
+                }
+                match (a.as_ref(), b.as_ref()) {
+                    (Formula::Var(_, Sort::Int), Formula::Int(_))
+                    | (Formula::Int(_), Formula::Var(_, Sort::Int)) => {
+                        self.has_int_var_const_eq = true;
+                    }
+                    (Formula::Var(_, Sort::Int), Formula::Var(_, Sort::Int)) => {
+                        self.has_int_var_var_eq = true;
+                    }
+                    (leaf, Formula::Rem(..)) | (Formula::Rem(..), leaf)
+                        if int_var_name_str(leaf).is_some() =>
+                    {
+                        self.has_eq_rem = true;
+                    }
+                    (leaf, Formula::Div(..)) | (Formula::Div(..), leaf)
+                        if int_var_name_str(leaf).is_some() =>
+                    {
+                        self.has_eq_div = true;
+                    }
+                    (Formula::Var(_, Sort::Int), Formula::BvToInt(.., false))
+                    | (Formula::BvToInt(.., false), Formula::Var(_, Sort::Int)) => {
+                        self.has_eq_bv_to_int = true;
+                    }
+                    _ => {}
+                }
+            }
+            Formula::Lt(..) | Formula::Gt(..) => self.has_lt_or_gt = true,
+            Formula::Le(a, b) | Formula::Ge(a, b) => {
+                if matches!(
+                    (a.as_ref(), b.as_ref()),
+                    (Formula::Var(_, Sort::Int), Formula::Int(_))
+                        | (Formula::Int(_), Formula::Var(_, Sort::Int))
+                ) {
+                    self.has_int_le_or_ge = true;
+                }
+            }
+            Formula::Or(_) => self.has_or = true,
+            Formula::Implies(..) => self.has_implies = true,
+            _ => {}
+        }
+    }
+}
+
+const NORMALIZATION_STEP_GATES: [fn(&NormSurface) -> bool; 15] = [
+    |s| s.has_bool_eq_def && s.has_bool_var_lit, // 0: unfold_asserted_bool_reifications
+    |s| s.has_int_var_const_eq,                  // 1: propagate_constant_equalities
+    |s| s.has_lt_or_gt,                          // 2: tighten_strict_int_bounds
+    |s| s.has_or,                                // 3: membership_interval_bounds
+    |s| s.has_implies,                           // 4: discharge_entailed_implications
+    |s| s.has_const_arith_redex,                 // 5: fold_constant_arith_conjuncts
+    |s| s.has_eq_rem,                            // 6: modulo_range_bounds
+    |s| s.has_eq_div,                            // 7: division_range_bounds
+    |s| s.has_or,                                // 8: extract_disjunction_common_conjuncts
+    |s| s.has_int_var_var_eq && s.has_int_le_or_ge, // 9: propagate_equality_class_bounds
+    |s| s.has_int_var_var_eq && s.has_int_var_var_neq, // 10: complete_class_disequalities
+    |s| s.has_eq_bv_to_int,                      // 11: bv_mask_shift_rewrites
+    |s| s.has_eq_rem,                            // 12: modulo_range_bounds_late
+    |s| s.has_eq_div,                            // 13: division_range_bounds_late
+    |s| s.has_bool_eq_def && s.has_bool_var_lit, // 14: unfold_asserted_bool_reifications_late
+];
+
 /// Owned result of [`normalize_violation`]: `base` borrows the violation's own
 /// conjuncts, `pool` owns every derived (entailed) atom.
 struct NormalizedConjuncts<'a> {
@@ -1171,12 +2245,10 @@ impl NormalizedConjuncts<'_> {
     /// Dropping conjuncts is sound for a refutation — it can only weaken the
     /// system, so a SAT obligation stays SAT and fails closed.
     fn view(&self) -> Vec<&Formula> {
-        self.base
-            .iter()
-            .copied()
-            .chain(self.pool.iter())
-            .filter(|c| !is_bool_reification_conjunct(c))
-            .collect()
+        let mut out = Vec::with_capacity(self.base.len() + self.pool.len());
+        out.extend(self.base.iter().copied().filter(|c| !is_bool_reification_conjunct(c)));
+        out.extend(self.pool.iter().filter(|c| !is_bool_reification_conjunct(c)));
+        out
     }
 
     /// The conjunct view WITHOUT the spent-Bool-reification filter, for the
@@ -1192,13 +2264,17 @@ impl NormalizedConjuncts<'_> {
     /// [`NORMALIZATION_STEPS`], so a satisfiable obligation stays satisfiable
     /// and still fails closed.
     fn propositional_view(&self) -> Vec<&Formula> {
-        self.base.iter().copied().chain(self.pool.iter()).collect()
+        let mut out = Vec::with_capacity(self.base.len() + self.pool.len());
+        out.extend_from_slice(&self.base);
+        out.extend(self.pool.iter());
+        out
     }
 }
 
 /// Split the violation into conjuncts (recursive And), drop vacuous
 /// `Bool(true)` tautologies (they contribute nothing to a refutation but poison
-/// the fail-closed special-case paths), then run [`NORMALIZATION_STEPS`].
+/// the fail-closed special-case paths), expose asserted negated Boolean
+/// connectives, then run the unchanged [`NORMALIZATION_STEPS`].
 /// Returns `None` when no conjuncts survive — an empty system is vacuously SAT,
 /// so nothing may be certified or re-checked against it.
 fn normalize_violation(violation: &Formula) -> Option<NormalizedConjuncts<'_>> {
@@ -1208,22 +2284,112 @@ fn normalize_violation(violation: &Formula) -> Option<NormalizedConjuncts<'_>> {
     if base.is_empty() {
         return None;
     }
-    let mut pool: Vec<Formula> = Vec::new();
-    for step in NORMALIZATION_STEPS {
-        let view: Vec<&Formula> = base.iter().copied().chain(pool.iter()).collect();
-        pool.extend(step(&view));
+    let mut surface = NormSurface::default();
+    for &c in &base {
+        surface.observe(c);
+    }
+    let mut pool = negated_boolean_consequences(&base);
+    for c in &pool {
+        surface.observe(c);
+    }
+
+    let pool_len_at_reify_pass1 = pool.len();
+    let mut pool_len_at_mod_pass1 = pool.len();
+    let mut pool_len_at_div_pass1 = pool.len();
+
+    let mut cached_view: Option<Vec<&Formula>> = None;
+    for (idx, (step, gate)) in
+        NORMALIZATION_STEPS.into_iter().zip(NORMALIZATION_STEP_GATES).enumerate()
+    {
+        if idx == 6 {
+            pool_len_at_mod_pass1 = pool.len();
+        } else if idx == 7 {
+            pool_len_at_div_pass1 = pool.len();
+        }
+        if !gate(&surface) {
+            continue;
+        }
+        // Late second-pass emitters (indices 12, 13, 14) wrap deterministic
+        // pass-1 emitters with `retain_new_atoms`: when `pool` did not grow at
+        // or since pass 1, pass 1 already returned `[]` on the exact same view.
+        if (idx == 12 && pool.len() == pool_len_at_mod_pass1)
+            || (idx == 13 && pool.len() == pool_len_at_div_pass1)
+            || (idx == 14 && pool.len() == pool_len_at_reify_pass1)
+        {
+            continue;
+        }
+        let emitted = {
+            let view = cached_view.get_or_insert_with(|| {
+                let mut v = Vec::with_capacity(base.len() + pool.len());
+                v.extend_from_slice(&base);
+                v.extend(pool.iter());
+                v
+            });
+            step(view)
+        };
+        if !emitted.is_empty() {
+            cached_view = None;
+            for atom in &emitted {
+                surface.observe(atom);
+            }
+            pool.extend(emitted);
+        }
     }
     Some(NormalizedConjuncts { base, pool })
 }
 
+/// Expose only conjunctive consequences of an ASSERTED negated connective:
+/// `¬(a → b)` entails `a` and `¬b`, and `¬(a ∨ b)` entails `¬a` and `¬b`.
+/// Recursing through positive `And`, negative `Or`/`Implies`, and double
+/// negation keeps this linear in the input tree; it never distributes a
+/// disjunction, branches, or descends into an unasserted child.
+///
+/// This is trusted source-to-hypothesis normalization, like the entailed-atom
+/// passes below, not a kernel proof of the translation. The implication rule
+/// uses the source formula's classical Boolean semantics. Every emitted fact
+/// holds in every model of the original violation. The original conjuncts and
+/// obligation identity remain intact, and the consumer independently runs the
+/// same normalization before its kernel check and exact certificate comparison.
+fn negated_boolean_consequences(conjuncts: &[&Formula]) -> Vec<Formula> {
+    fn expose(formula: &Formula, negated: bool, out: &mut Vec<Formula>) {
+        match (formula, negated) {
+            (Formula::Not(inner), _) => expose(inner, !negated, out),
+            (Formula::And(children), false) | (Formula::Or(children), true) => {
+                for child in children {
+                    expose(child, negated, out);
+                }
+            }
+            (Formula::Implies(antecedent, consequent), true) => {
+                expose(antecedent, false, out);
+                expose(consequent, true, out);
+            }
+            (_, true) => out.push(Formula::Not(Box::new(formula.clone()))),
+            (Formula::Bool(true), false) => {}
+            (_, false) => out.push(formula.clone()),
+        }
+    }
+
+    let mut out = Vec::new();
+    for &conjunct in conjuncts {
+        if let Formula::Not(inner) = conjunct {
+            if matches!(inner.as_ref(), Formula::Implies(..) | Formula::Or(_)) {
+                expose(conjunct, false, &mut out);
+            }
+        }
+    }
+    out
+}
+
 /// Consumer-side re-check of a `CleanCic` certificate (the soundness gate for
-/// importing a CHC-discharged obligation). It independently regenerates the
-/// canonical evidence from this obligation, rerunning the applicable solver
-/// gate and clean-CIC kernel check, then requires exact term, context, and
+/// importing a CHC-discharged obligation). For normalized linear-Int and
+/// supported full-context primary disjunctive evidence, it reconstructs the
+/// current obligation's context and kernel-checks the presented term without
+/// rerunning proof search. Other families
+/// regenerate their canonical evidence and require exact term, context, and
 /// lineage equality. Presented `context_bytes` are never treated as authority.
 /// This pairs every producer family, including closed-constant, disjunctive,
 /// accumulator, bounded-sum, signed-BV/ITE, generic Farkas, and direct
-/// disequality lanes. Returns `true` only when canonical regeneration matches,
+/// disequality lanes. Returns `true` only after kernel checking and identity binding,
 /// so:
 ///  * a tampered/forged term fails the kernel check;
 ///  * a term that genuinely refutes a *different* contradiction over the same
@@ -1237,16 +2403,22 @@ pub fn recheck_cleancic(
     lineage: &trust_ir::ProofDigest,
     obligation_violation: &Formula,
 ) -> bool {
-    let Some(identity) = ObligationIdentity::from_violation(obligation_violation) else {
+    // Iterative depth gate on the caller's thread; the identity's serde
+    // recursion and the regeneration run on the large-stack thread.
+    if !violation_within_depth_gate(obligation_violation) {
         return false;
-    };
-    recheck_cleancic_with_identity(
-        term_bytes,
-        context_bytes,
-        lineage,
-        obligation_violation,
-        &identity,
-    )
+    }
+    on_certify_stack_if_needed(|| {
+        let identity = ObligationIdentity::from_violation(obligation_violation)?;
+        Some(recheck_cleancic_with_identity(
+            term_bytes,
+            context_bytes,
+            lineage,
+            obligation_violation,
+            &identity,
+        ))
+    })
+    .unwrap_or(false)
 }
 
 /// Consumer-side recheck paired with [`certify_vc`].  Unlike the legacy
@@ -1260,10 +2432,27 @@ pub fn recheck_vc_cleancic(
     lineage: &trust_ir::ProofDigest,
     vc: &VerificationCondition,
 ) -> bool {
-    let Some(identity) = ObligationIdentity::from_vc(vc) else {
+    // The consumer obeys the producer's kind gate (`certify_vc`): a kind whose
+    // violation formula is not situated never replays, whatever its identity binds.
+    if vc.kernel_authority_refusal().is_some() {
         return false;
-    };
-    recheck_cleancic_with_identity(term_bytes, context_bytes, lineage, &vc.formula, &identity)
+    }
+    // Same discipline as [`certify_vc`]: gate every serialized formula
+    // iteratively first, then build the identity on the large-stack thread.
+    if !vc_within_depth_gate(vc) {
+        return false;
+    }
+    on_certify_stack_if_needed(|| {
+        let identity = ObligationIdentity::from_vc(vc)?;
+        Some(recheck_cleancic_with_identity(
+            term_bytes,
+            context_bytes,
+            lineage,
+            &vc.formula,
+            &identity,
+        ))
+    })
+    .unwrap_or(false)
 }
 
 /// Replay a certificate against the full obligation identity of `vc` (function,
@@ -1291,6 +2480,258 @@ pub fn replay_vc_evidence(vc: &VerificationCondition, evidence: &trust_ir::Proof
     }
 }
 
+/// Replay a presented certificate without invoking any solver or proof search.
+/// The supported original contexts are reconstructed by the existing linear,
+/// rewrite-evaluation and closed-constant producers. Every other family is an
+/// explicit refusal. Repeated exact payloads reuse the checked reference fact;
+/// the original VC context and lineage are still checked on every call.
+#[must_use]
+pub fn replay_presented_vc_evidence(
+    vc: &VerificationCondition,
+    evidence: &trust_ir::ProofEvidence,
+) -> bool {
+    if vc.kernel_authority_refusal().is_some() || !vc_within_depth_gate(vc) {
+        return false;
+    }
+    if !branch_clamp::formula_is_well_sorted_bool(&vc.formula) {
+        return false;
+    }
+    on_certify_stack_if_needed(|| {
+        let trust_ir::ProofEvidence::CleanCic { term, context, lineage, .. } = evidence else {
+            return Some(false);
+        };
+        let identity = ObligationIdentity::from_vc(vc)?;
+        if lineage_digest(term, context, &identity) != *lineage {
+            return Some(false);
+        }
+        let normalized = normalize_violation(&vc.formula);
+        let vars = normalized
+            .as_ref()
+            .and_then(|norm| presented_linear_int_context_from_normalized(norm, context))
+            .or_else(|| rewrite_eval::presented_context_variables(&vc.formula, context))
+            .or_else(|| bv_equality::presented_context_variables(&vc.formula, context))
+            .or_else(|| {
+                let normalized = normalized.as_ref()?;
+                let prop_view = normalized.propositional_view();
+                try_propositional_closure(&prop_view, |leaves| {
+                    let (hyps, _, vars) = propositional_closure_hypotheses(leaves)?;
+                    let expected = serialize_context(&reduced_context(&build_ctx(&hyps))).ok()?;
+                    (expected == *context).then_some(vars)
+                })
+                .or_else(|| {
+                    membership_witnesses(&prop_view, MEMBERSHIP_RESOLUTION_MAX_POOL)
+                        .into_iter()
+                        .find_map(|branches| {
+                            let (hyps, _, vars) = membership_resolution_hypotheses(&branches)?;
+                            let expected =
+                                serialize_context(&reduced_context(&build_ctx(&hyps))).ok()?;
+                            (expected == *context).then_some(vars)
+                        })
+                })
+                .or_else(|| {
+                    try_path_membership(&prop_view, |paths| {
+                        let (_, hyps, _, vars) = path_membership_hypotheses(paths)?;
+                        let expected =
+                            serialize_context(&reduced_context(&build_ctx(&hyps))).ok()?;
+                        (expected == *context).then_some(vars)
+                    })
+                })
+                .or_else(|| {
+                    let (hyps, _) = closed_constant_refutation(&normalized.view())?;
+                    let expected = serialize_context(&reduced_context(&build_ctx(&hyps))).ok()?;
+                    (expected == *context).then(BTreeSet::new)
+                })
+            })?;
+        if reference_certificate_for(evidence).is_some() {
+            return Some(true);
+        }
+        Some(recheck_and_register_roundtrip(Carrier::Int, &vars, term, context, lineage))
+    })
+    .unwrap_or(false)
+}
+
+/// Directly check the PRESENTED term/context against an independently supplied
+/// original VC, without invoking a solver or regenerating a replacement proof.
+///
+/// Deliberately limited to the existing normalized linear-Int hypothesis lane.
+/// Other producer contexts fail closed. The source-to-hypothesis normalization
+/// and formula-to-kernel translation remain trusted, exactly as in that lane's
+/// producer; this is not a new verified translation theorem or a compiler/source
+/// binding. The caller is responsible for the provenance of `expected_vc`.
+#[must_use]
+pub fn recheck_presented_linear_int_vc(
+    expected_vc: &VerificationCondition,
+    evidence: &trust_ir::ProofEvidence,
+) -> bool {
+    if trust_types::original_vc_snapshot::bounded_original_vc_json(expected_vc).is_none()
+        || !vc_within_depth_gate(expected_vc)
+        || expected_vc.kernel_authority_refusal().is_some()
+    {
+        return false;
+    }
+    on_certify_stack_if_needed(|| recheck_presented_linear_int_vc_on_stack(expected_vc, evidence))
+        .unwrap_or(false)
+}
+
+fn recheck_presented_linear_int_vc_on_stack(
+    expected_vc: &VerificationCondition,
+    evidence: &trust_ir::ProofEvidence,
+) -> Option<bool> {
+    let trust_ir::ProofEvidence::CleanCic { term, context, lineage, .. } = evidence else {
+        return Some(false);
+    };
+    let identity = ObligationIdentity::from_vc(expected_vc)?;
+    Some(
+        check_presented_linear_int(&expected_vc.formula, &identity, term, context, lineage)
+            .is_some(),
+    )
+}
+
+/// Reconstruct the hypotheses from the current obligation, then check the
+/// submitted proof bytes. No saved context, solver answer or authority token
+/// supplies a premise. The returned variables are those of this reconstruction.
+fn check_presented_linear_int(
+    violation: &Formula,
+    identity: &ObligationIdentity,
+    term: &[u8],
+    context: &[u8],
+    lineage: &trust_ir::ProofDigest,
+) -> Option<BTreeSet<String>> {
+    let vars = presented_linear_int_context(violation, identity, term, context, lineage)?;
+    // Includes the transitive axiom audit, not just term typing.
+    payload_roundtrip_rechecks(&vars, term, context).then_some(vars)
+}
+
+fn presented_linear_int_context(
+    violation: &Formula,
+    identity: &ObligationIdentity,
+    term: &[u8],
+    context: &[u8],
+    lineage: &trust_ir::ProofDigest,
+) -> Option<BTreeSet<String>> {
+    if !branch_clamp::formula_is_well_sorted_bool(violation)
+        || lineage_digest(term, context, identity) != *lineage
+    {
+        return None;
+    }
+    let normalized = normalize_violation(violation)?;
+    presented_linear_int_context_from_normalized(&normalized, context)
+}
+
+fn presented_linear_int_context_from_normalized(
+    normalized: &NormalizedConjuncts<'_>,
+    context: &[u8],
+) -> Option<BTreeSet<String>> {
+    let (atoms, vars) = collect_supported_atoms(&normalized.view());
+    if atoms.is_empty() {
+        return None;
+    }
+    let hyps = supported_hyps_from_atoms(&atoms)?;
+    let expected_context = serialize_context(&reduced_context(&build_ctx(&hyps))).ok()?;
+    if expected_context.as_slice() != context {
+        return None;
+    }
+    Some(vars)
+}
+
+/// Reconstruct an artifact's supported hypothesis environment from the CURRENT
+/// violation. Stored context bytes supply no premises. The ordinary linear
+/// fragment stays first; a full-context primary disjunction uses the exact same
+/// structural hypothesis constructor as its producer, without running its
+/// refuter, ay, or proof search. Other producer families remain ordinary misses.
+fn presented_artifact_context(
+    violation: &Formula,
+    identity: &ObligationIdentity,
+    term: &[u8],
+    context: &[u8],
+    lineage: &trust_ir::ProofDigest,
+) -> Option<BTreeSet<String>> {
+    const MAX_DISJUNCTIVE_CONTEXTS: usize = 32;
+    if !branch_clamp::formula_is_well_sorted_bool(violation)
+        || lineage_digest(term, context, identity) != *lineage
+    {
+        return None;
+    }
+    let normalized = normalize_violation(violation)?;
+    if let Some(vars) = presented_linear_int_context_from_normalized(&normalized, context) {
+        return Some(vars);
+    }
+    let conjuncts = normalized.view();
+    let mut candidates = Vec::new();
+    let mut base = Vec::new();
+    for conjunct in conjuncts {
+        if let Formula::Or(disjuncts) = conjunct {
+            // Bound optional context reconstructions, not proof availability.
+            // The unchanged ordinary producer handles an artifact miss.
+            if candidates.len() == MAX_DISJUNCTIVE_CONTEXTS {
+                return None;
+            }
+            candidates.push(disjuncts);
+        } else {
+            base.push(conjunct);
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    let (hyps, _, base_vars) = build_disjunctive_context(&base)?;
+    for disjuncts in candidates {
+        let mut vars = base_vars.clone();
+        let Some((_, hypothesis)) =
+            parse_disjunctive_hypothesis(disjuncts, hyps.len(), &mut vars, parse_disjunct_primary)
+        else {
+            continue;
+        };
+        let mut current = hyps.clone();
+        current.push(hypothesis);
+        let expected = serialize_context(&reduced_context(&build_ctx(&current))).ok()?;
+        if expected.as_slice() == context {
+            return Some(vars);
+        }
+    }
+    None
+}
+
+/// Correlate a saved snapshot with an INDEPENDENTLY supplied expected original
+/// VC/row/semantics, then directly check its stored certificate as mathematics.
+/// A self-asserted snapshot never establishes source/program authority. Saved
+/// report decoding/publication policy is unchanged by this opt-in check.
+#[must_use]
+pub fn recheck_presented_original_vc_snapshot(
+    snapshot: &trust_types::OriginalVcSnapshot,
+    expected_vc: &VerificationCondition,
+    expected_obligation_id: &str,
+    expected_overflow_checks: bool,
+    expected_target: &str,
+    evidence: &trust_ir::ProofEvidence,
+) -> bool {
+    if trust_types::original_vc_snapshot::bounded_original_vc_json(expected_vc).is_none()
+        || !vc_within_depth_gate(expected_vc)
+        || expected_vc.kernel_authority_refusal().is_some()
+    {
+        return false;
+    }
+    on_certify_stack_if_needed(|| {
+        let digest = trust_types::original_vc_snapshot::exact_vc_claim_digest_sha256(
+            expected_vc,
+            expected_overflow_checks,
+            Some(expected_target),
+        )?;
+        let decoded = snapshot.decode_for_row(expected_obligation_id, &digest).ok()?;
+        if !vc_within_depth_gate(&decoded)
+            || ObligationIdentity::from_vc(&decoded)?.encoded
+                != ObligationIdentity::from_vc(expected_vc)?.encoded
+        {
+            return Some(false);
+        }
+        recheck_presented_linear_int_vc_on_stack(expected_vc, evidence)
+    })
+    .unwrap_or(false)
+}
+
+/// Consumer-side replay. Runs ON the certify stack: both public callers
+/// enter through [`on_certify_stack`] after their iterative depth gate, so
+/// any fallback regeneration is the in-thread producer, not a second thread.
 fn recheck_cleancic_with_identity(
     term_bytes: &[u8],
     context_bytes: &[u8],
@@ -1298,6 +2739,45 @@ fn recheck_cleancic_with_identity(
     obligation_violation: &Formula,
     identity: &ObligationIdentity,
 ) -> bool {
+    recheck_cleancic_with_identity_or(
+        term_bytes,
+        context_bytes,
+        lineage,
+        obligation_violation,
+        identity,
+        || certify_with_identity_on_stack(obligation_violation, identity),
+    )
+}
+
+fn recheck_cleancic_with_identity_or(
+    term_bytes: &[u8],
+    context_bytes: &[u8],
+    lineage: &trust_ir::ProofDigest,
+    obligation_violation: &Formula,
+    identity: &ObligationIdentity,
+    regenerate: impl FnOnce() -> Option<trust_ir::ProofEvidence>,
+) -> bool {
+    if let Some(vars) = presented_artifact_context(
+        obligation_violation,
+        identity,
+        term_bytes,
+        context_bytes,
+        lineage,
+    ) {
+        // A certificate checks the mathematics under its own hypotheses. Even
+        // a warm replay must first reconstruct this obligation's context above;
+        // identity and a genuine kernel token alone cannot establish that link.
+        if reference_mint::reference_certificate_for_parts(term_bytes, context_bytes, lineage)
+            .is_some()
+        {
+            return true;
+        }
+        // Imported bytes earn fresh authority only from this process's current
+        // reference kernel. A stored certificate is never an authority token.
+        if recheck_and_register_roundtrip(Carrier::Int, &vars, term_bytes, context_bytes, lineage) {
+            return true;
+        }
+    }
     // Regenerate the lane's canonical evidence from the obligation itself. This
     // covers every producer family (generic Farkas, direct disequality,
     // closed-constant, disjunctive, signed-BV/ITE reductions, accumulator and
@@ -1309,7 +2789,7 @@ fn recheck_cleancic_with_identity(
         context: canonical_context,
         lineage: canonical_lineage,
         ..
-    }) = certify_with_identity(obligation_violation, identity)
+    }) = regenerate()
     else {
         return false;
     };
@@ -1363,6 +2843,9 @@ fn unfold_asserted_bool_reifications(conjuncts: &[&Formula]) -> Vec<Formula> {
             }
         }
     }
+    if defs.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for &c in conjuncts {
         match c {
@@ -1412,29 +2895,31 @@ fn is_bool_reification_conjunct(c: &Formula) -> bool {
 fn propagate_constant_equalities(conjuncts: &[&Formula]) -> Vec<Formula> {
     use std::collections::BTreeMap;
     // Union-find over Int variable names.
-    let mut parent: BTreeMap<String, String> = BTreeMap::new();
-    fn find(parent: &mut BTreeMap<String, String>, x: &str) -> String {
-        match parent.get(x).cloned() {
-            None => x.to_string(),
+    let mut parent: BTreeMap<&str, &str> = BTreeMap::new();
+    fn find<'a>(parent: &mut BTreeMap<&'a str, &'a str>, x: &'a str) -> &'a str {
+        match parent.get(x).copied() {
+            None => x,
             Some(p) if p == x => p,
             Some(p) => {
-                let root = find(parent, &p);
-                parent.insert(x.to_string(), root.clone());
+                let root = find(parent, p);
+                parent.insert(x, root);
                 root
             }
         }
     }
-    let mut vars: std::collections::BTreeSet<String> = Default::default();
+    let mut vars: std::collections::BTreeSet<&str> = Default::default();
     // Pass 1: union variable/variable equalities.
     for &c in conjuncts {
         if let Formula::Eq(a, b) = c
             && let (Formula::Var(x, Sort::Int), Formula::Var(y, Sort::Int)) =
                 (a.as_ref(), b.as_ref())
         {
-            vars.insert(x.clone());
-            vars.insert(y.clone());
-            parent.entry(x.clone()).or_insert_with(|| x.clone());
-            parent.entry(y.clone()).or_insert_with(|| y.clone());
+            let x = x.as_str();
+            let y = y.as_str();
+            vars.insert(x);
+            vars.insert(y);
+            parent.entry(x).or_insert(x);
+            parent.entry(y).or_insert(y);
             let (rx, ry) = (find(&mut parent, x), find(&mut parent, y));
             if rx != ry {
                 parent.insert(rx, ry);
@@ -1442,26 +2927,29 @@ fn propagate_constant_equalities(conjuncts: &[&Formula]) -> Vec<Formula> {
         }
     }
     // Pass 2: bind a constant to each class root (after all unions are settled).
-    let mut class_const: BTreeMap<String, i128> = BTreeMap::new();
+    let mut class_const: BTreeMap<&str, i128> = BTreeMap::new();
     for &c in conjuncts {
         if let Formula::Eq(a, b) = c {
             let (var, lit) = match (a.as_ref(), b.as_ref()) {
-                (Formula::Var(x, Sort::Int), Formula::Int(n)) => (x, *n),
-                (Formula::Int(n), Formula::Var(x, Sort::Int)) => (x, *n),
+                (Formula::Var(x, Sort::Int), Formula::Int(n)) => (x.as_str(), *n),
+                (Formula::Int(n), Formula::Var(x, Sort::Int)) => (x.as_str(), *n),
                 _ => continue,
             };
-            vars.insert(var.clone());
+            vars.insert(var);
             let r = find(&mut parent, var);
             class_const.insert(r, lit);
         }
     }
+    if class_const.is_empty() {
+        return Vec::new();
+    }
     // Pass 3: emit `v == k` for every var whose class carries a constant.
     let mut out = Vec::new();
-    for v in &vars {
+    for &v in &vars {
         let r = find(&mut parent, v);
-        if let Some(&k) = class_const.get(&r) {
+        if let Some(&k) = class_const.get(r) {
             out.push(Formula::Eq(
-                Box::new(Formula::Var(v.clone(), Sort::Int)),
+                Box::new(Formula::Var(v.to_string(), Sort::Int)),
                 Box::new(Formula::Int(k)),
             ));
         }
@@ -1477,14 +2965,14 @@ fn propagate_constant_equalities(conjuncts: &[&Formula]) -> Vec<Formula> {
 /// equals its root, so the root's bound holds of the member.
 fn propagate_equality_class_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
     use std::collections::BTreeMap;
-    let mut parent: BTreeMap<String, String> = BTreeMap::new();
-    fn find(parent: &mut BTreeMap<String, String>, x: &str) -> String {
-        match parent.get(x).cloned() {
-            None => x.to_string(),
+    let mut parent: BTreeMap<&str, &str> = BTreeMap::new();
+    fn find<'a>(parent: &mut BTreeMap<&'a str, &'a str>, x: &'a str) -> &'a str {
+        match parent.get(x).copied() {
+            None => x,
             Some(p) if p == x => p,
             Some(p) => {
-                let root = find(parent, &p);
-                parent.insert(x.to_string(), root.clone());
+                let root = find(parent, p);
+                parent.insert(x, root);
                 root
             }
         }
@@ -1495,8 +2983,10 @@ fn propagate_equality_class_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
             && let (Formula::Var(x, Sort::Int), Formula::Var(y, Sort::Int)) =
                 (a.as_ref(), b.as_ref())
         {
-            parent.entry(x.clone()).or_insert_with(|| x.clone());
-            parent.entry(y.clone()).or_insert_with(|| y.clone());
+            let x = x.as_str();
+            let y = y.as_str();
+            parent.entry(x).or_insert(x);
+            parent.entry(y).or_insert(y);
             let (rx, ry) = (find(&mut parent, x), find(&mut parent, y));
             if rx != ry {
                 parent.insert(rx, ry);
@@ -1507,57 +2997,65 @@ fn propagate_equality_class_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
         return Vec::new();
     }
     // Collect `(var, literal, is_upper)` bound facts (both operand orders).
-    let mut facts: Vec<(String, i128, bool)> = Vec::new();
+    let mut facts: Vec<(&str, i128, bool)> = Vec::new();
     for &c in conjuncts {
         match c {
             Formula::Le(a, b) => match (a.as_ref(), b.as_ref()) {
-                (Formula::Var(v, Sort::Int), Formula::Int(n)) => facts.push((v.clone(), *n, true)),
-                (Formula::Int(n), Formula::Var(v, Sort::Int)) => facts.push((v.clone(), *n, false)),
+                (Formula::Var(v, Sort::Int), Formula::Int(n)) => {
+                    facts.push((v.as_str(), *n, true));
+                }
+                (Formula::Int(n), Formula::Var(v, Sort::Int)) => {
+                    facts.push((v.as_str(), *n, false));
+                }
                 _ => {}
             },
             Formula::Ge(a, b) => match (a.as_ref(), b.as_ref()) {
-                (Formula::Var(v, Sort::Int), Formula::Int(n)) => facts.push((v.clone(), *n, false)),
-                (Formula::Int(n), Formula::Var(v, Sort::Int)) => facts.push((v.clone(), *n, true)),
+                (Formula::Var(v, Sort::Int), Formula::Int(n)) => {
+                    facts.push((v.as_str(), *n, false));
+                }
+                (Formula::Int(n), Formula::Var(v, Sort::Int)) => {
+                    facts.push((v.as_str(), *n, true));
+                }
                 _ => {}
             },
             _ => {}
         }
     }
     // Tightest per class root: min upper, max lower.
-    let mut upper: BTreeMap<String, i128> = BTreeMap::new();
-    let mut lower: BTreeMap<String, i128> = BTreeMap::new();
-    for (v, n, is_upper) in &facts {
+    let mut upper: BTreeMap<&str, i128> = BTreeMap::new();
+    let mut lower: BTreeMap<&str, i128> = BTreeMap::new();
+    for &(v, n, is_upper) in &facts {
         if !parent.contains_key(v) {
             continue;
         }
         let r = find(&mut parent, v);
-        if *is_upper {
-            let e = upper.entry(r).or_insert(*n);
-            if *n < *e {
-                *e = *n;
+        if is_upper {
+            let e = upper.entry(r).or_insert(n);
+            if n < *e {
+                *e = n;
             }
         } else {
-            let e = lower.entry(r).or_insert(*n);
-            if *n > *e {
-                *e = *n;
+            let e = lower.entry(r).or_insert(n);
+            if n > *e {
+                *e = n;
             }
         }
     }
     // Emit the class-tightest bound for every member.
-    let members: Vec<String> = parent.keys().cloned().collect();
+    let members: Vec<&str> = parent.keys().copied().collect();
     let mut out = Vec::new();
-    for m in &members {
+    for m in members {
         let r = find(&mut parent, m);
-        if let Some(&u) = upper.get(&r) {
+        if let Some(&u) = upper.get(r) {
             out.push(Formula::Le(
-                Box::new(Formula::Var(m.clone(), Sort::Int)),
+                Box::new(Formula::Var(m.to_string(), Sort::Int)),
                 Box::new(Formula::Int(u)),
             ));
         }
-        if let Some(&l) = lower.get(&r) {
+        if let Some(&l) = lower.get(r) {
             out.push(Formula::Le(
                 Box::new(Formula::Int(l)),
-                Box::new(Formula::Var(m.clone(), Sort::Int)),
+                Box::new(Formula::Var(m.to_string(), Sort::Int)),
             ));
         }
     }
@@ -1608,8 +3106,8 @@ fn modulo_range_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
     for c in conjuncts {
         let Formula::Eq(a, b) = c else { continue };
         let (k_leaf, dividend, divisor) = match (a.as_ref(), b.as_ref()) {
-            (leaf, Formula::Rem(d, m)) if int_var_name(leaf).is_some() => (leaf, d, m),
-            (Formula::Rem(d, m), leaf) if int_var_name(leaf).is_some() => (leaf, d, m),
+            (leaf, Formula::Rem(d, m)) if int_var_name_str(leaf).is_some() => (leaf, d, m),
+            (Formula::Rem(d, m), leaf) if int_var_name_str(leaf).is_some() => (leaf, d, m),
             _ => continue,
         };
         let kv = || Box::new(k_leaf.clone());
@@ -1627,14 +3125,14 @@ fn modulo_range_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
             // `(h % num_partitions.max(1)) as u32` with `n ≤ u32::MAX`. The
             // literal arms above run FIRST, so only a `Var`/`SymVar` divisor
             // reaches this guard.
-            leaf if int_var_name(leaf).is_some_and(|n| positive(&n)) => {
+            leaf if int_var_name_str(leaf).is_some_and(positive) => {
                 out.push(Formula::Lt(kv(), Box::new(leaf.clone())));
             }
             _ => continue,
         }
         // Non-negative dividend ⇒ k ≥ 0 (Rust `%` keeps the sign of the dividend).
-        if let Some(a_name) = int_var_name(dividend.as_ref())
-            && nonneg(&a_name)
+        if let Some(a_name) = int_var_name_str(dividend.as_ref())
+            && nonneg(a_name)
         {
             out.push(Formula::Ge(kv(), Box::new(Formula::Int(0))));
         }
@@ -1712,31 +3210,31 @@ fn division_range_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
     for c in conjuncts {
         let Formula::Eq(a, b) = c else { continue };
         let (q_leaf, dividend, divisor) = match (a.as_ref(), b.as_ref()) {
-            (leaf, Formula::Div(d, m)) if int_var_name(leaf).is_some() => (leaf, d, m),
-            (Formula::Div(d, m), leaf) if int_var_name(leaf).is_some() => (leaf, d, m),
+            (leaf, Formula::Div(d, m)) if int_var_name_str(leaf).is_some() => (leaf, d, m),
+            (Formula::Div(d, m), leaf) if int_var_name_str(leaf).is_some() => (leaf, d, m),
             _ => continue,
         };
         // The dividend must be an Int variable so its bounds can be consulted.
-        let Some(a_name) = int_var_name(dividend.as_ref()) else { continue };
+        let Some(a_name) = int_var_name_str(dividend.as_ref()) else { continue };
         // REQUIRE a provably non-negative dividend (`a ≥ L ≥ 0`); otherwise the
         // truncation-vs-floor mismatch breaks monotonicity and nothing is sound.
-        let Some(l) = lower(&a_name).filter(|l| *l >= 0) else { continue };
+        let Some(l) = lower(a_name).filter(|l| *l >= 0) else { continue };
         let qv = || Box::new(q_leaf.clone());
         if let Some(cval) = int_lit(divisor).filter(|c| *c > 0) {
             // Positive literal divisor: division-monotone floor bounds.
             // q ≥ ⌊L/c⌋ (≥ 0). div_euclid == floor for the non-negative L, c > 0.
             out.push(Formula::Ge(qv(), Box::new(Formula::Int(l.div_euclid(cval)))));
             // q ≤ ⌊U/c⌋ when a present upper bound `a ≤ U` (U ≥ 0) exists.
-            if let Some(u) = upper(&a_name).filter(|u| *u >= 0) {
+            if let Some(u) = upper(a_name).filter(|u| *u >= 0) {
                 out.push(Formula::Le(qv(), Box::new(Formula::Int(u.div_euclid(cval)))));
             }
-        } else if let Some(d_name) = int_var_name(divisor.as_ref())
-            && int_var_lower_bound_at_least(conjuncts, &d_name, 1)
+        } else if let Some(d_name) = int_var_name_str(divisor.as_ref())
+            && int_var_lower_bound_at_least(conjuncts, d_name, 1)
         {
             // VARIABLE divisor provably ≥ 1 with a non-negative dividend (see
             // the doc): `q ≥ 0`, and `q ≤ U` under a present `a ≤ U`, `U ≥ 0`.
             out.push(Formula::Ge(qv(), Box::new(Formula::Int(0))));
-            if let Some(u) = upper(&a_name).filter(|u| *u >= 0) {
+            if let Some(u) = upper(a_name).filter(|u| *u >= 0) {
                 out.push(Formula::Le(qv(), Box::new(Formula::Int(u))));
             }
         }
@@ -1754,12 +3252,27 @@ fn division_range_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
 /// genuinely NEW atom still change bytes — see the certificate-byte candor
 /// note on [`NORMALIZATION_STEPS`].
 fn retain_new_atoms(view: &[&Formula], emitted: Vec<Formula>) -> Vec<Formula> {
-    let mut out: Vec<Formula> = Vec::new();
-    for atom in emitted {
-        if view.iter().any(|&c| *c == atom) || out.contains(&atom) {
-            continue;
+    if emitted.is_empty() {
+        return emitted;
+    }
+    if view.len() + emitted.len() <= 16 {
+        let mut out: Vec<Formula> = Vec::new();
+        for atom in emitted {
+            if view.iter().any(|&c| *c == atom) || out.contains(&atom) {
+                continue;
+            }
+            out.push(atom);
         }
-        out.push(atom);
+        return out;
+    }
+    let present: trust_types::fx::FxHashSet<&Formula> = view.iter().copied().collect();
+    let mut seen: trust_types::fx::FxHashSet<Formula> =
+        trust_types::fx::FxHashSet::with_capacity_and_hasher(emitted.len(), Default::default());
+    let mut out = Vec::new();
+    for atom in emitted {
+        if !present.contains(&atom) && seen.insert(atom.clone()) {
+            out.push(atom);
+        }
     }
     out
 }
@@ -1796,7 +3309,7 @@ fn membership_interval_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
             continue;
         }
         let mut var: Option<&str> = None;
-        let mut lits: Vec<i128> = Vec::with_capacity(disjuncts.len());
+        let mut bounds: Option<(i128, i128)> = None;
         let mut ok = true;
         for d in disjuncts {
             // Accept either operand order: `Eq(Var, Int)` or `Eq(Int, Var)`.
@@ -1822,14 +3335,15 @@ fn membership_interval_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
                     break;
                 }
             }
-            lits.push(n);
+            bounds = Some(match bounds {
+                None => (n, n),
+                Some((lo, hi)) => (lo.min(n), hi.max(n)),
+            });
         }
         if !ok {
             continue;
         }
-        if let Some(v) = var {
-            let lo = lits.iter().copied().min().unwrap();
-            let hi = lits.iter().copied().max().unwrap();
+        if let (Some(v), Some((lo, hi))) = (var, bounds) {
             out.push(Formula::Ge(
                 Box::new(Formula::Var(v.to_string(), Sort::Int)),
                 Box::new(Formula::Int(lo)),
@@ -1852,13 +3366,16 @@ fn membership_interval_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
 /// `Implies(Ge(_4,0), Eq(_3,_4))` discharges here because the membership bound
 /// `Ge(_4,0)` is present. Sound: modus ponens — `(ante → cons) ∧ ante ⊢ cons`, and
 /// `ante` is emitted only when it is a genuine consequence of present bounds.
-fn discharge_entailed_implications(conjuncts: &[&Formula]) -> Vec<Formula> {
+fn discharge_entailed_implications<'a>(conjuncts: &[&'a Formula]) -> Vec<Formula> {
+    if !conjuncts.iter().any(|c| matches!(c, Formula::Implies(..))) {
+        return Vec::new();
+    }
     // Best-known lower/upper bound for each var from present `Ge`/`Le`/`Eq` literals.
-    let mut lower: std::collections::BTreeMap<String, i128> = std::collections::BTreeMap::new();
-    let mut upper: std::collections::BTreeMap<String, i128> = std::collections::BTreeMap::new();
-    let mut note_lower = |v: &str, n: i128| {
+    let mut lower: std::collections::BTreeMap<&'a str, i128> = std::collections::BTreeMap::new();
+    let mut upper: std::collections::BTreeMap<&'a str, i128> = std::collections::BTreeMap::new();
+    let mut note_lower = |v: &'a str, n: i128| {
         lower
-            .entry(v.to_string())
+            .entry(v)
             .and_modify(|e| {
                 if n > *e {
                     *e = n;
@@ -1866,49 +3383,33 @@ fn discharge_entailed_implications(conjuncts: &[&Formula]) -> Vec<Formula> {
             })
             .or_insert(n);
     };
-    // (separate closure borrow scoping: build both maps in one pass)
+    let mut note_upper = |v: &'a str, n: i128| {
+        upper
+            .entry(v)
+            .and_modify(|e| {
+                if n < *e {
+                    *e = n;
+                }
+            })
+            .or_insert(n);
+    };
     for &c in conjuncts {
         match c {
             Formula::Ge(a, b) => match (a.as_ref(), b.as_ref()) {
-                (Formula::Var(v, Sort::Int), Formula::Int(n)) => note_lower(v, *n),
-                (Formula::Int(n), Formula::Var(v, Sort::Int)) => {
-                    upper
-                        .entry(v.clone())
-                        .and_modify(|e| {
-                            if *n < *e {
-                                *e = *n;
-                            }
-                        })
-                        .or_insert(*n);
-                }
+                (Formula::Var(v, Sort::Int), Formula::Int(n)) => note_lower(v.as_str(), *n),
+                (Formula::Int(n), Formula::Var(v, Sort::Int)) => note_upper(v.as_str(), *n),
                 _ => {}
             },
             Formula::Le(a, b) => match (a.as_ref(), b.as_ref()) {
-                (Formula::Var(v, Sort::Int), Formula::Int(n)) => {
-                    upper
-                        .entry(v.clone())
-                        .and_modify(|e| {
-                            if *n < *e {
-                                *e = *n;
-                            }
-                        })
-                        .or_insert(*n);
-                }
-                (Formula::Int(n), Formula::Var(v, Sort::Int)) => note_lower(v, *n),
+                (Formula::Var(v, Sort::Int), Formula::Int(n)) => note_upper(v.as_str(), *n),
+                (Formula::Int(n), Formula::Var(v, Sort::Int)) => note_lower(v.as_str(), *n),
                 _ => {}
             },
             Formula::Eq(a, b) => match (a.as_ref(), b.as_ref()) {
                 (Formula::Var(v, Sort::Int), Formula::Int(n))
                 | (Formula::Int(n), Formula::Var(v, Sort::Int)) => {
-                    note_lower(v, *n);
-                    upper
-                        .entry(v.clone())
-                        .and_modify(|e| {
-                            if *n < *e {
-                                *e = *n;
-                            }
-                        })
-                        .or_insert(*n);
+                    note_lower(v.as_str(), *n);
+                    note_upper(v.as_str(), *n);
                 }
                 _ => {}
             },
@@ -1922,21 +3423,21 @@ fn discharge_entailed_implications(conjuncts: &[&Formula]) -> Vec<Formula> {
             // `v ≥ k` entailed iff a known lower bound is ≥ k.
             Formula::Ge(a, b) => match (a.as_ref(), b.as_ref()) {
                 (Formula::Var(v, Sort::Int), Formula::Int(k)) => {
-                    lower.get(v).is_some_and(|lo| lo >= k)
+                    lower.get(v.as_str()).is_some_and(|lo| lo >= k)
                 }
                 (Formula::Int(k), Formula::Var(v, Sort::Int)) => {
                     // `k ≥ v` iff a known upper bound is ≤ k.
-                    upper.get(v).is_some_and(|up| up <= k)
+                    upper.get(v.as_str()).is_some_and(|up| up <= k)
                 }
                 _ => false,
             },
             // `v ≤ k` entailed iff a known upper bound is ≤ k.
             Formula::Le(a, b) => match (a.as_ref(), b.as_ref()) {
                 (Formula::Var(v, Sort::Int), Formula::Int(k)) => {
-                    upper.get(v).is_some_and(|up| up <= k)
+                    upper.get(v.as_str()).is_some_and(|up| up <= k)
                 }
                 (Formula::Int(k), Formula::Var(v, Sort::Int)) => {
-                    lower.get(v).is_some_and(|lo| lo >= k)
+                    lower.get(v.as_str()).is_some_and(|lo| lo >= k)
                 }
                 _ => false,
             },
@@ -1955,34 +3456,40 @@ fn discharge_entailed_implications(conjuncts: &[&Formula]) -> Vec<Formula> {
 
 /// The `Int` kernel type.
 fn int_ty() -> Expr {
-    Expr::const_(Name::from_string("Int"), vec![])
+    static INT: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    INT.get_or_init(|| Expr::const_(Name::from_string("Int"), vec![])).clone()
 }
 
 /// `False` as the kernel constant `False` (no level args).
 fn false_expr() -> Expr {
-    Expr::const_(Name::from_string("False"), Vec::new())
+    static FALSE: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    FALSE.get_or_init(|| Expr::const_(Name::from_string("False"), Vec::new())).clone()
 }
 
 /// `Not False` — the dummy negated goal passed to reconstruction when the
 /// contradiction lives entirely in the asserted hypotheses.
 fn neg_false() -> Expr {
-    not_prop(false_expr())
+    static NEG_FALSE: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    NEG_FALSE.get_or_init(|| not_prop(false_expr())).clone()
 }
 
 /// `Int.ofNat n` — a non-negative integer literal as a kernel term.
 fn int_ofnat(n: u64) -> Expr {
-    Expr::app(Expr::const_(Name::from_string("Int.ofNat"), vec![]), Expr::nat_lit(n))
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    Expr::app(HEAD.get_or_init(|| Expr::const_(Name::from_string("Int.ofNat"), vec![])).clone(), Expr::nat_lit(n))
 }
 
 /// `Int.ofNat n` for an arbitrary `u128` magnitude (values > `u64::MAX` use the
 /// kernel's arbitrary-precision `BigNat`). Needed for `i128`/`u128` type thresholds.
 fn int_ofnat_u128(n: u128) -> Expr {
-    Expr::app(Expr::const_(Name::from_string("Int.ofNat"), vec![]), Expr::nat_lit_u128(n))
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    Expr::app(HEAD.get_or_init(|| Expr::const_(Name::from_string("Int.ofNat"), vec![])).clone(), Expr::nat_lit_u128(n))
 }
 
 /// `Int.negSucc n` (= `-(n+1)`) for an arbitrary `u128` index.
 fn int_neg_succ_u128(n: u128) -> Expr {
-    Expr::app(Expr::const_(Name::from_string("Int.negSucc"), vec![]), Expr::nat_lit_u128(n))
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    Expr::app(HEAD.get_or_init(|| Expr::const_(Name::from_string("Int.negSucc"), vec![])).clone(), Expr::nat_lit_u128(n))
 }
 
 fn int_literal_to_kernel(n: i128) -> Option<Expr> {
@@ -2002,30 +3509,26 @@ fn int_literal_to_smt(n: i128) -> Option<String> {
 
 /// `@LT.lt Int instLTInt a b`.
 fn lt_int(a: Expr, b: Expr) -> Expr {
-    Expr::app(
-        Expr::app(
-            Expr::app(
-                Expr::app(Expr::const_(Name::from_string("LT.lt"), vec![Level::zero()]), int_ty()),
-                Expr::const_(Name::from_string("instLTInt"), vec![]),
-            ),
-            a,
-        ),
-        b,
-    )
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        Expr::apps(
+            Expr::const_(Name::from_string("LT.lt"), vec![Level::zero()]),
+            [int_ty(), Expr::const_(Name::from_string("instLTInt"), vec![])],
+        )
+    });
+    Expr::app(Expr::app(head.clone(), a), b)
 }
 
 /// `@LE.le Int instLEInt a b`. (`LE.le @Int instLEInt` δ-reduces to `Int.le`.)
 fn le_int(a: Expr, b: Expr) -> Expr {
-    Expr::app(
-        Expr::app(
-            Expr::app(
-                Expr::app(Expr::const_(Name::from_string("LE.le"), vec![Level::zero()]), int_ty()),
-                Expr::const_(Name::from_string("instLEInt"), vec![]),
-            ),
-            a,
-        ),
-        b,
-    )
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        Expr::apps(
+            Expr::const_(Name::from_string("LE.le"), vec![Level::zero()]),
+            [int_ty(), Expr::const_(Name::from_string("instLEInt"), vec![])],
+        )
+    });
+    Expr::app(Expr::app(head.clone(), a), b)
 }
 
 /// `@HAdd.hAdd.{0,0,0} Int Int Int instHAddInt a b` — the elaborated integer
@@ -2034,29 +3537,15 @@ fn le_int(a: Expr, b: Expr) -> Expr {
 /// so `find_hypothesis_by_prop`'s structural match succeeds and the kernel
 /// re-check passes. n-ary sums fold left at the call site.
 fn hadd_int(a: Expr, b: Expr) -> Expr {
-    let int = int_ty();
-    Expr::app(
-        Expr::app(
-            Expr::app(
-                Expr::app(
-                    Expr::app(
-                        Expr::app(
-                            Expr::const_(
-                                Name::from_string("HAdd.hAdd"),
-                                vec![Level::zero(), Level::zero(), Level::zero()],
-                            ),
-                            int.clone(),
-                        ),
-                        int.clone(),
-                    ),
-                    int,
-                ),
-                Expr::const_(Name::from_string("instHAddInt"), vec![]),
-            ),
-            a,
-        ),
-        b,
-    )
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        let int = int_ty();
+        Expr::apps(
+            Expr::const_(Name::from_string("HAdd.hAdd"), vec![Level::zero(), Level::zero(), Level::zero()]),
+            [int.clone(), int.clone(), int, Expr::const_(Name::from_string("instHAddInt"), vec![])],
+        )
+    });
+    Expr::app(Expr::app(head.clone(), a), b)
 }
 
 /// Register the `HAdd Int Int Int` instance so `hadd_int` props type-check.
@@ -2105,29 +3594,15 @@ fn ensure_hadd(env: &mut Environment) -> Option<()> {
 /// normalizes `(* lit var)` to variable-first `(* var lit)`, so callers must
 /// pass the variable term as `a` and the literal as `b`.
 fn hmul_int(a: Expr, b: Expr) -> Expr {
-    let int = int_ty();
-    Expr::app(
-        Expr::app(
-            Expr::app(
-                Expr::app(
-                    Expr::app(
-                        Expr::app(
-                            Expr::const_(
-                                Name::from_string("HMul.hMul"),
-                                vec![Level::zero(), Level::zero(), Level::zero()],
-                            ),
-                            int.clone(),
-                        ),
-                        int.clone(),
-                    ),
-                    int,
-                ),
-                Expr::const_(Name::from_string("instHMulInt"), vec![]),
-            ),
-            a,
-        ),
-        b,
-    )
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        let int = int_ty();
+        Expr::apps(
+            Expr::const_(Name::from_string("HMul.hMul"), vec![Level::zero(), Level::zero(), Level::zero()]),
+            [int.clone(), int.clone(), int, Expr::const_(Name::from_string("instHMulInt"), vec![])],
+        )
+    });
+    Expr::app(Expr::app(head.clone(), a), b)
 }
 
 /// Register the `HMul Int Int Int` instance so `hmul_int` props type-check.
@@ -2192,67 +3667,146 @@ fn linear_mul_operands<'a>(a: &'a Formula, b: &'a Formula) -> Option<(i128, &'a 
 /// `Int.mul`/`Int.add`/`Int.sub` over literals is a definitional reduction the clean
 /// kernel performs identically, so the folded form is provably equal; `checked_*`
 /// guards keep an overflowing fold from wrapping (it just stays unfolded).
-fn fold_constant_arith(f: &Formula) -> Formula {
+fn fold_constant_arith_opt(f: &Formula) -> Option<Formula> {
     use Formula::{Add, And, Eq, Ge, Gt, Int, Le, Lt, Mul, Neg, Not, Or, Sub};
+    let fold_children = |cs: &[Formula], wrap: fn(Vec<Formula>) -> Formula| -> Option<Formula> {
+        let mut out: Option<Vec<Formula>> = None;
+        for (i, child) in cs.iter().enumerate() {
+            if let Some(folded) = fold_constant_arith_opt(child) {
+                let vec = out.get_or_insert_with(|| {
+                    let mut v = Vec::with_capacity(cs.len());
+                    v.extend_from_slice(&cs[..i]);
+                    v
+                });
+                vec.push(folded);
+            } else if let Some(vec) = &mut out {
+                vec.push(child.clone());
+            }
+        }
+        out.map(wrap)
+    };
+    let fold_binary =
+        |a: &Formula, b: &Formula, wrap: fn(Box<Formula>, Box<Formula>) -> Formula| {
+            match (fold_constant_arith_opt(a), fold_constant_arith_opt(b)) {
+                (None, None) => None,
+                (fa, fb) => Some(wrap(
+                    Box::new(fa.unwrap_or_else(|| a.clone())),
+                    Box::new(fb.unwrap_or_else(|| b.clone())),
+                )),
+            }
+        };
     match f {
         Mul(a, b) => {
-            let (fa, fb) = (fold_constant_arith(a), fold_constant_arith(b));
-            if let (Int(x), Int(y)) = (&fa, &fb) {
+            let (fa, fb) = (fold_constant_arith_opt(a), fold_constant_arith_opt(b));
+            if let (Int(x), Int(y)) = (fa.as_ref().unwrap_or(a), fb.as_ref().unwrap_or(b)) {
                 if let Some(p) = x.checked_mul(*y) {
-                    return Int(p);
+                    return Some(Int(p));
                 }
             }
-            Mul(Box::new(fa), Box::new(fb))
+            match (fa, fb) {
+                (None, None) => None,
+                (fa, fb) => Some(Mul(
+                    Box::new(fa.unwrap_or_else(|| (**a).clone())),
+                    Box::new(fb.unwrap_or_else(|| (**b).clone())),
+                )),
+            }
         }
         Add(a, b) => {
-            let (fa, fb) = (fold_constant_arith(a), fold_constant_arith(b));
-            if let (Int(x), Int(y)) = (&fa, &fb) {
+            let (fa, fb) = (fold_constant_arith_opt(a), fold_constant_arith_opt(b));
+            if let (Int(x), Int(y)) = (fa.as_ref().unwrap_or(a), fb.as_ref().unwrap_or(b)) {
                 if let Some(p) = x.checked_add(*y) {
-                    return Int(p);
+                    return Some(Int(p));
                 }
             }
-            Add(Box::new(fa), Box::new(fb))
+            match (fa, fb) {
+                (None, None) => None,
+                (fa, fb) => Some(Add(
+                    Box::new(fa.unwrap_or_else(|| (**a).clone())),
+                    Box::new(fb.unwrap_or_else(|| (**b).clone())),
+                )),
+            }
         }
         Sub(a, b) => {
-            let (fa, fb) = (fold_constant_arith(a), fold_constant_arith(b));
-            if let (Int(x), Int(y)) = (&fa, &fb) {
+            let (fa, fb) = (fold_constant_arith_opt(a), fold_constant_arith_opt(b));
+            if let (Int(x), Int(y)) = (fa.as_ref().unwrap_or(a), fb.as_ref().unwrap_or(b)) {
                 if let Some(p) = x.checked_sub(*y) {
-                    return Int(p);
+                    return Some(Int(p));
                 }
             }
-            Sub(Box::new(fa), Box::new(fb))
+            match (fa, fb) {
+                (None, None) => None,
+                (fa, fb) => Some(Sub(
+                    Box::new(fa.unwrap_or_else(|| (**a).clone())),
+                    Box::new(fb.unwrap_or_else(|| (**b).clone())),
+                )),
+            }
         }
         Neg(a) => {
-            let fa = fold_constant_arith(a);
-            if let Int(x) = &fa {
+            let fa = fold_constant_arith_opt(a);
+            if let Int(x) = fa.as_ref().unwrap_or(a) {
                 if let Some(n) = x.checked_neg() {
-                    return Int(n);
+                    return Some(Int(n));
                 }
             }
-            Neg(Box::new(fa))
+            fa.map(|fa| Neg(Box::new(fa)))
         }
-        Not(x) => Not(Box::new(fold_constant_arith(x))),
-        And(cs) => And(cs.iter().map(fold_constant_arith).collect()),
-        Or(ds) => Or(ds.iter().map(fold_constant_arith).collect()),
-        Lt(a, b) => Lt(Box::new(fold_constant_arith(a)), Box::new(fold_constant_arith(b))),
-        Le(a, b) => Le(Box::new(fold_constant_arith(a)), Box::new(fold_constant_arith(b))),
-        Gt(a, b) => Gt(Box::new(fold_constant_arith(a)), Box::new(fold_constant_arith(b))),
-        Ge(a, b) => Ge(Box::new(fold_constant_arith(a)), Box::new(fold_constant_arith(b))),
-        Eq(a, b) => Eq(Box::new(fold_constant_arith(a)), Box::new(fold_constant_arith(b))),
-        other => other.clone(),
+        Not(x) => fold_constant_arith_opt(x).map(|fx| Not(Box::new(fx))),
+        And(cs) => fold_children(cs, And),
+        Or(ds) => fold_children(ds, Or),
+        Lt(a, b) => fold_binary(a, b, Lt),
+        Le(a, b) => fold_binary(a, b, Le),
+        Gt(a, b) => fold_binary(a, b, Gt),
+        Ge(a, b) => fold_binary(a, b, Ge),
+        Eq(a, b) => fold_binary(a, b, Eq),
+        _ => None,
     }
 }
 
 /// Constant-folded copies of any conjuncts whose closed arithmetic actually reduces
-/// (`fold_constant_arith` changed something). Only the CHANGED conjuncts are
+/// (`fold_constant_arith_opt` changed something). Only the CHANGED conjuncts are
 /// returned, so the unfolded majority is not duplicated. The copies are added
 /// alongside the originals; the closed-constant / disjunctive paths then pick up the
 /// folded form. `out` owns them.
+/// Zero-allocation check matching [`fold_constant_arith_opt`]'s exact spine:
+/// `true` iff `f` contains a foldable non-overflowing literal-on-literal
+/// `Mul`/`Add`/`Sub`/`Neg` redex.
+pub(crate) fn formula_has_const_arith_redex(f: &Formula) -> bool {
+    use Formula::{Add, And, Eq, Ge, Gt, Int, Le, Lt, Mul, Neg, Not, Or, Sub};
+    match f {
+        Mul(a, b) => {
+            matches!((a.as_ref(), b.as_ref()), (Int(x), Int(y)) if x.checked_mul(*y).is_some())
+                || formula_has_const_arith_redex(a)
+                || formula_has_const_arith_redex(b)
+        }
+        Add(a, b) => {
+            matches!((a.as_ref(), b.as_ref()), (Int(x), Int(y)) if x.checked_add(*y).is_some())
+                || formula_has_const_arith_redex(a)
+                || formula_has_const_arith_redex(b)
+        }
+        Sub(a, b) => {
+            matches!((a.as_ref(), b.as_ref()), (Int(x), Int(y)) if x.checked_sub(*y).is_some())
+                || formula_has_const_arith_redex(a)
+                || formula_has_const_arith_redex(b)
+        }
+        Neg(a) => {
+            matches!(a.as_ref(), Int(x) if x.checked_neg().is_some())
+                || formula_has_const_arith_redex(a)
+        }
+        Not(x) => formula_has_const_arith_redex(x),
+        And(cs) | Or(cs) => cs.iter().any(formula_has_const_arith_redex),
+        Lt(a, b) | Le(a, b) | Gt(a, b) | Ge(a, b) | Eq(a, b) => {
+            formula_has_const_arith_redex(a) || formula_has_const_arith_redex(b)
+        }
+        _ => false,
+    }
+}
+
 fn fold_constant_arith_conjuncts(conjuncts: &[&Formula]) -> Vec<Formula> {
     let mut out = Vec::new();
     for &c in conjuncts {
-        let folded = fold_constant_arith(c);
-        if &folded != c {
+        if formula_has_const_arith_redex(c)
+            && let Some(folded) = fold_constant_arith_opt(c)
+        {
             out.push(folded);
         }
     }
@@ -2319,6 +3873,7 @@ fn tighten_strict_int_bounds(conjuncts: &[&Formula]) -> Vec<Formula> {
 /// (only weakening it would be unsound; adding entailed facts never is).
 fn extract_disjunction_common_conjuncts(conjuncts: &[&Formula]) -> Vec<Formula> {
     let mut out: Vec<Formula> = Vec::new();
+    let mut out_set: trust_types::fx::FxHashSet<Formula> = trust_types::fx::FxHashSet::default();
     for &c in conjuncts {
         let Formula::Or(disjuncts) = c else { continue };
         if disjuncts.len() < 2 {
@@ -2332,12 +3887,20 @@ fn extract_disjunction_common_conjuncts(conjuncts: &[&Formula]) -> Vec<Formula> 
             sets.push(cs);
         }
         let Some((first, rest)) = sets.split_first() else { continue };
+        let rest_hash: Vec<Option<trust_types::fx::FxHashSet<&Formula>>> = rest
+            .iter()
+            .map(|s| (s.len() > 16).then(|| s.iter().copied().collect()))
+            .collect();
         for &f in first {
+            if matches!(f, Formula::Bool(true)) {
+                continue;
+            }
             // Common to EVERY disjunct?
-            if rest.iter().all(|s| s.iter().any(|&g| g == f))
-                && !matches!(f, Formula::Bool(true))
-                && !out.iter().any(|o| o == f)
-            {
+            let in_all = rest.iter().zip(&rest_hash).all(|(s, h)| match h {
+                Some(set) => set.contains(f),
+                None => s.iter().any(|&g| g == f),
+            });
+            if in_all && out_set.insert(f.clone()) {
                 out.push(f.clone());
             }
         }
@@ -2356,42 +3919,111 @@ fn int_literal_value(f: &Formula) -> Option<i128> {
 
 /// `@Eq Int a b`.
 fn eq_int(a: Expr, b: Expr) -> Expr {
-    Expr::app(
-        Expr::app(
-            Expr::app(
-                Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
-                int_ty(),
-            ),
-            a,
-        ),
-        b,
-    )
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        Expr::app(Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]), int_ty())
+    });
+    Expr::app(Expr::app(head.clone(), a), b)
 }
 
 fn not_prop(prop: Expr) -> Expr {
-    Expr::app(Expr::const_(Name::from_string("Not"), vec![]), prop)
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    Expr::app(HEAD.get_or_init(|| Expr::const_(Name::from_string("Not"), vec![])).clone(), prop)
 }
 
 /// `@Eq.refl Int a`.
 fn eq_refl_int(a: Expr) -> Expr {
-    Expr::app(
-        Expr::app(
-            Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
-            int_ty(),
-        ),
-        a,
-    )
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        Expr::app(Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]), int_ty())
+    });
+    Expr::app(head.clone(), a)
 }
 
 /// A normalized linear-integer atom: a strict `<` or a non-strict `≤`. Every
 /// supported comparison — and its negation, and `=` — reduces to these two via
 /// [`normalize_atom`]. These are exactly the bounds ay's Farkas (`la_generic`)
 /// proofs reconstruct with ZERO residual trust.
+#[derive(Clone, Copy)]
 enum Atom<'a> {
     /// `a < b`.
     Lt(&'a Formula, &'a Formula),
     /// `a ≤ b`.
     Le(&'a Formula, &'a Formula),
+}
+
+/// Zero-heap-allocation 1- or 2-element stack container returned by
+/// [`normalize_atom`].
+#[derive(Clone, Copy)]
+struct NormalizedAtoms<'a> {
+    items: [Atom<'a>; 2],
+    len: u8,
+}
+
+impl<'a> NormalizedAtoms<'a> {
+    #[inline]
+    fn one(atom: Atom<'a>) -> Self {
+        Self { items: [atom, atom], len: 1 }
+    }
+
+    #[inline]
+    fn two(first: Atom<'a>, second: Atom<'a>) -> Self {
+        Self { items: [first, second], len: 2 }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[Atom<'a>] {
+        &self.items[..usize::from(self.len)]
+    }
+}
+
+impl<'a> std::ops::Deref for NormalizedAtoms<'a> {
+    type Target = [Atom<'a>];
+
+    #[inline]
+    fn deref(&self) -> &[Atom<'a>] {
+        self.as_slice()
+    }
+}
+
+struct NormalizedAtomsIter<'a> {
+    items: [Atom<'a>; 2],
+    pos: u8,
+    len: u8,
+}
+
+impl<'a> Iterator for NormalizedAtomsIter<'a> {
+    type Item = Atom<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.len {
+            return None;
+        }
+        let item = self.items[usize::from(self.pos)];
+        self.pos += 1;
+        Some(item)
+    }
+}
+
+impl<'a> IntoIterator for NormalizedAtoms<'a> {
+    type Item = Atom<'a>;
+    type IntoIter = NormalizedAtomsIter<'a>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        NormalizedAtomsIter { items: self.items, pos: 0, len: self.len }
+    }
+}
+
+impl<'a, 'b> IntoIterator for &'b NormalizedAtoms<'a> {
+    type Item = &'b Atom<'a>;
+    type IntoIter = std::slice::Iter<'b, Atom<'a>>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
 }
 
 /// Normalize a violation conjunct into one or more supported [`Atom`]s, or
@@ -2404,18 +4036,18 @@ enum Atom<'a> {
 /// raw `=` assumption gets decomposed by ay for the Farkas lemma, and the
 /// decomposed literals no longer syntactically match the assumption, forcing a
 /// `trustedAy` fallback. Two `≤` assumptions match their lemma literals exactly.
-fn normalize_atom(f: &Formula) -> Option<Vec<Atom<'_>>> {
+fn normalize_atom(f: &Formula) -> Option<NormalizedAtoms<'_>> {
     Some(match f {
-        Formula::Lt(a, b) => vec![Atom::Lt(a, b)],
-        Formula::Gt(a, b) => vec![Atom::Lt(b, a)],
-        Formula::Le(a, b) => vec![Atom::Le(a, b)],
-        Formula::Ge(a, b) => vec![Atom::Le(b, a)],
-        Formula::Eq(a, b) => vec![Atom::Le(a, b), Atom::Le(b, a)],
+        Formula::Lt(a, b) => NormalizedAtoms::one(Atom::Lt(a, b)),
+        Formula::Gt(a, b) => NormalizedAtoms::one(Atom::Lt(b, a)),
+        Formula::Le(a, b) => NormalizedAtoms::one(Atom::Le(a, b)),
+        Formula::Ge(a, b) => NormalizedAtoms::one(Atom::Le(b, a)),
+        Formula::Eq(a, b) => NormalizedAtoms::two(Atom::Le(a, b), Atom::Le(b, a)),
         Formula::Not(inner) => match inner.as_ref() {
-            Formula::Ge(a, b) => vec![Atom::Lt(a, b)],
-            Formula::Le(a, b) => vec![Atom::Lt(b, a)],
-            Formula::Gt(a, b) => vec![Atom::Le(a, b)],
-            Formula::Lt(a, b) => vec![Atom::Le(b, a)],
+            Formula::Ge(a, b) => NormalizedAtoms::one(Atom::Lt(a, b)),
+            Formula::Le(a, b) => NormalizedAtoms::one(Atom::Lt(b, a)),
+            Formula::Gt(a, b) => NormalizedAtoms::one(Atom::Le(a, b)),
+            Formula::Lt(a, b) => NormalizedAtoms::one(Atom::Le(b, a)),
             _ => return None,
         },
         _ => return None,
@@ -2478,22 +4110,35 @@ fn atom_identity_key<'a>(atom: &Atom<'a>) -> (bool, &'a Formula, &'a Formula) {
 }
 
 fn collect_supported_atoms<'a>(conjuncts: &[&'a Formula]) -> (Vec<Atom<'a>>, BTreeSet<String>) {
-    let mut atoms: Vec<Atom<'a>> = Vec::new();
+    let mut atoms: Vec<Atom<'a>> = Vec::with_capacity(conjuncts.len());
     let mut var_names: BTreeSet<String> = BTreeSet::new();
-    // Structural keys of the atoms already kept, parallel to `atoms`, so a
-    // repeated conjunct contributes its atom exactly once. See the duplicate
-    // note on the loop below.
-    let mut kept_keys: Vec<(bool, &'a Formula, &'a Formula)> = Vec::new();
+    let use_hash = conjuncts.len() > 16;
+    // Structural keys of the atoms already kept, so a repeated conjunct
+    // contributes its atom exactly once.
+    let mut kept_keys: Vec<(bool, &'a Formula, &'a Formula)> =
+        if use_hash { Vec::new() } else { Vec::with_capacity(conjuncts.len()) };
+    let mut kept_set: trust_types::fx::FxHashSet<(bool, &'a Formula, &'a Formula)> =
+        if use_hash {
+            trust_types::fx::FxHashSet::with_capacity_and_hasher(
+                conjuncts.len(),
+                Default::default(),
+            )
+        } else {
+            trust_types::fx::FxHashSet::default()
+        };
     for &c in conjuncts {
         let Some(normalized) = normalize_atom(c) else {
             continue;
         };
-        // Only keep the conjunct if EVERY resulting atom's leaves are supported
-        // Int terms; collect its vars into a scratch set first so a rejected
-        // conjunct contributes nothing to `var_names`.
-        let mut local_vars = BTreeSet::new();
-        if normalized.iter().all(|a| collect_int_vars(a, &mut local_vars)) {
-            var_names.extend(local_vars);
+        // Validate every resulting atom's leaves with zero heap allocation first
+        // so a rejected conjunct allocates nothing and contributes nothing to `var_names`.
+        let first_atom = normalized.as_slice()[0];
+        let (lhs, rhs) = match first_atom {
+            Atom::Lt(a, b) | Atom::Le(a, b) => (a, b),
+        };
+        if is_supported_int_term(lhs) && is_supported_int_term(rhs) {
+            record_supported_term_vars(lhs, &mut var_names);
+            record_supported_term_vars(rhs, &mut var_names);
             // DEDUPLICATE by structural identity. `∧` is idempotent, so a
             // conjunct that appears twice states one hypothesis, not two — but
             // `supported_hyps_from_atoms` is 1:1 with this vector, so a repeat
@@ -2501,29 +4146,22 @@ fn collect_supported_atoms<'a>(conjuncts: &[&'a Formula]) -> (Vec<Atom<'a>>, BTr
             // SAME assertion. ay's zero-trust reconstruction then cannot bind
             // its premise to one exact hypothesis and the whole certification
             // declines, even though the identical single-copy obligation
-            // certifies. Measured 2026-08-29 on
-            // `fn clamp_upper(v: u32, hi: u32) -> u32 ensures result <= hi`:
-            // any build with `-C debuginfo != 0` (i.e. every cargo/targo `dev`
-            // profile build) emits the return-slot definition `_0#s1_0 = hi`
-            // twice and the row lost its kernel certificate; with one copy it
-            // certifies. A constant-bounded twin (`_0 = 15`) was unaffected,
-            // which is exactly why constant bounds kept publishing while
-            // parameter bounds stopped.
-            //
-            // SOUNDNESS: this is the ∧-elimination argument above, applied to
-            // the strongest possible subset — the kept set is IDENTICAL as a
-            // set of propositions, so nothing is weakened. Producer and
-            // consumer both reach it through this one function, so the kernel
-            // still re-checks the term against the same context.
+            // certifies.
             for atom in normalized {
                 let key = atom_identity_key(&atom);
-                if kept_keys
-                    .iter()
-                    .any(|kept| kept.0 == key.0 && kept.1 == key.1 && kept.2 == key.2)
-                {
-                    continue;
+                if use_hash {
+                    if !kept_set.insert(key) {
+                        continue;
+                    }
+                } else {
+                    if kept_keys
+                        .iter()
+                        .any(|kept| kept.0 == key.0 && kept.1 == key.1 && kept.2 == key.2)
+                    {
+                        continue;
+                    }
+                    kept_keys.push(key);
                 }
-                kept_keys.push(key);
                 atoms.push(atom);
             }
         }
@@ -2569,14 +4207,30 @@ struct CanonicalEq<'a> {
 /// in `finish_certificate` are the backstops.
 fn complete_class_disequalities(conjuncts: &[&Formula]) -> Vec<Formula> {
     use std::collections::BTreeMap;
-    let mut parent: BTreeMap<String, String> = BTreeMap::new();
-    fn find(parent: &mut BTreeMap<String, String>, x: &str) -> String {
-        match parent.get(x).cloned() {
-            None => x.to_string(),
+    if !conjuncts.iter().any(|c| {
+        matches!(
+            c,
+            Formula::Not(inner)
+                if matches!(
+                    inner.as_ref(),
+                    Formula::Eq(a, b)
+                        if matches!(
+                            (a.as_ref(), b.as_ref()),
+                            (Formula::Var(_, Sort::Int), Formula::Var(_, Sort::Int))
+                        )
+                )
+        )
+    }) {
+        return Vec::new();
+    }
+    let mut parent: BTreeMap<&str, &str> = BTreeMap::new();
+    fn find<'a>(parent: &mut BTreeMap<&'a str, &'a str>, x: &'a str) -> &'a str {
+        match parent.get(x).copied() {
+            None => x,
             Some(p) if p == x => p,
             Some(p) => {
-                let root = find(parent, &p);
-                parent.insert(x.to_string(), root.clone());
+                let root = find(parent, p);
+                parent.insert(x, root);
                 root
             }
         }
@@ -2586,8 +4240,10 @@ fn complete_class_disequalities(conjuncts: &[&Formula]) -> Vec<Formula> {
             && let (Formula::Var(x, Sort::Int), Formula::Var(y, Sort::Int)) =
                 (a.as_ref(), b.as_ref())
         {
-            parent.entry(x.clone()).or_insert_with(|| x.clone());
-            parent.entry(y.clone()).or_insert_with(|| y.clone());
+            let x = x.as_str();
+            let y = y.as_str();
+            parent.entry(x).or_insert(x);
+            parent.entry(y).or_insert(y);
             let (rx, ry) = (find(&mut parent, x), find(&mut parent, y));
             if rx != ry {
                 parent.insert(rx, ry);
@@ -2603,9 +4259,9 @@ fn complete_class_disequalities(conjuncts: &[&Formula]) -> Vec<Formula> {
             && let Formula::Eq(a, b) = inner.as_ref()
             && let (Formula::Var(x, Sort::Int), Formula::Var(y, Sort::Int)) =
                 (a.as_ref(), b.as_ref())
-            && parent.contains_key(x)
-            && parent.contains_key(y)
-            && find(&mut parent, x) == find(&mut parent, y)
+            && parent.contains_key(x.as_str())
+            && parent.contains_key(y.as_str())
+            && find(&mut parent, x.as_str()) == find(&mut parent, y.as_str())
         {
             out.push(Formula::Eq(
                 Box::new(Formula::Var(x.clone(), Sort::Int)),
@@ -2693,7 +4349,9 @@ fn certify_direct_disequality_contradiction(
 
     let proof = direct_disequality_refutation(&eq_hyps, &neq_hyps)?;
 
-    let env = build_env(&var_names)?;
+    if !Carrier::Int.admits_skolems(&var_names) {
+        return None;
+    }
 
     let mut backend = AyProofBackend::new_with_proofs(AyLogic::QfLia);
     for name in &var_names {
@@ -2707,33 +4365,45 @@ fn certify_direct_disequality_contradiction(
     // drops at the end of this block — BEFORE the clean-kernel reconstruction /
     // re-check below, which is thread-safe by construction and must stay unlocked
     // so it parallelizes across verification threads.
-    match {
+    let answer = {
         let _ay_guard = trust_types::ay_exec_lock().lock().unwrap_or_else(|e| e.into_inner());
         backend.check_sat()
-    } {
+    };
+    note_ay_answer(&answer);
+    match answer {
         Ok(AyProofResult::Unsat { .. }) => {}
         _ => return None,
     }
 
+    let audited_env = AuditedCarrierEnv::build(Carrier::Int, &var_names)?;
     let ctx = build_ctx(&hyps);
-    if !kernel_checks_false(&env, ctx.clone(), &proof, &var_names) {
+    if !audited_env.kernel_checks_false(ctx.clone(), &proof, &var_names) {
         return None;
     }
 
     let term_bytes = serialize_term(&proof).ok()?;
     let reduced = reduced_context(&ctx);
     let context_bytes = serialize_context(&reduced).ok()?;
-    if !payload_roundtrip_rechecks(&var_names, &term_bytes, &context_bytes) {
-        return None;
-    }
+    let (roundtrip_term, roundtrip_reduced) =
+        audited_env.recheck_roundtrip(&var_names, &term_bytes, &context_bytes)?;
 
     let lineage = lineage_digest(&term_bytes, &context_bytes, identity);
-    Some(trust_ir::ProofEvidence::CleanCic {
+    register_reference_refutation_decoded(
+        Carrier::Int,
+        &var_names,
+        &term_bytes,
+        &context_bytes,
+        &lineage,
+        &roundtrip_term,
+        roundtrip_reduced,
+    );
+    let evidence = trust_ir::ProofEvidence::CleanCic {
         term: term_bytes,
         context: context_bytes,
         lineage,
         kernel_recheck: None,
-    })
+    };
+    Some(evidence)
 }
 
 fn push_hyp(hyps: &mut Vec<Hyp>, smt: String, prop: Expr) -> FVarId {
@@ -2824,6 +4494,17 @@ fn certify_propositional_closure_contradiction(
     conjuncts: &[&Formula],
     identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
+    try_propositional_closure(conjuncts, |leaves| {
+        propositional_closure_certificate(leaves, identity)
+    })
+}
+
+/// Enumerate only source-entailed closures; shared by proof generation and
+/// presented-context replay. No solver or certificate is consulted here.
+fn try_propositional_closure<T>(
+    conjuncts: &[&Formula],
+    mut accept: impl FnMut(&[Formula]) -> Option<T>,
+) -> Option<T> {
     let mut flat: Vec<&Formula> = Vec::new();
     for &c in conjuncts {
         collect_conjuncts(c, &mut flat);
@@ -2851,7 +4532,7 @@ fn certify_propositional_closure_contradiction(
         if !leaves.iter().all(|q| pool.iter().any(|h| h == q)) {
             continue;
         }
-        if let Some(evidence) = propositional_closure_certificate(&leaves, identity) {
+        if let Some(evidence) = accept(&leaves) {
             return Some(evidence);
         }
     }
@@ -2868,6 +4549,13 @@ fn propositional_closure_certificate(
     leaves: &[Formula],
     identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
+    let (hyps, term, var_names) = propositional_closure_hypotheses(leaves)?;
+    finish_certificate(&hyps, &term, &var_names, identity)
+}
+
+fn propositional_closure_hypotheses(
+    leaves: &[Formula],
+) -> Option<(Vec<Hyp>, Expr, BTreeSet<String>)> {
     // Injective atom → indicator index (structural dedup, positional index).
     let mut distinct: Vec<&Formula> = Vec::new();
     let mut index_of: Vec<usize> = Vec::with_capacity(leaves.len());
@@ -2919,7 +4607,7 @@ fn propositional_closure_certificate(
     let term = Expr::app(Expr::fvar(v_fvar), conj_proof);
 
     let var_names: BTreeSet<String> = names.into_iter().collect();
-    finish_certificate(&hyps, &term, &var_names, identity)
+    Some((hyps, term, var_names))
 }
 
 // ---------------------------------------------------------------------------
@@ -3010,7 +4698,9 @@ fn certify_membership_disjunction_resolution(
 ///
 /// Returns every `Or` conjunct of the pool EVERY disjunct of which also appears,
 /// verbatim, negated as its own conjunct — the branch list in branch order, in
-/// canonical [`propositional_form`], in pool order. Empty when there is none.
+/// canonical [`propositional_form`], in pool order — then, after every such `Or`,
+/// every positive atom conjunct whose own negation is also a conjunct, as the
+/// one-branch list `[P]`. Empty when there is none.
 ///
 /// SOUNDNESS of the two rewrites the pool passes through: [`collect_conjuncts`]
 /// only flattens `And` and eliminates double negation, and [`propositional_form`]
@@ -3051,6 +4741,32 @@ fn membership_witnesses(conjuncts: &[&Formula], max_pool: usize) -> Vec<Vec<Form
         }
         found.push(branches);
     }
+    // Trust (2026-09-27, class `v-refuted-unreachable`): a POSITIVE unit `P` whose
+    // negation `¬P` is also a conjunct is the ONE-disjunct membership `Or([P])` —
+    // the same gate (its only disjunct appears negated) over the same pool, tried
+    // after every genuine `Or` so the witness chosen for a pool that already had one
+    // is unchanged. The shape is a path of a tuple `match` whose re-read scrutinee
+    // the generator renders through the read it is tied to (`a = 1` on the edge that
+    // tested the field, `¬(a = 1)` on the subset switch's `otherwise`). Sound by the
+    // lane's own argument: `P` and `¬P` are both conjuncts of the pool handed in, so
+    // both are entailed by it, and the one-branch resolution derives `False` from
+    // hypotheses the input implies. Only the pool's OWN negations are consulted, so a
+    // per-path caller never closes one path with a sibling path's `¬P`. This check is
+    // TRUSTED, like the `Or` gate above: the kernel re-checks only the abstracted
+    // resolution over opaque indicators, so a unit admitted without its own negation
+    // would certify a satisfiable path (`a_unit_without_its_own_negation_declines`
+    // and the reachable-trap declines fail when it is dropped).
+    for candidate in &pool {
+        if matches!(
+            candidate,
+            Formula::Or(_) | Formula::Not(_) | Formula::And(_) | Formula::Bool(_)
+        ) {
+            continue;
+        }
+        if negated.iter().any(|n| n == candidate) {
+            found.push(vec![candidate.clone()]);
+        }
+    }
     found
 }
 
@@ -3064,6 +4780,13 @@ fn membership_resolution_certificate(
     branches: &[Formula],
     identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
+    let (hyps, term, var_names) = membership_resolution_hypotheses(branches)?;
+    finish_certificate(&hyps, &term, &var_names, identity)
+}
+
+fn membership_resolution_hypotheses(
+    branches: &[Formula],
+) -> Option<(Vec<Hyp>, Expr, BTreeSet<String>)> {
     // Injective disjunct → indicator index (structural dedup, positional index).
     let mut distinct: Vec<&Formula> = Vec::new();
     let mut index_of: Vec<usize> = Vec::with_capacity(branches.len());
@@ -3111,7 +4834,7 @@ fn membership_resolution_certificate(
     let term = membership_resolution_false(&branch_props, &branch_negs, Expr::fvar(or_fvar))?;
 
     let var_names: BTreeSet<String> = names.into_iter().collect();
-    finish_certificate(&hyps, &term, &var_names, identity)
+    Some((hyps, term, var_names))
 }
 
 /// Build a `False` term from `h_or : P₀ ∨ (P₁ ∨ …)` where branch `i` is closed
@@ -3334,6 +5057,13 @@ fn certify_path_disjunction_membership(
     conjuncts: &[&Formula],
     identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
+    try_path_membership(conjuncts, |paths| path_membership_certificate(paths, identity))
+}
+
+fn try_path_membership<T>(
+    conjuncts: &[&Formula],
+    mut accept: impl FnMut(&[Vec<Formula>]) -> Option<T>,
+) -> Option<T> {
     let mut flat: Vec<&Formula> = Vec::new();
     for &c in conjuncts {
         collect_conjuncts(c, &mut flat);
@@ -3371,7 +5101,7 @@ fn certify_path_disjunction_membership(
         if witnesses.len() != paths.len() {
             continue;
         }
-        if let Some(evidence) = path_membership_certificate(&witnesses, identity) {
+        if let Some(evidence) = accept(&witnesses) {
             return Some(evidence);
         }
     }
@@ -3388,6 +5118,14 @@ fn path_membership_certificate(
     paths: &[Vec<Formula>],
     identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
+    let (plans, hyps, or_fvar, var_names) = path_membership_hypotheses(paths)?;
+    let term = path_disjunction_false(&plans, PathCarrier::Free(or_fvar))?;
+    finish_certificate(&hyps, &term, &var_names, identity)
+}
+
+fn path_membership_hypotheses(
+    paths: &[Vec<Formula>],
+) -> Option<(Vec<PathPlan>, Vec<Hyp>, FVarId, BTreeSet<String>)> {
     // ONE global atom → indicator table across every path. Structural dedup, so
     // the map is a function; distinct atoms get distinct indicators, so it merges
     // nothing (merging two distinct atoms would add an unsound "they agree"
@@ -3475,10 +5213,9 @@ fn path_membership_certificate(
 
     let mut hyps: Vec<Hyp> = Vec::new();
     let or_fvar = push_hyp(&mut hyps, or_smt, build_or_prop(&path_props)?);
-    let term = path_disjunction_false(&plans, PathCarrier::Free(or_fvar))?;
 
     let var_names: BTreeSet<String> = names.into_iter().collect();
-    finish_certificate(&hyps, &term, &var_names, identity)
+    Some((plans, hyps, or_fvar, var_names))
 }
 
 /// Build a `False` term from `h : W₀ ∨ (W₁ ∨ …)`, each branch closed by the
@@ -3643,20 +5380,22 @@ fn closed_int_eq_operands(f: &Formula) -> (Option<i128>, Option<i128>) {
 }
 
 /// Apply a kernel constant (no level args) to a list of argument terms.
-fn const_app(name: &str, args: impl IntoIterator<Item = Expr>) -> Expr {
-    Expr::apps(Expr::const_(Name::from_string(name), vec![]), args)
+fn const_app(name: &'static str, args: impl IntoIterator<Item = Expr>) -> Expr {
+    Expr::apps(Expr::const_(Name::interned(name), vec![]), args)
 }
 
 /// `@Int.NonNeg.mk k : Int.NonNeg (Int.ofNat k)` — the positive witness whose
 /// type def-eq-reduces (via the native `Int.sub`/`Int.add` reducers) to the
 /// `Int.le`/`Int.lt` proposition we need.
 fn nonneg_mk(k: u64) -> Expr {
-    Expr::app(Expr::const_(Name::from_string("Int.NonNeg.mk"), vec![]), Expr::nat_lit(k))
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    Expr::app(HEAD.get_or_init(|| Expr::const_(Name::interned("Int.NonNeg.mk"), vec![])).clone(), Expr::nat_lit(k))
 }
 
 /// `Int.NonNeg.mk k` for an arbitrary `u128` gap witness (i128-range thresholds).
 fn nonneg_mk_u128(k: u128) -> Expr {
-    Expr::app(Expr::const_(Name::from_string("Int.NonNeg.mk"), vec![]), Expr::nat_lit_u128(k))
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    Expr::app(HEAD.get_or_init(|| Expr::const_(Name::interned("Int.NonNeg.mk"), vec![])).clone(), Expr::nat_lit_u128(k))
 }
 
 /// The kernel proposition for a closed order atom, built from the BARE
@@ -3727,18 +5466,20 @@ fn refute_false_atom(atom: &ClosedOrderAtom, h: Expr) -> Option<Expr> {
 
 /// `@Eq.symm.{1} Int a b (h : Eq a b) : Eq b a`.
 fn eq_symm_int(a: Expr, b: Expr, h: Expr) -> Expr {
-    Expr::apps(
-        Expr::const_(Name::from_string("Eq.symm"), vec![Level::succ(Level::zero())]),
-        [int_ty(), a, b, h],
-    )
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        Expr::app(Expr::const_(Name::interned("Eq.symm"), vec![Level::succ(Level::zero())]), int_ty())
+    });
+    Expr::apps(head.clone(), [a, b, h])
 }
 
 /// `@Eq.subst.{1} Int motive a b (h : Eq a b) (m : motive a) : motive b`.
 fn eq_subst_int(motive: Expr, a: Expr, b: Expr, h: Expr, m: Expr) -> Expr {
-    Expr::apps(
-        Expr::const_(Name::from_string("Eq.subst"), vec![Level::succ(Level::zero())]),
-        [int_ty(), motive, a, b, h, m],
-    )
+    static HEAD: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        Expr::app(Expr::const_(Name::interned("Eq.subst"), vec![Level::succ(Level::zero())]), int_ty())
+    });
+    Expr::apps(head.clone(), [motive, a, b, h, m])
 }
 
 /// Build a kernel term of type `False` from a hypothesis `h : Eq a b` for two
@@ -3799,13 +5540,20 @@ struct VarBound {
     hyp: Expr,
 }
 
-/// The variable name if `f` is an `Int`-sorted variable, else `None`.
-fn int_var_name(f: &Formula) -> Option<String> {
+/// Borrowed variable name if `f` is an `Int`-sorted variable, else `None`.
+#[inline]
+fn int_var_name_str(f: &Formula) -> Option<&str> {
     match f {
-        Formula::Var(name, Sort::Int) => Some(name.clone()),
-        Formula::SymVar(sym, Sort::Int) => Some(sym.as_str().to_string()),
+        Formula::Var(name, Sort::Int) => Some(name.as_str()),
+        Formula::SymVar(sym, Sort::Int) => Some(sym.as_str()),
         _ => None,
     }
+}
+
+/// The variable name if `f` is an `Int`-sorted variable, else `None`.
+#[inline]
+fn int_var_name(f: &Formula) -> Option<String> {
+    int_var_name_str(f).map(str::to_string)
 }
 
 /// Interpret a normalized atom (`x < c`, `c ≤ x`, …) as a constant bound on a
@@ -4037,7 +5785,15 @@ fn chain_node(f: &Formula) -> Option<ChainNode> {
 /// `L R U`, then closed by [`refute_false_atom`]. Fail-closed: only a genuine
 /// conflict is refuted, and the kernel re-check is the backstop.
 fn transitive_chain_refutation(atoms: &[Atom<'_>], hyps: &[Hyp]) -> Option<Expr> {
-    let edges: Vec<OrderEdge> = atoms
+    refute_via_chain_edges(&atom_order_edges(atoms, hyps))
+}
+
+/// The order edges of an atom pool, one or two per atom ([`build_order_edges`]),
+/// each carrying its hypothesis fvar. Shared by [`transitive_chain_refutation`]
+/// and the large-pool chain lane ([`large_order_chain`]) so both search the
+/// IDENTICAL edge set.
+fn atom_order_edges(atoms: &[Atom<'_>], hyps: &[Hyp]) -> Vec<OrderEdge> {
+    atoms
         .iter()
         .zip(hyps)
         .flat_map(|(atom, hyp)| {
@@ -4047,8 +5803,7 @@ fn transitive_chain_refutation(atoms: &[Atom<'_>], hyps: &[Hyp]) -> Option<Expr>
             };
             build_order_edges(a, b, strict, Expr::fvar(hyp.fvar))
         })
-        .collect();
-    refute_via_chain_edges(&edges)
+        .collect()
 }
 
 /// Lift the guard bounds in an edge set onto the scaled (`x*c`) nodes that
@@ -4057,9 +5812,11 @@ fn transitive_chain_refutation(atoms: &[Atom<'_>], hyps: &[Hyp]) -> Option<Expr>
 /// additive linear shift, and is what lets a guarded multiplication
 /// (`if x<100 { x*2 }`: violation `Or([x*2<0, x*2>255])`) close: `x≤99 ⟹ x*2≤198`
 /// contradicts `x*2>255`, and `0≤x ⟹ 0≤x*2` contradicts `x*2<0`.
-fn augment_with_multiplicative_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
+fn augment_with_multiplicative_lifts<'a>(
+    edges: std::borrow::Cow<'a, [OrderEdge]>,
+) -> std::borrow::Cow<'a, [OrderEdge]> {
     let mut scaled: BTreeSet<(String, i128)> = BTreeSet::new();
-    for edge in edges {
+    for edge in edges.iter() {
         for node in [&edge.from, &edge.to] {
             if let ChainNode::Scaled(v, c) = node {
                 scaled.insert((v.clone(), *c));
@@ -4067,10 +5824,10 @@ fn augment_with_multiplicative_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
         }
     }
     if scaled.is_empty() {
-        return edges.to_vec();
+        return edges;
     }
-    let mut out = edges.to_vec();
-    for edge in edges {
+    let mut lifts = Vec::new();
+    for edge in edges.iter() {
         // Only NON-STRICT bounds lift cleanly (`Int.mul_le_mul_of_nonneg_right`);
         // a strict guard already carries its integer-tightened `≤` form alongside.
         if edge.strict {
@@ -4081,7 +5838,7 @@ fn augment_with_multiplicative_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
             (ChainNode::Var(v), ChainNode::Lit(b)) => {
                 for (_, c) in scaled.iter().filter(|(sv, _)| sv == v) {
                     if let Some(lift) = mul_lift(v, *b, *c, true, &edge.hyp) {
-                        out.push(lift);
+                        lifts.push(lift);
                     }
                 }
             }
@@ -4089,14 +5846,19 @@ fn augment_with_multiplicative_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
             (ChainNode::Lit(l), ChainNode::Var(v)) => {
                 for (_, c) in scaled.iter().filter(|(sv, _)| sv == v) {
                     if let Some(lift) = mul_lift(v, *l, *c, false, &edge.hyp) {
-                        out.push(lift);
+                        lifts.push(lift);
                     }
                 }
             }
             _ => {}
         }
     }
-    out
+    if lifts.is_empty() {
+        return edges;
+    }
+    let mut out = edges.into_owned();
+    out.extend(lifts);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Build the lifted edge for a guard bound on `x` scaled by `c > 0`.
@@ -4158,9 +5920,11 @@ fn chain_var_expr(v: &str) -> Expr {
 /// `La≤a ∧ Lb≤b ⟹ La+Lb ≤ a+b`. This is what lets a guarded two-variable
 /// addition (`if a<1000 && b<1000 { a+b }` (u32, Int overflow): violation
 /// `Or([a+b<0, a+b>u32::MAX])`) close: `a≤999 ∧ b≤999 ⟹ a+b≤1998 < MAX`.
-fn augment_with_additive_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
+fn augment_with_additive_lifts<'a>(
+    edges: std::borrow::Cow<'a, [OrderEdge]>,
+) -> std::borrow::Cow<'a, [OrderEdge]> {
     let mut sums: BTreeSet<(String, String)> = BTreeSet::new();
-    for edge in edges {
+    for edge in edges.iter() {
         for node in [&edge.from, &edge.to] {
             if let ChainNode::Sum(a, b) = node {
                 sums.insert((a.clone(), b.clone()));
@@ -4168,12 +5932,12 @@ fn augment_with_additive_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
         }
     }
     if sums.is_empty() {
-        return edges.to_vec();
+        return edges;
     }
     // Tightest non-strict bound per variable: min upper, max lower.
     let mut upper: std::collections::BTreeMap<String, (i128, Expr)> = Default::default();
     let mut lower: std::collections::BTreeMap<String, (i128, Expr)> = Default::default();
-    for edge in edges {
+    for edge in edges.iter() {
         if edge.strict {
             continue;
         }
@@ -4193,20 +5957,25 @@ fn augment_with_additive_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
             _ => {}
         }
     }
-    let mut out = edges.to_vec();
+    let mut lifts = Vec::new();
     for (a, b) in &sums {
         if let (Some((ua, ha)), Some((ub, hb))) = (upper.get(a), upper.get(b)) {
             if let Some(e) = add_lift(a, b, *ua, *ub, ha, hb, true) {
-                out.push(e);
+                lifts.push(e);
             }
         }
         if let (Some((la, ha)), Some((lb, hb))) = (lower.get(a), lower.get(b)) {
             if let Some(e) = add_lift(a, b, *la, *lb, ha, hb, false) {
-                out.push(e);
+                lifts.push(e);
             }
         }
     }
-    out
+    if lifts.is_empty() {
+        return edges;
+    }
+    let mut out = edges.into_owned();
+    out.extend(lifts);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Build the lifted edge for two guard bounds on the summands of `a+b`.
@@ -4279,7 +6048,8 @@ fn int_neg_expr(a: Expr) -> Expr {
 /// `Int.ofNat 0` form `int_literal_to_kernel(0)` emits. The `Int.add_zero` /
 /// `Int.add_neg_self` / `Int.neg_add_self` algebra lemmas are stated over it.
 fn int_zero_expr() -> Expr {
-    Expr::const_(Name::from_string("Int.zero"), vec![])
+    static ZERO: std::sync::OnceLock<Expr> = std::sync::OnceLock::new();
+    ZERO.get_or_init(|| Expr::const_(Name::interned("Int.zero"), vec![])).clone()
 }
 
 /// LOWER bound on a two-variable difference: from the guard `h : Int.le b a`
@@ -4374,9 +6144,11 @@ fn diff_upper_proof(a: &str, b: &str, nonneg_b_hyp: &Expr) -> Expr {
 /// SOUNDNESS: every lifted edge is a kernel-checked proof term re-verified by the
 /// clean kernel; an unguarded `a-b` keeps no `b ≤ a` edge, so its underflow
 /// disjunct stays unrefuted and the whole `Or.rec` fails closed (no certificate).
-fn augment_with_subtractive_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
+fn augment_with_subtractive_lifts<'a>(
+    edges: std::borrow::Cow<'a, [OrderEdge]>,
+) -> std::borrow::Cow<'a, [OrderEdge]> {
     let mut diffs: BTreeSet<(String, String)> = BTreeSet::new();
-    for edge in edges {
+    for edge in edges.iter() {
         for node in [&edge.from, &edge.to] {
             if let ChainNode::Diff(a, b) = node {
                 diffs.insert((a.clone(), b.clone()));
@@ -4384,9 +6156,9 @@ fn augment_with_subtractive_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
         }
     }
     if diffs.is_empty() {
-        return edges.to_vec();
+        return edges;
     }
-    let mut out = edges.to_vec();
+    let mut lifts = Vec::new();
     for (a, b) in &diffs {
         // LOWER: find a guard `b ≤ a` / `b < a` (edge Var(b) → Var(a)).
         if let Some(guard) = edges.iter().find_map(|e| match (&e.from, &e.to) {
@@ -4403,7 +6175,7 @@ fn augment_with_subtractive_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
             }
             _ => None,
         }) {
-            out.push(OrderEdge {
+            lifts.push(OrderEdge {
                 from: ChainNode::Lit(0),
                 to: ChainNode::Diff(a.clone(), b.clone()),
                 from_expr: int_literal_to_kernel(0).expect("ofNat 0"),
@@ -4417,7 +6189,7 @@ fn augment_with_subtractive_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
             (ChainNode::Lit(0), ChainNode::Var(vb)) if vb == b && !e.strict => Some(e.hyp.clone()),
             _ => None,
         }) {
-            out.push(OrderEdge {
+            lifts.push(OrderEdge {
                 from: ChainNode::Diff(a.clone(), b.clone()),
                 to: ChainNode::Var(a.clone()),
                 from_expr: const_app("Int.sub", [chain_var_expr(a), chain_var_expr(b)]),
@@ -4427,7 +6199,12 @@ fn augment_with_subtractive_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
             });
         }
     }
-    out
+    if lifts.is_empty() {
+        return edges;
+    }
+    let mut out = edges.into_owned();
+    out.extend(lifts);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Lift guard bounds onto the two-variable PRODUCT nodes (`x*y`) that appear —
@@ -4457,9 +6234,11 @@ fn augment_with_subtractive_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
 /// an edge to `Lit(Kx·Ky)` whose literal EXCEEDS the violation threshold, so no
 /// conflicting chain exists and the obligation fails closed — the lift uses
 /// the actual bound magnitudes, never the mere existence of a guard.
-fn augment_with_product_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
+fn augment_with_product_lifts<'a>(
+    edges: std::borrow::Cow<'a, [OrderEdge]>,
+) -> std::borrow::Cow<'a, [OrderEdge]> {
     let mut products: BTreeSet<(String, String)> = BTreeSet::new();
-    for edge in edges {
+    for edge in edges.iter() {
         for node in [&edge.from, &edge.to] {
             if let ChainNode::Product(x, y) = node {
                 products.insert((x.clone(), y.clone()));
@@ -4467,7 +6246,7 @@ fn augment_with_product_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
         }
     }
     if products.is_empty() {
-        return edges.to_vec();
+        return edges;
     }
     // Tightest non-strict upper bound per variable (min B — same discipline as
     // the additive lift) and the EXACT `0 ≤ v` witnesses. The non-negativity
@@ -4477,7 +6256,7 @@ fn augment_with_product_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
     // weakened here — absent the exact form the lift declines (fail-closed).
     let mut upper: std::collections::BTreeMap<String, (i128, Expr)> = Default::default();
     let mut nonneg: std::collections::BTreeMap<String, Expr> = Default::default();
-    for edge in edges {
+    for edge in edges.iter() {
         if edge.strict {
             continue;
         }
@@ -4494,22 +6273,27 @@ fn augment_with_product_lifts(edges: &[OrderEdge]) -> Vec<OrderEdge> {
             _ => {}
         }
     }
-    let mut out = edges.to_vec();
+    let mut lifts = Vec::new();
     for (x, y) in &products {
         if let (Some((kx, hx)), Some((ky, hy)), Some(hy0)) =
             (upper.get(x), upper.get(y), nonneg.get(y))
         {
             if let Some(edge) = product_upper_lift(x, y, *kx, *ky, hx, hy, hy0) {
-                out.push(edge);
+                lifts.push(edge);
             }
         }
         if let (Some(hx0), Some(hy0)) = (nonneg.get(x), nonneg.get(y)) {
             if let Some(edge) = product_nonneg_lift(x, y, hx0, hy0) {
-                out.push(edge);
+                lifts.push(edge);
             }
         }
     }
-    out
+    if lifts.is_empty() {
+        return edges;
+    }
+    let mut out = edges.into_owned();
+    out.extend(lifts);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Build the UPPER lifted edge `Product(x,y) → Lit(Kx·Ky)` — see
@@ -4602,19 +6386,30 @@ fn product_nonneg_lift(x: &str, y: &str, hx0: &Expr, hy0: &Expr) -> Option<Order
     })
 }
 
+/// The edge-set cap of the EXHAUSTIVE chain DFS in [`refute_via_chain_edges`].
+/// A lifted edge set above it is not searched there; [`large_order_chain`]
+/// takes exactly those sets, with a polynomial search instead.
+const CHAIN_DFS_MAX_EDGES: usize = 48;
+
+/// `edges` plus every lifted edge the chain search derives from them
+/// (multiplicative, additive, subtractive and product lifts, in that order).
+fn lifted_chain_edges<'a>(edges: &'a [OrderEdge]) -> std::borrow::Cow<'a, [OrderEdge]> {
+    let edges = augment_with_multiplicative_lifts(std::borrow::Cow::Borrowed(edges));
+    let edges = augment_with_additive_lifts(edges);
+    let edges = augment_with_subtractive_lifts(edges);
+    augment_with_product_lifts(edges)
+}
+
 /// Search a set of order edges for a transitive chain `L R … R U` between
 /// conflicting literals and return its kernel `False` refutation, or `None`.
 fn refute_via_chain_edges(edges: &[OrderEdge]) -> Option<Expr> {
-    let edges = augment_with_multiplicative_lifts(edges);
-    let edges = augment_with_additive_lifts(&edges);
-    let edges = augment_with_subtractive_lifts(&edges);
-    let edges = augment_with_product_lifts(&edges);
-    let edges = edges.as_slice();
+    let edges = lifted_chain_edges(edges);
+    let edges = edges.as_ref();
     // Bound the DFS: a handful of order atoms is typical, and the `visited` set
     // already caps each path at the node count, but cap the edge set so a
     // pathological machine-generated VC cannot drive a super-polynomial search.
     // Fail-closed: an over-large system simply isn't chain-refuted here.
-    if edges.len() > 48 {
+    if edges.len() > CHAIN_DFS_MAX_EDGES {
         return None;
     }
     for start in edges.iter().filter(|e| matches!(e.from, ChainNode::Lit(_))) {
@@ -5163,6 +6958,23 @@ enum DisjunctRefutation<'a> {
     /// admits a derived member only after proving the syntactic entailment rule
     /// described by the branch-clamp consequence-closure module.
     DerivedChainAtoms { atoms: Vec<(Formula, Formula, bool)>, props: Vec<Expr> },
+    /// VGAPS-G1C: the index disequality `Not(Eq(a, b))` of an element-read
+    /// congruence, closed against the context by `Int.le_antisymm`
+    /// ([`element_congruence::refute_disequality`]). Parsed only by the congruence
+    /// lane, so no other lane's accepted set or bytes change.
+    Disequality { a: &'a Formula, b: &'a Formula },
+    /// VGAPS-G1C, the hardened twin: the value tie of a congruence (its two order
+    /// atoms, as [`Self::ChainAtoms`]), whose branch closes only against ANOTHER
+    /// disjunction of the violation, `then` (the twin's own overflow core
+    /// `Or([d - 1 < 0, d - 1 > MAX])`), bound to `then_hyp`: each of its disjuncts is
+    /// refuted against the context extended by the tie's edges
+    /// ([`element_congruence::refute_tie_then`]). Parsed only by the congruence lane.
+    ChainAtomsThen {
+        atoms: Vec<(Formula, Formula, bool)>,
+        props: Vec<Expr>,
+        then: Vec<Disjunct<'a>>,
+        then_hyp: Expr,
+    },
 }
 
 // R171 note: the right-nested binary `And` builder this variant projects through is
@@ -5256,6 +7068,12 @@ fn refute_disjunct(d: &Disjunct<'_>, context: &[OrderEdge], h: Expr) -> Option<E
         }
         DisjunctRefutation::DerivedChainAtoms { atoms, props } => {
             branch_clamp::refute_derived_chain_atoms(atoms, props, context, h)
+        }
+        DisjunctRefutation::Disequality { a, b } => {
+            element_congruence::refute_disequality(a, b, context, h)
+        }
+        DisjunctRefutation::ChainAtomsThen { atoms, props, then, then_hyp } => {
+            element_congruence::refute_tie_then(atoms, props, then, then_hyp, context, h)
         }
     }
 }
@@ -5556,8 +7374,7 @@ fn derive_disjunct_entailed_atoms(pool: &[&Formula]) -> Vec<Formula> {
     let mut derived: Vec<Formula> = unfold_asserted_bool_reifications(pool);
     for _round in 0..4 {
         let mut new: Vec<Formula> = Vec::new();
-        let have =
-            |f: &Formula| pool.iter().any(|p| *p == f) || derived.iter().any(|d| d == f);
+        let have = |f: &Formula| pool.iter().any(|p| *p == f) || derived.iter().any(|d| d == f);
         // Rule 2 — reverse unfold, over pool and previously derived facts.
         for asserted in pool.iter().copied().chain(derived.iter()) {
             for (name, body) in &defs {
@@ -5578,9 +7395,12 @@ fn derive_disjunct_entailed_atoms(pool: &[&Formula]) -> Vec<Formula> {
         for &c in pool {
             if let Formula::Implies(cond, cons) = c {
                 let want = strip_double_neg(cond);
-                let hit = pool.iter().copied().chain(derived.iter()).chain(new.iter()).any(
-                    |p| strip_double_neg(p) == want,
-                );
+                let hit = pool
+                    .iter()
+                    .copied()
+                    .chain(derived.iter())
+                    .chain(new.iter())
+                    .any(|p| strip_double_neg(p) == want);
                 if hit && !have(cons) && !new.iter().any(|n| n == cons.as_ref()) {
                     new.push(cons.as_ref().clone());
                 }
@@ -5620,9 +7440,9 @@ fn distribute_negated_conjunctions(arms: &[Formula]) -> Option<Vec<Formula>> {
         // denotes exactly the original arm.
         let mut members: Vec<&Formula> = Vec::new();
         collect_conjuncts(arm, &mut members);
-        let target = members.iter().position(|m| {
-            matches!(m, Formula::Not(inner) if matches!(inner.as_ref(), Formula::And(_)))
-        });
+        let target = members.iter().position(
+            |m| matches!(m, Formula::Not(inner) if matches!(inner.as_ref(), Formula::And(_))),
+        );
         match target {
             None => out.push(arm.clone()),
             Some(i) => {
@@ -5632,8 +7452,7 @@ fn distribute_negated_conjunctions(arms: &[Formula]) -> Option<Vec<Formula>> {
                     return None; // Not(And([])) = Not(true) = false — outside this rule.
                 }
                 for piece in negated {
-                    let mut m: Vec<Formula> =
-                        members.iter().map(|f| (*f).clone()).collect();
+                    let mut m: Vec<Formula> = members.iter().map(|f| (*f).clone()).collect();
                     m[i] = Formula::Not(Box::new(piece.clone()));
                     out.push(Formula::And(m));
                 }
@@ -5674,8 +7493,7 @@ fn parse_and_disjunct_order_atoms(di: &Formula) -> Option<Disjunct<'_>> {
     for c in flat.iter().copied().chain(derived.iter()) {
         let Some(norm) = normalize_atom(c) else { continue };
         for atom in &norm {
-            let (Some(prop), Some(smt)) = (linear_atom_prop(atom), linear_atom_smt(atom))
-            else {
+            let (Some(prop), Some(smt)) = (linear_atom_prop(atom), linear_atom_smt(atom)) else {
                 continue;
             };
             match atom {
@@ -5791,14 +7609,14 @@ fn parse_and_disjunct_internal_pair(di: &Formula) -> Option<Disjunct<'_>> {
 
     // Canonical `(var, literal)` reading of an `Eq` between an Int variable and
     // an Int literal (either operand order).
-    let var_lit_eq = |f: &Formula| -> Option<(String, i128)> {
+    fn var_lit_eq(f: &Formula) -> Option<(&str, i128)> {
         let Formula::Eq(a, b) = f else { return None };
-        match (int_var_name(a), int_literal_value(b), int_literal_value(a), int_var_name(b)) {
+        match (int_var_name_str(a), int_literal_value(b), int_literal_value(a), int_var_name_str(b)) {
             (Some(v), Some(c), _, _) => Some((v, c)),
             (_, _, Some(c), Some(v)) => Some((v, c)),
             _ => None,
         }
-    };
+    }
 
     // The kernel/SMT renderings shared by both pair kinds.
     let build = |v: &str, c: i128, kind_b: Option<i128>| -> Option<Disjunct<'static>> {
@@ -5839,7 +7657,7 @@ fn parse_and_disjunct_internal_pair(di: &Formula) -> Option<Disjunct<'_>> {
                 if var_lit_eq(inner).is_some_and(|(nv, nc)| nv == v && nc == c))
         });
         if has_neg {
-            return build(&v, c, None);
+            return build(v, c, None);
         }
     }
     // (ii) `Eq(v, a)` with a conflicting `Eq(v, b)`, `a ≠ b`.
@@ -5849,7 +7667,7 @@ fn parse_and_disjunct_internal_pair(di: &Formula) -> Option<Disjunct<'_>> {
             .iter()
             .find_map(|&g| var_lit_eq(g).filter(|(gv, gc)| *gv == v && *gc != a).map(|(_, gc)| gc));
         if let Some(b) = conflicting {
-            return build(&v, a, Some(b));
+            return build(v, a, Some(b));
         }
     }
     None
@@ -5890,16 +7708,24 @@ impl Threshold {
     }
 }
 
-/// The two free `Int` variables `a, b` of an `Add(a, b)` term (either operand
-/// order is the sum `a + b`), or `None` if the term is not a sum of two plain
-/// `Int` variables.
-fn add_var_pair(f: &Formula) -> Option<(String, String)> {
+/// Borrowed free `Int` variables `(a, b)` of an `Add(a, b)` term, or `None` if
+/// the term is not a sum of two plain `Int` variables.
+#[inline]
+fn add_var_pair_str(f: &Formula) -> Option<(&str, &str)> {
     if let Formula::Add(x, y) = f {
-        if let (Some(a), Some(b)) = (int_var_name(x), int_var_name(y)) {
+        if let (Some(a), Some(b)) = (int_var_name_str(x), int_var_name_str(y)) {
             return Some((a, b));
         }
     }
     None
+}
+
+/// The two free `Int` variables `a, b` of an `Add(a, b)` term (either operand
+/// order is the sum `a + b`), or `None` if the term is not a sum of two plain
+/// `Int` variables.
+#[inline]
+fn add_var_pair(f: &Formula) -> Option<(String, String)> {
+    add_var_pair_str(f).map(|(a, b)| (a.to_string(), b.to_string()))
 }
 
 /// Match the loop-accumulation overflow disjunction
@@ -5912,27 +7738,27 @@ fn match_overflow_disjunction(f: &Formula) -> Option<(String, String, Threshold)
     let Formula::Or(ds) = f else { return None };
     let [d0, d1] = ds.as_slice() else { return None };
     // A `Lt(Add(a,b), 0)` lower (underflow) disjunct → `(a, b)`.
-    let lower = |d: &Formula| -> Option<(String, String)> {
+    fn lower(d: &Formula) -> Option<(&str, &str)> {
         match d {
-            Formula::Lt(s, z) if matches!(z.as_ref(), Formula::Int(0)) => add_var_pair(s),
+            Formula::Lt(s, z) if matches!(z.as_ref(), Formula::Int(0)) => add_var_pair_str(s),
             _ => None,
         }
-    };
+    }
     // A `Gt(Add(a,b), MAX)` / `Lt(MAX, Add(a,b))` upper (overflow) disjunct
     // → `(a, b, MAX)`.
-    let upper = |d: &Formula| -> Option<(String, String, Threshold)> {
+    fn upper(d: &Formula) -> Option<(&str, &str, Threshold)> {
         match d {
             Formula::Gt(s, m) => {
-                let (a, b) = add_var_pair(s)?;
+                let (a, b) = add_var_pair_str(s)?;
                 Some((a, b, threshold_value(m)?))
             }
             Formula::Lt(m, s) => {
-                let (a, b) = add_var_pair(s)?;
+                let (a, b) = add_var_pair_str(s)?;
                 Some((a, b, threshold_value(m)?))
             }
             _ => None,
         }
-    };
+    }
     // Accept either disjunct order.
     let try_order = |lo: &Formula, up: &Formula| -> Option<(String, String, Threshold)> {
         let (la, lb) = lower(lo)?;
@@ -5940,7 +7766,11 @@ fn match_overflow_disjunction(f: &Formula) -> Option<(String, String, Threshold)
         // The lower and upper disjuncts must be over the SAME sum `a + b`
         // (modulo operand order), so the refutation's three present facts key
         // onto one term.
-        if (la == ua && lb == ub) || (la == ub && lb == ua) { Some((ua, ub, max)) } else { None }
+        if (la == ua && lb == ub) || (la == ub && lb == ua) {
+            Some((ua.to_string(), ub.to_string(), max))
+        } else {
+            None
+        }
     };
     try_order(d0, d1).or_else(|| try_order(d1, d0))
 }
@@ -5957,29 +7787,29 @@ fn match_not_in_range_overflow(f: &Formula) -> Option<(String, String, i128)> {
     let Formula::And(cs) = inner.as_ref() else { return None };
     let [c0, c1] = cs.as_slice() else { return None };
     // `Le(0, Add(a,b))` lower-in-range conjunct → `(a,b)`.
-    let lower = |c: &Formula| -> Option<(String, String)> {
+    fn lower(c: &Formula) -> Option<(&str, &str)> {
         match c {
-            Formula::Le(z, s) if matches!(z.as_ref(), Formula::Int(0)) => add_var_pair(s),
+            Formula::Le(z, s) if matches!(z.as_ref(), Formula::Int(0)) => add_var_pair_str(s),
             _ => None,
         }
-    };
+    }
     // `Le(Add(a,b), MAX)` upper-in-range conjunct → `(a,b,MAX)`.
-    let upper = |c: &Formula| -> Option<(String, String, i128)> {
+    fn upper(c: &Formula) -> Option<(&str, &str, i128)> {
         match c {
             Formula::Le(s, m) => {
-                let (a, b) = add_var_pair(s)?;
+                let (a, b) = add_var_pair_str(s)?;
                 Some((a, b, int_literal_value(m)?))
             }
             _ => None,
         }
-    };
+    }
     let check = |lo: &Formula, up: &Formula| -> Option<(String, String, i128)> {
         let (la, lb) = lower(lo)?;
         let (ua, ub, max) = upper(up)?;
         if max < 0 || !((la == ua && lb == ub) || (la == ub && lb == ua)) {
             return None;
         }
-        Some((ua, ub, max))
+        Some((ua.to_string(), ub.to_string(), max))
     };
     check(c0, c1).or_else(|| check(c1, c0))
 }
@@ -6009,7 +7839,7 @@ fn find_sum_upper_bound(conjuncts: &[&Formula], a: &str, b: &str) -> Option<Thre
     let mut best: Option<Threshold> = None;
     for &c in conjuncts {
         if let Formula::Le(s, bnd) = c {
-            if let Some((sa, sb)) = add_var_pair(s) {
+            if let Some((sa, sb)) = add_var_pair_str(s) {
                 if (sa == a && sb == b) || (sa == b && sb == a) {
                     if let Some(t) = threshold_value(bnd) {
                         best = Some(match best {
@@ -6489,32 +8319,32 @@ fn match_two_sided_overflow_disjunction(f: &Formula) -> Option<(String, String, 
     let Formula::Or(ds) = f else { return None };
     let [d0, d1] = ds.as_slice() else { return None };
     // lower: `Lt(Add(a,b), MIN)` → `(a, b, MIN)`.
-    let lower = |d: &Formula| -> Option<(String, String, i128)> {
+    fn lower(d: &Formula) -> Option<(&str, &str, i128)> {
         if let Formula::Lt(s, m) = d {
-            let (a, b) = add_var_pair(s)?;
+            let (a, b) = add_var_pair_str(s)?;
             return Some((a, b, int_literal_value(m)?));
         }
         None
-    };
+    }
     // upper: `Gt(Add(a,b), MAX)` / `Lt(MAX, Add(a,b))` → `(a, b, MAX)`.
-    let upper = |d: &Formula| -> Option<(String, String, i128)> {
+    fn upper(d: &Formula) -> Option<(&str, &str, i128)> {
         match d {
             Formula::Gt(s, m) => {
-                let (a, b) = add_var_pair(s)?;
+                let (a, b) = add_var_pair_str(s)?;
                 Some((a, b, int_literal_value(m)?))
             }
             Formula::Lt(m, s) => {
-                let (a, b) = add_var_pair(s)?;
+                let (a, b) = add_var_pair_str(s)?;
                 Some((a, b, int_literal_value(m)?))
             }
             _ => None,
         }
-    };
+    }
     let try_order = |lo: &Formula, up: &Formula| -> Option<(String, String, i128, i128)> {
         let (la, lb, min) = lower(lo)?;
         let (ua, ub, max) = upper(up)?;
         if ((la == ua && lb == ub) || (la == ub && lb == ua)) && min < max {
-            Some((ua, ub, min, max))
+            Some((ua.to_string(), ub.to_string(), min, max))
         } else {
             None
         }
@@ -6528,7 +8358,7 @@ fn match_two_sided_overflow_disjunction(f: &Formula) -> Option<(String, String, 
 /// kept. `None` if absent.
 fn find_sum_lower_bound(conjuncts: &[&Formula], a: &str, b: &str) -> Option<i128> {
     let same = |s: &Formula| -> bool {
-        add_var_pair(s).is_some_and(|(sa, sb)| (sa == a && sb == b) || (sa == b && sb == a))
+        add_var_pair_str(s).is_some_and(|(sa, sb)| (sa == a && sb == b) || (sa == b && sb == a))
     };
     let mut best: Option<i128> = None;
     for &c in conjuncts {
@@ -6549,7 +8379,7 @@ fn find_sum_lower_bound(conjuncts: &[&Formula], a: &str, b: &str) -> Option<i128
 /// sibling of [`find_sum_upper_bound`] (which keys on the non-negative `Threshold`).
 fn find_sum_upper_bound_i128(conjuncts: &[&Formula], a: &str, b: &str) -> Option<i128> {
     let same = |s: &Formula| -> bool {
-        add_var_pair(s).is_some_and(|(sa, sb)| (sa == a && sb == b) || (sa == b && sb == a))
+        add_var_pair_str(s).is_some_and(|(sa, sb)| (sa == a && sb == b) || (sa == b && sb == a))
     };
     let mut best: Option<i128> = None;
     for &c in conjuncts {
@@ -6674,24 +8504,18 @@ fn certify_bounded_sum_no_overflow(
 // Signed wide-BV add/sub no-overflow (i128 / widened) → linear-Int refutation.
 // ---------------------------------------------------------------------------
 
-/// The signed value carried by an overflow-check operand leaf, transparently
-/// through a 64→128 (or any) sign-extension. Returns `(name, source_width)`:
+/// The variable an overflow-check operand reads: a bare BV variable, or one
+/// under any number of sign-extensions (`BvSignExt(v, k)` preserves `v`'s signed
+/// value, so the extension is a lossless unwrap). Only names the lane's fresh
+/// Int carrier; the operand's signed range comes from
+/// [`trust_types::signed_bv_operand_interval`].
 ///
-/// * `Var(n, _)` — a bare BV operand var; its source width is the BV sort width.
-/// * `BvSignExt(Var(n, _), _)` — a sign-extended operand; the carrier value is
-///   exactly the inner value `n`, so we recurse to it and report the INNER
-///   (source) width. `BvSignExt(v, k)` preserves v's signed value, so this is a
-///   faithful, lossless unwrap (no signedness information is dropped).
-///
-/// `None` for any non-variable leaf (a literal, a nested arithmetic term, etc.),
-/// so the lift is fail-closed on shapes it cannot bound.
-fn bv_overflow_operand(f: &Formula) -> Option<(String, u32)> {
+/// `None` for any other operand (a literal, a nested arithmetic term, a
+/// non-bitvector variable), so the lift is fail-closed on shapes it cannot name.
+fn bv_overflow_operand_name(f: &Formula) -> Option<&str> {
     match f {
-        Formula::Var(name, Sort::BitVec(w)) => Some((name.clone(), *w)),
-        Formula::Var(name, _) => Some((name.clone(), 0)),
-        // Sign-extension preserves the signed value; recurse transparently and
-        // keep the INNER source width (which bounds the carrier's signed range).
-        Formula::BvSignExt(inner, _) => bv_overflow_operand(inner),
+        Formula::Var(name, Sort::BitVec(_)) => Some(name),
+        Formula::BvSignExt(inner, _) => bv_overflow_operand_name(inner),
         _ => None,
     }
 }
@@ -7121,53 +8945,6 @@ fn bv_mask_shift_rewrites(conjuncts: &[&Formula]) -> Vec<Formula> {
         }
     }
     out
-}
-
-/// The closed signed interval `[lo, hi]` of an operand from the present `BvSLt`/
-/// `BvSLe` bound atoms over it (mirrors `conjuncts_carry_bv_overflow_safe`'s
-/// `bounds` closure on the router side). `BvSLt(c, name)` ⟹ `name > c`;
-/// `BvSLt(name, c)` ⟹ `name < c`; non-strict via `BvSLe`. Strict bounds are
-/// integer-tightened (`name > c ⟹ name ≥ c+1`). Returns `(Some(lo), Some(hi))`
-/// only when BOTH ends are pinned by an explicit guard.
-fn bv_signed_guard_bounds(conjuncts: &[&Formula], name: &str) -> (Option<i128>, Option<i128>) {
-    let mut lo: Option<i128> = None;
-    let mut hi: Option<i128> = None;
-    let tighten_lo = |lo: &mut Option<i128>, v: i128| *lo = Some(lo.map_or(v, |p: i128| p.max(v)));
-    let tighten_hi = |hi: &mut Option<i128>, v: i128| *hi = Some(hi.map_or(v, |p: i128| p.min(v)));
-    for &c in conjuncts {
-        let (strict, l, r) = match c {
-            Formula::BvSLt(l, r, _) => (true, l, r),
-            Formula::BvSLe(l, r, _) => (false, l, r),
-            _ => continue,
-        };
-        // The bounded operand may be reached through a transparent sign-extension.
-        let lname = bv_overflow_operand(l).map(|(n, _)| n);
-        let rname = bv_overflow_operand(r).map(|(n, _)| n);
-        match (l.as_ref(), r.as_ref(), lname.as_deref(), rname.as_deref()) {
-            // `c <(=) name`  ⟹  lower bound.
-            (Formula::BitVec { value, .. }, _, _, Some(rn)) if rn == name => {
-                if strict {
-                    if let Some(v) = value.checked_add(1) {
-                        tighten_lo(&mut lo, v);
-                    }
-                } else {
-                    tighten_lo(&mut lo, *value);
-                }
-            }
-            // `name <(=) c`  ⟹  upper bound.
-            (_, Formula::BitVec { value, .. }, Some(ln), _) if ln == name => {
-                if strict {
-                    if let Some(v) = value.checked_sub(1) {
-                        tighten_hi(&mut hi, v);
-                    }
-                } else {
-                    tighten_hi(&mut hi, *value);
-                }
-            }
-            _ => {}
-        }
-    }
-    (lo, hi)
 }
 
 /// A non-negative bitvector literal represented exactly at `width` (rather than
@@ -7652,9 +9429,8 @@ fn certify_negated_return_via_neg_bound(
 ) -> Option<trust_ir::ProofEvidence> {
     // Leakage gate over EVERY node of EVERY conjunct.
     for &c in conjuncts {
-        let mut foreign = false;
-        c.visit(&mut |sub| {
-            if !matches!(
+        if !trust_types::all_formula_nodes(c, &mut |sub| {
+            matches!(
                 sub,
                 Formula::Int(_)
                     | Formula::UInt(_)
@@ -7667,24 +9443,21 @@ fn certify_negated_return_via_neg_bound(
                     | Formula::Gt(..)
                     | Formula::Ge(..)
                     | Formula::Neg(_)
-            ) {
-                foreign = true;
-            }
-        });
-        if foreign {
+            )
+        }) {
             return None;
         }
     }
 
-    let is_named = |f: &Formula, n: &str| int_var_name(f).is_some_and(|v| v == n);
+    let is_named = |f: &Formula, n: &str| int_var_name_str(f).is_some_and(|v| v == n);
     let is_zero = |f: &Formula| matches!(f, Formula::Int(0));
 
     // The return relation `Eq(r, Neg(x))` (either orientation) over Int vars…
     for &c in conjuncts {
         let Formula::Eq(a, b) = c else { continue };
         let Some((r, x)) = (match (a.as_ref(), b.as_ref()) {
-            (rv, Formula::Neg(xv)) => int_var_name(rv).zip(int_var_name(xv)),
-            (Formula::Neg(xv), rv) => int_var_name(rv).zip(int_var_name(xv)),
+            (rv, Formula::Neg(xv)) => int_var_name_str(rv).zip(int_var_name_str(xv)),
+            (Formula::Neg(xv), rv) => int_var_name_str(rv).zip(int_var_name_str(xv)),
             _ => None,
         }) else {
             continue;
@@ -7693,13 +9466,13 @@ fn certify_negated_return_via_neg_bound(
         // …the dominating negative guard `x < 0`…
         let guard = conjuncts
             .iter()
-            .any(|&g| matches!(g, Formula::Lt(l, z) if is_named(l, &x) && is_zero(z)));
+            .any(|&g| matches!(g, Formula::Lt(l, z) if is_named(l, x) && is_zero(z)));
         // …the violated ensures `¬(r ≥ 0)` on the SAME return slot (a
         // wrong-direction violation — e.g. `¬(r ≤ 0)` — does not match: that
         // family is satisfiable and must stay uncertified)…
         let violation = conjuncts.iter().any(|&v| {
             matches!(v, Formula::Not(inner)
-                if matches!(inner.as_ref(), Formula::Ge(l, z) if is_named(l, &r) && is_zero(z)))
+                if matches!(inner.as_ref(), Formula::Ge(l, z) if is_named(l, r) && is_zero(z)))
         });
         // …and the present type bounds on `x` (`lo ≤ x ≤ hi`; `lo < 0 ≤ hi` so
         // the negative branch is non-degenerate — the i32 range in the
@@ -7738,120 +9511,98 @@ fn certify_negated_return_via_neg_bound(
     None
 }
 
-/// Find the FIRST signed wide-BV overflow target `BvAdd(x,y,w)` / `BvSub(x,y,w)`
-/// anywhere in the conjunct tree whose operands are overflow-check leaves
-/// (`bv_overflow_operand`). Returns `(x, y, source-bounds-width, w, is_add)`
-/// where the source widths bound the operands' signed ranges (the inner width of
-/// a sign-extension, else the operand's own width). Mirrors the target search in
-/// the router's `conjuncts_carry_bv_overflow_safe`.
-fn find_bv_overflow_target(
-    conjuncts: &[&Formula],
-) -> Option<(String, u32, String, u32, u32, bool)> {
-    let mut target: Option<(String, u32, String, u32, u32, bool)> = None;
-    for c in conjuncts {
-        c.visit(&mut |sub| {
-            if target.is_some() {
-                return;
-            }
-            if let Formula::BvAdd(a, b, w) | Formula::BvSub(a, b, w) = sub {
-                if let (Some((x, wx)), Some((y, wy))) =
-                    (bv_overflow_operand(a), bv_overflow_operand(b))
-                {
-                    target = Some((x, wx, y, wy, *w, matches!(sub, Formula::BvAdd(..))));
-                }
-            }
-        });
-        if target.is_some() {
-            break;
-        }
-    }
-    target
-}
-
 /// The signed `[min, max]` of a `w`-bit two's-complement integer (`w ≤ 128`).
 fn signed_width_range(w: u32) -> (i128, i128) {
     if w >= 128 { (i128::MIN, i128::MAX) } else { (-(1i128 << (w - 1)), (1i128 << (w - 1)) - 1) }
 }
 
-/// The signed result `BvAdd(x,y,w)` / `BvSub(x,y,w)` of a wide-BV overflow check
-/// cannot overflow `[i_w_min, i_w_max]` — certify it by translating to a
-/// linear-Int disjunctive contradiction and reusing the existing additive-lift
-/// refutation (`certify_disjunctive_contradiction`).
+/// Direct kernel discharge of a SIGNED wide-BV add/sub no-overflow obligation
+/// (`i128`, or a sign-extended widening): the row asserts that `BvAdd(x,y,w)` /
+/// `BvSub(x,y,w)` overflows `w` signed bits, and the operands' signed bounds rule
+/// that out. Certified by translating to a linear-Int disjunctive contradiction
+/// and reusing the existing additive-lift refutation
+/// (`certify_disjunctive_contradiction`).
 ///
 /// Recognized shape (the fixtures `i128_guarded_add`, `i128_widened_sub`,
-/// `i128_shift_accumulator`): an `BvAdd`/`BvSub(x, y, w)` whose operands carry a
-/// closed signed bound — either an explicit `BvSLt`/`BvSLe` guard interval, or
-/// the inherent `[-2^(sw-1), 2^(sw-1)-1]` of a `sw→w` sign-extension — plus the
-/// carry-bit overflow disjunction over the result. The exact carry encoding is
-/// NOT decoded: under the bound hypotheses it is equivalent to "the signed result
-/// is outside `[i_w_min, i_w_max]`", which we model as the closed linear-Int
-/// disjunction `Or([x±y < i_w_min, x±y > i_w_max])`.
+/// `i128_shift_accumulator`): BOTH conjuncts of the signed overflow predicate
+/// `trust_types::signed_bv_addsub_overflow_sign_test(x, y, op, w)` — the
+/// sign-relation conjunct and the result-sign-flip conjunct trust-vcgen emits —
+/// present as TOP-LEVEL conjuncts of the violation
+/// ([`trust_types::asserted_signed_bv_addsub_overflows`] rebuilds the predicate
+/// from the operation's own operands and compares structurally). Each operand's
+/// closed signed interval comes from [`trust_types::signed_bv_operand_interval`]:
+/// the inherent range of its sign-extension source, narrowed by top-level
+/// `BvSLt`/`BvSLe` atoms whose literals are read as two's complement at the
+/// atom's own width.
 ///
-/// We do NOT prove that equivalence in the kernel; instead we discharge the
-/// STRONGER, structurally-simpler obligation
-///   `x ∈ [xlo,xhi] ∧ y ∈ [ylo,yhi] ⟹ ¬(x±y < i_w_min ∨ x±y > i_w_max)`,
-/// which the existing additive-lift chain proves and the clean kernel re-checks.
+/// We discharge the synthesized linear-Int system
+///   `xlo ≤ cx ≤ xhi ∧ ylo ≤ cy ≤ yhi ∧ (cx ± cy < i_w_min ∨ cx ± cy > i_w_max)`
+/// over FRESH carriers, which the existing additive-lift chain refutes and the
+/// clean kernel re-checks.
 ///
-/// SOUNDNESS — over-approximation, fail-closed.
-///  * Bound translation: each `BvSLt/BvSLe` guard atom (and each sign-extension's
-///    inherent range) is a SOUND signed bound on the operand's mathematical value
-///    — these only NARROW the operand's range. We use ONLY present guards, so we
-///    never invent a tighter bound than the obligation provides.
-///  * Carry→Int mapping: we REPLACE the carry-bit disjunction with the Int
-///    overflow disjunction `Or([x±y<min, x±y>max])`. The synthesized Int violation
-///    we refute is `bounds ∧ Or([...])`. If this Int violation is UNSAT (which is
-///    all we ever certify — the kernel re-checks it), then under the SAME bounds
-///    the result `x±y` provably lies in `[min,max]`, i.e. no overflow — exactly
-///    the safety fact. The original carry-bit overflow assertion is at most this
-///    Int disjunction (it fires only when the signed result leaves `[min,max]`),
-///    so proving the Int disjunction impossible proves the carry assertion
-///    impossible. The mapping can only make the obligation HARDER (we drop any
-///    information beyond the operand bounds), so it is impossible to certify a
-///    genuinely-overflowing add/sub: without tight enough bounds the Int `Or`
-///    stays satisfiable and we fail closed (see the `fails_closed` tests).
+/// SOUNDNESS — the certificate is minted under the ROW's identity but proves the
+/// SYNTHESIZED system, so it discharges the row only if every model of the
+/// violation maps to a model of the synthesized system (`violation ⟹ synth`, a
+/// trusted Rust meta-step outside the kernel, the [`certify_unsigned_bv_div_sum_no_overflow`]
+/// posture). Take any BV model of the violation, with signed operand values
+/// `sx`, `sy`:
+///  * the overflow predicate is a TOP-LEVEL conjunct pair, so it holds in the
+///    model; it is the EXACT two's-complement overflow test, so `sx ± sy` lies
+///    outside `[i_w_min, i_w_max]` (the overflow disjunction, with `cx := sx` and
+///    `cy := sy`, or `cy := -sy` for a sub);
+///  * each bound atom used is a TOP-LEVEL conjunct over the operand or one of its
+///    sign-extension sources (extension preserves the signed value), read at its
+///    own width, and the inherent range of a `sw`-bit source holds of every
+///    value, so `sx ∈ [xlo, xhi]` and `sy ∈ [ylo, yhi]`.
+///
+/// A predicate that is merely MENTIONED — a bounded `BvAdd` inside an `ensures`
+/// equation (`ensures result == a + b + 1` over `a.wrapping_add(b)`), a guard, or
+/// one disjunct of an `Or` — is not asserted by the violation, which then does not
+/// imply the overflow; refuting the overflow would say nothing about the row.
+/// Until 2026-10-03 the lane took the first bounded `BvAdd`/`BvSub` ANYWHERE in the
+/// violation, and kernel-certified false `i128` postconditions that way
+/// (KNOWN_HAZARDS, "the signed-BV certify lane certified any row containing a
+/// bounded `BvAdd`/`BvSub`"; DECISION_QUEUE BV-LANE-1). The kernel re-check and the
+/// consumer-side regeneration cannot catch such a mismatch: both see only the
+/// synthesized system.
+///
 ///  * Sub via negation carrier: for subtraction we model `x - y` as `x + ny` over
 ///    a FRESH carrier `ny ∈ [-yhi, -ylo]` (the exact range of `-y`). Treating `ny`
 ///    as an independent free variable rather than tying it to `y` only ENLARGES
 ///    the feasible region (it forgets `ny = -y`), so a refutation of the relaxed
-///    system refutes the original a fortiori. The additive-lift Sum path then
-///    closes `x + ny`'s no-overflow exactly as for a real two-variable add.
+///    system refutes the original a fortiori.
+///  * The synthesized system is UNSAT exactly when the result range fits
+///    `[i_w_min, i_w_max]`; the lane checks that first and declines otherwise, so a
+///    genuinely-overflowing add/sub (bounds too loose, or none) is never handed to
+///    the kernel.
 ///
-/// KERNEL-REDUCER LIMIT (scope). The hand-rolled closed-atom refutation compares
-/// the additive-lifted result bound against the i128 type extreme, whose
-/// `Int.NonNeg.mk` witness the clean kernel reduces via `Int.sub`. The native
-/// `Int`/`Nat` reducers only evaluate that subtraction for modest result
-/// magnitudes; a result range wider than ~`2^20` leaves the witness type stuck.
-/// We therefore guard on the result magnitude and fail closed beyond it — so this
-/// arm certifies the small-result guarded/shift `i128` add cases but declines the
-/// 64→128 widened sub (±2^64 range). Fail-closed is sound (records `Trusted`).
-///
-/// The whole thing is fail-closed: the kernel re-check (`finish_certificate`) is
-/// the backstop, so a wrong bound or a mis-recognized shape can only FAIL to
-/// certify, never mint an unsound `Certified`.
+/// RESULT-MAGNITUDE LIMIT (scope): see the constant below; a wider result fails
+/// closed (records `Trusted`, never a false `Certified`).
 fn certify_signed_bv_overflow_safe(
     conjuncts: &[&Formula],
     identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
-    let (x, wx, y, wy, w, is_add) = find_bv_overflow_target(conjuncts)?;
+    trust_types::asserted_signed_bv_addsub_overflows(conjuncts)
+        .into_iter()
+        .find_map(|target| certify_one_signed_bv_overflow(conjuncts, &target, identity))
+}
+
+/// One candidate of [`certify_signed_bv_overflow_safe`]: an operation whose
+/// overflow predicate the violation asserts (the caller's gate).
+fn certify_one_signed_bv_overflow(
+    conjuncts: &[&Formula],
+    target: &trust_types::SignedBvAddSubOverflow<'_>,
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    let w = target.width;
+    let is_add = target.is_add;
     if w == 0 || w > 128 {
         return None;
     }
-
-    // Signed bound on each operand: the explicit guard interval if present, else
-    // the inherent sign-extension range `[-2^(sw-1), 2^(sw-1)-1]`. A bare same-
-    // width operand (sw == w, no guard) has only the full `[min,max]` type range,
-    // whose add/sub CAN overflow — so we require a guard there and fail closed.
-    let operand_bounds = |name: &str, src_w: u32| -> Option<(i128, i128)> {
-        let (glo, ghi) = bv_signed_guard_bounds(conjuncts, name);
-        // The sign-extension's inherent range (only when the source is strictly
-        // narrower than the result width — that is what makes it informative).
-        let ext = (src_w != 0 && src_w < w).then(|| signed_width_range(src_w));
-        let lo = glo.or(ext.map(|(l, _)| l))?;
-        let hi = ghi.or(ext.map(|(_, h)| h))?;
-        Some((lo, hi))
-    };
-    let (xlo, xhi) = operand_bounds(&x, wx)?;
-    let (ylo, yhi) = operand_bounds(&y, wy)?;
+    let x = bv_overflow_operand_name(target.lhs)?;
+    let y = bv_overflow_operand_name(target.rhs)?;
+    let (xlo, xhi) = trust_types::signed_bv_operand_interval(conjuncts, target.lhs, w)?;
+    let (ylo, yhi) = trust_types::signed_bv_operand_interval(conjuncts, target.rhs, w)?;
     let (min, max) = signed_width_range(w);
 
     if xlo > xhi || ylo > yhi {
@@ -7865,6 +9616,10 @@ fn certify_signed_bv_overflow_safe(
         // sub: `x - y` is minimized at `xlo - yhi`, maximized at `xhi - ylo`.
         (xlo.checked_sub(yhi)?, xhi.checked_sub(ylo)?)
     };
+    // The bounds allow an overflow: the synthesized system is satisfiable.
+    if result_lo < min || result_hi > max {
+        return None;
+    }
 
     // RESULT-MAGNITUDE BOUND (fail-closed). The refutation closes each overflow
     // disjunct with a closed atom comparing the additive-lifted result bound
@@ -7886,8 +9641,6 @@ fn certify_signed_bv_overflow_safe(
 
     // Build the linear-Int violation over fresh carriers (treated as free `Int`
     // vars) and refute it via the existing disjunctive/additive-lift machinery.
-    // The overflow disjunction `Or([x±y < min, x±y > max])` is the exact carry
-    // condition; the additive lift closes both disjuncts from the operand bounds.
     let cx = format!("__cert_bvovf_x_{x}");
     let v = |n: &str| Formula::Var(n.to_string(), Sort::Int);
     let i = Formula::Int;
@@ -7898,9 +9651,6 @@ fn certify_signed_bv_overflow_safe(
 
     // For subtraction, model `x - y` as `x + ny` over the negation carrier
     // `ny ∈ [-yhi, -ylo]` (exact range of `-y`); for addition use `y` directly.
-    // Treating `ny` as an independent free var (forgetting `ny = -y`) only enlarges
-    // the feasible region, so a refutation of the relaxed system is a fortiori a
-    // refutation of the original (sound over-approximation).
     let (cy, ylo2, yhi2) = if is_add {
         (format!("__cert_bvovf_y_{y}"), ylo, yhi)
     } else {
@@ -7917,8 +9667,9 @@ fn certify_signed_bv_overflow_safe(
     ]);
 
     // Hand the synthesized Int violation to the existing disjunctive refutation;
-    // its kernel re-check + ay cross-check are the soundness backstop, and the
-    // certificate is lineage-bound to the ORIGINAL obligation's `identity`.
+    // its kernel re-check + ay cross-check check the SYNTHESIZED system, and the
+    // certificate is lineage-bound to the ORIGINAL obligation's `identity` — which
+    // is why the top-level gate in the caller is what makes it the row's proof.
     let mut synth_conjuncts = Vec::new();
     collect_conjuncts(&synth, &mut synth_conjuncts);
     certify_disjunctive_contradiction(&synth_conjuncts, identity)
@@ -8153,6 +9904,79 @@ fn relevant_context_conjuncts<'a>(
     context.iter().enumerate().filter(|(i, _)| keep[*i]).map(|(_, &c)| c).collect()
 }
 
+/// The largest variable distance [`context_within_var_distance`] is asked for by
+/// [`certify_disjunctive_contradiction_in_distance_balls`]. Distance 0 is the 1-hop
+/// pruning and the unbounded distance the variable-connected component, both tried
+/// by [`certify_disjunctive_contradiction`]; 1..=3 are the balls between them.
+const DISJUNCTIVE_CONTEXT_MAX_VAR_DISTANCE: usize = 3;
+
+/// The context conjuncts whose every `Int` variable lies within `distance` steps of
+/// the disjunction's own variables, plus the variable-free conjuncts: the BALL of
+/// that radius in the graph that links two variables when one context conjunct
+/// mentions both. `V₀` is the disjunction's variable set and
+/// `Vᵢ₊₁ = Vᵢ ∪ vars(c)` for every conjunct `c` sharing a variable with `Vᵢ`; the
+/// ball keeps a conjunct `c` iff `vars(c) ⊆ V_distance`. For a disjunction with a
+/// variable, radius 0 is exactly the 1-hop set of [`relevant_context_conjuncts`]
+/// (`transitive = false`) and the fixpoint exactly its variable-connected component
+/// (`transitive = true`); the balls are nested, so each is a subset of the next, and
+/// two equal balls mean the fixpoint. A CLOSED disjunction has `V₀ = ∅`: every ball
+/// is the variable-free conjuncts, the distance-ball lane stops at radius 1 (no
+/// growth), and such a disjunction is left to the lanes that handle it.
+///
+/// WHY (TRUST-KI-1014-1, aterm-codec `inflate.rs:911`, the hardened `Overflow(Sub)`
+/// twin of `input.len() - 4`). The guard that refutes the disjunction can sit TWO
+/// steps from it: `Or([_48 - 4 < 0, _48 - 4 > MAX])` is closed by `_48 = len` and
+/// `¬(len < 6)`. The 1-hop set keeps only `_48`'s own bounds, which do not close it;
+/// the connected component reaches the guard but also every alias of `len`
+/// (`_4 = len`, `_8 = len`, `_12 = len`, `_33 = len`, …), each with its own
+/// type-range pair, and its augmented chain-edge set (49) is over
+/// [`refute_via_chain_edges`]' 48-edge cap. The ball of radius 1
+/// (`vars ⊆ {_48, len}`) holds exactly the guard, the tie and the two variables'
+/// ranges.
+///
+/// SOUNDNESS: the ball is a SUBSET of the violation's conjuncts, as both existing
+/// prunings are; the candidate disjunction is passed unchanged. A refutation of the
+/// weaker system refutes the original a fortiori, an omitted hypothesis that was
+/// needed leaves the weaker system satisfiable (no chain is found, or ay's
+/// `Required` UNSAT cross-check declines), and the clean kernel re-checks every
+/// term. Nothing is invented and no conclusion is weakened.
+fn context_within_var_distance<'a>(
+    disjuncts: &[Formula],
+    context: &[&'a Formula],
+    distance: usize,
+) -> Vec<&'a Formula> {
+    let mut vars: BTreeSet<String> = BTreeSet::new();
+    for d in disjuncts {
+        collect_int_vars_deep(d, &mut vars);
+    }
+    let cvars: Vec<BTreeSet<String>> = context
+        .iter()
+        .map(|&c| {
+            let mut s = BTreeSet::new();
+            collect_int_vars_deep(c, &mut s);
+            s
+        })
+        .collect();
+    for _ in 0..distance {
+        let mut next = vars.clone();
+        for cv in &cvars {
+            if cv.iter().any(|v| vars.contains(v)) {
+                next.extend(cv.iter().cloned());
+            }
+        }
+        if next.len() == vars.len() {
+            break;
+        }
+        vars = next;
+    }
+    context
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| cvars[*i].iter().all(|v| vars.contains(v)))
+        .map(|(_, &c)| c)
+        .collect()
+}
+
 /// Build the shared conjunctive-context hypotheses + chain edges for the disjunctive
 /// refutation from the representable subset of a set of (non-`Or`) context conjuncts.
 ///
@@ -8354,6 +10178,175 @@ fn certify_disjunctive_contradiction(
     None
 }
 
+/// LAST-RESORT: a VARIABLE-FREE disjunction refuted against the VARIABLE-FREE
+/// conjuncts of its own violation alone.
+///
+/// THE SHAPE. The `unix_hardened` twin of a checked subtraction over two
+/// constants (`BLOCK_LEN - 8` with `const BLOCK_LEN: usize = 64`) carries the
+/// violation core `Or([Lt(Sub(64, 8), 0), Gt(Sub(64, 8), u64::MAX)])` and the
+/// closed operand ranges `0 ≤ 64 - 8 ≤ u64::MAX` the vcgen conjoins beside it.
+/// Those closed facts refute the core by two two-edge chains. Since `aebf15b1ed`
+/// (B2, 2026-09-29) the twin also carries a type-range fact for every integer
+/// local and slice length of the function (`hardened_twin_type_ranges`), and
+/// those true but irrelevant atoms push the augmented edge set of
+/// [`certify_disjunctive_contradiction`] past `refute_via_chain_edges`' 48-edge
+/// cap. Its relevance-pruned retry cannot help: [`relevant_context_conjuncts`]
+/// seeds the component from the disjunction's VARIABLES, and a closed
+/// disjunction has none, so the pruned context is the full one and the retry is
+/// skipped. MEASURED on the five-line reproducer of aterm-digest
+/// `sha256.rs:155` (the twin of `self.buf[BLOCK_LEN - 8..]` in
+/// `Sha256::finalize`; `tests/closed_sub_twin_certification.rs`): 35/36
+/// augmented edges and a certificate for the twin formula `6606d3bdf2`
+/// generates, 54/55 edges and none for `62f89f111a`'s and `b58a105dde`'s.
+/// aterm-digest's own row certifies on `321aaeda75` and `6606d3bdf2` and not
+/// from `62f89f111a` on, while its primary row and the twins at `:147` and
+/// `:154` still certify.
+///
+/// THE ROUTE. Keep exactly the context conjuncts that mention no variable and
+/// hand them, with the UNCHANGED candidate disjunction, to the same
+/// [`build_disjunctive_context`] / [`build_disjunctive_certificate`] pair the
+/// disjunctive lane uses. A refutation that needs a chain through a variable
+/// (`64 - 8 ≤ x ∧ x < 0`) is not searched here: fail-closed, the obligation
+/// stays where the earlier lanes left it.
+///
+/// SOUNDNESS. The retained context is a SUBSET of the violation's own conjuncts
+/// (base conjuncts or atoms the normalization steps derive from them), and the
+/// refuted disjunction is the violation's own conjunct, unchanged. If the weaker
+/// system `closed context ∧ disjunction` is UNSAT, the violation is UNSAT a
+/// fortiori, the same argument as the disjunctive lane's Attempt 2. A satisfiable
+/// closed disjunct (`64 - 72 < 0`) has no refuting chain, so the builder declines;
+/// ay's UNSAT cross-check and the clean-kernel re-check of the term remain the
+/// authority, exactly as for every certificate the builder mints.
+///
+/// INERT unless it can differ from the disjunctive lane: it returns `None` when
+/// no candidate disjunction is closed, or when no non-disjunction conjunct was
+/// dropped (that context was already tried there). Runs after every other lane,
+/// so no certificate this producer already mints changes shape or bytes, and
+/// [`recheck_cleancic`] regenerates through the same lane order.
+fn certify_closed_disjunction_in_closed_context(
+    conjuncts: &[&Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    let mut candidates: Vec<&Vec<Formula>> = Vec::new();
+    let mut closed_context: Vec<&Formula> = Vec::new();
+    let mut dropped = 0usize;
+    for &c in conjuncts {
+        match c {
+            Formula::Or(ds) => {
+                if !ds.is_empty() && ds.iter().all(is_closed_int_order_formula) {
+                    candidates.push(ds);
+                }
+            }
+            other if is_closed_int_order_formula(other) => closed_context.push(other),
+            _ => dropped += 1,
+        }
+    }
+    if candidates.is_empty() || dropped == 0 {
+        return None;
+    }
+    let (hyps, context_edges, var_names) = build_disjunctive_context(&closed_context)?;
+    for disjuncts in candidates {
+        let mut cand_hyps = hyps.clone();
+        let mut cand_names = var_names.clone();
+        if let Some(evidence) = build_disjunctive_certificate(
+            disjuncts,
+            &context_edges,
+            &mut cand_hyps,
+            &mut cand_names,
+            identity,
+            false,
+        ) {
+            return Some(evidence);
+        }
+    }
+    None
+}
+
+/// LAST-RESORT: [`certify_disjunctive_contradiction`] once more, against the
+/// BOUNDED-DISTANCE context balls (2026-10-14, TRUST-KI-1014-1). Between that lane's
+/// 1-hop set (distance 0, too small when the guard is reached through an alias) and
+/// its connected component (unbounded, over the 48-edge cap when the alias has many
+/// siblings), each candidate disjunction is refuted against the balls of radius
+/// 1..=3 around its variables ([`context_within_var_distance`], whose doc carries the
+/// measured case and the soundness argument). A ball that is the 1-hop set, the
+/// component, the full context, or the previous radius's ball was already tried
+/// there and is skipped. Called after every other lane in [`certify_lanes`], so no
+/// certificate this producer already mints changes shape or bytes, and
+/// [`recheck_cleancic`] regenerates through the same lane order.
+fn certify_disjunctive_contradiction_in_distance_balls(
+    conjuncts: &[&Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    // The same split as `certify_disjunctive_contradiction`.
+    let mut or_candidates: Vec<&Vec<Formula>> = Vec::new();
+    let mut context_conjuncts: Vec<&Formula> = Vec::new();
+    for &c in conjuncts {
+        match c {
+            Formula::Or(ds) => or_candidates.push(ds),
+            other => context_conjuncts.push(other),
+        }
+    }
+    for disjuncts in &or_candidates {
+        if disjuncts.is_empty() {
+            continue;
+        }
+        let component = relevant_context_conjuncts(disjuncts, &context_conjuncts, true).len();
+        let mut tried = context_within_var_distance(disjuncts, &context_conjuncts, 0).len();
+        for distance in 1..=DISJUNCTIVE_CONTEXT_MAX_VAR_DISTANCE {
+            let ball = context_within_var_distance(disjuncts, &context_conjuncts, distance);
+            // Nested balls: an unchanged size is an unchanged set.
+            if ball.len() == tried
+                || ball.len() == component
+                || ball.len() == context_conjuncts.len()
+            {
+                break;
+            }
+            tried = ball.len();
+            if let Some((mut hyps, context_edges, mut var_names)) = build_disjunctive_context(&ball)
+                && let Some(ev) = build_disjunctive_certificate(
+                    disjuncts,
+                    &context_edges,
+                    &mut hyps,
+                    &mut var_names,
+                    identity,
+                    false,
+                )
+            {
+                return Some(ev);
+            }
+        }
+    }
+    None
+}
+
+/// A variable-free integer order formula: comparisons (`=`, `<`, `≤`, `>`, `≥`)
+/// over integer literals combined by `+`, `-`, `*` and unary negation, under
+/// `¬`. A STRICT whitelist: every other node — a variable of any sort, a
+/// `SymVar`, a Bool literal, a bit-vector, a quantifier, an `Ite`, division — is
+/// not closed for this purpose, so the caller treats the conjunct as open and
+/// drops it (dropping a context conjunct can only weaken the refuted system).
+fn is_closed_int_order_formula(f: &Formula) -> bool {
+    fn closed_term(t: &Formula) -> bool {
+        match t {
+            Formula::Int(_) | Formula::UInt(_) => true,
+            Formula::Neg(a) => closed_term(a),
+            Formula::Add(a, b) | Formula::Sub(a, b) | Formula::Mul(a, b) => {
+                closed_term(a) && closed_term(b)
+            }
+            _ => false,
+        }
+    }
+    match f {
+        Formula::Not(inner) => is_closed_int_order_formula(inner),
+        Formula::Eq(a, b)
+        | Formula::Lt(a, b)
+        | Formula::Le(a, b)
+        | Formula::Gt(a, b)
+        | Formula::Ge(a, b) => closed_term(a) && closed_term(b),
+        _ => false,
+    }
+}
+
 /// Build a kernel-checked `CleanCic` for a single candidate disjunction against the
 /// already-built conjunctive context (`hyps` carries the context hypotheses;
 /// `context_edges` the chain edges). Returns `None` if any disjunct is outside the
@@ -8397,6 +10390,32 @@ fn build_disjunctive_certificate_with_parser(
     identity: &ObligationIdentity,
     parser: for<'a> fn(&'a Formula) -> Option<Disjunct<'a>>,
 ) -> Option<trust_ir::ProofEvidence> {
+    let (parsed, hypothesis) =
+        parse_disjunctive_hypothesis(disjuncts, hyps.len(), var_names, parser)?;
+    let term = build_disjunctive_false(&parsed, context_edges, Expr::fvar(hypothesis.fvar))?;
+    hyps.push(hypothesis);
+
+    // STRICT (`Required`) ay cross-check. Context reconstruction never calls
+    // this tail, and the producer's independent gate remains unchanged.
+    //
+    // An earlier revision relaxed this lane to `Advisory`, on the reading that
+    // ay could not decide its or-of-conjunctions. That was wrong: ay refutes the
+    // query in ~26ms. Demanding an unused proof artifact caused the abstention
+    // (see `finish_certificate_with`). With that demand dropped, `Required` is
+    // the correct gate; a real abstention must still decline the certificate.
+    finish_certificate(hyps, &term, var_names, identity)
+}
+
+/// Pure shared construction of one ACTUAL candidate disjunction hypothesis.
+/// This neither proves the candidate nor accepts a stored context. In the
+/// producer the hypothesis is refuted; artifact intake independently builds it
+/// from the current normalized VC and requires exact serialized context bytes.
+fn parse_disjunctive_hypothesis<'a>(
+    disjuncts: &'a [Formula],
+    hypothesis_count: usize,
+    var_names: &mut BTreeSet<String>,
+    parser: for<'b> fn(&'b Formula) -> Option<Disjunct<'b>>,
+) -> Option<(Vec<Disjunct<'a>>, Hyp)> {
     // Disjuncts: each is a closed-false atom/equality, or an order atom refuted
     // against the context. A disjunct outside these shapes declines the whole.
     let mut parsed: Vec<Disjunct<'_>> = Vec::new();
@@ -8426,6 +10445,10 @@ fn build_disjunctive_certificate_with_parser(
                     collect_formula_int_vars(b, var_names);
                 }
             }
+            DisjunctRefutation::Disequality { a, b } => {
+                collect_formula_int_vars(a, var_names);
+                collect_formula_int_vars(b, var_names);
+            }
             _ => {}
         }
         disjunct_smts.push(disjunct.smt.clone());
@@ -8433,26 +10456,14 @@ fn build_disjunctive_certificate_with_parser(
     }
 
     let or_prop = build_or_prop(&parsed.iter().map(|d| d.prop.clone()).collect::<Vec<_>>())?;
-    let or_fvar = FVarId::new(HYP_FVAR_BASE + hyps.len() as u64);
-    let term = build_disjunctive_false(&parsed, context_edges, Expr::fvar(or_fvar))?;
-    hyps.push(Hyp {
+    let or_fvar = FVarId::new(HYP_FVAR_BASE + hypothesis_count as u64);
+    let hypothesis = Hyp {
         smt: format!("(or {})", disjunct_smts.join(" ")),
         prop: or_prop,
         fvar: or_fvar,
-        name: format!("h_{}", hyps.len()),
-    });
-
-    // STRICT (`Required`) ay cross-check.
-    //
-    // An earlier revision of this fix relaxed the lane to `Advisory`, on the
-    // reading that ay could not decide the or-of-conjunctions this lane emits.
-    // That reading was WRONG and is recorded here so it is not repeated: ay
-    // refutes the query in ~26ms. What produced the abstention was this crate
-    // DEMANDING a proof artifact it never reads (see the note in
-    // `finish_certificate_with`). With the demand dropped, the strongest gate is
-    // also the correct one, so the lane keeps `Required`: an ay abstention here
-    // would now be real evidence and must decline.
-    finish_certificate(hyps, &term, var_names, identity)
+        name: format!("h_{hypothesis_count}"),
+    };
+    Some((parsed, hypothesis))
 }
 
 /// General integer disequality via order totality: a supported `a ≠ b`
@@ -8598,11 +10609,17 @@ fn formula_linform(f: &Formula) -> Option<LinForm> {
         Formula::Int(n) => Some(LinForm::constant(*n)),
         Formula::UInt(n) if *n <= i128::MAX as u128 => Some(LinForm::constant(*n as i128)),
         Formula::Add(a, b) => formula_linform(a)?.add(&formula_linform(b)?),
+        // A difference of linear terms (`a - b`). Every atom of the pool is read
+        // here, so without this arm ONE difference atom anywhere took the Farkas
+        // lane from the whole pool, used or not. Must stay in step with the `Sub`
+        // arm of [`formula_to_normterm`], which normalizes the rows the lane uses;
+        // see there for the rows that lost it.
+        Formula::Sub(a, b) => formula_linform(a)?.sub(&formula_linform(b)?),
         Formula::Mul(a, b) => {
             let (coeff, var) = linear_mul_operands(a, b)?;
-            let name = int_var_name(var)?;
+            let name = int_var_name_str(var)?;
             let mut l = LinForm::constant(0);
-            l.add_term(&name, coeff)?;
+            l.add_term(name, coeff)?;
             Some(l)
         }
         _ => None,
@@ -8822,6 +10839,20 @@ fn neg_canon_parts(parts: &[Part]) -> Option<(Vec<Part>, Expr)> {
     let target = fold_parts(&out_parts);
     let proof = eq_trans_int(neg_sum, mid, target, neg_add, congr);
     Some((out_parts, proof))
+}
+
+/// Subtract two NormTerms: `Eq (Int.sub e1 e2) (fold merged)`.
+///
+/// The expression is spelled `Int.sub e1 e2`, exactly as [`linear_term_to_kernel`]
+/// spells a `Sub` operand in the hypothesis a Farkas row is read from. The proof
+/// is [`nt_add`]'s for `e1 + (-e2)`: the kernel's `Int.sub` is the reducible
+/// Definition `λ m n => Int.add m (Int.neg n)` (`Int.sub_eq_add_neg` is
+/// `Eq.refl`), so that proof's type is definitionally the one stated here. The
+/// kernel re-check of the finished term decides it; nothing here is trusted.
+fn nt_sub(nt1: NormTerm, nt2: NormTerm) -> Option<NormTerm> {
+    let expr = const_app("Int.sub", [nt1.expr.clone(), nt2.expr.clone()]);
+    let sum = nt_add(nt1, nt_neg(nt2)?)?;
+    Some(NormTerm { expr, parts: sum.parts, proof: sum.proof })
 }
 
 /// Add two NormTerms: `Eq (Int.add e1 e2) (fold merged)`.
@@ -9063,10 +11094,21 @@ fn formula_to_normterm(f: &Formula) -> Option<NormTerm> {
         Formula::Int(n) => Some(nt_lit(*n)),
         Formula::UInt(n) if *n <= i128::MAX as u128 => Some(nt_lit(*n as i128)),
         Formula::Add(a, b) => nt_add(formula_to_normterm(a)?, formula_to_normterm(b)?),
+        // `a - b`. Since TRUST-KI-1015-1 (`range_index_len`) every `&s[a..]` /
+        // `&s[a..b]` result carries the definition `len' = len - a` / `b - a`.
+        // [`multi_var_farkas_refutation`] reads only the atoms its multipliers
+        // use through here, so this arm is what a refutation THROUGH such a
+        // definition needs (`rest.len() - 4` under `input.len() >= 6`, through
+        // `rest.len() == input.len() - 2`). [`formula_linform`]'s arm is what an
+        // unused one needed: without it `&rest[m + 1..]` after
+        // `let rest = &data[k + 1..]` (aterm-parser `dispatch.rs:718`) and
+        // `&rows[frame.bottom + 1..]` after `rows[from..top]` (aterm-phase
+        // `turn.rs:157`) lost the lane and went certified -> uncertified -> UNKNOWN.
+        Formula::Sub(a, b) => nt_sub(formula_to_normterm(a)?, formula_to_normterm(b)?),
         Formula::Mul(a, b) => {
             let (coeff, var) = linear_mul_operands(a, b)?;
-            let name = int_var_name(var)?;
-            Some(nt_mul(coeff, &name))
+            let name = int_var_name_str(var)?;
+            Some(nt_mul(coeff, name))
         }
         _ => None,
     }
@@ -9227,17 +11269,32 @@ fn multi_var_farkas_refutation(atoms: &[Atom<'_>], hyps: &[Hyp]) -> Option<Expr>
         return None;
     }
     // Row per atom: `poslin = linform(B) − linform(A)` with meaning `0 ≤ poslin`.
+    //
+    // Trust (2026-10-04, INTEGER tightening): a strict `A < B` is the row for
+    // `A + 1 ≤ B`, not the weakened `A ≤ B`. The kernel defines
+    // `Int.lt a b := Int.le (Int.add a (Int.ofNat 1)) b` (clean-kernel
+    // `algebra_int_le_of_lt_proof.rs`), so the hypothesis itself proves it with no
+    // lemma. Weakening threw away integrality: `i0 < n ∧ i1 = i0 + 1 ∧ n < i1` is
+    // infeasible over ℤ but not over ℚ, and was refused (TINV step 0(b),
+    // `tests/tinv_probe_0b.rs`). Every multiplier set that refuted the weakened
+    // system refutes the tightened one (each tightened row only gains a `-1`), so
+    // this can only add certificates, and the kernel re-checks every term.
     let mut rows: Vec<LinForm> = Vec::with_capacity(atoms.len());
-    let mut meta: Vec<(&Formula, &Formula, bool, Expr)> = Vec::with_capacity(atoms.len());
+    let mut meta: Vec<(Formula, &Formula, Expr)> = Vec::with_capacity(atoms.len());
     for (atom, hyp) in atoms.iter().zip(hyps) {
         let (a, b, is_lt) = match atom {
             Atom::Le(a, b) => (*a, *b, false),
             Atom::Lt(a, b) => (*a, *b, true),
         };
-        let la = formula_linform(a)?;
+        let a_eff = if is_lt {
+            Formula::Add(Box::new(a.clone()), Box::new(Formula::Int(1)))
+        } else {
+            a.clone()
+        };
+        let la = formula_linform(&a_eff)?;
         let lb = formula_linform(b)?;
         rows.push(lb.sub(&la)?);
-        meta.push((a, b, is_lt, Expr::fvar(hyp.fvar)));
+        meta.push((a_eff, b, Expr::fvar(hyp.fvar)));
     }
     // Only engage when there is a genuine multi-variable / negative-coefficient
     // combination; the single-variable and unit-chain paths run first.
@@ -9253,17 +11310,14 @@ fn multi_var_farkas_refutation(atoms: &[Atom<'_>], hyps: &[Hyp]) -> Option<Expr>
         if m <= 0 {
             continue;
         }
-        let (a, b, is_lt, fvar) = &meta[i];
+        let (a, b, fvar) = &meta[i];
         let n_a = formula_to_normterm(a)?;
         let n_b = formula_to_normterm(b)?;
         let neg_a = int_neg_expr(n_a.expr.clone());
         let posexpr = int_add_expr(n_b.expr.clone(), neg_a.clone());
-        // h : Int.le A B  (weaken a strict `<` via Int.le_of_lt).
-        let h = if *is_lt {
-            const_app("Int.le_of_lt", [n_a.expr.clone(), n_b.expr.clone(), fvar.clone()])
-        } else {
-            fvar.clone()
-        };
+        // h : Int.le A B, where for a strict atom A is already `A₀ + 1` and the
+        // hypothesis `Int.lt A₀ B` is definitionally `Int.le (A₀ + 1) B`.
+        let h = fvar.clone();
         // step1 : Int.le (A + -A) (B + -A)
         let step1 = const_app(
             "Int.add_le_add_right",
@@ -9419,9 +11473,9 @@ fn ite_split_linform(f: &Formula) -> Option<LinForm> {
         Formula::Neg(a) => LinForm::constant(0).sub(&ite_split_linform(a)?),
         Formula::Mul(a, b) => {
             let (coeff, var) = linear_mul_operands(a, b)?;
-            let name = int_var_name(var)?;
+            let name = int_var_name_str(var)?;
             let mut l = LinForm::constant(0);
-            l.add_term(&name, coeff)?;
+            l.add_term(name, coeff)?;
             Some(l)
         }
         _ => None,
@@ -10402,81 +12456,278 @@ fn finish_certificate_with(
     identity: &ObligationIdentity,
     cross_check: AyCrossCheck,
 ) -> Option<trust_ir::ProofEvidence> {
-    let env = build_env(var_names)?;
+    finish_certificate_carrier(hyps, term, var_names, identity, cross_check, Carrier::Int)
+}
 
-    // Defense in depth: ay must independently refute the asserted hypotheses.
-    // VERDICT ONLY — deliberately NOT `new_with_proofs`.
-    //
-    // This gate matches `AyProofResult::Unsat { .. }` and discards the proof: it
-    // wants ay's independent VERDICT as defence in depth behind the kernel, not
-    // an ay proof artifact.
-    //
-    // Demanding the artifact is not free. ay documents `set_produce_proofs` as
-    // an AUTHORITY DEMAND — "if strict validation of the requested artifact
-    // fails, an otherwise computed UNSAT must remain `unknown`"
-    // (ay-dpll/src/api/solving/proofs.rs). MEASURED on the per-branch
-    // or-of-conjunctions this lane emits: ay answers `unsat` in ~26ms with proof
-    // production OFF and `unknown` with it ON. The verdict was correct and was
-    // being withheld only because the unwanted artifact could not be validated,
-    // which under `Required` declined every per-branch certificate.
-    //
-    // ay's own CLI does not make this demand for a synthesized default proof
-    // either — it budgets reconstruction as best-effort
-    // (`should_budget_synthesized_proof`, ay/src/run.rs). Dropping it here asks
-    // ay the question this gate actually has.
-    let mut backend = AyProofBackend::new_default(AyLogic::QfLia);
+/// The arithmetic carrier a certificate's free variables range over. It fixes
+/// the three things the shared tail must agree on with the lane that built the
+/// term: the ay logic and SMT sort of the cross-check, and the kernel
+/// environment (lemma library + skolem type) the term is checked in. The Int
+/// lane's environment is untouched by the Real one: each carrier has its own
+/// process-global base env, so no Int certificate changes bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Carrier {
+    /// `QF_LIA`, `(declare-fun x () Int)`, Int-typed skolems ([`build_env`]).
+    Int,
+    /// `QF_LRA`, `(declare-fun x () Real)`, `Rat`-typed skolems
+    /// ([`real_fragment::build_env_real`]).
+    Real,
+}
+
+impl Carrier {
+    fn ay_logic(self) -> AyLogic {
+        match self {
+            Carrier::Int => AyLogic::QfLia,
+            Carrier::Real => AyLogic::QfLra,
+        }
+    }
+
+    fn smt_sort(self) -> &'static str {
+        match self {
+            Carrier::Int => "Int",
+            Carrier::Real => "Real",
+        }
+    }
+
+    fn base_env(self) -> Option<&'static Environment> {
+        match self {
+            Carrier::Int => base_env(),
+            Carrier::Real => real_fragment::real_base_env(),
+        }
+    }
+
+    /// Cheap, clone-free check that `var_names` map to pairwise-distinct encoded
+    /// skolem names none of which collides with an existing declaration in this
+    /// carrier's base environment.
+    fn admits_skolems(self, var_names: &BTreeSet<String>) -> bool {
+        let Some(base) = self.base_env() else {
+            return false;
+        };
+        if var_names.is_empty() {
+            return true;
+        }
+        let mut seen = trust_types::fx::FxHashSet::with_capacity_and_hasher(
+            var_names.len(),
+            Default::default(),
+        );
+        for raw in var_names {
+            let encoded = Name::from_string(&encoded_var_name(raw));
+            if base.get_const(&encoded).is_some() || !seen.insert(encoded) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn build_env(self, var_names: &BTreeSet<String>) -> Option<Environment> {
+        match self {
+            Carrier::Int => build_env(var_names),
+            Carrier::Real => real_fragment::build_env_real(var_names),
+        }
+    }
+
+    /// KR0 switch: the Clean reference entry over this carrier's base
+    /// environment (no skolems), built once per process. `None` when the
+    /// entry refuses the base (recorded in `reference_mint::base_refusals`);
+    /// every certificate of the carrier then names no theory and none mints
+    /// `Certified`.
+    fn reference(self) -> Option<&'static reference_mint::CarrierReference> {
+        match self {
+            Carrier::Int => {
+                static INT: std::sync::OnceLock<Option<reference_mint::CarrierReference>> =
+                    std::sync::OnceLock::new();
+                INT.get_or_init(|| reference_mint::carrier_reference("int", base_env(), int_ty()))
+                    .as_ref()
+            }
+            Carrier::Real => real_fragment::real_reference(),
+        }
+    }
+}
+
+/// KR0 switch: re-check an already-decoded `(term, reduced)` payload through the
+/// carrier's reference entry and register its certificate under `lineage` without
+/// re-deserializing `term_bytes` or `context_bytes`.
+fn register_reference_refutation_decoded(
+    carrier: Carrier,
+    var_names: &BTreeSet<String>,
+    term_bytes: &[u8],
+    context_bytes: &[u8],
+    lineage: &trust_ir::ProofDigest,
+    term: &Expr,
+    reduced: ReducedContext,
+) {
+    if let Some(certificate) =
+        check_reference_refutation_decoded(carrier, var_names, term, reduced)
+    {
+        reference_mint::register(term_bytes, context_bytes, lineage, certificate);
+    }
+}
+
+fn check_reference_refutation_decoded(
+    carrier: Carrier,
+    var_names: &BTreeSet<String>,
+    term: &Expr,
+    reduced: ReducedContext,
+) -> Option<ReferenceCertificate> {
+    let reference = carrier.reference()?;
+    let binders = reduced
+        .decls
+        .into_iter()
+        .map(|decl| reference_mint::ClosedBinder {
+            id: FVarId::new(decl.id),
+            type_: decl.type_,
+            value: decl.value,
+            bi: decl.bi,
+            name: decl.name,
+        })
+        .collect();
+    let skolems = var_names.iter().map(|name| encoded_var_name(name)).collect();
+    match reference_mint::check_refutation(reference, &skolems, binders, &false_expr(), term) {
+        Ok(certificate) => Some(certificate),
+        Err(miss) => {
+            reference_mint::note_miss(
+                match carrier {
+                    Carrier::Int => "int",
+                    Carrier::Real => "real",
+                },
+                &miss,
+            );
+            None
+        }
+    }
+}
+
+/// ay's independent answer on a hypothesis set, collapsed to the three cases
+/// the certificate tail distinguishes. NEVER proof: an `Unsat` here only
+/// permits the kernel work that follows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AyVerdict {
+    /// ay refutes the hypotheses.
+    Unsat,
+    /// ay produced a model of the hypotheses.
+    Sat,
+    /// `Unknown` (incl. a computed UNSAT withdrawn by ay's own strict
+    /// certification), a lapsed `AY_DIRECT_SOLVE_TIMEOUT_MS` deadline, a solver
+    /// error, or a future `#[non_exhaustive]` variant.
+    Abstained,
+}
+
+/// Ask ay for its VERDICT on `hyps` over the free variables `var_names` in the
+/// carrier's logic (`QF_LIA` / `QF_LRA`). Deliberately NOT `new_with_proofs`.
+///
+/// This gate matches `AyProofResult::Unsat { .. }` and discards the proof: it
+/// wants ay's independent VERDICT as defence in depth behind the kernel, not
+/// an ay proof artifact.
+///
+/// Demanding the artifact is not free. ay documents `set_produce_proofs` as
+/// an AUTHORITY DEMAND — "if strict validation of the requested artifact
+/// fails, an otherwise computed UNSAT must remain `unknown`"
+/// (ay-dpll/src/api/solving/proofs.rs). MEASURED on the per-branch
+/// or-of-conjunctions the disjunctive lane emits: ay answers `unsat` in ~26ms
+/// with proof production OFF and `unknown` with it ON. The verdict was correct
+/// and was being withheld only because the unwanted artifact could not be
+/// validated, which under `Required` declined every per-branch certificate.
+///
+/// ay's own CLI does not make this demand for a synthesized default proof
+/// either — it budgets reconstruction as best-effort
+/// (`should_budget_synthesized_proof`, ay/src/run.rs). Dropping it here asks
+/// ay the question this gate actually has.
+///
+/// Called from [`finish_certificate_carrier`] — every lane's tail, the Real
+/// lane included (its ay pre-solve before the Farkas search was retired; see
+/// `real_fragment`'s ORDER OF WORK) — so every lane asks ay the IDENTICAL
+/// question over the identical declarations and assertions, exactly once.
+fn ay_cross_check_hyps(hyps: &[Hyp], var_names: &BTreeSet<String>, carrier: Carrier) -> AyVerdict {
+    let mut backend = AyProofBackend::new_default(carrier.ay_logic());
     for name in var_names {
-        backend.add_raw_declaration(&format!("(declare-fun {} () Int)", encoded_var_name(name)));
+        backend.add_raw_declaration(&format!(
+            "(declare-fun {} () {})",
+            encoded_var_name(name),
+            carrier.smt_sort()
+        ));
     }
     for hyp in hyps {
         backend.assert_formula(&hyp.smt);
     }
     // Trust (parallel verify): serialize ONLY the raw ay solve on the shared
     // `trust_types::ay_exec_lock()` (ay's direct path is non-reentrant). The lock
-    // drops at the end of this block — BEFORE the clean-kernel reconstruction /
-    // re-check below, which is thread-safe by construction and must stay unlocked
-    // so it parallelizes across verification threads.
-    match {
+    // drops at the end of this block — BEFORE any clean-kernel reconstruction /
+    // re-check, which is thread-safe by construction and must stay unlocked so
+    // it parallelizes across verification threads.
+    let answer = {
         let _ay_guard = trust_types::ay_exec_lock().lock().unwrap_or_else(|e| e.into_inner());
         backend.check_sat()
-    } {
-        Ok(AyProofResult::Unsat { .. }) => {}
+    };
+    note_ay_answer(&answer);
+    match answer {
+        Ok(AyProofResult::Unsat { .. }) => AyVerdict::Unsat,
+        Ok(AyProofResult::Sat) => AyVerdict::Sat,
+        _ => AyVerdict::Abstained,
+    }
+}
+
+/// [`finish_certificate_with`] over an explicit [`Carrier`]. The Int callers
+/// reach it through the wrappers above with [`Carrier::Int`], so their
+/// behaviour — and their certificate bytes — are exactly what they were.
+fn finish_certificate_carrier(
+    hyps: &[Hyp],
+    term: &Expr,
+    var_names: &BTreeSet<String>,
+    identity: &ObligationIdentity,
+    cross_check: AyCrossCheck,
+    carrier: Carrier,
+) -> Option<trust_ir::ProofEvidence> {
+    if !carrier.admits_skolems(var_names) {
+        return None;
+    }
+
+    // Defense in depth: ay must independently refute the asserted hypotheses.
+    match ay_cross_check_hyps(hyps, var_names, carrier) {
+        AyVerdict::Unsat => {}
         // ay DISAGREES: it produced a model of the very hypotheses the kernel is
         // about to prove `False` from. One of the two encoders is then wrong, and
         // which one is unknown — so decline in EVERY mode. Disagreement is never
         // waved through; only abstention is.
-        Ok(AyProofResult::Sat) => return None,
-        // ay ABSTAINS: `Unknown` (incl. a computed UNSAT withdrawn by its own
-        // strict certification), a lapsed `AY_DIRECT_SOLVE_TIMEOUT_MS` deadline, a
-        // solver error, or a future `#[non_exhaustive]` variant. This is not
-        // evidence against the certificate, and on an [`AyCrossCheck::Advisory`]
-        // lane it is not evidence the certificate ever rested on.
-        _ => {
+        AyVerdict::Sat => return None,
+        // ay ABSTAINS: this is not evidence against the certificate, and on an
+        // [`AyCrossCheck::Advisory`] lane it is not evidence the certificate
+        // ever rested on.
+        AyVerdict::Abstained => {
             if cross_check == AyCrossCheck::Required {
                 return None;
             }
         }
     }
 
+    let audited_env = AuditedCarrierEnv::build(carrier, var_names)?;
     let ctx = build_ctx(hyps);
-    if !kernel_checks_false(&env, ctx.clone(), term, var_names) {
+    if !audited_env.kernel_checks_false(ctx.clone(), term, var_names) {
         return None;
     }
 
     let term_bytes = serialize_term(term).ok()?;
     let reduced = reduced_context(&ctx);
     let context_bytes = serialize_context(&reduced).ok()?;
-    if !payload_roundtrip_rechecks(var_names, &term_bytes, &context_bytes) {
-        return None;
-    }
+    let (roundtrip_term, roundtrip_reduced) =
+        audited_env.recheck_roundtrip(var_names, &term_bytes, &context_bytes)?;
 
     let lineage = lineage_digest(&term_bytes, &context_bytes, identity);
-    Some(trust_ir::ProofEvidence::CleanCic {
+    register_reference_refutation_decoded(
+        carrier,
+        var_names,
+        &term_bytes,
+        &context_bytes,
+        &lineage,
+        &roundtrip_term,
+        roundtrip_reduced,
+    );
+    let evidence = trust_ir::ProofEvidence::CleanCic {
         term: term_bytes,
         context: context_bytes,
         lineage,
         kernel_recheck: None,
-    })
+    };
+    Some(evidence)
 }
 
 fn push_order_hyps(
@@ -10558,10 +12809,10 @@ fn term_to_kernel(f: &Formula) -> Option<Expr> {
             if let Some((lit, var)) = linear_mul_operands(a, b) {
                 return Some(hmul_int(term_to_kernel(var)?, int_literal_to_kernel(lit)?));
             }
-            let (x, y) = (int_var_name(a)?, int_var_name(b)?);
+            let (x, y) = (int_var_name_str(a)?, int_var_name_str(b)?);
             Some(hmul_int(
-                Expr::const_(Name::from_string(&encoded_var_name(&x)), vec![]),
-                Expr::const_(Name::from_string(&encoded_var_name(&y)), vec![]),
+                Expr::const_(Name::from_string(&encoded_var_name(x)), vec![]),
+                Expr::const_(Name::from_string(&encoded_var_name(y)), vec![]),
             ))
         }
         _ => None,
@@ -10584,8 +12835,8 @@ fn term_to_smt(f: &Formula) -> Option<String> {
             // ay cross-check sees the genuine nonlinear atom — if ay cannot
             // refute the asserted set it returns non-UNSAT and the certificate
             // is declined (fail-closed), never approximated.
-            let (x, y) = (int_var_name(a)?, int_var_name(b)?);
-            Some(format!("(* {} {})", encoded_var_name(&x), encoded_var_name(&y)))
+            let (x, y) = (int_var_name_str(a)?, int_var_name_str(b)?);
+            Some(format!("(* {} {})", encoded_var_name(x), encoded_var_name(y)))
         }
         _ => None,
     }
@@ -10636,14 +12887,58 @@ fn collect_int_vars(atom: &Atom<'_>, out: &mut BTreeSet<String>) -> bool {
     collect_term_vars(a, out) && collect_term_vars(b, out)
 }
 
+fn is_supported_int_term(f: &Formula) -> bool {
+    match f {
+        Formula::Var(_, Sort::Int) | Formula::SymVar(_, Sort::Int) => true,
+        Formula::Int(n) => int_literal_to_kernel(*n).is_some(),
+        Formula::UInt(n) => *n <= u64::MAX as u128,
+        Formula::Add(a, b) | Formula::Sub(a, b) => {
+            is_supported_int_term(a) && is_supported_int_term(b)
+        }
+        Formula::Neg(a) => is_supported_int_term(a),
+        Formula::Mul(a, b) => match linear_mul_operands(a, b) {
+            Some((lit, var)) => int_literal_to_kernel(lit).is_some() && is_supported_int_term(var),
+            None => int_var_name_str(a).is_some() && int_var_name_str(b).is_some(),
+        },
+        _ => false,
+    }
+}
+
+fn record_supported_term_vars(f: &Formula, out: &mut BTreeSet<String>) {
+    match f {
+        Formula::Var(name, Sort::Int) => {
+            if !out.contains(name.as_str()) {
+                out.insert(name.clone());
+            }
+        }
+        Formula::SymVar(sym, Sort::Int) => {
+            let raw = sym.as_str();
+            if !out.contains(raw) {
+                out.insert(raw.to_string());
+            }
+        }
+        Formula::Add(a, b) | Formula::Sub(a, b) | Formula::Mul(a, b) => {
+            record_supported_term_vars(a, out);
+            record_supported_term_vars(b, out);
+        }
+        Formula::Neg(a) => record_supported_term_vars(a, out),
+        _ => {}
+    }
+}
+
 fn collect_term_vars(f: &Formula, out: &mut BTreeSet<String>) -> bool {
     match f {
         Formula::Var(name, Sort::Int) => {
-            out.insert(name.clone());
+            if !out.contains(name.as_str()) {
+                out.insert(name.clone());
+            }
             true
         }
         Formula::SymVar(sym, Sort::Int) => {
-            out.insert(sym.as_str().to_string());
+            let raw = sym.as_str();
+            if !out.contains(raw) {
+                out.insert(raw.to_string());
+            }
             true
         }
         Formula::Int(n) => int_literal_to_kernel(*n).is_some(),
@@ -10659,7 +12954,7 @@ fn collect_term_vars(f: &Formula, out: &mut BTreeSet<String>) -> bool {
             Some((lit, var)) => int_literal_to_kernel(lit).is_some() && collect_term_vars(var, out),
             // var×var product: supported iff BOTH operands are Int variables
             // (the [`ChainNode::Product`] fragment); var×compound stays out.
-            None => match (int_var_name(a), int_var_name(b)) {
+            None => match (int_var_name_str(a), int_var_name_str(b)) {
                 (Some(_), Some(_)) => collect_term_vars(a, out) && collect_term_vars(b, out),
                 _ => false,
             },
@@ -10762,99 +13057,335 @@ fn reduced_context(ctx: &LocalContext) -> ReducedContext {
 /// Typing alone proves only that the term is accepted in this environment. If
 /// an ambient `sorry`/`trusted*` oracle is present, the kernel can type a
 /// one-node inhabitant of `False`. The closure check below restricts proof
-/// dependencies to obligation-local Int skolems and the Clean kernel's
-/// foundational axiom base.
+/// dependencies to obligation-local skolems (`Int`, or `Rat` for the Real
+/// lane) and the Clean kernel's foundational axiom base.
+#[cfg_attr(not(test), allow(dead_code))]
 fn kernel_checks_false(
     env: &Environment,
     ctx: LocalContext,
     term: &Expr,
     obligation_vars: &BTreeSet<String>,
 ) -> bool {
-    TypeChecker::with_context(env, ctx).check_type(term, &false_expr()).is_ok()
-        && proof_axiom_closure_is_clean(env, term, obligation_vars)
+    kernel_checks_false_for(env, ctx, term, obligation_vars, Carrier::Int)
 }
 
-/// Collect every constant name in an expression. Unknown expression forms fail
-/// closed so a new kernel node cannot silently bypass the closure audit.
-/// Free variables are permitted: their declarations come from the exact local
-/// obligation context passed to the independent kernel check above.
+/// [`kernel_checks_false`] over an explicit [`Carrier`]: the closure audit
+/// admits a skolem only when it is typed by THAT carrier (`Int` for the Int
+/// lanes, `Rat` for the Real lane). The Int wrapper above passes
+/// [`Carrier::Int`], so every Int lane audits exactly as it always did.
+#[cfg_attr(not(test), allow(dead_code))]
+fn kernel_checks_false_for(
+    env: &Environment,
+    ctx: LocalContext,
+    term: &Expr,
+    obligation_vars: &BTreeSet<String>,
+    carrier: Carrier,
+) -> bool {
+    kernel_stop::check_type(TypeChecker::with_context(env, ctx), term, &false_expr()).is_ok()
+        && proof_axiom_closure_is_clean_for(env, term, obligation_vars, carrier)
+}
+
+/// Collect every constant name in an expression DAG, visiting shared `Arc<Expr>`
+/// subterms at most once. Unknown expression forms fail closed so a new kernel
+/// node cannot silently bypass the closure audit. Free variables are permitted:
+/// their declarations come from the exact local obligation context passed to
+/// the independent kernel check above.
 fn collect_const_names(e: &Expr, out: &mut Vec<Name>) -> bool {
+    let mut seen_shared = trust_types::fx::FxHashSet::default();
+    collect_const_names_dag(e, &mut seen_shared, &mut |name| out.push(name.clone()))
+}
+
+fn collect_const_names_dag(
+    root: &Expr,
+    seen_shared: &mut trust_types::fx::FxHashSet<usize>,
+    on_const: &mut impl FnMut(&Name),
+) -> bool {
     use clean_kernel::expr::ExprKind;
-    match e.kind() {
-        ExprKind::BVar(_) | ExprKind::FVar(_) | ExprKind::Sort(_) | ExprKind::Lit(_) => true,
-        ExprKind::Const(name, _) => {
-            out.push(name.clone());
-            true
+    fn push_arc<'a>(
+        stack: &mut Vec<&'a Expr>,
+        seen_shared: &mut trust_types::fx::FxHashSet<usize>,
+        child: &'a std::sync::Arc<Expr>,
+    ) {
+        if std::sync::Arc::strong_count(child) > 1
+            && !seen_shared.insert(std::sync::Arc::as_ptr(child) as usize)
+        {
+            return;
         }
-        ExprKind::App(function, argument) => {
-            collect_const_names(function, out) && collect_const_names(argument, out)
-        }
-        ExprKind::Lam(_, type_, body) | ExprKind::Pi(_, type_, body) => {
-            collect_const_names(type_, out) && collect_const_names(body, out)
-        }
-        ExprKind::Let(_, type_, value, body, _) => {
-            collect_const_names(type_, out)
-                && collect_const_names(value, out)
-                && collect_const_names(body, out)
-        }
-        ExprKind::Proj(name, _, inner) => {
-            out.push(name.clone());
-            collect_const_names(inner, out)
-        }
-        ExprKind::MData(_, inner) => collect_const_names(inner, out),
-        _ => false,
+        stack.push(&**child);
     }
+
+    let mut stack = vec![root];
+    while let Some(e) = stack.pop() {
+        match e.kind() {
+            ExprKind::BVar(_) | ExprKind::FVar(_) | ExprKind::Sort(_) | ExprKind::Lit(_) => {}
+            ExprKind::Const(name, _) => on_const(name),
+            ExprKind::App(function, argument) => {
+                push_arc(&mut stack, seen_shared, argument);
+                push_arc(&mut stack, seen_shared, function);
+            }
+            ExprKind::Lam(_, type_, body) | ExprKind::Pi(_, type_, body) => {
+                push_arc(&mut stack, seen_shared, body);
+                push_arc(&mut stack, seen_shared, type_);
+            }
+            ExprKind::Let(_, type_, value, body, _) => {
+                push_arc(&mut stack, seen_shared, body);
+                push_arc(&mut stack, seen_shared, value);
+                push_arc(&mut stack, seen_shared, type_);
+            }
+            ExprKind::Proj(name, _, inner) => {
+                on_const(name);
+                push_arc(&mut stack, seen_shared, inner);
+            }
+            ExprKind::MData(_, inner) => push_arc(&mut stack, seen_shared, inner),
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The Clean kernel's consistency-preserving foundational axiom residue. A
 /// certificate may depend on these declarations, but never on an unguarded
-/// oracle such as `sorry`, `trustedAy`, or `trustedArith`.
-const FOUNDATIONAL_AXIOMS: [&str; 6] =
-    ["Classical.choice", "propext", "Quot", "Quot.mk", "Quot.lift", "Quot.sound"];
+/// oracle such as `sorry`, `trustedAy`, or `trustedArith`. `Quot.ind` is the
+/// quotient's induction principle — the kernel builtin every `Rat.le`/`Rat.lt`
+/// theorem of the Real lane rests on (`Rat` is `Quot Rat.Raw Rat.Raw.Equiv`);
+/// it is as foundational as `Quot.lift`/`Quot.sound`, which were already here.
+const FOUNDATIONAL_AXIOMS: [&str; 7] =
+    ["Classical.choice", "propext", "Quot", "Quot.mk", "Quot.lift", "Quot.sound", "Quot.ind"];
+
+fn foundational_axiom_names() -> &'static trust_types::fx::FxHashSet<Name> {
+    static SET: std::sync::OnceLock<trust_types::fx::FxHashSet<Name>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        FOUNDATIONAL_AXIOMS.iter().map(|s| Name::from_string(s)).collect()
+    })
+}
+
+/// Process-once transitive-closure audit of every constant in `carrier`'s
+/// immutable `base_env` (which holds zero skolems). Only constants whose full
+/// transitive `ConstantInfo` closure inside `base_env` passes the exact
+/// foundational-axiom-only audit are admitted to the returned set.
+fn preaudited_base_constants(carrier: Carrier) -> Option<&'static trust_types::fx::FxHashSet<Name>> {
+    fn compute(base: &Environment, carrier: Carrier) -> trust_types::fx::FxHashSet<Name> {
+        let empty = BTreeSet::new();
+        let mut clean = trust_types::fx::FxHashSet::default();
+        for info in base.constants() {
+            if clean.contains(&info.name) {
+                continue;
+            }
+            let probe = Expr::const_(info.name.clone(), Vec::new());
+            if proof_axiom_closure_is_clean_for(base, &probe, &empty, carrier) {
+                clean.insert(info.name.clone());
+            }
+        }
+        clean
+    }
+
+    match carrier {
+        Carrier::Int => {
+            static INT_CLEAN: std::sync::OnceLock<Option<trust_types::fx::FxHashSet<Name>>> =
+                std::sync::OnceLock::new();
+            INT_CLEAN
+                .get_or_init(|| base_env().map(|base| compute(base, Carrier::Int)))
+                .as_ref()
+        }
+        Carrier::Real => {
+            static REAL_CLEAN: std::sync::OnceLock<Option<trust_types::fx::FxHashSet<Name>>> =
+                std::sync::OnceLock::new();
+            REAL_CLEAN
+                .get_or_init(|| {
+                    real_fragment::real_base_env().map(|base| compute(base, Carrier::Real))
+                })
+                .as_ref()
+        }
+    }
+}
+
+/// Carrier environment proven by construction to equal `carrier.base_env()`
+/// extended only with `var_names` skolem declarations (borrowing `&'static`
+/// directly with zero `Environment::clone()` when `var_names` is empty).
+struct AuditedCarrierEnv {
+    env: std::borrow::Cow<'static, Environment>,
+    carrier: Carrier,
+}
+
+impl AuditedCarrierEnv {
+    fn build(carrier: Carrier, var_names: &BTreeSet<String>) -> Option<Self> {
+        if var_names.is_empty() {
+            let base = carrier.base_env()?;
+            return Some(Self { env: std::borrow::Cow::Borrowed(base), carrier });
+        }
+        let owned = carrier.build_env(var_names)?;
+        Some(Self { env: std::borrow::Cow::Owned(owned), carrier })
+    }
+
+    fn kernel_checks_false(
+        &self,
+        ctx: LocalContext,
+        term: &Expr,
+        obligation_vars: &BTreeSet<String>,
+    ) -> bool {
+        kernel_stop::check_type(TypeChecker::with_context(&self.env, ctx), term, &false_expr())
+            .is_ok()
+            && self.closure_is_clean(term, obligation_vars)
+    }
+
+    fn closure_is_clean(&self, term: &Expr, obligation_vars: &BTreeSet<String>) -> bool {
+        let Some(preaudited_base) = preaudited_base_constants(self.carrier) else {
+            return proof_axiom_closure_is_clean_for(&self.env, term, obligation_vars, self.carrier);
+        };
+        let mut non_base_work: Vec<Name> = Vec::new();
+        let mut seen_non_base: trust_types::fx::FxHashSet<Name> =
+            trust_types::fx::FxHashSet::default();
+        let mut seen_shared: trust_types::fx::FxHashSet<usize> =
+            trust_types::fx::FxHashSet::default();
+        if !collect_const_names_dag(term, &mut seen_shared, &mut |name| {
+            if !preaudited_base.contains(name) && seen_non_base.insert(name.clone()) {
+                non_base_work.push(name.clone());
+            }
+        }) {
+            return false;
+        }
+        if non_base_work.is_empty() {
+            return true;
+        }
+        use clean_kernel::env::ConstantKind;
+        let skolem_ty = match self.carrier {
+            Carrier::Int => int_ty(),
+            Carrier::Real => real_fragment::rat_ty(),
+        };
+        let allowed_skolems: trust_types::fx::FxHashSet<Name> = obligation_vars
+            .iter()
+            .map(|raw| Name::from_string(&encoded_var_name(raw)))
+            .collect();
+        let foundational = foundational_axiom_names();
+        while let Some(name) = non_base_work.pop() {
+            let Some(info) = self.env.get_const(&name) else {
+                return false;
+            };
+            if info.kind == ConstantKind::Axiom {
+                let is_skolem = info.type_ == skolem_ty && allowed_skolems.contains(&name);
+                let is_foundational = foundational.contains(&name);
+                if !is_skolem && !is_foundational {
+                    return false;
+                }
+            }
+            seen_shared.clear();
+            if !collect_const_names_dag(&info.type_, &mut seen_shared, &mut |dep| {
+                if !preaudited_base.contains(dep) && seen_non_base.insert(dep.clone()) {
+                    non_base_work.push(dep.clone());
+                }
+            }) {
+                return false;
+            }
+            if let Some(value) = &info.value {
+                seen_shared.clear();
+                if !collect_const_names_dag(value, &mut seen_shared, &mut |dep| {
+                    if !preaudited_base.contains(dep) && seen_non_base.insert(dep.clone()) {
+                        non_base_work.push(dep.clone());
+                    }
+                }) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn recheck_roundtrip(
+        &self,
+        var_names: &BTreeSet<String>,
+        term_bytes: &[u8],
+        context_bytes: &[u8],
+    ) -> Option<(Expr, ReducedContext)> {
+        let term = deserialize_term(term_bytes).ok()?;
+        let reduced: ReducedContext = deserialize_context(context_bytes).ok()?;
+        let ctx = reduced.clone().into_context();
+        self.kernel_checks_false(ctx, &term, var_names).then_some((term, reduced))
+    }
+}
 
 /// Require the complete transitive constant closure of a proof to contain only
-/// declared definitions, obligation-local Int skolems, and the foundational
-/// Clean axioms above. Declaration types and values are traversed as well as the
-/// submitted term, so an oracle cannot hide behind a reducible definition.
+/// declared definitions, the obligation-local skolems, and the foundational
+/// Clean axioms above. A skolem is admitted only if it is named EXACTLY by the
+/// obligation's variable set AND typed by the certificate's carrier — `Int`
+/// for the Int lanes, `Rat` for the Real lane (an unconstrained constant of
+/// either type is consistency-preserving; anything else is an oracle).
+/// Declaration types and values are traversed as well as the submitted term,
+/// so an oracle cannot hide behind a reducible definition.
+///
+/// This entry point is the INT-carrier audit (every Int lane's behaviour,
+/// unchanged; production reaches it through [`kernel_checks_false`]'s carrier
+/// form, so it is exercised directly only by the test suite);
+/// [`proof_axiom_closure_is_clean_for`] takes the carrier explicitly and is
+/// what the Real lane uses.
+#[cfg_attr(not(test), allow(dead_code))]
 fn proof_axiom_closure_is_clean(
     env: &Environment,
     term: &Expr,
     obligation_vars: &BTreeSet<String>,
 ) -> bool {
+    proof_axiom_closure_is_clean_for(env, term, obligation_vars, Carrier::Int)
+}
+
+/// [`proof_axiom_closure_is_clean`] over an explicit [`Carrier`]: a skolem is
+/// admitted only when typed by that carrier's sort — a `Rat`-typed constant is
+/// an oracle to an Int certificate and an `Int`-typed one to a Real
+/// certificate, whatever its name.
+fn proof_axiom_closure_is_clean_for(
+    env: &Environment,
+    term: &Expr,
+    obligation_vars: &BTreeSet<String>,
+    carrier: Carrier,
+) -> bool {
     use clean_kernel::env::ConstantKind;
 
-    let int = int_ty();
-    let allowed_int_skolems = obligation_vars
+    let skolem_ty = match carrier {
+        Carrier::Int => int_ty(),
+        Carrier::Real => real_fragment::rat_ty(),
+    };
+    let allowed_skolems: trust_types::fx::FxHashSet<Name> = obligation_vars
         .iter()
         .map(|raw| Name::from_string(&encoded_var_name(raw)))
-        .collect::<BTreeSet<_>>();
-    let mut work = Vec::new();
-    if !collect_const_names(term, &mut work) {
+        .collect();
+    let foundational = foundational_axiom_names();
+    let mut work: Vec<Name> = Vec::new();
+    let mut seen: trust_types::fx::FxHashSet<Name> = trust_types::fx::FxHashSet::default();
+    let mut seen_shared: trust_types::fx::FxHashSet<usize> =
+        trust_types::fx::FxHashSet::default();
+    if !collect_const_names_dag(term, &mut seen_shared, &mut |name| {
+        if seen.insert(name.clone()) {
+            work.push(name.clone());
+        }
+    }) {
         return false;
     }
-    let mut seen: BTreeSet<Name> = BTreeSet::new();
     while let Some(name) = work.pop() {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
         let Some(info) = env.get_const(&name) else {
             return false;
         };
         if info.kind == ConstantKind::Axiom {
-            let is_int_skolem = info.type_ == int && allowed_int_skolems.contains(&name);
-            let is_foundational =
-                FOUNDATIONAL_AXIOMS.iter().any(|allowed| name == Name::from_string(allowed));
-            if !is_int_skolem && !is_foundational {
+            let is_skolem = info.type_ == skolem_ty && allowed_skolems.contains(&name);
+            let is_foundational = foundational.contains(&name);
+            if !is_skolem && !is_foundational {
                 return false;
             }
         }
-        if !collect_const_names(&info.type_, &mut work) {
+        seen_shared.clear();
+        if !collect_const_names_dag(&info.type_, &mut seen_shared, &mut |dep| {
+            if seen.insert(dep.clone()) {
+                work.push(dep.clone());
+            }
+        }) {
             return false;
         }
-        if let Some(value) = &info.value
-            && !collect_const_names(value, &mut work)
-        {
-            return false;
+        if let Some(value) = &info.value {
+            seen_shared.clear();
+            if !collect_const_names_dag(value, &mut seen_shared, &mut |dep| {
+                if seen.insert(dep.clone()) {
+                    work.push(dep.clone());
+                }
+            }) {
+                return false;
+            }
         }
     }
     true
@@ -10867,16 +13398,66 @@ fn payload_roundtrip_rechecks(
     term_bytes: &[u8],
     context_bytes: &[u8],
 ) -> bool {
-    let Ok(term) = deserialize_term(term_bytes) else {
+    payload_roundtrip_rechecks_with(Carrier::Int, var_names, term_bytes, context_bytes)
+}
+
+/// [`payload_roundtrip_rechecks`] over an explicit [`Carrier`] (the rebuilt
+/// environment types the skolems by it).
+fn payload_roundtrip_rechecks_with(
+    carrier: Carrier,
+    var_names: &BTreeSet<String>,
+    term_bytes: &[u8],
+    context_bytes: &[u8],
+) -> bool {
+    let Some(audited_env) = AuditedCarrierEnv::build(carrier, var_names) else {
         return false;
     };
-    let Ok(reduced): Result<ReducedContext, _> = deserialize_context(context_bytes) else {
+    audited_env.recheck_roundtrip(var_names, term_bytes, context_bytes).is_some()
+}
+
+/// Single-deserialization roundtrip kernel check + KR0 reference check +
+/// registration for cold consumer replay paths.
+fn recheck_and_register_roundtrip(
+    carrier: Carrier,
+    var_names: &BTreeSet<String>,
+    term_bytes: &[u8],
+    context_bytes: &[u8],
+    lineage: &trust_ir::ProofDigest,
+) -> bool {
+    let Some(audited_env) = AuditedCarrierEnv::build(carrier, var_names) else {
         return false;
     };
-    let Some(env) = build_env(var_names) else {
+    let Some((term, reduced)) =
+        audited_env.recheck_roundtrip(var_names, term_bytes, context_bytes)
+    else {
         return false;
     };
-    kernel_checks_false(&env, reduced.into_context(), &term, var_names)
+    let Some(certificate) = check_reference_refutation_decoded(carrier, var_names, &term, reduced)
+    else {
+        return false;
+    };
+    reference_mint::register(term_bytes, context_bytes, lineage, certificate);
+    true
+}
+
+fn payload_lineage_hasher(term_bytes: &[u8], context_bytes: &[u8]) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(LINEAGE_DOMAIN.as_bytes());
+    for field in [term_bytes, context_bytes] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    hasher
+}
+
+fn finish_lineage_digest(mut hasher: Sha256, identity: &ObligationIdentity) -> trust_ir::ProofDigest {
+    let encoded = identity.encoded.as_slice();
+    hasher.update((encoded.len() as u64).to_le_bytes());
+    hasher.update(encoded);
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&digest);
+    trust_ir::ProofDigest::sha256(bytes)
 }
 
 /// SHA-256 lineage digest binding the serialized term + context **and** the
@@ -10890,17 +13471,7 @@ fn lineage_digest(
     context_bytes: &[u8],
     identity: &ObligationIdentity,
 ) -> trust_ir::ProofDigest {
-    let mut hasher = Sha256::new();
-    hasher.update(LINEAGE_DOMAIN.as_bytes());
-    // Fixed order, each field length-prefixed for an injective encoding.
-    for field in [term_bytes, context_bytes, identity.encoded.as_slice()] {
-        hasher.update((field.len() as u64).to_le_bytes());
-        hasher.update(field);
-    }
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&digest);
-    trust_ir::ProofDigest::sha256(bytes)
+    finish_lineage_digest(payload_lineage_hasher(term_bytes, context_bytes), identity)
 }
 
 #[cfg(test)]
@@ -10926,6 +13497,310 @@ mod tests {
             contract_metadata: None,
             obligation: None,
         }
+    }
+
+    /// Replay imported bytes with no producer available: even a cold consumer
+    /// must check the proof rather than solve the obligation again.
+    #[test]
+    fn imported_linear_proof_replays_without_regeneration() {
+        let mut vc = contradiction_vc();
+        let evidence = certify_vc(&vc).expect("producer certificate");
+        let ProofEvidence::CleanCic { term, context, .. } = evidence else {
+            panic!("expected a kernel proof");
+        };
+        // This exact identity has never had a certificate registered. It uses
+        // the same mathematics, but import must mint fresh local authority.
+        vc.function = "imported_linear_proof_replays_without_regeneration".into();
+        let identity = ObligationIdentity::from_vc(&vc).expect("identity");
+        let lineage = lineage_digest(&term, &context, &identity);
+        let imported = ProofEvidence::CleanCic {
+            term: term.clone(),
+            context: context.clone(),
+            lineage,
+            kernel_recheck: None,
+        };
+        assert!(reference_certificate_for(&imported).is_none());
+        let accepted = on_certify_stack(|| {
+            Some(recheck_cleancic_with_identity_or(
+                &term,
+                &context,
+                &lineage,
+                &vc.formula,
+                &identity,
+                || panic!("replaying this saved proof must not invoke proof search"),
+            ))
+        });
+        assert_eq!(accepted, Some(true));
+        assert!(reference_certificate_for(&imported).is_some());
+        assert_eq!(
+            on_certify_stack(|| Some(recheck_cleancic_with_identity_or(
+                &term,
+                &context,
+                &lineage,
+                &vc.formula,
+                &identity,
+                || panic!("warm replay must not invoke proof search either"),
+            ))),
+            Some(true)
+        );
+        assert!(replay_vc_evidence(&vc, &imported));
+    }
+
+    #[test]
+    fn registered_proof_does_not_replace_current_context_check() {
+        let mut vc = contradiction_vc();
+        let evidence = certify_vc(&vc).expect("producer certificate");
+        let certificate = reference_certificate_for(&evidence).expect("reference certificate");
+        let ProofEvidence::CleanCic { term, context, .. } = evidence else {
+            panic!("expected a kernel proof");
+        };
+        // Simulate a producer binding a genuine mathematical proof to the wrong
+        // VC. The reference token is valid for the submitted bytes, but this
+        // obligation is satisfiable and does not supply those hypotheses.
+        vc.function = "registered_proof_does_not_replace_current_context_check".into();
+        vc.formula =
+            Formula::Lt(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(0)));
+        let identity = ObligationIdentity::from_vc(&vc).expect("identity");
+        let lineage = lineage_digest(&term, &context, &identity);
+        reference_mint::register(&term, &context, &lineage, certificate);
+        assert!(
+            reference_mint::reference_certificate_for_parts(&term, &context, &lineage).is_some()
+        );
+        assert_eq!(
+            on_certify_stack(|| Some(recheck_cleancic_with_identity_or(
+                &term,
+                &context,
+                &lineage,
+                &vc.formula,
+                &identity,
+                || None,
+            ))),
+            Some(false)
+        );
+        assert!(!recheck_vc(&vc, &term, &context, &lineage));
+    }
+
+    #[test]
+    fn imported_linear_proof_rejects_changed_claim_and_forged_bytes() {
+        let vc = contradiction_vc();
+        let evidence = certify_vc(&vc).expect("producer certificate");
+        let ProofEvidence::CleanCic { term, context, lineage, .. } = evidence else {
+            panic!("expected a kernel proof");
+        };
+        let identity = ObligationIdentity::from_vc(&vc).expect("identity");
+        let mut changed = vc.clone();
+        changed.function = "different_claim".into();
+        let changed_identity = ObligationIdentity::from_vc(&changed).expect("identity");
+        assert_eq!(
+            on_certify_stack(|| Some(recheck_cleancic_with_identity_or(
+                &term,
+                &context,
+                &lineage,
+                &changed.formula,
+                &changed_identity,
+                || None,
+            ))),
+            Some(false)
+        );
+
+        // Recompute lineage for the forgery, so the digest alone cannot be the
+        // reason it fails. The submitted term must actually pass the kernel.
+        let forged_term = serialize_term(&Expr::sort(Level::zero())).expect("term");
+        let forged_lineage = lineage_digest(&forged_term, &context, &identity);
+        assert_eq!(
+            on_certify_stack(|| Some(recheck_cleancic_with_identity_or(
+                &forged_term,
+                &context,
+                &forged_lineage,
+                &vc.formula,
+                &identity,
+                || None,
+            ))),
+            Some(false)
+        );
+
+        // A real proof under different hypotheses cannot supply this claim's
+        // context, even when it mentions the same variable and hashes itself.
+        let mut other = vc.clone();
+        other.formula = Formula::And(vec![
+            Formula::Lt(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(3))),
+            Formula::Lt(Box::new(Formula::Int(3)), Box::new(Formula::Var("x".into(), Sort::Int))),
+        ]);
+        let ProofEvidence::CleanCic { term: other_term, context: other_context, .. } =
+            certify_vc(&other).expect("other certificate")
+        else {
+            panic!("kernel proof")
+        };
+        let swapped_lineage = lineage_digest(&other_term, &other_context, &identity);
+        assert_eq!(
+            on_certify_stack(|| Some(recheck_cleancic_with_identity_or(
+                &other_term,
+                &other_context,
+                &swapped_lineage,
+                &vc.formula,
+                &identity,
+                || None,
+            ))),
+            Some(false)
+        );
+    }
+
+    /// A violation no other test certifies, so the process-global memo holds
+    /// no entry for it until the test that owns `tag` writes one.
+    fn memo_probe_violation(tag: i128) -> Formula {
+        let x = || Formula::Var(format!("memo_probe_{tag}"), Sort::Int);
+        Formula::And(vec![
+            Formula::Lt(Box::new(x()), Box::new(Formula::Int(tag))),
+            Formula::Lt(Box::new(Formula::Int(tag)), Box::new(x())),
+        ])
+    }
+
+    /// Plan P4 (T4.2): a run some clock or budget stopped is never memoized —
+    /// the next request recomputes it — while a pure run is stored and served.
+    #[test]
+    fn memo_never_stores_a_stopped_result() {
+        let violation = memo_probe_violation(910_001);
+        let identity = ObligationIdentity::from_violation(&violation).expect("identity");
+        let key = bincode::serialize(&violation).expect("key");
+        let runs = std::cell::Cell::new(0u32);
+        let stopped = || {
+            runs.set(runs.get() + 1);
+            CertifyOutcome::Stopped {
+                cause: trust_types::determinism::StopCause::WallBackstop,
+                evidence: None,
+            }
+        };
+        assert!(certify_memoized(key.clone(), &identity, stopped).is_none());
+        assert!(certify_memo_lookup(&key).is_none(), "a stopped run left an entry");
+        assert!(certify_memoized(key.clone(), &identity, stopped).is_none());
+        assert_eq!(runs.get(), 2, "the second request must recompute, not replay");
+
+        let pure = || {
+            runs.set(runs.get() + 1);
+            CertifyOutcome::Uncertifiable
+        };
+        assert!(certify_memoized(key.clone(), &identity, pure).is_none());
+        assert!(matches!(certify_memo_lookup(&key), Some(None)), "a pure decline is stored");
+        assert!(certify_memoized(key, &identity, pure).is_none());
+        assert_eq!(runs.get(), 3, "a stored pure run is served, not recomputed");
+    }
+
+    /// The stop record crosses the certification thread hop and scopes nest: a
+    /// run that consumed a stopped nested run is itself stopped, and a sibling
+    /// run that consumed nothing stopped is not.
+    #[test]
+    fn a_nested_stop_reaches_the_enclosing_run() {
+        let ((), outer) = with_stop_scope(|| {
+            let nested: Option<()> = on_certify_stack(|| {
+                note_ay_answer::<()>(&Ok(AyProofResult::Unknown {
+                    reason: clean_auto::bridge::ay_contract::AyUnknownReason::Unknown,
+                    detail: None,
+                }));
+                None
+            });
+            assert!(nested.is_none());
+        });
+        assert_eq!(outer, Some(trust_types::determinism::StopCause::Unclassified));
+        let ((), clean) = with_stop_scope(|| {
+            note_ay_answer::<()>(&Ok(AyProofResult::Sat));
+        });
+        assert_eq!(clean, None, "a decided ay answer is not a stop");
+    }
+
+    /// The linear-REAL lane runs on a thread of its own, and its ay
+    /// cross-check records an abstention there. The stop must reach the run
+    /// that consumed the lane: under `AyCrossCheck::Required` an abstaining ay
+    /// makes the lane decline, and a decline the run did not see as stopped
+    /// would be memoized and served to every later request for the formula.
+    #[test]
+    fn a_stop_on_the_real_lane_thread_is_never_memoized() {
+        let violation = memo_probe_violation(910_003);
+        let identity = ObligationIdentity::from_violation(&violation).expect("identity");
+        let key = bincode::serialize(&violation).expect("key");
+        let runs = std::cell::Cell::new(0u32);
+        let abstaining_real_lane = || {
+            runs.set(runs.get() + 1);
+            let (evidence, stop) = with_stop_scope(|| {
+                real_fragment::run_on_real_lane_stack(|| {
+                    note_ay_answer::<()>(&Ok(AyProofResult::Unknown {
+                        reason: clean_auto::bridge::ay_contract::AyUnknownReason::Unknown,
+                        detail: None,
+                    }));
+                    None::<ProofEvidence>
+                })
+            });
+            CertifyOutcome::of(evidence, stop)
+        };
+        assert!(certify_memoized(key.clone(), &identity, abstaining_real_lane).is_none());
+        assert!(certify_memo_lookup(&key).is_none(), "an abstaining real lane left an entry");
+        assert!(certify_memoized(key, &identity, abstaining_real_lane).is_none());
+        assert_eq!(runs.get(), 2, "the second request must recompute, not replay a decline");
+    }
+
+    /// T3 L4 (C06a): `certify_vc_reporting_stop` returns exactly `certify_vc`'s evidence
+    /// and the stop its run saw: none for a run nothing stopped, and a stop injected into
+    /// the run on the certification stack, which leaves the evidence unchanged.
+    #[test]
+    fn certify_vc_reporting_stop_returns_the_evidence_and_the_runs_stop() {
+        use trust_types::determinism::StopCause;
+        let mut vc = contradiction_vc();
+        vc.function = "certify_vc_reporting_stop_probe".into();
+        let plain = certify_vc(&vc);
+        assert!(plain.is_some(), "a QF_LIA contradiction certifies");
+        assert_eq!(certify_vc_reporting_stop(&vc), (plain.clone(), None));
+
+        INJECTED_TEST_STOPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(("certify_vc_reporting_stop_probe".to_string(), StopCause::WallBackstop));
+        let (evidence, stop) = certify_vc_reporting_stop(&vc);
+        assert_eq!(stop, Some(StopCause::WallBackstop));
+        assert_eq!(evidence, plain, "a reported stop leaves certify_vc's result unchanged");
+        assert_eq!(certify_vc(&vc), plain);
+        // The planning entry reports the same way (this formula is outside its grammar).
+        assert_eq!(
+            certify_vc_for_native_planning_reporting_stop(&vc),
+            (certify_vc_for_native_planning(&vc), None)
+        );
+    }
+
+    /// The checker-core kernel stack carries its stop home the same way.
+    #[test]
+    fn a_stop_on_the_kernel_stack_reaches_the_enclosing_run() {
+        let (answer, stop) = with_stop_scope(|| {
+            checker_core::run_on_large_stack(|| {
+                note_certify_stop(trust_types::determinism::StopCause::Effort);
+            })
+        });
+        assert_eq!(answer, Some(()));
+        assert_eq!(stop, Some(trust_types::determinism::StopCause::Effort));
+    }
+
+    /// A memo hit is byte-identical to a fresh run of the producer, lineage
+    /// included, for every identity the formula is certified under.
+    #[test]
+    fn memo_hit_is_byte_identical_to_fresh() {
+        let violation = memo_probe_violation(910_002);
+        let fresh = |identity: &ObligationIdentity| {
+            on_certify_stack(|| certify_lanes(&violation, identity))
+        };
+        let formula_identity = ObligationIdentity::from_violation(&violation).expect("identity");
+        let first = certify_violation(&violation).expect("a QF_LIA contradiction certifies");
+        let hit = certify_violation(&violation).expect("memo hit");
+        assert_eq!(hit, first);
+        assert_eq!(Some(hit), fresh(&formula_identity));
+
+        let vc = VerificationCondition {
+            kind: VcKind::Assertion { message: "memo purity".to_string() },
+            function: "memo_hit_is_byte_identical_to_fresh".into(),
+            location: SourceSpan::default(),
+            formula: violation.clone(),
+            contract_metadata: None,
+            obligation: None,
+        };
+        let vc_identity = ObligationIdentity::from_vc(&vc).expect("identity");
+        let vc_hit = certify_vc(&vc).expect("memo hit under a full-VC identity");
+        assert_eq!(Some(vc_hit), fresh(&vc_identity));
     }
 
     fn assert_formula_certificate_pairs(violation: &Formula) {
@@ -10997,16 +13872,12 @@ mod tests {
                         eq(iv("_0"), iv("_5")),
                         F::And(vec![
                             eq(iv("_0"), iv("_5b")),
-                            not(F::And(vec![
-                                le(iv("lo"), iv("_0")),
-                                le(iv("_0"), iv("hi")),
-                            ])),
+                            not(F::And(vec![le(iv("lo"), iv("_0")), le(iv("_0"), iv("hi"))])),
                         ]),
                     ]),
                 ]),
             ];
-            let mut members =
-                vec![not(lt(iv("_8"), iv("lo"))), second];
+            let mut members = vec![not(lt(iv("_8"), iv("lo"))), second];
             if include_requires {
                 members.push(le(iv("lo"), iv("hi")));
             }
@@ -13889,6 +16760,45 @@ mod tests {
         assert!(certify_vc_for_native_planning(&vc).is_none());
     }
 
+    /// The authenticated-obligation record is bounded ITERATIVELY before the
+    /// recursive identity measurement: a deep `Add` chain in `obligation.body`
+    /// used to overflow a 2 MiB caller stack inside `bincode::serialized_size`
+    /// (measured 2026-09-16 at depth 300); it is now refused as
+    /// `ObligationRecordShape` without recursing, while a shallow record still
+    /// passes the shape gate and is judged on its identity bytes as before.
+    #[test]
+    fn native_planning_bounds_the_obligation_record_before_measuring_it() {
+        use trust_types::ObligationRecord;
+        let iv = |name: &str| Formula::Var(name.to_string(), Sort::Int);
+        let chain = |depth: usize| {
+            (0..depth).fold(iv("x"), |acc, _| Formula::Add(Box::new(acc), Box::new(iv("x"))))
+        };
+        let with_body = |body: Formula| {
+            let mut vc = native_planning_unsigned_bv_vc("idx", 10);
+            vc.obligation =
+                Some(ObligationRecord { body, wrappers: vec![], subject: None, width: None });
+            vc
+        };
+        // Deep record: refused by the iterative bound, before any recursion.
+        for depth in [NATIVE_PLANNING_MAX_RECORD_FORMULA_DEPTH, 300, 4000] {
+            let vc = with_body(chain(depth));
+            assert_eq!(
+                preflight_unsigned_bv_order_vc_for_native_planning(&vc),
+                Err(NativePlanningPreflightFailure::ObligationRecordShape),
+                "depth {depth}"
+            );
+            assert!(!vc_fits_native_planning_certification_budget(&vc));
+            assert!(certify_vc_for_native_planning(&vc).is_none());
+        }
+        // Shallow record: passes the shape gate; whatever the identity-bytes cap
+        // then says is unchanged behaviour.
+        let shallow = with_body(chain(4));
+        assert_ne!(
+            preflight_unsigned_bv_order_vc_for_native_planning(&shallow),
+            Err(NativePlanningPreflightFailure::ObligationRecordShape)
+        );
+    }
+
     #[test]
     fn native_planning_rejects_wrong_kind_width_and_direction() {
         let mut wrong_kind = native_planning_unsigned_bv_vc("idx", 10);
@@ -14879,25 +17789,18 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Signed wide-BV add/sub no-overflow → linear-Int refutation.
-    // These use the EXACT shapes the `i128_guarded_add` / `i128_widened_sub` /
-    // `i128_shift_accumulator` fixtures dump (`AY_CERT_DUMP=1`), so they exercise
+    // These use the shapes the `i128_guarded_add` / `i128_widened_sub` /
+    // `i128_shift_accumulator` fixtures dump (`AY_CERT_DUMP=1`): the guards plus
+    // BOTH conjuncts of the overflow predicate trust-vcgen emits (built here with
+    // the producer's own constructor), so they exercise
     // `certify_signed_bv_overflow_safe` end-to-end through the clean kernel.
     // -----------------------------------------------------------------------
 
-    /// Helpers building the BV overflow shapes the router emits.
     fn bv(value: i128, width: u32) -> Formula {
         Formula::BitVec { value, width }
     }
     fn bvvar(name: &str, width: u32) -> Formula {
         Formula::Var(name.to_string(), Sort::BitVec(width))
-    }
-    /// `i128::MIN` rendered as the unsigned threshold the carry test compares
-    /// against (`2^127`), exactly as the dump shows (`value: i128::MIN`).
-    fn imin_threshold() -> Formula {
-        bv(i128::MIN, 128)
-    }
-    fn bvult(a: Formula, b: Formula) -> Formula {
-        Formula::BvULt(Box::new(a), Box::new(b), 128)
     }
     fn bvslt(a: Formula, b: Formula) -> Formula {
         Formula::BvSLt(Box::new(a), Box::new(b), 128)
@@ -14909,41 +17812,40 @@ mod tests {
         Formula::Not(Box::new(f))
     }
 
-    /// The carry-bit overflow disjunction the router emits over `result`:
-    /// `Or([ result <u MIN ∧ ¬(x <u MIN), ¬(result <u MIN) ∧ x <u MIN ])`.
-    fn carry_overflow_or(result: Formula, x: Formula) -> Formula {
-        Formula::Or(vec![
-            Formula::And(vec![
-                bvult(result.clone(), imin_threshold()),
-                not(bvult(x.clone(), imin_threshold())),
-            ]),
-            Formula::And(vec![not(bvult(result, imin_threshold())), bvult(x, imin_threshold())]),
-        ])
+    /// The signed overflow predicate trust-vcgen emits for `x OP y` at `w` bits:
+    /// `And([sign_relation, result_sign_flips])` (single-sourced in trust-types).
+    fn overflow_predicate(x: Formula, y: Formula, is_add: bool, w: u32) -> Formula {
+        trust_types::signed_bv_addsub_overflow_sign_test(x, y, is_add, w).expect("width in range")
+    }
+
+    /// Only the result-sign-flip half of [`overflow_predicate`] — what these tests
+    /// built before 2026-10-03 (`carry_overflow_or`). It is NOT the overflow
+    /// predicate: `x = 5, y = -10` flips the result's sign with no overflow.
+    fn result_sign_flip_only(x: Formula, y: Formula, is_add: bool, w: u32) -> Formula {
+        let Formula::And(mut parts) = overflow_predicate(x, y, is_add, w) else {
+            unreachable!("the predicate is a two-conjunct And")
+        };
+        parts.pop().expect("two conjuncts")
     }
 
     /// `i128_guarded_add`: `if a>-1000 && a<1000 && b>-1000 && b<1000 { a+b }`.
-    /// Signed-BV guards `BvSLt(-1000,a) ∧ BvSLt(a,1000) ∧ …` + the carry-bit
-    /// overflow disjunction over `BvAdd(a,b,128)`. Bounded sum ∈ (-1998,1998) ⊂
-    /// i128 ⇒ no overflow ⇒ UNSAT.
+    /// Signed-BV guards `BvSLt(-1000,a) ∧ BvSLt(a,1000) ∧ …` + the overflow
+    /// predicate over `BvAdd(a,b,128)`. Bounded sum ∈ (-1998,1998) ⊂ i128 ⇒ no
+    /// overflow ⇒ UNSAT.
     #[test]
     fn certifies_i128_guarded_add_bv_carry_shape() {
         let a = bvvar("__trust_ovf_bv_lhs_a", 128);
         let b = bvvar("__trust_ovf_bv_rhs_b", 128);
-        let sum = Formula::BvAdd(Box::new(a.clone()), Box::new(b.clone()), 128);
         let viol = Formula::And(vec![
             bvslt(bv(-1000, 128), a.clone()),
             bvslt(a.clone(), bv(1000, 128)),
             bvslt(bv(-1000, 128), b.clone()),
             bvslt(b.clone(), bv(1000, 128)),
-            // The carry_in test is `Not(Or([...]))` — irrelevant to the bound, so
-            // we keep ONLY the carry_out overflow disjunction (the conjunct that
-            // asserts overflow). Dropping the `Not(carry_in)` conjunct is sound
-            // (it only weakens the asserted violation).
-            carry_overflow_or(sum, a),
+            overflow_predicate(a, b, true, 128),
         ]);
         assert!(
             certify_violation(&viol).is_some(),
-            "i128 guarded add (signed-BV carry overflow shape) must certify"
+            "i128 guarded add (signed-BV overflow predicate shape) must certify"
         );
         assert_formula_certificate_pairs(&viol);
     }
@@ -14962,7 +17864,6 @@ mod tests {
     fn certifies_i128_widened_sub_bv_carry_shape() {
         let sx = Formula::BvSignExt(Box::new(bvvar("__trust_ovf_bv_lhs__3", 64)), 64);
         let sy = Formula::BvSignExt(Box::new(bvvar("__trust_ovf_bv_rhs__4", 64)), 64);
-        let diff = Formula::BvSub(Box::new(sx.clone()), Box::new(sy.clone()), 128);
         let viol = Formula::And(vec![
             // Type bounds on the (post-widen) operands, as the dump carries them
             // on the Int carriers — present but redundant with the sign-extension.
@@ -14974,7 +17875,7 @@ mod tests {
                 Box::new(Formula::Var("a".into(), Sort::Int)),
                 Box::new(Formula::Int(i64::MAX as i128)),
             ),
-            carry_overflow_or(diff, sx),
+            overflow_predicate(sx, sy, false, 128),
         ]);
         assert!(
             certify_violation(&viol).is_some(),
@@ -14992,8 +17893,7 @@ mod tests {
         // 16→128: BvSignExt adds 112 bits to a 16-bit source.
         let sx = Formula::BvSignExt(Box::new(bvvar("__trust_ovf_bv_lhs__3", 16)), 112);
         let sy = Formula::BvSignExt(Box::new(bvvar("__trust_ovf_bv_rhs__4", 16)), 112);
-        let diff = Formula::BvSub(Box::new(sx.clone()), Box::new(sy.clone()), 128);
-        let viol = Formula::And(vec![carry_overflow_or(diff, sx)]);
+        let viol = overflow_predicate(sx, sy, false, 128);
         assert!(
             certify_violation(&viol).is_some(),
             "narrow (16→128) widened sub must certify (within reducer reach)"
@@ -15001,7 +17901,7 @@ mod tests {
     }
 
     /// `i128_shift_accumulator` per-add obligation: `t ∈ [0,65280]`, `_9 ∈ [0,4080]`
-    /// in SIGNED BV (`BvSLe`), plus the carry-bit overflow disjunction over
+    /// in SIGNED BV (`BvSLe`), plus the overflow predicate over
     /// `BvAdd(t,_9,128)`. Sum ≤ 69360 ⊂ i128 ⇒ no overflow ⇒ UNSAT. (The fixture's
     /// shift-amount obligation is certified by `certify_closed_constant_contradiction`
     /// already; this is the ADD obligation.)
@@ -15009,30 +17909,430 @@ mod tests {
     fn certifies_i128_shift_accumulator_add_bv_carry_shape() {
         let t = bvvar("__trust_ovf_bv_lhs_t", 128);
         let n = bvvar("__trust_ovf_bv_rhs__9", 128);
-        let sum = Formula::BvAdd(Box::new(t.clone()), Box::new(n.clone()), 128);
         let viol = Formula::And(vec![
             bvsle(bv(0, 128), t.clone()),
             bvsle(t.clone(), bv(65280, 128)),
             bvsle(bv(0, 128), n.clone()),
             bvsle(n.clone(), bv(4080, 128)),
-            carry_overflow_or(sum, t),
+            overflow_predicate(t, n, true, 128),
         ]);
         assert!(
             certify_violation(&viol).is_some(),
-            "i128 shift-accumulator add (signed-BV ≤ guard carry overflow shape) must certify"
+            "i128 shift-accumulator add (signed-BV ≤ guard overflow predicate shape) must certify"
         );
+    }
+
+    /// The overflow rows of `pos.rs` (`g`: `if a > -1000 && a < 1000 && b > -1000 &&
+    /// b < 1000 { a + b } else { 0 }` over `i128`; `ws`: `(b as i128) - (a as i128)`
+    /// over `i64`), transcribed VERBATIM from `AY_CERT_DUMP=1` on the stage 1 of
+    /// `a0877b2a62` — Int type ranges, `Bool` reifications and all. Both were
+    /// kernel-certified by this lane there, and both assert the overflow predicate as
+    /// top-level conjuncts (nested `And`s flatten), so the gate keeps them.
+    #[test]
+    fn certifies_the_dumped_i128_guarded_add_and_widened_sub_rows() {
+        let g = Formula::And(vec![
+            Formula::And(vec![
+                Formula::Le(
+                    Box::new(Formula::Int(i128::MIN)),
+                    Box::new(Formula::Var("a".into(), Sort::Int)),
+                ),
+                Formula::Le(
+                    Box::new(Formula::Var("a".into(), Sort::Int)),
+                    Box::new(Formula::Int(i128::MAX)),
+                ),
+            ]),
+            Formula::And(vec![
+                Formula::Le(
+                    Box::new(Formula::Int(i128::MIN)),
+                    Box::new(Formula::Var("b".into(), Sort::Int)),
+                ),
+                Formula::Le(
+                    Box::new(Formula::Var("b".into(), Sort::Int)),
+                    Box::new(Formula::Int(i128::MAX)),
+                ),
+            ]),
+            Formula::And(vec![
+                Formula::Eq(
+                    Box::new(Formula::Var("_3".into(), Sort::Bool)),
+                    Box::new(Formula::Gt(
+                        Box::new(Formula::Var("a".into(), Sort::Int)),
+                        Box::new(Formula::Int(-1000i128)),
+                    )),
+                ),
+                Formula::Eq(
+                    Box::new(Formula::Var("_4".into(), Sort::Bool)),
+                    Box::new(Formula::Lt(
+                        Box::new(Formula::Var("a".into(), Sort::Int)),
+                        Box::new(Formula::Int(1000)),
+                    )),
+                ),
+                Formula::Eq(
+                    Box::new(Formula::Var("_5".into(), Sort::Bool)),
+                    Box::new(Formula::Gt(
+                        Box::new(Formula::Var("b".into(), Sort::Int)),
+                        Box::new(Formula::Int(-1000i128)),
+                    )),
+                ),
+                Formula::Eq(
+                    Box::new(Formula::Var("_6".into(), Sort::Bool)),
+                    Box::new(Formula::Lt(
+                        Box::new(Formula::Var("b".into(), Sort::Int)),
+                        Box::new(Formula::Int(1000)),
+                    )),
+                ),
+                Formula::And(vec![
+                    Formula::Gt(
+                        Box::new(Formula::Var("a".into(), Sort::Int)),
+                        Box::new(Formula::Int(-1000i128)),
+                    ),
+                    Formula::Lt(
+                        Box::new(Formula::Var("a".into(), Sort::Int)),
+                        Box::new(Formula::Int(1000)),
+                    ),
+                    Formula::Gt(
+                        Box::new(Formula::Var("b".into(), Sort::Int)),
+                        Box::new(Formula::Int(-1000i128)),
+                    ),
+                    Formula::Lt(
+                        Box::new(Formula::Var("b".into(), Sort::Int)),
+                        Box::new(Formula::Int(1000)),
+                    ),
+                    Formula::Eq(
+                        Box::new(Formula::Var("_3".into(), Sort::Bool)),
+                        Box::new(Formula::Gt(
+                            Box::new(Formula::Var("a".into(), Sort::Int)),
+                            Box::new(Formula::Int(-1000i128)),
+                        )),
+                    ),
+                    Formula::Eq(
+                        Box::new(Formula::Var("_4".into(), Sort::Bool)),
+                        Box::new(Formula::Lt(
+                            Box::new(Formula::Var("a".into(), Sort::Int)),
+                            Box::new(Formula::Int(1000)),
+                        )),
+                    ),
+                    Formula::Eq(
+                        Box::new(Formula::Var("_5".into(), Sort::Bool)),
+                        Box::new(Formula::Gt(
+                            Box::new(Formula::Var("b".into(), Sort::Int)),
+                            Box::new(Formula::Int(-1000i128)),
+                        )),
+                    ),
+                    Formula::Eq(
+                        Box::new(Formula::Var("_6".into(), Sort::Bool)),
+                        Box::new(Formula::Lt(
+                            Box::new(Formula::Var("b".into(), Sort::Int)),
+                            Box::new(Formula::Int(1000)),
+                        )),
+                    ),
+                    Formula::And(vec![
+                        Formula::BvSLt(
+                            Box::new(bv(-1000i128, 128)),
+                            Box::new(Formula::Var(
+                                "__trust_ovf_bv_lhs_a".into(),
+                                Sort::BitVec(128),
+                            )),
+                            128,
+                        ),
+                        Formula::BvSLt(
+                            Box::new(Formula::Var(
+                                "__trust_ovf_bv_lhs_a".into(),
+                                Sort::BitVec(128),
+                            )),
+                            Box::new(bv(1000, 128)),
+                            128,
+                        ),
+                        Formula::BvSLt(
+                            Box::new(bv(-1000i128, 128)),
+                            Box::new(Formula::Var(
+                                "__trust_ovf_bv_rhs_b".into(),
+                                Sort::BitVec(128),
+                            )),
+                            128,
+                        ),
+                        Formula::BvSLt(
+                            Box::new(Formula::Var(
+                                "__trust_ovf_bv_rhs_b".into(),
+                                Sort::BitVec(128),
+                            )),
+                            Box::new(bv(1000, 128)),
+                            128,
+                        ),
+                        Formula::And(vec![
+                            not(Formula::Or(vec![
+                                Formula::And(vec![
+                                    Formula::BvULt(
+                                        Box::new(Formula::Var(
+                                            "__trust_ovf_bv_lhs_a".into(),
+                                            Sort::BitVec(128),
+                                        )),
+                                        Box::new(bv(i128::MIN, 128)),
+                                        128,
+                                    ),
+                                    not(Formula::BvULt(
+                                        Box::new(Formula::Var(
+                                            "__trust_ovf_bv_rhs_b".into(),
+                                            Sort::BitVec(128),
+                                        )),
+                                        Box::new(bv(i128::MIN, 128)),
+                                        128,
+                                    )),
+                                ]),
+                                Formula::And(vec![
+                                    not(Formula::BvULt(
+                                        Box::new(Formula::Var(
+                                            "__trust_ovf_bv_lhs_a".into(),
+                                            Sort::BitVec(128),
+                                        )),
+                                        Box::new(bv(i128::MIN, 128)),
+                                        128,
+                                    )),
+                                    Formula::BvULt(
+                                        Box::new(Formula::Var(
+                                            "__trust_ovf_bv_rhs_b".into(),
+                                            Sort::BitVec(128),
+                                        )),
+                                        Box::new(bv(i128::MIN, 128)),
+                                        128,
+                                    ),
+                                ]),
+                            ])),
+                            Formula::Or(vec![
+                                Formula::And(vec![
+                                    Formula::BvULt(
+                                        Box::new(Formula::BvAdd(
+                                            Box::new(Formula::Var(
+                                                "__trust_ovf_bv_lhs_a".into(),
+                                                Sort::BitVec(128),
+                                            )),
+                                            Box::new(Formula::Var(
+                                                "__trust_ovf_bv_rhs_b".into(),
+                                                Sort::BitVec(128),
+                                            )),
+                                            128,
+                                        )),
+                                        Box::new(bv(i128::MIN, 128)),
+                                        128,
+                                    ),
+                                    not(Formula::BvULt(
+                                        Box::new(Formula::Var(
+                                            "__trust_ovf_bv_lhs_a".into(),
+                                            Sort::BitVec(128),
+                                        )),
+                                        Box::new(bv(i128::MIN, 128)),
+                                        128,
+                                    )),
+                                ]),
+                                Formula::And(vec![
+                                    not(Formula::BvULt(
+                                        Box::new(Formula::BvAdd(
+                                            Box::new(Formula::Var(
+                                                "__trust_ovf_bv_lhs_a".into(),
+                                                Sort::BitVec(128),
+                                            )),
+                                            Box::new(Formula::Var(
+                                                "__trust_ovf_bv_rhs_b".into(),
+                                                Sort::BitVec(128),
+                                            )),
+                                            128,
+                                        )),
+                                        Box::new(bv(i128::MIN, 128)),
+                                        128,
+                                    )),
+                                    Formula::BvULt(
+                                        Box::new(Formula::Var(
+                                            "__trust_ovf_bv_lhs_a".into(),
+                                            Sort::BitVec(128),
+                                        )),
+                                        Box::new(bv(i128::MIN, 128)),
+                                        128,
+                                    ),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]);
+        assert!(certify_violation(&g).is_some(), "the dumped guarded i128 add row must certify");
+        let ws = Formula::And(vec![
+            Formula::And(vec![
+                Formula::Le(
+                    Box::new(Formula::Int(-9223372036854775808i128)),
+                    Box::new(Formula::Var("a".into(), Sort::Int)),
+                ),
+                Formula::Le(
+                    Box::new(Formula::Var("a".into(), Sort::Int)),
+                    Box::new(Formula::Int(9223372036854775807)),
+                ),
+            ]),
+            Formula::And(vec![
+                Formula::Le(
+                    Box::new(Formula::Int(-9223372036854775808i128)),
+                    Box::new(Formula::Var("b".into(), Sort::Int)),
+                ),
+                Formula::Le(
+                    Box::new(Formula::Var("b".into(), Sort::Int)),
+                    Box::new(Formula::Int(9223372036854775807)),
+                ),
+            ]),
+            Formula::And(vec![
+                Formula::And(vec![
+                    Formula::Ge(
+                        Box::new(Formula::Var("a".into(), Sort::Int)),
+                        Box::new(Formula::Int(-9223372036854775808i128)),
+                    ),
+                    Formula::Le(
+                        Box::new(Formula::Var("a".into(), Sort::Int)),
+                        Box::new(Formula::Int(9223372036854775807)),
+                    ),
+                ]),
+                Formula::And(vec![
+                    Formula::Ge(
+                        Box::new(Formula::Var("b".into(), Sort::Int)),
+                        Box::new(Formula::Int(-9223372036854775808i128)),
+                    ),
+                    Formula::Le(
+                        Box::new(Formula::Var("b".into(), Sort::Int)),
+                        Box::new(Formula::Int(9223372036854775807)),
+                    ),
+                ]),
+                Formula::And(vec![
+                    Formula::Or(vec![
+                        Formula::And(vec![
+                            Formula::BvULt(
+                                Box::new(Formula::BvSignExt(
+                                    Box::new(Formula::Var(
+                                        "__trust_ovf_bv_lhs__3".into(),
+                                        Sort::BitVec(64),
+                                    )),
+                                    64,
+                                )),
+                                Box::new(bv(i128::MIN, 128)),
+                                128,
+                            ),
+                            not(Formula::BvULt(
+                                Box::new(Formula::BvSignExt(
+                                    Box::new(Formula::Var(
+                                        "__trust_ovf_bv_rhs__4".into(),
+                                        Sort::BitVec(64),
+                                    )),
+                                    64,
+                                )),
+                                Box::new(bv(i128::MIN, 128)),
+                                128,
+                            )),
+                        ]),
+                        Formula::And(vec![
+                            not(Formula::BvULt(
+                                Box::new(Formula::BvSignExt(
+                                    Box::new(Formula::Var(
+                                        "__trust_ovf_bv_lhs__3".into(),
+                                        Sort::BitVec(64),
+                                    )),
+                                    64,
+                                )),
+                                Box::new(bv(i128::MIN, 128)),
+                                128,
+                            )),
+                            Formula::BvULt(
+                                Box::new(Formula::BvSignExt(
+                                    Box::new(Formula::Var(
+                                        "__trust_ovf_bv_rhs__4".into(),
+                                        Sort::BitVec(64),
+                                    )),
+                                    64,
+                                )),
+                                Box::new(bv(i128::MIN, 128)),
+                                128,
+                            ),
+                        ]),
+                    ]),
+                    Formula::Or(vec![
+                        Formula::And(vec![
+                            Formula::BvULt(
+                                Box::new(Formula::BvSub(
+                                    Box::new(Formula::BvSignExt(
+                                        Box::new(Formula::Var(
+                                            "__trust_ovf_bv_lhs__3".into(),
+                                            Sort::BitVec(64),
+                                        )),
+                                        64,
+                                    )),
+                                    Box::new(Formula::BvSignExt(
+                                        Box::new(Formula::Var(
+                                            "__trust_ovf_bv_rhs__4".into(),
+                                            Sort::BitVec(64),
+                                        )),
+                                        64,
+                                    )),
+                                    128,
+                                )),
+                                Box::new(bv(i128::MIN, 128)),
+                                128,
+                            ),
+                            not(Formula::BvULt(
+                                Box::new(Formula::BvSignExt(
+                                    Box::new(Formula::Var(
+                                        "__trust_ovf_bv_lhs__3".into(),
+                                        Sort::BitVec(64),
+                                    )),
+                                    64,
+                                )),
+                                Box::new(bv(i128::MIN, 128)),
+                                128,
+                            )),
+                        ]),
+                        Formula::And(vec![
+                            not(Formula::BvULt(
+                                Box::new(Formula::BvSub(
+                                    Box::new(Formula::BvSignExt(
+                                        Box::new(Formula::Var(
+                                            "__trust_ovf_bv_lhs__3".into(),
+                                            Sort::BitVec(64),
+                                        )),
+                                        64,
+                                    )),
+                                    Box::new(Formula::BvSignExt(
+                                        Box::new(Formula::Var(
+                                            "__trust_ovf_bv_rhs__4".into(),
+                                            Sort::BitVec(64),
+                                        )),
+                                        64,
+                                    )),
+                                    128,
+                                )),
+                                Box::new(bv(i128::MIN, 128)),
+                                128,
+                            )),
+                            Formula::BvULt(
+                                Box::new(Formula::BvSignExt(
+                                    Box::new(Formula::Var(
+                                        "__trust_ovf_bv_lhs__3".into(),
+                                        Sort::BitVec(64),
+                                    )),
+                                    64,
+                                )),
+                                Box::new(bv(i128::MIN, 128)),
+                                128,
+                            ),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]);
+        assert!(certify_violation(&ws).is_some(), "the dumped widened i128 sub row must certify");
     }
 
     /// SOUNDNESS: an UNGUARDED wide-BV add (operands at the full 128-bit type
     /// range, no `BvSLt`/`BvSLe` narrowing, no sign-extension) CAN overflow, so
-    /// the carry obligation is genuinely SAT — must fail closed.
+    /// the overflow obligation is genuinely SAT — must fail closed.
     #[test]
     fn signed_bv_overflow_fails_closed_when_unguarded_add() {
         let a = bvvar("__trust_ovf_bv_lhs_a", 128);
         let b = bvvar("__trust_ovf_bv_rhs_b", 128);
-        let sum = Formula::BvAdd(Box::new(a.clone()), Box::new(b.clone()), 128);
         // No guard, no sign-extension: only the implicit full type range.
-        let viol = Formula::And(vec![carry_overflow_or(sum, a)]);
+        let viol = overflow_predicate(a, b, true, 128);
         assert!(
             certify_violation(&viol).is_none(),
             "unguarded wide-BV add (real overflow risk) must NOT certify"
@@ -15047,17 +18347,209 @@ mod tests {
     fn signed_bv_overflow_fails_closed_when_guard_one_sided() {
         let a = bvvar("__trust_ovf_bv_lhs_a", 128);
         let b = bvvar("__trust_ovf_bv_rhs_b", 128);
-        let sum = Formula::BvAdd(Box::new(a.clone()), Box::new(b.clone()), 128);
         let viol = Formula::And(vec![
             // Only lower bounds — upper extreme of `a+b` is unbounded.
             bvsle(bv(0, 128), a.clone()),
             bvsle(bv(0, 128), b.clone()),
-            carry_overflow_or(sum, a),
+            overflow_predicate(a, b, true, 128),
         ]);
         assert!(
             certify_violation(&viol).is_none(),
             "one-sided signed-BV guard (unpinned upper extreme) must NOT certify"
         );
+    }
+
+    /// The `i128` guards `0 ≤ a < 10 ∧ 0 ≤ b < 10` the postcondition probes carry
+    /// (`requires a >= 0 && a < 10 && b >= 0 && b < 10`), at width `w`.
+    fn probe_guards(a: &Formula, b: &Formula, w: u32) -> Vec<Formula> {
+        let sle = |l: Formula, r: Formula| Formula::BvSLe(Box::new(l), Box::new(r), w);
+        let slt = |l: Formula, r: Formula| Formula::BvSLt(Box::new(l), Box::new(r), w);
+        vec![
+            sle(bv(0, w), a.clone()),
+            slt(a.clone(), bv(10, w)),
+            sle(bv(0, w), b.clone()),
+            slt(b.clone(), bv(10, w)),
+        ]
+    }
+
+    /// KNOWN_HAZARDS 2026-10-03 (BV-LANE-1): the violation of a FALSE `ensures`
+    /// over an unmodeled body, exactly as `AY_CERT_DUMP=1` printed it for
+    /// `fn p(a: i128, b: i128) -> i128 requires 0 <= a,b < 10 ensures result != a + b
+    /// { a.wrapping_add(b) }` on the stage 1 of `a0877b2a62`:
+    /// `guards ∧ ¬¬(_0 = BvAdd(a,b,128))`. It is SATISFIABLE (`a=1, b=2, _0=3`;
+    /// `_0` is unconstrained), and the lane certified it — a kernel-`Certified`
+    /// false postcondition — because the bounded `BvAdd` inside the equation
+    /// cannot overflow. The row asserts no overflow, so the lane must decline.
+    #[test]
+    fn false_ensures_with_a_bounded_add_is_not_certified() {
+        let a = bvvar("a", 128);
+        let b = bvvar("b", 128);
+        let sum = Formula::BvAdd(Box::new(a.clone()), Box::new(b.clone()), 128);
+        let viol = Formula::And(vec![
+            Formula::And(probe_guards(&a, &b, 128)),
+            not(not(Formula::Eq(Box::new(bvvar("_0", 128)), Box::new(sum)))),
+        ]);
+        assert!(
+            certify_violation(&viol).is_none(),
+            "a satisfiable postcondition violation that merely mentions a bounded add \
+             must not be kernel-certified"
+        );
+        // The same row through the full-VC entry the compiler's certify fallback,
+        // KERNEL_PROMOTE and `certify_all` call.
+        let vc = VerificationCondition {
+            kind: VcKind::Postcondition,
+            function: "p".into(),
+            location: SourceSpan::default(),
+            formula: viol,
+            contract_metadata: None,
+            obligation: None,
+        };
+        assert!(certify_vc(&vc).is_none(), "certify_vc must decline the false postcondition");
+    }
+
+    /// The other false `ensures` shapes the confirmer measured Certified: a bounded
+    /// sub inside the equation (`ensures result == a - b + 5 { a.wrapping_sub(b) }`),
+    /// and a clause that only MENTIONS the add in a disjunct
+    /// (`ensures result == 7 || a + b > 100`, false at every input in range).
+    #[test]
+    fn false_ensures_mentioning_a_bounded_sub_or_a_disjunct_add_is_not_certified() {
+        let a = bvvar("a", 128);
+        let b = bvvar("b", 128);
+        let r = bvvar("_0", 128);
+        let diff = Formula::BvSub(Box::new(a.clone()), Box::new(b.clone()), 128);
+        let shifted = Formula::BvAdd(Box::new(diff), Box::new(bv(5, 128)), 128);
+        let sub_row = Formula::And(vec![
+            Formula::And(probe_guards(&a, &b, 128)),
+            not(Formula::Eq(Box::new(r.clone()), Box::new(shifted))),
+        ]);
+        assert!(certify_violation(&sub_row).is_none(), "the bounded-sub ensures must not certify");
+
+        let sum = Formula::BvAdd(Box::new(a.clone()), Box::new(b.clone()), 128);
+        let far_row = Formula::And(vec![
+            Formula::And(probe_guards(&a, &b, 128)),
+            not(Formula::Or(vec![
+                Formula::Eq(Box::new(r), Box::new(bv(7, 128))),
+                bvslt(bv(100, 128), sum),
+            ])),
+        ]);
+        assert!(certify_violation(&far_row).is_none(), "the disjunct-add ensures must not certify");
+    }
+
+    /// The `i64` twin of the false postcondition, with the machine lane's type-range
+    /// atoms (`BvSLe(BitVec{2^63, 64}, a)` — `i64::MIN` in two's complement). It
+    /// declined before 2026-10-03 only because the bound reader took that literal
+    /// as `+2^63` and emptied the operand range; the bound reader now decodes it,
+    /// so this pins that the top-level predicate gate is what declines it.
+    #[test]
+    fn i64_false_ensures_with_type_range_atoms_is_not_certified() {
+        let a = bvvar("a", 64);
+        let b = bvvar("b", 64);
+        let sle = |l: Formula, r: Formula| Formula::BvSLe(Box::new(l), Box::new(r), 64);
+        let sum = Formula::BvAdd(Box::new(a.clone()), Box::new(b.clone()), 64);
+        let viol = Formula::And(vec![
+            Formula::And(probe_guards(&a, &b, 64)),
+            Formula::And(vec![
+                sle(bv(1 << 63, 64), a.clone()),
+                sle(a.clone(), bv(i64::MAX as i128, 64)),
+            ]),
+            Formula::And(vec![
+                sle(bv(1 << 63, 64), b.clone()),
+                sle(b.clone(), bv(i64::MAX as i128, 64)),
+            ]),
+            not(not(Formula::Eq(Box::new(bvvar("_0", 64)), Box::new(sum)))),
+        ]);
+        assert!(certify_violation(&viol).is_none(), "the i64 false ensures must not certify");
+    }
+
+    /// The decoding fix's capability side: a GENUINE guarded `i64` add overflow row
+    /// carrying the same type-range atoms certifies now that `BitVec{2^63, 64}` is
+    /// read as `i64::MIN` (it declined before, by the misread).
+    #[test]
+    fn i64_guarded_add_overflow_row_with_type_range_atoms_certifies() {
+        let a = bvvar("a", 64);
+        let b = bvvar("b", 64);
+        let sle = |l: Formula, r: Formula| Formula::BvSLe(Box::new(l), Box::new(r), 64);
+        let viol = Formula::And(vec![
+            Formula::And(probe_guards(&a, &b, 64)),
+            Formula::And(vec![
+                sle(bv(1 << 63, 64), a.clone()),
+                sle(a.clone(), bv(i64::MAX as i128, 64)),
+            ]),
+            Formula::And(vec![
+                sle(bv(1 << 63, 64), b.clone()),
+                sle(b.clone(), bv(i64::MAX as i128, 64)),
+            ]),
+            overflow_predicate(a, b, true, 64),
+        ]);
+        assert!(certify_violation(&viol).is_some(), "the genuine guarded i64 add row certifies");
+    }
+
+    /// Half the predicate is not the predicate: with only the result-sign-flip
+    /// conjunct, `a ∈ [0, 10)`, `b ∈ [-20, 0)` is SATISFIABLE (`a = 5, b = -10`:
+    /// the result `-5` flips sign, no overflow), so the lane must decline although
+    /// the add's result range `[-20, 8]` cannot overflow.
+    #[test]
+    fn result_sign_flip_alone_is_not_the_overflow_predicate() {
+        let a = bvvar("a", 128);
+        let b = bvvar("b", 128);
+        let viol = Formula::And(vec![
+            bvsle(bv(0, 128), a.clone()),
+            bvslt(a.clone(), bv(10, 128)),
+            bvsle(bv(-20, 128), b.clone()),
+            bvslt(b.clone(), bv(0, 128)),
+            result_sign_flip_only(a, b, true, 128),
+        ]);
+        assert!(certify_violation(&viol).is_none(), "the half predicate must not certify");
+    }
+
+    /// EXHAUSTIVE at `w = 8`: over a grid of signed guard intervals, for add and
+    /// sub, the lane certifies `guards ∧ predicate` EXACTLY when no input pair in
+    /// the intervals overflows `i8`. "Certifies ⟹ no overflow" is the soundness
+    /// direction; the converse pins that the gate keeps the real rows. Each lower
+    /// bound is written in both literal spellings the producers use (negative
+    /// `i128`, and the `w`-bit unsigned pattern), so the two's-complement decoding
+    /// is exercised too.
+    #[test]
+    fn exhaustive_w8_lane_certifies_exactly_the_non_overflowing_intervals() {
+        let w = 8;
+        let intervals: [(i8, i8); 6] =
+            [(-128, 127), (-100, -60), (-64, 63), (-1, 1), (0, 100), (60, 127)];
+        let x = bvvar("x", w);
+        let y = bvvar("y", w);
+        let sle = |l: Formula, r: Formula| Formula::BvSLe(Box::new(l), Box::new(r), w);
+        for is_add in [true, false] {
+            for (i, &(xlo, xhi)) in intervals.iter().enumerate() {
+                for &(ylo, yhi) in &intervals {
+                    let overflows = (xlo..=xhi).any(|xv| {
+                        (ylo..=yhi).any(|yv| {
+                            if is_add {
+                                xv.checked_add(yv).is_none()
+                            } else {
+                                xv.checked_sub(yv).is_none()
+                            }
+                        })
+                    });
+                    // Alternate the lower-bound literal spelling per x interval.
+                    let lo_lit = |v: i8| {
+                        if i % 2 == 0 { bv(i128::from(v), w) } else { bv(i128::from(v as u8), w) }
+                    };
+                    let viol = Formula::And(vec![
+                        sle(lo_lit(xlo), x.clone()),
+                        sle(x.clone(), bv(i128::from(xhi), w)),
+                        sle(lo_lit(ylo), y.clone()),
+                        sle(y.clone(), bv(i128::from(yhi), w)),
+                        overflow_predicate(x.clone(), y.clone(), is_add, w),
+                    ]);
+                    let certified = certify_violation(&viol).is_some();
+                    let op = if is_add { "+" } else { "-" };
+                    assert_eq!(
+                        certified, !overflows,
+                        "x ∈ [{xlo},{xhi}] {op} y ∈ [{ylo},{yhi}]: certified={certified}, \
+                         some input overflows={overflows}"
+                    );
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -16621,18 +20113,25 @@ mod tests {
         }
     }
 
-    /// Anti-vacuity: pin that the SHIFTED rung is what closes these, i.e. the
-    /// test above cannot pass without it. The plain interval rung declines
-    /// (`atom_var_bound` wants a bare `Var` endpoint, the goal's is `Sub(x,c)`),
+    /// Anti-vacuity: pin which rungs close these. The plain interval rung declines
+    /// (`atom_var_bound` wants a bare `Var` endpoint, the goal's is `Sub(x,c)`) and
     /// the chain rung declines (the surrounding VC exceeds `refute_via_chain_edges`'
-    /// 48-augmented-edge fail-closed cap), and Farkas declines.
+    /// 48-augmented-edge fail-closed cap). The SHIFTED rung closes each on its own.
+    /// Until C-ROWS-PRECISION-1 (2026-10-19) the Farkas rung declined too, because
+    /// `formula_linform` had no `Sub` arm; it now reads the `Sub(x,c)` goal and closes
+    /// each as well. It runs before the shifted rung in `certify_linear_int_fragment`,
+    /// so its term is the one the test above mints, and both terms must pass the
+    /// kernel re-check here. The satisfiable mutation below holds both rungs to
+    /// declining.
     #[test]
-    fn countdown_sub_underflow_is_reached_only_by_the_shifted_rung() {
+    fn countdown_sub_underflow_is_reached_by_the_shifted_and_farkas_rungs() {
         for (name, viol) in real_countdown_sub_violations() {
             let normalized = normalize_violation(&viol).expect("supported violation");
             let conjuncts = normalized.view();
-            let (atoms, _vars) = collect_supported_atoms(&conjuncts);
+            let (atoms, vars) = collect_supported_atoms(&conjuncts);
             let hyps = supported_hyps_from_atoms(&atoms).expect("supported hypotheses");
+            let env = build_env(&vars).expect("kernel environment");
+            let ctx = build_ctx(&hyps);
             assert!(
                 single_var_interval_refutation(&atoms, &hyps).is_none(),
                 "{name}: the plain interval rung must still decline"
@@ -16641,13 +20140,17 @@ mod tests {
                 transitive_chain_refutation(&atoms, &hyps).is_none(),
                 "{name}: the chain rung must still decline (edge cap)"
             );
+            let farkas = multi_var_farkas_refutation(&atoms, &hyps)
+                .unwrap_or_else(|| panic!("{name}: the Farkas rung must read the `Sub(x,c)` goal"));
             assert!(
-                multi_var_farkas_refutation(&atoms, &hyps).is_none(),
-                "{name}: the Farkas rung must still decline"
+                kernel_checks_false(&env, ctx.clone(), &farkas, &vars),
+                "{name}: the Farkas term must pass the kernel re-check"
             );
+            let shifted = shifted_single_var_interval_refutation(&atoms, &hyps)
+                .unwrap_or_else(|| panic!("{name}: the shifted interval rung must close it"));
             assert!(
-                shifted_single_var_interval_refutation(&atoms, &hyps).is_some(),
-                "{name}: the shifted interval rung must close the contradiction"
+                kernel_checks_false(&env, ctx, &shifted, &vars),
+                "{name}: the shifted term must pass the kernel re-check"
             );
         }
     }
@@ -16677,6 +20180,10 @@ mod tests {
         assert!(
             shifted_single_var_interval_refutation(&atoms, &hyps).is_none(),
             "the shifted rung must decline a SATISFIABLE shifted interval (offset = 2 is a model)"
+        );
+        assert!(
+            multi_var_farkas_refutation(&atoms, &hyps).is_none(),
+            "the Farkas rung, which reads `Sub` since C-ROWS-PRECISION-1, must decline it too"
         );
         assert!(
             certify_violation(&weakened).is_none(),
@@ -17263,5 +20770,312 @@ mod tests {
         for required in ["Or.rec", "And.left", "And.right"] {
             assert!(used.contains(required), "certificate does not use {required}");
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_budget_tests;
+
+#[cfg(test)]
+mod wave485_perf_tests {
+    use trust_types::{SourceSpan, VcKind};
+
+    use super::*;
+
+    fn normalize_violation_unconditional_oracle(
+        violation: &Formula,
+    ) -> Option<NormalizedConjuncts<'_>> {
+        let mut base = Vec::new();
+        collect_conjuncts(violation, &mut base);
+        base.retain(|c| !matches!(c, Formula::Bool(true)));
+        if base.is_empty() {
+            return None;
+        }
+        let mut pool = negated_boolean_consequences(&base);
+        for step in NORMALIZATION_STEPS {
+            let view: Vec<&Formula> = base.iter().copied().chain(pool.iter()).collect();
+            pool.extend(step(&view));
+        }
+        Some(NormalizedConjuncts { base, pool })
+    }
+
+    #[test]
+    fn test_normalize_violation_surface_gated_matches_unconditional_15_step_oracle() {
+        let ivar = |n: &str| Box::new(Formula::Var(n.to_string(), Sort::Int));
+        let bvar = |n: &str| Box::new(Formula::Var(n.to_string(), Sort::Bool));
+        let ilit = |k: i128| Box::new(Formula::Int(k));
+
+        let cases: Vec<Formula> = vec![
+            Formula::Bool(true),
+            // Simple strict-bound contradiction
+            Formula::And(vec![
+                Formula::Lt(ivar("x"), ilit(0)),
+                Formula::Gt(ivar("x"), ilit(5)),
+            ]),
+            // Bool reification + transitive constant equality + disequality
+            Formula::And(vec![
+                Formula::Eq(bvar("_b0"), Box::new(Formula::Eq(ivar("_4"), ilit(0)))),
+                *bvar("_b0"),
+                Formula::Eq(ivar("_4"), ivar("div")),
+                Formula::Not(Box::new(Formula::Eq(ivar("div"), ilit(0)))),
+            ]),
+            // Or-common late Bool reification + membership interval + entailed implication
+            Formula::And(vec![
+                Formula::Or(vec![
+                    Formula::Eq(ivar("tag"), ilit(0)),
+                    Formula::Eq(ilit(2), ivar("tag")),
+                ]),
+                Formula::Implies(
+                    Box::new(Formula::Ge(ivar("tag"), ilit(0))),
+                    Box::new(Formula::Le(ivar("tag"), ilit(10))),
+                ),
+                Formula::Or(vec![
+                    Formula::And(vec![
+                        Formula::Eq(bvar("_b_late"), Box::new(Formula::Eq(ivar("d"), ilit(0)))),
+                        *bvar("_b_late"),
+                        Formula::Ge(ivar("p"), ilit(1)),
+                    ]),
+                    Formula::And(vec![
+                        Formula::Eq(bvar("_b_late"), Box::new(Formula::Eq(ivar("d"), ilit(0)))),
+                        *bvar("_b_late"),
+                        Formula::Le(ivar("p"), ilit(0)),
+                    ]),
+                ]),
+            ]),
+            // Closed arithmetic + chained Rem/Div + equality-class bounds + class disequalities
+            Formula::And(vec![
+                Formula::Lt(
+                    Box::new(Formula::Mul(ilit(4096), ilit(64))),
+                    ilit(0),
+                ),
+                Formula::Ge(ivar("a"), ilit(0)),
+                Formula::Le(ivar("a"), ilit(100)),
+                Formula::Eq(ivar("a"), ivar("a_alias")),
+                Formula::Not(Box::new(Formula::Eq(ivar("a"), ivar("a_alias")))),
+                Formula::Eq(
+                    ivar("r1"),
+                    Box::new(Formula::Rem(ivar("a_alias"), ilit(4))),
+                ),
+                Formula::Eq(
+                    ivar("r2"),
+                    Box::new(Formula::Rem(ivar("r1"), ilit(2))),
+                ),
+                Formula::Eq(
+                    ivar("q1"),
+                    Box::new(Formula::Div(ivar("a_alias"), ilit(2))),
+                ),
+            ]),
+            // BV mask/shift rewrite shape
+            Formula::And(vec![
+                Formula::Ge(ivar("idx"), ilit(0)),
+                Formula::Le(ivar("idx"), ilit(7)),
+                Formula::Eq(
+                    ivar("masked"),
+                    Box::new(Formula::BvToInt(
+                        Box::new(Formula::BvAnd(
+                            Box::new(Formula::IntToBv(ivar("idx"), 64)),
+                            Box::new(Formula::IntToBv(ilit(7), 64)),
+                            64,
+                        )),
+                        64,
+                        false,
+                    )),
+                ),
+            ]),
+        ];
+
+        for formula in &cases {
+            let actual = normalize_violation(formula);
+            let expected = normalize_violation_unconditional_oracle(formula);
+            assert_eq!(actual.is_some(), expected.is_some(), "presence mismatch on {formula:?}");
+            if let (Some(a), Some(e)) = (actual, expected) {
+                assert_eq!(a.base, e.base, "base mismatch on {formula:?}");
+                assert_eq!(a.pool, e.pool, "pool mismatch on {formula:?}");
+                assert_eq!(a.view(), e.view(), "view mismatch on {formula:?}");
+                assert_eq!(
+                    a.propositional_view(),
+                    e.propositional_view(),
+                    "propositional_view mismatch on {formula:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_shallow_memo_hit_fast_path_is_byte_identical_and_preserves_reference_and_stops() {
+        reset_certify_memo();
+        let x = || Box::new(Formula::Var("fast_memo_x".to_string(), Sort::Int));
+        let z = || Box::new(Formula::Int(0));
+        let formula = Formula::And(vec![Formula::Lt(x(), z()), Formula::Lt(z(), x())]);
+
+        let vc1 = VerificationCondition {
+            kind: VcKind::Assertion { message: "first".to_string() },
+            function: "wave485_fn_one".into(),
+            location: SourceSpan::default(),
+            formula: formula.clone(),
+            obligation: None,
+            contract_metadata: None,
+        };
+        let mut vc2 = vc1.clone();
+        vc2.function = "wave485_fn_two".into();
+
+        // Cold run populates memo + KR0 reference registration.
+        let ev1 = certify_vc(&vc1).expect("cold contradiction certifies");
+        let ref1 = reference_certificate_for(&ev1);
+        assert!(ref1.is_some(), "cold run registers KR0 reference certificate");
+
+        // Shallow warm hit for a distinct VC identity skips 256 MiB thread spawn,
+        // restamps exact lineage via pre-absorbed Sha256 mid-state, and registers KR0.
+        let ev2_hit = certify_vc(&vc2).expect("warm contradiction certifies");
+        let ref2_hit = reference_certificate_for(&ev2_hit);
+        assert_eq!(ref2_hit, ref1, "warm hit preserves exact KR0 reference certificate");
+
+        reset_certify_memo();
+        let ev2_fresh = certify_vc(&vc2).expect("fresh vc2 certifies");
+        assert_eq!(ev2_hit, ev2_fresh, "shallow memo hit must be byte-identical to fresh run");
+        assert!(replay_vc_evidence(&vc2, &ev2_hit), "restamped certificate replays cleanly");
+
+        // Formula-only shallow memo hit also matches fresh run byte-for-byte.
+        let viol_hit = certify_violation(&formula).expect("warm violation certifies");
+        reset_certify_memo();
+        let viol_fresh = certify_violation(&formula).expect("fresh violation certifies");
+        assert_eq!(viol_hit, viol_fresh);
+    }
+
+    #[test]
+    fn test_audited_carrier_env_closure_and_dag_const_collection_match_full_walk() {
+        // 1. Shared-DAG `Expr` visits shared `Arc` subterms once instead of 2^N times,
+        //    and still rejects implanted trust markers.
+        let leaf = Expr::const_(Name::from_string("Int.add"), Vec::new());
+        let shared_dag = (0..24).fold(leaf, |acc, _| Expr::app(acc.clone(), acc));
+        let mut names = Vec::new();
+        assert!(collect_const_names(&shared_dag, &mut names));
+        assert!(names.contains(&Name::from_string("Int.add")));
+
+        // 2. Empty-skolem `AuditedCarrierEnv` borrows `&'static` base_env directly
+        //    with zero `Environment::clone()`.
+        let empty_vars = BTreeSet::new();
+        let borrowed = AuditedCarrierEnv::build(Carrier::Int, &empty_vars).expect("int base");
+        assert!(matches!(borrowed.env, std::borrow::Cow::Borrowed(_)));
+        assert!(borrowed.closure_is_clean(&shared_dag, &empty_vars));
+
+        // 3. Skolem-bearing `AuditedCarrierEnv` admits declared carrier skolems and
+        //    rejects undeclared skolems or base-name collisions.
+        let vars = BTreeSet::from(["alpha".to_string(), "beta".to_string()]);
+        let owned = AuditedCarrierEnv::build(Carrier::Int, &vars).expect("int skolem env");
+        let skolem_term = Expr::app(
+            shared_dag,
+            Expr::const_(Name::from_string(&encoded_var_name("alpha")), Vec::new()),
+        );
+        assert!(owned.closure_is_clean(&skolem_term, &vars));
+        assert!(
+            !owned.closure_is_clean(&skolem_term, &BTreeSet::from(["beta".to_string()])),
+            "undeclared skolem must fail closure audit"
+        );
+        assert!(
+            !Carrier::Int.admits_skolems(&BTreeSet::from(["Int".to_string()])),
+            "collision with base constant must be rejected pre-solve"
+        );
+
+        // 4. Adversarial trust marker implanted into a mutable `Environment` is still
+        //    rejected by `proof_axiom_closure_is_clean_for`.
+        let mut tampered = build_env(&empty_vars).expect("base env");
+        let marker = install_adversarial_trust_marker(&mut tampered, &false_expr())
+            .expect("marker installs");
+        assert!(!proof_axiom_closure_is_clean(&tampered, &marker, &empty_vars));
+    }
+
+    #[test]
+    fn test_collect_supported_atoms_and_normalize_atom_stack_match_vec_oracle() {
+        let iv = |n: &str| Box::new(Formula::Var(n.to_string(), Sort::Int));
+        let bv = |n: &str| Box::new(Formula::Var(n.to_string(), Sort::Bool));
+        let il = |k: i128| Box::new(Formula::Int(k));
+
+        let mut owned: Vec<Formula> = Vec::new();
+        for i in 0..24 {
+            let v = format!("v_{}", i % 5);
+            owned.push(Formula::Lt(iv(&v), il(i)));
+            owned.push(Formula::Lt(iv(&v), il(i))); // exact duplicate
+            owned.push(Formula::Eq(iv(&v), il(i + 1))); // expands to 2 Le atoms
+            owned.push(Formula::Eq(bv("_b"), Box::new(Formula::Lt(iv(&v), il(0))))); // rejected Bool leaf
+        }
+        let refs: Vec<&Formula> = owned.iter().collect();
+        let (atoms, vars) = collect_supported_atoms(&refs);
+
+        // Reference Vec+BTreeSet oracle.
+        let mut oracle_atoms: Vec<(bool, &Formula, &Formula)> = Vec::new();
+        let mut oracle_vars: BTreeSet<String> = BTreeSet::new();
+        for &c in &refs {
+            let Some(norm) = normalize_atom(c) else { continue };
+            let mut local = BTreeSet::new();
+            if norm.iter().all(|a| collect_int_vars(a, &mut local)) {
+                oracle_vars.extend(local);
+                for a in norm {
+                    let key = atom_identity_key(&a);
+                    if !oracle_atoms.contains(&key) {
+                        oracle_atoms.push(key);
+                    }
+                }
+            }
+        }
+        let actual_keys: Vec<_> = atoms.iter().map(atom_identity_key).collect();
+        assert_eq!(actual_keys, oracle_atoms);
+        assert_eq!(vars, oracle_vars);
+    }
+
+    #[test]
+    fn test_wave501_cow_lifted_chain_edges_and_borrowed_var_helpers_preserve_exact_certificates() {
+        let iv = |n: &str| Box::new(Formula::Var(n.to_string(), Sort::Int));
+        let il = |k: i128| Box::new(Formula::Int(k));
+
+        // 1. Plain variable/literal order edges have no Scaled/Sum/Diff/Product
+        //    nodes, so `lifted_chain_edges` returns `Cow::Borrowed` with zero
+        //    `Vec<OrderEdge>` clones across all four lift passes.
+        let plain_conjuncts = [
+            Formula::Le(il(10), iv("x")),
+            Formula::Le(iv("x"), iv("y")),
+            Formula::Lt(iv("y"), il(10)),
+        ];
+        let plain_refs: Vec<&Formula> = plain_conjuncts.iter().collect();
+        let (plain_atoms, _) = collect_supported_atoms(&plain_refs);
+        let plain_hyps = supported_hyps_from_atoms(&plain_atoms).expect("plain hyps");
+        let base_edges = atom_order_edges(&plain_atoms, &plain_hyps);
+        let lifted_plain = lifted_chain_edges(&base_edges);
+        assert!(matches!(lifted_plain, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(lifted_plain.len(), base_edges.len());
+
+        // 2. When a scaled node (`x * 2`) is present with a non-strict bound on `x`,
+        //    `lifted_chain_edges` transitions to `Cow::Owned` and appends the lifted
+        //    edge while preserving exact kernel refutation.
+        let scaled_conjuncts = [
+            Formula::Le(il(0), iv("x")),
+            Formula::Le(iv("x"), il(99)),
+            Formula::Gt(Box::new(Formula::Mul(iv("x"), il(2))), il(255)),
+        ];
+        let scaled_refs: Vec<&Formula> = scaled_conjuncts.iter().collect();
+        let (scaled_atoms, _) = collect_supported_atoms(&scaled_refs);
+        let scaled_hyps = supported_hyps_from_atoms(&scaled_atoms).expect("scaled hyps");
+        let scaled_base = atom_order_edges(&scaled_atoms, &scaled_hyps);
+        let lifted_scaled = lifted_chain_edges(&scaled_base);
+        assert!(matches!(lifted_scaled, std::borrow::Cow::Owned(_)));
+        assert!(lifted_scaled.len() > scaled_base.len());
+        assert!(refute_via_chain_edges(&scaled_base).is_some());
+
+        // 3. `int_var_name_str`, `add_var_pair_str`, `const_app`, and `int_zero_expr`
+        //    preserve exact semantics and interned `Name` equality.
+        let add_term = Formula::Add(iv("lhs"), iv("rhs"));
+        assert_eq!(int_var_name_str(&Formula::Var("lhs".to_string(), Sort::Int)), Some("lhs"));
+        assert_eq!(add_var_pair_str(&add_term), Some(("lhs", "rhs")));
+        assert_eq!(
+            int_zero_expr(),
+            Expr::const_(Name::from_string("Int.zero"), Vec::new()),
+        );
+        assert_eq!(
+            const_app("Int.add", [int_zero_expr(), int_zero_expr()]),
+            Expr::apps(
+                Expr::const_(Name::from_string("Int.add"), Vec::new()),
+                [int_zero_expr(), int_zero_expr()],
+            ),
+        );
     }
 }

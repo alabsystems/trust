@@ -128,10 +128,11 @@ fn loop_measure_literal(n: u32) -> u32 {
 }
 
 // Expansion-authored clauses belong to the macro, not to the caller who cannot
-// rewrite them.
+// rewrite them. The compiler separately refuses their mismatched contract hygiene.
 macro_rules! vacuous_contract_fn {
     ($name:ident) => {
         fn $name(x: u32) -> u32
+        //~^ ERROR: parameter `x` and a contract clause of this function have different macro hygiene
             requires true
         {
             x

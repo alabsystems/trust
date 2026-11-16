@@ -1,0 +1,573 @@
+{
+  "name": "new_range_from_find",
+  "def_path": "nrp::new_range_from_find",
+  "span": {
+    "file": "nrp.rs",
+    "line_start": 3,
+    "col_start": 0,
+    "line_end": 3,
+    "col_end": 108
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "c"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::range::iter::RangeFromIter",
+                "fields": [
+                  [
+                    "start",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "exhausted",
+                    "Bool"
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::range::iter::RangeFromIter",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "exhausted",
+                "Bool"
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "core::range::RangeFrom",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeFrom",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeFrom",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeFrom<char>"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "nrp.rs",
+                "line_start": 3,
+                "col_start": 70,
+                "line_end": 3,
+                "col_end": 73
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::range::RangeFrom<char> as core::convert::From<core::ops::range::RangeFrom<char>>>::from",
+            "args": [
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "nrp.rs",
+              "line_start": 3,
+              "col_start": 54,
+              "line_end": 3,
+              "col_end": 74
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4703791156326232143,
+              "def_index": 3760,
+              "substs_digest": [
+                11733889783309135936,
+                9569146770237373984
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4703791156326232143,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<core::range::RangeFrom<char> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "nrp.rs",
+              "line_start": 3,
+              "col_start": 54,
+              "line_end": 3,
+              "col_end": 86
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4703791156326232143,
+              "def_index": 10349,
+              "substs_digest": [
+                8127513405694353108,
+                3671496188025561598
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4703791156326232143,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "nrp.rs",
+                "line_start": 3,
+                "col_start": 54,
+                "line_end": 3,
+                "col_end": 86
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::range::iter::RangeFromIter<char> as core::iter::traits::iterator::Iterator>::find::<{closure@nrp.rs:3:93: 3:97}>",
+            "args": [
+              {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "CallableItem": {
+                    "def_path": "nrp::new_range_from_find::{closure#0}",
+                    "kind": "closure",
+                    "def_path_hash": {
+                      "stable_crate_id": "f44cb0dfa2a3ef67",
+                      "local_hash": "c9d823952e402151"
+                    }
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "nrp.rs",
+              "line_start": 3,
+              "col_start": 54,
+              "line_end": 3,
+              "col_end": 106
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4703791156326232143,
+              "def_index": 10671,
+              "substs_digest": [
+                18351610327834871049,
+                6105161660359874228
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4703791156326232143,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "core::option::Option",
+        "fields": [
+          [
+            "__tag",
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          ],
+          [
+            "__v1_0",
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            }
+          ]
+        ],
+        "variants": [
+          {
+            "name": "None",
+            "discriminant": 0,
+            "fields": []
+          },
+          {
+            "name": "Some",
+            "discriminant": 1,
+            "fields": [
+              [
+                "0",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "disc_index_safe": false,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Enum"
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "c",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "c",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1114111
+            }
+          ]
+        },
+        {
+          "Not": {
+            "And": [
+              {
+                "Ge": [
+                  {
+                    "Var": [
+                      "c",
+                      "Int"
+                    ]
+                  },
+                  {
+                    "Int": 55296
+                  }
+                ]
+              },
+              {
+                "Le": [
+                  {
+                    "Var": [
+                      "c",
+                      "Int"
+                    ]
+                  },
+                  {
+                    "Int": 57343
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "c",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "c",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

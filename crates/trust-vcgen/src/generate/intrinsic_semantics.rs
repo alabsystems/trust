@@ -289,18 +289,14 @@ pub(crate) fn marked_saturating_intrinsic(callee: &str) -> Option<&'static str> 
 /// `[core|std::]intrinsics::<name>[::<generics>]`. `None` for anything else.
 fn marked_intrinsic_name(marked: &str) -> Option<&str> {
     // Drop the monomorphization/generic segments (`<u8>`, `<impl …>`).
-    let segments: Vec<&str> = marked.split("::").filter(|s| !s.starts_with('<')).collect();
-    let name = *segments.last()?;
-    let n = segments.len();
-    // The segment immediately before the name must be `intrinsics`.
-    if n < 2 || segments[n - 2] != "intrinsics" {
-        return None;
-    }
-    match n {
+    let mut segments = marked.split("::").filter(|s| !s.starts_with('<'));
+    let s0 = segments.next()?;
+    let s1 = segments.next()?;
+    match (segments.next(), segments.next()) {
         // `intrinsics::<name>` — the dump's truncated spelling.
-        2 => Some(name),
+        (None, _) if s0 == "intrinsics" => Some(s1),
         // At most one crate root, and it must be a real std/core root.
-        3 if matches!(segments[0], "core" | "std") => Some(name),
+        (Some(s2), None) if matches!(s0, "core" | "std") && s1 == "intrinsics" => Some(s2),
         // Extra or foreign segments ⇒ fail closed.
         _ => None,
     }
@@ -445,19 +441,26 @@ fn balanced_fold(
     mut items: Vec<Formula>,
     combine: impl Fn(Formula, Formula) -> Formula,
 ) -> Formula {
-    assert!(!items.is_empty(), "balanced_fold needs at least one leaf");
     while items.len() > 1 {
-        let mut next = Vec::with_capacity(items.len().div_ceil(2));
-        let mut rest = items.into_iter();
-        while let Some(left) = rest.next() {
-            match rest.next() {
-                Some(right) => next.push(combine(left, right)),
-                None => next.push(left),
-            }
+        let len = items.len();
+        let mut write = 0;
+        let mut read = 0;
+        while read + 1 < len {
+            let left = std::mem::replace(&mut items[read], Formula::Bool(false));
+            let right = std::mem::replace(&mut items[read + 1], Formula::Bool(false));
+            items[write] = combine(left, right);
+            write += 1;
+            read += 2;
         }
-        items = next;
+        if read < len {
+            if write != read {
+                items.swap(write, read);
+            }
+            write += 1;
+        }
+        items.truncate(write);
     }
-    items.pop().expect("non-empty")
+    items.pop().unwrap_or(Formula::Bool(false))
 }
 
 /// The width and signedness of `operand`'s integer type, or `None` for a
@@ -504,20 +507,18 @@ pub(crate) fn value_modeled_intrinsic_facts<'a>(
     let Terminator::Call { func: callee, args, dest, .. } = terminator else {
         return None;
     };
-    let kind = classify_value_modeled_intrinsic(callee)?;
     if args.len() != 1 || !dest.projections.is_empty() {
         return None;
     }
-    if !is_single_static_assignment(func, dest.local) {
-        return None;
-    }
-    if !argument_is_stable(func, &args[0]) {
-        return None;
-    }
+    let dest_shape = match crate::local_ty_ref(func, dest.local) {
+        Some(Ty::Int { width, signed }) => (*width, *signed),
+        _ => return None,
+    };
     let (width, signed) = int_operand_shape(func, &args[0])?;
     if width == 0 {
         return None;
     }
+    let kind = classify_value_modeled_intrinsic(callee)?;
     // The DESTINATION type must agree with the intrinsic's declared signature, or
     // this is a misextraction and every fact below would be sorted wrongly.
     // `library/core/src/intrinsics/mod.rs`:
@@ -527,14 +528,15 @@ pub(crate) fn value_modeled_intrinsic_facts<'a>(
     //   `bswap`/`bitreverse`  : `fn(T) -> T`    — the dest must be EXACTLY `T`,
     //                           because the emitted `BvToInt(_, width, signed)`
     //                           reads the result under `T`'s width/signedness.
-    let dest_shape =
-        func.body.locals.iter().find(|d| d.index == dest.local).and_then(|d| match &d.ty {
-            Ty::Int { width, signed } => Some((*width, *signed)),
-            _ => None,
-        })?;
     if matches!(kind, ValueModeledIntrinsic::Bswap | ValueModeledIntrinsic::Bitreverse)
         && dest_shape != (width, signed)
     {
+        return None;
+    }
+    if !is_single_static_assignment(func, dest.local) {
+        return None;
+    }
+    if !argument_is_stable(func, &args[0]) {
         return None;
     }
     let x = crate::operand_to_formula(func, &args[0]);

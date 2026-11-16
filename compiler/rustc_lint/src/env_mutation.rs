@@ -1,8 +1,8 @@
 use rustc_hir::{Expr, ExprKind, Node};
-use rustc_session::{declare_lint, declare_lint_pass};
+use rustc_lint_defs::{declare_lint, declare_lint_pass};
 use rustc_span::{Symbol, sym};
 
-use crate::lints::EnvMutationDiag;
+use crate::diagnostics::EnvMutationDiag;
 use crate::{LateContext, LateLintPass, LintContext};
 
 declare_lint! {
@@ -16,6 +16,7 @@ declare_lint! {
     /// ### Example
     ///
     /// ```rust,compile_fail
+    /// # #![deny(unknown_lints)]
     /// #![deny(env_mutation)]
     /// unsafe { std::env::set_var("KEY", "VALUE") };
     /// ```

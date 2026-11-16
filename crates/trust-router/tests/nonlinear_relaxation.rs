@@ -13,35 +13,21 @@
 // is abstracted away. Sound: the relaxation has a superset of models, so its
 // UNSAT implies the original's UNSAT.
 //
-// Skips gracefully if the `ay` solver is not co-located (env-dependent).
+// Drives the `ay` every real-solver test resolves
+// (`trust_router::ay_discovery::detect_test_ay`); with none it FAILS, NOT RUN.
 use trust_router::IncrementalAYSession;
+use trust_router::ay_discovery::detect_test_ay;
 use trust_types::*;
 
-fn locate_ay() -> Option<String> {
-    if let Ok(p) = std::env::var("TRUST_AY_BIN") {
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
-    }
-    // Walk up from the crate dir to a repo root holding build/host/stage2/bin/ay.
-    let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    loop {
-        let cand = dir.join("build/host/stage2/bin/ay");
-        if cand.exists() {
-            return Some(cand.to_string_lossy().into_owned());
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+fn locate_ay() -> String {
+    let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ay = detect_test_ay(&checkout).unwrap_or_else(|not_run| panic!("{not_run}"));
+    ay.path.to_str().expect("utf-8 solver path").to_owned()
 }
 
 #[test]
 fn nonlinear_relaxation_proves_symbolic_modulo_bound() {
-    let Some(ay) = locate_ay() else {
-        eprintln!("ay solver not found (set TRUST_AY_BIN); skipping");
-        return;
-    };
+    let ay = locate_ay();
     let k = || Formula::Var("k".into(), Sort::Int);
     let slen = || Formula::Var("slen".into(), Sort::Int);
     let n = || Formula::Var("n".into(), Sort::Int);
@@ -62,7 +48,7 @@ fn nonlinear_relaxation_proves_symbolic_modulo_bound() {
         contract_metadata: None,
         obligation: None,
     };
-    let result = IncrementalAYSession::with_solver_path(ay).verify_vc(&vc);
+    let result = IncrementalAYSession::with_solver_path(&ay).verify_vc(&vc);
     assert!(
         matches!(result, VerificationResult::Proved { .. }),
         "symbolic-modulo bound must PROVE (directly or via nonlinear relaxation), got {result:?}"
@@ -88,8 +74,7 @@ fn nonlinear_relaxation_proves_symbolic_modulo_bound() {
         contract_metadata: None,
         obligation: None,
     };
-    let r2 =
-        IncrementalAYSession::with_solver_path(locate_ay().unwrap()).verify_vc(&unsat_should_not);
+    let r2 = IncrementalAYSession::with_solver_path(ay).verify_vc(&unsat_should_not);
     assert!(
         !(matches!(r2, VerificationResult::Proved { .. })
             && r2.solver_name() == "ay-nonlinear-relaxation"),

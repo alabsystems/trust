@@ -4,6 +4,8 @@
 // identically here and in the CHC lane or facts minted by one become inert in
 // the other.
 
+use trust_types::vc_context::{RowId, VcContext};
+
 use super::*;
 
 /// Generate VCs and run an abstract interpretation pre-pass to discharge
@@ -19,7 +21,7 @@ use super::*;
 pub fn generate_vcs_with_discharge(
     func: &VerifiableFunction,
 ) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
-    let context = crate::VcgenContext::for_function(func.def_path.clone());
+    let context = crate::VcgenContext::for_function_inheriting_self_call_identity(&func.def_path);
     crate::with_vcgen_context(&context, || {
         generate_vcs_with_discharge_impl(func, None, false, &FxHashSet::default())
     })
@@ -32,8 +34,86 @@ pub(super) fn generate_vcs_with_discharge_impl(
     func: &VerifiableFunction,
     summaries: Option<&crate::modular::SummaryDatabase>,
     hardened: bool,
-    box_deref_spans: &FxHashSet<SourceSpan>,
+    box_deref_ops: &FxHashSet<(BlockId, usize)>,
 ) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
+    let generation = generate_vcs_with_discharge_and_origins_impl(
+        func,
+        summaries,
+        hardened,
+        box_deref_ops,
+        KeepOrigins::No,
+        None,
+    );
+    (generation.solver_vcs, generation.discharged)
+}
+
+/// The solver-bound rows, the preclassified rows, the id of each in the context the
+/// generation wrote into, and the overflow-check origins of both, by index until the entry
+/// resolves them to ids (T3 C05, C07, C08s; see `super::overflow_origins`).
+pub(super) struct GenerationWithOrigins {
+    solver_vcs: Vec<VerificationCondition>,
+    /// `solver_rows[i]` is the id of `solver_vcs[i]`: `None` for a row the context refused,
+    /// and for every row of a generation that wrote into no context.
+    solver_rows: Vec<Option<RowId>>,
+    discharged: Vec<(VerificationCondition, VerificationResult)>,
+    /// `discharged_rows[i]` is the id of `discharged[i].0`, as `solver_rows`.
+    discharged_rows: Vec<Option<RowId>>,
+    origins: PendingOrigins,
+}
+
+impl GenerationWithOrigins {
+    /// The rows of a refused body, split by [`preclassify_unsupported_mir_vcs`], each
+    /// interned into `rows` through the row oracle, with no origin table.
+    fn preclassified(rows: Option<&mut VcContext>, vcs: Vec<VerificationCondition>) -> Self {
+        let (solver_vcs, discharged) = preclassify_unsupported_mir_vcs(vcs);
+        Self::without_table(rows, solver_vcs, discharged)
+    }
+
+    /// `solver_vcs` and `discharged`, each interned into `rows` through the row oracle,
+    /// with no origin table: a refused or degraded body's rows.
+    fn without_table(
+        mut rows: Option<&mut VcContext>,
+        solver_vcs: Vec<VerificationCondition>,
+        discharged: Vec<(VerificationCondition, VerificationResult)>,
+    ) -> Self {
+        let solver_rows = checked_ids(rows.as_deref_mut(), &solver_vcs);
+        let discharged_rows = checked_ids(rows, discharged.iter().map(|(vc, _)| vc));
+        Self {
+            solver_vcs,
+            solver_rows,
+            discharged,
+            discharged_rows,
+            origins: PendingOrigins::no_table(),
+        }
+    }
+}
+
+/// [`generate_vcs_with_discharge_impl`], plus the overflow-check origins of the rows
+/// it returns when `keep` says so (T3 C05; see `super::overflow_origins`), every row
+/// written into `rows` when the caller keeps a context (T3 C08s).
+fn generate_vcs_with_discharge_and_origins_impl(
+    func: &VerifiableFunction,
+    summaries: Option<&crate::modular::SummaryDatabase>,
+    hardened: bool,
+    box_deref_ops: &FxHashSet<(BlockId, usize)>,
+    keep: KeepOrigins,
+    mut rows: Option<&mut VcContext>,
+) -> GenerationWithOrigins {
+    // OPAQUE-SCALAR-ID-1 / OPAQUE-REF-ID-1: the walk and the discharge below must
+    // name each unmodeled carrier identically, so both see the one placed view (see
+    // `generate_vcs_impl`).
+    let _input_analysis_scope = super::FuncAnalysisScope::enter_if_unbound(func);
+    let placed = super::with_placed_opaque_values_cached(func);
+    let func = placed.as_ref();
+    // INTRINSIC-RESIDUAL-1: the same 128-bit parameter type-range view
+    // `generate_vcs_impl` takes (`with_param_type_range_facts`; no clone for a body
+    // without a 128-bit parameter).
+    let ranged = with_param_type_range_facts(func);
+    let func = ranged.as_ref();
+    let _analysis_scope = super::FuncAnalysisScope::enter_placed_if_unbound(func);
+    if let Some(vc) = crate::memory_image_vc(func) {
+        return GenerationWithOrigins::preclassified(rows, vec![vc]);
+    }
     // verifier-perf: hold the mid-generation work-meter scope across BOTH the
     // `generate_vcs_impl` obligation walk AND the abstract-interp pre-pass below (both go
     // through owned `place_ty` queries). On the outermost entry this resets the
@@ -50,8 +130,17 @@ pub(super) fn generate_vcs_with_discharge_impl(
     // pre-existing conservative behaviour.
     let _write_sets = callee_write_set::enter_callee_write_sets(summaries);
 
-    let all_vcs = generate_vcs_impl(func, summaries, hardened, box_deref_spans);
-    discharge_body_vcs(func, all_vcs)
+    let SinkOutput { vcs, ids, origins } = generate_vcs_impl_with_origins(
+        func,
+        summaries,
+        hardened,
+        box_deref_ops,
+        keep,
+        rows.as_deref_mut(),
+        super::recipes::Spines::Join,
+    );
+    let inventory = origins.finish(&vcs);
+    discharge_body_vcs_with_origins(func, vcs, ids, inventory, rows)
 }
 
 /// The DISCHARGE + augment half of body VC generation: given the RAW
@@ -59,50 +148,86 @@ pub(super) fn generate_vcs_with_discharge_impl(
 /// unsupported-MIR obligations, run the interval fixpoint, discharge what
 /// interval analysis proves, and augment the rest with the abstract state.
 ///
-/// Split out (from `generate_vcs_with_discharge_impl`) so the compiler's
-/// VC-artifact cache can CACHE the raw `all_vcs` and re-run ONLY this
-/// (dominant-cost-free: ~1-5% of generation) on a warm rebuild — re-minting the
-/// interval proofs IN-PROCESS (no verdict replay) and re-augmenting with the
-/// interval env (preserving provability).
+/// `generate_vcs_with_discharge_impl` is its only caller. (It was split out for
+/// the VC-artifact cache, which T4.6 deleted.)
 ///
 /// Deterministic in `(func, all_vcs)` and PURE (no side effects beyond the work
-/// meter). Does NOT open its own work scope — the caller owns the scope so the
-/// combined path keeps its single-budget semantics byte-for-byte, and the
-/// re-run path scopes it freshly (safe: the raw is cached only when the cold
-/// run did NOT degrade, and discharge-alone work never re-trips the budget).
+/// meter). Does NOT open its own work scope: the caller owns the scope, so
+/// generation and discharge share one budget.
 pub(super) fn discharge_body_vcs(
     func: &VerifiableFunction,
     all_vcs: Vec<VerificationCondition>,
 ) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
+    let generation =
+        discharge_body_vcs_with_origins(func, all_vcs, Vec::new(), RowInventory::none(), None);
+    (generation.solver_vcs, generation.discharged)
+}
+
+/// [`discharge_body_vcs`], carrying each row's origin block through the split and the
+/// augment, so the overflow-check inventory holds every Add/Sub/Mul overflow row exactly
+/// as it leaves: a discharged row as it was, a solver row augmented (T3 C05).
+///
+/// T3 C08s: `all_ids[i]` is the id of `all_vcs[i]` in `rows` (a missing entry is no id),
+/// and each row keeps it through the split: a discharged row, and a solver row the augment
+/// left as it was, are the rows that id names; an augmented row joins `rows` through the
+/// row oracle as it leaves, and its pre-augment row stays in the context unreferenced.
+fn discharge_body_vcs_with_origins(
+    func: &VerifiableFunction,
+    all_vcs: Vec<VerificationCondition>,
+    all_ids: Vec<Option<RowId>>,
+    inventory: RowInventory,
+    mut rows: Option<&mut VcContext>,
+) -> GenerationWithOrigins {
+    if let Some(vc) = crate::memory_image_vc(func) {
+        return GenerationWithOrigins::preclassified(rows, vec![vc]);
+    }
     if all_vcs.is_empty() {
-        return (all_vcs, Vec::new());
+        return GenerationWithOrigins {
+            solver_vcs: all_vcs,
+            solver_rows: Vec::new(),
+            discharged: Vec::new(),
+            discharged_rows: Vec::new(),
+            origins: inventory.into_origins(Vec::new()),
+        };
     }
 
     let mut solver_candidates = Vec::with_capacity(all_vcs.len());
+    // The origin and the id of each solver candidate, parallel to `solver_candidates`.
+    let mut candidate_origins: Vec<Option<(BlockId, OriginSite)>> =
+        Vec::with_capacity(all_vcs.len());
+    let mut candidate_ids: Vec<Option<RowId>> = Vec::with_capacity(all_vcs.len());
     let mut preclassified = Vec::new();
-    for vc in all_vcs {
-        let unsupported_reason = if let VcKind::UnsupportedMir { kind, detail } = &vc.kind {
-            Some(format!("unsupported MIR `{kind}` preserved in TrustIr: {detail}"))
-        } else {
-            None
-        };
-
-        if let Some(reason) = unsupported_reason {
+    let mut preclassified_ids: Vec<Option<RowId>> = Vec::new();
+    let mut unknown_solver: Option<Symbol> = None;
+    for (index, vc) in all_vcs.into_iter().enumerate() {
+        let id = all_ids.get(index).copied().flatten();
+        if let VcKind::UnsupportedMir { kind, detail } = &vc.kind {
+            let reason = format!("unsupported MIR `{kind}` preserved in TrustIr: {detail}");
+            let solver = *unknown_solver.get_or_insert_with(|| Symbol::intern("trust_vcgen"));
             preclassified.push((
                 vc,
                 VerificationResult::Unknown {
-                    solver: Symbol::intern("trust_vcgen"),
+                    solver,
                     time_ms: 0,
                     reason,
                 },
             ));
+            preclassified_ids.push(id);
         } else {
             solver_candidates.push(vc);
+            candidate_origins.push(inventory.origin(index));
+            candidate_ids.push(id);
         }
     }
 
     if solver_candidates.is_empty() {
-        return (Vec::new(), preclassified);
+        return GenerationWithOrigins {
+            solver_vcs: Vec::new(),
+            solver_rows: Vec::new(),
+            discharged: preclassified,
+            discharged_rows: preclassified_ids,
+            origins: inventory.into_origins(Vec::new()),
+        };
     }
 
     //, #452: Use type-aware initial state for tighter interval bounds,
@@ -111,18 +236,43 @@ pub(super) fn discharge_body_vcs(
     // Abstract interpretation also consumes `func.preconditions` directly;
     // give it the same arithmetic-safe view as VC construction.
     let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
-    let merged_env = abstract_interp::merged_interval_environment(arithmetic_safe_func.as_ref());
+    let _analysis_scope = super::FuncAnalysisScope::enter_if_unbound(arithmetic_safe_func.as_ref());
+    let (unnarrowed_env, merged_env) =
+        abstract_interp::merged_interval_environments(arithmetic_safe_func.as_ref());
 
     // Discharge VCs that interval analysis can prove.
-    let report = abstract_interp::try_discharge_batch(&solver_candidates, &merged_env);
-
-    let discharged_map: FxHashMap<usize, VerificationResult> =
-        report.discharged.into_iter().collect();
+    //
+    // Trust (2026-10-10): decided under the environment WITHOUT the def-site narrowing
+    // (`narrow_single_assignments_to_their_def`), which the solver rows below are
+    // augmented WITH. An interval proof carries no kernel or native proof authority, so
+    // the compiler reports a preclassified row runtime-checked, and the bridge's ay
+    // producer never sees it. Discharging under the narrowed environment therefore
+    // MOVED rows from kernel-certified to runtime-checked (`g[i]` over `let i = match s
+    // { Lo => 0, Hi => 5 }` in the falsification corpus), and a native lane given the
+    // bare formula refuted a havoc the environment bounds (`*r = 5; *v = w; a[m / 1]`).
+    // Sending every newly provable row to the solver instead (review round 118) doubled
+    // the solve set of long functions past their budget and exposed rows whose proof
+    // reads a versioned name through its base entry, which the conjoined environment
+    // does not state. So the narrowing decides which FACTS a row carries, never which
+    // lane decides it.
+    let merged_env_formula: std::cell::OnceCell<Formula> = std::cell::OnceCell::new();
     let mut solver_vcs = Vec::new();
+    let mut solver_rows: Vec<Option<RowId>> = Vec::new();
     let mut discharged = preclassified;
-    for (i, vc) in solver_candidates.into_iter().enumerate() {
-        if let Some(result) = discharged_map.get(&i) {
-            discharged.push((vc, result.clone()));
+    let mut discharged_rows = preclassified_ids;
+    let mut origin_rows: Vec<PendingOriginRow> = Vec::new();
+    let keep_origins = !inventory.is_truncated();
+    let candidates = solver_candidates.into_iter().zip(candidate_origins).zip(candidate_ids);
+    for ((vc, origin), id) in candidates {
+        // T3 C07: the inventory names the row by where it left, and the entry names it by
+        // its id (`PendingOrigins::resolve`).
+        let row = if let abstract_interp::AbstractInterpResult::Discharged(result) =
+            abstract_interp::try_discharge_vc(&vc, &unnarrowed_env)
+        {
+            let at = discharged.len();
+            discharged.push((vc, result));
+            discharged_rows.push(id);
+            EmittedRow::Discharged(at)
         } else {
             // Augment remaining VCs with abstract-state assumptions
             // before solver dispatch. The abstract state is an over-approximation
@@ -130,7 +280,24 @@ pub(super) fn discharge_body_vcs(
             // the violation formula narrows the solver's search space without
             // excluding real counterexamples. If the environment is Top (no
             // finite bounds), the VC is returned unchanged.
-            solver_vcs.push(abstract_interp::augment_vc_with_abstract_state(&vc, &merged_env));
+            let env_formula = merged_env_formula
+                .get_or_init(|| abstract_interp::interval_domain_to_formula(&merged_env));
+            let at = solver_vcs.len();
+            let (augmented, changed) =
+                abstract_interp::discharge::augment_owned_vc_with_env_formula(vc, env_formula);
+            // T3 C08s: a row the augment left as it was is the row its id names; an
+            // augmented row joins the context as it leaves.
+            let id = match rows.as_deref_mut() {
+                Some(rows) if changed => rows.push_checked_row(&augmented).ok(),
+                _ => id,
+            };
+            solver_vcs.push(augmented);
+            solver_rows.push(id);
+            EmittedRow::Solver(at)
+        };
+        // T3 C05: the inventory pairs the origin with the row exactly as it leaves.
+        if keep_origins && let Some((block, site)) = origin {
+            origin_rows.push(PendingOriginRow { block, site, row });
         }
     }
 
@@ -139,10 +306,17 @@ pub(super) fn discharge_body_vcs(
     // and degrade the whole function to a single fail-closed Unknown.
     // SOUNDNESS: DROP-ONLY — preclassifies to Unknown, never Proved.
     if crate::gen_work_tripped() {
-        return gen_work_degraded_discharge(func);
+        let (solver_vcs, discharged) = gen_work_degraded_discharge(func);
+        return GenerationWithOrigins::without_table(rows, solver_vcs, discharged);
     }
 
-    (solver_vcs, discharged)
+    GenerationWithOrigins {
+        solver_vcs,
+        solver_rows,
+        discharged,
+        discharged_rows,
+        origins: inventory.into_origins(origin_rows),
+    }
 }
 
 /// Build the degraded `(solver_vcs, discharged)` result for a function whose VC-gen
@@ -207,7 +381,7 @@ pub fn generate_vcs_with_discharge_and_summaries_configured(
     summaries: &crate::modular::SummaryDatabase,
     hardened: bool,
 ) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
-    let context = crate::VcgenContext::for_function(func.def_path.clone());
+    let context = crate::VcgenContext::for_function_inheriting_self_call_identity(&func.def_path);
     generate_vcs_with_discharge_and_summaries_configured_with_context(
         func, summaries, hardened, &context,
     )
@@ -216,22 +390,22 @@ pub fn generate_vcs_with_discharge_and_summaries_configured(
 /// Trust (box-deref doc-lint fix): the compiler passes the spans of
 /// compiler-synthesized `Box` derefs so the always-`Bool(true)` missing-SAFETY
 /// documentation lint is dropped for them (drop-only; see
-/// `collect_synthesized_box_deref_spans` in the compiler). Generic over the
+/// `collect_synthesized_box_deref_ops` in the compiler). Generic over the
 /// hasher so the compiler's `rustc_data_structures::fx::FxHashSet` (an alias for
 /// the same `rustc_hash::FxHashSet`) passes through unchanged.
 #[must_use]
-pub fn generate_vcs_with_discharge_and_summaries_with_box_deref_spans<S: std::hash::BuildHasher>(
+pub fn generate_vcs_with_discharge_and_summaries_with_box_deref_ops<S: std::hash::BuildHasher>(
     func: &VerifiableFunction,
     summaries: &crate::modular::SummaryDatabase,
-    box_deref_spans: &std::collections::HashSet<SourceSpan, S>,
+    box_deref_ops: &std::collections::HashSet<(BlockId, usize), S>,
 ) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
-    let context = crate::VcgenContext::for_function(func.def_path.clone());
-    generate_vcs_with_discharge_and_summaries_configured_with_context_and_box_deref_spans(
+    let context = crate::VcgenContext::for_function_inheriting_self_call_identity(&func.def_path);
+    generate_vcs_with_discharge_and_summaries_configured_with_context_and_box_deref_ops(
         func,
         summaries,
         false,
         &context,
-        box_deref_spans,
+        box_deref_ops,
     )
 }
 
@@ -247,7 +421,7 @@ pub fn generate_vcs_with_discharge_and_summaries_configured_with_context(
     hardened: bool,
     context: &crate::VcgenContext,
 ) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
-    generate_vcs_with_discharge_and_summaries_configured_with_context_and_box_deref_spans(
+    generate_vcs_with_discharge_and_summaries_configured_with_context_and_box_deref_ops(
         func,
         summaries,
         hardened,
@@ -259,36 +433,396 @@ pub fn generate_vcs_with_discharge_and_summaries_configured_with_context(
 /// The fully-configured entry: explicit hardened obligation policy, explicit
 /// function-owned proof-policy context, AND the compiler-synthesized
 /// `Box`-deref span set (the union of the `_configured_with_context` and
-/// `_with_box_deref_spans` variants above). Generic over the hasher so both
+/// `_with_box_deref_ops` variants above). Generic over the hasher so both
 /// this crate's `FxHashSet` and the compiler's
 /// `rustc_data_structures::fx::FxHashSet` alias pass through unchanged.
 #[must_use]
-pub fn generate_vcs_with_discharge_and_summaries_configured_with_context_and_box_deref_spans<
+pub fn generate_vcs_with_discharge_and_summaries_configured_with_context_and_box_deref_ops<
     S: std::hash::BuildHasher,
 >(
     func: &VerifiableFunction,
     summaries: &crate::modular::SummaryDatabase,
     hardened: bool,
     context: &crate::VcgenContext,
-    box_deref_spans: &std::collections::HashSet<SourceSpan, S>,
+    box_deref_ops: &std::collections::HashSet<(BlockId, usize), S>,
 ) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
-    let owned: FxHashSet<SourceSpan> = box_deref_spans.iter().cloned().collect();
-    crate::with_function_vcgen_context(&func.def_path, context, || {
-        generate_vcs_with_discharge_and_summaries_configured_impl(func, summaries, hardened, &owned)
-    })
+    let generation = configured_generation(
+        func,
+        summaries,
+        hardened,
+        context,
+        box_deref_ops,
+        KeepOrigins::No,
+        None,
+    );
+    (generation.solver_vcs, generation.discharged)
+}
+
+/// The compiler's consumed generation (T3 C07): the rows, each with its id in the body's
+/// context, and the overflow-check origins of the rows by id.
+///
+/// `solver_rows[i]` is the id of `solver_vcs[i]` and `discharged_rows[i]` that of
+/// `discharged[i].0`. An id is `None` only for a row the context could not hold (a full
+/// table, 2^32 entries), and such a row is still returned and consumed as its eager VC.
+/// The eager VCs are authoritative: each id was checked by the row oracle
+/// ([`VcContext::check_row`]) when its row was interned, so the row it names reads back
+/// as the eager VC in every field.
+///
+/// Since T3 C08s each row is interned as it joins the generation's row sink, and carries
+/// its id through the discharge split; an augmented solver row is interned as it leaves.
+/// The context therefore also holds rows no id names: the pre-augment row of each augmented
+/// solver row, and the rows that joined a generation the work meter then refused or
+/// degraded.
+#[derive(Debug)]
+pub struct ConsumedGeneration {
+    pub solver_vcs: Vec<VerificationCondition>,
+    pub solver_rows: Vec<Option<RowId>>,
+    pub discharged: Vec<(VerificationCondition, VerificationResult)>,
+    pub discharged_rows: Vec<Option<RowId>>,
+    pub overflow_origins: OverflowOrigins,
+}
+
+/// Intern each of `vcs` into `rows` through the row oracle (T3 C07): the id of each row,
+/// in order, `None` where the context refused it.
+///
+/// UNMETERED (L4-METER-1): this polls no step budget and charges no work meter, so no
+/// reproducible stop moves because it ran.
+pub fn intern_checked_rows<'a>(
+    rows: &mut VcContext,
+    vcs: impl IntoIterator<Item = &'a VerificationCondition>,
+) -> Vec<Option<RowId>> {
+    vcs.into_iter().map(|vc| rows.push_checked_row(vc).ok()).collect()
+}
+
+/// Intern each of `vcs` into `rows` through the row oracle, keeping no id (T3 C07p): the
+/// `_rows` producers write every row they return into the caller's context this way, and
+/// return their eager rows unchanged, which stay what every consumer reads. A row a full
+/// context refuses is not interned and is still consumed as itself.
+///
+/// UNMETERED (L4-METER-1), as [`intern_checked_rows`].
+pub fn intern_eager_rows<'a>(
+    rows: &mut VcContext,
+    vcs: impl IntoIterator<Item = &'a VerificationCondition>,
+) {
+    for vc in vcs {
+        // The id is not kept: the eager row is what the caller returns.
+        let _ = rows.push_checked_row(vc);
+    }
+}
+
+/// The compiler's consumed generation: the fully-configured entry above, plus the
+/// overflow-check origins of the rows it returns (T3 C05, design §9.1), every row
+/// interned into `rows`, the body's context (T3 C07).
+///
+/// The origins are the proven-overflow-check elision seam's join table: every
+/// Add/Sub/Mul overflow row exactly as this call returns it, named by its id in `rows`,
+/// with its origin block, or no table when the generation cannot show its enumeration
+/// complete ([`OverflowOrigins::complete`]). They replace `overflow_vc_block_origins`,
+/// the replay that regenerated the rows a second time to recover their blocks.
+///
+/// Each row is interned as it joins the generation's row sink (T3 C08s), inside the
+/// generation's work scope; the row oracle that checks each one charges no work meter
+/// and polls no budget (L4-METER-1, L4-C08s-3), so it decides nothing the generation
+/// decides.
+#[must_use]
+pub fn generate_vcs_with_discharge_and_overflow_origins<S: std::hash::BuildHasher>(
+    func: &VerifiableFunction,
+    summaries: &crate::modular::SummaryDatabase,
+    hardened: bool,
+    context: &crate::VcgenContext,
+    box_deref_ops: &std::collections::HashSet<(BlockId, usize), S>,
+    rows: &mut VcContext,
+) -> ConsumedGeneration {
+    let GenerationWithOrigins { solver_vcs, solver_rows, discharged, discharged_rows, origins } =
+        configured_generation(
+            func,
+            summaries,
+            hardened,
+            context,
+            box_deref_ops,
+            KeepOrigins::Yes,
+            Some(rows),
+        );
+    let overflow_origins = origins.resolve(&solver_rows, &discharged_rows);
+    ConsumedGeneration { solver_vcs, solver_rows, discharged, discharged_rows, overflow_origins }
+}
+
+/// The body of the two fully-configured entries above, which differ only in whether
+/// the overflow-check origins are kept and the rows written into a context.
+fn configured_generation<S: std::hash::BuildHasher>(
+    func: &VerifiableFunction,
+    summaries: &crate::modular::SummaryDatabase,
+    hardened: bool,
+    context: &crate::VcgenContext,
+    box_deref_ops: &std::collections::HashSet<(BlockId, usize), S>,
+    keep: KeepOrigins,
+    rows: Option<&mut VcContext>,
+) -> GenerationWithOrigins {
+    let owned: FxHashSet<(BlockId, usize)> = box_deref_ops.iter().cloned().collect();
+    let out = crate::with_function_vcgen_context(&func.def_path, context, || {
+        generate_vcs_with_discharge_and_summaries_configured_impl(
+            func, summaries, hardened, &owned, keep, rows,
+        )
+    });
+    // Trust (DIAGNOSTIC ONLY, 2026-09-19): `TRUST_VCGEN_EXIT_TRACE=1` prints each
+    // bounds row AS IT LEAVES vcgen. This is the bisection point between
+    // `TRUST_SLICE_VC_TRACE` (end of the safety-VC builder, where a failing
+    // slice-bounds row's formula is UNSAT and still carries its definitional
+    // equations) and `TRUST_AY_SMT_TRACE` (the solver boundary, where those
+    // equations are GONE — measured, 5 survive in the passing twin and 0 in the
+    // failing row — and the violation is trivially satisfiable).
+    //
+    // IT IS ON *THIS* ENTRY POINT BECAUSE THE OTHERS ARE OFF-PATH. Placed first
+    // in the (since deleted) cross-function cached router, then in its parallel
+    // path, then on the bare `generate_vcs`, it printed ZERO rows each time for
+    // a program that refutes: the compiler calls THIS function
+    // (trust_verify.rs:25393) and dispatches through `trust_router::Router`,
+    // not the cached router. Three build cycles
+    // spent guessing a module that one read of the call site would have given.
+    // A zero from an instrument is a fact about the instrument — placement
+    // included. Verdict-neutral.
+    static VCGEN_EXIT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *VCGEN_EXIT_TRACE
+        .get_or_init(|| crate::trust_vcgen_env_var_present("TRUST_VCGEN_EXIT_TRACE"))
+    {
+        for vc in &out.solver_vcs {
+            if matches!(
+                vc.kind,
+                trust_types::VcKind::SliceBoundsCheck | trust_types::VcKind::IndexOutOfBounds
+            ) {
+                let rendered = format!("{:?}", vc.formula);
+                // Trust: 2026-09-20 — also print the row's VARIABLE VOCABULARY.
+                //
+                // Two lanes mint a bounds row and they were measured to use
+                // DIFFERENT vocabularies for the same check: the rvalue lane's
+                // `collection_len_formula` resolves a slice through
+                // `slice_len_formula` to the place-keyed `{place}__slice_len`,
+                // while the failing row that reaches the solver names only raw
+                // locals and carries no such symbol. eq_count and len cannot
+                // tell those apart — two rows can agree on both and still speak
+                // about different variables, which is exactly the confusion
+                // this class cost three attempts to.
+                let vars = rendered_formula_var_names(&rendered);
+                // Trust: 2026-09-21 — and the row's LANE, via its obligation
+                // record. `index_projection_vc` (the rvalue/projection lane)
+                // seeds `ObligationRecord { wrappers: Vec::new(), .. }` and the
+                // pipeline then APPENDS one wrapper per fact family it conjoins,
+                // so `ob=<n>` distinguishes the two builders that mint the same
+                // check: a row with no record at all is neither. Without this
+                // the vocabulary column shows THAT two rows disagree and not
+                // WHICH builder is responsible, which is the last thing this
+                // class needs identified.
+                let ob = match &vc.obligation {
+                    Some(record) => format!("{}", record.wrappers.len()),
+                    None => "none".to_owned(),
+                };
+                // Trust: 2026-09-21 — and the row's own VIOLATION, truncated.
+                // `ob=` says whether a row is recorded and `vars=` says what it
+                // can name, but neither says WHICH CHECK the row is about, and
+                // a function with two indexing sites emits two rows that agree
+                // on kind. Printing the recorded body (or the formula when
+                // there is no record) is what distinguishes `w[0]` from
+                // `&v[i..]` without guessing from a counterexample.
+                let body = match &vc.obligation {
+                    Some(record) => format!("{:?}", record.body),
+                    None => rendered.clone(),
+                };
+                // Trust: 2026-09-21 — 140 chars truncated BEFORE the violation
+                // clause on a row whose body opens with type ranges, which left
+                // "which check does the refuting row state" as an inference.
+                // The limit is generous now because the column's whole job is
+                // to name the check, and an assembled body front-loads the
+                // ranges.
+                let body: String = body.chars().take(1200).collect();
+                eprintln!(
+                    "[vcexit] fn={} kind={:?} ob={} eq_count={} len={} slice_len_syms={} vars=[{}] body={}",
+                    func.def_path,
+                    vc.kind,
+                    ob,
+                    rendered.matches("Eq(").count(),
+                    rendered.len(),
+                    vars.iter().filter(|v| v.ends_with("__slice_len")).count(),
+                    vars.join(" "),
+                    body,
+                );
+            }
+        }
+    }
+    ob_criterion_trace(func, &out.solver_vcs);
+    out
+}
+
+/// Variable names inside a rendered `Formula`, for the `TRUST_VCGEN_EXIT_TRACE`
+/// vocabulary column only. Hand-scanned rather than a regex so this diagnostic
+/// adds no dependency to the crate. Diagnostic; never read by a verdict.
+fn rendered_formula_var_names(rendered: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = rendered;
+    while let Some(at) = rest.find("Var(") {
+        rest = &rest[at + 4..];
+        let Some(open) = rest.find('"') else { break };
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('"') else { break };
+        names.push(rest[..close].to_owned());
+        rest = &rest[close + 1..];
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Trust (DIAGNOSTIC ONLY, 2026-09-21): is `f` a literal two-sided range on the
+/// variable `name` — `And([Le(lit, x), Le(x, lit)])` with `x` that variable?
+///
+/// This is the shape `mirsem::vc_faithful::range_constraint_parts` recognises (and
+/// its parity-checked trust-ir twin in `trust_clean::trustir_safety`), reproduced
+/// here rather than shared because those live in a different crate and this is an
+/// instrument, not a verdict. The shape is SHALLOW and fully specified, so unlike a
+/// recursive walk it carries no exhaustiveness risk.
+fn ob_is_type_range_on(f: &trust_types::Formula, name: &str) -> bool {
+    use trust_types::Formula as F;
+    let F::And(v) = f else { return false };
+    let [F::Le(lo, t_lo), F::Le(t_hi, hi)] = v.as_slice() else { return false };
+    let is_lit = |x: &F| matches!(x, F::Int(_) | F::UInt(_));
+    let names = |x: &F| matches!(x, F::Var(n, _) if n == name);
+    is_lit(lo) && is_lit(hi) && t_lo == t_hi && names(&**t_lo)
+}
+
+/// Trust (DIAGNOSTIC ONLY, 2026-09-21): every fact a record carries — the conjoined
+/// facts of each `ConjoinFactsLast` and the guards of each `PathGuardOr` term. A
+/// `PathGuardTerm::Raw` carries no formula.
+fn ob_record_facts(rec: &trust_types::ObligationRecord) -> Vec<&trust_types::Formula> {
+    use trust_types::{ObligationWrapper as W, PathGuardTerm as P};
+    let mut out = Vec::new();
+    for w in &rec.wrappers {
+        match w {
+            W::ConjoinFactsLast { facts } => out.extend(facts.iter()),
+            W::PathGuardOr { paths } => {
+                for p in paths {
+                    if let P::Guarded { guards } = p {
+                        out.extend(guards.iter());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Trust (DIAGNOSTIC ONLY, 2026-09-21): `TRUST_OB_CRITERION_TRACE=1` prints, per
+/// bounds row, whether the discharge criterion of
+/// `reports/2026-09-20-the-slice-loop-false-refutation-is-a-second-row.md` FIRES —
+/// i.e. whether some free variable of the recorded violation occurs in no fact
+/// except a literal two-sided range on that same variable.
+///
+/// IT MOVES NO VERDICT. The criterion was validated on a 24-row corpus built to
+/// exercise ONE class (3/3 on the defects, 1/1 on that corpus's true refutation),
+/// and a criterion that turns a refutation into `Unknown` MASKS a real bug when it
+/// fires on a true one. So it is measured in the open, across the full gate set,
+/// BEFORE anything is wired to it. A row printed `fires=yes` that is a genuine
+/// out-of-bounds program is a refutation of the criterion, not a finding about the
+/// program.
+///
+/// Variable names come from the same exhaustive-by-construction Debug scan the
+/// `vars=` column uses: it cannot miss a `Var` nested inside a variant a hand-written
+/// walk forgot. Its one gap is `SymVar`, which renders without a name — a row using
+/// one is printed `symvar=yes` rather than being silently treated as naming less.
+fn ob_criterion_trace(func: &VerifiableFunction, vcs: &[VerificationCondition]) {
+    static OB_CRITERION_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*OB_CRITERION_TRACE
+        .get_or_init(|| crate::trust_vcgen_env_var_present("TRUST_OB_CRITERION_TRACE"))
+    {
+        return;
+    }
+    for vc in vcs {
+        if !matches!(
+            vc.kind,
+            trust_types::VcKind::SliceBoundsCheck | trust_types::VcKind::IndexOutOfBounds
+        ) {
+            continue;
+        }
+        let Some(rec) = &vc.obligation else {
+            eprintln!("[obcrit] fn={} kind={:?} ob=none fires=n/a", func.def_path, vc.kind);
+            continue;
+        };
+        let body_rendered = format!("{:?}", rec.body);
+        let facts = ob_record_facts(rec);
+        let rendered_facts: Vec<String> = facts.iter().map(|f| format!("{f:?}")).collect();
+        let symvar = body_rendered.contains("SymVar(")
+            || rendered_facts.iter().any(|r| r.contains("SymVar("));
+        let mut unpinned: Vec<String> = Vec::new();
+        for name in rendered_formula_var_names(&body_rendered) {
+            // A variable is PINNED when some fact names it and that fact is not
+            // merely its own type range. Ranges are dropped per-variable, not
+            // per-fact: one fact can range `x` and constrain `y`.
+            let pinned = facts.iter().zip(rendered_facts.iter()).any(|(f, r)| {
+                !ob_is_type_range_on(f, &name) && rendered_formula_var_names(r).contains(&name)
+            });
+            if !pinned {
+                unpinned.push(name);
+            }
+        }
+        // Trust: 2026-09-21 — print the FACTS too, truncated. A row whose body
+        // has no free variables (a vacuous `Bool(true)` violation) makes
+        // `unpinned` trivially empty, so the fires= column alone cannot say
+        // whether the row is safe or merely unreadable — and attributing such a
+        // row to a lane by matching it against a solver program printed
+        // elsewhere is exactly the mistake this file records once already.
+        let facts_col: String = rendered_facts
+            .iter()
+            .map(|r| r.chars().take(90).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        eprintln!(
+            "[obcrit] fn={} kind={:?} ob={} facts={} symvar={} fires={} unpinned=[{}] factlist=[{}] body={}",
+            func.def_path,
+            vc.kind,
+            rec.wrappers.len(),
+            facts.len(),
+            if symvar { "yes" } else { "no" },
+            if unpinned.is_empty() { "no" } else { "yes" },
+            unpinned.join(" "),
+            facts_col.chars().take(2000).collect::<String>(),
+            body_rendered.chars().take(400).collect::<String>(),
+        );
+    }
 }
 
 pub(super) fn generate_vcs_with_discharge_and_summaries_configured_impl(
     func: &VerifiableFunction,
     summaries: &crate::modular::SummaryDatabase,
     hardened: bool,
-    box_deref_spans: &FxHashSet<SourceSpan>,
-) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
+    box_deref_ops: &FxHashSet<(BlockId, usize)>,
+    keep: KeepOrigins,
+    mut rows: Option<&mut VcContext>,
+) -> GenerationWithOrigins {
+    // OPAQUE-SCALAR-ID-1 / OPAQUE-REF-ID-1: callsite rows and body rows must share
+    // one placed view.
+    // PERF-COMPILER-VCGEN-774: hold a `FuncAnalysisScope` across both the callsite
+    // precondition pass and the body generation/discharge pass so placement, parameter
+    // type-range checks, memory-image detection, body validation, budget checks, and
+    // whole-body analyses (`PathGuardAnalysis`, `path_definition_map`, `StmtVersionCtx`,
+    // `RowGlobalFacts`, `semantic_guard_map`, `LocalWriteIndex`, `SafetyTerminatorPresence`)
+    // are shared across both passes instead of being recomputed.
+    let placed = super::with_placed_opaque_values_cached(func);
+    let func = placed.as_ref();
+    let _placed_scope = super::FuncAnalysisScope::enter_placed_if_unbound(func);
+    // INTRINSIC-RESIDUAL-1: the same 128-bit parameter type-range view
+    // `generate_vcs_impl` takes (`with_param_type_range_facts`; no clone for a body
+    // without a 128-bit parameter).
+    let ranged = with_param_type_range_facts(func);
+    let func = ranged.as_ref();
+    let _ranged_scope = matches!(ranged, std::borrow::Cow::Owned(_))
+        .then(|| super::FuncAnalysisScope::enter_placed(func));
+    if let Some(vc) = crate::memory_image_vc(func) {
+        return GenerationWithOrigins::preclassified(rows, vec![vc]);
+    }
     // This entry builds caller-side rows before it reaches `generate_vcs_impl`.
     // Admit the complete public body first so malformed positional MIR cannot
     // mint an otherwise-valid summary obligation alongside the later Unknown.
     if let Err(error) = crate::validate_function(func) {
-        return preclassify_unsupported_mir_vcs(vec![malformed_trust_ir_vc(func, &error)]);
+        let refused = vec![malformed_trust_ir_vc(func, &error)];
+        return GenerationWithOrigins::preclassified(rows, refused);
     }
 
     // verifier-perf: hold the mid-generation work-meter scope across the WHOLE outermost
@@ -310,83 +844,52 @@ pub(super) fn generate_vcs_with_discharge_and_summaries_configured_impl(
     // postcondition is assumed (conjoined) at the dominated successors of its call,
     // so a downstream obligation that depends on the callee's guarantee can be
     // discharged instead of false-FAILing on a havoced result.
-    let (mut solver_vcs, mut discharged) =
-        generate_vcs_with_discharge_impl(func, Some(summaries), hardened, box_deref_spans);
-    let (callsite_solver_vcs, callsite_preclassified) =
-        preclassify_unsupported_mir_vcs(callsite_precondition_vcs);
-    solver_vcs.extend(callsite_solver_vcs);
-    discharged.extend(callsite_preclassified);
+    let mut generation = generate_vcs_with_discharge_and_origins_impl(
+        func,
+        Some(summaries),
+        hardened,
+        box_deref_ops,
+        keep,
+        rows.as_deref_mut(),
+    );
+    // The callsite rows are appended after the inventory was taken: they are
+    // `Precondition` rows, never an Add/Sub/Mul overflow row the seam joins. They join the
+    // context as they are appended (T3 C08s).
+    if !callsite_precondition_vcs.is_empty() {
+        let (callsite_solver_vcs, callsite_preclassified) =
+            preclassify_unsupported_mir_vcs(callsite_precondition_vcs);
+        generation.solver_rows.extend(checked_ids(rows.as_deref_mut(), &callsite_solver_vcs));
+        generation.solver_vcs.extend(callsite_solver_vcs);
+        let callsite_discharged = callsite_preclassified.iter().map(|(vc, _)| vc);
+        generation.discharged_rows.extend(checked_ids(rows.as_deref_mut(), callsite_discharged));
+        generation.discharged.extend(callsite_preclassified);
+    }
 
     // verifier-perf (mid-generation work-bound): if any sub-pass tripped the per-function
     // work budget, DISCARD all accumulated VCs and degrade the whole function to a single
     // fail-closed Unknown. SOUNDNESS: DROP-ONLY — Unknown, never Proved.
     if crate::gen_work_tripped() {
-        return gen_work_degraded_discharge(func);
+        let (solver_vcs, discharged) = gen_work_degraded_discharge(func);
+        return GenerationWithOrigins::without_table(rows, solver_vcs, discharged);
     }
-    (solver_vcs, discharged)
+    // T3 C05, belt and braces: an ambient budget trip anywhere in this generation drops
+    // the table. The walk's own flag already carries every trip the walk made, and a
+    // trip in a later pass cannot unpair a row from its origin (the inventory pairs each
+    // row as it leaves), so the table would still be the emitted rows'. The compiler
+    // discards such a generation at its checkpoint in any case. This makes the table
+    // not depend on that, at no cost to a generation that did not trip.
+    if trust_types::verify_budget::exhausted_readonly() {
+        generation.origins.mark_truncated();
+    }
+    generation
 }
 
-/// Compiler VC-artifact-cache COLD-path variant: the `(solver_vcs, discharged)`
-/// result is BYTE-IDENTICAL to
-/// [`generate_vcs_with_discharge_and_summaries_configured_with_context_and_box_deref_spans`]
-/// (same single outermost work scope; the combined path's inner
-/// `generate_vcs_with_discharge_impl` scope is share-only, so inlining the walk
-/// + [`discharge_body_vcs`] here changes nothing) — PLUS the RAW pre-discharge
-/// body obligation set for the cache.
+/// Run body discharge+augment alone on a given raw obligation set, minting
+/// the interval proofs in-process, under `context`.
 ///
-/// `raw` is `Some(body_all_vcs)` ONLY when the result is fully reproducible from
-/// that raw alone by [`discharge_captured_raw_body_with_context`]: the function
-/// did not work-degrade, had body obligations, and emitted NO callsite-
-/// precondition VCs (guaranteed when the summary DB is empty — the compiler's
-/// cacheability precondition). Otherwise `None`, and the function is not cached.
-#[must_use]
-pub fn generate_vcs_capturing_raw_body_with_context<S: std::hash::BuildHasher>(
-    func: &VerifiableFunction,
-    summaries: &crate::modular::SummaryDatabase,
-    hardened: bool,
-    context: &crate::VcgenContext,
-    box_deref_spans: &std::collections::HashSet<SourceSpan, S>,
-) -> (
-    Vec<VerificationCondition>,
-    Vec<(VerificationCondition, VerificationResult)>,
-    Option<Vec<VerificationCondition>>,
-) {
-    let owned: FxHashSet<SourceSpan> = box_deref_spans.iter().cloned().collect();
-    crate::with_function_vcgen_context(&func.def_path, context, || {
-        let _gen_work_scope = crate::gen_work_scope();
-        let callsite_precondition_vcs = generate_callsite_precondition_vcs(func, summaries);
-        let callsite_empty = callsite_precondition_vcs.is_empty();
-        // Body obligation WALK — the cacheable raw set (~95-99% of generation).
-        let body_all_vcs = generate_vcs_impl(func, Some(summaries), hardened, &owned);
-        let raw_capture = body_all_vcs.clone();
-        // Body DISCHARGE + augment (shares this scope; ~1-5% of generation).
-        let (mut solver_vcs, mut discharged) = discharge_body_vcs(func, body_all_vcs);
-        let (callsite_solver_vcs, callsite_preclassified) =
-            preclassify_unsupported_mir_vcs(callsite_precondition_vcs);
-        solver_vcs.extend(callsite_solver_vcs);
-        discharged.extend(callsite_preclassified);
-        if crate::gen_work_tripped() {
-            let (s, d) = gen_work_degraded_discharge(func);
-            return (s, d, None);
-        }
-        let raw = if raw_capture.is_empty() || !callsite_empty { None } else { Some(raw_capture) };
-        (solver_vcs, discharged, raw)
-    })
-}
-
-/// Prospective measurement-only rehydration helper: re-run body
-/// discharge+augment on a previously captured raw obligation set, re-minting
-/// the interval proofs in-process (no verdict is replayed from storage).
-///
-/// The `(solver_vcs, discharged)` result equals the cold generation's whenever
-/// `raw_body` is a set that [`generate_vcs_capturing_raw_body_with_context`]
-/// returned as `Some` (non-degraded, empty callsite).
-///
-/// This helper is not a compiler verdict path and does not authorize a cache
-/// hit to replace fresh VC generation. It is public only so measurement and
-/// parity tests can evaluate a possible future split. Any future compiler use
-/// requires its own complete cache-key and obligation-completeness design,
-/// authority review, and fail-closed regression battery.
+/// This is not a compiler verdict path: the compiler always generates and
+/// discharges in one call. It is public so tests can drive the discharge half
+/// over a hand-built obligation set.
 #[must_use]
 pub fn discharge_captured_raw_body_with_context(
     func: &VerifiableFunction,
@@ -402,20 +905,17 @@ pub fn discharge_captured_raw_body_with_context(
 pub(super) fn preclassify_unsupported_mir_vcs(
     vcs: Vec<VerificationCondition>,
 ) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
-    let mut solver_vcs = Vec::new();
+    let mut solver_vcs = Vec::with_capacity(vcs.len());
     let mut preclassified = Vec::new();
+    let mut unknown_solver: Option<Symbol> = None;
     for vc in vcs {
-        let unsupported_reason = if let VcKind::UnsupportedMir { kind, detail } = &vc.kind {
-            Some(format!("unsupported MIR `{kind}` preserved in TrustIr: {detail}"))
-        } else {
-            None
-        };
-
-        if let Some(reason) = unsupported_reason {
+        if let VcKind::UnsupportedMir { kind, detail } = &vc.kind {
+            let reason = format!("unsupported MIR `{kind}` preserved in TrustIr: {detail}");
+            let solver = *unknown_solver.get_or_insert_with(|| Symbol::intern("trust_vcgen"));
             preclassified.push((
                 vc,
                 VerificationResult::Unknown {
-                    solver: Symbol::intern("trust_vcgen"),
+                    solver,
                     time_ms: 0,
                     reason,
                 },
@@ -433,8 +933,10 @@ pub(super) fn preclassify_unsupported_mir_vcs(
 ///
 /// SOUNDNESS (R1 caller-propagation): a const-generic / associated-const / `size_of::<T>()` /
 /// otherwise-unevaluated const actual lowers (in `operand_to_formula`) to a by-NAME-interned
-/// opaque symbol — every `OpaqueScalar` of a given width collapses to one
-/// `__trust_opaque_scalar_uN`, every other unknown const to one `__unknown_const`. Two DISTINCT
+/// opaque symbol — before OPAQUE-SCALAR-ID-1 / OPAQUE-REF-ID-1 every `OpaqueScalar` of a
+/// given width collapsed to one `__trust_opaque_scalar_uN` and every opaque reference to one
+/// `__unknown_const`; today each is named by its site in ITS function, which still collides
+/// with the callee's own sites. Two DISTINCT
 /// such actuals bound to two DISTINCT callee parameters would then SHARE one symbol, which
 /// silently asserts `param_i == param_j` and can turn a satisfiable `¬P[σ]` into a spurious
 /// UNSAT — a FALSE discharge (e.g. `helper(M, N)` with inferred `P = a >= b` over const generics
@@ -466,8 +968,9 @@ pub(super) fn sigma_actual_formula(
     // whole-local `copy`-chain to its STABLE, source-named root so σ renders `x` —
     // matching the guard's `x` — and the guard discharges. SOUND: the fold only
     // fires when every hop is a unique whole-local `Use(Copy|Move)` and the root is
-    // `place_source_is_stable` (single assignment, no `&mut`/`&raw mut`, no projected
-    // or call-dest store, no set-discriminant/deinit), so the temp provably holds the
+    // `place_source_is_stable` (single assignment, no slot-write channel — `&mut`,
+    // `&raw mut`, `&raw const` of an owned place — no projected or call-dest store,
+    // no set-discriminant/deinit), so the temp provably holds the
     // root's unchanged value at the call. A stale-guard vector (`x` reborrowed `&mut`
     // and reassigned before the call) fails `place_source_is_stable` at the root, so
     // σ falls back to the opaque `_6` name and the guard does NOT discharge
@@ -476,7 +979,7 @@ pub(super) fn sigma_actual_formula(
     // never mask a real out-of-bounds (a too-weak/off-by-one/other-var guard stays
     // SAT and still fails).
     if let Some(root) = sigma_actual_stable_copy_root(func, actual) {
-        return operand_to_formula(func, &Operand::Copy(root));
+        return crate::place_to_formula(func, &root);
     }
     operand_to_formula(func, actual)
 }
@@ -518,6 +1021,9 @@ pub(super) fn sigma_actual_stable_copy_root(
     let mut local = place.local;
     let mut seen = 0u32;
     loop {
+        if crate::local_defs::is_parameter(func, local) {
+            break;
+        }
         seen += 1;
         if seen > 16 {
             return None;
@@ -576,6 +1082,18 @@ pub(super) fn sigma_actual_stable_copy_root(
             _ => break,
         }
     }
+    // Require a source-named, UNIQUELY-named root: otherwise `place_to_var_name`
+    // falls back to `_{local}`, which does NOT match the guard's source-name read,
+    // so the fold would not help (and could, for a shadowed name, mis-key a fact).
+    // Checked BEFORE the three whole-body stability scans so unnamed / `_`-prefixed
+    // temporaries return `None` in O(1).
+    let name = func.body.locals.get(local).and_then(|d| d.name.as_deref())?;
+    if name.starts_with('_') {
+        return None;
+    }
+    if crate::has_other_local_with_name(func, local, name) {
+        return None;
+    }
     // The root must hold a SINGLE FIXED value for the whole body — the entry value of
     // a parameter, unchanged — so the temp provably equals it at the call and the
     // guard's same-named read denotes the same value. Three independent gates, all
@@ -585,9 +1103,9 @@ pub(super) fn sigma_actual_stable_copy_root(
     //     `whole_assigns == 1 <= 1` = true, yet its value changed from the entry
     //     value the guard/σ name `x` denotes; this gate rejects it). A never-written
     //     non-parameter local has no value at all and is likewise excluded.
-    //   * `place_source_is_stable`: no `&mut`/`&raw mut` borrow, projected store,
-    //     set-discriminant, or deinit reseats/mutates it (the stale-guard `&mut`
-    //     vector).
+    //   * `place_source_is_stable`: no slot-write channel (`&mut`, `&raw mut`,
+    //     `&raw const` of an owned place), projected store, set-discriminant, or
+    //     deinit reseats/mutates it (the stale-guard `&mut` vector).
     //   * `local_has_call_dest_write`: NEITHER of the above sees a whole-local
     //     CALL-destination reassign of a PARAMETER (`x = f(..)`):
     //     `local_is_never_written` scans only statements, and
@@ -597,24 +1115,23 @@ pub(super) fn sigma_actual_stable_copy_root(
     //     whose value CHANGED since entry — one SMT name for two values, a false-
     //     discharge channel. Explicit reject, fail-closed.
     // Together they guarantee the root denotes its fixed entry value at every read.
-    if !crate::local_is_never_written(func, local)
-        || !crate::place_source_is_stable(func, local)
-        || local_has_call_dest_write(func, local)
+    //
+    // ONE RULE FOR EVERY ROOT, with no parameter arm (VCGEN-NINE-REDS-20261110). The
+    // three gates are the def questions themselves, so a parameter root is judged by
+    // the same conjunction as any other. PERF-COMPILER-VCGEN-523 had answered a
+    // parameter root through `local_versions_collapse_to_bare` instead (identical for
+    // a parameter today, and memoized), which is a second, hand-kept copy of this
+    // rule that `local_defs_seam_lint` flagged as a parameter arm; de077b9c36
+    // (PERF-COMPILER-VCGEN-542..546) then moved the parameter test into a helper the
+    // lint cannot see. Keep it one rule here: a parameter arm belongs in the lint's
+    // CLASSIFIED list with its reason, or not at all.
+    if !(crate::local_is_never_written(func, local)
+        && !local_has_call_dest_write(func, local)
+        && crate::place_source_is_stable(func, local))
     {
         return None;
     }
-    let root = Place { local, projections: Vec::new() };
-    // Require a source-named, UNIQUELY-named root: otherwise `place_to_var_name`
-    // falls back to `_{local}`, which does NOT match the guard's source-name read,
-    // so the fold would not help (and could, for a shadowed name, mis-key a fact).
-    let name = func.body.locals.get(local).and_then(|d| d.name.as_deref())?;
-    if name.starts_with('_') {
-        return None;
-    }
-    if func.body.locals.iter().filter(|d| d.name.as_deref() == Some(name)).count() != 1 {
-        return None;
-    }
-    Some(root)
+    Some(Place::local(local))
 }
 
 /// A whole-or-projected CALL-destination write to `local` anywhere in the body.
@@ -624,8 +1141,11 @@ pub(super) fn sigma_actual_stable_copy_root(
 /// stability gates that must mean "the local's value is its entry value at every
 /// read".
 pub(super) fn local_has_call_dest_write(func: &VerifiableFunction, local: usize) -> bool {
-    func.body.blocks.iter().any(
-        |block| matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == local),
+    crate::any_local_write_term(
+        func,
+        &func.body.blocks,
+        local,
+        |_block, term| matches!(term, Terminator::Call { dest, .. } if dest.local == local),
     )
 }
 
@@ -636,10 +1156,18 @@ pub(super) fn local_has_call_dest_write(func: &VerifiableFunction, local: usize)
 /// replacement (the callee's `<formal>__slice_len` stays a free var ⇒ `¬P[σ]`
 /// SAT ⇒ fail-closed, INV-2).
 ///
-///   * (c) `actual` is a PARAMETER-slice reborrow (`fill(s, k)` on `s: &mut [T]`):
-///     `param_slice_len` resolves it to the caller's own `s__slice_len`, tied to
-///     the caller's fat-pointer metadata. The caller's guard `k <= s.len()`
-///     discharges `¬(k <= s__slice_len)` through the existing guard machinery.
+///   * (c) `actual` is a slice whose ROOT the name licence admits (`fill(s, k)` on
+///     `s: &mut [T]`; since round A8 also a single-write local such as a call
+///     destination `t = make()`): `param_slice_len` follows the copy/reborrow/cast
+///     hops to the root and resolves to the caller's own `{root}__slice_len` ONLY
+///     when `slice_len_licence` licenses it — the place owning the metadata is
+///     `local_defs::path_is_single_static_assignment`, so the name is a name of ONE
+///     value, which is the actual's length at the call whatever point the caller's
+///     rename versions it at (a twice-written destination is refused, and the
+///     member's own spelling then survives for the gate to catch — pinned in
+///     `trust-ir-bridge/tests/bundled_member_bounds_charge_real_mir.rs`). The
+///     caller's guard `k <= s.len()` discharges `¬(k <= s__slice_len)` through the
+///     existing guard machinery.
 ///   * (a) `actual` is an array→slice UNSIZE cast of a FIXED-size array
 ///     (`fill(&mut buf, N)` on `buf: [T; 16]`): the reaching def is
 ///     `Rvalue::Cast(&buf, &mut [T])` whose SOURCE is `&[T; 16]`, so the length is
@@ -661,8 +1189,9 @@ pub(super) fn sigma_actual_slice_len(
     actual: &Operand,
 ) -> Option<Formula> {
     const TRACE_FUEL: u32 = 16;
+    let (Operand::Copy(p) | Operand::Move(p)) = actual else { return None };
     // (c) A parameter-slice reborrow → the caller's own `<param>__slice_len`.
-    if let Some(len) = param_slice_len(func, actual, TRACE_FUEL) {
+    if let Some(len) = param_slice_len_place(func, p, TRACE_FUEL) {
         return Some(len);
     }
     // (a)/(b) An array→slice unsize cast → the SOURCE array's length. Follow the
@@ -687,7 +1216,7 @@ pub(super) fn sigma_actual_array_cast_len(
         return None;
     }
     let (Operand::Copy(p) | Operand::Move(p)) = actual else { return None };
-    if !p.projections.is_empty() {
+    if !p.projections.is_empty() || crate::local_defs::is_parameter(func, p.local) {
         return None;
     }
     match crate::local_defs::unique_value_def(func, p.local)? {
@@ -772,15 +1301,28 @@ pub(super) fn ty_is_slice_or_array_param(ty: &Ty) -> bool {
 /// (pinned by `cross_block_bitand_range_guard_dropped_on_reassign`). So a
 /// parameter must have NO statement write, NO call-dest write, and pass
 /// `place_source_is_stable` (no `&mut` escape / projected store).
+///
+/// Trust: 2026-10-14 (INTERIOR-MUT-CHANNEL-1) — and, for both, no `UnsafeCell` byte of
+/// the local's own storage under a shared borrow (`shared_borrowed_cell_places`, which
+/// `place_source_is_stable` already asks for a parameter): `poke(&c)` changes an owned
+/// `c: Cell<usize>` with no statement write and no `&mut`, so its versions do not all
+/// denote its one definition.
 pub(super) fn local_versions_collapse_to_bare(func: &VerifiableFunction, local: usize) -> bool {
-    let is_param = (1..=func.body.arg_count).contains(&local);
-    if is_param {
-        crate::local_is_never_written(func, local)
-            && !local_has_call_dest_write(func, local)
-            && crate::place_source_is_stable(func, local)
-    } else {
-        is_single_static_assignment(func, local)
-    }
+    // verifier-perf: three whole-body scans per decision, asked once per
+    // versioned variable of every formula the collapse pass touches. Pure
+    // function of (`func.body`, `local`); memoized per function per scope
+    // (`fn_memo`).
+    crate::fn_memo::collapse_to_bare(func, local, || {
+        let is_param = (1..=func.body.arg_count).contains(&local);
+        if is_param {
+            crate::local_is_never_written(func, local)
+                && !local_has_call_dest_write(func, local)
+                && crate::place_source_is_stable(func, local)
+        } else {
+            is_single_static_assignment(func, local)
+                && super::shared_borrowed_cell_places(func, local).is_empty()
+        }
+    })
 }
 
 /// The EXACT variable spelling under which this function's EMITTED VC formulas
@@ -868,31 +1410,121 @@ pub fn call_arg_fact_token(func: &VerifiableFunction, arg: &Operand) -> Option<S
 /// for SSA bases is an identity on the fact's meaning. Non-SSA versioned vars
 /// are left untouched (identity on the rest keeps the fact true); returns
 /// `None` when no rename fires.
+#[inline]
+fn collect_ssa_collapse_renames(
+    func: &VerifiableFunction,
+    formula: &Formula,
+) -> (Vec<(String, Formula)>, bool) {
+    let mut renames: Vec<(String, Formula)> = Vec::new();
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
+    let mut needs_full_subst = false;
+    trust_types::visit_formula_nodes(formula, &mut |f| match f {
+        Formula::Forall(..) | Formula::Exists(..) => {
+            needs_full_subst = true;
+        }
+        Formula::Var(name, sort) => {
+            let Some((base, tok)) = name.split_once('#') else {
+                return;
+            };
+            if !needs_full_subst
+                && tok.bytes().any(crate::is_projection_segment_lead)
+                && !base.bytes().any(crate::is_projection_segment_lead)
+            {
+                needs_full_subst = true;
+            }
+            // A loop-transition HAVOC is not a second spelling of the bare
+            // local; collapsing it would assert the iteration left the local
+            // unchanged. See `LOOP_TRANSITION_HAVOC_TOKEN_PREFIX` for the
+            // measured false proof this excludes.
+            if !crate::version_token_is_loop_transition_havoc(name)
+                // Nor is a TINV unwind havoc (`TINV_UNWIND_HAVOC_TOKEN_PREFIX`).
+                && !crate::version_token_is_tinv_unwind_havoc(name)
+                // Nor a guard-local path-guard spelling (`GUARD_VALUE_TOKEN_PREFIX`).
+                && !crate::version_token_is_guard_value(name)
+                && seen.insert(name.as_str())
+            {
+                // verifier-perf: the "which local mints this base" search is a table
+                // lookup built once per function per scope (`fn_memo`) — the
+                // linear `find` over every local, each step a full name mint, was
+                // being re-run for every versioned variable of every formula.
+                let base_local = crate::fn_memo::whole_local_index_by_base(func, base, |l| {
+                    crate::place_to_var_name(func, &Place::local(l))
+                });
+                if let Some(local) = base_local
+                    && local_versions_collapse_to_bare(func, local)
+                {
+                    renames.push((
+                        name.clone(),
+                        Formula::var_owned(base.to_string(), sort.clone()),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    });
+    (renames, needs_full_subst)
+}
+
+fn rewrite_exact_hash_vars_small(formula: Formula, renames: &[(String, Formula)]) -> Formula {
+    match formula {
+        Formula::Var(name, sort) => {
+            if name.as_bytes().contains(&b'#')
+                && let Some((_, repl)) = renames.iter().find(|(formal, _)| *formal == name)
+            {
+                return repl.clone();
+            }
+            Formula::Var(name, sort)
+        }
+        other => other.map_children(&mut |child| rewrite_exact_hash_vars_small(child, renames)),
+    }
+}
+
+fn rewrite_exact_hash_vars_indexed(
+    formula: Formula,
+    renames: &FxHashMap<&str, &Formula>,
+) -> Formula {
+    match formula {
+        Formula::Var(name, sort) => {
+            if name.as_bytes().contains(&b'#')
+                && let Some(repl) = renames.get(name.as_str())
+            {
+                return (*repl).clone();
+            }
+            Formula::Var(name, sort)
+        }
+        other => other.map_children(&mut |child| rewrite_exact_hash_vars_indexed(child, renames)),
+    }
+}
+
+fn apply_ssa_collapse_renames_owned(
+    formula: Formula,
+    renames: &[(String, Formula)],
+    needs_full_subst: bool,
+) -> Formula {
+    if needs_full_subst {
+        return substitute_summary_params_owned(formula, renames);
+    }
+    if renames.len() <= 8 {
+        rewrite_exact_hash_vars_small(formula, renames)
+    } else {
+        let mut indexed: FxHashMap<&str, &Formula> =
+            FxHashMap::with_capacity_and_hasher(renames.len(), Default::default());
+        for (k, v) in renames {
+            indexed.insert(k.as_str(), v);
+        }
+        rewrite_exact_hash_vars_indexed(formula, &indexed)
+    }
+}
+
 pub(super) fn bare_ssa_guard_variant(
     func: &VerifiableFunction,
     guard: &Formula,
 ) -> Option<Formula> {
-    let mut renames: Vec<(String, Formula)> = Vec::new();
-    guard.visit(&mut |f| {
-        if let Formula::Var(name, sort) = f
-            && let Some((base, _tok)) = name.split_once('#')
-            && !crate::version_token_is_loop_transition_havoc(name)
-            && !renames.iter().any(|(n, _)| n == name)
-        {
-            let base_local = (0..func.body.locals.len()).find(|&l| {
-                crate::place_to_var_name(func, &Place { local: l, projections: Vec::new() }) == base
-            });
-            if let Some(local) = base_local
-                && local_versions_collapse_to_bare(func, local)
-            {
-                renames.push((name.clone(), Formula::var_owned(base.to_string(), sort.clone())));
-            }
-        }
-    });
+    let (renames, needs_full_subst) = collect_ssa_collapse_renames(func, guard);
     if renames.is_empty() {
         return None;
     }
-    Some(substitute_summary_params(guard, &renames))
+    Some(apply_ssa_collapse_renames_owned(guard.clone(), &renames, needs_full_subst))
 }
 
 /// Collapse every versioned occurrence `X#tok` of a SINGLE-STATIC-ASSIGNMENT
@@ -910,31 +1542,24 @@ pub(super) fn normalize_ssa_version_tokens(
     func: &VerifiableFunction,
     formula: &Formula,
 ) -> Formula {
-    let mut renames: Vec<(String, Formula)> = Vec::new();
-    formula.visit(&mut |f| {
-        if let Formula::Var(name, sort) = f
-            && let Some((base, _tok)) = name.split_once('#')
-            // A loop-transition HAVOC is not a second spelling of the bare
-            // local; collapsing it would assert the iteration left the local
-            // unchanged. See `LOOP_TRANSITION_HAVOC_TOKEN_PREFIX` for the
-            // measured false proof this excludes.
-            && !crate::version_token_is_loop_transition_havoc(name)
-            && !renames.iter().any(|(n, _)| n == name)
-        {
-            let base_local = (0..func.body.locals.len()).find(|&l| {
-                crate::place_to_var_name(func, &Place { local: l, projections: Vec::new() }) == base
-            });
-            if let Some(local) = base_local
-                && local_versions_collapse_to_bare(func, local)
-            {
-                renames.push((name.clone(), Formula::var_owned(base.to_string(), sort.clone())));
-            }
-        }
-    });
+    let (renames, needs_full_subst) = collect_ssa_collapse_renames(func, formula);
     if renames.is_empty() {
         return formula.clone();
     }
-    substitute_summary_params(formula, &renames)
+    apply_ssa_collapse_renames_owned(formula.clone(), &renames, needs_full_subst)
+}
+
+/// Owned counterpart of [`normalize_ssa_version_tokens`] that returns `formula` untouched
+/// when no SSA version tokens need collapsing and transforms in place otherwise.
+pub(super) fn normalize_ssa_version_tokens_owned(
+    func: &VerifiableFunction,
+    formula: Formula,
+) -> Formula {
+    let (renames, needs_full_subst) = collect_ssa_collapse_renames(func, &formula);
+    if renames.is_empty() {
+        return formula;
+    }
+    apply_ssa_collapse_renames_owned(formula, &renames, needs_full_subst)
 }
 
 /// True for the `ConstValue` variants that `operand_to_formula` lowers to a by-name-interned
@@ -968,47 +1593,110 @@ pub(super) fn const_lowers_to_aliasing_opaque(c: &ConstValue) -> bool {
     )
 }
 
-/// True for the two by-NAME-interned opaque symbols `operand_to_formula` produces for
-/// alias-prone consts: `__trust_opaque_scalar_{u,i}{width}` (OpaqueScalar) and `__unknown_const`
-/// (the unevaluated/unknown fallback). NOT the σ namespace `__trust_sigma_opaque__*`, which is
-/// already per-formal-distinct (`sigma_actual_formula`) and must be left intact so `¬P[σ]`
-/// remains structurally equal to `¬substituted` for the discharge gate.
+/// True for the opaque symbol families `operand_to_formula` produces for alias-prone
+/// carriers: `__trust_opaque_scalar_*` (OpaqueScalar), `__trust_opaque_ref_*` (the
+/// opaque-reference carriers), `__trust_unsupported_operand_*`, and the `__unknown_*`
+/// fallbacks. Within one function the scalar/reference/unsupported names are per
+/// occurrence (OPAQUE-SCALAR-ID-1, OPAQUE-REF-ID-1); a callsite formula mixes two
+/// functions' sites, so the families are still freshened there. NOT the σ namespace
+/// `__trust_sigma_opaque__*`, which is already per-formal-distinct (`sigma_actual_formula`)
+/// and must be left intact so `¬P[σ]` remains structurally equal to `¬substituted` for the
+/// discharge gate. NOT the const-generic family `__trust_constparam_*` either: it is keyed
+/// on the param's identity, so within one σ obligation one symbol is one value of the
+/// caller (see the soundness argument in the body; CONSTPARAM-SIGMA-FRESHEN-1).
 pub(super) fn is_aliasing_opaque_symbol_name(name: &str) -> bool {
     // The COMPLETE set of by-name-interned opaque/unknown symbols (enumerated against
     // operand_to_formula, lib.rs ~2150-2214) — each keyed only by width/type/kind, never by
     // value, so two distinct values collapse onto one symbol:
-    //   __trust_opaque_scalar_{u,i}{width}  integer const-generic / assoc-const / size_of
-    //   __unknown_const                     unevaluated/unknown ConstValue fallback
-    //   __trust_unsupported_operand_{k}_{d} non-int/bool/Alias const refused by convert.rs, keyed
-    //                                       by type ⇒ distinct bool/projection values collide
+    //   __trust_opaque_scalar_{u,i}{width}_*  OpaqueScalar (assoc-const / size_of / runtime
+    //                                       value). Since OPAQUE-SCALAR-ID-1 the suffix is
+    //                                       the occurrence's site or constant key, so the name
+    //                                       is per-value WITHIN one function; a callsite σ
+    //                                       formula mixes two functions' sites, so the whole
+    //                                       family is still freshened per occurrence here.
+    //   __trust_opaque_ref_*                OpaqueConst / UnitVariantRef / StructScalarFieldsRef.
+    //                                       Since OPAQUE-REF-ID-1 the suffix is the occurrence's
+    //                                       site (it was the ONE symbol `__unknown_const`);
+    //                                       per-value within one function, freshened here for
+    //                                       the same cross-function reason as the scalar family.
+    //   __unknown_const                     fallback for a ConstValue variant with no identity arm
+    //   __trust_unsupported_operand_*       refused operand, named by its site since
+    //                                       OPAQUE-REF-ID-1 (was keyed by kind/detail text)
     //   __unknown_operand                   unknown-Operand fallback
     // EXCLUDED (injective, must NOT be freshened): __trust_float_bits_* (by bits), Str (by bytes),
-    // __trust_callable_reify_{dest} (by dest), plain places `_n`, and the σ namespace
-    // __trust_sigma_opaque__* (already per-formal-distinct; freshening it would break
-    // `¬P[σ] == ¬substituted` at the discharge gate).
+    // __trust_callable_reify_{dest} (by dest), plain places `_n`, the σ namespaces
+    // __trust_sigma_opaque__* / __trust_sigma_constparam__* (already per-formal / per-callee-
+    // param distinct; freshening them would break `¬P[σ] == ¬substituted` at the discharge gate),
+    // and — since CONSTPARAM-SIGMA-FRESHEN-1 (2026-10-11) — the const-generic family
     //   __trust_constparam_{index}_{name}   const-generic PARAM value / array length (piece #7a)
-    name.starts_with("__trust_opaque_scalar_")
+    //
+    // Trust (CONSTPARAM-SIGMA-FRESHEN-1): the const-generic family is IDENTITY-keyed, not
+    // width-keyed, so it is not alias-prone and is NOT in this set. It used to be, on the
+    // argument that `helper(M, N)` would alias `M` and `N` on the σ path — true of the
+    // pre-piece-#7a `(width, signed)` key, false since: `M` and `N` mint `__trust_constparam_0_M`
+    // and `__trust_constparam_1_N`, and `helper(M, M)` shares one symbol because the two
+    // actuals ARE one value. Freshening the family split the caller's ONE `K` into
+    // `__trust_constparam_0_K__r1occ{n}`, one per occurrence, which detached the guard `n < K`
+    // from the unsize fact `_4__slice_len == K` and from σ's `buf__slice_len := K`: the correct
+    // `if n < K { pick(a, n) }` on `a: &[u32; K]` was refuted (`[precond] FAILED`, default
+    // rc 1), and the R1 flip of a private `idx(a, i)` behind such a guard was refused —
+    // measured on the stage 1 of `5911b1325f` (`tests/ui/trust/const_param_sigma_caller_guard.rs`
+    // `ok`, `r1`) and of `2bf0ad72e3` (the wave-22 scout's probes). By the same split, the
+    // `fill(buf, M)` tautology the piece #8 comment on `const_lowers_to_aliasing_opaque`
+    // promises read `M_occ0 <= M_occ1`, which cannot discharge (read from the code, not run).
+    //
+    // WHY SHARING IS SOUND — no σ obligation can hold two DISTINCT const-param values under
+    // one `__trust_constparam_*` symbol. Every conjunct of the three σ assemblies
+    // (`generate_callsite_precondition_vcs{,_attributed}`, `generate_callsite_l0_replay_candidates`)
+    // comes from one of:
+    //   (a) the CALLER's own body: block defs, path defs, path guards, semantic guards, global
+    //       facts and the caller's own stable `requires`. Every family leaf there is minted from
+    //       a `ConstValue::ConstParam` / `Ty::SymArray` of the caller's MIR
+    //       (`operand_to_formula`, `slice_len_formula`, `value_facts`, `chc`), i.e. from a rustc
+    //       `ParamConst { index, name }` of the caller's body, whose `index` is the param's
+    //       position in the caller's generics (parents included) and so unique per param;
+    //       `trust_types::const_param_symbol` is injective on `(index, name)`. One symbol is
+    //       one param of the caller, and a const param is ONE value for a whole execution of
+    //       the body. (MIR inlining instantiates an inlined body's params with the call's
+    //       arguments, so inlined code too names only the caller's params.)
+    //   (b) callee SUMMARY facts injected as semantic guards: `rebind_callee_postconditions`
+    //       admits only clauses whose free variables are formals and `_0`
+    //       (`postcondition_rebindable`, `precondition_rebindable` for the antecedent), all
+    //       replaced by caller-side formulas, so a callee's own family leaf drops the clause;
+    //       return-value summaries are integer literals.
+    //   (c) σ's replacement VALUES: `sigma_actual_formula` / `sigma_actual_slice_len` over the
+    //       caller's operands — (a) again — or the `__trust_sigma_*` fresh names.
+    //   (d) the CALLEE's `P` itself — the one foreign formula. In the two precondition
+    //       producers, `isolate_callee_const_param_symbols` renames every FREE family leaf of
+    //       `P` into `__trust_sigma_constparam__*` BEFORE σ, so a callee's `M` can never be
+    //       read as a caller's `M` (pinned by
+    //       `const_param_fold_tests::callee_const_param_cannot_meet_the_callers_symbol`).
+    //       In the replay lane the callee violation's non-formal leaves are temps that must
+    //       be def-pinned and are renamed into `__trust_replay__*`, or the candidate drops.
+    // No producer today puts a family leaf into `P` (a source contract cannot name a const
+    // param and spells a length `<formal>__slice_len`; R1 and the derived-requires lane take
+    // `P` from a monomorphic body), so (d) is defence in depth.
+    //
+    // The replay lane (refutation-only) no longer meets a caller's const param as a
+    // `__r1occ` name, which it rejected by name; it now meets the shared symbol, which
+    // `composed_formula_is_caller_entry_grounded` classifies like any non-parameter name:
+    // admitted only when a conjunct def-pins it to entry state, else the candidate drops.
+    name.starts_with(trust_types::OPAQUE_SCALAR_SYMBOL_PREFIX)
+        || name.starts_with(trust_types::OPAQUE_REF_SYMBOL_PREFIX)
         || name == "__unknown_const"
-        || name.starts_with("__trust_unsupported_operand_")
+        || name.starts_with(trust_types::UNSUPPORTED_OPERAND_SYMBOL_PREFIX)
         || name == "__unknown_operand"
-        // Trust: piece #7a — a const-generic PARAM value shares one symbol WITHIN
-        // a function (the guard `N` and the array length `N` must be the SAME term
-        // — this is the intra-function tie, and freshen does NOT run on that path).
-        // But on the R1 σ callsite path, a const-param actual flowing to TWO callee
-        // params must NOT alias — exactly the OpaqueScalar M==N hazard. So it must
-        // be freshened per occurrence there. Registering the family here is both
-        // correct AND necessary (without it, `helper(M, N)` could re-introduce the
-        // M==N alias on the σ path). Sound: freshening only splits distinct
-        // occurrences apart; it never merges.
-        || name.starts_with("__trust_constparam_")
 }
 
 /// Per-OCCURRENCE freshen every alias-prone opaque symbol leaf in `formula`.
 ///
-/// SOUNDNESS (R1 caller-propagation, complete alias fix): const-generic / associated-const /
-/// unevaluated-const operands lower (in `operand_to_formula`) to a single by-name-interned
-/// symbol per `(width,signed)`, so two DISTINCT such values collapse to ONE symbol and silently
-/// assert an equality between unrelated terms. The σ-substitution surface is fixed locally
+/// SOUNDNESS (R1 caller-propagation, complete alias fix): associated-const / `size_of` /
+/// unevaluated-const operands lowered (in `operand_to_formula`) to a single by-name-interned
+/// symbol per `(width,signed)` — today per site within ONE function (OPAQUE-SCALAR-ID-1), which
+/// still collides across the two functions a σ obligation mixes — so two DISTINCT such values
+/// could collapse to ONE symbol and silently assert an equality between unrelated terms. (A
+/// const-generic PARAM is not in the family: its symbol is identity-keyed, one value per
+/// symbol; see `is_aliasing_opaque_symbol_name`.) The σ-substitution surface is fixed locally
 /// (`sigma_actual_formula`), but the SAME interned symbol re-enters the discharge obligation as a
 /// SUB-operand through many guard/semantic-fact helpers (bool-temp resolution, the BinaryOp/Cast
 /// semantic arms, checked-arith results, min/max/clamp facts). Rather than chase every syntactic
@@ -1017,13 +1705,41 @@ pub(super) fn is_aliasing_opaque_symbol_name(name: &str) -> bool {
 /// ("each occurrence an independent fresh symbol"). Splitting a shared symbol only REMOVES
 /// implied equalities ⇒ the obligation can only move SAT-ward ⇒ `certify_vc`'s UNSAT (discharge)
 /// set strictly shrinks ⇒ a previously-false discharge is killed, a genuine one is preserved.
-/// The fresh leaf KEEPS THE LEAF'S OWN SORT: not every alias-prone opaque is `Sort::Int` — a
-/// `bool` const-generic (`ConstParam { width: 1, signed: false }`) is in this family and mints
-/// `Sort::Bool`, so the previous hardcoded `Sort::Int` handed the solver an ill-typed `And`/`Not`
-/// operand on the σ path. Sort is orthogonal to the argument above: renaming splits equalities
-/// whatever the sort is.
+/// The fresh leaf KEEPS THE LEAF'S OWN SORT: not every alias-prone opaque is `Sort::Int` (a
+/// `bool` const-generic, `ConstParam { width: 1, signed: false }`, minting `Sort::Bool`, was in
+/// this family until CONSTPARAM-SIGMA-FRESHEN-1, and the previous hardcoded `Sort::Int` handed
+/// the solver an ill-typed `And`/`Not` operand on the σ path). Sort is orthogonal to the
+/// argument above: renaming splits equalities whatever the sort is.
+fn formula_has_aliasing_opaque_occurrence(formula: &Formula) -> bool {
+    trust_types::any_formula_node(formula, &mut |node| {
+        node.var_name().is_some_and(is_aliasing_opaque_symbol_name)
+    })
+}
+
 pub(super) fn freshen_aliasing_opaque_occurrences(
     formula: &Formula,
+    counter: &std::cell::Cell<u32>,
+) -> Formula {
+    if !formula_has_aliasing_opaque_occurrence(formula) {
+        return formula.clone();
+    }
+    freshen_aliasing_opaque_occurrences_rec(formula.clone(), counter)
+}
+
+/// Owned counterpart of [`freshen_aliasing_opaque_occurrences`] that returns `formula`
+/// untouched when no alias-prone opaque leaf is present and transforms in place otherwise.
+pub(super) fn freshen_aliasing_opaque_occurrences_owned(
+    formula: Formula,
+    counter: &std::cell::Cell<u32>,
+) -> Formula {
+    if !formula_has_aliasing_opaque_occurrence(&formula) {
+        return formula;
+    }
+    freshen_aliasing_opaque_occurrences_rec(formula, counter)
+}
+
+fn freshen_aliasing_opaque_occurrences_rec(
+    formula: Formula,
     counter: &std::cell::Cell<u32>,
 ) -> Formula {
     if let Some(name) = formula.var_name()
@@ -1034,7 +1750,103 @@ pub(super) fn freshen_aliasing_opaque_occurrences(
         let sort = formula.var_sort().cloned().unwrap_or(Sort::Int);
         return Formula::var_owned(format!("{name}__r1occ{n}"), sort);
     }
-    formula.clone().map_children(&mut |child| freshen_aliasing_opaque_occurrences(&child, counter))
+    formula.map_children(&mut |child| freshen_aliasing_opaque_occurrences_rec(child, counter))
+}
+
+/// The σ namespace a CALLEE's own const-generic parameter symbols are moved into before σ
+/// substitution (CONSTPARAM-SIGMA-FRESHEN-1; see [`isolate_callee_const_param_symbols`]). It
+/// starts with `__trust_sigma_`, the prefix the replay lane rejects as a deliberately free σ
+/// var, and contains `__`, so no source place can spell it (`place_to_var_name` demotes such a
+/// name, `trust_types::source_contract_synthetic_name_collision` rejects it in a contract).
+pub(super) const SIGMA_CALLEE_CONST_PARAM_PREFIX: &str = "__trust_sigma_constparam__";
+
+/// Trust (CONSTPARAM-SIGMA-FRESHEN-1, defence in depth): rename every FREE
+/// `__trust_constparam_*` leaf of a CALLEE's precondition `P` into
+/// [`SIGMA_CALLEE_CONST_PARAM_PREFIX`], BEFORE σ substitution.
+///
+/// WHY. `trust_types::const_param_symbol` is keyed on a param's identity WITHIN ONE ITEM, so a
+/// callee's `M` and a caller's `M` at the same index spell the same symbol. A family leaf in
+/// `P` names the callee INSTANCE's param, whose value at this call is the call's generic
+/// argument, not the caller's same-spelled param. σ obligations no longer freshen the family
+/// (it is one value per symbol on the caller's side), so such a leaf left as is would be read
+/// as the caller's `M`: `P = n < __trust_constparam_0_M` at `g::<2>(b, n)` inside a caller
+/// guarding `n < M` would discharge — a false PROVE. No producer puts a family leaf into `P`
+/// today (a source contract cannot name a const param and spells a length
+/// `<formal>__slice_len`; R1 and the derived-requires lane read a monomorphic body), so this
+/// closes the channel structurally rather than by that census.
+///
+/// SOUND. All occurrences of one callee param land on ONE σ name (they are one value of the
+/// callee instance), disjoint from every caller-side name: σ's replacement values mint only
+/// `__trust_sigma_opaque__*` / `__trust_sigma_field__*`, and no source place can spell the
+/// prefix. The renamed symbol is FREE in the obligation, so it asserts nothing: `¬P[σ]` can
+/// only move SAT-ward and the call site fails closed. On a `P` without a free family leaf
+/// (every producer today) this is the identity.
+///
+/// BINDER-AWARE. Only FREE occurrences are renamed: renaming a bound occurrence changes the
+/// formula's meaning in either direction (`∃x. x != x` is false, `∃x. y != x` is valid). A
+/// quantifier in `P` binding a name in the σ const-param namespace could capture a renamed
+/// leaf; such a `P` becomes `Bool(false)`, the impossible caller obligation (fail-closed;
+/// nothing mints such a binder).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn isolate_callee_const_param_symbols(precondition: &Formula) -> Formula {
+    isolate_callee_const_param_symbols_cow(precondition).into_owned()
+}
+
+pub(super) fn isolate_callee_const_param_symbols_cow(
+    precondition: &Formula,
+) -> std::borrow::Cow<'_, Formula> {
+    fn rename_free(formula: Formula, bound: &FxHashSet<String>) -> Formula {
+        if let Some(name) = formula.var_name()
+            && let Some(rest) = name.strip_prefix(trust_types::CONST_PARAM_SYMBOL_PREFIX)
+            && !bound.contains(name)
+        {
+            let sort = formula.var_sort().cloned().unwrap_or(Sort::Int);
+            return Formula::var_owned(format!("{SIGMA_CALLEE_CONST_PARAM_PREFIX}{rest}"), sort);
+        }
+        match formula {
+            Formula::Forall(bindings, body) => {
+                let body = if bindings.is_empty() {
+                    Box::new(rename_free(*body, bound))
+                } else {
+                    let mut inner = bound.clone();
+                    inner.extend(bindings.iter().map(|(sym, _)| sym.as_str().to_string()));
+                    Box::new(rename_free(*body, &inner))
+                };
+                Formula::Forall(bindings, body)
+            }
+            Formula::Exists(bindings, body) => {
+                let body = if bindings.is_empty() {
+                    Box::new(rename_free(*body, bound))
+                } else {
+                    let mut inner = bound.clone();
+                    inner.extend(bindings.iter().map(|(sym, _)| sym.as_str().to_string()));
+                    Box::new(rename_free(*body, &inner))
+                };
+                Formula::Exists(bindings, body)
+            }
+            other => other.map_children(&mut |child| rename_free(child, bound)),
+        }
+    }
+    if !trust_types::any_formula_node(precondition, &mut |node| {
+        node.var_name()
+            .is_some_and(|name| name.starts_with(trust_types::CONST_PARAM_SYMBOL_PREFIX))
+    }) || !trust_types::any_free_variable_name(precondition, &mut |name| {
+        name.starts_with(trust_types::CONST_PARAM_SYMBOL_PREFIX)
+    }) {
+        return std::borrow::Cow::Borrowed(precondition);
+    }
+    if trust_types::any_formula_node(precondition, &mut |node| {
+        matches!(
+            node,
+            Formula::Forall(bindings, _) | Formula::Exists(bindings, _)
+                if bindings
+                    .iter()
+                    .any(|(sym, _)| sym.as_str().starts_with(SIGMA_CALLEE_CONST_PARAM_PREFIX))
+        )
+    }) {
+        return std::borrow::Cow::Owned(Formula::Bool(false));
+    }
+    std::borrow::Cow::Owned(rename_free(precondition.clone(), &FxHashSet::default()))
 }
 
 /// The subset of the CALLER's own `#[requires]` preconditions that may be conjoined
@@ -1068,9 +1880,9 @@ pub(super) fn stable_caller_preconditions(func: &VerifiableFunction) -> Vec<Form
             // Binder-aware free variables (quantifier-bound names excluded), same
             // walk `postcondition_rebindable` uses. A closed formula (no free
             // vars) is a constant fact of the contract and passes vacuously.
-            pre.free_variables()
-                .iter()
-                .all(|name| caller_precondition_var_is_entry_stable(func, name))
+            trust_types::all_free_variable_names(pre, &mut |name| {
+                caller_precondition_var_is_entry_stable(func, name)
+            })
         })
         .cloned()
         .collect()
@@ -1096,8 +1908,9 @@ pub(super) fn stable_caller_preconditions(func: &VerifiableFunction) -> Vec<Form
 ///       - `local_is_never_written`: no `Assign` statement targets the formal
 ///         (`place_source_is_stable` alone tolerates ONE whole-local reassign,
 ///         e.g. `lo = lo + 1`, which invalidates the entry reading);
-///       - `place_source_is_stable`: no `&mut`/`&raw mut` escape, projected
-///         store, projected call-dest, set-discriminant, or deinit (the mutation
+///       - `place_source_is_stable`: no slot-write channel (`&mut`, `&raw mut`,
+///         `&raw const` of an owned place), projected store, projected call-dest,
+///         set-discriminant, or deinit (the mutation
 ///         channels `local_is_never_written`'s whole-local scan cannot see);
 ///   * no Call terminator writes the formal (`lo = f(..)` is neither an `Assign`
 ///     statement nor >1 whole assign, so it slips BOTH predicates above).
@@ -1117,13 +1930,9 @@ pub(super) fn caller_precondition_var_is_entry_stable(
     if name.starts_with('_') {
         return false;
     }
-    let mut named = func.body.locals.iter().filter(|d| d.name.as_deref() == Some(name));
-    let Some(decl) = named.next() else {
+    let Some(decl) = crate::unique_named_local_decl(func, name) else {
         return false;
     };
-    if named.next().is_some() {
-        return false;
-    }
     let local = decl.index;
     // A parameter is `1..=arg_count` (inlined `is_parameter`, which is
     // canonical-pipeline helper).
@@ -1139,14 +1948,11 @@ pub(super) fn caller_precondition_var_is_entry_stable(
     if !matches!(decl.ty, Ty::Int { .. } | Ty::Bool | Ty::Float { .. }) {
         return false;
     }
-    if !crate::local_is_never_written(func, local) || !crate::place_source_is_stable(func, local) {
-        return false;
-    }
-    !func
-        .body
-        .blocks
-        .iter()
-        .any(|b| matches!(&b.terminator, Terminator::Call { dest, .. } if dest.local == local))
+    crate::fn_memo::collapse_to_bare(func, local, || {
+        crate::local_is_never_written(func, local)
+            && !local_has_call_dest_write(func, local)
+            && crate::place_source_is_stable(func, local)
+    })
 }
 
 /// True iff a caller `#[requires]` FIELD-projected var `<base><suffix>` denotes a
@@ -1176,13 +1982,10 @@ pub(super) fn caller_precondition_field_base_is_entry_stable(
     if base.starts_with('_') {
         return false;
     }
-    let mut named = func.body.locals.iter().filter(|d| d.name.as_deref() == Some(base));
-    let Some(decl) = named.next() else {
+    // shadowed base name → ambiguous → fail-closed (`unique_named_local_decl` returns `None`)
+    let Some(decl) = crate::unique_named_local_decl(func, base) else {
         return false;
     };
-    if named.next().is_some() {
-        return false; // shadowed base name → ambiguous → fail-closed
-    }
     let local = decl.index;
     if !(local >= 1 && local <= func.body.arg_count) {
         return false;

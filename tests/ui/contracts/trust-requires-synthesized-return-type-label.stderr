@@ -1,0 +1,17 @@
+error[E0308]: mismatched types
+  --> $DIR/trust-requires-synthesized-return-type-label.rs:15:12
+   |
+LL | #[requires(1u32)]
+   |            ^^^^ expected `bool`, found `u32`
+
+error[E0308]: mismatched types
+  --> $DIR/trust-requires-synthesized-return-type-label.rs:21:37
+   |
+LL | #[requires(let check = || -> bool { () }; check())]
+   |                              ----   ^^ expected `bool`, found `()`
+   |                              |
+   |                              expected `bool` because of return type
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `trustc --explain E0308`.

@@ -37,16 +37,26 @@
 //   (2) VALUE-DIFFERENTIAL (concrete bytes): e.g. 7/2=3, -7/2=-2 (signed trunc
 //       toward zero), 7%3=1, -7%3=-1.
 //   (3) PROVEN-OUTPUT (HALF-SYMBOLIC, INFINITE DOMAIN): the emitted bytes are
-//       decoded into machine effects (NOT reconstructed from the IR). The bounded
-//       path-merge executor explores the guard branch; the trapping arm (b == 0,
-//       or the i32::MIN/-1 overflow) diverges into the abort `Trap`, so it is the
-//       excluded path — the executor returns the LIVE (no-trap) arm's value and
-//       records the live-arm path condition as the NO-TRAP PRECONDITION. ay
-//       (QF_BV) proves `precondition => (machine_out == a OP c)` for ALL 2^32
-//       values of the symbolic `a`, for a REPRESENTATIVE SET of fixed divisors
-//       `c` (UNSAT of the negation).
+//       decoded into machine effects (NOT reconstructed from the IR). The
+//       NO-TRAP PRECONDITION is the fixture's SOURCE domain (b != 0, and for
+//       signed b != -1), read off its own `Assert` terminators and bound to the
+//       original argument registers — never derived from the emitted branches.
+//       The executor omits a guard arm only when ay proves that arm's
+//       accumulated path condition UNSAT under that domain; the trap arm (a
+//       `BRK #1` since trust-cg b80b958f5) is therefore never decoded on the
+//       proven path, and a FEASIBLE trap still reaches the unchanged
+//       Semantics refusal. ay (QF_BV) proves
+//       `precondition => (machine_out == a OP c)` for ALL 2^32 values of the
+//       symbolic `a`, for a REPRESENTATIVE SET of fixed divisors `c` (UNSAT of
+//       the negation).
 //   (4) NEGATIVE CONTROL: the SAME bytes proven against `a OP c + 1` (under the
 //       same precondition) MUST be SAT — otherwise the discharge is vacuous.
+//   (5) DOMAIN AND REFUSAL CONTROLS: the source domain has exact boundaries;
+//       feasible trap inputs (b == 0; signed b == -1), an entry BRK and a call
+//       remain refusals, and an inverted emitted guard cannot silently shrink
+//       the admitted input domain.
+//
+// These are bounded development solver checks, not kernel certificates.
 //
 // WHY HALF-SYMBOLIC. A fully-symbolic 32-bit divide equivalence is among the
 // hardest QF_BV instances (ay bit-blasts a 32x32 restoring divider); see
@@ -62,11 +72,30 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#![cfg(feature = "ay-proofs")]
+// Trust (2026-09-30, plan §5 fail-open item 1): every shipping `module_to_lir`
+// entry point now refuses an `Assert`-bearing body as
+// `ModuleLirError::ImplicitPanicUnfaithful` — the `Brif`/`Trap` lowering this
+// file proves is a bare `brk`, not Rust's panic. The proofs stay under test
+// for plan §5 item P through the trap oracle, which exists only under the
+// non-default `test-hooks` feature (never enabled by the compiler); this file
+// moved from the `ay-proofs` lane to `test-hooks` with it (`test-hooks`
+// implies `ay-proofs`).
+#![cfg(feature = "test-hooks")]
 
-use ay::{BigInt, Logic, Solver, Term};
+use std::time::Duration;
+
+use ay::{BigInt, Logic, Solver, SolverConfig, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
-use trust_cg_bridge::lower_trust_ir_function_to_lir;
+use trust_cg_bridge::module_to_lir::lower_trust_ir_function_to_lir_trap_assert_oracle;
+
+/// The trap oracle under the name this file always used (see the note at the
+/// top): `Assert` lowers to `Brif`/`Trap` here and is refused everywhere else.
+fn lower_trust_ir_function_to_lir(
+    module: &trust_ir::Module,
+    function: &trust_ir::Function,
+) -> Result<trust_cg_lower::function::Function, trust_cg_bridge::ModuleLirError> {
+    lower_trust_ir_function_to_lir_trap_assert_oracle(module, function, false)
+}
 use trust_disasm::{Opcode, decode_aarch64};
 use trust_ir::Module;
 use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
@@ -131,8 +160,9 @@ fn make_bridge_divrem_module(signed: bool, rem: bool) -> Module {
         // the guard's cond as `_4 = (b == -1)` — a real Assert/Br that the
         // converter lowers to a Brif/Trap. (The PRECISE overflow predicate does
         // not change the no-trap arithmetic we prove; the proof pins `b` to
-        // non-(-1) divisors, and the value-diff exercises the trap path only via
-        // the byte executor's trap-arm divergence.)
+        // non-(-1) divisors. `source_no_trap_domain` follows THIS modeled guard,
+        // and `feasible_div_by_zero_and_overflow_traps_remain_brk_refused`
+        // drives the trap path itself to the unchanged BRK refusal.)
         blocks.push(BasicBlock {
             id: BlockId(1),
             stmts: vec![Statement::Assign {
@@ -192,6 +222,7 @@ fn make_bridge_divrem_module(signed: bool, rem: bool) -> Module {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     trust_ir_bridge::lower_to_trust_ir(&vf).expect("bridge lower_to_trust_ir failed for div/rem")
@@ -277,10 +308,27 @@ fn has_conditional_branch(code: &[u8], base: u64) -> bool {
     false
 }
 
+/// Decode all emitted words. Unknown words or a truncated instruction refuse
+/// the structural check rather than being omitted from the call/trap counts.
+fn count_opcode(code: &[u8], base: u64, wanted: &[Opcode]) -> usize {
+    assert_eq!(code.len() % 4, 0, "AArch64 text must contain complete instructions");
+    code.chunks_exact(4)
+        .enumerate()
+        .filter(|(index, bytes)| {
+            let bytes: [u8; 4] = (*bytes).try_into().unwrap();
+            let insn = decode_aarch64(&bytes, base + (*index * 4) as u64)
+                .expect("every emitted word must decode for structural accounting");
+            wanted.contains(&insn.opcode)
+        })
+        .count()
+}
+
 // ===========================================================================
-// BOUNDED SYMBOLIC PATH-MERGING EXECUTOR (mirrors the checked-mul test): the
-// trapping guard arm (a `Trap`/abort) diverges that arm, accumulating the
-// no-trap precondition.
+// BOUNDED SYMBOLIC RETURN-PATH EXECUTOR (ported from the inline-multiblock
+// replay, 7a1034b5c1). The no-trap input assumption is supplied independently
+// of emitted control flow. An arm is omitted only when AY establishes that its
+// accumulated path condition is UNSAT. Reachable BRK, calls, and unknown
+// feasibility remain refusals; no trap semantics is invented.
 // ===========================================================================
 
 const MAX_STEPS: u32 = 4096;
@@ -290,7 +338,6 @@ const MAX_DEPTH: u32 = 16;
 enum ExecError {
     Loop { at: u64 },
     BudgetExceeded,
-    Trapped,
     Unsupported(String),
     Decode(String),
 }
@@ -300,12 +347,11 @@ struct Executor<'a> {
     code: &'a [u8],
     base: u64,
     steps: u32,
-    precondition: Vec<Formula>,
 }
 
 impl<'a> Executor<'a> {
     fn new(code: &'a [u8], base: u64) -> Self {
-        Executor { sem: Aarch64Semantics, code, base, steps: 0, precondition: Vec::new() }
+        Executor { sem: Aarch64Semantics, code, base, steps: 0 }
     }
 
     fn decode_at(&self, pc: u64) -> Result<trust_disasm::Instruction, ExecError> {
@@ -326,6 +372,7 @@ impl<'a> Executor<'a> {
         mut state: MachineState,
         mut visited: Vec<u64>,
         depth: u32,
+        path_condition: Formula,
     ) -> Result<Formula, ExecError> {
         if depth > MAX_DEPTH {
             return Err(ExecError::BudgetExceeded);
@@ -363,11 +410,12 @@ impl<'a> Executor<'a> {
                     }
                     Effect::Branch { target } => uncond_target = Some(target.clone()),
                     Effect::PcUpdate { .. } => {}
-                    // The Assert trap block begins with `call abort` (see
-                    // `select_trap`): the abort call IS the trap/panic path, so
-                    // this arm diverges — the no-trap precondition excludes it.
+                    // The Assert trap block no longer begins with `call abort`:
+                    // since trust-cg b80b958f5 a LIR `Trap` selects to `BRK #1`,
+                    // which the Semantics refuses above. A call is therefore
+                    // not a proved diverging branch; it is an unsupported step.
                     Effect::Call { .. } => {
-                        return Err(ExecError::Trapped);
+                        return Err(ExecError::Unsupported(format!("call at {pc:#x}")));
                     }
                     Effect::Aarch64SyncBoundary { .. } | Effect::Aarch64AtomicAccess { .. } => {
                         return Err(ExecError::Unsupported(format!("atomic/sync at {pc:#x}")));
@@ -394,10 +442,30 @@ impl<'a> Executor<'a> {
                     return Err(ExecError::Loop { at: pc });
                 }
 
-                let taken = self.run(target_pc, state.clone(), visited.clone(), depth + 1);
-                let fall = self.run(fall_pc, state.clone(), visited.clone(), depth + 1);
-
-                return self.merge(path_cond, taken, fall);
+                let taken_path = Formula::And(vec![path_condition.clone(), path_cond.clone()]);
+                let fall_path = Formula::And(vec![
+                    path_condition.clone(),
+                    Formula::Not(Box::new(path_cond.clone())),
+                ]);
+                // Do not even decode an infeasible destination. In particular,
+                // a BRK may only be avoided by proving its path impossible;
+                // a feasible BRK still reaches the unchanged Semantics refusal.
+                return match (path_is_feasible(&taken_path)?, path_is_feasible(&fall_path)?) {
+                    (true, true) => {
+                        let taken = self.run(
+                            target_pc,
+                            state.clone(),
+                            visited.clone(),
+                            depth + 1,
+                            taken_path,
+                        )?;
+                        let fall = self.run(fall_pc, state, visited, depth + 1, fall_path)?;
+                        Ok(Formula::Ite(Box::new(path_cond), Box::new(taken), Box::new(fall)))
+                    }
+                    (true, false) => self.run(target_pc, state, visited, depth + 1, taken_path),
+                    (false, true) => self.run(fall_pc, state, visited, depth + 1, fall_path),
+                    (false, false) => Err(ExecError::Unsupported("no feasible return path".into())),
+                };
             }
 
             if let Some(target) = uncond_target {
@@ -413,26 +481,25 @@ impl<'a> Executor<'a> {
             pc += 4;
         }
     }
+}
 
-    fn merge(
-        &mut self,
-        path_cond: Formula,
-        taken: Result<Formula, ExecError>,
-        fall: Result<Formula, ExecError>,
-    ) -> Result<Formula, ExecError> {
-        match (taken, fall) {
-            (Ok(t), Ok(f)) => Ok(Formula::Ite(Box::new(path_cond), Box::new(t), Box::new(f))),
-            (Err(ExecError::Trapped), Ok(f)) => {
-                self.precondition.push(Formula::Not(Box::new(path_cond)));
-                Ok(f)
-            }
-            (Ok(t), Err(ExecError::Trapped)) => {
-                self.precondition.push(path_cond);
-                Ok(t)
-            }
-            (Err(ExecError::Trapped), Err(ExecError::Trapped)) => Err(ExecError::Trapped),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
+/// Unknown (including the finite solver deadline) is never an infeasibility
+/// certificate. This is a test oracle, not a kernel-certified proof artifact.
+fn path_is_feasible(path: &Formula) -> Result<bool, ExecError> {
+    let config = SolverConfig::default().with_timeout(Duration::from_secs(30));
+    let mut solver = Solver::try_new_with_config(Logic::QfAbv, config)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility solver: {e:?}")))?;
+    let condition = formula_to_term(&mut solver, path);
+    solver
+        .try_assert_term(condition)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility assertion: {e:?}")))?;
+    let result = solver.check_sat();
+    if result.is_unsat() {
+        Ok(false)
+    } else if result.is_sat() {
+        Ok(true)
+    } else {
+        Err(ExecError::Unsupported(format!("unknown branch feasibility: {result:?}")))
     }
 }
 
@@ -453,31 +520,36 @@ fn const_addr(f: &Formula) -> Option<u64> {
 fn symbolic_machine_output_b_const(
     code: &[u8],
     base: u64,
+    signed: bool,
     c: i32,
 ) -> Result<(Formula, Formula), ExecError> {
     let mut state = MachineState::symbolic();
     state.gpr[1] = Formula::BitVec { value: i128::from(c) & 0xffff_ffff, width: 64 };
-    run_machine_output(code, base, state)
+    run_machine_output(code, base, signed, state)
 }
 
-fn symbolic_machine_output(code: &[u8], base: u64) -> Result<(Formula, Formula), ExecError> {
-    run_machine_output(code, base, MachineState::symbolic())
+fn symbolic_machine_output(
+    code: &[u8],
+    base: u64,
+    signed: bool,
+) -> Result<(Formula, Formula), ExecError> {
+    run_machine_output(code, base, signed, MachineState::symbolic())
 }
 
+/// Bind the source precondition to the ORIGINAL argument registers before any
+/// emitted instruction executes; decoded branches cannot redefine this domain.
+/// An empty domain (e.g. a pinned trapping divisor) is refused, never proven.
 fn run_machine_output(
     code: &[u8],
     base: u64,
+    signed: bool,
     state: MachineState,
 ) -> Result<(Formula, Formula), ExecError> {
-    let mut exec = Executor::new(code, base);
-    let out = exec.run(base, state, Vec::new(), 0)?;
-    let pre = if exec.precondition.is_empty() {
-        Formula::Bool(true)
-    } else if exec.precondition.len() == 1 {
-        exec.precondition.pop().unwrap()
-    } else {
-        Formula::And(exec.precondition.clone())
-    };
+    let pre = source_no_trap_domain(signed, state.read_gpr(1, 32));
+    if !path_is_feasible(&pre)? {
+        return Err(ExecError::Unsupported("empty input domain".into()));
+    }
+    let out = Executor::new(code, base).run(base, state, Vec::new(), 0, pre.clone())?;
     Ok((out, pre))
 }
 
@@ -608,6 +680,24 @@ fn bv32(value: i128) -> Formula {
     Formula::BitVec { value, width: 32 }
 }
 
+/// The fixture's SOURCE no-trap domain over the 32-bit divisor `b`, read off
+/// its own `Assert` terminators in `make_bridge_divrem_module` and NEVER off the
+/// emitted branches: bb0 traps iff `b == 0`; for SIGNED, the bb1 overflow guard
+/// as this fixture models it traps iff `b == -1`. The dividend is unconstrained.
+fn source_no_trap_domain(signed: bool, b: Formula) -> Formula {
+    let excludes = |value: i32| {
+        Formula::Not(Box::new(Formula::Eq(
+            Box::new(b.clone()),
+            Box::new(bv32(i128::from(value) & 0xffff_ffff)),
+        )))
+    };
+    let mut admitted = vec![excludes(0)];
+    if signed {
+        admitted.push(excludes(-1));
+    }
+    Formula::And(admitted)
+}
+
 /// `a OP c` spec for a fixed 32-bit divisor `c` (used with X1 pinned to `c`):
 /// the 32-bit signed/unsigned quotient or remainder of the symbolic `a` and `c`.
 fn divrem_by_const_spec(signed: bool, rem: bool, c: i32) -> Formula {
@@ -643,21 +733,16 @@ fn divrem_spec(signed: bool, rem: bool) -> Formula {
 // Concrete byte-execution oracle.
 // ---------------------------------------------------------------------------
 
-enum ConcreteOutcome {
-    Trapped,
-    Value(Formula),
-}
-
-fn concrete_run(code: &[u8], base: u64, a: i32, b: i32) -> ConcreteOutcome {
+fn concrete_run(code: &[u8], base: u64, a: i32, b: i32) -> Result<Formula, ExecError> {
     let mut state = MachineState::symbolic();
     state.gpr[0] = Formula::BitVec { value: i128::from(a) & 0xffff_ffff, width: 64 };
     state.gpr[1] = Formula::BitVec { value: i128::from(b) & 0xffff_ffff, width: 64 };
-    let mut exec = Executor::new(code, base);
-    match exec.run(base, state, Vec::new(), 0) {
-        Ok(out) => ConcreteOutcome::Value(out),
-        Err(ExecError::Trapped) => ConcreteOutcome::Trapped,
-        Err(e) => panic!("concrete run failed: {e:?}"),
-    }
+    // The concrete inputs ARE the precondition: they are bound into X0/X1, so
+    // every guard condition is ground over them and feasibility under them
+    // alone picks the side that runs. Concrete runs are NOT restricted to the
+    // source no-trap domain: a trapping input (b == 0; signed b == -1) makes
+    // the BRK side the feasible one, and it reaches the unchanged refusal.
+    Executor::new(code, base).run(base, state, Vec::new(), 0, Formula::Bool(true))
 }
 
 fn concrete_equals(out: &Formula, expected: i32) -> bool {
@@ -674,10 +759,8 @@ fn concrete_equals(out: &Formula, expected: i32) -> bool {
 }
 
 fn bytes_value_equals(code: &[u8], base: u64, a: i32, b: i32, expected: i32) -> bool {
-    match concrete_run(code, base, a, b) {
-        ConcreteOutcome::Value(out) => concrete_equals(&out, expected),
-        ConcreteOutcome::Trapped => false,
-    }
+    let out = concrete_run(code, base, a, b).expect("concrete no-trap execution must return");
+    concrete_equals(&out, expected)
 }
 
 // ===========================================================================
@@ -724,18 +807,32 @@ fn divrem_lir_shape_carries_guarded_divide() {
 
 // ===========================================================================
 // TEST 1 — the converter emits a real object whose __text carries a conditional
-// branch (the div-by-zero / overflow guard was lowered, not dropped).
+// branch (the div-by-zero / overflow guard was lowered, not dropped). The one
+// shared LIR `Trap` block is a `BRK` in the bytes (no BL/BLR call), so the
+// refusal controls below exercise the real trap, not a stand-in.
 // ===========================================================================
+
+const VARIANTS: [(bool, bool); 4] = [(false, false), (true, false), (false, true), (true, true)];
 
 #[test]
 fn divrem_emits_object_with_guard_conditional_branch() {
-    for &(signed, rem) in &[(false, false), (true, false), (false, true), (true, true)] {
+    for &(signed, rem) in &VARIANTS {
         let module = make_bridge_divrem_module(signed, rem);
         let (code, base) = emit_text(&module);
         assert!(!code.is_empty(), "emitted __text is empty for div/rem");
         assert!(
             has_conditional_branch(&code, base),
             "expected a conditional branch (guard lowered) for signed={signed} rem={rem}"
+        );
+        assert_eq!(
+            count_opcode(&code, base, &[Opcode::Bl, Opcode::Blr]),
+            0,
+            "div/rem must have no emitted call edge (signed={signed} rem={rem})"
+        );
+        assert_eq!(
+            count_opcode(&code, base, &[Opcode::Brk]),
+            1,
+            "div/rem must retain the one shared trap BRK (signed={signed} rem={rem})"
         );
     }
 }
@@ -744,12 +841,15 @@ fn divrem_emits_object_with_guard_conditional_branch() {
 // TEST 2 — concrete value-differential: the EMITTED BYTES compute the right
 // quotient/remainder on no-trap inputs, including signed truncation toward zero.
 //
-// NOTE on the trap path: the bounded path-merge executor ALWAYS returns the LIVE
-// (non-trapping) arm's value — the b==0 trap arm is the EXCLUDED branch, so the
-// `bytes_value_equals` oracle here only witnesses no-trap arithmetic. That the
-// guard genuinely TRAPS on b==0 is established by TEST 0 (the LIR carries a Brif
-// to a `call abort`/Trap block) + TEST 1 (the emitted __text carries a real
-// conditional branch) + the NON-TRIVIAL no-trap precondition TEST 3 requires.
+// NOTE on the trap path (rewritten: its old premise was the retired `call
+// abort` trap block, which the executor silently excluded as `Trapped`): every
+// input here is in the source no-trap domain, so under these concrete inputs
+// the BRK side of each guard is infeasible and never decoded, and
+// `bytes_value_equals` witnesses no-trap arithmetic only. That the guard
+// genuinely TRAPS on b==0 (and, signed, b==-1) is established directly by
+// `feasible_div_by_zero_and_overflow_traps_remain_brk_refused`, on top of TEST 0
+// (the LIR carries a Brif to a Trap block) and TEST 1 (a real conditional
+// branch and the BRK survive in the emitted __text).
 // ===========================================================================
 
 #[test]
@@ -793,17 +893,19 @@ fn run_proven_output(signed: bool, rem: bool, cs: &[i32]) {
     assert!(bytes_value_equals(&code, base, 7, 2, if rem { 1 } else { 3 }), "value precondition");
 
     for &c in cs {
-        let (machine_out, precondition) = symbolic_machine_output_b_const(&code, base, c)
+        let (machine_out, precondition) = symbolic_machine_output_b_const(&code, base, signed, c)
             .unwrap_or_else(|e| panic!("path-merge failed for c={c}: {e:?}"));
 
-        // The no-trap path must be GUARDED: a vacuously-true precondition would
-        // mean the div-by-zero (and overflow) guard was never explored. Since `c`
-        // is a fixed NON-ZERO, NON-(-1) divisor here, the trap arm is reachable
-        // only symbolically — the executor records the live-arm path condition.
+        // The precondition is now the explicit, independent SOURCE no-trap
+        // domain (it used to be the live-arm condition recorded when the retired
+        // `call abort` arm was excluded). It must never be vacuously `true`.
+        // Since `c` is a fixed NON-ZERO, NON-(-1) divisor, the BRK arm is
+        // UNSAT under it and never decoded; that the guard still traps on a
+        // feasible divisor, and that an inverted guard cannot shrink this
+        // domain, is checked by the refusal controls after TEST 4.
         assert!(
             !matches!(precondition, Formula::Bool(true)),
-            "expected a non-trivial no-trap precondition for c={c}; got `true` \
-             (guard not explored — divide could trap differently than source)"
+            "expected the explicit independent source no-trap domain for c={c}; got `true`"
         );
 
         let spec = divrem_by_const_spec(signed, rem, c);
@@ -854,7 +956,7 @@ fn run_negative_control(signed: bool, rem: bool, cs: &[i32]) {
     assert!(!code.is_empty(), "emitted __text is empty");
 
     for &c in cs {
-        let (machine_out, precondition) = symbolic_machine_output_b_const(&code, base, c)
+        let (machine_out, precondition) = symbolic_machine_output_b_const(&code, base, signed, c)
             .unwrap_or_else(|e| panic!("path-merge failed for c={c}: {e:?}"));
         let wrong = divrem_by_const_plus_one_spec(signed, rem, c);
         let proven = discharge_equal_under(&precondition, &machine_out, &wrong);
@@ -880,6 +982,150 @@ fn negative_control_unsigned_rem_vs_plus_one_is_sat() {
 }
 
 // ===========================================================================
+// REFUSAL AND DOMAIN CONTROLS: the pruning above may omit a BRK only by
+// proving its path impossible. A FEASIBLE trap must still reach the exact,
+// unchanged Semantics refusal; a call is not a trap; the source domain has
+// exact boundaries; and corrupting an emitted guard cannot shrink the domain.
+// ===========================================================================
+
+fn assert_brk_refused(result: Result<Formula, ExecError>) {
+    assert!(
+        matches!(result, Err(ExecError::Decode(ref message))
+        if message.contains("effects Brk")
+        && message.contains("aarch64-brk-debug-trap-not-proof-consumed")),
+        "reachable BRK must remain the exact semantics refusal: {result:?}"
+    );
+}
+
+#[test]
+fn feasible_div_by_zero_and_overflow_traps_remain_brk_refused() {
+    for &(signed, rem) in &VARIANTS {
+        let (code, base) = emit_text(&make_bridge_divrem_module(signed, rem));
+        // Division / remainder by zero is a feasible trap in every variant.
+        assert_brk_refused(concrete_run(&code, base, 7, 0));
+        assert_brk_refused(concrete_run(&code, base, i32::MIN, 0));
+        if signed {
+            // The modeled signed overflow guard traps on b == -1 for any a.
+            assert_brk_refused(concrete_run(&code, base, 7, -1));
+            assert_brk_refused(concrete_run(&code, base, i32::MIN, -1));
+        } else {
+            // Unsigned has no -1 guard: u32::MAX is an ordinary divisor.
+            assert!(
+                bytes_value_equals(&code, base, 7, -1, if rem { 7 } else { 0 }),
+                "unsigned 7 OP u32::MAX must return, not trap (rem={rem})"
+            );
+        }
+    }
+    // A BRK at entry is reachable under every input and stays refused.
+    assert_brk_refused(concrete_run(&0xd4200020u32.to_le_bytes(), 0, 2, 3));
+}
+
+#[test]
+fn symbolic_divisor_prunes_the_brk_only_under_the_full_source_domain() {
+    for &(signed, rem) in &VARIANTS {
+        let (code, base) = emit_text(&make_bridge_divrem_module(signed, rem));
+        // Fully symbolic divisor: the BRK arm is not pruned by a ground literal
+        // here but only because ay proves it UNSAT under the source domain.
+        // (Path merge only; the divide discharge is TEST 5's recorded bound.)
+        symbolic_machine_output(&code, base, signed).unwrap_or_else(|e| {
+            panic!("symbolic-divisor path merge failed (signed={signed} rem={rem}): {e:?}")
+        });
+        // With no domain, b == 0 is feasible and the BRK is reached.
+        assert_brk_refused(Executor::new(&code, base).run(
+            base,
+            MachineState::symbolic(),
+            Vec::new(),
+            0,
+            Formula::Bool(true),
+        ));
+        if signed {
+            // Dropping the b != -1 conjunct leaves the signed overflow BRK
+            // feasible: the second guard is not pruned vacuously either.
+            let state = MachineState::symbolic();
+            let div_by_zero_only = source_no_trap_domain(false, state.read_gpr(1, 32));
+            assert_brk_refused(Executor::new(&code, base).run(
+                base,
+                state,
+                Vec::new(),
+                0,
+                div_by_zero_only,
+            ));
+        }
+    }
+}
+
+#[test]
+fn arbitrary_call_is_not_treated_as_a_trap() {
+    let result = concrete_run(&0x94000000u32.to_le_bytes(), 0, 2, 3);
+    assert!(
+        matches!(result, Err(ExecError::Unsupported(ref message))
+        if message.starts_with("call at ")),
+        "a call is not a proved diverging branch: {result:?}"
+    );
+}
+
+#[test]
+fn independent_no_trap_domain_has_exact_boundaries() {
+    for (signed, b, admitted) in [
+        (false, 0, false),
+        (false, 1, true),
+        (false, -1, true),
+        (false, i32::MIN, true),
+        (false, i32::MAX, true),
+        (true, 0, false),
+        (true, -1, false),
+        (true, 1, true),
+        (true, -2, true),
+        (true, i32::MIN, true),
+        (true, i32::MAX, true),
+    ] {
+        let predicate = source_no_trap_domain(signed, bv32(i128::from(b) & 0xffff_ffff));
+        assert_eq!(path_is_feasible(&predicate).unwrap(), admitted, "signed={signed} b={b}");
+    }
+    // A pinned trapping divisor is an EMPTY domain: refused, never "proven".
+    for (signed, rem, c) in [(false, false, 0), (true, true, 0), (true, false, -1)] {
+        let (code, base) = emit_text(&make_bridge_divrem_module(signed, rem));
+        let result = symbolic_machine_output_b_const(&code, base, signed, c);
+        assert!(
+            matches!(result, Err(ExecError::Unsupported(ref message))
+            if message == "empty input domain"),
+            "a trapping pinned divisor must be refused (signed={signed} c={c}): {result:?}"
+        );
+    }
+}
+
+#[test]
+fn corrupted_guard_cannot_shrink_the_input_domain() {
+    for &(signed, rem) in &VARIANTS {
+        let (code, base) = emit_text(&make_bridge_divrem_module(signed, rem));
+        let guards: Vec<_> = code
+            .chunks_exact(4)
+            .enumerate()
+            .filter_map(|(index, bytes)| {
+                let bytes: [u8; 4] = bytes.try_into().unwrap();
+                (decode_aarch64(&bytes, base + (index * 4) as u64).unwrap().opcode == Opcode::BCond)
+                    .then_some(index * 4)
+            })
+            .collect();
+        assert_eq!(
+            guards.len(),
+            if signed { 2 } else { 1 },
+            "fixture must have one actual B.cond per source guard (signed={signed} rem={rem})"
+        );
+        for offset in guards {
+            // Invert this one guard's condition (bit 0 of the B.cond `cond`).
+            let mut corrupted = code.clone();
+            let word = u32::from_le_bytes(corrupted[offset..offset + 4].try_into().unwrap()) ^ 1;
+            corrupted[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            assert_brk_refused(concrete_run(&corrupted, base, 7, 2));
+            assert_brk_refused(
+                symbolic_machine_output_b_const(&corrupted, base, signed, 2).map(|(out, _)| out),
+            );
+        }
+    }
+}
+
+// ===========================================================================
 // TEST 5 — BOUNDARY MARKER (ignored): the FULLY-symbolic `a OP b` proof. Both
 // operands symbolic 32-bit, so the obligation is a 32x32 divider-equivalence —
 // ay bit-blasts the restoring divider and does NOT converge in practical time.
@@ -899,7 +1145,7 @@ fn full_symbolic_div_proof_is_divider_equivalence_bound() {
     let module = make_bridge_divrem_module(true, false);
     let (code, base) = emit_text(&module);
     let (machine_out, precondition) =
-        symbolic_machine_output(&code, base).expect("path-merge of the div bytes failed");
+        symbolic_machine_output(&code, base, true).expect("path-merge of the div bytes failed");
     assert!(
         !matches!(precondition, Formula::Bool(true)),
         "expected a non-trivial no-trap precondition"

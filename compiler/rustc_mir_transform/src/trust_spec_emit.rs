@@ -70,13 +70,36 @@
 //! object per line, every line self-describing (`"format":
 //! "trust-spec-clean", "v": 2`):
 //!
-//! * `row: "goal"` — one cited-ensures obligation: `def_path`, dense authored
-//!   `contract_index`,
+//! * `row: "goal"` — one kernel-graded ensures obligation: `def_path`, dense
+//!   authored `contract_index`,
 //!   `origin` (`ensures-citation` in-walk / `ensures-citation-deferred`
-//!   post-walk), the authored `clause` text exactly as graded (post-rewrite),
+//!   post-walk / `ensures-island-defeq` for an UNCITED clause that names a
+//!   Clean island definition and is judged by definitional equality — its
+//!   `theorem` slot then reads `defeq:<island def>`, the same referent the
+//!   sealed row authority records), the authored `clause` text exactly as
+//!   graded (post-rewrite),
 //!   the cited `theorem`, `goal_clean` (kernel `Display` of the elaborated
 //!   goal; `null` with `elab_error` set when elaboration refused — the same
-//!   refusal the verdict reports), the `verdict`, and optional `detail`. If the
+//!   refusal the verdict reports), the `verdict`, optional `detail`, and
+//!   `view` — `null` for an ordinary goal, and `"frozen-shared-erased"` when
+//!   the goal's binders name a frozen shared pointee's field VALUES through the
+//!   borrow-erased E6 parameter view, which is graded BELOW `Certified` (owner
+//!   ruling R1, `docs/TCB.md`). Three OR-A1 members follow it (owner ruling
+//!   2026-09-27): `rung` — WHICH goal the row describes, not whether a grade
+//!   ran: `"unconditional"` on every graded-goal row whose `goal_clean` /
+//!   `elab_error` is the unconditional goal `G0` (including a row whose grade
+//!   never ran, e.g. `session-tainted` — its goal is still `G0`),
+//!   `"under-requires"` when it is the CONDITIONAL goal a cited theorem was
+//!   credited on, and `null` only on a preparation-refusal row, where no goal
+//!   was built at all;
+//!   `requires_link` — `null`, or `"kernel-canonical"` / `"allow-listed"` for an
+//!   under-requires row (which reading of the function's own `requires` the
+//!   hypotheses took; both are graded `Trusted`, `docs/TCB.md`'s
+//!   `EnsuresCitationUnderRequiresDischarge` row); `hypotheses` — `null`, or the
+//!   carried hypotheses of an under-requires row in binder order, each
+//!   `{binder, contract_index, canonical, graded}`. Like `view`, the keys are
+//!   written on every goal row, so their PRESENCE marks an artifact written
+//!   after OR-A1 without moving the schema version. If the
 //!   compiler cannot recover either authored or query-owned clause text, the
 //!   row remains counted with null `clause`/`goal_clean` and an explicit
 //!   `clause-outside-fragment` preparation refusal; it is never described as a
@@ -85,9 +108,16 @@
 //!   clause from the compiler query inventory. It carries the dense authored
 //!   `contract_index`, kind/source, canonical clause spelling, the elaborated
 //!   Clean proposition (or an explicit refusal), and the immutable labels
-//!   `authority: "none"`, `verdict: "ungraded"`. It can never mint proof
-//!   authority. Citation-bearing clauses are outside this uncited population;
-//!   cited `ensures` retain their separately graded `goal` rows.
+//!   `authority: "none"`, `verdict: "ungraded"`, plus the same `view` key the
+//!   goal rows carry — a zero-authority row whose binders name a frozen shared
+//!   pointee's field values still rests on owner ruling R1, and a reader
+//!   grepping for `"view"` must not have to know which populations disclose.
+//!   It can never mint proof authority. Citation-bearing clauses are outside this uncited population;
+//!   cited `ensures` retain their separately graded `goal` rows. An uncited
+//!   island-defeq clause is BOTH: it stays in this inventory as a
+//!   zero-authority denotation AND carries an `ensures-island-defeq` goal row
+//!   when the defeq lane graded it — the two populations are sealed with
+//!   independent counts and the reader keys them separately.
 //! * `row: "session"` — the completion seal, written once at the end of
 //!   `trust_ensure_whole_crate_verification`'s enabled path, carrying the
 //!   independent `goals` and `denotations` counts written by this process. The
@@ -220,6 +250,61 @@ fn verdict_fields(
     }
 }
 
+/// Trust (OR-A1, owner ruling 2026-09-27): the disclosure a goal row carries
+/// when its graded goal is a CONDITIONAL one — the cited theorem was credited
+/// on the under-`requires` rung. Built by the compiler from the ladder that
+/// certified it, so the row prints the goal the kernel actually graded (`G1★`
+/// or `G1`) rather than re-elaborating the unconditional one.
+pub struct ConditionalGoalRow {
+    /// `"kernel-canonical"` or `"allow-listed"`
+    /// (`trust_certify::clean_island::RequiresLink::as_str`).
+    pub requires_link: &'static str,
+    /// Kernel `Display` of the conditional goal that certified.
+    pub goal_clean: String,
+    /// The carried hypotheses in BINDER order:
+    /// `(binder, contract_index, canonical text, graded text)`. The graded text
+    /// is the lifted `T_j` on the kernel-canonical link and the canonical text
+    /// itself on the allow-listed one.
+    pub hypotheses: Vec<(usize, u64, String, String)>,
+}
+
+/// The `rung`/`requires_link`/`hypotheses` members of a graded-goal row. They
+/// are written on EVERY goal row so the KEY'S PRESENCE marks a post-OR-A1
+/// artifact (the schema version does not move, exactly as for `view`). `rung`
+/// names the goal `goal_clean` prints — `"unconditional"` for `G0` whether or
+/// not its grade ran (a `session-tainted` row still describes `G0`),
+/// `"under-requires"` for a credited conditional goal. The only `null` rung is
+/// the preparation-refusal row, which builds no goal and writes its members
+/// itself (`record_ensures_citation_preparation_refusal`).
+fn rung_fields(
+    conditional: Option<&ConditionalGoalRow>,
+) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+    match conditional {
+        Some(row) => (
+            serde_json::Value::from("under-requires"),
+            serde_json::Value::from(row.requires_link),
+            serde_json::Value::Array(
+                row.hypotheses
+                    .iter()
+                    .map(|(binder, contract_index, canonical, graded)| {
+                        serde_json::json!({
+                            "binder": binder,
+                            "contract_index": contract_index,
+                            "canonical": canonical,
+                            "graded": graded,
+                        })
+                    })
+                    .collect(),
+            ),
+        ),
+        None => (
+            serde_json::Value::from("unconditional"),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
+    }
+}
+
 /// Publish one kernel-graded cited-ensures goal row.
 ///
 /// Called by the discharge lanes immediately after their
@@ -245,18 +330,44 @@ pub fn record_ensures_citation_goal(
     facets: &trust_spec_elab::FacetTable,
     theorem: &str,
     verdict: &trust_certify::clean_island::CitationVerdict,
+    // Trust (nat-lift §5.6): the clause mode the grade call ran with. "Same
+    // inputs as the grade call" is the property this row's honesty rests on,
+    // and after the nat-lift work the mode is one of those inputs.
+    inputs: &trust_spec_elab::ProofClauseInputs,
+    // Trust (ref-self I1): `Some(marker)` when this goal's binders name a
+    // frozen shared pointee's field VALUES — the borrow-erased E6 PARAMETER
+    // VIEW. The key is written on EVERY goal row (null otherwise), so the
+    // KEY'S PRESENCE — not the schema version, which does not move — is what
+    // distinguishes an artifact written before this increment (no `view` key at
+    // all) from one that disclosed no view (`"view": null`). A row carrying a
+    // marker is graded below `Certified` (owner ruling R1, `docs/TCB.md`).
+    view: Option<&str>,
+    // Trust (OR-A1): `Some` when the grade this row records is a CREDITED
+    // conditional one; the row then prints the conditional goal the kernel
+    // graded, with its link and hypotheses, instead of re-elaborating `G0`.
+    conditional: Option<&ConditionalGoalRow>,
 ) {
     let Some(dir) = spec_emit_destination(tcx) else {
         return;
     };
     // Same session, same entry point, same inputs as the grade call — see the
     // module docs for why this is not the rejected offline re-elaboration and
-    // for the byte-identity controls that pin it.
-    let (goal_clean, elab_error) =
-        match trust_spec_elab::elaborate_ensures(clause, params, self_fn_name, facets) {
-            Ok(goal) => (Some(goal.to_string()), None),
+    // for the byte-identity controls that pin it. A conditional row carries the
+    // goal the ladder RETURNED, which is the swap those docs ask for.
+    let (goal_clean, elab_error) = match conditional {
+        Some(row) => (Some(row.goal_clean.clone()), None),
+        None => match trust_spec_elab::elaborate_ensures_in(
+            clause,
+            params,
+            self_fn_name,
+            facets,
+            inputs,
+        ) {
+            Ok(elaborated) => (Some(elaborated.goal.to_string()), None),
             Err(reason) => (None, Some(reason)),
-        };
+        },
+    };
+    let (rung, requires_link, hypotheses) = rung_fields(conditional);
     let (verdict_tag, detail) = verdict_fields(verdict);
     let row = serde_json::json!({
         "format": SPEC_CLEAN_FORMAT,
@@ -273,6 +384,10 @@ pub fn record_ensures_citation_goal(
         "elab_error": elab_error,
         "verdict": verdict_tag,
         "detail": detail,
+        "view": view,
+        "rung": rung,
+        "requires_link": requires_link,
+        "hypotheses": hypotheses,
     });
     append_row(tcx, &dir, &row);
     GOAL_ROWS_WRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -312,6 +427,12 @@ pub fn record_ensures_citation_preparation_refusal(
         "elab_error": reason,
         "verdict": "clause-outside-fragment",
         "detail": reason,
+        // Trust (ref-self I1): no grade ran, so nothing rests on a view.
+        "view": serde_json::Value::Null,
+        // Trust (OR-A1): no goal was built, so the row describes no rung.
+        "rung": serde_json::Value::Null,
+        "requires_link": serde_json::Value::Null,
+        "hypotheses": serde_json::Value::Null,
     });
     append_row(tcx, &dir, &row);
     GOAL_ROWS_WRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -334,6 +455,16 @@ pub fn record_uncited_contract_denotation(
     source: &str,
     clause: Option<&str>,
     goal: Result<String, String>,
+    // Trust (ref-self I1): this ZERO-AUTHORITY population needs the disclosure
+    // too. A frozen shared parameter contributes `self.<field>` clause binders,
+    // so an uncited `ensures self.x <= 5` on a `&self` method prints an
+    // elaborated proposition whose binders name pointee values at entry — which
+    // rests on owner ruling R1 exactly as a graded row does. The row grants
+    // nothing (`authority: "none"`, `verdict: "ungraded"`), and that is
+    // precisely why the marker must be on it: a reader who greps spec-clean for
+    // `"view"` must not have to know which populations disclose and which do
+    // not.
+    view: Option<&str>,
 ) {
     let Some(dir) = spec_emit_destination(tcx) else {
         return;
@@ -357,6 +488,7 @@ pub fn record_uncited_contract_denotation(
         "elab_error": elab_error,
         "authority": "none",
         "verdict": "ungraded",
+        "view": view,
     });
     append_row(tcx, &dir, &row);
     DENOTATION_ROWS_WRITTEN.fetch_add(1, Ordering::Relaxed);

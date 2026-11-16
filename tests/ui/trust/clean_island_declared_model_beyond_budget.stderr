@@ -1,0 +1,35 @@
+error: finite model `Deep.Counter` is unsafe: the reachable state { x = 600 } breaks invariant `Bounded`. Trust checks every `ScalarModel` an island declares; the kernel evaluates the invariant false in that state and replayed the run to it (below). Fix the model or the system it describes. A model that is unsafe on purpose takes a parameter (`def M (buggy : Nat) : ScalarModel`): a function is not checked until applied.
+  --> $DIR/clean_island_declared_model_beyond_budget.rs:18:5
+   |
+LL |     def Counter : Trust.Temporal.FiniteModel.ScalarModel :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: a shortest run of `Deep.Counter` to the state that breaks `Bounded` (600 steps); the kernel replayed each step:
+          0: (initial)  x = 0
+          1: Step       x = 1
+          2: Step       x = 2
+          3: Step       x = 3
+        ...  (581 steps not shown)
+        585: Step       x = 585
+        586: Step       x = 586
+        587: Step       x = 587
+        588: Step       x = 588
+        589: Step       x = 589
+        590: Step       x = 590
+        591: Step       x = 591
+        592: Step       x = 592
+        593: Step       x = 593
+        594: Step       x = 594
+        595: Step       x = 595
+        596: Step       x = 596
+        597: Step       x = 597
+        598: Step       x = 598
+        599: Step       x = 599
+        600: Step       x = 600
+  --> $DIR/clean_island_declared_model_beyond_budget.rs:18:5
+   |
+LL |     def Counter : Trust.Temporal.FiniteModel.ScalarModel :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+

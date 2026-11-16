@@ -1,0 +1,14 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (refl_u64)
+  --> $DIR/off_naked_ensures.rs:24:5
+   |
+LL |     theorem refl_u64 : forall (x : UInt64), Eq x x := fun x => Eq.refl x
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: citation `refl_u64` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `cited`, with a clean certification audit
+  --> $DIR/off_naked_ensures.rs:34:28
+   |
+LL |     ensures result == x by refl_u64
+   |                            ^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
+

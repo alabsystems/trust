@@ -10,7 +10,7 @@
 
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
-use trust_integration_tests::ay_test_support::{ay_available, require_ay};
+use trust_integration_tests::ay_test_support::require_ay;
 use trust_router::VerificationBackend;
 use trust_types::*;
 
@@ -83,6 +83,7 @@ fn buggy_midpoint_mir() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -182,6 +183,7 @@ fn safe_midpoint_mir() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -218,6 +220,7 @@ fn div_by_variable_mir() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -253,6 +256,7 @@ fn div_by_constant_mir() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -262,10 +266,6 @@ fn div_by_constant_mir() -> VerifiableFunction {
 
 #[test]
 fn test_real_ay_detects_midpoint_overflow() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
     let func = buggy_midpoint_mir();
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -305,10 +305,6 @@ fn test_real_ay_detects_midpoint_overflow() {
 
 #[test]
 fn test_real_ay_proves_constant_division_safe() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
     let func = div_by_constant_mir();
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -331,10 +327,6 @@ fn test_real_ay_proves_constant_division_safe() {
 
 #[test]
 fn test_real_ay_detects_division_by_variable() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
     let func = div_by_variable_mir();
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -366,10 +358,6 @@ fn test_real_ay_detects_division_by_variable() {
 
 #[test]
 fn test_real_ay_full_pipeline_buggy_vs_safe() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
 
     let buggy = buggy_midpoint_mir();
@@ -449,10 +437,6 @@ fn test_real_ay_full_pipeline_buggy_vs_safe() {
 
 #[test]
 fn test_real_ay_direct_overflow_formula() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
 
     let max_val = (1i128 << 64) - 1;
@@ -492,10 +476,6 @@ fn test_real_ay_direct_overflow_formula() {
 
 #[test]
 fn test_real_ay_direct_divzero_constant_safe() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
 
     let formula = Formula::Eq(Box::new(Formula::Int(2)), Box::new(Formula::Int(0)));

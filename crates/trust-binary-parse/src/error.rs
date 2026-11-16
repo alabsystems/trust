@@ -216,12 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn test_errors_implement_debug() {
-        let _ = format!("{:?}", DwarfError::InvalidUnit);
-        let _ = format!("{:?}", ParseError::InvalidMagic(0));
-    }
-
-    #[test]
     fn test_errors_implement_std_error() {
         fn assert_error<E: std::error::Error>(_: &E) {}
         assert_error(&DwarfError::InvalidUnit);

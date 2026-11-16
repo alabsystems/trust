@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 use std::collections::BTreeSet;
 
 use trust_types::fx::FxHashSet;
@@ -9,12 +10,12 @@ use trust_types::{
 
 use super::{
     StmtVersionCtx, VersionCtx, accumulator_bound_init_const, accumulator_init_const,
-    block_def_establish_subsumes_kill,
-    build_semantic_guard_map, flip_matches_kill_stmt, flip_token_distinctness_violations,
-    formula_survives_redefs, generate_full_assert_refutation_vcs, reaching_def_versions,
-    shadow_parity_disagreements, shadow_parity_disagreements_overlap, stmt_writes_name,
-    v2_build_path_definition_map, v2_live_path_defs, v2_may_reassigned_per_block,
-    version_rename_at,
+    block_def_establish_subsumes_kill, build_semantic_guard_map, flip_matches_kill_stmt,
+    flip_token_distinctness_violations, formula_survives_redefs,
+    generate_full_assert_refutation_vcs, reaching_def_versions, shadow_parity_disagreements,
+    shadow_parity_disagreements_overlap, stmt_writes_name, v2_build_path_definition_map,
+    v2_live_path_defs, v2_live_path_defs_at_point, v2_may_reassigned_per_block, version_rename_at,
+    writes_until,
 };
 
 /// `fn(a, b) { let m = if a < b { a } else { b }; if m < 1000 { .. } else { .. } }`
@@ -106,6 +107,7 @@ fn merge_then_guard_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -177,18 +179,22 @@ fn checked_assert_with_cleanup(cleanup: BlockId) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
 fn option_u64_ty() -> Ty {
-    Ty::Adt { arbitrary_precision: None,
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
         adt_kind: None,
         layout: None,
         name: "core::option::Option".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
             ("__v1_0".into(), Ty::u64()),
-        ],
+        ]
+        .into(),
         variants: vec![
             VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
             VariantDef {
@@ -196,7 +202,8 @@ fn option_u64_ty() -> Ty {
                 discriminant: 1,
                 fields: vec![("0".into(), Ty::u64())],
             },
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -237,6 +244,9 @@ fn probe_call_with_cleanup(cleanup: BlockId) -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::option::Option::<T>::is_some",
+                        ),
                         is_foreign: false,
                         unwind: UnwindEdge::Cleanup(cleanup),
                     },
@@ -252,6 +262,7 @@ fn probe_call_with_cleanup(cleanup: BlockId) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -369,6 +380,9 @@ fn overflow_cleanup_asserts_wrapped_result() -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::panicking::panic_fmt",
+                        ),
                         is_foreign: false,
                         unwind: UnwindEdge::Terminate,
                     },
@@ -389,6 +403,7 @@ fn overflow_cleanup_asserts_wrapped_result() -> VerifiableFunction {
         ],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -526,6 +541,7 @@ fn if_without_else_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -630,6 +646,7 @@ fn if_without_else_ancestor_init_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -766,6 +783,7 @@ fn two_chained_skips_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -879,6 +897,7 @@ fn chained_add_chain_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1038,6 +1057,7 @@ fn enum_demux_result_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1072,6 +1092,25 @@ fn enum_construction_demux_routes_payload_to_matching_arm() {
         !err_arm.iter().any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("r@0.0"))),
         "Err arm bb5 must NOT carry the other variant's payload `r@0.0`; got {err_arm:?}"
     );
+}
+
+/// VARIANT-ARM-DUP-EDGE-1 (2026-10-06): the de-mux routes a variant's facts to an arm
+/// only when the arm is the ONLY one of J's switch edges into it. With bb3's switch
+/// `[0: bb4, 1: bb4] otherwise bb5`, bb4 is entered under BOTH tags (the deduplicated
+/// predecessor list still reads `[bb3]`), so `r@0.0 == 10` is false on the `Err` path
+/// and bb4 must receive nothing; bb5 (the `otherwise` edge alone) keeps routing.
+#[test]
+fn enum_construction_demux_routes_nothing_to_an_arm_two_tags_reach() {
+    let mut func = enum_demux_result_fn();
+    let Terminator::SwitchInt { targets, .. } = &mut func.body.blocks[3].terminator else {
+        panic!("bb3 is the discriminant switch");
+    };
+    *targets = vec![(0, BlockId(4)), (1, BlockId(4))];
+    let demux = super::guards::enum_construction_demux_definitions(&func);
+    assert!(demux.get(&BlockId(4)).is_none_or(Vec::is_empty), "bb4: {demux:?}");
+    // Control: the unmutated function routes into bb4 (the gate, not the shape, drops it).
+    let control = super::guards::enum_construction_demux_definitions(&enum_demux_result_fn());
+    assert!(control.get(&BlockId(4)).is_some_and(|f| !f.is_empty()), "control: {control:?}");
 }
 
 /// SOUNDNESS probe: `if flag { Some(a) } else { Some(b) }` — BOTH
@@ -1185,6 +1224,7 @@ fn enum_demux_duplicate_variant_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1354,6 +1394,7 @@ fn enum_demux_guarded_some_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1511,6 +1552,7 @@ fn enum_demux_multipred_some_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1692,6 +1734,7 @@ fn enum_demux_tuple_payload_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1784,6 +1827,7 @@ fn cross_block_stale_cmp_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1856,6 +1900,7 @@ fn sem_stale_blockdef_fn(reassign_lo_in_bb1: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1947,6 +1992,7 @@ fn sem_reseat_havoc_fn(reseat: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -2052,6 +2098,7 @@ fn accumulator_fn_with_arg_count(escape: bool, arg_count: usize) -> VerifiableFu
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -2152,6 +2199,7 @@ fn term_call_dest_fn(call_dest: bool) -> VerifiableFunction {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("make"),
             is_foreign: false,
             func: "make".to_string(),
             args: vec![Operand::Copy(Place::local(1))],
@@ -2194,6 +2242,7 @@ fn term_call_dest_fn(call_dest: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -2245,6 +2294,7 @@ fn term_call_projected_dest_fn() -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("make"),
                         is_foreign: false,
                         func: "make".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -2264,6 +2314,7 @@ fn term_call_projected_dest_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -2347,6 +2398,7 @@ fn projected_call_then_overflow_fn() -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("make"),
                         is_foreign: false,
                         func: "make".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -2384,6 +2436,7 @@ fn projected_call_then_overflow_fn() -> VerifiableFunction {
         )],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -2487,6 +2540,7 @@ fn precond_reassign_fn(reassign_hi_in_bb1: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -2575,6 +2629,7 @@ fn kill_drops_x_fact(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let kill = v2_may_reassigned_per_block(&func);
     let empty = trust_types::fx::FxHashSet::default();
@@ -2598,6 +2653,115 @@ fn assign_x(v: u128) -> Statement {
     }
 }
 
+fn pointer_copy_path_probe(count: u128) -> VerifiableFunction {
+    let raw = |mutable| Ty::RawPtr { mutable, pointee: Box::new(Ty::u32()) };
+    VerifiableFunction {
+        name: "pointer_copy_path_probe".into(),
+        def_path: "test::pointer_copy_path_probe".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                ret_unit(),
+                x_u32(),
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("y".into()) },
+                LocalDecl { index: 3, ty: raw(false), name: Some("src".into()) },
+                LocalDecl { index: 4, ty: raw(true), name: Some("dst".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![assign_x(5)],
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(3),
+                            rvalue: Rvalue::AddressOf(false, Place::local(2)),
+                            span: SourceSpan::default(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(4),
+                            rvalue: Rvalue::AddressOf(true, Place::local(1)),
+                            span: SourceSpan::default(),
+                        },
+                        Statement::CopyNonOverlapping {
+                            src: Operand::Copy(Place::local(3)),
+                            dst: Operand::Copy(Place::local(4)),
+                            count: Operand::Constant(ConstValue::Uint(count, 64)),
+                            elem_ty: Ty::u32(),
+                            span: SourceSpan::default(),
+                        },
+                    ],
+                    terminator: Terminator::Goto(BlockId(2)),
+                },
+                BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+#[test]
+fn pointer_copy_kills_path_facts_at_the_copy_and_in_successors() {
+    let func = pointer_copy_path_probe(1);
+    let block = &func.body.blocks[1];
+    let fact =
+        Formula::Eq(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(5)));
+
+    assert!(!writes_until(&func, block, 2).contains("x"));
+    assert!(writes_until(&func, block, 3).contains("x"));
+    assert!(stmt_writes_name(&func, block, 2, "x"));
+    assert_eq!(v2_live_path_defs_at_point(&func, block, &[fact.clone()], 2).len(), 1);
+    assert!(v2_live_path_defs(&func, block, &[fact]).is_empty());
+
+    let versions = StmtVersionCtx::build(&func);
+    assert_ne!(
+        versions.version_token_at(&func, BlockId(1), 2, "x"),
+        versions.version_token_at(&func, BlockId(1), 3, "x"),
+    );
+    let map = v2_build_path_definition_map(&func);
+    assert!(defines(&map[&BlockId(1)], "x"));
+    assert!(!defines(&map[&BlockId(2)], "x"));
+}
+
+#[test]
+fn zero_count_pointer_copy_preserves_path_facts() {
+    let func = pointer_copy_path_probe(0);
+    let block = &func.body.blocks[1];
+    assert!(!stmt_writes_name(&func, block, 2, "x"));
+    assert!(!writes_until(&func, block, 3).contains("x"));
+    let versions = StmtVersionCtx::build(&func);
+    assert_eq!(
+        versions.version_token_at(&func, BlockId(1), 2, "x"),
+        versions.version_token_at(&func, BlockId(1), 3, "x"),
+    );
+    let map = v2_build_path_definition_map(&func);
+    assert!(defines(&map[&BlockId(2)], "x"));
+}
+
+#[test]
+fn pointer_copy_clobbers_an_earlier_same_block_definition() {
+    let mut func = pointer_copy_path_probe(1);
+    func.body.blocks[0].stmts.clear();
+    func.body.blocks[1].stmts.insert(0, assign_x(5));
+    let block = &func.body.blocks[1];
+    let before = crate::guards::extract_block_definitions_until(&func, block, 3);
+    let after = crate::guards::extract_block_definitions_until(&func, block, 4);
+    assert!(defines(&before, "x"));
+    assert!(!defines(&after, "x"));
+    let map = v2_build_path_definition_map(&func);
+    assert!(!defines(&map[&BlockId(2)], "x"));
+}
+
 #[test]
 fn kill_oracle_covers_whole_local_store() {
     assert!(
@@ -2614,10 +2778,14 @@ fn kill_oracle_covers_whole_local_store() {
 fn kill_oracle_covers_set_discriminant() {
     let x = LocalDecl {
         index: 1,
-        ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-            variants: Vec::new(),
+        ty: Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
             name: "E".into(),
-            fields: vec![("__tag".into(), Ty::i64())],
+            fields: vec![("__tag".into(), Ty::i64())].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -2651,6 +2819,7 @@ fn kill_oracle_covers_call_dest_and_mut_arg() {
                 atomic: None,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("f"),
                 is_foreign: false,
             },
         ),
@@ -2680,6 +2849,7 @@ fn kill_oracle_covers_call_dest_and_mut_arg() {
                 atomic: None,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("f"),
                 is_foreign: false,
             },
         ),
@@ -2844,12 +3014,24 @@ fn kill_oracle_channel_coverage_report() {
     //                     `terminator_def_names` now havocs at `Drop` exactly
     //                     like a Call (mut-borrowed + mut-pointer locals + the
     //                     dropped place + its deref-extension).
-    //   - opaque/asm (false): with NO mut-borrowed/mut-pointer local there is no
-    //                     modeled mutation channel to a bare scalar; inline asm
-    //                     itself lowers to `InlineAsm` → `UnsupportedMir` → the
-    //                     function is not certified (e2e: asm_out → `[unknown]`).
-    //                     (When such locals DO exist, the new `Opaque` havoc arm
-    //                     kills them — not visible to this bare-scalar fixture.)
+    //   - opaque/asm (TRUE, locked 2026-10-08 — H3 OPAQUE-ASM-OUTPUT): the OLD
+    //                     adjudication ("with no mut-borrowed/mut-pointer local
+    //                     there is no modeled mutation channel to a bare scalar;
+    //                     the asm's `UnsupportedMir` row keeps the function
+    //                     uncertified") was DISPROVED by live per-row false
+    //                     proofs: the extraction DROPS an asm's operands, so
+    //                     `inout(reg) x` IS a channel to the bare scalar, and the
+    //                     function-level Unknown row did not stop
+    //                     `let mut k = n & 3; asm!(.., inout(reg) k); t[k]` from
+    //                     being PROVED and `certify_vc`-certified at -O0/-O1
+    //                     (`tests/ploss_adv_false_proofs_realmir.rs`, `h3_*`).
+    //                     `terminator_def_names_structured` now writes EVERY local
+    //                     at a terminator `Terminator::place_writes` calls
+    //                     `Unlocatable` (the `Opaque`).
+    //                     Independently measured by local review round 118
+    //                     (2026-10-10): `100 / x` after `inout(reg) x`
+    //                     (tests/review115_false_proofs_realmir.rs
+    //                     `an_inline_asm_output_forgets_what_it_may_write`).
     //   - intrinsic ptr (false): a write through a pointer needs a `&mut x`/
     //                     `&raw mut x` escape (killed) and the raw-pointer op
     //                     fails closed (`hardened_unsafe_operation`).
@@ -2857,7 +3039,7 @@ fn kill_oracle_channel_coverage_report() {
     // precision/soundness gain to lock; a flip whose backstop also weakens is a
     // hole to fix.
     assert!(
-        deinit && drop_term && !opaque && !intrinsic,
+        deinit && drop_term && opaque && !intrinsic,
         "a residual kill-channel changed coverage; re-adjudicate the backstop \
          before locking: deinit={deinit} drop={drop_term} opaque={opaque} intrinsic={intrinsic}"
     );
@@ -2908,6 +3090,7 @@ fn write_completeness_lemma_holds_for_captured_channels() {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         // Overlap-aware (the oracle's real semantics): a write to any name
         // overlapping `x` invalidates a fact about `x`.
@@ -2947,6 +3130,7 @@ fn write_completeness_lemma_holds_for_captured_channels() {
             atomic: None,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("f"),
             is_foreign: false,
         }
         .write_effect(),
@@ -3103,6 +3287,7 @@ fn freshness_theorem_holds_on_loop_carried_counter() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     // `i` is killed at the header (back-edge) — freshness must give it a
     // non-entry version there, proving the loop case is closeable by versioning.
@@ -3197,6 +3382,7 @@ fn chain_fn(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -3388,6 +3574,7 @@ fn overlap_aware_query_closes_projection_gap() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     // Whole-`s` write: a fact about `s.0` must be version-stale at bb1.
     let whole = write_whole_s(vec![]);
@@ -3465,6 +3652,7 @@ fn read_before_same_block_write() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -3528,6 +3716,7 @@ fn intra_block_battery() -> Vec<trust_types::VerifiableFunction> {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let asn = |l: usize, v: u128| Statement::Assign {
         place: Place::local(l),
@@ -3721,6 +3910,7 @@ fn pa_two_same_block_writes_get_distinct_tokens() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let sv = StmtVersionCtx::build(&func);
     let t1 = sv.version_token_at(&func, BlockId(0), 1, "x");
@@ -3778,6 +3968,7 @@ fn stmt_oracle_versions_after_a_prior_write() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let sv = StmtVersionCtx::build(&func);
     // The read at stmt1 is AFTER the write at stmt0 → `x` is versioned there.
@@ -3850,7 +4041,9 @@ fn two_field_store_fn(kind: Option<trust_types::AdtKind>) -> VerifiableFunction 
             layout,
             enum_layout,
             ..
-        } => Ty::Adt { arbitrary_precision: None,
+        } => Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
             name,
             fields,
             variants,
@@ -3893,6 +4086,7 @@ fn two_field_store_fn(kind: Option<trust_types::AdtKind>) -> VerifiableFunction 
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -3997,5 +4191,284 @@ fn store_through_one_pointer_still_havocs_another() {
         stmt_writes_name(&f, bb, 1, "self*.0"),
         "a store through `q` may alias `self`'s pointee and MUST still havoc it; \
          subtracting anything but the STORING pointer's own tree would be unsound"
+    );
+}
+
+/// Trust (triage ticket 216): a `SetDiscriminant` whose declared discriminant the
+/// tag field cannot hold (`B = 4096` in an `i8` tag) is refused by
+/// `set_discriminant_definitions`, which then defines nothing. The write still
+/// happens, so it must still kill the synthetic names the definitions would
+/// have defined: `discr_e` is not a projection of `e`, and before the write
+/// oracle named it a stale block-entry fact `discr_e == 5` survived the write.
+#[test]
+fn refused_set_discriminant_still_kills_the_discr_and_tag_names() {
+    let enum_ty = Ty::Adt {
+        adt_kind: Some(trust_types::AdtKind::Enum),
+        layout: None,
+        name: "Narrow".into(),
+        fields: vec![("__tag".to_string(), Ty::Int { width: 8, signed: true })].into(),
+        variants: vec![
+            VariantDef { name: "A".into(), discriminant: 5, fields: vec![] },
+            VariantDef { name: "B".into(), discriminant: 4096, fields: vec![] },
+        ]
+        .into(),
+        disc_index_safe: true,
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
+    let func = VerifiableFunction {
+        name: "refused_set_discriminant".into(),
+        def_path: "test::refused_set_discriminant".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: enum_ty, name: Some("e".into()) },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::SetDiscriminant {
+                    place: Place::local(1),
+                    variant_index: 1,
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    };
+    let block = &func.body.blocks[0];
+    assert!(
+        super::set_discriminant_definitions(&func, &Place::local(1), 1).is_err(),
+        "the regime under test: the definitions are refused"
+    );
+
+    let discr = crate::discriminant_formula_var_name("e");
+    let kill = super::block_entry_fact_kill_names(&func, block);
+    assert!(kill.contains(&discr), "the refused write kills `{discr}`: {kill:?}");
+    assert!(kill.contains("e.0"), "and the tag field: {kill:?}");
+    let mut direct = FxHashSet::default();
+    super::stmt_direct_write_names(&func, &block.stmts[0], &mut direct);
+    assert!(direct.contains(&discr) && direct.contains("e.0"), "{direct:?}");
+
+    let stale = Formula::Eq(Box::new(Formula::Var(discr, Sort::Int)), Box::new(Formula::Int(5)));
+    assert!(
+        v2_live_path_defs(&func, block, &[stale]).is_empty(),
+        "a block-entry `discr_e == 5` must not survive the write"
+    );
+    let unrelated =
+        Formula::Eq(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(5)));
+    assert_eq!(
+        v2_live_path_defs(&func, block, std::slice::from_ref(&unrelated)),
+        vec![unrelated],
+        "a fact about a name the write does not touch survives (the kill is not everything)"
+    );
+}
+
+/// THE ESTABLISH POINT OF A STORE THROUGH A POINTER (`def_subject_establish_stmt`).
+/// `fn(m: *mut usize) { let i = *m; *m = usize::MAX; }`: the store's def `m* ==
+/// usize::MAX` is established by the store itself, so the threaded fact carries the
+/// post-store token and is name-disjoint from the bare pre-store read `i == m*`.
+/// Every establish search used to be keyed on the subject's BASE `m`, which a store
+/// through `m` never writes: the def stayed bare and shared its symbol with the
+/// pre-store read, and `if *m < s.len() { *m = usize::MAX; s[*m] }` was
+/// kernel-certified PROVED (tests/opaque_deref_store_reseat.rs, the store-establish
+/// section). The borrow `x = &y` still establishes the referent def `x* == y`.
+#[test]
+fn a_store_through_a_pointer_establishes_its_own_def() {
+    let usize_ty = Ty::Int { width: 64, signed: false };
+    let raw = Ty::RawPtr { mutable: true, pointee: Box::new(usize_ty.clone()) };
+    let deref = |l: usize| Place { local: l, projections: vec![Projection::Deref] };
+    let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+        place,
+        rvalue,
+        span: SourceSpan::default(),
+    };
+    let func = VerifiableFunction {
+        name: "store_through".into(),
+        def_path: "test::store_through".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: raw.clone(), name: Some("m".into()) },
+                LocalDecl { index: 2, ty: usize_ty.clone(), name: Some("i".into()) },
+                LocalDecl { index: 3, ty: usize_ty.clone(), name: Some("y".into()) },
+                LocalDecl {
+                    index: 4,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(usize_ty.clone()) },
+                    name: Some("x".into()),
+                },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    assign(Place::local(2), Rvalue::Use(Operand::Copy(deref(1)))),
+                    assign(
+                        deref(1),
+                        Rvalue::Use(Operand::Constant(ConstValue::Uint(u64::MAX as u128, 64))),
+                    ),
+                    assign(
+                        Place::local(3),
+                        Rvalue::Use(Operand::Constant(ConstValue::Uint(7, 64))),
+                    ),
+                    assign(Place::local(4), Rvalue::Ref { mutable: false, place: Place::local(3) }),
+                ],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    };
+    let block = &func.body.blocks[0];
+    let m_star = crate::place_to_var_name(&func, &deref(1));
+    let m = crate::place_to_var_name(&func, &Place::local(1));
+    assert_eq!(
+        super::def_subject_establish_stmt(&func, block, &m_star, 2),
+        Some(1),
+        "the store `*m = MAX` establishes `{m_star}`"
+    );
+    assert_eq!(
+        super::block_def_establish_stmt(&func, block, &m, 2),
+        None,
+        "the base `{m}` is never written: keyed on it, the store had no establish point"
+    );
+    // A deref subject is also established by an ANCESTOR write, the borrow `x = &..`
+    // of its base (spelled here directly: `place_to_var_name` folds this `*x` onto
+    // `y`, whose own def establishes it).
+    let x_star = format!("{}*", crate::place_to_var_name(&func, &Place::local(4)));
+    assert_eq!(
+        super::def_subject_establish_stmt(&func, block, &x_star, 4),
+        Some(3),
+        "the borrow `x = &y` still establishes a def about `{x_star}`"
+    );
+    // The threaded def carries a version token, so it cannot be the bare `m*` the
+    // pre-store read `i == m*` names.
+    let sv = super::stmt_versions_for(&func);
+    let def = Formula::Eq(
+        Box::new(Formula::Var(m_star.clone().into(), Sort::Int)),
+        Box::new(Formula::Int(u64::MAX as i128)),
+    );
+    let versioned = super::version_block_def_at_establish(&sv, &func, block, 2, def);
+    let Formula::Eq(lhs, _) = &versioned else { panic!("{versioned:?}") };
+    let Formula::Var(name, _) = &**lhs else { panic!("{versioned:?}") };
+    assert!(
+        name.as_str().starts_with(&format!("{m_star}#")),
+        "the store's def must carry its establish token, not the bare `{m_star}`: {versioned:?}"
+    );
+}
+
+#[test]
+fn ordered_duplicate_seed_survives_base_edges_and_mixed_success_join() {
+    let first = Formula::Eq(Box::new(Formula::Int(1)), Box::new(Formula::Int(1)));
+    let second = Formula::Eq(Box::new(Formula::Int(2)), Box::new(Formula::Int(2)));
+    let seed = vec![first.clone(), second, first];
+    for (mut func, success_name) in [
+        (checked_assert_with_cleanup(BlockId(2)), "checked.0"),
+        (probe_call_with_cleanup(BlockId(2)), "g"),
+    ] {
+        // Both distinct outcomes cross a base-only Goto before their mixed join.
+        // The join then transports the same facts over both SwitchInt edges.
+        for block in &mut func.body.blocks[1..=2] {
+            block.terminator = Terminator::Goto(BlockId(3));
+        }
+        func.body.blocks.extend([
+            BasicBlock {
+                id: BlockId(3),
+                stmts: vec![],
+                terminator: Terminator::SwitchInt {
+                    discr: Operand::Constant(ConstValue::Int(0)),
+                    targets: vec![(0, BlockId(4))],
+                    otherwise: BlockId(5),
+                    exhaustive_enum_unreachable: false,
+                    span: SourceSpan::default(),
+                },
+            },
+            BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Return },
+            BasicBlock { id: BlockId(5), stmts: vec![], terminator: Terminator::Return },
+        ]);
+        let seeds = [(BlockId(0), seed.clone())].into_iter().collect();
+        let map = super::path_defs::v2_path_def_fixpoint(&func, &seeds);
+        for block in 1..=5 {
+            let facts = map.get(&BlockId(block)).expect("all successor blocks reached");
+            assert_eq!(facts.get(..seed.len()), Some(seed.as_slice()), "{} bb{block}", func.name);
+            assert_eq!(mentions(facts, success_name), block == 1, "{} bb{block}", func.name);
+        }
+    }
+}
+
+#[test]
+fn goto_backedge_shrinks_entry_facts_without_reordering_duplicates() {
+    let stable = Formula::Eq(Box::new(Formula::Int(1)), Box::new(Formula::Int(1)));
+    let stale =
+        Formula::Eq(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(1)));
+    let mut func = merge_then_guard_fn();
+    func.name = "goto_backedge_duplicate_seed".into();
+    func.def_path = "test::goto_backedge_duplicate_seed".into();
+    func.body.locals = vec![
+        LocalDecl { index: 0, ty: Ty::Unit, name: Some("ret".into()) },
+        LocalDecl { index: 1, ty: Ty::u32(), name: Some("x".into()) },
+        LocalDecl { index: 2, ty: Ty::Bool, name: Some("cond".into()) },
+    ];
+    func.body.return_ty = Ty::Unit;
+    func.preconditions = vec![stale.clone()];
+    func.body.blocks = vec![
+        BasicBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Goto(BlockId(1)) },
+        BasicBlock {
+            id: BlockId(1),
+            stmts: vec![],
+            terminator: Terminator::SwitchInt {
+                discr: Operand::Copy(Place::local(2)),
+                targets: vec![(0, BlockId(2))],
+                otherwise: BlockId(4),
+                exhaustive_enum_unreachable: false,
+                span: SourceSpan::default(),
+            },
+        },
+        BasicBlock {
+            id: BlockId(2),
+            stmts: vec![Statement::Assign {
+                place: Place::local(1),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(2))),
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::Goto(BlockId(3)),
+        },
+        BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Goto(BlockId(1)) },
+        BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Goto(BlockId(5)) },
+        BasicBlock { id: BlockId(5), stmts: vec![], terminator: Terminator::Return },
+    ];
+    let seed = vec![stable.clone(), stale, stable.clone()];
+    let map =
+        super::path_defs::v2_path_def_fixpoint(&func, &[(BlockId(0), seed)].into_iter().collect());
+    assert_eq!(map.len(), 6, "every block must be reached, including the backedge bridge");
+    assert!(map[&BlockId(0)].is_empty(), "seeds belong to outflow, not pure incoming facts");
+    for block in [1, 2, 4, 5] {
+        assert_eq!(
+            map[&BlockId(block)],
+            vec![stable.clone(), stable.clone()],
+            "the loop shrinks away x == 1 before facts cross the exit Goto: bb{block}"
+        );
+    }
+    let written =
+        Formula::Eq(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(2)));
+    assert_eq!(
+        map[&BlockId(3)],
+        vec![stable.clone(), stable, written],
+        "the body Goto carries its newly established fact after the ordered duplicate prefix"
     );
 }

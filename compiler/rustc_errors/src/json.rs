@@ -37,6 +37,25 @@ use crate::{CodeSuggestion, MultiSpan, SpanLabel, Subdiag, Suggestions, Terminal
 #[cfg(test)]
 mod tests;
 
+/// Trust: (TRANSPORT-LINE-BUDGET-1) the code (`IsLint` name) trustc's verification
+/// transport note carries; the same string as `trust_types::TRANSPORT_DIAGNOSTIC_CODE`,
+/// which `rustc_mir_transform` asserts at compile time.
+pub const TRUST_TRANSPORT_DIAGNOSTIC_CODE: &str = "trust_verification_transport_v1";
+
+/// Trust: (TRANSPORT-LINE-BUDGET-1) the `rendered` text of a verification transport
+/// note, in place of a second copy of its (possibly tens of megabytes) message.
+pub const TRUST_TRANSPORT_RENDERED: &str = concat!(
+    "note: Trust verification transport ",
+    "(its machine-readable payload is this diagnostic's `message`)\n\n",
+);
+
+/// Trust: (TRANSPORT-LINE-BUDGET-1) whether `diag` is a verification transport note: a
+/// `note` whose code is [`TRUST_TRANSPORT_DIAGNOSTIC_CODE`].
+fn is_trust_transport_note(diag: &crate::DiagInner) -> bool {
+    diag.level == crate::Level::Note
+        && diag.is_lint.as_ref().is_some_and(|lint| lint.name == TRUST_TRANSPORT_DIAGNOSTIC_CODE)
+}
+
 #[derive(Setters)]
 pub struct JsonEmitter {
     #[setters(skip)]
@@ -136,20 +155,8 @@ impl Emitter for JsonEmitter {
     fn emit_future_breakage_report(&mut self, diags: Vec<crate::DiagInner>) {
         let data: Vec<FutureBreakageItem<'_>> = diags
             .into_iter()
-            .map(|mut diag| {
-                // Allowed or expected lints don't normally (by definition) emit a lint
-                // but future incompat lints are special and are emitted anyway.
-                //
-                // So to avoid ICEs and confused users we "upgrade" the lint level for
-                // those `FutureBreakageItem` to warn.
-                if matches!(diag.level, crate::Level::Allow | crate::Level::Expect) {
-                    diag.level = crate::Level::Warning;
-                }
-                FutureBreakageItem {
-                    diagnostic: EmitTyped::Diagnostic(Diagnostic::from_errors_diagnostic(
-                        diag, self,
-                    )),
-                }
+            .map(|diag| FutureBreakageItem {
+                diagnostic: EmitTyped::Diagnostic(Diagnostic::from_errors_diagnostic(diag, self)),
             })
             .collect();
         let report = FutureIncompatReport { future_incompat_report: data };
@@ -297,7 +304,7 @@ struct UnusedExterns<'a> {
 
 impl Diagnostic {
     /// Converts from `rustc_errors::DiagInner` to `Diagnostic`.
-    fn from_errors_diagnostic(diag: crate::DiagInner, je: &JsonEmitter) -> Diagnostic {
+    fn from_errors_diagnostic(mut diag: crate::DiagInner, je: &JsonEmitter) -> Diagnostic {
         let sugg_to_diag = |sugg: &CodeSuggestion| {
             let formatted_message = format_diag_message(&sugg.msg, &diag.args);
             Diagnostic {
@@ -356,6 +363,29 @@ impl Diagnostic {
                 Diagnostic::from_sub_diagnostic(&diag.emitted_at_sub_diag(), &diag.args, je),
             );
         }
+        // Trust: (TRANSPORT-LINE-BUDGET-1) a verification transport note's `message` is one
+        // function's machine-readable report, which can run to tens of megabytes. Rendering
+        // it too wrote every byte of it twice on the one line (once in `message`, once in
+        // `rendered`), which is half of what pushed a line past targo's per-line cap. Its
+        // consumer reads only `message`; `rendered` says what the diagnostic is, so a
+        // human-format Cargo still prints one short line.
+        if is_trust_transport_note(&diag) {
+            return Diagnostic {
+                message: formatted_message,
+                code,
+                level,
+                spans,
+                children,
+                rendered: Some(TRUST_TRANSPORT_RENDERED.to_string()),
+            };
+        }
+        // Trust: machine payloads retain their full structured message above,
+        // without copying it into the human rendering a second time. Keep a
+        // rendered string for Cargo, whose diagnostic handling requires one.
+        if let Some(message) = diag.json_rendered_message.take() {
+            diag.messages = vec![(message, crate::Style::NoStyle)];
+        }
+
         let buf = BufWriter(Arc::new(Mutex::new(Vec::new())));
         let dst: Destination = AutoStream::new(
             Box::new(buf.clone()),
@@ -379,20 +409,13 @@ impl Diagnostic {
         let buf = Arc::try_unwrap(buf.0).unwrap().into_inner().unwrap();
         let buf = String::from_utf8(buf).unwrap();
 
-        Diagnostic {
-            message: formatted_message.to_string(),
-            code,
-            level,
-            spans,
-            children,
-            rendered: Some(buf),
-        }
+        Diagnostic { message: formatted_message, code, level, spans, children, rendered: Some(buf) }
     }
 
     fn from_sub_diagnostic(subdiag: &Subdiag, args: &DiagArgMap, je: &JsonEmitter) -> Diagnostic {
         let formatted_message = format_diag_messages(&subdiag.messages, args);
         Diagnostic {
-            message: formatted_message.to_string(),
+            message: formatted_message,
             code: None,
             level: subdiag.level.to_str(),
             spans: DiagnosticSpan::from_multispan(&subdiag.span, args, je),

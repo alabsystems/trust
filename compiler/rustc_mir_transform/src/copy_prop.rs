@@ -6,6 +6,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::{Analysis, ResultsCursor};
 use tracing::{debug, instrument};
 
+use crate::PassPolicy;
 use crate::ssa::{MaybeUninitializedLocals, SsaLocals};
 
 /// Unify locals that copy each other.
@@ -21,8 +22,8 @@ use crate::ssa::{MaybeUninitializedLocals, SsaLocals};
 pub(super) struct CopyProp;
 
 impl<'tcx> crate::MirPass<'tcx> for CopyProp {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 1
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 1)
     }
 
     #[instrument(level = "trace", skip(self, tcx, body))]
@@ -35,20 +36,18 @@ impl<'tcx> crate::MirPass<'tcx> for CopyProp {
         debug!(borrowed_locals = ?ssa.borrowed_locals());
         debug!(copy_classes = ?ssa.copy_classes());
 
-        let mut any_replacement = false;
+        if !ssa.has_copy_classes() {
+            return;
+        }
+
         // Locals that participate in copy propagation either as a source or a destination.
         let mut unified = DenseBitSet::new_empty(body.local_decls.len());
 
         for (local, &head) in ssa.copy_classes().iter_enumerated() {
             if local != head {
-                any_replacement = true;
                 unified.insert(head);
                 unified.insert(local);
             }
-        }
-
-        if !any_replacement {
-            return;
         }
 
         // When emitting storage statements, we want to retain the head locals' storage statements,
@@ -94,10 +93,6 @@ impl<'tcx> crate::MirPass<'tcx> for CopyProp {
             .visit_body_preserves_cfg(body);
 
         crate::simplify::remove_unused_definitions(body);
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 

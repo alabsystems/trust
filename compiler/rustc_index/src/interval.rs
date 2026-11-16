@@ -1,6 +1,7 @@
 use std::iter::Step;
 use std::marker::PhantomData;
-use std::ops::{Bound, Range, RangeBounds};
+use std::ops::{Bound, RangeBounds};
+use std::range::RangeInclusive;
 
 use smallvec::SmallVec;
 
@@ -24,7 +25,7 @@ pub struct IntervalSet<I> {
 }
 
 #[inline]
-fn inclusive_start<T: Idx>(range: impl RangeBounds<T>) -> u32 {
+fn inclusive_start<T: Idx>(range: &impl RangeBounds<T>) -> u32 {
     match range.start_bound() {
         Bound::Included(start) => start.index() as u32,
         Bound::Excluded(start) => start.index() as u32 + 1,
@@ -33,7 +34,7 @@ fn inclusive_start<T: Idx>(range: impl RangeBounds<T>) -> u32 {
 }
 
 #[inline]
-fn inclusive_end<T: Idx>(domain: usize, range: impl RangeBounds<T>) -> Option<u32> {
+fn inclusive_end<T: Idx>(domain: usize, range: &impl RangeBounds<T>) -> Option<u32> {
     let end = match range.end_bound() {
         Bound::Included(end) => end.index() as u32,
         Bound::Excluded(end) => end.index().checked_sub(1)? as u32,
@@ -59,11 +60,14 @@ impl<I: Idx> IntervalSet<I> {
     }
 
     /// Iterates through intervals stored in the set, in order.
-    pub fn iter_intervals(&self) -> impl Iterator<Item = std::ops::Range<I>>
+    pub fn iter_intervals(&self) -> impl Iterator<Item = RangeInclusive<I>>
     where
         I: Step,
     {
-        self.map.iter().map(|&(start, end)| I::new(start as usize)..I::new(end as usize + 1))
+        self.map.iter().map(|&(start, end)| RangeInclusive {
+            start: I::new(start as usize),
+            last: I::new(end as usize),
+        })
     }
 
     /// Returns true if we increased the number of elements present.
@@ -72,9 +76,9 @@ impl<I: Idx> IntervalSet<I> {
     }
 
     /// Returns true if we increased the number of elements present.
-    pub fn insert_range(&mut self, range: impl RangeBounds<I> + Clone) -> bool {
-        let start = inclusive_start(range.clone());
-        let Some(end) = inclusive_end(self.domain, range) else {
+    pub fn insert_range(&mut self, range: impl RangeBounds<I>) -> bool {
+        let start = inclusive_start(&range);
+        let Some(end) = inclusive_end(self.domain, &range) else {
             // empty range
             return false;
         };
@@ -166,9 +170,9 @@ impl<I: Idx> IntervalSet<I> {
 
     /// Specialized version of `insert_range` when we know that the inserted point is *after* any
     /// contained.
-    pub fn append_range(&mut self, range: impl RangeBounds<I> + Clone) {
-        let start = inclusive_start(range.clone());
-        let Some(end) = inclusive_end(self.domain, range) else {
+    pub fn append_range(&mut self, range: impl RangeBounds<I>) {
+        let start = inclusive_start(&range);
+        let Some(end) = inclusive_end(self.domain, &range) else {
             // empty range
             return;
         };
@@ -204,17 +208,38 @@ impl<I: Idx> IntervalSet<I> {
         needle <= *prev_end
     }
 
+    /// Returns whether any point in `range` is contained in the set.
+    pub fn intersects_range(&self, range: impl RangeBounds<I>) -> bool {
+        let start = inclusive_start(&range);
+        let Some(end) = inclusive_end(self.domain, &range) else {
+            // empty range
+            return false;
+        };
+        if start > end {
+            return false;
+        }
+
+        // Find the last interval whose start is <= end.
+        let Some(last) = self.map.partition_point(|r| r.0 <= end).checked_sub(1) else {
+            // All ranges in the map start after the new range's end
+            return false;
+        };
+        let (_, prev_end) = &self.map[last];
+        start <= *prev_end
+    }
+
     pub fn superset(&self, other: &IntervalSet<I>) -> bool
     where
         I: Step,
     {
         let mut sup_iter = self.iter_intervals();
         let mut current = None;
-        let contains = |sup: Range<I>, sub: Range<I>, current: &mut Option<Range<I>>| {
-            if sup.end < sub.start {
-                // if `sup.end == sub.start`, the next sup doesn't contain `sub.start`
+        let contains = |sup: RangeInclusive<I>,
+                        sub: RangeInclusive<I>,
+                        current: &mut Option<RangeInclusive<I>>| {
+            if sup.last < sub.start {
                 None // continue to the next sup
-            } else if sup.end >= sub.end && sup.start <= sub.start {
+            } else if sup.last >= sub.last && sup.start <= sub.start {
                 *current = Some(sup); // save the current sup
                 Some(true)
             } else {
@@ -224,8 +249,8 @@ impl<I: Idx> IntervalSet<I> {
         other.iter_intervals().all(|sub| {
             current
                 .take()
-                .and_then(|sup| contains(sup, sub.clone(), &mut current))
-                .or_else(|| sup_iter.find_map(|sup| contains(sup, sub.clone(), &mut current)))
+                .and_then(|sup| contains(sup, sub, &mut current))
+                .or_else(|| sup_iter.find_map(|sup| contains(sup, sub, &mut current)))
                 .unwrap_or(false)
         })
     }
@@ -242,11 +267,11 @@ impl<I: Idx> IntervalSet<I> {
             let mut other_current = other_iter.next()?;
 
             loop {
-                if self_current.end <= other_current.start {
+                if self_current.last < other_current.start {
                     self_current = self_iter.next()?;
                     continue;
                 }
-                if other_current.end <= self_current.start {
+                if other_current.last < self_current.start {
                     other_current = other_iter.next()?;
                     continue;
                 }
@@ -261,9 +286,9 @@ impl<I: Idx> IntervalSet<I> {
     }
 
     /// Equivalent to `range.iter().find(|i| !self.contains(i))`.
-    pub fn first_unset_in(&self, range: impl RangeBounds<I> + Clone) -> Option<I> {
-        let start = inclusive_start(range.clone());
-        let Some(end) = inclusive_end(self.domain, range) else {
+    pub fn first_unset_in(&self, range: impl RangeBounds<I>) -> Option<I> {
+        let start = inclusive_start(&range);
+        let Some(end) = inclusive_end(self.domain, &range) else {
             // empty range
             return None;
         };
@@ -285,9 +310,9 @@ impl<I: Idx> IntervalSet<I> {
     }
 
     /// Returns the maximum (last) element present in the set from `range`.
-    pub fn last_set_in(&self, range: impl RangeBounds<I> + Clone) -> Option<I> {
-        let start = inclusive_start(range.clone());
-        let Some(end) = inclusive_end(self.domain, range) else {
+    pub fn last_set_in(&self, range: impl RangeBounds<I>) -> Option<I> {
+        let start = inclusive_start(&range);
+        let Some(end) = inclusive_end(self.domain, &range) else {
             // empty range
             return None;
         };
@@ -374,6 +399,12 @@ impl<R: Idx, C: Step + Idx> SparseIntervalMatrix<R, C> {
         self.rows.iter_enumerated()
     }
 
+    pub fn clear_row(&mut self, row: R) {
+        if let Some(row) = self.rows.get_mut(row) {
+            row.clear();
+        }
+    }
+
     fn ensure_row(&mut self, row: R) -> &mut IntervalSet<C> {
         self.rows.ensure_contains_elem(row, || IntervalSet::new(self.column_size))
     }
@@ -397,11 +428,21 @@ impl<R: Idx, C: Step + Idx> SparseIntervalMatrix<R, C> {
         write_row.union(read_row)
     }
 
+    pub fn disjoint_rows(&self, a: R, b: R) -> bool
+    where
+        C: Step,
+    {
+        let (Some(a), Some(b)) = (self.rows.get(a), self.rows.get(b)) else {
+            return true;
+        };
+        a.disjoint(b)
+    }
+
     pub fn insert_all_into_row(&mut self, row: R) {
         self.ensure_row(row).insert_all();
     }
 
-    pub fn insert_range(&mut self, row: R, range: impl RangeBounds<C> + Clone) {
+    pub fn insert_range(&mut self, row: R, range: impl RangeBounds<C>) {
         self.ensure_row(row).insert_range(range);
     }
 
@@ -413,7 +454,7 @@ impl<R: Idx, C: Step + Idx> SparseIntervalMatrix<R, C> {
         self.ensure_row(row).append(point)
     }
 
-    pub fn append_range(&mut self, row: R, point: impl RangeBounds<C> + Clone) {
+    pub fn append_range(&mut self, row: R, point: impl RangeBounds<C>) {
         self.ensure_row(row).append_range(point)
     }
 

@@ -119,12 +119,10 @@ fn selfadd_still_carries_an_obligation_at_the_index() {
     // workaround in place and fail the root-cause fix — a test that blocks the
     // correct repair is worse than no test. Vacuity itself is covered above.
     assert!(
-        at_index
-            .iter()
-            .any(|vc| matches!(
-                vc.kind,
-                VcKind::UnsupportedMir { .. } | VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck
-            )),
+        at_index.iter().any(|vc| matches!(
+            vc.kind,
+            VcKind::UnsupportedMir { .. } | VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck
+        )),
         "`a[i]` must carry either a real bounds obligation or the fail-closed \
          UnsupportedMir; anything else means the obligation was laundered: {:?}",
         at_index.iter().map(|vc| &vc.kind).collect::<Vec<_>>()

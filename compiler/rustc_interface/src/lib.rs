@@ -1,7 +1,6 @@
 // tidy-alphabetical-start
 #![feature(decl_macro)]
 #![feature(file_buffered)]
-#![feature(iter_intersperse)]
 #![feature(try_blocks)]
 // tidy-alphabetical-end
 
@@ -11,6 +10,9 @@ pub mod interface;
 mod limits;
 pub mod passes;
 mod queries;
+mod trust_body_census;
+// Trust: diagnostic HIR observations, never a MIR producer or proof input.
+mod trust_hir_calls;
 pub mod util;
 
 pub use callbacks::setup_callbacks;

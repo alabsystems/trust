@@ -2,13 +2,14 @@
 //@ dont-check-compiler-stderr
 //@ needs-asm-support
 //@ no-prefer-dynamic
-//@ revisions: global_allocator global_asm inline_asm link_section naked no_main no_mangle export_name test_runner rustc_main
+//@ revisions: global_allocator global_asm island_global_asm inline_asm link_section naked no_main no_mangle export_name test_runner rustc_main
 //@ compile-flags: -Ztrust-verify=off -Ztrust-verify-session=startup-controls-ui
 //@ compile-flags: -Ztrust-targo-test-monitor -Awarnings
 //@ rustc-env:TRUST_TARGO_TEST_MONITOR_SESSION=startup-controls-ui
 //@ check-fail
 //[global_allocator]~? ERROR certified-monitor tests reject source-controlled runtime roles in the selected crate
 //[global_asm]~? ERROR certified-monitor tests reject unauthenticated global assembly
+//[island_global_asm]~? ERROR certified-monitor tests reject unauthenticated global assembly
 //[inline_asm]~? ERROR certified-monitor tests reject inline assembly
 //[link_section]~? ERROR certified-monitor tests reject #[link_section]
 //[naked]~? ERROR certified-monitor tests reject #[naked]
@@ -42,6 +43,17 @@ unsafe impl std::alloc::GlobalAlloc for ExitAllocator {
 static GLOBAL_ALLOCATOR: ExitAllocator = ExitAllocator;
 
 #[cfg(global_asm)]
+core::arch::global_asm!("");
+
+// Trust: CB3 (2026-09-28) — a `clean { … }` island shares `DefKind::GlobalAsm`
+// and is admitted (`certified_monitor_admits_clean_island.rs`), but only per
+// def: a real `global_asm!` beside an island is still refused.
+#[cfg(island_global_asm)]
+clean {
+    theorem startup_controls_island_holds : 0 = 0 := rfl
+}
+
+#[cfg(island_global_asm)]
 core::arch::global_asm!("");
 
 #[cfg(inline_asm)]

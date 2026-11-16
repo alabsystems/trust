@@ -44,13 +44,16 @@ trust-ir-codegen = ["trust-ir-emission"]
 # tidy-alphabetical-start
 rustc_abi = { path = "../rustc_abi" }
 rustc_ast = { path = "../rustc_ast" }
+rustc_attr_ir = { path = "../rustc_attr_ir" }
 rustc_codegen_ssa = { path = "../rustc_codegen_ssa" }
 rustc_data_structures = { path = "../rustc_data_structures" }
+rustc_fs_util = { path = "../rustc_fs_util" }
 rustc_hir = { path = "../rustc_hir" }
 rustc_metadata = { path = "../rustc_metadata" }
 rustc_middle = { path = "../rustc_middle" }
 rustc_session = { path = "../rustc_session" }
 rustc_span = { path = "../rustc_span" }
+rustc_structures = { path = "../rustc_structures" }
 rustc_symbol_mangling = { path = "../rustc_symbol_mangling" }
 rustc_target = { path = "../rustc_target" }
 tracing = "0.1"
@@ -74,6 +77,20 @@ trust-cg-bridge = { path = "../../crates/trust-cg-bridge", features = ["ay-proof
 # `trust-ir-emission` fidelity oracle needs; features are additive, so declaring
 # it here keeps that lane working unchanged.
 trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir", features = ["serde"] }
+# Trust (G2, crate-module codegen exit): NOT optional, for the same reason as
+# `trust-ir` above — the mode is selected at run time, not at build time.
+#
+# * `trust-ir-build` supplies `validate::validate_module_for_codegen` /
+#   `ValidationError`: the v41 codegen-license layer, used as the INDEPENDENT
+#   second reading that this crate's own `body_gate` walk is cross-checked
+#   against (`trust_ir_frontend::cross_check_license`).
+# * `trust-thir-lower` supplies `crate_module::with_published_crate_module`:
+#   the Session-scoped artifact the producing half of G2 publishes.
+#
+# Neither adds anything to the compiler's link closure: `rustc_mir_build`
+# already depends on `trust-thir-lower`, which already depends on
+# `trust-ir-build`.
+trust-ir-build = { workspace = true }
 trust-mir-extract = { path = "../../crates/trust-mir-extract" }
 # Trust (F1 callee seam): the producer's session-state handoff type
 # (`AssembledCrateModuleForCodegen`) — the finalize-assembled crate module,
@@ -89,8 +106,9 @@ trust-types = { path = "../../crates/trust-types" }
 # part of the builtin backend's link closure, so the default codegen path is
 # unchanged.
 serde_json = { workspace = true, optional = true }
-# Unconditional since the trust-ir frontend's UPSTREAM-INSTANCE lane
-# (-Ztrust-ir-upstream-mir): monomorphized upstream bodies are bridged
-# MIR -> VerifiableFunction -> trust-ir and fed to the same converter and
-# proven-output gate as the source-first artifacts.
+# Retained for the off-by-default trust-ir-emission MIR fidelity oracle. The
+# production Trust-IR frontend imports source metadata through upstream_entry.
 trust-ir-bridge = { path = "../../crates/trust-ir-bridge" }
+
+[dev-dependencies]
+ar_archive_writer = "0.5"

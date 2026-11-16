@@ -32,6 +32,20 @@ pub struct AtomicAccessLog {
     entries: Vec<AtomicAccessEntry>,
 }
 
+fn is_legal_log_entry(kind: AccessKind) -> bool {
+    match kind {
+        AccessKind::Read
+        | AccessKind::Write
+        | AccessKind::AtomicRead(MemoryOrdering::Release | MemoryOrdering::AcqRel)
+        | AccessKind::AtomicWrite(MemoryOrdering::Acquire | MemoryOrdering::AcqRel)
+        | AccessKind::Fence(MemoryOrdering::Relaxed) => false,
+        AccessKind::AtomicRead(_)
+        | AccessKind::AtomicWrite(_)
+        | AccessKind::AtomicRmw(..)
+        | AccessKind::Fence(_) => true,
+    }
+}
+
 impl AtomicAccessLog {
     /// Create a new empty log.
     #[must_use]
@@ -42,20 +56,26 @@ impl AtomicAccessLog {
     /// Record an atomic access.
     ///
     /// Returns the index of the newly added entry. Panics if the access kind
-    /// is non-atomic (use `try_record` for fallible recording).
+    /// is non-atomic or has an illegal ordering for its operation kind (use
+    /// `try_record` for fallible recording).
     pub fn record(&mut self, entry: AtomicAccessEntry) -> usize {
         assert!(
             !entry.access_kind.is_non_atomic(),
             "AtomicAccessLog::record requires atomic access"
+        );
+        assert!(
+            is_legal_log_entry(entry.access_kind),
+            "AtomicAccessLog::record requires legal atomic ordering"
         );
         let idx = self.entries.len();
         self.entries.push(entry);
         idx
     }
 
-    /// Record an atomic access, returning `None` if the access is non-atomic.
+    /// Record an atomic access, returning `None` for a non-atomic access or
+    /// an ordering that is illegal for the operation kind.
     pub fn try_record(&mut self, entry: AtomicAccessEntry) -> Option<usize> {
-        if entry.access_kind.is_non_atomic() {
+        if !is_legal_log_entry(entry.access_kind) {
             return None;
         }
         Some(self.record(entry))
@@ -79,7 +99,7 @@ impl AtomicAccessLog {
         self.entries.is_empty()
     }
 
-    /// Validate that every log entry preserves the atomic-only invariant.
+    /// Validate that every log entry has an atomic operation and legal ordering.
     ///
     /// `record` and `try_record` enforce this during normal construction, but
     /// deserialization can still materialize malformed logs. Returning all
@@ -90,7 +110,7 @@ impl AtomicAccessLog {
             .entries
             .iter()
             .enumerate()
-            .filter_map(|(idx, entry)| entry.access_kind.is_non_atomic().then_some(idx))
+            .filter_map(|(idx, entry)| (!is_legal_log_entry(entry.access_kind)).then_some(idx))
             .collect();
 
         if invalid_indices.is_empty() { Ok(()) } else { Err(invalid_indices) }
@@ -153,55 +173,153 @@ impl AtomicAccessLog {
         self.entries.iter().map(|e| e.thread_id.as_str()).collect()
     }
 
-    /// Check for release-acquire pairs on the same location across threads.
+    /// Return synchronization pairs backed by read-from evidence.
     ///
-    /// Returns pairs `(release_idx, acquire_idx)` where a release store
-    /// to location L in thread A is followed by an acquire load from L
-    /// in thread B.
+    /// This log records event shape and order, but not which write an acquire
+    /// read or whether that write belongs to a release sequence. Even adjacent
+    /// release/acquire events on the same location cannot establish a pair.
+    /// Until that evidence is available, callers must not derive HB edges from
+    /// this log. The events remain available through `entries` for diagnostics.
     #[must_use]
     pub fn find_release_acquire_pairs(&self) -> Vec<(usize, usize)> {
         if self.validate().is_err() {
             return Vec::new();
         }
+        Vec::new()
+    }
+}
 
-        let mut pairs = Vec::new();
+#[cfg(test)]
+mod tests {
+    use trust_types::{AtomicRmwOp, SourceSpan, VcKind};
 
-        for (i, release) in self.entries.iter().enumerate() {
-            let is_release = matches!(
-                release.access_kind,
-                AccessKind::AtomicWrite(MemoryOrdering::Release)
-                    | AccessKind::AtomicWrite(MemoryOrdering::AcqRel)
-                    | AccessKind::AtomicWrite(MemoryOrdering::SeqCst)
-                    | AccessKind::AtomicRmw(MemoryOrdering::Release, _)
-                    | AccessKind::AtomicRmw(MemoryOrdering::AcqRel, _)
-                    | AccessKind::AtomicRmw(MemoryOrdering::SeqCst, _)
-            );
-            if !is_release {
-                continue;
-            }
+    use super::{AtomicAccessEntry, AtomicAccessLog};
+    use crate::data_race::{AccessKind, MemoryOrdering};
+    use crate::memory_ordering::{HappensBefore, MemoryModelChecker};
 
-            for (j, acquire) in self.entries.iter().enumerate().skip(i + 1) {
-                if acquire.location != release.location {
-                    continue;
-                }
-                if acquire.thread_id == release.thread_id {
-                    continue;
-                }
-                let is_acquire = matches!(
-                    acquire.access_kind,
-                    AccessKind::AtomicRead(MemoryOrdering::Acquire)
-                        | AccessKind::AtomicRead(MemoryOrdering::AcqRel)
-                        | AccessKind::AtomicRead(MemoryOrdering::SeqCst)
-                        | AccessKind::AtomicRmw(MemoryOrdering::Acquire, _)
-                        | AccessKind::AtomicRmw(MemoryOrdering::AcqRel, _)
-                        | AccessKind::AtomicRmw(MemoryOrdering::SeqCst, _)
-                );
-                if is_acquire {
-                    pairs.push((i, j));
-                }
-            }
+    fn entry(thread_id: &str, access_kind: AccessKind) -> AtomicAccessEntry {
+        AtomicAccessEntry {
+            location: "flag".to_string(),
+            access_kind,
+            thread_id: thread_id.to_string(),
+            span: SourceSpan::default(),
         }
+    }
 
-        pairs
+    #[test]
+    fn adjacent_release_acquire_without_read_from_does_not_create_hb() {
+        let mut log = AtomicAccessLog::new();
+        log.record(entry("producer", AccessKind::AtomicWrite(MemoryOrdering::Release)));
+        log.record(entry("consumer", AccessKind::AtomicRead(MemoryOrdering::Acquire)));
+
+        assert_eq!(log.entries().len(), 2);
+        assert_eq!(log.accesses_to("flag").len(), 2);
+        assert!(log.find_release_acquire_pairs().is_empty());
+        let graph = MemoryModelChecker::new(log, HappensBefore::new(2)).build_happens_before(&[]);
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn intervening_write_does_not_create_release_acquire_hb() {
+        let mut log = AtomicAccessLog::new();
+        log.record(entry("producer", AccessKind::AtomicWrite(MemoryOrdering::Release)));
+        log.record(entry("other", AccessKind::AtomicWrite(MemoryOrdering::Relaxed)));
+        log.record(entry("consumer", AccessKind::AtomicRead(MemoryOrdering::Acquire)));
+
+        assert_eq!(log.entries().len(), 3);
+        assert_eq!(log.accesses_to("flag").len(), 3);
+        assert!(log.find_release_acquire_pairs().is_empty());
+        let graph = MemoryModelChecker::new(log, HappensBefore::new(3)).build_happens_before(&[]);
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn seq_cst_ordering_alone_does_not_establish_read_from() {
+        let mut log = AtomicAccessLog::new();
+        log.record(entry("producer", AccessKind::AtomicWrite(MemoryOrdering::SeqCst)));
+        log.record(entry("consumer", AccessKind::AtomicRead(MemoryOrdering::SeqCst)));
+
+        assert!(log.find_release_acquire_pairs().is_empty());
+    }
+
+    #[test]
+    fn rmw_ordering_alone_does_not_establish_read_from() {
+        let mut log = AtomicAccessLog::new();
+        log.record(entry(
+            "producer",
+            AccessKind::AtomicRmw(MemoryOrdering::Release, AtomicRmwOp::Add),
+        ));
+        log.record(entry(
+            "consumer",
+            AccessKind::AtomicRmw(MemoryOrdering::Acquire, AtomicRmwOp::Add),
+        ));
+
+        assert!(log.find_release_acquire_pairs().is_empty());
+        let graph = MemoryModelChecker::new(log, HappensBefore::new(2)).build_happens_before(&[]);
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn illegal_atomic_orderings_in_imported_log_emit_coverage_gap_vcs() {
+        let illegal = [
+            AccessKind::AtomicRead(MemoryOrdering::Release),
+            AccessKind::AtomicRead(MemoryOrdering::AcqRel),
+            AccessKind::AtomicWrite(MemoryOrdering::Acquire),
+            AccessKind::AtomicWrite(MemoryOrdering::AcqRel),
+            AccessKind::Fence(MemoryOrdering::Relaxed),
+        ];
+
+        for access_kind in illegal {
+            let malformed = entry("worker", access_kind);
+            let log: AtomicAccessLog = serde_json::from_value(serde_json::json!({
+                "entries": [malformed]
+            }))
+            .expect("serialized evidence can bypass record");
+
+            assert_eq!(log.validate(), Err(vec![0]), "{access_kind:?}");
+            let checker = MemoryModelChecker::new(log, HappensBefore::new(1));
+            assert!(!checker.check().is_sound, "{access_kind:?}");
+            let vcs = checker.generate_vcs("illegal_atomic_ordering");
+            assert_eq!(vcs.len(), 1, "{access_kind:?}");
+            assert!(
+                matches!(&vcs[0].kind, VcKind::UnsupportedMir { kind, .. }
+                    if kind == "ConcurrencyOrderingCoverageGap"),
+                "{access_kind:?}: {vcs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legal_atomic_orderings_remain_recordable() {
+        let legal = [
+            AccessKind::AtomicRead(MemoryOrdering::Acquire),
+            AccessKind::AtomicWrite(MemoryOrdering::Release),
+            AccessKind::Fence(MemoryOrdering::Acquire),
+            AccessKind::Fence(MemoryOrdering::Release),
+            AccessKind::Fence(MemoryOrdering::SeqCst),
+            AccessKind::AtomicRmw(MemoryOrdering::AcqRel, AtomicRmwOp::Add),
+        ];
+        let mut log = AtomicAccessLog::new();
+        for access_kind in legal {
+            assert!(log.try_record(entry("worker", access_kind)).is_some());
+        }
+        assert_eq!(log.validate(), Ok(()));
+        assert_eq!(log.len(), legal.len());
+    }
+
+    #[test]
+    fn try_record_refuses_illegal_atomic_ordering_without_mutating_log() {
+        let mut log = AtomicAccessLog::new();
+        assert_eq!(
+            log.try_record(entry("worker", AccessKind::AtomicRead(MemoryOrdering::Release))),
+            None
+        );
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "AtomicAccessLog::record requires legal atomic ordering")]
+    fn record_rejects_illegal_atomic_ordering() {
+        AtomicAccessLog::new().record(entry("worker", AccessKind::Fence(MemoryOrdering::Relaxed)));
     }
 }

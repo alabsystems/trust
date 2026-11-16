@@ -12,21 +12,29 @@ const OPTION_EXPECT: &str = "core::option::Option::<T>::expect";
 fn enter_bool_pred_summaries(
     summaries: trust_types::fx::FxHashMap<String, super::ReturnBoolPredSummary>,
 ) -> crate::VcgenContextGuard {
+    let ids = crate::test_summary_body_identities(summaries.keys().cloned());
     crate::enter_test_callee_summaries(
-        crate::CalleeSummaryContext::default().with_return_bool_preds(summaries),
+        crate::CalleeSummaryContext::default()
+            .with_return_bool_preds(summaries)
+            .with_summary_body_identities(ids),
     )
 }
 
 /// `Result<u64, ()>` in the flattened `lower_enum_adt` shape: the explicit
 /// `__tag` slot plus per-variant defs carrying the REAL discriminant tags.
 fn std_result_ty() -> Ty {
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
             ("__v0_0".into(), Ty::u64()),
             ("__v1_0".into(), Ty::Unit),
-        ],
+        ]
+        .into(),
         variants: vec![
             VariantDef {
                 name: "Ok".into(),
@@ -38,7 +46,8 @@ fn std_result_ty() -> Ty {
                 discriminant: 1,
                 fields: vec![("0".into(), Ty::Unit)],
             },
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -47,12 +56,17 @@ fn std_result_ty() -> Ty {
 
 /// `Option<u64>` in the same flattened shape (`None` = 0, `Some` = 1).
 fn std_option_ty() -> Ty {
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "core::option::Option".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
             ("__v1_0".into(), Ty::u64()),
-        ],
+        ]
+        .into(),
         variants: vec![
             VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
             VariantDef {
@@ -60,7 +74,8 @@ fn std_option_ty() -> Ty {
                 discriminant: 1,
                 fields: vec![("0".into(), Ty::u64())],
             },
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -77,7 +92,14 @@ fn call_term(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Te
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
-        callee_identity: None,
+        callee_identity: Some(trust_types::CalleeIdentity {
+            // A concrete call: the compiler gives it an identity, and a body-derived
+            // summary applies only to a call to its own body (`crate::call_reaches_summarized_body`).
+            stable_crate_id: 1,
+            def_index: 1,
+            substs_digest: [0, 0],
+        }),
+        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
         is_foreign: false,
     }
 }
@@ -106,6 +128,7 @@ fn func_of(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -669,10 +692,14 @@ fn infers_bool_pred_from_field_probe() {
     const OPTION_IS_SOME: &str = "core::option::Option::<T>::is_some";
     let widget_ref = |mutable: bool| Ty::Ref {
         mutable,
-        inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+        inner: Box::new(Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
+            adt_kind: None,
+            layout: None,
             name: "mycrate::Widget".into(),
-            fields: vec![("slot".into(), std_option_ty())],
-            variants: vec![],
+            fields: vec![("slot".into(), std_option_ty())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -841,10 +868,14 @@ fn field_guarded_field_unwrap_connects_via_inferred_contract() {
     const IS_READY: &str = "mycrate::Widget::is_ready";
     let widget_ref = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+        inner: Box::new(Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
+            adt_kind: None,
+            layout: None,
             name: "mycrate::Widget".into(),
-            fields: vec![("slot".into(), std_option_ty())],
-            variants: vec![],
+            fields: vec![("slot".into(), std_option_ty())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -947,10 +978,14 @@ fn unguarded_field_unwrap_refutes_with_witness() {
                 index: 1,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+                    inner: Box::new(Ty::Adt {
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                        adt_kind: None,
+                        layout: None,
                         name: "mycrate::Widget".into(),
-                        fields: vec![("slot".into(), std_option_ty())],
-                        variants: vec![],
+                        fields: vec![("slot".into(), std_option_ty())].into(),
+                        variants: vec![].into(),
                         disc_index_safe: false,
                         faithful_enum_repr: None,
                         enum_layout: None,
@@ -1184,10 +1219,14 @@ fn field_observer_gate_follows_multihop_base_copy() {
                 index: 1,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+                    inner: Box::new(Ty::Adt {
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                        adt_kind: None,
+                        layout: None,
                         name: "mycrate::Foo".into(),
-                        fields: vec![("slot".into(), std_option_ty())],
-                        variants: vec![],
+                        fields: vec![("slot".into(), std_option_ty())].into(),
+                        variants: vec![].into(),
                         disc_index_safe: false,
                         faithful_enum_repr: None,
                         enum_layout: None,
@@ -1199,10 +1238,14 @@ fn field_observer_gate_follows_multihop_base_copy() {
                 index: 2,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+                    inner: Box::new(Ty::Adt {
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                        adt_kind: None,
+                        layout: None,
                         name: "mycrate::Foo".into(),
-                        fields: vec![("slot".into(), std_option_ty())],
-                        variants: vec![],
+                        fields: vec![("slot".into(), std_option_ty())].into(),
+                        variants: vec![].into(),
                         disc_index_safe: false,
                         faithful_enum_repr: None,
                         enum_layout: None,
@@ -1214,10 +1257,14 @@ fn field_observer_gate_follows_multihop_base_copy() {
                 index: 3,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+                    inner: Box::new(Ty::Adt {
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                        adt_kind: None,
+                        layout: None,
                         name: "mycrate::Foo".into(),
-                        fields: vec![("slot".into(), std_option_ty())],
-                        variants: vec![],
+                        fields: vec![("slot".into(), std_option_ty())].into(),
+                        variants: vec![].into(),
                         disc_index_safe: false,
                         faithful_enum_repr: None,
                         enum_layout: None,
@@ -1970,10 +2017,14 @@ fn whole_pointee_guard_through_reseat_does_not_connect() {
 fn raw_pointer_field_base_is_not_pinned() {
     const OPTION_UNWRAP: &str = "core::option::Option::<T>::unwrap";
     const IS_READY: &str = "mycrate::S::is_ready";
-    let s_adt = || Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    let s_adt = || Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "mycrate::S".into(),
-        fields: vec![("f".into(), std_option_ty())],
-        variants: vec![],
+        fields: vec![("f".into(), std_option_ty())].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -2071,10 +2122,14 @@ fn raw_pointer_field_base_is_not_pinned() {
 fn field_guard_through_aliased_reseat_does_not_connect() {
     const OPTION_UNWRAP: &str = "core::option::Option::<T>::unwrap";
     const CHECK: &str = "mycrate::S::check";
-    let s_adt = || Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    let s_adt = || Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "mycrate::S".into(),
-        fields: vec![("slot".into(), std_option_ty())],
-        variants: vec![],
+        fields: vec![("slot".into(), std_option_ty())].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -2193,10 +2248,14 @@ fn unwrap_field_place_rejects_aliased_reseated_temp() {
                 index: 1,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+                    inner: Box::new(Ty::Adt {
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                        adt_kind: None,
+                        layout: None,
                         name: "mycrate::S".into(),
-                        fields: vec![("slot".into(), std_option_ty())],
-                        variants: vec![],
+                        fields: vec![("slot".into(), std_option_ty())].into(),
+                        variants: vec![].into(),
                         disc_index_safe: false,
                         faithful_enum_repr: None,
                         enum_layout: None,
@@ -2281,10 +2340,7 @@ fn param_unwrap_guarded_by_eq_none_const_connects() {
                     Statement::Assign {
                         place: Place::local(3),
                         rvalue: Rvalue::Use(Operand::Constant(
-                            trust_types::ConstValue::UnitVariantRef {
-                                enum_name: "core::option::Option".into(),
-                                variant: 0,
-                            },
+                            trust_types::ConstValue::unit_variant_ref("core::option::Option", 0),
                         )),
                         span: SourceSpan::default(),
                     },
@@ -2537,7 +2593,7 @@ fn non_std_or_unmodeled_receiver_stays_unsupported() {
     // (b) std name but the flattened `__tag` slot is absent.
     let mut no_tag = guarded_result_unwrap_fn();
     if let Ty::Adt { fields, .. } = &mut no_tag.body.locals[1].ty {
-        fields.retain(|(n, _)| n != "__tag");
+        fields.make_mut().retain(|(n, _)| n != "__tag");
     }
     assert!(generate_unwrap_panic_freedom_vcs(&no_tag).is_empty());
     assert_eq!(unverified_row_count(&no_tag), 1);
@@ -2545,7 +2601,7 @@ fn non_std_or_unmodeled_receiver_stays_unsupported() {
     // (c) std name but no variant defs (a degraded / pre-P4 lowering).
     let mut no_variants = guarded_result_unwrap_fn();
     if let Ty::Adt { variants, .. } = &mut no_variants.body.locals[1].ty {
-        variants.clear();
+        variants.make_mut().clear();
     }
     assert!(generate_unwrap_panic_freedom_vcs(&no_variants).is_empty());
     assert_eq!(unverified_row_count(&no_variants), 1);
@@ -2810,5 +2866,134 @@ fn generate_vcs_swaps_row_for_solvable_vc() {
         !vcs.iter().any(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
             if kind.ends_with("::panic-freedom-unverified"))),
         "the fail-closed row must be replaced, not doubled"
+    );
+}
+
+// ======================================================================
+// Trust (2026-10-03, unwrap-from-facts): the SUBJECT-lane gates, asked
+// directly. The verdict matrix on real MIR is
+// `tests/unwrap_from_facts_realmir.rs`; these pin the declines a fixture can
+// only reach through unsafe code.
+// ======================================================================
+
+fn named_adt(name: &str, fields: Vec<(&str, Ty)>) -> Ty {
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        name: name.into(),
+        fields: fields.into_iter().map(|(n, t)| (n.into(), t)).collect::<Vec<_>>().into(),
+        variants: vec![].into(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
+}
+
+fn subject_fn(param_ty: Ty) -> VerifiableFunction {
+    func_of(
+        vec![
+            LocalDecl { index: 0, ty: Ty::u64(), name: None },
+            LocalDecl { index: 1, ty: param_ty, name: Some("x".into()) },
+        ],
+        vec![ret_block(0)],
+        1,
+    )
+}
+
+fn deref_field(field: Option<usize>) -> Place {
+    let mut projections = vec![Projection::Deref];
+    projections.extend(field.map(Projection::Field));
+    Place { local: 1, projections }
+}
+
+/// The pointee of a SHARED `&Option` parameter, and a field of a shared
+/// `&(Option, u64)`, are pinned subjects; the same places behind `&mut` are
+/// not (a raw pointer derived from the `&mut` can write them without touching
+/// the parameter local), and a field hop into an interior-mutability wrapper
+/// is not (a shared `&` does not freeze an `UnsafeCell`'s contents).
+#[test]
+fn subject_pinning_needs_a_shared_reference_and_no_interior_mutability() {
+    let shared = |inner: Ty| Ty::Ref { mutable: false, inner: Box::new(inner) };
+    let unique = |inner: Ty| Ty::Ref { mutable: true, inner: Box::new(inner) };
+    let pair = named_adt("(Option, u64)", vec![("0", std_option_ty()), ("1", Ty::u64())]);
+    let cell = named_adt("core::cell::UnsafeCell<Option<u64>>", vec![("value", std_option_ty())]);
+
+    let f = subject_fn(shared(std_option_ty()));
+    assert!(super::field_subject_is_pinned(&f, &deref_field(None)), "pointee of `&Option`");
+    let f = subject_fn(shared(pair.clone()));
+    assert!(super::field_subject_is_pinned(&f, &deref_field(Some(0))), "field of `&(Option, _)`");
+
+    let f = subject_fn(unique(std_option_ty()));
+    assert!(!super::field_subject_is_pinned(&f, &deref_field(None)), "pointee of `&mut Option`");
+    let f = subject_fn(unique(pair));
+    assert!(!super::field_subject_is_pinned(&f, &deref_field(Some(0))), "behind `&mut`");
+
+    let f = subject_fn(shared(cell.clone()));
+    assert!(
+        !super::field_subject_is_pinned(&f, &deref_field(Some(0))),
+        "a field hop into an `UnsafeCell` behind `&` is not frozen"
+    );
+    let f = subject_fn(cell);
+    assert!(
+        !super::field_subject_is_pinned(
+            &f,
+            &Place { local: 1, projections: vec![Projection::Field(0)] }
+        ),
+        "nor a by-value `UnsafeCell` parameter's field"
+    );
+}
+
+/// A shared-reference PARAMETER passed directly is the subject `*x`; a `&mut`
+/// parameter is not, and neither is a temp borrowing a BARE local (that is the
+/// whole-local lane's shape, never this one's).
+#[test]
+fn shared_ref_operand_subject_resolves_only_the_subject_shapes() {
+    let f = subject_fn(Ty::Ref { mutable: false, inner: Box::new(std_option_ty()) });
+    assert_eq!(
+        super::shared_ref_operand_subject(&f, &Operand::Copy(Place::local(1))),
+        Some(deref_field(None))
+    );
+    let f = subject_fn(Ty::Ref { mutable: true, inner: Box::new(std_option_ty()) });
+    assert_eq!(super::shared_ref_operand_subject(&f, &Operand::Copy(Place::local(1))), None);
+
+    // `_2 = &_1` (a bare local's borrow) is not a subject.
+    let mut f = func_of(
+        vec![
+            LocalDecl { index: 0, ty: Ty::u64(), name: None },
+            LocalDecl { index: 1, ty: std_option_ty(), name: Some("o".into()) },
+            LocalDecl {
+                index: 2,
+                ty: Ty::Ref { mutable: false, inner: Box::new(std_option_ty()) },
+                name: None,
+            },
+        ],
+        vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![Statement::Assign {
+                place: Place::local(2),
+                rvalue: Rvalue::Ref { mutable: false, place: Place::local(1) },
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::Return,
+        }],
+        1,
+    );
+    assert_eq!(super::shared_ref_operand_subject(&f, &Operand::Copy(Place::local(2))), None);
+    // ...while `_2 = &(_1.0)` of a by-value parameter's field is.
+    f.body.locals[1].ty =
+        named_adt("(Option, u64)", vec![("0", std_option_ty()), ("1", Ty::u64())]);
+    f.body.blocks[0].stmts[0] = Statement::Assign {
+        place: Place::local(2),
+        rvalue: Rvalue::Ref {
+            mutable: false,
+            place: Place { local: 1, projections: vec![Projection::Field(0)] },
+        },
+        span: SourceSpan::default(),
+    };
+    assert_eq!(
+        super::shared_ref_operand_subject(&f, &Operand::Copy(Place::local(2))),
+        Some(Place { local: 1, projections: vec![Projection::Field(0)] })
     );
 }

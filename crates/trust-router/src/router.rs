@@ -3,23 +3,23 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use trust_types::*;
 
 use crate::memory_guard::MemoryGuard;
-use crate::{
-    BackendSelection, VerificationBackend, constant_folder, routing, termination_dispatch,
-    ty_backend,
-};
+use crate::{BackendSelection, VerificationBackend, constant_folder, routing, ty_backend};
 
 /// Routes VCs to appropriate backends.
 ///
-/// Trust: Backends are stored as `Arc<dyn VerificationBackend>` internally
-/// to support both sequential and parallel verification modes. The public
-/// constructors accept `Box<dyn VerificationBackend>` for backward
-/// compatibility and convert to Arc on construction.
+/// Trust: Backends are stored as `Arc<dyn VerificationBackend>` so one
+/// discovered inventory can be shared by several routers. The public
+/// constructors accept `Box<dyn VerificationBackend>` and convert to Arc on
+/// construction.
+///
+/// Dispatch is serial, in input order: there is no parallel path, so the
+/// order in which a backend sees VCs is a function of the input alone
+/// (plan P4).
 ///
 /// # Examples
 ///
@@ -48,8 +48,12 @@ use crate::{
 /// assert_eq!(results.len(), 1);
 /// ```
 pub struct Router {
-    // Trust: Arc storage enables zero-copy sharing with parallel threads.
+    // Trust: Arc storage lets one router hand its backends to another
+    // (`arc_backends`) without re-wrapping them.
     backends: Vec<Arc<dyn VerificationBackend>>,
+    // Pre-interned backend names aligned 1:1 with `backends`, avoiding repeated
+    // `Symbol::intern(backend.name())` lock acquisitions on every `backend_plan`.
+    backend_names: Vec<Symbol>,
     // Process memory guard — checks RSS before each solver dispatch.
     memory_guard: Arc<MemoryGuard>,
 }
@@ -61,53 +65,60 @@ impl Router {
     /// concrete backend implementations (e.g. `InProcessAyBackend`).
     pub fn new() -> Self {
         // When the `ay-backend` feature is enabled, register the
-        // in-process ay-dpll SMT backend alongside the constant folder. It sits
-        // beside the existing subprocess backends (IncrementalAYSession,
-        // smtlib_backend) — it does not replace them at the registration site —
-        // and is selected by the router for L0 safety obligations via its
-        // `can_handle`/`role`.
+        // in-process ay-dpll SMT backend alongside the constant folder; the
+        // router selects it through its `can_handle`/`role`. The subprocess
+        // backends (`IncrementalAYSession`, `smtlib_backend`) are never
+        // registered here: since plan P4 / T4.1 only targo-trust's
+        // verify-binary builds one.
         #[allow(unused_mut)]
         let mut backends: Vec<Arc<dyn VerificationBackend>> =
             vec![Arc::new(constant_folder::ConstantFolderBackend)];
         #[cfg(feature = "ay-backend")]
         backends.push(Arc::new(crate::in_process_ay_backend::InProcessAyBackend::new()));
-        Router { backends, memory_guard: Arc::new(MemoryGuard::default()) }
+        Self::with_arc_backends(backends)
     }
 
     /// Create a router with specific backends.
     ///
-    /// Accepts `Box<dyn VerificationBackend>` for backward compatibility.
-    /// Converts to Arc internally to support parallel verification.
+    /// Accepts `Box<dyn VerificationBackend>` and converts to Arc internally.
     pub fn with_backends(backends: Vec<Box<dyn VerificationBackend>>) -> Self {
-        Router {
-            backends: backends.into_iter().map(Arc::from).collect(),
-            memory_guard: Arc::new(MemoryGuard::default()),
-        }
+        Self::with_arc_backends(backends.into_iter().map(Arc::from).collect())
     }
 
-    /// Trust (R-U Phase D, router convergence): the ONE name for the
-    /// deterministic analysis-seam router — a single in-process ay backend
-    /// with the given per-VC timeout, and nothing else. Compiler analysis
-    /// seams (the R1 oracle, assert-refutation sweeps, Liskov checks)
-    /// construct their router through this name instead of an inline
-    /// `with_backends` so the seam set is enumerable and the determinism
-    /// contract has one definition site: IN-PROCESS ay only — never the
-    /// external-binary cached router, whose per-VC subprocess timeout makes
-    /// verdicts nondeterministic across builds (Failed one build, Unknown
-    /// the next).
+    /// Trust (R-U Phase D, router convergence): the deterministic
+    /// analysis-seam router — a single in-process ay backend with the given
+    /// per-VC timeout, and nothing else. The compiler's analysis seams (the R1
+    /// oracle, the assert-refutation sweeps) construct their router through
+    /// this name so the determinism contract has one definition site:
+    /// IN-PROCESS ay only, never a subprocess solver, whose per-VC timeout
+    /// made verdicts differ across builds (Failed one build, Unknown the
+    /// next). One compiler router that runs ay is not built here: the Liskov
+    /// check's, over `discover_router_backends`' four-backend inventory, on
+    /// which this same in-process ay handles symbolic Liskov VCs and the
+    /// constant folder can decide fully constant ones (plan P4 / T4.1).
+    ///
+    /// `scale` sets the one effort count that ends an undecided solve (ay
+    /// `:rlimit`, `min(C, max(1, k · size))` per query); `timeout_ms` is the
+    /// wall-clock backstop.
     #[cfg(feature = "ay-backend")]
-    pub fn deterministic_in_process_ay(timeout_ms: u64) -> Self {
+    pub fn deterministic_in_process_ay(
+        timeout_ms: u64,
+        scale: trust_types::determinism::EffortScale,
+    ) -> Self {
         Router::with_backends(vec![Box::new(
-            crate::in_process_ay_backend::InProcessAyBackend::new().with_timeout(timeout_ms),
+            crate::in_process_ay_backend::InProcessAyBackend::new()
+                .with_timeout(timeout_ms)
+                .with_effort_scale(scale),
         )])
     }
 
-    /// Trust: Create a router with Arc-wrapped backends for parallel use.
+    /// Trust: Create a router with Arc-wrapped backends.
     ///
-    /// Use this when you already have Arc-wrapped backends (e.g., when
-    /// sharing backends between a Router and standalone parallel functions).
+    /// Use this when you already hold Arc-wrapped backends, for example
+    /// another router's (`arc_backends`).
     pub fn with_arc_backends(backends: Vec<Arc<dyn VerificationBackend>>) -> Self {
-        Router { backends, memory_guard: Arc::new(MemoryGuard::default()) }
+        let backend_names = backends.iter().map(|b| Symbol::intern(b.name())).collect();
+        Router { backends, backend_names, memory_guard: Arc::new(MemoryGuard::default()) }
     }
 
     /// Set a custom memory guard on this router.
@@ -129,8 +140,8 @@ impl Router {
 
     /// Trust: Get a clone of the Arc-wrapped backend list.
     ///
-    /// Useful for passing backends to standalone parallel functions
-    /// without re-wrapping.
+    /// Useful for building another router over the same inventory without
+    /// re-wrapping.
     pub fn arc_backends(&self) -> Vec<Arc<dyn VerificationBackend>> {
         self.backends.clone()
     }
@@ -141,11 +152,15 @@ impl Router {
     /// the preferred backend family for the VC's proof level is tried first,
     /// then fallback families, then general-purpose backends.
     pub fn backend_plan(&self, vc: &VerificationCondition) -> Vec<BackendSelection> {
-        if matches!(&vc.kind, VcKind::UnsupportedMir { .. }) {
+        // Trust (v6/D2): the concurrency kinds carry no execution or memory model,
+        // so no backend is planned for them (see `unsupported_mir_unknown`).
+        if matches!(&vc.kind, VcKind::UnsupportedMir { .. })
+            || crate::backend_trait::is_unmodeled_concurrency_kind(&vc.kind)
+        {
             return Vec::new();
         }
 
-        routing::backend_plan(&self.backends, vc)
+        routing::backend_plan(&self.backends, &self.backend_names, vc)
     }
 
     /// Verify all VCs, returning paired results.
@@ -170,6 +185,13 @@ impl Router {
         vcs: &[VerificationCondition],
         deadline: Option<std::time::Instant>,
     ) -> Vec<(VerificationCondition, VerificationResult)> {
+        if vcs.is_empty() {
+            return Vec::new();
+        }
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            return vcs.iter().map(|vc| (vc.clone(), budget_exceeded_unknown(vc))).collect();
+        }
+
         // Trust: shared-prefix batch fast path. When this router's SOLE backend
         // is one that shares a per-function assertion prefix across a batch
         // (the incremental AY session), route the whole VC set through its
@@ -182,41 +204,54 @@ impl Router {
         // below. The deadline is still honored: a passed deadline short-circuits
         // before dispatch.
         if let Some(backend) = self.sole_shared_prefix_batch_backend() {
-            if !deadline.is_some_and(|at| std::time::Instant::now() >= at) {
-                return Self::batch_via_backend_with_deadline(backend, vcs, deadline);
-            }
+            return Self::batch_via_backend_with_deadline(backend, vcs, deadline);
+        }
+
+        // Single-VC fast path: skip dedup bucketing, `VcKind::description`
+        // formatting, formula hashing, and intermediate slot/plan vectors.
+        if let [vc] = vcs {
+            let result = if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+                budget_exceeded_unknown(vc)
+            } else {
+                self.verify_one(vc)
+            };
+            return vec![(vc.clone(), result)];
         }
 
         // Trust (audit rec 4): structural dedup before sequential dispatch.
         //
         // Identical safety VCs (the same obligation up to renaming of bound
         // variables) are collapsed to ONE solve and the shared verdict is
-        // fanned out to every duplicate. This mirrors the parallel cache path's
-        // miss-coalescing (`solver_cache::pending_miss_by_key`), which the
-        // sequential loop here previously lacked — it dispatched every duplicate
-        // 1:1.
+        // fanned out to every duplicate, within this batch only (nothing is
+        // carried from one batch, or one function, to the next).
         //
         // Soundness: `vc_dedup::dedup_groups` merges two VCs only when they are
         // alpha-equivalent obligations AND carry the same routing requirements
-        // (the plan signature below). The representative of each group is
-        // verified exactly as it would be in the per-VC path; cloning its
-        // verdict to the other group members is sound because they denote the
-        // identical obligation. Every input VC still receives a result, in
-        // original order (see the fan-out below). The deadline short-circuit is
-        // preserved for every VC, including non-representatives.
-        let groups = crate::vc_dedup::dedup_groups(vcs, |i| self.plan_signature(&vcs[i]));
+        // (the plan signature below). Retain the preflight `backend_plan`
+        // computed for each VC so `verify_one_with_cached_plan` never re-runs
+        // `backend.can_handle` on group representatives.
+        let mut cached_plans: Vec<Option<Vec<BackendSelection>>> = Vec::with_capacity(vcs.len());
+        cached_plans.resize_with(vcs.len(), || None);
+        let groups = crate::vc_dedup::dedup_groups(vcs, |i| {
+            let plan = self.backend_plan(&vcs[i]);
+            let sig = Self::plan_signature_from_plan(&plan);
+            cached_plans[i] = Some(plan);
+            sig
+        });
 
         // Output slots, one per input VC, filled by original index.
-        let mut slots: Vec<Option<VerificationResult>> = (0..vcs.len()).map(|_| None).collect();
+        let mut slots: Vec<Option<VerificationResult>> = Vec::with_capacity(vcs.len());
+        slots.resize_with(vcs.len(), || None);
 
         for group in &groups {
-            let rep_vc = &vcs[group.representative];
+            let rep_idx = group.representative;
+            let rep_vc = &vcs[rep_idx];
             // Solve the representative once (honoring the deadline exactly as
             // the per-VC loop would).
             let rep_result = if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
                 budget_exceeded_unknown(rep_vc)
             } else {
-                self.verify_one(rep_vc)
+                self.verify_one_with_cached_plan(rep_vc, cached_plans[rep_idx].as_deref())
             };
 
             // Fan the verdict out to every member of the group. Members denote
@@ -224,14 +259,25 @@ impl Router {
             // the deadline per-member: if it lapsed mid-group, late members
             // degrade to a sound `Unknown` rather than receiving the
             // representative's verdict — matching the per-VC loop's behavior
-            // where each VC re-checks the deadline before dispatch.
-            for &member in &group.members {
-                let member_result = if member == group.representative {
-                    rep_result.clone()
-                } else if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
-                    budget_exceeded_unknown(&vcs[member])
+            // where each VC re-checks the deadline before dispatch. Move
+            // `rep_result` on the final member so unique VCs avoid deep-cloning
+            // proof certificates or counterexamples.
+            let mut rep_opt = Some(rep_result);
+            let last_pos = group.members.len().saturating_sub(1);
+            for (pos, &member) in group.members.iter().enumerate() {
+                let use_rep = member == group.representative
+                    || !deadline.is_some_and(|at| std::time::Instant::now() >= at);
+                let member_result = if use_rep {
+                    if pos == last_pos {
+                        rep_opt.take().unwrap_or_else(|| budget_exceeded_unknown(&vcs[member]))
+                    } else {
+                        rep_opt
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| budget_exceeded_unknown(&vcs[member]))
+                    }
                 } else {
-                    rep_result.clone()
+                    budget_exceeded_unknown(&vcs[member])
                 };
                 slots[member] = Some(member_result);
             }
@@ -271,29 +317,29 @@ impl Router {
 
     /// Trust: Dispatch `vcs` through a single backend's `verify_batch`, honoring
     /// `deadline` for any VC not reached when the deadline lapses. The
-    /// unsupported-MIR guard runs per VC exactly as in the per-VC path, so
-    /// unsupported-MIR VCs are never sent to the backend.
+    /// unroutable-VC guard runs per VC exactly as in the per-VC path, so
+    /// unsupported MIR and data-race VCs are never sent to the backend.
     fn batch_via_backend_with_deadline(
         backend: &Arc<dyn VerificationBackend>,
         vcs: &[VerificationCondition],
         deadline: Option<std::time::Instant>,
     ) -> Vec<(VerificationCondition, VerificationResult)> {
-        // Partition into VCs the backend should solve (after the unsupported-MIR
+        // Partition into VCs the backend should solve (after the unroutable-VC
         // short-circuit) vs. those resolved here, preserving order.
         let mut to_batch: Vec<VerificationCondition> = Vec::with_capacity(vcs.len());
         let mut to_batch_indices: Vec<usize> = Vec::with_capacity(vcs.len());
         let mut results: Vec<Option<VerificationResult>> = (0..vcs.len()).map(|_| None).collect();
 
         for (i, vc) in vcs.iter().enumerate() {
-            if let Some(result) = crate::backend_trait::unsupported_mir_unknown(vc, "router", 0) {
+            if let Some(result) = unroutable_vc_unknown(vc) {
                 results[i] = Some(result);
             } else if !backend.can_handle(vc) {
                 // Match the per-VC fallback-chain outcome: no eligible backend.
-                results[i] = Some(VerificationResult::Unknown {
-                    solver: "none".into(),
-                    time_ms: 0,
-                    reason: "no backend can handle this VC".to_string(),
-                });
+                results[i] = Some(trust_types::determinism::StopCause::Unsupported.unknown_result(
+                    "none",
+                    0,
+                    "no backend can handle this VC",
+                ));
             } else {
                 to_batch_indices.push(i);
                 to_batch.push(vc.clone());
@@ -338,8 +384,8 @@ impl Router {
     /// The signature is the ordered list of `(backend name, can_handle)` pairs
     /// from the backend plan — exactly the routing inputs that determine which
     /// backend ultimately produces the verdict in `verify_one`.
-    fn plan_signature(&self, vc: &VerificationCondition) -> Vec<(trust_types::Symbol, bool)> {
-        self.backend_plan(vc).iter().map(|sel| (sel.name, sel.can_handle)).collect()
+    fn plan_signature_from_plan(plan: &[BackendSelection]) -> Vec<(trust_types::Symbol, bool)> {
+        plan.iter().map(|sel| (sel.name, sel.can_handle)).collect()
     }
 
     /// Verify a single VC by finding an appropriate backend.
@@ -348,166 +394,27 @@ impl Router {
     /// before dispatching to a solver backend. Returns an Unknown result
     /// with the memory error reason if the limit is exceeded.
     pub fn verify_one(&self, vc: &VerificationCondition) -> VerificationResult {
-        if let Some(result) = crate::backend_trait::unsupported_mir_unknown(vc, "router", 0) {
-            return result;
-        }
-
-        self.verify_one_with_components(vc)
+        self.verify_one_with_cached_plan(vc, None)
     }
 
-    /// Verify a VC using a routing plan that was already computed by this router.
-    ///
-    /// This keeps wrapper layers that need the plan for their own preflight
-    /// work from paying a second `can_handle` pass on cache misses.
-    pub(crate) fn verify_one_with_plan(
+    fn verify_one_with_cached_plan(
         &self,
         vc: &VerificationCondition,
-        plan: &[BackendSelection],
+        cached_plan: Option<&[BackendSelection]>,
     ) -> VerificationResult {
-        if let Some(result) = crate::backend_trait::unsupported_mir_unknown(vc, "router", 0) {
+        if let Some(result) = unroutable_vc_unknown(vc) {
             return result;
         }
 
-        Self::verify_with_backend_fallback_from_plan(
-            &self.backends,
+        let eligible_backends = match cached_plan {
+            Some(plan) => routing::eligible_backends_from_plan(&self.backends, vc, plan),
+            None => routing::eligible_backends(&self.backends, vc),
+        };
+        Self::verify_eligible_with_backend_fallback(
+            &eligible_backends,
             self.memory_guard.as_ref(),
-            vc,
-            plan,
             |backend| backend.verify(vc),
         )
-    }
-
-    /// Trust: Verify all VCs using bounded thread parallelism.
-    ///
-    /// For a single VC or `max_threads <= 1`, falls back to sequential
-    /// `verify_all` to avoid thread overhead. Otherwise splits VCs into
-    /// chunks and verifies each chunk on a separate thread.
-    ///
-    /// `max_threads` bounds concurrency (clamped to `1..=vcs.len()`).
-    pub fn verify_all_parallel(
-        &self,
-        vcs: &[VerificationCondition],
-        max_threads: usize,
-    ) -> Vec<(VerificationCondition, VerificationResult)> {
-        self.verify_all_parallel_with_deadline(vcs, max_threads, None)
-    }
-
-    /// Verify all VCs using bounded thread parallelism under an optional
-    /// per-batch wall-clock deadline.
-    ///
-    /// The deadline is checked inside each worker immediately before a VC is
-    /// dispatched. Obligations that have not started by the time the deadline
-    /// passes degrade to `Unknown`; already-started solver calls rely on their
-    /// per-VC timeout.
-    pub fn verify_all_parallel_with_deadline(
-        &self,
-        vcs: &[VerificationCondition],
-        max_threads: usize,
-        deadline: Option<std::time::Instant>,
-    ) -> Vec<(VerificationCondition, VerificationResult)> {
-        // Trust: Sequential fallback for trivial cases.
-        if vcs.is_empty() {
-            return Vec::new();
-        }
-        if vcs.len() <= 1 || max_threads <= 1 {
-            return self.verify_all_with_deadline(vcs, deadline);
-        }
-
-        // Inlined from deleted parallel.rs — simple chunked threading.
-        //
-        // Trust: ownership-only optimization — dispatch by shared `Arc<[VC]>`
-        // + per-thread index ranges instead of cloning each VC into an owned
-        // chunk (and again into a panic-fallback chunk, and again into each
-        // result tuple). The VCs are materialized into the `Arc` exactly once;
-        // workers borrow them by index and return `(index, result)` pairs, and
-        // the final output tuples clone each VC once from the shared slice into
-        // its original position. Verdicts and output order are unchanged: every
-        // VC is still dispatched exactly once, results are placed back by their
-        // original index, and the panic-fallback path re-runs the same VC range
-        // by borrowing the shared slice (no lost fallback).
-        let max_threads = max_threads.min(vcs.len()).max(1);
-        let backends = Arc::new(self.backends.clone());
-        let memory_guard = Arc::clone(&self.memory_guard);
-        let shared_vcs: Arc<[VerificationCondition]> = Arc::from(vcs);
-        let chunk_size = vcs.len().div_ceil(max_threads);
-
-        let mut handles = Vec::with_capacity(max_threads);
-        let mut start = 0usize;
-        while start < shared_vcs.len() {
-            let end = (start + chunk_size).min(shared_vcs.len());
-            let backends = Arc::clone(&backends);
-            let memory_guard = Arc::clone(&memory_guard);
-            let shared_vcs = Arc::clone(&shared_vcs);
-            let handle = std::thread::spawn(move || {
-                let mut results = Vec::with_capacity(end - start);
-                for index in start..end {
-                    let vc = &shared_vcs[index];
-                    let result = if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
-                        budget_exceeded_unknown(vc)
-                    } else {
-                        catch_unwind(AssertUnwindSafe(|| {
-                            Self::verify_one_with_components_from(
-                                backends.as_slice(),
-                                memory_guard.as_ref(),
-                                vc,
-                            )
-                        }))
-                        .unwrap_or_else(|_| {
-                            crate::backend_trait::panic_unknown(
-                                "router-parallel",
-                                0,
-                                format!("parallel dispatch for {}", vc.function),
-                            )
-                        })
-                    };
-                    results.push((index, result));
-                }
-                results
-            });
-            handles.push((start, end, handle));
-            start = end;
-        }
-
-        // Preallocate result slots by original position so output order is
-        // independent of thread completion order.
-        let mut slots: Vec<Option<VerificationResult>> =
-            (0..shared_vcs.len()).map(|_| None).collect();
-        for (start, end, handle) in handles {
-            match handle.join() {
-                Ok(chunk_results) => {
-                    for (index, result) in chunk_results {
-                        slots[index] = Some(result);
-                    }
-                }
-                // Panic-fallback: the worker thread itself unwound. Re-fill the
-                // same VC range (borrowed from the shared slice) with a sound
-                // `Unknown`, matching the prior per-VC fallback behavior.
-                Err(_) => {
-                    for index in start..end {
-                        slots[index] = Some(crate::backend_trait::panic_unknown(
-                            "router-parallel",
-                            0,
-                            format!("parallel worker for {}", shared_vcs[index].function),
-                        ));
-                    }
-                }
-            }
-        }
-
-        shared_vcs
-            .iter()
-            .zip(slots)
-            .map(|(vc, slot)| {
-                let result = slot.unwrap_or_else(|| {
-                    crate::backend_trait::panic_unknown(
-                        "router-parallel",
-                        0,
-                        format!("missing parallel result for {}", vc.function),
-                    )
-                });
-                (vc.clone(), result)
-            })
-            .collect()
     }
 
     /// Verify temporal VCs that carry an associated StateMachine.
@@ -525,8 +432,7 @@ impl Router {
     ) -> Vec<(VerificationCondition, VerificationResult)> {
         vcs.iter()
             .map(|(vc, machine)| {
-                if let Some(result) = crate::backend_trait::unsupported_mir_unknown(vc, "router", 0)
-                {
+                if let Some(result) = unroutable_vc_unknown(vc) {
                     return (vc.clone(), result);
                 }
 
@@ -542,28 +448,9 @@ impl Router {
     // Memory guard integration
     // -------------------------------------------------------------------
 
-    /// Verify through shared components so sequential and
-    /// parallel dispatch apply the same memory guard before solver calls.
-    fn verify_one_with_components(&self, vc: &VerificationCondition) -> VerificationResult {
-        Self::verify_one_with_components_from(&self.backends, self.memory_guard.as_ref(), vc)
-    }
-
-    fn verify_one_with_components_from(
-        backends: &[Arc<dyn VerificationBackend>],
+    fn verify_eligible_with_backend_fallback<F>(
+        eligible_backends: &[&Arc<dyn VerificationBackend>],
         memory_guard: &MemoryGuard,
-        vc: &VerificationCondition,
-    ) -> VerificationResult {
-        if let Some(result) = crate::backend_trait::unsupported_mir_unknown(vc, "router", 0) {
-            return result;
-        }
-
-        Self::verify_with_backend_fallback(backends, memory_guard, vc, |backend| backend.verify(vc))
-    }
-
-    fn verify_with_backend_fallback<F>(
-        backends: &[Arc<dyn VerificationBackend>],
-        memory_guard: &MemoryGuard,
-        vc: &VerificationCondition,
         mut verify: F,
     ) -> VerificationResult
     where
@@ -571,7 +458,6 @@ impl Router {
     {
         // Ordinary router dispatch keeps FallbackChain's retry/simplify policy
         // out of the path: only later capable backends are tried here.
-        let eligible_backends = routing::eligible_backends(backends, vc);
         let mut last_non_definitive = None;
         let mut dispatched_any = false;
 
@@ -596,64 +482,11 @@ impl Router {
             });
         }
 
-        VerificationResult::Unknown {
-            solver: "none".into(),
-            time_ms: 0,
-            reason: "no backend can handle this VC".to_string(),
-        }
-    }
-
-    fn verify_with_backend_fallback_from_plan<F>(
-        backends: &[Arc<dyn VerificationBackend>],
-        memory_guard: &MemoryGuard,
-        vc: &VerificationCondition,
-        plan: &[BackendSelection],
-        mut verify: F,
-    ) -> VerificationResult
-    where
-        F: FnMut(&Arc<dyn VerificationBackend>) -> VerificationResult,
-    {
-        let property = termination_dispatch::classify_property(vc);
-        let mut last_non_definitive = None;
-        let mut dispatched_any = false;
-
-        for selection in plan {
-            if !selection.can_handle {
-                continue;
-            }
-            let Some(backend) = backends.get(selection.index) else {
-                continue;
-            };
-            let validity = termination_dispatch::validate_dispatch(property, backend.name());
-            if validity.is_invalid() {
-                continue;
-            }
-
-            if let Some(result) = Self::check_memory_limit_for(memory_guard) {
-                return result;
-            }
-
-            dispatched_any = true;
-            let result = verify(backend);
-            if router_result_is_definitive(&result) {
-                return result;
-            }
-            last_non_definitive = Some(result);
-        }
-
-        if dispatched_any {
-            return last_non_definitive.unwrap_or_else(|| VerificationResult::Unknown {
-                solver: "none".into(),
-                time_ms: 0,
-                reason: "no backend produced a verification result".to_string(),
-            });
-        }
-
-        VerificationResult::Unknown {
-            solver: "none".into(),
-            time_ms: 0,
-            reason: "no backend can handle this VC".to_string(),
-        }
+        trust_types::determinism::StopCause::Unsupported.unknown_result(
+            "none",
+            0,
+            "no backend can handle this VC",
+        )
     }
 
     fn check_memory_limit_for(memory_guard: &MemoryGuard) -> Option<VerificationResult> {
@@ -663,14 +496,20 @@ impl Router {
                 current_mb,
                 limit_mb,
                 peak_mb,
-            }) => Some(VerificationResult::Unknown {
-                solver: "memory-guard".into(),
-                time_ms: 0,
-                reason: format!(
-                    "memory limit exceeded: {current_mb}MB used, {limit_mb}MB limit \
-                     (peak: {peak_mb}MB) — skipping solver dispatch"
-                ),
-            }),
+            }) => {
+                let result = trust_types::determinism::StopCause::RssBackstop.unknown_result(
+                    "memory-guard",
+                    0,
+                    &format!(
+                        "memory limit exceeded: {current_mb}MB used, {limit_mb}MB limit \
+                         (peak: {peak_mb}MB) — skipping solver dispatch"
+                    ),
+                );
+                // Plan §2: an RSS backstop fired, whether or not this result
+                // becomes a published row.
+                trust_types::determinism::note_result(ROUTER_LANE, &result);
+                Some(result)
+            }
             Err(_query_err) => {
                 // Query failure is non-fatal: proceed with dispatch.
                 // The guard already logs warnings to stderr.
@@ -678,6 +517,10 @@ impl Router {
             }
         }
     }
+}
+
+fn unroutable_vc_unknown(vc: &VerificationCondition) -> Option<VerificationResult> {
+    crate::backend_trait::unsupported_mir_unknown(vc, "router", 0)
 }
 
 fn router_result_is_definitive(result: &VerificationResult) -> bool {
@@ -693,16 +536,27 @@ impl Default for Router {
 /// Sound fallback verdict when a per-function wall-clock budget is exceeded: the
 /// obligation is reported `Unknown` (never `Proved` or `Failed`), so degrading a
 /// pathological function under time pressure can never produce an unsound proof.
+///
+/// Which obligations land here depends on how fast the ones before them ran, so
+/// the stop is `wall-backstop`: the unit that carries it is not reproducible.
 fn budget_exceeded_unknown(vc: &VerificationCondition) -> VerificationResult {
-    VerificationResult::Unknown {
-        solver: Symbol::intern("trust-budget"),
-        time_ms: 0,
-        reason: format!(
+    let result = trust_types::determinism::StopCause::WallBackstop.unknown_result(
+        "trust-budget",
+        0,
+        &format!(
             "per-function wall-clock verification budget exceeded before dispatching obligation for `{}`",
             vc.function
         ),
-    }
+    );
+    // Plan §2: the wall backstop fired, whether or not this result becomes a
+    // published row (an internal lane that routes through here consumes it).
+    trust_types::determinism::note_result(ROUTER_LANE, &result);
+    result
 }
+
+/// The backstop-ledger lane the router reports its own backstops under (the
+/// per-function deadline before dispatch, the memory guard).
+const ROUTER_LANE: &str = "router";
 
 #[cfg(test)]
 mod tests {
@@ -720,9 +574,12 @@ mod tests {
     #[cfg(feature = "ay-backend")]
     #[test]
     fn deterministic_in_process_ay_is_the_inline_form() {
-        let named = Router::deterministic_in_process_ay(1234);
+        let scale = trust_types::determinism::EffortScale { conflicts_per_node: 7 };
+        let named = Router::deterministic_in_process_ay(1234, scale);
         let inline = Router::with_backends(vec![Box::new(
-            crate::in_process_ay_backend::InProcessAyBackend::new().with_timeout(1234),
+            crate::in_process_ay_backend::InProcessAyBackend::new()
+                .with_timeout(1234)
+                .with_effort_scale(scale),
         )]);
         assert_eq!(named.backends.len(), 1, "exactly one backend — determinism seam");
         assert_eq!(inline.backends.len(), 1);
@@ -842,30 +699,6 @@ mod tests {
         // Soundness: a budget-exceeded obligation is never reported Proved, and the
         // solver backend is never dispatched once the deadline has passed.
         assert!(!results.iter().any(|(_, r)| r.is_proved()));
-        assert_eq!(verify_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn verify_all_parallel_with_past_deadline_degrades_to_unknown_without_dispatch() {
-        let can_handle_calls = Arc::new(AtomicUsize::new(0));
-        let verify_calls = Arc::new(AtomicUsize::new(0));
-        let backend = Arc::new(CountingBackend {
-            can_handle_calls: Arc::clone(&can_handle_calls),
-            verify_calls: Arc::clone(&verify_calls),
-        });
-        let router = Router::with_arc_backends(vec![backend]);
-        let vcs = vec![division_vc("a"), division_vc("b"), division_vc("c"), division_vc("d")];
-
-        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        let results = router.verify_all_parallel_with_deadline(&vcs, 4, Some(past));
-
-        assert_eq!(results.len(), 4);
-        assert!(results.iter().all(|(_, r)| matches!(
-            r,
-            VerificationResult::Unknown { solver, reason, .. }
-                if solver.as_str() == "trust-budget" && reason.contains("budget exceeded")
-        )));
-        assert_eq!(can_handle_calls.load(Ordering::SeqCst), 0);
         assert_eq!(verify_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1006,6 +839,57 @@ mod tests {
         );
     }
 
+    /// Plan P4: dispatch is serial and in input order — the only path. A
+    /// backend sees the batch's distinct obligations exactly in the order they
+    /// were given, on the calling thread.
+    #[test]
+    fn serial_canonical_dispatch_is_the_only_path() {
+        struct OrderRecordingBackend {
+            seen: Arc<std::sync::Mutex<Vec<(String, std::thread::ThreadId)>>>,
+        }
+
+        impl VerificationBackend for OrderRecordingBackend {
+            fn name(&self) -> &str {
+                "order-recording"
+            }
+
+            fn can_handle(&self, _vc: &VerificationCondition) -> bool {
+                true
+            }
+
+            fn verify(&self, vc: &VerificationCondition) -> VerificationResult {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((vc.function.as_str().to_string(), std::thread::current().id()));
+                VerificationResult::Proved {
+                    solver: "order-recording".into(),
+                    time_ms: 0,
+                    strength: ProofStrength::smt_unsat(),
+                    proof_certificate: None,
+                    solver_warnings: None,
+                    native_proof_envelope: None,
+                }
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = Router::with_backends(vec![Box::new(OrderRecordingBackend {
+            seen: Arc::clone(&seen),
+        })]);
+        let names = ["v9", "v1", "v5", "v3", "v7", "v2", "v8", "v4", "v6", "v0"];
+        let vcs: Vec<VerificationCondition> = names.into_iter().map(distinct_division_vc).collect();
+
+        let results = router.verify_all(&vcs);
+
+        assert_eq!(results.len(), names.len());
+        let seen = seen.lock().unwrap();
+        let order: Vec<&str> = seen.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(order, names, "the backend sees the batch in input order");
+        let caller = std::thread::current().id();
+        assert!(seen.iter().all(|(_, thread)| *thread == caller), "dispatch stays on the caller");
+    }
+
     #[test]
     fn routing_preflight_backend_plan_queries_each_backend_once() {
         let can_handle_calls = Arc::new(AtomicUsize::new(0));
@@ -1057,26 +941,31 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_mir_verify_all_parallel_does_not_dispatch_backend() {
+    fn routing_preflight_verify_all_queries_each_backend_once_per_vc() {
         let can_handle_calls = Arc::new(AtomicUsize::new(0));
         let verify_calls = Arc::new(AtomicUsize::new(0));
-        let backend = Arc::new(CountingBackend {
+        let first = Arc::new(CountingBackend {
             can_handle_calls: Arc::clone(&can_handle_calls),
             verify_calls: Arc::clone(&verify_calls),
         });
-        let router = Router::with_arc_backends(vec![backend]);
-        let vcs = vec![unsupported_mir_vc(), unsupported_mir_vc()];
+        let second = Arc::new(CountingBackend {
+            can_handle_calls: Arc::clone(&can_handle_calls),
+            verify_calls: Arc::clone(&verify_calls),
+        });
+        let router = Router::with_arc_backends(vec![first, second]);
 
-        let results = router.verify_all_parallel(&vcs, 2);
-
-        assert_eq!(results.len(), 2);
-        assert!(
-            results
-                .iter()
-                .all(|(_, result)| matches!(result, VerificationResult::Unknown { reason, .. } if reason.contains("unsupported MIR")))
-        );
-        assert_eq!(can_handle_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(verify_calls.load(Ordering::SeqCst), 0);
+        let vcs = vec![
+            distinct_division_vc("a"),
+            distinct_division_vc("b"),
+            distinct_division_vc("a"),
+        ];
+        let results = router.verify_all(&vcs);
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|(_, r)| r.is_proved()));
+        // 3 input VCs × 2 backends = 6 `can_handle` queries total (representatives
+        // reuse their preflight plan instead of re-querying every backend).
+        assert_eq!(can_handle_calls.load(Ordering::SeqCst), 6);
+        assert_eq!(verify_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1089,5 +978,50 @@ mod tests {
         assert!(
             matches!(&results[0].1, VerificationResult::Unknown { reason, .. } if reason.contains("unsupported MIR"))
         );
+    }
+
+    #[test]
+    fn wave495_single_vc_fast_path_and_multi_vc_fanout_and_ground_check_parity() {
+        let can_handle_calls = Arc::new(AtomicUsize::new(0));
+        let verify_calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(CountingBackend {
+            can_handle_calls: Arc::clone(&can_handle_calls),
+            verify_calls: Arc::clone(&verify_calls),
+        });
+        let router = Router::with_arc_backends(vec![backend]);
+
+        let single = [distinct_division_vc("only")];
+        let out = router.verify_all(&single);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.function.as_str(), "only");
+        assert!(out[0].1.is_proved());
+        assert_eq!(can_handle_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(verify_calls.load(Ordering::SeqCst), 1);
+
+        #[cfg(feature = "ay-backend")]
+        {
+            use crate::in_process_ay_backend::formula_is_ground;
+            assert!(formula_is_ground(&Formula::Eq(
+                Box::new(Formula::Int(2)),
+                Box::new(Formula::Int(2)),
+            )));
+            assert!(!formula_is_ground(&Formula::Var("free_x".into(), Sort::Int)));
+            let closed_forall = Formula::Forall(
+                vec![("b".into(), Sort::Int)],
+                Box::new(Formula::Gt(
+                    Box::new(Formula::Var("b".into(), Sort::Int)),
+                    Box::new(Formula::Int(0)),
+                )),
+            );
+            assert!(formula_is_ground(&closed_forall));
+            let shadowed_plus_free = Formula::And(vec![
+                closed_forall,
+                Formula::Eq(
+                    Box::new(Formula::Var("b".into(), Sort::BitVec(8))),
+                    Box::new(Formula::BitVec { value: 1, width: 8 }),
+                ),
+            ]);
+            assert!(!formula_is_ground(&shadowed_plus_free));
+        }
     }
 }

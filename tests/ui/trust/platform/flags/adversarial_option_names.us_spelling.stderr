@@ -1,0 +1,4 @@
+error: unknown unstable option: `trust-platform-unanalyzed`
+  |
+  = help: you might have meant to use `-Z trust-platform-unanalysed=<value>`
+

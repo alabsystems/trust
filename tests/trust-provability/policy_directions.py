@@ -107,7 +107,6 @@ def run(path, certify):
     """-> (built: bool, rows: [transport rows]).  Raises HarnessError."""
     out_dir = tempfile.mkdtemp(prefix="directions_")
     env = dict(os.environ)
-    env["TRUST_SEED_STAIRCASE"] = "1"
     cmd = [TRUSTC, *BASE_FLAGS]
     if certify:
         cmd.append("-Ztrust-policy=certify")

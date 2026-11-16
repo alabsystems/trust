@@ -13,6 +13,8 @@ use rustc_middle::ty::{self, TyCtxt, TyKind, TypeVisitableExt};
 use trust_types::fx::FxHashMap;
 use trust_types::{AdtAuth, ArbPrecKind, FnSig, SerdeJsonKind, TotalMapKind, Ty as TrustTy};
 
+use crate::ty_frontier::{FrontierStep, frontier_walk};
+
 // verifier-perf: original budget restored. An earlier patch bumped
 // nodes 4096 → 65536, but that interacted badly with the alias-normalize
 // path — more types reached normalization, each invoking the trait
@@ -38,8 +40,8 @@ const MAX_TYPE_LOWERING_NODES: usize = 4096;
 //
 // FIX: meter the cumulative node count of every PRODUCED subtree (charged for
 // freshly-lowered trees AND for cache-hit clones, since the clone materializes
-// the same memory). Once the cumulative produced size for ONE function's type
-// lowering crosses the budget, every subsequent lowering returns the cheap
+// the same memory). Once the cumulative produced size for ONE WALK crosses the
+// budget, every subsequent lowering in that walk returns the cheap
 // fail-closed recursive-ADT `Unsupported` marker instead of assembling more fat
 // tree. The marker is the SAME `Ty::Unsupported { kind: "TyKind::Adt", detail:
 // "recursive…" }` shape this module already produces for recursive ADTs, so a
@@ -195,6 +197,34 @@ fn produced_node_budget() -> usize {
     MAX_TYPE_LOWERING_PRODUCED_NODES
 }
 
+/// A scalar leaf: `bool`, `char`, an integer or a float type. Each lowers to ONE
+/// produced node and reaches no other type (the first arms of `convert_ty_inner_raw`),
+/// so the produced-node bail does not apply to it.
+///
+/// That bail exists to stop ASSEMBLING tree, and a scalar assembles none: its
+/// fail-closed replacement is one node too, so degrading it saves nothing. What it
+/// cost was real. The meter is cumulative over the walk (residual R6), so a scalar's
+/// spelling depended on how much budget the types lowered before it had spent: a
+/// `u32` field declared after a fat sibling field lowered to `Unsupported`, and every
+/// read of that field collapsed its whole body. Measured on aterm-wasm
+/// (TRUST-KI-1014-1, channel seal `b58a105dde`): `self.reflow_grace -= 1` on
+/// `AtermTerminal` made `pump_reflow_on_render_tick` `MalformedTrustIr` ("CheckedBinaryOp
+/// lhs must match the tuple payload's supported fixed-width integer type"), and its
+/// overflow obligation and hardened twin, both proved when the field is declared
+/// first, were lost.
+///
+/// SOUNDNESS: a scalar's lowering is a function of the type alone (and of the
+/// compilation's fixed `faithful_scalars` mode and target pointer width), exactly what
+/// an in-budget walk produces for it. The exemption adds no modeling, and every node
+/// it emits is still charged, so the bail still stops every non-scalar type that
+/// follows.
+fn is_produced_budget_exempt_scalar(ty: ty::Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
+    )
+}
+
 /// The cheap fail-closed leaf returned once the produced-node budget is spent —
 /// the SAME recursive-ADT `Unsupported` marker this module already produces for
 /// genuinely recursive ADTs (load-bearing `detail.starts_with("recursive")`).
@@ -203,6 +233,30 @@ fn produced_budget_degraded_leaf() -> TrustTy {
         kind: "TyKind::Adt".to_string(),
         detail: "recursive ADT (degraded: type lowering exceeded produced-node budget)".to_string(),
     }
+}
+
+/// Trust (REPR-U128-HIGH-TAG-1): the fail-closed leaf for an enum one of whose
+/// tags has no `i128` denotation — in practice a `#[repr(u128)]` tag above
+/// `i128::MAX` (see [`decode_discr_tag`]). `VariantDef::discriminant` is an
+/// `i128`, so such an enum cannot be lowered to a modeled `Ty::Adt` without
+/// storing a FALSE tag, and every consumer of the tag set would then state a
+/// false fact about the discriminant (see `lower_enum_adt`).
+///
+/// Shaped like [`produced_budget_degraded_leaf`] (`kind: "TyKind::Adt"`), but the
+/// detail deliberately does NOT start with `recursive`: that prefix is
+/// load-bearing (`trust_vcgen`'s `collect_type_unsupported` skips the
+/// declaration marker of a recursive ADT), and this enum is not recursive — a
+/// local of this type must keep stamping its `UnsupportedMir` row. The detail is
+/// a function of the TYPE alone, so the memo caches one answer per type.
+fn enum_tag_without_i128_denotation_leaf(name: &str, variant: &str) -> TrustTy {
+    unsupported_ty(
+        "TyKind::Adt",
+        format!(
+            "enum {name}: the tag of variant {variant} has no i128 denotation (a #[repr(u128)] \
+             tag above i128::MAX); a modeled enum would carry a false discriminant \
+             (REPR-U128-HIGH-TAG-1)"
+        ),
+    )
 }
 
 /// A BY-NAME recursive-datatype reference (Lever A): an empty-`variants`
@@ -214,8 +268,8 @@ fn produced_budget_degraded_leaf() -> TrustTy {
 /// Unknown. The defining occurrence (the outer, fully-lowered type) carries the
 /// full structure. SOUNDNESS: a datatype reference introduces NO facts; it is a
 /// sort marker only (see `Ty::Datatype`'s doc).
-fn recursive_datatype_ref(name: &str) -> TrustTy {
-    TrustTy::Datatype { name: name.to_string(), variants: Vec::new() }
+fn recursive_datatype_ref(name: impl Into<String>) -> TrustTy {
+    TrustTy::Datatype { name: name.into(), variants: Vec::new() }
 }
 
 // ─── RC-1: CANONICAL recursive-type lowering ────────────────────────────────
@@ -549,6 +603,17 @@ fn recursive_datatype_ref(name: &str) -> TrustTy {
 // of every nominal position, and the whole point of the root exemption is that
 // the defining occurrence still carries the real variant list.
 //
+// THE SCOPE OF THE BUDGET, corrected 2026-09-13 because three comments in this
+// file said "per function" and the code has never been that: the meter lives in
+// `TyLoweringCtx`, and a context is built per `convert_ty` CALL — one root type,
+// i.e. one local, one place, one signature slot — and AFRESH for every cut-point
+// definition (`cut_point_definition`). So a body performs many independently
+// metered walks, and a definition is metered on its own, not against the walk
+// that first reached the cut point. That is deliberate (a definition built with
+// leftover budget would be root-relative, R6), but it also means "the budget is
+// bounded per function" is false: the per-function bound is the ambient
+// `VerifyBudgetGuard` deadline polled in `convert_ty_inner`, not this meter.
+//
 // FAIL-SAFE. Discovery is bounded by `MAX_CANONICAL_CUT_NODES`. If the bound is
 // hit — the EXPANDING-generic recursion (`List<Box<List<T>>>`), whose node set is
 // genuinely infinite and which `is_expanding_recursive_adt` deliberately leaves
@@ -632,7 +697,40 @@ fn recursive_datatype_ref(name: &str) -> TrustTy {
 //       lowered earlier would not. The cut MARKER itself is exempt (it is
 //       emitted before every budget bail, see `convert_ty_inner`), so this can
 //       only cost a DEFINITION, never split one type into two markers. A missing
-//       definition is the pre-carrier decline.
+//       definition is the pre-carrier decline. A SCALAR LEAF is exempt from the
+//       produced-node bail too (2026-10-14, `is_produced_budget_exempt_scalar`):
+//       before that, a `u32` field declared after a fat sibling lowered to
+//       `Unsupported` (TRUST-KI-1014-1). The node-count bail
+//       (`MAX_TYPE_LOWERING_NODES`) still applies to scalars, unchanged: every
+//       fresh node also charges one produced node, so it fires first only on a
+//       walk of 4096 distinct types with few memo hits between them, and no such
+//       walk was seen in the cases measured for TRUST-KI-1014-1.
+//   R8. NEW (2026-09-13), the by-name-child rule's remainder: inside a cut
+//       point's definition every nominal non-sysroot ADT is a marker with a
+//       table entry, while the same type as a LOCAL (an acyclic type, never a
+//       cut point) is its full self. Position-relative, like R5, and narrower:
+//       it fires only inside a definition. `ty_eq` declines the pair; the
+//       native lane havocs a marker VALUE and resolves only the TYPE through
+//       the table. Since 2026-09-24, faithful enum-field admission can consult
+//       an exact completed enum definition for its layout metadata; that does
+//       not inline the marker or establish its value. Removing R8 means lowering
+//       such a type by name EVERYWHERE — a canonical rule ("by name iff its
+//       reachability graph has a cycle" is a function of the type alone) that
+//       would trade the native lane's structural precision on every acyclic
+//       aggregate that merely CONTAINS a recursive type, and is not taken here.
+//   R9. NEW (2026-09-13), what this change does NOT fix, sized rather than
+//       built: a memo-cache hit is still CLONED and CHARGED at its full size
+//       (see the memo arm of `convert_ty_inner`), so an ACYCLIC diamond DAG
+//       (the measured `Result<(), clean_kernel::EnvError>` walk: 5633
+//       materialized, 6 retained) is still charged per PATH, and a definition's
+//       flattened `__v{v}_{f}` view still duplicates every variant field. Under
+//       the tree representation both are real memory, so "charge one node per
+//       hit" would be a false meter, not a fix; the fix is the shared-node
+//       representation of `0c57a19ff6` applied to `trust_types::Ty` itself
+//       (`Box<Ty>` -> a refcounted node), which is a wire-format change across
+//       every consumer of `Ty` and is out of this change's size. Inside a
+//       DEFINITION the by-name-child rule makes the cyclic diamond O(k) instead
+//       of O(2^k) without it (measured on the `gen2.py` shape).
 
 /// Node bound for the canonical-cut discovery walk. Reaching it yields an EMPTY
 /// cut set (i.e. exactly today's root-relative lowering) — never a partial cut
@@ -640,20 +738,42 @@ fn recursive_datatype_ref(name: &str) -> TrustTy {
 const MAX_CANONICAL_CUT_NODES: usize = MAX_TYPE_LOWERING_NODES;
 
 /// The ordering key the greedy feedback vertex set picks its cut points with.
-/// EVERY component must be a function of the TYPE ALONE — anything derived from
-/// the walk (discovery index, insertion order, the root) would make the cut set
-/// root-relative again, which is the very defect RC-1 exists to remove.
-type CanonicalCutKey = (usize, String, u32, u32);
+/// EVERY component must be a function of the TYPE and of the strongly connected
+/// component the pick is made in — NEVER of the walk (discovery index, insertion
+/// order, the root), which would make the cut set root-relative again, the very
+/// defect RC-1 exists to remove. `wraps_component_member` says why the component
+/// is admissible and why the type alone is not enough.
+///
+/// Lexicographic: (wraps a member of the current component, static key). The
+/// order is TOTAL because each component's order is total — `bool`, `usize`,
+/// byte-lexicographic `String`, `u32`, `u32` — and a lexicographic product of
+/// total orders is total. It is STRICT on distinct interned types up to residual
+/// R4 (a printer collision between two different argument lists on one `DefId`
+/// ties the static key; nothing else can), and the FVS it drives is therefore
+/// deterministic: two compilations of one crate compute one `datatype_defs`.
+type CanonicalCutKey = (bool, CanonicalCutStaticKey);
 
-/// The deterministic total order the greedy feedback vertex set picks its cut
-/// points with: the SHALLOWEST def path in the cycle first (so a cycle through
-/// `Tree`/`std::sync::Arc`/`std::ptr::NonNull`/`alloc::sync::ArcInner` is cut at
-/// `Tree`, the type the cycle is ABOUT, not at an `std` container internal),
-/// then the fully-instantiated path, then the type's `DefId` (`CrateNum`,
+/// The component-independent part of [`CanonicalCutKey`]: a function of the
+/// type alone, rendered once per node and cached across the greedy rounds.
+type CanonicalCutStaticKey = (usize, String, u32, u32);
+
+/// The static (component-independent) part of the deterministic total order the
+/// greedy feedback vertex set picks its cut points with: the SHALLOWEST def path
+/// first, then the fully-instantiated path, then the type's `DefId` (`CrateNum`,
 /// `DefIndex`) so two distinct types that happen to PRINT the same still order
 /// deterministically rather than falling back on discovery order. See residual
 /// R4 on the block comment above for what is left.
-fn canonical_cut_key<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> CanonicalCutKey {
+///
+/// CORRECTION 2026-09-13: this used to be the WHOLE key, and its doc said the
+/// shallowest path cuts "`Tree`, the type the cycle is ABOUT, not an `std`
+/// container internal". That holds only for a CRATE-ROOT type, whose single
+/// segment out-sorts every std wrapper. For a type in a module —
+/// `syn::expr::Expr`, two segments — `alloc::boxed::Box<syn::expr::Expr>` ties
+/// on segments and `"alloc" < "syn"` decides, so the cut landed on the WRAPPER
+/// and the enum it wraps was tree-expanded at every occurrence (see
+/// `wraps_component_member` for the measurement). The wrapper bit now precedes
+/// this key; this key only orders the non-wrapper candidates among themselves.
+fn canonical_cut_static_key<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> CanonicalCutStaticKey {
     let TyKind::Adt(def, args) = ty.kind() else {
         return (usize::MAX, String::new(), u32::MAX, u32::MAX);
     };
@@ -670,7 +790,117 @@ fn canonical_cut_key<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> CanonicalCutK
     )
 }
 
-/// The by-name reference a CUT POINT lowers to.
+/// The "wrapper" bit of [`CanonicalCutKey`]: does `ty`'s generic-argument list
+/// mention a member of the strongly connected component the pick is being made
+/// in? `false` sorts first, so a WRAPPED type outranks every wrapper of it.
+///
+/// THE DEFECT THIS CLOSES, measured 2026-09-13 on sealed driver `dff2b22d1`
+/// against `syn::Expr` and the 600-variant `gen3.py` shape: the cycle
+/// `Expr -> Box<Expr> -> Unique<Expr> -> NonNull<Expr> -> Expr` was ordered by
+/// (segment count, path) alone, `syn::expr::Expr` ties `alloc::boxed::Box` at two
+/// segments, and `"alloc" < "syn"` decided — so the feedback vertex set cut
+/// `Box<Expr>` and never `Expr`. `Expr` was then a NON-cut node, tree-expanded at
+/// every occurrence: the root walk `&syn::Expr` materialized 8003 nodes against
+/// the 8000 budget and degraded, and every `Box<Expr>` definition re-expanded its
+/// pointee in a fresh sub-context and tripped the same budget — the exact
+/// `Box{Unique{NonNull{RawPtr{pointee: Unsupported{degraded}}}}}` string on 272
+/// rows across 16 functions of `trust-spec-elab`.
+///
+/// WHY THIS CRITERION AND NOT "prefer non-sysroot": a user wrapper (`struct
+/// MyBox<T>(Box<T>)`) sits in the same cycle with the same defect, and the crate
+/// is not what makes `Box<Expr>` the wrong cut — its ARGUMENT is. A node whose
+/// arguments mention another member of the cycle is an instantiation ABOUT that
+/// member; cutting it leaves the member expanded at every occurrence. `Foo<u8>`
+/// in `enum Foo<T> { Cons(T, Box<Foo<T>>) }` mentions only `u8`, which is not on
+/// the cycle, so it stays the preferred cut over `Box<Foo<u8>>`.
+///
+/// ROOT-INDEPENDENCE. SCC membership is decided by the global graph, and every
+/// discovery from any root sees each SCC wholly or not at all (see
+/// `greedy_feedback_vertex_set`), so this bit is the same for every root. It is
+/// recomputed per greedy ROUND from the CURRENT component — deleting the wrapped
+/// member can turn a wrapper into a non-wrapper in the next round — and that,
+/// too, is the same in every root's walk, because the deleted set is (by
+/// induction on rounds) the same. Pinned by
+/// `greedy_fvs_recomputes_the_wrapper_bit_after_each_cut`.
+fn wraps_component_member<'tcx>(
+    ty: ty::Ty<'tcx>,
+    component: &trust_types::fx::FxHashSet<ty::Ty<'tcx>>,
+) -> bool {
+    let TyKind::Adt(_, args) = ty.kind() else { return false };
+    args.iter().any(|arg| {
+        arg.walk().filter_map(|inner| inner.as_type()).any(|inner_ty| component.contains(&inner_ty))
+    })
+}
+
+/// The name a by-name marker carries, from its rendered def path and the four
+/// facts the identity-stamp rule is stated over. Pure, so the SAME-NAME
+/// CROSS-CRATE pin (`by_name_marker_name_separates_same_named_crates`) can run
+/// without a compiler session.
+///
+/// `safe_def_path_str` prefixes the crate NAME, so two crates with different
+/// names never collide — but two crates that SHARE a name (two versions of `syn`
+/// in one graph; a local crate shadowing a dependency's name) both render
+/// `syn::expr::Expr`, and a by-name marker carries nothing but its name. Two such
+/// markers compare EQUAL under `assignment_types::ty_eq` while denoting different
+/// types — the same fail-open merge the instantiation suffix exists to prevent,
+/// one axis over — and their definitions collide in the table (a second,
+/// different definition of one name is refused and REMOVES the first, so both
+/// go undefined: fail-closed, but silently). The marker is therefore stamped
+/// with the defining crate's `StableCrateId` whenever its crate name is
+/// ambiguous in this graph, on exactly the rule the callee renderer uses
+/// (`convert::direct_call_def_path` -> `sysroot_identity_stamp_required`), so
+/// an unambiguous graph — every ordinary compilation — keeps byte-identical
+/// names, and the impersonation half of that rule (already applied by
+/// `sysroot_authenticated_def_path_str`) composes idempotently.
+fn by_name_marker_name(
+    rendered_path: String,
+    stable_crate_id: u64,
+    defining_crate_is_local: bool,
+    crate_name_wears_sysroot_spelling: bool,
+    defining_crate_is_real_sysroot: bool,
+    crate_name_is_ambiguous: bool,
+) -> String {
+    trust_types::stamp_unauthenticated_crate_path(
+        rendered_path,
+        stable_crate_id,
+        trust_types::sysroot_identity_stamp_required(
+            defining_crate_is_local,
+            crate_name_wears_sysroot_spelling,
+            defining_crate_is_real_sysroot,
+            crate_name_is_ambiguous,
+        ),
+    )
+}
+
+/// Is `krate`'s NAME shared with another crate in this graph (the local crate,
+/// or another external)? The local crate itself is never ambiguous — there is
+/// exactly one crate under compilation. The same value as the `ambiguous_callee`
+/// computation in `convert::direct_call_def_path`: DROP-NAME-COLLIDE-1
+/// (2026-10-03) made both read the one rule, `convert::crate_name_is_shared`,
+/// instead of each spelling a copy.
+fn crate_name_is_ambiguous(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> bool {
+    krate != rustc_span::def_id::LOCAL_CRATE
+        && crate::convert::crate_name_is_shared(tcx, krate, |_| false)
+}
+
+/// [`by_name_marker_name`] over a rustc type's defining `DefId`.
+fn identity_bearing_marker_name(
+    tcx: TyCtxt<'_>,
+    did: rustc_hir::def_id::DefId,
+    rendered_path: String,
+) -> String {
+    by_name_marker_name(
+        rendered_path,
+        tcx.stable_crate_id(did.krate).as_u64(),
+        did.is_local(),
+        trust_types::crate_name_wears_sysroot_spelling(tcx.crate_name(did.krate).as_str()),
+        crate::convert::is_real_sysroot_crate(tcx, did.krate),
+        crate_name_is_ambiguous(tcx, did.krate),
+    )
+}
+
+/// The by-name reference a CUT POINT — or, inside a definition, a BY-NAME
+/// NOMINAL CHILD (see `is_by_name_nominal_child`) — lowers to.
 ///
 /// IDENTITY-BEARING, and that is the whole point (see "WHY IT CANNOT MERGE TWO
 /// GENUINELY DIFFERENT TYPES" above): a cut point is emitted with no structure at
@@ -691,15 +921,15 @@ fn canonical_cut_ref<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> TrustTy {
         return unsupported_ty("TyKind", "canonical cut point was not a nominal ADT");
     };
     let did = def.did();
-    let erased = crate::sysroot_authenticated_def_path_str(tcx, did);
     let has_non_lifetime_args = args.types().next().is_some() || args.consts().next().is_some();
-    if has_non_lifetime_args {
-        recursive_datatype_ref(&crate::sysroot_authenticated_def_path_str_with_args(
-            tcx, did, *args,
-        ))
+    let rendered = if has_non_lifetime_args {
+        crate::sysroot_authenticated_def_path_str_with_args(tcx, did, *args)
     } else {
-        recursive_datatype_ref(&erased)
-    }
+        crate::sysroot_authenticated_def_path_str(tcx, did)
+    };
+    // Same-name cross-crate pin: stamp only when the crate name is ambiguous in
+    // THIS graph, so every ordinary compilation keeps byte-identical names.
+    recursive_datatype_ref(identity_bearing_marker_name(tcx, did, rendered))
 }
 
 // ─── R0 REMOVED: the out-of-band definition table, and who may write it ──────
@@ -779,6 +1009,7 @@ pub(crate) struct DatatypeDefScope(());
 
 impl DatatypeDefScope {
     pub(crate) fn begin() -> Self {
+        bump_extraction_scope_epoch();
         DATATYPE_DEFS.with(|c| *c.borrow_mut() = DatatypeDefCollector::default());
         DatatypeDefScope(())
     }
@@ -786,6 +1017,7 @@ impl DatatypeDefScope {
 
 impl Drop for DatatypeDefScope {
     fn drop(&mut self) {
+        bump_extraction_scope_epoch();
         DATATYPE_DEFS.with(|c| *c.borrow_mut() = DatatypeDefCollector::default());
     }
 }
@@ -793,6 +1025,13 @@ impl Drop for DatatypeDefScope {
 /// The definitions recorded so far in the current [`DatatypeDefScope`].
 pub(crate) fn collected_datatype_defs() -> trust_types::DatatypeDefs {
     DATATYPE_DEFS.with(|c| c.borrow().defs.clone())
+}
+
+/// Move out the definitions recorded in the current [`DatatypeDefScope`] at the
+/// end of body extraction, avoiding a second clone of the map right before the
+/// scope drops.
+pub(crate) fn take_collected_datatype_defs() -> trust_types::DatatypeDefs {
+    DATATYPE_DEFS.with(|c| std::mem::take(&mut c.borrow_mut().defs))
 }
 
 thread_local! {
@@ -821,6 +1060,7 @@ pub(crate) struct OwnerDefPathScope(String);
 
 impl OwnerDefPathScope {
     pub(crate) fn begin(def_path: &str) -> Self {
+        bump_extraction_scope_epoch();
         let prev = OWNER_DEF_PATH.with(|c| c.replace(def_path.to_string()));
         OwnerDefPathScope(prev)
     }
@@ -828,6 +1068,7 @@ impl OwnerDefPathScope {
 
 impl Drop for OwnerDefPathScope {
     fn drop(&mut self) {
+        bump_extraction_scope_epoch();
         let prev = std::mem::take(&mut self.0);
         OWNER_DEF_PATH.with(|c| *c.borrow_mut() = prev);
     }
@@ -866,9 +1107,68 @@ fn cut_point_definition<'tcx>(
         // Expand THIS occurrence, once. Every other cut point below it — and
         // every FURTHER occurrence of this one — still takes the marker arm.
         expand_cut_point: Some(ty),
+        // …and every nominal non-sysroot ADT strictly below it is a by-name
+        // marker with a definition of its own, so this definition is O(its own
+        // fields) whatever it reaches. See the by-name-child arm of
+        // `convert_ty_inner`.
+        by_name_nominal_children: true,
         ..TyLoweringCtx::default()
     };
-    rename_definition(convert_ty_inner(tcx, ty, &mut sub), marker_name)
+    let def = rename_definition(convert_ty_inner(tcx, ty, &mut sub), marker_name);
+    // MEASUREMENT-ONLY, gated exactly like `trace_walk`: a definition is built
+    // in its own sub-context, so the root walk's `[TL_WALK]` line says nothing
+    // about whether the definition fit its budget. Without this line a refused
+    // definition — a marker with no entry, the very defect — is invisible.
+    if trace_budget_enabled() {
+        eprintln!(
+            "[TL_DEF] materialized={} final={} budget={} degraded={} name={marker_name}",
+            sub.produced_nodes,
+            produced_node_count(&def, usize::MAX),
+            sub.produced_budget,
+            sub.produced_nodes > sub.produced_budget,
+        );
+    }
+    def
+}
+
+/// Emit the identity-bearing by-name marker for `ty` and record its definition.
+///
+/// Shared by the cut-point arm and the by-name-child arm of `convert_ty_inner`,
+/// so both mint ONE name space (`canonical_cut_ref`) and write ONE table
+/// (`record_cut_definition`): a type that is a cut point in one walk and a
+/// by-name child in another is the same marker with the same entry.
+fn by_name_marker_with_definition<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    ctx: &mut TyLoweringCtx<'tcx>,
+) -> TrustTy {
+    let marker = canonical_cut_ref(tcx, ty);
+    if let TrustTy::Datatype { name, .. } = &marker {
+        record_cut_definition(tcx, ty, name, ctx);
+    }
+    ctx.produced_nodes = ctx.produced_nodes.saturating_add(1);
+    marker
+}
+
+/// Does `ty` lower BY NAME when it is met strictly below a definiendum inside a
+/// cut-point definition? A nominal, non-sysroot ADT with at least one field in
+/// some variant.
+///
+/// Sysroot ADTs (`core`/`alloc`/`std`, authenticated — an impersonator is NOT
+/// sysroot) keep their inline expansion: `Box`/`Option`/`NonNull`/`Vec` are
+/// modeled BY STRUCTURE on the native lane (a `Box` deref is a pointer read, an
+/// `Option::unwrap` a tag test, a `Vec<T>` its physical fields in faithful mode
+/// or `Seq { elem: T }` in logical mode — with `T` examined by this predicate
+/// in its own right on the logical lane), and a marker
+/// would turn each into an opaque havoc slot. A fieldless struct or enum is
+/// already one or two nodes, and a marker would only lose a fieldless enum its
+/// tag lane. Both expand inline exactly as they do outside a definition.
+fn is_by_name_nominal_child<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    let TyKind::Adt(adt_def, _) = ty.kind() else { return false };
+    if crate::convert::is_real_sysroot_crate(tcx, adt_def.did().krate) {
+        return false;
+    }
+    adt_def.variants().iter().any(|variant| !variant.fields.is_empty())
 }
 
 /// Restate a definition's own name as the KEY it will be filed under.
@@ -932,9 +1232,13 @@ fn record_cut_definition<'tcx>(
         // definition can never be filed under a name it does not claim; it
         // returns false for a value with no name, a value with no structure, and
         // a conflicting redefinition (which it also removes).
-        if !trust_types::insert_datatype_def(&mut c.defs, def) {
+        let recorded = trust_types::insert_datatype_def(&mut c.defs, def);
+        if !recorded {
             c.defs.remove(marker_name);
             c.refused.insert(marker_name.to_string());
+        }
+        if trace_budget_enabled() {
+            eprintln!("[TL_DEF] recorded={recorded} name={marker_name}");
         }
     });
 }
@@ -945,29 +1249,85 @@ fn record_cut_definition<'tcx>(
 /// datatype lowering uses (`datatype_child_field_ty` cuts at every nominal child
 /// unconditionally), so a feedback vertex set computed here breaks every cycle
 /// the lowering can actually walk.
-fn nominal_frontier<'tcx>(ty: ty::Ty<'tcx>, depth: usize, out: &mut Vec<ty::Ty<'tcx>>) {
-    if depth >= MAX_TYPE_LOWERING_DEPTH {
-        return;
+///
+/// `out` may hold duplicates; see [`frontier_walk`] for why that is exact and
+/// for the rule on sharing `shallowest`.
+enum PeelTarget<'tcx> {
+    Empty,
+    SingleAdt { adt: ty::Ty<'tcx>, depth: usize },
+    Branching,
+}
+
+fn peel_nominal_chain<'tcx>(mut ty: ty::Ty<'tcx>) -> PeelTarget<'tcx> {
+    let mut depth = 0usize;
+    while depth < MAX_TYPE_LOWERING_DEPTH {
+        match ty.kind() {
+            TyKind::Adt(..) => return PeelTarget::SingleAdt { adt: ty, depth },
+            TyKind::Ref(_, inner, _)
+            | TyKind::RawPtr(inner, _)
+            | TyKind::Slice(inner)
+            | TyKind::Array(inner, _)
+            | TyKind::Pat(inner, _) => {
+                ty = *inner;
+                depth += 1;
+            }
+            TyKind::Tuple(fields) if !fields.is_empty() => return PeelTarget::Branching,
+            TyKind::Closure(_, args) if !args.as_closure().upvar_tys().is_empty() => {
+                return PeelTarget::Branching;
+            }
+            TyKind::Coroutine(_, args) if !args.as_coroutine().upvar_tys().is_empty() => {
+                return PeelTarget::Branching;
+            }
+            _ => return PeelTarget::Empty,
+        }
     }
+    PeelTarget::Empty
+}
+
+fn nominal_frontier<'tcx>(
+    ty: ty::Ty<'tcx>,
+    shallowest: &mut FxHashMap<ty::Ty<'tcx>, usize>,
+    out: &mut Vec<ty::Ty<'tcx>>,
+) {
+    match peel_nominal_chain(ty) {
+        PeelTarget::Empty => {}
+        PeelTarget::SingleAdt { adt, depth } => {
+            if !shallowest.get(&adt).is_some_and(|seen| *seen <= depth) {
+                shallowest.insert(adt, depth);
+                out.push(adt);
+            }
+        }
+        PeelTarget::Branching => {
+            frontier_walk(ty, 0, MAX_TYPE_LOWERING_DEPTH, &nominal_frontier_step, shallowest, out);
+        }
+    }
+}
+
+/// One step of `nominal_frontier`: classify `ty` and hand its peeled children to
+/// `visit`, in order.
+fn nominal_frontier_step<'tcx>(
+    ty: ty::Ty<'tcx>,
+    visit: &mut dyn FnMut(ty::Ty<'tcx>),
+) -> FrontierStep {
     match ty.kind() {
-        TyKind::Adt(..) => out.push(ty),
-        TyKind::Ref(_, inner, _) => nominal_frontier(*inner, depth + 1, out),
-        TyKind::RawPtr(pointee, _) => nominal_frontier(*pointee, depth + 1, out),
-        TyKind::Slice(elem) => nominal_frontier(*elem, depth + 1, out),
-        TyKind::Array(elem, _) => nominal_frontier(*elem, depth + 1, out),
+        TyKind::Adt(..) => return FrontierStep::Nominal,
+        TyKind::Ref(_, inner, _) => visit(*inner),
+        TyKind::RawPtr(pointee, _) => visit(*pointee),
+        TyKind::Slice(elem) => visit(*elem),
+        TyKind::Array(elem, _) => visit(*elem),
         TyKind::Tuple(fields) => {
             for field in fields.iter() {
-                nominal_frontier(field, depth + 1, out);
+                visit(field);
             }
         }
         TyKind::Closure(_, args) => {
             for upvar in args.as_closure().upvar_tys().iter() {
-                nominal_frontier(upvar, depth + 1, out);
+                visit(upvar);
             }
         }
         TyKind::Coroutine(_, args) => {
             for upvar in args.as_coroutine().upvar_tys().iter() {
-                nominal_frontier(upvar, depth + 1, out);
+                visit(upvar);
             }
         }
         // Trust: a pattern type is a restricted-value SUBSET of its base, and
@@ -979,7 +1339,7 @@ fn nominal_frontier<'tcx>(ty: ty::Ty<'tcx>, depth: usize, out: &mut Vec<ty::Ty<'
         // came back EMPTY for `enum Tree { Node(Arc<Tree>) }`, the canonical-cut
         // lowering never fired on a single real dump, and recursion fell back to
         // the `adt_stack` cut — which is root-relative, i.e. R0.
-        TyKind::Pat(inner, _) => nominal_frontier(*inner, depth + 1, out),
+        TyKind::Pat(inner, _) => visit(*inner),
         // Trust: EXHAUSTIVE ON PURPOSE — no `_` arm. This function's contract
         // (above) is that it peels exactly what the lowering peels, and a silent
         // fallthrough is how that contract was broken: the two walks drifted and
@@ -1012,68 +1372,159 @@ fn nominal_frontier<'tcx>(ty: ty::Ty<'tcx>, depth: usize, out: &mut Vec<ty::Ty<'
         | TyKind::Infer(_)
         | TyKind::Error(_) => {}
     }
+    FrontierStep::Peeled
 }
 
 /// The nominal ADTs directly reachable from `ty`'s own fields (every variant of
-/// an enum, `all_fields` of a struct/union).
+/// an enum, `all_fields` of a struct/union) — or, for the real `Vec<T>`, from
+/// its ELEMENT.
+///
+/// On the logical lane, `Vec<T>` lowers to `Seq { elem: T }` (the `is_std_vec` arm of
+/// `convert_ty_inner`), never to its `RawVec` internals — and those internals
+/// hold `T` only in a `PhantomData`, which has no fields. So the edge the
+/// lowering walks is `Vec<T> -> T`, and a discovery that followed the fields
+/// instead saw NO edge at all: a type recursive only through a `Vec`
+/// (`struct Block { stmts: Vec<Stmt> }` / `enum Stmt { Expr(Expr) }` /
+/// `Expr::Block(Block)` — the real `syn` shape) was invisible to the cut set and
+/// fell to the legacy root-relative `adt_stack` guard, which emits a marker with
+/// NO definition. This function's contract, like `nominal_frontier`'s, is to
+/// peel exactly what the lowering peels.
 fn adt_field_successors<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<ty::Ty<'tcx>> {
     let TyKind::Adt(adt_def, args) = ty.kind() else {
         return Vec::new();
     };
     let mut out = Vec::new();
+    // One memo for every field of this ADT: their frontiers are concatenated
+    // into the one `out`, which is the sharing `frontier_walk` permits.
+    let mut shallowest = FxHashMap::default();
+    // Discovery must follow the same edges as conversion. The logical lane
+    // replaces Vec<T> with Seq<T>; the faithful lane retains RawVec/len and
+    // must not introduce a logical Vec<T> -> T cycle into its physical graph.
+    if !faithful_scalars() && is_std_vec(tcx, adt_def.did()) {
+        if let Some(elem) = args.types().next() {
+            nominal_frontier(elem, &mut shallowest, &mut out);
+        }
+        return out;
+    }
     for variant in adt_def.variants().iter() {
         for field in variant.fields.iter() {
-            nominal_frontier(field.ty(tcx, *args).skip_normalization(), 0, &mut out);
+            nominal_frontier(field.ty(tcx, *args).skip_normalization(), &mut shallowest, &mut out);
         }
     }
     out
 }
 
+/// Intern `node` into the discovery graph: its existing index if it is already
+/// present, else the next index. The ONLY writer of `index`/`order`, so a node
+/// has exactly one index for the whole walk (see the seeding note in
+/// `canonical_cut_set` for what a second writer cost).
+fn intern_node<N: std::hash::Hash + Eq + Copy>(
+    index: &mut FxHashMap<N, usize>,
+    order: &mut Vec<N>,
+    node: N,
+) -> usize {
+    if let Some(id) = index.get(&node) {
+        return *id;
+    }
+    let id = order.len();
+    index.insert(node, id);
+    order.push(node);
+    id
+}
+
+/// Zero-allocation-when-acyclic canonical feedback vertex set, keyed by
+/// [`crate::interned_ty_identity`].
+#[derive(Clone, Default)]
+struct CanonicalCutSet(Option<std::rc::Rc<trust_types::fx::FxHashSet<usize>>>);
+
+impl CanonicalCutSet {
+    #[inline]
+    fn empty() -> Self {
+        Self(None)
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |cut| cut.len())
+    }
+
+    #[inline]
+    fn contains(&self, ty: ty::Ty<'_>) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|cut| cut.contains(&crate::interned_ty_identity(ty)))
+    }
+}
+
 /// The canonical feedback vertex set of the ADT reachability graph rooted at
 /// `root`. Empty when the graph is acyclic or when discovery hit its bound.
-fn canonical_cut_set<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    root: ty::Ty<'tcx>,
-) -> trust_types::fx::FxHashSet<ty::Ty<'tcx>> {
+fn canonical_cut_set<'tcx>(tcx: TyCtxt<'tcx>, root: ty::Ty<'tcx>) -> CanonicalCutSet {
     // ── discovery (bounded) ────────────────────────────────────────────────
     let mut order: Vec<ty::Ty<'tcx>> = Vec::new();
     let mut index: FxHashMap<ty::Ty<'tcx>, usize> = FxHashMap::default();
-    let mut seeds = Vec::new();
-    nominal_frontier(root, 0, &mut seeds);
-    for seed in seeds {
-        if index.insert(seed, order.len()).is_none() {
-            order.push(seed);
+    match peel_nominal_chain(root) {
+        PeelTarget::Empty => return CanonicalCutSet::empty(),
+        PeelTarget::SingleAdt { adt, .. } => {
+            order.push(adt);
+            index.insert(adt, 0);
+        }
+        PeelTarget::Branching => {
+            let mut seeds = Vec::new();
+            nominal_frontier(root, &mut FxHashMap::default(), &mut seeds);
+            if seeds.is_empty() {
+                return CanonicalCutSet::empty();
+            }
+            order.reserve(seeds.len());
+            // MEASURED DEFECT (2026-09-13, `trust-spec-elab`): this loop used to read
+            // `if index.insert(seed, order.len()).is_none() { order.push(seed) }`, and
+            // `HashMap::insert` OVERWRITES the value of a key that is already present. A
+            // root with a REPEATED nominal seed — `(&Expr, &Expr)`, `(&&[String],
+            // &String, &&Vec<String>)`, any closure whose upvars name one type twice —
+            // therefore re-pointed the duplicate's index at whatever node was pushed
+            // NEXT, and every edge INTO that seed was routed to the wrong node. Two
+            // consequences, both seen in one trace: `Vec<String>` acquired a self-loop
+            // (its only successor, `String`, now indexed AS `Vec<String>`) and was cut,
+            // then refused as a definition; and in `(SelectCmp, bool, &Expr, &Expr)` the
+            // real `Expr` fell out of its own cycle, was never cut, and tree-expanded to
+            // 8004 nodes with 21 OTHER cut points in force. Root-relative by
+            // construction, and invisible from any single-type root. `intern_node` is
+            // the one interning path now, pinned by `intern_node_keeps_the_first_index`.
+            for seed in seeds {
+                intern_node(&mut index, &mut order, seed);
+            }
         }
     }
-    let mut edges: Vec<Vec<usize>> = Vec::new();
+    let mut edges: Vec<Vec<usize>> = Vec::with_capacity(order.len());
     let mut head = 0usize;
+    let mut any_edge = false;
     while head < order.len() {
         if order.len() > MAX_CANONICAL_CUT_NODES {
-            return trust_types::fx::FxHashSet::default();
+            return CanonicalCutSet::empty();
         }
         let node = order[head];
         let mut succ = Vec::new();
         for child in adt_field_successors(tcx, node) {
-            let id = match index.get(&child) {
-                Some(id) => *id,
-                None => {
-                    if order.len() > MAX_CANONICAL_CUT_NODES {
-                        return trust_types::fx::FxHashSet::default();
-                    }
-                    let id = order.len();
-                    index.insert(child, id);
-                    order.push(child);
-                    id
-                }
-            };
+            if !index.contains_key(&child) && order.len() > MAX_CANONICAL_CUT_NODES {
+                return CanonicalCutSet::empty();
+            }
+            let id = intern_node(&mut index, &mut order, child);
             if !succ.contains(&id) {
                 succ.push(id);
+                any_edge = true;
             }
         }
         edges.push(succ);
         head += 1;
     }
     debug_assert_eq!(edges.len(), order.len());
+    if !any_edge {
+        return CanonicalCutSet::empty();
+    }
 
     // ── deterministic greedy feedback vertex set ───────────────────────────
     // Keys are computed LAZILY. `canonical_cut_key` renders two rustc def paths
@@ -1081,14 +1532,26 @@ fn canonical_cut_set<'tcx>(
     // once per local, per place, per body. The overwhelmingly common graph is
     // ACYCLIC, and an acyclic graph needs no key at all: the first SCC pass finds
     // no non-trivial component and the loop exits before any key is rendered.
-    let mut keys: Vec<Option<CanonicalCutKey>> = vec![None; order.len()];
-    let mut cut: trust_types::fx::FxHashSet<ty::Ty<'tcx>> = trust_types::fx::FxHashSet::default();
-    for pick in greedy_feedback_vertex_set(&edges, &mut |node| {
-        keys[node].get_or_insert_with(|| canonical_cut_key(tcx, order[node])).clone()
+    let mut keys: Vec<Option<CanonicalCutStaticKey>> = vec![None; order.len()];
+    let mut cut: trust_types::fx::FxHashSet<usize> = trust_types::fx::FxHashSet::default();
+    for pick in greedy_feedback_vertex_set(&edges, &mut |node, component| {
+        // The component arrives as node indices; the wrapper bit needs the
+        // member TYPES. Built per key request — O(|component|), and only ever
+        // inside a non-trivial SCC.
+        let members: trust_types::fx::FxHashSet<ty::Ty<'tcx>> =
+            component.iter().map(|member| order[*member]).collect();
+        (
+            wraps_component_member(order[node], &members),
+            keys[node].get_or_insert_with(|| canonical_cut_static_key(tcx, order[node])).clone(),
+        )
     }) {
-        cut.insert(order[pick]);
+        cut.insert(crate::interned_ty_identity(order[pick]));
     }
-    cut
+    if cut.is_empty() {
+        CanonicalCutSet::empty()
+    } else {
+        CanonicalCutSet(Some(std::rc::Rc::new(cut)))
+    }
 }
 
 /// The deterministic greedy feedback vertex set of `edges`: while a non-trivial
@@ -1106,10 +1569,12 @@ fn canonical_cut_set<'tcx>(
 /// at all, (ii) a path leaving an SCC never returns, so an SCC's internal SCC
 /// structure after deletions depends only on its own induced subgraph, and (iii)
 /// the pick is by `key_of` alone, never by node index or iteration order. Point
-/// (iii) is why `key_of` must be a function of the underlying type only.
+/// (iii) is why `key_of` must be a function of the underlying type and of the
+/// component's MEMBER SET only — the member set is handed over precisely because
+/// (i) and (ii) make it root-independent, whereas its index order is not.
 fn greedy_feedback_vertex_set(
     edges: &[Vec<usize>],
-    key_of: &mut dyn FnMut(usize) -> CanonicalCutKey,
+    key_of: &mut dyn FnMut(usize, &[usize]) -> CanonicalCutKey,
 ) -> Vec<usize> {
     let mut alive: Vec<bool> = vec![true; edges.len()];
     let mut cut: Vec<usize> = Vec::new();
@@ -1123,7 +1588,7 @@ fn greedy_feedback_vertex_set(
             }
             let mut best: Option<(usize, CanonicalCutKey)> = None;
             for node in component.iter().copied() {
-                let key = key_of(node);
+                let key = key_of(node, &component);
                 let better = match &best {
                     None => true,
                     Some((_, best_key)) => key < *best_key,
@@ -1153,12 +1618,13 @@ fn strongly_connected_components(edges: &[Vec<usize>], alive: &[bool]) -> Vec<Ve
     let mut on_stack = vec![false; n];
     let mut stack: Vec<usize> = Vec::new();
     let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut work: Vec<(usize, usize)> = Vec::new();
     let mut counter = 0usize;
     for start in 0..n {
         if !alive[start] || index[start] != usize::MAX {
             continue;
         }
-        let mut work: Vec<(usize, usize)> = vec![(start, 0)];
+        work.push((start, 0));
         while let Some((node, next)) = work.pop() {
             if next == 0 {
                 index[node] = counter;
@@ -1233,6 +1699,11 @@ const MAX_DATATYPE_FIELD_NODES: usize = 128;
 /// anyway, so collapsing it loses no SOUND obligation (the scalar leaves that
 /// matter — the `__tag` discriminant and small payloads — are under the cap and
 /// keep full detail).
+///
+/// ELEMENT-SIZE OBLIGATION (ALLOC-STRIDE-ADT-2): the result is a key minted AFTER
+/// `convert_ty_inner` returned, so every call site must hand it, with the field's
+/// rustc type, to `crate::elem_sizes::record_compacted`; otherwise the shared marker
+/// row is read for a preimage that was never recorded.
 fn compact_oversized_field(ty: &TrustTy) -> TrustTy {
     match ty {
         TrustTy::Adt { name, .. } | TrustTy::Datatype { name, .. } => recursive_datatype_ref(name),
@@ -1313,9 +1784,11 @@ struct TyLoweringCtx<'tcx> {
     depth: usize,
     remaining_nodes: usize,
     /// verifier-perf: cumulative count of PRODUCED `TrustTy` nodes materialized
-    /// across THIS function's type lowering (fresh trees + cache-hit clones).
-    /// Once it crosses `produced_budget`, lowering degrades to the fail-closed
-    /// recursive-ADT marker. See `MAX_TYPE_LOWERING_PRODUCED_NODES`.
+    /// across THIS WALK's type lowering (fresh trees + cache-hit clones) — one
+    /// `convert_ty` call, or one cut-point definition sub-context; a function
+    /// performs many walks and each is metered afresh. Once it crosses
+    /// `produced_budget`, lowering degrades to the fail-closed recursive-ADT
+    /// marker. See `MAX_TYPE_LOWERING_PRODUCED_NODES`.
     produced_nodes: usize,
     /// Per-walk cached produced-node budget (read once at construction, so an env
     /// override is honored without re-parsing per node). `usize::MAX` disables.
@@ -1334,7 +1807,7 @@ struct TyLoweringCtx<'tcx> {
     /// acyclic type and whenever discovery hit its bound — in both cases
     /// lowering is byte-identical to the pre-RC-1 behavior. See the block
     /// comment on `canonical_cut_set`.
-    canonical_cut: trust_types::fx::FxHashSet<ty::Ty<'tcx>>,
+    canonical_cut: CanonicalCutSet,
     /// The ONE cut-point occurrence that expands instead of taking the marker
     /// arm, set only by `cut_point_definition` while it builds that type's
     /// out-of-band definition. `None` in every ordinary walk.
@@ -1343,6 +1816,12 @@ struct TyLoweringCtx<'tcx> {
     /// fires, and lives in a throwaway sub-context whose result goes to the
     /// definition table rather than into the surrounding tree.
     expand_cut_point: Option<ty::Ty<'tcx>>,
+    /// Set ONLY by `cut_point_definition`, for its sub-context: every nominal
+    /// non-sysroot ADT strictly below the definiendum lowers to a by-name marker
+    /// whose own definition is recorded in turn (`is_by_name_nominal_child`).
+    /// `false` in every ordinary walk, so a walk with an EMPTY cut set — every
+    /// acyclic type — is byte-identical to before this field existed.
+    by_name_nominal_children: bool,
     /// verifier-coverage: the `TypingEnv` in which alias
     /// normalization is attempted. `None` means "do not normalize
     /// aliases" — every non-`Free` alias stays `Unsupported` (the legacy
@@ -1364,6 +1843,13 @@ struct TyLoweringCtx<'tcx> {
     /// bodies. Keyed by the raw `Ty` pointer (rustc interns types, so
     /// equality is pointer-identity).
     cache: FxHashMap<ty::Ty<'tcx>, TrustTy>,
+    /// Number of `budget_exhausted()` polls performed by THIS walk's own context
+    /// (excludes cut-point definition sub-contexts, which are no-ops on repeat
+    /// calls in the same body scope).
+    root_budget_polls: usize,
+    /// Set when `budget_exhausted()` returned `true` during this walk, so a
+    /// budget-degraded tree is never served to another local from `BodyLocalTyMemo`.
+    root_budget_tripped: bool,
 }
 
 impl<'tcx> Default for TyLoweringCtx<'tcx> {
@@ -1374,10 +1860,13 @@ impl<'tcx> Default for TyLoweringCtx<'tcx> {
             produced_nodes: 0,
             produced_budget: produced_node_budget(),
             adt_stack: Vec::new(),
-            canonical_cut: trust_types::fx::FxHashSet::default(),
+            canonical_cut: CanonicalCutSet::empty(),
             expand_cut_point: None,
+            by_name_nominal_children: false,
             typing_env: None,
             cache: FxHashMap::default(),
+            root_budget_polls: 0,
+            root_budget_tripped: false,
         }
     }
 }
@@ -1523,7 +2012,7 @@ fn ty_contains_ty<'tcx>(haystack: ty::Ty<'tcx>, needle: ty::Ty<'tcx>) -> bool {
 fn is_expanding_recursive_adt<'tcx>(
     stack_ty: ty::Ty<'tcx>,
     current_def_id: rustc_hir::def_id::DefId,
-    current_args: ty::GenericArgsRef<'tcx>,
+    current_args: ty::GenericArgs<'tcx>,
 ) -> bool {
     let TyKind::Adt(stack_adt, stack_args) = stack_ty.kind() else { return false };
     if stack_adt.did() != current_def_id {
@@ -1546,6 +2035,10 @@ fn is_expanding_recursive_adt<'tcx>(
 // legacy verifier path (plain `extract_function`) is byte-identical
 // unchanged — its ~700 direct `Ty::Int{..}` matches never see the new
 // spellings until their own migration wave.
+// This mode also bypasses the logical Clean datatype shortcuts below: their
+// pointer-peeling constructor fields are not a physical MIR representation.
+// Call conversion and body postpasses consult the same scoped mode to retain
+// actual calls instead of verifier-only total-havoc summaries/normalizations.
 thread_local! {
     static FAITHFUL_SCALARS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1566,8 +2059,443 @@ impl Drop for FaithfulScalarsGuard {
     }
 }
 
-fn faithful_scalars() -> bool {
+pub(crate) fn faithful_scalars() -> bool {
     FAITHFUL_SCALARS.with(|f| f.get())
+}
+
+/// Fast stack-only lowering for scalar/unit/never/str leaves and shallow
+/// (`< MAX_TYPE_LOWERING_DEPTH`) `Ref` / `RawPtr` / `Slice` / `Pat` wrappers
+/// around them.
+///
+/// Every shape matched here:
+///  * has an empty `canonical_cut_set` (no nominal ADT anywhere in the chain),
+///  * touches neither `DATATYPE_DEFS` nor `tuple_layouts::record_tuple_layout`
+///    nor `elem_sizes::record` (`consulted_shape` is false at every level),
+///  * is independent of `typing_env` (no alias or layout query), and
+///  * visits `1..=MAX_TYPE_LOWERING_DEPTH` nodes, so `remaining_nodes` starts at
+///    `4096` (`4096 % 256 == 0` -> exactly one `budget_exhausted()` poll at the
+///    root) and never crosses another `% 256 == 0` boundary or the produced-node
+///    budget.
+#[derive(Clone, Copy)]
+enum FastWrapper {
+    Ref { mutable: bool },
+    RawPtr { mutable: bool },
+    Slice,
+}
+
+pub(crate) fn try_convert_fast_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<TrustTy> {
+    let mut wrappers = [FastWrapper::Slice; MAX_TYPE_LOWERING_DEPTH];
+    let mut wrapper_len = 0usize;
+    let mut depth = 0usize;
+    let mut cur = ty;
+    let mut leaf = loop {
+        if depth >= MAX_TYPE_LOWERING_DEPTH {
+            return None;
+        }
+        match cur.kind() {
+            TyKind::Bool => break TrustTy::Bool,
+            TyKind::Int(int_ty) => {
+                break if faithful_scalars() && matches!(int_ty, rustc_ast_ir::IntTy::Isize) {
+                    TrustTy::PtrSizedInt { signed: true }
+                } else {
+                    TrustTy::Int { width: int_width_from_int_ty(int_ty, tcx), signed: true }
+                };
+            }
+            TyKind::Uint(uint_ty) => {
+                break if faithful_scalars() && matches!(uint_ty, rustc_ast_ir::UintTy::Usize) {
+                    TrustTy::PtrSizedInt { signed: false }
+                } else {
+                    TrustTy::Int { width: uint_width_from_uint_ty(uint_ty, tcx), signed: false }
+                };
+            }
+            TyKind::Float(float_ty) => {
+                let width = match float_ty {
+                    rustc_ast_ir::FloatTy::F16 => 16,
+                    rustc_ast_ir::FloatTy::F32 => 32,
+                    rustc_ast_ir::FloatTy::F64 => 64,
+                    rustc_ast_ir::FloatTy::F128 => 128,
+                };
+                break TrustTy::Float { width };
+            }
+            TyKind::Char => {
+                break if faithful_scalars() {
+                    TrustTy::Char
+                } else {
+                    TrustTy::Int { width: 32, signed: false }
+                };
+            }
+            TyKind::Str => {
+                break if faithful_scalars() {
+                    TrustTy::Str
+                } else {
+                    TrustTy::Slice { elem: Box::new(TrustTy::Int { width: 8, signed: false }) }
+                };
+            }
+            TyKind::Never => break TrustTy::Never,
+            TyKind::Tuple(fields) if fields.is_empty() => break TrustTy::Unit,
+            TyKind::Ref(_, inner_ty, mutability) => {
+                wrappers[wrapper_len] = FastWrapper::Ref { mutable: mutability.is_mut() };
+                wrapper_len += 1;
+                depth += 1;
+                cur = *inner_ty;
+            }
+            TyKind::RawPtr(pointee_ty, mutability) => {
+                wrappers[wrapper_len] = FastWrapper::RawPtr { mutable: mutability.is_mut() };
+                wrapper_len += 1;
+                depth += 1;
+                cur = *pointee_ty;
+            }
+            TyKind::Slice(elem_ty) => {
+                wrappers[wrapper_len] = FastWrapper::Slice;
+                wrapper_len += 1;
+                depth += 1;
+                cur = *elem_ty;
+            }
+            TyKind::Pat(inner_ty, _) => {
+                depth += 1;
+                cur = *inner_ty;
+            }
+            _ => return None,
+        }
+    };
+
+    // Exact step-meter parity with `convert_ty_inner_raw`'s root node (`4096 % 256 == 0`).
+    if trust_types::verify_budget::budget_exhausted() {
+        let cause = trust_types::verify_budget::exhaustion_cause()
+            .unwrap_or(trust_types::determinism::StopCause::Unclassified);
+        return Some(unsupported_ty(
+            "TyKind",
+            cause.stamp("type lowering exceeded the per-function verification budget"),
+        ));
+    }
+
+    for wrapper in wrappers[..wrapper_len].iter().rev() {
+        leaf = match *wrapper {
+            FastWrapper::Ref { mutable } => TrustTy::Ref { mutable, inner: Box::new(leaf) },
+            FastWrapper::RawPtr { mutable } => {
+                TrustTy::RawPtr { mutable, pointee: Box::new(leaf) }
+            }
+            FastWrapper::Slice => TrustTy::Slice { elem: Box::new(leaf) },
+        };
+    }
+    Some(leaf)
+}
+
+/// Body-scoped memo for `extract_body`'s `local_decls` loop.
+///
+/// Within one `extract_body` call (`typing_env`, `faithful_scalars()`, and
+/// `OWNER_DEF_PATH` all fixed), dozens of MIR temporaries share the same interned
+/// `ty::Ty<'tcx>` (`Option<…>`, `Result<…>`, `Vec<…>`, nominal ADTs, tuples).
+/// First-visit side effects (`DATATYPE_DEFS`, `ElemSizeScope`, `TupleLayoutScope`)
+/// are idempotent on repeat calls in the same body scope; replaying the exact
+/// `root_budget_polls` count preserves deterministic `VERIFY_STEPS` accounting to
+/// the single step and falls back to a full walk if a poll trips mid-type.
+type TypingEnvIdentity = [usize; 4];
+
+fn param_env_identity(param_env: ty::ParamEnv<'_>) -> Option<usize> {
+    use std::hash::{Hash, Hasher};
+    if param_env.is_empty() {
+        return Some(0);
+    }
+    struct ExactInternedPtrHasher {
+        addr: usize,
+        writes: u32,
+    }
+    impl Hasher for ExactInternedPtrHasher {
+        #[inline]
+        fn finish(&self) -> u64 {
+            self.addr as u64
+        }
+        #[inline]
+        fn write(&mut self, _: &[u8]) {
+            self.writes = self.writes.saturating_add(2);
+        }
+        #[inline]
+        fn write_usize(&mut self, i: usize) {
+            self.writes = self.writes.saturating_add(1);
+            self.addr = i;
+        }
+    }
+    let mut h = ExactInternedPtrHasher { addr: 0, writes: 0 };
+    param_env.hash(&mut h);
+    (h.writes == 1 && h.addr != 0).then_some(h.addr)
+}
+
+fn typing_env_identity<'tcx>(typing_env: Option<ty::TypingEnv<'tcx>>) -> Option<TypingEnvIdentity> {
+    let Some(te) = typing_env else {
+        return Some([0; 4]);
+    };
+    let p_ptr = param_env_identity(te.param_env)?;
+    let list_id = |list: &[rustc_span::def_id::LocalDefId]| {
+        if list.is_empty() { (0, 0) } else { (list.as_ptr() as usize, list.len()) }
+    };
+    let (tag, m_ptr, m_len) = match te.typing_mode() {
+        ty::TypingMode::Coherence => (1, 0, 0),
+        ty::TypingMode::Typeck { defining_opaque_types_and_generators } => {
+            let (ptr, len) = list_id(defining_opaque_types_and_generators);
+            (2, ptr, len)
+        }
+        ty::TypingMode::OpaqueAnalysis => (3, 0, 0),
+        ty::TypingMode::PostTypeckThroughBorrowck { defining_opaque_types } => {
+            let (ptr, len) = list_id(defining_opaque_types);
+            (4, ptr, len)
+        }
+        ty::TypingMode::PostBorrowck { defined_opaque_types } => {
+            let (ptr, len) = list_id(defined_opaque_types);
+            (5, ptr, len)
+        }
+        ty::TypingMode::Reflection => (6, 0, 0),
+        ty::TypingMode::OpaqueBoundsOnly => (7, 0, 0),
+        ty::TypingMode::PostAnalysis => (8, 0, 0),
+        ty::TypingMode::Codegen => (9, 0, 0),
+        ty::TypingMode::ErasedNotCoherence(_) => (10, 0, 0),
+    };
+    Some([p_ptr, tag, m_ptr, m_len])
+}
+
+thread_local! {
+    /// Monotonic epoch bumped whenever any extraction side-table scope
+    /// (`DatatypeDefScope`, `ElemSizeScope`, `TupleLayoutScope`,
+    /// `OwnerDefPathScope`) enters or exits on this thread.
+    static EXTRACTION_SCOPE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BODY_TY_MEMO: std::cell::RefCell<BodyTyMemoCollector> =
+        std::cell::RefCell::new(BodyTyMemoCollector::default());
+}
+
+pub(crate) fn bump_extraction_scope_epoch() {
+    EXTRACTION_SCOPE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+}
+
+#[derive(Default)]
+struct BodyTyMemoCollector {
+    active: bool,
+    sess_ptr: usize,
+    scope_epoch: u64,
+    cut_by_ty: FxHashMap<(usize, bool), CanonicalCutSet>,
+    ty_by_key: FxHashMap<(usize, bool, TypingEnvIdentity), (TrustTy, usize)>,
+}
+
+/// Whole-extraction memo for [`convert_ty`] / [`convert_ty_in_env`] and
+/// [`canonical_cut_set`] across metadata/signature, `local_decls`, basic blocks,
+/// and constant images. Saves and restores any enclosing collector so nested
+/// extractions stay isolated, and invalidates automatically if any side-table
+/// scope changes mid-extraction.
+pub(crate) struct BodyTyMemoScope {
+    prev: Option<BodyTyMemoCollector>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DISABLE_BODY_TY_MEMO_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct DisableBodyTyMemoGuard(bool);
+
+#[cfg(test)]
+impl DisableBodyTyMemoGuard {
+    pub(crate) fn enable() -> Self {
+        let prev = DISABLE_BODY_TY_MEMO_FOR_TEST.with(|f| f.replace(true));
+        Self(prev)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DisableBodyTyMemoGuard {
+    fn drop(&mut self) {
+        DISABLE_BODY_TY_MEMO_FOR_TEST.with(|f| f.set(self.0));
+    }
+}
+
+#[inline]
+fn body_ty_memo_disabled_for_test() -> bool {
+    #[cfg(test)]
+    {
+        DISABLE_BODY_TY_MEMO_FOR_TEST.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+impl BodyTyMemoScope {
+    pub(crate) fn begin(tcx: TyCtxt<'_>) -> Self {
+        let sess_ptr = std::ptr::from_ref(tcx.sess) as usize;
+        let scope_epoch = EXTRACTION_SCOPE_EPOCH.with(std::cell::Cell::get);
+        let active = !body_ty_memo_disabled_for_test();
+        let prev = BODY_TY_MEMO.with(|c| {
+            c.replace(BodyTyMemoCollector {
+                active,
+                sess_ptr,
+                scope_epoch,
+                cut_by_ty: FxHashMap::default(),
+                ty_by_key: FxHashMap::default(),
+            })
+        });
+        Self { prev: Some(prev) }
+    }
+}
+
+impl Drop for BodyTyMemoScope {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            BODY_TY_MEMO.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+}
+
+fn canonical_cut_set_cached<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> CanonicalCutSet {
+    let sess_ptr = std::ptr::from_ref(tcx.sess) as usize;
+    let key = (crate::interned_ty_identity(ty), faithful_scalars());
+    let cached = BODY_TY_MEMO.with(|c| {
+        let c = c.borrow();
+        (c.active && c.sess_ptr == sess_ptr).then(|| c.cut_by_ty.get(&key).cloned()).flatten()
+    });
+    if let Some(cut) = cached {
+        return cut;
+    }
+    let computed = canonical_cut_set(tcx, ty);
+    BODY_TY_MEMO.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.active && c.sess_ptr == sess_ptr {
+            c.cut_by_ty.insert(key, computed.clone());
+        }
+    });
+    computed
+}
+
+fn convert_ty_uncached_opt_env<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+    ty: ty::Ty<'tcx>,
+) -> TrustTy {
+    let mut ctx = match typing_env {
+        Some(env) => TyLoweringCtx::with_typing_env(env),
+        None => TyLoweringCtx::default(),
+    };
+    ctx.canonical_cut = canonical_cut_set_cached(tcx, ty);
+    let out = convert_ty_inner(tcx, ty, &mut ctx);
+    trace_walk(ty, &out, &ctx);
+    out
+}
+
+pub(crate) fn body_ty_memo_active(tcx: TyCtxt<'_>) -> bool {
+    let sess_ptr = std::ptr::from_ref(tcx.sess) as usize;
+    let scope_epoch = EXTRACTION_SCOPE_EPOCH.with(std::cell::Cell::get);
+    !crate::in_key_skeleton_frame()
+        && BODY_TY_MEMO.with(|c| {
+            let c = c.borrow();
+            c.active && c.sess_ptr == sess_ptr && c.scope_epoch == scope_epoch
+        })
+}
+
+fn convert_ty_opt_env<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: Option<ty::TypingEnv<'tcx>>,
+    ty: ty::Ty<'tcx>,
+) -> TrustTy {
+    if trace_budget_enabled() {
+        return convert_ty_uncached_opt_env(tcx, typing_env, ty);
+    }
+    if let Some(fast) = try_convert_fast_ty(tcx, ty) {
+        return fast;
+    }
+    if crate::in_key_skeleton_frame() {
+        return convert_ty_uncached_opt_env(tcx, typing_env, ty);
+    }
+    let Some(env_id) = typing_env_identity(typing_env) else {
+        return convert_ty_uncached_opt_env(tcx, typing_env, ty);
+    };
+    let sess_ptr = std::ptr::from_ref(tcx.sess) as usize;
+    let scope_epoch = EXTRACTION_SCOPE_EPOCH.with(std::cell::Cell::get);
+    let key = (crate::interned_ty_identity(ty), faithful_scalars(), env_id);
+    let memo_lookup = BODY_TY_MEMO.with(|c| {
+        let c = c.borrow();
+        if !(c.active && c.sess_ptr == sess_ptr && c.scope_epoch == scope_epoch) {
+            None
+        } else {
+            Some(c.ty_by_key.get(&key).cloned())
+        }
+    });
+    let Some(cached) = memo_lookup else {
+        return convert_ty_uncached_opt_env(tcx, typing_env, ty);
+    };
+    if let Some((cached_ty, polls)) = cached {
+        let mut tripped = false;
+        for _ in 0..polls {
+            if trust_types::verify_budget::budget_exhausted() {
+                tripped = true;
+                break;
+            }
+        }
+        if !tripped {
+            return cached_ty;
+        }
+        return convert_ty_uncached_opt_env(tcx, typing_env, ty);
+    }
+    let mut ctx = match typing_env {
+        Some(env) => TyLoweringCtx::with_typing_env(env),
+        None => TyLoweringCtx::default(),
+    };
+    ctx.canonical_cut = canonical_cut_set_cached(tcx, ty);
+    let out = convert_ty_inner(tcx, ty, &mut ctx);
+    if !ctx.root_budget_tripped
+        && EXTRACTION_SCOPE_EPOCH.with(std::cell::Cell::get) == scope_epoch
+    {
+        BODY_TY_MEMO.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.active && c.sess_ptr == sess_ptr && c.scope_epoch == scope_epoch {
+                c.ty_by_key.insert(key, (out.clone(), ctx.root_budget_polls));
+            }
+        });
+    }
+    out
+}
+
+#[derive(Default)]
+pub(crate) struct BodyLocalTyMemo<'tcx> {
+    entries: FxHashMap<ty::Ty<'tcx>, (TrustTy, usize)>,
+}
+
+impl<'tcx> BodyLocalTyMemo<'tcx> {
+    pub(crate) fn convert_local_ty(
+        &mut self,
+        tcx: TyCtxt<'tcx>,
+        typing_env: ty::TypingEnv<'tcx>,
+        ty: ty::Ty<'tcx>,
+    ) -> TrustTy {
+        if trace_budget_enabled() || body_ty_memo_disabled_for_test() {
+            return convert_ty_uncached_opt_env(tcx, Some(typing_env), ty);
+        }
+        if let Some(fast) = try_convert_fast_ty(tcx, ty) {
+            return fast;
+        }
+        if let Some((cached, polls)) = self.entries.get(&ty) {
+            let mut tripped = false;
+            for _ in 0..*polls {
+                if trust_types::verify_budget::budget_exhausted() {
+                    tripped = true;
+                    break;
+                }
+            }
+            if !tripped {
+                return cached.clone();
+            }
+            // Budget tripped mid-replay: run the full walk from the remaining
+            // step/deadline state (already latched, so subsequent polls trip
+            // deterministically at the first checked node).
+            return convert_ty_uncached_opt_env(tcx, Some(typing_env), ty);
+        }
+        let mut ctx = TyLoweringCtx::with_typing_env(typing_env);
+        ctx.canonical_cut = canonical_cut_set_cached(tcx, ty);
+        let out = convert_ty_inner(tcx, ty, &mut ctx);
+        if !ctx.root_budget_tripped {
+            self.entries.insert(ty, (out.clone(), ctx.root_budget_polls));
+        }
+        out
+    }
 }
 
 /// Convert a rustc Ty to our simplified Ty.
@@ -1578,11 +2506,12 @@ fn faithful_scalars() -> bool {
 /// To reveal opaque alias types where it is sound and build-safe to do so,
 /// use [`convert_ty_in_env`] instead. (`Free` aliases are still expanded.)
 pub(crate) fn convert_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> TrustTy {
-    let mut ctx = TyLoweringCtx::default();
-    ctx.canonical_cut = canonical_cut_set(tcx, ty);
-    let out = convert_ty_inner(tcx, ty, &mut ctx);
-    trace_walk(ty, &out, &ctx);
-    out
+    convert_ty_opt_env(tcx, None, ty)
+}
+
+fn trace_budget_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRUST_VCGEN_TRACE_BUDGET").is_some())
 }
 
 /// MEASUREMENT-ONLY per-walk report, gated on `TRUST_VCGEN_TRACE_BUDGET`.
@@ -1593,16 +2522,17 @@ pub(crate) fn convert_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> TrustTy {
 /// is the ancestor re-charge multiplier. Writes nothing and changes nothing when
 /// the variable is unset.
 fn trace_walk<'tcx>(root: ty::Ty<'tcx>, out: &TrustTy, ctx: &TyLoweringCtx<'tcx>) {
-    if std::env::var("TRUST_VCGEN_TRACE_BUDGET").is_err() {
+    if !trace_budget_enabled() {
         return;
     }
     let degraded = ctx.produced_nodes > ctx.produced_budget;
     eprintln!(
-        "[TL_WALK] materialized={} final={} budget={} degraded={} root={:?}",
+        "[TL_WALK] materialized={} final={} budget={} degraded={} cut={} root={:?}",
         ctx.produced_nodes,
         produced_node_count(out, usize::MAX),
         ctx.produced_budget,
         degraded,
+        ctx.canonical_cut.len(),
         root,
     );
 }
@@ -1624,19 +2554,47 @@ fn trace_walk<'tcx>(root: ty::Ty<'tcx>, out: &TrustTy, ctx: &TyLoweringCtx<'tcx>
 /// trait solver, which can fatally overflow rustc's recursion limit (the
 /// typenum `UInt<UInt<…>>: Unsigned` regression that defeated four prior
 /// normalization attempts). See the alias arm of `convert_ty_inner`.
-pub(crate) fn convert_ty_in_env<'tcx>(
+#[cfg(test)]
+pub(crate) fn convert_ty_in_env_uncached_for_test<'tcx>(
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
     ty: ty::Ty<'tcx>,
 ) -> TrustTy {
     let mut ctx = TyLoweringCtx::with_typing_env(typing_env);
     ctx.canonical_cut = canonical_cut_set(tcx, ty);
-    let out = convert_ty_inner(tcx, ty, &mut ctx);
-    trace_walk(ty, &out, &ctx);
+    convert_ty_inner(tcx, ty, &mut ctx)
+}
+
+pub(crate) fn convert_ty_in_env<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    ty: ty::Ty<'tcx>,
+) -> TrustTy {
+    convert_ty_opt_env(tcx, Some(typing_env), ty)
+}
+
+/// Trust (ALLOC-STRIDE-ADT-2, 2026-10-07): every exit of the lowering —
+/// [`convert_ty_inner_raw`]'s cut markers, budget and depth bails, memo hits and
+/// every arm — passes through here, so the element-size recorder sees the rustc
+/// preimage of every key this lowering RETURNS (`crate::elem_sizes`). NOT every
+/// key it produces: a caller that rewrites a returned type into a new key after
+/// this exit must record that key's preimage itself — Lever A's field compaction
+/// does (`crate::elem_sizes::record_compacted` at both `compact_oversized_field`
+/// call sites); `datatype_child_field_ty`'s refs need not (they sit only inside
+/// `Datatype.variants`, which the consumer never sizes).
+/// The recorder only reads `(ty, out)`; `out` is returned unchanged, so the
+/// lowering is identical whether or not a table is being collected.
+fn convert_ty_inner<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    ctx: &mut TyLoweringCtx<'tcx>,
+) -> TrustTy {
+    let out = convert_ty_inner_raw(tcx, ty, ctx);
+    crate::elem_sizes::record(tcx, ty, &out);
     out
 }
 
-fn convert_ty_inner<'tcx>(
+fn convert_ty_inner_raw<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
     ctx: &mut TyLoweringCtx<'tcx>,
@@ -1673,20 +2631,59 @@ fn convert_ty_inner<'tcx>(
     // it is set only by `cut_point_definition`, for exactly one occurrence of
     // exactly one type, to build that type's own out-of-band definition (`C`
     // unrolled one level with markers at every cut point inside, including `C`).
-    if ctx.canonical_cut.contains(&ty) {
+    if ctx.canonical_cut.contains(ty) {
         if ctx.expand_cut_point == Some(ty) {
             // One level, once: clear it so a nested re-entry of the SAME type
             // (a self-recursive datatype) still takes the marker arm below.
             ctx.expand_cut_point = None;
         } else {
-            let marker = canonical_cut_ref(tcx, ty);
-            if let TrustTy::Datatype { name, .. } = &marker {
-                let name = name.clone();
-                record_cut_definition(tcx, ty, &name, ctx);
-            }
-            ctx.produced_nodes = ctx.produced_nodes.saturating_add(1);
-            return marker;
+            return by_name_marker_with_definition(tcx, ty, ctx);
         }
+    }
+
+    // ── BY-NAME NOMINAL CHILDREN inside a definition ──────────────────────────
+    //
+    // This walk is building a cut point's out-of-band definition (see
+    // `cut_point_definition`), and `ty` is a nominal non-sysroot ADT strictly
+    // below the definiendum. It lowers to the SAME identity-bearing marker a cut
+    // point does, and its own definition is recorded in turn — so a definition is
+    // O(its own fields) whatever it reaches, and the table closes over every user
+    // type reachable from a cut point, each defined exactly once per body.
+    //
+    // MEASURED reason (2026-09-13, `syn::Expr`): with the cut correctly on `Expr`,
+    // its definition still expanded all 40 payload structs INLINE, and every one
+    // of them reaches `Expr` again through `Box<Expr>` / `Punctuated<Expr, _>`, so
+    // the definition sub-context (fresh 8000 budget) tripped exactly as the root
+    // walk had. A knot-tied `syn::Expr` is ~97 nodes (1 + 40 variants + 56 fields,
+    // every nominal child one marker) — the shape `lower_adt_as_datatype` already
+    // produces, gated by def path to three `clean_kernel` types; this arm is that
+    // rule for every cut point's definition, without the def-path gate and
+    // WITHOUT peeling `Box`/`Arc` (a pointer field stays a pointer: the native
+    // lane models the deref, the null check, and the field read by structure).
+    //
+    // A MARKER WITHOUT A DEFINITION IS THE DEFECT, NOT THE FIX. A bare marker
+    // whose name is absent from `datatype_defs` is exactly the
+    // `TrustSymbolicAggregateFieldSortMissing` decline (the second-largest
+    // family measured on `trust-spec-elab`). That is why this arm records the
+    // child's definition rather than merely emitting the marker — the same write
+    // authority as a cut point (`record_cut_definition`), under the same
+    // instantiation-bearing name (`canonical_cut_ref`), so `Foo<u8>` and
+    // `Foo<i32>` stay two entries and two markers, and a same-named type from a
+    // second crate of the same name is stamped apart (`by_name_marker_name`).
+    //
+    // BEFORE every budget/depth bail, like the cut arm and for the same reason:
+    // a marker is one node, and a budget-relative choice of marker-vs-degrade
+    // would give one rustc type two spellings keyed on how much budget the
+    // definition had spent. Depth-gated so the definiendum itself — the
+    // sub-context's root, met here at depth 0 — still expands.
+    //
+    // POSITION-RELATIVE, recorded rather than hidden (residual R8 on the block
+    // comment above): a type that is NOT a cut point is a marker at a field of a
+    // definition and its full self as a local. Fail-closed on the consumer side
+    // — `ty_eq` declines the pair, the native lane havocs a marker VALUE — and
+    // strictly narrower than R5, because it only ever fires inside a definition.
+    if ctx.by_name_nominal_children && ctx.depth > 0 && is_by_name_nominal_child(tcx, ty) {
+        return by_name_marker_with_definition(tcx, ty, ctx);
     }
 
     // verifier-perf (produced-node budget): once this function's cumulative
@@ -1694,7 +2691,11 @@ fn convert_ty_inner<'tcx>(
     // the cheap fail-closed recursive-ADT marker. SOUNDNESS: DROP-ONLY (the marker
     // carries no modeled sort; uses still fail closed). See
     // `MAX_TYPE_LOWERING_PRODUCED_NODES`.
-    if ctx.produced_nodes > ctx.produced_budget {
+    //
+    // A scalar leaf is exempt (`is_produced_budget_exempt_scalar`): it assembles no
+    // tree, and degrading it made a scalar field's type depend on the fields
+    // declared before it (TRUST-KI-1014-1).
+    if ctx.produced_nodes > ctx.produced_budget && !is_produced_budget_exempt_scalar(ty) {
         return produced_budget_degraded_leaf();
     }
 
@@ -1714,6 +2715,15 @@ fn convert_ty_inner<'tcx>(
         // `clone` copies the whole tree into the parent), so charge its produced
         // size against the budget — otherwise the cache lets an unbounded number of
         // fat-subtree clones bypass the budget (the actual OOM mechanism).
+        //
+        // Trust (2026-09-25, `trust_types::SharedVec`): an `Adt`'s `fields` and
+        // `variants` are now shared copy-on-write bodies, so this clone copies only
+        // the non-shared spine above them. The CHARGE is deliberately left at the
+        // produced size: it decides which walks degrade to the fail-closed marker,
+        // and keeping it byte-identical keeps the degraded set, and so the obligation
+        // inventory, exactly what it was. Charging only what a clone materializes
+        // (3dbc35ac3d's `materialized_node_count`) would degrade strictly fewer walks
+        // and needs its own ablation before it lands.
         let cached = cached.clone();
         let hit_cost = produced_node_count(
             &cached,
@@ -1753,11 +2763,26 @@ fn convert_ty_inner<'tcx>(
     // Before trusting this poll from a NEW caller, check that the caller
     // installs a budget; `grep -rn 'VerifyBudgetGuard::install' compiler/ crates/`
     // is the whole list.
-    if ctx.remaining_nodes % 256 == 0 && trust_types::verify_budget::budget_exhausted() {
-        return unsupported_ty(
-            "TyKind",
-            "type lowering exceeded the per-function verification budget",
-        );
+    if ctx.remaining_nodes % 256 == 0 {
+        ctx.root_budget_polls += 1;
+        if trust_types::verify_budget::budget_exhausted() {
+            ctx.root_budget_tripped = true;
+            // Trust (determinism plan §3.2/§3.7, review 2026-09-29): say WHICH half
+            // of the budget tripped, at the source. The poll trips on the step
+            // COUNT (reproducible) or on the wall CLOCK (not), and the marker it
+            // returns becomes an `UnsupportedMir` row and native `Unsupported`
+            // evidence, both of which read as the deterministic `unsupported`
+            // unless the detail says otherwise. The stamp rides in the detail, and
+            // the combination rule keeps it: a later `unsupported` wrapper cannot
+            // launder a clock stop (`StopCause::stamp`). `budget_exhausted` has just
+            // latched the trip, so the cause is always known here.
+            let cause = trust_types::verify_budget::exhaustion_cause()
+                .unwrap_or(trust_types::determinism::StopCause::Unclassified);
+            return unsupported_ty(
+                "TyKind",
+                cause.stamp("type lowering exceeded the per-function verification budget"),
+            );
+        }
     }
 
     ctx.remaining_nodes -= 1;
@@ -1812,7 +2837,28 @@ fn convert_ty_inner<'tcx>(
             // "unsupported" wrongly fails panic-freedom on ordinary fixed arrays.
             // Use the body's `TypingEnv` when present, else the fully-monomorphized
             // env (sound here: the array type is part of a concrete, monomorphic body).
+            //
+            // Trust (fix11, L2): inside `mir_built` (`ctfe_reentrancy::frozen`) that
+            // evaluation is CTFE on this thread's query stack, and an array reached through a
+            // local ADT's FIELDS is one the body's own `typeck` never evaluated. MEASURED on
+            // stage 1 of `425f2192be`, default flags, valid code stock rustc accepts:
+            //     pub struct Cyc { a: [u8; sized()], b: u8 }
+            //     pub const fn sized() -> usize { let _r: Option<&Cyc> = None; 4 }
+            // `error[E0391]`: wfcheck(Cyc) -> eval `sized()` -> mir_built(sized) -> this
+            // oracle converts `Option<&Cyc>`, reaches the field, normalizes `sized()` -> the
+            // same evaluation. Inside `mir_built` only a constant that may be evaluated there
+            // (`ctfe_reentrancy::may_evaluate_constant`: its whole CTFE closure is leaf, so it
+            // builds no body but leaf constants, and no body being lowered on this thread can
+            // be one of them) is evaluated; any other length stays unknown and lowers
+            // `unsupported` below, its existing fail-closed answer.
             let len = len_const.try_to_target_usize(tcx).or_else(|| {
+                if crate::ctfe_reentrancy::frozen() {
+                    let ty::ConstKind::Alias(_, alias) = len_const.kind() else { return None };
+                    let def = crate::ctfe_reentrancy::alias_const_def_id(alias.kind)?;
+                    if !crate::ctfe_reentrancy::may_evaluate_constant(tcx, def, alias.args) {
+                        return None;
+                    }
+                }
                 let typing_env = ctx.typing_env.unwrap_or_else(ty::TypingEnv::fully_monomorphized);
                 tcx.try_normalize_erasing_regions(typing_env, ty::Unnormalized::new_wip(*len_const))
                     .ok()
@@ -1846,10 +2892,45 @@ fn convert_ty_inner<'tcx>(
         TyKind::Tuple(fields) => {
             let field_tys: Vec<TrustTy> =
                 fields.iter().map(|f| convert_ty_inner(tcx, f, ctx)).collect();
-            trust_tuple_or_unit(field_tys)
+            let lowered = trust_tuple_or_unit(field_tys);
+            // Trust (2026-09-29): rustc's own layout of this tuple, faithful lane only
+            // (`crate::tuple_layouts`). A tuple carries no layout in `Ty`, so without
+            // this row a field address into it names no byte offset downstream.
+            crate::tuple_layouts::record_tuple_layout(tcx, ctx.typing_env, ty, &lowered);
+            lowered
         }
 
         TyKind::Adt(adt_def, args) => {
+            // R0 REMOVED — the cut arm that used to live HERE, behind the
+            // root-relative conjunct `!ctx.adt_stack.is_empty() &&`, has moved to
+            // the TOP of this function and lost the conjunct. A cut point never
+            // reaches this arm at all any more (except on the single
+            // `expand_cut_point` occurrence that builds its own definition), so
+            // the paths below see only NON-cut nominal ADTs.
+            //
+            // `Vec<T>` carries its ELEMENT TYPE. Without this the RawVec
+            // expansion below mentions `T` nowhere, so `Vec<Term>` and
+            // `Vec<Lit>` extracted identically and every identity check on a
+            // vector-typed field was vacuous. Placed ahead of the other gates
+            // because it is a whole-type replacement, not a refinement of the
+            // structural lowering.
+            // Seq is an abstraction, not Vec's MIR storage. In faithful mode
+            // keep the actual fields/layout through ordinary ADT lowering.
+            if !faithful_scalars() && is_std_vec(tcx, adt_def.did()) && args.types().next().is_some() {
+                // Trust (W3, 2026-09-21): stamp drop-totality HERE, on the FULL
+                // `ty` -- element AND allocator -- with the identical predicate
+                // the `Ty::Adt` stamp below uses. This whole-type replacement
+                // sits AHEAD of that stamp site, so a bare `Vec` never reached it
+                // and the bridge's classifier had nothing to read; see the
+                // variant's doc for why the bridge must never recurse `elem`
+                // instead.
+                let drop_auth =
+                    crate::convert::tcx_drop_is_total(tcx, ty).then_some(AdtAuth::TotalDrop(None));
+                return TrustTy::Seq {
+                    elem: Box::new(convert_ty_inner(tcx, args.type_at(0), ctx)),
+                    drop_auth,
+                };
+            }
             // SYSROOT-AUTHENTICATED (2026-08-17). This one binding is the name of
             // every emitted `Ty::Adt`/`Ty::Datatype` in this arm AND of the
             // by-name back-edge reference below, so stamping it here keeps the
@@ -1858,51 +2939,37 @@ fn convert_ty_inner<'tcx>(
             // the endless iterator is authenticated by
             // `ty_is_authenticated_std_iterator` from this printed root alone.
             let name = crate::sysroot_authenticated_def_path_str(tcx, adt_def.did());
-            // R0 REMOVED — the cut arm that used to live HERE, behind the
-            // root-relative conjunct `!ctx.adt_stack.is_empty() &&`, has moved to
-            // the TOP of this function and lost the conjunct. A cut point never
-            // reaches this arm at all any more (except on the single
-            // `expand_cut_point` occurrence that builds its own definition), so
-            // the paths below see only NON-cut nominal ADTs.
+            // The logical kernel datatypes below deliberately peel pointer wrappers.
+            // Faithful MIR extraction must instead retain the ordinary physical ADT
+            // spelling (including canonical cut-point definitions and layout guards).
+            // A logical constructor field is not a Rust memory-layout field.
             //
-            // Lever A step 2: the kernel universe-`Level` enum lowers to a native
-            // recursive `Ty::Datatype` (its `Arc<Level>` children become by-name
-            // self-references) instead of degrading to the recursive-ADT
-            // `Unsupported` marker. Def-path gated to EXACTLY `Level` (the `Expr`/
-            // `ExprKind` datatypes have their own step-5 gates below); `Name` still
-            // keeps its existing lowering.
-            // `Vec<T>` carries its ELEMENT TYPE. Without this the RawVec
-            // expansion below mentions `T` nowhere, so `Vec<Term>` and
-            // `Vec<Lit>` extracted identically and every identity check on a
-            // vector-typed field was vacuous. Placed ahead of the other gates
-            // because it is a whole-type replacement, not a refinement of the
-            // structural lowering.
-            if is_std_vec(tcx, adt_def.did()) && args.types().count() >= 1 {
-                TrustTy::Seq { elem: Box::new(convert_ty_inner(tcx, args.type_at(0), ctx)) }
-            } else if is_level_datatype_target(tcx, adt_def.did()) {
-                lower_level_datatype(tcx, ty, *adt_def, args, &name, ctx)
-            }
-            // Lever A step 5: the kernel `ExprKind` ENUM — the structural
-            // expression variants the real `infer_type` matches on (BVar/Sort/
-            // Const/App/Lam/Pi/Let/Lit/Proj/MData/…) — lowers to a native recursive
-            // `Ty::Datatype`. Its recursive `Arc<Expr>` children, and its `Level`/
-            // `Name`/`Literal` payloads, become BY-NAME datatype references (see
-            // `datatype_child_field_ty`), so the produced tree stays O(variants):
-            // the mutually-recursive Expr/ExprKind cluster no longer expands into
-            // the ~464 MB `Ty::Adt` tree that OOM-killed extraction. Def-path gated
-            // to EXACTLY `ExprKind`, checked BEFORE the enum path below.
-            else if is_exprkind_datatype_target(tcx, adt_def.did()) {
-                lower_exprkind_datatype(tcx, ty, *adt_def, args, &name, ctx)
-            }
-            // Lever A step 5: the kernel `Expr` STRUCT (an `ExprKind` plus cached
-            // metadata) lowers to a single-constructor `Ty::Datatype` whose `kind`
-            // field is a by-name `ExprKind` reference and whose `meta` field is an
-            // opaque datatype reference. Checked BEFORE the struct/union path so
-            // `Expr` takes the datatype model (and its recursive `kind` child a
-            // by-name ref) instead of the recursive-struct field compaction.
-            // Def-path gated to EXACTLY `Expr`.
-            else if is_expr_datatype_target(tcx, adt_def.did()) {
-                lower_expr_datatype(tcx, ty, *adt_def, args, &name, ctx)
+            // Trust (DATATYPE-POSITIONAL-TAGS): each logical-datatype gate also
+            // requires `adt_discriminants_are_positional` — a `Ty::Datatype` cannot
+            // carry a discriminant, and every consumer reads its constructor at
+            // position `i` as tag `i`. A gated type with an explicit discriminant
+            // falls through to the ordinary enum lowering (real tags).
+            //
+            // Lever A step 2 & step 5: kernel `Level` / `ExprKind` / `Expr`
+            // datatypes. Classifier reads `crate_name` once and formats
+            // `safe_def_path_str` at most once (only inside `clean_kernel` when
+            // the item leaf name is `Level`, `ExprKind`, or `Expr`).
+            if let Some(target) = (!faithful_scalars())
+                .then(|| clean_kernel_datatype_target(tcx, adt_def.did()))
+                .flatten()
+                .filter(|_| adt_discriminants_are_positional(*adt_def))
+            {
+                match target {
+                    CleanKernelDatatypeTarget::Level => {
+                        lower_level_datatype(tcx, ty, *adt_def, *args, &name, ctx)
+                    }
+                    CleanKernelDatatypeTarget::ExprKind => {
+                        lower_exprkind_datatype(tcx, ty, *adt_def, *args, &name, ctx)
+                    }
+                    CleanKernelDatatypeTarget::Expr => {
+                        lower_expr_datatype(tcx, ty, *adt_def, *args, &name, ctx)
+                    }
+                }
             }
             // A UNION lowers like a struct (its real-named overlapping fields via
             // `all_fields()`), NOT like an enum: it has no discriminant, so the
@@ -1916,7 +2983,7 @@ fn convert_ty_inner<'tcx>(
             // another) is still caught by the read-only union-field obligation,
             // which fails closed. So treat structs and unions identically below.
             else if !adt_def.is_struct() && !adt_def.is_union() {
-                lower_enum_adt(tcx, ty, *adt_def, args, &name, ctx)
+                lower_enum_adt(tcx, ty, *adt_def, *args, &name, ctx)
             } else if ctx.adt_stack.contains(&ty) {
                 // Lever A (recursive-struct back-edge): re-entering the SAME ADT
                 // with identical arguments is the recursive field position (e.g.
@@ -1946,7 +3013,7 @@ fn convert_ty_inner<'tcx>(
             } else if ctx
                 .adt_stack
                 .iter()
-                .any(|stack_ty| is_expanding_recursive_adt(*stack_ty, adt_def.did(), args))
+                .any(|stack_ty| is_expanding_recursive_adt(*stack_ty, adt_def.did(), *args))
             {
                 // An EXPANDING generic recursion (`List<Box<List<T>>>`-style, the
                 // arguments grow on each re-entry) does NOT have a finite, single
@@ -1993,8 +3060,8 @@ fn convert_ty_inner<'tcx>(
                     .all_fields()
                     .map(|f| {
                         let field_name = f.name.to_string();
-                        let mut field_ty =
-                            convert_ty_inner(tcx, f.ty(tcx, args).skip_normalization(), ctx);
+                        let field_rustc_ty = f.ty(tcx, *args).skip_normalization();
+                        let mut field_ty = convert_ty_inner(tcx, field_rustc_ty, ctx);
                         if ty_node_count(&field_ty, MAX_DATATYPE_FIELD_NODES + 1)
                             > MAX_DATATYPE_FIELD_NODES
                             // Trust (F6, Build V): NEVER size-compact a field that
@@ -2022,6 +3089,16 @@ fn convert_ty_inner<'tcx>(
                             )
                         {
                             field_ty = compact_oversized_field(&field_ty);
+                            // Trust (ALLOC-STRIDE-ADT-2 review): the compacted
+                            // marker is a NEW key minted after `convert_ty_inner`
+                            // returned; record its preimage (the field's rustc
+                            // type) so it min-merges into, or poisons, the
+                            // shared marker row (`elem_sizes::record_compacted`).
+                            crate::elem_sizes::record_compacted(
+                                tcx,
+                                field_rustc_ty,
+                                &field_ty,
+                            );
                         }
                         (field_name, field_ty)
                     })
@@ -2043,10 +3120,10 @@ fn convert_ty_inner<'tcx>(
                 // the `SerdeJson` stamp) so a `Map` gets `SerdeJson(Map)` rather than
                 // a `TotalDrop(None)`/`TotalStdMap` from the drop/map fallback. Empty
                 // allowlist ⇒ `None` ⇒ fail closed (byte-identical to today).
-                let arbitrary_precision = authenticate_serde_json(tcx, adt_def.did(), args)
+                let arbitrary_precision = authenticate_serde_json(tcx, adt_def.did(), *args)
                     .map(AdtAuth::SerdeJson)
                     .or_else(|| {
-                        authenticate_arbitrary_precision(tcx, adt_def.did(), args)
+                        authenticate_arbitrary_precision(tcx, adt_def.did(), *args)
                             .map(AdtAuth::ArbPrec)
                     })
                     .or_else(|| {
@@ -2069,7 +3146,7 @@ fn convert_ty_inner<'tcx>(
                         // SOUND: `tcx_drop_is_total` certifies NO user `Drop` anywhere
                         // in the owned tree; the stamp is `#[serde(skip)]` (a decoded
                         // bundle reads `None`, fail-closed).
-                        let map_kind = authenticate_total_std_map(tcx, adt_def.did(), args);
+                        let map_kind = authenticate_total_std_map(tcx, adt_def.did(), *args);
                         let drop_total = crate::convert::tcx_drop_is_total(tcx, ty);
                         match (map_kind, drop_total) {
                             (map, true) => Some(AdtAuth::TotalDrop(map)),
@@ -2115,7 +3192,7 @@ fn convert_ty_inner<'tcx>(
                     && !ty.has_escaping_bound_vars()
                 {
                     ctx.typing_env.and_then(|te| {
-                        tcx.layout_of(te.as_query_input(ty)).ok().map(|l| {
+                        crate::tuple_layouts::extractor_layout_of(tcx, te, ty).map(|l| {
                             let r = adt_def.repr();
                             let repr = if r.transparent() {
                                 "transparent".to_string()
@@ -2128,7 +3205,7 @@ fn convert_ty_inner<'tcx>(
                             };
                             Box::new(trust_types::AdtLayoutInfo {
                                 size: l.size.bytes(),
-                                align: l.align.abi.bytes(),
+                                align: l.align.bytes(),
                                 // `FieldsShape::offset` PANICS out of range and a
                                 // struct's layout may carry fewer field entries
                                 // than the variant has (scalable-vector structs):
@@ -2144,13 +3221,18 @@ fn convert_ty_inner<'tcx>(
                 } else {
                     None
                 };
+                // Trust (R107-IDENTITY-1): std's validity wrappers, identified by the
+                // DEFINITION, never by the printed `name` (which carries the
+                // unauthenticated-crate stamp for a non-resident `core`).
+                let validity_wrapper = validity_wrapper_of(tcx, adt_def.did());
                 TrustTy::Adt {
                     name,
-                    fields,
-                    variants: Vec::new(),
+                    fields: fields.into(),
+                    variants: trust_types::SharedVec::default(),
                     disc_index_safe: false,
                     faithful_enum_repr: None,
                     arbitrary_precision,
+                    validity_wrapper,
                     layout,
                     enum_layout: None,
                     // Trust: W19 — the struct/union kind, read from rustc's AdtDef.
@@ -2213,7 +3295,7 @@ fn convert_ty_inner<'tcx>(
             ),
         ),
         TyKind::FnDef(def_id, args) => {
-            let sig = tcx.fn_sig(*def_id).instantiate(tcx, args).skip_normalization();
+            let sig = tcx.fn_sig(*def_id).instantiate(tcx, args.skip_binder()).skip_normalization();
             TrustTy::FnDef {
                 name: crate::sysroot_authenticated_def_path_str(tcx, *def_id),
                 sig: Box::new(trust_fn_sig_from_rustc(tcx, sig, ctx)),
@@ -2474,7 +3556,7 @@ fn convert_ty_inner<'tcx>(
     // inside that bound. Degradation remains DROP-ONLY, so this can only restore
     // obligations that were being dropped, never manufacture a PROVE.
     ctx.produced_nodes = ctx.produced_nodes.saturating_add(fresh_node_charge(&lowered));
-    if ctx.produced_nodes > ctx.produced_budget && std::env::var("TRUST_VCGEN_TRACE_BUDGET").is_ok()
+    if ctx.produced_nodes > ctx.produced_budget && trace_budget_enabled()
     {
         eprintln!(
             "[TYPE_LOWERING_BUDGET] produced-node budget {} crossed (produced={}) — degrading remaining types to fail-closed Unsupported",
@@ -2486,7 +3568,12 @@ fn convert_ty_inner<'tcx>(
     // RC-1: a cut point never gets here except on its single `expand_cut_point`
     // occurrence, and that runs in a throwaway sub-context whose memo dies with
     // it — so caching is unconditional again.
-    ctx.cache.insert(ty, lowered.clone());
+    // Skip inserting at `ctx.depth == 0` (the root of `convert_ty`, `convert_ty_in_env`,
+    // or `cut_point_definition`), where the walk has finished and `ctx.cache` is dropped
+    // immediately after returning `lowered`.
+    if ctx.depth > 0 {
+        ctx.cache.insert(ty, lowered.clone());
+    }
     lowered
 }
 
@@ -2557,17 +3644,36 @@ fn normalize_alias<'tcx>(
         );
     }
 
-    // rustc's canonical normalization. `try_*` (not the panicking variant) so a
-    // normalization failure is a graceful `Err`, never a panic. The
-    // monomorphism + depth guards above keep this off the typenum E0275 path.
+    // Inside `mir_built` (`ctfe_reentrancy::frozen`), never reveal: the body has not
+    // been borrow-checked, and revealing an opaque demands its `type_of`, which
+    // borrow-checks the opaque's defining body — possibly the one under construction
+    // (E0391; measured on `tests/ui/impl-trait/trait_upcasting.rs` and
+    // `tests/ui/type-alias-impl-trait/type-alias-impl-trait-assoc-dyn.rs`, through the
+    // THIR producer's `convert_ty_in_env` under the codegen typing mode). Normalized in
+    // the analysis mode, an opaque stays an alias and lowers `Unsupported` below.
+    // Trust (OPAQUE-IMPL-WHERE-LEAK-1): the analysis mode still leaks a local opaque's auto
+    // traits through the where-clause of the impl a normalization selects, so inside
+    // `mir_built` the normalization is the leak-free one (`try_normalize_unrevealed`, which
+    // also asks the analysis mode in a crate with no opaque of its own). And it declines,
+    // first, an alias naming a constant that may not be evaluated there (fix11
+    // CTFE-IN-MIR-BUILT-1, `ctfe_reentrancy::non_leaf_constant_if_frozen`): the normalizer
+    // would evaluate it on this thread's query stack. A constant reached only through the
+    // impl's VALUE is not seen by that check (docs/KNOWN_HAZARDS.md CTFE-IN-MIR-BUILT-1).
+    // `try_*` (not the panicking variant) so a normalization failure is a graceful
+    // "unsupported", never a panic. The monomorphism + depth guards above keep this off the
+    // typenum E0275 path.
     let revealed =
-        match tcx.try_normalize_erasing_regions(typing_env, ty::Unnormalized::new_wip(alias_ty)) {
-            Ok(revealed) => revealed,
-            Err(_) => {
-                return unsupported_ty(
-                    "TyKind::Alias",
-                    "alias could not be normalized in this typing env".to_string(),
-                );
+        match crate::ctfe_reentrancy::try_normalize_ty_unrevealed(tcx, typing_env, alias_ty) {
+            Some(revealed) => revealed,
+            None => {
+                let detail = if crate::ctfe_reentrancy::non_leaf_constant_if_frozen(tcx, &alias_ty)
+                    .is_some()
+                {
+                    "alias names a constant whose evaluation could re-enter `mir_built`"
+                } else {
+                    "alias could not be normalized in this typing env"
+                };
+                return unsupported_ty("TyKind::Alias", detail.to_string());
             }
         };
 
@@ -2605,23 +3711,135 @@ fn is_level_path(crate_name: &str, def_path: &str) -> bool {
         && (def_path == "clean_kernel::level::Level" || def_path == "level::Level")
 }
 
-/// `tcx`-driven form of [`is_level_path`]: reads the ADT's owning crate name and
-/// its def path. Scoping to a single crate+path keeps the change faithful and
-/// auditable — no other type's lowering shifts.
-fn is_level_datatype_target(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
-    is_level_path(tcx.crate_name(def_id.krate).as_str(), &crate::safe_def_path_str(tcx, def_id))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanKernelDatatypeTarget {
+    Level,
+    ExprKind,
+    Expr,
+}
+
+/// Fused `tcx` classifier for [`is_level_path`], [`is_exprkind_path`], and
+/// [`is_expr_path`]: reads `crate_name` once and formats `safe_def_path_str` at
+/// most once (only when the crate is `clean_kernel` and the item leaf name is
+/// `Level`, `ExprKind`, or `Expr`).
+fn clean_kernel_datatype_target(
+    tcx: TyCtxt<'_>,
+    def_id: rustc_hir::def_id::DefId,
+) -> Option<CleanKernelDatatypeTarget> {
+    let crate_name = tcx.crate_name(def_id.krate);
+    if crate_name.as_str() != "clean_kernel" {
+        return None;
+    }
+    let item_name = tcx.opt_item_name(def_id)?;
+    let candidate = match item_name.as_str() {
+        "Level" => CleanKernelDatatypeTarget::Level,
+        "ExprKind" => CleanKernelDatatypeTarget::ExprKind,
+        "Expr" => CleanKernelDatatypeTarget::Expr,
+        _ => return None,
+    };
+    let def_path = crate::safe_def_path_str(tcx, def_id);
+    match candidate {
+        CleanKernelDatatypeTarget::Level if is_level_path("clean_kernel", &def_path) => {
+            Some(CleanKernelDatatypeTarget::Level)
+        }
+        CleanKernelDatatypeTarget::ExprKind if is_exprkind_path("clean_kernel", &def_path) => {
+            Some(CleanKernelDatatypeTarget::ExprKind)
+        }
+        CleanKernelDatatypeTarget::Expr if is_expr_path("clean_kernel", &def_path) => {
+            Some(CleanKernelDatatypeTarget::Expr)
+        }
+        _ => None,
+    }
+}
+
+/// Trust (DATATYPE-POSITIONAL-TAGS): may `adt_def` be modeled as a `Ty::Datatype`
+/// without losing its discriminants? True for a struct or union (no discriminant)
+/// and for an enum EVERY variant of which takes the default tag — its declaration
+/// position (`VariantDiscr::Relative(i)` at index `i`, i.e. no explicit `= k`
+/// anywhere before or at it).
+///
+/// `Ty::Datatype` records constructors only, and its consumers read the
+/// constructor at position `i` as discriminant `i` (`enum_variant_tag_set` in
+/// trust-vcgen publishes `d ∈ {0..n}`; `recursive_datatype_functional` maps a
+/// `SwitchInt` tag to `variants[tag]`). The by-path gates above are user-reachable
+/// (a crate named `clean_kernel` with a `level::Level`), and measured on a stage1
+/// of `0f52d0194b`: `#[repr(u8)] enum Level { Zero = 7, Succ(Box<Level>) = 9 }`
+/// lowered here published `d ∈ {0, 1}` while the real tag is 7 or 9, making both
+/// real arms infeasible and FALSE-PROVING the reachable `x + 200` overflow under
+/// the `Zero` arm (also for the inline `Succ(u8)` shape, on main). Declining
+/// here sends such a type to the ordinary enum lowering, whose `VariantDef`s
+/// carry the real tags. `cell_threading::normalize_ty` enforces the same rule on
+/// the other `Ty::Datatype` producer. An explicit `= 0` on the first variant is
+/// declined too (conservative: no const evaluation is needed to decide).
+fn adt_discriminants_are_positional(adt_def: ty::AdtDef<'_>) -> bool {
+    !adt_def.is_enum()
+        || adt_def
+            .variants()
+            .iter_enumerated()
+            .all(|(idx, v)| v.discr == ty::VariantDiscr::Relative(idx.as_u32()))
 }
 
 /// Is `def_id` the real `alloc::vec::Vec`?
 ///
-/// Authenticated through the DIAGNOSTIC ITEM, not through a rendered path.
-/// A def-path string test would also fire on any user type whose path ends
-/// in `Vec` (`mod fake { pub struct Vec<T>(T); }`), and admitting a
-/// look-alike as a sequence is exactly the confusion this lowering exists to
-/// remove. `rustc_diagnostic_item = "Vec"` is attached to the one `Vec` in
-/// `alloc`, so the gate cannot be spoofed from user code.
+/// Two conditions, both required:
+///  * the DIAGNOSTIC ITEM `Vec`, not a rendered path. A def-path string test
+///    would also fire on any user type whose path ends in `Vec`
+///    (`mod fake { pub struct Vec<T>(T); }`), and admitting a look-alike as a
+///    sequence is exactly the confusion this lowering exists to remove;
+///  * the defining crate is this compiler's own sysroot crate by ARTIFACT
+///    RESIDENCY (`convert::is_real_sysroot_crate`, the R2 discipline).
+///
+/// Trust (SEQ-RESIDENCY-1, 2026-10-04): the diagnostic item alone is NOT an
+/// identity. It is a source attribute (`#[rustc_diagnostic_item = "Vec"]` under
+/// `#![feature(rustc_attrs)]`), resolved through a graph-wide registry, and in a
+/// `#![no_std]` graph the real `alloc` is not loaded to contest it. Measured on
+/// the stage 1 of `ee3f51541d`: a dependency built `--crate-name alloc` whose
+/// `vec::Vec` carries that attribute and whose `Deref` alternates two slices
+/// lowered to `Ty::Seq`. Every vcgen consumer reads `Ty::Seq` as std's `Vec`
+/// (DEREF-ANCHOR-1's receiver anchor, VEC-AS-SLICE's `place_is_std_vec`), so
+/// `if w.len() == 0 { return 0; } w.len() - 1` on `&alloc::vec::Vec<u32>` was
+/// Clean-kernel Certified, its overflow check elided, and the program returned
+/// `usize::MAX` where vanilla Rust panics. Residency is not source-declarable,
+/// so the forgery now lowers to an ordinary `Ty::Adt` whose name the
+/// impersonation stamp (`sysroot_authenticated_def_path_str`) marks, and no
+/// exact-path `alloc::vec::Vec` test accepts it. A `Vec` from a non-resident
+/// `alloc` (`-Zbuild-std`) loses the `Seq` lowering too: fail-closed.
+///
+/// Trust (2026-10-07): AND the defining crate is a real sysroot crate. A crate
+/// built with `rustc_attrs` (and no `alloc` linked) can register its own `Vec`
+/// diagnostic item, and `Ty::Seq` is now read as authenticated std by the
+/// bounded-source grants (trust-vcgen `ty_receiver_is_authenticated_sysroot`), so
+/// its provenance must be certain; an impostor stays an ordinary (stamped) ADT.
+/// Trust (R107-IDENTITY-1): which of std's validity wrappers the ADT `def_id`
+/// is, from its DEFINITION. `NonNull` is the `non_null` LANG ITEM: the test the
+/// extractor's `ptr_to_nonnull` and `asserted_wrap` admissions already ask
+/// (convert.rs), so the bridge's R107 charge and those admissions read one
+/// verdict. `NonZero` is the `NonZero` DIAGNOSTIC ITEM. Neither reads a printed
+/// path, so the answer is the same for the resident `core`, for a `core` loaded
+/// from outside the sysroot (whose names print under the unauthenticated-crate
+/// stamp) and for any other spelling.
+///
+/// A CHARGE trigger only (`trust_types::ValidityWrapper`): unlike `is_std_vec`,
+/// this deliberately does NOT require a real sysroot crate. A crate that declares
+/// either item for its own type (a `#![no_core]` crate's `non_null` lang item is
+/// the one the compiler uses for that compilation) is charged one more `!= 0`
+/// assert, which is fail-closed; no consumer may read the stamp to grant.
+pub(crate) fn validity_wrapper_of(
+    tcx: TyCtxt<'_>,
+    def_id: rustc_hir::def_id::DefId,
+) -> Option<trust_types::ValidityWrapper> {
+    if tcx.is_lang_item(def_id, rustc_attr_ir::lang_items::LangItem::NonNull) {
+        Some(trust_types::ValidityWrapper::NonNull)
+    } else if tcx.is_diagnostic_item(rustc_span::sym::NonZero, def_id) {
+        Some(trust_types::ValidityWrapper::NonZero)
+    } else {
+        None
+    }
+}
+
 fn is_std_vec(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
     tcx.is_diagnostic_item(rustc_span::sym::Vec, def_id)
+        && crate::convert::is_real_sysroot_crate(tcx, def_id.krate)
 }
 
 /// Lever A step 5 — is `(crate_name, def_path)` the kernel `Expr` STRUCT (the
@@ -2646,16 +3864,6 @@ fn is_expr_path(crate_name: &str, def_path: &str) -> bool {
 fn is_exprkind_path(crate_name: &str, def_path: &str) -> bool {
     crate_name == "clean_kernel"
         && (def_path == "clean_kernel::expr::kind::ExprKind" || def_path == "expr::kind::ExprKind")
-}
-
-/// `tcx`-driven form of [`is_expr_path`].
-fn is_expr_datatype_target(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
-    is_expr_path(tcx.crate_name(def_id.krate).as_str(), &crate::safe_def_path_str(tcx, def_id))
-}
-
-/// `tcx`-driven form of [`is_exprkind_path`].
-fn is_exprkind_datatype_target(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
-    is_exprkind_path(tcx.crate_name(def_id.krate).as_str(), &crate::safe_def_path_str(tcx, def_id))
 }
 
 /// The nominal-ADT paths that are TRANSPARENT heap/pointer indirections for the
@@ -2686,10 +3894,13 @@ fn peel_transparent_pointers<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> ty::T
             TyKind::Ref(_, inner, _) => cur = *inner,
             TyKind::RawPtr(inner, _) => cur = *inner,
             TyKind::Adt(def, args)
-                if is_transparent_pointer_wrapper(&crate::sysroot_authenticated_def_path_str(
-                    tcx,
-                    def.did(),
-                )) =>
+                if crate::convert::is_real_sysroot_crate(tcx, def.did().krate)
+                    && tcx
+                        .opt_item_name(def.did())
+                        .is_some_and(|s| matches!(s.as_str(), "Arc" | "Rc" | "Box"))
+                    && is_transparent_pointer_wrapper(
+                        &crate::sysroot_authenticated_def_path_str(tcx, def.did()),
+                    ) =>
             {
                 match args.types().next() {
                     Some(inner) => cur = inner,
@@ -2748,7 +3959,7 @@ fn lower_level_datatype<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
     adt_def: ty::AdtDef<'tcx>,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
     name: &str,
     ctx: &mut TyLoweringCtx<'tcx>,
 ) -> TrustTy {
@@ -2770,7 +3981,7 @@ fn lower_exprkind_datatype<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
     adt_def: ty::AdtDef<'tcx>,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
     name: &str,
     ctx: &mut TyLoweringCtx<'tcx>,
 ) -> TrustTy {
@@ -2789,7 +4000,7 @@ fn lower_expr_datatype<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
     adt_def: ty::AdtDef<'tcx>,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
     name: &str,
     ctx: &mut TyLoweringCtx<'tcx>,
 ) -> TrustTy {
@@ -2808,11 +4019,18 @@ fn lower_expr_datatype<'tcx>(
 /// never blows up (the 464 MB `Ty::Adt` expansion is dodged). SOUNDNESS: a
 /// datatype declaration introduces only the standard sound datatype-theory
 /// axioms; a fresh datatype-sorted constant is unconstrained.
+///
+/// Member names are the RAW Rust names on purpose (every tuple variant calls
+/// its first field `0`): trust-clean reflects this `Ty` back against the ADT.
+/// They are not SMT symbols. The SMT declaration is `Sort::from_ty`'s, which
+/// declares each field under `trust_types::datatype_selector_name(ctor,
+/// field)`; trust-router's ay namespace then qualifies every constructor and
+/// selector by its datatype (TRUST-04, TRUST-05).
 fn lower_adt_as_datatype<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
     adt_def: ty::AdtDef<'tcx>,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
     name: &str,
     ctx: &mut TyLoweringCtx<'tcx>,
 ) -> TrustTy {
@@ -2826,9 +4044,11 @@ fn lower_adt_as_datatype<'tcx>(
         return recursive_datatype_ref(name);
     }
     ctx.adt_stack.push(ty);
-    let mut variants: Vec<(String, Vec<(String, TrustTy)>)> = Vec::new();
+    let mut variants: Vec<(String, Vec<(String, TrustTy)>)> =
+        Vec::with_capacity(adt_def.variants().len());
     for variant in adt_def.variants().iter() {
-        let mut variant_fields: Vec<(String, TrustTy)> = Vec::new();
+        let mut variant_fields: Vec<(String, TrustTy)> =
+            Vec::with_capacity(variant.fields.len());
         for field in variant.fields.iter() {
             let modeled =
                 datatype_child_field_ty(tcx, field.ty(tcx, args).skip_normalization(), ctx);
@@ -2936,11 +4156,15 @@ const SERDE_JSON_TCB_LOG_ENV: &str = "TRUST_SERDE_JSON_TCB_LOG";
 pub(crate) fn authenticate_arbitrary_precision<'tcx>(
     tcx: TyCtxt<'tcx>,
     did: rustc_hir::def_id::DefId,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
 ) -> Option<ArbPrecKind> {
+    static LOG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let krate = did.krate;
     let crate_name = tcx.crate_name(krate);
     let name_str = crate_name.as_str();
+    if !matches!(name_str, "num_bigint" | "num-bigint" | "num_rational" | "num-rational") {
+        return None;
+    }
     let scid = tcx.stable_crate_id(krate).as_u64();
 
     // One-shot CAPTURE log (env-gated, allowlist-INDEPENDENT): whenever a
@@ -2949,9 +4173,7 @@ pub(crate) fn authenticate_arbitrary_precision<'tcx>(
     // the id is currently allowlisted, so the very first build with an EMPTY
     // list still reveals the real ids. Precedent for `.as_u64()` on an external
     // crate: `convert::direct_call_def_path`.
-    if matches!(name_str, "num_bigint" | "num-bigint" | "num_rational" | "num-rational")
-        && std::env::var_os(BIGNUM_TCB_LOG_ENV).is_some()
-    {
+    if *LOG_ENABLED.get_or_init(|| std::env::var_os(BIGNUM_TCB_LOG_ENV).is_some()) {
         let crate_hash = tcx.crate_hash(krate);
         eprintln!(
             "[BIGNUM_TCB_CANDIDATE] name={name_str} scid={scid:#x} hash={crate_hash:?} item={}",
@@ -2986,7 +4208,7 @@ pub(crate) fn authenticate_arbitrary_precision<'tcx>(
             let ty::TyKind::Adt(elem_def, elem_args) = elem.kind() else { return None };
             match tcx.item_name(elem_def.did()).as_str() {
                 "BigInt" | "BigUint" => {
-                    match authenticate_arbitrary_precision(tcx, elem_def.did(), elem_args)? {
+                    match authenticate_arbitrary_precision(tcx, elem_def.did(), *elem_args)? {
                         ArbPrecKind::Signed => Some(ArbPrecKind::RatioSigned),
                         ArbPrecKind::Unsigned => Some(ArbPrecKind::RatioUnsigned),
                         // A `Ratio`/`Ratio`-nested element cannot reach here (the name
@@ -3011,19 +4233,21 @@ pub(crate) fn authenticate_arbitrary_precision<'tcx>(
 pub(crate) fn authenticate_serde_json<'tcx>(
     tcx: TyCtxt<'tcx>,
     did: rustc_hir::def_id::DefId,
-    _args: ty::GenericArgsRef<'tcx>,
+    _args: ty::GenericArgs<'tcx>,
 ) -> Option<SerdeJsonKind> {
+    static LOG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let krate = did.krate;
     let crate_name = tcx.crate_name(krate);
     let name_str = crate_name.as_str();
+    if !matches!(name_str, "serde_json" | "serde-json") {
+        return None;
+    }
     let scid = tcx.stable_crate_id(krate).as_u64();
 
     // One-shot capture log (env-gated, allowlist-INDEPENDENT) — mirror bignum. This
     // fires regardless of whether the id is allowlisted, so the very first build
     // with an EMPTY list still reveals the real id to capture.
-    if matches!(name_str, "serde_json" | "serde-json")
-        && std::env::var_os(SERDE_JSON_TCB_LOG_ENV).is_some()
-    {
+    if *LOG_ENABLED.get_or_init(|| std::env::var_os(SERDE_JSON_TCB_LOG_ENV).is_some()) {
         let crate_hash = tcx.crate_hash(krate);
         eprintln!(
             "[SERDE_JSON_TCB_CANDIDATE] name={name_str} scid={scid:#x} hash={crate_hash:?} item={}",
@@ -3065,9 +4289,7 @@ pub(crate) fn authenticate_serde_json<'tcx>(
 pub fn is_authenticated_bignum_crate(tcx: TyCtxt<'_>, krate: rustc_hir::def_id::CrateNum) -> bool {
     let name = tcx.crate_name(krate);
     let scid = tcx.stable_crate_id(krate).as_u64();
-    BIGNUM_TCB_ALLOWLIST
-        .iter()
-        .any(|&(n, s)| n == name.as_str() && s == scid)
+    BIGNUM_TCB_ALLOWLIST.iter().any(|&(n, s)| n == name.as_str() && s == scid)
 }
 
 /// Trust (Route A): true iff `krate` is the StableCrateId-AUTHENTICATED serde_json
@@ -3084,9 +4306,7 @@ pub fn is_authenticated_serde_json_crate(
 ) -> bool {
     let name = tcx.crate_name(krate);
     let scid = tcx.stable_crate_id(krate).as_u64();
-    SERDE_JSON_TCB_ALLOWLIST
-        .iter()
-        .any(|&(n, s)| n == name.as_str() && s == scid)
+    SERDE_JSON_TCB_ALLOWLIST.iter().any(|&(n, s)| n == name.as_str() && s == scid)
 }
 
 /// Trust (C2): true iff `k` is a key type whose std `Hash`+`Eq` (and derived
@@ -3113,7 +4333,10 @@ pub fn is_authenticated_serde_json_crate(
 /// `Q`. The read hole is closed on the BRIDGE side: `read_query_arg_is_std_total`
 /// gates the erased query `Q` (recovered as the `k: &Q` argument type) with this
 /// SAME total-key predicate, so a user `Q`/`Borrow<Q>` fails closed there.
-fn tcx_key_is_std_total<'tcx>(tcx: TyCtxt<'tcx>, k: ty::Ty<'tcx>) -> bool {
+///
+/// Trust (2026-10-10): `pub(crate)` for the hash-query sentinel's method-`Q` gate
+/// (`convert::is_total_hash_map_query_call`, the CALL-REACH-1 interim H3 stopgap).
+pub(crate) fn tcx_key_is_std_total<'tcx>(tcx: TyCtxt<'tcx>, k: ty::Ty<'tcx>) -> bool {
     let mut k = k;
     while let TyKind::Ref(_, inner, _) = k.kind() {
         k = *inner;
@@ -3127,7 +4350,7 @@ fn tcx_key_is_std_total<'tcx>(tcx: TyCtxt<'tcx>, k: ty::Ty<'tcx>) -> bool {
         TyKind::Adt(def, adt_args) => {
             let did = def.did();
             crate::convert::is_element_free_total_std_adt(tcx, did)
-                || authenticate_arbitrary_precision(tcx, did, adt_args).is_some()
+                || authenticate_arbitrary_precision(tcx, did, *adt_args).is_some()
         }
         _ => false,
     }
@@ -3137,9 +4360,10 @@ fn tcx_key_is_std_total<'tcx>(tcx: TyCtxt<'tcx>, k: ty::Ty<'tcx>) -> bool {
 /// panic-free-`get`/`insert`/`new` unblocker for `HashMap`/`BTreeMap`.
 ///
 /// Returns `Some(TotalMapKind::HashDefault)` ONLY for a REAL
-/// `std::collections::HashMap<K, V, S>` whose hasher `S` is the std DEFAULT
-/// `std::hash::random::RandomState` (SipHash — never panics) AND whose key `K`
-/// is total-`Hash`+`Eq` ([`tcx_key_is_std_total`]); resp.
+/// `std::collections::HashMap<K, V, S, A>` whose hasher `S` is the std DEFAULT
+/// `std::hash::random::RandomState` (SipHash — never panics), whose allocator `A`
+/// is the std `Global` allocator, AND whose key `K` is total-`Hash`+`Eq`
+/// ([`tcx_key_is_std_total`]); resp.
 /// `Some(TotalMapKind::OrdGlobal)` for a `BTreeMap<K, V, A>` with the std
 /// `Global` allocator and a total-`Ord` key. EVERYTHING else — a custom hasher,
 /// a user `RandomState` LOOKALIKE (its defining crate is NOT the reserved
@@ -3157,7 +4381,7 @@ fn tcx_key_is_std_total<'tcx>(tcx: TyCtxt<'tcx>, k: ty::Ty<'tcx>) -> bool {
 fn authenticate_total_std_map<'tcx>(
     tcx: TyCtxt<'tcx>,
     did: rustc_hir::def_id::DefId,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
 ) -> Option<TotalMapKind> {
     // Un-spoofable identity: DEFINING crate is the reserved sysroot `std`/`alloc`
     // (no user crate can be named these) AND the exact defining def-path matches.
@@ -3168,17 +4392,20 @@ fn authenticate_total_std_map<'tcx>(
     // they pin the ONE real HashMap/BTreeMap/BTreeSet and decline a like-named
     // impostor whose insert/`Ord`/`Hash` path can panic. (`_want_crate` retained for
     // call-site self-documentation; the scid bind subsumes the printed-name check.)
-    let is_reserved =
-        |item: rustc_hir::def_id::DefId, _want_crate: rustc_span::Symbol, want_path: &str| {
-            crate::convert::is_real_sysroot_crate(tcx, item.krate)
-                && crate::safe_def_path_str(tcx, item) == want_path
-        };
+    if !crate::convert::is_real_sysroot_crate(tcx, did.krate) {
+        return None;
+    }
+    let item_name = tcx.opt_item_name(did)?;
+    if !matches!(item_name.as_str(), "HashMap" | "BTreeMap" | "BTreeSet") {
+        return None;
+    }
+    let def_path = crate::safe_def_path_str(tcx, did);
     // Recover a TYPE generic argument WITHOUT panicking on a malformed/short arg
     // list (fail closed on the unexpected shape).
     let type_arg = |i: usize| args.get(i).and_then(|a| a.as_type());
 
     // HashMap<K, V, S = RandomState>: authenticate S == the std default hasher.
-    if is_reserved(did, rustc_span::sym::std, "std::collections::hash::map::HashMap") {
+    if def_path == "std::collections::hash::map::HashMap" {
         let (Some(k), Some(s)) = (type_arg(0), type_arg(2)) else {
             return None;
         };
@@ -3188,23 +4415,46 @@ fn authenticate_total_std_map<'tcx>(
         let s_did = s_def.did();
         // SOUNDNESS (crate-name forgery): bind `S` to a genuine sysroot crate by scid,
         // not the spoofable printed `std` name; the exact def-path below pins RandomState.
-        let s_is_default_random_state = crate::convert::is_real_sysroot_crate(tcx, s_did.krate) && {
-            // The real std `RandomState` (SipHash — panic-free). Accept BOTH the
-            // defining and re-export spellings; both are in the reserved `std`
-            // crate, so the crate-name anchor keeps this sound. A custom hasher
-            // or a `BuildHasherDefault<…>` renders a DIFFERENT path and fails.
-            let p = crate::safe_def_path_str(tcx, s_did);
-            p == "std::hash::random::RandomState"
-                || p == "std::collections::hash_map::RandomState"
-        };
+        let s_is_default_random_state = crate::convert::is_real_sysroot_crate(tcx, s_did.krate)
+            && {
+                // The real std `RandomState` (SipHash — panic-free). Accept BOTH the
+                // defining and re-export spellings; both are in the reserved `std`
+                // crate, so the crate-name anchor keeps this sound. A custom hasher
+                // or a `BuildHasherDefault<…>` renders a DIFFERENT path and fails.
+                let p = crate::safe_def_path_str(tcx, s_did);
+                p == "std::hash::random::RandomState"
+                    || p == "std::collections::hash_map::RandomState"
+            };
         if !s_is_default_random_state {
+            return None;
+        }
+        // HashMap<K, V, S, A = Global>: authenticate A == the std `Global` allocator,
+        // as the BTreeMap/BTreeSet arms below do. `insert`/`entry` on a full table run
+        // hashbrown's `reserve_rehash`, which allocates the new table and frees the old
+        // one through `A`, and the bridge discharges those calls by this stamp with no
+        // row (`is_std_total_hash_eq_key_map_insert_absent_callee`). MEASURED on Trust's
+        // stage 1 of `dcac671f946`: `insert` on a `HashMap<u32, u8, RandomState,
+        // dep::AllocBomb>` (a verify-off dependency's allocator that panics) built exit 0
+        // with no Trust diagnostic under default and certify, while SP-1's BEFORE runs
+        // of the same call panicked in `AllocBomb::allocate` < `reserve_rehash` <
+        // `HashMap::insert` (KNOWN_HAZARDS, FIXED 2026-10-10).
+        let Some(a) = type_arg(3) else {
+            return None;
+        };
+        let ty::TyKind::Adt(a_def, _) = a.kind() else {
+            return None;
+        };
+        let a_did = a_def.did();
+        let a_is_global = crate::convert::is_real_sysroot_crate(tcx, a_did.krate)
+            && crate::safe_def_path_str(tcx, a_did) == "alloc::alloc::Global";
+        if !a_is_global {
             return None;
         }
         return tcx_key_is_std_total(tcx, k).then_some(TotalMapKind::HashDefault);
     }
 
     // BTreeMap<K, V, A = Global>: authenticate A == the std `Global` allocator.
-    if is_reserved(did, rustc_span::sym::alloc, "alloc::collections::btree::map::BTreeMap") {
+    if def_path == "alloc::collections::btree::map::BTreeMap" {
         let (Some(k), Some(a)) = (type_arg(0), type_arg(2)) else {
             return None;
         };
@@ -3227,7 +4477,7 @@ fn authenticate_total_std_map<'tcx>(
     // value has no drop code — so its totality reduces EXACTLY to the BTreeMap
     // OrdGlobal gate. Reuse the OrdGlobal stamp. ARG LAYOUT DIFFERS from BTreeMap:
     // key = arg0, allocator = arg1 (no V), so a mis-copy fails closed via the let-else.
-    if is_reserved(did, rustc_span::sym::alloc, "alloc::collections::btree::set::BTreeSet") {
+    if def_path == "alloc::collections::btree::set::BTreeSet" {
         let (Some(k), Some(a)) = (type_arg(0), type_arg(1)) else {
             return None;
         };
@@ -3252,10 +4502,53 @@ fn lower_enum_adt<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
     adt_def: ty::AdtDef<'tcx>,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
     name: &str,
     ctx: &mut TyLoweringCtx<'tcx>,
 ) -> TrustTy {
+    // Trust (REPR-U128-HIGH-TAG-1): FAIL CLOSED, before anything else, on an enum
+    // one of whose tags has no `i128` denotation. `VariantDef::discriminant` is an
+    // `i128`; a `#[repr(u128)]` tag above `i128::MAX` used to be stored as the
+    // lossy `val as i128` (`u128::MAX` as `-1`, `1 << 127` as `i128::MIN`), and
+    // every consumer of the tag set inherited a FALSE tag. The discriminant-domain
+    // fact (`trust_vcgen`'s `build_discriminant_variant_range_facts`) then said
+    // `d ∈ {0, -1, 5}` about a `u128` read whose `SwitchInt` label is the true
+    // `u128::MAX`, the arm for that variant was UNSAT, and every row in it was
+    // proved — under the default policy and certify alike, while the binary
+    // panics (and accepts `unreachable_unchecked` in that arm).
+    //
+    // Checked HERE, at the single extraction boundary for `VariantDef`, so every
+    // consumer is closed at once: the domain fact, the aggregate and
+    // `SetDiscriminant` tag definitions, the refutation pins and the cast lanes.
+    // It is a function of the type alone (the memo caches one answer per type),
+    // it runs before the `adt_stack` push and before any field is lowered (so the
+    // back-edge arm below can never meet such an enum), and it matches the THIR
+    // producer, whose `enum_discriminants` already declines every discriminant
+    // wider than 64 bits. The faithful `u128` rendering is REPR-U128-HIGH-TAG-REFUTE-1.
+    //
+    // Trust (fix11, CTFE-IN-MIR-BUILT-1): computing a tag evaluates the enum's explicit
+    // discriminants, and inside `mir_built` one may not be evaluable there (E0391 measured:
+    // `enum E { A = f() }` with `const fn f` naming a struct that holds an `E`).
+    // `ctfe_reentrancy::discriminants_may_be_evaluated` is asked first; a decline lowers the
+    // enum `Unsupported`, before any tag is computed.
+    if !crate::ctfe_reentrancy::discriminants_may_be_evaluated(tcx, adt_def) {
+        return unsupported_ty(
+            "TyKind::Adt",
+            format!(
+                "enum `{name}`: an explicit discriminant may not be evaluated inside `mir_built`"
+            ),
+        );
+    }
+    let mut decoded_discriminants: Vec<i128> = Vec::with_capacity(adt_def.variants().len());
+    for (v_idx, raw_discr) in adt_def.discriminants(tcx) {
+        let Some(discriminant) = decode_discr_tag(raw_discr.val, raw_discr.ty, tcx) else {
+            return enum_tag_without_i128_denotation_leaf(
+                name,
+                adt_def.variant(v_idx).name.as_str(),
+            );
+        };
+        decoded_discriminants.push(discriminant);
+    }
     if ctx.adt_stack.contains(&ty) {
         // Lever A (recursive-enum back-edge): the enum re-enters itself at a
         // variant field (e.g. `Expr` reached through a variant's `Box<Expr>`).
@@ -3296,7 +4589,8 @@ fn lower_enum_adt<'tcx>(
     // fail-closed `Unsupported` leaf, which is strictly worse.
     ctx.adt_stack.push(ty);
 
-    let mut fields = Vec::new();
+    let total_variant_fields: usize = adt_def.variants().iter().map(|v| v.fields.len()).sum();
+    let mut fields = Vec::with_capacity(1 + total_variant_fields);
     // 1. Add discriminant
     fields.push(("__tag".to_string(), TrustTy::Int { width: pointer_width(tcx), signed: true }));
 
@@ -3307,7 +4601,7 @@ fn lower_enum_adt<'tcx>(
     // positional index for tuple variants), so `trust-clean` can reflect a real
     // multi-constructor inductive. The flattened `fields` view below is RETAINED
     // verbatim so no pre-P4 consumer (sort lookup, field projection) changes.
-    let mut variants: Vec<trust_types::VariantDef> = Vec::new();
+    let mut variants: Vec<trust_types::VariantDef> = Vec::with_capacity(adt_def.variants().len());
     // Trust (B3-1): a compacted (by-name-ref) variant field disqualifies the
     // faithful first-class spelling — the def would not be structurally equal
     // to the producer's.
@@ -3322,7 +4616,7 @@ fn lower_enum_adt<'tcx>(
     // 2. Flatten all variants (existing union view) + populate per-variant defs.
     for (v_idx, variant) in adt_def.variants().iter_enumerated() {
         // verifier-perf (produced-node budget): bail the WHOLE enum to the
-        // fail-closed recursive-ADT marker once the per-function produced-tree size
+        // fail-closed recursive-ADT marker once this WALK's produced-tree size
         // crosses the budget. This is the load-bearing cap for the
         // `Ty::clone`-in-the-flattened-fields-loop explosion (each `field_ty.clone()`
         // below deep-copies a recursive `Ty::Adt`, and a mutually-recursive enum
@@ -3335,9 +4629,10 @@ fn lower_enum_adt<'tcx>(
             ctx.adt_stack.pop();
             return produced_budget_degraded_leaf();
         }
-        let mut variant_fields: Vec<(String, TrustTy)> = Vec::new();
+        let mut variant_fields: Vec<(String, TrustTy)> = Vec::with_capacity(variant.fields.len());
         for field in &variant.fields {
-            let mut field_ty = convert_ty_inner(tcx, field.ty(tcx, args).skip_normalization(), ctx);
+            let field_rustc_ty = field.ty(tcx, args).skip_normalization();
+            let mut field_ty = convert_ty_inner(tcx, field_rustc_ty, ctx);
             // Lever A (field compaction): a recursive enum reached through `Arc`/
             // `Box` (clean-kernel's `Expr`/`ExprKind`/`Level`) has variant fields
             // that flatten — via Arc/ArcInner/Atomic/UnsafeCell wrappers — into `Ty`
@@ -3350,8 +4645,17 @@ fn lower_enum_adt<'tcx>(
             // field is a modeled, fact-free datatype sort (see
             // `compact_oversized_field`); only precision vs. tractability trades off,
             // never soundness, and the small scalar payloads keep full detail.
-            if ty_node_count(&field_ty, MAX_DATATYPE_FIELD_NODES + 1) > MAX_DATATYPE_FIELD_NODES {
+            if ty_node_count(&field_ty, MAX_DATATYPE_FIELD_NODES + 1) > MAX_DATATYPE_FIELD_NODES
+                && !matches!(&field_ty, TrustTy::Adt { arbitrary_precision: Some(_), .. })
+            {
                 field_ty = compact_oversized_field(&field_ty);
+                // Trust (ALLOC-STRIDE-ADT-2 review): record the compacted
+                // marker's preimage, as the struct arm does.
+                crate::elem_sizes::record_compacted(
+                    tcx,
+                    field_rustc_ty,
+                    &field_ty,
+                );
                 compacted = true;
             }
             // verifier-perf (produced-node budget): charge the flattened-view clone we
@@ -3376,7 +4680,7 @@ fn lower_enum_adt<'tcx>(
             // above keeps the real spelling (the flat lane + every verifier lane
             // are byte-identical; eligible enums never consume the flat view).
             let variant_field_ty = if faithful_scalars()
-                && extractor_drop_free_zst(tcx, field.ty(tcx, args).skip_normalization(), ctx)
+                && extractor_drop_free_zst(tcx, field_rustc_ty, ctx)
             {
                 TrustTy::Unit
             } else {
@@ -3390,7 +4694,7 @@ fn lower_enum_adt<'tcx>(
             if faithful_scalars() {
                 fields_admissible &= extractor_enum_variant_field_admissible(
                     tcx,
-                    field.ty(tcx, args).skip_normalization(),
+                    field_rustc_ty,
                     &variant_field_ty,
                     ctx,
                 );
@@ -3414,14 +4718,18 @@ fn lower_enum_adt<'tcx>(
         //
         // Decode HERE, at the single boundary, so `VariantDef::discriminant` is
         // the TRUE signed tag and no consumer downstream of extraction can be
-        // raw. `decode_discr_tag_or_raw` falls back to the historical
-        // `val as i128` in exactly the cases where an `i128` FIELD cannot hold
-        // the answer — a `#[repr(u128)]` tag above `i128::MAX`, or a
-        // discriminant type that is neither `Int` nor `Uint` (which rustc does
-        // not produce). Both were already `val as i128` before this change, so
-        // neither is a behaviour delta; see that function's doc.
-        let raw_discr = adt_def.discriminant_for_variant(tcx, v_idx);
-        let discriminant = decode_discr_tag_or_raw(raw_discr.val, raw_discr.ty, tcx);
+        // raw. A tag an `i128` FIELD cannot hold — a `#[repr(u128)]` tag above
+        // `i128::MAX`, or a discriminant type that is neither `Int` nor `Uint`
+        // (which rustc does not produce) — has NO spelling here. It used to fall
+        // back to the lossy `val as i128` (`decode_discr_tag_or_raw`, now
+        // deleted), which was a FALSE tag, not a representation gap: see
+        // REPR-U128-HIGH-TAG-1 at the top of this function, which declines the
+        // whole enum before this loop. The `else` arm is therefore unreachable;
+        // it fails closed the same way rather than trusting that argument.
+        let Some(&discriminant) = decoded_discriminants.get(v_idx.as_usize()) else {
+            ctx.adt_stack.pop();
+            return enum_tag_without_i128_denotation_leaf(name, variant.name.as_str());
+        };
         variants.push(trust_types::VariantDef {
             name: variant.name.to_string(),
             discriminant,
@@ -3488,7 +4796,10 @@ fn lower_enum_adt<'tcx>(
     // `canonical_tag_repr` (a false NotRun). The legacy lane and every
     // ineligible enum get `None` — byte-identical historical behavior.
     let eligible = faithful_scalars() && !compacted && !variants.is_empty() && fields_admissible;
-    if std::env::var_os("TRUST_ENUM_ELIGIBILITY_DEBUG").is_some() {
+    static ENUM_ELIGIBILITY_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENUM_ELIGIBILITY_DEBUG
+        .get_or_init(|| std::env::var_os("TRUST_ENUM_ELIGIBILITY_DEBUG").is_some())
+    {
         eprintln!(
             "[trust_enum_eligibility] {name}: faithful={} compacted={compacted} variants={} \
              fields_admissible={fields_admissible} eligible={eligible}",
@@ -3511,7 +4822,7 @@ fn lower_enum_adt<'tcx>(
         && !ty.has_opaque_types()
     {
         ctx.typing_env
-            .and_then(|te| tcx.layout_of(te.as_query_input(ty)).ok())
+            .and_then(|te| crate::tuple_layouts::extractor_layout_of(tcx, te, ty))
             .and_then(|l| extractor_enum_layout_info(adt_def, &l))
             .map(Box::new)
     } else {
@@ -3524,9 +4835,8 @@ fn lower_enum_adt<'tcx>(
     // defining crate's StableCrateId (`authenticate_serde_json`, the SOLE writer of
     // the `SerdeJson` stamp). This is the ONLY enum that ever carries a stamp; every
     // other enum declines and resolves to `None`. Empty allowlist ⇒ fail closed.
-    let arbitrary_precision = authenticate_serde_json(tcx, adt_def.did(), args)
-        .map(AdtAuth::SerdeJson)
-        .or_else(|| {
+    let arbitrary_precision =
+        authenticate_serde_json(tcx, adt_def.did(), args).map(AdtAuth::SerdeJson).or_else(|| {
             // Trust (ROOT2 enum parity): certify whole-owned-tree DROP-totality from
             // the CONCRETE monomorphized enum `ty` — every variant's every field —
             // exactly as the struct arm does. An enum whose entire owned tree carries
@@ -3553,11 +4863,14 @@ fn lower_enum_adt<'tcx>(
     // constructor setter fragment).
     TrustTy::Adt {
         name: name.to_string(),
-        fields,
-        variants,
+        fields: fields.into(),
+        variants: variants.into(),
         disc_index_safe,
         faithful_enum_repr,
         arbitrary_precision,
+        // Trust (R107-IDENTITY-1): std's validity wrappers are structs; an enum is
+        // never one (`validity_wrapper_of` stamps only the struct arm).
+        validity_wrapper: None,
         layout: None,
         enum_layout,
         adt_kind: Some(trust_types::AdtKind::Enum),
@@ -3638,7 +4951,7 @@ fn extractor_enum_layout_info<'tcx>(
     Some(trust_types::EnumLayoutInfo {
         encoding,
         size: l.size.bytes(),
-        align: l.align.abi.bytes(),
+        align: l.align.bytes(),
         variant_field_offsets,
     })
 }
@@ -3674,7 +4987,7 @@ fn extractor_untagged_enum_layout_info<'tcx>(
     Some(trust_types::EnumLayoutInfo {
         encoding: trust_types::EnumTagEncodingInfo::Untagged,
         size: l.size.bytes(),
-        align: l.align.abi.bytes(),
+        align: l.align.bytes(),
         variant_field_offsets: vec![offsets],
     })
 }
@@ -3750,7 +5063,7 @@ fn extractor_drop_free_zst<'tcx>(
     if ty.has_non_region_param() {
         return false;
     }
-    let Ok(layout) = tcx.layout_of(typing_env.as_query_input(ty)) else {
+    let Some(layout) = crate::tuple_layouts::extractor_layout_of(tcx, typing_env, ty) else {
         return false;
     };
     layout.is_zst() && !ty.needs_drop(tcx, typing_env)
@@ -3801,7 +5114,8 @@ fn extractor_drop_free_zst<'tcx>(
 /// Fail-closed by default: a spelling this function has not been taught about
 /// declines the whole enum, exactly as before — tuples, arrays, fn pointers
 /// (`Option<fn()>` — the producer declines `Ty::Func` fields), `Datatype`
-/// markers, `Never` (unreachable here: a monomorphic `!` field is a drop-free
+/// markers without an exact completed physical ENUM definition, `Never`
+/// (unreachable here: a monomorphic `!` field is a drop-free
 /// ZST and respells `Unit` upstream — see the issue-54378 probe dump), and
 /// every generic/opaque leaf.
 fn extractor_enum_variant_field_admissible<'tcx>(
@@ -3836,7 +5150,14 @@ fn extractor_enum_variant_field_admissible<'tcx>(
                 // not (an alias/normalization gap) — refuse rather than guess.
                 _ => return false,
             };
-            !pointee.has_non_region_param() && pointee.is_sized(tcx, typing_env)
+            // Preserve rustc's query-free fast path, including a reference whose
+            // pointee carries a bound lifetime. Only the fallback trait query
+            // requires the type to have no escaping bound variables: it wraps
+            // its input in a dummy binder and otherwise panics. A callback can
+            // reach this reader before its enclosing binder is instantiated.
+            !pointee.has_non_region_param()
+                && (pointee.has_trivial_sizedness(tcx, ty::SizedTraitKind::Sized)
+                    || (!pointee.has_escaping_bound_vars() && pointee.is_sized(tcx, typing_env)))
         }
         // SIZED struct payload (#174 mirror).
         TrustTy::Adt { adt_kind: Some(trust_types::AdtKind::Struct), layout, variants, .. } => {
@@ -3846,8 +5167,65 @@ fn extractor_enum_variant_field_admissible<'tcx>(
         TrustTy::Adt { adt_kind: Some(trust_types::AdtKind::Enum), faithful_enum_repr, .. } => {
             faithful_enum_repr.is_some()
         }
+        TrustTy::Datatype { variants, .. } if variants.is_empty() => {
+            // A nominal child inside a cut definition is emitted by name even
+            // when its own enum definition has already finished. Resolve only
+            // that exact concrete compiler enum, with no prefix/erased-name
+            // fallback and no recursive expansion or definition retry.
+            if !faithful_scalars()
+                || ctx.typing_env.is_none()
+                || rust_fty.has_non_region_param()
+                || rust_fty.has_non_region_infer()
+                || rust_fty.has_opaque_types()
+                || rust_fty.has_escaping_bound_vars()
+            {
+                return false;
+            }
+            let TyKind::Adt(def, _) = rust_fty.kind() else { return false };
+            if !def.is_enum() {
+                // Do not widen struct-marker admission here. The downstream
+                // producer additionally requires layout-resolvable struct
+                // fields; a recorded size alone cannot establish that.
+                return false;
+            }
+            let expected_marker = canonical_cut_ref(tcx, rust_fty);
+            DATATYPE_DEFS.with(|collector| {
+                completed_enum_marker_has_layout(&collector.borrow(), t, &expected_marker)
+            })
+        }
         _ => false,
     }
+}
+
+/// Read-only admission of an exact, completed enum marker. `expected_marker`
+/// comes from the caller's concrete compiler enum type, not a name search in
+/// other locals. Node completion is not transitive graph completeness: neither
+/// the marker nor its descendants are expanded, and downstream physical-layout
+/// validation remains necessary.
+fn completed_enum_marker_has_layout(
+    collector: &DatatypeDefCollector,
+    marker: &TrustTy,
+    expected_marker: &TrustTy,
+) -> bool {
+    let Some(name) = trust_types::bare_datatype_marker_name(marker) else {
+        return false;
+    };
+    if marker != expected_marker
+        || collector.in_progress.contains(name)
+        || collector.refused.contains(name)
+    {
+        return false;
+    }
+    matches!(
+        trust_types::datatype_marker_definition(&collector.defs, marker),
+        Some(TrustTy::Adt {
+            adt_kind: Some(trust_types::AdtKind::Enum),
+            variants,
+            faithful_enum_repr: Some(_),
+            enum_layout: Some(_),
+            ..
+        }) if !variants.is_empty()
+    )
 }
 
 fn enum_discriminant_index_safe<'tcx>(
@@ -3864,7 +5242,7 @@ fn enum_discriminant_index_safe<'tcx>(
         return false;
     }
     // GATE: layout query must succeed. Any Err ⇒ fail-closed.
-    let Ok(layout) = tcx.layout_of(typing_env.as_query_input(ty)) else {
+    let Some(layout) = crate::tuple_layouts::extractor_layout_of(tcx, typing_env, ty) else {
         return false;
     };
     // GATE-NICHE: Direct tag encoding only. `Niche` (Option<&T>, Result<bool,()>,
@@ -3922,8 +5300,15 @@ fn pointer_width(tcx: TyCtxt<'_>) -> u32 {
 /// `Int` nor `Uint` (rustc does not produce such a discriminant type), the
 /// pattern does not fit the declared width (rustc would have handed us an
 /// unmasked value), or — the real case — `ty` is `u128` and the tag exceeds
-/// `i128::MAX`. A caller that can fail closed MUST (see [`decode_discr_tag_or_raw`]
-/// for the one that structurally cannot).
+/// `i128::MAX`. Every caller fails closed on `None`: `place_enum_tags` emits no
+/// membership fact, and `lower_enum_adt` lowers the whole enum to an `Unsupported`
+/// leaf (REPR-U128-HIGH-TAG-1).
+///
+/// There is deliberately NO `val as i128` fallback. One existed
+/// (`decode_discr_tag_or_raw`, deleted by REPR-U128-HIGH-TAG-1) on the theory that
+/// the lossy value was only a representation gap that every consumer declined on.
+/// It was not: `trust_vcgen`'s discriminant-domain fact published `u128::MAX`
+/// stored as `-1`, and the arm for that variant was proved vacuously.
 pub(crate) fn decode_discr_tag<'tcx>(
     val: u128,
     discr_ty: rustc_middle::ty::Ty<'tcx>,
@@ -3937,673 +5322,13 @@ pub(crate) fn decode_discr_tag<'tcx>(
     trust_types::decode_raw_two_complement(val, width, signed)
 }
 
-/// [`decode_discr_tag`] for the ONE caller that has nowhere to fail closed to:
-/// `VariantDef::discriminant` is an `i128` FIELD, so a `#[repr(u128)]` tag above
-/// `i128::MAX` has no representation in it at all.
-///
-/// The fallback is `val as i128`, BYTE-IDENTICAL to the pre-decode behaviour, so
-/// that case is unchanged by this decode: it was a lossy `as` cast before and it
-/// is the same lossy `as` cast now (both `guards`'s and `lower`'s `min_disc >= 0`
-/// gates see the same negative number and decline in both). It is a
-/// representation gap in the `VariantDef` field's TYPE, not a surviving raw
-/// convention — every path that CAN decline does.
-pub(crate) fn decode_discr_tag_or_raw<'tcx>(
-    val: u128,
-    discr_ty: rustc_middle::ty::Ty<'tcx>,
-    tcx: TyCtxt<'tcx>,
-) -> i128 {
-    decode_discr_tag(val, discr_ty, tcx).unwrap_or(val as i128)
-}
+#[cfg(test)]
+#[path = "tests/completed_enum_markers.rs"]
+mod completed_enum_markers;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "tests/bound_enum_fields.rs"]
+mod bound_enum_fields;
 
-    #[derive(Clone, Debug)]
-    struct DepthGraphNode {
-        adt: bool,
-        children: Vec<usize>,
-    }
-
-    fn graph_adt_depth(
-        graph: &[DepthGraphNode],
-        root: usize,
-        cutoff: usize,
-        node_budget: usize,
-    ) -> usize {
-        bounded_adt_arg_depth(
-            root,
-            cutoff,
-            node_budget,
-            |node| graph[node].adt,
-            |node, push| graph[node].children.iter().copied().all(push),
-        )
-    }
-
-    #[test]
-    fn bounded_adt_depth_collapses_a_shared_tuple_dag() {
-        let mut graph = vec![DepthGraphNode { adt: true, children: Vec::new() }];
-        for previous in 0..1_000 {
-            graph.push(DepthGraphNode { adt: false, children: vec![previous, previous] });
-        }
-        assert_eq!(graph_adt_depth(&graph, 1_000, 5, 4_096), 1);
-    }
-
-    #[test]
-    fn bounded_adt_depth_clamps_exactly_after_four_adts() {
-        let chain = |count: usize| {
-            (0..count)
-                .map(|index| DepthGraphNode {
-                    adt: true,
-                    children: (index + 1 < count).then_some(index + 1).into_iter().collect(),
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(graph_adt_depth(&chain(4), 0, 5, 32), 4);
-        assert_eq!(graph_adt_depth(&chain(5), 0, 5, 32), 5);
-    }
-
-    #[test]
-    fn bounded_adt_depth_handles_deep_wrappers_without_recursion() {
-        let graph = (0..3_000)
-            .map(|index| DepthGraphNode {
-                adt: false,
-                children: (index + 1 < 3_000).then_some(index + 1).into_iter().collect(),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(graph_adt_depth(&graph, 0, 5, 4_096), 0);
-    }
-
-    #[test]
-    fn bounded_adt_depth_wide_or_over_budget_graph_fails_closed() {
-        let mut graph = vec![DepthGraphNode { adt: false, children: (1..=4_096).collect() }];
-        graph.extend((0..4_096).map(|_| DepthGraphNode { adt: false, children: Vec::new() }));
-        assert_eq!(graph_adt_depth(&graph, 0, 5, 4_096), 5);
-
-        let exact = vec![
-            DepthGraphNode { adt: false, children: vec![1] },
-            DepthGraphNode { adt: false, children: vec![2] },
-            DepthGraphNode { adt: false, children: Vec::new() },
-        ];
-        assert_eq!(graph_adt_depth(&exact, 0, 5, 3), 0);
-        assert_eq!(graph_adt_depth(&exact, 0, 5, 2), 5);
-    }
-
-    #[test]
-    fn bounded_adt_depth_revisits_shared_nodes_at_greater_depth_in_either_order() {
-        for root_children in [vec![0, 1], vec![1, 0]] {
-            let graph = vec![
-                DepthGraphNode { adt: false, children: vec![3] },
-                DepthGraphNode { adt: true, children: vec![0] },
-                DepthGraphNode { adt: false, children: root_children },
-                DepthGraphNode { adt: true, children: Vec::new() },
-            ];
-            assert_eq!(graph_adt_depth(&graph, 2, 5, 32), 2);
-        }
-    }
-
-    #[test]
-    fn trust_tuple_or_unit_maps_empty_tuple_to_unit() {
-        assert_eq!(trust_tuple_or_unit(vec![]), TrustTy::Unit);
-    }
-
-    #[test]
-    fn trust_tuple_or_unit_preserves_non_empty_tuple() {
-        assert_eq!(
-            trust_tuple_or_unit(vec![TrustTy::Bool, TrustTy::Int { width: 32, signed: true }]),
-            TrustTy::Tuple(vec![TrustTy::Bool, TrustTy::Int { width: 32, signed: true }]),
-        );
-    }
-
-    #[test]
-    fn unsupported_ty_preserves_reason() {
-        assert_eq!(
-            unsupported_ty("TyKind::Alias", "not normalized"),
-            TrustTy::Unsupported {
-                kind: "TyKind::Alias".to_string(),
-                detail: "not normalized".to_string(),
-            },
-        );
-    }
-
-    #[test]
-    fn ty_lowering_context_starts_with_guard_budget() {
-        let ctx = TyLoweringCtx::default();
-
-        assert_eq!(ctx.depth, 0);
-        assert_eq!(ctx.remaining_nodes, MAX_TYPE_LOWERING_NODES);
-        assert_eq!(ctx.produced_nodes, 0);
-        assert_eq!(ctx.produced_budget, MAX_TYPE_LOWERING_PRODUCED_NODES);
-        assert!(ctx.adt_stack.is_empty());
-    }
-
-    /// The ANCESTOR RE-CHARGE regression, pinned at the charge site.
-    ///
-    /// Until 2026-08-28 `convert_ty_inner` charged `produced_node_count(&lowered, ..)`
-    /// — the size of the WHOLE produced subtree — at every level of its own recursion.
-    /// Each node was therefore billed once for itself and once more for each of its
-    /// ancestors, so the meter measured `sum over nodes of subtree_size(node)` =
-    /// O(nodes x depth) instead of the node count the constant, the field's doc
-    /// comment and the DROP-ONLY soundness argument all claim it measures. The guard
-    /// then degraded types that were comfortably inside its own advertised budget.
-    ///
-    /// MEASURED on `crates/trust-semantics` the day it was fixed, over 20319 traced
-    /// walks: the ONLY type the guard degraded in the whole crate was
-    /// `Result<(), clean_kernel::EnvError>` — charged 8005 against the 8000 budget for
-    /// a walk that materializes 5633 nodes and RETAINS 6. Correcting this one charge
-    /// took the crate's degraded walks 83 -> 0 and its rows 101 -> 104 with ZERO rows
-    /// lost, and made three of the four blocked bodies lower.
-    ///
-    /// This is the same correction `a0f2d05e35` already made to trust-vcgen's sibling
-    /// meter: "T2 — meter PEAK type materialization, not cumulative re-query churn".
-    #[test]
-    fn a_fresh_node_costs_one_regardless_of_its_subtree_size() {
-        let leaf = TrustTy::Bool;
-        // A deliberately fat subtree: what the old charge would have billed here.
-        let mut fat = TrustTy::Bool;
-        for _ in 0..200 {
-            fat = TrustTy::Ref { mutable: false, inner: Box::new(fat) };
-        }
-        assert!(
-            produced_node_count(&fat, usize::MAX) > 100,
-            "fixture must be fat or the assertion below cannot discriminate"
-        );
-        assert_eq!(fresh_node_charge(&leaf), 1);
-        assert_eq!(
-            fresh_node_charge(&fat),
-            1,
-            "a freshly materialized node must cost ONE, independently of the subtree \
-             hanging off it. Charging its subtree size here re-bills every descendant \
-             once per ancestor, making the meter O(nodes x depth) and the effective \
-             allowance budget/average-depth instead of budget."
-        );
-    }
-
-    /// `produced_node_count` counts EVERY structural node — including each variant
-    /// field — short-circuiting at `cap`. This is the produced-tree size the
-    /// extraction-time budget charges (the real clone/retain memory cost).
-    #[test]
-    fn produced_node_count_counts_all_nodes_and_caps() {
-        // A leaf is 1 node.
-        assert_eq!(produced_node_count(&TrustTy::Bool, 1000), 1);
-        // An enum: 1 (Adt) + its flattened `fields` + each variant's fields.
-        let enum_ty = TrustTy::adt_enum(
-            "E",
-            vec![
-                trust_types::VariantDef {
-                    name: "A".into(),
-                    discriminant: 0,
-                    fields: vec![("0".into(), TrustTy::Bool), ("1".into(), TrustTy::Bool)],
-                },
-                trust_types::VariantDef {
-                    name: "B".into(),
-                    discriminant: 1,
-                    fields: vec![("0".into(), TrustTy::Bool)],
-                },
-            ],
-        );
-        // adt_enum dedups fields into the union view; count is bounded and > 1.
-        let n = produced_node_count(&enum_ty, 10_000);
-        assert!(n > 1, "an enum with fields must count more than one node, got {n}");
-        // The cap short-circuits: a huge tree costs O(cap).
-        let mut fields = Vec::new();
-        for i in 0..5_000 {
-            fields.push((format!("f{i}"), TrustTy::Bool));
-        }
-        let fat = TrustTy::adt("Fat", fields);
-        assert_eq!(
-            produced_node_count(&fat, 100),
-            100,
-            "counting must short-circuit at the cap (O(cap), not O(size))"
-        );
-    }
-
-    /// Lever A step 2 — the datatype gate un-degrades EXACTLY `Level` (in the
-    /// `clean_kernel` crate, both def-path renderings) and nothing else, so no
-    /// other recursive ADT's lowering shifts this step.
-    #[test]
-    fn is_level_path_matches_only_kernel_level_both_renderings() {
-        // Upstream-dependency rendering (crate-name prefixed) and local-crate
-        // rendering (no prefix) both match.
-        assert!(is_level_path("clean_kernel", "clean_kernel::level::Level"));
-        assert!(is_level_path("clean_kernel", "level::Level"));
-        // Not Name/Expr, not a same-named type in another crate, not a suffix hit.
-        assert!(!is_level_path("clean_kernel", "clean_kernel::name::Name"));
-        assert!(!is_level_path("clean_kernel", "clean_kernel::expr::Expr"));
-        assert!(!is_level_path("clean_kernel", "clean_kernel::level::LevelArc"));
-        assert!(!is_level_path("clean_kernel", "sublevel::Level"));
-        assert!(!is_level_path("clean_kernel", "Level"));
-        // Right path, WRONG crate — rejected by the crate-name guard.
-        assert!(!is_level_path("other_crate", "level::Level"));
-        assert!(!is_level_path("other_crate", "clean_kernel::level::Level"));
-    }
-
-    /// Lever A step 5 — the `Expr`/`ExprKind` datatype gates un-degrade EXACTLY the
-    /// kernel `Expr` struct and `ExprKind` enum (both def-path renderings), and
-    /// nothing else — no cross-firing between the two, and no `Level`/`Name`.
-    #[test]
-    fn is_expr_and_exprkind_paths_match_only_their_target_both_renderings() {
-        // Expr struct: both renderings match.
-        assert!(is_expr_path("clean_kernel", "clean_kernel::expr::Expr"));
-        assert!(is_expr_path("clean_kernel", "expr::Expr"));
-        // ExprKind enum: both renderings match.
-        assert!(is_exprkind_path("clean_kernel", "clean_kernel::expr::kind::ExprKind"));
-        assert!(is_exprkind_path("clean_kernel", "expr::kind::ExprKind"));
-        // No cross-firing: the Expr gate must NOT match ExprKind and vice versa.
-        assert!(!is_expr_path("clean_kernel", "expr::kind::ExprKind"));
-        assert!(!is_expr_path("clean_kernel", "clean_kernel::expr::kind::ExprKind"));
-        assert!(!is_exprkind_path("clean_kernel", "expr::Expr"));
-        assert!(!is_exprkind_path("clean_kernel", "clean_kernel::expr::Expr"));
-        // Neither matches Level/Name, a suffix hit, or a bare name.
-        assert!(!is_expr_path("clean_kernel", "clean_kernel::level::Level"));
-        assert!(!is_exprkind_path("clean_kernel", "clean_kernel::name::Name"));
-        assert!(!is_expr_path("clean_kernel", "other::expr::Expr"));
-        assert!(!is_expr_path("clean_kernel", "Expr"));
-        assert!(!is_exprkind_path("clean_kernel", "ExprKind"));
-        // Right path, WRONG crate — rejected by the crate-name guard.
-        assert!(!is_expr_path("other_crate", "expr::Expr"));
-        assert!(!is_exprkind_path("other_crate", "expr::kind::ExprKind"));
-    }
-
-    /// Lever A step 2 — the transparent-pointer wrapper recognition used to peel a
-    /// recursive `Succ(Arc<Level>)` field to a `Level` self-reference. The real
-    /// kernel stores children behind `Arc<Level>`; this covers the `Arc`/`Box`/`Rc`
-    /// def-path recognition (the fixture exercises the `Ref`/`RawPtr` peel branch).
-    #[test]
-    fn transparent_pointer_wrappers_recognized_by_def_path() {
-        for wrapper in [
-            "alloc::sync::Arc",
-            "std::sync::Arc",
-            "alloc::rc::Rc",
-            "std::rc::Rc",
-            "alloc::boxed::Box",
-            "std::boxed::Box",
-        ] {
-            assert!(is_transparent_pointer_wrapper(wrapper), "{wrapper} must peel");
-        }
-        // A non-wrapper nominal ADT (e.g. the kernel `Name`) must NOT peel — its
-        // `Param` field stays a by-name datatype reference, not its pointee.
-        assert!(!is_transparent_pointer_wrapper("clean_kernel::name::Name"));
-        assert!(!is_transparent_pointer_wrapper("clean_kernel::level::Level"));
-        assert!(!is_transparent_pointer_wrapper("core::cell::UnsafeCell"));
-    }
-
-    /// A by-name recursive datatype reference is a `Ty::Datatype` with the referent
-    /// name and an EMPTY variant list — the sort marker a `Level` self-reference /
-    /// opaque `Name` field lowers to. SOUNDNESS: it asserts nothing.
-    #[test]
-    fn recursive_datatype_ref_is_empty_named_datatype() {
-        match recursive_datatype_ref("clean_kernel::level::Level") {
-            TrustTy::Datatype { name, variants } => {
-                assert_eq!(name, "clean_kernel::level::Level");
-                assert!(variants.is_empty(), "a by-name reference carries no variants");
-            }
-            other => panic!("expected an empty-variant Ty::Datatype, got {other:?}"),
-        }
-    }
-
-    /// The fail-closed degraded leaf is the recursive-ADT `Unsupported` marker
-    /// (load-bearing `detail.starts_with("recursive")`) — byte-compatible with the
-    /// existing recursive-ADT skip in the consumer. SOUNDNESS: never a provable type.
-    #[test]
-    fn produced_budget_degraded_leaf_is_recursive_adt_marker() {
-        match produced_budget_degraded_leaf() {
-            TrustTy::Unsupported { kind, detail } => {
-                assert_eq!(kind, "TyKind::Adt");
-                assert!(
-                    detail.starts_with("recursive"),
-                    "leaf must be the fail-closed recursive-ADT marker: {detail}"
-                );
-            }
-            other => panic!("degraded leaf must be the recursive-ADT marker, got {other:?}"),
-        }
-    }
-
-    // ─── RC-1: canonical recursive-type lowering ────────────────────────────
-    //
-    // These exercise the two properties the change stands or falls on, WITHOUT a
-    // compiler session: (1) the cut set is a function of the type alone, i.e. the
-    // greedy FVS restricted to what a root can reach equals the global FVS
-    // restricted the same way, for every root and independent of discovery order;
-    // (2) a cut point's by-name marker still tells two instantiations of one
-    // generic ADT apart.
-
-    /// Successor-closure of `roots` in `edges` — exactly the node set
-    /// `canonical_cut_set`'s discovery walk would find from those seeds.
-    fn reachable_from(edges: &[Vec<usize>], roots: &[usize]) -> Vec<usize> {
-        let mut seen = vec![false; edges.len()];
-        let mut work: Vec<usize> = roots.to_vec();
-        while let Some(node) = work.pop() {
-            if seen[node] {
-                continue;
-            }
-            seen[node] = true;
-            work.extend(edges[node].iter().copied());
-        }
-        (0..edges.len()).filter(|n| seen[*n]).collect()
-    }
-
-    /// Induce `edges` on `nodes`, laid out in the given (arbitrary) index order —
-    /// the stand-in for a different root's discovery order.
-    fn induced_subgraph(edges: &[Vec<usize>], nodes: &[usize]) -> Vec<Vec<usize>> {
-        let mut position = vec![usize::MAX; edges.len()];
-        for (slot, node) in nodes.iter().enumerate() {
-            position[*node] = slot;
-        }
-        nodes
-            .iter()
-            .map(|node| {
-                let mut succ: Vec<usize> = Vec::new();
-                for child in edges[*node].iter().copied() {
-                    let slot = position[child];
-                    if slot != usize::MAX && !succ.contains(&slot) {
-                        succ.push(slot);
-                    }
-                }
-                succ
-            })
-            .collect()
-    }
-
-    /// A `CanonicalCutKey` standing for one type. Only the ordering matters, so
-    /// the rendered path carries the whole discriminating weight here.
-    fn test_key(name: &str) -> CanonicalCutKey {
-        (name.matches("::").count(), name.to_string(), 0, 0)
-    }
-
-    fn cut_labels(edges: &[Vec<usize>], names: &[&str], nodes: &[usize]) -> Vec<String> {
-        let mut picked: Vec<String> =
-            greedy_feedback_vertex_set(edges, &mut |node| test_key(names[nodes[node]]))
-                .into_iter()
-                .map(|slot| names[nodes[slot]].to_string())
-                .collect();
-        picked.sort();
-        picked
-    }
-
-    #[test]
-    fn strongly_connected_components_separates_cycle_from_tail() {
-        // 0 → 1 → 2 → 0, and 2 → 3 (a tail that never returns).
-        let edges = vec![vec![1], vec![2], vec![0, 3], vec![]];
-        let alive = vec![true; 4];
-        let mut components: Vec<Vec<usize>> = strongly_connected_components(&edges, &alive)
-            .into_iter()
-            .map(|mut c| {
-                c.sort();
-                c
-            })
-            .collect();
-        components.sort();
-        assert_eq!(components, vec![vec![0, 1, 2], vec![3]]);
-    }
-
-    #[test]
-    fn strongly_connected_components_skips_dead_nodes() {
-        // Same graph with node 1 deleted: the cycle is broken, so every surviving
-        // component is a singleton. This is the step the greedy FVS iterates on.
-        let edges = vec![vec![1], vec![2], vec![0, 3], vec![]];
-        let alive = vec![true, false, true, true];
-        let mut components: Vec<Vec<usize>> = strongly_connected_components(&edges, &alive)
-            .into_iter()
-            .map(|mut c| {
-                c.sort();
-                c
-            })
-            .collect();
-        components.sort();
-        assert_eq!(components, vec![vec![0], vec![2], vec![3]]);
-    }
-
-    #[test]
-    fn greedy_fvs_leaves_an_acyclic_graph_uncut_and_asks_for_no_keys() {
-        // The overwhelmingly common case. It must cost NOTHING beyond one SCC
-        // pass — no def-path rendering at all, which is why `canonical_cut_set`
-        // computes keys lazily.
-        let edges = vec![vec![1, 2], vec![2], vec![3], vec![]];
-        let mut key_requests = 0usize;
-        let cut = greedy_feedback_vertex_set(&edges, &mut |node| {
-            key_requests += 1;
-            test_key(&format!("n{node}"))
-        });
-        assert!(cut.is_empty(), "acyclic graph must have an empty cut set: {cut:?}");
-        assert_eq!(key_requests, 0, "an acyclic graph must not render a single def path");
-    }
-
-    #[test]
-    fn greedy_fvs_cuts_a_self_loop() {
-        // `struct S { next: Box<S> }` reduces to a single node with a self edge.
-        let edges = vec![vec![0]];
-        let cut = greedy_feedback_vertex_set(&edges, &mut |_| test_key("krate::S"));
-        assert_eq!(cut, vec![0]);
-    }
-
-    #[test]
-    fn greedy_fvs_cuts_the_shallowest_def_path_in_the_cycle() {
-        // The measured `xor_all` cycle: Tree ↔ Arc ↔ NonNull ↔ ArcInner. The cut
-        // must land on `Tree` — the type the cycle is ABOUT — not on an std
-        // container internal, so the marker names something the consumer can
-        // recognize.
-        let names =
-            ["xor_all::Tree", "std::sync::Arc", "std::ptr::NonNull", "alloc::sync::ArcInner"];
-        let edges = vec![vec![1], vec![2], vec![3], vec![0]];
-        let nodes: Vec<usize> = (0..4).collect();
-        assert_eq!(cut_labels(&edges, &names, &nodes), vec!["xor_all::Tree".to_string()]);
-    }
-
-    /// THE root-independence property. Every root's discovery finds a
-    /// successor-closed subset of the global graph, in its own index order; the
-    /// cut it computes must be the global cut restricted to that subset. If this
-    /// fails, one rustc type still reaches the dump as two different unrollings —
-    /// the defect RC-1 exists to remove.
-    #[test]
-    fn greedy_fvs_is_root_independent() {
-        // Two independent cycles plus an entry node that reaches both, plus a
-        // second entry that reaches only one of them, plus a nested cycle so the
-        // greedy loop has to iterate.
-        //   0 entry_both → 1, 5
-        //   1 a::Alpha ↔ 2 zzz::AlphaBox        (cycle A)
-        //   3 entry_alpha → 1
-        //   5 b::Beta → 6 zzz::BetaMid → 7 zzz::BetaTail → 5, and 6 → 6 (nested)
-        let names = [
-            "e::EntryBoth",
-            "a::Alpha",
-            "zzz::AlphaBox",
-            "e::EntryAlpha",
-            "e::EntryBeta",
-            "b::Beta",
-            "zzz::BetaMid",
-            "zzz::BetaTail",
-        ];
-        let edges: Vec<Vec<usize>> = vec![
-            vec![1, 5], // 0
-            vec![2],    // 1
-            vec![1],    // 2
-            vec![1],    // 3
-            vec![5],    // 4
-            vec![6],    // 5
-            vec![7, 6], // 6
-            vec![5],    // 7
-        ];
-
-        let all: Vec<usize> = (0..edges.len()).collect();
-        let global = cut_labels(&edges, &names, &all);
-        assert!(!global.is_empty(), "the fixture must actually contain cycles");
-
-        for root in 0..edges.len() {
-            let nodes = reachable_from(&edges, &[root]);
-            let reachable_names: Vec<String> =
-                nodes.iter().map(|n| names[*n].to_string()).collect();
-            let expected: Vec<String> =
-                global.iter().filter(|name| reachable_names.contains(name)).cloned().collect();
-
-            // Discovery order is whatever order the walk happened to meet the
-            // nodes in. Try several, including the reverse, to prove the pick is
-            // decided by the key and never by an index.
-            let mut orders = vec![nodes.clone()];
-            let mut reversed = nodes.clone();
-            reversed.reverse();
-            orders.push(reversed);
-            let mut rotated = nodes.clone();
-            rotated.rotate_left(nodes.len() / 2);
-            orders.push(rotated);
-
-            for order in orders {
-                let sub = induced_subgraph(&edges, &order);
-                let actual = cut_labels(&sub, &names, &order);
-                assert_eq!(
-                    actual, expected,
-                    "root {} ({}) with discovery order {:?} computed a different cut set",
-                    root, names[root], order
-                );
-            }
-        }
-    }
-
-    /// The merge hazard the identity-bearing marker exists to close. A cut point
-    /// is emitted with NO structure, so its name is the only thing that separates
-    /// two instantiations of one generic ADT. With the generics-erased def path
-    /// (the first draft of RC-1) `Foo<u8>` and `Foo<i32>` collapse to one marker
-    /// and the consumer's structural comparator reports two genuinely different
-    /// types as EQUAL — strictly worse than the non-canonicity it was fixing,
-    /// because that direction fails OPEN.
-    #[test]
-    fn canonical_cut_marker_must_carry_the_instantiation() {
-        let erased_u8 = recursive_datatype_ref("krate::Foo");
-        let erased_i32 = recursive_datatype_ref("krate::Foo");
-        assert!(
-            erased_u8.eq_ignoring_disc_index_safe(&erased_i32),
-            "the erased-name draft really does merge the two instantiations"
-        );
-
-        let instantiated_u8 = recursive_datatype_ref("krate::Foo<u8>");
-        let instantiated_i32 = recursive_datatype_ref("krate::Foo<i32>");
-        assert!(
-            !instantiated_u8.eq_ignoring_disc_index_safe(&instantiated_i32),
-            "distinct instantiations of one recursive ADT must not compare equal"
-        );
-
-        // …and a cut point with no generic arguments keeps the EXACT legacy
-        // marker, so the Lever A `Level`/`Expr`/`ExprKind` cluster and `Tree` are
-        // byte-identical to pre-RC-1.
-        assert!(
-            recursive_datatype_ref("clean_kernel::level::Level")
-                .eq_ignoring_disc_index_safe(&recursive_datatype_ref("clean_kernel::level::Level"))
-        );
-    }
-
-    /// An ordinary (acyclic) lowering must keep using the memo, so
-    /// `TyLoweringCtx` starts with an empty cut set — and with NO cut-point
-    /// expansion pending, since `expand_cut_point` is set only by
-    /// `cut_point_definition` and a walk that started with one set would emit a
-    /// definition where a marker belongs.
-    #[test]
-    fn ty_lowering_context_starts_with_an_empty_canonical_cut() {
-        let ctx = TyLoweringCtx::default();
-        assert!(ctx.canonical_cut.is_empty());
-        assert!(ctx.expand_cut_point.is_none());
-    }
-
-    /// R0: the definition table's KEY/VALUE agreement, at the producer end.
-    ///
-    /// `canonical_cut_ref` keys a generic cut point by its INSTANTIATED def path
-    /// while `lower_enum_adt` / `lower_adt_as_datatype` name the definition they
-    /// build with the ERASED one. `rename_definition` is what reconciles them;
-    /// without it `trust_types::insert_datatype_def` would file `Foo<u8>`'s
-    /// definition under `k::Foo` — colliding with `Foo<i32>`'s — and
-    /// `trust_types::datatype_definition` would refuse to serve it under the key
-    /// the marker actually carries.
-    #[test]
-    fn a_recorded_definition_is_renamed_to_the_key_its_marker_carries() {
-        let variants = vec![(
-            "Mk".to_string(),
-            vec![("0".to_string(), TrustTy::Int { width: 8, signed: false })],
-        )];
-        let erased = TrustTy::Datatype { name: "k::Foo".into(), variants: variants.clone() };
-
-        // A generic cut point: the definition is restated under the instantiated
-        // key, so it agrees with the marker `canonical_cut_ref` emits.
-        let renamed = rename_definition(erased.clone(), "k::Foo<u8>");
-        assert_eq!(trust_types::definitional_datatype_name(&renamed), Some("k::Foo<u8>"),);
-        let mut defs = trust_types::DatatypeDefs::new();
-        assert!(trust_types::insert_datatype_def(&mut defs, renamed));
-        assert!(
-            trust_types::datatype_marker_definition(&defs, &recursive_datatype_ref("k::Foo<u8>"))
-                .is_some(),
-            "the marker's own name must find its definition",
-        );
-        // …and the OTHER instantiation, which is a different cut point, does not
-        // pick it up — nor does the generics-erased name `compact_oversized_field`
-        // would spell.
-        for other in ["k::Foo<i32>", "k::Foo"] {
-            assert!(
-                trust_types::datatype_marker_definition(&defs, &recursive_datatype_ref(other))
-                    .is_none(),
-                "`{other}` must not resolve through `k::Foo<u8>`'s entry",
-            );
-        }
-
-        // A NON-generic cut point keeps the exact erased name: the rename is the
-        // identity, so nothing in the Lever A `Level`/`Expr`/`ExprKind` cluster
-        // moves.
-        assert_eq!(rename_definition(erased.clone(), "k::Foo"), erased);
-    }
-
-    /// R0: `compact_oversized_field` must stay UNRESOLVABLE, and the mechanism is
-    /// WRITE AUTHORITY, not the shape of the marker.
-    ///
-    /// For a non-generic type the three producers of `Ty::Datatype { name,
-    /// variants: [] }` emit byte-identical markers, so no consumer can tell them
-    /// apart by inspection. What separates them is that only
-    /// `record_cut_definition` ever writes an entry: a compacted field's marker,
-    /// and the `__trust_compacted_aggregate` fallback, therefore resolve to
-    /// nothing and every consumer declines on them exactly as before the table
-    /// existed.
-    #[test]
-    fn a_compacted_field_marker_is_never_resolvable_as_a_cut_point() {
-        // A big nested aggregate compacts to a marker naming the ADT it replaced…
-        let big = TrustTy::Adt {
-            name: "k::Big".into(),
-            fields: vec![("0".into(), TrustTy::Int { width: 8, signed: false })],
-            variants: vec![],
-            disc_index_safe: false,
-            faithful_enum_repr: None,
-            // Not a bignum/std-map: the unauthenticated (fail-closed) default.
-            arbitrary_precision: None,
-            layout: None,
-            enum_layout: None,
-            adt_kind: None,
-        };
-        let compacted = compact_oversized_field(&big);
-        assert_eq!(compacted, recursive_datatype_ref("k::Big"));
-        // …and to the fallback name when the field is not a named aggregate.
-        assert_eq!(
-            compact_oversized_field(&TrustTy::Tuple(vec![TrustTy::Bool])),
-            recursive_datatype_ref("__trust_compacted_aggregate"),
-        );
-
-        // A table carrying a DIFFERENT cut point resolves neither of them. This is
-        // the fail-open the withdrawn by-name body search opened: a compacted
-        // `Big<u8>` field binding to a declared `Big<i32>`.
-        let mut defs = trust_types::DatatypeDefs::new();
-        assert!(trust_types::insert_datatype_def(
-            &mut defs,
-            rename_definition(
-                TrustTy::Datatype {
-                    name: "k::Big".into(),
-                    variants: vec![(
-                        "Mk".to_string(),
-                        vec![("0".to_string(), TrustTy::Int { width: 32, signed: true })],
-                    )],
-                },
-                "k::Big<i32>",
-            ),
-        ));
-        for marker in [&compacted, &recursive_datatype_ref("__trust_compacted_aggregate")] {
-            assert!(
-                trust_types::datatype_marker_definition(&defs, marker).is_none(),
-                "a compacted marker must resolve to nothing: it is a SIZE BOUND, \
-                 not a back-edge, and binding it would be the withdrawn fail-open",
-            );
-        }
-    }
-}
+#[cfg(test)]
+mod tests;

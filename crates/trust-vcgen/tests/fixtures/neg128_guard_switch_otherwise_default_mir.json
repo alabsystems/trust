@@ -1,0 +1,246 @@
+{
+  "name": "switch_otherwise",
+  "def_path": "neg128_guard_stale::switch_otherwise",
+  "span": {
+    "file": "neg128_guard_stale.rs",
+    "line_start": 50,
+    "col_start": 0,
+    "line_end": 56,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": true
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 1,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ],
+              [
+                1,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_stale.rs",
+              "line_start": 51,
+              "col_start": 4,
+              "line_end": 51,
+              "col_end": 11
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -170141183460469231731687303715884105728
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "neg128_guard_stale.rs",
+                "line_start": 54,
+                "col_start": 13,
+                "line_end": 54,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "OverflowNeg",
+            "target": 4,
+            "span": {
+              "file": "neg128_guard_stale.rs",
+              "line_start": 54,
+              "col_start": 13,
+              "line_end": 54,
+              "col_end": 15
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Int": 2
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_stale.rs",
+                "line_start": 53,
+                "col_start": 13,
+                "line_end": 53,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Int": 1
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_stale.rs",
+                "line_start": 52,
+                "col_start": 13,
+                "line_end": 52,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Neg",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "neg128_guard_stale.rs",
+                "line_start": 54,
+                "col_start": 13,
+                "line_end": 54,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 128,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

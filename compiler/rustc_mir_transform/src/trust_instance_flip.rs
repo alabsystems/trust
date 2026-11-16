@@ -60,7 +60,7 @@ use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{
     self, Body, CastKind, ConstValue, Location, MirPhase, RuntimePhase, Rvalue, TerminatorKind,
 };
-use rustc_middle::ty::{self, GenericArgsRef, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, GenericArgs, TyCtxt, TypeVisitableExt};
 use rustc_session::Session;
 use tracing::{info, warn};
 
@@ -94,7 +94,7 @@ fn note_refused(sess: &Session) -> usize {
 /// body" — silently for non-candidates, loudly for refusals.
 pub(crate) fn trust_instance_flip_body<'tcx>(
     tcx: TyCtxt<'tcx>,
-    key: (DefId, GenericArgsRef<'tcx>),
+    key: (DefId, GenericArgs<'tcx>),
 ) -> Option<&'tcx Body<'tcx>> {
     let (def_id, args) = key;
     // Cheap exits first: they run for every codegen'd instance in the crate.

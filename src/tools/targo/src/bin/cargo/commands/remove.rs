@@ -1,19 +1,19 @@
-use cargo::CargoResult;
-use cargo::core::PackageIdSpec;
-use cargo::core::PackageIdSpecQuery;
-use cargo::core::Resolve;
-use cargo::core::Workspace;
-use cargo::core::dependency::DepKind;
-use cargo::ops::cargo_remove::RemoveOptions;
-use cargo::ops::cargo_remove::remove;
-use cargo::ops::resolve_ws;
-use cargo::util::command_prelude::*;
-use cargo::util::print_available_packages;
-use cargo::util::toml_mut::dependency::Dependency;
-use cargo::util::toml_mut::dependency::MaybeWorkspace;
-use cargo::util::toml_mut::dependency::Source;
-use cargo::util::toml_mut::manifest::DepTable;
-use cargo::util::toml_mut::manifest::LocalManifest;
+use targo::CargoResult;
+use targo::ops::cargo_remove::RemoveOptions;
+use targo::ops::cargo_remove::remove;
+use targo::ops::resolve_ws;
+use targo::resolver::Resolve;
+use targo::util::command_prelude::*;
+use targo::util::print_available_packages;
+use targo::workspace::PackageIdSpec;
+use targo::workspace::PackageIdSpecQuery;
+use targo::workspace::Workspace;
+use targo::workspace::dependency::DepKind;
+use targo::workspace::editor::dependency::Dependency;
+use targo::workspace::editor::dependency::MaybeWorkspace;
+use targo::workspace::editor::dependency::Source;
+use targo::workspace::editor::manifest::DepTable;
+use targo::workspace::editor::manifest::LocalManifest;
 
 pub fn cli() -> clap::Command {
     clap::Command::new("remove")

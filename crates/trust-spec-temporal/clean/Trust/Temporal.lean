@@ -161,6 +161,94 @@ theorem forwardRefinementSatisfiesUnderFairness
       (forwardRefinementRuns concrete abstractModel project refinement behavior runs)
       fair
 
+-- A reachable-state simulation keeps the original concrete transition relation.
+-- The invariant is evidence to establish along actual runs, not a filter that
+-- removes concrete steps from the machine being refined.
+structure InvariantForwardRefinement {Concrete Abstract : Type}
+    (concrete : StateMachine Concrete)
+    (abstractModel : StateMachine Abstract)
+    (project : Concrete → Abstract)
+    (invariant : Concrete → Prop) : Prop where
+  init_invariant : ∀ state : Concrete, concrete.init state → invariant state
+  preserve_invariant : ∀ before after : Concrete,
+    invariant before → concrete.next before after → invariant after
+  init : ∀ state : Concrete,
+    concrete.init state → abstractModel.init (project state)
+  next : ∀ before after : Concrete,
+    invariant before → concrete.next before after →
+      abstractModel.next (project before) (project after) ∨
+        project after = project before
+
+theorem invariantForwardRefinementInvariant {Concrete Abstract : Type}
+    (concrete : StateMachine Concrete)
+    (abstractModel : StateMachine Abstract)
+    (project : Concrete → Abstract)
+    (invariant : Concrete → Prop)
+    (refinement : InvariantForwardRefinement concrete abstractModel project invariant)
+    (behavior : Behavior Concrete)
+    (runs : Runs concrete behavior) :
+    ∀ n : Nat, invariant (behavior n) :=
+  Nat.rec
+    (refinement.init_invariant (behavior 0) runs.1)
+    (fun n previous =>
+      Or.elim (runs.2 n)
+        (fun step =>
+          refinement.preserve_invariant (behavior n) (behavior (Nat.succ n)) previous step)
+        (fun stutter => Eq.mpr (congrArg invariant stutter) previous))
+
+theorem invariantForwardRefinementRuns {Concrete Abstract : Type}
+    (concrete : StateMachine Concrete)
+    (abstractModel : StateMachine Abstract)
+    (project : Concrete → Abstract)
+    (invariant : Concrete → Prop)
+    (refinement : InvariantForwardRefinement concrete abstractModel project invariant)
+    (behavior : Behavior Concrete)
+    (runs : Runs concrete behavior) :
+    Runs abstractModel (fun n => project (behavior n)) :=
+  And.intro
+    (refinement.init (behavior 0) runs.1)
+    (fun n =>
+      Or.elim (runs.2 n)
+        (fun step => refinement.next (behavior n) (behavior (Nat.succ n))
+          (invariantForwardRefinementInvariant concrete abstractModel project invariant
+            refinement behavior runs n) step)
+        (fun stutter => Or.inr (congrArg project stutter)))
+
+theorem invariantForwardRefinementSatisfies {Concrete Abstract : Type}
+    (concrete : StateMachine Concrete)
+    (abstractModel : StateMachine Abstract)
+    (project : Concrete → Abstract)
+    (invariant : Concrete → Prop)
+    (refinement : InvariantForwardRefinement concrete abstractModel project invariant)
+    (F : Formula Abstract)
+    (holds : Satisfies abstractModel F) :
+    Satisfies concrete (Pullback project F) :=
+  fun behavior runs =>
+    holds (fun n => project (behavior n))
+      (invariantForwardRefinementRuns concrete abstractModel project invariant
+        refinement behavior runs)
+
+-- Fairness is still an explicit premise about the projected concrete run.
+theorem invariantForwardRefinementSatisfiesUnderFairness
+    {Concrete Abstract Index : Type}
+    (concrete : StateMachine Concrete)
+    (abstractModel : StateMachine Abstract)
+    (project : Concrete → Abstract)
+    (invariant : Concrete → Prop)
+    (refinement : InvariantForwardRefinement concrete abstractModel project invariant)
+    (constraints : Index → FairnessConstraint Abstract)
+    (F : Formula Abstract)
+    (holds : SatisfiesUnderFairness abstractModel constraints F) :
+    ∀ behavior : Behavior Concrete,
+      Runs concrete behavior →
+      FairFamily constraints (fun n => project (behavior n)) →
+      Pullback project F behavior :=
+  fun behavior runs fair =>
+    holds (fun n => project (behavior n))
+      (invariantForwardRefinementRuns concrete abstractModel project invariant
+        refinement behavior runs)
+      fair
+
 -- Notation expansion happens at the use site, so force every expansion target
 -- through Clean's root-namespace escape.  A merely dotted name such as
 -- `Trust.Temporal.Always` is still namespace-relative: inside `namespace N`,

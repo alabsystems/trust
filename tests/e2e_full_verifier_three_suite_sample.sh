@@ -12,7 +12,7 @@ case "$HOST_TRIPLE" in
         ;;
 esac
 
-CRATES_MANIFEST="$TRUST_ROOT/crates/Cargo.toml"
+CRATES_MANIFEST="$TRUST_ROOT/Cargo.toml"
 TARGET_DIR="${TRUST_THREE_SUITE_TARGET_DIR:-$TRUST_ROOT/build/full-verifier-three-suite-target}"
 OUTPUT_DIR="${TRUST_THREE_SUITE_OUTPUT_DIR:-$TRUST_ROOT/build/full-verifier-three-suite-evidence}"
 REPORT_JSON="${TRUST_THREE_SUITE_REPORT:-$OUTPUT_DIR/report.json}"
@@ -25,18 +25,6 @@ mkdir -p "$OUTPUT_DIR" "$TARGET_DIR"
 fail() {
     echo "FAIL: $*" >&2
     exit 2
-}
-
-first_executable() {
-    local candidate
-
-    for candidate in "$@"; do
-        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-    return 1
 }
 
 resolve_targo() {

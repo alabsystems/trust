@@ -24,10 +24,24 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                 // Invisible delimiters cannot occur here because `TokenTreesReader` parses
                 // code directly from strings, with no macro expansion involved.
                 debug_assert!(!matches!(delim, Delimiter::Invisible(_)));
+                // Trust: record what this group is before descending, so a
+                // `clean { … }` island inside it knows whether it sits at
+                // module item position. Popped by `lex_token_tree_open_delim`.
+                self.trust_delim_classes.push(Self::trust_classify_delim(&buf, delim));
                 buf.push(match self.lex_token_tree_open_delim(delim) {
                     Ok(val) => val,
                     Err(errs) => return Err(errs),
                 })
+            } else if self.trust_at_clean_island(&buf) {
+                // Trust: `clean { … }` PARSER ISLAND at module item position
+                // (ruling v7/D1; G2 "a Rust token tree is not the lexical
+                // boundary of the Lean language"). The body is scanned as
+                // Clean text to its matching `}` and never meets the Rust
+                // lexer; the parser reads the bytes back through the source
+                // map from the delimiter spans. See `trust_clean_island`.
+                let ((clean_tok, clean_spacing), island) = self.trust_lex_clean_island()?;
+                buf.push(TokenTree::Token(clean_tok, clean_spacing));
+                buf.push(island);
             } else if let Some(delim) = self.token.kind.close_delim() {
                 // Invisible delimiters cannot occur here because `TokenTreesReader` parses
                 // code directly from strings, with no macro expansion involved.
@@ -63,7 +77,10 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
         // Lex the token trees within the delimiters.
         // We stop at any delimiter so we can try to recover if the user
         // uses an incorrect delimiter.
-        let (open_spacing, tts) = self.lex_token_trees(/* is_delimited */ true)?;
+        let inner = self.lex_token_trees(/* is_delimited */ true);
+        // Trust: pushed by the caller for this group; popped on every path.
+        self.trust_delim_classes.pop();
+        let (open_spacing, tts) = inner?;
 
         // Expand to cover the entire delimited token tree.
         let delim_span = DelimSpan::from_pair(pre_span, self.token.span);
@@ -88,6 +105,15 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                 if Delimiter::Brace == open_delim {
                     // Add all the matching spans, we will sort by span later
                     self.diag_info.matching_block_spans.push((pre_span, close_delimiter_span));
+                }
+
+                // A brace-delimited block whose first token is `&&`/`||` usually means
+                // the user meant to continue an if-let chain, e.g. `if let P = e { && cond {`.
+                if Delimiter::Brace == open_delim
+                    && let Some(TokenTree::Token(tok, _)) = tts.iter().next()
+                    && matches!(tok.kind, token::AndAnd | token::OrOr)
+                {
+                    self.diag_info.if_let_chain_hint_spans.push(tok.span);
                 }
 
                 // Move past the closing delimiter.
@@ -155,7 +181,9 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
 
     // Move on to the next token, returning the current token and its spacing.
     // Will glue adjacent single-char tokens together.
-    fn bump(&mut self) -> (Token, Spacing) {
+    // Trust: `pub(super)` so the sibling `trust_clean_island` module can step
+    // over `clean` and past an island's closing brace with the same bumps.
+    pub(super) fn bump(&mut self) -> (Token, Spacing) {
         let (this_spacing, next_tok) = loop {
             let (next_tok, is_next_tok_preceded_by_whitespace) = self.next_token_from_cursor();
 
@@ -173,7 +201,8 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
     }
 
     // Cut-down version of `bump` used when the token kind is known in advance.
-    fn bump_minimal(&mut self) -> Spacing {
+    // Trust: `pub(super)` — see `bump`.
+    pub(super) fn bump_minimal(&mut self) -> Spacing {
         let (next_tok, is_next_tok_preceded_by_whitespace) = self.next_token_from_cursor();
         let this_spacing = if is_next_tok_preceded_by_whitespace {
             Spacing::Alone

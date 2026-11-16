@@ -12,6 +12,9 @@
 use trust_types::*;
 use trust_vcgen::generate_vcs;
 
+#[path = "support/pre_carrier_keys.rs"]
+mod pre_carrier_keys;
+
 /// Strip `#<token>` version suffixes (S2c flip renames `n` -> `n#token`) so these
 /// structural assertions test semantic content, not the encoding.
 fn strip_v(s: &str) -> String {
@@ -38,9 +41,12 @@ fn bounds_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
 
 #[test]
 fn enumerate_index_carries_slice_length_yield_fact() {
-    let func: VerifiableFunction =
+    // A pre-carrier capture: supply the `callee_key` today's extractor mints, which the
+    // `<[T]>` recognizers decide on since SLICE-INHERENT-1 (2026-10-04).
+    let func: VerifiableFunction = pre_carrier_keys::rekey_pre_carrier_dump(
         serde_json::from_str(include_str!("fixtures/enumerate_index_mir.json"))
-            .expect("fixture MIR must deserialize");
+            .expect("fixture MIR must deserialize"),
+    );
     let bounds = bounds_vcs(&func);
     assert!(!bounds.is_empty(), "enumerate indexing must produce a bounds VC");
     for vc in &bounds {
@@ -60,15 +66,20 @@ fn chunks_exact_yields_exact_length_chunks() {
     // 4, so the chunk's modeled `__slice_len` must be constrained `== 4`, letting
     // c[0]..c[3] discharge. The bounds VC must carry that `len == 4` fact.
     //
-    // The chunk-length trace resolves the `ChunksExact` local through
-    // `local_defs::unique_value_def`, and the `Iterator::next` desugar `&mut`-borrows
-    // that local — so this fact exists only because that resolver still admits the
-    // ESCAPE channel, which is the seam's open defect (see `body_unique_value_def`'s
-    // `Escape` arm). Closing the defect empties this row; the repair has to move the
-    // iterator tracers onto an origin question rather than loosen the seam.
-    let func: VerifiableFunction =
+    // The chunk-length trace resolves the `ChunksExact` local through the iterator
+    // tracers, and the `Iterator::next` desugar `&mut`-borrows that local. Since
+    // 2026-09-15 `local_defs::unique_value_def` refuses that alias (`x3::pesc`), and
+    // since 2026-09-16 the tracer asks the ORIGIN question instead
+    // (`generate::iterator_yield::iterator_origin_def`, under the conduit allow-list):
+    // `ChunksExact::next` consumes and never reseats, so every yielded chunk has the
+    // length the `chunks_exact(4)` call fixed. This row is the pin that the recovery
+    // reached the slice-iterator tracer and not only the range one.
+    // A pre-carrier capture: supply the `callee_key` today's extractor mints, which the
+    // `<[T]>` recognizers decide on since SLICE-INHERENT-1 (2026-10-04).
+    let func: VerifiableFunction = pre_carrier_keys::rekey_pre_carrier_dump(
         serde_json::from_str(include_str!("fixtures/chunks_exact_index_mir.json"))
-            .expect("fixture MIR must deserialize");
+            .expect("fixture MIR must deserialize"),
+    );
     let bounds = bounds_vcs(&func);
     assert!(!bounds.is_empty(), "chunks_exact indexing must produce bounds VCs");
     assert!(

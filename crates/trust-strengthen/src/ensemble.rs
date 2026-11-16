@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use trust_types::fx::FxHashMap;
+use trust_types::fx::{FxHashMap, FxHashSet};
 
 use crate::confidence::ProposalSource;
 use crate::proposer::{Proposal, ProposalKind};
@@ -280,12 +280,12 @@ pub fn consensus(proposals_by_source: &FxHashMap<ProposalSource, Vec<Proposal>>)
         }
     }
 
-    let consensus_keys: Vec<String> = spec_sources
+    spec_sources
         .into_iter()
-        .filter_map(|(key, count)| if count == source_count { Some(key) } else { None })
-        .collect();
-
-    consensus_keys.into_iter().filter_map(|key| spec_proposals.remove(&key)).collect()
+        .filter_map(|(key, count)| {
+            if count == source_count { spec_proposals.remove(&key) } else { None }
+        })
+        .collect()
 }
 
 /// Compute a diversity bonus for a proposal relative to existing proposals.
@@ -331,16 +331,14 @@ pub fn dedup_proposals(mut proposals: Vec<ScoredProposal>) -> Vec<ScoredProposal
     // Sort by confidence descending so we keep the best
     proposals.sort_by(compare_scored_proposals);
 
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut seen: FxHashSet<(&'static str, String)> = FxHashSet::default();
     proposals
         .into_iter()
         .filter(|sp| {
-            let key = format!(
-                "{}:{}",
+            seen.insert((
                 kind_discriminant_name(&sp.proposal.kind),
-                spec_body_key(&sp.proposal.kind)
-            );
-            seen.insert(key)
+                spec_body_key(&sp.proposal.kind),
+            ))
         })
         .collect()
 }
@@ -356,6 +354,17 @@ fn spec_body_key(kind: &ProposalKind) -> String {
         }
         ProposalKind::AddBoundsCheck { check_expr }
         | ProposalKind::AddNonZeroCheck { check_expr } => check_expr.clone(),
+    }
+}
+
+fn spec_body_parts(kind: &ProposalKind) -> (&str, &str) {
+    match kind {
+        ProposalKind::AddPrecondition { spec_body }
+        | ProposalKind::AddPostcondition { spec_body }
+        | ProposalKind::AddInvariant { spec_body } => (spec_body, ""),
+        ProposalKind::SafeArithmetic { original, replacement } => (original, replacement),
+        ProposalKind::AddBoundsCheck { check_expr }
+        | ProposalKind::AddNonZeroCheck { check_expr } => (check_expr, ""),
     }
 }
 
@@ -397,7 +406,7 @@ fn has_significant_overlap(a: &str, b: &str) -> bool {
 
 fn sorted_source_entries(
     proposals_by_source: &FxHashMap<ProposalSource, Vec<Proposal>>,
-) -> Vec<(&ProposalSource, &Vec<Proposal>)> {
+) -> impl Iterator<Item = (&ProposalSource, &Vec<Proposal>)> {
     const SOURCES: [ProposalSource; 5] = [
         ProposalSource::Heuristic,
         ProposalSource::WeakestPrecondition,
@@ -406,7 +415,7 @@ fn sorted_source_entries(
         ProposalSource::SignatureBased,
     ];
 
-    SOURCES.iter().filter_map(|source| proposals_by_source.get_key_value(source)).collect()
+    SOURCES.iter().filter_map(|source| proposals_by_source.get_key_value(source))
 }
 
 fn compare_scored_proposals(a: &ScoredProposal, b: &ScoredProposal) -> Ordering {
@@ -422,7 +431,7 @@ fn compare_proposals(a: &Proposal, b: &Proposal) -> Ordering {
         .cmp(&b.function_path)
         .then_with(|| a.function_name.cmp(&b.function_name))
         .then_with(|| kind_discriminant_name(&a.kind).cmp(kind_discriminant_name(&b.kind)))
-        .then_with(|| spec_body_key(&a.kind).cmp(&spec_body_key(&b.kind)))
+        .then_with(|| spec_body_parts(&a.kind).cmp(&spec_body_parts(&b.kind)))
         .then_with(|| a.rationale.cmp(&b.rationale))
 }
 

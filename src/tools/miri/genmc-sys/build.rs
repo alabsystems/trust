@@ -28,7 +28,7 @@ mod downloading {
     /// The GenMC repository the we get our commit from.
     pub(crate) const GENMC_GITHUB_URL: &str = "https://github.com/MPI-SWS/genmc.git";
     /// The GenMC commit we depend on. It must be available on the specified GenMC repository.
-    pub(crate) const GENMC_COMMIT: &str = "29b03a66402c4453fc77901ef3be90bb55707cd4";
+    pub(crate) const GENMC_COMMIT: &str = "fab5bba7d9efaf76990227c2f59d62c11c7ea2a3";
 
     /// Ensure that a local GenMC repo is present and set to the correct commit.
     /// Return the path of the GenMC repo clone.
@@ -178,7 +178,7 @@ fn compile_cpp_dependencies(genmc_path: &Path) {
     // These are all the C++ files we need to compile, which needs to be updated if more C++ files are added to Miri.
     // We use absolute paths since relative paths can confuse IDEs when attempting to go-to-source on a path in a compiler error.
     let cpp_files_base_path = Path::new("cpp/src/");
-    let cpp_files = ["MiriInterface/Exploration.cpp", "MiriInterface/Setup.cpp"]
+    let cpp_files = ["Exploration.cpp", "Setup.cpp"]
         .map(|file| std::path::absolute(cpp_files_base_path.join(file)).unwrap());
 
     let mut bridge = cxx_build::bridge("src/lib.rs");

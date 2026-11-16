@@ -1,0 +1,42 @@
+# Identities for adv.trust_ir: a real stage1 dump of adv.rs, the review of
+# census/c0's source (the review read trustc 771983b92's; the dump's
+# `; trustc` header names which this is). Conventions: census_shapes.identities. Every
+# leaking root forks and strips every descriptor >= 3 in the child (the
+# census_shapes strip, verbatim) before the leak.
+body adv_erased_helper pub
+body adv_drop_guard pub
+body adv_reexec pub
+body adv_unstrip_direct pub
+body adv_u32_strip pub
+# `nm -u` of the libc rlib references no spawn-capable symbol (nm/liblibc.nm).
+spawners
+product-census
+
+effects dup_one 22:38=dup
+effects leak_one 36:25=dup
+# The `for` calls the local helper; 771983b92's producer (S1) erased the
+# call, a bare `ret` (held in 771983b92/adv.trust_ir); today's lowers it.
+effects dup_via_helper_for 37:48=leak_one
+effects adv_erased_helper 39:23=fork 42:39=fcntl 43:8=dup_via_helper_for 44:17=execv 44:42=_exit
+effects "<Inherit as std::ops::Drop>::drop" 52:34=fcntl
+effects adv_drop_guard 55:23=fork 58:39=fcntl 62:17=execv 62:42=_exit
+effects adv_reexec 70:8=dup 71:8=execv
+effects adv_unstrip_direct 78:23=fork 81:39=fcntl 82:17=fcntl 83:17=execv 83:42=_exit
+effects adv_u32_strip 90:23=fork 93:39=fcntl 94:17=execv 94:42=_exit
+effects "adv_closure_core::{closure#0}" 15:42=dup
+# Bodies the producer refused: their HIR sites.
+site adv_closure_core 10:23=fork 13:39=fcntl 16:17=execv
+site adv_fnitem_core 24:23=fork 27:39=fcntl 29:17=execv
+site adv_thread 102:13=std::thread::spawn 103:23=fork 106:39=fcntl 107:17=execv
+
+drops dup_one
+drops leak_one
+drops dup_via_helper_for
+drops adv_erased_helper
+drops "<Inherit as std::ops::Drop>::drop"
+# `let _g = Inherit { fd: 5 }`: a guard whose Drop impl runs fcntl.
+drops adv_drop_guard Inherit
+drops adv_reexec
+drops adv_unstrip_direct
+drops adv_u32_strip
+drops "adv_closure_core::{closure#0}"

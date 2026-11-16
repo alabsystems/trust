@@ -39,6 +39,7 @@ pub fn encode_borrows(func: &VerifiableFunction) -> BorrowEncoding {
     // identity: two sequential borrows of the same source place must not share
     // one prophecy pair merely because their source names are equal.
     let mut active_borrows: Vec<(usize, usize)> = Vec::new();
+    let mut dense_locals: Option<bool> = None;
 
     for block in &func.body.blocks {
         for stmt in &block.stmts {
@@ -47,8 +48,11 @@ pub fn encode_borrows(func: &VerifiableFunction) -> BorrowEncoding {
                 place, rvalue: Rvalue::Ref { mutable, place: src }, ..
             } = stmt
             {
+                let is_dense = *dense_locals.get_or_insert_with(|| {
+                    func.body.locals.iter().enumerate().all(|(idx, decl)| decl.index == idx)
+                });
                 let place_name = local_name(func, src.local);
-                let sort = local_sort(func, src.local);
+                let sort = local_sort_with_density(func, src.local, is_dense);
                 let mut prophecy = if *mutable {
                     ProphecyVar::mutable_borrow(&place_name, sort)
                 } else {
@@ -85,7 +89,9 @@ pub fn encode_borrows(func: &VerifiableFunction) -> BorrowEncoding {
         }
 
         // Check terminators for drops that expire borrows
-        if let Terminator::Drop { place, .. } = &block.terminator {
+        if !active_borrows.is_empty()
+            && let Terminator::Drop { place, .. } = &block.terminator
+        {
             // When a reference is dropped, the borrow expires.
             // Find prophecies associated with this local and generate
             // expiry constraints.
@@ -133,14 +139,30 @@ pub fn augment_chc_with_borrows(system: &ChcSystem, encoding: &BorrowEncoding) -
     }
 
     let prophecy_params = encoding.predicate_params();
+    let mut prophecy_arg_vars = Vec::with_capacity(encoding.prophecies.len() * 2);
+    for p in &encoding.prophecies {
+        prophecy_arg_vars.push(Formula::Var(p.current_var.clone(), p.sort.clone()));
+        prophecy_arg_vars.push(Formula::Var(p.prophecy_var.clone(), p.sort.clone()));
+    }
+
+    let aliasing_opt = (!encoding.aliasing_constraints.is_empty())
+        .then(|| encoding.aliasing_formula())
+        .filter(|f| !matches!(f, Formula::Bool(true)));
+    let creation_opt = (!encoding.creation_constraints.is_empty())
+        .then(|| encoding.creation_formula())
+        .filter(|f| !matches!(f, Formula::Bool(true)));
+    let expiry_opt = (!encoding.expiry_constraints.is_empty())
+        .then(|| encoding.expiry_formula())
+        .filter(|f| !matches!(f, Formula::Bool(true)));
 
     // Extend predicate signatures with prophecy variables
     let predicates: Vec<ChcPredicate> = system
         .predicates
         .iter()
         .map(|pred| {
-            let mut params = pred.params.clone();
-            params.extend(prophecy_params.clone());
+            let mut params = Vec::with_capacity(pred.params.len() + prophecy_params.len());
+            params.extend_from_slice(&pred.params);
+            params.extend_from_slice(&prophecy_params);
             ChcPredicate { name: pred.name.clone(), params }
         })
         .collect();
@@ -151,47 +173,26 @@ pub fn augment_chc_with_borrows(system: &ChcSystem, encoding: &BorrowEncoding) -
         .iter()
         .zip(system.roles.iter())
         .map(|(clause, role)| {
-            let mut extra_constraints = Vec::new();
+            let role_extra = match role {
+                ClauseRole::Entry => creation_opt.as_ref(),
+                ClauseRole::Exit => expiry_opt.as_ref(),
+                ClauseRole::Inductive | ClauseRole::Safety => None,
+            };
 
-            // All clauses get aliasing constraints
-            let aliasing = encoding.aliasing_formula();
-            if aliasing != Formula::Bool(true) {
-                extra_constraints.push(aliasing);
-            }
-
-            match role {
-                ClauseRole::Entry => {
-                    // Entry clauses: add creation constraints (prophecy introduction)
-                    let creation = encoding.creation_formula();
-                    if creation != Formula::Bool(true) {
-                        extra_constraints.push(creation);
-                    }
+            let constraint = match (aliasing_opt.as_ref(), role_extra) {
+                (None, None) => clause.constraint.clone(),
+                (Some(a), None) => Formula::And(vec![clause.constraint.clone(), a.clone()]),
+                (None, Some(r)) => Formula::And(vec![clause.constraint.clone(), r.clone()]),
+                (Some(a), Some(r)) => {
+                    Formula::And(vec![clause.constraint.clone(), a.clone(), r.clone()])
                 }
-                ClauseRole::Exit => {
-                    // Exit clauses: add expiry constraints (prophecy resolution)
-                    let expiry = encoding.expiry_formula();
-                    if expiry != Formula::Bool(true) {
-                        extra_constraints.push(expiry);
-                    }
-                }
-                ClauseRole::Inductive => {
-                    // Inductive clauses: prophecy variables flow through unchanged
-                    // (they are parameters of the predicate, not modified by the body)
-                }
-                ClauseRole::Safety => {
-                    // Safety query clauses are not a rusthorn/prophecy construct
-                    // (they encode a loop-carried bounds/overflow obligation); no
-                    // prophecy creation/expiry applies.
-                }
-            }
+            };
 
             // Extend head/body atoms with prophecy arguments
             let head = clause.head.as_ref().map(|atom| {
-                let mut args = atom.args.clone();
-                for p in &encoding.prophecies {
-                    args.push(Formula::Var(p.current_var.clone(), p.sort.clone()));
-                    args.push(Formula::Var(p.prophecy_var.clone(), p.sort.clone()));
-                }
+                let mut args = Vec::with_capacity(atom.args.len() + prophecy_arg_vars.len());
+                args.extend_from_slice(&atom.args);
+                args.extend_from_slice(&prophecy_arg_vars);
                 crate::chc::ChcAtom { predicate: atom.predicate.clone(), args }
             });
 
@@ -199,21 +200,12 @@ pub fn augment_chc_with_borrows(system: &ChcSystem, encoding: &BorrowEncoding) -
                 .body_atoms
                 .iter()
                 .map(|atom| {
-                    let mut args = atom.args.clone();
-                    for p in &encoding.prophecies {
-                        args.push(Formula::Var(p.current_var.clone(), p.sort.clone()));
-                        args.push(Formula::Var(p.prophecy_var.clone(), p.sort.clone()));
-                    }
+                    let mut args = Vec::with_capacity(atom.args.len() + prophecy_arg_vars.len());
+                    args.extend_from_slice(&atom.args);
+                    args.extend_from_slice(&prophecy_arg_vars);
                     crate::chc::ChcAtom { predicate: atom.predicate.clone(), args }
                 })
                 .collect();
-
-            let constraint = if extra_constraints.is_empty() {
-                clause.constraint.clone()
-            } else {
-                extra_constraints.insert(0, clause.constraint.clone());
-                Formula::And(extra_constraints)
-            };
 
             ChcClause {
                 head,
@@ -249,6 +241,9 @@ pub fn encode_function_with_borrows(
         Err(err) => return Err(err),
     };
     let encoding = encode_borrows(func);
+    if encoding.is_empty() {
+        return Ok(Some((system, encoding)));
+    }
     let augmented = augment_chc_with_borrows(&system, &encoding);
     Ok(Some((augmented, encoding)))
 }
@@ -263,16 +258,15 @@ fn local_name(func: &VerifiableFunction, local: usize) -> String {
 }
 
 /// Get the SMT sort for a local variable.
-fn local_sort(func: &VerifiableFunction, local: usize) -> Sort {
+fn local_sort_with_density(func: &VerifiableFunction, local: usize, dense_locals: bool) -> Sort {
+    if dense_locals {
+        return func.body.locals.get(local).map_or(Sort::Int, |decl| Sort::from_ty(&decl.ty));
+    }
     // LocalDecl.index is the Trust IR identity; vector position is not. Public
     // standalone callers may provide sparse/reordered tables, while duplicate
     // indices are ambiguous and therefore receive only the conservative legacy
     // fallback (the checked CHC entry point rejects malformed Trust IR first).
-    let mut matches = func.body.locals.iter().filter(|decl| decl.index == local);
-    match (matches.next(), matches.next()) {
-        (Some(decl), None) => Sort::from_ty(&decl.ty),
-        _ => Sort::Int,
-    }
+    crate::unique_local_decl(func, local).map_or(Sort::Int, |decl| Sort::from_ty(&decl.ty))
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +325,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -370,6 +365,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -421,6 +417,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -485,6 +482,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -521,6 +519,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -590,6 +589,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

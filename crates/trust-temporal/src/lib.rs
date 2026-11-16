@@ -114,7 +114,7 @@ impl StateMachine {
 
     #[must_use]
     pub fn successors(&self, id: StateId) -> Vec<StateId> {
-        self.outgoing(id).into_iter().map(|transition| transition.to).collect()
+        self.transitions.iter().filter(|t| t.from == id).map(|t| t.to).collect()
     }
 
     #[must_use]
@@ -147,8 +147,10 @@ impl StateMachine {
                 continue;
             }
 
-            for next in self.successors(state) {
-                queue.push_back((next, depth + 1));
+            for t in &self.transitions {
+                if t.from == state {
+                    queue.push_back((t.to, depth + 1));
+                }
             }
         }
 
@@ -180,15 +182,12 @@ impl StateMachine {
                 continue;
             }
 
-            let successors = self.successors(last);
-            if successors.is_empty() {
-                continue;
-            }
-
-            for next in successors {
-                let mut next_trace = trace.clone();
-                next_trace.states.push(next);
-                queue.push_back(next_trace);
+            for t in &self.transitions {
+                if t.from == last {
+                    let mut next_trace = trace.clone();
+                    next_trace.states.push(t.to);
+                    queue.push_back(next_trace);
+                }
             }
         }
 

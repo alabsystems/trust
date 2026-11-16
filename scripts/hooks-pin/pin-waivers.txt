@@ -1,89 +1,21 @@
 # Pin-coherence waivers, read by scripts/hooks-pin/pre-push.
 #
-# A row here means: "this submodule is knowingly off its recorded pin, someone
-# owns it, and it is not the pushing lane's fault." The pre-push pin gate steps
-# over the listed path and BLOCKS on every other drift. It is per-path on
-# purpose — a whole-gate quarantine would waive the next drift too, which is the
-# only drift the gate exists to catch.
+# A row means: this submodule is knowingly off its recorded pin. The pre-push
+# pin gate steps over the listed path and blocks on every other drift. It is
+# per-path on purpose: a whole-gate quarantine would also waive the next drift,
+# which is the one the gate exists to catch.
 #
 # Format (`|`-separated, one row per line):
 #     <submodule path> | <expires YYYY-MM-DD> | <owner> | <reason>
 #
-# Rules the hook enforces mechanically, so a row cannot rot:
-#   * past `expires_on`, the row stops applying and the drift blocks again;
-#   * once the path is back AT its pin, the row FAILS the push until deleted.
+# The hook enforces, so a row cannot rot:
+#   * past `expires`, the row stops applying and the drift blocks again;
+#   * once the path is back at its pin, the row fails the push until deleted.
 #
-# Adding a row is a decision, not a workaround. If the drift is yours, fix it:
+# Fix drift rather than waive it:
 #     scripts/submodule_sync.sh              # classify, read-only
 #     scripts/submodule_sync.sh --restore    # BEHIND, plus AHEAD/DIVERGENT whose
 #                                            # every unique commit is held by a
 #                                            # durable ref (ANCHORED); refuses others
-
-# --- Opened 2026-08-13 at 352aa0306d, CLOSED 2026-08-13 -----------------------
-# first-party/trust-cg and first-party/trust-vc were waived here as DIVERGENT
-# (pin ecbc84402d95 / worktree 746aab73d028, and pin aae302c37bf4 / worktree
-# 45b0eb72c31b). Both are back AT their recorded pins — pins now eb23208b9745
-# and 60ac48545812, worktrees equal, `scripts/submodule_sync.sh` reports 12/12
-# SYNCED — so the hook's own rule fired: "once the path is back AT its pin, the
-# row FAILS the push until deleted." Deleted, and recorded rather than silently
-# dropped, so the next reader can see the waiver expired by being FIXED.
 #
-# No active rows. That is the intended steady state: every drift blocks.
-
-# --- Opened 2026-08-19 at 45acd105ad ------------------------------------------
-# first-party/ay is AT its recorded pin; the PIN-DIRTY finding is one untracked
-# file, crates/ay/examples/exec_parity_probe.rs — an orphan of unknown ownership
-# that the 2026-08-19 binary-stack handoff (item 6) records as deliberately
-# PRESERVED across pin restores. Deleting another lane's uncommitted work is not
-# this lane's call; committing it into first-party/ay is not either. Waived so
-# the (just-reinstalled) pin gate does not teach --no-verify, expiring soon
-# enough to force a real disposition.
-# CLOSED 2026-08-20. The row that stood here waived first-party/ay for ONE untracked file,
-# crates/ay/examples/exec_parity_probe.rs. That file no longer exists in the ay
-# checkout (`git status --untracked-files=all` in first-party/ay is empty) and the
-# submodule is at its recorded pin, so the hook's own rule fired: "once the path is
-# back AT its pin, the row FAILS the push until deleted." Deleted here rather than
-# silently dropped, per the convention above, so the next reader can see that this
-# waiver expired by being RESOLVED and not by timing out. The orphan's disposition
-# is therefore no longer an open question for the pin gate.
-#
-# No active rows. That is the intended steady state: every drift blocks.
-
-# --- Opened 2026-08-21 ---------------------------------------------------------
-# CLOSED 2026-08-22. The row that stood here waived first-party/clean as PIN-DIRTY for
-# one untracked test file (crates/clean-elab/tests/recursion_refusal_diagnostic_e2e.rs)
-# plus a stash (r0-wip-spincheck) belonging to the in-flight R0 diagnostic lane. Neither
-# is there any more: `git -C first-party/clean status --untracked-files=all` is empty,
-# no r0-wip-spincheck stash remains, the submodule is at its recorded pin
-# (b4808f00c845e13eaf6de572ad4f3f1643dbfd0e) and scripts/check_pin_coherence.sh reports
-# every submodule OK. So the hook's own rule fired on a real push attempt:
-#
-#     FAIL: a pin waiver is no longer needed.
-#       x first-party/clean is at its recorded pin again — delete its line from
-#         scripts/hooks-pin/pin-waivers.txt
-#     PIN GATE: RED.
-#
-# Deleted here rather than silently dropped, per the convention the two closures above
-# established, so the next reader can see this waiver expired by being RESOLVED and not
-# by timing out. Removing it strictly TIGHTENS the gate: first-party/clean drift blocks
-# again from this commit on.
-#
-# No active rows. That is the intended steady state: every drift blocks.
-
-# --- Opened 2026-08-30 -------------------------------------------------------
-# first-party/ay's recorded pin b851ff380a2c does not exist anywhere reachable:
-# not in the submodule's object store, not in the sibling ay clone,
-# and not on ay's origin after `fetch --all` on both. It was set by 4e10b0af72
-# ("deps(ay): move the pin off the trust-cg epoch that required an UNPUBLISHED
-# trust-ir") — a commit whose own subject is about depending on something
-# unpublished, which is exactly what its gitlink then did.
-#
-# This is the hazard CLAUDE.md states directly: "Always push a sibling before
-# pushing the superproject gitlink that names it." Until ay pushes b851ff38, the
-# pin gate blocks EVERY push to this repo from every clone, not just this lane's.
-#
-# Waived per-path and dated, not quarantined: the gate still blocks on drift in
-# any other submodule, and this row self-destructs — it stops applying after the
-# date, and the hook FAILS the push once first-party/ay is back at its pin, so it
-# cannot outlive the problem. Nothing here is fixable locally; the commit exists
-# only on the machine that authored it.
+# No active rows: every drift blocks.

@@ -2010,10 +2010,7 @@ fn three_zero_levels() -> Vec<Level> {
 
 /// `HSub.{0,0,0} Nat Nat Nat` — the type of a homogeneous `Nat` HSub instance.
 fn hsub_nat_ty() -> Expr {
-    Expr::apps(
-        Expr::const_(Name::from_string("HSub"), three_zero_levels()),
-        [nat(), nat(), nat()],
-    )
+    Expr::apps(Expr::const_(Name::from_string("HSub"), three_zero_levels()), [nat(), nat(), nat()])
 }
 
 /// `@HSub.mk.{0,0,0} Nat Nat Nat <op>`.
@@ -2058,8 +2055,19 @@ fn probe_w10_typeclass_spellings_are_delta_aliases() {
     // spellings are built from is in the PRODUCTION prelude this crate links
     // (the w0 discipline). If one is absent, nothing below means what it says.
     for name in [
-        "LT", "LT.mk", "LT.lt", "instLTNat", "instDecidableNatLt", "Nat.decLt", "Nat.decLe",
-        "HSub", "HSub.mk", "HSub.hSub", "instHSubNat", "OfNat.ofNat", "instOfNatNat",
+        "LT",
+        "LT.mk",
+        "LT.lt",
+        "instLTNat",
+        "instDecidableNatLt",
+        "Nat.decLt",
+        "Nat.decLe",
+        "HSub",
+        "HSub.mk",
+        "HSub.hSub",
+        "instHSubNat",
+        "OfNat.ofNat",
+        "instOfNatNat",
     ] {
         assert!(
             has(&env, name),

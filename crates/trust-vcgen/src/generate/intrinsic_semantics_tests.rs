@@ -476,6 +476,7 @@ fn intrinsic_fn(arg_ty: Ty, dest_ty: Ty, callee: &str) -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                         is_foreign: false,
                     },
                 },
@@ -489,6 +490,7 @@ fn intrinsic_fn(arg_ty: Ty, dest_ty: Ty, callee: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -862,6 +864,9 @@ fn saturating_intrinsic_clamp_exhaustive_width8_matches_rust() {
                             atomic: None,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key(
+                                &format!("{MARK}core::intrinsics::{name}::<x8>").to_string(),
+                            ),
                             is_foreign: false,
                         },
                     },
@@ -875,6 +880,7 @@ fn saturating_intrinsic_clamp_exhaustive_width8_matches_rust() {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let (dest, value) = saturating_call_dest_value(&func, &func.body.blocks[0].terminator)
             .expect("the marked saturating intrinsic must reach the clamp model");

@@ -105,6 +105,7 @@ fn helper_callee() -> VerifiableFunction {
         ],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -137,6 +138,7 @@ fn unguarded_caller() -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("test::helper"),
                         is_foreign: false,
                         func: "test::helper".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -156,6 +158,7 @@ fn unguarded_caller() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -652,6 +655,7 @@ fn havoc_dest_caller() -> VerifiableFunction {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("ext::clamp3"),
                 is_foreign: false,
                 func: "ext::clamp3".to_string(),
                 args: vec![Operand::Copy(Place::local(2))],
@@ -695,20 +699,47 @@ fn caller_gate_rejects_r1occ_freshened_opaque_vars() {
         Formula::Ge(Box::new(Formula::var("i", Sort::Int)), Box::new(Formula::Int(4))),
     ]);
     assert!(!composed_formula_is_caller_entry_grounded(&func, &hypothesis_only));
+    // Trust (CONSTPARAM-SIGMA-FRESHEN-1): spelled over the opaque-scalar family; the
+    // const-generic family is no longer freshened, so it never carries `__r1occ`.
     let eq_pinned = Formula::And(vec![
         Formula::Eq(
-            Box::new(Formula::var("__trust_constparam_0_N__r1occ1", Sort::Int)),
+            Box::new(Formula::var("__trust_opaque_scalar_u64__r1occ1", Sort::Int)),
             Box::new(Formula::Int(4)),
         ),
         Formula::Ge(
             Box::new(Formula::var("i", Sort::Int)),
-            Box::new(Formula::var("__trust_constparam_0_N__r1occ1", Sort::Int)),
+            Box::new(Formula::var("__trust_opaque_scalar_u64__r1occ1", Sort::Int)),
         ),
     ]);
     assert!(
         !composed_formula_is_caller_entry_grounded(&func, &eq_pinned),
         "an __r1occ var must be rejected by NAME, pin or no pin"
     );
+}
+
+/// Trust (CONSTPARAM-SIGMA-FRESHEN-1): the caller's const-generic symbol now reaches
+/// this refutation-only gate UNFRESHENED (it used to arrive as `__r1occ` and was
+/// rejected by name). It names no caller local, so the gate classifies it like any
+/// other non-parameter name: a free one is an unconstrained model dimension and the
+/// candidate DROPS; one a conjunct def-pins (one value per symbol, so the pin holds
+/// at every occurrence) is admitted under the gate's ordinary rule.
+#[test]
+fn caller_gate_classifies_an_unfreshened_const_param_by_its_pins() {
+    let func = unguarded_caller();
+    let n = trust_types::const_param_symbol(0, "N");
+    let free = Formula::And(vec![
+        Formula::Ge(Box::new(Formula::var("i", Sort::Int)), Box::new(Formula::var(&n, Sort::Int))),
+        Formula::Ge(Box::new(Formula::var("i", Sort::Int)), Box::new(Formula::Int(0))),
+    ]);
+    assert!(
+        !composed_formula_is_caller_entry_grounded(&func, &free),
+        "a free const param is not a witness of any execution"
+    );
+    let pinned = Formula::And(vec![
+        Formula::Eq(Box::new(Formula::var(&n, Sort::Int)), Box::new(Formula::Int(4))),
+        Formula::Ge(Box::new(Formula::var("i", Sort::Int)), Box::new(Formula::var(&n, Sort::Int))),
+    ]);
+    assert!(composed_formula_is_caller_entry_grounded(&func, &pinned));
 }
 
 #[test]
@@ -861,14 +892,9 @@ fn caller_gate_admits_chained_nested_pins_through_a_slice_len() {
 /// else in the formula.
 fn overflow_add_body_vc() -> Formula {
     let sum = || {
-        Formula::Add(
-            Box::new(Formula::var("a", Sort::Int)),
-            Box::new(Formula::var("b", Sort::Int)),
-        )
+        Formula::Add(Box::new(Formula::var("a", Sort::Int)), Box::new(Formula::var("b", Sort::Int)))
     };
-    let overflowed = || {
-        Formula::Gt(Box::new(sum()), Box::new(Formula::Int(18446744073709551615)))
-    };
+    let overflowed = || Formula::Gt(Box::new(sum()), Box::new(Formula::Int(18446744073709551615)));
     Formula::And(vec![
         Formula::And(vec![u64_range("a"), u64_range("b")]),
         Formula::And(vec![
@@ -905,10 +931,7 @@ fn caller_gate_still_rejects_a_disjunctively_pinned_temp_used_elsewhere() {
     func.body.locals[2] =
         LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: false }, name: Some("b".into()) };
     let Formula::And(mut blocks) = overflow_add_body_vc() else { unreachable!() };
-    blocks.push(Formula::Gt(
-        Box::new(Formula::var("_0", Sort::Int)),
-        Box::new(Formula::Int(7)),
-    ));
+    blocks.push(Formula::Gt(Box::new(Formula::var("_0", Sort::Int)), Box::new(Formula::Int(7))));
     assert!(!composed_formula_is_caller_entry_grounded(&func, &Formula::And(blocks)));
 }
 
@@ -938,10 +961,7 @@ fn caller_gate_still_rejects_a_bare_eq_over_an_opaque_value() {
     // exact false refutation the campaign closed, so the top of the formula
     // must still be required to be a conjunction.
     let func = havoc_dest_caller();
-    let violation = Formula::Eq(
-        Box::new(Formula::var("j", Sort::Int)),
-        Box::new(Formula::Int(0)),
-    );
+    let violation = Formula::Eq(Box::new(Formula::var("j", Sort::Int)), Box::new(Formula::Int(0)));
     assert!(!composed_formula_is_caller_entry_grounded(&func, &violation));
     // SCOPE, stated rather than implied: the fixpoint cannot tell `_3 == 4`
     // (a legitimate constant block def, named as such in
@@ -999,4 +1019,29 @@ fn genuine_violation_caller_composition_survives_gate_and_stays_sat() {
         ),
         "the genuine composition must stay SAT with a model after the gate: {result:?}"
     );
+}
+
+/// T3 C07p: the replay lane writes its candidates into the caller's context through the
+/// row oracle, and returns the candidates the tree-only lane returns.
+#[test]
+fn replay_candidates_go_through_the_row_oracle() {
+    use trust_types::vc_context::{Oracle, ParityCount, VcContext, same_row};
+
+    let caller = unguarded_caller();
+    let mut summaries = SummaryDatabase::new();
+    summaries.insert(helper_summary_with_body());
+    let mut rows = VcContext::new();
+    let interned = super::generate_callsite_l0_replay_candidates_rows(
+        &caller,
+        &summaries,
+        "test::helper",
+        &call_span(),
+        &mut rows,
+    );
+    let tree =
+        generate_callsite_l0_replay_candidates(&caller, &summaries, "test::helper", &call_span());
+    assert_eq!(interned.len(), 1, "exactly one composed bounds candidate: {interned:#?}");
+    assert_eq!(tree.len(), 1);
+    assert!(same_row(&interned[0], &tree[0]));
+    assert_eq!(rows.parity(Oracle::Row), ParityCount { rows: 1, mismatches: 0 });
 }

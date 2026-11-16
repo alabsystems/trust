@@ -4,6 +4,7 @@
 // tidy-alphabetical-start
 #![allow(internal_features)]
 #![feature(decl_macro)]
+#![feature(default_field_values)]
 #![feature(deref_patterns)]
 #![feature(iter_order_by)]
 #![feature(proc_macro_internals)]
@@ -39,13 +40,16 @@ mod eii;
 mod env;
 mod format;
 mod format_foreign;
+mod gca;
 mod global_allocator;
 mod iter;
 mod log_syntax;
 mod offload;
 mod pattern_type;
+mod rustdoc_skip_body;
 mod source_util;
 mod test;
+mod test_binder_constraints;
 mod trace_macros;
 mod view_type;
 
@@ -60,13 +64,13 @@ pub mod util;
 pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
     let mut register = |name, kind| resolver.register_builtin_macro(name, kind);
     macro register_bang($($name:ident: $f:expr,)*) {
-        $(register(sym::$name, SyntaxExtensionKind::LegacyBang(Arc::new($f as MacroExpanderFn)));)*
+        $(register(sym::$name, SyntaxExtensionKind::AstBang(Arc::new($f as MacroExpanderFn)));)*
     }
     macro register_attr($($name:ident: $f:expr,)*) {
-        $(register(sym::$name, SyntaxExtensionKind::LegacyAttr(Arc::new($f)));)*
+        $(register(sym::$name, SyntaxExtensionKind::AstAttr(Arc::new($f)));)*
     }
     macro register_derive($($name:ident: $f:expr,)*) {
-        $(register(sym::$name, SyntaxExtensionKind::LegacyDerive(Arc::new(BuiltinDerive($f))));)*
+        $(register(sym::$name, SyntaxExtensionKind::AstDerive(Arc::new(BuiltinDerive($f))));)*
     }
 
     register_bang! {
@@ -85,6 +89,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         file: source_util::expand_file,
         format_args: format::expand_format_args,
         format_args_nl: format::expand_format_args_nl,
+        gca: gca::expand,
         global_asm: asm::expand_global_asm,
         include: source_util::expand_include,
         include_bytes: source_util::expand_include_bytes,
@@ -98,6 +103,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         pattern_type: pattern_type::expand,
         std_panic: edition_panic::expand_panic,
         stringify: source_util::expand_stringify,
+        test_binder_constraints: test_binder_constraints::expand,
         trace_macros: trace_macros::expand_trace_macros,
         unreachable: edition_panic::expand_unreachable,
         view_type: view_type::expand,
@@ -120,6 +126,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         eii_shared_macro: eii::eii_shared_macro,
         global_allocator: global_allocator::expand,
         offload_kernel: offload::expand_kernel,
+        rustdoc_skip_body: rustdoc_skip_body::expand,
         test: test::expand_test,
         test_case: test::expand_test_case,
         unsafe_eii: eii::unsafe_eii,
@@ -128,8 +135,9 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
 
     register_derive! {
         Clone: clone::expand_deriving_clone,
-        Copy: bounds::expand_deriving_copy,
-        ConstParamTy: bounds::expand_deriving_const_param_ty,
+        CoerceShared: reborrow::expand_deriving_coerce_shared,
+        Copy: copy::expand_deriving_copy,
+        ConstParamTy: const_param_ty::expand_deriving_const_param_ty,
         Debug: debug::expand_deriving_debug,
         Default: default::expand_deriving_default,
         Eq: eq::expand_deriving_eq,
@@ -138,10 +146,13 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         PartialEq: partial_eq::expand_deriving_partial_eq,
         PartialOrd: partial_ord::expand_deriving_partial_ord,
         CoercePointee: coerce_pointee::expand_deriving_coerce_pointee,
+        Reborrow: reborrow::expand_deriving_reborrow,
         From: from::expand_deriving_from,
     }
 
     let client = rustc_proc_macro::bridge::client::Client::expand1(rustc_proc_macro::quote);
+    // Trust (D21): the compiler's own `quote` is not a loaded dylib; it stays in process.
+    let client = rustc_expand::proc_macro::MacroClient::InProcess(client);
     register(sym::quote, SyntaxExtensionKind::Bang(Arc::new(BangProcMacro { client })));
     let requires = SyntaxExtensionKind::Attr(Arc::new(contracts::ExpandRequires));
     register(sym::contracts_requires, requires);

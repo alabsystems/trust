@@ -1,106 +1,113 @@
-//! clean (CIC kernel / proof checker) discovery helpers for integration tests.
+//! The `clean` executable the binary cross-check gates measure.
 //!
-//! Mirrors [`crate::ay_test_support`]: locates a `clean` executable so a gate
-//! can cross-check it against the proof corpora.
+//! Five gates in `tests/` shell out to a `clean` binary:
+//! `ay_blast_correspondence_gate`, `structured_multiplier_proof_gate`,
+//! `i128_corner_bounds_proof_gate`, `codegen_equivalence_gate` and
+//! `trust_soundness_ouroboros_gate`. What such a run measures is THE BINARY:
+//! that a `clean` built from the pinned `first-party/clean` agrees with the
+//! verdicts reached in process. The proofs' authority does not live there.
+//! `clean-parser`, `clean-elab` and `clean-kernel` are dependencies of
+//! `trust-certify`, so `lean_front_door_gate` kernel-checks both corpora in
+//! process, at the pinned revision, and [`crate::clean_proof_obligations`] holds
+//! the required theorem names and the multiply-cap coupling; nothing there is
+//! discovered and nothing can skip.
 //!
-//! What a binary found here measures is THE BINARY. Discovery reaches `PATH`
-//! and other locations outside this checkout, so the executable may be older
-//! than the pinned `first-party/clean` source and disagree with it. The
-//! corpora's own authority therefore does not live here: `clean-parser`,
-//! `clean-elab`, and `clean-kernel` are workspace dependencies of
-//! `trust-certify`, so `lean_front_door_gate` kernel-checks the same files in
-//! process, at the pinned revision, with nothing to discover and no way to
-//! skip.
+//! The binary is named, never discovered: [`require_clean_bin`] reads
+//! `TRUST_CLEAN_BIN` and panics, with the build recipe, without it. The five
+//! gates are `#[ignore]`d, and the `slow.clean-binary-proof-gates` row of
+//! `tests/run_trust_comprehensive_harness.sh` builds `clean` from the submodule
+//! at its pin, exports the variable, runs them with `--ignored`, and demands
+//! `1 passed` from each.
+//!
+//! Until 2026-10-09 a search here (beside the test binary, then
+//! `build/*/stage{2,3}/bin`, then `first-party/clean/target`) that found
+//! nothing made all five gates return green with a NOTICE that libtest
+//! captured, so a fresh clone or worktree passed them having run nothing. One
+//! that found something measured whatever had built it: on the measured host a
+//! nine-day-old stage2 `clean`, not the pinned source.
 
-use std::env;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
+use std::ffi::OsString;
+use std::path::PathBuf;
 
-/// Return a usable `clean` checker binary path, or `None` if none is discoverable.
-///
-/// Discovery order:
-/// - sibling `clean` next to the running test binary
-/// - repo-local `build/*/stage{2,3}/bin/clean`
-/// - repo-local `first-party/clean/target/{debug,release}/clean`
-///
-/// `PATH` is deliberately NOT searched. An installed `clean` is not an artifact
-/// of this tree: it can predate the `first-party/clean` pin by any amount, and
-/// when it does, it disagrees with the pinned source about proofs that are
-/// perfectly good — a red gate carrying no information about the repository.
-/// Every candidate above is something a build in THIS checkout produced, so a
-/// disagreement is a fact about the tree and worth failing on.
+use crate::trust_rustc::is_executable_file;
+
+/// The environment variable that names the `clean` executable to measure.
+pub const TRUST_CLEAN_BIN: &str = "TRUST_CLEAN_BIN";
+
+/// How to build `clean` from the pinned submodule, from the repository root.
+/// The executable is `<target dir>/release/clean`; cargo's
+/// `--message-format json` names it exactly.
+pub const CLEAN_BUILD_RECIPE: &str = "targo --unverified build --manifest-path \
+     first-party/clean/Cargo.toml -p clean --bin clean --release --locked";
+
+/// The `clean` executable `TRUST_CLEAN_BIN` names. Panics, naming the build
+/// recipe, when the variable is unset or empty or names no executable file.
 #[must_use]
-pub fn clean_checker_path() -> Option<PathBuf> {
-    static CLEAN_CHECKER_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-    CLEAN_CHECKER_PATH
-        .get_or_init(|| clean_candidates().into_iter().find(|path| clean_usable(path)))
-        .clone()
-}
-
-/// True when a usable `clean` checker can be discovered by the test harness.
-#[must_use]
-pub fn clean_available() -> bool {
-    clean_checker_path().is_some()
-}
-
-fn clean_exe_name() -> &'static str {
-    if cfg!(windows) { "clean.exe" } else { "clean" }
-}
-
-/// A binary is "usable" if it exists and responds to a trivial `--help`/`check`
-/// invocation without an exec error (we don't pin a version string — the gate's
-/// per-file `check` is the real test).
-fn clean_usable(path: &Path) -> bool {
-    path.is_file()
-        && Command::new(path)
-            .arg("--help")
-            .output()
-            .map(|o| o.status.success() || !o.stdout.is_empty() || !o.stderr.is_empty())
-            .unwrap_or(false)
-}
-
-fn push_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if !candidates.contains(&candidate) {
-        candidates.push(candidate);
+pub fn require_clean_bin() -> PathBuf {
+    match clean_bin_from(std::env::var_os(TRUST_CLEAN_BIN)) {
+        Ok(path) => {
+            // Printed per test (libtest captures per test thread), so a failing
+            // gate's output names the binary it measured.
+            eprintln!("clean checker: {}", path.display());
+            path
+        }
+        Err(why) => panic!("{why}"),
     }
 }
 
-fn clean_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
+/// [`require_clean_bin`] over an explicit `TRUST_CLEAN_BIN` value.
+pub fn clean_bin_from(value: Option<OsString>) -> Result<PathBuf, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Err(format!(
+            "{TRUST_CLEAN_BIN} is unset. This gate cross-checks a `clean` executable built from \
+             the pinned first-party/clean, and it never searches for one: build it from the \
+             repository root with\n    {CLEAN_BUILD_RECIPE}\nand set {TRUST_CLEAN_BIN} to the \
+             executable cargo reports (the slow.clean-binary-proof-gates harness row does both). \
+             The proofs themselves are checked without a binary by lean_front_door_gate and \
+             clean_proof_obligations."
+        ));
+    };
+    let path = PathBuf::from(value);
+    if is_executable_file(&path) {
+        Ok(path)
+    } else {
+        Err(format!(
+            "{TRUST_CLEAN_BIN}={} is not an executable file; build one with\n    \
+             {CLEAN_BUILD_RECIPE}",
+            path.display()
+        ))
+    }
+}
 
-    if let Ok(current) = env::current_exe() {
-        if let Some(dir) = current.parent() {
-            push_candidate(&mut candidates, dir.join(clean_exe_name()));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unset_or_empty_trust_clean_bin_is_an_error_naming_the_recipe() {
+        for value in [None, Some(OsString::new())] {
+            let why = clean_bin_from(value).expect_err("no binary must be an error");
+            assert!(why.contains("TRUST_CLEAN_BIN is unset") && why.contains(CLEAN_BUILD_RECIPE));
         }
     }
 
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir.parent().and_then(Path::parent);
-
-    if let Some(repo_root) = repo_root {
-        let build_root = repo_root.join("build");
-        if let Ok(entries) = std::fs::read_dir(&build_root) {
-            let mut stage_dirs = entries
-                .flatten()
-                .filter_map(|entry| {
-                    let file_type = entry.file_type().ok()?;
-                    file_type.is_dir().then_some(entry.path())
-                })
-                .flat_map(|slot| [slot.join("stage2/bin"), slot.join("stage3/bin")])
-                .collect::<Vec<_>>();
-            stage_dirs.sort();
-            for dir in stage_dirs {
-                push_candidate(&mut candidates, dir.join(clean_exe_name()));
-            }
+    #[test]
+    fn a_trust_clean_bin_naming_no_executable_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("no-such-clean");
+        for value in [missing.as_os_str(), dir.path().as_os_str()] {
+            let why = clean_bin_from(Some(value.to_owned())).expect_err("not an executable");
+            assert!(why.contains("is not an executable file"), "{why}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let plain = dir.path().join("clean");
+            std::fs::write(&plain, b"").expect("write stand-in");
+            assert!(clean_bin_from(Some(plain.clone().into_os_string())).is_err());
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            assert_eq!(clean_bin_from(Some(plain.clone().into_os_string())), Ok(plain));
         }
     }
-
-    if let Some(repo_root) = repo_root {
-        let clean_target = repo_root.join("first-party/clean/target");
-        push_candidate(&mut candidates, clean_target.join("debug").join(clean_exe_name()));
-        push_candidate(&mut candidates, clean_target.join("release").join(clean_exe_name()));
-    }
-
-    candidates
 }

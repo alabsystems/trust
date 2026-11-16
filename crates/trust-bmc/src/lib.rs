@@ -52,6 +52,13 @@ mod config;
 #[cfg(all(test, feature = "trust-mc-native-trust-ir-bundle"))]
 mod direct_shadow_differential;
 mod error;
+// Verifier-lane soundness of trust-ir-bridge's unknown-offset field address
+// (2026-09-29): an address the bridge could not place must never be read as a
+// concrete offset. The production gate refuses every field address, and the
+// translator behind it refuses the poison offset (`OperandConsumption`, since
+// trust-mc c88bca8d7). Test-only by construction.
+#[cfg(all(test, feature = "trust-mc-native-trust-ir-bundle"))]
+mod unknown_offset_soundness;
 // Sealed-authority S3 (2026-07-17 blueprint): gate-side CHC/PDR invariant
 // replay oracle. Library-only — rides the trust-mc-native-solver feature so it
 // sees the same patched ay-chc package trust-mc-driver's native lane uses,
@@ -90,8 +97,6 @@ pub use trust_mc_core::{
 // verification condition containers, violation descriptors, and property kinds.
 #[cfg(feature = "trust-mc-core-types")]
 pub use trust_mc_core::{BmcVc, ChcVc, PropertyKind, Violation};
-#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
-pub use verifier_api::NativeTrustIrBundleEvidenceWithFreshReceipts;
 #[cfg(feature = "trust-mc-core-types")]
 pub use verifier_api::trust_mc_full_verification_verdict_metadata_entry;
 // targo-trust doctor: canonical one-obligation typed-CHC smoke request for the
@@ -105,6 +110,18 @@ pub use verifier_api::{
     FreshExactDirectChcPdrReceipt, TrustMcNativeTypedChcPdrProofTransport,
     TrustMcNativeTypedProofArtifactRef, TrustMcNativeTypedProofStatus,
     TrustMcNativeTypedProofStrength,
+};
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+pub use verifier_api::{
+    FreshWholeFunctionChcPdrBundleSeal, FreshWholeFunctionChcPdrReceipt,
+    NativeTrustIrBundleEvidenceWithFreshReceipts,
+};
+// Trust (C1, 2026-11-06): trust-mc's live source reference facts, for the router
+// and the compiler's single issuer (see `verifier_api`).
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+pub use verifier_api::{
+    SourceReferenceFacts, SourceReferenceFactsError, SourceReferenceLoadFact,
+    SourceReferenceParameterFact, SourceReferenceValueFact,
 };
 pub use verifier_api::{
     TRUST_MC_FULL_VERIFICATION_VERDICT_METADATA_KEY, TRUST_MC_TYPED_CHC_BINDING_METADATA_KEY,

@@ -6,16 +6,21 @@
 
 use std::process::ExitCode;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[doc(hidden)]
+pub use rustc_driver_impl::{
+    BOOTSTRAP_FIXED_COMPILER_PROTOCOL_MARKER, WORKLOAD_MEMBER_PROTOCOL_MARKER,
+};
 #[doc(no_inline)]
 pub use rustc_driver_impl::{
     Callbacks, Compilation, DEFAULT_BUG_REPORT_URL, EXIT_FAILURE, EXIT_SUCCESS, HandledOptions,
     NoTrustEvidence, TimePassesCallbacks, USING_INTERNAL_FEATURES, args, catch_fatal_errors,
     catch_with_exit_code, describe_flag_categories, describe_lints, handle_help, handle_options,
     highlighter, init_logger, init_logger_with_additional_layer, init_rustc_env_logger,
-    install_ctrlc_handler, install_ice_hook, install_ice_hook_with_default_compiler, pretty,
-    run_compiler, run_compiler_with_expanded_args,
-    run_compiler_with_expanded_args_and_no_trust_evidence, trust_display_binary, version,
-    version_at_macro_invocation,
+    install_ctrlc_handler, install_ice_hook, install_ice_hook_with_default_compiler,
+    override_c_allocator_in_binary, pretty, print_crate_info, run_compiler,
+    run_compiler_with_expanded_args, run_compiler_with_expanded_args_and_no_trust_evidence,
+    trust_display_binary, version, version_at_macro_invocation,
 };
 
 /// Run rustc as an embedded host tool without official Trust evidence

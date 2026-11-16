@@ -142,17 +142,21 @@ pub(super) fn check_bound_tool_files(
         check_bound_tool_identity(&mut findings, severity, tool, false, profile);
     }
     if profile.requires_bound_tools() {
-        match (identity.candidate_commit.as_deref(), identity.tools.daemon.commit_hash.as_deref()) {
-            (Some(candidate), Some(commit)) if candidate == commit => {}
-            (Some(candidate), Some(commit)) => findings.push(finding_with_severity(
-                severity,
-                "tool-commit-mismatch",
-                format!(
-                    "trustd reports commit-hash {commit}, expected release candidate {candidate}"
-                ),
-            )),
-            (Some(_), None) => {}
-            (None, _) => {}
+        for tool in [&identity.tools.compiler, &identity.tools.daemon] {
+            if let (Some(candidate), Some(commit)) =
+                (identity.candidate_commit.as_deref(), tool.commit_hash.as_deref())
+            {
+                if candidate != commit {
+                    findings.push(finding_with_severity(
+                        severity,
+                        "tool-commit-mismatch",
+                        format!(
+                            "{} reports commit-hash {commit}, expected release candidate {candidate}",
+                            tool.name
+                        ),
+                    ));
+                }
+            }
         }
     }
 

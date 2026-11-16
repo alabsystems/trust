@@ -3,10 +3,9 @@ use std::mem;
 
 use rustc_ast::token::Token;
 use rustc_ast::tokenstream::{
-    AttrsTarget, LazyAttrTokenStream, NodeRange, ParserRange, Spacing, TokenCursor,
+    AttrsTarget, LazyTokenStream, NodeRange, ParserRange, Spacing, TokenCursor,
 };
-use rustc_ast::{self as ast, AttrVec, Attribute, HasAttrs, HasTokens};
-use rustc_data_structures::fx::FxHashSet;
+use rustc_ast::{self as ast, AttrKind, AttrVec, Attribute, HasTokens};
 use rustc_errors::PResult;
 use rustc_session::parse::ParseSess;
 use rustc_span::{DUMMY_SP, sym};
@@ -101,12 +100,28 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses code with `f`. If appropriate, it records the tokens (in
-    /// `LazyAttrTokenStream` form) that were parsed in the result, accessible
-    /// via the `HasTokens` trait. The `Trailing` part of the callback's
-    /// result indicates if an extra token should be captured, e.g. a comma or
-    /// semicolon. The `UsePreAttrPos` part of the callback's result indicates
-    /// if we should use `pre_attr_pos` as the collection start position (only
-    /// required in a few cases).
+    /// `LazyTokenStream` form) that were parsed in the result, accessible
+    /// via the `HasTokens` trait.
+    ///
+    /// Why is this done? Various macro cases require an AST node's tokens.
+    /// - Proc macros: all proc macros take a token stream.
+    ///   - Function-style proc macros (`foo!(..)`): these can receive a token
+    ///     stream without any parsing occurring within the parentheses.
+    ///   - Attribute macros (`#[foo]`): at parse time (pre-resolution) we
+    ///     don't know if a non-builtin `#[foo]` is an attribute proc macro, so
+    ///     the parser does a full parse and collects tokens (lazily) in case.
+    ///   - Derive macros (`derive(Foo)`): any input with
+    ///     `#[cfg]`/`#[cfg_attr]` must be stripped before being passed to the
+    ///     derive macro, which requires parsing. Identifying the end of the
+    ///     item also requires parsing.
+    /// - Decl macros: a matched nonterminal (e.g. `$e:expr`) needs tokens in
+    ///   case it is passed into a proc macro.
+    ///
+    /// The `Trailing` part of the callback's result indicates if an extra
+    /// token should be captured, e.g. a comma or semicolon. The
+    /// `UsePreAttrPos` part of the callback's result indicates if we should
+    /// use `pre_attr_pos` as the collection start position (only required in a
+    /// few cases).
     ///
     /// The `attrs` passed in are in `AttrWrapper` form, which is opaque. The
     /// `AttrVec` within is passed to `f`. See the comment on `AttrWrapper` for
@@ -137,7 +152,7 @@ impl<'a> Parser<'a> {
     ///     }                               //  32..33
     /// }                                   //  33..34
     /// ```
-    pub(super) fn collect_tokens<R: HasAttrs + HasTokens>(
+    pub(super) fn collect_tokens<R: HasTokens>(
         &mut self,
         pre_attr_pos: Option<CollectPos>,
         attrs: AttrWrapper,
@@ -189,27 +204,24 @@ impl<'a> Parser<'a> {
         // an inner call to `collect_tokens` returns an AST node and then an
         // outer call ends up with the same AST node without any additional
         // wrapping layer.
-        let mut seen_indices = FxHashSet::default();
-        for (i, attr) in ret.attrs().iter().enumerate() {
-            let is_unseen = self.capture_state.seen_attrs.insert(attr.id);
-            if !is_unseen {
-                seen_indices.insert(i);
+        let ret_attrs_slice = ret.attrs();
+        let ret_attrs: Cow<'_, [Attribute]> = if ret_attrs_slice.is_empty() {
+            Cow::Borrowed(&[])
+        } else {
+            let mut unseen_attrs: Option<Vec<Attribute>> = None;
+            for (i, attr) in ret_attrs_slice.iter().enumerate() {
+                let is_unseen = self.capture_state.seen_attrs.insert(attr.id);
+                if !is_unseen {
+                    unseen_attrs.get_or_insert_with(|| ret_attrs_slice[..i].to_vec());
+                } else if let Some(unseen) = &mut unseen_attrs {
+                    unseen.push(attr.clone());
+                }
             }
-        }
-        let ret_attrs: Cow<'_, [Attribute]> =
-            if seen_indices.is_empty() {
-                Cow::Borrowed(ret.attrs())
-            } else {
-                let ret_attrs =
-                    ret.attrs()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, attr)| {
-                            if seen_indices.contains(&i) { None } else { Some(attr.clone()) }
-                        })
-                        .collect();
-                Cow::Owned(ret_attrs)
-            };
+            match unseen_attrs {
+                None => Cow::Borrowed(ret_attrs_slice),
+                Some(unseen) => Cow::Owned(unseen),
+            }
+        };
 
         // When we're not in "definite capture mode", then skip collecting and
         // return early if `ret` doesn't support tokens or already has some.
@@ -271,7 +283,7 @@ impl<'a> Parser<'a> {
             // breaking a `>>=` token twice into `>` + `>` + `=`), then extend the range of
             // captured tokens to include it, because the parser was not actually bumped past it.
             // (Even if we broke twice, it was still just one token originally, hence the `1`.)
-            // When the `LazyAttrTokenStream` gets converted into an `AttrTokenStream`, we will
+            // When the `LazyTokenStream` gets converted into a `TokenStream`, we will
             // rebreak that final token once or twice.
             + if self.break_last_token == 0 { 0 } else { 1 };
 
@@ -302,8 +314,7 @@ impl<'a> Parser<'a> {
         } else {
             // Grab any replace ranges that occur *inside* the current AST node. Convert them
             // from `ParserRange` form to `NodeRange` form. We will perform the actual
-            // replacement only when we convert the `LazyAttrTokenStream` to an
-            // `AttrTokenStream`.
+            // replacement only when we convert the `LazyTokenStream` to a `TokenStream`.
             self.capture_state.parser_replacements
                 [parser_replacements_start..parser_replacements_end]
                 .iter()
@@ -337,7 +348,7 @@ impl<'a> Parser<'a> {
         //     - `attrs`: includes the outer and the inner attr.
         //     - `tokens`: lazy tokens for `g` (with its inner attr deleted).
 
-        let tokens = LazyAttrTokenStream::new_pending(
+        let tokens = LazyTokenStream::new_pending(
             collect_pos.start_token,
             collect_pos.cursor_snapshot,
             num_calls,
@@ -391,15 +402,22 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Tokens are needed if:
-/// - any non-single-segment attributes (other than doc comments) are present,
-///   e.g. `rustfmt::skip`; or
-/// - any `cfg_attr` attributes are present; or
-/// - any single-segment, non-builtin attributes are present, e.g. `derive`,
-///   `test`, `global_allocator`.
 fn needs_tokens(attrs: &[ast::Attribute]) -> bool {
-    attrs.iter().any(|attr| match attr.name() {
-        None => !attr.is_doc_comment(),
-        Some(name) => name == sym::cfg_attr || !rustc_feature::is_builtin_attr_name(name),
+    // Tokens are needed if...
+    attrs.iter().any(|attr| match &attr.kind {
+        AttrKind::Normal(normal) => {
+            match normal.item.name() {
+                // ... a multi-segment attribute is present, e.g. `rustfmt::skip`.
+                None => true,
+                // ... `cfg_attr` or a single-segment non-builtin attribute is present, e.g.
+                // `derive`, `test`, `global_allocator`.
+                Some(name) => name == sym::cfg_attr || !rustc_feature::is_builtin_attr_name(name),
+            }
+        }
+        // Synthetic attributes are created only during expansion, and can't re-enter the parser
+        // because they have no token form.
+        AttrKind::Synthetic(_) => unreachable!(),
+        AttrKind::DocComment(..) => false,
+        AttrKind::Generated(..) => unreachable!(),
     })
 }

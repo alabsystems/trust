@@ -30,8 +30,9 @@ choosing one on purpose.
 
 The census answers "how many bodies would this family unblock", which is the
 CLEAN-rate question. It does not answer "how many would become Agreed" — measured
-at ~1% marginal, that is a different and much smaller number. See
-`trust_ir_marginal_conversion.py`; do not price a lane off a sole-count alone.
+at ~1% marginal, that is a different and much smaller number (measured by
+`scripts/trust_ir_marginal_conversion.py`, deleted 2026-11-10; it is at
+4b7ad005d7); do not price a lane off a sole-count alone.
 
 USAGE
 -----
@@ -339,7 +340,7 @@ def report(spec, artifact, top=8) -> int:
     print("\nA sole count is a CLEAN-rate number. The marginal clean->Agreed conversion "
           "measured\nover whole windows is ~1% (0.6% / 2.8% / 0.0%), not the ~59% aggregate "
           "agreed/clean —\nso a family's sole count is NOT its Agreed yield. Price the second "
-          "axis with\nscripts/trust_ir_marginal_conversion.py before ranking a lane on it.")
+          "axis before\nranking a lane on it.")
     return 0
 
 

@@ -9,7 +9,7 @@
 
 use thiserror::Error;
 use trust_types::fx::{FxHashMap, FxHashSet};
-use trust_types::{Formula, Sort, infer_sort};
+use trust_types::{Formula, Sort, infer_sort, sorts_agree};
 
 /// Errors that can occur during formula substitution.
 #[derive(Debug, Clone, Error)]
@@ -85,7 +85,17 @@ impl SubstitutionMap {
         for (i, (name, sort)) in params.iter().enumerate() {
             let arg = &args[i];
             let arg_sort = infer_sort(arg);
-            if &arg_sort != sort {
+            // `sorts_agree`, not `!=`: structural `Sort` equality is too strict
+            // for datatypes. trust-ir-contract spells every datatype-typed
+            // FIELD, pattern binder and `Sel::field_sort` as the BY-NAME
+            // reference `Datatype { name, constructors: [] }` while the
+            // definitional occurrence (a formal parameter's declared sort)
+            // carries the full constructor list. Both name ONE SMT sort, so
+            // `!=` refused every call whose datatype-sorted argument arrived in
+            // the shipped by-name spelling — an arity/sort error on a
+            // perfectly well-sorted call. A genuine mismatch (Int vs a
+            // datatype, or two DIFFERENT datatype names) is still refused.
+            if !sorts_agree(&arg_sort, sort) {
                 return Err(SubstitutionError::SortMismatch {
                     name: name.clone(),
                     expected: sort.clone(),
@@ -158,11 +168,17 @@ fn validate_substitution_complete(
     result: &Formula,
     map: &SubstitutionMap,
 ) -> Result<(), SubstitutionError> {
-    let original_free = free_variables(original);
+    if map.is_empty() {
+        return Ok(());
+    }
     let result_free = free_variables(result);
-    for name in map.variables() {
-        if original_free.contains(name) && result_free.contains(name) {
-            return Err(SubstitutionError::IncompleteSubstitution { name: name.to_string() });
+    if !map.mappings.keys().any(|name| result_free.contains(name.as_str())) {
+        return Ok(());
+    }
+    let original_free = free_variables(original);
+    for name in map.mappings.keys() {
+        if result_free.contains(name.as_str()) && original_free.contains(name.as_str()) {
+            return Err(SubstitutionError::IncompleteSubstitution { name: name.clone() });
         }
     }
     Ok(())
@@ -268,10 +284,12 @@ fn substitute_inner(
 
         // Quantifiers: capture-avoiding substitution.
         Formula::Forall(bindings, body) | Formula::Exists(bindings, body) => {
+            let is_forall = matches!(formula, Formula::Forall(..));
             let bound_names: FxHashSet<&str> = bindings.iter().map(|(n, _)| n.as_str()).collect();
 
-            // Check for capture: if any replacement formula contains a free variable
-            // that is bound by this quantifier, we have capture.
+            // Check for capture and build a restricted map that excludes bound variables
+            // in a single pass over `map.mappings`.
+            let mut restricted = SubstitutionMap::new();
             for (var_name, replacement) in &map.mappings {
                 if bound_names.contains(var_name.as_str()) {
                     // Variable is shadowed by the quantifier -- skip it.
@@ -281,29 +299,20 @@ fn substitute_inner(
                 for bound in &bound_names {
                     if free_in_replacement.contains(*bound) {
                         return Err(SubstitutionError::VariableCapture {
-                            captured: bound.to_string(),
-                            binder: bound.to_string(),
+                            captured: (*bound).to_string(),
+                            binder: (*bound).to_string(),
                         });
                     }
                 }
-            }
-
-            // Build a restricted map that excludes bound variables.
-            let mut restricted = SubstitutionMap::new();
-            for (name, replacement) in &map.mappings {
-                if !bound_names.contains(name.as_str()) {
-                    let sort = map.sorts.get(name).cloned().unwrap_or(Sort::Int);
-                    restricted.insert(name.clone(), sort, replacement.clone());
-                }
+                let sort = map.sorts.get(var_name).cloned().unwrap_or(Sort::Int);
+                restricted.insert(var_name.clone(), sort, replacement.clone());
             }
 
             let new_body = substitute_inner(body, &restricted, depth + 1, max_depth)?;
-            match formula {
-                Formula::Forall(..) => Ok(Formula::Forall(bindings.clone(), Box::new(new_body))),
-                Formula::Exists(..) => Ok(Formula::Exists(bindings.clone(), Box::new(new_body))),
-                _ => unreachable!(
-                    "quantifier branch only matches Formula::Forall or Formula::Exists"
-                ),
+            if is_forall {
+                Ok(Formula::Forall(bindings.clone(), Box::new(new_body)))
+            } else {
+                Ok(Formula::Exists(bindings.clone(), Box::new(new_body)))
             }
         }
 
@@ -312,6 +321,11 @@ fn substitute_inner(
         Formula::Store(arr, idx, val) => {
             Ok(Formula::Store(recurse_box(arr)?, recurse_box(idx)?, recurse_box(val)?))
         }
+        Formula::ConstArray { index_sort, elem_sort, value } => Ok(Formula::ConstArray {
+            index_sort: index_sort.clone(),
+            elem_sort: elem_sort.clone(),
+            value: recurse_box(value)?,
+        }),
         _ => Ok(formula.clone()),
     }
 }
@@ -347,56 +361,60 @@ pub fn simplify(formula: &Formula) -> Formula {
         }
 
         Formula::And(conjuncts) => {
-            let simplified: Vec<Formula> = conjuncts
-                .iter()
-                .map(simplify)
-                .flat_map(|f| {
-                    // Flatten nested And
-                    if let Formula::And(inner) = f { inner } else { vec![f] }
-                })
-                .filter(|f| !matches!(f, Formula::Bool(true)))
-                .collect();
-
-            // If any conjunct is false, the whole thing is false.
-            if simplified.iter().any(|f| matches!(f, Formula::Bool(false))) {
-                return Formula::Bool(false);
-            }
-            match simplified.len() {
-                0 => Formula::Bool(true),
-                1 =>
-                // SAFETY: match arm guarantees len == 1, so .next() returns Some.
-                {
-                    simplified
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(|| unreachable!("empty iter despite len == 1"))
+            let mut simplified: Vec<Formula> = Vec::with_capacity(conjuncts.len());
+            for c in conjuncts {
+                match simplify(c) {
+                    Formula::Bool(true) => {}
+                    Formula::Bool(false) => return Formula::Bool(false),
+                    Formula::And(inner) => {
+                        for item in inner {
+                            match item {
+                                Formula::Bool(true) => {}
+                                Formula::Bool(false) => return Formula::Bool(false),
+                                other => simplified.push(other),
+                            }
+                        }
+                    }
+                    other => simplified.push(other),
                 }
-                _ => Formula::And(simplified),
+            }
+            if simplified.is_empty() {
+                Formula::Bool(true)
+            } else if simplified.len() == 1
+                && let Some(single) = simplified.pop()
+            {
+                single
+            } else {
+                Formula::And(simplified)
             }
         }
 
         Formula::Or(disjuncts) => {
-            let simplified: Vec<Formula> = disjuncts
-                .iter()
-                .map(simplify)
-                .flat_map(|f| if let Formula::Or(inner) = f { inner } else { vec![f] })
-                .filter(|f| !matches!(f, Formula::Bool(false)))
-                .collect();
-
-            if simplified.iter().any(|f| matches!(f, Formula::Bool(true))) {
-                return Formula::Bool(true);
-            }
-            match simplified.len() {
-                0 => Formula::Bool(false),
-                1 =>
-                // SAFETY: match arm guarantees len == 1, so .next() returns Some.
-                {
-                    simplified
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(|| unreachable!("empty iter despite len == 1"))
+            let mut simplified: Vec<Formula> = Vec::with_capacity(disjuncts.len());
+            for d in disjuncts {
+                match simplify(d) {
+                    Formula::Bool(false) => {}
+                    Formula::Bool(true) => return Formula::Bool(true),
+                    Formula::Or(inner) => {
+                        for item in inner {
+                            match item {
+                                Formula::Bool(false) => {}
+                                Formula::Bool(true) => return Formula::Bool(true),
+                                other => simplified.push(other),
+                            }
+                        }
+                    }
+                    other => simplified.push(other),
                 }
-                _ => Formula::Or(simplified),
+            }
+            if simplified.is_empty() {
+                Formula::Bool(false)
+            } else if simplified.len() == 1
+                && let Some(single) = simplified.pop()
+            {
+                single
+            } else {
+                Formula::Or(simplified)
             }
         }
 
@@ -499,6 +517,7 @@ fn infer_var_sort(formula: &Formula, var_name: &str) -> Option<Sort> {
         Formula::Ite(c, t, e) | Formula::Store(c, t, e) => infer_var_sort(c, var_name)
             .or_else(|| infer_var_sort(t, var_name))
             .or_else(|| infer_var_sort(e, var_name)),
+        Formula::ConstArray { value, .. } => infer_var_sort(value, var_name),
 
         Formula::Forall(bindings, body) | Formula::Exists(bindings, body) => {
             // Check bindings first.
@@ -592,6 +611,63 @@ mod tests {
         ));
         assert!(matches!(
             SubstitutionMap::from_params_and_args(&bv_param, &[Formula::Int(1)]),
+            Err(SubstitutionError::SortMismatch { .. })
+        ));
+    }
+
+    /// A datatype's BY-NAME and FULL spellings are one SMT sort, so a call
+    /// whose datatype-sorted argument arrives in the shipped by-name form
+    /// (trust-ir-contract cuts every datatype-typed field, pattern binder and
+    /// `Sel::field_sort` that way) binds against a formal declared with the
+    /// full constructor list — and vice versa. Structural `!=` refused both.
+    /// Two DIFFERENT datatype names, and a scalar against a datatype, are
+    /// still refused.
+    #[test]
+    fn test_substitution_map_agrees_by_name_and_full_datatype_spellings() {
+        let level_ref = Sort::Datatype { name: "Level".to_string(), constructors: Vec::new() };
+        let level = Sort::Datatype {
+            name: "Level".to_string(),
+            constructors: vec![
+                ("zero".to_string(), Vec::new()),
+                ("succ".to_string(), vec![("pred".to_string(), level_ref.clone())]),
+            ],
+        };
+        let full_param = vec![("x".to_string(), level.clone())];
+        let ref_param = vec![("x".to_string(), level_ref.clone())];
+        let by_name_arg = Formula::Var("__fld_Succ_0".to_string(), level_ref.clone());
+        let full_arg = Formula::Var("l".to_string(), level.clone());
+
+        // A by-name argument binds a full-definition formal, and vice versa.
+        let map = SubstitutionMap::from_params_and_args(&full_param, &[by_name_arg.clone()])
+            .expect("one datatype, two spellings");
+        assert_eq!(map.len(), 1);
+        assert!(SubstitutionMap::from_params_and_args(&ref_param, &[full_arg.clone()]).is_ok());
+        // A constructor application carries its datatype sort and binds too.
+        let succ = Formula::Ctor {
+            ctor: "succ".to_string(),
+            args: vec![full_arg.clone()],
+            sort: level.clone(),
+        };
+        assert!(SubstitutionMap::from_params_and_args(&ref_param, &[succ]).is_ok());
+
+        // A DIFFERENT datatype name is still a mismatch, and so is a scalar.
+        let expr = Formula::Var(
+            "e".to_string(),
+            Sort::Datatype { name: "Expr".to_string(), constructors: Vec::new() },
+        );
+        assert!(matches!(
+            SubstitutionMap::from_params_and_args(&full_param, &[expr]),
+            Err(SubstitutionError::SortMismatch { .. })
+        ));
+        assert!(matches!(
+            SubstitutionMap::from_params_and_args(&full_param, &[Formula::Int(0)]),
+            Err(SubstitutionError::SortMismatch { .. })
+        ));
+        assert!(matches!(
+            SubstitutionMap::from_params_and_args(
+                &vec![("x".to_string(), Sort::Int)],
+                &[by_name_arg]
+            ),
             Err(SubstitutionError::SortMismatch { .. })
         ));
     }

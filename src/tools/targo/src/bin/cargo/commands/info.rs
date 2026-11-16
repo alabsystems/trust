@@ -1,7 +1,7 @@
 use anyhow::Context;
-use cargo::ops::info;
-use cargo::util::command_prelude::*;
 use cargo_util_schemas::core::PackageIdSpec;
+use targo::ops::info;
+use targo::util::command_prelude::*;
 
 pub fn cli() -> Command {
     Command::new("info")

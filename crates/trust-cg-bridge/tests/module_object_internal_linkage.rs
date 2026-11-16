@@ -72,6 +72,7 @@ fn wrap(name: &str, body: VerifiableBody) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -121,6 +122,7 @@ fn make_caller(name: &str, callee: &str) -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],

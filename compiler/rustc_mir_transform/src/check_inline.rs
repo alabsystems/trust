@@ -1,9 +1,9 @@
 //! Check that a body annotated with `#[rustc_force_inline]` will not fail to inline based on its
 //! definition alone (irrespective of any specific caller).
 
-use rustc_hir::attrs::InlineAttr;
+use rustc_attr_ir::{InlineAttr, find_attr};
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
-use rustc_hir::find_attr;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir::{Body, TerminatorKind};
 use rustc_middle::ty;
@@ -16,7 +16,7 @@ pub(super) struct CheckForceInline;
 impl<'tcx> MirLint<'tcx> for CheckForceInline {
     fn run_lint(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
         let def_id = body.source.def_id();
-        if !tcx.hir_body_owner_kind(def_id).is_fn_or_closure() || !def_id.is_local() {
+        if !def_id.is_local() || !tcx.hir_body_owner_kind(def_id).is_fn_or_closure() {
             return;
         }
         let InlineAttr::Force { attr_span, .. } = tcx.codegen_fn_attrs(def_id).inline else {
@@ -46,12 +46,22 @@ pub(super) fn is_inline_valid_on_fn<'tcx>(
         return Err("#[rustc_no_mir_inline]");
     }
 
-    let ty = tcx.type_of(def_id);
-    if match ty.instantiate_identity().skip_norm_wip().kind() {
-        ty::FnDef(..) => tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip().c_variadic(),
-        ty::Closure(_, args) => args.as_closure().sig().c_variadic(),
+    let c_variadic = match tcx.def_kind(def_id) {
+        DefKind::Fn | DefKind::AssocFn => {
+            tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip().c_variadic()
+        }
+        // Trust: `DefKind::Closure` also names coroutines and coroutine-closures
+        // (`async` blocks and closures), whose type is not `ty::Closure`; only a
+        // plain closure has a signature that can be C-variadic, as before 69d2b4c9a91.
+        DefKind::Closure => {
+            match *tcx.type_of(def_id).instantiate_identity().skip_norm_wip().kind() {
+                ty::Closure(_, args) => args.as_closure().sig().c_variadic(),
+                _ => false,
+            }
+        }
         _ => false,
-    } {
+    };
+    if c_variadic {
         return Err("C variadic");
     }
 

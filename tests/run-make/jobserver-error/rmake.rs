@@ -1,4 +1,4 @@
-// ignore-tidy-linelength
+// ignore-tidy-file-linelength
 //! If the environment variables contain an invalid `jobserver-auth`, this used to cause an ICE
 //! until this was fixed in [do not panic on failure to acquire jobserver token
 //! #109694](https://github.com/rust-lang/rust/pull/109694).
@@ -16,6 +16,7 @@ use run_make_support::{diff, rustc};
 
 fn main() {
     let out = rustc()
+        .edition("2015")
         .stdin_buf(("fn main() {}").as_bytes())
         .env("MAKEFLAGS", "--jobserver-auth=1000,1000")
         .run_fail()
@@ -23,6 +24,7 @@ fn main() {
     diff().expected_file("cannot_open_fd.stderr").actual_text("actual", out).run();
 
     let out = rustc()
+        .edition("2015")
         .stdin_buf(("fn main() {}").as_bytes())
         .input("-")
         .env("MAKEFLAGS", "--jobserver-auth=3,3")

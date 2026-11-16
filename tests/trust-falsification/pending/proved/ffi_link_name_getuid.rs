@@ -28,6 +28,8 @@ unsafe extern "C" {
 
 /// Effective-uid read via the aliased import.
 pub fn current_uid() -> u32 {
-    // SAFETY: getuid() is always safe — no failure mode, no args.
+    // getuid() is always safe — no failure mode, no args. Not marked as a SAFETY
+    // comment on purpose: one would declare this block (SAFETY-ASSUME-1), and
+    // certify would refuse the declaration instead of judging the aliased summary.
     unsafe { libc_getuid() }
 }

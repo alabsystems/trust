@@ -1,0 +1,48 @@
+{
+  "id": "h3-asm-output",
+  "class": "H3 (OPAQUE-ASM-OUTPUT)",
+  "title": "an asm! output kept its pre-asm value because the extractor drops asm operands",
+  "origin": [
+    "KH:23828, KH:23888-23893 (H3)",
+    "fix 50760a1f9c in c054d5b16f (fail-closed)",
+    "crates/trust-vcgen/tests/fixtures/ploss_adv/h3_asm.rs (h3a, h3c2)"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "h3a_out_bug",
+    "obligation": {
+      "kind": "bounds",
+      "at": "t[k]"
+    }
+  },
+  "twin": {
+    "function": "h3c2_fact_after_asm_ctl",
+    "obligation": {
+      "kind": "bounds",
+      "at": "t[k]"
+    }
+  },
+  "witness": {
+    "input": "n = 0 (any n); aarch64 only",
+    "observed": "index out of bounds: the len is 4 but the index is 4",
+    "exit": 101,
+    "main": "witness.rs",
+    "target_arch": "aarch64"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  },
+  "opt_levels": [
+    "0",
+    "1"
+  ],
+  "expected_refusal": {
+    "trust-vc-syn": {
+      "reproducer": "Unsupported asm!() in vc_extraction — unsupported macros are rejected",
+      "twin": "Unsupported asm!() in vc_extraction — unsupported macros are rejected"
+    }
+  }
+}

@@ -1,0 +1,384 @@
+{
+ "name": "bump_then_overwrite",
+ "def_path": "deref_store_reload::bump_then_overwrite",
+ "span": {
+  "file": "tests/data/deref_store_reload.rs",
+  "line_start": 23,
+  "col_start": 0,
+  "line_end": 27,
+  "col_end": 1
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Ref": {
+      "mutable": true,
+      "inner": {
+       "Int": {
+        "width": 64,
+        "signed": false
+       }
+      }
+     }
+    },
+    "name": "count"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": "v"
+   },
+   {
+    "index": 3,
+    "ty": {
+     "Tuple": [
+      {
+       "Int": {
+        "width": 64,
+        "signed": false
+       }
+      },
+      "Bool"
+     ]
+    },
+    "name": null
+   },
+   {
+    "index": 4,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 5,
+    "ty": {
+     "Tuple": [
+      {
+       "Int": {
+        "width": 64,
+        "signed": false
+       }
+      },
+      "Bool"
+     ]
+    },
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 3,
+        "projections": []
+       },
+       "rvalue": {
+        "CheckedBinaryOp": [
+         "Add",
+         {
+          "Copy": {
+           "local": 1,
+           "projections": [
+            "Deref"
+           ]
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            1,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 24,
+        "col_start": 4,
+        "line_end": 24,
+        "col_end": 15
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Move": {
+        "local": 3,
+        "projections": [
+         {
+          "Field": 1
+         }
+        ]
+       }
+      },
+      "expected": false,
+      "msg": {
+       "Overflow": "Add"
+      },
+      "target": 1,
+      "span": {
+       "file": "tests/data/deref_store_reload.rs",
+       "line_start": 24,
+       "col_start": 4,
+       "line_end": 24,
+       "col_end": 15
+      },
+      "unwind": "Continue"
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 1,
+        "projections": [
+         "Deref"
+        ]
+       },
+       "rvalue": {
+        "Use": {
+         "Move": {
+          "local": 3,
+          "projections": [
+           {
+            "Field": 0
+           }
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 24,
+        "col_start": 4,
+        "line_end": 24,
+        "col_end": 15
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 1,
+        "projections": [
+         "Deref"
+        ]
+       },
+       "rvalue": {
+        "Use": {
+         "Copy": {
+          "local": 2,
+          "projections": []
+         }
+        }
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 25,
+        "col_start": 4,
+        "line_end": 25,
+        "col_end": 14
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 4,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Copy": {
+          "local": 1,
+          "projections": [
+           "Deref"
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 26,
+        "col_start": 4,
+        "line_end": 26,
+        "col_end": 10
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 5,
+        "projections": []
+       },
+       "rvalue": {
+        "CheckedBinaryOp": [
+         "Sub",
+         {
+          "Copy": {
+           "local": 4,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            1,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 26,
+        "col_start": 4,
+        "line_end": 26,
+        "col_end": 14
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Move": {
+        "local": 5,
+        "projections": [
+         {
+          "Field": 1
+         }
+        ]
+       }
+      },
+      "expected": false,
+      "msg": {
+       "Overflow": "Sub"
+      },
+      "target": 2,
+      "span": {
+       "file": "tests/data/deref_store_reload.rs",
+       "line_start": 26,
+       "col_start": 4,
+       "line_end": 26,
+       "col_end": 14
+      },
+      "unwind": "Continue"
+     }
+    }
+   },
+   {
+    "id": 2,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 0,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Move": {
+          "local": 5,
+          "projections": [
+           {
+            "Field": 0
+           }
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 26,
+        "col_start": 4,
+        "line_end": 26,
+        "col_end": 14
+       }
+      }
+     }
+    ],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 2,
+  "return_ty": {
+   "Int": {
+    "width": 64,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "v",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "v",
+        "Int"
+       ]
+      },
+      {
+       "Int": 18446744073709551615
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

@@ -138,7 +138,8 @@ Options:
   --manifest-path <path>  Analyze a specific hardened example Cargo.toml
   --format <terminal|json>  Output format (terminal default)
   --json                  Alias for --format json
-  --show-vcs              Include raw analyzer VCs in terminal/JSON output
+  --show-vcs              Include analyzer VCs: the raw set in JSON output, the
+                          hardened-kind ones in terminal output
   --help                  Show this help
 
 Examples:

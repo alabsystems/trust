@@ -1,0 +1,9 @@
+// An upstream crate NAMED `libc` whose declarations are not libc's: one links another
+// symbol under a modeled name, one a modeled symbol under another name.
+#![crate_type = "rlib"]
+unsafe extern "C" {
+    #[link_name = "getppid"]
+    pub fn getpid() -> i32;
+    #[link_name = "getsid"]
+    pub fn session_of(pid: i32) -> i32;
+}

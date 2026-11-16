@@ -398,6 +398,7 @@ mod record_witness_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -617,6 +618,7 @@ mod record_witness_tests {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         unwind: UnwindEdge::default(),
                     },
                 },
@@ -820,7 +822,7 @@ fn current_fieldless_enum_ty() -> trust_types::Ty {
         ],
     );
     let Ty::Adt { fields, .. } = &mut ty else { unreachable!() };
-    fields.push(("__tag".into(), Ty::isize()));
+    fields.make_mut().push(("__tag".into(), Ty::isize()));
     ty
 }
 
@@ -866,6 +868,7 @@ fn fieldless_clone_func(ty: trust_types::Ty) -> trust_types::VerifiableFunction 
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -934,6 +937,7 @@ fn fieldless_eq_func(ty: trust_types::Ty) -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -966,25 +970,25 @@ fn fieldless_enum_recognizers_require_explicit_nullary_variants() {
     // payload, even if a forged flattened view contains only `__tag`.
     let mut payload = current_fieldless_enum_ty();
     let trust_types::Ty::Adt { variants, .. } = &mut payload else { unreachable!() };
-    variants[0].fields.push(("0".into(), trust_types::Ty::u8()));
+    variants.make_mut()[0].fields.push(("0".into(), trust_types::Ty::u8()));
     assert!(explicit_fieldless_enum_ty(&payload).is_none());
 
     let mut duplicate_tag = current_fieldless_enum_ty();
     let trust_types::Ty::Adt { variants, .. } = &mut duplicate_tag else { unreachable!() };
-    variants[1].discriminant = variants[0].discriminant;
+    variants.make_mut()[1].discriminant = variants[0].discriminant;
     assert!(explicit_fieldless_enum_ty(&duplicate_tag).is_none());
 
     let mut unsigned_tag = current_fieldless_enum_ty();
     let trust_types::Ty::Adt { fields, .. } = &mut unsigned_tag else { unreachable!() };
-    fields[0].1 = trust_types::Ty::u64();
+    fields.make_mut()[0].1 = trust_types::Ty::u64();
     assert!(explicit_fieldless_enum_ty(&unsigned_tag).is_none());
 
     let mut out_of_range_tag = current_fieldless_enum_ty();
     let trust_types::Ty::Adt { fields, variants, .. } = &mut out_of_range_tag else {
         unreachable!()
     };
-    fields[0].1 = trust_types::Ty::i8();
-    variants[1].discriminant = 128;
+    fields.make_mut()[0].1 = trust_types::Ty::i8();
+    variants.make_mut()[1].discriminant = 128;
     assert!(explicit_fieldless_enum_ty(&out_of_range_tag).is_none());
 
     let mut move_from_shared = fieldless_clone_func(current_fieldless_enum_ty());
@@ -1033,7 +1037,7 @@ fn fieldless_eq_recognizer_requires_exact_ordered_skeleton() {
         unreachable!()
     };
     let trust_types::Ty::Adt { variants, .. } = inner.as_mut() else { unreachable!() };
-    variants[1].discriminant = 7;
+    variants.make_mut()[1].discriminant = 7;
     assert!(sem_fieldless_enum_eq_shape_of(&mismatched_enum).is_none());
 }
 
@@ -1070,35 +1074,35 @@ fn fieldless_then_recognizer_rejects_type_metadata_near_misses() {
     let mut legacy = baseline.clone();
     let mut legacy_ty = legacy.body.return_ty.clone();
     let trust_types::Ty::Adt { variants, .. } = &mut legacy_ty else { unreachable!() };
-    variants.clear();
+    variants.make_mut().clear();
     replace_then_value_type(&mut legacy, legacy_ty);
     assert!(sem_fieldless_enum_then_shape_of(&legacy).is_none());
 
     let mut payload = baseline.clone();
     let mut payload_ty = payload.body.return_ty.clone();
     let trust_types::Ty::Adt { variants, .. } = &mut payload_ty else { unreachable!() };
-    variants[0].fields.push(("0".into(), trust_types::Ty::u8()));
+    variants.make_mut()[0].fields.push(("0".into(), trust_types::Ty::u8()));
     replace_then_value_type(&mut payload, payload_ty);
     assert!(sem_fieldless_enum_then_shape_of(&payload).is_none());
 
     let mut duplicate = baseline.clone();
     let mut duplicate_ty = duplicate.body.return_ty.clone();
     let trust_types::Ty::Adt { variants, .. } = &mut duplicate_ty else { unreachable!() };
-    variants[1].discriminant = variants[0].discriminant;
+    variants.make_mut()[1].discriminant = variants[0].discriminant;
     replace_then_value_type(&mut duplicate, duplicate_ty);
     assert!(sem_fieldless_enum_then_shape_of(&duplicate).is_none());
 
     let mut unsigned_marker = baseline.clone();
     let mut unsigned_ty = unsigned_marker.body.return_ty.clone();
     let trust_types::Ty::Adt { fields, .. } = &mut unsigned_ty else { unreachable!() };
-    fields[0].1 = trust_types::Ty::u64();
+    fields.make_mut()[0].1 = trust_types::Ty::u64();
     replace_then_value_type(&mut unsigned_marker, unsigned_ty);
     assert!(sem_fieldless_enum_then_shape_of(&unsigned_marker).is_none());
 
     let mut mismatched_param = baseline.clone();
     let mut other_ty = mismatched_param.body.locals[2].ty.clone();
     let trust_types::Ty::Adt { variants, .. } = &mut other_ty else { unreachable!() };
-    variants[2].discriminant = 7;
+    variants.make_mut()[2].discriminant = 7;
     mismatched_param.body.locals[2].ty = other_ty;
     assert!(sem_fieldless_enum_then_shape_of(&mismatched_param).is_none());
 
@@ -1277,6 +1281,7 @@ fn to_ascii_chain_body(
                     is_foreign: false,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                 },
             },
             BasicBlock {
@@ -1355,6 +1360,7 @@ fn to_ascii_chain_func(
         preconditions: vec![],
         postconditions: vec![],
         spec: trust_types::FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1436,6 +1442,7 @@ fn call_term(
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
     }
 }
 /// The `min_max_i32` two-call chain body: `_4 := min(_1,_2); _0 := max(_4,_3);
@@ -1513,6 +1520,7 @@ fn min_max_func(extra_use: bool, reassign_mid: bool) -> trust_types::VerifiableF
         ],
         postconditions: vec![],
         spec: trust_types::FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1664,6 +1672,7 @@ fn overflowing_body(field: usize) -> trust_types::VerifiableFunction {
         preconditions: vec![int_range_conjunct("a", 0, 255), int_range_conjunct("b", 0, 255)],
         postconditions: vec![],
         spec: trust_types::FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 fn overflowing_registry() -> std::collections::BTreeMap<String, CalleeFact> {
@@ -3308,10 +3317,10 @@ fn sem_operand_of_mir_recognizes_deref_self_and_declines_others() {
     let mut_ref = || Ty::Ref { mutable: true, inner: Box::new(u8t()) };
     let struct_ref = || Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None, validity_wrapper: None,  adt_kind: None, layout: None,
             name: "S".into(),
-            fields: vec![("0".into(), u8t())],
-            variants: vec![],
+            fields: vec![("0".into(), u8t())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -4105,6 +4114,7 @@ fn deref_self_declines_a_call_dest_write_through_the_reference() {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                 },
             },
@@ -4251,6 +4261,7 @@ fn ts_is_even_shape_certifies_end_to_end() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let param_index = |local: usize| -> Option<u64> { (local == 1).then_some(0) };
 
@@ -4321,6 +4332,7 @@ fn u8_is_ascii_shape_certifies_end_to_end_via_deref_self_and_compare_as_value() 
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let param_index = |local: usize| -> Option<u64> { (local == 1).then_some(0) };
 
@@ -4480,6 +4492,7 @@ fn u8_range_predicate_join_temp_body(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -5470,6 +5483,7 @@ fn flat_bitor_shape_certifies_end_to_end() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let param_index = |local: usize| -> Option<u64> { (local == 1).then_some(0) };
 
@@ -5699,6 +5713,7 @@ fn sem_guarded_local_value_declines_adversarial_probes() {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
             },
         });
         let body = VerifiableBody {
@@ -6435,6 +6450,7 @@ fn guarded_local_bitor_shape_certifies_end_to_end() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let cert = function_fully_faithful_witness(&func)
@@ -6736,6 +6752,7 @@ fn decision_dag_declines_adversarial_probes() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let cmp_assign = |tmp: usize, k: u128| Statement::Assign {
         place: Place::local(tmp),
@@ -7509,6 +7526,7 @@ fn cast_assignment_destination_type_mismatch_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let param_index = |local: usize| (local == 1).then_some(0);
     assert!(sem_return_of_mir(&func, &param_index).is_none());
@@ -7724,6 +7742,7 @@ fn literal_shift_in_range_fully_faithful_and_oob_literal_stays_open() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     // IN-RANGE: the composed witness mints AND the discharge closes ⇒ the
     // production FF gate (witness && discharge) holds.
@@ -7941,6 +7960,7 @@ fn nested_cast_source_defined_after_use_declines_at_production_site() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let param_index = |local: usize| (local == 1).then_some(0);
     assert!(sem_return_of_mir(&func, &param_index).is_none());
@@ -8051,6 +8071,7 @@ fn w11_float_cast_return_func(
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -8202,6 +8223,7 @@ fn identity_return_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -8245,6 +8267,7 @@ fn inc_return_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -8300,10 +8323,10 @@ fn field_read_cast_leaf_func(
     let u32t = || Ty::Int { width: 32, signed: false };
     let self_ty = Ty::Ref {
         mutable: self_mutable,
-        inner: Box::new(Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None, validity_wrapper: None,  adt_kind: None, layout: None,
             name: "test::S".into(),
-            fields: vec![("0".into(), u32t())],
-            variants: vec![],
+            fields: vec![("0".into(), u32t())].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -8346,6 +8369,7 @@ fn field_read_cast_leaf_func(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -8432,6 +8456,7 @@ fn div_return_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -8983,6 +9008,7 @@ fn pick_call_func() -> trust_types::VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -9000,6 +9026,7 @@ fn pick_call_func() -> trust_types::VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -9013,6 +9040,7 @@ fn pick_call_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -9181,6 +9209,7 @@ fn sem_call_return_of_mir_admits_a_guard_but_not_a_join() {
         is_unsafe_sig: false,
         is_foreign: false,
         callee_identity: None,
+        callee_key: None,
     };
     assert!(
         sem_call_return_of_mir(&build(panic_arm), &registry).is_some(),
@@ -9238,6 +9267,7 @@ fn sem_call_return_of_mir_treats_a_diverging_call_as_a_sink() {
         is_unsafe_sig: false,
         is_foreign: false,
         callee_identity: None,
+        callee_key: None,
     };
 
     let mut registry = std::collections::BTreeMap::new();
@@ -9428,6 +9458,7 @@ fn unguarded_index_bounds_vc_not_discharged_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(
         function_fully_faithful_witness(&func).is_none(),
@@ -9638,6 +9669,7 @@ fn guarded_div_cf_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -10049,17 +10081,19 @@ fn transparent_unwrap_multihop_field_return_certifies() {
     let u8t = || Ty::Int { width: 8, signed: false };
     let adt = |name: &str, fields: Vec<(String, Ty)>, variants_nonempty: bool| Ty::Adt {
         name: name.into(),
-        fields,
+        fields: fields.into(),
         variants: if variants_nonempty {
             vec![trust_types::VariantDef { name: "V".into(), discriminant: 0, fields: vec![] }]
+                .into()
         } else {
-            vec![]
+            vec![].into()
         },
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
         arbitrary_precision: None,
+        validity_wrapper: None,
         adt_kind: Some(trust_types::AdtKind::Struct),
     };
     let chain = |variant: &str| -> Ty {
@@ -10131,6 +10165,7 @@ fn transparent_unwrap_multihop_field_return_certifies() {
             preconditions: vec![],
             postconditions: vec![],
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     };
     let ok = build("ok");
@@ -10610,6 +10645,7 @@ fn sem_cf_return_of_mir_recognizes_conjunctive_guard() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let param_index =
         |local: usize| -> Option<u64> { (1..=2).contains(&local).then(|| (local - 1) as u64) };
@@ -10679,7 +10715,7 @@ fn either_is_left_shaped_func() -> trust_types::VerifiableFunction {
     };
     let either_ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None, validity_wrapper: None,  adt_kind: None, layout: None,
             name: "Either".to_string(),
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -10697,8 +10733,9 @@ fn either_is_left_shaped_func() -> trust_types::VerifiableFunction {
                         detail: "generic parameter R/#1 needs monomorphization".into(),
                     },
                 ),
-            ],
-            variants: vec![],
+            ]
+            .into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -10762,6 +10799,7 @@ fn either_is_left_shaped_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -10826,10 +10864,10 @@ fn discriminant_base_accepts_only_validated_enum_representations() {
         *inner = Box::new(ty);
     };
     let tag = || ("__tag".into(), Ty::Int { width: 64, signed: true });
-    let legacy = |fields| Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
+    let legacy = |fields| Ty::Adt { arbitrary_precision: None, validity_wrapper: None,  adt_kind: None, layout: None,
         name: "MaybeEnum".into(),
         fields,
-        variants: vec![],
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -10837,19 +10875,22 @@ fn discriminant_base_accepts_only_validated_enum_representations() {
     let malformed = [
         ("scalar", Ty::Int { width: 64, signed: true }),
         ("ordinary struct", Ty::adt("S", vec![("value".into(), Ty::Bool)])),
-        ("tag only", legacy(vec![tag()])),
+        ("tag only", legacy(vec![tag()].into())),
         (
             "unsigned tag",
-            legacy(vec![
-                ("__tag".into(), Ty::Int { width: 64, signed: false }),
-                ("__v0_0".into(), Ty::Bool),
-            ]),
+            legacy(
+                vec![
+                    ("__tag".into(), Ty::Int { width: 64, signed: false }),
+                    ("__v0_0".into(), Ty::Bool),
+                ]
+                .into(),
+            ),
         ),
-        ("noncanonical payload name", legacy(vec![tag(), ("value".into(), Ty::Bool)])),
-        ("gapped payload positions", legacy(vec![tag(), ("__v0_1".into(), Ty::Bool)])),
+        ("noncanonical payload name", legacy(vec![tag(), ("value".into(), Ty::Bool)].into())),
+        ("gapped payload positions", legacy(vec![tag(), ("__v0_1".into(), Ty::Bool)].into())),
         (
             "duplicate parsed payload position",
-            legacy(vec![tag(), ("__v0_0".into(), Ty::Bool), ("__v00_0".into(), Ty::Bool)]),
+            legacy(vec![tag(), ("__v0_0".into(), Ty::Bool), ("__v00_0".into(), Ty::Bool)].into()),
         ),
     ];
     for (label, ty) in malformed {
@@ -10994,13 +11035,14 @@ fn bound_matches_shaped_func(k: u128, tag_true: bool) -> trust_types::Verifiable
         Ty, VariantDef, VerifiableBody, VerifiableFunction,
     };
     let i32t = Ty::Int { width: 32, signed: true };
-    let bound_ty = Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
+    let bound_ty = Ty::Adt { arbitrary_precision: None, validity_wrapper: None,  adt_kind: None, layout: None,
         name: "std::ops::Bound".to_string(),
         fields: vec![
             ("__tag".to_string(), Ty::Int { width: 64, signed: true }),
             ("__v0_0".to_string(), i32t.clone()),
             ("__v1_0".to_string(), i32t.clone()),
-        ],
+        ]
+        .into(),
         variants: vec![
             VariantDef {
                 name: "Included".to_string(),
@@ -11013,7 +11055,8 @@ fn bound_matches_shaped_func(k: u128, tag_true: bool) -> trust_types::Verifiable
                 fields: vec![("0".to_string(), i32t.clone())],
             },
             VariantDef { name: "Unbounded".to_string(), discriminant: 2, fields: vec![] },
-        ],
+        ]
+        .into(),
         disc_index_safe: true,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -11081,6 +11124,7 @@ fn bound_matches_shaped_func(k: u128, tag_true: bool) -> trust_types::Verifiable
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -11257,10 +11301,10 @@ fn capped_count_shaped_func() -> trust_types::VerifiableFunction {
     let u64t = Ty::Int { width: 64, signed: false };
     let ref_to = |name: &str, field_ty: Ty| Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None, validity_wrapper: None,  adt_kind: None, layout: None,
             name: name.to_string(),
-            fields: vec![("padding".into(), Ty::Unit), ("value".into(), field_ty)],
-            variants: vec![],
+            fields: vec![("padding".into(), Ty::Unit), ("value".into(), field_ty)].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -11320,6 +11364,7 @@ fn capped_count_shaped_func() -> trust_types::VerifiableFunction {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -11332,6 +11377,7 @@ fn capped_count_shaped_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -11451,6 +11497,7 @@ fn char_is_ascii_leaf_func() -> trust_types::VerifiableFunction {
         preconditions: vec![char_validity_fact("_3")],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -11648,7 +11695,7 @@ fn either_is_right_shaped_func() -> trust_types::VerifiableFunction {
     };
     let either_ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None, validity_wrapper: None,  adt_kind: None, layout: None,
             name: "Either".to_string(),
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -11666,8 +11713,9 @@ fn either_is_right_shaped_func() -> trust_types::VerifiableFunction {
                         detail: "generic parameter R/#1 needs monomorphization".into(),
                     },
                 ),
-            ],
-            variants: vec![],
+            ]
+            .into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -11698,6 +11746,7 @@ fn either_is_right_shaped_func() -> trust_types::VerifiableFunction {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock {
@@ -11718,6 +11767,7 @@ fn either_is_right_shaped_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -11978,6 +12028,7 @@ fn ordering_as_raw_shaped_func(variant_count: usize) -> trust_types::VerifiableF
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -12273,6 +12324,7 @@ fn optres_is_some_shaped_func(tag_k: i128) -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -12333,6 +12385,7 @@ fn optres_is_none_shaped_func(tag_k: i128) -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -12484,6 +12537,7 @@ fn optres_plain_param_compare_is_not_a_tag_read() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let ret =
         sem_return_of_mir(&func, &optres_param_index).expect("plain param compare recognizes");
@@ -12669,6 +12723,7 @@ fn sem_return_requires_exact_reachable_contract_wrapper() {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
             },
         };
         let ret = BasicBlock {
@@ -12707,6 +12762,7 @@ fn sem_return_requires_exact_reachable_contract_wrapper() {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     };
     let no_params = |_: usize| None;
@@ -12756,6 +12812,7 @@ fn sem_return_requires_exact_reachable_contract_wrapper() {
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
     };
     nested.body.blocks.push(BasicBlock {
         id: BlockId(2),
@@ -12856,6 +12913,7 @@ fn wlen_slice_is_empty_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -12905,6 +12963,7 @@ fn wlen_str_len_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -12970,12 +13029,25 @@ fn wlen_str_len_certifies_through_same_fat_pointer_cast() {
         .expect("str::len must certify its contract through the verified cast");
     assert!(cert.is_modulo_3());
     assert!(matches!(cert.ret, ReturnCertificate::StraightLine(_)));
+    // MEASURED 2026-09-14 — the tier IS recovered. `315db2a0a6` (2026-09-12,
+    // "feat(vcgen): model the three defined casts std's format_args! emits at -O")
+    // put all three cast accept-lists in step, and the same-fat-type reinterpret
+    // cast no longer mints a declined row: `function_emits_declined_vc` is false for
+    // this body, clause (b) has nothing to refuse, and the whole-function witness
+    // mints on the SAME filtered obligation set the contract axis already certified
+    // (no safety VC — a metadata read raises none). The deferral above was named and
+    // one-sided by design; this is the flip it named, pinned in the recovered
+    // direction. A declined row reappearing here is a vcgen cast-list regression.
     assert!(
-        function_fully_faithful_witness(&func).is_none(),
-        "str::len carries a DECLINED `Rvalue::Cast` row, so the WHOLE-FUNCTION tier must \
-         refuse; if vcgen learns to model a source==destination cast this flips and the \
-         tier is recovered — update this assertion then, do not weaken the gate"
+        !crate::mirsem::function_emits_declined_vc(&func),
+        "str::len's same-fat-type reinterpret cast is MODELED (vcgen 315db2a0a6); a \
+         declined `Rvalue::Cast` row here is a cast accept-list regression"
     );
+    let full = function_fully_faithful_witness(&func)
+        .expect("str::len must mint a fully-faithful cert once the cast is modeled");
+    assert!(full.is_modulo_3());
+    assert!(full.safety.is_none(), "a metadata read through a modeled cast raises NO safety VC");
+    assert!(matches!(full.contract.ret, ReturnCertificate::StraightLine(_)));
 }
 
 #[test]
@@ -13121,6 +13193,7 @@ fn wlen_ptr_metadata_of_non_param_temp_declines() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(
         sem_return_of_mir(&func, &wlen_param_index).is_none(),
@@ -13266,28 +13339,26 @@ fn real_slice_len_isempty_leaves_are_fully_faithful() {
         // source and destination types are equal (`generate/slice_conversion.rs`), and
         // these two flip back. Do NOT recover them by teaching this gate to ignore the
         // emitter.
+        //
+        // MEASURED 2026-09-14 — the split CLOSED from the vcgen side, exactly as the
+        // deferral named: `315db2a0a6` (2026-09-12) models the same-fat-type
+        // reinterpret cast in all three accept-lists, so the two `str` leaves no
+        // longer carry a declined row and the corpus is uniform again. Pinned in the
+        // recovered direction: a declined row on ANY of the three is a cast
+        // accept-list regression, and the gate itself is untouched.
         let declines = crate::mirsem::function_emits_declined_vc(func);
-        assert_eq!(
-            declines,
-            name.starts_with("core::str::"),
-            "{name}: exactly the two `str` leaves carry the declined reinterpret-cast row"
+        assert!(
+            !declines,
+            "{name}: the same-fat-type reinterpret cast is MODELED (vcgen 315db2a0a6); a \
+             declined row here is a cast accept-list regression"
         );
-        let witness = function_fully_faithful_witness(func);
-        if declines {
-            assert!(
-                witness.is_none(),
-                "{name} carries a DECLINED `Rvalue::Cast` row, so the whole-function tier \
-                 must refuse"
-            );
-            // The CONTRACT axis is untouched — the reflection is still kernel-adequate.
-            let cert = function_adequacy_witness(func)
-                .unwrap_or_else(|| panic!("{name}'s contract adequacy must still certify"));
-            assert!(cert.is_modulo_3(), "{name}'s contract certificate must be modulo 3");
-            assert!(matches!(cert.ret, ReturnCertificate::StraightLine(_)));
-            continue;
-        }
-        let cert =
-            witness.unwrap_or_else(|| panic!("{name} must be fully faithful (len/is_empty leaf)"));
+        // The CONTRACT axis still certifies on its own — the reflection is kernel-adequate.
+        let adequacy = function_adequacy_witness(func)
+            .unwrap_or_else(|| panic!("{name}'s contract adequacy must certify"));
+        assert!(adequacy.is_modulo_3(), "{name}'s contract certificate must be modulo 3");
+        assert!(matches!(adequacy.ret, ReturnCertificate::StraightLine(_)));
+        let cert = function_fully_faithful_witness(func)
+            .unwrap_or_else(|| panic!("{name} must be fully faithful (len/is_empty leaf)"));
         assert!(cert.is_modulo_3(), "{name}'s certificate must be modulo 3");
         assert!(cert.safety.is_none(), "{name}: a metadata read + compare raises no safety VC");
         assert!(
@@ -13545,6 +13616,7 @@ fn function_adequacy_witness_fails_closed_on_unmodeled_return_rvalue() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(
         function_adequacy_witness(&func).is_none(),
@@ -13599,6 +13671,7 @@ fn signed_rem_return_composes_adequacy_but_stays_open() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(
         function_adequacy_witness(&func).is_some(),
@@ -13642,6 +13715,7 @@ fn function_adequacy_witness_fails_closed_on_unmodeled_function() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(
         function_adequacy_witness(&func).is_none(),
@@ -13878,6 +13952,7 @@ fn unsigned_var_mul_record_certifies_adequacy_discharge_still_refuses() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = trust_vcgen::generate_vcs(&func);
     assert!(
@@ -13953,6 +14028,7 @@ fn const_multiplier_unsigned_mul_certifies_adequacy() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let certs = function_safety_vcs_faithful(&func)
         .expect("a constant-multiplier unsigned-mul VC certifies adequate (LIA Gt(Mul,MAX))");
@@ -14163,6 +14239,7 @@ fn u32_add_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -14218,6 +14295,7 @@ fn function_safety_vc_faithful_fails_closed_on_signed_add() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(function_uadd_overflow_widths(&func).is_empty(), "signed add is out of fragment");
     assert!(
@@ -14538,6 +14616,7 @@ fn i32_add_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -14667,6 +14746,7 @@ fn signed_mul_fails_closed_deferred_gap() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     // The emitter DOES raise a signed-mul ArithmeticOverflow VC.
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -14796,6 +14876,7 @@ fn neg_func(width: u32) -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -15090,6 +15171,7 @@ fn shift_func(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -15434,6 +15516,7 @@ fn const_shift_func(amount_signed: bool) -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -15605,6 +15688,7 @@ fn formula_aware_certifies_overflow_with_constant_operand() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let certs = function_safety_vcs_faithful(&func)
         .expect("`x + 1` signed overflow VC must certify (const operand grounds live)");
@@ -15983,6 +16067,7 @@ fn idx_array_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -16026,6 +16111,7 @@ fn div_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -16140,6 +16226,7 @@ fn u32_sub_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -16184,6 +16271,7 @@ fn u32_rem_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -16454,6 +16542,7 @@ fn function_safety_vcs_faithful_certifies_pure_division() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let certs = function_safety_vcs_faithful(&func)
         .expect("a `%` function's rem-by-zero VC is certified adequate");
@@ -16971,7 +17060,7 @@ fn call_arg_shared_field_admits_only_exact_u64_newtype() {
         let Ty::Adt { fields, .. } = inner.as_mut() else {
             panic!("Expr receiver must stay an ADT")
         };
-        fields[1].1 = meta;
+        fields.make_mut()[1].1 = meta;
     };
     let mut layout_marked =
         Ty::adt("expr::meta::ExprMeta", vec![("0".into(), Ty::Int { width: 64, signed: false })]);
@@ -17149,6 +17238,7 @@ fn call_then_pureop_field_definition_must_precede_comparison() {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock {
@@ -17173,6 +17263,7 @@ fn call_then_pureop_field_definition_must_precede_comparison() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let mut registry = std::collections::BTreeMap::new();
     registry.insert(
@@ -20801,6 +20892,7 @@ fn param_reassigned_by_stmt_flags_call_dest_write() {
                 atomic: None,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 is_foreign: false,
             },
         }],
@@ -20869,10 +20961,10 @@ fn call_arg_opaque_enum_is_narrow_and_reassignment_safe() {
     for bad_ty in [
         Ty::adt("S", vec![("value".into(), Ty::Bool)]),
         Ty::Unsupported { kind: "opaque".into(), detail: "not an enum".into() },
-        Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
+        Ty::Adt { arbitrary_precision: None, validity_wrapper: None,  adt_kind: None, layout: None,
             name: "Fake".into(),
-            fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })],
-            variants: vec![],
+            fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
@@ -20937,6 +21029,7 @@ fn call_arg_opaque_enum_is_narrow_and_reassignment_safe() {
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         is_foreign: false,
     };
     assert_eq!(
@@ -21097,6 +21190,7 @@ fn half_promotion_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -21110,16 +21204,16 @@ fn remap_result_error_discriminants(
     };
     assert_eq!(name, "core::result::Result");
     assert_eq!(variants.len(), result_discriminants.len());
-    for (variant, discriminant) in variants.iter_mut().zip(result_discriminants) {
+    for (variant, discriminant) in variants.make_mut().iter_mut().zip(result_discriminants) {
         variant.discriminant = discriminant;
     }
-    let (_, nested_ty) = variants[1].fields.get_mut(0).expect("Err payload type");
+    let (_, nested_ty) = variants.make_mut()[1].fields.get_mut(0).expect("Err payload type");
     let trust_types::Ty::Adt { name, variants, .. } = nested_ty else {
         panic!("expected Error enum type")
     };
     assert_eq!(name, "Error");
     assert_eq!(variants.len(), error_discriminants.len());
-    for (variant, discriminant) in variants.iter_mut().zip(error_discriminants) {
+    for (variant, discriminant) in variants.make_mut().iter_mut().zip(error_discriminants) {
         variant.discriminant = discriminant;
     }
 }
@@ -21130,7 +21224,7 @@ fn remap_error_discriminants(ty: &mut trust_types::Ty, discriminants: [i128; 4])
     };
     assert_eq!(name, "Error");
     assert_eq!(variants.len(), discriminants.len());
-    for (variant, discriminant) in variants.iter_mut().zip(discriminants) {
+    for (variant, discriminant) in variants.make_mut().iter_mut().zip(discriminants) {
         variant.discriminant = discriminant;
     }
 }
@@ -21303,6 +21397,7 @@ fn slice_first_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -21397,6 +21492,7 @@ fn slice_get_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -22026,7 +22122,7 @@ fn sem_adt_return_opaque_declines_float_guard_operands() {
     let Ty::Adt { fields, .. } = inner.as_mut() else {
         panic!("lifter self referent must be an ADT")
     };
-    fields[0].1 = Ty::Float { width: 64 };
+    fields.make_mut()[0].1 = Ty::Float { width: 64 };
     assert!(
         crate::assignment_types::all_assignments_match(&func.body),
         "the adversarial float comparison remains well typed"
@@ -22087,6 +22183,7 @@ fn sem_adt_return_opaque_declines_nonterminal_field_ref_call() {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
         },
     });
     let trust_types::Statement::Assign { rvalue, .. } = &mut func.body.blocks[3].stmts[0] else {
@@ -22120,7 +22217,7 @@ fn sem_adt_return_opaque_declines_non_shared_field_snapshots() {
         let Ty::Adt { fields, .. } = self_ty.as_mut() else {
             panic!("self referent must be an ADT")
         };
-        fields[1].1 = field_ty.clone();
+        fields.make_mut()[1].1 = field_ty.clone();
         func.body.locals[7].ty = field_ty;
         assert!(trust_vcgen::validate_function(&func).is_ok(), "{case}");
         assert!(crate::assignment_types::all_assignments_match(&func.body), "{case}");
@@ -22240,9 +22337,9 @@ fn sem_adt_return_opaque_declines_guard_newtype_width_or_layout_drift() {
             };
             let Ty::Adt { fields, .. } = ty else { panic!("FVarId must be an ADT") };
             if case == "width" {
-                fields[0].1 = Ty::Int { width: 32, signed: false };
+                fields.make_mut()[0].1 = Ty::Int { width: 32, signed: false };
             } else {
-                fields[0].0 = "different_layout_field".into();
+                fields.make_mut()[0].0 = "different_layout_field".into();
             }
         }
         assert!(trust_vcgen::validate_function(&func).is_ok(), "{case}");
@@ -22313,6 +22410,7 @@ fn sem_adt_return_opaque_declines_non_guard_origin_ref_call() {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
             },
         },
     );
@@ -22707,6 +22805,7 @@ fn scalar_sentinel_select_declines_empty_body() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(
         sem_scalar_sentinel_select_shape_of(&empty).is_none(),
@@ -22742,7 +22841,9 @@ fn sem_adt_return_opaque_declines_option_discriminant_metadata_drift() {
     let mut func = abstractor_fold_fvar_opt_func();
     let remap = |ty: &mut trust_types::Ty| {
         let trust_types::Ty::Adt { variants, .. } = ty else { panic!("expected Option enum type") };
-        let [none, some] = variants.as_mut_slice() else { panic!("expected None/Some variants") };
+        let [none, some] = variants.make_mut().as_mut_slice() else {
+            panic!("expected None/Some variants")
+        };
         none.discriminant = 10;
         some.discriminant = 20;
     };
@@ -22926,6 +23027,7 @@ fn sem_adt_return_shape_of_composes_with_discriminant_guard() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let shape = sem_adt_return_shape_of(&func)
         .expect("a discriminant-guarded ADT-return must recognize (composition)");
@@ -23149,6 +23251,7 @@ fn from_signed_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -23545,6 +23648,7 @@ fn reverse_switch3_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -23845,6 +23949,7 @@ fn cmp_binop_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -24052,6 +24157,7 @@ fn is_ascii_whitespace_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -25388,15 +25494,26 @@ fn ref_self_probe_enum_ty() -> trust_types::Ty {
             ("__tag".into(), i64t.clone()),
             ("__v0_0".into(), i64t.clone()),
             ("__v1_0".into(), i64t.clone()),
-        ],
+        ]
+        .into(),
         variants: vec![
-            VariantDef { name: "A".into(), discriminant: 0, fields: vec![("0".into(), i64t.clone())] },
-            VariantDef { name: "B".into(), discriminant: 1, fields: vec![("0".into(), i64t.clone())] },
-        ],
+            VariantDef {
+                name: "A".into(),
+                discriminant: 0,
+                fields: vec![("0".into(), i64t.clone())],
+            },
+            VariantDef {
+                name: "B".into(),
+                discriminant: 1,
+                fields: vec![("0".into(), i64t.clone())],
+            },
+        ]
+        .into(),
         disc_index_safe: true,
         faithful_enum_repr: None,
         enum_layout: None,
         arbitrary_precision: None,
+        validity_wrapper: None,
     }
 }
 
@@ -25408,15 +25525,17 @@ fn ref_self_probe_option_ty() -> trust_types::Ty {
         adt_kind: None,
         layout: None,
         name: "Option".to_string(),
-        fields: vec![("__tag".into(), i64t.clone()), ("__v1_0".into(), i64t.clone())],
+        fields: vec![("__tag".into(), i64t.clone()), ("__v1_0".into(), i64t.clone())].into(),
         variants: vec![
             VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
             VariantDef { name: "Some".into(), discriminant: 1, fields: vec![("0".into(), i64t)] },
-        ],
+        ]
+        .into(),
         disc_index_safe: true,
         faithful_enum_repr: None,
         enum_layout: None,
         arbitrary_precision: None,
+        validity_wrapper: None,
     }
 }
 
@@ -25514,6 +25633,7 @@ fn ref_self_downcast_func(mutable: bool) -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -25659,7 +25779,8 @@ fn nested_probe_option_ty() -> trust_types::Ty {
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
             ("__v1_0".into(), nested_probe_inner_ty()),
-        ],
+        ]
+        .into(),
         variants: vec![
             VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
             VariantDef {
@@ -25667,11 +25788,13 @@ fn nested_probe_option_ty() -> trust_types::Ty {
                 discriminant: 1,
                 fields: vec![("0".into(), nested_probe_inner_ty())],
             },
-        ],
+        ]
+        .into(),
         disc_index_safe: true,
         faithful_enum_repr: None,
         enum_layout: None,
         arbitrary_precision: None,
+        validity_wrapper: None,
     }
 }
 
@@ -25785,6 +25908,7 @@ fn nested_ctor_arm_func(first: usize, second: usize) -> trust_types::VerifiableF
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -25868,16 +25992,18 @@ fn nested_ctor_arm_payload_declines_an_opaque_param_field() {
         adt_kind: None,
         layout: None,
         name: "Opaque".to_string(),
-        fields: vec![("0".into(), Ty::Int { width: 64, signed: true })],
+        fields: vec![("0".into(), Ty::Int { width: 64, signed: true })].into(),
         variants: vec![VariantDef {
             name: "Opaque".into(),
             discriminant: 0,
             fields: vec![("0".into(), Ty::Int { width: 64, signed: true })],
-        }],
+        }]
+        .into(),
         disc_index_safe: true,
         faithful_enum_repr: None,
         enum_layout: None,
         arbitrary_precision: None,
+        validity_wrapper: None,
     };
     f.body.locals[1] = LocalDecl { index: 1, name: Some("a".into()), ty: opaque.clone() };
     let inner = Ty::adt(
@@ -25917,8 +26043,8 @@ fn nested_ctor_arm_control_scalar_payload_certifies() {
     // Retype the Some payload slot to a scalar so the aggregate type-checks.
     let i64t = trust_types::Ty::Int { width: 64, signed: true };
     if let trust_types::Ty::Adt { variants, fields, .. } = &mut f.body.locals[0].ty {
-        variants[1].fields = vec![("0".into(), i64t.clone())];
-        fields[1] = ("__v1_0".into(), i64t.clone());
+        variants.make_mut()[1].fields = vec![("0".into(), i64t.clone())];
+        fields.make_mut()[1] = ("__v1_0".into(), i64t.clone());
     }
     let rt = f.body.locals[0].ty.clone();
     f.body.return_ty = rt;
@@ -26084,6 +26210,7 @@ fn scalar_temp_chase_func(extra: Vec<trust_types::Statement>) -> trust_types::Ve
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

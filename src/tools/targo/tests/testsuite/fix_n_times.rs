@@ -441,7 +441,7 @@ fn fix_overlapping_max() {
 [ERROR] error applying suggestions
  --> src/lib.rs
   = cause: cannot replace slice of data that was already replaced
-[HELP] to report this as a bug, open an issue at https://github.com/andrewyates/Trust/issues, quoting the full output of this command
+[HELP] to report this as a bug, open an issue at https://github.com/alabsystems/Trust/issues, quoting the full output of this command
 [HELP] to possibly apply more fixes, pass in the `--broken-code` flag
 [FIXED] src/lib.rs (4 fixes)
 rustc fix shim comment 5
@@ -466,7 +466,7 @@ fn fix_verification_failed() {
 [ERROR] errors present after applying fixes to crate `foo`
  --> src/lib.rs
   = cause: rustc fix shim error count=2
-[HELP] to report this as a bug, open an issue at https://github.com/andrewyates/Trust/issues, quoting the full output of this command
+[HELP] to report this as a bug, open an issue at https://github.com/alabsystems/Trust/issues, quoting the full output of this command
 [HELP] to possibly apply more fixes, pass in the `--broken-code` flag
 [NOTE] original diagnostics will follow:
 rustc fix shim comment 1
@@ -571,7 +571,7 @@ fn broken_code_one_suggestion() {
 [ERROR] errors present after applying fixes to crate `foo`
  --> src/lib.rs
   = cause: rustc fix shim error count=2
-[HELP] to report this as a bug, open an issue at https://github.com/andrewyates/Trust/issues, quoting the full output of this command
+[HELP] to report this as a bug, open an issue at https://github.com/alabsystems/Trust/issues, quoting the full output of this command
 [HELP] to possibly apply more fixes, pass in the `--broken-code` flag
 [NOTE] original diagnostics will follow:
 rustc fix shim comment 1
@@ -600,7 +600,7 @@ fn fix_exclusive_suggestions() {
 [ERROR] error applying suggestions
  --> src/lib.rs
   = cause: cannot replace slice of data that was already replaced
-[HELP] to report this as a bug, open an issue at https://github.com/andrewyates/Trust/issues, quoting the full output of this command
+[HELP] to report this as a bug, open an issue at https://github.com/alabsystems/Trust/issues, quoting the full output of this command
 [HELP] to possibly apply more fixes, pass in the `--broken-code` flag
 [FIXED] src/lib.rs (0 fixes)
 [..]

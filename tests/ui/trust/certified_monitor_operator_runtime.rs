@@ -38,6 +38,12 @@
 //! revision falsifies only one exercised clause, proving that its monitor is
 //! present rather than letting the shared passing case succeed vacuously.
 
+// Each mismatch revision compiles only the item(s) its assertion exercises;
+// `pass` still compiles and runs every item, so coverage is unchanged.
+// `not(test)` keeps every body in a harness-free build of this file: the trust-ir
+// producer scorecard compiles it as a plain lib with no revision cfg.
+
+#[cfg(any(pass, not(test), bool_mismatch))]
 fn bool_identity(flag: bool) -> bool
     ensures result == flag
 {
@@ -47,6 +53,7 @@ fn bool_identity(flag: bool) -> bool
     return flag;
 }
 
+#[cfg(any(pass, not(test), ne_mismatch))]
 fn unequal_successor(x: u8) -> u8
     ensures result != x
 {
@@ -56,6 +63,7 @@ fn unequal_successor(x: u8) -> u8
     return x + 1;
 }
 
+#[cfg(any(pass, not(test), mixed_mismatch, mixed_numeric_mismatch))]
 fn mixed_gate(flag: bool, x: u8) -> u8
     ensures flag && result == x
 {
@@ -65,6 +73,7 @@ fn mixed_gate(flag: bool, x: u8) -> u8
     x
 }
 
+#[cfg(any(pass, not(test), or_mismatch))]
 fn disjunction_gate(flag: bool) -> bool
     ensures result || flag
 {
@@ -74,6 +83,7 @@ fn disjunction_gate(flag: bool) -> bool
     return !flag;
 }
 
+#[cfg(any(pass, not(test), not_mismatch))]
 fn negated_result() -> bool
     ensures !result
 {
@@ -83,6 +93,7 @@ fn negated_result() -> bool
     return false;
 }
 
+#[cfg(any(pass, not(test), le_mismatch))]
 fn le_identity(x: u8) -> u8
     ensures result <= x
 {
@@ -92,12 +103,14 @@ fn le_identity(x: u8) -> u8
     return x;
 }
 
+#[cfg(any(pass, not(test)))]
 fn le_halved(x: u8) -> u8
     ensures result <= x
 {
     x / 2
 }
 
+#[cfg(any(pass, not(test), lt_mismatch))]
 fn lt_predecessor(x: u8) -> u8
     ensures result < x
 {
@@ -107,6 +120,7 @@ fn lt_predecessor(x: u8) -> u8
     return x - 1;
 }
 
+#[cfg(any(pass, not(test), ge_mismatch))]
 fn ge_identity(x: u8) -> u8
     ensures result >= x
 {
@@ -116,12 +130,14 @@ fn ge_identity(x: u8) -> u8
     return x;
 }
 
+#[cfg(any(pass, not(test)))]
 fn ge_max(x: u8) -> u8
     ensures result >= x
 {
     u8::MAX
 }
 
+#[cfg(any(pass, not(test), gt_mismatch))]
 fn gt_successor(x: u8) -> u8
     ensures result > x
 {
@@ -131,6 +147,7 @@ fn gt_successor(x: u8) -> u8
     return x + 1;
 }
 
+#[cfg(any(pass, not(test), sub_mismatch))]
 fn wrapping_sub(x: u8) -> u8
     ensures result == x - 1
 {
@@ -140,6 +157,7 @@ fn wrapping_sub(x: u8) -> u8
     return x - 1;
 }
 
+#[cfg(any(pass, not(test), mul_mismatch))]
 fn wrapping_mul(x: u8) -> u8
     ensures result == x * 2
 {
@@ -149,6 +167,7 @@ fn wrapping_mul(x: u8) -> u8
     return x * 2;
 }
 
+#[cfg(any(pass, not(test), div_mismatch))]
 fn halved(x: u8) -> u8
     ensures result == x / 2
 {
@@ -158,6 +177,7 @@ fn halved(x: u8) -> u8
     return x / 2;
 }
 
+#[cfg(any(pass, not(test), rem_mismatch))]
 fn parity(x: u8) -> u8
     ensures result == x % 2
 {
@@ -167,16 +187,19 @@ fn parity(x: u8) -> u8
     return x % 2;
 }
 
+#[cfg(any(pass, bool_mismatch))]
 #[test]
 fn certified_bool_monitor_executes() {
     assert!(bool_identity(true));
 }
 
+#[cfg(any(pass, ne_mismatch))]
 #[test]
 fn certified_ne_monitor_executes() {
     assert_eq!(unequal_successor(7), 8);
 }
 
+#[cfg(any(pass, mixed_mismatch, mixed_numeric_mismatch))]
 #[test]
 fn certified_mixed_domain_monitor_executes() {
     // One mismatch keeps the numeric atom true and falsifies only the bare
@@ -186,42 +209,55 @@ fn certified_mixed_domain_monitor_executes() {
     assert_eq!(mixed_gate(!cfg!(mixed_mismatch), 7), 7);
 }
 
+#[cfg(any(pass, or_mismatch))]
 #[test]
 fn certified_or_monitor_executes() {
     assert!(disjunction_gate(false));
     assert!(!disjunction_gate(true));
 }
 
+#[cfg(any(pass, not_mismatch))]
 #[test]
 fn certified_not_monitor_executes() {
     assert!(!negated_result());
 }
 
+#[cfg(any(pass, le_mismatch, lt_mismatch, ge_mismatch, gt_mismatch))]
 #[test]
 fn certified_comparison_monitors_execute() {
+    #[cfg(any(pass, le_mismatch))]
     assert_eq!(le_identity(7), 7);
+    #[cfg(pass)]
     assert_eq!(le_halved(7), 3);
+    #[cfg(any(pass, lt_mismatch))]
     assert_eq!(lt_predecessor(7), 6);
+    #[cfg(any(pass, ge_mismatch))]
     assert_eq!(ge_identity(7), 7);
+    #[cfg(pass)]
     assert_eq!(ge_max(7), u8::MAX);
+    #[cfg(any(pass, gt_mismatch))]
     assert_eq!(gt_successor(7), 8);
 }
 
+#[cfg(any(pass, sub_mismatch))]
 #[test]
 fn certified_sub_monitor_uses_wrapping_machine_arithmetic() {
     assert_eq!(wrapping_sub(0), u8::MAX);
 }
 
+#[cfg(any(pass, mul_mismatch))]
 #[test]
 fn certified_mul_monitor_uses_wrapping_machine_arithmetic() {
     assert_eq!(wrapping_mul(200), 144);
 }
 
+#[cfg(any(pass, div_mismatch))]
 #[test]
 fn certified_div_monitor_executes() {
     assert_eq!(halved(7), 3);
 }
 
+#[cfg(any(pass, rem_mismatch))]
 #[test]
 fn certified_rem_monitor_executes() {
     assert_eq!(parity(7), 1);

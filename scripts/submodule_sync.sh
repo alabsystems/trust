@@ -87,26 +87,43 @@
 #   holds, and is cached per remote URL per run. The all-synced path — the
 #   overwhelmingly common one — issues no network call at all and is unchanged.
 #
+# FETCH — missing pins, incomplete objects or unreadable ancestry
+# -------------------------------------------------------------
+# --fetch acquires missing pins by exact SHA, then reclassifies rather than
+# blindly restoring. Present pins with unreadable ancestry may be refetched
+# without negotiation; that repair path changes no durable ref or FETCH_HEAD.
+# Genuine unrelated histories are not repaired. Reads suppress promisor lazy
+# fetching. An unreadable root tree is PIN-INCOMPLETE: explicit --fetch repairs
+# canonical HTTPS GitHub pins through the recreator's owner-routed Agh fetch,
+# retaining source identity, deadline and private-ref checks, with no Git
+# fallback after refusal. Only readable pin/root data reaches classification.
+# The all-synced path remains network-free. --fetch --restore realigns only
+# where the resulting complete safety evidence permits it.
+#
 # USAGE
 #   scripts/submodule_sync.sh              classify and report (default)
 #   scripts/submodule_sync.sh --quiet      one line, for hooks and prompts
 #   scripts/submodule_sync.sh --json       machine-readable records
 #   scripts/submodule_sync.sh --restore    check out ONLY the provably-lossless ones
+#   scripts/submodule_sync.sh --fetch      acquire missing pins, repair canonical
+#                                          incomplete pins or unreadable ancestry
 #   scripts/submodule_sync.sh --root DIR   operate on DIR's superproject (self-test)
 #   scripts/submodule_sync.sh --offline    never touch the network; unanchored-unless
-#                                          a LOCAL ref proves it (fail closed)
+#                                          a LOCAL ref proves it (fail closed).
+#                                          Cold local clones require file in the
+#                                          explicit GIT_ALLOW_PROTOCOL whitelist.
 #   scripts/submodule_sync.sh --restore --force   restore even while a build runs
 #
 # EXIT CODES
 #   0  every submodule worktree is at its recorded pin
 #   1  drift, and every drifted module is provably lossless to restore
-#      (BEHIND, or AHEAD/DIVERGENT with every unique commit ANCHORED)
+#      (BEHIND, UNREGISTERED, or AHEAD/DIVERGENT with unique commits ANCHORED)
 #   2  drift, and at least one module needs a human (UNANCHORED AHEAD /
-#      DIVERGENT / dirty / unrelated / pin object missing locally)
+#      DIVERGENT / dirty / unrelated / ancestry unreadable / pin object missing)
 #   3  usage or environment error
 #   4  --restore refused: a build appears to be running against this repo
 #
-# NEVER run x.py to test this. Use `cargo check --locked` (see
+# NEVER run x.py to test this. Use `targo --unverified check --locked` (see
 # reports/submodule-pin-drift.md §4 for the bootstrap environment it needs).
 
 set -uo pipefail
@@ -118,7 +135,9 @@ usage() {
 MODE="report"
 FORCE=0
 OFFLINE=0
+FETCH=0
 ROOT_ARG=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --quiet|-q)   MODE="quiet" ;;
@@ -126,6 +145,7 @@ while [ "$#" -gt 0 ]; do
     --restore)    MODE="restore" ;;
     --force)      FORCE=1 ;;
     --offline)    OFFLINE=1 ;;
+    --fetch)      FETCH=1 ;;
     --root)       ROOT_ARG="${2:-}"; shift ;;
     --root=*)     ROOT_ARG="${1#--root=}" ;;
     -h|--help)    usage; exit 0 ;;
@@ -133,6 +153,27 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+if [ "$FETCH" -eq 1 ] && [ "$OFFLINE" -eq 1 ]; then
+  echo "submodule_sync: --fetch and --offline contradict each other" >&2
+  exit 3
+fi
+
+offline_clone_protocols() {
+  # --no-fetch controls explicit later fetches, not clone or promisor reads.
+  # Preserve only the caller's explicit local transport permission.
+  case ":${GIT_ALLOW_PROTOCOL-}:" in *:file:*) printf '%s' file ;; esac
+  return 0
+}
+# A diagnostic object read must not silently repair a partial clone. Explicit
+# --fetch and anchor probes remain separately controlled below; Git must report
+# missing local commits/trees instead of hiding them through a promisor fetch.
+export GIT_NO_LAZY_FETCH=1
+if [ "$OFFLINE" -eq 1 ]; then
+  # Apply before every Git read: missing promised objects can otherwise make
+  # even ls-tree, status or cat-file contact a remote. The transport whitelist
+  # also protects children/older Git; explicit local initialization still works.
+  export GIT_ALLOW_PROTOCOL="$(offline_clone_protocols)"
+fi
 
 # Resolve against the SCRIPT's repository, not $PWD: "am I at the pins" is a
 # question about the superproject, and an agent that asks it from inside
@@ -170,6 +211,19 @@ TAB=$'\t'
 # ---------------------------------------------------------------------------
 NET_UNREACHABLE="!UNREACHABLE"
 NET_TIMEOUT="${SUBMODULE_SYNC_NET_TIMEOUT:-20}"
+# A fetch moves objects, not just refs, so it gets a transfer-sized bound. The
+# default suits a sibling of ordinary size. It is settable because one is not:
+# on 2026-11-10 first-party/trust-ir's pin was a 17 GiB transfer, about twenty
+# minutes on the link that measured it, and two bounded attempts discarded
+# 13 GiB and reported the pin as not provided (fetch_missing_pin, below).
+FETCH_TIMEOUT="${SUBMODULE_SYNC_FETCH_TIMEOUT:-600}"
+case "$FETCH_TIMEOUT" in
+  ''|*[!0-9]*|0*)
+    echo "submodule_sync: SUBMODULE_SYNC_FETCH_TIMEOUT='$FETCH_TIMEOUT' is not a positive number of seconds" >&2
+    exit 3 ;;
+esac
+FETCH_ATTEMPTED_KEYS=()
+FETCH_FAILED_KEYS=()
 NET_CACHE_URLS=()
 NET_CACHE_REFS=()
 TIMEOUT_BIN=""
@@ -179,9 +233,11 @@ done
 
 # A hung remote must not hang the tool a human runs before every build. Bound it
 # where a bound is available, and never let git open an interactive prompt.
-net_git() {
+net_git() { net_git_within "$NET_TIMEOUT" "$@"; }
+net_git_within() { # <seconds> <git args...>
+  local secs="$1"; shift
   if [ -n "$TIMEOUT_BIN" ]; then
-    "$TIMEOUT_BIN" "$NET_TIMEOUT" env GIT_TERMINAL_PROMPT=0 git "$@"
+    "$TIMEOUT_BIN" "$secs" env GIT_TERMINAL_PROMPT=0 git "$@"
   else
     env GIT_TERMINAL_PROMPT=0 git "$@"
   fi
@@ -326,11 +382,123 @@ anchor_check() { # <moddir> <ondisk> <pin> -> ANCHORED_OUT, ANCHOR_NOTE_OUT
   ANCHOR_NOTE_OUT="$evidence"
 }
 
+# --fetch: bring exactly <pin> into <moddir>'s object store, by sha.
+# A refetch can repair an unreadable ancestor graph even when the pin already
+# exists. It names no destination and creates no new anchoring ref.
+fetch_pin() { # <moddir> <pin> <display> [missing|refetch]
+  local moddir="$1" pin="$2" display="$3" mode="${4:-missing}"
+  local pair rname rurl key i=0 fetch_rc
+  # Restore rescans after each checkout. Each kind of acquisition gets one
+  # attempt per selected pin, including a successful but insufficient refetch.
+  key="${moddir}${TAB}${pin}${TAB}${mode}"
+  while [ "$i" -lt "${#FETCH_ATTEMPTED_KEYS[@]}" ]; do
+    [ "${FETCH_ATTEMPTED_KEYS[$i]}" != "$key" ] || return 1
+    i=$((i + 1))
+  done
+  FETCH_ATTEMPTED_KEYS+=("$key")
+  if ! pair="$(module_remote "$moddir")"; then
+    printf 'submodule_sync --fetch: %s: no remote to fetch pin %.8s from\n' "$display" "$pin" >&2
+    return 1
+  fi
+  rname="${pair%% *}"; rurl="${pair#* }"
+  if [ "$mode" = refetch ]; then
+    [ -z "${SUBMODULE_SYNC_TRACE_NET:-}" ] || echo "net: refetch $rurl $pin" >&2
+    # Negotiation can assume a locally present commit includes its ancestors.
+    # Refetch transfers the selected closure without that assumption. Keep all
+    # durable refs and FETCH_HEAD untouched on this repair-only path.
+    net_git_within "$FETCH_TIMEOUT" -C "$moddir" fetch -q --no-tags --recurse-submodules=no \
+      --refetch --no-write-fetch-head "$rname" "$pin" >/dev/null 2>&1
+    fetch_rc=$?
+  else
+    # Preserve the existing missing-pin acquisition's tracking-ref refresh.
+    net_git_within "$FETCH_TIMEOUT" -C "$moddir" fetch -q --no-tags --recurse-submodules=no \
+      "$rname" >/dev/null 2>&1 || true
+    [ -z "${SUBMODULE_SYNC_TRACE_NET:-}" ] || echo "net: fetch $rurl $pin" >&2
+    net_git_within "$FETCH_TIMEOUT" -C "$moddir" fetch -q --no-tags --recurse-submodules=no \
+      "$rname" "$pin" >/dev/null 2>&1
+    fetch_rc=$?
+  fi
+  if [ "$fetch_rc" -eq 0 ] && git -C "$moddir" cat-file -e "${pin}^{commit}" 2>/dev/null; then
+    printf 'submodule_sync --fetch: %s: fetched pin %.8s from %s (%s)\n' "$display" "$pin" "$rname" "$mode" >&2
+    return 0
+  fi
+  if [ "$fetch_rc" -eq 124 ] && [ -n "$TIMEOUT_BIN" ]; then
+    # The bound ended the transfer. That says nothing about whether the remote
+    # holds the pin, and "did not provide" sent a reader to look for an
+    # unpublished pin that was in fact being sent.
+    printf 'submodule_sync --fetch: %s: fetching pin %.8s from %s <%s> did not finish within %ss (%s); the remote was still answering\n' "$display" "$pin" "$rname" "$rurl" "$FETCH_TIMEOUT" "$mode" >&2
+    printf '  raise the bound (SUBMODULE_SYNC_FETCH_TIMEOUT=<seconds>), or fetch it unbounded:  git -C %s fetch %s %s\n' "$moddir" "$rname" "$pin" >&2
+    printf '  an interrupted fetch can leave a partial objects/pack/tmp_pack_* file in the module\n' >&2
+    return 1
+  fi
+  printf 'submodule_sync --fetch: %s: %s <%s> did not provide pin %.8s (%s)\n' "$display" "$rname" "$rurl" "$pin" "$mode" >&2
+  return 1
+}
+
+# Commit ancestry does not establish that checkout data is available. Check only
+# the pin's root tree here, not an expensive full object-closure walk on every
+# build. Deeper missing objects remain native checkout failures with stderr.
+pin_root_tree_readable() {
+  local moddir="$1" pin="$2" tree object_type
+  PIN_TREE_NOTE_OUT=""
+  if ! tree="$(git -C "$moddir" cat-file -p "${pin}^{commit}" 2>/dev/null | sed -n '1s/^tree //p')" \
+     || [ -z "$tree" ]; then
+    PIN_TREE_NOTE_OUT="pin commit header is unreadable; local object closure is incomplete"
+    return 1
+  fi
+  if ! object_type="$(git -C "$moddir" cat-file -t "$tree" 2>&1)" \
+     || [ "$object_type" != tree ]; then
+    object_type="${object_type//$'\n'/; }"
+    object_type="${object_type//$'\r'/ }"
+    object_type="${object_type//$'\t'/ }"
+    PIN_TREE_NOTE_OUT="pin commit exists but root tree $tree is missing or unreadable: $object_type"
+    return 1
+  fi
+  return 0
+}
+
+repair_incomplete_pin() { # <moddir> <pin> <display>; explicit --fetch only
+  local moddir="$1" pin="$2" display="$3" pair rurl key i=0 python="" rc
+  [ "$FETCH" -eq 1 ] && [ "$OFFLINE" -eq 0 ] || return 1
+  pair="$(module_remote "$moddir")" || return 1
+  rurl="${pair#* }"
+  # The maintained provider validates the full canonical URL. Other transports
+  # retain their existing local behavior; none is a fallback from Agh refusal.
+  case "$rurl" in https://github.com/*) ;; *) return 1 ;; esac
+  key="${moddir}${TAB}${pin}"
+  while [ "$i" -lt "${#FETCH_FAILED_KEYS[@]}" ]; do
+    [ "${FETCH_FAILED_KEYS[$i]}" != "$key" ] || return 1
+    i=$((i + 1))
+  done
+  for python in python3.14 python3.13 python3.12 python3.11 python3; do
+    command -v "$python" >/dev/null 2>&1 && break
+    python=""
+  done
+  [ -z "${SUBMODULE_SYNC_TRACE_NET:-}" ] || echo "net: agh source-pin $rurl $pin" >&2
+  if [ -n "$python" ] && "$python" -B "$SCRIPT_DIR/recreate_bootstrap.py" fetch-source-pin \
+      --url "$rurl" --directory "$moddir" --pin "$pin" >&2; then
+    if git -C "$moddir" cat-file -e "${pin}^{commit}" 2>/dev/null \
+        && pin_root_tree_readable "$moddir" "$pin"; then
+      printf 'submodule_sync --fetch: %s: repaired exact pin %.8s through Agh\n' "$display" "$pin" >&2
+      return 0
+    fi
+    rc=2
+  else
+    rc=$?
+  fi
+  printf 'submodule_sync --fetch: %s: Agh pin repair failed (exit %s); no Git fallback\n' "$display" "$rc" >&2
+  FETCH_FAILED_KEYS+=("$key")
+  return 1
+}
+
 classify_one() {
   local parent="$1" rel="$2" display="$3"
-  local pin ondisk state ahead behind dirty counts anchored anote
+  local pin ondisk state ahead behind dirty counts anchored anote reg_output reg_rc merge_rc merge_err repaired=0
 
-  pin="$(git -C "$parent" ls-tree HEAD -- "$rel" 2>/dev/null | awk '$2 == "commit" { print $3 }')"
+  if ! pin="$(git -C "$parent" ls-tree HEAD -- "$rel" 2>/dev/null | awk '$2 == "commit" { print $3 }')"; then
+    RECORDS+=("${display}${TAB}${parent}${TAB}${rel}${TAB}PIN-UNREADABLE${TAB}0${TAB}0${TAB}-${TAB}-${TAB}0${TAB}0${TAB}HEAD gitlink could not be read")
+    return
+  fi
   if [ -z "$pin" ]; then
     # No gitlink at HEAD. Either the path is not a submodule at this commit (the
     # `first-party/trust` symlink is exactly this case) or the gitlink was removed.
@@ -350,36 +518,95 @@ classify_one() {
   fi
 
   if [ "$ondisk" = "$pin" ]; then
+    if ! pin_root_tree_readable "$parent/$rel" "$pin" \
+        && ! repair_incomplete_pin "$parent/$rel" "$pin" "$display"; then
+      RECORDS+=("${display}${TAB}${parent}${TAB}${rel}${TAB}PIN-INCOMPLETE${TAB}0${TAB}0${TAB}${ondisk}${TAB}${pin}${TAB}0${TAB}0${TAB}${PIN_TREE_NOTE_OUT}")
+      return
+    fi
     # Synced. Deliberately skip the dirty probe here: `git status` is the
     # expensive call (~0.1-0.2s per module) and local edits on a module that is
     # AT its pin are nobody's drift problem. Skipping keeps the all-synced case
     # — the overwhelmingly common one — free of both `git status` and, since the
     # anchor probe hangs off `ahead > 0`, of any network call whatsoever.
-    RECORDS+=("${display}${TAB}${parent}${TAB}${rel}${TAB}SYNCED${TAB}0${TAB}0${TAB}${ondisk}${TAB}${pin}${TAB}0${TAB}0${TAB}-")
+    # A standalone clone can already hold every pinned byte while its parent
+    # lacks `submodule init` records. Git then reports '-', and x.py refuses
+    # the uninitialised closure. Ask Git rather than guessing a module's name
+    # from its path or overlooking explicit activation settings.
+    reg_output="$(git -C "$parent" submodule status -- "$rel" 2>/dev/null)"
+    reg_rc=$?
+    state="REGISTRATION-UNKNOWN"
+    anote="git submodule status did not confirm the recorded pin and initialization"
+    if [ "$reg_rc" -eq 0 ]; then
+      case "${reg_output:0:1}" in
+        ' ') state="SYNCED"; anote="-" ;;
+        '-') state="UNREGISTERED"; anote="source is at pin; parent initialization is missing" ;;
+      esac
+    fi
+    RECORDS+=("${display}${TAB}${parent}${TAB}${rel}${TAB}${state}${TAB}0${TAB}0${TAB}${ondisk}${TAB}${pin}${TAB}0${TAB}0${TAB}${anote}")
     return
   fi
 
   # Drifted. From here on accuracy outweighs speed.
-  dirty="$(git -C "$parent/$rel" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  # Classification is a read: Git's optional stat-cache refresh must not rewrite
+  # the owner's index while diagnosing or acquiring missing source objects.
+  if ! dirty="$(GIT_OPTIONAL_LOCKS=0 git -C "$parent/$rel" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"; then
+    RECORDS+=("${display}${TAB}${parent}${TAB}${rel}${TAB}STATUS-UNREADABLE${TAB}0${TAB}0${TAB}${ondisk}${TAB}${pin}${TAB}0${TAB}0${TAB}worktree status could not be read")
+    return
+  fi
 
-  if ! git -C "$parent/$rel" cat-file -e "${pin}^{commit}" 2>/dev/null; then
+  if ! git -C "$parent/$rel" cat-file -e "${pin}^{commit}" 2>/dev/null \
+     && ! { [ "$FETCH" -eq 1 ] && fetch_pin "$parent/$rel" "$pin" "$display"; }; then
     # The recorded pin is not in the local object store, so ancestry cannot be
     # computed at all and no restore can be attempted without a fetch (a write).
     RECORDS+=("${display}${TAB}${parent}${TAB}${rel}${TAB}PIN-MISSING${TAB}0${TAB}0${TAB}${ondisk}${TAB}${pin}${TAB}${dirty}${TAB}0${TAB}-")
     return
   fi
 
-  if ! git -C "$parent/$rel" merge-base "$ondisk" "$pin" >/dev/null 2>&1; then
-    # No merge base: `rev-list ondisk ^pin` would be the module's ENTIRE history,
-    # so "is every unique commit anchored" is not the question anyone is asking.
-    # Left as needs-a-human, exactly as before.
-    RECORDS+=("${display}${TAB}${parent}${TAB}${rel}${TAB}UNRELATED${TAB}0${TAB}0${TAB}${ondisk}${TAB}${pin}${TAB}${dirty}${TAB}0${TAB}-")
+  if ! pin_root_tree_readable "$parent/$rel" "$pin" \
+      && ! repair_incomplete_pin "$parent/$rel" "$pin" "$display"; then
+    RECORDS+=("${display}${TAB}${parent}${TAB}${rel}${TAB}PIN-INCOMPLETE${TAB}0${TAB}0${TAB}${ondisk}${TAB}${pin}${TAB}${dirty}${TAB}0${TAB}${PIN_TREE_NOTE_OUT}")
     return
   fi
 
-  # left = reachable from the worktree but not the pin (AHEAD of the pin)
-  # right = reachable from the pin but not the worktree (BEHIND the pin)
-  counts="$(git -C "$parent/$rel" rev-list --left-right --count "${ondisk}...${pin}" 2>/dev/null)"
+  while :; do
+    if merge_err="$(git -C "$parent/$rel" merge-base "$ondisk" "$pin" 2>&1 >/dev/null)"; then
+      merge_rc=0
+    else
+      merge_rc=$?
+    fi
+    # Exit 1 is "no common ancestor" only when git says nothing. Git 2.43.0
+    # (measured; Ubuntu 24.04's) also exits 1 when it could not read an ancestor,
+    # after `error: Could not read <sha>`, where newer git exits 128. Without
+    # this an incomplete store was called UNRELATED there and never repaired.
+    if [ "$merge_rc" -eq 1 ] && [ -n "$merge_err" ]; then
+      merge_rc=128
+    fi
+    if [ "$merge_rc" -eq 1 ]; then
+      # Git's no-common-ancestor result remains unrelated, never a reason to
+      # acquire objects or auto-restore a different history.
+      RECORDS+=("${display}${TAB}${parent}${TAB}${rel}${TAB}UNRELATED${TAB}0${TAB}0${TAB}${ondisk}${TAB}${pin}${TAB}${dirty}${TAB}0${TAB}-")
+      return
+    fi
+    # left = worktree-only commits (AHEAD); right = pin-only (BEHIND).
+    if [ "$merge_rc" -eq 0 ] &&
+       counts="$(git -C "$parent/$rel" rev-list --left-right --count "${ondisk}...${pin}" 2>/dev/null)"; then
+      break
+    fi
+    anote="ancestry counts could not be read"
+    if [ "$merge_rc" -ne 0 ]; then
+      anote="merge-base failed (exit $merge_rc); ancestry objects are incomplete or unreadable"
+    fi
+    if [ "$repaired" -eq 0 ] && [ "$FETCH" -eq 1 ]; then
+      repaired=1
+      if fetch_pin "$parent/$rel" "$pin" "$display" refetch; then
+        # Successful transport is not ancestry evidence. Classify the changed
+        # object graph once through the same ordinary safety predicates.
+        continue
+      fi
+    fi
+    RECORDS+=("${display}${TAB}${parent}${TAB}${rel}${TAB}ANCESTRY-UNREADABLE${TAB}0${TAB}0${TAB}${ondisk}${TAB}${pin}${TAB}${dirty}${TAB}0${TAB}${anote}")
+    return
+  done
   ahead="$(printf '%s' "$counts" | awk '{print $1}')"
   behind="$(printf '%s' "$counts" | awk '{print $2}')"
   [ -n "$ahead" ] || ahead=0
@@ -433,13 +660,6 @@ walk() {
              --get-regexp 'submodule\..*\.path' 2>/dev/null | awk '{print $2}')
 }
 
-walk "$ROOT" ""
-
-if [ "${#RECORDS[@]}" -eq 0 ]; then
-  echo "submodule_sync: no submodules recorded in .gitmodules" >&2
-  exit 3
-fi
-
 # ---------------------------------------------------------------------------
 # Tally
 # ---------------------------------------------------------------------------
@@ -472,74 +692,133 @@ anchor_lines() { # <rec> <indent>
   set +f
 }
 
-TOTAL=0; N_SYNCED=0; N_DRIFT=0; N_SAFE=0; N_REVIEW=0; N_ANCHORED=0
-SAFE_ROWS=(); REVIEW_ROWS=(); DRIFT_ROWS=()
+scan_modules() {
+  local rec state dirty
+  RECORDS=()
+  walk "$ROOT" ""
+  if [ "${#RECORDS[@]}" -eq 0 ]; then
+    echo "submodule_sync: no submodules recorded in .gitmodules" >&2
+    return 3
+  fi
 
-for rec in "${RECORDS[@]}"; do
-  state="$(field "$rec" 4)"
-  dirty="$(field "$rec" 9)"
-  TOTAL=$((TOTAL + 1))
-  case "$state" in
-    SYNCED)
-      N_SYNCED=$((N_SYNCED + 1))
-      ;;
-    NO-GITLINK)
-      # Not a submodule at this commit; not drift. Counted as neither.
-      TOTAL=$((TOTAL - 1))
-      ;;
-    BEHIND)
-      N_DRIFT=$((N_DRIFT + 1)); DRIFT_ROWS+=("$rec")
-      if [ "$dirty" -eq 0 ]; then
-        N_SAFE=$((N_SAFE + 1)); SAFE_ROWS+=("$rec")
-      else
-        N_REVIEW=$((N_REVIEW + 1)); REVIEW_ROWS+=("$rec")
-      fi
-      ;;
-    ABSENT)
-      # Never checked out. `--init` is the intended repair and cannot lose work,
-      # because there is no worktree to lose.
-      N_DRIFT=$((N_DRIFT + 1)); DRIFT_ROWS+=("$rec")
-      N_SAFE=$((N_SAFE + 1)); SAFE_ROWS+=("$rec")
-      ;;
-    AHEAD|DIVERGENT)
-      # The worktree holds commits the pin lacks. Restorable ONLY if every one of
-      # them is held by a durable ref (field 10), which also implies a clean
-      # worktree — see anchor_check. Anything else is unchanged from before: it
-      # needs a human.
-      N_DRIFT=$((N_DRIFT + 1)); DRIFT_ROWS+=("$rec")
-      if [ "$(field "$rec" 10)" = "1" ]; then
-        N_SAFE=$((N_SAFE + 1)); SAFE_ROWS+=("$rec")
-        N_ANCHORED=$((N_ANCHORED + 1))
-      else
-        N_REVIEW=$((N_REVIEW + 1)); REVIEW_ROWS+=("$rec")
-      fi
-      ;;
-    *)
-      N_DRIFT=$((N_DRIFT + 1)); DRIFT_ROWS+=("$rec")
-      N_REVIEW=$((N_REVIEW + 1)); REVIEW_ROWS+=("$rec")
-      ;;
-  esac
-done
+  TOTAL=0; N_SYNCED=0; N_DRIFT=0; N_SAFE=0; N_REVIEW=0; N_ANCHORED=0
+  SAFE_ROWS=(); REVIEW_ROWS=(); DRIFT_ROWS=()
 
-if [ "$N_DRIFT" -eq 0 ]; then
-  RC=0
-elif [ "$N_REVIEW" -eq 0 ]; then
-  RC=1
-else
-  RC=2
-fi
+  for rec in "${RECORDS[@]}"; do
+    state="$(field "$rec" 4)"
+    dirty="$(field "$rec" 9)"
+    TOTAL=$((TOTAL + 1))
+    case "$state" in
+      SYNCED)
+        N_SYNCED=$((N_SYNCED + 1))
+        ;;
+      NO-GITLINK)
+        # Not a submodule at this commit; not drift. Counted as neither.
+        TOTAL=$((TOTAL - 1))
+        ;;
+      BEHIND)
+        N_DRIFT=$((N_DRIFT + 1)); DRIFT_ROWS+=("$rec")
+        if [ "$dirty" -eq 0 ]; then
+          N_SAFE=$((N_SAFE + 1)); SAFE_ROWS+=("$rec")
+        else
+          N_REVIEW=$((N_REVIEW + 1)); REVIEW_ROWS+=("$rec")
+        fi
+        ;;
+      ABSENT|UNREGISTERED)
+        # Never checked out. `--init` is the intended repair and cannot lose work,
+        # because there is no worktree to lose. UNREGISTERED is different: the
+        # worktree exists, so repair ONLY the parent's init records, never bytes.
+        N_DRIFT=$((N_DRIFT + 1)); DRIFT_ROWS+=("$rec")
+        N_SAFE=$((N_SAFE + 1)); SAFE_ROWS+=("$rec")
+        ;;
+      AHEAD|DIVERGENT)
+        # The worktree holds commits the pin lacks. Restorable ONLY if every one of
+        # them is held by a durable ref (field 10), which also implies a clean
+        # worktree — see anchor_check. Anything else is unchanged from before: it
+        # needs a human.
+        N_DRIFT=$((N_DRIFT + 1)); DRIFT_ROWS+=("$rec")
+        if [ "$(field "$rec" 10)" = "1" ]; then
+          N_SAFE=$((N_SAFE + 1)); SAFE_ROWS+=("$rec")
+          N_ANCHORED=$((N_ANCHORED + 1))
+        else
+          N_REVIEW=$((N_REVIEW + 1)); REVIEW_ROWS+=("$rec")
+        fi
+        ;;
+      *)
+        N_DRIFT=$((N_DRIFT + 1)); DRIFT_ROWS+=("$rec")
+        N_REVIEW=$((N_REVIEW + 1)); REVIEW_ROWS+=("$rec")
+        ;;
+    esac
+  done
+
+  if [ "$N_DRIFT" -eq 0 ]; then
+    RC=0
+  elif [ "$N_REVIEW" -eq 0 ]; then
+    RC=1
+  else
+    RC=2
+  fi
+}
+
+scan_modules || exit $?
 
 restore_cmd_for() {
   # One explicit path per invocation, run from the module's own parent. No bare
   # repo-wide `git submodule update`, and no `--recursive`: both would sweep in
   # modules this script has not cleared, which is precisely the mistake the
   # BEHIND/AHEAD split exists to prevent.
-  local rec="$1" parent rel
+  local rec="$1" parent rel gitdir=""
   parent="$(field "$rec" 2)"; rel="$(field "$rec" 3)"
-  if [ "$parent" = "$ROOT" ]; then
-    printf '    git -C %s submodule update --init -- %s\n' "$ROOT" "$rel"
+  if [ "$(field "$rec" 4)" = "UNREGISTERED" ]; then
+    printf '    git -C %q submodule init -- %q\n' "$parent" "$rel"
+    return
+  fi
+  if [ -e "$parent/$rel/.git" ]; then
+    gitdir="$(git -C "$parent/$rel" rev-parse --absolute-git-dir 2>/dev/null)"
+  fi
+  printf '    '
+  if [ "$OFFLINE" -eq 1 ]; then
+    printf 'GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL=%q ' "$GIT_ALLOW_PROTOCOL"
+  fi
+  if [ -n "$gitdir" ] && [ -f "$gitdir/commondir" ]; then
+    printf 'git -C %q -c submodule.recurse=false checkout --detach %q\n' \
+      "$parent/$rel" "$(field "$rec" 8)"
+  elif [ -n "$gitdir" ]; then
+    printf 'git -C %q submodule update --init --no-fetch -- %q\n' "$parent" "$rel"
+  elif [ "$OFFLINE" -eq 1 ]; then
+    printf 'git -C %q submodule update --init --no-fetch -- %q\n' "$parent" "$rel"
   else
-    printf '    git -C %s submodule update --init -- %s\n' "$parent" "$rel"
+    printf 'git -C %q submodule update --init -- %q\n' "$parent" "$rel"
+  fi
+}
+
+restore_module() {
+  local parent="$1" rel="$2" pin="$3" state="${4:-}" gitdir reg_output
+  if [ "$state" = "UNREGISTERED" ]; then
+    git -C "$parent" submodule init -- "$rel" || return 1
+    reg_output="$(git -C "$parent" submodule status -- "$rel" 2>/dev/null)" || return 1
+    [ "${reg_output:0:1}" = ' ' ] && [ "$(git -C "$parent/$rel" rev-parse HEAD)" = "$pin" ]
+    return $?
+  fi
+  if [ ! -e "$parent/$rel/.git" ]; then
+    if [ "$OFFLINE" -eq 1 ]; then
+      git -C "$parent" submodule update --init --no-fetch -- "$rel"
+    else
+      git -C "$parent" submodule update --init -- "$rel"
+    fi
+    return $?
+  fi
+  gitdir="$(git -C "$parent/$rel" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  if [ -f "$gitdir/commondir" ]; then
+    # `submodule update` rewrites core.worktree in the shared config relative
+    # to this linked gitdir, breaking the primary submodule checkout. Move
+    # only this worktree; ancestry, anchoring and dirty checks still apply.
+    git -C "$parent/$rel" -c submodule.recurse=false checkout --detach "$pin"
+  else
+    # Classification already proved the pin is a local commit. Without
+    # --no-fetch, a pin on no local ref (fetched by sha, or anchored-only)
+    # sends `submodule update` to the network, --offline or not.
+    git -C "$parent" submodule update --init --no-fetch -- "$rel"
   fi
 }
 
@@ -584,10 +863,9 @@ emit_report() {
 
   echo "submodule sync: DRIFT"
   echo
-  echo "  $N_DRIFT of $TOTAL submodule worktrees disagree with the pins recorded at"
-  echo "  superproject HEAD. Until this is resolved, a build compiles source that is"
-  echo "  NOT the source the pins name, and any error it reports may be an artifact"
-  echo "  of the drift rather than a real defect."
+  echo "  $N_DRIFT of $TOTAL submodule worktrees need pin or initialization repair."
+  echo "  A build's source or Git initialization differs from the recorded closure;"
+  echo "  resolve the reported states before diagnosing compiler errors."
   echo
   printf '  %-34s %-14s %-22s %s\n' "MODULE" "STATE" "DELTA" "WORKTREE -> PIN"
   printf '  %-34s %-14s %-22s %s\n' "----------------------------------" "--------------" "----------------------" "--------------------"
@@ -599,7 +877,9 @@ emit_report() {
       AHEAD)       delta="${ahead} ahead" ;;
       DIVERGENT)   delta="${ahead} ahead, ${behind} behind" ;;
       ABSENT)      delta="not checked out" ;;
+      UNREGISTERED) delta="parent init missing" ;;
       PIN-MISSING) delta="pin not in object store" ;;
+      PIN-INCOMPLETE) delta="pin object data missing" ;;
       *)           delta="-" ;;
     esac
     [ "$(field "$rec" 10)" = "1" ] && state="${state}+ANCH"
@@ -627,7 +907,10 @@ emit_report() {
     echo
     echo "  or let this script do exactly that set and nothing else:"
     echo
-    echo "    scripts/submodule_sync.sh --restore"
+    printf '    scripts/submodule_sync.sh'
+    [ -z "$ROOT_ARG" ] || printf ' --root %q' "$ROOT"
+    [ "$OFFLINE" -eq 0 ] || printf ' --offline'
+    printf ' --restore\n'
     echo
   fi
 
@@ -669,6 +952,25 @@ emit_report() {
             "$(field "$rec" 2)/$(field "$rec" 3)" "$(field "$rec" 8)"
           printf '                # NOT `fetch --all`: it fetches branches, and an\n'
           printf '                # anchored pin (refs/pins/*) is on no branch.\n'
+          [ "$FETCH" -eq 1 ] || printf '      or fetch every missing pin:  scripts/submodule_sync.sh --fetch --restore\n'
+          ;;
+        ANCESTRY-UNREADABLE)
+          printf '      Unknown ancestry: %s\n' "$(field "$rec" 11)"
+          printf '      No restore is safe until the object graph can be read.\n'
+          printf '      Explicit repair: scripts/submodule_sync.sh'
+          [ -z "$ROOT_ARG" ] || printf ' --root %q' "$ROOT"
+          printf ' --fetch --restore\n'
+          ;;
+        PIN-INCOMPLETE)
+          printf '      %s\n' "$(field "$rec" 11)"
+          printf '      Repair the selected pin\047s local object closure through Git before\n'
+          printf '      restoring; preserve existing refs, index and worktree data.\n'
+          printf '      inspect locally: GIT_NO_LAZY_FETCH=1 git -C %q cat-file -e %q\n' \
+            "$(field "$rec" 2)/$(field "$rec" 3)" "$(field "$rec" 8)^{tree}"
+          printf '      An ordinary exact-pin fetch can exit 0 without filling missing\n'
+          printf '      objects for a commit already present. For canonical HTTPS GitHub\n'
+          printf '      remotes, explicit --fetch --restore uses owner-routed Agh repair.\n'
+          printf '      Other stores need an appropriate object repair; read-only checks never fetch.\n'
           ;;
         UNRELATED)
           printf '      No merge base with the pin. Treat as a re-pin to a different history.\n'
@@ -689,6 +991,29 @@ emit_report() {
 # ---------------------------------------------------------------------------
 # Restore — the safe subset only
 # ---------------------------------------------------------------------------
+
+# Read `pid command...` lines (the `ps -o pid=,command=` shape) on stdin; print the
+# pid of each line whose command names $ROOT as a whole path — the root itself or
+# a path beneath it — never a sibling that merely shares the prefix
+# (`$ROOT-wt-b`, `$ROOT-packs`, `$ROOT.old`). See `builds_running` for why.
+# ROOT goes through the environment, not `awk -v`, which would expand backslash
+# escapes in the path.
+cmdlines_naming_root() {
+  SUBMODULE_SYNC_ROOT_PATH="$ROOT" awk '
+    function names_root(s, root,   n, i, after) {
+      n = length(root)
+      if (n == 0) return 0
+      while ((i = index(s, root)) > 0) {
+        after = substr(s, i + n, 1)
+        # A name continues past the match: a different directory.
+        if (after == "" || after !~ /[A-Za-z0-9._~+@%#-]/) return 1
+        s = substr(s, i + 1)
+      }
+      return 0
+    }
+    { if (names_root($0, ENVIRON["SUBMODULE_SYNC_ROOT_PATH"])) print $1 }'
+}
+
 builds_running() {
   # Mutating a submodule worktree under a running build is worse than leaving it
   # stale: the build then mixes pre- and post-checkout sources and can SUCCEED
@@ -700,6 +1025,16 @@ builds_running() {
   # time is a guard everyone learns to `--force` past. A process counts if its cwd
   # is inside the superproject or its command line names it.
   #
+  # "Names it" means names the ROOT AS A PATH: the root itself, or something under
+  # "$ROOT/". A plain substring test (`grep -F "$ROOT"`, the pre-2026-09-28 form)
+  # also matched every SIBLING that shares the prefix — with ROOT=<home>/trust
+  # a build in <home>/trust-packs/... or <home>/trust-wt-b/... counted
+  # as a build in this repo, and --restore refused on a machine where worktrees
+  # build constantly. The test is the character AFTER the match: end of the command
+  # line, `/`, or anything that cannot continue a path-component name. No test is
+  # made of the character BEFORE it: `/private/tmp/x` names the same directory as
+  # `/tmp/x` on macOS, and over-refusing is the safe direction for this guard.
+  #
   # `pgrep -x bootstrap` is a SEPARATE probe, not another alternative in the -f
   # pattern, and it is not optional: the python `x.py` wrapper can exit while its
   # bootstrap child keeps compiling (observed 2026-08-01, attempt 8), and matching
@@ -707,9 +1042,34 @@ builds_running() {
   # executable NAME also assumes nothing about argument order — `bootstrap build`
   # as a -f pattern never matches, because `x.py --stage 1 build` produces
   # `.../bootstrap --stage 1 build` and the two words are not adjacent.
-  local cands pid_csv by_cmd by_cwd
+  #
+  # A SHELL counts by its command line only, never by its cwd alone. An agent
+  # harness starts every shell in the superproject (cwd <home>/trust) and
+  # runs `bash -c '<script that mentions targo>'` from there while the build
+  # itself runs in another tree: measured 2026-10-14 18:02, a 90-minute trust-vc
+  # gate in a scratch directory refused the lander's --restore here. A real build
+  # in this tree is still seen: its x.py, bootstrap, cargo, targo and rustc
+  # processes are candidates themselves, with their own cwd and command line.
+  #
+  # An AGENT HARNESS executable (codex, claude, agy, muse, grok, kimi: the agents
+  # aterm spawns, as atpkg installs them) is the same case one level up and counts
+  # by its command line only too. Its argv carries the task prompt, which names
+  # targo and rustc in prose, and it starts in the superproject: measured
+  # 2026-10-31, a read-only codex prep task (pid 87525, started 00:28, no child
+  # but its code-mode host) whose prompt said "installed genuine targo identity"
+  # and "stock cargo/rustc builds" held this checkout's --restore at exit 4 for
+  # over an hour. A build it runs is its own candidate. The executable's NAME is
+  # read from the whole comm field: atpkg installs agents under "Application
+  # Support", so the second whitespace field is "/Users/<u>/Library/Application".
+  #
+  # EVERY candidate is examined (2026-09-29). This used to keep only the 40 lowest
+  # PIDs (`| head -40`). On this machine ~140 compiler processes run at once, so the
+  # 40 lowest were other lanes' long-running builds, and a build started in THIS
+  # checkout after them — a higher PID — was never looked at: the guard failed OPEN
+  # exactly when the box was busiest.
+  local cands pid_csv by_cmd by_cwd cmd_only
   cands="$( { pgrep -f 'x\.py|[/ ]cargo |[/ ]rustc |[/ ]targo ' 2>/dev/null
-              pgrep -x bootstrap 2>/dev/null; } | sort -un | head -40)"
+              pgrep -x bootstrap 2>/dev/null; } | sort -un)"
   [ -n "$cands" ] || return 0
 
   if ! command -v lsof >/dev/null 2>&1; then
@@ -721,11 +1081,15 @@ builds_running() {
 
   pid_csv="$(printf '%s' "$cands" | tr '\n' ',' | sed 's/,$//')"
   by_cmd="$(ps -o pid=,command= -p $(printf '%s' "$cands" | tr '\n' ' ') 2>/dev/null \
-            | grep -F "$ROOT" | awk '{print $1}')"
+            | cmdlines_naming_root)"
+  cmd_only="$(ps -o pid=,comm= -p $(printf '%s' "$cands" | tr '\n' ' ') 2>/dev/null \
+            | awk '{ n = $0; sub(/^ *[0-9]+ /, "", n); sub(/.*\//, "", n); sub(/^-/, "", n)
+                     if (n ~ /^(sh|bash|zsh|dash|ksh|mksh|fish|codex|claude|agy|muse|grok|kimi)$/) printf " %s ", $1 }')"
   by_cwd="$(lsof -a -d cwd -p "$pid_csv" -Fpn 2>/dev/null \
-            | awk -v root="$ROOT" '
+            | awk -v root="$ROOT" -v cmd_only="$cmd_only" '
                 /^p/ { pid = substr($0, 2) }
                 /^n/ { path = substr($0, 2)
+                       if (index(cmd_only, " " pid " ")) next
                        if (path == root || index(path, root "/") == 1) print pid }')"
   printf '%s\n%s\n' "$by_cmd" "$by_cwd" | grep -E '^[0-9]+$' | sort -un
 }
@@ -737,22 +1101,35 @@ do_restore() {
     return
   fi
 
-  local pids
-  pids="$(builds_running)"
-  if [ -n "$pids" ] && [ "$FORCE" -ne 1 ]; then
-    echo "submodule_sync --restore: REFUSED — a build appears to be running." >&2
-    echo >&2
-    echo "  Swapping a submodule worktree mid-build produces a binary compiled from" >&2
-    echo "  two different source trees, which can pass while being meaningless." >&2
-    echo "  Wait for the build, or re-run with --force if you know these are yours:" >&2
-    echo >&2
-    ps -o pid=,command= -p $(printf '%s' "$pids" | tr '\n' ' ') 2>/dev/null | cut -c1-140 | sed 's/^/    /' >&2
-    exit 4
-  fi
+  local pids rec parent rel display restored_head key i restore_error restore_rc rc=0
+  local restored_keys=()
+  while [ "${#SAFE_ROWS[@]}" -gt 0 ]; do
+    pids="$(builds_running)"
+    if [ -n "$pids" ] && [ "$FORCE" -ne 1 ]; then
+      echo "submodule_sync --restore: REFUSED — a build appears to be running." >&2
+      echo >&2
+      echo "  Swapping a submodule worktree mid-build produces a binary compiled from" >&2
+      echo "  two different source trees, which can pass while being meaningless." >&2
+      echo "  Wait for the build, or re-run with --force if you know these are yours:" >&2
+      echo >&2
+      ps -o pid=,command= -p $(printf '%s' "$pids" | tr '\n' ' ') 2>/dev/null | cut -c1-140 | sed 's/^/    /' >&2
+      exit 4
+    fi
 
-  local rec parent rel display rc=0
-  for rec in "${SAFE_ROWS[@]}"; do
+    # A parent checkout may expose children or change their pins. Restore only
+    # one row from a classification, then walk the resulting tree again before
+    # trusting any more safety decisions. Never use a stale child's old pin.
+    rec="${SAFE_ROWS[0]}"
     display="$(field "$rec" 1)"; parent="$(field "$rec" 2)"; rel="$(field "$rec" 3)"
+    key="${parent}${TAB}${rel}${TAB}$(field "$rec" 8)"
+    i=0
+    while [ "$i" -lt "${#restored_keys[@]}" ]; do
+      if [ "${restored_keys[$i]}" = "$key" ]; then
+        echo "submodule_sync --restore: REFUSED — $display moved again after restoration." >&2
+        exit 2
+      fi
+      i=$((i + 1))
+    done
     # An ANCHORED restore MOVES OFF commits the pin does not have. That is the
     # act this tool exists to prevent doing blindly, so it never happens
     # silently: name the commits and the ref that keeps each one alive. Without
@@ -764,12 +1141,25 @@ do_restore() {
       printf '  each stays fetchable by sha from the ref above after this checkout.\n'
     fi
     printf 'restoring %s ... ' "$display"
-    if git -C "$parent" submodule update --init -- "$rel" >/dev/null 2>&1; then
-      printf 'ok (%.8s)\n' "$(git -C "$parent/$rel" rev-parse HEAD 2>/dev/null)"
+    # Keep native Git diagnostics: missing descendant objects, lock failures,
+    # permissions and transport errors must not collapse to a bare FAILED.
+    if restore_error="$(restore_module "$parent" "$rel" "$(field "$rec" 8)" "$(field "$rec" 4)" 2>&1 >/dev/null)"; then
+      restored_head="$(git -C "$parent/$rel" rev-parse HEAD 2>/dev/null)"
+      if [ "$restored_head" != "$(field "$rec" 8)" ]; then
+        printf 'FAILED (checkout did not reach the selected pin)\n'
+        rc=1
+        break
+      fi
+      printf 'ok (%.8s)\n' "$restored_head"
+      restored_keys+=("$key")
     else
-      printf 'FAILED\n'
+      restore_rc=$?
+      printf 'FAILED (git exit %s)\n' "$restore_rc"
+      [ -z "$restore_error" ] || printf '%s\n' "$restore_error" >&2
       rc=1
+      break
     fi
+    scan_modules || exit $?
   done
 
   if [ "$N_REVIEW" -gt 0 ]; then
@@ -781,6 +1171,7 @@ do_restore() {
     echo "Run scripts/submodule_sync.sh for the per-module reasoning."
     rc=2
   fi
+  [ "$rc" -ne 0 ] || emit_quiet
   exit "$rc"
 }
 

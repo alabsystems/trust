@@ -17,17 +17,23 @@ thread_local! { static ARMED: Cell<bool> = const { Cell::new(false) }; }
 struct BoobyKey(u32);
 
 impl PartialOrd for BoobyKey {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) }
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
 }
 impl Ord for BoobyKey {
     fn cmp(&self, o: &Self) -> Ordering {
-        if ARMED.with(|a| a.get()) { panic!("BoobyKey::cmp ran"); }
+        if ARMED.with(|a| a.get()) {
+            panic!("BoobyKey::cmp ran");
+        }
         self.0.cmp(&o.0)
     }
 }
 impl Drop for BoobyKey {
     fn drop(&mut self) {
-        if ARMED.with(|a| a.get()) { panic!("BoobyKey::drop ran"); }
+        if ARMED.with(|a| a.get()) {
+            panic!("BoobyKey::drop ran");
+        }
     }
 }
 
@@ -35,19 +41,25 @@ impl Drop for BoobyKey {
 struct BoobyVal(u32);
 impl Clone for BoobyVal {
     fn clone(&self) -> Self {
-        if ARMED.with(|a| a.get()) { panic!("BoobyVal::clone ran"); }
+        if ARMED.with(|a| a.get()) {
+            panic!("BoobyVal::clone ran");
+        }
         BoobyVal(self.0)
     }
 }
 impl Drop for BoobyVal {
     fn drop(&mut self) {
-        if ARMED.with(|a| a.get()) { panic!("BoobyVal::drop ran"); }
+        if ARMED.with(|a| a.get()) {
+            panic!("BoobyVal::drop ran");
+        }
     }
 }
 
 fn build() -> BTreeMap<BoobyKey, BoobyVal> {
     let mut m = BTreeMap::new();
-    for i in 0..64u32 { m.insert(BoobyKey(i), BoobyVal(i * 3)); }
+    for i in 0..64u32 {
+        m.insert(BoobyKey(i), BoobyVal(i * 3));
+    }
     m
 }
 
@@ -73,7 +85,9 @@ fn k2_btreemap_iter_next_runs_no_user_code() {
 #[test]
 fn k2_btreeset_iter_next_runs_no_user_code() {
     let mut s = BTreeSet::new();
-    for i in 0..64u32 { s.insert(BoobyKey(i)); }
+    for i in 0..64u32 {
+        s.insert(BoobyKey(i));
+    }
     ARMED.with(|a| a.set(true));
     let n = s.iter().fold(0u32, |acc, k| acc + k.0);
     ARMED.with(|a| a.set(false));
@@ -86,8 +100,12 @@ fn k2_keys_values_enumerate_run_no_user_code() {
     let m = build();
     ARMED.with(|a| a.set(true));
     let mut c = 0usize;
-    for (i, k) in m.keys().enumerate() { c += i + k.0 as usize; }
-    for v in m.values() { c += v.0 as usize; }
+    for (i, k) in m.keys().enumerate() {
+        c += i + k.0 as usize;
+    }
+    for v in m.values() {
+        c += v.0 as usize;
+    }
     ARMED.with(|a| a.set(false));
     assert!(c > 0);
     std::mem::forget(m);
@@ -102,10 +120,15 @@ fn k1_filter_over_btree_iter_really_panics() {
     // `Filter<btree::map::Iter>` is a CLOSURE adapter: its `next` drives user code.
     // The gate lists no `Filter` arm, so it stays fail-closed — this witness shows
     // what admitting it would have certified away.
-    let _n = m.iter().filter(|(k, _)| {
-        if k.0 == 7 { panic!("user filter predicate panicked"); }
-        true
-    }).count();
+    let _n = m
+        .iter()
+        .filter(|(k, _)| {
+            if k.0 == 7 {
+                panic!("user filter predicate panicked");
+            }
+            true
+        })
+        .count();
     std::mem::forget(m);
 }
 
@@ -113,17 +136,24 @@ fn k1_filter_over_btree_iter_really_panics() {
 #[should_panic(expected = "user map closure panicked")]
 fn k1_map_over_btree_iter_really_panics() {
     let m = build();
-    let _s: u32 = m.iter().map(|(k, _)| {
-        if k.0 == 9 { panic!("user map closure panicked"); }
-        k.0
-    }).sum();
+    let _s: u32 = m
+        .iter()
+        .map(|(k, _)| {
+            if k.0 == 9 {
+                panic!("user map closure panicked");
+            }
+            k.0
+        })
+        .sum();
     std::mem::forget(m);
 }
 
 #[derive(Debug)]
 struct CloneBomb(u32);
 impl Clone for CloneBomb {
-    fn clone(&self) -> Self { panic!("CloneBomb::clone ran"); }
+    fn clone(&self) -> Self {
+        panic!("CloneBomb::clone ran");
+    }
 }
 
 #[test]
@@ -132,7 +162,9 @@ fn k1_cloned_over_btree_values_really_panics() {
     // `Cloned<btree::map::Values>` runs `V::clone` inside `next` — also absent from the
     // gate. Uses a benign-Drop bomb so the witness unwinds cleanly.
     let mut m: BTreeMap<u32, CloneBomb> = BTreeMap::new();
-    for i in 0..8u32 { m.insert(i, CloneBomb(i)); }
+    for i in 0..8u32 {
+        m.insert(i, CloneBomb(i));
+    }
     let _v: Vec<CloneBomb> = m.values().cloned().collect();
     unreachable!();
 }
@@ -140,11 +172,15 @@ fn k1_cloned_over_btree_values_really_panics() {
 #[derive(Debug, PartialEq, Eq)]
 struct CmpBomb(u32);
 impl PartialOrd for CmpBomb {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) }
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
 }
 impl Ord for CmpBomb {
     fn cmp(&self, o: &Self) -> Ordering {
-        if CMP_ARMED.with(|a| a.get()) { panic!("CmpBomb::cmp ran"); }
+        if CMP_ARMED.with(|a| a.get()) {
+            panic!("CmpBomb::cmp ran");
+        }
         self.0.cmp(&o.0)
     }
 }
@@ -156,7 +192,9 @@ fn k1_insert_does_run_user_cmp() {
     // CONTROL. Without this, K2 could be vacuous — passing because the user `Ord` is
     // never callable at all rather than because `next` avoids it. Insert DOES reach it.
     let mut m: BTreeMap<CmpBomb, u32> = BTreeMap::new();
-    for i in 0..8u32 { m.insert(CmpBomb(i), i); }
+    for i in 0..8u32 {
+        m.insert(CmpBomb(i), i);
+    }
     CMP_ARMED.with(|a| a.set(true));
     m.insert(CmpBomb(999), 0);
     unreachable!();
@@ -167,7 +205,9 @@ fn k2_cmpbomb_iteration_is_clean_after_insert_control() {
     // The K2 claim restated on the CONTROL's own key type: same map, same armed `cmp`,
     // iteration completes.
     let mut m: BTreeMap<CmpBomb, u32> = BTreeMap::new();
-    for i in 0..64u32 { m.insert(CmpBomb(i), i); }
+    for i in 0..64u32 {
+        m.insert(CmpBomb(i), i);
+    }
     CMP_ARMED.with(|a| a.set(true));
     let n: u32 = m.iter().map(|(k, _)| k.0).sum();
     CMP_ARMED.with(|a| a.set(false));

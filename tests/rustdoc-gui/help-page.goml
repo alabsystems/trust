@@ -1,4 +1,5 @@
 // This test ensures that opening the help page in its own tab works.
+include: "utils.goml"
 go-to: "file://" + |DOC_PATH| + "/help.html"
 set-window-size: (1000, 1000) // Try desktop size first.
 wait-for: "#help"
@@ -55,16 +56,36 @@ wait-for: "#search-tabs" // Waiting for the search.js to load.
 set-window-size: (1000, 1000) // Only supported on desktop.
 assert-false: "#help"
 click: "rustdoc-toolbar .help-menu > a"
-assert-css: ("#help", {"display": "block"})
+wait-for-css: ("#help", {"display": "block"})
 assert-css: ("#help dd", {"font-size": "16px"})
+
+define-function: ("check-arrow-color", [theme], block {
+    call-function: ("switch-theme", {"theme": |theme|})
+    click: "rustdoc-toolbar .help-menu > a"
+    wait-for-css: ("#help", {"display": "block"})
+    store-css: ("#help", {"background-color": background})
+    assert-css: ("#help::before", {
+        "background-color": |background|,
+    })
+})
+
+// We check that the "top arrow" has the same color as the popover background.
+call-function: ("check-arrow-color", {"theme": "ayu"})
+call-function: ("check-arrow-color", {"theme": "dark"})
+call-function: ("check-arrow-color", {"theme": "light"})
+
 click: "rustdoc-toolbar .help-menu > a"
 assert-false: "#help"
 
-// This test ensures that the "the rustdoc book" anchor link within the help popover works.
+// Trust: the help popover points to the Trust documentation shipped with the
+// toolchain instead of linking the rustdoc book (see buildHelpMenu in main.js).
 go-to: "file://" + |DOC_PATH| + "/test_docs/index.html?search=a"
 wait-for: "#search-tabs" // Waiting for the search.js to load.
 set-window-size: (1000, 1000) // Popover only appears when the screen width is >700px.
 assert-false: "#help"
 click: "rustdoc-toolbar .help-menu > a"
-click: "//*[@id='help']//a[text()='the rustdoc book']"
-wait-for-document-property: ({"URL": "https://doc.rust-lang.org/"}, STARTS_WITH)
+assert-text: (
+    "#help span.top",
+    "Use the Trust documentation shipped with this toolchain for more information.",
+)
+assert-false: "//*[@id='help']//a[text()='the rustdoc book']"

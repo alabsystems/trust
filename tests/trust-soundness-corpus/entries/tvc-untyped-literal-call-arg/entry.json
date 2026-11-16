@@ -1,0 +1,31 @@
+{
+  "id": "tvc-untyped-literal-call-arg",
+  "class": "trust-vc untyped literal (930d025f)",
+  "title": "an unsuffixed literal bound by an unascribed let was read at its i32 placeholder; its type is fixed by a later call argument",
+  "origin": [
+    "trust-vc 930d025f 'type untyped literals at their slot'",
+    "trust-vc crates/trust-vc-core/tests/untyped_literal_binding_soundness.rs never_binding_typed_by_call_arg_used_in_assert"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "never_binding_typed_by_call_arg_used_in_assert",
+    "obligation": {
+      "kind": "overflow",
+      "at": "*r + 100"
+    }
+  },
+  "twin": {
+    "function": "verified_borrow_i32",
+    "obligation": {
+      "kind": "overflow",
+      "at": "*r + 100"
+    }
+  },
+  "witness": {
+    "input": "(none: a = 200u8)",
+    "observed": "attempt to add with overflow",
+    "exit": 101,
+    "main": "witness.rs"
+  }
+}

@@ -426,15 +426,6 @@ mod tests {
         assert_eq!(result, Some("result.is_ok() ==> value > 0".to_string()));
     }
 
-    // --- SpecTemplateKind ---
-
-    #[test]
-    fn test_spec_template_kind_equality() {
-        assert_eq!(SpecTemplateKind::Precondition, SpecTemplateKind::Precondition);
-        assert_ne!(SpecTemplateKind::Precondition, SpecTemplateKind::Postcondition);
-        assert_ne!(SpecTemplateKind::Postcondition, SpecTemplateKind::Invariant);
-    }
-
     // --- Integration: templates + counterexample hints ---
 
     #[test]

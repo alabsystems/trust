@@ -16,6 +16,9 @@ use std::str::SplitWhitespace;
 
 use shlex::Shlex;
 
+// Trust: native-link kinds follow llvm-config's exact selected files, including Polly.
+mod native_link;
+
 const OPTIONAL_COMPONENTS: &[&str] = &[
     "x86",
     "arm",
@@ -172,6 +175,12 @@ impl<'a> IntoIterator for &'a LlvmConfigOutput {
     }
 }
 
+fn is_libstdcxx_cxx11_abi_flag(flag: &str) -> bool {
+    flag == "-D_GLIBCXX_USE_CXX11_ABI"
+        || flag.starts_with("-D_GLIBCXX_USE_CXX11_ABI=")
+        || flag == "-U_GLIBCXX_USE_CXX11_ABI"
+}
+
 fn main() {
     if cfg!(feature = "check_only") {
         return;
@@ -257,13 +266,24 @@ fn main() {
     // for this platform. See https://github.com/rust-lang/rust/pull/145031#issuecomment-3162677202.
     // Moreover, LLVM generally guarantees warning-freedom only when building with Clang, as other
     // compilers have too many false positives. This is typically the case for MSVC, which throws
-    // many false-positive warnings. We keep it excluded, for these reasons.
-    if std::env::var_os("CI").is_some() && !target.contains("msvc") {
+    // many false-positive warnings, and also GCC. We keep these excluded, for these reasons.
+    let is_msvc = target.contains("msvc");
+    let compiler_is_gcc =
+        tracked_env_var_os("LLVM_COMPILER_IS_GNU_LIKE").as_deref() == Some(OsStr::new("1"));
+    if std::env::var_os("CI").is_some() && !is_msvc && !compiler_is_gcc {
         cfg.warnings_into_errors(true);
     }
     for flag in &cxxflags {
         // Ignore flags like `-m64` when we're doing a cross build
         if is_crossed && flag.starts_with("-m") {
+            continue;
+        }
+
+        // This is a libstdc++ implementation detail for the C++ library that
+        // built the runnable llvm-config. When cross-compiling, target LLVM may
+        // have been built against a target libstdc++ with a different default.
+        // Let the target compiler/toolchain select its ABI instead.
+        if is_crossed && is_libstdcxx_cxx11_abi_flag(flag.as_ref()) {
             continue;
         }
 
@@ -283,15 +303,6 @@ fn main() {
         }
 
         cfg.flag(&*flag);
-    }
-
-    // Remap ci-llvm include paths in debug info for reproducible builds.
-    if let Some(maps) = tracked_env_var_os("RUSTC_DEBUGINFO_MAP")
-        && let Some(maps_str) = maps.to_str()
-    {
-        for map in maps_str.split('\t') {
-            cfg.flag_if_supported(&format!("-ffile-prefix-map={map}"));
-        }
     }
 
     for component in &components {
@@ -328,18 +339,76 @@ fn main() {
 
     let (llvm_kind, llvm_link_arg) = detect_llvm_link();
 
-    // Link in all LLVM libraries, if we're using the "wrong" llvm-config then
-    // we don't pick up system libs because unfortunately they're for the host
-    // of llvm-config, not the target that we're attempting to link.
+    // Trust: pair --libs with --libfiles for the identical link mode and
+    // component set. LLVM extensions such as Polly do not start with LLVM,
+    // but their selected .a files must still be bundled as static libraries.
     let mut cmd = Command::new(&llvm_config);
     cmd.arg(llvm_link_arg).arg("--libs");
+    cmd.args(&components);
+    let llvm_libs = quoted_split(cmd);
+    let selected_libraries = native_link::native_inventory(
+        || {
+            let mut cmd = Command::new(&llvm_config);
+            cmd.arg(llvm_link_arg).arg("--libfiles").args(&components);
+            let selected_files = quoted_split(cmd);
+            (&selected_files).into_iter().map(|path| PathBuf::from(path.as_ref())).collect()
+        },
+        &target,
+        llvm_kind == "dylib",
+        is_crossed,
+    )
+    .unwrap_or_else(|error| panic!("invalid selected LLVM native-link closure: {error}"));
+    // Trust: a static LLVM file inventory does not authorize unrelated siblings
+    // (notably a private libc++ runtime) as native library search providers.
+    let isolated_search = selected_libraries.as_ref().map(|libraries| {
+        let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+        native_link::isolate_static_search(libraries, &output)
+            .unwrap_or_else(|error| panic!("could not isolate selected LLVM archives: {error}"))
+    });
 
-    // Don't link system libs if cross-compiling unless targeting Windows from Windows host.
-    // On Windows system DLLs aren't linked directly, instead import libraries are used.
-    // These import libraries are independent of the host.
-    if !is_crossed || target.contains("windows") && host.contains("windows") {
-        cmd.arg("--system-libs");
+    // Trust: preserve the host/target boundary for system dependencies.
+    let system_libs = if !is_crossed || target.contains("windows") && host.contains("windows") {
+        let mut cmd = Command::new(&llvm_config);
+        cmd.arg(llvm_link_arg).arg("--system-libs").args(&components);
+        quoted_split(cmd)
+    } else {
+        LlvmConfigOutput::UnquotedPaths(String::new())
+    };
+    // Trust: macOS provides no SDK zstd link stub. Bind the static provider
+    // selected by its own metadata, so the rlib bundles the actual dependency
+    // instead of exporting an unresolvable -lzstd to rustc_private consumers.
+    let zstd_input = if target.contains("apple-darwin") && llvm_kind == "static" {
+        native_link::system_zstd_input(&system_libs)
+            .unwrap_or_else(|error| panic!("invalid LLVM zstd input: {error}"))
+    } else {
+        native_link::ZstdInput::default()
+    };
+    for path in &zstd_input.watch_paths {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
+    let static_zstd = if !zstd_input.provider_tokens.is_empty() {
+        for variable in ["PATH", "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR"] {
+            let _ = tracked_env_var_os(variable);
+        }
+        let provider = tracked_env_var_os("PKG_CONFIG").unwrap_or_else(|| "pkg-config".into());
+        let directory = tracked_env_var_os("LLVM_ZSTD_PC_DIR").filter(|value| !value.is_empty());
+        let resolved = match directory {
+            Some(directory) => {
+                native_link::static_zstd_in(Path::new(&provider), &target, Path::new(&directory))
+            }
+            None => native_link::static_zstd(Path::new(&provider), &target),
+        }
+        .unwrap_or_else(|error| panic!("could not close LLVM's static zstd dependency: {error}"));
+        for path in [&resolved.provider, &resolved.metadata, &resolved.library.path]
+            .into_iter()
+            .chain(&resolved.watch_paths)
+        {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+        Some(resolved)
+    } else {
+        None
+    };
 
     // We need libkstat for getHostCPUName on SPARC builds.
     // See also: https://github.com/llvm/llvm-project/issues/64186
@@ -377,11 +446,36 @@ fn main() {
         println!("cargo:rustc-link-lib=z");
         println!("cargo:rustc-link-lib=execinfo");
     }
-    cmd.args(&components);
-
-    for lib in &quoted_split(cmd) {
+    // Trust: LLVM-owned files and OS/system dependencies have different link
+    // authorities; a bare system name is not evidence of a static archive.
+    for (lib, is_llvm_library) in (&llvm_libs)
+        .into_iter()
+        .map(|lib| (lib, true))
+        .chain((&system_libs).into_iter().map(|lib| (lib, false)))
+    {
+        // Trust: bind each owned link token to its selected file, including
+        // versioned shared paths and Windows import-library semantics.
+        let selected =
+            if let Some(inventory) = selected_libraries.as_ref().filter(|_| is_llvm_library) {
+                match native_link::selected_library(&lib, inventory, &target, llvm_kind == "dylib")
+                    .unwrap_or_else(|error| panic!("invalid LLVM native-link closure: {error}"))
+                {
+                    Some(selected) => Some(selected),
+                    None => continue,
+                }
+            } else {
+                None
+            };
         let mut is_static = false;
-        let name = if let Some(stripped) = lib.strip_prefix("-l") {
+        let name = if let Some(selected) = selected {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                isolated_search.as_ref().expect("static inventory search").directory.display()
+            );
+            selected.name.as_str()
+        } else if zstd_input.provider_tokens.contains(lib.as_ref()) {
+            "zstd"
+        } else if let Some(stripped) = lib.strip_prefix("-l") {
             stripped
         } else if let Some(stripped) = lib.strip_prefix('-') {
             stripped
@@ -443,6 +537,26 @@ fn main() {
             continue;
         }
 
+        // Trust: resolve the selected file before normalizing its linker name.
+        let kind = if let Some(selected) = selected {
+            println!("cargo:rerun-if-changed={}", selected.path.display());
+            selected.kind.rustc_name()
+        } else if selected_libraries.is_none() && name.starts_with("LLVM") {
+            // Trust: preserve shared/crossed LLVM's legacy policy. The
+            // runnable host's files cannot authorize target archive kinds.
+            llvm_kind
+        } else if let Some(resolved) = static_zstd.as_ref().filter(|_| name == "zstd") {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                resolved.library.path.parent().unwrap().display(),
+            );
+            resolved.library.kind.rustc_name()
+        } else if is_static {
+            "static"
+        } else {
+            "dylib"
+        };
+
         // On apple-darwin, llvm-config reports the versioned shared library name such as LLVM-22-..., but
         // the distributed toolchain ships libLLVM.dylib. Normalize the link name here.
         let name =
@@ -453,13 +567,6 @@ fn main() {
                 name
             };
 
-        let kind = if name.starts_with("LLVM") {
-            llvm_kind
-        } else if is_static {
-            "static"
-        } else {
-            "dylib"
-        };
         println!("cargo:rustc-link-lib={kind}={name}");
     }
 
@@ -479,11 +586,17 @@ fn main() {
                 println!("cargo:rustc-link-search=native={}", stripped.replace(&host, &target));
             }
         } else if let Some(stripped) = lib.strip_prefix("-LIBPATH:") {
-            println!("cargo:rustc-link-search=native={stripped}");
+            if !isolated_search.as_ref().is_some_and(|search| search.replaces(Path::new(stripped)))
+            {
+                println!("cargo:rustc-link-search=native={stripped}");
+            }
         } else if let Some(stripped) = lib.strip_prefix("-l") {
             println!("cargo:rustc-link-lib={stripped}");
         } else if let Some(stripped) = lib.strip_prefix("-L") {
-            println!("cargo:rustc-link-search=native={stripped}");
+            if !isolated_search.as_ref().is_some_and(|search| search.replaces(Path::new(stripped)))
+            {
+                println!("cargo:rustc-link-search=native={stripped}");
+            }
         }
     }
 
@@ -508,9 +621,8 @@ fn main() {
     let llvm_static_stdcpp = tracked_env_var_os("LLVM_STATIC_STDCPP");
     let llvm_use_libcxx = tracked_env_var_os("LLVM_USE_LIBCXX");
 
-    let stdcppname = if target.contains("openbsd") {
-        if target.contains("sparc64") { "estdc++" } else { "c++" }
-    } else if target.contains("darwin")
+    let stdcppname = if target.contains("openbsd")
+        || target.contains("darwin")
         || target.contains("freebsd")
         || target.contains("windows-gnullvm")
         || target.contains("aix")

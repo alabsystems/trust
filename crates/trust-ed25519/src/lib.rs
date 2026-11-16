@@ -306,7 +306,7 @@ impl Signature {
 ///
 /// So the randomness stays with the caller, who has an RNG already:
 ///
-/// ```ignore
+/// ```ignore (illustrative)
 /// let mut seed = [0u8; 32];
 /// rand::thread_rng().fill_bytes(&mut seed);
 /// let key = SigningKey::from_bytes(&seed);

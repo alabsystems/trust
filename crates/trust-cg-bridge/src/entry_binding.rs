@@ -195,7 +195,12 @@ pub fn compute_entry_preservation(
     // This is what makes a table built for the wrong body (or the wrong
     // architecture) refuse instead of silently binding the wrong register.
     for param in &bindings.params {
-        let Some(local) = body.locals.iter().find(|l| l.index == param.local_index) else {
+        let local = body
+            .locals
+            .get(param.local_index)
+            .filter(|l| l.index == param.local_index)
+            .or_else(|| body.locals.iter().find(|l| l.index == param.local_index));
+        let Some(local) = local else {
             return refuse(format!(
                 "entry binding {} names local {} which does not exist in the body",
                 param.reg_name, param.local_index
@@ -364,10 +369,18 @@ pub struct LoadShapeRoot {
 /// amount, a missing byte, a different memory operand) returns `None`. Only
 /// the root's shape is trusted from extraction; everything else is recomputed.
 pub fn recognize_le_load(formula: &Formula) -> Option<LoadShapeRoot> {
-    // Walk the left spine of the BvOr chain to the base term.
+    // Walk the left spine of the BvOr chain to the base term (7 BvOr steps for an 8-byte load).
     let mut base = formula;
+    let mut or_depth = 0usize;
     while let Formula::BvOr(lhs, _, 64) = base {
+        or_depth += 1;
+        if or_depth > 7 {
+            return None;
+        }
         base = lhs;
+    }
+    if or_depth != 7 {
+        return None;
     }
     // Base term: BvZeroExt(Select(mem_seed, root), 56).
     let Formula::BvZeroExt(inner, 56) = base else {

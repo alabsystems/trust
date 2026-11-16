@@ -1,5 +1,6 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,9 +13,9 @@ use trust_release::{GateFinding, GateReport, GateStatus};
 use trust_version::BoundToolIdentity;
 
 use super::identity::{
-    bound_file_sha256, discover_repo_root, exact_file_sha256_with_prefix, file_sha256,
-    generated_at_unix_seconds, is_executable_file, option_value, repo_dirty, repo_dirty_metadata,
-    repo_relative_path, trustd_version_output_is_bound,
+    RepositoryStatus, TOOL_IDENTITY_PROBE_HANG_GUARD, bound_file_sha256, discover_repo_root,
+    file_sha256, generated_at_unix_seconds, is_executable_file, option_value, repo_relative_path,
+    repository_status, trustd_version_output_is_bound,
 };
 pub(super) use super::product_proof_catalog::{
     product_proof_component_requirements, product_proof_evidence_class_requirements,
@@ -38,11 +39,23 @@ const PRODUCT_PROOF_RELEASE_ARTIFACT_SCHEMA: &str =
     "trust.product-proof-release-artifact-report.v1";
 const PRODUCT_PROOF_RELEASE_BINDING_SCHEMA: &str = "trust.product-proof-release-binding.v1";
 const PRODUCT_PROOF_RELEASE_CERTIFICATE_SCHEMA: &str = "trust.product-proof-release-certificate.v1";
+const SELECTED_IMAGE_REPLAY_SCHEMA: &str = "trust.product-proof-selected-image-replay.v1";
 const PRODUCT_PROOF_STUB_COMMAND: &str = "targo trust release product-proof-stub";
 const PRODUCT_PROOF_REPORT_COMMAND: &str = "targo trust release product-proof-report";
 const PRODUCT_PROOF_SOLVER_EVIDENCE_UNVERIFIED: &str = "product-proof-solver-evidence-unverified";
 const PRODUCT_PROOF_DEFAULT_RELEASE_CERTIFICATE_PATH: &str =
     "release/evidence/product-proof/product-proof-release-certificate.json";
+// The maintained vendored source distribution includes LLVM and all nine
+// first-party repositories. The 2026-09-25 archive has 508,468 entries, 2.67 GB
+// compressed and 8.55 GB of file contents; tar framing adds further bytes.
+// Decode in bounded memory, retaining only bounded path metadata (see below).
+const MAX_SOURCE_ARCHIVE_COMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_SOURCE_ARCHIVE_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_SOURCE_ARCHIVE_MEMBERS: usize = 1_000_000;
+mod source_archive;
+const MAX_SOURCE_ARCHIVE_LONGNAME_BYTES: u64 = 64 * 1024;
+const MAX_SOURCE_ARCHIVE_XZ_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SOURCE_ARCHIVE_XZ_PADDING_BYTES: u64 = 1024 * 1024;
 const PRODUCT_PROOF_RELEASE_REQUIRED_COMPILE_BACK_KINDS: &[&str] = &[
     "compile-back-artifact-digests-bound",
     "compile-back-lifted-binary-trust_ir-sha256",
@@ -710,9 +723,17 @@ fn repo_relative_exact_file(root: &Path, path_text: &str) -> Option<PathBuf> {
             return None;
         };
         current.push(name);
-        let metadata = fs::symlink_metadata(&current).ok()?;
+        let mut metadata = fs::symlink_metadata(&current).ok()?;
         if metadata.file_type().is_symlink() {
-            return None;
+            // The one admitted link: `build` itself under the sanctioned
+            // `build -> build.noindex` Spotlight layout (docs/BUILD_AND_INSTALL.md).
+            if index != 0
+                || name.to_str() != Some("build")
+                || !crate::stage2_tools::is_sanctioned_build_link(root)
+            {
+                return None;
+            }
+            metadata = fs::metadata(&current).ok()?;
         }
         let is_last = index + 1 == components.len();
         if (is_last && !metadata.file_type().is_file())
@@ -786,6 +807,17 @@ fn build_product_proof_stub_evidence(
             "--selected-image-range must be a numeric `<start>..<end>` range".to_string()
         })?;
         binding.insert("selected_image_range".to_string(), normalized_range.into());
+    }
+    if matches!(
+        evidence_kind,
+        "compile-back-artifact-digests-bound" | "compile-back-selected-image-range"
+    ) {
+        if let Some(defect) = selected_image_range_binding_defect(
+            root,
+            Some(&serde_json::Value::Object(binding.clone())),
+        ) {
+            return Err(format!("`{evidence_kind}` selected-image range is invalid: {defect}"));
+        }
     }
 
     let mut evidence = json!({
@@ -1071,9 +1103,15 @@ fn product_proof_source_tarball_binding_from_path(
     if !source_tarball_path_satisfied(path_text) {
         return Err(format!("--source-tarball path `{path_text}` must name a .tar.xz archive"));
     }
-    let sha256 = exact_xz_file_sha256(&path).ok_or_else(|| {
-        format!("--source-tarball {} is not an immutable exact regular XZ archive", path.display())
+    let (sha256, archive_commit) = source_tarball_archive_identity(&path).map_err(|detail| {
+        format!("--source-tarball {} is not a bound source archive: {detail}", path.display())
     })?;
+    if archive_commit != candidate_commit {
+        return Err(format!(
+            "--source-tarball {} embeds git-commit-hash {archive_commit}, expected candidate {candidate_commit}",
+            path.display()
+        ));
+    }
     Ok(json!({
         "path": path_text,
         "sha256": sha256,
@@ -1132,6 +1170,10 @@ fn build_product_proof_stub_release_report(
     let evidence_ref = options.out.as_deref().and_then(|out| {
         options.evidence_kind.as_deref().map(|kind| format!("{}:{}", kind.trim(), out.trim()))
     });
+    let repo_status = repository_status(
+        root,
+        evidence.get("candidate_commit").and_then(serde_json::Value::as_str),
+    );
 
     Ok(json!({
         "schema_version": PRODUCT_PROOF_RELEASE_ARTIFACT_SCHEMA,
@@ -1143,8 +1185,8 @@ fn build_product_proof_stub_release_report(
             .get("candidate_commit_binding")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
-        "repo_dirty": repo_dirty(root),
-        "repo_dirty_metadata": repo_dirty_metadata(root),
+        "repo_dirty": repo_status.is_dirty_or_unavailable(),
+        "repo_dirty_metadata": repo_status.metadata(),
         "runner": evidence.get("runner").cloned().unwrap_or_else(product_proof_stub_runner_json),
         "candidate_command": PRODUCT_PROOF_STUB_COMMAND,
         "candidate_command_version": CANDIDATE_COMMAND_VERSION,
@@ -1233,11 +1275,7 @@ fn build_product_proof_release_report(
     evidence_path: &Path,
 ) -> serde_json::Value {
     let generated_at = generated_at_unix_seconds();
-    let current_repo_dirty_metadata = repo_dirty_metadata(root);
-    let current_repo_dirty = current_repo_dirty_metadata
-        .get("dirty")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+    let current_repo_status = repository_status(root, Some(candidate_commit));
     let evidence_result = read_product_proof_release_evidence(evidence_path);
     let (evidence, evidence_sha256, mut findings) = match evidence_result {
         Ok((evidence, sha256)) => {
@@ -1251,8 +1289,11 @@ fn build_product_proof_release_report(
         }
         Err(finding) => (None, None, vec![finding]),
     };
-    findings
-        .extend(product_proof_release_current_repo_findings(root, &current_repo_dirty_metadata));
+    findings.extend(product_proof_release_current_repo_findings(
+        root,
+        candidate_commit,
+        &current_repo_status,
+    ));
     let evidence = evidence.as_ref();
     let passed = findings.is_empty();
     let status = if passed { "passed" } else { "blocked" };
@@ -1270,8 +1311,8 @@ fn build_product_proof_release_report(
         "artifact_kind": "product-proof-release-report",
         "candidate_commit": candidate_commit,
         "candidate_commit_binding": candidate_commit_binding,
-        "repo_dirty": current_repo_dirty,
-        "repo_dirty_metadata": current_repo_dirty_metadata,
+        "repo_dirty": current_repo_status.is_dirty_or_unavailable(),
+        "repo_dirty_metadata": current_repo_status.metadata(),
         "runner": product_proof_release_report_runner_json(),
         "candidate_command": PRODUCT_PROOF_REPORT_COMMAND,
         "candidate_command_version": CANDIDATE_COMMAND_VERSION,
@@ -1310,6 +1351,13 @@ fn build_product_proof_release_report(
                     "reason": "product-proof evidence could not be parsed",
                 })
             }),
+        "selected_image_replay_check": evidence
+            .map(|value| selected_image_replay_check_json(root, candidate_commit, value))
+            .unwrap_or_else(|| json!({
+                "status": "blocked",
+                "scope": "selected-image-byte-relation-only",
+                "reason": "product-proof evidence could not be parsed",
+            })),
         "release_artifact_binding_check": evidence
             .map(|value| {
                 product_proof_release_artifact_binding_check_json(root, candidate_commit, value)
@@ -1339,35 +1387,28 @@ fn build_product_proof_release_report(
 
 fn product_proof_release_current_repo_findings(
     root: &Path,
-    metadata: &serde_json::Value,
+    candidate_commit: &str,
+    status: &RepositoryStatus,
 ) -> Vec<GateFinding> {
-    if metadata.get("available").and_then(serde_json::Value::as_bool) != Some(true) {
-        return vec![GateFinding::blocker(
-            "product-proof-release-repo-provenance-unavailable",
-            format!(
-                "{} must be a git repository with available status before emitting product-proof release evidence",
-                root.display()
-            ),
-        )];
-    }
-
-    if metadata.get("dirty").and_then(serde_json::Value::as_bool) == Some(true) {
-        let dirty_entries = metadata
-            .get("porcelain_v1")
-            .and_then(serde_json::Value::as_array)
-            .map(Vec::len)
-            .unwrap_or(0);
-        return vec![GateFinding::blocker(
+    match status {
+        RepositoryStatus::Clean => Vec::new(),
+        RepositoryStatus::Dirty(lines) => vec![GateFinding::blocker(
             "product-proof-release-repo-dirty",
             format!(
-                "{} must be clean before emitting product-proof release evidence; git status has {dirty_entries} entr{}",
+                "{} must be clean before emitting product-proof release evidence; git status has {} entr{}",
                 root.display(),
-                if dirty_entries == 1 { "y" } else { "ies" }
+                lines.len(),
+                if lines.len() == 1 { "y" } else { "ies" }
             ),
-        )];
+        )],
+        RepositoryStatus::Unavailable(error) => vec![GateFinding::blocker(
+            "product-proof-release-repo-provenance-unavailable",
+            format!(
+                "{} repository status for candidate {candidate_commit} is unavailable: {error}",
+                root.display()
+            ),
+        )],
     }
-
-    Vec::new()
 }
 
 fn read_product_proof_release_evidence(
@@ -1553,6 +1594,12 @@ fn validate_product_proof_release_artifact_evidence(
             ),
         ));
     }
+    if let Err(detail) = replay_selected_image_range(root, candidate_commit, evidence) {
+        findings.push(GateFinding::blocker(
+            "product-proof-selected-image-replay-invalid",
+            format!("{} selected-image byte replay failed: {detail}", evidence_path.display()),
+        ));
+    }
     findings.push(GateFinding::blocker(
         PRODUCT_PROOF_SOLVER_EVIDENCE_UNVERIFIED,
         format!(
@@ -1645,42 +1692,26 @@ fn runner_clean_provenance_defect(evidence: &serde_json::Value) -> Option<String
         "runner.git_dirty",
         "runner.git.dirty",
     ];
-    for path in dirty_paths {
-        if dotted_bool(evidence, path) == Some(true) {
-            return Some(format!("declares {path}=true"));
+    let clean_paths =
+        ["repo_clean", "provenance.repo_clean", "runner.repo_clean", "runner.git.clean"];
+
+    let mut saw_clean = false;
+    for (paths, expected) in [(dirty_paths.as_slice(), false), (clean_paths.as_slice(), true)] {
+        for path in paths {
+            let Some(value) = dotted_value(evidence, path) else {
+                continue;
+            };
+            match value.as_bool() {
+                Some(actual) if actual == expected => saw_clean = true,
+                Some(actual) => return Some(format!("declares {path}={actual}")),
+                None => return Some(format!("declares {path} with a non-boolean value")),
+            }
         }
     }
 
-    let clean_paths = [
-        ("repo_dirty", false),
-        ("repo_dirty_metadata.dirty", false),
-        ("repo_clean", true),
-        ("provenance.repo_dirty", false),
-        ("provenance.repo_dirty_metadata.dirty", false),
-        ("provenance.repo_clean", true),
-        ("runner.repo_dirty", false),
-        ("runner.repo_dirty_metadata.dirty", false),
-        ("runner.repo_clean", true),
-        ("runner.git_dirty", false),
-        ("runner.git.dirty", false),
-        ("runner.git.clean", true),
-    ];
-    if clean_paths.iter().any(|(path, expected)| dotted_bool(evidence, path) == Some(*expected)) {
-        None
-    } else {
-        Some(
-            "declares no explicit clean git/worktree provenance such as runner.repo_dirty=false"
-                .to_string(),
-        )
-    }
-}
-
-fn dotted_bool(value: &serde_json::Value, path: &str) -> Option<bool> {
-    dotted_value(value, path).and_then(|value| match value {
-        serde_json::Value::Bool(value) => Some(*value),
-        serde_json::Value::String(text) if text.eq_ignore_ascii_case("true") => Some(true),
-        serde_json::Value::String(text) if text.eq_ignore_ascii_case("false") => Some(false),
-        _ => None,
+    (!saw_clean).then(|| {
+        "declares no explicit clean git/worktree provenance such as runner.repo_dirty=false"
+            .to_string()
     })
 }
 
@@ -1688,20 +1719,178 @@ fn selected_image_release_binding_defect(
     root: &Path,
     evidence: &serde_json::Value,
 ) -> Option<String> {
-    let binding = evidence.get("compile_back_artifact_digest_binding");
-    if let Some(detail) = compile_back_digest_requirement_defect(
+    selected_image_range_binding_defect(root, evidence.get("compile_back_artifact_digest_binding"))
+}
+
+// This is a replay of one finite byte relation, not a compile-back proof or
+// evidence that the candidate compiler produced either artifact.
+fn replay_selected_image_range(
+    root: &Path,
+    candidate_commit: &str,
+    evidence: &serde_json::Value,
+) -> Result<(), String> {
+    let replay =
+        evidence.get("selected_image_replay").ok_or("missing selected_image_replay transcript")?;
+    for field in ["obligations", "transcript"] {
+        if replay.get(field).and_then(serde_json::Value::as_array).map(Vec::len) != Some(1) {
+            return Err(format!("selected_image_replay.{field} must contain exactly one entry"));
+        }
+    }
+    let expected = expected_selected_image_replay(root, candidate_commit, evidence)?;
+    if replay != &expected {
+        return Err("selected_image_replay is not the exact closed candidate/tree/executable/artifact/obligation transcript recomputed from live bytes".to_string());
+    }
+    Ok(())
+}
+
+fn expected_selected_image_replay(
+    root: &Path,
+    candidate_commit: &str,
+    evidence: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if declared_candidate_commit(evidence) != Some(candidate_commit) {
+        return Err("selected-image evidence does not bind the requested candidate commit".into());
+    }
+    let mut candidate_values = Vec::new();
+    collect_candidate_commit_values(evidence, &mut candidate_values);
+    if candidate_values.iter().any(|value| *value != candidate_commit) {
+        return Err("selected-image replay contains a conflicting candidate commit".into());
+    }
+    let head = crate::controlled_git::canonical_head(
         root,
-        binding,
-        &COMPILE_BACK_SELECTED_IMAGE_DIGEST[0],
-    ) {
-        return Some(detail);
+        "selected-image replay candidate HEAD",
+        64 * 1024,
+        Duration::from_secs(10),
+    )?;
+    if head != candidate_commit {
+        return Err(format!("selected-image replay HEAD {head} differs from {candidate_commit}"));
     }
-    if let Some(detail) =
-        compile_back_digest_requirement_defect(root, binding, &COMPILE_BACK_SELECTED_IMAGE_RANGE[0])
+    let tree = crate::controlled_git::text(
+        root,
+        &["rev-parse", "--verify", &format!("{candidate_commit}^{{tree}}")],
+        "selected-image replay candidate tree",
+        64 * 1024,
+        Duration::from_secs(10),
+    )?;
+    if !matches!(tree.len(), 40 | 64)
+        || !tree.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Some(detail);
+        return Err("candidate tree is not a canonical Git object ID".into());
     }
-    None
+
+    let identity = find_stage2_trustc_identity(evidence)
+        .ok_or("selected-image replay has no stage2 executable binding")?;
+    let identity_defects = stage2_trustc_identity_defects(root, candidate_commit, identity);
+    if !identity_defects.is_empty() {
+        return Err(format!("selected-image replay executable: {}", identity_defects[0].1));
+    }
+    let executable = json!({
+        "path": identity["path"],
+        "sha256": normalized_sha256_value(&identity["sha256"])
+            .ok_or("invalid selected-image replay executable digest")?,
+        "version": identity["version"].as_str().ok_or("missing executable version")?.trim(),
+        "commit_hash": candidate_commit,
+    });
+
+    let binding = evidence
+        .get("compile_back_artifact_digest_binding")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("missing compile-back artifact binding")?;
+    for requirement in COMPILE_BACK_SELECTED_IMAGE_RANGE_MATERIAL {
+        if let Some(defect) = compile_back_digest_requirement_defect(
+            root,
+            evidence.get("compile_back_artifact_digest_binding"),
+            requirement,
+        ) {
+            return Err(format!("selected-image replay artifact: {defect}"));
+        }
+    }
+    let range = normalize_compile_back_digest_value(
+        binding.get("selected_image_range").ok_or("missing selected_image_range")?,
+        CompileBackDigestValueKind::Range,
+    )
+    .ok_or("invalid selected_image_range")?;
+    let (start, end) = range.split_once("..").ok_or("invalid selected_image_range")?;
+    let start = start.parse::<u64>().map_err(|_| "invalid selected_image_range")?;
+    let end = end.parse::<u64>().map_err(|_| "invalid selected_image_range")?;
+    let root_path_text = binding["root_artifact_path"].as_str().ok_or("missing root path")?;
+    let selected_path_text =
+        binding["selected_image_path"].as_str().ok_or("missing selected path")?;
+    let root_path = repo_relative_exact_file(root, root_path_text).ok_or("unsafe root path")?;
+    let selected_path =
+        repo_relative_exact_file(root, selected_path_text).ok_or("unsafe selected path")?;
+    let root_sha256 = normalize_compile_back_digest_value(
+        &binding["root_artifact_sha256"],
+        CompileBackDigestValueKind::Sha256,
+    )
+    .ok_or("invalid root digest")?;
+    let selected_sha256 = normalize_compile_back_digest_value(
+        &binding["selected_image_sha256"],
+        CompileBackDigestValueKind::Sha256,
+    )
+    .ok_or("invalid selected digest")?;
+
+    let mut root_file =
+        fs::File::open(&root_path).map_err(|err| format!("root artifact: {err}"))?;
+    let mut selected_file =
+        fs::File::open(&selected_path).map_err(|err| format!("selected image: {err}"))?;
+    let (root_len, selected_len, root_range_sha256) = verify_selected_image_byte_relation(
+        &mut root_file,
+        &mut selected_file,
+        start,
+        end,
+        &root_sha256,
+        &selected_sha256,
+    )?;
+    if file_sha256(&root_path).as_deref() != Some(&root_sha256)
+        || file_sha256(&selected_path).as_deref() != Some(&selected_sha256)
+    {
+        return Err("selected-image replay artifact changed during readback".into());
+    }
+
+    let artifact_census = json!([
+        {"role": "root-artifact", "path": root_path_text, "sha256": root_sha256, "bytes": root_len},
+        {"role": "selected-image", "path": selected_path_text, "sha256": selected_sha256, "bytes": selected_len},
+    ]);
+    let subject = json!({
+        "candidate_commit": candidate_commit,
+        "candidate_tree_oid": tree,
+        "executable": executable,
+        "artifact_census": artifact_census,
+        "range": range,
+    });
+    let subject_bytes = serde_json::to_vec(&subject).map_err(|err| err.to_string())?;
+    let obligation_id = format!("sha256:{:x}", Sha256::digest(&subject_bytes));
+    Ok(json!({
+        "schema_version": SELECTED_IMAGE_REPLAY_SCHEMA,
+        "candidate_commit": candidate_commit,
+        "candidate_tree_oid": tree,
+        "executable": executable,
+        "artifact_census": artifact_census,
+        "obligations": [{
+            "id": obligation_id,
+            "relation": "root-range-equals-selected-image/v1",
+            "range": range,
+        }],
+        "transcript": [{
+            "obligation_id": obligation_id,
+            "root_range_sha256": root_range_sha256,
+            "selected_image_sha256": selected_sha256,
+        }],
+    }))
+}
+
+fn selected_image_replay_check_json(
+    root: &Path,
+    candidate_commit: &str,
+    evidence: &serde_json::Value,
+) -> serde_json::Value {
+    match replay_selected_image_range(root, candidate_commit, evidence) {
+        Ok(()) => json!({"status": "passed", "scope": "selected-image-byte-relation-only"}),
+        Err(reason) => {
+            json!({"status": "blocked", "scope": "selected-image-byte-relation-only", "reason": reason})
+        }
+    }
 }
 
 fn product_proof_release_findings_json(findings: &[GateFinding]) -> serde_json::Value {
@@ -1838,6 +2027,12 @@ fn product_proof_release_selected_image_range_check_json(
         binding,
         &COMPILE_BACK_SELECTED_IMAGE_RANGE[0],
     );
+    let root_digest_defect = compile_back_digest_requirement_defect(
+        root,
+        binding,
+        &COMPILE_BACK_ROOT_ARTIFACT_DIGEST[0],
+    );
+    let defect = selected_image_range_binding_defect(root, binding);
     let range = binding.and_then(|binding| binding.get("selected_image_range")).and_then(|value| {
         normalize_compile_back_digest_value(value, CompileBackDigestValueKind::Range)
     });
@@ -1850,7 +2045,7 @@ fn product_proof_release_selected_image_range_check_json(
         binding.and_then(|binding| binding.get("selected_image_sha256")).and_then(|value| {
             normalize_compile_back_digest_value(value, CompileBackDigestValueKind::Sha256)
         });
-    let passed = digest_defect.is_none() && range_defect.is_none();
+    let passed = defect.is_none();
     json!({
         "status": if passed { "passed" } else { "blocked" },
         "check": "selected-image-range-and-digest",
@@ -1858,8 +2053,9 @@ fn product_proof_release_selected_image_range_check_json(
         "selected_image_path": path,
         "selected_image_sha256": digest,
         "hash_bound": digest_defect.is_none(),
+        "root_hash_bound": root_digest_defect.is_none(),
         "range_bound": range_defect.is_none(),
-        "defect": digest_defect.or(range_defect),
+        "defect": defect,
     })
 }
 
@@ -2173,25 +2369,39 @@ fn source_tarball_identity_defects(
     }
     let expected_sha256 = identity.get("sha256").and_then(normalized_sha256_value);
     match (path_text, expected_sha256.as_deref()) {
-        (Some(path_text), Some(expected_sha256)) => {
-            match repo_relative_exact_file(root, path_text)
-                .and_then(|path| exact_xz_file_sha256(&path).map(|actual| (path, actual)))
-            {
-                Some((_, actual)) if actual == expected_sha256 => {}
-                Some((path, actual)) => defects.push((
+        (Some(path_text), Some(expected_sha256)) => match repo_relative_exact_file(root, path_text) {
+            Some(path) => match source_tarball_archive_identity(&path) {
+                Ok((actual, archive_commit)) => {
+                    if actual != expected_sha256 {
+                        defects.push((
+                            "product-proof-release-source-tarball-hash",
+                            format!(
+                                "source tarball hash mismatch for {}: expected {expected_sha256}, got {actual}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    if archive_commit != candidate_commit {
+                        defects.push((
+                            "product-proof-release-source-tarball-candidate-mismatch",
+                            format!(
+                                "source tarball {} embeds git-commit-hash {archive_commit}, expected {candidate_commit}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+                Err(detail) => defects.push((
                     "product-proof-release-source-tarball-hash",
-                    format!(
-                        "source tarball hash mismatch for {}: expected {expected_sha256}, got {actual}",
-                        path.display()
-                    ),
+                    format!("source tarball {} is not a bound source archive: {detail}", path.display()),
                 )),
-                None => defects.push((
-                    "product-proof-release-source-tarball-hash",
-                    "source tarball must be an immutable exact regular repo-relative XZ archive"
-                        .to_string(),
-                )),
-            }
-        }
+            },
+            None => defects.push((
+                "product-proof-release-source-tarball-hash",
+                "source tarball must be an exact regular repo-relative archive without symlink components"
+                    .to_string(),
+            )),
+        },
         (_, None) => defects.push((
             "product-proof-release-source-tarball-hash",
             "source tarball binding must include canonical 64-hex `sha256`".to_string(),
@@ -2205,9 +2415,254 @@ fn source_tarball_entry_path_text(entry: &serde_json::Value) -> Option<&str> {
     entry.get("path").and_then(nonempty_json_string_value)
 }
 
-fn exact_xz_file_sha256(path: &Path) -> Option<String> {
-    let (sha256, prefix) = exact_file_sha256_with_prefix(path, 6, None)?;
-    prefix.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]).then_some(sha256)
+fn source_tarball_archive_identity(path: &Path) -> Result<(String, String), String> {
+    let before = fs::symlink_metadata(path).map_err(|err| format!("archive metadata: {err}"))?;
+    if !before.file_type().is_file() || before.len() > MAX_SOURCE_ARCHIVE_COMPRESSED_BYTES {
+        return Err(format!(
+            "archive must be an exact regular file within the compressed-byte bound \
+             ({}/{} bytes)",
+            before.len(),
+            MAX_SOURCE_ARCHIVE_COMPRESSED_BYTES
+        ));
+    }
+    let mut file = fs::File::open(path).map_err(|err| format!("open archive: {err}"))?;
+    let opened = file.metadata().map_err(|err| format!("opened archive metadata: {err}"))?;
+    if !same_source_archive_snapshot(&before, &opened) {
+        return Err("archive changed before it was opened".into());
+    }
+    let sha256 = opened_source_archive_sha256(&mut file, before.len())?;
+    let filename = path.file_name().and_then(|name| name.to_str()).ok_or("invalid archive name")?;
+    let package = filename.strip_suffix(".tar.xz").ok_or("invalid archive suffix")?;
+    let member = format!("{package}/git-commit-hash");
+    file.seek(io::SeekFrom::Start(0)).map_err(|err| format!("rewind archive: {err}"))?;
+    let stream = xz2::stream::Stream::new_stream_decoder(MAX_SOURCE_ARCHIVE_XZ_MEMORY_BYTES, 0)
+        .map_err(|err| format!("initialize bounded XZ decoder: {err}"))?;
+    let decoder = xz2::bufread::XzDecoder::new_stream(io::BufReader::new(&mut file), stream);
+    let mut archive = tar::Archive::new(BoundedSourceArchiveReader { inner: decoder, bytes: 0 });
+    let mut archive_commit = None;
+    let mut members = 0_usize;
+    let mut pending_longname: Option<Vec<u8>> = None;
+    let mut namespace = source_archive::Namespace::new(package);
+    for entry in archive.entries().map_err(|err| format!("read tar entries: {err}"))?.raw(true) {
+        let mut entry = entry.map_err(|err| format!("read tar member: {err}"))?;
+        members += 1;
+        if members > MAX_SOURCE_ARCHIVE_MEMBERS {
+            return Err("source archive member count exceeds its bound".into());
+        }
+        if entry.size() > MAX_SOURCE_ARCHIVE_DECOMPRESSED_BYTES {
+            return Err("source archive member size exceeds its bound".into());
+        }
+        match entry.header().entry_type() {
+            tar::EntryType::GNULongName => {
+                if pending_longname.is_some() || entry.size() > MAX_SOURCE_ARCHIVE_LONGNAME_BYTES {
+                    return Err("source archive has ambiguous or oversized GNU long name".into());
+                }
+                let mut longname = Vec::with_capacity(entry.size() as usize);
+                entry
+                    .read_to_end(&mut longname)
+                    .map_err(|err| format!("read GNU long name: {err}"))?;
+                let longname_path =
+                    longname
+                        .strip_suffix(&[0])
+                        .filter(|path| !path.contains(&0))
+                        .ok_or("source archive has an ambiguous GNU long name terminator")?;
+                if source_archive_path_targets_revision(longname_path, member.as_bytes())? {
+                    return Err(format!("source archive has a GNU long-name alias for {member}"));
+                }
+                pending_longname = Some(longname_path.to_vec());
+                continue;
+            }
+            tar::EntryType::GNULongLink
+            | tar::EntryType::XHeader
+            | tar::EntryType::XGlobalHeader => {
+                return Err("source archive has unsupported extended tar headers".into());
+            }
+            _ => {}
+        }
+        let longname = pending_longname.take();
+        let path_bytes = entry.path_bytes();
+        let raw_path = path_bytes.as_ref();
+        if source_archive_path_targets_revision(raw_path, member.as_bytes())?
+            && raw_path != member.as_bytes()
+        {
+            return Err(format!("source archive member path aliases {member}"));
+        }
+        if raw_path != member.as_bytes() {
+            namespace.register(
+                longname.as_deref().unwrap_or(raw_path),
+                entry.header().entry_type(),
+                entry.link_name_bytes().as_deref(),
+                entry.size(),
+            )?;
+            continue;
+        }
+        if longname.is_some() {
+            return Err(format!("{member} is overridden by a GNU long-name alias"));
+        }
+        if archive_commit.is_some() {
+            return Err(format!("archive has duplicate {member} entries"));
+        }
+        if !entry.header().entry_type().is_file() || entry.size() != 40 {
+            return Err(format!("{member} must be an exact regular 40-byte member"));
+        }
+        namespace.register(raw_path, tar::EntryType::Regular, None, entry.size())?;
+        let mut bytes = [0_u8; 40];
+        entry.read_exact(&mut bytes).map_err(|err| format!("read {member}: {err}"))?;
+        let commit = std::str::from_utf8(&bytes).map_err(|_| format!("{member} is not UTF-8"))?;
+        if !candidate_commit_is_40_hex(commit) {
+            return Err(format!("{member} must contain exactly one 40-hex revision"));
+        }
+        archive_commit = Some(commit.to_string());
+    }
+    if pending_longname.is_some() {
+        return Err("source archive ends with an unmatched GNU long-name header".into());
+    }
+    namespace.finish()?;
+    let mut reader = archive.into_inner();
+    let mut remaining = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut remaining).map_err(|err| format!("finish XZ stream: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        if remaining[..read].iter().any(|byte| *byte != 0) {
+            return Err("source archive has nonzero data after the tar terminator".into());
+        }
+    }
+    let mut compressed = reader.inner.into_inner();
+    let mut padding_len = 0_u64;
+    loop {
+        let read = compressed
+            .read(&mut remaining)
+            .map_err(|err| format!("read XZ stream padding: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        padding_len += read as u64;
+        if padding_len > MAX_SOURCE_ARCHIVE_XZ_PADDING_BYTES
+            || remaining[..read].iter().any(|byte| *byte != 0)
+        {
+            return Err("source archive has invalid or excessive XZ stream padding".into());
+        }
+    }
+    if !padding_len.is_multiple_of(4) {
+        return Err("XZ stream padding is not four-byte aligned".into());
+    }
+    drop(compressed);
+    if opened_source_archive_sha256(&mut file, before.len())? != sha256 {
+        return Err("archive changed during revision readback".to_string());
+    }
+    let opened_after = file.metadata().map_err(|err| format!("opened archive metadata: {err}"))?;
+    let after = fs::symlink_metadata(path).map_err(|err| format!("archive metadata: {err}"))?;
+    if !same_source_archive_snapshot(&before, &opened_after)
+        || !same_source_archive_snapshot(&before, &after)
+    {
+        return Err("archive path or opened file changed during revision readback".into());
+    }
+    Ok((sha256, archive_commit.ok_or_else(|| format!("archive lacks {member}"))?))
+}
+
+fn source_archive_path_targets_revision(path: &[u8], member: &[u8]) -> Result<bool, String> {
+    if path.is_empty() || path[0] == b'/' || path.contains(&b'\\') {
+        return Err("source archive member has an ambiguous extraction path".into());
+    }
+    let mut parts = Vec::new();
+    for part in path.split(|byte| *byte == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                if parts.pop().is_none() {
+                    return Err("source archive member escapes its extraction root".into());
+                }
+            }
+            _ => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        return Err("source archive member has an empty extraction path".into());
+    }
+    let mut expected = member.split(|byte| *byte == b'/');
+    Ok(parts
+        .into_iter()
+        .all(|part| expected.next().is_some_and(|target| part.eq_ignore_ascii_case(target)))
+        && expected.next().is_none())
+}
+
+struct BoundedSourceArchiveReader<R> {
+    inner: R,
+    bytes: u64,
+}
+
+impl<R: io::Read> io::Read for BoundedSourceArchiveReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = MAX_SOURCE_ARCHIVE_DECOMPRESSED_BYTES.saturating_sub(self.bytes);
+        let allowed =
+            usize::try_from(remaining.saturating_add(1)).unwrap_or(usize::MAX).min(buf.len());
+        let read = self.inner.read(&mut buf[..allowed])?;
+        if read as u64 > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source archive exceeds its decompressed-byte bound",
+            ));
+        }
+        self.bytes += read as u64;
+        Ok(read)
+    }
+}
+
+fn opened_source_archive_sha256(file: &mut fs::File, expected_len: u64) -> Result<String, String> {
+    file.seek(io::SeekFrom::Start(0)).map_err(|err| format!("rewind archive: {err}"))?;
+    let mut prefix = [0_u8; 6];
+    file.read_exact(&mut prefix).map_err(|err| format!("read XZ header: {err}"))?;
+    if prefix != [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
+        return Err("archive lacks the XZ stream header".into());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(prefix);
+    let mut total = 6_u64;
+    let mut bytes = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut bytes).map_err(|err| format!("hash archive: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        total = total.checked_add(read as u64).ok_or("archive length overflow")?;
+        if total > expected_len {
+            return Err("archive grew during hash readback".into());
+        }
+        hasher.update(&bytes[..read]);
+    }
+    if total != expected_len {
+        return Err("archive length changed during hash readback".into());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(unix)]
+fn same_source_archive_snapshot(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mode() == right.mode()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_source_archive_snapshot(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
 }
 
 fn stage2_trustc_path_satisfied(path_text: &str) -> bool {
@@ -2240,7 +2695,7 @@ fn command_output_text(path: &Path, args: &[&str]) -> Option<String> {
         &mut command,
         &format!("product-proof tool identity probe for {}", path.display()),
         64 * 1024,
-        Duration::from_secs(10),
+        TOOL_IDENTITY_PROBE_HANG_GUARD,
     )
     .ok()?;
     if !output.status.success() {
@@ -2496,28 +2951,28 @@ pub(super) fn check_product_proof_coverage(
             .find(|entry| product_proof_component_matches(&entry.component, required.component));
         match entry {
             Some(entry) if entry.status == "accepted" => {
-                validate_product_proof_evidence(
+                validate_product_proof_evidence(ProductProofEvidenceInput {
                     root,
                     candidate_commit,
                     candidate_daemon,
                     required,
                     entry,
-                    true,
-                    &mut findings,
-                    &mut evidence_refs,
-                );
+                    require_all_required_evidence: true,
+                    findings: &mut findings,
+                    evidence_refs: &mut evidence_refs,
+                });
             }
             Some(entry) if matches!(entry.status.as_str(), "not_shipped" | "not_claimed") => {
-                validate_product_proof_evidence(
+                validate_product_proof_evidence(ProductProofEvidenceInput {
                     root,
                     candidate_commit,
                     candidate_daemon,
                     required,
                     entry,
-                    false,
-                    &mut findings,
-                    &mut evidence_refs,
-                );
+                    require_all_required_evidence: false,
+                    findings: &mut findings,
+                    evidence_refs: &mut evidence_refs,
+                });
                 findings.push(GateFinding::blocker(
                     "product-proof-component-excluded",
                     format!(
@@ -2697,16 +3152,28 @@ fn product_proof_manifest_status_supported(status: &str) -> bool {
     matches!(status, "accepted" | "blocked" | "missing_evidence" | "not_claimed" | "not_shipped")
 }
 
-fn validate_product_proof_evidence(
-    root: &Path,
-    candidate_commit: Option<&str>,
-    candidate_daemon: Option<&BoundToolIdentity>,
-    required: &ProductProofComponent,
-    entry: &ProductProofManifestComponent,
+struct ProductProofEvidenceInput<'a> {
+    root: &'a Path,
+    candidate_commit: Option<&'a str>,
+    candidate_daemon: Option<&'a BoundToolIdentity>,
+    required: &'a ProductProofComponent,
+    entry: &'a ProductProofManifestComponent,
     require_all_required_evidence: bool,
-    findings: &mut Vec<GateFinding>,
-    evidence_refs: &mut Vec<String>,
-) {
+    findings: &'a mut Vec<GateFinding>,
+    evidence_refs: &'a mut Vec<String>,
+}
+
+fn validate_product_proof_evidence(input: ProductProofEvidenceInput<'_>) {
+    let ProductProofEvidenceInput {
+        root,
+        candidate_commit,
+        candidate_daemon,
+        required,
+        entry,
+        require_all_required_evidence,
+        findings,
+        evidence_refs,
+    } = input;
     if entry.evidence.is_empty() {
         findings.push(GateFinding::blocker(
             "product-proof-evidence-empty",
@@ -2943,23 +3410,22 @@ fn proof_content_defect(json: &serde_json::Value) -> Option<(&'static str, Strin
 }
 
 /// Return the unconditional admission defect for today's generic solver
-/// evidence format.
-///
-/// There are intentionally no magic JSON fields that make this return `None`.
-/// A document can claim any runner, executable, obligation count, or transcript
-/// digest. Product-proof admission needs a registered Rust producer that the
-/// gate invokes through the exact candidate toolchain, plus a kind-specific
-/// grammar/replayer that reconstructs and checks every candidate obligation.
-/// That infrastructure does not exist yet, so these documents are useful only
-/// as hash-checked release checklists.
+/// evidence format. A saved compiler report carries a claim digest, not the
+/// canonical VC needed by `trust_certify::recheck_vc`; the structural binary
+/// certificate checker binds bytes but does not replay LRAT/LFSC. Neither API
+/// can turn an authored JSON transcript into proof authority here.
 fn solver_evidence_admission_defect(kind: &str) -> String {
     format!(
         "`{kind}` has no registered kind-specific Rust collector/replayer; self-declared \
-         runner identity, proof counts, solver names, artifact hashes, and transcript hashes \
-         do not bind execution by the exact candidate executable. Admission requires a \
-         collector-bound canonical executable path and pre/post SHA-256, candidate commit and \
-         version, exact argv and sanitized environment, a complete ID/digest-indexed candidate \
-         obligation set, and a strictly parsed transcript replayed against that set"
+         runner identity, proof counts, solver names, artifact hashes, certificate labels, and \
+         transcript hashes are not proof. Missing producer contract: invoke the exact candidate \
+         executable with a canonical path, pre/post SHA-256, candidate commit and version, exact \
+         argv and sanitized environment; export the complete typed obligation set with stable IDs, \
+         canonical VC/query bytes, semantic digests, and raw proof bytes in a bounded transcript. \
+         Missing replayer contract: independently regenerate the canonical VC/query and digests, \
+         reconcile every ID exactly once, and check each proof in its actual format against that \
+         query at the declared grade. The saved claim_digest_sha256 cannot reconstruct the VC, \
+         and StructuralBinaryCertificateChecker checks bindings, not LRAT/LFSC derivations"
     )
 }
 
@@ -3818,7 +4284,7 @@ fn trustd_tool_identity_defect(
             &mut command,
             "Trust daemon product-proof identity",
             64 * 1024,
-            Duration::from_secs(10),
+            TOOL_IDENTITY_PROBE_HANG_GUARD,
         )
         .map_err(|error| format!("`{kind}` exact daemon --version failed: {error}"))?;
         if !output.status.success() {
@@ -4076,13 +4542,17 @@ fn trustd_status_transition_is_valid(
 struct ProductProofTrustdChild {
     child: std::process::Child,
     pid: u32,
+    _ownership: crate::process_lifecycle::Ownership,
 }
 
 #[cfg(unix)]
 impl Drop for ProductProofTrustdChild {
     fn drop(&mut self) {
-        let _ = crate::bounded_process::terminate_process_group(self.pid);
-        let _ = self.child.kill();
+        // The private daemon runs until it is stopped; the smoke is done with it.
+        let _ = crate::process_lifecycle::stop_tree(
+            self.pid,
+            crate::process_lifecycle::StopCause::Released,
+        );
         let _ = self.child.wait();
     }
 }
@@ -4100,12 +4570,13 @@ fn live_trustd_protocol_smoke_defect(
     if bound_file_sha256(path).as_deref() != Some(sha256) {
         return Some("canonical trustd digest changed before the live smoke".to_string());
     }
-    let socket_root = match tempfile::Builder::new().prefix("trust-product-proof-").tempdir() {
-        Ok(root) => root,
-        Err(error) => {
-            return Some(format!("could not create private trustd smoke directory: {error}"));
-        }
-    };
+    let socket_root =
+        match crate::smoke_socket_root::create(crate::smoke_socket_root::Purpose::ProductProof) {
+            Ok(root) => root,
+            Err(error) => {
+                return Some(format!("could not create private trustd smoke directory: {error}"));
+            }
+        };
     if let Err(error) = fs::set_permissions(socket_root.path(), fs::Permissions::from_mode(0o700)) {
         return Some(format!("could not make trustd smoke directory owner-private: {error}"));
     }
@@ -4121,9 +4592,8 @@ fn live_trustd_protocol_smoke_defect(
     if let Err(detail) = apply_trustd_runtime_closure(&mut command, path, runtime_closure) {
         return Some(format!("could not admit the trustd runtime closure: {detail}"));
     }
-    crate::bounded_process::configure_process_group(&mut command);
-    let child = match command.spawn() {
-        Ok(child) => child,
+    let (child, ownership) = match crate::process_lifecycle::spawn_owned(&mut command) {
+        Ok(owned) => owned,
         Err(error) => {
             if bound_file_sha256(path).as_deref() != Some(sha256) {
                 return Some("canonical trustd changed during its failed launch".to_string());
@@ -4137,7 +4607,7 @@ fn live_trustd_protocol_smoke_defect(
         }
     };
     let pid = child.id();
-    let mut child = ProductProofTrustdChild { child, pid };
+    let mut child = ProductProofTrustdChild { child, pid, _ownership: ownership };
 
     let result = (|| -> Result<(), String> {
         // Same wall-clock/contention hazard as a bounded probe deadline, so it
@@ -4152,7 +4622,9 @@ fn live_trustd_protocol_smoke_defect(
                 Ok(false) => {}
                 Err(error) => return Err(format!("could not poll canonical trustd: {error}")),
             }
-            if trust_router::coordinator::daemon_matches_executable(&socket, path) {
+            if trust_router::coordinator::daemon_matches_executable_from_pid(
+                &socket, path, child.pid,
+            ) {
                 break;
             }
             if std::time::Instant::now() >= ready_deadline {
@@ -4168,10 +4640,11 @@ fn live_trustd_protocol_smoke_defect(
             return Err("canonical trustd exited before the live exchange".to_string());
         }
 
-        let smoke = trust_router::coordinator::exercise_daemon_at(
+        let smoke = trust_router::coordinator::exercise_daemon_at_from_pid(
             &socket,
             path,
             "product-proof-live-smoke",
+            child.pid,
         )?;
         if smoke.identity.version != trust_router::coordinator::IDENTITY_VERSION
             || smoke.identity.protocol != trust_router::coordinator::STATUS_VERSION
@@ -4430,9 +4903,7 @@ fn tool_identity_path_hash_defect(
 }
 
 fn binary_identity_materialization_defect(root: &Path, json: &serde_json::Value) -> Option<String> {
-    let Some(identity) = json.get("binary_identity") else {
-        return None;
-    };
+    let identity = json.get("binary_identity")?;
     if !identity.is_object() {
         return Some("`binary_identity` must be a structured object".to_string());
     }
@@ -4646,9 +5117,7 @@ fn artifact_entry_satisfied(entry: &serde_json::Value) -> bool {
 }
 
 fn proof_artifact_materialization_defect(root: &Path, json: &serde_json::Value) -> Option<String> {
-    let Some(sha256_value) = json.get("proof_artifact_sha256") else {
-        return None;
-    };
+    let sha256_value = json.get("proof_artifact_sha256")?;
     let Some(expected_sha256) = normalized_sha256_value(sha256_value) else {
         return Some("`proof_artifact_sha256` must be a 64-hex sha256".to_string());
     };
@@ -4941,6 +5410,11 @@ const COMPILE_BACK_SELECTED_IMAGE_RANGE: &[CompileBackDigestRequirement] =
         path_field: None,
         value_kind: CompileBackDigestValueKind::Range,
     }];
+const COMPILE_BACK_SELECTED_IMAGE_RANGE_MATERIAL: &[CompileBackDigestRequirement] = &[
+    COMPILE_BACK_ROOT_ARTIFACT_DIGEST[0],
+    COMPILE_BACK_SELECTED_IMAGE_DIGEST[0],
+    COMPILE_BACK_SELECTED_IMAGE_RANGE[0],
+];
 const COMPILE_BACK_ALL_DIGESTS: &[CompileBackDigestRequirement] = &[
     COMPILE_BACK_LIFTED_BINARY_TRUST_IR_DIGEST[0],
     COMPILE_BACK_RUST_SOURCE_DIGEST[0],
@@ -4972,12 +5446,20 @@ fn compile_back_artifact_digest_evidence_defect(
 ) -> Option<String> {
     let requirements = compile_back_artifact_digest_requirements(kind)?;
     let binding = json.get("compile_back_artifact_digest_binding");
-    let missing: Vec<_> = requirements
+    let mut missing: Vec<_> = requirements
         .iter()
         .filter_map(|requirement| {
             compile_back_digest_requirement_defect(root, binding, requirement)
         })
         .collect();
+    if missing.is_empty()
+        && matches!(
+            kind,
+            "compile-back-artifact-digests-bound" | "compile-back-selected-image-range"
+        )
+    {
+        missing.extend(selected_image_range_binding_defect(root, binding));
+    }
 
     if missing.is_empty() {
         None
@@ -5008,7 +5490,7 @@ fn compile_back_artifact_digest_requirements(
         "compile-back-refinement-artifact-sha256" => Some(COMPILE_BACK_REFINEMENT_ARTIFACT_DIGEST),
         "compile-back-root-artifact-sha256" => Some(COMPILE_BACK_ROOT_ARTIFACT_DIGEST),
         "compile-back-selected-image-sha256" => Some(COMPILE_BACK_SELECTED_IMAGE_DIGEST),
-        "compile-back-selected-image-range" => Some(COMPILE_BACK_SELECTED_IMAGE_RANGE),
+        "compile-back-selected-image-range" => Some(COMPILE_BACK_SELECTED_IMAGE_RANGE_MATERIAL),
         _ => None,
     }
 }
@@ -5028,9 +5510,7 @@ fn compile_back_digest_requirement_defect(
     else {
         return Some(format!("`compile_back_artifact_digest_binding.{}`", requirement.json_field));
     };
-    let Some(path_field) = requirement.path_field else {
-        return None;
-    };
+    let path_field = requirement.path_field?;
     let Some(path_text) = binding
         .get(path_field)
         .and_then(serde_json::Value::as_str)
@@ -5050,6 +5530,137 @@ fn compile_back_digest_requirement_defect(
         )),
         None => Some(format!("readable `compile_back_artifact_digest_binding.{path_field}`")),
     }
+}
+
+fn selected_image_range_binding_defect(
+    root: &Path,
+    binding: Option<&serde_json::Value>,
+) -> Option<String> {
+    let check = || -> Result<(), String> {
+        for requirement in COMPILE_BACK_SELECTED_IMAGE_RANGE_MATERIAL {
+            if let Some(defect) = compile_back_digest_requirement_defect(root, binding, requirement)
+            {
+                return Err(defect);
+            }
+        }
+        let binding = binding.and_then(serde_json::Value::as_object).ok_or("missing binding")?;
+        let range = normalize_compile_back_digest_value(
+            binding.get("selected_image_range").ok_or("missing selected_image_range")?,
+            CompileBackDigestValueKind::Range,
+        )
+        .ok_or("invalid selected_image_range")?;
+        let (start, end) = range.split_once("..").ok_or("invalid selected_image_range")?;
+        let start = start.parse::<u64>().map_err(|_| "invalid selected_image_range")?;
+        let end = end.parse::<u64>().map_err(|_| "invalid selected_image_range")?;
+        let bound_path = |field| -> Result<PathBuf, String> {
+            let path = binding
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("missing {field}"))?;
+            repo_relative_exact_file(root, path).ok_or_else(|| format!("unsafe or missing {field}"))
+        };
+        let root_path = bound_path("root_artifact_path")?;
+        let selected_path = bound_path("selected_image_path")?;
+        let mut root_image = fs::File::open(&root_path)
+            .map_err(|err| format!("cannot open root artifact {}: {err}", root_path.display()))?;
+        let mut selected_image = fs::File::open(&selected_path).map_err(|err| {
+            format!("cannot open selected image {}: {err}", selected_path.display())
+        })?;
+        let root_sha256 = normalize_compile_back_digest_value(
+            &binding["root_artifact_sha256"],
+            CompileBackDigestValueKind::Sha256,
+        )
+        .ok_or("invalid root digest")?;
+        let selected_sha256 = normalize_compile_back_digest_value(
+            &binding["selected_image_sha256"],
+            CompileBackDigestValueKind::Sha256,
+        )
+        .ok_or("invalid selected digest")?;
+        verify_selected_image_byte_relation(
+            &mut root_image,
+            &mut selected_image,
+            start,
+            end,
+            &root_sha256,
+            &selected_sha256,
+        )?;
+        Ok(())
+    };
+    check().err()
+}
+
+fn verify_selected_image_byte_relation(
+    root_file: &mut fs::File,
+    selected_file: &mut fs::File,
+    start: u64,
+    end: u64,
+    expected_root_sha256: &str,
+    expected_selected_sha256: &str,
+) -> Result<(u64, u64, String), String> {
+    let root_len = root_file.metadata().map_err(|err| format!("root artifact: {err}"))?.len();
+    let selected_len =
+        selected_file.metadata().map_err(|err| format!("selected image: {err}"))?.len();
+    if start >= end {
+        return Err("invalid selected_image_range".into());
+    }
+    if end > root_len {
+        return Err(format!(
+            "selected_image_range {start}..{end} exceeds root artifact length {root_len}"
+        ));
+    }
+    if selected_len != end - start {
+        return Err(format!(
+            "selected image length {selected_len} does not equal selected_image_range length {}",
+            end - start
+        ));
+    }
+    root_file.seek(io::SeekFrom::Start(0)).map_err(|err| format!("root artifact: {err}"))?;
+    selected_file.seek(io::SeekFrom::Start(0)).map_err(|err| format!("selected image: {err}"))?;
+
+    let mut root_hash = Sha256::new();
+    let mut selected_hash = Sha256::new();
+    let mut range_hash = Sha256::new();
+    let mut root_bytes = [0; 8192];
+    let mut selected_bytes = [0; 8192];
+    let mut offset = 0_u64;
+    loop {
+        let count =
+            root_file.read(&mut root_bytes).map_err(|err| format!("root artifact: {err}"))?;
+        if count == 0 {
+            break;
+        }
+        root_hash.update(&root_bytes[..count]);
+        let chunk_end = offset.checked_add(count as u64).ok_or("root artifact length overflow")?;
+        let overlap_start = start.max(offset);
+        let overlap_end = end.min(chunk_end);
+        if overlap_start < overlap_end {
+            let begin = (overlap_start - offset) as usize;
+            let len = (overlap_end - overlap_start) as usize;
+            selected_file
+                .read_exact(&mut selected_bytes[..len])
+                .map_err(|err| format!("selected image: {err}"))?;
+            range_hash.update(&root_bytes[begin..begin + len]);
+            selected_hash.update(&selected_bytes[..len]);
+            if root_bytes[begin..begin + len] != selected_bytes[..len] {
+                return Err("selected image bytes do not equal root artifact range".into());
+            }
+        }
+        offset = chunk_end;
+    }
+    if offset != root_len
+        || selected_file
+            .read(&mut selected_bytes[..1])
+            .map_err(|err| format!("selected image: {err}"))?
+            != 0
+    {
+        return Err("selected-image artifact length changed during readback".into());
+    }
+    if format!("{:x}", root_hash.finalize()) != expected_root_sha256
+        || format!("{:x}", selected_hash.finalize()) != expected_selected_sha256
+    {
+        return Err("selected-image opened artifact hash does not match its binding".into());
+    }
+    Ok((root_len, selected_len, format!("{:x}", range_hash.finalize())))
 }
 
 fn normalize_compile_back_digest_value(
@@ -5218,16 +5829,16 @@ pub(super) fn product_proof_components(
                 } else {
                     let mut findings = Vec::new();
                     let mut evidence_refs = Vec::new();
-                    validate_product_proof_evidence(
+                    validate_product_proof_evidence(ProductProofEvidenceInput {
                         root,
                         candidate_commit,
                         candidate_daemon,
-                        &component,
+                        required: &component,
                         entry,
-                        true,
-                        &mut findings,
-                        &mut evidence_refs,
-                    );
+                        require_all_required_evidence: true,
+                        findings: &mut findings,
+                        evidence_refs: &mut evidence_refs,
+                    });
                     if !findings.is_empty() {
                         component.status = product_proof_component_status_for_findings(&findings);
                     }
@@ -5317,14 +5928,219 @@ mod content_gate_tests {
     //! regression: a product-proof release claim must be backed
     //! by real discharge content, never metadata alone. A structurally-valid
     //! placeholder must be rejected (fail closed).
+    use std::fs;
+    use std::process::Command;
+    use std::time::Duration;
+
     use serde_json::json;
+    use sha2::{Digest as _, Sha256};
 
     use super::{
-        PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS, product_proof_stage2_trustc_binding_from_path,
-        proof_content_defect, solver_evidence_admission_defect,
+        PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS, ProductProofStubOptions,
+        build_product_proof_release_report, build_product_proof_stub_release_report, file_sha256,
+        product_proof_source_tarball_binding_from_path,
+        product_proof_stage2_trustc_binding_from_path, proof_content_defect,
+        replay_selected_image_range, repo_relative_exact_file, runner_clean_provenance_defect,
+        selected_image_replay_check_json, solver_evidence_admission_defect,
+        source_tarball_archive_identity, source_tarball_identity_defects,
+        validate_product_proof_release_artifact_evidence, verify_selected_image_byte_relation,
     };
 
     const TEST_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn runner_clean_provenance_rejects_conflicting_or_malformed_markers() {
+        assert_eq!(runner_clean_provenance_defect(&json!({"repo_dirty": false})), None);
+        assert_eq!(
+            runner_clean_provenance_defect(&json!({"runner": {"git": {"clean": true}}})),
+            None
+        );
+
+        let conflicting = json!({"repo_dirty": false, "runner": {"git": {"clean": false}}});
+        assert!(
+            runner_clean_provenance_defect(&conflicting)
+                .expect("conflicting clean marker must block")
+                .contains("runner.git.clean=false")
+        );
+
+        let malformed = json!({"repo_dirty": false, "provenance": {"repo_clean": "maybe"}});
+        assert!(
+            runner_clean_provenance_defect(&malformed)
+                .expect("malformed clean marker must block")
+                .contains("provenance.repo_clean with a non-boolean value")
+        );
+        assert!(
+            runner_clean_provenance_defect(&json!({"repo_dirty": "false"}))
+                .expect("string dirty marker must block")
+                .contains("repo_dirty with a non-boolean value")
+        );
+    }
+
+    #[test]
+    fn product_proof_reports_bind_repo_fields_to_candidate_status() {
+        let temp = tempfile::tempdir().expect("release report repository fixture");
+        let root = temp.path();
+        let git = crate::controlled_git::executable().expect("controlled Git executable");
+        let run_git = |args: &[&str]| {
+            let output = Command::new(&git)
+                .current_dir(root)
+                .args(args)
+                .output()
+                .expect("run Git fixture command");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "--quiet"]);
+
+        let candidate = "0123456789abcdef0123456789abcdef01234567";
+        let evidence_path = root.join("evidence.json");
+        let evidence = json!({
+            "schema_version": "trust.product-proof.v1",
+            "candidate_commit": candidate,
+            "runner": rust_owned_runner_json(),
+            "generated_at": PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS,
+            "proof_results": valid_results_json(),
+            "proof_artifact_sha256": TEST_SHA256,
+            "repo_dirty": false,
+        });
+        fs::write(&evidence_path, serde_json::to_vec(&evidence).expect("render evidence"))
+            .expect("write evidence");
+        run_git(&["add", "evidence.json"]);
+        run_git(&[
+            "-c",
+            "user.name=Release Test",
+            "-c",
+            "user.email=release-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--no-verify",
+            "-m",
+            "fixture",
+        ]);
+
+        let head = crate::controlled_git::canonical_head(
+            root,
+            "release report fixture HEAD probe",
+            64 * 1024,
+            Duration::from_secs(10),
+        )
+        .expect("fixture HEAD");
+        assert_ne!(head, candidate);
+
+        let stub_options = ProductProofStubOptions::default();
+        let mismatched_stub = build_product_proof_stub_release_report(
+            root,
+            &stub_options,
+            &evidence,
+            None,
+            None,
+            None,
+        )
+        .expect("blocked stub report");
+        assert_eq!(mismatched_stub["repo_dirty"], true);
+        assert_eq!(mismatched_stub["repo_dirty_metadata"]["available"], false);
+        assert!(mismatched_stub["repo_dirty_metadata"]["dirty"].is_null());
+        assert!(
+            mismatched_stub["repo_dirty_metadata"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("repository HEAD changed from candidate"))
+        );
+        assert_eq!(mismatched_stub["status"], "blocked");
+        assert_eq!(mismatched_stub["product_proof_pass_evidence"], false);
+        assert_eq!(mismatched_stub["domination_admissible"], false);
+
+        let mismatched =
+            build_product_proof_release_report(root, candidate, "evidence.json", &evidence_path);
+        assert_eq!(mismatched["repo_dirty"], true);
+        assert_eq!(mismatched["repo_dirty_metadata"]["available"], false);
+        assert!(mismatched["repo_dirty_metadata"]["dirty"].is_null());
+        let has_code = |report: &serde_json::Value, code: &str| {
+            report["blockers"]
+                .as_array()
+                .expect("release blockers")
+                .iter()
+                .any(|finding| finding["code"] == code)
+        };
+        assert!(has_code(&mismatched, "product-proof-release-repo-provenance-unavailable"));
+        assert!(has_code(&mismatched, "product-proof-solver-evidence-unverified"));
+        assert_eq!(mismatched["status"], "blocked");
+        assert_eq!(mismatched["product_proof_pass_evidence"], false);
+        assert_eq!(mismatched["domination_admissible"], false);
+
+        let mut matching_evidence = evidence.clone();
+        matching_evidence["candidate_commit"] = json!(head);
+        let matching_stub = build_product_proof_stub_release_report(
+            root,
+            &stub_options,
+            &matching_evidence,
+            None,
+            None,
+            None,
+        )
+        .expect("clean stub report");
+        assert_eq!(matching_stub["repo_dirty"], false);
+        assert_eq!(matching_stub["repo_dirty_metadata"]["available"], true);
+        assert_eq!(matching_stub["repo_dirty_metadata"]["dirty"], false);
+        assert_eq!(matching_stub["status"], "blocked");
+        let matching =
+            build_product_proof_release_report(root, &head, "evidence.json", &evidence_path);
+        assert_eq!(matching["repo_dirty"], false);
+        assert_eq!(matching["repo_dirty_metadata"]["dirty"], false);
+        assert!(!has_code(&matching, "product-proof-release-repo-provenance-unavailable"));
+        assert!(has_code(&matching, "product-proof-solver-evidence-unverified"));
+
+        fs::write(root.join("untracked.txt"), b"dirty").expect("write untracked fixture");
+        let dirty_stub = build_product_proof_stub_release_report(
+            root,
+            &stub_options,
+            &matching_evidence,
+            None,
+            None,
+            None,
+        )
+        .expect("dirty stub report");
+        assert_eq!(dirty_stub["repo_dirty"], true);
+        assert_eq!(dirty_stub["repo_dirty_metadata"]["available"], true);
+        assert_eq!(dirty_stub["repo_dirty_metadata"]["dirty"], true);
+        assert_eq!(dirty_stub["repo_dirty_metadata"]["porcelain_v1"].as_array().unwrap().len(), 1);
+        assert_eq!(dirty_stub["status"], "blocked");
+        let dirty =
+            build_product_proof_release_report(root, &head, "evidence.json", &evidence_path);
+        assert_eq!(dirty["repo_dirty"], true);
+        assert_eq!(dirty["repo_dirty_metadata"]["available"], true);
+        assert_eq!(dirty["repo_dirty_metadata"]["dirty"], true);
+        assert!(has_code(&dirty, "product-proof-release-repo-dirty"));
+        assert!(has_code(&dirty, "product-proof-solver-evidence-unverified"));
+        assert_eq!(dirty["product_proof_pass_evidence"], false);
+        assert_eq!(dirty["domination_admissible"], false);
+    }
+
+    #[test]
+    fn product_proof_stub_report_without_candidate_has_unavailable_status() {
+        let temp = tempfile::tempdir().expect("stub report fixture");
+        let report = build_product_proof_stub_release_report(
+            temp.path(),
+            &ProductProofStubOptions::default(),
+            &json!({}),
+            None,
+            None,
+            None,
+        )
+        .expect("blocked stub report");
+
+        assert_eq!(report["repo_dirty"], true);
+        assert_eq!(report["repo_dirty_metadata"]["available"], false);
+        assert!(report["repo_dirty_metadata"]["dirty"].is_null());
+        assert_eq!(report["repo_dirty_metadata"]["error"], "candidate HEAD is unavailable");
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["product_proof_pass_evidence"], false);
+        assert_eq!(report["domination_admissible"], false);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -5351,6 +6167,309 @@ mod content_gate_tests {
         )
         .expect_err("release identity must reject a canonical compiler symlink");
         assert!(error.contains("no symlink components"), "{error}");
+    }
+
+    /// `build -> build.noindex` (the Spotlight layout, docs/BUILD_AND_INSTALL.md)
+    /// is the one link a repo-relative exact file may pass through, and only as
+    /// its first component. Any other `build` link is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn repo_relative_exact_file_admits_only_the_sanctioned_build_link() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("build.noindex fixture");
+        let root = temp.path().canonicalize().expect("canonical fixture root");
+        let path_text = "build/host/stage2/bin/trustc";
+        let physical = root.join("build.noindex/host/stage2/bin/trustc");
+        fs::create_dir_all(physical.parent().expect("parent")).expect("create stage2 bin");
+        fs::write(&physical, b"#!/bin/sh\nexit 0\n").expect("write trustc");
+        symlink("build.noindex", root.join("build")).expect("link build");
+        assert_eq!(repo_relative_exact_file(&root, path_text), Some(root.join(path_text)));
+
+        fs::remove_file(root.join("build")).expect("remove build link");
+        fs::rename(root.join("build.noindex"), root.join("elsewhere")).expect("move tree");
+        symlink("elsewhere", root.join("build")).expect("relink build");
+        assert_eq!(repo_relative_exact_file(&root, path_text), None);
+        // A link below the first component is still refused.
+        fs::remove_file(root.join("build")).expect("remove build link");
+        fs::create_dir(root.join("build")).expect("real build");
+        symlink(root.join("elsewhere/host"), root.join("build/host")).expect("link host");
+        assert_eq!(repo_relative_exact_file(&root, path_text), None);
+    }
+
+    #[test]
+    fn source_tarball_rejects_a_different_candidate_with_a_matching_outer_digest() {
+        let temp = tempfile::tempdir().expect("source archive fixture");
+        let candidate = "0123456789abcdef0123456789abcdef01234567";
+        let stale = "0123456789abcdef0123456789abcdef01234566";
+        let name = "trust-src-1.96.0-trust";
+        let path_text = format!("dist/{name}.tar.xz");
+        let source_dir = temp.path().join(name);
+        let archive = temp.path().join(&path_text);
+        fs::create_dir_all(&source_dir).expect("create source tree");
+        fs::create_dir_all(archive.parent().expect("archive parent")).expect("create dist");
+        fs::write(source_dir.join("git-commit-hash"), stale).expect("write stale revision");
+        fs::write(source_dir.join("README.md"), b"source archive\n").expect("write source file");
+        let encoder =
+            xz2::write::XzEncoder::new(fs::File::create(&archive).expect("create archive"), 6);
+        let mut builder = tar::Builder::new(encoder);
+        builder.append_dir_all(name, &source_dir).expect("add source tree");
+        builder.into_inner().expect("finish tar archive").finish().expect("finish XZ stream");
+
+        let identity = json!({
+            "path": path_text,
+            "sha256": file_sha256(&archive).expect("hash archive"),
+            "candidate_commit": candidate,
+        });
+        assert!(
+            source_tarball_identity_defects(temp.path(), candidate, &identity)
+                .iter()
+                .any(|(code, _)| *code == "product-proof-release-source-tarball-candidate-mismatch"),
+            "archive from another revision must not be admitted"
+        );
+        assert!(
+            product_proof_source_tarball_binding_from_path(temp.path(), &path_text, candidate)
+                .is_err(),
+            "stub exporter must refuse the same archive"
+        );
+    }
+
+    #[test]
+    fn source_tarball_revision_member_must_be_unique_and_regular() {
+        let temp = tempfile::tempdir().expect("source archive fixture");
+        let name = "trust-src-1.96.0-trust";
+        let member = format!("{name}/git-commit-hash");
+        let candidate = "0123456789abcdef0123456789abcdef01234567";
+        let duplicate = temp.path().join(format!("{name}.tar.xz"));
+        let encoder = xz2::write::XzEncoder::new(fs::File::create(&duplicate).expect("archive"), 6);
+        let mut builder = tar::Builder::new(encoder);
+        for _ in 0..2 {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(40);
+            builder.append_data(&mut header, &member, candidate.as_bytes()).expect("revision");
+        }
+        builder.into_inner().expect("finish tar").finish().expect("finish XZ");
+        assert!(
+            source_tarball_archive_identity(&duplicate)
+                .expect_err("duplicate revision member")
+                .contains("duplicate"),
+        );
+
+        let linked = temp.path().join(format!("{name}-link.tar.xz"));
+        let encoder = xz2::write::XzEncoder::new(fs::File::create(&linked).expect("archive"), 6);
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        header.set_link_name("other").expect("link target");
+        builder
+            .append_data(&mut header, format!("{name}-link/git-commit-hash"), std::io::empty())
+            .expect("linked revision");
+        builder.into_inner().expect("finish tar").finish().expect("finish XZ");
+        assert!(
+            source_tarball_archive_identity(&linked)
+                .expect_err("symlinked revision member")
+                .contains("exact regular"),
+        );
+    }
+
+    #[test]
+    fn source_tarball_rejects_extended_header_alias_of_revision_member() {
+        let temp = tempfile::tempdir().expect("source archive fixture");
+        let name = "trust-src-1.96.0-trust";
+        let member = format!("{name}/git-commit-hash");
+        let candidate = "0123456789abcdef0123456789abcdef01234567";
+        let archive = temp.path().join(format!("{name}.tar.xz"));
+        let encoder = xz2::write::XzEncoder::new(fs::File::create(&archive).expect("archive"), 6);
+        let mut builder = tar::Builder::new(encoder);
+        let mut longname = member.as_bytes().to_vec();
+        longname.push(0);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNULongName);
+        header.set_mode(0o644);
+        header.set_size(longname.len() as u64);
+        builder.append_data(&mut header, "././@LongLink", &longname[..]).expect("long name");
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(40);
+        builder.append_data(&mut header, "other", candidate.as_bytes()).expect("alias");
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(40);
+        builder.append_data(&mut header, &member, candidate.as_bytes()).expect("revision");
+        builder.into_inner().expect("finish tar").finish().expect("finish XZ");
+
+        assert!(
+            source_tarball_archive_identity(&archive)
+                .expect_err("extended header aliases the revision member")
+                .contains("alias"),
+        );
+    }
+
+    #[test]
+    fn source_tarball_rejects_lexical_aliases_after_revision_member() {
+        let temp = tempfile::tempdir().expect("source archive fixture");
+        let name = "trust-src-1.96.0-trust";
+        let member = format!("{name}/git-commit-hash");
+        let candidate = "0123456789abcdef0123456789abcdef01234567";
+        let stale = "0123456789abcdef0123456789abcdef01234566";
+        for (case, alias) in [
+            ("dot", format!("{name}/./git-commit-hash")),
+            ("parent", format!("{name}/sub/../git-commit-hash")),
+            ("case", format!("{name}/GIT-COMMIT-HASH")),
+        ] {
+            let dir = temp.path().join(case);
+            fs::create_dir(&dir).expect("archive case directory");
+            let archive = dir.join(format!("{name}.tar.xz"));
+            let encoder =
+                xz2::write::XzEncoder::new(fs::File::create(&archive).expect("archive"), 6);
+            let mut builder = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(40);
+            builder.append_data(&mut header, &member, candidate.as_bytes()).expect("revision");
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(7);
+            builder
+                .append_data(&mut header, format!("{name}/README"), b"readme\n".as_slice())
+                .expect("unrelated regular member");
+            if case == "parent" {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_mode(0o755);
+                header.set_size(0);
+                builder
+                    .append_data(&mut header, format!("{name}/sub/"), std::io::empty())
+                    .expect("intermediate directory");
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(40);
+            header.as_mut_bytes()[..alias.len()].copy_from_slice(alias.as_bytes());
+            header.set_cksum();
+            builder.append(&header, stale.as_bytes()).expect("raw alias member");
+            builder.into_inner().expect("finish tar").finish().expect("finish XZ");
+            let error = source_tarball_archive_identity(&archive)
+                .expect_err("lexical alias must not replace the exact revision member");
+            assert!(error.contains("alias"), "{case}: {error}");
+        }
+    }
+
+    #[test]
+    fn source_tarball_rejects_unrelated_link_members() {
+        let temp = tempfile::tempdir().expect("source archive fixture");
+        let name = "trust-src-1.96.0-trust";
+        let member = format!("{name}/git-commit-hash");
+        let candidate = "0123456789abcdef0123456789abcdef01234567";
+        for (case, kind, target) in [
+            ("symlink", tar::EntryType::Symlink, "."),
+            ("hardlink", tar::EntryType::Link, member.as_str()),
+        ] {
+            let dir = temp.path().join(case);
+            fs::create_dir(&dir).expect("archive case directory");
+            let archive = dir.join(format!("{name}.tar.xz"));
+            let encoder =
+                xz2::write::XzEncoder::new(fs::File::create(&archive).expect("archive"), 6);
+            let mut builder = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(40);
+            builder.append_data(&mut header, &member, candidate.as_bytes()).expect("revision");
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(0o777);
+            header.set_size(0);
+            header.set_link_name(target).expect("link target");
+            builder
+                .append_data(&mut header, format!("{name}/alias"), std::io::empty())
+                .expect("link alias");
+            if kind == tar::EntryType::Symlink {
+                let stale = "0123456789abcdef0123456789abcdef01234566";
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(0o644);
+                header.set_size(40);
+                builder
+                    .append_data(
+                        &mut header,
+                        format!("{name}/alias/git-commit-hash"),
+                        stale.as_bytes(),
+                    )
+                    .expect("revision through linked directory");
+            }
+            builder.into_inner().expect("finish tar").finish().expect("finish XZ");
+            source_tarball_archive_identity(&archive).expect_err(
+                "a hardlink member, or a member written through a symlink, must fail closed",
+            );
+        }
+    }
+
+    #[test]
+    fn source_tarball_accepts_unrelated_regular_members() {
+        let temp = tempfile::tempdir().expect("source archive fixture");
+        let name = "trust-src-1.96.0-trust";
+        let member = format!("{name}/git-commit-hash");
+        let candidate = "0123456789abcdef0123456789abcdef01234567";
+        let archive = temp.path().join(format!("{name}.tar.xz"));
+        let encoder = xz2::write::XzEncoder::new(fs::File::create(&archive).expect("archive"), 6);
+        let mut builder = tar::Builder::new(encoder);
+        for (path, data) in [
+            (member.as_str(), candidate.as_bytes()),
+            ("trust-src-1.96.0-trust/README", b"readme\n".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(data.len() as u64);
+            builder.append_data(&mut header, path, data).expect("regular member");
+        }
+        builder.into_inner().expect("finish tar").finish().expect("finish XZ");
+        let (digest, embedded) =
+            source_tarball_archive_identity(&archive).expect("valid archive identity");
+        assert_eq!(digest, file_sha256(&archive).expect("outer digest"));
+        assert_eq!(embedded, candidate);
+    }
+
+    #[test]
+    fn source_tarball_diagnostic_byte_bounds_fail_closed() {
+        let temp = tempfile::tempdir().expect("source archive fixture");
+        let archive = temp.path().join("trust-src-1.96.0-trust.tar.xz");
+        fs::File::create(&archive)
+            .expect("create sparse archive")
+            .set_len(super::MAX_SOURCE_ARCHIVE_COMPRESSED_BYTES + 1)
+            .expect("extend sparse archive");
+        assert!(
+            source_tarball_archive_identity(&archive)
+                .expect_err("oversized archive must fail before readback")
+                .contains("compressed-byte bound")
+        );
+
+        let mut reader = super::BoundedSourceArchiveReader {
+            inner: &[1_u8, 2][..],
+            bytes: super::MAX_SOURCE_ARCHIVE_DECOMPRESSED_BYTES - 1,
+        };
+        assert!(std::io::Read::read(&mut reader, &mut [0_u8; 2]).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires TRUST_SOURCE_ARCHIVE_PROBE to name a real source .tar.xz"]
+    fn source_tarball_real_archive_probe() {
+        let path = std::env::var("TRUST_SOURCE_ARCHIVE_PROBE").expect("real source archive path");
+        let started = std::time::Instant::now();
+        let (digest, commit) = source_tarball_archive_identity(std::path::Path::new(&path))
+            .expect("real archive identity");
+        println!("source archive: sha256={digest} commit={commit} elapsed={:?}", started.elapsed());
     }
 
     #[test]
@@ -5452,14 +6571,76 @@ mod content_gate_tests {
             "no registered kind-specific Rust collector/replayer",
             "self-declared runner identity",
             "exact candidate executable",
-            "complete ID/digest-indexed candidate obligation set",
-            "strictly parsed transcript",
+            "complete typed obligation set with stable IDs",
+            "canonical VC/query bytes",
+            "reconcile every ID exactly once",
+            "saved claim_digest_sha256 cannot reconstruct the VC",
+            "checks bindings, not LRAT/LFSC derivations",
         ] {
             assert!(
                 admission_defect.contains(required),
                 "solver admission defect must name missing `{required}`: {admission_defect}"
             );
         }
+    }
+
+    #[test]
+    fn authored_solver_transcript_and_certificate_cannot_clear_release_blocker() {
+        let temp = tempfile::tempdir().expect("release evidence fixture");
+        let candidate = "0123456789abcdef0123456789abcdef01234567";
+        let evidence_path = temp.path().join("evidence.json");
+        let evidence = json!({
+            "schema_version": "trust.product-proof.v1",
+            "candidate_commit": candidate,
+            "runner": rust_owned_runner_json(),
+            "generated_at": PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS,
+            "repo_dirty": false,
+            "status": "passed",
+            "product_proof_pass_evidence": true,
+            "domination_admissible": true,
+            "proof_results": valid_results_json(),
+            "proof_artifact_sha256": TEST_SHA256,
+            "solver_transcript": {
+                "status": "replayed",
+                "candidate_executable_sha256": TEST_SHA256,
+                "obligations": [{
+                    "obligation_id": "division-by-zero:0",
+                    "claim_digest_sha256": TEST_SHA256,
+                    "status": "proved"
+                }]
+            },
+            "checked_certificate": {
+                "format": "lrat",
+                "status": "checked",
+                "proof_sha256": TEST_SHA256
+            }
+        });
+        assert!(proof_content_defect(&evidence).is_none());
+        fs::write(&evidence_path, serde_json::to_vec(&evidence).expect("render evidence"))
+            .expect("write evidence");
+
+        let findings = validate_product_proof_release_artifact_evidence(
+            temp.path(),
+            candidate,
+            &evidence_path,
+            &evidence,
+        );
+        let solver = findings
+            .iter()
+            .find(|finding| finding.code == "product-proof-solver-evidence-unverified")
+            .expect("manual solver JSON must retain the unconditional blocker");
+        assert!(solver.message.contains("Missing producer contract"));
+        assert!(solver.message.contains("Missing replayer contract"));
+
+        let report = build_product_proof_release_report(
+            temp.path(),
+            candidate,
+            "evidence.json",
+            &evidence_path,
+        );
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["product_proof_pass_evidence"], false);
+        assert_eq!(report["domination_admissible"], false);
     }
 
     #[test]
@@ -5847,5 +7028,307 @@ mod content_gate_tests {
             "entrypoint": "targo trust release check",
             "python_used": false
         })
+    }
+
+    #[cfg(unix)]
+    fn selected_image_replay_fixture() -> (tempfile::TempDir, String, serde_json::Value) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("selected-image replay repository");
+        let root = temp.path();
+        let git = crate::controlled_git::executable().expect("controlled Git executable");
+        let run_git = |args: &[&str]| {
+            let output = Command::new(&git).current_dir(root).args(args).output().expect("run Git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "--quiet"]);
+        run_git(&[
+            "-c",
+            "user.name=Replay Test",
+            "-c",
+            "user.email=replay@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--no-verify",
+            "-m",
+            "seed",
+        ]);
+        let candidate = crate::controlled_git::canonical_head(
+            root,
+            "selected-image fixture HEAD",
+            64 * 1024,
+            Duration::from_secs(10),
+        )
+        .expect("fixture candidate");
+        let tree = crate::controlled_git::text(
+            root,
+            &["rev-parse", "--verify", &format!("{candidate}^{{tree}}")],
+            "selected-image fixture tree",
+            64 * 1024,
+            Duration::from_secs(10),
+        )
+        .expect("fixture tree");
+
+        let executable_path = "build/host/stage2/bin/trustc";
+        let executable = root.join(executable_path);
+        fs::create_dir_all(executable.parent().expect("executable parent")).expect("mkdir");
+        let script = format!("#!/bin/sh\nprintf 'trustc test\\ncommit-hash: {candidate}\\n'\n");
+        fs::write(&executable, &script).expect("write executable");
+        let mut permissions = fs::metadata(&executable).expect("executable metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).expect("chmod executable");
+        let executable_sha256 = format!("{:x}", Sha256::digest(script.as_bytes()));
+
+        let root_bytes = b"AAhelloZZ";
+        let selected_bytes = b"hello";
+        fs::write(root.join("root.bin"), root_bytes).expect("write root artifact");
+        fs::write(root.join("selected.bin"), selected_bytes).expect("write selected image");
+        let root_sha256 = format!("{:x}", Sha256::digest(root_bytes));
+        let selected_sha256 = format!("{:x}", Sha256::digest(selected_bytes));
+        let artifact_census = json!([
+            {"role": "root-artifact", "path": "root.bin", "sha256": root_sha256, "bytes": 9},
+            {"role": "selected-image", "path": "selected.bin", "sha256": selected_sha256, "bytes": 5},
+        ]);
+        let executable_record = json!({
+            "path": executable_path,
+            "sha256": executable_sha256,
+            "version": "trustc test",
+            "commit_hash": candidate,
+        });
+        let subject = json!({
+            "candidate_commit": candidate,
+            "candidate_tree_oid": tree,
+            "executable": executable_record,
+            "artifact_census": artifact_census,
+            "range": "2..7",
+        });
+        let obligation_id = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&subject).expect("render subject"))
+        );
+        let evidence = json!({
+            "schema_version": "trust.product-proof.v1",
+            "candidate_commit": candidate,
+            "release_artifact_binding": {
+                "schema_version": "trust.product-proof-release-binding.v1",
+                "candidate_commit": candidate,
+                "stage2_trustc": {
+                    "name": "trustc", "stage": "stage2", "path": executable_path,
+                    "sha256": executable_sha256, "executable": true,
+                    "version": "trustc test", "commit_hash": candidate,
+                },
+            },
+            "compile_back_artifact_digest_binding": {
+                "root_artifact_path": "root.bin", "root_artifact_sha256": root_sha256,
+                "selected_image_path": "selected.bin", "selected_image_sha256": selected_sha256,
+                "selected_image_range": "2..7",
+            },
+            "selected_image_replay": {
+                "schema_version": "trust.product-proof-selected-image-replay.v1",
+                "candidate_commit": candidate,
+                "candidate_tree_oid": tree,
+                "executable": executable_record,
+                "artifact_census": artifact_census,
+                "obligations": [{
+                    "id": obligation_id,
+                    "relation": "root-range-equals-selected-image/v1",
+                    "range": "2..7",
+                }],
+                "transcript": [{
+                    "obligation_id": obligation_id,
+                    "root_range_sha256": selected_sha256,
+                    "selected_image_sha256": selected_sha256,
+                }],
+            },
+        });
+        (temp, candidate, evidence)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_image_relation_rejects_root_replaced_between_path_hash_and_read() {
+        let temp = tempfile::tempdir().expect("artifact directory");
+        let root_path = temp.path().join("root.bin");
+        let selected_path = temp.path().join("selected.bin");
+        let parked_path = temp.path().join("parked.bin");
+        let bound_root = b"AAwrongZZ";
+        let forged_root = b"AAhelloZZ";
+        let selected = b"hello";
+        fs::write(&root_path, bound_root).expect("write bound root");
+        fs::write(&selected_path, selected).expect("write selected image");
+        let root_sha256 = format!("{:x}", Sha256::digest(bound_root));
+        let selected_sha256 = format!("{:x}", Sha256::digest(selected));
+
+        fs::rename(&root_path, &parked_path).expect("park bound root");
+        fs::write(&root_path, forged_root).expect("substitute root");
+        let mut opened_root = fs::File::open(&root_path).expect("open substituted root");
+        fs::remove_file(&root_path).expect("remove substituted root path");
+        fs::rename(&parked_path, &root_path).expect("restore bound root path");
+        let mut opened_selected = fs::File::open(&selected_path).expect("open selected image");
+
+        assert_eq!(file_sha256(&root_path).as_deref(), Some(root_sha256.as_str()));
+        assert_eq!(file_sha256(&selected_path).as_deref(), Some(selected_sha256.as_str()));
+        assert_eq!(&forged_root[2..7], selected);
+        assert_ne!(&bound_root[2..7], selected);
+        assert!(
+            verify_selected_image_byte_relation(
+                &mut opened_root,
+                &mut opened_selected,
+                2,
+                7,
+                &root_sha256,
+                &selected_sha256,
+            )
+            .expect_err("substituted open inode must fail")
+            .contains("opened artifact hash")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_image_relation_checks_cross_chunk_range() {
+        let temp = tempfile::tempdir().expect("artifact directory");
+        let mut root = vec![b'x'; 16_384];
+        root[8_190..8_200].copy_from_slice(b"0123456789");
+        let selected = b"0123456789";
+        let root_path = temp.path().join("root.bin");
+        let selected_path = temp.path().join("selected.bin");
+        fs::write(&root_path, &root).expect("write root");
+        fs::write(&selected_path, selected).expect("write selected image");
+        let (root_len, selected_len, range_sha256) = verify_selected_image_byte_relation(
+            &mut fs::File::open(&root_path).expect("open root"),
+            &mut fs::File::open(&selected_path).expect("open selected image"),
+            8_190,
+            8_200,
+            &format!("{:x}", Sha256::digest(&root)),
+            &format!("{:x}", Sha256::digest(selected)),
+        )
+        .expect("cross-chunk byte relation");
+        assert_eq!((root_len, selected_len), (16_384, 10));
+        assert_eq!(range_sha256, format!("{:x}", Sha256::digest(selected)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_image_replay_accepts_only_the_byte_relation() {
+        let (temp, candidate, evidence) = selected_image_replay_fixture();
+        replay_selected_image_range(temp.path(), &candidate, &evidence).expect("honest replay");
+        assert_eq!(
+            selected_image_replay_check_json(temp.path(), &candidate, &evidence)["status"],
+            "passed"
+        );
+        let findings = validate_product_proof_release_artifact_evidence(
+            temp.path(),
+            &candidate,
+            &temp.path().join("evidence.json"),
+            &evidence,
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| { finding.code == "product-proof-solver-evidence-unverified" })
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| { finding.code == "product-proof-selected-image-replay-invalid" })
+        );
+
+        fs::write(
+            temp.path().join("evidence.json"),
+            serde_json::to_vec(&evidence).expect("render evidence"),
+        )
+        .expect("write evidence");
+        let report = build_product_proof_release_report(
+            temp.path(),
+            &candidate,
+            "evidence.json",
+            &temp.path().join("evidence.json"),
+        );
+        assert_eq!(report["selected_image_replay_check"]["status"], "passed");
+        assert_eq!(
+            report["selected_image_replay_check"]["scope"],
+            "selected-image-byte-relation-only"
+        );
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["product_proof_pass_evidence"], false);
+        assert_eq!(report["domination_admissible"], false);
+        assert!(report["blockers"].as_array().is_some_and(|blockers| {
+            blockers
+                .iter()
+                .any(|blocker| blocker["code"] == "product-proof-solver-evidence-unverified")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_image_replay_rejects_forged_range_even_with_matching_claim() {
+        let (temp, candidate, mut evidence) = selected_image_replay_fixture();
+        evidence["compile_back_artifact_digest_binding"]["selected_image_range"] = json!("1..6");
+        evidence["selected_image_replay"]["obligations"][0]["range"] = json!("1..6");
+        assert!(
+            replay_selected_image_range(temp.path(), &candidate, &evidence)
+                .expect_err("forged range")
+                .contains("do not equal")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_image_replay_rejects_missing_duplicate_and_authored_pass() {
+        let (temp, candidate, evidence) = selected_image_replay_fixture();
+        let mut missing = evidence.clone();
+        missing["selected_image_replay"]["obligations"] = json!([]);
+        assert!(replay_selected_image_range(temp.path(), &candidate, &missing).is_err());
+        let mut duplicate = evidence.clone();
+        let obligation = duplicate["selected_image_replay"]["obligations"][0].clone();
+        duplicate["selected_image_replay"]["obligations"] = json!([obligation.clone(), obligation]);
+        assert!(replay_selected_image_range(temp.path(), &candidate, &duplicate).is_err());
+        let mut missing_step = evidence.clone();
+        missing_step["selected_image_replay"]["transcript"] = json!([]);
+        assert!(replay_selected_image_range(temp.path(), &candidate, &missing_step).is_err());
+        let mut duplicate_step = evidence.clone();
+        let step = duplicate_step["selected_image_replay"]["transcript"][0].clone();
+        duplicate_step["selected_image_replay"]["transcript"] = json!([step.clone(), step]);
+        assert!(replay_selected_image_range(temp.path(), &candidate, &duplicate_step).is_err());
+        let mut forged_census = evidence.clone();
+        forged_census["selected_image_replay"]["artifact_census"][0]["bytes"] = json!(8);
+        assert!(replay_selected_image_range(temp.path(), &candidate, &forged_census).is_err());
+        let mut wrong_candidate = evidence.clone();
+        wrong_candidate["release_artifact_binding"]["candidate_commit"] = json!("0".repeat(40));
+        assert!(
+            replay_selected_image_range(temp.path(), &candidate, &wrong_candidate)
+                .expect_err("conflicting candidate")
+                .contains("conflicting candidate")
+        );
+        let mut authored_pass = evidence;
+        authored_pass["selected_image_replay"]["status"] = json!("passed");
+        assert!(replay_selected_image_range(temp.path(), &candidate, &authored_pass).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_image_replay_rejects_altered_artifact_tree_and_executable() {
+        let (temp, candidate, evidence) = selected_image_replay_fixture();
+        let mut wrong_tree = evidence.clone();
+        wrong_tree["selected_image_replay"]["candidate_tree_oid"] = json!("0".repeat(40));
+        assert!(replay_selected_image_range(temp.path(), &candidate, &wrong_tree).is_err());
+        fs::write(temp.path().join("selected.bin"), b"HELLO").expect("alter artifact");
+        assert!(replay_selected_image_range(temp.path(), &candidate, &evidence).is_err());
+        fs::write(temp.path().join("selected.bin"), b"hello").expect("restore test artifact");
+        fs::write(temp.path().join("build/host/stage2/bin/trustc"), b"#!/bin/sh\nexit 0\n")
+            .expect("alter executable");
+        assert!(
+            replay_selected_image_range(temp.path(), &candidate, &evidence)
+                .expect_err("altered executable")
+                .contains("executable")
+        );
     }
 }

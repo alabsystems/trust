@@ -73,6 +73,7 @@ fn try_from_unwrap_or_fn(
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(&try_callee.to_string()),
                         is_foreign: false,
                     },
                 },
@@ -89,6 +90,9 @@ fn try_from_unwrap_or_fn(
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            &unwrap_callee.to_string(),
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -102,6 +106,7 @@ fn try_from_unwrap_or_fn(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

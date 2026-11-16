@@ -37,15 +37,30 @@ verdict directions per class —
 | m1probe | `divu_safe` | div-by-zero (`b \| 1` is odd) | provable | PROVED, both lanes |
 | m1probe | `sh` | shift-in-range (`k` unconstrained) | refutable | refutation stated, both lanes |
 | m1shift | `sh_safe` | shift-in-range (`k & 31 < 32`) | provable | PROVED, both lanes |
-| m1bounds | `pick` | bounds (`i` unconstrained) | refutable | NOT SOLVED — named blocker |
-| m1bounds | `pick_safe` | bounds (`i & 3 < 7`) | provable | NOT SOLVED — named blocker |
+| m1bounds | `pick` | bounds (`i` unconstrained) | refutable | refutation stated, both lanes (2026-11-06) |
+| m1bounds | `pick_safe` | bounds (`i & 3 < 7`) | provable | PROVED, both lanes (2026-11-06) |
 
-The m1bounds probe plans cleanly on both lanes but cannot be SOLVED through
-the native proof-grade entry: trust-mc's admission gate refuses
-`Inst::ExtractElement` unconditionally. The harness pins that refusal
-(`bounds_probe_is_refused_by_the_extract_element_gate_on_both_lanes`) so a
-future trust-mc bounds derivation flips it into the solved battery
-consciously.
+The m1bounds probe plans cleanly on both lanes. Until trust-mc TMC-1
+(`496360df7`) it could not be SOLVED through the native proof-grade entry,
+because trust-mc's admission gate refused every `Inst::ExtractElement`. TMC-1
+admits a read the translator models as a `select` of SMT-array lanes under its
+own bounds obligation. From Trust's pin of it (2026-10-02, `10a825655d`) the
+MIR lane refuted `pick` and proved `pick_safe`. The direct lane proved
+neither, because the translator did not model its `icmp ult usize` bounds
+comparison (`UnsupportedComparison`, failing closed: refutations demote to
+unknown), and a retired test
+(`bounds_probe_solves_on_the_mir_lane_and_the_direct_lane_fails_closed_at_its_comparison`)
+pinned that split. From Trust `8862c94337` (2026-11-02), whose trust-mc pin
+brought in trust-mc `c88bca8d7`'s operand-consumption guard, the MIR lane's
+read of the root `[i32; 7]` parameter was refused too (NotProved,
+`OperandConsumption`): the guard counted a root entry parameter as initialized
+only when it was a scalar or a zero-field aggregate. That lasted until trust-mc
+`9cb7ffef6` granted a root array parameter its value domain. The probe is in
+the solved battery
+(`m1_differential_scorecard_agrees_and_pins_both_verdict_directions`) since
+Trust pinned trust-mc `5d05b457a` (2026-11-06, BMC-LANE-1), and the entry needs
+both fixes: `9cb7ffef6` for the MIR lane, and `00e0292a8` (pointer-width
+integer comparisons modeled in both native lanes) for the direct lane.
 
 Consumed by `trust-bmc/src/direct_shadow_differential.rs` (feature
 `trust-mc-native-trust-ir-bundle`). Re-minting with a newer driver is fine —

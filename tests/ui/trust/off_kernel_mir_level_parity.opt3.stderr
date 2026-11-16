@@ -1,0 +1,27 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (wadd, wadd_self)
+  --> $DIR/off_kernel_mir_level_parity.rs:37:5
+   |
+LL | /     def wadd (a b : UInt64) : UInt64 := a + b
+LL | |     theorem wadd_self : forall (a b : UInt64), wadd a b = wadd a b := fun a b => rfl
+   | |____________________________________________________________________________________^
+
+note: citation `wadd_self` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `add2`, with a clean certification audit
+  --> $DIR/off_kernel_mir_level_parity.rs:42:37
+   |
+LL |     ensures result == wadd(a, b) by wadd_self
+   |                                     ^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
+
+error: citation `wadd_self` failed the strict Clean statement/certification audit: the postcondition goal could not be built (ensures discharge requires the specified function `off_kernel_mir_level_parity::add2_via` to be E6-admitted (its defining equation kernel-imported); it is not; E6 admission of `off_kernel_mir_level_parity::add2_via` was refused by the island-FORWARDING gate: all four E6 facets hold and its body forwards its parameters to `off_kernel_mir_level_parity::wadd_helper`, but that callee has no kernel-checked Clean island identity of arity 2 whose declared carriers match the forwarded ones), so the citation was graded against the clause with `result` universally quantified, which the cited theorem does not prove
+  --> $DIR/off_kernel_mir_level_parity.rs:54:37
+   |
+LL |     ensures result == wadd(a, b) by wadd_self
+   |                                     ^^^^^^^^^
+   |
+   = note: statement drift and authority/provenance failures are hard citation errors; there is no router fallback (E9)
+   = help: options: (1) reduce the body to an E6-importable shape — a projection, a constant, a wrapping `+`/`-`/`*` tree, a select (`if a < b { a } else { b }`), a comparison, `==`/`!=` over `bool`, a `bool` connective tree (`&&`, `||`, `!` over `bool` parameters and comparisons), or a decision tree (`if`/`else`, `match` on a parameter with literal arms and `_`) — so `result` has a kernel denotation; (2) state the fact over the parameters only: a clause that does not mention `result` is graded on any body; (3) drop the `by` citation and let the solver lanes prove the clause
+   = note: kernel detail for the universally-quantified `result` reading: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), App(App(App(Const(Name { depth: 1, suffix: [\"Eq\"], lean4_hash: dfbff609f865258f }, [Succ(Zero)]), Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, [])), BVar(2)), App(App(Const(Name { depth: 1, suffix: [\"wadd\"], lean4_hash: ac54cd5c621c5439 }, []), BVar(1)), BVar(0)))))), inferred: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), App(App(App(Const(Name { depth: 1, suffix: [\"Eq\"], lean4_hash: dfbff609f865258f }, [Succ(Zero)]), Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, [])), App(App(Const(Name { depth: 1, suffix: [\"wadd\"], lean4_hash: ac54cd5c621c5439 }, []), BVar(1)), BVar(0))), App(App(Const(Name { depth: 1, suffix: [\"wadd\"], lean4_hash: ac54cd5c621c5439 }, []), BVar(1)), BVar(0))))), location: None }" }]
+
+error: aborting due to 1 previous error
+

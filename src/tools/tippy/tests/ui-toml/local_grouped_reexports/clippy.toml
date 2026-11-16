@@ -1,0 +1,14 @@
+disallowed-macros = [
+    "local_grouped_reexports::single::single_macro",
+    "local_grouped_reexports::grouped::grouped_macro",
+    "local_grouped_reexports::nested::nested_macro",
+    "local_grouped_reexports::aliases::macro_alias",
+    "local_grouped_reexports::bridge::grouped_module::module_macro",
+]
+disallowed-methods = [
+    "local_grouped_reexports::single::single_function",
+    "local_grouped_reexports::grouped::grouped_function",
+    "local_grouped_reexports::nested::nested_function",
+    "local_grouped_reexports::aliases::function_alias",
+    "local_grouped_reexports::bridge::grouped_module::module_function",
+]

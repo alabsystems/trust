@@ -1,6 +1,6 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aprivate_interfaces
 //@ edition: 2021
 //! Trust (wave-AFS2): a struct literal with a FUNCTION-POINTER field recovers that lane's
 //! aggregate seed from the OPEN BLOCK, so the seed IS the value that immediately overwrites it.

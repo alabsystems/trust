@@ -33,7 +33,7 @@
 //      ordering-sensitive and that the Vec-based insertion order is what saves us.
 //
 // from the repo root:
-//   RUSTC_BOOTSTRAP=1 cargo test --manifest-path crates/Cargo.toml \
+//   targo --unverified test --manifest-path crates/Cargo.toml \
 //     -p trust-cg-bridge --test emit_determinism_multisym -- --test-threads=1
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -73,6 +73,7 @@ fn wrap(name: &str, body: VerifiableBody) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -135,6 +136,7 @@ fn make_caller(name: &str, callee: &str) -> VerifiableFunction {
                         is_unsafe_sig: false,
                         is_foreign: false,
                         callee_identity: None,
+                        callee_key: None,
                         func: callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(2),
@@ -360,7 +362,11 @@ fn from_hex(s: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Child entry, re-executed by `run_child`; a no-op without `CHILD_ENV`, and
+/// `#[ignore]`d so a plain run does not count that no-op as a pass.
 #[test]
+#[ignore = "subprocess child: re-executed by \
+            multisym_emit_cross_process_object_bytes_are_bit_identical"]
 fn multisym_emit_child_emitter() {
     if std::env::var(CHILD_ENV).is_err() {
         return;
@@ -374,7 +380,8 @@ fn multisym_emit_child_emitter() {
 fn run_child(salt: &str) -> BTreeMap<String, Vec<u8>> {
     let exe = std::env::current_exe().expect("current_exe");
     let output = Command::new(&exe)
-        .args(["--exact", CHILD_TEST_NAME, "--nocapture", "--test-threads=1"])
+        // The child is `#[ignore]`d: `--ignored` selects it, `--exact` only it.
+        .args(["--ignored", "--exact", CHILD_TEST_NAME, "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, "1")
         .env("TRUST_EMIT_DETERMINISM_SALT", salt)
         .output()
@@ -569,7 +576,11 @@ fn hashmap_ordering_fingerprint(names: &[String]) -> String {
     map.keys().cloned().collect::<Vec<_>>().join(",")
 }
 
+/// Child entry, re-executed by `run_hazard_child`; a no-op without
+/// `HAZARD_CHILD_ENV`, and `#[ignore]`d so a plain run does not count that no-op
+/// as a pass.
 #[test]
+#[ignore = "subprocess child: re-executed by multisym_emit_negative_control_hashmap_reorder"]
 fn multisym_hazard_child_emitter() {
     if std::env::var(HAZARD_CHILD_ENV).is_err() {
         return;
@@ -584,7 +595,8 @@ fn multisym_hazard_child_emitter() {
 fn run_hazard_child(salt: &str) -> String {
     let exe = std::env::current_exe().expect("current_exe");
     let output = Command::new(&exe)
-        .args(["--exact", HAZARD_CHILD_TEST_NAME, "--nocapture", "--test-threads=1"])
+        // The child is `#[ignore]`d: `--ignored` selects it, `--exact` only it.
+        .args(["--ignored", "--exact", HAZARD_CHILD_TEST_NAME, "--nocapture", "--test-threads=1"])
         .env(HAZARD_CHILD_ENV, "1")
         .env("TRUST_EMIT_DETERMINISM_SALT", salt)
         .output()

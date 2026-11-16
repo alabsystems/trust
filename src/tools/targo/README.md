@@ -34,6 +34,44 @@ along.
 a native compilation command, so it neither warns nor starts a broker. Its
 alias `targo clippy` IS one, so `clippy` prints the `UNVERIFIED` warning where
 `tippy` stays silent — interchangeable in what they run, not in what they say.
+In a branded invocation the target-info probe runs the selected compiler, never
+`RUSTC_WORKSPACE_WRAPPER`, so `targo tippy` (tippy-driver as that wrapper)
+matches `[target.'cfg(..)']` tables, platform dependencies and build scripts'
+`CARGO_CFG_*` exactly as `targo --unverified check` does, a
+`[target.'cfg(trust_verify)']` table included. `cfg(trust_verify)` itself stays
+false in a lint compile, whose verification is off, and lint compiles of
+workspace members run one front-end thread whatever `-Zthreads` asks
+(DECISION_QUEUE T14-TIPPY-1). In the explicitly unverified lane
+(`targo --unverified`, and `targo tippy`, which runs it) the probe keeps the
+lane's `-Ztrust-verify=off`, so every other cfg (`overflow_checks`,
+`ub_checks`, `contract_checks`, …) follows the lane's units, and so does a
+refusal that depends only on whether they verify; the probe still drops the
+lane's other `-Ztrust-*` options and the MIR-pipeline options, so a refusal
+that depends on one of those fires at the first unit instead. `trust_verify`
+alone comes from one more `--print=cfg` query at the compiler's default, with
+the Trust options and those a Trust compilation refuses dropped from it; that
+query is a verifying compile, so it still refuses the compiler's legacy Trust
+environment variables (`AY_PATH`, `TRUST_LEVEL`, …) the lane's units accept
+(DECISION_QUEUE TARGO-PROBE-LANE-1). The verified lane's probe is unchanged,
+and so is the probe of `targo trust`'s unit-graph preflight, which runs in the
+unverified lane with a lane handed to it and resolves the verified build's
+graph. Commands outside every lane (`targo tree`, `targo metadata`) still probe
+at the compiler's default.
+
+`targo trust` hands Cargo its lane in the private variable
+`TRUST_TARGO_LANE_RUSTFLAGS`. A branded invocation appends it to the project's
+rustflags, resolved by Cargo's own precedence, so a verified unit compiles with
+`<project> <lane>`; the lane owns the codegen backend, LLVM plugins,
+`-Cllvm-args`, and the safety checks and codegen contract it sets, and a project
+spelling of one is dropped with a notice naming its source (DECISION_QUEUE
+T14-APPEND-1/2). Under a lane an argument file (`@path`) or a `--` in the
+project's flags is refused, naming its source: rustc expands the file wherever
+it sits, so its flags could not be classified. An environment value that
+replaces configured tables (Cargo's precedence) is named in a note. No child
+process sees the variable: it is scrubbed from compilers, trustdoc, build
+scripts and tests. Outside the verified lane it may carry only what `targo
+trust` hands its probes (trust-cg's codegen contract and the strict safety
+checks), so it is no second ambient rustflags channel.
 
 When code run by an explicitly authorized command recursively invokes the
 `$CARGO` frontend (for example, a compile-test harness), Targo preserves that
@@ -43,8 +81,25 @@ descriptor, or Cargo configuration: client and server authenticate each
 other's kernel PID, opened executable identity, PID lifetime, and ancestry on a
 fresh connection. Nested Targo prints its own `UNVERIFIED` warning and keeps
 verified invocations fail-closed. Linux uses abstract Unix sockets and pidfds,
-so abnormal exit leaves no socket path behind. Other platforms do not propagate
-this authority until equivalent handle-bound checks exist. Each client binds an
+so abnormal exit leaves no socket path behind. macOS (DECISION_QUEUE
+T14-EXPORT-2) authenticates the same facts through other handles: the peer's
+audit token (pid and pid version) for process identity, the code-directory hash
+read through that token for executable identity (an image without one is
+refused), and `proc_pidinfo` unique ids for ancestry; its endpoint is a socket in
+a fresh `0700` directory under the per-user temporary directory, removed when
+the root exits. Other platforms do not propagate this authority until
+equivalent handle-bound checks exist. The address travels in
+`TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT` (before T14c,
+`TRUST_TARGO_NESTED_UNVERIFIED_BROKER`, which is no longer read and is removed
+wherever the new name is, so a pre-T14c Targo, which stops when an address does
+not authenticate, never sees one it cannot authenticate). An address that does
+not authenticate (a path a killed root left, another Targo build's root, a
+replayed environment) grants nothing and stops nothing: a typed `--unverified`,
+the verified lane and every verb that compiles nothing proceed on their own,
+and a compile verb naming no lane is refused with a note naming the address.
+An explicit lane beats an inherited one: `targo trust` run under an
+explicit-unverified ancestor keeps its verified lane, and never asks the
+broker. Each client binds an
 unpredictable one-shot callback address; the broker must actively connect back,
 and the kernel-reported callback peer must be the authenticated Targo ancestor.
 This broker boundary assumes the ancestor Targo process itself has not already
@@ -55,7 +110,20 @@ class requires an external, handle-bound launcher/attester. The broker does
 reject forged environment/configuration values, inherited listeners serviced
 by helper processes, unrelated executables, stale PIDs, and reparented peers.
 Propagation also requires broker and client to share a Linux PID namespace and
-usable procfs/pidfd view; container-boundary mismatches fail closed.
+usable procfs/pidfd view; container-boundary mismatches fail closed. The root
+`targo --unverified run` keeps its broker alive by supervising its target
+instead of replacing itself. It forwards SIGHUP, SIGUSR1/2, SIGALRM and
+SIGTERM; it does not forward SIGINT or SIGQUIT, which a terminal (or a
+job-control parent) sends to the whole process group, target included, so a
+forwarded copy would arrive twice. Like `system(3)` it outlives them and ends as
+its target does; a SIGINT sent to the supervisor's pid alone therefore does not
+reach the target (signal the group, or send SIGTERM). On macOS, which has no
+parent-death signal, a supervisor killed with SIGKILL leaves its target running.
+On macOS a target ended by a signal that writes a crash report (SIGQUIT,
+SIGILL, SIGTRAP, SIGABRT, SIGFPE, SIGBUS, SIGSEGV, SIGSYS) ends the supervisor
+with one line and exit `128 + n`, so no second report is written for targo. The
+verified lane exports no authority, and neither does the `cargo` compatibility
+name.
 
 Trust's Rust and Lean frontends are moving to direct TrustIR lowering. MIR is a
 Rust compatibility path, not the architectural proof boundary. Targo owns the
@@ -81,11 +149,6 @@ the inherited package-manager surface, [The Cargo Book] remains applicable.
 > Trust-specific frontend identity, toolchain selection, and verifier transport
 > live on top of that compatibility base.
 
-## Code Status
-
-[![CI](https://github.com/rust-lang/cargo/actions/workflows/main.yml/badge.svg?branch=auto-cargo)](https://github.com/rust-lang/cargo/actions/workflows/main.yml)
-
-Code documentation: <https://doc.rust-lang.org/nightly/nightly-rustc/cargo/>
 
 ## Compiling from Source
 
@@ -132,7 +195,7 @@ Build Targo as part of the Trust checkout so it is paired with the matching
 compiler, standard library, verifier supervisor, and Tippy driver:
 
 ```
-TRUST_SEED_STAIRCASE=1 ./x build src/tools/targo --set build.submodules=false
+./x build src/tools/targo --set build.submodules=false
 ```
 
 For a complete user-facing stage2 toolchain, use the repository's normal stage2
@@ -173,6 +236,8 @@ Please report all issues on the GitHub [issue tracker][issues].
 
 See the **[Cargo Contributor Guide]** for a complete introduction
 to contributing to Cargo.
+
+Code documentation: <https://doc.rust-lang.org/nightly/nightly-rustc/cargo/>
 
 ## License
 

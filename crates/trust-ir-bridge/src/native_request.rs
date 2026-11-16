@@ -1,13 +1,17 @@
 //! Trust native verifier request planning over upstream TrustIr request types.
 //!
 //! The schema types live in `trust_ir`; this bridge only decides how a lowered
-//! Trust module is split into the currently authoritative TrustVc and TrustMc
-//! request variants. Historical TrustWp wire variants remain readable in
-//! `trust_ir`, but the current ownership contract never emits them.
+//! Trust module is split into primary TrustVc and TrustMc requests, with
+//! body-aware TrustWp alternatives for postconditions. All strategies retain
+//! one module, source identity, and proof-obligation inventory.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
+use trust_ir::binary::{
+    BinaryProjectionError, ModuleBinaryBody, ModuleBinaryOptions, ModuleObligationRows,
+    ModuleSymbolProjection, ProjectedModuleBinaryPlan,
+};
 use trust_ir::{
     FuncId, Module, NativeAdapterInput, NativeAssertionId, NativeBundleProducer,
     NativeCompilerFactRef, NativeCompilerFacts, NativeDiagnosticsPolicy, NativeEvidenceArtifact,
@@ -18,13 +22,20 @@ use trust_ir::{
     NativeVerificationBundle, NativeVerificationBundleError, NativeVerificationRequest,
     ObligationKind, Producer, ProofCertificate, ProofDigest, ProofDigestAlgorithm, ProofId,
     ProofLineageId, ProofLineageManifest, ProofLineageNode, ProofReplayIdentity, ProofTransform,
-    ProofTransformStage, SourceSpan, TrustMcChcOptions, TrustMcNativeRequest,
-    TrustMcRequestOptions, TrustMcVerificationMode, TrustVcNativeEvidenceBundle,
-    TrustVcNativeRequest, TrustVcRequestOptions, TrustVcVerificationMode,
+    ProofTransformStage, SourceSpan, TrustMcArithmeticModel, TrustMcBmcOptions, TrustMcChcEngine,
+    TrustMcChcOptions, TrustMcInvariantSource, TrustMcMemoryModel, TrustMcNativeRequest,
+    TrustMcPdrGeneralization, TrustMcPdrOptions, TrustMcRequestOptions, TrustMcSlicingMode,
+    TrustMcVerificationMode, TrustVcNativeEvidenceBundle, TrustVcNativeRequest,
+    TrustVcRequestOptions, TrustVcVerificationMode, TrustWpNativeRequest, TrustWpRequestOptions,
+    TrustWpVerificationMode,
 };
 
 #[cfg(test)]
 use crate::lower::TRUST_OBLIGATION_SOURCE_SCHEMA;
+
+#[cfg(test)]
+#[path = "native_request_metadata_tests.rs"]
+pub(super) mod metadata_tests;
 
 /// Transform version string used in TrustIr-bridge lineage for this boundary.
 pub const TRUST_NATIVE_REQUEST_TRANSFORM_VERSION: &str = "native-request-schema-v1";
@@ -45,6 +56,8 @@ const TRUST_VC_LEAN_SOLVER_INTERFACE_VERSION: &str = "lean4-trust_vc-proof-kerne
 /// Builder errors for the TrustIr MIR-compatibility native-request planner.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum NativeVerificationBundleBuildError {
+    #[error("native verification module has no binary identity: {0}")]
+    ModuleBinaryIdentity(BinaryProjectionError),
     #[error("cannot emit native verification bundle for an empty TrustIr module")]
     EmptyModule,
     #[error("native request target function {0} is missing from the TrustIr module")]
@@ -80,6 +93,20 @@ pub enum NativeVerificationBundleBuildError {
     DuplicateOwner(FuncId),
     #[error("native verification bundle validation failed")]
     Validation(Vec<NativeVerificationBundleError>),
+    /// A module certificate arrived with `ProofCertificate::assurance`
+    /// (trust-ir v41) already recorded. See the COVERAGE ASSURANCE section of
+    /// [`native_verification_bundle_from_module_owners`]: a row must cite a
+    /// request of the bundle it travels in, those requests are minted here, and
+    /// each one binds the module digest the row itself feeds, so a row present
+    /// on entry cites a request of some OTHER bundle. Refused by name here
+    /// rather than shipped for trust-ir-build to refuse later as
+    /// `CoverageAssuranceRequestUnknown`.
+    #[error(
+        "native proof certificate for obligation {obligation} carries a coverage assurance \
+         recorded before this bundle's requests existed; a coverage row must cite a request \
+         of the bundle it travels in, and none can be cited from outside it"
+    )]
+    PreRecordedCoverageAssurance { obligation: ProofId },
 }
 
 /// One body whose proof obligations a native verification bundle may carry.
@@ -118,8 +145,8 @@ pub struct NativeBundleOwner {
 ///
 /// - TrustVc owns memory-safety and refinement certificate import/merge work.
 /// - TrustMc owns body-aware contract/loop/termination and reachability work.
-/// - TrustWp advertises no native request; formula-less structural give-back
-///   records carry no proof authority.
+/// - TrustWp receives a body-aware alternative for each postcondition. A
+///   formula-less structural give-back record still carries no proof authority.
 ///
 /// This planner does not manufacture solver-result evidence. It emits one
 /// narrow TrustVc import-evidence row only when every certificate in that
@@ -127,6 +154,9 @@ pub struct NativeBundleOwner {
 /// each exact certificate in-process; an opaque `LeanProof`, public
 /// `Discharged` label, or mixed certificate request can never cross this
 /// boundary as evidence.
+///
+/// See [`native_verification_bundle_from_module_owners`] for why every
+/// certificate it carries leaves with `assurance: None` (NOT RECORDED).
 pub fn native_verification_bundle_from_module(
     module: Module,
     source_digest: ProofDigest,
@@ -150,6 +180,36 @@ pub fn native_verification_bundle_from_module(
 /// cites, the lineage node that attests which body was lowered, and the request
 /// `function` / replay-transcript digest. What stays root-scoped: the bundle's
 /// own `provenance.source_digest` and adapter input, which name the SUBJECT.
+///
+/// # Coverage assurance (trust-ir v41 `ProofCertificate::assurance`)
+///
+/// A coverage row is recorded exactly when trust-ir-build's establishing
+/// criterion holds for the request it cites (`coverage_assurance_report`,
+/// admitting on `is_checked() && errors().is_empty() && undetermined() == 0`):
+/// the cited request is in this bundle, lists the certificate's obligation,
+/// fixes a bound from its own fields, and no sibling over the obligation fixes
+/// a shorter one. For every certificate this planner carries the criterion
+/// does NOT hold, so every row leaves as `None` — NOT RECORDED, which a
+/// fail-closed consumer reads as unknown coverage, never as unbounded:
+///
+/// * a certificate rides the TrustVc `ImportProofCertificates` request of its
+///   owner (a `CleanCic` one regardless of kind), and trust-ir-build fixes NO
+///   bound for any TrustVc mode — the import's coverage is whatever the
+///   imported certificate established, not a field of the request. Recording
+///   `Unbounded` there is the over-claim trust-ir-build calls the unsound
+///   direction (pinned by test against `coverage_assurance_report` itself);
+/// * the TrustMc `Chc` requests minted here are PENDING solve requests. A
+///   certificate the module already carries did not come from one of them,
+///   so citing one would state a provenance that is false, and a `CleanCic`
+///   obligation is excluded from them anyway;
+/// * no row can be recorded here even where a bound were established: every
+///   request binds `trust_ir_module_digest` through its replay-transcript
+///   digest, and that module digest covers the row's own `request_digest`.
+///   A row citing a request of the same bundle is a digest cycle.
+///
+/// For the same reason a certificate that ARRIVES with a row recorded is
+/// refused ([`NativeVerificationBundleBuildError::PreRecordedCoverageAssurance`]):
+/// whatever request it cites is not one of the requests minted below.
 pub fn native_verification_bundle_from_module_owners(
     module: Module,
     owners: &[NativeBundleOwner],
@@ -193,6 +253,15 @@ pub fn native_verification_bundle_from_module_owners(
         }
     }
     require_mir_compatibility_producers(&module, function)?;
+    if let Some(certificate) =
+        module.proof_certificates.iter().find(|certificate| certificate.assurance.is_some())
+    {
+        return Err(NativeVerificationBundleBuildError::PreRecordedCoverageAssurance {
+            obligation: certificate.obligation,
+        });
+    }
+    require_native_module_binary_identity(&module)
+        .map_err(NativeVerificationBundleBuildError::ModuleBinaryIdentity)?;
     let trust_ir_module_digest = module.stable_digest();
     if trust_ir_module_digest.algorithm != ProofDigestAlgorithm::Sha256 {
         return Err(NativeVerificationBundleBuildError::NonAuthoritativeModuleDigest {
@@ -233,6 +302,11 @@ pub fn native_verification_bundle_from_module_owners(
     );
     bundle.provenance.producer_version = TRUST_NATIVE_REQUEST_COMPILER_VERSION.to_string();
     bundle.provenance.source_language = NativeSourceLanguage::Rust;
+    // Rust is the backing source; the admitted function tags describe the
+    // retained TrustIr MIR bridge. Do not infer extra languages from imports:
+    // upstream bundle validation must refuse any uncovered dependency tag.
+    bundle.provenance.source_languages =
+        BTreeSet::from([NativeSourceLanguage::Rust, NativeSourceLanguage::TrustIr]);
     bundle.provenance.source_digest = Some(source_digest);
     bundle.provenance.toolchain = vec![trust_ir_bridge_tool_identity()];
     bundle.compiler_facts = compiler_facts;
@@ -263,9 +337,8 @@ pub fn native_verification_bundle_from_module_owners(
     // single-owner module has always produced, extended outward rather than
     // interleaved, so request ids stay stable for the subject.
     for owner in owners {
-        let owned_by = |obligation: &trust_ir::ProofObligation| {
-            obligation.function == Some(owner.function)
-        };
+        let owned_by =
+            |obligation: &trust_ir::ProofObligation| obligation.function == Some(owner.function);
         let trust_vc_obligations = request_obligations(&bundle.module, |obligation| {
             owned_by(obligation)
                 && (trust_vc_owns_obligation(&obligation.kind)
@@ -343,6 +416,32 @@ pub fn native_verification_bundle_from_module_owners(
             next_request_id += 1;
         }
     }
+    // Alternative proof strategies share the exact module, public obligation
+    // and source binding. Append after every primary request so their stable
+    // ids and the primary ownership table are unchanged.
+    for owner in owners {
+        for obligation in request_obligations(&bundle.module, |obligation| {
+            obligation.function == Some(owner.function)
+                && obligation.kind == ObligationKind::Postcondition
+                && !clean_cic_obligations.contains(&obligation.id)
+        }) {
+            let obligations = vec![obligation];
+            bundle.requests.push(native_wp_request(
+                NativeRequestId::new(next_request_id),
+                owner.function,
+                obligation,
+                lineage_root,
+                ProofReplayIdentity::new("trust_wp", "replay_trust_ir_body_contracts")
+                    .with_transcript_digest(native_replay_transcript_digest(
+                        "trust_wp",
+                        owner.source_digest,
+                        trust_ir_module_digest,
+                        &obligations,
+                    )),
+            ));
+            next_request_id += 1;
+        }
+    }
     if bundle.requests.is_empty() {
         return Err(NativeVerificationBundleBuildError::EmptyRequests);
     }
@@ -358,6 +457,38 @@ pub fn native_verification_bundle_from_module_owners(
     // authorized seam mints the affine authority from the live bundle itself, and
     // a deserialized copy can never be authorized (fail-closed direction kept).
     Ok(bundle)
+}
+
+/// Assemble the same single-question WP request for either input provenance.
+/// The caller supplies its own truthful replay identity: direct diagnostic
+/// requests must not invent a MIR source digest or source authority.
+pub(super) fn native_wp_request(
+    id: NativeRequestId,
+    function: FuncId,
+    obligation: ProofId,
+    lineage_root: ProofLineageId,
+    replay: ProofReplayIdentity,
+) -> NativeVerificationRequest {
+    let provenance = NativeRequestProvenance::trust_wp(
+        NativeToolIdentity::new("trust_wp")
+            .with_version("trust-wp-trust-ir-body-wp-v1")
+            .with_revision(TRUST_NATIVE_REQUEST_TRANSFORM_VERSION),
+    )
+    .with_solver(
+        NativeToolIdentity::new("trust-wp-core.native-pure-replay")
+            .with_version("trust_wp.native-pure-replay.v1"),
+    )
+    .with_replay(replay);
+    NativeVerificationRequest::TrustWp(TrustWpNativeRequest {
+        id,
+        mode: TrustWpVerificationMode::WeakestPrecondition,
+        function,
+        obligations: vec![obligation],
+        lineage_roots: vec![lineage_root],
+        options: TrustWpRequestOptions::default(),
+        diagnostics: NativeDiagnosticsPolicy::default(),
+        provenance,
+    })
 }
 
 /// Require positive MIR-compatibility provenance before relabeling a module as
@@ -391,6 +522,23 @@ fn require_mir_compatibility_producers(
     Ok(())
 }
 
+/// Admit the exact module to its existing binary identity without deriving a
+/// second digest or dropping claims. Adaptive Raw accepts every lossless wire
+/// version; the default RawV38 would reject already-supported v39-v46 content.
+pub(super) fn require_native_module_binary_identity(
+    module: &Module,
+) -> Result<(), BinaryProjectionError> {
+    ProjectedModuleBinaryPlan::try_new(
+        module,
+        ModuleBinaryOptions {
+            body: ModuleBinaryBody::Raw,
+            symbols: ModuleSymbolProjection::Exact,
+            obligations: ModuleObligationRows::All,
+        },
+    )
+    .map(|_| ())
+}
+
 fn trust_ir_bridge_tool_identity() -> NativeToolIdentity {
     NativeToolIdentity::new("TrustIr")
         .with_version(TRUST_NATIVE_REQUEST_COMPILER_VERSION)
@@ -418,6 +566,16 @@ fn trust_ir_bridge_tool_identity() -> NativeToolIdentity {
 ///
 /// With ONE owner no join is emitted and this is exactly the single node, single
 /// root, all-obligations, all-certificates manifest that shipped before.
+#[inline]
+fn obligation_by_id(module: &Module, id: ProofId) -> Option<&trust_ir::ProofObligation> {
+    let idx = id.index() as usize;
+    module
+        .proof_obligations
+        .get(idx)
+        .filter(|obligation| obligation.id == id)
+        .or_else(|| module.proof_obligations.iter().find(|obligation| obligation.id == id))
+}
+
 fn native_lineage_for_owners(
     module: &Module,
     owners: &[NativeBundleOwner],
@@ -440,13 +598,7 @@ fn native_lineage_for_owners(
     }
 
     let obligation_owner = |id: ProofId| {
-        owner_of(
-            module
-                .proof_obligations
-                .iter()
-                .find(|obligation| obligation.id == id)
-                .and_then(|obligation| obligation.function),
-        )
+        owner_of(obligation_by_id(module, id).and_then(|obligation| obligation.function))
     };
     let mut per_owner_certificates = vec![Vec::new(); owners.len()];
     let mut all_certificates = Vec::with_capacity(module.proof_certificates.len());
@@ -566,8 +718,7 @@ fn populate_compiler_facts_for_owners(
             )
         })
         .collect();
-    compiler_facts.obligation_sources =
-        obligation_sources_for_owners(module, owner_indices, root)?;
+    compiler_facts.obligation_sources = obligation_sources_for_owners(module, owner_indices, root)?;
     Ok(())
 }
 
@@ -728,10 +879,27 @@ fn trust_vc_request_provenance(
     .with_replay_context(native_replay_context(module, compiler_facts, obligations))
 }
 
-fn trust_mc_chc_request_options() -> TrustMcRequestOptions {
+/// Declare the native whole-function safety encoding and native PDR execution.
+/// Keep this explicit: the wire defaults also describe backends and transforms
+/// that this producer does not request or supply.
+pub fn trust_mc_chc_request_options() -> TrustMcRequestOptions {
     TrustMcRequestOptions {
-        chc: TrustMcChcOptions { emit_horn_clauses: true, ..TrustMcChcOptions::default() },
-        ..TrustMcRequestOptions::default()
+        memory_model: TrustMcMemoryModel::TrustIrPlaces,
+        arithmetic_model: TrustMcArithmeticModel::FixedWidthBitvectors,
+        // Inactive on CHC/PDR requests; this does not claim cyclic BMC support.
+        bmc: TrustMcBmcOptions { unwind_limit: 1, unwinding_assertions: true },
+        chc: TrustMcChcOptions {
+            engine: TrustMcChcEngine::NativePdr,
+            // Solver-internal candidate discovery is not an imported invariant.
+            invariant_source: TrustMcInvariantSource::None,
+            pdr: TrustMcPdrOptions {
+                enabled: true,
+                max_frames: None,
+                generalization: TrustMcPdrGeneralization::Cubes,
+            },
+            emit_horn_clauses: true,
+        },
+        slicing: TrustMcSlicingMode::None,
     }
 }
 
@@ -793,9 +961,7 @@ pub(crate) fn native_replay_context(
 ) -> NativeReplayContext {
     let mut context = NativeReplayContext::default();
     for (index, obligation_id) in obligations.iter().enumerate() {
-        let Some(obligation) =
-            module.proof_obligations.iter().find(|obligation| obligation.id == *obligation_id)
-        else {
+        let Some(obligation) = obligation_by_id(module, *obligation_id) else {
             continue;
         };
         let Some(formula) = obligation.formula.clone() else {
@@ -827,9 +993,7 @@ fn trust_mc_native_replay_context(
 ) -> NativeReplayContext {
     let mut context = native_replay_context(module, compiler_facts, obligations);
     for obligation_id in obligations {
-        let Some(obligation) =
-            module.proof_obligations.iter().find(|obligation| obligation.id == *obligation_id)
-        else {
+        let Some(obligation) = obligation_by_id(module, *obligation_id) else {
             continue;
         };
         if let Some(unsupported) = trust_mc_unsupported_semantics_mode(obligation) {
@@ -839,11 +1003,44 @@ fn trust_mc_native_replay_context(
     context
 }
 
+#[derive(serde::Deserialize)]
+struct NativeAdmissionPayload {
+    unsupported_semantics_status: Option<String>,
+    status: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct NativeAdmissionEnvelope {
+    trust_native_admission: Option<NativeAdmissionPayload>,
+}
+
 fn trust_mc_unsupported_semantics_mode(
     obligation: &trust_ir::ProofObligation,
 ) -> Option<NativeUnsupportedMode> {
     let formula = obligation.formula.as_ref()?;
-    let value: serde_json::Value = serde_json::from_str(&formula.payload).ok()?;
+    let payload = formula.payload.as_str();
+    if !payload.contains("trust_native_admission") && !payload.contains("\\u") {
+        return None;
+    }
+    if let Ok(envelope) = serde_json::from_str::<NativeAdmissionEnvelope>(payload) {
+        let admission = envelope.trust_native_admission?;
+        let status =
+            admission.unsupported_semantics_status.as_deref().or(admission.status.as_deref())?;
+        if status != "unsupported" && status != "unsupported_semantics" {
+            return None;
+        }
+        let detail = admission
+            .detail
+            .as_deref()
+            .filter(|detail| !detail.trim().is_empty())
+            .unwrap_or("TrustMc native admission contract marked unsupported semantics");
+        return Some(NativeUnsupportedMode::new(
+            NativeUnsupportedModeReason::UnsupportedVerifierMode,
+            format!("{}: {}", TRUST_TRUST_MC_NATIVE_ADMISSION_CONTRACT_VERSION, detail),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
     let admission = value.get("trust_native_admission")?;
     let status = admission
         .get("unsupported_semantics_status")
@@ -1025,6 +1222,45 @@ mod tests {
     }
 
     #[test]
+    fn native_mc_requests_declare_native_execution_without_imports_or_slicing() {
+        let bundle = native_verification_bundle_from_module(
+            native_request_module_without_trust_vc_lane(),
+            digest(0x35),
+            FuncId::new(0),
+        )
+        .expect("native bundle builds");
+        let mut requests = Vec::new();
+        for request in &bundle.requests {
+            let NativeVerificationRequest::TrustMc(request) = request else {
+                continue;
+            };
+            requests.push(request.obligations.clone());
+            assert_eq!(request.mode, TrustMcVerificationMode::Chc);
+            assert_eq!(request.options.memory_model, TrustMcMemoryModel::TrustIrPlaces);
+            assert_eq!(
+                request.options.arithmetic_model,
+                TrustMcArithmeticModel::FixedWidthBitvectors
+            );
+            assert_eq!(request.options.chc.engine, TrustMcChcEngine::NativePdr);
+            assert_eq!(request.options.chc.invariant_source, TrustMcInvariantSource::None);
+            assert!(request.options.chc.pdr.enabled);
+            assert_eq!(request.options.chc.pdr.max_frames, None);
+            assert_eq!(request.options.chc.pdr.generalization, TrustMcPdrGeneralization::Cubes);
+            assert!(request.options.chc.emit_horn_clauses);
+            assert_eq!(request.options.slicing, TrustMcSlicingMode::None);
+        }
+        assert_eq!(
+            requests,
+            vec![vec![ProofId::new(1)], vec![ProofId::new(2)], vec![ProofId::new(3)]],
+            "each primary request must declare the executed profile"
+        );
+        let NativeVerificationRequest::TrustWp(alternative) = &bundle.requests[3] else {
+            panic!("the body-aware WP fallback remains a separate request");
+        };
+        assert_eq!(alternative.obligations, [ProofId::new(3)]);
+    }
+
+    #[test]
     fn monomorphization_authority_digest_frames_semantic_fields() {
         fn legacy_unframed_payload(module: &str, function: FuncId, source_item: &str) -> Vec<u8> {
             let mut bytes = Vec::new();
@@ -1115,7 +1351,7 @@ mod tests {
     /// Happy-path tests build from this module; the trust_vc lane itself is
     /// pinned via the exact fail-closed error in
     /// `native_bundle_builder_emits_only_typed_trust_vc_and_trust_mc_requests`.
-    fn native_request_module_without_trust_vc_lane() -> Module {
+    pub(super) fn native_request_module_without_trust_vc_lane() -> Module {
         let mut module = native_request_module();
         let removed = module.proof_obligations.remove(0);
         assert!(
@@ -1127,11 +1363,14 @@ mod tests {
     }
     fn native_request_module_without_source_metadata() -> Module {
         let mut module = Module::new("trust_native_request_bundle");
-        let ft = module.add_func_type(FuncTy {
-            params: vec![Ty::I32, Ty::I32],
-            returns: vec![Ty::I32],
-            is_vararg: false,
-        });
+        let ft = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::I32, Ty::I32],
+                returns: vec![Ty::I32],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function = Function::new(FuncId::new(0), "checked_add", ft, BlockId::new(0))
             .with_producer(trust_ir::Producer::TrustIr);
         function.blocks.push(Block {
@@ -1148,7 +1387,7 @@ mod tests {
                 InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }),
             ],
         });
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
 
         module.proof_obligations.push(
             ProofObligation::new(
@@ -1198,6 +1437,8 @@ mod tests {
             obligation: ProofId::new(0),
             prover: "trust_vc".to_string(),
             evidence: ProofEvidence::LeanProof("exact TrustVc.MIR.place_projection_sound".into()),
+            // v41: no native evidence bundle to project a coverage assurance from.
+            assurance: None,
         });
 
         module
@@ -1205,13 +1446,17 @@ mod tests {
 
     fn kernel_certified_native_bundle_module() -> Module {
         let mut module = Module::new("trust_native_kernel_bundle");
-        let file = module.intern_file("src/kernel_bundle.rs");
+        let file =
+            module.intern_file("src/kernel_bundle.rs").expect("Module::intern_file: test fixture");
         let function_id = FuncId::new(0);
-        let ft = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
+        let ft = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function = Function::new(function_id, "kernel_checked", ft, BlockId::new(0))
             .with_producer(trust_ir::Producer::TrustIr);
         function.blocks.push(Block {
@@ -1219,7 +1464,7 @@ mod tests {
             params: Vec::new(),
             body: vec![InstrNode::new(Inst::Return { values: Vec::new() })],
         });
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
 
         let obligations = [
             (
@@ -1281,7 +1526,7 @@ mod tests {
     }
 
     fn attach_obligation_source_metadata(module: &mut Module) {
-        let file = module.intern_file("src/lib.rs");
+        let file = module.intern_file("src/lib.rs").expect("Module::intern_file: test fixture");
         for obligation in &mut module.proof_obligations {
             let native_assertion_id = 40 + obligation.id.index();
             let line = 100 + obligation.id.index();
@@ -1322,10 +1567,6 @@ mod tests {
                 "source_id": format!("trust-native-request:checked_add:{}", obligation.index()),
                 "assertion_id": format!("trust-assertion:checked_add:{}", obligation.index()),
                 "native_assertion_id": native_assertion_id,
-                "public_obligation_id": format!(
-                    "trust-native-request:checked_add:public:{}",
-                    obligation.index()
-                ),
                 "span": {
                     "file": "src/lib.rs",
                     "line_start": line,
@@ -1337,6 +1578,8 @@ mod tests {
             .to_string(),
             smtlib: None,
             sort: None,
+            // v41: no clause bindings — an empty table reads as UNBINDABLE, never as a wildcard.
+            bindings: Vec::new(),
         }
     }
 
@@ -1362,7 +1605,8 @@ mod tests {
         let mut module = native_request_module_without_source_metadata();
         module.proof_obligations.clear();
         module.proof_certificates.clear();
-        let file = module.intern_file("src/give_back.rs");
+        let file =
+            module.intern_file("src/give_back.rs").expect("Module::intern_file: test fixture");
         module.proof_obligations.push(
             ProofObligation::new(
                 ProofId::new(0),
@@ -1434,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn native_bundle_builder_emits_only_typed_trust_vc_and_trust_mc_requests() {
+    fn native_bundle_builder_preserves_primaries_and_adds_typed_wp_alternatives() {
         // trust_vc lane: the builder still plans the typed TrustVc request
         // (id 0, ImportProofCertificates) carrying the module's certificate for
         // the MemorySafety obligation — but trust-ir's replayed-evidence
@@ -1563,7 +1807,7 @@ mod tests {
         assert!(bundle.lineage.nodes[0].replay.as_ref().is_some_and(|replay| {
             replay.invocation.contains(TRUST_TRUST_MC_NATIVE_ADMISSION_CONTRACT_VERSION)
         }));
-        assert_eq!(bundle.requests.len(), 3);
+        assert_eq!(bundle.requests.len(), 4);
         assert!(
             bundle.evidence_bundles.is_empty(),
             "request planning must not manufacture verifier result evidence"
@@ -1627,12 +1871,14 @@ mod tests {
             }
             other => panic!("expected third TrustMc request, got {other:?}"),
         }
-        assert!(
-            bundle
-                .requests
-                .iter()
-                .all(|request| { !matches!(request, NativeVerificationRequest::TrustWp(_)) })
-        );
+        let NativeVerificationRequest::TrustWp(alternative) = &bundle.requests[3] else {
+            panic!("one body-aware postcondition alternative follows stable primary request ids");
+        };
+        assert_eq!(alternative.id, NativeRequestId::new(3));
+        assert_eq!(alternative.function, FuncId::new(0));
+        assert_eq!(alternative.obligations, [ProofId::new(3)]);
+        assert_eq!(alternative.mode, TrustWpVerificationMode::WeakestPrecondition);
+        assert!(alternative.provenance.replay_context.atoms.is_empty());
 
         bundle.validate().expect("native bundle validates");
     }
@@ -1644,7 +1890,7 @@ mod tests {
         let bundle = native_verification_bundle_from_module(module, digest(0x42), FuncId::new(0))
             .expect("kernel-certified native bundle builds");
 
-        assert_eq!(bundle.requests.len(), 3);
+        assert_eq!(bundle.requests.len(), 4);
         let NativeVerificationRequest::TrustVc(trust_vc) = &bundle.requests[0] else {
             panic!("CleanCic-certified contract must route to TrustVc import");
         };
@@ -1653,12 +1899,10 @@ mod tests {
         assert_eq!(trust_vc.certificates, vec![certificate_ref.clone()]);
         assert!(matches!(bundle.requests[1], NativeVerificationRequest::TrustMc(_)));
         assert!(matches!(bundle.requests[2], NativeVerificationRequest::TrustMc(_)));
-        assert!(
-            bundle
-                .requests
-                .iter()
-                .all(|request| { !matches!(request, NativeVerificationRequest::TrustWp(_)) })
-        );
+        let NativeVerificationRequest::TrustWp(alternative) = &bundle.requests[3] else {
+            panic!("only the unproved postcondition receives a WP alternative");
+        };
+        assert_eq!(alternative.obligations, [ProofId::new(2)]);
 
         assert_eq!(bundle.evidence_bundles.len(), 1);
         let NativeEvidenceBundle::TrustVc(evidence) = &bundle.evidence_bundles[0] else {
@@ -1684,6 +1928,89 @@ mod tests {
         bundle.validate().expect("kernel-certified evidence remains replay-valid");
     }
 
+    /// The writer records NO coverage row, and trust-ir-build agrees that `None`
+    /// is the only honest value for the certificate it carries: the row the
+    /// writer declines to record (`Unbounded`, citing the TrustVc import request
+    /// that carries the certificate) is left UNDETERMINED by
+    /// `coverage_assurance_report` itself — its admission rule
+    /// (`undetermined() == 0`) would refuse it, and trust-vc's release admission
+    /// refuses it as `CertificateCoverageUndetermined`. The oracle here is the
+    /// upstream rule, not a mirror of it.
+    #[test]
+    fn kernel_certified_import_records_no_coverage_and_upstream_leaves_the_row_undetermined() {
+        use trust_ir::proof::{CoverageAssurance, CoverageBound};
+
+        let bundle = native_verification_bundle_from_module(
+            kernel_certified_native_bundle_module(),
+            digest(0x42),
+            FuncId::new(0),
+        )
+        .expect("kernel-certified native bundle builds");
+        assert!(
+            bundle
+                .module
+                .proof_certificates
+                .iter()
+                .all(|certificate| certificate.assurance.is_none()),
+            "the writer must leave every coverage row NOT RECORDED"
+        );
+        let report = trust_ir_build::coverage_assurance_report(&bundle.module, Some(&bundle));
+        assert!(report.is_checked(), "{}", report.summary());
+        assert_eq!(report.recorded(), 0);
+        assert!(report.errors().is_empty(), "{:?}", report.errors());
+
+        // The row the writer declines to record.
+        let mut probe = bundle.clone();
+        let NativeVerificationRequest::TrustVc(import) = &probe.requests[0] else {
+            panic!("the CleanCic certificate rides the TrustVc import request");
+        };
+        assert_eq!(import.mode, TrustVcVerificationMode::ImportProofCertificates);
+        assert_eq!(import.obligations, vec![probe.module.proof_certificates[0].obligation]);
+        let request_digest = probe.requests[0].stable_digest();
+        probe.module.proof_certificates[0].assurance =
+            Some(CoverageAssurance { bound: CoverageBound::Unbounded, request_digest });
+        // Re-point only the header so the report reaches the per-row checks.
+        // The requests still bind the PRE-row module digest through their
+        // replay transcripts: the digest cycle the writer's doc names.
+        probe.trust_ir_module_digest = probe.module.stable_digest();
+        assert_ne!(probe.trust_ir_module_digest, bundle.trust_ir_module_digest);
+        let report = trust_ir_build::coverage_assurance_report(&probe.module, Some(&probe));
+        assert!(report.is_checked(), "{}", report.summary());
+        assert!(report.errors().is_empty(), "{:?}", report.errors());
+        assert_eq!(report.recorded(), 1);
+        assert_eq!(report.agreed(), 0, "a TrustVc import request establishes no bound");
+        assert_eq!(report.undetermined(), 1, "{}", report.summary());
+    }
+
+    /// A certificate that arrives with a coverage row already recorded cites a
+    /// request this writer has not minted yet — and never can, since every
+    /// request it mints binds the module digest that covers the row. Refused by
+    /// name at the writer, before any request exists.
+    #[test]
+    fn a_certificate_arriving_with_a_coverage_row_is_refused_by_name() {
+        use trust_ir::proof::{CoverageAssurance, CoverageBound};
+
+        for bound in [
+            CoverageBound::Unbounded,
+            CoverageBound::UnwindBounded { depth: 1 },
+            CoverageBound::ModelBounded { size: 4 },
+            CoverageBound::Unrecorded,
+        ] {
+            let mut module = kernel_certified_native_bundle_module();
+            let obligation = module.proof_certificates[0].obligation;
+            module.proof_certificates[0].assurance =
+                Some(CoverageAssurance { bound, request_digest: digest(0x77) });
+            let error =
+                native_verification_bundle_from_module(module, digest(0x42), FuncId::new(0))
+                    .expect_err("a pre-recorded coverage row must not cross the writer");
+            assert_eq!(
+                error,
+                NativeVerificationBundleBuildError::PreRecordedCoverageAssurance { obligation },
+                "bound {bound:?}"
+            );
+        }
+    }
+
     #[test]
     fn defined_narrowing_cast_never_enters_native_request_inventory() {
         let mut module =
@@ -1700,7 +2027,8 @@ mod tests {
         // Every request must contain only that unit; a resurrected cast-range
         // obligation would appear as a second TrustMc request and fail this pin.
         let proof = ProofId::new(0);
-        let source_file = module.intern_file("src/lib.rs");
+        let source_file =
+            module.intern_file("src/lib.rs").expect("Module::intern_file: test fixture");
         module.proof_obligations.push(
             ProofObligation::new(
                 proof,
@@ -1764,7 +2092,6 @@ mod tests {
                 "source_id": "trust-native-request:checked_add:0",
                 "assertion_id": "trust-assertion:checked_add:0",
                 "native_assertion_id": 40,
-                "public_obligation_id": "trust-native-request:checked_add:public:0",
                 "span": {
                     "file": "src/lib.rs",
                     "line_start": 100,
@@ -1780,6 +2107,8 @@ mod tests {
             .to_string(),
             smtlib: None,
             sort: None,
+            // v41: no clause bindings — an empty table reads as UNBINDABLE, never as a wildcard.
+            bindings: Vec::new(),
         });
 
         let err = native_verification_bundle_from_module(module, digest(0x31), FuncId::new(0))
@@ -1813,7 +2142,6 @@ mod tests {
                 "source_id": "trust-contract:test::checked_add:requires:0",
                 "assertion_id": "trust-assertion:trust-contract:test::checked_add:requires:0",
                 "native_assertion_id": 41,
-                "public_obligation_id": "public:test::checked_add:requires:0",
                 "span": {
                     "file": "src/lib.rs",
                     "line_start": 17,
@@ -1825,6 +2153,8 @@ mod tests {
             .to_string(),
             smtlib: None,
             sort: None,
+            // v41: no clause bindings — an empty table reads as UNBINDABLE, never as a wildcard.
+            bindings: Vec::new(),
         });
         proof_obligation.source = Some(
             ProofObligationSourceIdentity::new(
@@ -1904,7 +2234,7 @@ mod tests {
         assert_eq!(json["schema_version"], json!(NATIVE_VERIFICATION_BUNDLE_SCHEMA_VERSION));
         assert_eq!(json["producer"], json!("TrustIr"));
         assert!(json["input"]["RustMir"]["body_digest"].is_object());
-        assert_eq!(json["requests"].as_array().map(Vec::len), Some(3));
+        assert_eq!(json["requests"].as_array().map(Vec::len), Some(4));
         assert_eq!(json["compiler_facts"]["monomorphizations"].as_array().map(Vec::len), Some(1));
         assert_eq!(
             json["compiler_facts"]["obligation_sources"][0]["facts"].as_array().map(Vec::len),
@@ -1940,9 +2270,9 @@ mod tests {
             json["requests"][2]["TrustMc"]["provenance"]["expected_verifier"]["name"],
             "trust_mc"
         );
-        assert!(json["requests"].as_array().is_some_and(|requests| {
-            requests.iter().all(|request| request.get("TrustWp").is_none())
-        }));
+        assert_eq!(json["requests"][3]["TrustWp"]["id"], json!(3));
+        assert_eq!(json["requests"][3]["TrustWp"]["function"], json!(0));
+        assert_eq!(json["requests"][3]["TrustWp"]["obligations"], json!([3]));
 
         // TrustVc provenance JSON shape, pinned from the planner directly.
         let module = native_request_module();
@@ -1987,7 +2317,6 @@ mod tests {
                 "source_id": "trust-native-request:checked_add:1",
                 "assertion_id": "trust-assertion:checked_add:1",
                 "native_assertion_id": 41,
-                "public_obligation_id": "trust-native-request:checked_add:public:1",
                 "span": {
                     "file": "src/lib.rs",
                     "line_start": 101,
@@ -2003,6 +2332,8 @@ mod tests {
             .to_string(),
             smtlib: None,
             sort: None,
+            // v41: no clause bindings — an empty table reads as UNBINDABLE, never as a wildcard.
+            bindings: Vec::new(),
         });
 
         let err = native_verification_bundle_from_module(module, digest(0x31), FuncId::new(0))
@@ -2070,11 +2401,14 @@ mod tests {
         let mut module = native_request_module_without_trust_vc_lane();
         let root = FuncId::new(0);
         let member = FuncId::new(1);
-        let ft = module.add_func_type(FuncTy {
-            params: vec![Ty::I32],
-            returns: vec![Ty::I32],
-            is_vararg: false,
-        });
+        let ft = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::I32],
+                returns: vec![Ty::I32],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function = Function::new(member, "checked_neg", ft, BlockId::new(0))
             .with_producer(trust_ir::Producer::TrustIr);
         function.blocks.push(Block {
@@ -2082,7 +2416,7 @@ mod tests {
             params: vec![(ValueId::new(0), Ty::I32)],
             body: vec![InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] })],
         });
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
 
         let postcondition = module
             .proof_obligations
@@ -2150,10 +2484,33 @@ mod tests {
             assert_eq!(source.monomorphization, Some(expected));
         }
 
-        // Requests: owner-major, each scoped to the body its rows belong to.
+        // Primary requests remain owner-major; alternatives retain the same
+        // exact owner and proof-obligation scope.
         let request_functions: Vec<Option<FuncId>> =
             bundle.requests.iter().map(NativeVerificationRequest::function).collect();
-        assert_eq!(request_functions.iter().filter(|f| **f == Some(member)).count(), 1);
+        assert_eq!(request_functions.iter().filter(|f| **f == Some(member)).count(), 2);
+        assert_eq!(
+            bundle
+                .requests
+                .iter()
+                .filter(|request| {
+                    matches!(request, NativeVerificationRequest::TrustMc(_))
+                        && request.function() == Some(member)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            bundle
+                .requests
+                .iter()
+                .filter(|request| {
+                    matches!(request, NativeVerificationRequest::TrustWp(_))
+                        && request.function() == Some(member)
+                })
+                .count(),
+            1
+        );
         assert!(request_functions.iter().any(|f| *f == Some(root)));
         for request in &bundle.requests {
             let owner = request.function().expect("every emitted request names its body");
@@ -2207,10 +2564,7 @@ mod tests {
             NativeVerificationBundleBuildError::EmptyOwners
         );
 
-        let duplicate = NativeBundleOwner {
-            function: FuncId::new(0),
-            source_digest: digest(0x31),
-        };
+        let duplicate = NativeBundleOwner { function: FuncId::new(0), source_digest: digest(0x31) };
         assert_eq!(
             native_verification_bundle_from_module_owners(
                 native_request_module_without_trust_vc_lane(),
@@ -2240,5 +2594,61 @@ mod tests {
             ),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn wave488_obligation_by_id_and_admission_fast_reject_match_oracle() {
+        let mut module = native_request_module_without_trust_vc_lane();
+        for (idx, ob) in module.proof_obligations.iter().enumerate() {
+            assert_eq!(obligation_by_id(&module, ob.id).map(|o| o.id), Some(ob.id));
+            let _ = idx;
+        }
+        if module.proof_obligations.len() >= 2 {
+            module.proof_obligations.swap(0, 1);
+            for ob in &module.proof_obligations {
+                assert_eq!(obligation_by_id(&module, ob.id).map(|o| o.id), Some(ob.id));
+            }
+        }
+        assert!(obligation_by_id(&module, ProofId::new(99_999)).is_none());
+
+        let payloads = [
+            r#"{"formula":{"Bool":false},"source":{"source_id":"s"}}"#,
+            r#"{"trust_native_admission":{"status":"unsupported","detail":"custom reason"}}"#,
+            r#"{"trust_native_admission":{"unsupported_semantics_status":"unsupported_semantics","detail":"   "}}"#,
+            r#"{"trust_native_admission":{"status":"supported"}}"#,
+            r#"{"\u0074rust_native_admission":{"status":"unsupported","detail":"escaped key"}}"#,
+            r#"{"trust_native_admission":{"status":123}}"#,
+        ];
+        for (i, payload) in payloads.into_iter().enumerate() {
+            let mut ob = module.proof_obligations[0].clone();
+            ob.id = ProofId::new(i as u32);
+            ob.formula = Some(trust_ir::ProofFormula {
+                schema: "trust.test".into(),
+                payload: payload.to_string(),
+                smtlib: None,
+                sort: None,
+                bindings: Vec::new(),
+            });
+            let oracle = serde_json::from_str::<serde_json::Value>(payload).ok().and_then(|v| {
+                let admission = v.get("trust_native_admission")?;
+                let status = admission
+                    .get("unsupported_semantics_status")
+                    .or_else(|| admission.get("status"))
+                    .and_then(serde_json::Value::as_str)?;
+                if status != "unsupported" && status != "unsupported_semantics" {
+                    return None;
+                }
+                let detail = admission
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|d| !d.trim().is_empty())
+                    .unwrap_or("TrustMc native admission contract marked unsupported semantics");
+                Some(NativeUnsupportedMode::new(
+                    NativeUnsupportedModeReason::UnsupportedVerifierMode,
+                    format!("{}: {}", TRUST_TRUST_MC_NATIVE_ADMISSION_CONTRACT_VERSION, detail),
+                ))
+            });
+            assert_eq!(trust_mc_unsupported_semantics_mode(&ob), oracle, "payload={payload}");
+        }
     }
 }

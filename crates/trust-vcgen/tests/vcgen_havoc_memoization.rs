@@ -18,6 +18,7 @@
 // deliberately DIFFERENT havoc lists and pins that the first function's
 // obligations are byte-identical before and after the second one runs.
 use std::time::Instant;
+
 use trust_types::{
     BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
     SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
@@ -111,6 +112,7 @@ fn havoc_func(name: &str, n: usize, borrows: usize) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

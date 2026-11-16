@@ -1,0 +1,130 @@
+{
+  "provenance": {
+    "scope": "Projection of actual closedec8 observational parser DATA only, never proof/native qualification. Row outcomes/locations/descriptions and source hashes unchanged; proof payloads and private authority deliberately absent.",
+    "source": "default.functions.json",
+    "source_sha256": "d6d56fa2505114867640b559b5b2c5c354128b4c2ce19bf552eb4fde3b4b0dfe",
+    "archive_sha256": "589ee94b66708a8d2809db8bb19a4b68346691e25319d4cb93a35ab318585577",
+    "engineering_compiler_source": "ec8d5f0ef4a504cdd63d070d750224224b1693e1",
+    "runtime_observation": "pointer_panics=true direct_panics=true guarded=128 total=255"
+  },
+  "functions": [
+    {
+      "cached": 0,
+      "crate_name": "reified_charge",
+      "failed": 0,
+      "function": "reified_charge::reified_counted",
+      "proved": 1,
+      "runtime_checked": 0,
+      "runtime_checks": {
+        "overflow_checks": true,
+        "ub_checks": true
+      },
+      "skipped": 0,
+      "source_sha256": "4322a20265b3a2f0a42985e7987fe9c543639f6aaaf38ef2234f0f1f81369e9e",
+      "stable_ids": [
+        "36c62ee00f303a84"
+      ],
+      "timed_out": 0,
+      "total": 1,
+      "type": "function_result",
+      "unknown": 0,
+      "results": [
+        {
+          "kind": "divzero",
+          "outcome": "proved",
+          "location": {
+            "col_end": 28,
+            "col_start": 23,
+            "file": "reified_charge.rs",
+            "line_end": 19,
+            "line_start": 19
+          },
+          "description": "division by zero"
+        }
+      ]
+    },
+    {
+      "cached": 0,
+      "crate_name": "reified_charge",
+      "failed": 0,
+      "function": "reified_charge::direct_counted",
+      "proved": 1,
+      "runtime_checked": 1,
+      "runtime_checks": {
+        "overflow_checks": true,
+        "ub_checks": true
+      },
+      "skipped": 0,
+      "source_sha256": "716a71b6fe22f801367175283b3c100b0bc30314165a1931c785b2601cb95ccd",
+      "stable_ids": [
+        "36c62ee00f303a84",
+        "d8681e6b9630ef35"
+      ],
+      "timed_out": 0,
+      "total": 2,
+      "type": "function_result",
+      "unknown": 0,
+      "results": [
+        {
+          "kind": "divzero",
+          "outcome": "proved",
+          "location": {
+            "col_end": 47,
+            "col_start": 47,
+            "file": "reified_charge.rs",
+            "line_end": 23,
+            "line_start": 23
+          },
+          "description": "division by zero"
+        },
+        {
+          "kind": "assert",
+          "outcome": "runtime_checked",
+          "location": {
+            "col_end": 1,
+            "col_start": 0,
+            "file": "reified_charge.rs",
+            "line_end": 24,
+            "line_start": 22
+          },
+          "description": "assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable"
+        }
+      ]
+    },
+    {
+      "cached": 0,
+      "crate_name": "reified_charge",
+      "failed": 0,
+      "function": "reified_charge::total_counted",
+      "proved": 1,
+      "runtime_checked": 0,
+      "runtime_checks": {
+        "overflow_checks": true,
+        "ub_checks": true
+      },
+      "skipped": 0,
+      "source_sha256": "1169cfcd131631275385aec81ac9c308387d18e72b9c009d3c48576e46784239",
+      "stable_ids": [
+        "36c62ee00f303a84"
+      ],
+      "timed_out": 0,
+      "total": 1,
+      "type": "function_result",
+      "unknown": 0,
+      "results": [
+        {
+          "kind": "divzero",
+          "outcome": "proved",
+          "location": {
+            "col_end": 28,
+            "col_start": 23,
+            "file": "reified_charge.rs",
+            "line_end": 30,
+            "line_start": 30
+          },
+          "description": "division by zero"
+        }
+      ]
+    }
+  ]
+}

@@ -1,16 +1,24 @@
 use crate::command_prelude::*;
 
-use cargo::ops;
+use targo::ops;
 
 pub fn cli() -> Command {
     // Trust: `arg_package_spec` takes a literal, so the branded help text has
     // to be chosen before the builder rather than formatted inside it.
-    let package_help = if cargo::is_targo_invocation() {
+    let package_help = if targo::is_targo_invocation() {
         "Package to build (see `targo help pkgid`)"
     } else {
         "Package to build (see `cargo help pkgid`)"
     };
     subcommand("build")
+        // Trust: only the original native helper's stdin socket activates this;
+        // a config alias or environment marker cannot install control custody.
+        .arg(
+            Arg::new("__resource-root-control")
+                .long("__resource-root-control")
+                .hide(true)
+                .action(ArgAction::SetTrue),
+        )
         // subcommand aliases are handled in aliased_command()
         // .alias("b")
         .about("Compile a local package and all of its dependencies")
@@ -39,7 +47,7 @@ pub fn cli() -> Command {
         .arg_redundant_default_mode("debug", "build", "release")
         .arg_profile("Build artifacts with the specified profile")
         .arg_parallel()
-        .arg_target_triple("Build for the target triple")
+        .arg_target_tuple("Build for the target tuple")
         .arg_target_dir()
         .arg_artifact_dir()
         .arg_unit_graph()
@@ -53,6 +61,14 @@ pub fn cli() -> Command {
 }
 
 pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
+    // Trust: containment happens before CLI/config setup in native main. Never
+    // accept an alias-injected flag or silently lose an already captured socket.
+    if args.flag("__resource-root-control") != gctx.has_root_control() {
+        return Err(anyhow::anyhow!(
+            "private root control must be supplied on the original genuine Targo build command"
+        )
+        .into());
+    }
     let ws = args.workspace(gctx)?;
     let mut compile_opts =
         args.compile_options(gctx, UserIntent::Build, Some(&ws), ProfileChecking::Custom)?;

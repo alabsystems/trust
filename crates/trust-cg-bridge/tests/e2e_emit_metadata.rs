@@ -14,12 +14,16 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use trust_cg_bridge::codegen_backend::{
     CrateInfo, OngoingCodegen, OutputFilenames, RustcCodegenBackend, TrustCgCodegenBackend,
 };
-use trust_cg_bridge::validation::validate_lir;
+use trust_cg_bridge::validation::{ValidationError, validate_lir};
+use trust_cg_lower::function::{BasicBlock as LirBasicBlock, Function as LirFunction, Signature};
+use trust_cg_lower::instructions::{Block, Instruction, Opcode, Value};
+use trust_cg_lower::types::Type as LirType;
 use trust_types::{
     BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
     Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
@@ -62,6 +66,7 @@ fn make_add() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -93,6 +98,7 @@ fn make_identity() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -155,6 +161,7 @@ fn make_checked_div() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -215,6 +222,7 @@ fn make_sum_loop() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -272,9 +280,25 @@ fn test_emit_metadata_e2e_smoke() {
     for (lir, expected_name) in module.lir_functions.iter().zip(expected_names.iter()) {
         assert_eq!(&lir.name, expected_name, "function order should match input order");
 
-        // Run structural validation.
-        if let Err(errors) = validate_lir(lir) {
-            panic!("LIR validation failed for `{}`: {:?}", lir.name, errors);
+        // Every use must be defined on every path that reaches it.
+        assert_defined_before_use_by_dominance(lir);
+
+        // Run structural validation. `validate_lir` is block-local: it accepts
+        // only values defined in the same block, the formals, or the block's
+        // own parameters. `sum_loop` carries `n` in its loop header's block
+        // parameter, which the loop body and the exit read from the dominating
+        // header, so for it only those dominance-justified `UndefinedValue`
+        // reports are tolerated (the check above proved each is defined).
+        match validate_lir(lir) {
+            Ok(()) => {}
+            Err(errors) if lir.name == "sum_loop" => {
+                let other: Vec<_> = errors
+                    .iter()
+                    .filter(|e| !matches!(e, ValidationError::UndefinedValue { .. }))
+                    .collect();
+                assert!(other.is_empty(), "LIR validation failed for `sum_loop`: {other:?}");
+            }
+            Err(errors) => panic!("LIR validation failed for `{}`: {:?}", lir.name, errors),
         }
 
         // Verify entry block exists and has instructions.
@@ -312,6 +336,180 @@ fn test_emit_metadata_e2e_smoke() {
         "sum_loop should have >= 3 blocks (loop), got {}",
         sum_loop_lir.blocks.len()
     );
+    assert_entry_loop_carries_n_through_header_param(sum_loop_lir);
+}
+
+/// `sum_loop`'s bb0 is re-entered by bb1's backedge after `n -= 1`, so bb0
+/// must read `n` from a block parameter that both the function entry and the
+/// latch assign (the bridge feeds block parameters with `Copy`s in each
+/// predecessor). Reading the formal argument there, as the lowering used to,
+/// loops forever for any `n != 0`.
+fn assert_entry_loop_carries_n_through_header_param(lir: &LirFunction) {
+    // The value a predecessor copies into `param` right before jumping.
+    fn copied_into(bb: &LirBasicBlock, param: Value) -> Value {
+        let copies: Vec<_> = bb
+            .instructions
+            .iter()
+            .filter(|i| matches!(i.opcode, Opcode::Copy) && i.results == [param])
+            .collect();
+        assert_eq!(copies.len(), 1, "one copy into {param:?}: {:?}", bb.instructions);
+        copies[0].args[0]
+    }
+
+    let entry = &lir.blocks[&lir.entry_block];
+    assert!(entry.params.is_empty(), "the function entry takes no block parameters");
+    let header = match entry.instructions.last().map(|i| &i.opcode) {
+        Some(Opcode::Jump { dest }) => *dest,
+        other => panic!("sum_loop entry should jump to the loop header, got {other:?}"),
+    };
+    assert_ne!(header, lir.entry_block, "the loop header is not the function entry");
+    let header_params = &lir.blocks[&header].params;
+    assert_eq!(header_params.len(), 1, "the header carries exactly `n`: {header_params:?}");
+    let n = header_params[0].0;
+    assert_eq!(copied_into(entry, n), Value(0), "the entry feeds the formal `n`");
+
+    let latches: Vec<_> = lir
+        .blocks
+        .iter()
+        .filter(|(block, bb)| **block != lir.entry_block && bb.successors().contains(&header))
+        .collect();
+    assert_eq!(latches.len(), 1, "exactly one backedge into the header");
+    let (_, latch) = latches[0];
+    let passed = copied_into(latch, n);
+    assert!(
+        latch.instructions.iter().any(|i| i.results.contains(&passed) && i.args.contains(&n)),
+        "the backedge feeds a value computed in the latch from the header's `n`, \
+         not the formal: {:?}",
+        latch.instructions
+    );
+    assert_ne!(passed, Value(0));
+    assert_ne!(passed, n);
+}
+
+/// Dominance-aware defined-before-use: every operand is a formal, a parameter
+/// of its own block, an earlier result in its own block, or a result or
+/// parameter of a block that strictly dominates it.
+fn assert_defined_before_use_by_dominance(lir: &LirFunction) {
+    let mut preds: HashMap<Block, Vec<Block>> = HashMap::new();
+    let mut rpo = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![(lir.entry_block, false)];
+    while let Some((block, done)) = stack.pop() {
+        if done {
+            rpo.push(block);
+            continue;
+        }
+        if !seen.insert(block) {
+            continue;
+        }
+        stack.push((block, true));
+        for succ in lir.blocks[&block].successors() {
+            preds.entry(succ).or_default().push(block);
+            if !seen.contains(&succ) {
+                stack.push((succ, false));
+            }
+        }
+    }
+    rpo.reverse();
+
+    // Iterative dominator sets over the reachable blocks.
+    let all: HashSet<Block> = rpo.iter().copied().collect();
+    let mut dom: HashMap<Block, HashSet<Block>> = rpo.iter().map(|b| (*b, all.clone())).collect();
+    dom.insert(lir.entry_block, HashSet::from([lir.entry_block]));
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &block in rpo.iter().filter(|b| **b != lir.entry_block) {
+            let mut new: Option<HashSet<Block>> = None;
+            for pred in preds.get(&block).into_iter().flatten().filter(|p| all.contains(p)) {
+                new = Some(match new {
+                    None => dom[pred].clone(),
+                    Some(acc) => acc.intersection(&dom[pred]).copied().collect(),
+                });
+            }
+            let mut new = new.unwrap_or_default();
+            new.insert(block);
+            if new != dom[&block] {
+                dom.insert(block, new);
+                changed = true;
+            }
+        }
+    }
+
+    let defs_of = |block: Block| -> HashSet<Value> {
+        let bb = &lir.blocks[&block];
+        bb.params
+            .iter()
+            .map(|(v, _)| *v)
+            .chain(bb.instructions.iter().flat_map(|i| i.results.iter().copied()))
+            .collect()
+    };
+    for &block in &rpo {
+        let mut defined: HashSet<Value> =
+            (0..lir.signature.params.len() as u32).map(Value).collect();
+        for dominator in dom[&block].iter().filter(|d| **d != block) {
+            defined.extend(defs_of(*dominator));
+        }
+        let bb = &lir.blocks[&block];
+        defined.extend(bb.params.iter().map(|(v, _)| *v));
+        for instr in &bb.instructions {
+            let cond = match &instr.opcode {
+                Opcode::Brif { cond, .. } => Some(*cond),
+                _ => None,
+            };
+            for used in instr.args.iter().copied().chain(cond) {
+                assert!(
+                    defined.contains(&used),
+                    "`{}`: {block:?} uses {used:?}, not defined on every path to it",
+                    lir.name
+                );
+            }
+            defined.extend(instr.results.iter().copied());
+        }
+    }
+}
+
+/// The dominance check itself: a diamond whose join returns a value defined
+/// on one arm only is rejected; its twin returning the entry's value passes.
+fn diamond_returning(join_reads_arm_value: bool) -> LirFunction {
+    let inst =
+        |opcode, args: Vec<Value>, results: Vec<Value>| Instruction { opcode, args, results };
+    let block = |instructions| LirBasicBlock { params: vec![], instructions, source_locs: vec![] };
+    let mut f = LirFunction::new(
+        "diamond",
+        Signature { params: vec![LirType::I32], returns: vec![LirType::I32] },
+    );
+    f.entry_block = Block(0);
+    f.blocks.insert(
+        Block(0),
+        block(vec![inst(
+            Opcode::Brif { cond: Value(0), then_dest: Block(1), else_dest: Block(2) },
+            vec![],
+            vec![],
+        )]),
+    );
+    f.blocks.insert(
+        Block(1),
+        block(vec![
+            inst(Opcode::Iconst { ty: LirType::I32, imm: 7 }, vec![], vec![Value(1)]),
+            inst(Opcode::Jump { dest: Block(3) }, vec![], vec![]),
+        ]),
+    );
+    f.blocks.insert(Block(2), block(vec![inst(Opcode::Jump { dest: Block(3) }, vec![], vec![])]));
+    let returned = if join_reads_arm_value { Value(1) } else { Value(0) };
+    f.blocks.insert(Block(3), block(vec![inst(Opcode::Return, vec![returned], vec![])]));
+    f
+}
+
+#[test]
+#[should_panic(expected = "not defined on every path")]
+fn dominance_check_rejects_a_value_defined_on_one_arm_only() {
+    assert_defined_before_use_by_dominance(&diamond_returning(true));
+}
+
+#[test]
+fn dominance_check_accepts_a_value_from_the_dominating_entry() {
+    assert_defined_before_use_by_dominance(&diamond_returning(false));
 }
 
 /// Verify that the backend can emit metadata for an empty crate (zero functions).
@@ -319,13 +517,12 @@ fn test_emit_metadata_e2e_smoke() {
 #[test]
 fn test_emit_metadata_empty_crate() {
     let backend = TrustCgCodegenBackend::host();
-    let crate_info =
-        CrateInfo {
-            crate_name: "empty_crate".to_string(),
-            functions: vec![],
-            linkage: Vec::new(),
-            statics: Vec::new(),
-        };
+    let crate_info = CrateInfo {
+        crate_name: "empty_crate".to_string(),
+        functions: vec![],
+        linkage: Vec::new(),
+        statics: Vec::new(),
+    };
 
     let ongoing =
         backend.codegen_crate(&crate_info).expect("empty crate should codegen successfully");
@@ -376,6 +573,7 @@ fn test_emit_metadata_float_function() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let crate_info = CrateInfo {

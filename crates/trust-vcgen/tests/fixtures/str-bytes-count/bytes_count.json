@@ -1,0 +1,611 @@
+{
+  "name": "bytes_count",
+  "def_path": "count_bytes::bytes_count",
+  "span": {
+    "file": "count_bytes.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 3,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::iter::adapters::filter::Filter",
+            "fields": [
+              [
+                "iter",
+                {
+                  "Adt": {
+                    "name": "core::str::iter::Bytes",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "core::iter::adapters::copied::Copied",
+                            "fields": [
+                              [
+                                "it",
+                                {
+                                  "Adt": {
+                                    "name": "core::slice::iter::Iter",
+                                    "fields": [
+                                      [
+                                        "ptr",
+                                        {
+                                          "Adt": {
+                                            "name": "core::ptr::non_null::NonNull",
+                                            "fields": [
+                                              [
+                                                "pointer",
+                                                {
+                                                  "RawPtr": {
+                                                    "mutable": false,
+                                                    "pointee": {
+                                                      "Int": {
+                                                        "width": 8,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "end_or_len",
+                                        {
+                                          "RawPtr": {
+                                            "mutable": false,
+                                            "pointee": {
+                                              "Int": {
+                                                "width": 8,
+                                                "signed": false
+                                              }
+                                            }
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "_marker",
+                                        {
+                                          "Adt": {
+                                            "name": "core::marker::PhantomData",
+                                            "fields": [],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "predicate",
+                {
+                  "Closure": {
+                    "name": "count_bytes::bytes_count::{closure#0}",
+                    "upvars": [],
+                    "call": {
+                      "kind": "FnMut",
+                      "params": [
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      "ret": "Bool"
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "core::str::iter::Bytes",
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "core::iter::adapters::copied::Copied",
+                    "fields": [
+                      [
+                        "it",
+                        {
+                          "Adt": {
+                            "name": "core::slice::iter::Iter",
+                            "fields": [
+                              [
+                                "ptr",
+                                {
+                                  "Adt": {
+                                    "name": "core::ptr::non_null::NonNull",
+                                    "fields": [
+                                      [
+                                        "pointer",
+                                        {
+                                          "RawPtr": {
+                                            "mutable": false,
+                                            "pointee": {
+                                              "Int": {
+                                                "width": 8,
+                                                "signed": false
+                                              }
+                                            }
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ],
+                              [
+                                "end_or_len",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Int": {
+                                        "width": 8,
+                                        "signed": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ],
+                              [
+                                "_marker",
+                                {
+                                  "Adt": {
+                                    "name": "core::marker::PhantomData",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::str::<impl str>::bytes",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "count_bytes.rs",
+              "line_start": 2,
+              "col_start": 4,
+              "line_end": 2,
+              "col_end": 13
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 17085351922330956479,
+              "def_index": 17269,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "StrBytes",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 17085351922330956479,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<core::str::iter::Bytes<'_> as core::iter::traits::iterator::Iterator>::filter::<{closure@count_bytes.rs:2:22: 2:25}>",
+            "args": [
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "CallableItem": {
+                    "def_path": "count_bytes::bytes_count::{closure#0}",
+                    "kind": "closure",
+                    "def_path_hash": {
+                      "stable_crate_id": "7d18755a67d60514",
+                      "local_hash": "9be29fef1f320f39"
+                    }
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "count_bytes.rs",
+              "line_start": 2,
+              "col_start": 4,
+              "line_end": 2,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 17085351922330956479,
+              "def_index": 11212,
+              "substs_digest": [
+                6205729029210254233,
+                1054289872110712811
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 17085351922330956479,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<core::iter::adapters::filter::Filter<core::str::iter::Bytes<'_>, {closure@count_bytes.rs:2:22: 2:25}> as core::iter::traits::iterator::Iterator>::count",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "count_bytes.rs",
+              "line_start": 2,
+              "col_start": 4,
+              "line_end": 2,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 17085351922330956479,
+              "def_index": 11178,
+              "substs_digest": [
+                10717506905081594367,
+                12739624436777107922
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 17085351922330956479,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "count_bytes.rs",
+                "line_start": 2,
+                "col_start": 4,
+                "line_end": 2,
+                "col_end": 49
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 5,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 4,
+            "span": {
+              "file": "count_bytes.rs",
+              "line_start": 2,
+              "col_start": 4,
+              "line_end": 2,
+              "col_end": 49
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 5,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "count_bytes.rs",
+                "line_start": 2,
+                "col_start": 4,
+                "line_end": 2,
+                "col_end": 49
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Ge": [
+        {
+          "Var": [
+            "s__slice_len",
+            "Int"
+          ]
+        },
+        {
+          "Int": 0
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

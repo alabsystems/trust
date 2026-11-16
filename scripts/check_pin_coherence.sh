@@ -90,7 +90,9 @@ while IFS= read -r module_row; do
   # Matching HEAD is not sufficient: tracked edits or untracked files change
   # the code a local build consumes without changing the superproject gitlink.
   # Include nested-submodule state and fail closed if Git cannot classify it.
-  if ! dirty="$(git -C "$path" status --porcelain=v1 --untracked-files=all --ignore-submodules=none 2>/dev/null)"; then
+  # Only success and empty/nonempty are consumed: normal still reports every
+  # untracked tree as dirty without enumerating each descendant in the output.
+  if ! dirty="$(git -C "$path" status --porcelain=v1 --untracked-files=normal --ignore-submodules=none 2>/dev/null)"; then
     problems+=("PIN-STATUS-FAILED  $path  pin=$recorded  (could not audit working-tree content)")
     fail=1
     continue

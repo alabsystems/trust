@@ -44,6 +44,7 @@ fn make_func(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -426,7 +427,7 @@ fn test_synthetic_shift_overflow_shr() {
 
 // ---------------------------------------------------------------------------
 // Narrowing int->int `as` cast is DEFINED, not "cast overflow"
-// (drop-in, owner decision 2026-07-06): a truncating / reinterpreting integer
+// (drop-in, decision 2026-07-06): a truncating / reinterpreting integer
 // `as` cast is defined behavior in Rust (wraps, never UB), so Trust does NOT
 // restrict the programmer with a CastOverflow safety obligation. Instead it
 // TYPE-TRACKS the result to the target-type range. This test pins the new policy
@@ -1128,6 +1129,7 @@ fn test_stage2_concrete_integer_bool_constants_in_switch_and_call_are_modeled() 
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "synthetic::callee".to_string(),
                     args: vec![
@@ -1180,30 +1182,33 @@ fn test_stage2_unavailable_integer_bool_constants_fail_closed() {
                 id: BlockId(0),
                 stmts: vec![],
                 terminator: Terminator::SwitchInt {
-                    discr: Operand::Unsupported {
-                        kind: "Const".to_string(),
-                        detail: "unsupported constant of MIR type bool; refusing to prove with a guessed value"
-                            .to_string(),
-                    },
+                    discr: Operand::unsupported(
+                        "Const",
+                        "unsupported constant of MIR type bool; refusing to prove with a guessed value",
+                    ),
                     targets: vec![(1, BlockId(1))],
                     otherwise: BlockId(2),
                     span: span_switch.clone(),
-                exhaustive_enum_unreachable: false,
+                    exhaustive_enum_unreachable: false,
                 },
             },
             BasicBlock {
                 id: BlockId(1),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,  is_unsafe_sig: false, callee_identity: None, is_foreign: false,
+                terminator: Terminator::Call {
+                    unwind: trust_types::UnwindEdge::Unreachable,
+                    is_unsafe_sig: false,
+                    callee_identity: None,
+                    callee_key: None,
+                    is_foreign: false,
                     func: "synthetic::callee".to_string(),
                     args: vec![
                         Operand::Constant(ConstValue::Uint(0, 64)),
                         Operand::Constant(ConstValue::Bool(true)),
-                        Operand::Unsupported {
-                            kind: "Const".to_string(),
-                            detail: "unsupported constant of MIR type usize; refusing to prove with a guessed value"
-                                .to_string(),
-                        },
+                        Operand::unsupported(
+                            "Const",
+                            "unsupported constant of MIR type usize; refusing to prove with a guessed value",
+                        ),
                     ],
                     dest: Place::local(1),
                     target: Some(BlockId(2)),
@@ -1732,6 +1737,7 @@ fn test_synthetic_native_switchint_assertion_panic_fmt() {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "std::rt::panic_fmt".to_string(),
                     args: vec![],
@@ -1965,6 +1971,7 @@ fn test_synthetic_native_unreachable_panic_fmt_from_str_nonconst_chain() {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "std::fmt::Arguments::<'a>::from_str_nonconst".to_string(),
                     args: vec![],
@@ -1981,6 +1988,7 @@ fn test_synthetic_native_unreachable_panic_fmt_from_str_nonconst_chain() {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "std::rt::panic_fmt".to_string(),
                     args: vec![],
@@ -2038,6 +2046,7 @@ fn test_synthetic_native_numeric_switch_panic_fmt_stays_assertion_without_noncon
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "std::fmt::Arguments::<'a>::from_str".to_string(),
                     args: vec![],
@@ -2054,6 +2063,7 @@ fn test_synthetic_native_numeric_switch_panic_fmt_stays_assertion_without_noncon
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "std::rt::panic_fmt".to_string(),
                     args: vec![],
@@ -2239,6 +2249,7 @@ fn test_synthetic_native_guarded_slice_is_empty_proves_bounds_without_unsafe_vcs
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "core::slice::<impl [u32]>::is_empty".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],

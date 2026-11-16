@@ -1,0 +1,535 @@
+{
+  "name": "h2h_tuple_carried_raw_const_bug",
+  "def_path": "adv::h2h_tuple_carried_raw_const_bug",
+  "span": {
+    "file": "ploss_adv/h2_raw_const.rs",
+    "line_start": 80,
+    "col_start": 0,
+    "line_end": 85,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 4
+              }
+            }
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "k"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Tuple": [
+            {
+              "RawPtr": {
+                "mutable": false,
+                "pointee": {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              }
+            },
+            {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          ]
+        },
+        "name": "h"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        3,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 81,
+                "col_start": 16,
+                "line_end": 81,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 3,
+                    "projections": []
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 82,
+                "col_start": 33,
+                "line_end": 82,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Move": {
+                        "local": 5,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          8
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 82,
+                "col_start": 32,
+                "line_end": 82,
+                "col_end": 49
+              }
+            }
+          },
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 83,
+                "col_start": 15,
+                "line_end": 83,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": true,
+                      "pointee": {
+                        "Int": {
+                          "width": 64,
+                          "signed": false
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 83,
+                "col_start": 14,
+                "line_end": 83,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "StorageDead": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": [
+                  "Deref"
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      4,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 83,
+                "col_start": 13,
+                "line_end": 83,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageLive": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 84,
+                "col_start": 6,
+                "line_end": 84,
+                "col_end": 7
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 84,
+                "col_start": 4,
+                "line_end": 84,
+                "col_end": 8
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 9,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 1,
+            "span": {
+              "file": "ploss_adv/h2_raw_const.rs",
+              "line_start": 84,
+              "col_start": 4,
+              "line_end": 84,
+              "col_end": 8
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 8
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "ploss_adv/h2_raw_const.rs",
+                "line_start": 84,
+                "col_start": 4,
+                "line_end": 84,
+                "col_end": 8
+              }
+            }
+          },
+          {
+            "StorageDead": 8
+          },
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageDead": 3
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

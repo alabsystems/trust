@@ -1,0 +1,13 @@
+
+=== Trust Verification Report (kr0_certified_mint_requires_reference_entry) ===
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/kr0_certified_mint_requires_reference_entry.rs:30:1
+   |
+LL | / pub fn shift_inline(x: u64, bit: u32) -> Option<u64> {
+LL | |     if !(bit < 64) {
+LL | |         return None;
+...  |
+LL | | }
+   | |_^
+

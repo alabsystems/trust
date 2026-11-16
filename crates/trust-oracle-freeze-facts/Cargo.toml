@@ -1,0 +1,12 @@
+[package]
+name = "trust-oracle-freeze-facts"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Invocation-local committed citation facts for the oracle freeze gate"
+
+# A small native tool must not resolve or compile the compiler/proof workspace.
+[workspace]
+
+[dependencies]

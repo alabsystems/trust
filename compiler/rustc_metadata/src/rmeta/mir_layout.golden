@@ -1,0 +1,113 @@
+# Trust: recorded by compiler/rustc_metadata/src/rmeta/tests.rs -- the
+# TyEncodable MIR wire layout under the METADATA_VERSION below. Re-record
+# ONLY after bumping METADATA_VERSION:
+#   ./x.py test compiler/rustc_metadata --bless
+METADATA_VERSION 23
+Statement/Nop: span u32:1 u8:10 u8:0 u8:0
+Statement/Nop+debuginfos: span u32:1 u8:10 u8:1 usize:2 u8:0 u32:2 u32:3 usize:0 u8:1 u32:4 u8:0
+Statement/Assign(BinaryOp)+trust_modular_arith: span u32:1 u8:0 u32:1 usize:0 u8:6 u8:2 u8:0 u32:2 usize:0 u8:1 u32:3 usize:0 u8:0 u8:1
+Statement/Assign(Use): span u32:1 u8:0 u32:1 usize:0 u8:0 u8:0 u32:2 usize:0 u8:0 u8:0 u8:0
+Statement/Assign(ThreadLocalRef): span u32:1 u8:0 u32:1 usize:0 u8:3 def_id:0:0 u8:0 u8:0
+Statement/Assign(RawPtr): span u32:1 u8:0 u32:1 usize:0 u8:4 u8:0 u32:2 usize:0 u8:0 u8:0
+Statement/Assign(UnaryOp): span u32:1 u8:0 u32:1 usize:0 u8:7 u8:1 u8:0 u32:2 usize:0 u8:0 u8:0
+Statement/Assign(Discriminant): span u32:1 u8:0 u32:1 usize:0 u8:8 u32:2 usize:0 u8:0 u8:0
+Statement/Assign(Aggregate(Tuple)): span u32:1 u8:0 u32:1 usize:0 u8:9 u8:1 usize:2 u8:0 u32:2 usize:0 u8:0 u32:3 usize:0 u8:0 u8:0
+Statement/Assign(Aggregate(Adt)): span u32:1 u8:0 u32:1 usize:0 u8:9 u8:2 def_id:0:0 u32:1 usize:0 u8:1 u32:0 u8:1 u32:2 usize:0 u8:0 u8:0
+Statement/Assign(CopyForDeref): span u32:1 u8:0 u32:1 usize:0 u8:10 u32:2 usize:0 u8:0 u8:0
+Statement/FakeRead: span u32:1 u8:1 u8:4 u32:1 usize:0 u8:0 u8:0
+Statement/SetDiscriminant: span u32:1 u8:2 u32:1 usize:0 u32:3 u8:0 u8:0
+Statement/StorageLive: span u32:1 u8:3 u32:5 u8:0 u8:0
+Statement/StorageDead: span u32:1 u8:4 u32:5 u8:0 u8:0
+Statement/PlaceMention: span u32:1 u8:5 u32:2 usize:0 u8:0 u8:0
+Statement/AscribeUserType: span u32:1 u8:6 u32:1 usize:0 u32:0 usize:1 u8:0 u8:2 u8:0 u8:0
+Statement/Coverage: span u32:1 u8:7 u8:1 u32:1 u8:0 u8:0
+Statement/Intrinsic(Assume): span u32:1 u8:8 u8:0 u8:0 u32:2 usize:0 u8:0 u8:0
+Statement/ConstEvalCounter: span u32:1 u8:9 u8:0 u8:0
+Statement/BackwardIncompatibleDropHint: span u32:1 u8:11 u32:1 usize:0 u8:0 u8:0
+Terminator/Goto: span u32:1 u8:0 u32:1 usize:0
+Terminator/SwitchInt: span u32:1 u8:1 u8:0 u32:1 usize:0 usize:1 u128:7 usize:2 u32:1 u32:2
+Terminator/UnwindResume: span u32:1 u8:2
+Terminator/UnwindTerminate: span u32:1 u8:3 u8:1
+Terminator/Return: span u32:1 u8:4
+Terminator/Unreachable: span u32:1 u8:5
+Terminator/Drop: span u32:1 u8:6 u32:1 usize:0 u32:1 u8:3 u32:3 u8:1 u8:1 u32:2
+Terminator/Call: span u32:1 u8:7 u8:0 u32:4 usize:0 usize:1 u8:1 u32:2 usize:0 span u32:0 usize:0 u8:1 u32:1 u8:2 u8:0 u8:0 span
+Terminator/TailCall: span u32:1 u8:8 u8:0 u32:4 usize:0 usize:1 u8:0 u32:2 usize:0 span span
+Terminator/Assert: span u32:1 u8:9 u8:0 u32:1 usize:0 u8:0 u8:0 u8:0 u32:2 usize:0 u8:0 u32:3 usize:0 u32:1 u8:1
+Terminator/Yield: span u32:1 u8:10 u8:0 u32:1 usize:0 u32:1 u32:2 usize:0 u8:0
+Terminator/CoroutineDrop: span u32:1 u8:11
+Terminator/FalseEdge: span u32:1 u8:12 u32:1 u32:2
+Terminator/FalseUnwind: span u32:1 u8:13 u32:1 u8:0
+Body: usize:2 usize:1 span u32:1 u8:3 u32:1 u8:0 u8:0 u8:0 u8:1 span u32:1 u8:0 u32:1 usize:0 u8:0 usize:0 u8:0 u8:1 span u32:1 u8:4 u8:1 u8:0 usize:3 u8:0 def_id:0:0 u8:0 usize:2 span u8:0 u8:0 u8:0 span u8:1 u32:0 u8:0 u8:1 u32:0 u8:0 usize:0 usize:0 usize:1 u8:1 u32:1 usize:1 sym span u32:1 u8:0 u8:0 u32:1 usize:0 u8:1 u16:1 span u8:0 u8:0 u8:0 u8:1 u8:2 u8:2 u8:0 u8:0 u8:0
+Allocation/bytes: u8:0 usize:3 bytes:[01, 00, 02] usize:0 u8:0 u8:1 u64:3
+Allocation/all_zero: u8:128 usize:4 usize:0 u8:0 u8:1 u64:4
+TrustContractBundle/empty: def_id:0:0 usize:0 usize:0 u32:0 u32:0 u32:0 u32:0 u32:0 u32:0 u32:0
+variant_count AggregateKind: 7
+variant_count AnalysisPhase: 2
+variant_count AnnotationSource: 4
+variant_count AssertKind: 12
+variant_count BackwardIncompatibleDropReason: 1
+variant_count BinOp: 26
+variant_count BindingForm: 3
+variant_count BorrowKind: 3
+variant_count CallSource: 5
+variant_count CastKind: 12
+variant_count ClearCrossCrate: 2
+variant_count CoercionSource: 2
+variant_count Const: 3
+variant_count ConstValue: 4
+variant_count ConstraintCategory: 19
+variant_count CovTerm: 3
+variant_count CoverageKind: 3
+variant_count ErrorHandled: 2
+variant_count FakeBorrowKind: 2
+variant_count FakeReadCause: 5
+variant_count GlobalAlloc: 5
+variant_count InlineAsmMacro: 2
+variant_count InlineAsmOperand: 7
+variant_count LocalInfo: 10
+variant_count MappingKind: 2
+variant_count MentionedItem: 4
+variant_count MirPhase: 3
+variant_count MutBorrowKind: 3
+variant_count NonDivergingIntrinsic: 2
+variant_count Op: 2
+variant_count Operand: 4
+variant_count PointKind: 3
+variant_count ProjectionElem: 9
+variant_count RawPtrKind: 3
+variant_count ReturnConstraint: 2
+variant_count RuntimeChecks: 3
+variant_count RuntimePhase: 3
+variant_count Rvalue: 13
+variant_count Scalar: 2
+variant_count StatementKind: 12
+variant_count StmtDebugInfo: 2
+variant_count TerminatorKind: 15
+variant_count UnOp: 3
+variant_count UnwindAction: 4
+variant_count UnwindTerminateReason: 2
+variant_count ValTreeCreationError: 5
+variant_count VarDebugInfoContents: 2
+variant_count WithRetag: 2
+variant_count TrustBinOp: 7
+variant_count TrustContractKind: 9
+variant_count TrustContractPayloadType: 2
+variant_count TrustContractPredicateKind: 5
+variant_count TrustContractProposition: 20
+variant_count TrustContractPropositionDomain: 5
+variant_count TrustContractSource: 5
+variant_count TrustContractSubject: 4
+variant_count TrustContractVerifierSort: 2
+variant_count TrustHardenedVcCategory: 16
+variant_count TrustObligationKind: 22
+variant_count TrustOnceCellKind: 5
+variant_count TrustProofBody: 3
+variant_count TrustProofItemKind: 2
+variant_count TrustProofItemSource: 3
+variant_count TrustProofLevel: 4
+variant_count TrustProofStrength: 9
+variant_count TrustProofTarget: 3
+variant_count TrustRuntimeFallbackReason: 2
+variant_count TrustSpawnVerdict: 5
+variant_count TrustStatus: 6

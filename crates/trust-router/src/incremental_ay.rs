@@ -14,19 +14,34 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use std::io::{Read as _, Write as _};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use trust_types::determinism::{EffortScale, QueryEffort, StopCause};
+use trust_types::logic_lattice::{Theories, select_logic_name};
 use trust_types::*;
 
+use crate::disjoint_components::{
+    ComponentRetryBudget, disjoint_conjunctive_components, timeout_within_deadline,
+};
 use crate::error::SolverProcessError;
 use crate::{BackendRole, VerificationBackend, smt2_export, smtlib_backend};
 
-/// Default timeout per-query in milliseconds.
+/// Default wall-clock BACKSTOP per query in milliseconds.
 const DEFAULT_QUERY_TIMEOUT_MS: u64 = 30_000;
 
-/// Maximum consecutive failures before permanently falling back.
+/// Consecutive solver-PROCESS failures (a crash, a broken protocol, a failed
+/// spawn — never a timeout) within ONE function before that function's
+/// remaining VCs are dispatched per-process.
+///
+/// Plan §3.2, subprocess row: the counter used to include wall-clock timeouts
+/// and, once tripped, switched the session to per-process mode for the rest of
+/// the COMPILER PROCESS, so one load spike changed how every later VC of every
+/// later function was dispatched. It now counts process failures only and
+/// resets whenever the session moves to another function
+/// ([`SessionState::enter_function`]).
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// Maximum model output size in bytes (10 MiB).
@@ -57,12 +72,25 @@ pub struct IncrementalAYStats {
     pub fallback_queries: u64,
     /// Number of solver process restarts.
     pub restarts: u64,
-    /// Whether the session permanently fell back to per-process mode.
+    /// Whether some function's VCs fell back to per-process mode after
+    /// [`MAX_CONSECUTIVE_FAILURES`] process failures. The fallback itself lasts
+    /// only until the session moves to another function.
     pub permanently_fallen_back: bool,
     /// Number of common assertions shared across VCs.
     pub common_assertions: usize,
     /// Cumulative time saved (estimated) by reusing shared context (ms).
     pub estimated_time_saved_ms: u64,
+    /// True once a base scope has been opened under a logic name DIFFERENT from
+    /// the one [`IncrementalAYSession::with_logic`] configured.
+    ///
+    /// The correction is always a WIDENING and is described in
+    /// `IncrementalAYSession::base_logic_for`; this flag exists so the
+    /// substitution is observable rather than silent. It is set for a
+    /// recognized override that does not admit the session's record AND for an
+    /// unrecognized one over a session that requires more than Core — the two
+    /// cases that contract covers. It stays `false` when no override is
+    /// configured, and when the override is emitted unchanged.
+    pub logic_override_widened: bool,
 }
 
 /// Internal state of the persistent solver process.
@@ -205,10 +233,12 @@ struct SessionState {
     process: Option<SolverProcess>,
     /// Whether common assertions have been sent to the current process.
     base_initialized: bool,
-    /// Number of consecutive process failures.
+    /// Number of consecutive process failures within `failure_function`.
     consecutive_failures: u32,
-    /// Whether permanently fallen back to per-process mode.
+    /// Whether `failure_function`'s remaining VCs dispatch per-process.
     fallen_back: bool,
+    /// The function the failure counter and the fallback belong to.
+    failure_function: Option<Symbol>,
     /// Session statistics.
     stats: IncrementalAYStats,
     /// Trust: The per-function shared assertion prefix currently installed at
@@ -228,39 +258,101 @@ struct SessionState {
     /// the base-scope declaration. Empty for the per-VC `verify` path (no
     /// prefix), so that path re-declares exactly as before.
     prefix_declared_vars: std::collections::HashSet<String>,
-    /// Trust: The SMT logic to set at the base scope for the current batch.
+    /// Trust: The SMT logic the currently-installed prefix GROUP requires.
     ///
-    /// `verify_batch` detects this from the union of EVERY full formula in the
-    /// function group (prefix ∪ all obligations), so the single base-scope logic
-    /// is rich enough for every push/pop query — even when a bare obligation in
-    /// isolation would auto-detect a weaker logic than the prefix needs (e.g. a
-    /// pure-LIA obligation under a bitvector prefix). `None` for the per-VC path,
-    /// which keeps auto-detecting from the first VC's formula exactly as before.
+    /// `install_prefix` computes it with [`detect_group_logic`], from the UNION
+    /// of every full formula in the function group (prefix ∪ all obligations),
+    /// so it is rich enough for every push/pop query in the group — even when a
+    /// bare obligation in isolation would select a weaker logic than the prefix
+    /// needs (e.g. a pure-LIA obligation under a bitvector prefix). `None` for
+    /// the per-VC path (no prefix).
+    ///
+    /// It is NOT what gets emitted: the emitted name comes from
+    /// [`SessionState::session_theories`], whose union is a SUPERSET of this
+    /// group's (it accumulates every VC of every group in the session), so by
+    /// ADMISSIBILITY the emitted name already admits everything this group
+    /// needs. What this field is still for is `set_prefix`'s base-change
+    /// detection: a group whose logic requirement differs cannot reuse a live
+    /// process's top-level scope.
     prefix_logic: Option<String>,
-    /// Trust: The session-wide SMT logic pinned by the FIRST `verify_batch`
-    /// call, from the first batched VC's FULL formula — exactly the formula the
-    /// per-VC dispatch path would have auto-detected its (single, session-long)
-    /// `(set-logic …)` from. Batch mode re-initializes the base across function
-    /// groups (a prefix change kills the process, see `set_prefix`), so without
-    /// a pin each re-init would re-detect a logic from whatever query happens to
-    /// come first in the new group — making verdicts depend on group boundaries
-    /// where the per-VC path's verdicts do not (observed: a `true` obligation
-    /// first in a group pinned `QF_LIA` on the fresh process, degrading the
-    /// group's bitvector obligations `sat → unknown` vs the per-VC path).
-    /// Pinning replicates the per-VC path's one-logic-per-session behavior, so
-    /// batch dispatch stays verdict-identical. `None` until a batch runs; the
-    /// pure per-VC path never reads or writes it (its fault-restart re-detect
-    /// behavior is unchanged).
-    batch_pinned_logic: Option<String>,
+    /// Trust: THE UNION of the theory features of every VC this session has
+    /// been asked about, and the sole input to the emitted `(set-logic …)`.
+    ///
+    /// # Why a union and not a pin
+    ///
+    /// The base scope is initialized ONCE per process and every subsequent
+    /// push/pop query is asserted under the `(set-logic L)` it opened with, so
+    /// `L` has to admit the features of EVERY query that will run under it —
+    /// not just the first one. The previous revision pinned `L` from the FIRST
+    /// batched VC's formula alone, which is the same defect one level up: a
+    /// batch whose first VC is propositional pinned `QF_UF`, and a float or
+    /// bitvector member later in the same batch then ran under a logic naming
+    /// neither theory. (The pin was introduced for a real reason — without it,
+    /// each base re-init at a group boundary re-detected a logic from whatever
+    /// query happened to come first in the new group, so verdicts depended on
+    /// group boundaries; the observed shape was a `true` obligation pinning
+    /// `QF_LIA` and degrading the group's bitvector obligations `sat →
+    /// unknown`. A running union fixes that too, and strictly better: it never
+    /// narrows.)
+    ///
+    /// `verify_batch` folds in every VC of the batch BEFORE any of them runs,
+    /// and `ensure_base_initialized` folds in each per-VC query as it arrives.
+    /// The emitted name is `select_logic_name(session_theories)`, chosen ONCE
+    /// from the union — which is exactly the shape ADMISSIBILITY covers, and
+    /// the reason nothing here needs the selector to be monotone (it is not;
+    /// see `trust_types::logic_lattice`'s module header).
+    session_theories: Theories,
+    /// Trust: The logic name written into the LIVE process's base scope, or
+    /// `None` if no base is initialized.
+    ///
+    /// Recorded so [`IncrementalAYSession::ensure_base_initialized`] can notice
+    /// that a new query has WIDENED [`SessionState::session_theories`] past
+    /// what the live `(set-logic …)` line says, and re-initialize (one respawn)
+    /// rather than assert a query the live logic does not admit. Because a
+    /// non-monotone selector can answer a DIFFERENT name for a larger union
+    /// (`{Quantifiers}` → `BV`, `{Quantifiers, Ints}` → `LIA`), the comparison
+    /// is against the name actually emitted, not against a theory subset test.
+    base_logic: Option<String>,
 }
 
 impl SessionState {
+    /// Scope the failure counter and the per-process fallback to `function`:
+    /// moving to another function starts both afresh, so how a VC is dispatched
+    /// depends on its own function's history, not on what failed before it.
+    fn enter_function(&mut self, function: Symbol) {
+        if self.failure_function != Some(function) {
+            self.failure_function = Some(function);
+            self.consecutive_failures = 0;
+            self.fallen_back = false;
+        }
+    }
+
+    /// Record one session fault. A wall-clock timeout is not a PROCESS failure
+    /// and does not count toward the per-process fallback.
+    fn record_fault(&mut self, is_timeout: bool) {
+        self.kill_process();
+        self.stats.restarts += 1;
+        if is_timeout {
+            return;
+        }
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            self.fallen_back = true;
+            self.stats.permanently_fallen_back = true;
+        }
+    }
+
     /// Kill the current solver process.
     fn kill_process(&mut self) {
         // SolverProcess::drop kills its complete group and reaps the leader
         // before its reservation field can release aggregate capacity.
         drop(self.process.take());
         self.base_initialized = false;
+        // No live process ⇒ no live `(set-logic …)` line. Clearing this keeps
+        // the recorded base logic and the solver's actual base scope in step,
+        // so the widening check in `ensure_base_initialized` can never compare
+        // against a name that was written to a process that is gone.
+        self.base_logic = None;
     }
 
     /// Trust: Install a new per-function shared prefix at the base scope.
@@ -329,6 +421,7 @@ impl SessionState {
         self.current_prefix = prefix;
         self.prefix_logic = logic;
         self.base_initialized = false;
+        self.base_logic = None;
     }
 }
 
@@ -343,12 +436,37 @@ pub struct CommonAssertion {
     pub label: String,
     /// SMT-LIB2 commands (declarations + assertions) for this group.
     pub commands: Vec<String>,
+    /// The theories [`commands`](Self::commands) needs the live `(set-logic …)`
+    /// to admit.
+    ///
+    /// BASE-SCOPE CONTENT COUNTS. A common assertion is sent in the BASE scope,
+    /// beside the logic line and outside every push/pop, so the session
+    /// invariant — at every `(check-sat)` the live `(set-logic L)` satisfies
+    /// `admits(L) ⊇ features(everything asserted under it)` — covers it exactly
+    /// as it covers a VC. [`SessionState::session_theories`] therefore folds
+    /// this in, and a common assertion that widens the union past the live name
+    /// re-opens the base under the wider one.
+    ///
+    /// [`from_formula`](Self::from_formula) measures it from the formula.
+    theories: Theories,
+    /// The formula this group asserts, exactly as its `(assert …)` renders
+    /// it, or `None` for a declarations-only group. Every assertion in scope
+    /// at a check-sat counts toward that query's size, and so toward its one
+    /// effort count (plan §3.2a).
+    asserted: Option<Formula>,
 }
 
 impl CommonAssertion {
+    /// The theories this group's commands need the session logic to admit.
+    #[must_use]
+    pub(crate) fn theories(&self) -> Theories {
+        self.theories
+    }
+
     /// Create a common assertion from a trust-types Formula.
     ///
-    /// Generates the necessary variable declarations and assertion commands.
+    /// Generates the necessary variable declarations and assertion commands,
+    /// and measures the theories they need (see [`CommonAssertion::theories`]).
     #[must_use]
     pub fn from_formula(label: impl Into<String>, formula: &Formula) -> Self {
         let mut commands = Vec::new();
@@ -369,18 +487,15 @@ impl CommonAssertion {
         // Mirrors `in_process_ay_backend::flatten_conjunction_spine`; the real
         // printer fix belongs in ay, but the flat input is logically identical
         // and keeps every solver verdict backed by its own strict proof.
-        commands.push(format!(
-            "(assert {})",
-            smt2_export::formula_to_smt2(&conjoin_formulas(flatten_conjuncts(formula)))
-        ));
+        let asserted = conjoin_formulas(flatten_conjuncts(formula));
+        commands.push(format!("(assert {})", smt2_export::formula_to_smt2(&asserted)));
 
-        CommonAssertion { label: label.into(), commands }
-    }
-
-    /// Create a common assertion from raw SMT-LIB2 commands.
-    #[must_use]
-    pub fn from_commands(label: impl Into<String>, commands: Vec<String>) -> Self {
-        CommonAssertion { label: label.into(), commands }
+        CommonAssertion {
+            label: label.into(),
+            commands,
+            theories: smt2_export::formula_features(formula),
+            asserted: Some(asserted),
+        }
     }
 }
 
@@ -409,14 +524,22 @@ impl CommonAssertion {
 /// On solver crash or timeout:
 /// 1. The solver process is killed and restarted.
 /// 2. Common assertions are re-asserted on the new process.
-/// 3. After `MAX_CONSECUTIVE_FAILURES`, permanently falls back to per-process mode.
+/// 3. After `MAX_CONSECUTIVE_FAILURES` process failures (never timeouts) within
+///    one function, that function's remaining VCs fall back to per-process mode.
 pub struct IncrementalAYSession {
     /// Path to the solver binary.
     solver_path: String,
     /// Extra arguments passed to the solver.
     solver_args: Vec<String>,
-    /// Timeout per query in milliseconds.
+    /// Wall-clock BACKSTOP per query in milliseconds. The bound that ends an
+    /// undecided search is the query's effort count ([`Self::effort_scale`]);
+    /// this clock only catches a solver that stopped counting, and a query it
+    /// ends is `wall-backstop`.
     query_timeout_ms: u64,
+    /// The one effort count's scale (plan §3.2a): before EVERY check-sat the
+    /// session sends `(set-option :rlimit N)`, `N = min(C, max(1, k · size))`
+    /// over every assertion in scope at that check-sat.
+    scale: EffortScale,
     /// Per-job memory ceiling in MB (the `solver_memory_limit_mb` config). When
     /// set, it is (a) propagated into the spawned `ay` as `--memory <mb>` so the
     /// solver self-limits and returns Unknown on pressure instead of OOMing, and
@@ -444,13 +567,12 @@ struct SolverMemoryPlan {
 }
 
 impl IncrementalAYSession {
-    /// Create a new incremental session with the default ay solver.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_solver_path("ay")
-    }
-
-    /// Create a new incremental session with a custom solver path.
+    /// Create an incremental session that spawns the solver at `path`.
+    ///
+    /// There is no default solver: the caller names the `ay` it resolved
+    /// ([`crate::ay_discovery`] has the compiler's rule). A bare file name
+    /// such as `"ay"` is refused at spawn time, because `Command` would look
+    /// it up on `PATH`.
     #[must_use]
     pub fn with_solver_path(path: impl Into<String>) -> Self {
         IncrementalAYSession {
@@ -467,6 +589,7 @@ impl IncrementalAYSession {
                 "--incremental".to_string(),
             ],
             query_timeout_ms: DEFAULT_QUERY_TIMEOUT_MS,
+            scale: EffortScale::BUILTIN,
             solver_memory_limit_mb: None,
             common_assertions: Vec::new(),
             logic: None,
@@ -475,20 +598,35 @@ impl IncrementalAYSession {
                 base_initialized: false,
                 consecutive_failures: 0,
                 fallen_back: false,
+                failure_function: None,
                 stats: IncrementalAYStats::default(),
                 current_prefix: Vec::new(),
                 prefix_declared_vars: std::collections::HashSet::new(),
                 prefix_logic: None,
-                batch_pinned_logic: None,
+                session_theories: Theories::NONE,
+                base_logic: None,
             }),
         }
     }
 
-    /// Set the per-query timeout in milliseconds.
+    /// Set the per-query wall-clock BACKSTOP in milliseconds.
     #[must_use]
     pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
         self.query_timeout_ms = timeout_ms;
         self
+    }
+
+    /// Set the one effort count's scale `k`.
+    #[must_use]
+    pub fn with_effort_scale(mut self, scale: EffortScale) -> Self {
+        self.scale = scale;
+        self
+    }
+
+    /// The effort scale in force.
+    #[must_use]
+    pub fn effort_scale(&self) -> EffortScale {
+        self.scale
     }
 
     /// Set the per-job memory ceiling in MB (the `solver_memory_limit_mb`
@@ -589,7 +727,20 @@ impl IncrementalAYSession {
 
     /// Set the SMT-LIB2 logic for this session.
     ///
-    /// If not set, the logic is auto-detected from the first VC's formula.
+    /// If not set, the logic is auto-detected from the union of every VC's
+    /// feature record. If set, it is honoured WHENEVER IT PROVABLY ADMITS that
+    /// union and WIDENED when it does not — a base scope is never opened under
+    /// a name narrower than the content asserted into it, whoever named it.
+    ///
+    /// "PROVABLY" is the operative word for a name
+    /// `trust_types::logic_lattice::logic_admits` does not carry a row for: it
+    /// is credited with Core alone, which is all that can be proved of an
+    /// unknown SMT-LIB logic, so it survives unchanged only over a Core-only
+    /// session. That is a deliberate contract, not an oversight, and
+    /// [`IncrementalAYSession::base_logic_for`] states it in full — including
+    /// why the alternative of refusing an unknown name was rejected. When the
+    /// configured name is not the name emitted,
+    /// [`IncrementalAYStats::logic_override_widened`] says so.
     #[must_use]
     pub fn with_logic(mut self, logic: impl Into<String>) -> Self {
         self.logic = Some(logic.into());
@@ -601,11 +752,17 @@ impl IncrementalAYSession {
     /// Common assertions are sent once at the base solver level and persist
     /// across push/pop scopes. Use for type constraints, range bounds, and
     /// other assertions that apply to all VCs in a batch.
+    /// The assertion's own theories are folded into
+    /// [`SessionState::session_theories`], so the base scope this content is
+    /// sent in is opened under a logic that admits it — the same treatment a
+    /// VC's formula gets (see [`CommonAssertion::theories`]).
     pub fn add_common_assertion(&mut self, assertion: CommonAssertion) {
+        let theories = assertion.theories();
         self.common_assertions.push(assertion);
         let count = self.common_assertions.len();
         let mut st = self.state.lock().expect("invariant: mutex not poisoned");
         st.stats.common_assertions = count;
+        st.session_theories.insert(theories);
         // Force re-initialization on next query so the new assertion is sent.
         st.base_initialized = false;
     }
@@ -631,6 +788,9 @@ impl IncrementalAYSession {
     /// Uses push/pop to isolate the VC's assertions while sharing
     /// common assertions from the base level.
     pub fn verify_vc(&self, vc: &VerificationCondition) -> VerificationResult {
+        let budget = ComponentRetryBudget::new(self.query_timeout_ms);
+        let _query_clock =
+            trust_types::verify_budget::DeadlineShareGuard::narrow(budget.deadline());
         if let Some(result) = crate::backend_trait::unsupported_mir_unknown(vc, "ay-incremental", 0)
         {
             // Unsupported-MIR VCs may carry an incomplete (unsound-to-relax)
@@ -642,15 +802,146 @@ impl IncrementalAYSession {
         }
 
         let result = self.verify_vc_solved(vc);
-        self.relax_if_undecided(vc, result)
+        let result = self.relax_if_undecided(vc, result);
+        self.refute_components_if_unknown(vc, result, &budget)
+    }
+
+    /// Trust: DISJOINT-COMPONENT REFUTATION, external-process lane (2026-09-16).
+    ///
+    /// Parity with `InProcessAyBackend::try_disjoint_component_refutation`, over
+    /// the SAME split ([`crate::disjoint_components`], whose module docs carry
+    /// the soundness argument and its fragment gate). The motivating shape is the
+    /// unsigned `var*var` overflow VC since 983d7a62f88 (the re-landed UMUL
+    /// record in `trust_vcgen::generate::overflow_vc`): a QF_BV overflow check
+    /// over fresh `__trust_ovf_bv_*` variables conjoined with the NIA
+    /// `a*b` out-of-range core over the program's `Int` locals. The external
+    /// `ay` answers the whole query `unknown` ("unsupported logic: ALL ... theory
+    /// mix"), and `mul_counterexample` cannot witness it either, because it binds
+    /// ONE multiplication pair while the other stays unbound. Each component
+    /// alone is decidable (or witnessable), and a conjunction of pairwise
+    /// variable-disjoint components is satisfiable iff every component is.
+    ///
+    /// Fires only on an `Unknown` (never on a decided verdict, never on an
+    /// admission failure), and can only turn it into `Failed` with the composed
+    /// witness. A component that is UNSAT, undecided, or refuted without a model
+    /// leaves the original `Unknown` standing: this path never produces `Proved`.
+    /// Neither lane retries ay's own UNSAT that certification withheld
+    /// ([`crate::ay_stop::withheld_computed_unsat`]), as the whole query or as a
+    /// component: the components are all satisfiable iff the whole is, so the
+    /// retry could only contradict ay's search, and certifying a component's
+    /// UNSAT again under 1/n of the clock let that clock choose the row's stop
+    /// (determinism acceptance, 2026-10-01). Such a component ends the retry on
+    /// its verdict, as a bare `unsat` does.
+    ///
+    /// Base-scope facts: each component is solved on a FRESH, base-free process
+    /// (`verify_per_process_bounded`), so the composed model is a model of
+    /// `vc.formula` alone. A session carrying static common assertions or a
+    /// per-function prefix decides `base ∧ vc`, and a model of `vc` alone need
+    /// not satisfy the base — so the lane is refused whenever a base exists.
+    ///
+    /// Budget: the component-size effort split is unchanged. Wall time uses
+    /// one absolute deadline captured before the original solve; each component
+    /// gets at most the nominal split and the remaining whole milliseconds.
+    /// The nominal 1 ms floor alone does not bound aggregate elapsed time.
+    /// (Splitting only the clock gave each component the full conflict
+    /// allowance but 1/n of the time, so the clock bound first.) A component that stops undecided ends
+    /// the retry; if it stopped on a clock, a fault or an unexplained stop, the
+    /// original `Unknown` carries that cause ([`crate::ay_stop::after_undecided_retry`]).
+    fn refute_components_if_unknown(
+        &self,
+        vc: &VerificationCondition,
+        result: VerificationResult,
+        budget: &ComponentRetryBudget,
+    ) -> VerificationResult {
+        let elapsed = match &result {
+            VerificationResult::Unknown { reason, .. } if is_pre_spawn_admission_error(reason) => {
+                return result;
+            }
+            _ if crate::ay_stop::withheld_computed_unsat(&result) => return result,
+            VerificationResult::Unknown { time_ms, .. } => *time_ms,
+            _ => return result,
+        };
+        if !self.common_assertions.is_empty() {
+            return result;
+        }
+        {
+            let st = self.state.lock().expect("invariant: mutex not poisoned");
+            if !st.current_prefix.is_empty() {
+                return result;
+            }
+        }
+        // THE SOUNDNESS GATE lives in the shared split: outside its fragment a
+        // variable partition is not a symbol partition and it answers `None`.
+        let Some(components) = disjoint_conjunctive_components(&vc.formula) else {
+            return result;
+        };
+        let _clock = trust_types::verify_budget::DeadlineShareGuard::narrow(budget.deadline());
+        let component_count = components.len();
+        let sizes: Vec<u64> = components
+            .iter()
+            .map(|component| trust_types::determinism::query_size(&[component]))
+            .collect();
+        let shares = self.scale.for_query(&[&vc.formula]).split_by_size(&sizes);
+        let mut assignments: Vec<(String, CounterexampleValue)> = Vec::new();
+        let mut time_ms = elapsed;
+        for (component, share) in components.into_iter().zip(shares) {
+            let Some(per_component_ms) =
+                budget.component_timeout_at(component_count, Instant::now())
+            else {
+                return crate::ay_stop::after_undecided_retry(
+                    result,
+                    StopCause::WallBackstop,
+                    "disjoint-component refutation retry",
+                );
+            };
+            let component_vc = VerificationCondition { formula: component, ..vc.clone() };
+            // A concrete witness first (it is only ever returned when the
+            // component EVALUATES to true under it), then a bounded solve.
+            let refuted = mul_counterexample(&component_vc).unwrap_or_else(|| {
+                self.verify_per_process_bounded(&component_vc, per_component_ms, share)
+            });
+            match refuted {
+                VerificationResult::Failed {
+                    counterexample: Some(counterexample),
+                    time_ms: t,
+                    ..
+                } => {
+                    time_ms = time_ms.saturating_add(t);
+                    assignments.extend(counterexample.assignments);
+                }
+                // A model-less refutation: decided, but no witness to compose.
+                VerificationResult::Failed { .. } => return result,
+                // ay's own UNSAT, whatever certification made of it: the whole
+                // is UNSAT, and the original Unknown stands as it was.
+                other if crate::ay_stop::withheld_computed_unsat(&other) => return result,
+                // UNSAT / undecided: the original Unknown stands, carrying the
+                // component's stop if a clock, fault or unexplained stop ended it.
+                other => {
+                    return crate::ay_stop::after_undecided_retry(
+                        result,
+                        StopCause::of_result(&other),
+                        "disjoint-component refutation retry",
+                    );
+                }
+            }
+        }
+        // Disjoint components cannot share a name, so sorting by name is a total
+        // order and the witness is deterministic.
+        assignments.sort_by(|a, b| a.0.cmp(&b.0));
+        VerificationResult::Failed {
+            solver: "ay-incremental-components".into(),
+            time_ms,
+            counterexample: Some(Counterexample::new(assignments)),
+        }
     }
 
     /// The core solve for a VC (incremental session, with per-process fallback).
     fn verify_vc_solved(&self, vc: &VerificationCondition) -> VerificationResult {
         let mut st = self.state.lock().expect("invariant: mutex not poisoned");
         st.stats.total_queries += 1;
+        st.enter_function(vc.function);
 
-        // Permanently fallen back: use per-process mode.
+        // This function's VCs fell back: use per-process mode.
         if st.fallen_back {
             st.stats.fallback_queries += 1;
             drop(st); // Release lock before per-process call.
@@ -665,21 +956,10 @@ impl IncrementalAYSession {
             }
             Err(err) => {
                 if is_pre_spawn_admission_error(&err) {
-                    return VerificationResult::Unknown {
-                        solver: "ay-incremental".into(),
-                        time_ms: 0,
-                        reason: err,
-                    };
+                    return StopCause::AdmissionRefused.unknown_result("ay-incremental", 0, &err);
                 }
                 let is_timeout = err.contains("timeout");
-                st.kill_process();
-                st.consecutive_failures += 1;
-                st.stats.restarts += 1;
-
-                if st.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    st.fallen_back = true;
-                    st.stats.permanently_fallen_back = true;
-                }
+                st.record_fault(is_timeout);
 
                 if is_timeout {
                     return VerificationResult::Timeout {
@@ -764,8 +1044,14 @@ impl IncrementalAYSession {
                 }
             }
             // relaxation sat / unknown / timeout: no sound conclusion — keep the
-            // original undecided verdict exactly as it stood.
-            _ => result,
+            // original undecided verdict, carrying the relaxation's stop if a
+            // clock, a fault or an unexplained stop ended it (had it not, the
+            // relaxation might have proved the VC).
+            other => crate::ay_stop::after_undecided_retry(
+                result,
+                StopCause::of_result(&other),
+                "nonlinear relaxation retry",
+            ),
         }
     }
 
@@ -788,8 +1074,9 @@ impl IncrementalAYSession {
     fn solve_relaxed(&self, relaxed_vc: &VerificationCondition) -> VerificationResult {
         let mut st = self.state.lock().expect("invariant: mutex not poisoned");
         st.stats.total_queries += 1;
+        st.enter_function(relaxed_vc.function);
 
-        // Permanently fallen back: session unavailable, use per-process mode.
+        // This function's VCs fell back: use per-process mode.
         if st.fallen_back {
             st.stats.fallback_queries += 1;
             drop(st); // Release lock before per-process call.
@@ -804,23 +1091,12 @@ impl IncrementalAYSession {
             }
             Err(err) => {
                 if is_pre_spawn_admission_error(&err) {
-                    return VerificationResult::Unknown {
-                        solver: "ay-incremental".into(),
-                        time_ms: 0,
-                        reason: err,
-                    };
+                    return StopCause::AdmissionRefused.unknown_result("ay-incremental", 0, &err);
                 }
                 // Session fault: kill + rebuild on next query, advance the same
                 // failure counters as the primary path, then solve the relaxed
                 // VC out-of-process so the verdict is still sound.
-                st.kill_process();
-                st.consecutive_failures += 1;
-                st.stats.restarts += 1;
-
-                if st.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    st.fallen_back = true;
-                    st.stats.permanently_fallen_back = true;
-                }
+                st.record_fault(err.contains("timeout"));
 
                 st.stats.fallback_queries += 1;
                 drop(st); // Release lock before per-process call.
@@ -870,20 +1146,33 @@ impl IncrementalAYSession {
             return Vec::new();
         }
 
-        // Trust: pin the session logic ONCE, from the first batched VC's FULL
-        // formula — exactly the formula the per-VC path's single session-long
-        // base init would have auto-detected `(set-logic …)` from. Batch mode
-        // re-initializes the base whenever a group's prefix changes (a fresh
-        // process, see `set_prefix`), and without the pin each re-init would
-        // re-detect a logic from whatever query the new group happens to start
-        // with — making verdicts depend on group boundaries where the per-VC
-        // path's do not. See `SessionState::batch_pinned_logic`.
+        // Trust: fold EVERY VC in this batch into the session's running feature
+        // UNION before any of them runs, so the one `(set-logic …)` line the
+        // base scope opens with admits every member — including the members
+        // that come after the first.
+        //
+        // The previous revision pinned the session logic from the FIRST batched
+        // VC's formula ALONE. That reproduced the per-VC path's
+        // one-logic-per-session behaviour, which was the point, but it is the
+        // M1 defect one level up: a batch whose first VC is propositional
+        // pinned `QF_UF`, and a float or bitvector member later in the SAME
+        // batch then ran under a logic naming neither theory. Because the pin
+        // also took PRECEDENCE over `prefix_logic`, it made
+        // `detect_group_logic`'s correctly-unioned answer unreachable on the
+        // only path that computes it.
+        //
+        // Unioning keeps everything the pin was for: the union only ever GROWS,
+        // so a base re-init at a group boundary can never re-detect a NARROWER
+        // logic from whatever query the new group happens to start with, and
+        // verdicts cannot depend on group boundaries. The union is selected
+        // from ONCE, in `send_base_assertions`; see
+        // `SessionState::session_theories`.
         {
             let mut st = self.state.lock().expect("invariant: mutex not poisoned");
-            if st.batch_pinned_logic.is_none() {
-                st.batch_pinned_logic =
-                    Some(smt2_export::detect_logic(&vcs[0].formula).to_string());
-            }
+            let batch = Theories::union_all(
+                vcs.iter().map(|vc| smt2_export::formula_features(&vc.formula)),
+            );
+            st.session_theories.insert(batch);
         }
 
         // Group VC indices by function, preserving first-seen order.
@@ -1009,10 +1298,16 @@ impl IncrementalAYSession {
             .map(|(i, f)| CommonAssertion::from_formula(format!("shared-prefix-{i}"), f))
             .collect();
 
-        // Detect a logic that covers EVERY full formula in the group (the prefix
-        // conjuncts are a subset of each, so analyzing the obligations suffices),
-        // so the single base-scope `(set-logic ...)` is never too weak for a
-        // member query. `None` ⇒ keep per-VC auto-detect (empty prefix).
+        // The logic the GROUP requires: one selection from the UNION of every
+        // full formula in the group (the prefix conjuncts are a subset of each,
+        // so unioning the obligations suffices), so no member query can need
+        // more than it admits. `None` ⇒ no prefix installed.
+        //
+        // This is no longer what gets EMITTED — `send_base_assertions` selects
+        // from `session_theories`, whose union is a superset of this group's,
+        // so by admissibility the emitted name already admits everything here.
+        // It is kept because `set_prefix` compares it: a group with a different
+        // logic requirement must not reuse a live process's top-level scope.
         let logic = if prefix.is_empty() { None } else { Some(detect_group_logic(group_vcs)) };
 
         let mut st = self.state.lock().expect("invariant: mutex not poisoned");
@@ -1064,9 +1359,10 @@ impl IncrementalAYSession {
     ) -> VerificationResult {
         let mut st = self.state.lock().expect("invariant: mutex not poisoned");
         st.stats.total_queries += 1;
+        st.enter_function(full_vc.function);
 
-        // Permanently fallen back: the base scope is unavailable, so solve the
-        // FULL formula per-process (it carries the prefix).
+        // This function's VCs fell back: the base scope is unavailable, so solve
+        // the FULL formula per-process (it carries the prefix).
         if st.fallen_back {
             st.stats.fallback_queries += 1;
             drop(st);
@@ -1081,21 +1377,10 @@ impl IncrementalAYSession {
             }
             Err(err) => {
                 if is_pre_spawn_admission_error(&err) {
-                    return VerificationResult::Unknown {
-                        solver: "ay-incremental".into(),
-                        time_ms: 0,
-                        reason: err,
-                    };
+                    return StopCause::AdmissionRefused.unknown_result("ay-incremental", 0, &err);
                 }
                 let is_timeout = err.contains("timeout");
-                st.kill_process();
-                st.consecutive_failures += 1;
-                st.stats.restarts += 1;
-
-                if st.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    st.fallen_back = true;
-                    st.stats.permanently_fallen_back = true;
-                }
+                st.record_fault(is_timeout);
 
                 if is_timeout {
                     return VerificationResult::Timeout {
@@ -1168,10 +1453,21 @@ impl IncrementalAYSession {
         }
 
         if !shared_decls.is_empty() {
-            self.add_common_assertion(CommonAssertion::from_commands(
-                "shared-variable-declarations",
-                shared_decls,
-            ));
+            // These lines were lifted out of the VCs above, so their record IS
+            // measurable — it is the union of those VCs' own feature records,
+            // which admits every sort a promoted `declare-*` line can name (each
+            // sort was read off one of these formulas). ONE union, folded in
+            // here, so the base scope is selected from a record that covers the
+            // declarations without paying `ALL` for them.
+            self.add_common_assertion(CommonAssertion {
+                label: "shared-variable-declarations".into(),
+                commands: shared_decls,
+                theories: Theories::union_all(
+                    vcs.iter().map(|vc| smt2_export::formula_features(&vc.formula)),
+                ),
+                // Declarations assert no term.
+                asserted: None,
+            });
         }
     }
 
@@ -1183,9 +1479,8 @@ impl IncrementalAYSession {
         st: &mut SessionState,
         vc: &VerificationCondition,
     ) -> Result<VerificationResult, String> {
-        let timeout = Duration::from_millis(self.query_timeout_ms);
         let start = Instant::now();
-        let deadline = start.checked_add(timeout).unwrap_or(start);
+        let deadline = SolverDeadline::after(Duration::from_millis(self.query_timeout_ms));
         self.ensure_base_initialized(st, vc, deadline)?;
 
         // Snapshot what the base-scope prefix already declares (variables AND
@@ -1198,6 +1493,23 @@ impl IncrementalAYSession {
         // Compute the scope's declarations BEFORE taking the &mut borrow on
         // `st.process`.
         let vc_declarations = scope_declarations(&vc.formula, &base_declared);
+        // Assert the VC formula, conjunction spine flattened — see the
+        // common-assertion builder above for why (ay `and_pos` strict-export
+        // failure on nested conjunctions; flat input is logically identical).
+        let vc_asserted = conjoin_formulas(flatten_conjuncts(&vc.formula));
+        // Plan §3.2a: this check-sat's ONE effort count, over every assertion
+        // in scope at it — the static common assertions and the function's
+        // prefix at the base scope, and this VC's assertion.
+        let effort = {
+            let mut in_scope: Vec<&Formula> = self
+                .common_assertions
+                .iter()
+                .chain(st.current_prefix.iter())
+                .filter_map(|assertion| assertion.asserted.as_ref())
+                .collect();
+            in_scope.push(&vc_asserted);
+            self.scale.for_query(&in_scope)
+        };
 
         let proc = st.process.as_mut().ok_or("no solver process")?;
         // Push a new scope for this VC.
@@ -1209,18 +1521,13 @@ impl IncrementalAYSession {
             send_command_until(proc, decl, deadline)?;
         }
 
-        // Assert the VC formula, conjunction spine flattened — see the
-        // common-assertion builder above for why (ay `and_pos` strict-export
-        // failure on nested conjunctions; flat input is logically identical).
-        let assertion = format!(
-            "(assert {})",
-            smt2_export::formula_to_smt2(&conjoin_formulas(flatten_conjuncts(&vc.formula)))
-        );
+        let assertion = format!("(assert {})", smt2_export::formula_to_smt2(&vc_asserted));
         send_command_until(proc, &assertion, deadline)?;
 
-        // Check satisfiability.
+        // Check satisfiability, under this query's own count.
+        send_command_until(proc, &effort.smt2_command(), deadline)?;
         send_command_until(proc, "(check-sat)", deadline)?;
-        let sat_line = read_response_line(proc, remaining_timeout(timeout, start))?;
+        let sat_line = read_response_line(proc, deadline)?;
 
         let elapsed = start.elapsed().as_millis() as u64;
 
@@ -1230,18 +1537,52 @@ impl IncrementalAYSession {
         } else if sat_line.trim() == "sat" {
             // Get model for counterexample.
             send_command_until(proc, "(get-model)", deadline)?;
-            let model_output = read_model_response(proc, remaining_timeout(timeout, start))?;
+            let model_output = read_model_response(proc, deadline)?;
 
             send_command_until(proc, "(pop 1)", deadline)?;
 
             let full_output = format!("sat\n{model_output}");
             smtlib_backend::parse_solver_output(&full_output, elapsed, vec![])
         } else if sat_line.trim() == "unknown" {
-            send_command_until(proc, "(pop 1)", deadline)?;
-            VerificationResult::Unknown {
-                solver: "ay-incremental".into(),
-                time_ms: elapsed,
-                reason: "solver returned unknown".to_string(),
+            // Ask ay WHY (plan §3.7). `--z3-mode` folds a conflict budget and a
+            // clock into one "canceled" reason; its statistics block keeps the
+            // native `:unknown.reason` that tells them apart. The account is read
+            // within this query's own deadline, so asking adds no clock of its
+            // own: an account that does not arrive in time leaves the `unknown`
+            // unexplained (`unclassified`), never re-decided.
+            let statistics = send_command_until(proc, "(get-info :all-statistics)", deadline)
+                .and_then(|()| read_statistics_response(proc, deadline))
+                .and_then(|statistics| {
+                    send_command_until(proc, "(pop 1)", deadline).map(|()| statistics)
+                });
+            match statistics {
+                Ok(statistics) => match crate::ay_stop::AyUnknownAccount::parse(&statistics) {
+                    Some(account) => account.stop().unknown_result(
+                        "ay-incremental",
+                        elapsed,
+                        &account.describe(),
+                    ),
+                    None => StopCause::Unclassified.unknown_result(
+                        "ay-incremental",
+                        elapsed,
+                        "solver returned unknown",
+                    ),
+                },
+                Err(error) => {
+                    // The verdict arrived; only its explanation did not. The
+                    // protocol may now be out of step, so this process is
+                    // retired (the next query starts a fresh one), but the
+                    // answer stands: re-solving would change how this VC is
+                    // dispatched because a read failed.
+                    st.kill_process();
+                    StopCause::Unclassified.unknown_result(
+                        "ay-incremental",
+                        elapsed,
+                        &format!(
+                            "solver returned unknown; its statistics were unreadable: {error}"
+                        ),
+                    )
+                }
             }
         } else {
             let _ = send_command_until(proc, "(pop 1)", deadline);
@@ -1252,12 +1593,51 @@ impl IncrementalAYSession {
     }
 
     /// Ensure the solver process is running and base-level assertions are sent.
+    ///
+    /// # Trust: the live logic line is WIDENED, never outgrown
+    ///
+    /// A base scope is initialized once and every later push/pop query runs
+    /// under the `(set-logic L)` it opened with, so `L` has to admit the
+    /// features of every query that will ever run under it — and on the per-VC
+    /// path the session cannot know those in advance. Before this, `L` was
+    /// selected from the FIRST VC of the session and never revisited: a session
+    /// that started with an `Int` obligation and was later handed a bitvector
+    /// one asserted the bitvector query under `QF_LIA`.
+    ///
+    /// So each arriving VC is folded into the session's running feature UNION
+    /// first, and the name that union selects is compared against the one the
+    /// live base actually carries. If it differs, the process is killed and the
+    /// base re-sent under the wider name — base-scope commands cannot be
+    /// retracted from a live process, and a SECOND `(set-logic …)` on one is
+    /// undefined (empirically it flips ay into answering `unknown` for
+    /// trivially-sat queries), so a respawn is the only correct way to change
+    /// it. The union only grows, and the number of distinct names it can select
+    /// along one growing chain is small, so this costs at most a few respawns
+    /// per session and usually none.
+    ///
+    /// The comparison is on the NAME, not on a theory subset test, because the
+    /// selector is not monotone: a wider union can select a name that admits
+    /// something the previous name did not (`{Quantifiers}` → `BV`,
+    /// `{Quantifiers, Ints}` → `LIA`). Re-selecting from the union and
+    /// comparing names is right in both directions.
     fn ensure_base_initialized(
         &self,
         st: &mut SessionState,
         vc: &VerificationCondition,
-        deadline: Instant,
+        deadline: SolverDeadline,
     ) -> Result<(), String> {
+        // Fold this query into the session's union FIRST, so `base_logic_for`
+        // sees it whether or not a base is already live.
+        st.session_theories.insert(smt2_export::formula_features(&vc.formula));
+        if st.base_initialized {
+            let required = self.base_logic_for(st, vc);
+            if st.base_logic.as_deref() != Some(required.as_str()) {
+                // The live base scope carries a logic line this query's union
+                // no longer selects. It cannot be rewritten in place.
+                st.kill_process();
+            }
+        }
+
         if st.process.is_none() {
             let proc = self.spawn_solver_until(deadline)?;
             st.process = Some(proc);
@@ -1284,30 +1664,35 @@ impl IncrementalAYSession {
         &self,
         st: &mut SessionState,
         vc: &VerificationCondition,
-        deadline: Instant,
+        deadline: SolverDeadline,
     ) -> Result<(), String> {
-        // Snapshot the per-function prefix commands + batch logic BEFORE taking
-        // the &mut borrow on `st.process` (cannot hold both an immutable borrow
-        // of `st.current_prefix` and a mutable borrow of `st.process`).
+        // Snapshot the per-function prefix commands BEFORE taking the &mut
+        // borrow on `st.process` (cannot hold both an immutable borrow of
+        // `st.current_prefix` and a mutable borrow of `st.process`).
         let prefix_commands: Vec<String> =
             st.current_prefix.iter().flat_map(|a| a.commands.iter().cloned()).collect();
-        let batch_logic = st.prefix_logic.clone();
-        let pinned_logic = st.batch_pinned_logic.clone();
+        let logic = self.base_logic_for(st, vc);
 
         let proc = st.process.as_mut().ok_or("no solver process")?;
 
-        // Set logic. Precedence: explicit session logic > batch-pinned session
-        // logic (set once by the first `verify_batch` call from its first VC's
-        // FULL formula, so every base re-init across function groups uses the
-        // SAME logic the per-VC path would have pinned for the whole session) >
-        // per-group batch logic (covers the group: prefix ∪ obligations) >
-        // auto-detect from the (possibly bare) representative VC.
-        let logic = self
-            .logic
-            .clone()
-            .or(pinned_logic)
-            .or(batch_logic)
-            .unwrap_or_else(|| smt2_export::detect_logic(&vc.formula).to_string());
+        // THIS IS THE SUBPROCESS LANE, AND IT TAKES THE TABLE'S NAME UNNARROWED
+        // — checked 2026-09-18, not assumed. `in_process_ay_backend`'s NATIVE
+        // `set_logic` passes its name through `native_lane_logic` first,
+        // because the LINKED `ay_bindings::execute_direct` path carries its own
+        // logic-name parser, which can answer `ExecuteError::UnsupportedLogic`
+        // — i.e. abort the solve — for a name the lattice emits. It refused
+        // sixteen of them until ay `9d2cda9c8727`; re-measured 2026-09-19 it
+        // refuses NONE, so that guard is a no-op today and is kept as the alarm
+        // for a future narrowing. Nothing of the sort applies here either way:
+        // `proc` is a child process spawned from
+        // `self.solver_path`, so what reads this line is the ay BINARY's
+        // front end, which accepts every name in the lattice and prints
+        // `; ignoring unsupported logic` only for a name that is not a logic at
+        // all (re-probed 2026-09-18 against ay 0.13.0+build.8256 over all of
+        // `LOGIC_LATTICE` plus a fabricated control). Narrowing here would cost
+        // header precision on the wire and buy nothing. The lattice's module
+        // header records both measurements side by side; a future re-measure
+        // must drive BOTH wires, because each gets the other's answer wrong.
         send_command_until(proc, &format!("(set-logic {logic})"), deadline)?;
         // ay does not respond to set-logic.
 
@@ -1326,18 +1711,174 @@ impl IncrementalAYSession {
             send_command_until(proc, cmd, deadline)?;
         }
 
+        // The correction `base_logic_for` may have made is recorded BEFORE the
+        // name is filed as the live base's, so a caller reading `stats()` can
+        // tell that the header it configured is not the header that went out.
+        // Set, never cleared: one widened base scope is what the flag reports,
+        // and a later query that happens to need less does not un-widen it.
+        if self.logic.as_deref().is_some_and(|configured| configured != logic) {
+            st.stats.logic_override_widened = true;
+        }
+
+        // Record what the LIVE base scope now says, so a later query that
+        // widens `session_theories` into a different name is noticed by
+        // `ensure_base_initialized` instead of being asserted under a logic
+        // that does not admit it. Recorded only on the success path: a base
+        // that failed to go out in full is not a base this session may reuse,
+        // and `base_logic` stays `None` so the next attempt re-sends it.
+        st.base_logic = Some(logic);
+
         Ok(())
+    }
+
+    /// The `(set-logic …)` name the base scope must open with, given everything
+    /// this session has been asked about so far.
+    ///
+    /// ONE SELECTION FROM THE UNION. `st.session_theories` is the union of the
+    /// feature records of every VC the session has seen —
+    /// [`IncrementalAYSession::verify_batch`] folds in a whole batch up front
+    /// and [`IncrementalAYSession::ensure_base_initialized`] folds in each
+    /// per-VC query — so ADMISSIBILITY of this single selection is exactly the
+    /// property the shared base scope needs: the emitted name admits every
+    /// theory every query under it uses. Nothing here relies on the selector
+    /// being monotone, which it is not (see
+    /// `trust_types::logic_lattice`'s module header).
+    ///
+    /// Precedence: an EXPLICIT session logic ([`IncrementalAYSession::with_logic`],
+    /// configured by the caller) is honoured WHENEVER IT ADMITS WHAT THE
+    /// SESSION NEEDS, and widened when it does not. Otherwise the union decides.
+    ///
+    /// # Why the override is validated rather than obeyed blindly
+    ///
+    /// `with_logic` is publicly reachable (`incremental_ay` is a `pub mod`
+    /// re-exported from this crate's root), so before this check an external
+    /// caller could write `.with_logic("QF_LIA")` and then assert a VC applying
+    /// an uninterpreted function, or `.with_logic("QF_BV")` and then assert one
+    /// declaring an `Int` — a base scope opened under a name NARROWER than the
+    /// content sent into it. That is the identical defect class the logic
+    /// lattice exists to close (`trust_types::logic_lattice`'s module header:
+    /// `QF_FP` over an `Int` declaration), reintroduced one layer up, and
+    /// "the caller owns its admissibility" is the same excuse the early-return
+    /// cascades were written under.
+    ///
+    /// WIDENING IS THE ONLY CORRECTION MADE, never narrowing. When the override
+    /// does not admit the session's record, the emitted name is selected from
+    /// the UNION of what the caller asked for and what the session needs, so it
+    /// admits BOTH — the caller's intent is kept, not discarded, and the result
+    /// can only be a superset of the override. A wider logic admits more terms
+    /// and changes no formula's models, so it cannot turn a SAT violation into
+    /// UNSAT (no false proof).
+    ///
+    /// # THE CONTRACT FOR AN OVERRIDE THE TABLE DOES NOT KNOW
+    ///
+    /// **An unrecognized name is credited with what EVERY SMT-LIB logic
+    /// provably admits — Core, i.e. `Theories::NONE` — and then runs through
+    /// the SAME widening rule as a recognized one.** In effect:
+    ///
+    /// * the session requires nothing beyond Core ⇒ the override is emitted
+    ///   EXACTLY, because every SMT-LIB logic admits a Core-only transcript and
+    ///   there is nothing left to prove;
+    /// * the session requires anything at all ⇒ the emitted name is the one
+    ///   selected from the session's own record, which is PROVED to admit the
+    ///   content asserted under it.
+    ///
+    /// This replaces a pass-through that emitted the unknown name whatever the
+    /// session required. Under it, a REAL SMT-LIB name that this table happens
+    /// not to carry — `QF_UFBVLIA`, say, which the lattice's rejection list
+    /// names and declines — could head a session that used more than the name
+    /// admits, which is a logic line NARROWER than its own transcript: the
+    /// exact defect class the lattice exists to close, one layer up.
+    ///
+    /// WHY NOT REFUSE. Because an unknown name is IGNORANCE, not a proven
+    /// defect, and a gate may decline only on a proven one. Nothing here
+    /// declines: the session runs, the query is answered, and the only thing
+    /// the caller loses is the SPELLING of a header this workspace cannot
+    /// check.
+    ///
+    /// WHY NOT PASS IT THROUGH. Because `logic_admits` returning `None` says
+    /// the table cannot check the name, not that the name is safe. Emitting an
+    /// unchecked header over checked content makes the header decoration — and
+    /// "the caller owns its admissibility" is the same excuse the early-return
+    /// cascades were written under. The downstream backstops the old comment
+    /// appealed to are real but they are not this lane's: the transcript
+    /// self-consistency checker runs over EXPORTED transcripts, not over the
+    /// live `ay` stdin this function writes, and `ay` does not answer
+    /// `(set-logic …)` at all, so an unknown name fails silently here.
+    ///
+    /// WHY CORE IS THE RIGHT CREDIT, and not zero and not a guess. Every
+    /// SMT-LIB logic includes Core, so `admits(unknown) ⊇ Theories::NONE` is a
+    /// THEOREM about the whole name space, not an assumption about this one
+    /// name. Crediting more would be a guess; crediting less would refuse the
+    /// Core-only case for no reason. It is the largest set that can be proved
+    /// without knowing which logic was named.
+    ///
+    /// THE COST IS PRECISION, AND IT SHRINKS. The correction is a WIDENING —
+    /// `select_logic_name(required)` admits everything the session asserts — so
+    /// it can never turn a SAT violation into UNSAT. What it costs is the
+    /// caller's chosen spelling, and the way to get it back is to ADD THE NAME
+    /// TO THE TABLE with its citation, which is the same act that shrinks the
+    /// unknown set for every other consumer. `logic_admits`'s docs say what
+    /// `None` does and does not license.
+    ///
+    /// THE SUBSTITUTION IS NOT SILENT: `send_base_assertions` records it in
+    /// [`IncrementalAYStats::logic_override_widened`] whenever the emitted name
+    /// differs from the configured one, for a known override and an unknown one
+    /// alike.
+    ///
+    /// `vc`'s own features are folded in by the caller before this runs; the
+    /// parameter is kept so a session that somehow reaches here with an empty
+    /// union still selects from a record that covers the query in hand rather
+    /// than from `Theories::NONE`.
+    fn base_logic_for(&self, st: &SessionState, vc: &VerificationCondition) -> String {
+        let required = st.session_theories.union(smt2_export::formula_features(&vc.formula));
+        match &self.logic {
+            Some(explicit) => {
+                // A name with no row is credited with CORE ONLY — the one thing
+                // every SMT-LIB logic provably admits — so the two arms below
+                // cover it without a third, guessing arm.
+                let admits = trust_types::logic_lattice::logic_admits(explicit)
+                    .unwrap_or(trust_types::logic_lattice::Theories::NONE);
+                if required.is_subset_of(admits) {
+                    // The override provably admits everything asserted under
+                    // it: honour it exactly, which is the whole point of
+                    // configuring one. For an unknown name this is the
+                    // Core-only session, and only that.
+                    explicit.clone()
+                } else {
+                    // It does not, or cannot be shown to: emit a name admitting
+                    // the override's KNOWN theories AND the session's. ONE
+                    // selection from the union, as everywhere else. For an
+                    // unknown name the union is the session's record alone.
+                    select_logic_name(required.union(admits)).to_string()
+                }
+            }
+            None => select_logic_name(required).to_string(),
+        }
     }
 
     /// Spawn a fresh solver process with incremental-mode options.
     fn spawn_solver(&self) -> Result<SolverProcess, String> {
-        let start = Instant::now();
-        let deadline =
-            start.checked_add(Duration::from_millis(self.query_timeout_ms)).unwrap_or(start);
-        self.spawn_solver_until(deadline)
+        self.spawn_solver_until(SolverDeadline::after(Duration::from_millis(self.query_timeout_ms)))
     }
 
-    fn spawn_solver_until(&self, deadline: Instant) -> Result<SolverProcess, String> {
+    /// The command that runs the configured solver. A bare file name is
+    /// refused: `Command::new("ay")` searches `PATH`, and the solver must be
+    /// the one the caller resolved, never whichever `ay` `PATH` offers.
+    fn solver_command(&self) -> Result<Command, String> {
+        let path = Path::new(&self.solver_path);
+        if path.parent().is_none_or(|dir| dir.as_os_str().is_empty()) {
+            return Err(format!(
+                "refusing to spawn solver `{}`: a bare name is a PATH lookup; pass the path of \
+                 the ay to run (trust_router::ay_discovery)",
+                self.solver_path
+            ));
+        }
+        Ok(Command::new(path))
+    }
+
+    fn spawn_solver_until(&self, deadline: SolverDeadline) -> Result<SolverProcess, String> {
+        deadline.check_spawn()?;
+        let mut command = self.solver_command()?;
         // Reserve the per-job memory budget from the cross-process token bucket
         // BEFORE spawning, so N concurrent workers cannot collectively exceed the
         // machine budget. The reservation rides on the SolverProcess and is freed
@@ -1345,7 +1886,6 @@ impl IncrementalAYSession {
         // is configured; a selected authority that cannot derive a ceiling fails.
         let memory_plan = self.solver_memory_plan()?;
         let mut reservation = self.acquire_reservation(&memory_plan)?;
-        let mut command = Command::new(&self.solver_path);
         command
             .args(&memory_plan.args)
             .stdin(Stdio::piped())
@@ -1357,6 +1897,9 @@ impl IncrementalAYSession {
         reservation
             .configure_child_lifetime_guard(&mut command)
             .map_err(|error| format!("{PRE_SPAWN_LIFETIME_PREFIX} {error}"))?;
+        // Admission and child setup are synchronous. Do not launch a solver
+        // after they have consumed the query's shared clock.
+        deadline.check_spawn()?;
         let mut child =
             command.spawn().map_err(|e| format!("failed to spawn {}: {e}", self.solver_path))?;
         // The pre-exec lifetime guard owns a parent-side staging duplicate.
@@ -1423,7 +1966,8 @@ impl IncrementalAYSession {
         };
 
         // ay does not implement :print-success and only emits responses for
-        // check-sat/get-model-style queries.
+        // check-sat/get-model-style queries. The effort count is not set here:
+        // each check-sat sends its own query's (`verify_incremental`).
         send_command_until(&mut proc, "(set-option :produce-models true)", deadline)?;
 
         // Trust: deliberately do NOT enable `:produce-proofs`. The pinned ay
@@ -1442,7 +1986,30 @@ impl IncrementalAYSession {
 
     /// Fall back to per-process verification for a single VC.
     fn verify_per_process(&self, vc: &VerificationCondition) -> VerificationResult {
-        let script = smtlib_backend::generate_smtlib_script(&vc.formula);
+        let effort = self.scale.for_query(&[&vc.formula]);
+        self.verify_per_process_bounded(vc, self.query_timeout_ms, effort)
+    }
+
+    /// [`Self::verify_per_process`] under an explicit per-query budget — both
+    /// halves of it: the effort count that ends the search and the wall
+    /// backstop behind it. Component retries additionally share the original
+    /// query's absolute deadline, including admission and spawn time. The
+    /// synchronous admission call itself remains cooperatively bounded.
+    fn verify_per_process_bounded(
+        &self,
+        vc: &VerificationCondition,
+        timeout_ms: u64,
+        effort: QueryEffort,
+    ) -> VerificationResult {
+        let start = Instant::now();
+        let credit = trust_types::verify_budget::clock_credit_mark();
+        let own_deadline = (timeout_ms != 0)
+            .then(|| start.checked_add(Duration::from_millis(timeout_ms)).unwrap_or(start));
+        let deadline = trust_types::verify_budget::earliest(
+            own_deadline,
+            trust_types::verify_budget::current_deadline(),
+        );
+        let script = smtlib_backend::generate_smtlib_script(&vc.formula, effort);
 
         // Hold an aggregate-memory reservation for the lifetime of this one-shot
         // solve (acquired before spawn, released when `_reservation` drops at the
@@ -1450,24 +2017,33 @@ impl IncrementalAYSession {
         let memory_plan = match self.solver_memory_plan() {
             Ok(plan) => plan,
             Err(reason) => {
-                return VerificationResult::Unknown {
-                    solver: "ay-incremental-fallback".into(),
-                    time_ms: 0,
-                    reason,
-                };
+                return StopCause::AdmissionRefused.unknown_result(
+                    "ay-incremental-fallback",
+                    0,
+                    &reason,
+                );
             }
         };
         let mut reservation = match self.acquire_reservation(&memory_plan) {
             Ok(reservation) => reservation,
             Err(reason) => {
-                return VerificationResult::Unknown {
-                    solver: "ay-incremental-fallback".into(),
-                    time_ms: 0,
-                    reason,
-                };
+                return StopCause::AdmissionRefused.unknown_result(
+                    "ay-incremental-fallback",
+                    0,
+                    &reason,
+                );
             }
         };
-        let mut command = Command::new(&self.solver_path);
+        let mut command = match self.solver_command() {
+            Ok(command) => command,
+            Err(reason) => {
+                return StopCause::SolverFault.unknown_result(
+                    "ay-incremental-fallback",
+                    0,
+                    &reason,
+                );
+            }
+        };
         command
             .args(&memory_plan.args)
             .stdin(Stdio::piped())
@@ -1475,20 +2051,33 @@ impl IncrementalAYSession {
             .stderr(Stdio::piped());
         isolate_solver_process_group(&mut command);
         if let Err(reason) = reservation.configure_child_lifetime_guard(&mut command) {
-            return VerificationResult::Unknown {
-                solver: "ay-incremental-fallback".into(),
-                time_ms: 0,
-                reason: format!("{PRE_SPAWN_LIFETIME_PREFIX} {reason}"),
-            };
+            return StopCause::AdmissionRefused.unknown_result(
+                "ay-incremental-fallback",
+                0,
+                &format!("{PRE_SPAWN_LIFETIME_PREFIX} {reason}"),
+            );
+        }
+        if timeout_within_deadline(
+            timeout_ms,
+            trust_types::verify_budget::credited(deadline, credit),
+            Instant::now(),
+        )
+        .is_none()
+        {
+            return StopCause::WallBackstop.unknown_result(
+                "ay-incremental-fallback",
+                start.elapsed().as_millis() as u64,
+                "shared query deadline exhausted before solver spawn",
+            );
         }
         let child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
-                return VerificationResult::Unknown {
-                    solver: "ay-incremental-fallback".into(),
-                    time_ms: 0,
-                    reason: format!("failed to spawn solver: {e}"),
-                };
+                return StopCause::SolverFault.unknown_result(
+                    "ay-incremental-fallback",
+                    0,
+                    &format!("failed to spawn solver {}: {e}", self.solver_path),
+                );
             }
         };
         // Do not let Command's retained pre-exec closure keep the daemon socket
@@ -1497,8 +2086,6 @@ impl IncrementalAYSession {
         // From this point every return path kills/reaps the group before this
         // guard's reservation field can drop.
         let mut child = ReservedSolverChild::new(child, reservation, true);
-
-        let start = Instant::now();
 
         let stdout = match child.child.stdout.take() {
             Some(stdout) => stdout,
@@ -1541,9 +2128,8 @@ impl IncrementalAYSession {
             }
         };
 
-        let timeout = Duration::from_millis(self.query_timeout_ms);
-        let deadline = start.checked_add(timeout).unwrap_or(start);
         loop {
+            let deadline = trust_types::verify_budget::credited(deadline, credit);
             match child.exited_without_reaping() {
                 Ok(true) => {
                     // Even a normally exited leader may have left same-group
@@ -1552,8 +2138,10 @@ impl IncrementalAYSession {
                     child.terminate_and_reap();
                     break;
                 }
-                Ok(false) if Instant::now() < deadline => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                Ok(false) if deadline.is_none_or(|at| Instant::now() < at) => {
+                    let remaining = deadline.map_or(Duration::from_millis(5), |at| {
+                        at.saturating_duration_since(Instant::now())
+                    });
                     std::thread::sleep(Duration::from_millis(5).min(remaining));
                 }
                 Ok(false) => {
@@ -1563,7 +2151,7 @@ impl IncrementalAYSession {
                     let _ = join_bounded_solver_reader(stderr_reader, "stderr");
                     return VerificationResult::Timeout {
                         solver: "ay-incremental-fallback".into(),
-                        timeout_ms: self.query_timeout_ms,
+                        timeout_ms,
                     };
                 }
                 Err(error) => {
@@ -1594,11 +2182,9 @@ impl IncrementalAYSession {
     }
 }
 
-impl Default for IncrementalAYSession {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// The backstop-ledger lane the subprocess ay session reports its
+/// non-reproducible stops under ([`trust_types::determinism::note_stop`]).
+pub(crate) const SUBPROCESS_AY_LANE: &str = "subprocess ay";
 
 impl VerificationBackend for IncrementalAYSession {
     fn name(&self) -> &str {
@@ -1617,7 +2203,11 @@ impl VerificationBackend for IncrementalAYSession {
         // VerificationBackend::verify takes &self. The incremental session
         // uses its internal Mutex to manage mutable state, so we can call
         // verify_vc directly (which also takes &self and locks internally).
-        self.verify_vc(vc)
+        let result = self.verify_vc(vc);
+        // Plan §2: every backstop that fired goes to the determinism ledger,
+        // whether or not the caller publishes this result as a row.
+        trust_types::determinism::note_result(SUBPROCESS_AY_LANE, &result);
+        result
     }
 
     /// Trust: This backend exploits its persistent push/pop context to share a
@@ -1633,18 +2223,73 @@ impl VerificationBackend for IncrementalAYSession {
     ) -> Vec<(VerificationCondition, VerificationResult)> {
         // Delegate to the inherent shared-prefix batch (installs each function's
         // prefix at base scope once; verdict-identical to per-VC dispatch).
-        IncrementalAYSession::verify_batch(self, vcs)
+        let results = IncrementalAYSession::verify_batch(self, vcs);
+        for (_, result) in &results {
+            trust_types::determinism::note_result(SUBPROCESS_AY_LANE, result);
+        }
+        results
     }
 }
 
 // -- I/O helpers --
+
+/// One absolute clock for persistent solver setup, protocol I/O, and cleanup.
+/// A zero configured timeout is unbounded unless the enclosing query has a
+/// deadline. Nested function verification uses the existing shared-clock credit.
+#[derive(Clone, Copy)]
+struct SolverDeadline {
+    captured: Option<Instant>,
+    credit: trust_types::verify_budget::ClockCreditMark,
+}
+
+impl SolverDeadline {
+    fn after(timeout: Duration) -> Self {
+        let start = Instant::now();
+        let own = (!timeout.is_zero()).then(|| start.checked_add(timeout).unwrap_or(start));
+        Self::capture(trust_types::verify_budget::earliest(
+            own,
+            trust_types::verify_budget::current_deadline(),
+        ))
+    }
+
+    fn capture(captured: Option<Instant>) -> Self {
+        Self { captured, credit: trust_types::verify_budget::clock_credit_mark() }
+    }
+
+    fn remaining_at(self, now: Instant) -> Option<Duration> {
+        trust_types::verify_budget::earliest(
+            trust_types::verify_budget::credited(self.captured, self.credit),
+            trust_types::verify_budget::current_deadline(),
+        )
+        .map(|at| at.saturating_duration_since(now))
+    }
+
+    fn check_spawn(self) -> Result<(), String> {
+        if self.remaining_at(Instant::now()).is_some_and(|remaining| remaining.is_zero()) {
+            Err("solver spawn timeout: shared query deadline elapsed".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn receive(
+        self,
+        lines: &mpsc::Receiver<Result<String, String>>,
+    ) -> Result<Result<String, String>, mpsc::RecvTimeoutError> {
+        match self.remaining_at(Instant::now()) {
+            Some(remaining) if remaining.is_zero() => Err(mpsc::RecvTimeoutError::Timeout),
+            Some(remaining) => lines.recv_timeout(remaining),
+            None => lines.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        }
+    }
+}
 
 /// Send one framed command without allowing a non-reading solver to block past
 /// the query's absolute deadline.
 fn send_command_until(
     proc: &mut SolverProcess,
     cmd: &str,
-    deadline: Instant,
+    deadline: SolverDeadline,
 ) -> Result<(), String> {
     write_solver_bytes_until(&mut proc.stdin, cmd.as_bytes(), deadline)
         .map_err(|error| format!("write to solver: {error}"))?;
@@ -1656,7 +2301,7 @@ fn send_command_until(
 fn write_solver_bytes_until(
     stdin: &mut std::process::ChildStdin,
     bytes: &[u8],
-    deadline: Instant,
+    deadline: SolverDeadline,
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
@@ -1672,19 +2317,21 @@ fn write_solver_bytes_until(
     let write_result = (|| {
         let mut written = 0usize;
         while written < bytes.len() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let remaining = deadline.remaining_at(Instant::now());
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "solver stdin write timeout: deadline elapsed",
                 ));
             }
-            let timeout_ms = remaining
-                .as_nanos()
-                .saturating_add(999_999)
-                .checked_div(1_000_000)
-                .unwrap_or(1)
-                .min(i32::MAX as u128) as i32;
+            let timeout_ms = remaining.map_or(-1, |remaining| {
+                remaining
+                    .as_nanos()
+                    .saturating_add(999_999)
+                    .checked_div(1_000_000)
+                    .unwrap_or(1)
+                    .min(i32::MAX as u128) as i32
+            });
             let mut descriptor = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
             let polled = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
             if polled == 0 {
@@ -1706,7 +2353,7 @@ fn write_solver_bytes_until(
                     "solver closed stdin while a command was being written",
                 ));
             }
-            if Instant::now() >= deadline {
+            if deadline.remaining_at(Instant::now()).is_some_and(|remaining| remaining.is_zero()) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "solver stdin write timeout: deadline elapsed",
@@ -1752,7 +2399,7 @@ fn write_solver_bytes_until(
 fn write_solver_bytes_until(
     _stdin: &mut std::process::ChildStdin,
     _bytes: &[u8],
-    _deadline: Instant,
+    _deadline: SolverDeadline,
 ) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -1760,12 +2407,14 @@ fn write_solver_bytes_until(
     ))
 }
 
+/// A one-shot solve that broke on process plumbing (a pipe, a reader thread, a
+/// wait): a solver fault, never a verdict.
 fn one_shot_unknown(start: Instant, reason: String) -> VerificationResult {
-    VerificationResult::Unknown {
-        solver: "ay-incremental-fallback".into(),
-        time_ms: start.elapsed().as_millis() as u64,
-        reason,
-    }
+    StopCause::SolverFault.unknown_result(
+        "ay-incremental-fallback",
+        start.elapsed().as_millis() as u64,
+        &reason,
+    )
 }
 
 /// Read one incremental protocol line with a hard allocation ceiling. The old
@@ -1845,12 +2494,6 @@ fn join_bounded_solver_reader(
     reader.join().map_err(|_| format!("solver {stream_name} reader panicked"))?
 }
 
-/// Compute remaining timeout from a deadline.
-fn remaining_timeout(total: Duration, start: Instant) -> Duration {
-    let elapsed = start.elapsed();
-    if elapsed >= total { Duration::from_millis(1) } else { total - elapsed }
-}
-
 /// Read a single response line from the solver.
 /// Whether a solver stdout line is a non-response comment to be skipped.
 ///
@@ -1865,17 +2508,12 @@ fn is_solver_comment_line(line: &str) -> bool {
     trimmed == "c" || trimmed.starts_with("c ") || trimmed.starts_with(';')
 }
 
-fn read_response_line(proc: &mut SolverProcess, timeout: Duration) -> Result<String, String> {
-    let start = Instant::now();
+fn read_response_line(
+    proc: &mut SolverProcess,
+    deadline: SolverDeadline,
+) -> Result<String, String> {
     loop {
-        if start.elapsed() >= timeout {
-            return Err(SolverProcessError::Timeout {
-                solver: "ay-incremental",
-                detail: "no response within deadline".to_string(),
-            }
-            .to_string());
-        }
-        match proc.line_rx.recv_timeout(remaining_timeout(timeout, start)) {
+        match deadline.receive(&proc.line_rx) {
             Ok(Ok(line)) => {
                 if line.is_empty() {
                     return Err(SolverProcessError::ProcessCrashed {
@@ -1911,22 +2549,16 @@ fn read_response_line(proc: &mut SolverProcess, timeout: Duration) -> Result<Str
 }
 
 /// Read a multi-line model response from the solver.
-fn read_model_response(proc: &mut SolverProcess, timeout: Duration) -> Result<String, String> {
+fn read_model_response(
+    proc: &mut SolverProcess,
+    deadline: SolverDeadline,
+) -> Result<String, String> {
     let mut output = String::new();
     let mut depth: i32 = 0;
     let mut started = false;
-    let start = Instant::now();
 
     loop {
-        if start.elapsed() >= timeout {
-            return Err(SolverProcessError::Timeout {
-                solver: "ay-incremental",
-                detail: "timeout during model read".to_string(),
-            }
-            .to_string());
-        }
-        let remaining = remaining_timeout(timeout, start);
-        let line = match proc.line_rx.recv_timeout(remaining) {
+        let line = match deadline.receive(&proc.line_rx) {
             Ok(Ok(line)) => line,
             Ok(Err(e)) => return Err(e),
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1981,6 +2613,87 @@ fn read_model_response(proc: &mut SolverProcess, timeout: Duration) -> Result<St
     }
 
     Ok(output)
+}
+
+/// Read ay's `(get-info :all-statistics)` answer: one parenthesized block that
+/// may span many lines and whose string values may contain parentheses of their
+/// own (`:unknown.detail "… (conflicts=10000, …)"`), so the depth count skips
+/// string literals (SMT-LIB escapes a quote inside one as `""`).
+fn read_statistics_response(
+    proc: &mut SolverProcess,
+    deadline: SolverDeadline,
+) -> Result<String, String> {
+    let mut output = String::new();
+    let mut scanner = SexprScanner::default();
+    loop {
+        let line = match deadline.receive(&proc.line_rx) {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => return Err(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(SolverProcessError::Timeout {
+                    solver: "ay-incremental",
+                    detail: "timeout during statistics read".to_string(),
+                }
+                .to_string());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(SolverProcessError::Disconnected {
+                    solver: "ay-incremental",
+                    detail: "disconnected during statistics read".to_string(),
+                }
+                .to_string());
+            }
+        };
+        if line.is_empty() {
+            return Err(SolverProcessError::ProcessCrashed {
+                solver: "ay-incremental",
+                detail: "solver closed stdout during statistics read".to_string(),
+            }
+            .to_string());
+        }
+        let attempted_bytes = output.len().saturating_add(line.len()).saturating_add(1);
+        if attempted_bytes > MAX_MODEL_OUTPUT_BYTES {
+            return Err(SolverProcessError::ModelOutputTooLarge {
+                solver: "ay-incremental",
+                bytes: attempted_bytes,
+                limit: MAX_MODEL_OUTPUT_BYTES,
+            }
+            .to_string());
+        }
+        let complete = scanner.feed(&line);
+        output.push_str(&line);
+        output.push('\n');
+        if complete {
+            return Ok(output);
+        }
+    }
+}
+
+/// Paren depth over SMT-LIB text, outside string literals.
+#[derive(Debug, Default)]
+struct SexprScanner {
+    depth: i64,
+    started: bool,
+    in_string: bool,
+}
+
+impl SexprScanner {
+    /// Feed one line; `true` once a top-level s-expression has closed.
+    fn feed(&mut self, line: &str) -> bool {
+        for ch in line.chars() {
+            match ch {
+                // `""` inside a string toggles out and straight back in.
+                '"' => self.in_string = !self.in_string,
+                '(' if !self.in_string => {
+                    self.depth += 1;
+                    self.started = true;
+                }
+                ')' if !self.in_string => self.depth -= 1,
+                _ => {}
+            }
+        }
+        self.started && self.depth <= 0 && !self.in_string
+    }
 }
 
 /// Trust: The DECLARATION IDENTITY of an SMT-LIB2 declaration command — the
@@ -2050,23 +2763,40 @@ fn scope_declarations(
         .collect()
 }
 
-/// Trust: Detect an SMT logic wide enough for EVERY VC in a function group.
+/// Trust: The SMT logic for a whole function group — UNION FIRST, SELECT ONCE.
 ///
-/// `detect_logic` is monotone in formula features, so the logic that covers the
-/// union of all the group's full formulas is correct for each individual member
-/// (and for the shared prefix, whose conjuncts are a subset of each member). We
-/// compute it by analyzing each VC's formula and keeping the richest logic
-/// observed — concretely, the logic of `And([all group formulas])`.
+/// The group's single base-scope `(set-logic L)` must admit every theory any
+/// member query uses, i.e. `admits(L) ⊇ features(vc1) ∪ … ∪ features(vcn)`.
+/// This function computes that union with `Theories::union_all` over
+/// `smt2_export::formula_features` and hands it to the shared selector exactly
+/// ONCE.
+///
+/// THAT SHAPE IS THE WHOLE ARGUMENT, and it needs only ADMISSIBILITY: for every
+/// feature set `S`, `select_logic_name(S)` returns a name admitting every
+/// feature in `S`, proved by EXHAUSTIVE ENUMERATION of the entire 2^11 powerset
+/// in `trust_types::logic_lattice`'s
+/// `every_feature_set_selects_an_admitting_logic`, with the union form itself
+/// pinned over all 4_194_304 ordered pairs by `union_admissibility_covers_every_
+/// member`. Each member's features are a subset of the union, so the one name
+/// admits each member directly.
+///
+/// WHAT THIS REPLACES, twice over:
+///
+/// * The comment here once asserted MONOTONICITY of the selector (`S1 ⊆ S2` ⇒
+///   the name for `S2` admits everything the name for `S1` does). That was
+///   false of the early-return cascade this lane used to have, was then made
+///   true by under-stating the table, and is false again now that the precise
+///   BV and Real names are back (`{Arrays}` → `QF_ABV` but `{Arrays, Ints}` →
+///   `QF_ALIA`). Selecting from the union never needed it — which is why the
+///   table was allowed to give it up.
+/// * The implementation conjoined every member into one `Formula::And` and
+///   classified that, relying on `features(And([f1, …])) = ⋃ features(fi)`.
+///   True, but it CLONED every formula in the group to compute a bitmask. The
+///   fold below allocates nothing.
 fn detect_group_logic(group_vcs: &[VerificationCondition]) -> String {
-    match group_vcs.len() {
-        0 => smt2_export::detect_logic(&Formula::Bool(true)).to_string(),
-        1 => smt2_export::detect_logic(&group_vcs[0].formula).to_string(),
-        _ => {
-            let all =
-                Formula::And(group_vcs.iter().map(|vc| vc.formula.clone()).collect::<Vec<_>>());
-            smt2_export::detect_logic(&all).to_string()
-        }
-    }
+    let required =
+        Theories::union_all(group_vcs.iter().map(|vc| smt2_export::formula_features(&vc.formula)));
+    select_logic_name(required).to_string()
 }
 
 /// Trust: Flatten the top-level conjunction of a formula into its conjuncts.
@@ -2280,8 +3010,8 @@ fn mul_counterexample(vc: &VerificationCondition) -> Option<VerificationResult> 
 }
 
 /// Bounded equality propagation. For every `Eq(Var(x), expr)` (either
-/// orientation) reachable in `formula` whose `expr` evaluates to a concrete
-/// integer under the current `env` and whose `x` is not yet bound, bind
+/// orientation) asserted through conjunctions in `formula` whose `expr` evaluates
+/// to a concrete integer under the current `env` and whose `x` is not yet bound, bind
 /// `x -> value`. Repeat to a fixpoint so chained definitions
 /// (`a == s*2`, `count == a*6`) resolve. Bounded by the number of distinct
 /// variables (each pass binds at least one new var or stops), so it terminates.
@@ -2293,11 +3023,19 @@ fn mul_counterexample(vc: &VerificationCondition) -> Option<VerificationResult> 
 fn propagate_equalities(formula: &Formula, env: &mut std::collections::BTreeMap<String, Formula>) {
     let mut eqs = Vec::new();
     collect_var_equalities(formula, &mut eqs);
+    propagate_collected_equalities(&eqs, env);
+}
+
+/// The fixpoint of [`propagate_equalities`] over an already-collected equation list.
+fn propagate_collected_equalities(
+    eqs: &[(String, &Formula)],
+    env: &mut std::collections::BTreeMap<String, Formula>,
+) {
     // At most one new binding can be discovered per (eq), so capping the outer
     // loop at the equation count is a sound, generous fixpoint bound.
     for _ in 0..=eqs.len() {
         let mut changed = false;
-        for (name, expr) in &eqs {
+        for (name, expr) in eqs {
             if env.contains_key(name) {
                 continue;
             }
@@ -2318,8 +3056,9 @@ fn propagate_equalities(formula: &Formula, env: &mut std::collections::BTreeMap<
 }
 
 /// Collect `(var_name, defining_expr)` for every `Eq(Var(x), expr)` /
-/// `Eq(expr, Var(x))` atom anywhere in `formula` (where the other side is not
-/// itself a bare variable, to avoid binding a var to another unbound var).
+/// `Eq(expr, Var(x))` atom asserted through conjunctions in `formula` (where the
+/// other side is not itself a bare variable, to avoid binding a var to another
+/// unbound var).
 ///
 /// SOUNDNESS (forced-violation classification): when an `Eq(Var(x), expr)` IS
 /// collected as `x`'s definition, we MUST NOT then recurse INTO `expr` to harvest a
@@ -2353,8 +3092,14 @@ fn collect_var_equalities<'a>(formula: &'a Formula, out: &mut Vec<(String, &'a F
             _ => {}
         }
     }
-    for child in formula.children() {
-        collect_var_equalities(child, out);
+    // A definition under an implication, disjunction, or negation is not an
+    // unconditional fact. In particular, saturating arithmetic emits several
+    // guarded result equations; harvesting the overflow arm would bind an
+    // input-dependent result to MAX even when that arm is not taken.
+    if let Formula::And(parts) = formula {
+        for child in parts {
+            collect_var_equalities(child, out);
+        }
     }
 }
 
@@ -2442,9 +3187,9 @@ fn collect_ceiling_thresholds(formula: &Formula, out: &mut Vec<i128>) {
         }
         _ => {}
     }
-    for child in formula.children() {
+    trust_types::for_each_formula_child(formula, |child| {
         collect_ceiling_thresholds(child, out);
-    }
+    });
 }
 
 /// Integer literal value of `f` (`Int`/`UInt`/`BitVec`), else `None`.
@@ -2509,9 +3254,9 @@ fn collect_mul_var_pairs(formula: &Formula, pairs: &mut Vec<(String, String)>) {
     {
         pairs.push((lhs_name, rhs_name));
     }
-    for child in formula.children() {
+    trust_types::for_each_formula_child(formula, |child| {
         collect_mul_var_pairs(child, pairs);
-    }
+    });
 }
 
 fn formula_var_name(formula: &Formula) -> Option<String> {
@@ -2665,11 +3410,144 @@ fn bv_mask(v: i128, w: u32) -> Option<i128> {
 /// free) and is merely POSSIBLE, not guaranteed. Independent of the forward
 /// solver verdict, so it ALSO catches a trivial ground violation the solver could
 /// only return `unknown` for.
+///
+/// Trust (2026-10-15): the bindings come from the HYPOTHESES only — every conjunct off
+/// the violation spine (the chain of last conjuncts; vcgen's conjoiners append the
+/// violation-bearing formula last). The violation's own equalities are what it ASKS,
+/// not definitions: the division-family precondition rows state `b == 0` and `a == MIN
+/// ∧ b == -1` as the violation, and harvesting them bound `b := 0`, so `a.rem_euclid(b)`
+/// over two parameters was reported a "guaranteed Level 0 safety violation" (measured
+/// on the stage 1 of the 2026-10-14 merge, `tests/ui/trust/divzero_call_user_namesake.rs
+/// #controls` `c3`/`c4`). Definitions on the spine's earlier conjuncts, at any depth,
+/// still bind. Fail-closed: a narrower binding set can only withhold the escalation;
+/// the row stays FAILED.
+///
+/// Trust (2026-10-15): a variable the formula mentions ONLY in hypothesis range atoms
+/// (`x >= lo`, `x <= hi`, conjuncts of the hypotheses, never inside an `Or`/`Not` and
+/// never in the violation) is bound to one value of its non-empty range
+/// ([`bind_isolated_range_witnesses`]). Every other conjunct is independent of it, so the
+/// formula has the same truth value for every in-range `x`, and the non-empty range is
+/// what "reached" asks of it. `(false as u8) % 0u8` reads `_1 ∈ [0, 255]` for the
+/// unmodeled cast beside the ground violation `0 == 0`, and was not reported forced
+/// (`tests/ui/trust/self_guarded_literal_operand.rs#certify`, `rem_cast_0`).
 #[must_use]
 pub fn violation_is_forced(formula: &Formula) -> bool {
     let mut env = std::collections::BTreeMap::new();
-    propagate_equalities(formula, &mut env);
+    let mut eqs = Vec::new();
+    collect_hypothesis_equalities(formula, &mut eqs);
+    propagate_collected_equalities(&eqs, &mut env);
+    bind_isolated_range_witnesses(formula, &mut env);
     eval_bool_formula(formula, &env) == Some(true)
+}
+
+/// Bind each unbound variable that `formula` mentions only in its HYPOTHESES' range
+/// atoms to the least value of its range, when the range is non-empty. See
+/// [`violation_is_forced`]. Fail-closed: a variable with any other mention, a bound that
+/// is not an integer literal, or an empty range is left unbound, which can only keep the
+/// formula from evaluating.
+fn bind_isolated_range_witnesses(
+    formula: &Formula,
+    env: &mut std::collections::BTreeMap<String, Formula>,
+) {
+    let mut bounds: std::collections::BTreeMap<String, (Option<i128>, Option<i128>)> =
+        std::collections::BTreeMap::new();
+    let mut outside: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    collect_spine_range_atoms(formula, &mut bounds, &mut outside);
+    for (name, (lo, hi)) in bounds {
+        if outside.contains(&name) || env.contains_key(&name) {
+            continue;
+        }
+        let witness = match (lo, hi) {
+            (Some(lo), Some(hi)) if lo <= hi => lo,
+            (Some(lo), None) => lo,
+            (None, Some(hi)) => hi,
+            _ => continue,
+        };
+        env.insert(name, Formula::Int(witness));
+    }
+}
+
+/// Walk the violation spine: at each `And`, every conjunct but the last is a hypothesis
+/// (its conjunctive range atoms are collected), and the last continues the spine; the
+/// spine's terminal formula is the violation, whose every variable is an outside mention.
+fn collect_spine_range_atoms(
+    formula: &Formula,
+    bounds: &mut std::collections::BTreeMap<String, (Option<i128>, Option<i128>)>,
+    outside: &mut std::collections::BTreeSet<String>,
+) {
+    if let Formula::And(parts) = formula
+        && let Some((last, hypotheses)) = parts.split_last()
+    {
+        for hypothesis in hypotheses {
+            collect_hypothesis_range_atoms(hypothesis, bounds, outside);
+        }
+        collect_spine_range_atoms(last, bounds, outside);
+    } else {
+        outside.extend(smt2_export::collect_free_vars(formula).into_iter().map(|(name, _)| name));
+    }
+}
+
+/// Inside one hypothesis: through nested `And`s, a range atom over an `Int` variable and
+/// an integer literal narrows that variable's bounds; anything else marks every variable
+/// it mentions as an outside mention.
+fn collect_hypothesis_range_atoms(
+    formula: &Formula,
+    bounds: &mut std::collections::BTreeMap<String, (Option<i128>, Option<i128>)>,
+    outside: &mut std::collections::BTreeSet<String>,
+) {
+    if let Formula::And(parts) = formula {
+        for part in parts {
+            collect_hypothesis_range_atoms(part, bounds, outside);
+        }
+        return;
+    }
+    let var_lit = |var: &Formula, lit: &Formula| match (var, lit) {
+        (Formula::Var(name, Sort::Int), Formula::Int(c)) => Some((name.clone(), *c)),
+        _ => None,
+    };
+    // (variable, lower bound, upper bound) of the atom.
+    let atom = match formula {
+        Formula::Ge(a, b) => var_lit(a, b)
+            .map(|(x, c)| (x, Some(c), None))
+            .or_else(|| var_lit(b, a).map(|(x, c)| (x, None, Some(c)))),
+        Formula::Le(a, b) => var_lit(a, b)
+            .map(|(x, c)| (x, None, Some(c)))
+            .or_else(|| var_lit(b, a).map(|(x, c)| (x, Some(c), None))),
+        Formula::Gt(a, b) => var_lit(a, b)
+            .and_then(|(x, c)| Some((x, Some(c.checked_add(1)?), None)))
+            .or_else(|| var_lit(b, a).and_then(|(x, c)| Some((x, None, Some(c.checked_sub(1)?))))),
+        Formula::Lt(a, b) => var_lit(a, b)
+            .and_then(|(x, c)| Some((x, None, Some(c.checked_sub(1)?))))
+            .or_else(|| var_lit(b, a).and_then(|(x, c)| Some((x, Some(c.checked_add(1)?), None)))),
+        _ => None,
+    };
+    match atom {
+        Some((name, lo, hi)) => {
+            let entry = bounds.entry(name).or_insert((None, None));
+            if let Some(lo) = lo {
+                entry.0 = Some(entry.0.map_or(lo, |old| old.max(lo)));
+            }
+            if let Some(hi) = hi {
+                entry.1 = Some(entry.1.map_or(hi, |old| old.min(hi)));
+            }
+        }
+        None => outside
+            .extend(smt2_export::collect_free_vars(formula).into_iter().map(|(name, _)| name)),
+    }
+}
+
+/// The `Eq` definitions of `formula`'s HYPOTHESES: at every `And` on the violation spine
+/// (the chain of last conjuncts), the conjuncts before the last; never the spine's own
+/// terminal formula (the violation). See [`violation_is_forced`].
+fn collect_hypothesis_equalities<'a>(formula: &'a Formula, out: &mut Vec<(String, &'a Formula)>) {
+    if let Formula::And(parts) = formula
+        && let Some((last, hypotheses)) = parts.split_last()
+    {
+        for hypothesis in hypotheses {
+            collect_var_equalities(hypothesis, out);
+        }
+        collect_hypothesis_equalities(last, out);
+    }
 }
 
 /// Trust: `true` iff `formula` is a bare `true` LITERAL — a vcgen MODELING-GAP
@@ -2727,16 +3605,15 @@ fn contains_failclose_marker(formula: &Formula) -> bool {
     }
 }
 
-/// Trust: an `UnboundedAllocation` is a GUARANTEED over-budget violation iff its
-/// COUNT folds to a compile-time constant at or above the budget ceiling — i.e.
-/// the violation atom `Ge(count, CEILING)` / `Gt(count, CEILING)` holds with
-/// `count` forced — REGARDLESS of reaching guards. The allocation SITE, when
-/// reached, allocates that constant over-budget amount; reaching guards (a
-/// shift's panic-freedom, a branch condition — often carrying a free var like a
-/// shift amount vcgen leaves unpinned) only decide WHEN it is reached, not
-/// WHETHER it is over-budget. Soundness: anchored at `ALLOC_CEILING`, so a small
-/// guard threshold (`_2 < 64`) cannot match; and an input-dependent count
-/// (`with_capacity(a+b)`) does not fold, so it stays a warning.
+/// Detect a positive allocation-budget atom whose count is forced by mandatory
+/// constant definitions. Conditional result equations (such as saturation arms)
+/// cannot pin the count, and negated or inactive atoms cannot report a violation.
+///
+/// A symbolic reaching guard may remain unknown: this checks the amount at the
+/// allocation site when reached, not satisfiability of the entire formula (see
+/// `violation_is_forced`). Known-false paths and conflicting definitions decline.
+/// Small guard thresholds do not match `ALLOC_CEILING`; input-dependent counts
+/// that do not fold also decline.
 #[must_use]
 pub fn alloc_over_ceiling_forced(formula: &Formula) -> bool {
     let mut env = std::collections::BTreeMap::new();
@@ -2745,6 +3622,11 @@ pub fn alloc_over_ceiling_forced(formula: &Formula) -> bool {
 }
 
 fn alloc_violation_holds(f: &Formula, env: &std::collections::BTreeMap<String, Formula>) -> bool {
+    // A false reaching condition or inconsistent definition cannot witness an
+    // allocation. This also makes conflicting constant bindings order independent.
+    if eval_bool_formula(f, env) == Some(false) {
+        return false;
+    }
     // Must match trust-vcgen's `UNBOUNDED_ALLOC_ELEM_CEILING`. The large value is
     // what distinguishes the violation atom `Ge(count, CEILING)` from small-
     // threshold range/shift guards (`_1 >= 0`, `_2 < 64`).
@@ -2759,7 +3641,32 @@ fn alloc_violation_holds(f: &Formula, env: &std::collections::BTreeMap<String, F
             return true;
         }
     }
-    f.children().into_iter().any(|child| alloc_violation_holds(child, env))
+    match f {
+        // Trust (2026-10-15): only the LAST conjunct can carry the violation. Every vcgen
+        // conjoiner of an allocation VC appends the violation-bearing formula last
+        // (`bounds.push(formula)` in the type/value-join range conjoiners, the global
+        // facts, the semantic guards, the preconditions; the path-guard splice keeps the
+        // body last inside each disjunct), and every earlier conjunct is a HYPOTHESIS that
+        // holds by construction. A hypothesis can look exactly like the violation atom:
+        // the loop-carried value-join range of a guard constant `_3 = 1 << 28` is
+        // `Ge(_3, 2^28) ∧ Le(_3, 2^28)`, and reading its `Ge` as "the count folds to the
+        // ceiling" escalated the correct `if n < (1 << 28) { Vec::with_capacity(n) }`
+        // into a "guaranteed" violation over ay's own UNSAT (measured on the stage 1 of the
+        // 2026-10-14 merge, `[unbounded_allocation] FAILED (structural-forced-unbounded-
+        // allocation-over-unwitnessed-proof:ay-in-process)`,
+        // `tests/ui/trust/alloc_additional_count_live_receiver.rs#fresh` and
+        // `alloc_capacity_from_live_length.rs#same_stride_sum_coprime_direct_guarded`).
+        // The hypotheses still feed `env` (`propagate_equalities` read the whole formula).
+        Formula::And(parts) => parts.last().is_some_and(|last| alloc_violation_holds(last, env)),
+        // Only a known-true disjunct may expose its atom. Unknown branches must
+        // not contribute a violation merely because it occurs inside them.
+        Formula::Or(parts) => parts.iter().any(|child| {
+            eval_bool_formula(child, env) == Some(true) && alloc_violation_holds(child, env)
+        }),
+        // Comparisons nested in Not, Implies, Eq, etc. are boolean operands,
+        // not asserted positive allocation violations.
+        _ => false,
+    }
 }
 
 /// Benchmark comparing incremental session vs per-process verification.
@@ -2824,7 +3731,7 @@ fn proved_from_bare_unsat(time_ms: u64) -> VerificationResult {
 fn finish_bare_unsat(
     state: &mut SessionState,
     time_ms: u64,
-    deadline: Instant,
+    deadline: SolverDeadline,
 ) -> VerificationResult {
     let proved = proved_from_bare_unsat(time_ms);
     let popped = state
@@ -2840,6 +3747,18 @@ fn finish_bare_unsat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The query timeout for sessions on a stand-in shell solver. It is a hang
+    /// detector, not a latency budget: the stand-in answers at once (about
+    /// 0.25 s per test alone), but on a loaded machine running the push lane's
+    /// parallel test pool a 10 s budget ran out before the stand-in answered
+    /// (component_lane_is_refused_under_common_assertions got `Timeout`
+    /// instead of `Unknown`, 2026-09-30, load average about 70).
+    const STAND_IN_SOLVER_TIMEOUT_MS: u64 = 60_000;
+
+    /// A solver path nothing is installed at: for tests that build a session
+    /// and never reach a real solver.
+    const UNSPAWNED_AY: &str = "/nonexistent/trust-router-unit-test/ay";
 
     struct ScopedEnv {
         name: &'static str,
@@ -2982,14 +3901,14 @@ mod tests {
 
     #[test]
     fn bare_unsat_survives_expired_pop_deadline_and_resets_the_process() {
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let (_tx, rx) = mpsc::channel();
         let mut state = session.state.lock().unwrap_or_else(|error| error.into_inner());
         state.process = Some(mock_proc(rx));
         state.base_initialized = true;
         let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
-        let result = finish_bare_unsat(&mut state, 9, expired);
+        let result = finish_bare_unsat(&mut state, 9, SolverDeadline::capture(Some(expired)));
         match result {
             VerificationResult::Proved { strength, time_ms, .. } => {
                 assert_eq!(time_ms, 9);
@@ -3064,15 +3983,88 @@ mod tests {
         let count_def = Formula::Eq(Box::new(count.clone()), Box::new(Formula::Int(ALLOC_CEILING)));
         let viol = Formula::Ge(Box::new(count), Box::new(Formula::Int(ALLOC_CEILING)));
         let guard = Formula::Lt(Box::new(int_var("shift_amt")), Box::new(Formula::Int(64)));
-        let real_vc = Formula::And(vec![count_def, guard, viol]);
+        let real_vc = Formula::And(vec![count_def.clone(), guard, viol.clone()]);
+        // Trust (2026-10-15): since `bind_isolated_range_witnesses`, whole-conjunction
+        // folding DOES see past a guard whose variable nothing else mentions (`shift_amt`
+        // only in `shift_amt < 64`): the count is forced on every reaching execution.
         assert!(
-            !violation_is_forced(&real_vc),
-            "whole-conjunction folding cannot see past the unpinned shift guard"
+            violation_is_forced(&real_vc),
+            "a guard variable only its own range atom mentions does not block the fold"
+        );
+        // A guard variable another hypothesis constrains still blocks it, and the
+        // violation-atom check is what catches that shape.
+        let shift_amt = int_var("shift_amt");
+        let entangled = Formula::And(vec![
+            count_def,
+            Formula::Lt(Box::new(shift_amt.clone()), Box::new(Formula::Int(64))),
+            Formula::Eq(
+                Box::new(Formula::Rem(Box::new(shift_amt), Box::new(Formula::Int(2)))),
+                Box::new(Formula::Int(1)),
+            ),
+            viol,
+        ]);
+        assert!(
+            !violation_is_forced(&entangled),
+            "whole-conjunction folding cannot see past an entangled shift guard"
+        );
+        assert!(
+            alloc_over_ceiling_forced(&entangled),
+            "the violation-atom check catches the constant over-budget count past it"
         );
         assert!(
             alloc_over_ceiling_forced(&real_vc),
             "the violation-atom check must catch the constant over-budget count \
              regardless of the unpinned reaching guard (the nn OOM case)"
+        );
+    }
+
+    #[test]
+    fn alloc_over_ceiling_forced_ignores_a_range_hypothesis_on_a_guard_constant() {
+        // The merged tree's real VC of `if n < (1 << 28) { Vec::with_capacity(n) }` over a
+        // 2^35-byte element (`alloc_additional_count_live_receiver.rs#fresh`): the guard
+        // constant `_3 = 1 << 28` carries the value-join range hypothesis
+        // `_3 >= 2^28 ∧ _3 <= 2^28`, conjoined BEFORE the violation, which is the
+        // disjunction over the input `n`. The hypothesis is not the violation; the count
+        // `n` folds to nothing, so this is not a guaranteed violation (ay proves it).
+        let n = int_var("n");
+        let c = int_var("_3");
+        let ceiling = Formula::Int(ALLOC_CEILING);
+        let violation = Formula::Or(vec![
+            Formula::Ge(Box::new(n.clone()), Box::new(ceiling.clone())),
+            Formula::Ge(
+                Box::new(Formula::Mul(Box::new(Formula::Int(1 << 35)), Box::new(n.clone()))),
+                Box::new(Formula::Int(i128::from(i64::MAX))),
+            ),
+        ]);
+        let vc = Formula::And(vec![
+            Formula::Ge(Box::new(c.clone()), Box::new(ceiling.clone())),
+            Formula::Le(Box::new(c.clone()), Box::new(ceiling.clone())),
+            Formula::Eq(Box::new(c.clone()), Box::new(ceiling.clone())),
+            Formula::Lt(Box::new(n), Box::new(c)),
+            violation,
+        ]);
+        assert!(
+            !alloc_over_ceiling_forced(&vc),
+            "a range hypothesis on a guard constant must not read as the violation atom"
+        );
+        // The forced twin: the COUNT is the constant (`Vec::with_capacity(1 << 28)`), the
+        // same range hypothesis precedes it, and the violation's ceiling disjunct folds true.
+        let count = int_var("_2");
+        let forced = Formula::And(vec![
+            Formula::Ge(Box::new(count.clone()), Box::new(ceiling.clone())),
+            Formula::Le(Box::new(count.clone()), Box::new(ceiling.clone())),
+            Formula::Eq(Box::new(count.clone()), Box::new(ceiling.clone())),
+            Formula::Or(vec![
+                Formula::Ge(Box::new(count.clone()), Box::new(ceiling)),
+                Formula::Ge(
+                    Box::new(Formula::Mul(Box::new(Formula::Int(1 << 35)), Box::new(count))),
+                    Box::new(Formula::Int(i128::from(i64::MAX))),
+                ),
+            ]),
+        ]);
+        assert!(
+            alloc_over_ceiling_forced(&forced),
+            "a constant over-ceiling COUNT is still a guaranteed violation"
         );
     }
 
@@ -3105,6 +4097,108 @@ mod tests {
         assert!(
             violation_is_forced(&Formula::And(vec![count_def, flag_def, flag])),
             "a constant alloc flowing through a bool block-def temp must fold to forced"
+        );
+    }
+
+    #[test]
+    fn violation_is_forced_does_not_bind_the_violations_own_equalities() {
+        // The merged tree's `a.rem_euclid(b)` rows over two parameters: type ranges, then
+        // the violation `b == 0` (remainder by zero) / `a == MIN && b == -1` (overflow).
+        // The violation's equalities are what it asks, not definitions: not forced.
+        let a = int_var("a");
+        let b = int_var("b");
+        let ranges = |v: &Formula| {
+            vec![
+                Formula::Ge(Box::new(v.clone()), Box::new(Formula::Int(i128::from(i64::MIN)))),
+                Formula::Le(Box::new(v.clone()), Box::new(Formula::Int(i128::from(i64::MAX)))),
+            ]
+        };
+        let mut remzero = ranges(&a);
+        remzero.extend(ranges(&b));
+        remzero.push(Formula::Eq(Box::new(b.clone()), Box::new(Formula::Int(0))));
+        assert!(
+            !violation_is_forced(&Formula::And(remzero)),
+            "`b == 0` over a free `b` is possible, not guaranteed"
+        );
+        let mut overflow = ranges(&a);
+        overflow.extend(ranges(&b));
+        overflow.push(Formula::And(vec![
+            Formula::Eq(Box::new(a.clone()), Box::new(Formula::Int(i128::from(i64::MIN)))),
+            Formula::Eq(Box::new(b.clone()), Box::new(Formula::Int(-1))),
+        ]));
+        assert!(
+            !violation_is_forced(&Formula::And(overflow)),
+            "`a == MIN && b == -1` over free `a`, `b` is possible, not guaranteed"
+        );
+        // A HYPOTHESIS that pins `b` still forces the same violation.
+        let pinned = Formula::And(vec![
+            Formula::Eq(Box::new(b.clone()), Box::new(Formula::Int(0))),
+            Formula::Eq(Box::new(b), Box::new(Formula::Int(0))),
+        ]);
+        assert!(
+            violation_is_forced(&pinned),
+            "a definition of `b` before the violation still binds"
+        );
+    }
+
+    #[test]
+    fn violation_is_forced_binds_a_variable_only_its_range_mentions() {
+        // `(false as u8) % 0u8` on the merged stage 1 (measured with a vcgen probe): the
+        // unmodeled cast leaves `_1 ∈ [0, 255]`, the divisor check is the ground `0 == 0`.
+        let x1 = int_var("_1");
+        let x0 = int_var("_0");
+        let x2 = Formula::Var("_2".into(), Sort::Bool);
+        let zero_eq_zero = || Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(0)));
+        let range = |v: &Formula, lo: i128, hi: i128| {
+            Formula::And(vec![
+                Formula::Ge(Box::new(v.clone()), Box::new(Formula::Int(lo))),
+                Formula::Le(Box::new(v.clone()), Box::new(Formula::Int(hi))),
+            ])
+        };
+        let rem_cast_0 = Formula::And(vec![
+            range(&x1, 0, 255),
+            Formula::And(vec![
+                Formula::Or(vec![
+                    zero_eq_zero(),
+                    Formula::Lt(Box::new(x0.clone()), Box::new(Formula::Int(0))),
+                ]),
+                Formula::And(vec![
+                    Formula::Eq(Box::new(x2.clone()), Box::new(zero_eq_zero())),
+                    x2.clone(),
+                ]),
+            ]),
+        ]);
+        assert!(violation_is_forced(&rem_cast_0), "a ground divisor-zero beside a free dividend");
+        // The violation mentions the ranged variable: possible, not forced.
+        let viol_on_x = Formula::And(vec![
+            range(&x1, 0, 255),
+            Formula::Eq(Box::new(x1.clone()), Box::new(Formula::Int(0))),
+        ]);
+        assert!(!violation_is_forced(&viol_on_x), "`_1 == 0` over `_1 ∈ [0, 255]` is possible");
+        // An empty range names no reaching execution: never forced.
+        let empty = Formula::And(vec![range(&x1, 5, 3), zero_eq_zero()]);
+        assert!(!violation_is_forced(&empty), "an empty range is unreachable code");
+        // A range atom under an `Or` is not a hypothesis conjunct: its variable stays free.
+        let under_or = Formula::And(vec![
+            Formula::Or(vec![
+                Formula::Ge(Box::new(x1.clone()), Box::new(Formula::Int(7))),
+                Formula::Bool(false),
+            ]),
+            zero_eq_zero(),
+        ]);
+        assert!(!violation_is_forced(&under_or), "a disjunct does not bound the variable");
+        // A second, non-range hypothesis on the same variable keeps it free.
+        let also_elsewhere = Formula::And(vec![
+            range(&x1, 0, 255),
+            Formula::Eq(
+                Box::new(Formula::Rem(Box::new(x1.clone()), Box::new(Formula::Int(2)))),
+                Box::new(Formula::Int(1)),
+            ),
+            zero_eq_zero(),
+        ]);
+        assert!(
+            !violation_is_forced(&also_elsewhere),
+            "a variable another hypothesis constrains is not isolated"
         );
     }
 
@@ -3238,8 +4332,8 @@ mod tests {
 
     #[test]
     fn test_session_default_config() {
-        let session = IncrementalAYSession::new();
-        assert_eq!(session.solver_path, "ay");
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
+        assert_eq!(session.solver_path, UNSPAWNED_AY);
         // No redundant `-in`: it is an alias of `--incremental` in the pinned
         // ay, so passing both makes ay reject the invocation. `--incremental`
         // alone drives the stdin push/pop protocol.
@@ -3264,10 +4358,48 @@ mod tests {
         assert_eq!(session.logic.as_deref(), Some("QF_LIA"));
     }
 
+    /// A bare solver name is never looked up on `PATH`: the session refuses to
+    /// spawn it, on both the incremental and the per-process lane, whatever
+    /// `ay` `PATH` holds (on a machine with one, running it would have
+    /// answered `unsat` and turned this `Proved`).
     #[test]
-    fn test_session_default_impl() {
-        let session = IncrementalAYSession::default();
-        assert_eq!(session.solver_path, "ay");
+    fn a_bare_solver_name_is_refused_not_looked_up_on_path() {
+        let _memory_authority = unconfigured_memory_authority();
+        let session = IncrementalAYSession::with_solver_path("ay");
+        // `x > 5 /\ x < 3`: unsat, so a real ay would have proved it.
+        let vc = make_vc(Formula::And(vec![
+            Formula::Gt(Box::new(int_var("x")), Box::new(Formula::Int(5))),
+            Formula::Lt(Box::new(int_var("x")), Box::new(Formula::Int(3))),
+        ]));
+        let per_process = session.verify_per_process(&vc);
+        let incremental = session.verify_vc(&vc);
+        for result in [&per_process, &incremental] {
+            match result {
+                VerificationResult::Unknown { reason, .. } => assert!(
+                    reason.contains("refusing to spawn solver `ay`: a bare name is a PATH lookup"),
+                    "{reason}"
+                ),
+                other => panic!("a bare solver name must not run anything: {other:?}"),
+            }
+        }
+    }
+
+    /// A solver path with nothing at it gives `Unknown` naming that path, on
+    /// both lanes: targo-trust's verify-binary relies on it to say which `ay`
+    /// it could not run when its toolchain ships none.
+    #[test]
+    fn a_missing_solver_is_unknown_naming_its_path() {
+        let _memory_authority = unconfigured_memory_authority();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
+        let vc = make_vc(Formula::Gt(Box::new(int_var("x")), Box::new(Formula::Int(5))));
+        for result in [session.verify_per_process(&vc), session.verify_vc(&vc)] {
+            match result {
+                VerificationResult::Unknown { reason, .. } => {
+                    assert!(reason.contains(UNSPAWNED_AY), "{reason}");
+                }
+                other => panic!("nothing is installed at {UNSPAWNED_AY}: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -3275,7 +4407,8 @@ mod tests {
         // The per-job ceiling must reach the spawned `ay` as `--memory <mb>` so
         // the solver self-limits (degrades to Unknown) instead of OOM-killing the
         // host. The stored solver_args are unchanged; only spawn_args() carries it.
-        let session = IncrementalAYSession::new().with_memory_limit_mb(4096);
+        let session =
+            IncrementalAYSession::with_solver_path(UNSPAWNED_AY).with_memory_limit_mb(4096);
         let args = session.solver_memory_plan().expect("memory plan").args;
         let pos = args.iter().position(|a| a == "--memory").expect("--memory must be present");
         assert_eq!(args.get(pos + 1).map(String::as_str), Some("4096"));
@@ -3295,7 +4428,7 @@ mod tests {
         let _socket = ScopedEnv::remove(crate::coordinator::SOCK_ENV);
         let _disable = ScopedEnv::remove(crate::coordinator::DISABLE_ENV);
         let _lane = TestTokenLane::new();
-        let session = IncrementalAYSession::new().with_memory_limit_mb(16);
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY).with_memory_limit_mb(16);
         let plan = session.solver_memory_plan().expect("memory plan");
         let args = &plan.args;
         let position = args.iter().position(|arg| arg == "--memory").expect("memory flag");
@@ -3309,7 +4442,8 @@ mod tests {
 
     #[test]
     fn unrepresentable_memory_ceiling_fails_before_reservation_or_spawn() {
-        let session = IncrementalAYSession::new().with_memory_limit_mb(u64::MAX);
+        let session =
+            IncrementalAYSession::with_solver_path(UNSPAWNED_AY).with_memory_limit_mb(u64::MAX);
         let error = session
             .solver_memory_plan()
             .err()
@@ -3323,7 +4457,7 @@ mod tests {
         let _env = crate::memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _socket = ScopedEnv::set(crate::coordinator::SOCK_ENV, "");
         let _disable = ScopedEnv::remove(crate::coordinator::DISABLE_ENV);
-        let session = IncrementalAYSession::new().with_memory_limit_mb(1);
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY).with_memory_limit_mb(1);
         // Keep a nonlinear term in the VC: the public path would ordinarily
         // attempt the sound relaxation after an Unknown. Admission failure must
         // bypass that second solve as well as the one-shot fallback.
@@ -3353,7 +4487,7 @@ mod tests {
     fn memory_plan_snapshot_cannot_split_after_environment_mutation() {
         let _env = crate::memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _limit = ScopedEnv::set("TRUST_SOLVER_MEMORY_LIMIT_MB", "8");
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let plan = session.solver_memory_plan().expect("snapshot eight-MiB plan");
         let _mutated = ScopedEnv::set("TRUST_SOLVER_MEMORY_LIMIT_MB", "8192");
 
@@ -3374,13 +4508,13 @@ mod tests {
         // no-ceiling behavior left the plain-cargo lane's solver unbounded
         // (the aterm-lz4 / trustc 300 GB incident class). Unbounded now only
         // happens when RAM is undetectable.
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let derived = crate::memory_jobserver::default_per_job_limit_mb();
         let plan = session.solver_memory_plan().expect("default memory plan");
         let has_flag = plan.args.iter().any(|a| a == "--memory");
         assert_eq!(has_flag, derived.is_some());
         // A zero ceiling clears the explicit setting (env/derived may still apply).
-        let zeroed = IncrementalAYSession::new().with_memory_limit_mb(0);
+        let zeroed = IncrementalAYSession::with_solver_path(UNSPAWNED_AY).with_memory_limit_mb(0);
         assert!(zeroed.solver_memory_limit_mb.is_none());
     }
 
@@ -3391,14 +4525,14 @@ mod tests {
         // env lock to avoid races with jobserver env tests.
         let _env = crate::memory_jobserver::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _limit = ScopedEnv::set("TRUST_SOLVER_MEMORY_LIMIT_MB", "3072");
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let args = session.solver_memory_plan().expect("environment memory plan").args;
         let pos = args.iter().position(|a| a == "--memory").expect("--memory must be present");
         assert_eq!(args.get(pos + 1).map(String::as_str), Some("3072"));
         // 0 clears the override; it cannot request an unbounded solver or
         // decouple the enforced flag from aggregate admission.
         let _cleared = ScopedEnv::set("TRUST_SOLVER_MEMORY_LIMIT_MB", "0");
-        let cleared = IncrementalAYSession::new();
+        let cleared = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let derived = crate::memory_jobserver::default_per_job_limit_mb();
         let args = cleared.solver_memory_plan().expect("cleared memory plan").args;
         let actual = args
@@ -3425,36 +4559,43 @@ mod tests {
         assert!(joined.contains("(assert"), "should contain assertion");
     }
 
+    /// The internal promotion of shared declarations does NOT pay `ALL`: its
+    /// record is the union of the promoted VCs' measured records, so the base
+    /// scope for two integer VCs sharing a declaration stays `QF_LIA`.
     #[test]
-    fn test_common_assertion_from_commands() {
-        let commands = vec!["(declare-fun x () Int)".to_string(), "(assert (>= x 0))".to_string()];
-        let assertion = CommonAssertion::from_commands("range", commands.clone());
-
-        assert_eq!(assertion.label, "range");
-        assert_eq!(assertion.commands, commands);
+    fn shared_declarations_are_recorded_from_the_promoted_vcs_not_as_everything() {
+        let mut session = IncrementalAYSession::with_solver_path("nonexistent_solver_xyz");
+        let vcs = vec![
+            make_vc(Formula::Ge(Box::new(int_var("x")), Box::new(Formula::Int(0)))),
+            make_vc(Formula::Le(Box::new(int_var("x")), Box::new(Formula::Int(10)))),
+        ];
+        session.extract_common_declarations(&vcs);
+        assert_eq!(session.stats().common_assertions, 1, "`x` is declared by both VCs");
+        let promoted = session.common_assertions.last().expect("one promoted group");
+        assert_eq!(promoted.label, "shared-variable-declarations");
+        let expected =
+            Theories::union_all(vcs.iter().map(|vc| smt2_export::formula_features(&vc.formula)));
+        assert_eq!(promoted.theories(), expected);
+        assert_ne!(promoted.theories(), Theories::EVERYTHING);
+        let st = session.state.lock().unwrap();
+        assert_eq!(session.base_logic_for(&st, &vcs[0]), "QF_LIA");
     }
 
     #[test]
     fn test_add_common_assertion_updates_stats() {
-        let mut session = IncrementalAYSession::new();
+        let mut session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         assert_eq!(session.stats().common_assertions, 0);
 
-        session.add_common_assertion(CommonAssertion::from_commands(
-            "test",
-            vec!["(assert true)".to_string()],
-        ));
+        session.add_common_assertion(CommonAssertion::from_formula("test", &Formula::Bool(true)));
         assert_eq!(session.stats().common_assertions, 1);
 
-        session.add_common_assertion(CommonAssertion::from_commands(
-            "test2",
-            vec!["(assert false)".to_string()],
-        ));
+        session.add_common_assertion(CommonAssertion::from_formula("test2", &Formula::Bool(false)));
         assert_eq!(session.stats().common_assertions, 2);
     }
 
     #[test]
     fn test_add_common_formulas() {
-        let mut session = IncrementalAYSession::new();
+        let mut session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let formulas = vec![
             (
                 "x_bound".to_string(),
@@ -3471,7 +4612,7 @@ mod tests {
 
     #[test]
     fn test_extract_common_declarations_shared_vars() {
-        let mut session = IncrementalAYSession::new();
+        let mut session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
 
         let vcs = vec![
             make_vc(Formula::Gt(Box::new(int_var("x")), Box::new(Formula::Int(0)))),
@@ -3493,7 +4634,7 @@ mod tests {
 
     #[test]
     fn test_extract_common_declarations_no_shared() {
-        let mut session = IncrementalAYSession::new();
+        let mut session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
 
         let vcs = vec![
             make_vc(Formula::Gt(Box::new(int_var("a")), Box::new(Formula::Int(0)))),
@@ -3720,26 +4861,26 @@ mod tests {
 
     #[test]
     fn test_backend_name() {
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         assert_eq!(session.name(), "ay-incremental");
     }
 
     #[test]
     fn test_backend_role() {
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         assert_eq!(session.role(), BackendRole::SmtSolver);
     }
 
     #[test]
     fn test_backend_can_handle_l0() {
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let vc = make_vc(Formula::Bool(false));
         assert!(session.can_handle(&vc));
     }
 
     #[test]
     fn test_backend_can_handle_l1() {
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let vc = VerificationCondition {
             kind: VcKind::Postcondition,
             function: "test".into(),
@@ -3753,7 +4894,7 @@ mod tests {
 
     #[test]
     fn test_backend_cannot_handle_l2() {
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let vc = VerificationCondition {
             kind: VcKind::Deadlock,
             function: "test".into(),
@@ -3838,7 +4979,7 @@ mod tests {
 
     #[test]
     fn test_verify_batch_empty() {
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let results = session.verify_batch(&[]);
         assert!(results.is_empty());
     }
@@ -3908,7 +5049,7 @@ mod tests {
 
     #[test]
     fn test_initial_stats() {
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let stats = session.stats();
         assert_eq!(stats.total_queries, 0);
         assert_eq!(stats.incremental_queries, 0);
@@ -3921,19 +5062,91 @@ mod tests {
     // -- Timeout enforcement test --
 
     #[test]
-    fn test_remaining_timeout_returns_minimum() {
+    fn persistent_deadline_uses_the_earlier_ambient_clock_without_renewal() {
         let start = Instant::now();
-        std::thread::sleep(Duration::from_millis(5));
-        let remaining = remaining_timeout(Duration::from_millis(1), start);
-        assert_eq!(remaining, Duration::from_millis(1));
+        let ambient = start + Duration::from_millis(100);
+        let _clock =
+            trust_types::verify_budget::VerifyBudgetGuard::install(Some(ambient), u64::MAX);
+        let deadline = SolverDeadline::after(Duration::from_secs(30));
+        assert_eq!(deadline.remaining_at(start), Some(Duration::from_millis(100)));
+        assert_eq!(deadline.remaining_at(ambient), Some(Duration::ZERO));
+        assert_eq!(deadline.remaining_at(ambient + Duration::from_secs(30)), Some(Duration::ZERO));
     }
 
     #[test]
-    fn test_remaining_timeout_normal() {
+    fn persistent_deadline_retains_nested_function_credit_once() {
+        let _outer = trust_types::verify_budget::VerifyBudgetGuard::install_function(
+            Some(Instant::now() + Duration::from_secs(3600)),
+            u64::MAX,
+        );
+        let deadline = SolverDeadline::after(Duration::from_secs(30));
+        let captured = deadline.captured.expect("bounded query");
+        {
+            let _nested = trust_types::verify_budget::VerifyBudgetGuard::install_function(
+                Some(Instant::now() + Duration::from_secs(3600)),
+                u64::MAX,
+            );
+        }
+        let credit = trust_types::verify_budget::clock_credit_since(deadline.credit);
+        assert_eq!(deadline.remaining_at(captured), Some(credit));
+        assert_eq!(deadline.remaining_at(captured), Some(credit), "reading cannot credit it twice");
+    }
+
+    #[test]
+    fn persistent_deadline_zero_is_unbounded_but_an_ambient_clock_still_applies() {
         let start = Instant::now();
-        let remaining = remaining_timeout(Duration::from_secs(10), start);
-        // Should be close to 10 seconds.
-        assert!(remaining.as_secs() >= 9);
+        let deadline = SolverDeadline::after(Duration::ZERO);
+        assert_eq!(deadline.remaining_at(start + Duration::from_secs(3600)), None);
+        let _clock = trust_types::verify_budget::VerifyBudgetGuard::install(Some(start), u64::MAX);
+        assert_eq!(deadline.remaining_at(start), Some(Duration::ZERO));
+        assert_eq!(SolverDeadline::after(Duration::ZERO).remaining_at(start), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn persistent_deadline_keeps_positive_submillisecond_io_allowances() {
+        let start = Instant::now();
+        let deadline = SolverDeadline::capture(Some(start + Duration::from_nanos(1)));
+        assert_eq!(deadline.remaining_at(start), Some(Duration::from_nanos(1)));
+        assert_eq!(deadline.remaining_at(start + Duration::from_nanos(1)), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn persistent_expired_deadline_refuses_spawn_before_touching_the_solver() {
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
+        let expired = SolverDeadline::capture(Some(Instant::now() - Duration::from_secs(1)));
+        let error = session.spawn_solver_until(expired).err().expect("expired spawn must fail");
+        assert!(error.contains("timeout"), "no attempt to spawn the nonexistent solver: {error}");
+    }
+
+    #[test]
+    fn persistent_expired_deadline_stops_every_reader_before_consuming_queued_data() {
+        let readers: [fn(&mut SolverProcess, SolverDeadline) -> Result<String, String>; 3] =
+            [read_response_line, read_model_response, read_statistics_response];
+        for read in readers {
+            let (tx, rx) = mpsc::channel();
+            tx.send(Ok("(queued-reply)\n".into())).expect("queue reply");
+            let mut proc = mock_proc(rx);
+            let expired = SolverDeadline::capture(Some(Instant::now() - Duration::from_secs(1)));
+            let error =
+                read(&mut proc, expired).expect_err("expired read cannot use a fresh timer");
+            assert!(error.contains("timeout"), "{error}");
+            assert_eq!(
+                proc.line_rx.try_recv().expect("reply was not consumed"),
+                Ok("(queued-reply)\n".into())
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_unbounded_reader_skips_comments_and_receives_the_verdict() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok("c banner\n".into())).expect("queue banner");
+        tx.send(Ok("sat\n".into())).expect("queue verdict");
+        let mut proc = mock_proc(rx);
+        assert_eq!(
+            read_response_line(&mut proc, SolverDeadline::after(Duration::ZERO)).unwrap(),
+            "sat\n"
+        );
     }
 
     #[cfg(unix)]
@@ -3957,7 +5170,7 @@ mod tests {
         };
         let command = "x".repeat(4 * 1024 * 1024);
         let start = Instant::now();
-        let deadline = start.checked_add(Duration::from_millis(50)).unwrap_or(start);
+        let deadline = SolverDeadline::capture(start.checked_add(Duration::from_millis(50)));
         let error = send_command_until(&mut proc, &command, deadline)
             .expect_err("a non-reading solver cannot block stdin forever");
         assert!(error.contains("deadline"), "bounded write diagnostic: {error}");
@@ -4042,7 +5255,8 @@ mod tests {
         };
 
         let start = Instant::now();
-        let result = read_response_line(&mut proc, Duration::from_millis(100));
+        let result =
+            read_response_line(&mut proc, SolverDeadline::after(Duration::from_millis(100)));
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "should timeout");
@@ -4071,7 +5285,7 @@ mod tests {
             _reservation: crate::coordinator::Reservation::inert(),
         };
 
-        let result = read_response_line(&mut proc, Duration::from_secs(1));
+        let result = read_response_line(&mut proc, SolverDeadline::after(Duration::from_secs(1)));
         assert!(result.is_ok());
         assert_eq!(result.unwrap().trim(), "success");
 
@@ -4089,7 +5303,7 @@ mod tests {
             );
         let mut proc = mock_proc(rx);
         let start = Instant::now();
-        let error = read_response_line(&mut proc, Duration::from_millis(25))
+        let error = read_response_line(&mut proc, SolverDeadline::after(Duration::from_millis(25)))
             .expect_err("continuously ready comments must still time out");
         assert!(error.contains("timeout"));
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -4158,7 +5372,7 @@ mod tests {
         }
 
         let mut proc = mock_proc(rx);
-        let result = read_model_response(&mut proc, Duration::from_secs(1));
+        let result = read_model_response(&mut proc, SolverDeadline::after(Duration::from_secs(1)));
         assert!(result.is_ok(), "should read balanced proof: {result:?}");
         let captured = result.unwrap();
         assert_eq!(captured, expected, "full proof S-expression must be intact");
@@ -4280,7 +5494,7 @@ mod tests {
 
     #[test]
     fn set_prefix_replaces_and_forces_reinitialization() {
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
 
         let prefix_a = vec![CommonAssertion::from_formula("pa", &le_var("a", 10))];
         let prefix_b = vec![CommonAssertion::from_formula("pb", &le_var("b", 20))];
@@ -4402,42 +5616,476 @@ mod tests {
         st.kill_process();
     }
 
+    /// THE DEFECT THIS PINS: a batch whose FIRST VC is propositional must not
+    /// head a logic too weak for a later member.
+    ///
+    /// The previous revision computed the session logic from `vcs[0]`'s formula
+    /// ALONE, so this batch — `true ∧ true` first, a floating-point obligation
+    /// second, a bitvector obligation third — opened its base scope with
+    /// `QF_UF`, and the float and bitvector queries were then asserted under a
+    /// logic naming neither theory. The emitted line must admit the UNION.
     #[test]
-    fn verify_batch_pins_session_logic_once_from_first_full_formula() {
+    fn verify_batch_logic_admits_the_union_not_just_the_first_vc() {
         let _memory_authority = unconfigured_memory_authority();
-        // Trust: batch mode must pin ONE session logic (from the first batched
-        // VC's FULL formula — what the per-VC path's single base init would
-        // auto-detect) and keep it across later batch calls, so base re-inits
-        // at group boundaries cannot flap the logic and flip verdicts.
         let session = IncrementalAYSession::with_solver_path("nonexistent_solver_xyz");
-        let first = vc_for("f1", Formula::And(vec![le_var("a", 10), le_var("a", 5)]));
-        let expected = smt2_export::detect_logic(&first.formula).to_string();
 
-        let _ = session.verify_batch(std::slice::from_ref(&first));
-        {
-            let st = session.state.lock().unwrap();
-            assert_eq!(st.batch_pinned_logic.as_deref(), Some(expected.as_str()));
-        }
-
-        // A later batch with a different-theory formula must NOT re-pin.
-        let bv = vc_for(
+        let propositional = vc_for("f0", Formula::Bool(true));
+        let floating = vc_for(
+            "f1",
+            Formula::FpIsNaN(Box::new(Formula::Var("g".into(), Sort::Float { eb: 11, sb: 53 }))),
+        );
+        let bitvector = vc_for(
             "f2",
             Formula::Not(Box::new(Formula::Eq(
                 Box::new(Formula::Var("x".into(), Sort::BitVec(64))),
                 Box::new(Formula::BitVec { value: 3, width: 64 }),
             ))),
         );
-        let _ = session.verify_batch(std::slice::from_ref(&bv));
+
+        // What the OLD rule would have pinned, for contrast.
+        assert_eq!(smt2_export::detect_logic(&propositional.formula), "QF_UF");
+
+        let batch = vec![propositional.clone(), floating.clone(), bitvector.clone()];
+        let _ = session.verify_batch(&batch);
+
+        let union =
+            Theories::union_all(batch.iter().map(|vc| smt2_export::formula_features(&vc.formula)));
+        {
+            let st = session.state.lock().unwrap();
+            assert_eq!(
+                st.session_theories, union,
+                "every batched VC's features must be folded into the session union, not \
+                 just the first VC's"
+            );
+            let emitted = session.base_logic_for(&st, &propositional);
+            let admits = trust_types::logic_lattice::logic_admits(&emitted)
+                .expect("the emitted name must be a row of the shared table");
+            for vc in &batch {
+                let needed = smt2_export::formula_features(&vc.formula);
+                assert!(
+                    needed.is_subset_of(admits),
+                    "the batch logic `{emitted}` (admitting {admits:?}) does not admit \
+                     {:?}, which `{}`'s query uses",
+                    needed,
+                    vc.function
+                );
+            }
+            // FP mixed with BV IS named by SMT-LIB — `QF_BVFP`, since the
+            // SMT-LIB name audit added the floating-point family — so this
+            // batch heads that combined fragment. It used to be `ALL` for want
+            // of a row; either way the point of this test is that it is not
+            // `QF_UF`, the name `vcs[0]` alone would have selected.
+            assert_eq!(emitted, "QF_BVFP");
+        }
+
+        // A later batch WIDENS the union rather than being ignored by a pin:
+        // the previous revision kept `QF_UF` here forever.
+        let quantified = vc_for(
+            "f3",
+            Formula::Forall(
+                vec![("k".into(), Sort::Int)],
+                Box::new(Formula::Ge(
+                    Box::new(Formula::Var("k".into(), Sort::Int)),
+                    Box::new(Formula::Int(0)),
+                )),
+            ),
+        );
+        let _ = session.verify_batch(std::slice::from_ref(&quantified));
         let st = session.state.lock().unwrap();
-        assert_eq!(
-            st.batch_pinned_logic.as_deref(),
-            Some(expected.as_str()),
-            "the session logic is pinned once, like the per-VC path's"
+        assert!(
+            st.session_theories.contains(Theories::QUANTIFIERS)
+                && st.session_theories.contains(Theories::FLOATS)
+                && st.session_theories.contains(Theories::BITVECTORS),
+            "the session union only ever grows: {:?}",
+            st.session_theories
         );
     }
 
+    /// A propositional-first batch that stays inside ONE precise name: the
+    /// union is `{Quantifiers, Ints}`, so the emitted logic is `LIA` — not
+    /// `QF_UF` (too weak for the quantified member, which is the defect) and
+    /// not `ALL` (which would prove nothing about the union being taken).
+    #[test]
+    fn verify_batch_logic_is_the_precise_name_for_the_union() {
+        let _memory_authority = unconfigured_memory_authority();
+        let session = IncrementalAYSession::with_solver_path("nonexistent_solver_xyz");
+
+        let propositional = vc_for("g0", Formula::Bool(true));
+        let quantified = vc_for(
+            "g1",
+            Formula::Forall(
+                vec![("k".into(), Sort::Int)],
+                Box::new(Formula::Ge(
+                    Box::new(Formula::Var("k".into(), Sort::Int)),
+                    Box::new(Formula::Int(0)),
+                )),
+            ),
+        );
+
+        let batch = vec![propositional.clone(), quantified];
+        let _ = session.verify_batch(&batch);
+
+        let st = session.state.lock().unwrap();
+        assert_eq!(
+            session.base_logic_for(&st, &propositional),
+            "LIA",
+            "the batch logic comes from the union of every member's features"
+        );
+    }
+
+    /// The GROUP logic is the union of the group's members, selected ONCE —
+    /// and it must not be the per-member selection of whichever VC comes first.
+    #[test]
+    fn detect_group_logic_selects_once_from_the_union() {
+        let arrays = vc_for(
+            "h0",
+            Formula::Select(
+                Box::new(Formula::Var(
+                    "arr".into(),
+                    Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int)),
+                )),
+                Box::new(Formula::Var("i".into(), Sort::Int)),
+            ),
+        );
+        let quantified = vc_for(
+            "h1",
+            Formula::Forall(
+                vec![("k".into(), Sort::Int)],
+                Box::new(Formula::Ge(
+                    Box::new(Formula::Var("k".into(), Sort::Int)),
+                    Box::new(Formula::Int(0)),
+                )),
+            ),
+        );
+
+        // Each alone.
+        assert_eq!(detect_group_logic(std::slice::from_ref(&arrays)), "QF_ALIA");
+        assert_eq!(detect_group_logic(std::slice::from_ref(&quantified)), "LIA");
+        // Together: `{Arrays, Quantifiers, Ints}` — neither member's own name
+        // admits the other's features, and the union names both.
+        let group = vec![arrays, quantified];
+        assert_eq!(detect_group_logic(&group), "ALIA");
+        // An empty group still answers a real name.
+        assert_eq!(detect_group_logic(&[]), "QF_UF");
+    }
+
+    /// Trust: the PER-VC path's session logic is widened, not fixed by the
+    /// first query.
+    ///
+    /// `ensure_base_initialized` folds each arriving VC into the session union
+    /// and re-selects; when the name changes, the live process is killed so the
+    /// new `(set-logic …)` can go out at the base scope of a fresh one. Before
+    /// this, a session that opened on an `Int` obligation asserted every later
+    /// bitvector query under `QF_LIA`.
+    #[test]
+    fn per_vc_session_logic_widens_when_a_later_query_needs_more() {
+        let session = IncrementalAYSession::with_solver_path("nonexistent_solver_xyz");
+        let ints = vc_for("p0", le_var("a", 10));
+        let bv = vc_for(
+            "p1",
+            Formula::Not(Box::new(Formula::Eq(
+                Box::new(Formula::Var("x".into(), Sort::BitVec(64))),
+                Box::new(Formula::BitVec { value: 3, width: 64 }),
+            ))),
+        );
+
+        let mut st = session.state.lock().unwrap();
+
+        // First query: the union is `{Ints}`.
+        st.session_theories.insert(smt2_export::formula_features(&ints.formula));
+        assert_eq!(session.base_logic_for(&st, &ints), "QF_LIA");
+        // Pretend the base went out under that name.
+        st.base_initialized = true;
+        st.base_logic = Some("QF_LIA".to_string());
+
+        // Second query: the union becomes `{Ints, BitVectors, WideArith}`,
+        // which `QF_LIA` does not admit, so the name changes and the live base
+        // must be torn down rather than reused. Since Lever C was split on
+        // measurement (2026-09-18) the widened name is `QF_UFBVLIA` rather
+        // than `ALL` — the narrowest name ay's in-process lane accepts for
+        // that mix. What this test is about is the WIDENING and the teardown,
+        // which is unchanged.
+        st.session_theories.insert(smt2_export::formula_features(&bv.formula));
+        let widened = session.base_logic_for(&st, &bv);
+        assert_eq!(widened, "QF_UFBVLIA");
+        assert_ne!(
+            st.base_logic.as_deref(),
+            Some(widened.as_str()),
+            "the live base carries a logic the widened union no longer selects"
+        );
+        let admits = trust_types::logic_lattice::logic_admits(&widened)
+            .expect("the emitted name must be a row of the shared table");
+        assert!(smt2_export::formula_features(&ints.formula).is_subset_of(admits));
+        assert!(smt2_export::formula_features(&bv.formula).is_subset_of(admits));
+    }
+
+    /// An explicit session logic configured by the caller is honoured when it
+    /// ADMITS the session's record, and WIDENED when it does not.
+    ///
+    /// `with_logic` is publicly reachable, so it is the one path by which a
+    /// base scope could be opened under a name narrower than the content sent
+    /// into it — the defect class the logic lattice closes, one layer up. The
+    /// correction only ever widens: the emitted name admits the override AND
+    /// the session.
+    #[test]
+    fn an_explicit_session_logic_is_honoured_when_admitting_and_widened_otherwise() {
+        use trust_types::logic_lattice::logic_admits;
+
+        let ints = vc_for("q0", le_var("a", 10));
+        let features = smt2_export::formula_features(&ints.formula);
+
+        // ADMITTING: `QF_LIA` admits `{Ints}`, so the caller's name stands.
+        let honoured =
+            IncrementalAYSession::with_solver_path("nonexistent_solver_xyz").with_logic("QF_LIA");
+        {
+            let mut st = honoured.state.lock().unwrap();
+            st.session_theories.insert(features);
+            assert_eq!(honoured.base_logic_for(&st, &ints), "QF_LIA");
+        }
+
+        // NOT ADMITTING: `QF_BV` does not admit `{Ints}`. The emitted name must
+        // admit BOTH the override's own theories and the session's — never the
+        // narrower `QF_BV`, which would head an `Int` declaration with a
+        // bitvector-only logic.
+        let widened =
+            IncrementalAYSession::with_solver_path("nonexistent_solver_xyz").with_logic("QF_BV");
+        {
+            let mut st = widened.state.lock().unwrap();
+            st.session_theories.insert(features);
+            let emitted = widened.base_logic_for(&st, &ints);
+            assert_ne!(emitted, "QF_BV", "a narrower-than-the-content override must be widened");
+            let admits =
+                logic_admits(&emitted).expect("the emitted name must be a row of the shared table");
+            assert!(features.is_subset_of(admits), "`{emitted}` must admit the session's record");
+            let override_admits =
+                logic_admits("QF_BV").expect("`QF_BV` is a row of the shared table");
+            assert!(
+                override_admits.is_subset_of(admits),
+                "`{emitted}` must also admit everything the caller asked for — the correction \
+                 WIDENS, it does not discard the override"
+            );
+        }
+
+        // A UF-bearing VC under a UF-free override is the item-2 shape, and it
+        // is closed the same way.
+        let uf_vc = vc_for(
+            "q1",
+            Formula::Gt(
+                Box::new(Formula::FnApp {
+                    func: "f".to_string(),
+                    args: vec![Formula::Var("a".to_string(), Sort::Int)],
+                    sort: Sort::Int,
+                }),
+                Box::new(Formula::Int(0)),
+            ),
+        );
+        let uf_session =
+            IncrementalAYSession::with_solver_path("nonexistent_solver_xyz").with_logic("QF_LIA");
+        {
+            let mut st = uf_session.state.lock().unwrap();
+            st.session_theories.insert(smt2_export::formula_features(&uf_vc.formula));
+            let emitted = uf_session.base_logic_for(&st, &uf_vc);
+            let admits =
+                logic_admits(&emitted).expect("the emitted name must be a row of the shared table");
+            assert!(
+                admits.contains(Theories::UF),
+                "`{emitted}` heads a VC applying an uninterpreted function, so it must admit UF"
+            );
+        }
+
+        // An override the table does not know is credited with CORE ONLY, so
+        // over a session that requires anything at all it is widened to the
+        // name the session's own record selects. See
+        // `an_unrecognized_explicit_logic_is_credited_with_core_only`.
+        let unknown = IncrementalAYSession::with_solver_path("nonexistent_solver_xyz")
+            .with_logic("QF_NOT_A_LOGIC");
+        {
+            let mut st = unknown.state.lock().unwrap();
+            st.session_theories.insert(features);
+            assert_eq!(unknown.base_logic_for(&st, &ints), "QF_LIA");
+        }
+    }
+
+    /// THE CONTRACT FOR AN EXPLICIT LOGIC NAME THE SHARED TABLE DOES NOT KNOW,
+    /// pinned as behaviour. The residual this closes: `base_logic_for` used to
+    /// answer `None => explicit.clone()`, emitting an unrecognized override
+    /// UNWIDENED whatever the session had asserted.
+    ///
+    /// WHY THAT WAS A DEFECT. `logic_admits` returning `None` means the TABLE
+    /// cannot check the name, not that the name is unreal: the lattice's own
+    /// rejection list names two dozen genuine SMT-LIB logics it declines to
+    /// carry (`QF_UFBVLIA`, `QF_IDL`, the whole `*DT*` family …). So a caller
+    /// could configure a real SMT-LIB name that admits LESS than the session
+    /// asserts and get it emitted verbatim — a `(set-logic …)` line narrower
+    /// than its own transcript, which is the defect class the lattice exists to
+    /// close, one layer up. The downstream backstop the old comment appealed to
+    /// does not cover this lane: `smt2_self_consistency_tests` reads EXPORTED
+    /// transcripts, and `ay` does not answer `(set-logic …)`.
+    ///
+    /// WHAT REPLACED IT, and the two halves this test pins:
+    ///
+    /// 1. An unknown name is credited with `Theories::NONE` — Core, which every
+    ///    SMT-LIB logic includes, so this is a theorem about the name space and
+    ///    not a guess about the name. Over a session requiring only Core the
+    ///    override is therefore emitted EXACTLY: the caller's spelling survives
+    ///    wherever it is provably safe.
+    /// 2. Over a session requiring anything more, the emitted name is the one
+    ///    the session's record selects — proved to admit the content. The
+    ///    caller's spelling is lost, and `logic_override_widened` says so.
+    ///
+    /// NOTHING IS REFUSED. An unknown name is ignorance, not a proven defect,
+    /// and a gate may decline only on the latter; every session here runs. The
+    /// price is precision, and the way to buy it back is to add the name to the
+    /// table with its SMT-LIB citation.
+    #[test]
+    fn an_unrecognized_explicit_logic_is_credited_with_core_only() {
+        use trust_types::logic_lattice::logic_admits;
+
+        let unknown_name = "QF_NOT_A_LOGIC";
+        assert_eq!(
+            logic_admits(unknown_name),
+            None,
+            "this test is only meaningful while the name has no row"
+        );
+
+        // (1) A CORE-ONLY SESSION KEEPS THE CALLER'S SPELLING. `p ∧ ¬p` needs
+        // no theory at all, and every SMT-LIB logic admits a Core transcript,
+        // so there is nothing the override could be too narrow for.
+        let core_vc = vc_for(
+            "c0",
+            Formula::And(vec![
+                Formula::Var("p".to_string(), Sort::Bool),
+                Formula::Not(Box::new(Formula::Var("p".to_string(), Sort::Bool))),
+            ]),
+        );
+        let core_features = smt2_export::formula_features(&core_vc.formula);
+        assert_eq!(core_features, Theories::NONE, "the fixture must require only Core");
+        let core_session = IncrementalAYSession::with_solver_path("nonexistent_solver_xyz")
+            .with_logic(unknown_name);
+        {
+            let mut st = core_session.state.lock().unwrap();
+            st.session_theories.insert(core_features);
+            assert_eq!(
+                core_session.base_logic_for(&st, &core_vc),
+                unknown_name,
+                "an unknown override provably admits a Core-only session, so it stands"
+            );
+        }
+
+        // (2) ANY REAL REQUIREMENT WIDENS IT to a name the table can prove
+        // admits the content — never to the unchecked spelling. Three shapes,
+        // one per theory dimension a caller might plausibly mis-head.
+        let uf_vc = vc_for(
+            "c1",
+            Formula::Gt(
+                Box::new(Formula::FnApp {
+                    func: "f".to_string(),
+                    args: vec![Formula::Var("a".to_string(), Sort::Int)],
+                    sort: Sort::Int,
+                }),
+                Box::new(Formula::Int(0)),
+            ),
+        );
+        let bv_vc = vc_for(
+            "c2",
+            Formula::Not(Box::new(Formula::Eq(
+                Box::new(Formula::Var("x".into(), Sort::BitVec(64))),
+                Box::new(Formula::BitVec { value: 3, width: 64 }),
+            ))),
+        );
+        for (label, vc, expected) in [
+            ("integers", vc_for("c3", le_var("a", 10)), "QF_LIA"),
+            ("applied UF", uf_vc, "QF_UFLIA"),
+            ("bitvectors", bv_vc, "QF_BV"),
+        ] {
+            let session = IncrementalAYSession::with_solver_path("nonexistent_solver_xyz")
+                .with_logic(unknown_name);
+            let mut st = session.state.lock().unwrap();
+            let features = smt2_export::formula_features(&vc.formula);
+            st.session_theories.insert(features);
+            let emitted = session.base_logic_for(&st, &vc);
+            assert_ne!(
+                emitted, unknown_name,
+                "[{label}] a session requiring more than Core must not be headed by a name the \
+                 table cannot check"
+            );
+            assert_eq!(emitted, expected, "[{label}] the session's own record decides");
+            let admits =
+                logic_admits(&emitted).expect("the emitted name must be a row of the shared table");
+            assert!(
+                features.is_subset_of(admits),
+                "[{label}] `{emitted}` must be PROVED to admit the session's record"
+            );
+        }
+    }
+
+    /// THE SUBSTITUTION IS NOT SILENT. Whenever the emitted `(set-logic …)`
+    /// name differs from the one `with_logic` configured — for a recognized
+    /// override that does not admit the record, and for an unrecognized one
+    /// over a non-Core session alike — `send_base_assertions` sets
+    /// `logic_override_widened`, so a caller reading `stats()` can tell that
+    /// the header it asked for is not the header that went out.
+    ///
+    /// This is checked at the seam `send_base_assertions` uses, rather than by
+    /// spawning a solver, because the flag is a property of the name
+    /// comparison and not of the process.
+    #[test]
+    fn a_widened_logic_override_is_reported_in_the_session_stats() {
+        let ints = vc_for("w0", le_var("a", 10));
+        let features = smt2_export::formula_features(&ints.formula);
+
+        // Honoured: the configured name IS the emitted name, so nothing is
+        // reported.
+        let honoured =
+            IncrementalAYSession::with_solver_path("nonexistent_solver_xyz").with_logic("QF_LIA");
+        {
+            let mut st = honoured.state.lock().unwrap();
+            st.session_theories.insert(features);
+            let emitted = honoured.base_logic_for(&st, &ints);
+            assert_eq!(honoured.logic.as_deref(), Some(emitted.as_str()));
+        }
+        assert!(
+            !honoured.stats().logic_override_widened,
+            "an override that stands must not be reported as widened"
+        );
+
+        // Widened, both ways: a known-but-too-narrow override and an unknown
+        // one. Neither emitted name equals the configured one, which is exactly
+        // the condition `send_base_assertions` files the flag on.
+        for configured in ["QF_BV", "QF_NOT_A_LOGIC"] {
+            let session = IncrementalAYSession::with_solver_path("nonexistent_solver_xyz")
+                .with_logic(configured);
+            let mut st = session.state.lock().unwrap();
+            st.session_theories.insert(features);
+            let emitted = session.base_logic_for(&st, &ints);
+            assert_ne!(emitted, configured, "`{configured}` must not survive this session");
+            // The exact predicate `send_base_assertions` applies.
+            assert!(session.logic.as_deref().is_some_and(|c| c != emitted));
+        }
+    }
+
+    /// A NONLINEAR VC heads the nonlinear logic on the session lane too — the
+    /// group/session selector reads the same shared record, so the linearity
+    /// bit arrives here with no edit to this file's selection code.
+    #[test]
+    fn a_nonlinear_session_vc_heads_a_nonlinear_logic() {
+        let product = Formula::Gt(
+            Box::new(Formula::Mul(
+                Box::new(Formula::Var("x".to_string(), Sort::Int)),
+                Box::new(Formula::Var("y".to_string(), Sort::Int)),
+            )),
+            Box::new(Formula::Int(0)),
+        );
+        let vc = vc_for("q0", product);
+        let session = IncrementalAYSession::with_solver_path("nonexistent_solver_xyz");
+        let mut st = session.state.lock().unwrap();
+        st.session_theories.insert(smt2_export::formula_features(&vc.formula));
+        assert_eq!(session.base_logic_for(&st, &vc), "QF_NIA");
+    }
+
     /// Trust: S2 stage (C) end-to-end engagement + isolation regression against
-    /// the REAL `ay` solver (skips when `ay` is not spawnable).
+    /// the REAL `ay` solver, resolved as every real-solver test resolves it
+    /// (`ay_discovery::detect_test_ay`; with none this FAILS, NOT RUN).
     ///
     /// - Group `fa` (M=2, shared conjunct `x <= 2`) exercises the HOIST path:
     ///   `fa1`'s bare obligation (`x > 9`) is SAT on its own, so its `Proved`
@@ -4452,17 +6100,11 @@ mod tests {
     #[test]
     fn batch_hoist_verdicts_match_per_vc_and_never_leak_prefix_with_real_ay() {
         let _memory_authority = unconfigured_memory_authority();
-        if std::process::Command::new("ay")
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
-            eprintln!("skipping: `ay` not spawnable on PATH");
-            return;
-        }
+        let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ay = crate::ay_discovery::detect_test_ay(&checkout)
+            .unwrap_or_else(|not_run| panic!("{not_run}"))
+            .path;
+        let ay = ay.to_str().expect("utf-8 solver path");
 
         let gt_var =
             |name: &str, k: i128| Formula::Gt(Box::new(int_var(name)), Box::new(Formula::Int(k)));
@@ -4472,11 +6114,11 @@ mod tests {
         let fb2 = vc_for("fb", Formula::And(vec![gt_var("x", 49), le_var("x", 55)]));
         let vcs = vec![fa1, fa2, fb1, fb2];
 
-        let batch_session = IncrementalAYSession::new();
+        let batch_session = IncrementalAYSession::with_solver_path(ay);
         let batched = batch_session.verify_batch(&vcs);
         assert_eq!(batched.len(), 4);
 
-        let pervc_session = IncrementalAYSession::new();
+        let pervc_session = IncrementalAYSession::with_solver_path(ay);
         let per_vc: Vec<VerificationResult> =
             vcs.iter().map(|vc| pervc_session.verify_vc(vc)).collect();
 
@@ -4557,7 +6199,7 @@ mod tests {
     /// re-declare a datatype the base-scope prefix already declared.
     #[test]
     fn push_scope_skips_a_datatype_the_base_prefix_declared() {
-        let session = IncrementalAYSession::new();
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         // Two obligations of one function sharing the datatype-bearing conjunct.
         let shared = expr_eq("e", "f");
         let vcs = vec![
@@ -4613,6 +6255,54 @@ mod tests {
         );
     }
 
+    /// Execute a freshly written stand-in solver ONCE, with an empty stdin and
+    /// outside any session, before a test hands its path to one.
+    ///
+    /// macOS assesses a file the first time it is executed (the fixture carries
+    /// `com.apple.provenance`), and it assesses first executions ONE AT A TIME,
+    /// machine-wide. Measured 2026-10-01 on 14 cores: a fresh four-line script
+    /// took 343-1028 ms to start and 4-7 ms the second time (15 runs each);
+    /// eight fresh copies of the 490 MB `trust-router` lib test binary were
+    /// assessed serially, finishing at 6.3, 12.5, ... 49.3 s, and a fresh script
+    /// started 0.2 s in waited 49.4 s behind them. A push lane starts freshly
+    /// linked test binaries side by side, so that queue is real there.
+    ///
+    /// Without this run, the session's FIRST spawn waits in that queue inside
+    /// its query's 30 s wall backstop. When the wait passes it, the first
+    /// obligation ends `Timeout` (restarts = 1) before the shell has read its
+    /// `(push 1)`, the second runs on the respawned process, and
+    /// `batch_lane_sends_a_datatype_declaration_exactly_once` reports one push
+    /// for two obligations: the lane failure, reproduced by queueing seven fresh
+    /// copies of that binary first. [`TheoryMixSolver`]'s sessions run under a
+    /// 10 s backstop, and `component_lane_is_refused_under_common_assertions`
+    /// failed behind the same queue. Paying the assessment here keeps it out of
+    /// the session deadlines these fixtures' tests assert about, and the empty
+    /// stdin ends the read loop before it can log a line. Each of the seven
+    /// tests that builds one of these fixtures builds it BEFORE taking
+    /// `ENV_TEST_LOCK` (through `unconfigured_memory_authority`), so a queued
+    /// warm-up does not hold the crate's environment lock. The same warm-up
+    /// covers every script trust-wp's `cli.rs` tests write, the `trustd` build
+    /// output and packaged copies in `tests/trustd_process.rs`, and
+    /// trust-proof-cert's success-path checker fixture. Not covered yet (known
+    /// exposures to the same first-run stall): trust-cg-bridge's
+    /// `t216_cg_home_coherence` probe executable, timed by `run_bounded`'s 60 s
+    /// deadline, and trust-proof-cert's 50 ms timeout test, whose timed run of a
+    /// fresh script never reaches the checker on macOS.
+    #[cfg(unix)]
+    fn run_fresh_stand_in_once(script: &std::path::Path, log: &std::path::Path) {
+        let status = Command::new(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run the fresh stand-in solver once before any session spawns it");
+        assert!(status.success(), "the stand-in's warm-up run failed: {status:?}");
+        assert!(
+            !log.exists(),
+            "the warm-up run must log no command, or the session's stream is not alone in it"
+        );
+    }
+
     /// A stand-in solver that RECORDS every command it is sent and answers
     /// `(check-sat)` with `unknown` (the branch that pops and returns without a
     /// model or a proof), so a test can assert on the exact command stream the
@@ -4627,6 +6317,12 @@ mod tests {
     #[cfg(unix)]
     impl RecordingSolver {
         fn new(label: &str) -> Self {
+            Self::with_conflicts(label, 0)
+        }
+
+        /// The stand-in, reporting `conflicts` as the `:conflicts` of every
+        /// solve's statistics block.
+        fn with_conflicts(label: &str, conflicts: u64) -> Self {
             use std::os::unix::fs::PermissionsExt as _;
 
             let nonce = std::time::SystemTime::now()
@@ -4647,6 +6343,7 @@ mod tests {
                      while IFS= read -r line; do\n\
                      \x20 printf '%s\\n' \"$line\" >> '{}'\n\
                      \x20 if [ \"$line\" = '(check-sat)' ]; then printf 'unknown\\n'; fi\n\
+                     \x20 if [ \"$line\" = '(get-info :all-statistics)' ]; then printf '(:conflicts {conflicts}\\n :unknown.reason \"incomplete\")\\n'; fi\n\
                      done\n",
                     log.display()
                 ),
@@ -4654,6 +6351,7 @@ mod tests {
             .expect("write recording solver");
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
                 .expect("make recording solver executable");
+            run_fresh_stand_in_once(&script, &log);
             Self { directory, script, log }
         }
 
@@ -4676,6 +6374,24 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn persistent_zero_timeout_reaches_the_recording_solver_without_an_ambient_deadline() {
+        let fixture = RecordingSolver::new("zero-timeout");
+        let _memory_authority = unconfigured_memory_authority();
+        let session = IncrementalAYSession::with_solver_path(
+            fixture.script.to_str().expect("utf-8 fixture path"),
+        )
+        .with_timeout(0);
+        let vc = make_vc(Formula::Gt(Box::new(int_var("unbounded_x")), Box::new(Formula::Int(0))));
+        let mut state = session.state.lock().unwrap_or_else(|error| error.into_inner());
+        let result =
+            session.verify_incremental(&mut state, &vc).expect("unbounded persistent query");
+        assert!(matches!(result, VerificationResult::Unknown { .. }), "{result:?}");
+        assert!(fixture.commands().iter().any(|command| command == "(check-sat)"));
+        assert!(state.process.is_some(), "the statistics account and pop completed");
+    }
+
     /// REGRESSION, end to end: drive two datatype-bearing obligations of one
     /// function through `verify_batch` against a recording solver and assert the
     /// datatype reaches the solver exactly ONCE — at the base scope, before the
@@ -4683,8 +6399,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn batch_lane_sends_a_datatype_declaration_exactly_once() {
-        let _memory_authority = unconfigured_memory_authority();
         let fixture = RecordingSolver::new("datatype-once");
+        let _memory_authority = unconfigured_memory_authority();
         let session = IncrementalAYSession::with_solver_path(
             fixture.script.to_str().expect("utf-8 fixture path"),
         );
@@ -4699,7 +6415,15 @@ mod tests {
 
         let commands = fixture.commands();
         let pushes = commands.iter().filter(|c| c.trim() == "(push 1)").count();
-        assert_eq!(pushes, 2, "both obligations ran as push/pop scopes: {commands:?}");
+        // The verdicts and stats name a session fault (a wall-backstop
+        // `Timeout`, a restart) that the command stream alone cannot.
+        let verdicts: Vec<&VerificationResult> = results.iter().map(|(_, result)| result).collect();
+        assert_eq!(
+            pushes,
+            2,
+            "both obligations ran as push/pop scopes: {commands:?}\nverdicts: {verdicts:?}\n{:?}",
+            session.stats()
+        );
         assert_eq!(
             commands.iter().filter(|c| c.starts_with("(declare-datatype Expr ")).count(),
             1,
@@ -4723,11 +6447,153 @@ mod tests {
         assert_eq!(stats.fallback_queries, 0, "no per-process fallback: {commands:?}");
     }
 
+    /// Plan §3.2a/§3.7, end to end against a recording stand-in: the query's
+    /// own effort count — `k` times the size of every assertion in scope —
+    /// reaches the solver right before its check-sat, an `unknown` is followed
+    /// by the statistics request, and the stop cause the solver states is the
+    /// one the row carries.
+    #[cfg(unix)]
+    #[test]
+    fn the_session_sends_the_effort_count_and_asks_why_an_unknown_stopped() {
+        let fixture = RecordingSolver::new("effort-and-why");
+        let _memory_authority = unconfigured_memory_authority();
+        let scale = EffortScale { conflicts_per_node: 43 };
+        let session = IncrementalAYSession::with_solver_path(
+            fixture.script.to_str().expect("utf-8 fixture path"),
+        )
+        .with_effort_scale(scale);
+        assert_eq!(session.effort_scale(), scale);
+
+        let formula = Formula::Lt(Box::new(int_var("x")), Box::new(Formula::Int(10)));
+        let result = session.verify_vc(&make_vc(formula.clone()));
+        assert_eq!(
+            StopCause::of_result(&result),
+            StopCause::SolverIncomplete,
+            "the stand-in answers `:unknown.reason \"incomplete\"`: {result:?}"
+        );
+
+        let commands = fixture.commands();
+        let expected = format!(
+            "(set-option :rlimit {})",
+            43 * trust_types::determinism::query_size(&[&formula])
+        );
+        let rlimit = commands
+            .iter()
+            .position(|c| *c == expected)
+            .unwrap_or_else(|| panic!("`{expected}` never sent: {commands:?}"));
+        let push = commands.iter().position(|c| c == "(push 1)").expect("a push scope ran");
+        let check = commands.iter().position(|c| c == "(check-sat)").expect("a solve ran");
+        let why = commands
+            .iter()
+            .position(|c| c == "(get-info :all-statistics)")
+            .unwrap_or_else(|| panic!("the unknown was never explained: {commands:?}"));
+        // (The trailing `(pop 1)` is not asserted: the stand-in logs each line
+        // as it reads it, and the session returns before it reads the last.)
+        assert!(push < rlimit && rlimit + 1 == check && check < why, "{commands:?}");
+        assert!(!commands.iter().any(|c| c.contains(":timeout")), "no ay wall clock: {commands:?}");
+        let stats = session.stats();
+        assert_eq!((stats.restarts, stats.fallback_queries), (0, 0), "{commands:?}");
+    }
+
+    /// Plan §3.2a: `:rlimit` is sent before EVERY check-sat, each query's own
+    /// value, sized over every assertion in scope — here a common assertion at
+    /// the base scope as well as the VC — never once per process.
+    #[cfg(unix)]
+    #[test]
+    fn every_check_sat_carries_its_own_query_count() {
+        let fixture = RecordingSolver::new("effort-per-check-sat");
+        let _memory_authority = unconfigured_memory_authority();
+        let scale = EffortScale { conflicts_per_node: 5 };
+        let base = Formula::Ge(Box::new(int_var("x")), Box::new(Formula::Int(0)));
+        let mut session = IncrementalAYSession::with_solver_path(
+            fixture.script.to_str().expect("utf-8 fixture path"),
+        )
+        .with_effort_scale(scale);
+        session.add_common_formulas(&[("base".to_string(), base.clone())]);
+        let small = Formula::Lt(Box::new(int_var("x")), Box::new(Formula::Int(10)));
+        let large = Formula::And(vec![
+            Formula::Lt(Box::new(int_var("x")), Box::new(Formula::Int(10))),
+            Formula::Gt(Box::new(int_var("x")), Box::new(Formula::Int(3))),
+        ]);
+        for formula in [&small, &large] {
+            session.verify_vc(&make_vc(formula.clone()));
+        }
+
+        let commands = fixture.commands();
+        let rlimits: Vec<&String> = commands.iter().filter(|c| c.contains(":rlimit")).collect();
+        let checks = commands.iter().filter(|c| *c == "(check-sat)").count();
+        assert_eq!(rlimits.len(), checks, "one count per check-sat: {commands:?}");
+        let expected: Vec<String> = [&small, &large]
+            .into_iter()
+            .map(|formula| {
+                let vc_asserted = conjoin_formulas(flatten_conjuncts(formula));
+                let size = trust_types::determinism::query_size(&[&base, &vc_asserted]);
+                format!("(set-option :rlimit {})", 5 * size)
+            })
+            .collect();
+        assert_ne!(expected[0], expected[1], "two sizes, two counts");
+        assert_eq!(rlimits, expected.iter().collect::<Vec<_>>(), "{commands:?}");
+    }
+
+    #[test]
+    fn a_timeout_is_not_a_process_failure_and_each_function_starts_afresh() {
+        let session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
+        let mut st = session.state.lock().expect("invariant: mutex not poisoned");
+        st.enter_function("crate::f".into());
+        for _ in 0..(2 * MAX_CONSECUTIVE_FAILURES) {
+            st.record_fault(true);
+        }
+        assert!(!st.fallen_back, "wall-clock timeouts never switch the dispatch mode");
+        assert_eq!(st.consecutive_failures, 0);
+        assert_eq!(st.stats.restarts, u64::from(2 * MAX_CONSECUTIVE_FAILURES));
+
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            st.record_fault(false);
+        }
+        assert!(st.fallen_back, "{MAX_CONSECUTIVE_FAILURES} process failures fall back");
+        assert!(st.stats.permanently_fallen_back);
+
+        st.enter_function("crate::f".into());
+        assert!(st.fallen_back, "the same function keeps its fallback");
+        st.enter_function("crate::g".into());
+        assert!(!st.fallen_back, "another function is dispatched on its own history");
+        assert_eq!(st.consecutive_failures, 0);
+        assert!(st.stats.permanently_fallen_back, "the stat records that a fallback happened");
+    }
+
+    #[test]
+    fn the_statistics_scanner_ignores_parentheses_inside_strings() {
+        let mut scanner = SexprScanner::default();
+        assert!(!scanner.feed("(:conflicts 10000"));
+        assert!(!scanner.feed(" :unknown.detail \"budget (conflicts=1, decisions=2; x)\""));
+        assert!(!scanner.feed(" :unknown.note \"an unbalanced ( and a \"\"quote\"\" \""));
+        assert!(scanner.feed(" :unknown.reason \"resourceout\")"));
+
+        let mut single = SexprScanner::default();
+        assert!(single.feed("(:conflicts 3 :unknown.reason timeout)"));
+        let mut open_string = SexprScanner::default();
+        assert!(!open_string.feed("(:unknown.detail \"a ) inside\" )x \"never closed"));
+    }
+
+    #[test]
+    fn an_admission_refusal_is_stamped_and_still_recognised_by_its_prefix() {
+        let refused = StopCause::AdmissionRefused.unknown_result(
+            "ay-incremental",
+            0,
+            &format!("{PRE_SPAWN_ADMISSION_PREFIX} trustd declined the reservation"),
+        );
+        let VerificationResult::Unknown { reason, .. } = &refused else {
+            panic!("expected Unknown, got {refused:?}");
+        };
+        assert!(is_pre_spawn_admission_error(reason), "prefix consumers still see it: {reason}");
+        assert_eq!(StopCause::of_result(&refused), StopCause::AdmissionRefused);
+    }
+
     /// A promoted `(declare-fun e () Expr)` is malformed unless `Expr` is
     /// promoted with it, and ahead of it.
     #[test]
     fn extract_common_declarations_promotes_datatypes_before_their_users() {
-        let mut session = IncrementalAYSession::new();
+        let mut session = IncrementalAYSession::with_solver_path(UNSPAWNED_AY);
         let vcs = vec![make_vc(expr_eq("e", "a")), make_vc(expr_eq("e", "b"))];
 
         session.extract_common_declarations(&vcs);
@@ -4747,5 +6613,453 @@ mod tests {
             !commands.iter().any(|c| c.starts_with("(declare-fun a ")),
             "a variable in only ONE VC is not promoted: {commands:?}"
         );
+    }
+
+    // -- Disjoint-component refutation (external-process lane) --
+
+    /// A scripted `ay` stand-in with the measured behaviour of the real binary on
+    /// the UMUL-record query: a query that mixes `bvmul` with the nonlinear
+    /// integer `(* ..)` is answered `unknown` (the real `ay` says "unsupported
+    /// logic: ALL ... theory mix"), a pure bit-vector `bvmul` query is `sat` with
+    /// the `#xffffffff` model the real `ay` returns for the BV conjunct alone
+    /// (/tmp/diag-ay-sibling/q_bvonly.smt2), and anything else is `unknown`.
+    /// Every command is logged so a test can count the solves.
+    #[cfg(unix)]
+    struct TheoryMixSolver {
+        directory: std::path::PathBuf,
+        script: std::path::PathBuf,
+        log: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl TheoryMixSolver {
+        fn new(label: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let directory = std::env::temp_dir()
+                .join(format!("trust-theory-mix-solver-{label}-{}-{nonce:x}", std::process::id()));
+            std::fs::create_dir_all(&directory).expect("create theory-mix solver fixture");
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("make theory-mix solver fixture private");
+            let log = directory.join("commands.log");
+            let script = directory.join("solver.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n\
+                     asserts=''\n\
+                     last=''\n\
+                     while IFS= read -r line; do\n\
+                     \x20 printf '%s\\n' \"$line\" >> '{}'\n\
+                     \x20 case \"$line\" in\n\
+                     \x20   '(push 1)') asserts='' ;;\n\
+                     \x20   '(assert '*) asserts=\"$asserts $line\" ;;\n\
+                     \x20   '(check-sat)')\n\
+                     \x20     case \"$asserts\" in\n\
+                     \x20       *'(* '*) last=unknown ;;\n\
+                     \x20       *bvmul*) last=sat ;;\n\
+                     \x20       *) last=unknown ;;\n\
+                     \x20     esac\n\
+                     \x20     printf '%s\\n' \"$last\" ;;\n\
+                     \x20   '(get-info :all-statistics)')\n\
+                     \x20     printf '(:conflicts 0\\n :unknown.reason \"incomplete\")\\n' ;;\n\
+                     \x20   '(get-model)')\n\
+                     \x20     if [ \"$last\" = sat ]; then\n\
+                     \x20       printf '(\\n  (define-fun __trust_ovf_bv_lhs_a () (_ BitVec 32) #xffffffff)\\n  (define-fun __trust_ovf_bv_rhs_b () (_ BitVec 32) #xffffffff)\\n)\\n'\n\
+                     \x20     fi ;;\n\
+                     \x20   '(exit)') exit 0 ;;\n\
+                     \x20 esac\n\
+                     done\n",
+                    log.display()
+                ),
+            )
+            .expect("write theory-mix solver");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+                .expect("make theory-mix solver executable");
+            run_fresh_stand_in_once(&script, &log);
+            Self { directory, script, log }
+        }
+
+        fn session(&self) -> IncrementalAYSession {
+            IncrementalAYSession::with_solver_path(self.script.to_str().expect("utf-8 path"))
+                .with_timeout(STAND_IN_SOLVER_TIMEOUT_MS)
+        }
+
+        fn commands(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TheoryMixSolver {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.log);
+            let _ = std::fs::remove_file(&self.script);
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
+    fn bv32_var(name: &str) -> Formula {
+        Formula::Var(name.into(), Sort::BitVec(32))
+    }
+
+    /// The BV overflow half of the captured UMUL-record query: `lhs != 0` and
+    /// `(lhs * rhs) / lhs != rhs`, over the fresh `__trust_ovf_bv_*` variables.
+    fn umul_bv_violation() -> Vec<Formula> {
+        let lhs = bv32_var("__trust_ovf_bv_lhs_a");
+        let rhs = bv32_var("__trust_ovf_bv_rhs_b");
+        let product = Formula::BvMul(Box::new(lhs.clone()), Box::new(rhs.clone()), 32);
+        vec![
+            Formula::Not(Box::new(Formula::Eq(
+                Box::new(lhs.clone()),
+                Box::new(Formula::BitVec { value: 0, width: 32 }),
+            ))),
+            Formula::Not(Box::new(Formula::Eq(
+                Box::new(Formula::BvUDiv(Box::new(product), Box::new(lhs), 32)),
+                Box::new(rhs),
+            ))),
+        ]
+    }
+
+    /// The Int half: the `u32` range facts on `a`, `b` and the NIA out-of-range
+    /// core `a*b < 0 ∨ a*b > u32::MAX`.
+    fn umul_int_core() -> Vec<Formula> {
+        let bound = |v: &str| {
+            vec![
+                Formula::Le(Box::new(Formula::Int(0)), Box::new(int_var(v))),
+                Formula::Le(Box::new(int_var(v)), Box::new(Formula::Int(4_294_967_295))),
+            ]
+        };
+        let product = Formula::Mul(Box::new(int_var("a")), Box::new(int_var("b")));
+        let mut out = bound("a");
+        out.extend(bound("b"));
+        out.push(Formula::Or(vec![
+            Formula::Lt(Box::new(product.clone()), Box::new(Formula::Int(0))),
+            Formula::Gt(Box::new(product), Box::new(Formula::Int(4_294_967_295))),
+        ]));
+        out
+    }
+
+    /// The exact assertion captured from the failing
+    /// `error_detection::test_detect_overflow_mul_u32` session
+    /// (/tmp/diag-ay-sibling/in.3554.smt2), in its conjunct order.
+    fn captured_umul_record_formula() -> Formula {
+        let int = umul_int_core();
+        let mut conjuncts = int[..4].to_vec();
+        conjuncts.extend(umul_bv_violation());
+        conjuncts.push(int[4].clone());
+        Formula::And(conjuncts)
+    }
+
+    #[test]
+    fn captured_umul_record_formula_splits_into_its_two_theories() {
+        let components = disjoint_conjunctive_components(&captured_umul_record_formula())
+            .expect("the BV and Int halves share no variable");
+        assert_eq!(components.len(), 2, "{components:?}");
+    }
+
+    /// REGRESSION (983d7a62f88 made the u32 `var*var` overflow VC a BV + NIA
+    /// mix; the external session answered it `Unknown`). The component lane
+    /// refutes it: the Int half by the concrete witness, the BV half by a
+    /// bounded solve, and the result carries the COMPOSED model.
+    #[cfg(unix)]
+    #[test]
+    fn mixed_bv_nia_umul_record_is_refuted_with_a_composed_model() {
+        let fixture = TheoryMixSolver::new("mixed");
+        let _memory_authority = unconfigured_memory_authority();
+        let session = fixture.session();
+
+        let result = session.verify_vc(&u32_mul_overflow_vc(captured_umul_record_formula()));
+
+        let VerificationResult::Failed { counterexample: Some(cex), solver, .. } = &result else {
+            panic!("the mixed query must be refuted component-wise, got {result:?}");
+        };
+        assert_eq!(solver, "ay-incremental-components");
+        let names: Vec<&str> = cex.assignments.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["__trust_ovf_bv_lhs_a", "__trust_ovf_bv_rhs_b", "a", "b"],
+            "the witness is the union of both component models: {cex:?}"
+        );
+        // The composed model really satisfies the Int half (65536 * 65536 =
+        // 2^32 > u32::MAX) — the BV half's model came from the solver.
+        let mut env = std::collections::BTreeMap::new();
+        for (name, value) in &cex.assignments {
+            if let CounterexampleValue::Uint(v) = value {
+                env.insert(name.clone(), Formula::Int(*v as i128));
+            }
+        }
+        assert_eq!(eval_bool_formula(&Formula::And(umul_int_core()), &env), Some(true));
+
+        // The whole query was asked once (unknown) and its relaxation once
+        // (unknown) on the live session; exactly ONE more solve — the BV
+        // component — ran, on a fresh base-free process.
+        let commands = fixture.commands();
+        let check_sats = commands.iter().filter(|c| c.trim() == "(check-sat)").count();
+        assert_eq!(check_sats, 3, "{commands:?}");
+    }
+
+    /// TWIN: the same two halves, but LINKED through a shared variable
+    /// (`a == bv2nat(lhs)`). The conjunction is one component; splitting it
+    /// would compose models that disagree on the link. The split must refuse,
+    /// and the verdict must stay `Unknown` (never `Failed`, never `Proved`).
+    #[cfg(unix)]
+    #[test]
+    fn linked_bv_nia_umul_record_is_never_split() {
+        let fixture = TheoryMixSolver::new("linked");
+        let _memory_authority = unconfigured_memory_authority();
+        let Formula::And(mut conjuncts) = captured_umul_record_formula() else {
+            unreachable!("the captured formula is a conjunction")
+        };
+        conjuncts.push(Formula::Eq(
+            Box::new(int_var("a")),
+            Box::new(Formula::BvToInt(Box::new(bv32_var("__trust_ovf_bv_lhs_a")), 32, false)),
+        ));
+        let linked = Formula::And(conjuncts);
+        assert!(
+            disjoint_conjunctive_components(&linked).is_none(),
+            "components sharing a variable must not be split"
+        );
+
+        let session = fixture.session();
+        let result = session.verify_vc(&u32_mul_overflow_vc(linked));
+        assert!(
+            matches!(result, VerificationResult::Unknown { .. }),
+            "a linked mix stays undecided, got {result:?}"
+        );
+        let commands = fixture.commands();
+        let check_sats = commands.iter().filter(|c| c.trim() == "(check-sat)").count();
+        assert_eq!(check_sats, 2, "no component solve may run: {commands:?}");
+    }
+
+    /// A session carrying base-scope facts decides `base ∧ vc`; a model of the
+    /// VC alone is not a model of that, so the lane must not fire.
+    #[cfg(unix)]
+    #[test]
+    fn component_lane_is_refused_under_common_assertions() {
+        let fixture = TheoryMixSolver::new("common");
+        let _memory_authority = unconfigured_memory_authority();
+        let mut session = fixture.session();
+        session.add_common_formulas(&[(
+            "unrelated".to_string(),
+            Formula::Le(Box::new(Formula::Int(0)), Box::new(int_var("c"))),
+        )]);
+        let result = session.verify_vc(&u32_mul_overflow_vc(captured_umul_record_formula()));
+        assert!(
+            matches!(result, VerificationResult::Unknown { .. }),
+            "the lane must stay off under a base scope, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn an_expired_retry_never_spawns_a_component() {
+        let _clock = trust_types::verify_budget::VerifyBudgetGuard::install(
+            Some(Instant::now() - Duration::from_secs(1)),
+            u64::MAX,
+        );
+        let budget = ComponentRetryBudget::new(1);
+        let formula = Formula::And(vec![
+            Formula::Gt(Box::new(int_var("expired_x")), Box::new(Formula::Int(1))),
+            Formula::Gt(Box::new(int_var("expired_y")), Box::new(Formula::Int(1))),
+        ]);
+        let vc = u32_mul_overflow_vc(formula);
+        let original = StopCause::Effort.unknown_result("original", 0, "initial effort exhausted");
+        // Reaching dispatch would try this absent executable and report a fault.
+        let session = IncrementalAYSession::with_solver_path("/absent-retry-budget-solver");
+        let result = session.refute_components_if_unknown(&vc, original, &budget);
+        assert_eq!(StopCause::of_result(&result), StopCause::WallBackstop, "{result:?}");
+    }
+
+    /// The lane never turns a component UNSAT into `Proved`: when the BV half is
+    /// not refuted (here: the solver answers `unknown` for everything), the
+    /// original `Unknown` stands even though the Int half has a witness.
+    #[cfg(unix)]
+    #[test]
+    fn component_lane_keeps_unknown_when_a_component_is_not_refuted() {
+        let fixture = RecordingSolver::new("components-unknown");
+        let _memory_authority = unconfigured_memory_authority();
+        let session = IncrementalAYSession::with_solver_path(
+            fixture.script.to_str().expect("utf-8 fixture path"),
+        )
+        .with_timeout(STAND_IN_SOLVER_TIMEOUT_MS);
+        let result = session.verify_vc(&u32_mul_overflow_vc(captured_umul_record_formula()));
+        assert!(
+            matches!(result, VerificationResult::Unknown { .. }),
+            "an unrefuted component leaves the verdict undecided, got {result:?}"
+        );
+    }
+
+    /// A stand-in that answers every `(check-sat)` with `unknown`, and gives
+    /// one ay account for the whole query (whose asserts mention `cert_y`) and
+    /// another for the `{cert_x}` component, which the component lane solves
+    /// first.
+    #[cfg(unix)]
+    struct CertificationRefusalSolver {
+        directory: std::path::PathBuf,
+        script: std::path::PathBuf,
+        log: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl CertificationRefusalSolver {
+        fn new(label: &str, whole: (&str, Option<&str>), component: (&str, Option<&str>)) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "trust-cert-refusal-solver-{label}-{}-{nonce:x}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).expect("create certification-refusal fixture");
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("make certification-refusal fixture private");
+            let account = |name: &str, (reason, detail): (&str, Option<&str>)| {
+                let path = directory.join(name);
+                let detail = detail
+                    .map(|detail| format!(" :unknown.detail \"{detail}\"\n"))
+                    .unwrap_or_default();
+                std::fs::write(
+                    &path,
+                    format!("(:conflicts 1\n{detail} :unknown.reason \"{reason}\")\n"),
+                )
+                .expect("write the stand-in's account");
+                path
+            };
+            let (whole, component) = (account("whole", whole), account("component", component));
+            let log = directory.join("commands.log");
+            let script = directory.join("solver.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n\
+                     asserts=''\n\
+                     while IFS= read -r line; do\n\
+                     \x20 printf '%s\\n' \"$line\" >> '{}'\n\
+                     \x20 case \"$line\" in\n\
+                     \x20   '(push 1)') asserts='' ;;\n\
+                     \x20   '(assert '*) asserts=\"$asserts $line\" ;;\n\
+                     \x20   '(check-sat)') printf 'unknown\\n' ;;\n\
+                     \x20   '(get-info :all-statistics)')\n\
+                     \x20     case \"$asserts\" in\n\
+                     \x20       *cert_y*) cat '{}' ;;\n\
+                     \x20       *) cat '{}' ;;\n\
+                     \x20     esac ;;\n\
+                     \x20   '(exit)') exit 0 ;;\n\
+                     \x20 esac\n\
+                     done\n",
+                    log.display(),
+                    whole.display(),
+                    component.display()
+                ),
+            )
+            .expect("write certification-refusal solver");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+                .expect("make certification-refusal solver executable");
+            run_fresh_stand_in_once(&script, &log);
+            Self { directory, script, log }
+        }
+
+        /// The stand-in's verdict on `cert_x > 10 ∧ cert_x < 5 ∧ cert_y > 0`,
+        /// and how many `(check-sat)`s it was asked.
+        fn verify(&self) -> (VerificationResult, usize) {
+            let x = int_var("cert_x");
+            let formula = Formula::And(vec![
+                Formula::Gt(Box::new(x.clone()), Box::new(Formula::Int(10))),
+                Formula::Lt(Box::new(x), Box::new(Formula::Int(5))),
+                Formula::Gt(Box::new(int_var("cert_y")), Box::new(Formula::Int(0))),
+            ]);
+            let session = IncrementalAYSession::with_solver_path(
+                self.script.to_str().expect("utf-8 fixture path"),
+            )
+            .with_timeout(STAND_IN_SOLVER_TIMEOUT_MS);
+            let result = session.verify_vc(&vc_for("cert", formula));
+            let commands = std::fs::read_to_string(&self.log).unwrap_or_default();
+            (result, commands.lines().filter(|line| line.trim() == "(check-sat)").count())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CertificationRefusalSolver {
+        fn drop(&mut self) {
+            for file in [&self.log, &self.script] {
+                let _ = std::fs::remove_file(file);
+            }
+            for account in ["whole", "component"] {
+                let _ = std::fs::remove_file(self.directory.join(account));
+            }
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
+    /// ay's own UNSAT that certification withheld is not retried component-wise
+    /// on this lane either: the retry could only contradict ay's search. A
+    /// `self_check_rejected` naming no refused UNSAT proof (here ay's SAT
+    /// refusal) is no such UNSAT, and the retry runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_withheld_computed_unsat_is_not_retried_component_wise() {
+        use trust_types::determinism::StopItem;
+        let _memory_authority = unconfigured_memory_authority();
+        let refused = "(incomplete self-check-rejected)";
+        let trust_rule = "computed UNSAT rejected by mandatory strict certification: step t0 \
+                          uses unverified trust rule";
+        let fixture = CertificationRefusalSolver::new(
+            "withheld",
+            (refused, Some(trust_rule)),
+            ("unsupported", None),
+        );
+        let (result, check_sats) = fixture.verify();
+        let VerificationResult::Unknown { reason, .. } = &result else {
+            panic!("still withheld: {result:?}");
+        };
+        assert_eq!(StopItem::from_reason(reason), Some(StopItem::UnverifiedTrustRule), "{reason}");
+        assert_eq!(check_sats, 1, "no component was solved: {result:?}");
+
+        let sat_refusal =
+            "computed SAT reached the native API boundary without its model-validation capability";
+        let fixture = CertificationRefusalSolver::new(
+            "sat-refusal",
+            (refused, Some(sat_refusal)),
+            ("unsupported", None),
+        );
+        let (result, check_sats) = fixture.verify();
+        assert!(matches!(result, VerificationResult::Unknown { .. }), "{result:?}");
+        assert_eq!(check_sats, 2, "the `{{cert_x}}` component was solved: {result:?}");
+    }
+
+    /// The same gate, per component: the whole query stops on a deterministic
+    /// `unsupported`, and its first component is ay's own UNSAT that
+    /// certification refused. The retry ends on that verdict and the row keeps
+    /// `unsupported`; before, the refusal (or a clock that cancelled the strict
+    /// check) was folded into it.
+    #[cfg(unix)]
+    #[test]
+    fn a_withheld_computed_unsat_component_ends_the_retry_on_its_verdict() {
+        let _memory_authority = unconfigured_memory_authority();
+        let fixture = CertificationRefusalSolver::new(
+            "component",
+            ("unsupported", None),
+            (
+                "(incomplete self-check-rejected)",
+                Some(
+                    "computed UNSAT rejected by mandatory strict certification: step t0 uses \
+                     unverified trust rule",
+                ),
+            ),
+        );
+        let (result, check_sats) = fixture.verify();
+        assert_eq!(check_sats, 2, "the `{{cert_x}}` component was solved: {result:?}");
+        assert_eq!(StopCause::of_result(&result), StopCause::Unsupported, "{result:?}");
     }
 }

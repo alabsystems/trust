@@ -1,0 +1,12 @@
+/* SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ */
+
+body {
+    --side-nav-arrow-opacity: 1;
+}
+
+.arrow {
+	vertical-align: baseline;
+	font-size: 95%;
+}

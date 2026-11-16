@@ -12,7 +12,6 @@
 use trust_router::VerificationBackend;
 use trust_router::constant_folder::ConstantFolderBackend;
 use trust_router::interval_backend::IntervalBackend;
-use trust_router::trust_wp_backend::TrustWpRouterBackend;
 use trust_types::*;
 
 fn const_vc(formula: Formula) -> VerificationCondition {
@@ -54,11 +53,91 @@ fn interval_follows_violation_polarity() {
 }
 
 #[test]
-fn trust_wp_follows_violation_polarity() {
-    // The native-backed R4 backend declines contract-less VCs -> Unknown, which
-    // satisfies the invariant; this pins that it never inverts (the historical
-    // trust-wp inversion is what this gate was built for).
-    assert_polarity("trust_wp", &TrustWpRouterBackend::new());
+fn shared_constant_folder_covers_contract_and_contractless_literals() {
+    for contract_metadata in
+        [None, Some(ContractMetadata { has_ensures: true, ..ContractMetadata::default() })]
+    {
+        let vc = |formula| VerificationCondition {
+            contract_metadata: contract_metadata.clone(),
+            ..const_vc(formula)
+        };
+        let result = ConstantFolderBackend.verify(&vc(Formula::Bool(false)));
+        assert!(matches!(result, VerificationResult::Proved { strength, .. }
+            if strength == ProofStrength::smt_unsat()));
+        assert!(matches!(
+            ConstantFolderBackend.verify(&vc(Formula::Bool(true))),
+            VerificationResult::Failed { .. }
+        ));
+    }
+}
+
+#[test]
+fn bare_symbolic_contracts_are_not_wp_proofs() {
+    let mut vc = const_vc(Formula::Not(Box::new(Formula::Var("ok".into(), Sort::Bool))));
+    vc.contract_metadata =
+        Some(ContractMetadata { has_ensures: true, ..ContractMetadata::default() });
+    assert!(matches!(ConstantFolderBackend.verify(&vc), VerificationResult::Unknown { .. }));
+}
+
+#[test]
+fn canonical_formula_route_keeps_every_input_and_refuses_unmodeled_rows() {
+    let router = trust_router::Router::with_backends(vec![Box::new(ConstantFolderBackend)]);
+    let mut unsupported = const_vc(Formula::Bool(false));
+    unsupported.kind =
+        VcKind::UnsupportedMir { kind: "opaque".into(), detail: "no operational model".into() };
+    let inputs = vec![
+        const_vc(Formula::Bool(false)),
+        const_vc(Formula::Bool(true)),
+        const_vc(Formula::Var("not_proved".into(), Sort::Bool)),
+        unsupported,
+    ];
+    let rows = router.verify_all(&inputs);
+    assert_eq!(rows.len(), inputs.len());
+    assert!(matches!(&rows[0].1, VerificationResult::Proved { strength, .. }
+        if *strength == ProofStrength::smt_unsat()));
+    assert!(matches!(&rows[1].1, VerificationResult::Failed { .. }));
+    assert!(matches!(&rows[2].1, VerificationResult::Unknown { .. }));
+    assert!(matches!(&rows[3].1, VerificationResult::Unknown { .. }));
+}
+
+#[test]
+fn mixed_portfolio_reaches_constant_fallback_and_keeps_expired_budget_refusal() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct InconclusiveSmt(Arc<AtomicUsize>);
+    impl VerificationBackend for InconclusiveSmt {
+        fn name(&self) -> &str {
+            "inconclusive-smt"
+        }
+        fn role(&self) -> trust_router::BackendRole {
+            trust_router::BackendRole::SmtSolver
+        }
+        fn can_handle(&self, _: &VerificationCondition) -> bool {
+            true
+        }
+        fn verify(&self, _: &VerificationCondition) -> VerificationResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            VerificationResult::Timeout { solver: self.name().into(), timeout_ms: 1 }
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = trust_router::Router::with_backends(vec![
+        Box::new(InconclusiveSmt(calls.clone())),
+        Box::new(ConstantFolderBackend),
+    ]);
+    let inputs = [const_vc(Formula::Bool(false)), const_vc(Formula::Bool(true))];
+    let rows = router.verify_all(&inputs);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "SMT ranks before the General fallback");
+    assert!(matches!(&rows[0].1, VerificationResult::Proved { strength, .. }
+        if *strength == ProofStrength::smt_unsat()));
+    assert!(matches!(&rows[1].1, VerificationResult::Failed { .. }));
+
+    calls.store(0, Ordering::SeqCst);
+    let rows = router.verify_all_with_deadline(&inputs, Some(std::time::Instant::now()));
+    assert_eq!(rows.len(), inputs.len());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(rows.iter().all(|(_, row)| matches!(row, VerificationResult::Unknown { .. })));
 }
 
 #[test]
@@ -77,28 +156,31 @@ fn constant_folder_is_the_reference_convention() {
 }
 
 #[test]
-fn compiler_and_cegis_do_not_register_parsed_trust_wp_subprocess_authority() {
-    // The seal, post-R4-flip: the per-VC backend the compiler registers is
-    // NATIVE-BACKED (typed in-process engine). No compiler-reachable path may
-    // import the subprocess `CliBackend`, the `verify_with_contracts` text
-    // wrapper, or the `TrustWpConfig` that would select a solver path — a
-    // compiler verdict must never be minted from parsed subprocess text.
-    // (`tests/trust_wp_native_flip_ab.rs` pins TRUST_WP_PATH invariance at
-    // runtime; the TrustWP full-verification adapter separately advertises
-    // ZERO obligation kinds, so historical records grant no authority.)
-    let backend_module = include_str!("../src/trust_wp_backend.rs");
+fn compiler_and_cegis_cannot_reintroduce_formula_only_wp_requests() {
+    // This source-bound architecture check guards the retired constructor and
+    // registration. Native body-WP's semantic/refusal tests remain separate.
+    let compiler = include_str!("../../../compiler/rustc_mir_transform/src/trust_verify.rs");
+    let router = include_str!("../src/lib.rs");
+    let native_body = include_str!("../src/full_verification/engines/native_trust_wp.rs");
     let strengthen_oracle = include_str!("../../trust-strengthen/src/trust_wp_oracle.rs");
-
-    // The backend's ONLY trust_wp import is the typed in-process engine.
-    assert_eq!(backend_module.matches("use trust_wp::").count(), 1);
-    assert!(backend_module.contains("use trust_wp::TrustWpVerificationEngine;"));
-    // The CEGIS oracle imports no trust_wp surface at all.
-    assert!(!strengthen_oracle.contains("use trust_wp"));
-    // No fully-qualified reach into the subprocess lane either (the doc
-    // comments name these identifiers in backticks only, never callable).
-    for (name, source) in
-        [("trust_wp_backend", backend_module), ("trust_wp_oracle", strengthen_oracle)]
+    assert!(compiler.contains("constant_folder::ConstantFolderBackend"));
+    for removed in
+        ["trust_wp_backend", "TrustWpRouterBackend", "verify_vc_via_native_trust_wp_engine"]
     {
+        assert!(!compiler.contains(removed), "compiler retains {removed}");
+        assert!(!router.contains(removed), "router exports {removed}");
+    }
+    assert!(
+        !std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/trust_wp_backend.rs").exists()
+    );
+    assert!(native_body.contains("verify_trust_ir_body_contracts"));
+    assert!(native_body.contains("replay_trust_ir_body_contracts"));
+    assert!(!strengthen_oracle.contains("use trust_wp"));
+    for (name, source) in [
+        ("compiler", compiler),
+        ("native_body", native_body),
+        ("trust_wp_oracle", strengthen_oracle),
+    ] {
         for forbidden in ["CliBackend::", "verify_with_contracts(", "TrustWpConfig::"] {
             assert!(
                 !source.contains(forbidden),

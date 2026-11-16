@@ -1,0 +1,33 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+;
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+; RUN: %tpde_test --run-until=ir --print-ir %s | FileCheck %s --dump-input always
+
+; CHECK-LABEL: Function test
+test() {
+; CHECK-NEXT: Block entry
+entry:
+; CHECK-NEXT: Value a (alloca)
+; CHECK-NEXT: Op $8
+; CHECK-NEXT: Op $1
+  %a = alloca 8, 1
+; CHECK-NEXT: Value b (alloca)
+; CHECK-NEXT: Op $8
+; CHECK-NEXT: Op $2
+  %b = alloca 8, 2
+; CHECK-NEXT: Value c (alloca)
+; CHECK-NEXT: Op $8
+; CHECK-NEXT: Op $4
+  %c = alloca 8, 4
+; CHECK-NEXT: Value d (alloca)
+; CHECK-NEXT: Op $8
+; CHECK-NEXT: Op $8
+  %d = alloca 8, 8
+; CHECK-NEXT: Value e (alloca)
+; CHECK-NEXT: Op $8
+; CHECK-NEXT: Op $16
+  %e = alloca 8, 16
+; CHECK-NEXT: Value (terminate)
+  terminate
+}

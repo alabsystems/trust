@@ -1089,10 +1089,7 @@ PROOF_GRADE_RELEASE_SENTINEL_BLOCKERS=(
 RELEASE_GATE_LOCKFILE_STABILITY_PATHS=(
     "Cargo.toml"
     "Cargo.lock"
-    "crates/Cargo.toml"
-    "crates/Cargo.lock"
     "targo-trust/Cargo.toml"
-    "targo-trust/Cargo.lock"
 )
 FORMULA_OWNER_MATRIX=(
     "separation/ownership|trust-vc|ownership-gate|FormulaFamily::SeparationOwnership|BackendRole::Ownership"

@@ -1,0 +1,57 @@
+# relift_aarch64_load_macho.hex — a 288-byte AArch64 Mach-O executable
+#
+# WHAT IT IS. One function, `_trust_fixture_aarch64_load`, whose body is
+#   f9400000  ldr x0, [x0]      (one unchecked memory read -> at least one binary VC)
+#   d65f03c0  ret
+# in __TEXT,__text at 0x1000000e8, with LC_MAIN pointing at it and one
+# N_SECT|N_EXT symbol naming it. Shape: mach_header_64 + LC_SEGMENT_64 __TEXT
+# (one section) + LC_SYMTAB + LC_MAIN — the layout of trust-binary-parse's
+# private `build_test_macho` (src/unified.rs), with this two-instruction body in
+# place of a bare `ret`. It is the Mach-O twin of the checked-in ELF fixture
+# tests/fixtures/binary_decomp/x86_64-load-elf.hex (`mov rax, [rdi]; ret`).
+#
+# WHY A FIXTURE. trust-lift lifts only AArch64 Mach-O and requires a named
+# __TEXT segment: the 392-byte MH_OBJECT that `as` emits for this body has one
+# unnamed segment and is refused with `Lift(NoTextSection)` (measured). Apple's
+# linker pads an arm64 __TEXT segment to 16 KiB, so `ld -static` on that object
+# gives 16472 bytes. The Mach-O builders that exist are private to
+# trust-binary-parse's #[cfg(test)] modules.
+#
+# HOW IT WAS PRODUCED (2026-09-27). The two instruction words are the output of
+# `as -arch arm64` on the two-line body above (`otool -t` on the object printed
+# `f9400000 d65f03c0`). The headers were packed field by field, little-endian,
+# exactly as annotated below. The result was checked with Apple's own tools:
+#   otool -hlv  -> MH_MAGIC_64 ARM64 ALL EXECUTE, 3 cmds, sizeofcmds 200, NOUNDEFS
+#   otool -tv   -> 00000001000000e8 ldr x0, [x0] / 00000001000000ec ret
+#   nm -m       -> 00000001000000e8 (__TEXT,__text) external _trust_fixture_aarch64_load
+#   file        -> Mach-O 64-bit executable arm64
+#
+# Decoding: drop everything from `#` to end of line, drop whitespace, read hex.
+# sha256 of the 288 decoded bytes:
+#   e541ad3162bd438840e7ea9f05e117755f57d5948f96f943f6f382392b82df77
+# The tests that read this file pin that digest; an edit here must re-pin it.
+#
+# mach_header_64: MH_MAGIC_64, CPU_TYPE_ARM64, ARM64_ALL, MH_EXECUTE, ncmds=3, sizeofcmds=200, MH_NOUNDEFS, reserved
+cffaedfe0c000001000000000200000003000000c80000000100000000000000
+# LC_SEGMENT_64 __TEXT: cmd, cmdsize=152, segname
+19000000980000005f5f5445585400000000000000000000
+#   vmaddr=0x100000000 vmsize=0x4000 fileoff=0 filesize=0xf0 (header..end of __text)
+000000000100000000400000000000000000000000000000f000000000000000
+#   maxprot=r-x initprot=r-x nsects=1 flags=0
+05000000050000000100000000000000
+#   section_64 __TEXT,__text: sectname, segname
+5f5f74657874000000000000000000005f5f5445585400000000000000000000
+#   addr=0x1000000e8 size=8 offset=0xe8 align=2^2 reloff=0 nreloc=0
+e8000000010000000800000000000000e8000000020000000000000000000000
+#   flags=PURE_INSTRUCTIONS|SOME_INSTRUCTIONS reserved1..3=0
+00040080000000000000000000000000
+# LC_SYMTAB: cmdsize=24 symoff=0x110 nsyms=1 stroff=0xf0 strsize=32
+02000000180000001001000001000000f000000020000000
+# LC_MAIN: cmdsize=24 entryoff=0xe8 stacksize=0
+2800008018000000e8000000000000000000000000000000
+# __text @0xe8: f9400000 ldr x0, [x0] ; d65f03c0 ret
+000040f9c0035fd6
+# string table @0xf0: "\0_trust_fixture_aarch64_load\0" + pad
+005f74727573745f666978747572655f616172636836345f6c6f616400000000
+# nlist_64 @0x110: n_strx=1 N_SECT|N_EXT n_sect=1 n_desc=0 n_value=0x1000000e8
+010000000f010000e800000001000000

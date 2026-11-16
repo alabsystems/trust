@@ -3,11 +3,10 @@ use std::fmt::Write;
 use rustc_abi::Primitive::{Float, Int, Pointer};
 use rustc_abi::{Align, BackendRepr, FieldsShape, Scalar, Size, Variants};
 use rustc_codegen_ssa::traits::*;
-use rustc_middle::bug;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
 use rustc_middle::ty::{self, CoroutineArgsExt, Ty, TypeVisitableExt};
-use rustc_span::{DUMMY_SP, Span};
+use rustc_span::{DUMMY_SP, Span, bug};
 use tracing::debug;
 
 use crate::common::*;
@@ -22,7 +21,7 @@ fn uncached_llvm_type<'a, 'tcx>(
         BackendRepr::Scalar(_) => bug!("handled elsewhere"),
         BackendRepr::SimdVector { element, count } => {
             let element = layout.scalar_llvm_type_at(cx, element);
-            return cx.type_vector(element, count);
+            return cx.type_vector(element, count.as_u64());
         }
         BackendRepr::SimdScalableVector { ref element, count, number_of_vectors } => {
             let element = if element.is_bool() {
@@ -31,49 +30,20 @@ fn uncached_llvm_type<'a, 'tcx>(
                 layout.scalar_llvm_type_at(cx, *element)
             };
 
-            let vector_type = cx.type_scalable_vector(element, count);
+            let vector_type = cx.type_scalable_vector(element, count.as_u64());
             return match number_of_vectors.0 {
                 1 => vector_type,
-                2 => cx.type_struct(&[vector_type, vector_type], false),
-                3 => cx.type_struct(&[vector_type, vector_type, vector_type], false),
-                4 => cx.type_struct(&[vector_type, vector_type, vector_type, vector_type], false),
-                5 => cx.type_struct(
-                    &[vector_type, vector_type, vector_type, vector_type, vector_type],
-                    false,
-                ),
-                6 => cx.type_struct(
-                    &[vector_type, vector_type, vector_type, vector_type, vector_type, vector_type],
-                    false,
-                ),
-                7 => cx.type_struct(
-                    &[
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                    ],
-                    false,
-                ),
-                8 => cx.type_struct(
-                    &[
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                        vector_type,
-                    ],
-                    false,
-                ),
+                2 => cx.type_struct(&[vector_type; 2]),
+                3 => cx.type_struct(&[vector_type; 3]),
+                4 => cx.type_struct(&[vector_type; 4]),
+                5 => cx.type_struct(&[vector_type; 5]),
+                6 => cx.type_struct(&[vector_type; 6]),
+                7 => cx.type_struct(&[vector_type; 7]),
+                8 => cx.type_struct(&[vector_type; 8]),
                 _ => bug!("`#[rustc_scalable_vector]` tuple struct with too many fields"),
             };
         }
-        BackendRepr::Memory { .. } | BackendRepr::ScalarPair(..) => {}
+        BackendRepr::Memory { .. } | BackendRepr::ScalarPair { .. } => {}
     }
 
     let name = match layout.ty.kind() {
@@ -104,12 +74,12 @@ fn uncached_llvm_type<'a, 'tcx>(
 
     match layout.fields {
         FieldsShape::Primitive | FieldsShape::Union(_) => {
-            let fill = cx.type_padding_filler(layout.size, layout.align.abi);
-            let packed = false;
+            let fill = cx.type_padding_filler(layout.size, layout.align);
             match name {
-                None => cx.type_struct(&[fill], packed),
+                None => cx.type_struct(&[fill]),
                 Some(ref name) => {
                     let llty = cx.type_named_struct(name);
+                    let packed = false;
                     cx.set_struct_body(llty, &[fill], packed);
                     llty
                 }
@@ -119,7 +89,7 @@ fn uncached_llvm_type<'a, 'tcx>(
         FieldsShape::Arbitrary { .. } => match name {
             None => {
                 let (llfields, packed) = struct_llfields(cx, layout);
-                cx.type_struct(&llfields, packed)
+                if packed { cx.type_packed_struct(&llfields) } else { cx.type_struct(&llfields) }
             }
             Some(ref name) => {
                 let llty = cx.type_named_struct(name);
@@ -139,14 +109,14 @@ fn struct_llfields<'a, 'tcx>(
 
     let mut packed = false;
     let mut offset = Size::ZERO;
-    let mut prev_effective_align = layout.align.abi;
+    let mut prev_effective_align = layout.align;
     let mut result: Vec<_> = Vec::with_capacity(1 + field_count * 2);
     for i in layout.fields.index_by_increasing_offset() {
         let target_offset = layout.fields.offset(i as usize);
         let field = layout.field(cx, i);
         let effective_field_align =
-            layout.align.abi.min(field.align.abi).restrict_for_offset(target_offset);
-        packed |= effective_field_align < field.align.abi;
+            layout.align.min(field.align).restrict_for_offset(target_offset);
+        packed |= effective_field_align < field.align;
 
         debug!(
             "struct_llfields: {}: {:?} offset: {:?} target_offset: {:?} \
@@ -191,7 +161,7 @@ fn struct_llfields<'a, 'tcx>(
 
 impl<'a, 'tcx> CodegenCx<'a, 'tcx> {
     pub(crate) fn align_of(&self, ty: Ty<'tcx>) -> Align {
-        self.layout_of(ty).align.abi
+        self.layout_of(ty).align
     }
 
     pub(crate) fn size_of(&self, ty: Ty<'tcx>) -> Size {
@@ -204,13 +174,11 @@ impl<'a, 'tcx> CodegenCx<'a, 'tcx> {
 
     pub(crate) fn spanned_size_and_align_of(&self, ty: Ty<'tcx>, span: Span) -> (Size, Align) {
         let layout = self.spanned_layout_of(ty, span);
-        (layout.size, layout.align.abi)
+        (layout.size, layout.align)
     }
 }
 
 pub(crate) trait LayoutLlvmExt<'tcx> {
-    fn is_llvm_immediate(&self) -> bool;
-    fn is_llvm_scalar_pair(&self) -> bool;
     fn llvm_type<'a>(&self, cx: &CodegenCx<'a, 'tcx>) -> &'a Type;
     fn immediate_llvm_type<'a>(&self, cx: &CodegenCx<'a, 'tcx>) -> &'a Type;
     fn scalar_llvm_type_at<'a>(&self, cx: &CodegenCx<'a, 'tcx>, scalar: Scalar) -> &'a Type;
@@ -223,25 +191,6 @@ pub(crate) trait LayoutLlvmExt<'tcx> {
 }
 
 impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
-    fn is_llvm_immediate(&self) -> bool {
-        match self.backend_repr {
-            BackendRepr::Scalar(_)
-            | BackendRepr::SimdVector { .. }
-            | BackendRepr::SimdScalableVector { .. } => true,
-            BackendRepr::ScalarPair(..) | BackendRepr::Memory { .. } => false,
-        }
-    }
-
-    fn is_llvm_scalar_pair(&self) -> bool {
-        match self.backend_repr {
-            BackendRepr::ScalarPair(..) => true,
-            BackendRepr::Scalar(_)
-            | BackendRepr::SimdVector { .. }
-            | BackendRepr::SimdScalableVector { .. }
-            | BackendRepr::Memory { .. } => false,
-        }
-    }
-
     /// Gets the LLVM type corresponding to a Rust type, i.e., `rustc_middle::ty::Ty`.
     /// The pointee type of the pointer in `PlaceRef` is always this type.
     /// For sized types, it is also the right LLVM type for an `alloca`
@@ -313,16 +262,13 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
                     return cx.type_i1();
                 }
             }
-            BackendRepr::ScalarPair(..) => {
+            BackendRepr::ScalarPair { .. } => {
                 // An immediate pair always contains just the two elements, without any padding
                 // filler, as it should never be stored to memory.
-                return cx.type_struct(
-                    &[
-                        self.scalar_pair_element_llvm_type(cx, 0, true),
-                        self.scalar_pair_element_llvm_type(cx, 1, true),
-                    ],
-                    false,
-                );
+                return cx.type_struct(&[
+                    self.scalar_pair_element_llvm_type(cx, 0, true),
+                    self.scalar_pair_element_llvm_type(cx, 1, true),
+                ]);
             }
             _ => {}
         };
@@ -346,7 +292,7 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
         // This must produce the same result for `repr(transparent)` wrappers as for the inner type!
         // In other words, this should generally not look at the type at all, but only at the
         // layout.
-        let BackendRepr::ScalarPair(a, b) = self.backend_repr else {
+        let BackendRepr::ScalarPair { a, b, b_offset: _ } = self.backend_repr else {
             bug!("TyAndLayout::scalar_pair_element_llty({:?}): not applicable", self);
         };
         let scalar = [a, b][index];

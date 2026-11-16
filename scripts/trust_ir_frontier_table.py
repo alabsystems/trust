@@ -46,7 +46,7 @@ Two independent masking effects, both measured in this campaign:
     (crates/trust-thir-lower/src/differential.rs, the ParamClass loop). A row
     that a fix retires often just surfaces the next blocker in the same body.
   * A clean row is not an Agreed row. Marginal clean->Agreed conversion measured
-    over 21 consecutive artifacts is ~1% (see `trust_ir_marginal_conversion.py`),
+    over 21 consecutive artifacts is ~1% (scripts/trust_ir_marginal_conversion.py at 4b7ad005d7),
     so a class's row count is a CLEAN-rate quantity. Price the Agreed axis off
     the MODELLED column: OPAQUE-COLLAPSE rows have never once been Agreed in
     this artifact (0 of 118) and SYMBOLIC rows agree at ~15% (64 of 440).
@@ -374,7 +374,7 @@ def lane_gap(per, rows):
     print("The gap is partitioned by the classes above (MODELLED column, excluding "
           "`agreed`).")
     print("Rank on THIS column, not on `rows`: a class of not-yet-clean bodies converts at")
-    print("~1% (trust_ir_marginal_conversion.py), a class of already-clean MODELLED bodies")
+    print("~1% (measured over 21 artifacts), a class of already-clean MODELLED bodies")
     print("is what ~99% of realized Agreed gains came from.")
     acc = 0
     ranked = sorted(

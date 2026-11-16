@@ -3,8 +3,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::HashSet;
-
+use trust_types::fx::FxHashSet;
 use trust_types::{Formula, Sort, Symbol};
 
 // ---------------------------------------------------------------------------
@@ -55,27 +54,36 @@ fn extract_range_from_guard(guard: &Formula, var_name: &str) -> Option<(i128, i1
 
 /// Extract (lo, hi) from the clauses of an And list, flattening nested Ands.
 fn extract_range_from_and_clauses(clauses: &[Formula], var_name: &str) -> Option<(i128, i128)> {
-    let mut flat: Vec<&Formula> = Vec::new();
+    let mut lo = None;
+    let mut hi = None;
     for clause in clauses {
-        flatten_and_refs(clause, &mut flat);
+        extract_bounds_from_and_clause(clause, var_name, &mut lo, &mut hi);
     }
-    extract_range_parts_refs(&flat, var_name)
+    match (lo, hi) {
+        (Some(l), Some(h)) if l < h => Some((l, h)),
+        _ => None,
+    }
 }
 
-/// Flatten And formulas into a flat list of references.
-fn flatten_and_refs<'a>(f: &'a Formula, out: &mut Vec<&'a Formula>) {
+/// Extract bounds from a clause, recursing into nested `And` formulas without allocating.
+fn extract_bounds_from_and_clause(
+    f: &Formula,
+    var_name: &str,
+    lo: &mut Option<i128>,
+    hi: &mut Option<i128>,
+) {
     match f {
         Formula::And(cs) => {
             for c in cs {
-                flatten_and_refs(c, out);
+                extract_bounds_from_and_clause(c, var_name, lo, hi);
             }
         }
-        other => out.push(other),
+        other => extract_bound_from_atom(other, var_name, lo, hi),
     }
 }
 
-/// Extract (lo, hi) from a flat list of bound constraint references.
-fn extract_range_parts_refs(parts: &[&Formula], var_name: &str) -> Option<(i128, i128)> {
+/// Extract (lo, hi) from a pair of bound constraints on `var_name`.
+fn extract_range_parts(parts: &[Formula], var_name: &str) -> Option<(i128, i128)> {
     let mut lo = None;
     let mut hi = None;
 
@@ -87,12 +95,6 @@ fn extract_range_parts_refs(parts: &[&Formula], var_name: &str) -> Option<(i128,
         (Some(l), Some(h)) if l < h => Some((l, h)),
         _ => None,
     }
-}
-
-/// Extract (lo, hi) from a pair of bound constraints on `var_name`.
-fn extract_range_parts(parts: &[Formula], var_name: &str) -> Option<(i128, i128)> {
-    let refs: Vec<&Formula> = parts.iter().collect();
-    extract_range_parts_refs(&refs, var_name)
 }
 
 /// Extract a bound from a single atomic formula.
@@ -193,36 +195,40 @@ fn range_to_domain(lo: i128, hi: i128, max: usize) -> Option<Vec<i128>> {
 /// be captured.
 #[must_use]
 pub(crate) fn substitute(formula: &Formula, var_name: &str, replacement: &Formula) -> Formula {
-    let replacement_free: HashSet<String> = replacement.free_variables().into_iter().collect();
-    let mut occupied = formula_symbol_names(formula);
-    occupied.extend(formula_symbol_names(replacement));
-    occupied.insert(var_name.to_string());
+    if !trust_types::any_free_variable_name(formula, &mut |name| name == var_name) {
+        return formula.clone();
+    }
+    let mut replacement_free: Option<FxHashSet<String>> = None;
+    let mut occupied: Option<FxHashSet<String>> = None;
     let mut fresh_counter = 0usize;
     substitute_rec(
+        formula.clone(),
         formula,
         var_name,
         replacement,
-        &replacement_free,
+        &mut replacement_free,
         &mut occupied,
         &mut fresh_counter,
     )
 }
 
 fn substitute_rec(
-    formula: &Formula,
+    formula: Formula,
+    root_formula: &Formula,
     var_name: &str,
     replacement: &Formula,
-    replacement_free: &HashSet<String>,
-    occupied: &mut HashSet<String>,
+    replacement_free: &mut Option<FxHashSet<String>>,
+    occupied: &mut Option<FxHashSet<String>>,
     fresh_counter: &mut usize,
 ) -> Formula {
     match formula {
-        Formula::Var(name, _) if name == var_name => replacement.clone(),
-        Formula::SymVar(name, _) if name.as_str() == var_name => replacement.clone(),
+        Formula::Var(ref name, _) if name == var_name => replacement.clone(),
+        Formula::SymVar(ref name, _) if name.as_str() == var_name => replacement.clone(),
         Formula::Forall(bindings, body) => substitute_quantifier(
             true,
             bindings,
-            body,
+            *body,
+            root_formula,
             var_name,
             replacement,
             replacement_free,
@@ -232,15 +238,24 @@ fn substitute_rec(
         Formula::Exists(bindings, body) => substitute_quantifier(
             false,
             bindings,
-            body,
+            *body,
+            root_formula,
             var_name,
             replacement,
             replacement_free,
             occupied,
             fresh_counter,
         ),
-        _ => formula.clone().map_children(&mut |child| {
-            substitute_rec(&child, var_name, replacement, replacement_free, occupied, fresh_counter)
+        other => other.map_children(&mut |child| {
+            substitute_rec(
+                child,
+                root_formula,
+                var_name,
+                replacement,
+                replacement_free,
+                occupied,
+                fresh_counter,
+            )
         }),
     }
 }
@@ -248,40 +263,50 @@ fn substitute_rec(
 #[allow(clippy::too_many_arguments)]
 fn substitute_quantifier(
     is_forall: bool,
-    bindings: &[(Symbol, Sort)],
-    body: &Formula,
+    mut renamed_bindings: Vec<(Symbol, Sort)>,
+    mut renamed_body: Formula,
+    root_formula: &Formula,
     var_name: &str,
     replacement: &Formula,
-    replacement_free: &HashSet<String>,
-    occupied: &mut HashSet<String>,
+    replacement_free: &mut Option<FxHashSet<String>>,
+    occupied: &mut Option<FxHashSet<String>>,
     fresh_counter: &mut usize,
 ) -> Formula {
-    if bindings.iter().any(|(name, _)| name.as_str() == var_name) {
+    if renamed_bindings.iter().any(|(name, _)| name.as_str() == var_name) {
         return if is_forall {
-            Formula::Forall(bindings.to_vec(), Box::new(body.clone()))
+            Formula::Forall(renamed_bindings, Box::new(renamed_body))
         } else {
-            Formula::Exists(bindings.to_vec(), Box::new(body.clone()))
+            Formula::Exists(renamed_bindings, Box::new(renamed_body))
         };
     }
 
-    let mut renamed_bindings = bindings.to_vec();
-    let mut renamed_body = body.clone();
-    let mut renamed_names = HashSet::new();
-    for (name, _) in bindings {
-        let name = name.as_str();
-        if replacement_free.contains(name) && renamed_names.insert(name.to_string()) {
-            let fresh = fresh_substitution_binder(occupied, fresh_counter);
-            for (binding, _) in &mut renamed_bindings {
-                if binding.as_str() == name {
-                    *binding = Symbol::intern(&fresh);
+    let rep_free = replacement_free.get_or_insert_with(|| replacement.free_variables());
+    if !rep_free.is_empty() && renamed_bindings.iter().any(|(n, _)| rep_free.contains(n.as_str())) {
+        let orig_names: Vec<Symbol> = renamed_bindings.iter().map(|(n, _)| n.clone()).collect();
+        let mut renamed_names = FxHashSet::default();
+        for name_sym in &orig_names {
+            let name = name_sym.as_str();
+            if rep_free.contains(name) && renamed_names.insert(name.to_string()) {
+                let occ = occupied.get_or_insert_with(|| {
+                    let mut set = formula_symbol_names(root_formula);
+                    set.extend(formula_symbol_names(replacement));
+                    set.insert(var_name.to_string());
+                    set
+                });
+                let fresh = fresh_substitution_binder(occ, fresh_counter);
+                for (binding, _) in &mut renamed_bindings {
+                    if binding.as_str() == name {
+                        *binding = Symbol::intern(&fresh);
+                    }
                 }
+                renamed_body = alpha_rename_bound_occurrences(renamed_body, name, &fresh);
             }
-            renamed_body = alpha_rename_bound_occurrences(&renamed_body, name, &fresh);
         }
     }
 
     let substituted = substitute_rec(
-        &renamed_body,
+        renamed_body,
+        root_formula,
         var_name,
         replacement,
         replacement_free,
@@ -295,24 +320,24 @@ fn substitute_quantifier(
     }
 }
 
-fn alpha_rename_bound_occurrences(formula: &Formula, from: &str, to: &str) -> Formula {
+fn alpha_rename_bound_occurrences(formula: Formula, from: &str, to: &str) -> Formula {
     match formula {
-        Formula::Var(name, sort) if name == from => Formula::Var(to.to_string(), sort.clone()),
-        Formula::SymVar(name, sort) if name.as_str() == from => {
+        Formula::Var(ref name, ref sort) if name == from => {
+            Formula::Var(to.to_string(), sort.clone())
+        }
+        Formula::SymVar(ref name, ref sort) if name.as_str() == from => {
             Formula::SymVar(Symbol::intern(to), sort.clone())
         }
-        Formula::Forall(bindings, _) | Formula::Exists(bindings, _)
+        Formula::Forall(ref bindings, _) | Formula::Exists(ref bindings, _)
             if bindings.iter().any(|(name, _)| name.as_str() == from) =>
         {
-            formula.clone()
+            formula
         }
-        _ => formula
-            .clone()
-            .map_children(&mut |child| alpha_rename_bound_occurrences(&child, from, to)),
+        other => other.map_children(&mut |child| alpha_rename_bound_occurrences(child, from, to)),
     }
 }
 
-fn fresh_substitution_binder(occupied: &mut HashSet<String>, fresh_counter: &mut usize) -> String {
+fn fresh_substitution_binder(occupied: &mut FxHashSet<String>, fresh_counter: &mut usize) -> String {
     loop {
         *fresh_counter = (*fresh_counter).saturating_add(1);
         let candidate = crate::generated_formula_symbol("subst", &fresh_counter.to_string());
@@ -322,9 +347,9 @@ fn fresh_substitution_binder(occupied: &mut HashSet<String>, fresh_counter: &mut
     }
 }
 
-fn formula_symbol_names(formula: &Formula) -> HashSet<String> {
-    let mut names = HashSet::new();
-    formula.visit(&mut |node| match node {
+fn formula_symbol_names(formula: &Formula) -> FxHashSet<String> {
+    let mut names = FxHashSet::default();
+    trust_types::visit_formula_nodes(formula, &mut |node| match node {
         Formula::Var(name, _) => {
             names.insert(name.clone());
         }
@@ -386,7 +411,7 @@ pub(super) fn instantiate_binding_prefix(
     let mut placeholders = Vec::with_capacity(count);
     for (name, _) in &bindings[..count] {
         let placeholder = fresh_instantiation_placeholder(&mut occupied, &mut counter);
-        renamed_body = alpha_rename_bound_occurrences(&renamed_body, name.as_str(), &placeholder);
+        renamed_body = alpha_rename_bound_occurrences(renamed_body, name.as_str(), &placeholder);
         placeholders.push(placeholder);
     }
 
@@ -401,7 +426,10 @@ pub(super) fn instantiate_binding_prefix(
     result
 }
 
-fn fresh_instantiation_placeholder(occupied: &mut HashSet<String>, counter: &mut usize) -> String {
+fn fresh_instantiation_placeholder(
+    occupied: &mut FxHashSet<String>,
+    counter: &mut usize,
+) -> String {
     loop {
         *counter = (*counter).saturating_add(1);
         let candidate = crate::generated_formula_symbol("instantiate", &counter.to_string());

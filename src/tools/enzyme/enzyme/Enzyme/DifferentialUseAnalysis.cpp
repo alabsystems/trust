@@ -262,7 +262,8 @@ bool DifferentialUseAnalysis::is_use_directly_needed_in_reverse(
             return true;
           }
       }
-      if (MTI->getArgOperand(2) != val)
+      // we also need the primal of all values if runtime activity is true
+      if (!gutils->runtimeActivity && MTI->getArgOperand(2) != val)
         return false;
       bool res = !gutils->isConstantValue(MTI->getArgOperand(0));
       if (res) {
@@ -323,7 +324,7 @@ bool DifferentialUseAnalysis::is_use_directly_needed_in_reverse(
   }
 
   if (!shadow)
-    if (isa<CmpInst>(user) || isa<BranchInst>(user) || isa<ReturnInst>(user) ||
+    if (isa<CmpInst>(user) || isAnyBranch(user) || isa<ReturnInst>(user) ||
         isa<FPExtInst>(user) || isa<FPTruncInst>(user)
         // isa<ExtractElement>(use) ||
         // isa<InsertElementInst>(use) || isa<ShuffleVectorInst>(use) ||
@@ -537,7 +538,7 @@ bool DifferentialUseAnalysis::is_use_directly_needed_in_reverse(
       if (shadow && val == CI->getArgOperand(0)) {
         if ((funcName == "MPI_Irecv" || funcName == "PMPI_Irecv") &&
             mode != DerivativeMode::ReverseModeGradient) {
-          // Need shadow buffer for forward pass of irecieve
+          // Need shadow buffer for forward pass of ireceive
           if (EnzymePrintDiffUse)
             llvm::errs() << " Need: shadow(" << to_string(qtype) << ") of "
                          << *val << " in reverse as shadow MPI " << *CI << "\n";
@@ -1141,7 +1142,7 @@ bool DifferentialUseAnalysis::callShouldNotUseDerivative(
           if (!gutils->TR.anyPointer(a))
             continue;
 
-          auto vd = gutils->TR.query(a);
+          const auto &vd = gutils->TR.query(a);
 
           if (!vd[{-1, -1}].isPossiblePointer())
             continue;
@@ -1181,14 +1182,8 @@ bool DifferentialUseAnalysis::callShouldNotUseDerivative(
           goto doneEscapeCheck;
         }
 
-        std::map<UsageKey, bool> CacheResults;
-        for (auto pair : gutils->knownRecomputeHeuristic) {
-          if (!pair.second || gutils->unnecessaryIntermediates.count(
-                                  cast<Instruction>(pair.first))) {
-            CacheResults[UsageKey(pair.first, QueryType::Primal)] = false;
-          }
-        }
-
+        std::map<UsageKey, bool> CacheResults =
+            gutils->populateSeenFromKnownRecompute();
         // to avoid an infinite loop, we assume this is needed by
         // marking the query that led us.
         if (val)
@@ -1220,3 +1215,137 @@ bool DifferentialUseAnalysis::callShouldNotUseDerivative(
   }
   return useConstantFallback;
 }
+
+namespace DifferentialUseAnalysis {
+
+bool checkLoopyReductionPHI(const GradientUtils *gutils,
+                            const llvm::PHINode *P0,
+                            const llvm::Value *incomingVal) {
+  using namespace llvm;
+  if (!gutils->OrigLI)
+    return false;
+  auto L = gutils->OrigLI->getLoopFor(P0->getParent());
+  if (!L || L->getHeader() != P0->getParent())
+    return false;
+  BasicBlock *preheader = L->getLoopPreheader();
+  if (!preheader)
+    return false;
+  Value *Pstart = P0->getIncomingValueForBlock(preheader);
+  while (auto phi = dyn_cast_or_null<PHINode>(Pstart)) {
+    if (phi->getNumIncomingValues() == 1)
+      Pstart = phi->getIncomingValue(0);
+    else
+      break;
+  }
+  if (Pstart != incomingVal &&
+      P0->getIncomingValueForBlock(preheader) != incomingVal)
+    return false;
+
+  SmallVector<const Instruction *, 4> activeUses;
+  for (auto u : P0->users()) {
+    if (auto I = dyn_cast<Instruction>(u)) {
+      if (!gutils->isConstantInstruction(const_cast<Instruction *>(I))) {
+        activeUses.push_back(I);
+      }
+    }
+  }
+  if (activeUses.size() != 1)
+    return false;
+  const Instruction *userInst = activeUses[0];
+  bool isLoopyReduction = false;
+  if (auto BO = dyn_cast<BinaryOperator>(userInst)) {
+    if (BO->getOpcode() == Instruction::FDiv && BO->getOperand(0) == P0 &&
+        !gutils->isConstantValue(const_cast<BinaryOperator *>(BO))) {
+      isLoopyReduction = true;
+    }
+  }
+  // A select reduction (e.g. a running max) is differentiated through the
+  // index of the last selecting iteration and never reads the start value's
+  // primal, so only the division form needs it.
+  if (!isLoopyReduction)
+    return false;
+
+  SmallVector<BasicBlock *, 1> Latches;
+  L->getLoopLatches(Latches);
+  for (auto Latch : Latches) {
+    if (userInst != P0->getIncomingValueForBlock(Latch)) {
+      return false;
+    }
+  }
+  SmallVector<BasicBlock *, 2> exitBlocks;
+  L->getExitBlocks(exitBlocks);
+  if (exitBlocks.size() != 1)
+    return false;
+
+  return true;
+}
+
+void pushLoopyPHIPreheader(const GradientUtils *gutils, llvm::Value *V,
+                           llvm::SetVector<llvm::Value *> &Intermediates,
+                           std::deque<llvm::Value *> &todo) {
+  using namespace llvm;
+  if (auto P0 = dyn_cast<PHINode>(V)) {
+    if (!gutils->OrigLI)
+      return;
+    auto L = gutils->OrigLI->getLoopFor(P0->getParent());
+    if (!L || L->getHeader() != P0->getParent())
+      return;
+    BasicBlock *preheader = L->getLoopPreheader();
+    if (!preheader)
+      return;
+    Value *Pstart = P0->getIncomingValueForBlock(preheader);
+    if (!Pstart)
+      return;
+    SmallVector<const Instruction *, 4> activeUses;
+    for (auto u : P0->users()) {
+      if (auto I = dyn_cast<Instruction>(u)) {
+        if (!gutils->isConstantInstruction(const_cast<Instruction *>(I))) {
+          activeUses.push_back(I);
+        }
+      }
+    }
+    if (activeUses.size() != 1)
+      return;
+    const Instruction *userInst = activeUses[0];
+    bool isLoopyReduction = false;
+    if (auto BO = dyn_cast<BinaryOperator>(userInst)) {
+      if (BO->getOpcode() == Instruction::FDiv && BO->getOperand(0) == P0 &&
+          !gutils->isConstantValue(const_cast<BinaryOperator *>(BO))) {
+        isLoopyReduction = true;
+      }
+    }
+    if (!isLoopyReduction)
+      return;
+
+    SmallVector<BasicBlock *, 1> Latches;
+    L->getLoopLatches(Latches);
+    for (auto Latch : Latches) {
+      if (userInst != P0->getIncomingValueForBlock(Latch)) {
+        return;
+      }
+    }
+    SmallVector<BasicBlock *, 2> exitBlocks;
+    L->getExitBlocks(exitBlocks);
+    if (exitBlocks.size() != 1)
+      return;
+
+    while (Pstart) {
+      // Constants and arguments are always available in the reverse pass, and
+      // thus need not be added to the recompute graph (which only contains
+      // instructions).
+      if (!isa<Instruction>(Pstart))
+        break;
+      Intermediates.insert(Pstart);
+      todo.push_back(Pstart);
+      if (auto phi = dyn_cast<PHINode>(Pstart)) {
+        if (phi->getNumIncomingValues() == 1)
+          Pstart = phi->getIncomingValue(0);
+        else
+          break;
+      } else
+        break;
+    }
+  }
+}
+
+} // namespace DifferentialUseAnalysis

@@ -77,8 +77,23 @@ impl SmtPrinter {
         param_sorts: &[Sort],
         return_sort: &Sort,
     ) -> String {
-        let params: Vec<String> = param_sorts.iter().map(|s| s.to_smtlib()).collect();
-        format!("(declare-fun {} ({}) {})", name, params.join(" "), return_sort.to_smtlib())
+        if param_sorts.is_empty() {
+            return format!("(declare-fun {name} () {})", return_sort.to_smtlib());
+        }
+        let mut out = String::with_capacity(name.len() + param_sorts.len() * 8 + 24);
+        out.push_str("(declare-fun ");
+        out.push_str(name);
+        out.push_str(" (");
+        for (i, sort) in param_sorts.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(&sort.to_smtlib());
+        }
+        out.push_str(") ");
+        out.push_str(&return_sort.to_smtlib());
+        out.push(')');
+        out
     }
 
     /// Emit an `(assert <formula>)` command with pretty-printed body.
@@ -89,8 +104,12 @@ impl SmtPrinter {
             // 9 = len("(assert ") + len(")")
             format!("(assert {body})")
         } else {
-            let indent = " ".repeat(self.config.indent_size);
-            format!("(assert\n{indent}{body})")
+            let mut out = String::with_capacity(body.len() + self.config.indent_size + 10);
+            out.push_str("(assert\n");
+            out.extend(std::iter::repeat_n(' ', self.config.indent_size));
+            out.push_str(&body);
+            out.push(')');
+            out
         }
     }
 
@@ -104,7 +123,7 @@ impl SmtPrinter {
     // Benchmark generation
     // ------------------------------------------------------------------
 
-    /// Produce a complete SMT-LIB2 benchmark string.
+    /// Produce a complete SMT-LIB2 benchmark string, FOR DEBUGGING ONLY.
     ///
     /// The benchmark includes:
     ///   1. `(set-logic ...)` if a logic name is provided
@@ -112,30 +131,57 @@ impl SmtPrinter {
     ///   3. `(assert <formula>)`
     ///   4. `(check-sat)`
     ///
-    /// Variable sorts are extracted from `Formula::Var` nodes.
+    /// NOT THE VERIFICATION PATH, and not interchangeable with it. The router's
+    /// canonical transcript (`in_process_ay_backend::problem_smt2`, and the
+    /// external-solver script beside it) composes THREE declaration sources —
+    /// the datatype sort preamble, the free variables, and the `Pred`/`FnApp`
+    /// signature map — under a logic line chosen by
+    /// [`crate::logic_lattice::select_logic_name`]. This function has only the
+    /// second of those, and takes its logic name as a PARAMETER. Consequently
+    /// it renders a MALFORMED query for a formula that
+    ///
+    /// * carries a datatype sort (no `declare-datatype`/`declare-sort`
+    ///   preamble, so the `declare-fun` names an undeclared sort), or
+    /// * applies a `Formula::Pred`/`FnApp` symbol (never declared, so the
+    ///   assertion applies an undeclared function), or
+    /// * is handed a `logic` its own declarations do not fit under — nothing
+    ///   here checks that, whereas the transcript lane's
+    ///   `smt2_self_consistency_tests` checks exactly that property of every
+    ///   transcript it produces.
+    ///
+    /// Use it to LOOK at a formula. To ask a solver about one, go through
+    /// trust-router. (There is no caller of this function anywhere in
+    /// `crates/*/src` today, and adding one on a verification path would be a
+    /// bug.)
     #[must_use]
     pub fn format_benchmark(&self, logic: Option<&str>, formula: &Formula) -> String {
-        let mut lines: Vec<String> = Vec::new();
+        let decls = self.collect_variable_decls(formula);
+        let assert_line = self.print_assert(formula);
+        let mut out = String::with_capacity(
+            logic.map_or(0, |l| l.len() + 13) + decls.len() * 24 + assert_line.len() + 12,
+        );
 
         // Set-logic
         if let Some(logic_name) = logic {
-            lines.push(format!("(set-logic {logic_name})"));
+            out.push_str("(set-logic ");
+            out.push_str(logic_name);
+            out.push_str(")\n");
         }
 
         // Collect free variable declarations.
         // Already sorted — collect_free_var_decls returns a BTreeSet.
-        let decls = self.collect_variable_decls(formula);
-        for (name, sort) in &decls {
-            lines.push(self.print_declare_fun(name, &[], sort));
+        for (name, sort) in decls {
+            out.push_str("(declare-fun ");
+            out.push_str(&name);
+            out.push_str(" () ");
+            out.push_str(&sort.to_smtlib());
+            out.push_str(")\n");
         }
 
-        // Assert
-        lines.push(self.print_assert(formula));
-
-        // Check-sat
-        lines.push(self.print_check_sat());
-
-        lines.join("\n")
+        // Assert + Check-sat
+        out.push_str(&assert_line);
+        out.push_str("\n(check-sat)");
+        out
     }
 
     // ------------------------------------------------------------------
@@ -144,10 +190,17 @@ impl SmtPrinter {
 
     /// Collect `(name, sort)` pairs for all free variables in the formula.
     ///
-    /// Delegates to `smt_logic::collect_free_var_decls` — the canonical
-    /// free variable collector — and converts the BTreeSet to a sorted Vec.
-    fn collect_variable_decls(&self, formula: &Formula) -> Vec<(String, Sort)> {
-        collect_free_var_decls(formula).into_iter().collect()
+    /// Delegates to [`collect_free_var_decls`], which is the workspace's one
+    /// free-variable collector — trust-router's `smt2_export::collect_free_vars`
+    /// now delegates to it too, so this printer and the canonical transcript
+    /// see the same variables. It collects VARIABLES only; the sort preamble
+    /// and the uninterpreted-symbol signatures a transcript also needs are not
+    /// its job and are not obtainable from it (see `format_benchmark`).
+    fn collect_variable_decls(
+        &self,
+        formula: &Formula,
+    ) -> std::collections::BTreeSet<(String, Sort)> {
+        collect_free_var_decls(formula)
     }
 
     /// Apply indentation and line-breaking to a raw s-expression string.
@@ -159,31 +212,41 @@ impl SmtPrinter {
         if sexp.len() <= self.config.line_width {
             return sexp.to_string();
         }
-        self.indent_sexp(sexp, 0)
+        let mut out = String::with_capacity(sexp.len() + 32);
+        self.indent_sexp_into(sexp, 0, &mut out);
+        out
     }
 
-    /// Recursively indent an s-expression.
-    fn indent_sexp(&self, sexp: &str, depth: usize) -> String {
+    /// Recursively indent an s-expression into `out`.
+    fn indent_sexp_into(&self, sexp: &str, depth: usize, out: &mut String) {
         let sexp = sexp.trim();
         // Fits on one line — keep it.
         let current_indent = depth * self.config.indent_size;
         if sexp.len() + current_indent <= self.config.line_width {
-            return sexp.to_string();
+            out.push_str(sexp);
+            return;
         }
         // Not an s-expression — return as-is.
         if !sexp.starts_with('(') || !sexp.ends_with(')') {
-            return sexp.to_string();
+            out.push_str(sexp);
+            return;
         }
         // Strip outer parens.
         let inner = &sexp[1..sexp.len() - 1];
         let parts = self.split_top_level(inner);
         if parts.len() <= 1 {
-            return sexp.to_string();
+            out.push_str(sexp);
+            return;
         }
-        let indent = " ".repeat((depth + 1) * self.config.indent_size);
-        let head = &parts[0];
-        let rest: Vec<String> = parts[1..].iter().map(|p| self.indent_sexp(p, depth + 1)).collect();
-        format!("({head}\n{indent}{})", rest.join(&format!("\n{indent}")))
+        let child_indent = (depth + 1) * self.config.indent_size;
+        out.push('(');
+        out.push_str(parts[0]);
+        for part in &parts[1..] {
+            out.push('\n');
+            out.extend(std::iter::repeat_n(' ', child_indent));
+            self.indent_sexp_into(part, depth + 1, out);
+        }
+        out.push(')');
     }
 
     /// Split an s-expression body into its top-level tokens/sub-expressions.

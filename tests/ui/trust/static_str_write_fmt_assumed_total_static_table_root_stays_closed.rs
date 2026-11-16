@@ -5,6 +5,7 @@
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
 //@ check-fail
+//@ forbid-output: this function has no obligation of its own
 //~? RAW Trust
 //! MUTANT: the `write!` reduction must refuse a `write_str` whose only path to a
 //! `#[trust::assume_total]` axiom runs through a FUNCTION POINTER IN A STATIC.
@@ -68,3 +69,7 @@ pub fn render(sink: &mut Sink) -> fmt::Result {
     use fmt::Write as _;
     write!(sink, "constant")
 }
+
+// ZERO-ROW-GATE (2026-10-10): this rail must refuse for its OWN reason; a refusal by the
+// zero-row gate (whose note is forbidden here) would mean the gate under test regressed
+// into discharging and the zero-row gate masked it.

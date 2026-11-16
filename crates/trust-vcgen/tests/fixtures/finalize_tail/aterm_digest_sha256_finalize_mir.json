@@ -1,0 +1,4444 @@
+{
+  "name": "finalize",
+  "def_path": "repro::sha256::Sha256::finalize",
+  "span": {
+    "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+    "line_start": 133,
+    "col_start": 4,
+    "line_end": 165,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 32
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "repro::sha256::Sha256",
+            "fields": [
+              [
+                "state",
+                {
+                  "Array": {
+                    "elem": {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    },
+                    "len": 8
+                  }
+                }
+              ],
+              [
+                "buf",
+                {
+                  "Array": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    },
+                    "len": 64
+                  }
+                }
+              ],
+              [
+                "buf_len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "bit_len"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeFrom",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                },
+                "len": 8
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::Range",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeFrom",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 8
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 8
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                },
+                "len": 8
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 39,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 64
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 40,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 32
+          }
+        },
+        "name": "out"
+      },
+      {
+        "index": 41,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Array": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    },
+                    "len": 4
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "words"
+      },
+      {
+        "index": 42,
+        "ty": {
+          "Tuple": [
+            {
+              "Ref": {
+                "mutable": true,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        },
+                        "len": 4
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "Ref": {
+                "mutable": true,
+                "inner": {
+                  "Slice": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 43,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 44,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 32
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 45,
+        "ty": {
+          "Adt": {
+            "name": "core::iter::adapters::zip::Zip",
+            "fields": [
+              [
+                "a",
+                {
+                  "Adt": {
+                    "name": "core::slice::iter::IterMut",
+                    "fields": [
+                      [
+                        "ptr",
+                        {
+                          "Adt": {
+                            "name": "core::ptr::non_null::NonNull",
+                            "fields": [
+                              [
+                                "pointer",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Array": {
+                                        "elem": {
+                                          "Int": {
+                                            "width": 8,
+                                            "signed": false
+                                          }
+                                        },
+                                        "len": 4
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ],
+                      [
+                        "end_or_len",
+                        {
+                          "RawPtr": {
+                            "mutable": true,
+                            "pointee": {
+                              "Array": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                },
+                                "len": 4
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "core::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "b",
+                {
+                  "Adt": {
+                    "name": "core::slice::iter::Iter",
+                    "fields": [
+                      [
+                        "ptr",
+                        {
+                          "Adt": {
+                            "name": "core::ptr::non_null::NonNull",
+                            "fields": [
+                              [
+                                "pointer",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Int": {
+                                        "width": 32,
+                                        "signed": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ],
+                      [
+                        "end_or_len",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "core::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "index",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 46,
+        "ty": {
+          "Adt": {
+            "name": "core::iter::adapters::zip::Zip",
+            "fields": [
+              [
+                "a",
+                {
+                  "Adt": {
+                    "name": "core::slice::iter::IterMut",
+                    "fields": [
+                      [
+                        "ptr",
+                        {
+                          "Adt": {
+                            "name": "core::ptr::non_null::NonNull",
+                            "fields": [
+                              [
+                                "pointer",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Array": {
+                                        "elem": {
+                                          "Int": {
+                                            "width": 8,
+                                            "signed": false
+                                          }
+                                        },
+                                        "len": 4
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ],
+                      [
+                        "end_or_len",
+                        {
+                          "RawPtr": {
+                            "mutable": true,
+                            "pointee": {
+                              "Array": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                },
+                                "len": 4
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "core::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "b",
+                {
+                  "Adt": {
+                    "name": "core::slice::iter::Iter",
+                    "fields": [
+                      [
+                        "ptr",
+                        {
+                          "Adt": {
+                            "name": "core::ptr::non_null::NonNull",
+                            "fields": [
+                              [
+                                "pointer",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Int": {
+                                        "width": 32,
+                                        "signed": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ],
+                      [
+                        "end_or_len",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "core::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "index",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 47,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::IterMut",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Array": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                },
+                                "len": 4
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": true,
+                    "pointee": {
+                      "Array": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        },
+                        "len": 4
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 48,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 49,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 50,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                },
+                "len": 8
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 51,
+        "ty": {
+          "Adt": {
+            "name": "core::iter::adapters::zip::Zip",
+            "fields": [
+              [
+                "a",
+                {
+                  "Adt": {
+                    "name": "core::slice::iter::IterMut",
+                    "fields": [
+                      [
+                        "ptr",
+                        {
+                          "Adt": {
+                            "name": "core::ptr::non_null::NonNull",
+                            "fields": [
+                              [
+                                "pointer",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Array": {
+                                        "elem": {
+                                          "Int": {
+                                            "width": 8,
+                                            "signed": false
+                                          }
+                                        },
+                                        "len": 4
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ],
+                      [
+                        "end_or_len",
+                        {
+                          "RawPtr": {
+                            "mutable": true,
+                            "pointee": {
+                              "Array": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                },
+                                "len": 4
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "core::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "b",
+                {
+                  "Adt": {
+                    "name": "core::slice::iter::Iter",
+                    "fields": [
+                      [
+                        "ptr",
+                        {
+                          "Adt": {
+                            "name": "core::ptr::non_null::NonNull",
+                            "fields": [
+                              [
+                                "pointer",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Int": {
+                                        "width": 32,
+                                        "signed": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ],
+                      [
+                        "end_or_len",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "core::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "index",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "iter"
+      },
+      {
+        "index": 52,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Tuple": [
+                    {
+                      "Ref": {
+                        "mutable": true,
+                        "inner": {
+                          "Array": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            },
+                            "len": 4
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Tuple": [
+                        {
+                          "Ref": {
+                            "mutable": true,
+                            "inner": {
+                              "Array": {
+                                "elem": {
+                                  "Int": {
+                                    "width": 8,
+                                    "signed": false
+                                  }
+                                },
+                                "len": 4
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 53,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::iter::adapters::zip::Zip",
+                "fields": [
+                  [
+                    "a",
+                    {
+                      "Adt": {
+                        "name": "core::slice::iter::IterMut",
+                        "fields": [
+                          [
+                            "ptr",
+                            {
+                              "Adt": {
+                                "name": "core::ptr::non_null::NonNull",
+                                "fields": [
+                                  [
+                                    "pointer",
+                                    {
+                                      "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": {
+                                          "Array": {
+                                            "elem": {
+                                              "Int": {
+                                                "width": 8,
+                                                "signed": false
+                                              }
+                                            },
+                                            "len": 4
+                                          }
+                                        }
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ],
+                          [
+                            "end_or_len",
+                            {
+                              "RawPtr": {
+                                "mutable": true,
+                                "pointee": {
+                                  "Array": {
+                                    "elem": {
+                                      "Int": {
+                                        "width": 8,
+                                        "signed": false
+                                      }
+                                    },
+                                    "len": 4
+                                  }
+                                }
+                              }
+                            }
+                          ],
+                          [
+                            "_marker",
+                            {
+                              "Adt": {
+                                "name": "core::marker::PhantomData",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ],
+                  [
+                    "b",
+                    {
+                      "Adt": {
+                        "name": "core::slice::iter::Iter",
+                        "fields": [
+                          [
+                            "ptr",
+                            {
+                              "Adt": {
+                                "name": "core::ptr::non_null::NonNull",
+                                "fields": [
+                                  [
+                                    "pointer",
+                                    {
+                                      "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": {
+                                          "Int": {
+                                            "width": 32,
+                                            "signed": false
+                                          }
+                                        }
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ],
+                          [
+                            "end_or_len",
+                            {
+                              "RawPtr": {
+                                "mutable": false,
+                                "pointee": {
+                                  "Int": {
+                                    "width": 32,
+                                    "signed": false
+                                  }
+                                }
+                              }
+                            }
+                          ],
+                          [
+                            "_marker",
+                            {
+                              "Adt": {
+                                "name": "core::marker::PhantomData",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ],
+                  [
+                    "index",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 54,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 55,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 4
+              }
+            }
+          }
+        },
+        "name": "slot"
+      },
+      {
+        "index": 56,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "word"
+      },
+      {
+        "index": 57,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "len": 4
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 58,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 137,
+                "col_start": 22,
+                "line_end": 137,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_mul",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    8,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 137,
+              "col_start": 22,
+              "line_end": 137,
+              "col_end": 46
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 27860,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 141,
+                "col_start": 17,
+                "line_end": 141,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 141,
+                "col_start": 8,
+                "line_end": 141,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 2,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 141,
+              "col_start": 8,
+              "line_end": 141,
+              "col_end": 30
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  {
+                    "Field": 1
+                  },
+                  {
+                    "Index": 4
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      128,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 141,
+                "col_start": 8,
+                "line_end": 141,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": [
+                        {
+                          "Field": 2
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 142,
+                "col_start": 8,
+                "line_end": 142,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 6,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 3,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 142,
+              "col_start": 8,
+              "line_end": 142,
+              "col_end": 25
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  {
+                    "Field": 2
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 6,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 142,
+                "col_start": 8,
+                "line_end": 142,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 147,
+                "col_start": 11,
+                "line_end": 147,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 147,
+                "col_start": 26,
+                "line_end": 147,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 10,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 4,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 147,
+              "col_start": 26,
+              "line_end": 147,
+              "col_end": 39
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 10,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 147,
+                "col_start": 26,
+                "line_end": 147,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 147,
+                "col_start": 11,
+                "line_end": 147,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                9
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 147,
+              "col_start": 11,
+              "line_end": 147,
+              "col_end": 39
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 148,
+                "col_start": 12,
+                "line_end": 148,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 148,
+                "col_start": 21,
+                "line_end": 148,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeFrom",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeFrom<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 15,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 148,
+                "col_start": 21,
+                "line_end": 148,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8; 64] as core::ops::index::IndexMut<core::ops::range::RangeFrom<usize>>>::index_mut",
+            "args": [
+              {
+                "Move": {
+                  "local": 13,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 14,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 12,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 148,
+              "col_start": 20,
+              "line_end": 148,
+              "col_end": 36
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 4524,
+              "substs_digest": [
+                7685911593046415622,
+                15791885237918717175
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::fill",
+            "args": [
+              {
+                "Copy": {
+                  "local": 12,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    0,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 11,
+              "projections": []
+            },
+            "target": 7,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 148,
+              "col_start": 12,
+              "line_end": 148,
+              "col_end": 44
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15579,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 149,
+                "col_start": 24,
+                "line_end": 149,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 150,
+                "col_start": 21,
+                "line_end": 150,
+                "col_end": 36
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 16,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 150,
+                "col_start": 38,
+                "line_end": 150,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "repro::sha256::compress",
+            "args": [
+              {
+                "Copy": {
+                  "local": 18,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 19,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 17,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 150,
+              "col_start": 12,
+              "line_end": 150,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3410588637815928769,
+              "def_index": 49,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3410588637815928769,
+              "krate_name": "repro"
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  {
+                    "Field": 2
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 151,
+                "col_start": 12,
+                "line_end": 151,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 154,
+                "col_start": 8,
+                "line_end": 154,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 154,
+                "col_start": 17,
+                "line_end": 154,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 154,
+                "col_start": 31,
+                "line_end": 154,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 26,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 10,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 154,
+              "col_start": 31,
+              "line_end": 154,
+              "col_end": 44
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 26,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 154,
+                "col_start": 31,
+                "line_end": 154,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::Range",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::Range<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 24,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 25,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 154,
+                "col_start": 17,
+                "line_end": 154,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8; 64] as core::ops::index::IndexMut<core::ops::range::Range<usize>>>::index_mut",
+            "args": [
+              {
+                "Move": {
+                  "local": 22,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 23,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 21,
+              "projections": []
+            },
+            "target": 11,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 154,
+              "col_start": 16,
+              "line_end": 154,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 4524,
+              "substs_digest": [
+                14450106600928918777,
+                10772248289640540759
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::fill",
+            "args": [
+              {
+                "Copy": {
+                  "local": 21,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    0,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 20,
+              "projections": []
+            },
+            "target": 12,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 154,
+              "col_start": 8,
+              "line_end": 154,
+              "col_end": 53
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15579,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 155,
+                "col_start": 8,
+                "line_end": 155,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        64,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        8,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 155,
+                "col_start": 17,
+                "line_end": 155,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 32,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 13,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 155,
+              "col_start": 17,
+              "line_end": 155,
+              "col_end": 30
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 31,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 32,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 155,
+                "col_start": 17,
+                "line_end": 155,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 30,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::ops::range::RangeFrom",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::ops::range::RangeFrom<usize>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 31,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 155,
+                "col_start": 17,
+                "line_end": 155,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<[u8; 64] as core::ops::index::IndexMut<core::ops::range::RangeFrom<usize>>>::index_mut",
+            "args": [
+              {
+                "Move": {
+                  "local": 29,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 30,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 28,
+              "projections": []
+            },
+            "target": 14,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 155,
+              "col_start": 16,
+              "line_end": 155,
+              "col_end": 33
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 4524,
+              "substs_digest": [
+                7685911593046415622,
+                15791885237918717175
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl u64>::to_be_bytes",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 35,
+              "projections": []
+            },
+            "target": 15,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 155,
+              "col_start": 51,
+              "line_end": 155,
+              "col_end": 72
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 27902,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 35,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 155,
+                "col_start": 50,
+                "line_end": 155,
+                "col_end": 72
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 33,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 34,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Ref": {
+                      "mutable": false,
+                      "inner": {
+                        "Slice": {
+                          "elem": {
+                            "Int": {
+                              "width": 8,
+                              "signed": false
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 155,
+                "col_start": 50,
+                "line_end": 155,
+                "col_end": 72
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::copy_from_slice",
+            "args": [
+              {
+                "Copy": {
+                  "local": 28,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 33,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 27,
+              "projections": []
+            },
+            "target": 16,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 155,
+              "col_start": 8,
+              "line_end": 155,
+              "col_end": 73
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15583,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 156,
+                "col_start": 20,
+                "line_end": 156,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 38,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 157,
+                "col_start": 17,
+                "line_end": 157,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 39,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 36,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 157,
+                "col_start": 34,
+                "line_end": 157,
+                "col_end": 40
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "repro::sha256::compress",
+            "args": [
+              {
+                "Copy": {
+                  "local": 38,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 39,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 37,
+              "projections": []
+            },
+            "target": 17,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 157,
+              "col_start": 8,
+              "line_end": 157,
+              "col_end": 41
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 3410588637815928769,
+              "def_index": 49,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 3410588637815928769,
+              "krate_name": "repro"
+            }
+          }
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 40,
+                "projections": []
+              },
+              "rvalue": {
+                "Repeat": [
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        8
+                      ]
+                    }
+                  },
+                  32
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 159,
+                "col_start": 22,
+                "line_end": 159,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 44,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 40,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 160,
+                "col_start": 25,
+                "line_end": 160,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 43,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 44,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Ref": {
+                      "mutable": true,
+                      "inner": {
+                        "Slice": {
+                          "elem": {
+                            "Int": {
+                              "width": 8,
+                              "signed": false
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 160,
+                "col_start": 25,
+                "line_end": 160,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::as_chunks_mut::<4>",
+            "args": [
+              {
+                "Move": {
+                  "local": 43,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 42,
+              "projections": []
+            },
+            "target": 18,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 160,
+              "col_start": 25,
+              "line_end": 160,
+              "col_end": 49
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15462,
+              "substs_digest": [
+                1866060073485462676,
+                7612859773958291488
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 41,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 42,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 160,
+                "col_start": 13,
+                "line_end": 160,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [[u8; 4]]>::iter_mut",
+            "args": [
+              {
+                "Copy": {
+                  "local": 41,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 47,
+              "projections": []
+            },
+            "target": 19,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 161,
+              "col_start": 28,
+              "line_end": 161,
+              "col_end": 44
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15444,
+              "substs_digest": [
+                4124021750833248847,
+                9711614583873878446
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 50,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 161,
+                "col_start": 49,
+                "line_end": 161,
+                "col_end": 59
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 49,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 50,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Ref": {
+                      "mutable": false,
+                      "inner": {
+                        "Slice": {
+                          "elem": {
+                            "Int": {
+                              "width": 32,
+                              "signed": false
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 161,
+                "col_start": 49,
+                "line_end": 161,
+                "col_end": 59
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u32]>::iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 49,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 48,
+              "projections": []
+            },
+            "target": 20,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 161,
+              "col_start": 49,
+              "line_end": 161,
+              "col_end": 66
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 15443,
+              "substs_digest": [
+                12295953916534365648,
+                15423895294860648131
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "SliceIter",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::IterMut<'_, [u8; 4]> as core::iter::traits::iterator::Iterator>::zip::<core::slice::iter::Iter<'_, u32>>",
+            "args": [
+              {
+                "Move": {
+                  "local": 47,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 48,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 46,
+              "projections": []
+            },
+            "target": 21,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 161,
+              "col_start": 28,
+              "line_end": 161,
+              "col_end": 67
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 10554,
+              "substs_digest": [
+                14435939962496722369,
+                3975156280699574278
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 21,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<core::iter::adapters::zip::Zip<core::slice::iter::IterMut<'_, [u8; 4]>, core::slice::iter::Iter<'_, u32>> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 46,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 45,
+              "projections": []
+            },
+            "target": 22,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 161,
+              "col_start": 28,
+              "line_end": 161,
+              "col_end": 67
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 10349,
+              "substs_digest": [
+                13460117749033082560,
+                14049506438694851451
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 51,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 45,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 161,
+                "col_start": 28,
+                "line_end": 161,
+                "col_end": 67
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 23
+        }
+      },
+      {
+        "id": 23,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 53,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 51,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 161,
+                "col_start": 28,
+                "line_end": 161,
+                "col_end": 67
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::iter::adapters::zip::Zip<core::slice::iter::IterMut<'_, [u8; 4]>, core::slice::iter::Iter<'_, u32>> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Copy": {
+                  "local": 53,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 52,
+              "projections": []
+            },
+            "target": 24,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 161,
+              "col_start": 28,
+              "line_end": 161,
+              "col_end": 67
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 10530,
+              "substs_digest": [
+                13460117749033082560,
+                14049506438694851451
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 24,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 54,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 52,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 161,
+                "col_start": 28,
+                "line_end": 161,
+                "col_end": 67
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 54,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                27
+              ],
+              [
+                1,
+                26
+              ]
+            ],
+            "otherwise": 25,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 161,
+              "col_start": 28,
+              "line_end": 161,
+              "col_end": 67
+            }
+          }
+        }
+      },
+      {
+        "id": 25,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 26,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 55,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 52,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 161,
+                "col_start": 13,
+                "line_end": 161,
+                "col_end": 17
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 56,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 52,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      },
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 161,
+                "col_start": 19,
+                "line_end": 161,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 58,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 56,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 162,
+                "col_start": 20,
+                "line_end": 162,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl u32>::to_be_bytes",
+            "args": [
+              {
+                "Move": {
+                  "local": 58,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 57,
+              "projections": []
+            },
+            "target": 28,
+            "span": {
+              "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+              "line_start": 162,
+              "col_start": 20,
+              "line_end": 162,
+              "col_end": 38
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 1997058143751125963,
+              "def_index": 27720,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 1997058143751125963,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 27,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 40,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 164,
+                "col_start": 8,
+                "line_end": 164,
+                "col_end": 11
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 28,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 55,
+                "projections": [
+                  "Deref"
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 57,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "repro/aterm-digest-848d791bd/src/sha256.rs",
+                "line_start": 162,
+                "col_start": 12,
+                "line_end": 162,
+                "col_end": 38
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 23
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Array": {
+        "elem": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "len": 32
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_54",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_54",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

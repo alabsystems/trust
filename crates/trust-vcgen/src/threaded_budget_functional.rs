@@ -87,8 +87,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::HashMap;
-
+use trust_types::fx::FxHashMap;
 use trust_types::{
     BlockId, Formula, Place, Projection, Sort, Terminator, Ty, VcKind, VerifiableFunction,
     VerificationCondition,
@@ -440,11 +439,12 @@ fn emit_cluster(
 
     // Coverage: the step arms cover every payload constructor exactly once;
     // exactly one pinned base per member/reference.
-    let all_tags: Vec<usize> = (0..payload_variants.len()).collect();
     for mo in outs.iter_mut().chain(ref_outs.iter_mut()) {
         mo.steps.sort_by_key(|a| a.tag);
-        let tags: Vec<usize> = mo.steps.iter().map(|a| a.tag).collect();
-        if tags != all_tags || mo.base.len() != 1 {
+        if mo.steps.len() != payload_variants.len()
+            || !mo.steps.iter().enumerate().all(|(idx, a)| a.tag == idx)
+            || mo.base.len() != 1
+        {
             return None;
         }
     }
@@ -578,14 +578,16 @@ fn is_remainder_of(f: &Formula, res_dt: &Ty, prev: &Formula) -> bool {
     let Ty::Datatype { name, variants } = res_dt else {
         return false;
     };
-    let Some((_, fields)) = variants.first() else {
+    let Some((ctor, fields)) = variants.first() else {
         return false;
     };
     let Some((fuel_field, _)) = fields.first() else {
         return false;
     };
+    // The selector as the builders and the declaration spell it.
+    let fuel_selector = trust_types::datatype_selector_name(ctor, fuel_field);
     matches!(f, Formula::Sel { datatype, field, arg, .. }
-        if datatype == name && field == fuel_field && arg.as_ref() == prev)
+        if datatype == name && *field == fuel_selector && arg.as_ref() == prev)
 }
 
 /// Whether `f` is the payload-field selection `<call value>.1`; returns the
@@ -594,12 +596,12 @@ fn payload_of_call(f: &Formula, res_dt: &Ty, calls: &[Formula]) -> Option<usize>
     let Ty::Datatype { name, variants } = res_dt else {
         return None;
     };
-    let (_, fields) = variants.first()?;
+    let (ctor, fields) = variants.first()?;
     let (payload_field, _) = fields.get(1)?;
     let Formula::Sel { datatype, field, arg, .. } = f else {
         return None;
     };
-    (datatype == name && field == payload_field)
+    (datatype == name && *field == trust_types::datatype_selector_name(ctor, payload_field))
         .then(|| calls.iter().position(|c| c == arg.as_ref()))
         .flatten()
 }
@@ -642,7 +644,13 @@ fn twalk(
         return false;
     }
     let func = cx.members[cx.member_idx];
-    let Some(block) = func.body.blocks.iter().find(|b| b.id == block_id) else {
+    let Some(block) = func
+        .body
+        .blocks
+        .get(block_id.0)
+        .filter(|b| b.id == block_id)
+        .or_else(|| func.body.blocks.iter().find(|b| b.id == block_id))
+    else {
         return false;
     };
 
@@ -673,7 +681,7 @@ fn twalk(
             let [rem, tree] = args.as_slice() else {
                 return false;
             };
-            match (fuel, state.ctor.clone()) {
+            match (fuel, state.ctor.take()) {
                 (FuelLayer::None, _) => false,
                 (FuelLayer::Base, None) => {
                     // PINNED exhaustion: `Mk(Z, e)` — zero remainder, input
@@ -690,36 +698,35 @@ fn twalk(
                     if !z_ok || tree.var_name() != Some(e_name.as_str()) {
                         return false;
                     }
-                    out.base.push(subst_post(func, post, &state, result.clone()));
+                    out.base.push(subst_post(func, post, &state, result));
                     out.base.len() == 1
                 }
                 (FuelLayer::Base, Some(_)) | (FuelLayer::Step, None) => false,
                 (FuelLayer::Step, Some((tag, ctor_name))) => {
                     // Remainder: `k` (call-free) or the LAST call's remainder.
-                    let Some(k_name) = arm.k_name.clone() else {
+                    let Some(k_name) = arm.k_name.as_deref() else {
                         return false;
                     };
                     let rem_ok = if let Some(last) = arm.call_values.last() {
                         is_remainder_of(rem, res_dt, last)
                     } else {
-                        rem.var_name() == Some(k_name.as_str())
+                        rem.var_name() == Some(k_name)
                     };
                     if !rem_ok {
                         return false;
                     }
-                    let payload_dt = out.payload_dt.clone();
-                    let Some(payload_dt) = payload_dt else {
+                    let Some(payload_dt) = &out.payload_dt else {
                         return false;
                     };
-                    if !valid_payload_tree(tree, &arm, res_dt, &payload_dt) {
+                    if !valid_payload_tree(tree, &arm, res_dt, payload_dt) {
                         return false;
                     }
-                    let conclusion = subst_post(func, post, &state, result.clone());
+                    let conclusion = subst_post(func, post, &state, result);
                     let body = if state.ih_atoms.is_empty() {
                         conclusion
                     } else {
                         Formula::Implies(
-                            Box::new(conjoin_all(state.ih_atoms.clone())),
+                            Box::new(conjoin_all(state.ih_atoms)),
                             Box::new(conclusion),
                         )
                     };
@@ -728,7 +735,7 @@ fn twalk(
                     out.steps.push(ArmRec {
                         tag,
                         ctor: ctor_name,
-                        callees: arm.callees.clone(),
+                        callees: arm.callees,
                         formula: Formula::forall(&refs, body),
                     });
                     true
@@ -768,9 +775,7 @@ fn twalk(
                     };
                     let mut tags: Vec<usize> = targets.iter().map(|(t, _)| *t as usize).collect();
                     tags.sort_unstable();
-                    let mut expected = vec![z_tag, s_tag];
-                    expected.sort_unstable();
-                    if tags != expected {
+                    if tags.as_slice() != [z_tag.min(s_tag), z_tag.max(s_tag)] {
                         return false;
                     }
                     out.fuel_dt = Some(dt.clone());
@@ -841,7 +846,7 @@ fn twalk(
                     let dt_sort = crate::sort_for_ty(&dt);
                     for (tag, target) in targets {
                         let tag = *tag as usize;
-                        let Some((ctor, fields)) = variants.get(tag).cloned() else {
+                        let Some((ctor, fields)) = variants.get(tag) else {
                             return false;
                         };
                         let mut arm_state = state.clone();
@@ -862,7 +867,7 @@ fn twalk(
                                 sort: dt_sort.clone(),
                             },
                         );
-                        arm_state.ctor = Some((tag, ctor));
+                        arm_state.ctor = Some((tag, ctor.clone()));
                         if !twalk(cx, *target, arm_state, arm_cx, fuel, depth + 1, ih_counter, out)
                         {
                             return false;
@@ -925,7 +930,8 @@ fn twalk(
                     state.store.insert(dest.local, ih_var.clone());
                     // The REMAINDER-THREADING IH atom: the callee's
                     // postcondition at the threaded fuel.
-                    let mut map: HashMap<String, Formula> = HashMap::new();
+                    let mut map: FxHashMap<String, Formula> =
+                        FxHashMap::with_capacity_and_hasher(3, Default::default());
                     map.insert(
                         crate::place_to_var_name(callee_fn, &Place::local(FUEL_LOCAL)),
                         fuel_arg,
@@ -1123,6 +1129,8 @@ pub mod fixtures {
         let call = |a: usize, b: usize, dst: usize, next: usize| Terminator::Call {
             is_unsafe_sig: false,
             callee_identity: None,
+            // NO KEY: synthesized terminator, no compiler-resolved callee. Fails closed.
+            callee_key: None,
             is_foreign: false,
             func: callee.to_string(),
             args: vec![Operand::Move(Place::local(a)), Operand::Move(Place::local(b))],
@@ -1339,6 +1347,7 @@ pub mod fixtures {
             preconditions: vec![],
             postconditions: post,
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1445,7 +1454,8 @@ mod tests {
             panic!("atom 1's fuel must be the previous call's REMAINDER, got {:?}", args[0]);
         };
         assert_eq!(datatype, "res::Res");
-        assert_eq!(field, "0");
+        // `Mk`'s field 0, as `Sort::from_ty` declares it (TRUST-04).
+        assert_eq!(field, "Mk.0");
         assert_eq!(arg.var_name(), Some("__ih1"));
         // Conclusion: `Mk(__ih2.0, M(__ih1.1, __ih2.1)) = fr(S k, M(x, y))`.
         let Formula::Eq(c_l, c_r) = concl.as_ref() else { panic!() };

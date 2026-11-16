@@ -1,5 +1,8 @@
 //@ revisions: positive nested by_ref non_scalar effectful promoted promote_wanted enum_promote_wanted
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //@ dont-check-compiler-stderr
 //@[positive] run-pass
 
@@ -75,11 +78,16 @@ pub fn by_ref_alternative(t: (i32, i32)) -> i32 {
 
 // A tuple-valued field is not a scalar carrier even though both alternatives
 // bind the same Rust local and type.
+// (RE-PINNED 2026-09-14: the literal field is an INT — a `bool` literal is refused earlier,
+// as `TupleMatch(bool literal field)`, before any bind gate is consulted — and the or-lane's
+// bind witness names the refusal: an alternative binding a non-scalar carrier is refused as
+// `or-pattern alternative not scalar by-value` (measured on the 2026-09-14 stage1).)
 #[cfg(non_scalar)]
-pub fn non_scalar_binding(t: ((i32, i32), bool)) -> i32 {
-    //[non_scalar]~^ ERROR TupleMatch(non-scalar field binding)
+pub fn non_scalar_binding(t: ((i32, i32), i32)) -> i32 {
+    //[non_scalar]~^ ERROR TupleMatch(or-pattern alternative not scalar by-value)
     match t {
-        (pair, true) | (pair, false) => pair.0,
+        (pair, 1) | (pair, 2) => pair.0,
+        _ => 0,
     }
 }
 

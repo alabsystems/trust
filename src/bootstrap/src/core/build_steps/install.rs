@@ -8,12 +8,16 @@ use std::{env, fs};
 
 use crate::core::build_steps::dist;
 use crate::core::build_steps::tool::{self, RustcPrivateCompilers};
-use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
+use crate::core::builder::{Builder, CommandLineStep, Kind, RunConfig, ShouldRun};
+use crate::core::compiler::Compiler;
 use crate::core::config::{Config, TargetSelection};
 use crate::utils::exec::command;
 use crate::utils::helpers::t;
 use crate::utils::tarball::GeneratedTarball;
-use crate::{Compiler, Kind};
+
+// Trust: an explicit compiled transaction, separate from mutable prefix installation.
+mod wp;
+pub(crate) use wp::{WpInstallation, is_wp_installation, validate_wp_installation};
 
 #[cfg(target_os = "illumos")]
 const SHELL: &str = "bash";
@@ -203,7 +207,7 @@ macro_rules! install {
             }
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ();
             const IS_HOST: bool = $IS_HOST;
             $(const $c: bool = true;)*
@@ -374,17 +378,23 @@ pub struct Src {
     stage: u32,
 }
 
-impl Step for Src {
+impl CommandLineStep for Src {
     type Output = ();
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("src")
+        // Trust: accept the owned component spelling and its compatibility name.
+        // `src` remains a directory selector, including its existing docs step.
+        run.alias("trust-src").alias("rust-src")
     }
 
     fn is_default_step(builder: &Builder<'_>) -> bool {
         let config = &builder.config;
-        config.extended && config.tools.as_ref().is_none_or(|t| t.contains("src"))
+        // Trust: committed compiler/tools profiles use the legacy `src` allowlist.
+        config.extended
+            && (config.tools.as_ref().is_none_or(|t| t.contains("trust-src"))
+                || config.tools.as_ref().is_none_or(|t| t.contains("rust-src"))
+                || config.tools.as_ref().is_none_or(|t| t.contains("src")))
     }
 
     fn make_run(run: RunConfig<'_>) {

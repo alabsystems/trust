@@ -674,6 +674,9 @@ fn share_dependencies() {
 
                 [workspace]
                 members = ["bar"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -688,6 +691,9 @@ fn share_dependencies() {
 
                 [dependencies]
                 dep1 = "< 0.1.5"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/main.rs", "fn main() {}");
@@ -699,7 +705,7 @@ fn share_dependencies() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] dep1 v0.1.3 (available: v0.1.8)
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep1 v0.1.3 (registry `dummy-registry`)
@@ -749,7 +755,7 @@ fn fetch_fetches_all() {
     p.cargo("fetch")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] dep1 v0.1.3 (registry `dummy-registry`)
 
@@ -774,6 +780,9 @@ fn lock_works_for_everyone() {
 
                 [workspace]
                 members = ["bar"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -788,6 +797,9 @@ fn lock_works_for_everyone() {
 
                 [dependencies]
                 dep1 = "0.1"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/main.rs", "fn main() {}");
@@ -799,7 +811,7 @@ fn lock_works_for_everyone() {
     p.cargo("generate-lockfile")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 
 "#]])
         .run();
@@ -1888,73 +1900,6 @@ fn glob_syntax() {
     assert!(p.root().join("crates/qux/Cargo.lock").is_file());
 }
 
-/*FIXME: This fails because of how workspace.exclude and workspace.members are working.
-#[cargo_test]
-fn glob_syntax_2() {
-    let p = project()
-        .file("Cargo.toml", r#"
-            [package]
-            name = "foo"
-            version = "0.1.0"
-            edition = "2015"
-            authors = []
-
-            [workspace]
-            members = ["crates/b*"]
-            exclude = ["crates/q*"]
-        "#)
-        .file("src/main.rs", "fn main() {}")
-        .file("crates/bar/Cargo.toml", r#"
-            [package]
-            name = "bar"
-            version = "0.1.0"
-            edition = "2015"
-            authors = []
-            workspace = "../.."
-        "#)
-        .file("crates/bar/src/main.rs", "fn main() {}")
-        .file("crates/baz/Cargo.toml", r#"
-            [package]
-            name = "baz"
-            version = "0.1.0"
-            edition = "2015"
-            authors = []
-            workspace = "../.."
-        "#)
-        .file("crates/baz/src/main.rs", "fn main() {}")
-        .file("crates/qux/Cargo.toml", r#"
-            [package]
-            name = "qux"
-            version = "0.1.0"
-            edition = "2015"
-            authors = []
-        "#)
-        .file("crates/qux/src/main.rs", "fn main() {}");
-    p.build();
-
-    p.cargo("build").run();
-    assert!(p.bin("foo").is_file());
-    assert!(!p.bin("bar").is_file());
-    assert!(!p.bin("baz").is_file());
-
-    p.cargo("build").cwd("crates/bar").run();
-    assert!(p.bin("foo").is_file());
-    assert!(p.bin("bar").is_file());
-
-    p.cargo("build").cwd("crates/baz").run();
-    assert!(p.bin("foo").is_file());
-    assert!(p.bin("baz").is_file());
-
-    p.cargo("build").cwd("crates/qux").run();
-    assert!(!p.bin("qux").is_file());
-
-    assert!(p.root().join("Cargo.lock").is_file());
-    assert!(!p.root().join("crates/bar/Cargo.lock").is_file());
-    assert!(!p.root().join("crates/baz/Cargo.lock").is_file());
-    assert!(p.root().join("crates/qux/Cargo.lock").is_file());
-}
-*/
-
 #[cargo_test]
 fn glob_syntax_invalid_members() {
     let p = project()
@@ -2020,6 +1965,9 @@ fn dep_used_with_separate_features() {
 
                 [features]
                 myfeature = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("feat_lib/src/lib.rs", "")
@@ -2034,6 +1982,9 @@ fn dep_used_with_separate_features() {
 
                 [dependencies]
                 feat_lib = { path = "../feat_lib" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("caller1/src/main.rs", "fn main() {}")
@@ -2050,6 +2001,9 @@ fn dep_used_with_separate_features() {
                 [dependencies]
                 feat_lib = { path = "../feat_lib", features = ["myfeature"] }
                 caller1 = { path = "../caller1" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("caller2/src/main.rs", "fn main() {}")
@@ -2112,7 +2066,14 @@ fn dep_used_with_separate_features() {
 fn dont_recurse_out_of_cargo_home() {
     let git_project = git::new("dep", |project| {
         project
-            .file("Cargo.toml", &basic_manifest("dep", "0.1.0"))
+            .file(
+                "Cargo.toml",
+                &format!(
+                    "{}{}",
+                    basic_manifest("dep", "0.1.0"),
+                    crate::utils::tools::jobserver_build_dependency()
+                ),
+            )
             .file("src/lib.rs", "")
             .file(
                 "build.rs",
@@ -2122,13 +2083,15 @@ fn dont_recurse_out_of_cargo_home() {
                     use std::process::{self, Command};
 
                     fn main() {
+                        let jobserver = unsafe { jobserver_utils::InheritedJobserver::from_env() }
+                            .expect("inherit build-script jobserver");
                         let cargo = env::var_os("CARGO").unwrap();
                         let cargo_manifest_dir = env::var_os("CARGO_MANIFEST_DIR").unwrap();
-                        let output = Command::new(cargo)
-                            .args(&["metadata", "--format-version", "1", "--manifest-path"])
-                            .arg(&Path::new(&cargo_manifest_dir).join("Cargo.toml"))
-                            .output()
-                            .unwrap();
+                        let mut command = Command::new(cargo);
+                        command.args(&["metadata", "--format-version", "1", "--manifest-path"])
+                            .arg(&Path::new(&cargo_manifest_dir).join("Cargo.toml"));
+                        jobserver.configure(&mut command);
+                        let output = command.output().unwrap();
                         if !output.status.success() {
                             eprintln!("{}", String::from_utf8(output.stderr).unwrap());
                             process::exit(1);
@@ -2162,30 +2125,6 @@ fn dont_recurse_out_of_cargo_home() {
         .env("CARGO_HOME", p.root().join(".cargo"))
         .run();
 }
-
-// FIXME: this fails because of how workspace.exclude and workspace.members are working.
-/*
-#[cargo_test]
-fn include_and_exclude() {
-    let p = project()
-        .file("Cargo.toml", r#"
-            [workspace]
-            members = ["foo"]
-            exclude = ["foo/bar"]
-            "#)
-        .file("foo/Cargo.toml", &basic_manifest("foo", "0.1.0"))
-        .file("foo/src/lib.rs", "")
-        .file("foo/bar/Cargo.toml", &basic_manifest("bar", "0.1.0"))
-        .file("foo/bar/src/lib.rs", "");
-    p.build();
-
-    p.cargo("build").cwd("foo").run();
-    assert!(p.root().join("target").is_dir());
-    assert!(!p.root().join("foo/target").is_dir());
-    p.cargo("build").cwd("foo/bar").run();
-    assert!(p.root().join("foo/bar/target").is_dir());
-}
-*/
 
 #[cargo_test]
 fn cargo_home_at_root_works() {
@@ -2263,7 +2202,14 @@ fn relative_rustc() {
                     for arg in env::args_os().skip(1) {
                         cmd.arg(arg);
                     }
-                    std::process::exit(cmd.status().unwrap().code().unwrap());
+                    // Trust: this compiler proxy has no work after forwarding.
+                    #[cfg(unix)] {
+                        use std::os::unix::process::CommandExt;
+                        panic!("failed to exec rustc: {}", cmd.exec());
+                    }
+                    #[cfg(not(unix))] {
+                        std::process::exit(cmd.status().unwrap().code().unwrap());
+                    }
                 }
             "#,
         )
@@ -2345,7 +2291,6 @@ fn ws_err_unused() {
         "[features]",
         "[target]",
         "[badges]",
-        "[lints]",
     ] {
         let key = table.trim_start_matches('[').trim_end_matches(']');
         let p = project()
@@ -2371,6 +2316,55 @@ fn ws_err_unused() {
 
 Caused by:
   this virtual manifest specifies a `{key}` section, which is not allowed
+",
+            ))
+            .run();
+    }
+}
+
+#[cargo_test]
+fn ws_err_unused_similar_suggest() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "[lints]",
+            "[HELP] a similar field exists: `[workspace.lints]`",
+        ),
+        (
+            "[lints.rust]",
+            "[HELP] a similar field exists: `[workspace.lints]`",
+        ),
+        (
+            "[lints.clippy]",
+            "[HELP] a similar field exists: `[workspace.lints]`",
+        ),
+    ];
+    for (table, suggestion) in cases {
+        let key = table.trim_start_matches('[').trim_end_matches(']');
+        let key = key.split_once('.').map(|p| p.0).unwrap_or(key);
+        let p = project()
+            .file(
+                "Cargo.toml",
+                &format!(
+                    r#"
+                    [workspace]
+                    members = ["a"]
+
+                    {table}
+                    "#,
+                ),
+            )
+            .file("a/Cargo.toml", &basic_lib_manifest("a"))
+            .file("a/src/lib.rs", "")
+            .build();
+        p.cargo("check")
+            .with_status(101)
+            .with_stderr_data(&format!(
+                "\
+[ERROR] failed to parse manifest at `[..]/foo/Cargo.toml`
+
+Caused by:
+  this virtual manifest specifies a `{key}` section, which is not allowed
+  {suggestion}
 ",
             ))
             .run();
@@ -2449,7 +2443,7 @@ fn ws_warn_path() {
 
     p.cargo("check").with_stderr_data(str![[r#"
 [WARNING] a/Cargo.toml: the cargo feature `edition` has been stabilized in the 1.31 release and is no longer necessary to be listed in the manifest
-  See https://doc.rust-lang.org/cargo/reference/manifest.html#the-edition-field for more information about using this feature.
+  See https://doc.rust-lang.org/[..]cargo/reference/manifest.html#the-edition-field for more information about using this feature.
 [WARNING] `foo` (manifest) generated 1 warning
 [CHECKING] foo v0.1.0 ([ROOT]/foo/a)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -2479,19 +2473,9 @@ fn invalid_missing() {
     p.cargo("check -q")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[ERROR] failed to get `x` as a dependency of package `foo v0.1.0 ([ROOT]/foo)`
-
-Caused by:
-  failed to load source for dependency `x`
-
-Caused by:
-  unable to update [ROOT]/foo/x
-
-Caused by:
-  failed to read `[ROOT]/foo/x/Cargo.toml`
-
-Caused by:
-  [NOT_FOUND]
+[ERROR] no matching package named `x` found
+location searched: [ROOT]/foo/x
+required by package `foo v0.1.0 ([ROOT]/foo)`
 
 "#]])
         .run();

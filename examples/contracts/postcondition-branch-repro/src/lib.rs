@@ -2,7 +2,7 @@
 // constrain the joined return slot on every predecessor path.
 //
 // Run (from this directory):
-//   cargo clean && targo trust check --allow-l0-gaps
+//   targo clean && targo trust check --allow-l0-gaps
 //
 // Required result:
 //   one_path [VERIFIED]  (one postcondition proved)

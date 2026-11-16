@@ -3,6 +3,11 @@
 **Author:** Andrew Yates <andrewyates.name@gmail.com>
 **License:** MIT OR Apache-2.0
 
+The version is deliberately not restated here: `[package] version` in this
+crate's `Cargo.toml`, and the releases page, are the authorities, and neither
+can drift from itself. A number repeated in a README is one more thing to bump
+on every promote, and therefore one more thing to miss.
+
 <!--
 cite:
 - Cargo.toml
@@ -125,7 +130,11 @@ targo trust check --no-hardened
 targo trust check --trust-profile coreutils_hardened
 targo trust check --standalone --format json
 targo trust check --standalone --no-hardened --format json
+targo trust check --report-dir target/trust   # writes target/trust/report.json
 targo trust report-query --report target/trust/report.json --function divide_safe
+targo trust check --lib --save-baseline trust.baseline   # commit the proved obligation keys
+targo trust diff --baseline trust.baseline              # exit 1 on any lost proof, 3 if not measured
+targo trust stability --axes repetition,path --lib       # same inputs, same verdict vector: exit 1 names every moved key
 targo trust hardened-lab
 targo trust hardened-lab --manifest-path examples/hardened/Cargo.toml --format json
 targo trust hardened-lab --json --show-vcs
@@ -170,15 +179,46 @@ installed toolchain does.
 What that lane accepts is narrower than `clean check`, in two directions that
 both fail closed:
 
-- External `.olean` import search is disabled. Only Clean's built-in preludes
-  resolve, so a file that depends on an outside library is rejected, never
-  silently checked against a smaller environment.
+- External `.olean` import search is disabled. Clean's built-in preludes and
+  resolved local `.lean` sources are checked in one batch. An unresolved
+  dependency rejects that batch; it is never silently checked against a
+  smaller environment.
 - The strict island policy applies: an `axiom`, a `sorry`, a valueless
   `opaque`, a `partial`/`unsafe` marker, or any trust debt in a theorem's
   reachable closure is a rejection even where the kernel alone would accept it.
 
-`targo trust build` has no Lean lane. Compiling Clean to an artifact judges
-nothing, and a successful compile must not be readable as a discharged proof.
+An explicit, bounded Lean library-artifact path is also available:
+
+```lean
+-- add8.lean
+def add8 (a b : UInt8) : UInt8 := a + b
+```
+
+```bash
+targo trust build add8.lean --emit=trust-ir --out add8.trust-ir.json
+```
+
+The output is a `trust.lean.ir-library/v1` JSON envelope containing canonical
+binary Trust-IR, the exact checked local sources, the complete newly added
+declaration roster and per-body source/IR bindings. It is not a raw `.tir`, an
+executable, or a transferable proof certificate. An importer must recheck the
+sources and independently revalidate the actual decoded IR; serialized labels
+and hashes alone grant no authority. The output must be a new path; existing
+files and symlinks are preserved.
+
+Every computational declaration in the checked source closure must pass the
+independent source/SSA gate for wrapping add/subtract/multiply or ordinary
+parameter/literal returns over `UInt8`, `UInt16`, `UInt32` or `UInt64`. Parameter
+and literal returns preserve mixed argument widths exactly. Literal returns admit
+zero through the carrier's maximum, with no parameters or unused parameters
+at their exact individual UInt widths, including widths different from the
+result. Other carriers, unsupported siblings and generated computational declarations
+reject the whole artifact instead of disappearing. Kernel-accepted proof-only
+declarations are retained in a separate roster, not emitted as functions.
+General Lean lowering, native executable codegen, cross-language linking and
+complete program-obligation proofs remain unfinished. Plain `build FILE.lean`
+still reports that native Lean codegen is unavailable; artifact success does
+not mean those missing requirements have passed.
 
 A nonzero expected-obligation count is necessary but not sufficient for those
 single-file Rust commands to contribute proof evidence. The report must also contain
@@ -338,6 +378,26 @@ not promote that result to proof or release evidence.
   walkthrough binary failed.
 - Exit code `2` means `targo-trust` hit an internal setup or argument error,
   including invalid `hardened-lab` usage or unreadable corpus setup.
+- Exit code `3` on native `check`/`build`/`report`/`test` means COULD NOT RUN:
+  the run is not a measurement and failed for that alone, so it is no verdict
+  either way (a lane that would have passed, or failed on an unproved row,
+  exits 3 instead). Its rows' outcome is `could-not-run` or
+  `not-reproducible` (a refused solver admission, a row with no stable key, a
+  clock, an RSS reading, a solver fault or an unexplained stop), its
+  `[trust] backstop` ended the compiler, or the trustd that admits its solvers
+  could not be established. A refuted obligation still exits `1`, and failing
+  tests, a compiler error the rows do not account for, or a hardened or
+  Cargo-exclusion gate failure exit as a measured run does. `check --rewrite`
+  and `loop` exit 3 when the loop converged on rows that are no measurement.
+  Any command also exits 3 when SIGINT, SIGTERM or SIGHUP, or the end of the
+  process that started it, interrupts it: every child it started is stopped
+  first (SIGTERM, then SIGKILL after 10 s or at once on a second signal), and
+  the `COULD NOT RUN` line names the stop cause. If `targo-trust` itself is
+  killed, a stop sentinel it started stops those children the same way
+  (`docs/cli-reference.md`, "Signals and child processes"). That exit is
+  `targo-trust`'s: through `targo trust`, a shell still reads 130 after a
+  Ctrl-C or 143 after a SIGTERM to `targo`, until the `targo` wrapper passes 3
+  through (owed, DECISION_QUEUE T5a-4).
 - `targo trust check` and `targo trust report` require native verification through Trust-preferred `trustc` driven with Trust-owned verifier flags. Rust-compatible aliases inside the same Trust sysroot are compatibility surface; ambient external Rust tools are not Trust evidence.
 - `--standalone` is an explicit source-inventory mode for `check` and `report`; it is never selected silently.
 - Hardened mode is the default for native `check`/`build`/`report` and explicit
@@ -375,22 +435,49 @@ version = "0.1.0"
 
 [trust]
 level = "L1"
-function_budget_ms = 45000
+backstop = 2000
 ```
 
-`targo-trust` accepts `enabled`, `level`, `timeout_ms`, `function_budget_ms`,
-`skip_functions`, `codegen_backend`, `hardened`, `trust_profile`, and `intent`.
+`targo-trust` accepts `enabled`, `level`, `effort`, `backstop`,
+`skip_functions`, `codegen_backend`, `hardened`, `trust_profile`, `intent`, and
+`require_dep_evidence`. `backstop` (workspace root only, per mille, default
+`1000`) is the run's one wall-clock backstop: it scales the per-query and
+per-function clocks and, above 1000 but never below, the bounds of each
+verified compiler process, 8 hours absolute with a progress watchdog beneath it
+(a process that drains nothing
+from its pipes and consumes no CPU for 30 minutes, or never produced anything
+within 2 hours, is stopped as stalled: SIGTERM to its process tree, then
+SIGKILL to whatever still runs 10 s later). A run a backstop ends could not run
+and exits 3. A crate with thousands of verified functions that legitimately runs
+longer raises `backstop`; how long a crate may take to verify is policy, not a
+constant. `compiler_timeout_secs`, the former separate ceiling, is retired into
+`backstop` and refused naming it.
 The former `verify_functions` placeholder was never wired into verification and
 is rejected as an unknown key. Use `targo trust check --function <selector>`
 when you need focused report and exit semantics; the compiler still verifies the
 complete selected target.
 
-`timeout_ms` is required to be positive and is enforced through the compiler's
-tracked per-obligation timeout option; it is not an advisory/report-only field.
+The budgets are two keys, set only in the workspace root's `[trust]` table.
+`effort` (default `384`, 1 through 100000) is the scale `k` of the one
+deterministic solver count: each query on the router's AY lanes gets
+`min(100000, max(1, k * size))` SAT conflicts per SAT solve, `size` being its number of
+distinct terms, passed as tracked `-Ztrust-verify-effort` and sent to AY as
+`:rlimit` before every `check-sat`. `backstop` (default `1000`, at least 1) is
+the wall-clock backstop in per mille of the reference clocks, 5,000 ms per
+query and 120,000 ms per function, which targo passes as the tracked
+`-Ztrust-verify-timeout-ms` and `-Ztrust-verify-function-budget-ms`. The report
+header's budget profile id hashes both, so two reports with the same id ran
+under the same bounds. An inherited RUSTFLAGS spelling of these options is
+ignored with a notice, and TRUSTFLAGS is not read at all (see "Per-run
+selections" below).
 
-In a workspace, a `[trust]` table in the root manifest fills only the keys a
-member left unwritten. A member's own declaration always wins, so a permissive
-workspace root cannot lower the level a member crate asked to be proved at.
+In a workspace, the root manifest's `[trust]` table is the policy of every
+member, whichever member a run starts in or selects (`-p`, `--workspace`): one
+workspace has one policy. A member's own `[trust]` table, of any keys or none,
+or a `trust.toml` beside it, is refused (exit 2), naming what it declares and
+the root's manifest to move it to, so no member table governs one run and is
+ignored by the next. A crate that must be proved at another level, or with
+another profile, is made a workspace of its own.
 
 For verifier entrypoints (`check`, `build`, and `report`), a present policy must
 be readable and valid; invalid TOML, unknown keys, invalid levels, or invalid
@@ -411,6 +498,49 @@ label under
 `hardened.profile.name` and the active category list under
 `hardened.profile.enabled_categories`. `--backend` overrides
 `codegen_backend`.
+
+### Per-run selections
+
+A verdict depends only on declared inputs: the command line, the manifests and
+Cargo configuration. Each choice a single run can make has one spelling:
+
+* the lane: `--certify`, `--memory-safe`, or `--allow-l0-gaps`/`--survey`
+  (strict is the default);
+* the hardened profile: `--trust-profile <name>` or `--no-hardened` (or the
+  `[trust]` `hardened`/`trust_profile` keys);
+* the verifier's worker threads: `--worker-threads <N>` (0 through 256; 0, the
+  default, is no cap). The budget profile records the count; it is not in the
+  profile id;
+* a level below the resolved one: `level` in the `[trust]` table, and nothing
+  else;
+* a tightening (a higher level, `-Ztrust-verify-include-dependencies=yes`,
+  `-Ztrust-ir-lower=strict`): Cargo configuration, the project's committed
+  `.cargo/config.toml` or `--config` for one run, as `-Ztrust-*` rustflags of
+  the `[build]` or a matching `[target]` table. The project-policy query reads them,
+  adopts each requirement that only tightens the run (a weaker one is refused,
+  naming the selection above that runs it), and targo carries the adopted
+  requirements to the compiler itself, last in the verified lane.
+
+`TRUSTFLAGS` and `CARGO_ENCODED_TRUSTFLAGS`, the per-run `-Ztrust-*` channel
+until 2026-10-11, are not read: a non-empty one is ignored with one notice naming
+where each selection lives (determinism plan §3.6; `docs/DECISION_QUEUE.md`
+T7a). `-Ztrust-*` in an inherited RUSTFLAGS is stripped with a warning, as
+before.
+
+The project's own rustflags reach a verified compile (determinism plan §5.3,
+`docs/DECISION_QUEUE.md` T14-APPEND-1). `targo trust` hands the sibling Targo
+its lane (the level, policy, backend, codegen contract, safety checks,
+verification controls and adopted requirements) in the private variable
+`TRUST_TARGO_LANE_RUSTFLAGS`, and leaves RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS
+alone. Targo resolves the project's flags by Cargo's own precedence (the
+environment, else the matching `[target]` and `[target.'cfg(..)']` tables,
+else `[build]`), then appends the lane, so a unit compiles with
+`<project> <lane>`: a committed `[target.'cfg(trust_verify)'] rustflags =
+["--cfg", "clean_islands"]` reaches verification. The lane owns the codegen
+backend, LLVM plugins, `-Cllvm-args`, the strict safety checks and trust-cg's
+codegen contract: a project spelling of one is dropped with a notice naming its
+source (T14-APPEND-2). A configured `-Ztrust-*` token is a requirement that
+must match the lane, and a configured `-Ztrust-verify=off` refuses the run.
 
 ## Maintainer/Debug Transport
 

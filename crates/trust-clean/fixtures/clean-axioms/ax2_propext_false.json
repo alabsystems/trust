@@ -1,0 +1,1 @@
+{"term": {"Const": "propext"}, "context": [{"name": "False", "entry": {"Definition": {"ty": {"Sort": 1}, "value": {"Sort": 0}}}}, {"name": "propext", "entry": {"Axiom": {"ty": {"Const": "False"}}}}]}

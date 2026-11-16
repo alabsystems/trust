@@ -150,7 +150,12 @@ fn decode_hex(hex: &str) -> Vec<u8> {
     let compact = hex.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
     let bytes = compact.as_bytes();
     assert_eq!(bytes.len() % 2, 0, "hex fixture should have an even length");
-    bytes.chunks_exact(2).map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1])).collect()
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
+        .collect()
 }
 
 fn hex_nibble(byte: u8) -> u8 {

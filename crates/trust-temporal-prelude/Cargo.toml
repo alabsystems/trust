@@ -1,0 +1,24 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-temporal-prelude — Trust's canonical temporal vocabulary (Clean source
+# text: `Trust.Temporal`, `Trust.FiniteModel`, and the executable checker
+# `Trust.FiniteModelCheck`) for the compiler lanes that elaborate it. The
+# files are the ones `trust-spec-temporal` certifies against; this crate
+# carries only their text, with NO dependencies, so a compiler crate
+# can serve the vocabulary to `clean { … }` islands without linking the
+# temporal certification stack (its own workspace, with its own `[patch]`
+# closure). Design: aterm `docs/DESIGN-trust-temporal-models-2026-09-29.md`
+# §5 P1.
+
+[package]
+name = "trust-temporal-prelude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"

@@ -13,7 +13,7 @@ pins:
     (PARITY-MATCH), demonstrating the edit-loop key + the measurement fire.
 
 Run after `x.py build --stage 2`:
-    TRUST_SEED_STAIRCASE=1 python3 tests/trust-witness/precise_parity_smoke.py
+    python3 tests/trust-witness/precise_parity_smoke.py
 """
 import subprocess, os, sys, re, glob, hashlib, tempfile
 
@@ -34,7 +34,7 @@ BASE = ["-Zthreads=1", "-Ztrust-verify=off", "-Ztrust-witness=off",
 
 def run(extra, outdir, stats=False):
     os.makedirs(outdir, exist_ok=True)
-    env = dict(os.environ); env["TRUST_SEED_STAIRCASE"] = "1"
+    env = dict(os.environ)
     if stats:
         env["TRUST_WITNESS_STATS"] = "1"
     return subprocess.run([TRUSTC] + BASE + extra + ["--out-dir", outdir, SRC],

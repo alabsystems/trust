@@ -5,26 +5,131 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use arg_file_command::ArgFileCommand;
-use shared_helpers::{
-    RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV, activate_cargo_test_shim_environment,
-    cargo_test_no_verify_requested, dylib_path, dylib_path_var, expand_rustc_argfiles,
-    finalize_trust_no_verify, finalize_trust_no_verify_snapshot, maybe_dump, parse_rustc_stage,
-    parse_rustc_verbose, parse_value_from_args, retired_trust_bootstrap_shim_target_only_refusal,
+// Trust: the shim helpers live in the `shim_utils` crate since the 1.101
+// port (upstream moved them out of `#[path]` includes).
+use shim_utils::{
+    ArgFileCommand, InheritedJobserver, RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV,
+    activate_cargo_test_shim_environment, cargo_test_no_verify_requested, dylib_path,
+    dylib_path_var, expand_rustc_argfiles, finalize_trust_no_verify,
+    finalize_trust_no_verify_snapshot, maybe_dump, parse_rustc_stage, parse_rustc_verbose,
+    parse_value_from_args, retired_trust_bootstrap_shim_target_only_refusal,
     trust_bootstrap_no_verify_applies, trust_bootstrap_shim_marker_enabled,
 };
-
-#[path = "../utils/shared_helpers.rs"]
-mod shared_helpers;
-
-#[path = "../../../build_helper/src/arg_file_command.rs"]
-mod arg_file_command;
 
 #[cfg(test)]
 #[path = "rustdoc/tests.rs"]
 mod tests;
 
+/// Trust (CUSTODY-PROTOCOL1-LAUNCH-1): the markers that make the real
+/// rustdoc's custody strict (`strict_context` in
+/// compiler/rustc_data_structures/src/jobserver/early.rs), less the
+/// descendant handoff, which is a GNU advertisement. A marker missing here
+/// only withholds a loan, and the real rustdoc then refuses.
+const STRICT_CUSTODY_MARKERS: [&str; 6] = [
+    "BUILD_SLOT_CPU_PROTOCOL",
+    "TRUST_CPU_HANDOFF",
+    "TRUST_CPU_IMPLICIT_FD",
+    "ATERM_SDK_LEASE_V3",
+    "ATERM_WORKLOAD_CPU_FDS_V1",
+    "ATERM_WORKLOAD_HOST_STORE_FD_V1",
+];
+
+/// Trust (CUSTODY-PROTOCOL1-LAUNCH-1): each variable whose presence, whatever
+/// its value, is a GNU scheduler advertisement to a Trust compiler.
+const GNU_ADVERTISEMENTS: [&str; 4] =
+    ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS", "CARGO_JOBSERVER_HANDOFF"];
+
+/// Trust (CUSTODY-PROTOCOL1-LAUNCH-1): what this shim hands the real rustdoc.
+#[derive(Debug, PartialEq, Eq)]
+enum Lending {
+    /// Run it as configured: it inherited a scheduler, or was handed an
+    /// advertisement it judges itself, or is not owed one.
+    Forward,
+    /// Lend it this shim's own execution. A doctest run also compiles and
+    /// runs its doctests one at a time.
+    Lend { one_doctest_at_a_time: bool },
+}
+
+/// Trust (CUSTODY-PROTOCOL1-LAUNCH-1): Cargo hands its scheduler only to
+/// compilation units, so `rustdoc --test` reaches this shim with none, and in a
+/// strict custody context the real rustdoc refuses for want of one: "native
+/// compiler work has no captured inherited GNU scheduler". It is owed this
+/// shim's own synchronous execution (Cargo waits for the shim) when the shim
+/// inherited no scheduler and received no GNU advertisement at all
+/// (`inbound_advertised`, read at entry), and the command marks a strict
+/// context. Anything advertised, even a broken advertisement, is forwarded
+/// as it was, so the real rustdoc still judges and refuses it.
+///
+/// A loan is ONE execution, but rustdoc's doctest harness compiles and runs
+/// doctests on as many threads as libtest is told, each compiler recovering
+/// the loan through the handoff. So a doctest run is lent only with one test
+/// thread, and not at all when its arguments choose any other thread count:
+/// then it refuses as before.
+fn lending_owed(
+    inherited: bool,
+    inbound_advertised: bool,
+    cmd: &std::process::Command,
+    args: &[std::ffi::OsString],
+) -> Lending {
+    let child_env = |name: &str| match cmd.get_envs().find(|(key, _)| *key == name) {
+        Some((_, value)) => value.is_some(),
+        None => env::var_os(name).is_some(),
+    };
+    if inherited
+        || inbound_advertised
+        || GNU_ADVERTISEMENTS.into_iter().any(child_env)
+        || !STRICT_CUSTODY_MARKERS.into_iter().any(child_env)
+    {
+        return Lending::Forward;
+    }
+    if !args.iter().any(|arg| arg == "--test") {
+        return Lending::Lend { one_doctest_at_a_time: false };
+    }
+    // rustdoc splits every `--test-args` value on whitespace. Any word naming
+    // a thread count other than exactly `--test-threads=1` could beat
+    // RUST_TEST_THREADS, so such a run is not lent.
+    let words = args.iter().flat_map(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.split_whitespace()
+            .map(|word| word.trim_start_matches("--test-args=").to_owned())
+            .collect::<Vec<_>>()
+    });
+    if words.filter(|word| word.contains("--test-threads")).any(|word| word != "--test-threads=1") {
+        return Lending::Forward;
+    }
+    Lending::Lend { one_doctest_at_a_time: true }
+}
+
+/// Trust (CUSTODY-PROTOCOL1-LAUNCH-1): apply `lending` to `cmd`. A loan is an
+/// owned GNU pool holding ZERO tokens, with the descendant handoff each
+/// doctest compiler (which rustdoc starts with no descriptor) recovers it
+/// through. The returned owner, and `cmd`'s spawn hooks, which share it, must
+/// outlive the child's wait.
+fn lend(lending: Lending, cmd: &mut std::process::Command) -> Option<jobserver_utils::Jobserver> {
+    let Lending::Lend { one_doctest_at_a_time } = lending else {
+        return None;
+    };
+    let mut lent = jobserver_utils::Jobserver::new(0)
+        .unwrap_or_else(|error| panic!("cannot lend rustdoc an empty scheduler: {error}"));
+    lent.enable_descendant_handoff()
+        .unwrap_or_else(|error| panic!("cannot lend rustdoc a descendant handoff: {error}"));
+    lent.configure_make(cmd);
+    if one_doctest_at_a_time {
+        cmd.env("RUST_TEST_THREADS", "1");
+    }
+    Some(lent)
+}
+
 fn main() {
+    // Trust: checked import precedes sidecar/argument-file opens. Keep its
+    // descriptor owners alive through the final rustdoc wait.
+    // SAFETY: this is the shim's first operation, before opening other files.
+    let jobserver = unsafe { InheritedJobserver::from_env() }
+        .unwrap_or_else(|error| panic!("cannot inherit bootstrap jobserver: {error}"));
+    // Trust (CUSTODY-PROTOCOL1-LAUNCH-1): what reached this shim, before any
+    // environment rewrite; see `lending_owed`.
+    let inbound_advertised = GNU_ADVERTISEMENTS.into_iter().any(|name| env::var_os(name).is_some());
+
     // Refuse the retired marker on the AMBIENT environment, before the
     // Cargo-test sidecar can rewrite anything. Same guard as the rustc shim.
     if let Some(message) = retired_trust_bootstrap_shim_target_only_refusal(
@@ -158,15 +263,16 @@ fn main() {
     if let Some(crate_name) = parse_value_from_args(&args, "--crate-name") {
         // Add rust logo and set html root for all rustc crates.
         if crate_name.starts_with("rustc_") {
-            cmd.arg("-Ainternal_features")
+            // We use `-Zcrate-attr=allow` instead of `-A` to force rustdoc to forward this flag to
+            // the actual doctests. Otherwise those tests all receive the
+            // `feature(rustdoc_internals)` without receiving the `-A` which leads to errors.
+            cmd.arg("-Zcrate-attr=allow(internal_features)")
                 .arg("-Zcrate-attr=doc(rust_logo)")
                 .arg("-Zcrate-attr=doc(html_root_url = \"https://doc.rust-lang.org/nightly/nightly-rustc/\")");
 
-            // rustc_proc_macro is another build of library/proc_macro which already enables this
-            // feature
-            if crate_name != "rustc_proc_macro" {
-                cmd.arg("-Zcrate-attr=feature(rustdoc_internals)");
-            }
+            // Some crates already have this feature enabled
+            cmd.arg("-Zcrate-attr=feature(rustdoc_internals)");
+            cmd.arg("-Aduplicate-features");
         }
     }
 
@@ -194,8 +300,12 @@ fn main() {
     let (mut cmd, arg_file) = cmd.build().unwrap();
     maybe_dump(format!("stage{}-rustdoc", stage + 1), &cmd);
     if let Some(environment) = &mut isolated_shim_environment {
-        environment.restore();
+        environment.restore_for_compiler_command(&mut cmd, rustdoc_bootstrap_no_verify_applies);
     }
+    jobserver.configure(&mut cmd);
+    // Trust (CUSTODY-PROTOCOL1-LAUNCH-1): held through the wait below.
+    let lent =
+        lend(lending_owed(jobserver.is_present(), inbound_advertised, &cmd, &args), &mut cmd);
 
     if verbose > 1 {
         eprintln!(
@@ -210,9 +320,15 @@ fn main() {
 
     let status = cmd.status();
     drop(arg_file);
+    // Trust (CUSTODY-PROTOCOL1-LAUNCH-1): `exit` runs no destructor, and the
+    // command's spawn hooks share the loan's handoff endpoint, whose drop
+    // removes its socket directory. Release both before exiting.
+    let rendered = status.is_err().then(|| format!("{cmd:?}"));
+    drop(cmd);
+    drop(lent);
 
     std::process::exit(match status {
         Ok(s) => s.code().unwrap_or(1),
-        Err(e) => panic!("\n\nfailed to run {cmd:?}: {e}\n\n"),
+        Err(e) => panic!("\n\nfailed to run {}: {e}\n\n", rendered.unwrap_or_default()),
     })
 }

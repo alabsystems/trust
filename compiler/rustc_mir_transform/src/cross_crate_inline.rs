@@ -1,13 +1,12 @@
-use rustc_hir::attrs::InlineAttr;
+use rustc_attr_ir::{InlineAttr, find_attr};
+use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::{self as hir, find_attr};
-use rustc_middle::bug;
-use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{InliningThreshold, OptLevel};
+use rustc_span::{bug, sym};
 
 use crate::{clean_origin_mir, inline, pass_manager as pm};
 
@@ -79,13 +78,19 @@ fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         return true;
     }
 
-    let sig = tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip();
-    for ty in sig.inputs().skip_binder().iter().chain(std::iter::once(&sig.output().skip_binder()))
-    {
-        // FIXME(f16_f128): in order to avoid crashes building `core`, always inline to skip
-        // codegen if the function is not used.
-        if ty == &tcx.types.f16 || ty == &tcx.types.f128 {
-            return true;
+    let reliable_f16 = tcx.sess.config.contains(&(sym::target_has_reliable_f16, None));
+    let reliable_f128 = tcx.sess.config.contains(&(sym::target_has_reliable_f128, None));
+    if !reliable_f16 || !reliable_f128 {
+        let sig = tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip();
+        for ty in
+            sig.inputs().skip_binder().iter().chain(std::iter::once(&sig.output().skip_binder()))
+        {
+            // FIXME(f16,f128): in order to avoid crashes building `core`, inline on targets that
+            // have issues to skip codegen if the function is not used.
+            if (!reliable_f16 && ty == &tcx.types.f16) || (!reliable_f128 && ty == &tcx.types.f128)
+            {
+                return true;
+            }
         }
     }
 
@@ -98,8 +103,9 @@ fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     // Don't do any inference if codegen optimizations are disabled and also MIR inlining is not
     // enabled. This ensures that we do inference even if someone only passes -Zinline-mir,
     // which is less confusing than having to also enable -Copt-level=1.
-    let inliner_will_run = pm::should_run_pass(tcx, &inline::Inline, pm::Optimizations::Allowed)
-        || inline::ForceInline::should_run_pass_for_callee(tcx, def_id.to_def_id());
+    let inliner_will_run =
+        pm::should_run_pass(&inline::Inline, &pm::PassCtx::for_body(tcx, def_id.to_def_id()))
+            || inline::ForceInline::should_run_pass_for_callee(tcx, def_id.to_def_id());
     if matches!(tcx.sess.opts.optimize, OptLevel::No) && !inliner_will_run {
         return false;
     }
@@ -115,56 +121,49 @@ fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     };
 
     let mir = tcx.optimized_mir(def_id);
-    let mut checker =
-        CostChecker { tcx, callee_body: mir, calls: 0, statements: 0, landing_pads: 0, resumes: 0 };
-    checker.visit_body(mir);
-    checker.calls == 0
-        && checker.resumes == 0
-        && checker.landing_pads == 0
-        && checker.statements <= threshold
-}
-
-// The threshold that CostChecker computes is balancing the desire to make more things
-// inlinable cross crates against the growth in incremental CGU size that happens when too many
-// things in the sysroot are made inlinable.
-// Permitting calls causes the size of some incremental CGUs to grow, because more functions are
-// made inlinable out of the sysroot or dependencies.
-// Assert terminators are similar to calls, but do not have the same impact on compile time, so
-// those are just treated as statements.
-// A threshold exists at all because we don't want to blindly mark a huge function as inlinable.
-
-struct CostChecker<'b, 'tcx> {
-    tcx: TyCtxt<'tcx>,
-    callee_body: &'b Body<'tcx>,
-    calls: usize,
-    statements: usize,
-    landing_pads: usize,
-    resumes: usize,
-}
-
-impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
-    fn visit_statement(&mut self, statement: &Statement<'tcx>, _: Location) {
-        // Don't count StorageLive/StorageDead in the inlining cost.
-        match statement.kind {
-            StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {}
-            _ => self.statements += 1,
-        }
+    // Each basic block has at least one terminator, which counts as 1 statement.
+    if mir.basic_blocks.len() > threshold {
+        return false;
     }
 
-    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, _: Location) {
-        self.statements += 1;
-        let tcx = self.tcx;
-        match &terminator.kind {
-            TerminatorKind::Drop { place, unwind, .. } => {
-                let ty = place.ty(self.callee_body, tcx).ty;
-                if !ty.is_trivially_pure_clone_copy() {
-                    self.calls += 1;
-                    if let UnwindAction::Cleanup(_) = unwind {
-                        self.landing_pads += 1;
+    // The threshold that we check here balances the desire to make more things
+    // inlinable cross crates against the growth in incremental CGU size that happens when too many
+    // things in the sysroot are made inlinable.
+    // Permitting calls causes the size of some incremental CGUs to grow, because more functions are
+    // made inlinable out of the sysroot or dependencies.
+    // Assert terminators are similar to calls, but do not have the same impact on compile time, so
+    // those are just treated as statements.
+    // A threshold exists at all because we don't want to blindly mark a huge function as inlinable.
+    let mut statements = 0;
+    for block in mir.basic_blocks.iter() {
+        for statement in &block.statements {
+            // Don't count StorageLive/StorageDead in the inlining cost.
+            match statement.kind {
+                StatementKind::StorageLive(_)
+                | StatementKind::StorageDead(_)
+                | StatementKind::Nop => {}
+                _ => {
+                    statements += 1;
+                    if statements > threshold {
+                        return false;
                     }
                 }
             }
-            TerminatorKind::Call { func, unwind, .. } => {
+        }
+
+        statements += 1;
+        if statements > threshold {
+            return false;
+        }
+
+        match &block.terminator().kind {
+            TerminatorKind::Drop { place, .. } => {
+                let ty = place.ty(mir, tcx).ty;
+                if !ty.is_trivially_pure_clone_copy() {
+                    return false;
+                }
+            }
+            TerminatorKind::Call { func, .. } => {
                 // We track calls because they make our function not a leaf (and in theory, the
                 // number of calls indicates how likely this function is to perturb other CGUs).
                 // But there are a handful of intrinsics such as raw_eq that should not block
@@ -173,25 +172,16 @@ impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
                 if let Some((fn_def_id, _)) = func.const_fn_def()
                     && find_attr!(tcx, fn_def_id, RustcIntrinsic)
                 {
-                    return;
+                    continue;
                 }
-                self.calls += 1;
-                if let UnwindAction::Cleanup(_) = unwind {
-                    self.landing_pads += 1;
-                }
+                return false;
             }
-            TerminatorKind::TailCall { .. } => {
-                self.calls += 1;
+            TerminatorKind::TailCall { .. } | TerminatorKind::UnwindResume => {
+                return false;
             }
-            TerminatorKind::Assert { unwind, .. } => {
+            TerminatorKind::Assert { unwind, .. } | TerminatorKind::InlineAsm { unwind, .. } => {
                 if let UnwindAction::Cleanup(_) = unwind {
-                    self.landing_pads += 1;
-                }
-            }
-            TerminatorKind::UnwindResume => self.resumes += 1,
-            TerminatorKind::InlineAsm { unwind, .. } => {
-                if let UnwindAction::Cleanup(_) = unwind {
-                    self.landing_pads += 1;
+                    return false;
                 }
             }
             TerminatorKind::Return
@@ -207,4 +197,6 @@ impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
             }
         }
     }
+
+    true
 }

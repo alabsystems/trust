@@ -34,7 +34,7 @@ projection_clean_bin="${AY_PROJECTION_CLEAN_BIN:-$trust_projection_root/first-pa
 if [[ ! -x "$projection_clean_bin" ]]; then
   echo "BLOCKED: pinned Clean checker is not executable: $projection_clean_bin" >&2
   echo "Build it from this checkout, or set AY_PROJECTION_CLEAN_BIN to a pinned Clean binary." >&2
-  echo "  rustup run nightly-2026-06-25 cargo build --manifest-path first-party/clean/cli-runner/Cargo.toml" >&2
+  echo "  targo --unverified build --manifest-path first-party/clean/cli-runner/Cargo.toml" >&2
   exit 3
 fi
 

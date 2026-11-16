@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "native-check-all-targets"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+# Negative control: only test code becomes ill-typed.
+reject-test-type = []

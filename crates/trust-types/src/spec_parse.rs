@@ -87,7 +87,7 @@ pub fn parse_spec_expr_result(input: &str) -> Result<Formula, SpecParseError> {
     // cast is the measured case: `u32::MAX` alone parses, so the generic message
     // pointed at the wrong place entirely. Still a refusal — see
     // `SpecParseError::UnsupportedCast` for why this parser cannot decide casts.
-    if parser.peek() == Some(&Token::Ident("as".to_string())) {
+    if matches!(parser.peek(), Some(Token::Ident(s)) if s == "as") {
         return Err(SpecParseError::UnsupportedCast { clause: input.trim().to_string() });
     }
     Err(SpecParseError::TrailingTokens)
@@ -114,10 +114,10 @@ pub(crate) fn literal_index_spellings_are_canonical(input: &str) -> bool {
         };
         let content = input[cursor + 1..cursor + 1 + close].trim();
         if let Some((spelling, parenthesized)) = parenthesized_decimal_literal(content) {
-            let Ok(value) = spelling.parse::<u128>() else {
+            if parenthesized || (spelling.len() > 1 && spelling.starts_with('0')) {
                 return false;
-            };
-            if parenthesized || value.to_string() != spelling {
+            }
+            if spelling.parse::<u128>().is_err() {
                 return false;
             }
         }
@@ -262,15 +262,19 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SpecParseError> {
             index += crate::int_literal::int_literal_tail_len(&input[index..]);
             let spelling = &input[start..index];
 
-            let value = crate::int_literal::read_contract_int_literal(spelling).map_err(
-                |refusal| SpecParseError::UnsupportedIntegerLiteral {
-                    literal: refusal.literal,
-                    reason: refusal.reason,
-                    fix: refusal.fix,
-                },
-            )?;
+            let value =
+                crate::int_literal::read_contract_int_literal(spelling).map_err(|refusal| {
+                    SpecParseError::UnsupportedIntegerLiteral {
+                        literal: refusal.literal,
+                        reason: refusal.reason,
+                        fix: refusal.fix,
+                    }
+                })?;
 
-            if field_index_context && value.to_string() != spelling {
+            let is_canonical_decimal = !spelling.is_empty()
+                && spelling.bytes().all(|b| b.is_ascii_digit())
+                && (spelling.len() == 1 || !spelling.starts_with('0'));
+            if field_index_context && !is_canonical_decimal {
                 // A tuple-field index is the CANONICAL bare-decimal spelling
                 // and nothing else. `0_0` and `0x0` denote field 0, but they
                 // are not the name `place_to_var_name` mints for it, so
@@ -491,13 +495,23 @@ impl Parser {
     }
 
     fn bump(&mut self) -> Result<Token, SpecParseError> {
-        self.tokens
-            .get(self.index)
-            .cloned()
-            .inspect(|_t| {
-                self.index += 1;
-            })
-            .ok_or_else(|| SpecParseError::UnexpectedEof { expected: "token".into() })
+        let Some(slot) = self.tokens.get_mut(self.index) else {
+            return Err(SpecParseError::UnexpectedEof { expected: "token".into() });
+        };
+        self.index += 1;
+        Ok(std::mem::replace(slot, Token::Comma))
+    }
+
+    fn eat_ident(&mut self) -> Option<String> {
+        if !matches!(self.tokens.get(self.index), Some(Token::Ident(_))) {
+            return None;
+        };
+        let slot = self.tokens.get_mut(self.index)?;
+        let Token::Ident(name) = std::mem::replace(slot, Token::Comma) else {
+            return None;
+        };
+        self.index += 1;
+        Some(name)
     }
 
     fn eat(&mut self, expected: &Token) -> bool {
@@ -519,6 +533,20 @@ impl Parser {
         }
     }
 
+    fn expect_with(
+        &mut self,
+        expected: &Token,
+        label: impl FnOnce() -> String,
+    ) -> Result<(), SpecParseError> {
+        if self.eat(expected) {
+            Ok(())
+        } else if self.is_eof() {
+            Err(SpecParseError::UnexpectedEof { expected: label() })
+        } else {
+            Err(SpecParseError::UnexpectedToken { position: self.index, expected: label() })
+        }
+    }
+
     fn parse_implies(&mut self) -> Result<Formula, SpecParseError> {
         let lhs = self.parse_or()?;
 
@@ -532,32 +560,30 @@ impl Parser {
 
     fn parse_or(&mut self) -> Result<Formula, SpecParseError> {
         let first = self.parse_and()?;
-        let mut terms = vec![first];
+        if !self.eat(&Token::OrOr) {
+            return Ok(first);
+        }
+        let mut terms = vec![first, self.parse_and()?];
 
         while self.eat(&Token::OrOr) {
             terms.push(self.parse_and()?);
         }
 
-        if terms.len() == 1 {
-            Ok(terms.pop().expect("invariant: non-empty"))
-        } else {
-            Ok(canonical_or(terms))
-        }
+        Ok(canonical_or(terms))
     }
 
     fn parse_and(&mut self) -> Result<Formula, SpecParseError> {
         let first = self.parse_comparison()?;
-        let mut terms = vec![first];
+        if !self.eat(&Token::AndAnd) {
+            return Ok(first);
+        }
+        let mut terms = vec![first, self.parse_comparison()?];
 
         while self.eat(&Token::AndAnd) {
             terms.push(self.parse_comparison()?);
         }
 
-        if terms.len() == 1 {
-            Ok(terms.pop().expect("invariant: non-empty"))
-        } else {
-            Ok(canonical_and(terms))
-        }
+        Ok(canonical_and(terms))
     }
 
     fn parse_comparison(&mut self) -> Result<Formula, SpecParseError> {
@@ -583,8 +609,14 @@ impl Parser {
             CmpOp::Ge => Formula::Ge(Box::new(lhs), Box::new(rhs)),
             CmpOp::Lt => Formula::Lt(Box::new(lhs), Box::new(rhs)),
             CmpOp::Le => Formula::Le(Box::new(lhs), Box::new(rhs)),
-            CmpOp::Eq => Formula::Eq(Box::new(lhs), Box::new(rhs)),
-            CmpOp::Ne => Formula::Not(Box::new(Formula::Eq(Box::new(lhs), Box::new(rhs)))),
+            // A contract `==` is Rust `PartialEq` (SPEC-FLOAT-EQ-STRUCTURAL-1):
+            // with a float-sorted side (a float literal fixes it here) it is IEEE
+            // `FpEq`, never structural `Eq` — `NaN == NaN` is false and
+            // `0.0 == -0.0` is true. Two bare identifiers stay `Eq` until
+            // `retype_formula_variables` learns their sorts and applies the same
+            // rule (`crate::spec_float_eq`).
+            CmpOp::Eq => crate::spec_equality(Box::new(lhs), Box::new(rhs)),
+            CmpOp::Ne => Formula::Not(Box::new(crate::spec_equality(Box::new(lhs), Box::new(rhs)))),
         })
     }
 
@@ -658,10 +690,11 @@ impl Parser {
                     position: self.index.saturating_sub(1),
                     expected: "a named parameter, not result, after prefix '*'".into(),
                 }),
-                Formula::Var(name, sort)
+                Formula::Var(mut name, sort)
                     if is_plain_source_binding_name(name.trim_end_matches('*')) =>
                 {
-                    Ok(Formula::Var(format!("{name}*"), sort))
+                    name.push('*');
+                    Ok(Formula::Var(name, sort))
                 }
                 _ => Err(SpecParseError::UnexpectedToken {
                     position: self.index.saturating_sub(1),
@@ -688,11 +721,7 @@ impl Parser {
                     // never a method call (there is no `t.0()` form), so it takes the
                     // field-projection path directly. Over-refutation audit defect #2.
                     Token::Int(index) => {
-                        expr = field_projection(
-                            expr,
-                            &index.to_string(),
-                            self.index.saturating_sub(1),
-                        )?;
+                        expr = field_projection_int(expr, index, self.index.saturating_sub(1))?;
                         continue;
                     }
                     _ => {
@@ -725,8 +754,10 @@ impl Parser {
                 let index = self.parse_implies()?;
                 self.expect(&Token::RBracket, "closing ']'")?;
                 expr = match (expr, index) {
-                    (Formula::Var(name, sort), Formula::Int(index)) if index >= 0 => {
-                        Formula::Var(format!("{name}[{index}]"), sort)
+                    (Formula::Var(mut name, sort), Formula::Int(index)) if index >= 0 => {
+                        use std::fmt::Write as _;
+                        let _ = write!(name, "[{index}]");
+                        Formula::Var(name, sort)
                     }
                     (base, index) => Formula::Select(Box::new(base), Box::new(index)),
                 };
@@ -813,8 +844,10 @@ impl Parser {
             // PRED_VOCAB membership so only reviewed names can ever become a
             // Pred; an out-of-vocab ident keeps today's behavior (a free Var,
             // with `(` left to fail downstream — never a silent Pred).
-            _ if self.peek() == Some(&Token::LParen) && pred_arg_sorts(&name).is_some() => {
-                self.parse_pred_call(name)
+            _ if self.peek() == Some(&Token::LParen)
+                && let Some(sorts) = pred_arg_sorts(&name) =>
+            {
+                self.parse_pred_call(name, sorts)
             }
             _ if is_plain_source_binding_name(&name) => Ok(self.variable(&name)),
             _ => Err(SpecParseError::UnexpectedToken {
@@ -841,11 +874,8 @@ impl Parser {
     /// The caller's routing guard guarantees `name` is in PRED_VOCAB. Here we
     /// additionally reject a wrong arity (a hard parse error, never a silent
     /// accept) and re-key each argument to its declared sort.
-    fn parse_pred_call(&mut self, name: String) -> Result<Formula, SpecParseError> {
-        let sorts = pred_arg_sorts(&name)
-            .expect("parse_pred_call is only reached for in-vocabulary predicate names");
-
-        self.expect(&Token::LParen, &format!("'(' after predicate {name}"))?;
+    fn parse_pred_call(&mut self, name: String, sorts: &[Sort]) -> Result<Formula, SpecParseError> {
+        self.expect_with(&Token::LParen, || format!("'(' after predicate {name}"))?;
 
         let mut args = Vec::new();
         // Zero-arity predicates (e.g. `priv_dropped()`) close immediately.
@@ -857,7 +887,7 @@ impl Parser {
                 }
             }
         }
-        self.expect(&Token::RParen, &format!("closing ')' for predicate {name}"))?;
+        self.expect_with(&Token::RParen, || format!("closing ')' for predicate {name}"))?;
 
         if !is_valid_pred(&name, args.len()) {
             return Err(SpecParseError::InvalidQuantifier {
@@ -888,7 +918,10 @@ impl Parser {
     fn parse_compat_quantifier(&mut self, is_forall: bool) -> Result<Formula, SpecParseError> {
         let label = if is_forall { "forall" } else { "exists" };
 
-        self.expect(&Token::LParen, &format!("'(' after {label}"))?;
+        self.expect(
+            &Token::LParen,
+            if is_forall { "'(' after forall" } else { "'(' after exists" },
+        )?;
 
         // Parse bound variable name
         let var_name = match self.bump()? {
@@ -922,24 +955,35 @@ impl Parser {
                     detail: format!("{label}: unsupported binder type `{ty}`"),
                 }
             })?;
-            self.expect(&Token::Comma, &format!("',' after binder type in {label}"))?;
+            self.expect(
+                &Token::Comma,
+                if is_forall {
+                    "',' after binder type in forall"
+                } else {
+                    "',' after binder type in exists"
+                },
+            )?;
 
             let scope_len = self.bound_sorts.len();
             self.bound_sorts.push((var_name.clone(), sort.clone()));
             let parsed_body = self.parse_implies();
             self.bound_sorts.truncate(scope_len);
             let mut body = parsed_body?;
-            self.expect(&Token::RParen, &format!("closing ')' for {label}"))?;
+            self.expect(
+                &Token::RParen,
+                if is_forall { "closing ')' for forall" } else { "closing ')' for exists" },
+            )?;
 
+            let var_sym = crate::Symbol::intern(&var_name);
             if let Some(domain) = domain {
-                let guard = domain.guard(Formula::Var(var_name.clone(), sort.clone()));
+                let guard = domain.guard(Formula::Var(var_name, sort.clone()));
                 body = if is_forall {
                     Formula::Implies(Box::new(guard), Box::new(body))
                 } else {
                     canonical_and(vec![guard, body])
                 };
             }
-            let bindings = vec![(crate::Symbol::intern(&var_name), sort)];
+            let bindings = vec![(var_sym, sort)];
             return Ok(if is_forall {
                 Formula::Forall(bindings, Box::new(body))
             } else {
@@ -947,7 +991,14 @@ impl Parser {
             });
         }
 
-        self.expect(&Token::Comma, &format!("',' or ':' after variable in {label}"))?;
+        self.expect(
+            &Token::Comma,
+            if is_forall {
+                "',' or ':' after variable in forall"
+            } else {
+                "',' or ':' after variable in exists"
+            },
+        )?;
 
         // Parse range: lo..hi
         let lo = self.parse_add_sub()?;
@@ -958,7 +1009,10 @@ impl Parser {
         }
         let hi = self.parse_add_sub()?;
 
-        self.expect(&Token::Comma, &format!("',' after range in {label}"))?;
+        self.expect(
+            &Token::Comma,
+            if is_forall { "',' after range in forall" } else { "',' after range in exists" },
+        )?;
 
         // Parse the body with the compatibility binder in lexical scope.  The
         // explicit Int entry matters when this quantifier shadows an outer
@@ -969,10 +1023,13 @@ impl Parser {
         self.bound_sorts.truncate(scope_len);
         let body = parsed_body?;
 
-        self.expect(&Token::RParen, &format!("closing ')' for {label}"))?;
+        self.expect(
+            &Token::RParen,
+            if is_forall { "closing ')' for forall" } else { "closing ')' for exists" },
+        )?;
 
-        let bound_var = Formula::Var(var_name.clone(), Sort::Int);
         let bindings = vec![(crate::Symbol::intern(&var_name), Sort::Int)];
+        let bound_var = Formula::Var(var_name, Sort::Int);
 
         // Build range guard: lo <= var && var < hi
         let range_guard = Formula::And(vec![
@@ -1002,8 +1059,7 @@ impl Parser {
     fn parse_typed_quantifier(&mut self, is_forall: bool) -> Result<Formula, SpecParseError> {
         let label = if is_forall { "forall" } else { "exists" };
         let mut names = Vec::new();
-        while let Some(Token::Ident(_)) = self.peek() {
-            let Token::Ident(name) = self.bump()? else { unreachable!() };
+        while let Some(name) = self.eat_ident() {
             if !is_plain_source_binding_name(&name) || names.contains(&name) {
                 return Err(SpecParseError::InvalidQuantifier {
                     detail: format!("{label}: invalid or duplicate binder `{name}`"),
@@ -1019,7 +1075,10 @@ impl Parser {
                 detail: format!("{label}: expected a binder name"),
             });
         }
-        self.expect(&Token::Colon, &format!("':' after binders in {label}"))?;
+        self.expect(
+            &Token::Colon,
+            if is_forall { "':' after binders in forall" } else { "':' after binders in exists" },
+        )?;
         let ty = match self.bump()? {
             Token::Ident(ty) if !ty.contains('\'') => ty,
             _ => {
@@ -1033,7 +1092,14 @@ impl Parser {
                 detail: format!("{label}: unsupported binder type `{ty}`"),
             }
         })?;
-        self.expect(&Token::Comma, &format!("',' after binder type in {label}"))?;
+        self.expect(
+            &Token::Comma,
+            if is_forall {
+                "',' after binder type in forall"
+            } else {
+                "',' after binder type in exists"
+            },
+        )?;
 
         let scope_len = self.bound_sorts.len();
         self.bound_sorts.extend(names.iter().cloned().map(|name| (name, sort.clone())));
@@ -1130,17 +1196,22 @@ pub(crate) fn typed_quantifier_domain(
 /// - `.len()` => `Var("<base>__len", Int)` (models collection length)
 /// - `.is_empty()` => `Eq(<base>__len, 0)` (models emptiness check)
 pub(crate) fn map_method_call(base: Formula, method: &str) -> Result<Formula, SpecParseError> {
-    let base_name = match &base {
-        Formula::Var(name, _) => name.clone(),
-        _ => return Err(SpecParseError::UnsupportedMethod { method: method.into() }),
+    let Formula::Var(mut base_name, _) = base else {
+        return Err(SpecParseError::UnsupportedMethod { method: method.into() });
     };
 
     match method {
-        "len" => Ok(int_var(format!("{base_name}__len"))),
-        "is_empty" => Ok(Formula::Eq(
-            Box::new(int_var(format!("{base_name}__len"))),
-            Box::new(Formula::Int(0)),
-        )),
+        "len" => {
+            base_name.push_str("__len");
+            Ok(int_var(base_name))
+        }
+        "is_empty" => {
+            base_name.push_str("__len");
+            Ok(Formula::Eq(
+                Box::new(int_var(base_name)),
+                Box::new(Formula::Int(0)),
+            ))
+        }
         // Trust SAFE_API §3.4: the fixed capability accessor set. `.fd()` /
         // `.components()` lower to the handle's stable ghost-identity term — a
         // Var keyed to the handle binding, identical to the bare handle — so
@@ -1157,15 +1228,24 @@ pub(crate) fn map_method_call(base: Formula, method: &str) -> Result<Formula, Sp
         // `UnsupportedMethod`, which `parse_spec_expr` swallows to `None`,
         // SILENTLY DROPPING the entire contract (no VC emitted) — a
         // false-success hazard that this closes.
-        "is_none" => Ok(Formula::Eq(
-            Box::new(int_var(format!("{base_name}__discr"))),
-            Box::new(Formula::Int(0)),
-        )),
-        "is_some" => Ok(Formula::Not(Box::new(Formula::Eq(
-            Box::new(int_var(format!("{base_name}__discr"))),
-            Box::new(Formula::Int(0)),
-        )))),
-        "unwrap" => Ok(int_var(format!("{base_name}__value"))),
+        "is_none" => {
+            base_name.push_str("__discr");
+            Ok(Formula::Eq(
+                Box::new(int_var(base_name)),
+                Box::new(Formula::Int(0)),
+            ))
+        }
+        "is_some" => {
+            base_name.push_str("__discr");
+            Ok(Formula::Not(Box::new(Formula::Eq(
+                Box::new(int_var(base_name)),
+                Box::new(Formula::Int(0)),
+            ))))
+        }
+        "unwrap" => {
+            base_name.push_str("__value");
+            Ok(int_var(base_name))
+        }
         // Result reasoning, mirroring the Option discriminant/value model above.
         // We adopt the SAME convention as Option (`__discr == 0` = the "empty"
         // variant): for a Result, `__discr == 0` models the `Err` variant and a
@@ -1182,14 +1262,20 @@ pub(crate) fn map_method_call(base: Formula, method: &str) -> Result<Formula, Sp
         // so such a postcondition can only FAIL to prove, never vacuously prove
         // (fail-closed). Previously these returned UnsupportedMethod, which
         // `parse_spec_expr` swallows to None — silently dropping the whole contract.
-        "is_ok" => Ok(Formula::Not(Box::new(Formula::Eq(
-            Box::new(int_var(format!("{base_name}__discr"))),
-            Box::new(Formula::Int(0)),
-        )))),
-        "is_err" => Ok(Formula::Eq(
-            Box::new(int_var(format!("{base_name}__discr"))),
-            Box::new(Formula::Int(0)),
-        )),
+        "is_ok" => {
+            base_name.push_str("__discr");
+            Ok(Formula::Not(Box::new(Formula::Eq(
+                Box::new(int_var(base_name)),
+                Box::new(Formula::Int(0)),
+            ))))
+        }
+        "is_err" => {
+            base_name.push_str("__discr");
+            Ok(Formula::Eq(
+                Box::new(int_var(base_name)),
+                Box::new(Formula::Int(0)),
+            ))
+        }
         // Sign predicates on an integer/rational base (e.g. `c.is_positive()` for
         // the rational `c` extracted from an Ok payload). We model the trichotomy
         // with ONE synthetic Int var `{base}__sign` that stands for the sign of the
@@ -1209,18 +1295,27 @@ pub(crate) fn map_method_call(base: Formula, method: &str) -> Result<Formula, Sp
         // the base's concrete value, so a sign postcondition can only FAIL to prove,
         // never vacuously prove (fail-closed). Previously these returned
         // UnsupportedMethod, silently dropping the contract.
-        "is_negative" => Ok(Formula::Lt(
-            Box::new(int_var(format!("{base_name}__sign"))),
-            Box::new(Formula::Int(0)),
-        )),
-        "is_zero" => Ok(Formula::Eq(
-            Box::new(int_var(format!("{base_name}__sign"))),
-            Box::new(Formula::Int(0)),
-        )),
-        "is_positive" => Ok(Formula::Gt(
-            Box::new(int_var(format!("{base_name}__sign"))),
-            Box::new(Formula::Int(0)),
-        )),
+        "is_negative" => {
+            base_name.push_str("__sign");
+            Ok(Formula::Lt(
+                Box::new(int_var(base_name)),
+                Box::new(Formula::Int(0)),
+            ))
+        }
+        "is_zero" => {
+            base_name.push_str("__sign");
+            Ok(Formula::Eq(
+                Box::new(int_var(base_name)),
+                Box::new(Formula::Int(0)),
+            ))
+        }
+        "is_positive" => {
+            base_name.push_str("__sign");
+            Ok(Formula::Gt(
+                Box::new(int_var(base_name)),
+                Box::new(Formula::Int(0)),
+            ))
+        }
         _ => Err(SpecParseError::UnsupportedMethod { method: method.into() }),
     }
 }
@@ -1235,7 +1330,30 @@ pub(crate) fn field_projection(
     position: usize,
 ) -> Result<Formula, SpecParseError> {
     match base {
-        Formula::Var(name, sort) => Ok(Formula::Var(format!("{name}.{field}"), sort)),
+        Formula::Var(mut name, sort) => {
+            name.reserve(1 + field.len());
+            name.push('.');
+            name.push_str(field);
+            Ok(Formula::Var(name, sort))
+        }
+        _ => Err(SpecParseError::UnexpectedToken {
+            position,
+            expected: "a variable to project a field from".into(),
+        }),
+    }
+}
+
+fn field_projection_int(
+    base: Formula,
+    index: i128,
+    position: usize,
+) -> Result<Formula, SpecParseError> {
+    match base {
+        Formula::Var(mut name, sort) => {
+            use std::fmt::Write as _;
+            let _ = write!(name, ".{index}");
+            Ok(Formula::Var(name, sort))
+        }
         _ => Err(SpecParseError::UnexpectedToken {
             position,
             expected: "a variable to project a field from".into(),
@@ -1294,6 +1412,9 @@ fn int_var(name: String) -> Formula {
 /// left-to-right order.  Flattening nested nodes makes parentheses around an
 /// associative Boolean chain irrelevant to Formula identity.
 pub(crate) fn canonical_and(items: Vec<Formula>) -> Formula {
+    if !items.iter().any(|item| matches!(item, Formula::And(_))) {
+        return Formula::And(items);
+    }
     fn append(item: Formula, flat: &mut Vec<Formula>) {
         match item {
             Formula::And(nested) => {
@@ -1305,7 +1426,7 @@ pub(crate) fn canonical_and(items: Vec<Formula>) -> Formula {
         }
     }
 
-    let mut flat = Vec::new();
+    let mut flat = Vec::with_capacity(items.len());
     for item in items {
         append(item, &mut flat);
     }
@@ -1315,6 +1436,9 @@ pub(crate) fn canonical_and(items: Vec<Formula>) -> Formula {
 /// Build the parser's canonical n-ary disjunction while preserving authored
 /// left-to-right order.  See [`canonical_and`].
 pub(crate) fn canonical_or(items: Vec<Formula>) -> Formula {
+    if !items.iter().any(|item| matches!(item, Formula::Or(_))) {
+        return Formula::Or(items);
+    }
     fn append(item: Formula, flat: &mut Vec<Formula>) {
         match item {
             Formula::Or(nested) => {
@@ -1326,7 +1450,7 @@ pub(crate) fn canonical_or(items: Vec<Formula>) -> Formula {
         }
     }
 
-    let mut flat = Vec::new();
+    let mut flat = Vec::with_capacity(items.len());
     for item in items {
         append(item, &mut flat);
     }
@@ -1599,9 +1723,11 @@ mod tests {
             parse_spec_expr("x <= 2.5e-3"),
             Some(Formula::Le(Box::new(f64_var("x")), Box::new(fp(2.5e-3_f64)))),
         );
+        // `3.25`, not `3.14`: tippy's deny-by-default `approx_constant` reads
+        // `3.14_f64` as a misspelt `PI` and refused this test target.
         assert_eq!(
-            parse_spec_expr("x <= 3.14"),
-            Some(Formula::Le(Box::new(f64_var("x")), Box::new(fp(3.14_f64)))),
+            parse_spec_expr("x <= 3.25"),
+            Some(Formula::Le(Box::new(f64_var("x")), Box::new(fp(3.25_f64)))),
         );
     }
 

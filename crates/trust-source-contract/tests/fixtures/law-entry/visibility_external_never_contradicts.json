@@ -1,0 +1,268 @@
+{
+  "name": "visibility_external_never_contradicts",
+  "def_path": "trust_ir_laws::laws::visibility_external_never_contradicts",
+  "span": {
+    "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+    "line_start": 2280,
+    "col_start": 0,
+    "line_end": 2284,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "trust_ir::Visibility",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Default",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Hidden",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "Protected",
+                "discriminant": 2,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "visibility"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "trust_ir::Linkage",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "External",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Internal",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "Private",
+                "discriminant": 2,
+                "fields": []
+              },
+              {
+                "name": "Weak",
+                "discriminant": 3,
+                "fields": []
+              },
+              {
+                "name": "LinkOnce",
+                "discriminant": 4,
+                "fields": []
+              },
+              {
+                "name": "AvailableExternally",
+                "discriminant": 5,
+                "fields": []
+              },
+              {
+                "name": "ExternalWeak",
+                "discriminant": 6,
+                "fields": []
+              },
+              {
+                "name": "WeakOdr",
+                "discriminant": 7,
+                "fields": []
+              },
+              {
+                "name": "LinkOnceOdr",
+                "discriminant": 8,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 2
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "trust_ir::Linkage",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "trust_ir::Linkage"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+                "line_start": 2283,
+                "col_start": 35,
+                "line_end": 2283,
+                "col_end": 52
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "trust_ir_laws::visibility_contradicts_linkage",
+            "args": [
+              {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+              "line_start": 2283,
+              "col_start": 4,
+              "line_end": 2283,
+              "col_end": 65
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 18354624647166368809,
+              "def_index": 18,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 18354624647166368809,
+              "krate_name": "trust_ir_laws"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 2
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Bool"
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+        "line_start": 2281,
+        "col_start": 12,
+        "line_end": 2281,
+        "col_end": 27
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) == (false)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Eq": [
+        {
+          "Var": [
+            "_0",
+            "Bool"
+          ]
+        },
+        {
+          "Bool": false
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) == (false)"
+    ],
+    "invariants": []
+  }
+}

@@ -28,7 +28,7 @@ pub struct Shell {
 impl fmt::Debug for Shell {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.output {
-            ShellOut::Write(_) => f
+            ShellOut::Write(..) => f
                 .debug_struct("Shell")
                 .field("verbosity", &self.verbosity)
                 .finish(),
@@ -68,7 +68,21 @@ impl Shell {
     /// Creates a shell from a plain writable object, with no color, and max verbosity.
     pub fn from_write(out: Box<dyn Write + Send + Sync>) -> Shell {
         Shell {
-            output: ShellOut::Write(AutoStream::never(out)), // strip all formatting on write
+            output: ShellOut::Write(AutoStream::never(out), None), // strip all formatting on write
+            verbosity: Verbosity::Verbose,
+            needs_clear: false,
+        }
+    }
+
+    /// Creates a nonterminal shell with distinct original output writers.
+    /// Formatting is stripped exactly as in `from_write`; combined writer
+    /// users keep their behavior. Errors propagate on the original stream.
+    pub fn from_writes(
+        stdout: Box<dyn Write + Send + Sync>,
+        stderr: Box<dyn Write + Send + Sync>,
+    ) -> Shell {
+        Shell {
+            output: ShellOut::Write(AutoStream::never(stdout), Some(AutoStream::never(stderr))),
             verbosity: Verbosity::Verbose,
             needs_clear: false,
         }
@@ -287,14 +301,14 @@ impl Shell {
 
     pub fn out_unicode(&self) -> bool {
         match &self.output {
-            ShellOut::Write(_) => true,
+            ShellOut::Write(..) => true,
             ShellOut::Stream { stdout_unicode, .. } => *stdout_unicode,
         }
     }
 
     pub fn err_unicode(&self) -> bool {
         match &self.output {
-            ShellOut::Write(_) => true,
+            ShellOut::Write(..) => true,
             ShellOut::Stream { stderr_unicode, .. } => *stderr_unicode,
         }
     }
@@ -306,28 +320,28 @@ impl Shell {
     pub fn color_choice(&self) -> ColorChoice {
         match self.output {
             ShellOut::Stream { color_choice, .. } => color_choice,
-            ShellOut::Write(_) => ColorChoice::Never,
+            ShellOut::Write(..) => ColorChoice::Never,
         }
     }
 
     /// Whether the shell supports color.
     pub fn err_supports_color(&self) -> bool {
         match &self.output {
-            ShellOut::Write(_) => false,
+            ShellOut::Write(..) => false,
             ShellOut::Stream { stderr, .. } => supports_color(stderr.current_choice()),
         }
     }
 
     pub fn out_supports_color(&self) -> bool {
         match &self.output {
-            ShellOut::Write(_) => false,
+            ShellOut::Write(..) => false,
             ShellOut::Stream { stdout, .. } => supports_color(stdout.current_choice()),
         }
     }
 
     pub fn out_hyperlink<D: fmt::Display>(&self, url: D) -> Hyperlink<D> {
         let supports_hyperlinks = match &self.output {
-            ShellOut::Write(_) => false,
+            ShellOut::Write(..) => false,
             ShellOut::Stream {
                 stdout, hyperlinks, ..
             } => stdout.current_choice() == anstream::ColorChoice::AlwaysAnsi && *hyperlinks,
@@ -341,7 +355,7 @@ impl Shell {
 
     pub fn err_hyperlink<D: fmt::Display>(&self, url: D) -> Hyperlink<D> {
         let supports_hyperlinks = match &self.output {
-            ShellOut::Write(_) => false,
+            ShellOut::Write(..) => false,
             ShellOut::Stream {
                 stderr, hyperlinks, ..
             } => stderr.current_choice() == anstream::ColorChoice::AlwaysAnsi && *hyperlinks,
@@ -363,9 +377,24 @@ impl Shell {
         url.map(|u| self.err_hyperlink(u)).unwrap_or_default()
     }
 
+    /// Query terminal capability, independent of user configuration
+    pub fn progress_supported(&self) -> bool {
+        // report no progress when -q (for quiet) or TERM=dumb are set
+        // or if running on Continuous Integration service like Travis where the
+        // output logs get mangled.
+        if self.verbosity == Verbosity::Quiet
+            || std::env::var("TERM").as_deref() == Ok("dumb")
+            || cargo_util::is_ci()
+        {
+            false
+        } else {
+            true
+        }
+    }
+
     fn unstable_flags_rustc_unicode(&self) -> bool {
         match &self.output {
-            ShellOut::Write(_) => false,
+            ShellOut::Write(..) => false,
             ShellOut::Stream {
                 unstable_flags_rustc_unicode,
                 ..
@@ -447,7 +476,10 @@ impl Default for Shell {
 /// A `Write`able object, either with or without color support
 enum ShellOut {
     /// A plain write object without color support
-    Write(AutoStream<Box<dyn Write + Send + Sync>>),
+    Write(
+        AutoStream<Box<dyn Write + Send + Sync>>,
+        Option<AutoStream<Box<dyn Write + Send + Sync>>>,
+    ),
     /// Color-enabled stdio, with information on whether color should be used
     Stream {
         stdout: AutoStream<std::io::Stdout>,
@@ -491,7 +523,7 @@ impl ShellOut {
     fn stdout(&mut self) -> &mut dyn Write {
         match self {
             ShellOut::Stream { stdout, .. } => stdout,
-            ShellOut::Write(w) => w,
+            ShellOut::Write(w, _) => w,
         }
     }
 
@@ -499,7 +531,10 @@ impl ShellOut {
     fn stderr(&mut self) -> &mut dyn Write {
         match self {
             ShellOut::Stream { stderr, .. } => stderr,
-            ShellOut::Write(w) => w,
+            ShellOut::Write(out, err) => match err {
+                Some(err) => err,
+                None => out,
+            },
         }
     }
 }
@@ -715,5 +750,64 @@ fn default_err_erase_line(shell: &mut Shell) {
             drop(write!(shell.output.stderr(), "{}\r", blank));
         }
         _ => (),
+    }
+}
+
+#[cfg(test)]
+mod owned_writer_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Original(Arc<Mutex<Vec<u8>>>);
+    impl Write for Original {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct Refuse;
+    impl Write for Refuse {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("actual stderr sink refused"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn separate_original_writers_preserve_streams_and_combined_writer_behavior() {
+        let stdout = Original::default();
+        let stderr = Original::default();
+        let mut shell = Shell::from_writes(Box::new(stdout.clone()), Box::new(stderr.clone()));
+        shell.out().write_all(b"stdout\0binary\n").unwrap();
+        shell.err().write_all(b"stderr\0binary\n").unwrap();
+        shell
+            .status("Finished", "same actual stderr writer")
+            .unwrap();
+        // Both constructors preserve Cargo's existing control-character and
+        // ANSI filtering. These are graph diagnostics, not raw child pipes.
+        assert_eq!(*stdout.0.lock().unwrap(), b"stdoutbinary\n");
+        let actual = stderr.0.lock().unwrap();
+        assert!(actual.starts_with(b"stderrbinary\n"));
+        assert!(actual.ends_with(b"same actual stderr writer\n"));
+        drop(actual);
+        assert!(!shell.is_err_tty());
+        let combined = Original::default();
+        let mut shell = Shell::from_write(Box::new(combined.clone()));
+        shell.out().write_all(b"out").unwrap();
+        shell.err().write_all(b"err").unwrap();
+        assert_eq!(*combined.0.lock().unwrap(), b"outerr");
+    }
+    #[test]
+    fn original_stderr_failure_never_retries_or_contaminates_stdout() {
+        let stdout = Original::default();
+        let mut shell = Shell::from_writes(Box::new(stdout.clone()), Box::new(Refuse));
+        shell.out().write_all(b"original stdout").unwrap();
+        assert!(shell.status("Error", "refused destination").is_err());
+        assert_eq!(*stdout.0.lock().unwrap(), b"original stdout");
     }
 }

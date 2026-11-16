@@ -1,0 +1,23 @@
+{
+  "id": "tvc-mut-alias-field-method",
+  "class": "trust-vc &mut place escape (930d025f)",
+  "title": "a method called through a &mut alias of a whole struct wrote a field the lane did not frame",
+  "origin": [
+    "trust-vc 930d025f 'frame every escaping &mut place'",
+    "trust-vc crates/trust-vc-core/tests/mut_place_borrow_escape_soundness.rs never_whole_alias_field_method / verified_alias_write_twin"
+  ],
+  "lang": "trust-vc",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "never_whole_alias_field_method"
+  },
+  "twin": {
+    "function": "verified_alias_write_twin"
+  },
+  "witness": {
+    "input": "y = 1",
+    "observed": "trust_vc::assert! violated",
+    "exit": 101,
+    "main": "witness.rs"
+  }
+}

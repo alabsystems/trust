@@ -1,9 +1,10 @@
+// ignore-tidy-file-linelength
+//
 // Check that backtrace info is correctly generated for dynamic libraries and is usable by a
 // rust binary.
 // Part of porting some backtrace tests to rustc: <https://github.com/rust-lang/rust/issues/122899>.
 // Original test:
 // <https://github.com/rust-lang/backtrace-rs/tree/6fa4b85b9962c3e1be8c2e5cc605cd078134152b/crates/dylib-dep>
-// ignore-tidy-linelength
 //@ ignore-android FIXME #17520
 //@ ignore-fuchsia Backtraces not symbolized
 //@ ignore-musl musl doesn't support dynamic libraries (at least when the original test was written).
@@ -14,7 +15,7 @@
 //@ needs-unwind
 //@ ignore-backends: gcc
 //@ compile-flags: -g -Copt-level=0 -Cstrip=none -Cforce-frame-pointers=yes
-//@ ignore-emscripten Requires custom symbolization code
+//@ ignore-wasm Requires custom symbolization code
 //@ aux-crate: dylib_dep_helper=dylib-dep-helper.rs
 //@ aux-crate: auxiliary=dylib-dep-helper-aux.rs
 //@ run-pass

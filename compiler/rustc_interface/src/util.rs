@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::{env, thread};
@@ -9,7 +10,7 @@ use rustc_ast as ast;
 use rustc_attr_parsing::ShouldEmit;
 use rustc_codegen_ssa::back::archive::{ArArchiveBuilderBuilder, ArchiveBuilderBuilder};
 use rustc_codegen_ssa::back::link::link_binary;
-use rustc_codegen_ssa::target_features::cfg_target_feature;
+use rustc_codegen_ssa::target_features::internal_target_features;
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_codegen_ssa::{CompiledModules, CrateInfo, TargetConfig};
 use rustc_data_structures::base_n::{CASE_INSENSITIVE, ToBaseN};
@@ -19,14 +20,16 @@ use rustc_metadata::{DylibError, EncodedMetadata, load_symbol_from_dylib};
 use rustc_middle::dep_graph::WorkProductMap;
 use rustc_middle::ty::{CurrentGcx, TyCtxt};
 use rustc_query_impl::{CollectActiveJobsKind, collect_active_query_jobs};
+pub use rustc_session::config::DEFAULT_STACK_SIZE;
 use rustc_session::config::{
-    Cfg, CrateType, OutFileName, OutputFilenames, OutputTypes, Sysroot, host_tuple,
+    Cfg, Jobs, OutFileName, OutputFilenames, OutputTypes, Sysroot, host_tuple,
 };
-use rustc_session::{EarlyDiagCtxt, Session, filesearch};
+use rustc_session::{EarlyDiagCtxt, EarlySession, IncrCompSession, Session, filesearch};
 use rustc_span::edition::Edition;
 use rustc_span::source_map::SourceMapInputs;
 use rustc_span::{SessionGlobals, Symbol, sym};
-use rustc_target::spec::Target;
+use rustc_structures::CrateType;
+use rustc_target::spec::{Arch, Target};
 use tracing::info;
 
 use crate::diagnostics;
@@ -39,70 +42,110 @@ type MakeBackendFn = fn() -> Box<dyn CodegenBackend>;
 /// specific features (SSE, NEON etc.).
 ///
 /// This is performed by checking whether a set of permitted features
-/// is available on the target machine, by querying the codegen backend.
+/// is available on the target machine, by querying the `TargetConfig` from the codegen backend.
 pub(crate) fn add_configuration(
     cfg: &mut Cfg,
-    sess: &mut Session,
-    codegen_backend: &dyn CodegenBackend,
+    target_config: &TargetConfig,
+    target: &Target,
+    is_nightly_build: bool,
+    is_crt_static: bool,
 ) {
-    let tf = sym::target_feature;
-    let tf_cfg = codegen_backend.target_config(sess);
+    // Add some of the target features to `cfg`.
+    if !target_config.internal_target_features.is_empty() {
+        cfg.extend(
+            target
+                .rust_target_features()
+                .iter()
+                .filter_map(|(feature, gate, _)| {
+                    if gate.in_cfg()
+                        && (is_nightly_build || gate.requires_nightly(/* in_cfg */ true).is_none())
+                    {
+                        let sym = Symbol::intern(feature);
+                        target_config
+                            .internal_target_features
+                            .contains(&sym)
+                            .then_some((sym::target_feature, Some(sym)))
+                    } else {
+                        None
+                    }
+                }),
+        );
+    }
 
-    sess.unstable_target_features.extend(tf_cfg.unstable_target_features.iter().copied());
-    sess.target_features.extend(tf_cfg.target_features.iter().copied());
-
-    cfg.extend(tf_cfg.target_features.into_iter().map(|feat| (tf, Some(feat))));
-
-    if tf_cfg.has_reliable_f16 {
+    if target_config.has_reliable_f16 {
         cfg.insert((sym::target_has_reliable_f16, None));
     }
-    if tf_cfg.has_reliable_f16_math {
+    if target_config.has_reliable_f16_math {
         cfg.insert((sym::target_has_reliable_f16_math, None));
     }
-    if tf_cfg.has_reliable_f128 {
+    if target_config.has_reliable_f16b {
+        cfg.insert((sym::target_has_reliable_f16b, None));
+    }
+    if target_config.has_reliable_f128 {
         cfg.insert((sym::target_has_reliable_f128, None));
     }
-    if tf_cfg.has_reliable_f128_math {
+    if target_config.has_reliable_f128_math {
         cfg.insert((sym::target_has_reliable_f128_math, None));
     }
 
-    if sess.crt_static(None) {
-        cfg.insert((tf, Some(sym::crt_dash_static)));
+    if is_crt_static {
+        cfg.insert((sym::target_feature, Some(sym::crt_dash_static)));
     }
 }
 
 /// Ensures that all target features required by the ABI are present.
-/// Must be called after `unstable_target_features` has been populated!
+/// Must be called after `internal_target_features` has been populated!
 pub(crate) fn check_abi_required_features(sess: &Session) {
     let abi_feature_constraints = sess.target.abi_required_features();
-    // We check this against `unstable_target_features` as that is conveniently already
+    // We check this against `internal_target_features` as that is conveniently already
     // back-translated to rustc feature names, taking into account `-Ctarget-cpu` and `-Ctarget-feature`.
     // Just double-check that the features we care about are actually on our list.
     for feature in
         abi_feature_constraints.required.iter().chain(abi_feature_constraints.incompatible.iter())
     {
-        assert!(
+        debug_assert!(
             sess.target.rust_target_features().iter().any(|(name, ..)| feature == name),
             "target feature {feature} is required/incompatible for the current ABI but not a recognized feature for this target"
         );
     }
 
+    // Make this a hard error on ARM since starting with LLVM24, the backend will otherwise
+    // emit a (less friendly) hard error.
+    // Also make it a hard error on x86, where we use SSE registers for the "Rust" ABI. The
+    // post-mono ABI check only systematically checks "C" calls, so we better reject this here.
+    let hard_error = matches!(sess.target.arch, Arch::AArch64 | Arch::Arm | Arch::X86);
+
     for feature in abi_feature_constraints.required {
-        if !sess.unstable_target_features.contains(&Symbol::intern(feature)) {
-            sess.dcx()
-                .emit_warn(diagnostics::AbiRequiredTargetFeature { feature, enabled: "enabled" });
+        if !sess.internal_target_features.contains(&Symbol::intern(feature)) {
+            let diag = diagnostics::AbiRequiredTargetFeature {
+                feature,
+                enabled: "enabled",
+                fcw: !hard_error,
+            };
+            if hard_error {
+                sess.dcx().emit_err(diag);
+            } else {
+                sess.dcx().emit_warn(diag);
+            }
         }
     }
     for feature in abi_feature_constraints.incompatible {
-        if sess.unstable_target_features.contains(&Symbol::intern(feature)) {
-            sess.dcx()
-                .emit_warn(diagnostics::AbiRequiredTargetFeature { feature, enabled: "disabled" });
+        if sess.internal_target_features.contains(&Symbol::intern(feature)) {
+            let diag = diagnostics::AbiRequiredTargetFeature {
+                feature,
+                enabled: "disabled",
+                fcw: !hard_error,
+            };
+            if hard_error {
+                sess.dcx().emit_err(diag);
+            } else {
+                sess.dcx().emit_warn(diag);
+            }
         }
     }
 }
 
 pub static STACK_SIZE: OnceLock<usize> = OnceLock::new();
-pub const DEFAULT_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 fn init_stack_size(early_dcx: &EarlyDiagCtxt) -> usize {
     // Obey the environment setting or default
@@ -124,7 +167,7 @@ fn init_stack_size(early_dcx: &EarlyDiagCtxt) -> usize {
                         r#"`RUST_MIN_STACK` should be a number of bytes, but was "{s}""#,
                     ));
                     err.note("you can also unset `RUST_MIN_STACK` to use the default stack size");
-                    err.emit()
+                    err.emit_fatal()
                 })
             })
             // otherwise pick a consistent default
@@ -132,7 +175,7 @@ fn init_stack_size(early_dcx: &EarlyDiagCtxt) -> usize {
     })
 }
 
-fn run_in_thread_with_globals<F: FnOnce(CurrentGcx, Arc<Proxy>) -> R + Send, R: Send>(
+fn run_in_thread_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
     thread_stack_size: usize,
     edition: Edition,
     sm_inputs: SourceMapInputs,
@@ -158,7 +201,7 @@ fn run_in_thread_with_globals<F: FnOnce(CurrentGcx, Arc<Proxy>) -> R + Send, R: 
                     edition,
                     extra_symbols,
                     Some(sm_inputs),
-                    || f(CurrentGcx::new(), Proxy::new()),
+                    || f(CurrentGcx::new()),
                 )
             })
             .unwrap()
@@ -171,13 +214,10 @@ fn run_in_thread_with_globals<F: FnOnce(CurrentGcx, Arc<Proxy>) -> R + Send, R: 
     })
 }
 
-pub(crate) fn run_in_thread_pool_with_globals<
-    F: FnOnce(CurrentGcx, Arc<Proxy>) -> R + Send,
-    R: Send,
->(
+pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
     thread_builder_diag: &EarlyDiagCtxt,
     edition: Edition,
-    threads: usize,
+    jobs: Jobs,
     extra_symbols: &[&'static str],
     sm_inputs: SourceMapInputs,
     f: F,
@@ -190,19 +230,21 @@ pub(crate) fn run_in_thread_pool_with_globals<
 
     let thread_stack_size = init_stack_size(thread_builder_diag);
 
-    let registry = sync::Registry::new(std::num::NonZero::new(threads).unwrap());
+    let jobs_frontend = jobs.frontend.or(NonZero::new(1)).unwrap();
+    let registry = sync::Registry::new(jobs_frontend);
 
     let Some(proof) = sync::check_dyn_thread_safe() else {
+        assert_eq!(jobs_frontend.get(), 1);
         return run_in_thread_with_globals(
             thread_stack_size,
             edition,
             sm_inputs,
             extra_symbols,
-            |current_gcx, jobserver_proxy| {
+            |current_gcx| {
                 // Register the thread for use with the `WorkerLocal` type.
                 registry.register();
 
-                f(current_gcx, jobserver_proxy)
+                f(current_gcx)
             },
         );
     };
@@ -211,14 +253,38 @@ pub(crate) fn run_in_thread_pool_with_globals<
     let current_gcx2 = current_gcx.clone();
 
     let proxy = Proxy::new();
-
     let proxy_ = Arc::clone(&proxy);
-    let proxy__ = Arc::clone(&proxy);
+    // Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): retire the proxy's helper thread
+    // here, on this thread, once the pool below is gone. The two handlers own
+    // the proxy and live in the pool's registry, and the deadlock handler can
+    // pass that registry to a detached thread, so the place where the last
+    // owner drops is not fixed; and that drop waits only about a second for the
+    // helper. A helper still alive when the process exits can have taken a
+    // token out of the jobserver without having handed it over, and the token
+    // is then lost while the compiler exits 0. This guard is declared before
+    // the pool is built, so it runs after `build_scoped` has joined every
+    // worker, on return and on unwinding, and `Proxy::shutdown` returns only
+    // when the helper is joined.
+    let proxy_retired = Arc::clone(&proxy);
+    let _retire_jobserver_helper = defer(move || {
+        if let Err(error) = proxy_retired.shutdown() {
+            // Fail closed: the compilation does not succeed with its token
+            // accounting unsettled. While a panic or a fatal error is already
+            // unwinding the process fails anyway, and a second panic would
+            // replace that failure with an abort.
+            if thread::panicking() {
+                eprintln!("error: {error}");
+            } else {
+                panic!("{error}");
+            }
+        }
+    });
+
     let builder = rustc_thread_pool::ThreadPoolBuilder::new()
         .thread_name(|_| "rustc".to_string())
-        .acquire_thread_handler(move || proxy_.acquire_thread())
-        .release_thread_handler(move || proxy__.release_thread())
-        .num_threads(threads)
+        .acquire_thread_handler(move || proxy.acquire_thread())
+        .release_thread_handler(move || proxy_.release_thread())
+        .num_threads(jobs_frontend.get())
         .deadlock_handler(move || {
             // On deadlock, creates a new thread and forwards information in thread
             // locals to it. The new thread runs the deadlock handler.
@@ -293,17 +359,17 @@ internal compiler error: query cycle handler thread panicked, aborting process";
                     },
                     // Run `f` on the first thread in the thread pool.
                     move |pool: &rustc_thread_pool::ThreadPool| {
-                        pool.install(|| f(current_gcx.into_inner(), proxy))
+                        pool.install(|| f(current_gcx.into_inner()))
                     },
                 )
                 .unwrap_or_else(|err| {
                     let mut diag = thread_builder_diag.early_struct_fatal(format!(
-                        "failed to spawn compiler thread pool: could not create {threads} threads ({err})",
+                        "failed to spawn compiler thread pool: could not create {jobs_frontend} threads ({err})",
                     ));
                     diag.help(
                         "try lowering `-Z threads` or checking the operating system's resource limits",
                     );
-                    diag.emit()
+                    diag.emit_fatal()
                 })
         })
     })
@@ -352,6 +418,18 @@ pub fn get_no_trust_evidence_codegen_backend(
         .then(|| builtin_codegen_backend(backend))
         .flatten()
         .map(|load| load())
+}
+
+/// Construct only the already-linked LLVM backend for retained native work.
+/// Absence is a refusal: this route never consults a sysroot dylib loader.
+pub(crate) fn get_native_llvm_codegen_backend(
+    backend_name: Option<&str>,
+    target: &Target,
+) -> Option<Box<dyn CodegenBackend>> {
+    if effective_codegen_backend_name(backend_name, target) != "llvm" {
+        return None;
+    }
+    builtin_codegen_backend("llvm").map(|load| load())
 }
 
 /// Get the codegen backend based on the name and specified sysroot.
@@ -420,6 +498,13 @@ fn builtin_codegen_backend(backend: &str) -> Option<MakeBackendFn> {
     }
 }
 
+// Trust: only already-linked backends use this compiler's observed native-link
+// path. A callback or external backend cannot establish an empty inventory by
+// merely reporting one of their names.
+pub(crate) fn builtin_tool_input_observer(backend: Option<&str>, target: &Target) -> bool {
+    builtin_codegen_backend(effective_codegen_backend_name(backend, target)).is_some()
+}
+
 #[cfg(test)]
 #[path = "util/tests.rs"]
 mod builtin_codegen_backend_tests;
@@ -433,13 +518,9 @@ impl CodegenBackend for DummyCodegenBackend {
         "dummy"
     }
 
-    fn target_config(&self, sess: &Session) -> TargetConfig {
-        if let Some(target_config_override) = &self.target_config_override {
-            return target_config_override(sess);
-        }
-
+    fn target_config(&self, sess: &EarlySession) -> TargetConfig {
         let abi_required_features = sess.target.abi_required_features();
-        let (target_features, unstable_target_features) = cfg_target_feature::<0>(
+        let internal_target_features = internal_target_features::<0>(
             sess,
             |_feature| Default::default(),
             |feature| {
@@ -452,10 +533,10 @@ impl CodegenBackend for DummyCodegenBackend {
         );
 
         TargetConfig {
-            target_features,
-            unstable_target_features,
+            internal_target_features,
             has_reliable_f16: true,
             has_reliable_f16_math: true,
+            has_reliable_f16b: true,
             has_reliable_f128: true,
             has_reliable_f128_math: true,
         }
@@ -490,6 +571,7 @@ impl CodegenBackend for DummyCodegenBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         _sess: &Session,
+        _incr_comp_session: Option<&IncrCompSession>,
         _outputs: &OutputFilenames,
         _crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
@@ -684,6 +766,14 @@ fn multiple_output_types_to_stdout(
     output_types: &OutputTypes,
     single_output_file_is_stdout: bool,
 ) -> bool {
+    if output_types.len() <= 1 {
+        return false;
+    }
+    if !single_output_file_is_stdout
+        && !output_types.values().any(|o| *o == Some(OutFileName::Stdout))
+    {
+        return false;
+    }
     use std::io::IsTerminal;
     if std::io::stdout().is_terminal() {
         // If stdout is a tty, check if multiple text output types are

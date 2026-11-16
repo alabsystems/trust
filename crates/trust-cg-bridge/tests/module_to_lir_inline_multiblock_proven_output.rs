@@ -21,24 +21,28 @@
 // + ValueIds, params bound to args, and each callee `Return(v)` becomes a
 // `Br -> cont, args=[v]` into a fresh continuation block whose single param is
 // the call result. The existing scalar / checked-tuple / Assert-split / CFG
-// machinery then lowers the result with ZERO proof-executor changes.
+// machinery then lowers the result. The test executor below admits only paths
+// feasible under an independent source-level no-overflow domain.
 //
 // We prove, over the no-overflow path, the emitted machine bytes compute
 // `a + b` for ALL inputs:
 //
 //   (1) NO-Bl / NO-Call: the emitted __text must contain NO `Bl`/`Blr` (AArch64
 //       call) — proof the multi-block callee was INLINED, not emitted as a call;
-//   (2) PROVEN-OUTPUT (infinite domain): the emitted bytes are decoded into
-//       machine effects (NOT reconstructed from the IR), path-merged (the
-//       overflow trap arm is discarded, its negation conjoined into the
-//       no-overflow PRECONDITION) into a symbolic output Formula; ay (QF_BV)
+//   (2) PROVEN-OUTPUT (full symbolic input domain): the emitted bytes are decoded into
+//       machine effects (NOT reconstructed from the IR). Each omitted arm must
+//       be solver-UNSAT under the independent signed-add no-overflow domain
+//       and accumulated byte-derived guards; ay (QF_BV)
 //       proves `precondition => (Formula == a + b)` for ALL inputs (UNSAT of the
 //       negation); and
 //   (3) NEGATIVE CONTROL: the SAME emitted bytes proven against an `a + b + 1`
 //       spec (under the same precondition) MUST be SAT — otherwise the discharge
 //       is vacuous (e.g. if the inlined add were silently dropped); and
-//   (4) NON-TRIVIAL PRECONDITION: a vacuously-`true` precondition would mean the
-//       overflow trap was never explored (the inlined check was dropped).
+//   (4) DOMAIN AND REFUSAL CONTROLS: the source domain has exact signed
+//       boundaries; feasible BRK/calls remain refused, and an inverted actual
+//       overflow branch cannot silently shrink the admitted input domain.
+//
+// These are bounded development solver checks, not kernel certificates.
 //
 // The machine output is BYTE-DERIVED (emit -> decode -> effects), NEVER
 // reconstructed from the IR; a wrong multi-block clone/redirect (wrong arg
@@ -49,11 +53,30 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#![cfg(feature = "ay-proofs")]
+// Trust (2026-09-30, plan §5 fail-open item 1): every shipping `module_to_lir`
+// entry point now refuses an `Assert`-bearing body as
+// `ModuleLirError::ImplicitPanicUnfaithful` — the `Brif`/`Trap` lowering this
+// file proves is a bare `brk`, not Rust's panic. The proofs stay under test
+// for plan §5 item P through the trap oracle, which exists only under the
+// non-default `test-hooks` feature (never enabled by the compiler); this file
+// moved from the `ay-proofs` lane to `test-hooks` with it (`test-hooks`
+// implies `ay-proofs`).
+#![cfg(feature = "test-hooks")]
 
-use ay::{BigInt, Logic, Solver, Term};
+use std::time::Duration;
+
+use ay::{BigInt, Logic, Solver, SolverConfig, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
-use trust_cg_bridge::lower_trust_ir_function_to_lir;
+use trust_cg_bridge::module_to_lir::lower_trust_ir_function_to_lir_trap_assert_oracle;
+
+/// The trap oracle under the name this file always used (see the note at the
+/// top): `Assert` lowers to `Brif`/`Trap` here and is refused everywhere else.
+fn lower_trust_ir_function_to_lir(
+    module: &trust_ir::Module,
+    function: &trust_ir::Function,
+) -> Result<trust_cg_lower::function::Function, trust_cg_bridge::ModuleLirError> {
+    lower_trust_ir_function_to_lir_trap_assert_oracle(module, function, false)
+}
 use trust_disasm::{Opcode, decode_aarch64};
 use trust_ir::Module;
 use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
@@ -130,6 +153,7 @@ fn make_bridge_cab_module() -> Module {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // cab(a, b) -> i32 { add(a, b) }
@@ -158,6 +182,7 @@ fn make_bridge_cab_module() -> Module {
                         is_unsafe_sig: false,
                         is_foreign: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -170,6 +195,7 @@ fn make_bridge_cab_module() -> Module {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // cab MUST be functions[0] (the emitter lowers functions[0]); add is the
@@ -244,22 +270,19 @@ fn macho_text(obj: &[u8]) -> Option<(Vec<u8>, u64)> {
     None
 }
 
-/// Decode every 4-byte word in __text and count `Bl`/`Blr` (AArch64 call)
-/// opcodes. An INLINED call emits NONE; a real (un-inlined) call edge emits one.
-fn count_bl(code: &[u8], base: u64) -> usize {
-    let mut bls = 0usize;
-    let mut pc = base;
-    while (pc - base) as usize + 4 <= code.len() {
-        let off = (pc - base) as usize;
-        let bytes: [u8; 4] = code[off..off + 4].try_into().unwrap();
-        if let Ok(insn) = decode_aarch64(&bytes, pc) {
-            if matches!(insn.opcode, Opcode::Bl | Opcode::Blr) {
-                bls += 1;
-            }
-        }
-        pc += 4;
-    }
-    bls
+/// Decode all emitted words. Unknown words or a truncated instruction refuse
+/// the structural check rather than being omitted from the call/trap counts.
+fn count_opcode(code: &[u8], base: u64, wanted: &[Opcode]) -> usize {
+    assert_eq!(code.len() % 4, 0, "AArch64 text must contain complete instructions");
+    code.chunks_exact(4)
+        .enumerate()
+        .filter(|(index, bytes)| {
+            let bytes: [u8; 4] = (*bytes).try_into().unwrap();
+            let insn = decode_aarch64(&bytes, base + (*index * 4) as u64)
+                .expect("every emitted word must decode for structural accounting");
+            wanted.contains(&insn.opcode)
+        })
+        .count()
 }
 
 /// Does the emitted __text carry a conditional branch? The inlined overflow
@@ -283,10 +306,10 @@ fn has_conditional_branch(code: &[u8], base: u64) -> bool {
 }
 
 // ===========================================================================
-// BOUNDED SYMBOLIC PATH-MERGING EXECUTOR (mirrors the checked-tuple harness):
-// explores both targets at a ConditionalBranch; an arm that diverges into the
-// `abort` trap (a Call effect) is the overflow/panic path — discarded, and the
-// live arm's path condition is conjoined into the no-overflow PRECONDITION.
+// BOUNDED SYMBOLIC RETURN-PATH EXECUTOR. The arithmetic input assumption is
+// supplied independently of emitted control flow. An arm is omitted only when
+// AY establishes that its accumulated path condition is UNSAT. Reachable BRK,
+// calls, and unknown feasibility remain refusals; no trap semantics is invented.
 // ===========================================================================
 
 const MAX_STEPS: u32 = 4096;
@@ -296,7 +319,6 @@ const MAX_DEPTH: u32 = 16;
 enum ExecError {
     Loop { at: u64 },
     BudgetExceeded,
-    Trapped,
     Unsupported(String),
     Decode(String),
 }
@@ -306,12 +328,11 @@ struct Executor<'a> {
     code: &'a [u8],
     base: u64,
     steps: u32,
-    precondition: Vec<Formula>,
 }
 
 impl<'a> Executor<'a> {
     fn new(code: &'a [u8], base: u64) -> Self {
-        Executor { sem: Aarch64Semantics, code, base, steps: 0, precondition: Vec::new() }
+        Executor { sem: Aarch64Semantics, code, base, steps: 0 }
     }
 
     fn decode_at(&self, pc: u64) -> Result<trust_disasm::Instruction, ExecError> {
@@ -332,6 +353,7 @@ impl<'a> Executor<'a> {
         mut state: MachineState,
         mut visited: Vec<u64>,
         depth: u32,
+        path_condition: Formula,
     ) -> Result<Formula, ExecError> {
         if depth > MAX_DEPTH {
             return Err(ExecError::BudgetExceeded);
@@ -370,7 +392,7 @@ impl<'a> Executor<'a> {
                     Effect::Branch { target } => uncond_target = Some(target.clone()),
                     Effect::PcUpdate { .. } => {}
                     Effect::Call { .. } => {
-                        return Err(ExecError::Trapped);
+                        return Err(ExecError::Unsupported(format!("call at {pc:#x}")));
                     }
                     Effect::Aarch64SyncBoundary { .. } | Effect::Aarch64AtomicAccess { .. } => {
                         return Err(ExecError::Unsupported(format!("atomic/sync at {pc:#x}")));
@@ -397,10 +419,30 @@ impl<'a> Executor<'a> {
                     return Err(ExecError::Loop { at: pc });
                 }
 
-                let taken = self.run(target_pc, state.clone(), visited.clone(), depth + 1);
-                let fall = self.run(fall_pc, state.clone(), visited.clone(), depth + 1);
-
-                return self.merge(path_cond, taken, fall);
+                let taken_path = Formula::And(vec![path_condition.clone(), path_cond.clone()]);
+                let fall_path = Formula::And(vec![
+                    path_condition.clone(),
+                    Formula::Not(Box::new(path_cond.clone())),
+                ]);
+                // Do not even decode an infeasible destination. In particular,
+                // a BRK may only be avoided by proving its path impossible;
+                // a feasible BRK still reaches the unchanged Semantics refusal.
+                return match (path_is_feasible(&taken_path)?, path_is_feasible(&fall_path)?) {
+                    (true, true) => {
+                        let taken = self.run(
+                            target_pc,
+                            state.clone(),
+                            visited.clone(),
+                            depth + 1,
+                            taken_path,
+                        )?;
+                        let fall = self.run(fall_pc, state, visited, depth + 1, fall_path)?;
+                        Ok(Formula::Ite(Box::new(path_cond), Box::new(taken), Box::new(fall)))
+                    }
+                    (true, false) => self.run(target_pc, state, visited, depth + 1, taken_path),
+                    (false, true) => self.run(fall_pc, state, visited, depth + 1, fall_path),
+                    (false, false) => Err(ExecError::Unsupported("no feasible return path".into())),
+                };
             }
 
             if let Some(target) = uncond_target {
@@ -416,26 +458,25 @@ impl<'a> Executor<'a> {
             pc += 4;
         }
     }
+}
 
-    fn merge(
-        &mut self,
-        path_cond: Formula,
-        taken: Result<Formula, ExecError>,
-        fall: Result<Formula, ExecError>,
-    ) -> Result<Formula, ExecError> {
-        match (taken, fall) {
-            (Ok(t), Ok(f)) => Ok(Formula::Ite(Box::new(path_cond), Box::new(t), Box::new(f))),
-            (Err(ExecError::Trapped), Ok(f)) => {
-                self.precondition.push(Formula::Not(Box::new(path_cond)));
-                Ok(f)
-            }
-            (Ok(t), Err(ExecError::Trapped)) => {
-                self.precondition.push(path_cond);
-                Ok(t)
-            }
-            (Err(ExecError::Trapped), Err(ExecError::Trapped)) => Err(ExecError::Trapped),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
+/// Unknown (including the finite solver deadline) is never an infeasibility
+/// certificate. This is a test oracle, not a kernel-certified proof artifact.
+fn path_is_feasible(path: &Formula) -> Result<bool, ExecError> {
+    let config = SolverConfig::default().with_timeout(Duration::from_secs(30));
+    let mut solver = Solver::try_new_with_config(Logic::QfAbv, config)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility solver: {e:?}")))?;
+    let condition = formula_to_term(&mut solver, path);
+    solver
+        .try_assert_term(condition)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility assertion: {e:?}")))?;
+    let result = solver.check_sat();
+    if result.is_unsat() {
+        Ok(false)
+    } else if result.is_sat() {
+        Ok(true)
+    } else {
+        Err(ExecError::Unsupported(format!("unknown branch feasibility: {result:?}")))
     }
 }
 
@@ -446,17 +487,15 @@ fn const_addr(f: &Formula) -> Option<u64> {
     }
 }
 
+/// Bind the source precondition to the ORIGINAL argument registers before any
+/// emitted instruction executes; decoded branches cannot redefine this domain.
 fn symbolic_machine_output(code: &[u8], base: u64) -> Result<(Formula, Formula), ExecError> {
-    let mut exec = Executor::new(code, base);
     let state = MachineState::symbolic();
-    let out = exec.run(base, state, Vec::new(), 0)?;
-    let pre = if exec.precondition.is_empty() {
-        Formula::Bool(true)
-    } else if exec.precondition.len() == 1 {
-        exec.precondition.pop().unwrap()
-    } else {
-        Formula::And(exec.precondition.clone())
-    };
+    let pre = no_signed_i32_add_overflow(state.read_gpr(0, 32), state.read_gpr(1, 32));
+    if !path_is_feasible(&pre)? {
+        return Err(ExecError::Unsupported("empty input domain".into()));
+    }
+    let out = Executor::new(code, base).run(base, state, Vec::new(), 0, pre.clone())?;
     Ok((out, pre))
 }
 
@@ -583,6 +622,28 @@ fn bv32(value: i128) -> Formula {
     Formula::BitVec { value, width: 32 }
 }
 
+/// The exact signed i32 addition fits iff its exact signed i64 sum lies in
+/// [i32::MIN, i32::MAX]. Two sign-extended i32 values cannot overflow i64.
+fn no_signed_i32_add_overflow(a: Formula, b: Formula) -> Formula {
+    let sum = Formula::BvAdd(
+        Box::new(Formula::BvSignExt(Box::new(a), 32)),
+        Box::new(Formula::BvSignExt(Box::new(b), 32)),
+        64,
+    );
+    Formula::And(vec![
+        Formula::BvSLe(
+            Box::new(Formula::BitVec { value: i128::from(i32::MIN), width: 64 }),
+            Box::new(sum.clone()),
+            64,
+        ),
+        Formula::BvSLe(
+            Box::new(sum),
+            Box::new(Formula::BitVec { value: i128::from(i32::MAX), width: 64 }),
+            64,
+        ),
+    ])
+}
+
 /// cab(a,b) = add(a,b) = a + b.
 fn add_spec() -> Formula {
     Formula::BvAdd(Box::new(wn(0)), Box::new(wn(1)), 32)
@@ -594,28 +655,25 @@ fn add_plus_one_spec() -> Formula {
 }
 
 // ---------------------------------------------------------------------------
-// CONCRETE byte oracle. The trust-ir reference interpreter cannot run the
-// bridge's aggregate-undef tuple idiom (it reads the `(i32, bool)` Undef seed
-// eagerly), so — as in the checked-tuple proven-output test — the value oracle
-// is the EMITTED BYTES executed CONCRETELY by `trust_machine_sem`, the same
-// machine semantics the symbolic proof uses but with constant arguments.
+// CONCRETE byte oracle: the EMITTED BYTES executed CONCRETELY by
+// `trust_machine_sem`, the same machine semantics the symbolic proof uses but
+// with constant arguments, because the bytes are what this file checks. This
+// note used to say the trust-ir reference interpreter could not run the
+// module; that held while the bridge packed `add`'s checked pair from an
+// `undef (i32, bool)` seed, on which the interpreter faults. Since BMC-LANE-1
+// (2026-11-06) the bridge packs it with one `make_aggregate`, and the
+// interpreter runs `cab` (call included) and `add`:
+// `cab_interpreter_and_emitted_bytes_agree_on_concrete_inputs` below compares
+// the two, and pins the interpreter's overflow panic.
 // ---------------------------------------------------------------------------
 
-enum ConcreteOutcome {
-    Trapped,
-    Value(Formula),
-}
-
-fn concrete_run(code: &[u8], base: u64, a: i32, b: i32) -> ConcreteOutcome {
+fn concrete_run(code: &[u8], base: u64, a: i32, b: i32) -> Result<Formula, ExecError> {
     let mut state = MachineState::symbolic();
     state.gpr[0] = Formula::BitVec { value: i128::from(a) & 0xffff_ffff, width: 64 };
     state.gpr[1] = Formula::BitVec { value: i128::from(b) & 0xffff_ffff, width: 64 };
-    let mut exec = Executor::new(code, base);
-    match exec.run(base, state, Vec::new(), 0) {
-        Ok(out) => ConcreteOutcome::Value(out),
-        Err(ExecError::Trapped) => ConcreteOutcome::Trapped,
-        Err(e) => panic!("concrete run failed: {e:?}"),
-    }
+    // Concrete executions are not restricted to non-overflowing arguments:
+    // actual overflow must reach the unchanged BRK refusal below.
+    Executor::new(code, base).run(base, state, Vec::new(), 0, Formula::Bool(true))
 }
 
 fn concrete_equals(out: &Formula, expected: i32) -> bool {
@@ -632,10 +690,8 @@ fn concrete_equals(out: &Formula, expected: i32) -> bool {
 }
 
 fn bytes_cab_equals(code: &[u8], base: u64, a: i32, b: i32, expected: i32) -> bool {
-    match concrete_run(code, base, a, b) {
-        ConcreteOutcome::Value(out) => concrete_equals(&out, expected),
-        ConcreteOutcome::Trapped => false,
-    }
+    let out = concrete_run(code, base, a, b).expect("concrete non-overflow execution must return");
+    concrete_equals(&out, expected)
 }
 
 // ===========================================================================
@@ -692,45 +748,32 @@ fn cab_multiblock_inlines_with_no_call_and_no_memory() {
 }
 
 // ===========================================================================
-// TEST 1 — the inlined cab introduces NO call edge: its emitted __text has the
-// SAME `Bl`/`Blr` count as the STANDALONE callee `add` (both carry exactly the
-// one trap `Bl` to the abort runtime — the lowered overflow check — and NOTHING
-// ELSE). A residual call to `add` would show as an EXTRA `Bl`. The inlined cab
-// also carries a conditional branch (the inlined overflow check was lowered).
-//
-// NOTE: a checked-arith body's overflow `Assert` lowers to a `Trap` = a `Bl` to
-// the abort runtime (a `Call` effect). So "the call was inlined" is NOT "zero
-// `Bl`" — it is "no MORE `Bl` than the divergence the body itself contains",
-// proven by the standalone-add baseline. The structural proof that NO call
-// survived is TEST 0 (no LIR `Call` opcode); the path-merge proof (TEST 3)
-// further shows the single `Bl` is the TRAP (it classifies as `Trapped`, i.e.
-// a divergence, leaving a live no-overflow arm — a real call to `add` would
-// trap EVERY path and the proof would have no live arm).
+// TEST 1 — both standalone add and inlined cab carry NO BL/BLR call. Their
+// checked-add trap is BRK; it must remain present along with the conditional
+// branch. LIR call absence and emitted no-call structure are independent checks.
 // ===========================================================================
 
 #[test]
 fn cab_introduces_no_call_edge_over_baseline_and_has_conditional_branch() {
     let module = make_bridge_cab_module();
-    let (cab_code, cab_base) = emit_cab_text(&module);
-    assert!(!cab_code.is_empty(), "emitted __text is empty for inlined cab");
-
-    // Baseline: the standalone callee `add` (same checked-arith body, NOT
-    // inlined into anything). Its only `Bl` is the trap.
-    let (add_code, add_base) = emit_fn_text(&module, 1);
-    let add_bls = count_bl(&add_code, add_base);
-    assert_eq!(add_bls, 1, "standalone add carries exactly one trap Bl (the overflow abort)");
-
-    let cab_bls = count_bl(&cab_code, cab_base);
-    assert_eq!(
-        cab_bls, add_bls,
-        "inlined cab introduced a call edge: cab has {cab_bls} Bl vs the add baseline's {add_bls} \
-         (an inlined call must add NO Bl beyond the body's own trap divergence)"
-    );
-
-    assert!(
-        has_conditional_branch(&cab_code, cab_base),
-        "expected a conditional branch in the emitted bytes (inlined overflow check lowered)"
-    );
+    for idx in [0, 1] {
+        let (code, base) = emit_fn_text(&module, idx);
+        assert!(!code.is_empty(), "emitted text must be nonempty for function {idx}");
+        assert_eq!(
+            count_opcode(&code, base, &[Opcode::Bl, Opcode::Blr]),
+            0,
+            "function {idx} must have no emitted call edge"
+        );
+        assert_eq!(
+            count_opcode(&code, base, &[Opcode::Brk]),
+            1,
+            "function {idx} must retain the checked-add BRK"
+        );
+        assert!(
+            has_conditional_branch(&code, base),
+            "function {idx} must retain the overflow branch"
+        );
+    }
 }
 
 // ===========================================================================
@@ -750,7 +793,47 @@ fn cab_emitted_bytes_are_correct() {
 }
 
 // ===========================================================================
-// TEST 3 — PROVEN OUTPUT (infinite domain): on the no-overflow path the emitted
+// TEST 2b — the reference interpreter runs the SAME bridge Module (cab calling
+// add, whose checked pair is one `make_aggregate`) and agrees with the emitted
+// bytes on concrete no-overflow inputs; on an overflowing pair it panics with
+// the add-overflow kind while the bytes reach the refused BRK.
+// ===========================================================================
+
+#[test]
+fn cab_interpreter_and_emitted_bytes_agree_on_concrete_inputs() {
+    use trust_ir::interpret::{InterpretErrorCode, InterpretValue, Interpreter};
+    use trust_ir::ty::Ty;
+    let module = make_bridge_cab_module();
+    assert!(
+        module.functions[1].blocks.iter().flat_map(|b| &b.body).any(|n| matches!(
+            &n.inst,
+            trust_ir::inst::Inst::MakeAggregate { ty: Ty::Tuple(lanes), variant: None, .. }
+                if *lanes == [Ty::I32, Ty::Bool]
+        )),
+        "the callee packs its checked pair with the complete constructor"
+    );
+    let interpret = |a: i32, b: i32| {
+        let args = vec![
+            InterpretValue::int(Ty::I32, i128::from(a)).expect("arg a"),
+            InterpretValue::int(Ty::I32, i128::from(b)).expect("arg b"),
+        ];
+        Interpreter::with_module(&module).execute_func(module.functions[0].id, args)
+    };
+    let (code, base) = emit_cab_text(&module);
+    for (a, b) in [(2, 3), (-1, 1), (0, 0), (-5, -7), (i32::MAX - 1, 1), (i32::MIN, 0)] {
+        let outcome = interpret(a, b).expect("the interpreter runs the bridge module");
+        let returned = outcome.returns[0].as_int().expect("integer return").as_signed();
+        assert_eq!(returned, i128::from(a + b), "interpreter cab({a}, {b})");
+        assert!(bytes_cab_equals(&code, base, a, b, a + b), "bytes cab({a}, {b}) == {}", a + b);
+    }
+    let overflow = interpret(i32::MAX, 1).expect_err("i32::MAX + 1 overflows");
+    assert_eq!(overflow.code, InterpretErrorCode::Panic, "{overflow:?}");
+    assert_eq!(overflow.message, "attempt to add with overflow", "{overflow:?}");
+    assert_brk_refused(concrete_run(&code, base, i32::MAX, 1));
+}
+
+// ===========================================================================
+// TEST 3 — PROVEN OUTPUT (full symbolic input domain): on the no-overflow path the emitted
 // bytes of the MULTI-BLOCK-inlined cab compute `a + b` for ALL inputs (UNSAT of
 // the negation), under a NON-TRIVIAL no-overflow precondition.
 // ===========================================================================
@@ -763,23 +846,20 @@ fn cab_multiblock_inlined_bytes_compute_a_plus_b_on_no_overflow_path() {
     // Concrete byte-level value-differential precondition.
     assert!(bytes_cab_equals(&code, base, 2, 3, 5), "value-differential precondition");
     assert!(!code.is_empty(), "emitted __text is empty");
-    // The multi-block call was inlined: cab introduces no `Bl` beyond the body's
-    // own trap divergence (same count as the standalone-add baseline).
-    let (add_code, add_base) = emit_fn_text(&module, 1);
     assert_eq!(
-        count_bl(&code, base),
-        count_bl(&add_code, add_base),
-        "the multi-block call must be inlined (no extra Bl over the add baseline)"
+        count_opcode(&code, base, &[Opcode::Bl, Opcode::Blr]),
+        0,
+        "multi-block inlining must leave no emitted call"
     );
 
     let (machine_out, precondition) = symbolic_machine_output(&code, base)
         .expect("path-merge of the inlined cab bytes failed (loop/unsupported/budget)");
 
-    // A vacuously-true precondition would mean the inlined overflow trap was
-    // never explored (the check was dropped). Assert it is non-trivial.
+    // The independent source domain is explicit and nonempty. Separate
+    // boundary and corrupted-guard tests below check that it is not weakened.
     assert!(
         !matches!(precondition, Formula::Bool(true)),
-        "expected a non-trivial no-overflow precondition; got `true` (overflow trap not explored)"
+        "expected the explicit independent source no-overflow domain"
     );
 
     let spec = add_spec();
@@ -794,7 +874,7 @@ fn cab_multiblock_inlined_bytes_compute_a_plus_b_on_no_overflow_path() {
 // ===========================================================================
 // TEST 4 — MANDATORY NEGATIVE CONTROL: the SAME cab bytes proven against an
 // `a + b + 1` spec (under the same precondition) MUST be SAT — a non-SAT result
-// would make the positive certificate vacuous (e.g. if the inlined add body
+// would make the positive check vacuous (e.g. if the inlined add body
 // were silently dropped or the return mis-routed).
 // ===========================================================================
 
@@ -814,4 +894,68 @@ fn negative_control_cab_vs_a_plus_b_plus_1_is_sat() {
         "VACUITY CHECK FAILED: the multi-block-inlined cab bytes were 'proven' equal to a+b+1; \
          the inline discharge has no teeth.\n  machine_out = {machine_out:?}"
     );
+}
+
+fn assert_brk_refused(result: Result<Formula, ExecError>) {
+    assert!(
+        matches!(result, Err(ExecError::Decode(ref message))
+        if message.contains("effects Brk")
+        && message.contains("aarch64-brk-debug-trap-not-proof-consumed")),
+        "reachable BRK must remain the exact semantics refusal: {result:?}"
+    );
+}
+
+#[test]
+fn feasible_overflow_and_entry_brk_remain_refused() {
+    let (code, base) = emit_cab_text(&make_bridge_cab_module());
+    assert_brk_refused(concrete_run(&code, base, i32::MAX, 1));
+    assert_brk_refused(concrete_run(&code, base, i32::MIN, -1));
+    assert_brk_refused(concrete_run(&0xd4200020u32.to_le_bytes(), 0, 2, 3));
+}
+
+#[test]
+fn arbitrary_call_is_not_treated_as_a_trap() {
+    let result = concrete_run(&0x94000000u32.to_le_bytes(), 0, 2, 3);
+    assert!(
+        matches!(result, Err(ExecError::Unsupported(ref message))
+        if message.starts_with("call at ")),
+        "a call is not a proved diverging branch: {result:?}"
+    );
+}
+
+#[test]
+fn independent_no_overflow_domain_has_exact_signed_boundaries() {
+    for (a, b, fits) in [
+        (i32::MIN, 0, true),
+        (i32::MIN, -1, false),
+        (i32::MAX, 0, true),
+        (i32::MAX, 1, false),
+        (i32::MAX, i32::MIN, true),
+        (i32::MIN, i32::MIN, false),
+        (-1, 1, true),
+        (-5, -7, true),
+    ] {
+        let predicate = no_signed_i32_add_overflow(bv32(i128::from(a)), bv32(i128::from(b)));
+        assert_eq!(path_is_feasible(&predicate).unwrap(), fits, "domain for {a} + {b}");
+    }
+}
+
+#[test]
+fn corrupted_overflow_guard_cannot_shrink_the_input_domain() {
+    let (mut code, base) = emit_cab_text(&make_bridge_cab_module());
+    let branches: Vec<_> = code
+        .chunks_exact(4)
+        .enumerate()
+        .filter_map(|(index, bytes)| {
+            let bytes: [u8; 4] = bytes.try_into().unwrap();
+            (decode_aarch64(&bytes, base + (index * 4) as u64).unwrap().opcode == Opcode::BCond)
+                .then_some(index * 4)
+        })
+        .collect();
+    assert_eq!(branches.len(), 1, "fixture must have one actual overflow branch");
+    let offset = branches[0];
+    let word = u32::from_le_bytes(code[offset..offset + 4].try_into().unwrap()) ^ 1;
+    code[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    assert_brk_refused(concrete_run(&code, base, 2, 3));
+    assert_brk_refused(symbolic_machine_output(&code, base).map(|(out, _)| out));
 }

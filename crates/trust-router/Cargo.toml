@@ -18,10 +18,12 @@ authors.workspace = true
 workspace = true
 
 [features]
-# MIR-level routing is the sole maintained pipeline. The former empty
-# `pipeline-v2` switch was retired with its deleted v1 implementation so
-# `--no-default-features` cannot silently hide the canonical public API.
+# Production dispatch uses the typed full-verifier boundary. The legacy MIR
+# router and its separate VC builder are retained only as comparison oracles.
 default = []
+# Explicitly selected by the comparison tests and historical benchmark. Never
+# enabled by compiler/tool production dependencies.
+mir-test-oracle = []
 # trust #420: ay-backend gates the native ay SMT backend module.
 #
 # Off by default so that merely depending on trust-router does not drag the
@@ -41,8 +43,6 @@ ay-backend = [
     "dep:tracing",
 ]
 # trust #798: ay-direct, trust-wp, trust-wp-direct features removed — Pipeline v2.
-trust-mc-backend = ["dep:trust-mc-verifier"]
-trust-vc-backend = ["dep:trust-vc-core"]
 # trust #870: trust-codegen backend gates the trust-cg-bridge codegen integration.
 # When enabled, the MirRouter can dispatch scalar functions to the trust-codegen
 # verified codegen pipeline (lower to LIR, compile, translation-validate).
@@ -86,13 +86,17 @@ ay-certify = [
     "dep:num-bigint",
 ]
 # Enables the two native proof-authority suites (TrustMC and TrustVC) used by
-# full-verifier integration tests and native trustc builds. The TrustWP edge
-# compiles standalone historical inspection/conformance support only; it does
-# not add a routed capability or publication authority.
+# full-verifier integration tests and native trustc builds. TrustWP contributes
+# a body-aware deductive alternative through its rustc-private-free library.
 trust-vc-native = ["trust-vc-bridge/trust-build"]
+# Match the component's native test feature to the library used by this router.
+trust-ir-native = ["trust-wp-lib?/trust-ir-native"]
 trust-build = [
     "trust-bmc/trust-mc-native-trust-ir-bundle",
+    "trust-verifier-api/native-trust-ir-claims",
     "trust-wp/trust-build",
+    "dep:trust-wp-lib",
+    "trust-ir-native",
     "trust-vc-native",
     # Kernel replay for CleanCic proof authority (see trust-bmc's
     # trust-mc-native-trust-ir-bundle note): native TrustVc requests only
@@ -101,6 +105,10 @@ trust-build = [
 ]
 
 [dependencies]
+trust-coordinator = { workspace = true }
+# Trust: `memory_jobserver` is included from trust-coordinator by `#[path]`
+# (see src/lib.rs), so every crate that module names is a dependency here too.
+trust-file-lock = { workspace = true }
 # Trust: `trust-budget` is a strict-lane VERIFIED crate (`Gate: PASS`,
 # `docs/STRICT_VERIFICATION_FRAGMENT.md` §17). It owns the solver
 # resource-budget arithmetic this crate used to compute inline in three files:
@@ -131,8 +139,9 @@ trust-temporal = { workspace = true }
 trust-cache = { workspace = true }
 trust-bmc = { workspace = true }
 trust-wp = { workspace = true }
+trust-wp-lib = { workspace = true, features = ["trust-ir-native"], optional = true }
 trust-ir-bridge = { workspace = true }
-trust-ir = { workspace = true, features = ["serde"] }
+trust-ir = { workspace = true, features = ["native-transport-json"] }
 tla-mc-core = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -169,20 +178,20 @@ clean-auto = { workspace = true, optional = true }
 clean-kernel = { workspace = true, optional = true }
 ay-core = { workspace = true, optional = true }
 
-# trust #442: Optional solver backends
-# trust #798: ay-bindings, trust-mc_core, trust-wp-ay removed — Pipeline v2.
-trust-mc-verifier = { workspace = true, optional = true }
-trust-vc-core = { workspace = true, optional = true }
-
-# trust #887: Verification daemon binary — shared solver state over TCP.
-[[bin]]
-name = "trustd"
-path = "src/bin/trustd.rs"
-
 [dev-dependencies]
+# Router unit tests compile trust-coordinator's sources by path; its admission
+# receipts require OS-random incarnations, never PID/time substitutes.
+trust-rand = { workspace = true }
 toml = { workspace = true }
 trust-proof-cert = { workspace = true }
 trust-vcgen = { workspace = true }
 trust-report = { workspace = true }
 trust-ir-build = { workspace = true }
+trust-ir = { workspace = true, features = ["binary", "serde", "native-validation-observer"] }
+trust-ir-contract = { workspace = true }
 trust-bmc = { workspace = true, features = ["trust-mc-core-types"] }
+trust-wp-core = { path = "../../first-party/trust-wp/crates/trust-wp-core" }
+
+[[test]]
+name = "native_wp_body"
+required-features = ["trust-build"]

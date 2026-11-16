@@ -88,8 +88,6 @@ pub fn detect_format(data: &[u8]) -> Option<BinaryFormat> {
 
 #[cfg(test)]
 mod tests {
-    use trust_types::fx::FxHashSet;
-
     use super::*;
 
     #[test]
@@ -201,24 +199,6 @@ mod tests {
     #[test]
     fn test_detect_all_ff_returns_none() {
         assert_eq!(detect_format(&[0xFF, 0xFF, 0xFF, 0xFF]), None);
-    }
-
-    #[test]
-    fn test_format_clone_copy_eq_hash() {
-        let fmt = BinaryFormat::Elf;
-        let cloned = fmt;
-        assert_eq!(fmt, cloned);
-
-        // Verify all variants are distinct
-        assert_ne!(BinaryFormat::Elf, BinaryFormat::MachO);
-        assert_ne!(BinaryFormat::MachO, BinaryFormat::FatMachO);
-        assert_ne!(BinaryFormat::FatMachO, BinaryFormat::Pe);
-
-        // Verify Hash works (compiles)
-        let mut set = FxHashSet::default();
-        set.insert(BinaryFormat::Elf);
-        set.insert(BinaryFormat::MachO);
-        assert_eq!(set.len(), 2);
     }
 
     #[test]

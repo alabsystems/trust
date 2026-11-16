@@ -1,0 +1,334 @@
+{
+  "name": "pos_tag_param",
+  "def_path": "enc13d::pos_tag_param",
+  "span": {
+    "file": "enc13d.rs",
+    "line_start": 13,
+    "col_start": 0,
+    "line_end": 16,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "enc13d::T",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Zero",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Five",
+                "discriminant": 5,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 8,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 8,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "enc13d.rs",
+                "line_start": 14,
+                "col_start": 12,
+                "line_end": 14,
+                "col_end": 12
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 127
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "enc13d.rs",
+                "line_start": 15,
+                "col_start": 4,
+                "line_end": 15,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 3,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 1,
+            "span": {
+              "file": "enc13d.rs",
+              "line_start": 15,
+              "col_start": 4,
+              "line_end": 15,
+              "col_end": 4
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": [
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 1
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "enc13d.rs",
+                "line_start": 15,
+                "col_start": 4,
+                "line_end": 15,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 4,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 2,
+            "span": {
+              "file": "enc13d.rs",
+              "line_start": 15,
+              "col_start": 4,
+              "line_end": 15,
+              "col_end": 4
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "enc13d.rs",
+                "line_start": 16,
+                "col_start": 1,
+                "line_end": 16,
+                "col_end": 1
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 5
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

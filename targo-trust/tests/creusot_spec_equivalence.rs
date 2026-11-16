@@ -34,7 +34,7 @@
 //!   defers quantifier auto-application until the bounded-domain encoding.
 //!
 //! What runs where: the denotation-map/diff layer and every fixture-integrity pin
-//! below run in the ordinary cargo test lane. The end-to-end two-run test
+//! below run in the ordinary `targo --unverified test` lane. The end-to-end two-run test
 //! needs the built Trust toolchain and is `#[ignore]`d with the exact command
 //! in its reason string. It passed twice against this increment's stage-1
 //! compiler/toolchain; it remains ignored because an ordinary Cargo checkout
@@ -416,7 +416,7 @@ fn spec_emit_rows(package: &str) -> String {
 /// package's predicates were authored by hand from the pearlite semantics;
 /// every proposition came from the compiler.
 #[test]
-#[ignore = "needs the installed Trust toolchain siblings; run: cd targo-trust && TRUST_SPEC_EQUIV_TARGO_TRUST=$PWD/../build/host/stage1/bin/targo-trust RUSTC_BOOTSTRAP=1 cargo test --test creusot_spec_equivalence -- --ignored --nocapture"]
+#[ignore = "needs the installed Trust toolchain siblings; run: cd targo-trust && TRUST_SPEC_EQUIV_TARGO_TRUST=$PWD/../build/host/stage1/bin/targo-trust targo --unverified test --test creusot_spec_equivalence -- --ignored --nocapture"]
 fn blob_equivalence_end_to_end() {
     let before = denotation_map(&spec_emit_rows("proposed")).expect("proposed artifact rows parse");
     let after = denotation_map(&spec_emit_rows("native")).expect("native artifact rows parse");

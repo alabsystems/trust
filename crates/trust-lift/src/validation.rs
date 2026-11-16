@@ -40,6 +40,18 @@ fn ay_lift_error(operation: &str, error: impl std::fmt::Display) -> LiftError {
     LiftError::Ssa(ay_error(operation, error))
 }
 
+fn reject_memory_images(lifted: &LiftedFunction) -> Result<(), LiftError> {
+    // These public adapters can otherwise ignore dead operands, terminators,
+    // or unencodable statements. Observe the complete body before any such
+    // shortcut: retained allocation data has no admitted value semantics.
+    if lifted.trust_ir_body.contains_memory_image() {
+        return Err(LiftError::Ssa(
+            "ConstValue::MemoryImage has no modeled allocation/provenance value semantics".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// ay-backed translation validator for lifted binary code.
 ///
 /// Encodes `trust_types::Formula` as ay bitvector terms and checks:
@@ -110,6 +122,7 @@ impl TranslationValidator {
         lifted: &LiftedFunction,
         _binary: &[u8],
     ) -> Result<ValidationResult, LiftError> {
+        reject_memory_images(lifted)?;
         // Build the lifted-side formula from TrustIr body.
         // For now we encode each block's statements as BV formulas and check
         // that the lifted representation is self-consistent (a simulated
@@ -174,9 +187,10 @@ impl TranslationValidator {
     /// constructs.
     pub fn check_property(
         &mut self,
-        _lifted: &LiftedFunction,
+        lifted: &LiftedFunction,
         property: &Formula,
     ) -> Result<ValidationResult, LiftError> {
+        reject_memory_images(lifted)?;
         let mut solver =
             Solver::try_new(Logic::QfBv).map_err(|err| ay_lift_error("solver init", err))?;
         let (prop_term, declared_vars) = {
@@ -335,8 +349,9 @@ impl TranslationValidator {
 /// counterexample extraction by name.
 struct EncodingEnv<'s> {
     solver: &'s mut Solver,
-    /// Map from variable name to ay Term handle.
-    vars: FxHashMap<String, Term>,
+    /// Map from variable name to its ay Term handle and the sort it was
+    /// declared at (a later use at another sort is refused, not reused).
+    vars: FxHashMap<String, (Term, AYSort)>,
     /// Ordered list of declared variable names (for counterexample extraction).
     declared_vars: Vec<String>,
     /// Default bitvector width.
@@ -570,14 +585,28 @@ impl<'s> EncodingEnv<'s> {
     }
 
     /// Get or declare a ay variable for the given name and sort.
+    ///
+    /// Fails with `Err` rather than panicking: `name` can come from a caller's
+    /// `Formula` (see [`TranslationValidator::check_property`]), so a name ay
+    /// reserves (a theory-operator spelling such as `select`) is refused by
+    /// `try_declare_const`, and one name used at two sorts is refused here
+    /// instead of silently reusing the first sort's term.
     fn get_or_declare_var(&mut self, name: &str, sort: &FormulaSort) -> Result<Term, String> {
-        if let Some(&term) = self.vars.get(name) {
-            return Ok(term);
+        let ay_sort = self.formula_sort_to_ay(sort);
+        if let Some((term, bound_sort)) = self.vars.get(name) {
+            if *bound_sort != ay_sort {
+                return Err(format!(
+                    "variable `{name}` is used at sort {ay_sort} but was declared at {bound_sort}"
+                ));
+            }
+            return Ok(*term);
         }
 
-        let ay_sort = self.formula_sort_to_ay(sort);
-        let term = self.solver.declare_const(name, ay_sort);
-        self.vars.insert(name.to_string(), term);
+        let term = self
+            .solver
+            .try_declare_const(name, ay_sort.clone())
+            .map_err(|err| ay_error("declare_const", err))?;
+        self.vars.insert(name.to_string(), (term, ay_sort));
         self.declared_vars.push(name.to_string());
         Ok(term)
     }
@@ -649,6 +678,168 @@ mod tests {
             return_ty: Ty::u64(),
             datatype_defs: Default::default(),
         }
+    }
+
+    // Synthetic carrier controls: these are not compiler-extraction evidence,
+    // and the legacy validator is not a binary-equivalence proof engine.
+    fn memory_image(nested: bool) -> trust_types::ConstValue {
+        use trust_types::{
+            CallableDefPathHash, ConstValue, ConstantImageLayout, ConstantImageOwner,
+            ConstantImageRoot, ConstantImageTarget, ConstantMemoryImage,
+        };
+        let image = ConstValue::MemoryImage(Box::new(ConstantMemoryImage {
+            schema_version: 1,
+            owner: ConstantImageOwner {
+                def_path: "fixture::memory_image".into(),
+                def_path_hash: CallableDefPathHash::new(1, 2),
+                mir_phase: "synthetic-test".into(),
+            },
+            target: ConstantImageTarget {
+                triple: "synthetic-test".into(),
+                data_layout: "e-p:64:64".into(),
+                pointer_size_bytes: 8,
+                little_endian: true,
+            },
+            ty: Ty::u64(),
+            ty_fingerprint: [3, 4],
+            layout: ConstantImageLayout { size_bytes: 8, align_bytes: 8 },
+            root: ConstantImageRoot::ScalarBits { bits: 42, size_bytes: 8 },
+            nodes: Default::default(),
+        }));
+        if nested {
+            ConstValue::struct_scalar_fields_ref(
+                "Nested",
+                vec![ConstValue::struct_scalar_fields_ref("Inner", vec![image])],
+            )
+        } else {
+            image
+        }
+    }
+
+    fn assign_constant(value: trust_types::ConstValue) -> Statement {
+        Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Use(Operand::Constant(value)),
+            span: SourceSpan::default(),
+        }
+    }
+
+    fn assert_memory_image_refused(body: VerifiableBody) {
+        let lifted = make_lifted(body);
+        let mut validator = TranslationValidator::new();
+        // Evaluate both API results before asserting, so the negative control
+        // records both historical successes rather than hiding the second.
+        let results = [
+            validator.validate_refinement(&lifted, &[]),
+            validator.check_property(&lifted, &Formula::Bool(true)),
+            validator.check_property(&lifted, &Formula::Bool(false)),
+        ];
+        assert!(
+            results.iter().all(|result| matches!(result,
+                Err(LiftError::Ssa(reason)) if reason.contains("ConstValue::MemoryImage"))),
+            "every public validator must refuse diagnostic memory images: {results:?}"
+        );
+    }
+
+    #[test]
+    fn memory_image_assignment_refuses_before_no_encodable_statement_success() {
+        assert_memory_image_refused(make_body(vec![assign_constant(memory_image(false))]));
+    }
+
+    #[test]
+    fn memory_image_nested_assignment_refuses_before_no_encodable_statement_success() {
+        assert_memory_image_refused(make_body(vec![assign_constant(memory_image(true))]));
+    }
+
+    #[test]
+    fn memory_image_dead_block_refuses_both_validators() {
+        for nested in [false, true] {
+            let mut body = make_body(vec![]);
+            body.blocks.push(BasicBlock {
+                id: BlockId(1),
+                stmts: vec![assign_constant(memory_image(nested))],
+                terminator: trust_types::Terminator::Unreachable,
+            });
+            assert_memory_image_refused(body);
+        }
+    }
+
+    #[test]
+    fn memory_image_ignored_intrinsic_live_and_dead_arguments_refuse_both_validators() {
+        for nested in [false, true] {
+            for dead in [false, true] {
+                let statement = Statement::Intrinsic {
+                    name: "diagnostic_fixture".into(),
+                    args: vec![Operand::Constant(memory_image(nested))],
+                };
+                let mut body = make_body(vec![]);
+                if dead {
+                    body.blocks.push(BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![statement],
+                        terminator: trust_types::Terminator::Unreachable,
+                    });
+                } else {
+                    body.blocks[0].stmts.push(statement);
+                }
+                assert_memory_image_refused(body);
+            }
+        }
+    }
+
+    #[test]
+    fn memory_image_ignored_terminator_operands_refuse_both_validators() {
+        for nested in [false, true] {
+            let operand = Operand::Constant(memory_image(nested));
+            for terminator in [
+                trust_types::Terminator::Assert {
+                    cond: operand.clone(),
+                    expected: true,
+                    msg: trust_types::AssertMessage::Custom("diagnostic_fixture".into()),
+                    target: BlockId(0),
+                    span: SourceSpan::default(),
+                    unwind: trust_types::UnwindEdge::Unreachable,
+                },
+                trust_types::Terminator::TailCall {
+                    func: "fixture::consume".into(),
+                    args: vec![operand],
+                    span: SourceSpan::default(),
+                    atomic: None,
+                    is_foreign: false,
+                    is_unsafe_sig: false,
+                    callee_identity: None,
+                    callee_key: None,
+                },
+            ] {
+                let mut body = make_body(vec![]);
+                body.blocks[0].terminator = terminator;
+                assert_memory_image_refused(body);
+            }
+        }
+    }
+
+    #[test]
+    fn memory_image_refusal_preserves_existing_scalar_formula_behavior() {
+        let statement = assign_constant(trust_types::ConstValue::Uint(42, 64));
+        assert_eq!(
+            TranslationValidator::statement_to_formula(&statement),
+            Some(Formula::Eq(
+                Box::new(Formula::Var("local_0".into(), FormulaSort::BitVec(64))),
+                Box::new(Formula::BitVec { value: 42, width: 64 }),
+            )),
+        );
+        let lifted = make_lifted(make_body(vec![statement]));
+        let mut validator = TranslationValidator::new();
+        // The legacy refinement API negates its assignment relation, with no
+        // binary-side model. Preserve that result without calling it a proof.
+        assert!(matches!(
+            validator.validate_refinement(&lifted, &[]).unwrap(),
+            ValidationResult::CounterExample { .. }
+        ));
+        assert!(matches!(
+            validator.check_property(&lifted, &Formula::Bool(true)).unwrap(),
+            ValidationResult::Verified { .. }
+        ));
     }
 
     #[test]
@@ -807,5 +998,49 @@ mod tests {
         let mut validator = TranslationValidator::new();
         let result = validator.check_property(&lifted, &property).unwrap();
         assert!(matches!(result, ValidationResult::Verified { .. }));
+    }
+
+    /// TRUST-12: a variable whose name ay reserves (a theory-operator
+    /// spelling such as `default` or `select`) must come back as an encoding
+    /// `Err`, never a panic out of `Solver::declare_const`. `check_property` is
+    /// public and takes an arbitrary caller `Formula`, so the name is not
+    /// generated by this crate and cannot be assumed collision-free.
+    #[test]
+    fn test_reserved_variable_name_is_err_not_panic() {
+        let lifted = make_lifted(make_body(vec![]));
+        for reserved in ["default", "select"] {
+            let x = Formula::Var(reserved.into(), FormulaSort::BitVec(64));
+            let property = Formula::Eq(Box::new(x.clone()), Box::new(x));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                TranslationValidator::new().check_property(&lifted, &property)
+            }));
+            let result = result.unwrap_or_else(|_| {
+                panic!("declaring reserved name `{reserved}` panicked instead of returning Err")
+            });
+            match result {
+                Err(LiftError::Ssa(msg)) => {
+                    assert!(msg.contains("reserved"), "unexpected error for `{reserved}`: {msg}");
+                }
+                other => panic!("reserved name `{reserved}` must be an Err, got {other:?}"),
+            }
+        }
+    }
+
+    /// TRUST-12: one name used at two sorts is a rebinding. The name cache
+    /// used to hand back the first sort's term for the second use; it must
+    /// be refused as an encoding `Err` instead.
+    #[test]
+    fn test_variable_rebound_at_different_sort_is_err() {
+        let lifted = make_lifted(make_body(vec![]));
+        let as_bv = Formula::Var("x".into(), FormulaSort::BitVec(64));
+        let as_bool = Formula::Var("x".into(), FormulaSort::Bool);
+        let property =
+            Formula::And(vec![Formula::Eq(Box::new(as_bv.clone()), Box::new(as_bv)), as_bool]);
+        match TranslationValidator::new().check_property(&lifted, &property) {
+            Err(LiftError::Ssa(msg)) => {
+                assert!(msg.contains("`x`"), "unexpected error: {msg}");
+            }
+            other => panic!("a sort-conflicting rebinding must be an Err, got {other:?}"),
+        }
     }
 }

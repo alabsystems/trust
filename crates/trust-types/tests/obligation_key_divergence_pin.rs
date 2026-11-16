@@ -1,7 +1,7 @@
-// obligation_key_divergence_pin — pins the MEASURED cross-lane obligation-identity
-// divergence that cutover item 0.4 (docs/plans/2026-07-27-trust-ir-first-cutover.md,
-// §3.2.1) must resolve, so it cannot drift silently while the producer-independent
-// gate key is being designed.
+// obligation_key_divergence_pin — the MEASURED obligation-identity divergence
+// (cutover item 0.4, docs/plans/2026-07-27-trust-ir-first-cutover.md §3.2.1) and
+// the stable key that resolves it (work item T9,
+// `trust_types::obligation_identity`).
 //
 // THE TWO LANES, ONE FIXTURE. `fixtures/obligation-key-divergence/fixture.rs` holds
 // three functions: `contract_div_index` (an authored `requires`/`ensures` contract
@@ -15,8 +15,10 @@
 //              -Ztrust-policy=advisory -Ztrust-verify-output=json fixture.rs
 //     → the three `TRUST_JSON:` `function_result` lines, verbatim, in
 //       `mir-lane-rows.jsonl`. Row identity = `obligation_id` minted in
-//       `crates/trust-mir-extract/src/verifier_api.rs` (`obligation_id`/`contract_id`
+//       `crates/trust-source-contract/src/lib.rs` (`obligation_id`/`contract_id`
 //       for the contract bundle; `format!("vc:{}:{}:{}", …, index)` for safety VCs).
+//       `crates/trust-mir-extract/src/verifier_api.rs` re-exports it since
+//       ca0ddf652c moved the single implementation there.
 //   * Direct lane (THIR → trust-ir Module):
 //       trustc --crate-type=lib --crate-name fixture -Ztrust-verify=off \
 //              -Ztrust-ir-lower -Ztrust-dump=ir:<dir> fixture.rs
@@ -25,48 +27,57 @@
 //
 // Both runs were re-run and compared: the direct lane is byte-deterministic, and
 // the MIR lane's `function_result` rows are byte-deterministic in every field the
-// pins read — `time_ms` is wall-clock and may differ between runs (measured: one
-// row flipped 1↔0 ms), which is why no pin reads it. Every assertion below states what IS; none asserts the key item 0.4
-// wants to exist.
+// pins read — `time_ms` is wall-clock and may differ between runs, which is why no
+// pin reads it. Do not hand-edit the frozen artifacts; on a mint or span-shaping
+// change re-take BOTH with the commands above.
 //
-// WHAT THIS BATTERY DETECTS, stated precisely rather than optimistically: pins
-// 1, 2, 3 and 5 assert over the FROZEN artifact files, so they detect artifact
-// tampering and keep the measured divergence readable — they do NOT detect a
-// live producer change (a fix to the trust-mode MIR span collapse, or an
-// ordinal-scheme change that keeps the `vc:{}:{}:{}` format string, leaves them
-// green on stale artifacts). Only pin 6 (the mint format-string census) and
-// pin 4's `structural-parity-only-v1` probe read the live tree. On any mint or
-// span-shaping change: re-take BOTH artifacts with the commands above (one
-// commit, one trustc stamp for both) and re-derive the expectations; do not
-// hand-edit the frozen artifacts.
+// WHAT THE ORDINAL `obligation_id` GOT WRONG (measured on the artifacts):
+//   1. One carrier index per function, interleaved across kinds
+//      (`bounds_check:0, arithmetic_safety:1, postcondition:2,
+//      arithmetic_safety:3`): a removed obligation renumbers every later one.
+//   2. Same-span twins are REAL: one source division mints TWO rows of one kind at
+//      the IDENTICAL stored span with distinct claim digests.
+//   3. Checked-add and macro rows carry DEGENERATE point spans (lo == hi), macro
+//      rows at the CALLSITE.
+//   4. The LO-edge triple both lanes share is not injective.
 //
-// WHAT THE PIN HOLDS (each has a dedicated test):
-//   1. The safety-VC mint is carrier-relative: one index space per function,
-//      interleaved across kinds (`bounds_check:0, arithmetic_safety:1,
-//      postcondition:2, arithmetic_safety:3`) — a removed VC renumbers survivors.
-//   2. Same-anchor duplicates are REAL: one source division mints TWO rows of the
-//      same kind at the IDENTICAL stored span with distinct claim digests. Under
-//      §3.2.1's fail-closed rule (equal anchor → `ordinal-collision`, run has no
-//      rows) today's carrier zeroes any run containing a division.
-//   3. The MIR lane's anchor input is destroyed before the mint for two classes:
-//      checked-add rows and macro-expanded rows carry DEGENERATE point spans
-//      (lo == hi), macro rows at the CALLSITE — although `convert_span` is pinned
-//      raw LO+HI (span_normalization_parity.rs) and `--emit=mir` under
-//      -Ztrust-verify=off shows real ranges (add3 15:5:15:10 / 15:5:15:14, macro
-//      div 19:9:19:16). The damage is trust-mode MIR shaping upstream of the
-//      converter: -Ztrust-verify=on MIR already reads 15:5:15:5 / 26:5:26:5.
-//   4. The direct lane births only a SUBSET of obligations (its coverage artifact
-//      says so: `direct_obligation_capability = "structural-parity-only-v1"`):
-//      div_nonzero and no_overflow asserts exist; the slice bounds obligation and
-//      both contract obligations are NOT born there today.
-//   5. The LO-edge triple both lanes share is NOT an injective anchor: add3's two
-//      no_overflow obligations agree on (file, line, col) in BOTH lanes, and
-//      contract_div_index's bounds row shares its LO with its div row.
+// So the ordinal stays the private binding/certificate token (docs/TCB.md) and is
+// never a comparison key. THE STABLE KEY (`<def_path>#<local id>`,
+// `trust_types::obligation_identity`) is derived here from the SAME frozen rows
+// and the fixture's source text, through the very functions trustc calls at
+// transport emission, and the pins below hold what it must do with them:
+//   A. every row of every function gets a distinct key — twins included;
+//   B. removing an obligation leaves every other key alone (fixes 1);
+//   C. twenty comment lines and an unrelated function inserted above the code,
+//      or a line inserted inside a function above an obligation, leave every key
+//      alone, and only the edited function's source digest moves;
+//   D. a span anchors on the statement around its START, so a point span is
+//      anchored (fixes 3), and twins differ only in `nth` (fixes 2);
+//   E. a moved or renamed function keeps its local ids (the def path is outside
+//      the hash);
+//   F. the order the compiler emits rows in decides no key a row's content can
+//      decide: reversed emission keeps every distinguishable row's key, and
+//      gives each twin group the same keys;
+//   G. a reflow (`a + b + c` split over three lines) keeps every key AND the
+//      function's source digest — the digest and the anchors read the same
+//      tokens, so "unchanged source" never disagrees with "unchanged keys".
+//   H. a row's END decides no key: every frozen row re-published as the point at
+//      its start (what another compile publishes for the same obligation,
+//      measured 2026-10-10 by tests/run-make/trust-obligation-ids) keeps its key.
+// Pin 6 (the mint-format census, read live) stays: the ordinal mint is untouched
+// and the frozen artifacts are evidence of exactly that mint.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use trust_types::SourceSpan;
+use trust_types::obligation_identity::{
+    AnchorInput, KeyedRow, LineIndex, anchor, function_source_digest, local_ids, obligation_key,
+    row_anchor, row_discriminator, span_position,
+};
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is <repo>/crates/trust-types.
@@ -86,6 +97,7 @@ struct MirRow {
     function: String,
     obligation_id: String,
     kind: String,
+    description: String,
     claim_digest: String,
     /// (line_start, col_start, line_end, col_end) — trust_types::SourceSpan fields.
     span: (u64, u64, u64, u64),
@@ -107,6 +119,7 @@ fn mir_rows() -> Vec<MirRow> {
                 function: function.clone(),
                 obligation_id: r["obligation_id"].as_str().expect("obligation_id").to_string(),
                 kind: r["kind"].as_str().expect("kind").to_string(),
+                description: r["description"].as_str().expect("description").to_string(),
                 claim_digest: r["claim_digest_sha256"].as_str().expect("digest").to_string(),
                 span: (
                     loc["line_start"].as_u64().expect("line_start"),
@@ -233,89 +246,6 @@ fn mir_lane_rows_are_exactly_the_frozen_table() {
     assert_eq!(digests.len(), rows.len(), "claim digests must be pairwise distinct");
 }
 
-/// Pin 1 — the safety mint's trailing ordinal is a position in ONE per-function
-/// carrier, interleaved across kinds. Per-kind ordinals would read
-/// `arithmetic_safety:{0,1}`; the measured carrier reads `{1,3}` because
-/// `bounds_check` and the body-aware `postcondition` VC occupy 0 and 2.
-#[test]
-fn safety_ordinals_are_carrier_relative_not_per_kind() {
-    let rows = mir_rows();
-    let f1_safety: Vec<&str> = rows
-        .iter()
-        .filter(|r| r.function == "fixture::contract_div_index")
-        .filter(|r| r.obligation_id.starts_with("vc:"))
-        .map(|r| r.obligation_id.rsplit(':').next().expect("trailing ordinal"))
-        .collect();
-    assert_eq!(f1_safety, ["0", "1", "2", "3"], "one interleaved index space per function");
-    let f1_kinds: Vec<&str> = rows
-        .iter()
-        .filter(|r| r.function == "fixture::contract_div_index")
-        .filter(|r| r.obligation_id.starts_with("vc:"))
-        .map(|r| r.kind.as_str())
-        .collect();
-    assert_eq!(
-        f1_kinds,
-        ["slice", "divzero", "postcond", "divzero"],
-        "kinds interleave in the same space"
-    );
-}
-
-/// Pin 2 — the §3.2.1 ordinal-collision class is ALREADY POPULATED: in every
-/// function of this fixture, one source construct mints two rows of the same kind
-/// at the identical stored span, distinguished only by carrier index (and by
-/// claim digest, which the locator does not include).
-#[test]
-fn same_kind_same_span_duplicates_exist_in_every_function() {
-    let rows = mir_rows();
-    for (function, kind) in [
-        ("fixture::contract_div_index", "divzero"),
-        ("fixture::add3", "overflow:add"),
-        ("fixture::macro_div", "divzero"),
-    ] {
-        let pair: Vec<&MirRow> =
-            rows.iter().filter(|r| r.function == function && r.kind == kind).collect();
-        assert_eq!(pair.len(), 2, "{function}: exactly two {kind} rows");
-        assert_eq!(
-            pair[0].span, pair[1].span,
-            "{function}: the two {kind} rows share one stored span"
-        );
-        assert_ne!(
-            pair[0].claim_digest, pair[1].claim_digest,
-            "{function}: but they are distinct propositions"
-        );
-        assert_ne!(
-            pair[0].obligation_id, pair[1].obligation_id,
-            "{function}: only the carrier index separates them"
-        );
-    }
-}
-
-/// Pin 3 — anchor-input destruction: checked-add and macro-expanded rows carry
-/// DEGENERATE point spans (lo == hi), and the macro rows sit at the CALLSITE
-/// (fixture.rs line 26, `halve!(a, d)`) — not at the macro-definition division
-/// (line 22, `$x / $d`). `convert_span` itself is pinned raw LO+HI by
-/// span_normalization_parity.rs, so this loss happens UPSTREAM, in trust-mode MIR
-/// shaping (MEASURED: `--emit=mir -Zmir-include-spans=yes` shows ranges under
-/// -Ztrust-verify=off and points under -Ztrust-verify=on). The plain division and
-/// the contract clauses keep real ranges — the damage is class-specific.
-#[test]
-fn checked_add_and_macro_rows_have_collapsed_spans_macro_at_callsite() {
-    let rows = mir_rows();
-    for r in &rows {
-        let degenerate = r.span.0 == r.span.2 && r.span.1 == r.span.3;
-        let expect_degenerate = r.function == "fixture::add3" || r.function == "fixture::macro_div";
-        assert_eq!(
-            degenerate, expect_degenerate,
-            "span degeneracy is exactly the checked-add + macro classes; row {}",
-            r.obligation_id
-        );
-    }
-    // The macro rows' stored line is the invocation (26), not the macro body (22).
-    for r in rows.iter().filter(|r| r.function == "fixture::macro_div") {
-        assert_eq!(r.span.0, 26, "macro-expanded VC stored at the callsite line");
-    }
-}
-
 /// Pin 4 — the direct lane's obligation surface today: exactly four
 /// obligation-shaped asserts (`div_nonzero` ×2, `no_overflow` ×2). No slice
 /// bounds obligation is born, and no contract clause reaches the module text —
@@ -374,62 +304,20 @@ fn direct_lane_births_exactly_the_four_known_asserts_and_no_contracts() {
     );
 }
 
-/// Pin 5 — the LO-edge triple, the one span form BOTH lanes can compute today,
-/// AGREES across lanes wherever both mint an obligation — and is NOT injective:
-/// add3's two no_overflow obligations share one LO triple in both lanes, and
-/// contract_div_index's bounds row shares its LO with its div row. An anchor
-/// needs the HI edge (or equivalent extent data), which only un-collapsed spans
-/// carry.
-#[test]
-fn lo_triples_agree_across_lanes_but_do_not_separate_obligations() {
-    let rows = mir_rows();
-    let asserts = direct_asserts();
-    // Cross-lane agreement, where the direct lane births the obligation at all.
-    for (function, kind, tag) in [
-        ("fixture::contract_div_index", "divzero", "div_nonzero"),
-        ("fixture::add3", "overflow:add", "no_overflow"),
-        ("fixture::macro_div", "divzero", "div_nonzero"),
-    ] {
-        let mir_lo: Vec<(u64, u64)> = rows
-            .iter()
-            .filter(|r| r.function == function && r.kind == kind)
-            .map(|r| (r.span.0, r.span.1))
-            .collect();
-        let direct_lo: Vec<(u64, u64)> = asserts
-            .iter()
-            .filter(|a| function.ends_with(a.function.as_str()) && a.proof_tag == tag)
-            .map(|a| (a.loc.1, a.loc.2))
-            .collect();
-        for lo in &direct_lo {
-            assert!(mir_lo.contains(lo), "{function}: direct-lane LO {lo:?} matches a MIR-lane LO");
-        }
-    }
-    // Non-injectivity, lane by lane.
-    let add3_direct: Vec<(u64, u64, u64)> =
-        asserts.iter().filter(|a| a.function == "add3").map(|a| a.loc).collect();
-    assert_eq!(add3_direct[0], add3_direct[1], "direct lane: the two adds share one LO triple");
-    let f1 = |kind: &str| {
-        rows.iter()
-            .find(|r| r.function == "fixture::contract_div_index" && r.kind == kind)
-            .map(|r| (r.span.0, r.span.1))
-            .expect("row present")
-    };
-    assert_eq!(f1("slice"), f1("divzero"), "MIR lane: bounds and div share one LO");
-}
-
 /// Pin 6 — the mint sites themselves, read live (span_normalization_parity
 /// style): the safety mint is the carrier-index `format!("vc:{}:{}:{}", …)`
 /// (three copies) and the contract mint indexes by CONTRACT position. If either
 /// changes, the frozen artifacts above are stale evidence — re-take them.
 #[test]
 fn mint_sites_still_have_the_pinned_shape() {
-    let api =
-        std::fs::read_to_string(repo_root().join("crates/trust-mir-extract/src/verifier_api.rs"))
-            .expect("verifier_api.rs readable");
+    // ca0ddf652c moved the mint into `trust-source-contract`;
+    // `trust-mir-extract`'s `verifier_api.rs` is now a re-export of it.
+    let api = std::fs::read_to_string(repo_root().join("crates/trust-source-contract/src/lib.rs"))
+        .expect("trust-source-contract's lib.rs readable");
     let vc_mints = api.matches(r#""vc:{}:{}:{}""#).count();
     assert_eq!(
         vc_mints, 3,
-        "expected exactly the three carrier-index safety mint sites in verifier_api.rs \
+        "expected exactly the three carrier-index safety mint sites in trust-source-contract \
          (verifier_vc_content_identity_with_source_digest_and_crate_name, \
          function_to_verifier_api_bundle_for_target, \
          trust_vc_mir_memory_metadata); found {vc_mints} — \
@@ -443,4 +331,295 @@ fn mint_sites_still_have_the_pinned_shape() {
         api.contains(r#""obligation:{}:{}:{}""#),
         "the contract-lane obligation id format moved — re-take the artifacts"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The stable key (T9) over the same frozen rows.
+// ---------------------------------------------------------------------------
+
+fn fixture_source() -> String {
+    std::fs::read_to_string(fixture_dir().join("fixture.rs")).expect("fixture.rs present")
+}
+
+fn source_span(row: &MirRow, line_shift: u32) -> SourceSpan {
+    let shift = |line: u64| u32::try_from(line).expect("line fits") + line_shift;
+    SourceSpan {
+        file: "fixture.rs".to_string(),
+        line_start: shift(row.span.0),
+        col_start: u32::try_from(row.span.1).expect("col fits"),
+        line_end: shift(row.span.2),
+        col_end: u32::try_from(row.span.3).expect("col fits"),
+    }
+}
+
+/// Every row's `<def_path>#<local id>`, in artifact order, computed the way
+/// trustc computes it at emission: one anchor per row against the file's text,
+/// then one `local_ids` call per function. `shift(row)` is how many lines an
+/// edit moved that row down.
+fn stable_keys_with(rows: &[MirRow], source: &str, shift: impl Fn(&MirRow) -> u32) -> Vec<String> {
+    let lines = LineIndex::new(source);
+    let spans: Vec<SourceSpan> = rows.iter().map(|row| source_span(row, shift(row))).collect();
+    let anchors: Vec<String> = rows
+        .iter()
+        .zip(&spans)
+        .map(|(row, span)| {
+            let input = AnchorInput::of(Some(span), &row.description, Some((source, &lines)));
+            // The strict anchor accepts every frozen span, so the compiler's
+            // anchor (which degrades instead of refusing) is the strict one.
+            let strict = anchor(input).expect("every frozen span lies inside fixture.rs");
+            let compiled = row_anchor(input);
+            assert!(!compiled.degraded);
+            assert_eq!(compiled.anchor, strict);
+            strict
+        })
+        .collect();
+    let discriminators: Vec<String> =
+        rows.iter().map(|row| row_discriminator(&row.description)).collect();
+    let mut by_function: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        by_function.entry(row.function.as_str()).or_default().push(index);
+    }
+    let mut keys = vec![String::new(); rows.len()];
+    for (function, indices) in by_function {
+        let keyed: Vec<KeyedRow<'_>> = indices
+            .iter()
+            .map(|&i| KeyedRow {
+                kind: &rows[i].kind,
+                anchor: &anchors[i],
+                position: span_position(Some(&spans[i])),
+                discriminator: &discriminators[i],
+            })
+            .collect();
+        let ids = local_ids(&keyed).expect("no collision on the fixture");
+        for (&i, id) in indices.iter().zip(ids) {
+            keys[i] = obligation_key(function, &id);
+        }
+    }
+    keys
+}
+
+fn stable_keys(rows: &[MirRow]) -> Vec<String> {
+    stable_keys_with(rows, &fixture_source(), |_| 0)
+}
+
+/// Pin A — every row of every function gets a distinct key, the twins
+/// included: contract_div_index's two divisions at one stored span, add3's two
+/// point-span additions, macro_div's two point-span divisions.
+#[test]
+fn every_row_has_a_distinct_stable_key_twins_included() {
+    let rows = mir_rows();
+    let keys = stable_keys(&rows);
+    let mut distinct = keys.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), rows.len(), "keys must be pairwise distinct: {keys:#?}");
+    for (row, key) in rows.iter().zip(&keys) {
+        assert!(key.starts_with(&format!("{}#", row.function)), "{key} names its function");
+    }
+}
+
+/// Pin B — removing an obligation leaves every other key alone. The ordinal
+/// mint numbered the bounds row 0 in ONE interleaved space, so dropping it
+/// renumbered every later safety row; the stable key has no such space.
+#[test]
+fn removing_an_obligation_leaves_every_other_key_alone() {
+    let rows = mir_rows();
+    let keys = stable_keys(&rows);
+    let bounds = rows
+        .iter()
+        .position(|row| row.obligation_id == "vc:fixture__contract_div_index:bounds_check:0")
+        .expect("the bounds row is in the artifact");
+    let mut without = rows.clone();
+    without.remove(bounds);
+    let mut expected = keys.clone();
+    expected.remove(bounds);
+    assert_eq!(stable_keys(&without), expected);
+
+    // Dropping ONE twin renumbers only that twin cell: the survivor takes nth 0.
+    let twin = rows.iter().rposition(|row| row.function == "fixture::add3").expect("add3 rows");
+    let mut one_twin = rows.clone();
+    one_twin.remove(twin);
+    let after = stable_keys(&one_twin);
+    for (index, key) in after.iter().enumerate() {
+        let original = if index < twin { index } else { index + 1 };
+        assert_eq!(key, &keys[original], "only the dropped twin's cell moves");
+    }
+}
+
+/// Pin C — edits that do not touch an obligation's text do not move its key:
+/// twenty comment lines and an unrelated function above everything, and one
+/// line inserted inside `contract_div_index` above `xs[i] / d`. Only the edited
+/// function's source digest moves.
+#[test]
+fn unrelated_edits_and_edits_above_an_obligation_keep_every_key() {
+    let rows = mir_rows();
+    let base = fixture_source();
+    let keys = stable_keys(&rows);
+
+    let mut prefix = String::new();
+    for n in 0..20 {
+        prefix.push_str(&format!("// unrelated comment {n}\n"));
+    }
+    prefix.push_str("pub fn unrelated(x: u32) -> u32 {\n    x / 3\n}\n");
+    let prefix_lines = u32::try_from(prefix.lines().count()).expect("fits");
+    let shifted = format!("{prefix}{base}");
+    assert_eq!(stable_keys_with(&rows, &shifted, |_| prefix_lines), keys);
+
+    // One line inside contract_div_index, after the body's `{` (line 6): the
+    // rows on line 7 move to line 8, the contract rows on lines 4-5 stay.
+    let mut lines: Vec<&str> = base.lines().collect();
+    lines.insert(6, "    let _unrelated = 1u64;");
+    let inside = format!("{}\n", lines.join("\n"));
+    let moved = stable_keys_with(&rows, &inside, |row| u32::from(row.span.0 >= 7));
+    assert_eq!(moved, keys);
+
+    // The edited function's source digest moves; the untouched ones do not.
+    let item = |text: &str, from: usize, to: usize| -> String {
+        text.lines().skip(from - 1).take(to - from + 1).collect::<Vec<_>>().join("\n")
+    };
+    assert_ne!(
+        function_source_digest(&item(&base, 3, 8)),
+        function_source_digest(&item(&inside, 3, 9))
+    );
+    assert_eq!(
+        function_source_digest(&item(&base, 14, 16)),
+        function_source_digest(&item(&inside, 15, 17)),
+        "add3 is untouched"
+    );
+}
+
+/// Pin D — a degenerate point span anchors on its enclosing statement, so the
+/// checked-add pair anchors on `a + b + c` and the macro pair on the callsite
+/// statement `halve!(a, d)`, and each pair differs only in `nth`.
+#[test]
+fn point_spans_anchor_on_their_statement_and_twins_differ_only_in_nth() {
+    let rows = mir_rows();
+    let source = fixture_source();
+    let lines = LineIndex::new(&source);
+    for function in ["fixture::add3", "fixture::macro_div"] {
+        let pair: Vec<&MirRow> = rows.iter().filter(|row| row.function == function).collect();
+        assert_eq!(pair.len(), 2);
+        let anchors: Vec<String> = pair
+            .iter()
+            .map(|row| {
+                let span = source_span(row, 0);
+                anchor(AnchorInput::of(Some(&span), &row.description, Some((&source, &lines))))
+                    .expect("anchor")
+            })
+            .collect();
+        assert!(
+            anchors[0].starts_with("stmt:"),
+            "{function}: a point span anchors on its statement"
+        );
+        assert_eq!(anchors[0], anchors[1], "{function}: the twins share one anchor");
+        let keyed = |row: &MirRow, anchor: &'_ str| -> (String, String, String) {
+            (row.kind.clone(), anchor.to_string(), row_discriminator(&row.description))
+        };
+        let (k0, k1) = (keyed(pair[0], &anchors[0]), keyed(pair[1], &anchors[1]));
+        let ids = local_ids(&[
+            KeyedRow { kind: &k0.0, anchor: &k0.1, position: (1, 0), discriminator: &k0.2 },
+            KeyedRow { kind: &k1.0, anchor: &k1.1, position: (1, 0), discriminator: &k1.2 },
+        ])
+        .expect("ids");
+        assert_ne!(ids[0], ids[1], "{function}: nth separates the twins");
+    }
+}
+
+/// Pin E — the def path is outside the hash: the same rows under another def
+/// path (a moved or renamed function) keep their local ids.
+#[test]
+fn a_moved_function_keeps_its_local_ids() {
+    let rows = mir_rows();
+    let keys = stable_keys(&rows);
+    let renamed: Vec<MirRow> = rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            row.function = row.function.replace("fixture::", "fixture::moved::");
+            row
+        })
+        .collect();
+    let moved = stable_keys(&renamed);
+    for (before, after) in keys.iter().zip(&moved) {
+        let id = |key: &str| key.rsplit_once('#').expect("key").1.to_string();
+        assert_eq!(id(before), id(after));
+        assert_ne!(before, after, "the def path half follows the move");
+    }
+}
+
+/// Pin F — emission order decides no key that a row's content can decide. With
+/// the rows emitted in reverse, every row that differs from its group-mates in
+/// position (its span's START: the end is not the obligation's) or description
+/// keeps its key, and each group of true twins (same kind, anchor, start and
+/// description) is given the same set of keys.
+#[test]
+fn reversed_emission_moves_no_key_a_rows_content_decides() {
+    let rows = mir_rows();
+    let keys = stable_keys(&rows);
+    let mut reversed_rows = rows.clone();
+    reversed_rows.reverse();
+    let mut reversed = stable_keys(&reversed_rows);
+    reversed.reverse();
+    let content = |row: &MirRow| {
+        (row.function.clone(), row.kind.clone(), (row.span.0, row.span.1), row.description.clone())
+    };
+    for (index, row) in rows.iter().enumerate() {
+        let twins: Vec<usize> =
+            (0..rows.len()).filter(|&other| content(&rows[other]) == content(row)).collect();
+        if twins.len() == 1 {
+            assert_eq!(reversed[index], keys[index], "{} keeps its key", row.obligation_id);
+        } else {
+            let mut before: Vec<&String> = twins.iter().map(|&i| &keys[i]).collect();
+            let mut after: Vec<&String> = twins.iter().map(|&i| &reversed[i]).collect();
+            before.sort();
+            after.sort();
+            assert_eq!(before, after, "a twin group keeps its keys");
+        }
+    }
+}
+
+/// Pin G — a reflow is not an edit. `add3`'s `a + b + c` split over three
+/// lines keeps every key (its point spans still start at `a`; the macro rows
+/// below move down two lines) and `add3`'s source digest.
+#[test]
+fn a_reflow_keeps_every_key_and_the_source_digest() {
+    let rows = mir_rows();
+    let base = fixture_source();
+    let keys = stable_keys(&rows);
+    let reflowed = base.replace("    a + b + c\n", "    a\n        + b\n        + c\n");
+    assert_ne!(reflowed, base, "the fixture still holds `a + b + c` on one line");
+    let moved = stable_keys_with(&rows, &reflowed, |row| if row.span.0 > 15 { 2 } else { 0 });
+    assert_eq!(moved, keys);
+    let item = |text: &str, from: usize, to: usize| -> String {
+        text.lines().skip(from - 1).take(to - from + 1).collect::<Vec<_>>().join("\n")
+    };
+    assert_eq!(
+        function_source_digest(&item(&base, 14, 16)),
+        function_source_digest(&item(&reflowed, 14, 18)),
+        "a reflow of add3 is not an edit of add3"
+    );
+}
+
+/// Pin H — a row's END is not the obligation's: the same division is published
+/// as a point at its start by one compile and as a range by another, and an
+/// unrelated edit can move a function from one to the other (measured
+/// 2026-10-10, `tests/run-make/trust-obligation-ids`). Every frozen row
+/// re-published as the point at its start keeps its key.
+#[test]
+fn a_row_republished_as_the_point_at_its_start_keeps_its_key() {
+    let rows = mir_rows();
+    let keys = stable_keys(&rows);
+    assert!(
+        rows.iter().any(|row| (row.span.0, row.span.1) != (row.span.2, row.span.3)),
+        "the frozen rows include ranges, so this pin compares two span shapes"
+    );
+    let points: Vec<MirRow> = rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            row.span = (row.span.0, row.span.1, row.span.0, row.span.1);
+            row
+        })
+        .collect();
+    assert_eq!(stable_keys(&points), keys);
 }

@@ -11,6 +11,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Termina
         unwind: UnwindEdge::Unreachable,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
         is_foreign: false,
         func: callee.to_string(),
         args,
@@ -51,6 +52,7 @@ fn one_call_fn(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -300,6 +302,7 @@ fn crown_deep_shape_threads_tobits_fact_to_underflow_block() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let guards = build_semantic_guard_map(&func);
     let underflow_guards = guards.get(&BlockId(4)).cloned().unwrap_or_default();

@@ -295,8 +295,8 @@ fn mir_assert_condition_core(
         }
         let Rvalue::BinaryOp(BinOp::Eq, a, b) = rvalue else { return None };
         found.push(F::Eq(
-            Box::new(trust_vcgen::operand_to_formula(func, a)),
-            Box::new(trust_vcgen::operand_to_formula(func, b)),
+            Box::new(trust_vcgen::try_operand_to_formula(func, a).ok()?),
+            Box::new(trust_vcgen::try_operand_to_formula(func, b).ok()?),
         ));
     }
     let first = found.first()?.clone();
@@ -341,24 +341,20 @@ fn mir_assert_condition_core(
 /// on the SUBJECT — every negation certificate, by whatever route, must name a variable
 /// this MIR negates.
 ///
-/// THE `abs` RECOGNIZER IS A DELIBERATELY NARROWER TWIN. `is_signed_abs_call`
-/// (`unwrap_panic.rs:123`) is `pub(super)` inside `trust-vcgen`, so it is re-derived
-/// here as `<last `::` segment> == "abs"` plus the same `core::num::` / `std::num::`
-/// anchor. The emitter's third condition — a SIGNED-int receiver
-/// (`signed_abs_panic_body`, `:141-143`) — is not re-tested here but at the USE site:
-/// `SWidth::from_mir` returns `None` for an unsigned width (`mirsem/mod.rs:2408-2410`),
-/// so an unsigned subject declines there. `trust-vcgen`'s own `method_tail`
-/// additionally strips TRAILING turbofish groups (`alloc_bounds.rs:162-196`), which this
-/// twin does not: a path ending in a turbofish therefore matches THERE and not HERE, so
-/// the twin's recognized set is a SUBSET of the emitter's and the disagreement direction
-/// is over-rejection (a lost certificate), never over-acceptance (a subject the emitter
-/// never used).
+/// THE `abs` RECOGNIZER IS THE EMITTER'S OWN. Trust (2026-10-06, ABS-NAME-1): this
+/// used to be a local twin of `trust_vcgen`'s `is_signed_abs_call`, re-derived as
+/// `<last `::` segment> == "abs"` plus a `core::num::` / `std::num::` SUBSTRING test,
+/// because the original was `pub(super)`. Both halves had the same unanchored
+/// substring, so a user `mycore::num::abs` or `G::<core::num::Wrapping<i32>>::abs`
+/// was an `abs` call on both sides. The emitter now takes exactly the authenticated
+/// `core::num::<impl iN>::abs` (signed primitive owner, `__trust_crate@` stamp
+/// refused), and it is exported, so this gate calls `trust_vcgen::is_signed_abs_call`
+/// and the two sets are EQUAL by construction rather than kept a subset by care. The
+/// emitter's other condition — a SIGNED-int receiver TYPE (`signed_abs_panic_body`)
+/// — is still re-tested at the USE site: `SWidth::from_mir` returns `None` for an
+/// unsigned width.
 fn negation_subjects(func: &trust_types::VerifiableFunction) -> Vec<(String, trust_types::Ty)> {
     use trust_types::{Operand, Rvalue, Statement, Terminator, UnOp};
-    fn is_signed_abs_call(callee: &str) -> bool {
-        callee.trim().rsplit("::").next() == Some("abs")
-            && (callee.contains("core::num::") || callee.contains("std::num::"))
-    }
     let mut out: Vec<(String, trust_types::Ty)> = Vec::new();
     let mut push = |operand: &Operand| {
         let (Operand::Copy(p) | Operand::Move(p)) = operand else { return };
@@ -372,7 +368,7 @@ fn negation_subjects(func: &trust_types::VerifiableFunction) -> Vec<(String, tru
             }
         }
         if let Terminator::Call { func: callee, args, target: Some(_), .. } = &block.terminator
-            && is_signed_abs_call(callee)
+            && trust_vcgen::is_signed_abs_call(callee)
             && let Some(arg) = args.first()
         {
             push(arg);
@@ -580,7 +576,7 @@ pub(super) fn reconstruct_obligation(rec: &trust_types::ObligationRecord) -> tru
                 let terms: Vec<F> = paths
                     .iter()
                     .map(|p| match p {
-                        P::Raw => cur.clone(),
+                        P::Raw | P::Collapsed => cur.clone(),
                         P::Guarded { guards } => {
                             let mut c = guards.clone();
                             match cur.clone() {

@@ -217,14 +217,25 @@ Second-pass Lane H runtime/parity and next-run matrix notes are tracked in
 ## Repair Evidence E2E
 
 `crates/trust-backprop/tests/program_index_real_verifier_repair_e2e.rs` is an
-ignored real-compiler evidence test for the `proof_div_zero.flawed` fixture. Set
-`TRUST_REPAIR_E2E_TRUSTC` to a stage2 `trustc` and
-`TRUST_REPAIR_E2E_REPORT_DIR` to an evidence directory, then run:
+`#[ignore]`d real-compiler evidence test for the `proof_div_zero.flawed`
+fixture, run by the slow harness row `slow.program-index-repair-e2e`
+(`tests/run_trust_comprehensive_harness.sh slow`). It compiles with the in-tree
+stage2 compiler, `build/host/stage2/bin/rustc`, and panics when that file is
+missing (build it with `./x.py build --stage 2`); it never skips.
+`TRUST_REPAIR_E2E_TRUSTC` overrides the compiler and
+`TRUST_REPAIR_E2E_REPORT_DIR` the evidence directory, which otherwise is a
+fresh directory under the test target's tmp dir; the test prints both paths.
+By hand, from the repo root:
 
 ```sh
-cargo test -p trust-backprop --test program_index_real_verifier_repair_e2e \
-  -- --ignored --nocapture
+targo --unverified test --manifest-path crates/Cargo.toml -p trust-backprop \
+  --test program_index_real_verifier_repair_e2e --locked -- --ignored --exact \
+  real_stage2_program_index_divzero_repair_improves_proof_counts --nocapture
 ```
+
+and read the last line: it must say `test result: ok. 1 passed`. libtest exits
+0 when its filter selects nothing, so `0 passed` (a renamed test, or a missing
+`--ignored`) ran nothing and is not a pass; the harness row fails on it.
 
 The test copies the flawed fixture to a temp file, requires real stage2
 `TRUST_JSON` divzero failure and counterexample evidence, applies a deterministic

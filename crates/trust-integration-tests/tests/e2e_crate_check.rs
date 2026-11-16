@@ -450,6 +450,7 @@ fn to_verifiable_function(parsed: &ParsedFunction) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -650,10 +651,7 @@ fn test_e2e_json_report_valid_structure() {
 #[test]
 fn test_source_extraction_finds_real_functions() {
     let src_dir = trust_types_src();
-    if !src_dir.is_dir() {
-        eprintln!("Skipping: trust-types/src not found");
-        return;
-    }
+    assert!(src_dir.is_dir(), "trust-types/src not found at {}", src_dir.display());
 
     // lib.rs is module declarations and re-exports — no functions. The historical
     // `formula.rs` file was split into a `formula/` directory; `formula/mod.rs` is
@@ -809,6 +807,7 @@ fn make_simple_add(name: &str, ty: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -844,6 +843,7 @@ fn make_simple_div(name: &str, ty: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -867,5 +867,6 @@ fn make_noop(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }

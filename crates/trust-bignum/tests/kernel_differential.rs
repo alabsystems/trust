@@ -35,6 +35,17 @@ use trust_bignum::Nat;
 // Harness
 // ---------------------------------------------------------------------------
 
+/// The environment every differential checker is built over: Clean's own
+/// prelude world, whose `Nat.*` heads carry the canonical closure digests the
+/// kernel authorizes a literal fold by. Since Clean `3809edf31` an ABSENT head
+/// never folds, so over an empty `Environment::new()` every application this
+/// harness builds stays stuck and nothing is measured (pinned by
+/// `an_empty_environment_folds_no_nat_head`). This grants no authority: it is
+/// the environment a real proof check reduces in.
+fn kernel_environment() -> Environment {
+    Environment::with_prelude()
+}
+
 /// `Nat.<op> <lit a> <lit b>` as a kernel expression.
 fn binop_expr(op: &str, a: &[u64], b: &[u64]) -> Expr {
     Expr::app(
@@ -162,7 +173,7 @@ fn edge_values() -> Vec<Vec<u64>> {
 
 #[test]
 fn every_operation_agrees_with_the_kernel_on_the_edge_cross() {
-    let env = Environment::new();
+    let env = kernel_environment();
     let tc = TypeChecker::new(&env);
     let edges = edge_values();
     for a in &edges {
@@ -174,7 +185,7 @@ fn every_operation_agrees_with_the_kernel_on_the_edge_cross() {
 
 #[test]
 fn every_operation_agrees_with_the_kernel_on_randomized_multi_limb_values() {
-    let env = Environment::new();
+    let env = kernel_environment();
     let tc = TypeChecker::new(&env);
     let mut rng = Rng(0x1657_8235_D5A6_29F1);
     for _ in 0..250 {
@@ -190,7 +201,7 @@ fn the_division_by_zero_lane_is_measured_not_assumed() {
     // diverge hardest from Rust intuition. The edge cross above already hits
     // b = 0; this pins the pair EXPLICITLY so the property is named in a test
     // the day either side changes.
-    let env = Environment::new();
+    let env = kernel_environment();
     let tc = TypeChecker::new(&env);
     for a in edge_values() {
         let n = Nat::from_limbs(a.clone());
@@ -205,7 +216,7 @@ fn the_division_by_zero_lane_is_measured_not_assumed() {
 fn subtraction_truncates_identically_across_the_boundary() {
     // (a - b) with b > a is 0 on BOTH sides — measured at the exact boundary,
     // one below, one above, at multi-limb scale.
-    let env = Environment::new();
+    let env = kernel_environment();
     let tc = TypeChecker::new(&env);
     let pairs: [(&[u64], &[u64]); 4] = [
         (&[0, 1], &[1, 1]),                  // 2^64 - (2^64 + 1) = 0
@@ -216,5 +227,22 @@ fn subtraction_truncates_identically_across_the_boundary() {
     for (a, b) in pairs {
         let ours = Nat::from_limbs(a.to_vec()).sub(&Nat::from_limbs(b.to_vec()));
         assert_eq!(as_runtime_value(&kernel_nat(&tc, "Nat.sub", a, b)), ours);
+    }
+}
+
+#[test]
+fn an_empty_environment_folds_no_nat_head() {
+    // The negative twin of `kernel_environment`: the same application over an
+    // environment that declares no `Nat.*` head stays stuck for every
+    // operation, so the fold the tests above measure is the prelude world's
+    // authorized fold, not a name-keyed rule that fires anywhere. If this
+    // starts folding, Clean's fold authority changed and the differential no
+    // longer measures what the I6 row says it does.
+    let env = Environment::new();
+    let tc = TypeChecker::new(&env);
+    for op in ["Nat.add", "Nat.sub", "Nat.mul", "Nat.div", "Nat.mod", "Nat.beq", "Nat.ble"] {
+        let applied = binop_expr(op, &[7], &[3]);
+        let reduced = tc.whnf(&applied);
+        assert_eq!(reduced, applied, "`{op} 7 3` reduced in an empty environment");
     }
 }

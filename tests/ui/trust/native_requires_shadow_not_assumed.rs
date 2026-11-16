@@ -3,6 +3,12 @@
 //@ check-fail
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: ERROR
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
+// (RE-PINNED 2026-09-14: main's whole-function panic-freedom aggregate is
+// runtime-checked — trust-mc's CHC/PDR transport "solved obligation … without a
+// proof" — and ruling B reports it as an advisory WARN pair. That row is not what
+// this file pins; the annotations above/below are.)
 //! Trust #14 soundness regression. A native first-class `requires` clause binds
 //! to the ENTRY PARAMETER — recovered from the HIR signature when
 //! `var_debug_info` is absent at low `-Cdebuginfo` (locals `1..=arg_count` are

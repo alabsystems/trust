@@ -4,6 +4,19 @@
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
 //@ check-pass
+// This file runs at the default per-obligation budget (20 s). It ran at 2 s,
+// with every per-function verdict measured identical at 0.5 s, 2 s and 20 s
+// (2026-09-23, 96f2019566), to save the time an engine burns on an obligation
+// it cannot decide. That no longer holds at ay main 01b58012 (Trust train T8,
+// 2026-10-07). The in-process refutation of `num_patches`' `grid * grid`
+// splits its query into four disjoint components, each with a quarter of the
+// budget, and ay now takes 0.58 s on the QF_NIA one
+// (`0 <= g <= 2^64-1 and (g*g < 0 or g*g > 2^64-1)`) where ay 630e4d62 took
+// 0.07 s (the ay CLI on the same program). At 2 s (0.5 s a component) the
+// refutation misses and the row reads runtime-checked; at 5 s it held alone
+// but missed under the ui suite's load. At 20 s every verdict is the one
+// pinned below. The ay slowdown itself is not fixed here; the
+// `Trust verification:` NOTE pins fail if a budget ever changes a verdict.
 //! E6 — a `requires` CLAUSE MAY PROJECT A FIELD OF A PARAMETER.
 //!
 //! Until this landed, the native clause grammar accepted only plain scalar
@@ -82,6 +95,7 @@ impl VitConfig {
     pub fn num_patches(&self) -> usize
         requires self.patch_size != 0
     {
+        //~^^^ NOTE Trust verification: 1 proved, 1 failed, 0 unknown
         let grid = self.image_size / self.patch_size;
         grid * grid
     }
@@ -96,6 +110,7 @@ impl VitConfig {
     pub fn seq_len(&self) -> usize
         requires self.patch_size != 0
     {
+        //~^^^ NOTE Trust verification: 1 proved, 1 failed, 0 unknown
         let n = self.num_patches();
         if self.use_cls_token { n + 1 } else { n }
     }
@@ -116,6 +131,7 @@ impl VitConfig {
 pub fn grid_of(c: &VitConfig) -> usize
     requires c.patch_size != 0
 {
+    //~^^^ NOTE Trust verification: 1 proved, 0 failed, 0 unknown
     c.image_size / c.patch_size
 }
 
@@ -124,6 +140,7 @@ pub fn grid_of(c: &VitConfig) -> usize
 pub fn grid_of_owned(c: VitConfig) -> usize
     requires c.patch_size != 0
 {
+    //~^^^ NOTE Trust verification: 1 proved, 0 failed, 0 unknown
     c.image_size / c.patch_size
 }
 
@@ -136,6 +153,7 @@ pub fn grid_of_owned(c: VitConfig) -> usize
 /// `[precond] FAILED; counterexample: c*.0 = 0`. Both directions are needed:
 /// an unbound projection would be spuriously SAT and fail here too.
 pub fn guarded(c: &VitConfig) -> usize {
+    //~^ NOTE Trust verification: 1 proved, 0 failed, 0 unknown
     if c.patch_size != 0 { c.num_patches() } else { 0 }
 }
 
@@ -143,6 +161,7 @@ pub fn guarded(c: &VitConfig) -> usize {
 /// different σ paths (a method call reborrows the already-`&` receiver, a free
 /// call passes the argument through a `Use(Copy)` temp), and both discharge.
 pub fn guarded_free(c: &VitConfig) -> usize {
+    //~^ NOTE Trust verification: 1 proved, 0 failed, 0 unknown
     if c.patch_size != 0 { grid_of(c) } else { 0 }
 }
 

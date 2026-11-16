@@ -816,7 +816,7 @@ mod tests {
         assert_eq!(utf8_decode3(0xEF, 0xBF, 0xBF), 0xFFFF);
         assert_eq!(utf8_decode3(0xE2, 0x82, 0xAC), 0x20AC); // EURO SIGN
         // Overlong three-byte form of U+0000, and a UTF-8-encoded lone
-        // surrogate — the input `trust-json/tests/adversarial.rs:240` feeds in.
+        // surrogate — the input `trust-json/tests/adversarial.rs:241` feeds in.
         assert_eq!(utf8_decode3(0xE0, 0x80, 0x80), NOT_A_SCALAR);
         assert_eq!(utf8_decode3(0xED, 0xA0, 0x80), NOT_A_SCALAR);
         assert_eq!(utf8_decode3(0xED, 0x9F, 0xBF), 0xD7FF);

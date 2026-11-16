@@ -30,7 +30,7 @@ fn min2(x: u8, y: u8) -> u8 {
 // do not discharge a citation.
 fn cite_fully_certified() -> u8
     ensures min2(1, 2) == 1 by placeholder
-    //~^ ERROR citation `placeholder` cannot be validated because this clause is outside the exact statement fragment: the elaborated goal does not typecheck
+    //~^ ERROR citation `placeholder` failed the strict Clean statement/certification audit
 {
     1
 }

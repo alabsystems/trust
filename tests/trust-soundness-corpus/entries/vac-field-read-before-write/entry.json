@@ -1,0 +1,41 @@
+{
+  "id": "vac-field-read-before-write",
+  "class": "vac",
+  "title": "a field read before a write through the same place plus an unversioned return pin PROVED `result && !result`",
+  "origin": [
+    "KH:29294 (vac, FIXED 2026-09-30 (residuals OPEN))",
+    "fix f1ec77ab75: P1 (a bare read sealed to the entry sentinel) and P2 (the return pin stamped at its statement) close this program",
+    "the residuals R-a..R-e of that KH entry are other programs (R-a, R-d precision losses; R-b a per-row overstatement; R-c's field-store member closed by 7f118dfc1f; R-e a counterexample that is not an execution). None is this reproducer, and none is in the corpus yet (README, Not in the corpus yet)"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "vac",
+    "obligation": {
+      "kind": "postcond",
+      "at": "ensures result && !result"
+    }
+  },
+  "twin": {
+    "function": "set_true",
+    "obligation": {
+      "kind": "postcond",
+      "at": "ensures result"
+    }
+  },
+  "witness": {
+    "input": "s.f = false",
+    "observed": "postcondition violated",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "n/a": "the reproducer and twin carry trustc's native `ensures` clause between the signature and the body, which is not Rust syntax; trust-vc-syn parses the file with syn and cannot read it at all (`parse verification source file: expected curly braces`), so it has no verdict to give on either side"
+    }
+  },
+  "rustc_flags": [
+    "-Ztrim-diagnostic-paths=false"
+  ],
+  "rustc_flags_note": "store 9192 panics after it has emitted every row of a crate holding an `ensures` function (`trimmed_def_paths` called, diagnostics were expected but none were emitted; exit 101), the twin alone included. -Ztrim-diagnostic-paths=false changes only how diagnostics print paths, and the rows are the same with and without it."
+}

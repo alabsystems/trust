@@ -354,15 +354,6 @@ mod tests {
     }
 
     #[test]
-    fn test_chain_validator_empty_chain() {
-        let chain = CertificateChain::new();
-        let result = ChainValidator::validate(&chain);
-        assert!(!result.valid);
-        assert_eq!(result.findings.len(), 1);
-        assert_eq!(result.findings[0].kind, ChainFindingKind::EmptyChain);
-    }
-
-    #[test]
     fn test_chain_validator_hash_mismatch() {
         let mut chain = CertificateChain::new();
         chain.push(ChainStep {

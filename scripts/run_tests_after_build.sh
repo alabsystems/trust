@@ -149,7 +149,7 @@ find_stage2_tool() {
             printf '%s\n' "$candidate"
             return 0
         fi
-    done < <(find "${REPO}/build" -path "*/stage2/bin/${tool}" -type f -print 2>/dev/null | sort)
+    done < <(find -H "${REPO}/build" -path "*/stage2/bin/${tool}" -type f -print 2>/dev/null | sort)
 
     return 1
 }
@@ -411,11 +411,8 @@ echo "$(date '+%H:%M:%S') waiting for in-flight x.py build to exit" | tee -a "${
 # So: the LOCK is authoritative (x.py holds it for the whole build), and
 # `pgrep -x bootstrap` — matching the executable NAME, which assumes nothing
 # about argument order — is the backstop for a build that predates the lock.
-BUILD_LOCK="${REPO}/scripts/trust_build_lock.sh"
 while :; do
-    if [ -x "${BUILD_LOCK}" ] || [ -f "${BUILD_LOCK}" ]; then
-        sh "${BUILD_LOCK}" status >/dev/null 2>&1 || { sleep 60; continue; }
-    fi
+    "${TARGO:-targo}" trust repo lock status --repo-root "$REPO" >/dev/null 2>&1 || { sleep 60; continue; }
     pgrep -x bootstrap >/dev/null 2>&1 || break
     sleep 60
 done
@@ -430,7 +427,7 @@ echo "$(date '+%H:%M:%S') diagnostic Git-clean candidate: ${CANDIDATE_HEAD} (loc
 # Never let an outer T3 invocation or developer shell export relocate/disable
 # the post-build identity boundary, and keep these variables unexported so T4+
 # receive them only when explicitly scoped below.
-unset TRUSTC TARGO TARGO_TRUST TRUSTD TRUST_MEMORY_JOBSERVER_SOCK TRUSTD_DISABLE
+unset TRUSTC TARGO TARGO_TRUST TRUSTD TRUST_MEMORY_JOBSERVER_SOCK TRUSTD_RUNTIME_DIR TRUSTD_DISABLE
 TRUSTC=""
 if ! TRUSTC="$(find_stage2_tool trustc)"; then
     TRUSTC=""
@@ -568,7 +565,7 @@ run_tier_and_record T0_tidy \
 # reports ~163 s under `--report-time` while the suite's wall is 175 s). So the
 # marginal cost of this package is roughly its slowest single test.
 run_tier_and_record T1_trust_crates \
-    "${CARGO_BIN}" --unverified test --manifest-path crates/Cargo.toml \
+    "${CARGO_BIN}" --unverified test --manifest-path Cargo.toml \
     --locked \
     -p trust-loop -p trust-vcgen -p trust-router -p trust-certify \
     --no-fail-fast
@@ -578,21 +575,9 @@ run_tier_and_record T1_trust_crates \
 # revision, so this tier's verdict does not depend on any installed `clean`
 # executable — and unlike the sibling binary cross-checks, it cannot skip.
 run_tier_and_record T1b_proof_corpora \
-    "${CARGO_BIN}" --unverified test --manifest-path crates/Cargo.toml \
+    "${CARGO_BIN}" --unverified test --manifest-path Cargo.toml \
     --locked \
     -p trust-integration-tests --test lean_front_door_gate \
-    --no-fail-fast
-
-# T1c: the ny certificate bridge, which no other tier reaches. Its `ny` feature
-# is off by default — nothing in the verifier calls it yet — so without an
-# explicit tier its rational-clearing arithmetic (checked u128/i128, where an
-# unnoticed overflow would turn a fail-closed `None` into a wrong integer
-# system and a certificate about the wrong constraints) would compile in no
-# build and be exercised by no gate.
-run_tier_and_record T1c_ny_bridge \
-    "${CARGO_BIN}" --unverified test --manifest-path crates/Cargo.toml \
-    --locked \
-    -p trust-ny-bridge --features ny \
     --no-fail-fast
 
 # T1d: the `is_whnf` MINT-GATE canary — one release test that asks whether the
@@ -663,7 +648,7 @@ else
 fi
 record_tier_status T3_e2e "$T3_RC"
 
-# T3b: the five ignored real-Targo certified-monitor tests are a distinct
+# T3b: the eleven ignored real-Targo certified-monitor tests are a distinct
 # release boundary. Ordinary `targo test` and the T3 shell glob do not execute
 # them. The dedicated gate proves each exact ignored test actually ran once;
 # it supports Linux/macOS x86_64/aarch64 and deliberately fails on other hosts

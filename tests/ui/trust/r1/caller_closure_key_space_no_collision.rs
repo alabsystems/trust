@@ -4,17 +4,13 @@
 //@ normalize-stderr: "formula=.* freevars=\{[^}]*\}" -> "formula=$$FORMULA freevars=$$FREEVARS"
 //@ normalize-stderr: "sealed [0-9a-f]{64}" -> "sealed $$DIGEST"
 //@ check-pass
-//
-// CONTROL for `caller_closure_key_space_collision.rs`: byte-for-byte the same
-// program with the module renamed `t` -> `u`, so no nesting eats exactly one
-// segment. Here the two producers' key spaces ARE disjoint —
-//
-//   RAW  = {`u::helper`, `helper`}       (`… : found Failed VC` prefixes)
-//   SEAM = {`t::u::helper`, `t::helper`} (`stored flip key='…'`)
-//
-// — which is the OTHER observed state of the pair. The ordinary shape loses the
-// lookup (a raw key never equals the same DefId's seam key); only the shadowing
-// shape in the sibling fixture turns that loss into a WRONG-DefId hit.
+
+// R1-MONO-SUPPRESSION-1: sealed row harvesting remains enabled, but its
+// root-only evidence cannot suppress a failed/discarded native bundle.
+// The former generic-coverage registry and transitive caller census are gone.
+// The raw diagnostic name of one helper collides with another helper's
+// crate-prefixed sealed-row key only in the collision variant. Both genuine
+// per-row sealed flips must still apply to their own source functions.
 #![allow(dead_code)]
 mod u {
     pub(crate) fn helper(x: u32, d: u32) -> u32 {

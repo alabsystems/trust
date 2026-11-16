@@ -36,9 +36,139 @@
 //! it is a rare own-effect/panic/nondet source with no legitimate coverage cost,
 //! whereas here it is common benign scaffolding.)
 
-use std::collections::HashMap;
-
+use crate::fx::{FxHashMap, FxHashSet};
 use crate::{BasicBlock, BlockId, Terminator, VerifiableFunction};
+
+/// Visit each successor block a terminator may branch to in canonical order,
+/// without allocating a temporary `Vec<BlockId>`.
+pub(crate) fn for_each_terminator_successor(t: &Terminator, mut f: impl FnMut(BlockId)) {
+    match t {
+        Terminator::Goto(b)
+        | Terminator::Assert { target: b, .. }
+        | Terminator::Drop { target: b, .. } => f(*b),
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            for (_, b) in targets {
+                f(*b);
+            }
+            f(*otherwise);
+        }
+        Terminator::Call { target, .. } => {
+            if let Some(b) = target {
+                f(*b);
+            }
+        }
+        Terminator::Opaque { targets, .. } => {
+            for b in targets {
+                f(*b);
+            }
+        }
+        Terminator::Return
+        | Terminator::TailCall { .. }
+        | Terminator::Unreachable
+        | Terminator::Resume => {}
+    }
+}
+
+/// Return the `idx`-th successor of `t` in the same order as [`terminator_successors`],
+/// without allocating a temporary `Vec<BlockId>`.
+#[inline]
+pub(crate) fn terminator_successor_at(t: &Terminator, idx: usize) -> Option<BlockId> {
+    match t {
+        Terminator::Goto(b)
+        | Terminator::Assert { target: b, .. }
+        | Terminator::Drop { target: b, .. } => (idx == 0).then_some(*b),
+        Terminator::Call { target, .. } => (idx == 0).then_some(*target)?,
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            if let Some((_, b)) = targets.get(idx) {
+                Some(*b)
+            } else if idx == targets.len() {
+                Some(*otherwise)
+            } else {
+                None
+            }
+        }
+        Terminator::Opaque { targets, .. } => targets.get(idx).copied(),
+        Terminator::Return
+        | Terminator::TailCall { .. }
+        | Terminator::Unreachable
+        | Terminator::Resume => None,
+    }
+}
+
+/// Whether `target` is a direct control-flow successor of `t`.
+#[inline]
+pub(crate) fn terminator_has_successor(t: &Terminator, target: BlockId) -> bool {
+    match t {
+        Terminator::Goto(b)
+        | Terminator::Assert { target: b, .. }
+        | Terminator::Drop { target: b, .. } => *b == target,
+        Terminator::Call { target: Some(b), .. } => *b == target,
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            *otherwise == target || targets.iter().any(|(_, b)| *b == target)
+        }
+        Terminator::Opaque { targets, .. } => targets.contains(&target),
+        Terminator::Call { target: None, .. }
+        | Terminator::Return
+        | Terminator::TailCall { .. }
+        | Terminator::Unreachable
+        | Terminator::Resume => false,
+    }
+}
+
+/// Whether every block reachable from `blocks.first()` satisfies `predicate`.
+/// Returns `false` on an empty block slice (fail closed).
+pub(crate) fn all_reachable_blocks(
+    blocks: &[BasicBlock],
+    mut predicate: impl FnMut(&BasicBlock) -> bool,
+) -> bool {
+    let Some(entry) = blocks.first().map(|b| b.id) else {
+        return false;
+    };
+    if blocks.iter().enumerate().all(|(i, b)| b.id.0 == i) {
+        let mut seen = vec![false; blocks.len()];
+        seen[0] = true;
+        let mut stack = Vec::with_capacity(blocks.len());
+        stack.push(0usize);
+        while let Some(idx) = stack.pop() {
+            let Some(block) = blocks.get(idx) else {
+                continue;
+            };
+            if !predicate(block) {
+                return false;
+            }
+            for_each_terminator_successor(&block.terminator, |s| {
+                if let Some(slot) = seen.get_mut(s.0)
+                    && !*slot
+                {
+                    *slot = true;
+                    stack.push(s.0);
+                }
+            });
+        }
+        return true;
+    }
+
+    let by_id: FxHashMap<BlockId, &BasicBlock> = blocks.iter().map(|b| (b.id, b)).collect();
+    let mut seen: FxHashSet<BlockId> =
+        FxHashSet::with_capacity_and_hasher(blocks.len(), Default::default());
+    seen.insert(entry);
+    let mut stack = Vec::with_capacity(blocks.len());
+    stack.push(entry);
+    while let Some(bid) = stack.pop() {
+        let Some(block) = by_id.get(&bid) else {
+            continue;
+        };
+        if !predicate(block) {
+            return false;
+        }
+        for_each_terminator_successor(&block.terminator, |s| {
+            if seen.insert(s) {
+                stack.push(s);
+            }
+        });
+    }
+    true
+}
 
 /// The successor blocks a terminator may branch to (empty for the leaves
 /// `Return`, `Unreachable`, `Resume`, and a `Call` with no return target).
@@ -47,7 +177,8 @@ pub fn terminator_successors(t: &Terminator) -> Vec<BlockId> {
     match t {
         Terminator::Goto(b) => vec![*b],
         Terminator::SwitchInt { targets, otherwise, .. } => {
-            let mut s: Vec<BlockId> = targets.iter().map(|(_, b)| *b).collect();
+            let mut s: Vec<BlockId> = Vec::with_capacity(targets.len() + 1);
+            s.extend(targets.iter().map(|(_, b)| *b));
             s.push(*otherwise);
             s
         }
@@ -74,18 +205,52 @@ pub fn is_loop_free(blocks: &[BasicBlock]) -> bool {
     let Some(entry) = blocks.first().map(|b| b.id) else {
         return false;
     };
-    let succ: HashMap<BlockId, Vec<BlockId>> =
-        blocks.iter().map(|b| (b.id, terminator_successors(&b.terminator))).collect();
+    if blocks.iter().enumerate().all(|(i, b)| b.id.0 == i) {
+        // 0 = white (unseen), 1 = grey (on the DFS stack), 2 = black (finished).
+        let mut colour = vec![0u8; blocks.len()];
+        let mut stack: Vec<(usize, usize)> = Vec::with_capacity(blocks.len());
+        colour[0] = 1;
+        stack.push((0, 0));
+        while let Some(top) = stack.last_mut() {
+            let (node, idx) = *top;
+            let Some(block) = blocks.get(node) else {
+                stack.pop();
+                continue;
+            };
+            if let Some(next) = terminator_successor_at(&block.terminator, idx) {
+                top.1 += 1;
+                let Some(next_colour) = colour.get_mut(next.0) else {
+                    continue;
+                };
+                match *next_colour {
+                    1 => return false, // grey: back edge → cycle
+                    0 => {
+                        *next_colour = 1;
+                        stack.push((next.0, 0));
+                    }
+                    _ => {} // black: already finished
+                }
+            } else {
+                colour[node] = 2;
+                stack.pop();
+            }
+        }
+        return true;
+    }
 
+    let by_id: FxHashMap<BlockId, &BasicBlock> = blocks.iter().map(|b| (b.id, b)).collect();
     // 0 = white (unseen), 1 = grey (on the DFS stack), 2 = black (finished).
-    let mut colour: HashMap<BlockId, u8> = HashMap::new();
+    let mut colour: FxHashMap<BlockId, u8> =
+        FxHashMap::with_capacity_and_hasher(blocks.len(), Default::default());
     let mut stack: Vec<(BlockId, usize)> = vec![(entry, 0)];
     colour.insert(entry, 1);
-    while let Some(&(node, idx)) = stack.last() {
-        let succs: &[BlockId] = succ.get(&node).map_or(&[], Vec::as_slice);
-        if idx < succs.len() {
-            stack.last_mut().unwrap().1 += 1;
-            let next = succs[idx];
+    while let Some(top) = stack.last_mut() {
+        let (node, idx) = *top;
+        let next = by_id
+            .get(&node)
+            .and_then(|block| terminator_successor_at(&block.terminator, idx));
+        if let Some(next) = next {
+            top.1 += 1;
             match colour.get(&next).copied().unwrap_or(0) {
                 1 => return false, // grey: back edge → cycle
                 0 => {

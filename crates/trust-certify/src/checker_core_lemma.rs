@@ -41,8 +41,13 @@
 //   axiom AS STATED, NOT a claim of full dependent-CIC strong normalization.
 //
 //   whnf_terminates_well_typed_dependent :  (conditional dependent SN)
-//     forall (tenv : Name -> OptionType KExpr) (M : CandModel tenv) (e T : KExpr),
+//     forall (tenv : KDeclEnv) (M : CandModel tenv) (e T : KExpr),
 //       TypingCtx tenv (ListType.nil KExpr) e T -> whnf_acc e
+//   where `KDeclEnv := Name -> OptionType KConstSig`: constants carry a schematic
+//   signature (universe parameters + type), not a bare `KExpr` type. clean-verify
+//   restated both environment-typed lemmas that way on 2026-09-08 (clean
+//   31fa57c00, schematic universes); these pins still named the old carrier until
+//   2026-09-27, so both lemmas failed closed — never certified — in the meantime.
 //   This is the stronger CLOSED-term result for the dependent `TypingCtx`
 //   judgment (including variables under binders and the let case), but it remains
 //   conditional on a caller-supplied `M : CandModel tenv`. It does not establish
@@ -63,7 +68,7 @@
 //   it here independently attests that exact model-side coherence claim.
 //
 //   bootstrap_infer_sound :  (modeled algorithm-to-typing soundness)
-//     forall (tenv : Name -> OptionType KExpr) (G : ListType KExpr) (e T : KExpr),
+//     forall (tenv : KDeclEnv) (G : ListType KExpr) (e T : KExpr),
 //       KernelInfers tenv G e T -> TypingCtxConv tenv G e T
 //   This is soundness of the six-shape `KernelInfers` relation (sort/bvar/pi/lam/
 //   const/app; no let arm) against the declarative-with-conversion judgment. The
@@ -400,8 +405,8 @@ pub(crate) const KERNEL_INFER_INVERSION: CheckerCoreLemma = CheckerCoreLemma {
 /// nor grounds the literal Rust implementation.
 pub(crate) const WHNF_TERMINATES_WELL_TYPED_DEPENDENT: CheckerCoreLemma = CheckerCoreLemma {
     name: "whnf_terminates_well_typed_dependent",
-    type_src: "forall (tenv : Name -> OptionType KExpr) (M : CandModel tenv) (e : KExpr) (T : KExpr), TypingCtx tenv (ListType.nil KExpr) e T -> whnf_acc e",
-    fake_src: "fun (tenv : Name -> OptionType KExpr) (M : CandModel tenv) (e : KExpr) (T : KExpr) (h : TypingCtx tenv (ListType.nil KExpr) e T) => h",
+    type_src: "forall (tenv : KDeclEnv) (M : CandModel tenv) (e : KExpr) (T : KExpr), TypingCtx tenv (ListType.nil KExpr) e T -> whnf_acc e",
+    fake_src: "fun (tenv : KDeclEnv) (M : CandModel tenv) (e : KExpr) (T : KExpr) (h : TypingCtx tenv (ListType.nil KExpr) e T) => h",
     lineage_domain: "trust-certify.cleancic.checker-core.whnf-termination-dependent.v1",
     // Protocol compatibility: keep the published v1 metadata byte-for-byte;
     // the qualification above is the authoritative scope clarification.
@@ -413,8 +418,8 @@ pub(crate) const WHNF_TERMINATES_WELL_TYPED_DEPENDENT: CheckerCoreLemma = Checke
 /// relation-to-Rust fidelity boundary remains outside this theorem.
 pub(crate) const BOOTSTRAP_INFER_SOUND: CheckerCoreLemma = CheckerCoreLemma {
     name: "bootstrap_infer_sound",
-    type_src: "forall (tenv : Name -> OptionType KExpr) (G : ListType KExpr) (e : KExpr) (T : KExpr), KernelInfers tenv G e T -> TypingCtxConv tenv G e T",
-    fake_src: "fun (tenv : Name -> OptionType KExpr) (G : ListType KExpr) (e : KExpr) (T : KExpr) (h : KernelInfers tenv G e T) => h",
+    type_src: "forall (tenv : KDeclEnv) (G : ListType KExpr) (e : KExpr) (T : KExpr), KernelInfers tenv G e T -> TypingCtxConv tenv G e T",
+    fake_src: "fun (tenv : KDeclEnv) (G : ListType KExpr) (e : KExpr) (T : KExpr) (h : KernelInfers tenv G e T) => h",
     lineage_domain: "trust-certify.cleancic.checker-core.bootstrap-infer-sound.v1",
     label: "clean-verify.bootstrap.bootstrap_infer_sound: KernelInfers tenv G e T -> TypingCtxConv tenv G e T (context-explicit algorithmic soundness — the bootstrap infer relation implies the declarative dependent judgment; DerivedProved, empty axiom_deps, by induction on KernelInfers; third of the three crosscheck-pinned flagships)",
 };
@@ -762,7 +767,7 @@ fn lemma_authority_is_clean(
 
 /// The heavy body of the mint, run on the large-stack thread.
 fn certify_inner(lemma: &CheckerCoreLemma) -> Option<trust_ir::ProofEvidence> {
-    let spec = clean_verify::spec::Specification::new().ok()?;
+    let spec = crate::checker_core::checker_specification()?;
     let def = spec.get_definition(lemma.name)?;
 
     // Pin the exact checker-core Prop: fail closed if the spec has drifted, so
@@ -771,7 +776,7 @@ fn certify_inner(lemma: &CheckerCoreLemma) -> Option<trust_ir::ProofEvidence> {
         return None;
     }
     // Honesty residual (model level): a constructive, zero-domain-axiom proof.
-    if !lemma_authority_is_clean(&spec, lemma) {
+    if !lemma_authority_is_clean(spec, lemma) {
         return None;
     }
 
@@ -827,7 +832,7 @@ fn recheck_inner(
     context_bytes: &[u8],
     lineage: &trust_ir::ProofDigest,
 ) -> bool {
-    let Some(spec) = clean_verify::spec::Specification::new().ok() else {
+    let Some(spec) = crate::checker_core::checker_specification() else {
         return false;
     };
     let Some(def) = spec.get_definition(lemma.name) else {
@@ -837,7 +842,7 @@ fn recheck_inner(
     if def.type_src != lemma.type_src {
         return false;
     }
-    if !lemma_authority_is_clean(&spec, lemma) {
+    if !lemma_authority_is_clean(spec, lemma) {
         return false;
     }
     let (Some(goal), Some(canonical_proof)) =

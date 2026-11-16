@@ -7,30 +7,63 @@ use trust_types::*;
 
 use crate::BackendRole;
 
-/// Return the mandatory fail-closed result for an unsupported MIR VC.
+/// Return the mandatory fail-closed result for an undischargeable VC.
 ///
 /// `UnsupportedMir` is not a solver obligation: it records a valid MIR shape
 /// whose semantics are not yet modeled precisely enough for proof. Any direct
 /// backend/router entrypoint must return `Unknown` before formula dispatch.
+/// Legacy `DataRace` VCs likewise lack authenticated location, runtime-thread,
+/// and happens-before evidence. `InsufficientOrdering` VCs have no execution or
+/// memory model either (v6/D2). Their only production producer decides an
+/// API-legality violation in Rust and emits a free boolean. A hand-built one with a
+/// hardcoded `false` formula was PROVED by the constant folder before this arm
+/// existed. The historical function name is retained for existing backend
+/// callers, but all three kinds must be refused before dispatch. The gate is a
+/// real model (ty's), not this match.
 pub fn unsupported_mir_unknown(
     vc: &VerificationCondition,
     solver: impl Into<Symbol>,
     time_ms: u64,
 ) -> Option<VerificationResult> {
-    if let VcKind::UnsupportedMir { kind, detail } = &vc.kind {
-        let classification = unsupported_mir_classification(kind, detail)
-            .map(|classification| format!(" [{classification}]"))
-            .unwrap_or_default();
-        Some(VerificationResult::Unknown {
+    match &vc.kind {
+        VcKind::UnsupportedMir { kind, detail } => {
+            let classification = unsupported_mir_classification(kind, detail)
+                .map(|classification| format!(" [{classification}]"))
+                .unwrap_or_default();
+            Some(VerificationResult::Unknown {
+                solver: solver.into(),
+                time_ms,
+                reason: trust_types::determinism::StopCause::Unsupported.stamp(&format!(
+                    "unsupported MIR {kind}{classification} preserved in TrustIr: {detail}"
+                )),
+            })
+        }
+        VcKind::DataRace { .. } => Some(VerificationResult::Unknown {
             solver: solver.into(),
             time_ms,
-            reason: format!(
-                "unsupported MIR {kind}{classification} preserved in TrustIr: {detail}"
+            reason: trust_types::determinism::StopCause::Unsupported.stamp(
+                "data-race VC unsupported: location alias, runtime-thread, and happens-before \
+                 event identities are unauthenticated",
             ),
-        })
-    } else {
-        None
+        }),
+        VcKind::InsufficientOrdering { .. } => Some(VerificationResult::Unknown {
+            solver: solver.into(),
+            time_ms,
+            reason: trust_types::determinism::StopCause::Unsupported
+                .stamp(MEMORY_ORDERING_UNSUPPORTED_REASON),
+        }),
+        _ => None,
     }
+}
+
+/// Fail-closed reason for every `InsufficientOrdering` row (v6/D2).
+pub(crate) const MEMORY_ORDERING_UNSUPPORTED_REASON: &str =
+    "memory-ordering VC unsupported (v6/D2): no execution or memory model backs its formula";
+
+/// v6/D2 concurrency kinds that carry no execution or memory model. They are
+/// refused before dispatch and any externally supplied verdict is downgraded.
+pub(crate) fn is_unmodeled_concurrency_kind(kind: &VcKind) -> bool {
+    matches!(kind, VcKind::DataRace { .. } | VcKind::InsufficientOrdering { .. })
 }
 
 fn unsupported_mir_classification(kind: &str, detail: &str) -> Option<&'static str> {
@@ -159,7 +192,8 @@ pub(crate) fn panic_unknown(
     VerificationResult::Unknown {
         solver: solver.into(),
         time_ms,
-        reason: format!("{context} panicked; failing closed"),
+        reason: trust_types::determinism::StopCause::SolverFault
+            .stamp(&format!("{context} panicked; failing closed")),
     }
 }
 

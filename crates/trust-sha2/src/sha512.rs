@@ -242,8 +242,9 @@ impl Core512 {
 /// Serialize the state words big-endian (§6.4.2 step 4).
 fn state_to_bytes(h: &[u64; 8]) -> [u8; 64] {
     let mut out = [0u8; 64];
-    for (chunk, word) in out.chunks_exact_mut(8).zip(h.iter()) {
-        chunk.copy_from_slice(&word.to_be_bytes());
+    // 64 = 8 * 8, so the remainder is empty and every word has its own chunk.
+    for (chunk, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(h) {
+        *chunk = word.to_be_bytes();
     }
     out
 }

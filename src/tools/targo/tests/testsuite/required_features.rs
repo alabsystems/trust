@@ -295,7 +295,7 @@ fn test_default_features() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] tests/foo.rs (target/debug/deps/foo-[HASH][EXE])
+[RUNNING] tests/foo.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -320,7 +320,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     p.cargo("test --test=foo")
         .with_stderr_data(str![[r#"
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] tests/foo.rs (target/debug/deps/foo-[HASH][EXE])
+[RUNNING] tests/foo.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -371,7 +371,7 @@ fn test_arg_features() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] tests/foo.rs (target/debug/deps/foo-[HASH][EXE])
+[RUNNING] tests/foo.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -421,7 +421,7 @@ fn test_multiple_required_features() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] tests/foo_2.rs (target/debug/deps/foo_2-[HASH][EXE])
+[RUNNING] tests/foo_2.rs (target/debug/build/foo/[HASH]/out/foo_2-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -439,8 +439,8 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] tests/foo_1.rs (target/debug/deps/foo_1-[HASH][EXE])
-[RUNNING] tests/foo_2.rs (target/debug/deps/foo_2-[HASH][EXE])
+[RUNNING] tests/foo_1.rs (target/debug/build/foo/[HASH]/out/foo_1-[HASH][EXE])
+[RUNNING] tests/foo_2.rs (target/debug/build/foo/[HASH]/out/foo_2-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -507,7 +507,7 @@ fn bench_default_features() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
-[RUNNING] benches/foo.rs (target/release/deps/foo-[HASH][EXE])
+[RUNNING] benches/foo.rs (target/release/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -532,7 +532,7 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 1 measured; 0 filtered out; fini
     p.cargo("bench --bench=foo")
         .with_stderr_data(str![[r#"
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
-[RUNNING] benches/foo.rs (target/release/deps/foo-[HASH][EXE])
+[RUNNING] benches/foo.rs (target/release/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -593,7 +593,7 @@ fn bench_arg_features() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
-[RUNNING] benches/foo.rs (target/release/deps/foo-[HASH][EXE])
+[RUNNING] benches/foo.rs (target/release/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -663,7 +663,7 @@ fn bench_multiple_required_features() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
-[RUNNING] benches/foo_2.rs (target/release/deps/foo_2-[HASH][EXE])
+[RUNNING] benches/foo_2.rs (target/release/build/foo/[HASH]/out/foo_2-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -681,8 +681,8 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 1 measured; 0 filtered out; fini
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
-[RUNNING] benches/foo_1.rs (target/release/deps/foo_1-[HASH][EXE])
-[RUNNING] benches/foo_2.rs (target/release/deps/foo_2-[HASH][EXE])
+[RUNNING] benches/foo_1.rs (target/release/build/foo/[HASH]/out/foo_1-[HASH][EXE])
+[RUNNING] benches/foo_2.rs (target/release/build/foo/[HASH]/out/foo_2-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -861,6 +861,9 @@ fn install_multiple_required_features() {
                 name = "foo_4"
                 path = "src/foo_4.rs"
                 required-features = ["a"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/foo_1.rs", "fn main() {}")
@@ -1036,7 +1039,7 @@ fn dep_feature_in_toml() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] tests/foo.rs (target/debug/deps/foo-[HASH][EXE])
+[RUNNING] tests/foo.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -1057,7 +1060,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 [COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
-[RUNNING] benches/foo.rs (target/release/deps/foo-[HASH][EXE])
+[RUNNING] benches/foo.rs (target/release/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
             .with_stdout_data(str![[r#"
@@ -1153,7 +1156,7 @@ fn dep_feature_in_cmd_line() {
     // This is a no-op
     p.cargo("build")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1203,7 +1206,7 @@ Consider enabling them by passing, e.g., `--features="bar/a"`
 [COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] tests/foo.rs (target/debug/deps/foo-[HASH][EXE])
+[RUNNING] tests/foo.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -1232,7 +1235,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 [COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
-[RUNNING] benches/foo.rs (target/release/deps/foo-[HASH][EXE])
+[RUNNING] benches/foo.rs (target/release/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
             .with_stdout_data(str![[r#"
@@ -1251,7 +1254,7 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 1 measured; 0 filtered out; fini
     p.cargo("install --path .")
         .with_stderr_data(str![[r#"
 [INSTALLING] foo v0.0.1 ([ROOT]/foo)
-[LOCKING] 1 package to latest compatible version
+[WARNING] invalid feature `bar/a` in required-features of target `foo`: dependency `bar` does not exist
 [FINISHED] `release` profile [optimized] target(s) in [ELAPSED]s
 [WARNING] none of the package's binaries are available for install using the selected features
   bin "foo" requires the features: `bar/a`
@@ -1286,6 +1289,9 @@ fn test_skips_compiling_bin_with_missing_required_features() {
                 name = "bin_foo"
                 path = "src/bin/foo.rs"
                 required-features = ["a"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/bin/foo.rs", "extern crate bar; fn main() {}")
@@ -1297,7 +1303,7 @@ fn test_skips_compiling_bin_with_missing_required_features() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] tests/foo.rs (target/debug/deps/foo-[HASH][EXE])
+[RUNNING] tests/foo.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
         .with_stdout_data(str![[r#"
@@ -1324,7 +1330,7 @@ error[E0463]: can't find crate for `bar`
             .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
-[RUNNING] benches/foo.rs (target/release/deps/foo-[HASH][EXE])
+[RUNNING] benches/foo.rs (target/release/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
             .with_stdout_data(str![[r#"
@@ -1511,7 +1517,7 @@ fn renamed_required_features() {
     p.cargo("run")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [ERROR] target `x` in package `foo` requires the features: `a1/f1`
 Consider enabling them by passing, e.g., `--features="a1/f1"`
 

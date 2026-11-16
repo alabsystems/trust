@@ -425,9 +425,9 @@ fn compile_smoke(sysroot: &Path, cwd: &Path) -> Result<()> {
         );
     };
     if outcomes.is_empty()
-        || outcomes
-            .iter()
-            .any(|row| !row.outcome.is_proved() || !row.has_obligation_id || !row.has_location)
+        || outcomes.iter().any(|row| {
+            !row.credited_outcome().is_proved() || !row.has_obligation_id || !row.has_location
+        })
     {
         bail!(
             "standalone smoke verification was vacuous, non-proof, or lacked stable obligation IDs/source locations: {outcomes:?}"

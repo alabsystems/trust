@@ -125,6 +125,7 @@ fn guarded_fn(expected: bool, bb1_stmts: Vec<Statement>) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

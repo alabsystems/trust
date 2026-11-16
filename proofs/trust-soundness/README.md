@@ -9,9 +9,15 @@ false-proofs found by hand into a class that cannot exist by construction.
 
 They are *Trust's* soundness proofs. Keeping the canonical copy here makes them:
 - **reproducible from a Trust checkout** (no dependency on a separate `~/clean` working clone), and
-- **re-verified on every `cargo test`** by the ouroboros gate
-  (`crates/trust-integration-tests/tests/trust_soundness_ouroboros_gate.rs`), which shells out to the
-  `clean` binary Trust builds from the **pinned** `first-party/clean` submodule.
+- **kernel-checked in process on every test run** by `lean_front_door_gate`
+  (`crates/trust-integration-tests/tests/lean_front_door_gate.rs`, harness row
+  `fast.lean-front-door-gate`), through the Clean kernel linked into the test binary at the
+  **pinned** `first-party/clean` revision, and
+- **cross-checked against a `clean` binary built from that pin** by the ouroboros gate
+  (`crates/trust-integration-tests/tests/trust_soundness_ouroboros_gate.rs`). That gate is
+  `#[ignore]`d: it runs only under `slow.clean-binary-proof-gates`, which builds `clean` from the
+  submodule and names it in `TRUST_CLEAN_BIN`. Selected without the variable, it panics with the
+  build recipe; a plain `targo --unverified test` reports it ignored and runs nothing.
 
 The corpus currently contains 35 proof files. The ouroboros gate must
 kernel-check all 35 with the pinned `clean` before a current-checkout pass is
@@ -69,8 +75,21 @@ exact counts and no unknown-name diagnostics.
 ## Workflow
 
 Develop proofs against a full `clean` checkout (e.g. `~/clean`), then copy the `.lean` file here and
-confirm the gate stays green:
+confirm both gates stay green. The in-process check needs no binary:
 
 ```
-cargo test -p trust-integration-tests --test trust_soundness_ouroboros_gate -- --nocapture
+targo --unverified test --manifest-path crates/Cargo.toml -p trust-integration-tests \
+  --test lean_front_door_gate
 ```
+
+The binary cross-check needs a `clean` built from `first-party/clean` at its pin
+(`targo --unverified build --manifest-path first-party/clean/Cargo.toml -p clean --bin clean
+--release --locked`, or run the whole `slow.clean-binary-proof-gates` row):
+
+```
+TRUST_CLEAN_BIN=<clean built from first-party/clean> \
+  targo --unverified test --manifest-path crates/Cargo.toml -p trust-integration-tests \
+  --test trust_soundness_ouroboros_gate -- --ignored --nocapture
+```
+
+Without `--ignored` that second command runs no test and still exits 0; read its `1 passed`.

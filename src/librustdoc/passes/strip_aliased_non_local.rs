@@ -1,18 +1,16 @@
+//! Strips all non-local private aliases items from the output.
+
 use rustc_middle::ty::{TyCtxt, Visibility};
 
 use crate::clean;
 use crate::clean::Item;
 use crate::core::DocContext;
 use crate::fold::{DocFolder, strip_item};
-use crate::passes::Pass;
 
-pub(crate) const STRIP_ALIASED_NON_LOCAL: Pass = Pass {
-    name: "strip-aliased-non-local",
-    run: Some(strip_aliased_non_local),
-    description: "strips all non-local private aliased items from the output",
-};
-
-fn strip_aliased_non_local(krate: clean::Crate, cx: &mut DocContext<'_>) -> clean::Crate {
+pub(super) fn strip_aliased_non_local(
+    krate: clean::Crate,
+    cx: &mut DocContext<'_>,
+) -> clean::Crate {
     let mut stripper = AliasedNonLocalStripper { tcx: cx.tcx };
     stripper.fold_crate(krate)
 }
@@ -24,7 +22,7 @@ struct AliasedNonLocalStripper<'tcx> {
 impl DocFolder for AliasedNonLocalStripper<'_> {
     fn fold_item(&mut self, i: Item) -> Option<Item> {
         Some(match i.kind {
-            clean::TypeAliasItem(..) => {
+            clean::ItemKind::TypeAlias(..) => {
                 let mut stripper = NonLocalStripper { tcx: self.tcx };
                 // don't call `fold_item` as that could strip the type alias itself
                 // which we don't want to strip out

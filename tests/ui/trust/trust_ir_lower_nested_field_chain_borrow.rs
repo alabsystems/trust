@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-MD: `&mut b.a.x` — a DEPTH >= 2 all-struct field chain over a bare
 // struct local. Classified as its own `ReborrowTarget::FieldChainOfLocal`
 // (the depth-1 lane's gate ORDER is a probe surface per the FS2 standing

@@ -1,0 +1,78 @@
+{
+  "name": "ctl_ud64",
+  "def_path": "literal_pair_width_arms::ctl_ud64",
+  "span": {
+    "file": "literal_pair_width_arms.rs",
+    "line_start": 45,
+    "col_start": 0,
+    "line_end": 47,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Constant": {
+                      "Int": -9223372036854775808
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -1
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_pair_width_arms.rs",
+                "line_start": 46,
+                "col_start": 13,
+                "line_end": 46,
+                "col_end": 40
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,0 +1,35 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-model-prelude — the Beyond-TLA executable presentation (Clean source
+# text: `Trust.Temporal`, `Trust.FiniteModel` and the `Trust.Model.*` modules)
+# with its identity: `PRELUDE_DIGEST` over the source bytes,
+# `PRELUDE_TERM_DIGEST` over the elaborated prelude terms, `EP_VERSION` and
+# `EP_COMPLETE`. ty consumes it (ty design
+# `docs/design/beyond-tla/10-executable-semantics.md`, "Clean-core
+# conventions"); `trust-spec-temporal` kernel-checks the same files.
+#
+# NO NORMAL DEPENDENCIES, by design (B1A-D03): the crate breaks the cycle in
+# which `trust-spec-temporal` depends on `tla-check`, so a consumer links only
+# text and literals. The one dev-dependency is the Trust-owned SHA-256 the
+# source-digest test recomputes `PRELUDE_DIGEST` with (B1A-D65); third-party
+# `sha2` is dependency-policy-excluded (see `crates/trust-sha2/Cargo.toml`).
+
+[package]
+name = "trust-model-prelude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# NONE, by design. Read the header before adding one.
+
+[dev-dependencies]
+trust-sha2.workspace = true

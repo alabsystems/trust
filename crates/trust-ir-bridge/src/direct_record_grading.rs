@@ -35,9 +35,10 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{AssertMessage, BinOp, Formula, LocalDecl, Terminator, VerifiableFunction};
 
 use crate::direct_formula_dump::{
@@ -179,18 +180,17 @@ pub fn tally(reports: &[AssertReport]) -> Scorecard {
     card
 }
 
+#[inline]
+fn is_mir_temp(name: &str) -> bool {
+    name.strip_prefix('_')
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// `const-folded-operand` recognizer: the two ASTs are equal at every position
 /// EXCEPT positions where `ours` is a folded integer literal and `bridge` is a
 /// materialized MIR temp `Var("_N", Int)` — and at least one such position
 /// exists. Any other divergence disqualifies (stays Unclassified).
 fn const_folded_operand_only(ours: &Formula, bridge: &Formula) -> bool {
-    fn is_mir_temp(name: &str) -> bool {
-        let mut cs = name.chars();
-        cs.next() == Some('_') && {
-            let rest: String = cs.collect();
-            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
-        }
-    }
     fn walk(a: &Formula, b: &Formula, hits: &mut usize) -> bool {
         use trust_types::Sort;
         if a == b {
@@ -304,13 +304,6 @@ fn literal_range_width_only(ours: &Formula, bridge: &Formula) -> bool {
 /// such position must exist. Any other divergence disqualifies (stays
 /// Unclassified).
 fn let_bound_checked_intermediate_only(ours: &Formula, bridge: &Formula) -> bool {
-    fn is_mir_temp(name: &str) -> bool {
-        let mut cs = name.chars();
-        cs.next() == Some('_') && {
-            let rest: String = cs.collect();
-            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
-        }
-    }
     fn is_leaf(f: &Formula) -> bool {
         matches!(f, Formula::Var(..) | Formula::Int(_) | Formula::UInt(_))
     }
@@ -373,10 +366,7 @@ pub fn print_scorecard(label: &str, card: &Scorecard, total: usize) {
     );
     println!("   version-stripped-only: {}", card.version_stripped_only);
     println!("   mint-declined: {:?}", card.mint_declined);
-    println!(
-        "   bridge-declined: {}  both-declined: {}",
-        card.bridge_declined, card.both_declined
-    );
+    println!("   bridge-declined: {}  both-declined: {}", card.bridge_declined, card.both_declined);
     println!(
         "   known-mismatch shadowed-param-name: {} const-folded-operand: {} \
          literal-range-width: {} let-bound-checked-intermediate: {}",
@@ -419,7 +409,12 @@ pub const fn class_label(msg: &AssertMessage) -> &'static str {
 pub fn slug_for_assert_message(msg: &AssertMessage) -> Option<&'static str> {
     Some(match msg {
         AssertMessage::Overflow(
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Shl
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::Shl
             | BinOp::Shr,
         ) => "overflow",
         AssertMessage::OverflowNeg => "overflow_neg",
@@ -497,12 +492,8 @@ pub(crate) fn grade_pair(
             (SafetyPredicate::Reconstructed(_), Err(code)) => {
                 (Grade::MintDeclined(code), String::new())
             }
-            (SafetyPredicate::NotReconstructed(_), Ok(_)) => {
-                (Grade::BridgeDeclined, String::new())
-            }
-            (SafetyPredicate::NotReconstructed(_), Err(_)) => {
-                (Grade::BothDeclined, String::new())
-            }
+            (SafetyPredicate::NotReconstructed(_), Ok(_)) => (Grade::BridgeDeclined, String::new()),
+            (SafetyPredicate::NotReconstructed(_), Err(_)) => (Grade::BothDeclined, String::new()),
         }),
         DirectSide::RealDumped { formula_raw, smtlib, withheld_reason, not_minted } => {
             if not_minted {
@@ -525,9 +516,7 @@ pub(crate) fn grade_pair(
                     SafetyPredicate::Reconstructed(_) => {
                         (Grade::MintDeclined(stable), String::new())
                     }
-                    SafetyPredicate::NotReconstructed(_) => {
-                        (Grade::BothDeclined, String::new())
-                    }
+                    SafetyPredicate::NotReconstructed(_) => (Grade::BothDeclined, String::new()),
                 });
             }
             let (Some(raw), Some(smt)) = (formula_raw, smtlib) else {
@@ -538,9 +527,7 @@ pub(crate) fn grade_pair(
                 );
             };
             match bridge {
-                SafetyPredicate::NotReconstructed(_) => {
-                    Ok((Grade::BridgeDeclined, String::new()))
-                }
+                SafetyPredicate::NotReconstructed(_) => Ok((Grade::BridgeDeclined, String::new())),
                 SafetyPredicate::Reconstructed(bf) => {
                     let canonical = serde_json::to_string(bf)
                         .map_err(|e| format!("bridge formula failed to render: {e}"))?;
@@ -582,10 +569,7 @@ pub(crate) fn grade_pair(
                             } else if literal_range_width_only(&dumped, bf) {
                                 Ok((Grade::KnownMismatchLiteralRangeWidth, String::new()))
                             } else if let_bound_checked_intermediate_only(&dumped, bf) {
-                                Ok((
-                                    Grade::KnownMismatchLetBoundCheckedIntermediate,
-                                    String::new(),
-                                ))
+                                Ok((Grade::KnownMismatchLetBoundCheckedIntermediate, String::new()))
                             } else {
                                 Ok((
                                     Grade::Unclassified,
@@ -623,8 +607,7 @@ pub(crate) fn bridge_formula_names_a_shadowed_param(
     locals: &[LocalDecl],
     arg_count: usize,
 ) -> bool {
-    let mut shadowed = false;
-    formula.visit(&mut |node| {
+    trust_types::any_formula_node(formula, &mut |node| {
         let name = match node {
             Formula::Var(name, _) => Some(name.as_str()),
             Formula::SymVar(sym, _) => Some(sym.as_str()),
@@ -634,24 +617,18 @@ pub(crate) fn bridge_formula_names_a_shadowed_param(
             let base = bv_base_name(name);
             if let Some(index) =
                 base.strip_prefix('_').and_then(|digits| digits.parse::<usize>().ok())
+                && (1..=arg_count).contains(&index)
+                && let Some(decl_name) = locals
+                    .get(index)
+                    .filter(|d| d.index == index)
+                    .or_else(|| locals.iter().find(|d| d.index == index))
+                    .and_then(|d| d.name.as_deref())
             {
-                if (1..=arg_count).contains(&index) {
-                    if let Some(decl_name) = locals
-                        .iter()
-                        .find(|d| d.index == index)
-                        .and_then(|d| d.name.as_deref())
-                    {
-                        shadowed |= locals
-                            .iter()
-                            .filter(|d| d.name.as_deref() == Some(decl_name))
-                            .count()
-                            > 1;
-                    }
-                }
+                return locals.iter().filter(|d| d.name.as_deref() == Some(decl_name)).nth(1).is_some();
             }
         }
-    });
-    shadowed
+        false
+    })
 }
 
 /// Load a directory of `VerifiableFunction` json fixtures (the mir-only dump
@@ -721,7 +698,8 @@ pub fn grade_real_records(
     }
 
     // Duplicate dumped identity (assertion_id is the minted identity).
-    let mut seen_ids: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut seen_ids: FxHashSet<(&str, &str)> =
+        FxHashSet::with_capacity_and_hasher(records.len(), Default::default());
     for record in records {
         if !seen_ids.insert((record.krate.as_str(), record.assertion_id.as_str())) {
             errors.push(format!(
@@ -731,12 +709,16 @@ pub fn grade_real_records(
         }
     }
 
-    // Index records by (scope, slug, line, col) -> occ -> record index.
-    let mut index: BTreeMap<(String, String, u32, u32), BTreeMap<u32, usize>> = BTreeMap::new();
+    // Index records by scope -> (slug, line, col) -> occ -> record index.
+    let mut index: FxHashMap<String, FxHashMap<(&str, u32, u32), FxHashMap<u32, usize>>> =
+        FxHashMap::default();
     for (i, record) in records.iter().enumerate() {
         let scope = format!("{}::{}", record.krate, record.def_path);
-        let group =
-            index.entry((scope, record.slug.clone(), record.line, record.col)).or_default();
+        let group = index
+            .entry(scope)
+            .or_default()
+            .entry((record.slug.as_str(), record.line, record.col))
+            .or_default();
         if group.insert(record.occ, i).is_some() {
             errors.push(format!(
                 "duplicate dumped identity: two records at ({}::{}, {}, L{}C{}, o{})",
@@ -760,13 +742,11 @@ pub fn grade_real_records(
     }
 
     let mut reports: Vec<AssertReport> = Vec::new();
-    let mut consumed: BTreeSet<usize> = BTreeSet::new();
+    let mut consumed: Vec<bool> = vec![false; records.len()];
 
     for (scope, (fixture_name, func)) in &by_scope {
         let locals = &func.body.locals;
         let arg_count = func.body.arg_count;
-        // MIR-side ordinals at SLUG granularity, block order.
-        let mut occ_counters: BTreeMap<(&'static str, u32, u32), u32> = BTreeMap::new();
         // (slug, line, col) -> asserts in emission order.
         let mut groups: BTreeMap<(&'static str, u32, u32), Vec<&trust_types::BasicBlock>> =
             BTreeMap::new();
@@ -774,14 +754,12 @@ pub fn grade_real_records(
             let Terminator::Assert { msg, span, .. } = &block.terminator else { continue };
             let Some(slug) = slug_for_assert_message(msg) else { continue };
             let key = (slug, span.line_start, span.col_start);
-            let counter = occ_counters.entry(key).or_insert(0);
-            *counter += 1;
             groups.entry(key).or_default().push(block);
         }
 
+        let by_site = index.get(*scope);
         for ((slug, line, col), asserts) in groups {
-            let record_group =
-                index.get(&((*scope).to_string(), slug.to_string(), line, col));
+            let record_group = by_site.and_then(|site_map| site_map.get(&(slug, line, col)));
             let Some(record_group) = record_group else {
                 for block in &asserts {
                     let Terminator::Assert { msg, .. } = &block.terminator else { continue };
@@ -794,7 +772,9 @@ pub fn grade_real_records(
                 }
                 continue;
             };
-            consumed.extend(record_group.values());
+            for &record_idx in record_group.values() {
+                consumed[record_idx] = true;
+            }
             if record_group.len() != asserts.len() {
                 errors.push(format!(
                     "collision-group size mismatch at ({scope}, {slug}, L{line}C{col}): \
@@ -861,16 +841,15 @@ pub fn grade_real_records(
                         grade,
                         detail,
                     }),
-                    Err(refusal) => errors.push(format!(
-                        "({scope}, {slug}, L{line}C{col}, o{mir_occ}): {refusal}"
-                    )),
+                    Err(refusal) => errors
+                        .push(format!("({scope}, {slug}, L{line}C{col}, o{mir_occ}): {refusal}")),
                 }
             }
         }
     }
 
     for (i, record) in records.iter().enumerate() {
-        if !consumed.contains(&i) {
+        if !consumed[i] {
             errors.push(format!(
                 "unpaired dumped record: ({}::{}, {}, L{}C{}, o{}) matches no MIR assert in \
                  the corpus",
@@ -960,6 +939,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1002,10 +982,8 @@ mod tests {
     #[test]
     fn a_verbatim_minted_record_grades_byte_identical() {
         let minted = minted_add();
-        let rows = vec![dump_record(DumpedOutcome::minted_verbatim(
-            &minted.formula_json,
-            &minted.smtlib,
-        ))];
+        let rows =
+            vec![dump_record(DumpedOutcome::minted_verbatim(&minted.formula_json, &minted.smtlib))];
         let dir = std::env::temp_dir()
             .join(format!("direct-grading-{}-byte-identical", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1049,12 +1027,9 @@ mod tests {
         let text =
             crate::direct_formula_dump::render_direct_formula_dump("realcrate", &rows).unwrap();
         let records = parse_direct_formula_dump(&text).expect("parse");
-        let errs = grade_real_records(&records, &corpus())
-            .expect_err("non-canonical bytes must refuse");
-        assert!(
-            errs.iter().any(|e| e.contains("non-canonical-formula-bytes")),
-            "{errs:?}"
-        );
+        let errs =
+            grade_real_records(&records, &corpus()).expect_err("non-canonical bytes must refuse");
+        assert!(errs.iter().any(|e| e.contains("non-canonical-formula-bytes")), "{errs:?}");
     }
 
     /// The fail-closed pairing errors: unpaired record, collision-group size
@@ -1069,19 +1044,17 @@ mod tests {
         let mut foreign = dump_record(DumpedOutcome::NotMinted(true));
         foreign.def_path = "nosuch".to_string();
         foreign.assertion_id = "realcrate::nosuch#L3C8#overflow#o0".to_string();
-        let errs = grade_real_records(&[foreign], &corpus())
-            .expect_err("unpaired record must refuse");
+        let errs =
+            grade_real_records(&[foreign], &corpus()).expect_err("unpaired record must refuse");
         assert!(errs.iter().any(|e| e.contains("unpaired dumped record")), "{errs:?}");
 
         // Two records for a one-assert group: collision-group size mismatch.
         let mut second = dump_record(DumpedOutcome::NotMinted(true));
         second.occ = 1;
         second.assertion_id = "realcrate::f#L3C8#overflow#o1".to_string();
-        let errs = grade_real_records(
-            &[dump_record(DumpedOutcome::NotMinted(true)), second],
-            &corpus(),
-        )
-        .expect_err("size mismatch must refuse");
+        let errs =
+            grade_real_records(&[dump_record(DumpedOutcome::NotMinted(true)), second], &corpus())
+                .expect_err("size mismatch must refuse");
         assert!(errs.iter().any(|e| e.contains("collision-group size mismatch")), "{errs:?}");
 
         // Duplicate identity.
@@ -1124,23 +1097,17 @@ mod tests {
         // The exact measured shape (p06 `first`): dumped folds the const index,
         // the bridge names the materialized temp.
         let dumped = Formula::Ge(Box::new(Formula::Int(0)), Box::new(Formula::Int(4)));
-        let bridge = Formula::Ge(
-            Box::new(Formula::Var("_2".into(), Sort::Int)),
-            Box::new(Formula::Int(4)),
-        );
+        let bridge =
+            Formula::Ge(Box::new(Formula::Var("_2".into(), Sort::Int)), Box::new(Formula::Int(4)));
         assert!(const_folded_operand_only(&dumped, &bridge));
         // NEGATIVE 1: the var is a PARAM name, not a MIR temp — a param-vs-const
         // divergence is a real disagreement, never this class.
-        let bridge_param = Formula::Ge(
-            Box::new(Formula::Var("i".into(), Sort::Int)),
-            Box::new(Formula::Int(4)),
-        );
+        let bridge_param =
+            Formula::Ge(Box::new(Formula::Var("i".into(), Sort::Int)), Box::new(Formula::Int(4)));
         assert!(!const_folded_operand_only(&dumped, &bridge_param));
         // NEGATIVE 2: any OTHER divergence alongside the fold disqualifies.
-        let bridge_other_len = Formula::Ge(
-            Box::new(Formula::Var("_2".into(), Sort::Int)),
-            Box::new(Formula::Int(5)),
-        );
+        let bridge_other_len =
+            Formula::Ge(Box::new(Formula::Var("_2".into(), Sort::Int)), Box::new(Formula::Int(5)));
         assert!(!const_folded_operand_only(&dumped, &bridge_other_len));
         // NEGATIVE 3: identical formulas are NOT this class (hits == 0).
         assert!(!const_folded_operand_only(&bridge, &bridge));
@@ -1162,10 +1129,8 @@ mod tests {
             ])
         };
         let dumped = Formula::And(vec![clamp(-0x8000_0000, 0x7fff_ffff), core.clone()]);
-        let bridge = Formula::And(vec![
-            clamp(-0x8000_0000_0000_0000, 0x7fff_ffff_ffff_ffff),
-            core.clone(),
-        ]);
+        let bridge =
+            Formula::And(vec![clamp(-0x8000_0000_0000_0000, 0x7fff_ffff_ffff_ffff), core.clone()]);
         assert!(literal_range_width_only(&dumped, &bridge));
         // NEGATIVE 1: a bound that is NOT a type extreme is a real disagreement.
         let bridge_weird = Formula::And(vec![clamp(-12345, 0x7fff_ffff_ffff_ffff), core.clone()]);
@@ -1199,19 +1164,22 @@ mod tests {
         assert!(let_bound_checked_intermediate_only(&dumped, &bridge));
         // CONSISTENCY across positions: the same name must map to the same
         // composed term everywhere.
-        let dumped2 = Formula::And(vec![dumped.clone(), Formula::Lt(
-            Box::new(var("s")),
-            Box::new(Formula::Int(0)),
-        )]);
-        let bridge2 = Formula::And(vec![bridge.clone(), Formula::Lt(
-            Box::new(composed.clone()),
-            Box::new(Formula::Int(0)),
-        )]);
+        let dumped2 = Formula::And(vec![
+            dumped.clone(),
+            Formula::Lt(Box::new(var("s")), Box::new(Formula::Int(0))),
+        ]);
+        let bridge2 = Formula::And(vec![
+            bridge.clone(),
+            Formula::Lt(Box::new(composed.clone()), Box::new(Formula::Int(0))),
+        ]);
         assert!(let_bound_checked_intermediate_only(&dumped2, &bridge2));
-        let bridge2_skewed = Formula::And(vec![bridge.clone(), Formula::Lt(
-            Box::new(Formula::Sub(Box::new(var("a")), Box::new(var("b")))),
-            Box::new(Formula::Int(0)),
-        )]);
+        let bridge2_skewed = Formula::And(vec![
+            bridge.clone(),
+            Formula::Lt(
+                Box::new(Formula::Sub(Box::new(var("a")), Box::new(var("b")))),
+                Box::new(Formula::Int(0)),
+            ),
+        ]);
         assert!(
             !let_bound_checked_intermediate_only(&dumped2, &bridge2_skewed),
             "one name mapping to two different composed terms is a REAL disagreement"
@@ -1244,22 +1212,29 @@ mod tests {
         assert!(!let_bound_checked_intermediate_only(&dumped, &bridge_other));
     }
 
+    /// Env-keyed driver: grades real direct-formula records against a MIR
+    /// corpus. `#[ignore]`d, and it panics when either input is unset, so a bare
+    /// `--ignored` run cannot pass having graded nothing.
     #[test]
+    #[ignore = "measurement driver: set TRUST_DIRECT_RECORDS_JSONL and \
+                TRUST_DIRECT_MIR_CORPUS and run with --ignored --nocapture"]
     fn grade_real_records_env_driver() {
+        const RECIPE: &str = "TRUST_DIRECT_RECORDS_JSONL=<a *.direct-formulas.jsonl written \
+             under TRUST_DIRECT_FORMULA_DUMP> TRUST_DIRECT_MIR_CORPUS=<dir of \
+             VerifiableFunction json> targo --unverified test --manifest-path crates/Cargo.toml \
+             -p trust-ir-bridge --lib -- --ignored --exact \
+             direct_record_grading::tests::grade_real_records_env_driver --nocapture";
         let Some(records_path) = std::env::var_os("TRUST_DIRECT_RECORDS_JSONL") else {
-            eprintln!(
-                "SKIPPED (loudly): TRUST_DIRECT_RECORDS_JSONL unset — set it to a \
-                 *.direct-formulas.jsonl written under TRUST_DIRECT_FORMULA_DUMP, and \
-                 TRUST_DIRECT_MIR_CORPUS to a dir of VerifiableFunction json, to grade \
-                 real records"
+            panic!(
+                "grade_real_records_env_driver is a measurement driver and \
+                 TRUST_DIRECT_RECORDS_JSONL is unset, so it graded nothing. Run: {RECIPE}"
             );
-            println!("SKIPPED (loudly): TRUST_DIRECT_RECORDS_JSONL unset");
-            return;
         };
         let Some(corpus_dir) = std::env::var_os("TRUST_DIRECT_MIR_CORPUS") else {
-            eprintln!("SKIPPED (loudly): TRUST_DIRECT_MIR_CORPUS unset");
-            println!("SKIPPED (loudly): TRUST_DIRECT_MIR_CORPUS unset");
-            return;
+            panic!(
+                "grade_real_records_env_driver: TRUST_DIRECT_MIR_CORPUS is unset, so it \
+                 graded nothing. Run: {RECIPE}"
+            );
         };
         let text = std::fs::read_to_string(PathBuf::from(&records_path))
             .expect("TRUST_DIRECT_RECORDS_JSONL must be readable");

@@ -49,6 +49,12 @@ pub fn generate_refinement_vcs(
     target: &VerifiableFunction,
     relation: &SimulationRelation,
 ) -> Result<Vec<RefinementVc>, TranslationValidationError> {
+    // Even identical images have no modeled value semantics yet. Check both
+    // complete bodies before relation validation, expression overrides, or
+    // dead-assignment elimination can hide an unsupported constant.
+    reject_memory_images(source)?;
+    reject_memory_images(target)?;
+
     // Validate inputs.
     if source.body.blocks.is_empty() {
         return Err(TranslationValidationError::EmptyBody(source.name.clone()));
@@ -65,16 +71,19 @@ pub fn generate_refinement_vcs(
 
     relation.validate(source, target)?;
 
+    let target_blocks: FxHashMap<BlockId, &BasicBlock> =
+        target.body.blocks.iter().map(|bb| (bb.id, bb)).collect();
+
     let mut vcs = Vec::new();
 
     // 1. Control flow preservation.
-    vcs.extend(check_control_flow_preservation(source, target, relation)?);
+    vcs.extend(check_control_flow_preservation_with_map(source, target, relation, &target_blocks)?);
 
     // 2. Data flow preservation.
-    vcs.extend(check_data_flow_preservation(source, target, relation)?);
+    vcs.extend(check_data_flow_preservation_with_map(source, target, relation, &target_blocks)?);
 
     // 3. Return value preservation.
-    vcs.extend(check_return_value_preservation(source, target, relation)?);
+    vcs.extend(check_return_value_preservation_with_map(source, target, relation, &target_blocks)?);
 
     // 4. Termination preservation.
     vcs.extend(check_termination_preservation(source, target, relation)?);
@@ -87,14 +96,24 @@ pub fn generate_refinement_vcs(
 /// For each source block that has a conditional terminator, verify that the
 /// target's corresponding block branches to the corresponding target of each
 /// source successor.
+#[cfg(test)]
 pub(crate) fn check_control_flow_preservation(
     source: &VerifiableFunction,
     target: &VerifiableFunction,
     relation: &SimulationRelation,
 ) -> Result<Vec<RefinementVc>, TranslationValidationError> {
-    let mut vcs = Vec::new();
     let target_blocks: FxHashMap<BlockId, &BasicBlock> =
         target.body.blocks.iter().map(|bb| (bb.id, bb)).collect();
+    check_control_flow_preservation_with_map(source, target, relation, &target_blocks)
+}
+
+fn check_control_flow_preservation_with_map(
+    source: &VerifiableFunction,
+    target: &VerifiableFunction,
+    relation: &SimulationRelation,
+    target_blocks: &FxHashMap<BlockId, &BasicBlock>,
+) -> Result<Vec<RefinementVc>, TranslationValidationError> {
+    let mut vcs = Vec::new();
 
     for source_block in &source.body.blocks {
         let source_succs = trust_types::block_successors_list(&source_block.terminator);
@@ -157,14 +176,24 @@ pub(crate) fn check_control_flow_preservation(
 ///
 /// For each assignment in a source block, verify that the corresponding target
 /// block computes an equivalent value for the mapped variable.
+#[cfg(test)]
 pub(crate) fn check_data_flow_preservation(
     source: &VerifiableFunction,
     target: &VerifiableFunction,
     relation: &SimulationRelation,
 ) -> Result<Vec<RefinementVc>, TranslationValidationError> {
-    let mut vcs = Vec::new();
     let target_blocks: FxHashMap<BlockId, &BasicBlock> =
         target.body.blocks.iter().map(|bb| (bb.id, bb)).collect();
+    check_data_flow_preservation_with_map(source, target, relation, &target_blocks)
+}
+
+fn check_data_flow_preservation_with_map(
+    source: &VerifiableFunction,
+    target: &VerifiableFunction,
+    relation: &SimulationRelation,
+    target_blocks: &FxHashMap<BlockId, &BasicBlock>,
+) -> Result<Vec<RefinementVc>, TranslationValidationError> {
+    let mut vcs = Vec::new();
 
     for source_block in &source.body.blocks {
         let target_block_id = relation
@@ -259,14 +288,24 @@ pub(crate) fn check_data_flow_preservation(
 /// For each Return terminator in the source, verify that the target's
 /// corresponding block also returns and that _0 (the return local) holds
 /// an equivalent value.
+#[cfg(test)]
 pub(crate) fn check_return_value_preservation(
     source: &VerifiableFunction,
     target: &VerifiableFunction,
     relation: &SimulationRelation,
 ) -> Result<Vec<RefinementVc>, TranslationValidationError> {
-    let mut vcs = Vec::new();
     let target_blocks: FxHashMap<BlockId, &BasicBlock> =
         target.body.blocks.iter().map(|bb| (bb.id, bb)).collect();
+    check_return_value_preservation_with_map(source, target, relation, &target_blocks)
+}
+
+fn check_return_value_preservation_with_map(
+    source: &VerifiableFunction,
+    target: &VerifiableFunction,
+    relation: &SimulationRelation,
+    target_blocks: &FxHashMap<BlockId, &BasicBlock>,
+) -> Result<Vec<RefinementVc>, TranslationValidationError> {
+    let mut vcs = Vec::new();
 
     for source_block in &source.body.blocks {
         if !matches!(source_block.terminator, Terminator::Return) {
@@ -414,9 +453,24 @@ pub(crate) fn check_termination_preservation(
 
 // --- Internal helpers ---
 
+pub(crate) fn reject_memory_images(
+    func: &VerifiableFunction,
+) -> Result<(), TranslationValidationError> {
+    if func.body.contains_memory_image() {
+        return Err(unsupported_mir(
+            "ConstValue::MemoryImage",
+            format!(
+                "{} contains a constant memory image without modeled value semantics",
+                func.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Convert an Rvalue to a Formula for comparison.
 ///
-/// Uses trust_vcgen helpers (`operand_to_formula`, `try_binop_to_formula`) for
+/// Uses trust_vcgen helpers (`try_operand_to_formula`, `try_binop_to_formula`) for
 /// consistent encoding with the rest of the verification pipeline.
 fn rvalue_to_formula(
     func: &VerifiableFunction,
@@ -496,9 +550,16 @@ fn operand_to_formula(
     operand: &Operand,
 ) -> Result<Formula, TranslationValidationError> {
     match operand {
-        Operand::Unsupported { kind, detail } => Err(unsupported_mir(kind.clone(), detail.clone())),
+        Operand::Unsupported { kind, detail, .. } => {
+            Err(unsupported_mir(kind.clone(), detail.clone()))
+        }
+        Operand::Constant(value) if value.contains_memory_image() => Err(unsupported_mir(
+            "ConstValue::MemoryImage",
+            "constant memory images have no modeled value semantics",
+        )),
         Operand::Copy(_) | Operand::Move(_) | Operand::Constant(_) | Operand::Symbolic(_) => {
-            Ok(trust_vcgen::operand_to_formula(func, operand))
+            trust_vcgen::try_operand_to_formula(func, operand)
+                .map_err(|error| unsupported_mir("Operand", error.to_string()))
         }
         _ => Err(unsupported_mir(
             "Operand::<unknown>",
@@ -533,24 +594,15 @@ fn rvalue_kind(rvalue: &Rvalue) -> &'static str {
 
 /// Convert a local variable to a formula.
 fn local_to_formula(func: &VerifiableFunction, local_idx: usize) -> Formula {
-    let name = func
-        .body
-        .locals
-        .get(local_idx)
-        .and_then(|d| d.name.as_deref())
-        .unwrap_or(&format!("_{}", local_idx))
-        .to_string();
+    let decl = func.body.locals.get(local_idx);
+    let name =
+        decl.and_then(|d| d.name.as_deref()).map_or_else(|| format!("_{local_idx}"), str::to_owned);
 
-    let sort = func
-        .body
-        .locals
-        .get(local_idx)
-        .map(|d| match &d.ty {
-            Ty::Bool => Sort::Bool,
-            Ty::Int { .. } => Sort::Int,
-            other => Sort::from_ty(other),
-        })
-        .unwrap_or(Sort::Int);
+    let sort = decl.map_or(Sort::Int, |d| match &d.ty {
+        Ty::Bool => Sort::Bool,
+        Ty::Int { .. } => Sort::Int,
+        other => Sort::from_ty(other),
+    });
 
     Formula::Var(name, sort)
 }
@@ -711,6 +763,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -754,7 +807,161 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
+    }
+
+    fn memory_image_function(value: ConstValue) -> VerifiableFunction {
+        unsupported_rvalue_function("memory_image", Rvalue::Use(Operand::Constant(value)))
+    }
+
+    // Synthetic transport fixture only: these tests establish refusal, not
+    // compiler extraction or executable semantics for the recorded storage.
+    fn memory_image_constant(byte: u8) -> ConstValue {
+        ConstValue::MemoryImage(Box::new(ConstantMemoryImage {
+            schema_version: 1,
+            owner: ConstantImageOwner {
+                def_path: "fixture".into(),
+                def_path_hash: CallableDefPathHash::new(1, 2),
+                mir_phase: "test".into(),
+            },
+            target: ConstantImageTarget {
+                triple: "test".into(),
+                data_layout: "e-p:64:64".into(),
+                pointer_size_bytes: 8,
+                little_endian: true,
+            },
+            ty: Ty::u8(),
+            ty_fingerprint: [1, 2],
+            layout: ConstantImageLayout { size_bytes: 1, align_bytes: 1 },
+            root: ConstantImageRoot::ScalarBits { bits: byte.into(), size_bytes: 1 },
+            nodes: Default::default(),
+        }))
+    }
+
+    fn assert_memory_image_refused(error: impl std::fmt::Display) {
+        assert!(error.to_string().contains("ConstValue::MemoryImage"), "{error}");
+    }
+
+    #[test]
+    fn memory_image_identical_distinct_and_one_sided_bodies_are_refused() {
+        let source = memory_image_function(memory_image_constant(1));
+        let same = source.clone();
+        let different = memory_image_function(memory_image_constant(2));
+        let plain = memory_image_function(ConstValue::Int(1));
+        for (source, target) in
+            [(&source, &same), (&source, &different), (&source, &plain), (&plain, &source)]
+        {
+            let relation = SimulationRelation::identity(source);
+            assert_memory_image_refused(
+                generate_refinement_vcs(source, target, &relation).unwrap_err(),
+            );
+            assert_memory_image_refused(
+                crate::RefinementChecker::new().check(source, target).unwrap_err(),
+            );
+            assert_memory_image_refused(
+                crate::RefinementChecker::new()
+                    .check_with_relation(source, target, &relation)
+                    .unwrap_err(),
+            );
+        }
+        // The preflight is specific to unsupported images, not all constants.
+        assert!(
+            generate_refinement_vcs(&plain, &plain, &SimulationRelation::identity(&plain)).is_ok()
+        );
+    }
+
+    #[test]
+    fn memory_image_nested_constant_and_checked_renderer_are_refused() {
+        let nested = ConstValue::struct_scalar_fields_ref(
+            "Outer",
+            vec![ConstValue::struct_scalar_fields_ref("Inner", vec![memory_image_constant(7)])],
+        );
+        let func = memory_image_function(nested.clone());
+        let plain = memory_image_function(ConstValue::Int(7));
+        for value in [memory_image_constant(7), nested] {
+            assert_memory_image_refused(
+                operand_to_formula(&plain, &Operand::Constant(value)).unwrap_err(),
+            );
+        }
+        assert_memory_image_refused(
+            generate_refinement_vcs(&func, &func, &SimulationRelation::identity(&func))
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn memory_image_target_is_refused_before_expression_override() {
+        let source = memory_image_function(ConstValue::Int(1));
+        let target = memory_image_function(memory_image_constant(1));
+        let mut relation = SimulationRelation::identity(&source);
+        relation.expression_map.insert(3, Formula::Int(1));
+        assert_memory_image_refused(
+            generate_refinement_vcs(&source, &target, &relation).unwrap_err(),
+        );
+        for (source, target) in [(&source, &target), (&target, &source)] {
+            let builder =
+                crate::SimulationRelationBuilder::new().with_expression(3, Formula::Int(1));
+            assert_memory_image_refused(builder.build_from_functions(source, target).unwrap_err());
+            assert_memory_image_refused(builder.build_by_name(source, target).unwrap_err());
+        }
+    }
+
+    #[test]
+    fn memory_image_dead_assignment_and_empty_relation_cannot_skip_refusal() {
+        let mut source = memory_image_function(memory_image_constant(1));
+        // The image is assigned to _3, which is never read. Only a scalar is
+        // returned; the target omits the assignment completely.
+        source.body.blocks[0].stmts[1] = Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(0))),
+            span: SourceSpan::default(),
+        };
+        let mut target = source.clone();
+        target.body.blocks[0].stmts.remove(0);
+        assert_memory_image_refused(
+            generate_refinement_vcs(&source, &target, &SimulationRelation::identity(&source))
+                .unwrap_err(),
+        );
+        let empty_relation = SimulationRelation {
+            block_map: Default::default(),
+            variable_map: Default::default(),
+            expression_map: Default::default(),
+        };
+        assert_memory_image_refused(
+            generate_refinement_vcs(&source, &target, &empty_relation).unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn memory_image_terminator_and_solver_entry_points_are_refused() {
+        let mut func = memory_image_function(ConstValue::Int(1));
+        func.body.blocks[0].terminator = Terminator::SwitchInt {
+            discr: Operand::Constant(memory_image_constant(1)),
+            targets: vec![(0, BlockId(0))],
+            otherwise: BlockId(0),
+            exhaustive_enum_unreachable: false,
+            span: SourceSpan::default(),
+        };
+        let validator = crate::TranslationValidator::new();
+        assert_memory_image_refused(validator.validate_refinement(&func, &func).unwrap_err());
+        assert_memory_image_refused(
+            validator.validate_block_pair(&func, &func, BlockId(0), BlockId(0)).unwrap_err(),
+        );
+        assert_memory_image_refused(
+            validator.check_property(&func, &Formula::Bool(true)).unwrap_err(),
+        );
+        assert_memory_image_refused(
+            crate::EquivalenceVcGenerator::new()
+                .generate_for_block_pair(
+                    &func,
+                    &func,
+                    &SimulationRelation::identity(&func),
+                    BlockId(0),
+                    BlockId(0),
+                )
+                .unwrap_err(),
+        );
     }
 
     fn assert_unsupported_rvalue_fails_closed(rvalue: Rvalue, expected_kind: &str) {
@@ -956,10 +1163,7 @@ mod tests {
     #[test]
     fn unsupported_operand_does_not_prove_equivalence() {
         assert_unsupported_rvalue_fails_closed(
-            Rvalue::Use(Operand::Unsupported {
-                kind: "Operand::Opaque".into(),
-                detail: "opaque test operand".into(),
-            }),
+            Rvalue::Use(Operand::unsupported("Operand::Opaque", "opaque test operand")),
             "Operand::Opaque",
         );
     }

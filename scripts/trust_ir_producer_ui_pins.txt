@@ -96,6 +96,46 @@
 # left to the owner rather than taken here.
 
 [excluded]
+# 2026-09-18: introduction-history audit classifies 20 campaign regressions
+# added on 2026-09-14 through 2026-09-17, after the 2026-07-01 baseline.
+# Existing memberships and content filters are unchanged. These tests remain
+# in the source/test population; this section only preserves the historical
+# sampler's campaign-pin rule. The resulting sample population is 7026, so
+# no comparison to an older sampled-file baseline is asserted.
+tests/ui/trust/clean_origin_frame_read.rs
+tests/ui/trust/clean_origin_let_rust_call.rs
+tests/ui/trust/clean_origin_named_lean_calls.rs
+tests/ui/trust/clean_origin_rust_call_shadowed_name_unused.rs
+tests/ui/trust/clean_origin_wf_lib_proof_only.rs
+tests/ui/trust/float_contract_bound_discharges.rs
+tests/ui/trust/float_contract_f32_bound_discharges.rs
+tests/ui/trust/foundational_member_qualified_path.rs
+tests/ui/trust/native_clause_citation_call_unverified_residual.rs
+tests/ui/trust/plain_binaryop_return_value_proves.rs
+tests/ui/trust/policy_b/absent_sysroot_callee_run_pass.rs
+tests/ui/trust/policy_b/debug_of_std_container_run_pass.rs
+tests/ui/trust/policy_b/dynamic_fmt_width_run_pass.rs
+tests/ui/trust/policy_b/fn_pointer_call_is_silently_unverified_KNOWN_GAP.rs
+tests/ui/trust/policy_b/hardened_declared_policy_run_pass.rs
+tests/ui/trust/policy_b/hardened_generic_print_mandate_reported.rs
+tests/ui/trust/policy_b/hardened_unix_print_run_pass.rs
+tests/ui/trust/trust_ir_lower_callee_args_never_and_foreign.rs
+tests/ui/trust/trust_ir_lower_rvalue_snapshot_field.rs
+tests/ui/trust/trust_ir_lower_static_index_addr.rs
+
+# 2026-09-14: scalar let-else, else-borrow and loop-scope regressions, minted
+# after the baseline; retain explicit UI execution outside the seeded sample.
+tests/ui/trust/trust_ir_lower_let_else_borrow.rs
+tests/ui/trust/trust_ir_lower_let_else_value_enum.rs
+tests/ui/trust/trust_ir_lower_loop_scope_identity.rs
+
+# 2026-09-25: the dyn-tail container layout pin and its strict twin (ported from
+# 7b85680de6) and the struct-row coherence residue pin (ported from 8bd29c63c3),
+# minted after the baseline; slice regression tests, not corpus.
+tests/ui/trust/trust_ir_lower_dyn_tail_container_layout.rs
+tests/ui/trust/trust_ir_lower_dyn_tail_container_strict.rs
+tests/ui/trust/trust_ir_lower_struct_row_coherence_gate.rs
+
 # 2026-08-27 (totality-baseline sweep): two campaign pins minted after the
 # baseline by concurrent sessions — slice regression tests, not corpus.
 tests/ui/trust/abi_total_key_alias_extern_block_stays_closed.rs
@@ -180,7 +220,6 @@ tests/ui/trust/copy_nonoverlapping_oob_refuted.rs
 tests/ui/trust/cross_crate_bundle_scope_declared.rs
 tests/ui/trust/cross_crate_bundle_scope_no_clause_import.rs
 tests/ui/trust/cross_crate_bundle_scope_undeclared_stays_closed.rs
-tests/ui/trust/cross_crate_inlined_loop.rs
 tests/ui/trust/assumption-rows/async_exhibit_does_not_certify.rs
 tests/ui/trust/clean_origin_call_parity.rs
 tests/ui/trust/clean_origin_composed.rs
@@ -235,6 +274,7 @@ tests/ui/trust/dyn_dispatch_reliance_panicking_sink.rs
 tests/ui/trust/dyn_dispatch_reliance_poison_lane_liveness.rs
 tests/ui/trust/dyn_dispatch_reliance_recursive_field_carrier_discharges.rs
 tests/ui/trust/dyn_dispatch_reliance_skipped_target_refuses.rs
+tests/ui/trust/dyn_dispatch_reliance_slice_of_dyn_not_a_vtable.rs
 tests/ui/trust/e2_mut_by_value_prime_undischarged.rs
 tests/ui/trust/e2_mut_prime_undischarged.rs
 tests/ui/trust/e6_kernel_import_admits.rs
@@ -339,7 +379,6 @@ tests/ui/trust/r1/reject_unconstrained_caller.rs
 tests/ui/trust/s1_div_by_zero_not_minted.rs
 tests/ui/trust/s1_false_postcondition_refutation_immune.rs
 tests/ui/trust/s1c_arith_ensures_no_false_pass.rs
-tests/ui/trust/s1c_body_bound_gt_refl_refuted.rs
 tests/ui/trust/s1c_branch_false_ensures_refuted.rs
 tests/ui/trust/s1c_int_open_never_failed.rs
 tests/ui/trust/safe_intrinsic_no_safety_comment_demand.rs
@@ -456,7 +495,6 @@ tests/ui/trust/unauthenticated_iter_adaptor_collect_control.rs
 tests/ui/trust/unauthenticated_iter_adaptor_collect_refused.rs
 tests/ui/trust/verifier_budget_advisory_verdict.rs
 tests/ui/trust/verifier_budget_termination.rs
-tests/ui/trust/wrapping_binop_opt_level.rs
 tests/ui/trust/wrapping_div_zero_false_proof.rs
 tests/ui/trust/wrapping_intrinsic_is_modular.rs
 
@@ -520,9 +558,83 @@ tests/ui/trust/native_bundle_std_red_depends_on_bundled_body.rs
 tests/ui/trust/wrapping_intrinsic_plain_add_still_charged.rs
 tests/ui/trust/zero_obligation_registry_call_gate.rs
 
+# 2026-09-14 (merge of codex/two-language-completion-20260907 @ 4d972edcfd, plus
+# the ui/trust repair): 42 campaign pins minted after the baseline — the
+# Clean-origin/island wave (clean_island_*, clean_origin_*, clean_unit_lean_-
+# extension), the policy-B println run-pass trio, the seq carrier pair, the
+# producer waves' trust_ir_lower_* pins (several became eligible only when their
+# headers were made compiletest-runnable), and singles. Every one was created
+# between 2026-09-01 and 2026-09-13 (`git log --diff-filter=A`), so the default
+# applies; none needed a judgement call. Classified so a sweep can start again.
+tests/ui/trust/advisory_invalid_module_is_a_warning.rs
+tests/ui/trust/advisory_println_no_trimmed_paths_ice.rs
+tests/ui/trust/clean_island_lexical_lean_bytes.rs
+tests/ui/trust/clean_island_lexical_unicode.rs
+tests/ui/trust/clean_island_rust_identity.rs
+tests/ui/trust/clean_island_tactic_theorem.rs
+tests/ui/trust/clean_origin_bool_connective.rs
+tests/ui/trust/clean_origin_bool_decide.rs
+tests/ui/trust/clean_origin_let.rs
+tests/ui/trust/clean_origin_rust_call.rs
+tests/ui/trust/clean_unit_lean_extension.rs
+tests/ui/trust/drop_reenters_its_own_conversion_no_query_cycle.rs
+tests/ui/trust/e6_requires_field_projection.rs
+tests/ui/trust/generic_mono_harvest_rejects_non_concrete_args.rs
+tests/ui/trust/ice_trimmed_def_paths_clean_crate.rs
+tests/ui/trust/large_str_const_does_not_hard_error.rs
+tests/ui/trust/pf_registry_postcondition_only_leaf_composes.rs
+tests/ui/trust/policy_b/println_default_run_pass.rs
+tests/ui/trust/policy_b/println_release_opt_run_pass.rs
+tests/ui/trust/policy_b/println_runtime_value_run_pass.rs
+tests/ui/trust/seq_carrier_vec_shapes.rs
+tests/ui/trust/seq_lowering_vec_field_gap.rs
+tests/ui/trust/trust_ir_lower_array_ref_match.rs
+tests/ui/trust/trust_ir_lower_bare_param_borrow.rs
+tests/ui/trust/trust_ir_lower_box_leaf_addr.rs
+tests/ui/trust/trust_ir_lower_container_dst_reborrow.rs
+tests/ui/trust/trust_ir_lower_diverging_reborrow.rs
+tests/ui/trust/trust_ir_lower_field_array_elem_store.rs
+tests/ui/trust/trust_ir_lower_fn_ptr_field_seed.rs
+tests/ui/trust/trust_ir_lower_foreach_carrier_havoc.rs
+tests/ui/trust/trust_ir_lower_generic_reborrow.rs
+tests/ui/trust/trust_ir_lower_if_let_registered_enum.rs
+tests/ui/trust/trust_ir_lower_inline_slice_element_parity.rs
+tests/ui/trust/trust_ir_lower_precise_capture_read.rs
+tests/ui/trust/trust_ir_lower_promoted_unit_leaf.rs
+tests/ui/trust/trust_ir_lower_tuple_field_empty_declines.rs
+tests/ui/trust/trust_ir_lower_tuple_field_registration.rs
+tests/ui/trust/trust_ir_lower_tuple_match_bind.rs
+tests/ui/trust/trust_ir_lower_union_value_lane.rs
+tests/ui/trust/trust_ir_lower_vacuous_match.rs
+tests/ui/trust/trust_vtable_key_reentrancy_cycle.rs
+tests/ui/trust/vcgen_budget_census_bodies.rs
+# 2026-09-23: regression pins for the per-site fold gate, the local-helper
+# cascade exemption, and the async by-move body ICE. Default for a new
+# regression test; the sample population is unchanged.
+tests/ui/trust/async_closure_by_move_body_no_ice.rs
+tests/ui/trust/policy_b/folded_panic_row_judges_every_site.rs
+tests/ui/trust/policy_b/local_unproven_helper_stays_bundled.rs
+
+# 2026-09-23: the run-pass pin for the `uint.xor`/`uint.shr` raw-binop rows —
+# a campaign pin minted after the baseline, so the default applies.
+tests/ui/trust/clean_origin_xor_shr_rows.rs
+
+# 2026-09-29: crystal U14's carrier-local field refusal, ported from one of
+# origin's last unmerged branches. A post-baseline campaign pin, so the
+# default applies.
+tests/ui/trust/trust_ir_lower_opaque_carrier_field_after_rebind.rs
+
+# 2026-09-29: wave-ZFT's fn-item opaque return tail, ported the same way.
+tests/ui/trust/trust_ir_lower_zst_fn_item_opaque_tail.rs
+
+# 2026-10-01: step 2 increment 4b's pin — the producer places drops, strict passes them.
+# A post-baseline campaign pin, so the default applies.
+tests/ui/trust/trust_ir_lower_drops_placed.rs
+
+# 2026-10-08: the 4b residuals' pin — temporaries, pattern bindings, a store through a
+# pointer placed, strict passes them. A post-baseline campaign pin, so the default applies.
+tests/ui/trust/trust_ir_lower_drops_placed_residuals.rs
 [in-pool]
-tests/ui/trust/assoc_const_projection_no_ice.rs
-tests/ui/trust/assumed_total_key_alias_write_fmt_recovery.rs
 tests/ui/trust/certified_monitor_e5_extended_carriers.rs
 tests/ui/trust/certified_monitor_early_returns.rs
 tests/ui/trust/certified_monitor_entry_snapshot.rs
@@ -613,13 +725,10 @@ tests/ui/trust/trust_ir_flip_loop_source_provenance_false_proof.rs
 tests/ui/trust/trust_ir_flip_loop_source_provenance_proof.rs
 tests/ui/trust/trust_ir_link_sig_instantiation_invariance.rs
 tests/ui/trust/trust_ir_loop_without_break_has_no_exit_block.rs
-tests/ui/trust/trust_ir_lower_call_result_provenance.rs
 tests/ui/trust/trust_ir_lower_fat_pointee_spelling.rs
 tests/ui/trust/trust_ir_lower_logical_op_env_merge.rs
 tests/ui/trust/trust_ir_lower_loop_break_carries_writes.rs
-tests/ui/trust/trust_ir_lower_match_case_hoist_guard.rs
 tests/ui/trust/trust_ir_lower_recursive_pointer_payload_enum.rs
-tests/ui/trust/trust_ir_lower_reify_shim_stays_closed.rs
 tests/ui/trust/trust_ir_lower_reify_track_caller.rs
 tests/ui/trust/trust_ir_lower_rpit_no_cycle.rs
 tests/ui/trust/trust_ir_lower_self_ctor_zst.rs

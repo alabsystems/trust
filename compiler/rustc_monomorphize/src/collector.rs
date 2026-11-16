@@ -208,20 +208,25 @@
 use std::cell::OnceCell;
 use std::ops::ControlFlow;
 
+use rustc_attr_ir::InlineAttr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync::{Lock, par_for_each_in};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir as hir;
-use rustc_hir::attrs::InlineAttr;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, DefIdMap, LocalDefId};
-use rustc_hir::lang_items::LangItem;
-use rustc_hir::limit::Limit;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir::interpret::{AllocId, ErrorHandled, GlobalAlloc, Scalar};
-use rustc_middle::mir::visit::Visitor as MirVisitor;
+use rustc_middle::mir::visit::{PlaceContext, TyContext, Visitor as MirVisitor};
 use rustc_middle::mir::{self, Body, Location, MentionedItem, traversal};
 use rustc_middle::mono::{CollectionMode, InstantiationMode, MonoItem, NormalizationErrorInMono};
+// Trust: observer records are separate from MonoItem selection and survive query caching.
+use rustc_middle::mono::{
+    TrustAllocation, TrustAllocationForm, TrustAllocationSource, TrustCollectedItems,
+    TrustDependency, TrustDependencyKind, TrustDependencyObservations, TrustDependencyOrigin,
+    TrustDependencySite, TrustVtableEntry,
+};
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::adjustment::{CustomCoerceUnsized, PointerCoercion};
 use rustc_middle::ty::layout::ValidityRequirement;
@@ -230,9 +235,9 @@ use rustc_middle::ty::{
     TypeFoldable, TypeVisitable, TypeVisitableExt, TypeVisitor, Unnormalized, VtblEntry,
 };
 use rustc_middle::util::Providers;
-use rustc_middle::{bug, span_bug};
-use rustc_session::config::{DebugInfo, EntryFnType};
-use rustc_span::{DUMMY_SP, Span, Spanned, dummy_spanned, respan};
+use rustc_session::config::{DebugInfo, EntryFnType, Offload};
+use rustc_span::{DUMMY_SP, Span, Spanned, Symbol, bug, dummy_spanned, respan, span_bug};
+use rustc_structures::Limit;
 use tracing::{debug, instrument, trace};
 
 use crate::diagnostics::{
@@ -257,9 +262,29 @@ struct SharedState<'tcx> {
     usage_map: Lock<UsageMap<'tcx>>,
 }
 
+// Trust: a successful eager free-const value scan has a LocalDefId owner, never
+// a fabricated MonoItem. Empty scans are retained; this is not a query payload.
+pub(crate) struct EagerConstRootVisit<'tcx> {
+    pub def_id: LocalDefId,
+    pub dependencies: Vec<TrustDependency<'tcx>>,
+}
+
+struct RootCollection<'tcx> {
+    items: Vec<MonoItem<'tcx>>,
+    eager_const_visits: Option<Vec<EagerConstRootVisit<'tcx>>>,
+}
+
 pub(crate) struct UsageMap<'tcx> {
     // Maps every mono item to the mono items used by it.
     pub used_map: UnordMap<MonoItem<'tcx>, Vec<MonoItem<'tcx>>>,
+
+    // Trust: actual owner/pass visits, including empty and mentioned-only visits.
+    // This is not consulted by collection, partitioning or codegen decisions.
+    pub dependencies: UnordMap<(MonoItem<'tcx>, CollectionMode), Vec<TrustDependency<'tcx>>>,
+
+    // Trust: separate from the complete recursive mono-body owner population.
+    // None means disabled; Some([]) means no successful eager free-const scan.
+    pub eager_const_visits: Option<Vec<EagerConstRootVisit<'tcx>>>,
 
     // Maps each mono item with users to the mono items that use it.
     // Be careful: subsets `used_map`, so unused items are vacant.
@@ -268,7 +293,12 @@ pub(crate) struct UsageMap<'tcx> {
 
 impl<'tcx> UsageMap<'tcx> {
     fn new() -> UsageMap<'tcx> {
-        UsageMap { used_map: Default::default(), user_map: Default::default() }
+        UsageMap {
+            used_map: Default::default(),
+            user_map: Default::default(),
+            dependencies: Default::default(),
+            eager_const_visits: None,
+        }
     }
 
     fn record_used<'a>(&mut self, user_item: MonoItem<'tcx>, used_items: &'a MonoItems<'tcx>)
@@ -309,11 +339,68 @@ struct MonoItems<'tcx> {
     // We want a set of MonoItem + Span where trying to re-insert a MonoItem with a different Span
     // is ignored. Map does that, but it looks odd.
     items: FxIndexMap<MonoItem<'tcx>, Span>,
+    // Trust: enabled for recursive visits, or scoped to one existing successful
+    // eager free-const value scan. Other root-discovery work remains unobserved.
+    observe: bool,
+    mode: CollectionMode,
+    origin: TrustDependencyOrigin,
+    dependencies: Vec<TrustDependency<'tcx>>,
+    // Trust: set for `trust_seal_items_of_instance` only ([`MonoItems::codegen_locally`]).
+    seal_check: bool,
 }
 
 impl<'tcx> MonoItems<'tcx> {
     fn new() -> Self {
-        Self { items: FxIndexMap::default() }
+        Self {
+            items: FxIndexMap::default(),
+            observe: false,
+            mode: CollectionMode::UsedItems,
+            origin: TrustDependencyOrigin::Mir,
+            dependencies: Vec::new(),
+            seal_check: false,
+        }
+    }
+
+    // Trust: no observation adds an item, evaluates a constant or forces a query.
+    fn observed(tcx: TyCtxt<'tcx>, mode: CollectionMode) -> Self {
+        Self {
+            observe: tcx.sess.opts.unstable_opts.trust_instance_census.is_some(),
+            mode,
+            ..Self::new()
+        }
+    }
+
+    // Trust: `should_codegen_locally`, asked by every decision made while one instance's items
+    // are collected. For `trust_seal_items_of_instance` (`seal_check`), an upstream instance
+    // whose crate's metadata carries no MIR for it is codegened locally, as it is where the MIR
+    // is there, instead of stopping the build: that query's answer feeds no codegen.
+    fn codegen_locally(&self, tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
+        if self.seal_check {
+            codegen_locally_or_unbuilt(tcx, instance).unwrap_or(true)
+        } else {
+            tcx.should_codegen_locally(instance)
+        }
+    }
+
+    fn observe(&mut self, kind: TrustDependencyKind<'tcx>) {
+        if self.observe {
+            self.dependencies.push(TrustDependency { mode: self.mode, origin: self.origin, kind });
+        }
+    }
+
+    fn observe_instance(
+        &mut self,
+        target: MonoItem<'tcx>,
+        site: TrustDependencySite,
+        collector_direct_call: Option<bool>,
+        local_codegen: Option<bool>,
+    ) {
+        self.observe(TrustDependencyKind::InstanceUse {
+            target,
+            site,
+            collector_direct_call,
+            local_codegen,
+        });
     }
 
     fn is_empty(&self) -> bool {
@@ -345,6 +432,8 @@ impl<'tcx> Extend<Spanned<MonoItem<'tcx>>> for MonoItems<'tcx> {
     where
         I: IntoIterator<Item = Spanned<MonoItem<'tcx>>>,
     {
+        let iter = iter.into_iter();
+        self.items.reserve(iter.size_hint().0);
         for item in iter {
             self.push(item)
         }
@@ -386,8 +475,9 @@ fn collect_items_rec<'tcx>(
     recursion_limit: Limit,
     mode: CollectionMode,
 ) {
-    let mut used_items = MonoItems::new();
-    let mut mentioned_items = MonoItems::new();
+    // Trust: modes describe result buckets, not just the enclosing query pass.
+    let mut used_items = MonoItems::observed(tcx, CollectionMode::UsedItems);
+    let mut mentioned_items = MonoItems::observed(tcx, CollectionMode::MentionedItems);
     let recursion_depth_reset;
 
     // Post-monomorphization errors MVP
@@ -420,6 +510,8 @@ fn collect_items_rec<'tcx>(
     // hide const-eval errors that those calls would otherwise have triggered.
     match starting_item.node {
         MonoItem::Static(def_id) => {
+            // Trust: static initializer/drop/shim observations retain their owner.
+            used_items.origin = TrustDependencyOrigin::Static;
             recursion_depth_reset = None;
 
             // Statics always get evaluated (which is possible because they can't be generic), so for
@@ -438,12 +530,34 @@ fn collect_items_rec<'tcx>(
                 }
 
                 if let Ok(alloc) = tcx.eval_static_initializer(def_id) {
-                    for &prov in alloc.inner().provenance().ptrs().values() {
+                    // Trust: preserve even pointer-free static initializers.
+                    used_items.observe(TrustDependencyKind::StaticInitializer {
+                        def_id,
+                        allocation: alloc,
+                    });
+                    for &(offset, prov) in alloc.inner().provenance().ptrs().iter() {
+                        used_items.observe(TrustDependencyKind::Relocation {
+                            source: TrustAllocationSource::StaticInitializer(def_id),
+                            target: prov.alloc_id(),
+                            offset_bytes: offset.bytes(),
+                            immutable: prov.immutable(),
+                            shared_ref: prov.shared_ref(),
+                        });
                         collect_alloc(tcx, prov.alloc_id(), &mut used_items);
                     }
                 }
 
                 if tcx.needs_thread_local_shim(def_id) {
+                    // Trust: no local-codegen query existed at this insertion.
+                    used_items.observe_instance(
+                        MonoItem::Fn(Instance {
+                            def: InstanceKind::Shim(ShimKind::ThreadLocal(def_id)),
+                            args: GenericArgs::empty(),
+                        }),
+                        TrustDependencySite::ThreadLocalShim,
+                        None,
+                        None,
+                    );
                     used_items.push(respan(
                         starting_item.span,
                         MonoItem::Fn(Instance {
@@ -472,7 +586,33 @@ fn collect_items_rec<'tcx>(
             ));
 
             rustc_data_structures::stack::ensure_sufficient_stack(|| {
-                let Ok((used, mentioned)) = tcx.items_of_instance((instance, mode)) else {
+                // Trust (plan step 3.3, docs/design/2026-10-02-step3-lean-through-trust-ir.md
+                // §5.4): on F1 a Clean-origin item's neighbours are its published trust-ir row's
+                // Rust callees, never `clean_origin_mir`'s MIR, whose primitive calls (the
+                // marker-authenticated `u64::wrapping_add` of a wrapping-binop shape) the
+                // trust-ir spelling replaces by instructions and which no Rust body calls.
+                // Outside F1, and on F1 for an item with no complete recorded row (a
+                // planner-skipped def; since plan step 3.5 the recorder runs on every F1 compile,
+                // verification on or off; plan R-8), the hook answers `None` and the item's MIR
+                // is walked as ever, a read the hook charges to the reach counter's `inventory`
+                // lane (plan step 3.5, design §5.7).
+                // Under `-Ztrust-instance-census` these edges keep the observer's default
+                // `TrustDependencyOrigin::Mir` label although they come from the published row;
+                // no F1 compile with a Clean def completes before plan step 3.6, so no census
+                // record carries them yet.
+                if let Some(neighbours) = tcx.trust_f1_clean_origin_neighbours(instance) {
+                    let output = if mode == CollectionMode::UsedItems {
+                        &mut used_items
+                    } else {
+                        &mut mentioned_items
+                    };
+                    for &callee in neighbours {
+                        let callee = Instance::mono(tcx, callee);
+                        visit_instance_use(tcx, callee, true, starting_item.span, output);
+                    }
+                    return;
+                }
+                let Ok(collected) = tcx.items_of_instance((instance, mode)) else {
                     // Normalization errors here are usually due to trait solving overflow.
                     // FIXME: I assume that there are few type errors at post-analysis stage, but not
                     // entirely sure.
@@ -488,11 +628,24 @@ fn collect_items_rec<'tcx>(
                         def_path_str,
                     });
                 };
-                used_items.extend(used.into_iter().copied());
-                mentioned_items.extend(mentioned.into_iter().copied());
+                used_items.extend(collected.used.into_iter().copied());
+                mentioned_items.extend(collected.mentioned.into_iter().copied());
+                // Trust: replay the persisted query payload on warm cache hits too.
+                if used_items.observe {
+                    let TrustDependencyObservations::Observed(dependencies) =
+                        collected.dependencies
+                    else {
+                        tcx.dcx().fatal(
+                            "Rust instance census: cached query lacks dependency observations",
+                        );
+                    };
+                    used_items.dependencies.extend_from_slice(dependencies);
+                }
             });
         }
         MonoItem::GlobalAsm(item_id) => {
+            // Trust: these are HIR assembly references, not MIR calls.
+            used_items.origin = TrustDependencyOrigin::GlobalAsm;
             assert!(
                 mode == CollectionMode::UsedItems,
                 "should never encounter global_asm when collecting mentioned items"
@@ -503,10 +656,18 @@ fn collect_items_rec<'tcx>(
             if let hir::ItemKind::GlobalAsm { asm, .. } = item.kind {
                 for (op, op_sp) in asm.operands {
                     match *op {
-                        hir::InlineAsmOperand::Const { .. } => {
-                            // Only constants which resolve to a plain integer
-                            // are supported. Therefore the value should not
-                            // depend on any other items.
+                        hir::InlineAsmOperand::Const { anon_const } => {
+                            match tcx.const_eval_poly(anon_const.def_id.to_def_id()) {
+                                Ok(val) => {
+                                    collect_const_value(tcx, val, &mut used_items);
+                                }
+                                Err(ErrorHandled::TooGeneric(..)) => {
+                                    span_bug!(*op_sp, "asm const cannot be resolved; too generic")
+                                }
+                                Err(ErrorHandled::Reported(..)) => {
+                                    continue;
+                                }
+                            }
                         }
                         hir::InlineAsmOperand::SymFn { expr } => {
                             let fn_ty = tcx.typeck(item_id.owner_id).expr_ty(expr);
@@ -514,7 +675,15 @@ fn collect_items_rec<'tcx>(
                         }
                         hir::InlineAsmOperand::SymStatic { path: _, def_id } => {
                             let instance = Instance::mono(tcx, def_id);
-                            if tcx.should_codegen_locally(instance) {
+                            // Trust: record the existing filter result before it discards an edge.
+                            let local_codegen = tcx.should_codegen_locally(instance);
+                            used_items.observe_instance(
+                                MonoItem::Static(def_id),
+                                TrustDependencySite::AsmStatic,
+                                None,
+                                Some(local_codegen),
+                            );
+                            if local_codegen {
                                 trace!("collecting static {:?}", def_id);
                                 used_items.push(dummy_spanned(MonoItem::Static(def_id)));
                             }
@@ -567,6 +736,21 @@ fn collect_items_rec<'tcx>(
     // ("Mentioned" items are only considered internally during collection.)
     if mode == CollectionMode::UsedItems {
         state.usage_map.lock().record_used(starting_item.node, &used_items);
+    }
+    // Trust: attach observations to actual recursive owners outside cached query
+    // providers. Empty visits and MentionedItems are retained without changing
+    // visited/mentioned sets or the usage graph.
+    if used_items.observe {
+        let mut dependencies = std::mem::take(&mut used_items.dependencies);
+        dependencies.append(&mut mentioned_items.dependencies);
+        assert!(
+            state
+                .usage_map
+                .lock()
+                .dependencies
+                .insert((starting_item.node, mode), dependencies)
+                .is_none()
+        );
     }
 
     {
@@ -630,6 +814,9 @@ fn check_normalization_error<'tcx>(
         type Result = ControlFlow<()>;
 
         fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
+            if !t.has_non_region_param() && !t.has_aliases() {
+                return ControlFlow::Continue(());
+            }
             match self.instance.try_instantiate_mir_and_normalize_erasing_regions(
                 self.tcx,
                 ty::TypingEnv::fully_monomorphized(),
@@ -724,6 +911,12 @@ impl<'a, 'tcx> MirUsedCollector<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
+    fn visit_place(&mut self, _: &mir::Place<'tcx>, _: PlaceContext, _: Location) {}
+
+    fn visit_source_info(&mut self, _: &mir::SourceInfo) {}
+
+    fn visit_ty(&mut self, _: Ty<'tcx>, _: TyContext) {}
+
     fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
         debug!("visiting rvalue {:?}", *rvalue);
 
@@ -782,7 +975,15 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
                 if let ty::Closure(def_id, args) = *source_ty.kind() {
                     let instance =
                         Instance::resolve_closure(self.tcx, def_id, args, ty::ClosureKind::FnOnce);
-                    if self.tcx.should_codegen_locally(instance) {
+                    // Trust: retain the resolved target and the existing filter outcome.
+                    let local_codegen = self.used_items.codegen_locally(self.tcx, instance);
+                    self.used_items.observe_instance(
+                        MonoItem::Fn(instance),
+                        TrustDependencySite::Closure,
+                        None,
+                        Some(local_codegen),
+                    );
+                    if local_codegen {
                         self.used_items.push(create_fn_mono_item(self.tcx, instance, span));
                     }
                 } else {
@@ -792,7 +993,15 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
             mir::Rvalue::ThreadLocalRef(def_id) => {
                 assert!(self.tcx.is_thread_local_static(def_id));
                 let instance = Instance::mono(self.tcx, def_id);
-                if self.tcx.should_codegen_locally(instance) {
+                // Trust: a thread-local reference can target an external static.
+                let local_codegen = self.used_items.codegen_locally(self.tcx, instance);
+                self.used_items.observe_instance(
+                    MonoItem::Static(def_id),
+                    TrustDependencySite::ThreadLocalStatic,
+                    None,
+                    Some(local_codegen),
+                );
+                if local_codegen {
                     trace!("collecting thread-local static {:?}", def_id);
                     self.used_items.push(respan(span, MonoItem::Static(def_id)));
                 }
@@ -819,14 +1028,22 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
         let tcx = self.tcx;
         let push_mono_lang_item = |this: &mut Self, lang_item: LangItem| {
             let instance = Instance::mono(tcx, tcx.require_lang_item(lang_item, source));
-            if tcx.should_codegen_locally(instance) {
+            // Trust: record the same resolved panic/termination helper decision.
+            let local_codegen = this.used_items.codegen_locally(tcx, instance);
+            this.used_items.observe_instance(
+                MonoItem::Fn(instance),
+                TrustDependencySite::LanguageItem,
+                None,
+                Some(local_codegen),
+            );
+            if local_codegen {
                 this.used_items.push(create_fn_mono_item(tcx, instance, source));
             }
         };
 
         match terminator.kind {
-            mir::TerminatorKind::Call { ref func, .. }
-            | mir::TerminatorKind::TailCall { ref func, .. } => {
+            mir::TerminatorKind::Call { ref func, ref args, .. }
+            | mir::TerminatorKind::TailCall { ref func, ref args, .. } => {
                 let callee_ty = func.ty(self.body, tcx);
                 // *Before* monomorphizing, record that we already handled this mention.
                 self.used_mentioned_items.insert(MentionedItem::Fn(callee_ty));
@@ -843,7 +1060,7 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
                             self.tcx,
                             ty::TypingEnv::fully_monomorphized(),
                             def_id,
-                            args,
+                            args.no_bound_vars().unwrap(),
                             source,
                         )
                         && instance.def.requires_caller_location(self.tcx)
@@ -859,7 +1076,16 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
                     !force_indirect_call,
                     source,
                     &mut self.used_items,
-                )
+                );
+
+                if let ty::FnDef(def_id, _) = *callee_ty.kind()
+                    && self.tcx.is_intrinsic(def_id, rustc_span::sym::offload)
+                    && let Some(kernel) = args.first()
+                {
+                    let kernel_ty = kernel.node.ty(self.body, self.tcx);
+                    let kernel_ty = self.monomorphize(kernel_ty);
+                    visit_fn_use(self.tcx, kernel_ty, false, source, &mut self.used_items);
+                }
             }
             mir::TerminatorKind::Drop { ref place, .. } => {
                 let ty = place.ty(self.body, self.tcx).ty;
@@ -880,7 +1106,15 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
                         }
                         mir::InlineAsmOperand::SymStatic { def_id } => {
                             let instance = Instance::mono(self.tcx, def_id);
-                            if self.tcx.should_codegen_locally(instance) {
+                            // Trust: retain external as well as local assembly references.
+                            let local_codegen = self.used_items.codegen_locally(self.tcx, instance);
+                            self.used_items.observe_instance(
+                                MonoItem::Static(def_id),
+                                TrustDependencySite::AsmStatic,
+                                None,
+                                Some(local_codegen),
+                            );
+                            if local_codegen {
                                 trace!("collecting asm sym static {:?}", def_id);
                                 self.used_items.push(respan(source, MonoItem::Static(def_id)));
                             }
@@ -952,6 +1186,7 @@ fn visit_fn_use<'tcx>(
     output: &mut MonoItems<'tcx>,
 ) {
     if let ty::FnDef(def_id, args) = *ty.kind() {
+        let args = args.no_bound_vars().unwrap();
         let instance = if is_direct_call {
             ty::Instance::expect_resolve(
                 tcx,
@@ -983,7 +1218,16 @@ fn visit_instance_use<'tcx>(
     output: &mut MonoItems<'tcx>,
 ) {
     debug!("visit_item_use({:?}, is_direct_call={:?})", instance, is_direct_call);
-    if !tcx.should_codegen_locally(instance) {
+    // Trust: this early return previously erased foreign and upstream references
+    // from the usage graph. Preserve its exact decision without changing it.
+    let local_codegen = output.codegen_locally(tcx, instance);
+    output.observe_instance(
+        MonoItem::Fn(instance),
+        TrustDependencySite::InstanceUse,
+        Some(is_direct_call),
+        Some(local_codegen),
+    );
+    if !local_codegen {
         return;
     }
     if let Some(intrinsic) = tcx.intrinsic(instance.def_id()) {
@@ -994,7 +1238,15 @@ fn visit_instance_use<'tcx>(
             // codegen a call to that function without generating code for the function itself.
             let def_id = tcx.require_lang_item(LangItem::PanicNounwind, source);
             let panic_instance = Instance::mono(tcx, def_id);
-            if tcx.should_codegen_locally(panic_instance) {
+            // Trust: preserve the existing intrinsic-generated helper filter.
+            let local_codegen = output.codegen_locally(tcx, panic_instance);
+            output.observe_instance(
+                MonoItem::Fn(panic_instance),
+                TrustDependencySite::IntrinsicPanic,
+                None,
+                Some(local_codegen),
+            );
+            if local_codegen {
                 output.push(create_fn_mono_item(tcx, panic_instance, source));
             }
         } else if !intrinsic.must_be_overridden
@@ -1011,14 +1263,24 @@ fn visit_instance_use<'tcx>(
             // implementations) we ignore the optimization hint and do monomorphize
             // the fallback body.
             let instance = ty::Instance::new_raw(instance.def_id(), instance.args);
-            if tcx.should_codegen_locally(instance) {
+            // Trust: the fallback is a separate resolved instance.
+            let local_codegen = output.codegen_locally(tcx, instance);
+            output.observe_instance(
+                MonoItem::Fn(instance),
+                TrustDependencySite::IntrinsicFallback,
+                None,
+                Some(local_codegen),
+            );
+            if local_codegen {
                 output.push(create_fn_mono_item(tcx, instance, source));
             }
         }
     }
 
     match instance.def {
-        ty::InstanceKind::Virtual(..) | ty::InstanceKind::Intrinsic(_) => {
+        ty::InstanceKind::Virtual(..)
+        | ty::InstanceKind::Intrinsic(_)
+        | ty::InstanceKind::LlvmIntrinsic(_) => {
             if !is_direct_call {
                 bug!("{:?} being reified", instance);
             }
@@ -1046,7 +1308,8 @@ fn visit_instance_use<'tcx>(
         | ty::InstanceKind::Shim(ty::ShimKind::ConstructCoroutineInClosure { .. })
         | ty::InstanceKind::Shim(ty::ShimKind::FnPtr(..))
         | ty::InstanceKind::Shim(ty::ShimKind::Clone(..))
-        | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAddr(..)) => {
+        | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAsPtr(..))
+        | ty::InstanceKind::Shim(ty::ShimKind::FnPtrFromPtr(..)) => {
             output.push(create_fn_mono_item(tcx, instance, source));
         }
     }
@@ -1055,13 +1318,32 @@ fn visit_instance_use<'tcx>(
 /// Returns `true` if we should codegen an instance in the local crate, or returns `false` if we
 /// can just link to the upstream crate and therefore don't need a mono item.
 fn should_codegen_locally<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
+    // Trust: the decision is `codegen_locally_or_unbuilt`'s, unchanged; only the fatal error
+    // where an upstream body has no MIR is this hook's own.
+    match codegen_locally_or_unbuilt(tcx, instance) {
+        Ok(local_codegen) => local_codegen,
+        Err(def_id) => tcx.dcx().emit_fatal(NoOptimizedMir {
+            span: tcx.def_span(def_id),
+            crate_name: tcx.crate_name(def_id.krate),
+            instance: instance.to_string(),
+        }),
+    }
+}
+
+// Trust: `should_codegen_locally` without its fatal error. `Err` names the upstream item whose
+// crate's metadata carries no MIR for it (a crate built with `--emit=metadata`), where that hook
+// stops the build; `MonoItems::codegen_locally` asks it for `trust_seal_items_of_instance`.
+fn codegen_locally_or_unbuilt<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Result<bool, DefId> {
     let Some(def_id) = instance.def.def_id_if_not_guaranteed_local_codegen() else {
-        return true;
+        return Ok(true);
     };
 
     if tcx.is_foreign_item(def_id) {
         // Foreign items are always linked against, there's no way of instantiating them.
-        return false;
+        return Ok(false);
     }
 
     if tcx.def_kind(def_id).has_codegen_attrs()
@@ -1074,30 +1356,26 @@ fn should_codegen_locally<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> 
 
     if def_id.is_local() {
         // Local items cannot be referred to locally without monomorphizing them locally.
-        return true;
+        return Ok(true);
     }
 
     if tcx.is_reachable_non_generic(def_id) || instance.upstream_monomorphization(tcx).is_some() {
         // We can link to the item in question, no instance needed in this crate.
-        return false;
+        return Ok(false);
     }
 
     if let DefKind::Static { .. } = tcx.def_kind(def_id) {
         // We cannot monomorphize statics from upstream crates.
-        return false;
+        return Ok(false);
     }
 
     // See comment in should_encode_mir in rustc_metadata for why we don't report
     // an error for constructors.
     if !tcx.is_mir_available(def_id) && !matches!(tcx.def_kind(def_id), DefKind::Ctor(..)) {
-        tcx.dcx().emit_fatal(NoOptimizedMir {
-            span: tcx.def_span(def_id),
-            crate_name: tcx.crate_name(def_id.krate),
-            instance: instance.to_string(),
-        });
+        return Err(def_id);
     }
 
-    true
+    Ok(true)
 }
 
 /// For a given pair of source and target type that occur in an unsizing coercion,
@@ -1224,6 +1502,10 @@ fn create_mono_items_for_vtable_methods<'tcx>(
 ) {
     assert!(!trait_ty.has_escaping_bound_vars() && !impl_ty.has_escaping_bound_vars());
 
+    // Trust: a symbolic request is distinct from an allocation materialized by
+    // CTFE. Merely observing this request must not force vtable_allocation.
+    let observed_trait_ty = trait_ty;
+
     let ty::Dynamic(trait_ty, ..) = trait_ty.kind() else {
         bug!("create_mono_items_for_vtable_methods: {trait_ty:?} not a trait type");
     };
@@ -1235,23 +1517,54 @@ fn create_mono_items_for_vtable_methods<'tcx>(
         // Walk all methods of the trait, including those of its supertraits
         let entries = tcx.vtable_entries(trait_ref);
         debug!(?entries);
-        let methods = entries
-            .iter()
-            .filter_map(|entry| match entry {
-                VtblEntry::MetadataDropInPlace
-                | VtblEntry::MetadataSize
-                | VtblEntry::MetadataAlign
-                | VtblEntry::Vacant => None,
-                VtblEntry::TraitVPtr(_) => {
-                    // all super trait items already covered, so skip them.
-                    None
+        // Trust: bind the count to the already-returned entries, so a missing
+        // final slot cannot be confused with a genuinely shorter vtable.
+        output.observe(TrustDependencyKind::Vtable {
+            impl_ty,
+            trait_ty: observed_trait_ty,
+            entry_count: Some(entries.len() as u64),
+        });
+        // Trust: retain each entry before the same local-codegen filter. The
+        // loop preserves the original filter/map/insertion order and queries.
+        for (slot, entry) in entries.iter().enumerate() {
+            let (observed, local_codegen) = match *entry {
+                VtblEntry::MetadataDropInPlace => (TrustVtableEntry::DropInPlace, None),
+                VtblEntry::MetadataSize => (TrustVtableEntry::Size, None),
+                VtblEntry::MetadataAlign => (TrustVtableEntry::Align, None),
+                VtblEntry::Vacant => (TrustVtableEntry::Vacant, None),
+                // All supertrait items remain covered by the original walk.
+                VtblEntry::TraitVPtr(trait_ref) => (TrustVtableEntry::TraitVPtr(trait_ref), None),
+                VtblEntry::Method(instance) => (
+                    TrustVtableEntry::Method(instance),
+                    Some(output.codegen_locally(tcx, instance)),
+                ),
+            };
+            output.observe(TrustDependencyKind::VtableEntry {
+                impl_ty,
+                trait_ty: observed_trait_ty,
+                slot: slot as u64,
+                entry: observed,
+                local_codegen,
+            });
+            if let VtblEntry::Method(instance) = *entry {
+                output.observe_instance(
+                    MonoItem::Fn(instance),
+                    TrustDependencySite::VtableMethod,
+                    None,
+                    local_codegen,
+                );
+                if local_codegen == Some(true) {
+                    output.push(create_fn_mono_item(tcx, instance, source));
                 }
-                VtblEntry::Method(instance) => {
-                    Some(*instance).filter(|instance| tcx.should_codegen_locally(*instance))
-                }
-            })
-            .map(|item| create_fn_mono_item(tcx, item, source));
-        output.extend(methods);
+            }
+        }
+    } else {
+        // Trust: a principal-free request does not query vtable_entries.
+        output.observe(TrustDependencyKind::Vtable {
+            impl_ty,
+            trait_ty: observed_trait_ty,
+            entry_count: None,
+        });
     }
 
     // Also add the destructor, if it's necessary.
@@ -1267,41 +1580,93 @@ fn create_mono_items_for_vtable_methods<'tcx>(
 fn collect_alloc<'tcx>(tcx: TyCtxt<'tcx>, alloc_id: AllocId, output: &mut MonoItems<'tcx>) {
     match tcx.global_alloc(alloc_id) {
         GlobalAlloc::Static(def_id) => {
+            // Trust: allocation identities remain typed until rendering.
+            output.observe(TrustDependencyKind::Allocation {
+                id: alloc_id,
+                allocation: TrustAllocation::Static(def_id),
+            });
             assert!(!tcx.is_thread_local_static(def_id));
             let instance = Instance::mono(tcx, def_id);
-            if tcx.should_codegen_locally(instance) {
+            // Trust: as every decision of one instance's collection (`MonoItems::codegen_locally`).
+            let local_codegen = output.codegen_locally(tcx, instance);
+            output.observe_instance(
+                MonoItem::Static(def_id),
+                TrustDependencySite::AllocationStatic,
+                None,
+                Some(local_codegen),
+            );
+            if local_codegen {
                 trace!("collecting static {:?}", def_id);
                 output.push(dummy_spanned(MonoItem::Static(def_id)));
             }
         }
         GlobalAlloc::Memory(alloc) => {
+            // Trust: retain pointer-free allocations and each actual relocation.
+            output.observe(TrustDependencyKind::Allocation {
+                id: alloc_id,
+                allocation: TrustAllocation::Memory(alloc),
+            });
             trace!("collecting {:?} with {:#?}", alloc_id, alloc);
             let ptrs = alloc.inner().provenance().ptrs();
-            // avoid `ensure_sufficient_stack` in the common case of "no pointers"
             if !ptrs.is_empty() {
                 rustc_data_structures::stack::ensure_sufficient_stack(move || {
-                    for &prov in ptrs.values() {
+                    for &(offset, prov) in ptrs.iter() {
+                        output.observe(TrustDependencyKind::Relocation {
+                            source: TrustAllocationSource::Allocation(alloc_id),
+                            target: prov.alloc_id(),
+                            offset_bytes: offset.bytes(),
+                            immutable: prov.immutable(),
+                            shared_ref: prov.shared_ref(),
+                        });
                         collect_alloc(tcx, prov.alloc_id(), output);
                     }
                 });
             }
         }
         GlobalAlloc::Function { instance, .. } => {
-            if tcx.should_codegen_locally(instance) {
+            // Trust: external function-pointer dependencies survive the filter.
+            output.observe(TrustDependencyKind::Allocation {
+                id: alloc_id,
+                allocation: TrustAllocation::Function(instance),
+            });
+            let local_codegen = output.codegen_locally(tcx, instance);
+            output.observe_instance(
+                MonoItem::Fn(instance),
+                TrustDependencySite::AllocationFunction,
+                None,
+                Some(local_codegen),
+            );
+            if local_codegen {
                 trace!("collecting {:?} with {:#?}", alloc_id, instance);
                 output.push(create_fn_mono_item(tcx, instance, DUMMY_SP));
             }
         }
         GlobalAlloc::VTable(ty, dyn_ty) => {
-            let alloc_id = tcx.vtable_allocation((
+            // Trust: record this already-existing materialization, never request
+            // a physical allocation merely for a symbolic vtable observation.
+            output.observe(TrustDependencyKind::Allocation {
+                id: alloc_id,
+                allocation: TrustAllocation::Vtable(ty, dyn_ty),
+            });
+            let materialized = tcx.vtable_allocation((
                 ty,
                 dyn_ty
                     .principal()
                     .map(|principal| tcx.instantiate_bound_regions_with_erased(principal)),
             ));
-            collect_alloc(tcx, alloc_id, output)
+            output.observe(TrustDependencyKind::VtableMaterialization {
+                source: alloc_id,
+                target: materialized,
+            });
+            collect_alloc(tcx, materialized, output)
         }
-        GlobalAlloc::TypeId { .. } => {}
+        GlobalAlloc::TypeId { ty } => {
+            // Trust: type-id allocations also belong to the encountered population.
+            output.observe(TrustDependencyKind::Allocation {
+                id: alloc_id,
+                allocation: TrustAllocation::TypeId(ty),
+            });
+        }
     }
 }
 
@@ -1313,6 +1678,8 @@ fn collect_items_of_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     mode: CollectionMode,
+    // Trust: `trust_seal_items_of_instance` ([`MonoItems::codegen_locally`]).
+    seal_check: bool,
 ) -> Result<(MonoItems<'tcx>, MonoItems<'tcx>), NormalizationErrorInMono> {
     // This item is getting monomorphized, do mono-time checks.
     let body = tcx.instance_mir(instance.def);
@@ -1332,8 +1699,11 @@ fn collect_items_of_instance<'tcx>(
     // mentioned item. So instead we collect all pre-monomorphized `MentionedItem` that were already
     // added to `used_items` in a hash set, which can efficiently query in the
     // `body.mentioned_items` loop below without even having to monomorphize the item.
-    let mut used_items = MonoItems::new();
-    let mut mentioned_items = MonoItems::new();
+    // Trust: persist every observed bucket, independent of the enclosing pass.
+    let mut used_items = MonoItems::observed(tcx, CollectionMode::UsedItems);
+    let mut mentioned_items = MonoItems::observed(tcx, CollectionMode::MentionedItems);
+    used_items.seal_check = seal_check;
+    mentioned_items.seal_check = seal_check;
     let mut used_mentioned_items = Default::default();
     let mut collector = MirUsedCollector {
         tcx,
@@ -1345,9 +1715,12 @@ fn collect_items_of_instance<'tcx>(
 
     if mode == CollectionMode::UsedItems {
         if tcx.sess.opts.debuginfo == DebugInfo::Full {
+            // Trust: debug constants are not executable MIR dependencies.
+            collector.used_items.origin = TrustDependencyOrigin::DebugInfo;
             for var_debug_info in &body.var_debug_info {
                 collector.visit_var_debug_info(var_debug_info);
             }
+            collector.used_items.origin = TrustDependencyOrigin::Mir;
         }
         for (bb, data) in traversal::mono_reachable(body, tcx, instance) {
             collector.visit_basic_block_data(bb, data)
@@ -1358,6 +1731,8 @@ fn collect_items_of_instance<'tcx>(
     // them errors.
     for const_op in body.required_consts() {
         if let Some(val) = collector.eval_constant(const_op) {
+            // Trust: required-const evaluation always feeds MentionedItems.
+            mentioned_items.origin = TrustDependencyOrigin::RequiredConst;
             collect_const_value(tcx, val, &mut mentioned_items);
         }
     }
@@ -1366,6 +1741,9 @@ fn collect_items_of_instance<'tcx>(
     // `used_items` above.
     for item in body.mentioned_items() {
         if !collector.used_mentioned_items.contains(&item.node) {
+            // Trust: suppressions above remain unchanged; they are not a full
+            // pre-optimization population claim.
+            mentioned_items.origin = TrustDependencyOrigin::MentionedItem;
             let item_mono = collector.monomorphize(item.node);
             visit_mentioned_item(tcx, &item_mono, item.span, &mut mentioned_items);
         }
@@ -1377,16 +1755,46 @@ fn collect_items_of_instance<'tcx>(
 fn items_of_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     (instance, mode): (Instance<'tcx>, CollectionMode),
-) -> Result<
-    (&'tcx [Spanned<MonoItem<'tcx>>], &'tcx [Spanned<MonoItem<'tcx>>]),
-    NormalizationErrorInMono,
-> {
-    let (used_items, mentioned_items) = collect_items_of_instance(tcx, instance, mode)?;
+) -> Result<TrustCollectedItems<'tcx>, NormalizationErrorInMono> {
+    // Trust: shared with `trust_seal_items_of_instance`, which differs only where an upstream
+    // body has no MIR.
+    collected_items_of_instance(tcx, instance, mode, false)
+}
+
+// Trust: the sealed-types check's question (the query's docs): `items_of_instance` in
+// `UsedItems` mode, where an upstream instance whose MIR its crate's metadata does not carry is
+// listed as used instead of stopping the build. Nothing that makes code reads it.
+fn trust_seal_items_of_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Result<TrustCollectedItems<'tcx>, NormalizationErrorInMono> {
+    collected_items_of_instance(tcx, instance, CollectionMode::UsedItems, true)
+}
+
+// Trust: the body `items_of_instance` had, with `seal_check` handed to the collection.
+fn collected_items_of_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    mode: CollectionMode,
+    seal_check: bool,
+) -> Result<TrustCollectedItems<'tcx>, NormalizationErrorInMono> {
+    let (mut used_items, mut mentioned_items) =
+        collect_items_of_instance(tcx, instance, mode, seal_check)?;
+
+    // Trust: keep the typed observations in the cache result, not session-only
+    // side effects that disappear when this query is reused incrementally.
+    let dependencies = if used_items.observe {
+        let mut dependencies = std::mem::take(&mut used_items.dependencies);
+        dependencies.append(&mut mentioned_items.dependencies);
+        TrustDependencyObservations::Observed(tcx.arena.alloc_from_iter(dependencies))
+    } else {
+        TrustDependencyObservations::Unobserved
+    };
 
     let used_items = tcx.arena.alloc_from_iter(used_items);
     let mentioned_items = tcx.arena.alloc_from_iter(mentioned_items);
 
-    Ok((used_items, mentioned_items))
+    Ok(TrustCollectedItems { used: used_items, mentioned: mentioned_items, dependencies })
 }
 
 /// `item` must be already monomorphized.
@@ -1400,6 +1808,7 @@ fn visit_mentioned_item<'tcx>(
     match *item {
         MentionedItem::Fn(ty) => {
             if let ty::FnDef(def_id, args) = *ty.kind() {
+                let args = args.no_bound_vars().unwrap();
                 let instance = Instance::expect_resolve(
                     tcx,
                     ty::TypingEnv::fully_monomorphized(),
@@ -1431,7 +1840,15 @@ fn visit_mentioned_item<'tcx>(
             if let ty::Closure(def_id, args) = *source_ty.kind() {
                 let instance =
                     Instance::resolve_closure(tcx, def_id, args, ty::ClosureKind::FnOnce);
-                if tcx.should_codegen_locally(instance) {
+                // Trust: mentioned-only closure targets retain their own mode.
+                let local_codegen = output.codegen_locally(tcx, instance);
+                output.observe_instance(
+                    MonoItem::Fn(instance),
+                    TrustDependencySite::Closure,
+                    None,
+                    Some(local_codegen),
+                );
+                if local_codegen {
                     output.push(create_fn_mono_item(tcx, instance, span));
                 }
             } else {
@@ -1449,10 +1866,42 @@ fn collect_const_value<'tcx>(
 ) {
     match value {
         mir::ConstValue::Scalar(Scalar::Ptr(ptr, _size)) => {
-            collect_alloc(tcx, ptr.provenance.alloc_id(), output)
+            // Trust: retain the original pointer offset and provenance flags.
+            let (provenance, offset) = ptr.prov_and_relative_offset();
+            output.observe(TrustDependencyKind::AllocationRoot {
+                id: provenance.alloc_id(),
+                offset_bytes: offset.bytes(),
+                form: TrustAllocationForm::Pointer,
+                metadata: None,
+                immutable: Some(provenance.immutable()),
+                shared_ref: Some(provenance.shared_ref()),
+            });
+            collect_alloc(tcx, provenance.alloc_id(), output)
         }
-        mir::ConstValue::Indirect { alloc_id, .. }
-        | mir::ConstValue::Slice { alloc_id, meta: _ } => collect_alloc(tcx, alloc_id, output),
+        mir::ConstValue::Indirect { alloc_id, offset } => {
+            // Trust: an indirect value has an offset but no pointer flags.
+            output.observe(TrustDependencyKind::AllocationRoot {
+                id: alloc_id,
+                offset_bytes: offset.bytes(),
+                form: TrustAllocationForm::Indirect,
+                metadata: None,
+                immutable: None,
+                shared_ref: None,
+            });
+            collect_alloc(tcx, alloc_id, output)
+        }
+        mir::ConstValue::Slice { alloc_id, meta } => {
+            // Trust: slice metadata is not an allocation size or a proof.
+            output.observe(TrustDependencyKind::AllocationRoot {
+                id: alloc_id,
+                offset_bytes: 0,
+                form: TrustAllocationForm::Slice,
+                metadata: Some(meta),
+                immutable: None,
+                shared_ref: None,
+            });
+            collect_alloc(tcx, alloc_id, output)
+        }
         _ => {}
     }
 }
@@ -1464,16 +1913,52 @@ fn collect_const_value<'tcx>(
 // Find all non-generic items by walking the HIR. These items serve as roots to
 // start monomorphizing from.
 #[instrument(skip(tcx, mode), level = "debug")]
-fn collect_roots(tcx: TyCtxt<'_>, mode: MonoItemCollectionStrategy) -> Vec<MonoItem<'_>> {
+fn collect_roots(tcx: TyCtxt<'_>, mode: MonoItemCollectionStrategy) -> RootCollection<'_> {
     debug!("collecting roots");
     let mut roots = MonoItems::new();
+    let mut eager_const_visits =
+        tcx.sess.opts.unstable_opts.trust_instance_census.as_ref().map(|_| Vec::new());
+
+    // Read the manifest and add the recorded kernel instantiations as roots so they are codegened.
+    if let Some(manifest_path) = tcx.sess.opts.unstable_opts.offload.iter().find_map(|o| {
+        if let rustc_session::config::Offload::Device(p) = o
+            && !p.is_empty()
+        {
+            Some(p)
+        } else {
+            None
+        }
+    }) {
+        tcx.sess.file_depinfo.borrow_mut().insert(Symbol::intern(manifest_path));
+        match crate::offload::manifest::read_manifest(std::path::Path::new(manifest_path), tcx) {
+            Ok(instances) => {
+                for instance in instances {
+                    if instance.def_id().is_local() {
+                        roots.push(dummy_spanned(MonoItem::Fn(instance)));
+                    }
+                }
+            }
+            Err(e) => {
+                tcx.dcx().emit_err(crate::diagnostics::OffloadManifestReadError {
+                    path: manifest_path.clone(),
+                    err: e.to_string(),
+                });
+            }
+        }
+    }
 
     {
         let entry_fn = tcx.entry_fn(());
 
         debug!("collect_roots: entry_fn = {:?}", entry_fn);
 
-        let mut collector = RootCollector { tcx, strategy: mode, entry_fn, output: &mut roots };
+        let mut collector = RootCollector {
+            tcx,
+            strategy: mode,
+            entry_fn,
+            output: &mut roots,
+            eager_const_visits: &mut eager_const_visits,
+        };
 
         let crate_items = tcx.hir_crate_items(());
 
@@ -1492,15 +1977,60 @@ fn collect_roots(tcx: TyCtxt<'_>, mode: MonoItemCollectionStrategy) -> Vec<MonoI
         collector.push_extra_entry_roots();
     }
 
+    let is_host_metadata = tcx
+        .sess
+        .opts
+        .unstable_opts
+        .offload
+        .iter()
+        .any(|o| matches!(o, rustc_session::config::Offload::HostMetadata(_)));
+    if is_host_metadata {
+        let crate_items = tcx.hir_crate_items(());
+        for id in crate_items.free_items() {
+            if !matches!(tcx.def_kind(id.owner_id), DefKind::Fn | DefKind::AssocFn) {
+                continue;
+            }
+            let def_id = id.owner_id.to_def_id();
+            if !tcx.generics_of(def_id).requires_monomorphization(tcx)
+                && tcx.codegen_fn_attrs(def_id).flags.intersects(CodegenFnAttrFlags::OFFLOAD_KERNEL)
+            {
+                roots.push(dummy_spanned(MonoItem::Fn(Instance::mono(tcx, def_id))));
+            }
+        }
+        for id in crate_items.impl_items() {
+            if !matches!(tcx.def_kind(id.owner_id), DefKind::Fn | DefKind::AssocFn) {
+                continue;
+            }
+            let def_id = id.owner_id.to_def_id();
+            if !tcx.generics_of(def_id).requires_monomorphization(tcx)
+                && tcx.codegen_fn_attrs(def_id).flags.intersects(CodegenFnAttrFlags::OFFLOAD_KERNEL)
+            {
+                roots.push(dummy_spanned(MonoItem::Fn(Instance::mono(tcx, def_id))));
+            }
+        }
+        for id in crate_items.trait_items() {
+            if !matches!(tcx.def_kind(id.owner_id), DefKind::Fn | DefKind::AssocFn) {
+                continue;
+            }
+            let def_id = id.owner_id.to_def_id();
+            if !tcx.generics_of(def_id).requires_monomorphization(tcx)
+                && tcx.codegen_fn_attrs(def_id).flags.intersects(CodegenFnAttrFlags::OFFLOAD_KERNEL)
+            {
+                roots.push(dummy_spanned(MonoItem::Fn(Instance::mono(tcx, def_id))));
+            }
+        }
+    }
+
     // We can only codegen items that are instantiable - items all of
     // whose predicates hold. Luckily, items that aren't instantiable
     // can't actually be used, so we can just skip codegenning them.
-    roots
+    let items = roots
         .into_iter()
         .filter_map(|Spanned { node: mono_item, .. }| {
             mono_item.is_instantiable(tcx).then_some(mono_item)
         })
-        .collect()
+        .collect();
+    RootCollection { items, eager_const_visits }
 }
 
 struct RootCollector<'a, 'tcx> {
@@ -1508,6 +2038,7 @@ struct RootCollector<'a, 'tcx> {
     strategy: MonoItemCollectionStrategy,
     output: &'a mut MonoItems<'tcx>,
     entry_fn: Option<(DefId, EntryFnType)>,
+    eager_const_visits: &'a mut Option<Vec<EagerConstRootVisit<'tcx>>>,
 }
 
 impl<'v> RootCollector<'_, 'v> {
@@ -1536,7 +2067,7 @@ impl<'v> RootCollector<'_, 'v> {
 
                     // This type is impossible to instantiate, so we should not try to
                     // generate a `drop_glue` instance for it.
-                    if self.tcx.instantiate_and_check_impossible_predicates((
+                    if self.tcx.instantiate_and_check_impossible_clauses((
                         id.owner_id.to_def_id(),
                         id_args,
                     )) {
@@ -1573,7 +2104,7 @@ impl<'v> RootCollector<'_, 'v> {
                 debug!("RootCollector: ItemKind::Static({})", self.tcx.def_path_str(def_id));
                 self.output.push(dummy_spanned(MonoItem::Static(def_id)));
             }
-            DefKind::Const { .. } => {
+            DefKind::Const => {
                 // Const items only generate mono items if they are actually used somewhere.
                 // Just declaring them is insufficient.
 
@@ -1581,21 +2112,30 @@ impl<'v> RootCollector<'_, 'v> {
                 // Otherwise the value is only collected when explicitly mentioned in other items.
                 if self.strategy == MonoItemCollectionStrategy::Eager {
                     let def_id = id.owner_id.to_def_id();
-                    // Type Consts don't have bodies to evaluate
-                    // nor do they make sense as a static.
-                    if self.tcx.is_type_const(def_id) {
-                        // FIXME(mgca): Is this actually what we want? We may want to
-                        // normalize to a ValTree then convert to a const allocation and
-                        // collect that?
-                        return;
-                    }
                     if self.tcx.generics_of(id.owner_id).own_requires_monomorphization() {
                         return;
                     }
                     let Ok(val) = self.tcx.const_eval_poly(def_id) else {
                         return;
                     };
+                    // Trust: observe only this ALREADY successful value scan.
+                    // Do not add evaluation, change item insertion/filter order,
+                    // or fold other root-discovery work into this const owner.
+                    let previous = (self.output.observe, self.output.mode, self.output.origin);
+                    let start = self.output.dependencies.len();
+                    if self.eager_const_visits.is_some() {
+                        self.output.observe = true;
+                        self.output.mode = CollectionMode::UsedItems;
+                        self.output.origin = TrustDependencyOrigin::EagerConstRoot;
+                    }
                     collect_const_value(self.tcx, val, self.output);
+                    if let Some(visits) = self.eager_const_visits.as_mut() {
+                        visits.push(EagerConstRootVisit {
+                            def_id: id.owner_id.def_id,
+                            dependencies: self.output.dependencies.split_off(start),
+                        });
+                    }
+                    (self.output.observe, self.output.mode, self.output.origin) = previous;
                 }
             }
             DefKind::Impl { of_trait: true } => {
@@ -1674,6 +2214,15 @@ impl<'v> RootCollector<'_, 'v> {
             && match self.strategy {
                 MonoItemCollectionStrategy::Eager => {
                     !matches!(self.tcx.codegen_fn_attrs(def_id).inline, InlineAttr::Force { .. })
+                    // comptime fns can't be codegenned, so we need to prevent collecting them even
+                    // with link-dead-code. Lazy mode prevents them by them not showing up in
+                    // `is_reachable_non_generic` (and `entry_fn` can't be comptime).
+                    && match self.tcx.def_kind(def_id) {
+                        DefKind::Fn | DefKind::AssocFn => {
+                            self.tcx.constness(def_id) != hir::Constness::Const { always: true }
+                        }
+                        _ => true,
+                    }
                 }
                 MonoItemCollectionStrategy::Lazy => {
                     self.entry_fn.and_then(|(id, _)| id.as_local()) == Some(def_id)
@@ -1788,8 +2337,8 @@ fn create_mono_items_for_default_impls<'tcx>(
     // Even though this impl has no type or const generic parameters, because we don't
     // consider higher-ranked predicates such as `for<'a> &'a mut [u8]: Copy` to
     // be trivially false. We must now check that the impl has no impossible-to-satisfy
-    // predicates.
-    if tcx.instantiate_and_check_impossible_predicates((item.owner_id.to_def_id(), impl_args)) {
+    // clauses.
+    if tcx.instantiate_and_check_impossible_clauses((item.owner_id.to_def_id(), impl_args)) {
         return;
     }
 
@@ -1829,21 +2378,24 @@ pub(crate) fn collect_crate_mono_items<'tcx>(
 ) -> (Vec<MonoItem<'tcx>>, UsageMap<'tcx>) {
     let _prof_timer = tcx.prof.generic_activity("monomorphization_collector");
 
-    let roots = tcx
+    let RootCollection { items: roots, eager_const_visits } = tcx
         .sess
         .time("monomorphization_collector_root_collections", || collect_roots(tcx, strategy));
 
     debug!("building mono item graph, beginning at roots");
+    crate::trust_instance_census::roots(tcx, &roots);
 
+    let mut usage_map = UsageMap::new();
+    usage_map.eager_const_visits = eager_const_visits;
     let state = SharedState {
         visited: Lock::new(UnordSet::default()),
         mentioned: Lock::new(UnordSet::default()),
-        usage_map: Lock::new(UsageMap::new()),
+        usage_map: Lock::new(usage_map),
     };
     let recursion_limit = tcx.recursion_limit();
 
     tcx.sess.time("monomorphization_collector_graph_walk", || {
-        par_for_each_in(roots, |root| {
+        par_for_each_in(&roots[..], |root| {
             collect_items_root(tcx, dummy_spanned(*root), &state, recursion_limit);
         });
     });
@@ -1854,10 +2406,23 @@ pub(crate) fn collect_crate_mono_items<'tcx>(
         state.visited.into_inner().into_sorted(&mut hcx, true)
     });
 
+    if tcx
+        .sess
+        .opts
+        .unstable_opts
+        .offload
+        .iter()
+        .any(|o| matches!(o, Offload::Device(p) if p.is_empty()))
+    {
+        crate::offload::check_offload_kernels_instantiated(tcx, &mono_items);
+    }
+
     (mono_items, state.usage_map.into_inner())
 }
 
 pub(crate) fn provide(providers: &mut Providers) {
     providers.hooks.should_codegen_locally = should_codegen_locally;
     providers.queries.items_of_instance = items_of_instance;
+    // Trust: the sealed-types check's collection (`trust_seal_items_of_instance`).
+    providers.queries.trust_seal_items_of_instance = trust_seal_items_of_instance;
 }

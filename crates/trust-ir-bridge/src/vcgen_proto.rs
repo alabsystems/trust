@@ -181,8 +181,11 @@ fn node_safety_vc(node: &trust_ir::node::InstrNode) -> Option<TrustIrSafetyVc> {
         // The dominant shape: a checked panic-class assert. Kind + description
         // are recovered from the faithful `ProofAnnotation` the lowering
         // attached (overflow/shift/div → ArithmeticSafety, bounds → BoundsCheck,
-        // everything else → PanicFreedom).
-        Inst::Assert { cond } => Some(TrustIrSafetyVc {
+        // everything else → PanicFreedom). Neither the assert's kind nor its
+        // panic site (trust-ir v52/v54) changes whether the check fails, and
+        // `AssertInvoke` (v54) is the same check whose failure enters an
+        // in-frame landing pad, so each is the same obligation.
+        Inst::Assert { cond, .. } | Inst::AssertInvoke { cond, .. } => Some(TrustIrSafetyVc {
             kind: assert_safety_kind(&node.proofs),
             desc: assert_desc(&node.proofs).to_string(),
             cond: Some(*cond),
@@ -244,8 +247,12 @@ fn node_safety_vc(node: &trust_ir::node::InstrNode) -> Option<TrustIrSafetyVc> {
         //   metadata; it is not a checked operation.
         // * `Resume` re-raises via `_Unwind_Resume(exn)` (divergent); no
         //   postcondition obligation flows to any successor.
+        // * `InvokeIndirect` and `DropInvoke` (trust-ir v55/v56) are the
+        //   unwinding twins of `CallIndirect` and `Drop`: call-like, as `Invoke`.
         Inst::CoroSuspend { .. }
         | Inst::Invoke { .. }
+        | Inst::InvokeIndirect { .. }
+        | Inst::DropInvoke { .. }
         | Inst::LandingPad { .. }
         | Inst::Resume { .. } => None,
 
@@ -729,10 +736,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // (d) CastOverflow — POLICY UPDATE (9f4b2c8417, owner decision 2026-07-06).
+    // (d) CastOverflow — POLICY UPDATE (9f4b2c8417, decision 2026-07-06).
     //
     // trust-vcgen used to emit `VcKind::CastOverflow` directly from a narrowing
-    // integer `Rvalue::Cast` statement. The owner decision made int→int `as`
+    // integer `Rvalue::Cast` statement. That decision made int→int `as`
     // casts obligation-FREE (they are DEFINED Rust — truncate / sign-extend /
     // reinterpret, never a trap); vcgen type-tracks the result to its target
     // range instead (`guards::narrowing_cast_result_range`). The bridge must not
@@ -1046,7 +1053,7 @@ mod tests {
         assert_eq!(stamped, "(= b 0)");
 
         // The bounds obligation in the SAME function carries NO solvable formula
-        // (the honest TODO gap), so it is fail-closed, not fabricated.
+        // (the honest, not yet implemented gap), so it is fail-closed, not fabricated.
         let module = lower_to_trust_ir(&oracle::multiple_asserts_one_function()).expect("lowers");
         let obs = safety_obligations_from_trust_ir_module(&module);
         let bounds: Vec<_> = obs.iter().filter(|o| o.kind == ObligationKind::BoundsCheck).collect();

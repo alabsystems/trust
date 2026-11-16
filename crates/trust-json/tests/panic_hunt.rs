@@ -5,8 +5,9 @@
 // so every probe here runs under `catch_unwind` on BOTH sides and compares
 // "did it panic", not "what did it return".
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use incumbent_serde_json as inc;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use trust_json as tj;
 
 fn panicked<F: FnOnce()>(f: F) -> bool {
@@ -20,10 +21,7 @@ fn panicked<F: FnOnce()>(f: F) -> bool {
 struct Lcg(u64);
 impl Lcg {
     fn next_u64(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let x = self.0;
         x ^ (x >> 31)
     }
@@ -72,9 +70,9 @@ fn from_slice_never_panics_where_the_incumbent_does_not() {
 #[test]
 fn structured_fuzz_never_panics_where_the_incumbent_does_not() {
     let frags: &[&str] = &[
-        "[", "]", "{", "}", ",", ":", "\"", "\\", "u", "d", "8", "0", "0", "e", "E", "+", "-",
-        ".", "1", "9", "n", "t", "f", "\\u", "\\ud800", "\\udc00", "\\uD8", "\"a\"", "null",
-        "true", "false", "1e", "0.", "-", "\u{7f}", " ", "\n", "\\\"", "[]", "{}", "\"\":",
+        "[", "]", "{", "}", ",", ":", "\"", "\\", "u", "d", "8", "0", "0", "e", "E", "+", "-", ".",
+        "1", "9", "n", "t", "f", "\\u", "\\ud800", "\\udc00", "\\uD8", "\"a\"", "null", "true",
+        "false", "1e", "0.", "-", "\u{7f}", " ", "\n", "\\\"", "[]", "{}", "\"\":",
     ];
     let mut rng = Lcg(0x243F6A8885A308D3);
     let mut diffs = Vec::new();
@@ -114,11 +112,7 @@ fn structured_fuzz_never_panics_where_the_incumbent_does_not() {
 fn formatter_non_finite_failure_modes() {
     use trust_json::Formatter as _;
     let mut fmt = tj::CompactFormatter;
-    for (name, v) in [
-        ("NaN", f64::NAN),
-        ("inf", f64::INFINITY),
-        ("-inf", f64::NEG_INFINITY),
-    ] {
+    for (name, v) in [("NaN", f64::NAN), ("inf", f64::INFINITY), ("-inf", f64::NEG_INFINITY)] {
         let mine = panicked(|| {
             let mut buf = Vec::new();
             let mut f = tj::CompactFormatter;
@@ -126,11 +120,7 @@ fn formatter_non_finite_failure_modes() {
         });
         println!("  trust-json Formatter::write_f64({name}) panicked = {mine}");
     }
-    for (name, v) in [
-        ("NaN", f32::NAN),
-        ("inf", f32::INFINITY),
-        ("-inf", f32::NEG_INFINITY),
-    ] {
+    for (name, v) in [("NaN", f32::NAN), ("inf", f32::INFINITY), ("-inf", f32::NEG_INFINITY)] {
         let mine = panicked(|| {
             let mut buf = Vec::new();
             let mut f = tj::CompactFormatter;
@@ -188,10 +178,7 @@ fn deep_value_serialize_depth_parity() {
     let a = tj::from_str(&src).unwrap();
     let b = inc::from_str::<inc::Value>(&src).unwrap();
     assert_eq!(tj::to_string(&a).unwrap(), inc::to_string(&b).unwrap());
-    assert_eq!(
-        tj::to_string_pretty(&a).unwrap(),
-        inc::to_string_pretty(&b).unwrap()
-    );
+    assert_eq!(tj::to_string_pretty(&a).unwrap(), inc::to_string_pretty(&b).unwrap());
     println!("  127-deep round trip OK on both sides");
 
     // The unbounded lane (`json_depth.rs` uses it) genuinely blows the stack --

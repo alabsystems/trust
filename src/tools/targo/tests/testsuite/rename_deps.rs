@@ -183,6 +183,9 @@ fn rename_twice() {
                 bar = { version = "0.1", package = "foo" }
                 [build-dependencies]
                 foo = { version = "0.1" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -192,7 +195,10 @@ fn rename_twice() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[RUNNING] `git [..] fetch [..]`
+From [ROOTURL]/registry
+ * [new ref]         HEAD       -> origin/HEAD
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] foo v0.1.0 (registry `dummy-registry`)
 [ERROR] the crate `test v0.1.0 ([ROOT]/foo)` depends on crate `foo v0.1.0` multiple times with different names
@@ -282,7 +288,7 @@ fn can_run_doc_tests() {
     foo.cargo("test -v").with_stderr_data(str![[r#"
 ...
 [DOCTEST] foo
-[RUNNING] `rustdoc [..]--test src/lib.rs [..] --extern bar=[ROOT]/foo/target/debug/deps/libbar-[HASH].rlib --extern baz=[ROOT]/foo/target/debug/deps/libbar-[HASH].rlib [..]`
+[RUNNING] `rustdoc [..]--test src/lib.rs [..] --extern bar=[ROOT]/foo/target/debug/build/bar/[HASH]/out/libbar-[HASH].rlib[..] --extern baz=[ROOT]/foo/target/debug/build/bar/[HASH]/out/libbar-[HASH].rlib [..]`
 
 "#]]).run();
 }

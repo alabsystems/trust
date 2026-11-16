@@ -1,14 +1,11 @@
 //! Implements threads.
 
 use std::mem;
-use std::sync::atomic::Ordering::Relaxed;
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
 use rand::RngExt;
-use rand::seq::IteratorRandom;
 use rustc_abi::ExternAbi;
-use rustc_const_eval::CTRL_C_RECEIVED;
 use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
@@ -19,29 +16,8 @@ use rustc_span::{DUMMY_SP, Span};
 use rustc_target::spec::Os;
 
 use crate::concurrency::GlobalDataRaceHandler;
-use crate::shims::{Epoll, EpollEvalContextExt, FileDescriptionRef, tls};
+use crate::shims::tls;
 use crate::*;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum SchedulingAction {
-    /// Execute step on the active thread.
-    ExecuteStep,
-    /// Wait for a bit, but at most as long as the duration specified.
-    /// We wake up early if an I/O event happened.
-    /// If the duration is [`None`], we sleep indefinitely. This is
-    /// only allowed when isolation is disabled and there are threads waiting for I/O!
-    SleepAndWaitForIo(Option<Duration>),
-}
-
-/// What to do with TLS allocations from terminated threads
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum TlsAllocAction {
-    /// Deallocate backing memory of thread-local statics as usual
-    Deallocate,
-    /// Skip deallocating backing memory of thread-local statics and consider all memory reachable
-    /// from them as "allowed to leak" (like global `static`s).
-    Leak,
-}
 
 /// The argument type for the "unblock" callback, indicating why the thread got unblocked.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,7 +66,7 @@ impl From<ThreadId> for u64 {
 }
 
 /// Keeps track of what the thread is blocked on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum BlockReason {
     /// The thread tried to join the specified thread and is blocked until that
     /// thread terminates.
@@ -103,18 +79,22 @@ pub enum BlockReason {
     Condvar,
     /// Blocked on a reader-writer lock.
     RwLock,
+    /// Blocked on a semaphore.
+    Semaphore,
     /// Blocked on a Futex variable.
     Futex,
     /// Blocked on an InitOnce.
     InitOnce,
-    /// Blocked on epoll.
-    Epoll { epfd: FileDescriptionRef<Epoll> },
+    /// Blocked until a file description readiness is satisfied (e.g. epoll).
+    Readiness,
     /// Blocked on eventfd.
     Eventfd,
     /// Blocked on virtual socket.
     VirtualSocket,
     /// Blocked on an IO operation.
     IO,
+    /// Thread is paused indefinitely.
+    Pause,
     /// Blocked for any reason related to GenMC, such as `assume` statements (GenMC mode only).
     /// Will be implicitly unblocked when GenMC schedules this thread again.
     Genmc,
@@ -154,8 +134,8 @@ impl<'tcx> ThreadState<'tcx> {
         matches!(self, ThreadState::Terminated)
     }
 
-    fn is_blocked_on(&self, reason: &BlockReason) -> bool {
-        matches!(self, ThreadState::Blocked { reason: actual_reason, .. } if actual_reason == reason)
+    fn is_blocked_on(&self, reason: BlockReason) -> bool {
+        matches!(self, ThreadState::Blocked { reason: actual_reason, .. } if *actual_reason == reason)
     }
 }
 
@@ -226,6 +206,14 @@ impl<'tcx> Thread<'tcx> {
     /// Return whether this thread is enabled or not.
     pub fn is_enabled(&self) -> bool {
         self.state.is_enabled()
+    }
+
+    pub fn is_terminated(&self) -> bool {
+        self.state.is_terminated()
+    }
+
+    pub fn is_blocked_on(&self, reason: BlockReason) -> bool {
+        self.state.is_blocked_on(reason)
     }
 
     /// Get the name of the current thread for display purposes; will include thread ID if not set.
@@ -351,8 +339,8 @@ impl VisitProvenance for Thread<'_> {
 impl VisitProvenance for Frame<'_, Provenance, FrameExtra<'_>> {
     fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let return_place = self.return_place();
+        let locals = self.locals();
         let Frame {
-            locals,
             extra,
             // There are some private fields we cannot access; they contain no tags.
             ..
@@ -362,7 +350,8 @@ impl VisitProvenance for Frame<'_, Provenance, FrameExtra<'_>> {
         return_place.visit_provenance(visit);
         // Locals.
         for local in locals.iter() {
-            match local.as_mplace_or_imm() {
+            // We only need the provenance so it's good for this to not be a real read.
+            match local.as_mplace_or_imm_ghost() {
                 None => {}
                 Some(Either::Left((ptr, meta))) => {
                     ptr.visit_provenance(visit);
@@ -400,7 +389,7 @@ pub struct ThreadManager<'tcx> {
     thread_local_allocs: FxHashMap<(DefId, ThreadId), StrictPointer>,
     /// A flag that indicates that we should change the active thread.
     /// Completely ignored in GenMC mode.
-    yield_active_thread: bool,
+    pub(super) yield_active_thread: bool,
     /// A flag that indicates that we should do round robin scheduling of threads else randomized scheduling is used.
     fixed_scheduling: bool,
 }
@@ -495,6 +484,10 @@ impl<'tcx> ThreadManager<'tcx> {
         &mut self.threads[self.active_thread].stack
     }
 
+    pub(super) fn all_threads(&self) -> impl Iterator<Item = (ThreadId, &Thread<'tcx>)> {
+        self.threads.iter_enumerated()
+    }
+
     pub fn all_blocked_stacks(
         &self,
     ) -> impl Iterator<Item = (ThreadId, &[Frame<'tcx, Provenance, FrameExtra<'tcx>>])> {
@@ -512,7 +505,7 @@ impl<'tcx> ThreadManager<'tcx> {
     }
 
     /// Set an active thread and return the id of the thread that was active before.
-    fn set_active_thread_id(&mut self, id: ThreadId) -> ThreadId {
+    pub(super) fn set_active_thread(&mut self, id: ThreadId) -> ThreadId {
         assert!(id.index() < self.threads.len());
         info!(
             "---------- Now executing on thread `{}` (previous: `{}`) ----------------------------------------",
@@ -620,180 +613,258 @@ impl<'tcx> ThreadManager<'tcx> {
         *state = ThreadState::Blocked { reason, deadline, callback }
     }
 
-    /// Change the active thread to some enabled thread.
-    fn yield_active_thread(&mut self) {
-        // We do not yield immediately, as swapping out the current stack while executing a MIR statement
-        // could lead to all sorts of confusion.
-        // We should only switch stacks between steps.
-        self.yield_active_thread = true;
+    pub fn fixed_scheduling(&self) -> bool {
+        self.fixed_scheduling
     }
 }
 
-impl<'tcx> EvalContextPrivExt<'tcx> for MiriInterpCx<'tcx> {}
-trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
+// Public interface to thread management.
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     #[inline]
-    fn run_on_stack_empty(&mut self) -> InterpResult<'tcx, Poll<()>> {
-        let this = self.eval_context_mut();
-        let active_thread = this.active_thread_mut();
-        active_thread.origin_span = DUMMY_SP; // reset, the old value no longer applied
-        let mut callback = active_thread
-            .on_stack_empty
-            .take()
-            .expect("`on_stack_empty` not set up, or already running");
-        let res = callback(this)?;
-        this.active_thread_mut().on_stack_empty = Some(callback);
-        interp_ok(res)
+    fn thread_id_try_from(&self, id: impl TryInto<u32>) -> Result<ThreadId, ThreadLookupError> {
+        self.eval_context_ref().machine.threads.thread_id_try_from(id)
     }
 
-    /// Decide which action to take next and on which thread.
-    ///
-    /// The currently implemented scheduling policy is the one that is commonly
-    /// used in stateless model checkers such as Loom: run the active thread as
-    /// long as we can and switch only when we have to (the active thread was
-    /// blocked, terminated, or has explicitly asked to be preempted).
-    ///
-    /// If GenMC mode is active, the scheduling is instead handled by GenMC.
-    fn schedule(&mut self) -> InterpResult<'tcx, SchedulingAction> {
-        let this = self.eval_context_mut();
-
-        // In GenMC mode, we let GenMC do the scheduling.
-        if this.machine.data_race.as_genmc_ref().is_some() {
-            loop {
-                let genmc_ctx = this.machine.data_race.as_genmc_ref().unwrap();
-                let Some(next_thread_id) = genmc_ctx.schedule_thread(this)? else {
-                    return interp_ok(SchedulingAction::ExecuteStep);
-                };
-                // If a thread is blocked on GenMC, we have to implicitly unblock it when it gets scheduled again.
-                if this.machine.threads.threads[next_thread_id]
-                    .state
-                    .is_blocked_on(&BlockReason::Genmc)
-                {
-                    info!(
-                        "GenMC: scheduling blocked thread {next_thread_id:?}, so we unblock it now."
-                    );
-                    this.unblock_thread(next_thread_id, BlockReason::Genmc)?;
-                }
-                // The thread we just unblocked may have been blocked again during the unblocking callback.
-                // In that case, we need to ask for a different thread to run next.
-                let thread_manager = &mut this.machine.threads;
-                if thread_manager.threads[next_thread_id].state.is_enabled() {
-                    // Set the new active thread.
-                    thread_manager.active_thread = next_thread_id;
-                    return interp_ok(SchedulingAction::ExecuteStep);
-                }
+    /// Get a thread-specific allocation id for the given thread-local static.
+    /// If needed, allocate a new one.
+    fn get_or_create_thread_local_alloc(
+        &mut self,
+        def_id: DefId,
+    ) -> InterpResult<'tcx, StrictPointer> {
+        let ecx = self.eval_context_mut();
+        let tcx = ecx.tcx;
+        if let Some(old_alloc) = ecx.machine.threads.get_thread_local_alloc_id(def_id) {
+            // We already have a thread-specific allocation id for this
+            // thread-local static.
+            interp_ok(old_alloc)
+        } else {
+            // We need to allocate a thread-specific allocation id for this
+            // thread-local static.
+            // First, we compute the initial value for this static.
+            if tcx.is_foreign_item(def_id) {
+                throw_unsup_format!("foreign thread-local statics are not supported");
             }
+            let params = ecx.machine.get_default_alloc_params();
+            let alloc = ecx.ctfe_query(|tcx| tcx.eval_static_initializer(def_id))?;
+            // We make a full copy of this allocation.
+            let mut alloc = alloc.inner().adjust_from_tcx(
+                &ecx.tcx,
+                |bytes, align| {
+                    interp_ok(MiriAllocBytes::from_bytes(
+                        std::borrow::Cow::Borrowed(bytes),
+                        align,
+                        params,
+                    ))
+                },
+                |ptr| ecx.global_root_pointer(ptr),
+            )?;
+            // This allocation will be deallocated when the thread dies, so it is not in read-only memory.
+            alloc.mutability = Mutability::Mut;
+            // Create a fresh allocation with this content.
+            let ptr = ecx.insert_allocation(alloc, MiriMemoryKind::Tls.into())?;
+            ecx.machine.threads.set_thread_local_alloc(def_id, ptr);
+            interp_ok(ptr)
+        }
+    }
+
+    /// Start a regular (non-main) thread.
+    #[inline]
+    fn start_regular_thread(
+        &mut self,
+        thread: Option<MPlaceTy<'tcx>>,
+        start_routine: Pointer,
+        start_abi: ExternAbi,
+        func_arg: ImmTy<'tcx>,
+        ret_layout: TyAndLayout<'tcx>,
+    ) -> InterpResult<'tcx, ThreadId> {
+        let ecx = self.eval_context_mut();
+
+        // Create the new thread
+        let current_span = ecx.machine.current_user_relevant_span();
+        let new_thread_id = ecx.machine.threads.create_thread({
+            let mut state = tls::TlsDtorsState::new_for_thread_finish();
+            Box::new(move |m| state.on_stack_empty(m))
+        });
+        match &mut ecx.machine.data_race {
+            GlobalDataRaceHandler::None => {}
+            GlobalDataRaceHandler::Vclocks(data_race) =>
+                data_race.thread_created(&ecx.machine.threads, new_thread_id, current_span),
+            GlobalDataRaceHandler::Genmc(genmc_ctx) =>
+                genmc_ctx.handle_thread_create(
+                    &ecx.machine.threads,
+                    start_routine,
+                    &func_arg,
+                    new_thread_id,
+                )?,
+        }
+        // Write the current thread-id, switch to the next thread later
+        // to treat this write operation as occurring on the current thread.
+        if let Some(thread_info_place) = thread {
+            ecx.write_scalar(
+                Scalar::from_uint(new_thread_id.to_u32(), thread_info_place.layout.size),
+                &thread_info_place,
+            )?;
         }
 
-        // We are not in GenMC mode, so we control the scheduling.
-        let thread_manager = &this.machine.threads;
-        // This thread and the program can keep going.
-        if thread_manager.threads[thread_manager.active_thread].state.is_enabled()
-            && !thread_manager.yield_active_thread
+        // Finally switch to new thread so that we can push the first stackframe.
+        // After this all accesses will be treated as occurring in the new thread.
+        let old_thread_id = ecx.machine.threads.set_active_thread(new_thread_id);
+
+        // The child inherits its parent's cpu affinity.
+        // Skips this if `machine.thread_cpu_affinity` is not initialized.
+        if let Some(thread_cpu_affinity) = &mut ecx.machine.thread_cpu_affinity
+            && let Some(cpuset) = thread_cpu_affinity.get(&old_thread_id).cloned()
         {
-            // The currently active thread is still enabled, just continue with it.
-            return interp_ok(SchedulingAction::ExecuteStep);
+            thread_cpu_affinity.insert(new_thread_id, cpuset);
         }
 
-        // The active thread yielded or got terminated. Let's see if there are any I/O events
-        // or timeouts to take care of.
+        // Perform the function pointer load in the new thread frame.
+        let instance = ecx.get_ptr_fn(start_routine)?.as_instance()?;
 
-        if this.machine.communicate() {
-            // When isolation is disabled we need to check for events for threads
-            // which are blocked on host I/O. Unlike the `poll_and_unblock` before
-            // any foreign item, the call here is needed to ensure that threads which
-            // are blocked on host I/O are woken up even if no shimmed functions are
-            // executed afterwards.
-            // We do this before running any other threads such that the threads
-            // which received events are available for scheduling afterwards.
+        // Note: the returned value is currently ignored (see the FIXME in
+        // pthread_join in shims/unix/thread.rs) because the Rust standard library does not use
+        // it.
+        let ret_place = ecx.allocate(ret_layout, MiriMemoryKind::Machine.into())?;
 
-            // Perform a non-blocking poll for newly available I/O events from the OS.
-            this.poll_and_unblock(Some(Duration::ZERO))?;
-        }
+        ecx.call_thread_root_function(
+            instance,
+            start_abi,
+            &[func_arg],
+            Some(&ret_place),
+            current_span,
+        )?;
 
-        // We also check timeouts before running any other thread, to ensure that timeouts
-        // "in the past" fire before any other thread can take an action. This ensures that for
-        // `pthread_cond_timedwait`, "an error is returned if [...] the absolute time specified by
-        // abstime has already been passed at the time of the call".
-        // <https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_cond_timedwait.html>
-        let potential_sleep_time = this.unblock_expired_deadlines()?;
+        // Restore the old active thread frame.
+        ecx.machine.threads.set_active_thread(old_thread_id);
 
-        let thread_manager = &mut this.machine.threads;
-        let rng = this.machine.rng.get_mut();
-
-        // No callbacks immediately scheduled, pick a regular thread to execute.
-        // The active thread blocked or yielded. So we go search for another enabled thread.
-        // We build the list of threads by starting with the threads after the current one, followed by
-        // the threads before the current one and then the current thread itself (i.e., this iterator acts
-        // like `threads.rotate_left(self.active_thread.index() + 1)`. This ensures that if we pick the first
-        // eligible thread, we do regular round-robin scheduling, and all threads get a chance to take a step.
-        let mut threads_iter = thread_manager
-            .threads
-            .iter_enumerated()
-            .skip(thread_manager.active_thread.index() + 1)
-            .chain(
-                thread_manager
-                    .threads
-                    .iter_enumerated()
-                    .take(thread_manager.active_thread.index() + 1),
-            )
-            .filter(|(_id, thread)| thread.state.is_enabled());
-        // Pick a new thread, and switch to it.
-        let new_thread = if thread_manager.fixed_scheduling {
-            let next = threads_iter.next();
-            drop(threads_iter);
-            next
-        } else {
-            threads_iter.choose(rng)
-        };
-
-        if let Some((id, _thread)) = new_thread {
-            if thread_manager.active_thread != id {
-                info!(
-                    "---------- Now executing on thread `{}` (previous: `{}`) ----------------------------------------",
-                    thread_manager.get_thread_display_name(id),
-                    thread_manager.get_thread_display_name(thread_manager.active_thread)
-                );
-                thread_manager.active_thread = id;
-            }
-        }
-        // This completes the `yield`, if any was requested.
-        thread_manager.yield_active_thread = false;
-
-        if thread_manager.threads[thread_manager.active_thread].state.is_enabled() {
-            return interp_ok(SchedulingAction::ExecuteStep);
-        }
-
-        // We have not found a thread to execute.
-        let threads = &this.machine.threads.threads;
-
-        if threads.iter().all(|thread| thread.state.is_terminated()) {
-            unreachable!("all threads terminated without the main thread terminating?!");
-        } else if let Some(sleep_time) = potential_sleep_time {
-            // All threads are currently blocked, but we have unexecuted
-            // timeout_callbacks, which may unblock some of the threads. Hence,
-            // sleep until the first callback.
-            interp_ok(SchedulingAction::SleepAndWaitForIo(Some(sleep_time)))
-        } else if threads.iter().any(|thread| this.is_thread_blocked_on_host(thread)) {
-            // At least one thread doesn't have a timeout set, and is blocked on host I/O or is waiting on an
-            // epoll instance which contains a host source interest. Hence, we sleep indefinitely in the
-            // hope that eventually an I/O event happens.
-            interp_ok(SchedulingAction::SleepAndWaitForIo(None))
-        } else {
-            throw_machine_stop!(TerminationInfo::GlobalDeadlock);
-        }
+        interp_ok(new_thread_id)
     }
 
-    /// Check whether the provided thread is currently blocked on host I/O.
-    /// This means, it's either blocked on an I/O operation directly or it's
-    /// blocked on an epoll instance which contains a host source interest.
-    fn is_thread_blocked_on_host(&self, thread: &Thread<'tcx>) -> bool {
-        let this = self.eval_context_ref();
-        match &thread.state {
-            ThreadState::Blocked { reason: BlockReason::IO, .. } => true,
-            ThreadState::Blocked { reason: BlockReason::Epoll { epfd }, .. } =>
-                this.has_epoll_host_interests(epfd),
-            _ => false,
+    /// Replace the active thread with an empty one, and a new on-empty handler.
+    /// The memory of the old stack is leaked.
+    /// Used to implement `exit`.
+    fn replace_active_thread_stack(&mut self, on_stack_empty: StackEmptyCallback<'tcx>) {
+        let ecx = self.eval_context_mut();
+        let thread = ecx.active_thread_mut();
+        let span = thread.current_user_relevant_span();
+
+        thread.stack.clear();
+        thread.origin_span = span;
+        thread.top_user_relevant_frame = None;
+        thread.on_stack_empty = Some(on_stack_empty);
+    }
+
+    /// Handles thread termination of the active thread: wakes up threads joining on this one,
+    /// and frees the thread's thread-local statics. `for_exit` indicates whether we are
+    /// about to exit the program; that changes some details.
+    ///
+    /// This is called by the eval loop when a thread's on_stack_empty returns `Ready`.
+    fn terminate_active_thread(&mut self, for_exit: bool) -> InterpResult<'tcx> {
+        let ecx = self.eval_context_mut();
+
+        // Mark thread as terminated.
+        let thread = ecx.active_thread_mut();
+        thread.state = ThreadState::Terminated;
+        assert!(
+            for_exit || thread.stack.is_empty(),
+            "only threads with an empty stack can be terminated"
+        );
+
+        // Deallocate TLS.
+        let gone_thread = ecx.active_thread();
+        {
+            let mut free_tls_statics = Vec::new();
+            ecx.machine.threads.thread_local_allocs.retain(|&(_def_id, thread), &mut ptr| {
+                if thread != gone_thread {
+                    // A different thread, keep this static around.
+                    return true;
+                }
+                // Delete this static from the map and from memory.
+                // We cannot free directly here as we cannot use `?` in this context.
+                free_tls_statics.push(ptr);
+                false
+            });
+            // Now free the TLS statics.
+            for ptr in free_tls_statics {
+                if for_exit {
+                    // Leak the thread-local statics rather than freeing them.
+                    if let Some(alloc) = ptr.provenance.get_alloc_id() {
+                        trace!("Thread-local static leaked and stored as static root: {:?}", alloc);
+                        ecx.machine.static_roots.push(alloc);
+                    }
+                } else {
+                    ecx.deallocate_ptr(ptr.into(), None, MiriMemoryKind::Tls.into())?;
+                }
+            }
         }
+
+        match &mut ecx.machine.data_race {
+            GlobalDataRaceHandler::None => {}
+            GlobalDataRaceHandler::Vclocks(data_race) =>
+                data_race.thread_terminated(&ecx.machine.threads),
+            GlobalDataRaceHandler::Genmc(genmc_ctx) => {
+                // Inform GenMC that the thread finished.
+                // This needs to happen once all accesses to the thread are done, including freeing any TLS statics.
+                genmc_ctx.handle_thread_finish(&ecx.machine.threads)
+            }
+        }
+
+        // Unblock joining threads.
+        let unblock_reason = BlockReason::Join(gone_thread);
+        let threads = &ecx.machine.threads.threads;
+        let joining_threads = threads
+            .iter_enumerated()
+            .filter(|(_, thread)| thread.state.is_blocked_on(unblock_reason))
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        for thread in joining_threads {
+            ecx.unblock_thread(thread, unblock_reason)?;
+        }
+
+        interp_ok(())
+    }
+
+    /// Block the current thread, with an optional timeout.
+    /// The callback will be invoked when the thread gets unblocked.
+    #[inline]
+    fn block_thread(
+        &mut self,
+        reason: BlockReason,
+        deadline: Option<Deadline>,
+        callback: DynUnblockCallback<'tcx>,
+    ) {
+        let ecx = self.eval_context_mut();
+        if deadline.is_some() && ecx.machine.data_race.as_genmc_ref().is_some() {
+            panic!("Unimplemented: Timeouts not yet supported in GenMC mode.");
+        }
+        if matches!(deadline, Some(Deadline::RealTime(_))) && !ecx.machine.communicate() {
+            panic!("cannot have `RealTime` timeout with isolation");
+        }
+        ecx.machine.threads.block_thread(reason, deadline, callback);
+    }
+
+    /// Put the blocked thread into the enabled state.
+    /// Sanity-checks that the thread previously was blocked for the right reason.
+    fn unblock_thread(&mut self, thread: ThreadId, reason: BlockReason) -> InterpResult<'tcx> {
+        let ecx = self.eval_context_mut();
+        let old_state =
+            mem::replace(&mut ecx.machine.threads.threads[thread].state, ThreadState::Enabled);
+        let callback = match old_state {
+            ThreadState::Blocked { reason: actual_reason, callback, .. } => {
+                assert_eq!(
+                    reason, actual_reason,
+                    "unblock_thread: thread was blocked for the wrong reason"
+                );
+                callback
+            }
+            _ => panic!("unblock_thread: thread was not blocked"),
+        };
+        // The callback must be executed in the previously blocked thread.
+        let old_thread = ecx.machine.threads.set_active_thread(thread);
+        callback.call(ecx, UnblockKind::Ready)?;
+        ecx.machine.threads.set_active_thread(old_thread);
+        interp_ok(())
     }
 
     /// Find all threads with expired timeouts, unblock them and execute their timeout callbacks.
@@ -801,18 +872,18 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
     /// This method returns the minimum duration until the next thread deadline.
     /// If all ready threads have no deadline set, [`None`] is returned.
     fn unblock_expired_deadlines(&mut self) -> InterpResult<'tcx, Option<Duration>> {
-        let this = self.eval_context_mut();
-        let communicate = this.machine.communicate();
+        let ecx = self.eval_context_mut();
+        let communicate = ecx.machine.communicate();
 
         let mut min_wait_time = Option::<Duration>::None;
         let mut callbacks = Vec::new();
 
-        for (id, thread) in this.machine.threads.threads.iter_enumerated_mut() {
+        for (id, thread) in ecx.machine.threads.threads.iter_enumerated_mut() {
             match &thread.state {
                 ThreadState::Blocked { deadline: Some(deadline), .. } => {
                     let wait_time = match deadline {
                         Deadline::Monotonic(instant) =>
-                            instant.duration_since(this.machine.monotonic_clock.now()),
+                            instant.duration_since(ecx.machine.monotonic_clock.now()),
                         Deadline::RealTime(time) => {
                             assert!(communicate, "cannot have `RealTime` timeout with isolation");
                             time.duration_since(SystemTime::now()).unwrap_or(Duration::ZERO)
@@ -844,264 +915,12 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
             //    thread.
             // 2. Make the scheduler the only place that can change the active
             //    thread.
-            let old_thread = this.machine.threads.set_active_thread_id(thread);
-            callback.call(this, UnblockKind::TimedOut)?;
-            this.machine.threads.set_active_thread_id(old_thread);
+            let old_thread = ecx.machine.threads.set_active_thread(thread);
+            callback.call(ecx, UnblockKind::TimedOut)?;
+            ecx.machine.threads.set_active_thread(old_thread);
         }
 
         interp_ok(min_wait_time)
-    }
-}
-
-// Public interface to thread management.
-impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
-pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
-    /// Public because this is used by Priroda.
-    fn miri_step(&mut self) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-
-        if !this.step()? {
-            // See if this thread can do something else.
-            match this.run_on_stack_empty()? {
-                Poll::Pending => {} //keep going
-                Poll::Ready(()) => {
-                    this.terminate_active_thread(TlsAllocAction::Deallocate)?;
-                }
-            }
-        }
-
-        interp_ok(())
-    }
-
-    #[inline]
-    fn thread_id_try_from(&self, id: impl TryInto<u32>) -> Result<ThreadId, ThreadLookupError> {
-        self.eval_context_ref().machine.threads.thread_id_try_from(id)
-    }
-
-    /// Get a thread-specific allocation id for the given thread-local static.
-    /// If needed, allocate a new one.
-    fn get_or_create_thread_local_alloc(
-        &mut self,
-        def_id: DefId,
-    ) -> InterpResult<'tcx, StrictPointer> {
-        let this = self.eval_context_mut();
-        let tcx = this.tcx;
-        if let Some(old_alloc) = this.machine.threads.get_thread_local_alloc_id(def_id) {
-            // We already have a thread-specific allocation id for this
-            // thread-local static.
-            interp_ok(old_alloc)
-        } else {
-            // We need to allocate a thread-specific allocation id for this
-            // thread-local static.
-            // First, we compute the initial value for this static.
-            if tcx.is_foreign_item(def_id) {
-                throw_unsup_format!("foreign thread-local statics are not supported");
-            }
-            let params = this.machine.get_default_alloc_params();
-            let alloc = this.ctfe_query(|tcx| tcx.eval_static_initializer(def_id))?;
-            // We make a full copy of this allocation.
-            let mut alloc = alloc.inner().adjust_from_tcx(
-                &this.tcx,
-                |bytes, align| {
-                    interp_ok(MiriAllocBytes::from_bytes(
-                        std::borrow::Cow::Borrowed(bytes),
-                        align,
-                        params,
-                    ))
-                },
-                |ptr| this.global_root_pointer(ptr),
-            )?;
-            // This allocation will be deallocated when the thread dies, so it is not in read-only memory.
-            alloc.mutability = Mutability::Mut;
-            // Create a fresh allocation with this content.
-            let ptr = this.insert_allocation(alloc, MiriMemoryKind::Tls.into())?;
-            this.machine.threads.set_thread_local_alloc(def_id, ptr);
-            interp_ok(ptr)
-        }
-    }
-
-    /// Start a regular (non-main) thread.
-    #[inline]
-    fn start_regular_thread(
-        &mut self,
-        thread: Option<MPlaceTy<'tcx>>,
-        start_routine: Pointer,
-        start_abi: ExternAbi,
-        func_arg: ImmTy<'tcx>,
-        ret_layout: TyAndLayout<'tcx>,
-    ) -> InterpResult<'tcx, ThreadId> {
-        let this = self.eval_context_mut();
-
-        // Create the new thread
-        let current_span = this.machine.current_user_relevant_span();
-        let new_thread_id = this.machine.threads.create_thread({
-            let mut state = tls::TlsDtorsState::default();
-            Box::new(move |m| state.on_stack_empty(m))
-        });
-        match &mut this.machine.data_race {
-            GlobalDataRaceHandler::None => {}
-            GlobalDataRaceHandler::Vclocks(data_race) =>
-                data_race.thread_created(&this.machine.threads, new_thread_id, current_span),
-            GlobalDataRaceHandler::Genmc(genmc_ctx) =>
-                genmc_ctx.handle_thread_create(
-                    &this.machine.threads,
-                    start_routine,
-                    &func_arg,
-                    new_thread_id,
-                )?,
-        }
-        // Write the current thread-id, switch to the next thread later
-        // to treat this write operation as occurring on the current thread.
-        if let Some(thread_info_place) = thread {
-            this.write_scalar(
-                Scalar::from_uint(new_thread_id.to_u32(), thread_info_place.layout.size),
-                &thread_info_place,
-            )?;
-        }
-
-        // Finally switch to new thread so that we can push the first stackframe.
-        // After this all accesses will be treated as occurring in the new thread.
-        let old_thread_id = this.machine.threads.set_active_thread_id(new_thread_id);
-
-        // The child inherits its parent's cpu affinity.
-        // Skips this if `machine.thread_cpu_affinity` is not initialized.
-        if let Some(thread_cpu_affinity) = &mut this.machine.thread_cpu_affinity
-            && let Some(cpuset) = thread_cpu_affinity.get(&old_thread_id).cloned()
-        {
-            thread_cpu_affinity.insert(new_thread_id, cpuset);
-        }
-
-        // Perform the function pointer load in the new thread frame.
-        let instance = this.get_ptr_fn(start_routine)?.as_instance()?;
-
-        // Note: the returned value is currently ignored (see the FIXME in
-        // pthread_join in shims/unix/thread.rs) because the Rust standard library does not use
-        // it.
-        let ret_place = this.allocate(ret_layout, MiriMemoryKind::Machine.into())?;
-
-        this.call_thread_root_function(
-            instance,
-            start_abi,
-            &[func_arg],
-            Some(&ret_place),
-            current_span,
-        )?;
-
-        // Restore the old active thread frame.
-        this.machine.threads.set_active_thread_id(old_thread_id);
-
-        interp_ok(new_thread_id)
-    }
-
-    /// Handles thread termination of the active thread: wakes up threads joining on this one,
-    /// and deals with the thread's thread-local statics according to `tls_alloc_action`.
-    ///
-    /// This is called by the eval loop when a thread's on_stack_empty returns `Ready`.
-    fn terminate_active_thread(&mut self, tls_alloc_action: TlsAllocAction) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-
-        // Mark thread as terminated.
-        let thread = this.active_thread_mut();
-        assert!(thread.stack.is_empty(), "only threads with an empty stack can be terminated");
-        thread.state = ThreadState::Terminated;
-
-        // Deallocate TLS.
-        let gone_thread = this.active_thread();
-        {
-            let mut free_tls_statics = Vec::new();
-            this.machine.threads.thread_local_allocs.retain(|&(_def_id, thread), &mut alloc_id| {
-                if thread != gone_thread {
-                    // A different thread, keep this static around.
-                    return true;
-                }
-                // Delete this static from the map and from memory.
-                // We cannot free directly here as we cannot use `?` in this context.
-                free_tls_statics.push(alloc_id);
-                false
-            });
-            // Now free the TLS statics.
-            for ptr in free_tls_statics {
-                match tls_alloc_action {
-                    TlsAllocAction::Deallocate =>
-                        this.deallocate_ptr(ptr.into(), None, MiriMemoryKind::Tls.into())?,
-                    TlsAllocAction::Leak =>
-                        if let Some(alloc) = ptr.provenance.get_alloc_id() {
-                            trace!(
-                                "Thread-local static leaked and stored as static root: {:?}",
-                                alloc
-                            );
-                            this.machine.static_roots.push(alloc);
-                        },
-                }
-            }
-        }
-
-        match &mut this.machine.data_race {
-            GlobalDataRaceHandler::None => {}
-            GlobalDataRaceHandler::Vclocks(data_race) =>
-                data_race.thread_terminated(&this.machine.threads),
-            GlobalDataRaceHandler::Genmc(genmc_ctx) => {
-                // Inform GenMC that the thread finished.
-                // This needs to happen once all accesses to the thread are done, including freeing any TLS statics.
-                genmc_ctx.handle_thread_finish(&this.machine.threads)
-            }
-        }
-
-        // Unblock joining threads.
-        let unblock_reason = BlockReason::Join(gone_thread);
-        let threads = &this.machine.threads.threads;
-        let joining_threads = threads
-            .iter_enumerated()
-            .filter(|(_, thread)| thread.state.is_blocked_on(&unblock_reason))
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>();
-        for thread in joining_threads {
-            this.unblock_thread(thread, unblock_reason.clone())?;
-        }
-
-        interp_ok(())
-    }
-
-    /// Block the current thread, with an optional timeout.
-    /// The callback will be invoked when the thread gets unblocked.
-    #[inline]
-    fn block_thread(
-        &mut self,
-        reason: BlockReason,
-        deadline: Option<Deadline>,
-        callback: DynUnblockCallback<'tcx>,
-    ) {
-        let this = self.eval_context_mut();
-        if deadline.is_some() && this.machine.data_race.as_genmc_ref().is_some() {
-            panic!("Unimplemented: Timeouts not yet supported in GenMC mode.");
-        }
-        if matches!(deadline, Some(Deadline::RealTime(_))) && !this.machine.communicate() {
-            panic!("cannot have `RealTime` timeout with isolation");
-        }
-        this.machine.threads.block_thread(reason, deadline, callback);
-    }
-
-    /// Put the blocked thread into the enabled state.
-    /// Sanity-checks that the thread previously was blocked for the right reason.
-    fn unblock_thread(&mut self, thread: ThreadId, reason: BlockReason) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-        let old_state =
-            mem::replace(&mut this.machine.threads.threads[thread].state, ThreadState::Enabled);
-        let callback = match old_state {
-            ThreadState::Blocked { reason: actual_reason, callback, .. } => {
-                assert_eq!(
-                    reason, actual_reason,
-                    "unblock_thread: thread was blocked for the wrong reason"
-                );
-                callback
-            }
-            _ => panic!("unblock_thread: thread was not blocked"),
-        };
-        // The callback must be executed in the previously blocked thread.
-        let old_thread = this.machine.threads.set_active_thread_id(thread);
-        callback.call(this, UnblockKind::Ready)?;
-        this.machine.threads.set_active_thread_id(old_thread);
-        interp_ok(())
     }
 
     #[inline]
@@ -1110,8 +929,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         thread_id: ThreadId,
         allow_terminated_joined: bool,
     ) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-        this.machine.threads.detach_thread(thread_id, allow_terminated_joined)
+        let ecx = self.eval_context_mut();
+        ecx.machine.threads.detach_thread(thread_id, allow_terminated_joined)
     }
 
     /// Mark that the active thread tries to join the thread with `joined_thread_id`.
@@ -1123,28 +942,28 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         success_retval: Scalar,
         return_dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-        let thread_mgr = &mut this.machine.threads;
+        let ecx = self.eval_context_mut();
+        let thread_mgr = &mut ecx.machine.threads;
         if thread_mgr.threads[joined_thread_id].join_status == ThreadJoinStatus::Detached {
             // On Windows this corresponds to joining on a closed handle.
             throw_ub_format!("trying to join a detached thread");
         }
 
         fn after_join<'tcx>(
-            this: &mut InterpCx<'tcx, MiriMachine<'tcx>>,
+            ecx: &mut MiriInterpCx<'tcx>,
             joined_thread_id: ThreadId,
             success_retval: Scalar,
             return_dest: &MPlaceTy<'tcx>,
         ) -> InterpResult<'tcx> {
-            let threads = &this.machine.threads;
-            match &mut this.machine.data_race {
+            let threads = &ecx.machine.threads;
+            match &mut ecx.machine.data_race {
                 GlobalDataRaceHandler::None => {}
                 GlobalDataRaceHandler::Vclocks(data_race) =>
                     data_race.thread_joined(threads, joined_thread_id),
                 GlobalDataRaceHandler::Genmc(genmc_ctx) =>
                     genmc_ctx.handle_thread_join(threads.active_thread, joined_thread_id)?,
             }
-            this.write_scalar(success_retval, return_dest)?;
+            ecx.write_scalar(success_retval, return_dest)?;
             interp_ok(())
         }
 
@@ -1156,7 +975,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 "{:?} blocked on {:?} when trying to join",
                 thread_mgr.active_thread, joined_thread_id
             );
-            if let Some(genmc_ctx) = this.machine.data_race.as_genmc_ref() {
+            if let Some(genmc_ctx) = ecx.machine.data_race.as_genmc_ref() {
                 genmc_ctx.handle_thread_join(thread_mgr.active_thread, joined_thread_id)?;
             }
 
@@ -1180,7 +999,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             );
         } else {
             // The thread has already terminated - establish happens-before and write the return value.
-            after_join(this, joined_thread_id, success_retval, return_dest)?;
+            after_join(ecx, joined_thread_id, success_retval, return_dest)?;
         }
         interp_ok(())
     }
@@ -1195,75 +1014,75 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         success_retval: Scalar,
         return_dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-        let threads = &this.machine.threads.threads;
+        let ecx = self.eval_context_mut();
+        let threads = &ecx.machine.threads.threads;
         if threads[joined_thread_id].join_status == ThreadJoinStatus::Joined {
             throw_ub_format!("trying to join an already joined thread");
         }
 
-        if joined_thread_id == this.machine.threads.active_thread {
+        if joined_thread_id == ecx.machine.threads.active_thread {
             throw_ub_format!("trying to join itself");
         }
 
         // Sanity check `join_status`.
         assert!(
-            threads.iter().all(|thread| {
-                !thread.state.is_blocked_on(&BlockReason::Join(joined_thread_id))
-            }),
+            threads
+                .iter()
+                .all(|thread| { !thread.state.is_blocked_on(BlockReason::Join(joined_thread_id)) }),
             "this thread already has threads waiting for its termination"
         );
 
-        this.join_thread(joined_thread_id, success_retval, return_dest)
+        ecx.join_thread(joined_thread_id, success_retval, return_dest)
     }
 
     #[inline]
     fn active_thread(&self) -> ThreadId {
-        let this = self.eval_context_ref();
-        this.machine.threads.active_thread()
+        let ecx = self.eval_context_ref();
+        ecx.machine.threads.active_thread()
     }
 
     #[inline]
     fn active_thread_mut(&mut self) -> &mut Thread<'tcx> {
-        let this = self.eval_context_mut();
-        this.machine.threads.active_thread_mut()
+        let ecx = self.eval_context_mut();
+        ecx.machine.threads.active_thread_mut()
     }
 
     #[inline]
     fn active_thread_ref(&self) -> &Thread<'tcx> {
-        let this = self.eval_context_ref();
-        this.machine.threads.active_thread_ref()
+        let ecx = self.eval_context_ref();
+        ecx.machine.threads.active_thread_ref()
     }
 
     #[inline]
     fn get_total_thread_count(&self) -> usize {
-        let this = self.eval_context_ref();
-        this.machine.threads.get_total_thread_count()
+        let ecx = self.eval_context_ref();
+        ecx.machine.threads.get_total_thread_count()
     }
 
     #[inline]
     fn have_all_terminated(&self) -> bool {
-        let this = self.eval_context_ref();
-        this.machine.threads.have_all_terminated()
+        let ecx = self.eval_context_ref();
+        ecx.machine.threads.have_all_terminated()
     }
 
     #[inline]
     fn enable_thread(&mut self, thread_id: ThreadId) {
-        let this = self.eval_context_mut();
-        this.machine.threads.enable_thread(thread_id);
+        let ecx = self.eval_context_mut();
+        ecx.machine.threads.enable_thread(thread_id);
     }
 
     #[inline]
     fn active_thread_stack<'a>(&'a self) -> &'a [Frame<'tcx, Provenance, FrameExtra<'tcx>>] {
-        let this = self.eval_context_ref();
-        this.machine.threads.active_thread_stack()
+        let ecx = self.eval_context_ref();
+        ecx.machine.threads.active_thread_stack()
     }
 
     #[inline]
     fn active_thread_stack_mut<'a>(
         &'a mut self,
     ) -> &'a mut Vec<Frame<'tcx, Provenance, FrameExtra<'tcx>>> {
-        let this = self.eval_context_mut();
-        this.machine.threads.active_thread_stack_mut()
+        let ecx = self.eval_context_mut();
+        ecx.machine.threads.active_thread_stack_mut()
     }
 
     /// Set the name of the current thread. The buffer must not include the null terminator.
@@ -1282,47 +1101,19 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     #[inline]
     fn yield_active_thread(&mut self) {
-        self.eval_context_mut().machine.threads.yield_active_thread();
+        // We do not yield immediately, as swapping out the current stack while executing a MIR statement
+        // could lead to all sorts of confusion.
+        // We should only switch stacks between steps.
+        self.eval_context_mut().machine.threads.yield_active_thread = true;
     }
 
     #[inline]
     fn maybe_preempt_active_thread(&mut self) {
-        let this = self.eval_context_mut();
-        if !this.machine.threads.fixed_scheduling
-            && this.machine.rng.get_mut().random_bool(this.machine.preemption_rate)
+        let ecx = self.eval_context_mut();
+        if !ecx.machine.threads.fixed_scheduling
+            && ecx.machine.rng.get_mut().random_bool(ecx.machine.preemption_rate)
         {
-            this.yield_active_thread();
-        }
-    }
-
-    /// Run the core interpreter loop. Returns only when an interrupt occurs (an error or program
-    /// termination).
-    fn run_threads(&mut self) -> InterpResult<'tcx, !> {
-        let this = self.eval_context_mut();
-        loop {
-            if CTRL_C_RECEIVED.load(Relaxed) {
-                this.machine.handle_abnormal_termination();
-                throw_machine_stop!(TerminationInfo::Interrupted);
-            }
-            match this.schedule()? {
-                SchedulingAction::ExecuteStep => {
-                    this.miri_step()?;
-                }
-                SchedulingAction::SleepAndWaitForIo(duration) => {
-                    if this.machine.communicate() {
-                        // When we're running with isolation disabled, instead of
-                        // strictly sleeping the duration we allow waking up
-                        // early for I/O events from the OS.
-
-                        this.poll_and_unblock(duration)?;
-                    } else {
-                        let duration = duration.expect(
-                            "Infinite sleep should not be triggered when isolation is enabled",
-                        );
-                        this.machine.monotonic_clock.sleep(duration);
-                    }
-                }
-            }
+            ecx.yield_active_thread();
         }
     }
 }

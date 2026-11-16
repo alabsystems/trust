@@ -162,8 +162,10 @@ pub enum SyntaxKind {
     ERROR,
     FRONTMATTER,
     IDENT,
+    INNER_DOC_COMMENT,
     LIFETIME_IDENT,
     NEWLINE,
+    OUTER_DOC_COMMENT,
     SHEBANG,
     WHITESPACE,
     ABI,
@@ -197,6 +199,8 @@ pub enum SyntaxKind {
     CFG_ATTR_META,
     CFG_COMPOSITE,
     CFG_META,
+    CFG_PRED_EXPR,
+    CFG_PRED_PAT,
     CLOSURE_EXPR,
     CONST,
     CONST_ARG,
@@ -204,6 +208,7 @@ pub enum SyntaxKind {
     CONST_PARAM,
     CONTINUE_EXPR,
     DEREF_PAT,
+    DOC_COMMENT,
     DYN_TRAIT_TYPE,
     ENUM,
     EXPR_STMT,
@@ -214,7 +219,6 @@ pub enum SyntaxKind {
     FN,
     FN_PTR_TYPE,
     FORMAT_ARGS_ARG,
-    FORMAT_ARGS_ARG_NAME,
     FORMAT_ARGS_EXPR,
     FOR_BINDER,
     FOR_EXPR,
@@ -385,6 +389,8 @@ impl SyntaxKind {
             | CFG_ATTR_META
             | CFG_COMPOSITE
             | CFG_META
+            | CFG_PRED_EXPR
+            | CFG_PRED_PAT
             | CLOSURE_EXPR
             | CONST
             | CONST_ARG
@@ -392,6 +398,7 @@ impl SyntaxKind {
             | CONST_PARAM
             | CONTINUE_EXPR
             | DEREF_PAT
+            | DOC_COMMENT
             | DYN_TRAIT_TYPE
             | ENUM
             | EXPR_STMT
@@ -402,7 +409,6 @@ impl SyntaxKind {
             | FN
             | FN_PTR_TYPE
             | FORMAT_ARGS_ARG
-            | FORMAT_ARGS_ARG_NAME
             | FORMAT_ARGS_EXPR
             | FOR_BINDER
             | FOR_EXPR
@@ -528,8 +534,10 @@ impl SyntaxKind {
             | ERROR
             | FRONTMATTER
             | IDENT
+            | INNER_DOC_COMMENT
             | LIFETIME_IDENT
             | NEWLINE
+            | OUTER_DOC_COMMENT
             | SHEBANG
             | WHITESPACE => panic!("no text for these `SyntaxKind`s"),
             DOLLAR => "$",
@@ -998,6 +1006,104 @@ impl SyntaxKind {
         };
         Some(kw)
     }
+    #[doc = r" Matches any keyword, regardless of edition or contextuality."]
+    #[expect(unreachable_patterns)]
+    pub fn from_any_keyword(ident: &str) -> Option<SyntaxKind> {
+        let kw = match ident {
+            "Self" => SELF_TYPE_KW,
+            "abstract" => ABSTRACT_KW,
+            "as" => AS_KW,
+            "become" => BECOME_KW,
+            "box" => BOX_KW,
+            "break" => BREAK_KW,
+            "const" => CONST_KW,
+            "continue" => CONTINUE_KW,
+            "crate" => CRATE_KW,
+            "do" => DO_KW,
+            "else" => ELSE_KW,
+            "enum" => ENUM_KW,
+            "extern" => EXTERN_KW,
+            "false" => FALSE_KW,
+            "final" => FINAL_KW,
+            "fn" => FN_KW,
+            "for" => FOR_KW,
+            "if" => IF_KW,
+            "impl" => IMPL_KW,
+            "in" => IN_KW,
+            "let" => LET_KW,
+            "loop" => LOOP_KW,
+            "macro" => MACRO_KW,
+            "match" => MATCH_KW,
+            "mod" => MOD_KW,
+            "move" => MOVE_KW,
+            "mut" => MUT_KW,
+            "override" => OVERRIDE_KW,
+            "priv" => PRIV_KW,
+            "pub" => PUB_KW,
+            "ref" => REF_KW,
+            "return" => RETURN_KW,
+            "self" => SELF_KW,
+            "static" => STATIC_KW,
+            "struct" => STRUCT_KW,
+            "super" => SUPER_KW,
+            "trait" => TRAIT_KW,
+            "true" => TRUE_KW,
+            "type" => TYPE_KW,
+            "typeof" => TYPEOF_KW,
+            "unsafe" => UNSAFE_KW,
+            "unsized" => UNSIZED_KW,
+            "use" => USE_KW,
+            "virtual" => VIRTUAL_KW,
+            "where" => WHERE_KW,
+            "while" => WHILE_KW,
+            "yield" => YIELD_KW,
+            "async" => ASYNC_KW,
+            "await" => AWAIT_KW,
+            "dyn" => DYN_KW,
+            "gen" => GEN_KW,
+            "try" => TRY_KW,
+            "asm" => ASM_KW,
+            "att_syntax" => ATT_SYNTAX_KW,
+            "auto" => AUTO_KW,
+            "bikeshed" => BIKESHED_KW,
+            "builtin" => BUILTIN_KW,
+            "cfg" => CFG_KW,
+            "cfg_attr" => CFG_ATTR_KW,
+            "clobber_abi" => CLOBBER_ABI_KW,
+            "default" => DEFAULT_KW,
+            "deref" => DEREF_KW,
+            "dyn" => DYN_KW,
+            "format_args" => FORMAT_ARGS_KW,
+            "global_asm" => GLOBAL_ASM_KW,
+            "include_bytes" => INCLUDE_BYTES_KW,
+            "inlateout" => INLATEOUT_KW,
+            "inout" => INOUT_KW,
+            "is" => IS_KW,
+            "label" => LABEL_KW,
+            "lateout" => LATEOUT_KW,
+            "macro_rules" => MACRO_RULES_KW,
+            "may_unwind" => MAY_UNWIND_KW,
+            "naked_asm" => NAKED_ASM_KW,
+            "nomem" => NOMEM_KW,
+            "noreturn" => NORETURN_KW,
+            "nostack" => NOSTACK_KW,
+            "null" => NULL_KW,
+            "offset_of" => OFFSET_OF_KW,
+            "options" => OPTIONS_KW,
+            "out" => OUT_KW,
+            "pattern_type" => PATTERN_TYPE_KW,
+            "preserves_flags" => PRESERVES_FLAGS_KW,
+            "pure" => PURE_KW,
+            "raw" => RAW_KW,
+            "readonly" => READONLY_KW,
+            "safe" => SAFE_KW,
+            "sym" => SYM_KW,
+            "union" => UNION_KW,
+            "yeet" => YEET_KW,
+            _ => return None,
+        };
+        Some(kw)
+    }
     pub fn from_contextual_keyword(ident: &str, edition: Edition) -> Option<SyntaxKind> {
         let kw = match ident {
             "asm" => ASM_KW,
@@ -1228,6 +1334,8 @@ macro_rules ! T_ {
     [string] => { $ crate :: SyntaxKind :: STRING };
     [shebang] => { $ crate :: SyntaxKind :: SHEBANG };
     [frontmatter] => { $ crate :: SyntaxKind :: FRONTMATTER };
+    [inner_doc_comment] => { $ crate :: SyntaxKind :: INNER_DOC_COMMENT };
+    [outer_doc_comment] => { $ crate :: SyntaxKind :: OUTER_DOC_COMMENT };
 }
 
 impl ::core::marker::Copy for SyntaxKind {}

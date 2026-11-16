@@ -72,6 +72,9 @@ use trust_types::{
     Terminator, VcKind, VerifiableFunction, VerificationCondition, VerificationResult,
 };
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn load(name: &str) -> VerifiableFunction {
     let path = format!("{}/tests/data/{name}.json", env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(&path)
@@ -89,7 +92,7 @@ fn async_sentinel() -> VerifiableFunction {
 }
 
 fn refuted(vcs: &[VerificationCondition]) -> Vec<String> {
-    let router = trust_router::Router::deterministic_in_process_ay(60_000);
+    let router = test_router::deterministic_test_router();
     router
         .verify_all(vcs)
         .into_iter()
@@ -187,7 +190,7 @@ fn the_resumed_after_sentinel_row_is_present_and_survives_the_budget_trip() {
         "the row's violation core must be the tautology: {:?}",
         sentinel_rows.iter().map(|vc| &vc.formula).collect::<Vec<_>>()
     );
-    let router = trust_router::Router::deterministic_in_process_ay(60_000);
+    let router = test_router::deterministic_test_router();
     for (vc, result) in router.verify_all(&vcs) {
         if is_sentinel_row(&vc) {
             assert!(

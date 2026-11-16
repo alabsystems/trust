@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 // trust-types/result.rs: Verification results
 //
 // What solvers return after checking a verification condition.
@@ -16,6 +17,14 @@ use sha2::{Digest, Sha256};
 use crate::formula::{ProofLevel, RuntimeCheckEnv, VcKind, VerificationCondition};
 use crate::outcome::Outcome;
 use crate::{SourceSpan, Symbol};
+
+mod native_body_wp;
+pub use native_body_wp::modern_body_wp_proof_defect;
+mod source_clause;
+pub use source_clause::{
+    SOURCE_CLAUSE_PROOF_BACKEND, SOURCE_CLAUSE_PROOF_SCHEMA, SOURCE_CLAUSE_PROOF_SUITE,
+    source_clause_certificate_payload,
+};
 
 // ---------------------------------------------------------------------------
 // SMT theory classification for TheoryLemma reasoning kind.
@@ -186,11 +195,14 @@ pub struct NativeProofEnvelope {
     /// What kind of native evidence the artifacts claim to be. Closed enum —
     /// see [`NativeProofEnvelopeKind`] for why bounded kinds cannot exist.
     pub kind: NativeProofEnvelopeKind,
-    /// The FULL canonical exact-VC claim payload string
-    /// (`trustc.transport-exact-vc-claim.v2`) for the obligation this
-    /// envelope claims to discharge. Carried in full — not just a digest —
-    /// so a replay gate can bind by structural payload equality (U7), and an
-    /// offline auditor can read the claim without the producing compiler.
+    /// The FULL claim payload string for the obligation this envelope claims
+    /// to discharge, in the producer's own rendering: ay-certify's is the
+    /// formula's own JSON (`trust_router::ay_certify`'s `claim_payload_for`),
+    /// and a compiler-side producer would carry the exact-VC claim (schema
+    /// `trustc.exact-vc-claim.v3` since T3 L4 C09w). Carried in full — not
+    /// just a digest — so a replay gate can bind by structural payload
+    /// equality (U7), and an offline auditor can read the claim without the
+    /// producing compiler. Correlation only, like the digest below.
     pub claim_payload: String,
     /// Hex SHA-256 of `claim_payload`. **Correlation only — grants nothing.**
     /// A gate that cares recomputes the digest from `claim_payload` (or,
@@ -260,8 +272,15 @@ impl NativeProofEnvelope {
         self.schema == NATIVE_PROOF_ENVELOPE_SCHEMA
             && !self.claim_payload.is_empty()
             && !self.artifacts.is_empty()
-            && self.artifacts.len() <= NATIVE_PROOF_ENVELOPE_MAX_ARTIFACTS
-            && self.total_carried_bytes() <= NATIVE_PROOF_ENVELOPE_MAX_TOTAL_BYTES
+            // T3 L4 (C06a): each size refusal is a CAP hit (`crate::audit_ledger`).
+            && !crate::audit_ledger::cap_hit_if(
+                self.artifacts.len() > NATIVE_PROOF_ENVELOPE_MAX_ARTIFACTS,
+                "crates/trust-types/src/result.rs:NATIVE_PROOF_ENVELOPE_MAX_ARTIFACTS",
+            )
+            && !crate::audit_ledger::cap_hit_if(
+                self.total_carried_bytes() > NATIVE_PROOF_ENVELOPE_MAX_TOTAL_BYTES,
+                "crates/trust-types/src/result.rs:NATIVE_PROOF_ENVELOPE_MAX_TOTAL_BYTES",
+            )
     }
 }
 
@@ -287,7 +306,12 @@ impl NativeProofEnvelopeParseBudget {
 
     /// Reserve payload bytes before allocating them in the decoded carrier.
     fn reserve(&mut self, bytes: usize) -> bool {
-        if self.invalid || bytes > self.remaining {
+        if self.invalid
+            || crate::audit_ledger::cap_hit_if(
+                bytes > self.remaining,
+                "crates/trust-types/src/result.rs:NATIVE_PROOF_ENVELOPE_MAX_TOTAL_BYTES",
+            )
+        {
             self.invalid = true;
             return false;
         }
@@ -920,9 +944,12 @@ impl<'de> DeserializeSeed<'de> for NativeProofArtifactsSeed<'_> {
                 A: SeqAccess<'de>,
             {
                 if self.budget.invalid
-                    || sequence
-                        .size_hint()
-                        .is_some_and(|hint| hint > NATIVE_PROOF_ENVELOPE_MAX_ARTIFACTS)
+                    || crate::audit_ledger::cap_hit_if(
+                        sequence
+                            .size_hint()
+                            .is_some_and(|hint| hint > NATIVE_PROOF_ENVELOPE_MAX_ARTIFACTS),
+                        "crates/trust-types/src/result.rs:NATIVE_PROOF_ENVELOPE_MAX_ARTIFACTS",
+                    )
                 {
                     self.budget.invalidate();
                     discard_native_proof_sequence(&mut sequence)?;
@@ -944,7 +971,10 @@ impl<'de> DeserializeSeed<'de> for NativeProofArtifactsSeed<'_> {
                         }
                     }
                 }
-                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                if crate::audit_ledger::cap_hit_if(
+                    sequence.next_element::<IgnoredAny>()?.is_some(),
+                    "crates/trust-types/src/result.rs:NATIVE_PROOF_ENVELOPE_MAX_ARTIFACTS",
+                ) {
                     self.budget.invalidate();
                     discard_native_proof_sequence(&mut sequence)?;
                     return Ok(None);
@@ -1628,6 +1658,48 @@ impl ProofStrength {
         Self { reasoning: ReasoningKind::Smt, assurance: AssuranceLevel::Certified }
     }
 
+    /// Trust (ref-self I1): a CONSTRUCTIVE kernel proof whose correspondence to
+    /// the Rust function rests on the borrow-erased PARAMETER VIEW
+    /// (`trust_types::e6_param_view`) and therefore on an unproved aliasing
+    /// assumption — R1, carried as a named row in `docs/TCB.md`.
+    ///
+    /// The reasoning really is `Constructive` (a Clean CIC kernel re-check of a
+    /// closed proof term did happen), and the assurance is deliberately
+    /// [`AssuranceLevel::Trusted`], not [`AssuranceLevel::Certified`]: the term
+    /// proves a proposition about the pointee's field VALUES at entry, and that
+    /// those values ARE what the Rust function reads is asserted, not proved.
+    /// `Trusted` is below [`AssuranceLevel::meets_reporting_floor`], so a
+    /// consumer that applies `require_reporting_floor` (`trust-report`'s
+    /// `result_to_outcome`, `trust-router`'s report builder) rewrites such a
+    /// `Proved` into `Unknown`. That is a SECOND demotion by an unrelated
+    /// mechanism, and it is intended: it means no surface can report this row as
+    /// proof of the obligation. It is not the one the authenticated lane uses —
+    /// that one withholds the row because it ships no kernel proof evidence at
+    /// all (`kernel_evidence_for` returns `None` for the view authority) — and
+    /// neither path is reachable from `rustc_mir_transform`, which has no
+    /// `trust_report` dependency. Both directions are what R1 requires ("no
+    /// `Certified` row may rest on an unproved aliasing assumption").
+    #[must_use]
+    pub fn view_erased_constructive() -> Self {
+        Self { reasoning: ReasoningKind::Constructive, assurance: AssuranceLevel::Trusted }
+    }
+
+    /// Trust (OR-A1, 2026-09-27): a CONSTRUCTIVE kernel proof of a
+    /// postcondition UNDER the function's own `requires` — a cited theorem the
+    /// Clean kernel re-checked against the conditional goal
+    /// `∀ params, P_0 → … → P_{n-1} → Q`, whose requires→hypothesis link (what
+    /// callers are charged implies what the theorem consumed) is NOT itself a
+    /// kernel judgment. The same value as [`Self::view_erased_constructive`] —
+    /// `Constructive` reasoning, [`AssuranceLevel::Trusted`] — under its own
+    /// name, so a reader of the call site sees which assumption the row rests
+    /// on and a later increment can move one class without the other. Below
+    /// the reporting floor, like the view strength, for the same reason: no
+    /// surface may report such a row as proof of the obligation.
+    #[must_use]
+    pub fn requires_conditioned_constructive() -> Self {
+        Self { reasoning: ReasoningKind::Constructive, assurance: AssuranceLevel::Trusted }
+    }
+
     /// BMC checked all states to depth k with no violation.
     #[must_use]
     pub fn bounded(depth: u64) -> Self {
@@ -1727,25 +1799,99 @@ impl ProofStrength {
 /// `ProofStrength` conflates reasoning method with certification status;
 /// `ProofEvidence` keeps them orthogonal so that e.g. a `BoundedDepth`
 /// result can never silently upgrade to `Certified`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Serialization (KR0 switch review, problem 2): a human-readable format
+/// (JSON) omits an absent `kernel_theory`/`env_digest`, so an unstamped row
+/// keeps its pre-switch spelling; a positional binary format (bincode, which
+/// `trust_proof_cert::SolverInfo` goes through) always writes both, because a
+/// skipped field there misaligns every byte after it. See the hand-written
+/// `Serialize` impl below.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct ProofEvidence {
     /// What kind of reasoning was used to prove the property.
     pub reasoning: ReasoningKind,
     /// How much independent assurance backs the proof.
     pub assurance: AssuranceLevel,
+    /// The kernel theory a `Certified` check ran in, read off the Clean
+    /// reference entry's `ReferenceAccepted` token (KR0 switch). `None` on
+    /// every row not checked through the entry, and on every row written
+    /// before the switch (`serde(default)`): such a row is not Certified
+    /// ([`Self::is_certified`]), which is the fail-closed reading.
+    #[serde(default)]
+    pub kernel_theory: Option<crate::KernelTheoryId>,
+    /// The environment that check ran against (the token's `EnvDigest`).
+    #[serde(default)]
+    pub env_digest: Option<crate::KernelEnvDigest>,
+}
+
+impl Serialize for ProofEvidence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Only a self-describing (human-readable) format may leave a field
+        // out: its reader finds fields by name and `serde(default)` fills the
+        // gap. A positional binary format has no names, so it gets every field.
+        let omit_absent = serializer.is_human_readable();
+        let write_theory = !omit_absent || self.kernel_theory.is_some();
+        let write_digest = !omit_absent || self.env_digest.is_some();
+        let len = 2 + usize::from(write_theory) + usize::from(write_digest);
+        let mut state = serializer.serialize_struct("ProofEvidence", len)?;
+        state.serialize_field("reasoning", &self.reasoning)?;
+        state.serialize_field("assurance", &self.assurance)?;
+        if write_theory {
+            state.serialize_field("kernel_theory", &self.kernel_theory)?;
+        } else {
+            state.skip_field("kernel_theory")?;
+        }
+        if write_digest {
+            state.serialize_field("env_digest", &self.env_digest)?;
+        } else {
+            state.skip_field("env_digest")?;
+        }
+        state.end()
+    }
 }
 
 impl ProofEvidence {
-    /// Create a new `ProofEvidence` from reasoning kind and assurance level.
+    /// Create a new `ProofEvidence` from reasoning kind and assurance level,
+    /// with no kernel theory (so never [`Self::is_certified`]).
     #[must_use]
     pub fn new(reasoning: ReasoningKind, assurance: AssuranceLevel) -> Self {
-        Self { reasoning, assurance }
+        Self { reasoning, assurance, kernel_theory: None, env_digest: None }
     }
 
-    /// Whether this evidence has been independently certified (clean kernel).
+    /// This evidence stamped with the kernel theory and environment a Clean
+    /// reference-entry token named. Only `trust-certify`'s reference mint has
+    /// those values to hand; a stamp alone never makes a row Certified, the
+    /// assurance must say so too.
+    #[must_use]
+    pub fn with_kernel_reference(
+        mut self,
+        theory: crate::KernelTheoryId,
+        env_digest: crate::KernelEnvDigest,
+    ) -> Self {
+        self.kernel_theory = Some(theory);
+        self.env_digest = Some(env_digest);
+        self
+    }
+
+    /// Whether this evidence has been independently certified by the Clean
+    /// kernel through its reference entry: `Certified` assurance AND a kernel
+    /// theory and environment from a `ReferenceAccepted` token. A `Certified`
+    /// assurance with no theory (an old row, or a mint that bypassed the
+    /// entry) is not certified.
     #[must_use]
     pub fn is_certified(&self) -> bool {
         matches!(self.assurance, AssuranceLevel::Certified)
+            && self.kernel_theory.is_some()
+            && self.env_digest.is_some()
+    }
+
+    /// The same claim with no kernel stamp: what a `ProofStrength` can say.
+    /// Equality on this is the strength/evidence agreement contract; the stamp
+    /// is checked on its own ([`Self::is_certified`]).
+    #[must_use]
+    pub fn without_kernel_reference(&self) -> Self {
+        Self::new(self.reasoning.clone(), self.assurance.clone())
     }
 
     /// Whether this evidence comes from bounded (incomplete) reasoning.
@@ -1788,7 +1934,7 @@ impl From<ProofStrength> for ProofEvidence {
             // New variants pass through directly.
             other => other,
         };
-        Self { reasoning: ps.reasoning, assurance }
+        Self::new(ps.reasoning, assurance)
     }
 }
 
@@ -1934,9 +2080,13 @@ impl Counterexample {
 
 impl std::fmt::Display for Counterexample {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let parts: Vec<String> =
-            self.assignments.iter().map(|(name, val)| format!("{name} = {val}")).collect();
-        write!(f, "{}", parts.join(", "))
+        for (idx, (name, val)) in self.assignments.iter().enumerate() {
+            if idx > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{name} = {val}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1968,6 +2118,16 @@ pub enum CounterexampleValue {
         u128,
     ),
     Float(f64),
+    /// A model value with no scalar carrier above, rendered EXACTLY as the
+    /// solver spells it in SMT-LIB: a datatype constructor application
+    /// (`(succ zero)`), an array store chain, an exact rational, a string or
+    /// an uninterpreted-sort element. Faithful by construction — the text is
+    /// the solver's own model literal — where a scalar stand-in (the old
+    /// `Int(0)` placeholder) would have been a fabricated witness: a
+    /// counterexample is read by people and replayed by machinery, and both
+    /// must see the value the solver actually found. Consumers that only
+    /// understand scalars treat it as an opaque, non-replayable value.
+    Term(String),
 }
 
 /// Serialize an `i128` without producing JSON that our own deserializer cannot
@@ -1987,7 +2147,7 @@ where
     } else if let Ok(value) = u64::try_from(*value) {
         serializer.serialize_u64(value)
     } else {
-        serializer.serialize_str(&value.to_string())
+        serializer.collect_str(value)
     }
 }
 
@@ -2004,7 +2164,7 @@ where
     if let Ok(value) = u64::try_from(*value) {
         serializer.serialize_u64(value)
     } else {
-        serializer.serialize_str(&value.to_string())
+        serializer.collect_str(value)
     }
 }
 
@@ -2087,6 +2247,7 @@ impl std::fmt::Display for CounterexampleValue {
             CounterexampleValue::Int(n) => write!(f, "{n}"),
             CounterexampleValue::Uint(n) => write!(f, "{n}"),
             CounterexampleValue::Float(n) => write!(f, "{n}"),
+            CounterexampleValue::Term(term) => f.write_str(term),
         }
     }
 }
@@ -2132,9 +2293,13 @@ impl std::fmt::Display for CounterexampleTrace {
             if let Some(ref pp) = step.program_point {
                 write!(f, "[{pp}] ")?;
             }
-            let assigns: Vec<String> =
-                step.assignments.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            writeln!(f, "{}", assigns.join(", "))?;
+            for (idx, (k, v)) in step.assignments.iter().enumerate() {
+                if idx > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{k}={v}")?;
+            }
+            f.write_str("\n")?;
         }
         Ok(())
     }
@@ -2174,8 +2339,13 @@ pub struct FunctionSummary {
     /// Number checked at runtime instead of proved statically.
     #[serde(default)]
     pub runtime_checked: usize,
-    /// Number with counterexamples (violations).
+    /// Number that FAIL: refuted, or unproved and failed closed. Gates read this.
     pub failed: usize,
+    /// Of `failed`, how many nothing refuted ([`FailureBasis::UnprovedFailClosed`]:
+    /// no counterexample exists; forced to failed because the row may not pass
+    /// unproved). A SUBSET of `failed`, never added to it; display only.
+    #[serde(default)]
+    pub failed_unproved: usize,
     /// Number unknown or timed out.
     pub unknown: usize,
     /// Number timed out.
@@ -2221,7 +2391,8 @@ pub enum ScopeVerdict {
     Verified,
     /// No violations, but some obligations in scope rest on runtime checks.
     RuntimeChecked,
-    /// At least one obligation in scope has a counterexample.
+    /// At least one obligation in scope FAILED — refuted, or unproved and
+    /// failed closed (`failed_unproved` / [`FailureBasis`] says which).
     HasViolations,
     /// No violations, but some obligations in scope are unresolved.
     Inconclusive,
@@ -2356,6 +2527,14 @@ pub struct ObligationReport {
     /// represents publishable proof-grade evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_evidence: Option<ObligationTransportEvidenceReport>,
+    /// Trust (TINV step 10.7): the named premises this row's verdict rests on, one
+    /// disclosure line each, beginning with [`crate::TINV_ASSUMES_PREFIX`]
+    /// (`assumes type_invariant(S)#k`, then the conjunct and the certificate it comes
+    /// from). Copied from the compiler transport row's `assumes`. Disclosure only: it is
+    /// never proof authority, and a row carrying it is never `Certified`. Absent from the
+    /// wire when empty, so pre-10.7 reports read unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumes: Vec<String>,
 }
 
 // ObligationLocation alias removed — use SourceSpan directly.
@@ -2422,9 +2601,16 @@ pub struct ObligationProofEvidenceReport {
 /// Raw transport evidence preserved for one stable obligation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObligationTransportEvidenceReport {
-    /// Stable obligation ID from compiler transport, when present.
+    /// The compiler's private ordinal obligation ID (the binding/certificate
+    /// token), when present. Never a comparison key: `identity` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obligation_id: Option<String>,
+    /// Trust (T9): the obligation's stable key, package and function source
+    /// digest, from the compiler's transport envelope. The key the verdict
+    /// vector, the committed baseline and `targo trust diff` compare by.
+    /// Diagnostic identity only, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::obligation_identity::ObligationIdentity>,
     /// Compiler digest of the complete canonical VC payload. This remains
     /// useful for offline correlation, but is diagnostic-only and cannot
     /// recreate the live verifier authority that accepted the claim.
@@ -2433,12 +2619,23 @@ pub struct ObligationTransportEvidenceReport {
     /// Exact compiler VC classification, including parameterized temporal and
     /// deep-property fields that the compact report tag cannot reconstruct.
     /// This remains diagnostic metadata and never recreates live authority.
+    /// Bounded original full typed VC. Serialized diagnostic data, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_vc_snapshot: Option<Box<crate::OriginalVcSnapshot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typed_kind: Option<Box<VcKind>>,
     /// Structured native TrustIr evidence carried by the compiler transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_trust_ir: Option<TransportNativeTrustIrEvidence>,
     /// Structured proof evidence carried by the compiler transport.
+    ///
+    /// On a published proved row this is ELIDED: the producer drops it after
+    /// checking it is an exact duplicate of the obligation's own
+    /// `proof_evidence` (see [`elide_duplicate_transport_proof_evidence`]),
+    /// and the decoder treats its absence beside a present
+    /// `proof_evidence` as that elision. Rows that were not promoted keep it:
+    /// there it is the only record of what the transport claimed. A row that
+    /// still carries both copies is judged by the full field-equality check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof_evidence: Option<TransportProofEvidence>,
     /// Kernel-certified runtime-monitor status carried by the compiler for
@@ -2456,11 +2653,21 @@ pub enum ObligationOutcome {
     /// Property proved safe — no violation possible.
     #[serde(rename = "proved")]
     Proved { strength: ProofStrength },
-    /// Property violated — counterexample available.
+    /// The obligation FAILS the gate. [`FailureBasis`] says why: `refuted` (a
+    /// backend or a structural decision found the violation; a counterexample
+    /// may be attached) or `unproved_fail_closed` (nothing refuted it — no
+    /// counterexample exists — but Trust forces it to `failed` because it could
+    /// not prove it and must not let it pass). Both count as `failed` in every
+    /// gate and summary; the basis is display/classification only.
     #[serde(rename = "failed")]
     Failed {
         #[serde(skip_serializing_if = "Option::is_none")]
         counterexample: Option<CounterexampleReport>,
+        /// Absent on the wire for `refuted` (the historical meaning of every
+        /// `failed` row), so refuted rows serialize byte-identically to before
+        /// this field existed.
+        #[serde(default, skip_serializing_if = "FailureBasis::is_refuted")]
+        basis: FailureBasis,
     },
     /// Solver could not determine outcome.
     #[serde(rename = "unknown")]
@@ -2484,6 +2691,214 @@ pub enum ObligationOutcome {
     DesignRequirement { detail: String },
 }
 
+/// Why a `failed` obligation fails.
+///
+/// `failed` is one gate outcome with two very different meanings, and a reader
+/// must be able to tell them apart:
+///
+/// * [`FailureBasis::Refuted`] — the violation was FOUND: a backend returned a
+///   refutation (SAT, a model, a trace) or a structural decision established it
+///   on every reaching execution. This is the historical meaning of every
+///   `failed` row and the default.
+///   The compiler's DEFINITE structural `[unsafe…]` findings (a double free or
+///   a use-after-free the separation model established on every reaching
+///   execution, [`unsafe_demand_is_definite_violation`]) are this basis even
+///   when no solver ran: they carry [`UNSAFE_DEMAND_DEFINITE_SOLVER`].
+/// * [`FailureBasis::UnprovedFailClosed`] — nothing refuted the obligation and no
+///   counterexample exists. The row came back `unknown`/`timeout`, never reached
+///   a solver (e.g. the function did not lower to native trust-ir), or carries a
+///   proof Trust refuses (a vacuous placeholder, an unwitnessed proof of an
+///   unprovable mandate); Trust FORCES it to `failed` because it is a
+///   fail-closed family that may never pass unproved. Today two families: the
+///   `[unsafe…]` unsafe-operation demands that are not definite findings
+///   ([`UNSAFE_DEMAND_FAIL_CLOSED_SOLVER`]), and the compiler's Level-0
+///   refutation reclassifications ([`L0_REFUTATION_FAIL_CLOSED_SOLVER`]: a
+///   known-panicking unmodeled call, a Level-0 safety VC the native lane could
+///   not model, an open generic dispatch — none of which carries a witness). It
+///   is a gate failure, not a found bug.
+///
+/// The basis is classification only: it never changes the outcome, a count, a
+/// verdict, or an exit code. Both bases are `failed` everywhere a gate reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FailureBasis {
+    /// The violation was found (a counterexample may be attached).
+    #[default]
+    Refuted,
+    /// Not refuted, not proved; forced to `failed` by a fail-closed policy.
+    UnprovedFailClosed,
+}
+
+impl FailureBasis {
+    /// `true` for [`FailureBasis::Refuted`] (also the serde skip predicate).
+    #[must_use]
+    pub fn is_refuted(&self) -> bool {
+        matches!(self, Self::Refuted)
+    }
+
+    /// Stable machine spelling (`refuted` / `unproved_fail_closed`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refuted => "refuted",
+            Self::UnprovedFailClosed => "unproved_fail_closed",
+        }
+    }
+
+    /// Human qualifier for a `FAILED` label.
+    #[must_use]
+    pub fn human_label(self) -> &'static str {
+        match self {
+            Self::Refuted => "refuted",
+            Self::UnprovedFailClosed => "unproved, no counterexample; failed closed",
+        }
+    }
+
+    /// Classify a FAILED backend row from the solver label the compiler stamped
+    /// on it and whether it carries a counterexample.
+    ///
+    /// A counterexample always means [`FailureBasis::Refuted`]. Otherwise only the
+    /// compiler's fail-closed families ([`FAIL_CLOSED_SOLVER_FAMILIES`]: the
+    /// unsafe-demand label [`UNSAFE_DEMAND_FAIL_CLOSED_SOLVER`] and the Level-0
+    /// refutation label [`L0_REFUTATION_FAIL_CLOSED_SOLVER`], each exactly or
+    /// as its `<label>-over-<reason>:<solver>` variant) are
+    /// [`FailureBasis::UnprovedFailClosed`]; every other label keeps the
+    /// historical `refuted` meaning. A label is self-asserted, so this can only
+    /// ever change how a FAILED row is DESCRIBED — never whether it fails.
+    #[must_use]
+    pub fn for_failed_row(solver: &str, has_counterexample: bool) -> Self {
+        if has_counterexample {
+            return Self::Refuted;
+        }
+        if is_fail_closed_solver_label(solver) { Self::UnprovedFailClosed } else { Self::Refuted }
+    }
+
+    /// [`FailureBasis::for_failed_row`] over a backend result; `None` unless the
+    /// result is `Failed`.
+    #[must_use]
+    pub fn of_result(result: &VerificationResult) -> Option<Self> {
+        match result {
+            VerificationResult::Failed { solver, counterexample, .. } => {
+                Some(Self::for_failed_row(solver.as_str(), counterexample.is_some()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The one human phrase for a `failed` count: `"N failed"`, or
+/// `"N failed (M unproved, no counterexample)"` when `M` of them were forced to
+/// failed by a fail-closed policy rather than refuted. `M` is a subset of `N`;
+/// the phrase never changes `N`.
+#[must_use]
+pub fn failed_count_phrase(failed: usize, failed_unproved: usize) -> String {
+    if failed_unproved == 0 {
+        format!("{failed} failed")
+    } else {
+        format!("{failed} failed ({failed_unproved} unproved, no counterexample)")
+    }
+}
+
+/// Solver label the compiler stamps on an `[unsafe…]` unsafe-operation demand it
+/// forced to `Failed` without a refutation (`refute_unsafe_demand_findings` in
+/// `compiler/rustc_mir_transform/src/trust_verify.rs`). A row carrying it (or
+/// `<label>-over-<reason>:<solver>`) is [`FailureBasis::UnprovedFailClosed`].
+pub const UNSAFE_DEMAND_FAIL_CLOSED_SOLVER: &str = "structural-unsafe-demand-finding";
+
+/// Solver label the compiler stamps on a Level-0 row it PUBLISHES as `failed` by
+/// reclassification, without a counterexample
+/// ([`crate::l0_refutation::reclassify_published_row`]: a known-panicking
+/// unmodeled call, a Level-0 safety VC whose native result was `Unsupported`
+/// whatever the solver then returned — a timeout included —, the FATAL
+/// absent-callee row of an open, uncontracted generic dispatch). No engine
+/// returned `Failed` for such a row and no witness exists, so it is
+/// [`FailureBasis::UnprovedFailClosed`]. The stamped spelling is always
+/// `<label>-over-<verifier outcome>:<verifier solver>`
+/// ([`crate::l0_refutation::l0_refutation_solver_label`]), so the engine that
+/// actually ran stays readable in the label.
+pub const L0_REFUTATION_FAIL_CLOSED_SOLVER: &str = "level0-refutation-fail-closed";
+
+/// Every solver-label family [`FailureBasis::for_failed_row`] reads as
+/// [`FailureBasis::UnprovedFailClosed`]. A family matches its label exactly or
+/// as `<label>-over-<reason>:<solver>`; a lookalike that merely shares a prefix
+/// does not.
+pub const FAIL_CLOSED_SOLVER_FAMILIES: &[&str] =
+    &[UNSAFE_DEMAND_FAIL_CLOSED_SOLVER, L0_REFUTATION_FAIL_CLOSED_SOLVER];
+
+/// `true` iff `solver` is one of [`FAIL_CLOSED_SOLVER_FAMILIES`] (exactly, or as
+/// its `-over-…` variant). Description only: it never decides an outcome.
+#[must_use]
+pub fn is_fail_closed_solver_label(solver: &str) -> bool {
+    FAIL_CLOSED_SOLVER_FAMILIES.iter().any(|family| {
+        solver
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("-over-"))
+    })
+}
+
+/// Solver label the compiler stamps on an `[unsafe…]` row that
+/// `refute_unsafe_demand_findings` forces to `Failed` when the row is a DEFINITE
+/// structural violation ([`unsafe_demand_is_definite_violation`]). Such a row was
+/// decided by the separation model on every reaching execution — it is a found
+/// violation, not a tooling gap — so [`FailureBasis::for_failed_row`] reads it
+/// (like every label other than [`UNSAFE_DEMAND_FAIL_CLOSED_SOLVER`]) as
+/// [`FailureBasis::Refuted`].
+pub const UNSAFE_DEMAND_DEFINITE_SOLVER: &str = "structural-unsafe-definite-violation";
+
+/// Message markers of the `[unsafe…]` rows the vcgen emits as DEFINITE
+/// violations: a constant `Bool(true)` violation that the separation model
+/// mints only when every execution reaching the site has already freed the
+/// allocation (`trust-vcgen` `SepEngine::interpret_drop` /
+/// `interpret_global_dealloc` / `interpret_dealloc_call`, and
+/// `SymbolicHeap::read_vc` / `write_vc` under the dominance-scoped freed set).
+///
+/// Deliberately NARROW. Every other constant `[unsafe…]` row says "no model of
+/// this construct" or "not known to be valid" (`[unsafe:unmodeled-call]`,
+/// `[unsafe:validity-transmute]`, the `[unsafe] missing SAFETY comment`
+/// stand-in, which is minted for every UNDECIDED site, `[unsafe:zeroed]` /
+/// `[unsafe:uninitialized]`, whose predicates refute every type they cannot
+/// positively recognise, …) and stays [`FailureBasis::UnprovedFailClosed`]. A
+/// row is added here only when its emitter makes a claim about every reaching
+/// execution, pinned by a trust-vcgen test over that emitter's real output.
+pub const UNSAFE_DEFINITE_VIOLATION_MARKERS: &[&str] =
+    &["[unsafe:sep:free] double-free", "[unsafe:sep:heap] use-after-free"];
+
+/// `true` iff an `[unsafe…]` row's message (or a reconstructed row's detail,
+/// which embeds it) names a DEFINITE structural violation
+/// ([`UNSAFE_DEFINITE_VIOLATION_MARKERS`]). Description only: the compiler
+/// forces the row to `failed` either way.
+#[must_use]
+pub fn unsafe_demand_is_definite_violation(message: &str) -> bool {
+    UNSAFE_DEFINITE_VIOLATION_MARKERS.iter().any(|marker| message.contains(marker))
+}
+
+impl ObligationOutcome {
+    /// A `failed` outcome whose basis is derived from the backend's solver label
+    /// and counterexample ([`FailureBasis::for_failed_row`]).
+    #[must_use]
+    pub fn failed_from_backend(solver: &str, counterexample: Option<CounterexampleReport>) -> Self {
+        let basis = FailureBasis::for_failed_row(solver, counterexample.is_some());
+        Self::Failed { counterexample, basis }
+    }
+
+    /// The failure basis of a `failed` outcome; `None` for every other outcome.
+    #[must_use]
+    pub fn failure_basis(&self) -> Option<FailureBasis> {
+        match self {
+            Self::Failed { basis, .. } => Some(*basis),
+            _ => None,
+        }
+    }
+
+    /// `true` iff this is a `failed` outcome that nothing refuted
+    /// ([`FailureBasis::UnprovedFailClosed`]).
+    #[must_use]
+    pub fn is_unproved_fail_closed(&self) -> bool {
+        self.failure_basis() == Some(FailureBasis::UnprovedFailClosed)
+    }
+}
+
 /// Private serde representation for an obligation outcome.
 ///
 /// The public [`ObligationOutcome`] can be constructed as `Proved` by a live,
@@ -2500,6 +2915,8 @@ enum ObligationOutcomeWire {
     Failed {
         #[serde(skip_serializing_if = "Option::is_none")]
         counterexample: Option<CounterexampleReport>,
+        #[serde(default)]
+        basis: FailureBasis,
     },
     #[serde(rename = "unknown")]
     Unknown { reason: String },
@@ -2518,7 +2935,13 @@ impl ObligationOutcomeWire {
     fn into_public_untrusted(self) -> ObligationOutcome {
         match self {
             Self::Proved { strength } => ObligationOutcome::Proved { strength },
-            Self::Failed { counterexample } => ObligationOutcome::Failed { counterexample },
+            // A row that carries a counterexample is a refutation whatever basis
+            // it claims: the basis may only ever describe a row as LESS than a
+            // refutation when no counterexample backs one.
+            Self::Failed { counterexample, basis } => {
+                let basis = if counterexample.is_some() { FailureBasis::Refuted } else { basis };
+                ObligationOutcome::Failed { counterexample, basis }
+            }
             Self::Unknown { reason } => ObligationOutcome::Unknown { reason },
             Self::RuntimeChecked { note } => ObligationOutcome::RuntimeChecked { note },
             Self::Timeout { timeout_ms } => ObligationOutcome::Timeout { timeout_ms },
@@ -2595,7 +3018,20 @@ pub struct CounterexampleVariable {
     pub name: String,
     /// The value as a string (supports arbitrarily large integers).
     pub value: String,
-    /// Type of the value for machine parsing: "bool", "int", "uint", "float".
+    /// Type of the value for machine parsing, one tag per
+    /// [`CounterexampleValue`] carrier:
+    ///
+    /// * `"bool"`, `"int"`, `"uint"`, `"float"` — the scalar carriers, with
+    ///   `value` the parseable decimal (`int`/`uint` may exceed 64 bits);
+    /// * `"term"` — a non-scalar model value ([`CounterexampleValue::Term`]),
+    ///   with `value` the solver's OWN SMT-LIB spelling (a datatype
+    ///   constructor application `(succ zero)`, an array store chain, an exact
+    ///   rational, a string, an uninterpreted-sort element). Faithful but
+    ///   opaque: a consumer that only understands scalars must treat it as a
+    ///   non-replayable value, never parse it as a number;
+    /// * `"unknown"` — a carrier this renderer does not know (a future
+    ///   `#[non_exhaustive]` variant), with `value` the literal `"unknown"`.
+    ///   `display` still carries the value's own rendering.
     pub value_type: String,
     /// Display-friendly string representation of the value.
     pub display: String,
@@ -2641,6 +3077,8 @@ struct ObligationReportWire {
     proof_evidence: Option<ObligationProofEvidenceReport>,
     #[serde(default)]
     transport_evidence: Option<ObligationTransportEvidenceReport>,
+    #[serde(default)]
+    assumes: Vec<String>,
 }
 
 impl ObligationReportWire {
@@ -2657,6 +3095,7 @@ impl ObligationReportWire {
             evidence: self.evidence,
             proof_evidence: self.proof_evidence,
             transport_evidence: self.transport_evidence,
+            assumes: self.assumes,
         }
     }
 
@@ -2673,6 +3112,7 @@ impl ObligationReportWire {
             evidence: self.evidence,
             proof_evidence: self.proof_evidence,
             transport_evidence: self.transport_evidence,
+            assumes: self.assumes,
         };
         scrub_deserialized_monitor_claim(&mut report);
         report
@@ -2748,16 +3188,6 @@ pub struct ReportMetadata {
     pub timestamp: String,
     /// Total wall-clock time for all verification in milliseconds.
     pub total_time_ms: u64,
-    /// Per-obligation solver timeout selected by the frontend, in
-    /// milliseconds. Absent for producers and older reports that do not carry
-    /// canonical timeout policy metadata.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
-    /// Per-function cooperative wall-clock verification budget selected by
-    /// the frontend, in milliseconds. Absent for producers and older reports
-    /// that do not have a canonical function-budget policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub function_budget_ms: Option<u64>,
 }
 
 /// Crate-level summary aggregating all function results.
@@ -2785,8 +3215,13 @@ pub struct CrateSummary {
     /// Obligations checked at runtime instead of proved statically.
     #[serde(default)]
     pub total_runtime_checked: usize,
-    /// Obligations with counterexamples.
+    /// Obligations that FAIL: refuted, or unproved and failed closed. Gates read this.
     pub total_failed: usize,
+    /// Of `total_failed`, how many nothing refuted
+    /// ([`FailureBasis::UnprovedFailClosed`]: no counterexample exists). A SUBSET
+    /// of `total_failed`, never added to it; display only.
+    #[serde(default)]
+    pub total_failed_unproved: usize,
     /// Obligations unknown or timed out.
     pub total_unknown: usize,
     /// Obligations timed out.
@@ -2831,19 +3266,20 @@ pub struct ProofGradeEngineStatus {
 pub fn summarize_proof_grade_engine_statuses(
     functions: &[FunctionProofReport],
 ) -> Vec<ProofGradeEngineStatus> {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
 
-    let mut engines: BTreeMap<String, ProofGradeEngineStatus> = BTreeMap::new();
+    let mut engines: BTreeMap<&str, ProofGradeEngineStatus> = BTreeMap::new();
+    let mut functions_routed = crate::fx::FxHashSet::default();
 
     for func in functions {
-        let mut functions_routed = HashSet::new();
+        functions_routed.clear();
 
         for obl in &func.obligations {
             if let Some(proof) = &obl.proof_evidence
-                && let Some(suite) = &proof.suite
+                && let Some(suite) = proof.suite.as_deref()
             {
-                let entry = engines.entry(suite.clone()).or_insert_with(|| {
-                    ProofGradeEngineStatus { engine: suite.clone(), ..Default::default() }
+                let entry = engines.entry(suite).or_insert_with(|| {
+                    ProofGradeEngineStatus { engine: suite.to_string(), ..Default::default() }
                 });
                 entry.total_obligations += 1;
                 // this runs on DESERIALIZED report functions, so
@@ -2858,13 +3294,9 @@ pub fn summarize_proof_grade_engine_statuses(
                 {
                     entry.proof_grade_obligations += 1;
                 }
-                functions_routed.insert(suite.clone());
-            }
-        }
-
-        for engine in functions_routed {
-            if let Some(entry) = engines.get_mut(&engine) {
-                entry.functions_routed += 1;
+                if functions_routed.insert(suite) {
+                    entry.functions_routed += 1;
+                }
             }
         }
     }
@@ -2872,10 +3304,10 @@ pub fn summarize_proof_grade_engine_statuses(
     engines.into_values().collect()
 }
 
-// Trust: per-compile "Trust Surface" — how the proof report deviates from what
-// vanilla rustc accepts unchanged. Vanilla rustc compiles this code with zero of
-// these obligations; Trust adds them and classifies each by the *strength of the
-// basis* it rests on, not by a single blended `proved` total. The collapsed
+// Trust: per-compile "Trust Surface" — reported verification obligations,
+// classified by the *strength of the basis* each rests on, not by a single
+// blended `proved` total. It makes no claim about another compiler accepting the
+// source; obligation outcomes do not establish source compatibility. The collapsed
 // `CrateSummary::total_proved` answers "how many obligations are green"; it cannot
 // answer "how many are independently certified vs solver-backed vs merely trusted",
 // which is the only honest way to state the assurance Trust actually delivers.
@@ -2889,7 +3321,7 @@ pub fn summarize_proof_grade_engine_statuses(
 // downgrades obligations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustSurface {
-    /// Total obligations Trust added on top of what vanilla rustc accepts.
+    /// Total reported obligations with a verification outcome.
     pub total_obligations: usize,
     /// Proved with a kernel-reconstructed, independently re-checked proof
     /// (`AssuranceLevel::Certified`) — soundness reduces to the verified kernel.
@@ -2911,7 +3343,8 @@ pub struct TrustSurface {
     /// "Proved" only by fully trusting the solver verdict with no validation at
     /// all (`AssuranceLevel::Unchecked`/`Heuristic`). The weakest rung.
     pub fully_trusted: usize,
-    /// Refuted — a concrete counterexample (`ObligationOutcome::Failed`). Not part
+    /// Failed (`ObligationOutcome::Failed`) — refuted, or unproved and failed
+    /// closed (see [`FailureBasis`]). Not part
     /// of the "additionally proved" story; tracked so the surface reconciles with
     /// the crate totals and a violation never hides.
     pub failed: usize,
@@ -3158,11 +3591,15 @@ pub struct CertifiedTestExecutableReport {
 /// Keep this independent of the enclosing report schema: execution semantics
 /// can evolve without silently changing what an older `trust.report.v1`
 /// consumer interprets from the same field names.
-pub const CERTIFIED_TEST_EXECUTION_SCHEMA_VERSION: &str = "trust.certified-test-execution.v2";
+pub const CERTIFIED_TEST_EXECUTION_SCHEMA_VERSION: &str = "trust.certified-test-execution.v3";
 
 /// Exact human-readable boundary paired with
 /// [`CertifiedTestExecutionCompletionScope::TopLevelCargoChildExitOnlyV1`].
 pub const CERTIFIED_TEST_EXECUTION_SCOPE: &str = "authorized selected-package non-doctest test executable paths under Cargo; monitors installed in authenticated artifacts; authenticated launch permits ordinary child spawning and is host-specific: Linux uses a sealed anonymous executable image, so current_exe/self-reexecution and pathname/inode/xattr/mode identity are not preserved; macOS uses a private signed pathname snapshot whose bytes and suspended live-process code identity are reauthenticated before release, so snapshot-path current_exe/self-reexecution is preserved during that process lifetime but original-artifact pathname/inode/xattr/mode identity is not; completion attests only the top-level Cargo child exit, not libtest-case completion, monitor coverage, exec replacement, descendant processes, or runtime-loaded code";
+
+/// The original native queue remains alive between compile completion and its
+/// qualified test execution. A compile checkpoint is not a child exit.
+pub const CERTIFIED_RETAINED_TEST_EXECUTION_SCOPE: &str = "authorized selected-package non-doctest test executable paths in the original retained Targo queue; phase A records a completed compiler checkpoint while that child remains alive, and phase B records that same child's actual exit after qualification; monitors installed in authenticated artifacts; authenticated launch permits ordinary child spawning and is host-specific: Linux uses a sealed anonymous executable image, so current_exe/self-reexecution and pathname/inode/xattr/mode identity are not preserved; macOS uses a private signed pathname snapshot whose bytes and suspended live-process code identity are reauthenticated before release, so snapshot-path current_exe/self-reexecution is preserved during that process lifetime but original-artifact pathname/inode/xattr/mode identity is not; completion attests only the original top-level Targo child exit, not libtest-case completion, monitor coverage, exec replacement, descendant processes, or runtime-loaded code";
 
 /// Machine-readable meaning of a phase-B completion state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3173,6 +3610,10 @@ pub enum CertifiedTestExecutionCompletionScope {
     /// `exec`, runtime dynamic-load, or host launch/original-artifact identity
     /// attestation.
     TopLevelCargoChildExitOnlyV1,
+    /// Phase A is a compiler-complete checkpoint in a still-live child. Phase B
+    /// attests that same original child's actual exit after proof qualification.
+    /// The libtest/monitor/descendant/loaded-code limitations still apply.
+    RetainedCompileCheckpointAndChildExitV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3196,6 +3637,8 @@ pub struct CertifiedTestExecutionReport {
     pub requested: bool,
     pub scope: String,
     pub compile_only: bool,
+    /// Compiler completion status. Its provenance is a child exit in the legacy
+    /// scope and a live checkpoint in the retained-queue scope.
     pub phase_a_status: i32,
     pub phase_a_success: bool,
     pub phase_b_state: CertifiedTestExecutionPhaseState,
@@ -3219,8 +3662,9 @@ pub struct CertifiedTestExecutionReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationGateReport {
     /// Which gate lane produced this decision: `"advisory"`, `"memory-safe"`,
-    /// or `"strict"`. Only advisory may admit contract-panic conditional
-    /// evidence; strict and memory-safe never do.
+    /// `"strict"`, or `"certify"`. Only advisory may admit contract-panic
+    /// conditional evidence or pass conditionally on a genuine unknown; the
+    /// other lanes never do.
     pub lane: String,
     /// Canonical configured verification level (`"L0"`, `"L1"`, or `"L2"`).
     ///
@@ -3230,7 +3674,9 @@ pub struct VerificationGateReport {
     /// and non-Targo reports, which diff consumers must treat as unscoped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_level: Option<String>,
-    /// `"pass"` | `"conditional-pass"` | `"inconclusive"` | `"fail"`.
+    /// `"pass"` | `"conditional-pass"` | `"inconclusive"` | `"fail"` |
+    /// `"could-not-run"` (exit 3: the rows are no measurement and none was
+    /// refuted; `determinism.outcome` says which).
     pub decision: String,
     /// The final process exit code persisted by the frontend after every
     /// verification, evidence, and setup gate has been applied.
@@ -3251,6 +3697,14 @@ pub struct VerificationGateReport {
     /// The pass is conditional on ≥1 runtime-checked obligation.
     #[serde(default)]
     pub conditional_on_runtime_checks: bool,
+    /// The pass is conditional on ≥1 genuine-unknown obligation. Only the
+    /// advisory lane (`--allow-l0-gaps`, the ramp) produces this: it reports an
+    /// unproved obligation instead of failing on it, while every other lane
+    /// keeps an unknown fatal. `false` in a pre-ramp report, which stored
+    /// `inconclusive` for the same counts. `#[serde(default)]` keeps that
+    /// older JSON deserializable.
+    #[serde(default)]
+    pub conditional_on_unknown_rows: bool,
     /// The pass is conditional on ≥1 crate-scope visitation-rowless entry.
     #[serde(default)]
     pub conditional_on_visitation_entries: bool,
@@ -3267,6 +3721,89 @@ pub struct VerificationGateReport {
     /// Authenticated compile/execute state for `targo trust test`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_execution: Option<CertifiedTestExecutionReport>,
+    /// Trust (CB4): every body excluded from the proof inventory, one entry
+    /// per body (`counts.excluded` is their number). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclusions: Vec<GateExclusionReport>,
+    /// Determinism accounting (plan
+    /// `docs/design/2026-09-29-incremental-deterministic-trust-results.md`
+    /// §3.7): whether these counts are a measurement, under which budget
+    /// profile, and the verdict vector behind them. `None` in a report from a
+    /// toolchain that did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub determinism: Option<crate::determinism::GateDeterminism>,
+    /// Distinct-site accounting over the `failed` rows
+    /// ([`crate::failure_sites`]): how many source sites they sit at, and which
+    /// failed hardened `PanicBoundary` twins share a MIR assert with a failed L0
+    /// overflow/bounds row. INFORMATIONAL: `counts.failed` stays the row count,
+    /// both rows of a pair stay failed, and no gate decision, exit code or
+    /// verdict reads this. `None` in a report from a toolchain that did not
+    /// record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_sites: Option<crate::failure_sites::FailureSiteAccounting>,
+    /// The Trust requirements Cargo project configuration supplied and this
+    /// run adopted (`targo config trust-policy`), so a lane, level or profile
+    /// chosen by a project file is never indistinguishable from one chosen on
+    /// the command line. A project may tighten the invocation's lane but not
+    /// loosen it (DECISION_QUEUE "Project policy cannot loosen the lane —
+    /// 2026-10-07"). Informational: no decision, exit code or verdict reads it.
+    /// `None` when the project set no requirement, and in a report from a
+    /// toolchain that did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_requirements: Option<ProjectRequirementsReport>,
+}
+
+/// The Cargo project-configuration Trust requirements a run adopted, as
+/// recorded on [`VerificationGateReport::project_requirements`]. Each `None`
+/// field is one the project did not set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRequirementsReport {
+    /// `-Ztrust-policy`: `"strict"`, `"certify"`, `"advisory"` or `"memory-safe"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// `-Ztrust-verify-level`, canonical (`"L0"`, `"L1"`, `"L2"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// `-Ztrust-verify-profile` (`"default"` or a registered hardened profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// `-Ztrust-verify-include-dependencies`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_dependencies: Option<bool>,
+    /// `-Ztrust-ir-lower`: `"off"`, `"on"` or `"strict"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ir_lower: Option<String>,
+    /// A positive `-Ztrust-verify` assertion: the project requires verification.
+    #[serde(default)]
+    pub verification_required: bool,
+}
+
+impl ProjectRequirementsReport {
+    /// The requirements as `key=value` items in a fixed order, the one
+    /// spelling the terminal, HTML and setup line share.
+    #[must_use]
+    pub fn items(&self) -> Vec<String> {
+        let mut items = Vec::new();
+        if let Some(policy) = &self.policy {
+            items.push(format!("policy={policy}"));
+        }
+        if let Some(level) = &self.level {
+            items.push(format!("level={level}"));
+        }
+        if let Some(profile) = &self.profile {
+            items.push(format!("profile={profile}"));
+        }
+        if let Some(include) = self.include_dependencies {
+            items.push(format!("include-dependencies={}", if include { "yes" } else { "no" }));
+        }
+        if let Some(lower) = &self.ir_lower {
+            items.push(format!("ir-lower={lower}"));
+        }
+        if self.verification_required {
+            items.push("verification=required".to_string());
+        }
+        items
+    }
 }
 
 /// Trust (assertion-grade coverage, roadmap §4.1): verification-coverage counts
@@ -3285,13 +3822,21 @@ pub struct VerificationCoverage {
     /// `processed == eligible`. Any mismatch, including an over-count, is
     /// malformed/incomplete coverage and therefore never a pass.
     pub coverage_complete: bool,
+    /// Trust (CB4): how many of the `processed` bodies were EXCLUDED from the
+    /// proof inventory rather than verified — today only the bodies rustc's
+    /// libtest harness synthesizes (`crate::exclusion`). They are accounted for
+    /// (each carries its one exclusion row) but never proved, so the human
+    /// coverage line splits them out. `0` in every non-test run, where the field
+    /// is omitted, so those reports stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub excluded: usize,
 }
 
 impl VerificationCoverage {
     /// Build from raw counts; `coverage_complete` is derived, never asserted.
     #[must_use]
     pub fn from_counts(eligible: usize, processed: usize) -> Self {
-        Self { eligible, processed, coverage_complete: processed == eligible }
+        Self { eligible, processed, coverage_complete: processed == eligible, excluded: 0 }
     }
 }
 
@@ -3323,6 +3868,28 @@ pub struct VerificationGateCounts {
     /// and never proof credit. `#[serde(default)]` keeps pre-T9 JSON deserializable.
     #[serde(default)]
     pub contract_panics: usize,
+    /// Trust (CB4): bodies EXCLUDED from the proof inventory because rustc's
+    /// libtest harness synthesized them (`crate::exclusion`). NOT part of
+    /// `total` and never proof credit: a run whose only rows are exclusions has
+    /// `total == 0`. Omitted when zero, so every non-test report is unchanged.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub excluded: usize,
+}
+
+/// Trust (CB4): one body excluded from the proof inventory, as the canonical
+/// report lists it under `verification_gate.exclusions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateExclusionReport {
+    /// The excluded body's canonical identity (Cargo-scoped in crate mode).
+    pub function: String,
+    /// The exclusion class, e.g. `test-harness-synthesized`.
+    pub reason: String,
+    /// Which synthesized item it is, e.g. `test-runner-closure`, `harness-main`.
+    pub item: String,
+    /// For a runner closure, the user test function it calls — which is
+    /// verified as its own body and appears in the report on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_function: Option<String>,
 }
 
 /// Authority label attached to every serialized [`JsonProofReport`].
@@ -3686,7 +4253,8 @@ pub struct UntrustedSavedReportClaims {
 
 impl UntrustedSavedReportClaims {
     fn from_functions(functions: &[FunctionProofReport]) -> Self {
-        let mut obligations = Vec::new();
+        let total_obligations: usize = functions.iter().map(|f| f.obligations.len()).sum();
+        let mut obligations = Vec::with_capacity(total_obligations);
         for (function_index, function) in functions.iter().enumerate() {
             for (obligation_index, obligation) in function.obligations.iter().enumerate() {
                 obligations.push(UntrustedSavedObligationClaim {
@@ -3967,6 +4535,13 @@ impl JsonProofReport {
             gate.counts.proved = 0;
             gate.counts.runtime_checked = 0;
             gate.conditional_on_runtime_checks = false;
+            // Ramp (2026-09-07): the unknown-row condition is a claim about a
+            // LIVE conditional pass. The demotion below rewrites the decision
+            // to inconclusive, so the flag must fall with it — a saved ramp
+            // report that kept it would contradict its own decision, and every
+            // consumer that cross-checks the two (`targo trust diff` does)
+            // would refuse every ramp report.json ever written.
+            gate.conditional_on_unknown_rows = false;
             gate.decision = if gate.counts.failed > 0 {
                 "fail".to_string()
             } else {
@@ -4034,6 +4609,7 @@ impl JsonProofReport {
             mut c_design,
             mut c_total,
         ) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut c_failed_unproved = 0usize;
         let (mut f_verified, mut f_runtime, mut f_violations, mut f_inconclusive) =
             (0usize, 0usize, 0usize, 0usize);
 
@@ -4059,6 +4635,7 @@ impl JsonProofReport {
             c_unknown = c_unknown.saturating_add(func.summary.unknown);
             c_timed_out = c_timed_out.saturating_add(func.summary.timed_out);
             c_design = c_design.saturating_add(func.summary.design_requirements);
+            c_failed_unproved = c_failed_unproved.saturating_add(func.summary.failed_unproved);
             c_unattributed_failed =
                 c_unattributed_failed.saturating_add(func.summary.unattributed_failed);
             c_unattributed_unknown =
@@ -4086,6 +4663,7 @@ impl JsonProofReport {
         self.summary.total_unknown = c_unknown;
         self.summary.total_timed_out = c_timed_out;
         self.summary.total_design_requirements = c_design;
+        self.summary.total_failed_unproved = c_failed_unproved;
         self.summary.total_unattributed_failed = c_unattributed_failed;
         self.summary.total_unattributed_unknown = c_unattributed_unknown;
         self.summary.total_unattributed_proved = c_unattributed_proved;
@@ -4151,7 +4729,7 @@ fn saved_report_publishable_proof_defect(
         obligation.obligation_id.as_deref(),
         trusted_root,
     )
-    .or_else(|| matching_transport_evidence_defect(obligation, proof));
+    .or_else(|| matching_transport_evidence_defect(obligation, proof, trusted_root));
     defect
 }
 
@@ -4229,19 +4807,26 @@ fn clean_kernel_certificate_artifact_defect(
     if !digest.algorithm.eq_ignore_ascii_case("sha256") {
         return Some("clean-kernel certificate digest algorithm is not sha256".to_string());
     }
-    let digest_value = digest.value.trim().to_ascii_lowercase();
+    let digest_value = digest.value.trim();
     if digest_value.len() != 64 || !digest_value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Some("clean-kernel certificate digest value is not a 64-hex sha256".to_string());
     }
     // proof_id (`clean-cic:v2:<digest>`) and the content-addressed URI must both
     // reconstruct from the certificate digest.
-    if proof_id.to_ascii_lowercase() != format!("{CLEAN_KERNEL_PROOF_ID_PREFIX}{digest_value}") {
+    let matches_prefix_and_digest = |s: &str, prefix: &str| -> bool {
+        s.len() == prefix.len() + digest_value.len()
+            && s.get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+            && s.get(prefix.len()..).is_some_and(|d| d.eq_ignore_ascii_case(digest_value))
+    };
+    if !matches_prefix_and_digest(proof_id, CLEAN_KERNEL_PROOF_ID_PREFIX) {
         return Some(
             "clean-kernel proof_id does not reconstruct from the certificate digest".to_string(),
         );
     }
-    if artifact.uri.as_deref().map(str::to_ascii_lowercase)
-        != Some(format!("{CLEAN_KERNEL_CERTIFICATE_URI_PREFIX}{digest_value}"))
+    if !artifact
+        .uri
+        .as_deref()
+        .is_some_and(|uri| matches_prefix_and_digest(uri, CLEAN_KERNEL_CERTIFICATE_URI_PREFIX))
     {
         return Some(
             "clean-kernel certificate uri does not bind the certificate digest".to_string(),
@@ -4284,9 +4869,20 @@ fn publishable_clean_kernel_proof_defect(proof: &ObligationProofEvidenceReport) 
     if !proof_evidence_is_publication_grade(&proof.evidence) {
         return Some("clean-kernel proof_evidence.evidence is not publication-grade".to_string());
     }
-    if proof.evidence != ProofEvidence::from(proof.strength.clone()) {
+    if proof.evidence.without_kernel_reference() != ProofEvidence::from(proof.strength.clone()) {
         return Some(
             "clean-kernel proof_evidence.evidence does not match proof_evidence.strength"
+                .to_string(),
+        );
+    }
+    // KR0 switch: a clean-kernel row that claims `Certified` must name the
+    // reference entry's theory and environment. A row written before the
+    // switch carries neither (`serde(default)`) and is refused here.
+    if matches!(proof.evidence.assurance, AssuranceLevel::Certified)
+        && !proof.evidence.is_certified()
+    {
+        return Some(
+            "clean-kernel proof_evidence.evidence claims Certified but names no reference kernel theory"
                 .to_string(),
         );
     }
@@ -4329,6 +4925,19 @@ fn publishable_obligation_proof_defect(
     if is_clean_kernel_certified_proof(proof) {
         return publishable_clean_kernel_proof_defect(proof);
     }
+    if suite == SOURCE_CLAUSE_PROOF_SUITE {
+        if proof.proof_certificate.is_some()
+            || proof.native_trust_ir.is_some()
+            || proof.provenance
+                != (ObligationEvidenceProvenanceReport::NativeBackend {
+                    verifier: SOURCE_CLAUSE_PROOF_BACKEND.into(),
+                })
+        {
+            return Some("source-clause proof carries mixed authority or provenance".into());
+        }
+        // Full source/snapshot identity is checked against the transport below.
+        return source_clause::topology_defect(&proof.artifacts, obligation_id, trusted_root);
+    }
     if proof.request_id.as_deref().map_or(true, |request_id| !nonempty(request_id)) {
         return Some("proof_evidence.request_id is missing".to_string());
     }
@@ -4367,7 +4976,13 @@ fn publishable_obligation_proof_defect(
     let Some(native_trust_ir) = &proof.native_trust_ir else {
         return Some("proof_evidence.native_trust_ir is missing".to_string());
     };
-    if let Some(defect) = publishable_native_trust_ir_defect(suite, proof, native_trust_ir) {
+    if let Some(defect) = publishable_native_trust_ir_defect(
+        suite,
+        proof,
+        native_trust_ir,
+        obligation_id,
+        trusted_root,
+    ) {
         return Some(defect);
     }
 
@@ -4403,12 +5018,37 @@ fn publishable_obligation_proof_defect(
 fn matching_transport_evidence_defect(
     obligation: &ObligationReport,
     proof: &ObligationProofEvidenceReport,
+    trusted_root: Option<&Path>,
 ) -> Option<String> {
     let Some(transport) = &obligation.transport_evidence else {
         return Some("transport_evidence is missing".to_string());
     };
     if transport.obligation_id.as_deref() != obligation.obligation_id.as_deref() {
         return Some("transport_evidence.obligation_id does not match obligation_id".to_string());
+    }
+    if proof.suite.as_deref() == Some(SOURCE_CLAUSE_PROOF_SUITE) {
+        let encoded = TransportProofEvidence {
+            suite: proof.suite.clone().unwrap_or_default(),
+            backend: proof.backend.clone(),
+            request_id: proof.request_id.clone(),
+            proof_id: proof.proof_id.clone(),
+            native_id: proof.native_id.clone(),
+            status: proof.status.unwrap_or(TransportProofStatus::Unknown),
+            strength: Some(proof.strength.clone()),
+            evidence: Some(proof.evidence.clone()),
+            artifacts: proof.artifacts.clone(),
+            diagnostics: proof.diagnostics.clone(),
+        };
+        return source_clause_certificate_payload(
+            &encoded,
+            obligation.obligation_id.as_deref(),
+            transport.identity.as_ref(),
+            transport.claim_digest_sha256.as_deref(),
+            transport.original_vc_snapshot.as_deref(),
+            trusted_root,
+        )
+        .err()
+        .or_else(|| transport_proof_evidence_match_defect(transport, proof));
     }
 
     // A Clean-kernel proof carries no solver native_trust_ir bundle; the
@@ -4434,15 +5074,27 @@ fn matching_transport_evidence_defect(
     transport_proof_evidence_match_defect(transport, proof)
 }
 
-/// The transport envelope's own `proof_evidence` record must reproduce the
-/// published proof exactly. Shared by the routed-solver and Clean-kernel lanes;
-/// only the separate native-TrustIr bundle relationship differs between them.
+/// The transport envelope's own `proof_evidence` record, WHEN PRESENT, must
+/// reproduce the published proof exactly. Shared by the routed-solver and
+/// Clean-kernel lanes; only the separate native-TrustIr bundle relationship
+/// differs between them.
+///
+/// An absent transport record beside a present `proof` is the producer's
+/// elision of an exact duplicate (`elide_duplicate_transport_proof_evidence`),
+/// not a defect: the producer only drops the copy after this same comparison
+/// returned no defect, so nothing the check could have said about the row is
+/// lost — the published `proof` is the single record and is validated in full
+/// by `publishable_obligation_proof_defect`. A row that still carries both
+/// copies (a legacy report, or one edited by hand) is judged field-for-field
+/// exactly as before.
 fn transport_proof_evidence_match_defect(
     transport: &ObligationTransportEvidenceReport,
     proof: &ObligationProofEvidenceReport,
 ) -> Option<String> {
     let Some(transport_proof) = &transport.proof_evidence else {
-        return Some("transport_evidence.proof_evidence is missing".to_string());
+        // Elided duplicate: `proof` is present (the caller holds it) and the
+        // transport copy was dropped by the producer.
+        return None;
     };
     if transport_proof.suite != proof.suite.as_deref().unwrap_or_default() {
         return Some("transport_evidence.proof_evidence.suite does not match".to_string());
@@ -4478,27 +5130,93 @@ fn transport_proof_evidence_match_defect(
     None
 }
 
+/// Drop the transport envelope's `proof_evidence` record from a proved row
+/// when it is an exact duplicate of the obligation's published
+/// `proof_evidence`, and report whether it was dropped.
+///
+/// The producer projects the obligation record from the same structured
+/// transport record it stores in the envelope, so on every published proved
+/// row the two agree on every field the decoder compares (suite, backend,
+/// request/proof/native ids, proved status, strength, evidence, artifacts,
+/// diagnostics) and the envelope copy carries nothing the obligation copy does
+/// not. Serializing both wrote every proof artifact twice — measured 2026-09-17
+/// on three clean crates: 11.6 of 84.5 MiB, 11.4 of 48.5 MiB, 22.0 of 133.1
+/// MiB — for a record the decoder only ever checked for equality.
+///
+/// The elision is gated on the decoder's own comparison
+/// (`transport_proof_evidence_match_defect`), so a copy that would have been
+/// reported as a mismatch is never dropped: it stays in the report and the
+/// decoder reports it exactly as it always did. Nothing here touches the
+/// compiler's raw transport rows, and no digest over the raw rows changes.
+///
+/// Returns `false`, leaving the row untouched, when the row carries no
+/// published `proof_evidence` (an unpromoted row's transport record is its only
+/// account of what the transport claimed), when there is no transport
+/// envelope or no transport copy to drop, or when the two copies differ.
+pub fn elide_duplicate_transport_proof_evidence(obligation: &mut ObligationReport) -> bool {
+    let Some(proof) = obligation.proof_evidence.as_ref() else {
+        return false;
+    };
+    let Some(transport) = obligation.transport_evidence.as_mut() else {
+        return false;
+    };
+    if transport.proof_evidence.is_none()
+        || transport_proof_evidence_match_defect(transport, proof).is_some()
+    {
+        return false;
+    }
+    transport.proof_evidence = None;
+    true
+}
+
+fn canonical_native_trust_ir_suite(suite: &str) -> Option<&'static str> {
+    let trimmed = suite.trim();
+    if trimmed.eq_ignore_ascii_case("trust-wp") {
+        Some("trust-wp")
+    } else if trimmed.eq_ignore_ascii_case("trust-mc") {
+        Some("trust-mc")
+    } else if trimmed.eq_ignore_ascii_case("trust-vc") {
+        Some("trust-vc")
+    } else {
+        None
+    }
+}
+
+fn strip_native_trust_ir_id<'a>(
+    native_id: &'a str,
+    canonical_suite: &str,
+    request_id: &str,
+) -> Option<&'a str> {
+    native_id
+        .strip_prefix("trust_ir-native-")?
+        .strip_prefix(canonical_suite)?
+        .strip_prefix("-request-")?
+        .strip_prefix(request_id)?
+        .strip_prefix("-proof-")
+}
+
 fn publishable_native_trust_ir_defect(
     suite: &str,
     proof: &ObligationProofEvidenceReport,
     native_trust_ir: &TransportNativeTrustIrEvidence,
+    obligation_id: Option<&str>,
+    trusted_root: Option<&Path>,
 ) -> Option<String> {
-    let canonical_suite = suite.trim().to_ascii_lowercase();
-    if !matches!(canonical_suite.as_str(), "trust-wp" | "trust-mc" | "trust-vc") {
+    let Some(canonical_suite) = canonical_native_trust_ir_suite(suite) else {
         return Some("proof_evidence.suite is not a canonical native TrustIr suite".to_string());
-    }
+    };
     if !native_trust_ir.present {
         return Some("proof_evidence.native_trust_ir.present is false".to_string());
     }
-    if native_trust_ir.suite.trim().to_ascii_lowercase() != canonical_suite {
+    if !native_trust_ir.suite.trim().eq_ignore_ascii_case(canonical_suite) {
         return Some("proof_evidence.native_trust_ir.suite does not match proof suite".to_string());
     }
-    if proof.backend.trim().to_ascii_lowercase() != canonical_suite {
+    if !proof.backend.trim().eq_ignore_ascii_case(canonical_suite) {
         return Some(
             "proof_evidence.backend is not bound to the canonical native TrustIr suite".to_string(),
         );
     }
-    if native_trust_ir.backend.trim().to_ascii_lowercase() != canonical_suite {
+    if !native_trust_ir.backend.trim().eq_ignore_ascii_case(canonical_suite) {
         return Some(
             "proof_evidence.native_trust_ir.backend is not bound to the canonical suite"
                 .to_string(),
@@ -4513,12 +5231,28 @@ fn publishable_native_trust_ir_defect(
     let request_id = proof.request_id.as_deref().expect("request_id checked before native shape");
     let proof_id = proof.proof_id.as_deref().expect("proof_id checked before native shape");
     let native_id = proof.native_id.as_deref().expect("native_id checked before native shape");
-    let expected_native_id =
-        format!("trust_ir-native-{canonical_suite}-request-{request_id}-proof-{proof_id}");
-    if native_id != expected_native_id {
+    if strip_native_trust_ir_id(native_id, canonical_suite, request_id) != Some(proof_id) {
         return Some("proof_evidence.proof_id/request_id do not reconstruct native_id".to_string());
     }
-    if proof.artifacts.iter().any(|artifact| {
+    let modern_wp = canonical_suite == "trust-wp"
+        && proof
+            .artifacts
+            .iter()
+            .any(|artifact| normalized_artifact_kind(&artifact.kind) == "proof_certificate");
+    if modern_wp {
+        if let Some(defect) = modern_body_wp_proof_defect(
+            &proof.artifacts,
+            obligation_id,
+            proof.request_id.as_deref(),
+            proof.proof_id.as_deref(),
+            &proof.strength,
+            &proof.evidence,
+            native_trust_ir,
+            trusted_root,
+        ) {
+            return Some(defect);
+        }
+    } else if proof.artifacts.iter().any(|artifact| {
         artifact
             .materialization
             .as_ref()
@@ -4587,6 +5321,13 @@ pub fn transport_proof_artifact_topology_defect_at_root(
     )
 }
 
+fn canonical_proof_artifact_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.trim() == owner
+        && owner.len() <= 1024
+        && owner.bytes().all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'?' | b'#'))
+}
+
 fn transport_proof_artifact_topology_defect_with_root(
     suite: &str,
     artifacts: &[TransportEvidenceArtifact],
@@ -4596,14 +5337,13 @@ fn transport_proof_artifact_topology_defect_with_root(
     let Some(obligation_id) = obligation_id else {
         return Some("proof artifact owner obligation_id is missing".to_string());
     };
-    if obligation_id.is_empty()
-        || obligation_id.trim() != obligation_id
-        || obligation_id.len() > 1024
-        || obligation_id.bytes().any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'?' | b'#'))
-    {
+    if !canonical_proof_artifact_owner(obligation_id) {
         return Some("proof artifact owner obligation_id is not canonical".to_string());
     }
-    if artifacts.len() > MAX_TRANSPORT_EVIDENCE_ARTIFACTS {
+    if crate::audit_ledger::cap_hit_if(
+        artifacts.len() > MAX_TRANSPORT_EVIDENCE_ARTIFACTS,
+        "crates/trust-types/src/result.rs:MAX_TRANSPORT_EVIDENCE_ARTIFACTS",
+    ) {
         return Some(format!(
             "proof artifacts exceed the per-evidence {}-artifact safety limit",
             MAX_TRANSPORT_EVIDENCE_ARTIFACTS
@@ -4627,31 +5367,21 @@ fn transport_proof_artifact_topology_defect_with_root(
         }
     }
 
-    let certificates = artifacts
-        .iter()
-        .filter(|artifact| normalized_artifact_kind(&artifact.kind) == "proof_certificate")
-        .collect::<Vec<_>>();
-    let transcripts = artifacts
-        .iter()
-        .filter(|artifact| normalized_artifact_kind(&artifact.kind) == "solver_transcript")
-        .collect::<Vec<_>>();
-    let replays = artifacts
-        .iter()
-        .filter(|artifact| {
-            matches!(
-                normalized_artifact_kind(&artifact.kind).as_str(),
-                "proof_replay_trace" | "replay_log"
-            )
-        })
-        .collect::<Vec<_>>();
-    let checks = artifacts
-        .iter()
-        .filter(|artifact| normalized_artifact_kind(&artifact.kind) == "proof_check_report")
-        .collect::<Vec<_>>();
-    let models = artifacts
-        .iter()
-        .filter(|artifact| normalized_artifact_kind(&artifact.kind) == "model")
-        .collect::<Vec<_>>();
+    let mut certificates = Vec::new();
+    let mut transcripts = Vec::new();
+    let mut replays = Vec::new();
+    let mut checks = Vec::new();
+    let mut models = Vec::new();
+    for artifact in artifacts {
+        match normalized_artifact_kind(&artifact.kind).as_str() {
+            "proof_certificate" => certificates.push(artifact),
+            "solver_transcript" => transcripts.push(artifact),
+            "proof_replay_trace" | "replay_log" => replays.push(artifact),
+            "proof_check_report" => checks.push(artifact),
+            "model" => models.push(artifact),
+            _ => {}
+        }
+    }
 
     let certificate_route = certificates.len() == 1
         && transcripts.is_empty()
@@ -4659,6 +5389,17 @@ fn transport_proof_artifact_topology_defect_with_root(
         && checks.is_empty()
         && models.is_empty();
     if certificate_route {
+        if suite == SOURCE_CLAUSE_PROOF_SUITE {
+            return source_clause::topology_defect(artifacts, Some(obligation_id), trusted_root);
+        }
+        if suite.eq_ignore_ascii_case("trust-wp") {
+            return native_body_wp::certificate_identity(
+                artifacts,
+                Some(obligation_id),
+                trusted_root,
+            )
+            .err();
+        }
         let certificate = certificates[0];
         if !suite.eq_ignore_ascii_case("trust-vc")
             || !is_trust_vc_digest_bound_proof_certificate_artifact(certificate)
@@ -4813,8 +5554,8 @@ fn transport_proof_artifact_topology_defect_with_root(
 
 fn transport_artifact_identity(
     artifact: &TransportEvidenceArtifact,
-) -> Option<(String, TransportArtifactDigest)> {
-    Some((artifact.kind.clone(), artifact.digest.clone()?))
+) -> Option<(&str, &TransportArtifactDigest)> {
+    Some((artifact.kind.as_str(), artifact.digest.as_ref()?))
 }
 
 fn transport_artifact_references_exactly(
@@ -4824,25 +5565,27 @@ fn transport_artifact_references_exactly(
     let Some(materialization) = &consumer.materialization else {
         return false;
     };
-    let Some(mut expected) = consumed
-        .iter()
-        .map(|artifact| {
-            artifact
-                .digest
-                .clone()
-                .map(|digest| TransportArtifactReference { kind: artifact.kind.clone(), digest })
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
+    if materialization.referenced_artifacts.len() != consumed.len() {
         return false;
-    };
-    expected.sort();
+    }
+    let mut expected = Vec::with_capacity(consumed.len());
+    for artifact in consumed {
+        let Some(digest) = artifact.digest.as_ref() else {
+            return false;
+        };
+        expected.push((artifact.kind.as_str(), digest));
+    }
+    expected.sort_unstable();
     // The backward-reference contract is set equality. Producers order their
     // references by typed artifact role, which need not match this string-keyed
-    // DTO's lexical order. Sort clones for membership comparison while keeping
+    // DTO's lexical order. Sort borrowed pairs for membership comparison while keeping
     // the stored sequence unchanged for bound-envelope validation.
-    let mut declared = materialization.referenced_artifacts.clone();
-    declared.sort();
+    let mut declared: Vec<(&str, &TransportArtifactDigest)> = materialization
+        .referenced_artifacts
+        .iter()
+        .map(|r| (r.kind.as_str(), &r.digest))
+        .collect();
+    declared.sort_unstable();
     declared == expected
 }
 
@@ -4886,6 +5629,16 @@ fn transport_bound_payload_matches(
     proof_binding_id: &str,
     references: &[TransportArtifactReference],
 ) -> bool {
+    transport_bound_payload(bytes, kind, obligation_id, proof_binding_id, references).is_some()
+}
+
+fn transport_bound_payload<'a>(
+    bytes: &'a [u8],
+    kind: &str,
+    obligation_id: &str,
+    proof_binding_id: &str,
+    references: &[TransportArtifactReference],
+) -> Option<&'a [u8]> {
     let mut cursor = EVIDENCE_ARTIFACT_BINDING_ENVELOPE_MAGIC.len();
     if !bytes.starts_with(EVIDENCE_ARTIFACT_BINDING_ENVELOPE_MAGIC)
         || transport_binding_field(bytes, &mut cursor) != Some(kind.as_bytes())
@@ -4894,7 +5647,7 @@ fn transport_bound_payload_matches(
         || transport_binding_u32(bytes, &mut cursor).map(|count| count as usize)
             != Some(references.len())
     {
-        return false;
+        return None;
     }
     for reference in references {
         if transport_binding_field(bytes, &mut cursor) != Some(reference.kind.as_bytes())
@@ -4903,15 +5656,16 @@ fn transport_bound_payload_matches(
             || transport_binding_field(bytes, &mut cursor)
                 != Some(reference.digest.value.as_bytes())
         {
-            return false;
+            return None;
         }
     }
     let Some(payload_len) =
         transport_binding_u64(bytes, &mut cursor).and_then(|len| usize::try_from(len).ok())
     else {
-        return false;
+        return None;
     };
-    payload_len > 0 && cursor.checked_add(payload_len) == Some(bytes.len())
+    (payload_len > 0 && cursor.checked_add(payload_len) == Some(bytes.len()))
+        .then(|| &bytes[cursor..])
 }
 
 fn transport_binding_field<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
@@ -4965,10 +5719,9 @@ fn native_trust_ir_artifact_shape_is_publishable_with_root(
     native: &TransportNativeTrustIrEvidence,
     trusted_root: Option<&Path>,
 ) -> bool {
-    let suite = native.suite.trim().to_ascii_lowercase();
-    if !matches!(suite.as_str(), "trust-wp" | "trust-mc" | "trust-vc") {
+    let Some(suite) = canonical_native_trust_ir_suite(&native.suite) else {
         return false;
-    }
+    };
     let Some(request_id) =
         native.request_id.as_deref().map(str::trim).filter(|id| {
             !id.is_empty() && !id.contains('/') && !id.contains('?') && !id.contains('#')
@@ -4979,9 +5732,7 @@ fn native_trust_ir_artifact_shape_is_publishable_with_root(
     let Some(native_id) = native.native_id.as_deref() else {
         return false;
     };
-    let native_id_prefix = format!("trust_ir-native-{suite}-request-{request_id}-proof-");
-    let Some(proof_id) = native_id
-        .strip_prefix(&native_id_prefix)
+    let Some(proof_id) = strip_native_trust_ir_id(native_id, suite, request_id)
         .filter(|id| !id.is_empty() && !id.contains('/') && !id.contains('?') && !id.contains('#'))
     else {
         return false;
@@ -5005,11 +5756,11 @@ fn native_trust_ir_artifact_shape_is_publishable_with_root(
     }
 
     const URI_PREFIX: &str = "trust_ir-native://verification-bundle/";
-    let mut common_bundle = None::<String>;
-    let mut bundle_digest = None::<String>;
-    let mut request_digest = None::<String>;
-    let mut normalized_digest = None::<String>;
-    let mut normalized_request_digest = None::<String>;
+    let mut common_bundle = None::<&str>;
+    let mut bundle_digest = None::<&str>;
+    let mut request_digest = None::<&str>;
+    let mut normalized_digest = None::<&str>;
+    let mut normalized_request_digest = None::<&str>;
 
     for artifact in &native.artifacts {
         let Some(digest) = artifact.digest.as_ref().filter(|digest| {
@@ -5036,10 +5787,10 @@ fn native_trust_ir_artifact_shape_is_publishable_with_root(
         }) else {
             return false;
         };
-        if common_bundle.as_deref().is_some_and(|expected| expected != bundle) {
+        if common_bundle.is_some_and(|expected| expected != bundle) {
             return false;
         }
-        common_bundle.get_or_insert_with(|| bundle.to_string());
+        common_bundle.get_or_insert(bundle);
 
         match (normalized_artifact_kind(&artifact.kind).as_str(), segments.as_slice()) {
             ("engine_input", [_])
@@ -5058,7 +5809,7 @@ fn native_trust_ir_artifact_shape_is_publishable_with_root(
                             )
                     }) =>
             {
-                bundle_digest = Some(digest.value.clone());
+                bundle_digest = Some(digest.value.as_str());
             }
             ("engine_input", [_, uri_suite, "request", uri_request, uri_request_digest])
                 if request_digest.is_none()
@@ -5071,20 +5822,16 @@ fn native_trust_ir_artifact_shape_is_publishable_with_root(
                             digest,
                             trusted_root,
                             "request",
-                            Some(&suite),
+                            Some(suite),
                             Some(request_id),
                             None,
-                        ) && materialization.referenced_artifacts.as_slice()
-                            == [TransportArtifactReference {
-                                kind: "EngineInput".to_string(),
-                                digest: TransportArtifactDigest {
-                                    algorithm: "sha256".to_string(),
-                                    value: bundle.to_string(),
-                                },
-                            }]
+                        ) && materialization.referenced_artifacts.len() == 1
+                            && materialization.referenced_artifacts[0].kind == "EngineInput"
+                            && materialization.referenced_artifacts[0].digest.algorithm == "sha256"
+                            && materialization.referenced_artifacts[0].digest.value == bundle
                     }) =>
             {
-                request_digest = Some(digest.value.clone());
+                request_digest = Some(digest.value.as_str());
             }
             (
                 "normalized_obligation",
@@ -5109,21 +5856,18 @@ fn native_trust_ir_artifact_shape_is_publishable_with_root(
                         digest,
                         trusted_root,
                         "normalized_obligation",
-                        Some(&suite),
+                        Some(suite),
                         Some(request_id),
                         Some(proof_id),
-                    ) && materialization.referenced_artifacts.as_slice()
-                        == [TransportArtifactReference {
-                            kind: "EngineInput".to_string(),
-                            digest: TransportArtifactDigest {
-                                algorithm: "sha256".to_string(),
-                                value: uri_request_digest.to_string(),
-                            },
-                        }]
+                    ) && materialization.referenced_artifacts.len() == 1
+                        && materialization.referenced_artifacts[0].kind == "EngineInput"
+                        && materialization.referenced_artifacts[0].digest.algorithm == "sha256"
+                        && materialization.referenced_artifacts[0].digest.value
+                            == *uri_request_digest
                 }) =>
             {
-                normalized_digest = Some(digest.value.clone());
-                normalized_request_digest = Some(uri_request_digest.to_string());
+                normalized_digest = Some(digest.value.as_str());
+                normalized_request_digest = Some(*uri_request_digest);
             }
             _ => return false,
         }
@@ -5144,18 +5888,39 @@ fn native_materialization_envelope_matches(
     request_id: Option<&str>,
     proof_id: Option<&str>,
 ) -> bool {
+    native_materialization_payload(
+        materialization,
+        digest,
+        trusted_root,
+        role,
+        suite,
+        request_id,
+        proof_id,
+    )
+    .is_some()
+}
+
+fn native_materialization_payload(
+    materialization: &TransportArtifactMaterialization,
+    digest: &TransportArtifactDigest,
+    trusted_root: Option<&Path>,
+    role: &str,
+    suite: Option<&str>,
+    request_id: Option<&str>,
+    proof_id: Option<&str>,
+) -> Option<serde_json::Value> {
     let bytes = match trusted_root {
         Some(root) => materialization.decoded_bytes_at_root(digest, root),
         None => materialization.decoded_bytes(),
     };
     let Ok(bytes) = bytes else {
-        return false;
+        return None;
     };
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
+        return None;
     };
     let Some(object) = value.as_object() else {
-        return false;
+        return None;
     };
     if object.len() != 6
         || object.get("schema").and_then(serde_json::Value::as_str)
@@ -5166,10 +5931,14 @@ fn native_materialization_envelope_matches(
         || json_optional_string(object.get("proof_id")) != Some(proof_id)
         || object.get("payload").is_none_or(serde_json::Value::is_null)
     {
-        return false;
+        return None;
     }
     crate::digest::canonicalize_json_in_place(&mut value);
-    serde_json::to_vec(&value).is_ok_and(|canonical| canonical == bytes)
+    if serde_json::to_vec(&value).is_ok_and(|canonical| canonical == bytes) {
+        value.as_object_mut()?.remove("payload")
+    } else {
+        None
+    }
 }
 
 fn json_optional_string(value: Option<&serde_json::Value>) -> Option<Option<&str>> {
@@ -5245,13 +6014,15 @@ pub fn is_trust_vc_digest_bound_proof_certificate_artifact(
 }
 
 fn trust_vc_proof_certificate_uri_matches_digest(uri: &str, digest: &str) -> bool {
-    let exported_id = format!("{TRUST_VC_PROOF_ARTIFACT_ID_PREFIX}{digest}");
-    [
-        format!("{TRUST_VC_NATIVE_TRUST_IR_PROOF_CERTIFICATE_URI_PREFIX}{digest}.json"),
-        format!("{TRUST_VC_PROOF_CERTIFICATE_URI_PREFIX}{exported_id}.alethe"),
-    ]
-    .iter()
-    .any(|expected| uri == expected)
+    if let Some(rest) = uri.strip_prefix(TRUST_VC_NATIVE_TRUST_IR_PROOF_CERTIFICATE_URI_PREFIX) {
+        return rest.strip_suffix(".json") == Some(digest);
+    }
+    if let Some(rest) = uri.strip_prefix(TRUST_VC_PROOF_CERTIFICATE_URI_PREFIX)
+        && let Some(rest) = rest.strip_prefix(TRUST_VC_PROOF_ARTIFACT_ID_PREFIX)
+    {
+        return rest.strip_suffix(".alethe") == Some(digest);
+    }
+    false
 }
 
 fn transport_diagnostics_are_publishable(diagnostics: &[TransportEvidenceDiagnostic]) -> bool {
@@ -5327,12 +6098,18 @@ fn recompute_function_summary(
 ) {
     let (mut proved, mut runtime, mut failed, mut unknown, mut timed_out, mut design) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut failed_unproved = 0usize;
 
     for obligation in &function.obligations {
         match &obligation.outcome {
             ObligationOutcome::Proved { .. } => proved += 1,
             ObligationOutcome::RuntimeChecked { .. } => runtime += 1,
-            ObligationOutcome::Failed { .. } => failed += 1,
+            ObligationOutcome::Failed { basis, .. } => {
+                failed += 1;
+                if *basis == FailureBasis::UnprovedFailClosed {
+                    failed_unproved += 1;
+                }
+            }
             ObligationOutcome::Unknown { .. } => unknown += 1,
             ObligationOutcome::Timeout { .. } => {
                 unknown += 1;
@@ -5373,6 +6150,9 @@ fn recompute_function_summary(
     function.summary.proved = proved;
     function.summary.runtime_checked = runtime;
     function.summary.failed = failed;
+    // Rows only, never a deserialized residual: a summary-only `failed` count
+    // has no row whose basis could be read, so it stays `refuted`.
+    function.summary.failed_unproved = failed_unproved;
     function.summary.unknown = unknown;
     function.summary.timed_out = timed_out;
     function.summary.design_requirements = design;
@@ -5718,6 +6498,9 @@ pub enum TransportMessage {
     /// older compiler) is coverage-UNKNOWN, reported but not gate-driving.
     #[serde(rename = "coverage_summary")]
     CoverageSummary(CoverageTransportSummary),
+    /// Resource observations only; never contributes a proof row or grade.
+    #[serde(rename = "native_admission_census")]
+    NativeAdmissionCensus(crate::native_admission::NativeAdmissionCensus),
 }
 
 /// Structured verification results for a single function, emitted by the
@@ -5741,6 +6524,79 @@ pub struct FunctionTransportResult {
     /// credit.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub verification_session: String,
+    /// The EFFECTIVE runtime-check settings of the compilation unit that minted
+    /// these rows, read off the compiler's own `Session` at the moment the
+    /// obligations were minted: `Session::overflow_checks()` and
+    /// `Session::ub_checks()` (rustc_session/src/session.rs).
+    ///
+    /// WHY IT IS HERE AT ALL. [`VcKind::has_runtime_fallback_in`] answers the
+    /// overflow and unchecked-UB families from exactly these two bits, and its
+    /// `true` is a POSITIVE SAFETY CLAIM. Only the compiler knows them: they are
+    /// `-C overflow-checks` / `-C debug-assertions` / `-Z ub-checks` resolved
+    /// against the profile, the `RUSTFLAGS` the unit was actually built with,
+    /// and the per-unit defaults. A downstream consumer that reasons from the
+    /// flags it *appended* is guessing, and a guess in the `true` direction is a
+    /// false safety claim. The compiler already commits `overflow_checks` into
+    /// every row's `claim_digest_sha256` (`canonical_exact_vc_claim_payload`'s
+    /// `semantics` object, compiler/rustc_mir_transform/src/trust_verify.rs), so
+    /// this truth already rides along inside the authenticated identity of each
+    /// row — one-way-hashed, and therefore unreadable. This field states the
+    /// same value where a consumer can read it. It does not enter that digest.
+    ///
+    /// PER-COMPILATION-UNIT, NOT PER-OBLIGATION, and that is the exact
+    /// granularity of the fact. `Session::overflow_checks()` and
+    /// `Session::ub_checks()` are properties of the rustc invocation, resolved
+    /// once from `opts` and constant for its whole life; the `TrustVerify` pass
+    /// only ever mints obligations for LOCAL bodies of that same session, so
+    /// there is no body in the envelope the settings could differ for.
+    /// `build_transport_results` already threads the single `sess.overflow_checks()`
+    /// to every row it builds. Restating it per obligation would be N copies of
+    /// one fact that a defect could make disagree, with no place to notice; it
+    /// rides on the envelope instead, beside the other per-unit identities
+    /// (`package_name`, `crate_name`, `primary_package`, `verification_session`
+    /// — itself a per-unit nonce restated on every envelope).
+    ///
+    /// ABSENCE IS NEVER "TRUE". `None` is what an older compiler, a lane that
+    /// does not mint the field, and a malformed row all deserialize to, and a
+    /// consumer must fall back to whatever conservative value it can establish
+    /// on its own. `Some(env)` is a measurement; `None` is the absence of one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_checks: Option<RuntimeCheckEnv>,
+    /// Trust (D2 tier 1, 2026-09-24): the MODELED FACTS this function's rows
+    /// were proved under — premises about the execution environment that no
+    /// kernel proof re-derives (`docs/TCB.md`, "Modeled-fact axioms"). Each entry
+    /// starts with the fact's name (`ADAPTER_YIELD: …`). A row of a function
+    /// with a non-empty list is `Proved`/`Certified` for `premise ⇒ safe`, and a
+    /// consumer must never read it as unconditional. Empty — and omitted from
+    /// the wire — for every function that rests on none; an older compiler's
+    /// envelope deserializes to empty, which is the same claim it made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modeled_facts: Vec<String>,
+    /// Trust (T9): the stable local id of every row of `results`, in the same
+    /// order — `results[i]`'s key is `<function>#<stable_ids[i]>`
+    /// ([`crate::obligation_identity::obligation_key`]). Minted for the whole
+    /// row set at once ([`crate::obligation_identity::local_ids`]), because a
+    /// row's `nth` counts its siblings; that is why the ids ride on the envelope
+    /// and not on the rows. Empty means the producer minted none — an older
+    /// compiler, or a refused mint (a colliding id or a span outside its file),
+    /// which the compiler reports as an error — and then NO row of the function
+    /// has a key: a consumer reads the unit as could-not-run, never as a
+    /// comparison it can make. A length other than `results.len()` is the same
+    /// defect. Diagnostic identity only: never proof authority, never in a claim
+    /// digest or certificate binding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stable_ids: Vec<String>,
+    /// Trust (T9): [`crate::obligation_identity::function_source_digest`] of
+    /// the item's source text (`tcx.source_span` of the body's def), the input
+    /// a baseline matches a moved function by and tells an edited function from
+    /// an untouched one. `None` when the compiler could not read the item's
+    /// text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
+    /// Versioned compiler-captured expanded typed input; never ordinary source text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_function_identity:
+        Option<crate::expanded_function_identity::ExpandedFunctionIdentity>,
     /// Per-obligation (VC, result) pairs.
     pub results: Vec<TransportObligationResult>,
     /// Summary counts for this function.
@@ -5764,15 +6620,61 @@ pub struct FunctionTransportResult {
     #[serde(default)]
     pub cached: usize,
     pub total: usize,
+    /// Trust (TRANSPORT-LINE-BUDGET-1, 2026-11-01): the compiler's statement that this
+    /// report did not fit the transport line budget whole, and what it withheld from
+    /// which rows, which rows it demoted, or what it replaced, to make it fit
+    /// ([`crate::transport_budget`]). `None` — and absent from the wire — when the
+    /// report is whole. A consumer must never read a report carrying it as complete
+    /// evidence, and must treat a disclosure that does not match the rows
+    /// ([`crate::transport_budget::TransportBudgetDisclosure::defect`]) as a malformed
+    /// report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_budget: Option<crate::transport_budget::TransportBudgetDisclosure>,
+}
+
+/// Trust (2026-09-17): the compiler's own classification of a COMPLETENESS-GAP
+/// row it recognizes by construction — see
+/// [`TransportObligationResult::gap_class`]. Classification, never authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransportGapClass {
+    /// This function's whole-function panic-freedom row stands for EXACTLY ONE
+    /// kind of panic source: the std stdout/stderr print backend
+    /// (`std::io::_print` / `_eprint`, in either the `std::io::` or
+    /// `std::io::stdio::` spelling, crate-rooted at the real `std`) reached as an
+    /// ABSENT callee, whose only unproved obligation is std's own DEFINED
+    /// write-failure / broken-pipe panic. The row is an AGGREGATE over every
+    /// panic site the compiler folded into it — its description names only the
+    /// first marked one — so the compiler attests this class where the fold is
+    /// visible: every per-site panic-freedom obligation in the lowered bundle
+    /// (root and bundled members alike) is that absent-callee print row, and
+    /// there is at least one. A user `assert!`/`panic!`, another absent or
+    /// dependency callee, a drop-glue site, or the extern print/format/write
+    /// DISPATCH shape (a user `Display` reached through the machinery) folded
+    /// under the same row leaves it UNCLASSED — and so does any OTHER `Assert`
+    /// instruction in the lowered bundle that is not the print marker or a
+    /// root-owned check with its own graded row (a bundled member's assert of
+    /// any kind, a discharged drop-glue row for an owned heap value): the class
+    /// is narrow by construction and widens only by an explicit allowlist,
+    /// never by loosening the recognizer. The owner's completeness-gap
+    /// ruling (policy B, `34ce7d8591`) has the default lane REPORT the classed row
+    /// as `runtime_checked` rather than fail the build; a consumer that tolerates
+    /// the gap keys on this class and never re-derives it from the prose
+    /// description.
+    StdPrintDispatch,
 }
 
 /// A single obligation result in the transport format.
 ///
 /// Carries the essential fields from `VerificationResult` in a flat,
-/// JSON-friendly structure without requiring the full `VerificationCondition`.
+/// JSON-friendly structure with an optional bounded original-VC snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransportObligationResult {
-    /// Stable router/native obligation ID, when available.
+    /// The router/native obligation ID, when available: the private binding
+    /// and certificate token (`docs/TCB.md`). It is an ORDINAL
+    /// (`vc:<fn>:<kind>:<carrier index>`) and is never a comparison key — a
+    /// removed sibling renumbers it. Comparisons use the stable key the
+    /// envelope carries ([`FunctionTransportResult::stable_ids`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obligation_id: Option<String>,
     /// SHA-256 digest of the exact canonical verification claim (VC), when the
@@ -5794,6 +6696,9 @@ pub struct TransportObligationResult {
     /// temporal machines, liveness/fairness payloads, and similar fields), so
     /// consumers must prefer this field whenever present.  The payload is
     /// classification/diagnostic data only and never proof authority.
+    /// Bounded original full typed VC. Serialized diagnostic data, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_vc_snapshot: Option<Box<crate::OriginalVcSnapshot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typed_kind: Option<Box<VcKind>>,
     /// Human-readable description of the obligation.
@@ -5834,6 +6739,16 @@ pub struct TransportObligationResult {
     /// the compiler may set this; consumers must never infer it from row text.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub design_mandate: bool,
+    /// Trust (2026-09-17): which completeness-gap class this row is, when the
+    /// compiler attests one — today only [`TransportGapClass::StdPrintDispatch`].
+    /// The attestation is made where the panic-freedom fold is visible (the
+    /// per-function bundle synthesis), carried to the transport builder, and
+    /// stamped only on the row that names the print backend and is not
+    /// `proved`. Diagnostic classification only: it grants no proof credit,
+    /// changes no outcome, and a row without it reads exactly as it did before
+    /// the field existed. Absent from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_class: Option<TransportGapClass>,
     /// Native TrustIr evidence associated with this obligation, when the backend
     /// transported the native representation instead of only a flattened VC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5847,6 +6762,22 @@ pub struct TransportObligationResult {
     /// must never be interpreted as a successful check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor: Option<TransportMonitorEvidence>,
+    /// Trust (TINV step 10.7): the named premises the row's verdict rests on, one
+    /// disclosure line each, beginning with [`crate::TINV_ASSUMES_PREFIX`]
+    /// (`assumes type_invariant(S)#k ...`). The compiler fills it for exactly the rows it
+    /// grades `TypeInvariantComposed`; every report surface copies it. Disclosure only,
+    /// self-asserted serialized data like every other field here: it is never proof
+    /// authority. Absent from the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumes: Vec<String>,
+    /// Trust (VF1): the row's three-axis grade (encoding, discharge, premises),
+    /// stated by the compiler from the row-bound proof authority whose
+    /// disposition it reports (`trust_grade_for_authority`). Present exactly on a
+    /// `proved` or `skipped` row an authority graded; `None` on every other row
+    /// and from a compiler that predates the field. Disclosure only, like
+    /// `assumes`: never proof authority. Absent from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<crate::authority_grade::ObligationGrade>,
 }
 
 /// Machine-stable runtime executability status for one contract clause.
@@ -6100,7 +7031,10 @@ pub struct TransportArtifactReference {
 const MAX_TRANSPORT_ARTIFACT_REFERENCES: usize = 32;
 
 fn transport_artifact_references_are_valid(references: &[TransportArtifactReference]) -> bool {
-    if references.len() > MAX_TRANSPORT_ARTIFACT_REFERENCES {
+    if crate::audit_ledger::cap_hit_if(
+        references.len() > MAX_TRANSPORT_ARTIFACT_REFERENCES,
+        "crates/trust-types/src/result.rs:MAX_TRANSPORT_ARTIFACT_REFERENCES",
+    ) {
         return false;
     }
     let mut seen = BTreeSet::new();
@@ -6121,7 +7055,10 @@ impl TransportArtifactMaterialization {
     ) -> Option<Self> {
         let proof_binding_id = proof_binding_id.into();
         if bytes.is_empty()
-            || bytes.len() > MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES
+            || crate::audit_ledger::cap_hit_if(
+                bytes.len() > MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES,
+                "crates/trust-types/src/result.rs:MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES",
+            )
             || !canonical_transport_proof_binding_id(&proof_binding_id)
             || !transport_artifact_references_are_valid(&referenced_artifacts)
         {
@@ -6157,6 +7094,22 @@ impl TransportArtifactMaterialization {
                 .to_string());
         }
         decode_inline_materialization(&self.encoded_bytes, byte_len)
+    }
+
+    /// Check a path-backed descriptor without opening or authenticating its
+    /// payload. Store deduplication must check each occurrence's shape and
+    /// digest/path binding even after another occurrence's bytes were read.
+    /// This grants no evidence or proof credit; consumers must still read and
+    /// hash the first payload under an explicit trusted root.
+    pub fn validate_path_descriptor(&self, digest: &TransportArtifactDigest) -> Result<(), String> {
+        if !is_canonical_sha256_digest(digest) {
+            return Err("artifact digest is not canonical SHA-256".to_string());
+        }
+        self.validate_shape()?;
+        let path = self.materialized_path.as_deref().ok_or_else(|| {
+            "path-backed artifact descriptor requires a materialized path".to_string()
+        })?;
+        validate_materialized_relative_path(path, Some(&digest.value))
     }
 
     /// Decode exact path-backed bytes relative to a canonical trusted root.
@@ -6207,6 +7160,28 @@ impl TransportArtifactMaterialization {
         lowercase_transport_hex(&actual) == digest.value
     }
 
+    /// True when this payload is carried by a content-addressed STORE PATH
+    /// whose only variable component is `digest`.
+    ///
+    /// The distinction matters to the publication seal. A path in general is
+    /// ambient state and cannot survive inside a final capability — it names
+    /// something the capability does not bind. This shape does not: it is
+    /// `<store>/sha256/<digest>` and `validate_materialized_relative_path`
+    /// cross-checks the final component against the declared digest, so the
+    /// path carries NO authority the digest does not already carry, and the
+    /// digest is inside the seal. Reading it is not a shortcut either —
+    /// `securely_read_materialized_path` re-hashes what it loads.
+    #[must_use]
+    pub fn path_is_digest_derived(&self, digest: &TransportArtifactDigest) -> bool {
+        if !is_canonical_sha256_digest(digest) {
+            return false;
+        }
+        let Some(path) = self.materialized_path.as_deref() else {
+            return false;
+        };
+        validate_materialized_relative_path(path, Some(&digest.value)).is_ok()
+    }
+
     /// Whether exact bytes match SHA-256 when any path is resolved under the
     /// caller's explicit trusted report/output root.
     #[must_use]
@@ -6243,7 +7218,10 @@ impl TransportArtifactMaterialization {
         if byte_len == 0 {
             return Err("artifact materialization is empty".to_string());
         }
-        if byte_len > MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES {
+        if crate::audit_ledger::cap_hit_if(
+            byte_len > MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES,
+            "crates/trust-types/src/result.rs:MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES",
+        ) {
             return Err(format!(
                 "artifact materialization exceeds {} byte limit",
                 MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES
@@ -6326,6 +7304,13 @@ fn validate_materialized_relative_path(
             "artifact materialization path digest does not match the declared digest".to_string()
         );
     }
+    // Path components normalize repeated separators and `.`. Saved reports
+    // bind the literal descriptor, so aliases must not pass as canonical.
+    if path != format!("{TRANSPORT_ARTIFACT_STORE_DIRECTORY}/sha256/{digest}") {
+        return Err(
+            "artifact materialization path is not the exact canonical store path".to_string()
+        );
+    }
     Ok(())
 }
 
@@ -6339,6 +7324,23 @@ fn securely_read_materialized_path(
     relative_path: &str,
     byte_len: usize,
     expected_digest: &str,
+) -> Result<Vec<u8>, String> {
+    securely_read_materialized_path_before_open(
+        trusted_root,
+        relative_path,
+        byte_len,
+        expected_digest,
+        |_| {},
+    )
+}
+
+fn securely_read_materialized_path_before_open(
+    trusted_root: &Path,
+    relative_path: &str,
+    byte_len: usize,
+    expected_digest: &str,
+    // Private deterministic race seam; production calls this with a no-op.
+    before_open: impl FnOnce(&Path),
 ) -> Result<Vec<u8>, String> {
     let root_metadata = std::fs::symlink_metadata(trusted_root).map_err(|error| {
         format!("could not inspect trusted artifact materialization root: {error}")
@@ -6388,7 +7390,19 @@ fn securely_read_materialized_path(
         return Err("artifact materialization path escaped the trusted store".to_string());
     }
 
-    let mut file = std::fs::File::open(&candidate)
+    before_open(&candidate);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        // A substituted FIFO must reach the regular-file refusal without
+        // waiting for a writer; a substituted symlink must never be followed.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&candidate)
         .map_err(|error| format!("could not open artifact materialization file: {error}"))?;
     let opened_before = file
         .metadata()
@@ -6481,7 +7495,10 @@ where
         where
             E: de::Error,
         {
-            if value.len() > MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES * 2 {
+            if crate::audit_ledger::cap_hit_if(
+                value.len() > MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES * 2,
+                "crates/trust-types/src/result.rs:MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES",
+            ) {
                 return Err(E::custom("artifact materialization encoded payload exceeds limit"));
             }
             Ok(value.to_string())
@@ -6491,7 +7508,10 @@ where
         where
             E: de::Error,
         {
-            if value.len() > MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES * 2 {
+            if crate::audit_ledger::cap_hit_if(
+                value.len() > MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES * 2,
+                "crates/trust-types/src/result.rs:MAX_TRANSPORT_ARTIFACT_MATERIALIZATION_BYTES",
+            ) {
                 return Err(E::custom("artifact materialization encoded payload exceeds limit"));
             }
             Ok(value)
@@ -6537,7 +7557,10 @@ where
                 sequence.size_hint().unwrap_or(0).min(MAX_TRANSPORT_ARTIFACT_REFERENCES),
             );
             while let Some(reference) = sequence.next_element::<TransportArtifactReference>()? {
-                if references.len() == MAX_TRANSPORT_ARTIFACT_REFERENCES {
+                if crate::audit_ledger::cap_hit_if(
+                    references.len() == MAX_TRANSPORT_ARTIFACT_REFERENCES,
+                    "crates/trust-types/src/result.rs:MAX_TRANSPORT_ARTIFACT_REFERENCES",
+                ) {
                     return Err(de::Error::custom("too many artifact digest references"));
                 }
                 references.push(reference);
@@ -6571,7 +7594,10 @@ where
         where
             A: SeqAccess<'de>,
         {
-            if sequence.size_hint().is_some_and(|hint| hint > MAX_TRANSPORT_EVIDENCE_ARTIFACTS) {
+            if crate::audit_ledger::cap_hit_if(
+                sequence.size_hint().is_some_and(|hint| hint > MAX_TRANSPORT_EVIDENCE_ARTIFACTS),
+                "crates/trust-types/src/result.rs:MAX_TRANSPORT_EVIDENCE_ARTIFACTS",
+            ) {
                 return Err(de::Error::custom("too many transport evidence artifacts"));
             }
             let mut artifacts = Vec::with_capacity(
@@ -6583,7 +7609,10 @@ where
                 };
                 artifacts.push(artifact);
             }
-            if sequence.next_element::<IgnoredAny>()?.is_some() {
+            if crate::audit_ledger::cap_hit_if(
+                sequence.next_element::<IgnoredAny>()?.is_some(),
+                "crates/trust-types/src/result.rs:MAX_TRANSPORT_EVIDENCE_ARTIFACTS",
+            ) {
                 return Err(de::Error::custom("too many transport evidence artifacts"));
             }
             Ok(artifacts)
@@ -6722,6 +7751,126 @@ pub struct CoverageTransportSummary {
     /// gate because equal cardinalities do not prove equal function sets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function_identities: Option<CoverageFunctionIdentityInventory>,
+    /// Determinism accounting (plan
+    /// `docs/design/2026-09-29-incremental-deterministic-trust-results.md` §2):
+    /// the backstops, and stops nobody explained, that fired anywhere in this
+    /// compile — including in work whose outcome the compiler consumed without
+    /// publishing a row (the R1 harvest, refutation attempts, S1 revalidation)
+    /// — drained from the process-wide ledger
+    /// ([`crate::determinism::take_noted_stops`]) when this row is emitted,
+    /// and the named stops and solver count stops the lanes saw. Any entry
+    /// whose cause is not
+    /// deterministic makes the unit `not-reproducible`. Empty from a producer that
+    /// predates the ledger; such a producer states no row causes either, so its
+    /// rows are already `unclassified`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub noted_stops: Vec<crate::determinism::NotedStop>,
+    /// Trust (T9): how many obligation keys this compile minted on a DEGRADED
+    /// anchor ([`crate::obligation_identity::RowAnchor::degraded`]: a span
+    /// that did not lie in its file's text, or covered no token). Such a key is
+    /// still a key, but coarser than a content address; consumers state the
+    /// count so it is never silent. Zero, and omitted, in the ordinary case.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub degraded_anchors: usize,
+    /// Trust (T3 L4, C09w; L4-SUMMARY-1): the compile's verification-memory counters
+    /// ([`MemorySummary`]). REQUIRED, with no default: a coverage row without it, or with
+    /// a schema other than [`MEMORY_SUMMARY_SCHEMA_V1`], does not deserialize, so a
+    /// producer that predates it is refused, never read as one that released everything.
+    /// Report-only: it is never in a verdict vector or a key.
+    pub memory: MemorySummary,
+}
+
+/// Schema of [`MemorySummary`] (T3 L4, C09w). A later counter joins under a new name with
+/// no bump (L4-SUMMARY-1); a change to what an existing name counts is a bump.
+pub const MEMORY_SUMMARY_SCHEMA_V1: &str = "trust-memory-summary/v1";
+
+/// Trust (T3 L4, C09w; design §8, plan §3.6): a compile's verification-memory counters, on
+/// its [`CoverageTransportSummary`], which the compiler's `-Ztrust-memory-notes` census
+/// prints too. Counts only, each a function of the compile and its source, never of the
+/// host: the resident sizes stay in the note. The compiler's names are the `MemorySummary`
+/// constants; a reader reads a counter by name and treats a missing one as unknown.
+///
+/// The schema is checked when it deserializes, and an unknown field is refused, so a row of
+/// another shape never decodes as this one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MemorySummaryWire")]
+pub struct MemorySummary {
+    schema: String,
+    counters: std::collections::BTreeMap<String, u64>,
+}
+
+/// [`MemorySummary`] as it is read, before its schema is checked.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemorySummaryWire {
+    schema: String,
+    counters: std::collections::BTreeMap<String, u64>,
+}
+
+impl TryFrom<MemorySummaryWire> for MemorySummary {
+    type Error = String;
+
+    fn try_from(wire: MemorySummaryWire) -> Result<Self, String> {
+        if wire.schema != MEMORY_SUMMARY_SCHEMA_V1 {
+            return Err(format!(
+                "memory summary schema {:?} is not {MEMORY_SUMMARY_SCHEMA_V1:?}",
+                wire.schema
+            ));
+        }
+        Ok(Self { schema: wire.schema, counters: wire.counters })
+    }
+}
+
+impl Default for MemorySummary {
+    /// The current schema with no counter: what a producer that verified nothing states.
+    fn default() -> Self {
+        Self { schema: MEMORY_SUMMARY_SCHEMA_V1.to_string(), counters: Default::default() }
+    }
+}
+
+impl MemorySummary {
+    /// Artifact slots compacted after their verify pass.
+    pub const SLOTS_COMPACTED: &'static str = "slots_compacted";
+    /// Of those, the slots whose pass had already dropped its own handle (expected 0).
+    pub const COMPACTED_AFTER_HANDLE_DROPPED: &'static str = "compacted_after_handle_dropped";
+    /// Verify passes that found their slot compacted and recomputed it (expected 0).
+    pub const COMPACTED_REHITS: &'static str = "compacted_rehits";
+    /// Compacted slots' VC contexts released by the end of the compile.
+    pub const CONTEXTS_RELEASED: &'static str = "contexts_released";
+    /// Compacted slots' VC contexts still alive at the end of the compile and held by no
+    /// pending citation (expected 0).
+    pub const CONTEXT_ALIVE_AFTER_COMPACTION: &'static str = "context_alive_after_compaction";
+    /// VC contexts a pending import citation still held at the end of the compile
+    /// (expected 0).
+    pub const CONTEXTS_HELD_FOR_CITATION: &'static str = "contexts_held_for_citation";
+    /// Records that held a VC context for a pending import citation at any point.
+    pub const CITATION_HOLDS_ATTACHED: &'static str = "citation_holds_attached";
+    /// The most VC contexts held for pending citations at once.
+    pub const CITATION_HOLDS_MAX: &'static str = "citation_holds_max";
+
+    /// The current schema with `counters`.
+    #[must_use]
+    pub fn new(counters: impl IntoIterator<Item = (String, u64)>) -> Self {
+        Self { counters: counters.into_iter().collect(), ..Self::default() }
+    }
+
+    /// This summary's schema, [`MEMORY_SUMMARY_SCHEMA_V1`].
+    #[must_use]
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    /// Every counter, by name.
+    #[must_use]
+    pub fn counters(&self) -> &std::collections::BTreeMap<String, u64> {
+        &self.counters
+    }
+
+    /// The counter `name`, if the producer stated it.
+    #[must_use]
+    pub fn counter(&self, name: &str) -> Option<u64> {
+        self.counters.get(name).copied()
+    }
 }
 
 /// Schema for canonical exact function sets carried by
@@ -6780,15 +7929,19 @@ impl CoverageTransportSummary {
 /// tagged schema on the wire).
 pub fn parse_transport_payload(payload: &str) -> Result<TransportMessage, serde_json::Error> {
     #[derive(Deserialize)]
-    struct TransportMessageTag {
-        r#type: String,
+    struct TransportMessageTag<'a> {
+        #[serde(borrow)]
+        r#type: std::borrow::Cow<'a, str>,
     }
 
-    let tag: TransportMessageTag = serde_json::from_str(payload)?;
-    match tag.r#type.as_str() {
+    let tag: TransportMessageTag<'_> = serde_json::from_str(payload)?;
+    match tag.r#type.as_ref() {
         "function_result" => serde_json::from_str(payload).map(TransportMessage::FunctionResult),
         "crate_summary" => serde_json::from_str(payload).map(TransportMessage::CrateSummary),
         "coverage_summary" => serde_json::from_str(payload).map(TransportMessage::CoverageSummary),
+        "native_admission_census" => {
+            serde_json::from_str(payload).map(TransportMessage::NativeAdmissionCensus)
+        }
         _ => Err(<serde_json::Error as de::Error>::custom(format!(
             "unknown Trust transport message type {:?}",
             tag.r#type
@@ -6807,6 +7960,44 @@ pub fn parse_transport_line(line: &str) -> Option<TransportMessage> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The seal's rule is "no ambient paths". A content-addressed store path is
+    /// the one shape that is not ambient — its final component IS the digest the
+    /// seal binds — and telling the two apart is what lets a large report stop
+    /// inlining its evidence instead of being refused.
+    #[test]
+    fn a_digest_derived_store_path_is_distinguished_from_an_ambient_one() {
+        let bytes = b"proof artifact payload";
+        let inline = TransportArtifactMaterialization::from_exact_bytes(bytes, "binding-1", vec![])
+            .expect("inline materialization");
+        let value = lowercase_transport_hex(&Sha256::digest(bytes));
+        let digest =
+            TransportArtifactDigest { algorithm: "sha256".to_string(), value: value.clone() };
+
+        // The canonical store path for exactly this digest.
+        let canonical = format!("{TRANSPORT_ARTIFACT_STORE_DIRECTORY}/sha256/{value}");
+        let path_backed =
+            inline.clone().with_materialized_path(canonical).expect("canonical store path");
+        assert!(
+            path_backed.path_is_digest_derived(&digest),
+            "the canonical store path for this digest carries no authority the digest does not"
+        );
+
+        // A store path naming a DIFFERENT digest is ambient: the seal binds one
+        // digest and the path points at another artifact entirely.
+        let other = lowercase_transport_hex(&Sha256::digest(b"a different artifact"));
+        let mismatched = inline
+            .clone()
+            .with_materialized_path(format!("{TRANSPORT_ARTIFACT_STORE_DIRECTORY}/sha256/{other}"))
+            .expect("well-formed but mismatched store path");
+        assert!(
+            !mismatched.path_is_digest_derived(&digest),
+            "a store path whose digest component disagrees with the declared digest is ambient"
+        );
+
+        // Inline bytes are not path-backed at all.
+        assert!(!inline.path_is_digest_derived(&digest));
+    }
     use super::*;
     use crate::formula::{StateMachineMetadata, VcKind};
     use crate::model::{BinOp, Ty};
@@ -6832,13 +8023,19 @@ mod tests {
                 assumed: 1,
                 mandated: 1,
                 contract_panics: 0,
+                excluded: 0,
             },
             conditional_on_assumption_rows: true,
             conditional_on_dependency_entries: true,
             conditional_on_runtime_checks: false,
+            conditional_on_unknown_rows: false,
             conditional_on_visitation_entries: false,
             coverage: None,
             test_execution: None,
+            exclusions: Vec::new(),
+            determinism: None,
+            failure_sites: None,
+            project_requirements: None,
         }
     }
 
@@ -6849,8 +8046,6 @@ mod tests {
                 trust_version: "t".into(),
                 timestamp: "1970".into(),
                 total_time_ms: 0,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "c".into(),
             summary: CrateSummary {
@@ -6866,6 +8061,7 @@ mod tests {
                 total_unknown: 0,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,
@@ -7137,6 +8333,20 @@ mod tests {
         assert_eq!(restored_gate.counts.unknown, 1);
         assert_eq!(restored_gate.test_execution, gate.test_execution);
 
+        let mut retained = gate.test_execution.clone().unwrap();
+        retained.completion_scope =
+            CertifiedTestExecutionCompletionScope::RetainedCompileCheckpointAndChildExitV1;
+        retained.scope = CERTIFIED_RETAINED_TEST_EXECUTION_SCOPE.into();
+        let retained_json = serde_json::to_string(&retained).unwrap();
+        assert!(retained_json.contains("retained-compile-checkpoint-and-child-exit-v1"));
+        assert_eq!(
+            serde_json::from_str::<CertifiedTestExecutionReport>(&retained_json).unwrap(),
+            retained
+        );
+        assert!(retained.scope.contains("child remains alive"));
+        assert!(retained.scope.contains("same child's actual exit"));
+        assert!(retained.scope.contains("not libtest-case completion"));
+
         for required in ["schema", "completion_scope"] {
             let mut value: serde_json::Value =
                 serde_json::from_str(&json).expect("parse serialized report");
@@ -7352,6 +8562,7 @@ mod tests {
         // re-gate to the truth: downgrade the weak Proved to Unknown and recompute
         // counts + verdicts so nothing false survives.
         let weak = ObligationReport {
+            assumes: Vec::new(),
             obligation_id: None,
             description: "x".into(),
             kind: "k".into(),
@@ -7372,8 +8583,6 @@ mod tests {
                 trust_version: "x".into(),
                 timestamp: "x".into(),
                 total_time_ms: 0,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "c".into(),
             summary: CrateSummary {
@@ -7389,6 +8598,7 @@ mod tests {
                 total_unknown: 0,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,
@@ -7405,6 +8615,7 @@ mod tests {
                     unknown: 0,
                     timed_out: 0,
                     design_requirements: 0,
+                    failed_unproved: 0,
                     unattributed_failed: 0,
                     unattributed_unknown: 0,
                     unattributed_proved: 0,
@@ -7442,6 +8653,7 @@ mod tests {
     #[test]
     fn sanitize_deserialized_requires_structured_publication_evidence_for_proved_rows() {
         let obligation = ObligationReport {
+            assumes: Vec::new(),
             obligation_id: Some("obl-1".into()),
             description: "ensures result is bounded".into(),
             kind: "postcondition".into(),
@@ -7599,6 +8811,7 @@ mod tests {
     fn saved_runtime_checked_row_and_gate_fail_closed_without_live_monitor_authority() {
         let typed_kind = VcKind::Postcondition;
         let runtime = ObligationReport {
+            assumes: Vec::new(),
             obligation_id: Some("runtime-1".into()),
             description: typed_kind.description(),
             kind: typed_kind.transport_tag(),
@@ -7612,8 +8825,10 @@ mod tests {
             evidence: None,
             proof_evidence: None,
             transport_evidence: Some(ObligationTransportEvidenceReport {
+                identity: None,
                 obligation_id: Some("runtime-1".into()),
                 claim_digest_sha256: None,
+                original_vc_snapshot: None,
                 typed_kind: Some(Box::new(typed_kind)),
                 native_trust_ir: None,
                 proof_evidence: None,
@@ -7648,13 +8863,19 @@ mod tests {
                 assumed: 0,
                 mandated: 0,
                 contract_panics: 0,
+                excluded: 0,
             },
             conditional_on_assumption_rows: false,
             conditional_on_dependency_entries: false,
             conditional_on_runtime_checks: true,
+            conditional_on_unknown_rows: false,
             conditional_on_visitation_entries: false,
             coverage: None,
             test_execution: None,
+            exclusions: Vec::new(),
+            determinism: None,
+            failure_sites: None,
+            project_requirements: None,
         });
 
         let json = serde_json::to_vec(&report).expect("serialize runtime report");
@@ -7692,10 +8913,63 @@ mod tests {
         assert_eq!(restored.sanitize_deserialized(), SavedReportSanitization::default());
     }
 
+    // Ramp (2026-09-07): a saved ramp report carries
+    // `conditional_on_unknown_rows: true` beside `conditional-pass`. The
+    // deserialization demotion rewrites the decision to `inconclusive`; the
+    // flag must be cleared in the same motion, or every reloaded ramp report
+    // contradicts itself and `targo trust diff` refuses it.
+    #[test]
+    fn saved_ramp_gate_drops_its_unknown_condition_when_the_pass_is_demoted() {
+        let mut report =
+            report_with_obligation(publication_grade_saved_obligation(), CrateVerdict::Verified);
+        report.verification_gate = Some(VerificationGateReport {
+            lane: "advisory".into(),
+            verification_level: Some("L0".into()),
+            decision: "conditional-pass".into(),
+            exit_code: 0,
+            counts: VerificationGateCounts {
+                total: 3,
+                proved: 2,
+                failed: 0,
+                unknown: 1,
+                runtime_checked: 0,
+                assumed: 0,
+                mandated: 0,
+                contract_panics: 0,
+                excluded: 0,
+            },
+            conditional_on_assumption_rows: false,
+            conditional_on_dependency_entries: false,
+            conditional_on_runtime_checks: false,
+            conditional_on_unknown_rows: true,
+            conditional_on_visitation_entries: false,
+            coverage: None,
+            test_execution: None,
+            exclusions: Vec::new(),
+            determinism: None,
+            failure_sites: None,
+            project_requirements: None,
+        });
+
+        let json = serde_json::to_vec(&report).expect("serialize ramp report");
+        let (restored, _, _) =
+            JsonProofReport::decode_saved_json(&json, None).expect("decode saved ramp report");
+        let gate = restored.verification_gate.as_ref().expect("diagnostic gate retained");
+        assert_eq!(gate.decision, "inconclusive");
+        assert_eq!(gate.exit_code, 1);
+        assert_eq!(gate.counts.proved, 0);
+        assert_eq!(gate.counts.unknown, 3, "saved proved rows fold into unknown on load");
+        assert!(
+            !gate.conditional_on_unknown_rows,
+            "a demoted pass cannot still claim its unknown condition"
+        );
+    }
+
     #[test]
     fn deserialized_unknown_row_cannot_materialize_monitor_grade() {
         let typed_kind = VcKind::Postcondition;
         let obligation = ObligationReport {
+            assumes: Vec::new(),
             obligation_id: Some("unknown-monitor-1".into()),
             description: typed_kind.description(),
             kind: typed_kind.transport_tag(),
@@ -7707,8 +8981,10 @@ mod tests {
             evidence: None,
             proof_evidence: None,
             transport_evidence: Some(ObligationTransportEvidenceReport {
+                identity: None,
                 obligation_id: Some("unknown-monitor-1".into()),
                 claim_digest_sha256: None,
+                original_vc_snapshot: None,
                 typed_kind: Some(Box::new(typed_kind)),
                 native_trust_ir: None,
                 proof_evidence: None,
@@ -7912,13 +9188,19 @@ mod tests {
                 assumed: 0,
                 mandated: 0,
                 contract_panics: 0,
+                excluded: 0,
             },
             conditional_on_assumption_rows: false,
             conditional_on_dependency_entries: false,
             conditional_on_runtime_checks: false,
+            conditional_on_unknown_rows: false,
             conditional_on_visitation_entries: false,
             coverage: Some(VerificationCoverage::from_counts(1, 1)),
             test_execution: None,
+            exclusions: Vec::new(),
+            determinism: None,
+            failure_sites: None,
+            project_requirements: None,
         });
 
         let restored: JsonProofReport =
@@ -7937,6 +9219,7 @@ mod tests {
     #[test]
     fn recompute_summaries_is_non_authoritative_aggregation_only() {
         let obligation = ObligationReport {
+            assumes: Vec::new(),
             obligation_id: Some("unvalidated-live-row".into()),
             description: "caller-asserted outcome".into(),
             kind: "postcondition".into(),
@@ -8163,6 +9446,275 @@ mod tests {
         assert!(defect(&unbound_certificate).contains("unbound raw certificate"));
     }
 
+    /// Both saved-row shapes the producer publishes: a routed-solver proof
+    /// (request/native ids + native-TrustIr bundle) and a Clean-kernel
+    /// certificate. Each starts with BOTH proof copies, as every report
+    /// written before the elision did.
+    fn saved_obligations_with_both_proof_copies() -> Vec<(&'static str, ObligationReport)> {
+        let rows = vec![
+            ("routed solver", publication_grade_saved_obligation()),
+            ("clean kernel", clean_kernel_saved_obligation()),
+        ];
+        for (label, row) in &rows {
+            assert!(row.proof_evidence.is_some(), "{label}: fixture carries the obligation copy");
+            assert!(
+                row.transport_evidence
+                    .as_ref()
+                    .and_then(|transport| transport.proof_evidence.as_ref())
+                    .is_some(),
+                "{label}: fixture carries the transport copy"
+            );
+            assert_eq!(saved_obligation_structural_proof_defect(row, None), None, "{label}");
+        }
+        rows
+    }
+
+    fn transport_proof_mut(obligation: &mut ObligationReport) -> &mut TransportProofEvidence {
+        obligation
+            .transport_evidence
+            .as_mut()
+            .and_then(|transport| transport.proof_evidence.as_mut())
+            .expect("transport proof copy")
+    }
+
+    #[test]
+    fn eliding_the_duplicate_transport_proof_copy_drops_only_that_copy() {
+        for (label, full) in saved_obligations_with_both_proof_copies() {
+            let mut elided = full.clone();
+            assert!(elide_duplicate_transport_proof_evidence(&mut elided), "{label}");
+
+            let transport = elided.transport_evidence.as_ref().expect("envelope is kept");
+            assert!(transport.proof_evidence.is_none(), "{label}: transport copy dropped");
+            let mut expected_envelope = full.transport_evidence.clone().expect("full envelope");
+            expected_envelope.proof_evidence = None;
+            assert_eq!(transport, &expected_envelope, "{label}: rest of the envelope untouched");
+            assert_eq!(elided.proof_evidence, full.proof_evidence, "{label}: obligation copy kept");
+            assert_eq!(elided.evidence, full.evidence, "{label}");
+            assert_eq!(elided.obligation_id, full.obligation_id, "{label}");
+
+            // The elided row is judged exactly as the full row was: no defect.
+            assert_eq!(saved_obligation_structural_proof_defect(&elided, None), None, "{label}");
+            // Nothing left to drop the second time.
+            assert!(!elide_duplicate_transport_proof_evidence(&mut elided.clone()), "{label}");
+        }
+    }
+
+    #[test]
+    fn elided_transport_proof_copy_round_trips_to_the_same_saved_report_verdict() {
+        for (label, full) in saved_obligations_with_both_proof_copies() {
+            let mut elided = full.clone();
+            assert!(elide_duplicate_transport_proof_evidence(&mut elided), "{label}");
+
+            // Serialized form: the envelope has no `proof_evidence` member at
+            // all (it is `skip_serializing_if = Option::is_none`), the
+            // obligation copy is still there, and nothing else moved.
+            let full_json = serde_json::to_value(&full).expect("serialize full row");
+            let elided_json = serde_json::to_value(&elided).expect("serialize elided row");
+            assert!(
+                elided_json["transport_evidence"].get("proof_evidence").is_none(),
+                "{label}: {elided_json}"
+            );
+            assert!(elided_json.get("proof_evidence").is_some(), "{label}");
+            let mut expected_json = full_json.clone();
+            expected_json["transport_evidence"]
+                .as_object_mut()
+                .expect("envelope object")
+                .remove("proof_evidence")
+                .expect("full row serialized the transport copy");
+            assert_eq!(elided_json, expected_json, "{label}");
+
+            // Decode through the row's own deserializer, which downgrades every
+            // saved proved row to Unknown: the elided row lands on exactly the
+            // outcome and reason the two-copy row does, with no defect.
+            let decoded_full: ObligationReport =
+                serde_json::from_value(full_json).expect("decode full row");
+            let decoded_elided: ObligationReport =
+                serde_json::from_value(elided_json).expect("decode elided row");
+            assert_eq!(
+                saved_obligation_structural_proof_defect(&decoded_elided, None),
+                None,
+                "{label}"
+            );
+            assert!(
+                matches!(decoded_elided.outcome, ObligationOutcome::Unknown { .. }),
+                "{label}: a saved proved row never deserializes as proved"
+            );
+            assert_eq!(
+                serde_json::to_value(&decoded_elided.outcome).expect("outcome"),
+                serde_json::to_value(&decoded_full.outcome).expect("outcome"),
+                "{label}"
+            );
+
+            // And the saved-report re-gate judges a report carrying the elided
+            // row exactly as one carrying both copies: identical counters,
+            // summary, outcome and reason.
+            let mut full_report = report_with_obligation(full, CrateVerdict::Verified);
+            let mut elided_report = report_with_obligation(elided, CrateVerdict::Verified);
+            let full_sanitization = full_report.sanitize_deserialized();
+            let elided_sanitization = elided_report.sanitize_deserialized();
+            assert_eq!(elided_sanitization, full_sanitization, "{label}");
+            assert_eq!(elided_sanitization.downgraded_proved, 1, "{label}");
+            assert_eq!(elided_sanitization.structural_evidence_defects, 0, "{label}");
+            assert_eq!(
+                serde_json::to_value(&elided_report.summary).expect("summary"),
+                serde_json::to_value(&full_report.summary).expect("summary"),
+                "{label}"
+            );
+            assert_eq!(elided_report.summary.verdict, CrateVerdict::Inconclusive, "{label}");
+            assert_eq!(
+                serde_json::to_value(&elided_report.functions[0].obligations[0].outcome)
+                    .expect("outcome"),
+                serde_json::to_value(&full_report.functions[0].obligations[0].outcome)
+                    .expect("outcome"),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_rows_with_both_proof_copies_are_still_judged_field_for_field() {
+        for (label, full) in saved_obligations_with_both_proof_copies() {
+            // Present and equal: accepted, exactly as before.
+            assert_eq!(saved_obligation_structural_proof_defect(&full, None), None, "{label}");
+
+            // Present and different: every mismatch the equality check names is
+            // still a defect, and such a copy is never elided — so the decoder
+            // always gets to see it.
+            let mut proof_id = full.clone();
+            transport_proof_mut(&mut proof_id).proof_id = Some("999".into());
+            let mut backend = full.clone();
+            transport_proof_mut(&mut backend).backend = "attacker-backend".into();
+            let mut status = full.clone();
+            transport_proof_mut(&mut status).status = TransportProofStatus::Unknown;
+            let mut strength = full.clone();
+            transport_proof_mut(&mut strength).strength = Some(ProofStrength::inductive());
+            let mut artifacts = full.clone();
+            transport_proof_mut(&mut artifacts).artifacts.clear();
+            let mut diagnostics = full.clone();
+            transport_proof_mut(&mut diagnostics).diagnostics.push(TransportEvidenceDiagnostic {
+                code: "extra".into(),
+                severity: TransportEvidenceDiagnosticSeverity::Info,
+                message: "only in the transport copy".into(),
+                detail: None,
+            });
+            for (field, mutated, expected) in [
+                ("proof_id", proof_id, "transport_evidence.proof_evidence.proof_id does not match"),
+                ("backend", backend, "transport_evidence.proof_evidence.backend does not match"),
+                ("status", status, "transport_evidence.proof_evidence.status is not proved"),
+                ("strength", strength, "transport_evidence.proof_evidence.strength does not match"),
+                (
+                    "artifacts",
+                    artifacts,
+                    "transport_evidence.proof_evidence.artifacts do not match",
+                ),
+                (
+                    "diagnostics",
+                    diagnostics,
+                    "transport_evidence.proof_evidence.diagnostics do not match",
+                ),
+            ] {
+                let defect = saved_obligation_structural_proof_defect(&mutated, None)
+                    .unwrap_or_else(|| panic!("{label}/{field}: mismatch must be a defect"));
+                assert!(defect.contains(expected), "{label}/{field}: {defect}");
+                let mut still_mismatched = mutated.clone();
+                assert!(
+                    !elide_duplicate_transport_proof_evidence(&mut still_mismatched),
+                    "{label}/{field}: a mismatching copy is never elided"
+                );
+                assert!(
+                    still_mismatched
+                        .transport_evidence
+                        .as_ref()
+                        .and_then(|transport| transport.proof_evidence.as_ref())
+                        .is_some(),
+                    "{label}/{field}"
+                );
+            }
+
+            // Absent transport copy beside an obligation copy whose OWN fields
+            // are defective: the elision buys the row nothing.
+            let mut relabelled = full.clone();
+            assert!(elide_duplicate_transport_proof_evidence(&mut relabelled), "{label}");
+            relabelled.proof_evidence.as_mut().expect("proof").status =
+                Some(TransportProofStatus::Unknown);
+            let defect = saved_obligation_structural_proof_defect(&relabelled, None)
+                .unwrap_or_else(|| panic!("{label}: unproved status must stay a defect"));
+            assert!(defect.contains("proof_evidence.status is not proved"), "{label}: {defect}");
+        }
+    }
+
+    #[test]
+    fn rows_without_a_published_proof_keep_their_transport_proof_record() {
+        for (label, full) in saved_obligations_with_both_proof_copies() {
+            // No obligation copy (the row was never promoted): the transport
+            // record is the only account of what the transport claimed.
+            let mut unpromoted = full.clone();
+            unpromoted.proof_evidence = None;
+            unpromoted.evidence = None;
+            unpromoted.outcome =
+                ObligationOutcome::Unknown { reason: "static proof remains open".into() };
+            assert!(!elide_duplicate_transport_proof_evidence(&mut unpromoted), "{label}");
+            assert!(
+                unpromoted
+                    .transport_evidence
+                    .as_ref()
+                    .and_then(|transport| transport.proof_evidence.as_ref())
+                    .is_some(),
+                "{label}"
+            );
+
+            // No envelope at all: nothing to do, and the decoder still names
+            // the missing envelope on a proved row.
+            let mut no_envelope = full.clone();
+            no_envelope.transport_evidence = None;
+            assert!(!elide_duplicate_transport_proof_evidence(&mut no_envelope), "{label}");
+            assert_eq!(
+                saved_obligation_structural_proof_defect(&no_envelope, None).as_deref(),
+                Some("transport_evidence is missing"),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn eliding_the_transport_proof_copy_saves_exactly_that_copy_in_bytes() {
+        for (label, full) in saved_obligations_with_both_proof_copies() {
+            let duplicate = full
+                .transport_evidence
+                .as_ref()
+                .and_then(|transport| transport.proof_evidence.as_ref())
+                .expect("transport copy");
+            let duplicate_bytes = serde_json::to_vec(duplicate).expect("serialize transport copy");
+            let full_bytes = serde_json::to_vec(&full).expect("serialize full row");
+
+            let mut elided = full.clone();
+            assert!(elide_duplicate_transport_proof_evidence(&mut elided), "{label}");
+            let elided_bytes = serde_json::to_vec(&elided).expect("serialize elided row");
+
+            // The saving is the one member `,"proof_evidence":<copy>` — no more,
+            // no less: splicing that member out of the full row's bytes gives
+            // the elided row's bytes exactly.
+            let member = [b",\"proof_evidence\":".as_slice(), &duplicate_bytes].concat();
+            let occurrences = full_bytes
+                .windows(member.len())
+                .enumerate()
+                .filter(|(_, window)| *window == member.as_slice())
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(occurrences.len(), 1, "{label}: the transport copy is one member");
+            let start = occurrences[0];
+            let spliced = [&full_bytes[..start], &full_bytes[start + member.len()..]].concat();
+            assert_eq!(spliced, elided_bytes, "{label}");
+            assert_eq!(full_bytes.len() - elided_bytes.len(), member.len(), "{label}");
+            assert!(
+                duplicate_bytes.len() * 4 > full_bytes.len(),
+                "{label}: the duplicate is a material share of the row ({} of {} bytes)",
+                duplicate_bytes.len(),
+                full_bytes.len()
+            );
+        }
+    }
+
     #[test]
     fn saved_report_native_identity_domains_cannot_be_relabelled_independently() {
         fn downgrade_reason(obligation: ObligationReport) -> String {
@@ -8316,6 +9868,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn path_descriptor_validation_requires_exact_shape_without_reading_payload() {
+        let bytes = b"descriptor validation is not evidence";
+        let digest = TransportArtifactDigest {
+            algorithm: "sha256".into(),
+            value: lowercase_transport_hex(&Sha256::digest(bytes)),
+        };
+        let inline = TransportArtifactMaterialization::from_exact_bytes(bytes, "binding-1", vec![])
+            .expect("inline descriptor");
+        assert!(inline.validate_path_descriptor(&digest).is_err());
+        let canonical = format!("{TRANSPORT_ARTIFACT_STORE_DIRECTORY}/sha256/{}", digest.value);
+        let path_backed = inline.clone().with_materialized_path(canonical.clone()).unwrap();
+        assert!(path_backed.validate_path_descriptor(&digest).is_ok());
+        let empty_root = tempfile::tempdir().unwrap();
+        let root = empty_root.path().canonicalize().unwrap();
+        assert!(path_backed.decoded_bytes_at_root(&digest, &root).is_err());
+        for path in [
+            format!("./{canonical}"),
+            canonical.replace("/sha256/", "//sha256/"),
+            canonical.replace("/sha256/", "/sha256/./"),
+            format!("{canonical}/"),
+            format!("{TRANSPORT_ARTIFACT_STORE_DIRECTORY}/sha256/{}", "a".repeat(64)),
+        ] {
+            let mut mutated = path_backed.clone();
+            mutated.materialized_path = Some(path.clone());
+            assert!(mutated.validate_path_descriptor(&digest).is_err(), "{path}");
+            assert!(!mutated.path_is_digest_derived(&digest), "{path}");
+        }
+        for mutation in ["encoding", "binding", "inline", "references", "length"] {
+            let mut mutated = path_backed.clone();
+            match mutation {
+                "encoding" => mutated.encoding = "bad".into(),
+                "binding" => mutated.proof_binding_id.clear(),
+                "inline" => mutated.encoded_bytes = "00".into(),
+                "references" => mutated.referenced_artifacts.push(TransportArtifactReference {
+                    kind: String::new(),
+                    digest: digest.clone(),
+                }),
+                "length" => mutated.byte_len = 0,
+                _ => unreachable!(),
+            }
+            assert!(mutated.validate_path_descriptor(&digest).is_err(), "{mutation}");
+        }
+        let mut wrong_algorithm = digest;
+        wrong_algorithm.algorithm = "bad".into();
+        assert!(path_backed.validate_path_descriptor(&wrong_algorithm).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn path_materialization_rejects_symlink_leaf_and_store_component() {
@@ -8352,6 +9952,107 @@ mod tests {
         let dir_materialization =
             inline.with_materialized_path(path).expect("directory descriptor");
         assert!(!dir_materialization.matches_sha256_digest_at_root(&digest, &dir_root));
+    }
+
+    #[cfg(unix)]
+    fn materialization_open_race_fixture()
+    -> (tempfile::TempDir, TransportArtifactMaterialization, TransportArtifactDigest) {
+        let bytes = b"bounded artifact open race";
+        let digest = TransportArtifactDigest {
+            algorithm: "sha256".into(),
+            value: lowercase_transport_hex(&Sha256::digest(bytes)),
+        };
+        let temp = tempfile::tempdir().expect("materialization race root");
+        let root = temp.path().canonicalize().expect("canonical race root");
+        let store = root.join(TRANSPORT_ARTIFACT_STORE_DIRECTORY).join("sha256");
+        std::fs::create_dir_all(&store).expect("race store");
+        std::fs::write(store.join(&digest.value), bytes).expect("original regular artifact");
+        let path = format!("{}/sha256/{}", TRANSPORT_ARTIFACT_STORE_DIRECTORY, digest.value);
+        let materialization =
+            TransportArtifactMaterialization::from_exact_bytes(bytes, "binding-1", vec![])
+                .expect("inline race descriptor")
+                .with_materialized_path(path)
+                .expect("path race descriptor");
+        assert_eq!(materialization.decoded_bytes_at_root(&digest, &root).unwrap(), bytes.to_vec());
+        (temp, materialization, digest)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_materialization_refuses_substituted_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (temp, materialization, digest) = materialization_open_race_fixture();
+        let root = temp.path().canonicalize().expect("canonical race root");
+        let relative = materialization.materialized_path.expect("relative materialization path");
+        let leaf = root.join(&relative);
+        let (ready_send, ready_receive) = mpsc::sync_channel(1);
+        let (send, receive) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = securely_read_materialized_path_before_open(
+                &root,
+                &relative,
+                materialization.byte_len as usize,
+                &digest.value,
+                |candidate| {
+                    std::fs::remove_file(candidate).expect("replace checked regular leaf");
+                    let name = std::ffi::CString::new(candidate.as_os_str().as_encoded_bytes())
+                        .expect("FIFO path");
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    ready_send.send(()).expect("signal FIFO substitution");
+                },
+            );
+            send.send(result).expect("return bounded reader result");
+        });
+        ready_receive
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader must reach the deterministic leaf substitution");
+        let result = match receive.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(error) => {
+                // If a regression restored blocking open, release its FIFO
+                // reader before failing, rather than leave a stuck worker.
+                let _release = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+                    .open(&leaf);
+                if receive.recv_timeout(Duration::from_secs(5)).is_ok() {
+                    worker.join().expect("reap released reader");
+                }
+                panic!("substituted FIFO waited for a writer: {error}");
+            }
+        };
+        worker.join().expect("reap nonblocking reader");
+        assert!(
+            result.unwrap_err().contains("file identity changed before reading"),
+            "the opened FIFO must reach the existing regular-file/identity refusal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_materialization_refuses_substituted_symlink_before_reading() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, materialization, digest) = materialization_open_race_fixture();
+        let root = temp.path().canonicalize().expect("canonical race root");
+        let retained_original = root.join("original-inode");
+        let error = securely_read_materialized_path_before_open(
+            &root,
+            materialization.materialized_path.as_deref().expect("relative materialization path"),
+            materialization.byte_len as usize,
+            &digest.value,
+            |candidate| {
+                // The alias resolves to the exact preflight inode and bytes.
+                // Only no-follow open refuses before any payload is read.
+                std::fs::rename(candidate, &retained_original).expect("retain original inode");
+                symlink(&retained_original, candidate).expect("substitute symlink leaf");
+            },
+        )
+        .expect_err("a substituted symlink must be refused");
+        assert!(error.contains("could not open artifact materialization file"), "{error}");
     }
 
     #[test]
@@ -8930,8 +10631,6 @@ mod tests {
                 trust_version: "x".into(),
                 timestamp: "x".into(),
                 total_time_ms: 0,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "c".into(),
             summary: CrateSummary {
@@ -8947,6 +10646,7 @@ mod tests {
                 total_unknown: 2,
                 total_timed_out: 1,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,
@@ -8963,6 +10663,7 @@ mod tests {
                     unknown: 2,
                     timed_out: 1,
                     design_requirements: 0,
+                    failed_unproved: 0,
                     unattributed_failed: 0,
                     unattributed_unknown: 0,
                     unattributed_proved: 0,
@@ -9003,6 +10704,7 @@ mod tests {
                 unknown: 0,
                 timed_out: 0,
                 design_requirements: 0,
+                failed_unproved: 0,
                 unattributed_failed: 0,
                 unattributed_unknown: 0,
                 unattributed_proved: 2,
@@ -9036,6 +10738,7 @@ mod tests {
                 unknown: 0,
                 timed_out: 0,
                 design_requirements: 0,
+                failed_unproved: 0,
                 unattributed_failed: 1,
                 unattributed_unknown: 1,
                 unattributed_proved: 1,
@@ -9081,8 +10784,6 @@ mod tests {
                 trust_version: "x".into(),
                 timestamp: "x".into(),
                 total_time_ms: 0,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "c".into(),
             summary: CrateSummary {
@@ -9101,6 +10802,7 @@ mod tests {
                 total_unknown: 0,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,
@@ -9117,6 +10819,7 @@ mod tests {
                     unknown: 0,
                     timed_out: 0,
                     design_requirements: 0,
+                    failed_unproved: 0,
                     unattributed_failed: 0,
                     unattributed_unknown: 0,
                     unattributed_proved: 0,
@@ -9223,6 +10926,7 @@ mod tests {
         };
 
         ObligationReport {
+            assumes: Vec::new(),
             obligation_id: Some(obligation_id.into()),
             description: description.into(),
             kind: "postcondition".into(),
@@ -9234,8 +10938,10 @@ mod tests {
             evidence: Some(evidence),
             proof_evidence: Some(proof_report),
             transport_evidence: Some(ObligationTransportEvidenceReport {
+                identity: None,
                 obligation_id: Some(obligation_id.into()),
                 claim_digest_sha256: None,
+                original_vc_snapshot: None,
                 typed_kind: None,
                 native_trust_ir: Some(native),
                 proof_evidence: Some(transport_proof),
@@ -9305,6 +11011,7 @@ mod tests {
             diagnostics: vec![],
         };
         ObligationReport {
+            assumes: Vec::new(),
             obligation_id: Some(obligation_id.into()),
             description: "postcondition".into(),
             kind: "arithmetic_safety".into(),
@@ -9316,14 +11023,74 @@ mod tests {
             evidence: Some(evidence),
             proof_evidence: Some(kernel_proof),
             transport_evidence: Some(ObligationTransportEvidenceReport {
+                identity: None,
                 obligation_id: Some(obligation_id.into()),
                 claim_digest_sha256: None,
+                original_vc_snapshot: None,
                 typed_kind: None,
                 native_trust_ir: Some(dispatch_bundle),
                 proof_evidence: Some(transport_proof),
                 monitor: None,
             }),
         }
+    }
+
+    #[test]
+    fn original_vc_snapshot_preserves_single_artifact_policy_and_saved_downgrade() {
+        let mut row = clean_kernel_saved_obligation();
+        let vc = crate::VerificationCondition {
+            function: "fixture::original".into(),
+            kind: VcKind::Postcondition,
+            location: SourceSpan::default(),
+            formula: crate::Formula::Bool(false),
+            contract_metadata: None,
+            obligation: None,
+        };
+        let digest = crate::original_vc_snapshot::exact_vc_claim_digest_sha256(
+            &vc,
+            true,
+            Some("target;ptr64"),
+        )
+        .unwrap();
+        let snapshot = crate::OriginalVcSnapshot::capture(
+            &vc,
+            true,
+            "target;ptr64",
+            row.obligation_id.as_deref().unwrap(),
+            &digest,
+        )
+        .unwrap();
+        row.transport_evidence.as_mut().unwrap().original_vc_snapshot =
+            Some(Box::new(snapshot.clone()));
+        assert!(saved_obligation_structural_proof_defect(&row, None).is_none());
+        let saved =
+            serde_json::to_vec(&report_with_obligation(row.clone(), CrateVerdict::Verified))
+                .unwrap();
+        let (decoded, _, _) = JsonProofReport::decode_saved_json(&saved, None).unwrap();
+        assert_eq!(decoded.summary.total_proved, 0);
+        assert_eq!(
+            decoded.functions[0].obligations[0]
+                .transport_evidence
+                .as_ref()
+                .unwrap()
+                .original_vc_snapshot
+                .as_deref(),
+            Some(&snapshot)
+        );
+        let duplicate = row.proof_evidence.as_ref().unwrap().artifacts[0].clone();
+        row.proof_evidence.as_mut().unwrap().artifacts.push(duplicate.clone());
+        row.transport_evidence
+            .as_mut()
+            .unwrap()
+            .proof_evidence
+            .as_mut()
+            .unwrap()
+            .artifacts
+            .push(duplicate);
+        assert!(
+            saved_obligation_structural_proof_defect(&row, None).is_some(),
+            "snapshot cannot relax the exactly-one CIC artifact rule"
+        );
     }
 
     #[test]
@@ -9355,6 +11122,52 @@ mod tests {
         assert!(
             saved_obligation_structural_proof_defect(&unbound, None).is_some(),
             "a certificate digest that does not bind the proof_id must be rejected"
+        );
+
+        // KR0 switch: a clean-kernel row that claims `Certified` is publishable
+        // only with the reference entry's theory stamp, on every copy of its
+        // evidence; the same row unstamped (an old row) is refused, and a
+        // stamp on a routed solver proof is refused too.
+        let certified = |stamped: bool| {
+            let mut obligation = clean_kernel_saved_obligation();
+            let strength = ProofStrength::smt_unsat_certified();
+            let base = ProofEvidence::from(strength.clone());
+            let evidence = if stamped {
+                base.with_kernel_reference(
+                    crate::KernelTheoryId::LeanReferenceV1,
+                    crate::KernelEnvDigest([0x2a; 32]),
+                )
+            } else {
+                base
+            };
+            obligation.outcome = ObligationOutcome::Proved { strength: strength.clone() };
+            obligation.evidence = Some(evidence.clone());
+            let proof = obligation.proof_evidence.as_mut().expect("proof");
+            proof.strength = strength.clone();
+            proof.evidence = evidence.clone();
+            let transport = obligation
+                .transport_evidence
+                .as_mut()
+                .and_then(|transport| transport.proof_evidence.as_mut())
+                .expect("transport proof");
+            transport.strength = Some(strength);
+            transport.evidence = Some(evidence);
+            obligation
+        };
+        assert_eq!(saved_obligation_structural_proof_defect(&certified(true), None), None);
+        assert!(
+            saved_obligation_structural_proof_defect(&certified(false), None).is_some(),
+            "a Certified clean-kernel row without a reference theory must be refused"
+        );
+        let mut stamped_solver = publication_grade_saved_obligation();
+        let proof = stamped_solver.proof_evidence.as_mut().expect("proof");
+        proof.evidence = proof.evidence.clone().with_kernel_reference(
+            crate::KernelTheoryId::LeanReferenceV1,
+            crate::KernelEnvDigest([0x2a; 32]),
+        );
+        assert!(
+            saved_obligation_structural_proof_defect(&stamped_solver, None).is_some(),
+            "a routed solver proof cannot carry a kernel theory stamp"
         );
 
         // A routed solver proof missing its native_trust_ir bundle must STILL
@@ -9732,6 +11545,7 @@ mod tests {
     // certified or smt-backed proof.
     fn surface_obligation(outcome: ObligationOutcome) -> ObligationReport {
         ObligationReport {
+            assumes: Vec::new(),
             obligation_id: None,
             description: "d".into(),
             kind: "k".into(),
@@ -9765,7 +11579,10 @@ mod tests {
             surface_obligation(ObligationOutcome::RuntimeChecked { note: None }),
             surface_obligation(ObligationOutcome::Unknown { reason: "x".into() }),
             surface_obligation(ObligationOutcome::Timeout { timeout_ms: 5 }),
-            surface_obligation(ObligationOutcome::Failed { counterexample: None }),
+            surface_obligation(ObligationOutcome::Failed {
+                counterexample: None,
+                basis: FailureBasis::Refuted,
+            }),
             surface_obligation(ObligationOutcome::DesignRequirement { detail: "x".into() }),
         ];
         let func = FunctionProofReport {
@@ -9778,6 +11595,7 @@ mod tests {
                 unknown: 2,
                 timed_out: 1,
                 design_requirements: 1,
+                failed_unproved: 0,
                 unattributed_failed: 0,
                 unattributed_unknown: 0,
                 unattributed_proved: 0,
@@ -9800,6 +11618,256 @@ mod tests {
         assert_eq!(surface.assumed_or_trusted(), 4);
         // Every classified row is accounted for; the design mandate is excluded.
         assert_eq!(surface.total_obligations, 11);
+    }
+
+    // --- FailureBasis: a fail-closed `failed` row is labelled unproved, never
+    // refuted; outcome, counts that gates read, and verdicts are unchanged. ---
+
+    fn failed_vr(solver: &str, cex: Option<Counterexample>) -> VerificationResult {
+        VerificationResult::Failed { solver: solver.into(), time_ms: 0, counterexample: cex }
+    }
+
+    fn one_cex() -> Counterexample {
+        Counterexample::new(vec![("x".into(), CounterexampleValue::Uint(1))])
+    }
+
+    #[test]
+    fn failure_basis_reads_the_unsafe_demand_family_as_unproved() {
+        use FailureBasis::*;
+        let label = UNSAFE_DEMAND_FAIL_CLOSED_SOLVER;
+        assert_eq!(FailureBasis::for_failed_row(label, false), UnprovedFailClosed);
+        for over in [
+            format!("{label}-over-unwitnessed-proof:trust-mc"),
+            format!("{label}-over-vacuous-placeholder-proof:ay-in-process"),
+        ] {
+            assert_eq!(FailureBasis::for_failed_row(&over, false), UnprovedFailClosed, "{over}");
+        }
+        // Every other label keeps the historical meaning: refuted.
+        for other in [
+            "ay",
+            "trust-mc",
+            "structural-forced-unbounded-allocation",
+            "structural-forced-unbounded-allocation-over-unwitnessed-proof:ay",
+            // A lookalike that only shares a prefix is not the family.
+            "structural-unsafe-demand-findings",
+            "structural-unsafe-demand-finding:ay",
+            "",
+        ] {
+            assert_eq!(FailureBasis::for_failed_row(other, false), Refuted, "{other}");
+        }
+    }
+
+    #[test]
+    fn failure_basis_reads_the_l0_refutation_family_as_unproved() {
+        use FailureBasis::*;
+        let label = L0_REFUTATION_FAIL_CLOSED_SOLVER;
+        assert_eq!(FailureBasis::for_failed_row(label, false), UnprovedFailClosed);
+        for prior in ["runtime_checked", "unknown", "timeout", "unsupported"] {
+            let over = format!("{label}-over-{prior}:trust-full-verifier");
+            assert_eq!(FailureBasis::for_failed_row(&over, false), UnprovedFailClosed, "{over}");
+            // A counterexample is a refutation whatever the label says.
+            assert_eq!(FailureBasis::for_failed_row(&over, true), Refuted, "{over}");
+        }
+        // The verifier's bare label, and lookalikes, keep `refuted`.
+        for other in [
+            "trust-full-verifier",
+            "level0-refutation-fail-closedx",
+            "level0-refutation-fail-closed:trust-full-verifier",
+            "level0-refutation",
+        ] {
+            assert_eq!(FailureBasis::for_failed_row(other, false), Refuted, "{other}");
+        }
+        assert!(FAIL_CLOSED_SOLVER_FAMILIES.contains(&L0_REFUTATION_FAIL_CLOSED_SOLVER));
+        assert!(FAIL_CLOSED_SOLVER_FAMILIES.contains(&UNSAFE_DEMAND_FAIL_CLOSED_SOLVER));
+        assert!(!FAIL_CLOSED_SOLVER_FAMILIES.contains(&UNSAFE_DEMAND_DEFINITE_SOLVER));
+    }
+
+    #[test]
+    fn failure_basis_reads_a_definite_unsafe_finding_as_refuted() {
+        // A definite structural violation (double free, use-after-free) was
+        // FOUND by the separation model; it must not read "nothing refuted it".
+        let label = UNSAFE_DEMAND_DEFINITE_SOLVER;
+        assert_ne!(label, UNSAFE_DEMAND_FAIL_CLOSED_SOLVER);
+        assert!(!label.starts_with(UNSAFE_DEMAND_FAIL_CLOSED_SOLVER));
+        assert_eq!(FailureBasis::for_failed_row(label, false), FailureBasis::Refuted);
+        let over = format!("{label}-over-unwitnessed-proof:trust-mc");
+        assert_eq!(FailureBasis::for_failed_row(&over, false), FailureBasis::Refuted);
+        // Both labels project onto the same gate outcome.
+        assert_eq!(
+            Outcome::from(&ObligationOutcome::failed_from_backend(label, None)),
+            Outcome::Failed
+        );
+    }
+
+    #[test]
+    fn unsafe_definite_violation_markers_are_narrow() {
+        for definite in [
+            "[unsafe:sep:free] double-free of `arg_1` (prov#1) in append",
+            "[unsafe:sep:free] double-free via `alloc::alloc::dealloc` of `p` in f",
+            "[unsafe:sep:heap] use-after-free: read through freed pointer `p`",
+            "[unsafe:sep:heap] use-after-free: write through freed pointer `p`",
+            // A reconstructed row embeds the message in its detail.
+            "hardened unsafe op: [unsafe:sep:free] double-free of `p` (prov#1) in f",
+        ] {
+            assert!(unsafe_demand_is_definite_violation(definite), "{definite}");
+        }
+        for unproved in [
+            "[unsafe] missing SAFETY comment on unsafe block",
+            "[unsafe:unmodeled-call] call to `c` (unsafe fn) is not covered",
+            "[unsafe:validity-transmute] transmute produces `Box<u8>`",
+            "[unsafe:zeroed] `mem::zeroed::<Foo>()` is undefined behaviour or a guaranteed abort: x",
+            "[unsafe:uninitialized] `mem::uninitialized::<u8>()` is undefined behaviour",
+            "[unsafe:sep:heap] permission denied: read through `p` (read-only)",
+            "[unsafe:sep:deref] null check for *p",
+            "[unsafe:sep:free]",
+            "",
+        ] {
+            assert!(!unsafe_demand_is_definite_violation(unproved), "{unproved}");
+        }
+    }
+
+    #[test]
+    fn failure_basis_a_counterexample_is_always_a_refutation() {
+        // A label can only ever make a row read as LESS than a refutation when
+        // no counterexample backs one.
+        assert_eq!(
+            FailureBasis::for_failed_row(UNSAFE_DEMAND_FAIL_CLOSED_SOLVER, true),
+            FailureBasis::Refuted
+        );
+        assert_eq!(
+            FailureBasis::of_result(&failed_vr(UNSAFE_DEMAND_FAIL_CLOSED_SOLVER, Some(one_cex()))),
+            Some(FailureBasis::Refuted)
+        );
+        assert_eq!(
+            FailureBasis::of_result(&failed_vr(UNSAFE_DEMAND_FAIL_CLOSED_SOLVER, None)),
+            Some(FailureBasis::UnprovedFailClosed)
+        );
+        // Not a failure: no basis at all.
+        let unknown = VerificationResult::Unknown {
+            solver: UNSAFE_DEMAND_FAIL_CLOSED_SOLVER.into(),
+            time_ms: 0,
+            reason: "r".into(),
+        };
+        assert_eq!(FailureBasis::of_result(&unknown), None);
+    }
+
+    #[test]
+    fn failure_basis_refuted_rows_serialize_byte_identically_to_before() {
+        let refuted = ObligationOutcome::failed_from_backend("ay", None);
+        assert_eq!(serde_json::to_string(&refuted).unwrap(), r#"{"status":"failed"}"#);
+        let unproved =
+            ObligationOutcome::failed_from_backend(UNSAFE_DEMAND_FAIL_CLOSED_SOLVER, None);
+        assert_eq!(
+            serde_json::to_string(&unproved).unwrap(),
+            r#"{"status":"failed","basis":"unproved_fail_closed"}"#
+        );
+        // Round trip keeps the basis; a legacy row without the field reads refuted.
+        let back: ObligationOutcome =
+            serde_json::from_str(r#"{"status":"failed","basis":"unproved_fail_closed"}"#).unwrap();
+        assert!(back.is_unproved_fail_closed());
+        let legacy: ObligationOutcome = serde_json::from_str(r#"{"status":"failed"}"#).unwrap();
+        assert_eq!(legacy.failure_basis(), Some(FailureBasis::Refuted));
+        // Both bases project onto the same shared outcome the gates read.
+        assert_eq!(Outcome::from(&unproved), Outcome::Failed);
+        assert_eq!(Outcome::from(&refuted), Outcome::Failed);
+        // An unknown basis spelling is protocol drift: refused, not guessed.
+        assert!(
+            serde_json::from_str::<ObligationOutcome>(r#"{"status":"failed","basis":"maybe"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failure_basis_wire_row_with_a_counterexample_cannot_claim_unproved() {
+        let json = r#"{"status":"failed","counterexample":{"variables":[]},"basis":"unproved_fail_closed"}"#;
+        let outcome: ObligationOutcome = serde_json::from_str(json).unwrap();
+        assert_eq!(outcome.failure_basis(), Some(FailureBasis::Refuted));
+    }
+
+    fn report_with_failed_rows(outcomes: Vec<ObligationOutcome>) -> JsonProofReport {
+        let mut report = minimal_gate_report(None);
+        report.functions.push(FunctionProofReport {
+            function: "f".into(),
+            summary: FunctionSummary {
+                total_obligations: 0,
+                proved: 0,
+                runtime_checked: 0,
+                failed: 0,
+                unknown: 0,
+                timed_out: 0,
+                design_requirements: 0,
+                failed_unproved: 0,
+                unattributed_failed: 0,
+                unattributed_unknown: 0,
+                unattributed_proved: 0,
+                total_time_ms: 0,
+                max_proof_level: None,
+                verdict: FunctionVerdict::NoObligations,
+            },
+            obligations: outcomes.into_iter().map(surface_obligation).collect(),
+        });
+        report.recompute_summaries_from_obligation_outcomes();
+        report
+    }
+
+    #[test]
+    fn failure_basis_counts_a_subset_and_leaves_gate_counts_and_verdicts_unchanged() {
+        let unproved =
+            || ObligationOutcome::failed_from_backend(UNSAFE_DEMAND_FAIL_CLOSED_SOLVER, None);
+        let refuted = || ObligationOutcome::failed_from_backend("ay", None);
+        let mixed = report_with_failed_rows(vec![
+            unproved(),
+            unproved(),
+            refuted(),
+            ObligationOutcome::Unknown { reason: "u".into() },
+        ]);
+        // CONTROL: the same rows, every failed one labelled refuted (the
+        // pre-change world). Every gate-read count and verdict must match.
+        let control = report_with_failed_rows(vec![
+            refuted(),
+            refuted(),
+            refuted(),
+            ObligationOutcome::Unknown { reason: "u".into() },
+        ]);
+        let (m, c) = (&mixed.summary, &control.summary);
+        assert_eq!(m.total_failed, 3);
+        assert_eq!(m.total_failed_unproved, 2);
+        assert_eq!(c.total_failed_unproved, 0);
+        assert_eq!(
+            (m.total_obligations, m.total_proved, m.total_failed, m.total_unknown, m.verdict),
+            (c.total_obligations, c.total_proved, c.total_failed, c.total_unknown, c.verdict),
+        );
+        assert_eq!(m.verdict, CrateVerdict::HasViolations);
+        assert_eq!(m.functions_with_violations, c.functions_with_violations);
+        let (mf, cf) = (&mixed.functions[0].summary, &control.functions[0].summary);
+        assert_eq!((mf.failed, mf.failed_unproved, mf.verdict), (3, 2, cf.verdict));
+        assert_eq!(cf.failed, 3);
+        // A report holding ONLY fail-closed rows still has violations.
+        let only = report_with_failed_rows(vec![unproved()]);
+        assert_eq!(only.summary.verdict, CrateVerdict::HasViolations);
+        assert_eq!((only.summary.total_failed, only.summary.total_failed_unproved), (1, 1));
+    }
+
+    #[test]
+    fn failure_basis_survives_a_saved_report_round_trip() {
+        let report = report_with_failed_rows(vec![
+            ObligationOutcome::failed_from_backend(UNSAFE_DEMAND_FAIL_CLOSED_SOLVER, None),
+            ObligationOutcome::failed_from_backend("ay", None),
+        ]);
+        let json = serde_json::to_string(&report).unwrap();
+        let mut back: JsonProofReport = serde_json::from_str(&json).unwrap();
+        back.sanitize_deserialized();
+        assert_eq!(back.summary.total_failed, 2);
+        assert_eq!(back.summary.total_failed_unproved, 1);
+        assert!(back.functions[0].obligations[0].outcome.is_unproved_fail_closed());
+        assert!(!back.functions[0].obligations[1].outcome.is_unproved_fail_closed());
+    }
+
+    #[test]
+    fn failed_count_phrase_names_the_unproved_subset_only_when_present() {
+        assert_eq!(failed_count_phrase(3, 0), "3 failed");
+        assert_eq!(failed_count_phrase(0, 0), "0 failed");
+        assert_eq!(failed_count_phrase(3, 2), "3 failed (2 unproved, no counterexample)");
     }
 
     #[test]
@@ -9843,6 +11911,77 @@ mod tests {
             .expect("memory guard skip should be a release-blocking proof gap");
         assert!(reason.contains("release-blocking proof gap"));
         assert!(reason.contains("memory guard skipped solver dispatch"));
+    }
+
+    /// THE CONSUMER A REVIEWER'S PROBE CAUGHT MOVING. `classify_runtime_disposition_in`
+    /// is the tree's other producer of `RuntimeChecked` (targo's
+    /// `--test-target-panics` is the first), it is reached by EVERY caller of
+    /// `trust_report::build_json_report` and `build_crate_verification_report`,
+    /// and NO FLAG GUARDS IT — the `Auto` policy is the default.
+    ///
+    /// Commit e4ae63e373 widened `VcKind::has_runtime_fallback_in` — this
+    /// function's sole downgrade condition — to answer the hardened
+    /// `mir_assert::*` panic subfamily `true`. MEASURED consequence through
+    /// `build_json_report`, with no flag involved: a `HardenedBoundary
+    /// { PanicBoundary, "mir_assert::BoundsCheck" }` carrying
+    /// `VerificationResult::Timeout` came back as `ObligationOutcome::Unknown`
+    /// instead of `ObligationOutcome::Timeout`, losing `timeout_ms` and moving
+    /// the crate's `total_timeout` / `total_unknown` counts.
+    ///
+    /// A hardened boundary's obligation is that the panic is UNREACHABLE. The
+    /// `Assert` that survives codegen IS that panic, so it can never discharge
+    /// the boundary, and `RuntimeChecked` — "will be enforced dynamically at
+    /// runtime" — is the wrong label for it. Pinned here, at the seam, in every
+    /// check environment.
+    #[test]
+    fn a_hardened_panic_boundary_is_never_downgraded_to_runtime_checked() {
+        let markers = [
+            "mir_assert::BoundsCheck",
+            "mir_assert::DivisionByZero",
+            "mir_assert::RemainderByZero",
+            "mir_assert::Overflow(Add)",
+            "mir_assert::Overflow(Shl)",
+            "mir_assert::OverflowNeg",
+            "std::option::Option::<T>::unwrap",
+        ];
+        for callee in markers {
+            let kind = VcKind::HardenedBoundary {
+                category: crate::HardenedVcCategory::PanicBoundary,
+                callee: callee.to_string(),
+                detail: "MIR assert can panic".to_string(),
+            };
+            for env in [
+                RuntimeCheckEnv::new(false, false),
+                RuntimeCheckEnv::new(true, false),
+                RuntimeCheckEnv::new(false, true),
+                RuntimeCheckEnv::new(true, true),
+            ] {
+                assert_eq!(
+                    classify_runtime_disposition_in(
+                        &kind,
+                        &unknown_result(),
+                        RuntimeCheckPolicy::Auto,
+                        env,
+                    ),
+                    RuntimeDisposition::Unknown {
+                        reason: "incomplete quantifier reasoning".to_string()
+                    },
+                    "`{callee}` must stay Unknown under Auto in {env:?}"
+                );
+                assert!(
+                    matches!(
+                        classify_runtime_disposition_in(
+                            &kind,
+                            &timeout_result(),
+                            RuntimeCheckPolicy::Auto,
+                            env,
+                        ),
+                        RuntimeDisposition::Timeout { .. }
+                    ),
+                    "`{callee}` must keep its Timeout (and its timeout_ms) in {env:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -10208,8 +12347,6 @@ mod tests {
                 trust_version: "0.1.0".to_string(),
                 timestamp: "2026-04-30T00:00:00Z".to_string(),
                 total_time_ms: 4,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "hardened".to_string(),
             summary: CrateSummary {
@@ -10225,6 +12362,7 @@ mod tests {
                 total_unknown: 0,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,
@@ -10391,16 +12529,83 @@ mod tests {
         );
     }
 
+    /// KR0 switch review (problem 2): `ProofEvidence` round-trips through
+    /// bincode (positional) unstamped, stamped, and inside an enclosing value
+    /// (where a misaligned field corrupts what follows), while JSON still
+    /// omits an absent stamp and reads a pre-switch row. Measured before the
+    /// fix: `skip_serializing_if` on the stamp fields failed the bincode
+    /// round trip (`UnexpectedEof`, and "tag for enum is not valid" inside a
+    /// tuple).
     #[test]
-    fn test_proof_evidence_new() {
-        let ev = ProofEvidence::new(ReasoningKind::Smt, AssuranceLevel::Certified);
-        assert_eq!(ev.reasoning, ReasoningKind::Smt);
-        assert_eq!(ev.assurance, AssuranceLevel::Certified);
+    fn proof_evidence_round_trips_through_bincode_and_json() {
+        let unstamped = ProofEvidence::new(ReasoningKind::Smt, AssuranceLevel::SmtBacked);
+        let stamped = ProofEvidence::new(ReasoningKind::Constructive, AssuranceLevel::Certified)
+            .with_kernel_reference(
+                crate::KernelTheoryId::LeanReferenceV1,
+                crate::KernelEnvDigest([7; 32]),
+            );
+        let half = ProofEvidence {
+            kernel_theory: Some(crate::KernelTheoryId::LeanReferenceV1),
+            ..unstamped.clone()
+        };
+        for evidence in [&unstamped, &stamped, &half] {
+            let bytes = bincode::serialize(evidence).expect("bincode");
+            assert_eq!(&bincode::deserialize::<ProofEvidence>(&bytes).expect("decode"), evidence);
+            let outer = (Some(evidence.clone()), AssuranceLevel::Trusted, 0x5a_u8);
+            let bytes = bincode::serialize(&outer).expect("bincode outer");
+            assert_eq!(
+                bincode::deserialize::<(Option<ProofEvidence>, AssuranceLevel, u8)>(&bytes)
+                    .expect("decode outer"),
+                outer
+            );
+            let json = serde_json::to_string(evidence).expect("json");
+            assert_eq!(
+                &serde_json::from_str::<ProofEvidence>(&json).expect("json decode"),
+                evidence
+            );
+        }
+        let json = serde_json::to_value(&unstamped).expect("json");
+        assert!(json.get("kernel_theory").is_none() && json.get("env_digest").is_none(), "{json}");
+        let json = serde_json::to_value(&stamped).expect("json");
+        assert_eq!(json["kernel_theory"], "lean-reference-v1");
+        let old: ProofEvidence =
+            serde_json::from_str(r#"{"reasoning":"Smt","assurance":"SmtBacked"}"#)
+                .expect("old row");
+        assert_eq!(old, unstamped);
+    }
+
+    /// KR0 switch review (T1b): `is_certified` needs BOTH halves of the stamp
+    /// as well as `Certified` assurance. Control: the full stamp certifies.
+    #[test]
+    fn proof_evidence_is_certified_needs_theory_and_environment() {
+        let base = ProofEvidence::new(ReasoningKind::Constructive, AssuranceLevel::Certified);
+        let theory_only = ProofEvidence {
+            kernel_theory: Some(crate::KernelTheoryId::LeanReferenceV1),
+            ..base.clone()
+        };
+        let digest_only =
+            ProofEvidence { env_digest: Some(crate::KernelEnvDigest([3; 32])), ..base.clone() };
+        assert!(!theory_only.is_certified(), "a theory without an environment");
+        assert!(!digest_only.is_certified(), "an environment without a theory");
+        let full = base.with_kernel_reference(
+            crate::KernelTheoryId::LeanReferenceV1,
+            crate::KernelEnvDigest([3; 32]),
+        );
+        assert!(full.is_certified(), "control");
+        let trusted = ProofEvidence { assurance: AssuranceLevel::Trusted, ..full };
+        assert!(!trusted.is_certified(), "a stamp never certifies a weaker assurance");
     }
 
     #[test]
     fn test_proof_evidence_is_certified() {
-        let certified = ProofEvidence::new(ReasoningKind::Constructive, AssuranceLevel::Certified);
+        // KR0 switch: `Certified` assurance alone is not certified; the
+        // reference entry's theory and environment stamp is required.
+        let unstamped = ProofEvidence::new(ReasoningKind::Constructive, AssuranceLevel::Certified);
+        assert!(!unstamped.is_certified());
+        let certified = unstamped.with_kernel_reference(
+            crate::KernelTheoryId::LeanReferenceV1,
+            crate::KernelEnvDigest([1; 32]),
+        );
         assert!(certified.is_certified());
         let unchecked = ProofEvidence::new(ReasoningKind::Smt, AssuranceLevel::Unchecked);
         assert!(!unchecked.is_certified());
@@ -10480,6 +12685,10 @@ mod tests {
         let ev = ProofEvidence::new(
             ReasoningKind::BoundedModelCheck { depth: 100 },
             AssuranceLevel::Certified,
+        )
+        .with_kernel_reference(
+            crate::KernelTheoryId::LeanReferenceV1,
+            crate::KernelEnvDigest([1; 32]),
         );
         // The type system allows construction (for flexibility), but
         // `is_bounded()` remains true, enabling callers to enforce the rule.
@@ -10493,18 +12702,156 @@ mod tests {
     // Transport message tests
     // -----------------------------------------------------------------------
 
+    /// The compilation unit's runtime-check settings ride on the envelope, and
+    /// adding them is INERT for a producer that does not mint them.
+    ///
+    /// Three properties, and the whole design rests on them:
+    ///
+    /// 1. ABSENT means absent. `None` serializes to no key at all, so a
+    ///    producer that does not state the settings emits byte-identical JSON
+    ///    to the one it emitted before this field existed.
+    /// 2. LEGACY JSON deserializes to `None` — never to a value, and in
+    ///    particular never to "checks are on".
+    /// 3. A STATED environment round-trips exactly, both knobs, both ways.
+    /// Trust (D2 tier 1): the `modeled_facts` envelope field. A function whose
+    /// rows rest on a modeled fact (`ADAPTER_YIELD`) carries it BY NAME on the
+    /// wire; one that rests on none adds nothing, and an older envelope without
+    /// the field reads back as resting on none — the claim it actually made.
+    #[test]
+    fn function_envelope_modeled_facts_are_named_on_the_wire_and_additive() {
+        let envelope = |modeled_facts: Vec<String>| FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts,
+            function: "crate::is_sorted::{closure#0}".to_string(),
+            package_name: None,
+            crate_name: Some("crate".to_string()),
+            primary_package: false,
+            verification_session: String::new(),
+            runtime_checks: None,
+            results: Vec::new(),
+            proved: 2,
+            failed: 0,
+            unknown: 0,
+            timed_out: 0,
+            skipped: 0,
+            runtime_checked: 0,
+            cached: 0,
+            total: 2,
+            transport_budget: None,
+        };
+        let fact = "ADAPTER_YIELD: core `Iterator::all` over `<[T]>::windows(2)` invokes this \
+                    closure only on items it yields; assumed: item parameter `_2` has slice \
+                    length 2"
+            .to_string();
+        let msg = TransportMessage::FunctionResult(envelope(vec![fact.clone()]));
+        let json = serde_json::to_string(&msg).expect("envelope serializes");
+        assert!(
+            json.contains("\"modeled_facts\":[\"ADAPTER_YIELD: "),
+            "the modeled fact must be named on the wire: {json}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).expect("envelope parses");
+        assert_eq!(value["modeled_facts"], serde_json::json!([fact.clone()]));
+        let parsed: FunctionTransportResult =
+            serde_json::from_value(value).expect("the envelope reads back as a function result");
+        assert_eq!(parsed.modeled_facts, vec![fact]);
+
+        let plain = serde_json::to_string(&envelope(Vec::new())).expect("envelope serializes");
+        assert!(!plain.contains("modeled_facts"), "no modeled fact, no field: {plain}");
+        let legacy: FunctionTransportResult =
+            serde_json::from_str(&plain).expect("legacy envelope parses");
+        assert!(legacy.modeled_facts.is_empty());
+    }
+
+    #[test]
+    fn function_envelope_runtime_checks_are_additive_and_absence_is_not_a_value() {
+        fn envelope(runtime_checks: Option<RuntimeCheckEnv>) -> FunctionTransportResult {
+            FunctionTransportResult {
+                stable_ids: Vec::new(),
+                source_sha256: None,
+                expanded_function_identity: None,
+                modeled_facts: Vec::new(),
+                function: "crate::solve".to_string(),
+                package_name: Some("ay-dpll".to_string()),
+                crate_name: Some("ay_dpll".to_string()),
+                primary_package: true,
+                verification_session: "s".repeat(64),
+                runtime_checks,
+                results: Vec::new(),
+                proved: 0,
+                failed: 0,
+                unknown: 0,
+                timed_out: 0,
+                skipped: 0,
+                runtime_checked: 0,
+                cached: 0,
+                total: 0,
+                transport_budget: None,
+            }
+        }
+
+        // 1. An unstated environment adds nothing to the wire.
+        let absent = serde_json::to_string(&envelope(None)).expect("envelope serializes");
+        assert!(
+            !absent.contains("runtime_checks"),
+            "an unstated environment must not appear on the wire: {absent}"
+        );
+
+        // 2. JSON from a producer that predates the field reads back as `None`.
+        let legacy: FunctionTransportResult =
+            serde_json::from_str(&absent).expect("legacy envelope parses");
+        assert_eq!(legacy.runtime_checks, None);
+        assert_eq!(
+            serde_json::to_string(&legacy).expect("legacy envelope reserializes"),
+            absent,
+            "a legacy envelope must survive a round trip byte-identically"
+        );
+
+        // 3. A stated environment round-trips exactly, in all four shapes.
+        for (overflow_checks, ub_checks) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let env = RuntimeCheckEnv::new(overflow_checks, ub_checks);
+            let json = serde_json::to_string(&envelope(Some(env))).expect("envelope serializes");
+            let parsed: FunctionTransportResult =
+                serde_json::from_str(&json).expect("envelope parses");
+            assert_eq!(parsed.runtime_checks, Some(env));
+            // And the value is exactly what `has_runtime_fallback_in` consumes.
+            assert_eq!(
+                VcKind::ArithmeticOverflow {
+                    op: crate::BinOp::Add,
+                    operand_tys: (
+                        crate::Ty::Int { width: 64, signed: true },
+                        crate::Ty::Int { width: 64, signed: true }
+                    ),
+                }
+                .has_runtime_fallback_in(parsed.runtime_checks.expect("stated")),
+                overflow_checks
+            );
+        }
+    }
+
     #[test]
     fn test_transport_message_function_result_roundtrip() {
         let msg = TransportMessage::FunctionResult(FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::safe_div".to_string(),
             package_name: Some("pkg".to_string()),
             crate_name: Some("crate".to_string()),
             primary_package: true,
             verification_session: "session-1".to_string(),
+            runtime_checks: None,
             results: vec![TransportObligationResult {
+                assumes: Vec::new(),
+                gap_class: None,
                 obligation_id: None,
                 claim_digest_sha256: None,
                 kind: "divzero".to_string(),
+                original_vc_snapshot: None,
                 typed_kind: None,
                 description: "division by zero".to_string(),
                 location: None,
@@ -10518,6 +12865,7 @@ mod tests {
                 native_trust_ir: None,
                 proof_evidence: None,
                 monitor: None,
+                grade: None,
             }],
             proved: 1,
             failed: 0,
@@ -10527,6 +12875,7 @@ mod tests {
             runtime_checked: 0,
             cached: 0,
             total: 1,
+            transport_budget: None,
         });
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed = parse_transport_payload(&json).expect("deserialize");
@@ -10554,15 +12903,23 @@ mod tests {
             }),
         };
         let msg = TransportMessage::FunctionResult(FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::protocol".to_string(),
             package_name: Some("pkg".to_string()),
             crate_name: Some("crate".to_string()),
             primary_package: true,
             verification_session: "session-temporal".to_string(),
+            runtime_checks: None,
             results: vec![TransportObligationResult {
+                assumes: Vec::new(),
+                gap_class: None,
                 obligation_id: Some("crate::protocol#vc0".to_string()),
                 claim_digest_sha256: None,
                 kind: typed_kind.transport_tag().to_string(),
+                original_vc_snapshot: None,
                 typed_kind: Some(Box::new(typed_kind.clone())),
                 description: typed_kind.description(),
                 location: None,
@@ -10576,6 +12933,7 @@ mod tests {
                 native_trust_ir: None,
                 proof_evidence: None,
                 monitor: None,
+                grade: None,
             }],
             proved: 0,
             failed: 0,
@@ -10585,6 +12943,7 @@ mod tests {
             runtime_checked: 0,
             cached: 0,
             total: 1,
+            transport_budget: None,
         });
 
         let json = serde_json::to_string(&msg).expect("serialize exact typed temporal transport");
@@ -10678,7 +13037,7 @@ mod tests {
     fn report_obligations_and_transport_rows_name_outcomes_identically() {
         for obligation in [
             ObligationOutcome::Proved { strength: ProofStrength::deductive() },
-            ObligationOutcome::Failed { counterexample: None },
+            ObligationOutcome::Failed { counterexample: None, basis: FailureBasis::Refuted },
             ObligationOutcome::Unknown { reason: "r".to_string() },
             ObligationOutcome::RuntimeChecked { note: None },
             ObligationOutcome::Timeout { timeout_ms: 1 },
@@ -10714,11 +13073,14 @@ mod tests {
     #[test]
     fn test_transport_obligation_result_structured_evidence_roundtrip() {
         let result = TransportObligationResult {
+            assumes: Vec::new(),
+            gap_class: None,
             obligation_id: Some("crate::safe_div#vc0".to_string()),
             claim_digest_sha256: Some(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
             ),
             kind: "divzero".to_string(),
+            original_vc_snapshot: None,
             typed_kind: None,
             description: "division by zero".to_string(),
             location: None,
@@ -10791,6 +13153,7 @@ mod tests {
                 reason: "Clean kernel checked monitor=true iff proposition".to_string(),
                 predicate_digest: format!("sha256:{}", "a".repeat(64)),
             }),
+            grade: None,
         };
 
         let json = serde_json::to_string(&result).expect("serialize structured evidence");
@@ -10907,9 +13270,30 @@ mod tests {
                 eligible_functions: eligible_functions.clone(),
                 processed_functions: processed_functions.clone(),
             }),
+            noted_stops: vec![crate::determinism::NotedStop {
+                lane: "in-process ay".to_string(),
+                cause: crate::determinism::StopCause::WallBackstop,
+                item: None,
+                count: 2,
+            }],
+            degraded_anchors: 3,
+            memory: MemorySummary::new([(MemorySummary::CONTEXTS_RELEASED.to_string(), 4)]),
         });
         let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"degraded_anchors\":3"), "{json}");
+        assert!(
+            json.contains(
+                "\"memory\":{\"schema\":\"trust-memory-summary/v1\",\"counters\":{\"contexts_released\":4}}"
+            ),
+            "{json}"
+        );
         assert!(json.contains("\"type\":\"coverage_summary\""), "{json}");
+        assert!(
+            json.contains(
+                "\"noted_stops\":[{\"lane\":\"in-process ay\",\"cause\":\"wall-backstop\",\"count\":2}]"
+            ),
+            "{json}"
+        );
         assert!(json.contains("\"eligible\":12"), "{json}");
         assert!(json.contains("\"processed\":9"), "{json}");
         assert!(json.contains("\"package_name\":\"my-package\""), "{json}");
@@ -10929,6 +13313,10 @@ mod tests {
                 assert_eq!(s.processed, 9);
                 assert!(!s.is_complete());
                 assert_eq!(s.shortfall(), 3);
+                assert_eq!(s.noted_stops.len(), 1);
+                assert_eq!(s.noted_stops[0].cause, crate::determinism::StopCause::WallBackstop);
+                assert_eq!(s.degraded_anchors, 3);
+                assert_eq!(s.memory.counter(MemorySummary::CONTEXTS_RELEASED), Some(4));
                 let identities = s.function_identities.expect("current exact identity inventory");
                 assert_eq!(identities.eligible_functions, eligible_functions);
                 assert_eq!(identities.processed_functions, processed_functions);
@@ -10947,6 +13335,9 @@ mod tests {
             eligible: 4,
             processed: 4,
             function_identities: None,
+            noted_stops: Vec::new(),
+            degraded_anchors: 0,
+            memory: MemorySummary::default(),
         };
         assert!(complete.is_complete());
         assert_eq!(complete.shortfall(), 0);
@@ -10959,20 +13350,66 @@ mod tests {
     }
 
     #[test]
-    fn test_coverage_summary_old_wire_shape_defaults_new_identity_fields() {
+    fn test_coverage_summary_unauthenticated_shape_defaults_identity_fields() {
+        // An unauthenticated row: no package, session or identities, and (since T3 L4 C09w) the
+        // required memory summary. A row older than C09w has no summary and is refused
+        // (`a_coverage_row_without_a_current_memory_summary_is_refused`).
         let line = format!(
-            "{TRANSPORT_PREFIX}{{\"type\":\"coverage_summary\",\"crate_name\":\"legacy\",\"eligible\":2,\"processed\":2}}"
+            "{TRANSPORT_PREFIX}{{\"type\":\"coverage_summary\",\"crate_name\":\"unauthenticated\",\"eligible\":2,\"processed\":2,\"memory\":{{\"schema\":\"trust-memory-summary/v1\",\"counters\":{{}}}}}}"
         );
-        let parsed = parse_transport_line(&line).expect("legacy coverage row must parse");
+        let parsed =
+            parse_transport_line(&line).expect("an unauthenticated coverage row must parse");
         let TransportMessage::CoverageSummary(summary) = parsed else {
             panic!("expected CoverageSummary");
         };
-        assert_eq!(summary.crate_name, "legacy");
+        assert_eq!(summary.crate_name, "unauthenticated");
         assert_eq!(summary.package_name, "");
         assert!(!summary.primary_package);
         assert_eq!(summary.verification_session, "");
         assert_eq!(summary.function_identities, None);
+        assert!(summary.noted_stops.is_empty());
         assert!(summary.is_complete());
+        assert_eq!(summary.memory, MemorySummary::default());
+    }
+
+    /// T3 L4 (C09w; L4-SUMMARY-1): `memory` is required from its first version. A row
+    /// without it, with another schema, with a counter that is not a count, or with a field
+    /// the summary does not have is refused, by the canonical parser and by plain serde
+    /// alike; the control, the same row with a v1 summary, parses.
+    #[test]
+    fn a_coverage_row_without_a_current_memory_summary_is_refused() {
+        let row = |memory: &str| {
+            format!(
+                "{{\"type\":\"coverage_summary\",\"crate_name\":\"c\",\"eligible\":1,\"processed\":1{memory}}}"
+            )
+        };
+        let control = row(
+            ",\"memory\":{\"schema\":\"trust-memory-summary/v1\",\"counters\":{\"compacted_rehits\":0}}",
+        );
+        let TransportMessage::CoverageSummary(parsed) =
+            parse_transport_payload(&control).expect("a v1 memory summary parses")
+        else {
+            panic!("expected CoverageSummary");
+        };
+        assert_eq!(parsed.memory.schema(), MEMORY_SUMMARY_SCHEMA_V1);
+        assert_eq!(parsed.memory.counter(MemorySummary::COMPACTED_REHITS), Some(0));
+        assert_eq!(parsed.memory.counter(MemorySummary::CONTEXTS_RELEASED), None);
+        for refused in [
+            row(""),
+            row(",\"memory\":null"),
+            row(",\"memory\":{\"counters\":{}}"),
+            row(",\"memory\":{\"schema\":\"trust-memory-summary/v0\",\"counters\":{}}"),
+            row(",\"memory\":{\"schema\":\"trust-memory-summary/v1\"}"),
+            row(",\"memory\":{\"schema\":\"trust-memory-summary/v1\",\"counters\":{\"a\":-1}}"),
+            row(",\"memory\":{\"schema\":\"trust-memory-summary/v1\",\"counters\":{},\"extra\":1}"),
+        ] {
+            assert!(parse_transport_payload(&refused).is_err(), "{refused}");
+            assert!(parse_transport_line(&format!("{TRANSPORT_PREFIX}{refused}")).is_none());
+            assert!(
+                serde_json::from_str::<CoverageTransportSummary>(&refused).is_err(),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
@@ -10992,8 +13429,53 @@ mod tests {
         let round: VerificationGateReport = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(
             round.coverage,
-            Some(VerificationCoverage { eligible: 7, processed: 5, coverage_complete: false })
+            Some(VerificationCoverage {
+                eligible: 7,
+                processed: 5,
+                coverage_complete: false,
+                excluded: 0
+            })
         );
+    }
+
+    /// DECISION_QUEUE "Project policy cannot loosen the lane — 2026-10-07":
+    /// `project_requirements` is additive (absent from older gate JSON and
+    /// omitted when unset) and round-trips when present.
+    #[test]
+    fn test_verification_gate_project_requirements_are_additive_and_round_trip() {
+        let json = r#"{"lane":"strict","decision":"fail","exit_code":1,"counts":{"total":1,"proved":0,"failed":1,"unknown":0,"runtime_checked":0,"assumed":0,"mandated":0}}"#;
+        let gate: VerificationGateReport = serde_json::from_str(json).expect("old gate JSON");
+        assert_eq!(gate.project_requirements, None);
+        let plain = serde_json::to_string(&gate).expect("serialize");
+        assert!(!plain.contains("project_requirements"), "{plain}");
+
+        let requirements = ProjectRequirementsReport {
+            policy: Some("certify".into()),
+            level: Some("L2".into()),
+            profile: Some("unix_hardened".into()),
+            include_dependencies: Some(true),
+            ir_lower: Some("strict".into()),
+            verification_required: true,
+        };
+        assert_eq!(
+            requirements.items(),
+            [
+                "policy=certify",
+                "level=L2",
+                "profile=unix_hardened",
+                "include-dependencies=yes",
+                "ir-lower=strict",
+                "verification=required"
+            ]
+        );
+        let with = VerificationGateReport { project_requirements: Some(requirements), ..gate };
+        let json = serde_json::to_string(&with).expect("serialize");
+        assert!(json.contains("\"project_requirements\":{\"policy\":\"certify\""), "{json}");
+        let round: VerificationGateReport = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(round, with);
+        let partial: ProjectRequirementsReport =
+            serde_json::from_str(r#"{"policy":"advisory"}"#).expect("partial requirements");
+        assert_eq!(partial.items(), ["policy=advisory"]);
     }
 
     #[test]
@@ -11068,14 +13550,35 @@ mod tests {
         }
     }
 
+    /// A non-scalar model value rides the transport as the solver's own
+    /// SMT-LIB spelling and displays as exactly that text — never a fabricated
+    /// scalar.
+    #[test]
+    fn test_counterexample_term_value_round_trips_and_displays_verbatim() {
+        let value = CounterexampleValue::Term("(succ zero)".to_string());
+        assert_eq!(value.to_string(), "(succ zero)");
+        let json = serde_json::to_string(&value).expect("serialize term value");
+        assert_eq!(json, r#"{"Term":"(succ zero)"}"#);
+        let round_trip: CounterexampleValue =
+            serde_json::from_str(&json).expect("deserialize term value");
+        assert_eq!(round_trip, value);
+        let cex = Counterexample::new(vec![("m".to_string(), value)]);
+        assert_eq!(cex.to_string(), "m = (succ zero)");
+    }
+
     #[test]
     fn test_transport_message_function_result_split_counters_roundtrip() {
         let msg = TransportMessage::FunctionResult(FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::proof_gap".to_string(),
             package_name: None,
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
+            runtime_checks: None,
             results: vec![],
             proved: 0,
             failed: 0,
@@ -11085,6 +13588,7 @@ mod tests {
             runtime_checked: 0,
             cached: 0,
             total: 2,
+            transport_budget: None,
         });
 
         let json = serde_json::to_string(&msg).expect("serialize split counters");
@@ -11108,11 +13612,16 @@ mod tests {
         // obligations in the machine-readable transport so `targo trust` can
         // aggregate hit-rate without relabeling the conservative `unknown` rows.
         let msg = TransportMessage::FunctionResult(FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::replayed".to_string(),
             package_name: None,
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
+            runtime_checks: None,
             results: vec![],
             proved: 0,
             failed: 0,
@@ -11122,6 +13631,7 @@ mod tests {
             runtime_checked: 0,
             cached: 3,
             total: 3,
+            transport_budget: None,
         });
         let json = serde_json::to_string(&msg).expect("serialize cached");
         assert!(json.contains("\"cached\":3"), "cached count must serialize: {json}");
@@ -11214,16 +13724,24 @@ mod tests {
     #[test]
     fn test_parse_transport_payload_with_i128_u128_counterexample_model() {
         let msg = TransportMessage::FunctionResult(FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::mixed".to_string(),
             package_name: None,
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
+            runtime_checks: None,
             results: vec![
                 TransportObligationResult {
+                    assumes: Vec::new(),
+                    gap_class: None,
                     obligation_id: None,
                     claim_digest_sha256: None,
                     kind: "bounds".to_string(),
+                    original_vc_snapshot: None,
                     typed_kind: None,
                     description: "index out of bounds".to_string(),
                     location: None,
@@ -11240,11 +13758,15 @@ mod tests {
                     proof_evidence: None,
                     design_mandate: false,
                     monitor: None,
+                    grade: None,
                 },
                 TransportObligationResult {
+                    assumes: Vec::new(),
+                    gap_class: None,
                     obligation_id: None,
                     claim_digest_sha256: None,
                     kind: "overflow:add".to_string(),
+                    original_vc_snapshot: None,
                     typed_kind: None,
                     description: "a + b".to_string(),
                     location: None,
@@ -11258,6 +13780,7 @@ mod tests {
                     proof_evidence: None,
                     design_mandate: false,
                     monitor: None,
+                    grade: None,
                 },
             ],
             proved: 1,
@@ -11268,6 +13791,7 @@ mod tests {
             runtime_checked: 0,
             cached: 0,
             total: 2,
+            transport_budget: None,
         });
         let payload = serde_json::to_string(&msg).expect("emit");
 
@@ -11321,9 +13845,8 @@ mod tests {
         NativeProofEnvelope {
             schema: NATIVE_PROOF_ENVELOPE_SCHEMA.to_string(),
             kind: NativeProofEnvelopeKind::ChcInductiveInvariant,
-            claim_payload:
-                r#"{"schema":"trustc.transport-exact-vc-claim.v2","semantics":{},"vc":{}}"#
-                    .to_string(),
+            claim_payload: r#"{"schema":"trustc.exact-vc-claim.v3","semantics":{},"vc":{}}"#
+                .to_string(),
             claim_digest_sha256: "ab".repeat(32),
             normalized_input_sha256: "cd".repeat(32),
             transport_identity: NativeProofTransportIdentity {

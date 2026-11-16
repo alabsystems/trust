@@ -564,6 +564,32 @@ class ReceiptHelpersTests(unittest.TestCase):
                     trustc_sha256="b" * 64,
                 )
 
+    def test_an_unpinned_root_seed_build_is_never_compatibility_evidence(self) -> None:
+        # docs/PLAN.md PKG-S6: a build from a seed whose host record is a fixed
+        # point of an unpinned host chain is graded unpinned-root-seed-ready by
+        # recreate_bootstrap.py, below every release status; this gate asks for one.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sysroot = root / "build" / "test-host" / "stage2"
+            sysroot.mkdir(parents=True)
+            receipt = sysroot / "tool-provenance.json"
+            stable = {"stable_across_build": True, "errors": []}
+            receipt.write_text(json.dumps({
+                "schema": MODULE.PROVENANCE_SCHEMA, "status": "unpinned-root-seed-ready", "stage": 2,
+                "host": "test-host", "path_scope": "repository-root-relative", "tool_binding_status": "ready",
+                "errors": [], "source_tree_clean": True, "trust_from_trust": True,
+                "source_lineage": {"status": "immutable_release", **stable},
+                "bootstrap_lineage": {"status": "trust_from_trust", **stable},
+                "build_authority": {"status": "ready", **stable},
+                "compiler": {"source_commit": "a" * 40, "compiler_sha256": "b" * 64, "sysroot_matches": True},
+                "bootstrap_compiler_verification": {"mode": "disabled", "flag": "-Ztrust-verify=off",
+                                                    "reason": "bootstrap stability", "counts_as_self_proof": False},
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.GateError, "receipt is not immutable internal/public release"):
+                MODULE.validate_stage_provenance(
+                    receipt, root=root, source_head="a" * 40, sysroot=sysroot, trustc_sha256="b" * 64,
+                )
+
     def test_partial_or_shared_cache_runs_cannot_exit_as_passing_evidence(self) -> None:
         self.assertEqual(MODULE.evidence_exit_code(complete=True, failed=0), 0)
         self.assertNotEqual(MODULE.evidence_exit_code(complete=False, failed=0), 0)

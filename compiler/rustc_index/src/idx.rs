@@ -143,3 +143,7 @@ impl<I: Idx, T> IntoSliceIdx<I, [T]> for core::range::RangeToInclusive<I> {
         core::range::RangeToInclusive { last: self.last.index() }
     }
 }
+
+// Trust: keep generated Step regressions in the compiler test-file layout.
+#[cfg(all(test, feature = "nightly"))]
+mod tests;

@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 //! Binary decompilation report adapters.
 //!
 //! These helpers summarize shared `trust-types` binary decompilation artifacts
@@ -1946,8 +1947,18 @@ pub fn build_binary_decompilation_report(
         &artifact.unsupported,
         &artifact.verification.unsupported_ledger,
     );
+    let verification = build_binary_verification_report_with_gate(
+        &artifact.verification,
+        artifact.trust_level,
+        &artifact_unsupported,
+    );
     let digest_identity = BinaryDigestIdentityReport::from_metadata(&artifact.binary);
-    let proof_grade_gate = build_binary_artifact_proof_grade_gate_report(artifact);
+    let proof_grade_gate = with_artifact_gates(
+        verification.proof_grade_gate.clone(),
+        &artifact.reconstruction,
+        &artifact.source_provenance,
+        &artifact.binary,
+    );
     let unsupported = build_binary_unsupported_ledger_report(&artifact.unsupported);
     let source_provenance = BinarySourceProvenanceReport::from_summary(&artifact.source_provenance);
     let reconstruction = BinaryReconstructionReport::from_summary(&artifact.reconstruction);
@@ -1956,11 +1967,6 @@ pub fn build_binary_decompilation_report(
         &source_provenance,
         &reconstruction,
         &artifact.type_fact_source_backpropagation_blockers(),
-    );
-    let verification = build_binary_verification_report_with_gate(
-        &artifact.verification,
-        artifact.trust_level,
-        &artifact_unsupported,
     );
     let unresolved_blockers = build_decompilation_unresolved_blocker_ledger(
         &proof_grade_gate,
@@ -2073,19 +2079,27 @@ pub fn build_binary_decompilation_proof_evidence_report(
         &artifact_unsupported,
     );
     let digest_identity = BinaryDigestIdentityReport::from_metadata(&artifact.binary);
-    let proof_grade_gate = build_binary_artifact_proof_grade_gate_report(artifact);
+    let proof_grade_gate = with_artifact_gates(
+        verification.proof_grade_gate.clone(),
+        &artifact.reconstruction,
+        &artifact.source_provenance,
+        &artifact.binary,
+    );
+    let source_provenance = BinarySourceProvenanceReport::from_summary(&artifact.source_provenance);
+    let reconstruction = BinaryReconstructionReport::from_summary(&artifact.reconstruction);
+    let source_backpropagation_gate = build_source_backpropagation_gate_report(
+        &proof_grade_gate,
+        &source_provenance,
+        &reconstruction,
+        &artifact.type_fact_source_backpropagation_blockers(),
+    );
     let unresolved_blockers = build_decompilation_unresolved_blocker_ledger(
         &proof_grade_gate,
         &digest_identity,
         &artifact.unsupported,
-        &BinarySourceProvenanceReport::from_summary(&artifact.source_provenance),
-        &build_source_backpropagation_gate_report(
-            &proof_grade_gate,
-            &BinarySourceProvenanceReport::from_summary(&artifact.source_provenance),
-            &BinaryReconstructionReport::from_summary(&artifact.reconstruction),
-            &artifact.type_fact_source_backpropagation_blockers(),
-        ),
-        &BinaryReconstructionReport::from_summary(&artifact.reconstruction),
+        &source_provenance,
+        &source_backpropagation_gate,
+        &reconstruction,
         &verification,
     );
 
@@ -2449,9 +2463,18 @@ fn build_binary_artifact_proof_grade_gate_report(
         &unsupported,
         &artifact.verification,
     );
-    let gate = with_artifact_reconstruction_gate(gate, &artifact.reconstruction);
-    let gate = with_source_provenance_gate(gate, &artifact.source_provenance);
-    with_digest_identity_gate(gate, &artifact.binary)
+    with_artifact_gates(gate, &artifact.reconstruction, &artifact.source_provenance, &artifact.binary)
+}
+
+fn with_artifact_gates(
+    gate: BinaryProofGradeGateReport,
+    reconstruction: &ReconstructionSummary,
+    source_provenance: &BinarySourceProvenanceSummary,
+    binary: &BinaryArtifactMetadata,
+) -> BinaryProofGradeGateReport {
+    let gate = with_artifact_reconstruction_gate(gate, reconstruction);
+    let gate = with_source_provenance_gate(gate, source_provenance);
+    with_digest_identity_gate(gate, binary)
 }
 
 fn build_binary_function_proof_grade_gate_report(
@@ -2485,19 +2508,22 @@ fn with_artifact_reconstruction_gate(
 ) -> BinaryProofGradeGateReport {
     let target = reconstruction.target.clone();
     let status = reconstruction.validation;
-    let target_outputs =
-        reconstruction.outputs.iter().filter(|output| output.target == target).collect::<Vec<_>>();
-    let validated_outputs = target_outputs
-        .iter()
-        .filter(|output| output.validation == ReconstructionValidationStatus::Validated)
-        .count();
-    let target_validation_blockers =
-        target_outputs.iter().map(|output| output.target_validation_blockers.len()).sum();
-    let preserved_symbolic_formulas =
-        target_outputs.iter().map(|output| output.preserved_symbolic_formulas.len()).sum();
-    let symbolic_formulas_consumed_by_proof_model = target_outputs
-        .iter()
-        .all(|output| output_symbolic_formulas_consumed_by_proof_model(output));
+    let mut validated_outputs = 0usize;
+    let mut target_validation_blockers = 0usize;
+    let mut preserved_symbolic_formulas = 0usize;
+    let mut symbolic_formulas_consumed_by_proof_model = true;
+    for output in reconstruction.outputs.iter().filter(|output| output.target == target) {
+        if output.validation == ReconstructionValidationStatus::Validated {
+            validated_outputs += 1;
+        }
+        target_validation_blockers += output.target_validation_blockers.len();
+        preserved_symbolic_formulas += output.preserved_symbolic_formulas.len();
+        if symbolic_formulas_consumed_by_proof_model
+            && !output_symbolic_formulas_consumed_by_proof_model(output)
+        {
+            symbolic_formulas_consumed_by_proof_model = false;
+        }
+    }
 
     with_reconstruction_target_semantics_gate(
         gate,
@@ -2733,6 +2759,9 @@ fn symbolic_formula_required_evidence(
 }
 
 fn diagnostic_has_token(diagnostic: &str, key: &str, value: &str) -> bool {
+    if !diagnostic.contains(key) {
+        return false;
+    }
     let quoted = format!("{value:?}");
     [
         format!("{key}={value}"),
@@ -3774,6 +3803,9 @@ fn strict_formula_sort(formula: &Formula) -> Option<Sort> {
                 && elem_sort.as_ref() == &strict_formula_sort(value)?)
                 .then_some(array_sort)
         }
+        Formula::ConstArray { index_sort, elem_sort, value } => (elem_sort
+            == &strict_formula_sort(value)?)
+            .then(|| Sort::Array(Box::new(index_sort.clone()), Box::new(elem_sort.clone()))),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -4086,6 +4118,15 @@ fn build_binary_function_report(function: &DecompiledFunction) -> BinaryFunction
         &function.unsupported,
         &function.verification.unsupported_ledger,
     );
+    let verification = build_binary_verification_report_with_gate(
+        &function.verification,
+        function.trust_level,
+        &function_unsupported,
+    );
+    let proof_grade_gate = with_function_reconstruction_gate(
+        verification.proof_grade_gate.clone(),
+        function.output.as_ref(),
+    );
     BinaryFunctionReport {
         name: function.name.clone(),
         entry: function.entry,
@@ -4098,13 +4139,9 @@ fn build_binary_function_report(function: &DecompiledFunction) -> BinaryFunction
             .map(BinaryInstructionProvenanceReport::from_origin)
             .collect(),
         trust_level: function.trust_level,
-        proof_grade_gate: build_binary_function_proof_grade_gate_report(function),
+        proof_grade_gate,
         unsupported: build_binary_unsupported_ledger_report(&function.unsupported),
-        verification: build_binary_verification_report_with_gate(
-            &function.verification,
-            function.trust_level,
-            &function_unsupported,
-        ),
+        verification,
     }
 }
 
@@ -4328,7 +4365,19 @@ fn json_bytes(value: &serde_json::Value, key: &str) -> Vec<u8> {
 }
 
 fn format_hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ")
+    if bytes.is_empty() {
+        return String::new();
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 3 - 1);
+    for (i, &byte) in bytes.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 impl BinaryReplayDigestIdentityReport {
@@ -5623,7 +5672,14 @@ fn append_dispatch_details(
 }
 
 fn format_counts(counts: &BTreeMap<String, usize>) -> String {
-    counts.iter().map(|(key, value)| format!("{key}: {value}")).collect::<Vec<_>>().join(", ")
+    let mut out = String::new();
+    for (i, (key, value)) in counts.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{key}: {value}");
+    }
+    out
 }
 
 fn format_replay_digest_identity_summary(report: &BinaryReplayDigestIdentityReport) -> String {
@@ -5836,11 +5892,14 @@ fn format_binary_address(address: u64) -> String {
 fn format_formula_sort_declarations(
     declarations: &[BinaryVcFormulaSortDeclarationReport],
 ) -> String {
-    declarations
-        .iter()
-        .map(|decl| format!("{}:{}", decl.name, decl.smtlib_sort))
-        .collect::<Vec<_>>()
-        .join(", ")
+    let mut out = String::new();
+    for (i, decl) in declarations.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{}:{}", decl.name, decl.smtlib_sort);
+    }
+    out
 }
 
 #[cfg(test)]

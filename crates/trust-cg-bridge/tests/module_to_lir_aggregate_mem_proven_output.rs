@@ -11,14 +11,26 @@
 //
 //     fn sf(a: i32, b: i32) -> i32 { let t = (a, b); t.0 + t.1 }   (= a + b)
 //
-// in the AGGREGATE-IN-MEMORY shape the bridge promotes a multi-block-written
-// tuple local to (`promote_local_to_memory` + `ensure_local_storage`), confirmed
-// by dumping `trust_ir_bridge::lower_to_trust_ir`:
+// in the AGGREGATE-IN-MEMORY shape: one whole-aggregate stack slot, stored and
+// loaded as a unit. The bridge promotes a tuple local that is written in more
+// than one block to such a slot (`promote_local_to_memory`). Since BMC-LANE-1
+// (2026-11-06) that slot is an `alloca` with no initializing store, every
+// complete construction written to it is ONE `make_aggregate` stored whole, and
+// every field read is a whole `load` then an `extractfield`
+// (`bridge_promoted_tuple_local_is_stored_from_a_make_aggregate` below pins
+// this on the real bridge). Before BMC-LANE-1 the stored value was an
+// `undef (i32,i32)` seed under two `insertfield`s. A tuple local written in
+// one block only is not promoted; it stays an SSA value.
+//
+// This file builds the round trip by hand, in one block, in three spellings of
+// the stored value (`AggBase`):
 //
 //   bb0(a, b):
-//     %c  = const (i32,i32) [0, 0]          ; aggregate base (interp-executable)
-//     %t0 = insertfield (i32,i32) %c,  0, a ; field 0 <- a
-//     %t  = insertfield (i32,i32) %t0, 1, b ; field 1 <- b   (full SSA aggregate)
+//     %c  = const (i32,i32) [0, 0]          ; ConstSeed: an interpreter-
+//     %t0 = insertfield (i32,i32) %c,  0, a ;   executable base and two writes
+//     %t  = insertfield (i32,i32) %t0, 1, b ;   (UndefSeed: `undef` for `const`)
+//       -- or, Constructor (the bridge's spelling since BMC-LANE-1) --
+//     %t  = make_aggregate (i32,i32) [a, b] ; no seed, no insertfield
 //     %s  = alloca (i32,i32)                ; AGGREGATE stack slot (size 8, align 4)
 //     store (i32,i32) %t -> *%s             ; WHOLE-aggregate store
 //     %ld = load  (i32,i32) *%s             ; WHOLE-aggregate load
@@ -79,18 +91,30 @@ use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Build the aggregate-in-memory Module for sf(a,b) = { let t=(a,b); t.0+t.1 }.
-//
-// `use_undef_seed = false` -> Const::Aggregate base (interpreter-executable;
-// the value-differential path). `true` -> Undef(Tuple) base (the RAW bridge
-// shape; the interpreter traps on Undef, so it is only lowered, not interpreted).
 // ---------------------------------------------------------------------------
 
-fn make_agg_sum_module(use_undef_seed: bool) -> Module {
+/// How the stored `(i32, i32)` value is spelled.
+#[derive(Clone, Copy, Debug)]
+enum AggBase {
+    /// `const (i32,i32) [0,0]` under two `insertfield`s: interpreter-executable
+    /// (the value-differential path).
+    ConstSeed,
+    /// `undef (i32,i32)` under two `insertfield`s: the bridge's spelling before
+    /// BMC-LANE-1. The interpreter faults on the seed, so it is only lowered.
+    UndefSeed,
+    /// One `make_aggregate (i32,i32) [a, b]`, no seed and no `insertfield`: the
+    /// bridge's spelling of a complete construction since BMC-LANE-1. The
+    /// interpreter executes it.
+    Constructor,
+}
+
+fn make_agg_sum_module(spelling: AggBase) -> Module {
     let mut module = Module::new("agg_mem_module");
     module.func_types.push(FuncTy {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
     let mut function = IrFunction::new(FuncId::new(0), "sf", FuncTyId::new(0), BlockId::new(0));
     let tup = Ty::Tuple(vec![Ty::I32, Ty::I32]);
@@ -110,27 +134,48 @@ fn make_agg_sum_module(use_undef_seed: bool) -> Module {
     bb0.params.push((a, Ty::I32));
     bb0.params.push((b, Ty::I32));
 
-    // aggregate base: Const::Aggregate [0,0] (interp) or Undef(Tuple) (raw bridge)
-    if use_undef_seed {
-        bb0.body.push(InstrNode::new(Inst::Undef { ty: tup.clone() }).with_result(base));
-    } else {
+    // The stored aggregate `%t`: a seed (Const or Undef) under two InsertFields,
+    // or the complete constructor (which leaves `base` and `t0` unused).
+    let seed = match spelling {
+        AggBase::ConstSeed => Some(Inst::Const {
+            ty: tup.clone(),
+            value: Constant::Aggregate(vec![Constant::Int(0), Constant::Int(0)]),
+        }),
+        AggBase::UndefSeed => Some(Inst::Undef { ty: tup.clone() }),
+        AggBase::Constructor => None,
+    };
+    if let Some(seed) = seed {
+        bb0.body.push(InstrNode::new(seed).with_result(base));
+        // %t0 = insertfield %base, 0, a ; %t = insertfield %t0, 1, b
         bb0.body.push(
-            InstrNode::new(Inst::Const {
+            InstrNode::new(Inst::InsertField {
                 ty: tup.clone(),
-                value: Constant::Aggregate(vec![Constant::Int(0), Constant::Int(0)]),
+                aggregate: base,
+                field: 0,
+                value: a,
             })
-            .with_result(base),
+            .with_result(t0),
+        );
+        bb0.body.push(
+            InstrNode::new(Inst::InsertField {
+                ty: tup.clone(),
+                aggregate: t0,
+                field: 1,
+                value: b,
+            })
+            .with_result(t),
+        );
+    } else {
+        // %t = make_aggregate (i32,i32) [a, b]
+        bb0.body.push(
+            InstrNode::new(Inst::MakeAggregate {
+                ty: tup.clone(),
+                variant: None,
+                fields: vec![a, b],
+            })
+            .with_result(t),
         );
     }
-    // %t0 = insertfield %base, 0, a ; %t = insertfield %t0, 1, b
-    bb0.body.push(
-        InstrNode::new(Inst::InsertField { ty: tup.clone(), aggregate: base, field: 0, value: a })
-            .with_result(t0),
-    );
-    bb0.body.push(
-        InstrNode::new(Inst::InsertField { ty: tup.clone(), aggregate: t0, field: 1, value: b })
-            .with_result(t),
-    );
     // %slot = alloca (i32,i32)
     bb0.body.push(
         InstrNode::new(Inst::Alloca { ty: tup.clone(), count: None, align: None })
@@ -261,8 +306,20 @@ fn count_single_ldr_str(code: &[u8], base: u64) -> (usize, usize) {
 // ===========================================================================
 
 fn symbolic_machine_output(code: &[u8], base: u64) -> Formula {
-    let sem = Aarch64Semantics;
+    machine_output_from(code, base, MachineState::symbolic())
+}
+
+/// The emitted bytes run on CONCRETE arguments `a` (W0) and `b` (W1); the stack
+/// pointer and memory stay symbolic, so the output still needs the solver.
+fn concrete_machine_output(code: &[u8], base: u64, a: i32, b: i32) -> Formula {
     let mut state = MachineState::symbolic();
+    state.gpr[0] = Formula::BitVec { value: i128::from(a) & 0xffff_ffff, width: 64 };
+    state.gpr[1] = Formula::BitVec { value: i128::from(b) & 0xffff_ffff, width: 64 };
+    machine_output_from(code, base, state)
+}
+
+fn machine_output_from(code: &[u8], base: u64, mut state: MachineState) -> Formula {
+    let sem = Aarch64Semantics;
     let mut pc = base;
     let mut steps = 0u32;
 
@@ -472,7 +529,7 @@ fn interpret_agg(module: &Module, a: i128, b: i128) -> i128 {
 
 #[test]
 fn module_to_lir_emits_aggregate_slot_with_field_stores_and_loads() {
-    let module = make_agg_sum_module(false);
+    let module = make_agg_sum_module(AggBase::ConstSeed);
     let lir =
         lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("lower aggregate");
 
@@ -524,7 +581,7 @@ fn module_to_lir_emits_aggregate_slot_with_field_stores_and_loads() {
 
 #[test]
 fn module_interpreter_aggregate_sum_round_trips_through_memory() {
-    let module = make_agg_sum_module(false);
+    let module = make_agg_sum_module(AggBase::ConstSeed);
     assert_eq!(interpret_agg(&module, 5, 7), 12);
     assert_eq!(interpret_agg(&module, 0, 0), 0);
     assert_eq!(interpret_agg(&module, -3, 10), 7);
@@ -541,7 +598,7 @@ fn module_interpreter_aggregate_sum_round_trips_through_memory() {
 
 #[test]
 fn module_derived_aggregate_bytes_compute_a_plus_b_for_all_inputs() {
-    let module = make_agg_sum_module(false);
+    let module = make_agg_sum_module(AggBase::ConstSeed);
 
     // Value-differential precondition before the symbolic proof.
     assert_eq!(interpret_agg(&module, 5, 7), 12, "value-differential precondition");
@@ -569,7 +626,7 @@ fn module_derived_aggregate_bytes_compute_a_plus_b_for_all_inputs() {
 
 #[test]
 fn negative_control_aggregate_bytes_vs_a_plus_b_plus_1_is_sat() {
-    let module = make_agg_sum_module(false);
+    let module = make_agg_sum_module(AggBase::ConstSeed);
     let (code, base) = emit_module_text(&module);
     assert!(!code.is_empty(), "emitted __text is empty");
 
@@ -585,10 +642,14 @@ fn negative_control_aggregate_bytes_vs_a_plus_b_plus_1_is_sat() {
 }
 
 // ===========================================================================
-// TEST 5 — the converter ALSO accepts the RAW bridge shape whose aggregate base
-// is `Undef(Tuple)` (the `promote_local_to_memory` seed), proving the per-field
-// decomposition admits the real emitted Module — not only the interpreter-
-// executable Const::Aggregate stand-in. The interpreter traps on `Undef`
+// TEST 5 — the converter ALSO accepts the shape whose aggregate base is
+// `Undef(Tuple)` (the construction seed under an `InsertField` chain, which the
+// bridge emitted for every aggregate construction until BMC-LANE-1, 2026-11-06;
+// it now emits `MakeAggregate` for a complete one and keeps the seed only for a
+// partial construction and a by-value FnOnce closure environment, so here the
+// seed is a hand-built, still-legal legacy shape),
+// proving the per-field decomposition admits it — not only the
+// interpreter-executable Const::Aggregate stand-in. The interpreter traps on `Undef`
 // EAGERLY (documented limitation), so this is a LOWERING + PROVEN-OUTPUT check,
 // not an interpret check: the emitted bytes must still compute a+b for all
 // inputs (the Undef-seeded fields are fully overwritten by the InsertFields
@@ -597,7 +658,7 @@ fn negative_control_aggregate_bytes_vs_a_plus_b_plus_1_is_sat() {
 
 #[test]
 fn raw_bridge_undef_seeded_aggregate_lowers_and_computes_a_plus_b() {
-    let module = make_agg_sum_module(true); // Undef(Tuple) base — the raw bridge shape.
+    let module = make_agg_sum_module(AggBase::UndefSeed); // the legacy bridge shape.
 
     // The Module REALLY contains an aggregate Undef seed (not a Const stand-in).
     assert!(
@@ -606,7 +667,7 @@ fn raw_bridge_undef_seeded_aggregate_lowers_and_computes_a_plus_b() {
             .iter()
             .flat_map(|b| b.body.iter())
             .any(|n| matches!(&n.inst, Inst::Undef { ty: Ty::Tuple(_) })),
-        "raw bridge module must carry an Undef(Tuple) aggregate seed"
+        "the legacy-shape module must carry an Undef(Tuple) aggregate seed"
     );
 
     let (code, base) = emit_module_text(&module);
@@ -623,4 +684,268 @@ fn raw_bridge_undef_seeded_aggregate_lowers_and_computes_a_plus_b() {
         !discharge_equal(&machine_out, &sum_plus_one_spec()),
         "VACUITY CHECK FAILED: raw-bridge aggregate bytes 'proven' equal to a+b+1"
     );
+}
+
+// ===========================================================================
+// TESTS 6-8 — the COMPLETE-CONSTRUCTOR spelling (`AggBase::Constructor`): the
+// stored value is ONE `make_aggregate (i32,i32) [a, b]`, with no seed and no
+// InsertField, which is how the bridge spells a complete construction since
+// BMC-LANE-1. PASS 1.7 records the constructor's two lanes as the aggregate's
+// field values (`lower_aggregate_inst`'s MakeAggregate arm), so the whole Store
+// becomes two per-field Stores of `a` and `b`. The same three checks the other
+// spellings get run over it: the interpreter value-differential (the
+// constructor executes, unlike the Undef seed), the infinite-domain
+// proven-output, and the a+b+1 vacuity control; TEST 8 adds a concrete run of
+// the emitted bytes against the interpreter on the SAME module.
+// ===========================================================================
+
+#[test]
+fn make_aggregate_spelling_has_no_seed_and_interprets_through_the_slot() {
+    let module = make_agg_sum_module(AggBase::Constructor);
+    let insts: Vec<&Inst> =
+        module.functions[0].blocks.iter().flat_map(|b| &b.body).map(|n| &n.inst).collect();
+    assert_eq!(
+        insts.iter().filter(|inst| matches!(inst, Inst::MakeAggregate { .. })).count(),
+        1,
+        "the stored value is one complete constructor"
+    );
+    assert!(
+        !insts.iter().any(|inst| matches!(
+            inst,
+            Inst::Undef { .. } | Inst::InsertField { .. } | Inst::Const { ty: Ty::Tuple(_), .. }
+        )),
+        "the constructor spelling carries no aggregate seed and no InsertField"
+    );
+    assert_eq!(interpret_agg(&module, 5, 7), 12);
+    assert_eq!(interpret_agg(&module, 0, 0), 0);
+    assert_eq!(interpret_agg(&module, -3, 10), 7);
+    assert_eq!(interpret_agg(&module, 100, -50), 50);
+    assert_eq!(interpret_agg(&module, 41, 1), 42);
+}
+
+#[test]
+fn make_aggregate_spelling_lowers_to_field_stores_and_computes_a_plus_b() {
+    let module = make_agg_sum_module(AggBase::Constructor);
+    let lir = lower_trust_ir_function_to_lir(&module, &module.functions[0])
+        .expect("the constructor spelling lowers");
+    assert_eq!(lir.stack_slots.len(), 1, "one aggregate stack slot");
+    assert_eq!(lir.stack_slots[0].size, 8, "(i32,i32) C-layout size is 8 bytes");
+    assert_eq!(lir.stack_slots[0].align, 4, "(i32,i32) C-layout align is 4 bytes");
+    let insts: Vec<_> = lir.blocks.values().flat_map(|b| &b.instructions).collect();
+    // The per-field Stores write the constructor's lanes, the entry params
+    // `a` (Value 0) then `b` (Value 1), in field-offset order.
+    let stored: Vec<_> = insts
+        .iter()
+        .filter(|i| matches!(i.opcode, LirOpcode::Store { .. }))
+        .map(|i| i.args[0])
+        .collect();
+    assert_eq!(
+        stored,
+        vec![trust_cg_lower::instructions::Value(0), trust_cg_lower::instructions::Value(1)],
+        "field 0 stores a, field 1 stores b"
+    );
+    assert_eq!(
+        insts.iter().filter(|i| matches!(i.opcode, LirOpcode::Load { .. })).count(),
+        2,
+        "two per-field Loads"
+    );
+
+    let (code, base) = emit_module_text(&module);
+    assert!(!code.is_empty(), "emitted __text is empty for the constructor spelling");
+    let (strs, ldrs) = count_single_ldr_str(&code, base);
+    assert!(strs >= 2, "expected >= 2 Str (the two field stores) in emitted bytes, got {strs}");
+    assert!(ldrs >= 2, "expected >= 2 Ldr (the two field loads) in emitted bytes, got {ldrs}");
+
+    let machine_out = symbolic_machine_output(&code, base);
+    assert!(
+        discharge_equal(&machine_out, &sum_spec()),
+        "PROVEN-OUTPUT FAILED: constructor-spelled aggregate bytes do not equal a+b for all \
+         inputs.\n  machine_out = {machine_out:?}"
+    );
+    assert!(
+        !discharge_equal(&machine_out, &sum_plus_one_spec()),
+        "VACUITY CHECK FAILED: constructor-spelled aggregate bytes 'proven' equal to a+b+1"
+    );
+}
+
+#[test]
+fn make_aggregate_spelling_bytes_and_interpreter_agree_on_concrete_inputs() {
+    let module = make_agg_sum_module(AggBase::Constructor);
+    let (code, base) = emit_module_text(&module);
+    for (a, b) in [(5i32, 7i32), (0, 0), (-3, 10), (i32::MAX, 1), (i32::MIN, -1), (41, 1)] {
+        // `add` wraps in both the interpreter and the bytes.
+        let expected = a.wrapping_add(b);
+        assert_eq!(
+            interpret_agg(&module, i128::from(a), i128::from(b)),
+            i128::from(expected),
+            "interpreter on ({a}, {b})"
+        );
+        let out = concrete_machine_output(&code, base, a, b);
+        assert!(
+            discharge_equal(&out, &bv32(i128::from(expected) & 0xffff_ffff)),
+            "the emitted bytes on ({a}, {b}) must return {expected}; got {out:?}"
+        );
+    }
+}
+
+// ===========================================================================
+// TEST 9 — the REAL bridge's promoted tuple local. `trust_ir_bridge::
+// lower_to_trust_ir` on `fn d(a, b) -> i32 { let t = if a == 0 { (a, b) } else
+// { (b, a) }; t.0 + t.1 }` (t is written in two blocks, so it is promoted to a
+// slot) emits an `alloca (i32,i32)` with no initializing store, one
+// `make_aggregate` stored whole on each arm, and a whole `load` before each
+// `extractfield` at the join. No aggregate seed and no InsertField remain. The
+// converter lowers that module to one 8-byte slot; the branch keeps it out of
+// this file's straight-line executor, so the byte proof stays on the
+// hand-built spellings above.
+// ===========================================================================
+
+fn make_bridge_promoted_tuple_module() -> Module {
+    use trust_types::{
+        AggregateKind, BasicBlock, BinOp as TtBinOp, BlockId as TtBlockId, LocalDecl, Operand,
+        Place, Rvalue, SourceSpan, Statement, Terminator, Ty as TtTy, VerifiableBody,
+        VerifiableFunction,
+    };
+    let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+        place,
+        rvalue,
+        span: SourceSpan::default(),
+    };
+    let tuple = |x: usize, y: usize| {
+        Rvalue::Aggregate(
+            AggregateKind::Tuple,
+            vec![Operand::Copy(Place::local(x)), Operand::Copy(Place::local(y))],
+        )
+    };
+    let vf = VerifiableFunction {
+        name: "d".to_string(),
+        def_path: "m::d".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: TtTy::i32(), name: None },
+                LocalDecl { index: 1, ty: TtTy::i32(), name: Some("a".into()) },
+                LocalDecl { index: 2, ty: TtTy::i32(), name: Some("b".into()) },
+                LocalDecl {
+                    index: 3,
+                    ty: TtTy::Tuple(vec![TtTy::i32(), TtTy::i32()]),
+                    name: Some("t".into()),
+                },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: TtBlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(1)),
+                        targets: vec![(0, TtBlockId(1))],
+                        otherwise: TtBlockId(2),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: TtBlockId(1),
+                    stmts: vec![assign(Place::local(3), tuple(1, 2))],
+                    terminator: Terminator::Goto(TtBlockId(3)),
+                },
+                BasicBlock {
+                    id: TtBlockId(2),
+                    stmts: vec![assign(Place::local(3), tuple(2, 1))],
+                    terminator: Terminator::Goto(TtBlockId(3)),
+                },
+                BasicBlock {
+                    id: TtBlockId(3),
+                    stmts: vec![assign(
+                        Place::local(0),
+                        Rvalue::BinaryOp(
+                            TtBinOp::Add,
+                            Operand::Copy(Place::field(3, 0)),
+                            Operand::Copy(Place::field(3, 1)),
+                        ),
+                    )],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 2,
+            return_ty: TtTy::i32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    };
+    trust_ir_bridge::lower_to_trust_ir(&vf).expect("bridge lower_to_trust_ir failed for d")
+}
+
+#[test]
+fn bridge_promoted_tuple_local_is_stored_from_a_make_aggregate() {
+    let module = make_bridge_promoted_tuple_module();
+    let tup = Ty::Tuple(vec![Ty::I32, Ty::I32]);
+    let nodes: Vec<&InstrNode> = module.functions[0].blocks.iter().flat_map(|b| &b.body).collect();
+    assert!(
+        !nodes.iter().any(|n| matches!(n.inst, Inst::Undef { .. } | Inst::InsertField { .. })),
+        "a complete construction carries no aggregate seed and no InsertField"
+    );
+    let allocas: Vec<ValueId> = nodes
+        .iter()
+        .filter(|n| matches!(&n.inst, Inst::Alloca { ty, count: None, .. } if *ty == tup))
+        .map(|n| n.results[0])
+        .collect();
+    let [slot] = allocas.as_slice() else {
+        panic!("one promoted (i32,i32) slot expected, found {allocas:?}")
+    };
+    let constructors: Vec<(ValueId, Vec<ValueId>)> = nodes
+        .iter()
+        .filter_map(|n| match &n.inst {
+            Inst::MakeAggregate { ty, variant: None, fields } if *ty == tup => {
+                Some((n.results[0], fields.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let (a, b) = (ValueId::new(0), ValueId::new(1));
+    assert_eq!(
+        constructors.iter().map(|(_, lanes)| lanes.clone()).collect::<Vec<_>>(),
+        vec![vec![a, b], vec![b, a]],
+        "one complete constructor per arm, (a, b) then (b, a)"
+    );
+    let stores: Vec<ValueId> = nodes
+        .iter()
+        .filter_map(|n| match &n.inst {
+            Inst::Store { ty, ptr, value, .. } if *ty == tup && ptr == slot => Some(*value),
+            Inst::Store { ty, .. } if *ty == tup => panic!("a tuple Store off the slot: {n:?}"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stores,
+        constructors.iter().map(|(result, _)| *result).collect::<Vec<_>>(),
+        "every store into the slot stores a constructor whole, and there is no other store \
+         (no initializing seed)"
+    );
+    // Each field read loads the whole slot, then extracts the field.
+    let loads = nodes
+        .iter()
+        .filter(|n| matches!(&n.inst, Inst::Load { ty, ptr, .. } if *ty == tup && ptr == slot))
+        .count();
+    assert_eq!(loads, 2, "one whole-slot load per field read");
+
+    let lir = lower_trust_ir_function_to_lir(&module, &module.functions[0])
+        .expect("the bridge's promoted tuple local lowers");
+    assert_eq!(lir.stack_slots.len(), 1, "one aggregate stack slot");
+    assert_eq!(lir.stack_slots[0].size, 8, "(i32,i32) C-layout size is 8 bytes");
+    let stores = lir
+        .blocks
+        .values()
+        .flat_map(|b| &b.instructions)
+        .filter(|i| matches!(i.opcode, LirOpcode::Store { .. }))
+        .count();
+    assert_eq!(stores, 4, "two per-field Stores on each arm");
+
+    // The interpreter executes the real bridge module through the slot.
+    assert_eq!(interpret_agg(&module, 0, 7), 7, "arm (a, b)");
+    assert_eq!(interpret_agg(&module, 5, 7), 12, "arm (b, a)");
 }

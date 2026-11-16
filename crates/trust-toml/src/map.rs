@@ -6,8 +6,9 @@
 //! # Why this is a newtype and not a bare `BTreeMap`
 //!
 //! The incumbent spells a table `toml::map::Map<String, Value>` and re-exports
-//! it as `toml::Table`. Consumers in this tree name `toml::Table` in function
-//! signatures (`crates/trust-deps/src/lib.rs:1600,1613`), so the name has to
+//! it as `toml::Table`. The retired `trust-deps` crate (removed by TRUST-08,
+//! 2026-09-24) named `toml::Table` in function signatures, and a consumer
+//! written against the incumbent's API may do so again, so the name has to
 //! exist and has to be a distinct type they can name. A `pub type Table =
 //! BTreeMap<String, Value>` would also compile today, but it would export
 //! `BTreeMap`'s entire surface as this crate's public API and make any later
@@ -36,8 +37,7 @@
 //! `preserve_order` feature here, you reintroduce that hazard.
 
 use std::borrow::Borrow;
-use std::collections::BTreeMap;
-use std::collections::btree_map;
+use std::collections::{BTreeMap, btree_map};
 use std::fmt;
 use std::iter::FromIterator;
 use std::ops::Index;
@@ -139,8 +139,9 @@ impl<K: Ord, V> Map<K, V> {
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Map<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Print like a map literal, not like `Map { inner: {...} }`. Consumers
-        // format values with `{:?}` in error paths (`trust-deps/src/lib.rs:1643`)
-        // and the newtype wrapper is noise there.
+        // format values with `{:?}` in error paths (the retired `trust-deps`
+        // crate's dependency-line parser did, before TRUST-08 removed it) and
+        // the newtype wrapper is noise there.
         self.inner.fmt(f)
     }
 }
@@ -245,7 +246,10 @@ where
         f.write_str("a table")
     }
 
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut access: A,
+    ) -> Result<Self::Value, A::Error> {
         let mut map = Map::new();
         // A duplicate key overwrites, matching `BTreeMap::insert` and the
         // incumbent. This crate's own parser rejects a duplicate key before it

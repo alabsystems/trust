@@ -7,7 +7,7 @@
 // - MIR classification (MirRouter::classify)
 // - Full function verification (MirRouter::verify_function)
 //
-// Run: cargo bench -p trust-benchmarks
+// Run: targo --unverified bench -p trust-benchmarks
 // Results: target/criterion/ (HTML reports with statistical analysis)
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>

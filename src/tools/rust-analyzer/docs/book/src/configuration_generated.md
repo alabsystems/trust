@@ -19,14 +19,6 @@ Default: `false`
 Prefer to use `Self` over the type name when inserting a type (e.g. in "fill match arms" assist).
 
 
-## rust-analyzer.assist.termSearch.borrowcheck {#assist.termSearch.borrowcheck}
-
-Default: `true`
-
-Enable borrow checking for term search code assists. If set to false, also there will be
-more suggestions, but some of them may not borrow-check.
-
-
 ## rust-analyzer.assist.termSearch.fuel {#assist.termSearch.fuel}
 
 Default: `1800`
@@ -593,6 +585,13 @@ Default: `1000`
 Term search fuel in "units of work" for autocompletion (Defaults to 1000).
 
 
+## rust-analyzer.completion.turbofish.enable {#completion.turbofish.enable}
+
+Default: `true`
+
+Complete turbofish (`::<>`) at the call site (if needed).
+
+
 ## rust-analyzer.diagnostics.disabled {#diagnostics.disabled}
 
 Default: `[]`
@@ -991,7 +990,7 @@ to always show them).
 
 Default: `false`
 
-Show inlay hints for closure captures.
+Show inlay hints for closure and coroutine captures.
 
 
 ## rust-analyzer.inlayHints.closureReturnTypeHints.enable {#inlayHints.closureReturnTypeHints.enable}
@@ -1368,7 +1367,7 @@ This config takes a map of crate names with the exported proc-macro names to ign
 
 ## rust-analyzer.procMacro.processes {#procMacro.processes}
 
-Default: `1`
+Default: `2`
 
 Number of proc-macro server processes to spawn.
 
@@ -1769,9 +1768,9 @@ will likely be useful:
 
 **Warning**: This format is provisional and subject to change.
 
-The discover command should output JSON objects, one per
-line (JSONL format). These objects should correspond to
-this Rust data type:
+The discover command should output JSON objects to stdout,
+one per line (JSONL format). These objects should correspond
+to this Rust data type:
 
 ```norun
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1811,6 +1810,9 @@ commented for readability):
 Only the finished event is required, but the other
 variants are encouraged to give users more feedback about
 progress or errors.
+
+Stderr is not parsed as JSONL. It is treated as command log
+output and forwarded to rust-analyzer's own logs.
 
 
 ## rust-analyzer.workspace.symbol.search.excludeImports {#workspace.symbol.search.excludeImports}

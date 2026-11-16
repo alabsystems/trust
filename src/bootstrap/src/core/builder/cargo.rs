@@ -1,21 +1,45 @@
-use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::{env, fs};
+
+// Trust: shim helpers live in the `shim_utils` crate since the 1.101 port.
+use shim_utils::{
+    BOOTSTRAP_FRONTEND_CEILING_ENV, RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV,
+    bootstrap_seed_frontend_ceiling, retired_trust_bootstrap_shim_target_only_refusal,
+};
 
 use super::{Builder, Kind};
+use crate::core::backend::CodegenBackendKind;
+use crate::core::build_steps::compile::{is_lto_stage, std_compiler_runtime_identity};
+use crate::core::build_steps::llvm::Llvm;
 use crate::core::build_steps::test;
-use crate::core::build_steps::tool::SourceType;
-use crate::core::config::flags::Color;
-use crate::core::config::{CompressDebuginfo, DebuginfoLevel, SplitDebuginfo};
+use crate::core::build_steps::tool::{SourceType, TargoBuildTool};
+use crate::core::compiler::Compiler;
+use crate::core::config::flags::{Color, Subcommand};
+use crate::core::config::toml::pgo::PgoConfig;
+use crate::core::config::{
+    CompressDebuginfo, Config, DebuginfoLevel, DryRun, RustcLto, SplitDebuginfo, TargetSelection,
+};
+use crate::core::session::{CLang, Mode, RemapScheme};
 use crate::utils::build_stamp;
-use crate::utils::helpers::{self, LldThreads, check_cfg_arg, linker_flags};
-use crate::utils::shared_helpers::{
-    RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV, retired_trust_bootstrap_shim_target_only_refusal,
-};
-use crate::{
-    BootstrapCommand, CLang, CodegenBackendKind, Compiler, Config, DryRun, EXTRA_CHECK_CFGS,
-    GitRepo, Mode, RemapScheme, TargetSelection, command, prepare_behaviour_dump_dir, t,
-};
+use crate::utils::exec::{BootstrapCommand, ExecutionContext, command};
+use crate::utils::helpers::{self, LldThreads, check_cfg_arg, envify, linker_flags, t};
+
+/// Extra `--check-cfg` to add when building the compiler or tools
+/// (Mode restriction, config name, config values (if any))
+#[expect(clippy::type_complexity)] // It's fine for hard-coded list and type is explained above.
+const EXTRA_CHECK_CFGS: &[(Option<Mode>, &str, Option<&[&'static str]>)] = &[
+    (Some(Mode::Rustc), "bootstrap", None),
+    (Some(Mode::Codegen), "bootstrap", None),
+    (Some(Mode::ToolRustcPrivate), "bootstrap", None),
+    (Some(Mode::ToolStd), "bootstrap", None),
+    (Some(Mode::ToolRustcPrivate), "rust_analyzer", None),
+    (Some(Mode::ToolStd), "rust_analyzer", None),
+    // Any library specific cfgs like `target_os`, `target_arch` should be put in
+    // priority the `[lints.rust.unexpected_cfgs.check-cfg]` table
+    // in the appropriate `library/{std,alloc,core}/Cargo.toml`
+];
 
 /// Represents flag values in `String` form with a `\x1f` delimiter to pass to the compiler later.
 ///
@@ -28,6 +52,52 @@ use crate::{
 /// information.
 #[derive(Debug, Clone)]
 struct Rustflags(String, TargetSelection);
+
+// Trust: mirror rustc's direct-linker name hints. Unknown configured drivers
+// keep the target's existing CC convention; do not guess from a path substring.
+fn configured_direct_linker(linker: Option<&Path>) -> bool {
+    let Some(stem) = linker.and_then(Path::file_stem).and_then(OsStr::to_str) else {
+        return false;
+    };
+    let stem = stem
+        .rsplit_once('-')
+        .filter(|(_, version)| version.chars().all(char::is_numeric))
+        .map_or(stem, |(name, _)| name);
+    matches!(stem, "lld" | "rust-lld" | "ld.lld" | "lld-link" | "ld" | "link")
+        || stem.ends_with("-ld")
+}
+
+// Trust: preserve the sysroot-relative loader policy while passing flags to
+// the configured linker at its own interface, rather than always through CC.
+fn append_sysroot_rpath(
+    flags: &mut Rustflags,
+    target: TargetSelection,
+    libdir: &str,
+    direct: bool,
+) {
+    let rpath = if target.contains("apple") {
+        flags.arg("-Zosx-rpath-install-name");
+        format!("@loader_path/../{libdir}")
+    } else if !target.is_windows()
+        && !target.contains("cygwin")
+        && !target.contains("aix")
+        && !target.contains("xous")
+    {
+        if direct {
+            flags.arg("-Clink-arg=-z").arg("-Clink-arg=origin");
+        } else {
+            flags.arg("-Clink-args=-Wl,-z,origin");
+        }
+        format!("$ORIGIN/../{libdir}")
+    } else {
+        return;
+    };
+    if direct {
+        flags.arg("-Clink-arg=-rpath").arg(&format!("-Clink-arg={rpath}"));
+    } else {
+        flags.arg(&format!("-Clink-args=-Wl,-rpath,{rpath}"));
+    }
+}
 
 impl Rustflags {
     fn new(target: TargetSelection) -> Rustflags {
@@ -44,11 +114,14 @@ impl Rustflags {
         self.env(prefix);
 
         // ... and also handle target-specific env RUSTFLAGS if they're configured.
-        let target_specific = format!("CARGO_TARGET_{}_{}", crate::envify(&self.1.triple), prefix);
+        let target_specific = format!("CARGO_TARGET_{}_{}", envify(&self.1.triple), prefix);
         self.env(&target_specific);
     }
 
     fn env(&mut self, env: &str) {
+        if cfg!(test) {
+            return;
+        }
         if let Ok(s) = env::var(env) {
             for part in s.split(' ') {
                 self.arg(part);
@@ -122,6 +195,114 @@ impl HostFlags {
     fn encode(self) -> String {
         self.rustc.join(Self::SEPARATOR)
     }
+}
+
+// Trust: Cargo's profile is the keyed authority for checked engine arithmetic,
+// including host units. Refuse later flag overrides rather than hiding an
+// enforcement flag in the rustc shim, outside Cargo's freshness key.
+fn checked_engine_flags(flags: &str) -> Result<(), String> {
+    if flags.split('\x1f').any(|arg| arg.starts_with('@')) {
+        return Err("response files are unsupported in compiler/tool flags; pass their flags \
+             explicitly so bootstrap can check engine overflow policy"
+            .into());
+    }
+    let mut args = flags.split('\x1f');
+    while let Some(arg) = args.next() {
+        let option = if matches!(arg, "-C" | "--codegen") {
+            args.next()
+        } else {
+            arg.strip_prefix("-C").or_else(|| arg.strip_prefix("--codegen="))
+        };
+        if let Some((name, value)) = option.and_then(|option| option.split_once('=')) {
+            let name = name.replace('_', "-");
+            // Cargo can omit both flags when opt-level=0 implies assertions
+            // and assertions imply checks. Later optimization flags invalidate
+            // that implication; keep optimization in the resolved profile.
+            if name == "opt-level" {
+                return Err("compiler/tool optimization must use rust.optimize, not codegen \
+                            flag overrides that can disable implicit overflow checks"
+                    .into());
+            }
+            if matches!(name.as_str(), "overflow-checks" | "debug-assertions")
+                && matches!(value, "n" | "no" | "off" | "false")
+            {
+                return Err(format!(
+                    "compiler/tool flags cannot disable overflow checks or their \
+                     debug-assertions implication: {arg} {name}={value}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// Trust: inspect forwarded inline Cargo configuration as TOML, including
+// package/build overrides and flag arrays. External config/include resolution
+// belongs to Cargo; do not pretend a partial resolver can audit those files.
+fn checked_engine_config(value: &toml::Value) -> Result<(), String> {
+    if value
+        .get("env")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|env| env.contains_key("RUSTC_HOST_FLAGS"))
+    {
+        return Err("Cargo configuration cannot set bootstrap-private RUSTC_HOST_FLAGS".into());
+    }
+    if let Some(table) = value.as_table() {
+        for (key, value) in table {
+            match key.as_str() {
+                "include" => {
+                    return Err("Cargo config includes are unsupported for compiler/tools; \
+                                pass audited inline settings instead"
+                        .into());
+                }
+                "overflow-checks" | "overflow_checks" if value.as_bool() == Some(false) => {
+                    return Err("Cargo configuration cannot disable compiler/tool \
+                                overflow checks"
+                        .into());
+                }
+                "rustflags" | "rustdocflags" => {
+                    if let Some(flags) = value.as_str() {
+                        let flags = flags.split_whitespace().collect::<Vec<_>>().join("\x1f");
+                        checked_engine_flags(&flags)?;
+                    } else if let Some(flags) = value.as_array() {
+                        let flags: Vec<_> = flags.iter().filter_map(toml::Value::as_str).collect();
+                        checked_engine_flags(&flags.join("\x1f"))?;
+                    }
+                }
+                _ => {}
+            }
+            checked_engine_config(value)?;
+        }
+    }
+    Ok(())
+}
+
+fn checked_engine_cargo_args(args: &[OsString], cwd: &Path) -> Result<(), String> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let arg = arg.to_string_lossy();
+        let setting = if arg == "--config" {
+            Some(args.next().ok_or("missing forwarded Cargo --config value")?.to_string_lossy())
+        } else {
+            arg.strip_prefix("--config=").map(std::borrow::Cow::Borrowed)
+        };
+        if let Some(setting) = setting {
+            // Cargo tries an existing path before parsing inline TOML. Even a
+            // filename like `net.offline=true` can therefore hide settings.
+            if cwd.join(setting.as_ref()).try_exists().map_err(|error| error.to_string())? {
+                return Err("external Cargo config files are unsupported for compiler/tools; \
+                            pass audited inline settings instead"
+                    .into());
+            }
+            let value = setting.parse::<toml::Value>().map_err(|_| {
+                "compiler/tools require inline TOML for forwarded Cargo --config; \
+                 external config files cannot be audited by bootstrap"
+                    .to_string()
+            })?;
+            checked_engine_config(&value)?;
+        }
+    }
+    Ok(())
 }
 
 fn is_trust_verifier_unstable_option(option: &str) -> bool {
@@ -291,11 +472,11 @@ fn bootstrap_verification_request_refusal(mode: Mode, rustflags: &str) -> Option
         return None;
     }
 
-    // The first sentence is load-bearing text: `docs/SELF_PROOF.md` quotes it
-    // verbatim as the recorded refusal. Extend it, never reword it.
+    // The refusal prefix is load-bearing: `docs/SELF_PROOF.md` quotes it.
+    // Replacement guidance names the compiled owner, never an evidence wrapper.
     Some(format!(
         "bootstrap compiler verification flags are unsupported without an authenticated \
-         artifact-bound bootstrap protocol; use scripts/stage2_verify_self_build.sh instead \
+         artifact-bound bootstrap protocol; use `targo trust verify self --full-verifier` instead \
          (refused for a {mode:?} unit; rustflags {rustflags:?}). To verify an in-tree \
          `library/` unit — which is NOT a self-proof claim — use the per-unit opt-in \
          `{TRUST_BOOTSTRAP_VERIFY_LIBRARY_ENV}=<unit>[,<unit>...]` instead; it is refused for \
@@ -391,7 +572,7 @@ fn parse_trust_verify_library_request(raw: Option<&OsStr>) -> Result<Option<Vec<
                  `library/` unit. This opt-in verifies library units only: compiler, \
                  bootstrap and tool units are refused, because bootstrap has no \
                  authenticated artifact-bound self-proof protocol (use \
-                 scripts/stage2_verify_self_build.sh for bounded compiler-crate \
+                 `targo trust verify self --full-verifier` for bounded compiler-crate \
                  evidence). Allowed: {}",
                 allowed()
             ));
@@ -426,6 +607,17 @@ fn trust_cg_codegen_is_active(
     build_compiler_stage != 0 && compiler_default_backend.is_trust_cg()
 }
 
+/// Trust: whether a staged compiler's DEFAULT backend is the trust-ir → trust-cg
+/// self-host plugin. It shares the builtin adapter's profile constraints (no
+/// debuginfo, one codegen unit per crate) but NOT its `-Cpanic=abort`: the
+/// plugin lowers real unwinding, and the compiler it self-hosts requires it.
+fn trust_ir_cg_codegen_is_active(
+    build_compiler_stage: u32,
+    compiler_default_backend: &CodegenBackendKind,
+) -> bool {
+    build_compiler_stage != 0 && compiler_default_backend.is_trust_ir_cg()
+}
+
 fn effective_debuginfo_level(
     trust_cg_is_active: bool,
     requested: DebuginfoLevel,
@@ -446,7 +638,7 @@ fn trust_cg_codegen_flags(trust_cg_is_active: bool, is_test: bool) -> &'static [
 }
 
 #[derive(Debug)]
-pub struct Cargo {
+pub(crate) struct Cargo {
     command: BootstrapCommand,
     args: Vec<OsString>,
     compiler: Compiler,
@@ -459,13 +651,14 @@ pub struct Cargo {
     build_compiler_stage: u32,
     extra_rustflags: Vec<String>,
     profile: Option<&'static str>,
+    kind: Kind,
 }
 
 impl Cargo {
     /// Calls [`Builder::cargo`] and [`Cargo::configure_linker`] to prepare an invocation of `cargo`
     /// to be run.
     #[track_caller]
-    pub fn new(
+    pub(crate) fn new(
         builder: &Builder<'_>,
         compiler: Compiler,
         mode: Mode,
@@ -473,7 +666,30 @@ impl Cargo {
         target: TargetSelection,
         cmd_kind: Kind,
     ) -> Cargo {
-        let mut cargo = builder.cargo(compiler, mode, source_type, target, cmd_kind);
+        Self::new_with_input(
+            builder,
+            compiler,
+            mode,
+            source_type,
+            target,
+            cmd_kind,
+            builder.cargo_input(mode),
+        )
+    }
+
+    // Trust: only the native build-tool producer explicitly selects the seed.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new_with_input(
+        builder: &Builder<'_>,
+        compiler: Compiler,
+        mode: Mode,
+        source_type: SourceType,
+        target: TargetSelection,
+        cmd_kind: Kind,
+        input: CargoInput,
+    ) -> Cargo {
+        let mut cargo =
+            builder.cargo_with_input(compiler, mode, source_type, target, cmd_kind, input);
         if target.synthetic {
             cargo.arg("-Zjson-target-spec");
         }
@@ -489,34 +705,43 @@ impl Cargo {
         cargo
     }
 
-    pub fn release_build(&mut self, release_build: bool) {
+    pub(crate) fn release_build(&mut self, release_build: bool) {
         self.profile = if release_build { Some("release") } else { None };
     }
 
-    pub fn profile(&mut self, profile: &'static str) {
+    #[expect(dead_code, reason = "general-purpose, currently unused")]
+    pub(crate) fn profile(&mut self, profile: &'static str) {
         self.profile = Some(profile);
     }
 
-    pub fn compiler(&self) -> Compiler {
+    pub(crate) fn compiler(&self) -> Compiler {
         self.compiler
     }
 
-    pub fn build_compiler_stage(&self) -> u32 {
+    // Trust: the effective stage, which can differ from the compiler's stage for
+    // local rebuilds and explicit seed tool inputs. It is the stage the off-switch
+    // default is decided on, so `compile::apply_trust_std_rustflags` reads the same
+    // one for the trust-ir producer flags; tests observe it too.
+    pub(crate) fn build_compiler_stage(&self) -> u32 {
         self.build_compiler_stage
     }
 
-    pub fn mode(&self) -> Mode {
+    pub(crate) fn mode(&self) -> Mode {
         self.mode
     }
 
-    pub fn into_cmd(self) -> BootstrapCommand {
+    pub(crate) fn into_cmd(self) -> BootstrapCommand {
         self.into()
+    }
+
+    pub(crate) fn kind(&self) -> Kind {
+        self.kind
     }
 
     /// Same as [`Cargo::new`] except this one doesn't configure the linker with
     /// [`Cargo::configure_linker`].
     #[track_caller]
-    pub fn new_for_mir_opt_tests(
+    pub(crate) fn new_for_mir_opt_tests(
         builder: &Builder<'_>,
         compiler: Compiler,
         mode: Mode,
@@ -531,12 +756,12 @@ impl Cargo {
         cargo
     }
 
-    pub fn rustdocflag(&mut self, arg: &str) -> &mut Cargo {
+    pub(crate) fn rustdocflag(&mut self, arg: &str) -> &mut Cargo {
         self.rustdocflags.arg(arg);
         self
     }
 
-    pub fn rustflag(&mut self, arg: &str) -> &mut Cargo {
+    pub(crate) fn rustflag(&mut self, arg: &str) -> &mut Cargo {
         self.rustflags.arg(arg);
         self
     }
@@ -563,19 +788,19 @@ impl Cargo {
     /// The same repetition also collides `core`, because `StableCrateId` is
     /// hash(name, -Cmetadata, is_exe, cfg_version) and `extra_filename` is not
     /// an input: two `core`s, one id.
-    pub fn rustflag_once(&mut self, arg: &str) -> &mut Cargo {
+    pub(crate) fn rustflag_once(&mut self, arg: &str) -> &mut Cargo {
         if !self.rustflags.0.split('\u{1f}').any(|existing| existing == arg) {
             self.rustflags.arg(arg);
         }
         self
     }
 
-    pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Cargo {
+    pub(crate) fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Cargo {
         self.args.push(arg.as_ref().into());
         self
     }
 
-    pub fn args<I, S>(&mut self, args: I) -> &mut Cargo
+    pub(crate) fn args<I, S>(&mut self, args: I) -> &mut Cargo
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -589,10 +814,18 @@ impl Cargo {
     /// Add an env var to the cargo command instance. Note that `RUSTFLAGS`/`RUSTDOCFLAGS` must go
     /// through [`Cargo::rustdocflags`] and [`Cargo::rustflags`] because inconsistent `RUSTFLAGS`
     /// and `RUSTDOCFLAGS` usages will trigger spurious rebuilds.
-    pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Cargo {
+    pub(crate) fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Cargo {
         assert_ne!(key.as_ref(), "RUSTFLAGS");
         assert_ne!(key.as_ref(), "RUSTDOCFLAGS");
         self.command.env(key.as_ref(), value.as_ref());
+        self
+    }
+
+    /// Remove a private constructor input instead of forwarding the caller's value.
+    pub(crate) fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Cargo {
+        assert_ne!(key.as_ref(), "RUSTFLAGS");
+        assert_ne!(key.as_ref(), "RUSTDOCFLAGS");
+        self.command.env_remove(key.as_ref());
         self
     }
 
@@ -602,7 +835,7 @@ impl Cargo {
     ///
     /// Note that this only considers the existence of the env. var. configured on this `Cargo`
     /// instance. It does not look at the environment of this process.
-    pub fn append_to_env(
+    pub(crate) fn append_to_env(
         &mut self,
         key: impl AsRef<OsStr>,
         value: impl AsRef<OsStr>,
@@ -622,20 +855,16 @@ impl Cargo {
         }
     }
 
-    pub fn add_rustc_lib_path(&mut self, builder: &Builder<'_>) {
+    pub(crate) fn add_rustc_lib_path(&mut self, builder: &Builder<'_>) {
         builder.add_rustc_lib_path(self.compiler, &mut self.command);
     }
 
-    pub fn current_dir(&mut self, dir: &Path) -> &mut Cargo {
-        self.command.current_dir(dir);
-        self
-    }
-
+    // Trust: the active bare_cargo command sets its source working directory before wrapping.
     /// Adds nightly-only features that this invocation is allowed to use.
     ///
     /// By default, all nightly features are allowed. Once this is called, it will be restricted to
     /// the given set.
-    pub fn allow_features(&mut self, features: &str) -> &mut Cargo {
+    pub(crate) fn allow_features(&mut self, features: &str) -> &mut Cargo {
         if !self.allow_features.is_empty() {
             self.allow_features.push(',');
         }
@@ -675,29 +904,24 @@ impl Cargo {
         // argument manually via `-C link-args=-Wl,-rpath,...`. Plus isn't it
         // fun to pass a flag to a tool to pass a flag to pass a flag to a tool
         // to change a flag in a binary?
-        if builder.config.rpath_enabled(target) && helpers::use_host_linker(target) {
+        // Trust: ToolTarget is the standalone, non-rustc-private tool mode.
+        // Its binaries (including trustd) must use the system loader defaults;
+        // injecting $ORIGIN/../lib or @loader_path gives mutable sysroot siblings
+        // authority and defeats the daemon's empty runtime-closure policy.
+        // Compiler/private modes still require their ordinary sysroot rpath.
+        if self.mode != Mode::ToolTarget
+            && builder.config.rpath_enabled(target)
+            && helpers::use_host_linker(target)
+        {
             let libdir = builder.sysroot_libdir_relative(compiler).to_str().unwrap();
-            let rpath = if target.contains("apple") {
-                // Note that we need to take one extra step on macOS to also pass
-                // `-Wl,-instal_name,@rpath/...` to get things to work right. To
-                // do that we pass a weird flag to the compiler to get it to do
-                // so. Note that this is definitely a hack, and we should likely
-                // flesh out rpath support more fully in the future.
-                self.rustflags.arg("-Zosx-rpath-install-name");
-                Some(format!("-Wl,-rpath,@loader_path/../{libdir}"))
-            } else if !target.is_windows()
-                && !target.contains("cygwin")
-                && !target.contains("aix")
-                && !target.contains("xous")
-            {
-                self.rustflags.arg("-Clink-args=-Wl,-z,origin");
-                Some(format!("-Wl,-rpath,$ORIGIN/../{libdir}"))
-            } else {
-                None
-            };
-            if let Some(rpath) = rpath {
-                self.rustflags.arg(&format!("-Clink-args={rpath}"));
-            }
+            let linker =
+                builder.config.target_config.get(&target).and_then(|c| c.linker.as_deref());
+            append_sysroot_rpath(
+                &mut self.rustflags,
+                target,
+                libdir,
+                configured_direct_linker(linker),
+            );
         }
 
         // We need to set host linker flags for compiling build scripts and proc-macros.
@@ -705,7 +929,7 @@ impl Cargo {
         // any fingerprint difference between host==target versus cross-compiled targets
         // when it comes to those host build artifacts.
         if let Some(host_linker) = builder.linker(compiler.host) {
-            let host = crate::envify(&compiler.host.triple);
+            let host = envify(&compiler.host.triple);
             self.command.env(format!("CARGO_TARGET_{host}_LINKER"), host_linker);
         }
         for arg in linker_flags(builder, compiler.host, LldThreads::Yes) {
@@ -713,7 +937,7 @@ impl Cargo {
         }
 
         if let Some(target_linker) = builder.linker(target) {
-            let target = crate::envify(&target.triple);
+            let target = envify(&target.triple);
             self.command.env(format!("CARGO_TARGET_{target}_LINKER"), target_linker);
         }
         // We want to set -Clinker using Cargo, therefore we only call `linker_flags` and not
@@ -730,7 +954,9 @@ impl Cargo {
                 // Do not enable Zlib compression on:
                 // - Windows, because MSVC/PDB doesn't support it
                 // - macOS, because its linker doesn't know the flag
-                if !self.target.is_windows() && !self.target.is_apple() {
+                // - Cygwin, because its linker may not support the flag
+                if !self.target.is_windows() && !self.target.is_apple() && !self.target.is_cygwin()
+                {
                     // If we link through cc, we need the -Wl prefix.
                     // If we don't, then we must not add it, because the linker wouldn't
                     // understand it.
@@ -785,10 +1011,40 @@ impl Cargo {
             let cc = ccacheify(&builder.cc(target));
             self.command.env(format!("CC_{triple_underscored}"), &cc);
 
-            // Extend `CXXFLAGS_$TARGET` with our extra flags.
+            // Compiling C deps, like jemalloc and llvm-wrapper, should be with
+            // the same LTO mode as the Rust code they are linked into.
+            //
+            // Std's C deps, e.g. compiler_builtins, ship inside rlibs that
+            // end users consume directly. Building with `-flto` may break
+            // non-LLVM linkers or mismatch on bitcode versions. Therefore we
+            // must not build std in LTO mode here.
+            let lto_cflag = if matches!(self.mode, Mode::Rustc | Mode::ToolRustcPrivate)
+                && is_lto_stage(&self.compiler)
+                && builder.cc_tool(target).is_like_clang()
+                // Exclude aarch64-linux as we can't assume the user has an LTO-capable linker
+                // (and these files get distributed in the rustc-dev component).
+                // FIXME: this means the argument above about doing this for rustc but not std makes
+                // no sense. We distribute rlibs for both, so both need to be linkable by users. I
+                // guess we just don't want to risk this for std, but are less worried about
+                // breaking rustc-dev.
+                && !target.starts_with("aarch64-unknown-linux")
+            {
+                match builder.config.rust_lto {
+                    RustcLto::Thin => Some("-flto=thin"),
+                    RustcLto::Fat => Some("-flto=full"),
+                    RustcLto::ThinLocal | RustcLto::Off => None,
+                }
+            } else {
+                None
+            };
+
+            // Extend `CFLAGS_$TARGET` with our extra flags.
             let env = format!("CFLAGS_{triple_underscored}");
-            let mut cflags =
-                builder.cc_unhandled_cflags(target, GitRepo::Rustc, CLang::C).join(" ");
+            let mut cflags = builder.cc_unhandled_cflags(target, CLang::C).join(" ");
+            if let Some(lto_cflag) = lto_cflag {
+                cflags.push(' ');
+                cflags.push_str(lto_cflag);
+            }
             if let Ok(var) = std::env::var(&env) {
                 cflags.push(' ');
                 cflags.push_str(&var);
@@ -808,8 +1064,11 @@ impl Cargo {
 
                 // Extend `CXXFLAGS_$TARGET` with our extra flags.
                 let env = format!("CXXFLAGS_{triple_underscored}");
-                let mut cxxflags =
-                    builder.cc_unhandled_cflags(target, GitRepo::Rustc, CLang::Cxx).join(" ");
+                let mut cxxflags = builder.cc_unhandled_cflags(target, CLang::Cxx).join(" ");
+                if let Some(lto_cflag) = lto_cflag {
+                    cxxflags.push(' ');
+                    cxxflags.push_str(lto_cflag);
+                }
                 if let Ok(var) = std::env::var(&env) {
                     cxxflags.push(' ');
                     cxxflags.push_str(&var);
@@ -854,6 +1113,20 @@ impl From<Cargo> for BootstrapCommand {
             cargo.args(s.split_whitespace());
         }
 
+        // Trust: extras and all supported inherited flag forms have now been
+        // folded in. Std retains its separate overflow policy.
+        if cargo.mode != Mode::Std {
+            checked_engine_flags(&cargo.rustflags.0)
+                .and_then(|()| checked_engine_flags(&cargo.rustdocflags.0))
+                .and_then(|()| {
+                    checked_engine_cargo_args(
+                        &cargo.args,
+                        cargo.command.get_current_dir().expect("bootstrap sets Cargo's directory"),
+                    )
+                })
+                .unwrap_or_else(|message| panic!("{message}"));
+        }
+
         cargo.command.args(cargo.args);
 
         // Unset any inherited flag variables (plain and encoded) so cargo uses only the flags
@@ -877,7 +1150,7 @@ impl From<Cargo> for BootstrapCommand {
         // variable is silently discarded by Cargo.
         if std::env::var_os("TRUST_FLYWHEEL").is_some() {
             panic!(
-                "TRUST_FLYWHEEL is retired: bootstrap has no authenticated proof session and cannot claim self-verification; use scripts/stage2_verify_self_build.sh for bounded compiler-crate evidence"
+                "TRUST_FLYWHEEL is retired: bootstrap has no authenticated proof session and cannot claim self-verification; use `targo trust verify self --full-verifier` for bounded compiler-crate evidence"
             );
         }
         // Same rung: a retired name that is still scrubbed in six places but read
@@ -947,46 +1220,16 @@ impl From<Cargo> for BootstrapCommand {
             cargo.build_compiler_stage,
         );
 
-        // Trust: the HOST half of the same decision. `rustflags` reaches only the
-        // TARGET units — bootstrap always passes `--target`, which is exactly why
-        // `apply_bootstrap_trust_verification_default`'s doc says host
-        // build-script/proc-macro units "keep going through the shim's
-        // `TRUST_BOOTSTRAP_SHIM_NO_VERIFY` lane". That lane was set in ONE place:
-        // `test.rs`'s `CargoTest` step. So a host unit compiled by a stage>=1
-        // trustc during any OTHER step got neither switch and was verified by
-        // default.
-        //
-        // Measured 2026-08-23: this is what made `targo trust domination
-        // upstream-tests --release --execute` return 15 tool build failures —
-        // `object`/`proc-macro2`/`libc` build scripts and the `memchr`/`autocfg`
-        // host libs, failing on unproved coverage inside "Building stage2 compiler
-        // artifacts". `memchr` identifies the mechanism: CLAUDE.md's "Why targo,
-        // not stock cargo?" describes precisely this — third-party code entering
-        // verification scope and dying in memchr's SIMD paths.
-        //
-        // Setting the MARKER rather than pushing `-Ztrust-verify=off` into
-        // hostflags is deliberate: the marker is capability-checked downstream by
-        // `trust_bootstrap_no_verify_applies`, which consults
-        // `no_target_driver_supports_no_verify` before the flag is added, so a
-        // stage0 snapshot rustc that rejects `-Z` never receives it. A raw
-        // hostflag would bypass that check.
-        //
-        // Scope is deliberately identical to the target-side default, including
-        // the `stage != 0` guard, so the two halves cannot drift: bootstrap's own
-        // units are not self-proving in either lane. The per-unit `library/`
-        // opt-in above is unaffected — it rides
-        // `TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS_ENV`, which
-        // `trust_bootstrap_verify_unit_applies` consults FIRST and which wins
-        // over this off-switch.
-        // The guard is the `stage != 0` half of
-        // `bootstrap_disables_default_trust_verification` and NOT its
-        // rustflags half: that half exists only to avoid duplicating a flag
-        // already present in rustflags, and rustflags do not reach host units,
-        // so a host unit needs the marker whether or not the target lane
-        // already carries the switch.
-        if cargo.build_compiler_stage != 0 {
-            cargo.command.env("TRUST_BOOTSTRAP_SHIM_NO_VERIFY", "1");
-        }
+        // Trust: the HOST half uses the marker already set above, at every
+        // compiler stage. Cargo omits target rustflags (including a modern
+        // seed's RUSTFLAGS_BOOTSTRAP) from explicit-target host dependencies.
+        // The marker expresses intent, not driver capability: the shim must
+        // admit the concrete snapshot's host capability and use its existing
+        // version-invariant environment transport. Raw hostflags could instead
+        // hand an old or stock seed a Trust option it cannot parse.
+        // The separately authorized per-unit library opt-in takes precedence
+        // in the shim. Its authenticated-frontend, real-compile and query guards
+        // remain responsible for the exact scope of the marker.
 
         if !cargo.rustflags.0.is_empty() {
             let (var, value) =
@@ -1001,6 +1244,9 @@ impl From<Cargo> for BootstrapCommand {
         }
 
         let encoded_hostflags = cargo.hostflags.encode();
+        // Trust: this is bootstrap-internal IPC, not a caller override. In
+        // particular, an empty internal list must not inherit unchecked flags.
+        cargo.command.env_remove("RUSTC_HOST_FLAGS");
         if !encoded_hostflags.is_empty() {
             cargo.command.env("RUSTC_HOST_FLAGS", encoded_hostflags);
         }
@@ -1017,39 +1263,353 @@ impl From<Cargo> for BootstrapCommand {
     }
 }
 
-/// Does this cargo binary implement Targo's two-lane policy (`--unverified`)?
-///
-/// Cached for the process: bootstrap constructs a great many cargo commands and
-/// the answer cannot change mid-run.
-///
-/// Detected by asking the binary itself rather than by version-sniffing, so the
-/// check stays correct across seed refreshes. A binary that does not mention the
-/// flag is treated as predating the policy and is invoked exactly as before —
-/// that is what keeps an older bootstrap seed usable.
-fn targo_supports_unverified_lane(cargo: &std::path::Path) -> bool {
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        std::process::Command::new(cargo)
-            .arg("--help")
-            .output()
-            .map(|out| {
-                let text = String::from_utf8_lossy(&out.stdout).into_owned()
-                    + &String::from_utf8_lossy(&out.stderr);
-                text.contains("--unverified")
-            })
-            .unwrap_or(false)
-    })
+// Trust: a private dependency edge, never a configuration/authority override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CargoInput {
+    Seed,
+    // Trust: an actual original Full owner executes this control SDK driver
+    // in its library. It does not impersonate seed or produced Cargo.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    OriginalControl,
+    CurrentBuildTool,
+    // Trust: native compiler units may use the produced Targo's owned test queue.
+    CurrentNativeUnitTests,
+    // Native artifact-only tools use the current Cargo generation with the
+    // actual snapshot's std and flags, independently of local-rebuild detection.
+    CurrentBuildToolSnapshotStd,
+}
+
+impl CargoInput {
+    pub(crate) fn for_original(self, session: &crate::core::session::Session) -> Self {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if self == Self::Seed && session.original_compilation().is_some() {
+            return Self::OriginalControl;
+        }
+        let _ = session;
+        self
+    }
+
+    pub(crate) fn is_original_control(self) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if self == Self::OriginalControl {
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn uses_snapshot_compiler(self) -> bool {
+        matches!(self, Self::Seed | Self::CurrentBuildToolSnapshotStd) || self.is_original_control()
+    }
+    pub(crate) fn for_mode(mode: Mode) -> Self {
+        match mode {
+            // Bootstrap utilities remain seed-built prerequisites.
+            Mode::ToolBootstrap => Self::Seed,
+            _ => Self::CurrentBuildTool,
+        }
+    }
+
+    fn uses_current_build_tool(self) -> bool {
+        matches!(
+            self,
+            Self::CurrentBuildTool
+                | Self::CurrentBuildToolSnapshotStd
+                | Self::CurrentNativeUnitTests
+        )
+    }
+
+    /// Trust: cache formats belong to the selected Cargo generation. Preserve
+    /// the actual build mode and flags; this projection is used only for output
+    /// paths. The native Cargo producer is a ToolTarget recipe run by the seed,
+    /// so it must share the seed prerequisites' domain, not its consumers'.
+    pub(crate) fn cache_mode(self, mode: Mode) -> Mode {
+        match (self, mode) {
+            (Self::Seed, Mode::ToolTarget) => Mode::ToolBootstrap,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            (Self::OriginalControl, Mode::ToolTarget) => Mode::ToolBootstrap,
+            _ => mode,
+        }
+    }
+}
+
+// Trust: what a Cargo command gets of the GNU jobserver Bootstrap inherited
+// (BOOTSTRAP-JOBSERVER-PROBE-1).
+//
+// A FIFO survives Trust std's strip of non-stdio descriptors, so an inherited
+// one is forwarded unchanged. A numeric pipe does not, so it is stripped. The
+// seed Cargo may predate CARGO_JOBSERVER_HANDOFF (29ebb403de and earlier): with
+// no FIFO it gives build scripts a numeric pipe that their compiler probes
+// reach closed, and the shim refuses them. So the seed Cargo gets Bootstrap's
+// own FIFO. The current Targo hands build scripts a recoverable pipe
+// (CARGO_JOBSERVER_HANDOFF), so its inputs keep the strip.
+//
+// One exception: under an enclosing owner's dispatch (the embedded engine's
+// protected scope, the macOS hosted graph) every command is handed that
+// owner's transport when it starts, over whatever MAKEFLAGS it carries, so the
+// seed Cargo there gets no FIFO of Bootstrap's (`enclosing_owner_transport`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MakeflagsPolicy {
+    ForwardInherited,
+    Strip,
+    #[cfg(unix)]
+    SeedFifo,
+}
+
+pub(crate) fn makeflags_policy(
+    inherited: Option<&std::ffi::OsStr>,
+    input: CargoInput,
+    enclosing_owner_transport: bool,
+) -> MakeflagsPolicy {
+    let inherited_fifo = inherited
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|flags| flags.contains("--jobserver-auth=fifo:"));
+    if inherited_fifo {
+        return MakeflagsPolicy::ForwardInherited;
+    }
+    #[cfg(unix)]
+    if input == CargoInput::Seed && !enclosing_owner_transport {
+        return MakeflagsPolicy::SeedFifo;
+    }
+    #[cfg(not(unix))]
+    let _ = (input, enclosing_owner_transport);
+    MakeflagsPolicy::Strip
+}
+
+// Trust: whether this process's commands start under an enclosing owner's
+// dispatch, which configures that owner's GNU transport on each one
+// (`metadata_scheduler::prepare_producer`, `host_graph::output`). A scope that
+// can no longer be upgraded refuses every start, so it counts too.
+fn enclosing_owner_transport() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        !matches!(crate::utils::exec::protected_scope(), Ok(None))
+            || crate::utils::metadata_scheduler::hosted_graph_active()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+// Trust: capabilities belong to the exact executable spelling (including argv0),
+// not a process-wide seed answer shared with the newly compiled Cargo.
+#[derive(Clone, Debug)]
+pub(crate) struct CargoProgram {
+    pub(crate) path: PathBuf,
+    pub(crate) unverified_lane: bool,
+    pub(crate) metadata_flag: &'static str,
+}
+
+impl CargoProgram {
+    // Trust: compatibility consumers retain their exact existing program and
+    // never depend on native probing. Only the explicit native unit input probes.
+    fn for_current_input(
+        &self,
+        exec_ctx: &ExecutionContext,
+        native_path: PathBuf,
+        input: CargoInput,
+    ) -> Self {
+        match input {
+            CargoInput::CurrentNativeUnitTests => Self::probe_native(exec_ctx, native_path),
+            CargoInput::CurrentBuildTool | CargoInput::CurrentBuildToolSnapshotStd => self.clone(),
+            _ => unreachable!("prerequisite driver selection is separate from the current tool"),
+        }
+    }
+
+    // Trust: native test scheduling requires the actual produced Targo spelling,
+    // successful branding probe and explicit lane, never a compatibility fallback.
+    pub(crate) fn probe_native(exec_ctx: &ExecutionContext, path: PathBuf) -> Self {
+        if !exec_ctx.dry_run() {
+            let help = command(&path).allow_failure().arg("--help").cached().run_capture(exec_ctx);
+            assert!(help.is_success(), "native Targo at {} --help failed", path.display());
+        }
+        let program = Self::probe(exec_ctx, path);
+        assert!(
+            exec_ctx.dry_run() || program.unverified_lane,
+            "native compiler unit tests require produced Targo branding at {}",
+            program.path.display(),
+        );
+        program
+    }
+
+    pub(crate) fn probe(exec_ctx: &ExecutionContext, path: PathBuf) -> Self {
+        if exec_ctx.dry_run() {
+            return Self { path, unverified_lane: false, metadata_flag: "-Zembed-metadata=no" };
+        }
+        // These source-owned inputs are immutable during an admitted build.
+        // The existing execution cache keys the literal program, arguments and
+        // explicit environment; never canonicalize cargo/targo hard-link names.
+        let output = command(&path).allow_failure().arg("--help").cached().run_capture(exec_ctx);
+        let unverified_lane = output
+            .stdout_if_present()
+            .into_iter()
+            .chain(output.stderr_if_present())
+            .any(|text| text.contains("--unverified"));
+        let mut probe = command(&path).allow_failure();
+        if unverified_lane {
+            probe.arg("--unverified");
+        }
+        let output =
+            probe.args(["-Z", "help"]).env("RUSTC_BOOTSTRAP", "1").cached().run_capture(exec_ctx);
+        // Trust: stdout from a failed probe grants no metadata capability,
+        // including when this execution context delays command failures.
+        assert!(
+            output.is_success(),
+            "Cargo at {} -Z help failed while probing separate-metadata support: {}",
+            path.display(),
+            output.stderr(),
+        );
+        // Preserve either help stream while binding the capability to this executable.
+        let help = format!("{}\n{}", output.stdout(), output.stderr());
+        let metadata_flag = no_embed_metadata_flag_from_help(&help).unwrap_or_else(|| {
+            panic!(
+                "Cargo at {} supports neither -Zembed-metadata=no nor -Zno-embed-metadata",
+                path.display(),
+            )
+        });
+        Self { path, unverified_lane, metadata_flag }
+    }
+}
+
+// Trust: Cargo renamed `-Zno-embed-metadata` to `-Zembed-metadata=no`
+// after the shipped Trust stage0. Both request the same split rlib/rmeta
+// artifacts that bootstrap requires. Ask the actual seed rather than deriving
+// its capabilities from the compiler's version (the two may be refreshed
+// independently), and never silently omit the metadata policy.
+fn no_embed_metadata_flag_from_help(help: &str) -> Option<&'static str> {
+    let advertises = |name| {
+        help.lines().any(|line| {
+            let mut words = line.split_whitespace();
+            words.next() == Some("-Z") && words.next() == Some(name)
+        })
+    };
+    if advertises("embed-metadata") {
+        Some("-Zembed-metadata=no")
+    } else if advertises("no-embed-metadata") {
+        Some("-Zno-embed-metadata")
+    } else {
+        None
+    }
+}
+
+// Trust: whether a compiler whose `-vV` is `version` borrow-checks with Polonius
+// unless told otherwise. A Trust compiler (`(trustc ...)` on the first line) of
+// release 1.101 or later does: its `trust` channel takes upstream nightly's
+// defaults (PERF-SEP26-DEFAULTS), and its `-Zpolonius` knows `off` (1.98 and
+// earlier reject `off`; a 1.101 Trust compiler built before that ruling only
+// gets a flag it already obeys). A stock beta or stable does not. `-vV`, not
+// `-Z help`: in a strict custody context a Trust compiler answers only fixed
+// metadata queries (CUSTODY-BOUNDED-QUERY-SPELLINGS-1).
+fn compiler_defaults_to_polonius(version: &str) -> bool {
+    let trust = version
+        .lines()
+        .next()
+        .is_some_and(|line| line.starts_with("rustc ") && line.contains("(trustc "));
+    let at_least_1_101 =
+        version.lines().find_map(|line| line.strip_prefix("release: ")).and_then(|release| {
+            let mut parts = release.split(['.', '-']);
+            let major: u32 = parts.next()?.parse().ok()?;
+            let minor: u32 = parts.next()?.parse().ok()?;
+            Some((major, minor) >= (1, 101))
+        });
+    trust && at_least_1_101 == Some(true)
 }
 
 impl Builder<'_> {
+    pub(crate) fn cargo_input(&self, mode: Mode) -> CargoInput {
+        CargoInput::for_mode(mode).for_original(self.sess)
+    }
+
+    // Trust: command writers and artifact readers must use the SAME selected
+    // Cargo generation. The control library cannot share seed fingerprints.
+    pub(crate) fn cargo_stage_out(
+        &self,
+        compiler: Compiler,
+        mode: Mode,
+        input: CargoInput,
+    ) -> PathBuf {
+        let ordinary = self.stage_out(compiler, input.cache_mode(mode));
+        if input.is_original_control() {
+            ordinary.with_file_name("bootstrap-control-tools")
+        } else {
+            ordinary
+        }
+    }
+
+    pub(crate) fn cargo_out_for_input(
+        &self,
+        compiler: Compiler,
+        mode: Mode,
+        target: TargetSelection,
+        input: CargoInput,
+    ) -> PathBuf {
+        self.cargo_stage_out(compiler, mode, input)
+            .join(target)
+            .join(self.cargo_dir(input.cache_mode(mode)))
+    }
+
+    // Trust: whether the stage0 compiler borrow-checks with Polonius by default
+    // (cached per execution context).
+    fn stage0_defaults_to_polonius(&self) -> bool {
+        if self.config.dry_run() {
+            return false;
+        }
+        let output = command(&self.initial_rustc)
+            .allow_failure()
+            .arg("-vV")
+            .cached()
+            .run_capture(self.config.exec_ctx());
+        assert!(
+            output.is_success(),
+            "stage0 compiler at {} -vV failed while reading its borrow-checker default: {}",
+            self.initial_rustc.display(),
+            output.stderr(),
+        );
+        compiler_defaults_to_polonius(&output.stdout())
+    }
+}
+
+impl Builder<'_> {
+    // Trust: Session.initial_cargo continues to name only the pinned seed.
+    pub(crate) fn build_cargo_program(&self, input: CargoInput) -> CargoProgram {
+        match input {
+            CargoInput::Seed => {
+                CargoProgram::probe(self.config.exec_ctx(), self.initial_cargo.clone())
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CargoInput::OriginalControl => {
+                CargoProgram::probe(self.config.exec_ctx(), t!(self.sess.original_control_targo()))
+            }
+            CargoInput::CurrentBuildTool
+            | CargoInput::CurrentBuildToolSnapshotStd
+            | CargoInput::CurrentNativeUnitTests => {
+                let tool = self.ensure(TargoBuildTool::native(self));
+                tool.cargo.for_current_input(self.config.exec_ctx(), tool.native_path, input)
+            }
+        }
+    }
+
     /// Like [`Builder::cargo`], but only passes flags that are valid for all commands.
     #[track_caller]
-    pub fn bare_cargo(
+    pub(crate) fn bare_cargo(
         &self,
         compiler: Compiler,
         mode: Mode,
         target: TargetSelection,
         cmd_kind: Kind,
+    ) -> BootstrapCommand {
+        let input = self.cargo_input(mode);
+        let program = self.build_cargo_program(input);
+        self.bare_cargo_with_program(compiler, mode, target, cmd_kind, &program, input)
+    }
+
+    fn bare_cargo_with_program(
+        &self,
+        compiler: Compiler,
+        mode: Mode,
+        target: TargetSelection,
+        cmd_kind: Kind,
+        program: &CargoProgram,
+        input: CargoInput,
     ) -> BootstrapCommand {
         let mut cargo = match cmd_kind {
             Kind::Clippy => {
@@ -1068,7 +1628,7 @@ impl Builder<'_> {
                 cargo
             }
             _ => {
-                let mut cargo = command(&self.initial_cargo);
+                let mut cargo = command(&program.path);
                 // Targo's two-lane policy: a targo new enough to have it REFUSES a
                 // bare `targo build`, because that would mint an artifact carrying
                 // no proof claim while looking like it might. Bootstrap builds the
@@ -1079,13 +1639,25 @@ impl Builder<'_> {
                 // Probed once rather than assumed, so a seed targo that predates
                 // the policy keeps working: passing it an unknown global flag
                 // would be a hard error. Costs one `--help` per bootstrap run.
-                if targo_supports_unverified_lane(&self.initial_cargo) {
+                if program.unverified_lane {
                     cargo.arg("--unverified");
                 }
                 cargo.arg(cmd_kind.as_str());
                 cargo
             }
         };
+        // Trust: the native compiler-unit input requires the managed test owner.
+        // Normal x.py scrubs ambient Cargo settings; select this existing queue
+        // explicitly instead of depending on inherited configuration. Two is the
+        // minimum guaranteed queue selector, not an extra CPU grant: its actual
+        // concurrency still respects the admitted build-job ceiling.
+        if input == CargoInput::CurrentNativeUnitTests {
+            assert_eq!(cmd_kind, Kind::Test);
+            cargo.args(["--config", "build.test-jobs=2", "--config", "build.test-weight=1"]);
+        }
+        // Trust: cargo-clippy/miri and nested build scripts must use the same
+        // selected executable and compatibility identity as this invocation.
+        cargo.env("CARGO", &program.path);
 
         // Optionally suppress cargo output.
         if self.config.quiet {
@@ -1096,7 +1668,7 @@ impl Builder<'_> {
         // This matters when using vendoring and the working directory is outside the repository.
         cargo.current_dir(&self.src);
 
-        let out_dir = self.stage_out(compiler, mode);
+        let out_dir = self.cargo_stage_out(compiler, mode, input);
         cargo.env("CARGO_TARGET_DIR", &out_dir);
 
         // Bootstrap makes a lot of assumptions about the artifacts produced in the target
@@ -1112,7 +1684,7 @@ impl Builder<'_> {
         // from out of tree it shouldn't matter, since x.py is only used for
         // building in-tree.
         let color_logs = ["RUSTDOC_LOG_COLOR", "RUSTC_LOG_COLOR", "RUST_LOG_COLOR"];
-        match self.build.config.color {
+        match self.sess.config.color {
             Color::Always => {
                 cargo.arg("--color=always");
                 for log in &color_logs {
@@ -1138,16 +1710,51 @@ impl Builder<'_> {
         // "invalid file descriptor" errors, as the jobserver file descriptors are not inherited by
         // scripts like bootstrap.py, while the environment variable is propagated. So, we pass
         // MAKEFLAGS only if we detect a FIFO jobserver, otherwise we clear it.
-        let has_modern_jobserver = env::var("MAKEFLAGS")
-            .map(|flags| flags.contains("--jobserver-auth=fifo:"))
-            .unwrap_or(false);
-
-        if !has_modern_jobserver {
-            cargo.env_remove("MAKEFLAGS");
-            cargo.env_remove("MFLAGS");
-        }
+        // Trust: and a seed Cargo that inherits none gets Bootstrap's own FIFO
+        // (BOOTSTRAP-JOBSERVER-PROBE-1, `makeflags_policy`).
+        self.apply_makeflags_policy(&mut cargo, env::var_os("MAKEFLAGS").as_deref(), input);
 
         cargo
+    }
+
+    // Trust: one decision per Cargo command, from the MAKEFLAGS Bootstrap inherited.
+    pub(crate) fn apply_makeflags_policy(
+        &self,
+        cargo: &mut BootstrapCommand,
+        inherited: Option<&std::ffi::OsStr>,
+        input: CargoInput,
+    ) {
+        match makeflags_policy(inherited, input, enclosing_owner_transport()) {
+            MakeflagsPolicy::ForwardInherited => {}
+            MakeflagsPolicy::Strip => {
+                cargo.env_remove("MAKEFLAGS");
+                cargo.env_remove("MFLAGS");
+            }
+            #[cfg(unix)]
+            MakeflagsPolicy::SeedFifo => self.seed_jobserver().configure(cargo),
+        }
+    }
+
+    // Trust: this builder's seed jobserver, made on first use. A dry run makes
+    // one too: a command marked to run in a dry run still needs it. Stale
+    // servers are removed only by a build that holds the build lock.
+    #[cfg(unix)]
+    fn seed_jobserver(&self) -> &crate::utils::seed_jobserver::SeedJobserver {
+        self.seed_jobserver.get_or_init(|| {
+            let parent = self.tempdir();
+            let remove_stale = !self.config.dry_run() && !self.config.bypass_bootstrap_lock;
+            crate::utils::seed_jobserver::SeedJobserver::for_build(
+                &parent,
+                self.jobs(),
+                remove_stale,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "cannot create the seed Cargo's FIFO jobserver under {}: {error}",
+                    parent.display()
+                )
+            })
+        })
     }
 
     /// This will create a [`BootstrapCommand`] that represents a pending execution of cargo. This
@@ -1164,26 +1771,37 @@ impl Builder<'_> {
         target: TargetSelection,
         cmd_kind: Kind,
     ) -> Cargo {
-        let mut cargo = self.bare_cargo(compiler, mode, target, cmd_kind);
-        let out_dir = self.stage_out(compiler, mode);
+        self.cargo_with_input(compiler, mode, source_type, target, cmd_kind, self.cargo_input(mode))
+    }
+
+    // Trust: configure one selected program once for both invocation and flags.
+    #[expect(clippy::too_many_arguments)]
+    fn cargo_with_input(
+        &self,
+        compiler: Compiler,
+        mode: Mode,
+        source_type: SourceType,
+        target: TargetSelection,
+        cmd_kind: Kind,
+        input: CargoInput,
+    ) -> Cargo {
+        let program = self.build_cargo_program(input);
+        let mut cargo =
+            self.bare_cargo_with_program(compiler, mode, target, cmd_kind, &program, input);
+        let out_dir = self.cargo_stage_out(compiler, mode, input);
 
         let mut hostflags = HostFlags::default();
 
-        // Cargo's new build-dir layout places every final artifact in a
-        // package/hash-specific `build/<pkg>/<hash>/out` directory.  Cargo's
-        // test runner does not add those dynamically-created directories to
-        // the target process's dylib search path.  That is fatal for compiler
-        // unit tests: a rustc_private test links `librustc_driver`, then dyld
-        // cannot find the just-built hashed dylib at execution time.  The
-        // traditional layout keeps dylibs in `deps`, which Cargo does put on
-        // the test process search path.  Keep compiler tests on that supported
-        // layout until Cargo teaches target_process about new-layout out dirs;
-        // all non-test builds retain the cache-friendly new layout.
-        let use_new_build_dir_layout = !(cmd_kind == Kind::Test && mode == Mode::Rustc);
-        cargo.env(
-            "CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT",
-            if use_new_build_dir_layout { "true" } else { "false" },
-        );
+        // Trust: the stage0 Cargo's experimental layout adds every unit's
+        // package/hash directory to the dynamic-library search path. Large
+        // compiler and rustc-private tool graphs exceed Linux's per-environment
+        // string limit before rustc can start (E2BIG). The traditional layout
+        // keeps this search path bounded by using shared `deps` directories,
+        // and also preserves compiler tests' runtime lookup of rustc_driver.
+        // Fine-grain locking implicitly re-enables the experimental layout,
+        // so both controls must agree until stage0 supports bounded unit paths.
+        cargo.env("CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT", "false");
+        cargo.env("CARGO_UNSTABLE_FINE_GRAIN_LOCKING", "false");
 
         // Codegen backends are not yet tracked by -Zbinary-dep-depinfo,
         // so we need to explicitly clear out if they've been updated.
@@ -1196,6 +1814,12 @@ impl Builder<'_> {
         }
 
         if cmd_kind == Kind::Doc {
+            // Will be stabilized soon -> let's dogfood it.
+            // No effect on doc output but massive doc-generation time improvements.
+            cargo.arg("-Zrustdoc-mergeable-info");
+
+            // FIXME: remove this directory clearing here, and do it explicitly in individua doc
+            // steps, to reduce dependency on implicit doc output paths.
             let my_out = match mode {
                 // This is the intended out directory for compiler documentation.
                 Mode::Rustc | Mode::ToolRustcPrivate | Mode::ToolBootstrap | Mode::ToolTarget => {
@@ -1223,23 +1847,21 @@ impl Builder<'_> {
             cargo.env("REAL_LIBRARY_PATH", e);
         }
 
-        // Set a flag for `check`/`clippy`/`fix`, so that certain build
-        // scripts can do less work (i.e. not building/requiring LLVM).
-        if matches!(cmd_kind, Kind::Check | Kind::Clippy | Kind::Fix) {
-            // If we've not yet built LLVM, or it's stale, then bust
-            // the rustc_llvm cache. That will always work, even though it
-            // may mean that on the next non-check build we'll need to rebuild
-            // rustc_llvm. But if LLVM is stale, that'll be a tiny amount
-            // of work comparatively, and we'd likely need to rebuild it anyway,
-            // so that's okay.
-            if crate::core::build_steps::llvm::prebuilt_llvm_config(self, target, false)
-                .should_build()
-            {
-                cargo.env("RUST_CHECK", "1");
-            }
+        // Forward `./x fix --allow-dirty` from bootstrap to cargo.
+        if matches!(cmd_kind, Kind::Fix)
+            && let Subcommand::Fix { allow_dirty } = self.config.cmd
+            && allow_dirty
+        {
+            cargo.arg("--allow-dirty");
         }
 
-        let build_compiler_stage = if compiler.stage == 0 && self.local_rebuild {
+        // Trust: exact native artifact roles use the raw snapshot for stage,
+        // flags and shim IPC as well as std, even under auto local-rebuild.
+        // Their Cargo generation remains the independently selected input.
+        let snapshot_tool = input.uses_snapshot_compiler()
+            && mode == Mode::ToolTarget
+            && compiler.is_snapshot(self);
+        let build_compiler_stage = if compiler.stage == 0 && self.local_rebuild && !snapshot_tool {
             // Assume the local-rebuild rustc already has stage1 features.
             1
         } else {
@@ -1252,6 +1874,12 @@ impl Builder<'_> {
             // may have a different target-specific bootstrap override.
             self.config.default_codegen_backend(compiler.host),
         );
+        let trust_ir_cg_is_active = trust_ir_cg_codegen_is_active(
+            build_compiler_stage,
+            self.config.default_codegen_backend(compiler.host),
+        );
+        // Profile constraints shared by both narrow Trust backends.
+        let narrow_trust_backend_is_active = trust_cg_is_active || trust_ir_cg_is_active;
 
         // We synthetically interpret a stage0 compiler used to build tools as a
         // "raw" compiler in that it's the exact snapshot we download. For things like
@@ -1337,9 +1965,18 @@ impl Builder<'_> {
         // `rustflags` without `cargo` making it required.
         rustflags.arg("-Zunstable-options");
 
-        // Add parallel frontend threads configuration
+        // Explicit configuration retains its existing argv, including config0.
+        // A seed Cargo route has no Targo frontend planner. Publish stable local
+        // potential; the concrete shim alone decides seed/off/query eligibility
+        // and requires an actual inherited GNU scheduler before using it.
+        cargo.env_remove(BOOTSTRAP_FRONTEND_CEILING_ENV);
         if let Some(threads) = self.config.rust_parallel_frontend_threads {
             rustflags.arg(&format!("-Zthreads={threads}"));
+        } else if let Some(ceiling) = bootstrap_seed_frontend_ceiling(
+            self.config.rust_parallel_frontend_threads,
+            std::thread::available_parallelism().ok().map(std::num::NonZeroUsize::get),
+        ) {
+            cargo.env(BOOTSTRAP_FRONTEND_CEILING_ENV, ceiling.to_string());
         }
 
         for (restricted_mode, name, values) in EXTRA_CHECK_CFGS {
@@ -1368,6 +2005,19 @@ impl Builder<'_> {
         // but this breaks CI. At the very least, stage0 `rustdoc` needs `--cfg bootstrap`. See
         // #71458.
         let mut rustdocflags = rustflags.clone();
+
+        // Trust: D12's double compile replaces the stage0 compiler with a stock
+        // oracle, whose borrow checker is NLL. A Trust stage0 defaults to Polonius
+        // alpha (the `trust` channel; DECISION_QUEUE.md PERF-SEP26-DEFAULTS) and
+        // accepts programs NLL rejects, so without this such code builds here and
+        // first fails at the cut. A stock stage0 already borrow-checks with NLL
+        // (and an old one rejects `-Zpolonius=off`), so it gets nothing.
+        // Std is outside it: the double compile builds std with stage 1, never with
+        // the oracle.
+        if compiler.stage == 0 && mode != Mode::Std && self.stage0_defaults_to_polonius() {
+            rustflags.arg("-Zpolonius=off");
+            hostflags.arg("-Zpolonius=off");
+        }
 
         match mode {
             Mode::Std | Mode::ToolBootstrap | Mode::ToolStd | Mode::ToolTarget => {}
@@ -1441,6 +2091,23 @@ impl Builder<'_> {
 
         // Make cargo emit diagnostics relative to the rustc src dir.
         cargo.arg(format!("-Zroot-dir={}", self.src.display()));
+
+        // Trust: in-tree Targo records paths under this tree's roots (its sources and its
+        // git directory) as tokens, so that a stage 1 cloned into another worktree
+        // (`utils::trust_stage1_seed`, EW-9) is checked against that worktree's files.
+        // The seed Cargo has no such flag.
+        if input.uses_current_build_tool()
+            && let Some(roots) = crate::utils::trust_stage1_seed::relocation_roots(&self.src)
+        {
+            cargo.arg(format!("-Ztrust-relocation-roots={roots}"));
+        }
+        // Trust: and reads the times a seed carried from the donor for the inputs of the
+        // units it cloned (EW-9), only in the target directories it cloned.
+        if input.uses_current_build_tool()
+            && let Some(table) = crate::utils::trust_stage1_seed::carried_times(&out_dir)
+        {
+            cargo.arg(format!("-Ztrust-carried-times={}", table.display()));
+        }
 
         if self.config.compile_time_deps {
             // Build only build scripts and proc-macros for rust-analyzer when requested.
@@ -1519,7 +2186,7 @@ impl Builder<'_> {
         // Avoid doing this during dry run as that usually means the relevant
         // compiler is not yet linked/copied properly.
         //
-        // Only clear out the directory if we're compiling std; otherwise, we
+        // Only clear out the directory if we're running Cargo on std; otherwise, we
         // should let Cargo take care of things for us (via depdep info)
         // Trust: `Kind::Test` must clear too. The reasoning above justifies only the `Mode::Std`
         // half -- cargo cannot see that the real rustc changed, because it thinks rustc is
@@ -1534,8 +2201,33 @@ impl Builder<'_> {
         // all, and the release gate's log carried 16x `E0514: found crate 'core' compiled by an
         // incompatible version of rustc` with `cannot resolve a prelude import` on the next line
         // -- which was the entire "missing prelude" symptom.
-        if !self.config.dry_run() && std_out_dir_needs_clear(mode, cmd_kind) {
-            build_stamp::clear_if_dirty(self, &out_dir, &self.rustc(compiler));
+        //
+        // When --keep-stage[-std] is passed, two things can happen:
+        // - Either this function is not invoked on `std` at all, because the corresponding Std step
+        //   checks the flag and doesn't invoke Cargo for std at all.
+        // - This function is invoked, in which case it will (most likely) do a no-op stdlib
+        //   rebuild.
+        //
+        // In the second situation, we must ensure that we will not clear the standard library
+        // output directory, otherwise --keep-stage[-std] will of course break.
+        // Note that the compiler stage corresponds to the standard library stage.
+        let keep_previously_built_std = self.config.keep_stage.contains(&compiler.stage)
+            || self.config.keep_stage_std.contains(&compiler.stage);
+        if !self.config.dry_run()
+            && std_out_dir_needs_clear(mode, cmd_kind)
+            && !keep_previously_built_std
+        {
+            // Trust: rustc can be a stable thin launcher while its loaded
+            // librustc_driver changes. Cargo no longer persists its `-vV` answer
+            // (CARGO_CACHE_RUSTC_INFO below), so a changed version string rebuilds
+            // every domain; this clear additionally ties std to the runtime's bytes,
+            // which can change while the version string does not.
+            let identity = std_compiler_runtime_identity(self, compiler);
+            if t!(build_stamp::clear_if_identity_changed(&out_dir, &identity)) {
+                self.do_if_verbose(|| {
+                    println!("Cleared `{}` for the selected compiler runtime", out_dir.display());
+                });
+            }
         }
 
         let rustdoc_path = match cmd_kind {
@@ -1553,15 +2245,13 @@ impl Builder<'_> {
         // These variables are primarily all read by
         // src/bootstrap/bin/{rustc.rs,rustdoc.rs}
         cargo
-            .env("RUSTBUILD_NATIVE_DIR", self.native_dir(target))
             .env("RUSTC_REAL", self.rustc(compiler))
             .env("RUSTC_STAGE", build_compiler_stage.to_string())
             .env("RUSTC_SYSROOT", sysroot)
             .env("RUSTC_LIBDIR", &libdir)
             .env("RUSTDOC_LIBDIR", libdir)
             .env("RUSTDOC", self.bootstrap_out.join("rustdoc"))
-            .env("RUSTDOC_REAL", rustdoc_path)
-            .env("RUSTC_ERROR_METADATA_DST", self.extended_error_dir());
+            .env("RUSTDOC_REAL", rustdoc_path);
 
         if self.config.rust_break_on_ice {
             cargo.env("RUSTC_BREAK_ON_ICE", "1");
@@ -1574,6 +2264,18 @@ impl Builder<'_> {
         cargo.env("RUSTC_WRAPPER", self.bootstrap_out.join("rustc"));
         // NOTE: we also need to set RUSTC so cargo can run `rustc -vV`; apparently that ignores RUSTC_WRAPPER >:(
         cargo.env("RUSTC", self.bootstrap_out.join("rustc"));
+        // Trust: RUSTC is this shim, never the compiler it runs (RUSTC_REAL, or RUSTC_SNAPSHOT
+        // for host units, `bin/rustc.rs`). Cargo persists its compiler queries in
+        // `<build-dir>/.rustc_info.json` (`-vV` and the target-info probes, failed answers
+        // included) and reuses them while RUSTC and RUSTC_WRAPPER keep their path, size and
+        // times (`rustc_fingerprint`). A driver rebuilt behind the unchanged shim was therefore
+        // answered with the previous driver's `-vV`; every unit fingerprint (whose `rustc` field
+        // is that text) still matched, so units the old driver built were kept, and std's
+        // consumers failed E0514. The std runtime-identity clear below covered std Build/Test
+        // only, never keep-stage runs, std Check/Doc/Clippy or any other domain. Asking the
+        // compiler once per Cargo invocation closes it for all of them; both the pinned seed
+        // Cargo and the current one honor this variable. (TG16, docs/DECISION_QUEUE.md.)
+        cargo.env("CARGO_CACHE_RUSTC_INFO", "0");
 
         // Someone might have set some previous rustc wrapper (e.g.
         // sccache) before bootstrap overrode it. Respect that variable.
@@ -1608,7 +2310,7 @@ impl Builder<'_> {
         // and can make an audited Trust-CG build impossible before the backend
         // sees user code.
         let debuginfo_level =
-            effective_debuginfo_level(trust_cg_is_active, requested_debuginfo_level);
+            effective_debuginfo_level(narrow_trust_backend_is_active, requested_debuginfo_level);
         cargo.env(profile_var("DEBUG"), debuginfo_level.to_string());
         if let Some(opt_level) = &self.config.rust_optimize.get_opt_level() {
             cargo.env(profile_var("OPT_LEVEL"), opt_level);
@@ -1693,42 +2395,28 @@ impl Builder<'_> {
         //
         // Keep this scheme in sync with `rustc_metadata::rmeta::decoder`'s
         // `try_to_translate_virtual_to_real`.
-        //
-        // `RUSTC_DEBUGINFO_MAP` is used to pass through to the underlying rustc
-        // `--remap-path-prefix`.
+        let trim_paths = |cargo: &mut BootstrapCommand, ws_remap: &str| {
+            cargo.arg("-Ztrim-paths");
+            cargo.arg("--config").arg("profile.release.trim-paths='all'");
+            cargo.arg("--config").arg("profile.dev.trim-paths='all'");
+            // This is an internal contract with cargo.
+            // bootstrap needs workspace sources remapped to `/rust{c,-dev}/<sha>` instead of `.`
+            // See <https://github.com/rust-lang/cargo/issues/17309>.
+            cargo.env("__CARGO_RUSTC_BOOTSTRAP_WS_REMAP", ws_remap);
+        };
+
         match mode {
             Mode::Rustc | Mode::Codegen => {
-                if let Some(ref map_to) =
-                    self.build.debuginfo_map_to(GitRepo::Rustc, RemapScheme::NonCompiler)
-                {
+                if let Some(ref map_to) = self.sess.debuginfo_map_to(RemapScheme::NonCompiler) {
                     // Tell the compiler which prefix was used for remapping the standard library
                     cargo.env("CFG_VIRTUAL_RUST_SOURCE_BASE_DIR", map_to);
                 }
 
-                if let Some(ref map_to) =
-                    self.build.debuginfo_map_to(GitRepo::Rustc, RemapScheme::Compiler)
-                {
+                if let Some(ref map_to) = self.sess.debuginfo_map_to(RemapScheme::Compiler) {
                     // Tell the compiler which prefix was used for remapping the compiler it-self
                     cargo.env("CFG_VIRTUAL_RUSTC_DEV_SOURCE_BASE_DIR", map_to);
 
-                    // When building compiler sources, we want to apply the compiler remap scheme.
-                    let map = [
-                        // Cargo use relative paths for workspace members, so let's remap those.
-                        format!("compiler/={map_to}/compiler"),
-                        // rustc creates absolute paths (in part bc of the `rust-src` unremap
-                        // and for working directory) so let's remap the build directory as well.
-                        format!("{}={map_to}", self.build.src.display()),
-                        // remap OUT_DIR so they don't leak into artifacts.
-                        format!("{}={map_to}/out", self.build.out.display()),
-                        // on windows, rustc may use forward slashes internally
-                        #[cfg(windows)]
-                        format!(
-                            "{}={map_to}\\out",
-                            self.build.out.display().to_string().replace('/', "\\")
-                        ),
-                    ]
-                    .join("\t");
-                    cargo.env("RUSTC_DEBUGINFO_MAP", map);
+                    trim_paths(&mut cargo, map_to);
                 }
             }
             Mode::Std
@@ -1736,62 +2424,25 @@ impl Builder<'_> {
             | Mode::ToolRustcPrivate
             | Mode::ToolStd
             | Mode::ToolTarget => {
-                if let Some(ref map_to) =
-                    self.build.debuginfo_map_to(GitRepo::Rustc, RemapScheme::NonCompiler)
-                {
-                    // When building the standard library sources, we want to apply the std remap scheme.
-                    let map = [
-                        // Cargo use relative paths for workspace members, so let's remap those.
-                        format!("library/={map_to}/library"),
-                        // rustc creates absolute paths (in part bc of the `rust-src` unremap
-                        // and for working directory) so let's remap the build directory as well.
-                        format!("{}={map_to}", self.build.src.display()),
-                        // remap OUT_DIR so they don't leak into artifacts.
-                        format!("{}={map_to}/out", self.build.out.display()),
-                        // on windows, rustc may use forward slashes internally
-                        #[cfg(windows)]
-                        format!(
-                            "{}={map_to}\\out",
-                            self.build.out.display().to_string().replace('/', "\\")
-                        ),
-                    ]
-                    .join("\t");
-                    cargo.env("RUSTC_DEBUGINFO_MAP", map);
+                if let Some(ref map_to) = self.sess.debuginfo_map_to(RemapScheme::NonCompiler) {
+                    trim_paths(&mut cargo, map_to);
                 }
             }
-        }
-
-        if self.config.rust_remap_debuginfo {
-            let mut env_var = OsString::new();
-            if let Some(vendor) = self.build.vendored_crates_path() {
-                env_var.push(vendor);
-                env_var.push("=/rust/deps");
-            } else {
-                let registry_src = t!(home::cargo_home()).join("registry").join("src");
-                for entry in t!(std::fs::read_dir(registry_src)) {
-                    if !env_var.is_empty() {
-                        env_var.push("\t");
-                    }
-                    env_var.push(t!(entry).path());
-                    env_var.push("=/rust/deps");
-                }
-            }
-            cargo.env("RUSTC_CARGO_REGISTRY_SRC_TO_REMAP", env_var);
         }
 
         // Enable usage of unstable features
         cargo.env("RUSTC_BOOTSTRAP", "1");
 
-        if matches!(mode, Mode::Std) {
-            cargo.arg("-Zno-embed-metadata");
-        }
+        // Trust: use the selected executable's capability, including when the
+        // pinned seed and source-built Cargo advertise different spellings.
+        cargo.arg(program.metadata_flag);
 
         if self.config.dump_bootstrap_shims {
-            prepare_behaviour_dump_dir(self.build);
+            prepare_shims_dump_dir(self);
 
             cargo
-                .env("DUMP_BOOTSTRAP_SHIMS", self.build.out.join("bootstrap-shims-dump"))
-                .env("BUILD_OUT", &self.build.out)
+                .env("DUMP_BOOTSTRAP_SHIMS", self.sess.out.join("bootstrap-shims-dump"))
+                .env("BUILD_OUT", &self.sess.out)
                 .env("CARGO_HOME", t!(home::cargo_home()));
         };
 
@@ -1827,49 +2478,113 @@ impl Builder<'_> {
         // prefix libdir. Homebrew's llvm-config emits dependencies such as
         // zstd as bare `-l` names, so LLVM's Cellar libdir alone is not enough.
         if (mode == Mode::ToolRustcPrivate || mode == Mode::Codegen)
-            && let Some(llvm_config) = self.llvm_config(target)
+            && self.is_llvm_enabled_for(target)
         {
-            let llvm_libdir_raw =
-                command(&llvm_config).cached().arg("--libdir").run_capture_stdout(self).stdout();
-            let mut native_dirs = Vec::new();
-            let llvm_libdir = PathBuf::from(llvm_libdir_raw.trim());
-            if llvm_libdir.is_dir() {
-                native_dirs.push(llvm_libdir);
-            }
+            let llvm = self.ensure(Llvm { target });
+            let isolated = crate::utils::llvm_native_dev::applies(
+                &target.triple,
+                &self.host_target.triple,
+                llvm.kind() == crate::core::build_steps::llvm::LlvmKind::External,
+                llvm.link_shared(),
+            );
+            if isolated && !self.config.dry_run() {
+                // The compiler build script already confines this static
+                // inventory. Do not undo that confinement for rustdoc and
+                // other private tools by exporting the whole LLVM prefix,
+                // which may contain a private libc++/ABI/unwind runtime.
+                let help = command(llvm.llvm_config()).cached().arg("--help").run_capture(self);
+                let quoted =
+                    help.stdout().contains("quote-paths") || help.stderr().contains("quote-paths");
+                let mut query = command(llvm.llvm_config());
+                query.cached().args(["--link-static", "--libfiles"]);
+                if quoted {
+                    query.arg("--quote-paths");
+                }
+                let files = query.run_capture_stdout(self).stdout();
+                // Older LLVM's documented unquoted output is whitespace
+                // delimited. Match the compiler build script's parser;
+                // every resulting absolute file is checked below.
+                let files = if quoted {
+                    files
+                } else {
+                    files
+                        .split_whitespace()
+                        .map(shlex::try_quote)
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap_or_else(|error| panic!("invalid unquoted LLVM inventory: {error}"))
+                        .join(" ")
+                };
+                let directory = crate::utils::llvm_native_dev::isolated_tool_search(
+                    &files,
+                    &target.triple,
+                    &self.sess.out.join("llvm-tool-native-search"),
+                )
+                .unwrap_or_else(|error| panic!("invalid native LLVM tool search: {error}"));
+                rustflags.arg(&format!("-Clink-arg=-L{}", directory.display()));
+            } else {
+                let llvm_libdir = if self.config.is_host_target(target) {
+                    command(self.host_llvm_config())
+                        .cached()
+                        .arg("--libdir")
+                        .run_capture_stdout(self)
+                        .stdout()
+                        .trim()
+                        .to_owned()
+                } else {
+                    let llvm_output = self.ensure(Llvm { target });
+                    llvm_output.root_dir().join("lib").to_string_lossy().into_owned()
+                };
+                let mut native_dirs = Vec::new();
+                let llvm_libdir = PathBuf::from(llvm_libdir);
+                if llvm_libdir.is_dir() {
+                    native_dirs.push(llvm_libdir);
+                }
 
-            let system_libs = command(&llvm_config)
-                .cached()
-                .args(["--link-static", "--system-libs"])
-                .run_capture_stdout(self)
-                .stdout();
-            for token in system_libs.split_whitespace() {
-                let library = Path::new(token);
-                if library.is_absolute()
-                    && let Some(parent) = library.parent()
-                    && parent.is_dir()
-                {
-                    let parent = parent.to_path_buf();
-                    if !native_dirs.contains(&parent) {
-                        native_dirs.push(parent);
+                // Trust: recover the remaining native dirs from `llvm-config` (see the
+                // comment above the guard). That binary can only be run when it was
+                // built for this host, which is also the system/Homebrew LLVM case this
+                // recovery exists for.
+                let llvm_config;
+                let system_libs = if self.config.is_host_target(target) {
+                    llvm_config = self.host_llvm_config();
+                    command(&llvm_config)
+                        .cached()
+                        .args(["--link-static", "--system-libs"])
+                        .run_capture_stdout(self)
+                        .stdout()
+                } else {
+                    llvm_config = PathBuf::new();
+                    String::new()
+                };
+                for token in system_libs.split_whitespace() {
+                    let library = Path::new(token);
+                    if library.is_absolute()
+                        && let Some(parent) = library.parent()
+                        && parent.is_dir()
+                    {
+                        let parent = parent.to_path_buf();
+                        if !native_dirs.contains(&parent) {
+                            native_dirs.push(parent);
+                        }
                     }
                 }
-            }
 
-            if let Some(opt_dir) =
-                llvm_config.ancestors().find(|path| path.file_name() == Some(OsStr::new("opt")))
-                && let Some(prefix) = opt_dir.parent()
-            {
-                let common_libdir = prefix.join("lib");
-                if common_libdir.is_dir() && !native_dirs.contains(&common_libdir) {
-                    native_dirs.push(common_libdir);
+                if let Some(opt_dir) =
+                    llvm_config.ancestors().find(|path| path.file_name() == Some(OsStr::new("opt")))
+                    && let Some(prefix) = opt_dir.parent()
+                {
+                    let common_libdir = prefix.join("lib");
+                    if common_libdir.is_dir() && !native_dirs.contains(&common_libdir) {
+                        native_dirs.push(common_libdir);
+                    }
                 }
-            }
 
-            for native_dir in native_dirs {
-                if target.is_msvc() {
-                    rustflags.arg(&format!("-Clink-arg=-LIBPATH:{}", native_dir.display()));
-                } else {
-                    rustflags.arg(&format!("-Clink-arg=-L{}", native_dir.display()));
+                for native_dir in native_dirs {
+                    if target.is_msvc() {
+                        rustflags.arg(&format!("-Clink-arg=-LIBPATH:{}", native_dir.display()));
+                    } else {
+                        rustflags.arg(&format!("-Clink-arg=-L{}", native_dir.display()));
+                    }
                 }
             }
         }
@@ -1915,7 +2630,16 @@ impl Builder<'_> {
 
         if self.verbosity >= 2 {
             // This provides very useful logs especially when debugging build cache-related stuff.
-            cargo.env("CARGO_LOG", "cargo::core::compiler::fingerprint=info");
+            // Trust: tracing targets are module paths, which start with the library's
+            // name. The in-tree Targo keeps its fingerprints in its `targo-core`
+            // library (`targo_core::compiler::…`), the pinned stage0 seal's Targo
+            // (29ebb403d) in its `targo` library (`targo::compiler::…`), and a stock
+            // Cargo, which the stage0 check admits, in `cargo::core::compiler::…`.
+            cargo.env(
+                "CARGO_LOG",
+                "targo_core::compiler::fingerprint=info,targo::compiler::fingerprint=info,\
+                 cargo::core::compiler::fingerprint=info",
+            );
         }
 
         cargo.env("RUSTC_VERBOSE", self.verbosity.to_string());
@@ -1983,7 +2707,7 @@ impl Builder<'_> {
         //   to be applied to proc macro crates.
         cargo.env("RUSTC_LINT_FLAGS", lint_flags.join(" "));
         cargo.env("RUSTC_COMPILER_LINT_FLAGS", compiler_lint_flags.join(" "));
-        cargo.env("RUSTC_COMPILER_ROOT", self.build.src.join("compiler"));
+        cargo.env("RUSTC_COMPILER_ROOT", self.sess.src.join("compiler"));
 
         if self.config.rust_frame_pointers {
             rustflags.arg("-Cforce-frame-pointers=true");
@@ -2035,7 +2759,9 @@ impl Builder<'_> {
                 (Mode::Std, Some(n), _) | (_, _, Some(n)) => Some(n),
                 _ => None,
             };
-        if let Some(n) = effective_codegen_units(trust_cg_is_active, requested_codegen_units) {
+        if let Some(n) =
+            effective_codegen_units(narrow_trust_backend_is_active, requested_codegen_units)
+        {
             // The current Trust-CG adapter emits exactly one rustc module and
             // rejects explicit multi-CGU profiles. Use Cargo's profile setting
             // so the constraint covers target crates and host units alike.
@@ -2045,9 +2771,11 @@ impl Builder<'_> {
         if self.config.locked_deps {
             cargo.arg("--locked");
         }
-        if self.config.vendor || self.is_sudo {
-            cargo.arg("--frozen");
-        }
+        // Trust: enforce lock/offline policy on the actual producer, including
+        // selected stage0/1 requests that use native source readiness. Cargo
+        // completes resolution/source acquisition before executing build units;
+        // full-recipe online preparation is a separate explicit operation.
+        cargo.arg("--frozen");
 
         // Try to use a sysroot-relative bindir, in case it was configured absolutely.
         cargo.env("RUSTC_INSTALL_BINDIR", self.config.bindir_relative());
@@ -2066,14 +2794,6 @@ impl Builder<'_> {
         if matches!(mode, Mode::Std) {
             rustflags.arg("-Cprefer-dynamic");
         }
-        if matches!(mode, Mode::Rustc) && !self.link_std_into_rustc_driver(target) {
-            rustflags.arg("-Cprefer-dynamic");
-        }
-
-        cargo.env(
-            "RUSTC_LINK_STD_INTO_RUSTC_DRIVER",
-            if self.link_std_into_rustc_driver(target) { "1" } else { "0" },
-        );
 
         // When building incrementally we default to a lower ThinLTO import limit
         // (unless explicitly specified otherwise). This will produce a somewhat
@@ -2151,11 +2871,12 @@ impl Builder<'_> {
             build_compiler_stage,
             extra_rustflags,
             profile,
+            kind: cmd_kind,
         }
     }
 }
 
-pub fn cargo_profile_var(name: &str, config: &Config, mode: Mode) -> String {
+pub(crate) fn cargo_profile_var(name: &str, config: &Config, mode: Mode) -> String {
     let profile = match (mode, config.rust_optimize.is_release()) {
         // Some std configuration exists in its own profile
         (Mode::Std, _) => "DIST",
@@ -2181,3 +2902,62 @@ fn std_out_dir_needs_clear(mode: Mode, cmd_kind: Kind) -> bool {
 
 #[cfg(test)]
 mod tests;
+/// Applies PGO compile flags to the given Cargo invocation based on the given PGO config.
+/// PGO flags are only applied when compiling a stage2 component.
+pub(crate) fn apply_pgo(
+    builder: &Builder<'_>,
+    cargo: &mut Cargo,
+    build_compiler: Compiler,
+    config: &PgoConfig,
+) {
+    let is_collecting = if let Some(path) = &config.generate_profile {
+        if build_compiler.stage == 1 {
+            cargo
+                .rustflag(&format!("-Cprofile-generate={}", path.to_str().expect("non-UTF8 path")));
+            // Apparently necessary to avoid overflowing the counters during
+            // a Cargo build profile
+            cargo.rustflag("-Cllvm-args=-vp-counters-per-site=4");
+            true
+        } else {
+            false
+        }
+    } else if let Some(path) = &config.use_profile {
+        if build_compiler.stage == 1 {
+            cargo.rustflag(&format!("-Cprofile-use={}", path.to_str().expect("non-UTF8 path")));
+            if builder.is_verbose() {
+                cargo.rustflag("-Cllvm-args=-pgo-warn-missing-function");
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if is_collecting {
+        // Ensure paths to Rust sources are relative, not absolute.
+        cargo.rustflag(&format!(
+            "-Cllvm-args=-static-func-strip-dirname-prefix={}",
+            builder.config.src.components().count()
+        ));
+    }
+}
+
+/// Ensures that the behavior dump directory is properly initialized.
+fn prepare_shims_dump_dir(builder: &Builder<'_>) {
+    static INITIALIZED: OnceLock<bool> = OnceLock::new();
+
+    let dump_path = builder.out.join("bootstrap-shims-dump");
+
+    let initialized = INITIALIZED.get().unwrap_or(&false);
+    if !initialized {
+        // clear old dumps
+        if dump_path.exists() {
+            t!(fs::remove_dir_all(&dump_path));
+        }
+
+        t!(fs::create_dir_all(&dump_path));
+
+        t!(INITIALIZED.set(true));
+    }
+}

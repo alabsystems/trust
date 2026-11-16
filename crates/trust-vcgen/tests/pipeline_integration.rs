@@ -88,6 +88,7 @@ fn midpoint_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -133,6 +134,7 @@ fn division_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -178,6 +180,7 @@ fn shift_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -206,6 +209,7 @@ fn trivially_safe_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -621,14 +625,14 @@ fn test_batch_verification_multiple_functions() {
 }
 
 #[test]
-fn test_batch_verification_parallel() {
-    // Use parallel verification with multiple functions
+fn test_batch_verification_report() {
+    // One batch over ten functions.
     let vcs: Vec<_> = (0..10)
         .map(|i| make_vc(VcKind::DivisionByZero, &format!("fn_{i}"), Formula::Bool(false)))
         .collect();
 
     let router = mock_router();
-    let results = router.verify_all_parallel(&vcs, 4);
+    let results = router.verify_all(&vcs);
     assert_eq!(results.len(), 10);
 
     for (_, result) in &results {
@@ -904,7 +908,7 @@ fn test_custom_backend_counterexample_in_report() {
 
     assert!(matches!(
         &ob.outcome,
-        ObligationOutcome::Failed { counterexample: Some(cex) }
+        ObligationOutcome::Failed { counterexample: Some(cex), .. }
             if cex.variables.len() == 2
     ));
 

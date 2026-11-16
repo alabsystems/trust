@@ -1,0 +1,140 @@
+{
+  "name": "bug_w7_u128_mut_wrapping_add",
+  "def_path": "probes_128_false::bug_w7_u128_mut_wrapping_add",
+  "span": {
+    "file": "probes_128_false.rs",
+    "line_start": 10,
+    "col_start": 0,
+    "line_end": 10,
+    "col_end": 105
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": "x"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-wrapping-refutation-method::core::num::<impl u128>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    128
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "probes_128_false.rs",
+              "line_start": 10,
+              "col_start": 85,
+              "line_end": 10,
+              "col_end": 85
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 6692626837626329215,
+              "def_index": 28042,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 6692626837626329215,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 128,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "probes_128_false.rs",
+        "line_start": 10,
+        "col_start": 65,
+        "line_end": 10,
+        "col_end": 76
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) >= (1)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Ge": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": 1
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) >= (1)"
+    ],
+    "invariants": []
+  }
+}

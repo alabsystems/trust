@@ -14,6 +14,11 @@
 //! a false postcondition can never be laundered into a `SolverRevalidated`
 //! authority. The obligation stays refuted and the build MUST fail. A passing
 //! compile here would be a catastrophic false proof.
+//!
+//! This is also the Slice 1C body-bound falsification, once a code-identical
+//! sibling fixture: the TrustMC-owned body-aware postcondition is false for the
+//! identity body on every input, so the strict build must fail without
+//! consulting or minting any historical TrustWP authority.
 pub fn gt_refl(x: u64) -> u64 //~ ERROR strict verification failed
     ensures result > x
 {

@@ -1,0 +1,27 @@
+{
+  "argv": [
+    "<home>/worktrees/trust-direct-contract-shadow-20261112/scripts/build-slot",
+    "--cpus",
+    "6",
+    "--",
+    "<home>/release-evidence/trust-forward-recovery-20261029/NOV10-CURRENT-COMPILER/prefix/bin/targo",
+    "--unverified",
+    "rustc",
+    "--manifest-path",
+    "<home>/release-evidence/trust-forward-recovery-20261029/NOV12-WP-TRUST-INTAKE/direct-contract-shadow/.ubd/capture-crate/Cargo.toml",
+    "--lib",
+    "--",
+    "-Ztrust-ir-lower=on",
+    "-Ztrust-ir-flip=no",
+    "-Ztrust-dump=ir:<home>/release-evidence/trust-forward-recovery-20261029/NOV12-WP-TRUST-INTAKE/direct-contract-shadow/ir-04"
+  ],
+  "compiler_version": "rustc 1.101.0-dev (4edcc7ec2 2026-11-09) (trustc 0.13.0+g4edcc7ec2)\nbinary: trustc\ncommit-hash: 4edcc7ec2bdd4427ad31af95a70552685a9f5709\ncommit-date: 2026-11-09\nhost: aarch64-apple-darwin\nrelease: 1.101.0-dev\ntrust: 0.13.0+g4edcc7ec2\nLLVM version: 23.1.5\n",
+  "scope": "Real THIR body and staged query report from retained4edcc. Tests rebuild Pending rows from this report; no new-source compiler qualification or source-fidelity proof.",
+  "exit": 0,
+  "seconds": 3.094295999966562,
+  "files": {
+    "module.trust-ir.bin": "71a722097691787e7ad5ee19e2b9ec94da6fff2cf40e03b473833cd73b8dd320",
+    "source.rs": "7a9be69266608eb84c256dbe741eef474734ad81c3dffd69b1128394eecfd502",
+    "staged-query.json": "d62b10f761bcf3e346da7bfd27161bd2bf300e806d8197990a8d3880248ae923"
+  }
+}

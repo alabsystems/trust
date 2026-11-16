@@ -14,6 +14,8 @@ unsafe extern "C" {
 
 /// Same call through the unmodeled alias name.
 pub fn current_uid() -> u32 {
-    // SAFETY: getuid() is always safe — no failure mode, no args.
+    // getuid() is always safe — no failure mode, no args. Not marked as a SAFETY
+    // comment on purpose: one would declare this block (SAFETY-ASSUME-1), and
+    // certify would refuse the declaration instead of the unmodeled call.
     unsafe { libc_getuid2() }
 }

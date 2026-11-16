@@ -14,7 +14,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::fx::FxHashMap;
+use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{
     Operand, Place, Rvalue, Statement, Terminator, VerifiableBody, VerifiableFunction,
 };
@@ -54,9 +54,9 @@ pub struct BorrowState {
     /// Map from *source* local to the set of active borrows on it.
     borrows: FxHashMap<usize, Vec<BorrowRecord>>,
     /// Set of locals that have been moved.
-    moved: FxHashMap<usize, bool>,
+    moved: FxHashSet<usize>,
     /// Set of locals that have been dropped.
-    dropped: FxHashMap<usize, bool>,
+    dropped: FxHashSet<usize>,
 }
 
 /// A borrow-safety violation detected during analysis.
@@ -91,11 +91,11 @@ impl BorrowState {
         kind: BorrowKind,
     ) -> Result<(), BorrowViolation> {
         // Cannot borrow a moved local.
-        if self.moved.get(&src).copied().unwrap_or(false) {
+        if self.moved.contains(&src) {
             return Err(BorrowViolation::UseAfterMove { local: src });
         }
         // Cannot borrow a dropped local.
-        if self.dropped.get(&src).copied().unwrap_or(false) {
+        if self.dropped.contains(&src) {
             return Err(BorrowViolation::DanglingReference { local: src, borrower: dst });
         }
 
@@ -129,10 +129,10 @@ impl BorrowState {
     /// Record a dereference of a local (read through a reference).
     /// Returns a violation if the local was moved or dropped.
     pub fn deref(&self, local: usize) -> Result<(), BorrowViolation> {
-        if self.moved.get(&local).copied().unwrap_or(false) {
+        if self.moved.contains(&local) {
             return Err(BorrowViolation::UseAfterMove { local });
         }
-        if self.dropped.get(&local).copied().unwrap_or(false) {
+        if self.dropped.contains(&local) {
             return Err(BorrowViolation::DanglingReference { local, borrower: local });
         }
         Ok(())
@@ -140,38 +140,42 @@ impl BorrowState {
 
     /// Record a move from a local. Returns a violation on double-move.
     pub fn move_place(&mut self, local: usize) -> Result<(), BorrowViolation> {
-        if self.moved.get(&local).copied().unwrap_or(false) {
+        if !self.moved.insert(local) {
             return Err(BorrowViolation::UseAfterMove { local });
         }
-        self.moved.insert(local, true);
         // Remove any borrows sourced from this local (they become dangling).
-        self.borrows.remove(&local);
+        if !self.borrows.is_empty() {
+            self.borrows.remove(&local);
+        }
         Ok(())
     }
 
     /// Record a drop of a local. Returns a violation if there are live borrows
     /// on the local (they would become dangling).
     pub fn drop_place(&mut self, local: usize) -> Result<(), BorrowViolation> {
-        if let Some(records) = self.borrows.get(&local)
-            && let Some(first) = records.first()
-        {
-            return Err(BorrowViolation::DanglingReference { local, borrower: first.borrower });
+        if let Some(records) = self.borrows.get(&local) {
+            if let Some(first) = records.first() {
+                return Err(BorrowViolation::DanglingReference {
+                    local,
+                    borrower: first.borrower,
+                });
+            }
+            self.borrows.remove(&local);
         }
-        self.dropped.insert(local, true);
-        self.borrows.remove(&local);
+        self.dropped.insert(local);
         Ok(())
     }
 
     /// Whether a local has been moved.
     #[must_use]
     pub fn is_moved(&self, local: usize) -> bool {
-        self.moved.get(&local).copied().unwrap_or(false)
+        self.moved.contains(&local)
     }
 
     /// Whether a local has been dropped.
     #[must_use]
     pub fn is_dropped(&self, local: usize) -> bool {
-        self.dropped.get(&local).copied().unwrap_or(false)
+        self.dropped.contains(&local)
     }
 
     /// Active borrows on a given source local.
@@ -256,13 +260,8 @@ fn scan_statement(
 fn check_operand(state: &mut BorrowState, op: &Operand, violations: &mut Vec<BorrowViolation>) {
     match op {
         Operand::Move(place) => {
-            // Check if already moved.
-            if state.is_moved(place.local) {
-                violations.push(BorrowViolation::UseAfterMove { local: place.local });
-            } else {
-                if let Err(v) = state.move_place(place.local) {
-                    violations.push(v);
-                }
+            if let Err(v) = state.move_place(place.local) {
+                violations.push(v);
             }
             // Also check deref projections.
             check_deref_projections(state, place, violations);
@@ -439,6 +438,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

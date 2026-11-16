@@ -286,13 +286,21 @@ impl Refusal {
                 "the boolean 0/1-carrier connectives. Their operands are not machine carriers, \
                  so they are outside this reflector's domain.",
             ),
+            BinOp::RotL | BinOp::RotR => (
+                "rotl/rotr",
+                "total in the IR (the amount is reduced modulo the bit width), but this \
+                 reflector has no Clean `UIntw` rotate image and no surface program in the \
+                 emitter's fragment produces a rotate, so the path could not be demonstrated \
+                 end to end. This file accepts only what it exercises.",
+            ),
             BinOp::FAdd
             | BinOp::FSub
             | BinOp::FMul
             | BinOp::FDiv
             | BinOp::FRem
             | BinOp::FMin
-            | BinOp::FMax => (
+            | BinOp::FMax
+            | BinOp::FCopySign => (
                 "floating-point arithmetic",
                 "IEEE-754 semantics (rounding mode, NaN payloads, signed zero) is not in this \
                  reflector's domain.",
@@ -1475,12 +1483,15 @@ fn test_refuses_multi_block_control_flow() {
 // ═══════════════════════════════════════════════════════════════════════════
 // 10. FINDINGS, RECORDED AS TESTS
 //
-// Two things this reflector could not honestly spell, both discovered by
-// building the semantics first and then measuring what the kernel said. Neither
-// is a false accept — both are the kernel refusing a correct reflection, which
-// is the safe direction. They are written down as executable tests so that a
-// later reader who is tempted to "fix" the reflector by making it guess at
-// source syntax has to argue with a measurement rather than with a comment.
+// Two things the IR does not record about the source, both discovered by
+// building the semantics first and then measuring what the kernel said. The
+// first — which `Decidable` instance a numeral comparison was elaborated with —
+// stopped costing the round trip at Clean `c91fa93f5` and is now pinned as an
+// agreement. The second is still the kernel refusing a correct reflection, which
+// is the safe direction. Neither was ever a false accept. They are written down
+// as executable tests so that a later reader who is tempted to "fix" the
+// reflector by making it guess at source syntax has to argue with a measurement
+// rather than with a comment.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Strip `n` leading lambdas.
@@ -1515,27 +1526,36 @@ fn reclose2(carrier: Carrier, body: Expr) -> Expr {
     )
 }
 
-/// The `Decidable` instance an `ite` eliminates is NOT recorded in the IR, and
-/// Clean's elaborator does not always choose the carrier's own instance.
+/// The `Decidable` instance an `ite` eliminates is NOT recorded in the IR — and,
+/// since Clean `c91fa93f5`, that no longer costs the numeral form its round trip.
 ///
-/// For `if a < b then a else b` it picks `instDecidableUInt8Lt a b`, which this
-/// reflector reconstructs exactly. For `if a < 10 then a else b` — the same
-/// relation, with a numeral on the right — it instead picks
-/// `instDecidableNatLt a.toBitVec.toFin.val 10`, comparing at `Nat` after
-/// projecting out of the carrier.
+/// For `if a < b then a else b` the elaborator picks `instDecidableUInt8Lt a b`,
+/// which this reflector reconstructs exactly. For `if a < 10 then a else b` — the
+/// same relation, with a numeral on the right — every Clean pin before
+/// `c91fa93f5` picked `instDecidableNatLt a.toBitVec.toFin.val 10`, comparing at
+/// `Nat` after projecting out of the carrier, and the kernel did not identify
+/// that with this reflector's `instDecidableUInt8Lt a (UInt8.ofNat 10)`: the
+/// propositions and both arms agreed, ONLY the instance did not, and since
+/// `ite`'s value is computed by eliminating the instance the whole term was
+/// rejected — a false NEGATIVE, never a false accept.
 ///
-/// The IR is identical in structure for both (`ICmp Ult` on a value and a
-/// constant), so an IR-only reflector has nothing to choose on. This test pins
-/// down exactly where the two terms diverge: the propositions and both arms
-/// agree definitionally, and ONLY the instance does not — and since `ite`'s
-/// value is computed by eliminating that instance, the whole term is rejected.
-///
-/// This is a false NEGATIVE of the round trip, not a soundness gap: the kernel
-/// declines to certify a body it in fact agrees with. Closing it would need
-/// either a canonical-instance normalization on the Clean side, or an IR that
-/// carries the instance — not a reflector that guesses.
+/// That finding said closing it would need a canonical-instance normalization on
+/// the Clean side or an IR that carries the instance, not a reflector that
+/// guesses. Clean `c91fa93f5` ("kernel(uint): the BitVec-carrier decLe/decLt ARE
+/// Nat.decLe/decLt, so `decide (d < 21)` is the carrier's decision") is the
+/// first: the carrier's decision now IS the `Nat` one on the projections.
+/// Measured with `clean check` at the superproject pin `dca882b5f`, the
+/// elaborator now picks `instDecidableUInt8Lt a (UInt8.ofBitVec (BitVec.ofFin 8
+/// (Fin.ofNat 255 10)))` — the carrier instance over the numeral unfolded one δβ
+/// step — and the kernel identifies it, and the old `Nat`-reduced instance, with
+/// this reflector's; on the previous pin (`faf434b73`) it identifies neither.
+/// The IR is still identical in structure for both forms (`ICmp Ult` on a value
+/// and a constant) and still records no instance. The numeral form round-trips
+/// like the variable form anyway, which is what this test now pins, argument by
+/// argument, so that a Clean pin which separates the two decisions again fails
+/// HERE with the instance named.
 #[test]
-fn test_finding_the_decidable_instance_is_not_recorded_in_the_ir() {
+fn test_finding_resolved_the_numeral_form_round_trips() {
     let session = session_with(&[
         "def mn (a : UInt8) (b : UInt8) : UInt8 := if a < b then a else b",
         "def clampish (a : UInt8) (b : UInt8) : UInt8 := if a < 10 then a else b",
@@ -1543,10 +1563,12 @@ fn test_finding_the_decidable_instance_is_not_recorded_in_the_ir() {
     let env = session.environment().expect("untainted session");
     let tc = clean_kernel::tc::TypeChecker::new(env);
 
-    // The variable-on-the-right form round-trips.
+    // The variable-on-the-right form round-trips, and so does the
+    // numeral-on-the-right form — through the same type-checked acceptance
+    // predicate as every coverage test.
     assert_kernel_agrees(env, "mn");
+    assert_kernel_agrees(env, "clampish");
 
-    // The numeral-on-the-right form does not.
     let (function, reflected) = emit_and_reflect(env, "clampish");
     let reflected = reflected.expect("`clampish` reflects");
     let declared = env.get_const(&Name::from_string("clampish")).unwrap().value.clone().unwrap();
@@ -1572,8 +1594,14 @@ fn test_finding_the_decidable_instance_is_not_recorded_in_the_ir() {
     assert_eq!(decl_args.len(), 5);
 
     let close = |e: &Expr| reclose2(Carrier::U8, e.clone());
-    // Result type, proposition, and both arms agree.
-    for (i, what) in [(0, "result type"), (1, "proposition"), (3, "then"), (4, "else")] {
+    // Result type, proposition, the `Decidable` instance, and both arms agree.
+    for (i, what) in [
+        (0, "result type"),
+        (1, "proposition"),
+        (2, "`Decidable` instance"),
+        (3, "then"),
+        (4, "else"),
+    ] {
         assert!(
             tc.is_def_eq(&close(&mine_args[i]), &close(&decl_args[i])),
             "the {what} argument of `ite` should agree, but does not:\n\
@@ -1582,13 +1610,26 @@ fn test_finding_the_decidable_instance_is_not_recorded_in_the_ir() {
             decl_args[i]
         );
     }
-    // The `Decidable` instance does not.
-    assert!(
-        !tc.is_def_eq(&close(&mine_args[2]), &close(&decl_args[2])),
-        "if the two `Decidable` instances now reconcile, this finding has been \
-         resolved upstream and `clampish` should move into the coverage tests"
+    // Including against the instance every pre-`c91fa93f5` pin elaborated,
+    // `instDecidableNatLt a.toBitVec.toFin.val 10`, built with the projection
+    // chain it carried — the identification the resolution rests on.
+    let to_nat = Expr::proj(
+        Name::from_string("Fin"),
+        0,
+        Expr::proj(
+            Name::from_string("BitVec"),
+            0,
+            Expr::proj(Name::from_string("UInt8"), 0, Expr::bvar(1)),
+        ),
     );
-    assert!(!tc.is_def_eq(&reflected, &declared), "whole-term verdict must follow the instance");
+    let nat_reduced =
+        Expr::apps(Expr::const_str("instDecidableNatLt"), [to_nat, Expr::nat_lit(10)]);
+    assert!(
+        tc.is_def_eq(&close(&mine_args[2]), &close(&nat_reduced)),
+        "the carrier decision and the `Nat` decision on its projections have come apart \
+         again: this finding is back, and `clampish` no longer round-trips"
+    );
+    assert!(tc.is_def_eq(&reflected, &declared), "whole-term verdict must follow the instance");
 }
 
 /// `ICmp Eq` at an unsigned carrier does NOT determine the Clean proposition

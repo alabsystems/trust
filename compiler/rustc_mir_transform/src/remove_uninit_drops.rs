@@ -1,10 +1,12 @@
 use rustc_abi::FieldIdx;
 use rustc_index::bit_set::MixedBitSet;
 use rustc_middle::mir::{Body, TerminatorKind};
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, VariantDef};
+use rustc_middle::ty::{self, GenericArgs, Ty, TyCtxt, VariantDef};
 use rustc_mir_dataflow::impls::MaybeInitializedPlaces;
 use rustc_mir_dataflow::move_paths::{LookupResult, MoveData, MovePathIndex};
 use rustc_mir_dataflow::{Analysis, MaybeReachable, move_path_children_matching};
+
+use crate::PassPolicy;
 
 /// Removes `Drop` terminators whose target is known to be uninitialized at
 /// that point.
@@ -18,6 +20,14 @@ pub(super) struct RemoveUninitDrops;
 
 impl<'tcx> crate::MirPass<'tcx> for RemoveUninitDrops {
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        if !body
+            .basic_blocks
+            .iter()
+            .any(|block| matches!(block.terminator().kind, TerminatorKind::Drop { .. }))
+        {
+            return;
+        }
+
         let typing_env = body.typing_env(tcx);
         let move_data = MoveData::gather_moves(body, tcx, |ty| ty.needs_drop(tcx, typing_env));
 
@@ -60,12 +70,13 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveUninitDrops {
             };
 
             // Replace block terminator with `Goto`.
-            block.terminator_mut().kind = TerminatorKind::Goto { target: *target };
+            block.terminator_mut().kind = TerminatorKind::goto(*target);
         }
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Const checking relies on uninitialized drops being removed before drop elaboration.
+        PassPolicy::Required
     }
 }
 
@@ -115,7 +126,7 @@ fn is_needs_drop_and_init<'tcx>(
                     let downcast =
                         move_path_children_matching(move_data, mpi, |x| x.is_downcast_to(vid));
                     let Some(dc_mpi) = downcast else {
-                        return variant_needs_drop(tcx, typing_env, args, variant);
+                        return variant_needs_drop(tcx, typing_env, *args, variant);
                     };
 
                     dc_mpi
@@ -128,7 +139,7 @@ fn is_needs_drop_and_init<'tcx>(
                     .iter()
                     .enumerate()
                     .map(|(f, field)| {
-                        (FieldIdx::from_usize(f), field.ty(tcx, args).skip_norm_wip(), mpi)
+                        (FieldIdx::from_usize(f), field.ty(tcx, *args).skip_norm_wip(), mpi)
                     })
                     .any(field_needs_drop_and_init)
             })
@@ -147,7 +158,7 @@ fn is_needs_drop_and_init<'tcx>(
 fn variant_needs_drop<'tcx>(
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
-    args: GenericArgsRef<'tcx>,
+    args: GenericArgs<'tcx>,
     variant: &VariantDef,
 ) -> bool {
     variant.fields.iter().any(|field| {

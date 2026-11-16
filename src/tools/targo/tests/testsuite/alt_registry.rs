@@ -26,6 +26,9 @@ fn depend_on_alt_registry() {
                 [dependencies.bar]
                 version = "0.0.1"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -36,7 +39,7 @@ fn depend_on_alt_registry() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
 [CHECKING] bar v0.0.1 (registry `alternative`)
@@ -75,6 +78,9 @@ fn depend_on_alt_registry_depends_on_same_registry_no_index() {
                 [dependencies.bar]
                 version = "0.0.1"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -90,7 +96,7 @@ fn depend_on_alt_registry_depends_on_same_registry_no_index() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
 [DOWNLOADED] baz v0.0.1 (registry `alternative`)
@@ -121,6 +127,9 @@ fn depend_on_alt_registry_depends_on_same_registry() {
                 [dependencies.bar]
                 version = "0.0.1"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -136,7 +145,7 @@ fn depend_on_alt_registry_depends_on_same_registry() {
         .with_stderr_data(
             str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
 [DOWNLOADED] baz v0.0.1 (registry `alternative`)
@@ -167,6 +176,9 @@ fn depend_on_alt_registry_depends_on_crates_io() {
                 [dependencies.bar]
                 version = "0.0.1"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -183,7 +195,7 @@ fn depend_on_alt_registry_depends_on_crates_io() {
             str![[r#"
 [UPDATING] `alternative` index
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] baz v0.0.1 (registry `dummy-registry`)
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
@@ -215,6 +227,9 @@ fn registry_and_path_dep_works() {
                 [dependencies.bar]
                 path = "bar"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -224,7 +239,7 @@ fn registry_and_path_dep_works() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.0.1 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -250,6 +265,9 @@ fn registry_and_git_dep_works() {
                 version = "0.0.1"
                 edition = "2015"
                 authors = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -270,6 +288,9 @@ fn registry_and_git_dep_works() {
                 version = "0.0.1"
                 registry = "alternative"
                 git="{}"
+
+                [lints.cargo]
+                default = "allow"
             "#,
                 bar.url(),
             ),
@@ -282,7 +303,7 @@ fn registry_and_git_dep_works() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/bar`
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.0.1 ([ROOTURL]/bar#[..])
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -371,6 +392,9 @@ fn publish_with_registry_dependency() {
                 [dependencies.bar]
                 version = "0.0.1"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -456,6 +480,9 @@ fn alt_registry_and_crates_io_deps() {
                 [dependencies.alt_reg_dep]
                 version = "0.1.0"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -471,7 +498,7 @@ fn alt_registry_and_crates_io_deps() {
             str![[r#"
 [UPDATING] `alternative` index
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] crates_io_dep v0.0.1 (registry `dummy-registry`)
 [DOWNLOADED] alt_reg_dep v0.1.0 (registry `alternative`)
@@ -612,6 +639,9 @@ fn publish_with_crates_io_dep() {
 
                 [dependencies.bar]
                 version = "0.0.1"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -696,6 +726,9 @@ fn publish_with_git_and_registry_dep() {
                 version = "0.0.1"
                 edition = "2015"
                 authors = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -716,6 +749,9 @@ fn publish_with_git_and_registry_dep() {
                 version = "0.0.1"
                 registry = "alternative"
                 git="{}"
+
+                [lints.cargo]
+                default = "allow"
             "#,
                 bar.url(),
             ),
@@ -847,7 +883,7 @@ fn patch_alt_reg() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -929,6 +965,9 @@ fn no_api() {
                 [dependencies.bar]
                 version = "0.0.1"
                 registry = "alternative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -937,7 +976,7 @@ fn no_api() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
 [CHECKING] bar v0.0.1 (registry `alternative`)
@@ -1784,6 +1823,9 @@ fn registries_index_relative_url() {
                 [dependencies.bar]
                 version = "0.0.1"
                 registry = "relative"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -1794,7 +1836,7 @@ fn registries_index_relative_url() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `relative` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `relative`)
 [CHECKING] bar v0.0.1 (registry `relative`)

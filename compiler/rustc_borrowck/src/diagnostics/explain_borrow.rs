@@ -2,7 +2,7 @@
 
 use std::assert_matches;
 
-use rustc_errors::{Applicability, Diag, EmissionGuarantee};
+use rustc_errors::{Applicability, Diag};
 use rustc_hir as hir;
 use rustc_hir::intravisit::Visitor;
 use rustc_infer::infer::NllRegionVariableOrigin;
@@ -22,7 +22,7 @@ use super::{RegionName, UseSpans, find_use};
 use crate::borrow_set::BorrowData;
 use crate::constraints::OutlivesConstraint;
 use crate::nll::ConstraintDescription;
-use crate::region_infer::{BlameConstraint, Cause};
+use crate::region_infer::{BestBlame, Cause};
 use crate::{MirBorrowckCtxt, WriteKind};
 
 #[derive(Debug)]
@@ -35,12 +35,9 @@ pub(crate) enum BorrowExplanation<'tcx> {
         should_note_order: bool,
     },
     MustBeValidFor {
-        category: ConstraintCategory<'tcx>,
-        from_closure: bool,
-        span: Span,
+        best_blame: BestBlame<'tcx>,
         region_name: RegionName,
         opt_place_desc: Option<String>,
-        path: Vec<OutlivesConstraint<'tcx>>,
     },
     Unexplained,
 }
@@ -58,10 +55,10 @@ impl<'tcx> BorrowExplanation<'tcx> {
     pub(crate) fn is_explained(&self) -> bool {
         !matches!(self, BorrowExplanation::Unexplained)
     }
-    pub(crate) fn add_explanation_to_diagnostic<G: EmissionGuarantee>(
+    pub(crate) fn add_explanation_to_diagnostic(
         &self,
         cx: &MirBorrowckCtxt<'_, '_, 'tcx>,
-        err: &mut Diag<'_, G>,
+        err: &mut Diag<'_>,
         borrow_desc: &str,
         borrow_span: Option<Span>,
         multiple_borrow_span: Option<(Span, Span)>,
@@ -376,13 +373,13 @@ impl<'tcx> BorrowExplanation<'tcx> {
                 }
             }
             BorrowExplanation::MustBeValidFor {
-                category,
-                span,
+                ref best_blame,
                 ref region_name,
                 ref opt_place_desc,
-                from_closure: _,
-                ref path,
             } => {
+                let OutlivesConstraint { category, span, .. } = *best_blame.constraint();
+                let path = best_blame.path();
+
                 region_name.highlight_region_name(err);
 
                 if let Some(desc) = opt_place_desc {
@@ -403,8 +400,8 @@ impl<'tcx> BorrowExplanation<'tcx> {
                     );
                 };
 
-                cx.add_placeholder_from_predicate_note(err, &path);
-                cx.add_sized_or_copy_bound_info(err, category, &path);
+                cx.add_placeholder_from_predicate_note(err, path);
+                cx.add_sized_or_copy_bound_info(err, category, path);
 
                 if let ConstraintCategory::Cast {
                     is_raw_ptr_dyn_type_cast: _,
@@ -418,12 +415,12 @@ impl<'tcx> BorrowExplanation<'tcx> {
                 let mut preds = path
                     .iter()
                     .filter_map(|constraint| match constraint.category {
-                        ConstraintCategory::Predicate(pred) if !pred.is_dummy() => Some(pred),
+                        ConstraintCategory::Predicate(pred, _) if !pred.is_dummy() => Some(pred),
                         _ => None,
                     })
                     .collect::<Vec<Span>>();
-                preds.sort();
-                preds.dedup();
+                preds.sort_by_key(|span| span.lo_hi());
+                preds.dedup_by_key(|span| span.lo_hi());
                 if !preds.is_empty() {
                     let s = if preds.len() == 1 { "" } else { "s" };
                     err.span_note(
@@ -440,10 +437,10 @@ impl<'tcx> BorrowExplanation<'tcx> {
         }
     }
 
-    fn add_object_lifetime_default_note<G: EmissionGuarantee>(
+    fn add_object_lifetime_default_note(
         &self,
         tcx: TyCtxt<'tcx>,
-        err: &mut Diag<'_, G>,
+        err: &mut Diag<'_>,
         unsize_ty: Ty<'tcx>,
     ) {
         if let ty::Adt(def, args) = unsize_ty.kind() {
@@ -497,9 +494,9 @@ impl<'tcx> BorrowExplanation<'tcx> {
         }
     }
 
-    fn add_lifetime_bound_suggestion_to_diagnostic<G: EmissionGuarantee>(
+    fn add_lifetime_bound_suggestion_to_diagnostic(
         &self,
-        err: &mut Diag<'_, G>,
+        err: &mut Diag<'_>,
         category: &ConstraintCategory<'tcx>,
         span: Span,
         region_name: &RegionName,
@@ -526,14 +523,14 @@ impl<'tcx> BorrowExplanation<'tcx> {
     }
 }
 
-fn suggest_rewrite_if_let<G: EmissionGuarantee>(
+fn suggest_rewrite_if_let(
     tcx: TyCtxt<'_>,
     expr: &hir::Expr<'_>,
     pat: &str,
     init: &hir::Expr<'_>,
     conseq: &hir::Expr<'_>,
     alt: Option<&hir::Expr<'_>>,
-    err: &mut Diag<'_, G>,
+    err: &mut Diag<'_>,
 ) {
     let source_map = tcx.sess.source_map();
     err.span_note(
@@ -613,7 +610,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
             // loop iteration. In this case, try using the loop terminator location in
             // `find_sub_region_live_at`.
             if let Some(loop_terminator_location) =
-                regioncx.find_loop_terminator_location(borrow.region, body)
+                regioncx.find_loop_terminator_location(borrow.region, body, location)
             {
                 region_sub = self
                     .regioncx
@@ -689,22 +686,18 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 // Here, under NLL: no cause was found. Under polonius: no cause was found, or a
                 // boring local was found, which we ignore like NLLs do to match its diagnostics.
                 if let Some(region) = self.regioncx.to_error_region_vid(borrow_region_vid) {
-                    let (blame_constraint, path) = self.regioncx.best_blame_constraint(
+                    let best_blame = self.regioncx.best_blame_constraint(
                         borrow_region_vid,
                         NllRegionVariableOrigin::FreeRegion,
                         region,
                     );
-                    let BlameConstraint { category, from_closure, span, .. } = blame_constraint;
 
                     if let Some(region_name) = self.give_region_a_name(region) {
                         let opt_place_desc = self.describe_place(borrow.borrowed_place.as_ref());
                         BorrowExplanation::MustBeValidFor {
-                            category,
-                            from_closure,
-                            span,
+                            best_blame,
                             region_name,
                             opt_place_desc,
-                            path,
                         }
                     } else {
                         debug!("Could not generate a region name");

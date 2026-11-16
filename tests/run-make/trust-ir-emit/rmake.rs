@@ -16,7 +16,34 @@
 //! enough to pass here.
 use std::path::Path;
 
+use run_make_support::object::{Object, ObjectSymbol};
 use run_make_support::{rfs, rustc};
+
+/// WS5.2: the `(name, display_path)` of the ONE function whose canonical-text
+/// block carries `; #display-path: "<def_path>"` — the def path moved out of
+/// `Function.name`, which is now the link-time symbol.
+fn named_by_display_path<'a>(text: &'a str, def_path: &str) -> &'a str {
+    let directive = format!("; #display-path: {def_path:?}\n");
+    let mut found = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.contains("fn @") {
+            let block = &text[offset..];
+            let block = &block[..block.find("\n}\n").map_or(block.len(), |end| end + 3)];
+            if block.contains(&directive) {
+                let name = line
+                    .split_once("fn @")
+                    .and_then(|(_, tail)| tail.split_once('('))
+                    .map(|(name, _)| name)
+                    .expect("function header names the function");
+                found.push(name);
+            }
+        }
+        offset += line.len();
+    }
+    assert_eq!(found.len(), 1, "exactly one function displays `{def_path}`: {found:?}\n{text}");
+    found[0]
+}
 
 /// The text of `"<key>": [ … ]` inside a single coverage row up to the first
 /// `]`, or `None` when the row carries no such key. Only emptiness is asserted
@@ -92,22 +119,122 @@ fn main() {
         "the direct THIR producer must never publish native verification requests"
     );
 
+    // WS5.2 (F-087): `Function.name` IS the link-time symbol and the def path is the
+    // display path. The spliced `add` is named by exactly the symbol the native object
+    // exports for it (`nm`), and carries `add` as its display path.
+    let text = rfs::read_to_string(out_dir.join("foo.trust-ir.txt"));
+    let add_symbol = named_by_display_path(&text, "add");
+    assert!(add_symbol.starts_with("_R"), "a v0 link-time symbol, not a def path: {add_symbol}");
+    let native_dir = Path::new("native");
+    rfs::create_dir(&native_dir);
+    rustc()
+        .input("foo.rs")
+        .crate_type("lib")
+        .emit("obj")
+        .out_dir(&native_dir)
+        .arg("-Ztrust-verify=off")
+        .run();
+    let object_bytes = rfs::read(native_dir.join("foo.o"));
+    let object = run_make_support::object::File::parse(&*object_bytes).expect("native object");
+    let exported: Vec<String> =
+        object.symbols().filter_map(|symbol| symbol.name().ok().map(str::to_string)).collect();
+    assert!(
+        exported
+            .iter()
+            .any(|symbol| { symbol == add_symbol || symbol.strip_prefix('_') == Some(add_symbol) }),
+        "the trust-ir name `{add_symbol}` must be the symbol the native object exports for \
+         `add`: {exported:?}"
+    );
+    // MUTATION CONTROL: the def path itself is not a symbol the object exports.
+    assert!(!exported.iter().any(|symbol| symbol == "add" || symbol == "_add"));
+
+    // WS5.2 POSITIVE (roadmap `gen.rs`): two items sharing a leaf name in two modules are two
+    // distinct v0 symbols, each exactly the native object's, each displaying its own def path.
+    // NEGATIVE TWIN: the generic `id<T>` publishes NO definition — the module is monomorphic —
+    // and the call at `id::<u32>` is a bodyless declaration; a closure inside a generic item
+    // gets no symbol either and stays out of the module, refused by name in coverage.
+    // RESIDUAL (WS5.2 NARROWED, docs/DECISION_QUEUE.md D17-DECL-SYMBOL-1): `id::<u32>` is a
+    // generic instance of a local fn — the shape the frozen D17 instance lane appends — so its
+    // declaration keeps the PRE-WS5.2 name, the bare def path `id`, with no display path and no
+    // symbol: the one place `Function.name` is not yet the link-time symbol.
+    rfs::write(
+        "gen.rs",
+        "pub mod a { pub fn same(x: u32) -> u32 { x.wrapping_add(1) } }\n\
+         pub mod b { pub fn same(x: u32) -> u32 { x.wrapping_mul(2) } }\n\
+         #[inline(never)] pub fn id<T>(x: T) -> T { x }\n\
+         pub fn call_id(x: u32) -> u32 { id::<u32>(x) }\n\
+         pub fn generic_parent<T>(_t: T) -> u32 { let c = |x: u32| x.wrapping_add(1); c(1) }\n",
+    );
+    let gen_dir = Path::new("gen-emit");
+    rfs::create_dir(&gen_dir);
+    rustc()
+        .input("gen.rs")
+        .crate_type("lib")
+        .emit("trust-ir")
+        .out_dir(&gen_dir)
+        .arg("-Ztrust-verify=off")
+        .run();
+    rustc()
+        .input("gen.rs")
+        .crate_type("lib")
+        .emit("obj")
+        .out_dir(&native_dir)
+        .arg("-Ztrust-verify=off")
+        .run();
+    let gen_text = rfs::read_to_string(gen_dir.join("gen.trust-ir.txt"));
+    let gen_bytes = rfs::read(native_dir.join("gen.o"));
+    let gen_object = run_make_support::object::File::parse(&*gen_bytes).expect("native gen object");
+    let gen_native: Vec<String> = gen_object
+        .symbols()
+        .filter(|symbol| symbol.is_definition())
+        .filter_map(|symbol| symbol.name().ok().map(str::to_string))
+        .collect();
+    let defines = |name: &str| {
+        gen_native.iter().any(|symbol| symbol == name || symbol.strip_prefix('_') == Some(name))
+    };
+    let a_same = named_by_display_path(&gen_text, "a::same");
+    let b_same = named_by_display_path(&gen_text, "b::same");
+    assert_ne!(a_same, b_same, "two items sharing a leaf are two link-time symbols");
+    for symbol in [a_same, b_same] {
+        assert!(defines(symbol), "`{symbol}` must be defined by the native object: {gen_native:?}");
+    }
+    let id_header = gen_text
+        .lines()
+        .find(|line| line.contains("fn @id("))
+        .expect("the id::<u32> declaration keeps its pre-WS5.2 name `id`");
+    let id_block = &gen_text[gen_text.find(id_header).unwrap()..];
+    let id_block = &id_block[..id_block.find("\n}\n").unwrap()];
+    assert!(
+        !id_block.lines().any(|line| line.trim_start().starts_with("bb")),
+        "the generic `id<T>` must publish no definition, only the instance's declaration:\n{id_block}"
+    );
+    assert!(
+        !gen_text.contains("; #display-path: \"id\""),
+        "the carved-out declaration carries no display path:\n{gen_text}"
+    );
+    assert!(!defines("id"), "the pre-WS5.2 name is not a symbol: {gen_native:?}");
+    let gen_cov = rfs::read_to_string(gen_dir.join("gen.trust-ir.coverage.json"));
+    let closure = body_row(&gen_cov, "generic_parent::{closure#0}");
+    // Refused either as `symbolic` (its lowering mentions the parent's `T`) or, when it does
+    // not, by the WS5.2 backstop `NoLinkTimeSymbol` — either way it is not in the module.
+    assert!(closure.contains("\"spliced\": false"), "{closure}");
+    assert!(
+        closure.contains("\"symbolic\": true")
+            || closure.contains("NoLinkTimeSymbol(generic_parent::{closure#0})"),
+        "{closure}"
+    );
+    assert!(!gen_text.contains("; #display-path: \"generic_parent::{closure#0}\""), "{gen_text}");
+
     // `add` is inside the lowerable fragment: no unsupported shapes, hence no
     // leaf demand to explain.
     let add = body_row(&cov, "add");
     assert_eq!(array_field(add, "unsupported"), Some(""), "`add` must lower cleanly: {add}");
     assert_eq!(array_field(add, "collect_primary"), Some(""));
 
-    // `evens` LOWERS now, and the way it is excluded is the point. It carries
-    // an unrevealed opaque (RPIT), so it is lowered for COVERAGE but never
-    // spliced into the executable module — `symbolic` records exactly that, and
-    // `splice_ok` reads it. Asserting the pair keeps the distinction pinned: a
-    // body that lowers is not thereby a body that ships.
-    //
-    // This assertion previously demanded that `evens` FAIL to lower. That
-    // stopped being true when the lowering improved, and the honest update is
-    // not to weaken it but to move the histogram guarantee to a body that still
-    // declines (below) — otherwise the improvement silently retires the check.
+    // `evens` lowers, but its declared opaque return remains symbolic even
+    // when typeck reveals the hidden Filter in the liberated THIR signature.
+    // That provenance refuses splicing before the independent ZST-callable
+    // check. The concrete-return twin below keeps the latter refusal tested.
     let evens = body_row(&cov, "evens");
     assert_eq!(
         array_field(evens, "unsupported"),
@@ -116,15 +243,75 @@ fn main() {
          win this row pins has been lost: {evens}"
     );
     assert!(
-        evens.contains("\"symbolic\": true"),
-        "`evens` must be marked symbolic — it mentions an unrevealed opaque, and that is \
-         what keeps it OUT of the spliced executable module: {evens}"
+        evens.contains("\"lowered\": true") && evens.contains("\"symbolic\": true"),
+        "`evens` must retain its declared opaque return after lowering: {evens}"
     );
     assert!(
-        evens.contains("\"spliced\": false"),
-        "`evens` lowered but must NOT be spliced: a body reading a value-less global in \
-         the assembled module would be a lie: {evens}"
+        evens.contains("\"spliced\": false")
+            && evens.contains("\"splice_refusal\": \"Splice(symbolic body)\""),
+        "`evens` must not splice while its declared opaque return is unsubstituted: {evens}"
     );
+
+    // Trust: a call-bearing opaque row is deferred, but its seam entry must still be
+    // refused. Its independent ZST-callable refusal must not mask lost declaration provenance.
+    assert!(evens.contains("\"deferred_to_seam\": true"), "{evens}");
+    assert!(
+        evens.contains("\"seam\": { \"state\": \"resolved\", \"verdict\": \"not-run\""),
+        "the deferred opaque entry must not gain seam agreement: {evens}"
+    );
+    assert!(!evens.contains("\"verdict\": \"agreed\""), "{evens}");
+    assert!(evens.contains("declares an opaque return"), "{evens}");
+    assert!(evens.contains("call args carry a ZST closure value"), "{evens}");
+
+    let even_count = body_row(&cov, "even_count");
+    assert_eq!(array_field(even_count, "unsupported"), Some(""), "{even_count}");
+    assert!(even_count.contains("\"lowered\": true"), "{even_count}");
+    assert!(even_count.contains("\"symbolic\": false"), "{even_count}");
+    assert!(even_count.contains("\"spliced\": false"), "{even_count}");
+    assert!(even_count.contains("Splice(zst callable stand-in argument)"), "{even_count}");
+    assert!(!even_count.contains("declares an opaque return"), "{even_count}");
+
+    // Trust: these opaque returns contain no callable stand-in, so only the declared
+    // provenance can explain their classification and exclusion. The scalar/alias twins
+    // ensure that concrete signatures are still compared and spliced.
+    let opaque_dir = Path::new("opaque-emit");
+    rfs::create_dir(&opaque_dir);
+    rustc()
+        .input("opaque_returns.rs")
+        .crate_type("lib")
+        .emit("trust-ir")
+        .out_dir(&opaque_dir)
+        .arg("-Ztrust-verify=off")
+        .run();
+    let opaque_cov = rfs::read_to_string(opaque_dir.join("opaque_returns.trust-ir.coverage.json"));
+    let opaque_text = rfs::read_to_string(opaque_dir.join("opaque_returns.trust-ir.txt"));
+    for name in ["opaque_scalar", "opaque_tuple", "Returner::opaque_associated"] {
+        let row = body_row(&opaque_cov, name);
+        assert!(row.contains("\"lowered\": true"), "{row}");
+        assert_eq!(array_field(row, "unsupported"), Some(""), "{row}");
+        assert!(row.contains("\"symbolic\": true"), "{row}");
+        assert!(row.contains("\"spliced\": false"), "{row}");
+        assert!(row.contains("Splice(symbolic body)"), "{row}");
+        assert!(row.contains("\"interpreter\": { \"verdict\": \"not-run\""), "{row}");
+        assert!(row.contains("\"derived_mir\": { \"verdict\": \"unsupported\""), "{row}");
+        assert!(row.contains("declares an opaque return"), "{row}");
+        assert!(!row.contains("\"verdict\": \"agreed\""), "{row}");
+        assert!(!row.contains("zst callable stand-in"), "{row}");
+        assert!(!row.contains("function contains a direct call"), "{row}");
+        assert!(!opaque_text.contains(&format!("; #display-path: {name:?}\n")), "{name}");
+    }
+    for name in ["plain_scalar", "concrete_alias"] {
+        let row = body_row(&opaque_cov, name);
+        assert!(row.contains("\"lowered\": true"), "{row}");
+        assert!(row.contains("\"symbolic\": false"), "{row}");
+        assert!(row.contains("\"spliced\": true"), "{row}");
+        assert!(row.contains("\"interpreter\": { \"verdict\": \"agreed\""), "{row}");
+        assert!(row.contains("\"derived_mir\": { \"verdict\": \"agreed\""), "{row}");
+        named_by_display_path(&opaque_text, name);
+    }
+    // The closure body is a BodyTy::Fn too, but must never be sent to tcx.fn_sig.
+    let closure = body_row(&opaque_cov, "closure_control::{closure#0}");
+    assert!(closure.contains("\"symbolic\": false"), "{closure}");
 
     // `dyn_call` is outside the lowerable fragment (no static callee). Its
     // first-fail inventory and its collect-all leaf demand must BOTH be

@@ -1,6 +1,6 @@
 //! Small utility helpers shared across full-verification submodules.
 
-use trust_verifier_api::{ArtifactHash, EvidenceArtifact, MetadataEntry, SupportLevel};
+use trust_verifier_api::{ArtifactHash, EvidenceArtifact, SupportLevel};
 
 pub(super) fn status_label(status: trust_verifier_api::EvidenceStatus) -> &'static str {
     status.outcome().as_str()
@@ -31,25 +31,6 @@ pub(super) fn append_unique_artifacts(
             target.push(artifact);
         }
     }
-}
-
-pub(super) fn metadata_u32(metadata: &[MetadataEntry], key: &str) -> Result<Option<u32>, String> {
-    metadata
-        .iter()
-        .find(|entry| entry.key == key)
-        .map(|entry| {
-            entry.value.parse::<u32>().map_err(|_| {
-                format!(
-                    "metadata `{key}` must be an unsigned 32-bit integer, got `{}`",
-                    entry.value
-                )
-            })
-        })
-        .transpose()
-}
-
-pub(super) fn metadata_value<'a>(metadata: &'a [MetadataEntry], key: &str) -> Option<&'a str> {
-    metadata.iter().find(|entry| entry.key == key).map(|entry| entry.value.as_str())
 }
 
 pub(super) fn artifact_hash_label(hash: &ArtifactHash) -> String {

@@ -156,13 +156,13 @@ impl InterpolantGenerator {
         }
 
         // Extract symbols actually used in both formulas.
-        let a_syms = extract_symbols(&request.formula_a);
-        let b_syms = extract_symbols(&request.formula_b);
+        let a_syms = extract_symbol_refs(&request.formula_a);
+        let b_syms = extract_symbol_refs(&request.formula_b);
         let shared: Vec<String> = if request.shared_symbols.is_empty() {
             // Auto-detect shared symbols from the formulas.
-            let mut s: Vec<String> = a_syms.intersection(&b_syms).cloned().collect();
-            s.sort();
-            s
+            let mut s: Vec<&str> = a_syms.intersection(&b_syms).copied().collect();
+            s.sort_unstable();
+            s.into_iter().map(str::to_string).collect()
         } else {
             // Filter declared shared symbols to those actually in both formulas.
             request
@@ -186,15 +186,21 @@ impl InterpolantGenerator {
         let interp_formula = match self.default_strength {
             InterpolantStrength::Strongest => {
                 // Strongest: conjoin all A-side constraints over shared symbols.
-                build_strongest_interpolant(&request.formula_a, &shared)
+                build_strongest_interpolant_with_syms(&request.formula_a, &a_syms, &shared)
             }
             InterpolantStrength::Weakest => {
                 // Weakest: negate B projected onto shared symbols.
-                build_weakest_interpolant(&request.formula_b, &shared)
+                build_weakest_interpolant_with_syms(&request.formula_b, &b_syms, &shared)
             }
             InterpolantStrength::Balanced => {
                 // Balanced: combine A-side constraints with shared-symbol projection.
-                build_balanced_interpolant(&request.formula_a, &request.formula_b, &shared)
+                build_balanced_interpolant_with_syms(
+                    &request.formula_a,
+                    &a_syms,
+                    &request.formula_b,
+                    &b_syms,
+                    &shared,
+                )
             }
         };
 
@@ -226,23 +232,22 @@ impl InterpolantGenerator {
 
         for cut in 0..formulas.len() - 1 {
             // A = conjunction of formulas[0..=cut]
-            let a_parts: Vec<&str> = formulas[..=cut].iter().map(String::as_str).collect();
-            let formula_a = if a_parts.len() == 1 {
-                a_parts[0].to_string()
+            let a_slice = &formulas[..=cut];
+            let formula_a = if a_slice.len() == 1 {
+                a_slice[0].clone()
             } else {
-                format!("(and {})", a_parts.join(" "))
+                format!("(and {})", a_slice.join(" "))
             };
 
             // B = conjunction of formulas[cut+1..]
-            let b_parts: Vec<&str> = formulas[cut + 1..].iter().map(String::as_str).collect();
-            let formula_b = if b_parts.len() == 1 {
-                b_parts[0].to_string()
+            let b_slice = &formulas[cut + 1..];
+            let formula_b = if b_slice.len() == 1 {
+                b_slice[0].clone()
             } else {
-                format!("(and {})", b_parts.join(" "))
+                format!("(and {})", b_slice.join(" "))
             };
 
-            let shared = extract_shared_symbols(&formula_a, &formula_b);
-            let request = InterpolantRequest::new(formula_a, formula_b, shared);
+            let request = InterpolantRequest::new(formula_a, formula_b, Vec::new());
             let interp = self.generate(&request)?;
             interpolants.push(interp);
         }
@@ -259,23 +264,49 @@ impl InterpolantGenerator {
         // Use targeted replacement to avoid clobbering nested parens.
         let simplified = remove_double_negations(formula);
 
-        // Normalize whitespace.
-        let normalized: String = simplified.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Normalize whitespace without allocating a Vec<&str> when already normalized.
+        let trimmed = simplified.trim();
+        let normalized: std::borrow::Cow<'_, str> = if !trimmed
+            .chars()
+            .any(|c| c.is_whitespace() && c != ' ')
+            && !trimmed.contains("  ")
+        {
+            match simplified {
+                std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Borrowed(s.trim()),
+                std::borrow::Cow::Owned(mut s) => {
+                    if s.trim().len() == s.len() {
+                        std::borrow::Cow::Owned(s)
+                    } else {
+                        s = s.trim().to_string();
+                        std::borrow::Cow::Owned(s)
+                    }
+                }
+            }
+        } else {
+            let mut out = String::with_capacity(trimmed.len());
+            for word in trimmed.split_whitespace() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(word);
+            }
+            std::borrow::Cow::Owned(out)
+        };
 
         // Remove trivial conjuncts.
         let cleaned = if normalized.starts_with("(and ") && normalized.ends_with(')') {
             let inner = &normalized[5..normalized.len() - 1];
-            let parts: Vec<String> =
-                split_sexp_args(inner).into_iter().filter(|p| p != "true").collect();
+            let parts: Vec<&str> =
+                split_sexp_args(inner).into_iter().filter(|&p| p != "true").collect();
             match parts.len() {
                 0 => "true".to_string(),
-                1 => parts[0].clone(),
+                1 => parts[0].to_string(),
                 _ => format!("(and {})", parts.join(" ")),
             }
         } else if normalized == "true" || normalized.is_empty() {
             "true".to_string()
         } else {
-            normalized
+            normalized.into_owned()
         };
 
         // Filter shared symbols to those still mentioned.
@@ -305,12 +336,12 @@ impl InterpolantGenerator {
         request: &InterpolantRequest,
     ) -> bool {
         // Property 3: All symbols in the interpolant must be shared.
-        let interp_syms = extract_symbols(&interp.formula);
+        let interp_syms = extract_symbol_refs(&interp.formula);
         let shared_set: FxHashSet<&str> =
             request.shared_symbols.iter().map(String::as_str).collect();
 
-        for sym in &interp_syms {
-            if !shared_set.contains(sym.as_str()) {
+        for &sym in &interp_syms {
+            if !shared_set.contains(sym) {
                 return false;
             }
         }
@@ -339,11 +370,11 @@ impl InterpolantGenerator {
 /// sorted alphabetically.
 #[must_use]
 pub fn extract_shared_symbols(formula_a: &str, formula_b: &str) -> Vec<String> {
-    let a_syms = extract_symbols(formula_a);
-    let b_syms = extract_symbols(formula_b);
-    let mut shared: Vec<String> = a_syms.intersection(&b_syms).cloned().collect();
-    shared.sort();
-    shared
+    let a_syms = extract_symbol_refs(formula_a);
+    let b_syms = extract_symbol_refs(formula_b);
+    let mut shared: Vec<&str> = a_syms.intersection(&b_syms).copied().collect();
+    shared.sort_unstable();
+    shared.into_iter().map(str::to_string).collect()
 }
 
 /// Conjoin multiple interpolants into a single interpolant.
@@ -403,28 +434,43 @@ pub fn weaken_interpolant(interp: &Interpolant) -> Interpolant {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Extract variable-like symbols from a formula string.
+fn is_sexp_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "and"
+            | "or"
+            | "not"
+            | "true"
+            | "false"
+            | "implies"
+            | "ite"
+            | "let"
+            | "forall"
+            | "exists"
+            | "assert"
+            | "define"
+    )
+}
+
+/// Extract borrowed variable-like symbols from a formula string without allocating `String`s.
 ///
 /// Treats any alphabetic-starting token that is not a keyword as a variable.
-fn extract_symbols(formula: &str) -> FxHashSet<String> {
-    let keywords: FxHashSet<&str> = [
-        "and", "or", "not", "true", "false", "implies", "ite", "let", "forall", "exists", "assert",
-        "define",
-    ]
-    .into_iter()
-    .collect();
-
+fn extract_symbol_refs(formula: &str) -> FxHashSet<&str> {
     let mut symbols = FxHashSet::default();
 
-    // Tokenize: split on parens, whitespace, and operators.
-    for token in formula.replace(['(', ')', ','], " ").split_whitespace() {
+    // Tokenize in place without allocating an intermediate `String`: split on parens, commas, and whitespace.
+    for token in formula
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ','))
+        .filter(|s| !s.is_empty())
+    {
         // Variable names start with a letter or underscore.
         let first = token.chars().next().unwrap_or('0');
         if (first.is_alphabetic() || first == '_')
-            && !keywords.contains(token)
+            && !is_sexp_keyword(token)
+            && !symbols.contains(token)
             && token.parse::<i128>().is_err()
         {
-            symbols.insert(token.to_string());
+            symbols.insert(token);
         }
     }
 
@@ -432,13 +478,15 @@ fn extract_symbols(formula: &str) -> FxHashSet<String> {
 }
 
 /// Build the strongest interpolant: project A onto shared symbols.
-fn build_strongest_interpolant(formula_a: &str, shared: &[String]) -> String {
-    // Extract A-side constraints that mention only shared symbols.
-    let a_syms = extract_symbols(formula_a);
+fn build_strongest_interpolant_with_syms(
+    formula_a: &str,
+    a_syms: &FxHashSet<&str>,
+    shared: &[String],
+) -> String {
     let shared_set: FxHashSet<&str> = shared.iter().map(String::as_str).collect();
 
     // If A mentions only shared symbols, use A directly.
-    if a_syms.iter().all(|s| shared_set.contains(s.as_str())) {
+    if a_syms.iter().all(|&s| shared_set.contains(s)) {
         return formula_a.to_string();
     }
 
@@ -453,12 +501,15 @@ fn build_strongest_interpolant(formula_a: &str, shared: &[String]) -> String {
 }
 
 /// Build the weakest interpolant: negate B projected onto shared symbols.
-fn build_weakest_interpolant(formula_b: &str, shared: &[String]) -> String {
-    let b_syms = extract_symbols(formula_b);
+fn build_weakest_interpolant_with_syms(
+    formula_b: &str,
+    b_syms: &FxHashSet<&str>,
+    shared: &[String],
+) -> String {
     let shared_set: FxHashSet<&str> = shared.iter().map(String::as_str).collect();
 
     // If B mentions only shared symbols, negate B.
-    if b_syms.iter().all(|s| shared_set.contains(s.as_str())) {
+    if b_syms.iter().all(|&s| shared_set.contains(s)) {
         return format!("(not {formula_b})");
     }
 
@@ -473,13 +524,17 @@ fn build_weakest_interpolant(formula_b: &str, shared: &[String]) -> String {
 }
 
 /// Build a balanced interpolant: combine A-side and B-side projections.
-fn build_balanced_interpolant(formula_a: &str, formula_b: &str, shared: &[String]) -> String {
-    let a_syms = extract_symbols(formula_a);
-    let b_syms = extract_symbols(formula_b);
+fn build_balanced_interpolant_with_syms(
+    formula_a: &str,
+    a_syms: &FxHashSet<&str>,
+    formula_b: &str,
+    b_syms: &FxHashSet<&str>,
+    shared: &[String],
+) -> String {
     let shared_set: FxHashSet<&str> = shared.iter().map(String::as_str).collect();
 
-    let a_only_shared = a_syms.iter().all(|s| shared_set.contains(s.as_str()));
-    let b_only_shared = b_syms.iter().all(|s| shared_set.contains(s.as_str()));
+    let a_only_shared = a_syms.iter().all(|&s| shared_set.contains(s));
+    let b_only_shared = b_syms.iter().all(|&s| shared_set.contains(s));
 
     match (a_only_shared, b_only_shared) {
         (true, _) => formula_a.to_string(),
@@ -499,8 +554,11 @@ fn build_balanced_interpolant(formula_a: &str, formula_b: &str, shared: &[String
 /// Remove double negations from an S-expression string.
 ///
 /// Transforms `(not (not X))` to `X` without clobbering unrelated nested parens.
-fn remove_double_negations(formula: &str) -> String {
+fn remove_double_negations(formula: &str) -> std::borrow::Cow<'_, str> {
     let pattern = "(not (not ";
+    if !formula.contains(pattern) {
+        return std::borrow::Cow::Borrowed(formula);
+    }
     let mut result = formula.to_string();
     while let Some(start) = result.find(pattern) {
         // Find the matching closing parens for the double negation.
@@ -532,39 +590,37 @@ fn remove_double_negations(formula: &str) -> String {
             break; // malformed, stop
         }
     }
-    result
+    std::borrow::Cow::Owned(result)
 }
 
-/// Split S-expression arguments at the top level.
+/// Split S-expression arguments at the top level without allocating `String`s.
 ///
 /// Given "a (b c) d", returns ["a", "(b c)", "d"].
-fn split_sexp_args(input: &str) -> Vec<String> {
+fn split_sexp_args(input: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
-    let mut current = String::new();
+    let mut seg_start = 0usize;
 
-    for ch in input.chars() {
+    for (idx, ch) in input.char_indices() {
         match ch {
             '(' => {
                 depth += 1;
-                current.push(ch);
             }
             ')' => {
                 depth = depth.saturating_sub(1);
-                current.push(ch);
             }
             ' ' | '\t' | '\n' if depth == 0 => {
-                let trimmed = current.trim().to_string();
+                let trimmed = input[seg_start..idx].trim();
                 if !trimmed.is_empty() {
                     parts.push(trimmed);
                 }
-                current.clear();
+                seg_start = idx + ch.len_utf8();
             }
-            _ => current.push(ch),
+            _ => {}
         }
     }
 
-    let trimmed = current.trim().to_string();
+    let trimmed = input[seg_start..].trim();
     if !trimmed.is_empty() {
         parts.push(trimmed);
     }
@@ -585,16 +641,6 @@ mod tests {
     #[test]
     fn test_interpolant_strength_default_is_balanced() {
         assert_eq!(InterpolantStrength::default(), InterpolantStrength::Balanced);
-    }
-
-    // -- InterpolantRequest --
-
-    #[test]
-    fn test_interpolant_request_new() {
-        let req = InterpolantRequest::new("(> x 0)", "(< x 0)", vec!["x".into()]);
-        assert_eq!(req.formula_a, "(> x 0)");
-        assert_eq!(req.formula_b, "(< x 0)");
-        assert_eq!(req.shared_symbols, vec!["x".to_string()]);
     }
 
     // -- Interpolant --

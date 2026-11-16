@@ -1,0 +1,109 @@
+{
+  "name": "bug_w1_u128_identity_ge1",
+  "def_path": "probes_128_false::bug_w1_u128_identity_ge1",
+  "span": {
+    "file": "probes_128_false.rs",
+    "line_start": 4,
+    "col_start": 0,
+    "line_end": 4,
+    "col_end": 74
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": "x"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "probes_128_false.rs",
+                "line_start": 4,
+                "col_start": 74,
+                "line_end": 4,
+                "col_end": 74
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 128,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "probes_128_false.rs",
+        "line_start": 4,
+        "col_start": 57,
+        "line_end": 4,
+        "col_end": 68
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) >= (1)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Ge": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": 1
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) >= (1)"
+    ],
+    "invariants": []
+  }
+}

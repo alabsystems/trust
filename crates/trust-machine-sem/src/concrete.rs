@@ -1255,28 +1255,6 @@ fn signed_to_i128(value: u128, width: u32) -> i128 {
     }
 }
 
-// Verifier-demo fixtures: these intentionally exercise overflow and bounds
-// checks so the Trust verification pass has known-broken targets it can
-// catch in tests and CI gating. Kept above `mod tests` so clippy does not
-// flag them with `items_after_test_module`.
-pub fn test_verify_overflow(a: u32, b: u32) -> u32 {
-    a + b // This can definitely overflow.
-}
-
-pub fn test_verify_bounds(arr: &[u32], idx: usize) -> u32 {
-    arr[idx] // This can definitely go out of bounds.
-}
-
-// Mirror fixture for the verifier — contract-clause form. The
-// `contract_requires` syntax requires `#![feature(contracts_internals)]`
-// at the crate root (see lib.rs). Kept above the test module to avoid
-// `items_after_test_module`.
-pub fn trigger_trust_verifier_overflow_again(a: usize, b: usize) -> usize
-contract_requires { a <= b }
-{
-    a + (b - a) / 2
-}
-
 #[cfg(test)]
 mod tests {
     use trust_types::{Formula, Sort};

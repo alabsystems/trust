@@ -7,15 +7,14 @@ assert-document-property: {"title": |title|}
 
 call-function: ("perform-search", {"query": "test"})
 
-assert-document-property: {"title": '"test" Search - Rust'}
+assert-document-property: {"title": '"test" Search - Trust'}
 
 set-property: (".search-input", {"value": "another one"})
 // To be SURE that the search will be run.
 press-key: 'Enter'
-wait-for: "#crate-search"
-wait-for-false: "#search-tabs .count.loading"
+call-function: ("wait-for-search-results", {})
 
-assert-document-property: {"title": '"another one" Search - Rust'}
+assert-document-property: {"title": '"another one" Search - Trust'}
 
 press-key: "Escape"
 
@@ -25,10 +24,10 @@ assert-document-property: {"title": |title|}
 go-to: "file://" + |DOC_PATH| + "/test_docs/all.html"
 assert-document-property: {"title": "List of all items in this crate"}
 call-function: ("perform-search", {"query": "verify"})
-assert-document-property: {"title": '"verify" Search - Rust'}
+assert-document-property: {"title": '"verify" Search - Trust'}
 
 // check that index.html does it correctly, too.
 go-to: "file://" + |DOC_PATH| + "/index.html"
 assert-document-property: {"title": "Index of crates"}
 call-function: ("perform-search", {"query": "verify"})
-assert-document-property: {"title": '"verify" Search - Rust'}
+assert-document-property: {"title": '"verify" Search - Trust'}

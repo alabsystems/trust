@@ -5,12 +5,13 @@ use run_make_support::{bin_name, cmd, rfs, rustc_path, serde_json};
 const TRUST_VANILLA_REAL_RUSTC_ENV: &str = "__COMPILETEST_TRUST_VANILLA_REAL_RUSTC";
 const CRATE_NAME: &str = "enum_differential";
 const DUMP_DIRECTORY: &str = "enum-differential-ir";
-const REQUIRED_AGREED: [&str; 5] = [
+const REQUIRED_AGREED: [&str; 6] = [
     "option_default_match",
     "signed_negative_discriminant",
     "multi_payload_field_lanes",
     "fieldless_reassignment",
     "nested_holder_round_trip",
+    "distinct_generic_enum_instantiations",
 ];
 const REQUIRED_FAIL_CLOSED: [&str; 2] =
     ["option_wildcard_before_variant", "multi_wildcard_before_variant"];
@@ -94,7 +95,7 @@ fn main() {
             body["differentials"]["deferred_to_seam"], false,
             "`{required}` escaped the per-body differential: {body}"
         );
-        // Trust (B3 enum-lowering drift): these bodies keep scalar parameters, so
+        // Trust (B3 enum-lowering drift): the older cases keep scalar parameters, so
         // the interpreter still EXECUTES them (samples > 0) — the coverage-only
         // skip the fixture guards against is the ENUM-PARAMETER skip, which is
         // still avoided. But each body now CONSTRUCTS an enum internally, which
@@ -108,16 +109,51 @@ fn main() {
         let interpreter = &body["differentials"]["interpreter"];
         let interpreter_verdict =
             interpreter["verdict"].as_str().expect("interpreter verdict must be typed text");
-        assert!(
-            matches!(interpreter_verdict, "agreed" | "not-run"),
-            "`{required}` interpreter verdict must be agreement or a conservative \
-             coverage-only skip, never a divergence, got `{interpreter_verdict}`: {body}"
-        );
+        if required == "distinct_generic_enum_instantiations" {
+            // This scalar-input case has exact interpretation; a downgrade must fail.
+            assert_eq!(interpreter_verdict, "agreed", "generic enum agreement regressed: {body}");
+            assert_eq!(body["symbolic"], false, "generic enum case became symbolic: {body}");
+            assert_eq!(
+                body["unsupported"],
+                serde_json::json!([]),
+                "generic enum case gained unsupported rows: {body}"
+            );
+        } else {
+            assert!(
+                matches!(interpreter_verdict, "agreed" | "not-run"),
+                "`{required}` interpreter verdict must be agreement or a conservative \
+                 coverage-only skip, never a divergence, got `{interpreter_verdict}`: {body}"
+            );
+        }
         assert!(
             interpreter["samples"].as_u64().is_some_and(|samples| samples > 0),
             "`{required}` interpreter differential carried no executed samples: {body}"
         );
     }
+
+    // The two concrete payload types must retain distinct enum declarations.
+    // Layout and absolute IDs may vary with the target and surrounding rows.
+    let ir_path = PathBuf::from(DUMP_DIRECTORY).join(format!("{CRATE_NAME}.trust-ir.txt"));
+    let ir = String::from_utf8(rfs::read(&ir_path)).expect("Trust IR text must be UTF-8");
+    let payload_rows = ir
+        .lines()
+        .filter(|line| line.starts_with("enum @GenericPayload "))
+        .collect::<Vec<_>>();
+    assert_eq!(payload_rows.len(), 2, "expected two concrete GenericPayload rows: {ir}");
+    let payload_id = |field: &str| {
+        let matching = payload_rows
+            .iter()
+            .filter(|line| line.contains(&format!("Present({field})")))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "expected one GenericPayload<{field}> row: {ir}");
+        matching[0]
+            .rsplit_once(" id=")
+            .expect("enum declaration must name its ID")
+            .1
+            .parse::<u32>()
+            .expect("enum declaration ID must be numeric")
+    };
+    assert_ne!(payload_id("u8"), payload_id("i64"), "concrete enum IDs collapsed: {ir}");
 
     for required in REQUIRED_FAIL_CLOSED {
         let matching = bodies

@@ -1,9 +1,10 @@
 # Trust workspace cargo config.
 #
-# A small set of Trust verification crates uses the compiler-internal
-# `contracts_internals` feature for `contract_requires { ... }` fixtures. Keep
-# the bootstrap escape scoped to those crates so ordinary workspace Cargo
-# invocations do not receive blanket unstable-feature semantics.
+# No compiler selection and no verification flags live here: `targo` owns the
+# verified/unverified lane and per-unit scope (CLAUDE.md "Consuming repos").
+# The commented-out RUSTC_BOOTSTRAP allowlist and the trust-rustc-guard
+# RUSTC_WRAPPER that sat in [env] were removed on 2026-09-28 (Trust for all ALab
+# systems: docs/OWNER_RULINGS.md OW-37); `git log -p -- .cargo/config.toml` has them.
 #
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -12,40 +13,19 @@
 #   bootstrap.toml sets `incremental = false`, but that knob is SCOPED to the
 #   rustc self-build only (the stage1/stage2 compiler self-compilation, where an
 #   interrupted incremental build once produced a corrupted-mmap SIGBUS). It does
-#   NOT govern the Trust-owned `crates/` workspace. This config sets no
-#   `[build] incremental`, so the `crates/` workspace keeps Cargo's default
-#   `incremental = true` for fast crates-only iteration (`targo check`,
-#   `scripts/check_all.sh`). Do not "unify" these: the bootstrap disable is a
+#   NOT govern the Trust developer default-members. This config sets no
+#   `[build] incremental`, so the developer library set keeps Cargo's default
+#   `incremental = true` for fast crates-only iteration (`targo --unverified check`,
+#   `targo --unverified test`). Do not "unify" these: the bootstrap disable is a
 #   self-build stability fix, not a workspace-wide policy.
 
 [build]
-# Spark shares its 128 GiB UMA pool with the GPU and desktop. Keep raw Cargo
-# invocations from fanning out across all 20 CPUs; callers can still select a
-# smaller limit for especially heavy bridge or proof builds.
-jobs = 4
-
-[env]
-# trust_vcgen was dropped from this allowlist: its `#![feature(contracts_internals)]`
-# + `#![feature(register_tool)]` gates were removed at the root (see
-# crates/trust-vcgen/src/lib.rs), so it now builds on the stable release channel
-# with no bootstrap escape. The remaining three crates still carry
-# `contract_requires { ... }` fixtures / `#[trust::..]` attributes that require it.
-# Windows genesis build: disabled — these crates are not built in the stage2
-# compiler/std/targo pass, and an inherited RUSTC_BOOTSTRAP poisons bootstrap.
-# RUSTC_BOOTSTRAP = "trust_mir_extract,trust_machine_sem,trust_cache"
-
-# Nudge humans off raw `cargo` and onto `targo` (see scripts/trust-rustc-guard.sh).
-# Raw cargo can serve a stale trustc (cache-hit ⇒ trustc never re-runs) and skips
-# the verifier flags; targo force-cleans + pins stage2 trustc + injects them.
-# The guard is a RUSTC_WRAPPER so it sees every rustc spawn (a build.rs would miss
-# the cache-hit case). It only WARNS (one notice/build) and execs the real rustc,
-# so it can't break x.py or targo; it stays silent for compiler descendants
-# marked by targo (`TRUST_TARGO_FRONTEND=1`) and for cargo's probe invocations.
-# `force = false` lets targo's own RUSTC_WRAPPER win. Set TRUST_STRICT_CARGO=1
-# for hard-fail; TRUST_RUSTC_GUARD=off to disable.
-# Windows genesis build: disabled — this is a POSIX shell script and cannot be
-# spawned as a RUSTC_WRAPPER on Windows (would break every rustc invocation).
-# RUSTC_WRAPPER = { value = "scripts/trust-rustc-guard.sh", relative = true, force = false }
+# One native target location for root, library-member and Targo entrypoints.
+# Preserve the established developer cache; explicit target directories used
+# by bootstrap and isolated qualification builds still override this default.
+# Machine admission belongs to build-slot, which measures the current host and
+# reserves its CPU share. A checked-in count from another machine must not cap
+# native Targo on every host; explicit caller limits still take precedence.
 
 # Some submodules under first-party/ reach the `alabsystems/ay` private
 # repository through hard-pinned HTTPS git URLs in their own workspaces. Trust's

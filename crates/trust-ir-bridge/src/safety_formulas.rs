@@ -382,10 +382,7 @@ fn substitute_bin(
     b: Box<Formula>,
     subs: &[(String, Formula)],
 ) -> Result<Formula, FormulaDecline> {
-    Ok(ctor(
-        Box::new(substitute_scalar(*a, subs)?),
-        Box::new(substitute_scalar(*b, subs)?),
-    ))
+    Ok(ctor(Box::new(substitute_scalar(*a, subs)?), Box::new(substitute_scalar(*b, subs)?)))
 }
 
 /// Replace every placeholder `Var` with its composed nested term. The walk is
@@ -452,16 +449,13 @@ pub(crate) fn substitute_nested_operands(
         return Ok(formula);
     }
     let out = substitute_scalar(formula, subs)?;
-    let mut leftover = false;
-    out.visit(&mut |node| {
+    let leftover = trust_types::any_formula_node(&out, &mut |node| {
         let name = match node {
             Formula::Var(name, _) => Some(name.as_str()),
             Formula::SymVar(sym, _) => Some(sym.as_str()),
             _ => None,
         };
-        if let Some(name) = name {
-            leftover |= name.starts_with(NESTED_OPERAND_PLACEHOLDER_PREFIX);
-        }
+        name.is_some_and(|n| n.starts_with(NESTED_OPERAND_PLACEHOLDER_PREFIX))
     });
     if leftover {
         return Err(FormulaDecline::OutsideBuilderEnvelope {
@@ -528,7 +522,10 @@ fn synthesize_env(
     Ok((locals, out, subs))
 }
 
-fn require_operands(operands: &[DirectFormulaOperand], expected: usize) -> Result<(), FormulaDecline> {
+fn require_operands(
+    operands: &[DirectFormulaOperand],
+    expected: usize,
+) -> Result<(), FormulaDecline> {
     if operands.len() == expected {
         Ok(())
     } else {
@@ -556,8 +553,7 @@ fn require_mintable_names(operands: &[DirectFormulaOperand]) -> Result<(), Formu
     // operand is actually in play — without one, nothing is synthesized in
     // that prefix and a user name there stays mintable (increment-1 behavior
     // preserved, pinned by `nested_operand_mint_unit_pins`).
-    let has_nested =
-        operands.iter().any(|op| matches!(op, DirectFormulaOperand::Nested { .. }));
+    let has_nested = operands.iter().any(|op| matches!(op, DirectFormulaOperand::Nested { .. }));
     for op in operands {
         require_mintable_name(op, has_nested)?;
     }
@@ -579,9 +575,7 @@ fn require_mintable_name(
             {
                 return Err(FormulaDecline::SyntheticNameCollision);
             }
-            if guard_placeholder_namespace
-                && name.starts_with(NESTED_OPERAND_PLACEHOLDER_PREFIX)
-            {
+            if guard_placeholder_namespace && name.starts_with(NESTED_OPERAND_PLACEHOLDER_PREFIX) {
                 // A user name inside the reserved placeholder prefix would
                 // alias a synthesized local (the builder would then demote
                 // BOTH to `_<index>` and the substitution would miss) —
@@ -618,7 +612,7 @@ fn fallback_shaped(name: &str) -> bool {
 fn sweep_no_guessed_mir_index(formula: &Formula) -> Result<(), FormulaDecline> {
     let mut guessed = false;
     let mut synthetic = false;
-    formula.visit(&mut |node| {
+    let _ = trust_types::all_formula_nodes(formula, &mut |node| {
         let name = match node {
             Formula::Var(name, _) => Some(name.as_str()),
             Formula::SymVar(sym, _) => Some(sym.as_str()),
@@ -631,10 +625,15 @@ fn sweep_no_guessed_mir_index(formula: &Formula) -> Result<(), FormulaDecline> {
                     .and_then(|rest| rest.strip_prefix('_'))
             });
             let base = base.unwrap_or(name);
-            guessed |= fallback_shaped(base);
-            synthetic |=
-                trust_types::source_contract_synthetic_name_collision(base).is_some();
+            if fallback_shaped(base) {
+                guessed = true;
+                return false;
+            }
+            if !synthetic {
+                synthetic = trust_types::source_contract_synthetic_name_collision(base).is_some();
+            }
         }
+        true
     });
     if guessed {
         Err(FormulaDecline::FallbackShapedVarWouldGuessMirIndex)
@@ -666,8 +665,7 @@ pub fn mint_direct_safety_formula(
     // exactly what the class fields repeat), so one shared guard covers all
     // seven classes.
     require_nested_widths(operands, width, signed)?;
-    let has_nested =
-        operands.iter().any(|op| matches!(op, DirectFormulaOperand::Nested { .. }));
+    let has_nested = operands.iter().any(|op| matches!(op, DirectFormulaOperand::Nested { .. }));
     let formula = match class {
         DirectFormulaClass::OverflowAddSub { op } => {
             require_operands(operands, 2)?;
@@ -777,8 +775,7 @@ pub fn mint_direct_safety_formula(
         }
     };
     sweep_no_guessed_mir_index(&formula)?;
-    let formula_json =
-        serde_json::to_string(&formula).map_err(|_| FormulaDecline::RenderFailed)?;
+    let formula_json = serde_json::to_string(&formula).map_err(|_| FormulaDecline::RenderFailed)?;
     let smtlib = formula.to_smtlib();
     Ok(MintedDirectFormula { formula, formula_json, smtlib })
 }
@@ -800,9 +797,9 @@ pub fn mint_direct_safety_formula(
 #[cfg(test)]
 mod parity_oracle {
     use trust_types::{
-        AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand,
-        Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, UnOp,
-        UnwindEdge, VerifiableBody, VerifiableFunction,
+        AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place,
+        Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, UnOp, UnwindEdge,
+        VerifiableBody, VerifiableFunction,
     };
 
     use super::{
@@ -813,12 +810,12 @@ mod parity_oracle {
     // the real-record grader and this model oracle share one vocabulary; the
     // 41/41 + per-class-floor pins passing unchanged was the refactor's gate.
     use crate::direct_record_grading::{
-        AssertReport, DirectSide, Grade, class_label, grade_pair, load_corpus_dir,
-        print_scorecard, tally,
+        AssertReport, DirectSide, Grade, class_label, grade_pair, load_corpus_dir, print_scorecard,
+        tally,
     };
     use crate::lower::{
-        SafetyPredicate, find_block_binary_operands, find_block_neg_operand,
-        find_condition_binary_operands, find_divrem_on_assert_target_chain,
+        SafetyPredicate, find_block_binary_operands, find_block_neg_statement,
+        find_condition_binary_operands, find_divrem_on_assert_target_chain, neg_operand_int_ty,
         reconstruct_assert_safety_predicate, safety_int_op_type, safety_operand_int_ty,
         safety_operand_int_ty_or_const,
     };
@@ -915,10 +912,8 @@ mod parity_oracle {
                 convert_nested_checked(func, place.local)
             }
             Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
-                let decl = locals
-                    .iter()
-                    .find(|d| d.index == place.local)
-                    .ok_or("opaque-operand")?;
+                let decl =
+                    locals.iter().find(|d| d.index == place.local).ok_or("opaque-operand")?;
                 let is_param = (1..=arg_count).contains(&place.local);
                 match (&decl.name, is_param) {
                     (Some(name), true) => {
@@ -942,9 +937,7 @@ mod parity_oracle {
                             defs_of(func, place.local).as_slice()
                         {
                             if src.projections.is_empty()
-                                && locals
-                                    .iter()
-                                    .any(|d| d.index == src.local && d.name.is_some())
+                                && locals.iter().any(|d| d.index == src.local && d.name.is_some())
                             {
                                 return Err("ambiguous-operand-name");
                             }
@@ -981,12 +974,8 @@ mod parity_oracle {
         func: &VerifiableFunction,
         local: usize,
     ) -> Result<(DirectFormulaOperand, bool), &'static str> {
-        let decl = func
-            .body
-            .locals
-            .iter()
-            .find(|d| d.index == local)
-            .ok_or("unnamed-temp-operand")?;
+        let decl =
+            func.body.locals.iter().find(|d| d.index == local).ok_or("unnamed-temp-operand")?;
         let Ty::Tuple(elems) = &decl.ty else { return Err("unnamed-temp-operand") };
         let [value_ty, Ty::Bool] = elems.as_slice() else {
             return Err("unnamed-temp-operand");
@@ -1121,10 +1110,9 @@ mod parity_oracle {
                 let value_bits = safety_operand_int_ty(locals, value)
                     .or_else(|| deep_operand_int_ty(func, value))
                     .map_or(0, |(w, _)| w);
-                let (amount_width, amount_signed) =
-                    safety_operand_int_ty_or_const(locals, amount)
-                        .or_else(|| deep_operand_int_ty(func, amount))
-                        .unwrap_or((0, false));
+                let (amount_width, amount_signed) = safety_operand_int_ty_or_const(locals, amount)
+                    .or_else(|| deep_operand_int_ty(func, amount))
+                    .unwrap_or((0, false));
                 let (converted, shadowed) =
                     match convert_operand(func, amount).map(|(c, s)| (vec![c], s)) {
                         Ok(converted) => converted,
@@ -1158,9 +1146,7 @@ mod parity_oracle {
                     .and_then(|b| find_block_binary_operands(b, want))
                     .map(|(_, d)| d)
                     .or_else(|| find_block_binary_operands(block, want).map(|(_, d)| d))
-                    .or_else(|| {
-                        find_divrem_on_assert_target_chain(&body.blocks, *target, want)
-                    });
+                    .or_else(|| find_divrem_on_assert_target_chain(&body.blocks, *target, want));
                 let Some(divisor) = divisor else {
                     return Some(ModelSide::Excluded("no-divrem-op-found"));
                 };
@@ -1180,12 +1166,21 @@ mod parity_oracle {
                 ModelSide::Case { class, width, signed, operands: converted, shadowed }
             }
             AssertMessage::OverflowNeg => {
-                let Some(neg_op) = block_by_id(*target).and_then(find_block_neg_operand) else {
+                let Some((neg_dest, neg_op)) =
+                    block_by_id(*target).and_then(find_block_neg_statement)
+                else {
                     return Some(ModelSide::Excluded("no-neg-op-found"));
                 };
-                let (width, signed) = safety_operand_int_ty_or_const(locals, neg_op)
-                    .or_else(|| deep_operand_int_ty(func, neg_op))
-                    .unwrap_or((0, false));
+                // The capture reads the negation's own THIR type; for a width-less
+                // literal operand that is the Neg's destination type, never the
+                // literal's value-derived width.
+                let (width, signed) = if matches!(neg_op, Operand::Constant(ConstValue::Int(_))) {
+                    neg_operand_int_ty(locals, neg_dest, neg_op)
+                } else {
+                    safety_operand_int_ty_or_const(locals, neg_op)
+                        .or_else(|| deep_operand_int_ty(func, neg_op))
+                }
+                .unwrap_or((0, false));
                 let (converted, shadowed) =
                     match convert_operand(func, neg_op).map(|(c, s)| (vec![c], s)) {
                         Ok(converted) => converted,
@@ -1310,11 +1305,7 @@ mod parity_oracle {
     /// The `(value, overflowed)` pair a MIR `CheckedBinaryOp` materializes —
     /// the increment-3 nested band's carrier (always unnamed in real MIR).
     fn checked_pair_local(index: usize, width: u32, signed: bool) -> LocalDecl {
-        LocalDecl {
-            index,
-            ty: Ty::Tuple(vec![Ty::Int { width, signed }, Ty::Bool]),
-            name: None,
-        }
+        LocalDecl { index, ty: Ty::Tuple(vec![Ty::Int { width, signed }, Ty::Bool]), name: None }
     }
 
     fn assign(dest: usize, rvalue: Rvalue) -> Statement {
@@ -1367,6 +1358,7 @@ mod parity_oracle {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1456,10 +1448,7 @@ mod parity_oracle {
                     ],
                     vec![
                         assert_block(0, vec![], 1, AssertMessage::OverflowNeg, 1),
-                        return_block(
-                            1,
-                            vec![assign(2, Rvalue::UnaryOp(UnOp::Neg, copy(1)))],
-                        ),
+                        return_block(1, vec![assign(2, Rvalue::UnaryOp(UnOp::Neg, copy(1)))]),
                     ],
                     1,
                 ),
@@ -1477,10 +1466,7 @@ mod parity_oracle {
                     ],
                     vec![
                         assert_block(0, vec![], 1, AssertMessage::OverflowNeg, 1),
-                        return_block(
-                            1,
-                            vec![assign(2, Rvalue::UnaryOp(UnOp::Neg, copy(1)))],
-                        ),
+                        return_block(1, vec![assign(2, Rvalue::UnaryOp(UnOp::Neg, copy(1)))]),
                     ],
                     1,
                 ),
@@ -1500,10 +1486,7 @@ mod parity_oracle {
                     vec![
                         assert_block(
                             0,
-                            vec![assign(
-                                3,
-                                Rvalue::CheckedBinaryOp(BinOp::Add, copy(1), copy(2)),
-                            )],
+                            vec![assign(3, Rvalue::CheckedBinaryOp(BinOp::Add, copy(1), copy(2)))],
                             3,
                             AssertMessage::Overflow(BinOp::Add),
                             1,
@@ -1527,10 +1510,7 @@ mod parity_oracle {
                     vec![
                         assert_block(
                             0,
-                            vec![assign(
-                                3,
-                                Rvalue::CheckedBinaryOp(BinOp::Sub, copy(1), copy(2)),
-                            )],
+                            vec![assign(3, Rvalue::CheckedBinaryOp(BinOp::Sub, copy(1), copy(2)))],
                             3,
                             AssertMessage::Overflow(BinOp::Sub),
                             1,
@@ -1555,10 +1535,7 @@ mod parity_oracle {
                     vec![
                         assert_block(
                             0,
-                            vec![assign(
-                                3,
-                                Rvalue::CheckedBinaryOp(BinOp::Mul, copy(1), copy(2)),
-                            )],
+                            vec![assign(3, Rvalue::CheckedBinaryOp(BinOp::Mul, copy(1), copy(2)))],
                             3,
                             AssertMessage::Overflow(BinOp::Mul),
                             1,
@@ -1582,19 +1559,10 @@ mod parity_oracle {
                     ],
                     vec![
                         assert_block(0, vec![], 3, AssertMessage::DivisionByZero, 1),
-                        assert_block(
-                            1,
-                            vec![],
-                            4,
-                            AssertMessage::Overflow(BinOp::Div),
-                            2,
-                        ),
+                        assert_block(1, vec![], 4, AssertMessage::Overflow(BinOp::Div), 2),
                         return_block(
                             2,
-                            vec![assign(
-                                3,
-                                Rvalue::BinaryOp(BinOp::Div, copy(1), copy(2)),
-                            )],
+                            vec![assign(3, Rvalue::BinaryOp(BinOp::Div, copy(1), copy(2)))],
                         ),
                     ],
                     2,
@@ -1620,10 +1588,7 @@ mod parity_oracle {
                         assert_block(0, vec![], 3, AssertMessage::DivisionByZero, 1),
                         return_block(
                             1,
-                            vec![assign(
-                                3,
-                                Rvalue::BinaryOp(BinOp::Div, copy(1), copy(2)),
-                            )],
+                            vec![assign(3, Rvalue::BinaryOp(BinOp::Div, copy(1), copy(2)))],
                         ),
                     ],
                     2,
@@ -1643,10 +1608,7 @@ mod parity_oracle {
                         assert_block(0, vec![], 3, AssertMessage::RemainderByZero, 1),
                         return_block(
                             1,
-                            vec![assign(
-                                3,
-                                Rvalue::BinaryOp(BinOp::Rem, copy(1), copy(2)),
-                            )],
+                            vec![assign(3, Rvalue::BinaryOp(BinOp::Rem, copy(1), copy(2)))],
                         ),
                     ],
                     2,
@@ -1666,10 +1628,7 @@ mod parity_oracle {
                     vec![
                         assert_block(
                             0,
-                            vec![assign(
-                                3,
-                                Rvalue::CheckedBinaryOp(BinOp::Shl, copy(1), copy(2)),
-                            )],
+                            vec![assign(3, Rvalue::CheckedBinaryOp(BinOp::Shl, copy(1), copy(2)))],
                             3,
                             AssertMessage::Overflow(BinOp::Shl),
                             1,
@@ -1876,10 +1835,7 @@ mod parity_oracle {
                         assert_block(
                             0,
                             vec![
-                                assign(
-                                    4,
-                                    Rvalue::CheckedBinaryOp(BinOp::Add, copy(1), copy(2)),
-                                ),
+                                assign(4, Rvalue::CheckedBinaryOp(BinOp::Add, copy(1), copy(2))),
                                 assign(
                                     5,
                                     Rvalue::CheckedBinaryOp(
@@ -1919,10 +1875,7 @@ mod parity_oracle {
                         assert_block(
                             0,
                             vec![
-                                assign(
-                                    4,
-                                    Rvalue::CheckedBinaryOp(BinOp::Add, copy(1), copy(2)),
-                                ),
+                                assign(4, Rvalue::CheckedBinaryOp(BinOp::Add, copy(1), copy(2))),
                                 assign(
                                     5,
                                     Rvalue::CheckedBinaryOp(
@@ -1966,10 +1919,7 @@ mod parity_oracle {
                             0,
                             vec![
                                 assign(4, Rvalue::BinaryOp(BinOp::Sub, copy(1), copy(2))),
-                                assign(
-                                    5,
-                                    Rvalue::CheckedBinaryOp(BinOp::Add, copy(4), copy(3)),
-                                ),
+                                assign(5, Rvalue::CheckedBinaryOp(BinOp::Add, copy(4), copy(3))),
                             ],
                             5,
                             AssertMessage::Overflow(BinOp::Add),
@@ -2004,14 +1954,8 @@ mod parity_oracle {
                         assert_block(
                             0,
                             vec![
-                                assign(
-                                    4,
-                                    Rvalue::CheckedBinaryOp(BinOp::Add, copy(1), copy(2)),
-                                ),
-                                assign(
-                                    4,
-                                    Rvalue::CheckedBinaryOp(BinOp::Add, copy(1), copy(3)),
-                                ),
+                                assign(4, Rvalue::CheckedBinaryOp(BinOp::Add, copy(1), copy(2))),
+                                assign(4, Rvalue::CheckedBinaryOp(BinOp::Add, copy(1), copy(3))),
                                 assign(
                                     5,
                                     Rvalue::CheckedBinaryOp(
@@ -2207,8 +2151,7 @@ mod parity_oracle {
             "bounds-check",
             "overflow-neg",
         ] {
-            let (_, byte_identical) =
-                adv_card.per_class.get(class).copied().unwrap_or((0, 0));
+            let (_, byte_identical) = adv_card.per_class.get(class).copied().unwrap_or((0, 0));
             assert!(
                 byte_identical >= 1,
                 "adversarial battery must pin a ByteIdentical floor for {class}"
@@ -2240,8 +2183,7 @@ mod parity_oracle {
             ("bounds-check", 3),
             ("overflow-neg", 1),
         ] {
-            let (_, byte_identical) =
-                corpus_card.per_class.get(class).copied().unwrap_or((0, 0));
+            let (_, byte_identical) = corpus_card.per_class.get(class).copied().unwrap_or((0, 0));
             assert!(
                 byte_identical >= floor,
                 "corpus {class}: byte-identical {byte_identical} fell below its floor {floor}"
@@ -2343,9 +2285,9 @@ mod parity_oracle {
                                     &minted.formula_json,
                                     &minted.smtlib,
                                 ),
-                                Err(decline) => DumpedOutcome::Withheld {
-                                    reason: decline.code().to_string(),
-                                },
+                                Err(decline) => {
+                                    DumpedOutcome::Withheld { reason: decline.code().to_string() }
+                                }
                             }
                         }
                     };
@@ -2581,8 +2523,7 @@ mod parity_oracle {
         }
         // The stale-divisor fixture's MIN/-1 assert still compares (the
         // existing target probe finds the op; staleness gates only the walk).
-        let (_, func) =
-            funcs.iter().find(|(n, _)| *n == "divzero_stale_divisor_refuses").unwrap();
+        let (_, func) = funcs.iter().find(|(n, _)| *n == "divzero_stale_divisor_refuses").unwrap();
         let reports = grade_function("divzero_stale_divisor_refuses", func);
         assert_eq!(reports[1].grade, Grade::ByteIdentical);
     }
@@ -2681,7 +2622,10 @@ mod parity_oracle {
                 &DirectFormulaClass::OverflowAddSub { op: AddSubOp::Add },
                 32,
                 false,
-                &[nested(NestedBinOp::Add, 64, false, "a", named("b")), DirectFormulaOperand::Lit(1)],
+                &[
+                    nested(NestedBinOp::Add, 64, false, "a", named("b")),
+                    DirectFormulaOperand::Lit(1)
+                ],
             ),
             Err(FormulaDecline::NestedOperandWidthMismatch {
                 outer: (32, false),
@@ -2694,7 +2638,10 @@ mod parity_oracle {
                 &DirectFormulaClass::OverflowAddSub { op: AddSubOp::Add },
                 32,
                 false,
-                &[nested(NestedBinOp::Add, 32, true, "a", named("b")), DirectFormulaOperand::Lit(1)],
+                &[
+                    nested(NestedBinOp::Add, 32, true, "a", named("b")),
+                    DirectFormulaOperand::Lit(1)
+                ],
             ),
             Err(FormulaDecline::NestedOperandWidthMismatch {
                 outer: (32, false),
@@ -2771,9 +2718,7 @@ mod parity_oracle {
                     named("trust_direct_nested_operand_0"),
                 ],
             ),
-            Err(FormulaDecline::OutsideBuilderEnvelope {
-                builder: "nested_operand_placeholder"
-            }),
+            Err(FormulaDecline::OutsideBuilderEnvelope { builder: "nested_operand_placeholder" }),
         );
         // …and WITHOUT one, the same name still mints — increment-1 behavior
         // preserved (nothing is synthesized in the prefix).
@@ -2890,9 +2835,7 @@ mod parity_oracle {
                 false,
                 &[DirectFormulaOperand::Lit(3)],
             ),
-            Err(FormulaDecline::OutsideBuilderEnvelope {
-                builder: "reconstruct_divisor_is_zero"
-            }),
+            Err(FormulaDecline::OutsideBuilderEnvelope { builder: "reconstruct_divisor_is_zero" }),
         );
         // Char discipline lives in direct_int_width.
         assert_eq!(

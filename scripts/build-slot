@@ -1,0 +1,2430 @@
+#!/usr/bin/env python3
+"""build-slot: machine-wide admission for heavy jobs (builds, full test suites, sweeps).
+
+Every agent and person on a shared machine runs heavy work through this gate, so the
+machine is never driven to load 100 with no free memory, where every build crawls:
+
+    build-slot -- python3 x.py build --stage 1 compiler/rustc library
+    build-slot -- targo --unverified test -p ay-dpll
+    build-slot --cpus 24 -- python3 x.py build --stage 1 compiler/rustc
+    build-slot --wait-timeout 180 -- targo --unverified test -p ay-dpll
+    build-slot --exclusive --wait-timeout 1800 -- <quiet-window command>
+    build-slot adopt <existing-direct-job-pid>
+    build-slot status
+
+What it does:
+  * At most --slots heavy jobs run at once, machine-wide. The default is one per 6
+    CPUs, overridable with BUILD_SLOTS.
+  * A job starts only while at least --mem-gb GiB is available (free + inactive +
+    purgeable + speculative pages). The default is 8 GiB, overridable with
+    BUILD_SLOT_MEM_GB.
+  * --exclusive reserves every slot in the canonical host pool, including when
+    --slots or BUILD_SLOTS is smaller. Its default CPU budget spans the host; it does not
+    waive the command's own quiet/load/memory guards or stop unmanaged work.
+    Workers must share BUILD_SLOT_DIR and the configured pool; an independently
+    enlarged peer pool may use higher-numbered slots outside this reservation.
+  * Exclusive admission also covers historic slot files and requires measured
+    memory, load1 <= 0.35 * CPUs and no compiler/build processes for 10 seconds.
+    Nested commands retain an already-exclusive reservation without establishing
+    fresh quietness.
+  * --wait-timeout bounds a fresh ordinary, native or exclusive admission. Timeout
+    releases this unlaunched request; it never cancels another job or a running child.
+    Nested, adopted and coordinated shared-memory requests cannot select this option.
+  * Inside a git worktree, only one build-slot job runs at a time per worktree, so two
+    agents that land in the same worktree queue instead of killing each other's builds.
+  * Shared commands using Clean's structured `heavy_gate.sh run GB LABEL -- ...`
+    wrapper wait for memory before claiming CPU. CPU contention rolls memory back
+    immediately; old CPU-first callers therefore cannot form a mixed-order deadlock.
+  * --cpus N atomically reserves the matching shared slots and grants N CPUs.
+    Smaller explicit caller caps are retained; adopted jobs cannot be resized.
+    An exclusive command defaults to the whole host CPU budget.
+  * The child gets CARGO_BUILD_JOBS bounded by its share of the CPUs. A smaller
+    positive caller request is preserved; a larger one is capped, and malformed
+    requests refuse before admission.
+  * With no caller CPU cap, admission borrows the currently free slots. Each
+    borrowed share needs measured memory headroom; unknown memory keeps one
+    share. Queued peers that fit beside the actual minimum retain room before
+    optional borrowing. Borrowed shares remain leased through command exit, including if
+    the gate dies. This is admission-time sizing, not runtime lease revocation.
+  * Inside an aterm session, an admitted command runs through aterm's
+    authenticated resource runner when the host advertises one, so its resource
+    use is attributed to that session; otherwise it runs unchanged and unreported.
+  * Among queued jobs, the oldest currently eligible request gets admission. A busy
+    worktree or insufficient memory does not idle slots another request can use.
+    An eligible multi-slot request reserves drain against later arrivals until
+    its whole CPU claim fits, without exclusive admission's quiet-machine guards.
+    An eligible exclusive request waits for the pool to drain before newer jobs run.
+    `status` shows pending requests and their exclusive/resource requirements, so free
+    slots held for that reservation are distinguishable from an idle queue. It observes
+    ticket leases without changing admission order or retiring tickets.
+  * The locks use the Unix account home independently of a private HOME/TMPDIR.
+    BUILD_SLOT_DIR explicitly overrides this canonical pool and is inherited by children.
+    The actual
+    command inherits the leases, so a dead gate supervisor cannot free a slot while
+    its command still runs. The kernel releases a lease after its last holder exits.
+  * Every namespace directory it makes, ancestors included, is 0700 whatever the
+    umask. An existing namespace directory writable by its group or others is
+    refused with the `chmod go-w` that repairs it; build-slot never changes it.
+  * Nested use is free: a child of a build-slot job (BUILD_SLOT_HELD=1) runs at once.
+    A nested --exclusive requires an already exclusive parent; it cannot upgrade
+    a shared admission. Use --exclusive on the outermost invocation.
+  * `adopt PID` accounts for an existing unleased job without a watcher or a new
+    command. Run it from that direct job's exact working directory, using the
+    same canonical pool. Native PID/UID/birth/executable and cwd queries must
+    succeed, and the job must belong to this user. Adopted leases remain held
+    after this command exits, until that process exits or its PID is reused.
+    Uncertain identity remains held; an exec by the same process does not free
+    it. Repeating adoption repairs an interrupted publication without taking
+    another slot. Adoption grants no CPU share, proof claim, or process control.
+
+The exit status is the command's own; 128+N if it was killed by signal N.
+"""
+import errno
+import fcntl
+import importlib.util
+import json
+import math
+import os
+import pwd
+
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+import secrets
+import shlex
+from urllib.parse import unquote_to_bytes
+from contextlib import contextmanager
+
+DIR = None
+MEASURED_NCPU = os.cpu_count()
+NCPU = MEASURED_NCPU or 4
+QUIET_LOAD_FRACTION = 0.35
+QUIET_SECONDS = 10.0
+
+
+class AdmissionTimeout(Exception):
+    pass
+
+
+class AdmissionUnavailable(Exception):
+    """A coordinated memory holder must roll back instead of waiting for CPU."""
+    pass
+
+
+# Tests replace only this entrypoint, retaining their private account/pool probes.
+_REEXEC = None
+_EXIT_OWNER = None
+RESOURCE_FD_HANDOFF_VERSION = 1
+
+
+def resource_transport_owner():
+    """Share the maintained descriptor parser and original-child observer."""
+    global _EXIT_OWNER
+    if _EXIT_OWNER is None:
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                            "lib", "landing_targo.py")
+        spec = importlib.util.spec_from_file_location("build_slot_exit_owner", path)
+        owner = importlib.util.module_from_spec(spec)
+        # This source-controlled helper owns transport and child observation.
+        # Execute its captured bytes, never an ignored timestamp-matching .pyc.
+        with open(path, "rb") as source:
+            code = source.read()
+        exec(compile(code, path, "exec", dont_inherit=True), owner.__dict__)
+        _EXIT_OWNER = owner
+    return _EXIT_OWNER
+
+
+def inherited_resource_fds(env):
+    """Forward only declared live transport; its native owner judges authority."""
+    try:
+        return resource_transport_owner().resource_fds(env)
+    except (OSError, ImportError, AttributeError, RuntimeError) as error:
+        raise NamespaceError(f"inherited resource transport refused: {error}") from error
+
+
+def original_child_exit_observer():
+    """Require exclusive reaping and reuse the maintained native exit observer.
+
+    The unreaped original child pins its group identity until forwarding is
+    disabled. Neither Popen.returncode nor a later PID lookup supplies that.
+    """
+    try:
+        if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+            raise RuntimeError("SIGCHLD must retain the original child for its sole reaper")
+        owner = resource_transport_owner()
+        if not owner.exit_observation_available():
+            raise RuntimeError("native nonreaping child observation is unavailable")
+        return owner.wait_child_exit
+    except (OSError, ImportError, AttributeError, RuntimeError) as error:
+        print(f"build-slot: REFUSED — cannot retain original child group: {error}",
+              file=sys.stderr)
+        return None
+
+
+def memory_wrapper(cmd):
+    """Recognize Clean's structured shared wrapper without parsing shell text."""
+    offset = 1 if cmd and os.path.basename(cmd[0]) in ("bash", "sh") else 0
+    if (len(cmd) < offset + 5
+            or os.path.basename(cmd[offset]) != "heavy_gate.sh"
+            or cmd[offset + 1] != "run"):
+        return None
+    split = offset + 4
+    if cmd[split] == "--":
+        split += 1
+    if split >= len(cmd):
+        return None
+    return cmd[:offset + 4], cmd[split:]
+
+
+def coordinate_memory(options, wrapper):
+    """Wait for memory with no CPU lease; roll it back if CPU cannot start.
+
+    Old CPU-first callers remain safe: a new memory holder never waits for
+    their CPU slots. Failed retries use the existing nonzero peak-history rule.
+    The pipe distinguishes admission failure from a payload's real exit 75.
+    """
+    prefix, payload = wrapper
+    observe_exit = original_child_exit_observer()
+    if observe_exit is None:
+        return 2
+    reexec = _REEXEC or [sys.executable, "-I", "-B", os.path.abspath(__file__)]
+    interrupted = None
+    child = None
+    with admission_registry() as directory:
+        live = [int(name[5:]) for name in os.listdir(directory)
+                if name.startswith("wait-") and name[5:].isdigit()]
+        arrival = next_admission_order(directory, live)
+
+    def forward(sig, _frame):
+        nonlocal interrupted
+        interrupted = sig
+        if child is not None:
+            resource_transport_owner().signal_owned_group(child.pid, sig)
+
+    previous = {sig: signal.signal(sig, forward)
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        while interrupted is None:
+            reader, writer = os.pipe()
+            os.set_blocking(reader, False)
+            try:
+                if interrupted is not None:
+                    return 128 + interrupted
+                command = [*prefix, "--", *reexec, "--_memory-attempt", str(writer), str(arrival),
+                           *options, "--", *payload]
+                child = subprocess.Popen(
+                    command, start_new_session=True,
+                    pass_fds=sorted({writer, *inherited_resource_fds(os.environ)}))
+                if interrupted is not None:
+                    forward(interrupted, None)
+                os.close(writer)
+                writer = None
+                original = child
+                observe_exit(original.pid)
+                # Stop forwarding BEFORE the only owning wait can recycle the
+                # group identity, including inside Popen's returncode update.
+                child = None
+                rc = original.wait()
+                try:
+                    marker = os.read(reader, 3)
+                except BlockingIOError:
+                    marker = b""
+            finally:
+                if writer is not None:
+                    os.close(writer)
+                os.close(reader)
+                child = None
+            if interrupted is not None:
+                return 128 + interrupted
+            if marker not in (b"", b"W", b"WR"):
+                print("build-slot: invalid coordinated admission reply", file=sys.stderr)
+                return 2
+            if rc != 75 or marker != b"W":
+                return 128 - rc if rc < 0 else rc
+            # heavy_gate has already released memory before this retry.
+            time.sleep(0.1)
+        return 128 + interrupted
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+
+class NamespaceError(ValueError):
+    pass
+
+
+class CpuBridgeUnavailable(ValueError):
+    pass
+
+
+def worker_command(cmd):
+    """Return the mandatory native invocation for the exact supported shape."""
+    if not cmd or os.path.basename(cmd[0]) != "targo":
+        return None
+    args = list(cmd[1:])
+    if args[:1] == ["--resource-worker-v2"]:
+        args = args[1:]
+    if (len(args) < 2 or args[0] != "--unverified"
+            or args[1] not in ("build", "check", "test")
+            or "--resource-worker-v2" in args):
+        return None
+    return [cmd[0], "--resource-worker-v2", *args]
+
+
+def worker_capability(cmd, observation=None):
+    """True=supported, False=explicitly unsupported; failed discovery refuses.
+
+    Probe only the selected Targo entrypoint; never unwrap or parse a shim.
+    An absent/invalid reply is not evidence authorizing fixed admission.
+    The optional observer retains the exact completed probe for SDK surface
+    receipts. It changes neither decoding nor admission and grants no resources.
+    """
+    native = worker_command(cmd)
+    if native is None:
+        return False
+    program = shutil.which(cmd[0])
+    if not program:
+        raise CpuBridgeUnavailable("selected Targo capability program is unavailable")
+    # An invalid transport is a refusal, never a reason to downgrade to fixed
+    # admission after the selected frontend's capability could not be queried.
+    passed = inherited_resource_fds(os.environ)
+    observe_exit = original_child_exit_observer()
+    if observe_exit is None:
+        raise CpuBridgeUnavailable("capability discovery cannot retain its original child group")
+    child = None
+    reaped = False
+    output = bytearray()
+    diagnostic = bytearray()
+
+    def refused(reason):
+        detail = diagnostic.decode("utf-8", errors="replace")
+        reply = output.decode("utf-8", errors="replace")
+        return CpuBridgeUnavailable(
+            f"selected Targo {program!r} capability discovery {reason}; "
+            f"stdout={reply!r}; stderr={detail!r}; no command was started")
+
+    def capability_object(pairs):
+        value = {}
+        for key, entry in pairs:
+            if key in value:
+                raise ValueError("duplicate capability response field")
+            value[key] = entry
+        return value
+
+    try:
+        # Every command must prove its configured compiler cohort before
+        # native epoch admission; a Targo/platform-only response is insufficient.
+        query = [program, "--resource-capabilities", "--", *native[2:]]
+        end = time.monotonic() + 2
+        child = subprocess.Popen(query, start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, pass_fds=passed)
+        os.set_blocking(child.stdout.fileno(), False)
+        os.set_blocking(child.stderr.fileno(), False)
+        eof = set()
+        while time.monotonic() < end:
+            # Drain both bounded channels, including a diagnostic-only failure,
+            # so a full stderr pipe cannot masquerade as a capability timeout.
+            for stream, buffer, label in ((child.stdout, output, "stdout"),
+                                          (child.stderr, diagnostic, "stderr")):
+                if label in eof:
+                    continue
+                try:
+                    part = os.read(stream.fileno(), min(4096, 8193 - len(buffer)))
+                except BlockingIOError:
+                    continue
+                if part:
+                    buffer.extend(part)
+                    if len(buffer) > 8192:
+                        raise refused(f"exceeded its {label} bound")
+                else:
+                    eof.add(label)
+            if observe_exit(child.pid, nohang=True) and len(eof) == 2:
+                # Pin the leader until its last group signal. Descendants may
+                # inherit either pipe; no reader thread or orphan pipe wait is
+                # allowed to extend the original discovery deadline.
+                resource_transport_owner().signal_owned_group(child.pid, signal.SIGKILL)
+                child.wait()
+                reaped = True
+                if observation is not None:
+                    observation(query, child.returncode, bytes(output), bytes(diagnostic))
+                if child.returncode != 0:
+                    raise refused(f"exited with status {child.returncode}")
+                value = json.loads(output, object_pairs_hook=capability_object)
+                if (isinstance(value, dict)
+                        and set(value) == {"version", "cpu_workers", "supports_invocation", "runtime_refusal"}
+                        and type(value["version"]) is int and value["version"] == 3
+                        and value["cpu_workers"] is True
+                        and value["supports_invocation"] is True
+                        and isinstance(value["runtime_refusal"], str)
+                        and value["runtime_refusal"]):
+                    raise CpuBridgeUnavailable(value["runtime_refusal"])
+                if (not isinstance(value, dict)
+                        or set(value) != {"version", "cpu_workers", "supports_invocation"}
+                        or type(value["version"]) is not int or value["version"] != 3
+                        or type(value["cpu_workers"]) is not bool
+                        or type(value["supports_invocation"]) is not bool
+                        or (value["supports_invocation"] and not value["cpu_workers"])):
+                    raise refused("returned an invalid capability response")
+                return value["cpu_workers"] and value["supports_invocation"]
+            time.sleep(0.01)
+        raise refused("timed out")
+    except CpuBridgeUnavailable:
+        raise
+    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+        raise refused(f"failed ({type(error).__name__}: {error})") from error
+    finally:
+        if child is not None:
+            if not reaped:
+                resource_transport_owner().signal_owned_group(child.pid, signal.SIGKILL)
+                child.wait()
+            child.stdout.close()
+            child.stderr.close()
+
+
+def cpu_capacity_directory():
+    """Use the same account database namespace as trust-build-cpu."""
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError) as error:
+        raise CpuBridgeUnavailable("CPU capacity account home unavailable") from error
+    if not isinstance(home, str) or not os.path.isabs(home):
+        raise CpuBridgeUnavailable("CPU capacity account home is not absolute")
+    suffix = "Library/Caches/aterm/capacity" if sys.platform == "darwin" else ".cache/aterm/capacity"
+    return os.path.join(home, suffix, "build-cpu-v1")
+
+
+def checked_cpu_file(directory, name, *, private=False):
+    fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory)
+    try:
+        meta = os.fstat(fd)
+        if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid()
+                or meta.st_nlink != 1 or meta.st_mode & (0o077 if private else 0o022)):
+            raise CpuBridgeUnavailable("CPU lease file has unsafe ownership or mode")
+        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != (meta.st_dev, meta.st_ino):
+            raise CpuBridgeUnavailable("CPU lease file changed during observation")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def unsafe_directory_reason(path, meta, *, private=False):
+    """Name a refused directory, what is wrong with it, and its owner's repair."""
+    if not stat.S_ISDIR(meta.st_mode):
+        return f"{path} is not a directory"
+    if meta.st_uid != os.geteuid():
+        return f"{path} is owned by uid {meta.st_uid}, not by this user (uid {os.geteuid()})"
+    access, repair = ("open to", "go-rwx") if private else ("writable by", "go-w")
+    return (f"{path} has mode {stat.S_IMODE(meta.st_mode):04o}, {access} its group or others; "
+            f"build-slot never changes an existing directory: run chmod {repair} "
+            f"{shlex.quote(path)}")
+
+
+def checked_cpu_directory(path, *, private=False):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    meta = os.fstat(fd)
+    if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.geteuid()
+            or meta.st_mode & (0o077 if private else 0o022)):
+        os.close(fd)
+        raise CpuBridgeUnavailable(
+            "CPU lease directory " + unsafe_directory_reason(path, meta, private=private))
+    return fd
+
+
+def observed_directory(path):
+    """fstat `path` itself, never a link it names."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise NamespaceError(f"{path} is not a directory: {error.strerror}") from error
+        raise
+    try:
+        return os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
+def namespace_directory(path):
+    """Make every missing component of `path` 0700, whatever the umask.
+
+    os.makedirs applies the process umask to every directory it makes and its
+    mode to the leaf only, so under umask 002 it made ~/.cache and
+    ~/.cache/build-slot 0775, which checked_cpu_directory and trust-build-tree's
+    admission then refuse. Each missing component is made here under umask 077
+    and checked to be this user's directory with permission bits 0700. Special
+    bits it did not ask for are not judged: on Linux mkdir(2) gives a directory
+    made under a set-group-ID parent S_ISGID, which names the group of what is
+    made in it and grants that group nothing. A directory that already
+    existed is never changed: the leaf is admitted only when it is this user's
+    and not writable by its group or others, and is otherwise refused with the
+    chmod its owner should run.
+    """
+    path = os.path.abspath(path)
+    missing = []
+    probe = path
+    while not os.path.lexists(probe):
+        missing.append(probe)
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    for component in reversed(missing):
+        # The umask is the defect: neutralize it for exactly this one creation.
+        previous = os.umask(0o077)
+        try:
+            os.mkdir(component, 0o700)
+        except FileExistsError:
+            # A concurrent launcher made it first; judge it as an existing directory.
+            continue
+        finally:
+            os.umask(previous)
+        meta = observed_directory(component)
+        # Owner rwx and nothing for its group or others; never the special bits.
+        if meta.st_uid != os.geteuid() or (meta.st_mode & 0o777) != 0o700:
+            raise NamespaceError(
+                f"build-slot created {component} but found mode "
+                f"{stat.S_IMODE(meta.st_mode):04o} owned by uid {meta.st_uid}, "
+                f"not a directory of uid {os.geteuid()} with permission bits 0700")
+    meta = observed_directory(path)
+    if meta.st_uid != os.geteuid() or meta.st_mode & 0o022:
+        raise NamespaceError(unsafe_directory_reason(path, meta))
+
+
+def kernel_held(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    return False
+
+
+def fixed_cpu_reservations(directory, cpus, slots):
+    """Count live fixed reservations, never using PID liveness as authority.
+
+    A malformed held record refuses the external launch. Native workers use
+    the equivalent conservative full-host veto. Unlocked stale files count zero.
+    """
+    try:
+        root = checked_cpu_directory(directory)
+    except FileNotFoundError:
+        return 0
+    try:
+        try:
+            fence = checked_cpu_file(root, "admission.lock")
+        except FileNotFoundError:
+            fence = None
+        if fence is not None:
+            try:
+                if kernel_held(fence):
+                    return cpus
+            finally:
+                os.close(fence)
+        entries = [name for name in os.listdir(root) if re.fullmatch(r"slot-[0-9]+", name)]
+        if len(entries) > 65536:
+            raise CpuBridgeUnavailable("too many external CPU slot files")
+        seen, total = {}, 0
+        weight = max(1, (cpus + max(1, slots) - 1) // max(1, slots))
+        for name in entries:
+            fd = checked_cpu_file(root, name)
+            try:
+                if not kernel_held(fd):
+                    continue
+                raw = os.read(fd, 65537)
+                if len(raw) > 65536:
+                    raise CpuBridgeUnavailable("external CPU record exceeds bound")
+                try:
+                    row = json.loads(raw)
+                except (ValueError, UnicodeError) as error:
+                    raise CpuBridgeUnavailable("held external CPU record is unreadable") from error
+                if not isinstance(row, dict):
+                    raise CpuBridgeUnavailable("held external CPU record is not an object")
+                mode = row.get("cpu_mode")
+                if "cpu_mode" not in row:
+                    if (type(row.get("pid")) is not int or row["pid"] <= 0
+                            or not isinstance(row.get("cmd"), str)
+                            or not isinstance(row.get("cwd"), str) or not os.path.isabs(row["cwd"])
+                            or type(row.get("started")) not in (int, float)
+                            or not math.isfinite(row["started"]) or row["started"] < 0):
+                        raise CpuBridgeUnavailable("held legacy CPU record is incomplete")
+                    total += cpus if int(name[5:]) >= slots else weight
+                    continue
+                lease = row.get("lease_id")
+                budget, pool_slots = row.get("cpu_budget"), row.get("pool_slots")
+                if (mode not in ("workers-v1", "fixed-v1")
+                        or not isinstance(lease, str) or not re.fullmatch(r"[0-9a-f]{32}", lease)
+                        or type(budget) is not int or not 1 <= budget <= cpus
+                        or type(pool_slots) is not int or not 1 <= pool_slots <= 65536
+                        or int(name[5:]) >= pool_slots):
+                    raise CpuBridgeUnavailable("held external CPU record has invalid provenance")
+                identity = (mode, budget, pool_slots)
+                if lease in seen and seen[lease] != identity:
+                    raise CpuBridgeUnavailable("external CPU lease records disagree")
+                if lease not in seen:
+                    seen[lease] = identity
+                    if mode == "fixed-v1":
+                        total += budget
+            finally:
+                os.close(fd)
+        return total
+    finally:
+        os.close(root)
+
+
+def native_cpu_room(directory, cpus, slots):
+    """Check and freeze native acquisition while judging fixed CPU room."""
+    try:
+        root = checked_cpu_directory(cpu_capacity_directory(), private=True)
+    except FileNotFoundError:
+        return True
+    try:
+        manifest = checked_cpu_file(root, "pool", private=True)
+        try:
+            try:
+                fcntl.flock(manifest, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            raw = os.read(manifest, 65537)
+            try:
+                text = raw.decode("ascii")
+            except UnicodeError as error:
+                raise CpuBridgeUnavailable("native CPU manifest is not ASCII") from error
+            lines = text.splitlines()
+            if not lines or lines[0] != f"trust-build-cpu-v1 slots={cpus}" or len(lines) != cpus + 1:
+                raise CpuBridgeUnavailable("native CPU manifest has incompatible capacity")
+            held = 0
+            for index, row in enumerate(lines[1:]):
+                match = re.fullmatch(rf"slot={index} dev=([0-9]+) ino=([0-9]+)", row)
+                if not match:
+                    raise CpuBridgeUnavailable("native CPU manifest slot is invalid")
+                fd = checked_cpu_file(root, f"slot-{index:08x}", private=True)
+                try:
+                    meta = os.fstat(fd)
+                    if (meta.st_dev, meta.st_ino) != tuple(map(int, match.groups())):
+                        raise CpuBridgeUnavailable(
+                            f"native CPU slot {index} identity changed: "
+                            f"expected dev={match[1]} ino={match[2]}, "
+                            f"observed dev={meta.st_dev} ino={meta.st_ino}; "
+                            "machine authority recovery is required")
+                    held += int(kernel_held(fd))
+                finally:
+                    os.close(fd)
+            return held + fixed_cpu_reservations(directory, cpus, slots) <= cpus
+        finally:
+            os.close(manifest)
+    finally:
+        os.close(root)
+
+
+def checked_legacy_fence_file(root, name):
+    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                 0o644, dir_fd=root)
+    try:
+        meta = os.fstat(fd)
+        named = os.stat(name, dir_fd=root, follow_symlinks=False)
+        if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid()
+                or meta.st_nlink != 1 or meta.st_mode & 0o022
+                or (meta.st_dev, meta.st_ino) != (named.st_dev, named.st_ino)):
+            raise CpuBridgeUnavailable("legacy CPU fence has unsafe ownership, mode or identity")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class EpochReservationLost(Exception):
+    """A non-atomic EX-to-SH conversion lost admission; release and requeue."""
+
+
+def try_legacy_fence(directory, slots, reservation=None, *, priority=False):
+    """Retain SH locks that make every old launcher's EX acquisition fail.
+
+    A FIFO winner already owns admission EX. Keep it while old slot holders
+    drain, then convert that same descriptor to the ordinary inherited SH fence.
+    Never open another admission descriptor against our own exclusive lease.
+    """
+    if reservation is None and not priority:
+        queued, _, error = queued_status(directory)
+        if queued or error:
+            # New joins must not starve an already registered legacy waiter.
+            return None
+    namespace_directory(directory)
+    root = checked_cpu_directory(directory)
+    held = []
+    try:
+        names = {f"slot-{i}" for i in range(exclusive_slot_count(slots))}
+        names.update(name for name in os.listdir(root) if re.fullmatch(r"slot-[0-9]+", name))
+        if len(names) > 65536:
+            raise CpuBridgeUnavailable("too many legacy CPU slot files")
+        if reservation is not None:
+            meta = os.fstat(reservation)
+            named = os.stat("admission.lock", dir_fd=root, follow_symlinks=False)
+            if (meta.st_dev, meta.st_ino) != (named.st_dev, named.st_ino):
+                raise CpuBridgeUnavailable("legacy admission reservation identity changed")
+        paths = sorted(names, key=lambda name: int(name[5:]))
+        if reservation is None:
+            paths.insert(0, "admission.lock")
+        for name in paths:
+            fd = checked_legacy_fence_file(root, name)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                if active_adoption(os.path.join(directory, name)) is not None:
+                    raise BlockingIOError()
+                held.append(fd)
+            except BaseException:
+                os.close(fd)
+                raise
+        if reservation is not None:
+            # flock conversion need not be atomic. Losing to an old exclusive
+            # launcher must release every slot, not wait and deadlock its drain.
+            try:
+                fcntl.flock(reservation, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise EpochReservationLost from error
+            held.insert(0, reservation)
+        result, held = held, []
+        return result
+    except BlockingIOError:
+        return None
+    finally:
+        for fd in held:
+            os.close(fd)
+        os.close(root)
+
+
+def slot_directory():
+    """Keep cooperative machine admission stable across isolated build homes."""
+    configured = os.environ.get("BUILD_SLOT_DIR")
+    if configured:
+        return os.path.realpath(configured)
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError) as error:
+        raise NamespaceError("cannot resolve the Unix UID account home") from error
+    if not isinstance(home, str) or not os.path.isabs(home) or not os.path.isdir(home):
+        raise NamespaceError("Unix UID account home must be an existing absolute directory")
+    return os.path.realpath(os.path.join(home, ".cache", "build-slot"))
+
+
+def canonical_adoption_directory():
+    # A different ambient HOME must not hide the same user's live leases.
+    import pwd
+
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+        if not isinstance(home, str) or not os.path.isabs(home):
+            return None
+        return os.path.join(os.path.realpath(home), ".cache", "build-slot", "adopted")
+    except (KeyError, OSError):
+        return None
+
+
+ADOPTION_DIR = canonical_adoption_directory()
+
+
+def resource_command(cmd, env):
+    """Keep daemon-launched work attributable to its authenticated aterm session."""
+    if not any(env.get(key) for key in ("ATERM_CHILD", "ATERM_PARENT_SESSION_ID", "ATERM_SESSION_ID", "ATERM_EDGE_TOKENS")):
+        return cmd
+
+    def unavailable(reason):
+        print(f"build-slot: aterm resource attribution unavailable ({reason}); native command remains unreported",
+              file=sys.stderr, flush=True)
+        return cmd
+
+    if "BUILD_SLOT_ATERM_CLI" in env:
+        cli = env["BUILD_SLOT_ATERM_CLI"]
+        if (not os.path.isabs(cli) or not os.path.isfile(cli)
+                or not os.access(cli, os.X_OK)):
+            return unavailable("explicit discovery executable unavailable")
+    else:
+        cli = shutil.which("aterm", path=env.get("PATH"))
+    if cli is None:
+        return unavailable("aterm executable absent")
+    try:
+        # The existing control route is safe on older clients/hosts. Never
+        # discover support by invoking an unknown top-level command.
+        probe = subprocess.run([cli, "ctl", "@self", "resources", "capabilities"],
+                               env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        return unavailable("control unavailable")
+    words = probe.stdout.split()
+    if probe.returncode or len(probe.stdout) > 8192 or words[:2] != ["OK", "resources"]:
+        return unavailable("unsupported control protocol")
+    fields = {}
+    tail = words[3:] if words[2:3] == ["capabilities"] else words[2:]
+    for word in tail:
+        key, sep, value = word.partition("=")
+        if not sep or key in fields:
+            return unavailable("malformed capability record")
+        fields[key] = value
+    if fields.get("version") != "1":
+        return unavailable("unsupported resource version")
+    if fields.get("available", "1") != "1":
+        return unavailable("host resource reporting unavailable")
+    encoded = fields.get("runner", "")
+    if re.search(r"%(?![0-9a-fA-F]{2})", encoded):
+        return unavailable("malformed runner path")
+    runner = os.fsdecode(unquote_to_bytes(encoded))
+    if "\0" in runner or not os.path.isabs(runner) or not os.path.isfile(runner) or not os.access(runner, os.X_OK):
+        return unavailable("runner unavailable")
+    # Resolve @self through aterm's authenticated control context: inherited
+    # session-id strings can be stale after adoption or a live app handoff.
+    # Job labels contain no command arguments, which may carry credentials.
+    label = f"{os.path.basename(os.getcwd()) or '/'}: {os.path.basename(cmd[0])}"
+    # Native paths may contain arbitrary bytes or controls, and both basenames
+    # can exceed the host's 200-byte UTF-8 label limit. Normalize only display
+    # metadata; the exact command below keeps every original argument.
+    label = "".join(char if char.isprintable() else "?" for char in label).strip()
+    label = label.encode("utf-8")[:200].decode("utf-8", errors="ignore")
+    print("build-slot: routing admitted job through aterm resource-run", file=sys.stderr, flush=True)
+    return [runner, "resource-run", "--session", "@self", "--job", label, "--", *cmd]
+
+
+def cpu_jobs(slots, requested=None, *, budget=None, strict=False):
+    """A caller may use less than its slot's CPU share, never more."""
+    if slots < 1:
+        raise ValueError("--slots must be positive")
+    share = max(1, NCPU // slots) if budget is None else budget
+    if requested is None:
+        return share
+    # Keep the existing oversized-input refusal on Python versions without
+    # the integer-conversion digit limit, and do not depend on its setting.
+    if len(requested) > 4300:
+        raise ValueError("CARGO_BUILD_JOBS is too large to parse")
+    if not re.fullmatch(r"[0-9]+", requested):
+        raise ValueError("CARGO_BUILD_JOBS must be a positive integer")
+    try:
+        jobs = int(requested)
+    except ValueError:
+        raise ValueError("CARGO_BUILD_JOBS is too large to parse") from None
+    if jobs < 1:
+        raise ValueError("CARGO_BUILD_JOBS must be a positive integer")
+    if strict and jobs > share:
+        raise ValueError("CARGO_BUILD_JOBS must be no larger than --cpus")
+    return min(share, jobs)
+
+
+def job_provenance(env, cpus=None):
+    """Separate generated counts from immutable caller upper bounds."""
+    raw = env.get("CARGO_BUILD_JOBS")
+    positive = lambda value: (isinstance(value, str) and len(value) <= 4300
+                              and re.fullmatch(r"[0-9]+", value) and int(value) > 0)
+    generated = positive(raw) and (
+        raw == env.get("TARGO_PLANNED_JOBS")
+        or (env.get("BUILD_SLOT_CPU_SOURCE") == "available-slots"
+            and raw == env.get("BUILD_SLOT_CPU_BUDGET")))
+    caps = []
+    caller = env.get("TARGO_CALLER_JOBS")
+    if caller:
+        if not positive(caller):
+            raise ValueError("TARGO_CALLER_JOBS must be a positive integer")
+        caps.append(int(caller))
+    if raw is not None and not generated:
+        cpu_jobs(1, raw)  # retain the existing strict numeric validation
+        caps.append(int(raw))
+    if cpus is not None:
+        caps.append(cpus)
+    return bool(generated), min(caps) if caps else None
+
+
+def default_slots():
+    env = os.environ.get("BUILD_SLOTS")
+    if env and env.isdigit() and int(env) > 0:
+        return int(env)
+    return max(1, NCPU // 6)
+
+
+def exclusive_slot_count(slots):
+    # --slots 1 alone cannot exclude default workers, which also use slot-1,
+    # slot-2, ... . Cover the host default and the configured/requested pool.
+    return max(1, NCPU // 6, default_slots(), slots)
+
+
+def try_exclusive_slots(slots):
+    """Acquire the whole pool, or release every partial lock before waiting."""
+    acquired = []
+    try:
+        for i in pool_slots(slots):
+            path = os.path.join(DIR, f"slot-{i}")
+            fd = try_lease(path)
+            if fd is None:
+                raise BlockingIOError()
+            acquired.append((i, fd, path))
+    except BaseException as error:
+        for _, fd, _ in acquired:
+            os.close(fd)
+        if isinstance(error, BlockingIOError):
+            return None
+        raise
+    return acquired
+
+
+def try_shared_slots(slots, needed, maximum=None, reserved=0):
+    """Acquire actual leases; optional borrowing leaves pending minimum claims."""
+    acquired = []
+    limit = maximum or needed
+    try:
+        for i in range(slots):
+            path = os.path.join(DIR, f"slot-{i}")
+            fd = try_lease(path)
+            if fd is not None:
+                acquired.append((i, fd, path))
+                if not reserved and len(acquired) == limit:
+                    break
+        if len(acquired) < needed:
+            return None
+        # Count the actually free, exclusively held descriptions, not nominal
+        # pool width. Busy slots cannot also back a pending peer's reservation.
+        keep = min(limit, max(needed, len(acquired) - reserved))
+        while len(acquired) > keep:
+            _, fd, _ = acquired.pop()
+            os.close(fd)
+        result, acquired = acquired, []
+        return result
+    finally:
+        for _, fd, _ in acquired:
+            os.close(fd)
+
+
+def available_gib():
+    """Available memory in GiB, or None if it cannot be measured."""
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=10).stdout
+            page = 4096
+            first = out.splitlines()[0] if out else ""
+            if "page size of" in first:
+                page = int(first.split("page size of")[1].split()[0])
+            pages = 0
+            for line in out.splitlines():
+                key, _, val = line.partition(":")
+                if key.strip() in ("Pages free", "Pages inactive", "Pages purgeable", "Pages speculative"):
+                    pages += int(val.strip().rstrip("."))
+            return pages * page / 2**30
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 2**20
+    except Exception:
+        return None
+    return None
+
+
+def load1():
+    try:
+        return os.getloadavg()[0]
+    except OSError:
+        return -1.0
+
+
+def build_processes():
+    """Conservative exact-name readiness probe; unknown is never quiet."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,stat=,comm="],
+                             capture_output=True, text=True, timeout=10, check=True).stdout
+        lines = out.splitlines()
+        if not lines or len(lines) > 1_000_000:
+            return None
+        found = []
+        for line in lines:
+            parts = line.split(None, 2)
+            if len(parts) != 3 or not parts[0].isdigit():
+                return None
+            pid, state, comm = parts
+            if not state.startswith("Z") and os.path.basename(comm) in {"cargo", "targo", "rustc", "trustc"}:
+                found.append((int(pid), comm))
+        return found
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+
+
+
+def pool_slots(slots):
+    """Include historic larger pools without inventing gaps up to a stale index."""
+    return sorted(set(range(exclusive_slot_count(slots))) | {
+        int(name[5:]) for name in os.listdir(DIR)
+        if re.fullmatch(r"slot-[0-9]+", name)
+    })
+
+
+
+def worktree_lock_path():
+    try:
+        r = subprocess.run(["git", "rev-parse", "--absolute-git-dir"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    gd = r.stdout.strip()
+    return os.path.join(gd, "build-slot.lock") if r.returncode == 0 and gd else None
+
+
+def holder_info(path):
+    adopted = read_adoption(path)
+    if adopted is not None:
+        return adopted
+    try:
+        with open(path) as f:
+            return json.loads(f.read() or "{}")
+    except Exception:
+        return {}
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+class IdentityError(Exception):
+    """A native query could not establish a stable process identity."""
+
+
+def confirmed_absent(pid):
+    # Missing procfs/libproc data may mean hidden or inaccessible, not dead.
+    # Signal zero is only a kernel existence probe; it sends no signal.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass
+    return False
+
+
+def process_identity(pid):
+    """No argv/environment query; birth distinguishes PID reuse, including exec."""
+    try:
+        if sys.platform == "darwin":
+            import ctypes
+            import errno
+
+            class BsdInfo(ctypes.Structure):
+                _fields_ = [("ids", ctypes.c_uint32 * 12), ("comm", ctypes.c_char * 16),
+                            ("name", ctypes.c_char * 32), ("tail", ctypes.c_uint32 * 6),
+                            ("seconds", ctypes.c_uint64), ("micros", ctypes.c_uint64)]
+
+            lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                        ctypes.c_void_p, ctypes.c_int]
+            lib.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+
+            def snapshot():
+                info = BsdInfo()
+                ctypes.set_errno(0)
+                size = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+                if size == 0 and ctypes.get_errno() == errno.ESRCH:
+                    if confirmed_absent(pid):
+                        return None
+                    raise IdentityError("native identity is unavailable for an existing process")
+                if size != ctypes.sizeof(info) or info.ids[3] != pid:
+                    raise IdentityError("native process birth query failed")
+                if info.ids[1] == 5:  # SZOMB: the direct command has exited.
+                    return None
+                return info.ids[5], f"darwin:{info.seconds}:{info.micros}"
+
+            before = snapshot()
+            if before is None:
+                return None
+            path = ctypes.create_string_buffer(4096)
+            if lib.proc_pidpath(pid, path, len(path)) <= 0:
+                raise IdentityError("native executable query failed")
+            executable = os.fsdecode(path.value)
+            if snapshot() != before:
+                raise IdentityError("process changed during its identity query")
+            return {"pid": pid, "uid": before[0], "birth": before[1], "executable": executable}
+        if sys.platform.startswith("linux"):
+            prefix = f"/proc/{pid}"
+
+            def snapshot():
+                try:
+                    with open(prefix + "/stat") as stream:
+                        stat = stream.read(4096)
+                    with open(prefix + "/status") as stream:
+                        status = stream.read(16384)
+                except FileNotFoundError:
+                    if confirmed_absent(pid):
+                        return None
+                    raise IdentityError("procfs identity is unavailable for an existing process")
+                fields = stat.rpartition(")")[2].split()
+                if fields[0] == "Z":
+                    return None
+                uid = next(line.split()[2] for line in status.splitlines() if line.startswith("Uid:"))
+                return int(uid), fields[19]
+
+            before = snapshot()
+            if before is None:
+                return None
+            executable = os.readlink(prefix + "/exe")
+            with open("/proc/sys/kernel/random/boot_id") as stream:
+                boot = stream.read(128).strip()
+            if not boot or snapshot() != before:
+                raise IdentityError("process changed during its identity query")
+            return {"pid": pid, "uid": before[0], "birth": f"linux:{boot}:{before[1]}",
+                    "executable": executable}
+        raise IdentityError("native process identity is unsupported on this host")
+    except IdentityError:
+        raise
+    except Exception as error:
+        raise IdentityError(f"native process identity is unavailable ({type(error).__name__})") from error
+
+
+def process_cwd(pid):
+    try:
+        if sys.platform.startswith("linux"):
+            return os.readlink(f"/proc/{pid}/cwd")
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                ["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), "-d", "cwd", "-F0n"],
+                capture_output=True, timeout=10,
+            )
+            paths = [field[1:] for raw in result.stdout.split(b"\0")
+                     if (field := raw.lstrip(b"\n")).startswith(b"n")]
+            if result.returncode == 0 and len(paths) == 1:
+                return os.fsdecode(paths[0])
+        raise IdentityError("native working-directory query failed")
+    except IdentityError:
+        raise
+    except Exception as error:
+        raise IdentityError("native working-directory query is unavailable") from error
+
+
+def same_process(left, right):
+    # An exec or UID change is not PID reuse: keep that process accounted for.
+    return left.get("pid") == right.get("pid") and left.get("birth") == right.get("birth")
+
+
+def adoption_records():
+    if ADOPTION_DIR is None:
+        return [(None, {"adopted": True, "pid": None,
+                        "cmd": "canonical user home unavailable; held fail-closed"})]
+    try:
+        names = sorted(name for name in os.listdir(ADOPTION_DIR) if name.endswith(".json"))
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return [(None, {"adopted": True, "pid": None, "cmd": "unreadable adoption registry; held fail-closed"})]
+    records = []
+    for name in names:
+        record = os.path.join(ADOPTION_DIR, name)
+        try:
+            with open(record) as stream:
+                info = json.load(stream)
+            identity = info["identity"]
+            valid = (info.get("adopted") is True and type(info.get("schema")) is int
+                     and info["schema"] == 1
+                     and type(identity.get("pid")) is int and identity["pid"] > 0
+                     and info.get("pid") == identity["pid"]
+                     and type(identity.get("uid")) is int
+                     and isinstance(identity.get("birth"), str) and identity["birth"]
+                     and isinstance(identity.get("executable"), str) and identity["executable"]
+                     and isinstance(info.get("leases"), list) and info["leases"]
+                     and all(isinstance(path, str) and os.path.isabs(path)
+                             and os.path.realpath(path) == path for path in info["leases"])
+                     and isinstance(info.get("pool"), str) and os.path.isabs(info["pool"])
+                     and (info.get("worktree") is None or info["worktree"] in info["leases"]))
+            if not valid:
+                raise ValueError("invalid adopted lease")
+            records.append((record, info))
+        except FileNotFoundError:
+            continue  # Another acquirer reclaimed this already-dead identity.
+        except Exception:
+            records.append((record, {"adopted": True, "pid": None,
+                                     "cmd": "unreadable adopted lease; held fail-closed"}))
+    return records
+
+
+def read_adoption(path):
+    path = os.path.realpath(path)
+    for _, info in adoption_records():
+        if "identity" not in info or path in info["leases"]:
+            return info
+    return None
+
+
+def active_adoption(path):
+    # Call only while holding this path's flock. Publication owns every path
+    # before making its one full record visible, even across different pools.
+    path = os.path.realpath(path)
+    for record, info in adoption_records():
+        if "identity" not in info:
+            return info
+        if path not in info["leases"]:
+            continue
+        try:
+            current = process_identity(info["identity"]["pid"])
+        except IdentityError:
+            return info
+        if current is not None and same_process(current, info["identity"]):
+            return info
+        try:
+            os.unlink(record)
+        except FileNotFoundError:
+            pass
+    return None
+
+
+def try_lease(path):
+    """Test virtual adoption only under the same flock used by every writer."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        info = active_adoption(path)
+        if info is not None:
+            os.close(fd)
+            return None
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextmanager
+def admission_registry():
+    """Serialize ticket registration/retirement, never the admitted command."""
+    directory = os.path.join(os.path.realpath(DIR), "admission")
+    namespace_directory(directory)
+    fd = os.open(os.path.join(directory, "registry.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield directory
+    finally:
+        os.close(fd)
+
+
+def same_waiter_file(fd, path):
+    held = os.fstat(fd)
+    found = os.stat(path, follow_symlinks=False)
+    return (held.st_dev, held.st_ino) == (found.st_dev, found.st_ino)
+
+
+def next_admission_order(directory, live):
+    """Reserve an arrival even when its memory wait has no live CPU ticket.
+
+    The registry lock is held. A counter also avoids comparing per-process
+    monotonic epochs on older macOS Python interpreters.
+    """
+    path = os.path.join(directory, "sequence")
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        previous = 0
+    else:
+        try:
+            meta = os.fstat(fd)
+            raw = os.read(fd, 64)
+            if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid()
+                    or meta.st_nlink != 1 or meta.st_mode & 0o022
+                    or not raw.strip().isdigit() or len(raw.strip()) > 39):
+                raise NamespaceError("unsafe admission sequence")
+            previous = int(raw)
+        finally:
+            os.close(fd)
+    order = max(previous, max(live, default=0)) + 1
+    temporary = path + "." + secrets.token_hex(8)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, str(order).encode())
+        os.close(fd)
+        fd = None
+        os.replace(temporary, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return order
+
+
+def try_resources(worktree, slots, exclusive, needed=1):
+    """Acquire the whole claim or release it; called under admission registry."""
+    leases = []
+    try:
+        if worktree:
+            fd = try_lease(worktree)
+            if fd is None:
+                raise BlockingIOError("worktree")
+            leases.append((worktree, fd))
+        if exclusive:
+            acquired = try_exclusive_slots(slots)
+            if not acquired:
+                raise BlockingIOError("slots")
+            leases.extend((path, fd) for _, fd, path in acquired)
+        else:
+            acquired = try_shared_slots(slots, needed)
+            if not acquired:
+                raise BlockingIOError("slots")
+            leases.extend((path, fd) for _, fd, path in acquired)
+        result, leases = leases, []
+        return result
+    finally:
+        for _, fd in leases:
+            os.close(fd)
+
+
+def try_command_claim(worktree, slots, exclusive, needed, maximum=None, pending=None):
+    """Claim under the queue lock, without waiting while holding partial leases.
+
+    The oldest eligible exclusive command reserves admission and its worktree
+    before draining old slot holders. Keep the existing admission.lock protocol
+    so commands already using that protocol cannot enter during its quiet check.
+    """
+    leases = []
+    try:
+        if worktree:
+            fd = try_lease(worktree)
+            if fd is None:
+                raise BlockingIOError("worktree")
+            leases.append((worktree, fd))
+        path = os.path.join(DIR, "admission.lock")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise BlockingIOError("admission")
+        leases.append((path, fd))
+        if not exclusive:
+            # Take the actual minimum first, under the same queue/worktree/
+            # admission custody. Only peers that can run beside this minimum
+            # may withhold optional shares; nominal free width is insufficient.
+            elastic = pending is not None and maximum and maximum > needed
+            acquired = try_shared_slots(slots, needed, None if elastic else maximum)
+            if not acquired:
+                raise BlockingIOError("slots")
+            leases.extend((path, fd) for _, fd, path in acquired)
+            if elastic:
+                reserved, protected = pending()
+                try:
+                    extra = try_shared_slots(slots, 0, maximum - needed, reserved)
+                    leases.extend((path, fd) for _, fd, path in extra)
+                finally:
+                    # These are only probes for queued minima, never child
+                    # grants. Keep their exact slots free through our borrow.
+                    for _, fd, _ in protected:
+                        os.close(fd)
+        result, leases = leases, []
+        return result
+    finally:
+        for _, fd in leases:
+            os.close(fd)
+
+
+def waiter_eligible(path, available, *, draining=False):
+    """A busy worktree or memory-ineligible waiter does not idle other slots.
+
+    Eligible exclusive and multi-slot requests reserve the queue while CPUs drain.
+    Unreadable requirements fail closed as a barrier, never as permission to pass.
+    """
+    try:
+        with open(path) as stream:
+            required = json.load(stream)["requires"]
+        worktree, slots = required["worktree"], required["slots"]
+        memory, exclusive = required["memory"], required["exclusive"]
+        needed = required.get("needed", 1)
+        if (worktree is not None and not isinstance(worktree, str)
+                or not isinstance(slots, int) or slots < 1
+                or type(needed) is not int or not 1 <= needed <= slots
+                or not isinstance(memory, (int, float))
+                or not isinstance(exclusive, bool)):
+            return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+    if available is not None and available < memory:
+        return False
+    worktree_fd = None
+    try:
+        if worktree:
+            worktree_fd = try_lease(worktree)
+            if worktree_fd is None:
+                return False
+        if exclusive or draining or needed > 1:
+            # An epoch join would itself extend the SH fences blocking an older
+            # fixed request. Only memory/worktree ineligibility permits bypass;
+            # busy slots cannot authorize extending that predecessor epoch.
+            # Likewise, later small fixed jobs must not continuously refill the
+            # slots an older wide claim needs. This reserves queue order only;
+            # the waiter still acquires its complete real claim atomically.
+            return True
+        acquired = try_shared_slots(slots, needed)
+        if not acquired:
+            return False
+        for _, fd, _ in acquired:
+            os.close(fd)
+        return True
+    finally:
+        if worktree_fd is not None:
+            os.close(worktree_fd)
+
+
+class AdmissionWaiter:
+    """FIFO among registered, eligible waiters; an OS lease proves each is live.
+
+    A ticket is registered before an ordinary command waits for memory.
+    Registration holds no CPU or worktree resources. No PID liveness guess,
+    watchdog or child process is needed: death closes its lease, and the next
+    registry reader retires the stale ticket. The ticket is never inherited by
+    the admitted command; only the existing pool/worktree leases survive it.
+    """
+
+    def __init__(self, label, worktree=None, slots=1, exclusive=False, memory=0, needed=1,
+                 arrival_ns=None):
+        self.label, self.path, self.fd = label, None, None
+        self.arrival_ns = arrival_ns
+        self.required = {"worktree": worktree, "slots": slots,
+                         "exclusive": exclusive, "memory": memory, "needed": needed}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def register(self):
+        # Share the exact live-lease scan and arrival order with acquisition;
+        # registration alone cannot return or transfer a resource claim.
+        self.attempt(None, None)
+
+    def close(self):
+        if self.fd is not None:
+            with admission_registry():
+                self.retire()
+
+    def retire(self):
+        """Retire while the caller holds the registry lock."""
+        try:
+            try:
+                if not same_waiter_file(self.fd, self.path):
+                    raise OSError("admission ticket changed during retirement")
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(self.fd)
+            self.fd = None
+
+    def pending_reservation(self, live, available):
+        """Hold temporary minimum probes only; never transfer a peer grant."""
+        protected = []
+        try:
+            for _, path in sorted(live):
+                if path == self.path:
+                    continue
+                try:
+                    with open(path) as stream:
+                        required = json.load(stream)["requires"]
+                    worktree = required["worktree"]
+                    slots, needed = required["slots"], required.get("needed", 1)
+                    exclusive, memory = required["exclusive"], required["memory"]
+                    if (worktree is not None and not isinstance(worktree, str)
+                            or type(slots) is not int or slots < 1
+                            or type(needed) is not int or not 1 <= needed <= slots
+                            or not isinstance(exclusive, bool)
+                            or type(memory) not in (int, float)
+                            or not math.isfinite(memory) or memory < 0):
+                        return self.required["slots"], protected
+                except (OSError, ValueError, KeyError, TypeError):
+                    return self.required["slots"], protected
+                # Our minimum and shared admission are already held. Exclusive
+                # work cannot overlap; withholding extras cannot admit it.
+                if exclusive or not waiter_eligible(path, available):
+                    continue
+                # Counts alone could leave only a high slot outside a peer's
+                # smaller configured pool. Retain the actual eligible minimum
+                # under registry custody until our optional borrowing finishes.
+                claim = try_shared_slots(slots, needed)
+                if claim:
+                    protected.extend(claim)
+            return 0, protected
+        except BaseException:
+            for _, fd, _ in protected:
+                os.close(fd)
+            raise
+
+    def attempt(self, acquire, available, *, draining=False, borrow=False):
+        # Keep eligibility probing and full resource acquisition atomic with
+        # respect to other queue readers. No queued waiter holds a worktree.
+        with admission_registry() as directory:
+            live = []
+            for name in os.listdir(directory):
+                if not name.startswith("wait-") or not name[5:].isdigit():
+                    continue
+                path = os.path.join(directory, name)
+                order = int(name[5:])
+                if path == self.path:
+                    live.append((order, path))
+                    continue
+                try:
+                    fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+                except FileNotFoundError:
+                    continue
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        live.append((order, path))
+                    else:
+                        if not same_waiter_file(fd, path):
+                            raise OSError("admission ticket changed while checking its lease")
+                        os.unlink(path)
+                finally:
+                    os.close(fd)
+            if self.fd is None:
+                if self.arrival_ns is None:
+                    order = next_admission_order(directory, [item[0] for item in live])
+                else:
+                    # A memory rollback must not turn an older command into
+                    # a new arrival behind a sustained stream of small jobs.
+                    order = self.arrival_ns
+                    while os.path.exists(os.path.join(directory, f"wait-{order}")):
+                        order += 1
+                self.path = os.path.join(directory, f"wait-{order}")
+                self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                fcntl.flock(self.fd, fcntl.LOCK_EX)
+                os.write(self.fd, json.dumps({"pid": os.getpid(), "cmd": self.label,
+                                             "cwd": os.getcwd(),
+                                             "started": time.time(),
+                                             "requires": self.required}).encode())
+            if acquire is None:
+                return None
+            order = int(os.path.basename(self.path)[5:])
+            if any(prior < order and waiter_eligible(path, available, draining=draining)
+                   for prior, path in live):
+                return None
+            acquired = (acquire(lambda: self.pending_reservation(live, available))
+                        if borrow else acquire())
+            if acquired:
+                self.retire()
+            return acquired
+
+
+class NativeEpochWaiter:
+    """Reserve the existing canonical FIFO/barrier before draining legacy work.
+
+    This is an epoch transition, not a user exclusive benchmark or a CPU grant.
+    Existing native peers still share the same SH fence when no ticket is ahead.
+    """
+
+    def __init__(self, directory, slots, label, memory, worktree=None, arrival_ns=None):
+        self.directory, self.slots, self.memory = directory, slots, memory
+        self.worktree, self.worktree_fd, self.barrier = worktree, None, None
+        self.ready_fence = None
+        self.waiter = AdmissionWaiter("native epoch: " + label, worktree=worktree,
+                                      slots=exclusive_slot_count(slots), exclusive=True, memory=memory,
+                                      arrival_ns=arrival_ns)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def close(self):
+        try:
+            self.waiter.close()
+        finally:
+            self.release_claim()
+
+    def release_claim(self):
+        if self.ready_fence is not None:
+            for fd in self.ready_fence:
+                os.close(fd)
+            self.ready_fence = None
+        for name in ("barrier", "worktree_fd"):
+            fd = getattr(self, name)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, name, None)
+
+    def take_worktree(self):
+        fd, self.worktree_fd = self.worktree_fd, None
+        return fd
+
+    def reserve(self):
+        # Full claim under the registry: never wait with only a worktree lease.
+        # Keeping it through the native claim also prevents a fixed waiter from
+        # holding this worktree while waiting on our newly shared epoch fence.
+        if self.worktree:
+            self.worktree_fd = try_lease(self.worktree)
+            if self.worktree_fd is None:
+                return None
+        try:
+            # Called only after FIFO eligibility is adjudicated under the same
+            # registry lock. Our own/younger tickets cannot forbid a compatible
+            # native join; older memory/worktree-eligible fixed work still wins.
+            self.ready_fence = try_legacy_fence(self.directory, self.slots, priority=True)
+            if self.ready_fence is not None:
+                return self.ready_fence
+            root = checked_cpu_directory(self.directory)
+            try:
+                self.barrier = checked_legacy_fence_file(root, "admission.lock")
+            finally:
+                os.close(root)
+            fcntl.flock(self.barrier, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if active_adoption(os.path.join(self.directory, "admission.lock")) is not None:
+                raise BlockingIOError()
+            os.ftruncate(self.barrier, 0)
+            os.write(self.barrier, json.dumps({"pid": os.getpid(), "cmd": self.waiter.label,
+                                              "cwd": os.getcwd(), "started": time.time(),
+                                              "native_epoch_transition": True}).encode())
+            return [self.barrier]
+        except BlockingIOError:
+            self.release_claim()
+            return None
+        except BaseException:
+            self.release_claim()
+            raise
+
+    def attempt(self, available):
+        # This transition has not started a command. If its measured memory
+        # eligibility disappears while old holders drain, release its barrier
+        # and worktree claim so eligible work can proceed. Retrying rejoins FIFO.
+        if available is not None and available < self.memory:
+            self.release_claim()
+            return None
+        if self.barrier is None:
+            # Preserve the ordinary memory precondition before reserving any
+            # legacy leases. An ineligible transition must not idle fixed work.
+            if self.waiter.path is None:
+                can_join = True
+                if self.worktree:
+                    self.worktree_fd = try_lease(self.worktree)
+                    can_join = self.worktree_fd is not None
+                if can_join:
+                    try:
+                        fence = try_legacy_fence(self.directory, self.slots)
+                        if fence is not None:
+                            return fence
+                    except BaseException:
+                        self.release_claim()
+                        raise
+                    self.release_claim()
+                # Busy worktrees still get tickets. They do not block other
+                # eligible work, and recover their FIFO turn when they free.
+            claim = self.waiter.attempt(self.reserve, available, draining=True)
+            if not claim:
+                return None
+            if self.ready_fence is not None:
+                fence, self.ready_fence = self.ready_fence, None
+                return fence
+        try:
+            fence = try_legacy_fence(self.directory, self.slots, self.barrier)
+        except EpochReservationLost:
+            self.release_claim()
+            return None
+        if fence is not None:
+            self.barrier = None  # ownership transfers to the native child fence
+        return fence
+
+
+def write_adoption(path, info):
+    import tempfile
+
+    pending = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(path),
+                                         prefix=".build-slot-adopt-", delete=False) as stream:
+            pending = stream.name
+            json.dump(info, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(pending, path)
+    finally:
+        if pending and os.path.exists(pending):
+            os.unlink(pending)
+
+
+def prior_adoption(identity, worktree):
+    for _, info in adoption_records():
+        if "identity" not in info:
+            raise IdentityError("adoption registry is unreadable")
+        if same_process(identity, info["identity"]):
+            if info.get("worktree") != worktree or info.get("pool") != os.path.realpath(DIR):
+                raise IdentityError("process is already adopted in another pool or worktree")
+            return info
+    return None
+
+
+def checked_adoption_identity(pid):
+    identity = process_identity(pid)
+    if identity is None:
+        raise IdentityError("process has exited")
+    if identity["uid"] != os.geteuid():
+        raise IdentityError("process is owned by another user")
+    if os.path.realpath(process_cwd(pid)) != os.path.realpath(os.getcwd()):
+        raise IdentityError("run adopt from the direct job's exact working directory")
+    after = process_identity(pid)
+    if after != identity:
+        raise IdentityError("process changed during adoption identity checks")
+    return identity
+
+
+def adopt(pid, slots, mem_gib, per_worktree, exclusive):
+    """One atomic full-claim record, no watcher and no inherited admission."""
+    import hashlib
+
+    worktree = worktree_lock_path() if per_worktree else None
+    worktree = os.path.realpath(worktree) if worktree else None
+    announced = False
+    count = exclusive_slot_count(slots) if exclusive else slots
+    waiter = AdmissionWaiter(f"adopt {pid}", worktree, count, exclusive, mem_gib)
+    try:
+        identity = checked_adoption_identity(pid)
+        namespace_directory(ADOPTION_DIR)
+        namespace_directory(DIR)
+        while True:
+            current = process_identity(pid)
+            if current is None or not same_process(current, identity):
+                raise IdentityError("process exited or its PID was reused while waiting")
+            if current["uid"] != os.geteuid():
+                raise IdentityError("process is no longer owned by this user")
+            # Serialize only registration attempts. Ordinary admission reads
+            # atomic records under its own lease flock; it needs no new lock.
+            registration = os.open(os.path.join(ADOPTION_DIR, "registration.lock"),
+                                   os.O_RDWR | os.O_CREAT, 0o600)
+            leases = []
+            try:
+                try:
+                    fcntl.flock(registration, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    prior = prior_adoption(identity, worktree)
+                    if prior:
+                        if exclusive and not prior.get("exclusive"):
+                            raise IdentityError("existing shared adoption cannot be upgraded")
+                        print(f"build-slot: already adopted pid={pid}")
+                        return 0
+                    avail = available_gib()
+                    if avail is None or avail >= mem_gib:
+                        claimed = waiter.attempt(
+                            lambda: try_resources(worktree, count, exclusive), avail)
+                        if not claimed:
+                            raise BlockingIOError()
+                        leases = claimed
+                        fresh = checked_adoption_identity(pid)
+                        if not same_process(fresh, identity):
+                            raise IdentityError("process changed before adoption publication")
+                        info = {"schema": 1, "adopted": True, "identity": fresh, "pid": pid,
+                                "cmd": fresh["executable"], "cwd": os.getcwd(),
+                                "started": time.time(), "exclusive": exclusive,
+                                "pool": os.path.realpath(DIR), "worktree": worktree,
+                                "leases": [os.path.realpath(path) for path, _ in leases]}
+                        key = hashlib.sha256(f"{pid}:{identity['birth']}".encode()).hexdigest()
+                        write_adoption(os.path.join(ADOPTION_DIR, key + ".json"), info)
+                        print(f"build-slot: adopted pid={pid} leases={len(leases)}")
+                        return 0
+                except BlockingIOError:
+                    pass
+            finally:
+                for _, fd in leases:
+                    os.close(fd)
+                os.close(registration)
+            if not announced:
+                print("build-slot: waiting for normal adoption admission", file=sys.stderr, flush=True)
+                announced = True
+            time.sleep(2)
+    except (IdentityError, OSError) as error:
+        print(f"build-slot: adoption refused: {error}", file=sys.stderr)
+        return 2
+    finally:
+        waiter.close()
+
+
+def queued_status(directory=None):
+    if directory is None:
+        directory = DIR if DIR is not None else slot_directory()
+    """Observe live ticket leases without creating, retiring or claiming one."""
+    directory = os.path.join(os.path.realpath(directory), "admission")
+    try:
+        registry = os.open(os.path.join(directory, "registry.lock"),
+                           os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return [], 0, None
+    except OSError as error:
+        return [], 0, str(error)
+    rows, stale = [], 0
+    try:
+        if not stat.S_ISREG(os.fstat(registry).st_mode):
+            return [], 0, "admission registry is not a regular file"
+        try:
+            fcntl.flock(registry, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return [], 0, "admission registry is busy"
+        for name in os.listdir(directory):
+            if not name.startswith("wait-") or not name[5:].isascii() or not name[5:].isdigit():
+                continue
+            path = os.path.join(directory, name)
+            record = {}
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise OSError("admission ticket is not a regular file")
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        if not same_waiter_file(fd, path):
+                            raise OSError("admission ticket changed during observation")
+                        data = os.read(fd, 65537)
+                        if len(data) > 65536:
+                            raise ValueError("admission ticket exceeds observation bound")
+                        record = json.loads(data)
+                        if not isinstance(record, dict):
+                            raise ValueError("admission ticket is not an object")
+                    else:
+                        stale += 1
+                        continue
+                finally:
+                    os.close(fd)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, RecursionError) as error:
+                record = {"observation_error": str(error)}
+            rows.append((int(name[5:]), record))
+        return sorted(rows, key=lambda row: row[0]), stale, None
+    except OSError as error:
+        return rows, stale, str(error)
+    finally:
+        os.close(registry)
+
+
+def print_exclusive_reservation(directory=None):
+    if directory is None:
+        directory = DIR if DIR is not None else slot_directory()
+    """Observe an exclusive winner that left the queue to drain the slot pool."""
+    path = os.path.join(os.path.realpath(directory), "admission.lock")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        print(f"reservation: observation unavailable ({error})")
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("admission lease is not a regular file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if not same_waiter_file(fd, path):
+                raise OSError("admission lease changed during observation")
+            data = os.read(fd, 65537)
+            if len(data) > 65536:
+                raise ValueError("admission lease exceeds observation bound")
+            record = json.loads(data)
+            if not isinstance(record, dict):
+                raise ValueError("admission lease is not an object")
+            print(f"reservation: exclusive=1 claim=all pid={record.get('pid')} "
+                  f"cwd={json.dumps(record.get('cwd'))} cmd={json.dumps(record.get('cmd'))}; "
+                  "shared launches wait while this lease is held")
+    except (OSError, ValueError, RecursionError) as error:
+        print(f"reservation: observation unavailable ({error})")
+    finally:
+        os.close(fd)
+
+
+def print_queued_status(directory=None):
+    rows, stale, error = queued_status(directory)
+    if error:
+        print(f"queue: observation unavailable ({error}); admission rules unchanged")
+        return
+    print(f"queue: {len(rows)} pending request(s), {stale} stale ticket(s) ignored; "
+          "oldest eligible first; eligible exclusive requests reserve the whole pool")
+    for position, (_, record) in enumerate(rows):
+        required = record.get("requires")
+        if not isinstance(required, dict) or record.get("observation_error"):
+            print(f"wait {position}: requirements unavailable; "
+                  "no eligibility or capacity claim can be made")
+            continue
+        exclusive = required.get("exclusive")
+        exclusive_text = str(int(exclusive)) if isinstance(exclusive, bool) else "?"
+        needed = required.get("needed", 1)
+        pool_slots = required.get("slots")
+        if exclusive is True:
+            claim = "all"
+        elif (exclusive is False and type(needed) is int and type(pool_slots) is int
+              and 1 <= needed <= pool_slots):
+            claim = "one" if needed == 1 else str(needed)
+        else:
+            claim = "unknown"
+        print(f"wait {position}: pid={record.get('pid')} exclusive={exclusive_text} "
+              f"claim={claim} pool_slots={required.get('slots')} "
+              f"mem_gib={required.get('memory')} "
+              f"cwd={json.dumps(record.get('cwd'))} "
+              f"worktree_lock={json.dumps(required.get('worktree'))} "
+              f"cmd={json.dumps(record.get('cmd'))}")
+
+
+def status(slots, directory=None):
+    if directory is None:
+        directory = DIR if DIR is not None else slot_directory()
+    if ADOPTION_DIR is None:
+        print("build-slot: canonical user home is unavailable", file=sys.stderr)
+        return 2
+    namespace_directory(directory)
+    avail = available_gib()
+    print(f"slots={slots} cpus={NCPU} load1={load1():.1f} avail_gib={avail if avail is None else round(avail, 1)} dir={directory}")
+    free_slots = 0
+    for i in range(slots):
+        p = os.path.join(directory, f"slot-{i}")
+        held = False
+        info = {}
+        try:
+            fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                adopted = active_adoption(p)
+                if adopted is not None:
+                    held = True
+                    info = adopted
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BlockingIOError:
+                held = True
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    # An EX failure does not identify the old JSON writer:
+                    # native epochs retain SH exclusion without rewriting it.
+                    # Recheck EX after SH so a holder retiring between probes
+                    # does not manufacture a shared fence from our own lock.
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        info = {"shared_exclusion": True}
+                    else:
+                        held = False
+                        adopted = active_adoption(p)
+                        if adopted is not None:
+                            held, info = True, adopted
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        except OSError:
+            held = True
+            info = {"pid": None, "cmd": "lease status unavailable; held fail-closed"}
+        info = info or (holder_info(p) if held else {})
+        if held:
+            if info.get("shared_exclusion"):
+                print(f"slot {i}: HELD mode=shared-exclusion pid=None age=unknown "
+                      "cwd=None cmd=shared-exclusion-fence cpu_budget=unknown; "
+                      "previous slot record is not current owner attribution")
+                continue
+            age = int(time.time() - info.get("started", time.time()))
+            adopted = " adopted=1" if info.get("adopted") else ""
+            budget = info.get("cpu_budget")
+            budget = budget if type(budget) is int and budget > 0 else "unknown"
+            print(f"slot {i}: HELD pid={info.get('pid')} age={age}s cwd={info.get('cwd')} cmd={info.get('cmd')}{adopted} cpu_budget={budget}")
+        else:
+            free_slots += 1
+            print(f"slot {i}: free")
+    print(f"capacity: free_slots={free_slots} pool_slots={slots} "
+          f"default_cpu_budget={max(1, NCPU // slots)} observed_cpu_use=unknown; "
+          "snapshot only; memory, worktree and queue eligibility still apply")
+    print_exclusive_reservation(directory)
+    print_queued_status(directory)
+    return 0
+
+
+def usage():
+    print("usage: build-slot [--exclusive] [--wait-timeout S] [--cpus N] [--slots N] [--mem-gb G] [--no-worktree-lock] -- <command> [args...]\n       build-slot [options] adopt PID\n       build-slot status", file=sys.stderr)
+
+
+def main(argv):
+    # Close only descriptors transferred to this invocation. A child keeps its
+    # inherited descriptions until actual exit; never explicitly unlock them.
+    owned = set()
+    try:
+        return _main(argv, owned)
+    finally:
+        for fd in owned:
+            os.close(fd)
+
+
+def _main(argv, owned):
+    global DIR
+    slots = default_slots()
+    mem_gib = float(os.environ.get("BUILD_SLOT_MEM_GB", "8"))
+    per_worktree = True
+    exclusive = False
+    wait_timeout = None
+    cpus = None
+    memory_attempt = None
+    memory_arrival = None
+    if argv[:1] == ["status"]:
+        DIR = slot_directory()
+        runtime = os.path.join(DIR, "runtime-v2")
+        if os.path.isdir(runtime):
+            print("legacy pool (native epochs hold shared exclusion fences here):")
+            result = status(slots)
+            print("native runtime-v2 pool:")
+            return max(result, status(slots, runtime))
+        return status(slots)
+    args = list(argv)
+    cmd = None
+    options = []
+    adopt_pid = None
+    while args:
+        a = args.pop(0)
+        if a == "--":
+            cmd = args
+            options = list(argv[:len(argv) - len(args) - 1])
+            break
+        if a == "--slots":
+            slots = int(args.pop(0))
+        elif a == "--cpus":
+            if (not args or len(args[0]) > 4300 or not args[0].isascii()
+                    or not args[0].isdigit() or not 1 <= int(args[0]) <= NCPU):
+                print(f"build-slot: --cpus requires an integer from 1 to {NCPU}", file=sys.stderr)
+                return 2
+            cpus = int(args.pop(0))
+        elif a == "--mem-gb":
+            mem_gib = float(args.pop(0))
+        elif a == "--_memory-attempt":
+            try:
+                memory_attempt = int(args.pop(0))
+                memory_arrival = int(args.pop(0))
+                held = os.environ.get("HEAVY_GATE_HELD", "").partition(":")
+                if (memory_attempt < 3 or not 0 < memory_arrival < 10**39
+                        or not held[0].isdigit()
+                        or int(held[0]) < 1 or not held[2]
+                        or not stat.S_ISFIFO(os.fstat(memory_attempt).st_mode)):
+                    raise ValueError
+            except (OSError, ValueError, IndexError):
+                print("build-slot: coordinated admission needs a held memory reservation and reply pipe", file=sys.stderr)
+                return 2
+        elif a == "--no-worktree-lock":
+            per_worktree = False
+        elif a == "--exclusive":
+            exclusive = True
+        elif a == "--wait-timeout":
+            try:
+                wait_timeout = float(args.pop(0))
+                if not math.isfinite(wait_timeout) or wait_timeout <= 0:
+                    raise ValueError
+            except (ValueError, IndexError):
+                print("build-slot: --wait-timeout needs positive finite seconds; no command was started", file=sys.stderr)
+                return 2
+        elif a == "adopt":
+            if len(args) != 1 or not args[0].isdigit() or int(args[0]) < 1 or slots < 1:
+                print("build-slot: adopt requires one positive PID and a positive slot count", file=sys.stderr)
+                return 2
+            adopt_pid = int(args[0])
+            cmd = ["adopt", args[0]]
+            break
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        elif a.startswith("-"):
+            print(f"build-slot: unknown option {a!r}; no command was started. "
+                  "Use -- before a command beginning with '-'.", file=sys.stderr)
+            usage()
+            return 2
+        else:
+            cmd = [a] + args
+            options = list(argv[:len(argv) - len(args) - 1])
+            break
+    if not cmd:
+        usage()
+        return 2
+    inherited_resource_fds(os.environ)
+    if "BUILD_SLOT_FENCE_FDS" in os.environ and not (
+            os.environ.get("BUILD_SLOT_HELD") == "1"
+            and os.environ.get("BUILD_SLOT_CPU_PROTOCOL") == "2"):
+        raise NamespaceError("inherited fences require their existing native epoch; "
+                             "fresh admission cannot replace or mix them")
+    if wait_timeout is not None and adopt_pid is not None:
+        print("build-slot: --wait-timeout cannot bound an already running adopted job; no command was started", file=sys.stderr)
+        return 2
+    if exclusive and slots < 1:
+        print("build-slot: --exclusive requires a positive slot count", file=sys.stderr)
+        return 2
+    if cpus is not None and adopt_pid is not None:
+        print("build-slot: --cpus cannot change an already running adopted job", file=sys.stderr)
+        return 2
+    wrapper = memory_wrapper(cmd)
+    if wait_timeout is not None and wrapper is not None and not exclusive:
+        print("build-slot: --wait-timeout requires a new --exclusive command for a shared memory wrapper; no command was started", file=sys.stderr)
+        return 2
+    if memory_attempt is not None:
+        if (adopt_pid is not None or exclusive or wait_timeout is not None
+                or wrapper is not None or os.environ.get("BUILD_SLOT_HELD") == "1"):
+            print("build-slot: coordinated CPU attempt requires a fresh command", file=sys.stderr)
+            return 2
+        os.write(memory_attempt, b"W")
+    elif wrapper is not None and not exclusive and adopt_pid is None:
+        if os.environ.get("BUILD_SLOT_HELD") == "1":
+            print("build-slot: acquire memory before the outer CPU reservation", file=sys.stderr)
+            return 2
+    if os.environ.get("BUILD_SLOT_HELD") == "1":
+        if adopt_pid is not None:
+            print("build-slot: adopt must run outside an existing admission", file=sys.stderr)
+            return 2
+        native_epoch = os.environ.get("BUILD_SLOT_CPU_PROTOCOL") == "2"
+        if native_epoch and (exclusive or not worker_capability(cmd)):
+            print("build-slot: nested native epochs require an invocation accepted by the selected Targo; fixed or exclusive work must run outside the epoch", file=sys.stderr)
+            return 2
+        if exclusive and os.environ.get("BUILD_SLOT_EXCLUSIVE") != "1":
+            print("build-slot: nested --exclusive cannot upgrade shared admission; request it on the outermost invocation", file=sys.stderr)
+            return 2
+        if wait_timeout is not None:
+            print("build-slot: --wait-timeout requires a fresh admission outside the held slot; no command was started", file=sys.stderr)
+            return 2
+        if cpus is not None:
+            try:
+                parent_jobs = cpu_jobs(1, os.environ.get("CARGO_BUILD_JOBS", "0"), budget=NCPU, strict=True)
+                if cpus > parent_jobs:
+                    raise ValueError("a nested command cannot enlarge its parent's CPU budget")
+                os.environ["CARGO_BUILD_JOBS"] = str(cpus)
+                os.environ["BUILD_SLOT_CPU_SOURCE"] = "caller-or-fixed-share"
+                os.environ["BUILD_SLOT_CPU_BUDGET"] = str(cpus)
+                _, cap = job_provenance(os.environ, cpus)
+                os.environ["TARGO_CALLER_JOBS"] = str(cap)
+                os.environ["TARGO_PLANNED_JOBS"] = str(cpus)
+            except ValueError as exc:
+                print(f"build-slot: REFUSED — {exc}; no command was started", file=sys.stderr)
+                return 2
+        if native_epoch:
+            cmd = worker_command(cmd)
+        os.execvp(cmd[0], cmd)
+    DIR = slot_directory()
+    if os.environ.get("BUILD_SLOT_CPU_PROTOCOL") == "2":
+        if (os.environ.get("BUILD_SLOT_V2_DIR") != os.path.join(DIR, "runtime-v2")
+                or os.environ.get("BUILD_SLOT_LEGACY_DIR", DIR) != DIR):
+            raise NamespaceError("inherited native CPU namespace is inconsistent")
+    if ADOPTION_DIR is None:
+        print("build-slot: canonical user home is unavailable", file=sys.stderr)
+        return 2
+    try:
+        if (exclusive or cpus is not None) and (type(MEASURED_NCPU) is not int or MEASURED_NCPU < 1):
+            raise ValueError("exclusive or explicit CPU admission requires a measured positive CPU count")
+        if exclusive and (not math.isfinite(mem_gib) or mem_gib < 0):
+            raise ValueError("--mem-gb must be finite and nonnegative")
+        generated_jobs, caller_jobs = job_provenance(os.environ, cpus) if adopt_pid is None else (False, None)
+        budget = cpus if cpus is not None else (NCPU if exclusive else None)
+        jobs = cpu_jobs(slots, os.environ.get("CARGO_BUILD_JOBS"), budget=budget,
+                        strict=cpus is not None and not generated_jobs) if adopt_pid is None else None
+        if jobs is not None and caller_jobs is not None:
+            jobs = min(jobs, caller_jobs)
+    except ValueError as exc:
+        print(f"build-slot: REFUSED — {exc}; no command was started", file=sys.stderr)
+        return 2
+    if adopt_pid is not None:
+        return adopt(adopt_pid, slots, mem_gib, per_worktree, exclusive)
+    if wrapper is not None and not exclusive and memory_attempt is None:
+        return coordinate_memory(options, wrapper)
+
+    automatic = (cpus is None and not exclusive
+                 and ("CARGO_BUILD_JOBS" not in os.environ or generated_jobs)
+                 and type(MEASURED_NCPU) is int and MEASURED_NCPU > 0)
+    workers = (not exclusive and type(MEASURED_NCPU) is int and MEASURED_NCPU > 0
+               and worker_capability(cmd))
+    own_args = cmd[1:cmd.index("--", 1)] if "--" in cmd[1:] else cmd[1:]
+    if os.path.basename(cmd[0]) == "targo" and "--resource-worker-v2" in own_args and not workers:
+        print("build-slot: selected compiler cohort does not support the requested native worker protocol; no command was started", file=sys.stderr)
+        return 2
+    cpu_mode = "workers-v1" if workers else "fixed-v1"
+    lease_id = secrets.token_hex(16)
+    cpu_pool = exclusive_slot_count(slots) if cpus is not None else slots
+    share = max(1, NCPU // cpu_pool)
+    needed = min(cpu_pool, (cpus + share - 1) // share) if cpus is not None else 1
+    namespace_directory(DIR)
+    held_fds = []
+    fence_fds = []
+    legacy_dir = DIR
+    label = " ".join(cmd)[:300]
+    announced = set()
+    deadline = time.monotonic() + wait_timeout if wait_timeout is not None else None
+
+    def say(key, msg):
+        if key not in announced:
+            announced.add(key)
+            print(f"build-slot: {msg}", file=sys.stderr, flush=True)
+
+    def check_deadline():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise AdmissionTimeout
+
+    def wait(seconds):
+        if memory_attempt is not None:
+            raise AdmissionUnavailable
+        check_deadline()
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AdmissionTimeout
+            seconds = min(seconds, remaining)
+        time.sleep(seconds)
+
+    def stamp(fd):
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps({"pid": os.getpid(), "cmd": label, "cwd": os.getcwd(), "started": time.time()}).encode())
+
+    worktree = worktree_lock_path() if per_worktree else None
+    epoch_worktree_fd = None
+    if workers:
+        # An invalid original CPU manifest cannot be repaired by an epoch wait.
+        # This is only a nonblocking preflight; admission and workers still
+        # revalidate their actual descriptors before granting or executing.
+        try:
+            native_cpu_room(legacy_dir, NCPU, exclusive_slot_count(slots))
+        except (OSError, ValueError) as error:
+            raise CpuBridgeUnavailable(f"native CPU accounting unavailable: {error}") from error
+        with NativeEpochWaiter(legacy_dir, slots, label, mem_gib, worktree,
+                               arrival_ns=memory_arrival) as epoch:
+            while True:
+                check_deadline()
+                fence_fds = epoch.attempt(available_gib())
+                if fence_fds is not None:
+                    owned.update(fence_fds)
+                    epoch_worktree_fd = epoch.take_worktree()
+                    if epoch_worktree_fd is not None:
+                        owned.add(epoch_worktree_fd)
+                        held_fds.append(epoch_worktree_fd)
+                    break
+                say("legacy-fence", "waiting: native epoch needs an eligible FIFO turn and legacy CPU drain")
+                wait(0.05)
+        DIR = os.path.join(legacy_dir, "runtime-v2")
+        namespace_directory(DIR)
+        checked = checked_cpu_directory(DIR, private=True)
+        os.close(checked)
+
+    # Retain the canonical gate's memory precondition before reserving leases.
+    # Unknown measurements also wait fail-closed for an exclusive command.
+    if exclusive:
+        while True:
+            check_deadline()
+            avail = available_gib()
+            if avail is not None and math.isfinite(avail) and avail >= mem_gib:
+                break
+            say("initial-mem", f"waiting: memory {avail} GiB available < {mem_gib:g} GiB needed or unavailable")
+            wait(2)
+
+    # Fixed commands register before taking a worktree lease; native commands
+    # reuse the lease already secured with their epoch. Acquire the full weighted
+    # claim at once. An eligible exclusive winner reserves the
+    # existing admission barrier, then drains the canonical/historic slot pool.
+    claim_worktree = None if epoch_worktree_fd is not None else worktree
+    count = exclusive_slot_count(slots) if exclusive else cpu_pool
+    admission_path = os.path.join(DIR, "admission.lock")
+    with AdmissionWaiter(label, claim_worktree, count, exclusive, mem_gib, needed,
+                         arrival_ns=memory_arrival if not workers else None) as waiter:
+        waiter.register()
+        while True:
+            check_deadline()
+            avail = available_gib()
+            if (exclusive and (avail is None or not math.isfinite(avail))
+                    or avail is not None and avail < mem_gib):
+                say("mem", f"waiting: {avail} GiB available < {mem_gib:g} GiB needed or unavailable")
+                wait(2 if exclusive else 10)
+                continue
+            try:
+                # An uncapped caller borrows currently idle slots atomically.
+                # Each additional share requires the same measured memory
+                # headroom as the first. Unknown memory retains one share.
+                maximum = 1
+                if automatic and not workers and avail is not None and math.isfinite(avail) and mem_gib > 0:
+                    maximum = max(1, min(count, int(avail // mem_gib)))
+                acquired = waiter.attempt(
+                    lambda pending=None: try_command_claim(
+                        claim_worktree, count, exclusive, needed,
+                        maximum if automatic else None, pending),
+                    avail, borrow=automatic and not workers)
+            except BlockingIOError as error:
+                if error.args == ("worktree",):
+                    info = holder_info(worktree)
+                    say("wt", f"waiting: another build-slot job runs in this worktree (pid={info.get('pid')} cmd={info.get('cmd')})")
+                elif error.args == ("admission",):
+                    say("admission", "waiting: an exclusive reservation owns admission")
+                elif cpus is not None:
+                    say("slot", f"waiting for {needed} of {count} slots for {cpus} CPUs")
+                else:
+                    say("slot", f"waiting for one of {count} slots")
+                acquired = None
+            else:
+                if not acquired:
+                    say("queue", "waiting: older eligible admission waiter first")
+            if acquired:
+                owned.update(fd for _, fd in acquired)
+                for _, fd in acquired:
+                    stamp(fd)
+                    held_fds.append(fd)
+                admission_fd = next(fd for path, fd in acquired if path == admission_path)
+                break
+            wait(2)
+
+    if exclusive:
+        while True:
+            check_deadline()
+            acquired = try_exclusive_slots(slots)
+            if acquired is not None:
+                owned.update(fd for _, fd, _ in acquired)
+                for _, fd, _ in acquired:
+                    stamp(fd)
+                    held_fds.append(fd)
+                break
+            say("exclusive", f"waiting for all {len(pool_slots(slots))} canonical slots; draining legacy or adopted slot holders for exclusive reservation")
+            wait(2)
+        print(f"build-slot: reserved {len(acquired)} slots exclusively; waiting for host readiness", file=sys.stderr, flush=True)
+        quiet_since = None
+        while True:
+            check_deadline()
+            avail, load, builds = available_gib(), load1(), build_processes()
+            reason = None
+            if avail is None or not math.isfinite(avail) or avail < mem_gib:
+                reason = ("mem", f"memory {avail} GiB unavailable or below {mem_gib:g} GiB")
+            elif not math.isfinite(load) or load < 0 or load > QUIET_LOAD_FRACTION * NCPU:
+                reason = ("load", f"load1 {load:g} unavailable or above {QUIET_LOAD_FRACTION:g} * {NCPU} CPUs")
+            elif builds is None or builds:
+                reason = ("processes", f"build/compiler processes: {builds}")
+            if reason:
+                quiet_since = None
+                key, message = reason
+                say(key, f"waiting: {message}")
+            else:
+                now = time.monotonic()
+                if quiet_since is None:
+                    quiet_since = now
+                if now - quiet_since >= QUIET_SECONDS:
+                    print(f"build-slot: quiet for {QUIET_SECONDS:g}s: load1={load:g} cpus={NCPU} avail_gib={avail:.1f} build_processes=0", file=sys.stderr, flush=True)
+                    break
+            wait(2)
+
+    if not exclusive:
+        held_fds.remove(admission_fd)
+        owned.remove(admission_fd)
+        os.close(admission_fd)
+
+    env = dict(os.environ)
+    env["BUILD_SLOT_HELD"] = "1"
+    env["BUILD_SLOT_DIR"] = legacy_dir
+    env.pop("BUILD_SLOT_EXCLUSIVE", None)
+    if exclusive:
+        env["BUILD_SLOT_EXCLUSIVE"] = "1"
+    if automatic:
+        reserved = sum(os.path.basename(path).startswith("slot-") for path, _ in acquired)
+        # Native records retain epoch/launch custody, not fixed CPU shares.
+        # Leave room for its scheduler to grow as actual global worker leases
+        # become available; every dispatch still needs those real credits.
+        # Fixed commands retain the exact backed-share ceiling instead.
+        jobs = NCPU if workers else max(1, NCPU * reserved // count)
+        if generated_jobs:
+            jobs = min(jobs, int(os.environ["CARGO_BUILD_JOBS"]))
+        if caller_jobs is not None:
+            jobs = min(jobs, caller_jobs)
+    env["CARGO_BUILD_JOBS"] = str(jobs)
+    # This records provenance; it does not authorize descendants to exceed
+    # their inherited reservation. Explicit caps remain caps at every layer.
+    env["BUILD_SLOT_CPU_SOURCE"] = "available-slots" if automatic else "caller-or-fixed-share"
+    env["BUILD_SLOT_CPU_BUDGET"] = str(jobs)
+    env["TARGO_PLANNED_JOBS"] = str(jobs)
+    if caller_jobs is None:
+        env.pop("TARGO_CALLER_JOBS", None)
+    else:
+        env["TARGO_CALLER_JOBS"] = str(caller_jobs)
+    env["BUILD_SLOT_CPU_MODE"] = cpu_mode
+    env["BUILD_SLOT_POOL_SLOTS"] = str(exclusive_slot_count(slots) if workers else count)
+    env["BUILD_SLOT_CPU_PROTOCOL"] = "2" if workers else "1"
+    if workers:
+        env["BUILD_SLOT_LEGACY_DIR"] = legacy_dir
+        env["BUILD_SLOT_V2_DIR"] = DIR
+        env["BUILD_SLOT_V2_SLOTS"] = str(count)
+        env["BUILD_SLOT_FENCE_FDS"] = ",".join(map(str, fence_fds))
+    else:
+        env.pop("BUILD_SLOT_LEGACY_DIR", None)
+        env.pop("BUILD_SLOT_V2_DIR", None)
+        env.pop("BUILD_SLOT_V2_SLOTS", None)
+        env.pop("BUILD_SLOT_FENCE_FDS", None)
+    info = {"pid": os.getpid(), "cmd": label, "cwd": os.getcwd(),
+            "started": time.time(), "cpu_mode": cpu_mode, "cpu_budget": jobs,
+            "pool_slots": count, "lease_id": lease_id}
+    # Publish the fixed reservation BEFORE judging native room. New native
+    # workers recheck these kernel-held records under the same manifest lock.
+    for fd in held_fds:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps(info).encode())
+    if not workers:
+        while True:
+            check_deadline()
+            try:
+                if native_cpu_room(DIR, NCPU, count):
+                    break
+                reason = "native workers are draining for the fixed CPU reservation"
+            except (OSError, ValueError) as error:
+                # Contention returns False above. Missing/malformed/replaced
+                # accounting cannot become valid by retaining our claim and
+                # spinning; refuse without granting or repairing capacity.
+                raise CpuBridgeUnavailable(f"native CPU accounting unavailable: {error}") from error
+            say("native-cpu", f"waiting: {reason}")
+            wait(0.05)
+    check_deadline()
+    worker_cmd = worker_command(cmd) if workers else cmd
+    launch = resource_command(worker_cmd, env)
+    check_deadline()
+    observe_exit = original_child_exit_observer()
+    if observe_exit is None:
+        return 2
+    if memory_attempt is not None:
+        os.write(memory_attempt, b"R")
+        os.close(memory_attempt)
+    child = subprocess.Popen(
+        launch, env=env, start_new_session=True,
+        pass_fds=sorted({*held_fds, *fence_fds, *inherited_resource_fds(env)}))
+    info.update(pid=child.pid, supervisor_pid=os.getpid())
+    if exclusive:
+        info["exclusive"] = True
+    if cpus is not None:
+        info["cpus"] = cpus
+    for fd in held_fds:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps(info).encode())
+
+    forwardable = child
+
+    def forward(sig, _frame):
+        if forwardable is not None:
+            resource_transport_owner().signal_owned_group(forwardable.pid, sig)
+
+    previous = {sig: signal.signal(sig, forward)
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        observe_exit(child.pid)
+        forwardable = None
+        rc = child.wait()
+    finally:
+        forwardable = None
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return 128 - rc if rc < 0 else rc
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except NamespaceError as error:
+        print(f"build-slot: namespace refused: {error}", file=sys.stderr)
+        sys.exit(2)
+    except CpuBridgeUnavailable as error:
+        print(f"build-slot: CPU admission refused: {error}", file=sys.stderr)
+        sys.exit(2)
+    except AdmissionTimeout:
+        print("build-slot: REFUSED — admission wait timed out; no command was started", file=sys.stderr)
+        sys.exit(2)
+    except AdmissionUnavailable:
+        sys.exit(75)

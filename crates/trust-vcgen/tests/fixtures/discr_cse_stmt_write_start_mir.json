@@ -1,0 +1,769 @@
+{
+  "name": "start",
+  "def_path": "discr_cse_stmt_write::Machine::start",
+  "span": {
+    "file": "discr_cse_stmt_write.rs",
+    "line_start": 5,
+    "col_start": 4,
+    "line_end": 9,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "discr_cse_stmt_write::Machine",
+                "fields": [
+                  [
+                    "st",
+                    {
+                      "Adt": {
+                        "name": "discr_cse_stmt_write::St",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "Idle",
+                            "discriminant": 0,
+                            "fields": []
+                          },
+                          {
+                            "name": "Busy",
+                            "discriminant": 1,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": true,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ],
+                  [
+                    "hits",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "discr_cse_stmt_write::St",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "Idle",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Busy",
+                    "discriminant": 1,
+                    "fields": []
+                  }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "discr_cse_stmt_write::St",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Idle",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Busy",
+                "discriminant": 1,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "discr_cse_stmt_write::St",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "Idle",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Busy",
+                    "discriminant": 1,
+                    "fields": []
+                  }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 6,
+                "col_start": 26,
+                "line_end": 6,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 2,
+                  "projections": [
+                    "Deref"
+                  ]
+                }
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 6,
+                "col_start": 26,
+                "line_end": 6,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                1,
+                1
+              ],
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "discr_cse_stmt_write.rs",
+              "line_start": 6,
+              "col_start": 15,
+              "line_end": 6,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 6,
+                "col_start": 44,
+                "line_end": 6,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 7
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "discr_cse_stmt_write::St",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "discr_cse_stmt_write::St"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 7,
+                "col_start": 18,
+                "line_end": 7,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 0
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 7,
+                "col_start": 8,
+                "line_end": 7,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 8,
+                "col_start": 14,
+                "line_end": 8,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 5,
+                  "projections": [
+                    "Deref"
+                  ]
+                }
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 8,
+                "col_start": 14,
+                "line_end": 8,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                5
+              ],
+              [
+                1,
+                4
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "discr_cse_stmt_write.rs",
+              "line_start": 8,
+              "col_start": 8,
+              "line_end": 8,
+              "col_end": 22
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 8,
+                "col_start": 52,
+                "line_end": 8,
+                "col_end": 61
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        8
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 8,
+                "col_start": 52,
+                "line_end": 8,
+                "col_end": 65
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 8,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 6,
+            "span": {
+              "file": "discr_cse_stmt_write.rs",
+              "line_start": 8,
+              "col_start": 52,
+              "line_end": 8,
+              "col_end": 65
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 8,
+                "col_start": 37,
+                "line_end": 8,
+                "col_end": 38
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 7
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 8,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_stmt_write.rs",
+                "line_start": 8,
+                "col_start": 52,
+                "line_end": 8,
+                "col_end": 65
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 7
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

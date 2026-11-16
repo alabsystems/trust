@@ -1,46 +1,32 @@
-# RETIREMENT, 2026-08-10 — 71 `*.sysroot-skew` rows deleted, not renewed.
-#
-# All 71 carried one byte-identical `reason` about the ui-fulldeps rustc-private
-# sysroot being assembled incoherently (E0463/E0460 on `extern crate rustc_*`),
-# sourced to domination run `exec-c30dc44143` (2026-07-12).
-#
-# THE DEFECT WAS FIXED THIRTEEN DAYS BEFORE THE ROWS WERE WRITTEN. Commit
-# `94446ac500` (2026-07-11) re-provided the pruned rustc_private crates with
-# `-Lall=` instead of `-Ldependency=`: `PathKind::Dependency` does not match the
-# `Crate`-kind load a direct `extern crate rustc_span;` performs, so the crates
-# were on disk but unfindable. Its own message names two of these very tests as
-# verified passing.
-#
-# The rows survived because their evidence anchor is a STALE BRANCH:
-#     git merge-base --is-ancestor 94446ac500 c30dc4414365   -> NO
-#     git show c30dc4414365:src/bootstrap/.../test.rs | grep -c 'Ldependency='  -> 2
-#     HEAD: grep -c 'Lall=' src/bootstrap/.../test.rs                          -> 2
-# The 2026-07-24 decomposition minted 71 per-test rows from an already-superseded
-# artifact without re-running anything.
-#
-# RETIRED ON A REAL LANE RUN, with its positive control:
-#     x.py test --stage 2 tests/ui-fulldeps
-#     2x "NOTE: verified rustc_private sysroot for ui-fulldeps (...)"  <- control
-#     running 76 tests; 73 passed; 0 FAILED; 3 ignored
-# (`verify_rustc_private_sysroot_dirs` panics if the prepared dirs are missing or
-# lack librustc_span/librustc_data_structures/libhashbrown, so those two NOTE
-# lines are proof the fulldeps lane actually ran on coherent dirs rather than
-# being skipped.) Log: reports/artifacts/2026-08-10-ui-fulldeps-lane.log
-#
-# ZERO failures means no row in this suite is currently justified — a row exists
-# to waive a failure. Deleted rather than marked `status = "resolved"`, because
-# nothing in crates/trust-upstream-compat ever reports an exception that covered
-# no failure (`failure_covering_exception` only ever ASKS whether a row covers
-# one), so a stale row stays invisible until its expiry fires. Any test that
-# genuinely fails later gets a NEW row with its actual diff text.
-#
 # Per-test exception ledger for `trust-upstream-compat prove`.
 #
 # Release evidence may only accept a vanilla upstream Rust failure, skip, or
 # output diff when a matching active entry appears here. Keep entries narrow:
 # one test id, one suite/path/revision, one owner, one issue, and one expiry.
+#
+# A row exists to waive a failure: delete it once its test passes. Nothing in
+# crates/trust-upstream-compat reports a row that covers no failure
+# (`failure_covering_exception` only asks whether a row covers one), so a stale
+# row stays invisible until its expiry fires.
 
 schema_version = "0.1.0"
+
+# LANE IS REQUIRED. Every active row here must declare the compiletest lane(s)
+# its failure was observed on — "vanilla" (--trust-vanilla), "default" (no lane
+# flag) or "verified" (--trust-verified). The assignment lives in the sibling
+# `test-exception-lanes.toml` and is enforced by `check_exception_lanes.py`,
+# which FAILS on a row with no assignment. It is a sidecar rather than a field
+# on this row only because `TestException` in
+# crates/trust-upstream-compat/src/model.rs is `deny_unknown_fields`, so an
+# inline `lane =` key would make this whole ledger unparseable and take the
+# release gate down with it; the fold-in migration is written out at the top of
+# the sidecar. Rationale, the measured premise that no verified lane exists yet,
+# and the runbook for building one: VERIFIED-LANE-RUNBOOK.md.
+#
+# ADDING A ROW: add the [[exceptions]] row here AND the [[lanes]] row there, in
+# the same commit. A row with no lane assignment fails the gate; that is the
+# point — before this, one undifferentiated row could be cited by a vanilla run
+# or a verified one, so a vanilla waiver could silently net a verified failure.
 
 # RETIRED 2026-07-23: `test-exc.crashes.135122.no-ice` removed. The exception was
 # already `status=resolved`, and its subject `tests/crashes/135122.rs` is DELETED
@@ -52,6 +38,15 @@ schema_version = "0.1.0"
 # (fix.trait_solver.implied_outlives_bounds_infer_ice_135122). Verified deleted +
 # replacement present + fix-record present before removal.
 
+# Re-reviewed 2026-10-09 (renewed, divergence still intended). Checked: the
+# prime fold in compiler/rustc_parse/src/lexer/mod.rs is still context-free and
+# unchanged in its prime path since 2026-07-18, and is identical to the installed
+# trustc 321aaeda75 (no rustc_lexer or lexer/ diff to this tree). Measured with
+# that trustc: `--edition 2021` on this file exits 0 with only `unused macro
+# definition`, where stock rustc 1.97.1 emits `prefix `world` is unknown` and
+# E0762. Primes are load-bearing in clause positions (DECISION_QUEUE
+# CITE-PRIME-NONASCII-1, 2026-10-05) and the lexer cannot see clause context, so
+# Q9 (spec-surface §11, ratified, not reopened) still requires this superset.
 [[exceptions]]
 id = "test-exc.lexer.str-as-char-4.prime-superset"
 test_id = "upstream.tests.ui.lexer.lex-bad-str-literal-as-char-4.rs"
@@ -63,8 +58,8 @@ status = "active"
 owner = "@trust-compiler"
 reason = "Post-state prime notation (two-language design D2/Q9) makes ident-adjacent quotes that are neither char literals nor lifetimes lex as prime tokens. The single-quoted string inside this UNEXPANDED macro body therefore lexes cleanly and the program compiles: an invalid-vanilla program admitted by the superset grammar, exactly like clause positions. Expanded uses still error at parse time."
 issue = "local:docs/design/2026-07-09-two-language-spec-surface.md#11-open-questions"
-reviewed_on = "2026-07-11"
-expires_on = "2026-10-09"
+reviewed_on = "2026-10-09"
+expires_on = "2027-01-07"
 allowed_patterns = [
     "unused macro definition",
     "compiled successfully where upstream expects unterminated character literal",
@@ -98,6 +93,15 @@ allowed_patterns = [
 # three PERMANENTLY UNNETTABLE failures. See the revision-keying gate defect
 # noted at the end of this file; fix that first, then restore char-3.
 
+# Re-reviewed 2026-10-09 (renewed; the note above still holds). Checked: the
+# revision-keying gate defect is unfixed — `failure_covering_exception` in
+# crates/trust-upstream-compat/src/porting.rs still compares `exception.path ==
+# path` with no `#<revision>` handling — so the pristine-annotation restoration
+# is still blocked. Measured with installed trustc 321aaeda75 (lexer identical to
+# this tree): all three editions emit the 3 label/prime errors the patched
+# annotations expect; stock rustc 1.97.1 emits E0762 (+ `prefix `world` is
+# unknown` on 2021). Divergence intended per Q9, as for str-as-char-4.
+
 [[exceptions]]
 id = "test-exc.lexer.str-as-char-3.prime-superset"
 test_id = "upstream.tests.ui.lexer.lex-bad-str-literal-as-char-3.rs"
@@ -109,8 +113,8 @@ status = "active"
 owner = "@trust-compiler"
 reason = "Companion to lex-bad-str-literal-as-char-4: post-state prime notation (two-language design D2/Q9) lexes the ident-adjacent single quote in `println!('hello world')` as a prime token rather than an unterminated char literal, so Trust emits label/prime parse diagnostics across all three edition revisions instead of upstream's 'unterminated character literal' + 'unknown prefix `world`'. Same intentional superset-grammar divergence; the invalid-vanilla program is still rejected, only the diagnostic text differs."
 issue = "local:docs/design/2026-07-09-two-language-spec-surface.md#11-open-questions"
-reviewed_on = "2026-07-12"
-expires_on = "2026-10-09"
+reviewed_on = "2026-10-09"
+expires_on = "2027-01-07"
 allowed_patterns = [
     "expected `while`, `for`, `loop` or `{` after a label",
     "prime token diagnostics replace the upstream unterminated character literal error",
@@ -133,50 +137,26 @@ allowed_patterns = [
 # 2026-08-21: the next strict stage2 executed run must confirm or retire each
 # row. No proof claim is made for waived tests.
 
-[[exceptions]]
-id = "test-exc.linking.macos-ignoring-duplicate.strict-exec-drift"
-test_id = "upstream.tests.ui.linking.macos-ignoring-duplicate.rs"
-suite = "ui"
-path = "tests/ui/linking/macos-ignoring-duplicate.rs"
-revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
-kind = "expected_fail"
-status = "active"
-owner = "@trust-compiler"
-reason = "Recorded failing (diagnostic-drift) by the most recent executed domination run, 2026-07-12 exec-c30dc44143 (reports/evidence-2026-07-11/execution/failures-extract.json) on aarch64-apple-darwin — one of exactly two tests/ui failures in that run. The extract carries no per-test diff text, so the current drift is unclassified; a fresh strict stage2 executed run must reproduce and classify it (or retire this row) before 2026-08-21. Decomposed from divergence-audit category row upstream.blocker.ui-diagnostic-drift."
-issue = "local:reports/evidence-2026-07-11/execution/failures-extract.json"
-reviewed_on = "2026-08-10"
-expires_on = "2026-10-16"
+# RETIRED 2026-10-09: test-exc.linking.macos-ignoring-duplicate.strict-exec-drift
+# and test-exc.linking.macos-search-path.strict-exec-drift (both due 2026-10-16).
+# The drift no longer reproduces. Installed trustc 321aaeda75 on aarch64-apple-darwin
+# (ld-27037.1) compiled each test with its own compile-flags in all three lanes
+# (default; -Ztrust-verify=off with TRUST_VANILLA_ANNOUNCED=1, the vanilla lane the
+# rows were measured on; -Ztrust-verify=on -Ztrust-policy=strict): each exits 1
+# with exactly the checked-in .stderr up to compiletest's $DIR/LL normalization
+# (`ld: warning: ignoring duplicate libraries: '-lc'` / `search path
+# '/no/such/file/or/directory' not found` under deny(linker_info), then
+# `aborting due to 1 previous error`), and no vanilla note. This tree's only
+# link.rs change after 321aaeda75 that reaches these links is the Apple
+# `-oso_prefix <tmpdir>/` argument; adding it by hand changes neither output.
+# The 2026-07-12 cause was never classified (the extract has no diff text).
+# Not run: compiletest itself on this tree. A future failure has no waiver.
 
-[[exceptions]]
-id = "test-exc.linking.macos-search-path.strict-exec-drift"
-test_id = "upstream.tests.ui.linking.macos-search-path.rs"
-suite = "ui"
-path = "tests/ui/linking/macos-search-path.rs"
-revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
-kind = "expected_fail"
-status = "active"
-owner = "@trust-compiler"
-reason = "Recorded failing (diagnostic-drift) by the most recent executed domination run, 2026-07-12 exec-c30dc44143 (reports/evidence-2026-07-11/execution/failures-extract.json) on aarch64-apple-darwin — one of exactly two tests/ui failures in that run. The extract carries no per-test diff text, so the current drift is unclassified; a fresh strict stage2 executed run must reproduce and classify it (or retire this row) before 2026-08-21. Decomposed from divergence-audit category row upstream.blocker.ui-diagnostic-drift."
-issue = "local:reports/evidence-2026-07-11/execution/failures-extract.json"
-reviewed_on = "2026-08-10"
-expires_on = "2026-10-16"
-
-[[exceptions]]
-id = "test-exc.tait.65679-free-alias-mir-built-cycle"
-test_id = "upstream.tests.ui.type-alias-impl-trait.issue-65679-inst-opaque-ty-from-val-twice.rs"
-suite = "ui"
-path = "tests/ui/type-alias-impl-trait/issue-65679-inst-opaque-ty-from-val-twice.rs"
-revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
-kind = "expected_fail"
-status = "active"
-owner = "@trust-compiler"
-reason = "Trust-introduced query cycle, NOT a diagnostic drift: this `//@ check-pass` test aborts with `error[E0391]: cycle detected when computing type of T::{opaque#0}`. Vanilla rustc 1.99.0-nightly (14cae6813) compiles it clean. CORRECTED 2026-07-30 — the 2026-07-25 text stated its evidence backwards TWICE and pointed at a line that had drifted. (a) It said `--emit=metadata` alone exits 0 and the failure therefore comes through `optimized_mir`. Re-measured: `--emit=metadata` FAILS, and the compiler prints the path itself — `borrow-checking bop -> promoting constants in MIR for bop -> checking if bop contains FFI-unwind calls -> building MIR for bop -> normalizing fn() -> T`. It is BORROWCK, reached through the `mir_built` hook at compiler/rustc_mir_build/src/builder/mod.rs, not codegen. (b) The `cycle_safe_normalize` citation `lib.rs:16129` is stale; the function is at crates/trust-thir-lower/src/lib.rs:17378 and its guard at :17386. MECHANISM (unchanged and confirmed): `type T = impl Sized;` is a TAIT, so uses lower to `ty::Alias(Free, T)`, which sets HAS_TY_FREE_ALIAS and NOT HAS_TY_OPAQUE. The `has_opaque_types()` guard therefore does not see it, and `try_normalize_erasing_regions` under `TypingEnv::fully_monomorphized()` (a REVEALING mode) demands `type_of_opaque` -> `mir_borrowck` -> `mir_built`, the query already in flight. TWO REPAIRS ARE NOW DISQUALIFIED, both recorded so neither is retried: (1) widening the guard to `has_aliases()` — it also stops resolving concrete projections, which is the identity-vs-concrete asymmetry the wave-19 DST-coherence gate reads to catch a thin-vs-fat pointer flip, so it could admit a fat value into a thin record slot; (2) returning `FatShape::Opaque` for an alias under `reveal_unsafe` — proposed and REFUTED 2026-07-30 by adversarial review, because three sites NEGATE `is_pure_value_shape` (lib.rs:3632 and :6504 among them) and would flip from DECLINE to ADMIT, e.g. the for-desugar arm whose in-tree comment states that a pure-value shape MUST fail closed. Both are soundness changes to gates that need their own evidence, not flag swaps. Retire this row when that evidence exists; do not retire it by widening the guard."
-issue = "local:crates/trust-thir-lower/src/differential.rs#opaque-reveal-cycle-gate"
-reviewed_on = "2026-07-25"
-expires_on = "2026-09-25"
-allowed_patterns = [
-    "cycle detected when computing type of",
-]
+# RETIRED 2026-09-25: test-exc.tait.65679-free-alias-mir-built-cycle
+# Exact default and vanilla reproducer compiles now succeed on qualified ae9c2c1d.
+# The normalization repair f4cee5c40f already predates that compiler.
+# Evidence: docs/archive/session-reports/2026-09-25-opaque-cycle-retirement/README.md
+# The original upstream test remains admitted; future failures have no waiver.
 
 [[exceptions]]
 id = "test-exc.hygiene.unpretty-debug-lifetimes.symbol-width-wrap"

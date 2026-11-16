@@ -10,10 +10,10 @@ use rustc_hir::def_id::{CRATE_DEF_INDEX, CrateNum, DefId, LOCAL_CRATE};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
-use rustc_middle::ty::layout::{LayoutOf, MaybeResult, TyAndLayout};
+use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, FnSigKind, IntTy, Ty, TyCtxt, UintTy};
-use rustc_session::config::CrateType;
 use rustc_span::{Span, Symbol};
+use rustc_structures::CrateType;
 use rustc_symbol_mangling::mangle_internal_symbol;
 use rustc_target::spec::Os;
 
@@ -109,6 +109,8 @@ pub fn resolve_path<'tcx>(
 /// Gets the layout of a type at a path.
 #[track_caller]
 pub fn path_ty_layout<'tcx>(cx: &impl LayoutOf<'tcx>, path: &[&str]) -> TyAndLayout<'tcx> {
+    use rustc_middle::ty::layout::MaybeResult;
+
     let ty = resolve_path(cx.tcx(), path, Namespace::TypeNS).ty(cx.tcx(), cx.typing_env());
     cx.layout_of(ty).to_result().ok().unwrap()
 }
@@ -116,34 +118,28 @@ pub fn path_ty_layout<'tcx>(cx: &impl LayoutOf<'tcx>, path: &[&str]) -> TyAndLay
 /// Call `f` for each exported symbol.
 pub fn iter_exported_symbols<'tcx>(
     tcx: TyCtxt<'tcx>,
-    mut f: impl FnMut(CrateNum, DefId) -> InterpResult<'tcx>,
+    mut f: impl FnMut(CrateNum, DefId, /* used */ bool) -> InterpResult<'tcx>,
 ) -> InterpResult<'tcx> {
-    // First, the symbols in the local crate. We can't use `exported_symbols` here as that
-    // skips `#[used]` statics (since `reachable_set` skips them in binary crates).
-    // So we walk all HIR items ourselves instead.
+    // First, the symbols in the local crate. We can't use `exported_symbols` here as that skips
+    // `#[used]` statics (since `reachable_set` does not specifically include them in binary crates,
+    // only in library crates). So we walk all HIR items ourselves instead.
     let crate_items = tcx.hir_crate_items(());
     for def_id in crate_items.definitions() {
-        let exported = tcx.def_kind(def_id).has_codegen_attrs() && {
-            let codegen_attrs = tcx.codegen_fn_attrs(def_id);
-            codegen_attrs.contains_extern_indicator()
-                || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER)
-                || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER)
-        };
-        // FIXME: `#[no_mangle]` makes no sense on a generic item, but still causes it to be
-        // considered "extern". Remove this once `no_mangle_generic_items` is a hard error.
-        let exported_mono = exported && {
-            let generics = tcx.generics_of(def_id);
-            !generics.requires_monomorphization(tcx)
-        };
-        if exported_mono {
-            f(LOCAL_CRATE, def_id.into())?;
+        if !tcx.def_kind(def_id).has_codegen_attrs() || tcx.is_foreign_item(def_id) {
+            continue;
         }
+        let codegen_attrs = tcx.codegen_fn_attrs(def_id);
+        let used = codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER)
+            || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER);
+        if !(used || codegen_attrs.contains_extern_indicator()) {
+            continue;
+        }
+        f(LOCAL_CRATE, def_id.into(), used)?;
     }
 
     // Next, all our dependencies.
-    // `dependency_formats` includes all the transitive information needed to link a crate,
-    // which is what we need here since we need to dig out `exported_symbols` from all transitive
-    // dependencies.
+    // `dependency_formats` includes all the transitive information needed to link a crate, which is
+    // what we need to dig out `exported_symbols` from all transitive dependencies.
     let dependency_formats = tcx.dependency_formats(());
     // Find the dependencies of the executable we are running.
     let dependency_format = dependency_formats
@@ -157,11 +153,12 @@ pub fn iter_exported_symbols<'tcx>(
             continue; // Already handled above
         }
 
-        // We can ignore `_export_info` here: we are a Rust crate, and everything is exported
-        // from a Rust crate.
-        for &(symbol, _export_info) in tcx.exported_non_generic_symbols(cnum) {
-            if let ExportedSymbol::NonGeneric(def_id) = symbol {
-                f(cnum, def_id)?;
+        for &(symbol, export_info) in tcx.exported_non_generic_symbols(cnum) {
+            if let ExportedSymbol::NonGeneric(def_id) = symbol
+                // Sometimes Rust has to re-export FFI imports; skip those.
+                && !tcx.is_foreign_item(def_id)
+            {
+                f(cnum, def_id, export_info.used)?;
             }
         }
     }
@@ -199,6 +196,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             );
         }
         self.eval_path_scalar(&["libc", name])
+    }
+
+    /// Helper function to get a `libc` constant as an `i16`.
+    fn eval_libc_i16(&self, name: &str) -> i16 {
+        // TODO: Cache the result.
+        self.eval_libc(name).to_i16().unwrap_or_else(|_err| {
+            panic!("required libc item has unexpected type (not `i16`): {name}")
+        })
+    }
+
+    /// Helper function to get a `libc` constant as an `u16`.
+    fn eval_libc_u16(&self, name: &str) -> u16 {
+        // TODO: Cache the result.
+        self.eval_libc(name).to_u16().unwrap_or_else(|_err| {
+            panic!("required libc item has unexpected type (not `u16`): {name}")
+        })
     }
 
     /// Helper function to get a `libc` constant as an `i32`.
@@ -263,14 +276,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         path_ty_layout(this, &["std", "sys", "pal", "windows", "c", name])
     }
 
-    /// Helper function to get `TyAndLayout` of an array that consists of `libc` type.
-    fn libc_array_ty_layout(&self, name: &str, size: u64) -> TyAndLayout<'tcx> {
-        let this = self.eval_context_ref();
-        let elem_ty_layout = this.libc_ty_layout(name);
-        let array_ty = Ty::new_array(*this.tcx, elem_ty_layout.ty, size);
-        this.layout_of(array_ty).unwrap()
-    }
-
     /// Project to the given *named* field (which must be a struct or union type).
     fn try_project_field_named<P: Projectable<'tcx, Provenance>>(
         &self,
@@ -297,6 +302,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             self.try_project_field_named(base, name)?
                 .unwrap_or_else(|| bug!("no field named {} in type {}", name, base.layout().ty)),
         )
+    }
+
+    /// Assuming `base` is the beginning of a C array (i.e., the already-dereferenced pointer),
+    /// returns the element at position `idx`.
+    fn project_c_array_field<P: Projectable<'tcx, Provenance>>(
+        &self,
+        base: &P,
+        idx: u64,
+    ) -> InterpResult<'tcx, P> {
+        let this = self.eval_context_ref();
+        let offset = base.layout().size * idx; // `Size` multiplication
+        base.offset(offset, base.layout(), this)
     }
 
     /// Write an int of the appropriate size to `dest`. The target type may be signed or unsigned,
@@ -408,9 +425,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             None => MPlaceTy::fake_alloc_zst(this.machine.layouts.unit),
         };
 
+        let with_caller_location = f.def.requires_caller_location(*this.tcx);
+
         // Construct a function pointer type representing the caller perspective.
         let sig = this.tcx.mk_fn_sig(
-            args.iter().map(|a| a.layout.ty),
+            args.iter()
+                .map(|a| a.layout.ty)
+                .chain(with_caller_location.then(|| this.tcx.caller_location_ty())),
             dest.layout.ty,
             // FIXME(splat): Do we need to set splatted here?
             // (Currently this also ignores c_variadic)
@@ -424,7 +445,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             mir,
             caller_fn_abi,
             &args.iter().map(|a| FnArg::Copy(a.clone().into())).collect::<Vec<_>>(),
-            /*with_caller_location*/ false,
+            with_caller_location,
             &dest.into(),
             cont,
         )
@@ -668,60 +689,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         self.eval_context_ref().tcx.sess.target.families.iter().any(|f| f == "unix")
     }
 
-    /// Dereference a pointer operand to a place using `layout` instead of the pointer's declared type
-    fn deref_pointer_as(
-        &self,
-        op: &impl Projectable<'tcx, Provenance>,
-        layout: TyAndLayout<'tcx>,
-    ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
-        let this = self.eval_context_ref();
-        let ptr = this.read_pointer(op)?;
-        interp_ok(this.ptr_to_mplace(ptr, layout))
-    }
-
-    /// Calculates the MPlaceTy given the offset and layout of an access on an operand
-    fn deref_pointer_and_offset(
-        &self,
-        op: &impl Projectable<'tcx, Provenance>,
-        offset: u64,
-        base_layout: TyAndLayout<'tcx>,
-        value_layout: TyAndLayout<'tcx>,
-    ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
-        let this = self.eval_context_ref();
-        let op_place = this.deref_pointer_as(op, base_layout)?;
-        let offset = Size::from_bytes(offset);
-
-        // Ensure that the access is within bounds.
-        assert!(base_layout.size >= offset + value_layout.size);
-        let value_place = op_place.offset(offset, value_layout, this)?;
-        interp_ok(value_place)
-    }
-
-    fn deref_pointer_and_read(
-        &self,
-        op: &impl Projectable<'tcx, Provenance>,
-        offset: u64,
-        base_layout: TyAndLayout<'tcx>,
-        value_layout: TyAndLayout<'tcx>,
-    ) -> InterpResult<'tcx, Scalar> {
-        let this = self.eval_context_ref();
-        let value_place = this.deref_pointer_and_offset(op, offset, base_layout, value_layout)?;
-        this.read_scalar(&value_place)
-    }
-
-    fn deref_pointer_and_write(
-        &mut self,
-        op: &impl Projectable<'tcx, Provenance>,
-        offset: u64,
-        value: impl Into<Scalar>,
-        base_layout: TyAndLayout<'tcx>,
-        value_layout: TyAndLayout<'tcx>,
-    ) -> InterpResult<'tcx, ()> {
-        let this = self.eval_context_mut();
-        let value_place = this.deref_pointer_and_offset(op, offset, base_layout, value_layout)?;
-        this.write_scalar(value, &value_place)
-    }
-
     /// Read bytes from a byte slice.
     fn read_byte_slice<'a>(&'a self, slice: &ImmTy<'tcx>) -> InterpResult<'tcx, &'a [u8]>
     where
@@ -729,7 +696,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     {
         let this = self.eval_context_ref();
         let (ptr, len) = slice.to_scalar_pair();
-        let ptr = ptr.to_pointer(this)?;
+        let ptr = ptr.to_pointer(this);
         let len = len.to_target_usize(this)?;
         let bytes = this.read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(len))?;
         interp_ok(bytes)
@@ -866,7 +833,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         } else {
             this.libc_ty_layout("wchar_t")
         };
-        self.read_c_str_with_char_size(ptr, wchar_t.size, wchar_t.align.abi)
+        self.read_c_str_with_char_size(ptr, wchar_t.size, wchar_t.align)
     }
 
     fn frame_in_std(&self) -> bool {
@@ -927,7 +894,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         target_feature: &str,
     ) -> InterpResult<'tcx, ()> {
         let this = self.eval_context_ref();
-        if !this.tcx.sess.unstable_target_features.contains(&Symbol::intern(target_feature)) {
+        if !this.tcx.sess.internal_target_features.contains(&Symbol::intern(target_feature)) {
             throw_ub_format!(
                 "attempted to call intrinsic `{intrinsic}` that requires missing target feature {target_feature}"
             );
@@ -938,16 +905,21 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Lookup an array of immediates from any linker sections matching the provided predicate,
     /// with the spans of where they were found.
     fn lookup_link_section(
-        &mut self,
+        &self,
         include_name: impl Fn(&str) -> bool,
     ) -> InterpResult<'tcx, Vec<(ImmTy<'tcx>, Span)>> {
-        let this = self.eval_context_mut();
+        let this = self.eval_context_ref();
         let tcx = this.tcx.tcx;
 
         let mut array = vec![];
 
-        iter_exported_symbols(tcx, |_cnum, def_id| {
+        iter_exported_symbols(tcx, |_cnum, def_id, used| {
             let attrs = tcx.codegen_fn_attrs(def_id);
+            if !used {
+                // We don't know if the symbol is actually going to be in the final binary,
+                // so we conservatively skip it.
+                return interp_ok(());
+            }
             let Some(link_section) = attrs.link_section else {
                 return interp_ok(());
             };
@@ -1069,7 +1041,7 @@ pub(crate) fn windows_check_buffer_size((success, len): (bool, u64)) -> u32 {
 
 /// Check whether the local crate has the `#![no_core]` attribute.
 pub fn is_no_core(tcx: TyCtxt<'_>) -> bool {
-    rustc_hir::find_attr!(tcx, crate, NoCore)
+    rustc_attr_ir::find_attr!(tcx, crate, NoCore)
 }
 
 /// We don't support 16-bit systems, so let's have ergonomic conversion from `u32` to `usize`.

@@ -33,7 +33,7 @@ fn attempt_load_dylib(path: &Path) -> Result<libloading::Library, libloading::Er
             .map(|lib| lib.into());
     }
 
-    unsafe { libloading::Library::new(&path) }
+    unsafe { libloading::Library::new(path) }
 }
 
 // On Windows the compiler would sometimes intermittently fail to open the
@@ -41,6 +41,10 @@ fn attempt_load_dylib(path: &Path) -> Result<libloading::Library, libloading::Er
 // system still holds a lock on the file, so we retry a few times before calling it
 // an error.
 fn load_dylib(path: &Path, max_attempts: usize) -> Result<libloading::Library, String> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if rustc_data_structures::jobserver::native_v3_context().is_some() {
+        return Err("native v3 cannot load an unqualified procedural macro phase".into());
+    }
     assert!(max_attempts > 0);
 
     let mut last_error = None;
@@ -140,7 +144,7 @@ pub(crate) fn dlsym_proc_macros(
             }
             Err(err) => {
                 debug!("failed to dlsym proc_macros {} for symbol `{}`", path.display(), sym_name);
-                Err(err.into())
+                Err(err)
             }
         }
     }

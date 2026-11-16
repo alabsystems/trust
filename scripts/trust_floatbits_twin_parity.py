@@ -46,7 +46,7 @@ EXPECTED_BY_CRATE = {
     "trust-budget": {
         "per_job_bytes": "ensures result <= budget_bytes",
         "megabytes_of": "ensures result <= bytes ensures result <= 17592186044415",
-        "split_budget_ms": "ensures result <= total_ms",
+        "split_budget_ms": "ensures result <= total_ms ensures total_ms > 0 ==> result > 0",
         "process_ceiling_mb": "ensures result >= budget_mb ensures result >= 2048",
     },
     "trust-floatbits": {
@@ -114,7 +114,7 @@ def materialize_consumer_candidate(
     repo_root: Path, candidate: Path, consumer: str
 ) -> None:
     """Create an inode-independent mutation-G workspace without copying sources."""
-    if consumer not in {"trust-ir-bridge", "trust-router", "trust-vcgen"}:
+    if consumer not in {"trust-ir-bridge", "trust-router", "trust-coordinator", "trust-vcgen"}:
         raise Refusal(f"unsupported mutation-G consumer: {consumer}")
     if not candidate.is_dir() or any(candidate.iterdir()):
         raise Refusal(f"candidate root is absent or not empty: {candidate}")
@@ -161,7 +161,7 @@ def materialize_consumer_candidate(
     # Resolve only the consumer graph. Retaining the authoritative dependency
     # and patch tables makes this a candidate of the crates workspace, while
     # avoiding unrelated members and a custom-Cargo duplicate-edge panic.
-    workspace = candidate / "crates/Cargo.toml"
+    workspace = candidate / "Cargo.toml"
     text = workspace.read_text(encoding="utf-8")
     if text.count("members = [") != 1:
         raise Refusal("candidate workspace members anchor is not unique")

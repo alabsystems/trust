@@ -1,0 +1,16 @@
+[package]
+name = "trust-process-isolation"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Checked, bounded untrusted worker protocol; no proof or sandbox authority"
+
+# B1 is independently testable without resolving the compiler/solver graph.
+# Compiler/frontend workspace integration belongs to the later adapter slice.
+[workspace]
+
+[lib]
+doctest = false
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -44,8 +44,6 @@ REQUIRED_SOURCE_MANIFESTS=(
 )
 SELF_CONTAINED_LOCKFILES=(
     "Cargo.lock"
-    "crates/Cargo.lock"
-    "targo-trust/Cargo.lock"
     "library/Cargo.lock"
     "src/bootstrap/Cargo.lock"
     "src/tools/targo/Cargo.lock"
@@ -540,7 +538,10 @@ scan_noverify_log() {
         echo "host_or_upstream_cargo=${host_cargo:-<not-found>}"
         echo "host_or_upstream_rustc=${host_rustc:-<not-found>}"
         echo
-        echo "trust_verification_report_count=$(grep -c 'Trust Verification Report\\|TRUST_JSON:' "$log_path" || true)"
+        # A transport note in Cargo's JSON stream renders as "note: Trust verification
+        # transport ..." (rustc_errors::json TRUST_TRANSPORT_RENDERED, TRANSPORT-LINE-BUDGET-1);
+        # its payload no longer appears in rendered text, so count that statement too.
+        echo "trust_verification_report_count=$(grep -c 'Trust Verification Report\\|TRUST_JSON:\\|Trust verification transport' "$log_path" || true)"
         echo "stage2_targo_path_count=$(grep -cF "$stage2_targo" "$log_path" || true)"
         echo "stage2_trustc_path_count=$(grep -cF "$stage2_trustc" "$log_path" || true)"
         echo "stage2_targo_trust_path_count=$(grep -cF "$stage2_targo_trust" "$log_path" || true)"
@@ -709,7 +710,7 @@ write_stage2_tool_surface_diagnostic() {
         while IFS= read -r path; do
             found_rustc_main=1
             echo "  - $path"
-        done < <(find "$TRUST_ROOT/build" -path '*/stage2-rustc/*/release/rustc-main' -type f -print 2>/dev/null | sort)
+        done < <(find -H "$TRUST_ROOT/build" -path '*/stage2-rustc/*/release/rustc-main' -type f -print 2>/dev/null | sort)
         if [[ "$found_rustc_main" -eq 0 ]]; then
             echo "  - <none>"
         fi

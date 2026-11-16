@@ -5,11 +5,13 @@
 
 //! Fail-closed `trust-verifier-api` adapter for trust_wp.
 //!
-//! trust_wp currently advertises no full-verification obligation kinds. The
+//! This legacy adapter advertises no full-verification obligation kinds. The
 //! body-aware contract kinds belong to trust-mc and refinement belongs to
 //! trust-vc. TrustIR's formula-less `&mut` give-back record is not a
 //! dischargeable proof obligation; treating its structural candidate (or a
 //! synthetic Boolean) as proof would be vacuous.
+//! The router's separate native body-WP alternative calls first-party
+//! `trust-wp-lib`; it does not revive this formula-only adapter.
 //! Historical typed replay and evidence-decoding helpers remain so old wire
 //! artifacts can be inspected and rejected precisely. They are not reachable
 //! as proof authority through [`TrustWpVerificationEngine`]: its manifest is
@@ -42,8 +44,12 @@ use trust_verifier_api::{
 use trust_verifier_api::{
     ContractKind, ContractPredicate, Counterexample, EvidenceArtifact, EvidenceArtifactKind,
     EvidenceArtifactMaterialization, EvidenceArtifactReference, ProofStrength, SummaryFact,
-    TRUST_SPEC_PREDICATE_SCHEMA_VERSION, TrustContract, TrustSpecBinaryOp, TrustSpecExpr,
-    TrustSpecExprKind, TrustSpecPredicate, TrustSpecSort, TrustSpecUnaryOp,
+    TrustContract,
+};
+#[cfg(feature = "trust-build")]
+use trust_verifier_api::{
+    TRUST_SPEC_PREDICATE_SCHEMA_VERSION, TrustSpecBinaryOp, TrustSpecExpr, TrustSpecExprKind,
+    TrustSpecPredicate, TrustSpecSort, TrustSpecUnaryOp,
 };
 
 /// Public trust_wp engine name used in manifests and evidence IDs.
@@ -1796,7 +1802,8 @@ fn typed_trust_wp_claim_from_contract(
         | ContractPredicate::TrustIr { schema, value }
             if schema == TRUST_WP_PURE_EXPR_SCHEMA_VERSION =>
         {
-            let predicate = serde_json::from_value::<TrustWpPureExprV1>(value.clone())
+            // Trust (T3 L4, C09d): read to the readers' bound, as every contract predicate is.
+            let predicate: TrustWpPureExprV1 = trust_types::json_depth::from_value_deep(value)
                 .map_err(|err| format!("invalid typed TrustWpPureExprV1 predicate: {err}"))?;
             if predicate.sort() != Some(TrustWpPureSortV1::Bool) {
                 return Err("typed TrustWpPureExprV1 predicate is not boolean".to_string());
@@ -1827,7 +1834,8 @@ fn typed_trust_wp_claim_from_contract(
         | ContractPredicate::TrustIr { schema, value }
             if schema == TRUST_SPEC_PREDICATE_SCHEMA_VERSION =>
         {
-            let predicate = serde_json::from_value::<TrustSpecPredicate>(value.clone())
+            // Trust (T3 L4, C09d): read to the readers' bound, as every contract predicate is.
+            let predicate: TrustSpecPredicate = trust_types::json_depth::from_value_deep(value)
                 .map_err(|err| format!("invalid typed TrustSpecPredicate payload: {err}"))?;
             Ok(NativeTrustWpClaim::TrustFormulaV1(trust_spec_predicate_to_trust_formula_payload(
                 &predicate,
@@ -2671,569 +2679,41 @@ fn typed_trust_wp_pure_predicate(
 fn trust_types_formula_value_to_trust_formula_payload(
     value: &serde_json::Value,
 ) -> Result<String, String> {
-    let formula = serde_json::from_value::<trust_types::Formula>(value.clone()).map_err(|err| {
-        format!("invalid typed `{TRUST_TYPES_FORMULA_SCHEMA_VERSION}` Formula payload: {err}")
-    })?;
+    // Trust (T3 L4, C09d): read to the readers' bound, as every contract predicate is.
+    let formula: trust_types::Formula =
+        trust_types::json_depth::from_value_deep(value).map_err(|err| {
+            format!("invalid typed `{TRUST_TYPES_FORMULA_SCHEMA_VERSION}` Formula payload: {err}")
+        })?;
     trust_types::trust_formula_v1::formula_to_trust_formula_v1_envelope(&formula)
 }
 
-#[cfg(all(test, feature = "trust-build"))]
+#[cfg(feature = "trust-build")]
 fn canonical_trust_formula_payload(value: &serde_json::Value) -> Result<String, String> {
     trust_types::trust_formula_v1::canonical_arithmetic_free_trust_formula_v1_payload(value)
 }
 
-#[cfg(all(test, feature = "trust-build"))]
+/// Convert an existing typed public specification to the native formula codec.
+///
+/// This is the shared strict decoder already used by the retained replay
+/// fixtures. It preserves their arithmetic, array, float, sort and shape
+/// refusals. Conversion grants no proof authority and does not guess how free
+/// names bind to a program: the producer must attach its independently
+/// authenticated clause bindings before requesting body verification.
+#[cfg(feature = "trust-build")]
+pub fn trust_wp_native_formula_from_trust_spec(
+    predicate: &TrustSpecPredicate,
+) -> Result<trust_ir::ProofFormula, String> {
+    let payload = trust_spec_predicate_to_trust_formula_payload(predicate)?;
+    Ok(trust_ir::ProofFormula::new(TRUST_WP_TRUST_FORMULA_SCHEMA_VERSION, payload))
+}
+
+#[cfg(feature = "trust-build")]
 fn trust_spec_predicate_to_trust_formula_payload(
     predicate: &TrustSpecPredicate,
 ) -> Result<String, String> {
-    if !predicate.has_current_schema() {
-        return Err(format!(
-            "unsupported TrustSpecPredicate schema `{}`, expected `{TRUST_SPEC_PREDICATE_SCHEMA_VERSION}`",
-            predicate.schema_version
-        ));
-    }
-    if predicate.root_sort != TrustSpecSort::Bool || predicate.root.sort != TrustSpecSort::Bool {
-        return Err("TrustSpecPredicate root must be a typed boolean predicate".to_string());
-    }
-    predicate.validate()?;
-    // TrustFormulaV1 is a scalar replay format. `TrustSpecSort::Array` is a
-    // valid public specification sort, but it has no faithful representation in
-    // this adapter and must fail closed before any scalar claim is serialized.
-    if predicate
-        .variables
-        .iter()
-        .any(|variable| matches!(variable.sort, TrustSpecSort::Array { .. }))
-        || trust_spec_expr_mentions_array_sort(&predicate.root)
-    {
-        return Err(
-            "TrustSpecPredicate array sort is outside trust_wp TrustFormulaV1 native int/bool replay fragment"
-                .to_string(),
-        );
-    }
-    // Float sorts are likewise valid public specification sorts with no
-    // faithful representation here: replaying IEEE-754 comparisons (NaN is
-    // unordered, +0.0 == -0.0) over the scalar int/bool fragment would give
-    // the terms the wrong semantics, so they must fail closed before any
-    // scalar claim is serialized.
-    if predicate
-        .variables
-        .iter()
-        .any(|variable| matches!(variable.sort, TrustSpecSort::Float { .. }))
-        || trust_spec_expr_mentions_float_sort(&predicate.root)
-    {
-        return Err(
-            "TrustSpecPredicate float sort is outside trust_wp TrustFormulaV1 native int/bool replay fragment"
-                .to_string(),
-        );
-    }
-    validate_trust_spec_div_mod_defined(&predicate.root)?;
-
-    let mut result_sort = None;
-    let body = trust_spec_expr_to_trust_formula_body(&predicate.root, &mut result_sort)?;
-    let mut variables = Vec::with_capacity(predicate.variables.len());
-    for variable in &predicate.variables {
-        if variable.name.trim().is_empty() {
-            return Err("TrustSpecPredicate variable name is empty".to_string());
-        }
-        variables.push(serde_json::json!({
-            "name": variable.name,
-            "sort": trust_spec_sort_label(variable.sort),
-        }));
-    }
-
-    let mut payload = serde_json::Map::new();
-    payload.insert("schema".to_string(), serde_json::json!(TRUST_WP_TRUST_FORMULA_SCHEMA_VERSION));
-    payload.insert("variables".to_string(), serde_json::Value::Array(variables));
-    if let Some(sort) = result_sort {
-        payload.insert(
-            "result".to_string(),
-            serde_json::json!({
-                "name": "result",
-                "sort": trust_spec_sort_label(sort),
-            }),
-        );
-    }
-    payload.insert("body".to_string(), body);
-
-    canonical_trust_formula_payload(&serde_json::Value::Object(payload)).map_err(|err| {
-        format!("could not canonicalize TrustSpecPredicate as TrustFormulaV1: {err}")
-    })
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_expr_to_trust_formula_body(
-    expr: &TrustSpecExpr,
-    result_sort: &mut Option<TrustSpecSort>,
-) -> Result<serde_json::Value, String> {
-    match &expr.kind {
-        TrustSpecExprKind::BoolLiteral { value } => {
-            require_sort(expr, TrustSpecSort::Bool, "bool literal")?;
-            Ok(serde_json::json!({ "bool": value }))
-        }
-        TrustSpecExprKind::IntLiteral { value } => {
-            require_sort(expr, TrustSpecSort::Int, "int literal")?;
-            let parsed = value.parse::<i64>().map_err(|err| {
-                format!("TrustSpecPredicate integer literal `{value}` is outside i64: {err}")
-            })?;
-            Ok(serde_json::json!({ "int": parsed }))
-        }
-        TrustSpecExprKind::Variable { name } => {
-            if name.trim().is_empty() {
-                return Err("TrustSpecPredicate variable reference has an empty name".to_string());
-            }
-            Ok(serde_json::json!({ "var": name }))
-        }
-        TrustSpecExprKind::Result => {
-            if let Some(existing) = result_sort {
-                if *existing != expr.sort {
-                    return Err("TrustSpecPredicate uses result with inconsistent sorts".to_string());
-                }
-            } else {
-                *result_sort = Some(expr.sort);
-            }
-            Ok(serde_json::json!({ "result": true }))
-        }
-        TrustSpecExprKind::Unary { op, expr: inner } => {
-            match op {
-                TrustSpecUnaryOp::Not => {
-                    require_sort(expr, TrustSpecSort::Bool, "not expression")?;
-                    require_sort(inner, TrustSpecSort::Bool, "not operand")?;
-                }
-                // Trust (#29): `Neg` is arithmetic — refuse it in the
-                // bare-claim lane for the same amendment-1 reason as the
-                // binary arithmetic refusal below.
-                TrustSpecUnaryOp::Neg => {
-                    return Err(trust_spec_bare_claim_arithmetic_refusal("neg"));
-                }
-                _ => {
-                    return Err(
-                        "TrustSpecPredicate unary operator is outside trust_wp TrustFormulaV1 native int/bool replay fragment"
-                            .to_string(),
-                    );
-                }
-            }
-            Ok(serde_json::json!({
-                "op": trust_spec_unary_op_label(*op)?,
-                "expr": trust_spec_expr_to_trust_formula_body(inner, result_sort)?,
-            }))
-        }
-        TrustSpecExprKind::Binary { op, lhs, rhs } => {
-            // Trust (#29, defense-in-depth): refuse machine arithmetic in the
-            // BARE (non-body-bound) trust-wp claim lane, mirroring the
-            // compiler's copy of this lowering
-            // (rustc_mir_transform::trust_verify) and the body-bound bridge
-            // fragment (`trust_ir_bridge::trust_wp_claim::
-            // spec_predicate_to_sibling_json`, blueprint amendment 1).
-            // Machine-integer predicates lowered as unbounded-Int arithmetic
-            // are a confirmed false-proof vector: the sibling's linear-int
-            // rule proves free-variable Int tautologies such as
-            // `ensures result + 1 > result`, which is FALSE at `u64::MAX`
-            // under Rust's wrapping machine semantics. Fail-closed: this
-            // refusal surfaces as "is not an eligible canonical typed claim"
-            // and the obligation demotes to Unsupported, never Proved.
-            if matches!(
-                op,
-                TrustSpecBinaryOp::Add
-                    | TrustSpecBinaryOp::Sub
-                    | TrustSpecBinaryOp::Mul
-                    | TrustSpecBinaryOp::Div
-                    | TrustSpecBinaryOp::Mod
-            ) {
-                return Err(trust_spec_bare_claim_arithmetic_refusal(
-                    trust_spec_binary_op_label(*op)?,
-                ));
-            }
-            validate_trust_spec_binary(*op, expr, lhs, rhs)?;
-            Ok(serde_json::json!({
-                "op": trust_spec_binary_op_label(*op)?,
-                "lhs": trust_spec_expr_to_trust_formula_body(lhs, result_sort)?,
-                "rhs": trust_spec_expr_to_trust_formula_body(rhs, result_sort)?,
-            }))
-        }
-        TrustSpecExprKind::Old { expr: inner } => Ok(serde_json::json!({
-            "old": trust_spec_expr_to_trust_formula_body(inner, result_sort)?,
-        })),
-        TrustSpecExprKind::Field { .. }
-        | TrustSpecExprKind::Index { .. }
-        | TrustSpecExprKind::Quantifier { .. } => Err(
-            "TrustSpecPredicate node is outside trust_wp TrustFormulaV1 native int/bool replay fragment"
-                .to_string(),
-        ),
-        _ => Err(
-            "TrustSpecPredicate future node is outside trust_wp TrustFormulaV1 native int/bool replay fragment"
-                .to_string(),
-        ),
-    }
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_expr_mentions_array_sort(root: &TrustSpecExpr) -> bool {
-    let mut pending = vec![root];
-    while let Some(expr) = pending.pop() {
-        if matches!(expr.sort, TrustSpecSort::Array { .. }) {
-            return true;
-        }
-        match &expr.kind {
-            TrustSpecExprKind::Unary { expr, .. }
-            | TrustSpecExprKind::Old { expr }
-            | TrustSpecExprKind::BvUnary { expr, .. }
-            | TrustSpecExprKind::BvFromInt { expr, .. }
-            | TrustSpecExprKind::IntFromBv { expr, .. } => pending.push(expr),
-            TrustSpecExprKind::Binary { lhs, rhs, .. }
-            | TrustSpecExprKind::BvBinary { lhs, rhs, .. } => {
-                pending.push(lhs);
-                pending.push(rhs);
-            }
-            TrustSpecExprKind::Field { base, .. } => pending.push(base),
-            TrustSpecExprKind::Index { base, index } => {
-                pending.push(base);
-                pending.push(index);
-            }
-            TrustSpecExprKind::Quantifier { variable_sort, body, .. } => {
-                if matches!(variable_sort, TrustSpecSort::Array { .. }) {
-                    return true;
-                }
-                pending.push(body);
-            }
-            TrustSpecExprKind::IsVariant { scrutinee, .. }
-            | TrustSpecExprKind::VariantField { scrutinee, .. } => pending.push(scrutinee),
-            TrustSpecExprKind::BoolLiteral { .. }
-            | TrustSpecExprKind::IntLiteral { .. }
-            | TrustSpecExprKind::Variable { .. }
-            | TrustSpecExprKind::Result
-            | TrustSpecExprKind::BitVecLiteral { .. } => {}
-            _ => {}
-        }
-    }
-    false
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_expr_mentions_float_sort(root: &TrustSpecExpr) -> bool {
-    let mut pending = vec![root];
-    while let Some(expr) = pending.pop() {
-        if matches!(expr.sort, TrustSpecSort::Float { .. }) {
-            return true;
-        }
-        match &expr.kind {
-            TrustSpecExprKind::Unary { expr, .. }
-            | TrustSpecExprKind::Old { expr }
-            | TrustSpecExprKind::BvUnary { expr, .. }
-            | TrustSpecExprKind::BvFromInt { expr, .. }
-            | TrustSpecExprKind::IntFromBv { expr, .. } => pending.push(expr),
-            TrustSpecExprKind::Binary { lhs, rhs, .. }
-            | TrustSpecExprKind::BvBinary { lhs, rhs, .. } => {
-                pending.push(lhs);
-                pending.push(rhs);
-            }
-            TrustSpecExprKind::Field { base, .. } => pending.push(base),
-            TrustSpecExprKind::Index { base, index } => {
-                pending.push(base);
-                pending.push(index);
-            }
-            TrustSpecExprKind::Quantifier { variable_sort, body, .. } => {
-                if matches!(variable_sort, TrustSpecSort::Float { .. }) {
-                    return true;
-                }
-                pending.push(body);
-            }
-            TrustSpecExprKind::IsVariant { scrutinee, .. }
-            | TrustSpecExprKind::VariantField { scrutinee, .. } => pending.push(scrutinee),
-            TrustSpecExprKind::FloatLiteral { .. } => return true,
-            TrustSpecExprKind::BoolLiteral { .. }
-            | TrustSpecExprKind::IntLiteral { .. }
-            | TrustSpecExprKind::Variable { .. }
-            | TrustSpecExprKind::Result
-            | TrustSpecExprKind::BitVecLiteral { .. } => {}
-            _ => {}
-        }
-    }
-    false
-}
-
-// Trust (#29): amendment-1 arithmetic refusal for the bare trust-wp claim
-// lane. Kept as a single helper so the walker's unary (`Neg`) and binary
-// (`Add`/`Sub`/`Mul`/`Div`/`Mod`) refusals stay message-identical with the
-// compiler's copy of this lowering (rustc_mir_transform::trust_verify).
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_bare_claim_arithmetic_refusal(op: &str) -> String {
-    format!(
-        "TrustSpecPredicate arithmetic operator `{op}` is outside the trust-wp TrustFormulaV1 bare-claim fragment: machine arithmetic modeled over unbounded Int is a false-proof vector (`ensures result + 1 > result` is Int-provable but false at u64::MAX); see 2026-07-17 trust-wp lowering blueprint amendment 1"
+    trust_verifier_api::trust_spec_native_formula::trust_spec_predicate_to_trust_formula_payload(
+        predicate,
     )
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn validate_trust_spec_div_mod_defined(expr: &TrustSpecExpr) -> Result<(), String> {
-    validate_trust_spec_expr_div_mod_defined(expr, &[])
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn validate_trust_spec_expr_div_mod_defined(
-    expr: &TrustSpecExpr,
-    assumptions: &[TrustSpecExpr],
-) -> Result<(), String> {
-    match &expr.kind {
-        TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::And, lhs, rhs } => {
-            let mut scoped = assumptions.to_vec();
-            collect_trust_spec_definedness_facts(expr, &mut scoped);
-            validate_trust_spec_expr_div_mod_defined(lhs, &scoped)?;
-            validate_trust_spec_expr_div_mod_defined(rhs, &scoped)
-        }
-        TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::Implies, lhs, rhs } => {
-            let mut scoped = assumptions.to_vec();
-            collect_trust_spec_definedness_facts(lhs, &mut scoped);
-            validate_trust_spec_expr_div_mod_defined(lhs, &scoped)?;
-            validate_trust_spec_expr_div_mod_defined(rhs, &scoped)
-        }
-        TrustSpecExprKind::Binary {
-            op: op @ (TrustSpecBinaryOp::Div | TrustSpecBinaryOp::Mod),
-            lhs,
-            rhs,
-        } => {
-            validate_trust_spec_expr_div_mod_defined(lhs, assumptions)?;
-            validate_trust_spec_expr_div_mod_defined(rhs, assumptions)?;
-            if trust_spec_expr_known_nonzero(rhs, assumptions) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "TrustSpecPredicate {:?} divisor must be syntactically nonzero or guarded by a nonzero assumption for trust_wp TrustFormulaV1 native replay",
-                    op
-                ))
-            }
-        }
-        TrustSpecExprKind::Binary { lhs, rhs, .. } => {
-            validate_trust_spec_expr_div_mod_defined(lhs, assumptions)?;
-            validate_trust_spec_expr_div_mod_defined(rhs, assumptions)
-        }
-        TrustSpecExprKind::Unary { expr: inner, .. } | TrustSpecExprKind::Old { expr: inner } => {
-            validate_trust_spec_expr_div_mod_defined(inner, assumptions)
-        }
-        TrustSpecExprKind::Field { base, .. } => {
-            validate_trust_spec_expr_div_mod_defined(base, assumptions)
-        }
-        TrustSpecExprKind::Index { base, index } => {
-            validate_trust_spec_expr_div_mod_defined(base, assumptions)?;
-            validate_trust_spec_expr_div_mod_defined(index, assumptions)
-        }
-        TrustSpecExprKind::Quantifier { body, .. } => {
-            validate_trust_spec_expr_div_mod_defined(body, assumptions)
-        }
-        TrustSpecExprKind::BoolLiteral { .. }
-        | TrustSpecExprKind::IntLiteral { .. }
-        | TrustSpecExprKind::Variable { .. }
-        | TrustSpecExprKind::Result => Ok(()),
-        _ => Ok(()),
-    }
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn collect_trust_spec_definedness_facts(expr: &TrustSpecExpr, facts: &mut Vec<TrustSpecExpr>) {
-    match &expr.kind {
-        TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::And, lhs, rhs } => {
-            collect_trust_spec_definedness_facts(lhs, facts);
-            collect_trust_spec_definedness_facts(rhs, facts);
-        }
-        TrustSpecExprKind::Binary { op, .. }
-            if trust_spec_is_definedness_fact_operator(*op)
-                && !trust_spec_contains_div_mod(expr) =>
-        {
-            facts.push(expr.clone());
-        }
-        _ => {}
-    }
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_is_definedness_fact_operator(op: TrustSpecBinaryOp) -> bool {
-    matches!(
-        op,
-        TrustSpecBinaryOp::Eq
-            | TrustSpecBinaryOp::Ne
-            | TrustSpecBinaryOp::Lt
-            | TrustSpecBinaryOp::Le
-            | TrustSpecBinaryOp::Gt
-            | TrustSpecBinaryOp::Ge
-    )
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_expr_known_nonzero(expr: &TrustSpecExpr, assumptions: &[TrustSpecExpr]) -> bool {
-    trust_spec_constant_int(expr).is_some_and(|value| value != 0)
-        || assumptions
-            .iter()
-            .any(|assumption| trust_spec_assumption_proves_nonzero(assumption, expr))
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_assumption_proves_nonzero(
-    assumption: &TrustSpecExpr,
-    target: &TrustSpecExpr,
-) -> bool {
-    let TrustSpecExprKind::Binary { op, lhs, rhs } = &assumption.kind else {
-        return false;
-    };
-    match op {
-        TrustSpecBinaryOp::Ne => {
-            (lhs.as_ref() == target && trust_spec_is_int_zero(rhs))
-                || (rhs.as_ref() == target && trust_spec_is_int_zero(lhs))
-        }
-        TrustSpecBinaryOp::Gt | TrustSpecBinaryOp::Lt => {
-            (lhs.as_ref() == target && trust_spec_is_int_zero(rhs))
-                || (trust_spec_is_int_zero(lhs) && rhs.as_ref() == target)
-        }
-        _ => false,
-    }
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_contains_div_mod(expr: &TrustSpecExpr) -> bool {
-    match &expr.kind {
-        TrustSpecExprKind::Binary {
-            op: TrustSpecBinaryOp::Div | TrustSpecBinaryOp::Mod, ..
-        } => true,
-        TrustSpecExprKind::Binary { lhs, rhs, .. } => {
-            trust_spec_contains_div_mod(lhs) || trust_spec_contains_div_mod(rhs)
-        }
-        TrustSpecExprKind::Unary { expr: inner, .. } | TrustSpecExprKind::Old { expr: inner } => {
-            trust_spec_contains_div_mod(inner)
-        }
-        TrustSpecExprKind::Field { base, .. } => trust_spec_contains_div_mod(base),
-        TrustSpecExprKind::Index { base, index } => {
-            trust_spec_contains_div_mod(base) || trust_spec_contains_div_mod(index)
-        }
-        TrustSpecExprKind::Quantifier { body, .. } => trust_spec_contains_div_mod(body),
-        TrustSpecExprKind::BoolLiteral { .. }
-        | TrustSpecExprKind::IntLiteral { .. }
-        | TrustSpecExprKind::Variable { .. }
-        | TrustSpecExprKind::Result => false,
-        _ => false,
-    }
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_is_int_zero(expr: &TrustSpecExpr) -> bool {
-    trust_spec_constant_int(expr) == Some(0)
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_constant_int(expr: &TrustSpecExpr) -> Option<i64> {
-    match &expr.kind {
-        TrustSpecExprKind::IntLiteral { value } => value.parse::<i64>().ok(),
-        _ => None,
-    }
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn require_sort(
-    expr: &TrustSpecExpr,
-    expected: TrustSpecSort,
-    context: &str,
-) -> Result<(), String> {
-    if expr.sort == expected {
-        Ok(())
-    } else {
-        Err(format!(
-            "TrustSpecPredicate {context} has sort {:?}, expected {:?}",
-            expr.sort, expected
-        ))
-    }
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn validate_trust_spec_binary(
-    op: TrustSpecBinaryOp,
-    expr: &TrustSpecExpr,
-    lhs: &TrustSpecExpr,
-    rhs: &TrustSpecExpr,
-) -> Result<(), String> {
-    require_sort(expr, op.result_sort(), "binary expression")?;
-    match op {
-        TrustSpecBinaryOp::Add
-        | TrustSpecBinaryOp::Sub
-        | TrustSpecBinaryOp::Mul
-        | TrustSpecBinaryOp::Div
-        | TrustSpecBinaryOp::Mod => {
-            require_sort(lhs, TrustSpecSort::Int, "arithmetic lhs")?;
-            require_sort(rhs, TrustSpecSort::Int, "arithmetic rhs")
-        }
-        TrustSpecBinaryOp::Eq | TrustSpecBinaryOp::Ne => {
-            if lhs.sort == rhs.sort {
-                require_sort(expr, TrustSpecSort::Bool, "comparison expression")
-            } else {
-                Err(format!(
-                    "TrustSpecPredicate equality compares incompatible sorts {:?} and {:?}",
-                    lhs.sort, rhs.sort
-                ))
-            }
-        }
-        TrustSpecBinaryOp::Lt
-        | TrustSpecBinaryOp::Le
-        | TrustSpecBinaryOp::Gt
-        | TrustSpecBinaryOp::Ge => {
-            require_sort(lhs, TrustSpecSort::Int, "comparison lhs")?;
-            require_sort(rhs, TrustSpecSort::Int, "comparison rhs")?;
-            require_sort(expr, TrustSpecSort::Bool, "comparison expression")
-        }
-        TrustSpecBinaryOp::And | TrustSpecBinaryOp::Or | TrustSpecBinaryOp::Implies => {
-            require_sort(lhs, TrustSpecSort::Bool, "boolean lhs")?;
-            require_sort(rhs, TrustSpecSort::Bool, "boolean rhs")?;
-            require_sort(expr, TrustSpecSort::Bool, "boolean expression")
-        }
-        _ => Err(
-            "TrustSpecPredicate future binary operator is outside trust_wp TrustFormulaV1 native int/bool replay fragment"
-                .to_string(),
-        ),
-    }
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_sort_label(sort: TrustSpecSort) -> &'static str {
-    match sort {
-        TrustSpecSort::Bool => "bool",
-        TrustSpecSort::Int => "int",
-        TrustSpecSort::BitVec { .. } => "bit_vec",
-        TrustSpecSort::Array { .. } => "array",
-        // Unreachable in the TrustFormulaV1 lane: float-sorted predicates are
-        // rejected up front in `trust_spec_predicate_to_trust_formula_payload`
-        // (IEEE semantics have no faithful scalar int/bool replay).
-        TrustSpecSort::Float { .. } => "float",
-    }
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_unary_op_label(op: TrustSpecUnaryOp) -> Result<&'static str, String> {
-    match op {
-        TrustSpecUnaryOp::Not => Ok("not"),
-        TrustSpecUnaryOp::Neg => Ok("neg"),
-        _ => Err(
-            "TrustSpecPredicate future unary operator is outside trust_wp TrustFormulaV1 native int/bool replay fragment"
-                .to_string(),
-        ),
-    }
-}
-
-#[cfg(all(test, feature = "trust-build"))]
-fn trust_spec_binary_op_label(op: TrustSpecBinaryOp) -> Result<&'static str, String> {
-    match op {
-        TrustSpecBinaryOp::Add => Ok("add"),
-        TrustSpecBinaryOp::Sub => Ok("sub"),
-        TrustSpecBinaryOp::Mul => Ok("mul"),
-        TrustSpecBinaryOp::Div => Ok("div"),
-        TrustSpecBinaryOp::Mod => Ok("mod"),
-        TrustSpecBinaryOp::Eq => Ok("eq"),
-        TrustSpecBinaryOp::Ne => Ok("ne"),
-        TrustSpecBinaryOp::Lt => Ok("lt"),
-        TrustSpecBinaryOp::Le => Ok("le"),
-        TrustSpecBinaryOp::Gt => Ok("gt"),
-        TrustSpecBinaryOp::Ge => Ok("ge"),
-        TrustSpecBinaryOp::And => Ok("and"),
-        TrustSpecBinaryOp::Or => Ok("or"),
-        TrustSpecBinaryOp::Implies => Ok("implies"),
-        _ => Err(
-            "TrustSpecPredicate future binary operator is outside trust_wp TrustFormulaV1 native int/bool replay fragment"
-                .to_string(),
-        ),
-    }
 }
 
 #[cfg(all(test, feature = "trust-build"))]
@@ -6050,6 +5530,36 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "trust-build")]
+    #[test]
+    fn native_public_formula_codec_preserves_boolean_parameter_and_result() {
+        let predicate = TrustSpecPredicate::new(
+            TrustSpecExpr::binary(
+                TrustSpecBinaryOp::Eq,
+                TrustSpecExpr::result(TrustSpecSort::Bool),
+                TrustSpecExpr::variable("input", TrustSpecSort::Bool),
+            ),
+            vec![TrustSpecVariable {
+                name: "input".into(),
+                sort: TrustSpecSort::Bool,
+                origin: TrustSpecVariableOrigin::Local { index: 1 },
+            }],
+        );
+        let original = predicate.clone();
+        let formula = trust_wp_native_formula_from_trust_spec(&predicate).unwrap();
+        assert_eq!(predicate, original, "conversion must preserve public source data");
+        assert!(formula.bindings.is_empty(), "conversion cannot invent program bindings");
+        assert_eq!(formula.schema, TRUST_WP_TRUST_FORMULA_SCHEMA_VERSION);
+        let claim = trust_wp_core::verify_bundle::BundleClaim::new(
+            trust_wp_core::verify_bundle::BundleClaimFormat::TrustFormulaV1,
+            formula.payload,
+        );
+        let names = trust_wp_core::verify_bundle::native_claim_names(&claim).unwrap();
+        let actual: std::collections::BTreeSet<_> =
+            names.iter().map(|name| name.name.as_str()).collect();
+        assert_eq!(actual, std::collections::BTreeSet::from(["input", "result"]));
+    }
+
     // Trust (#29): guarded div/mod USED to lower into the bare TrustFormulaV1
     // claim; the amendment-1 arithmetic refusal now fails it closed like every
     // other arithmetic operator (a nonzero-divisor guard removes the
@@ -6100,7 +5610,8 @@ mod tests {
             ],
         );
 
-        let err = trust_spec_predicate_to_trust_formula_payload(&predicate)
+        let err = trust_wp_native_formula_from_trust_spec(&predicate)
+            .map(|formula| formula.payload)
             .expect_err("guarded div/mod arithmetic must fail closed (amendment 1)");
 
         assert!(err.contains("arithmetic operator"), "{err}");
@@ -6133,7 +5644,8 @@ mod tests {
             ],
         );
 
-        let err = trust_spec_predicate_to_trust_formula_payload(&predicate)
+        let err = trust_wp_native_formula_from_trust_spec(&predicate)
+            .map(|formula| formula.payload)
             .expect_err("unguarded modulo must fail closed before native replay");
 
         assert!(err.contains("divisor must"), "{err}");
@@ -6163,7 +5675,8 @@ mod tests {
         );
 
         predicate.validate().expect("read-only array predicate is valid public TrustSpec IR");
-        let err = trust_spec_predicate_to_trust_formula_payload(&predicate)
+        let err = trust_wp_native_formula_from_trust_spec(&predicate)
+            .map(|formula| formula.payload)
             .expect_err("arrays must not be flattened into scalar TrustFormulaV1 claims");
 
         assert!(err.contains("array sort is outside"), "{err}");
@@ -6191,7 +5704,8 @@ mod tests {
         );
 
         predicate.validate().expect("float comparison predicate is valid public TrustSpec IR");
-        let err = trust_spec_predicate_to_trust_formula_payload(&predicate)
+        let err = trust_wp_native_formula_from_trust_spec(&predicate)
+            .map(|formula| formula.payload)
             .expect_err("floats must not be replayed through scalar TrustFormulaV1 claims");
 
         assert!(err.contains("float sort is outside"), "{err}");
@@ -6236,7 +5750,8 @@ mod tests {
         ];
         for (op, root) in shapes {
             let predicate = TrustSpecPredicate::new(root, Vec::new());
-            let err = trust_spec_predicate_to_trust_formula_payload(&predicate)
+            let err = trust_wp_native_formula_from_trust_spec(&predicate)
+                .map(|formula| formula.payload)
                 .expect_err("machine-arithmetic Int tautology must fail closed (amendment 1)");
             assert!(err.contains(&format!("arithmetic operator `{op}`")), "{op}: {err}");
             assert!(err.contains("false at u64::MAX"), "{op}: {err}");
@@ -6256,7 +5771,8 @@ mod tests {
             ),
             Vec::new(),
         );
-        let err = trust_spec_predicate_to_trust_formula_payload(&predicate)
+        let err = trust_wp_native_formula_from_trust_spec(&predicate)
+            .map(|formula| formula.payload)
             .expect_err("unary negation must fail closed (amendment 1)");
         assert!(err.contains("arithmetic operator `neg`"), "{err}");
     }
@@ -6386,17 +5902,22 @@ mod tests {
         let formula = trust_ir::ProofFormula::new("TrustWpPureExprV1", "true");
 
         let mut module = trust_ir::Module::new("trust-wp-native-metadata-test");
-        let func_ty = module.add_func_type(trust_ir::FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
-        module.add_function(trust_ir::Function::new(
-            function_id,
-            "demo::postcondition",
-            func_ty,
-            trust_ir::BlockId::new(0),
-        ));
+        let func_ty = module
+            .add_func_type(trust_ir::FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        module
+            .try_add_function(trust_ir::Function::new(
+                function_id,
+                "demo::postcondition",
+                func_ty,
+                trust_ir::BlockId::new(0),
+            ))
+            .expect("Module::try_add_function: test fixture");
         module.proof_obligations.push(
             trust_ir::ProofObligation::new(
                 proof_id,
@@ -7063,8 +6584,9 @@ mod tests {
         let public_semantic_digest = sha256_proof_digest(&public_semantic_digest);
 
         let mut module = trust_ir::Module::new("trust-wp-native-claim-test");
-        let source_file =
-            module.intern_file(public_obligation.source.file.as_deref().unwrap_or("src/lib.rs"));
+        let source_file = module
+            .intern_file(public_obligation.source.file.as_deref().unwrap_or("src/lib.rs"))
+            .expect("Module::intern_file: test fixture");
         let source_range = trust_ir::ProofObligationSourceRange {
             file: source_file,
             start_line: public_obligation.source.line.unwrap_or(1),
@@ -7082,17 +6604,22 @@ mod tests {
         let native_assertion_id = trust_ir::NativeAssertionId::new(trust_types::stable_u32_id(
             assertion_text_id.as_bytes(),
         ));
-        let func_ty = module.add_func_type(trust_ir::FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
-        module.add_function(trust_ir::Function::new(
-            function_id,
-            "demo::postcondition",
-            func_ty,
-            trust_ir::BlockId::new(0),
-        ));
+        let func_ty = module
+            .add_func_type(trust_ir::FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        module
+            .try_add_function(trust_ir::Function::new(
+                function_id,
+                "demo::postcondition",
+                func_ty,
+                trust_ir::BlockId::new(0),
+            ))
+            .expect("Module::try_add_function: test fixture");
         let replay_formula = formula
             .clone()
             .unwrap_or_else(|| trust_ir::ProofFormula::new("TrustWpPureExprV1", "true"));

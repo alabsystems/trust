@@ -1,6 +1,8 @@
 //! impl bool {}
 
+use crate::intrinsics;
 use crate::marker::Destruct;
+use crate::ub_checks::assert_unsafe_precondition;
 
 impl bool {
     /// Returns `Some(t)` if the `bool` is [`true`](../std/keyword.true.html),
@@ -93,7 +95,7 @@ impl bool {
     /// // evaluated eagerly.
     /// assert_eq!(a, 2);
     /// ```
-    #[stable(feature = "bool_to_result", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "bool_to_result", since = "1.98.0")]
     #[rustc_const_unstable(feature = "const_bool", issue = "151531")]
     #[inline]
     pub const fn ok_or<E: [const] Destruct>(self, err: E) -> Result<(), E> {
@@ -120,7 +122,7 @@ impl bool {
     /// // `ok_or_else`.
     /// assert_eq!(a, 1);
     /// ```
-    #[stable(feature = "bool_to_result", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "bool_to_result", since = "1.98.0")]
     #[rustc_const_unstable(feature = "const_bool", issue = "151531")]
     #[inline]
     pub const fn ok_or_else<E, F: [const] FnOnce() -> E + [const] Destruct>(
@@ -128,5 +130,79 @@ impl bool {
         f: F,
     ) -> Result<(), E> {
         if self { Ok(()) } else { Err(f()) }
+    }
+
+    /// Toggles `self` in-place.
+    ///
+    /// - If `self` is [`true`], sets `self` to [`false`].
+    /// - If `self` is [`false`], sets `self` to [`true`].
+    ///
+    /// Equivalent to `value = !value`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut boolean = false;
+    ///
+    /// boolean.toggle();
+    /// assert_eq!(boolean, true);
+    ///
+    /// boolean.toggle();
+    /// assert_eq!(boolean, false);
+    /// ```
+    ///
+    /// [`true`]: ../std/keyword.true.html
+    /// [`false`]: ../std/keyword.false.html
+    #[stable(feature = "bool_toggle", since = "1.100.0")]
+    #[rustc_const_stable(feature = "bool_toggle", since = "1.100.0")]
+    #[inline]
+    pub const fn toggle(&mut self) {
+        *self = !*self;
+    }
+
+    /// Disjoint, bitwise or. Computes `self | rhs`, assuming at most one, true value.
+    ///
+    /// Practically, this requires that `self | rhs` and `self ^ rhs` both yield the
+    /// same result, allowing for any of the two to be emitted in codegen -- depending
+    /// on whichever is cheapest.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(disjoint_bitor)]
+    ///
+    /// assert_eq!(
+    ///     // SAFETY: Only one, true value is passed.
+    ///     unsafe { false.unchecked_disjoint_bitor(true) },
+    ///     true,
+    /// );
+    ///
+    /// assert_eq!(
+    ///     // SAFETY: No true values are passed.
+    ///     unsafe { false.unchecked_disjoint_bitor(false) },
+    ///     false,
+    /// );
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// This results in undefined behaviour if both `self` and `rhs` are true.
+    #[unstable(feature = "disjoint_bitor", issue = "135758")]
+    #[rustc_const_unstable(feature = "disjoint_bitor", issue = "135758")]
+    #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+    #[inline]
+    pub const unsafe fn unchecked_disjoint_bitor(self, rhs: Self) -> Self {
+        assert_unsafe_precondition!(
+            check_language_ub,
+            "bool::unchecked_disjoint_bitor cannot bitor two truths",
+            (
+                lhs: bool = self,
+                rhs: bool = rhs,
+            ) => !(lhs & rhs),
+        );
+
+        // SAFETY: Same precondition.
+        unsafe { intrinsics::disjoint_bitor(self, rhs) }
     }
 }

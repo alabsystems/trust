@@ -173,7 +173,7 @@ release-gate proof.
 ## 3. The recursion population — what the ladder never had
 
 Of the 90 core dumps, **18 are direct-self-recursive** (first committed
-published-crate corpus with ANY): 
+published-crate corpus with ANY):
 
 | family | functions | shape |
 |---|---|---|

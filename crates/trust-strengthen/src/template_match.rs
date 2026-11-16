@@ -71,20 +71,25 @@ pub fn classify_function(sig: &FunctionSignature) -> Option<(FunctionCategory, f
     let lower = sig.name.to_lowercase();
     let ret = sig.return_type.as_deref().unwrap_or("");
 
-    let mut candidates: Vec<(FunctionCategory, f64)> = Vec::new();
+    let mut best: Option<(FunctionCategory, f64)> = None;
+    let mut record = |cat: FunctionCategory, conf: f64| {
+        if best.is_none_or(|(_, best_conf)| conf >= best_conf) {
+            best = Some((cat, conf));
+        }
+    };
 
     // Getter patterns
     if (lower.starts_with("get_") || lower.starts_with("fetch_") || lower.ends_with("_of"))
         && !ret.is_empty()
         && ret != "()"
     {
-        candidates.push((FunctionCategory::Getter, 0.8));
+        record(FunctionCategory::Getter, 0.8);
     }
 
     // Setter patterns
     if (lower.starts_with("set_") || lower.starts_with("with_")) && !sig.params.is_empty() {
         let conf = if ret == "()" || ret.contains("Self") || ret.is_empty() { 0.85 } else { 0.65 };
-        candidates.push((FunctionCategory::Setter, conf));
+        record(FunctionCategory::Setter, conf);
     }
 
     // Constructor patterns
@@ -93,17 +98,19 @@ pub fn classify_function(sig: &FunctionSignature) -> Option<(FunctionCategory, f
         || lower.starts_with("build_")
         || (lower.starts_with("from_") && !lower.contains("str"))
     {
-        candidates.push((FunctionCategory::Constructor, 0.85));
+        record(FunctionCategory::Constructor, 0.85);
     }
 
     // Validator patterns
+    let mut is_validator = false;
     if (lower.starts_with("is_")
         || lower.starts_with("has_")
         || lower.starts_with("check_")
         || lower.starts_with("validate_"))
         && ret.trim() == "bool"
     {
-        candidates.push((FunctionCategory::Validator, 0.9));
+        is_validator = true;
+        record(FunctionCategory::Validator, 0.9);
     }
 
     // Converter patterns
@@ -112,31 +119,29 @@ pub fn classify_function(sig: &FunctionSignature) -> Option<(FunctionCategory, f
         || lower.starts_with("as_")
         || lower.starts_with("from_str")
     {
-        candidates.push((FunctionCategory::Converter, 0.8));
+        record(FunctionCategory::Converter, 0.8);
     }
 
     // Predicate (returns bool but not explicitly a validator name)
-    let is_validator = candidates.iter().any(|(c, _)| *c == FunctionCategory::Validator);
     if ret.trim() == "bool" && !is_validator {
-        candidates.push((FunctionCategory::Predicate, 0.6));
+        record(FunctionCategory::Predicate, 0.6);
     }
 
     // Finder patterns
     if (lower.starts_with("find_") || lower.starts_with("search_") || lower.starts_with("lookup_"))
         && ret.starts_with("Option<")
     {
-        candidates.push((FunctionCategory::Finder, 0.85));
+        record(FunctionCategory::Finder, 0.85);
     }
 
     // Accumulator patterns
     if (lower.starts_with("sum") || lower.starts_with("count") || lower.starts_with("total"))
         && is_numeric_ret(ret)
     {
-        candidates.push((FunctionCategory::Accumulator, 0.75));
+        record(FunctionCategory::Accumulator, 0.75);
     }
 
-    // Return the highest confidence match
-    candidates.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    best
 }
 
 /// Match a function signature against templates and produce proposals.
@@ -399,17 +404,10 @@ fn accumulator_proposals(sig: &FunctionSignature, confidence: f64) -> Vec<Propos
     let mut proposals = Vec::new();
 
     // Non-empty precondition if taking a slice
-    let has_slice = sig.params.iter().any(|(_, ty)| {
+    if let Some((name, _)) = sig.params.iter().find(|(_, ty)| {
         let t = ty.trim();
         t.starts_with("&[") || t.starts_with("&mut [") || t.starts_with("Vec<")
-    });
-
-    if has_slice
-        && let Some((name, _)) = sig.params.iter().find(|(_, ty)| {
-            let t = ty.trim();
-            t.starts_with("&[") || t.starts_with("&mut [") || t.starts_with("Vec<")
-        })
-    {
+    }) {
         proposals.push(Proposal {
             function_path: sig.path.clone(),
             function_name: sig.name.clone(),
@@ -469,16 +467,20 @@ pub fn proposal_from_template(
 // --- Utility functions ---
 
 fn is_likely_index(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower == "i"
-        || lower == "j"
-        || lower == "k"
-        || lower == "idx"
-        || lower == "index"
-        || lower == "pos"
-        || lower == "offset"
-        || lower.ends_with("_idx")
-        || lower.ends_with("_index")
+    let ends_with_ci = |suffix: &str| {
+        name.len() >= suffix.len()
+            && name.is_char_boundary(name.len() - suffix.len())
+            && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    };
+    name.eq_ignore_ascii_case("i")
+        || name.eq_ignore_ascii_case("j")
+        || name.eq_ignore_ascii_case("k")
+        || name.eq_ignore_ascii_case("idx")
+        || name.eq_ignore_ascii_case("index")
+        || name.eq_ignore_ascii_case("pos")
+        || name.eq_ignore_ascii_case("offset")
+        || ends_with_ci("_idx")
+        || ends_with_ci("_index")
 }
 
 fn is_numeric_ret(ty: &str) -> bool {

@@ -1,0 +1,18 @@
+error: citation `Nat.zero_le` failed the strict Clean statement/certification audit: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"Nat\"], lean4_hash: 9ecc0d3a68dfdd9b }, []), App(App(Const(Name { depth: 2, suffix: [\"Nat\", \"le\"], lean4_hash: 959676cc24c7aac2 }, []), BVar(0)), BVar(0))), inferred: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"Nat\"], lean4_hash: 9ecc0d3a68dfdd9b }, []), App(Lam(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"Nat\"], lean4_hash: 9ecc0d3a68dfdd9b }, []), App(App(Const(Name { depth: 2, suffix: [\"Nat\", \"le\"], lean4_hash: 959676cc24c7aac2 }, []), Const(Name { depth: 2, suffix: [\"Nat\", \"zero\"], lean4_hash: ba5a9c475ea35133 }, [])), BVar(0))), BVar(0))), location: None }" }]
+  --> $DIR/kernel-obligations-island-free-citation-wrong.rs:13:38
+   |
+LL |     ensures forall n: nat, n <= n by Nat.zero_le
+   |                                      ^^^^^^^^^^^
+   |
+   = note: statement drift and authority/provenance failures are hard citation errors; there is no router fallback (E9)
+
+error: citation `Nat.le_refl` on a `decreases` clause cannot be validated as a typed well-founded transition obligation
+  --> $DIR/kernel-obligations-island-free-citation-wrong.rs:20:20
+   |
+LL |     decreases n by Nat.le_refl
+   |                    ^^^^^^^^^^^
+   |
+   = note: decreases citations remain blocked until the before/after measure, strict descent, and well-founded carrier are bound into TrustIR
+
+error: aborting due to 2 previous errors
+

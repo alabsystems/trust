@@ -45,7 +45,8 @@
 //@ build-pass
 //@ dont-check-compiler-stderr
 pub async fn helper(x: u32) -> u32 {
-    //~^ WARN Trust Level 0 safety verification incomplete for `refutation_not_swallowed::helper::{closure#0}`: 1 obligation(s) were not proved
+    // RE-PINNED 2026-09-14: the clean coroutine body's conditional rows are a NOTE now, not
+    // the Level-0 incomplete WARN (see async_fn_records_assumption.rs).
     x
 }
 pub fn mid(a: u64, b: u64) -> u64 {

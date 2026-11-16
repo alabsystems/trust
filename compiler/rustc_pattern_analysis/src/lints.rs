@@ -1,4 +1,4 @@
-use rustc_session::lint::builtin::NON_EXHAUSTIVE_OMITTED_PATTERNS;
+use rustc_lint_defs::builtin::NON_EXHAUSTIVE_OMITTED_PATTERNS;
 use rustc_span::ErrorGuaranteed;
 use tracing::instrument;
 
@@ -62,7 +62,6 @@ fn collect_nonexhaustive_missing_variants<'p, 'tcx>(
 pub(crate) fn lint_nonexhaustive_missing_variants<'p, 'tcx>(
     rcx: &RustcPatCtxt<'p, 'tcx>,
     arms: &[MatchArm<'p, RustcPatCtxt<'p, 'tcx>>],
-    pat_column: &PatternColumn<'p, RustcPatCtxt<'p, 'tcx>>,
     scrut_ty: RevealedTy<'tcx>,
 ) -> Result<(), ErrorGuaranteed> {
     if !rcx
@@ -70,7 +69,8 @@ pub(crate) fn lint_nonexhaustive_missing_variants<'p, 'tcx>(
         .lint_level_spec_at_node(NON_EXHAUSTIVE_OMITTED_PATTERNS, rcx.match_lint_level)
         .is_allow()
     {
-        let witnesses = collect_nonexhaustive_missing_variants(rcx, pat_column)?;
+        let pat_column = PatternColumn::new(arms);
+        let witnesses = collect_nonexhaustive_missing_variants(rcx, &pat_column)?;
         if !witnesses.is_empty() {
             // Report that a match of a `non_exhaustive` enum marked with `non_exhaustive_omitted_patterns`
             // is not exhaustive enough.
@@ -94,7 +94,7 @@ pub(crate) fn lint_nonexhaustive_missing_variants<'p, 'tcx>(
             let level_spec =
                 rcx.tcx.lint_level_spec_at_node(NON_EXHAUSTIVE_OMITTED_PATTERNS, arm.arm_data);
             let level = level_spec.level();
-            if level != rustc_session::lint::Level::Allow {
+            if level != rustc_lint_defs::Level::Allow {
                 rcx.tcx.dcx().emit_warn(NonExhaustiveOmittedPatternLintOnArm {
                     span: arm.pat.data().span,
                     lint_span: level_spec.src.span(),

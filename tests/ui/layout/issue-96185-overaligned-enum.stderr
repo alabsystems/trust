@@ -1,8 +1,6 @@
 error: layout_of(Aligned1) = Layout {
            size: Size(8 bytes),
-           align: AbiAlign {
-               abi: Align(8 bytes),
-           },
+           align: Align(8 bytes),
            backend_repr: Memory {
                sized: true,
            },
@@ -17,22 +15,13 @@ error: layout_of(Aligned1) = Layout {
            largest_niche: Some(
                Niche {
                    offset: Size(0 bytes),
-                   value: Int(
-                       I8,
-                       false,
-                   ),
+                   value: u8,
                    valid_range: 0..=1,
                },
            ),
            uninhabited: false,
            variants: Multiple {
-               tag: Initialized {
-                   value: Int(
-                       I8,
-                       false,
-                   ),
-                   valid_range: 0..=1,
-               },
+               tag: u8 is 0..=1,
                tag_encoding: Direct,
                tag_field: 0,
                variants: [
@@ -62,26 +51,19 @@ error: layout_of(Aligned1) = Layout {
                Align(8 bytes),
            ),
            unadjusted_abi_align: Align(1 bytes),
+           repr_c: false,
            randomization_seed: $SEED,
        }
-  --> $DIR/issue-96185-overaligned-enum.rs:9:1
+  --> $DIR/issue-96185-overaligned-enum.rs:8:1
    |
 LL | pub enum Aligned1 {
    | ^^^^^^^^^^^^^^^^^
 
 error: layout_of(Aligned2) = Layout {
            size: Size(1 bytes),
-           align: AbiAlign {
-               abi: Align(1 bytes),
-           },
+           align: Align(1 bytes),
            backend_repr: Scalar(
-               Initialized {
-                   value: Int(
-                       I8,
-                       false,
-                   ),
-                   valid_range: 0..=1,
-               },
+               u8 is 0..=1,
            ),
            fields: Arbitrary {
                offsets: [
@@ -94,22 +76,13 @@ error: layout_of(Aligned2) = Layout {
            largest_niche: Some(
                Niche {
                    offset: Size(0 bytes),
-                   value: Int(
-                       I8,
-                       false,
-                   ),
+                   value: u8,
                    valid_range: 0..=1,
                },
            ),
            uninhabited: false,
            variants: Multiple {
-               tag: Initialized {
-                   value: Int(
-                       I8,
-                       false,
-                   ),
-                   valid_range: 0..=1,
-               },
+               tag: u8 is 0..=1,
                tag_encoding: Direct,
                tag_field: 0,
                variants: [
@@ -139,9 +112,10 @@ error: layout_of(Aligned2) = Layout {
                Align(1 bytes),
            ),
            unadjusted_abi_align: Align(1 bytes),
+           repr_c: false,
            randomization_seed: $SEED,
        }
-  --> $DIR/issue-96185-overaligned-enum.rs:17:1
+  --> $DIR/issue-96185-overaligned-enum.rs:16:1
    |
 LL | pub enum Aligned2 {
    | ^^^^^^^^^^^^^^^^^

@@ -153,10 +153,12 @@ fn builtin_alias_shadowing_external_subcommand() {
 
     p.cargo("t")
         .env("PATH", &path)
+        // Trust: this PATH override tests command lookup, not compiler selection.
+        .env("RUSTC", crate::utils::tools::rustc_executable())
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.5.0 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/main.rs (target/debug/deps/foo-[HASH][EXE])
+[RUNNING] unittests src/main.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
         .run();
@@ -183,6 +185,8 @@ fn alias_shadowing_external_subcommand() {
 
     p.cargo("echo")
         .env("PATH", &path)
+        // Trust: this PATH override tests command lookup, not compiler selection.
+        .env("RUSTC", crate::utils::tools::rustc_executable())
         .with_stderr_data(str![[r#"
 [WARNING] user-defined alias `echo` is shadowing an external subcommand found at `[ROOT]/cargo-echo/target/debug/cargo-echo[EXE]`
   |

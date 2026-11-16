@@ -21,6 +21,12 @@
 #   TRUST_REQUIRE_TARGO
 #                      Set to 1 to require Trust targo; implied by --release
 #                      and TRUST_RELEASE_GATE=1
+#   TRUST_TARGO_TRUST_BIN
+#                      Set BY this script: a run that includes
+#                      trust-integration-tests' tests/*.rs builds targo-trust
+#                      and exports a private copy of it, replacing any value
+#                      from the caller. Other runs pass the caller's value on;
+#                      no test they run reads it
 
 set -euo pipefail
 
@@ -75,6 +81,15 @@ ENVIRONMENT:
   TRUST_REQUIRE_TARGO
                      Set to 1 to require Trust targo. This is implied by
                      --release and TRUST_RELEASE_GATE=1.
+  TRUST_TARGO_TRUST_BIN
+                     Set BY this script. A run that includes
+                     trust-integration-tests' integration tests (no CRATE list,
+                     or trust-integration-tests, without --lib) first builds
+                     targo-trust from this tree and exports a private copy,
+                     replacing any value from the caller:
+                     binary_to_trust_ir_e2e and scale_fixture_crate run it and
+                     fail without it. A failed build fails the run. Other runs
+                     pass the caller's value on; no test they run reads it.
 
 EXAMPLES:
   ./scripts/dev-test.sh                         # All trust crate tests
@@ -268,11 +283,9 @@ if [[ -n "$RELEASE" ]]; then
     CARGO_ARGS+=("$RELEASE")
 fi
 
-# Trust (#60, 2026-08-19): the three rustc_private crates are EXCLUDED from the
-# crates/ workspace (crates/Cargo.toml `exclude`), so the cargo path below cannot
-# reach them — it would answer "did not match any packages". They ARE reachable
-# through bootstrap's per-crate test step, so dispatch them there instead of
-# declaring them untestable (the NOTES block used to do exactly that).
+# The three rustc_private consumers need bootstrap's compiler sysroot. They
+# are root members but deliberately outside default-members; route explicit
+# requests through x.py so their tests receive the required private libraries.
 #
 # Deliberately `x.py test`, NOT `x.py check`: check compiles the test targets but
 # executes ZERO of them, so a check-dispatch would print green having run 0 of
@@ -337,9 +350,8 @@ if [[ ${#CRATES[@]} -gt 0 ]]; then
         fi
         CARGO_ARGS+=(-p "$crate")
     done
-else
-    CARGO_ARGS+=(--workspace)
 fi
+# With no -p selection, Cargo uses the canonical developer default-members.
 
 if [[ -n "$LIB_ONLY" ]]; then
     CARGO_ARGS+=("$LIB_ONLY")
@@ -367,6 +379,52 @@ if [[ -n "$LIB_ONLY" ]]; then
 fi
 if [[ -n "$FILTER" ]]; then
     log "Filter: ${FILTER}"
+fi
+
+# trust-integration-tests' binary_to_trust_ir_e2e and scale_fixture_crate run
+# the targo-trust TRUST_TARGO_TRUST_BIN names, and fail without it. Build it as
+# scripts/check_crates_tests_scoped.py does, with its parser: the path is the
+# one cargo's compiler-artifact message reports, and the tests get a private
+# copy, which a build sharing the target dir cannot relink under them. A --lib
+# run, or a crate list without trust-integration-tests, runs neither test.
+NEEDS_TARGO_TRUST=0
+if [[ -z "$LIB_ONLY" ]]; then
+    if [[ ${#CRATES[@]} -eq 0 ]]; then
+        NEEDS_TARGO_TRUST=1
+    else
+        for crate in "${CRATES[@]}"; do
+            if [[ "$crate" == "trust-integration-tests" ]]; then
+                NEEDS_TARGO_TRUST=1
+            fi
+        done
+    fi
+fi
+if [[ "$NEEDS_TARGO_TRUST" == "1" ]]; then
+    TARGO_TRUST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dev-test-targo-trust.XXXXXX")"
+    trap 'rm -rf "${TARGO_TRUST_DIR:?}"' EXIT
+    log "Building targo-trust for trust-integration-tests"
+    if ! targo_trust_messages="$(cd "$REPO_ROOT" && "${TRUST_TARGO_CMD[@]}" build \
+        --manifest-path targo-trust/Cargo.toml --bin targo-trust --locked \
+        --message-format json-render-diagnostics)"; then
+        echo "error: targo-trust failed to build; trust-integration-tests runs it and is never skipped." >&2
+        exit 1
+    fi
+    targo_trust_built="$(printf '%s\n' "$targo_trust_messages" | python3 -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("lane", sys.argv[1])
+lane = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lane)
+built = lane.targo_trust_executable(sys.stdin)
+print(built or sys.exit("error: no compiler-artifact message named the targo-trust bin"))' \
+        "$REPO_ROOT/scripts/check_crates_tests_scoped.py")"
+    # -c: an APFS clone on macOS (no new disk for ~200 MB; cp falls back to
+    # a copy where it cannot clone). GNU cp reads -c as an SELinux option.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        cp -c -p "$targo_trust_built" "$TARGO_TRUST_DIR/targo-trust"
+    else
+        cp -p "$targo_trust_built" "$TARGO_TRUST_DIR/targo-trust"
+    fi
+    export TRUST_TARGO_TRUST_BIN="$TARGO_TRUST_DIR/targo-trust"
+    log "targo-trust: built ${targo_trust_built}; the tests get the copy TRUST_TARGO_TRUST_BIN=${TRUST_TARGO_TRUST_BIN}"
 fi
 
 start_time=$(date +%s)

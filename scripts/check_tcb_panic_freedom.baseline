@@ -107,4 +107,165 @@
 #   planted in this same file takes the scoped
 #   `./x.py check --stage 1 compiler/rustc_mir_transform` to rc=1 with 2 errors,
 #   and the restored file back to rc=0.
-272
+# 2026-09-21: 272 -> 240. A COUNTER CORRECTION, NOT A RATCHET, and the number
+#   moved DOWN on BOTH trees by the same 32, so no delta this file ever quoted
+#   changes.
+#
+#   THE COUNTER WAS WRONG, and it over-counted — the third time, and the same
+#   shape as 2026-07-24 (comment prose) and 2026-08-26 (leaked test bodies).
+#   `.expect(` is not always `Option::expect`. `trust-types/src/spec_parse.rs`
+#   and `spec_attrs.rs` each define
+#       fn expect(&mut self, expected: &Token, label: &str) -> Result<(), SpecParseError>
+#   and call it 32 times between them, EVERY ONE `?`-propagated. An inherent
+#   method shadows the std ones and neither `Option` nor `Result` can be `Self`
+#   here, so not one of those 32 can panic. They were counted anyway. The number
+#   could therefore have been "reduced" by making a spec parser worse, which is
+#   the property that makes a metric worthless.
+#
+#   MEASURED BOTH TREES WITH THE CORRECTED COUNTER, which is the only way to
+#   read this: the baseline commit 84cfbacef69 measures 240 (not the 272 it
+#   recorded), and the tree at the time the ratchet went red measures 288 (not
+#   320). The over-count is a constant 32 across both, so the +48 regression
+#   reported on 2026-09-20 was RIGHT and is unaffected. 240 is that same
+#   baseline re-expressed in the corrected unit.
+#
+#   THE GATE STAYS RED, which is the point. Live is 250 against this 240: the
+#   +48 has been paid down to +10, not measured away. Paydown so far:
+#     native_shadow_request.rs   -8   (typed refusals the fn already had)
+#     verify_output.rs          -30   (Formula->ay translation fails closed)
+#   The remaining +10 is real and is still owed.
+#
+#   The correction is receiver-scoped (`self.expect(`) and mutation-proved in
+#   four directions in the script's own comment; a genuine `Option::expect` in
+#   one of those parser files is still counted.
+#
+# 2026-09-30 — 240 -> 239. trust_verify.rs's `unreachable!` in the verify
+#   pass's artifact-cache read is removed by type: the cache read is generic
+#   over its reader, and the pass takes the full artifact or a counted miss.
+#   See reports/tcb-hardening-audit.md, "Resolved: trust_verify.rs:4651".
+# 2026-10-10 — 239 -> 222. A COUNTER CORRECTION, then a PAYDOWN. They are
+#   separate, and the correction is measured on both trees, as on 2026-09-21.
+#
+#   THE COUNTER WAS WRONG, and it over-counted — the fourth time. A module FILE
+#   declared only under `#[cfg(test)]` was read as production: the stripper
+#   dropped the `#[cfg(test)] mod x;` LINE, but the file it names was walked
+#   like any other unless its NAME looked like a test. The counter now records
+#   every `mod` declaration in the TCB (inline-module nesting and `#[path]`
+#   resolved, as rustc resolves them) and drops a file only when EVERY
+#   declaration of it is test-only; one production declaration, or none found,
+#   keeps it counted. On main every non-root TCB file resolves to at least one
+#   declaration and no declaration resolves to a missing file. `--print` names
+#   each dropped file and what it would have added. Mutation-proved, in the four
+#   directions and more, by scripts/tests/check_tcb_panic_freedom_test.sh.
+#
+#   MEASURED BOTH TREES WITH THE CORRECTED COUNTER: the baseline commit
+#   ba8a0f9fe92 measures 237, not 239 (trust-types patterns.rs x1 and
+#   trust-vcgen generate/version_ssa_families.rs x1 are test-only), and main
+#   ce026e1c63b measures 236, not 251 (those two, plus trust-cg-bridge
+#   compiler_consumer_census.rs x9 and trust-vcgen referent_fold/fold_cost_fix.rs
+#   x4). 237 is the old baseline in the corrected unit, and main was inside it
+#   by 1 once counted honestly: the 13 production sites it added were offset by
+#   14 removed (solver_cache.rs x7, panic_calls.rs x4, overflow_vc.rs x2,
+#   vc_artifact_cache.rs x1). The red was the 13 test constructs.
+#
+#   THE PAYDOWN is those 13 added sites anyway, plus the older twin of one, each
+#   now total code or a refusal its function already returns — nothing hidden
+#   from the counter, no check deleted:
+#     trust-cg-bridge call_event.rs       x5  (frozen; waiver row, fifth movement)
+#     trust-cg-bridge compiled_object.rs  x3  (a missing section is `malformed`;
+#                                             the local-extent lookup is done once)
+#     trust-router ay_discovery.rs        x1  (require_test_ay -> detect_test_ay:
+#                                             the NOT RUN panic moved into the tests)
+#     trust-types e6_expr/tree.rs         x1  (spine_prefix builds the chain)
+#     trust-types formula_hash.rs         x1  (canonical_query_hash returns Result;
+#                                             moved here from solver_cache.rs)
+#     trust-vcgen loop_bounds.rs          x2  (the DFS edits its top in place; :55
+#                                             predates the baseline, :1509 is new)
+#     trust-vcgen type_invariant/houdini.rs x1 (indexed iteration)
+#   236 - 14 = 222. Per root, old counter -> corrected -> paid down:
+#   trust-vcgen 59 -> 54 -> 51, trust-router 24 -> 24 -> 23, trust-types
+#   29 -> 28 -> 26, trust-cg-bridge 58 -> 49 -> 41; the other roots unchanged.
+#   Reproduce: scripts/check_tcb_panic_freedom.sh --print (and --list).
+#
+# 2026-10-10 (T4.1 review, branch t4/t41-in-process-liskov-20261010): 222 -> 221.
+#   trust-cache fingerprint.rs x1: `hex_digest`'s `.expect` went with the
+#   solver-binary fingerprint it served, deleted because no caller reads it
+#   since T4.1. Nothing else moved.
+#
+# 2026-10-15: 221 -> 220. Main (e559e926105) measured 224: the WS7.14 series
+#   added four production sites to trust-cg-bridge verify_output_trust_ir.rs,
+#   and trust-ir-bridge lower.rs lost one (`stack.last_mut().unwrap()`), net +3.
+#   The four are paid down, each by code with no panic path and the same result:
+#     * `norm`'s three `if const_pair(..).is_some()` arms (BvOr/BvXor/BvAdd)
+#       followed by `const_pair(..).expect("guarded")` -> unguarded arms calling
+#       `fold_const_pair`, which folds two constants and otherwise rebuilds the
+#       variant unchanged, exactly what the fall-through `other => other` gave.
+#     * `find(..).expect("just located")` on a header's located cut -> the
+#       function's own `Err`, the same refusal its segment lookup below returns.
+#   224 - 4 = 220. Reproduce: scripts/check_tcb_panic_freedom.sh --list.
+#
+# 2026-10-15 (T3 L4 C06, branch t3/l4-s1-20261011): 220 -> 218.
+#   trust-types formula_arena/transform.rs x2 (`unreachable!`): the arena, with no
+#   production user, is deleted, and vc_context, which replaces it, adds none. The
+#   baseline falls by exactly those two, so they cannot be spent again.
+#
+# 2026-10-16 (T11, branch inc6/tb1-t11-20261016): 218 -> 206.
+#   trust-cache x12, every one in a module T11 deleted as dead (no compiler or
+#   verifier path consumed it): alpha_normalize.rs x3, independence.rs x2
+#   (`unreachable!`), integrity.rs x2, mir_hash.rs x2, query_cache.rs x1,
+#   sub_query_splitter.rs x2. The two modules left, fingerprint.rs and
+#   coordination.rs, count 0. Nothing else moved: the base (3a1cb55f071)
+#   measured 218. Reproduce: scripts/check_tcb_panic_freedom.sh --list.
+#
+# 2026-11-04: 206 -> 205. No code changed for this entry; it records a net
+#   movement already on main so the one freed site cannot be spent silently.
+#   Measured with the SAME (current) counter on both trees: the baseline
+#   commit 21bae64e0e9 counts 206, main f2204477fd4 counts 205 (the one
+#   intervening counter change, 4b2517912543, only refuses counts from
+#   incomplete checkouts and moves no number). Per-site diff of `--list`,
+#   line numbers normalized out: four trust-router coordinator.rs `.expect`
+#   sites (path.parent, staged.path clone, listener.take, child.stderr.take)
+#   are gone with the router rework; three sites were added elsewhere
+#   (trust-router full_verification/engine/mod.rs x2 `.expect`, trust-vcgen
+#   generate/inferred_return/calls.rs x1 `unreachable!`). -4 +3 = -1. Those
+#   three added sites are part of the recorded surface, not excused by this
+#   entry; paying them down is what moves the number next. Reproduce:
+#   scripts/check_tcb_panic_freedom.sh --list.
+#
+# 2026-11-04 (later): 205 -> 202. The three sites the entry above named as
+#   owed are paid, each by a TOTAL replacement, no counted panic swapped for
+#   an uncounted one:
+#     * trust-vcgen generate/inferred_return/calls.rs x1: the
+#       `let Terminator::Call .. else { unreachable!() }` after `admits()`
+#       (which itself destructures exactly that variant) now returns the
+#       `Err` the function already returns two lines above for a
+#       non-admitted call. Identical on every reachable path.
+#     * trust-router full_verification/engine/mod.rs x2: `.expect` on the
+#       primary and fallback engine `position()` lookups. `fallback_eligibility`
+#       already adjudicates a `None` fallback as Terminal(NoRoute); the call
+#       site now binds both indices by pattern and only enters the fallback
+#       attempt on `(eligible, Some(index))`. A `None` primary — unreachable
+#       for an item that arrived in a routed batch — skips the extra attempt
+#       and keeps the primary evidence, which is fail-closed: a fallback is
+#       only ever an additional attempt, never a requirement for a proof.
+#   Validated: trust-router --lib full_verification 106/106, trust-vcgen
+#   --lib inferred_return 27/27; counter 205 -> 202 is exactly these three
+#   (expect 135 -> 133, unreachable 52 -> 51). Full lib suites at the land
+#   head: trust-router 948 passed / 0 failed; trust-vcgen 5626 passed with
+#   8 failures (six contracts, one len_witness_grounding, one
+#   machine_faithful_contract_lane) that fail IDENTICALLY with this change's
+#   one vcgen file swapped back to the base version — pre-existing, none in
+#   inferred_return. Reproduce: scripts/check_tcb_panic_freedom.sh --list.
+# 2026-11-12: 202 -> 145. No production Rust changed in this ratchet.
+#   The previous population counted 157: it omitted the split compiler pass
+#   under trust_verify/ (three production sites) and included fifteen sites
+#   in descendants of cfg(test)-only files (five vcgen parity sites and ten
+#   IR-bridge removed_bundle_members sites). Declarations now come from all
+#   Rust files, including test-named parents, while only established test
+#   ancestry excludes a counted candidate. Production imports, orphans and
+#   ungrounded cycles remain counted. The corrected population is 145, not
+#   evidence that 57 panics were removed. Reproduce on the unchanged Rust
+#   sources of 401ce4326291 with the corrected counter:
+#   bash scripts/check_tcb_panic_freedom.sh --print
+#   The updater now refuses increases and malformed/overflowing baselines.
+145

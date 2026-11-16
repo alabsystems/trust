@@ -1,11 +1,13 @@
 use rustc_ast::entry::EntryPointType;
+use rustc_attr_ir::find_attr;
 use rustc_errors::codes::*;
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
-use rustc_hir::{ItemId, Node, find_attr};
+use rustc_hir::{ItemId, Node};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::config::{CrateType, EntryFnType, sigpipe};
+use rustc_session::config::{EntryFnType, sigpipe};
 use rustc_span::{RemapPathScopeComponents, Span};
+use rustc_structures::CrateType;
 
 use crate::diagnostics::{ExternMain, MultipleRustcMain, NoMainErr};
 
@@ -96,7 +98,9 @@ fn configure_main(tcx: TyCtxt<'_>, visitor: &EntryContext<'_>) -> Option<(DefId,
 }
 
 fn sigpipe(tcx: TyCtxt<'_>) -> u8 {
-    match tcx.sess.opts.unstable_opts.on_broken_pipe {
+    // Trust: the Unix-tool verification profiles declare `kill` when no explicit
+    // `-Zon-broken-pipe` is given; see `Session::trust_effective_on_broken_pipe`.
+    match tcx.sess.trust_effective_on_broken_pipe() {
         rustc_target::spec::OnBrokenPipe::Default => sigpipe::DEFAULT,
         rustc_target::spec::OnBrokenPipe::Kill => sigpipe::SIG_DFL,
         rustc_target::spec::OnBrokenPipe::Error => sigpipe::SIG_IGN,

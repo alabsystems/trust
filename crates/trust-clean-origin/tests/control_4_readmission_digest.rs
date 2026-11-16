@@ -180,6 +180,7 @@ fn extracted_projection(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -205,6 +206,7 @@ fn extracted_double_with_callee(callee: &str) -> VerifiableFunction {
                         is_unsafe_sig: false,
                         unwind: UnwindEdge::Unreachable,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: Vec::new(), terminator: Terminator::Return },
@@ -217,6 +219,7 @@ fn extracted_double_with_callee(callee: &str) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -332,7 +335,8 @@ fn tamper(bytes: &[u8], needle: &[u8], replacement: &[u8], index: usize) -> Vec<
 ///
 /// This fixture is intentionally outside the production encoder: new output
 /// must always use v2, while the decoder remains responsible for accepting
-/// complete historical v1 records. Constructing every v1 field from the
+/// the historical v1 layout with the current exact environment-digest mode.
+/// Old lossy environment modes remain refused. Constructing every v1 field from the
 /// decoded public decision makes the compatibility test exercise the actual
 /// old layout rather than merely changing a version byte on v2 bytes.
 fn encode_v1_defeq(digest: &VerdictDigest) -> Vec<u8> {
@@ -358,7 +362,7 @@ fn encode_v1_defeq(digest: &VerdictDigest) -> Vec<u8> {
     out.push(1);
     put_str(&mut out, digest.decl());
     put_str(&mut out, digest.kernel_version());
-    out.push(1); // dependency-closure environment digest
+    out.push(trust_clean_origin::admission::ENVIRONMENT_DIGEST_MODE_DEPENDENCY_CLOSURE);
     put_str(&mut out, digest.environment().as_hex());
     put_u32(&mut out, u32::try_from(digest.assumptions().len()).expect("assumptions"));
     for assumption in digest.assumptions() {
@@ -804,10 +808,22 @@ fn v1_defeq_digest_remains_readable_without_relabelling() {
     let env = env_with_double(double_body());
     let bytes = encode_v1_defeq(&honest_digest(&env));
 
-    let decoded = VerdictDigest::decode(&bytes).expect("the historical v1 layout remains valid");
+    let decoded = VerdictDigest::decode(&bytes)
+        .expect("the historical v1 layout with a current exact digest remains valid");
     assert_eq!(decoded.faithfulness().method(), FaithfulnessMethod::DefinitionalEquality);
     fully_readmit(&decoded, local_kernel_version(), &env, &extracted_double())
-        .expect("a valid historical defeq certificate remains re-admissible");
+        .expect("v1 envelope layout does not weaken current local re-admission");
+
+    // The same complete v1 record must not relabel the retired lossy mode as
+    // current, even when all remaining bytes are copied from an honest digest.
+    let mode_at = 5 + 4 + decoded.decl().len() + 4 + decoded.kernel_version().len();
+    let mut old_mode = bytes;
+    assert_eq!(old_mode[mode_at], 2);
+    old_mode[mode_at] = 1;
+    assert!(matches!(
+        VerdictDigest::decode(&old_mode),
+        Err(DecodeRefusal::Malformed { field: "environment digest mode", .. })
+    ));
 }
 
 #[test]
@@ -1068,7 +1084,46 @@ fn extracted_pick(param: usize) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
+}
+
+#[test]
+fn structural_export_rechecks_own_body_and_retains_legacy_name_refusal() {
+    use trust_clean_origin::admission::{
+        DigestMintRefusal, mint_encoded_digest_for_export_for_name,
+    };
+    let mut env = env_with_pick();
+    let plain = Name::from_string("pick");
+    let status = certified_status();
+    let direct =
+        mint_encoded_digest_for_export_for_name(&env, &plain, &status, &extracted_pick(0)).unwrap();
+    assert_eq!(
+        direct,
+        mint_encoded_digest_for_export(&env, "pick", &status, &extracted_pick(0),).unwrap()
+    );
+
+    let quoted = Name::anon().str("A.b");
+    let info = env.get_const(&plain).unwrap().clone();
+    env.add_decl(clean_kernel::Declaration::Definition {
+        name: quoted.clone(),
+        level_params: vec![],
+        type_: info.type_,
+        value: info.value.unwrap(),
+        is_reducible: true,
+    })
+    .unwrap();
+    // The display alias is absent. A typed lookup reaches this actual body,
+    // rechecks it, and then refuses the wire format that cannot name it.
+    assert!(matches!(
+        mint_encoded_digest_for_export_for_name(&env, &quoted, &status, &extracted_pick(0)),
+        Err(ExportDigestRefusal::Mint(DigestMintRefusal::UnencodableDeclaration { .. }))
+    ));
+    // A wrong body must fail at its kernel gate before the encoding refusal.
+    assert!(matches!(
+        mint_encoded_digest_for_export_for_name(&env, &quoted, &status, &extracted_pick(1)),
+        Err(ExportDigestRefusal::Emit(_))
+    ));
 }
 
 #[test]

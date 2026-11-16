@@ -100,7 +100,7 @@ fn feature_required_dependency() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
 [ERROR] failed to download replaced source registry `crates-io`
@@ -152,6 +152,7 @@ Caused by:
 
 #[cargo_test]
 fn unknown_feature() {
+    // Trust: retain the channel refusal and exact current Trust guidance.
     let p = project()
         .file(
             "Cargo.toml",
@@ -175,7 +176,7 @@ fn unknown_feature() {
 Caused by:
   unknown Cargo.toml feature `foo`
 
-  See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information.
+  See the Trust Cargo unstable-features documentation shipped with this toolchain for more information.
 
 "#]])
         .run();
@@ -183,6 +184,7 @@ Caused by:
 
 #[cargo_test]
 fn wrong_kind_of_feature() {
+    // Trust: retain the channel refusal and exact current Trust guidance.
     let p = project()
         .file(
             "Cargo.toml",
@@ -206,7 +208,7 @@ fn wrong_kind_of_feature() {
 Caused by:
   unknown Cargo.toml feature `build-dir`
 
-  See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information.
+  See the Trust Cargo unstable-features documentation shipped with this toolchain for more information.
 
 "#]])
         .run();
@@ -263,7 +265,7 @@ fn stable_feature_warns() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [WARNING] Cargo.toml: the cargo feature `test-dummy-stable` has been stabilized in the 1.0 release and is no longer necessary to be listed in the manifest
-  See https://doc.rust-lang.org/cargo/ for more information about using this feature.
+  See https://doc.rust-lang.org/[..]cargo/ for more information about using this feature.
 [WARNING] `a` (manifest) generated 1 warning
 [CHECKING] a v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -477,6 +479,7 @@ Caused by:
 
 #[cargo_test]
 fn nightly_feature_requires_nightly() {
+    // Trust: retain the channel refusal and exact current Trust guidance.
     let p = project()
         .file(
             "Cargo.toml",
@@ -508,7 +511,7 @@ fn nightly_feature_requires_nightly() {
 [ERROR] failed to parse manifest at `[ROOT]/foo/Cargo.toml`
 
 Caused by:
-  the cargo feature `test-dummy-unstable` requires a nightly version of Cargo, but this is the `stable` channel
+  the cargo feature `test-dummy-unstable` requires a Cargo channel with unstable-feature support, but this is the `stable` channel
 ...
 "#]])
         .run();
@@ -516,6 +519,7 @@ Caused by:
 
 #[cargo_test]
 fn nightly_feature_requires_nightly_in_dep() {
+    // Trust: retain the channel refusal and exact current Trust guidance.
     let p = project()
         .file(
             "Cargo.toml",
@@ -528,6 +532,9 @@ fn nightly_feature_requires_nightly_in_dep() {
 
                 [dependencies]
                 a = { path = "a" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -542,6 +549,9 @@ fn nightly_feature_requires_nightly_in_dep() {
                 edition = "2015"
                 authors = []
                 im-a-teapot = true
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a/src/lib.rs", "")
@@ -549,7 +559,7 @@ fn nightly_feature_requires_nightly_in_dep() {
     p.cargo("check")
         .masquerade_as_nightly_cargo(&["test-dummy-unstable"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] a v0.0.1 ([ROOT]/foo/a)
 [CHECKING] b v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -572,7 +582,7 @@ Caused by:
   failed to parse manifest at `[ROOT]/foo/a/Cargo.toml`
 
 Caused by:
-  the cargo feature `test-dummy-unstable` requires a nightly version of Cargo, but this is the `stable` channel
+  the cargo feature `test-dummy-unstable` requires a Cargo channel with unstable-feature support, but this is the `stable` channel
 ...
 "#]])
         .run();
@@ -580,6 +590,7 @@ Caused by:
 
 #[cargo_test]
 fn cant_publish() {
+    // Trust: retain the channel refusal and exact current Trust guidance.
     let p = project()
         .file(
             "Cargo.toml",
@@ -611,7 +622,7 @@ fn cant_publish() {
 [ERROR] failed to parse manifest at `[ROOT]/foo/Cargo.toml`
 
 Caused by:
-  the cargo feature `test-dummy-unstable` requires a nightly version of Cargo, but this is the `stable` channel
+  the cargo feature `test-dummy-unstable` requires a Cargo channel with unstable-feature support, but this is the `stable` channel
 ...
 
 "#]])
@@ -620,6 +631,7 @@ Caused by:
 
 #[cargo_test]
 fn z_flags_rejected() {
+    // Trust: retain the channel refusal and exact current Trust guidance.
     let p = project()
         .file(
             "Cargo.toml",
@@ -639,8 +651,8 @@ fn z_flags_rejected() {
     p.cargo("check -Zprint-im-a-teapot")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[ERROR] the `-Z` flag is only accepted on the nightly channel of Cargo, but this is the `stable` channel
-See [..]
+[ERROR] the `-Z` flag is only accepted on Trust/nightly-capable Cargo channels, but this is the `stable` channel
+Use the Trust `trust` channel, or another Cargo channel with explicit unstable-feature support, for these flags.
 
 "#]])
         .run();
@@ -651,7 +663,7 @@ See [..]
         .with_stderr_data(str![[r#"
 [ERROR] unknown `-Z` flag specified: arg
 
-For available unstable features, see https://doc.rust-lang.org/nightly/cargo/reference/unstable.html
+For available unstable features, run `cargo -Z help`
 If you intended to use an unstable rustc feature, try setting `RUSTFLAGS="-Zarg"`
 
 "#]])

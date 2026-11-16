@@ -19,19 +19,22 @@ use trust_vcgen::memory_ordering::{
     AtomicAccessEntry, AtomicAccessLog, DataRaceDetector, HappensBefore, HappensBeforeGraph,
     MemoryModelChecker,
 };
-use trust_vcgen::send_sync::{SendSyncChecker, TypeInfo, ViolationKind};
+use trust_vcgen::send_sync::{
+    MutexEvent as DiagnosticMutexEvent, SendSyncChecker, SharedAccess as DiagnosticSharedAccess,
+    TypeInfo, ViolationKind, generate_thread_safety_vcs,
+};
 
 // ---------------------------------------------------------------------------
-// 1. Correct release-acquire pattern: no DataRace VCs
+// 1. Claimed release-acquire pattern: race candidates remain
 // ---------------------------------------------------------------------------
 
-/// Simulates a producer-consumer pattern with proper release-acquire
-/// synchronization. The producer writes data, then release-stores a flag.
-/// The consumer acquire-loads the flag, then reads data.
+/// Simulates a producer-consumer pattern with a caller-claimed release-acquire
+/// chain. The producer writes data, then release-stores a flag. The consumer
+/// acquire-loads the flag, then reads data.
 ///
-/// Expected: no data race VCs on the data variable.
+/// Expected: the authored HB list cannot suppress the data race candidate.
 #[test]
-fn test_correct_release_acquire_produces_no_data_race_vcs() {
+fn test_claimed_release_acquire_still_produces_data_race_candidate() {
     // Build the access trace: producer writes data, release-stores flag;
     // consumer acquire-loads flag, reads data.
     let accesses = vec![
@@ -67,37 +70,34 @@ fn test_correct_release_acquire_produces_no_data_race_vcs() {
         },
     ];
 
-    // Detect races -- should find none on "data" because of transitive HB:
-    //   data_write --PO-> flag_store --sync-> flag_load --PO-> data_read
+    // The authored path lacks runtime event identity and a read-from witness.
     let races = detect_potential_races(&accesses);
-    let data_races: Vec<_> = races.iter().filter(|r| r.variable == "data").collect();
-    assert!(
-        data_races.is_empty(),
-        "Correct release-acquire pattern should produce no data race on 'data', \
-         but found {} race(s)",
-        data_races.len()
-    );
-
-    // Generate VCs -- should produce no DataRace VCs for data
-    let vcs = generate_race_vcs(&races, "producer_consumer", &accesses);
-    let data_race_vcs: Vec<_> = vcs
+    let data_pair = races
         .iter()
-        .filter(|vc| matches!(&vc.kind, VcKind::DataRace { variable, .. } if variable == "data"))
-        .collect();
-    assert!(
-        data_race_vcs.is_empty(),
-        "No DataRace VCs should be generated for correctly synchronized 'data'"
-    );
+        .position(|race| (race.first, race.second) == (0, 3))
+        .expect("authored HB cannot hide the data write/read candidate");
+
+    // The diagnostic VC mirrors that candidate; it is not a proof verdict.
+    let vcs = generate_race_vcs(&races, "producer_consumer", &accesses);
+    assert_eq!(vcs.len(), races.len());
+    assert!(matches!(
+        &vcs[data_pair].kind,
+        VcKind::UnsupportedMir { kind, detail }
+            if kind == "DataRaceCandidate"
+                && detail.contains("data")
+                && detail.contains("producer")
+                && detail.contains("consumer")
+    ));
 }
 
 // ---------------------------------------------------------------------------
-// 2. Buggy relaxed-only pattern: DataRace VCs with correct identifiers
+// 2. Buggy relaxed-only pattern: unsupported race candidate retained
 // ---------------------------------------------------------------------------
 
 /// Simulates a broken producer-consumer where the flag uses Relaxed ordering
 /// instead of Release/Acquire. The non-atomic data access is unprotected.
 ///
-/// Expected: DataRace VC on "data" with thread_a="producer", thread_b="consumer".
+/// Expected: an unsupported data-race candidate with diagnostic labels.
 #[test]
 fn test_buggy_relaxed_pattern_produces_data_race_vcs() {
     let accesses = vec![
@@ -133,37 +133,32 @@ fn test_buggy_relaxed_pattern_produces_data_race_vcs() {
         },
     ];
 
-    // Detect races -- should find a race on "data"
+    // Detect races -- the data write/read remains one of several may-alias pairs.
     let races = detect_potential_races(&accesses);
-    let data_races: Vec<_> = races.iter().filter(|r| r.variable == "data").collect();
-    assert_eq!(
-        data_races.len(),
-        1,
-        "Buggy relaxed pattern should produce exactly 1 data race on 'data'"
-    );
-
-    // Verify the race identifiers are correct
-    assert_eq!(data_races[0].thread_a, "producer");
-    assert_eq!(data_races[0].thread_b, "consumer");
-    assert_eq!(data_races[0].variable, "data");
-
-    // Generate VCs and verify the DataRace VC has correct metadata
-    let vcs = generate_race_vcs(&races, "broken_producer_consumer", &accesses);
-    let data_race_vcs: Vec<_> = vcs
+    let data_pair = races
         .iter()
-        .filter(|vc| matches!(&vc.kind, VcKind::DataRace { variable, .. } if variable == "data"))
-        .collect();
-    assert_eq!(data_race_vcs.len(), 1);
-    assert_eq!(data_race_vcs[0].function, "broken_producer_consumer");
+        .position(|race| (race.first, race.second) == (0, 3))
+        .expect("the data write/read must remain a candidate");
 
-    // Verify the VC kind carries correct thread identifiers
-    match &data_race_vcs[0].kind {
-        VcKind::DataRace { variable, thread_a, thread_b } => {
-            assert_eq!(variable, "data");
-            assert_eq!(thread_a, "producer");
-            assert_eq!(thread_b, "consumer");
+    // Verify diagnostic labels on the actual data pair.
+    assert_eq!(races[data_pair].thread_a, "producer");
+    assert_eq!(races[data_pair].thread_b, "consumer");
+    assert_eq!(races[data_pair].variable, "data");
+
+    // Generate VCs and verify this candidate's diagnostic metadata.
+    let vcs = generate_race_vcs(&races, "broken_producer_consumer", &accesses);
+    assert_eq!(vcs.len(), races.len());
+    assert_eq!(vcs[data_pair].function, "broken_producer_consumer");
+
+    // Verify the unsupported candidate carries the diagnostic labels.
+    match &vcs[data_pair].kind {
+        VcKind::UnsupportedMir { kind, detail } => {
+            assert_eq!(kind, "DataRaceCandidate");
+            assert!(detail.contains("data"));
+            assert!(detail.contains("producer"));
+            assert!(detail.contains("consumer"));
         }
-        other => panic!("expected DataRace VC kind, got: {other:?}"),
+        other => panic!("expected unsupported race candidate, got: {other:?}"),
     }
 }
 
@@ -269,10 +264,13 @@ fn test_full_pipeline_detector_to_checker_to_router() {
     // Establish release-acquire sync
     detector.add_sync_pair(release_flag, acquire_flag);
 
-    // Check: no races on shared_buf
+    // Check: the caller-claimed sync path does not erase the data pair.
     let races = detector.detect_races();
-    let buf_races: Vec<_> = races.iter().filter(|r| r.location == "shared_buf").collect();
-    assert!(buf_races.is_empty(), "shared_buf should be race-free with release-acquire sync");
+    assert!(
+        races
+            .iter()
+            .any(|race| { (race.first_access, race.second_access) == (write_data, read_data) })
+    );
 
     // Phase 2: Use MemoryModelChecker for ordering analysis
     let mut log = AtomicAccessLog::new();
@@ -294,20 +292,74 @@ fn test_full_pipeline_detector_to_checker_to_router() {
 
     let checker = MemoryModelChecker::new(log, hb);
 
-    // Memory model check should be sound
+    // This atomic-only check does not decide the non-atomic data race candidate.
     let result = checker.check();
-    assert!(result.is_sound, "properly synchronized code should be sound");
+    assert!(result.is_sound, "the atomic-only ordering check should pass");
     assert!(result.races.is_empty());
     assert!(result.ordering_violations.is_empty());
 
-    // Generate VCs from the checker -- should produce none
+    // This checker has no atomic ordering violation VC.
     let vcs = checker.generate_vcs("producer_consumer");
-    assert!(vcs.is_empty(), "sound memory model should produce no VCs");
+    assert!(vcs.is_empty(), "the atomic-only checker should produce no VCs");
 
-    // Phase 3: Route any VCs through the Router (verifying the empty case works)
+    // Phase 3: carry the retained data candidate to the router. The emitted
+    // formula is still a placeholder, so routing must not turn it into proof.
+    let candidates = detect_potential_races(detector.accesses());
+    let data_pair = candidates
+        .iter()
+        .position(|pair| (pair.first, pair.second) == (write_data, read_data))
+        .expect("the claimed sync path cannot erase the data candidate");
+    let race_vcs = generate_race_vcs(&candidates, "producer_consumer", detector.accesses());
+    assert_eq!(race_vcs.len(), candidates.len());
     let router = trust_router::Router::new();
-    let results = router.verify_all(&vcs);
-    assert!(results.is_empty(), "no VCs means no verification results");
+    let results = router.verify_all(&race_vcs);
+    assert_eq!(results.len(), race_vcs.len());
+    assert!(matches!(&results[data_pair].0.kind, VcKind::UnsupportedMir { .. }));
+    assert!(
+        matches!(&results[data_pair].1, trust_types::VerificationResult::Unknown { .. }),
+        "an unmodeled data-race candidate must be Unknown"
+    );
+}
+
+#[test]
+fn test_send_sync_forged_labels_candidate_reaches_router_without_proof() {
+    let accesses = [
+        DiagnosticSharedAccess {
+            location: "left".into(),
+            thread: "worker".into(),
+            is_write: true,
+            span: SourceSpan::default(),
+        },
+        DiagnosticSharedAccess {
+            location: "right".into(),
+            thread: "worker".into(),
+            is_write: false,
+            span: SourceSpan::default(),
+        },
+    ];
+    let mutex_events = [
+        DiagnosticMutexEvent {
+            mutex_id: "left".into(),
+            thread: "worker".into(),
+            is_acquire: true,
+            span: SourceSpan::default(),
+        },
+        DiagnosticMutexEvent {
+            mutex_id: "left".into(),
+            thread: "worker".into(),
+            is_acquire: false,
+            span: SourceSpan::default(),
+        },
+    ];
+
+    let vcs = generate_thread_safety_vcs("f", &accesses, &mutex_events, &[]);
+    assert_eq!(vcs.len(), 1, "forged labels and lock claims cannot hide the candidate");
+    let results = trust_router::Router::new().verify_all(&vcs);
+    assert_eq!(results.len(), 1);
+    assert!(
+        matches!(&results[0].1, trust_types::VerificationResult::Unknown { .. }),
+        "an unmodeled send_sync race candidate must be Unknown"
+    );
 }
 
 /// End-to-end pipeline with a buggy scenario that produces VCs routed to the solver.
@@ -496,7 +548,7 @@ fn test_happens_before_graph_release_acquire_sync() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Pipeline integration: DataRace VCs through Router -> Report
+// 7. Pipeline integration: unsupported race candidate through Router -> Report
 // ---------------------------------------------------------------------------
 
 /// Helper to construct a VC with a given kind and function name.
@@ -511,53 +563,60 @@ fn make_concurrency_vc(kind: VcKind, function: &str) -> trust_types::Verificatio
     }
 }
 
-/// Routes a hand-constructed DataRace VC through the Router and verifies:
-/// - Router produces a verification result
-/// - The report contains the correct VcKind description
-/// - proof_level is L0Safety
+/// Routes a generated potential-race candidate through every public Router
+/// entrypoint and checks that the report retains an Unknown L0 row.
 #[test]
-fn test_data_race_vc_pipeline_through_router_and_report() {
+fn test_data_race_candidate_is_unknown_through_router_and_report() {
     use trust_types::ProofLevel;
 
-    let vc = make_concurrency_vc(
-        VcKind::DataRace {
-            variable: "shared_counter".to_string(),
-            thread_a: "writer".to_string(),
-            thread_b: "reader".to_string(),
+    let accesses = [
+        SharedAccess {
+            variable: "shared_counter".into(),
+            access_kind: AccessKind::Write,
+            thread_id: "writer".into(),
+            happens_before: vec![],
+            span: SourceSpan::default(),
         },
-        "concurrent_counter",
-    );
+        SharedAccess {
+            variable: "shared_counter".into(),
+            access_kind: AccessKind::Read,
+            thread_id: "reader".into(),
+            happens_before: vec![],
+            span: SourceSpan::default(),
+        },
+    ];
+    let races = detect_potential_races(&accesses);
+    let vcs = generate_race_vcs(&races, "concurrent_counter", &accesses);
+    assert_eq!(vcs.len(), 1);
+    let vc = &vcs[0];
 
-    // Verify proof level classification
-    assert_eq!(vc.kind.proof_level(), ProofLevel::L0Safety, "DataRace should be L0 Safety");
+    assert_eq!(vc.kind.proof_level(), ProofLevel::L0Safety);
+    assert!(matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. } if kind == "DataRaceCandidate"));
 
-    // Verify description content
     let desc = vc.kind.description();
     assert!(desc.contains("shared_counter"), "description should mention the variable: {desc}");
     assert!(desc.contains("writer"), "description should mention thread_a: {desc}");
     assert!(desc.contains("reader"), "description should mention thread_b: {desc}");
 
-    // Route through Router (ConstantFolderBackend)
     let router = trust_router::Router::new();
-    let result = router.verify_one(&vc);
-    // ConstantFolderBackend proves trivially false formulas
-    assert!(result.is_proved(), "ConstantFolderBackend should prove trivially false formula");
+    assert!(router.backend_plan(vc).is_empty());
+    assert!(matches!(router.verify_one(vc), trust_types::VerificationResult::Unknown { .. }));
+    let results = router.verify_all(&vcs);
+    assert!(matches!(&results[0].1, trust_types::VerificationResult::Unknown { .. }));
 
-    // Build report and verify structure
-    let results = vec![(vc.clone(), result)];
     let report = trust_report::build_json_report("concurrency_crate", &results);
 
     assert_eq!(report.summary.functions_analyzed, 1);
     assert_eq!(report.summary.total_obligations, 1);
+    assert_eq!(report.summary.total_unknown, 1);
     assert_eq!(report.functions[0].function, "concurrent_counter");
 
-    // Obligation description should contain the DataRace details
     let ob = &report.functions[0].obligations[0];
     assert!(
         ob.description.contains("shared_counter"),
-        "report obligation should describe the data race variable"
+        "report obligation should describe the candidate's location label"
     );
-    assert_eq!(ob.proof_level, ProofLevel::L0Safety, "report obligation should be L0 Safety");
+    assert_eq!(ob.proof_level, ProofLevel::L0Safety);
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +624,10 @@ fn test_data_race_vc_pipeline_through_router_and_report() {
 // ---------------------------------------------------------------------------
 
 /// Routes a hand-constructed InsufficientOrdering VC through the Router and verifies:
-/// - Router produces a verification result
+/// - the Router refuses it as `Unknown` (v6/D2) even though its hardcoded
+///   `false` formula is trivially "provable": before the 2026-09-30 gate the
+///   constant folder minted `Proved` here, a green verdict about a cross-thread
+///   ordering claim that no memory model backed
 /// - The report contains the correct VcKind description
 /// - proof_level is L1Functional
 #[test]
@@ -594,10 +656,14 @@ fn test_insufficient_ordering_vc_pipeline_through_router_and_report() {
     assert!(desc.contains("Relaxed"), "description should mention actual ordering: {desc}");
     assert!(desc.contains("Acquire"), "description should mention required ordering: {desc}");
 
-    // Route through Router (ConstantFolderBackend)
+    // Route through Router (ConstantFolderBackend): refused before dispatch.
     let router = trust_router::Router::new();
     let result = router.verify_one(&vc);
-    assert!(result.is_proved(), "ConstantFolderBackend should prove trivially false formula");
+    assert!(
+        matches!(&result, trust_types::VerificationResult::Unknown { reason, .. }
+            if reason.contains("memory-ordering VC unsupported")),
+        "an ordering VC without a memory model must fail closed, got {result:?}"
+    );
 
     // Build report and verify structure
     let results = vec![(vc.clone(), result)];
@@ -622,23 +688,34 @@ fn test_insufficient_ordering_vc_pipeline_through_router_and_report() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Proof level filtering: L0 includes DataRace, excludes InsufficientOrdering
+// 9. Proof level filtering: L0 includes race candidate, excludes InsufficientOrdering
 // ---------------------------------------------------------------------------
 
-/// Constructs both concurrency VcKinds, filters at L0Safety, and verifies
-/// that DataRace (L0) is retained while InsufficientOrdering (L1) is excluded.
+/// Filters a generated unsupported race candidate and a separate ordering VC.
 #[test]
 fn test_proof_level_filtering_concurrency_vcs() {
     use trust_types::ProofLevel;
 
-    let data_race_vc = make_concurrency_vc(
-        VcKind::DataRace {
-            variable: "buf".to_string(),
-            thread_a: "t1".to_string(),
-            thread_b: "t2".to_string(),
+    let accesses = [
+        SharedAccess {
+            variable: "buf".into(),
+            access_kind: AccessKind::Write,
+            thread_id: "t1".into(),
+            happens_before: vec![],
+            span: SourceSpan::default(),
         },
-        "race_fn",
-    );
+        SharedAccess {
+            variable: "buf".into(),
+            access_kind: AccessKind::Read,
+            thread_id: "t2".into(),
+            happens_before: vec![],
+            span: SourceSpan::default(),
+        },
+    ];
+    let data_race_vc = generate_race_vcs(&detect_potential_races(&accesses), "race_fn", &accesses)
+        .into_iter()
+        .next()
+        .expect("the conflicting pair must yield a candidate");
 
     let ordering_vc = make_concurrency_vc(
         VcKind::InsufficientOrdering {
@@ -654,10 +731,10 @@ fn test_proof_level_filtering_concurrency_vcs() {
 
     // Filter to L0 Safety only
     let l0_vcs = trust_vcgen::filter_vcs_by_level(all_vcs.clone(), ProofLevel::L0Safety);
-    assert_eq!(l0_vcs.len(), 1, "L0 filter should keep only DataRace (1 VC)");
+    assert_eq!(l0_vcs.len(), 1, "L0 filter should keep the race candidate");
     assert!(
-        matches!(l0_vcs[0].kind, VcKind::DataRace { .. }),
-        "the retained VC should be DataRace"
+        matches!(l0_vcs[0].kind, VcKind::UnsupportedMir { .. }),
+        "the retained VC should be an unsupported race candidate"
     );
     assert_eq!(l0_vcs[0].kind.proof_level(), ProofLevel::L0Safety);
 

@@ -1,0 +1,136 @@
+{
+  "name": "fake_sid",
+  "def_path": "scalar::fake_sid",
+  "span": {
+    "file": "scalar.rs",
+    "line_start": 49,
+    "col_start": 0,
+    "line_end": 52,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "p"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "__trust_crate@db723a03577d5c29::libc::{extern#0}::session_of",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "scalar.rs",
+              "line_start": 51,
+              "col_start": 13,
+              "line_end": 51,
+              "col_end": 36
+            },
+            "atomic": null,
+            "is_foreign": true,
+            "is_unsafe_sig": true,
+            "callee_identity": {
+              "stable_crate_id": 15812765027678379049,
+              "def_index": 5,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": true,
+              "stable_crate_id": 15812765027678379049,
+              "krate_name": "libc",
+              "foreign_block_leaf": "session_of",
+              "upstream_foreign_link_symbol": "getsid"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "p",
+                "Int"
+              ]
+            },
+            {
+              "Int": -2147483648
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "p",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2147483647
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

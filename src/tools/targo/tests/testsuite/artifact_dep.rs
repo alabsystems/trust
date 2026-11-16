@@ -35,7 +35,8 @@ fn check_with_invalid_artifact_dependency() {
         .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
         .file("bar/src/lib.rs", "")
         .build();
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
 [ERROR] failed to parse manifest at `[ROOT]/foo/Cargo.toml`
@@ -53,7 +54,8 @@ Caused by:
         assert: &dyn Fn(&mut cargo_test_support::Execs),
     ) {
         assert(
-            p.cargo(&format!("{} -Z bindeps", cmd))
+            p.cargo(cmd)
+                .arg("-Zbindeps")
                 .masquerade_as_nightly_cargo(&["bindeps"]),
         );
         assert(&mut p.cargo(cmd));
@@ -125,7 +127,7 @@ Caused by:
 }
 
 #[cargo_test]
-fn check_with_invalid_target_triple() {
+fn check_with_invalid_target_tuple() {
     // invalid name
     let p = project()
         .file(
@@ -146,7 +148,8 @@ fn check_with_invalid_target_triple() {
         .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
         .file("bar/src/main.rs", "fn main() {}")
         .build();
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
 [ERROR] failed to run `rustc` to learn about target-specific information
@@ -217,11 +220,12 @@ fn disallow_artifact_and_no_artifact_dep_to_same_package_within_the_same_dep_cat
         .file("bar/Cargo.toml", &basic_bin_manifest("bar"))
         .file("bar/src/main.rs", "fn main() {}")
         .build();
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_status(101)
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [WARNING] foo v0.0.0 ([ROOT]/foo) ignoring invalid dependency `bar_stable` which is missing a lib target
 [ERROR] the crate `foo v0.0.0 ([ROOT]/foo)` depends on crate `bar v0.5.0 ([ROOT]/foo/bar)` multiple times with different names
 
@@ -328,10 +332,11 @@ fn features_are_unified_among_lib_and_bin_dep_of_same_target() {
         )
         .build();
 
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [COMPILING] d2 v0.0.1 ([ROOT]/foo/d2)
 [COMPILING] d1 v0.0.1 ([ROOT]/foo/d1)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
@@ -438,11 +443,12 @@ fn features_are_not_unified_among_lib_and_bin_dep_of_different_target() {
         )
         .build();
 
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_status(101)
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [COMPILING] d2 v0.0.1 ([ROOT]/foo/d2)
 [COMPILING] d1 v0.0.1 ([ROOT]/foo/d1)
 error[E0425]: cannot find function `f2` in crate `d2`
@@ -532,7 +538,8 @@ fn feature_resolution_works_for_cfg_target_specification() {
         .file("d2/src/lib.rs", "pub fn f() {}")
         .build();
 
-    p.cargo("test -Z bindeps")
+    p.cargo("test")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .run();
 }
@@ -600,11 +607,12 @@ fn build_script_with_bin_artifacts() {
         .file("bar/src/bin/baz.rs", "fn main() {}")
         .file("bar/src/lib.rs", "")
         .build();
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(
             str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
@@ -620,12 +628,12 @@ fn build_script_with_bin_artifacts() {
         assert_e2e().eq(
             &build_script_output,
             str![[r#"
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/bin/baz[EXE]
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/staticlib/bar-[HASH].lib
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/cdylib/bar.dll
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/bin
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/bin/bar[EXE]
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/bin/bar[EXE]
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/bin/baz[EXE]
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/staticlib/bar-[HASH].lib
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/cdylib/bar.dll
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/bin
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/bin/bar[EXE]
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/bin/bar[EXE]
 
 "#]],
         );
@@ -633,12 +641,12 @@ fn build_script_with_bin_artifacts() {
         assert_e2e().eq(
             &build_script_output,
             str![[r#"
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/bin/baz-[HASH][EXE]
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/staticlib/libbar-[HASH].a
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/cdylib/[..]bar.[..]
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/bin
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/bin/bar-[HASH][EXE]
-[ROOT]/foo/target/debug/deps/artifact/bar-[HASH]/bin/bar-[HASH][EXE]
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/bin/baz[EXE]
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/staticlib/libbar-[HASH].a
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/cdylib/[..]bar.[..]
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/bin
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/bin/bar[EXE]
+[ROOT]/foo/target/debug/build/bar/[HASH]/artifact/bin/bar[EXE]
 
 "#]],
         );
@@ -690,7 +698,8 @@ fn build_script_with_bin_artifact_and_lib_false() {
         )
         .build();
 
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_status(101)
         .with_stderr_does_not_contain("[..]sentinel[..]")
@@ -733,7 +742,8 @@ fn lib_with_bin_artifact_and_lib_false() {
         )
         .build();
 
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_status(101)
         .with_stderr_does_not_contain("[..]sentinel[..]")
@@ -793,10 +803,11 @@ fn build_script_with_selected_dashed_bin_artifact_and_lib_true() {
             }
         "#)
         .build();
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar-baz v0.5.0 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -810,8 +821,8 @@ fn build_script_with_selected_dashed_bin_artifact_and_lib_true() {
         assert_e2e().eq(
             &build_script_output,
             str![[r#"
-[ROOT]/foo/target/debug/deps/artifact/bar-baz-[HASH]/bin
-[ROOT]/foo/target/debug/deps/artifact/bar-baz-[HASH]/bin/baz_suffix[EXE]
+[ROOT]/foo/target/debug/build/bar-baz/[HASH]/artifact/bin
+[ROOT]/foo/target/debug/build/bar-baz/[HASH]/artifact/bin/baz_suffix[EXE]
 
 "#]],
         );
@@ -819,8 +830,8 @@ fn build_script_with_selected_dashed_bin_artifact_and_lib_true() {
         assert_e2e().eq(
             &build_script_output,
             str![[r#"
-[ROOT]/foo/target/debug/deps/artifact/bar-baz-[HASH]/bin
-[ROOT]/foo/target/debug/deps/artifact/bar-baz-[HASH]/bin/baz_suffix-[HASH][EXE]
+[ROOT]/foo/target/debug/build/bar-baz/[HASH]/artifact/bin
+[ROOT]/foo/target/debug/build/bar-baz/[HASH]/artifact/bin/baz_suffix[EXE]
 
 "#]],
         );
@@ -830,7 +841,7 @@ fn build_script_with_selected_dashed_bin_artifact_and_lib_true() {
         !p.bin("bar").is_file(),
         "artifacts are located in their own directory, exclusively, and won't be lifted up"
     );
-    assert_artifact_executable_output(&p, "debug", "bar", "baz_suffix");
+    assert_artifact_executable_output(&p, "debug", "bar-baz", "baz_suffix");
 }
 
 #[cargo_test]
@@ -885,10 +896,11 @@ fn lib_with_selected_dashed_bin_artifact_and_lib_true() {
         .file("bar/src/main.rs", "fn main() {}")
         .file("bar/src/lib.rs", "pub fn exists() {}")
         .build();
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar-baz v0.5.0 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -900,7 +912,7 @@ fn lib_with_selected_dashed_bin_artifact_and_lib_true() {
         !p.bin("bar").is_file(),
         "artifacts are located in their own directory, exclusively, and won't be lifted up"
     );
-    assert_artifact_executable_output(&p, "debug", "bar", "baz_suffix");
+    assert_artifact_executable_output(&p, "debug", "bar-baz", "baz_suffix");
 }
 
 #[cargo_test]
@@ -936,14 +948,15 @@ fn allow_artifact_and_no_artifact_dep_to_same_package_within_different_dep_categ
         .file("bar/src/main.rs", "fn main() {}")
         .file("bar/src/lib.rs", "")
         .build();
-    p.cargo("test -Z bindeps")
+    p.cargo("test")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/lib.rs (target/debug/deps/foo-[HASH][EXE])
+[RUNNING] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 [DOCTEST] foo
 
 "#]])
@@ -983,7 +996,8 @@ fn normal_build_deps_are_picked_up_in_presence_of_an_artifact_build_dep_to_the_s
         .file("bar/src/main.rs", "fn main() {}")
         .file("bar/src/lib.rs", "pub fn f() {}")
         .build();
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .run();
 }
@@ -1010,11 +1024,12 @@ fn disallow_using_example_binaries_as_artifacts() {
         .file("bar/src/main.rs", "fn main() {}")
         .file("bar/examples/one-example.rs", "fn main() {}")
         .build();
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_status(101)
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] dependency `bar` in package `foo` requires a `bin:one-example` artifact to be present.
 
 "#]])
@@ -1064,10 +1079,11 @@ fn allow_artifact_and_non_artifact_dependency_to_same_crate() {
             .file("bar/src/lib.rs", "pub fn doit() {}")
         .build();
 
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1114,7 +1130,8 @@ fn build_script_deps_adopt_specified_target_unconditionally() {
         .file("bar/src/lib.rs", "pub fn doit() {}")
         .build();
 
-    p.cargo("check -v -Z bindeps")
+    p.cargo("check -v")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_does_not_contain(
             "[RUNNING] `rustc --crate-name build_script_build --edition=2015 build.rs [..]--target [ALT_TARGET] [..]",
@@ -1182,11 +1199,12 @@ fn build_script_deps_adopt_do_not_allow_multiple_targets_under_different_name_an
         .file("bar/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -v -Z bindeps")
+    p.cargo("check -v")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_status(101)
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] the crate `foo v0.0.0 ([ROOT]/foo)` depends on crate `bar v0.5.0 ([ROOT]/foo/bar)` multiple times with different names
 
 "#]])
@@ -1229,7 +1247,8 @@ fn non_build_script_deps_adopt_specified_target_unconditionally() {
         .file("bar/src/lib.rs", "pub fn doit() {}")
         .build();
 
-    p.cargo("check -v -Z bindeps")
+    p.cargo("check -v")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_contains(
             "[RUNNING] `rustc --crate-name bar --edition=2015 bar/src/lib.rs [..]--target [ALT_TARGET] [..]",
@@ -1284,15 +1303,16 @@ fn cross_doctests_works_with_artifacts() {
         .build();
 
     let target = rustc_host();
-    p.cargo("test -Z bindeps --target")
+    p.cargo("test --target")
         .arg(&target)
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/lib.rs (target/[HOST_TARGET]/debug/deps/foo-[HASH][EXE])
+[RUNNING] unittests src/lib.rs (target/[HOST_TARGET]/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 [DOCTEST] foo
 
 "#]])
@@ -1305,8 +1325,9 @@ fn cross_doctests_works_with_artifacts() {
         return;
     }
 
-    p.cargo("test -Z bindeps -v --target")
+    p.cargo("test -v --target")
         .arg(&target)
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
@@ -1316,7 +1337,7 @@ fn cross_doctests_works_with_artifacts() {
 [RUNNING] `rustc --crate-name foo [..]
 [RUNNING] `rustc --crate-name foo [..]
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] `[ROOT]/foo/target/[ALT_TARGET]/debug/deps/foo-[HASH][EXE]`
+[RUNNING] `[ROOT]/foo/target/[ALT_TARGET]/debug/build/foo/[HASH]/out/foo-[HASH][EXE]`
 [DOCTEST] foo
 [RUNNING] `rustdoc [..]--test src/lib.rs --test-run-directory [ROOT]/foo --target [ALT_TARGET] [..]
 
@@ -1357,8 +1378,9 @@ fn build_script_deps_adopts_target_platform_if_target_equals_target() {
         .build();
 
     let alternate_target = cross_compile::alternate();
-    p.cargo("check -v -Z bindeps --target")
+    p.cargo("check -v --target")
         .arg(alternate_target)
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_does_not_contain(
             "[RUNNING] `rustc --crate-name build_script_build --edition=2015 build.rs [..]--target [ALT_TARGET] [..]",
@@ -1410,11 +1432,12 @@ fn profile_override_basic() {
         .file("bar/src/lib.rs", "pub fn bar() {}")
         .build();
 
-    p.cargo("build -v -Z bindeps")
+    p.cargo("build -v")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(
             str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [RUNNING] `rustc --crate-name build_script_build [..] -C opt-level=1 [..]`
 [RUNNING] `rustc --crate-name bar --edition=2015 bar/src/main.rs [..] -C opt-level=3 [..]`
@@ -1422,7 +1445,7 @@ fn profile_override_basic() {
 [RUNNING] `rustc --crate-name bar --edition=2015 bar/src/lib.rs [..] -C opt-level=1 [..]`
 [RUNNING] `rustc --crate-name bar --edition=2015 bar/src/lib.rs [..] -C opt-level=3 [..]`
 [RUNNING] `rustc --crate-name foo [..] -C opt-level=3 [..]`
-[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
+[RUNNING] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/build_script_build`
 [FINISHED] `dev` profile [optimized + debuginfo] target(s) in [ELAPSED]s
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 
@@ -1478,12 +1501,14 @@ fn dependencies_of_dependencies_work_in_artifacts() {
         .file("bar/src/lib.rs", r#"pub fn bar() {baz::baz()}"#)
         .file("bar/src/main.rs", r#"fn main() {bar::bar()}"#)
         .build();
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .run();
 
     // cargo tree sees artifacts as the dependency kind they are in and doesn't do anything special with it.
-    p.cargo("tree -Z bindeps")
+    p.cargo("tree")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stdout_data(str![[r#"
 foo v0.0.0 ([ROOT]/foo)
@@ -1523,10 +1548,11 @@ fn artifact_dep_target_specified() {
         .file("bindep/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bindep v0.0.0 ([ROOT]/foo/bindep)
 [CHECKING] foo v0.0.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1535,7 +1561,8 @@ fn artifact_dep_target_specified() {
         .with_status(0)
         .run();
 
-    p.cargo("tree -Z bindeps")
+    p.cargo("tree")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stdout_data(str![[r#"
 foo v0.0.0 ([ROOT]/foo)
@@ -1600,10 +1627,11 @@ fn dep_of_artifact_dep_same_target_specified() {
         .file("baz/src/lib.rs", "")
         .build();
 
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [COMPILING] baz v0.1.0 ([ROOT]/foo/baz)
 [COMPILING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
@@ -1613,7 +1641,8 @@ fn dep_of_artifact_dep_same_target_specified() {
         .with_status(0)
         .run();
 
-    p.cargo("tree -Z bindeps")
+    p.cargo("tree")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stdout_data(
             r#"...
@@ -1667,7 +1696,8 @@ fn targets_are_picked_up_from_non_workspace_artifact_deps() {
         )
         .build();
 
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .run();
 }
@@ -1718,11 +1748,12 @@ foo v0.1.0 ([ROOT]/foo)
         .run();
 
     // And with -Zbindeps it can use 1.0.1.
-    p.cargo("update -Zbindeps")
+    p.cargo("update")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [ADDING] artifact v1.0.0
 [UPDATING] bar v1.0.0 -> v1.0.1
 
@@ -1791,12 +1822,13 @@ fn proc_macro_in_artifact_dep() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
 ...
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 ...
 [ERROR] failed to download from `[ROOTURL]/dl/pm/1.0.0/download`
@@ -1844,12 +1876,13 @@ fn allow_dep_renames_with_multiple_versions() {
         .file("bar/Cargo.toml", &basic_bin_manifest("bar"))
         .file("bar/src/main.rs", r#"fn main() {println!("0.5.0")}"#)
         .build();
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
 [COMPILING] bar v1.0.0
@@ -1908,10 +1941,11 @@ fn allow_artifact_and_non_artifact_dependency_to_same_crate_if_these_are_not_the
         .file("bar/src/lib.rs", "pub fn doit() {}")
         .file("bar/src/main.rs", "fn main() {}")
         .build();
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1944,10 +1978,11 @@ fn prevent_no_lib_warning_with_artifact_dependencies() {
         .file("bar/Cargo.toml", &basic_bin_manifest("bar"))
         .file("bar/src/main.rs", "fn main() {}")
         .build();
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1974,6 +2009,9 @@ fn show_no_lib_warning_with_artifact_dependencies_that_have_no_lib_but_lib_true(
 
                 [dependencies]
                 bar = { path = "bar/", artifact = "bin", lib = true }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1981,10 +2019,11 @@ fn show_no_lib_warning_with_artifact_dependencies_that_have_no_lib_but_lib_true(
         .file("bar/Cargo.toml", &basic_bin_manifest("bar"))
         .file("bar/src/main.rs", "fn main() {}")
         .build();
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [WARNING] foo v0.0.0 ([ROOT]/foo) ignoring invalid dependency `bar` which is missing a lib target
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.0.0 ([ROOT]/foo)
@@ -2019,7 +2058,8 @@ fn resolver_2_build_dep_without_lib() {
         .file("bar/Cargo.toml", &basic_bin_manifest("bar"))
         .file("bar/src/main.rs", "fn main() {}")
         .build();
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .run();
 }
@@ -2048,11 +2088,12 @@ fn check_missing_crate_type_in_package_fails() {
             .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1")) //no bin, just rlib
             .file("bar/src/lib.rs", "")
             .build();
-        p.cargo("check -Z bindeps")
+        p.cargo("check")
+            .arg("-Zbindeps")
             .masquerade_as_nightly_cargo(&["bindeps"])
             .with_status(101)
             .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] dependency `bar` in package `foo` requires a [..] artifact to be present.
 
 "#]])
@@ -2081,7 +2122,8 @@ fn check_target_equals_target_in_non_build_dependency_errors() {
         .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
         .file("bar/src/main.rs", "fn main() {}")
         .build();
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_status(101)
         .with_stderr_data(str![[r#"
@@ -2200,15 +2242,16 @@ fn env_vars_and_build_products_for_various_build_targets() {
         .file("bar/src/lib.rs", r#"pub extern "C" fn c() {}"#)
         .file("bar/src/main.rs", "fn main() {}")
         .build();
-    p.cargo("test -Z bindeps")
+    p.cargo("test")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/lib.rs (target/debug/deps/foo-[HASH][EXE])
-[RUNNING] tests/main.rs (target/debug/deps/main-[HASH][EXE])
+[RUNNING] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[RUNNING] tests/main.rs (target/debug/build/foo/[HASH]/out/main-[HASH][EXE])
 [DOCTEST] foo
 
 "#]])
@@ -2248,8 +2291,9 @@ fn publish_artifact_dep() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("publish -Z bindeps --no-verify")
+    p.cargo("publish --no-verify")
         .replace_crates_io(registry.index_url())
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
@@ -2397,10 +2441,11 @@ fn doc_lib_true() {
         .file("bar/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("doc -Z bindeps")
+    p.cargo("doc")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
 [DOCUMENTING] bar v0.0.1 ([ROOT]/foo/bar)
 [DOCUMENTING] foo v0.0.1 ([ROOT]/foo)
@@ -2416,9 +2461,14 @@ fn doc_lib_true() {
 
     // Verify that it emits rmeta for the bin and lib dependency.
     assert_eq!(p.glob("target/debug/artifact/*.rlib").count(), 0);
-    assert_eq!(p.glob("target/debug/deps/libbar-*.rmeta").count(), 2);
+    assert_eq!(
+        p.glob("target/debug/build/bar/*/out/libbar-*.rmeta")
+            .count(),
+        2
+    );
 
-    p.cargo("doc -Z bindeps")
+    p.cargo("doc")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -2479,10 +2529,11 @@ fn rustdoc_works_on_libs_with_artifacts_and_lib_false() {
         .file("bar/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("doc -Z bindeps")
+    p.cargo("doc")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [DOCUMENTING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -2508,7 +2559,7 @@ fn assert_artifact_executable_output(
     if cfg!(target_env = "msvc") {
         assert_eq!(
             p.glob(format!(
-                "target/{}/deps/artifact/{}-*/bin/{}{}",
+                "target/{}/build/{}/*/artifact/bin/{}{}",
                 target_name,
                 dep_name,
                 bin_name,
@@ -2521,7 +2572,7 @@ fn assert_artifact_executable_output(
     } else {
         assert_eq!(
             p.glob(format!(
-                "target/{}/deps/artifact/{}-*/bin/{}-*{}",
+                "target/{}/build/{}/*/artifact/bin/{}{}",
                 target_name,
                 dep_name,
                 bin_name,
@@ -2538,7 +2589,7 @@ fn assert_artifact_executable_output(
 
 fn build_script_output_string(p: &Project, package_name: &str) -> String {
     let paths = p
-        .glob(format!("target/debug/build/{}-*/output", package_name))
+        .glob(format!("target/debug/build/{}/*/run/stdout", package_name))
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(paths.len(), 1);
@@ -2653,7 +2704,8 @@ fn build_script_features_for_shared_dependency() {
         )
         .build();
 
-    p.cargo("build -Z bindeps -v")
+    p.cargo("build -v")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .run();
 }
@@ -2686,10 +2738,11 @@ fn calc_bin_artifact_fingerprint() {
         .file("bar/Cargo.toml", &basic_bin_manifest("bar"))
         .file("bar/src/main.rs", r#"fn main() { println!("foo") }"#)
         .build();
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -2699,7 +2752,8 @@ fn calc_bin_artifact_fingerprint() {
 
     p.change_file("bar/src/main.rs", r#"fn main() { println!("bar") }"#);
     // Change in artifact bin dep `bar` propagates to `foo`, triggering recompile.
-    p.cargo("check -v -Z bindeps")
+    p.cargo("check -v")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
 [DIRTY] bar v0.5.0 ([ROOT]/foo/bar): the file `bar/src/main.rs` has changed ([..])
@@ -2714,7 +2768,8 @@ fn calc_bin_artifact_fingerprint() {
         .run();
 
     // All units are fresh. No recompile.
-    p.cargo("check -v -Z bindeps")
+    p.cargo("check -v")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
 [FRESH] bar v0.5.0 ([ROOT]/foo/bar)
@@ -2765,10 +2820,11 @@ fn with_target_and_optional() {
         .file("d1/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Z bindeps -F d1 -v")
+    p.cargo("check -F d1 -v")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] d1 v0.0.1 ([ROOT]/foo/d1)
 [RUNNING] `rustc --crate-name d1 [..]--crate-type bin[..]
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -2814,15 +2870,16 @@ fn with_assumed_host_target_and_optional_build_dep() {
         .file("d1/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Z bindeps -F d1 -v")
+    p.cargo("check -F d1 -v")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(
             str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] d1 v0.0.1 ([ROOT]/foo/d1)
 [RUNNING] `rustc --crate-name build_script_build --edition=2021 [..]--crate-type bin[..]
 [RUNNING] `rustc --crate-name d1 --edition=2021 [..]--crate-type bin[..]
-[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
+[RUNNING] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/build_script_build`
 [RUNNING] `rustc --crate-name foo --edition=2021 [..]--cfg[..]d1[..]
 [FINISHED] `dev` profile [..]
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
@@ -2850,6 +2907,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep() {
                 [dependencies]
                 a = {{ path = "a" }}
                 bar = {{ path = "bar", artifact = "bin", target = "{target}" }}
+
+                [lints.cargo]
+                default = "allow"
             "#
             ),
         )
@@ -2869,6 +2929,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep() {
 
                 [dependencies]
                 a = { path = "../a", features = ["feature"] }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -2891,6 +2954,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep() {
 
                 [features]
                 feature = ["c/feature"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -2913,6 +2979,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep() {
 
                 [dependencies]
                 c = { path = "../c" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -2935,6 +3004,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep() {
 
                 [features]
                 feature = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -2944,10 +3016,11 @@ fn decouple_same_target_transitive_dep_from_artifact_dep() {
             "#,
         )
         .build();
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 4 packages to latest compatible versions
+[LOCKING] 4 packages to highest compatible versions
 [COMPILING] c v0.1.0 ([ROOT]/foo/c)
 [COMPILING] b v0.1.0 ([ROOT]/foo/b)
 [COMPILING] a v0.1.0 ([ROOT]/foo/a)
@@ -2977,6 +3050,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_lib() {
                 a = {{ path = "a" }}
                 b = {{ path = "b", features = ["feature"] }}
                 bar = {{ path = "bar", artifact = "bin", lib = true, target = "{target}" }}
+
+                [lints.cargo]
+                default = "allow"
             "#
             ),
         )
@@ -2992,6 +3068,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_lib() {
                 [dependencies]
                 a = { path = "../a", features = ["b"] }
                 b = { path = "../b" }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/lib.rs", "")
@@ -3015,6 +3094,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_lib() {
 
                 [dependencies]
                 b = { path = "../b", optional = true }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -3036,6 +3118,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_lib() {
 
                 [features]
                 feature = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -3047,10 +3132,11 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_lib() {
             "#,
         )
         .build();
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [COMPILING] b v0.1.0 ([ROOT]/foo/b)
 [COMPILING] a v0.1.0 ([ROOT]/foo/a)
 [COMPILING] bar v0.1.0 ([ROOT]/foo/bar)
@@ -3077,6 +3163,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_and_proc_macro() {
                 [dependencies]
                 c = {{ path = "c" }}
                 bar = {{ path = "bar", artifact = "bin", target = "{target}" }}
+
+                [lints.cargo]
+                default = "allow"
             "#
             ),
         )
@@ -3091,6 +3180,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_and_proc_macro() {
 
             [dependencies]
             b = { path = "../b" }
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("bar/src/main.rs", "fn main() {}")
@@ -3107,6 +3199,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_and_proc_macro() {
 
             [lib]
             proc-macro = true
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("b/src/lib.rs", "")
@@ -3124,6 +3219,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_and_proc_macro() {
 
             [lib]
             proc-macro = true
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file(
@@ -3146,6 +3244,9 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_and_proc_macro() {
 
             [dependencies]
             d = { path = "../d" }
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file(
@@ -3168,16 +3269,20 @@ fn decouple_same_target_transitive_dep_from_artifact_dep_and_proc_macro() {
 
             [features]
             feature = []
+
+            [lints.cargo]
+            default = "allow"
             "#,
         )
         .file("d/src/lib.rs", "pub struct D;")
         .build();
 
-    p.cargo("build -Z bindeps")
+    p.cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(
             str![[r#"
-[LOCKING] 5 packages to latest compatible versions
+[LOCKING] 5 packages to highest compatible versions
 [COMPILING] d v0.1.0 ([ROOT]/foo/d)
 [COMPILING] a v0.1.0 ([ROOT]/foo/a)
 [COMPILING] b v0.1.0 ([ROOT]/foo/b)
@@ -3241,10 +3346,11 @@ fn same_target_artifact_dep_sharing() {
         )
         .file("a/src/lib.rs", "")
         .build();
-    p.cargo(&format!("build -Z bindeps --target {target}"))
+    p.cargo(&format!("build --target {target}"))
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [COMPILING] a v0.1.0 ([ROOT]/foo/a)
 [COMPILING] bar v0.1.0 ([ROOT]/foo/bar)
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
@@ -3297,10 +3403,11 @@ fn check_transitive_artifact_dependency_with_different_target() {
         .file("bar/baz/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [ERROR] failed to determine target information for target `custom-target`.
   Artifact dependency `baz` in package `bar v0.0.0 ([ROOT]/foo/bar)` requires building for `custom-target`
 
@@ -3375,7 +3482,8 @@ fn transitive_artifact_dep_with_target_and_platform_specific_dep() {
         .file("bar/baz/qux/src/lib.rs", "")
         .build();
 
-    p.cargo("tree -Z bindeps")
+    p.cargo("tree")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_stdout_data(str![[r#"
 foo v0.0.0 ([ROOT]/foo)
@@ -3461,7 +3569,8 @@ fn transitive_build_script_artifact_dep_with_target() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("check -Z bindeps")
+    p.cargo("check")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .with_status(0)
         .run();
@@ -3514,7 +3623,8 @@ fn build_only_specified_artifact_library() {
 
     let cdylib = create_project("cdylib");
     cdylib
-        .cargo("build -Z bindeps")
+        .cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .run();
     assert_e2e().eq(
@@ -3528,7 +3638,8 @@ staticlib present: false
 
     let staticlib = create_project("staticlib");
     staticlib
-        .cargo("build -Z bindeps")
+        .cargo("build")
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .run();
     assert_e2e().eq(
@@ -3630,17 +3741,18 @@ fn artifact_dep_target_does_not_propagate_to_deps_of_build_script() {
             r#"pub fn add(a: i32, b: i32) -> i32 { a + b }"#,
         )
         .build();
-    p.cargo("test -Z bindeps")
+    p.cargo("test")
         .with_stderr_data(str![[r#"
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [COMPILING] arch v0.0.1 ([ROOT]/foo/arch)
 [COMPILING] builder v0.0.1 ([ROOT]/foo/builder)
 [COMPILING] artifact v0.0.1 ([ROOT]/foo/artifact)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/main.rs (target/debug/deps/foo-[HASH][EXE])
+[RUNNING] unittests src/main.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .run();
 }
@@ -3722,17 +3834,18 @@ fn artifact_dep_target_does_not_propagate_to_proc_macro() {
             "pub fn add(a: i32, b: i32) -> i32 { a + b }",
         )
         .build();
-    p.cargo("test -Z bindeps")
+    p.cargo("test")
         .with_stderr_data(str![[r#"
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [COMPILING] arch v0.0.1 ([ROOT]/foo/arch)
 [COMPILING] macro v0.0.1 ([ROOT]/foo/macro)
 [COMPILING] artifact v0.0.1 ([ROOT]/foo/artifact)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/main.rs (target/debug/deps/foo-[HASH][EXE])
+[RUNNING] unittests src/main.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
 
 "#]])
+        .arg("-Zbindeps")
         .masquerade_as_nightly_cargo(&["bindeps"])
         .run();
 }

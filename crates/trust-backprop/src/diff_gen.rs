@@ -402,20 +402,24 @@ fn compute_edit_script<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(EditOp, Opt
     let m = old.len();
     let n = new.len();
 
-    // LCS table (O(mn) space — acceptable for source files).
-    let mut dp = vec![vec![0u32; n + 1]; m + 1];
+    // Flat LCS table (1 allocation instead of m + 1 allocations).
+    let stride = n + 1;
+    let mut dp = vec![0u32; (m + 1) * stride];
     for i in 1..=m {
+        let prev_row = (i - 1) * stride;
+        let curr_row = i * stride;
+        let old_line = old[i - 1];
         for j in 1..=n {
-            if old[i - 1] == new[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1] + 1;
+            if old_line == new[j - 1] {
+                dp[curr_row + j] = dp[prev_row + j - 1] + 1;
             } else {
-                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+                dp[curr_row + j] = dp[prev_row + j].max(dp[curr_row + j - 1]);
             }
         }
     }
 
     // Backtrack to produce edit script.
-    let mut edits = Vec::new();
+    let mut edits = Vec::with_capacity(m + n);
     let mut i = m;
     let mut j = n;
     while i > 0 || j > 0 {
@@ -423,7 +427,7 @@ fn compute_edit_script<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(EditOp, Opt
             edits.push((EditOp::Equal, Some(old[i - 1])));
             i -= 1;
             j -= 1;
-        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+        } else if j > 0 && (i == 0 || dp[i * stride + j - 1] >= dp[(i - 1) * stride + j]) {
             edits.push((EditOp::Add, Some(new[j - 1])));
             j -= 1;
         } else {
@@ -464,8 +468,11 @@ fn group_into_hunks(
     }
 
     // Build hunks around each change region.
-    let mut hunks = Vec::new();
+    let mut hunks = Vec::with_capacity(change_starts.len());
     let _ = old_lines; // Used via edits
+    let mut line_cursor = 0usize;
+    let mut running_old_line = 1usize;
+    let mut running_new_line = 1usize;
 
     for &start in &change_starts {
         // Find the end of this change region.
@@ -515,22 +522,21 @@ fn group_into_hunks(
             )
             .collect();
 
-        // Compute line numbers.
-        let mut old_line = 1usize;
-        let mut new_line = 1usize;
-        for &(op, _) in &edits[..ctx_before_start] {
-            match op {
+        // Advance running line numbers up to `ctx_before_start` (monotonically non-decreasing).
+        while line_cursor < ctx_before_start {
+            match edits[line_cursor].0 {
                 EditOp::Equal => {
-                    old_line += 1;
-                    new_line += 1;
+                    running_old_line += 1;
+                    running_new_line += 1;
                 }
-                EditOp::Remove => old_line += 1,
-                EditOp::Add => new_line += 1,
+                EditOp::Remove => running_old_line += 1,
+                EditOp::Add => running_new_line += 1,
             }
+            line_cursor += 1;
         }
 
-        let old_start = old_line;
-        let new_start = new_line;
+        let old_start = running_old_line;
+        let new_start = running_new_line;
         let old_count = context_before.len() + removed.len() + context_after.len();
         let new_count = context_before.len() + added.len() + context_after.len();
 

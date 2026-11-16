@@ -215,8 +215,9 @@ const MIR_DISC_DEST_STABLE: &str = r#"{"name":"disc_stable","def_path":"p::disc_
 /// no capture of this shape exists; the row pins the gate's CONTRACT.
 const MIR_DISC_DEST_MERGED: &str = r#"{"name":"disc_merged","def_path":"p::disc_merged","span":{"file":"p.rs","line_start":1,"col_start":1,"line_end":1,"col_end":1},"body":{"locals":[{"index":0,"ty":{"Int":{"width":64,"signed":true}},"name":null},{"index":1,"ty":{"Adt":{"name":"f1::E","fields":[["__tag",{"Int":{"width":64,"signed":true}}]],"variants":[{"name":"A","discriminant":0,"fields":[]},{"name":"B","discriminant":1,"fields":[]}],"disc_index_safe":true,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Enum"}},"name":"e"},{"index":2,"ty":{"Int":{"width":64,"signed":true}},"name":"b"},{"index":3,"ty":{"Int":{"width":64,"signed":true}},"name":"d"}],"blocks":[{"id":0,"stmts":[{"Assign":{"place":{"local":3,"projections":[]},"rvalue":{"Discriminant":{"local":1,"projections":[]}},"span":{"file":"p.rs","line_start":1,"col_start":1,"line_end":1,"col_end":1}}},{"Assign":{"place":{"local":3,"projections":[]},"rvalue":{"Use":{"Copy":{"local":2,"projections":[]}}},"span":{"file":"p.rs","line_start":1,"col_start":1,"line_end":1,"col_end":1}}},{"Assign":{"place":{"local":0,"projections":[]},"rvalue":{"Use":{"Copy":{"local":3,"projections":[]}}},"span":{"file":"p.rs","line_start":1,"col_start":1,"line_end":1,"col_end":1}}}],"terminator":"Return"}],"arg_count":2,"return_ty":{"Int":{"width":64,"signed":true}}},"contracts":[],"preconditions":[],"postconditions":[],"spec":{"requires":[],"ensures":[],"invariants":[]}}"#;
 
-/// A REDEFINED `Discriminant` destination must lose the tag-set fact — a value it can
-/// hold has no reason to be a variant tag. The SOURCE-keyed name keeps its fact
+/// A REDEFINED `Discriminant` destination must lose the tag-set fact on every name
+/// that can denote a value it holds AFTER the read — a value it can hold has no reason
+/// to be a variant tag. Only the read's own version (`d#s0_0`) keeps it. The SOURCE-keyed name keeps its fact
 /// unconditionally: it denotes `e`'s discriminant, and every value `e` can hold is an
 /// inhabitant of the same enum.
 ///
@@ -239,9 +240,26 @@ fn a_redefined_discriminant_dest_loses_its_tag_fact() {
         "the bare dest carries the fact: {stable_names:?}"
     );
     let merged_names = names(&merged);
-    assert_eq!(merged_names.len(), 1, "source-keyed name only: {merged_names:?}");
+    // Trust (2026-10-01, RESULT DISCRIMINANT DOMAIN): the redefined dest's BARE name
+    // still carries nothing, and neither does the version the SECOND def establishes
+    // (`d#s0_1`, the copy of `b`). What it now carries is the fact pinned to the
+    // read's OWN write, `d#s0_0` — the value the `Discriminant` produced, under a name
+    // no other def can carry (`value_facts::discriminant_dest_establish_name`).
+    assert_eq!(
+        merged_names.len(),
+        2,
+        "source-keyed name and the read's own pinned version: {merged_names:?}"
+    );
     assert!(
-        !merged_names[0].contains("\"d\""),
-        "the redefined dest must NOT carry it: {merged_names:?}"
+        !merged_names.iter().any(|f| f.contains("\"d\"")),
+        "the redefined dest's bare name must NOT carry it: {merged_names:?}"
+    );
+    assert!(
+        !merged_names.iter().any(|f| f.contains("\"d#s0_1\"")),
+        "the second def's version (the copy of `b`) must NOT carry it: {merged_names:?}"
+    );
+    assert!(
+        merged_names.iter().any(|f| f.contains("\"d#s0_0\"")),
+        "the read's own version carries it: {merged_names:?}"
     );
 }

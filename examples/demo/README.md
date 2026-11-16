@@ -190,7 +190,7 @@ surface skipped, unsupported, runtime-checked, unknown, or empty proof rows.
 
 ## Further Reading
 
-- `VISION.md` -- full design document (three big ideas, proof levels, milestones)
+- `VISION.md` -- the full vision, and where Trust is today
 - `examples/` -- more verification examples (overflow, division, bounds, etc.)
 - `crates/trust-report/` -- proof report generation
 - `targo-trust/` -- the `targo trust` verifier implementation

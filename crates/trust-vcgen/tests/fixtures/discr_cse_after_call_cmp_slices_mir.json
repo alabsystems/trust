@@ -1,0 +1,1702 @@
+{
+  "name": "cmp_slices",
+  "def_path": "discr_cse_after_call::cmp_slices",
+  "span": {
+    "file": "discr_cse_after_call.rs",
+    "line_start": 6,
+    "col_start": 0,
+    "line_end": 20,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "core::cmp::Ordering",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Less",
+                "discriminant": -1,
+                "fields": []
+              },
+              {
+                "name": "Equal",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Greater",
+                "discriminant": 1,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": "Bool"
+              }
+            }
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": "Bool"
+              }
+            }
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": "Bool"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": "Bool"
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": "Bool"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": "Bool"
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Tuple": [
+            {
+              "Adt": {
+                "name": "core::option::Option",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": "Bool"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "None",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Some",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": "Bool"
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            },
+            {
+              "Adt": {
+                "name": "core::option::Option",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": "Bool"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "None",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Some",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": "Bool"
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": "Bool"
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": "Bool"
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::slice::iter::Iter",
+                "fields": [
+                  [
+                    "ptr",
+                    {
+                      "Adt": {
+                        "name": "core::ptr::non_null::NonNull",
+                        "fields": [
+                          [
+                            "pointer",
+                            {
+                              "RawPtr": {
+                                "mutable": false,
+                                "pointee": "Bool"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ],
+                  [
+                    "end_or_len",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": "Bool"
+                      }
+                    }
+                  ],
+                  [
+                    "_marker",
+                    {
+                      "Adt": {
+                        "name": "core::marker::PhantomData",
+                        "fields": [],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": "Bool"
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": "Bool"
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::slice::iter::Iter",
+                "fields": [
+                  [
+                    "ptr",
+                    {
+                      "Adt": {
+                        "name": "core::ptr::non_null::NonNull",
+                        "fields": [
+                          [
+                            "pointer",
+                            {
+                              "RawPtr": {
+                                "mutable": false,
+                                "pointee": "Bool"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ],
+                  [
+                    "end_or_len",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": "Bool"
+                      }
+                    }
+                  ],
+                  [
+                    "_marker",
+                    {
+                      "Adt": {
+                        "name": "core::marker::PhantomData",
+                        "fields": [],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": "Bool"
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": "Bool"
+          }
+        },
+        "name": "y"
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Adt": {
+            "name": "core::cmp::Ordering",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Less",
+                "discriminant": -1,
+                "fields": []
+              },
+              {
+                "name": "Equal",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Greater",
+                "discriminant": 1,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "otherwise"
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [bool]>::iter",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "discr_cse_after_call.rs",
+              "line_start": 7,
+              "col_start": 16,
+              "line_end": 7,
+              "col_end": 24
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 15700825326188119286,
+              "def_index": 15443,
+              "substs_digest": [
+                13452560698435116873,
+                16715438638401440183
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [bool]>::iter",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "discr_cse_after_call.rs",
+              "line_start": 8,
+              "col_start": 16,
+              "line_end": 8,
+              "col_end": 24
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 15700825326188119286,
+              "def_index": 15443,
+              "substs_digest": [
+                13452560698435116873,
+                16715438638401440183
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 10,
+                "col_start": 15,
+                "line_end": 10,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::Iter<'_, bool> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "discr_cse_after_call.rs",
+              "line_start": 10,
+              "col_start": 15,
+              "line_end": 10,
+              "col_end": 23
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 15700825326188119286,
+              "def_index": 10530,
+              "substs_digest": [
+                12289127437215394146,
+                14455608573754426703
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 10,
+                "col_start": 25,
+                "line_end": 10,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::Iter<'_, bool> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Move": {
+                  "local": 9,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 8,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "discr_cse_after_call.rs",
+              "line_start": 10,
+              "col_start": 25,
+              "line_end": 10,
+              "col_end": 33
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 15700825326188119286,
+              "def_index": 10530,
+              "substs_digest": [
+                12289127437215394146,
+                14455608573754426703
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Move": {
+                        "local": 6,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 8,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 10,
+                "col_start": 14,
+                "line_end": 10,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 5,
+                  "projections": [
+                    {
+                      "Field": 0
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 10,
+                "col_start": 14,
+                "line_end": 10,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 12,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ],
+              [
+                1,
+                6
+              ]
+            ],
+            "otherwise": 8,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "discr_cse_after_call.rs",
+              "line_start": 10,
+              "col_start": 8,
+              "line_end": 10,
+              "col_end": 34
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 5,
+                  "projections": [
+                    {
+                      "Field": 1
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 10,
+                "col_start": 14,
+                "line_end": 10,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                9
+              ]
+            ],
+            "otherwise": 8,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "discr_cse_after_call.rs",
+              "line_start": 10,
+              "col_start": 8,
+              "line_end": 10,
+              "col_end": 34
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 5,
+                  "projections": [
+                    {
+                      "Field": 1
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 10,
+                "col_start": 14,
+                "line_end": 10,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                1,
+                12
+              ],
+              [
+                0,
+                5
+              ]
+            ],
+            "otherwise": 8,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "discr_cse_after_call.rs",
+              "line_start": 10,
+              "col_start": 8,
+              "line_end": 10,
+              "col_end": 34
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 5,
+                  "projections": [
+                    {
+                      "Field": 1
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 10,
+                "col_start": 14,
+                "line_end": 10,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                11
+              ],
+              [
+                1,
+                10
+              ]
+            ],
+            "otherwise": 8,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "discr_cse_after_call.rs",
+              "line_start": 10,
+              "col_start": 8,
+              "line_end": 10,
+              "col_end": 34
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::cmp::Ordering",
+                      "variant": 2,
+                      "active_field": null,
+                      "args": "core::cmp::Ordering"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 17,
+                "col_start": 32,
+                "line_end": 17,
+                "col_end": 49
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 15
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::cmp::Ordering",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::cmp::Ordering"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 16,
+                "col_start": 32,
+                "line_end": 16,
+                "col_end": 46
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 15
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::cmp::Ordering",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::cmp::Ordering"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 15,
+                "col_start": 35,
+                "line_end": 15,
+                "col_end": 50
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 15
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 5,
+                    "projections": [
+                      {
+                        "Field": 0
+                      },
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 11,
+                "col_start": 18,
+                "line_end": 11,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 5,
+                    "projections": [
+                      {
+                        "Field": 1
+                      },
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 11,
+                "col_start": 27,
+                "line_end": 11,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "__trust_total_clone",
+            "args": [
+              {
+                "Copy": {
+                  "local": 14,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 15,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 16,
+              "projections": []
+            },
+            "target": 13,
+            "span": {
+              "file": "discr_cse_after_call.rs",
+              "line_start": 11,
+              "col_start": 40,
+              "line_end": 11,
+              "col_end": 48
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 15700825326188119286,
+              "def_index": 3568,
+              "substs_digest": [
+                13452560698435116873,
+                16715438638401440183
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 16,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 11,
+                "col_start": 40,
+                "line_end": 11,
+                "col_end": 48
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 17,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 14,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "discr_cse_after_call.rs",
+              "line_start": 11,
+              "col_start": 34,
+              "line_end": 11,
+              "col_end": 48
+            }
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 16,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "discr_cse_after_call.rs",
+                "line_start": 13,
+                "col_start": 36,
+                "line_end": 13,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 15
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Adt": {
+        "name": "core::cmp::Ordering",
+        "fields": [
+          [
+            "__tag",
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          ]
+        ],
+        "variants": [
+          {
+            "name": "Less",
+            "discriminant": -1,
+            "fields": []
+          },
+          {
+            "name": "Equal",
+            "discriminant": 0,
+            "fields": []
+          },
+          {
+            "name": "Greater",
+            "discriminant": 1,
+            "fields": []
+          }
+        ],
+        "disc_index_safe": true,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Enum"
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_10",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_10",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_11",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_11",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_12",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_12",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_13",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_13",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_17",
+                "Int"
+              ]
+            },
+            {
+              "Int": -1
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_17",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_17",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

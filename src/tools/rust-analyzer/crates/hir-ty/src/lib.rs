@@ -11,38 +11,30 @@
 // For details, see the zulip discussion below:
 // https://rust-lang.zulipchat.com/#narrow/channel/185405-t-compiler.2Frust-analyzer/topic/relying.20on.20in-tree.20.60rustc_type_ir.60.2F.60rustc_next_trait_solver.60/with/541055689
 
-extern crate ra_ap_rustc_index as rustc_index;
-
 extern crate ra_ap_rustc_abi as rustc_abi;
-
-extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
-
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
-
-extern crate ra_ap_rustc_type_ir as rustc_type_ir;
-
+extern crate ra_ap_rustc_index as rustc_index;
 extern crate ra_ap_rustc_next_trait_solver as rustc_next_trait_solver;
+extern crate ra_ap_rustc_type_ir as rustc_type_ir;
 
 extern crate self as hir_ty;
 
 pub mod builtin_derive;
-mod generics;
+pub mod generics;
 mod infer;
-mod inhabitedness;
+pub mod inhabitedness;
 mod lower;
 pub mod next_solver;
 mod opaques;
 mod representability;
 mod specialization;
 mod target_feature;
-mod utils;
+pub mod utils;
 mod variance;
 
 pub mod autoderef;
 pub mod consteval;
 pub mod db;
-pub mod diagnostics;
-pub mod display;
 pub mod drop;
 pub mod dyn_compatibility;
 pub mod lang_items;
@@ -52,22 +44,16 @@ pub mod mir;
 pub mod primitive;
 pub mod solver_errors;
 pub mod traits;
-pub mod upvars;
-
-#[cfg(test)]
-mod test_db;
-#[cfg(test)]
-mod tests;
 
 use std::{hash::Hash, ops::ControlFlow};
 
+use base_db::SourceDatabase;
 use hir_def::{
     CallableDefId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FunctionId,
     GenericDefId, HasModule, LifetimeParamId, ModuleId, StaticId, TypeAliasId, TypeOrConstParamId,
     TypeParamId,
-    db::DefDatabase,
     expr_store::{Body, ExpressionStore},
-    hir::{BindingId, ExprId, ExprOrPatId, PatId},
+    hir::{BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, PatId},
     resolver::{HasResolver, Resolver, TypeNs},
     type_ref::{Rawness, TypeRefId},
 };
@@ -81,13 +67,12 @@ use rustc_type_ir::{
     BoundVarIndexKind, TypeSuperVisitable, TypeVisitableExt,
     inherent::{IntoKind, Ty as _},
 };
+use salsa::SalsaValue;
 use stdx::impl_from;
-use syntax::ast::{ConstArg, make};
 use traits::FnTrait;
 
 use crate::{
     db::{AnonConstId, HirDatabase},
-    display::HirDisplay,
     lower::SupertraitsInfo,
     next_solver::{
         AliasTy, Binder, BoundConst, BoundRegion, BoundRegionKind, BoundTy, BoundTyKind, Canonical,
@@ -105,13 +90,12 @@ use crate::{
 pub use autoderef::autoderef;
 pub use infer::{
     Adjust, Adjustment, AutoBorrow, BindingMode, ByRef, ExplicitDropMethodUseKind,
-    InferenceDiagnostic, InferenceResult, InferenceTyDiagnosticSource, OverloadedDeref,
-    PointerCast, cast::CastError, could_coerce, could_unify, could_unify_deeply,
-    infer_query_with_inspect,
+    InferenceDiagnostic, InferenceResult, OverloadedDeref, PointerCast, ReturnKind,
+    cast::CastError, could_coerce, could_unify, could_unify_deeply, infer_query_with_inspect,
 };
 pub use lower::{
-    FieldType, GenericDefaults, GenericDefaultsRef, GenericPredicates, ImplTraits,
-    LifetimeElisionKind, LoweringMode, TyDefId, TyLoweringContext, TyLoweringInferVarsCtx,
+    FieldType, GenericDefaults, GenericDefaultsRef, GenericPredicates, LifetimeElisionKind,
+    LifetimeLoweringMode, LoweringMode, TyDefId, TyLoweringContext, TyLoweringInferVarsCtx,
     TyLoweringResult, ValueTyDefId, diagnostics::*,
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
@@ -131,6 +115,9 @@ pub mod closure_analysis {
         },
     };
 }
+
+type ThinFxHashMap<K, V> = stdx::thin_map::ThinHashMap<K, V, FxBuildHasher>;
+type ThinFxHashSet<T> = stdx::thin_map::ThinHashSet<T, FxBuildHasher>;
 
 /// A constant can have reference to other things. Memory map job is holding
 /// the necessary bits of memory of the const eval session to keep the constant
@@ -165,7 +152,7 @@ impl ComplexMemoryMap<'_> {
 }
 
 impl<'db> MemoryMap<'db> {
-    pub fn vtable_ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError> {
+    pub fn vtable_ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError<'db>> {
         match self {
             MemoryMap::Empty | MemoryMap::Simple(_) => Err(MirEvalError::InvalidVTableId(id)),
             MemoryMap::Complex(cm) => cm.vtable.ty(id),
@@ -181,8 +168,8 @@ impl<'db> MemoryMap<'db> {
     /// allocator function as `f` and it will return a mapping of old addresses to new addresses.
     fn transform_addresses(
         &self,
-        mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError>,
-    ) -> Result<FxHashMap<usize, usize>, MirEvalError> {
+        mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError<'db>>,
+    ) -> Result<FxHashMap<usize, usize>, MirEvalError<'db>> {
         let mut transform = |(addr, val): (&usize, &[u8])| {
             let addr = *addr;
             let align = if addr == 0 { 64 } else { (addr - (addr & (addr - 1))).min(64) };
@@ -201,7 +188,7 @@ impl<'db> MemoryMap<'db> {
         }
     }
 
-    fn get(&self, addr: usize, size: usize) -> Option<&[u8]> {
+    pub fn get(&self, addr: usize, size: usize) -> Option<&[u8]> {
         if size == 0 {
             Some(&[])
         } else {
@@ -215,13 +202,13 @@ impl<'db> MemoryMap<'db> {
     }
 }
 
-/// Return an index of a parameter in the generic type parameter list by it's id.
+/// Returns the index of a parameter in the generic type parameter list by its id.
 pub fn type_or_const_param_idx(db: &dyn HirDatabase, id: TypeOrConstParamId) -> u32 {
     generics::generics(db, id.parent).type_or_const_param_idx(id)
 }
 
 pub fn lifetime_param_idx(db: &dyn HirDatabase, id: LifetimeParamId) -> u32 {
-    generics::generics(db, id.parent).lifetime_param_idx(id)
+    generics::generics(db, id.parent).lifetime_param_idx(id, false).0
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
@@ -505,16 +492,6 @@ where
     Vec::from_iter(collector.params)
 }
 
-pub fn known_const_to_ast<'db>(
-    konst: Const<'db>,
-    db: &'db dyn HirDatabase,
-    target_module: ModuleId,
-) -> Option<ConstArg> {
-    Some(make::expr_const_value(
-        &konst.display_source_code(db, target_module, true).unwrap_or_else(|_| "_".to_owned()),
-    ))
-}
-
 /// A `Span` represents some location in lowered code - a type, expression or pattern.
 ///
 /// It has no meaning outside its body therefore it should not exit the pass it was created in
@@ -531,9 +508,9 @@ pub enum Span {
 }
 impl_from!(ExprId, PatId, BindingId, TypeRefId for Span);
 
-impl From<ExprOrPatId> for Span {
-    fn from(value: ExprOrPatId) -> Self {
-        match value {
+impl From<ExprOrPatIdPacked> for Span {
+    fn from(value: ExprOrPatIdPacked) -> Self {
+        match value.unpack() {
             ExprOrPatId::ExprId(idx) => idx.into(),
             ExprOrPatId::PatId(idx) => idx.into(),
         }
@@ -553,20 +530,27 @@ impl Span {
 }
 
 /// A [`DefWithBodyId`], or an anon const.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::Supertype)]
-pub enum InferBodyId {
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::Supertype, SalsaValue,
+)]
+pub enum InferBodyId<'db> {
     DefWithBodyId(DefWithBodyId),
-    AnonConstId(AnonConstId),
+    AnonConstId(AnonConstId<'db>),
 }
-impl_from!(DefWithBodyId(FunctionId, ConstId, StaticId), AnonConstId for InferBodyId);
-impl From<EnumVariantId> for InferBodyId {
+impl_from!(
+    impl<'db>
+    DefWithBodyId(FunctionId, ConstId, StaticId),
+    AnonConstId<'db>
+    for InferBodyId<'db>
+);
+impl<'db> From<EnumVariantId> for InferBodyId<'db> {
     fn from(id: EnumVariantId) -> Self {
         InferBodyId::DefWithBodyId(DefWithBodyId::VariantId(id))
     }
 }
 
-impl HasModule for InferBodyId {
-    fn module(&self, db: &dyn DefDatabase) -> ModuleId {
+impl HasModule for InferBodyId<'_> {
+    fn module(&self, db: &dyn SourceDatabase) -> ModuleId {
         match self {
             InferBodyId::DefWithBodyId(id) => id.module(db),
             InferBodyId::AnonConstId(id) => id.module(db),
@@ -574,8 +558,8 @@ impl HasModule for InferBodyId {
     }
 }
 
-impl HasResolver for InferBodyId {
-    fn resolver(self, db: &dyn DefDatabase) -> Resolver<'_> {
+impl HasResolver for InferBodyId<'_> {
+    fn resolver(self, db: &dyn SourceDatabase) -> Resolver<'_> {
         match self {
             InferBodyId::DefWithBodyId(id) => id.resolver(db),
             InferBodyId::AnonConstId(id) => id.resolver(db),
@@ -583,7 +567,7 @@ impl HasResolver for InferBodyId {
     }
 }
 
-impl InferBodyId {
+impl InferBodyId<'_> {
     pub fn expression_store_owner(self, db: &dyn HirDatabase) -> ExpressionStoreOwnerId {
         match self {
             InferBodyId::DefWithBodyId(id) => id.into(),
@@ -631,17 +615,11 @@ impl InferBodyId {
 
 pub fn setup_tracing() -> Option<tracing::subscriber::DefaultGuard> {
     use std::env;
-    use std::sync::LazyLock;
     use tracing_subscriber::{Registry, layer::SubscriberExt};
     use tracing_tree::HierarchicalLayer;
 
-    static ENABLE: LazyLock<bool> = LazyLock::new(|| env::var("CHALK_DEBUG").is_ok());
-    if !*ENABLE {
-        return None;
-    }
-
     let filter: tracing_subscriber::filter::Targets =
-        env::var("CHALK_DEBUG").ok().and_then(|it| it.parse().ok()).unwrap_or_default();
+        env::var("SOLVER_DEBUG").ok().and_then(|it| it.parse().ok()).unwrap_or_default();
     let layer = HierarchicalLayer::default()
         .with_indent_lines(true)
         .with_ansi(false)

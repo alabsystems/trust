@@ -12,6 +12,7 @@ extend-exclude = [
     "src/tools/enzyme/",
     "src/tools/tippy",
     "src/tools/miri",
+    "src/tpde",
     # Hack: CI runs from a subdirectory under the main checkout
     "../src/tools/targo/",
     "../library/stdarch/",
@@ -20,6 +21,7 @@ extend-exclude = [
     "../src/tools/enzyme/",
     "../src/tools/tippy",
     "../src/tools/miri",
+    "../src/tpde",
 ]
 
 [lint]

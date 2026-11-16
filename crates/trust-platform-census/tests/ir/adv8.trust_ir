@@ -1,0 +1,99 @@
+; TrustIr text format v1
+; trustc c054d5b16f0689fc92ce4d9a4c2b6decfb881e07 2026-10-08
+module "adv8"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "adv8.rs"
+
+struct @"core::num::niche_types::I32NotAllOnes" { 0: i32 @0 } size=4 align=4 repr=transparent id=0
+
+struct @"std::os::fd::OwnedFd" { fd: struct.0 @0 } size=4 align=4 repr=transparent id=1
+
+functy.0 = (ptr, ptr) -> (i32)
+
+functy.1 = () -> (i32)
+
+functy.2 = (...) -> (i32)
+
+functy.3 = (i32) -> (i32)
+
+functy.4 = (i32) -> (struct.1)
+
+functy.5 = (i32) -> ()
+
+rustcc fn @adv_owned_implicit(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 5 4
+    ; #scope: 2 parent=1 at 0 7 8
+    ; #scope: 3 parent=2 at 0 10 12
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.1()  ; #loc: 0 5 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 6 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 6 7  ; #scope: 1
+    %8 = alloca struct.1  ; #scope: 0
+    condbr %7, bb1, bb2  ; #loc: 0 6 4  ; #scope: 1
+bb1:
+    %9 = const i32 3  ; #loc: 0 7 21  ; #scope: 1
+    br bb4(%9)  ; #loc: 0 8 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 6 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 15 1  ; #scope: 0
+bb4(%2: i32):
+    %10 = const i32 2147483647  ; #loc: 0 8 19  ; #scope: 2
+    %11 = icmp slt i32 %2, %10  ; #loc: 0 8 14  ; #scope: 2
+    condbr %11, bb6, bb7  ; #loc: 0 8 8  ; #scope: 2
+bb5(%3: i32):
+    %12 = const i32 1  ; #loc: 0 10 74  ; #scope: 2
+    %13 = call @func.3(%12)  ; #loc: 0 10 64  ; #scope: 2
+    %14 = call @func.4(%13)  ; #loc: 0 10 30  ; #scope: 2
+    store struct.1 %14, ptr %8  ; #loc: 0 11 8  ; #scope: 3
+    drop struct.1, %8  ; #loc: 0 11 8  ; #scope: 3
+    %15 = call @func.5(%0, %1)  ; #loc: 0 12 17  ; #scope: 2
+    %16 = const i32 127  ; #loc: 0 12 54  ; #scope: 2
+    call @func.6(%16)  ; #loc: 0 12 42  ; #scope: 2
+    unreachable  ; #loc: 0 12 42  ; #scope: 2
+bb6:
+    %17 = const i32 2  ; #loc: 0 8 55  ; #scope: 2
+    %18 = const i32 1  ; #loc: 0 8 70  ; #scope: 2
+    %19 = call @func.2(%2, %17, %18)  ; #loc: 0 8 39  ; #scope: 2
+    %20 = const i32 1  ; #loc: 0 8 97  ; #scope: 2
+    %21, %22 = add.overflow i32 %2, %20  ; #loc: 0 8 91  ; #scope: 2
+    %23 = const bool false  ; #loc: 0 8 91  ; #scope: 2
+    %24 = const bool true  ; #loc: 0 8 91  ; #scope: 2
+    %25 = select bool %22, %23, %24  ; #loc: 0 8 91  ; #scope: 2
+    assert %25, overflow add  ; #proof: no_overflow  ; #loc: 0 8 91  ; #scope: 2
+    br bb8(%21)  ; #loc: 0 8 8  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 8 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 8 8  ; #scope: 2
+}
+
+fn @"libc::fork"(functy.1) {
+    ; #producer: trust
+}
+
+fn @"libc::fcntl"(functy.2) {
+    ; #producer: trust
+}
+
+fn @"libc::dup"(functy.3) {
+    ; #producer: trust
+}
+
+rustcc fn @"<std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd"(functy.4) {
+    ; #producer: trust
+}
+
+fn @"libc::execv"(functy.2) {
+    ; #producer: trust
+}
+
+fn @"libc::_exit"(functy.5) {
+    ; #producer: trust
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L8C91 of `adv8::adv_owned_implicit`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "adv8::adv_owned_implicit#L8C91#overflow#o0" range 0 8 91 8 98 site f0/bb6#8

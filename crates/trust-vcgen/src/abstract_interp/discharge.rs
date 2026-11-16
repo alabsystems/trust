@@ -35,6 +35,49 @@ impl AbstractInterpResult {
     }
 }
 
+/// The environment's interval for a formula variable.
+///
+/// A body VC spells a local with its SSA VERSION token (`_1#s0_0_s3_0`), while
+/// the interval environment is keyed on the bare local (`_1`). An exact miss
+/// therefore falls back to the base name, which is everything before the first
+/// `#`.
+///
+/// SOUNDNESS. The environment is a whole-FUNCTION join: over every reachable
+/// block's entry state AND over the value every statement leaves in what it
+/// writes (`transfer::join_statement_values`), so a bound it carries for `_1`
+/// holds at EVERY program point at which `_1` is a value — that is the property
+/// the join buys, and it is why the join is taken over the whole function rather
+/// than at a point. A versioned spelling denotes `_1`'s value at one such point,
+/// so the base bound applies to it. The fallback is consulted only when the
+/// exact name is absent, so a version carrying its own entry keeps it, and a
+/// name with no base (nothing before the `#`) resolves to Top exactly as before.
+///
+/// Until 2026-10-09 the join was over block ENTRY states alone, and the property
+/// did not hold: a value written and overwritten between two statements of one
+/// block is no block's entry state. `let mut a = 1; let mut b = 0; let t = a;
+/// a = b; b = t; k / a` read `b#s0_1` (0) as the environment's `b ∈ [1, 1]`,
+/// its division by zero was discharged, and the build passed (review probes
+/// `e02`/`e03` of trust-interval-drop-havoc). The property is now re-derived
+/// from the formula path's write oracle for every environment a test computes
+/// (`transfer::assert_environment_bounds_every_statement_point`).
+///
+/// Without this the environment and the obligation never met. Measured on
+/// `loop { r += 1; if r > 5 { break; } }`: the environment bounds the counter
+/// by the break test, the obligation asks about `_1#s0_0_s3_0`, the lookup
+/// missed, and the add was reported REFUTED with a counterexample setting the
+/// counter to `u32::MAX` — a state the loop cannot reach.
+#[must_use]
+fn interval_for_var(env: &IntervalDomain, name: &str) -> Interval {
+    let exact = env.get(name);
+    if exact != Interval::TOP {
+        return exact;
+    }
+    match name.split_once('#') {
+        Some((base, _)) if !base.is_empty() => env.get(base),
+        _ => exact,
+    }
+}
+
 /// Evaluate a `Formula` to an `Interval` under the given variable environment.
 ///
 /// This is a recursive abstract evaluator: it maps formula sub-expressions to
@@ -51,7 +94,7 @@ pub fn abstract_eval_formula(formula: &Formula, env: &IntervalDomain) -> Interva
                 Interval::TOP
             }
         }
-        Formula::Var(name, _) => env.get(name),
+        Formula::Var(name, _) => interval_for_var(env, name),
         Formula::Add(a, b) => {
             interval_add(&abstract_eval_formula(a, env), &abstract_eval_formula(b, env))
         }
@@ -280,8 +323,11 @@ pub(crate) fn try_eval_boolean(formula: &Formula, env: &IntervalDomain) -> Optio
 /// - **Index out of bounds:** Checks if index interval fits within array length.
 #[must_use]
 pub fn try_discharge_vc(vc: &VerificationCondition, env: &IntervalDomain) -> AbstractInterpResult {
-    if matches!(vc.kind, VcKind::UnsupportedMir { .. }) {
-        // Unsupported MIR is a coverage gap, not a proved unsatisfiable violation.
+    if matches!(vc.kind, VcKind::UnsupportedMir { .. })
+        || vc.kind.declined_contract_body().is_some()
+    {
+        // A structural decline is coverage data, not a solver goal. Even an
+        // unreachable environment or a malformed false sentinel cannot prove it.
         // Refuse discharge before generic formula evaluation can prove `false`.
         return AbstractInterpResult::Undetermined;
     }
@@ -334,8 +380,16 @@ pub fn try_discharge_vc(vc: &VerificationCondition, env: &IntervalDomain) -> Abs
     match &vc.kind {
         // Division by zero: if the formula is And([guards..., Eq(divisor, 0)])
         // and the divisor's interval excludes zero, discharge.
+        //
+        // Trust (2026-10-09, trust-interval-drop-havoc): an EMPTY divisor interval
+        // decides nothing. `contains(0)` is false for it, so it read as "excludes
+        // zero" and discharged the division. An empty interval is what an infeasible
+        // edge leaves behind (the fixpoint's own spelling), not a value: the shift,
+        // cast and overflow arms below already refuse it, and so does
+        // `check_comparison_intervals`.
         VcKind::DivisionByZero | VcKind::RemainderByZero => {
             if let Some(divisor_interval) = extract_divisor_interval(&vc.formula, env)
+                && !divisor_interval.is_bottom()
                 && !divisor_interval.contains(0)
             {
                 return AbstractInterpResult::Discharged(VerificationResult::Proved {
@@ -427,6 +481,7 @@ pub fn try_discharge_vc(vc: &VerificationCondition, env: &IntervalDomain) -> Abs
         // Float division by zero — same pattern as integer div-by-zero.
         VcKind::FloatDivisionByZero => {
             if let Some(divisor_interval) = extract_divisor_interval(&vc.formula, env)
+                && !divisor_interval.is_bottom()
                 && !divisor_interval.contains(0)
             {
                 return AbstractInterpResult::Discharged(VerificationResult::Proved {
@@ -527,22 +582,31 @@ pub fn interval_domain_to_formula(env: &IntervalDomain) -> Formula {
         return Formula::Bool(false);
     }
 
-    let mut conjuncts = Vec::new();
+    let mut conjuncts = Vec::with_capacity(env.vars.len() * 2);
     for (name, interval) in &env.vars {
         if interval.is_bottom() {
             return Formula::Bool(false);
         }
-        let var = Formula::Var(name.clone(), Sort::Int);
-        if interval.lo != i128::MIN {
-            conjuncts.push(Formula::Ge(Box::new(var.clone()), Box::new(Formula::Int(interval.lo))));
-        }
-        if interval.hi != i128::MAX {
-            conjuncts.push(Formula::Le(Box::new(var), Box::new(Formula::Int(interval.hi))));
+        match (interval.lo != i128::MIN, interval.hi != i128::MAX) {
+            (true, true) => {
+                let var = Formula::Var(name.clone(), Sort::Int);
+                conjuncts
+                    .push(Formula::Ge(Box::new(var.clone()), Box::new(Formula::Int(interval.lo))));
+                conjuncts.push(Formula::Le(Box::new(var), Box::new(Formula::Int(interval.hi))));
+            }
+            (true, false) => {
+                let var = Formula::Var(name.clone(), Sort::Int);
+                conjuncts.push(Formula::Ge(Box::new(var), Box::new(Formula::Int(interval.lo))));
+            }
+            (false, true) => {
+                let var = Formula::Var(name.clone(), Sort::Int);
+                conjuncts.push(Formula::Le(Box::new(var), Box::new(Formula::Int(interval.hi))));
+            }
+            (false, false) => {}
         }
     }
 
     // Collapse: empty => Bool(true), single => unwrap, else => And(...)
-    conjuncts.retain(|f| *f != Formula::Bool(true));
     match conjuncts.len() {
         0 => Formula::Bool(true),
         1 => conjuncts.pop().unwrap_or(Formula::Bool(true)),
@@ -573,6 +637,50 @@ pub fn augment_vc_with_abstract_state(
     vc: &VerificationCondition,
     env: &IntervalDomain,
 ) -> VerificationCondition {
+    if trust_types::formula_mentions_bitvector_theory(&vc.formula) {
+        return vc.clone();
+    }
+    let env_formula = interval_domain_to_formula(env);
+    augment_vc_with_env_formula(vc, &env_formula)
+}
+
+fn augment_vc_with_env_formula(
+    vc: &VerificationCondition,
+    env_formula: &Formula,
+) -> VerificationCondition {
+    augment_owned_vc_with_env_formula(vc.clone(), env_formula).0
+}
+
+/// Whether interval augmentation must leave `vc` byte-identical under
+/// `env_formula`. This is the ONE exemption rule for both spellings of the
+/// augmentation ([`augment_vc_with_env_formula`] is the owned one applied to a
+/// clone), so the batch/regeneration path and the production solver-dispatch path
+/// cannot disagree about a row.
+///
+/// They did (VCGEN-PERF-67-69-VERDICTS-1, 2026-11-07): `ec21617adb`
+/// (PERF-COMPILER-VCGEN-60) gave the solver-dispatch path a hand-copied owned
+/// counterpart, `de718fe643` added the typed-decline exemption to the borrowed
+/// one only, and the merge `32c2109878` kept both. Every production
+/// `DeclinedContractBody` row in a function with a bounded local then left
+/// vcgen as `And([env, Bool(true)])`, which
+/// `trust_source_contract::validated_source_body_decline` refuses
+/// (`vc.formula != Bool(true)`), while its regenerated variants stayed exact.
+fn env_augmentation_exempt(vc: &VerificationCondition, env_formula: &Formula) -> bool {
+    // This row retains the authored question and a typed lowering refusal;
+    // its Bool(true) is a non-proving sentinel, not a violation to strengthen.
+    // Interval augmentation used to wrap it in range facts, breaking the exact
+    // current-constructor correspondence needed by source/monitor consumers.
+    // Preserve malformed records too, and under every environment including an
+    // unreachable one: augmentation must not repair them into accepted source
+    // evidence or a `false`-conjoined goal, and every authority consumer still
+    // refuses them.
+    if vc.kind.declined_contract_body().is_some() {
+        return true;
+    }
+    // If the environment yields no constraints (Top), return the VC unchanged.
+    if *env_formula == Formula::Bool(true) {
+        return true;
+    }
     // A Machine{w}-lane VC models its variables as declared-width bitvectors.
     // Conjoining the interval environment's Int-sorted facts onto it would
     // give the SAME variable two sorts in one formula — an ill-sorted goal
@@ -580,13 +688,41 @@ pub fn augment_vc_with_abstract_state(
     // severing the row's native evidence. The BV width already carries the
     // type-range information these facts would add; leave the row untouched.
     if trust_types::formula_mentions_bitvector_theory(&vc.formula) {
-        return vc.clone();
+        return true;
     }
-    let env_formula = interval_domain_to_formula(env);
 
-    // If the environment yields no constraints (Top), return the VC unchanged.
-    if env_formula == Formula::Bool(true) {
-        return vc.clone();
+    // A hardened DESIGN MANDATE (`VcKind::is_hardened_design_mandate`: an L1
+    // profile rule whose violation is the closed tautology `Bool(true)`) mentions
+    // no variable, so a REACHABLE environment cannot change its satisfiability:
+    // every non-bottom `env_formula` is a conjunction of `lo <= x` / `x <= hi`
+    // bounds on DISTINCT variables with `lo <= hi` (a bottom interval or an
+    // unreachable state renders as `Bool(false)` above), which is satisfiable, so
+    // `And([env_formula, true])` is satisfiable exactly as `true` is. Leave the row
+    // byte-identical: the compiler recognises a mandate by that same predicate
+    // over the syntactic formula (the transport's `design_mandate` bit and the
+    // policy-B tolerance skip), and the conjoined `(and (>= x lo) true)` turned
+    // every mandate in a function with any bounded integer or slice local into a
+    // refuted-then-demoted `Unknown` and a compile error (G3, 2026-10-27,
+    // G3-MANDATE-CLOSED-1). An UNREACHABLE environment (`Bool(false)`) still
+    // conjoins, so a mandate in dead code keeps being proved by unreachability.
+    //
+    // ONLY a mandate (G3-MANDATE-L1-ONLY-1). An L0 `UnsafeOperation`/`FfiBoundary`
+    // row with a `Bool(true)` violation is a modelling-gap fail-close (an FFI call
+    // with no summary), and every other kind's `Bool(true)`/`Bool(false)` keeps
+    // the augmentation it always had: exempting them relabelled the FFI gaps
+    // `mandated` in every function with a bounded local.
+    *env_formula != Formula::Bool(false) && vc.kind.is_hardened_design_mandate(&vc.formula)
+}
+
+/// Conjoin `env_formula` onto `vc` in place, returning `(vc, false)` untouched
+/// when [`env_augmentation_exempt`] holds. The only implementation of the
+/// augmentation: the borrowed spelling clones into it.
+pub(crate) fn augment_owned_vc_with_env_formula(
+    mut vc: VerificationCondition,
+    env_formula: &Formula,
+) -> (VerificationCondition, bool) {
+    if env_augmentation_exempt(&vc, env_formula) {
+        return (vc, false);
     }
 
     // The augmentation is a single body-LAST conjoin `And([env_formula, formula])`,
@@ -596,21 +732,13 @@ pub fn augment_vc_with_abstract_state(
     // wrapper reproduces the augmented formula. It is the LAST transformation (post
     // the safety pass's normalize), so no further rename/normalize applies. VCs
     // without an obligation are unaffected.
-    let obligation = vc.obligation.as_ref().map(|rec| {
-        let mut rec = rec.clone();
+    if let Some(rec) = vc.obligation.as_mut() {
         rec.wrappers.push(trust_types::ObligationWrapper::ConjoinFactsLast {
             facts: vec![env_formula.clone()],
         });
-        rec
-    });
-    VerificationCondition {
-        kind: vc.kind.clone(),
-        function: vc.function,
-        location: vc.location.clone(),
-        formula: Formula::And(vec![env_formula, vc.formula.clone()]),
-        contract_metadata: vc.contract_metadata,
-        obligation,
     }
+    vc.formula = Formula::And(vec![env_formula.clone(), vc.formula]);
+    (vc, true)
 }
 
 /// Augment a batch of VCs with abstract-state assumptions.
@@ -624,7 +752,14 @@ pub fn augment_batch(
     vcs: &[VerificationCondition],
     env: &IntervalDomain,
 ) -> Vec<VerificationCondition> {
-    vcs.iter().map(|vc| augment_vc_with_abstract_state(vc, env)).collect()
+    if vcs.is_empty() {
+        return Vec::new();
+    }
+    let env_formula = interval_domain_to_formula(env);
+    if env_formula == Formula::Bool(true) {
+        return vcs.to_vec();
+    }
+    vcs.iter().map(|vc| augment_vc_with_env_formula(vc, &env_formula)).collect()
 }
 
 // ── VC-Kind-Specific Helpers ─────────────────────────────────────────────
@@ -690,7 +825,7 @@ fn check_overflow_discharge(
         // (P1-11): With semantic guards, And can have 3+ elements.
         // The violation formula is always the last conjunct.
         Formula::And(clauses) if clauses.len() >= 2 => {
-            compute_overflow_result(clauses.last().expect("non-empty And"), env, op)
+            compute_overflow_result(clauses.last()?, env, op)
         }
         // Unguarded formula: the violation directly
         _ => compute_overflow_result(formula, env, op),
@@ -774,7 +909,9 @@ fn check_bounds_discharge(formula: &Formula, env: &IntervalDomain) -> Option<boo
             let len = abstract_eval_formula(length_expr, env);
             // Safe if index.hi < length.lo (all indices < all lengths)
             // AND index.lo >= 0 (no negative indices)
-            if idx == Interval::TOP || len == Interval::TOP {
+            // Top is no information, and an EMPTY interval is no value (2026-10-09:
+            // its `lo > hi` passed the two comparisons below for any positive length).
+            if idx == Interval::TOP || len == Interval::TOP || idx.is_bottom() || len.is_bottom() {
                 return None;
             }
             if idx.lo >= 0 && idx.hi < len.lo { Some(true) } else { None }
@@ -840,14 +977,36 @@ fn is_exact_negation(a: &Formula, d: &Formula) -> bool {
     }
 }
 
+fn has_or_conjunct(formula: &Formula) -> bool {
+    match formula {
+        Formula::And(parts) => parts.iter().rev().any(has_or_conjunct),
+        Formula::Or(disjuncts) => !disjuncts.is_empty(),
+        _ => false,
+    }
+}
+
 /// A violation `And([assumptions…, Or[d1..dn]])` is UNSAT — so the property holds —
 /// when some `Or` conjunct has EVERY disjunct exactly negated by an assumption
 /// conjunct. Then `assumptions ∧ Or` is contradictory regardless of the remaining
 /// conjuncts. See the call site in `try_discharge_vc` for the soundness argument.
 fn try_discharge_negated_disjuncts(formula: &Formula) -> bool {
+    let Formula::And(parts) = formula else {
+        return false;
+    };
+    if !has_or_conjunct(formula) {
+        return false;
+    }
+    if !parts.iter().any(|p| matches!(p, Formula::And(_))) {
+        return parts.iter().rev().any(|c| match c {
+            Formula::Or(disjuncts) if !disjuncts.is_empty() => {
+                disjuncts.iter().all(|d| parts.iter().any(|a| is_exact_negation(a, d)))
+            }
+            _ => false,
+        });
+    }
     let mut conjuncts = Vec::new();
     collect_and_conjuncts(formula, &mut conjuncts);
-    conjuncts.iter().any(|c| match c {
+    conjuncts.iter().rev().any(|c| match c {
         Formula::Or(disjuncts) if !disjuncts.is_empty() => {
             disjuncts.iter().all(|d| conjuncts.iter().any(|a| is_exact_negation(a, d)))
         }
@@ -869,6 +1028,12 @@ fn check_negation_discharge(formula: &Formula, env: &IntervalDomain, ty: &Ty) ->
     // Extract the operand interval from the formula. The inner Eq(val, INT_MIN)
     // gives us the variable; evaluate it in the environment.
     let operand_interval = extract_negation_operand_interval(formula, env)?;
+    // An EMPTY operand interval decides nothing (2026-10-09). It is exactly what the
+    // negation check's own success edge leaves when the operand is pinned to INT_MIN,
+    // and `contains` is false for it.
+    if operand_interval.is_bottom() {
+        return None;
+    }
 
     // If the operand interval doesn't contain INT_MIN, negation is safe.
     Some(!operand_interval.contains(type_min))

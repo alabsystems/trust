@@ -19,15 +19,14 @@
 // access here is the input boundary rather than a bypass of loaded config.
 #![allow(clippy::disallowed_methods)]
 
-use std::env;
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
+use std::{env, fs, thread};
 
 pub const BOOTSTRAP_COMMIT_ENV: [&str; 3] = [
     "CFG_COMMIT_HASH",
@@ -36,8 +35,10 @@ pub const BOOTSTRAP_COMMIT_ENV: [&str; 3] = [
 ];
 
 const MAX_GIT_STDOUT_BYTES: u64 = 512;
+const MAX_GIT_PATH_BYTES: u64 = 64 * 1024;
 const MAX_RECORDED_INFO_BYTES: u64 = 512;
 const MAX_GIT_RUNTIME: Duration = Duration::from_secs(10);
+const MAX_SYMBOLIC_REFS: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitInfo {
@@ -46,7 +47,19 @@ pub struct CommitInfo {
     pub date: String,
 }
 
-pub fn discover(manifest_dir: &Path, omit_git_hash: bool) -> Result<Option<CommitInfo>, String> {
+#[derive(Debug, Eq, PartialEq)]
+pub struct Discovery {
+    pub info: Option<CommitInfo>,
+    // These are Cargo freshness inputs for a diagnostic label, never a
+    // complete source inventory or provenance/verification authority.
+    // Only the selected existing origin/layout is watched. A change in origin
+    // or Git layout selection, including creation of previously absent marker,
+    // commondir, config.worktree or higher-priority record files, requires a
+    // clean rebuild if no already-watched input independently causes rerun.
+    pub rerun_if_changed: Vec<PathBuf>,
+}
+
+pub fn discover(manifest_dir: &Path, omit_git_hash: bool) -> Result<Discovery, String> {
     discover_with_env(manifest_dir, omit_git_hash, |name| env::var_os(name))
 }
 
@@ -54,29 +67,40 @@ fn discover_with_env(
     manifest_dir: &Path,
     omit_git_hash: bool,
     get: impl FnMut(&str) -> Option<OsString>,
-) -> Result<Option<CommitInfo>, String> {
+) -> Result<Discovery, String> {
     if omit_git_hash {
-        return Ok(None);
+        return Ok(Discovery {
+            info: None,
+            rerun_if_changed: Vec::new(),
+        });
     }
     if let Some(info) = commit_info_from_bootstrap_env(get)? {
-        return Ok(Some(info));
+        return Ok(Discovery {
+            info: Some(info),
+            rerun_if_changed: Vec::new(),
+        });
     }
 
     if let Some(root) = trust_checkout_root(manifest_dir) {
         if plain_git_marker(&root.join(".git")) {
-            return commit_info_from_git(&root).map(Some);
+            return discover_git(&root);
         }
     }
     // Preserve upstream Cargo's standalone-checkout behavior when this package
     // really does own a repository. In the Trust tree the package has no such
     // marker, so this can never replace the anchored monorepo identity above.
     if plain_git_marker(&manifest_dir.join(".git")) {
-        return commit_info_from_git(manifest_dir).map(Some);
+        return discover_git(manifest_dir);
     }
 
     // Source distributions retain a package-local record for compatibility.
     // The root record is also accepted because vendored Targo has the same
     // commit identity as the rest of the Trust source tree.
+    // Cargo treats every absent explicit path as perpetually dirty. Watch
+    // only the selected existing record; do not replace missing-path watches
+    // with a recursive package-root watch containing Cargo's own outputs.
+    // Origin-selection changes need an explicit clean rebuild as documented
+    // on `Discovery`; precedence is reevaluated whenever discovery runs.
     for path in [
         Some(manifest_dir.join("git-commit-info")),
         trust_root(manifest_dir).map(|p| p.join("git-commit-info")),
@@ -85,11 +109,137 @@ fn discover_with_env(
     .flatten()
     {
         if path.exists() {
-            return commit_info_from_recorded_file(&path).map(Some);
+            return discovery(Some(commit_info_from_recorded_file(&path)?), vec![path]);
         }
     }
 
-    Ok(None)
+    discovery(None, Vec::new())
+}
+
+fn discovery(info: Option<CommitInfo>, mut inputs: Vec<PathBuf>) -> Result<Discovery, String> {
+    inputs.sort();
+    inputs.dedup();
+    for path in &inputs {
+        let path = path
+            .to_str()
+            .ok_or("commit-label input path is not UTF-8")?;
+        if path.contains(['\n', '\r']) {
+            return Err("commit-label input path contains a newline".to_string());
+        }
+    }
+    Ok(Discovery {
+        info,
+        rerun_if_changed: inputs,
+    })
+}
+
+fn discover_git(root: &Path) -> Result<Discovery, String> {
+    // Resolve paths with the same sanitized native Git authority as `log`.
+    // In particular a linked worktree's HEAD and shared branch ref do not
+    // live below the same directory. Do not recursively watch `.git`: its
+    // objects, index, logs and unrelated refs are not label inputs.
+    let git_dir = git_path(root, &["rev-parse", "--absolute-git-dir"])?;
+    let common_dir = git_path(root, &["rev-parse", "--git-common-dir"])?;
+    let mut inputs = Vec::new();
+    for path in [
+        root.join(".git"),
+        git_dir.join("commondir"),
+        common_dir.join("config"),
+        git_dir.join("config.worktree"),
+    ] {
+        if path.is_file() {
+            inputs.push(path);
+        }
+    }
+
+    let mut reference = "HEAD".to_string();
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_SYMBOLIC_REFS {
+        if !seen.insert(reference.clone()) {
+            return Err("cyclic symbolic reference in commit-label inputs".to_string());
+        }
+        let path = git_path(root, &["rev-parse", "--git-path", &reference])?;
+        if path.is_file() {
+            inputs.push(path);
+        } else if reference != "HEAD" {
+            // A packed ref has no loose file. Watch its existing narrow
+            // parent for a new loose override and the packed table for
+            // updates. Watching the absent loose file itself would make
+            // every native build stale even when HEAD did not move.
+            let packed = common_dir.join("packed-refs");
+            if !packed.is_file() {
+                return Err("commit-label reference has no loose or packed file (unsupported reference storage)".to_string());
+            }
+            inputs.push(packed);
+            let namespace = git_path(root, &["rev-parse", "--git-path", "refs"])?;
+            let mut parent = path.parent().ok_or("commit-label ref has no parent")?;
+            while !parent.is_dir() {
+                parent = parent
+                    .parent()
+                    .ok_or("commit-label ref parent is missing")?;
+            }
+            if !parent.starts_with(&namespace) {
+                return Err("commit-label ref has no existing refs namespace".to_string());
+            }
+            inputs.push(parent.to_path_buf());
+        } else {
+            return Err("commit-label HEAD is not a regular file".to_string());
+        }
+        let next = git_stdout_status(
+            root,
+            OsStr::new("git"),
+            &["symbolic-ref", "--quiet", "--no-recurse", &reference],
+            MAX_GIT_RUNTIME,
+            true,
+            MAX_GIT_PATH_BYTES,
+        )?;
+        if let Some(next) = next {
+            let next = std::str::from_utf8(&next)
+                .map_err(|_| "commit-label symbolic reference is not UTF-8")?;
+            let next = next.trim_end();
+            // Git has already selected the namespace, but never let malformed
+            // metadata become an arbitrary path or build-script instruction.
+            if !next.starts_with("refs/")
+                || next
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+                || next.chars().any(char::is_whitespace)
+                || next.contains('\\')
+            {
+                return Err("invalid symbolic commit-label reference".to_string());
+            }
+            reference = next.to_string();
+            continue;
+        }
+        return discovery(Some(commit_info_from_git(root)?), inputs);
+    }
+    Err("commit-label symbolic reference depth exceeded".to_string())
+}
+
+fn git_path(root: &Path, args: &[&str]) -> Result<PathBuf, String> {
+    let output = git_stdout_status(
+        root,
+        OsStr::new("git"),
+        args,
+        MAX_GIT_RUNTIME,
+        false,
+        MAX_GIT_PATH_BYTES,
+    )?
+    .expect("path queries do not accept a non-symbolic status");
+    let output = std::str::from_utf8(&output).map_err(|_| "Git path is not UTF-8")?;
+    let path = output
+        .strip_suffix('\n')
+        .unwrap_or(output)
+        .trim_end_matches('\r');
+    if path.is_empty() || path.contains(['\n', '\r']) {
+        return Err("Git returned an empty or multiline metadata path".to_string());
+    }
+    let path = PathBuf::from(path);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
 }
 
 fn commit_info_from_bootstrap_env(
@@ -130,6 +280,56 @@ fn commit_info_from_git_command(
     program: &OsStr,
     timeout: Duration,
 ) -> Result<CommitInfo, String> {
+    let stdout = git_stdout(
+        root,
+        program,
+        &[
+            "log",
+            "--no-show-signature",
+            "-1",
+            "--date=short",
+            "--format=%H%n%cd",
+        ],
+        timeout,
+    )?;
+    let stdout = String::from_utf8(stdout).map_err(|_| "Git output was not UTF-8".to_string())?;
+    let mut lines = stdout.lines();
+    let hash = lines
+        .next()
+        .ok_or_else(|| "Git omitted the commit hash".to_string())?;
+    let date = lines
+        .next()
+        .ok_or_else(|| "Git omitted the commit date".to_string())?;
+    if lines.next().is_some() {
+        return Err("Git returned duplicate or trailing commit metadata".to_string());
+    }
+    let short_hash = hash.get(..9).unwrap_or_default();
+    validate_tuple(
+        hash.to_string(),
+        short_hash.to_string(),
+        date.to_string(),
+        "Git",
+    )
+}
+
+fn git_stdout(
+    root: &Path,
+    program: &OsStr,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    git_stdout_status(root, program, args, timeout, false, MAX_GIT_STDOUT_BYTES)
+        .map(|output| output.expect("non-symbolic status is not accepted"))
+}
+
+fn git_stdout_status(
+    root: &Path,
+    program: &OsStr,
+    args: &[&str],
+    timeout: Duration,
+    allow_not_symbolic: bool,
+    max_stdout_bytes: u64,
+) -> Result<Option<Vec<u8>>, String> {
     let mut command = Command::new(program);
     configure_git_environment(&mut command);
     command
@@ -137,11 +337,7 @@ fn commit_info_from_git_command(
         .arg("-C")
         .arg(root)
         .arg("--no-optional-locks")
-        .arg("log")
-        .arg("--no-show-signature")
-        .arg("-1")
-        .arg("--date=short")
-        .arg("--format=%H%n%cd")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -165,7 +361,7 @@ fn commit_info_from_git_command(
                     return;
                 }
                 Ok(read) => {
-                    let remaining = MAX_GIT_STDOUT_BYTES as usize - retained.len();
+                    let remaining = max_stdout_bytes as usize - retained.len();
                     retained.extend_from_slice(&buffer[..read.min(remaining)]);
                     if read > remaining && !overflow_reported {
                         overflow_reported = true;
@@ -190,7 +386,7 @@ fn commit_info_from_git_command(
             Ok(GitReaderEvent::Overflow) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("Git output exceeded {MAX_GIT_STDOUT_BYTES} bytes"));
+                return Err(format!("Git output exceeded {max_stdout_bytes} bytes"));
             }
             Ok(GitReaderEvent::Complete(Ok(output))) => stdout = Some(output),
             Ok(GitReaderEvent::Complete(Err(error))) => {
@@ -230,6 +426,12 @@ fn commit_info_from_git_command(
     }
 
     let status = status.expect("loop requires child status");
+    if allow_not_symbolic && status.code() == Some(1) {
+        if !stdout.expect("loop requires bounded stdout").is_empty() {
+            return Err("Git emitted output for a non-symbolic reference".to_string());
+        }
+        return Ok(None);
+    }
     if !status.success() {
         return Err(format!(
             "Git failed for {} with status {status}",
@@ -237,25 +439,7 @@ fn commit_info_from_git_command(
         ));
     }
 
-    let stdout = stdout.expect("loop requires bounded stdout");
-    let stdout = String::from_utf8(stdout).map_err(|_| "Git output was not UTF-8".to_string())?;
-    let mut lines = stdout.lines();
-    let hash = lines
-        .next()
-        .ok_or_else(|| "Git omitted the commit hash".to_string())?;
-    let date = lines
-        .next()
-        .ok_or_else(|| "Git omitted the commit date".to_string())?;
-    if lines.next().is_some() {
-        return Err("Git returned duplicate or trailing commit metadata".to_string());
-    }
-    let short_hash = hash.get(..9).unwrap_or_default();
-    validate_tuple(
-        hash.to_string(),
-        short_hash.to_string(),
-        date.to_string(),
-        "Git",
-    )
+    Ok(Some(stdout.expect("loop requires bounded stdout")))
 }
 
 enum GitReaderEvent {
@@ -285,7 +469,12 @@ fn configure_git_environment(command: &mut Command) {
         .env("GIT_CONFIG_COUNT", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_NO_REPLACE_OBJECTS", "1");
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        // Diagnostic metadata must refuse missing objects, never repair a
+        // partial clone. Deny transports even on Git versions that do not
+        // recognize lazy-fetch suppression.
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "");
 }
 
 fn null_device() -> &'static OsStr {
@@ -454,8 +643,602 @@ fn trust_root(manifest_dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::BTreeMap;
+
+    use super::*;
+
+    // Trust: preserve the independent local watch regressions at the unified discovery API.
+    fn rerun_paths_with_env(
+        root: &Path,
+        omit: bool,
+        get: impl FnMut(&str) -> Option<OsString>,
+    ) -> Result<Vec<PathBuf>, String> {
+        discover_with_env(root, omit, get).map(|result| result.rerun_if_changed)
+    }
+
+    fn watch_git_path(root: &Path, name: &OsStr) -> Result<PathBuf, String> {
+        git_path(root, &["rev-parse", "--git-path", name.to_str().ok_or("non-UTF-8 test ref")?])
+    }
+
+    fn watch_fixture() -> PathBuf {
+        // Timestamp-derived names can collide between concurrently starting
+        // tests on clocks with coarser resolution than SystemTime's type.
+        let root = tempfile::Builder::new()
+            .prefix("targo-version-watch-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        watch_git(&root, &["init", "-q"]);
+        watch_git(&root, &["symbolic-ref", "HEAD", "refs/heads/version-watch"]);
+        fs::write(root.join("Cargo.toml"), "fixture\n").unwrap();
+        watch_git(&root, &["add", "Cargo.toml"]);
+        watch_git(
+            &root,
+            &["commit", "-q", "-m", "initial version watch fixture"],
+        );
+        root
+    }
+
+    fn watch_git(root: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        configure_git_environment(&mut command);
+        let output = command
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=Version fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "Git {args:?}: {:?}", output.stderr);
+    }
+
+    #[test]
+    fn watches_loose_branch_when_commits_leave_head_file_unchanged() {
+        let root = watch_fixture();
+        let head = watch_git_path(&root, OsStr::new("HEAD")).unwrap();
+        let branch = watch_git_path(&root, OsStr::new("refs/heads/version-watch")).unwrap();
+        let before_head = fs::read(&head).unwrap();
+        let before_ref = fs::read(&branch).unwrap();
+        let paths = rerun_paths_with_env(&root, false, |_| None).unwrap();
+        assert!(paths.contains(&head) && paths.contains(&branch));
+        watch_git(
+            &root,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "advance metadata only",
+            ],
+        );
+        assert_eq!(fs::read(&head).unwrap(), before_head);
+        assert_ne!(fs::read(&branch).unwrap(), before_ref);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn packed_reference_watch_uses_existing_inputs_and_detects_loose_creation() {
+        let root = watch_fixture();
+        watch_git(&root, &["pack-refs", "--all", "--prune"]);
+        let branch = watch_git_path(&root, OsStr::new("refs/heads/version-watch")).unwrap();
+        assert!(!branch.exists());
+        let paths = rerun_paths_with_env(&root, false, |_| None).unwrap();
+        assert!(paths.iter().all(|path| path.exists()));
+        assert!(paths.contains(&watch_git_path(&root, OsStr::new("packed-refs")).unwrap()));
+        assert!(paths.contains(&branch.parent().unwrap().to_path_buf()));
+        watch_git(
+            &root,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "recreate loose reference",
+            ],
+        );
+        assert!(branch.is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_worktree_watches_its_head_marker_common_pointer_and_shared_ref() {
+        let root = watch_fixture();
+        let linked = root.join("linked");
+        watch_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-version-watch",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let paths = rerun_paths_with_env(&linked, false, |_| None).unwrap();
+        let head = watch_git_path(&linked, OsStr::new("HEAD")).unwrap();
+        let branch = watch_git_path(&linked, OsStr::new("refs/heads/linked-version-watch")).unwrap();
+        assert!(paths.contains(&linked.join(".git")));
+        assert!(paths.contains(&head));
+        assert!(paths.contains(&head.parent().unwrap().join("commondir")));
+        assert!(paths.contains(&branch));
+        assert_ne!(head.parent(), branch.parent());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detached_head_is_watched_without_unrelated_branch_dependencies() {
+        let root = watch_fixture();
+        watch_git(&root, &["checkout", "-q", "--detach"]);
+        let paths = rerun_paths_with_env(&root, false, |_| None).unwrap();
+        let mut expected = vec![watch_git_path(&root, OsStr::new("HEAD")).unwrap(), root.join(".git/config")];
+        expected.sort();
+        assert_eq!(paths, expected, "only HEAD and Git configuration affect a detached label");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn anchored_monorepo_watches_root_git_without_package_git_marker() {
+        let root = watch_fixture();
+        let manifest = root.join("src/tools/targo");
+        for directory in [
+            &manifest,
+            &root.join("src/ci"),
+            &root.join("compiler/rustc"),
+            &root.join("targo-trust"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        for file in [
+            manifest.join("Cargo.toml"),
+            root.join("src/ci/channel"),
+            root.join("x.py"),
+            root.join("targo-trust/Cargo.toml"),
+        ] {
+            fs::write(file, "fixture\n").unwrap();
+        }
+        let paths = rerun_paths_with_env(&manifest, false, |_| None).unwrap();
+        assert!(!manifest.join(".git").exists());
+        assert!(paths.contains(&watch_git_path(&root, OsStr::new("HEAD")).unwrap()));
+        assert!(paths.contains(&watch_git_path(&root, OsStr::new("refs/heads/version-watch")).unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn intermediate_symbolic_reference_is_an_input_too() {
+        let root = watch_fixture();
+        watch_git(&root, &["branch", "label-target"]);
+        watch_git(
+            &root,
+            &[
+                "symbolic-ref",
+                "refs/heads/version-watch",
+                "refs/heads/label-target",
+            ],
+        );
+        let paths = rerun_paths_with_env(&root, false, |_| None).unwrap();
+        for reference in [
+            "HEAD",
+            "refs/heads/version-watch",
+            "refs/heads/label-target",
+        ] {
+            assert!(paths.contains(&watch_git_path(&root, OsStr::new(reference)).unwrap()));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_and_omitted_labels_do_not_query_git_or_add_checkout_watches() {
+        let root = watch_fixture();
+        fs::remove_dir_all(root.join(".git")).unwrap();
+        fs::write(
+            root.join(".git"),
+            "invalid Git marker to detect accidental fallback\n",
+        )
+        .unwrap();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let values = BTreeMap::from([
+            ("CFG_COMMIT_HASH", OsString::from(hash)),
+            ("CFG_SHORT_COMMIT_HASH", OsString::from("012345678")),
+            ("CFG_COMMIT_DATE", OsString::from("2026-10-22")),
+        ]);
+        assert!(
+            rerun_paths_with_env(&root, false, |name| values.get(name).cloned())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            rerun_paths_with_env(&root, true, |_| Some(OsString::from("invalid")))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            rerun_paths_with_env(&root, false, |name| (name == "CFG_COMMIT_HASH")
+                .then(|| OsString::from(hash)))
+            .unwrap_err()
+            .contains("all-or-none")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_record_is_watched_but_unbound_package_needs_no_git() {
+        let root = env::temp_dir().join(format!(
+            "targo-unbound-version-watch-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            rerun_paths_with_env(&root, false, |_| None)
+                .unwrap()
+                .is_empty()
+        );
+        let record = root.join("git-commit-info");
+        fs::write(
+            &record,
+            "0123456789abcdef0123456789abcdef01234567\n012345678\n2026-10-22\n",
+        )
+        .unwrap();
+        assert_eq!(
+            rerun_paths_with_env(&root, false, |_| None).unwrap(),
+            [record]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn native_git(root: &Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        configure_git_environment(&mut command);
+        let output = command
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=Commit Label Test",
+                "-c",
+                "user.email=commit-label@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture Git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn native_fixture() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        native_git(root.path(), &["init", "--quiet"]);
+        native_git(root.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        fs::write(root.path().join("Cargo.toml"), "fixture\n").unwrap();
+        native_git(root.path(), &["add", "Cargo.toml"]);
+        native_git(
+            root.path(),
+            &["commit", "--quiet", "--no-gpg-sign", "-m", "first"],
+        );
+        root
+    }
+
+    #[test]
+    fn native_loose_and_detached_labels_watch_the_selected_inputs() {
+        let fixture = native_fixture();
+        let root = fixture.path();
+        let before = discover_with_env(root, false, |_| None).unwrap();
+        let head = git_path(root, &["rev-parse", "--git-path", "HEAD"]).unwrap();
+        let branch = git_path(root, &["rev-parse", "--git-path", "refs/heads/main"]).unwrap();
+        assert!(before.rerun_if_changed.contains(&head));
+        assert!(before.rerun_if_changed.contains(&branch));
+        assert!(
+            before.rerun_if_changed.iter().all(|path| path.is_file()),
+            "a loose native ref needs no recursive directory watch"
+        );
+        let head_bytes = fs::read(&head).unwrap();
+        let branch_bytes = fs::read(&branch).unwrap();
+        native_git(
+            root,
+            &[
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "second",
+            ],
+        );
+        let advanced = discover_with_env(root, false, |_| None).unwrap();
+        assert_ne!(before.info, advanced.info);
+        assert_eq!(before.rerun_if_changed, advanced.rerun_if_changed);
+        assert_eq!(
+            fs::read(&head).unwrap(),
+            head_bytes,
+            "HEAD alone cannot detect a branch advance"
+        );
+        assert_ne!(fs::read(&branch).unwrap(), branch_bytes);
+
+        native_git(root, &["checkout", "--quiet", "--detach", "HEAD"]);
+        let detached = discover_with_env(root, false, |_| None).unwrap();
+        assert_eq!(advanced.info, detached.info);
+        assert!(detached.rerun_if_changed.contains(&head));
+        assert!(!detached.rerun_if_changed.contains(&branch));
+        assert_ne!(fs::read(&head).unwrap(), head_bytes);
+        native_git(root, &["checkout", "--quiet", "--detach", "HEAD^"]);
+        assert_eq!(
+            discover_with_env(root, false, |_| None).unwrap().info,
+            before.info
+        );
+    }
+
+    #[test]
+    fn native_packed_label_watches_packed_table_and_new_loose_override() {
+        let fixture = native_fixture();
+        let root = fixture.path();
+        native_git(root, &["branch", "-m", "topic/main"]);
+        let first = native_git(root, &["rev-parse", "HEAD"]);
+        native_git(
+            root,
+            &[
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "second",
+            ],
+        );
+        let second = native_git(root, &["rev-parse", "HEAD"]);
+        native_git(root, &["update-ref", "refs/heads/topic/main", &first]);
+        let loose = discover_with_env(root, false, |_| None).unwrap();
+        let branch = git_path(root, &["rev-parse", "--git-path", "refs/heads/topic/main"]).unwrap();
+        assert!(loose.rerun_if_changed.contains(&branch));
+        native_git(root, &["pack-refs", "--all", "--prune"]);
+        assert!(
+            !branch.exists(),
+            "native pack-refs must exercise the absent-loose path"
+        );
+        if branch.parent().unwrap().exists() {
+            fs::remove_dir(branch.parent().unwrap()).unwrap();
+        }
+        let packed = discover_with_env(root, false, |_| None).unwrap();
+        let table = git_path(root, &["rev-parse", "--git-path", "packed-refs"]).unwrap();
+        let parent = git_path(root, &["rev-parse", "--git-path", "refs/heads"]).unwrap();
+        assert_eq!(loose.info, packed.info);
+        assert!(packed.rerun_if_changed.contains(&table));
+        assert!(packed.rerun_if_changed.contains(&parent));
+        assert!(
+            packed.rerun_if_changed.iter().all(|path| path.exists()),
+            "missing native watches would perpetually rebuild"
+        );
+        assert!(
+            !packed.rerun_if_changed.contains(&root.join(".git")),
+            "never recursively watch the whole Git directory"
+        );
+        let table_bytes = fs::read(&table).unwrap();
+        assert!(
+            !fs::read_dir(&parent)
+                .unwrap()
+                .any(|entry| entry.unwrap().file_name() == "topic")
+        );
+
+        native_git(root, &["update-ref", "refs/heads/topic/main", &second]);
+        assert_eq!(
+            fs::read(&table).unwrap(),
+            table_bytes,
+            "a loose override does not update packed-refs"
+        );
+        assert!(
+            fs::read_dir(&parent)
+                .unwrap()
+                .any(|entry| entry.unwrap().file_name() == "topic")
+        );
+        let overridden = discover_with_env(root, false, |_| None).unwrap();
+        assert_ne!(packed.info, overridden.info);
+        assert_eq!(overridden.info.unwrap().hash, second);
+        assert!(overridden.rerun_if_changed.contains(&branch));
+        assert!(!overridden.rerun_if_changed.contains(&parent));
+        native_git(root, &["pack-refs", "--all", "--prune"]);
+        let repacked = discover_with_env(root, false, |_| None).unwrap();
+        assert_eq!(repacked.info.unwrap().hash, second);
+        assert!(repacked.rerun_if_changed.contains(&table));
+        assert_ne!(fs::read(&table).unwrap(), table_bytes);
+    }
+
+    #[test]
+    fn native_linked_worktree_binds_private_head_and_common_branch() {
+        let fixture = native_fixture();
+        let root = fixture.path();
+        native_git(
+            root,
+            &[
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "second",
+            ],
+        );
+        let second = native_git(root, &["rev-parse", "HEAD"]);
+        let linked = root.join("linked-worktree");
+        native_git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+                "HEAD^",
+            ],
+        );
+        let private = git_path(&linked, &["rev-parse", "--absolute-git-dir"]).unwrap();
+        let common = git_path(&linked, &["rev-parse", "--git-common-dir"]).unwrap();
+        assert_ne!(private, common);
+        native_git(root, &["config", "extensions.worktreeConfig", "true"]);
+        let worktree_config = private.join("config.worktree");
+        assert!(!worktree_config.exists());
+        let common_config = fs::read(common.join("config")).unwrap();
+        let head = git_path(&linked, &["rev-parse", "--git-path", "HEAD"]).unwrap();
+        let branch = git_path(&linked, &["rev-parse", "--git-path", "refs/heads/linked"]).unwrap();
+        let before = discover_with_env(&linked, false, |_| None).unwrap();
+        for path in [
+            linked.join(".git"),
+            private.join("commondir"),
+            common.join("config"),
+            head.clone(),
+            branch.clone(),
+        ] {
+            assert!(
+                before.rerun_if_changed.contains(&path),
+                "missing {}",
+                path.display()
+            );
+        }
+        assert!(!before.rerun_if_changed.contains(&private));
+        assert!(!before.rerun_if_changed.contains(&common));
+        assert!(!before.rerun_if_changed.contains(&worktree_config));
+        let head_bytes = fs::read(&head).unwrap();
+        native_git(root, &["update-ref", "refs/heads/linked", &second]);
+        let after = discover_with_env(&linked, false, |_| None).unwrap();
+        assert_ne!(before.info, after.info);
+        assert_eq!(after.info.unwrap().hash, second);
+        assert_eq!(fs::read(&head).unwrap(), head_bytes);
+        assert_eq!(before.rerun_if_changed, after.rerun_if_changed);
+
+        // Creation alone is outside automatic freshness coverage: enabling
+        // the extension happened before the original discovery above.
+        native_git(&linked, &["config", "--worktree", "test.label", "changed"]);
+        assert_eq!(fs::read(common.join("config")).unwrap(), common_config);
+        assert!(
+            discover_with_env(&linked, false, |_| None)
+                .unwrap()
+                .rerun_if_changed
+                .contains(&worktree_config)
+        );
+        fs::write(&worktree_config, "[malformed\n").unwrap();
+        let error = discover_with_env(&linked, false, |_| None).unwrap_err();
+        assert!(error.contains("Git failed"), "{error}");
+    }
+
+    #[test]
+    fn native_symbolic_chain_watches_each_ref_and_refuses_cycles() {
+        let fixture = native_fixture();
+        let root = fixture.path();
+        let original = discover_with_env(root, false, |_| None).unwrap();
+        native_git(
+            root,
+            &["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
+        );
+        native_git(root, &["symbolic-ref", "HEAD", "refs/heads/alias"]);
+        let chained = discover_with_env(root, false, |_| None).unwrap();
+        assert_eq!(chained.info, original.info);
+        let alias = git_path(root, &["rev-parse", "--git-path", "refs/heads/alias"]).unwrap();
+        assert!(chained.rerun_if_changed.contains(&alias));
+        assert!(
+            original
+                .rerun_if_changed
+                .iter()
+                .all(|path| chained.rerun_if_changed.contains(path))
+        );
+        fs::write(alias, "ref: refs/heads/alias\n").unwrap();
+        let error = discover_with_env(root, false, |_| None).unwrap_err();
+        assert!(error.contains("cyclic symbolic reference"), "{error}");
+
+        for depth in 0..MAX_SYMBOLIC_REFS {
+            let current = format!("refs/heads/depth{depth}");
+            let next = format!("refs/heads/depth{}", depth + 1);
+            let path = git_path(root, &["rev-parse", "--git-path", &current]).unwrap();
+            fs::write(path, format!("ref: {next}\n")).unwrap();
+        }
+        let head = git_path(root, &["rev-parse", "--git-path", "HEAD"]).unwrap();
+        fs::write(head, "ref: refs/heads/depth0\n").unwrap();
+        let error = discover_with_env(root, false, |_| None).unwrap_err();
+        assert!(
+            error.contains("symbolic reference depth exceeded"),
+            "{error}"
+        );
+        assert!(discovery(None, vec![root.join("bad\ncargo:rustc-env=forged")]).is_err());
+    }
+
+    #[test]
+    fn recorded_label_inputs_preserve_precedence_creation_and_refusal() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let manifest = root.join("src/tools/targo");
+        fs::create_dir_all(&manifest).unwrap();
+        let record = root.join("git-commit-info");
+        let local = manifest.join("git-commit-info");
+        let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaa\n2026-10-24\n";
+        let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nbbbbbbbbb\n2026-10-24\n";
+        let absent = discover_with_env(&manifest, false, |_| None).unwrap();
+        assert_eq!(absent.info, None);
+        assert!(absent.rerun_if_changed.is_empty());
+        fs::write(&record, first).unwrap();
+        let root_record = discover_with_env(&manifest, false, |_| None).unwrap();
+        assert_eq!(root_record.info.as_ref().unwrap().short_hash, "aaaaaaaaa");
+        assert_eq!(root_record.rerun_if_changed, vec![record.clone()]);
+        fs::write(&local, second).unwrap();
+        let local_record = discover_with_env(&manifest, false, |_| None).unwrap();
+        assert_eq!(local_record.info.unwrap().short_hash, "bbbbbbbbb");
+        assert!(local_record.rerun_if_changed.contains(&local));
+        assert!(!local_record.rerun_if_changed.contains(&record));
+        fs::write(&local, "malformed\n").unwrap();
+        assert!(
+            discover_with_env(&manifest, false, |_| None).is_err(),
+            "a bad selected local record must not fall back to the valid root record"
+        );
+        fs::remove_file(&local).unwrap();
+        assert_eq!(
+            discover_with_env(&manifest, false, |_| None).unwrap().info,
+            root_record.info
+        );
+        fs::write(&record, second).unwrap();
+        assert_ne!(
+            discover_with_env(&manifest, false, |_| None).unwrap().info,
+            root_record.info
+        );
+
+        // On an explicit rediscovery (for example after clean), a complete
+        // Trust checkout replaces the still-valid recorded archive label.
+        for dir in [
+            root.join("compiler/rustc"),
+            root.join("src/ci"),
+            root.join("targo-trust"),
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        for file in [
+            root.join("x.py"),
+            root.join("src/ci/channel"),
+            root.join("targo-trust/Cargo.toml"),
+            manifest.join("Cargo.toml"),
+        ] {
+            fs::write(file, "fixture\n").unwrap();
+        }
+        native_git(root, &["init", "--quiet"]);
+        native_git(root, &["add", "x.py"]);
+        native_git(
+            root,
+            &["commit", "--quiet", "--no-gpg-sign", "-m", "checkout"],
+        );
+        let checkout = discover_with_env(&manifest, false, |_| None).unwrap();
+        assert_eq!(
+            checkout.info.unwrap().hash,
+            native_git(root, &["rev-parse", "HEAD"])
+        );
+        assert!(!checkout.rerun_if_changed.contains(&record));
+        assert!(!checkout.rerun_if_changed.contains(&root.join(".git")));
+    }
 
     fn env_tuple(values: &[(&str, &str)]) -> Result<Option<CommitInfo>, String> {
         let values = values
@@ -581,8 +1364,14 @@ mod tests {
         .into_iter()
         .map(|(name, value)| (name.to_string(), OsString::from(value)))
         .collect::<BTreeMap<_, _>>();
+        let supplied =
+            discover_with_env(&manifest_dir, false, |name| explicit.get(name).cloned()).unwrap();
+        assert!(
+            supplied.rerun_if_changed.is_empty(),
+            "explicit bootstrap labels must not acquire ambient Git/source dependencies"
+        );
         assert_eq!(
-            discover_with_env(&manifest_dir, false, |name| explicit.get(name).cloned()).unwrap(),
+            supplied.info,
             Some(CommitInfo {
                 hash: explicit_hash.to_string(),
                 short_hash: "aaaaaaaaa".to_string(),
@@ -600,13 +1389,122 @@ mod tests {
         );
         assert_eq!(
             discover_with_env(&manifest_dir, true, |name| partial.get(name).cloned()).unwrap(),
-            None,
+            Discovery {
+                info: None,
+                rerun_if_changed: Vec::new()
+            },
             "CFG_OMIT_GIT_HASH must suppress even malformed ambient metadata and checkout fallback"
         );
 
         fs::remove_file(root.join("targo-trust/Cargo.toml")).unwrap();
         assert_eq!(trust_checkout_root(&manifest_dir), None);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_git_fallback_never_fetches_promisor_head() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::temp_dir().join(format!(
+            "targo-build-commit-promisor-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let git = |args: &[&str]| {
+            let mut command = Command::new("git");
+            configure_git_environment(&mut command);
+            let output = command.arg("-C").arg(&root).args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "fixture Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        let ssh = root.join("fake-ssh");
+        let contacted = root.join("fake-ssh.contacted");
+        fs::write(
+            &ssh,
+            "#!/bin/sh\nprintf '%s\\n' contacted > \"$0.contacted\"\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh_command = format!("'{}'", ssh.to_str().unwrap().replace('\'', "'\\''"));
+        git(&["config", "core.sshCommand", &ssh_command]);
+        git(&["config", "ssh.variant", "ssh"]);
+        git(&[
+            "config",
+            "remote.origin.url",
+            "ssh://metadata-fixture.invalid/missing",
+        ]);
+        git(&["config", "remote.origin.promisor", "true"]);
+        git(&["config", "remote.origin.partialCloneFilter", "blob:none"]);
+
+        // An unreadable promisor HEAD must refuse locally, never repair the
+        // repository or invoke a transport while discovering a diagnostic label.
+        let head = b"1111111111111111111111111111111111111111\n";
+        fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(root.join(".git/refs/heads/main"), head).unwrap();
+        let config = fs::read(root.join(".git/config")).unwrap();
+
+        // Native positive control: this same repository really invokes SSH
+        // when lazy fetching and the SSH transport are explicitly permitted.
+        // The helper exits locally, so no network is contacted.
+        let mut online = Command::new("git");
+        configure_git_environment(&mut online);
+        let output = online
+            .env_remove("GIT_NO_LAZY_FETCH")
+            .env("GIT_ALLOW_PROTOCOL", "ssh")
+            .arg("-C")
+            .arg(&root)
+            .args(["log", "-1", "--format=%H%n%cd"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            contacted.exists(),
+            "native Git must exercise the promisor transport"
+        );
+        fs::remove_file(&contacted).unwrap();
+
+        let error = commit_info_from_git_command(&root, OsStr::new("git"), Duration::from_secs(2))
+            .unwrap_err();
+        assert!(error.contains("Git failed"), "{error}");
+        assert!(
+            !contacted.exists(),
+            "diagnostic Git must never invoke a transport"
+        );
+        assert_eq!(fs::read(root.join(".git/config")).unwrap(), config);
+        assert_eq!(fs::read(root.join(".git/refs/heads/main")).unwrap(), head);
+
+        // The transport prohibition must also hold when a Git version does
+        // not honor lazy-fetch suppression.
+        let mut transport_only = Command::new("git");
+        configure_git_environment(&mut transport_only);
+        let output = transport_only
+            .env("GIT_NO_LAZY_FETCH", "0")
+            .arg("-C")
+            .arg(&root)
+            .args(["log", "-1", "--format=%H%n%cd"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            !contacted.exists(),
+            "transport denial must independently hold"
+        );
     }
 
     #[cfg(unix)]

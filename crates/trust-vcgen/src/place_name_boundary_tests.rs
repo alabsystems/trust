@@ -69,6 +69,7 @@ fn two_asserts(second_param_name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -168,6 +169,43 @@ fn every_projection_segment_leads() {
             expected.starts_with(PROJECTION_SEGMENT_LEAD),
             "segment {expected:?} for {p:?} does not start with a boundary character, so it could \
              be read back as part of a base name"
+        );
+    }
+}
+
+/// Trust (W4 fix round 1, 2026-09-25): the byte predicate the place-name ALGEBRA
+/// reads (`place_names_overlap`, `place_root`, the establish and derived-length
+/// ancestor tests) is exactly this character set. It had drifted: all four spelled
+/// `.`/`[`/`*` and omitted `@`, the `Downcast` spelling, so a whole write of an
+/// enum local never rebound a fact over its payload `r@1.0` (probes r12..r12d, four
+/// kernel-certified false proofs through the `binary_search` result facts).
+#[test]
+fn segment_lead_byte_matches_the_char_set() {
+    for byte in 0u8..=127 {
+        assert_eq!(
+            crate::is_projection_segment_lead(byte),
+            PROJECTION_SEGMENT_LEAD.contains(&char::from(byte)),
+            "byte {:?} disagrees between the byte predicate and PROJECTION_SEGMENT_LEAD",
+            char::from(byte)
+        );
+    }
+    // Every emitted segment's lead byte is a separator for the algebra.
+    let func = two_asserts("flag");
+    for p in [
+        Projection::Field(0),
+        Projection::Index(2),
+        Projection::Deref,
+        Projection::Downcast(1),
+        Projection::OpaqueCast(Ty::Bool),
+        Projection::UnwrapUnsafeBinder(Ty::Bool),
+        Projection::ConstantIndex { offset: 1, min_length: 4, from_end: false },
+        Projection::Subslice { from: 1, to: 3, from_end: true },
+    ] {
+        let base = place_to_var_name(&func, &Place::local(1));
+        let name = place_to_var_name(&func, &Place { local: 1, projections: vec![p.clone()] });
+        assert!(
+            crate::generate::place_names_overlap(&base, &name),
+            "a write of `{base}` must rebind its projection `{name}` ({p:?})"
         );
     }
 }

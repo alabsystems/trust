@@ -544,15 +544,15 @@ fn normalize_not(f: &Formula) -> Formula {
 /// case-split rewrite ([`lift_ite`]).
 fn find_first_ite(f: &Formula) -> Option<(&Formula, &Formula, &Formula)> {
     use trust_types::Formula as F;
-    if let F::Ite(c, t, e) = f {
-        return Some((c, t, e));
-    }
-    for child in f.children() {
-        if let Some(found) = find_first_ite(child) {
-            return Some(found);
+    let mut found = None;
+    let _ = trust_types::all_formula_nodes(f, &mut |node| {
+        if let F::Ite(c, t, e) = node {
+            found = Some((c.as_ref(), t.as_ref(), e.as_ref()));
+            return false;
         }
-    }
-    None
+        true
+    });
+    found
 }
 
 /// Replace EVERY occurrence of the `Ite(cond, then, else)` whose condition is
@@ -1367,8 +1367,8 @@ pub(crate) fn cached_diag_path(
 /// the whole bucket as "missing capability" would overstate the headroom.
 fn note_refute_decline(reason: &'static str) {
     static REFUTE_DECLINE_LOG: std::sync::OnceLock<Option<std::path::PathBuf>> =
-            std::sync::OnceLock::new();
-        if let Some(path) = cached_diag_path(&REFUTE_DECLINE_LOG, "TRUST_REFUTE_DECLINE_LOG") {
+        std::sync::OnceLock::new();
+    if let Some(path) = cached_diag_path(&REFUTE_DECLINE_LOG, "TRUST_REFUTE_DECLINE_LOG") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{reason}");
@@ -1930,8 +1930,8 @@ fn operand_upper(
     // Trust: A LITERAL IS ITS OWN BOUND (2026-08-24). This arm used to decline,
     // on the recorded ground that a literal operand "would force the kernel to fold
     // `Int.sub (ofNat a)(ofNat b)` at a lemma-argument position, which it does not".
-    // MEASURED against the shipping kernel (`literal_int_sub_reduction_behaviour_is_
-    // what_the_comment_claims`): it DOES — `Int.sub 47 255` is def-eq to `-208` both
+    // MEASURED against the shipping kernel (`adjudicated_gap_1_widened_difference_
+    // range_check_refutes`): it DOES — `Int.sub 47 255` is def-eq to `-208` both
     // bare and under `Int.le` at exactly that position. The comment was stale.
     if let Formula::Int(_) = t {
         let cst = |s: &str| Expr::const_(Name::from_string(s), LevelVec::new());
@@ -2872,8 +2872,8 @@ fn build_false(atoms: &[Formula], vars: &[(String, bool)], n: u32, depth: u32) -
     // spent, so `REFUTE_SEARCH_FUEL` is set from the measured distribution of
     // SUCCESSFUL proofs rather than guessed.
     static REFUTE_FUEL_LOG: std::sync::OnceLock<Option<std::path::PathBuf>> =
-            std::sync::OnceLock::new();
-        if let Some(path) = cached_diag_path(&REFUTE_FUEL_LOG, "TRUST_REFUTE_FUEL_LOG") {
+        std::sync::OnceLock::new();
+    if let Some(path) = cached_diag_path(&REFUTE_FUEL_LOG, "TRUST_REFUTE_FUEL_LOG") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let spent = REFUTE_SEARCH_FUEL.saturating_sub(fuel);
@@ -3435,8 +3435,8 @@ fn check_refute_vc_inner_with_heartbeats(
     // ~110_000 nodes, while the curated corpus contains proofs up to 827_827 nodes
     // that the kernel checks without trouble. Size does not predict cost.
     static PROOF_SIZE_LOG: std::sync::OnceLock<Option<std::path::PathBuf>> =
-            std::sync::OnceLock::new();
-        if let Some(path) = cached_diag_path(&PROOF_SIZE_LOG, "TRUST_PROOF_SIZE_LOG") {
+        std::sync::OnceLock::new();
+    if let Some(path) = cached_diag_path(&PROOF_SIZE_LOG, "TRUST_PROOF_SIZE_LOG") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{}", proof_dag_size(&proof));
@@ -3857,14 +3857,19 @@ mod tests {
         let ty = trust_types::Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Pt".into(),
             fields: vec![
                 ("x".into(), trust_types::Ty::Int { width: 32, signed: true }),
                 ("y".into(), trust_types::Ty::Int { width: 32, signed: true }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let carrier = crate::reflect::reflect_struct(&ty).expect("Pt reflects");
         let mut env = clean_kernel::Environment::with_prelude();
         let registry =
@@ -3892,6 +3897,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let params = StructParams::from_function(&func, &registry);
 
@@ -3938,7 +3944,8 @@ mod tests {
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
                 ("__v0_0".into(), u32t()),
                 ("__v1_0".into(), u32t()),
-            ],
+            ]
+            .into(),
             variants: vec![
                 VariantDef {
                     name: "A".into(),
@@ -3950,9 +3957,14 @@ mod tests {
                     discriminant: 1,
                     fields: vec![("0".into(), u32t())],
                 },
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let carrier = crate::reflect::reflect_struct(&enum_ty).expect("E reflects as an enum");
         assert_eq!(carrier.fields.len(), 1, "the sum carrier exposes payloads, not __tag");
         assert_eq!(carrier.fields[0].0, "0", "constructor fields retain source names");
@@ -3978,6 +3990,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let params = StructParams::from_function(&func, &registry);
 
@@ -4130,10 +4143,14 @@ mod tests {
                 adt_kind: None,
                 layout: None,
                 name: format!("Malformed_{case}"),
-                fields,
-                variants,
+                fields: fields.into(),
+                variants: variants.into(),
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            };
             let carrier = crate::reflect::reflect_struct(&malformed)
                 .unwrap_or_else(|| panic!("{case}: variant view reflects"));
             assert!(
@@ -4185,7 +4202,7 @@ mod tests {
         let ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Wrapper".into(),
             fields: vec![
                 (
@@ -4196,9 +4213,14 @@ mod tests {
                     },
                 ),
                 ("count".into(), Ty::Int { width: 32, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let carrier =
             crate::reflect::reflect_struct(&ty).expect("Wrapper<T> reflects parameterized");
         assert!(carrier.is_parameterized());
@@ -4229,6 +4251,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let params = StructParams::from_function(&func, &registry);
 
@@ -4992,80 +5015,6 @@ mod tests {
         assert_eq!(starved, None, "budget exhaustion declines fail-closed");
     }
 
-    /// Is the "literal-arg reduction trap" still real? Measured, not assumed.
-    ///
-    /// `operand_upper`/`operand_lower` reject a literal operand because "a literal
-    /// operand would force the kernel to fold `Int.sub (ofNat a)(ofNat b)` at a
-    /// lemma-argument position, which it does not". Several docs in this tree have
-    /// gone stale today, so this checks the claim directly against the kernel that
-    /// ships rather than trusting the comment.
-    #[test]
-    fn literal_int_sub_reduction_behaviour_is_what_the_comment_claims() {
-        let env = env_with_order_lemmas().expect("order-lemma env builds");
-        let tc = TypeChecker::new(&env);
-        let cst = |s: &str| Expr::const_(Name::from_string(s), LevelVec::new());
-        // `Int.sub 47 255` against the folded literal `-208`.
-        let sub_term = Expr::apps(cst("Int.sub"), [int_lit(47), int_lit(255)]);
-        let folded = int_lit(-208);
-        let bare = tc.is_def_eq(&sub_term, &folded);
-        eprintln!("  Int.sub 47 255  ==def==  -208   : {bare}");
-
-        // The position that matters: the same equation as an ARGUMENT to a lemma —
-        // here as the subject of `Int.le`, which is where `sub_le_sub`'s type puts it.
-        let le_sub = Expr::apps(cst("Int.le"), [sub_term.clone(), int_lit(0)]);
-        let le_folded = Expr::apps(cst("Int.le"), [folded.clone(), int_lit(0)]);
-        let in_arg = tc.is_def_eq(&le_sub, &le_folded);
-        eprintln!("  Int.le (Int.sub 47 255) 0  ==def==  Int.le -208 0 : {in_arg}");
-
-        // No assertion on WHICH way it goes — this test exists to make the kernel's
-        // actual behaviour visible next to the comment that asserts it. Both results
-        // are printed; the follow-up work depends on them.
-        assert!(bare || !bare, "observational");
-    }
-
-    /// How many of the 18 solver-adjudicated gaps does the literal-bound fix close?
-    ///
-    /// Reads a file of undischarged VC formulas (one JSON `Formula` per line) named
-    /// by `TRUST_GAP_REPLAY`, and reports how many now refute modulo 3. Pointed at
-    /// the 18 formulas a complete solver called UNSAT, it measures the fix against
-    /// exactly the gap that motivated it rather than against a corpus average.
-    ///
-    /// No-op without the env var, so it costs the default suite nothing.
-    #[test]
-    fn replay_the_adjudicated_gaps() {
-        let Ok(path) = std::env::var("TRUST_GAP_REPLAY") else { return };
-        let Ok(text) = std::fs::read_to_string(&path) else { return };
-        let (mut refuted, mut still, mut unparsed) = (0usize, 0usize, 0usize);
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(f) = serde_json::from_str::<Formula>(line) else {
-                unparsed += 1;
-                continue;
-            };
-            match check_refute_vc(&f) {
-                Some(RefuteOutcome::RefutedModulo3) => refuted += 1,
-                _ => {
-                    still += 1;
-                    if let Ok(out) = std::env::var("TRUST_GAP_REMAINING") {
-                        use std::io::Write;
-                        if let Ok(mut fh) =
-                            std::fs::OpenOptions::new().create(true).append(true).open(out)
-                        {
-                            let _ = writeln!(fh, "{line}");
-                        }
-                    }
-                }
-            }
-        }
-        eprintln!(
-            "\n  gap replay: {refuted} now REFUTE modulo 3, {still} still undischarged, \
-             {unparsed} unparsable"
-        );
-    }
-
     /// THE MEASURED ENGINE GAP — CLOSED (2026-08-24).
     ///
     /// Adjudicating the undischarged safety obligations with a complete solver found
@@ -5083,11 +5032,11 @@ mod tests {
     /// that a literal operand would force the kernel to fold `Int.sub` at a
     /// lemma-argument position "which it does not".
     ///
-    /// That note was STALE. Measured against the shipping kernel
-    /// (`literal_int_sub_reduction_behaviour_is_what_the_comment_claims`),
-    /// `Int.sub 47 255` is def-eq to `-208` both bare and under `Int.le` at exactly
-    /// that position. Admitting a literal as its own bound (`Int.le_refl`) in both
-    /// directions closes the arm, and the kernel accepts the resulting proof.
+    /// That note was STALE. Measured against the shipping kernel (this test's lower
+    /// arm requires it), `Int.sub 47 255` is def-eq to `-208` both bare and under
+    /// `Int.le` at exactly that position. Admitting a literal as its own bound
+    /// (`Int.le_refl`) in both directions closes the arm, and the kernel accepts the
+    /// resulting proof.
     #[test]
     fn adjudicated_gap_1_widened_difference_range_check_refutes() {
         use trust_types::{Formula as F, Sort};

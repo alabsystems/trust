@@ -1,0 +1,28 @@
+[package]
+name = "jobserver_utils"
+version = "0.0.0"
+edition = "2024"
+
+# Trust: shared runtime scheduling authority; independent of bootstrap policy
+# helpers, argument parsing, compiler internals and Cargo workspace internals.
+[features]
+# Existing clients retain their GNU scheduling API. A custodian can transfer
+# existing descriptors without linking or minting a GNU token client.
+default = ["client"]
+client = ["dep:jobserver"]
+
+# Trust: a synchronous compiler caller may lend its own execution, never credits.
+[[example]]
+name = "lend_execution"
+path = "examples/lend_execution.rs"
+required-features = ["client"]
+
+[dependencies]
+jobserver = { version = "=0.1.35", path = "../../vendor/jobserver", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Trust: the scoped handoff tests create their FIFO witnesses in a fresh directory.
+tempfile = "3.23.0"

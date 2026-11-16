@@ -1,0 +1,2489 @@
+{
+  "name": "f",
+  "def_path": "yg_h4b::f",
+  "span": {
+    "file": "build/tmp/fix103/p/yg_h4b.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 32,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n1"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Windows",
+            "fields": [
+              [
+                "v",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Slice": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "size",
+                {
+                  "Adt": {
+                    "name": "core::num::nonzero::NonZero",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "core::num::niche_types::NonZeroUsizeInner",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "w0"
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Slice": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Slice": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "o"
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::slice::iter::Windows",
+                "fields": [
+                  [
+                    "v",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Slice": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "size",
+                    {
+                      "Adt": {
+                        "name": "core::num::nonzero::NonZero",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Adt": {
+                                "name": "core::num::niche_types::NonZeroUsizeInner",
+                                "fields": [
+                                  [
+                                    "0",
+                                    {
+                                      "Int": {
+                                        "width": 64,
+                                        "signed": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "acc"
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "w"
+      },
+      {
+        "index": 13,
+        "ty": "Bool",
+        "name": "c"
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n2"
+      },
+      {
+        "index": 15,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Windows",
+            "fields": [
+              [
+                "v",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Slice": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "size",
+                {
+                  "Adt": {
+                    "name": "core::num::nonzero::NonZero",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "core::num::niche_types::NonZeroUsizeInner",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "it"
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Slice": {
+                        "elem": {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Slice": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::slice::iter::Windows",
+                "fields": [
+                  [
+                    "v",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Slice": {
+                            "elem": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "size",
+                    {
+                      "Adt": {
+                        "name": "core::num::nonzero::NonZero",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Adt": {
+                                "name": "core::num::niche_types::NonZeroUsizeInner",
+                                "fields": [
+                                  [
+                                    "0",
+                                    {
+                                      "Int": {
+                                        "width": 64,
+                                        "signed": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 2,
+                "col_start": 7,
+                "line_end": 2,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 2,
+              "col_start": 7,
+              "line_end": 2,
+              "col_end": 14
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 2,
+                "col_start": 18,
+                "line_end": 2,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 2,
+                "col_start": 18,
+                "line_end": 2,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 2,
+              "col_start": 18,
+              "line_end": 2,
+              "col_end": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 3,
+                "col_start": 15,
+                "line_end": 3,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 26
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::windows",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    4,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 5,
+              "col_start": 17,
+              "line_end": 5,
+              "col_end": 29
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 15445,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 6,
+                "col_start": 16,
+                "line_end": 6,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::Windows<'_, u8> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Move": {
+                  "local": 8,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 7,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 6,
+              "col_start": 16,
+              "line_end": 6,
+              "col_end": 25
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 10530,
+              "substs_digest": [
+                16522309563941202860,
+                11610352619244075131
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 7,
+                "col_start": 18,
+                "line_end": 7,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      32
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 8,
+                "col_start": 16,
+                "line_end": 8,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 7,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 10,
+                "col_start": 25,
+                "line_end": 10,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                1,
+                7
+              ],
+              [
+                0,
+                23
+              ]
+            ],
+            "otherwise": 27,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 10,
+              "col_start": 15,
+              "line_end": 10,
+              "col_end": 22
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 7,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 10,
+                "col_start": 20,
+                "line_end": 10,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 11,
+                "col_start": 24,
+                "line_end": 11,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 8
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 13,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 13,
+                "col_start": 28,
+                "line_end": 13,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 15,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                10
+              ]
+            ],
+            "otherwise": 9,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 13,
+              "col_start": 28,
+              "line_end": 13,
+              "col_end": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      4,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 13,
+                "col_start": 32,
+                "line_end": 13,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 11
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 13,
+                "col_start": 43,
+                "line_end": 13,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 11
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 14,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 14,
+                "col_start": 24,
+                "line_end": 14,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 17,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 14,
+                "col_start": 24,
+                "line_end": 14,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 18,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 12,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 14,
+              "col_start": 24,
+              "line_end": 14,
+              "col_end": 30
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 18,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 14,
+                "col_start": 24,
+                "line_end": 14,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 13,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 15,
+                "col_start": 19,
+                "line_end": 15,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 19,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                17
+              ]
+            ],
+            "otherwise": 13,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 15,
+              "col_start": 19,
+              "line_end": 15,
+              "col_end": 20
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 16,
+                "col_start": 26,
+                "line_end": 16,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 16,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 16,
+                "col_start": 45,
+                "line_end": 16,
+                "col_end": 50
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 24,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 14,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 16,
+              "col_start": 45,
+              "line_end": 16,
+              "col_end": 50
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 24,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 16,
+                "col_start": 45,
+                "line_end": 16,
+                "col_end": 50
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 16,
+                "col_start": 43,
+                "line_end": 16,
+                "col_end": 51
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 23,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 25,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 16,
+                "col_start": 43,
+                "line_end": 16,
+                "col_end": 51
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 26,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 15,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 16,
+              "col_start": 43,
+              "line_end": 16,
+              "col_end": 51
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 12,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Index": 23
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 16,
+                "col_start": 43,
+                "line_end": 16,
+                "col_end": 51
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 21,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 22,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 20,
+              "projections": []
+            },
+            "target": 16,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 16,
+              "col_start": 26,
+              "line_end": 16,
+              "col_end": 52
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 20,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 16,
+                "col_start": 20,
+                "line_end": 16,
+                "col_end": 52
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 17
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 13,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 18,
+                "col_start": 19,
+                "line_end": 18,
+                "col_end": 20
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 27,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                18
+              ]
+            ],
+            "otherwise": 19,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 18,
+              "col_start": 19,
+              "line_end": 18,
+              "col_end": 20
+            }
+          }
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 10,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 18,
+                "col_start": 24,
+                "line_end": 18,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Move": {
+                      "local": 29,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 18,
+                "col_start": 24,
+                "line_end": 18,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 28,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                22
+              ]
+            ],
+            "otherwise": 19,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 18,
+              "col_start": 24,
+              "line_end": 18,
+              "col_end": 30
+            }
+          }
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [u8]>::windows",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 16,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 30,
+              "projections": []
+            },
+            "target": 20,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 19,
+              "col_start": 33,
+              "line_end": 19,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 15445,
+              "substs_digest": [
+                11436714793398030657,
+                9340045001130671630
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 30,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 20,
+                "col_start": 24,
+                "line_end": 20,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::slice::iter::Windows<'_, u8> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Move": {
+                  "local": 32,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 31,
+              "projections": []
+            },
+            "target": 21,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 20,
+              "col_start": 24,
+              "line_end": 20,
+              "col_end": 33
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 10530,
+              "substs_digest": [
+                16522309563941202860,
+                11610352619244075131
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 21,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 31,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 20,
+                "col_start": 20,
+                "line_end": 20,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 23
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 23,
+                "col_start": 16,
+                "line_end": 23,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 8
+        }
+      },
+      {
+        "id": 23,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 33,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 26,
+                "col_start": 8,
+                "line_end": 26,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 33,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 24,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 26,
+              "col_start": 8,
+              "line_end": 26,
+              "col_end": 14
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 24,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 33,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 26,
+                "col_start": 8,
+                "line_end": 26,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 35,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 10,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 27,
+                "col_start": 11,
+                "line_end": 27,
+                "col_end": 12
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 35,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 27,
+                "col_start": 11,
+                "line_end": 27,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 34,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ]
+            ],
+            "otherwise": 25,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "build/tmp/fix103/p/yg_h4b.rs",
+              "line_start": 27,
+              "col_start": 11,
+              "line_end": 27,
+              "col_end": 16
+            }
+          }
+        }
+      },
+      {
+        "id": 25,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "build/tmp/fix103/p/yg_h4b.rs",
+                "line_start": 31,
+                "col_start": 4,
+                "line_end": 31,
+                "col_end": 7
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 26
+        }
+      },
+      {
+        "id": 26,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 27,
+        "stmts": [],
+        "terminator": "Unreachable"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_11",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_11",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n1",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n1",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Ge": [
+        {
+          "Var": [
+            "a__slice_len",
+            "Int"
+          ]
+        },
+        {
+          "Int": 0
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

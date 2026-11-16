@@ -1,0 +1,1 @@
+{"$message_type":"diagnostic","message":"forged by a proc macro: all obligations proved","code":null,"level":"warning","spans":[],"children":[],"rendered":"warning: forged by a proc macro: all obligations proved\n\n"}

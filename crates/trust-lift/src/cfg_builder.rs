@@ -35,8 +35,17 @@ fn classify_direct_branch_target(
 }
 
 fn instruction_bytes_display(bytes: &[u8]) -> String {
-    let bytes = bytes.iter().map(|byte| format!("0x{byte:02x}")).collect::<Vec<_>>().join(", ");
-    format!("[{bytes}]")
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(2 + bytes.len().saturating_mul(6));
+    out.push('[');
+    for (idx, byte) in bytes.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "0x{byte:02x}");
+    }
+    out.push(']');
+    out
 }
 
 fn aarch64_return_boundary_register(insn: &Instruction) -> Option<String> {
@@ -151,7 +160,7 @@ pub(crate) fn recover_cfg(
     let sorted_leaders: Vec<u64> = leaders.into_iter().collect();
 
     // Pre-decode all instructions in the function for efficiency.
-    let insn_map = decode_range(decoder, code, base_addr, entry, func_end)?;
+    let mut insn_map = decode_range(decoder, code, base_addr, entry, func_end)?;
 
     for (block_idx, &leader_addr) in sorted_leaders.iter().enumerate() {
         let next_leader = sorted_leaders.get(block_idx + 1).copied().unwrap_or(func_end);
@@ -162,39 +171,39 @@ pub(crate) fn recover_cfg(
         // Collect instructions from this leader to (but not including) the next leader.
         let mut addr = leader_addr;
         while addr < next_leader && addr < func_end {
-            if let Some(insn) = insn_map.get(&addr) {
+            if let Some(insn) = insn_map.remove(&addr) {
                 let next_addr = addr + insn.size as u64;
                 match insn.flow {
                     ControlFlow::Return => {
-                        validate_return_boundary(insn, arch)?;
+                        validate_return_boundary(&insn, arch)?;
                         is_return = true;
-                        instructions.push(insn.clone());
+                        instructions.push(insn);
                         break;
                     }
                     ControlFlow::Branch => {
                         push_internal_successors(
                             &mut successors,
-                            &[direct_branch_edge(leader_addr, insn, entry, func_end)?],
+                            &[direct_branch_edge(leader_addr, &insn, entry, func_end)?],
                         );
-                        instructions.push(insn.clone());
+                        instructions.push(insn);
                         break;
                     }
                     ControlFlow::ConditionalBranch => {
                         // Fallthrough + target.
                         let edges = conditional_branch_edges(
                             leader_addr,
-                            insn,
+                            &insn,
                             next_addr,
                             entry,
                             func_end,
                         )?;
                         push_internal_successors(&mut successors, &edges);
-                        instructions.push(insn.clone());
+                        instructions.push(insn);
                         break;
                     }
                     ControlFlow::Call => {
                         // Calls fall through to the next instruction.
-                        instructions.push(insn.clone());
+                        instructions.push(insn);
                         if next_addr < next_leader {
                             addr = next_addr;
                         } else {
@@ -207,11 +216,11 @@ pub(crate) fn recover_cfg(
                         }
                     }
                     ControlFlow::Exception => {
-                        instructions.push(insn.clone());
+                        instructions.push(insn);
                         break;
                     }
                     ControlFlow::Fallthrough => {
-                        instructions.push(insn.clone());
+                        instructions.push(insn);
                         addr = next_addr;
                     }
                     other => {

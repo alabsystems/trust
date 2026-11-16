@@ -1,0 +1,732 @@
+[
+  [
+    {
+      "BvAdd": [
+        {
+          "Var": [
+            "X0",
+            {
+              "BitVec": 64
+            }
+          ]
+        },
+        {
+          "BitVec": {
+            "value": 0,
+            "width": 64
+          }
+        },
+        64
+      ]
+    },
+    {
+      "Var": [
+        "X0",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Select": [
+        {
+          "Store": [
+            {
+              "Var": [
+                "CER_MEM0@source_c_signed:fn6",
+                {
+                  "Array": [
+                    {
+                      "BitVec": 64
+                    },
+                    {
+                      "BitVec": 8
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "BvAdd": [
+                {
+                  "Var": [
+                    "X0",
+                    {
+                      "BitVec": 64
+                    }
+                  ]
+                },
+                {
+                  "BitVec": {
+                    "value": 0,
+                    "width": 64
+                  }
+                },
+                64
+              ]
+            },
+            {
+              "BvExtract": {
+                "high": 7,
+                "inner": {
+                  "BvExtract": {
+                    "high": 7,
+                    "inner": {
+                      "BvZeroExt": [
+                        {
+                          "BvZeroExt": [
+                            {
+                              "BvExtract": {
+                                "high": 7,
+                                "inner": {
+                                  "BvExtract": {
+                                    "high": 31,
+                                    "inner": {
+                                      "Var": [
+                                        "X1",
+                                        {
+                                          "BitVec": 64
+                                        }
+                                      ]
+                                    },
+                                    "low": 0
+                                  }
+                                },
+                                "low": 0
+                              }
+                            },
+                            24
+                          ]
+                        },
+                        32
+                      ]
+                    },
+                    "low": 0
+                  }
+                },
+                "low": 0
+              }
+            }
+          ]
+        },
+        {
+          "Var": [
+            "CER_LEAF_QUERY@6f730f51bd83601d193a141525e57bc57524eb4ca3f3a8d4e8c5ba543eb44742:trust_c_i8_store",
+            {
+              "BitVec": 64
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Select": [
+        {
+          "Store": [
+            {
+              "Var": [
+                "CER_MEM0@source_c_signed:fn6",
+                {
+                  "Array": [
+                    {
+                      "BitVec": 64
+                    },
+                    {
+                      "BitVec": 8
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "Var": [
+                "X0",
+                {
+                  "BitVec": 64
+                }
+              ]
+            },
+            {
+              "BvExtract": {
+                "high": 7,
+                "inner": {
+                  "BvExtract": {
+                    "high": 7,
+                    "inner": {
+                      "BvExtract": {
+                        "high": 63,
+                        "inner": {
+                          "Var": [
+                            "X1",
+                            {
+                              "BitVec": 64
+                            }
+                          ]
+                        },
+                        "low": 0
+                      }
+                    },
+                    "low": 0
+                  }
+                },
+                "low": 0
+              }
+            }
+          ]
+        },
+        {
+          "Var": [
+            "CER_LEAF_QUERY@6f730f51bd83601d193a141525e57bc57524eb4ca3f3a8d4e8c5ba543eb44742:trust_c_i8_store",
+            {
+              "BitVec": 64
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X19",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X19",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X20",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X20",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X21",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X21",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X22",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X22",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X23",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X23",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X24",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X24",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X25",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X25",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X26",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X26",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X27",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X27",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X28",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X28",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X29",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X29",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "Var": [
+        "SP",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "SP",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V8",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    },
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V8",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    }
+  ],
+  [
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V9",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    },
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V9",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    }
+  ],
+  [
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V10",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    },
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V10",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    }
+  ],
+  [
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V11",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    },
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V11",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    }
+  ],
+  [
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V12",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    },
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V12",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    }
+  ],
+  [
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V13",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    },
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V13",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    }
+  ],
+  [
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V14",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    },
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V14",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    }
+  ],
+  [
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V15",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    },
+    {
+      "BvExtract": {
+        "high": 63,
+        "inner": {
+          "Var": [
+            "V15",
+            {
+              "BitVec": 128
+            }
+          ]
+        },
+        "low": 0
+      }
+    }
+  ],
+  [
+    {
+      "Var": [
+        "X30",
+        {
+          "BitVec": 64
+        }
+      ]
+    },
+    {
+      "Var": [
+        "X30",
+        {
+          "BitVec": 64
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "BvExtract": {
+        "high": 31,
+        "inner": {
+          "BvZeroExt": [
+            {
+              "BvOr": [
+                {
+                  "BitVec": {
+                    "value": 0,
+                    "width": 32
+                  }
+                },
+                {
+                  "BvExtract": {
+                    "high": 31,
+                    "inner": {
+                      "BvSignExt": [
+                        {
+                          "BvExtract": {
+                            "high": 7,
+                            "inner": {
+                              "BvZeroExt": [
+                                {
+                                  "BvNot": [
+                                    {
+                                      "BitVec": {
+                                        "value": 6,
+                                        "width": 32
+                                      }
+                                    },
+                                    32
+                                  ]
+                                },
+                                32
+                              ]
+                            },
+                            "low": 0
+                          }
+                        },
+                        56
+                      ]
+                    },
+                    "low": 0
+                  }
+                },
+                32
+              ]
+            },
+            32
+          ]
+        },
+        "low": 0
+      }
+    },
+    {
+      "BvSignExt": [
+        {
+          "BitVec": {
+            "value": -7,
+            "width": 8
+          }
+        },
+        24
+      ]
+    }
+  ]
+]

@@ -13,23 +13,20 @@
 //! dispatch"*. A budget derivation that returns nothing, or that returns a
 //! ceiling the coordinator will not admit, produces exactly that log.
 //!
-//! The timeout split is sharper still. `trust-router`'s
-//! `try_disjoint_component_refutation` states its own soundness condition in
-//! prose:
+//! The timeout split has a different sentinel: `0` means unbounded. Its
+//! `ensures result <= total_ms` proves a numeric upper bound for ONE component,
+//! not that all components together fit the caller's timeout. Returning the
+//! whole `total_ms` for every component also satisfies it. The actual 1 ms
+//! floor makes `split_budget_ms(1, 64) == 1`, so 64 nominal component budgets
+//! sum to 64 ms, not 1 ms.
 //!
-//! > *the retry must not multiply the caller's per-obligation timeout. The
-//! > compiler computes that timeout as `min(configured,
-//! > remaining_function_budget)` precisely so ONE VC cannot outlive the
-//! > function's budget; re-solving N components at the full timeout would
-//! > defeat it and — by exhausting the shared budget — **change the verdict of
-//! > LATER obligations**, which is exactly the neutrality this lane claims.*
-//!
-//! That condition is a one-line inequality — the per-component budget must not
-//! exceed the whole budget — and it is exactly what [`split_budget_ms`]'s
-//! `ensures result <= total_ms` states. **This is the rare case where the
-//! clause language can say the actual safety property rather than a bound
-//! standing in for one.** Same for [`per_job_bytes`]: `result <= budget_bytes`
-//! IS "a single job may not be promised more than the machine has".
+//! **Correction, 2026-10-20:** earlier documentation called that upper bound
+//! "the neutrality condition" and claimed it excluded multiplying the whole
+//! retry's budget. It does neither. `trust-router` must enforce one absolute
+//! deadline across the original solve and its retries; this arithmetic alone
+//! cannot account for elapsed work. `per_job_bytes`'s `result <= budget_bytes`
+//! separately states that one job cannot be promised more than the machine's
+//! budget, without making a claim about the sum of concurrent reservations.
 //!
 //! # Why it fits the fragment
 //!
@@ -56,14 +53,15 @@
 //!
 //! # What is proved, and what is only tested
 //!
-//! `result <= total_ms` and `result <= budget_bytes` are the real properties
-//! and are proved. They do not pin the VALUE — a constant `0` satisfies both,
-//! and for [`split_budget_ms`] a constant `0` is the *unsound-for-neutrality*
-//! answer (it means unbounded), which is why
-//! `split_budget_ms_is_never_zero_for_a_bounded_caller` exists and why the gate
-//! watches a wrong-value mutation pass the lane at exit 0 while that test goes
-//! red. Every value is pinned against an independent oracle over a domain that
-//! includes both `u64` extremes.
+//! The per-call bounds `result <= total_ms` and `result <= budget_bytes`
+//! do not pin the exact VALUE. The timeout helper also states
+//! `total_ms > 0 ==> result > 0`, so bounded callers cannot receive the
+//! zero/unbounded sentinel. A constant `0` satisfies the upper bound alone
+//! and violates this conditional clause. The strict gate retains that weaker
+//! contract as a control and requires the strengthened contract to reject a
+//! broken floor. `split_budget_ms_is_never_zero_for_a_bounded_caller` remains
+//! an independent unit oracle. The other value oracles include both `u64`
+//! extremes and still check properties the clauses do not state.
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
@@ -228,7 +226,7 @@ fn raw_megabytes(bytes: u64) -> u64 {
 trust_contract_fn! {
 /// One component's share of a `total_ms` per-obligation timeout when a
 /// decomposed retry solves `parts` components: the even split, floored at 1 ms
-/// so no component is given a zero (instantly-expiring) budget.
+/// so no bounded component is given the zero/unbounded sentinel.
 ///
 /// **`0` MEANS UNBOUNDED HERE, NOT "NO ANSWER".** `trust-router`'s
 /// `timeout_ms` already carries that convention and this function preserves it:
@@ -236,23 +234,30 @@ trust_contract_fn! {
 /// `0` is the WIDE end, and it is why the clause below cannot be the whole
 /// story.
 ///
-/// **Clause `result <= total_ms`.** This is the neutrality condition
-/// `try_disjoint_component_refutation` states in prose and never checked: the
-/// whole retry must cost what ONE solve was already allowed to cost. It rules
-/// out `total_ms` returned per component (the N-times-the-budget bug the doc
-/// warns about), `total_ms * parts`, and `total_ms + 1`.
+/// **Clause `result <= total_ms`.** One component's numeric timeout cannot
+/// exceed the supplied timeout. It excludes oversized answers, but admits both
+/// a constant `0` and `total_ms` returned unchanged for every component. It says
+/// nothing about the sum of component timeouts, elapsed work, or a deadline.
+/// With `parts >= 1`, the implementation's nominal sum is at most
+/// `max(total_ms, parts)` milliseconds: the floor can exceed `total_ms` when
+/// there are more components than milliseconds. The unit oracle checks that
+/// arithmetic; a shared absolute deadline belongs to the caller.
 ///
-/// **It does NOT rule out a constant `0`, and here that is the DANGEROUS
-/// direction** — `0` means unbounded, so a function that always returned it
-/// would give every component an unlimited budget, which is precisely the
-/// verdict-changing behaviour the clause exists to prevent. The clause language
-/// cannot say "nonzero when `total_ms` is nonzero" (an implication over a
-/// parameter is not writable, §13.9), so
-/// `split_budget_ms_is_never_zero_for_a_bounded_caller` says it instead, and
-/// `trust_budget_strict_gate.sh` mutation E watches the lane PASS at exit 0
-/// with that mutation in place while the test goes red.
+/// **Correction, 2026-10-20:** the upper-bound clause was previously described
+/// as aggregate retry neutrality. The historical strict-lane results still
+/// prove only the stated per-component inequality.
+///
+/// **Clause `total_ms > 0 ==> result > 0`.** A bounded caller receives a
+/// positive component timeout, including when the quotient rounds down to
+/// zero. The upper bound alone admits the dangerous zero/unbounded sentinel;
+/// this additional clause excludes it. It still admits returning the whole
+/// timeout for each component and makes no aggregate deadline claim.
+/// `split_budget_ms_is_never_zero_for_a_bounded_caller` retains an independent
+/// unit oracle for the same property. Historical measurements on installed
+/// Trust `321aaeda7` left this clause unknown; current compiler measurements
+/// and the gate's live mutation controls determine support on a new toolchain.
 pub fn split_budget_ms(total_ms: u64, parts: u64) -> u64
-clauses [ensures result <= total_ms]
+clauses [ensures result <= total_ms ensures total_ms > 0 ==> result > 0]
 {
     if total_ms == 0 {
         return 0;
@@ -441,23 +446,19 @@ mod tests {
         }
     }
 
-    /// THE NEUTRALITY CONDITION, asserted rather than argued: N components at
-    /// the split budget must not cost more than one solve at the whole budget.
+    /// Nominal timeout arithmetic, separate from the caller's deadline. The
+    /// 1 ms floor permits N milliseconds when N exceeds the finite budget.
     #[test]
-    fn the_whole_retry_costs_at_most_one_solve() {
-        for total in [1u64, 2, 3, 5, 99, 100, 1000, 600_000] {
+    fn timeout_split_respects_its_aggregate_rounding_bound() {
+        for total in [1u64, 2, 3, 5, 99, 100, 1000, 600_000, u64::MAX] {
             for parts in 1..=64u64 {
                 let each = split_budget_ms(total, parts);
-                // The floor at 1 ms can round UP, so the guarantee is per
-                // component; the sum is bounded by the whole budget whenever
-                // the split is not floored.
                 assert!(each <= total, "a component got more than the whole budget");
-                if total / parts >= 1 {
-                    assert!(
-                        each.saturating_mul(parts) <= total.saturating_add(parts),
-                        "the retry multiplied the budget at total={total} parts={parts}"
-                    );
-                }
+                let aggregate = u128::from(each) * u128::from(parts);
+                assert!(
+                    aggregate <= u128::from(total).max(u128::from(parts)),
+                    "nominal timeouts exceeded the floor-aware bound at total={total} parts={parts}"
+                );
             }
         }
     }

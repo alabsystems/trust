@@ -1,0 +1,117 @@
+{
+  "name": "bug_w6_i128_as_u128_half",
+  "def_path": "probes_128_false::bug_w6_i128_as_u128_half",
+  "span": {
+    "file": "probes_128_false.rs",
+    "line_start": 9,
+    "col_start": 0,
+    "line_end": 9,
+    "col_end": 120
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": true
+          }
+        },
+        "name": "x"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 128,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probes_128_false.rs",
+                "line_start": 9,
+                "col_start": 109,
+                "line_end": 9,
+                "col_end": 109
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 128,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "probes_128_false.rs",
+        "line_start": 9,
+        "col_start": 57,
+        "line_end": 9,
+        "col_end": 106
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) <= (170141183460469231731687303715884105727)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Le": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": "170141183460469231731687303715884105727"
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) <= (170141183460469231731687303715884105727)"
+    ],
+    "invariants": []
+  }
+}

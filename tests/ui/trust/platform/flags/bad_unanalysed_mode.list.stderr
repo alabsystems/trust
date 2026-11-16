@@ -1,0 +1,2 @@
+error: incorrect value `warn,deny` for unstable option `trust-platform-unanalysed` - one of `warn` or `deny` was expected
+

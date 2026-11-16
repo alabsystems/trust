@@ -24,10 +24,10 @@ trust/
 │   ├── trust-backprop/     #   Source rewriting (Idea 3)
 │   ├── trust-convergence/  #   Fixed-point detection
 │   ├── trust-proof-cert/   #   Proof certificates
-│   ├── trust-cache/        #   Formula hash and result caching
+│   ├── trust-cache/        #   Verification-semantics key and cache file locks
 │   ├── trust-loop/         #   Prove-strengthen-backprop driver — NOT in the
 │   │                       #     compiler path; see the note below
-│   └── ...                 #   57 crate directories; 52 workspace members
+│   └── ...                 #   96 crate directories; 90 members of crates/Cargo.toml
 ├── targo-trust/           # `targo trust` verifier subcommand implementation
 ├── library/                # Rust standard library (upstream, read-only)
 └── x.py                    # Upstream build system
@@ -215,9 +215,11 @@ reached through the full-verification engine, not through a `*_backend.rs` file
 here. Read the current directory before citing this table — a stale backend list
 was one of the errors that made this file untrustworthy.
 
-The former `trust_wp_backend.rs` parsed a subprocess protocol and has been
-retired. TrustWP currently advertises no compiler/full-verifier obligation
-kinds; historical wire records remain readable but are not proof authority.
+The per-VC WP adapter and its synthetic formula requests are retired; the
+compiler uses the shared constant folder instead. Native body-WP handles
+supported Boolean postconditions through the typed TrustIR full-verifier route
+with independent replay. The legacy WP adapter owns no obligation kinds;
+historical wire records remain readable but grant no proof authority.
 
 Steps to add a new backend:
 
@@ -243,7 +245,7 @@ Example: `test_vcgen_division_by_zero_generates_vc`, `test_router_timeout_falls_
 
 ### Property-based testing
 
-We use `proptest` for roundtrip and fuzz testing. Example crates: trust-types, trust-vcgen, trust-cache, trust-proof-cert.
+We use `proptest` for roundtrip and fuzz testing. Example crates: trust-types, trust-vcgen, trust-proof-cert.
 
 ```rust
 proptest! {

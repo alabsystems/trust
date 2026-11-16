@@ -1,6 +1,6 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aprivate_bounds -Aprivate_interfaces
 //@ edition: 2021
 //! Trust (wave-DVB): `&*<diverging expr>` -- a reference-returning stub whose body is
 //! `todo!()`/`unimplemented!()`, with rustc's reborrow adjustment wrapped around it.

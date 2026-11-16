@@ -252,8 +252,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use trust_types::{
-        BasicBlock as TrustBlock, BlockId, Contract, ContractKind, LocalDecl, SourceSpan,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock as TrustBlock, BlockId, Contract, ContractKind, LocalDecl, Operand, Place,
+        Rvalue, SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
     };
 
     use super::*;
@@ -265,9 +265,9 @@ mod tests {
     // Unlike the L0 fixtures (which attach `Terminator::Assert` nodes and
     // leave `contracts: vec![]`), these attach `trust_types::Contract`
     // clauses — the surface the bridge lowers to module-level
-    // `ProofObligation`s. Bodies are minimal (one `Return` block) so the ONLY
-    // obligations are the contract ones (no panic-freedom aggregate, since
-    // there is no assert/panic call), keeping the L1 set clean.
+    // `ProofObligation`s. Bodies are minimal (one block, `_0 = copy _1;
+    // return`) so the ONLY obligations are the contract ones (no panic-freedom
+    // aggregate, since there is no assert/panic call), keeping the L1 set clean.
     // ===================================================================
 
     /// `#[requires("x >= 0")] fn nonneg(x: i32) -> i32 { x }` — a single
@@ -330,10 +330,43 @@ mod tests {
         )
     }
 
-    /// Build a minimal `i32 -> i32` `VerifiableFunction` with one `Return`
-    /// block and the given contracts attached. No asserts / panic calls, so the
-    /// only obligations are the contract ones.
+    /// Build a minimal `fn name(x: i32) -> i32 { x }` `VerifiableFunction` —
+    /// one block, `_0 = copy _1; return` — with the given contracts attached.
+    /// No asserts / panic calls, so the only obligations are the contract ones.
+    ///
+    /// The return-slot write is load-bearing. A body that returns without ever
+    /// assigning `_0` is malformed MIR (rustc writes the return place before
+    /// every `Return` of an inhabited, non-ZST return type), and since
+    /// 5fd50cf220 trust-vcgen refuses a result clause over it: there is no
+    /// established return-path value for `result` to name, so the clause
+    /// becomes a fail-closed `UnsupportedMir` row ("postcondition result has no
+    /// established return-path value"; pinned by trust-vcgen's
+    /// `missing_return_definition_is_an_explicit_refusal`), not an L1
+    /// `Postcondition`. Without the write every `#[ensures]` fixture here
+    /// would measure that refusal instead of the contract lane.
+    ///
+    /// The parsed clause carriers are load-bearing too. The producer
+    /// (`trust-mir-extract`'s `parse_contract_specs_with_typed`) carries every
+    /// authored `requires` in `preconditions` (`false` when it does not parse)
+    /// and every parseable `ensures` in `postconditions`. A `requires` present
+    /// only as `contracts` text is one the assumption gate DROPPED, and
+    /// trust-vcgen's `dropped_requires_clauses` then refuses a dependent
+    /// `ensures` (`result > 0` under `x > 0`) as an `UnsupportedMir` row rather
+    /// than refute it over entry states the `requires` excludes. Mirror the
+    /// producer so the fixtures measure an ASSUMED precondition.
     fn contract_fn(name: &str, contracts: Vec<Contract>) -> VerifiableFunction {
+        let mut preconditions = Vec::new();
+        let mut postconditions = Vec::new();
+        for contract in &contracts {
+            let parsed = trust_types::parse_spec_expr(&contract.body);
+            match contract.kind {
+                ContractKind::Requires => {
+                    preconditions.push(parsed.unwrap_or(trust_types::Formula::Bool(false)));
+                }
+                ContractKind::Ensures => postconditions.extend(parsed),
+                _ => {}
+            }
+        }
         VerifiableFunction {
             name: name.to_string(),
             def_path: format!("test::{name}"),
@@ -345,7 +378,11 @@ mod tests {
                 ],
                 blocks: vec![TrustBlock {
                     id: BlockId(0),
-                    stmts: vec![],
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                        span: SourceSpan::default(),
+                    }],
                     terminator: Terminator::Return,
                 }],
                 arg_count: 1,
@@ -353,9 +390,10 @@ mod tests {
                 datatype_defs: Default::default(),
             },
             contracts,
-            preconditions: vec![],
-            postconditions: vec![],
+            preconditions,
+            postconditions,
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -581,9 +619,24 @@ mod tests {
     /// corresponding `ObligationKind` (count ≥ 1, NOT count-equal — see the
     /// cardinality note); and every L1 VcKind that maps to `None` must be in
     /// `expected_carve_outs`, else the test FAILS (cannot mask a gap).
+    ///
+    /// An EMPTY trust-vcgen L1 set fails too: every caller passes a function
+    /// with at least one contract clause, so no L1 VC at all means the oracle
+    /// refused or dropped the clauses, and "every L1 kind is covered" would
+    /// hold vacuously. (It did: with an unassigned return slot the `#[ensures]`
+    /// clauses became `UnsupportedMir` refusals and the coverage checks still
+    /// passed.)
     fn assert_native_l1_covers_vcgen(func: &VerifiableFunction, expected_carve_outs: &[&str]) {
         let vcgen = vcgen_l1_kind_multiset(func);
         let native = native_contract_kinds_for(func);
+        assert!(
+            !vcgen.is_empty(),
+            "trust-vcgen emitted NO L1 VC for `{}`, which carries {} contract clause(s); the \
+             coverage comparison would be vacuous: all={:?} native={native:?}",
+            func.name,
+            func.contracts.len(),
+            trust_vcgen::generate_vcs(func).iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+        );
 
         for (variant, count) in &vcgen {
             assert!(*count >= 1);
@@ -637,9 +690,46 @@ mod tests {
         );
     }
 
+    /// The malformed shape the fixture used to have — `return` with `_0` never
+    /// assigned — is REFUSED by trust-vcgen, not verified: the `#[ensures]`
+    /// becomes one fail-closed `UnsupportedMir` row and no L1 VC. This is why
+    /// `contract_fn` writes `_0 = copy _1`, and it fails if trust-vcgen ever
+    /// again lets `result` name an unestablished return value.
+    #[test]
+    fn ensures_over_unassigned_return_slot_is_refused_not_l1() {
+        let mut func = ensures_postcondition();
+        func.body.blocks[0].stmts.clear();
+        assert!(
+            vcgen_l1_kind_multiset(&func).is_empty(),
+            "an unassigned return slot must not yield any L1 VC"
+        );
+        let all = trust_vcgen::generate_vcs(&func);
+        let refusals = all
+            .iter()
+            .filter(|vc| {
+                matches!(&vc.kind, trust_types::VcKind::UnsupportedMir { detail, .. }
+                    if detail.contains("no established return-path value"))
+            })
+            .count();
+        assert_eq!(refusals, 1, "the #[ensures] must become one visible refusal row: {all:?}");
+    }
+
     #[test]
     fn requires_and_ensures_l1_matches_vcgen() {
         assert_native_l1_covers_vcgen(&requires_and_ensures(), &[]);
+        // Pin BOTH clauses: coverage alone passed while the `#[ensures]` half
+        // was refused and only the `Precondition` reached the L1 set.
+        let vcgen = vcgen_l1_kind_multiset(&requires_and_ensures());
+        assert_eq!(
+            vcgen.get("Precondition").copied(),
+            Some(1),
+            "the #[requires] half must surface a trust-vcgen Precondition L1 VC: {vcgen:?}"
+        );
+        assert_eq!(
+            vcgen.get("Postcondition").copied(),
+            Some(1),
+            "the #[ensures] half must surface a trust-vcgen Postcondition L1 VC: {vcgen:?}"
+        );
     }
 
     #[test]

@@ -50,8 +50,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::HashMap;
-
+use trust_types::fx::FxHashMap;
 use trust_types::{
     AggregateKind, BlockId, ConstValue, Formula, Operand, Place, Projection, Rvalue, Sort,
     Statement, Terminator, Ty, VcKind, VerifiableFunction, VerificationCondition,
@@ -71,9 +70,9 @@ pub const CONCLUSION_PROPERTY_PREFIX: &str = "recursive_datatype_functional_conc
 #[derive(Clone, Default)]
 pub(crate) struct WalkState {
     /// MIR local index -> the datatype/scalar `Formula` term it holds.
-    pub(crate) store: HashMap<usize, Formula>,
+    pub(crate) store: FxHashMap<usize, Formula>,
     /// MIR local index -> the place whose `Discriminant` was read into it.
-    pub(crate) disc_of: HashMap<usize, Place>,
+    pub(crate) disc_of: FxHashMap<usize, Place>,
     /// The constructor arm this path is under: `(variant_tag, ctor_name)`.
     /// `None` before the match fork; at most ONE fork is modeled (the mutual
     /// lane layers its own fuel fork OUTSIDE this state).
@@ -128,28 +127,24 @@ pub fn recursive_datatype_functional_vcs(func: &VerifiableFunction) -> Vec<Verif
     let Ty::Datatype { name: dt_name, variants } = &dt else {
         return Vec::new();
     };
-    let mut tags: Vec<usize> = arms.iter().map(|a| a.tag).collect();
-    tags.sort_unstable();
-    tags.dedup();
-    if tags.len() != arms.len() || tags != (0..variants.len()).collect::<Vec<_>>() {
+    arms.sort_by_key(|a| a.tag);
+    if arms.len() != variants.len() || !arms.iter().enumerate().all(|(idx, a)| a.tag == idx) {
         return Vec::new();
     }
-    arms.sort_by_key(|a| a.tag);
+    let arms_len = arms.len();
 
-    let mut vcs: Vec<VerificationCondition> = arms
-        .iter()
-        .map(|arm| VerificationCondition {
-            kind: VcKind::FunctionalCorrectness {
-                property: format!("{CASE_PROPERTY_PREFIX}{}", arm.ctor),
-                context: func.name.clone(),
-            },
-            function: func.name.as_str().into(),
-            location: func.span.clone(),
-            formula: arm.formula.clone(),
-            contract_metadata: None,
-            obligation: None,
-        })
-        .collect();
+    let mut vcs: Vec<VerificationCondition> = Vec::with_capacity(arms_len + 1);
+    vcs.extend(arms.into_iter().map(|arm| VerificationCondition {
+        kind: VcKind::FunctionalCorrectness {
+            property: format!("{CASE_PROPERTY_PREFIX}{}", arm.ctor),
+            context: func.name.clone(),
+        },
+        function: func.name.as_str().into(),
+        location: func.span.clone(),
+        formula: arm.formula,
+        contract_metadata: None,
+        obligation: None,
+    }));
 
     // The conclusion `Forall [params] P` — `_0` stays free (the output), and the
     // property tag binds it to the case bundle above.
@@ -159,8 +154,7 @@ pub fn recursive_datatype_functional_vcs(func: &VerifiableFunction) -> Vec<Verif
     vcs.push(VerificationCondition {
         kind: VcKind::FunctionalCorrectness {
             property: format!(
-                "{CONCLUSION_PROPERTY_PREFIX}[induction:{dt_name};cases={}]",
-                arms.len()
+                "{CONCLUSION_PROPERTY_PREFIX}[induction:{dt_name};cases={arms_len}]"
             ),
             context: func.name.clone(),
         },
@@ -251,7 +245,13 @@ fn walk(
     if depth > 64 {
         return false;
     }
-    let Some(block) = func.body.blocks.iter().find(|b| b.id == block_id) else {
+    let Some(block) = func
+        .body
+        .blocks
+        .get(block_id.0)
+        .filter(|b| b.id == block_id)
+        .or_else(|| func.body.blocks.iter().find(|b| b.id == block_id))
+    else {
         return false;
     };
 
@@ -263,7 +263,7 @@ fn walk(
         Terminator::Return => {
             // A Return outside any constructor arm cannot be a per-constructor
             // induction case.
-            let Some((tag, ctor)) = state.ctor.clone() else {
+            let Some((tag, ctor)) = state.ctor.take() else {
                 return false;
             };
             let Some(result) = resolve_place(func, &state, &Place::local(0)) else {
@@ -273,10 +273,7 @@ fn walk(
             let body = if state.ih_atoms.is_empty() {
                 conclusion
             } else {
-                Formula::Implies(
-                    Box::new(conjoin_all(state.ih_atoms.clone())),
-                    Box::new(conclusion),
-                )
+                Formula::Implies(Box::new(conjoin_all(state.ih_atoms)), Box::new(conclusion))
             };
             let formula = if state.binders.is_empty() {
                 body
@@ -307,8 +304,8 @@ fn walk(
                 return false;
             };
             // R0: widen a bare marker through the body's own table (inline first).
-            let dt = crate::resolved_ty(func, peel_indirection(matched_ty)).into_owned();
-            let Ty::Datatype { variants, .. } = &dt else {
+            let dt = crate::resolved_ty(func, peel_indirection(matched_ty));
+            let Ty::Datatype { variants, .. } = &*dt else {
                 return false;
             };
             if variants.is_empty() {
@@ -325,7 +322,7 @@ fn walk(
             let dt_sort = crate::sort_for_ty(&dt);
             for (tag, target) in targets {
                 let tag = *tag as usize;
-                let Some((ctor, fields)) = variants.get(tag).cloned() else {
+                let Some((ctor, fields)) = variants.get(tag) else {
                     return false;
                 };
                 // Fresh pattern-field variables; rebind the scrutinee local to
@@ -344,7 +341,7 @@ fn walk(
                     matched.local,
                     Formula::Ctor { ctor: ctor.clone(), args: field_vars, sort: dt_sort.clone() },
                 );
-                arm_state.ctor = Some((tag, ctor));
+                arm_state.ctor = Some((tag, ctor.clone()));
                 if !walk(func, post, *target, arm_state, depth + 1, ih_counter, arms) {
                     return false;
                 }
@@ -379,7 +376,8 @@ fn walk(
             state.store.insert(dest.local, ih_var.clone());
             // IH atom: the postcondition assumed at the recursive call —
             // `P(call-args, __ih_k)`.
-            let mut map: HashMap<String, Formula> = HashMap::new();
+            let mut map: FxHashMap<String, Formula> =
+                FxHashMap::with_capacity_and_hasher(arg_terms.len() + 1, Default::default());
             for (i, term) in arg_terms.into_iter().enumerate() {
                 map.insert(crate::place_to_var_name(func, &Place::local(i + 1)), term);
             }
@@ -399,7 +397,8 @@ pub(crate) fn subst_post(
     state: &WalkState,
     result: Formula,
 ) -> Formula {
-    let mut map: HashMap<String, Formula> = HashMap::new();
+    let mut map: FxHashMap<String, Formula> =
+        FxHashMap::with_capacity_and_hasher(func.body.arg_count + 1, Default::default());
     for i in 1..=func.body.arg_count {
         if let Some(term) = state.store.get(&i) {
             map.insert(crate::place_to_var_name(func, &Place::local(i)), term.clone());
@@ -410,7 +409,7 @@ pub(crate) fn subst_post(
 }
 
 /// Capture-free variable substitution for the (quantifier-free) postcondition.
-pub(crate) fn subst_vars(f: Formula, map: &HashMap<String, Formula>) -> Formula {
+pub(crate) fn subst_vars(f: Formula, map: &FxHashMap<String, Formula>) -> Formula {
     if let Some(name) = f.var_name() {
         if let Some(t) = map.get(name) {
             return t.clone();
@@ -515,8 +514,7 @@ pub(crate) fn resolve_place(
     // R0: resolve at every assignment of the walk accumulator — the base local AND
     // each datatype-typed field stepped into — so a chain through a recursive child
     // keeps typing. Shallow (one level per step), so it terminates.
-    let mut base_ty =
-        crate::resolved_ty(func, peel_indirection(local_ty(func, place.local)?)).into_owned();
+    let mut base_ty = crate::resolved_ty(func, peel_indirection(local_ty(func, place.local)?));
     let mut pending_variant: Option<usize> = None;
 
     for proj in &place.projections {
@@ -524,31 +522,35 @@ pub(crate) fn resolve_place(
             Projection::Deref => {}
             Projection::Downcast(v) => pending_variant = Some(*v),
             Projection::Field(idx) => {
-                let Ty::Datatype { name, variants } = &base_ty else {
-                    return None;
-                };
-                let v = match pending_variant.take() {
-                    Some(v) => v,
-                    None if variants.len() == 1 => 0,
-                    None => return None,
-                };
-                let (vctor, fields) = variants.get(v)?;
-                let (fname, fty) = fields.get(*idx)?;
-                // Pattern reduction: selecting off the arm's own pattern term.
-                if let Formula::Ctor { ctor, args, .. } = &term {
-                    if ctor != vctor {
+                let next_ty = {
+                    let Ty::Datatype { name, variants } = &*base_ty else {
                         return None;
-                    }
-                    term = args.get(*idx)?.clone();
-                } else {
-                    term = Formula::Sel {
-                        datatype: name.clone(),
-                        field: fname.clone(),
-                        field_sort: crate::sort_for_ty(peel_indirection(fty)),
-                        arg: Box::new(term),
                     };
-                }
-                base_ty = crate::resolved_ty(func, peel_indirection(fty)).into_owned();
+                    let v = match pending_variant.take() {
+                        Some(v) => v,
+                        None if variants.len() == 1 => 0,
+                        None => return None,
+                    };
+                    let (vctor, fields) = variants.get(v)?;
+                    let (fname, fty) = fields.get(*idx)?;
+                    // Pattern reduction: selecting off the arm's own pattern term.
+                    if let Formula::Ctor { ctor, args, .. } = &term {
+                        if ctor != vctor {
+                            return None;
+                        }
+                        term = args.get(*idx)?.clone();
+                    } else {
+                        term = Formula::Sel {
+                            datatype: name.clone(),
+                            // Variant-qualified, as `Sort::from_ty` declares it.
+                            field: trust_types::datatype_selector_name(vctor, fname),
+                            field_sort: crate::sort_for_ty(peel_indirection(fty)),
+                            arg: Box::new(term),
+                        };
+                    }
+                    crate::resolved_ty(func, peel_indirection(fty)).into_owned()
+                };
+                base_ty = std::borrow::Cow::Owned(next_ty);
             }
             _ => return None,
         }
@@ -586,7 +588,12 @@ pub(crate) fn const_to_formula(cv: &ConstValue) -> Option<Formula> {
 }
 
 pub(crate) fn local_ty(func: &VerifiableFunction, local: usize) -> Option<&Ty> {
-    func.body.locals.iter().find(|d| d.index == local).map(|d| &d.ty)
+    func.body
+        .locals
+        .get(local)
+        .filter(|d| d.index == local)
+        .or_else(|| func.body.locals.iter().find(|d| d.index == local))
+        .map(|d| &d.ty)
 }
 
 #[cfg(test)]
@@ -724,6 +731,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("mirror"),
                         is_foreign: false,
                         func: "mirror".to_string(),
                         args: vec![Operand::Move(Place::local(5))],
@@ -786,6 +794,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![post],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

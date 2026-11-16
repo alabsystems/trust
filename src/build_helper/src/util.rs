@@ -1,10 +1,12 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::Command;
 
 use crate::ci::CiEnv;
 
+// Trust: upstream removed `exit!`/`fail`/`detail_exit` from build_helper in
+// 1.101; Trust's bootstrap refusals (version authority, stage0 rules,
+// trust-cg self-host) still exit through them, so they are carried here.
 /// Invokes `build_helper::util::detail_exit` with `cfg!(test)`
 ///
 /// This is a macro instead of a function so that it uses `cfg(test)` in the *calling* crate, not in build helper.
@@ -39,24 +41,6 @@ pub fn detail_exit(code: i32, is_test: bool) -> ! {
 pub fn fail(s: &str) -> ! {
     eprintln!("\n\n{s}\n\n");
     detail_exit(1, cfg!(test));
-}
-
-pub fn try_run(cmd: &mut Command, print_cmd_on_fail: bool) -> Result<(), ()> {
-    let status = match cmd.status() {
-        Ok(status) => status,
-        Err(e) => fail(&format!("failed to execute command: {cmd:?}\nerror: {e}")),
-    };
-    if !status.success() {
-        if print_cmd_on_fail {
-            println!(
-                "\n\ncommand did not execute successfully: {cmd:?}\n\
-                 expected success, got: {status}\n\n"
-            );
-        }
-        Err(())
-    } else {
-        Ok(())
-    }
 }
 
 /// Returns the submodule paths from the `.gitmodules` file in the given directory.

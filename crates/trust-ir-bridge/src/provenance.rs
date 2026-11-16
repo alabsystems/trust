@@ -11,6 +11,7 @@ use trust_ir::dialect::{AttrValue, DialectInst};
 use trust_ir::inst::Inst;
 use trust_ir::node::InstrNode;
 use trust_ir::{Block as TrustIrBlock, Function as TrustIrFunction, Module};
+use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{
     BinaryArtifactDigest, BinaryArtifactDigestIdentity, BinaryArtifactMetadata, BinaryOrigin,
     BinarySelectedImageIdentity, BinarySourceProvenanceSummary, DecompilationArtifact,
@@ -255,12 +256,24 @@ pub fn canonical_binary_provenance_target_blockers(
         return vec!["target conversion has no canonical binary provenance records".to_string()];
     }
 
+    let accepted_digests: Option<FxHashSet<&str>> = (records.len() > 1 && acceptances.len() > 8)
+        .then(|| {
+            acceptances
+                .iter()
+                .filter(|acceptance| !acceptance.consumer.trim().is_empty())
+                .map(|acceptance| acceptance.record_digest.as_str())
+                .collect()
+        });
+
     let mut blockers = Vec::new();
     for record in records {
-        let accepted = acceptances.iter().any(|acceptance| {
-            acceptance.record_digest == record.record_digest
-                && !acceptance.consumer.trim().is_empty()
-        });
+        let accepted = match &accepted_digests {
+            Some(set) => set.contains(record.record_digest.as_str()),
+            None => acceptances.iter().any(|acceptance| {
+                acceptance.record_digest == record.record_digest
+                    && !acceptance.consumer.trim().is_empty()
+            }),
+        };
         if !accepted {
             blockers.push(format!(
                 "canonical binary provenance record {} for {}::bb{}::stmt{} at 0x{:x} is not accepted by a target proof consumer",
@@ -276,6 +289,54 @@ pub fn canonical_binary_provenance_target_blockers(
     blockers
 }
 
+#[derive(Clone, Copy)]
+enum SpanBindState {
+    Single((usize, usize)),
+    Ambiguous,
+}
+
+impl SpanBindState {
+    #[inline]
+    fn fold(slot: &mut Option<Self>, loc: (usize, usize)) {
+        *slot = Some(match *slot {
+            None => Self::Single(loc),
+            Some(_) => Self::Ambiguous,
+        });
+    }
+}
+
+struct StatementSpanIndex<'a> {
+    by_binary_addr: FxHashMap<u64, SpanBindState>,
+    non_binary_spans: Vec<(&'a SourceSpan, (usize, usize))>,
+    all_spans: Vec<(&'a SourceSpan, (usize, usize))>,
+}
+
+impl<'a> StatementSpanIndex<'a> {
+    fn build(lifted: &'a VerifiableFunction) -> Self {
+        let mut by_binary_addr: FxHashMap<u64, SpanBindState> = FxHashMap::default();
+        let mut non_binary_spans = Vec::new();
+        let mut all_spans = Vec::new();
+        for block in &lifted.body.blocks {
+            for (statement_index, statement) in block.stmts.iter().enumerate() {
+                let Some(span) = statement_span(statement) else {
+                    continue;
+                };
+                let loc = (block.id.0, statement_index);
+                all_spans.push((span, loc));
+                if let Some(addr) = span.binary_address_value() {
+                    by_binary_addr
+                        .entry(addr)
+                        .and_modify(|state| *state = SpanBindState::Ambiguous)
+                        .or_insert(SpanBindState::Single(loc));
+                } else {
+                    non_binary_spans.push((span, loc));
+                }
+            }
+        }
+        Self { by_binary_addr, non_binary_spans, all_spans }
+    }
+}
+
 fn records_for_function(
     metadata: &BinaryArtifactMetadata,
     digest_identity: &BinaryArtifactDigestIdentity,
@@ -283,13 +344,14 @@ fn records_for_function(
     function: &DecompiledFunction,
     lifted: &VerifiableFunction,
 ) -> Result<Vec<CanonicalBinaryProvenanceRecord>, BridgeError> {
+    let span_index = StatementSpanIndex::build(lifted);
     function
         .instruction_provenance
         .iter()
         .enumerate()
         .map(|(index, origin)| {
             let (block, statement_index) =
-                bind_origin_to_statement(function, lifted, origin, index)?;
+                bind_origin_to_statement(function, &span_index, origin, index)?;
             let mut origin = origin.clone();
             if origin.binary_path.as_ref().is_none_or(|path| path.trim().is_empty()) {
                 origin.binary_path = metadata.path.clone();
@@ -370,29 +432,53 @@ fn provenance_status_for_origin(
 
 fn bind_origin_to_statement(
     function: &DecompiledFunction,
-    lifted: &VerifiableFunction,
+    span_index: &StatementSpanIndex<'_>,
     origin: &BinaryOrigin,
     instruction_index: usize,
 ) -> Result<(usize, usize), BridgeError> {
-    let mut matches = Vec::new();
-    for block in &lifted.body.blocks {
-        for (statement_index, statement) in block.stmts.iter().enumerate() {
-            let Some(span) = statement_span(statement) else {
-                continue;
-            };
-            if span_matches_origin(span, origin) {
-                matches.push((block.id.0, statement_index));
+    let state = match &origin.source {
+        None => span_index.by_binary_addr.get(&origin.instruction_address).copied(),
+        Some(src) => match src.binary_address_value() {
+            Some(src_addr) if src_addr == origin.instruction_address => {
+                // Any statement with `span == src` already has `span.binary_address_value() == Some(src_addr)`.
+                span_index.by_binary_addr.get(&origin.instruction_address).copied()
             }
-        }
-    }
+            None => {
+                let mut state = span_index.by_binary_addr.get(&origin.instruction_address).copied();
+                if !matches!(state, Some(SpanBindState::Ambiguous)) {
+                    for &(span, loc) in &span_index.non_binary_spans {
+                        if span == src {
+                            SpanBindState::fold(&mut state, loc);
+                            if matches!(state, Some(SpanBindState::Ambiguous)) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                state
+            }
+            Some(_) => {
+                let mut state = None;
+                for &(span, loc) in &span_index.all_spans {
+                    if span_matches_origin(span, origin) {
+                        SpanBindState::fold(&mut state, loc);
+                        if matches!(state, Some(SpanBindState::Ambiguous)) {
+                            break;
+                        }
+                    }
+                }
+                state
+            }
+        },
+    };
 
-    match matches.as_slice() {
-        [binding] => Ok(*binding),
-        [] => Err(BridgeError::UnsupportedOp(format!(
+    match state {
+        Some(SpanBindState::Single(binding)) => Ok(binding),
+        None => Err(BridgeError::UnsupportedOp(format!(
             "canonical binary provenance for `{}` instruction[{instruction_index}] at 0x{:x} cannot be bound to a lifted TrustIr statement span",
             function.name, origin.instruction_address
         ))),
-        _ => Err(BridgeError::UnsupportedOp(format!(
+        Some(SpanBindState::Ambiguous) => Err(BridgeError::UnsupportedOp(format!(
             "canonical binary provenance for `{}` instruction[{instruction_index}] at 0x{:x} ambiguously matches multiple lifted TrustIr statements",
             function.name, origin.instruction_address
         ))),
@@ -426,19 +512,31 @@ fn insert_records(
                 ))
             },
         )?;
+    if records.is_empty() {
+        return Ok(());
+    }
 
+    let block_pos_by_id: FxHashMap<usize, usize> = function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(pos, block)| (block.id.as_usize(), pos))
+        .collect();
+    let mut per_block: Vec<Vec<InstrNode>> = vec![Vec::new(); function.blocks.len()];
     for record in records {
-        let block = function
-            .blocks
-            .iter_mut()
-            .find(|block| block.id.as_usize() == record.block)
-            .ok_or_else(|| {
-                BridgeError::UnsupportedOp(format!(
-                    "lowered TrustIr function `{function_name}` has no bb{} for binary provenance",
-                    record.block
-                ))
-            })?;
-        block.body.insert(0, InstrNode::new(Inst::DialectOp(Box::new(record_to_op(record)))));
+        let Some(&pos) = block_pos_by_id.get(&record.block) else {
+            return Err(BridgeError::UnsupportedOp(format!(
+                "lowered TrustIr function `{function_name}` has no bb{} for binary provenance",
+                record.block
+            )));
+        };
+        per_block[pos].push(InstrNode::new(Inst::DialectOp(Box::new(record_to_op(record)))));
+    }
+    for (block, ops) in function.blocks.iter_mut().zip(per_block) {
+        if !ops.is_empty() {
+            // Sequential `insert(0, op)` places the last emitted record at index 0.
+            block.body.splice(0..0, ops.into_iter().rev());
+        }
     }
 
     Ok(())
@@ -721,7 +819,7 @@ fn record_digest(record: &CanonicalBinaryProvenanceRecord) -> String {
 }
 
 fn record_digest_material(record: &CanonicalBinaryProvenanceRecord) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(512);
     let _ = writeln!(out, "schema={BINARY_PROVENANCE_SCHEMA}");
     let _ = writeln!(out, "source={}", record.source.as_deref().unwrap_or(""));
     let _ = writeln!(out, "source_status={}", record.source_status);
@@ -730,23 +828,30 @@ fn record_digest_material(record: &CanonicalBinaryProvenanceRecord) -> String {
     let _ = writeln!(out, "block_id={}", record.block);
     let _ = writeln!(out, "statement_index={}", record.statement_index);
     let _ = writeln!(out, "binary_path={}", record.origin.binary_path.as_deref().unwrap_or(""));
-    let _ = writeln!(
-        out,
-        "function_entry={}",
-        record.origin.function_entry.map(hex_u64).unwrap_or_default()
-    );
-    let _ = writeln!(out, "instruction_address={}", hex_u64(record.origin.instruction_address));
-    let _ = writeln!(
-        out,
-        "instruction_size={}",
-        record.origin.instruction_size.map_or_else(String::new, |size| size.to_string())
-    );
-    let _ = writeln!(
-        out,
-        "encoding={}",
-        record.origin.encoding.map(|encoding| hex_u64(u64::from(encoding))).unwrap_or_default()
-    );
-    let _ = writeln!(out, "instruction_bytes={}", hex_bytes(&record.origin.instruction_bytes));
+    match record.origin.function_entry {
+        Some(entry) => {
+            let _ = writeln!(out, "function_entry=0x{entry:x}");
+        }
+        None => out.push_str("function_entry=\n"),
+    }
+    let _ = writeln!(out, "instruction_address=0x{:x}", record.origin.instruction_address);
+    match record.origin.instruction_size {
+        Some(size) => {
+            let _ = writeln!(out, "instruction_size={size}");
+        }
+        None => out.push_str("instruction_size=\n"),
+    }
+    match record.origin.encoding {
+        Some(encoding) => {
+            let _ = writeln!(out, "encoding=0x{:x}", u64::from(encoding));
+        }
+        None => out.push_str("encoding=\n"),
+    }
+    out.push_str("instruction_bytes=");
+    for byte in &record.origin.instruction_bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out.push('\n');
     if let Some(source) = &record.origin.source {
         let _ = writeln!(out, "source_file={}", source.file);
         let _ = writeln!(out, "source_line_start={}", source.line_start);
@@ -754,25 +859,23 @@ fn record_digest_material(record: &CanonicalBinaryProvenanceRecord) -> String {
         let _ = writeln!(out, "source_line_end={}", source.line_end);
         let _ = writeln!(out, "source_col_end={}", source.col_end);
     } else {
-        let _ = writeln!(out, "source_file=");
-        let _ = writeln!(out, "source_line_start=");
-        let _ = writeln!(out, "source_col_start=");
-        let _ = writeln!(out, "source_line_end=");
-        let _ = writeln!(out, "source_col_end=");
+        out.push_str(
+            "source_file=\nsource_line_start=\nsource_col_start=\nsource_line_end=\nsource_col_end=\n",
+        );
     }
     if let Some(root) = &record.artifact_digest_identity.root_artifact_digest {
         let _ = writeln!(out, "artifact_sha256={}", root.value);
     } else {
-        let _ = writeln!(out, "artifact_sha256=");
+        out.push_str("artifact_sha256=\n");
     }
     if let Some(selected) = &record.artifact_digest_identity.selected_image {
         let _ = writeln!(out, "selected_image_file_offset={}", selected.file_offset);
         let _ = writeln!(out, "selected_image_file_size={}", selected.file_size);
         let _ = writeln!(out, "selected_image_sha256={}", selected.sha256);
     } else {
-        let _ = writeln!(out, "selected_image_file_offset=");
-        let _ = writeln!(out, "selected_image_file_size=");
-        let _ = writeln!(out, "selected_image_sha256=");
+        out.push_str(
+            "selected_image_file_offset=\nselected_image_file_size=\nselected_image_sha256=\n",
+        );
     }
     out
 }
@@ -834,21 +937,28 @@ fn parse_canonical_u64(value: &str) -> Option<u64> {
 }
 
 fn parse_canonical_hex_bytes(value: &str) -> Option<Vec<u8>> {
-    let normalized = value
-        .trim()
+    let trimmed = value.trim();
+    let body = trimmed
         .strip_prefix("0x")
-        .or_else(|| value.trim().strip_prefix("0X"))
-        .unwrap_or_else(|| value.trim())
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace() && *ch != '_' && *ch != ':')
-        .collect::<String>();
-    if normalized.is_empty() || normalized.len() % 2 != 0 {
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    let mut out = Vec::with_capacity(body.len() / 2);
+    let mut pending_high: Option<u8> = None;
+    for ch in body.chars() {
+        if ch.is_ascii_whitespace() || ch == '_' || ch == ':' {
+            continue;
+        }
+        let nibble = ch.to_digit(16)? as u8;
+        if let Some(high) = pending_high.take() {
+            out.push((high << 4) | nibble);
+        } else {
+            pending_high = Some(nibble);
+        }
+    }
+    if pending_high.is_some() || out.is_empty() {
         return None;
     }
-    (0..normalized.len())
-        .step_by(2)
-        .map(|idx| u8::from_str_radix(&normalized[idx..idx + 2], 16).ok())
-        .collect()
+    Some(out)
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {

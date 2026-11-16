@@ -61,12 +61,10 @@
 //! therefore only ever make MORE declarations callable — each of them carrying
 //! strictly MORE caller obligations than a non-hypothesis declaration does.
 
-use clean_kernel::{Expr, ExprKind, Name};
-use trust_types::clean_origin_precondition::{
-    CleanOriginPrecondition, PreconditionOperand,
-};
+use clean_kernel::{Expr, ExprKind};
+use trust_types::clean_origin_precondition::{CleanOriginPrecondition, PreconditionOperand};
 
-use crate::{CleanType, recognize, strip_mdata};
+use crate::{CleanType, name_is_str2, name_str1, recognize, strip_mdata};
 
 /// A recognised hypothesis binder: a proof argument that is **erased** in the
 /// Rust signature and reappears as a caller-side precondition.
@@ -116,23 +114,29 @@ impl Hypothesis {
 /// `UInt64 -> …` "has no modeled Rust carrier for `LT.lt`" points at the wrong
 /// problem.
 pub(crate) fn is_proposition_shaped(domain: &Expr) -> bool {
-    let (head, _) = uncurry(domain);
+    let head = head_of(domain);
     let ExprKind::Const(name, _) = head.kind() else { return false };
-    matches!(
-        name.to_string().as_str(),
-        "Ne" | "Eq"
-            | "Not"
-            | "Iff"
-            | "And"
-            | "Or"
-            | "LT.lt"
-            | "LE.le"
-            | "GT.gt"
-            | "GE.ge"
-            | "Decidable"
-            | "False"
-            | "True"
-    )
+    if let Some(s) = name_str1(name) {
+        return matches!(
+            s,
+            "Ne" | "Eq"
+                | "Not"
+                | "Iff"
+                | "And"
+                | "Or"
+                | "LT.lt"
+                | "LE.le"
+                | "GT.gt"
+                | "GE.ge"
+                | "Decidable"
+                | "False"
+                | "True"
+        );
+    }
+    name_is_str2(name, "LT", "lt")
+        || name_is_str2(name, "LE", "le")
+        || name_is_str2(name, "GT", "gt")
+        || name_is_str2(name, "GE", "ge")
 }
 
 /// Read a hypothesis binder's domain as a caller-side precondition.
@@ -157,7 +161,7 @@ pub(crate) fn recognise_hypothesis(
     // only one would make the lift depend on which the user's Clean happened to
     // produce, which is exactly the kind of spelling sensitivity `emit.rs`'s
     // `numeral_leaf` already had to grow a second arm for.
-    let (ty, lhs, rhs) = match head_name.to_string().as_str() {
+    let (ty, lhs, rhs) = match name_str1(head_name)? {
         // `@Ne α a b`
         "Ne" => match args[..] {
             [ty, lhs, rhs] => (ty, lhs, rhs),
@@ -168,7 +172,7 @@ pub(crate) fn recognise_hypothesis(
             let [inner] = args[..] else { return None };
             let (inner_head, inner_args) = uncurry(inner);
             let ExprKind::Const(inner_name, _) = inner_head.kind() else { return None };
-            if inner_name.to_string() != "Eq" {
+            if name_str1(inner_name) != Some("Eq") {
                 return None;
             }
             match inner_args[..] {
@@ -184,24 +188,45 @@ pub(crate) fn recognise_hypothesis(
     // against a width, and the consuming renderer needs a width to state the
     // obligation at. `Nat`/`Int` (unbounded), `Bool`, `BitVec` and every
     // unmodeled type are refused here rather than guessed at.
-    let width = match recognize(ty)? {
-        CleanType::UInt(w) if matches!(w, 8 | 16 | 32 | 64) => w,
+    let (width, carrier_name, inst_ofnat_name) = match recognize(ty)? {
+        CleanType::UInt(8) => (8, "UInt8", "instOfNatUInt8"),
+        CleanType::UInt(16) => (16, "UInt16", "instOfNatUInt16"),
+        CleanType::UInt(32) => (32, "UInt32", "instOfNatUInt32"),
+        CleanType::UInt(64) => (64, "UInt64", "instOfNatUInt64"),
         _ => return None,
     };
-    let carrier_name = format!("UInt{width}");
 
-    let left = read_operand(lhs, &carrier_name, width, binder_depth, carried_index_of_binder)?;
-    let right = read_operand(rhs, &carrier_name, width, binder_depth, carried_index_of_binder)?;
+    let left = read_operand(
+        lhs,
+        carrier_name,
+        inst_ofnat_name,
+        width,
+        binder_depth,
+        carried_index_of_binder,
+    )?;
+    let right = read_operand(
+        rhs,
+        carrier_name,
+        inst_ofnat_name,
+        width,
+        binder_depth,
+        carried_index_of_binder,
+    )?;
 
-    let render = |o: PreconditionOperand| match o {
-        PreconditionOperand::Argument(i) => format!("arg{i}"),
-        PreconditionOperand::Literal(v) => v.to_string(),
-    };
+    struct DisplayOperand(PreconditionOperand);
+    impl core::fmt::Display for DisplayOperand {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self.0 {
+                PreconditionOperand::Argument(i) => write!(f, "arg{i}"),
+                PreconditionOperand::Literal(v) => write!(f, "{v}"),
+            }
+        }
+    }
     Some(CleanOriginPrecondition::not_equal(
         left,
         right,
         width,
-        format!("{} ≠ {} : {carrier_name}", render(left), render(right)),
+        format!("{} ≠ {} : {carrier_name}", DisplayOperand(left), DisplayOperand(right)),
     ))
 }
 
@@ -215,6 +240,7 @@ pub(crate) fn seal(binder_index: usize, precondition: CleanOriginPrecondition) -
 fn read_operand(
     operand: &Expr,
     carrier_name: &str,
+    inst_ofnat_name: &str,
     width: u32,
     binder_depth: usize,
     carried_index_of_binder: &[Option<usize>],
@@ -236,7 +262,7 @@ fn read_operand(
         return Some(PreconditionOperand::Argument(carried));
     }
 
-    let value = numeral_leaf(operand, carrier_name)?;
+    let value = numeral_leaf(operand, carrier_name, inst_ofnat_name)?;
     // Re-checked against the width HERE, not trusted from the spelling: an
     // out-of-range numeral in a hypothesis is a statement about a value the
     // carrier cannot hold, and admitting it would state the obligation at a
@@ -257,33 +283,35 @@ fn read_operand(
 /// dependencies and `trust-clean-origin` depends on IT, not the reverse); the
 /// unit tests below pin both spellings so the two cannot silently diverge on
 /// the arm that matters.
-fn numeral_leaf(operand: &Expr, carrier_name: &str) -> Option<u128> {
+fn numeral_leaf(operand: &Expr, carrier_name: &str, inst_ofnat_name: &str) -> Option<u128> {
     let (head, args) = uncurry(operand);
     let ExprKind::Const(head_name, _) = head.kind() else { return None };
 
-    if *head_name == Name::from_string(&format!("{carrier_name}.ofNat")) {
+    if name_is_str2(head_name, carrier_name, "ofNat") {
         let [literal] = args[..] else { return None };
         return nat_u128(literal);
     }
 
-    if *head_name == Name::from_string("OfNat.ofNat") {
+    if name_is_str2(head_name, "OfNat", "ofNat") {
         let [ty, literal, instance] = args[..] else { return None };
         if !matches!(strip_mdata(ty).kind(),
-            ExprKind::Const(n, _) if *n == Name::from_string(carrier_name))
+            ExprKind::Const(n, _) if name_str1(n) == Some(carrier_name))
         {
             return None;
         }
         let value = nat_u128(literal)?;
-        let (instance_head, instance_args) = uncurry(instance);
-        if !matches!(instance_head.kind(),
-            ExprKind::Const(n, _) if *n == Name::from_string(&format!("instOfNat{carrier_name}")))
+        // `instance` must be `instOfNat{C} <lit>`, applied to exactly one argument.
+        let ExprKind::App(instance_head, instance_literal) = strip_mdata(instance).kind() else {
+            return None;
+        };
+        if !matches!(strip_mdata(instance_head).kind(),
+            ExprKind::Const(n, _) if name_str1(n) == Some(inst_ofnat_name))
         {
             return None;
         }
         // The instance's own literal must AGREE with the value's. They are two
         // independent occurrences in the surface spelling, and a disagreement
         // means the term is not the numeral it looks like.
-        let [instance_literal] = instance_args[..] else { return None };
         if nat_u128(instance_literal)? != value {
             return None;
         }
@@ -300,6 +328,15 @@ fn nat_u128(e: &Expr) -> Option<u128> {
     n.to_u64().map(u128::from)
 }
 
+/// Return the head of an application spine `(f a b c)` without allocating a `Vec`.
+fn head_of(e: &Expr) -> &Expr {
+    let mut cursor = strip_mdata(e);
+    while let ExprKind::App(func, _) = cursor.kind() {
+        cursor = strip_mdata(func);
+    }
+    cursor
+}
+
 /// Split `f a b c` into `(f, [a, b, c])`, stripping metadata as it goes.
 fn uncurry(e: &Expr) -> (&Expr, Vec<&Expr>) {
     let mut args: Vec<&Expr> = Vec::new();
@@ -314,17 +351,19 @@ fn uncurry(e: &Expr) -> (&Expr, Vec<&Expr>) {
 
 #[cfg(test)]
 mod tests {
+    use clean_kernel::{BigNat, Level, Name};
+
     use super::*;
-    use clean_kernel::{BigNat, Level};
 
     fn c(n: &str) -> Expr {
         Expr::const_(Name::from_string(n), vec![])
     }
 
     fn ne(ty: Expr, a: Expr, b: Expr) -> Expr {
-        Expr::apps(Expr::const_(Name::from_string("Ne"), vec![Level::succ(Level::zero())]), [
-            ty, a, b,
-        ])
+        Expr::apps(
+            Expr::const_(Name::from_string("Ne"), vec![Level::succ(Level::zero())]),
+            [ty, a, b],
+        )
     }
 
     fn not_eq(ty: Expr, a: Expr, b: Expr) -> Expr {
@@ -344,11 +383,10 @@ mod tests {
 
     /// `OfNat.ofNat UInt64 n (instOfNatUInt64 n)` — the surface spelling.
     fn surface_numeral(n: u64) -> Expr {
-        Expr::apps(c("OfNat.ofNat"), [
-            c("UInt64"),
-            Expr::nat_lit(n),
-            Expr::app(c("instOfNatUInt64"), Expr::nat_lit(n)),
-        ])
+        Expr::apps(
+            c("OfNat.ofNat"),
+            [c("UInt64"), Expr::nat_lit(n), Expr::app(c("instOfNatUInt64"), Expr::nat_lit(n))],
+        )
     }
 
     /// Two value binders (`a`, `b`) are open; the hypothesis is binder 2.
@@ -433,11 +471,10 @@ mod tests {
     fn a_disagreeing_surface_instance_literal_is_not_a_numeral() {
         // `OfNat.ofNat UInt64 0 (instOfNatUInt64 7)` is not the numeral it
         // looks like.
-        let bogus = Expr::apps(c("OfNat.ofNat"), [
-            c("UInt64"),
-            Expr::nat_lit(0),
-            Expr::app(c("instOfNatUInt64"), Expr::nat_lit(7)),
-        ]);
+        let bogus = Expr::apps(
+            c("OfNat.ofNat"),
+            [c("UInt64"), Expr::nat_lit(0), Expr::app(c("instOfNatUInt64"), Expr::nat_lit(7))],
+        );
         let prop = ne(c("UInt64"), Expr::bvar(0), bogus);
         assert!(recognise_hypothesis(&prop, 1, &[Some(0)]).is_none());
     }
@@ -445,12 +482,10 @@ mod tests {
     #[test]
     fn proposition_shaped_covers_more_than_the_recogniser_admits() {
         // That gap is the point: it decides which REFUSAL is reported.
-        let lt = Expr::apps(Expr::const_(Name::from_string("LT.lt"), vec![Level::zero()]), [
-            c("UInt64"),
-            c("instLTUInt64"),
-            Expr::bvar(1),
-            Expr::bvar(0),
-        ]);
+        let lt = Expr::apps(
+            Expr::const_(Name::from_string("LT.lt"), vec![Level::zero()]),
+            [c("UInt64"), c("instLTUInt64"), Expr::bvar(1), Expr::bvar(0)],
+        );
         assert!(is_proposition_shaped(&lt));
         assert!(recognise_hypothesis(&lt, 2, &two_values()).is_none());
         // An ordinary value type is not proposition-shaped.

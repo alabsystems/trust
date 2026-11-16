@@ -57,7 +57,7 @@ pub struct RepairPromptContext<'a> {
     pub intent: Option<&'a str>,
 }
 
-/// Render the natural-language prompt body for one failure.
+/// Render the natural-language prompt body for an obligation needing a static proof.
 ///
 /// The prompt asks the AI assistant for first-class native signature clauses,
 /// with no compatibility attributes or helper surface.
@@ -82,7 +82,7 @@ pub fn build_ai_repair_prompt(ctx: &RepairPromptContext<'_>) -> String {
     }
 
     let _ = writeln!(s, "Solver: {} returned {}.", ctx.solver, ctx.outcome);
-    let _ = writeln!(s, "Failed VC: {} (pattern: {}).", ctx.vc_kind, ctx.pattern);
+    let _ = writeln!(s, "Verification condition: {} (pattern: {}).", ctx.vc_kind, ctx.pattern);
 
     if let Some(reason) = ctx.solver_reason.filter(|r| !r.trim().is_empty()) {
         let _ = writeln!(s, "Solver reason: {reason}");
@@ -126,7 +126,7 @@ pub fn build_ai_repair_prompt(ctx: &RepairPromptContext<'_>) -> String {
         signature clauses for `",
     );
     s.push_str(ctx.function);
-    s.push_str("` so the failed verification condition above is discharged.\n");
+    s.push_str("` so the verification condition above is discharged.\n");
     if intent.is_some() {
         s.push_str(
             "Align the spec with the author's stated intent above: choose the \
@@ -137,7 +137,7 @@ pub fn build_ai_repair_prompt(ctx: &RepairPromptContext<'_>) -> String {
     }
     s.push_str(
         "Constraints:\n\
-        - Edit ONLY native signature clauses on the failing function. Place \
+        - Edit ONLY native signature clauses on the named function. Place \
         them after the return type and before `where` or the body `{`. Do not touch \
         the function body, callers, tests, imports, or any other file.\n\
         - No comments, no docstrings, no helper functions, no other \

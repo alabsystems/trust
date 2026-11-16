@@ -1,10 +1,11 @@
 use rustc_abi::ExternAbi;
 use rustc_ast::InlineAsmOptions;
 use rustc_middle::mir::*;
-use rustc_middle::span_bug;
 use rustc_middle::ty::{self, TyCtxt, layout};
-use rustc_span::sym;
+use rustc_span::{span_bug, sym};
 use rustc_target::spec::PanicStrategy;
+
+use crate::PassPolicy;
 
 /// A pass that runs which is targeted at ensuring that codegen guarantees about
 /// unwinding are upheld for compilations of panic=abort programs.
@@ -31,6 +32,20 @@ impl<'tcx> crate::MirPass<'tcx> for AbortUnwindingCalls {
         // We don't simplify the MIR of constants at this time because that
         // namely results in a cyclic query when we call `tcx.type_of` below.
         if !kind.is_fn_like() {
+            return;
+        }
+
+        let has_candidate = body.basic_blocks.iter().any(|block| {
+            let Some(terminator) = &block.terminator else { return false };
+            if matches!(terminator.kind, TerminatorKind::UnwindResume) {
+                return true;
+            }
+            !block.is_cleanup
+                && terminator
+                    .unwind()
+                    .is_some_and(|unwind| !matches!(unwind, UnwindAction::Unreachable))
+        });
+        if !has_candidate {
             return;
         }
 
@@ -64,7 +79,8 @@ impl<'tcx> crate::MirPass<'tcx> for AbortUnwindingCalls {
         // with a function call, and whose function we're calling may unwind.
         // This will filter to functions with `extern "C-unwind"` ABIs, for
         // example.
-        for block in body.basic_blocks.as_mut() {
+        let mut changed = false;
+        for block in body.basic_blocks.as_mut_preserves_cfg() {
             let Some(terminator) = &mut block.terminator else { continue };
             let span = terminator.source_info.span;
 
@@ -77,8 +93,10 @@ impl<'tcx> crate::MirPass<'tcx> for AbortUnwindingCalls {
             if let TerminatorKind::UnwindResume = &terminator.kind {
                 if !target_supports_unwinding {
                     terminator.kind = TerminatorKind::Unreachable;
+                    changed = true;
                 } else if !body_can_unwind {
                     terminator.kind = TerminatorKind::UnwindTerminate(UnwindTerminateReason::Abi);
+                    changed = true;
                 }
             }
 
@@ -119,7 +137,10 @@ impl<'tcx> crate::MirPass<'tcx> for AbortUnwindingCalls {
                 // to have a landing pad. This means that we can remove any cleanup
                 // registered for it (and turn it into `UnwindAction::Unreachable`).
                 let cleanup = block.terminator_mut().unwind_mut().unwrap();
-                *cleanup = UnwindAction::Unreachable;
+                if *cleanup != UnwindAction::Unreachable {
+                    *cleanup = UnwindAction::Unreachable;
+                    changed = true;
+                }
             } else if !body_can_unwind
                 && matches!(terminator.unwind(), Some(UnwindAction::Continue))
             {
@@ -131,14 +152,20 @@ impl<'tcx> crate::MirPass<'tcx> for AbortUnwindingCalls {
                 // the `UnwindResume` -> `UnwindTerminate` terminator replacement.
                 let cleanup = block.terminator_mut().unwind_mut().unwrap();
                 *cleanup = UnwindAction::Terminate(UnwindTerminateReason::Abi);
+                changed = true;
             }
         }
 
-        // We may have invalidated some `cleanup` blocks so clean those up now.
-        super::simplify::remove_dead_blocks(body);
+        if changed {
+            body.basic_blocks.invalidate_cfg_cache();
+            // We may have invalidated some `cleanup` blocks so clean those up now.
+            super::simplify::remove_dead_blocks(body);
+        }
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Implements part of MIR semantics, turning effectively implicit aborts into explicit
+        // ones.
+        PassPolicy::Required
     }
 }

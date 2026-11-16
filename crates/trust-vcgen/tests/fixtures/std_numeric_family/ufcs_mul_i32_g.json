@@ -1,0 +1,475 @@
+{
+ "name": "ufcs_mul_i32_g",
+ "def_path": "nm::ufcs_mul_i32_g",
+ "span": {
+  "file": "nm.rs",
+  "line_start": 49,
+  "col_start": 0,
+  "line_end": 49,
+  "col_end": 132
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": true
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": true
+     }
+    },
+    "name": "a"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": true
+     }
+    },
+    "name": "b"
+   },
+   {
+    "index": 3,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 4,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 5,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 6,
+    "ty": "Bool",
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 3,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Ge",
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Int": 0
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 49,
+        "col_start": 50,
+        "line_end": 49,
+        "col_end": 56
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "SwitchInt": {
+      "discr": {
+       "Move": {
+        "local": 3,
+        "projections": []
+       }
+      },
+      "targets": [
+       [
+        0,
+        5
+       ]
+      ],
+      "otherwise": 1,
+      "exhaustive_enum_unreachable": false,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 49,
+       "col_start": 50,
+       "line_end": 49,
+       "col_end": 56
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 4,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Lt",
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Int": 1000
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 49,
+        "col_start": 60,
+        "line_end": 49,
+        "col_end": 68
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "SwitchInt": {
+      "discr": {
+       "Move": {
+        "local": 4,
+        "projections": []
+       }
+      },
+      "targets": [
+       [
+        0,
+        5
+       ]
+      ],
+      "otherwise": 2,
+      "exhaustive_enum_unreachable": false,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 49,
+       "col_start": 60,
+       "line_end": 49,
+       "col_end": 68
+      }
+     }
+    }
+   },
+   {
+    "id": 2,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 5,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Ge",
+         {
+          "Copy": {
+           "local": 2,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Int": 0
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 49,
+        "col_start": 72,
+        "line_end": 49,
+        "col_end": 78
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "SwitchInt": {
+      "discr": {
+       "Move": {
+        "local": 5,
+        "projections": []
+       }
+      },
+      "targets": [
+       [
+        0,
+        5
+       ]
+      ],
+      "otherwise": 3,
+      "exhaustive_enum_unreachable": false,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 49,
+       "col_start": 72,
+       "line_end": 49,
+       "col_end": 78
+      }
+     }
+    }
+   },
+   {
+    "id": 3,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 6,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Lt",
+         {
+          "Copy": {
+           "local": 2,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Int": 1000
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 49,
+        "col_start": 82,
+        "line_end": 49,
+        "col_end": 90
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "SwitchInt": {
+      "discr": {
+       "Move": {
+        "local": 6,
+        "projections": []
+       }
+      },
+      "targets": [
+       [
+        0,
+        5
+       ]
+      ],
+      "otherwise": 4,
+      "exhaustive_enum_unreachable": false,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 49,
+       "col_start": 82,
+       "line_end": 49,
+       "col_end": 90
+      }
+     }
+    }
+   },
+   {
+    "id": 4,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "<i32 as core::ops::arith::Mul>::mul",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       },
+       {
+        "Copy": {
+         "local": 2,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 0,
+       "projections": []
+      },
+      "target": 6,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 49,
+       "col_start": 93,
+       "line_end": 49,
+       "col_end": 117
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 16308397492346268927,
+       "def_index": 32699,
+       "substs_digest": [
+        4401082365745577916,
+        13159887354158232006
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 16308397492346268927,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 5,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 0,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Constant": {
+          "Int": 0
+         }
+        }
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 49,
+        "col_start": 127,
+        "line_end": 49,
+        "col_end": 128
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Goto": 6
+    }
+   },
+   {
+    "id": 6,
+    "stmts": [],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 2,
+  "return_ty": {
+   "Int": {
+    "width": 32,
+    "signed": true
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": -2147483648
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": 2147483647
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "b",
+        "Int"
+       ]
+      },
+      {
+       "Int": -2147483648
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "b",
+        "Int"
+       ]
+      },
+      {
+       "Int": 2147483647
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

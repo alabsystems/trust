@@ -1,6 +1,8 @@
 //@ dont-check-compiler-stderr
-//@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory -Aprivate_interfaces
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-UC): a `()`-TYPED named/inline CONSTANT is VALUE-LESS.
 //!
 //! Every body below carried a const-family tag before the wave —
@@ -33,13 +35,20 @@
 //!
 //! The REFUSALS live in `trust_ir_lower_unit_const_refuses.rs`: under `strict`
 //! a refusal is a compile error and cannot share a file with the admissions.
+//!
+//! EFFECT CONSERVATION (D28, 2026-10-01): `f` and `g` drop their by-value `T`. The direct trust-ir
+//! emits no `Drop` yet, so the effect-conservation gate tags each such body `Abstracted(drop, ..)`
+//! and strict refuses it (expected below). A producer tag would still be its own, unannotated,
+//! strict error, so this file keeps its mutation check.
 
 #![allow(dead_code, unused_variables, unused_mut)]
 
 struct Data;
 struct Data2;
 fn f<T>(_: T, _: ()) {}
+//~^ ERROR the effect-conservation check refused it against the built MIR
 fn g<T>(_: T, _: ()) {}
+//~^ ERROR the effect-conservation check refused it against the built MIR
 mod m {
     pub const FOO: () = ();
 }

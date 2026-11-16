@@ -17,8 +17,10 @@
 #   # typically launched alongside a build:  x.py build … & gov $! ; wait
 #
 # Env (all optional):
-#   TRUST_GOV_CRITICAL_GIB  Pause heaviest child when avail < this   (default 6)
-#   TRUST_GOV_RESUME_GIB    Resume paused children when avail >= this (default 12)
+#   TRUST_GOV_CRITICAL_GIB  Pause heaviest child when avail < this
+#                           (default: scripts/lib/host_budget.py governor; 6 if unmeasurable)
+#   TRUST_GOV_RESUME_GIB    Resume paused children when avail >= this
+#                           (default: scripts/lib/host_budget.py governor; 12 if unmeasurable)
 #   TRUST_GOV_POLL_SEC      Poll interval seconds                     (default 3)
 #   TRUST_GOV_LOG           Log file (default: metrics/build-governor.log)
 #
@@ -30,11 +32,23 @@
 set -uo pipefail
 
 readonly ROOT_PID="${1:?Usage: build-mem-governor.sh <ROOT_PID>}"
-readonly CRIT_GIB="${TRUST_GOV_CRITICAL_GIB:-6}"
-readonly RESUME_GIB="${TRUST_GOV_RESUME_GIB:-12}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The floors come from the measured host (scripts/lib/host_budget.py `governor`:
+# pause below a sixteenth of physical memory, resume above twice that) unless
+# the caller set them. Until 2026-10-14 they were a fixed 6 / 12 GiB: a quarter
+# of a 24 GiB host and under five percent of a 128 GiB one. The fixed pair stays
+# only as the fallback when the helper cannot measure the host.
+if [ -z "${TRUST_GOV_CRITICAL_GIB:-}" ] || [ -z "${TRUST_GOV_RESUME_GIB:-}" ]; then
+  _floors="$(python3 "$SCRIPT_DIR/lib/host_budget.py" governor 2>/dev/null)" || _floors=""
+  _crit="$(printf '%s\n' "$_floors" | sed -n 's/^TRUST_GOV_CRITICAL_GIB=\([0-9][0-9]*\)$/\1/p')"
+  _resume="$(printf '%s\n' "$_floors" | sed -n 's/^TRUST_GOV_RESUME_GIB=\([0-9][0-9]*\)$/\1/p')"
+  [ -n "${TRUST_GOV_CRITICAL_GIB:-}" ] || TRUST_GOV_CRITICAL_GIB="${_crit:-6}"
+  [ -n "${TRUST_GOV_RESUME_GIB:-}" ] || TRUST_GOV_RESUME_GIB="${_resume:-12}"
+fi
+readonly CRIT_GIB="$TRUST_GOV_CRITICAL_GIB"
+readonly RESUME_GIB="$TRUST_GOV_RESUME_GIB"
 readonly POLL_SEC="${TRUST_GOV_POLL_SEC:-3}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=lib/process_tree.sh
 . "$SCRIPT_DIR/lib/process_tree.sh"

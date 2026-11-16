@@ -1,0 +1,28 @@
+note: Clean island kernel-checked after program admission: 5 declaration(s) registered (member_approval_is_exact, admissible_is_exact, merge_is_a_receipt, classify_one, classify_other)
+  --> $DIR/off_import_discharge.rs:54:5
+   |
+LL | /     theorem member_approval_is_exact (authority eligible writer : Bool) :
+LL | |         trust_import_off_import_discharge__member_approval authority eligible writer =
+LL | |             (authority && eligible && writer) := by
+LL | |       simp only [trust_import_off_import_discharge__member_approval]
+...  |
+LL | |     theorem classify_one : trust_import_off_import_discharge__classify 1 = 20 := rfl
+LL | |     theorem classify_other : trust_import_off_import_discharge__classify 7 = 0 := rfl
+   | |_____________________________________________________________________________________^
+
+note: citation `member_approval_is_exact` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `member_approval`, with a clean certification audit
+  --> $DIR/off_import_discharge.rs:28:62
+   |
+LL |     ensures result == (authority && (eligible && writer)) by member_approval_is_exact
+   |                                                              ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
+
+note: citation `admissible_is_exact` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `admissible`, with a clean certification audit
+  --> $DIR/off_import_discharge.rs:35:70
+   |
+LL |     ensures result == (previous <= proposed && proposed <= limit) by admissible_is_exact
+   |                                                                      ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
+

@@ -1,0 +1,8 @@
+[package]
+name = "pass-bin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Trust: this standalone UI fixture owns its workspace, independently of Tippy.
+[workspace]

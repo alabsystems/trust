@@ -1,0 +1,7 @@
+# Identities for adv6.trust_ir: the review of census/c0's real stage1 dump
+# of adv6.rs. Conventions: census_shapes.identities.
+body adv_strip_to_this_hosts_limit pub
+spawners
+product-census
+effects adv_strip_to_this_hosts_limit 6:23=fork 9:37=fcntl 10:17=execv 10:42=_exit
+drops adv_strip_to_this_hosts_limit

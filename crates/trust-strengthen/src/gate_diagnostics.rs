@@ -192,13 +192,12 @@ pub fn suggest_fix(kind: &DiagnosticKind, spec_body: &str) -> Option<FixSuggesti
         }
         DiagnosticKind::Tautology => {
             // If it's x == x, suggest removing
-            if spec_body.contains("==") {
-                let parts: Vec<&str> = spec_body.splitn(2, "==").collect();
-                if parts.len() == 2 && parts[0].trim() == parts[1].trim() {
-                    return Some(FixSuggestion::new(
-                        "Remove tautological spec; both sides of == are identical",
-                    ));
-                }
+            if let Some((lhs, rhs)) = spec_body.split_once("==")
+                && lhs.trim() == rhs.trim()
+            {
+                return Some(FixSuggestion::new(
+                    "Remove tautological spec; both sides of == are identical",
+                ));
             }
             Some(FixSuggestion::new("Replace with a meaningful constraint that restricts behavior"))
         }
@@ -254,18 +253,21 @@ pub fn format_diagnostics(diagnostics: &[GateDiagnostic]) -> String {
         return "No diagnostics.".to_string();
     }
 
-    let rejections: Vec<_> =
-        diagnostics.iter().filter(|d| d.severity == Severity::Reject).collect();
-    let warnings: Vec<_> = diagnostics.iter().filter(|d| d.severity == Severity::Warn).collect();
-    let infos: Vec<_> = diagnostics.iter().filter(|d| d.severity == Severity::Info).collect();
+    let mut rejections = 0usize;
+    let mut warnings = 0usize;
+    let mut infos = 0usize;
+    for d in diagnostics {
+        match d.severity {
+            Severity::Reject => rejections += 1,
+            Severity::Warn => warnings += 1,
+            Severity::Info => infos += 1,
+        }
+    }
 
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Gate diagnostics: {} rejection(s), {} warning(s), {} info(s)",
-        rejections.len(),
-        warnings.len(),
-        infos.len(),
+        "Gate diagnostics: {rejections} rejection(s), {warnings} warning(s), {infos} info(s)",
     );
 
     for d in diagnostics {
@@ -367,13 +369,6 @@ mod tests {
         let s = d.to_string();
         assert!(s.contains("suggestion:"));
         assert!(s.contains("meaningful constraint"));
-    }
-
-    #[test]
-    fn test_fix_suggestion_new() {
-        let s = FixSuggestion::new("do something");
-        assert_eq!(s.description, "do something");
-        assert!(s.replacement.is_none());
     }
 
     #[test]

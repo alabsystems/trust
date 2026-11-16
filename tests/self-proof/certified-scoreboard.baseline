@@ -1,0 +1,104 @@
+{
+  "totals": {
+    "obligations": 296,
+    "proved": 172,
+    "failed": 13,
+    "unknown": 13,
+    "timed_out": 0,
+    "runtime_checked": 98,
+    "kernel_certified": 309,
+    "smt_backed": 0
+  },
+  "per_crate": {
+    "aterm-bidi": {
+      "obligations": 49,
+      "proved": 21,
+      "failed": 8,
+      "unknown": 0,
+      "timed_out": 0,
+      "runtime_checked": 20,
+      "kernel_certified": 26,
+      "smt_backed": 0
+    },
+    "aterm-bits": {
+      "obligations": 13,
+      "proved": 3,
+      "failed": 2,
+      "unknown": 3,
+      "timed_out": 0,
+      "runtime_checked": 5,
+      "kernel_certified": 4,
+      "smt_backed": 0
+    },
+    "aterm-codec": {
+      "obligations": 106,
+      "proved": 75,
+      "failed": 0,
+      "unknown": 3,
+      "timed_out": 0,
+      "runtime_checked": 28,
+      "kernel_certified": 213,
+      "smt_backed": 0
+    },
+    "aterm-cap": {
+      "obligations": 10,
+      "proved": 4,
+      "failed": 0,
+      "unknown": 0,
+      "timed_out": 0,
+      "runtime_checked": 6,
+      "kernel_certified": 4,
+      "smt_backed": 0
+    },
+    "aterm-rle": {
+      "obligations": 0,
+      "proved": 0,
+      "failed": 0,
+      "unknown": 0,
+      "timed_out": 0,
+      "runtime_checked": 0,
+      "kernel_certified": 0,
+      "smt_backed": 0
+    },
+    "aterm-log": {
+      "obligations": 31,
+      "proved": 5,
+      "failed": 2,
+      "unknown": 5,
+      "timed_out": 0,
+      "runtime_checked": 19,
+      "kernel_certified": 7,
+      "smt_backed": 0
+    },
+    "aterm-buffer": {
+      "obligations": 0,
+      "proved": 0,
+      "failed": 0,
+      "unknown": 0,
+      "timed_out": 0,
+      "runtime_checked": 0,
+      "kernel_certified": 0,
+      "smt_backed": 0
+    },
+    "aterm-hash": {
+      "obligations": 55,
+      "proved": 45,
+      "failed": 1,
+      "unknown": 0,
+      "timed_out": 0,
+      "runtime_checked": 9,
+      "kernel_certified": 35,
+      "smt_backed": 0
+    },
+    "aterm-sixel": {
+      "obligations": 32,
+      "proved": 19,
+      "failed": 0,
+      "unknown": 2,
+      "timed_out": 0,
+      "runtime_checked": 11,
+      "kernel_certified": 20,
+      "smt_backed": 0
+    }
+  }
+}

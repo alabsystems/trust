@@ -1,4 +1,4 @@
-use cargo::core::{Dependency, dependency::DepKind};
+use targo::workspace::{Dependency, dependency::DepKind};
 
 use resolver_tests::{
     helpers::{

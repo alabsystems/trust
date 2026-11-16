@@ -1264,13 +1264,13 @@ pub fn certify_single_composite_theorem() -> Option<bool> {
     .flatten()
 }
 
-// SLOW-LANE SPLIT (2026-07-20, owner-approved). The kernel-derivation tests in
-// this module (*_kernel_checks, *_reflection_pins_to_real_fixture,
+// SLOW-LANE SPLIT (2026-07-20; #[ignore]d, not on yet: docs/STATUS.md). The kernel-derivation
+// tests in this module (*_kernel_checks, *_reflection_pins_to_real_fixture,
 // reducer_universal_composition_closes) re-derive the full N-brick kernel
 // composite (~3.5h, and it grows with every brick added). That exceeds the
 // `quick` domination gate's 2h step budget (GATE_STEP_TIMEOUT), so those tests
 // carry #[ignore] and are excluded from `targo test --workspace --lib`. They
-// still run — and MUST stay green — in the opt-in composite lane:
+// run — and MUST stay green — in the `slow` profile only (not yet release: docs/PLAN.md PKG-V7):
 //     scripts/trust_kernel_derivation_lane.sh reducer_universal_composition
 // The CHEAP component/digest/encoder tests below stay inline and DO run in
 // `quick`, so the fast lane still catches drift in the composite's inputs.

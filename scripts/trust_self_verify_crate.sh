@@ -7,7 +7,8 @@
 # ============================================================================
 # WHY THIS EXISTS
 # ============================================================================
-# `docs/SELF_PROOF.md` §5 item 1 — "The smallest next step":
+# The step this script took (`git show cd8558a1cf:docs/SELF_PROOF.md`, §5 item 1;
+# docs/SELF_PROOF.md §5.1 now says what it holds):
 #
 #   "Not a flag. The numbers in §3 took 68 minutes to produce and exist nowhere
 #    else in the tree; the first job is to stop them from being a one-off.
@@ -57,6 +58,12 @@
 # file for where it belongs.
 set -uo pipefail
 
+MODE="${1:-run}"
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$MODE" != "--update" ] && [ "$MODE" != "--selftest" ]; }; then
+  echo "usage: scripts/trust_self_verify_crate.sh [--selftest|--update]" >&2
+  exit 2
+fi
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
@@ -73,12 +80,16 @@ TARGO="${TARGO:-$REPO_ROOT/build/host/stage1/bin/targo}"
 #   = note: summary: 3 trusted, 2 certified, 0 failed, ... out of 8
 field() {  # field <log> <name>  -> integer from the LAST Summary: line
   grep -E "^ *Summary: .*proved" "$1" | tail -1 \
-    | grep -oE "[0-9]+ $2" | grep -oE "^[0-9]+" || true
+    | awk -v name="$2" '{ for (i=2; i<NF; i++) if ($(i+1) == name || $(i+1) == name ",") print $i }'
 }
 certified_total() {  # sum of per-function kernel-certified rows
-  grep -oE "summary: [0-9]+ trusted, [0-9]+ certified" "$1" \
-    | grep -oE "[0-9]+ certified" | grep -oE "^[0-9]+" \
-    | awk '{s+=$1} END {print s+0}'
+  awk '/summary:/ {
+    for (i=1; i<NF; i++) if ($(i+1) == "certified," || $(i+1) == "certified") {
+      if ($i !~ /^[0-9]+$/) { bad=1; next }
+      s+=$i
+    }
+  }
+  END { if (bad) exit 2; print s+0 }' "$1"
 }
 coverage_pair() {  # "processed eligible complete_flag"
   local line
@@ -92,17 +103,38 @@ coverage_pair() {  # "processed eligible complete_flag"
   echo "$n $d $flag"
 }
 
-read_baseline() {  # read_baseline <key>
-  sed -e 's/#.*//' "$BASELINE" 2>/dev/null \
-    | grep -E "^[[:space:]]*$1[[:space:]]*=" \
-    | head -1 | sed -e 's/.*=[[:space:]]*//' -e 's/[[:space:]]*$//'
+require_count() {  # require_count <name> <value>
+  case "$2" in
+    ''|*[!0-9]*)
+      echo "REFUSE: $1 must be a nonnegative integer, got '$2'." >&2
+      return 2
+      ;;
+  esac
+  # Also reject values outside the shell's integer range: failed arithmetic
+  # comparisons must never silently become a passing ratchet.
+  if ! [ "$2" -ge 0 ] 2>/dev/null; then
+    echo "REFUSE: $1 is outside the supported integer range." >&2
+    return 2
+  fi
+}
+
+read_baseline() {  # exactly one integer for read_baseline <key>
+  local rows value
+  rows="$(sed -e 's/#.*//' "$BASELINE_INPUT" | grep -E "^[[:space:]]*$1[[:space:]]*=")"
+  if [ -z "$rows" ] || [[ "$rows" == *$'\n'* ]]; then
+    echo "REFUSE: $BASELINE must contain exactly one $1." >&2
+    return 2
+  fi
+  value="$(printf '%s\n' "$rows" | sed -e 's/^[^=]*=[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  require_count "$1" "$value" || return 2
+  printf '%s\n' "$value"
 }
 
 # --------------------------------------------------------------- selftest ---
 # Mutation proof. Every assertion must be shown to FIRE on a synthetic log that
 # violates it — a gate nobody has watched fail is not known to be a gate, and
 # this repo has shipped four instruments that were silently inert.
-if [ "${1:-}" = "--selftest" ]; then
+if [ "$MODE" = "--selftest" ]; then
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
   good="$tmp/good.log"
   cat > "$good" <<'LOG'
@@ -185,6 +217,44 @@ LOG
 fi
 
 # ------------------------------------------------------------------- run ----
+# Check the ratchet before spending time on a verified compile. Updating an
+# existing baseline may strengthen its floors/ceiling, never erase them.
+baseline_snapshot=""
+baseline_tmp=""
+baseline_lock=""
+log=""
+cleanup() {
+  [ -z "$log" ] || rm -f "$log"
+  [ -z "$baseline_snapshot" ] || rm -f "$baseline_snapshot"
+  [ -z "$baseline_tmp" ] || rm -f "$baseline_tmp"
+  [ -z "$baseline_lock" ] || rmdir "$baseline_lock"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [ "$MODE" = "--update" ]; then
+  mkdir -p "$(dirname "$BASELINE")" || exit 2
+  if ! mkdir "$BASELINE.lock" 2>/dev/null; then
+    echo "REFUSE: another update owns $BASELINE.lock." >&2
+    exit 2
+  fi
+  baseline_lock="$BASELINE.lock"
+fi
+BASELINE_INPUT="$BASELINE"
+HAVE_BASELINE=0
+if [ -f "$BASELINE" ]; then
+  baseline_snapshot="$(mktemp)" || exit 2
+  cp -p "$BASELINE" "$baseline_snapshot" || exit 2
+  BASELINE_INPUT="$baseline_snapshot"
+  certified_min="$(read_baseline certified_min)" || exit 2
+  proved_min="$(read_baseline proved_min)" || exit 2
+  assumed_max="$(read_baseline assumed_max)" || exit 2
+  HAVE_BASELINE=1
+elif [ "$MODE" != "--update" ]; then
+  echo "REFUSE: no baseline at $BASELINE — mint one with --update." >&2
+  exit 2
+fi
+
 if [ ! -x "$TARGO" ]; then
   echo "REFUSE: no targo at $TARGO" >&2
   echo "        set TARGO=<path>; verify it is REALLY targo, not cargo wearing" >&2
@@ -199,7 +269,7 @@ if ! "$TARGO" --unverified --version >/dev/null 2>&1; then
   exit 2
 fi
 
-log="$(mktemp)"; trap 'rm -f "$log"' EXIT
+log="$(mktemp)" || exit 2
 # `trust-semantics`' contracts are cfg-gated behind `trust_contracts` so that an
 # ordinary `x.py` build — which compiles this crate with a stage0 that may be a
 # STABLE rustc, and would answer E0554 to `#![feature(contracts)]` — is
@@ -207,14 +277,25 @@ log="$(mktemp)"; trap 'rm -f "$log"' EXIT
 # below are minted under them, so the gate must set the cfg or it would measure
 # a DIFFERENT configuration than the baseline and read as a regression.
 #
-# NOTE: `-Ztrust-*` in RUSTFLAGS is silently IGNORED by targo (it warns and
-# drops it); those belong in TRUSTFLAGS. Measured the hard way — a dump run
-# produced zero artifacts and the warning was the only evidence.
+# NOTE: `-Ztrust-*` in RUSTFLAGS is IGNORED by targo (it warns and drops it).
+# Measured the hard way — a dump run produced zero artifacts and the warning
+# was the only evidence. A per-run Trust selection is a `targo trust` flag
+# (`--certify`, `--trust-profile`, `--worker-threads`, ...), `[trust]` in the
+# workspace root, or Cargo configuration; TRUSTFLAGS is not read either
+# (DECISION_QUEUE T7a).
 CFG_FLAGS="${TRUST_SELF_VERIFY_RUSTFLAGS:---cfg=trust_contracts}"
 echo "running: RUSTFLAGS=\"$CFG_FLAGS\" targo trust check -p $CRATE"
 echo "         (verified lane; minutes, not seconds)"
 ( cd "$REPO_ROOT/crates" && RUSTFLAGS="$CFG_FLAGS" "$TARGO" trust check -p "$CRATE" ) > "$log" 2>&1
 run_status=$?
+case "$run_status" in
+  0|1) ;;  # strict-lane refusal may still supply the partial-proof ratchet
+  *)
+    echo "REFUSE: verified compile did not finish normally (exit $run_status)." >&2
+    tail -25 "$log"
+    exit 2
+    ;;
+esac
 
 cov="$(coverage_pair "$log")" || {
   echo "REFUSE: no 'Coverage:' line — verification did not run (exit $run_status)."
@@ -257,12 +338,25 @@ if grep -qE "^error: could not compile|Trust full verification failed for" "$log
   echo "        describe the bodies that DID lower, not the crate."
   exit 2
 fi
-set -- $cov; processed="$1"; eligible="$2"; complete="$3"
+read -r processed eligible complete <<< "$cov"
 
 proved="$(field "$log" proved)"
 failed="$(field "$log" failed)"
 assumed="$(field "$log" assumed)"
-certified="$(certified_total "$log")"
+certified="$(certified_total "$log")" || {
+  echo "REFUSE: malformed per-function certified count." >&2
+  exit 2
+}
+require_count processed "$processed" || exit 2
+require_count eligible "$eligible" || exit 2
+require_count proved "$proved" || exit 2
+require_count failed "$failed" || exit 2
+require_count assumed "$assumed" || exit 2
+require_count certified "$certified" || exit 2
+if [ "$eligible" -eq 0 ]; then
+  echo "REFUSE: zero eligible bodies — no compiler dependency was verified." >&2
+  exit 2
+fi
 
 echo ""
 echo "  coverage   $processed/$eligible ($complete)"
@@ -271,33 +365,6 @@ echo "  certified  $certified   (kernel-rechecked)"
 echo "  failed     $failed"
 echo "  assumed    $assumed"
 
-if [ "${1:-}" = "--update" ]; then
-  mkdir -p "$(dirname "$BASELINE")"
-  cat > "$BASELINE" <<EOF
-# Ratcheted self-proof baseline for \`$CRATE\`, a crate in trustc's own link
-# closure. Minted by scripts/trust_self_verify_crate.sh --update.
-#
-# floors are MONOTONE (may only rise); assumed_max is a CEILING and exists to
-# refuse the \`#[trust::assume_total]\` laundering SELF_PROOF.md §5.2 forbids.
-# Raising any number here is a claim that the improvement is real — state why.
-certified_min = $certified
-proved_min    = $proved
-assumed_max   = $assumed
-EOF
-  echo ""
-  echo "baseline written: $BASELINE"
-  exit 0
-fi
-
-if [ ! -f "$BASELINE" ]; then
-  echo ""
-  echo "REFUSE: no baseline at $BASELINE — mint one with --update." >&2
-  exit 2
-fi
-certified_min="$(read_baseline certified_min)"
-proved_min="$(read_baseline proved_min)"
-assumed_max="$(read_baseline assumed_max)"
-
 status=0
 if [ "$processed" != "$eligible" ] || [ "$complete" != "complete" ]; then
   echo ""
@@ -305,18 +372,18 @@ if [ "$processed" != "$eligible" ] || [ "$complete" != "complete" ]; then
   echo "      A crate that stops processing bodies reports better numbers for a worse reason."
   status=1
 fi
-if [ "$certified" -lt "$certified_min" ]; then
+if [ "$HAVE_BASELINE" -eq 1 ] && [ "$certified" -lt "$certified_min" ]; then
   echo ""
   echo "FAIL: kernel-certified rows $certified < floor $certified_min."
   echo "      Kernel re-check is the only thing that earns Certified; this floor may not fall."
   status=1
 fi
-if [ "$proved" -lt "$proved_min" ]; then
+if [ "$HAVE_BASELINE" -eq 1 ] && [ "$proved" -lt "$proved_min" ]; then
   echo ""
   echo "FAIL: proved rows $proved < floor $proved_min."
   status=1
 fi
-if [ "$assumed" -gt "$assumed_max" ]; then
+if [ "$HAVE_BASELINE" -eq 1 ] && [ "$assumed" -gt "$assumed_max" ]; then
   echo ""
   echo "FAIL: assumed rows $assumed > ceiling $assumed_max."
   echo "      SELF_PROOF.md §5.2 records assuming the callee perimeter as FORBIDDEN:"
@@ -324,6 +391,56 @@ if [ "$assumed" -gt "$assumed_max" ]; then
   echo "      crate goes green while proving strictly LESS. If these assumptions are"
   echo "      genuinely justified, raise the ceiling in $BASELINE and say why."
   status=1
+fi
+
+if [ "$HAVE_BASELINE" -eq 1 ] && ! cmp -s "$baseline_snapshot" "$BASELINE"; then
+  echo "REFUSE: $BASELINE changed during verification; preserving it." >&2
+  exit 2
+fi
+
+if [ "$MODE" = "--update" ] && [ "$status" -eq 0 ]; then
+  mkdir -p "$(dirname "$BASELINE")" || exit 2
+  baseline_tmp="$(mktemp "$BASELINE.tmp.XXXXXX")" || exit 2
+  if [ "$HAVE_BASELINE" -eq 1 ]; then
+    # Keep the historical explanation and evidence beside the measured floors.
+    cp -p "$baseline_snapshot" "$baseline_tmp" || exit 2
+    awk -v c="$certified" -v p="$proved" -v a="$assumed" '
+      /^[[:space:]]*certified_min[[:space:]]*=/ { sub(/=[[:space:]]*[0-9]+/, "= " c) }
+      /^[[:space:]]*proved_min[[:space:]]*=/ { sub(/=[[:space:]]*[0-9]+/, "= " p) }
+      /^[[:space:]]*assumed_max[[:space:]]*=/ { sub(/=[[:space:]]*[0-9]+/, "= " a) }
+      { print }
+    ' "$baseline_snapshot" > "$baseline_tmp"
+    write_status=$?
+  else
+    cat > "$baseline_tmp" <<EOF
+# Ratcheted self-proof baseline for \`$CRATE\`, a crate in trustc's own link
+# closure. Minted by scripts/trust_self_verify_crate.sh --update.
+#
+# Floors may only rise; the assumptions ceiling may only fall. These are
+# measured partial-proof counts, not a claim that the entire crate verifies.
+certified_min = $certified
+proved_min    = $proved
+assumed_max   = $assumed
+EOF
+    write_status=$?
+  fi
+  if [ "$HAVE_BASELINE" -eq 1 ]; then
+    if ! cmp -s "$baseline_snapshot" "$BASELINE"; then
+      echo "REFUSE: $BASELINE changed during verification; preserving it." >&2
+      exit 2
+    fi
+    if [ "$write_status" -ne 0 ] || ! mv "$baseline_tmp" "$BASELINE"; then
+      echo "REFUSE: could not write $BASELINE." >&2
+      exit 2
+    fi
+  elif [ "$write_status" -ne 0 ] || ! ln "$baseline_tmp" "$BASELINE"; then
+    # Atomic no-clobber publication for the first baseline.
+    echo "REFUSE: could not write $BASELINE." >&2
+    exit 2
+  fi
+  echo ""
+  echo "baseline written: $BASELINE"
+  exit 0
 fi
 
 echo ""

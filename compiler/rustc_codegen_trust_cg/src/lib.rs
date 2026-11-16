@@ -33,6 +33,8 @@
 
 // Trust: We need rustc_private to access compiler-internal crates.
 #![feature(rustc_private)]
+// Trust: compare actual Windows file identities before copying a final object.
+#![cfg_attr(windows, feature(windows_by_handle))]
 
 // Trust (Step 1, trust-ir-emission): feature-gated EMISSION ADAPTER. Compiled
 // into the builtin backend only behind the off-by-default `trust-ir-emission`
@@ -52,6 +54,19 @@ mod trust_ir_emission;
 #[cfg(feature = "trust-ir-codegen")]
 mod trust_ir_codegen;
 
+// Trust: opt-in retained object-gate diagnostics; no admission authority.
+mod compiler_input_capture;
+mod object_replay;
+
+// Trust: rustc's final native artifact naming, cleanup, and notification protocol.
+mod archive_output;
+mod output_artifacts;
+
+// Trust: exact source-to-native ABI agreement; legacy bridge admission is unchanged.
+mod source_abi;
+// Trust: typed source dependencies remain code even when the MIR inventory omits them.
+mod native_source_residue;
+
 // Trust (F1, trust-ir-frontend): the CONSUMER of `trust_ir_of`. Unlike the two
 // modules above it is NOT feature-gated — it is selected at run time by
 // `-Ztrust-cg-frontend=trust-ir`, off by default. A cargo feature could not be
@@ -65,29 +80,28 @@ use std::fs;
 
 use rustc_abi::{BackendRepr, CanonAbi, ExternAbi};
 use rustc_ast::expand::allocator::{NO_ALLOC_SHIM_IS_UNSTABLE, default_fn_name, global_fn_name};
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_attr_ir::{InstrumentFnAttr, Linkage};
 use rustc_codegen_ssa::back::archive::ArArchiveBuilderBuilder;
 use rustc_codegen_ssa::back::link::link_binary;
 use rustc_codegen_ssa::base::{allocator_kind_for_codegen, allocator_shim_contents};
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleKind, TargetConfig};
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::LangItem;
-use rustc_hir::attrs::Linkage;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::WorkProductMap;
-use rustc_middle::middle::codegen_fn_attrs::{
-    CodegenFnAttrFlags, CodegenFnAttrs, InstrumentFnAttr,
-};
+use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::mir;
 use rustc_middle::mono::Visibility;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::util::Providers;
-use rustc_session::Session;
 use rustc_session::config::{
-    CFGuard, CFProtection, CrateType, DebugInfo, FunctionReturn, InstrumentCoverage,
-    InstrumentMcount, Lto, OptLevel as RustcOptLevel, OutputFilenames, OutputType, PrintKind,
+    CFGuard, CFProtection, DebugInfo, FunctionReturn, InstrumentCoverage, InstrumentMcount, LtoCli,
+    OptLevel as RustcOptLevel, OutputFilenames, OutputType, PrintKind,
 };
+use rustc_session::{CodegenBackendInit, EarlySession, Session};
 use rustc_span::{Symbol, sym};
+use rustc_structures::CrateType;
 use rustc_symbol_mangling::mangle_internal_symbol;
 use rustc_target::callconv::{ArgAbi, ArgAttribute, ArgExtension, PassMode};
 use rustc_target::spec::{FramePointer, StackProtector};
@@ -99,6 +113,8 @@ use trust_cg_bridge::codegen_backend::{
 };
 use trust_types::{Terminator as VerifiableTerminator, VerifiableFunction};
 
+use self::output_artifacts::native_machine_output_requested;
+
 // ---------------------------------------------------------------------------
 // The rustc adapter
 // ---------------------------------------------------------------------------
@@ -108,7 +124,11 @@ use trust_types::{Terminator as VerifiableTerminator, VerifiableFunction};
 /// Implements the real `rustc_codegen_ssa::traits::CodegenBackend` trait by
 /// delegating to the bridge crate's `TrustCgCodegenBackend`.
 // Trust: CodegenBackend adapter for trust-cg integration (#829).
-pub struct TrustCgCodegenBackend;
+#[derive(Default)]
+pub struct TrustCgCodegenBackend {
+    // Private live gated bytes, consumed once by the matching archive link.
+    compiler_archive_object: std::sync::Mutex<Option<archive_output::CompilerArchiveObject>>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrustCgTargetCapability {
@@ -152,19 +172,19 @@ fn target_capability(triple: &str) -> Option<TrustCgTargetCapability> {
     }
 }
 
-fn target_is_builtin(sess: &Session) -> bool {
+fn target_is_builtin(sess: &EarlySession) -> bool {
     sess.opts.target_triple.debug_tuple() == sess.opts.target_triple.tuple()
 }
 
-fn target_is_exact_builtin_host(sess: &Session) -> bool {
+fn target_is_exact_builtin_host(sess: &EarlySession) -> bool {
     target_is_builtin(sess)
         && sess.opts.target_triple.tuple() == rustc_session::config::host_tuple()
 }
 
-fn supported_crate_types_for_outputs(should_link: bool) -> Vec<CrateType> {
-    if should_link {
-        // The only end-to-end artifact lane currently audited is an rlib whose
-        // exported scalar functions are consumed by a production backend.
+fn supported_crate_types_for_outputs(native_machine_output: bool) -> Vec<CrateType> {
+    if native_machine_output {
+        // Both rlib archives and standalone objects use the same bounded
+        // rlib compilation lane, with exported scalar-register functions.
         // Executables need rustc's synthesized process-entry wrapper; dynamic
         // libraries and proc macros need visibility/PIC/loader contracts; and
         // static libraries need a complete archive/linkage audit. Advertising
@@ -190,6 +210,45 @@ fn supported_link_crate_types() -> Vec<CrateType> {
     supported_crate_types_for_outputs(true)
 }
 
+/// Trust (WS7.10 / F-114): a crate type outside `supported_crate_types` is a
+/// hard error exactly when this session requests native machine output AND the
+/// driver will actually run codegen. A print-only invocation — Cargo's
+/// capability probe, `rustc - --crate-name ___ --print=file-names
+/// --crate-type bin --crate-type rlib …` — stops before codegen, and Cargo reads
+/// a missing `file-names` line as "unsupported"; erroring there would fail every
+/// Cargo build under trust-cg, rlib-only ones included. Frontend-only output
+/// (metadata, MIR, dep-info) advertises every crate type and never reaches the
+/// fatal path. A driver mode that builds the global context (so
+/// `collect_crate_types` runs) but exits before codegen and link
+/// (`exits_before_codegen`, see [`session_exits_before_codegen`]) produces no
+/// artifact of ANY crate type, so a dropped type there loses nothing and the
+/// upstream warning stands.
+fn unsupported_crate_type_is_fatal_for(
+    native_machine_output: bool,
+    exits_before_codegen: bool,
+    print_kinds: impl IntoIterator<Item = PrintKind>,
+) -> bool {
+    native_machine_output
+        && !exits_before_codegen
+        && !print_requests_stop_before_codegen(print_kinds)
+}
+
+/// Trust (WS7.10 review): driver modes that create the global context — so
+/// `collect_crate_types` and the crate-type hook DO run — and then return
+/// before `codegen_and_build_linker`, emitting nothing: `-Zunpretty=<mode>`
+/// (the tcx-needing modes such as `mir`, `hir`, `thir-tree`) and
+/// `-Zno-analysis`. Refusing a `bin` crate type there would turn a pure
+/// pretty-print of a `main.rs` into an error for an artifact nobody asked for.
+///
+/// `-Zno-codegen` is deliberately NOT listed: it skips `codegen_crate` but still
+/// runs the link step, which publishes the other requested crate types (an rlib,
+/// or rustc's object-less staticlib archive), so a dropped type there is still a
+/// requested artifact silently missing. It stays refused (fail closed).
+#[allow(rustc::bad_opt_access)]
+fn session_exits_before_codegen(sess: &Session) -> bool {
+    sess.opts.pretty.is_some() || sess.opts.unstable_opts.no_analysis
+}
+
 /// Mirrors the driver's `print_crate_info` stop/continue contract. Ordinary
 /// print requests are answered before codegen, while `native-static-libs` and
 /// `link-args` require a completed link and therefore must retain all
@@ -213,7 +272,7 @@ fn explicit_split_debuginfo_is_inert(debuginfo: DebugInfo) -> bool {
 }
 
 #[allow(rustc::bad_opt_access)]
-fn unsupported_explicit_codegen_model(sess: &Session) -> Option<&'static str> {
+fn unsupported_explicit_codegen_model(sess: &EarlySession) -> Option<&'static str> {
     let cg = &sess.opts.cg;
     let unstable = &sess.opts.unstable_opts;
     if cg.code_model.is_some() {
@@ -280,7 +339,7 @@ fn effective_frame_pointer_policy(
 impl TrustCgCodegenBackend {
     /// Create a new trust-cg backend adapter.
     pub fn new() -> Box<dyn CodegenBackend> {
-        Box::new(Self)
+        Box::new(Self::default())
     }
 
     fn bridge_for_target_arch(
@@ -292,7 +351,7 @@ impl TrustCgCodegenBackend {
             .map(|arch| BridgeBackend::new_for_triple(arch, target_triple))
     }
 
-    fn bridge_for_session(&self, sess: &Session) -> BridgeBackend {
+    fn bridge_for_session(&self, sess: &EarlySession) -> BridgeBackend {
         let target_arch = sess.target.arch.desc();
         // The requested rustc tuple is the ABI/object contract. LLVM's target
         // spelling may contain aliases or deployment-version decoration and is
@@ -331,8 +390,22 @@ impl TrustCgCodegenBackend {
         }
     }
 
-    fn is_wasm_session(sess: &Session) -> bool {
+    fn is_wasm_session(sess: &EarlySession) -> bool {
         sess.target.arch.desc() == "wasm32"
+    }
+
+    /// The backend-init facts upstream 1.101 moved out of the
+    /// `CodegenBackend` trait methods (`thin_lto_supported`,
+    /// `replaced_intrinsics`) into `CodegenBackendInit`.
+    fn backend_init() -> CodegenBackendInit {
+        CodegenBackendInit {
+            global_backend_features: Vec::new(),
+            // trust-cg does not currently replace any intrinsics.
+            replaced_intrinsics: Vec::new(),
+            fallback_intrinsics: Vec::new(),
+            // trust-cg does not implement LTO.
+            thin_lto_supported: false,
+        }
     }
 
     fn wasm_target_config() -> TargetConfig {
@@ -340,10 +413,10 @@ impl TrustCgCodegenBackend {
         // borrow the native bridge's ABI features here: that bridge supports
         // only AArch64/x86-64, and linked Wasm is rejected during `init`.
         TargetConfig {
-            target_features: Vec::new(),
-            unstable_target_features: Vec::new(),
+            internal_target_features: Default::default(),
             has_reliable_f16: false,
             has_reliable_f16_math: false,
+            has_reliable_f16b: false,
             has_reliable_f128: false,
             has_reliable_f128_math: false,
         }
@@ -357,13 +430,16 @@ impl TrustCgCodegenBackend {
             return matches!(output, OutputType::Metadata | OutputType::DepInfo | OutputType::Mir);
         }
 
-        // The native bridge produces internal object files for rustc's normal
-        // link/archive path. User-facing `--emit=obj` is excluded because the
-        // adapter does not yet implement rustc's final-object artifact naming
-        // and JSON notification protocol.
+        // Native objects use the same safety and proven-output gates as the
+        // archive lane. join_codegen publishes requested final objects through
+        // rustc's shared naming, cleanup, stdout, and notification protocol.
         matches!(
             output,
-            OutputType::Exe | OutputType::Metadata | OutputType::DepInfo | OutputType::Mir
+            OutputType::Exe
+                | OutputType::Object
+                | OutputType::Metadata
+                | OutputType::DepInfo
+                | OutputType::Mir
         )
     }
 
@@ -439,7 +515,6 @@ impl TrustCgCodegenBackend {
             bytecode: None,
             assembly: None,
             llvm_ir: None,
-            links_from_incr_cache: Vec::new(),
         }]
     }
 
@@ -463,6 +538,12 @@ impl TrustCgCodegenBackend {
         crate_name: String,
     ) -> Box<dyn Any> {
         let sess = tcx.sess;
+        // Trust (plan step 3.5, design §5.7): a Clean-origin body built while F1 codegen runs is
+        // charged to the reach counter's `codegen` lane (the inventory's fallback asks under its
+        // own lane, `clean_inventory::neighbours`). The step-3 exit requires it to be zero.
+        let _clean_origin_reach = trust_thir_lower::clean_origin_reach::within(
+            trust_thir_lower::clean_origin_reach::ReachLane::Codegen,
+        );
 
         // (1) The PRODUCER has to be running. `trust_ir_of` returns `None` for
         // every body unless the direct frontend is enabled, and `None` is a
@@ -521,29 +602,113 @@ impl TrustCgCodegenBackend {
             Err(e) => tcx.dcx().fatal(format!("trust-cg allocator shim planning failed: {e}")),
         }
 
-        // (5) SOURCE -> `trust_ir_of` -> LIR, per reachable item.
-        let mut lowered = Vec::with_capacity(reachable);
-        let mut linkage = Vec::with_capacity(reachable);
-        let mut refusals: Vec<String> = Vec::new();
-        for (_symbol, instance, item_linkage) in instances {
-            match trust_ir_frontend::lower_instance(
+        // Trust (step 2 increment 5, sub-step 5.4.2): the opt-in COMPILER LANE
+        // (`-Ztrust-cg-f1-backend=compiler`). It consumes the SAME inventory and the same
+        // instance-assembly plan, and builds ONE codegen module for trust-cg's
+        // `Compiler::compile`, shipped only through the call-event gate. The default `lir`
+        // lane below is untouched.
+        if sess.trust_cg_f1_backend_is_compiler() {
+            return self.codegen_crate_via_compiler_lane(
                 tcx,
-                instance,
-                validate_codegen_instance_abi_trust_ir,
-            ) {
-                Ok(function) => {
-                    lowered.push(function);
-                    linkage.push(item_linkage);
-                }
-                Err(refusal) => refusals.push(refusal.to_string()),
-            }
+                crate_name,
+                instances,
+                reachable_statics,
+            );
         }
+
+        // (5) SOURCE -> `trust_ir_of` -> LIR, per reachable item.
+        // Every refusal is recorded into one `RefusalCensus` instead of an
+        // unaggregated string list, so one compile shows the SHAPE of the gap.
+        // The census only reports: it admits nothing, and the `fatal` below
+        // stays a `fatal`.
+        //
+        // TWO MODES, and the selector is `-Ztrust-ir-crate-module`:
+        //
+        // * DEFAULT (`lower_instance`): each item is selected by EXACT IDENTITY
+        //   — `(DefIndex, DefPathHash)` — from the finalize-assembled crate
+        //   module.
+        // * CRATE-MODULE (`lower_crate_module`): the lowering context is the
+        //   module the producer PUBLISHES, and the trust-ir v41 CODEGEN LICENSE
+        //   (`Function::body_gate`) binds as a whole-module NEGATIVE gate. This
+        //   mode was unselectable until the producer stamped that field — every
+        //   body carried no licensing claim, so it refused all of them — and
+        //   `trust_thir_lower::crate_module::stamp_codegen_license` is what
+        //   changed.
+        //
+        // The default stays the handoff lane because the two differ in
+        // SELECTION, not in gate strength: the crate-module lane resolves a
+        // body by the producer's DISPLAY path, which is explicitly not identity,
+        // so a collision-renamed body (two macro-expanded definitions sharing
+        // one `def_path_str`) is refused there and admitted here. Flipping the
+        // default would trade a soundness-neutral selection mechanism for a
+        // weaker one; the license is available on request instead.
+        let (lowered, linkage, census, instance_coverage) = if sess.trust_ir_crate_module() {
+            let outcome = trust_ir_frontend::lower_crate_module(
+                tcx,
+                instances.into_iter().map(|(_s, i, l)| (i, l)).collect(),
+                validate_codegen_instance_abi_trust_ir,
+            );
+            (outcome.lowered, outcome.linkage, outcome.census, None)
+        } else {
+            let mut lowered = Vec::with_capacity(reachable);
+            let mut linkage = Vec::with_capacity(reachable);
+            let mut census = trust_ir_frontend::RefusalCensus::default();
+            // Trust (step 2 increment 3): every item's lane is decided ONCE, up
+            // front, over the whole inventory. A concrete generic local instance,
+            // or a monomorphic item whose assembled body reaches a bodyless
+            // declaration, lowers from the instance-keyed codegen module; every
+            // other item lowers from the finalize-assembled module exactly as
+            // before (and when no item takes the instance lane, no such module is
+            // built at all).
+            // Owner ruling D17 admits a GENERIC instance body only under the
+            // strict proven-output gate; the frozen plan reads the policy from
+            // the session itself.
+            let mut plan = trust_ir_frontend::instance_assembly::plan(tcx, &instances);
+            // Trust (step 2 increment 4c): the drop-glue lane — synthesized glue, and every
+            // `Inst::Drop` resolved to a call of it — active only under the strict output gate
+            // (owner ruling D18 OD-2, under D17's rule); the frozen lane reads the policy itself.
+            let mut glue = trust_ir_frontend::drop_glue_lane::GlueLane::new(tcx, &instances);
+            // The instance-lane items that LOWERED, for the D17 coverage
+            // disclosure, which is printed and written only after the gate.
+            let mut emitted_instance_items = Vec::new();
+            for (index, (_symbol, instance, item_linkage)) in instances.into_iter().enumerate() {
+                match trust_ir_frontend::lower_instance(
+                    tcx,
+                    instance,
+                    &mut plan,
+                    &mut glue,
+                    index,
+                    validate_codegen_instance_abi_trust_ir,
+                ) {
+                    Ok(function) => {
+                        if plan.is_instance_item(index) {
+                            emitted_instance_items
+                                .push((function.symbol.clone(), function.gate_source.func_id));
+                        }
+                        lowered.push(function);
+                        linkage.push(item_linkage);
+                    }
+                    // Trust (plan step 3.0): every refusal F1 makes because of a Clean-origin
+                    // body is named `[clean-below-gate]`; every other refusal is recorded as is.
+                    Err(refusal) => census
+                        .record(trust_ir_frontend::clean_below_gate::name(tcx, instance, refusal)),
+                }
+            }
+            let glue_rows = if glue.active() {
+                trust_ir_frontend::glue_coverage_rows(&lowered)
+            } else {
+                Vec::new()
+            };
+            let coverage =
+                trust_ir_frontend::instance_coverage(&plan, &emitted_instance_items, glue_rows);
+            (lowered, linkage, census, coverage)
+        };
 
         tracing::info!(
             crate_name = %crate_name,
             reachable,
             completed = lowered.len(),
-            refused = refusals.len(),
+            refused = census.len(),
             "[trust_cg] trust-ir frontend: source -> trust_ir_of -> lower_module_to_lir"
         );
         sess.dcx().note(format!(
@@ -551,47 +716,49 @@ impl TrustCgCodegenBackend {
              source -> trust_ir_of -> lower_module_to_lir",
             lowered.len()
         ));
+        if let Some(note) = trust_ir_frontend::clean_origin_reach_note(tcx) {
+            sess.dcx().note(note);
+        }
 
-        if !refusals.is_empty() {
-            let listed = refusals.iter().map(|r| format!("  {r}")).collect::<Vec<_>>().join("\n");
-            tcx.dcx().fatal(format!(
-                "-Ztrust-cg-frontend=trust-ir refused {} of {reachable} reachable function(s); \
-                 this frontend never falls back to the MIR path:\n{listed}",
-                refusals.len()
-            ));
+        if !census.is_empty() {
+            // The census reports counts per refusal class with a bounded
+            // sample, so one compile shows the SHAPE of the gap instead of one
+            // item at a time. The no-fallback property is deliberate and the
+            // report says so.
+            tcx.dcx().fatal(census.report(reachable));
         }
 
         if lowered.is_empty() {
             // A linking compilation with no functions is the MIR path's
             // "type-only library" case, which it handles by emitting no object.
+            // Trust (owner ruling D17): and it has no instance-lane rows.
+            clear_instance_coverage(sess, tcx.output_filenames(()));
+            // Trust (step 2 increment 5, sub-step 5.4.2): nor compiler-lane certificates.
+            clear_trust_cg_certificates(sess, tcx.output_filenames(()));
             return Box::new(OngoingTrustCgCodegen {
                 bridge_ongoing: None,
                 trust_ir_module: None,
                 trust_ir_gate_sources: Vec::new(),
                 crate_name,
                 function_count: 0,
+                instance_coverage: None,
+                compiler_lane: None,
             });
         }
 
         let function_count = lowered.len();
-        let (module, gate_sources) =
-            trust_ir_frontend::compiled_module(
-                &crate_name,
-                lowered,
-                linkage,
-                reachable_statics
-                    .into_iter()
-                    .map(ProductionStatic::into_object_global)
-                    .collect(),
-            )
-            .unwrap_or_else(
-                |reason| {
-                    tcx.dcx().fatal(format!(
-                        "trust-cg: refusing to emit a trust-ir codegen unit for `{crate_name}`: \
+        let (module, gate_sources) = trust_ir_frontend::compiled_module(
+            &crate_name,
+            lowered,
+            linkage,
+            reachable_statics.into_iter().map(ProductionStatic::into_object_global).collect(),
+        )
+        .unwrap_or_else(|reason| {
+            tcx.dcx().fatal(format!(
+                "trust-cg: refusing to emit a trust-ir codegen unit for `{crate_name}`: \
                          {reason}"
-                    ))
-                },
-            );
+            ))
+        });
         let _ = gate_mode;
         Box::new(OngoingTrustCgCodegen {
             bridge_ongoing: None,
@@ -599,6 +766,607 @@ impl TrustCgCodegenBackend {
             trust_ir_gate_sources: gate_sources,
             crate_name,
             function_count,
+            instance_coverage,
+            compiler_lane: None,
+        })
+    }
+
+    /// Trust (step 2 increment 5, sub-step 5.4.2): `codegen_crate_from_trust_ir` on the opt-in
+    /// COMPILER LANE, `-Ztrust-cg-f1-backend=compiler`
+    /// (docs/design/2026-10-08-step2-inc5-step4-compiler-lane-plan.md §2; design
+    /// docs/design/2026-10-01-step2-inc5-real-calls-retarget.md §3).
+    ///
+    /// The same inventory, the same instance-assembly plan and drop-glue lane as the default
+    /// lane; each item's body is SELECTED (`select_for_codegen_module`), rustc's `FnAbi` read
+    /// into plain data (`abi_shape`), and ONE codegen module built for the crate
+    /// (`codegen_module`, pure). trust-cg's `Compiler::compile` compiles it, and the bytes ship
+    /// only through `trust_cg_bridge::f1_compile::compile_and_verify_trust_ir_module`: the
+    /// call-event gate over the object, on its own 16 MiB thread (INC5.4-STACK), with
+    /// `CerReport::ships` under `f1_emit_policy` as the only shipping decision.
+    ///
+    /// FAIL-CLOSED like the default lane: every refusal is recorded into ONE census, the
+    /// frontend's, the codegen module's and trust-cg's own preflight rows together, and the
+    /// compilation fails; nothing falls back to the default lane or to MIR. What 5.4 does not
+    /// carry yet is refused by name (INC5.4-SCOPE).
+    fn codegen_crate_via_compiler_lane<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        crate_name: String,
+        instances: Vec<(String, ty::Instance<'tcx>, bridge_backend::FunctionLinkage)>,
+        reachable_statics: Vec<ProductionStatic>,
+    ) -> Box<dyn Any> {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+
+        use rustc_target::spec::RelocModel;
+        use trust_cg_bridge::call_event::{CallSiteKind, ProducerBody, ProducerModule};
+        use trust_cg_bridge::compiled_object::RelocationModel as CerRelocation;
+        use trust_cg_bridge::f1_compile::{
+            F1CompileConfig, F1CompileInput, F1OptLevel, F1Refusal, F1Target,
+            census_trust_ir_module, compile_and_verify_trust_ir_module,
+        };
+        use trust_ir_frontend::codegen_module::{
+            self, CodegenModuleInput, CollectorStatic, ExpectedTarget, WorkItem, WorkState,
+        };
+        use trust_ir_frontend::{FrontendRefusal, InstanceCoverage, InstanceCoverageRow};
+
+        let sess = tcx.sess;
+
+        // ---- INC5.4-SCOPE: what 5.4.2 does not carry, refused by name ------------------
+        if sess.trust_ir_crate_module() {
+            tcx.dcx().fatal(
+                "-Ztrust-cg-f1-backend=compiler does not take -Ztrust-ir-crate-module until step \
+                 5.4.4 moves the crate-module lane onto the compiler lane's consumer \
+                 (INC5.4-SCOPE); drop one of the two flags",
+            );
+        }
+        let gate_mode = output_gate_mode(sess);
+        if gate_mode == OutputGateMode::Off {
+            tcx.dcx().fatal(
+                "-Ztrust-cg-f1-backend=compiler refuses -Ztrust-cg-output-gate=off: the \
+                 call-event gate is the compiler lane's only shipping authority (owner ruling \
+                 D31), so the lane never ships an ungated object (INC5.4-SCOPE)",
+            );
+        }
+        let policy = f1_emit_policy(gate_mode);
+        let tuple = sess.opts.target_triple.tuple();
+        let Some(target) = F1Target::from_rustc_tuple(tuple) else {
+            tcx.dcx().fatal(format!(
+                "-Ztrust-cg-f1-backend=compiler compiles for aarch64-apple-darwin and \
+                 aarch64-unknown-linux-gnu only, not `{tuple}` (INC5.4-SCOPE): the call-event \
+                 gate models AArch64 Mach-O and ELF, and the lane's placement table is AAPCS64"
+            ));
+        };
+        let relocation = match sess.relocation_model() {
+            RelocModel::Static => CerRelocation::Static,
+            RelocModel::Pie => CerRelocation::Pie,
+            RelocModel::Pic => CerRelocation::Pic,
+            other => tcx.dcx().fatal(format!(
+                "-Ztrust-cg-f1-backend=compiler has no `{other:?}` relocation model; the gate and \
+                 trust-cg model static, pie and pic only (INC5.4-SCOPE)"
+            )),
+        };
+        let opt_level = match sess.opts.optimize {
+            RustcOptLevel::No => F1OptLevel::O0,
+            RustcOptLevel::Less => F1OptLevel::O1,
+            RustcOptLevel::More => F1OptLevel::O2,
+            RustcOptLevel::Aggressive => F1OptLevel::O3,
+            RustcOptLevel::Size | RustcOptLevel::SizeMin => tcx.dcx().fatal(
+                "trust-cg does not yet implement size-specific optimization for -Copt-level=s/z",
+            ),
+        };
+        // Trust: the effective target/CLI Always policy is a real AArch64
+        // object-codegen request. The Compiler path forces an entry FP/LR frame,
+        // including storage-free leaves; the same output gate still judges bytes.
+        let force_frame_pointers = matches!(
+            effective_frame_pointer_policy(
+                sess.target.frame_pointer,
+                sess.opts.cg.force_frame_pointers
+            ),
+            BridgeFramePointerPolicy::Always
+        );
+
+        // ---- the empty crate: no function and no static, no object ----------------------
+        if instances.is_empty() && reachable_statics.is_empty() {
+            clear_instance_coverage(sess, tcx.output_filenames(()));
+            clear_trust_cg_certificates(sess, tcx.output_filenames(()));
+            return Box::new(OngoingTrustCgCodegen {
+                bridge_ongoing: None,
+                trust_ir_module: None,
+                trust_ir_gate_sources: Vec::new(),
+                crate_name,
+                function_count: 0,
+                instance_coverage: None,
+                compiler_lane: None,
+            });
+        }
+
+        // ---- selection: the SAME plan and glue lane as the default lane ----------------
+        let reachable = instances.len();
+        let mut census = trust_ir_frontend::RefusalCensus::default();
+        let mut plan = trust_ir_frontend::instance_assembly::plan(tcx, &instances);
+        let mut glue = trust_ir_frontend::drop_glue_lane::GlueLane::new(tcx, &instances);
+        let mut selected = Vec::with_capacity(reachable);
+        for (index, (_symbol, instance, linkage)) in instances.iter().enumerate() {
+            match trust_ir_frontend::select_for_codegen_module(
+                tcx, *instance, &mut plan, &mut glue, index,
+            ) {
+                Ok((func, symbol)) => selected.push((index, *instance, symbol, func, *linkage)),
+                // Trust (plan step 3.0): a refusal because of a Clean-origin body is named
+                // `[clean-below-gate]`, exactly as on the default lane.
+                Err(refusal) => census
+                    .record(trust_ir_frontend::clean_below_gate::name(tcx, *instance, refusal)),
+            }
+        }
+
+        // ---- the producer: `star` if built (one clone per crate), else `base` -----------
+        let base = sess
+            .with_trust_compiler_state::<trust_thir_lower::AssembledCrateModuleForCodegen, _>(
+                |handoff| handoff.assembled_module(),
+            )
+            .ok();
+        let star = plan.instance_module().map(|star| Arc::new(star.clone()));
+        // Rule 1 compares every handoff body of `star` with `base`; without `base` it cannot
+        // run, so the lane refuses rather than skip it (unreachable today: `plan()` builds
+        // `star` from the same handoff).
+        if star.is_some() && base.is_none() {
+            tcx.dcx().fatal(
+                "trust-cg compiler lane: the instance-keyed module was built but the \
+                 finalize-assembled handoff module is unavailable, so design §3.1 rule 1 (every \
+                 handoff body equal in base and star) cannot be checked; refusing the crate",
+            );
+        }
+        let producer: Arc<trust_ir::Module> = match (&star, &base) {
+            (Some(star), _) => Arc::clone(star),
+            (None, Some(base)) => Arc::clone(base),
+            (None, None) => Arc::new(trust_ir::Module::new(crate_name.clone())),
+        };
+
+        // Trust: source-only primitive modules use the same identity-preserving native
+        // transport as logical closures. Route selection grants no ABI or body authority:
+        // every retained source instance still needs its exact FnAbi, handoff identity and
+        // conservation check. Unsupported signature shapes keep the checked rule-9 lane.
+        let source_definitions = if base.is_some() {
+            sess.with_trust_compiler_state::<trust_thir_lower::AssembledCrateModuleForCodegen, _>(
+                |handoff| handoff.codegen_body_ids(),
+            )
+        } else {
+            Vec::new()
+        };
+        let source_ids = source_definitions.iter().map(|(_, func)| *func).collect();
+        let route_roots = selected.iter().map(|(_, _, _, func, _)| *func).collect();
+        let expected = ExpectedTarget {
+            triple: sess.target.llvm_target.to_string(),
+            pointer_size: u32::from(sess.target.pointer_width / 8),
+        };
+        let native_source = trust_ir_frontend::native_source_module::uses_native_source(
+            &trust_ir_frontend::native_source_module::NativeRouteInput {
+                producer: &producer,
+                base: base.as_deref(),
+                source_ids: &source_ids,
+                roots: &route_roots,
+                has_statics: !reachable_statics.is_empty(),
+                target_triple: &expected.triple,
+                pointer_size: expected.pointer_size,
+            },
+        );
+        let mut native_items = Vec::new();
+        let mut native_abi = Vec::new();
+        // ---- the work list ---------------------------------------------------------------
+        let mut items = Vec::with_capacity(selected.len());
+        for (index, instance, symbol, func, linkage) in selected {
+            if native_source {
+                match source_abi::validate_module_instance(tcx, instance, &producer, func) {
+                    Ok(agreement) => {
+                        // P records rustc's actual placement and extensions; producer attrs
+                        // and logical ABI slots remain unchanged for the native adapter.
+                        native_items.push(
+                            trust_ir_frontend::native_source_module::NativeWorkItem {
+                                symbol,
+                                func,
+                                linkage,
+                                never_inline: instance_is_never_inline(tcx, instance),
+                                placement: agreement.placement.clone(),
+                                inventory_residue: false,
+                            },
+                        );
+                        native_abi.push(agreement);
+                    }
+                    Err(detail) => {
+                        census.record(FrontendRefusal::UnsupportedAbi { symbol, detail })
+                    }
+                }
+                continue;
+            }
+            let ir_param_count = producer
+                .function_by_id(func)
+                .and_then(|f| producer.func_types.get(f.ty.as_usize()))
+                .map(|ty| ty.params.len());
+            let state = match ir_param_count {
+                None => {
+                    census.record(FrontendRefusal::SelectedFunctionMissing {
+                        symbol: symbol.clone(),
+                        func_id: func.index(),
+                        functions: producer.functions.len(),
+                    });
+                    WorkState::Refused
+                }
+                Some(count) => {
+                    match trust_ir_frontend::abi_shape::abi_shape_of(tcx, instance, count) {
+                        Ok(abi) => WorkState::Admitted { abi },
+                        Err(detail) => {
+                            census.record(FrontendRefusal::UnsupportedAbi {
+                                symbol: symbol.clone(),
+                                detail,
+                            });
+                            WorkState::Refused
+                        }
+                    }
+                }
+            };
+            items.push(WorkItem {
+                symbol,
+                func,
+                linkage,
+                never_inline: instance_is_never_inline(tcx, instance),
+                handoff: !plan.is_instance_item(index),
+                state,
+            });
+        }
+
+        // Trust: the optimized MIR inventory is not the source IR's dependency graph.
+        // Recover real local source instances through the exact published handoff and
+        // HIR type-checker, then apply the same identity and actual FnAbi checks.
+        if native_source {
+            for (def_index, func) in source_definitions {
+                if producer.function_by_id(func).is_none_or(|f| f.is_declaration())
+                    || native_items.iter().any(|item| item.func == func)
+                {
+                    continue;
+                }
+                let symbol =
+                    producer.function_by_id(func).map(|f| f.name.clone()).unwrap_or_default();
+                let recovery =
+                    native_source_residue::recover_instance(tcx, &producer, func, def_index);
+                let instance = match recovery {
+                    Ok(instance) => instance,
+                    Err(detail) => {
+                        census.record(FrontendRefusal::CodegenModule { symbol, detail });
+                        continue;
+                    }
+                };
+                if let Err(refusal) = trust_ir_frontend::validate_native_source_dependency(
+                    tcx, instance, &symbol, &producer, func,
+                ) {
+                    census.record(refusal);
+                    continue;
+                }
+                match source_abi::validate_module_instance(tcx, instance, &producer, func) {
+                    Ok(agreement) => {
+                        native_items.push(
+                            trust_ir_frontend::native_source_module::NativeWorkItem {
+                                func,
+                                symbol,
+                                linkage: bridge_backend::FunctionLinkage::Internal,
+                                never_inline: instance_is_never_inline(tcx, instance),
+                                placement: agreement.placement.clone(),
+                                inventory_residue: true,
+                            },
+                        );
+                        native_abi.push(agreement);
+                    }
+                    Err(detail) => {
+                        census.record(FrontendRefusal::UnsupportedAbi { symbol, detail })
+                    }
+                }
+            }
+        }
+
+        // ---- residue identities (rule 2) ------------------------------------------------
+        let roots: BTreeSet<trust_ir::value::FuncId> = items
+            .iter()
+            .filter(|item| matches!(item.state, WorkState::Admitted { .. }))
+            .map(|item| item.func)
+            .collect();
+        let spliced = plan.spliced();
+        let residue = trust_ir_frontend::residue_identities(
+            tcx,
+            &producer,
+            &codegen_module::residue_candidates(&producer, &roots),
+            &spliced,
+        );
+        let statics: Vec<CollectorStatic> = reachable_statics
+            .iter()
+            .map(|s| CollectorStatic {
+                symbol: s.symbol.clone(),
+                mutable: s.mutable,
+                is_external: s.is_external,
+            })
+            .collect();
+        let declarations = BTreeMap::new();
+        let foreign_declarations = if native_source {
+            match source_abi::check_foreign_declarations(tcx, &producer) {
+                Ok(checked) => checked,
+                Err(detail) => {
+                    census.record(FrontendRefusal::CodegenModule { symbol: crate_name.clone(), detail });
+                    BTreeSet::new()
+                }
+            }
+        } else { BTreeSet::new() };
+        let mut out = if native_source {
+            let conserved =
+                match trust_thir_lower::effect_conservation::conserved_function_ids(sess) {
+                    Ok(ids) => ids,
+                    Err(detail) => {
+                        census.record(FrontendRefusal::CodegenModule {
+                            symbol: crate_name.clone(),
+                            detail,
+                        });
+                        BTreeSet::new()
+                    }
+                };
+            trust_ir_frontend::native_source_module::build(
+                &trust_ir_frontend::native_source_module::NativeModuleInput {
+                    producer: &producer,
+                    base: base.as_deref(),
+                    items: &native_items,
+                    conserved: &conserved,
+                    source_ids: &source_ids,
+                    foreign_declarations: &foreign_declarations,
+                    target: &expected,
+                    has_statics: !statics.is_empty(),
+                },
+            )
+        } else {
+            codegen_module::build(&CodegenModuleInput {
+                producer: &producer,
+                base: if star.is_some() { base.as_deref() } else { None },
+                items: &items,
+                residue: &residue,
+                declarations: &declarations,
+                statics: &statics,
+                target: &expected,
+            })
+        };
+        // Trust: aggregate classification requires actual source ABI witnesses for
+        // this exact image. The source producer remains unclassified for the gate.
+        if native_source && out.refusals.is_empty() {
+            if let Err(detail) =
+                source_abi::classify_native_module(&producer, &mut out.m_cg, &native_abi)
+            {
+                out.refusals
+                    .push(FrontendRefusal::CodegenModule { symbol: crate_name.clone(), detail });
+            }
+        }
+        // Trust (PKG-CP, R-8 item P): fold each constant-true check of M_cg and site every other
+        // check of an admitted kind at rustc's panic entry and `Location` record; a function
+        // holding a check that cannot be sited is refused by name. Only M_cg changes: the gate
+        // still reads the unmodified producer bodies. Run last, over a module with no refusal.
+        if out.refusals.is_empty() {
+            let sited = trust_ir_frontend::panic_sites::rustc_half::site_codegen_module(
+                tcx,
+                &mut out.m_cg,
+            );
+            if sited.folded + sited.sited > 0 {
+                sess.dcx().note(format!(
+                    "trust-cg compiler lane: {} runtime check(s) folded (constant true), {} \
+                     sited at rustc's panic entry and location (PKG-CP)",
+                    sited.folded, sited.sited
+                ));
+            }
+            out.refusals.extend(sited.refusals);
+        }
+        let codegen_module::CodegenModuleOutput {
+            m_cg,
+            symbols,
+            bodies,
+            placements,
+            never_inline,
+            residue: residue_rows,
+            refusals,
+        } = out;
+        for refusal in refusals {
+            census.record(refusal);
+        }
+        let completed = if native_source {
+            native_items
+                .iter()
+                .filter(|item| !item.inventory_residue && bodies.contains_key(&item.symbol))
+                .count()
+        } else {
+            items.iter().filter(|item| bodies.contains_key(&item.symbol)).count()
+        };
+        sess.dcx().note(format!(
+            "trust-cg trust-ir frontend: {completed}/{reachable} reachable function(s) completed \
+             source -> trust_ir_of -> codegen_module (the compiler lane, \
+             -Ztrust-cg-f1-backend=compiler)"
+        ));
+        if let Some(note) = trust_ir_frontend::clean_origin_reach_note(tcx) {
+            sess.dcx().note(note);
+        }
+
+        let config = F1CompileConfig {
+            target,
+            force_frame_pointers, // Trust: effective target/CLI Always policy.
+            opt_level,
+            relocation,
+            never_inline,
+            upstream_mir_lane: false,
+        };
+        let name = format!("{crate_name}.codegen_unit.0");
+        // A row that names no function (trust-cg's residual compile error, a module-level
+        // refusal) is attributed to the codegen unit, never to an empty symbol.
+        let trust_cg_rows =
+            |census: &mut trust_ir_frontend::RefusalCensus,
+             rows: Vec<trust_cg_bridge::f1_compile::CensusRow>| {
+                for row in rows {
+                    census.record(FrontendRefusal::TrustCgRefused {
+                        symbol: if row.symbol.is_empty() {
+                            format!("<module {name}>")
+                        } else {
+                            row.symbol
+                        },
+                        variant: row.variant,
+                        detail: row.detail,
+                    });
+                }
+            };
+        // The census counts refusal ROWS. On this lane a row can name inventory residue, a
+        // caller dropped with a refused callee, or a trust-cg refusal over the admitted subset,
+        // so the count can exceed the reachable items; say so beside every fatal.
+        let rows_note = || {
+            sess.dcx().note(
+                "trust-cg compiler lane: the census below counts refusal ROWS — besides refused \
+                 inventory items, inventory residue, callers dropped with a refused callee, and \
+                 trust-cg's own rows over the admitted subset (`[trust-cg-refused:<variant>]`) — \
+                 so its count can exceed the reachable function count",
+            )
+        };
+
+        // ---- refusals: ONE fatal, with trust-cg's census over the admitted subset --------
+        if !census.is_empty() {
+            match census_trust_ir_module(&m_cg, &config) {
+                Ok(rows) => trust_cg_rows(&mut census, rows),
+                Err(refusal) => census.record(FrontendRefusal::TrustCgRefused {
+                    symbol: format!("<module {name}>"),
+                    variant: "census".to_string(),
+                    detail: refusal.to_string(),
+                }),
+            }
+            rows_note();
+            tcx.dcx().fatal(census.report(reachable));
+        }
+
+        // ---- compile, gate, ship -------------------------------------------------------
+        let producers = [ProducerModule { module: Arc::clone(&producer), symbols }];
+        let bodies: BTreeMap<String, ProducerBody> = bodies;
+        let compiler_input = F1CompileInput {
+            m_cg: &m_cg,
+            producers: &producers,
+            bodies: &bodies,
+            placements: &placements,
+            policy,
+            config: &config,
+        };
+        let outcome = if let Some(directory) = sess.opts.unstable_opts.trust_dump.ir.as_deref() {
+            let captured = trust_cg_bridge::f1_compile::compile_and_verify_trust_ir_module_captured(
+                &compiler_input,
+            );
+            // Optional retention precedes a possible ordinary Strict refusal.
+            // Its I/O/capacity outcome never grants or changes any admission.
+            match compiler_input_capture::persist(directory, &name, &captured.capture) {
+                Ok(path) => {
+                    let status = match &captured.capture {
+                        Ok(_) => "complete non-authorizing input data".to_string(),
+                        Err(reason) => format!("capture incomplete: {}", reason.reason),
+                    };
+                    sess.dcx().note(format!(
+                        "trust-cg Compiler CER input data: {} ({status}; independent current inputs required for replay)", path.display()));
+                }
+                Err(reason) => sess
+                    .dcx()
+                    .note(format!("trust-cg Compiler CER input capture incomplete: {reason}")),
+            }
+            captured.outcome
+        } else {
+            compile_and_verify_trust_ir_module(&compiler_input)
+        };
+        let shipped = match outcome {
+            Ok(shipped) => shipped,
+            Err(F1Refusal::Census(rows)) => {
+                trust_cg_rows(&mut census, rows);
+                rows_note();
+                tcx.dcx().fatal(census.report(reachable));
+            }
+            Err(F1Refusal::Compile(row)) => {
+                trust_cg_rows(&mut census, vec![row]);
+                rows_note();
+                tcx.dcx().fatal(census.report(reachable));
+            }
+            Err(refusal) => tcx.dcx().fatal(format!(
+                "trust-cg: REFUSING to emit trust-ir module `{name}` on the compiler lane \
+                 ({}): {refusal}",
+                policy_label(policy)
+            )),
+        };
+
+        // ---- disclosure: the closure, never a per-function grade -------------------------
+        let report = &shipped.report;
+        sess.dcx().note(format!(
+            "trust-cg compiler-lane certification report for module `{name}`: {} function(s), {} \
+             closed-[PROVED], {} not closed, 0 refuted ({}); object sha256 {}",
+            report.certificates.len(),
+            report.closure.closed_kernel.len(),
+            shipped.unclosed.len(),
+            policy_label(policy),
+            report.object_sha256
+        ));
+        for line in &shipped.unclosed {
+            sess.dcx().note(format!("trust-cg compiler lane: not closed-[PROVED]: {line}"));
+        }
+
+        // ---- coverage: D17's instance-lane rows and the inventory residue ----------------
+        // WHERE each body's code ships is read off the certificates, never assumed: trust-cg's
+        // OPT-4 inlines co-emitted bodies into their callers at -O1 and above, and the object
+        // defines a body under its own symbol exactly when the gate certified one there. A row
+        // is written for a body whose code reaches the object at all, as on the default lane.
+        let certified: Vec<(String, Vec<String>)> = report
+            .certificates
+            .iter()
+            .map(|c| {
+                let inlined = c
+                    .call_sites
+                    .iter()
+                    .filter(|site| site.kind == CallSiteKind::InterpretedInline)
+                    .map(|site| site.symbol.clone())
+                    .collect();
+                (c.symbol.clone(), inlined)
+            })
+            .collect();
+        let placed = trust_ir_frontend::compiler_lane_code_placement(&m_cg, &certified);
+        let row_of = |symbol: String, func_id: u32, kind: trust_ir_frontend::CoverageKind| {
+            let place = placed.get(&symbol).cloned().unwrap_or_default();
+            (place.emitted_as_own_symbol || !place.inlined_into.is_empty()).then(|| {
+                InstanceCoverageRow {
+                    symbol,
+                    func_id,
+                    kind,
+                    emitted_as_own_symbol: place.emitted_as_own_symbol,
+                    inlined_into: place.inlined_into,
+                }
+            })
+        };
+        let mut rows: Vec<InstanceCoverageRow> = spliced
+            .into_iter()
+            .filter(|(symbol, _, _)| bodies.contains_key(symbol))
+            .filter_map(|(symbol, func_id, kind)| {
+                row_of(symbol, func_id.index(), trust_ir_frontend::CoverageKind::Instance(kind))
+            })
+            .collect();
+        rows.extend(residue_rows.iter().filter_map(|row| {
+            row_of(
+                row.symbol.clone(),
+                row.producer_func.index(),
+                trust_ir_frontend::CoverageKind::InventoryResidueLocal,
+            )
+        }));
+        let coverage = (star.is_some() || !rows.is_empty()).then(|| InstanceCoverage { rows });
+
+        let function_count = report.certificates.len();
+        Box::new(OngoingTrustCgCodegen {
+            bridge_ongoing: None,
+            trust_ir_module: None,
+            trust_ir_gate_sources: Vec::new(),
+            crate_name,
+            function_count,
+            instance_coverage: None,
+            compiler_lane: Some(CompilerLaneUnit {
+                name,
+                object: shipped.object,
+                report: shipped.report,
+                coverage,
+                function_count,
+            }),
         })
     }
 
@@ -629,6 +1397,7 @@ impl TrustCgCodegenBackend {
         use trust_cg_bridge::verify_output::EmitPolicy;
         use trust_cg_bridge::verify_output_trust_ir::{
             emit_trust_ir_module_object_unverified, emit_trust_ir_module_object_verified,
+            emit_trust_ir_module_object_with_replay,
         };
 
         let gate_mode = output_gate_mode(sess);
@@ -682,14 +1451,42 @@ impl TrustCgCodegenBackend {
                 // This arm is an explicit allow-unknown opt-in; Off returned above.
                 _ => EmitPolicy::AllowUnknown,
             };
-            match emit_trust_ir_module_object_verified(
-                sources,
-                &bridge_module.linkage,
-                &bridge_module.statics,
-                policy,
-                bridge,
-            ) {
-                Ok((module_object, report)) => {
+            let dump = sess.opts.unstable_opts.trust_dump.ir.as_deref();
+            let result = if dump.is_some() {
+                emit_trust_ir_module_object_with_replay(
+                    sources,
+                    &bridge_module.linkage,
+                    &bridge_module.statics,
+                    policy,
+                    bridge,
+                )
+                .map(|(object, report, replay)| (object, report, Some(replay)))
+            } else {
+                emit_trust_ir_module_object_verified(
+                    sources,
+                    &bridge_module.linkage,
+                    &bridge_module.statics,
+                    policy,
+                    bridge,
+                )
+                .map(|(object, report)| (object, report, None))
+            };
+            match result {
+                Ok((module_object, report, replay)) => {
+                    if let (Some(directory), Some(replay)) = (dump, replay) {
+                        let captured = replay.is_ok();
+                        let path = object_replay::persist(
+                            directory,
+                            &bridge_module.name,
+                            &module_object.bytes,
+                            sources.len(),
+                            replay.as_ref().map_err(String::as_str),
+                        )
+                        .unwrap_or_else(|error| {
+                            sess.dcx().fatal(format!("trust-cg object replay diagnostic: {error}"))
+                        });
+                        sess.dcx().note(format!("trust-cg retained object replay diagnostic at {} (capture_complete={captured}; not source refinement or executable admission)", path.display()));
+                    }
                     sess.dcx().note(format!(
                         "trust-cg TRUST-IR certification report for module `{}`: {} ({}); \
                          {} function(s) byte-preserved into one object",
@@ -732,7 +1529,6 @@ impl TrustCgCodegenBackend {
             bytecode: None,
             assembly: None,
             llvm_ir: None,
-            links_from_incr_cache: Vec::new(),
         }
     }
 
@@ -761,7 +1557,6 @@ impl TrustCgCodegenBackend {
                 bytecode: None,
                 assembly: None,
                 llvm_ir: None,
-                links_from_incr_cache: Vec::new(),
             },
             Some(emitted) => {
                 if !output_gate_allows_unverified_artifact(output_gate_mode(sess)) {
@@ -797,7 +1592,6 @@ impl TrustCgCodegenBackend {
                     bytecode: None,
                     assembly: None,
                     llvm_ir: None,
-                    links_from_incr_cache: Vec::new(),
                 }
             }
         }
@@ -879,15 +1673,19 @@ fn output_gate_mode_for_verification(
     strict_verification: bool,
     configured_mode: &str,
 ) -> Result<OutputGateMode, &'static str> {
-    let configured_mode = output_gate_mode_from_name(configured_mode)?;
-    if strict_verification {
-        if configured_mode == OutputGateMode::Off {
-            return Err("-Ztrust-cg-output-gate=off is incompatible with batteries-on strict \
-                 Trust verification; use -Ztrust-verify=off for a vanilla compile");
-        }
+    let configured = output_gate_mode_from_name(configured_mode)?;
+    if strict_verification && configured == OutputGateMode::Off {
+        return Err("-Ztrust-cg-output-gate=off is incompatible with batteries-on strict \
+             Trust verification; use -Ztrust-verify=off for a vanilla compile");
+    }
+    // Trust (owner ruling D17): whether the gate is STRICT is decided by ONE
+    // function, the frozen instance assembler's `strict_gate_from`, which both
+    // this emission path and the assembler's generic-append condition call.
+    if trust_ir_frontend::instance_assembly::strict_gate_from(strict_verification, configured_mode)
+    {
         return Ok(OutputGateMode::Strict);
     }
-    Ok(configured_mode)
+    Ok(configured)
 }
 
 fn output_gate_mode_from_name(mode: &str) -> Result<OutputGateMode, &'static str> {
@@ -1005,6 +1803,178 @@ fn run_module_output_preservation_gate(
                 bridge_module.name
             ));
         }
+    }
+}
+
+/// Trust (owner ruling D17): the per-function coverage artifact's path,
+/// `<out-dir>/<output filestem>.trust-instance-coverage.json` — rustc's output
+/// filestem, which carries `-Cextra-filename` and follows `-o`.
+fn instance_coverage_path(outputs: &OutputFilenames) -> std::path::PathBuf {
+    outputs.with_extension("trust-instance-coverage.json")
+}
+
+/// Trust (owner ruling D17): the artifact's LIFECYCLE, owned by the trust-ir
+/// frontend alone (the MIR-frontend trust-cg path and the LLVM backend never
+/// touch it):
+///
+/// * it lives at `<out-dir>/<output filestem>`, not necessarily beside the rlib
+///   (`--emit link=PATH` puts the rlib elsewhere);
+/// * a trust-ir compile with instance-lane rows replaces it atomically (written
+///   beside, renamed over) as soon as the gate accepts the object
+///   ([`disclose_instance_coverage`]), so a compile that fails LATER (at link or
+///   archive) has already replaced it;
+/// * a SUCCESSFUL trust-ir compile with no instance-keyed module removes the
+///   artifact under ITS OWN output filestem (this function); one an earlier
+///   compile left under another stem (e.g. via `-o`) stays;
+/// * a compile REFUSED by trust-cg or the frontend touches nothing: rustc keeps
+///   the previous rlib too, so the previous artifact stays beside the object it
+///   is bound to;
+/// * a rebuild by another backend (LLVM, or the MIR frontend) cannot remove it.
+///
+/// In every case where artifact and rlib can disagree, the object binding no
+/// longer matches the rlib, which is the consumer rule's job to see
+/// (`trust_ir_frontend::InstanceCoverage::to_json`).
+fn clear_instance_coverage(sess: &Session, outputs: &OutputFilenames) {
+    let path = instance_coverage_path(outputs);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => sess.dcx().fatal(format!(
+            "trust-cg: failed to remove the stale instance-lane coverage artifact `{}`: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Trust (owner ruling D17): print the instance lane's per-function coverage
+/// and write `<out-dir>/<output filestem>.trust-instance-coverage.json`, the
+/// per-function coverage artifact, bound to the compiler that wrote it and to
+/// the SHA-256 of the object(s) it describes. Called only after the
+/// proven-output gate accepted the object, so every row is emitted code. A
+/// GENERIC row exists only under the strict policy (the plan refuses the append
+/// otherwise); if one ever appears under another policy, the claim it would
+/// carry is false, so that is fatal.
+fn disclose_instance_coverage(
+    sess: &Session,
+    outputs: &OutputFilenames,
+    crate_name: &str,
+    coverage: &trust_ir_frontend::InstanceCoverage,
+    object_paths: &[&std::path::Path],
+) {
+    let mode = output_gate_mode(sess);
+    let (policy, verdict) = match mode {
+        OutputGateMode::Strict => ("strict", "[PROVED] (strict: only [PROVED] ships)"),
+        OutputGateMode::AllowUnknown => (
+            "allow-unknown",
+            "not individually reported (allow-unknown ships [PROVED], [VALIDATED] and \
+             uncertified functions; see the certification report)",
+        ),
+        OutputGateMode::Off => ("off", "none (the proven-output gate is off)"),
+    };
+    if mode != OutputGateMode::Strict && coverage.has_strict_only_rows() {
+        sess.dcx().fatal(format!(
+            "trust-cg internal error: the instance lane appended a GENERIC instance body, or the \
+             drop-glue lane spliced synthesized glue, under the `{policy}` output-gate policy; \
+             owner rulings D17 and D18 OD-2 admit one only under the strict gate"
+        ));
+    }
+    for note in coverage.notes(verdict) {
+        sess.dcx().note(note);
+    }
+    let mut objects = Vec::with_capacity(object_paths.len());
+    for object in object_paths {
+        let bytes = fs::read(object).unwrap_or_else(|error| {
+            sess.dcx().fatal(format!(
+                "trust-cg: failed to read the emitted object `{}` to bind the instance-lane \
+                 coverage artifact to it: {error}",
+                object.display()
+            ))
+        });
+        let digest = rustc_span::SourceFileHash::new_in_memory(
+            rustc_span::SourceFileHashAlgorithm::Sha256,
+            &bytes,
+        );
+        let hex: String = digest.hash_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let name = object
+            .file_name()
+            .map_or_else(|| object.display().to_string(), |n| n.to_string_lossy().into_owned());
+        objects.push((name, bytes.len(), hex));
+    }
+    let path = instance_coverage_path(outputs);
+    let json = coverage.to_json(crate_name, policy, verdict, sess.cfg_version, &objects);
+    // Written beside and RENAMED over, so a reader never sees a half-written
+    // artifact and a failure leaves the previous one whole.
+    let staged = outputs.with_extension("trust-instance-coverage.json.tmp");
+    if let Err(error) = fs::write(&staged, json).and_then(|()| fs::rename(&staged, &path)) {
+        sess.dcx().fatal(format!(
+            "trust-cg: failed to write the instance-lane coverage artifact `{}`: {error}",
+            path.display()
+        ));
+    }
+}
+
+/// Trust (step 2 increment 5, sub-step 5.4.2): the compiler lane's shipping policy, the one
+/// `CerReport::ships` reads (`trust_cg_bridge::f1_compile`). The same mapping as the two
+/// module-to-LIR gate sites (`emit_rustc_module_for_trust_ir_module` and
+/// `run_module_output_preservation_gate`), which keep their own literals; `tests.rs` asserts the
+/// three agree. `Off` never reaches it — the compiler lane refuses `off` by name (INC5.4-SCOPE)
+/// — and if it ever did it would get the STRICT policy, not a permissive one.
+fn f1_emit_policy(mode: OutputGateMode) -> trust_cg_bridge::verify_output::EmitPolicy {
+    use trust_cg_bridge::verify_output::EmitPolicy;
+    match mode {
+        OutputGateMode::Strict => EmitPolicy::StrictProvenOnly,
+        OutputGateMode::AllowUnknown => EmitPolicy::AllowUnknown,
+        OutputGateMode::Off => EmitPolicy::StrictProvenOnly,
+    }
+}
+
+/// Trust (step 2 increment 5, sub-step 5.4.2): the compiler lane's certificates file,
+/// `<out-dir>/<output filestem>.trust-cg-certificates.json` — one
+/// `trust-cg-bridge.call-refinement.v1` record per function, bound to the object's SHA-256
+/// (design §5), beside the coverage artifact.
+fn trust_cg_certificates_path(outputs: &OutputFilenames) -> std::path::PathBuf {
+    outputs.with_extension("trust-cg-certificates.json")
+}
+
+/// Write the certificates file through a staged file renamed over, so a reader never sees a
+/// half-written file and a failure leaves the previous one whole (the coverage artifact's
+/// lifecycle, [`clear_instance_coverage`]). An empty rendering is refused, never written.
+fn write_trust_cg_certificates(
+    sess: &Session,
+    outputs: &OutputFilenames,
+    report: &trust_cg_bridge::call_event::CerReport,
+) {
+    let path = trust_cg_certificates_path(outputs);
+    let json = report.to_json();
+    if json.is_empty() {
+        sess.dcx().fatal(format!(
+            "trust-cg: the call-event report for `{}` rendered to nothing; refusing to write an \
+             empty certificates file",
+            path.display()
+        ));
+    }
+    let staged = outputs.with_extension("trust-cg-certificates.json.tmp");
+    if let Err(error) = fs::write(&staged, json).and_then(|()| fs::rename(&staged, &path)) {
+        sess.dcx().fatal(format!(
+            "trust-cg: failed to write the certificates file `{}`: {error}",
+            path.display()
+        ));
+    }
+}
+
+/// Remove the certificates file under this compilation's output filestem: run by every
+/// successful trust-ir compile that did not take the compiler lane, so a file left by an
+/// earlier compiler-lane compile never stands beside an object it does not describe. Mirrors
+/// [`clear_instance_coverage`]; a refused compile touches nothing.
+fn clear_trust_cg_certificates(sess: &Session, outputs: &OutputFilenames) {
+    let path = trust_cg_certificates_path(outputs);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => sess.dcx().fatal(format!(
+            "trust-cg: failed to remove the stale certificates file `{}`: {error}",
+            path.display()
+        )),
     }
 }
 
@@ -1191,10 +2161,11 @@ fn ignored_return_abi_ty_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
 /// the byte-wide `LirType::I8` whose value-production set — cset, movz 0/1,
 /// csel of 0/1, byte ldrb — is zero-extended by construction on AArch64).
 ///
-/// Bool PARAMETERS stay refused: the gate's spec side deliberately rejects
-/// `Bool` in parameter position (`sig_position_width`), so admitting them here
-/// would create an admission the prover cannot speak about — the exact
-/// mismatch this validator exists to prevent.
+/// Bool PARAMETERS are admitted separately, and later (WS7.13,
+/// `zext_bool_param_abi_supported`): the gate's spec side models `Bool` in
+/// parameter position only under the caller-owed extension precondition the
+/// cross-check attests, so the admission here is exactly as wide as what the
+/// prover can speak about — the alignment this validator exists to keep.
 /// A SHARED SLICE REFERENCE argument (`&[T]`), admitted in ARGUMENT position
 /// on the trust-ir lane only.
 ///
@@ -1242,7 +2213,12 @@ fn indirect_by_value_struct_arg_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>
     if !adt.is_struct() {
         return false;
     }
-    let PassMode::Indirect { attrs, meta_attrs: None, on_stack: false } = &arg.mode else {
+    let PassMode::Indirect {
+        attrs,
+        address_space: None,
+        mode: rustc_target::callconv::IndirectMode::Pointer,
+    } = &arg.mode
+    else {
         return false;
     };
     !attrs.contains(ArgAttribute::InReg)
@@ -1270,7 +2246,7 @@ fn pair_struct_arg_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
     };
     attrs_ok(a)
         && attrs_ok(b)
-        && matches!(arg.layout.backend_repr, BackendRepr::ScalarPair(..))
+        && matches!(arg.layout.backend_repr, BackendRepr::ScalarPair { .. })
         && arg.layout.size.bytes() <= 16
 }
 
@@ -1319,7 +2295,7 @@ fn pair_enum_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
     // refused. The converter's own Direct{tag_offset:0} descriptor check is
     // the second, independent guard.
     let tag_initialized = match arg.layout.backend_repr {
-        BackendRepr::ScalarPair(t, _) => {
+        BackendRepr::ScalarPair { a: t, .. } => {
             matches!(t, rustc_abi::Scalar::Initialized { .. })
         }
         _ => false,
@@ -1336,6 +2312,90 @@ fn zext_bool_return_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
         && attrs.arg_ext == ArgExtension::Zext
         && arg.layout.size.bits() == 8
         && matches!(arg.layout.backend_repr, BackendRepr::Scalar(_))
+}
+
+/// A `bool` PARAMETER, admitted with its `Zext` extension contract — the
+/// trust-ir (F1) lane only (WS7.13).
+///
+/// The same `Zext` promise that a bool RETURN discharges BY PROOF (the callee
+/// owes it, and the gate's 32-bit obligation holds the emitted bytes to it) is,
+/// for a bool PARAMETER, a promise the CALLER owes — one the gate cannot see
+/// any caller keep. The gate therefore models a bool parameter only as a
+/// CONDITIONAL obligation under the ambient precondition `W{k}[31:1] == 0`,
+/// and only when the facts that license it are ATTESTED on the
+/// `AbiPassModeCrossCheck` this frontend mints ([`instance_param_extensions`]):
+/// rustc's `arg_ext: Zext` for that slot, and a target whose ABI makes the
+/// caller extend a small argument to 32 bits (Apple AArch64). The verdict is
+/// capped at `AyValidated` (never kernel-`PROVED`), and StrictProvenOnly
+/// refuses that grade; under `allow-unknown` the function ships VALIDATED with
+/// the precondition in its assumption list. Without the facts the gate stays
+/// `Unknown`, so admitting the slot here can never outrun the proof: the
+/// pre-WS7.13 refusal merely moved from the ABI filter to the gate, by name.
+///
+/// The shape admitted is EXACTLY the bool-return one: `Direct`, `Zext`, no
+/// `InReg`, 8 bits, `BackendRepr::Scalar`. The converter's side of the slot is
+/// the same byte-wide `LirType::I8` carrier a bool return uses.
+fn zext_bool_param_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
+    zext_bool_return_abi_supported(arg)
+}
+
+/// The width, in bits, to which `target`'s ABI makes the CALLER extend a
+/// `Zext`/`Sext` small (sub-32-bit) integer argument — `None` when the target
+/// makes no such promise and the callee owns the extension.
+///
+/// This is the target-side half of the bool-parameter precondition (WS7.13).
+/// It is deliberately a closed, MEASURED table rather than a rule read off
+/// `arg_ext`: rustc records `Zext` on every bool slot on every target, but
+/// whether the CALLER performs the extension is a platform ABI fact. Apple's
+/// ARM64 ABI states it — "The caller of a function is responsible for signing
+/// or zero-extending any argument with fewer than 32 bits. The standard ABI
+/// expects the callee to sign or zero-extend those arguments." — so Apple
+/// AArch64 is `Some(32)` and generic AAPCS64 (every non-Apple AArch64 target)
+/// is `None`. Everything else is `None` until measured, which keeps a bool
+/// parameter `Unknown` there rather than modeled under a promise nobody made.
+fn caller_small_arg_extension_bits(target: &rustc_target::spec::Target) -> Option<u32> {
+    if target.arch == rustc_target::spec::Arch::AArch64 && target.is_like_darwin {
+        return Some(32);
+    }
+    None
+}
+
+/// Mint the CALLER-OWED EXTENSION facts of `instance`'s parameter slots
+/// (WS7.13) from rustc's own `FnAbi` and the session target, for the
+/// `AbiPassModeCrossCheck` the trust-ir frontend attaches. Only a
+/// `PassMode::Direct` slot has a single `arg_ext`; any other mode is recorded
+/// as `None` ("not recorded"), which the gate never reads as
+/// `ArgExtension::None`.
+///
+/// Called only AFTER `validate_codegen_instance_abi_trust_ir` has accepted the
+/// instance with `ir_param_count` (the produced `FuncTy`'s parameter count), so
+/// the entries line up with the trust-ir parameters by index. The `FnAbi` is
+/// read through [`fn_abi_preconditions`] with that same count, the one site
+/// that asks rustc for it: the validator's preconditions are re-asked and
+/// cannot disagree with what the validator saw (a cached query over the same
+/// instance), and `fn_abi.args.len() == ir_param_count` is checked again there.
+pub(crate) fn instance_param_extensions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    ir_param_count: usize,
+) -> Result<trust_cg_bridge::AbiParamExtensions, String> {
+    let fn_abi = fn_abi_preconditions(tcx, instance, ir_param_count)?;
+    let per_param = fn_abi
+        .args
+        .iter()
+        .map(|arg| match &arg.mode {
+            PassMode::Direct(attrs) => Some(match attrs.arg_ext {
+                ArgExtension::None => trust_cg_bridge::AbiArgExtension::None,
+                ArgExtension::Zext => trust_cg_bridge::AbiArgExtension::Zext,
+                ArgExtension::Sext => trust_cg_bridge::AbiArgExtension::Sext,
+            }),
+            _ => None,
+        })
+        .collect();
+    Ok(trust_cg_bridge::AbiParamExtensions {
+        per_param,
+        caller_extends_to_bits: caller_small_arg_extension_bits(&tcx.sess.target),
+    })
 }
 
 fn codegen_attrs_issue(attrs: &CodegenFnAttrs) -> Option<String> {
@@ -1373,7 +2433,7 @@ fn codegen_attrs_issue(attrs: &CodegenFnAttrs) -> Option<String> {
     if attrs.objc_class.is_some() || attrs.objc_selector.is_some() {
         return Some("Objective-C function metadata is not emitted by trust-cg".to_string());
     }
-    if !matches!(attrs.instrument_fn, InstrumentFnAttr::Default) {
+    if attrs.instrument_fn.is_some() {
         return Some(
             "per-function instrumentation policy is not implemented by trust-cg".to_string(),
         );
@@ -1410,17 +2470,31 @@ fn scalar_register_argument_limit(target_triple: &str) -> Option<usize> {
     }
 }
 
-/// Admit only the exact ABI fragment the bridge materializes today: Rust or C,
-/// non-variadic/non-unwinding functions whose explicit arguments and result are
-/// single integer registers of at most 64 bits (or a unit/never result). This is
-/// checked for definitions and every direct callee, so an LLVM-built dependency
-/// cannot silently introduce an incompatible hidden/pass-mode contract.
-fn validate_codegen_instance_abi_with<'tcx>(
+/// Trust (step 2 increment 5, sub-step 5.4.2; plan critique H3(a)): the PRECONDITIONS of
+/// [`validate_codegen_instance_abi_with`], extracted verbatim so the compiler lane
+/// (`trust_ir_frontend::abi_shape::abi_shape_of`) asks rustc's `FnAbi` after exactly the
+/// checks the old lane makes, with byte-identical messages: the codegen attributes, the
+/// audited Rust/C convention, convention drift, no variadic or implicit argument, no
+/// unwinding, and `mir_arg_count` arguments. The old lane's register cap and per-`PassMode`
+/// loop stay in [`validate_codegen_instance_abi_with`], unchanged; the compiler lane imposes
+/// no cap (its placement table gives a function with a stack argument no entry, which the
+/// call-event gate grades Unknown).
+fn fn_abi_preconditions<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::Instance<'tcx>,
     mir_arg_count: usize,
-    enum_abi: EnumAbi,
-) -> Result<(), String> {
+) -> Result<&'tcx rustc_target::callconv::FnAbi<'tcx, Ty<'tcx>>, String> {
+    fn_abi_preconditions_with_source(tcx, instance, mir_arg_count, false)
+}
+
+/// Trust: the full native source consumer can additionally check a concrete
+/// FnOnce environment. Keep the legacy entry point above closure-refusing.
+fn fn_abi_preconditions_with_source<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    mir_arg_count: usize,
+    source_closure: bool,
+) -> Result<&'tcx rustc_target::callconv::FnAbi<'tcx, Ty<'tcx>>, String> {
     let attrs = tcx.codegen_instance_attrs(instance.def);
     if let Some(reason) = codegen_attrs_issue(&attrs) {
         return Err(reason);
@@ -1428,11 +2502,34 @@ fn validate_codegen_instance_abi_with<'tcx>(
 
     let typing_env = ty::TypingEnv::fully_monomorphized();
     let instance_ty = instance.ty(tcx, typing_env);
-    if !instance_ty.is_fn() {
-        return Err(format!("instance type `{instance_ty}` is not a callable function"));
-    }
-    let extern_abi = instance_ty.fn_sig(tcx).abi();
-    let Some(expected_canon_abi) = supported_canonical_abi(extern_abi) else {
+    let (extern_abi, closure_args) = match instance_ty.kind() {
+        ty::Closure(def_id, args) if source_closure => {
+            if instance.def != ty::InstanceKind::Item(*def_id)
+                || args.as_closure().kind() != ty::ClosureKind::FnOnce
+            {
+                return Err("the native source ABI requires an ordinary FnOnce closure".into());
+            }
+            let sig = tcx.instantiate_bound_regions_with_erased(args.as_closure().sig());
+            let [tuple] = sig.inputs() else {
+                return Err("source closure signature does not contain its argument tuple".into());
+            };
+            let ty::Tuple(fields) = tuple.kind() else {
+                return Err("source closure arguments are not a concrete tuple".into());
+            };
+            if sig.abi() != ExternAbi::RustCall || sig.c_variadic() {
+                return Err("source closure does not have the non-variadic RustCall ABI".into());
+            }
+            (sig.abi(), Some(fields.len()))
+        }
+        _ if instance_ty.is_fn() => (instance_ty.fn_sig(tcx).abi(), None),
+        _ => return Err(format!("instance type `{instance_ty}` is not a callable function")),
+    };
+    let expected_canon_abi = if closure_args.is_some() {
+        Some(CanonAbi::Rust)
+    } else {
+        supported_canonical_abi(extern_abi)
+    };
+    let Some(expected_canon_abi) = expected_canon_abi else {
         return Err(format!(
             "calling convention `{extern_abi}` is not in the audited Rust/C ABI lane"
         ));
@@ -1447,7 +2544,12 @@ fn validate_codegen_instance_abi_with<'tcx>(
             fn_abi.conv
         ));
     }
-    if fn_abi.c_variadic || fn_abi.fixed_count as usize != fn_abi.args.len() {
+    let fixed_args_match = match closure_args {
+        // rustc spreads the RustCall tuple after the one fixed environment.
+        Some(args) => fn_abi.fixed_count == 1 && fn_abi.args.len() == args + 1,
+        None => fn_abi.fixed_count as usize == fn_abi.args.len(),
+    };
+    if fn_abi.c_variadic || !fixed_args_match {
         return Err(
             "variadic or implicit ABI arguments are not represented by trust-cg".to_string()
         );
@@ -1463,6 +2565,21 @@ fn validate_codegen_instance_abi_with<'tcx>(
             fn_abi.args.len()
         ));
     }
+    Ok(fn_abi)
+}
+
+/// Admit only the exact ABI fragment the bridge materializes today: Rust or C,
+/// non-variadic/non-unwinding functions whose explicit arguments and result are
+/// single integer registers of at most 64 bits (or a unit/never result). This is
+/// checked for definitions and every direct callee, so an LLVM-built dependency
+/// cannot silently introduce an incompatible hidden/pass-mode contract.
+fn validate_codegen_instance_abi_with<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    mir_arg_count: usize,
+    enum_abi: EnumAbi,
+) -> Result<(), String> {
+    let fn_abi = fn_abi_preconditions(tcx, instance, mir_arg_count)?;
     let target_triple = tcx.sess.opts.target_triple.tuple();
     let Some(register_arg_limit) = scalar_register_argument_limit(target_triple) else {
         return Err(format!(
@@ -1499,19 +2616,26 @@ fn validate_codegen_instance_abi_with<'tcx>(
         // The by-value indirect struct formal rides the trust-ir lane only,
         // like the slice split: the converter binds the hidden pointer as one
         // I64 formal and reads fields at recorded offsets.
-        let indirect_struct_ok = matches!(enum_abi, EnumAbi::Admit)
-            && indirect_by_value_struct_arg_abi_supported(arg);
+        let indirect_struct_ok =
+            matches!(enum_abi, EnumAbi::Admit) && indirect_by_value_struct_arg_abi_supported(arg);
         let pair_struct_ok =
             matches!(enum_abi, EnumAbi::Admit) && pair_struct_arg_abi_supported(arg);
         let newtype_struct_ok =
             matches!(enum_abi, EnumAbi::Admit) && direct_newtype_struct_arg_abi_supported(arg);
         let pair_enum_ok = matches!(enum_abi, EnumAbi::Admit) && pair_enum_abi_supported(arg);
+        // The `bool` PARAMETER widening rides the trust-ir lane only (WS7.13):
+        // its caller-owed Zext contract is modeled by the trust-ir gate as an
+        // attested ambient precondition (`zext_bool_param_abi_supported`), and
+        // the MIR path's gate carries no such model.
+        let bool_param_ok =
+            matches!(enum_abi, EnumAbi::Admit) && zext_bool_param_abi_supported(arg);
         if !scalar_register_abi_ty_supported(arg, enum_abi)
             && !slice_ok
             && !indirect_struct_ok
             && !pair_struct_ok
             && !newtype_struct_ok
             && !pair_enum_ok
+            && !bool_param_ok
         {
             return Err(format!(
                 "argument {index} uses unsupported ABI type/pass mode `{}` / {:?}",
@@ -1581,7 +2705,12 @@ fn mono_direct_call_name_override<'tcx>(
         return Ok(None);
     };
 
-    match ty::Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), def_id, args) {
+    match ty::Instance::try_resolve(
+        tcx,
+        ty::TypingEnv::fully_monomorphized(),
+        def_id,
+        args.skip_binder(),
+    ) {
         Ok(Some(instance)) => {
             validate_codegen_instance_abi(tcx, instance, call_args.len()).map_err(|reason| {
                 format!(
@@ -1622,6 +2751,12 @@ fn apply_direct_call_name_overrides(
         }
     }
     Ok(())
+}
+
+/// Trust (step 2 increment 5, sub-step 5.4.2; design §3.1 rule 11): rustc's
+/// `#[inline(never)]`, which the compiler lane hands trust-cg as its never-inline set.
+fn instance_is_never_inline<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) -> bool {
+    matches!(tcx.codegen_instance_attrs(instance.def).inline, rustc_attr_ir::InlineAttr::Never)
 }
 
 // A codegen backend must consume rustc's reachable `MonoItem` inventory. Using
@@ -1685,23 +2820,18 @@ pub(crate) fn extract_mono_verifiable_function<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::Instance<'tcx>,
 ) -> Result<VerifiableFunction, String> {
-    extract_mono_verifiable_function_with_abi(tcx, instance, false, &|tcx, instance, arg_count| {
+    extract_mono_verifiable_function_with_abi(tcx, instance, &|tcx, instance, arg_count| {
         validate_codegen_instance_abi(tcx, instance, arg_count)
     })
 }
 
 /// [`extract_mono_verifiable_function`] with a caller-supplied ABI validator.
 ///
-/// The MIR path validates against its own emission constraints
-/// (`validate_codegen_instance_abi`); the trust-ir frontend's upstream lane
-/// validates against the F1 fragment's admission
-/// (`validate_codegen_instance_abi_trust_ir`) — the same validator every
-/// source-first artifact passes — so an upstream body is not refused by
-/// constraints belonging to the path it does not take.
+/// Only the retained MIR backend calls this extractor. F1 imports dependency Trust-IR through
+/// the sealed metadata route and never calls a MIR-to-Trust-IR producer.
 pub(crate) fn extract_mono_verifiable_function_with_abi<'tcx, V>(
     tcx: TyCtxt<'tcx>,
     instance: ty::Instance<'tcx>,
-    trust_ir_upstream: bool,
     validate_abi: &V,
 ) -> Result<VerifiableFunction, String>
 where
@@ -1722,18 +2852,8 @@ where
             validate_abi(tcx, instance, mono_body.arg_count)
                 .map_err(|reason| format!("unsupported definition ABI: {reason}"))?;
 
-            // The trust-ir upstream lane extracts under the faithful-scalars
-            // guard with the faithful-ADT ty policy — the differential
-            // oracle's spellings, which the trust-ir bridge and the
-            // converter's pair-enum/recorded-layout lanes consume. The MIR
-            // lane keeps the strict extraction.
-            let mut func = if trust_ir_upstream {
-                trust_mir_extract::extract_function_for_trust_ir_upstream(tcx, &mono_body)
-                    .map_err(|error| error.to_string())?
-            } else {
-                trust_mir_extract::extract_function_for_codegen(tcx, &mono_body)
-                    .map_err(|error| error.to_string())?
-            };
+            let mut func = trust_mir_extract::extract_function_for_codegen(tcx, &mono_body)
+                .map_err(|error| error.to_string())?;
             let overrides = mono_body
                 .basic_blocks
                 .iter()
@@ -1773,6 +2893,11 @@ struct ProductionStatic {
     mutable: bool,
     is_external: bool,
     align: u32,
+    /// `#[used]` (either flavour): the static must survive with no reference
+    /// in its object. trust-ir v41 carries this to the object writer as
+    /// `ObjectGlobal::retained`; emitting it `false` would let a linker drop
+    /// exactly the registration a `#[used]` static exists to keep.
+    retained: bool,
 }
 
 impl ProductionStatic {
@@ -1787,6 +2912,19 @@ impl ProductionStatic {
             is_import: false,
             is_weak: false,
             align: self.align,
+            // Admission refuses every non-default visibility, so the default is
+            // the static's actual visibility, not a placeholder.
+            visibility: trust_ir::Visibility::Default,
+            retained: self.retained,
+            // trust-ir v45. Both are provably right here rather than
+            // conventionally right, which is the only reason they may be
+            // constants: admission REFUSES `#[link_section]` by name (see the
+            // options it prints), so no static reaching this constructor has a
+            // section to carry; and it admits only `External` / `Internal`
+            // linkage, while COMDAT is exactly the one-definition-rule forms
+            // (`LinkOnceOdr` / `WeakOdr`), both of which are refused above.
+            section: None,
+            comdat: false,
         }
     }
 }
@@ -1848,6 +2986,30 @@ fn collect_production_mono_instances<'tcx>(
                             data.visibility,
                         ));
                     }
+                    // `#[link_section]` places the static in a named section.
+                    // Emitting it without one would put its bytes in the default
+                    // data section and silently drop the placement (a
+                    // linker-registration array would simply vanish from the
+                    // section its reader walks). Refuse by name, with the options.
+                    //
+                    // The reason this refusal used to give — "`ObjectGlobal` has
+                    // no section channel" — went STALE at trust-ir v45, which
+                    // added `ObjectGlobal.section`. The refusal still stands
+                    // because THIS lane does not populate it (see
+                    // `into_object_global`, which passes `None`), not because the
+                    // channel is missing. Wiring `attrs.link_section` through
+                    // `ProductionStatic` is what retires this arm; until then a
+                    // reader must not conclude from the old sentence that the
+                    // capability is absent downstream.
+                    if let Some(section) = attrs.link_section {
+                        return Err(format!(
+                            "reachable static `{path}` has #[link_section = \"{section}\"]; \
+                             trust-cg object emission has no named-section channel for data \
+                             and would place it in the default data section. Options: build \
+                             this crate with the LLVM backend (`-Zcodegen-backend=llvm`), or \
+                             use trust-ir-cg, whose trust-ir `Global.section` carries it"
+                        ));
+                    }
                     let is_external = match data.linkage {
                         Linkage::External => true,
                         Linkage::Internal => false,
@@ -1886,19 +3048,18 @@ fn collect_production_mono_instances<'tcx>(
                             bytes[start..end].fill(0);
                         }
                     }
-                    let align = u32::try_from(alloc.align.bytes()).map_err(|_| {
-                        format!("reachable static `{path}` alignment exceeds u32")
-                    })?;
-                    let symbol = tcx
-                        .symbol_name(ty::Instance::mono(tcx, def_id))
-                        .name
-                        .to_string();
+                    let align = u32::try_from(alloc.align.bytes())
+                        .map_err(|_| format!("reachable static `{path}` alignment exceeds u32"))?;
+                    let symbol = tcx.symbol_name(ty::Instance::mono(tcx, def_id)).name.to_string();
                     statics.push(ProductionStatic {
                         symbol,
                         bytes,
                         mutable: alloc.mutability.is_mut(),
                         is_external,
                         align,
+                        retained: attrs.flags.intersects(
+                            CodegenFnAttrFlags::USED_COMPILER | CodegenFnAttrFlags::USED_LINKER,
+                        ),
                     });
                 }
                 MonoItem::GlobalAsm(item_id) => {
@@ -1946,8 +3107,7 @@ fn build_production_mono_functions<'tcx>(
         internal_linkage = internal,
         "[trust_cg] reachable monomorphic extraction complete"
     );
-    let statics =
-        statics.into_iter().map(ProductionStatic::into_object_global).collect::<Vec<_>>();
+    let statics = statics.into_iter().map(ProductionStatic::into_object_global).collect::<Vec<_>>();
     Ok((functions, linkage, statics))
 }
 
@@ -2108,6 +3268,29 @@ struct OngoingTrustCgCodegen {
     crate_name: String,
     /// Number of functions extracted from MIR (for diagnostics).
     function_count: usize,
+    /// Trust (owner ruling D17): the instance lane's per-function coverage
+    /// rows, disclosed after the gate accepts the object. `None` when no
+    /// instance-keyed module was built.
+    instance_coverage: Option<trust_ir_frontend::InstanceCoverage>,
+    /// Trust (step 2 increment 5, sub-step 5.4.2): the COMPILER LANE's codegen unit
+    /// (`-Ztrust-cg-f1-backend=compiler`): the object `CerReport::ships` already allowed, its
+    /// call-event report and its coverage rows. When `Some`, every other field is empty.
+    compiler_lane: Option<CompilerLaneUnit>,
+}
+
+/// Trust (step 2 increment 5, sub-step 5.4.2): one crate's compiler-lane output, joined by
+/// `join_codegen`, which writes the object, the certificates file and the coverage artifact.
+struct CompilerLaneUnit {
+    /// The codegen unit's name (`<crate>.codegen_unit.0`).
+    name: String,
+    /// Exactly the bytes the call-event gate verified (`F1Shipped::object`).
+    object: Vec<u8>,
+    /// The gate's report over `object`.
+    report: trust_cg_bridge::call_event::CerReport,
+    /// The per-function coverage rows (D17 instance-lane rows and inventory residue).
+    coverage: Option<trust_ir_frontend::InstanceCoverage>,
+    /// Functions defined in the object.
+    function_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -2120,7 +3303,7 @@ impl CodegenBackend for TrustCgCodegenBackend {
         "trust-cg"
     }
 
-    fn init(&self, sess: &Session) {
+    fn init(&mut self, sess: &EarlySession) -> CodegenBackendInit {
         if !target_is_builtin(sess) {
             sess.dcx().fatal(
                 "trust-cg accepts only audited built-in target definitions; custom JSON targets \
@@ -2151,17 +3334,24 @@ impl CodegenBackend for TrustCgCodegenBackend {
         // Keep the target checks above so backend target queries remain
         // honest, but do not reject codegen settings that will never run.
         if print_requests_stop_before_codegen(sess.opts.prints.iter().map(|request| request.kind)) {
-            return;
+            return Self::backend_init();
         }
 
         // Neither backend implements whole-program LTO. `thin_lto_supported`
         // alone only changes rustc's fallback choice; it does not make fat LTO
         // or linker-plugin LTO sound for a backend that emits no bitcode.
-        match sess.lto() {
-            Lto::No | Lto::ThinLocal => {}
-            Lto::Thin | Lto::Fat => {
-                sess.dcx().fatal("LTO is not supported by the trust-cg codegen backend")
-            }
+        // Upstream 1.101: `init` runs before the Session exists, so the old
+        // `sess.lto()` is reconstructed from its inputs. With
+        // `thin_lto_supported: false` (see `backend_init`), `Session::lto`
+        // yields Fat exactly when the target requires LTO or the CLI asked
+        // for any LTO flavor, and No/ThinLocal otherwise — the same refusal.
+        if sess.target.requires_lto
+            || matches!(
+                sess.early_lto(),
+                LtoCli::Yes | LtoCli::Fat | LtoCli::NoParam | LtoCli::Thin
+            )
+        {
+            sess.dcx().fatal("LTO is not supported by the trust-cg codegen backend")
         }
         if sess.opts.cg.linker_plugin_lto.enabled() {
             sess.dcx().fatal("linker-plugin LTO is not supported by the trust-cg codegen backend");
@@ -2180,7 +3370,9 @@ impl CodegenBackend for TrustCgCodegenBackend {
             );
         }
 
-        if sess.opts.output_types.should_link() {
+        // Object-only builds execute native codegen too: they must not bypass
+        // any of the restrictions applied to the rlib archive lane below.
+        if native_machine_output_requested(&sess.opts.output_types) {
             if let Some(option) = unsupported_explicit_codegen_model(sess) {
                 sess.dcx().fatal(format!(
                     "{option} is not implemented by trust-cg and cannot be silently ignored"
@@ -2266,7 +3458,13 @@ impl CodegenBackend for TrustCgCodegenBackend {
             if !sess.sanitizers().is_empty() {
                 sess.dcx().fatal("sanitizers are not implemented by trust-cg");
             }
-            if sess.stack_protector() != StackProtector::None {
+            // `Session::stack_protector` on the EarlySession inputs.
+            let stack_protector = if sess.target.options.supports_stack_protector {
+                sess.opts.unstable_opts.stack_protector
+            } else {
+                StackProtector::None
+            };
+            if stack_protector != StackProtector::None {
                 sess.dcx().fatal("stack protection is not implemented by trust-cg");
             }
             if sess.opts.unstable_opts.direct_access_external_data.is_some()
@@ -2320,25 +3518,42 @@ impl CodegenBackend for TrustCgCodegenBackend {
         // Analysis-only Wasm requests need target queries but must not construct
         // the native register-machine bridge.
         if Self::is_wasm_session(sess) {
-            return;
+            return Self::backend_init();
         }
 
         let bridge = self.bridge_for_session(sess);
         if let Err(e) = bridge.init() {
             sess.dcx().fatal(format!("trust-cg backend initialization failed: {e}"));
         }
+        Self::backend_init()
     }
 
     fn supported_crate_types(&self, sess: &Session) -> Vec<CrateType> {
-        supported_crate_types_for_outputs(sess.opts.output_types.should_link())
+        supported_crate_types_for_outputs(native_machine_output_requested(&sess.opts.output_types))
     }
 
     fn supported_link_crate_types(&self, _sess: &Session) -> Vec<CrateType> {
         supported_link_crate_types()
     }
 
+    // Trust (WS7.10 / F-114): with native output requested, `supported_crate_types`
+    // advertises `[Rlib]` only, and rustc's default response to any other
+    // requested type is to DROP it with a warning. A plain `rustc main.rs`
+    // (default crate type `bin`) then exited 0 having produced nothing, and the
+    // `codegen_crate` refusal below never ran because `tcx.crate_types()` was
+    // already filtered. Turn the drop into an error for every compilation that
+    // will run native codegen; keep the warning for Cargo's print-only probe
+    // and for `-Zunpretty` / `-Zno-analysis`, which exit before codegen.
+    fn unsupported_crate_type_is_fatal(&self, sess: &Session) -> bool {
+        unsupported_crate_type_is_fatal_for(
+            native_machine_output_requested(&sess.opts.output_types),
+            session_exits_before_codegen(sess),
+            sess.opts.prints.iter().map(|request| request.kind),
+        )
+    }
+
     // Trust: #959 -- register queries needed by the trust-cg backend.
-    fn provide(&self, _providers: &mut Providers) {
+    fn provide(&self, providers: &mut Providers) {
         // trust-cg does not currently inject custom queries into the rustc
         // query system. When we add incremental compilation support or
         // custom optimization queries, they will be registered here.
@@ -2346,9 +3561,15 @@ impl CodegenBackend for TrustCgCodegenBackend {
         // The standard rustc_codegen_ssa queries (symbol_export, etc.)
         // are already registered by the driver before calling into
         // the backend.
+        //
+        // Trust (plan step 3.3): one HOOK, no query. On the F1 lane the collector takes a
+        // Clean-origin item's neighbours from its published trust-ir row, not from
+        // `clean_origin_mir`'s MIR; the provider answers `None` (walk the MIR) everywhere else.
+        providers.hooks.trust_f1_clean_origin_neighbours =
+            trust_ir_frontend::clean_inventory::neighbours;
     }
 
-    fn target_config(&self, sess: &Session) -> TargetConfig {
+    fn target_config(&self, sess: &EarlySession) -> TargetConfig {
         if Self::is_wasm_session(sess) {
             return Self::wasm_target_config();
         }
@@ -2356,18 +3577,18 @@ impl CodegenBackend for TrustCgCodegenBackend {
         let bridge = self.bridge_for_session(sess);
         let bridge_config = BridgeCodegenBackend::target_config(&bridge);
         TargetConfig {
-            target_features: bridge_config
+            // Upstream 1.101 merged the stable/unstable feature lists into
+            // one internal set the session splits by stability itself.
+            internal_target_features: bridge_config
                 .target_features
                 .iter()
-                .map(|s| Symbol::intern(s))
-                .collect(),
-            unstable_target_features: bridge_config
-                .unstable_target_features
-                .iter()
+                .chain(bridge_config.unstable_target_features.iter())
                 .map(|s| Symbol::intern(s))
                 .collect(),
             has_reliable_f16: bridge_config.has_reliable_f16,
             has_reliable_f16_math: bridge_config.has_reliable_f16_math,
+            // The bridge makes no f16b claim; do not invent one.
+            has_reliable_f16b: false,
             has_reliable_f128: bridge_config.has_reliable_f128,
             has_reliable_f128_math: bridge_config.has_reliable_f128_math,
         }
@@ -2387,11 +3608,6 @@ impl CodegenBackend for TrustCgCodegenBackend {
         BridgeCodegenBackend::target_cpu(&bridge)
     }
 
-    fn thin_lto_supported(&self) -> bool {
-        // trust-cg does not implement LTO.
-        false
-    }
-
     fn has_zstd(&self) -> bool {
         false
     }
@@ -2409,15 +3625,10 @@ impl CodegenBackend for TrustCgCodegenBackend {
         );
     }
 
-    fn replaced_intrinsics(&self) -> Vec<Symbol> {
-        // trust-cg does not currently replace any intrinsics.
-        vec![]
-    }
-
     fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
         let crate_name = tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).to_string();
 
-        if !tcx.sess.opts.output_types.should_link() {
+        if !native_machine_output_requested(&tcx.sess.opts.output_types) {
             // MIR is emitted by the common driver. Avoid mono collection,
             // verification, and lowering for metadata/dep-info/MIR-only work.
             return Box::new(OngoingTrustCgCodegen {
@@ -2426,12 +3637,40 @@ impl CodegenBackend for TrustCgCodegenBackend {
                 trust_ir_gate_sources: Vec::new(),
                 crate_name,
                 function_count: 0,
+                instance_coverage: None,
+                compiler_lane: None,
             });
+        }
+
+        // Trust (R-8 fail-open item 3, 2026-10-01): `-Zcodegen-emit-retag` asks the
+        // backend to emit Tree Borrows retag calls (R-7 instrumentation). trust-cg
+        // emits none, on either frontend, and used to ship the object without them
+        // and without a word (docs/audits/2026-09-29-r8-trust-ir-vs-mir.md, "Fails
+        // OPEN" item 3). Until it emits them it refuses the flag, so no build can
+        // believe it is instrumented when it is not.
+        if tcx.sess.opts.unstable_opts.codegen_emit_retag.is_some() {
+            tcx.dcx().fatal(
+                "trust-cg does not emit the retag calls `-Zcodegen-emit-retag` asks for \
+                 (Tree Borrows instrumentation), so it refuses the flag rather than ship an \
+                 object without them; build without it, or with the LLVM backend",
+            );
         }
 
         if Self::is_wasm_session(tcx.sess) {
             tcx.dcx().fatal(
-                "internal trust-cg invariant violated: linked Wasm codegen passed initialization",
+                "internal trust-cg invariant violated: native Wasm codegen passed initialization",
+            );
+        }
+
+        // Trust (WS7.10): belt and braces behind the `collect_crate_types`
+        // refusal. Native output with NO crate type left would compile nothing
+        // and exit 0; no path should reach here that way, and if one does it
+        // must fail loudly rather than succeed empty-handed.
+        if tcx.crate_types().is_empty() {
+            tcx.dcx().fatal(
+                "trust-cg was asked for native machine output but no crate type remains to \
+                 emit; every requested crate type was dropped before codegen, and trust-cg \
+                 refuses to exit successfully without producing the requested artifact",
             );
         }
 
@@ -2439,8 +3678,20 @@ impl CodegenBackend for TrustCgCodegenBackend {
             tcx.crate_types().iter().copied().find(|&kind| kind != CrateType::Rlib)
         {
             tcx.dcx().fatal(format!(
-                "trust-cg cannot link crate type `{crate_type:?}`; the only audited linked artifact is an rlib of External scalar-register functions. Executables additionally require rustc's process-entry wrapper, and dynamic/static/proc-macro outputs require unwired linkage/visibility contracts"
+                "trust-cg cannot emit native code for crate type `{crate_type:?}`; the supported machine-output lane is an rlib compilation of External scalar-register functions, as an archive or object. Executables additionally require rustc's process-entry wrapper, and dynamic/static/proc-macro outputs require unwired linkage/visibility contracts"
             ));
+        }
+
+        // Trust (step 2 increment 5, sub-step 5.4.2): the compiler lane is a consumer of F1's
+        // trust-ir; on the MIR frontend there is none to consume (INC5.4-SCOPE).
+        if tcx.sess.trust_cg_f1_backend_is_compiler()
+            && trust_cg_frontend(tcx.sess) != TrustCgFrontend::TrustIr
+        {
+            tcx.dcx().fatal(
+                "-Ztrust-cg-f1-backend=compiler selects the consumer of F1's trust-ir and \
+                 requires -Ztrust-cg-frontend=trust-ir; the MIR frontend has no compiler lane \
+                 (INC5.4-SCOPE)",
+            );
         }
 
         // Trust (F1): the source-first frontend. `-Ztrust-cg-frontend=trust-ir`
@@ -2454,11 +3705,12 @@ impl CodegenBackend for TrustCgCodegenBackend {
             return self.codegen_crate_from_trust_ir(tcx, crate_name);
         }
 
-        let (functions, linkage, statics) = build_production_mono_functions(tcx).unwrap_or_else(|reason| {
-            tcx.dcx().fatal(format!(
+        let (functions, linkage, statics) =
+            build_production_mono_functions(tcx).unwrap_or_else(|reason| {
+                tcx.dcx().fatal(format!(
                 "trust-cg cannot faithfully materialize rustc's reachable mono-item graph: {reason}"
             ))
-        });
+            });
 
         let function_count = functions.len();
 
@@ -2518,8 +3770,12 @@ impl CodegenBackend for TrustCgCodegenBackend {
             Err(e) => tcx.dcx().fatal(format!("trust-cg allocator shim planning failed: {e}")),
         };
 
-        let bridge_crate_info =
-            bridge_backend::CrateInfo { crate_name: crate_name.clone(), functions, linkage, statics };
+        let bridge_crate_info = bridge_backend::CrateInfo {
+            crate_name: crate_name.clone(),
+            functions,
+            linkage,
+            statics,
+        };
 
         let mut bridge_ongoing =
             match BridgeCodegenBackend::codegen_crate(&bridge, &bridge_crate_info) {
@@ -2552,6 +3808,8 @@ impl CodegenBackend for TrustCgCodegenBackend {
             trust_ir_gate_sources: Vec::new(),
             crate_name,
             function_count,
+            instance_coverage: None,
+            compiler_lane: None,
         })
     }
 
@@ -2561,10 +3819,67 @@ impl CodegenBackend for TrustCgCodegenBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
+        _incr_comp_session: Option<&rustc_session::IncrCompSession>,
         outputs: &OutputFilenames,
         _crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
-        let ongoing = ongoing_codegen.downcast::<OngoingTrustCgCodegen>().unwrap();
+        let mut ongoing = ongoing_codegen.downcast::<OngoingTrustCgCodegen>().unwrap();
+
+        // Trust (step 2 increment 5, sub-step 5.4.2): the COMPILER LANE's unit. Its object is
+        // the one `CerReport::ships` already allowed; it is written as is, then the
+        // certificates file and the coverage artifact that describe it.
+        if let Some(unit) = ongoing.compiler_lane.take() {
+            let object_path = outputs.temp_path_for_cgu(OutputType::Object, &unit.name);
+            if let Err(e) = fs::write(&object_path, &unit.object) {
+                sess.dcx()
+                    .fatal(format!("trust-cg: failed to write object for `{}`: {e}", unit.name));
+            }
+            write_trust_cg_certificates(sess, outputs, &unit.report);
+            match &unit.coverage {
+                Some(coverage) => disclose_instance_coverage(
+                    sess,
+                    outputs,
+                    &ongoing.crate_name,
+                    coverage,
+                    &[object_path.as_path()],
+                ),
+                None => clear_instance_coverage(sess, outputs),
+            }
+            sess.dcx().note(format!(
+                "trust-cg: compiled {} function(s) in 1 module(s) via the trust-ir frontend's \
+                 compiler lane",
+                unit.function_count
+            ));
+            let module = CompiledModule {
+                name: unit.name.clone(),
+                kind: ModuleKind::Regular,
+                object: Some(object_path.clone()),
+                global_asm_object: None,
+                dwarf_object: None,
+                bytecode: None,
+                assembly: None,
+                llvm_ir: None,
+            };
+            if outputs.outputs.should_link() {
+                let expected =
+                    archive_output::CompilerArchiveObject::new(unit.name, object_path, unit.object)
+                        .unwrap_or_else(|reason| sess.dcx().fatal(reason));
+                let mut pending = self
+                    .compiler_archive_object
+                    .lock()
+                    .unwrap_or_else(|_| sess.dcx().fatal("Compiler archive handoff lock poisoned"));
+                if pending.is_some() {
+                    sess.dcx()
+                        .fatal("Compiler archive handoff would overwrite unconsumed live bytes");
+                }
+                *pending = Some(expected);
+            }
+            return output_artifacts::finish_codegen(
+                sess,
+                CompiledModules { modules: vec![module], allocator_module: None },
+                outputs,
+            );
+        }
 
         // Trust (F1): the trust-ir frontend's codegen unit. It never entered the
         // bridge's MIR-fed `codegen_crate`, so there is no bridge `OngoingCodegen`
@@ -2578,20 +3893,42 @@ impl CodegenBackend for TrustCgCodegenBackend {
                 sess,
                 outputs,
             );
+            // Trust (owner ruling D17): the per-function coverage disclosure,
+            // AFTER the gate accepted the object (emission fatals otherwise), with
+            // the verdict every emitted function got under the active policy.
+            match &ongoing.instance_coverage {
+                Some(coverage) => {
+                    let objects: Vec<&std::path::Path> =
+                        module.object.iter().map(|p| p.as_path()).collect();
+                    disclose_instance_coverage(
+                        sess,
+                        outputs,
+                        &ongoing.crate_name,
+                        coverage,
+                        &objects,
+                    );
+                }
+                None => clear_instance_coverage(sess, outputs),
+            }
+            // Trust (step 2 increment 5, sub-step 5.4.2): this compile did not take the
+            // compiler lane, so no certificates file describes its object.
+            clear_trust_cg_certificates(sess, outputs);
             sess.dcx().note(format!(
                 "trust-cg: compiled {} function(s) in 1 module(s) via the trust-ir frontend",
                 ongoing.function_count
             ));
-            return (
+            return output_artifacts::finish_codegen(
+                sess,
                 CompiledModules { modules: vec![module], allocator_module: None },
-                WorkProductMap::default(),
+                outputs,
             );
         }
 
         let Some(bridge_ongoing) = ongoing.bridge_ongoing else {
-            return (
+            return output_artifacts::finish_codegen(
+                sess,
                 CompiledModules { modules: vec![], allocator_module: None },
-                WorkProductMap::default(),
+                outputs,
             );
         };
 
@@ -2609,9 +3946,8 @@ impl CodegenBackend for TrustCgCodegenBackend {
         match BridgeCodegenBackend::join_codegen(&bridge, bridge_ongoing, &bridge_outputs) {
             Ok((bridge_compiled, _bridge_work_products)) => {
                 // Convert bridge CompiledModules -> rustc CompiledModules.
-                // Multi-function bridge modules are split into one rustc object
-                // artifact per function because rustc CompiledModule carries a
-                // single object path.
+                // Each complete bridge CGU contributes one object; internal
+                // function symbols must remain in the same object as callers.
                 let mut rustc_modules = Vec::new();
 
                 for bridge_module in &bridge_compiled.modules {
@@ -2649,7 +3985,7 @@ impl CodegenBackend for TrustCgCodegenBackend {
                     compiled.modules.len()
                 ));
 
-                (compiled, WorkProductMap::default())
+                output_artifacts::finish_codegen(sess, compiled, outputs)
             }
             Err(e) => {
                 sess.dcx().fatal(format!("trust-cg join_codegen failed: {e}"));
@@ -2669,6 +4005,36 @@ impl CodegenBackend for TrustCgCodegenBackend {
         metadata: EncodedMetadata,
         outputs: &OutputFilenames,
     ) {
+        let expected = self
+            .compiler_archive_object
+            .lock()
+            .unwrap_or_else(|_| sess.dcx().fatal("Compiler archive handoff lock poisoned"))
+            .take();
+        if let Some(expected) = expected {
+            expected
+                .require_modules(&compiled_modules)
+                .unwrap_or_else(|reason| sess.dcx().fatal(reason));
+            let builder = archive_output::CheckedArchiveBuilderBuilder {
+                expected: std::sync::Arc::new(expected),
+            };
+            link_binary(
+                sess,
+                &builder,
+                compiled_modules,
+                crate_info,
+                metadata,
+                outputs,
+                self.name(),
+            );
+            return;
+        }
+        if outputs.outputs.should_link()
+            && sess.trust_cg_f1_backend_is_compiler()
+            && trust_cg_frontend(sess) == TrustCgFrontend::TrustIr
+            && compiled_modules.modules.iter().any(|module| module.object.is_some())
+        {
+            sess.dcx().fatal("Compiler archive link lacks its live gated object handoff");
+        }
         link_binary(
             sess,
             &ArArchiveBuilderBuilder,

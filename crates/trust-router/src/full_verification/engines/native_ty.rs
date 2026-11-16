@@ -23,10 +23,30 @@
 //! * Obligations without a transportable model are `Unsupported` with a
 //!   diagnostic naming the missing metadata (never a silent Unknown), and
 //!   refutations are `Failed` with a typed state/action trace.
+//! * A REFUTATION-ONLY payload (`TY_TEMPORAL_MODEL_SCHEMA_REFUTATION_ONLY`: a
+//!   derived model that may under-approximate the program) never yields
+//!   `Proved`: a check that finds no counterexample is `Unknown` with a
+//!   diagnostic saying so (D-10/D-11 plan SD-8). Its refutations stay
+//!   `Failed`.
+//! * The platform pass reads a refutation-only check TYPED, never through
+//!   `EvidenceStatus` or diagnostic text ([`NativeTyEngine::check_refutation_only`],
+//!   [`RefutationOnlyVerdict`]; Critique C-1, change 1): a counterexample
+//!   trace, "no counterexample" with the exploration's completeness
+//!   (exhaustive or truncated), or inconclusive. One pure mapping
+//!   ([`classify`]) builds both that value and the wire `Unknown`.
+//! * A refutation-only payload's formula is VETTED before any answer is
+//!   read from it, typed or on the wire ([`vet_refutation_only`]): it must
+//!   be CTL over the transported machine, the payload must declare its atom
+//!   vocabulary, and every atom of the formula and every state label must be
+//!   in it. Anything else is inconclusive (`Unknown`, never `Failed` and
+//!   never "no counterexample"): an atom no state carries is false
+//!   everywhere, so a misspelling would otherwise pass vacuously or refute
+//!   spuriously (FC-7).
 
+use trust_temporal::ctl::{CtlFormula, parse_ctl};
 use trust_types::{
-    StateMachineMetadata, TY_TEMPORAL_MODEL_METADATA_KEY, TyTemporalModelPayload, VcKind,
-    VerificationResult,
+    CounterexampleValue, StateMachineMetadata, TY_TEMPORAL_MODEL_METADATA_KEY,
+    TyTemporalModelPayload, VcKind, VerificationResult,
 };
 use trust_verifier_api::{
     API_VERSION, Counterexample, EngineCapability, EngineKind, EngineManifest, EvidenceArtifact,
@@ -41,6 +61,200 @@ use crate::ty_backend::{metadata_to_state_machine, verify_liveness, verify_tempo
 /// Schema marker stamped on this engine's transcript and check-report
 /// artifacts and typed counterexamples.
 const TY_EVIDENCE_SCHEMA: &str = "trust.ty.native-evidence.v1";
+
+/// What a refutation-only check of a derived model gave, typed (Critique
+/// C-1, change 1). The platform pass reads this, never `EvidenceStatus` or
+/// diagnostic text.
+///
+/// There is no proof arm: a derived model may under-approximate the program,
+/// so "no counterexample" is all ty can say about it (OD-8; it never becomes
+/// `Proved`, `Certified` or a proof strength).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefutationOnlyVerdict {
+    /// ty refuted the formula. `trace` is the counterexample's machine-state
+    /// sequence (one emitted-machine state id per step, from the initial
+    /// state), the input of the derivation's replay.
+    Counterexample { trace: Vec<usize> },
+    /// No counterexample, over an exploration of this completeness.
+    NoCounterexample { completeness: RefutationCompleteness },
+    /// No answer: ty was inconclusive, or the payload, the formula or the
+    /// counterexample did not parse. Never read as "no counterexample".
+    Inconclusive { reason: String },
+}
+
+/// How much of the transported machine a "no counterexample" covered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefutationCompleteness {
+    /// The exploration provably completed (ty's `ExplicitStateModel`,
+    /// `Sound` strength).
+    Exhaustive,
+    /// The exploration stopped after `states` states
+    /// (`ProofStrength::bounded(states)`): an unexplored state may violate.
+    Truncated { states: u64 },
+}
+
+/// The one mapping from ty's result to a [`RefutationOnlyVerdict`]. Pure.
+///
+/// * `Proved` at `ExplicitStateModel`/`Sound`: no counterexample, exhaustive;
+///   at a bounded strength: no counterexample, truncated; at any other
+///   strength: inconclusive (an unrecognised strength is never exhaustive).
+/// * `Failed` whose counterexample steps are `step_{i}_…` machine-state ids
+///   in order: the trace. Without a counterexample, empty, out of order, or
+///   with a step that is not a state id: inconclusive.
+/// * `Unknown`, `Timeout` and anything else: inconclusive.
+///
+/// `refutation_only` is whether the checked payload carried the
+/// refutation-only schema. Only derived models are read this way: without
+/// the marker the answer is the full lane's, so this is inconclusive.
+#[must_use]
+pub fn classify(result: &VerificationResult, refutation_only: bool) -> RefutationOnlyVerdict {
+    if !refutation_only {
+        return RefutationOnlyVerdict::Inconclusive {
+            reason: "the payload is not refutation-only: a refutation-only check reads derived \
+                     models only"
+                .to_string(),
+        };
+    }
+    match result {
+        VerificationResult::Proved { strength, .. } => {
+            match (&strength.reasoning, &strength.assurance, strength.bounded_depth()) {
+                (
+                    trust_types::ReasoningKind::ExplicitStateModel,
+                    trust_types::AssuranceLevel::Sound,
+                    _,
+                ) => RefutationOnlyVerdict::NoCounterexample {
+                    completeness: RefutationCompleteness::Exhaustive,
+                },
+                (_, _, Some(states)) => RefutationOnlyVerdict::NoCounterexample {
+                    completeness: RefutationCompleteness::Truncated { states },
+                },
+                _ => RefutationOnlyVerdict::Inconclusive {
+                    reason: format!(
+                        "no counterexample, at a strength that is neither a complete explicit-state \
+                         exploration nor a bounded one: {strength:?}"
+                    ),
+                },
+            }
+        }
+        VerificationResult::Failed { counterexample: Some(ce), .. } => {
+            match counterexample_trace(ce) {
+                Ok(trace) => RefutationOnlyVerdict::Counterexample { trace },
+                Err(reason) => RefutationOnlyVerdict::Inconclusive { reason },
+            }
+        }
+        VerificationResult::Failed { counterexample: None, .. } => {
+            RefutationOnlyVerdict::Inconclusive {
+                reason: "ty refuted the formula but returned no counterexample to replay"
+                    .to_string(),
+            }
+        }
+        VerificationResult::Unknown { reason, .. } => {
+            RefutationOnlyVerdict::Inconclusive { reason: reason.clone() }
+        }
+        other => RefutationOnlyVerdict::Inconclusive {
+            reason: format!("unexpected ty verification result: {other:?}"),
+        },
+    }
+}
+
+/// The machine-state ids of a ty counterexample (`step_{i}_{state}` →
+/// state id), or why they are not.
+fn counterexample_trace(ce: &trust_types::Counterexample) -> Result<Vec<usize>, String> {
+    if ce.assignments.is_empty() {
+        return Err("ty's counterexample has no steps".to_string());
+    }
+    ce.assignments
+        .iter()
+        .enumerate()
+        .map(|(i, (name, value))| {
+            let prefix = format!("step_{i}_");
+            if !name.starts_with(&prefix) {
+                return Err(format!("counterexample step {i} is named `{name}`, not `{prefix}…`"));
+            }
+            let id = match value {
+                CounterexampleValue::Int(v) => usize::try_from(*v).ok(),
+                CounterexampleValue::Uint(v) => usize::try_from(*v).ok(),
+                _ => None,
+            };
+            id.ok_or_else(|| {
+                format!("counterexample step {i} carries {value:?}, not a machine state id")
+            })
+        })
+        .collect()
+}
+
+/// Vet a REFUTATION-ONLY payload before any answer is read from it (FC-7):
+/// the check must be a CTL formula over a transported machine, the payload
+/// must declare its atom vocabulary, every atom the formula names must be
+/// in that vocabulary, and so must every label a state carries (a
+/// vocabulary that does not cover the machine's labels is not this
+/// machine's). `Err` says why the payload is inconclusive.
+///
+/// The machine alone cannot tell a misspelt atom from a real one: a fixed
+/// program legitimately labels no state with its violation atom, so only
+/// the producer's declared vocabulary can.
+pub(crate) fn vet_refutation_only(payload: &TyTemporalModelPayload) -> Result<(), String> {
+    let VcKind::Temporal { property, machine: Some(md) } = &payload.vc_kind else {
+        return Err(format!(
+            "a refutation-only check reads a CTL formula over a transported machine, not `{}`",
+            payload.vc_kind.description()
+        ));
+    };
+    let formula = parse_ctl(property)
+        .map_err(|e| format!("failed to parse temporal property `{property}` as CTL: {e}"))?;
+    let mut atoms = Vec::new();
+    ctl_atoms(&formula, &mut atoms)?;
+    let Some(vocabulary) = &payload.vocabulary else {
+        return Err(format!(
+            "the refutation-only payload for `{property}` declares no atom vocabulary, so its \
+             atoms cannot be vetted (an atom no state carries is false everywhere)"
+        ));
+    };
+    if let Some(atom) = atoms.iter().find(|a| !vocabulary.contains(*a)) {
+        return Err(format!(
+            "`{property}` names atom `{atom}`, which is not in the payload's vocabulary \
+             {vocabulary:?}"
+        ));
+    }
+    // The order of the Fx map never escapes: the strays are sorted before
+    // the first is named.
+    #[allow(rustc::potential_query_instability)]
+    let mut strays: Vec<&String> =
+        md.labels.values().flatten().filter(|l| !vocabulary.contains(*l)).collect();
+    strays.sort_unstable();
+    if let Some(label) = strays.first() {
+        return Err(format!(
+            "a state of the machine carries `{label}`, which is not in the payload's vocabulary: \
+             the vocabulary is not this machine's"
+        ));
+    }
+    Ok(())
+}
+
+/// Every atom of `f`, or `Err` for a connective this vetting does not know
+/// (its atoms could not be vetted).
+fn ctl_atoms(f: &CtlFormula, out: &mut Vec<String>) -> Result<(), String> {
+    match f {
+        CtlFormula::Atom(a) => out.push(a.clone()),
+        CtlFormula::True | CtlFormula::False => {}
+        CtlFormula::Not(x)
+        | CtlFormula::EX(x)
+        | CtlFormula::EF(x)
+        | CtlFormula::EG(x)
+        | CtlFormula::AX(x)
+        | CtlFormula::AF(x)
+        | CtlFormula::AG(x) => ctl_atoms(x, out)?,
+        CtlFormula::And(x, y)
+        | CtlFormula::Or(x, y)
+        | CtlFormula::EU(x, y)
+        | CtlFormula::AU(x, y) => {
+            ctl_atoms(x, out)?;
+            ctl_atoms(y, out)?;
+        }
+        other => return Err(format!("unvetted CTL connective in `{other}`")),
+    }
+    Ok(())
+}
 
 /// Native ty adapter registered as the full verifier's temporal primary.
 pub struct NativeTyEngine {
@@ -127,6 +341,54 @@ impl NativeTyEngine {
         }
     }
 
+    /// Check a refutation-only obligation and say what ty found, typed
+    /// (Critique C-1, change 1): the answer the platform pass reads.
+    ///
+    /// A missing, malformed or non-refutation-only payload, a formula ty
+    /// cannot parse, a payload [`vet_refutation_only`] refuses (no declared
+    /// vocabulary, or an atom outside it), an inconclusive check and a
+    /// counterexample that names a state the machine does not have are all
+    /// [`RefutationOnlyVerdict::Inconclusive`]. The wire evidence
+    /// ([`VerificationEngine::verify`]) of the same obligation is built from
+    /// the same [`classify`]: status `Unknown` (or `Failed` for a
+    /// counterexample) and never a proof strength.
+    #[must_use]
+    pub fn check_refutation_only(&self, obligation: &TrustObligation) -> RefutationOnlyVerdict {
+        let support = self.supports(obligation);
+        if !support.is_supported() {
+            return RefutationOnlyVerdict::Inconclusive {
+                reason: format!("ty does not check this obligation: {support:?}"),
+            };
+        }
+        let payload = match Self::transported_model(obligation) {
+            Ok(payload) => payload,
+            Err(reason) => return RefutationOnlyVerdict::Inconclusive { reason },
+        };
+        let result = match Self::check(&payload.vc_kind) {
+            Ok(result) => result,
+            Err(reason) => return RefutationOnlyVerdict::Inconclusive { reason },
+        };
+        if payload.is_refutation_only()
+            && let Err(reason) = vet_refutation_only(&payload)
+        {
+            return RefutationOnlyVerdict::Inconclusive { reason };
+        }
+        match classify(&result, payload.is_refutation_only()) {
+            RefutationOnlyVerdict::Counterexample { trace } => {
+                let states = payload_machine(&payload).map_or(0, |md| md.states.len());
+                match trace.iter().find(|s| **s >= states) {
+                    Some(s) => RefutationOnlyVerdict::Inconclusive {
+                        reason: format!(
+                            "the counterexample names state {s}, but the machine has {states} states"
+                        ),
+                    },
+                    None => RefutationOnlyVerdict::Counterexample { trace },
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Independent replay: re-parse the raw metadata value, rebuild the
     /// machine, re-run the check, and compare verdicts. This is the
     /// replay/check evidence a Sound (non-solver-backed) proof must carry.
@@ -157,12 +419,32 @@ impl NativeTyEngine {
             Err(diagnostic) => return self.unsupported(obligation, diagnostic),
         };
 
+        // A refutation-only payload whose formula cannot be vetted gives no
+        // answer at all, not even a refutation: its counterexample may be
+        // one of a misspelt atom (the same check the typed answer makes).
+        if payload.is_refutation_only()
+            && let Err(reason) = vet_refutation_only(&payload)
+        {
+            return self.refutation_only_unknown(
+                obligation,
+                &payload,
+                &RefutationOnlyVerdict::Inconclusive { reason },
+            );
+        }
+
         match result {
-            VerificationResult::Proved { strength, .. } => {
-                self.proved(bundle, obligation, &payload, raw_entry.as_deref(), strength)
-            }
             VerificationResult::Failed { counterexample, .. } => {
                 self.failed(obligation, &payload, counterexample)
+            }
+            // A derived (refutation-only) model never proves (SD-8, OD-8):
+            // anything but a refutation is `Unknown`, built from the typed
+            // verdict `check_refutation_only` returns, so the wire and the
+            // typed answer cannot disagree.
+            result if payload.is_refutation_only() => {
+                self.refutation_only_unknown(obligation, &payload, &classify(&result, true))
+            }
+            VerificationResult::Proved { strength, .. } => {
+                self.proved(bundle, obligation, &payload, raw_entry.as_deref(), strength)
             }
             VerificationResult::Unknown { reason, .. } => ObligationEvidence {
                 evidence_id: format!("ty:native:unknown:{}", obligation.obligation_id),
@@ -190,6 +472,53 @@ impl NativeTyEngine {
                 publication: EvidencePublicationMetadata::default(),
                 diagnostics: vec![format!("unexpected ty verification result: {other:?}")],
             },
+        }
+    }
+
+    /// The wire evidence of a refutation-only check that refuted nothing:
+    /// `Unknown`, no proof strength, the typed verdict in words.
+    fn refutation_only_unknown(
+        &self,
+        obligation: &TrustObligation,
+        payload: &TyTemporalModelPayload,
+        verdict: &RefutationOnlyVerdict,
+    ) -> ObligationEvidence {
+        let diagnostics = match verdict {
+            RefutationOnlyVerdict::NoCounterexample { completeness } => {
+                let mut diagnostics = vec![format!(
+                    "no counterexample to `{}` in the transported machine; the payload is \
+                     refutation-only (a derived model that may under-approximate the \
+                     program), so this is not a proof",
+                    property_description(&payload.vc_kind)
+                )];
+                if let RefutationCompleteness::Truncated { states } = completeness {
+                    diagnostics.push(format!(
+                        "the exploration was truncated after {states} states: an unexplored \
+                         state may violate the property"
+                    ));
+                }
+                diagnostics
+            }
+            RefutationOnlyVerdict::Inconclusive { reason } => {
+                vec![format!("ty model check inconclusive: {reason}")]
+            }
+            RefutationOnlyVerdict::Counterexample { trace } => vec![format!(
+                "ty model check inconclusive: a counterexample of {} steps reached the \
+                 no-counterexample path",
+                trace.len()
+            )],
+        };
+        ObligationEvidence {
+            evidence_id: format!("ty:native:unknown:{}", obligation.obligation_id),
+            obligation_id: obligation.obligation_id.clone(),
+            engine: self.manifest.clone(),
+            status: EvidenceStatus::Unknown,
+            decline: None,
+            proof_strength: None,
+            artifacts: Vec::new(),
+            counterexample: None,
+            publication: EvidencePublicationMetadata::default(),
+            diagnostics,
         }
     }
 
@@ -800,6 +1129,41 @@ mod tests {
         }
     }
 
+    /// SD-8: a derived (refutation-only) machine never proves; its
+    /// refutations still fail with a trace.
+    #[test]
+    fn refutation_only_payload_never_proves_and_still_refutes() {
+        let engine = NativeTyEngine::new();
+        for (single_writer, want) in [
+            (trust_types::SingleWriterEvidence::Verified, EvidenceStatus::Unknown),
+            (trust_types::SingleWriterEvidence::None, EvidenceStatus::Failed),
+        ] {
+            let payload = TyTemporalModelPayload::refutation_only(&VcKind::Temporal {
+                property: "AG !bad".to_string(),
+                machine: Some(StateMachineMetadata::mmap_temporal_model(single_writer)),
+            })
+            .expect("Temporal is a ty-owned kind")
+            .with_vocabulary(["bad".to_string()]);
+            assert!(payload.is_refutation_only());
+            let obligation = temporal_obligation(vec![MetadataEntry {
+                key: TY_TEMPORAL_MODEL_METADATA_KEY.to_string(),
+                value: payload.to_metadata_value().expect("payload serializes"),
+            }]);
+            let evidence = engine.verify(&bundle(&obligation), &[obligation]).remove(0);
+            assert_eq!(evidence.status, want, "{evidence:#?}");
+            assert!(evidence.proof_strength.is_none());
+            if want == EvidenceStatus::Unknown {
+                assert!(
+                    evidence.diagnostics.iter().any(|d| d.contains("refutation-only")),
+                    "{:#?}",
+                    evidence.diagnostics
+                );
+            } else {
+                assert!(evidence.counterexample.is_some());
+            }
+        }
+    }
+
     #[test]
     fn non_ty_kinds_are_not_supported() {
         let engine = NativeTyEngine::new();
@@ -807,5 +1171,434 @@ mod tests {
         obligation.kind = ObligationKind::Assertion;
         assert!(!engine.supports(&obligation).is_supported());
         assert!(engine.verify(&bundle(&obligation), &[obligation]).is_empty());
+    }
+
+    // ---- L1b (Critique C-1, change 1): typed completeness for refutation-only checks ----
+
+    fn proved(strength: trust_types::ProofStrength) -> VerificationResult {
+        VerificationResult::Proved {
+            solver: "ty".into(),
+            time_ms: 0,
+            strength,
+            proof_certificate: None,
+            solver_warnings: None,
+            native_proof_envelope: None,
+        }
+    }
+
+    fn failed(
+        assignments: Option<Vec<(String, trust_types::CounterexampleValue)>>,
+    ) -> VerificationResult {
+        VerificationResult::Failed {
+            solver: "ty".into(),
+            time_ms: 0,
+            counterexample: assignments.map(trust_types::Counterexample::new),
+        }
+    }
+
+    /// A refutation-only obligation over `machine` whose vocabulary is
+    /// `{bad}` (the mmap model's one atom).
+    fn refutation_only_obligation(
+        property: &str,
+        machine: StateMachineMetadata,
+    ) -> TrustObligation {
+        refutation_only_obligation_with(property, machine, Some(&["bad"]))
+    }
+
+    fn refutation_only_obligation_with(
+        property: &str,
+        machine: StateMachineMetadata,
+        vocabulary: Option<&[&str]>,
+    ) -> TrustObligation {
+        let mut payload = TyTemporalModelPayload::refutation_only(&VcKind::Temporal {
+            property: property.to_string(),
+            machine: Some(machine),
+        })
+        .expect("Temporal is a ty-owned kind");
+        if let Some(atoms) = vocabulary {
+            payload = payload.with_vocabulary(atoms.iter().map(|a| (*a).to_string()));
+        }
+        assert!(payload.is_refutation_only());
+        temporal_obligation(vec![MetadataEntry {
+            key: TY_TEMPORAL_MODEL_METADATA_KEY.to_string(),
+            value: payload.to_metadata_value().expect("payload serializes"),
+        }])
+    }
+
+    fn multi_writer() -> StateMachineMetadata {
+        StateMachineMetadata::mmap_temporal_model(trust_types::SingleWriterEvidence::None)
+    }
+
+    fn single_writer() -> StateMachineMetadata {
+        StateMachineMetadata::mmap_temporal_model(trust_types::SingleWriterEvidence::Verified)
+    }
+
+    fn wire(obligation: &TrustObligation) -> ObligationEvidence {
+        NativeTyEngine::new()
+            .verify(&bundle(obligation), std::slice::from_ref(obligation))
+            .remove(0)
+    }
+
+    fn is_inconclusive(v: &RefutationOnlyVerdict) -> bool {
+        matches!(v, RefutationOnlyVerdict::Inconclusive { .. })
+    }
+
+    #[test]
+    fn classify_complete_exploration_is_exhaustive() {
+        let sound = trust_types::ProofStrength {
+            reasoning: trust_types::ReasoningKind::ExplicitStateModel,
+            assurance: trust_types::AssuranceLevel::Sound,
+        };
+        assert_eq!(
+            classify(&proved(sound), true),
+            RefutationOnlyVerdict::NoCounterexample {
+                completeness: RefutationCompleteness::Exhaustive
+            }
+        );
+    }
+
+    #[test]
+    fn classify_bounded_strength_is_truncated() {
+        assert_eq!(
+            classify(&proved(trust_types::ProofStrength::bounded(4096)), true),
+            RefutationOnlyVerdict::NoCounterexample {
+                completeness: RefutationCompleteness::Truncated { states: 4096 }
+            }
+        );
+    }
+
+    #[test]
+    fn classify_unrecognised_strength_is_inconclusive_never_exhaustive() {
+        // Sound, but not the explicit-state exploration ty reports: the
+        // mapping does not guess.
+        let other = trust_types::ProofStrength {
+            reasoning: trust_types::ReasoningKind::Pdr,
+            assurance: trust_types::AssuranceLevel::Sound,
+        };
+        assert!(matches!(
+            classify(&proved(other), true),
+            RefutationOnlyVerdict::Inconclusive { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_unknown_is_inconclusive_never_no_counterexample() {
+        let unknown = VerificationResult::Unknown {
+            solver: "ty".into(),
+            time_ms: 0,
+            reason: "state budget".to_string(),
+        };
+        match classify(&unknown, true) {
+            RefutationOnlyVerdict::Inconclusive { reason } => {
+                assert!(reason.contains("state budget"), "{reason}");
+            }
+            v => panic!("an Unknown read {v:?}"),
+        }
+        let timeout = VerificationResult::Timeout { solver: "ty".into(), timeout_ms: 10 };
+        assert!(matches!(classify(&timeout, true), RefutationOnlyVerdict::Inconclusive { .. }));
+    }
+
+    #[test]
+    fn classify_failed_trace_is_a_counterexample_and_a_malformed_one_is_inconclusive() {
+        use trust_types::CounterexampleValue as V;
+        let step = |i: usize, v: V| (format!("step_{i}_q{i}"), v);
+        assert_eq!(
+            classify(&failed(Some(vec![step(0, V::Int(0)), step(1, V::Uint(3))])), true),
+            RefutationOnlyVerdict::Counterexample { trace: vec![0, 3] }
+        );
+        for (what, bad) in [
+            ("no counterexample", None),
+            ("an empty trace", Some(Vec::new())),
+            ("a negative state id", Some(vec![step(0, V::Int(-1))])),
+            ("a non-integer value", Some(vec![step(0, V::Term("q0".to_string()))])),
+            ("a boolean value", Some(vec![step(0, V::Bool(true))])),
+            ("steps out of order", Some(vec![step(1, V::Int(0)), step(0, V::Int(1))])),
+        ] {
+            assert!(
+                matches!(classify(&failed(bad), true), RefutationOnlyVerdict::Inconclusive { .. }),
+                "{what} must be inconclusive"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_answers_only_for_a_refutation_only_payload() {
+        let sound = trust_types::ProofStrength {
+            reasoning: trust_types::ReasoningKind::ExplicitStateModel,
+            assurance: trust_types::AssuranceLevel::Sound,
+        };
+        for result in [
+            proved(sound),
+            failed(Some(vec![("step_0_q0".to_string(), trust_types::CounterexampleValue::Int(0))])),
+        ] {
+            assert!(matches!(classify(&result, false), RefutationOnlyVerdict::Inconclusive { .. }));
+        }
+    }
+
+    #[test]
+    fn check_refutation_only_types_the_derived_model_answer() {
+        let engine = NativeTyEngine::new();
+        let ok = refutation_only_obligation(
+            "AG !bad",
+            StateMachineMetadata::mmap_temporal_model(trust_types::SingleWriterEvidence::Verified),
+        );
+        assert_eq!(
+            engine.check_refutation_only(&ok),
+            RefutationOnlyVerdict::NoCounterexample {
+                completeness: RefutationCompleteness::Exhaustive
+            }
+        );
+        let bad = refutation_only_obligation(
+            "AG !bad",
+            StateMachineMetadata::mmap_temporal_model(trust_types::SingleWriterEvidence::None),
+        );
+        match engine.check_refutation_only(&bad) {
+            RefutationOnlyVerdict::Counterexample { trace } => {
+                assert_eq!(trace.first(), Some(&0), "the trace starts at the initial state");
+                assert!(trace.len() > 1, "{trace:?}");
+            }
+            v => panic!("the multi-writer model must be refuted: {v:?}"),
+        }
+    }
+
+    #[test]
+    fn check_refutation_only_malformed_atom_is_inconclusive() {
+        let engine = NativeTyEngine::new();
+        let obligation = refutation_only_obligation(
+            "AG !fd-inherit violation",
+            StateMachineMetadata::mmap_temporal_model(trust_types::SingleWriterEvidence::Verified),
+        );
+        match engine.check_refutation_only(&obligation) {
+            RefutationOnlyVerdict::Inconclusive { reason } => {
+                assert!(reason.contains("parse"), "{reason}");
+            }
+            v => panic!("a formula ty cannot parse is never answered: {v:?}"),
+        }
+    }
+
+    #[test]
+    fn check_refutation_only_payload_errors_are_inconclusive() {
+        let engine = NativeTyEngine::new();
+        let missing = temporal_obligation(Vec::new());
+        let malformed = temporal_obligation(vec![MetadataEntry {
+            key: TY_TEMPORAL_MODEL_METADATA_KEY.to_string(),
+            value: "{not json".to_string(),
+        }]);
+        // A full (proof-capable) payload is not a derived model.
+        let full = temporal_obligation(vec![mmap_model_metadata(
+            trust_types::SingleWriterEvidence::Verified,
+        )]);
+        for (what, o) in [("missing", missing), ("malformed", malformed), ("full", full)] {
+            assert!(
+                matches!(
+                    engine.check_refutation_only(&o),
+                    RefutationOnlyVerdict::Inconclusive { .. }
+                ),
+                "{what} payload must be inconclusive"
+            );
+        }
+    }
+
+    /// FC-2: no refutation-only path carries a proof strength, and the wire
+    /// stays `Unknown` (no counterexample, truncated, inconclusive) or
+    /// `Failed` (refuted).
+    #[test]
+    fn refutation_only_paths_never_carry_proof_strength() {
+        let engine = NativeTyEngine::new();
+        for (property, single_writer, want) in [
+            ("AG !bad", trust_types::SingleWriterEvidence::Verified, EvidenceStatus::Unknown),
+            ("AG !bad", trust_types::SingleWriterEvidence::None, EvidenceStatus::Failed),
+            (
+                "AG !fd-inherit violation",
+                trust_types::SingleWriterEvidence::Verified,
+                EvidenceStatus::Unknown,
+            ),
+        ] {
+            let obligation = refutation_only_obligation(
+                property,
+                StateMachineMetadata::mmap_temporal_model(single_writer),
+            );
+            let evidence = engine.verify(&bundle(&obligation), &[obligation]).remove(0);
+            assert_eq!(evidence.status, want, "{evidence:#?}");
+            assert!(evidence.proof_strength.is_none(), "{evidence:#?}");
+        }
+        // The truncated arm, which no small machine reaches: built from the
+        // typed value, it is Unknown, carries no strength and says so.
+        let obligation = refutation_only_obligation(
+            "AG !bad",
+            StateMachineMetadata::mmap_temporal_model(trust_types::SingleWriterEvidence::Verified),
+        );
+        let payload = NativeTyEngine::transported_model(&obligation).expect("transported");
+        let evidence = engine.refutation_only_unknown(
+            &obligation,
+            &payload,
+            &RefutationOnlyVerdict::NoCounterexample {
+                completeness: RefutationCompleteness::Truncated { states: 7 },
+            },
+        );
+        assert_eq!(evidence.status, EvidenceStatus::Unknown);
+        assert!(evidence.proof_strength.is_none());
+        assert!(evidence.diagnostics.iter().any(|d| d.contains("refutation-only")));
+        assert!(evidence.diagnostics.iter().any(|d| d.contains("truncated") && d.contains('7')));
+    }
+
+    // ---- Red-team holes H1 and H2 (L1b): what an "Exhaustive" answer is about ----
+
+    /// H1. An atom that names no label still got a clean answer: `AG !bda`
+    /// (a misspelt `bad`) over the REFUTABLE multi-writer machine answered
+    /// `NoCounterexample { Exhaustive }`, and `AG bda` would refute
+    /// spuriously. Now the payload declares its vocabulary and the engine
+    /// refuses an atom outside it, typed and on the wire.
+    #[test]
+    fn refutation_only_atom_outside_the_vocabulary_is_inconclusive() {
+        let engine = NativeTyEngine::new();
+        let real = refutation_only_obligation("AG !bad", multi_writer());
+        assert!(matches!(
+            engine.check_refutation_only(&real),
+            RefutationOnlyVerdict::Counterexample { .. }
+        ));
+        for formula in ["AG !bda", "AG bda", "AG (!bad && !bda)", "EF bda", "A[!bad U bda]"] {
+            for machine in [multi_writer(), single_writer()] {
+                let o = refutation_only_obligation(formula, machine);
+                match engine.check_refutation_only(&o) {
+                    RefutationOnlyVerdict::Inconclusive { reason } => {
+                        assert!(reason.contains("`bda`"), "{formula}: {reason}");
+                    }
+                    v => panic!("`{formula}` names an atom outside the vocabulary: {v:?}"),
+                }
+                let evidence = wire(&o);
+                assert_eq!(evidence.status, EvidenceStatus::Unknown, "{formula}: {evidence:#?}");
+                assert!(evidence.proof_strength.is_none() && evidence.counterexample.is_none());
+            }
+        }
+        // A declared atom no state carries is the fixed program's case: a
+        // clean answer, because the producer said the atom is real.
+        let fixed = refutation_only_obligation("AG !bad", single_writer());
+        assert_eq!(
+            engine.check_refutation_only(&fixed),
+            RefutationOnlyVerdict::NoCounterexample {
+                completeness: RefutationCompleteness::Exhaustive
+            }
+        );
+    }
+
+    /// H1. Without a declared vocabulary nothing is answered: not "no
+    /// counterexample" and not a refutation (typed Inconclusive, wire
+    /// Unknown, never Failed).
+    #[test]
+    fn refutation_only_payload_without_a_vocabulary_is_inconclusive() {
+        let engine = NativeTyEngine::new();
+        for (formula, machine) in
+            [("AG !bad", multi_writer()), ("AG !bad", single_writer()), ("AG !bda", multi_writer())]
+        {
+            let o = refutation_only_obligation_with(formula, machine, None);
+            match engine.check_refutation_only(&o) {
+                RefutationOnlyVerdict::Inconclusive { reason } => {
+                    assert!(reason.contains("vocabulary"), "{formula}: {reason}");
+                }
+                v => panic!("`{formula}` without a vocabulary answered {v:?}"),
+            }
+            let evidence = wire(&o);
+            assert_eq!(evidence.status, EvidenceStatus::Unknown, "{formula}: {evidence:#?}");
+            assert!(evidence.proof_strength.is_none() && evidence.counterexample.is_none());
+        }
+    }
+
+    /// H1. A vocabulary that does not cover the machine's labels is not this
+    /// machine's: inconclusive even for a formula over declared atoms.
+    #[test]
+    fn refutation_only_label_outside_the_vocabulary_is_inconclusive() {
+        let engine = NativeTyEngine::new();
+        let o = refutation_only_obligation_with("AG !good", multi_writer(), Some(&["good"]));
+        match engine.check_refutation_only(&o) {
+            RefutationOnlyVerdict::Inconclusive { reason } => {
+                assert!(reason.contains("`bad`"), "{reason}");
+            }
+            v => panic!("a machine labelled outside its vocabulary answered {v:?}"),
+        }
+        assert_eq!(wire(&o).status, EvidenceStatus::Unknown);
+    }
+
+    /// H1. A refutation-only payload is vetted only as CTL over a machine:
+    /// a liveness payload (whose predicate no vocabulary vets) is
+    /// inconclusive, and so on the wire.
+    #[test]
+    fn refutation_only_non_ctl_payload_is_inconclusive() {
+        let payload = TyTemporalModelPayload::refutation_only(&VcKind::Liveness {
+            property: trust_types::LivenessProperty {
+                name: "eventually_bad".to_string(),
+                operator: trust_types::TemporalOperator::Eventually,
+                predicate: "bad".to_string(),
+                consequent: None,
+                fairness: Vec::new(),
+            },
+            machine: Some(multi_writer()),
+        })
+        .expect("Liveness is a ty-owned kind")
+        .with_vocabulary(["bad".to_string()]);
+        let o = temporal_obligation(vec![MetadataEntry {
+            key: TY_TEMPORAL_MODEL_METADATA_KEY.to_string(),
+            value: payload.to_metadata_value().expect("payload serializes"),
+        }]);
+        assert!(is_inconclusive(&NativeTyEngine::new().check_refutation_only(&o)));
+        let evidence = wire(&o);
+        assert_ne!(evidence.status, EvidenceStatus::Proved);
+        assert_ne!(evidence.status, EvidenceStatus::Failed);
+        assert!(evidence.proof_strength.is_none());
+    }
+
+    /// H2. A duplicate key in the payload's `labels` map was accepted (last
+    /// wins), so `"3":["bad"],"3":[]` erased the refutable machine's bad
+    /// state and the answer was `NoCounterexample { Exhaustive }`. Now any
+    /// duplicate key is a payload error: inconclusive typed, unsupported on
+    /// the wire, for the refutation-only and the full lane alike (the full
+    /// lane PROVED the erased machine).
+    #[test]
+    fn duplicate_label_keys_in_a_payload_are_refused() {
+        let engine = NativeTyEngine::new();
+        let ro = refutation_only_obligation("AG !bad", multi_writer());
+        let full =
+            temporal_obligation(vec![mmap_model_metadata(trust_types::SingleWriterEvidence::None)]);
+        for (lane, o) in [("refutation-only", ro), ("full", full)] {
+            let value = o.metadata[0].value.clone();
+            assert!(value.contains("\"3\":[\"bad\"]"), "{value}");
+            for (what, dup) in [
+                ("bad erased", "\"3\":[\"bad\"],\"3\":[]"),
+                ("bad erased, other order", "\"3\":[],\"3\":[\"bad\"],\"3\":[]"),
+                ("bad kept twice", "\"3\":[\"bad\"],\"3\":[\"bad\"]"),
+                ("an escaped twin key", "\"3\":[\"bad\"],\"\\u0033\":[]"),
+            ] {
+                let mut t = o.clone();
+                t.metadata[0].value = value.replacen("\"3\":[\"bad\"]", dup, 1);
+                let v = engine.check_refutation_only(&t);
+                assert!(is_inconclusive(&v), "{lane}, {what}: {v:?}");
+                let evidence = wire(&t);
+                assert_eq!(evidence.status, EvidenceStatus::Unsupported, "{lane}, {what}");
+                assert!(
+                    evidence.diagnostics.iter().any(|d| d.contains("twice")),
+                    "{lane}, {what}: {:#?}",
+                    evidence.diagnostics
+                );
+            }
+        }
+    }
+
+    /// H2. The same state under two spellings of its index is one state
+    /// keyed twice, whatever the JSON text looks like.
+    #[test]
+    fn a_state_labelled_under_two_spellings_is_refused() {
+        let value = refutation_only_obligation("AG !bad", multi_writer()).metadata[0].value.clone();
+        // A leading-zero spelling either does not parse as an index or
+        // names state 3 again: never a silent override.
+        let aliased = value.replacen("\"3\":[\"bad\"]", "\"3\":[\"bad\"],\"03\":[]", 1);
+        let err = TyTemporalModelPayload::from_metadata_value(&aliased)
+            .expect_err("an aliased state key must not parse");
+        assert!(err.contains("twice") || err.contains("invalid"), "{err}");
+        let mut o = temporal_obligation(Vec::new());
+        o.metadata.push(MetadataEntry {
+            key: TY_TEMPORAL_MODEL_METADATA_KEY.to_string(),
+            value: aliased,
+        });
+        assert!(is_inconclusive(&NativeTyEngine::new().check_refutation_only(&o)));
     }
 }

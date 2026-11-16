@@ -252,22 +252,35 @@ impl ReplayEngine {
     /// Generate a human-readable audit report from an audit log.
     #[must_use]
     pub fn generate_audit_report(&self, log: &ReplayAuditLog) -> String {
+        let mut valid_count = 0usize;
+        let mut invalid_count = 0usize;
+        let mut skipped_count = 0usize;
+        for entry in &log.entries {
+            match &entry.result {
+                StepVerdict::Valid => valid_count += 1,
+                StepVerdict::Invalid(_) => invalid_count += 1,
+                StepVerdict::Skipped => skipped_count += 1,
+            }
+        }
+
         let mut report = String::new();
         let _ = writeln!(report, "Audit Report for Certificate: {}", log.certificate_id);
         let _ = writeln!(report, "Total Steps Audited: {}", log.len());
-        let _ = writeln!(report, "Valid: {}", log.count_valid());
-        let _ = writeln!(report, "Invalid: {}", log.count_invalid());
-        let _ = writeln!(report, "Skipped: {}", log.count_skipped());
+        let _ = writeln!(report, "Valid: {valid_count}");
+        let _ = writeln!(report, "Invalid: {invalid_count}");
+        let _ = writeln!(report, "Skipped: {skipped_count}");
         report.push_str("---\n");
 
         for entry in &log.entries {
-            let verdict_str = match &entry.result {
-                StepVerdict::Valid => "VALID".to_string(),
-                StepVerdict::Invalid(reason) => format!("INVALID: {reason}"),
-                StepVerdict::Skipped => "SKIPPED".to_string(),
-            };
-            let _ =
-                write!(report, "Step {}: {} [t={}]", entry.step_id, verdict_str, entry.timestamp);
+            let _ = write!(report, "Step {}: ", entry.step_id);
+            match &entry.result {
+                StepVerdict::Valid => report.push_str("VALID"),
+                StepVerdict::Invalid(reason) => {
+                    let _ = write!(report, "INVALID: {reason}");
+                }
+                StepVerdict::Skipped => report.push_str("SKIPPED"),
+            }
+            let _ = write!(report, " [t={}]", entry.timestamp);
             if !entry.notes.is_empty() {
                 let _ = write!(report, " -- {}", entry.notes);
             }

@@ -32,17 +32,17 @@ impl<T: ?Sized, const VARIANT: u32, const FIELD: u32> fmt::Debug
             }
         }
         let (variant, field) = const {
-            use crate::mem::type_info::{Type, TypeKind};
+            use crate::mem::type_info::{self, Type, TypeKind};
+            let type_id = type_info::of::<T>();
             match Type::of::<T>().kind {
-                TypeKind::Struct(struct_) => {
-                    (None, Member::Name(struct_.fields[FIELD as usize].name))
+                TypeKind::Struct => (None, Member::Name(type_id.field(0, FIELD as usize).name())),
+                TypeKind::Tuple => (None, Member::Index(FIELD)),
+                TypeKind::Enum => {
+                    let variant_name = type_id.variant(VARIANT as usize).name();
+                    let field_name = type_id.field(VARIANT as usize, FIELD as usize).name();
+                    (Some(variant_name), Member::Name(field_name))
                 }
-                TypeKind::Tuple(_) => (None, Member::Index(FIELD)),
-                TypeKind::Enum(enum_) => {
-                    let variant = &enum_.variants[VARIANT as usize];
-                    (Some(variant.name), Member::Name(variant.fields[FIELD as usize].name))
-                }
-                TypeKind::Union(union) => (None, Member::Name(union.fields[FIELD as usize].name)),
+                TypeKind::Union => (None, Member::Name(type_id.field(0, FIELD as usize).name())),
                 _ => unreachable!(),
             }
         };
@@ -78,7 +78,7 @@ impl<T: ?Sized, const VARIANT: u32, const FIELD: u32> Default
     for FieldRepresentingType<T, VARIANT, FIELD>
 {
     fn default() -> Self {
-        Self { _phantom: PhantomData::default() }
+        Self { _phantom: PhantomData }
     }
 }
 
@@ -124,16 +124,17 @@ impl<T: ?Sized, const VARIANT: u32, const FIELD: u32> Ord
 /// The container type may be a tuple, `struct`, `union` or `enum`. In the case of an enum, the
 /// variant must also be specified. Only a single field is supported.
 #[unstable(feature = "field_projections", issue = "145383")]
-#[allow_internal_unstable(field_representing_type_raw, builtin_syntax)]
+#[allow_internal_unstable(field_representing_type_raw, internal_syntax)]
 #[diagnostic::on_unmatched_args(
     note = "this macro expects a container type and a field path, like `field_of!(Type, field)` or `field_of!(Enum, Variant.field)`"
 )]
+#[diagnostic::opaque]
 // NOTE: when stabilizing this macro, we can never add new trait impls for `FieldRepresentingType`,
 // since it is `#[fundamental]` and thus could break users of this macro, since the compiler expands
 // it to `FieldRepresentingType<...>`. Thus stabilizing this requires careful thought about the
 // completeness of the trait impls for `FieldRepresentingType`.
 pub macro field_of($Container:ty, $($fields:expr)+ $(,)?) {
-    builtin # field_of($Container, $($fields)+)
+    k#field_of($Container, $($fields)+)
 }
 
 /// Type representing a field of a `struct`, `union`, `enum` variant or tuple.

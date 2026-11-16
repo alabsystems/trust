@@ -217,8 +217,7 @@ fn unreachable_has_no_runtime_fallback_in_either_spelling() {
         detail: "assertion: panic call: std::rt::panic_fmt".into(),
     };
     assert!(
-        assert_sibling.has_runtime_fallback(true)
-            && assert_sibling.has_runtime_fallback(false),
+        assert_sibling.has_runtime_fallback(true) && assert_sibling.has_runtime_fallback(false),
         "the `assert` sibling of the same recovered family must still answer `true` — \
          otherwise the `false` assertions above are measuring a function that answers \
          `false` for everything"
@@ -801,12 +800,12 @@ fn pred_recurses_children_and_free_vars() {
 }
 
 #[test]
-fn pred_arena_roundtrips() {
+fn pred_dag_roundtrips() {
     let d = Formula::Var("d".into(), Sort::Int);
     let p = Formula::Pred(crate::Symbol::intern("single_component"), vec![d]);
-    let mut arena = crate::formula_arena::FormulaArena::new();
-    let r = arena.intern(&p);
-    assert_eq!(arena.to_formula(r), p);
+    let mut dag = trust_ir_contract::formula_dag::FormulaDag::new();
+    let r = dag.intern(&p);
+    assert_eq!(dag.expand(r), p);
 }
 
 #[test]

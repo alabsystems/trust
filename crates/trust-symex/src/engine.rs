@@ -298,7 +298,7 @@ impl SymbolicExecutor {
             Operand::Symbolic(_) => {
                 Err(unsupported("SMT Formula operands are not executable by trust-symex"))
             }
-            Operand::Unsupported { kind, detail } => {
+            Operand::Unsupported { kind, detail, .. } => {
                 Err(unsupported(format!("unsupported MIR operand in symex: {kind}: {detail}")))
             }
             other => Err(unsupported(format!("unhandled Operand variant: {other:?}"))),
@@ -739,6 +739,7 @@ mod tests {
                 span: span(),
                 atomic: None,
                 callee_identity: None,
+                callee_key: None,
             },
         };
 
@@ -1048,10 +1049,10 @@ mod tests {
             id: BlockId(0),
             stmts: vec![Statement::Assign {
                 place: Place::local(1),
-                rvalue: Rvalue::Use(Operand::Unsupported {
-                    kind: "FakeOperand".into(),
-                    detail: "test unsupported operand".into(),
-                }),
+                rvalue: Rvalue::Use(Operand::unsupported(
+                    "FakeOperand",
+                    "test unsupported operand",
+                )),
                 span: span(),
             }],
             terminator: Terminator::Return,

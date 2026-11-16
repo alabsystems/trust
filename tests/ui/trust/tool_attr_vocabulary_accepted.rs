@@ -1,7 +1,10 @@
+//@ revisions: aarch64 other
 //@ needs-trust-verify
 //@ check-pass
 //@ compile-flags: -Ztrust-verify=on -Ztrust-policy=advisory --crate-type=lib
 //@ dont-check-compiler-stderr
+//@[aarch64] only-aarch64
+//@[other] ignore-aarch64
 
 //! **Every `trust::` attribute the compiler consumes must survive the sweep, and
 //! must do so WITHOUT `#![register_tool(trust)]`.**
@@ -59,8 +62,28 @@ pub struct MustConsume(pub u32);
 #[trust::single_writer]
 pub struct SingleWriter(pub u32);
 
+// Trust (2026-09-17): `#[trust::verified_codegen]` reports a NARROWER capability off
+// AArch64, so this file is split by ARCH rather than by target triple.
+// `decode_emitted_object_env` refuses any `emitted_arch != AArch64` — an A64 decoder
+// handed a foreign ISA can mis-read an encoding as a plausible A64 word, so the gate
+// declines instead of guessing — and the refusal surfaces here as an extra advisory
+// WARN. It is the compiler being right: the claim "these BYTES compute the IR
+// semantics" is simply not available on a machine whose ISA the gate cannot name.
+//
+// The pinned substring stops before the interpolated `emitted {arch:?}` word, so the
+// `other` revision covers EVERY non-AArch64 target and not just x86_64 — which is why
+// the split is `only-aarch64` / `ignore-aarch64` rather than two named triples. A
+// third architecture therefore keeps this file running instead of silently skipping it.
+//
+// The two caret-WARN annotations further down stay UNQUALIFIED deliberately: they fire
+// on both revisions (measured on both targets), and in compiletest an unqualified
+// annotation applies to every revision, so qualifying them would only invite them to
+// drift apart. (Spelled out rather than quoted: compiletest scans comment text too, so
+// writing the caret form inside prose mints a real expectation — which is exactly what
+// it did on the first draft of this note.)
 #[trust::verified_codegen]
 pub fn verified_codegen(x: u32) -> u32 {
+    //[other]~^ WARN byte-level output preservation is wired for AArch64 machine semantics only
     x
 }
 

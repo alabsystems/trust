@@ -280,6 +280,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }

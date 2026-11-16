@@ -1,0 +1,14 @@
+# Identities for the SYNTHETIC synthetic.trust_ir.
+body command_shape pub
+body ir_unsupported pub
+body resolver_contradiction pub
+# A resolver bug: a foreign item whose link name is a std path.
+foreign weird::pair std::os::unix::net::UnixStream::pair
+effects command_shape 3:4=std::process::Command::frobnicate 3:20=fork
+effects ir_unsupported 4:20=fork
+effects resolver_contradiction 5:4=std::os::unix::net::UnixStream::pair 5:20=fork
+spawners
+product-census
+drops command_shape
+drops ir_unsupported
+drops resolver_contradiction

@@ -1,0 +1,21 @@
+[package]
+name = "trust-proof-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Owning fresh verification sessions and bounded untrusted mathematical hints"
+
+[dependencies]
+getrandom = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = "3"
+trust-file-lock = { path = "../trust-file-lock" }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["fs", "user"] }
+
+[lints]
+workspace = true

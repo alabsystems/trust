@@ -1,0 +1,47 @@
+{
+  "id": "union-sibling-write",
+  "class": "UNION-SIBLING-WRITE-1",
+  "title": "a fact about one union field survived a write of its sibling; the overflow row was kernel-certified and the binary printed 71",
+  "origin": [
+    "DQ VC-NARROW-CAST-FALSE-REFUTE-1 (CORRECTED 2026-10-12), UNION-SIBLING-WRITE-1",
+    "crates/trust-vcgen/tests/narrowing_cast_identity_realmir.rs::a_union_sibling_write_liar_is_never_proved",
+    "crates/trust-vcgen/tests/fixtures/narrowing_cast_identity/narrow_union_liars.rs"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "u_dst_add",
+    "obligation": {
+      "kind": "overflow",
+      "at": "+ 0x7f"
+    }
+  },
+  "twin": {
+    "function": "u_dst_add_ctl",
+    "obligation": {
+      "kind": "overflow",
+      "at": "y + 0x7f"
+    }
+  },
+  "witness": {
+    "input": "x = 0",
+    "observed": "attempt to add with overflow",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  },
+  "opt_levels": [
+    "0",
+    "1"
+  ],
+  "expected_refusal": {
+    "trust-vc-syn": {
+      "reproducer": "and TrustVc does not model Rust unions",
+      "twin": "and TrustVc does not model Rust unions"
+    }
+  }
+}

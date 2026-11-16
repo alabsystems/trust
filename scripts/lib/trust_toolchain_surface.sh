@@ -26,7 +26,9 @@ TRUST_TOOLCHAIN_FORBIDDEN_PUBLIC_BINS='cargo-trust tcargo tcargo-trust tcargo-fm
 TRUST_TOOLCHAIN_FORBIDDEN_PUBLIC_LIBEXEC_BINS='rust-analyzer-proc-macro-srv'
 
 trust_toolchain_resolve_path() {
-    "${TRUST_TOOLCHAIN_PYTHON3:-python3}" - "$1" <<'PY'
+    # The path contract needs only the standard library. Ambient site hooks
+    # and PYTHONPATH must not run before checking the selected tool root.
+    "${TRUST_TOOLCHAIN_PYTHON3:-python3}" -I -S - "$1" <<'PY'
 import pathlib
 import sys
 
@@ -176,4 +178,95 @@ trust_toolchain_forbidden_entry_error() (
 
 trust_toolchain_forbidden_entries_absent() {
     ! trust_toolchain_forbidden_entry_error "$@" >/dev/null
+}
+
+# Trust tools that descend from a stock Rust program with the same job, and so
+# could be confused with it: a stock build under the Trust name (a stale
+# tools-directory artifact that bootstrap restored, a hand copy) is a regular,
+# runnable executable that answers `--version`, so existence-and-runs cannot tell
+# the two apart. Each Trust build names itself in its `--version` output, where
+# the stock program names itself (measured on seal trust-7d5533b2, 2026-09-30):
+#
+#   trustc          rustc 1.99.0-dev (7d5533b2b 2026-09-23) (trustc 0.1.0)
+#   trustdoc        rustc 1.99.0-dev (7d5533b2b 2026-09-23) (trustdoc 0.1.0)
+#   targo           targo 1.99.0-dev (7d5533b2b 2026-09-23) (targo 0.1.0)
+#   trustfmt        trustfmt 1.9.0-trust (7d5533b2bb 2026-09-23)
+#   targo-fmt       trustfmt 1.9.0-trust (7d5533b2bb 2026-09-23)
+#   tippy           tippy 0.1.0 (7d5533b2bb 2026-09-23)
+#   targo-tippy     tippy 0.1.0 (7d5533b2bb 2026-09-23)
+#   tippy-driver    tippy 0.1.98 (7d5533b2bb 2026-09-23)
+#   trust-analyzer  trust-analyzer 1.99.0-dev (7d5533b2bb 2026-09-23)
+#
+# and, from source (neither is built by default): `trust-miri <version>`
+# (src/tools/miri/src/bin/miri.rs) and `targo-miri <version> (...)`
+# (src/tools/miri/cargo-miri/src/phases.rs). The stock programs print `rustc
+# <version> (...)` with no Trust parenthetical, `rustdoc`, `cargo`, `rustfmt`,
+# `clippy`, `rust-analyzer` and `miri`. The three compatibility aliases (rustc,
+# cargo, rustdoc) are not listed: each is held byte-identical to its canonical
+# tool here, which is. First-party tools with no stock ancestor (ay, ty, clean,
+# targo-trust, trustd, trustup) are not listed either.
+#
+# The banner is self-reported. This check refuses a stock program that reports
+# its own identity under a Trust name (a stale or copied artifact, unmodified).
+# It does not refuse a wrapper that runs a stock program and rewrites its first
+# line. The local genesis stage0 adapter (scripts/create_local_genesis_stage0.py)
+# is such a wrapper, and its trustfmt, tippy, targo-tippy, tippy-driver,
+# trust-analyzer and targo pass this check (docs/trust-naming.md, "What The
+# Banner Check Does Not Establish").
+TRUST_TOOLCHAIN_BRANDED_PUBLIC_BINS='trustc trustdoc targo trustfmt targo-fmt tippy targo-tippy tippy-driver trust-analyzer trust-miri targo-miri'
+
+# Print an error and return success when VERSION_OUTPUT, the STANDARD OUTPUT of
+# `NAME --version` for the public tool NAME, does not identify the Trust build of
+# NAME. Return failure when it does. NAME must be one of
+# TRUST_TOOLCHAIN_BRANDED_PUBLIC_BINS; any other name is an error, never a pass.
+# Only the first line counts: that is the version line, and a later line must
+# not be able to vouch for it. Callers pass stdout alone, never stdout merged
+# with stderr: every banner above is printed on stdout, and Cargo prints its
+# configuration warnings (an unused .cargo/config.toml key, a CARGO_HOME with
+# both `config` and `config.toml`) on stderr BEFORE its banner, so a merged
+# first line refuses the genuine targo.
+trust_toolchain_identity_error() (
+    name="$1"
+    version_output="$2"
+    first_line="$(printf '%s\n' "$version_output" | sed -n '1p')"
+
+    case "$name" in
+        trustc|trustdoc)
+            # rustc-derived banners keep the leading `rustc` token (build
+            # scripts across the ecosystem sniff it) and carry the Trust
+            # identity in a trailing parenthetical: `(trustc)` without
+            # CFG_TRUST_VERSION, `(trustc <version>)` with it
+            # (compiler/rustc_driver_impl/src/lib.rs). Accept exactly those two
+            # shapes and nothing looser. Matching only the literal `(trustc)`
+            # once refused every real toolchain built after CFG_TRUST_VERSION
+            # was threaded through bootstrap (a81c07e1d6; measured 2026-08-22:
+            # `rustc 1.99.0-dev (52e0a7031 2026-08-22) (trustc 0.1.0)`), while
+            # recorded banners from before it carry the bare shape. A stock
+            # rustc prints no parenthetical and fails either way.
+            case "$first_line" in
+                *"($name)"*|*"($name "*) return 1 ;;
+            esac
+            printf '%s --version does not carry the Trust brand "(%s)" or "(%s <version>)": %s\n' \
+                "$name" "$name" "$name" "$first_line"
+            return 0
+            ;;
+        targo|trustfmt|tippy|trust-analyzer|trust-miri|targo-miri) brand="$name" ;;
+        targo-fmt) brand=trustfmt ;;
+        targo-tippy|tippy-driver) brand=tippy ;;
+        *)
+            printf 'no Trust version brand is defined for %s\n' "$name"
+            return 0
+            ;;
+    esac
+
+    case "$first_line" in
+        "$brand "*) return 1 ;;
+    esac
+    printf '%s --version does not identify the Trust build (expected a first stdout line beginning "%s "): %s\n' \
+        "$name" "$brand" "$first_line"
+    return 0
+)
+
+trust_toolchain_identity_valid() {
+    ! trust_toolchain_identity_error "$@" >/dev/null
 }

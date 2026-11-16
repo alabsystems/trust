@@ -111,8 +111,10 @@ pub fn read(dir: &Path, stem: &str) -> Option<BTreeMap<String, Vec<u8>>> {
     unpack(&bytes)
 }
 
-/// Write the packed store for a crate stem into `dir`.
+/// Write the packed store for a crate stem, including an empty explicit
+/// measurement. The caller's AUTO policy decides when to skip writing.
 pub fn write(dir: &Path, stem: &str, entries: &BTreeMap<String, Vec<u8>>) -> std::io::Result<()> {
+    let path = dir.join(format!("{stem}.twit"));
     std::fs::create_dir_all(dir)?;
     let bytes = pack(entries).ok_or_else(|| {
         std::io::Error::new(
@@ -120,7 +122,7 @@ pub fn write(dir: &Path, stem: &str, entries: &BTreeMap<String, Vec<u8>>) -> std
             "trust-witness store exceeds its on-disk length fields",
         )
     })?;
-    std::fs::write(dir.join(format!("{stem}.twit")), bytes)
+    std::fs::write(path, bytes)
 }
 
 #[cfg(test)]
@@ -132,6 +134,64 @@ mod tests {
             ("k1".to_string(), vec![1u8, 2, 3, 4]),
             ("k2".to_string(), vec![9u8, 8, 7]),
         ])
+    }
+
+    fn test_store_dir() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("trust-witness-store-{}-{nanos}-{sequence}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn empty_store_writes_and_round_trips_the_explicit_measurement() {
+        let root = test_store_dir();
+        let absent = root.join("absent");
+        write(&absent, "own", &BTreeMap::new()).unwrap();
+        let bytes = std::fs::read(absent.join("own.twit")).unwrap();
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(&bytes[..8], b"TWSTORE2");
+        assert_eq!(&bytes[8..], &[0; 4]);
+        assert_eq!(read(&absent, "own"), Some(BTreeMap::new()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_store_replaces_only_its_previous_measurement() {
+        let dir = test_store_dir();
+        let entries = sample();
+        write(&dir, "own", &entries).unwrap();
+        write(&dir, "other", &entries).unwrap();
+        let expected_bytes = pack(&entries).unwrap();
+        assert_eq!(std::fs::read(dir.join("own.twit")).unwrap(), expected_bytes);
+        assert_eq!(read(&dir, "own"), Some(entries.clone()));
+
+        let empty = BTreeMap::new();
+        write(&dir, "own", &empty).unwrap();
+        let empty_bytes = std::fs::read(dir.join("own.twit")).unwrap();
+        assert_eq!(empty_bytes.len(), 12);
+        assert_eq!(read(&dir, "own"), Some(empty.clone()));
+        assert_eq!(std::fs::read(dir.join("other.twit")).unwrap(), expected_bytes);
+        assert_eq!(read(&dir, "other"), Some(entries));
+        // Repeating an explicit empty measurement preserves the same packed bytes.
+        write(&dir, "own", &empty).unwrap();
+        assert_eq!(std::fs::read(dir.join("own.twit")).unwrap(), empty_bytes);
+        assert_eq!(read(&dir, "own"), Some(empty));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn empty_store_propagates_write_errors_without_removing_directories() {
+        let dir = test_store_dir();
+        let obstruction = dir.join("own.twit");
+        std::fs::create_dir(&obstruction).unwrap();
+        assert!(write(&dir, "own", &BTreeMap::new()).is_err());
+        assert!(obstruction.is_dir());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

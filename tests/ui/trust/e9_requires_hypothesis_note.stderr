@@ -1,0 +1,67 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (rmax_le_left)
+  --> $DIR/e9_requires_hypothesis_note.rs:49:5
+   |
+LL | /     theorem rmax_le_left : forall (a : UInt64) (b : UInt64),
+LL | |         Nat.le (UInt64.toNat b) (UInt64.toNat a) ->
+LL | |         Nat.le (UInt64.toNat (if a < b then b else a)) (UInt64.toNat a) :=
+LL | |         fun a b h => Decidable.casesOn
+...  |
+LL | |             (fun _ => Nat.le.refl (UInt64.toNat a))
+LL | |             (fun _ => h)
+   | |________________________^
+
+
+=== Trust Verification Report (e9_requires_hypothesis_note) ===
+
+note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked, 1 assumed (requires) out of 4 obligation(s)
+  --> $DIR/e9_requires_hypothesis_note.rs:61:1
+   |
+LL | / pub fn rmax(a: u64, b: u64) -> u64
+LL | |     requires b <= a
+LL | |     ensures result <= a by rmax_le_left
+...  |
+LL | |     if a < b { b } else { a }
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+   = note: [unknown] conditional definition-entry assumption; every caller must establish the requires contract
+
+note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked, 1 assumed (requires) out of 4 obligation(s)
+  --> $DIR/e9_requires_hypothesis_note.rs:85:1
+   |
+LL | / pub fn rmax_usize(a: usize, b: usize) -> usize
+LL | |     requires b <= a
+LL | |     ensures result <= a by rmax_le_left
+...  |
+LL | |     if a < b { b } else { a }
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+   = note: [unknown] conditional definition-entry assumption; every caller must establish the requires contract
+
+note: citation `rmax_le_left` kernel-discharges this postcondition UNDER this function's `requires`, but not unconditionally (requires-link: kernel-canonical)
+  --> $DIR/e9_requires_hypothesis_note.rs:63:28
+   |
+LL |     ensures result <= a by rmax_le_left
+   |                            ^^^^^^^^^^^^
+   |
+   = note: the cited theorem proves the clause with `result` bound to the imported definition of `rmax` and these preconditions assumed: h0 = `b <= a` (`requires` #0)
+   = note: it therefore says NOTHING about an input that violates them; a caller assumes this `ensures` only as `requires → ensures` at a statically resolved call, so it obtains the postcondition only where it establishes these preconditions there
+   = note: requires-link: kernel-canonical — each hypothesis the theorem consumes was judged by the kernel against the LIFTED reading (`x as nat` / `x as int`) of the precondition callers are charged; that reading is built by the compiler through the nat-lift table
+   = note: this conditional discharge is creditable to the postcondition obligation at `Trusted`, never `Certified` (owner ruling OR-A1, 2026-09-27): a row already proved by another lane keeps that proof, and a row the discharge lane does credit carries the requires-link marker, ships no kernel proof evidence, and is withheld by the authenticated `targo trust` lane; the per-function report names the rows that were credited, if any
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows, and never over a row another lane already proved
+
+note: citation `rmax_le_left` kernel-discharges this postcondition UNDER this function's `requires`, but not unconditionally (requires-link: kernel-canonical)
+  --> $DIR/e9_requires_hypothesis_note.rs:87:28
+   |
+LL |     ensures result <= a by rmax_le_left
+   |                            ^^^^^^^^^^^^
+   |
+   = note: the cited theorem proves the clause with `result` bound to the imported definition of `rmax_usize` and these preconditions assumed: h0 = `b <= a` (`requires` #0)
+   = note: it therefore says NOTHING about an input that violates them; a caller assumes this `ensures` only as `requires → ensures` at a statically resolved call, so it obtains the postcondition only where it establishes these preconditions there
+   = note: requires-link: kernel-canonical — each hypothesis the theorem consumes was judged by the kernel against the LIFTED reading (`x as nat` / `x as int`) of the precondition callers are charged; that reading is built by the compiler through the nat-lift table
+   = note: this conditional discharge is creditable to the postcondition obligation at `Trusted`, never `Certified` (owner ruling OR-A1, 2026-09-27): a row already proved by another lane keeps that proof, and a row the discharge lane does credit carries the requires-link marker, ships no kernel proof evidence, and is withheld by the authenticated `targo trust` lane; the per-function report names the rows that were credited, if any
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows, and never over a row another lane already proved
+

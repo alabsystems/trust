@@ -19,9 +19,17 @@
 #
 # So this reproduces that resolution path end to end, on a throwaway crate:
 #
-#   1. RESOLUTION. From a crate pinned to the channel, `rustc --print sysroot`
-#      (through the rustup shim — the only thing that reads rust-toolchain.toml)
-#      must name the same sysroot as `rustup run <name>`.
+#   1. RESOLUTION. The Trust frontend on PATH (`trustc`, which is what aterm
+#      and the migrated gates run) and `rustup run <name>` (what a channel pin
+#      and the publish gate's `rustup run trust targo` resolve) must be ONE
+#      Trust build: the same sysroot, or byte-identical `trustc` and
+#      `librustc_driver`. Every `rustc` on PATH that is not aterm's reroute
+#      stub (identified positively, never by "printed nothing") must resolve
+#      the pin to that build too; a shim that cannot resolve it FAILS. With
+#      only the stub, nothing reads the pin, and the closing line says the pin
+#      was not checked. (Until 2026-09-28 this step asked only the shim,
+#      `rustc --print sysroot`, which the reroute stub fails on every aterm
+#      machine although every gate resolved Trust.)
 #   2. THE REFUSAL PREDICATE. rust_frontend.sh refuses when
 #      `$sysroot/bin/<channel>c` is absent. Assert it is present, in that exact
 #      form, so this proof and that refusal cannot drift apart.
@@ -76,37 +84,38 @@ ok()   { printf '  PROVED   %s\n' "$*"; }
 # override works, not that the PIN resolves — the whole point of step 1.
 unset RUSTUP_TOOLCHAIN || true
 
-# NO SELF-HEALING OF PATH. The gates in clean, trust-vc and aterm run with the
-# PATH the machine actually has. If the rustup shim is not on it, nothing reads
-# rust-toolchain.toml, `rustc` is whatever binary is ahead, and those gates
-# refuse (or worse, run a different lint set under the same name) — which is the
-# precise machine state this install path exists to cure.
+# NO SELF-HEALING OF PATH. The gates run with the PATH the machine actually
+# has, so this proof does too: it never adds a directory to find a tool. It
+# used to repair PATH from $HOME/.cargo/bin, print one stderr NOTE and go on to
+# PROOF COMPLETE — a proof about a shell it had just constructed. A rustup that
+# is installed but unreachable is a failure, and the fix is the user's to make.
 #
-# This script used to repair PATH from $HOME/.cargo/bin, print one stderr NOTE,
-# and then go on to print PROOF COMPLETE: a proof about a shell it had just
-# constructed, on a machine where every pinned repository would still refuse.
-# The NOTE was the only marker, and a NOTE under a green PROOF COMPLETE is read
-# by nobody. So the repair is gone and this is a failure. Repairing PATH here
-# could only ever prove that a shell WITH the shim works, which was never in
-# doubt; the proposition under test is that THIS environment resolves the pin.
+# The durable line goes in ~/.zprofile (main's 0a345d9cc8): macOS's
+# /etc/zprofile runs path_helper after ~/.zshenv and re-sorts /etc/paths.d
+# ahead of what was added there, and ~/.zshrc is where aterm's reroute block
+# lives. The line APPENDS, so wherever it runs it cannot get ahead of
+# targo/trustc or the reroute stubs.
 if ! command -v rustup >/dev/null 2>&1; then
     if [ -x "$HOME/.cargo/bin/rustup" ]; then
         fail "rustup is installed at $HOME/.cargo/bin/rustup, but $HOME/.cargo/bin is not
-  on the PATH this proof inherited. That is not a detail this script may paper
-  over: it is exactly the machine state in which channel = \"$TOOLCHAIN_NAME\"
-  fails to resolve, so the gates in clean, trust-vc and aterm would still refuse
-  no matter how good the linked toolchain is.
+  on the PATH this proof inherited, so \`rustup run $TOOLCHAIN_NAME\` and every
+  channel = \"$TOOLCHAIN_NAME\" pin read through a rustup shim fail to resolve here.
 
-  Fix the environment, not the proof:
+  Fix the environment, not the proof — APPEND it, so the Trust frontend
+  (targo/trustc) and aterm's reroute stubs stay ahead of rustup's cargo/rustc:
 
-      export PATH=\"\$HOME/.cargo/bin:\$PATH\"                        # this shell
-      echo 'export PATH=\"\$HOME/.cargo/bin:\$PATH\"' >> ~/.zshrc     # every future shell
+      export PATH=\"\$PATH:\$HOME/.cargo/bin\"                          # this shell
+      echo 'export PATH=\"\$PATH:\$HOME/.cargo/bin\"' >> ~/.zprofile    # every future login shell
 
-  then re-run this script. It will then be proving something about the PATH the
-  pinned repositories will actually get."
+  then re-run this script."
     fi
-    echo "prove: rustup not found — a pinned channel cannot resolve without it" >&2
+    echo "prove: rustup not found — \`rustup run $TOOLCHAIN_NAME\` and every channel pin need it" >&2
     exit 2
+fi
+if ! command -v trustc >/dev/null 2>&1; then
+    fail "no \`trustc\` on PATH. The migrated gates run the Trust frontend by name
+  (targo/trustc on PATH, as aterm provides them); install or repair the Trust
+  toolchain (aterm pkg doctor)."
 fi
 
 if ! rustup toolchain list 2>/dev/null | cut -d' ' -f1 | grep -qx "$TOOLCHAIN_NAME"; then
@@ -154,27 +163,110 @@ write_clean_source
 
 printf 'prove: channel "%s", throwaway crate %s\n' "$TOOLCHAIN_NAME" "$CRATE"
 
-# --- 1. the pin resolves -----------------------------------------------------
-PINNED_SYSROOT=$( (cd "$CRATE" && rustc --print sysroot) 2>/dev/null || true)
-[ -n "$PINNED_SYSROOT" ] || fail "\`rustc --print sysroot\` from a crate pinned to
-  channel = \"$TOOLCHAIN_NAME\" produced nothing. The rustup shim is not resolving
-  the pin — check that $HOME/.cargo/bin precedes any other rustc on PATH."
-NAMED_SYSROOT=$(rustup run "$TOOLCHAIN_NAME" rustc --print sysroot 2>/dev/null || true)
-[ -n "$NAMED_SYSROOT" ] || fail "\`rustup run $TOOLCHAIN_NAME rustc --print sysroot\` failed"
-
+# --- 1. the frontend, the named toolchain and the pin are one Trust build ----
 canonical() { python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || printf '%s\n' "$1"; }
-PINNED_REAL=$(canonical "$PINNED_SYSROOT")
-NAMED_REAL=$(canonical "$NAMED_SYSROOT")
-if [ "$PINNED_REAL" != "$NAMED_REAL" ]; then
-    fail "the pin resolves to a DIFFERENT toolchain than '$TOOLCHAIN_NAME':
-    rust-toolchain.toml -> $PINNED_REAL
-    rustup run $TOOLCHAIN_NAME -> $NAMED_REAL
-  Some other rustc is ahead of the rustup shim on PATH. This is the exact state
-  in which a gate runs a different lint set under the same name."
-fi
-ok "channel = \"$TOOLCHAIN_NAME\" resolves to $PINNED_REAL"
+digest() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
+# The build identity of a sysroot: its trustc bytes and its compiler-driver bytes.
+# Two directories with the same identity serve the same compiler (aterm keeps the
+# PATH store and the rustup link as separate byte-identical copies).
+build_identity() {
+    printf 'trustc=%s' "$(digest "$1/bin/trustc")"
+    for driver in "$1"/lib/librustc_driver-*; do
+        [ -f "$driver" ] && printf ' driver=%s' "$(digest "$driver")"
+    done
+    printf '\n'
+}
+same_build() {
+    [ "$(canonical "$1")" = "$(canonical "$2")" ] && return 0
+    [ -x "$1/bin/trustc" ] && [ -x "$2/bin/trustc" ] || return 1
+    [ "$(build_identity "$1")" = "$(build_identity "$2")" ]
+}
 
-BIN="$PINNED_REAL/bin"
+FRONTEND_SYSROOT=$( (cd "$CRATE" && trustc --print sysroot) 2>/dev/null || true)
+[ -n "$FRONTEND_SYSROOT" ] || fail "\`trustc --print sysroot\` (PATH frontend) produced nothing."
+NAMED_SYSROOT=$(rustup run "$TOOLCHAIN_NAME" trustc --print sysroot 2>/dev/null || true)
+[ -n "$NAMED_SYSROOT" ] || fail "\`rustup run $TOOLCHAIN_NAME trustc --print sysroot\` failed"
+FRONTEND_REAL=$(canonical "$FRONTEND_SYSROOT")
+NAMED_REAL=$(canonical "$NAMED_SYSROOT")
+if ! same_build "$FRONTEND_REAL" "$NAMED_REAL"; then
+    fail "the PATH Trust frontend and rustup's '$TOOLCHAIN_NAME' are DIFFERENT builds:
+    trustc on PATH             -> $FRONTEND_REAL ($(build_identity "$FRONTEND_REAL"))
+    rustup run $TOOLCHAIN_NAME -> $NAMED_REAL ($(build_identity "$NAMED_REAL"))
+  A gate run by name and a gate run through the pin would then use different
+  compilers under the same name. Re-link one to the other (aterm pkg doctor)."
+fi
+ok "trustc on PATH and \`rustup run $TOOLCHAIN_NAME\` are one build ($FRONTEND_REAL)"
+
+# The pin, read through `rustc` — the name a rustup shim answers to. Exactly one
+# `rustc` may be skipped: aterm's reroute stub, identified POSITIVELY (its
+# directory carries `.atpkg-reroute-dir`, and its second line is the stub
+# banner). It never reads a pin; in passthrough mode (`aterm --no-reroute`) it
+# execs the first non-stub `rustc` behind it, so that one is the reader proved
+# here. Any other `rustc` must resolve the pin to the build proved above: a shim
+# that prints no sysroot — e.g. a stale link, "'rustc' is not installed for the
+# custom toolchain 'trust'" — is a FAILURE, never "no shim on PATH".
+is_reroute_stub() {
+    [ -f "$(dirname "$1")/.atpkg-reroute-dir" ] && return 0
+    [ -f "$1" ] && [ -r "$1" ] && [ "$(sed -n 2p "$1" 2>/dev/null)" = '# atpkg reroute stub v1' ]
+}
+# The first `rustc` on PATH that is not a reroute stub, skipping every reroute
+# directory the way the stub's own passthrough loop does.
+first_non_stub_rustc() {
+    _ifs=$IFS
+    IFS=:
+    set -f
+    for _d in $PATH; do
+        case $_d in /*) ;; *) continue ;; esac
+        [ -f "$_d/.atpkg-reroute-dir" ] && continue
+        if [ -x "$_d/rustc" ] && [ ! -d "$_d/rustc" ] && ! is_reroute_stub "$_d/rustc"; then
+            IFS=$_ifs
+            set +f
+            printf '%s\n' "$_d/rustc"
+            return 0
+        fi
+    done
+    IFS=$_ifs
+    set +f
+    return 1
+}
+
+PIN_READER=$(first_non_stub_rustc || true)
+PATH_RUSTC=$(command -v rustc 2>/dev/null || true)
+PIN_NOTE=
+if [ -n "$PIN_READER" ]; then
+    PINNED_SYSROOT=$( (cd "$CRATE" && "$PIN_READER" --print sysroot) 2>/dev/null || true)
+    if [ -z "$PINNED_SYSROOT" ]; then
+        fail "\`$PIN_READER --print sysroot\`, run in a crate pinned to channel = \"$TOOLCHAIN_NAME\",
+  produced no sysroot. That \`rustc\` is not aterm's reroute stub, so it is the
+  thing that reads the pin on this PATH, and it cannot resolve it. A rustup shim
+  with a stale link fails exactly this way (\"'rustc' is not installed for the
+  custom toolchain '$TOOLCHAIN_NAME'\"): run \`aterm pkg doctor\`, then \`aterm pkg repair\`."
+    fi
+    PINNED_REAL=$(canonical "$PINNED_SYSROOT")
+    if ! same_build "$PINNED_REAL" "$FRONTEND_REAL"; then
+        fail "the pin resolves to a DIFFERENT toolchain than the Trust frontend:
+    rust-toolchain.toml (via $PIN_READER) -> $PINNED_REAL
+    trustc on PATH -> $FRONTEND_REAL
+  Some other rustc is ahead of the rustup shim on PATH. This is the exact state
+  in which a gate runs a different lint set under the same name.
+
+  Fix the environment, not the proof: uninstall that rustc if nothing needs it,
+  or put $HOME/.cargo/bin ahead of its directory in your login profile, but
+  behind targo/trustc and aterm's reroute stubs."
+    fi
+    ok "channel = \"$TOOLCHAIN_NAME\" read by $PIN_READER resolves to the same build"
+elif [ -z "$PATH_RUSTC" ]; then
+    PIN_NOTE="no \`rustc\` is on PATH at all"
+    ok "no pin reader on PATH: $PIN_NOTE; gates run the PATH frontend"
+elif is_reroute_stub "$PATH_RUSTC"; then
+    PIN_NOTE="the only \`rustc\` on PATH is aterm's reroute stub ($PATH_RUSTC), which reads no pin"
+    ok "no pin reader on PATH: $PIN_NOTE; gates run the PATH frontend"
+else
+    fail "\`rustc\` on PATH is $PATH_RUSTC, reached through a relative PATH entry:
+  it is not aterm's reroute stub, and this proof does not judge a relative PATH."
+fi
+
+BIN="$FRONTEND_REAL/bin"
 
 # --- 2. the consumer's refusal predicate, in its own form --------------------
 if [ ! -x "$BIN/${TOOLCHAIN_NAME}c" ] && [ ! -x "$BIN/$TOOLCHAIN_NAME" ]; then
@@ -249,7 +341,12 @@ grep -q 'unused' "$lint_out" || {
 ok "lint gate REJECTS a warning under -D warnings"
 write_clean_source
 
-printf '\nPROOF COMPLETE — channel "%s" resolves, and both gates the pinned repos\n' "$TOOLCHAIN_NAME"
+if [ -z "$PIN_NOTE" ]; then
+    printf '\nPROOF COMPLETE — channel "%s" resolves, and both gates the pinned repos\n' "$TOOLCHAIN_NAME"
+else
+    printf '\nPROOF COMPLETE — the PATH Trust frontend and `rustup run %s` are one build.\n' "$TOOLCHAIN_NAME"
+    printf 'The channel pin itself was NOT read: %s. Both gates the pinned repos\n' "$PIN_NOTE"
+fi
 printf 'run (format, lint under -D warnings) pass on clean source and fail on broken\n'
 printf 'source through %s.\n' "$BIN"
 exit 0

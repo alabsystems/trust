@@ -31,7 +31,7 @@
 //! ```
 //!
 //! We probably should replace most of the code here with bincode someday, but,
-//! as we don't have bincode in Cargo.toml yet, lets stick with serde_json for
+//! as we don't have bincode in Cargo.toml yet, let's stick with serde_json for
 //! the time being.
 
 #[cfg(feature = "in-rust-tree")]
@@ -43,6 +43,7 @@ use intern::Symbol;
 use rustc_hash::FxHashMap;
 use serde_derive::{Deserialize, Serialize};
 use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange};
+use tt::IdentKind;
 
 use crate::{
     legacy_protocol::SpanId,
@@ -54,7 +55,7 @@ pub type SpanDataIndexMap =
 
 pub fn serialize_span_data_index_map(map: &SpanDataIndexMap) -> Vec<u32> {
     map.iter()
-        .flat_map(|span| {
+        .map(|span| {
             [
                 span.anchor.file_id.as_u32(),
                 span.anchor.ast_id.into_raw(),
@@ -63,14 +64,16 @@ pub fn serialize_span_data_index_map(map: &SpanDataIndexMap) -> Vec<u32> {
                 span.ctx.into_u32(),
             ]
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .into_flattened()
 }
 
 pub fn deserialize_span_data_index_map(map: &[u32]) -> SpanDataIndexMap {
-    debug_assert!(map.len().is_multiple_of(5));
-    map.chunks_exact(5)
-        .map(|span| {
-            let &[file_id, ast_id, start, end, e] = span else { unreachable!() };
+    let (chunks, remainder) = map.as_chunks();
+    assert!(remainder.is_empty());
+    chunks
+        .iter()
+        .map(|&[file_id, ast_id, start, end, e]| {
             Span {
                 anchor: SpanAnchor {
                     file_id: EditionedFileId::from_raw(file_id),
@@ -345,14 +348,13 @@ impl FlatTree {
 }
 
 fn read_vec<T, F: Fn([u32; N]) -> T, const N: usize>(xs: Vec<u32>, f: F) -> Vec<T> {
-    let mut chunks = xs.chunks_exact(N);
-    let res = chunks.by_ref().map(|chunk| f(chunk.try_into().unwrap())).collect();
-    assert!(chunks.remainder().is_empty());
-    res
+    let (chunks, remainder) = xs.as_chunks();
+    assert!(remainder.is_empty());
+    chunks.iter().map(|chunk| f(*chunk)).collect()
 }
 
 fn write_vec<T, F: Fn(T) -> [u32; N], const N: usize>(xs: Vec<T>, f: F) -> Vec<u32> {
-    xs.into_iter().flat_map(f).collect()
+    xs.into_iter().map(f).collect::<Vec<_>>().into_flattened()
 }
 
 impl SubtreeRepr {
@@ -557,14 +559,19 @@ impl<'a, T: SpanTransformer<Span = span::Span>> Writer<'a, '_, T, tt::iter::TtIt
                     tt::Leaf::Ident(ident) => {
                         let idx = self.ident.len() as u32;
                         let id = self.token_id_of(ident.span);
+                        // FIXME(ChayimFriedman2): We don't handle forced keywords here yet, to be done after https://github.com/rust-lang/rust-analyzer/pull/23152.
                         let text = if self.version >= EXTENDED_LEAF_DATA {
                             self.intern_owned(ident.sym.as_str().to_owned())
-                        } else if ident.is_raw.yes() {
+                        } else if ident.kind == IdentKind::Raw {
                             self.intern_owned(format!("r#{}", ident.sym.as_str(),))
                         } else {
                             self.intern_owned(ident.sym.as_str().to_owned())
                         };
-                        self.ident.push(IdentRepr { id, text, is_raw: ident.is_raw.yes() });
+                        self.ident.push(IdentRepr {
+                            id,
+                            text,
+                            is_raw: ident.kind == IdentKind::Raw,
+                        });
                         (idx << 2) | 0b11
                     }
                 },
@@ -698,14 +705,17 @@ impl<'a, T: SpanTransformer>
                 proc_macro_srv::TokenTree::Ident(ident) => {
                     let idx = self.ident.len() as u32;
                     let id = self.token_id_of(ident.span);
+                    // NOTE(forced_keywords): Let's not bother to preserve forced keywords in this
+                    //                        legacy protocol.
+                    let is_raw = matches!(ident.kind, proc_macro_srv::IdentKind::Raw);
                     let text = if self.version >= EXTENDED_LEAF_DATA {
                         self.intern(ident.sym.as_str())
-                    } else if ident.is_raw {
+                    } else if is_raw {
                         self.intern_owned(format!("r#{}", ident.sym.as_str(),))
                     } else {
                         self.intern(ident.sym.as_str())
                     };
-                    self.ident.push(IdentRepr { id, text, is_raw: ident.is_raw });
+                    self.ident.push(IdentRepr { id, text, is_raw });
                     (idx << 2) | 0b11
                 }
             };
@@ -825,17 +835,21 @@ impl<T: SpanTransformer<Span = span::Span>> Reader<'_, T> {
                         let text = self.text[repr.text as usize].as_str();
                         let (is_raw, text) = if self.version >= EXTENDED_LEAF_DATA {
                             (
-                                if repr.is_raw { tt::IdentIsRaw::Yes } else { tt::IdentIsRaw::No },
+                                if repr.is_raw {
+                                    tt::IdentKind::Raw
+                                } else {
+                                    tt::IdentKind::Normal
+                                },
                                 text,
                             )
                         } else {
-                            tt::IdentIsRaw::split_from_symbol(text)
+                            tt::IdentKind::split_from_symbol(text)
                         };
                         s.push(
                             tt::Leaf::Ident(tt::Ident {
                                 sym: Symbol::intern(text),
                                 span: read_span(repr.id),
-                                is_raw,
+                                kind: is_raw,
                             })
                             .into(),
                         )
@@ -928,22 +942,28 @@ impl<T: SpanTransformer> Reader<'_, T> {
                         0b11 => {
                             let repr = &self.ident[idx];
                             let text = self.text[repr.text as usize].as_str();
-                            let (is_raw, text) = if self.version >= EXTENDED_LEAF_DATA {
+                            let (kind, text) = if self.version >= EXTENDED_LEAF_DATA {
                                 (
                                     if repr.is_raw {
-                                        tt::IdentIsRaw::Yes
+                                        tt::IdentKind::Raw
                                     } else {
-                                        tt::IdentIsRaw::No
+                                        tt::IdentKind::Normal
                                     },
                                     text,
                                 )
                             } else {
-                                tt::IdentIsRaw::split_from_symbol(text)
+                                tt::IdentKind::split_from_symbol(text)
                             };
                             proc_macro_srv::TokenTree::Ident(proc_macro_srv::Ident {
                                 sym: Symbol::intern(text),
                                 span: read_span(repr.id),
-                                is_raw: is_raw.yes(),
+                                kind: match kind {
+                                    tt::IdentKind::Raw => proc_macro_srv::IdentKind::Raw,
+                                    tt::IdentKind::Normal => proc_macro_srv::IdentKind::Normal,
+                                    tt::IdentKind::ForcedKeyword => {
+                                        proc_macro_srv::IdentKind::ForcedKeyword
+                                    }
+                                },
                             })
                         }
                         other => panic!("bad tag: {other}"),

@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -17,7 +17,8 @@ use trust_types::is_trust_vc_digest_bound_proof_certificate_artifact;
 use crate::config::DEFAULT_CODEGEN_BACKEND;
 use crate::input_limits::{MAX_CARGO_JSON_LINE_BYTES, read_bounded_utf8_line};
 use crate::pipeline::backend::{
-    canonical_rustc_option_name, find_forbidden_in_process_codegen_arg,
+    TRUST_TARGO_LANE_RUSTFLAGS_ENV, canonical_rustc_option_name, encode_lane_rustflags,
+    find_forbidden_in_process_codegen_arg,
 };
 use crate::pipeline::probe::native_runtime_environment;
 use crate::pipeline::transport::{
@@ -26,8 +27,11 @@ use crate::pipeline::transport::{
 };
 use crate::report::{
     is_replay_or_check_artifact, is_solver_transcript_artifact,
+    transport_obligation_has_publishable_clean_cic_proof,
     transport_obligation_has_publishable_native_proof,
 };
+
+mod retention;
 
 const SCHEMA: &str = "trust.self-verify-harness.report.v1";
 const SOLVER_SUITE_SCHEMA: &str = "trust.self-verify-harness.solver-suite.v1";
@@ -49,7 +53,13 @@ const UNIT_SEPARATOR: char = '\x1f';
 const MAX_RUN_ID_BYTES: usize = 128;
 const MAX_STAGE2_EXECUTABLE_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_IDENTITY_PROBE_STREAM_BYTES: usize = 64 * 1024;
-const IDENTITY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+// The stage2 tools these probes bind are files a build has just written, so
+// each probe's first exec waits behind macOS's machine-wide syspolicyd scan
+// (docs/KNOWN_HAZARDS.md EXEC-ASSESS-STALL-1). A plain 10 s here failed 21
+// verify_self_cli tests in land-gate run 20261024T190001 ("stage2 trustd version
+// identity probe exceeded the 10s timeout") on correct stand-ins; the release
+// identity probes' hang guard, and its measurements, apply unchanged.
+const IDENTITY_PROBE_TIMEOUT: Duration = crate::release_cli::TOOL_IDENTITY_PROBE_HANG_GUARD;
 #[cfg(unix)]
 const TRUSTD_READY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
@@ -138,6 +148,8 @@ Options:
   --max-obligation-rows N
   --max-cache-miss-obligations N
   --compare-report PATH
+      Revalidates saved report bytes and retained artifacts before tool probes.
+      Legacy reports disclose unavailable retention; saved reports remain observational.
   --stage-command <command...>
       Diagnostic custom stage command (not permitted with --full-verifier).
 
@@ -373,6 +385,8 @@ struct TransportSummary {
     stage2_execution_identity_bound: bool,
     source_provenance_bound: bool,
     authenticated_cargo_transport: bool,
+    artifact_stage_label: String,
+    retained_artifact_rows: Vec<retention::ArtifactRow>,
     completed_targets: Vec<String>,
     coverage_targets: Vec<String>,
     completed_target_identities: BTreeMap<String, Value>,
@@ -459,15 +473,24 @@ fn run_inner(args: &[String]) -> Result<u8, String> {
         }
     }
 
+    let comparison =
+        options.compare_report.as_deref().map(retention::inspect_saved_report).transpose()?;
     let plan = build_stage_plan(&options)?;
     let report_dir = create_private_report_directory(&report_dir)?;
-    let stages = if options.dry_run {
-        vec![planned_stage(&plan)]
+    let (stages, artifact_rows) = if options.dry_run {
+        (vec![planned_stage(&plan)], Vec::new())
     } else {
-        vec![run_stage(&plan, &options.repo_root, &report_dir)]
+        let executed = run_stage(&plan, &options.repo_root, &report_dir);
+        (vec![executed.report], executed.artifact_rows)
     };
     let status = report_status_from_stages(&stages);
     let mut report = build_report(&options, &report_dir, &plan, stages, &status);
+    if let Some(comparison) = comparison {
+        report["performance"]["comparison"]["retained_evidence"] = comparison;
+    }
+    let bundle =
+        retention::prepare_bundle(&report_dir, plan._proof_artifact_root.path(), artifact_rows)?;
+    report["evidence_retention"] = bundle.summary(&report)?;
     let effective_exit = exit_code(&report);
     report["exit"] = json!({
         "exit_code": effective_exit,
@@ -475,7 +498,7 @@ fn run_inner(args: &[String]) -> Result<u8, String> {
 
     validate_report_payload(&report)?;
     let report_path = report_dir.join(REPORT_NAME);
-    write_report(&report_path, &report)?;
+    bundle.publish(&report_path, &report)?;
     println!("self-verify-harness report: {}", report_path.display());
     println!(
         "self-verify-harness status: {} proof={}",
@@ -1178,45 +1201,94 @@ fn recheck_stage2_toolchain(
     Ok(())
 }
 
+/// The canonical `stage2/bin` directory that `build/host/stage2/bin` names.
+///
+/// Bootstrap never produces that chain as plain directories: `build/host` is
+/// always its alias for `build/<host triple>` (`src/bootstrap/src/lib.rs`), and
+/// under the Spotlight layout (docs/BUILD_AND_INSTALL.md, "Keeping Spotlight out
+/// of build/") `build` itself is a link to `build.noindex`. Refusing every link
+/// refused every real tree, so exactly those two aliases are admitted, each in
+/// its one sanctioned shape: `build` only as the link
+/// [`crate::stage2_tools::is_sanctioned_build_link`] accepts, and `host` only
+/// when it resolves to a plain directory that sits directly in that build
+/// directory. `stage2` and `bin` stay plain, and the result must be canonical,
+/// so the tool identities bound below name the real files.
 fn validate_plain_stage2_bin(canonical_root: &Path) -> Result<PathBuf, String> {
-    let mut path = canonical_root.to_path_buf();
-    for component in ["build", "host", "stage2", "bin"] {
+    let build_dir = if crate::stage2_tools::is_sanctioned_build_link(canonical_root) {
+        canonical_root.join(crate::stage2_tools::BUILD_NOINDEX)
+    } else {
+        canonical_root.join("build")
+    };
+    require_plain_stage2_directory(&build_dir)?;
+
+    let alias = build_dir.join("host");
+    let alias_metadata = fs::symlink_metadata(&alias).map_err(|error| {
+        format!(
+            "full self-verification requires plain stage2 directory `{}`: {error}",
+            alias.display()
+        )
+    })?;
+    let mut path = if alias_metadata.file_type().is_symlink() {
+        let host = alias.canonicalize().map_err(|error| {
+            format!("could not resolve bootstrap host alias `{}`: {error}", alias.display())
+        })?;
+        if host.parent() != Some(build_dir.as_path())
+            || host.file_name() == Some(std::ffi::OsStr::new("host"))
+        {
+            return Err(format!(
+                "full self-verification rejects symlinked stage2 directory `{}`: bootstrap's host alias must name a host directory directly inside `{}`, not `{}`",
+                alias.display(),
+                build_dir.display(),
+                host.display()
+            ));
+        }
+        host
+    } else {
+        alias
+    };
+    require_plain_stage2_directory(&path)?;
+    for component in ["stage2", "bin"] {
         path.push(component);
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            format!(
-                "full self-verification requires plain stage2 directory `{}`: {error}",
-                path.display()
-            )
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "full self-verification rejects symlinked stage2 directory `{}`",
-                path.display()
-            ));
-        }
-        if metadata_is_windows_reparse_point(&metadata) {
-            return Err(format!(
-                "full self-verification rejects reparse-point stage2 directory `{}`",
-                path.display()
-            ));
-        }
-        if !metadata.file_type().is_dir() {
-            return Err(format!(
-                "full self-verification requires stage2 directory `{}` to be a directory",
-                path.display()
-            ));
-        }
-        let canonical = path.canonicalize().map_err(|error| {
-            format!("could not canonicalize stage2 directory `{}`: {error}", path.display())
-        })?;
-        if canonical != path {
-            return Err(format!(
-                "stage2 directory resolves outside the exact repository path: `{}`",
-                canonical.display()
-            ));
-        }
+        require_plain_stage2_directory(&path)?;
     }
     Ok(path)
+}
+
+fn require_plain_stage2_directory(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "full self-verification requires plain stage2 directory `{}`: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "full self-verification rejects symlinked stage2 directory `{}`",
+            path.display()
+        ));
+    }
+    if metadata_is_windows_reparse_point(&metadata) {
+        return Err(format!(
+            "full self-verification rejects reparse-point stage2 directory `{}`",
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "full self-verification requires stage2 directory `{}` to be a directory",
+            path.display()
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|error| {
+        format!("could not canonicalize stage2 directory `{}`: {error}", path.display())
+    })?;
+    if canonical != path {
+        return Err(format!(
+            "stage2 directory resolves outside the exact repository path: `{}`",
+            canonical.display()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_stage2_executable(
@@ -1652,13 +1724,17 @@ fn unique_equals_version_field(output: &str, field: &str, tool: &str) -> Result<
 struct TrustdSmokeChild {
     child: std::process::Child,
     pid: u32,
+    _ownership: crate::process_lifecycle::Ownership,
 }
 
 #[cfg(unix)]
 impl Drop for TrustdSmokeChild {
     fn drop(&mut self) {
-        let _ = crate::bounded_process::terminate_process_group(self.pid);
-        let _ = self.child.kill();
+        // The private daemon runs until it is stopped; the smoke is done with it.
+        let _ = crate::process_lifecycle::stop_tree(
+            self.pid,
+            crate::process_lifecycle::StopCause::Released,
+        );
         let _ = self.child.wait();
     }
 }
@@ -1672,10 +1748,9 @@ fn live_stage2_trustd_protocol_smoke(
 
     // Each proof owns a fresh endpoint. Never adopt a pre-existing daemon:
     // even a byte-identical process would escape this invocation's lifecycle.
-    let socket_root = tempfile::Builder::new()
-        .prefix("trust-self-verify-trustd-")
-        .tempdir()
-        .map_err(|error| format!("could not create private trustd smoke directory: {error}"))?;
+    let socket_root =
+        crate::smoke_socket_root::create(crate::smoke_socket_root::Purpose::SelfVerify)
+            .map_err(|error| format!("could not create private trustd smoke directory: {error}"))?;
     fs::set_permissions(socket_root.path(), fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("could not make trustd smoke directory owner-private: {error}"))?;
     let metadata = fs::symlink_metadata(socket_root.path())
@@ -1702,15 +1777,15 @@ fn live_stage2_trustd_protocol_smoke(
     if let Some((variable, value)) = native_runtime_environment(&executable.canonical_path) {
         command.env(variable, value);
     }
-    crate::bounded_process::configure_process_group(&mut command);
-    let child = command.spawn().map_err(|error| {
-        format!(
-            "could not start exact stage2 trustd `{}` for the live protocol smoke: {error}",
-            executable.canonical_path.display()
-        )
-    })?;
+    let (child, ownership) =
+        crate::process_lifecycle::spawn_owned(&mut command).map_err(|error| {
+            format!(
+                "could not start exact stage2 trustd `{}` for the live protocol smoke: {error}",
+                executable.canonical_path.display()
+            )
+        })?;
     let pid = child.id();
-    let mut child = TrustdSmokeChild { child, pid };
+    let mut child = TrustdSmokeChild { child, pid, _ownership: ownership };
     let expected_identity = trust_router::coordinator::DaemonIdentity {
         version: trust_router::coordinator::IDENTITY_VERSION.to_string(),
         protocol: version.protocol.clone(),
@@ -2014,11 +2089,14 @@ fn verification_env(
         "TRUST_SELF_VERIFY_TRUSTC_SHA256",
         "TRUST_SELF_VERIFY_TRUSTDOC_SHA256",
         "TRUST_SELF_VERIFY_TRUSTD_SHA256",
-        "TRUST_TARGO_TEST_EXECUTE_FRESH_SESSION",
+        "TRUST_TARGO_PREPARED_TESTS_EXPORT",
+        "TRUST_TARGO_PREPARED_TESTS_SESSION",
+        "TRUST_TARGO_PREPARED_TEST_SESSION",
         "TRUST_TARGO_TEST_EXECUTION_MANIFEST",
         "TRUST_TARGO_TEST_EXECUTION_MANIFEST_SHA256",
         "TRUST_TARGO_TEST_MONITOR_AUTHORITY_SESSION",
         "TRUST_TARGO_TEST_MONITOR_SESSION",
+        TRUST_TARGO_LANE_RUSTFLAGS_ENV,
     ] {
         if env_map.remove(key).is_some() {
             removed_toolchain_overrides.insert(key.to_string());
@@ -2080,6 +2158,14 @@ fn verification_env(
     )?;
     let mut stripped = Map::new();
     let mut stripped_disable_flags = Map::new();
+    // T14a: the Targo route (`--full-verifier`, the stage2 `targo build`)
+    // hands Cargo the lane in TRUST_TARGO_LANE_RUSTFLAGS, and the stage2 Targo
+    // appends it to the flags the project resolves; the caller's rustflags
+    // variables keep only their non-verifier words, and one the caller did not
+    // set stays unset, since even an empty RUSTFLAGS would replace the
+    // project's configured tables. The bootstrap route keeps bootstrap's own
+    // RUSTFLAGS_* protocol, with the flags appended to every channel.
+    let targo_route = full_verifier;
     for key in [
         "RUSTFLAGS",
         "RUSTDOCFLAGS",
@@ -2089,6 +2175,11 @@ fn verification_env(
         "RUSTDOCFLAGS_NOT_BOOTSTRAP",
         "MAGIC_EXTRA_RUSTFLAGS",
     ] {
+        if targo_route && !env_map.contains_key(key) {
+            stripped.insert(key.to_string(), Value::Bool(false));
+            stripped_disable_flags.insert(key.to_string(), json!([]));
+            continue;
+        }
         let current = env_map.get(key).cloned().unwrap_or_default();
         let words = if matches!(key, "RUSTFLAGS" | "RUSTDOCFLAGS") {
             split_plain_rustflags(&current)
@@ -2099,7 +2190,7 @@ fn verification_env(
         };
         reject_uninspectable_inherited_flags(key, &words)?;
         let (kept, removed) = strip_inherited_verifier_words(words);
-        let merged = append_flag_words(kept, &flags);
+        let merged = if targo_route { kept } else { append_flag_words(kept, &flags) };
         env_map.insert(key.to_string(), merged.join(" "));
         stripped.insert(key.to_string(), Value::Bool(!removed.is_empty()));
         stripped_disable_flags.insert(key.to_string(), json!(removed));
@@ -2111,10 +2202,14 @@ fn verification_env(
         let words = split_encoded_rustflags(&current);
         reject_uninspectable_inherited_flags(key, &words)?;
         let (kept, removed) = strip_inherited_verifier_words(words);
-        let merged = append_flag_words(kept, &flags);
+        let merged = if targo_route { kept } else { append_flag_words(kept, &flags) };
         env_map.insert(key.to_string(), merged.join(&UNIT_SEPARATOR.to_string()));
         stripped.insert(key.to_string(), Value::Bool(!removed.is_empty()));
         stripped_disable_flags.insert(key.to_string(), json!(removed));
+    }
+    if targo_route {
+        let lane = flags.iter().flat_map(|flag| split_env_words(flag)).collect::<Vec<_>>();
+        env_map.insert(TRUST_TARGO_LANE_RUSTFLAGS_ENV.to_string(), encode_lane_rustflags(&lane)?);
     }
 
     Ok((
@@ -2352,7 +2447,12 @@ fn contains_subsequence(words: &[String], needle: &[String]) -> bool {
     words.windows(needle.len()).any(|window| window == needle)
 }
 
-fn run_stage(plan: &StagePlan, root: &Path, report_dir: &Path) -> Value {
+struct ExecutedStage {
+    report: Value,
+    artifact_rows: Vec<retention::ArtifactRow>,
+}
+
+fn run_stage(plan: &StagePlan, root: &Path, report_dir: &Path) -> ExecutedStage {
     let logs_dir = report_dir.join("logs");
     let log_stem = stage_log_stem(&plan.label);
     let stdout_path = logs_dir.join(format!("{log_stem}.stdout.log"));
@@ -2540,7 +2640,7 @@ fn run_stage(plan: &StagePlan, root: &Path, report_dir: &Path) -> Value {
     if let Some(error) = error {
         stage["error"] = Value::String(error);
     }
-    stage
+    ExecutedStage { report: stage, artifact_rows: summary.retained_artifact_rows }
 }
 
 fn append_stage_error(error: &mut Option<String>, message: String) {
@@ -2609,7 +2709,10 @@ fn parse_authenticated_cargo_transport(
     root: &Path,
     plan: &StagePlan,
 ) -> TransportSummary {
-    let mut summary = TransportSummary::default();
+    let mut summary = TransportSummary {
+        artifact_stage_label: plan.label.clone(),
+        ..TransportSummary::default()
+    };
     let source = relative_path(stdout_path, root);
     let package_scan = BufReader::new(io::Cursor::new(captured_stdout));
 
@@ -2774,6 +2877,22 @@ fn parse_authenticated_cargo_transport(
     for (index, (target, message)) in
         evidence.authenticated_transport_messages.into_iter().enumerate()
     {
+        // Trust (TRANSPORT-LINE-BUDGET-1): a transport budget disclosure that disagrees
+        // with its rows makes the function report malformed, here as in
+        // `parse_compiler_stderr`.
+        if let trust_types::TransportMessage::FunctionResult(result) = &message {
+            if let Some(defect) = result
+                .transport_budget
+                .as_ref()
+                .and_then(|disclosure| disclosure.defect(&result.results))
+            {
+                summary.inconsistencies.push(format!(
+                    "{source}:{}: `{}`: {defect}",
+                    index + 1,
+                    result.function
+                ));
+            }
+        }
         let decoded = match serde_json::to_value(message) {
             Ok(Value::Object(map)) => Value::Object(map),
             Ok(_) => {
@@ -3230,15 +3349,29 @@ fn ingest_result_rows(
             }
             _ => {}
         }
-        let proof_binding = match serde_json::from_value::<trust_types::TransportObligationResult>(
-            result.clone(),
-        ) {
-            Ok(transport) => proof_binding_summary(&transport, proof_artifact_root),
+        let (proof_binding, artifact_collection_status) = match serde_json::from_value::<
+            trust_types::TransportObligationResult,
+        >(result.clone())
+        {
+            Ok(transport) => {
+                retention::collect_typed_row(
+                    &mut summary.retained_artifact_rows,
+                    &summary.artifact_stage_label,
+                    summary.verification_rows.len(),
+                    cargo_target,
+                    source,
+                    line,
+                    function,
+                    row_index,
+                    &transport,
+                );
+                (proof_binding_summary(&transport, proof_artifact_root), "typed")
+            }
             Err(error) => {
                 summary.inconsistencies.push(format!(
                     "{source}:{line}: authenticated obligation row could not be restored to its typed transport form: {error}"
                 ));
-                rejected_proof_binding_summary(&error.to_string())
+                (rejected_proof_binding_summary(&error.to_string()), "rejected")
             }
         };
         if row.get("native_trust_ir").is_some() || row.get("proof_evidence").is_some() {
@@ -3261,17 +3394,17 @@ fn ingest_result_rows(
                 "proof_binding": proof_binding.clone(),
             }));
         }
-        let blockers = coverage_blockers_for_row(
+        let blockers = coverage_blockers_for_row(CoverageRowInput {
             source,
             line,
             cargo_target,
-            scoped_function.as_deref(),
-            function,
+            function: scoped_function.as_deref(),
+            raw_function: function,
             row_index,
             result,
-            &outcome,
-            &proof_binding,
-        );
+            outcome: &outcome,
+            proof_binding: &proof_binding,
+        });
         summary.coverage_blockers.extend(blockers.iter().cloned());
         summary.verification_rows.push(json!({
             "schema": VERIFICATION_ROW_SCHEMA,
@@ -3291,6 +3424,7 @@ fn ingest_result_rows(
             "native_trust_ir": row.get("native_trust_ir").cloned().unwrap_or(Value::Null),
             "proof_evidence": row.get("proof_evidence").cloned().unwrap_or(Value::Null),
             "proof_binding": proof_binding.clone(),
+            "artifact_collection_status": artifact_collection_status,
             "coverage_blockers": blockers,
             "supported": !matches!(
                 outcome.as_str(),
@@ -3406,13 +3540,57 @@ fn proof_binding_summary(row: &trust_types::TransportObligationResult, root: &Pa
     let publication_grade_native_proof = canonical_root
         .as_deref()
         .is_some_and(|root| transport_obligation_has_publishable_native_proof(row, root));
-    let (binding_evidence, required_artifact_materialization) =
-        typed_proof_artifact_bindings(row, canonical_root.as_deref().unwrap_or(root));
+    // Trust: kernel certificates have their own canonical, typed publication
+    // contract. They carry the certificate in metadata and deliberately have
+    // neither a native solver envelope nor transcript materialization.
+    let publication_grade_clean_cic_proof =
+        transport_obligation_has_publishable_clean_cic_proof(row);
+    let kernel_native_paths_secure = !publication_grade_clean_cic_proof
+        || supplied_native_artifact_paths_secure(row, canonical_root.as_deref().unwrap_or(root));
+    let kernel_certificate_binding =
+        publication_grade_clean_cic_proof && kernel_native_paths_secure;
+    let (binding_evidence, required_artifact_materialization) = if publication_grade_clean_cic_proof
+    {
+        let mut evidence = ProofBindingEvidence {
+            canonical_sha256_digest_binding: true,
+            ..ProofBindingEvidence::default()
+        };
+        for (index, artifact) in proof.into_iter().flat_map(|proof| &proof.artifacts).enumerate() {
+            evidence.digest_evidence.push(json!({
+                "artifact_index": index,
+                "kind": artifact.kind,
+                "digest": artifact.digest,
+            }));
+            evidence.artifact_evidence.push(json!({
+                "artifact_index": index,
+                "kind": artifact.kind,
+                "declared_digest": artifact.digest.as_ref().map(|digest| &digest.value),
+                "canonical_sha256_digest": true,
+                "canonical_clean_cic_certificate_binding": true,
+                "materialization_present": false,
+                "metadata_materialization_credit": false,
+                "accepted": true,
+            }));
+        }
+        (
+            evidence,
+            json!({
+                "mode": "clean_cic_kernel_certificate",
+                "complete": kernel_certificate_binding,
+                "certificate_payload_in_metadata": true,
+                "canonical_publication_contract": "trust-certify-clean-cic-v2",
+                "requires_native_solver_materialization": false,
+                "native_materialization_paths_secure": kernel_native_paths_secure,
+            }),
+        )
+    } else {
+        typed_proof_artifact_bindings(row, canonical_root.as_deref().unwrap_or(root))
+    };
     let artifact_or_transcript_binding =
-        binding_evidence.materialized_artifact_or_transcript_binding;
+        kernel_certificate_binding || binding_evidence.materialized_artifact_or_transcript_binding;
     let accepted = proof_evidence_object
         && proof_evidence_status_proved
-        && publication_grade_native_proof
+        && (publication_grade_native_proof || publication_grade_clean_cic_proof)
         && artifact_or_transcript_binding;
     json!({
         "schema": "trust.self-verify-harness.proof-binding.v1",
@@ -3421,6 +3599,8 @@ fn proof_binding_summary(row: &trust_types::TransportObligationResult, root: &Pa
         "proof_evidence_status": proof_evidence_status.map(Value::String).unwrap_or(Value::Null),
         "proof_evidence_status_proved": proof_evidence_status_proved,
         "publication_grade_native_proof": publication_grade_native_proof,
+        "publication_grade_clean_cic_proof": publication_grade_clean_cic_proof,
+        "kernel_certificate_binding": kernel_certificate_binding,
         "canonical_sha256_digest_binding": binding_evidence.canonical_sha256_digest_binding,
         "repo_local_readable_path_binding": binding_evidence.repo_local_readable_path_binding,
         "digest_matches_materialized_path": binding_evidence.digest_matches_materialized_path,
@@ -3443,6 +3623,8 @@ fn rejected_proof_binding_summary(error: &str) -> Value {
         "proof_evidence_status": Value::Null,
         "proof_evidence_status_proved": false,
         "publication_grade_native_proof": false,
+        "publication_grade_clean_cic_proof": false,
+        "kernel_certificate_binding": false,
         "canonical_sha256_digest_binding": false,
         "repo_local_readable_path_binding": false,
         "digest_matches_materialized_path": false,
@@ -3457,6 +3639,23 @@ fn rejected_proof_binding_summary(error: &str) -> Value {
         "path_evidence": [],
         "artifact_evidence": [],
         "accepted": false,
+    })
+}
+
+// Trust: supplied native materializations keep their path/digest hygiene
+// requirements even when a separate Clean CIC certificate supplies the proof.
+fn supplied_native_artifact_paths_secure(
+    row: &trust_types::TransportObligationResult,
+    root: &Path,
+) -> bool {
+    row.native_trust_ir.as_ref().is_none_or(|native| {
+        native.artifacts.iter().enumerate().all(|(index, artifact)| {
+            artifact.materialization.is_none()
+                || typed_artifact_binding(index, artifact, root)
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
     })
 }
 
@@ -3529,15 +3728,7 @@ fn typed_proof_artifact_bindings(
         binding.get("materialization_present").and_then(Value::as_bool) != Some(true)
             || binding.get("accepted").and_then(Value::as_bool) == Some(true)
     });
-    let native_paths_secure = row.native_trust_ir.as_ref().is_none_or(|native| {
-        native.artifacts.iter().enumerate().all(|(index, artifact)| {
-            artifact.materialization.is_none()
-                || typed_artifact_binding(index, artifact, root)
-                    .get("accepted")
-                    .and_then(Value::as_bool)
-                    == Some(true)
-        })
-    });
+    let native_paths_secure = supplied_native_artifact_paths_secure(row, root);
     let complete = topology_defect.is_none() && proof_paths_secure && native_paths_secure;
     evidence.materialized_artifact_or_transcript_binding = complete;
     let requirement = json!({
@@ -3748,46 +3939,59 @@ fn add_totals(totals: &mut BTreeMap<String, SolverTotals>, key: &str, outcome: &
     *entry.outcomes.entry(outcome.to_string()).or_default() += 1;
 }
 
-fn coverage_blockers_for_row(
-    source: &str,
+struct CoverageRowInput<'a> {
+    source: &'a str,
     line: usize,
-    cargo_target: &CargoTargetIdentity,
-    function: Option<&str>,
-    raw_function: Option<&str>,
+    cargo_target: &'a CargoTargetIdentity,
+    function: Option<&'a str>,
+    raw_function: Option<&'a str>,
     row_index: usize,
-    result: &Value,
-    outcome: &str,
-    proof_binding: &Value,
-) -> Vec<Value> {
+    result: &'a Value,
+    outcome: &'a str,
+    proof_binding: &'a Value,
+}
+
+fn coverage_blockers_for_row(input: CoverageRowInput<'_>) -> Vec<Value> {
+    let CoverageRowInput {
+        source,
+        line,
+        cargo_target,
+        function,
+        raw_function,
+        row_index,
+        result,
+        outcome,
+        proof_binding,
+    } = input;
     let mut blockers = Vec::new();
     for field in ["coverage_blocker", "coverage_blockers", "unsupported_reason"] {
         if let Some(value) = result.get(field) {
             match value {
                 Value::Array(items) => {
                     for item in items {
-                        blockers.push(coverage_blocker(
+                        blockers.push(coverage_blocker(CoverageBlockerInput {
                             source,
                             line,
                             cargo_target,
                             function,
                             raw_function,
                             row_index,
-                            field,
-                            item,
-                        ));
+                            kind: field,
+                            detail: item,
+                        }));
                     }
                 }
                 Value::Null => {}
-                other => blockers.push(coverage_blocker(
+                other => blockers.push(coverage_blocker(CoverageBlockerInput {
                     source,
                     line,
                     cargo_target,
                     function,
                     raw_function,
                     row_index,
-                    field,
-                    other,
-                )),
+                    kind: field,
+                    detail: other,
+                })),
             }
         }
     }
@@ -3841,16 +4045,28 @@ fn coverage_blockers_for_row(
     blockers
 }
 
-fn coverage_blocker(
-    source: &str,
+struct CoverageBlockerInput<'a> {
+    source: &'a str,
     line: usize,
-    cargo_target: &CargoTargetIdentity,
-    function: Option<&str>,
-    raw_function: Option<&str>,
+    cargo_target: &'a CargoTargetIdentity,
+    function: Option<&'a str>,
+    raw_function: Option<&'a str>,
     row_index: usize,
-    kind: &str,
-    detail: &Value,
-) -> Value {
+    kind: &'a str,
+    detail: &'a Value,
+}
+
+fn coverage_blocker(input: CoverageBlockerInput<'_>) -> Value {
+    let CoverageBlockerInput {
+        source,
+        line,
+        cargo_target,
+        function,
+        raw_function,
+        row_index,
+        kind,
+        detail,
+    } = input;
     json!({
         "schema": COVERAGE_BLOCKER_SCHEMA,
         "source": source,
@@ -5626,7 +5842,15 @@ fn validate_report_payload(report: &Value) -> Result<(), String> {
     if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
 }
 
+#[cfg(test)]
 fn write_report(report_path: &Path, report: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(report)
+        .map_err(|error| format!("failed to serialize report: {error}"))?
+        + "\n";
+    write_report_bytes(report_path, text.as_bytes())
+}
+
+fn write_report_bytes(report_path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = report_path
         .parent()
         .ok_or_else(|| format!("report path has no parent: {}", report_path.display()))?;
@@ -5650,14 +5874,11 @@ fn write_report(report_path: &Path, report: &Value) -> Result<(), String> {
         report_path.file_name().and_then(|name| name.to_str()).unwrap_or(REPORT_NAME),
         random_hex(16)?
     ));
-    let text = serde_json::to_string_pretty(report)
-        .map_err(|error| format!("failed to serialize report: {error}"))?
-        + "\n";
     let publish = (|| -> Result<(), String> {
         let mut tmp = open_private_new_file(&tmp_path).map_err(|error| {
             format!("failed to create private report {}: {error}", tmp_path.display())
         })?;
-        tmp.write_all(text.as_bytes())
+        tmp.write_all(bytes)
             .map_err(|error| format!("failed to write report {}: {error}", tmp_path.display()))?;
         tmp.sync_all()
             .map_err(|error| format!("failed to fsync report {}: {error}", tmp_path.display()))?;
@@ -6012,10 +6233,11 @@ fn validate_run_id(run_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn create_private_report_directory(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn create_private_report_directory(path: &Path) -> Result<PathBuf, String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("report directory has no parent: {}", path.display()))?;
+    let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
     create_directory_tree_without_symlinks(parent)?;
     fs::create_dir(path).map_err(|error| {
         format!(
@@ -6266,6 +6488,8 @@ fn is_help_arg(arg: &str) -> bool {
 mod tests {
     use super::*;
 
+    mod artifact_retention;
+    mod clean_cic_binding;
     mod fake_trustd;
 
     use fake_trustd::FakeTrustd;
@@ -6696,9 +6920,12 @@ mod tests {
         let check_digest = check.digest.as_ref().expect("check digest").value.clone();
         let strength = trust_types::ProofStrength::deductive();
         let mut row = trust_types::TransportObligationResult {
+            assumes: Vec::new(),
+            gap_class: None,
             obligation_id: Some(owner.to_string()),
             claim_digest_sha256: None,
             kind: "self-build".to_string(),
+            original_vc_snapshot: None,
             typed_kind: None,
             description: "native proof".to_string(),
             location: None,
@@ -6734,6 +6961,7 @@ mod tests {
                 diagnostics: Vec::new(),
             }),
             monitor: None,
+            grade: None,
         };
 
         let bound = proof_binding_summary(&row, &root);
@@ -6895,6 +7123,61 @@ mod tests {
         );
         assert!(!argv.iter().any(|word| word == &options.target));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_verifier_rejects_custom_commands_before_report_or_tool_side_effects() {
+        let root = test_repo_root("self-verify-refused-command");
+        for command_flag in ["--stage-command", "--stage-command=touch"] {
+            let report = root.join("report");
+            let mut args = vec![
+                "--full-verifier".to_string(),
+                "--repo-root".to_string(),
+                root.display().to_string(),
+                "--report-dir".to_string(),
+                report.display().to_string(),
+                command_flag.to_string(),
+            ];
+            if command_flag == "--stage-command" {
+                args.push("touch".to_string());
+            }
+            let marker = root.join("custom-command-executed");
+            args.push(marker.display().to_string());
+            let error = run_inner(&args).expect_err("full verifier must own its command");
+            assert!(error.contains("--full-verifier does not permit --stage-command"), "{error}");
+            assert!(!report.exists(), "refused command created a report");
+            assert!(!marker.exists(), "refused command executed");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_verifier_rejects_an_external_manifest_before_tool_probes_or_report_creation() {
+        let root = test_repo_root("self-verify-manifest-boundary");
+        let outside = test_repo_root("self-verify-external-manifest");
+        let manifest = outside.join("Cargo.toml");
+        fs::write(&manifest, "[package]\nname = \"outside\"\nversion = \"0.0.0\"\n")
+            .expect("write external manifest");
+        // Command construction requires the endpoint to exist. It is deliberately
+        // nonexecutable: manifest validation must fail before any identity probe.
+        let targo = root.join("build/host/stage2/bin/targo");
+        fs::create_dir_all(targo.parent().unwrap()).expect("create stage2 endpoint directory");
+        fs::write(&targo, "not an executable").expect("write nonexecutable endpoint");
+        let report = root.join("report");
+        let error = run_inner(&[
+            "--full-verifier".to_string(),
+            "--repo-root".to_string(),
+            root.display().to_string(),
+            "--report-dir".to_string(),
+            report.display().to_string(),
+            "--evidence-manifest".to_string(),
+            manifest.display().to_string(),
+        ])
+        .expect_err("external evidence must fail before tool validation");
+        assert!(error.contains("escapes repository root"), "{error}");
+        assert!(!report.exists(), "external evidence created a report");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]
@@ -7532,6 +7815,25 @@ mod tests {
         );
     }
 
+    /// Check the actual shared allocator used by the live smoke. The fake
+    /// endpoint child tests cover 56- and 70-byte TMPDIR parents; the real
+    /// coordinator tests cover 56 bytes. Include canonicalization and suffix.
+    #[test]
+    #[cfg(unix)]
+    fn trustd_smoke_shared_socket_path_fits_sun_path() {
+        let root = crate::smoke_socket_root::create(crate::smoke_socket_root::Purpose::SelfVerify)
+            .expect("smoke socket root");
+        let socket =
+            fs::canonicalize(root.path()).expect("canonical smoke root").join("trustd.sock");
+        // SAFETY: `sockaddr_un` is a plain C struct; all-zero bytes are valid.
+        let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }.sun_path.len();
+        assert!(
+            socket.as_os_str().len() < capacity,
+            "{} does not fit sun_path ({capacity} bytes)",
+            socket.display()
+        );
+    }
+
     #[test]
     fn stage2_identity_binds_file_objects_lengths_hashes_and_version_labels() {
         let root = test_repo_root("targo-trust-self-verify-stage2-identity");
@@ -7894,7 +8196,7 @@ mod tests {
             _proof_artifact_root: SelfVerifyProofArtifactRoot::create()
                 .expect("proof artifact root"),
         };
-        let stage = run_stage(&plan, &root, &report_dir);
+        let stage = run_stage(&plan, &root, &report_dir).report;
         assert_eq!(stage["process_timed_out"], true);
         assert_eq!(stage["process_group_isolated"], true);
         assert!(
@@ -7943,6 +8245,74 @@ mod tests {
         }
     }
 
+    /// `build/host/stage2/bin` as bootstrap and the Spotlight layout really
+    /// spell it: `host` is bootstrap's symlink to `build/<triple>` (an absolute
+    /// target, as `src/bootstrap/src/lib.rs` writes it), and under
+    /// docs/BUILD_AND_INSTALL.md's layout `build` is a link to `build.noindex`.
+    /// Both must yield the canonical stage2 tools; every other link must not.
+    #[cfg(unix)]
+    #[test]
+    fn stage2_endpoints_see_through_bootstrap_host_alias_and_build_noindex_link() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        const TOOLS: [&str; 4] = ["targo", "trustc", "trustdoc", "trustd"];
+        let root = test_repo_root("targo-trust-self-verify-stage2-aliases");
+        let triple_bin = root.join("build/test-triple/stage2/bin");
+        fs::create_dir_all(&triple_bin).expect("create stage2 bin");
+        for tool in TOOLS {
+            let path = triple_bin.join(stage2_tool_file_name(tool));
+            fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write stage2 tool");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod tool");
+        }
+        symlink(root.join("build/test-triple"), root.join("build/host")).expect("host alias");
+        let expect_tools_under = |bin: &Path| {
+            let snapshot = capture_stage2_endpoints(&root)
+                .unwrap_or_else(|error| panic!("stage2 under {}: {error}", bin.display()));
+            for (tool, identity) in TOOLS.iter().zip([
+                &snapshot.targo,
+                &snapshot.trustc,
+                &snapshot.trustdoc,
+                &snapshot.trustd,
+            ]) {
+                assert_eq!(identity.canonical_path, bin.join(stage2_tool_file_name(tool)));
+            }
+        };
+
+        // Bootstrap's own layout: a real `build` with the `host` alias.
+        expect_tools_under(&triple_bin);
+
+        // The Spotlight layout: `build` is the sanctioned link. The `host` alias
+        // still names `<root>/build/test-triple`, now through that link.
+        fs::rename(root.join("build"), root.join("build.noindex")).expect("move build");
+        symlink("build.noindex", root.join("build")).expect("link build");
+        expect_tools_under(&root.join("build.noindex/test-triple/stage2/bin"));
+
+        // A `host` alias that leaves the build directory is refused.
+        let outside = root.join("elsewhere");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        fs::rename(root.join("build.noindex/test-triple/stage2"), outside.join("stage2"))
+            .expect("move stage2 outside");
+        fs::remove_file(root.join("build.noindex/host")).expect("remove host alias");
+        symlink(&outside, root.join("build.noindex/host")).expect("redirect host alias");
+        let error = capture_stage2_endpoints(&root).expect_err("host alias outside build");
+        assert!(error.contains("rejects symlinked stage2 directory"), "{error}");
+        fs::rename(outside.join("stage2"), root.join("build.noindex/test-triple/stage2"))
+            .expect("restore stage2");
+        fs::remove_file(root.join("build.noindex/host")).expect("remove redirected alias");
+        symlink(root.join("build/test-triple"), root.join("build.noindex/host"))
+            .expect("restore host alias");
+        expect_tools_under(&root.join("build.noindex/test-triple/stage2/bin"));
+
+        // Any other `build` link is refused.
+        fs::remove_file(root.join("build")).expect("remove build link");
+        fs::rename(root.join("build.noindex"), root.join("other-build")).expect("move tree");
+        symlink("other-build", root.join("build")).expect("unsanctioned build link");
+        let error = capture_stage2_endpoints(&root).expect_err("unsanctioned build link");
+        assert!(error.contains("rejects symlinked stage2 directory"), "{error}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn test_repo_root(name: &str) -> PathBuf {
         let root = env::temp_dir().join(format!("{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -7970,6 +8340,19 @@ mod tests {
         let path = repo_root.join("build/host/stage2/bin").join(stage2_tool_file_name(tool));
         fs::create_dir_all(path.parent().expect("stage2 tool parent"))
             .expect("create stage2 tool parent");
+        // The real daemon client authenticates every executable ancestor.
+        // A host umask of 0002 must not turn these positive fixtures into
+        // group-writable toolchain directories that production correctly refuses.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for relative in
+                ["", "build", "build/host", "build/host/stage2", "build/host/stage2/bin"]
+            {
+                fs::set_permissions(repo_root.join(relative), fs::Permissions::from_mode(0o700))
+                    .expect("make stage2 fixture directory owner-private");
+            }
+        }
         fs::write(&path, contents).expect("write stage2 tool");
         #[cfg(unix)]
         {

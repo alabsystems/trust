@@ -568,12 +568,12 @@ struct AnalysisState {
 }
 
 impl AnalysisState {
-    fn labels_for_local(&self, local: usize) -> BTreeSet<TaintLabel> {
-        self.tainted_locals.get(&local).cloned().unwrap_or_default()
+    fn labels_for_local(&self, local: usize) -> Option<&BTreeSet<TaintLabel>> {
+        self.tainted_locals.get(&local)
     }
 
-    fn trace_for_label(&self, local: usize, label: &TaintLabel) -> Option<TaintTrace> {
-        self.traces.get(&local).and_then(|labels| labels.get(label)).cloned()
+    fn trace_for_label(&self, local: usize, label: &TaintLabel) -> Option<&TaintTrace> {
+        self.traces.get(&local).and_then(|labels| labels.get(label))
     }
 
     fn write_place_taint(
@@ -688,7 +688,7 @@ fn analyze_assign(state: &mut AnalysisState, block_id: usize, place: &Place, rva
     let mut labels = BTreeSet::new();
     let mut traces = BTreeMap::new();
 
-    for (source_local, kind) in rvalue_sources(rvalue) {
+    for_each_rvalue_source(rvalue, |source_local, kind| {
         state.flow_edges.push(DataFlowEdge {
             from_local: source_local,
             to_local: place.local,
@@ -700,11 +700,11 @@ fn analyze_assign(state: &mut AnalysisState, block_id: usize, place: &Place, rva
             source_local,
             place.local,
             block_id,
-            assign_description(kind, source_local, place.local),
+            || assign_description(kind, source_local, place.local),
             &mut labels,
             &mut traces,
         );
-    }
+    });
 
     state.write_place_taint(place, labels, traces);
 }
@@ -718,7 +718,7 @@ fn analyze_call(
     dest: &Place,
     span: &SourceSpan,
 ) {
-    for source_local in operand_locals(args) {
+    for source_local in args.iter().filter_map(operand_local) {
         state.flow_edges.push(DataFlowEdge {
             from_local: source_local,
             to_local: dest.local,
@@ -734,7 +734,7 @@ fn analyze_call(
     let mut result_labels = BTreeSet::new();
     let mut result_traces = BTreeMap::new();
 
-    for source_local in operand_locals(args) {
+    for source_local in args.iter().filter_map(operand_local) {
         state.flow_edges.push(DataFlowEdge {
             from_local: source_local,
             to_local: dest.local,
@@ -746,7 +746,7 @@ fn analyze_call(
             source_local,
             dest.local,
             block_id,
-            format!("local _{} receives call result from `{}`", dest.local, func),
+            || format!("local _{} receives call result from `{}`", dest.local, func),
             &mut result_labels,
             &mut result_traces,
         );
@@ -783,15 +783,23 @@ fn record_local_flow(
     source_local: usize,
     dest_local: usize,
     block_id: usize,
-    description: String,
+    description: impl FnOnce() -> String,
     labels: &mut BTreeSet<TaintLabel>,
     traces: &mut BTreeMap<TaintLabel, TaintTrace>,
 ) {
-    for label in state.labels_for_local(source_local) {
+    let Some(source_labels) = state.labels_for_local(source_local) else {
+        return;
+    };
+    if source_labels.is_empty() {
+        return;
+    }
+    let description = description();
+    for label in source_labels {
         labels.insert(label.clone());
         traces.entry(label.clone()).or_insert_with(|| {
             let mut trace = state
-                .trace_for_label(source_local, &label)
+                .trace_for_label(source_local, label)
+                .cloned()
                 .unwrap_or(TaintTrace { source_span: SourceSpan::default(), path: vec![] });
             trace.path.push(FlowStep {
                 local: dest_local,
@@ -816,11 +824,15 @@ fn record_sink_violations(
             continue;
         };
 
-        for label in state.labels_for_local(place.local) {
-            let trace = state
-                .trace_for_label(place.local, &label)
-                .unwrap_or(TaintTrace { source_span: SourceSpan::default(), path: vec![] });
-            let mut path = trace.path.clone();
+        let Some(source_labels) = state.labels_for_local(place.local) else {
+            continue;
+        };
+        let source_labels: Vec<TaintLabel> = source_labels.iter().cloned().collect();
+        for label in source_labels {
+            let (source_span, mut path) = match state.trace_for_label(place.local, &label) {
+                Some(trace) => (trace.source_span.clone(), trace.path.clone()),
+                None => (SourceSpan::default(), vec![]),
+            };
             path.push(FlowStep {
                 local: place.local,
                 block: block_id,
@@ -836,67 +848,47 @@ fn record_sink_violations(
                 sink_kind: sink.label.clone(),
                 sink_func: func.to_string(),
                 path,
-                source_span: trace.source_span,
+                source_span,
                 sink_span: span.clone(),
             });
         }
     }
 }
 
-fn rvalue_sources(rvalue: &Rvalue) -> Vec<(usize, FlowKind)> {
+fn for_each_rvalue_source(rvalue: &Rvalue, mut f: impl FnMut(usize, FlowKind)) {
     match rvalue {
-        Rvalue::Use(operand) | Rvalue::Cast(operand, _) | Rvalue::UnaryOp(_, operand) => {
-            operand_local(operand)
-                .map(|local| (local, operand_flow_kind(operand, FlowKind::Assignment)))
-                .into_iter()
-                .collect()
+        Rvalue::Use(operand)
+        | Rvalue::Cast(operand, _)
+        | Rvalue::UnaryOp(_, operand)
+        | Rvalue::Repeat(operand, _) => {
+            if let Some(local) = operand_local(operand) {
+                f(local, operand_flow_kind(operand, FlowKind::Assignment));
+            }
         }
         Rvalue::BinaryOp(_, lhs, rhs)
         | Rvalue::CheckedBinaryOp(_, lhs, rhs)
-        | Rvalue::UncheckedBinaryOp(_, lhs, rhs) => [lhs, rhs]
-            .into_iter()
-            .filter_map(|operand| {
-                operand_local(operand)
-                    .map(|local| (local, operand_flow_kind(operand, FlowKind::Assignment)))
-            })
-            .collect(),
+        | Rvalue::UncheckedBinaryOp(_, lhs, rhs)
+        | Rvalue::PtrOffset { ptr: lhs, count: rhs } => {
+            for operand in [lhs, rhs] {
+                if let Some(local) = operand_local(operand) {
+                    f(local, operand_flow_kind(operand, FlowKind::Assignment));
+                }
+            }
+        }
         Rvalue::Ref { place, .. } | Rvalue::AddressOf(_, place) => {
-            vec![(place.local, FlowKind::Ref)]
+            f(place.local, FlowKind::Ref);
         }
-        Rvalue::Aggregate(_, operands) => operands
-            .iter()
-            .filter_map(|operand| {
-                operand_local(operand)
-                    .map(|local| (local, operand_flow_kind(operand, FlowKind::Assignment)))
-            })
-            .collect(),
-        Rvalue::Repeat(operand, _) => operand_local(operand)
-            .map(|local| (local, operand_flow_kind(operand, FlowKind::Assignment)))
-            .into_iter()
-            .collect(),
+        Rvalue::Aggregate(_, operands) | Rvalue::Unsupported { operands, .. } => {
+            for operand in operands {
+                if let Some(local) = operand_local(operand) {
+                    f(local, operand_flow_kind(operand, FlowKind::Assignment));
+                }
+            }
+        }
         Rvalue::Discriminant(place) | Rvalue::Len(place) | Rvalue::CopyForDeref(place) => {
-            vec![(place.local, place_flow_kind(place, FlowKind::Assignment))]
+            f(place.local, place_flow_kind(place, FlowKind::Assignment));
         }
-        // Trust: W2 inc-0 — pointer arithmetic sources flow from BOTH operands.
-        Rvalue::PtrOffset { ptr, count } => [ptr, count]
-            .into_iter()
-            .filter_map(|operand| {
-                operand_local(operand)
-                    .map(|local| (local, operand_flow_kind(operand, FlowKind::Assignment)))
-            })
-            .collect(),
-        Rvalue::Unsupported { operands, .. } => operands
-            .iter()
-            .filter_map(|operand| {
-                operand_local(operand)
-                    .map(|local| (local, operand_flow_kind(operand, FlowKind::Assignment)))
-            })
-            .collect(),
     }
-}
-
-fn operand_locals(args: &[Operand]) -> Vec<usize> {
-    args.iter().filter_map(operand_local).collect()
 }
 
 fn operand_local(operand: &Operand) -> Option<usize> {
@@ -935,30 +927,30 @@ fn assign_description(kind: FlowKind, source_local: usize, dest_local: usize) ->
     }
 }
 
-fn taint_label_name(label: &TaintLabel) -> String {
+fn taint_label_name(label: &TaintLabel) -> &str {
     match label {
-        TaintLabel::UserInput => "user input".into(),
-        TaintLabel::NetworkData => "network data".into(),
-        TaintLabel::Secret => "secret".into(),
-        TaintLabel::FileData => "file data".into(),
-        TaintLabel::EnvVar => "environment variable".into(),
-        TaintLabel::UnsafeBlock => "unsafe block".into(),
-        TaintLabel::ExternCall => "extern call".into(),
-        TaintLabel::Custom(name) => name.clone(),
+        TaintLabel::UserInput => "user input",
+        TaintLabel::NetworkData => "network data",
+        TaintLabel::Secret => "secret",
+        TaintLabel::FileData => "file data",
+        TaintLabel::EnvVar => "environment variable",
+        TaintLabel::UnsafeBlock => "unsafe block",
+        TaintLabel::ExternCall => "extern call",
+        TaintLabel::Custom(name) => name.as_str(),
     }
 }
 
-fn sink_kind_name(kind: &SinkKind) -> String {
+fn sink_kind_name(kind: &SinkKind) -> &str {
     match kind {
-        SinkKind::SqlQuery => "SQL".into(),
-        SinkKind::LogOutput => "log".into(),
-        SinkKind::NetworkSend => "network".into(),
-        SinkKind::HtmlRender => "HTML".into(),
-        SinkKind::FileWrite => "file write".into(),
-        SinkKind::ShellCommand => "shell command".into(),
-        SinkKind::RawPointer => "raw pointer".into(),
-        SinkKind::Assertion => "assertion".into(),
-        SinkKind::Custom(name) => name.clone(),
+        SinkKind::SqlQuery => "SQL",
+        SinkKind::LogOutput => "log",
+        SinkKind::NetworkSend => "network",
+        SinkKind::HtmlRender => "HTML",
+        SinkKind::FileWrite => "file write",
+        SinkKind::ShellCommand => "shell command",
+        SinkKind::RawPointer => "raw pointer",
+        SinkKind::Assertion => "assertion",
+        SinkKind::Custom(name) => name.as_str(),
     }
 }
 
@@ -1025,6 +1017,7 @@ mod tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             is_foreign: false,
             func: func.into(),
             args,
@@ -1133,6 +1126,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
@@ -1149,6 +1143,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -1184,6 +1179,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
@@ -1200,6 +1196,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "web::escape_html".into(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -1216,6 +1213,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -1256,6 +1254,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "secrets::get_secret".into(),
                         args: vec![],
@@ -1272,6 +1271,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "audit::log".into(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -1308,6 +1308,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -1339,6 +1340,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
@@ -1359,6 +1361,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -1408,6 +1411,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
@@ -1424,6 +1428,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "secrets::get_secret".into(),
                         args: vec![],
@@ -1440,6 +1445,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -1456,6 +1462,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "audit::log".into(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -1502,6 +1509,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
@@ -1518,6 +1526,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -1918,6 +1927,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
@@ -1934,6 +1944,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::process::exec_cmd".into(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -2132,6 +2143,7 @@ mod tests {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],

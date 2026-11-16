@@ -36,6 +36,28 @@
 //! panic-freedom is therefore EQUIVALENT to `write_str`'s — not weaker, not
 //! assumed.
 //!
+//! ## Whose `write_fmt`: authentic core only
+//!
+//! Trust (identity-anchor sweep, 2026-09-28). The reading above is of THIS
+//! tree's `core`, so the rule may apply it only to that crate's body. Every
+//! lookup of `FmtWrite` and `FmtArgumentsFromStr` in this module is
+//! `authentic_core_diagnostic_item` — the diagnostic item AND its owner is
+//! authentic resident core (`crate_is_authentic_core`: owner of `Sized`, loaded
+//! from this compiler's own sysroot) — never the item alone. A diagnostic item
+//! is a source attribute: a whole-`core` substitute (`#![no_core]` +
+//! `#![compiler_builtins]`, crate name `core`, `--extern core=`) owns both in the
+//! one graph where no real `core` is loaded. MEASURED on stage-1 `trustc` at
+//! `246ceb451e5` (pinned in `tests/ui/trust` by
+//! `static_str_write_fmt_fmtwrite_core_substitution_impostor_refuted.rs`): such a
+//! substitute's `write_fmt`, which panics on every call, was
+//! `=> DISCHARGED (every site reduces to its own proved `write_str`)` here and
+//! `admitted … via the write_fmt reduction` by the `dyn` twin in
+//! `dyn_dispatch_reliance.rs`. No false proof followed (the bridge's own
+//! residency check kept each row, `runtime-checked`), but the grant was made for
+//! a body this rule never read. Refusal-only; the over-decline that
+//! `crate_is_compiler_resident_sysroot` discloses (`-Zbuild-std`, a genuine
+//! `--extern core=`) applies here too.
+//!
 //! ## Why this is not a totality allowlist
 //!
 //! `write_fmt` is never modeled total. The reduction only names WHICH body the
@@ -144,7 +166,9 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
+
+use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::mir::{BasicBlock, Body, Operand, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
@@ -163,7 +187,7 @@ struct WriteFmtCallSite<'tcx> {
     /// The receiver's `Self` type, taken from the resolved instance rather than
     /// from the operand, so an autoref/reborrow cannot skew it.
     self_ty: Ty<'tcx>,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
     /// Did the `Arguments` operand at THIS site come from `Arguments::from_str`?
     from_str_backed: bool,
 }
@@ -182,6 +206,45 @@ pub(crate) struct StaticStrWriteFmtFacts<'tcx> {
 impl<'tcx> StaticStrWriteFmtFacts<'tcx> {
     pub(crate) fn is_empty(&self) -> bool {
         self.sites.is_empty()
+    }
+
+    /// Trust (2026-09-14, bundle deferral): the callee key under which THIS
+    /// instance of `<W as Write>::write_fmt` was observed as a certifiable site
+    /// — `from_str`-backed (gate 3) with a concrete `write_str` that passes the
+    /// independent-verdict bar (gate 4) — or `None`. Gates 0 and 2 are decided
+    /// over the whole bundle by `resolve_reliance`; this per-site answer lets the
+    /// bundle closure DEFER expanding the callee's body until that decision is
+    /// in, and expand it after all if the key is not discharged. Why it matters:
+    /// bundling the default `write_fmt` body drags in `spec_write_fmt`,
+    /// `as_statically_known_str` and `core::fmt::write`, each of which carries
+    /// its own whole-function panic-freedom carrier (the FALSE PROOF #11 latch)
+    /// — rows the reduction has already proved irrelevant to the root's call,
+    /// which never executes them on a `from_str`-backed argument. Measured
+    /// 2026-09-14 on the five `write!` strict-lane reds: the root's own call was
+    /// `EXEMPT-AUTHENTICATED-TOTAL` in every one, and the red row was the
+    /// bundled members'.
+    pub(super) fn deferrable_key_for_instance(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &ty::Instance<'tcx>,
+        root_def_id: DefId,
+    ) -> Option<String> {
+        let fmt_write = super::authentic_core_diagnostic_item(tcx, sym::FmtWrite)?;
+        let ty::InstanceKind::Item(resolved) = instance.def else { return None };
+        if tcx.opt_item_name(resolved) != Some(sym::write_fmt)
+            || tcx.trait_of_assoc(resolved) != Some(fmt_write)
+        {
+            return None;
+        }
+        let site = self.sites.iter().find(|site| site.args == instance.args)?;
+        if !site.from_str_backed {
+            return None;
+        }
+        let target = resolve_write_str(tcx, fmt_write, site)?;
+        if !dyn_target_is_verified_panic_free(tcx, target, root_def_id) {
+            return None;
+        }
+        Some(site.call_key.clone())
     }
 
     /// Classify ONE bundled `Call` terminator: record it as a site of this rule
@@ -207,7 +270,9 @@ impl<'tcx> StaticStrWriteFmtFacts<'tcx> {
         func: &Operand<'tcx>,
         args: &[Spanned<Operand<'tcx>>],
     ) -> bool {
-        let Some(fmt_write) = tcx.get_diagnostic_item(sym::FmtWrite) else { return false };
+        let Some(fmt_write) = super::authentic_core_diagnostic_item(tcx, sym::FmtWrite) else {
+            return false;
+        };
         match certified_write_fmt_site(tcx, fmt_write, body, typing_env, block_id, func, args) {
             Some(site) => {
                 self.sites.push(site);
@@ -238,12 +303,15 @@ impl<'tcx> StaticStrWriteFmtFacts<'tcx> {
         if std::env::var_os("TRUST_NO_STATIC_STR_WRITE_FMT").is_some() {
             return;
         }
-        let Some(fmt_write) = tcx.get_diagnostic_item(sym::FmtWrite) else { return };
+        let Some(fmt_write) = super::authentic_core_diagnostic_item(tcx, sym::FmtWrite) else {
+            return;
+        };
         // Group by the identity the discharge channel is keyed by. EVERY gate
         // below is then decided over the WHOLE group, because inserting the key
         // discharges every call the bridge renders to it — not the one site that
-        // happened to be examined.
-        let mut by_callee: FxHashMap<&str, Vec<&WriteFmtCallSite<'tcx>>> = FxHashMap::default();
+        // happened to be examined. Ordered, so the probe lines below come out in
+        // one order on every run.
+        let mut by_callee: BTreeMap<&str, Vec<&WriteFmtCallSite<'tcx>>> = BTreeMap::new();
         for site in &self.sites {
             by_callee.entry(site.call_key.as_str()).or_default().push(site);
         }
@@ -369,7 +437,7 @@ fn certified_write_fmt_site<'tcx>(
     }
     let self_ty = instance.args.first().and_then(|arg| arg.as_type())?;
     Some(WriteFmtCallSite {
-        call_key: trust_mir_extract::func_operand_name(tcx, func),
+        call_key: trust_mir_extract::func_operand_name_in_body(tcx, body, func),
         self_ty,
         args: instance.args,
         // GATE 3.
@@ -388,6 +456,22 @@ fn resolve_write_str<'tcx>(
     fmt_write: DefId,
     site: &WriteFmtCallSite<'tcx>,
 ) -> Option<ty::Instance<'tcx>> {
+    resolve_write_str_for_args(tcx, fmt_write, site.args)
+}
+
+/// GATE 4's target for an instantiation `[Self]` given directly — the one
+/// implementation behind [`resolve_write_str`], shared with the `dyn` case
+/// split so that lane resolves the SAME body this lane does.
+///
+/// Trust (2026-09-21): C-FLOW enumerates each concrete `Self` that can reach a
+/// virtual `write_fmt` site and substitutes it into the site's args, which is
+/// exactly the `[Self]` instantiation this needs — so the reduction can be
+/// decided per enumerated `Self` at a `dyn` site with the identical resolver.
+pub(super) fn resolve_write_str_for_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fmt_write: DefId,
+    args: ty::GenericArgs<'tcx>,
+) -> Option<ty::Instance<'tcx>> {
     let write_str = tcx
         .associated_items(fmt_write)
         .in_definition_order()
@@ -395,16 +479,71 @@ fn resolve_write_str<'tcx>(
         .def_id;
     // `write_str` has the same generics as `write_fmt` (`Self` only), so the
     // site's own args are already the demanded instantiation.
-    if site.args.len() != 1 || site.args.has_non_region_param() {
+    if args.len() != 1 || args.has_non_region_param() {
         return None;
     }
     let instance =
-        ty::Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), write_str, site.args)
+        ty::Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), write_str, args)
             .ok()??;
     match instance.def {
         ty::InstanceKind::Item(_) => Some(instance),
         _ => None,
     }
+}
+
+/// GATE 1, stated for an instance C-FLOW resolved from an ENUMERATED `Self`:
+/// is it core's DEFAULT `fmt::Write::write_fmt` body? An impl that OVERRIDES
+/// `write_fmt` resolves to its own impl item, whose `trait_of_assoc` is `None`,
+/// and answers `false` — that `Self` must then take the ordinary independent-
+/// verdict bar on the override itself, never this reduction.
+///
+/// Trust (2026-09-21): this is what lets the arm be decided PER enumerated
+/// `Self` inside C-FLOW's loop. A mixed impl set — one `Self` overriding
+/// `write_fmt`, another inheriting the default — takes the bar for the first
+/// and the reduction only for the second, because the question is asked of each
+/// resolved target, never once of the site.
+pub(super) fn instance_is_core_default_write_fmt<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: &ty::Instance<'tcx>,
+) -> bool {
+    let Some(fmt_write) = super::authentic_core_diagnostic_item(tcx, sym::FmtWrite) else {
+        return false;
+    };
+    let ty::InstanceKind::Item(resolved) = instance.def else { return false };
+    tcx.opt_item_name(resolved) == Some(sym::write_fmt)
+        && tcx.trait_of_assoc(resolved) == Some(fmt_write)
+        // `Write::write_fmt` takes only `Self`; anything else means the trait
+        // moved under this rule and the audited reduction no longer applies.
+        && instance.args.len() == 1
+}
+
+/// GATE 3 for a VIRTUAL `write_fmt` site, decided where the call is observed —
+/// the only point the `Arguments` operand and its defining body are in hand.
+///
+/// Trust (2026-09-21): `observe_bundle_body` files a `Virtual` instance as a
+/// `dyn` site before the `else if` that offers a call to this rule, so a
+/// `write!(w, "lit")` through `&mut dyn Write` was never asked whether its
+/// operand is `from_str`-backed at all. This records that one fact on the
+/// `VirtualCallSite`; every other gate (1, 4, and the shared ledger's gate 0)
+/// is re-run by the `dyn` lane at decision time, per enumerated `Self`.
+/// `false` for any site that is not `fmt::Write::write_fmt`, so it costs
+/// nothing and admits nothing anywhere else.
+pub(super) fn virtual_write_fmt_site_is_from_str_backed<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    method_def_id: DefId,
+    body: &Body<'tcx>,
+    block_id: BasicBlock,
+    args: &[Spanned<Operand<'tcx>>],
+) -> bool {
+    let Some(fmt_write) = super::authentic_core_diagnostic_item(tcx, sym::FmtWrite) else {
+        return false;
+    };
+    if tcx.opt_item_name(method_def_id) != Some(sym::write_fmt)
+        || tcx.trait_of_assoc(method_def_id) != Some(fmt_write)
+    {
+        return false;
+    }
+    args.len() == 2 && operand_is_arguments_from_str(tcx, body, block_id, &args[1].node)
 }
 
 /// Does `operand`, read at `use_block`, necessarily hold a value that
@@ -423,7 +562,10 @@ fn operand_is_arguments_from_str<'tcx>(
     use_block: BasicBlock,
     operand: &Operand<'tcx>,
 ) -> bool {
-    let Some(from_str) = tcx.get_diagnostic_item(sym::FmtArgumentsFromStr) else { return false };
+    let Some(from_str) = super::authentic_core_diagnostic_item(tcx, sym::FmtArgumentsFromStr)
+    else {
+        return false;
+    };
     let place = match operand {
         Operand::Copy(place) | Operand::Move(place) => place,
         // A constant `Arguments` carries no witnessed provenance, and a

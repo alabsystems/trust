@@ -10,8 +10,8 @@ doctest = false
 [dependencies]
 # tidy-alphabetical-start
 rustc_ast = { path = "../rustc_ast" }
-rustc_ast_passes = { path = "../rustc_ast_passes" }
 rustc_ast_pretty = { path = "../rustc_ast_pretty" }
+rustc_attr_ir = { path = "../rustc_attr_ir" }
 rustc_attr_parsing = { path = "../rustc_attr_parsing" }
 rustc_data_structures = { path = "../rustc_data_structures" }
 rustc_errors = { path = "../rustc_errors" }
@@ -20,7 +20,6 @@ rustc_hir = { path = "../rustc_hir" }
 rustc_lexer = { path = "../rustc_lexer" }
 rustc_lint_defs = { path = "../rustc_lint_defs" }
 rustc_macros = { path = "../rustc_macros" }
-rustc_middle = { path = "../rustc_middle" }
 rustc_parse = { path = "../rustc_parse" }
 # We must use the proc_macro version that we will compile proc-macros against,
 # not the one from our own sysroot.
@@ -28,8 +27,33 @@ rustc_proc_macro = { path = "../rustc_proc_macro" }
 rustc_serialize = { path = "../rustc_serialize" }
 rustc_session = { path = "../rustc_session" }
 rustc_span = { path = "../rustc_span" }
-scoped-tls = "1.0"
+rustc_structures = { path = "../rustc_structures" }
 smallvec = { version = "1.8.1", features = ["union", "may_dangle"] }
-thin-vec = "0.2.18"
+thin-vec = "0.2.21"
 tracing = "0.1"
+# Trust (D21): the existing bounded wire/handle core for the private adapter.
+trust-process-isolation = { path = "../../crates/trust-process-isolation" }
 # tidy-alphabetical-end
+
+# Trust (D21): the isolated proc-macro worker (`-Ztrust-proc-macro-isolation`). The
+# compiler executable is its own worker, so both ends of the conversation live here:
+# the worker-side bridge, the socket transport and the fixed seatbelt policy. Only
+# macOS has that policy; every other host refuses the option.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+trust-exec-policy = { path = "../../crates/trust-exec-policy" }
+trust-proc-macro-bridge = { path = "../../crates/trust-proc-macro-bridge" }
+
+# Trust (D21): native ABI/B1 duplex tests on every host.
+[dev-dependencies]
+libc = "0.2"
+trust-proc-macro-bridge = { path = "../../crates/trust-proc-macro-bridge" }
+
+# Trust (PM-1): native Linux B3/dispatcher integration, never loader admission.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+sha2 = "=0.10.9"
+trust-worker-linux = { path = "../../crates/trust-worker-linux" }
+
+# Trust: qualify the fixed Darwin restriction with a real native Client.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+trust-exec-policy = { path = "../../crates/trust-exec-policy" }

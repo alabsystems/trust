@@ -426,3 +426,150 @@ fn yield_local_to_spawn() {
     // for it to finish if a different thread stole it first.
     assert_eq!(22, rx.recv().unwrap());
 }
+
+// Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): the thread-slot handlers as the
+// compiler's jobserver proxy sees them: who holds a slot, and who asked.
+mod trust_thread_slots {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, ThreadId};
+    use std::time::{Duration, Instant};
+
+    use crate::ThreadPoolBuilder;
+
+    #[derive(Default)]
+    struct Slots {
+        /// Per thread: slots acquired, slots released.
+        threads: HashMap<ThreadId, (usize, usize)>,
+        /// Per acquire: who acquired, and how many more slots the other
+        /// threads had acquired than released. The test thread counts as -1
+        /// there while it waits, because it never acquired its first slot.
+        acquires: Vec<(ThreadId, isize)>,
+    }
+
+    impl Slots {
+        fn total_acquires(&self) -> usize {
+            self.acquires.len()
+        }
+
+        /// Every thread that used a slot has given it back. The test thread
+        /// starts out holding one it never acquired, as the compiler's main
+        /// thread does, so its releases and acquires also come in pairs.
+        fn balanced(&self) -> bool {
+            self.threads.values().all(|(acquired, released)| acquired == released)
+        }
+    }
+
+    fn pool_with_slots(threads: usize) -> (crate::ThreadPool, Arc<Mutex<Slots>>) {
+        let (builder, slots) = builder_with_slots(threads);
+        (builder.build().unwrap(), slots)
+    }
+
+    fn builder_with_slots(threads: usize) -> (ThreadPoolBuilder, Arc<Mutex<Slots>>) {
+        let slots = Arc::new(Mutex::new(Slots::default()));
+        let (on_acquire, on_release) = (Arc::clone(&slots), Arc::clone(&slots));
+        let builder = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .acquire_thread_handler(move || {
+                let me = thread::current().id();
+                let mut slots = on_acquire.lock().unwrap();
+                let others = slots
+                    .threads
+                    .iter()
+                    .filter(|(id, _)| **id != me)
+                    .map(|(_, (acquired, released))| *acquired as isize - *released as isize)
+                    .sum();
+                slots.threads.entry(me).or_default().0 += 1;
+                slots.acquires.push((me, others));
+            })
+            .release_thread_handler(move || {
+                let me = thread::current().id();
+                on_release.lock().unwrap().threads.entry(me).or_default().1 += 1;
+            });
+        (builder, slots)
+    }
+
+    /// A sleeping worker woken only to terminate takes no thread slot, and
+    /// the acquires and releases of every thread still pair up.
+    #[test]
+    #[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
+    fn a_worker_woken_to_terminate_acquires_no_thread_slot() {
+        const THREADS: usize = 4;
+        let (pool, slots) = pool_with_slots(THREADS);
+        pool.install(|| ());
+        // Wait until every worker has started and gone to sleep, having
+        // released its slot. Balanced slots alone do not say that: a worker
+        // woken for the job above (or by the worker that found it) has no slot
+        // either until it runs again, and would then take one legitimately.
+        // A woken worker is no longer counted as asleep, so once all are
+        // counted nothing wakes one again before termination, and from then
+        // on balanced slots mean every one of them released.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let before = loop {
+            if pool.registry.sleeping_threads() == THREADS {
+                let slots = slots.lock().unwrap();
+                if slots.threads.len() == THREADS + 1 && slots.balanced() {
+                    break slots.total_acquires();
+                }
+            }
+            assert!(Instant::now() < deadline, "workers did not go to sleep");
+            thread::sleep(Duration::from_millis(1));
+        };
+        let me = thread::current().id();
+        pool.wait_until_stopped();
+        let slots = slots.lock().unwrap();
+        assert!(slots.balanced(), "an acquire or a release lost its pair");
+        assert_eq!(
+            slots.total_acquires(),
+            before + 1,
+            "a terminating worker acquired a thread slot"
+        );
+        assert_eq!(slots.acquires.last(), Some(&(me, 0)));
+    }
+
+    /// A worker whose thread starts after the pool was told to terminate runs
+    /// no job, and so neither waits for a thread slot nor takes one.
+    #[test]
+    #[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
+    fn a_worker_started_after_termination_acquires_no_thread_slot() {
+        let (builder, slots) = builder_with_slots(3);
+        let mut late = Vec::new();
+        let pool = builder
+            .spawn_handler(|thread| {
+                late.push(thread);
+                Ok(())
+            })
+            .build()
+            .unwrap();
+        drop(pool);
+        let workers: Vec<_> =
+            late.into_iter().map(|thread| thread::spawn(move || thread.run())).collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let slots = slots.lock().unwrap();
+        assert_eq!(slots.total_acquires(), 0, "a worker with nothing to run took a thread slot");
+        assert!(slots.balanced());
+    }
+
+    /// The thread that tears the pool down takes its slot back only when no
+    /// worker holds one, whether the workers were asleep or still running.
+    #[test]
+    #[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
+    fn pool_teardown_takes_its_slot_back_after_every_worker_released() {
+        let me = thread::current().id();
+        for _ in 0..200 {
+            let (pool, slots) = pool_with_slots(3);
+            pool.install(|| ());
+            // No pause: the worker that ran the job is usually still awake.
+            pool.wait_until_stopped();
+            let slots = slots.lock().unwrap();
+            assert!(slots.balanced(), "an acquire or a release lost its pair");
+            assert_eq!(
+                slots.acquires.last(),
+                Some(&(me, 0)),
+                "teardown asked for a slot while a worker still held one"
+            );
+        }
+    }
+}

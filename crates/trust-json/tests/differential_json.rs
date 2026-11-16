@@ -39,6 +39,7 @@
 //! | M13 | check recursion depth after consuming the bracket | `recursion_limit_matches_the_incumbent` |
 //! | M14 | accept a trailing comma in an array | `parse_agrees_on_an_enumerated_malformed_table` |
 //! | M15 | drop the `.0` on integral floats (emit `1` for `1.0`) | nine tests, incl. 1 052 / 999 530 `f64` and 362 966 / 4 378 905 `f32` |
+//! | M16 | gate harness, not the crate: `common::key_sorted` stops descending into arrays | `the_gates_view_of_the_incumbent_is_key_sorted_at_every_depth`, on the `IndexMap` backing only (`--features incumbent-serde-json/preserve_order`); every other test in this binary and `adversarial.rs` stayed green on both backings |
 //!
 //! M12 and M13 are not hypothetical: they are the two defects this file
 //! actually found on its first run, before either was known to be wrong.
@@ -57,7 +58,10 @@ use trust_json as tj;
 use trust_json::Formatter as _;
 
 mod common;
-use common::{Lcg, agree_on_parse as check_parse, to_inc};
+use common::{
+    IncumbentOrder, Lcg, agree_on_parse as check_parse, inc_from_str, incumbent_order, key_sorted,
+    to_inc,
+};
 
 // ---------------------------------------------------------------------------
 // 0. Oracle identity. Prints what the incumbent actually does, so a backend
@@ -71,10 +75,7 @@ fn oracle_identity() {
         ("1e-6", inc::to_string(&1e-6f64).unwrap()),
         ("1e-6f32", inc::to_string(&1e-6f32).unwrap()),
         ("1.0", inc::to_string(&1.0f64).unwrap()),
-        (
-            "tie 0x4307098d6fca6a8a",
-            inc::to_string(&f64::from_bits(0x4307098d6fca6a8a)).unwrap(),
-        ),
+        ("tie 0x4307098d6fca6a8a", inc::to_string(&f64::from_bits(0x4307098d6fca6a8a)).unwrap()),
         ("DEL in a string", inc::to_string("\u{7f}").unwrap()),
     ];
     for (name, got) in &sentinels {
@@ -85,12 +86,31 @@ fn oracle_identity() {
     // a different oracle -- STOP, do not "fix" trust-json to match.
     assert_eq!(sentinels[0].1, "1e+30", "float backend changed (ryu-style?)");
     assert_eq!(sentinels[1].1, "1e-6", "f64 fixed/exponential threshold moved");
-    assert_eq!(
-        sentinels[2].1, "0.000001",
-        "f32 fixed/exponential threshold moved"
-    );
+    assert_eq!(sentinels[2].1, "0.000001", "f32 fixed/exponential threshold moved");
     assert_eq!(sentinels[4].1, "810553441865041.2", "tie-break rule changed");
     assert_eq!(sentinels[5].1, "\"\u{7f}\"", "escape policy changed");
+
+    // The PARSE mode. The sentinels above only tell serializer backends apart.
+    // `1e-30` is 0x39b4484bfeebc2a0 when correctly rounded (exact rational
+    // arithmetic, ties to even) and 0x39b4484bfeebc29f under serde_json's
+    // default pow10-table parse. trust-json's Cargo.toml enables
+    // `float_roundtrip` on the incumbent, as clean-olean does for the whole
+    // workspace; if this fires, the oracle's parse mode changed underneath
+    // every parse differential in this file.
+    let parsed = inc::from_str::<f64>("1e-30").unwrap().to_bits();
+    println!("  oracle parse 1e-30          -> {parsed:#018x}");
+    assert_eq!(
+        parsed, 0x39b4484bfeebc2a0,
+        "incumbent float parse is no longer correctly rounded (float_roundtrip off?)"
+    );
+
+    // The object ORDER. Unlike the two modes above, Cargo.toml cannot pin this
+    // one: `preserve_order` can only be added, and whether some other selected
+    // package adds it is up to the invocation. It is printed, not pinned, and
+    // every incumbent tree the gate serializes is taken in key order through
+    // `common::key_sorted` (see `common::IncumbentOrder`).
+    let order = incumbent_order().unwrap();
+    println!("  oracle object order          -> {order:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -102,9 +122,7 @@ fn tj_f64(v: f64) -> String {
 }
 
 fn tj_f32(v: f32) -> String {
-    tj::ser::float::FloatBuffer::new()
-        .format_finite_f32(v)
-        .to_owned()
+    tj::ser::float::FloatBuffer::new().format_finite_f32(v).to_owned()
 }
 
 /// How many random bit patterns each float sweep draws. The `f64` tie
@@ -311,21 +329,11 @@ fn integer_bytes_match_at_the_boundaries_and_over_a_sweep() {
     // 128-bit goes through the Formatter directly; `Value` has no 128-bit
     // number, exactly as the incumbent's does not.
     let mut w = Vec::new();
-    tj::CompactFormatter
-        .write_i128(&mut w, i128::MIN)
-        .unwrap();
-    assert_eq!(
-        String::from_utf8(w).unwrap(),
-        inc::to_string(&i128::MIN).unwrap()
-    );
+    tj::CompactFormatter.write_i128(&mut w, i128::MIN).unwrap();
+    assert_eq!(String::from_utf8(w).unwrap(), inc::to_string(&i128::MIN).unwrap());
     let mut w = Vec::new();
-    tj::CompactFormatter
-        .write_u128(&mut w, u128::MAX)
-        .unwrap();
-    assert_eq!(
-        String::from_utf8(w).unwrap(),
-        inc::to_string(&u128::MAX).unwrap()
-    );
+    tj::CompactFormatter.write_u128(&mut w, u128::MAX).unwrap();
+    assert_eq!(String::from_utf8(w).unwrap(), inc::to_string(&u128::MAX).unwrap());
 
     let mut rng = Lcg::new(0x082EFA98EC4E6C89);
     for _ in 0..300_000 {
@@ -419,20 +427,11 @@ fn the_escape_policy_is_the_incumbents_and_not_a_safer_one() {
         "\"\\u0000\\u0001\\u000b\\u000e\\u001f\"",
         "\\u escapes are LOWERCASE hex"
     );
-    assert_eq!(
-        tj_str("\u{8}\t\n\u{c}\r"),
-        "\"\\b\\t\\n\\f\\r\"",
-        "the five short escapes"
-    );
+    assert_eq!(tj_str("\u{8}\t\n\u{c}\r"), "\"\\b\\t\\n\\f\\r\"", "the five short escapes");
     // ... and each of the above equals the incumbent.
-    for s in [
-        "/",
-        "\u{7f}",
-        "\u{2028}\u{2029}",
-        "é€𝄞",
-        "\u{0}\u{1}\u{b}\u{e}\u{1f}",
-        "\u{8}\t\n\u{c}\r",
-    ] {
+    for s in
+        ["/", "\u{7f}", "\u{2028}\u{2029}", "é€𝄞", "\u{0}\u{1}\u{b}\u{e}\u{1f}", "\u{8}\t\n\u{c}\r"]
+    {
         assert_eq!(inc::to_string(s).unwrap(), tj_str(s));
     }
 }
@@ -442,11 +441,7 @@ fn the_escape_policy_is_the_incumbents_and_not_a_safer_one() {
 // ---------------------------------------------------------------------------
 
 fn random_value(rng: &mut Lcg, depth: u32) -> tj::Value {
-    let pick = if depth >= 4 {
-        rng.below(5)
-    } else {
-        rng.below(7)
-    };
+    let pick = if depth >= 4 { rng.below(5) } else { rng.below(7) };
     match pick {
         0 => tj::Value::Null,
         1 => tj::Value::Bool(rng.below(2) == 0),
@@ -483,21 +478,14 @@ fn compact_and_pretty_documents_are_byte_identical() {
     for i in 0..20_000 {
         let v = random_value(&mut rng, 0);
         let iv = to_inc(&v);
-        assert_eq!(
-            inc::to_string(&iv).unwrap(),
-            tj::to_string(&v).unwrap(),
-            "compact case {i}"
-        );
+        assert_eq!(inc::to_string(&iv).unwrap(), tj::to_string(&v).unwrap(), "compact case {i}");
         assert_eq!(
             inc::to_string_pretty(&iv).unwrap(),
             tj::to_string_pretty(&v).unwrap(),
             "pretty case {i}"
         );
         assert_eq!(inc::to_vec(&iv).unwrap(), tj::to_vec(&v).unwrap());
-        assert_eq!(
-            inc::to_vec_pretty(&iv).unwrap(),
-            tj::to_vec_pretty(&v).unwrap()
-        );
+        assert_eq!(inc::to_vec_pretty(&iv).unwrap(), tj::to_vec_pretty(&v).unwrap());
     }
 }
 
@@ -505,7 +493,7 @@ fn compact_and_pretty_documents_are_byte_identical() {
 fn pretty_shape_is_exactly_the_incumbents() {
     let src = r#"{"b":1,"a":[1,2,{"z":null}],"c":{},"d":[],"e":"x"}"#;
     let mine: tj::Value = tj::from_str(src).unwrap();
-    let theirs: inc::Value = inc::from_str(src).unwrap();
+    let theirs: inc::Value = inc_from_str(src).unwrap();
     let p = tj::to_string_pretty(&mine).unwrap();
     assert_eq!(p, inc::to_string_pretty(&theirs).unwrap());
     // Spelled out, so a change to indent width or the `": "` separator is a
@@ -529,22 +517,120 @@ fn pretty_shape_is_exactly_the_incumbents() {
 #[test]
 fn object_key_order_is_sorted_on_both_sides() {
     let src = r#"{"z":1,"a":2,"m":3,"":4,"A":5,"\u00e9":6}"#;
+    let sorted = r#"{"":4,"A":5,"a":2,"m":3,"z":1,"é":6}"#;
     let mine: tj::Value = tj::from_str(src).unwrap();
+    assert_eq!(tj::to_string(&mine).unwrap(), sorted);
+    // The incumbent's own order belongs to the build graph, not to this crate
+    // (`common::IncumbentOrder`), so it is pinned for whichever backing this
+    // invocation resolved: sorted by default, insertion order once a selected
+    // package unified `preserve_order` in. trust-json sorts on both; that
+    // difference is stated in lib.rs's "Known differences".
     let theirs: inc::Value = inc::from_str(src).unwrap();
-    assert_eq!(
-        tj::to_string(&mine).unwrap(),
-        inc::to_string(&theirs).unwrap()
-    );
-    assert_eq!(
-        tj::to_string(&mine).unwrap(),
-        r#"{"":4,"A":5,"a":2,"m":3,"z":1,"é":6}"#
-    );
+    let raw = inc::to_string(&theirs).unwrap();
+    match incumbent_order().unwrap() {
+        IncumbentOrder::Sorted => assert_eq!(raw, sorted),
+        IncumbentOrder::Insertion => assert_eq!(raw, r#"{"z":1,"a":2,"m":3,"":4,"A":5,"é":6}"#),
+    }
+    // ... and the gate's view of the incumbent is the default backing's order
+    // on either, so it equals ours byte for byte.
+    assert_eq!(inc::to_string(&key_sorted(theirs)).unwrap(), tj::to_string(&mine).unwrap());
+}
+
+/// `common::key_sorted` reorders EVERY object the gate compares, not only the
+/// top-level one: objects inside objects, objects inside arrays, duplicate
+/// keys, and a 120-level chain in which every level is out of order.
+///
+/// On the default `BTreeMap` backing the function is the identity, and this
+/// test pins that. On the `IndexMap` backing (`preserve_order`, unified in by
+/// `crates/trust-certify` in any selection that contains it, or asked for
+/// directly with `targo --unverified test -p trust-json --features
+/// incumbent-serde-json/preserve_order`) it is the only thing between the gate
+/// and a byte comparison in the document's own order; there the test also
+/// asserts that the raw incumbent rendering really was out of order, so it
+/// cannot pass by having had nothing to sort. A normaliser that stopped at the
+/// top level, or skipped arrays, fails here on that backing.
+#[test]
+fn the_gates_view_of_the_incumbent_is_key_sorted_at_every_depth() {
+    fn deep_chain(depth: usize) -> String {
+        // `{"z":[{"y":0,"x":{"z":[ … ]}}]}`: every level is out of order, and
+        // every other level is an object inside an array.
+        let mut s = String::new();
+        for _ in 0..depth {
+            s.push_str(r#"{"z":[{"y":0,"x":"#);
+        }
+        s.push_str("null");
+        for _ in 0..depth {
+            s.push_str("}]}");
+        }
+        s
+    }
+    let docs: Vec<String> = vec![
+        r#"{"b":{"d":1,"c":2},"a":0}"#.to_owned(),
+        r#"[{"b":0,"a":0},[{"d":0,"c":{"f":0,"e":0}}]]"#.to_owned(),
+        r#"{"z":[{"\u00e9":0,"~":0,"A":0,"":0}],"m":{"y":{"x":{"w":[{"v":0,"u":0}]}}}}"#.to_owned(),
+        // duplicate keys collapse last-wins; the surviving key still sorts.
+        r#"{"b":1,"a":1,"b":2,"c":{"e":1,"d":1,"e":2}}"#.to_owned(),
+        deep_chain(40),
+    ];
+
+    fn assert_sorted_everywhere(v: &inc::Value, path: &str) {
+        match v {
+            inc::Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    assert_sorted_everywhere(item, &format!("{path}[{i}]"));
+                }
+            }
+            inc::Value::Object(map) => {
+                let keys: Vec<&String> = map.keys().collect();
+                assert!(
+                    keys.windows(2).all(|w| w[0] < w[1]),
+                    "{path}: the gate's view of the incumbent iterates {keys:?}, not key order"
+                );
+                for (k, item) in map {
+                    assert_sorted_everywhere(item, &format!("{path}.{k}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let order = incumbent_order().unwrap();
+    for src in &docs {
+        let raw: inc::Value = inc::from_str(src).unwrap();
+        let view = key_sorted(raw.clone());
+        // Only the ORDER moved: same keys, same values, same carriers.
+        assert_eq!(view, raw, "key_sorted changed content, not only order, for {src}");
+        assert_sorted_everywhere(&view, "$");
+
+        let ours = tj::from_str(src).unwrap();
+        assert_eq!(inc::to_string(&view).unwrap(), tj::to_string(&ours).unwrap(), "{src}");
+        assert_eq!(
+            inc::to_string_pretty(&view).unwrap(),
+            tj::to_string_pretty(&ours).unwrap(),
+            "{src}"
+        );
+        // ... and the gate's own entry point is this same view.
+        assert_eq!(
+            inc::to_string(&inc_from_str(src).unwrap()).unwrap(),
+            inc::to_string(&view).unwrap()
+        );
+
+        let raw_bytes = inc::to_string(&raw).unwrap();
+        match order {
+            IncumbentOrder::Sorted => assert_eq!(raw_bytes, inc::to_string(&view).unwrap()),
+            IncumbentOrder::Insertion => assert_ne!(
+                raw_bytes,
+                inc::to_string(&view).unwrap(),
+                "every document here is out of key order somewhere, so the insertion-ordered \
+                 incumbent must render it differently from the gate's view: {src}"
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 5. Parsing.
 // ---------------------------------------------------------------------------
-
 
 #[test]
 fn parse_agrees_on_an_enumerated_malformed_table() {
@@ -672,11 +758,7 @@ fn parse_agrees_over_random_number_texts() {
         }
         let int_digits = 1 + rng.below(25);
         for k in 0..int_digits {
-            let d = if k == 0 {
-                b'1' + rng.below(9) as u8
-            } else {
-                b'0' + rng.below(10) as u8
-            };
+            let d = if k == 0 { b'1' + rng.below(9) as u8 } else { b'0' + rng.below(10) as u8 };
             s.push(d as char);
         }
         if rng.below(2) == 0 {
@@ -722,7 +804,10 @@ fn parse_agrees_over_random_byte_soup() {
         check_parse(&s);
     }
     println!("  byte soup: 200000 inputs, {accepted} accepted by both");
-    assert!(accepted > 100, "the soup never produced valid JSON -- the generator, not the parser, is what got tested");
+    assert!(
+        accepted > 100,
+        "the soup never produced valid JSON -- the generator, not the parser, is what got tested"
+    );
 }
 
 #[test]
@@ -737,15 +822,9 @@ fn the_surprising_parse_behaviours_are_preserved() {
 
     assert!(tj::from_str("1e400").is_err() && inc::from_str::<inc::Value>("1e400").is_err());
     assert_eq!(tj::from_str("1e-400").unwrap().to_string(), "0.0");
-    assert_eq!(
-        inc::from_str::<inc::Value>("1e-400").unwrap().to_string(),
-        "0.0"
-    );
+    assert_eq!(inc::from_str::<inc::Value>("1e-400").unwrap().to_string(), "0.0");
 
-    assert_eq!(
-        tj::from_str(r#"{"a":1,"a":2}"#).unwrap().to_string(),
-        r#"{"a":2}"#
-    );
+    assert_eq!(tj::from_str(r#"{"a":1,"a":2}"#).unwrap().to_string(), r#"{"a":2}"#);
 }
 
 #[test]

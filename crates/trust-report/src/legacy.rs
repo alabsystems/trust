@@ -19,19 +19,19 @@ pub fn build_report(
     crate_name: &str,
     results: &[(VerificationCondition, VerificationResult)],
 ) -> ProofReport {
-    let mut by_function: BTreeMap<String, Vec<(&VerificationCondition, &VerificationResult)>> =
+    let mut by_function: BTreeMap<&str, Vec<(&VerificationCondition, &VerificationResult)>> =
         BTreeMap::new();
 
     for (vc, result) in results {
-        by_function.entry(vc.function.as_str().to_string()).or_default().push((vc, result));
+        by_function.entry(vc.function.as_str()).or_default().push((vc, result));
     }
 
-    let mut functions = Vec::new();
+    let mut functions = Vec::with_capacity(by_function.len());
     let mut total_proved = 0;
     let mut total_failed = 0;
     let mut total_unknown = 0;
 
-    for (func_name, pairs) in &by_function {
+    for (&func_name, pairs) in &by_function {
         let mut proved = Vec::new();
         let mut failed = Vec::new();
         let mut unknown = Vec::new();
@@ -77,10 +77,13 @@ pub fn build_report(
             }
         }
 
-        functions.push(FunctionReport { function: func_name.clone(), proved, failed, unknown });
+        functions.push(FunctionReport {
+            function: func_name.to_string(),
+            proved,
+            failed,
+            unknown,
+        });
     }
-
-    functions.sort_by(|a, b| a.function.cmp(&b.function));
 
     ProofReport {
         crate_name: crate_name.to_string(),

@@ -1,0 +1,1 @@
+def twice_a (a b : UInt64) : UInt64 := b

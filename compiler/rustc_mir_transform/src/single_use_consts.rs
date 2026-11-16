@@ -1,10 +1,11 @@
 use rustc_index::IndexVec;
 use rustc_index::bit_set::DenseBitSet;
-use rustc_middle::bug;
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
+use rustc_span::bug;
 
+use crate::PassPolicy;
 use crate::strip_debuginfo::drop_invalid_debuginfos;
 
 /// Various parts of MIR building introduce temporaries that are commonly not needed.
@@ -24,8 +25,8 @@ use crate::strip_debuginfo::drop_invalid_debuginfos;
 pub(super) struct SingleUseConsts;
 
 impl<'tcx> crate::MirPass<'tcx> for SingleUseConsts {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() > 0
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 1)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -39,6 +40,7 @@ impl<'tcx> crate::MirPass<'tcx> for SingleUseConsts {
 
         finder.visit_body(body);
 
+        let mut modified_debug_info = false;
         for (local, locations) in finder.locations.iter_enumerated() {
             if finder.ineligible_locals.contains(local) {
                 continue;
@@ -67,6 +69,7 @@ impl<'tcx> crate::MirPass<'tcx> for SingleUseConsts {
                 for var_debug_info in &mut body.var_debug_info {
                     replacer.visit_var_debug_info(var_debug_info);
                 }
+                modified_debug_info = true;
             }
 
             let Some(use_loc) = locations.use_loc else { continue };
@@ -85,11 +88,9 @@ impl<'tcx> crate::MirPass<'tcx> for SingleUseConsts {
             }
         }
 
-        drop_invalid_debuginfos(body);
-    }
-
-    fn is_required(&self) -> bool {
-        false
+        if modified_debug_info {
+            drop_invalid_debuginfos(body);
+        }
     }
 }
 

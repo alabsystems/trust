@@ -160,19 +160,11 @@ impl Error {
     }
 
     pub(crate) fn syntax(code: ErrorCode, line: usize, column: usize) -> Self {
-        Error {
-            err: Box::new(ErrorImpl { code, line, column }),
-        }
+        Error { err: Box::new(ErrorImpl { code, line, column }) }
     }
 
     pub(crate) fn io(error: std::io::Error) -> Self {
-        Error {
-            err: Box::new(ErrorImpl {
-                code: ErrorCode::Io(error),
-                line: 0,
-                column: 0,
-            }),
-        }
+        Error { err: Box::new(ErrorImpl { code: ErrorCode::Io(error), line: 0, column: 0 }) }
     }
 
     /// Builds a data error the way `serde::de::Error::custom` does, so the
@@ -193,11 +185,7 @@ impl Display for Error {
         if self.err.line == 0 {
             Display::fmt(&self.err.code, f)
         } else {
-            write!(
-                f,
-                "{} at line {} column {}",
-                self.err.code, self.err.line, self.err.column
-            )
+            write!(f, "{} at line {} column {}", self.err.code, self.err.line, self.err.column)
         }
     }
 }

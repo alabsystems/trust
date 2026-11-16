@@ -14,4 +14,10 @@ path = "main.rs"
 rustdoc = { path = "../../librustdoc" }
 
 [features]
-jemalloc = ['rustdoc/jemalloc']
+# Trust: upstream removed librustdoc's `jemalloc` feature in 1.101 (the
+# allocator is chosen by the driver); `max_level_info` is what bootstrap
+# passes now.
+max_level_info = ["rustdoc/max_level_info"]
+
+[package.metadata.rust-analyzer]
+rustc_private = true

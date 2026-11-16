@@ -1,0 +1,25 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+;
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+; RUN: %tpde_test --run-until=ir --print-ir %s | FileCheck %s --dump-input always
+
+; CHECK: Printing IR
+
+; CHECK-LABEL: Function func
+func() {
+; CHECK-NEXT: Block entry
+entry:
+; CHECK-NEXT: Value a (any)
+  %a =
+; CHECK-NEXT: Value b (any)
+  %b =
+; CHECK-NEXT: Value c (add)
+; CHECK-NEXT: Op a
+; CHECK-NEXT: Op b
+  %c = add %a, %b
+; CHECK-NEXT: Value (terminate)
+  terminate
+}
+
+; CHECK-EMPTY

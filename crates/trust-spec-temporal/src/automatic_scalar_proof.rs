@@ -172,7 +172,7 @@ fn render_expr(expression: &CleanScalarExpr) -> String {
                     tasks.push(Task::Visit(condition));
                 }
                 // These forms are in the wider finite ABI, but were never
-                // accepted by the retired DSL's owner-ratified scalar grammar.
+                // accepted by the retired DSL's ratified scalar grammar.
                 CleanScalarExpr::Neq(..)
                 | CleanScalarExpr::Or(..)
                 | CleanScalarExpr::And(..)

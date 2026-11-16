@@ -19,6 +19,6 @@ unsafe extern "C" {
 /// `buf` is a caller-supplied raw pointer with no non-null evidence — the
 /// summary's parameter-1 non-null obligation must fire.
 pub fn leak_bytes(fd: i32, buf: *const u8, n: usize) -> isize {
-    // SAFETY: none — this is the mutant; the wild `buf` is the injected bug.
+    // UNSOUND, deliberately: this is the mutant; the wild `buf` is the injected bug.
     unsafe { write(fd, buf, n) }
 }

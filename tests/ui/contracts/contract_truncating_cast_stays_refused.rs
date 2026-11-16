@@ -56,7 +56,7 @@ pub fn unsigned_to_same_width_signed(a: u8) -> u8 { //~ WARN `#[trust::requires]
     a
 }
 
-fn main() { //~ WARN Trust Level 0 safety verification incomplete
+fn main() {
     let _ = truncating(0);
     let _ = narrowing(0);
     let _ = sign_changing(0);

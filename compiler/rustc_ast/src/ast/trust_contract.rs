@@ -455,7 +455,9 @@ pub fn trust_loop_clause_attr_kind(attr: &Attribute) -> Option<LoopClauseKind> {
 #[must_use]
 pub fn trust_loop_clause_attr_payload(attr: &Attribute) -> Option<&DelimArgs> {
     let AttrKind::Normal(normal) = &attr.kind else { return None };
-    match normal.item.args.unparsed_ref()? {
+    // Upstream 1.101: `AttrItem::args` is the `AttrArgs` directly (the
+    // parsed/unparsed `AttrItemKind` split is gone from the AST).
+    match &normal.item.args {
         AttrArgs::Delimited(args) => Some(args),
         AttrArgs::Empty | AttrArgs::Eq { .. } => None,
     }

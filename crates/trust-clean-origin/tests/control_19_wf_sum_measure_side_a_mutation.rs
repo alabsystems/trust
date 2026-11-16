@@ -253,10 +253,8 @@ fn build_cnt3(mutation: Mutation) -> (Expr, Expr) {
     let n = f.next();
     let rec_ty = {
         let k = f.next();
-        let inner = Expr::arrow(
-            lt(Expr::fvar(k), Expr::fvar(n)),
-            Expr::app(motive.clone(), Expr::fvar(k)),
-        );
+        let inner =
+            Expr::arrow(lt(Expr::fvar(k), Expr::fvar(n)), Expr::app(motive.clone(), Expr::fvar(k)));
         Expr::pi(BinderInfo::Default, nat(), inner.abstract_fvar(k))
     };
     let rec = f.next();
@@ -269,12 +267,7 @@ fn build_cnt3(mutation: Mutation) -> (Expr, Expr) {
     // `Nat.sub_lt x 1 h (Nat.zero_lt_succ Nat.zero) : Nat.lt (Nat.sub x 1) x`
     let decrease = Expr::apps(
         c("Nat.sub_lt"),
-        [
-            Expr::fvar(x),
-            one.clone(),
-            Expr::fvar(h),
-            Expr::app(c("Nat.zero_lt_succ"), zero.clone()),
-        ],
+        [Expr::fvar(x), one.clone(), Expr::fvar(h), Expr::app(c("Nat.zero_lt_succ"), zero.clone())],
     );
 
     // `rec m hm x' y' z' prf` — arity + 3 = SIX arguments, the decrease LAST.
@@ -283,14 +276,10 @@ fn build_cnt3(mutation: Mutation) -> (Expr, Expr) {
     } else {
         Expr::fvar(x)
     };
-    let call = Expr::apps(Expr::fvar(rec), [
-        major,
-        Expr::fvar(hm),
-        x_minus_1,
-        Expr::fvar(y),
-        Expr::fvar(z),
-        decrease,
-    ]);
+    let call = Expr::apps(
+        Expr::fvar(rec),
+        [major, Expr::fvar(hm), x_minus_1, Expr::fvar(y), Expr::fvar(z), decrease],
+    );
 
     let then_lam = Expr::lam(BinderInfo::Default, cond.clone(), call.abstract_fvar(h));
     let h_neg = f.next();
@@ -302,13 +291,16 @@ fn build_cnt3(mutation: Mutation) -> (Expr, Expr) {
         // functions rather than the same one twice.
         Expr::fvar(y).abstract_fvar(h_neg),
     );
-    let dite_app = Expr::apps(c_at("dite", vec![l1.clone()]), [
-        nat(),
-        cond.clone(),
-        Expr::apps(c("Nat.decLt"), [zero.clone(), Expr::fvar(x)]),
-        then_lam,
-        else_lam,
-    ]);
+    let dite_app = Expr::apps(
+        c_at("dite", vec![l1.clone()]),
+        [
+            nat(),
+            cond.clone(),
+            Expr::apps(c("Nat.decLt"), [zero.clone(), Expr::fvar(x)]),
+            then_lam,
+            else_lam,
+        ],
+    );
 
     let functional = {
         let t = Expr::lam(BinderInfo::Default, hm_ty, dite_app.abstract_fvar(hm));
@@ -322,14 +314,10 @@ fn build_cnt3(mutation: Mutation) -> (Expr, Expr) {
     // value := fun a b c => fix … (Nat.succ a) a b c (Nat.le.refl (Nat.succ a))
     let (a_o, b_o, c_o) = (f.next(), f.next(), f.next());
     let succ_m = Expr::app(succ.clone(), Expr::fvar(a_o));
-    let fix = Expr::apps(c_at("WellFounded.fix", vec![l1.clone(), l1]), [
-        nat(),
-        motive,
-        relation,
-        hwf,
-        functional,
-        succ_m.clone(),
-    ]);
+    let fix = Expr::apps(
+        c_at("WellFounded.fix", vec![l1.clone(), l1]),
+        [nat(), motive, relation, hwf, functional, succ_m.clone()],
+    );
     // THE PERMUTATION, and the only thing row (a) changes: the last two
     // parameter arguments are exchanged. The seed and its proof are untouched,
     // because the measure is parameter 0 and the permutation does not move it —
@@ -340,12 +328,10 @@ fn build_cnt3(mutation: Mutation) -> (Expr, Expr) {
         [Expr::fvar(a_o), Expr::fvar(b_o), Expr::fvar(c_o)]
     };
     let seed_proof = Expr::app(c("Nat.le.refl"), succ_m);
-    let applied = Expr::apps(fix, [
-        parameters[0].clone(),
-        parameters[1].clone(),
-        parameters[2].clone(),
-        seed_proof,
-    ]);
+    let applied = Expr::apps(
+        fix,
+        [parameters[0].clone(), parameters[1].clone(), parameters[2].clone(), seed_proof],
+    );
     let value = {
         let t = Expr::lam(BinderInfo::Default, nat(), applied.abstract_fvar(c_o));
         let t = Expr::lam(BinderInfo::Default, nat(), t.abstract_fvar(b_o));
@@ -439,16 +425,12 @@ fn rewrite_call(expr: &Expr, depth: u32, edit: &dyn Fn(usize, &Expr) -> Expr) ->
             let ExprKind::App(function, argument) = expr.kind() else { unreachable!() };
             Expr::app(rewrite_call(function, depth, edit), rewrite_call(argument, depth, edit))
         }
-        ExprKind::Lam(binder, ty, body) => Expr::lam(
-            *binder,
-            rewrite_call(ty, depth, edit),
-            rewrite_call(body, depth + 1, edit),
-        ),
-        ExprKind::Pi(binder, ty, body) => Expr::pi(
-            *binder,
-            rewrite_call(ty, depth, edit),
-            rewrite_call(body, depth + 1, edit),
-        ),
+        ExprKind::Lam(binder, ty, body) => {
+            Expr::lam(*binder, rewrite_call(ty, depth, edit), rewrite_call(body, depth + 1, edit))
+        }
+        ExprKind::Pi(binder, ty, body) => {
+            Expr::pi(*binder, rewrite_call(ty, depth, edit), rewrite_call(body, depth + 1, edit))
+        }
         _ => expr.clone(),
     }
 }
@@ -587,19 +569,12 @@ fn control_19_a_a_permuted_spine_is_refused_by_the_gate_alone() {
     let l1 = Level::succ(Level::zero());
     let eq_at = |lhs: Expr, rhs: Expr| Expr::apps(c_at("Eq", vec![l1.clone()]), [nat(), lhs, rhs]);
     let value_of = |callee: &str, want: u64| {
-        let applied = Expr::apps(c(callee), [
-            Expr::nat_lit(2),
-            Expr::nat_lit(7),
-            Expr::nat_lit(9),
-        ]);
+        let applied = Expr::apps(c(callee), [Expr::nat_lit(2), Expr::nat_lit(7), Expr::nat_lit(9)]);
         Declaration::Theorem {
             name: Name::from_string(&format!("{callee}_2_7_9")),
             level_params: vec![],
             type_: eq_at(applied, Expr::nat_lit(want)),
-            value: Expr::apps(c_at("Eq.refl", vec![l1.clone()]), [
-                nat(),
-                Expr::nat_lit(want),
-            ]),
+            value: Expr::apps(c_at("Eq.refl", vec![l1.clone()]), [nat(), Expr::nat_lit(want)]),
         }
     };
     env.add_decl(value_of("cnt3", 7)).expect("`cnt3 2 7 9` must COMPUTE to 7");
@@ -612,9 +587,10 @@ fn control_19_a_a_permuted_spine_is_refused_by_the_gate_alone() {
     );
 
     // THE GATE, ALONE, REFUSES IT.
-    let refusal = gate(Mutation::PermutedSpine)
-        .expect_err("a permuted spine must never admit: the emitted body would compute `b` for a \
-                     declaration that denotes `c`");
+    let refusal = gate(Mutation::PermutedSpine).expect_err(
+        "a permuted spine must never admit: the emitted body would compute `b` for a \
+                     declaration that denotes `c`",
+    );
     assert!(
         refusal.contains("PERMUTED") && refusal.contains("NotWellFoundedRecursor"),
         "the refusal must name the permutation, from the gate's OWN spine parse: {refusal}"
@@ -688,9 +664,10 @@ fn control_19_c_a_motive_hypothesis_at_another_spelling_is_refused() {
 /// R3e the gate decided nothing about it.
 #[test]
 fn control_19_d_a_major_premise_that_is_not_the_measure_is_refused() {
-    let refusal = gate(Mutation::MajorPremise)
-        .expect_err("a major premise other than the measure at the enclosing parameters must not \
-                     admit — it is BORROWED into side B unexamined");
+    let refusal = gate(Mutation::MajorPremise).expect_err(
+        "a major premise other than the measure at the enclosing parameters must not \
+                     admit — it is BORROWED into side B unexamined",
+    );
     assert!(
         refusal.contains("MAJOR PREMISE"),
         "the refusal must name the major premise: {refusal}"

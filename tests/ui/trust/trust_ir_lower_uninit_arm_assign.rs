@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-UI: a local with NO pre-split binding that EVERY reaching arm binds
 // joins the if/match merge — the declared-uninit definite-initialization
 // shape. Sound on rustc's own grounds: a DIVERGED arm contributes no join

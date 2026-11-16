@@ -52,6 +52,7 @@ fn widening_mul_fn(src: Ty, dst: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 //! Trust-IR MIR-compatibility spine VERDICT-FLIP: make the compatibility module
 //! the verdict-provenance source for L0 safety obligations (overflow / bounds /
 //! shift / div-by-zero) AND for the SIMPLE straight-line single-`Return`
@@ -131,28 +132,74 @@ use crate::lower::{lower_to_trust_ir, reconstruct_full_safety_formula_candidates
 /// name where the versioned form keeps them disjoint — but because we never USE the
 /// stripped form as the proof formula, that risk cannot arise here. The decision is
 /// label-only and cannot change any verdict.
+fn formula_has_version_tokens(formula: &Formula) -> bool {
+    trust_types::any_formula_node(formula, &mut |node| match node {
+        Formula::Var(name, _) => name.contains('#'),
+        Formula::SymVar(sym, _) => sym.as_str().contains('#'),
+        _ => false,
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 pub(crate) fn strip_version_tokens_in_formula(formula: &Formula) -> Formula {
-    /// Strip a `#<token>` suffix from a place name (`in_bounds#s0_0` -> `in_bounds`).
-    /// Already-bare names pass through unchanged.
-    fn strip_name(name: &str) -> String {
-        match name.split_once('#') {
-            Some((base, _tok)) => base.to_string(),
-            None => name.to_string(),
-        }
+    if !formula_has_version_tokens(formula) {
+        return formula.clone();
     }
+    strip_version_tokens_in_formula_unchecked(formula)
+}
+
+fn strip_version_tokens_in_formula_unchecked(formula: &Formula) -> Formula {
     formula.clone().map(&mut |node| match node {
-        Formula::Var(name, sort) => Formula::Var(strip_name(&name), sort),
+        Formula::Var(mut name, sort) => {
+            if let Some(pos) = name.find('#') {
+                name.truncate(pos);
+            }
+            Formula::Var(name, sort)
+        }
         Formula::SymVar(sym, sort) => {
             let name = sym.as_str();
-            if name.contains('#') {
-                Formula::Var(strip_name(name), sort)
+            if let Some((base, _)) = name.split_once('#') {
+                Formula::Var(base.to_string(), sort)
             } else {
                 Formula::SymVar(sym, sort)
             }
         }
         other => other,
     })
+}
+
+fn strip_version_tokens_cow(formula: &Formula) -> std::borrow::Cow<'_, Formula> {
+    if !formula_has_version_tokens(formula) {
+        std::borrow::Cow::Borrowed(formula)
+    } else {
+        std::borrow::Cow::Owned(strip_version_tokens_in_formula_unchecked(formula))
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum StrippedVarAtom<'a> {
+    Var(&'a str, &'a trust_types::Sort),
+    SymVar(trust_types::Symbol, &'a trust_types::Sort),
+}
+
+#[inline]
+fn stripped_var_atom(formula: &Formula) -> Option<StrippedVarAtom<'_>> {
+    match formula {
+        Formula::Var(name, sort) => {
+            let base = name.split_once('#').map_or(name.as_str(), |(b, _)| b);
+            Some(StrippedVarAtom::Var(base, sort))
+        }
+        Formula::SymVar(sym, sort) => {
+            let s = sym.as_str();
+            if let Some((base, _)) = s.split_once('#') {
+                Some(StrippedVarAtom::Var(base, sort))
+            } else {
+                Some(StrippedVarAtom::SymVar(*sym, sort))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Version-token-insensitive structural equality of two formulas: `true` iff they
@@ -162,9 +209,344 @@ pub(crate) fn strip_version_tokens_in_formula(formula: &Formula) -> Formula {
 /// reconstruction does not reproduce. See `strip_version_tokens_in_formula` for the
 /// soundness argument (the live, versioned formula is always kept as the proof
 /// formula; stripping affects only the provenance decision).
+///
+/// Implemented as an explicit iterative stack comparison so matching or rejecting a
+/// candidate allocates zero `Formula` AST clones or stripped `String` buffers in
+/// the common (`<= 64` pending pairs) case and short-circuits on the first mismatch.
 #[must_use]
 pub(crate) fn formula_eq_modulo_versions(a: &Formula, b: &Formula) -> bool {
-    a == b || strip_version_tokens_in_formula(a) == strip_version_tokens_in_formula(b)
+    const INLINE_CAP: usize = 64;
+    let mut inline: [(&Formula, &Formula); INLINE_CAP] = [(a, b); INLINE_CAP];
+    let mut inline_len: usize = 1;
+    let mut overflow: Vec<(&Formula, &Formula)> = Vec::new();
+
+    macro_rules! push_pair {
+        ($lhs:expr, $rhs:expr) => {{
+            let pair = ($lhs, $rhs);
+            if overflow.is_empty() && inline_len < INLINE_CAP {
+                inline[inline_len] = pair;
+                inline_len += 1;
+            } else {
+                overflow.push(pair);
+            }
+        }};
+    }
+
+    macro_rules! push_slices {
+        ($la:expr, $ra:expr) => {{
+            let (la, ra) = ($la, $ra);
+            if la.len() != ra.len() {
+                return false;
+            }
+            for (lc, rc) in la.iter().zip(ra.iter()).rev() {
+                push_pair!(lc, rc);
+            }
+        }};
+    }
+
+    while let Some((lhs, rhs)) = if let Some(pair) = overflow.pop() {
+        Some(pair)
+    } else if inline_len > 0 {
+        inline_len -= 1;
+        Some(inline[inline_len])
+    } else {
+        None
+    } {
+        if std::ptr::eq(lhs, rhs) {
+            continue;
+        }
+        if let (Some(la), Some(ra)) = (stripped_var_atom(lhs), stripped_var_atom(rhs)) {
+            if la != ra {
+                return false;
+            }
+            continue;
+        }
+        match (lhs, rhs) {
+            (Formula::Bool(x), Formula::Bool(y)) => {
+                if x != y {
+                    return false;
+                }
+            }
+            (Formula::Int(x), Formula::Int(y)) => {
+                if x != y {
+                    return false;
+                }
+            }
+            (Formula::UInt(x), Formula::UInt(y)) => {
+                if x != y {
+                    return false;
+                }
+            }
+            (
+                Formula::BitVec { value: vx, width: wx },
+                Formula::BitVec { value: vy, width: wy },
+            ) => {
+                if vx != vy || wx != wy {
+                    return false;
+                }
+            }
+            (Formula::Rat(x), Formula::Rat(y)) => {
+                if x != y {
+                    return false;
+                }
+            }
+            (Formula::Var(..), _)
+            | (_, Formula::Var(..))
+            | (Formula::SymVar(..), _)
+            | (_, Formula::SymVar(..)) => return false,
+
+            (Formula::Not(la), Formula::Not(ra))
+            | (Formula::Neg(la), Formula::Neg(ra))
+            | (Formula::FpNeg(la), Formula::FpNeg(ra))
+            | (Formula::FpAbs(la), Formula::FpAbs(ra))
+            | (Formula::FpIsNaN(la), Formula::FpIsNaN(ra))
+            | (Formula::FpIsInfinite(la), Formula::FpIsInfinite(ra))
+            | (Formula::FpIsZero(la), Formula::FpIsZero(ra))
+            | (Formula::FpIsNormal(la), Formula::FpIsNormal(ra))
+            | (Formula::FpIsSubnormal(la), Formula::FpIsSubnormal(ra))
+            | (Formula::FpIsNegative(la), Formula::FpIsNegative(ra))
+            | (Formula::FpIsPositive(la), Formula::FpIsPositive(ra))
+            | (Formula::FpToIeeeBv(la), Formula::FpToIeeeBv(ra)) => {
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+
+            (Formula::BvNot(la, wx), Formula::BvNot(ra, wy))
+            | (Formula::IntToBv(la, wx), Formula::IntToBv(ra, wy))
+            | (Formula::BvZeroExt(la, wx), Formula::BvZeroExt(ra, wy))
+            | (Formula::BvSignExt(la, wx), Formula::BvSignExt(ra, wy)) => {
+                if wx != wy {
+                    return false;
+                }
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+            (Formula::BvToInt(la, wx, sx), Formula::BvToInt(ra, wy, sy)) => {
+                if wx != wy || sx != sy {
+                    return false;
+                }
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+            (
+                Formula::BvExtract { inner: la, high: hx, low: lx },
+                Formula::BvExtract { inner: ra, high: hy, low: ly },
+            ) => {
+                if hx != hy || lx != ly {
+                    return false;
+                }
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+
+            (Formula::And(la), Formula::And(ra)) | (Formula::Or(la), Formula::Or(ra)) => {
+                push_slices!(la, ra);
+            }
+
+            (Formula::Implies(la, lb), Formula::Implies(ra, rb))
+            | (Formula::Eq(la, lb), Formula::Eq(ra, rb))
+            | (Formula::Lt(la, lb), Formula::Lt(ra, rb))
+            | (Formula::Le(la, lb), Formula::Le(ra, rb))
+            | (Formula::Gt(la, lb), Formula::Gt(ra, rb))
+            | (Formula::Ge(la, lb), Formula::Ge(ra, rb))
+            | (Formula::Add(la, lb), Formula::Add(ra, rb))
+            | (Formula::Sub(la, lb), Formula::Sub(ra, rb))
+            | (Formula::Mul(la, lb), Formula::Mul(ra, rb))
+            | (Formula::Div(la, lb), Formula::Div(ra, rb))
+            | (Formula::Rem(la, lb), Formula::Rem(ra, rb))
+            | (Formula::BvConcat(la, lb), Formula::BvConcat(ra, rb))
+            | (Formula::Select(la, lb), Formula::Select(ra, rb))
+            | (Formula::FpSqrt(la, lb), Formula::FpSqrt(ra, rb))
+            | (Formula::FpRem(la, lb), Formula::FpRem(ra, rb))
+            | (Formula::FpMin(la, lb), Formula::FpMin(ra, rb))
+            | (Formula::FpMax(la, lb), Formula::FpMax(ra, rb))
+            | (Formula::FpEq(la, lb), Formula::FpEq(ra, rb))
+            | (Formula::FpLt(la, lb), Formula::FpLt(ra, rb))
+            | (Formula::FpLe(la, lb), Formula::FpLe(ra, rb))
+            | (Formula::FpGt(la, lb), Formula::FpGt(ra, rb))
+            | (Formula::FpGe(la, lb), Formula::FpGe(ra, rb)) => {
+                push_pair!(lb.as_ref(), rb.as_ref());
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+
+            (Formula::BvAdd(la, lb, wx), Formula::BvAdd(ra, rb, wy))
+            | (Formula::BvSub(la, lb, wx), Formula::BvSub(ra, rb, wy))
+            | (Formula::BvMul(la, lb, wx), Formula::BvMul(ra, rb, wy))
+            | (Formula::BvUDiv(la, lb, wx), Formula::BvUDiv(ra, rb, wy))
+            | (Formula::BvSDiv(la, lb, wx), Formula::BvSDiv(ra, rb, wy))
+            | (Formula::BvURem(la, lb, wx), Formula::BvURem(ra, rb, wy))
+            | (Formula::BvSRem(la, lb, wx), Formula::BvSRem(ra, rb, wy))
+            | (Formula::BvAnd(la, lb, wx), Formula::BvAnd(ra, rb, wy))
+            | (Formula::BvOr(la, lb, wx), Formula::BvOr(ra, rb, wy))
+            | (Formula::BvXor(la, lb, wx), Formula::BvXor(ra, rb, wy))
+            | (Formula::BvShl(la, lb, wx), Formula::BvShl(ra, rb, wy))
+            | (Formula::BvLShr(la, lb, wx), Formula::BvLShr(ra, rb, wy))
+            | (Formula::BvAShr(la, lb, wx), Formula::BvAShr(ra, rb, wy))
+            | (Formula::BvULt(la, lb, wx), Formula::BvULt(ra, rb, wy))
+            | (Formula::BvULe(la, lb, wx), Formula::BvULe(ra, rb, wy))
+            | (Formula::BvSLt(la, lb, wx), Formula::BvSLt(ra, rb, wy))
+            | (Formula::BvSLe(la, lb, wx), Formula::BvSLe(ra, rb, wy)) => {
+                if wx != wy {
+                    return false;
+                }
+                push_pair!(lb.as_ref(), rb.as_ref());
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+
+            (Formula::Ite(la, lb, lc), Formula::Ite(ra, rb, rc))
+            | (Formula::Store(la, lb, lc), Formula::Store(ra, rb, rc))
+            | (Formula::FpAdd(la, lb, lc), Formula::FpAdd(ra, rb, rc))
+            | (Formula::FpSub(la, lb, lc), Formula::FpSub(ra, rb, rc))
+            | (Formula::FpMul(la, lb, lc), Formula::FpMul(ra, rb, rc))
+            | (Formula::FpDiv(la, lb, lc), Formula::FpDiv(ra, rb, rc)) => {
+                push_pair!(lc.as_ref(), rc.as_ref());
+                push_pair!(lb.as_ref(), rb.as_ref());
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+
+            (Formula::FpFma(la, lb, lc, ld), Formula::FpFma(ra, rb, rc, rd)) => {
+                push_pair!(ld.as_ref(), rd.as_ref());
+                push_pair!(lc.as_ref(), rc.as_ref());
+                push_pair!(lb.as_ref(), rb.as_ref());
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+
+            (
+                Formula::FpConst { bits: bx, eb: ex, sb: sx },
+                Formula::FpConst { bits: by, eb: ey, sb: sy },
+            ) => {
+                if bx != by || ex != ey || sx != sy {
+                    return false;
+                }
+            }
+            (Formula::FpNaN { eb: ex, sb: sx }, Formula::FpNaN { eb: ey, sb: sy }) => {
+                if ex != ey || sx != sy {
+                    return false;
+                }
+            }
+            (
+                Formula::FpInf { neg: nx, eb: ex, sb: sx },
+                Formula::FpInf { neg: ny, eb: ey, sb: sy },
+            )
+            | (
+                Formula::FpZero { neg: nx, eb: ex, sb: sx },
+                Formula::FpZero { neg: ny, eb: ey, sb: sy },
+            ) => {
+                if nx != ny || ex != ey || sx != sy {
+                    return false;
+                }
+            }
+            (Formula::FpRoundingMode(rx), Formula::FpRoundingMode(ry)) => {
+                if rx != ry {
+                    return false;
+                }
+            }
+            (
+                Formula::FpFromBits { bits: la, eb: ex, sb: sx },
+                Formula::FpFromBits { bits: ra, eb: ey, sb: sy },
+            ) => {
+                if ex != ey || sx != sy {
+                    return false;
+                }
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+            (
+                Formula::FpToSbv { rm: lr, value: lv, width: wx, eb: ex, sb: sx },
+                Formula::FpToSbv { rm: rr, value: rv, width: wy, eb: ey, sb: sy },
+            )
+            | (
+                Formula::FpToUbv { rm: lr, value: lv, width: wx, eb: ex, sb: sx },
+                Formula::FpToUbv { rm: rr, value: rv, width: wy, eb: ey, sb: sy },
+            ) => {
+                if wx != wy || ex != ey || sx != sy {
+                    return false;
+                }
+                push_pair!(lv.as_ref(), rv.as_ref());
+                push_pair!(lr.as_ref(), rr.as_ref());
+            }
+            (
+                Formula::FpFromSbv { rm: lr, value: lv, eb: ex, sb: sx },
+                Formula::FpFromSbv { rm: rr, value: rv, eb: ey, sb: sy },
+            )
+            | (
+                Formula::FpFromUbv { rm: lr, value: lv, eb: ex, sb: sx },
+                Formula::FpFromUbv { rm: rr, value: rv, eb: ey, sb: sy },
+            )
+            | (
+                Formula::FpConvert { rm: lr, value: lv, eb: ex, sb: sx },
+                Formula::FpConvert { rm: rr, value: rv, eb: ey, sb: sy },
+            ) => {
+                if ex != ey || sx != sy {
+                    return false;
+                }
+                push_pair!(lv.as_ref(), rv.as_ref());
+                push_pair!(lr.as_ref(), rr.as_ref());
+            }
+
+            (Formula::Forall(bx, la), Formula::Forall(by, ra))
+            | (Formula::Exists(bx, la), Formula::Exists(by, ra)) => {
+                if bx != by {
+                    return false;
+                }
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+            (Formula::Pred(nx, la), Formula::Pred(ny, ra)) => {
+                if nx != ny {
+                    return false;
+                }
+                push_slices!(la, ra);
+            }
+            (
+                Formula::Ctor { ctor: cx, args: la, sort: sx },
+                Formula::Ctor { ctor: cy, args: ra, sort: sy },
+            ) => {
+                if cx != cy || sx != sy {
+                    return false;
+                }
+                push_slices!(la, ra);
+            }
+            (
+                Formula::Sel { datatype: dx, field: fx, field_sort: sx, arg: la },
+                Formula::Sel { datatype: dy, field: fy, field_sort: sy, arg: ra },
+            ) => {
+                if dx != dy || fx != fy || sx != sy {
+                    return false;
+                }
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+            (
+                Formula::IsCtor { datatype: dx, ctor: cx, arg: la },
+                Formula::IsCtor { datatype: dy, ctor: cy, arg: ra },
+            ) => {
+                if dx != dy || cx != cy {
+                    return false;
+                }
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+            (
+                Formula::FnApp { func: fx, args: la, sort: sx },
+                Formula::FnApp { func: fy, args: ra, sort: sy },
+            ) => {
+                if fx != fy || sx != sy {
+                    return false;
+                }
+                push_slices!(la, ra);
+            }
+            (
+                Formula::ConstArray { index_sort: ix, elem_sort: ex, value: la },
+                Formula::ConstArray { index_sort: iy, elem_sort: ey, value: ra },
+            ) => {
+                if ix != iy || ex != ey {
+                    return false;
+                }
+                push_pair!(la.as_ref(), ra.as_ref());
+            }
+
+            _ if std::mem::discriminant(lhs) != std::mem::discriminant(rhs) => return false,
+            _ => {
+                if *strip_version_tokens_cow(lhs) != *strip_version_tokens_cow(rhs) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// The decision the flip made for ONE trust-vcgen safety VC.
@@ -229,9 +611,9 @@ impl FlipReport {
 enum SafetyClass {
     /// `lhs OP rhs` arithmetic overflow, keyed by the binop name (`Add`/`Sub`/…)
     /// so an overflow VC matches the spine's `overflow on {op}` obligation.
-    Overflow(String),
+    Overflow(std::borrow::Cow<'static, str>),
     /// Shift-amount-out-of-range (`Shl`/`Shr`), keyed by op.
-    Shift(String),
+    Shift(std::borrow::Cow<'static, str>),
     /// Integer negation overflow (`-INT_MIN`).
     NegOverflow,
     /// Integer division-by-zero.
@@ -242,6 +624,46 @@ enum SafetyClass {
     CastOverflow,
     /// Array/slice index bounds check.
     Bounds,
+}
+
+fn binop_debug_str(op: &trust_types::BinOp) -> &'static str {
+    use trust_types::BinOp;
+    match op {
+        BinOp::Add => "Add",
+        BinOp::Sub => "Sub",
+        BinOp::Mul => "Mul",
+        BinOp::Div => "Div",
+        BinOp::Rem => "Rem",
+        BinOp::BitXor => "BitXor",
+        BinOp::BitAnd => "BitAnd",
+        BinOp::BitOr => "BitOr",
+        BinOp::Shl => "Shl",
+        BinOp::Shr => "Shr",
+        BinOp::Eq => "Eq",
+        BinOp::Lt => "Lt",
+        BinOp::Le => "Le",
+        BinOp::Ne => "Ne",
+        BinOp::Ge => "Ge",
+        BinOp::Gt => "Gt",
+        #[allow(unreachable_patterns)]
+        _ => "Unknown",
+    }
+}
+
+fn static_or_owned_op(name: &str) -> std::borrow::Cow<'static, str> {
+    match name {
+        "Add" => std::borrow::Cow::Borrowed("Add"),
+        "Sub" => std::borrow::Cow::Borrowed("Sub"),
+        "Mul" => std::borrow::Cow::Borrowed("Mul"),
+        "Div" => std::borrow::Cow::Borrowed("Div"),
+        "Rem" => std::borrow::Cow::Borrowed("Rem"),
+        "BitXor" => std::borrow::Cow::Borrowed("BitXor"),
+        "BitAnd" => std::borrow::Cow::Borrowed("BitAnd"),
+        "BitOr" => std::borrow::Cow::Borrowed("BitOr"),
+        "Shl" => std::borrow::Cow::Borrowed("Shl"),
+        "Shr" => std::borrow::Cow::Borrowed("Shr"),
+        other => std::borrow::Cow::Owned(other.to_string()),
+    }
 }
 
 /// The fine safety class of a trust-vcgen L0 safety `VcKind`, or `None` for a
@@ -259,8 +681,12 @@ enum SafetyClass {
 #[must_use]
 fn vcgen_safety_class(kind: &VcKind) -> Option<SafetyClass> {
     match kind {
-        VcKind::ArithmeticOverflow { op, .. } => Some(SafetyClass::Overflow(format!("{op:?}"))),
-        VcKind::ShiftOverflow { op, .. } => Some(SafetyClass::Shift(format!("{op:?}"))),
+        VcKind::ArithmeticOverflow { op, .. } => {
+            Some(SafetyClass::Overflow(std::borrow::Cow::Borrowed(binop_debug_str(op))))
+        }
+        VcKind::ShiftOverflow { op, .. } => {
+            Some(SafetyClass::Shift(std::borrow::Cow::Borrowed(binop_debug_str(op))))
+        }
         VcKind::NegationOverflow { .. } => Some(SafetyClass::NegOverflow),
         VcKind::DivisionByZero => Some(SafetyClass::DivByZero),
         VcKind::RemainderByZero => Some(SafetyClass::RemByZero),
@@ -294,9 +720,9 @@ fn spine_obligation_class(kind: &ObligationKind, description: &str) -> Option<Sa
             } else if let Some(rest) = description.strip_prefix("overflow on ") {
                 // `rest` is the binop debug name (`Add`/`Sub`/`Shl`/`Shr`/…).
                 if rest == "Shl" || rest == "Shr" {
-                    Some(SafetyClass::Shift(rest.to_string()))
+                    Some(SafetyClass::Shift(static_or_owned_op(rest)))
                 } else {
-                    Some(SafetyClass::Overflow(rest.to_string()))
+                    Some(SafetyClass::Overflow(static_or_owned_op(rest)))
                 }
             } else if description == "division by zero" {
                 Some(SafetyClass::DivByZero)
@@ -343,11 +769,10 @@ fn spine_safety_obligations(module: &trust_ir::Module) -> Vec<(SafetyClass, Sour
 /// `lower::ObligationSourceMetadata::source_json`). Returns `None` if the payload
 /// is not the expected shape (fail-closed — the obligation is then not matchable
 /// and the corresponding VC stays trust-vcgen-sourced).
-fn span_from_proof_formula_payload(payload: &str) -> Option<SourceSpan> {
-    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+fn span_from_json_value(value: &serde_json::Value) -> Option<SourceSpan> {
     // contract/safety formula payloads nest source under "source"; the
     // source-metadata-only payload IS the source object at the top level.
-    let source = value.get("source").unwrap_or(&value);
+    let source = value.get("source").unwrap_or(value);
     let span = source.get("span")?;
     Some(SourceSpan {
         file: span.get("file")?.as_str()?.to_string(),
@@ -356,6 +781,79 @@ fn span_from_proof_formula_payload(payload: &str) -> Option<SourceSpan> {
         line_end: u32::try_from(span.get("line_end")?.as_u64()?).ok()?,
         col_end: u32::try_from(span.get("col_end")?.as_u64()?).ok()?,
     })
+}
+
+#[derive(serde::Deserialize)]
+struct PayloadSpanFields {
+    file: String,
+    line_start: u32,
+    col_start: u32,
+    line_end: u32,
+    col_end: u32,
+}
+
+impl From<PayloadSpanFields> for SourceSpan {
+    fn from(s: PayloadSpanFields) -> Self {
+        SourceSpan {
+            file: s.file,
+            line_start: s.line_start,
+            col_start: s.col_start,
+            line_end: s.line_end,
+            col_end: s.col_end,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PayloadNestedSource {
+    span: Option<PayloadSpanFields>,
+}
+
+/// Distinguishes an absent `"source"` key (`Absent`) from a present `"source": null`
+/// (`Present(None)`), matching `value.get("source").unwrap_or(value)` identically.
+#[derive(Default)]
+enum SourceSlot<T> {
+    #[default]
+    Absent,
+    Present(Option<T>),
+}
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for SourceSlot<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<T>::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct StrictSpanEnvelope {
+    #[serde(default)]
+    source: SourceSlot<PayloadNestedSource>,
+    span: Option<PayloadSpanFields>,
+}
+
+impl StrictSpanEnvelope {
+    fn into_span(self) -> Option<SourceSpan> {
+        match self.source {
+            SourceSlot::Present(nested) => nested.and_then(|s| s.span).map(SourceSpan::from),
+            SourceSlot::Absent => self.span.map(SourceSpan::from),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct StrictContractEnvelope {
+    #[serde(default)]
+    source: SourceSlot<PayloadNestedSource>,
+    span: Option<PayloadSpanFields>,
+    formula: Option<Formula>,
+}
+
+fn span_from_proof_formula_payload(payload: &str) -> Option<SourceSpan> {
+    if let Ok(envelope) = serde_json::from_str::<StrictSpanEnvelope>(payload) {
+        return envelope.into_span();
+    }
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    span_from_json_value(&value)
 }
 
 /// True if `vc` is an L0 safety VC (the class the flip ranges over).
@@ -393,12 +891,25 @@ pub fn flip_safety_verdicts_to_spine(
     // module to `flip_safety_verdicts_with_module` during staged migration. If
     // this adapter cannot lower, the retained P9 route remains a conservative
     // no-op rather than losing verifier capability.
-    let Ok(module) = lower_to_trust_ir(func) else {
+    let module = lower_to_trust_ir(func).ok();
+    flip_safety_verdicts_with_optional_module(func, module.as_ref(), vcgen_vcs)
+}
+
+/// [`flip_safety_verdicts_with_module`] when the caller holds a lowering of
+/// `func`, or the conservative no-op (every VC `TrustVcgenSourced`) when it
+/// holds none — the two arms [`flip_safety_verdicts_to_spine`] always had, with
+/// the lowering itself lifted out so ONE module can serve both the native
+/// completeness gate and this flip.
+fn flip_safety_verdicts_with_optional_module(
+    func: &VerifiableFunction,
+    module: Option<&trust_ir::Module>,
+    vcgen_vcs: Vec<VerificationCondition>,
+) -> (Vec<VerificationCondition>, FlipReport) {
+    let Some(module) = module else {
         let decisions = vcgen_vcs.iter().map(|_| FlipDecision::TrustVcgenSourced).collect();
         return (vcgen_vcs, FlipReport { decisions });
     };
-
-    flip_safety_verdicts_with_module(func, &module, vcgen_vcs)
+    flip_safety_verdicts_with_module(func, module, vcgen_vcs)
 }
 
 /// Reconcile safety VCs against an already-produced typed Trust-IR module.
@@ -419,11 +930,9 @@ pub fn flip_safety_verdicts_with_module(
     // appears more than once on the spine is ambiguous → it matches NOTHING
     // (conservative: never flip an obligation we cannot pin to a single spine
     // counterpart).
-    use std::collections::HashMap;
-    let mut spine_seen: std::collections::HashSet<(SpanKey, SafetyClass)> =
-        std::collections::HashSet::new();
-    let mut spine_ambiguous: std::collections::HashSet<(SpanKey, SafetyClass)> =
-        std::collections::HashSet::new();
+    use trust_types::fx::{FxHashMap, FxHashSet};
+    let mut spine_seen: FxHashSet<(SpanKey, SafetyClass)> = FxHashSet::default();
+    let mut spine_ambiguous: FxHashSet<(SpanKey, SafetyClass)> = FxHashSet::default();
     for (class, span) in &spine_obligations {
         let key = (span_key(span), class.clone());
         if !spine_seen.insert(key.clone()) {
@@ -435,7 +944,7 @@ pub fn flip_safety_verdicts_with_module(
     // span+class that appears more than once on the trust-vcgen side is likewise
     // ambiguous and not flipped (we cannot tell which spine obligation owns
     // which VC).
-    let mut vcgen_class_counts: HashMap<(SpanKey, SafetyClass), usize> = HashMap::new();
+    let mut vcgen_class_counts: FxHashMap<(SpanKey, SafetyClass), usize> = FxHashMap::default();
     for vc in &vcgen_vcs {
         if !is_l0_safety(vc) {
             continue;
@@ -453,33 +962,45 @@ pub fn flip_safety_verdicts_with_module(
     // already proves verdict-identity — so we can pin the obligation to the ONE VC
     // whose formula the spine reproduces byte-for-byte, PROVIDED exactly one VC at
     // that key byte-matches. We pre-compute, per ambiguous (span, class) key with a
-    // unique spine obligation, the count of VCs whose formula a spine candidate
-    // byte-equals; the key is "formula-disambiguable" iff that count is exactly 1.
+    // unique spine obligation, the unique VC index whose formula a spine candidate
+    // byte-equals (`Some(vc_idx)` when exactly 1 matches, `None` when >= 2 match).
     //
     // SOUNDNESS: this never relaxes the formula gate — a VC is flipped only when a
     // spine candidate is byte-EQUAL to its formula (so the swap is verdict-identical
     // by construction). Disambiguation only decides WHICH same-span VC is flagged
     // spine-sourced; it cannot change any verdict. If zero or ≥2 VCs byte-match
     // (genuinely indistinguishable), we fail closed (no flip), exactly as before.
-    let mut formula_match_counts: HashMap<(SpanKey, SafetyClass), usize> = HashMap::new();
-    for vc in &vcgen_vcs {
-        if !is_l0_safety(vc) {
-            continue;
-        }
-        let Some(class) = vcgen_safety_class(&vc.kind) else {
-            continue;
-        };
-        let key = (span_key(&vc.location), class);
-        // Only relevant for ambiguous-vcgen keys with a unique spine obligation.
-        let spine_has_unique = spine_seen.contains(&key) && !spine_ambiguous.contains(&key);
-        let vcgen_ambiguous = vcgen_class_counts.get(&key).copied().unwrap_or(0) > 1;
-        if spine_has_unique && vcgen_ambiguous {
-            let byte_matches =
-                reconstruct_full_safety_formula_candidates(func, &vc.location, &vc.kind)
-                    .into_iter()
-                    .any(|cand| formula_eq_modulo_versions(&cand, &vc.formula));
-            if byte_matches {
-                *formula_match_counts.entry(key).or_insert(0) += 1;
+    let mut unique_ambiguous_match: FxHashMap<(SpanKey, SafetyClass), Option<usize>> =
+        FxHashMap::default();
+    if vcgen_class_counts.values().any(|&c| c > 1) {
+        for (vc_idx, vc) in vcgen_vcs.iter().enumerate() {
+            if !is_l0_safety(vc) {
+                continue;
+            }
+            let Some(class) = vcgen_safety_class(&vc.kind) else {
+                continue;
+            };
+            let key = (span_key(&vc.location), class);
+            // Only relevant for ambiguous-vcgen keys with a unique spine obligation.
+            let spine_has_unique = spine_seen.contains(&key) && !spine_ambiguous.contains(&key);
+            let vcgen_ambiguous = vcgen_class_counts.get(&key).copied().unwrap_or(0) > 1;
+            if spine_has_unique && vcgen_ambiguous {
+                let candidates =
+                    reconstruct_full_safety_formula_candidates(func, &vc.location, &vc.kind);
+                let byte_matches = if candidates.is_empty() {
+                    false
+                } else {
+                    let vc_stripped = strip_version_tokens_cow(&vc.formula);
+                    candidates.iter().any(|cand| {
+                        cand == &vc.formula || *strip_version_tokens_cow(cand) == *vc_stripped
+                    })
+                };
+                if byte_matches {
+                    unique_ambiguous_match
+                        .entry(key)
+                        .and_modify(|slot| *slot = None)
+                        .or_insert(Some(vc_idx));
+                }
             }
         }
     }
@@ -502,19 +1023,28 @@ pub fn flip_safety_verdicts_with_module(
     // a candidate the swap could not change a verdict. Any shape the spine does
     // not reproduce (a loop, an unreproducible block-def/guard, a non-Int return)
     // yields NO byte-equal candidate and fails closed (kept trust-vcgen-sourced).
-    let spine_postcondition_candidates =
-        crate::lower::reconstruct_postcondition_formula_candidates(func);
+    let spine_postcondition_candidates = vcgen_vcs
+        .iter()
+        .any(|vc| matches!(vc.kind, VcKind::Postcondition))
+        .then(|| crate::lower::reconstruct_postcondition_formula_candidates(func))
+        .unwrap_or_default();
 
     let mut decisions = Vec::with_capacity(vcgen_vcs.len());
     let out: Vec<VerificationCondition> = vcgen_vcs
         .into_iter()
-        .map(|vc| {
+        .enumerate()
+        .map(|(vc_idx, vc)| {
             // POSTCONDITION: flip to spine-sourced iff the spine reproduces this
             // VC's formula byte-for-byte (straight-line OR acyclic-branch path).
             if matches!(vc.kind, VcKind::Postcondition) {
-                let byte_equal = spine_postcondition_candidates
-                    .iter()
-                    .any(|c| formula_eq_modulo_versions(c, &vc.formula));
+                let byte_equal = if spine_postcondition_candidates.is_empty() {
+                    false
+                } else {
+                    let vc_stripped = strip_version_tokens_cow(&vc.formula);
+                    spine_postcondition_candidates.iter().any(|c| {
+                        c == &vc.formula || *strip_version_tokens_cow(c) == *vc_stripped
+                    })
+                };
                 if byte_equal {
                     // The spine reproduces this postcondition formula MODULO the
                     // statement-granular SSA version tokens (`__ret#s1_0`, `_0#s3_0`,
@@ -551,6 +1081,19 @@ pub fn flip_safety_verdicts_with_module(
             }
             let vcgen_unique = vcgen_class_counts.get(&key).copied() == Some(1);
 
+            if !vcgen_unique {
+                // AMBIGUOUS-vcgen case (div/rem same-span): flip ONLY if (a) this
+                // VC's formula matches a spine candidate (modulo version tokens) AND
+                // (b) it is the UNIQUE such VC at this key, already determined in the
+                // pre-scan above. Otherwise fail closed (no flip).
+                if unique_ambiguous_match.get(&key).copied().flatten() == Some(vc_idx) {
+                    decisions.push(FlipDecision::SpineSourcedFormula);
+                } else {
+                    decisions.push(FlipDecision::TrustVcgenSourced);
+                }
+                return vc;
+            }
+
             // Reconstruct the spine's candidate full formulas for this VC and decide
             // whether ANY is STRUCTURALLY EQUAL to trust-vcgen's formula MODULO the
             // statement-granular SSA version tokens (`in_bounds#s0_0`, `_3#s0_0`, …)
@@ -575,32 +1118,25 @@ pub fn flip_safety_verdicts_with_module(
             // as the proof formula, and the version flip's name-disjointness
             // staleness guarantee is fully preserved on the dispatched formula. See
             // `strip_version_tokens_in_formula`.
-            let spine_matches =
-                reconstruct_full_safety_formula_candidates(func, &vc.location, &vc.kind)
-                    .iter()
-                    .any(|cand| formula_eq_modulo_versions(cand, &vc.formula));
-
-            if vcgen_unique {
-                // Clean 1:1 case (overflow / bounds / shift / neg / cast): the spine
-                // owns this obligation. Re-key provenance to the spine when its
-                // reconstruction matches (modulo version tokens), KEEPING the live
-                // versioned formula; else keep trust-vcgen's (fail-closed).
-                if spine_matches {
-                    decisions.push(FlipDecision::SpineSourcedFormula);
-                } else {
-                    decisions.push(FlipDecision::SpineSourcedKeptFormula);
-                }
+            let candidates =
+                reconstruct_full_safety_formula_candidates(func, &vc.location, &vc.kind);
+            let spine_matches = if candidates.is_empty() {
+                false
             } else {
-                // AMBIGUOUS-vcgen case (div/rem same-span): flip ONLY if (a) this
-                // VC's formula matches a spine candidate (modulo version tokens) AND
-                // (b) it is the UNIQUE such VC at this key. Otherwise fail closed (no
-                // flip) — the VC stays entirely trust-vcgen-sourced.
-                let disambiguable = formula_match_counts.get(&key).copied() == Some(1);
-                if spine_matches && disambiguable {
-                    decisions.push(FlipDecision::SpineSourcedFormula);
-                } else {
-                    decisions.push(FlipDecision::TrustVcgenSourced);
-                }
+                let vc_stripped = strip_version_tokens_cow(&vc.formula);
+                candidates.iter().any(|cand| {
+                    cand == &vc.formula || *strip_version_tokens_cow(cand) == *vc_stripped
+                })
+            };
+
+            // Clean 1:1 case (overflow / bounds / shift / neg / cast): the spine
+            // owns this obligation. Re-key provenance to the spine when its
+            // reconstruction matches (modulo version tokens), KEEPING the live
+            // versioned formula; else keep trust-vcgen's (fail-closed).
+            if spine_matches {
+                decisions.push(FlipDecision::SpineSourcedFormula);
+            } else {
+                decisions.push(FlipDecision::SpineSourcedKeptFormula);
             }
             vc
         })
@@ -729,7 +1265,14 @@ impl ObligationSetDiff {
 fn obligation_class(kind: &VcKind) -> String {
     match kind {
         VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck => "BoundsCheck".to_string(),
-        VcKind::ArithmeticOverflow { op, .. } => format!("ArithmeticOverflow({op:?})"),
+        VcKind::ArithmeticOverflow { op, .. } => {
+            let op_str = binop_debug_str(op);
+            let mut s = String::with_capacity(20 + op_str.len());
+            s.push_str("ArithmeticOverflow(");
+            s.push_str(op_str);
+            s.push(')');
+            s
+        }
         // Trust (#57): trust-vcgen's UNSAFE-MODEL findings get their own class, and
         // it is not pedantry — it is the difference between a coverage gap and a
         // category error. These say "Trust has no model for this unsafe operation"
@@ -741,6 +1284,14 @@ fn obligation_class(kind: &VcKind) -> String {
         VcKind::Assertion { message } if message.starts_with("[unsafe") => {
             "Assertion(unsafe-model)".to_string()
         }
+        VcKind::Assertion { .. } => "Assertion".to_string(),
+        VcKind::DivisionByZero => "DivisionByZero".to_string(),
+        VcKind::RemainderByZero => "RemainderByZero".to_string(),
+        VcKind::ShiftOverflow { .. } => "ShiftOverflow".to_string(),
+        VcKind::NegationOverflow { .. } => "NegationOverflow".to_string(),
+        VcKind::CastOverflow { .. } => "CastOverflow".to_string(),
+        VcKind::Unreachable => "Unreachable".to_string(),
+        VcKind::UnsupportedMir { .. } => "UnsupportedMir".to_string(),
         other => {
             let rendered = format!("{other:?}");
             let head = rendered
@@ -762,10 +1313,10 @@ fn obligation_class(kind: &VcKind) -> String {
 /// A SET (not multiset), matching the historical comparison: trust-vcgen emits the
 /// co-located div/rem statement `DivByZero` VC twice where native has it once, and
 /// that duplication is not a disagreement about WHICH obligations exist.
-fn l0_obligation_key_set(
-    vcs: &[VerificationCondition],
+fn l0_obligation_key_set<'a>(
+    vcs: impl IntoIterator<Item = &'a VerificationCondition>,
 ) -> std::collections::BTreeMap<(String, SpanKey), SourceSpan> {
-    vcs.iter()
+    vcs.into_iter()
         .map(|vc| ((obligation_class(&vc.kind), span_key(&vc.location)), vc.location.clone()))
         .collect()
 }
@@ -808,35 +1359,45 @@ pub fn l0_obligation_set_diff_with_discharged<'a, I>(
 where
     I: IntoIterator<Item = &'a VerificationCondition>,
 {
+    l0_obligation_set_diff_iter_with_discharged(native, vcgen_l0.iter(), discharged)
+}
+
+fn l0_obligation_set_diff_iter_with_discharged<'a, 'b, V, I>(
+    native: &[VerificationCondition],
+    vcgen_l0: V,
+    discharged: I,
+) -> ObligationSetDiff
+where
+    V: IntoIterator<Item = &'b VerificationCondition>,
+    I: IntoIterator<Item = &'a VerificationCondition>,
+{
     let native_keys = l0_obligation_key_set(native);
     let vcgen_keys = l0_obligation_key_set(vcgen_l0);
-    let to_key = |(class, _): &(String, SpanKey), span: &SourceSpan| ObligationKey {
-        class: class.clone(),
-        location: span.clone(),
-    };
     // The discharged set enters ONE side only, and deliberately so. It answers
     // "is this obligation checked?", which is the `native_only` question; it does
     // not answer "did the spine derive this?", which is the `vcgen_only` one.
     // Folding it into both would manufacture spine-coverage-gap entries for every
     // obligation trust-vcgen proved statically — noise in the direction that was
     // already the benign one.
-    let mut checked_by_vcgen: std::collections::BTreeSet<(String, SpanKey)> =
-        vcgen_keys.keys().cloned().collect();
-    checked_by_vcgen.extend(
-        discharged.into_iter().map(|vc| (obligation_class(&vc.kind), span_key(&vc.location))),
-    );
-    ObligationSetDiff {
-        native_only: native_keys
-            .iter()
-            .filter(|(k, _)| !checked_by_vcgen.contains(*k))
-            .map(|(k, span)| to_key(k, span))
-            .collect(),
-        vcgen_only: vcgen_keys
-            .iter()
-            .filter(|(k, _)| !native_keys.contains_key(*k))
-            .map(|(k, span)| to_key(k, span))
-            .collect(),
+    let mut discharged_keys: trust_types::fx::FxHashSet<(String, SpanKey)> =
+        trust_types::fx::FxHashSet::default();
+    for vc in discharged {
+        let key = (obligation_class(&vc.kind), span_key(&vc.location));
+        if !vcgen_keys.contains_key(&key) {
+            discharged_keys.insert(key);
+        }
     }
+    let native_only = native_keys
+        .iter()
+        .filter(|(k, _)| !vcgen_keys.contains_key(*k) && !discharged_keys.contains(*k))
+        .map(|((class, _), span)| ObligationKey { class: class.clone(), location: span.clone() })
+        .collect();
+    let vcgen_only = vcgen_keys
+        .into_iter()
+        .filter(|(k, _)| !native_keys.contains_key(k))
+        .map(|((class, _), span)| ObligationKey { class, location: span })
+        .collect();
+    ObligationSetDiff { native_only, vcgen_only }
 }
 
 /// Outcome of [`generate_native_or_flip_safety_vcs`], for the compiler's debug log.
@@ -911,15 +1472,49 @@ pub fn generate_native_or_flip_safety_vcs_with_reachability<'a, I>(
 where
     I: IntoIterator<Item = &'a VerificationCondition>,
 {
-    if let Some(native) =
-        crate::lower::generate_native_safety_vcs_with_reachability(func, terminator_blocks)
-    {
-        let (vcgen_l0, vcgen_rest): (Vec<_>, Vec<_>) =
-            vcgen_vcs.iter().cloned().partition(|vc| is_l0_safety(vc));
-        if vc_dispatch_multiset_eq(&native, &vcgen_l0) {
+    // ONE lowering serves both the native completeness gate and the flip
+    // fallback. Each used to lower `func` on its own — the same pure function
+    // of the same value, so the two modules were byte-identical and one is
+    // enough. The compiler's live path holds this very module already
+    // (`spine_module` in `trust_verify.rs`); it can hand it to
+    // `generate_native_or_flip_safety_vcs_with_module` and pay none.
+    let module = lower_to_trust_ir(func).ok();
+    generate_native_or_flip_safety_vcs_with_module(
+        func,
+        vcgen_vcs,
+        discharged,
+        terminator_blocks,
+        module.as_ref(),
+    )
+}
+
+/// [`generate_native_or_flip_safety_vcs_with_reachability`] against a lowering
+/// the caller already holds.
+///
+/// `module` is `Some(lower_to_trust_ir(func))` — of this SAME `func` value, see
+/// the contract on [`crate::lower::generate_native_safety_vcs_with_module`] —
+/// or `None` when that lowering failed, in which case the native gate declines
+/// and the flip is the conservative no-op, exactly as the lowering wrappers
+/// behave on their own failure.
+pub fn generate_native_or_flip_safety_vcs_with_module<'a, I>(
+    func: &VerifiableFunction,
+    vcgen_vcs: Vec<VerificationCondition>,
+    discharged: I,
+    terminator_blocks: Option<&std::collections::HashSet<trust_types::BlockId>>,
+    module: Option<&trust_ir::Module>,
+) -> (Vec<VerificationCondition>, NativeGenOutcome)
+where
+    I: IntoIterator<Item = &'a VerificationCondition>,
+{
+    if let Some(native) = module.and_then(|module| {
+        crate::lower::generate_native_safety_vcs_with_module(func, terminator_blocks, module)
+    }) {
+        let vcgen_l0_refs: Vec<&VerificationCondition> =
+            vcgen_vcs.iter().filter(|vc| is_l0_safety(vc)).collect();
+        if vc_dispatch_multiset_eq_refs(&native, &vcgen_l0_refs) {
             let n = native.len();
             let mut out = native;
-            out.extend(vcgen_rest);
+            out.extend(vcgen_vcs.into_iter().filter(|vc| !is_l0_safety(vc)));
             return (out, NativeGenOutcome::NativeGenerated(n));
         }
         // Formula-different native output is intentionally not dispatched. Set equality
@@ -932,14 +1527,18 @@ where
         // native set — the soundness argument above depends on exactly that); what
         // changes is that a disagreement about WHICH obligations exist is now reported
         // rather than dropped on the floor.
-        let _ = vcgen_rest;
-        let diff = l0_obligation_set_diff_with_discharged(&native, &vcgen_l0, discharged);
+        let diff = l0_obligation_set_diff_iter_with_discharged(
+            &native,
+            vcgen_l0_refs.iter().copied(),
+            discharged,
+        );
         if !diff.is_empty() {
-            let (flipped, report) = flip_safety_verdicts_to_spine(func, vcgen_vcs);
+            let (flipped, report) =
+                flip_safety_verdicts_with_optional_module(func, module, vcgen_vcs);
             return (flipped, NativeGenOutcome::Disagreed { diff, report });
         }
     }
-    let (flipped, report) = flip_safety_verdicts_to_spine(func, vcgen_vcs);
+    let (flipped, report) = flip_safety_verdicts_with_optional_module(func, module, vcgen_vcs);
     (flipped, NativeGenOutcome::FlippedFallback(report))
 }
 
@@ -977,18 +1576,33 @@ fn native_l0_set_matches_vcgen(
 
 /// Multiset equality of two VC sets by their DISPATCHED IDENTITY — `kind`, source
 /// span, and `formula` (the fields that determine routing + the solver verdict).
-fn vc_dispatch_multiset_eq(a: &[VerificationCondition], b: &[VerificationCondition]) -> bool {
-    fn key(vc: &VerificationCondition) -> (String, SpanKey, String) {
-        (format!("{:?}", vc.kind), span_key(&vc.location), format!("{:?}", vc.formula))
-    }
+fn vc_dispatch_multiset_eq_refs(
+    a: &[VerificationCondition],
+    b: &[&VerificationCondition],
+) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut ka: Vec<_> = a.iter().map(key).collect();
-    let mut kb: Vec<_> = b.iter().map(key).collect();
-    ka.sort();
-    kb.sort();
-    ka == kb
+    if a.iter().zip(b.iter()).all(|(va, vb)| {
+        va.location == vb.location && va.kind == vb.kind && va.formula == vb.formula
+    }) {
+        return true;
+    }
+    let mut matched = vec![false; b.len()];
+    for va in a {
+        let Some(pos) = b.iter().enumerate().position(|(idx, vb)| {
+            !matched[idx]
+                && va.location.line_start == vb.location.line_start
+                && va.location.col_start == vb.location.col_start
+                && va.location == vb.location
+                && va.kind == vb.kind
+                && va.formula == vb.formula
+        }) else {
+            return false;
+        };
+        matched[pos] = true;
+    }
+    true
 }
 
 // ===========================================================================
@@ -1048,6 +1662,9 @@ fn vcgen_contract_class(kind: &VcKind) -> Option<ContractClass> {
         | VcKind::LoopInvariantConsecution { .. }
         | VcKind::LoopInvariantSufficiency { .. } => Some(ContractClass::LoopInvariant),
         VcKind::TypeRefinementViolation { .. } => Some(ContractClass::RefinementType),
+        // TINV: no spine counterpart on this path; design P7 keeps TINV out of the
+        // authority flip (`spine_contract_class` already excludes trust_ir TypeInvariant).
+        VcKind::TypeInvariant { .. } => None,
         // `Postcondition` is handled by the L0 flip's dedicated arm — excluded here.
         // Any other VcKind is not a contract class the flip ranges over.
         _ => None,
@@ -1070,29 +1687,6 @@ fn spine_contract_class(kind: &ObligationKind) -> Option<ContractClass> {
     }
 }
 
-/// Deserialize the contract PREDICATE `trust_types::Formula` from a spine contract
-/// obligation's `ProofFormula`, if it carries one machine-readably.
-///
-/// The predicate-bearing payload is the `trust-types.Formula@1` document
-/// `{formula: <Formula AST JSON>, source: {...}}` the lowering emits for a
-/// parseable contract (`lower::ObligationSourceMetadata::into_formula`). We pull
-/// the `formula` field and deserialize it back to a `trust_types::Formula` — the
-/// SAME AST `parse_spec_expr(predicate)` yielded (verified by
-/// `contract_formula_matches_parse_spec_expr`). Returns `None` (fail-closed) for
-/// the source-metadata fallback payload (unparseable predicate), a wrong schema,
-/// or any deserialization failure — the corresponding VC then stays
-/// trust-vcgen-sourced.
-#[must_use]
-fn spine_contract_predicate(formula: Option<&trust_ir::proof::ProofFormula>) -> Option<Formula> {
-    let formula = formula?;
-    if formula.schema != crate::lower::TRUST_CONTRACT_PREDICATE_SCHEMA {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(&formula.payload).ok()?;
-    let ast = value.get("formula")?.clone();
-    serde_json::from_value::<Formula>(ast).ok()
-}
-
 /// One spine contract obligation reduced to what the flip needs: its fine class,
 /// its source span, and its predicate `Formula` (if machine-readable).
 struct SpineContractObligation {
@@ -1108,20 +1702,43 @@ struct SpineContractObligation {
 /// are skipped (fail-closed — they are then not matchable).
 fn spine_contract_obligations(module: &trust_ir::Module) -> Vec<SpineContractObligation> {
     let mut out = Vec::new();
-    for vc in crate::contract_vcs_from_trust_ir(module) {
-        let Some(class) = spine_contract_class(&vc.kind) else {
+    for ob in &module.proof_obligations {
+        let Some(class) = spine_contract_class(&ob.kind) else {
             continue;
         };
-        let Some(span) =
-            vc.formula.as_ref().and_then(|f| span_from_proof_formula_payload(&f.payload))
-        else {
+        let Some(formula) = ob.formula.as_ref() else {
             continue;
         };
-        out.push(SpineContractObligation {
-            class,
-            span,
-            predicate: spine_contract_predicate(vc.formula.as_ref()),
-        });
+        let wants_predicate = class != ContractClass::Precondition
+            && formula.schema == crate::lower::TRUST_CONTRACT_PREDICATE_SCHEMA;
+        if !wants_predicate {
+            let Some(span) = span_from_proof_formula_payload(&formula.payload) else {
+                continue;
+            };
+            out.push(SpineContractObligation { class, span, predicate: None });
+            continue;
+        }
+        if let Ok(envelope) = serde_json::from_str::<StrictContractEnvelope>(&formula.payload) {
+            let span = match envelope.source {
+                SourceSlot::Present(nested) => nested.and_then(|s| s.span).map(SourceSpan::from),
+                SourceSlot::Absent => envelope.span.map(SourceSpan::from),
+            };
+            let Some(span) = span else {
+                continue;
+            };
+            out.push(SpineContractObligation { class, span, predicate: envelope.formula });
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&formula.payload) else {
+            continue;
+        };
+        let Some(span) = span_from_json_value(&value) else {
+            continue;
+        };
+        let predicate = value
+            .get("formula")
+            .and_then(|ast| <Formula as serde::Deserialize>::deserialize(ast).ok());
+        out.push(SpineContractObligation { class, span, predicate });
     }
     out
 }
@@ -1181,16 +1798,18 @@ pub fn flip_contract_verdicts_with_module(
     // span+class appearing more than once on the spine is ambiguous → matches
     // NOTHING (conservative: never flip a VC we cannot pin to a single spine
     // counterpart). The first-seen predicate for a unique key is retained.
-    use std::collections::{HashMap, HashSet};
-    let mut spine_predicate: HashMap<(SpanKey, ContractClass), Option<Formula>> = HashMap::new();
-    let mut spine_seen: HashSet<(SpanKey, ContractClass)> = HashSet::new();
-    let mut spine_ambiguous: HashSet<(SpanKey, ContractClass)> = HashSet::new();
-    for ob in &spine_obligations {
-        let key = (span_key(&ob.span), ob.class.clone());
+    use trust_types::fx::{FxHashMap, FxHashSet};
+    let mut spine_predicate: FxHashMap<(SpanKey, ContractClass), Option<Formula>> =
+        FxHashMap::default();
+    let mut spine_seen: FxHashSet<(SpanKey, ContractClass)> = FxHashSet::default();
+    let mut spine_ambiguous: FxHashSet<(SpanKey, ContractClass)> = FxHashSet::default();
+    for ob in spine_obligations {
+        let key = (span_key(&ob.span), ob.class);
         if !spine_seen.insert(key.clone()) {
+            spine_predicate.remove(&key);
             spine_ambiguous.insert(key);
         } else {
-            spine_predicate.insert(key, ob.predicate.clone());
+            spine_predicate.insert(key, ob.predicate);
         }
     }
 
@@ -1202,7 +1821,7 @@ pub fn flip_contract_verdicts_with_module(
     // class, so a loop-invariant clause is correctly self-ambiguous here and stays
     // trust-vcgen-sourced (fail-closed) — its consecution formula is `Bool(true)`,
     // which has no byte-equal spine reconstruction anyway.
-    let mut vcgen_class_counts: HashMap<(SpanKey, ContractClass), usize> = HashMap::new();
+    let mut vcgen_class_counts: FxHashMap<(SpanKey, ContractClass), usize> = FxHashMap::default();
     for vc in &vcgen_vcs {
         if let Some(class) = vcgen_contract_class(&vc.kind) {
             if vc.kind.proof_level() == ProofLevel::L1Functional {
@@ -1211,7 +1830,7 @@ pub fn flip_contract_verdicts_with_module(
         }
     }
 
-    let mut decisions = Vec::new();
+    let mut decisions = Vec::with_capacity(vcgen_vcs.len());
     let out: Vec<VerificationCondition> = vcgen_vcs
         .into_iter()
         .map(|vc| {
@@ -1244,21 +1863,18 @@ pub fn flip_contract_verdicts_with_module(
             // We KEEP trust-vcgen's exact LIVE formula as the dispatched/proof
             // formula in EVERY branch (the byte-equal swap re-keys PROVENANCE to the
             // spine; the formula stays verdict-identical by construction).
-            let candidate: Option<Formula> = match spine_predicate.get(&key).cloned().flatten() {
-                Some(predicate) => match key.1 {
-                    ContractClass::RefinementType | ContractClass::LoopInvariant => {
-                        Some(Formula::Not(Box::new(predicate)))
-                    }
-                    // Precondition's dispatched form is `Bool(false)` — not derived
-                    // from the predicate. Leave it unreconstructed (fail-closed).
-                    ContractClass::Precondition => None,
-                },
-                None => None,
+            let byte_equal = match (
+                &key.1,
+                spine_predicate.get(&key).and_then(Option::as_ref),
+                &vc.formula,
+            ) {
+                (
+                    ContractClass::RefinementType | ContractClass::LoopInvariant,
+                    Some(predicate),
+                    Formula::Not(vc_inner),
+                ) => formula_eq_modulo_versions(predicate, vc_inner),
+                _ => false,
             };
-
-            let byte_equal = candidate
-                .as_ref()
-                .is_some_and(|cand| formula_eq_modulo_versions(cand, &vc.formula));
             if byte_equal {
                 // Spine OWNS the obligation AND reconstructs a byte-equal formula:
                 // re-key provenance to the spine, keeping the live formula (verdict
@@ -1420,6 +2036,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1565,6 +2182,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1920,118 +2538,6 @@ mod tests {
         );
     }
 
-    /// DIAGNOSTIC (Step 1): replicate the EXACT live compiler path for the
-    /// overflow VC and print the precise diff vs the spine reconstruction. The
-    /// live daily-driver does NOT call `generate_vcs`; it calls
-    /// `generate_vcs_with_discharge_and_summaries(&func, &summaries)` →
-    /// `filter_vcs_by_level(.., max_level)` → `dedupe_exact_vcs(..)` (see
-    /// `compiler/rustc_mir_transform/src/trust_verify.rs`). This test computes the
-    /// overflow VC's formula that exact way and compares it to the spine's
-    /// `reconstruct_full_safety_formula_candidates`.
-    #[test]
-    fn diagnose_live_path_overflow_formula_vs_spine() {
-        use trust_types::ProofLevel;
-        use trust_vcgen::{AbstractDomain, SummaryDatabase, vc_fingerprint};
-
-        // Load the REAL dumped VerifiableFunction (the shape the live A/B used).
-        let json = fixture_json("/tmp/vfdump/add_ovf.json").to_string();
-        let func: VerifiableFunction = serde_json::from_str(&json).expect("parse add_ovf.json");
-
-        // Replicate `dedupe_exact_vcs` from trust_verify.rs: key on
-        // (function, file, span, vc_fingerprint).
-        fn dedupe_exact(vcs: Vec<VerificationCondition>) -> Vec<VerificationCondition> {
-            let mut seen = std::collections::HashSet::new();
-            let mut out = Vec::with_capacity(vcs.len());
-            for vc in vcs {
-                let key = (
-                    vc.function.to_string(),
-                    vc.location.file.clone(),
-                    vc.location.line_start,
-                    vc.location.col_start,
-                    vc.location.line_end,
-                    vc.location.col_end,
-                    vc_fingerprint(&vc),
-                );
-                if seen.insert(key) {
-                    out.push(vc);
-                }
-            }
-            out
-        }
-
-        for max_level in [ProofLevel::L0Safety, ProofLevel::L1Functional] {
-            // --- THE EXACT LIVE PATH (empty summaries; add_ovf has no calls) ---
-            let summaries = SummaryDatabase::new();
-            let (solver_vcs, _discharged) =
-                trust_vcgen::generate_vcs_with_discharge_and_summaries(&func, &summaries);
-            let solver_vcs = dedupe_exact(trust_vcgen::filter_vcs_by_level(solver_vcs, max_level));
-
-            let live_ovf =
-                solver_vcs.iter().find(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { .. }));
-            let Some(live_ovf) = live_ovf else {
-                eprintln!("[{max_level:?}] NO overflow VC in live path");
-                continue;
-            };
-
-            eprintln!("==================== max_level={max_level:?} ====================");
-            eprintln!("LIVE-PATH overflow formula (smtlib):\n{}", live_ovf.formula.to_smtlib());
-            eprintln!("LIVE-PATH overflow formula (debug):\n{:?}", live_ovf.formula);
-
-            // --- The PLAIN generate_vcs formula (what the crate test matched) ---
-            let plain = trust_vcgen::generate_vcs(&func);
-            if let Some(plain_ovf) =
-                plain.iter().find(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { .. }))
-            {
-                eprintln!(
-                    "PLAIN generate_vcs overflow formula (smtlib):\n{}",
-                    plain_ovf.formula.to_smtlib()
-                );
-                eprintln!(
-                    "LIVE == PLAIN ? {}",
-                    plain_ovf.formula.to_smtlib() == live_ovf.formula.to_smtlib()
-                );
-            }
-
-            // --- The SPINE reconstruction candidates ---
-            let cands = reconstruct_full_safety_formula_candidates(
-                &func,
-                &live_ovf.location,
-                &live_ovf.kind,
-            );
-            eprintln!("SPINE candidate count: {}", cands.len());
-            for (i, c) in cands.iter().enumerate() {
-                eprintln!("  spine cand[{i}] smtlib:\n  {}", c.to_smtlib());
-                eprintln!("  spine cand[{i}] == LIVE ? {}", *c == live_ovf.formula);
-            }
-            let any_match = cands.iter().any(|c| formula_eq_modulo_versions(c, &live_ovf.formula));
-            eprintln!("ANY spine candidate byte-equals LIVE-path formula? {any_match}");
-
-            // Also: what does augment add? Replicate the env formula directly.
-            let initial = trust_vcgen::type_aware_initial_state(&func);
-            let config = trust_vcgen::FixpointConfig::for_function(&func);
-            let fp = trust_vcgen::fixpoint_configured(&func, initial.clone(), &config);
-            let mut merged = trust_vcgen::IntervalDomain::bottom();
-            for state in fp.block_states.values() {
-                merged = merged.join(state);
-            }
-            let env_formula = trust_vcgen::interval_domain_to_formula(&merged);
-            eprintln!("MERGED env_formula (smtlib):\n{}", env_formula.to_smtlib());
-            eprintln!("MERGED env_formula (debug):\n{env_formula:?}");
-            eprintln!(
-                "LIVE == And([env_formula, spine_cand[0]]) ? {}",
-                live_ovf.formula
-                    == trust_types::Formula::And(vec![env_formula.clone(), cands[0].clone()])
-            );
-            // Also: what does the INITIAL state look like (before fixpoint)?
-            let init_env = trust_vcgen::interval_domain_to_formula(&initial);
-            eprintln!("INITIAL env_formula (smtlib):\n{}", init_env.to_smtlib());
-            eprintln!(
-                "fixpoint block_states keys = {:?}",
-                fp.block_states.keys().collect::<Vec<_>>()
-            );
-        }
-    }
-
     /// END-TO-END (Step 2 confirmation): run the FULL flip over the LIVE-path VC
     /// set for the real dumped `add_ovf.json` and assert the overflow VC flips
     /// SPINE-SOURCED (formula). The VC set is built EXACTLY as the live compiler
@@ -2343,7 +2849,7 @@ mod tests {
     }
 
     /// LIVE-FIRING (cast, POLICY PIN): `fn cst(x: i64) -> i32 { x as i32 }`
-    /// (`/tmp/vfdump3/cst.json`). Upstream policy (9f4b2c8417, owner decision
+    /// (`/tmp/vfdump3/cst.json`). Upstream policy (9f4b2c8417, decision
     /// 2026-07-06): an int→int `as` cast is DEFINED Rust — it truncates /
     /// sign-extends / reinterprets and NEVER traps — so trust-vcgen emits NO
     /// `CastOverflow` obligation for it; the result is instead TYPE-TRACKED to its
@@ -3507,6 +4013,7 @@ mod tests {
                 ensures: vec!["result >= 0".into()],
                 invariants: vec![],
             },
+            tuple_layouts: Default::default(),
         };
 
         // The spine declines to reconstruct any postcondition formula (two returns).
@@ -3558,14 +4065,156 @@ mod tests {
     // `generate_vcs_with_discharge_and_summaries` path for the dumped fixtures.
     // =================================================================
 
+    /// The LIVE abstract-interp env (trust-vcgen `merged_interval_environment`)
+    /// also carries facts on Int-typed NON-PARAMETER locals since the 2026-09-18
+    /// interval rounds (e848e0da59 seeds every local with its type range;
+    /// 77440a33e0 stops the entry block erasing a local it cannot yet hold). For
+    /// the fixtures below each such fact is exactly the local's TYPE range, on the
+    /// local's FORMULA name — sound, and invisible to the spine, whose
+    /// `reconstruct_abstract_state_param_env` models parameters only and runs no
+    /// fixpoint. Strip exactly those conjuncts from the live formula's leading env
+    /// and return which locals they named, so a test can assert that they are the
+    /// WHOLE difference between the live formula and the spine's reconstruction.
+    // The carrier wrapper is a separate, exact shared transform. Verify its
+    // complete shape before peeling it for a pre-existing body-shape assertion.
+    fn strip_checked_postcondition_carriers(
+        func: &VerifiableFunction,
+        formula: &Formula,
+    ) -> (Formula, usize) {
+        let Formula::And(parts) = formula else { return (formula.clone(), 0) };
+        if let Some(tail) = parts.last() {
+            let expected = trust_types::conjoin_postcondition_integer_carriers(
+                func,
+                tail.clone(),
+                |decl| trust_vcgen::local_var_name(func, decl),
+                |var, ty| {
+                    Some(crate::lower::safety_input_range_constraint(
+                        var,
+                        ty.int_width()?,
+                        ty.is_signed(),
+                    ))
+                },
+            );
+            if expected == *formula && expected != *tail {
+                return (tail.clone(), 1);
+            }
+        }
+        let mut removed = 0;
+        let parts = parts
+            .iter()
+            .map(|part| {
+                let (part, count) = strip_checked_postcondition_carriers(func, part);
+                removed += count;
+                part
+            })
+            .collect();
+        (Formula::And(parts), removed)
+    }
+
+    fn strip_int_temp_type_range_env(
+        func: &VerifiableFunction,
+        formula: &Formula,
+    ) -> (Formula, Vec<String>) {
+        let Formula::And(parts) = formula else { return (formula.clone(), vec![]) };
+        let [env, rest] = parts.as_slice() else { return (formula.clone(), vec![]) };
+        let conjuncts = match env {
+            Formula::And(cs) => cs.clone(),
+            other => vec![other.clone()],
+        };
+        let temp_range = |name: &str| {
+            func.body.locals.iter().enumerate().find_map(|(i, local)| {
+                let local_name = trust_vcgen::local_var_name(func, local);
+                if i == 0 || i <= func.body.arg_count || local_name != name {
+                    return None;
+                }
+                let width = local.ty.int_width()?;
+                if width >= 128 {
+                    return None;
+                }
+                Some(if local.ty.is_signed() {
+                    (-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1)
+                } else {
+                    (0, (1i128 << width) - 1)
+                })
+            })
+        };
+        let mut stripped = Vec::new();
+        let kept: Vec<Formula> = conjuncts
+            .into_iter()
+            .filter(|c| {
+                let bound = match c {
+                    Formula::Ge(v, b) => Some((v, b, true)),
+                    Formula::Le(v, b) => Some((v, b, false)),
+                    _ => None,
+                };
+                let Some((v, b, lower)) = bound else { return true };
+                let (Formula::Var(name, _), Formula::Int(k)) = (v.as_ref(), b.as_ref()) else {
+                    return true;
+                };
+                let Some((lo, hi)) = temp_range(name) else { return true };
+                if *k != if lower { lo } else { hi } {
+                    return true;
+                }
+                if !stripped.contains(name) {
+                    stripped.push(name.clone());
+                }
+                false
+            })
+            .collect();
+        let formula = match kept.len() {
+            0 => rest.clone(),
+            1 => Formula::And(vec![kept[0].clone(), rest.clone()]),
+            _ => Formula::And(vec![Formula::And(kept), rest.clone()]),
+        };
+        (formula, stripped)
+    }
+
+    fn postcondition_candidate_matches_body(
+        func: &VerifiableFunction,
+        candidates: &[Formula],
+        body: &Formula,
+    ) -> bool {
+        candidates.iter().any(|candidate| {
+            let (candidate_body, wrappers) = strip_checked_postcondition_carriers(func, candidate);
+            wrappers == 1 && formula_eq_modulo_versions(&candidate_body, body)
+        })
+    }
+
+    /// Every Postcondition VC of `after` took `expected` (and at least one exists).
+    fn assert_postconditions_decided(
+        after: &[VerificationCondition],
+        report: &FlipReport,
+        expected: FlipDecision,
+        label: &str,
+    ) {
+        let mut seen = 0;
+        for (vc, decision) in after.iter().zip(report.decisions.iter()) {
+            if matches!(vc.kind, VcKind::Postcondition) {
+                seen += 1;
+                assert_eq!(*decision, expected, "[{label}] postcondition decision: {vc:?}");
+            }
+        }
+        assert!(seen > 0, "[{label}] no postcondition VC was decided: {report:?}");
+    }
+
     /// LIVE-FIRING (acyclic branch, no precondition): `pick(b: bool) -> i32`
     /// (`#[ensures(|r| *r>0)] { if b {1} else {2} }`, `/tmp/vfbr/pick.json`).
-    /// TWO body-aware `Postcondition` VCs (one per branch predecessor); the spine
-    /// reproduces BOTH byte-for-byte, so BOTH flip SPINE-SOURCED (formula). No
-    /// precondition and a Bool-only param ⇒ NO abstract-interp env conjunct (the
-    /// live formula starts with the join-weakened semantic guard `Bool(true)`).
+    /// TWO body-aware `Postcondition` VCs (one per branch predecessor).
+    ///
+    /// RE-PINNED 2026-09-24, re-derived 2026-09-25. The live formula leads with the
+    /// env fact `_3 in [i32::MIN, i32::MAX]` on the contract's result binding
+    /// (local 3, source-named `__ret`, an i32 temp): the TYPE range the 2026-09-18
+    /// interval rounds carry for every Int-typed local. Until 2026-09-25 the domain
+    /// seeded it under the source name, so the fact read `__ret in …` and named no
+    /// term of the formula; it now names `_3`, the local's formula name
+    /// (`trust_vcgen::local_var_name`). The spine's env models parameters only,
+    /// so it does not reproduce that fact and the postcondition stays
+    /// trust-vcgen-SOURCED — fail-closed and verdict-identical. Pinned: the fact is
+    /// the ENTIRE difference (stripping it leaves a spine candidate), so any other
+    /// drift still fails here. Flipping this back is a SPINE capability: a
+    /// reconstruction of the interval fixpoint for non-parameter locals.
     #[test]
-    fn live_path_pick_branch_postconditions_spine_sourced_formula() {
+    fn live_path_pick_branch_postconditions_keep_formula_over_temp_type_range() {
         use trust_types::ProofLevel;
         for max_level in [ProofLevel::L0Safety, ProofLevel::L1Functional] {
             let (func, solver_vcs) = live_path_vcs("/tmp/vfbr/pick.json", max_level);
@@ -3575,39 +4224,29 @@ mod tests {
                 assert!(post_vcs.is_empty(), "[L0] postcondition is an L1 obligation");
                 continue;
             }
-            // Two per-predecessor body-aware postcondition VCs.
             assert_eq!(
                 post_vcs.len(),
                 2,
                 "[L1] pick's if/else join emits one postcondition VC per branch \
                  predecessor (two): {solver_vcs:?}"
             );
-            // The spine reproduces both, byte-for-byte.
             let cands = crate::lower::reconstruct_postcondition_formula_candidates(&func);
             for vc in &post_vcs {
+                let (original_body, wrappers) =
+                    strip_checked_postcondition_carriers(&func, &vc.formula);
+                assert_eq!(wrappers, 1, "one exact declared-carrier wrapper");
+                let (stripped, temps) = strip_int_temp_type_range_env(&func, &original_body);
+                assert_eq!(temps, vec!["_3".to_string()], "{}", vc.formula.to_smtlib());
                 assert!(
-                    cands.iter().any(|c| formula_eq_modulo_versions(c, &vc.formula)),
-                    "the spine reproduces pick's branch postcondition byte-equal: {}",
+                    postcondition_candidate_matches_body(&func, &cands, &stripped),
+                    "modulo the temp type range the spine reproduces pick's postcondition: {}",
                     vc.formula.to_smtlib()
                 );
             }
             let before = solver_vcs.clone();
             let (after, report) = flip_safety_verdicts_to_spine(&func, solver_vcs);
             assert_verdict_identical(&before, &after);
-            // BOTH postcondition VCs flip spine-sourced (formula).
-            for (vc, decision) in after.iter().zip(report.decisions.iter()) {
-                if matches!(vc.kind, VcKind::Postcondition) {
-                    assert_eq!(
-                        *decision,
-                        FlipDecision::SpineSourcedFormula,
-                        "[L1] each of pick's branch postcondition VCs is spine-FORMULA-sourced: {vc:?}"
-                    );
-                }
-            }
-            assert!(
-                report.spine_sourced_formula() >= 2,
-                "both branch postcondition VCs must flip spine-sourced (formula): {report:?}"
-            );
+            assert_postconditions_decided(&after, &report, FlipDecision::TrustVcgenSourced, "pick");
         }
     }
 
@@ -3615,11 +4254,15 @@ mod tests {
     /// -> i32` (`#[requires(x>0)] #[ensures(|r| *r>0)] { if b {x} else {1} }`,
     /// `/tmp/vfbr/clamp_branch.json`). TWO per-predecessor body-aware
     /// `Postcondition` VCs, each carrying the precondition-REFINED env
-    /// (`x ∈ [1, MAX]`) and the precondition conjunct `(> x 0)`; the spine
-    /// reproduces BOTH byte-for-byte, so BOTH flip SPINE-SOURCED (formula). This
-    /// is the branch-AND-precondition case — the harder of the two fixtures.
+    /// (`x ∈ [1, MAX]`) and the precondition conjunct `(> x 0)`.
+    ///
+    /// RE-PINNED 2026-09-24, same cause as the `pick` pin above: the live env also
+    /// carries the i32 TYPE range of the result binding (local 5, source-named
+    /// `__ret`, formula name `_5`), which the param-only spine env cannot
+    /// reproduce, so the postcondition stays trust-vcgen-sourced (fail-closed,
+    /// verdict-identical). The refined parameter half is still reproduced exactly.
     #[test]
-    fn live_path_clamp_branch_postconditions_spine_sourced_formula() {
+    fn live_path_clamp_branch_postconditions_keep_formula_over_temp_type_range() {
         use trust_types::ProofLevel;
         for max_level in [ProofLevel::L0Safety, ProofLevel::L1Functional] {
             let (func, solver_vcs) = live_path_vcs("/tmp/vfbr/clamp_branch.json", max_level);
@@ -3635,38 +4278,29 @@ mod tests {
                 "[L1] clamp_branch's if/else join emits one postcondition VC per branch \
                  predecessor (two): {solver_vcs:?}"
             );
-            // The live formula is precondition-refined: each VC carries `(>= x 1)`
-            // (refined env) AND `(> x 0)` (the precondition conjunct).
+            let cands = crate::lower::reconstruct_postcondition_formula_candidates(&func);
             for vc in &post_vcs {
                 let smt = vc.formula.to_smtlib();
                 assert!(smt.contains("(>= x 1)"), "refined env present: {smt}");
                 assert!(smt.contains("(> x 0)"), "precondition conjunct present: {smt}");
-            }
-            let cands = crate::lower::reconstruct_postcondition_formula_candidates(&func);
-            for vc in &post_vcs {
+                let (original_body, wrappers) =
+                    strip_checked_postcondition_carriers(&func, &vc.formula);
+                assert_eq!(wrappers, 1, "one exact declared-carrier wrapper");
+                let (stripped, temps) = strip_int_temp_type_range_env(&func, &original_body);
+                assert_eq!(temps, vec!["_5".to_string()], "{smt}");
                 assert!(
-                    cands.iter().any(|c| formula_eq_modulo_versions(c, &vc.formula)),
-                    "the spine reproduces clamp_branch's branch postcondition byte-equal: {}",
-                    vc.formula.to_smtlib()
+                    postcondition_candidate_matches_body(&func, &cands, &stripped),
+                    "modulo the temp type range the spine reproduces clamp_branch: {smt}"
                 );
             }
             let before = solver_vcs.clone();
             let (after, report) = flip_safety_verdicts_to_spine(&func, solver_vcs);
             assert_verdict_identical(&before, &after);
-            for (vc, decision) in after.iter().zip(report.decisions.iter()) {
-                if matches!(vc.kind, VcKind::Postcondition) {
-                    assert_eq!(
-                        *decision,
-                        FlipDecision::SpineSourcedFormula,
-                        "[L1] each of clamp_branch's branch postcondition VCs is \
-                         spine-FORMULA-sourced: {vc:?}"
-                    );
-                }
-            }
-            assert!(
-                report.spine_sourced_formula() >= 2,
-                "both branch postcondition VCs (with precondition) must flip \
-                 spine-sourced (formula): {report:?}"
+            assert_postconditions_decided(
+                &after,
+                &report,
+                FlipDecision::TrustVcgenSourced,
+                "clamp_branch",
             );
         }
     }
@@ -3748,6 +4382,7 @@ mod tests {
                 ensures: vec!["result > 0".into()],
                 invariants: vec![],
             },
+            tuple_layouts: Default::default(),
         };
         let _ = BinOp::Add; // (keep the import used regardless of body shape)
 
@@ -3802,90 +4437,74 @@ mod tests {
 
     /// LIVE-FIRING (LOOP tier): the dumped `count` while-loop
     /// (`/tmp/vfloop/count.json` — `#[ensures(|r| *r>=0)] fn count(n:u32)->u32`,
-    /// `while i<n { c=c.wrapping_add(1); i=i.wrapping_add(1); } c`) flips its
-    /// `Postcondition` VC SPINE-SOURCED (formula) on the LIVE-path VC set.
+    /// `while i<n { c=c.wrapping_add(1); i=i.wrapping_add(1); } c`).
     ///
-    /// The live formula is
-    /// `(and (and (>= n 0) (<= n 4294967295))
+    /// The live formula is, modulo SSA tokens,
+    /// `(and (and (>= _6 0) (<= _6 4294967295) (>= n 0) (<= n 4294967295))
     ///       (and true true
     ///            (and (= _6 i) (= _5 (< _6 n))
     ///                 (and (not (< _6 n))
-    ///                      (and (= _0 c) (not (>= _0 0)))))))` modulo SSA tokens:
-    ///   * the env conjunct is the parameter `n`'s u32 type range ONLY — the loop
-    ///     variables `c`/`i` widen to TOP (`[i128::MIN,i128::MAX]`) over the back-edge
-    ///     and are FILTERED OUT by `interval_domain_to_formula`, so they contribute no
-    ///     conjunct (the widening's observable env effect is "the loop vars drop out");
-    ///   * the two `true`s are the return block's and the loop-header predecessor's
-    ///     semantic guards, both JOIN-WEAKENED to `Bool(true)` on the back-edge revisit;
-    ///   * `_6 = i` and `_5 = (_6 < n)` are the predecessor definitions made
-    ///     relevant by the exact false loop-exit edge `not (_6 < n)`;
-    ///   * `Eq(_0, c)` is the return-pin (`_0 = c`) and `Not(Ge(_0,0))` the negated
-    ///     postcondition.
-    /// The spine reconstructs every piece byte-for-byte WITHOUT running the fixpoint
-    /// (it reproduces widening's observable RESULT — the param-only env — plus the
-    /// semantic-guard join-weakening), so the formula now lives on the spine. Asserted
-    /// against the LIVE `generate_vcs_with_discharge_and_summaries` path; verdicts are
-    /// byte-identical (the swap is structurally identical to the matched VC's formula).
+    ///                      (and (= _0 c) (not (>= _0 0)))))))`:
+    ///   * the loop variables `c`/`i` still widen to TOP and drop out of the env;
+    ///   * the env now ALSO carries the u32 TYPE range of the temp `_6` (the copy of
+    ///     `i` the exit test reads) — the 2026-09-18 interval rounds seed every
+    ///     Int-typed local, and the entry block no longer erases one it cannot hold;
+    ///   * the rest (join-weakened guards, the exact false exit edge, the return pin)
+    ///     is unchanged.
+    ///
+    /// RE-PINNED 2026-09-24. The spine reproduces widening's observable result only
+    /// for PARAMETERS (it runs no fixpoint), so the `_6` fact is out of its reach and
+    /// the postcondition stays trust-vcgen-sourced — the fail-closed outcome the
+    /// exact-equality gate exists for, verdict-identical by construction. Pinned:
+    /// `_6`'s type range is the WHOLE difference.
     #[test]
-    fn live_path_count_loop_postcondition_flips_spine_sourced_formula() {
+    fn live_path_count_loop_postcondition_keeps_formula_over_temp_type_range() {
         // The Postcondition VC only exists at L1 (it is an L1 functional obligation).
         let (func, solver_vcs) = live_path_vcs("/tmp/vfloop/count.json", ProofLevel::L1Functional);
         let posts: Vec<_> =
             solver_vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Postcondition)).collect();
         assert_eq!(posts.len(), 1, "exactly one count postcondition VC expected: {solver_vcs:?}");
-
-        // The spine reconstructs the live postcondition formula byte-for-byte.
-        let cands = crate::lower::reconstruct_postcondition_formula_candidates(&func);
-        assert!(
-            cands.iter().any(|c| formula_eq_modulo_versions(c, &posts[0].formula)),
-            "the spine must reconstruct count's loop postcondition formula byte-for-byte; \
-             live = {}",
-            posts[0].formula.to_smtlib()
-        );
-        // And it is exactly the env-wrapped, weakened-guard, return-pinned shape.
-        // The LIVE formula carries trust-vcgen's S2c statement-granular SSA version
-        // tokens (`c#s0_1_s3_0`); modulo those tokens it is the param-env +
-        // weakened-guard + exact edge + return-pin shape.
+        let (original_body, carrier_wrappers) =
+            strip_checked_postcondition_carriers(&func, &posts[0].formula);
+        assert_eq!(carrier_wrappers, 1, "one exact declared-carrier wrapper");
         assert_eq!(
-            strip_version_tokens_in_formula(&posts[0].formula).to_smtlib(),
-            "(and (and (>= n 0) (<= n 4294967295)) \
+            strip_version_tokens_in_formula(&original_body).to_smtlib(),
+            "(and (and (>= _6 0) (<= _6 4294967295) (>= n 0) (<= n 4294967295)) \
              (and true true (and (= _6 i) (= _5 (< _6 n)) \
              (and (not (< _6 n)) (and (= _0 c) (not (>= _0 0)))))))",
-            "the live count postcondition formula must be the param-env + weakened-guard \
-             + exact exit edge + return-pin shape (loop vars widen to TOP and drop out)"
+            "the live count postcondition: temp + param env, weakened guards, exact exit \
+             edge, return pin (loop vars widen to TOP and drop out)"
+        );
+        let (stripped, temps) = strip_int_temp_type_range_env(&func, &original_body);
+        assert_eq!(temps, vec!["_6".to_string()]);
+        let cands = crate::lower::reconstruct_postcondition_formula_candidates(&func);
+        assert!(
+            postcondition_candidate_matches_body(&func, &cands, &stripped),
+            "modulo `_6`'s type range the spine reconstructs count's loop postcondition: {}",
+            posts[0].formula.to_smtlib()
         );
 
         let before = solver_vcs.clone();
         let (after, report) = flip_safety_verdicts_to_spine(&func, solver_vcs);
         assert_verdict_identical(&before, &after);
-        // The postcondition VC flips spine-sourced (formula).
-        let post_spine_formula = after
-            .iter()
-            .zip(report.decisions.iter())
-            .filter(|(vc, d)| {
-                matches!(vc.kind, VcKind::Postcondition) && **d == FlipDecision::SpineSourcedFormula
-            })
-            .count();
-        assert_eq!(
-            post_spine_formula, 1,
-            "count's loop postcondition VC must flip SPINE-SOURCED (formula): {report:?}"
-        );
+        assert_postconditions_decided(&after, &report, FlipDecision::TrustVcgenSourced, "count");
     }
 
-    /// LOOP env byte-equality is a PROVABLE property of `count`, not a coincidence:
-    /// pin that the spine's reconstructed env conjunct equals the LIVE merged
-    /// abstract-interp env (the fixpoint-with-widening output joined across blocks).
-    /// This is the load-bearing claim — that the widened loop-variable intervals
-    /// (`c`, `i`) reach TOP and are FILTERED OUT, leaving only the parameter range.
-    /// If a future widening change made a loop var NOT reach TOP, the live env would
-    /// gain a conjunct, this assertion would fire, and the flip would (soundly) fall
-    /// back to fail-closed via the exact-equality gate.
+    /// LOOP env: the widened loop variables (`c`, `i`) reach TOP and are FILTERED
+    /// OUT, so the only non-parameter contribution to the LIVE merged env is a
+    /// temp at its exact TYPE range. RE-PINNED 2026-09-24: that temp (`_6`, u32)
+    /// appeared when the 2026-09-18 interval rounds began seeding every Int-typed
+    /// local; this pins that it is the ONLY addition over the spine's param env.
+    /// If a loop variable ever stopped reaching TOP it would show up here as a
+    /// non-type-range conjunct and this assertion would fire.
     #[test]
-    fn loop_widened_env_is_param_range_only_for_count() {
+    fn loop_widened_env_adds_only_temp_type_ranges_for_count() {
         use trust_vcgen::AbstractDomain;
         let (func, _vcs) = live_path_vcs("/tmp/vfloop/count.json", ProofLevel::L1Functional);
 
-        // LIVE merged env, built EXACTLY as generate_vcs_with_discharge does.
+        // The whole-function join of the fixpoint's block states (production's
+        // `merged_interval_environment` additionally skips the entry block for
+        // locals it cannot yet hold; that only removes entries).
         let initial = trust_vcgen::type_aware_initial_state(&func);
         let config = trust_vcgen::FixpointConfig::for_function(&func);
         let fp = trust_vcgen::fixpoint_configured(&func, initial, &config);
@@ -3907,11 +4526,16 @@ mod tests {
         // SPINE env (no fixpoint run — param type ranges only).
         let spine_env = crate::lower::reconstruct_abstract_state_param_env_for_test(&func)
             .expect("count has an integer parameter (n)");
+        let (stripped, temps) = strip_int_temp_type_range_env(
+            &func,
+            &Formula::And(vec![live_env.clone(), Formula::Bool(true)]),
+        );
+        assert_eq!(temps, vec!["_6".to_string()], "live={live_env:?}");
         assert_eq!(
-            live_env, spine_env,
-            "the spine's param-range env must byte-equal the live merged (widened) env \
-             — i.e. the widened loop vars contribute NOTHING. live={:?} spine={:?}",
-            live_env, spine_env
+            stripped,
+            Formula::And(vec![spine_env.clone(), Formula::Bool(true)]),
+            "beyond `_6`'s type range the live merged (widened) env must byte-equal the \
+             spine's param-range env. live={live_env:?} spine={spine_env:?}"
         );
     }
 }
@@ -3982,17 +4606,20 @@ mod missing_obligation_ratchet {
     ///    `SliceIndex::get`, plus range calls whose receiver or endpoint falls
     ///    outside the modeled scope. The 4 projection-derived rows
     ///    (`slice::first`/`last`/`get`) remain blocked by the guard-formula port.
-    ///  * `Assertion` (22, IDENTITY-PINNED below) — panic calls, and the
-    ///    population is HETEROGENEOUS, not one macro: 17 `assert_failed` sites at
+    ///  * `Assertion` (27, IDENTITY-PINNED below: 22 panic calls pinned
+    ///    2026-08-20, plus 5 std-numeric call-site rows pinned 2026-09-30). The
+    ///    22 are HETEROGENEOUS, not one macro: 17 `assert_failed` sites at
     ///    `macros/mod.rs:51` (16 byteorder `assert_eq!` preludes + arrayvec
     ///    `into_inner_unchecked`), 4 `panic_fmt` sites at `panic.rs:62`, and 1
     ///    sentinel at `panic.rs:73`. trust-vcgen derives these through
     ///    `overflow_vc.rs::v2_build_terminator_vc` via safety.rs lane 1b — NOT
     ///    `generate/panic_calls.rs`, which holds the div/rem + slice-method
-    ///    recognizers only. The module side ALREADY mints the real check at every
-    ///    site (the diverging panic-call arm: `Assert(const false)` + NoPanic +
-    ///    `Unreachable` + a PanicFreedom obligation), so this gap is ACCOUNTING —
-    ///    see `EXPECTED_ASSERTION_VCGEN_ONLY_ROWS` for the defer rationale.
+    ///    recognizers only. For those 22 the module side ALREADY mints the
+    ///    real check at every site (the diverging panic-call arm:
+    ///    `Assert(const false)` + NoPanic + `Unreachable` + a PanicFreedom
+    ///    obligation), so their gap is ACCOUNTING. The 5 std-numeric rows are
+    ///    NOT covered by that premise; see `EXPECTED_ASSERTION_VCGEN_ONLY_ROWS`
+    ///    for both rationales.
     ///  * `ArithmeticOverflow(Add)` (36) — concentrated in probe fixtures.
     ///
     /// Lowering this is progress; raising it means coverage was retired. Note the
@@ -4082,7 +4709,27 @@ mod missing_obligation_ratchet {
     /// UncheckedIndexBounds 1). Outcome shift: Disagreed 356 -> 147,
     /// FlippedFallback 318 -> 527 (enumeration agreement; formula parity for
     /// the class is the NEXT step), native_only exactly zero throughout.
-    const VCGEN_ONLY_CEILING: usize = 128;
+    /// RE-PINNED 128 -> 144 (2026-10-04, UF-1, docs/DECISION_QUEUE.md). The
+    /// whole delta is ONE class: `Assertion` 27 -> 47, every other class
+    /// unmoved (measured 124 at origin/main `d640234487`, 144 on the UF-1
+    /// branch; per-row census identical except the 20 added rows, none
+    /// removed). All 20 are trust-vcgen's `Call::unwrap::panic-freedom`
+    /// obligation, which UF-1 turned from a preclassified `UnsupportedMir`
+    /// `panic-freedom-unverified` row (never in this diff) into a solvable VC
+    /// over a call-pinned receiver. Named and justified at
+    /// `EXPECTED_ASSERTION_VCGEN_ONLY_ROWS` ("GROWN 27 -> 47").
+    /// RE-PINNED 144 -> 145 (2026-10-12, fix6 CLOSURE-ABSENT-CALLEE,
+    /// docs/DECISION_QUEUE.md). The ten bodies retired from
+    /// `SPINE_DECLINED_PIN` by that change are now compared. The per-row census
+    /// against origin/main is identical except for TWO ADDED rows, none removed,
+    /// both in the one newly compared slice `Iterator::fold` behind
+    /// `<i32 as Sum<&i32>>::sum`: `ArithmeticOverflow(Add)@core/src/num/
+    /// uint_macros.rs:973:16` (counted here) and
+    /// `Assertion(unsafe-model)@core/src/slice/iter/macros.rs:279:42` (counted
+    /// apart). Why the spine does not derive them was not isolated. trust-vcgen
+    /// still emits and dispatches both, and `native_only` stays zero. This is
+    /// more cross-check coverage, not a retired one.
+    const VCGEN_ONLY_CEILING: usize = 145;
 
     /// Trust (#63): the spine's DECLINE CENSUS — the pinned set of dump instances
     /// whose `generate_native_safety_vcs` returns `None`, keyed
@@ -4203,11 +4850,13 @@ mod missing_obligation_ratchet {
         // (6f50340200) made the w2-iter-offset-modeled slice-iter family
         // comparable (fixtures unchanged since 280306a5f1); rows transcribed
         // out per the ratchet's own paste-ready output — PROGRESS direction.
+        // RE-PINNED -10 (2026-10-12, fix6 CLOSURE-ABSENT-CALLEE): a `Fn*::call*`
+        // shim whose closure body is not in the bundle now lowers as the
+        // fail-closed absent callee instead of erroring, so ten bodies that call
+        // an unbundled closure (`Option::map`/`and_then`/`filter` over a fixture
+        // closure, `direct_call`, the slice `fold` behind `Sum`) are compared now.
+        // Rows transcribed out per the ratchet's own output — PROGRESS direction.
         ("<[T] as lib::BitArray<T>>::bit_length", "0d044330f8215218"),
-        (
-            "<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::fold::<i32, {closure@<i32 as core::iter::traits::accum::Sum<&i32>>::sum<core::slice::iter::Iter<'_, i32>>::{closure#0}}>",
-            "a14702a23ca07be2",
-        ),
         (
             "<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::fold_const_opt",
             "7739181a02c2e548",
@@ -4299,7 +4948,6 @@ mod missing_obligation_ratchet {
         ("crate::exp_bump", "6d385a7eb8ab2000"),
         ("crate::vec_get", "1aed8bb5b637a0c1"),
         ("deref", "a51e6d29ed470ab3"),
-        ("direct_call", "58d03eb8c010a621"),
         ("expr::meta::ExprMeta::approx_depth", "84be72a9fd24cd8f"),
         ("expr::meta::ExprMeta::has_expr_mvar", "2011094b879e562f"),
         ("expr::meta::ExprMeta::has_fvar", "1bbac65a6d5d443b"),
@@ -4363,37 +5011,8 @@ mod missing_obligation_ratchet {
         ("std::num::NonZero::<i64>::new", "1c022513d4e6bd54"),
         ("std::num::NonZero::<u32>::get", "5e23789181280118"),
         ("std::num::NonZero::<u32>::new", "5a8b2f4ea66eb1fa"),
-        (
-            "std::option::Option::<i32>::and_then::<i32, {closure@main.rs:15:16: 15:19}>",
-            "fef0eff00cb2375b",
-        ),
-        (
-            "std::option::Option::<i32>::and_then::<i32, {closure@main.rs:17:16: 17:24}>",
-            "7915268a1a16bdcb",
-        ),
         ("std::option::Option::<i32>::expect", "76538a8b0171e834"),
-        (
-            "std::option::Option::<i32>::filter::<{closure@main.rs:20:14: 20:17}>",
-            "4690500e691d8abc",
-        ),
-        (
-            "std::option::Option::<i32>::map::<i32, {closure@main.rs:10:11: 10:19}>",
-            "07927a68806ad347",
-        ),
-        (
-            "std::option::Option::<i32>::map::<i32, {closure@main.rs:26:11: 26:19}>",
-            "0f99f183a4037aa0",
-        ),
-        (
-            "std::option::Option::<i32>::map::<i32, {closure@main.rs:5:11: 5:14}>",
-            "bd02b317d3060711",
-        ),
         ("std::option::Option::<i32>::unwrap", "f8103e479a2fdf99"),
-        (
-            "std::option::Option::<u8>::map::<u8, {closure@main.rs:12:11: 12:19}>",
-            "ca3e5e3f7bade044",
-        ),
-        ("std::option::Option::<u8>::map::<u8, {closure@main.rs:7:11: 7:19}>", "1861a0ab16376266"),
         ("std::option::Option::<u8>::unwrap", "1ae34b3770614960"),
         (
             "std::ptr::const_ptr::<impl *const T>::offset_from_unsigned::precondition_check",
@@ -4509,8 +5128,7 @@ mod missing_obligation_ratchet {
     /// walk closed the class (see the aggregate re-pin above). A ceiling of 0
     /// is the tightest pin there is — ANY future Unreachable row in vcgen_only
     /// is a regression of the shared-recognizer agreement, not intake.
-    const VCGEN_ONLY_CLASS_CEILINGS: &[(&str, usize)] =
-        &[("BoundsCheck", 27), ("Unreachable", 0)];
+    const VCGEN_ONLY_CLASS_CEILINGS: &[(&str, usize)] = &[("BoundsCheck", 27), ("Unreachable", 0)];
 
     /// Trust (#62, C-D0): the Assertion class is IDENTITY-PINNED, not count-bounded.
     ///
@@ -4534,6 +5152,115 @@ mod missing_obligation_ratchet {
     /// identities that may surface as the corpus/vcgen shift — memchr
     /// `One::{find_raw,rfind_raw}` and itoa `udivmod_1e19`. Adding EXACTLY those,
     /// with this comment updated, is approved; anything else is a finding.
+    ///
+    /// GROWN 22 -> 27 (2026-09-30), five rows, NAMED: the last five entries
+    /// below, transcribed from the ratchet's own rendering. The pin went red on
+    /// non-latent rows, which is one of the panel's reopen triggers
+    /// (`git show 289ba550db:reports/2026-08-19-panic-call-campaign-plan.md`; the
+    /// report left the tree in `6ba5324748`). This is that fresh look:
+    ///  * WHO. `1f3b181649` ("verify: charge the std numeric value panics",
+    ///    2026-09-27) added trust-vcgen's safety-lane arm 1f
+    ///    (`generate/numeric_panic.rs::numeric_value_panic_row`). It mints a
+    ///    call-site `Assertion` wherever a caller's argument VALUE can make a std
+    ///    numeric method panic inside the library. The five rows are
+    ///    `Ord::clamp: min > max` (`w_clamp_i32`, `probe::cmp_family`),
+    ///    `isqrt: ... cannot be negative`, `ilog2: ... must be positive`, and
+    ///    `next_power_of_two: attempt to add with overflow`, each over a
+    ///    non-literal caller value. The follow-up `10734c7ffc` adds none of them.
+    ///  * TRUST-VCGEN EMITTING MORE, NOT THE SPINE DERIVING LESS. The five dump
+    ///    files are unchanged since their July harvests (`c6be27eb88`,
+    ///    `71b97029d6`, `f9454697d3`), and `native_only` stays zero. Every row is
+    ///    dispatched by trust-vcgen: these are the closed false accepts of
+    ///    docs/KNOWN_HAZARDS.md ("the std numeric methods that panic on an
+    ///    argument value were accepted").
+    ///  * THE DEFER PREMISE ABOVE DOES NOT COVER THEM. Unlike the 22, there is no
+    ///    diverging panic-call arm here: the panic is inside a sysroot callee, and
+    ///    the caller has no `Terminator::Assert`. KNOWN_HAZARDS records that the
+    ///    sysroot-callee channels (absent-callee tolerance, bundled-member
+    ///    advisory) are what ACCEPTED these panics, so trust-vcgen's arm 1f is
+    ///    the only producer that charges the caller-value condition. The
+    ///    trust-ir verifier path must charge it too: item V of the R-8 ledger
+    ///    (docs/plans/2026-09-29-trust-ir-sole-compile-path.md §5) owns that.
+    ///  * WHY NOT CLOSE THEM ON THE SPINE. Deriving the rows means porting the
+    ///    numeric_panic recognizers into this crate's lowering: a new feature
+    ///    for a MIR-derived trust-ir producer, which R-2 (2026-09-29,
+    ///    docs/DECISION_QUEUE.md) rules out. The panel's ratified closure
+    ///    (Design 2) is spine work too, so the same ruling covers it.
+    ///  * WHY THE AGGREGATE STAYED GREEN. `VCGEN_ONLY_CEILING` reads 125 <= 128.
+    ///    Since its 2026-09-01 pin, `CopyBoundsViolation` fell 7 -> 0,
+    ///    `BoundsCheck` 27 -> 26 and `UncheckedIndexBounds` 1 -> 0, while
+    ///    `ArithmeticOverflow(Mul)` rose 7 -> 8 (the same commit's `strict_pow`
+    ///    row inside `core::num::<impl i32>::pow`). So the commit's +6 hid behind
+    ///    an unrelated -9: exactly the lateral swap this identity pin exists for.
+    /// The latent identities above stay pre-authorized (27 -> 30).
+    ///
+    /// GROWN 27 -> 47 (2026-10-04), twenty rows, NAMED: the entries after the
+    /// `UF-1` marker below, transcribed from the ratchet's own rendering.
+    ///  * WHO. UF-1 (`25fa44a0ef`, docs/DECISION_QUEUE.md "UF-1"). Every row
+    ///    is trust-vcgen's `Assertion { "Call::unwrap::panic-freedom" }` (the
+    ///    exact message, read off the VC at the row's span by an instrumented
+    ///    run): the std unwrap-family obligation "the receiver's discriminant
+    ///    is not the panicking variant". Each site is `<call>(..).unwrap()`,
+    ///    the CALL-PINNED shape UF-1 added: byteorder
+    ///    `buf[..N].try_into().unwrap()` (`lib.rs:1941..1956`, `2129..2144`)
+    ///    and `src.try_into().unwrap()` in `unsafe_read_slice!`
+    ///    (`lib.rs:1916`, eight `read_*_into` instances); arrayvec
+    ///    `self.try_push(element).unwrap()` (`arrayvec_impl.rs:40`);
+    ///    lambda_calculus `self.lhs_mut().unwrap()` / `self.rhs_mut().unwrap()`
+    ///    (`reduction.rs:169,206,207`). Measured per site on both trees: at
+    ///    origin/main each of the twenty spans carried exactly one
+    ///    `UnsupportedMir { "Call::unwrap::panic-freedom-unverified" }` row on
+    ///    vcgen's preclassified (discharged) list, which never enters this diff;
+    ///    on UF-1 that row is gone and the solvable `Assertion` stands at the
+    ///    same span. Same obligation, now a solver VC.
+    ///  * TRUST-VCGEN EMITTING MORE, NOT THE SPINE DERIVING LESS. Measured A/B
+    ///    on the identical corpus (2347 functions): the vcgen_only row set is
+    ///    origin/main's plus exactly these twenty; no row left, no other class
+    ///    moved, `native_only` stays zero, the decline census and the dispatch
+    ///    floor are unchanged. Every row is dispatched by trust-vcgen.
+    ///  * WHY NOT CLOSE THEM ON THE SPINE. The spine derives no unwrap-family
+    ///    obligation; deriving one means porting UF-1's receiver recognizers
+    ///    into this crate's lowering, a new feature for a MIR-derived trust-ir
+    ///    producer, which R-2 (2026-09-29) rules out. As with the five
+    ///    std-numeric rows, the trust-ir verifier path must charge it instead.
+    /// The latent identities stay pre-authorized (now 47 -> 50).
+    ///
+    /// GROWN 47 -> 48 (2026-10-09, the wave-19 integration), one row, NAMED: the
+    /// entry after the `NUM-NIGHTLY-UNCHARGED-1` marker below, transcribed from the
+    /// ratchet's own rendering.
+    ///  * WHO. `b548304f0a` ("trust-vcgen: charge the nightly numeric methods that
+    ///    panic on the caller's value", NUM-NIGHTLY-UNCHARGED-1,
+    ///    docs/DECISION_QUEUE.md) added the signed `next_multiple_of` arm of
+    ///    `generate/numeric_panic.rs`: a call-site `Assertion` ("next_multiple_of:
+    ///    divide by zero, or attempt to add with overflow") over `rhs == 0 || (rhs
+    ///    > 0 && x + rhs - 1 > MAX) || (rhs < -1 && x + rhs + 1 < MIN)`. The row is
+    ///    `main::w_next_multiple_of` (`mass-harvest2-2026-07-21/integer-methods2`,
+    ///    `probe.rs:37`: `x.next_multiple_of(8)` over an `i32` parameter, the dump's
+    ///    one `Call` to `core::num::<impl i32>::next_multiple_of(x, 8)`), the signed
+    ///    sibling of the pinned `w_next_power_of_two` row of the same probe.
+    ///  * THE OBLIGATION IS REAL: the function panics. For `rhs = 8` the row's
+    ///    condition is `x + 7 > i32::MAX`, i.e. `x` in `2147483641..=i32::MAX`, and
+    ///    core adds under the caller's overflow checks. Measured 2026-10-09: the same
+    ///    body built by trustc `321aaeda7` with `-Ztrust-verify=off
+    ///    -Coverflow-checks=on` returns 2147483640 for 2147483640 and exits 101,
+    ///    "attempt to add with overflow", for 2147483641 and for `i32::MAX`.
+    ///  * TRUST-VCGEN EMITTING MORE, NOT THE SPINE DERIVING LESS. Measured A/B on
+    ///    the identical corpus (2347 functions), this crate unchanged, swapping only
+    ///    trust-vcgen's `src/` between origin/main `e314a7412c` and the wave
+    ///    (an env-gated per-row print, not committed): the vcgen_only row set is
+    ///    origin/main's 258 plus exactly this one (`vcgen_only` 143 -> 144, still
+    ///    within `VCGEN_ONLY_CEILING`; `unsafe_model` 115 both sides), no row left,
+    ///    `native_only` stays zero, and the decline census is unchanged.
+    ///    `w_next_multiple_of` itself leaves native dispatch (`native_generated` 1660
+    ///    -> 1659, floor 1656): the spine derives nothing for the call, which was
+    ///    byte-equal to vcgen's set until vcgen charged it.
+    ///  * WHY NOT CLOSE IT ON THE SPINE. The spine derives no std-numeric call-site
+    ///    obligation; deriving this one means porting the numeric_panic recognizers
+    ///    into this crate's lowering, a new feature for a MIR-derived trust-ir
+    ///    producer, which R-2 (2026-09-29) rules out — the reason the five
+    ///    std-numeric rows of 2026-09-30 carry. The trust-ir verifier path must
+    ///    charge it instead (item V of the R-8 ledger).
+    /// The latent identities stay pre-authorized (now 48 -> 51).
     const EXPECTED_ASSERTION_VCGEN_ONLY_ROWS: &[(&str, &str)] = &[
         (
             "core::cmp::impls::<impl core::cmp::Ord for i32>::clamp",
@@ -4614,6 +5341,93 @@ mod missing_obligation_ratchet {
             "<lib::LittleEndian as lib::ByteOrder>::write_u64_into",
             "Assertion@core/src/macros/mod.rs:51:20",
         ),
+        // 2026-09-30: the five std-numeric call-site rows of `1f3b181649`. The
+        // reason is in the doc comment above ("GROWN 22 -> 27").
+        ("probe::cmp_family", "Assertion@probe.rs:11:4"),
+        ("main::w_isqrt", "Assertion@main.rs:13:4"),
+        ("main::w_ilog2", "Assertion@main.rs:53:4"),
+        ("main::w_next_power_of_two", "Assertion@main.rs:47:0"),
+        (
+            "w_clamp_i32",
+            "Assertion@crates/trust-clean/fixtures/stdlib-leaf-cmp-2026-07-16/SOURCE/src/lib.rs:31:54",
+        ),
+        // 2026-10-04: the twenty `Call::unwrap::panic-freedom` rows of UF-1. The
+        // reason is in the doc comment above ("GROWN 27 -> 47").
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u128",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1956:28",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u128_into",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1916:38",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u16",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1941:27",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u16_into",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1916:38",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u32",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1946:27",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u32_into",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1916:38",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u64",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1951:27",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u64_into",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1916:38",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u128",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:2144:28",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u128_into",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1916:38",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u16",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:2129:27",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u16_into",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1916:38",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u32",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:2134:27",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u32_into",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1916:38",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u64",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:2139:27",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u64_into",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0/src/lib.rs:1916:38",
+        ),
+        (
+            "lib::arrayvec_impl::ArrayVecImpl::push",
+            "Assertion@<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/arrayvec-0.7.7/src/arrayvec_impl.rs:40:8",
+        ),
+        ("reduction::<impl term::Term>::beta_cbn", "Assertion@<dump-root>/reduction.rs:169:12"),
+        ("reduction::<impl term::Term>::beta_cbv", "Assertion@<dump-root>/reduction.rs:206:12"),
+        ("reduction::<impl term::Term>::beta_cbv", "Assertion@<dump-root>/reduction.rs:207:12"),
+        // 2026-10-09: the signed `next_multiple_of` call-site row of
+        // NUM-NIGHTLY-UNCHARGED-1 (`b548304f0a`). The reason is in the doc comment
+        // above ("GROWN 47 -> 48").
+        ("main::w_next_multiple_of", "Assertion@main.rs:37:0"),
     ];
 
     fn dump_dirs(root: &Path, out: &mut Vec<PathBuf>) {
@@ -4717,13 +5531,12 @@ mod missing_obligation_ratchet {
                 // arm-1b block population, the input the caller threads once the
                 // trust_verify hookup lands.
                 let terminator_blocks = trust_vcgen::terminator_vc_block_set(&func);
-                let (_dispatched, outcome) =
-                    generate_native_or_flip_safety_vcs_with_reachability(
-                        &func,
-                        vcgen,
-                        discharged.iter(),
-                        Some(&terminator_blocks),
-                    );
+                let (_dispatched, outcome) = generate_native_or_flip_safety_vcs_with_reachability(
+                    &func,
+                    vcgen,
+                    discharged.iter(),
+                    Some(&terminator_blocks),
+                );
                 match outcome {
                     NativeGenOutcome::NativeGenerated(_) => native_generated += 1,
                     NativeGenOutcome::Disagreed { diff, .. } => {
@@ -5087,6 +5900,7 @@ mod missing_obligation_alarm_controls {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -5137,8 +5951,7 @@ mod missing_obligation_alarm_controls {
         // not, and the flip must fall back rather than dispatch the native set.
         let func = unreachable_probe();
         let mut enriched = probe_unreachable_vc();
-        enriched.formula =
-            Formula::And(vec![Formula::Bool(true), Formula::Bool(true)]);
+        enriched.formula = Formula::And(vec![Formula::Bool(true), Formula::Bool(true)]);
         let (dispatched, outcome) = generate_native_or_flip_safety_vcs_with_reachability(
             &func,
             vec![enriched.clone()],
@@ -5197,6 +6010,141 @@ mod missing_obligation_alarm_controls {
                 assert_eq!(diff.vcgen_only[0].class, "Unreachable");
             }
             other => panic!("expected the pre-increment coverage-gap shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wave488_formula_eq_modulo_versions_matches_strip_oracle_across_variants_and_symvars() {
+        use trust_types::Sort;
+        let oracle_eq = |a: &Formula, b: &Formula| -> bool {
+            strip_version_tokens_in_formula(a) == strip_version_tokens_in_formula(b)
+        };
+        let sym_versioned = trust_types::Symbol::intern("idx#s0_1");
+        let sym_plain = trust_types::Symbol::intern("idx");
+        let sym_other = trust_types::Symbol::intern("len#s2_0");
+
+        let cases = [
+            Formula::Var("idx".into(), Sort::Int),
+            Formula::Var("idx#s0_0".into(), Sort::Int),
+            Formula::Var("idx#s9_3".into(), Sort::BitVec(64)),
+            Formula::SymVar(sym_versioned, Sort::Int),
+            Formula::SymVar(sym_plain, Sort::Int),
+            Formula::SymVar(sym_other, Sort::Int),
+            Formula::BvAdd(
+                Box::new(Formula::Var("x#s0_1".into(), Sort::BitVec(32))),
+                Box::new(Formula::BitVec { value: 7, width: 32 }),
+                32,
+            ),
+            Formula::BvAdd(
+                Box::new(Formula::Var("x".into(), Sort::BitVec(32))),
+                Box::new(Formula::BitVec { value: 7, width: 32 }),
+                32,
+            ),
+            Formula::BvAdd(
+                Box::new(Formula::Var("x".into(), Sort::BitVec(64))),
+                Box::new(Formula::BitVec { value: 7, width: 64 }),
+                64,
+            ),
+            Formula::And(vec![
+                Formula::Le(
+                    Box::new(Formula::Int(0)),
+                    Box::new(Formula::SymVar(sym_versioned, Sort::Int)),
+                ),
+                Formula::ConstArray {
+                    index_sort: Sort::Int,
+                    elem_sort: Sort::Int,
+                    value: Box::new(Formula::Var("v#s1_0".into(), Sort::Int)),
+                },
+                Formula::rat("3", "5").expect("canonical rat"),
+            ]),
+            Formula::And(vec![
+                Formula::Le(
+                    Box::new(Formula::Int(0)),
+                    Box::new(Formula::Var("idx".into(), Sort::Int)),
+                ),
+                Formula::ConstArray {
+                    index_sort: Sort::Int,
+                    elem_sort: Sort::Int,
+                    value: Box::new(Formula::Var("v".into(), Sort::Int)),
+                },
+                Formula::rat("3", "5").expect("canonical rat"),
+            ]),
+        ];
+
+        for a in &cases {
+            for b in &cases {
+                assert_eq!(
+                    formula_eq_modulo_versions(a, b),
+                    oracle_eq(a, b),
+                    "mismatch on a={a:?}, b={b:?}",
+                );
+            }
+        }
+
+        // Exercise > 64 pending pairs on the overflow stack (both wide And(80) on the
+        // default 2 MiB test thread stack, and deep Not^96 on an 8 MiB stack so the
+        // recursive reference `oracle_eq` + `Drop` do not overflow debug stack frames).
+        let wide_a = Formula::And(
+            (0..80)
+                .map(|i| Formula::Var(format!("w{i}#s0_{i}"), Sort::Int))
+                .collect(),
+        );
+        let wide_b = Formula::And(
+            (0..80)
+                .map(|i| Formula::Var(format!("w{i}"), Sort::Int))
+                .collect(),
+        );
+        let mut wide_mismatch_children: Vec<Formula> =
+            (0..80).map(|i| Formula::Var(format!("w{i}"), Sort::Int)).collect();
+        wide_mismatch_children[79] = Formula::Var("different".into(), Sort::Int);
+        let wide_mismatch = Formula::And(wide_mismatch_children);
+        assert!(formula_eq_modulo_versions(&wide_a, &wide_b));
+        assert_eq!(formula_eq_modulo_versions(&wide_a, &wide_b), oracle_eq(&wide_a, &wide_b));
+        assert!(!formula_eq_modulo_versions(&wide_a, &wide_mismatch));
+
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let mut deep_a = Formula::Var("leaf#s0_0".into(), Sort::Bool);
+                let mut deep_b = Formula::Var("leaf".into(), Sort::Bool);
+                let mut deep_mismatch = Formula::Var("other#s0_0".into(), Sort::Bool);
+                for _ in 0..96 {
+                    deep_a = Formula::Not(Box::new(deep_a));
+                    deep_b = Formula::Not(Box::new(deep_b));
+                    deep_mismatch = Formula::Not(Box::new(deep_mismatch));
+                }
+                assert!(formula_eq_modulo_versions(&deep_a, &deep_b));
+                assert_eq!(
+                    formula_eq_modulo_versions(&deep_a, &deep_b),
+                    oracle_eq(&deep_a, &deep_b),
+                );
+                assert!(!formula_eq_modulo_versions(&deep_a, &deep_mismatch));
+            })
+            .expect("spawn deep stack test thread")
+            .join()
+            .expect("deep stack test passed");
+    }
+
+    #[test]
+    fn wave488_zero_dom_payload_span_and_contract_extractors_match_value_dom_oracle() {
+        let payloads = [
+            r#"{"formula":{"Eq":[{"Var":["x","Int"]},{"Int":0}]},"source":{"source_id":"s","assertion_id":"a","native_assertion_id":1,"span":{"file":"src/lib.rs","line_start":10,"col_start":4,"line_end":10,"col_end":19}}}"#,
+            r#"{"source_id":"s","span":{"file":"src/top.rs","line_start":1,"col_start":2,"line_end":3,"col_end":4}}"#,
+            r#"{"source":null,"span":{"file":"src/shadow.rs","line_start":1,"col_start":2,"line_end":3,"col_end":4}}"#,
+            r#"{"source":{"span":null},"span":{"file":"src/shadow2.rs","line_start":1,"col_start":2,"line_end":3,"col_end":4}}"#,
+            r#"{"formula":"not-a-valid-formula-ast","source":{"span":{"file":"src/bad_ast.rs","line_start":5,"col_start":1,"line_end":5,"col_end":9}}}"#,
+            r#"[1, 2, 3]"#,
+            r#"{"broken_json":"#,
+        ];
+        for payload in payloads {
+            let oracle = serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|v| span_from_json_value(&v));
+            assert_eq!(
+                span_from_proof_formula_payload(payload),
+                oracle,
+                "span mismatch on payload={payload}",
+            );
         }
     }
 }

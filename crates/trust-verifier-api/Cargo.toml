@@ -13,6 +13,9 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+native-trust-ir-claims = ["dep:trust-ir"]
+
 [dependencies]
 # trust: canonical home of the proof-assurance vocabulary (AssuranceLevel,
 # ProofStrength, ReasoningKind, TrustSpecVariableOrigin). Re-exported below so
@@ -27,4 +30,6 @@ trust-types = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
+
+# Optional typed claim identity shared by native MC and WP adapters.
+trust-ir = { workspace = true, optional = true }

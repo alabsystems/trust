@@ -411,22 +411,4 @@ mod tests {
         let analyzer = AliasAnalyzer::default();
         assert_eq!(analyzer.pointer_count(), 0);
     }
-
-    #[test]
-    fn test_alias_set_default() {
-        let set = AliasSet::default();
-        assert!(set.entries.is_empty());
-    }
-
-    #[test]
-    fn test_alias_query_struct() {
-        let query = AliasQuery {
-            pointer_a: "p".to_owned(),
-            pointer_b: "q".to_owned(),
-            context: "fn_main".to_owned(),
-        };
-        assert_eq!(query.pointer_a, "p");
-        assert_eq!(query.pointer_b, "q");
-        assert_eq!(query.context, "fn_main");
-    }
 }

@@ -869,7 +869,8 @@ pub(crate) fn sem_transported_call_of_mir_diag(
 /// read-only allow-list permits a NON-Deref write `_p.f = ..` / `SetDiscriminant(_p)`
 /// on an owned local, so a by-value path BASE must additionally show the complete
 /// call-family write profile EMPTY — zero bare or projected assignments, no
-/// `&mut`/`AddressOf(true)` alias, no `SetDiscriminant`/`Deinit`/`Retag`, no `Drop`,
+/// `&mut`/`AddressOf` alias of either mutability (`&raw const` since
+/// INT-RAWCONST-HAVOC-1), no `SetDiscriminant`/`Deinit`/`Retag`, no `Drop`,
 /// no call destination (`call_family_local_writes` fails closed on each). A
 /// `pub(crate)` wrapper so `call_lift.rs` stays byte-unchanged.
 pub(crate) fn base_local_is_unwritten(body: &trust_types::VerifiableBody, local: usize) -> bool {
@@ -938,7 +939,7 @@ pub(crate) fn transport_const_referent(
     };
     let resolved = body.resolved_datatype(inner);
     match cv {
-        ConstValue::UnitVariantRef { enum_name, variant } => {
+        ConstValue::UnitVariantRef { enum_name, variant, .. } => {
             let Ty::Adt {
                 name, variants, disc_index_safe, faithful_enum_repr, ..
             } =
@@ -1003,7 +1004,7 @@ pub(crate) fn transport_const_referent(
             }
             Ok((Vec::new(), Some(d)))
         }
-        ConstValue::StructScalarFieldsRef { adt_name, fields } => {
+        ConstValue::StructScalarFieldsRef { adt_name, fields, .. } => {
             let Ty::Adt { name, fields: tf, variants, adt_kind, .. } = resolved.as_ref() else {
                 return Err("const-referent-shape-mismatch");
             };

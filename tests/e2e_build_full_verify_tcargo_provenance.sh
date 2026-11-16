@@ -127,12 +127,15 @@ GOOD_BOOTSTRAP_MANIFEST="$GOOD_REPO_ROOT/src/bootstrap/Cargo.toml"
 assert_contains "$GOOD_OUT" "Using canonical full-verify targo: $GOOD_TARGO"
 assert_contains "$GOOD_LOG" "$GOOD_TARGO trust verify self"
 assert_contains "$GOOD_LOG" "TRUST_VERIFY_WORKER_THREADS=2 $GOOD_TARGO trust verify self"
-assert_contains "$GOOD_LOG" "--stage-command env -u CARGO_TARGET_DIR $GOOD_TARGO --unverified run --locked --offline --target-dir $GOOD_BOOTSTRAP_TARGET --manifest-path $GOOD_BOOTSTRAP_MANIFEST -- --src $GOOD_REPO_ROOT build"
+assert_contains "$GOOD_LOG" "env -u CARGO_TARGET_DIR CARGO_NET_OFFLINE=true $GOOD_TARGO --unverified run --locked --offline --target-dir $GOOD_BOOTSTRAP_TARGET --manifest-path $GOOD_BOOTSTRAP_MANIFEST -- --src $GOOD_REPO_ROOT build"
 assert_contains "$GOOD_LOG" "--set build.full-bootstrap=true"
 assert_contains "$GOOD_LOG" "$GOOD_TARGO trust domination upstream-tests --release"
-assert_contains "$GOOD_LOG" "$GOOD_TARGO trust deps validate"
+assert_contains "$GOOD_LOG" "$GOOD_TARGO trust repo submodule-reachability --rev HEAD --json"
+assert_not_contains_regex "$GOOD_LOG" 'trust deps validate'
 assert_not_contains_regex "$GOOD_LOG" $'\ttargo trust'
-assert_not_contains_regex "$GOOD_LOG" '--stage-command \./x\.py'
+assert_not_contains_regex "$GOOD_LOG" '--stage-command'
+assert_not_contains_regex "$GOOD_LOG" 'stage2-build-verification-on'
+assert_not_contains_regex "$GOOD_LOG" '--timeout 0'
 assert_not_contains_regex "$GOOD_LOG" 'python'
 assert_not_contains_regex "$GOOD_LOG" 'src/bootstrap/target'
 if [[ -e "$GOOD_AMBIENT_MARKER" ]]; then

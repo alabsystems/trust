@@ -1,6 +1,6 @@
 //@ run-pass
 //@ dont-check-compiler-stderr
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aunused_features
 #![feature(loop_match)]
 //! Trust (wave-FLM): a FLOAT match lowers as a chain of `Inst::FCmp` — the
 //! slice/str skeleton with the length test replaced by a float comparison.

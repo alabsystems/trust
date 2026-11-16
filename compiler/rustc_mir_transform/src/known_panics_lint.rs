@@ -5,24 +5,26 @@
 use std::fmt::Debug;
 
 use rustc_abi::{BackendRepr, FieldIdx, HasDataLayout, Size, TargetDataLayout, VariantIdx};
+use rustc_attr_ir::find_attr;
 use rustc_const_eval::const_eval::DummyMachine;
-use rustc_const_eval::interpret::{
-    ImmTy, InterpCx, InterpResult, Projectable, Scalar, format_interp_error, interp_ok,
-};
+use rustc_const_eval::interpret::{ImmTy, InterpCx, InterpResult, Projectable, Scalar, interp_ok};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::HirId;
 use rustc_hir::def::DefKind;
 use rustc_index::IndexVec;
 use rustc_index::bit_set::DenseBitSet;
-use rustc_middle::bug;
+use rustc_lint_defs::builtin::UNCONDITIONAL_PANIC;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout::{LayoutError, LayoutOf, LayoutOfHelpers, TyAndLayout};
-use rustc_middle::ty::{self, ConstInt, ScalarInt, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
-use rustc_span::Span;
+use rustc_middle::ty::{
+    self, ConstInt, GenericArgKind, GenericParamDefKind, ScalarInt, Ty, TyCtxt, TypeVisitableExt,
+    Unnormalized,
+};
+use rustc_span::{Span, bug};
 use tracing::{debug, instrument, trace};
 
-use crate::diagnostics::{AssertLint, AssertLintKind};
+use crate::diagnostics::{AssertLint, AssertLintKind, ConstNIsZero};
 
 pub(super) struct KnownPanicsLint;
 
@@ -35,7 +37,7 @@ impl<'tcx> crate::MirLint<'tcx> for KnownPanicsLint {
         let def_id = body.source.def_id().expect_local();
         let def_kind = tcx.def_kind(def_id);
         let is_fn_like = def_kind.is_fn_like();
-        let is_assoc_const = matches!(def_kind, DefKind::AssocConst { .. });
+        let is_assoc_const = def_kind == DefKind::AssocConst;
 
         // Only run const prop on functions, methods, closures and associated constants
         if !is_fn_like && !is_assoc_const {
@@ -210,7 +212,9 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
     /// but not reading from them anymore.
     fn remove_const(&mut self, local: Local) {
         self.locals[local] = Value::Uninit;
-        self.written_only_inside_own_block_locals.remove(&local);
+        if !self.written_only_inside_own_block_locals.is_empty() {
+            self.written_only_inside_own_block_locals.remove(&local);
+        }
     }
 
     fn access_mut(&mut self, place: &Place<'_>) -> Option<&mut Value<'tcx>> {
@@ -233,7 +237,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         F: FnOnce(&mut Self) -> InterpResult<'tcx, T>,
     {
         f(self)
-            .map_err_info(|err| {
+            .inspect_err_info(|err| {
                 trace!("InterpCx operation failed: {:?}", err);
                 // Some errors shouldn't come up because creating them causes
                 // an allocation, which we should avoid. When that happens,
@@ -241,9 +245,8 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 assert!(
                     !err.kind().formatted_string(),
                     "known panics lint encountered formatting error: {}",
-                    format_interp_error(err),
+                    err.to_string(),
                 );
-                err
             })
             .discard_err()
     }
@@ -563,7 +566,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 let right = self.use_ecx(|this| this.ecx.read_immediate(&right))?;
 
                 let val = self.use_ecx(|this| this.ecx.binary_op(bin_op, &left, &right))?;
-                if matches!(val.layout.backend_repr, BackendRepr::ScalarPair(..)) {
+                if matches!(val.layout.backend_repr, BackendRepr::ScalarPair { .. }) {
                     // FIXME `Value` should properly support pairs in `Immediate`... but currently
                     // it does not.
                     let (val, overflow) = val.to_pair(&self.ecx);
@@ -629,7 +632,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                     // so bail out if the target is not one.
                     match (value.layout.backend_repr, to.backend_repr) {
                         (BackendRepr::Scalar(..), BackendRepr::Scalar(..)) => {}
-                        (BackendRepr::ScalarPair(..), BackendRepr::ScalarPair(..)) => {}
+                        (BackendRepr::ScalarPair { .. }, BackendRepr::ScalarPair { .. }) => {}
                         _ => return None,
                     }
 
@@ -768,6 +771,39 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
                 }
                 // We failed to evaluate the discriminant, fallback to visiting all successors.
             }
+            TerminatorKind::Call { func, args: _, .. } => {
+                if let Some((def_id, generic_args)) = func.const_fn_def() {
+                    for (index, arg) in generic_args.iter().enumerate() {
+                        if let GenericArgKind::Const(ct) = arg.kind()
+                            && let Some(0) = ct.try_to_target_usize(self.tcx)
+                        {
+                            let generics = self.tcx.generics_of(def_id);
+                            let param_def = generics.param_at(index, self.tcx);
+
+                            if let GenericParamDefKind::Const { .. } = param_def.kind
+                                && find_attr!(self.tcx, param_def.def_id, RustcPanicsWhenZero)
+                            {
+                                // We managed to figure-out that the value of a
+                                // `#[rustc_panics_when_zero]` const-generic parameter is zero.
+                                //
+                                // Let's report it as an unconditional panic.
+                                let source_info = self.body.source_info(location);
+                                if let Some(lint_root) = self.lint_root(*source_info) {
+                                    self.tcx.emit_node_span_lint(
+                                        UNCONDITIONAL_PANIC,
+                                        lint_root,
+                                        source_info.span,
+                                        ConstNIsZero {
+                                            const_param_span: source_info.span,
+                                            const_param_name: param_def.name,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // None of these have Operands to const-propagate.
             TerminatorKind::Goto { .. }
             | TerminatorKind::UnwindResume
@@ -780,7 +816,6 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
             | TerminatorKind::CoroutineDrop
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. }
-            | TerminatorKind::Call { .. }
             | TerminatorKind::InlineAsm { .. } => {}
         }
 
@@ -790,22 +825,24 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
     fn visit_basic_block_data(&mut self, block: BasicBlock, data: &BasicBlockData<'tcx>) {
         self.super_basic_block_data(block, data);
 
-        // We remove all Locals which are restricted in propagation to their containing blocks and
-        // which were modified in the current block.
-        // Take it out of the ecx so we can get a mutable reference to the ecx for `remove_const`.
-        let mut written_only_inside_own_block_locals =
-            std::mem::take(&mut self.written_only_inside_own_block_locals);
+        if !self.written_only_inside_own_block_locals.is_empty() {
+            // We remove all Locals which are restricted in propagation to their containing blocks and
+            // which were modified in the current block.
+            // Take it out of the ecx so we can get a mutable reference to the ecx for `remove_const`.
+            let mut written_only_inside_own_block_locals =
+                std::mem::take(&mut self.written_only_inside_own_block_locals);
 
-        // This loop can get very hot for some bodies: it check each local in each bb.
-        // To avoid this quadratic behaviour, we only clear the locals that were modified inside
-        // the current block.
-        // The order in which we remove consts does not matter.
-        #[allow(rustc::potential_query_instability)]
-        for local in written_only_inside_own_block_locals.drain() {
-            debug_assert_eq!(self.can_const_prop[local], ConstPropMode::OnlyInsideOwnBlock);
-            self.remove_const(local);
+            // This loop can get very hot for some bodies: it check each local in each bb.
+            // To avoid this quadratic behaviour, we only clear the locals that were modified inside
+            // the current block.
+            // The order in which we remove consts does not matter.
+            #[allow(rustc::potential_query_instability)]
+            for local in written_only_inside_own_block_locals.drain() {
+                debug_assert_eq!(self.can_const_prop[local], ConstPropMode::OnlyInsideOwnBlock);
+                self.remove_const(local);
+            }
+            self.written_only_inside_own_block_locals = written_only_inside_own_block_locals;
         }
-        self.written_only_inside_own_block_locals = written_only_inside_own_block_locals;
 
         if cfg!(debug_assertions) {
             for (local, &mode) in self.can_const_prop.iter_enumerated() {
@@ -843,6 +880,8 @@ struct CanConstProp {
     can_const_prop: IndexVec<Local, ConstPropMode>,
     // False at the beginning. Once set, no more assignments are allowed to that local.
     found_assignment: DenseBitSet<Local>,
+    // True if the local is the destination of at least one direct `Assign` or `SetDiscriminant`.
+    has_direct_store: DenseBitSet<Local>,
 }
 
 impl CanConstProp {
@@ -855,8 +894,19 @@ impl CanConstProp {
         let mut cpv = CanConstProp {
             can_const_prop: IndexVec::from_elem(ConstPropMode::FullConstProp, &body.local_decls),
             found_assignment: DenseBitSet::new_empty(body.local_decls.len()),
+            has_direct_store: DenseBitSet::new_empty(body.local_decls.len()),
         };
+        // Consider that arguments are assigned on entry.
+        for arg in body.args_iter() {
+            cpv.found_assignment.insert(arg);
+        }
+        cpv.visit_body(body);
+
         for (local, val) in cpv.can_const_prop.iter_enumerated_mut() {
+            if !cpv.has_direct_store.contains(local) || *val == ConstPropMode::NoPropagation {
+                *val = ConstPropMode::NoPropagation;
+                continue;
+            }
             let ty = body.local_decls[local].ty;
             if ty.is_async_drop_in_place_coroutine(tcx) {
                 // No const propagation for async drop coroutine (AsyncDropGlue).
@@ -882,11 +932,6 @@ impl CanConstProp {
                 }
             }
         }
-        // Consider that arguments are assigned on entry.
-        for arg in body.args_iter() {
-            cpv.found_assignment.insert(arg);
-        }
-        cpv.visit_body(body);
         cpv.can_const_prop
     }
 }
@@ -907,19 +952,32 @@ impl<'tcx> Visitor<'tcx> for CanConstProp {
     fn visit_local(&mut self, local: Local, context: PlaceContext, _: Location) {
         use rustc_middle::mir::visit::PlaceContext::*;
         match context {
-            // These are just stores, where the storing is not propagatable, but there may be later
-            // mutations of the same local via `Store`
-            | MutatingUse(MutatingUseContext::Call)
-            | MutatingUse(MutatingUseContext::AsmOutput)
             // Actual store that can possibly even propagate a value
-            | MutatingUse(MutatingUseContext::Store)
-            | MutatingUse(MutatingUseContext::SetDiscriminant) => {
+            MutatingUse(MutatingUseContext::Store | MutatingUseContext::SetDiscriminant) => {
+                self.has_direct_store.insert(local);
                 if !self.found_assignment.insert(local) {
                     match &mut self.can_const_prop[local] {
                         // If the local can only get propagated in its own block, then we don't have
                         // to worry about multiple assignments, as we'll nuke the const state at the
                         // end of the block anyway, and inside the block we overwrite previous
                         // states as applicable.
+                        ConstPropMode::OnlyInsideOwnBlock => {}
+                        ConstPropMode::NoPropagation => {}
+                        other @ ConstPropMode::FullConstProp => {
+                            trace!(
+                                "local {:?} can't be propagated because of multiple assignments. Previous state: {:?}",
+                                local, other,
+                            );
+                            *other = ConstPropMode::OnlyInsideOwnBlock;
+                        }
+                    }
+                }
+            }
+            // These are just stores, where the storing is not propagatable, but there may be later
+            // mutations of the same local via `Store`
+            MutatingUse(MutatingUseContext::Call | MutatingUseContext::AsmOutput) => {
+                if !self.found_assignment.insert(local) {
+                    match &mut self.can_const_prop[local] {
                         ConstPropMode::OnlyInsideOwnBlock => {}
                         ConstPropMode::NoPropagation => {}
                         other @ ConstPropMode::FullConstProp => {
@@ -943,7 +1001,6 @@ impl<'tcx> Visitor<'tcx> for CanConstProp {
             // whether they'd be fine right now.
             MutatingUse(MutatingUseContext::Yield)
             | MutatingUse(MutatingUseContext::Drop)
-            | MutatingUse(MutatingUseContext::Retag)
             // These can't ever be propagated under any scheme, as we can't reason about indirect
             // mutation.
             | NonMutatingUse(NonMutatingUseContext::SharedBorrow)

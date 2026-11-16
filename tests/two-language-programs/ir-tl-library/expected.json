@@ -1,0 +1,107 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-tl-library",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (f344fb244 2026-09-21) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@7b9146ba2ab5 sha256:c9692ee58d31e864",
+  "clean": "first-party/clean@faf434b73aac sha256:a9d64ad7f7b7ccde",
+  "trust-cg": "first-party/trust-cg@3f79b19a3d7f sha256:f24a73c879facca4"
+ },
+ "ratchets": {
+  "LEAN.build.envelope": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.check.multi_file": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.consumer.binary_container": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was `default+auto: expected tMBC magic` \u2014 trust-cg's reader accepted only the legacy `tMBC` container, so the canonical trust-ir binary (magic `TRUST_IR`) was refused in BOTH the default and `--format=auto` modes, i.e. the consumer could not read what the producer emits. It now reads the canonical container in both. NOT attributed to a single trust-cg commit: the superproject gitlink moved across a range in this landing (c3239510 -> 3f79b19a3) and the flip is what this tree measures."
+  },
+  "LEAN.consumer.ungated_codegen": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.envelope.module_sha256": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.home.body_gate": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.home.body_gate.populated": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "body_gate=None on 14/14 functions",
+   "audit": "GAP"
+  },
+  "LEAN.home.cross_file_import.populated": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "imports=[]:Lib bodies re-embedded=11",
+   "audit": "GAP"
+  },
+  "LEAN.home.gate_digest_slot": {
+   "verdict": "GAP",
+   "class": "format-gap",
+   "signature": "Gated{authority} only: subject_digest+kernel_payload_sha256 dropped",
+   "audit": "GAP"
+  },
+  "LEAN.home.gate_evidence.populated": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "obligations=0:certificates=0:summaries=0:imports=0",
+   "audit": "GAP"
+  },
+  "LEAN.home.kernel_only_theorems.populated": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "theorems=['addmul_def', 'fst3_again', 'fst3_eq', 'horner_def', 'snd32_eq']:absent",
+   "audit": "GAP"
+  },
+  "LEAN.home.source_digest": {
+   "verdict": "GAP",
+   "class": "format-gap",
+   "signature": "Module.files: invalid type: map, expected a string",
+   "audit": "GAP"
+  },
+  "LEAN.home.theorem_certified_tier": {
+   "verdict": "GAP",
+   "class": "format-gap",
+   "signature": "status=Certified -> [CertifiedWithoutCleanCic]",
+   "audit": "GAP"
+  },
+  "LEAN.home.theorem_statement": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.module.interpret": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.module.native_differential": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.module.producer_and_carrier": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.module.roundtrip4": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.module.validate": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "LEAN.oracle.kernel_vectors": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

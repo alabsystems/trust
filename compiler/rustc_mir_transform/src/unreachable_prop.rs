@@ -4,23 +4,32 @@
 
 use rustc_abi::Size;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_middle::bug;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, TyCtxt};
+use rustc_span::bug;
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 pub(super) struct UnreachablePropagation;
 
 impl crate::MirPass<'_> for UnreachablePropagation {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
         // Enable only under -Zmir-opt-level=2 as this can make programs less debuggable.
-        sess.mir_opt_level() >= 2
+        PassPolicy::optional(ctx.mir_opt_level() >= 2)
     }
 
     fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        let mut patch = MirPatch::new(body);
+        if !body.basic_blocks.iter().any(|bb_data| match &bb_data.terminator().kind {
+            TerminatorKind::Unreachable => true,
+            TerminatorKind::SwitchInt { targets, .. } => targets.all_targets().len() <= 1,
+            _ => false,
+        }) {
+            return;
+        }
+
+        let mut patch = MirPatch::new_without_block_cache(body);
         let mut unreachable_blocks = FxHashSet::default();
 
         for (bb, bb_data) in traversal::postorder(body) {
@@ -29,15 +38,19 @@ impl crate::MirPass<'_> for UnreachablePropagation {
                 TerminatorKind::Unreachable => true,
                 // This will unconditionally run into an unreachable and is therefore unreachable
                 // as well.
-                TerminatorKind::Goto { target } if unreachable_blocks.contains(target) => {
+                TerminatorKind::Goto { target, .. } if unreachable_blocks.contains(target) => {
                     patch.patch_terminator(bb, TerminatorKind::Unreachable);
                     true
                 }
                 // Try to remove unreachable targets from the switch.
-                TerminatorKind::SwitchInt { .. } => {
-                    remove_successors_from_switch(tcx, bb, body, &mut patch, |bb| {
-                        unreachable_blocks.contains(&bb)
-                    })
+                TerminatorKind::SwitchInt { targets, .. } => {
+                    if unreachable_blocks.is_empty() && targets.all_targets().len() > 1 {
+                        false
+                    } else {
+                        remove_successors_from_switch(tcx, bb, body, &mut patch, |bb| {
+                            unreachable_blocks.contains(&bb)
+                        })
+                    }
                 }
                 _ => false,
             };
@@ -48,16 +61,15 @@ impl crate::MirPass<'_> for UnreachablePropagation {
 
         patch.apply(body);
 
-        // We do want do keep some unreachable blocks, but make them empty.
-        // The order in which we clear bb statements does not matter.
-        #[allow(rustc::potential_query_instability)]
-        for bb in unreachable_blocks {
-            body.basic_blocks_mut()[bb].statements.clear();
+        if !unreachable_blocks.is_empty() {
+            // We do want do keep some unreachable blocks, but make them empty.
+            // The order in which we clear bb statements does not matter.
+            let bbs = body.basic_blocks_mut();
+            #[allow(rustc::potential_query_instability)]
+            for bb in unreachable_blocks {
+                bbs[bb].statements.clear();
+            }
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -71,6 +83,15 @@ pub(crate) fn remove_successors_from_switch<'tcx>(
 ) -> bool {
     let terminator = body.basic_blocks[bb].terminator();
     let TerminatorKind::SwitchInt { discr, targets } = &terminator.kind else { bug!() };
+    let otherwise = targets.otherwise();
+    let otherwise_unreachable = is_unreachable_block(otherwise);
+    if !otherwise_unreachable
+        && targets.all_targets().len() > 1
+        && !targets.iter().any(|(_, bb)| is_unreachable_block(bb))
+    {
+        return false;
+    }
+
     let source_info = terminator.source_info;
     let location = body.terminator_loc(bb);
 
@@ -115,9 +136,6 @@ pub(crate) fn remove_successors_from_switch<'tcx>(
         patch.add_statement(location, StatementKind::Intrinsic(Box::new(assume)));
     };
 
-    let otherwise = targets.otherwise();
-    let otherwise_unreachable = is_unreachable_block(otherwise);
-
     let reachable_iter = targets.iter().filter(|&(value, bb)| {
         let is_unreachable = is_unreachable_block(bb);
         // We remove this target from the switch, so record the inequality using `Assume`.
@@ -135,12 +153,12 @@ pub(crate) fn remove_successors_from_switch<'tcx>(
     let terminator = match (num_targets, otherwise_unreachable) {
         // If all targets are unreachable, we can be unreachable as well.
         (1, true) => TerminatorKind::Unreachable,
-        (1, false) => TerminatorKind::Goto { target: otherwise },
+        (1, false) => TerminatorKind::goto(otherwise),
         (2, true) => {
             // All targets are unreachable except one. Record the equality, and make it a goto.
             let (value, target) = new_targets.iter().next().unwrap();
             add_assumption(BinOp::Eq, value);
-            TerminatorKind::Goto { target }
+            TerminatorKind::goto(target)
         }
         _ if num_targets == targets.all_targets().len() => {
             // Nothing has changed.

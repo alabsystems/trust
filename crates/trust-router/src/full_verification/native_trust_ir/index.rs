@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+use trust_ir::request::transport::native_bundle_transport_payload;
 use trust_ir_bridge::{NativeVerificationBundle, NativeVerificationRequest};
 use trust_verifier_api::{
     ArtifactHash, EvidenceArtifact, EvidenceArtifactKind, EvidenceArtifactMaterialization,
@@ -14,21 +15,8 @@ use super::super::policy::{
     TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY,
     TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY,
 };
-use super::super::routing::{ObligationRoute, PrimaryEngine};
-use super::super::util::{artifact_hash_label, metadata_u32, metadata_value};
-
-fn parse_trust_ir_native_obligation_id(
-    obligation_id: &str,
-) -> Option<NativeTrustIrObligationIdentity> {
-    let suffix = obligation_id.strip_prefix("trust_ir-native-")?;
-    let (suite, rest) = suffix.split_once("-request-")?;
-    let (request, proof) = rest.split_once("-proof-")?;
-    Some(NativeTrustIrObligationIdentity {
-        suite: Some(suite.to_string()),
-        request_id: Some(request.parse().ok()?),
-        proof_obligation_id: proof.parse().ok()?,
-    })
-}
+use super::super::routing::{ObligationRoute, PrimaryEngine, fallback_route, obligation_route};
+use super::super::util::artifact_hash_label;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeTrustIrEvidenceIndex {
@@ -36,6 +24,8 @@ pub(crate) struct NativeTrustIrEvidenceIndex {
     pub(super) validation_errors: Vec<String>,
     pub(super) requests: Vec<NativeTrustIrRequestEvidence>,
     pub(crate) diagnostics: Vec<String>,
+    #[cfg(feature = "trust-build")]
+    wp_replay: Option<std::sync::Arc<super::wp_replay::NativeWpReplay>>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +42,8 @@ pub(super) struct NativeTrustIrRequestEvidence {
 pub(crate) struct NativeTrustIrArtifactMatch {
     pub(crate) artifacts: Vec<EvidenceArtifact>,
     pub(crate) diagnostic: String,
+    pub(crate) request_id: u32,
+    pub(crate) proof_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,8 +55,9 @@ pub(crate) struct NativeTrustIrObligationIdentity {
 
 impl NativeTrustIrEvidenceIndex {
     pub(crate) fn from_bundle(bundle: &NativeVerificationBundle) -> Self {
-        let bundle_bytes_result =
-            native_artifact_envelope_bytes("bundle", None, None, None, bundle);
+        let bundle_bytes_result = native_bundle_transport_payload(bundle).and_then(|payload| {
+            native_artifact_envelope_bytes("bundle", None, None, None, &payload)
+        });
         let bundle_serialization_error = bundle_bytes_result.as_ref().err().cloned();
         let bundle_bytes = bundle_bytes_result.unwrap_or_default();
         let bundle_hash = sha256_artifact_hash(&bundle_bytes);
@@ -127,7 +120,98 @@ impl NativeTrustIrEvidenceIndex {
             ));
         }
 
-        Self { bundle_artifact, validation_errors, requests, diagnostics }
+        #[cfg(feature = "trust-build")]
+        let wp_replay = (validation_errors.is_empty()
+            && bundle
+                .requests
+                .iter()
+                .any(|request| matches!(request, NativeVerificationRequest::TrustWp(_))))
+        .then(|| std::sync::Arc::new(super::wp_replay::NativeWpReplay::new(bundle)));
+        Self {
+            bundle_artifact,
+            validation_errors,
+            requests,
+            diagnostics,
+            #[cfg(feature = "trust-build")]
+            wp_replay,
+        }
+    }
+
+    pub(crate) fn accepts_wp_certificate(
+        &self,
+        bundle: &trust_verifier_api::TrustContractBundle,
+        obligation: &TrustObligation,
+        evidence: &trust_verifier_api::ObligationEvidence,
+        request_id: u32,
+        proof_id: u32,
+    ) -> bool {
+        #[cfg(feature = "trust-build")]
+        {
+            self.wp_replay.as_ref().is_some_and(|replay| {
+                replay.accepts(bundle, obligation, evidence, request_id, proof_id)
+            })
+        }
+        #[cfg(not(feature = "trust-build"))]
+        {
+            let _ = (bundle, obligation, evidence, request_id, proof_id);
+            false
+        }
+    }
+
+    pub(crate) fn checked_wp_proof(
+        &self,
+        bundle: &trust_verifier_api::TrustContractBundle,
+        obligation: &TrustObligation,
+        evidence: &trust_verifier_api::ObligationEvidence,
+    ) -> Option<super::CheckedNativeWpProof> {
+        if evidence.status != trust_verifier_api::EvidenceStatus::Proved
+            || evidence.proof_strength != Some(trust_verifier_api::ProofStrength::deductive())
+        {
+            return None;
+        }
+        let route = fallback_route(obligation)?.0;
+        let binding = self.artifact_match(route, obligation).ok()??;
+        #[cfg(feature = "trust-build")]
+        {
+            self.wp_replay.as_ref()?.checked_proof(
+                bundle,
+                obligation,
+                evidence,
+                binding.request_id,
+                binding.proof_id,
+            )
+        }
+        #[cfg(not(feature = "trust-build"))]
+        {
+            let _ = (bundle, binding);
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bundle_artifact_for_test(&self) -> &EvidenceArtifact {
+        &self.bundle_artifact
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validation_errors_for_test(&self) -> &[String] {
+        &self.validation_errors
+    }
+
+    /// `Some(reason)` when no proof on `route` can be accepted against this
+    /// bundle, whatever the engine returns: the bundle failed validation or
+    /// could not be materialized inline. Exactly the refusal
+    /// [`Self::artifact_match`] gives every such proof, so callers can know it
+    /// before dispatch.
+    pub(crate) fn proof_authority_refusal(&self, route: ObligationRoute) -> Option<String> {
+        if !route.primary.requires_trust_ir_native_bundle() || self.validation_errors.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "proved {} evidence is missing a valid typed TrustIr NativeVerificationBundle: {}",
+            route.primary.name(),
+            self.validation_errors.join("; ")
+        ))
     }
 
     pub(crate) fn artifact_match(
@@ -138,26 +222,53 @@ impl NativeTrustIrEvidenceIndex {
         if !route.primary.requires_trust_ir_native_bundle() {
             return Ok(None);
         }
-        if !self.validation_errors.is_empty() {
-            return Err(format!(
-                "proved {} evidence is missing a valid typed TrustIr NativeVerificationBundle: {}",
-                route.primary.name(),
-                self.validation_errors.join("; ")
-            ));
+        if let Some(refusal) = self.proof_authority_refusal(route) {
+            return Err(refusal);
         }
 
-        let identity = NativeTrustIrObligationIdentity::from_obligation(obligation, route.primary)?;
-        let request = self
-            .requests
-            .iter()
-            .find(|request| {
-                request.primary == route.primary
-                    && identity
-                        .request_id
-                        .is_none_or(|request_id| request.request_id == request_id)
-                    && request.proof_obligations.contains_key(&identity.proof_obligation_id)
-            })
-            .ok_or_else(|| {
+        let identity =
+            match NativeTrustIrObligationIdentity::from_obligation(obligation, route.primary) {
+                Ok(identity) => identity,
+                Err(primary_error) if route.primary == PrimaryEngine::TrustWp => {
+                    // A designated alternative strategy keeps the original public
+                    // identity. First authenticate that primary request, then find
+                    // its unique WP request for the same native proof obligation.
+                    // Never erase or relabel caller-supplied suite/request metadata.
+                    if fallback_route(obligation).is_none_or(|fallback| fallback.0 != route) {
+                        return Err(primary_error);
+                    }
+                    let primary = obligation_route(obligation).ok_or(primary_error)?;
+                    self.artifact_match(primary, obligation)?;
+                    let original = NativeTrustIrObligationIdentity::from_obligation(
+                        obligation,
+                        primary.primary,
+                    )?;
+                    let mut alternatives = self.requests.iter().filter(|request| {
+                        request.primary == route.primary
+                            && request.proof_obligations.contains_key(&original.proof_obligation_id)
+                    });
+                    let request = alternatives.next().ok_or_else(|| {
+                        "missing native WP request for the original proof obligation".to_string()
+                    })?;
+                    if alternatives.next().is_some() {
+                        return Err(
+                            "ambiguous native WP requests for the original proof obligation".into(),
+                        );
+                    }
+                    NativeTrustIrObligationIdentity {
+                        suite: Some(route.primary.name().into()),
+                        request_id: Some(request.request_id),
+                        proof_obligation_id: original.proof_obligation_id,
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+        let mut candidates = self.requests.iter().filter(|request| {
+            request.primary == route.primary
+                && identity.request_id.is_none_or(|request_id| request.request_id == request_id)
+                && request.proof_obligations.contains_key(&identity.proof_obligation_id)
+        });
+        let request = candidates.next().ok_or_else(|| {
                 format!(
                     "proved {} evidence is missing typed TrustIr native request artifact for request_id={} proof_obligation_id={}",
                     route.primary.name(),
@@ -167,6 +278,15 @@ impl NativeTrustIrEvidenceIndex {
                     identity.proof_obligation_id
                 )
             })?;
+
+        if candidates.next().is_some() {
+            return Err(format!(
+                "proved {} evidence has ambiguous typed TrustIr native requests for request_id={} proof_obligation_id={}",
+                route.primary.name(),
+                identity.request_id.map_or_else(|| "any".to_string(), |id| id.to_string()),
+                identity.proof_obligation_id,
+            ));
+        }
 
         let proof_artifact = request
             .proof_obligation_artifact(identity.proof_obligation_id)
@@ -207,6 +327,8 @@ impl NativeTrustIrEvidenceIndex {
                 });
         }
         Ok(Some(NativeTrustIrArtifactMatch {
+            request_id: request.request_id,
+            proof_id: identity.proof_obligation_id,
             artifacts,
             diagnostic: format!(
                 "typed TrustIr native request identity accepted: suite={} request_id={} proof_obligation_id={} public_obligation_id={:?} request_digest={} bundle_digest={}",
@@ -367,78 +489,42 @@ impl NativeTrustIrObligationIdentity {
         obligation: &TrustObligation,
         expected_primary: PrimaryEngine,
     ) -> Result<Self, String> {
-        for key in [
-            TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY,
-            TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY,
-            TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY,
-        ] {
-            if obligation.metadata.iter().filter(|entry| entry.key == key).take(2).count() > 1 {
-                return Err(format!(
-                    "proved {} evidence has ambiguous duplicate TrustIr native identity metadata `{key}`",
-                    expected_primary.name()
-                ));
+        use trust_verifier_api::native_routing_identity::{
+            NativeRoutingIdentityError as Error, NativeRoutingIdentityPolicy, SuiteComparison,
+            parse_native_routing_identity,
+        };
+        let identity = parse_native_routing_identity(obligation, NativeRoutingIdentityPolicy {
+            canonical_id_fallback: true,
+            canonical_metadata_numbers: false,
+            suite_comparison: SuiteComparison::Exact,
+        }).map_err(|error| match error {
+            Error::DuplicateMetadata { key } => format!(
+                "proved {} evidence has ambiguous duplicate TrustIr native identity metadata `{key}`",
+                expected_primary.name()
+            ),
+            Error::InvalidNumber { key, value } => format!(
+                "metadata `{key}` must be an unsigned 32-bit integer, got `{value}`"
+            ),
+            Error::Conflict { key, metadata, canonical } => {
+                let (field, id_field) = if key == TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY {
+                    ("suite", "suite")
+                } else if key == TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY {
+                    ("request", "request")
+                } else {
+                    ("proof-obligation", "proof")
+                };
+                format!(
+                    "proved {} evidence has TrustIr native {field} metadata `{metadata}` that disagrees with canonical obligation id `{}` {id_field} `{canonical}`",
+                    expected_primary.name(), obligation.obligation_id
+                )
             }
-        }
-        let parsed_id = parse_trust_ir_native_obligation_id(&obligation.obligation_id);
-        let metadata_proof_obligation_id = metadata_u32(
-            &obligation.metadata,
-            TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY,
-        )?;
-        let metadata_request_id =
-            metadata_u32(&obligation.metadata, TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY)?;
-        let metadata_suite =
-            metadata_value(&obligation.metadata, TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY)
-                .map(str::to_string);
-
-        if let Some(parsed_id) = parsed_id.as_ref() {
-            if let Some(metadata_suite) = metadata_suite.as_ref()
-                && parsed_id.suite.as_ref() != Some(metadata_suite)
-            {
-                return Err(format!(
-                    "proved {} evidence has TrustIr native suite metadata `{metadata_suite}` that disagrees with canonical obligation id `{}` suite `{}`",
-                    expected_primary.name(),
-                    obligation.obligation_id,
-                    parsed_id.suite.as_deref().unwrap_or("<missing>")
-                ));
-            }
-            if let Some(metadata_request_id) = metadata_request_id
-                && parsed_id.request_id != Some(metadata_request_id)
-            {
-                return Err(format!(
-                    "proved {} evidence has TrustIr native request metadata `{metadata_request_id}` that disagrees with canonical obligation id `{}` request `{}`",
-                    expected_primary.name(),
-                    obligation.obligation_id,
-                    parsed_id
-                        .request_id
-                        .map_or_else(|| "<missing>".to_string(), |value| value.to_string())
-                ));
-            }
-            if let Some(metadata_proof_obligation_id) = metadata_proof_obligation_id
-                && parsed_id.proof_obligation_id != metadata_proof_obligation_id
-            {
-                return Err(format!(
-                    "proved {} evidence has TrustIr native proof-obligation metadata `{metadata_proof_obligation_id}` that disagrees with canonical obligation id `{}` proof `{}`",
-                    expected_primary.name(),
-                    obligation.obligation_id,
-                    parsed_id.proof_obligation_id
-                ));
-            }
-        }
-
-        let proof_obligation_id = metadata_proof_obligation_id
-        .or_else(|| parsed_id.as_ref().map(|identity| identity.proof_obligation_id))
-        .ok_or_else(|| {
-            format!(
-                "proved {} evidence is missing TrustIr native proof-obligation identity; expected obligation metadata `{}` or id form `trust_ir-native-<suite>-request-<id>-proof-<proof_id>`",
-                expected_primary.name(),
-                TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY
-            )
         })?;
-
-        let request_id = metadata_request_id
-            .or_else(|| parsed_id.as_ref().and_then(|identity| identity.request_id));
-        let suite = metadata_suite
-            .or_else(|| parsed_id.as_ref().and_then(|identity| identity.suite.clone()));
+        let proof_obligation_id = identity.proof_obligation_id.ok_or_else(|| format!(
+            "proved {} evidence is missing TrustIr native proof-obligation identity; expected obligation metadata `{}` or id form `trust_ir-native-<suite>-request-<id>-proof-<proof_id>`",
+            expected_primary.name(), TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY
+        ))?;
+        let request_id = identity.request_id;
+        let suite = identity.suite;
 
         if let Some(suite) = suite.as_deref()
             && PrimaryEngine::from_trust_ir_suite_name(suite) != Some(expected_primary)
@@ -505,6 +591,8 @@ mod tests {
             validation_errors: Vec::new(),
             requests: vec![request],
             diagnostics: Vec::new(),
+            #[cfg(feature = "trust-build")]
+            wp_replay: None,
         };
         let obligation = TrustObligation {
             obligation_id: "public:aliased-obligation".to_string(),
@@ -644,5 +732,69 @@ mod tests {
         )
         .expect("unique metadata remains a complete identity channel");
         assert_eq!(from_metadata, from_id);
+    }
+
+    #[test]
+    fn native_routing_regression_requires_unique_inferred_request() {
+        let mut obligation = canonical_native_identity_obligation();
+        obligation.obligation_id = "public:shared-proof".into();
+        obligation
+            .metadata
+            .retain(|entry| entry.key != TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY);
+        let mut index = NativeTrustIrEvidenceIndex {
+            bundle_artifact: artifact(EvidenceArtifactKind::EngineInput, "bundle"),
+            validation_errors: Vec::new(),
+            requests: [7, 8]
+                .into_iter()
+                .map(|request_id| NativeTrustIrRequestEvidence {
+                    primary: PrimaryEngine::TrustMc,
+                    request_id,
+                    proof_obligations: BTreeMap::from([(
+                        0,
+                        artifact(EvidenceArtifactKind::NormalizedObligation, "proof"),
+                    )]),
+                    public_obligation_ids: BTreeMap::from([(0, obligation.obligation_id.clone())]),
+                    request_artifact: artifact(
+                        EvidenceArtifactKind::EngineInput,
+                        &format!("request-{request_id}"),
+                    ),
+                    diagnostic: String::new(),
+                })
+                .collect(),
+            diagnostics: Vec::new(),
+            #[cfg(feature = "trust-build")]
+            wp_replay: None,
+        };
+        let route = ObligationRoute {
+            obligation_kind: "assertion",
+            primary: PrimaryEngine::TrustMc,
+            proof_family: ProofFamily::TrustMcReachability,
+            minimum_assurance: RequiredAssurance::SmtBacked,
+        };
+        // These are correspondence controls, with no claim that synthetic
+        // artifact descriptors establish a proof.
+        let mut one = index.clone();
+        one.requests.truncate(1);
+        assert_eq!(one.artifact_match(route, &obligation).unwrap().unwrap().request_id, 7);
+        for _ in 0..2 {
+            let error = index
+                .artifact_match(route, &obligation)
+                .expect_err("a missing request id must not select by vector order");
+            assert!(error.contains("ambiguous"), "{error}");
+            assert_eq!(index.requests.len(), 2);
+            index.requests.reverse();
+        }
+        obligation.metadata.push(MetadataEntry {
+            key: TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY.into(),
+            value: "8".into(),
+        });
+        assert_eq!(index.artifact_match(route, &obligation).unwrap().unwrap().request_id, 8);
+        obligation.metadata.last_mut().unwrap().value = "9".into();
+        assert!(
+            index
+                .artifact_match(route, &obligation)
+                .unwrap_err()
+                .contains("missing typed TrustIr native request")
+        );
     }
 }

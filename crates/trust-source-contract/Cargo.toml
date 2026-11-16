@@ -1,0 +1,23 @@
+# Shared typed source contracts and exact body-VC correspondence.
+[package]
+name = "trust-source-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+trust-types = { workspace = true }
+trust-intbound = { workspace = true }
+trust-vcgen = { workspace = true }
+trust-verifier-api = { workspace = true }
+
+[dev-dependencies]
+trust-ir = { workspace = true }
+trust-ir-bridge = { path = "../trust-ir-bridge" }
+trust-vc-trust-engine = { path = "../../first-party/trust-vc/crates/trust-vc-trust-engine" }

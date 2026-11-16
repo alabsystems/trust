@@ -1,4 +1,4 @@
-use hir::{ConstEvalError, DefWithBody, DisplayTarget, Semantics};
+use hir::{ConstEvalError, ConstEvalErrorPretty as _, DefWithBody, DisplayTarget, Semantics};
 use ide_db::{FilePosition, RootDatabase, base_db::SourceDatabase, line_index};
 use std::time::{Duration, Instant};
 use stdx::format_to;
@@ -60,7 +60,7 @@ fn find_and_interpret(db: &RootDatabase, position: FilePosition) -> Option<(Dura
 
 pub(crate) fn render_const_eval_error(
     db: &RootDatabase,
-    e: ConstEvalError,
+    e: ConstEvalError<'_>,
     display_target: DisplayTarget,
 ) -> String {
     let span_formatter = |file_id, text_range: TextRange| {

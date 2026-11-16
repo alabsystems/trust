@@ -1,0 +1,28 @@
+[package]
+name = "trust-qualification"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+description = "Native immutable input binding for paired Trust qualification"
+
+[features]
+native-repository = ["dep:git2", "dep:trust-resource-provenance", "trust-resource-controller/client"]
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha1 = "0.10.6"
+trust-sha2 = { path = "../trust-sha2", features = ["std"] }
+trust-stage-receipt = { path = "../trust-stage-receipt" }
+trust-resource-controller = { path = "../trust-resource-controller" }
+trust-test-execution = { path = "../trust-test-execution" }
+git2 = { version = "0.21.0", default-features = false, optional = true }
+trust-resource-provenance = { path = "../trust-resource-provenance", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+# The admission library can be qualified without rebuilding a compiler.
+[workspace]

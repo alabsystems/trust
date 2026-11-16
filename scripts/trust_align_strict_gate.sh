@@ -31,9 +31,9 @@
 #     69 postconditions + 8 primary safety + 7 hardened twins.
 #  3. A pass never seen to fail is not evidence. Seven mutations run: five that
 #     must refute, and TWO that must NOT (D and G below).
-#  4. `TRUSTFLAGS` is silently dropped if misspelled, so the certify lane can
-#     look like it ran when it did not. The flag path is proved by feeding it a
-#     bogus policy and requiring the compiler to reject it BY NAME.
+#  4. The certify lane must be seen to run, not assumed. `--certify` selects
+#     it (TRUSTFLAGS is not read since T7a), and the Gate line names the lane
+#     that graded the run, so the certify step requires `[certify lane`.
 #  5. Proofs cover overflow and discharged contracts — NOT whether the answer is
 #     right.
 #
@@ -113,29 +113,11 @@ TARGO="${TARGO:-$REPO_ROOT/build/host/stage1/bin/targo}"
 [ -x "$(dirname "$TARGO")/trustc" ] \
   || { echo "REFUSE: no sibling trustc beside $TARGO — the stage1 sysroot is not assembled"; exit 2; }
 
-# PREFLIGHT: `crates/Cargo.toml` must LOAD. A workspace member listed without a
-# manifest on disk makes every `targo trust check` in this workspace exit 2 with
-# no `Gate:` line — indistinguishable, to every assertion below, from the §9.2
-# seal failure and from a real crate regression. Measured 2026-08-29: a
-# concurrent lane added its member row minutes before creating the crate, and
-# this gate reported 26 failures about `trust-align`, none of which were about
-# `trust-align`. Name the real cause instead.
-MISSING_MEMBERS="$(python3 - "$REPO_ROOT/crates" <<'PY'
-import os, re, sys
-root = sys.argv[1]
-s = open(os.path.join(root, "Cargo.toml")).read()
-m = re.search(r'^members\s*=\s*\[(.*?)^\]', s, re.S | re.M)
-if m:
-    for name in re.findall(r'^\s*"([^"]+)",\s*$', m.group(1), re.M):
-        if not os.path.exists(os.path.join(root, name, "Cargo.toml")):
-            print(name)
-PY
-)"
-[ -z "$MISSING_MEMBERS" ] || {
-  echo "REFUSE: crates/Cargo.toml lists member(s) with no manifest on disk:"
-  echo "$MISSING_MEMBERS" | sed 's/^/          /'
-  echo "        Every targo run in this workspace exits 2 with no Gate: line until"
-  echo "        that is fixed. This is NOT a trust-align result."
+# Ask Targo to load the canonical workspace before attributing a load failure
+# to the contract under test. Native metadata resolves members and manifests.
+"$TARGO" metadata --locked --no-deps --format-version 1 \
+  --manifest-path "$REPO_ROOT/Cargo.toml" >/dev/null || {
+  echo "REFUSE: Targo cannot load the canonical workspace"
   exit 2
 }
 
@@ -146,9 +128,9 @@ trap 'restore; rm -f "$BACKUP"' EXIT INT TERM
 
 fails=0
 LOG=""
-run() { # run [policy]; sets RC and LOG
+run() { # run [lane flag]; sets RC and LOG
   LOG="$(mktemp)"
-  ( cd "$REPO_ROOT/crates" && TRUSTFLAGS="${1:-}" "$TARGO" trust check -p trust-align ) > "$LOG" 2>&1
+  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check --all-rows ${1:+"$1"} -p trust-align ) > "$LOG" 2>&1
   RC=$?
   require_env "${STEP:-run}"
   no_rustc_error "${STEP:-run}"
@@ -165,7 +147,7 @@ runtests() { # sets RC and LOG
   RC=$?
   require_env "${STEP:-tests}"
 }
-gate_line() { grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$LOG" | tail -1; }
+gate_line() { grep -oE 'Gate: [A-Z-]+ \[[a-z-]+ lane, exit [0-9]+\]' "$LOG" | tail -1; }
 fail() { echo "  FAIL $*"; fails=$((fails+1)); }
 
 # ---------------------------------------------------------------------------
@@ -297,24 +279,19 @@ rm -f "$LOG"
 
 mut_end
 # ---------------------------------------------------------------------------
-# 2. THE SAME PASS UNDER `-Ztrust-policy=certify`.
-#    A misspelled TRUSTFLAGS is dropped, so first prove the flag path reaches
-#    the compiler by requiring a bogus policy to be REJECTED BY NAME. Without
-#    this control, "certify passed" is indistinguishable from "certify never
-#    ran".
+# 2. THE SAME PASS UNDER `--certify` (the compiler's `certify` policy).
+#    The lane flag selects the compiler's `certify` policy, and the Gate line
+#    names the lane that graded the run, so `[certify lane, exit 0]` is the
+#    evidence that certify ran. (A bogus-policy control proved the TRUSTFLAGS
+#    route reached the compiler; it went with that channel, DECISION_QUEUE T7a.)
 # ---------------------------------------------------------------------------
-STEP="THE SAME PASS UNDER '-Ztrust-policy=certify'"; mut_begin
-run "-Ztrust-policy=bogus_not_a_policy"
-grep -q "incorrect value \`bogus_not_a_policy\` for unstable option \`trust-policy\`" "$LOG" \
-  || fail "TRUSTFLAGS control: a bogus policy was NOT rejected — the flag never reaches the compiler, so the certify run below proves nothing"
-rm -f "$LOG"
-
-run "-Ztrust-policy=certify"
+STEP="THE SAME PASS UNDER '--certify'"; mut_begin
+run "--certify"
 require_env "certify"
 G="$(gate_line)"
 [ -n "$G" ] || fail "certify: no Gate: line"
 [ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
-case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
+case "$G" in *"PASS [certify lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
 grep -qE 'Summary: 84 proved, 0 failed, .*0 inconclusive \(84 total\)' "$LOG" \
   || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 [ "$(grep -oE 'proved by kind: [a-z_=0-9, ]+' "$LOG" | tail -1)" = "$PRISTINE_KINDS" ] \
@@ -391,11 +368,25 @@ mutate '    let m: u64 = mask as u64;' \
        '    let m: u64 = align_mask(mask) as u64;'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation C: an Assert behind a CALL bundled — §9.1 is stale and must be re-measured  $G"; else mut_ok "mutation C (align_mask folded into raw_up_from_mask)  rc=$RC  $G"; fi
+# RE-MEASURED 2026-09-15, and this arm did exactly what its header promised: the compiler
+# now ADMITS the call before the Assert, so the gate went red and said so. On a stage1 built
+# from main 12cf513003 this mutant bundles and verifies — Summary 84 proved / 0 failed /
+# 0 inconclusive, Coverage 34/34 complete, Gate PASS, exit 0, zero refusal notes. The PASS is
+# SOUND: `raw_up_from_mask` and its three callers are uncontracted, so the only obligation is
+# panic freedom on `(value as u64) + m`, and `align_mask`'s checked `ensures result <= 4095`
+# rules the overflow out. The row count equals the pristine run's 84, so the body is covered,
+# not skipped. §9.1 of the fragment doc carries the amendment.
+#
+# The arm is therefore re-purposed from a REFUSAL pin into a CAPABILITY pin. It asserts the
+# bundle is admitted, complete and fully proved, so if the non-entry-prefix refusal ever
+# returns, this gate goes red naming §9.1 again, rather than the capability quietly lapsing.
+if [ "$RC" -ne 0 ]; then fail "mutation C: a CALL before the Assert is REFUSED again (rc=$RC) — the 2026-09-15 capability in §9.1 regressed  $G"; else mut_ok "mutation C (align_mask folded into raw_up_from_mask) bundles  rc=$RC  $G"; fi
 grep -q 'member has a guarded or non-entry-prefix Assert' "$LOG" \
-  || fail "mutation C: the bundle did not refuse a non-entry-prefix Assert — $(grep -oE 'native TrustIr bundle for .*' "$LOG" | head -1)"
-grep -q 'refused Assert-bearing member `trust_align::raw_up_from_mask`' "$LOG" \
-  || fail "mutation C: raw_up_from_mask was not the refused member"
+  && fail "mutation C: a non-entry-prefix refusal note reappeared — $(grep -oE 'native TrustIr bundle for .*' "$LOG" | head -1)"
+grep -q 'Coverage: 34/34 eligible function bodies verified (complete)' "$LOG" \
+  || fail "mutation C: coverage is not 34/34 complete — $(grep -oE 'Coverage: [^)]*\)' "$LOG" | tail -1)"
+grep -qE '^Summary: 84 proved, 0 failed, 0 runtime-checked, 0 assumed, 0 mandated, 0 contract-panic, 0 inconclusive \(84 total\)' "$LOG" \
+  || fail "mutation C: the admitted bundle is not the pristine 84-row, fully proved shape — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 rm -f "$LOG"; restore
 
 mut_end

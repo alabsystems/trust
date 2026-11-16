@@ -21,6 +21,7 @@ The battery's integrity rests on two rules:
 
 Usage:
     python3 tests/two-language-battery/run.py [--filter PAT] [--output FILE]
+    python3 tests/two-language-battery/run.py --canonical --output /external/new.json
 """
 
 from __future__ import annotations
@@ -159,23 +160,6 @@ DIRECTIVE_RE = re.compile(r"^//@\s*(battery-[a-z-]+)\s*:\s*(.*?)\s*$", re.MULTIL
 # unfalsifiable. Markers below are therefore verdict phrases the compiler
 # actually prints, not vocabulary that could appear in a path.
 
-# "The proof was refused." Only these justify scoring a negative control as a
-# successful rejection.
-REFUTATION_MARKERS = (
-    "strict verification failed",
-    "safety verification incomplete",
-    "obligation(s) were not",
-    "[failed]",
-    "were not fully verified",
-    "were not proved",
-    "counterexample",
-    "does not typecheck",
-    "kernel rejected",
-    "type mismatch",
-    "undischarged",
-    "citation does not",
-)
-
 # "The machinery could not model this." A capability frontier — NOT evidence
 # that the tool refuted anything, and never a successful negative control.
 FRONTIER_MARKERS = (
@@ -222,7 +206,66 @@ def diagnostic_prose(stderr: str) -> str:
         keep.append(line)
     return "\n".join(keep).lower()
 
-LEAN_EMISSION_MARKERS = ("clean {", "clean{", "theorem ", ":= fun", "rfl")
+
+# Lane D asks whether tippy SUGGESTS the Lean the user should write instead, so
+# only the suggestion-bearing parts of a diagnostic can answer it:
+#
+#   * the code a `help:` carries in backticks, whether rustc renders that help
+#     inline on a label line (`   | ^^^ help: msg: `code``), on its own line,
+#     or as `= help:`;
+#   * the added/replaced lines of a multi-line suggestion (`NN + code`,
+#     `NN ~ code`).
+#
+# A `note:` or a warning message EXPLAINS; it suggests nothing. The previous
+# marker list was matched against all diagnostic prose, and on 2026-09-27 (pack
+# 5ab8dcccfcb) it scored d1 `tippy-emits-lean` on the `#[kani::proof]` NOTE
+# "... Trust's authoritative surfaces are `requires`/`ensures` signature
+# clauses and `clean { .. }` Lean islands" while every actual suggestion was a
+# Rust clause — a false green by the lane's own target. Inside suggestion code
+# only a Lean ARTIFACT counts: a Lean declaration with a signature or body, or
+# a `clean { … }` island whose body is more than a `..` placeholder. Source
+# echo lines (`NN | …`) are the fixture's own text and never count.
+_SOURCE_ECHO_RE = re.compile(r"^\s*(?:\d+|LL)\s*\|")
+_SUGGESTION_LINE_RE = re.compile(r"^\s*(?:\d+|LL)\s*[+~]\s?(?P<code>.*)$")
+_HELP_RE = re.compile(r"\bhelp:\s*(?P<rest>.*)$")
+_BACKTICK_CODE_RE = re.compile(r"`([^`]+)`")
+_LEAN_DECLARATION_RE = re.compile(
+    r"(?<![\w.])(?:theorem|lemma|def|abbrev|inductive|structure)\s+[A-Za-z_][\w.']*.*?:"
+)
+_CLEAN_ISLAND_RE = re.compile(r"(?<![\w.])clean\s*\{(?P<body>[^}]*)")
+_PLACEHOLDER_ONLY_RE = re.compile(r"^[\s.…]*$")
+
+
+def _is_lean_artifact(code: str) -> bool:
+    if _LEAN_DECLARATION_RE.search(code):
+        return True
+    return any(
+        not _PLACEHOLDER_ONLY_RE.match(m.group("body"))
+        for m in _CLEAN_ISLAND_RE.finditer(code)
+    )
+
+
+def suggested_lean_artifacts(text: str) -> list[str]:
+    """Return the suggestion code in `text` that is a Lean artifact.
+
+    Empty means tippy suggested no Lean, however often its explanatory prose
+    names Lean or `clean { .. }`.
+    """
+    found = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("-->", "::: ")) or _SOURCE_ECHO_RE.match(line):
+            continue
+        suggestion = _SUGGESTION_LINE_RE.match(line)
+        if suggestion:
+            candidates = [suggestion.group("code")]
+        else:
+            help_text = _HELP_RE.search(line)
+            if not help_text:
+                continue
+            candidates = _BACKTICK_CODE_RE.findall(help_text.group("rest"))
+        found.extend(code.strip() for code in candidates if _is_lean_artifact(code))
+    return found
 
 
 def is_toolchain_sealed(stamp: dict) -> bool:
@@ -457,20 +500,39 @@ def validate_output_policy(
     output: Path,
     canonical_output: Path,
     explicit_trustc: bool,
+    *,
+    canonical: bool = False,
 ) -> None:
-    if filter_pat and output == canonical_output:
+    canonical_run = canonical or output == canonical_output
+    if filter_pat and canonical_run:
         raise ValueError(
             "--filter requires a non-canonical --output; refusing to truncate "
             "results.json"
         )
-    if output == canonical_output and not explicit_trustc:
+    if canonical_run and not explicit_trustc:
         raise ValueError(
             "canonical results require TRUST_PROBE_TRUSTC to name the exact "
             "stage2 trustc; this also binds Tippy to the sibling driver"
         )
 
 
-def write_scorecard_atomic(output: Path, document: dict) -> None:
+def validate_external_canonical_output(output: Path, root: Path) -> None:
+    """Keep new canonical evidence out of the immutable source graph.
+
+    This changes output placement, not the fixture population or toolchain
+    requirements. The legacy default results.json remains available explicitly.
+    """
+    if output.resolve().is_relative_to(root.resolve()):
+        raise ValueError("--canonical --output must be outside the source checkout")
+    if output.exists() or output.is_symlink():
+        raise ValueError("--canonical --output requires a new file; nothing was overwritten")
+    if not output.parent.is_dir():
+        raise ValueError("--canonical --output requires an existing output directory")
+
+
+def write_scorecard_atomic(
+    output: Path, document: dict, *, create_only: bool = False
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output_mode = output.stat().st_mode & 0o777 if output.exists() else 0o644
     fd, temporary = tempfile.mkstemp(
@@ -483,7 +545,13 @@ def write_scorecard_atomic(output: Path, document: dict) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, output)
+        if create_only:
+            # Atomic no-clobber publication, including a file/symlink created
+            # after preflight. The temporary is in the same filesystem.
+            os.link(temporary, output)
+            os.unlink(temporary)
+        else:
+            os.replace(temporary, output)
     except BaseException:
         try:
             os.unlink(temporary)
@@ -503,17 +571,50 @@ def discover(filter_pat: str | None) -> list[Path]:
 # from vocabulary:
 #   Trust verification: 2 proved, 1 failed, 0 unknown, 0 timed out, ...
 OBLIGATION_SUMMARY_RE = re.compile(
-    r"trust verification:\s*(\d+)\s+proved,\s*(\d+)\s+failed,\s*(\d+)\s+unknown", re.IGNORECASE
+    r"^\s*(?:(?:=\s*)?note:\s*)?trust verification:\s*"
+    r"(\d+)\s+proved,\s*(\d+)\s+failed,\s*(\d+)\s+unknown"
+    r"(?:,\s*(\d+)\s+timed out)?", re.IGNORECASE | re.MULTILINE
 )
 
-# Kernel-level refusals carry no obligation summary — the Clean kernel rejected
-# the TERM itself, which is the strongest refutation available.
-KERNEL_REFUTATION_MARKERS = (
-    "declaration rejected",
-    "typemismatch",
-    "termrejected",
-    "failed the strict clean",
-    "certification audit failed",
+# A kernel rejection wrapper also carries resource, missing-name and internal
+# failures. Only an explicit terminal type mismatch can credit a bad proof.
+# Likewise the noun "counterexample" may describe failed replay, not a finding.
+OBLIGATION_FAILED_RE = re.compile(
+    r"^\s*(?:=\s*)?(?:error|note):\s*\[[^\]\n]+\]\s+failed\s+\([^)\n]+\)[:;]",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Since cb1/B2 (2026-09-28) a citation whose POSTCONDITION goal was built and
+# refuted leads with that goal: "... audit against this postcondition with
+# `result` bound to the imported definition of `f`:". Same verdict, same kernel
+# dump; only the head names which goal failed.
+KERNEL_TYPE_MISMATCH_RE = re.compile(
+    r"^\s*error:\s*(?:clean island declaration rejected:\s*"
+    r'|citation `[^`\n]+` failed the strict clean statement/certification audit'
+    r'(?: against this postcondition with `result` bound to the imported definition of `[^`\n]+`)?:\s*'
+    r'strict certification audit failed:\s*\[termrejected\s*\{\s*error:\s*")'
+    r"typemismatch\s*\{\s*expected:",
+    re.IGNORECASE | re.MULTILINE,
+)
+KERNEL_OPTION_MISMATCH_RE = re.compile(
+    r"^\s*error:\s*clean island declaration rejected:\s*typemismatch\s*"
+    r"\{\s*expected:[^\n]*\(option '[^'\n]+'\)", re.IGNORECASE | re.MULTILINE,
+)
+KERNEL_INCOMPLETE_MARKERS = (
+    "heartbeatexceeded",
+    "heartbeat limit exceeded",
+    "declarationbudgetexhausted",
+    "declaration budget exhausted",
+    "excessivememory",
+    "excessive memory consumption",
+    "deeprecursion",
+    "deep recursion detected",
+    "recursiondepthexceeded",
+    "type checking interrupted",
+    "crossvalidationfailure",
+    "cross-validation failure",
+    "internalinvariant",
+    "unknownident",
+    "unknownconstant",
 )
 
 # Surfaces the front end refuses to model at all.
@@ -521,16 +622,27 @@ SURFACE_FRONTIER_MARKERS = (
     "unsupported source-contract call",
     "[unknown]",
     "unsupported",
+    "lacked exact kernel/native proof authority",
+    "proof evidence unavailable",
+    "certification audit failed",
+    "failed the strict clean",
+)
+
+# Real compiler obligation rows spell the verdict AFTER the kind tag, not
+# `[unknown]`: `[hardened_panic_boundary] UNKNOWN (trust-mc): ...`.
+UNRESOLVED_VERDICT_RE = re.compile(
+    r"\[[^\]\n]+\]\s+(?:unknown|timed[_ -]out)\b", re.IGNORECASE
 )
 
 
-def obligation_counts(stderr: str) -> tuple[int, int]:
-    """Total (failed, unknown) across every verification report in the run."""
-    failed = unknown = 0
-    for _proved, f, u in OBLIGATION_SUMMARY_RE.findall(stderr):
+def obligation_counts(stderr: str) -> tuple[int, int, int]:
+    """Total (failed, unknown, timed out) across every report in the run."""
+    failed = unknown = timed_out = 0
+    for _proved, f, u, t in OBLIGATION_SUMMARY_RE.findall(stderr):
         failed += int(f)
         unknown += int(u)
-    return failed, unknown
+        timed_out += int(t or 0)
+    return failed, unknown, timed_out
 
 
 def classify_failure(stderr: str) -> str:
@@ -547,19 +659,26 @@ def classify_failure(stderr: str) -> str:
     program, nothing else it printed is evidence about verification.
     """
     prose = diagnostic_prose(stderr)
-    if any(m in prose for m in MALFORMED_MARKERS):
+    if "internal compiler error" in prose:
+        return "compiler-failure"
+    if any(m in prose for m in MALFORMED_MARKERS) or KERNEL_OPTION_MISMATCH_RE.search(prose):
         return "malformed"
+    if any(m in prose for m in KERNEL_INCOMPLETE_MARKERS):
+        return "frontier"
 
-    failed, unknown = obligation_counts(prose)
-    if failed > 0:
+    failed, unknown, timed_out = obligation_counts(prose)
+    if failed > 0 or KERNEL_TYPE_MISMATCH_RE.search(prose) or OBLIGATION_FAILED_RE.search(prose):
         # At least one obligation was REFUTED, whatever else is unsupported.
         return "refutation"
-    if any(m in prose for m in KERNEL_REFUTATION_MARKERS):
-        return "refutation"
-    if unknown > 0 or any(m in prose for m in SURFACE_FRONTIER_MARKERS):
+    if (
+        unknown > 0
+        or timed_out > 0
+        or UNRESOLVED_VERDICT_RE.search(prose)
+        or any(m in prose for m in SURFACE_FRONTIER_MARKERS)
+    ):
         return "frontier"
-    if any(m in prose for m in REFUTATION_MARKERS):
-        return "refutation"
+    # An aggregate strict-build refusal, an undischarged goal, or missing
+    # evidence alone does not say the proposed program/proof was refuted.
     return "unclassified"
 
 
@@ -625,35 +744,34 @@ def run_one(path: Path, timeout: int, source_path: Path | None = None) -> dict:
                 cmd, capture_output=True, text=True, timeout=timeout, cwd=REPO_ROOT,
             )
             rec["exit_code"] = proc.returncode
-            # Keep the FULL streams for classification and truncate only for
-            # storage. Classifying the stored excerpt is a silent verdict
-            # corrupter: Trust's reports are long, and the per-function
-            # "N proved, M failed" summary that decides refutation-vs-frontier
-            # routinely falls outside an 8 KB tail.
+            # Keep complete diagnostic text for both classification and later
+            # inspection. An 8 KB tail loses the first failing obligation in
+            # ordinary multi-function reports and forces another compile just
+            # to recover the cause. Only stored path spellings are normalized;
+            # the classifier still consumes the original complete streams.
             full_stdout, full_stderr = proc.stdout, proc.stderr
-            rec["stdout"] = portable(full_stdout[-8000:])
-            rec["stderr"] = portable(full_stderr[-8000:])
-            rec["stderr_truncated"] = len(full_stderr) > 8000
+            rec["stdout"] = portable(full_stdout)
+            rec["stderr"] = portable(full_stderr)
+            rec["stdout_truncated"] = False
+            rec["stderr_truncated"] = False
+            rec["streams_complete"] = True
             rec["_full_stderr"] = full_stderr
             rec["_full_stdout"] = full_stdout
 
             if ir_dir is not None:
-                # Read every published artifact as text; the markers are
-                # distinctive identifiers, so a substring hit is evidence the
-                # language reached the module.
+                # The publisher spells the requested crate's canonical text
+                # exactly this way. Binary bytes, sidecars, temporary files and
+                # other crates cannot supply textual marker or call evidence.
+                module_name = f"{crate_name}.trust-ir.txt"
                 blobs, names = [], []
                 for f in sorted(ir_dir.rglob("*")):
                     if not f.is_file():
                         continue
                     names.append(str(f.relative_to(ir_dir)))
-                    # Search ONLY the TrustIr module artifacts. The coverage
-                    # sidecar and the publication lock live in the same
-                    # directory and carry unrelated identifiers, which would
-                    # let a marker "appear in the IR" without being in the IR.
-                    if ".trust-ir." not in f.name:
+                    if f != ir_dir / module_name:
                         continue
                     blobs.append(f.read_text(encoding="utf-8", errors="replace"))
-                rec["ir_module_artifacts"] = [n for n in names if ".trust-ir." in n]
+                rec["ir_module_artifacts"] = [n for n in names if n == module_name]
                 rec["ir_artifact_count"] = len(rec["ir_module_artifacts"])
                 rec["ir_artifacts"] = names[:50]
                 rec["_ir_blob"] = "\n".join(blobs)
@@ -661,24 +779,45 @@ def run_one(path: Path, timeout: int, source_path: Path | None = None) -> dict:
                 # STRUCTURED — never the marker blob (the sidecar is excluded
                 # from the blob above, deliberately, and stays excluded).
                 if expect == "ir-links-clean-origin":
-                    for f in sorted(ir_dir.rglob("*.coverage.json")):
-                        rec["_coverage_json"] = f.read_text(
+                    coverage_path = ir_dir / f"{crate_name}.coverage.json"
+                    if coverage_path.is_file():
+                        rec["_coverage_json"] = coverage_path.read_text(
                             encoding="utf-8", errors="replace"
                         )
-                        break
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            # TimeoutExpired may carry bytes even when text=True was requested.
+            # Preserve the output already observed, but never score an earlier
+            # proof message as a completed compiler result.
+            def partial_text(value: str | bytes | None) -> str:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="replace")
+                return value or ""
+
             rec["exit_code"] = None
-            rec["stdout"] = ""
-            rec["stderr"] = f"TIMEOUT after {timeout}s"
+            rec["stdout"] = portable(partial_text(exc.stdout))
+            rec["stderr"] = portable(partial_text(exc.stderr))
+            rec["stdout_truncated"] = False
+            rec["stderr_truncated"] = False
+            rec["streams_complete"] = False
+            rec["error"] = f"TIMEOUT after {timeout}s"
             rec["verdict"] = "timeout"
             rec["battery_ok"] = False
             return rec
 
-    # Classify on the complete streams; the truncated copies stay in the
-    # scorecard for humans.
+    # Classify on the original complete streams; path-normalized complete
+    # copies stay in the scorecard for later diagnosis.
     stderr = rec.pop("_full_stderr", rec["stderr"])
     stdout = rec.pop("_full_stdout", rec["stdout"])
     compiled = rec["exit_code"] == 0
+
+    # rustc's ordinary diagnostic refusal is exit 1. A panic, signal, or
+    # launcher failure cannot earn negative-control credit from an earlier
+    # proof diagnostic printed before the driver failed.
+    if rec["exit_code"] not in (0, 1):
+        rec["verdict"] = "driver-failed"
+        rec["failure_kind"] = "compiler-failure"
+        rec["battery_ok"] = False
+        return rec
 
     if expect == "pass":
         rec["verdict"] = "pass" if compiled else "unexpected-reject"
@@ -822,7 +961,10 @@ def run_one(path: Path, timeout: int, source_path: Path | None = None) -> dict:
 
     elif expect == "tippy-emits-lean":
         tippy_prose = diagnostic_prose(stdout + "\n" + stderr)
-        emits_lean = any(m in tippy_prose for m in LEAN_EMISSION_MARKERS)
+        # Read the RAW streams, not `tippy_prose`: that view drops every
+        # `|`-prefixed line, which is where rustc renders an inline `help:`.
+        lean_suggestions = suggested_lean_artifacts(stdout + "\n" + stderr)
+        emits_lean = bool(lean_suggestions)
         fired = (
             "legacy" in tippy_prose
             or "spec_sugar" in tippy_prose
@@ -830,6 +972,9 @@ def run_one(path: Path, timeout: int, source_path: Path | None = None) -> dict:
         )
         rec["lint_fired"] = fired
         rec["emits_lean"] = emits_lean
+        rec["lean_suggestions"] = [
+            s.replace(str(REPO_ROOT), "<repo>") for s in lean_suggestions[:10]
+        ]
         if not compiled:
             rec["verdict"] = "tippy-compile-failed"
             rec["failure_kind"] = classify_failure(stderr)
@@ -855,6 +1000,14 @@ def main() -> int:
     ap.add_argument("--filter", default=None)
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument(
+        "--canonical",
+        action="store_true",
+        help=(
+            "require the full reviewed fixture population and this checkout's sealed "
+            "stage2 tools, writing to a new external --output without dirtying source"
+        ),
+    )
+    ap.add_argument(
         "--output",
         default=None,
         help="Scorecard JSON path (default: canonical results.json for full runs)",
@@ -870,18 +1023,26 @@ def main() -> int:
     args = ap.parse_args()
 
     canonical_output = (BATTERY_DIR / "results.json").resolve()
-    output = Path(args.output).resolve() if args.output else canonical_output
+    requested_output = Path(args.output) if args.output else canonical_output
+    output = requested_output.resolve()
+    if args.canonical and not args.output:
+        ap.error("--canonical requires an explicit new external --output")
+    canonical_run = args.canonical or output == canonical_output
+    if canonical_run and args.allow_unsealed_toolchain:
+        ap.error("canonical runs cannot use --allow-unsealed-toolchain")
     try:
+        if args.canonical:
+            validate_external_canonical_output(requested_output, REPO_ROOT)
         validate_output_policy(
             args.filter,
             output,
             canonical_output,
             bool(os.environ.get("TRUST_PROBE_TRUSTC")),
+            canonical=args.canonical,
         )
     except ValueError as exc:
         ap.error(str(exc))
 
-    canonical_run = output == canonical_output
     files = discover(args.filter)
     if not files:
         print("ERROR: battery selection contains no Rust fixtures", file=sys.stderr)
@@ -1050,11 +1211,18 @@ def main() -> int:
 
     doc = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "measurement_scope": "canonical-reviewed-battery" if canonical_run else "exploratory-selection",
         "toolchain": stamp,
         "summary": summary,
         "results": results,
     }
-    write_scorecard_atomic(output, doc)
+    try:
+        if args.canonical:
+            validate_external_canonical_output(output, REPO_ROOT)
+        write_scorecard_atomic(output, doc, create_only=args.canonical)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: scorecard publication refused: {exc}", file=sys.stderr)
+        return 2
 
     print()
     print(f"battery: {summary['ok']}/{summary['total']} as specified")

@@ -17,7 +17,7 @@
 // prove.rs/mirsem.rs/trustir_adt.rs from here — it only measures.
 //
 // Run with:
-//   RUSTC_BOOTSTRAP=1 cargo test -p trust-clean --manifest-path crates/Cargo.toml \
+//   targo --unverified test -p trust-clean --manifest-path crates/Cargo.toml \
 //       --test adt_return_corpus -- --nocapture
 
 use std::path::Path;

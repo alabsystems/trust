@@ -14,6 +14,44 @@ use super::types::CANDIDATE_COMMAND_VERSION;
 use crate::bounded_process;
 use crate::input_limits::{MAX_RELEASE_METADATA_BYTES, read_bounded_utf8_file};
 
+/// How long a release tool identity probe (a bound tool's `--version`, `-V` or
+/// `-Vv`) waits for the tool's answer before reporting the tool unbound. The
+/// self-verify harness's stage2 identity probes (Targo, `trustc` and `trustdoc`
+/// `-Vv`, `trustd --version`) bind the same freshly built files and wait the same
+/// guard (`self_verify_cli` `IDENTITY_PROBE_TIMEOUT`).
+///
+/// A hang detector, not a latency budget: a tool that is not hung answers its
+/// version flag, so this bound only has to catch one that never will. It used
+/// to be 10 s, which on macOS measured the host instead of the tool. The tools
+/// these probes bind are files a build or an install has just written (stage2,
+/// a fresh sysroot, a copied candidate), and a new executable's first exec,
+/// scripts included, waits for syspolicyd's scan of it in one machine-wide
+/// queue before its first instruction (docs/KNOWN_HAZARDS.md
+/// EXEC-ASSESS-STALL-1); a repeat exec does not. Measured 2026-10-22 on an
+/// 18-CPU macOS 26.6.2 host, fresh copies of bound tools: first exec 0.1-1.2 s
+/// idle against 2-10 ms for a repeat; 29 s for a 0.6 MB `trustd` behind twelve
+/// concurrent first execs of other fresh binaries at load 12-19; 55-57 s for
+/// `trustd`, a one-`echo` script and a 230 MB `targo-trust` behind the same
+/// queue at load 36. Behind that queue the 10 s bound reported 4-10 of the 12
+/// tools of `version_cli`'s full-surface fixture `version-probe-failed`.
+/// bounded_process.rs records a 273-275 s barrier for one-`echo` scripts. Ten
+/// minutes sits over twice that barrier and ten times this host's measured
+/// queue: a hung tool now takes that long to be reported, and a slow scan no
+/// longer rejects a correct tool. The identity checks around the probe (hash
+/// before and after, the same-file snapshot, the output bound) do not depend
+/// on how long the answer took.
+///
+/// Two consequences of the size. In a `cfg(test)` build `bounded_process::output`
+/// stretches this 180-fold, to 30 h, so no unit test may drive a hung tool through
+/// these probe sites; a test of the deadline itself passes a tiny bound to
+/// `bounded_process::output_with_exact_deadline`. And `bound_tools` probes its
+/// 13 tools one after another, so a host where every tool hangs reports after
+/// 13 times this bound; a caller with a shorter outer bound (trustc_native's 2 h
+/// capture of `targo trust version`) fails closed on its own timeout first. No
+/// progress line is printed meanwhile: `targo trust version` keeps its stderr
+/// empty (tests/version_cli.rs asserts it).
+pub(crate) const TOOL_IDENTITY_PROBE_HANG_GUARD: Duration = Duration::from_secs(10 * 60);
+
 pub(super) fn build_version_identity(
     explicit_root: Option<&Path>,
 ) -> io::Result<TrustVersionIdentity> {
@@ -25,12 +63,16 @@ pub(super) fn build_version_identity(
     let source = parse_version_source(&source_text)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
-    // Trust states its two version lines in two files, and each one has exactly
-    // one authority (`crates/trust-version` proves they agree with
-    // `release/trust-version.toml` in `the_three_checked_in_version_files_agree`):
+    // Trust states two version lines in two files, deliberately:
     //
     //   src/rust-compat-version  the Rust release the `-V` protocol reports
-    //   src/version              Trust's own major.minor.dev
+    //   src/version              Trust's own MAJOR.MINOR.0 — a mirror of the ONE
+    //                            authority, the root Cargo.toml
+    //                            `[workspace.package] version`, written only by
+    //                            `scripts/trust_version_sync.py --write` (bootstrap
+    //                            refuses to build on drift; `crates/trust-version`'s
+    //                            `every_version_mirror_agrees_with_the_authority`
+    //                            test fails on it)
     //
     // The bound-tool surface below measures every tool by the line it PRINTS for
     // `--version`, which bootstrap stamps from the compat file; reading Trust's
@@ -213,8 +255,23 @@ fn bound_tool(
     };
     let version_output = executable.then(|| command_output_text(&path, version_args)).flatten();
     let sha256 = bound_file_sha256(&path);
-    if sha256.as_deref() != Some(sha256_before.as_str()) {
+    let after = fs::symlink_metadata(&path).ok();
+    if sha256.as_deref() != Some(sha256_before.as_str())
+        || after.as_ref().is_none_or(|after| {
+            after.file_type().is_symlink()
+                || !after.file_type().is_file()
+                || !same_file_snapshot(&metadata, after)
+        })
+    {
         return rejected_bound_tool(name, path, rust_compat_version, "changed-during-identity");
+    }
+    let version = version_output
+        .as_deref()
+        .and_then(|text| text.lines().next())
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string);
+    if executable && version.is_none() {
+        return rejected_bound_tool(name, path, rust_compat_version, "version-probe-failed");
     }
     if name == "trustd"
         && !version_output.as_deref().is_some_and(|output| {
@@ -223,8 +280,6 @@ fn bound_tool(
     {
         return rejected_bound_tool(name, path, rust_compat_version, "invalid-trustd-identity");
     }
-    let version =
-        version_output.as_deref().and_then(|text| text.lines().next().map(str::to_string));
     let commit_hash = version_output.as_deref().and_then(parse_commit_hash);
     BoundToolIdentity {
         name: name.to_string(),
@@ -274,7 +329,7 @@ fn command_output_text(path: &Path, args: &[&str]) -> Option<String> {
         &mut command,
         &format!("release tool identity probe for {}", path.display()),
         64 * 1024,
-        Duration::from_secs(10),
+        TOOL_IDENTITY_PROBE_HANG_GUARD,
     )
     .ok()?;
     if !output.status.success() {
@@ -502,14 +557,33 @@ pub(super) fn generated_at_unix_seconds() -> u64 {
         .unwrap_or_default()
 }
 
-pub(super) fn repo_dirty(root: &Path) -> bool {
-    git_status_porcelain_lines(root).map(|lines| !lines.is_empty()).unwrap_or(true)
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RepositoryStatus {
+    Clean,
+    Dirty(Vec<String>),
+    Unavailable(String),
 }
 
-pub(super) fn repo_dirty_metadata(root: &Path) -> Value {
-    let Some(lines) = git_status_porcelain_lines(root) else {
-        return json!({"available": false, "dirty": null, "porcelain_v1": []});
-    };
+impl RepositoryStatus {
+    pub(super) fn is_dirty_or_unavailable(&self) -> bool {
+        !matches!(self, Self::Clean)
+    }
+
+    pub(super) fn metadata(&self) -> Value {
+        match self {
+            Self::Clean => status_metadata(Vec::new()),
+            Self::Dirty(lines) => status_metadata(lines.clone()),
+            Self::Unavailable(error) => json!({
+                "available": false,
+                "dirty": null,
+                "porcelain_v1": [],
+                "error": error,
+            }),
+        }
+    }
+}
+
+fn status_metadata(lines: Vec<String>) -> Value {
     json!({
         "available": true,
         "dirty": !lines.is_empty(),
@@ -519,14 +593,58 @@ pub(super) fn repo_dirty_metadata(root: &Path) -> Value {
     })
 }
 
-fn git_status_porcelain_lines(root: &Path) -> Option<Vec<String>> {
-    crate::controlled_git::exact_status_porcelain_v1(
-        root,
-        "release repository status probe",
-        1024 * 1024,
-        Duration::from_secs(30),
+pub(super) fn repository_status(root: &Path, candidate_commit: Option<&str>) -> RepositoryStatus {
+    let context = "release repository status probe";
+    capture_repository_status(
+        candidate_commit,
+        || crate::controlled_git::canonical_head(root, context, 64 * 1024, Duration::from_secs(10)),
+        || {
+            crate::controlled_git::exact_status_porcelain_v1(
+                root,
+                context,
+                1024 * 1024,
+                Duration::from_secs(30),
+            )
+        },
     )
-    .ok()
+}
+
+fn capture_repository_status(
+    candidate_commit: Option<&str>,
+    mut head: impl FnMut() -> Result<String, String>,
+    mut status: impl FnMut() -> Result<Vec<String>, String>,
+) -> RepositoryStatus {
+    let Some(candidate_commit) = candidate_commit else {
+        return RepositoryStatus::Unavailable("candidate HEAD is unavailable".to_string());
+    };
+    let check_head = |head: &mut dyn FnMut() -> Result<String, String>| -> Result<(), String> {
+        let actual = head()?;
+        if actual != candidate_commit {
+            return Err(format!(
+                "repository HEAD changed from candidate {candidate_commit} to {actual}"
+            ));
+        }
+        Ok(())
+    };
+
+    // A single status invocation is not an atomic worktree snapshot. A second
+    // bounded scan catches a change during status collection.
+    let result = (|| {
+        check_head(&mut head)?;
+        let first = status()?;
+        check_head(&mut head)?;
+        let second = status()?;
+        check_head(&mut head)?;
+        if first != second {
+            return Err("repository status changed between release probes".to_string());
+        }
+        Ok(first)
+    })();
+    match result {
+        Ok(lines) if lines.is_empty() => RepositoryStatus::Clean,
+        Ok(lines) => RepositoryStatus::Dirty(lines),
+        Err(error) => RepositoryStatus::Unavailable(error),
+    }
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
@@ -597,4 +715,164 @@ pub(super) fn repo_relative_path(root: &Path, path_text: &str) -> Option<PathBuf
 
 pub(super) fn option_value<'a>(arg: &'a str, option: &str) -> Option<&'a str> {
     arg.strip_prefix(option)?.strip_prefix('=')
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    use super::{
+        RepositoryStatus, bound_file_sha256, bound_tool, capture_repository_status,
+        repository_status,
+    };
+
+    const TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn write_executable(path: &Path, script: &str) {
+        fs::write(path, script).expect("write tool fixture");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .expect("make tool fixture executable");
+    }
+
+    #[test]
+    fn stable_versioned_tool_is_bound() {
+        let dir = tempfile::tempdir().expect("temporary tool directory");
+        let path = dir.path().join("trustfmt");
+        write_executable(&path, "#!/bin/sh\nprintf '%s\\n' 'trustfmt 1.96.0-dev'\n");
+
+        let identity = bound_tool("trustfmt", Some(path.clone()), &["--version"], None);
+
+        assert_eq!(identity.resolution.as_deref(), Some("bound-executable"));
+        assert_eq!(identity.version.as_deref(), Some("trustfmt 1.96.0-dev"));
+        assert_eq!(identity.sha256, bound_file_sha256(&path));
+    }
+
+    #[test]
+    fn failed_or_empty_version_probe_is_not_bound() {
+        let dir = tempfile::tempdir().expect("temporary tool directory");
+        for (name, script) in [
+            ("failed", "#!/bin/sh\nexit 7\n"),
+            ("empty", "#!/bin/sh\nexit 0\n"),
+            ("blank", "#!/bin/sh\nprintf ' \\n'\n"),
+        ] {
+            let path = dir.path().join(name);
+            write_executable(&path, script);
+
+            let identity = bound_tool("trustfmt", Some(path), &["--version"], None);
+
+            assert_eq!(identity.resolution.as_deref(), Some("version-probe-failed"));
+            assert_eq!(identity.executable, Some(false));
+            assert!(identity.sha256.is_none());
+            assert!(identity.version.is_none());
+        }
+    }
+
+    #[test]
+    fn same_byte_replacement_during_probe_is_not_bound() {
+        let dir = tempfile::tempdir().expect("temporary tool directory");
+        let path = dir.path().join("trustfmt");
+        write_executable(
+            &path,
+            "#!/bin/sh\n/bin/cp \"$0\" \"$0.next\" || exit 1\n/bin/mv \"$0.next\" \"$0\" || exit 1\nprintf '%s\\n' 'trustfmt 1.96.0-dev'\n",
+        );
+        let before = bound_file_sha256(&path);
+
+        let identity = bound_tool("trustfmt", Some(path.clone()), &["--version"], None);
+
+        assert!(before.is_some());
+        assert_eq!(bound_file_sha256(&path), before);
+        assert_eq!(identity.resolution.as_deref(), Some("changed-during-identity"));
+        assert_eq!(identity.executable, Some(false));
+        assert!(identity.sha256.is_none());
+    }
+
+    #[test]
+    fn executable_mode_change_during_probe_is_not_bound() {
+        let dir = tempfile::tempdir().expect("temporary tool directory");
+        let path = dir.path().join("trustfmt");
+        write_executable(
+            &path,
+            "#!/bin/sh\n/bin/chmod a-x \"$0\" || exit 1\nprintf '%s\\n' 'trustfmt 1.96.0-dev'\n",
+        );
+        let before = bound_file_sha256(&path);
+
+        let identity = bound_tool("trustfmt", Some(path.clone()), &["--version"], None);
+
+        assert_eq!(bound_file_sha256(&path), before);
+        assert_eq!(identity.resolution.as_deref(), Some("changed-during-identity"));
+        assert_eq!(identity.executable, Some(false));
+    }
+
+    #[test]
+    fn stable_repository_status_has_one_consistent_dirty_snapshot() {
+        for lines in [Vec::new(), vec!["?? new.txt".to_string()]] {
+            let mut heads = 0;
+            let mut scans = 0;
+            let snapshot = capture_repository_status(
+                Some(TEST_COMMIT),
+                || {
+                    heads += 1;
+                    Ok(TEST_COMMIT.to_string())
+                },
+                || {
+                    scans += 1;
+                    Ok(lines.clone())
+                },
+            );
+            assert_eq!(heads, 3);
+            assert_eq!(scans, 2);
+            assert_eq!(snapshot.is_dirty_or_unavailable(), !lines.is_empty());
+            let metadata = snapshot.metadata();
+            assert_eq!(metadata["available"], true);
+            assert_eq!(metadata["dirty"], !lines.is_empty());
+            assert_eq!(metadata["porcelain_v1"], serde_json::json!(lines));
+        }
+    }
+
+    #[test]
+    fn changing_status_in_either_direction_cannot_report_clean() {
+        for (first, second) in [
+            (Vec::new(), vec!["?? new.txt".to_string()]),
+            (vec!["?? new.txt".to_string()], Vec::new()),
+            (vec!["?? first.txt".to_string()], vec!["?? second.txt".to_string()]),
+        ] {
+            let mut scans = vec![first, second].into_iter();
+            let snapshot = capture_repository_status(
+                Some(TEST_COMMIT),
+                || Ok(TEST_COMMIT.to_string()),
+                || Ok(scans.next().expect("bounded second scan")),
+            );
+            assert!(matches!(snapshot, RepositoryStatus::Unavailable(_)));
+            assert!(snapshot.is_dirty_or_unavailable());
+            assert_eq!(snapshot.metadata()["available"], false);
+            assert_eq!(snapshot.metadata()["dirty"], serde_json::Value::Null);
+        }
+    }
+
+    #[test]
+    fn changed_or_unavailable_head_and_status_fail_closed() {
+        let mut heads = [TEST_COMMIT, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"].into_iter();
+        let changed_head = capture_repository_status(
+            Some(TEST_COMMIT),
+            || Ok(heads.next().expect("second HEAD probe").to_string()),
+            || Ok(Vec::new()),
+        );
+        assert!(matches!(changed_head, RepositoryStatus::Unavailable(_)));
+
+        let failed_status = capture_repository_status(
+            Some(TEST_COMMIT),
+            || Ok(TEST_COMMIT.to_string()),
+            || Err("Git authority unavailable".to_string()),
+        );
+        assert!(matches!(failed_status, RepositoryStatus::Unavailable(_)));
+        assert_eq!(failed_status.metadata()["available"], false);
+        assert!(failed_status.is_dirty_or_unavailable());
+
+        let root = tempfile::tempdir().expect("non-Git directory");
+        let no_git = repository_status(root.path(), Some(TEST_COMMIT));
+        assert!(matches!(no_git, RepositoryStatus::Unavailable(_)));
+        assert!(no_git.is_dirty_or_unavailable());
+    }
 }

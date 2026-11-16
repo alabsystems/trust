@@ -1,0 +1,175 @@
+note: Clean island kernel-checked: 8 declaration(s) registered (gate_keeps_sat_isl, lemma_admitted_isl, xor_parity_isl, any3_isl, odd_small_isl, printable_isl, nand_isl, before_unless_isl)
+  --> $DIR/e6_bool_tree_defeq.rs:27:5
+   |
+LL | /     def gate_keeps_sat_isl (was_sat confirmed enforce : Bool) : Bool := was_sat && (confirmed || !enforce)
+LL | |     def lemma_admitted_isl (self_ind init_valid entry_ind : Bool) : Bool := self_ind && init_valid && entry_ind
+LL | |     def xor_parity_isl (acc contribution : Bool) : Bool := xor acc contribution
+LL | |     def any3_isl (a b c : UInt64) : Bool := decide (a < b) || decide (b < c) || decide (a = c)
+...  |
+LL | |     def nand_isl (a b : Bool) : Bool := !(a && b)
+LL | |     def before_unless_isl (a b : UInt8) (c : Bool) : Bool := decide (a < b) && !c
+   | |_________________________________________________________________________________^
+
+note: island definition `gate_keeps_sat_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_tree_defeq::gate_keeps_sat`
+  --> $DIR/e6_bool_tree_defeq.rs:38:13
+   |
+LL |     ensures result == gate_keeps_sat_isl(was_sat, confirmed, enforce)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+
+=== Trust Verification Report (e6_bool_tree_defeq) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_tree_defeq.rs:37:1
+   |
+LL | / pub fn gate_keeps_sat(was_sat: bool, confirmed: bool, enforce: bool) -> bool
+LL | |     ensures result == gate_keeps_sat_isl(was_sat, confirmed, enforce)
+LL | | {
+LL | |     was_sat && (confirmed || !enforce)
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `lemma_admitted_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_tree_defeq::lemma_admitted_inductive`
+  --> $DIR/e6_bool_tree_defeq.rs:44:13
+   |
+LL |     ensures result == lemma_admitted_isl(self_ind, init_valid, entry_ind)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_tree_defeq.rs:43:1
+   |
+LL | / pub fn lemma_admitted_inductive(self_ind: bool, init_valid: bool, entry_ind: bool) -> bool
+LL | |     ensures result == lemma_admitted_isl(self_ind, init_valid, entry_ind)
+LL | | {
+LL | |     self_ind & init_valid & entry_ind
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `xor_parity_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_tree_defeq::xor_accumulate_parity`
+  --> $DIR/e6_bool_tree_defeq.rs:50:13
+   |
+LL |     ensures result == xor_parity_isl(acc, contribution)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_tree_defeq.rs:49:1
+   |
+LL | / pub fn xor_accumulate_parity(acc: bool, contribution: bool) -> bool
+LL | |     ensures result == xor_parity_isl(acc, contribution)
+LL | | {
+LL | |     acc ^ contribution
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `any3_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_tree_defeq::any_of_three`
+  --> $DIR/e6_bool_tree_defeq.rs:56:13
+   |
+LL |     ensures result == any3_isl(a, b, c)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_tree_defeq.rs:55:1
+   |
+LL | / pub fn any_of_three(a: u64, b: u64, c: u64) -> bool
+LL | |     ensures result == any3_isl(a, b, c)
+LL | | {
+LL | |     a < b || b < c || a == c
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `odd_small_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_tree_defeq::odd_small`
+  --> $DIR/e6_bool_tree_defeq.rs:62:13
+   |
+LL |     ensures result == odd_small_isl(x)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_tree_defeq.rs:61:1
+   |
+LL | / pub fn odd_small(x: u8) -> bool
+LL | |     ensures result == odd_small_isl(x)
+LL | | {
+LL | |     x == 1 || x == 3 || x == 5 || x == 7 || x == 9 || x == 11
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `printable_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_tree_defeq::is_printable_fallback`
+  --> $DIR/e6_bool_tree_defeq.rs:68:13
+   |
+LL |     ensures result == printable_isl(x)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_tree_defeq.rs:67:1
+   |
+LL | / pub fn is_printable_fallback(x: u8) -> bool
+LL | |     ensures result == printable_isl(x)
+LL | | {
+LL | |     x != 0x7f && x >= 0x20
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `nand_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_tree_defeq::nand`
+  --> $DIR/e6_bool_tree_defeq.rs:74:13
+   |
+LL |     ensures result == nand_isl(a, b)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_tree_defeq.rs:73:1
+   |
+LL | / pub fn nand(a: bool, b: bool) -> bool
+LL | |     ensures result == nand_isl(a, b)
+LL | | {
+LL | |     !(a && b)
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `before_unless_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_tree_defeq::before_unless`
+  --> $DIR/e6_bool_tree_defeq.rs:80:13
+   |
+LL |     ensures result == before_unless_isl(a, b, c)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_tree_defeq.rs:79:1
+   |
+LL | / pub fn before_unless(a: u8, b: u8, c: bool) -> bool
+LL | |     ensures result == before_unless_isl(a, b, c)
+LL | | {
+LL | |     a < b && !c
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+

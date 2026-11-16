@@ -101,6 +101,7 @@ fn midpoint_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -152,6 +153,7 @@ fn division_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -220,6 +222,7 @@ fn guarded_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -251,6 +254,7 @@ fn identity_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -419,51 +423,6 @@ fn test_pipeline_vc_level_filtering() {
 }
 
 // ===========================================================================
-// Test 5: Parallel verification produces same results as sequential
-// ===========================================================================
-
-#[test]
-fn test_pipeline_parallel_verification_consistency() {
-    let functions = vec![midpoint_function(), division_function(), guarded_function()];
-
-    let mut all_vcs = Vec::new();
-    for func in &functions {
-        all_vcs.extend(trust_vcgen::generate_vcs(func));
-    }
-
-    let router = mock_router();
-
-    // Sequential
-    let sequential_results = router.verify_all(&all_vcs);
-
-    // Parallel (4 threads)
-    let parallel_results = router.verify_all_parallel(&all_vcs, 4);
-
-    assert_eq!(sequential_results.len(), parallel_results.len());
-
-    // Same VCs produce same outcomes (may differ in timing)
-    for (seq, par) in sequential_results.iter().zip(parallel_results.iter()) {
-        assert_eq!(seq.0.function, par.0.function, "VC function names must match");
-        assert_eq!(seq.0.kind.description(), par.0.kind.description(), "VC kinds must match");
-
-        // Both should have the same proof status category
-        let seq_proved = seq.1.is_proved();
-        let par_proved = par.1.is_proved();
-        let seq_failed = seq.1.is_failed();
-        let par_failed = par.1.is_failed();
-        assert_eq!(seq_proved, par_proved, "proved status must match");
-        assert_eq!(seq_failed, par_failed, "failed status must match");
-    }
-
-    // Both produce valid reports
-    let seq_report = trust_report::build_json_report("seq", &sequential_results);
-    let par_report = trust_report::build_json_report("par", &parallel_results);
-
-    assert_eq!(seq_report.summary.total_obligations, par_report.summary.total_obligations);
-    assert_eq!(seq_report.summary.total_proved, par_report.summary.total_proved);
-}
-
-// ===========================================================================
 // Test 6: Raw proved statuses fail closed at the publication boundary
 // ===========================================================================
 
@@ -603,7 +562,7 @@ fn test_pipeline_mixed_results_verdict() {
         .iter()
         .find(|o| matches!(o.outcome, ObligationOutcome::Failed { .. }))
         .unwrap();
-    if let ObligationOutcome::Failed { counterexample: Some(cex) } = &failed_ob.outcome {
+    if let ObligationOutcome::Failed { counterexample: Some(cex), .. } = &failed_ob.outcome {
         assert_eq!(cex.variables.len(), 2);
         assert_eq!(cex.variables[0].name, "a");
     } else {
@@ -939,6 +898,7 @@ fn test_pipeline_large_batch_100_functions() {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         all_vcs.extend(trust_vcgen::generate_vcs(&func));
     }
@@ -946,7 +906,7 @@ fn test_pipeline_large_batch_100_functions() {
     assert_eq!(all_vcs.len(), 100, "each function should produce 1 div-by-zero VC");
 
     let router = mock_router();
-    let results = router.verify_all_parallel(&all_vcs, 4);
+    let results = router.verify_all(&all_vcs);
     assert_eq!(results.len(), 100);
 
     let report = trust_report::build_json_report("large_batch", &results);
@@ -1508,6 +1468,7 @@ fn test_pipeline_shift_overflow_function() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -1566,6 +1527,7 @@ fn test_pipeline_negation_overflow_function() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = trust_vcgen::generate_vcs(&func);

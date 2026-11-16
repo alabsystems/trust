@@ -36,9 +36,11 @@ use trust_types::clean_origin_precondition::{CleanOriginPrecondition, Preconditi
 use trust_types::*;
 use trust_vcgen::{
     FunctionSummary, SummaryDatabase, clean_origin_declared_precondition,
-    clean_origin_declared_preconditions, clean_origin_summary,
-    generate_callsite_precondition_vcs,
+    clean_origin_declared_preconditions, clean_origin_summary, generate_callsite_precondition_vcs,
 };
+
+#[path = "support/test_router.rs"]
+mod test_router;
 
 const CALLEE: &str = "clean_origin::safe_rem";
 
@@ -102,6 +104,7 @@ fn caller_passing(divisor: Operand) -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock {
@@ -122,6 +125,7 @@ fn caller_passing(divisor: Operand) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -138,7 +142,7 @@ fn precondition_rows(vcs: &[VerificationCondition]) -> Vec<&VerificationConditio
 /// Put the rows to the REAL solver. `true` = at least one obligation is
 /// refuted, i.e. the call site FAILS.
 fn any_refuted(vcs: &[VerificationCondition]) -> bool {
-    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+    let router = test_router::deterministic_test_router();
     router
         .verify_all(vcs)
         .into_iter()
@@ -201,10 +205,7 @@ fn a_symbolic_divisor_the_caller_cannot_bound_is_refuted() {
         &db_of(clean_origin_summary_of_record()),
     );
     assert_eq!(precondition_rows(&vcs).len(), 1);
-    assert!(
-        any_refuted(&vcs),
-        "an unbounded symbolic divisor must not discharge `b ≠ 0`"
-    );
+    assert!(any_refuted(&vcs), "an unbounded symbolic divisor must not discharge `b ≠ 0`");
 }
 
 #[test]
@@ -262,7 +263,9 @@ fn one_unrenderable_obligation_sinks_the_whole_set() {
     );
 
     assert!(clean_origin_declared_preconditions(&[good.clone()], &formals()).is_some());
-    assert!(clean_origin_declared_preconditions(&[good.clone(), bad.clone()], &formals()).is_none());
+    assert!(
+        clean_origin_declared_preconditions(&[good.clone(), bad.clone()], &formals()).is_none()
+    );
     assert!(clean_origin_declared_preconditions(&[bad, good], &formals()).is_none());
 }
 
@@ -339,10 +342,7 @@ fn the_l0_subset_withholds_the_clean_origin_summary_and_records_it() {
     // mints, so the two cannot drift.
     let subset = db_of(clean_origin_summary_of_record()).definitional_precondition_free_subset();
 
-    assert!(
-        subset.get(CALLEE).is_none(),
-        "the value fact must not ride L0 without its guard"
-    );
+    assert!(subset.get(CALLEE).is_none(), "the value fact must not ride L0 without its guard");
     assert_eq!(
         subset.l0_withheld_precondition_count(CALLEE),
         Some(1),

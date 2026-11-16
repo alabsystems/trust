@@ -45,8 +45,9 @@ genesis path uses a stock Rust as the seed)
 2. **Python 3.11+** (invoke as `py -3`; `python3` is the Store stub).
 3. **The pinned stock Rust nightly (msvc)** as the genesis seed:
    `rustup-init -y --default-host x86_64-pc-windows-msvc --default-toolchain nightly-2026-07-09 --profile minimal`
-   then `rustup component add rustfmt clippy rust-analyzer`. Verify
-   `rustc --version` shows `1.99.0-nightly (14cae68132 …)`. (Any nightly within one
+   then `rustup component add rustfmt clippy rust-analyzer`. Verify, from
+   OUTSIDE the checkout (its root `rust-toolchain.toml` pins `channel = "trust"`),
+   that `rustc --version` shows `1.99.0-nightly (14cae68132 …)`. (Any nightly within one
    minor of `src/version` works; `nightly-2026-07-09` is the recorded pin.)
 4. **`~/.cargo/config.toml`**: `[http]\ncheck-revoke = false` (Windows blocks the
    cert-revocation check in some networks; cargo's index fetch fails otherwise).
@@ -115,11 +116,13 @@ native backends need a Windows box.**
 
 The Trust-owned verifier crates now cross-check clean for `x86_64-pc-windows-msvc`
 via `cargo check` (type/borrow-checks without linking, so it runs from a Unix
-host with no MSVC linker). Gate: **`scripts/win_cross_check.sh`** — 17 pure-Rust
-crates green (`trust-router`, `trust-cache`, `trust-deps`, `trust-wp`,
-`trust-loop`, `trust-vcgen`, `trust-report`, `trust-proof-cert`, … ).
+host with no MSVC linker). Gate: **`scripts/win_cross_check.sh`** — the pure-Rust
+crates its `CRATES` list names (`trust-router`, `trust-cache`, `trust-wp`,
+`trust-loop`, `trust-vcgen`, `trust-report`, `trust-proof-cert`, … ); that list,
+not a count here, is the scope. `trust-deps` was on it until TRUST-08 deleted the
+crate.
 
-- `crates/trust-router/src/coordinator.rs` — **DONE.** The `std::os::unix::net`
+- `crates/trust-coordinator/src/coordinator.rs` — **DONE.** The `std::os::unix::net`
   (`UnixListener`/`UnixStream`) transport was already `#[cfg(unix)]`-gated with a
   `Reservation::inert()` fallback off-Unix; the only real gap was the daemon
   binary `src/bin/trustd.rs`, which called the `#[cfg(unix)]` `coordinator::serve`

@@ -23,21 +23,20 @@ const MAX_CARGO_LOCKFILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REGISTRY_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 
 const USAGE: &str = "\
-Usage: targo trust verify cargo-cache --repo-root <path> --cargo-home <path> [--json-output <path>]
+Usage: targo trust verify cargo-cache --cargo-home <path> [--repo-root <path>] [--json-output <path>]
 
 Materialize a dedicated registry-only Cargo seed cache for release full-verification.
 
 Options:
-  --repo-root <path>     Trust checkout root containing build/<host>/stage2
+  --repo-root <path>     Trust checkout root containing build/<host>/stage2 (default: the current directory)
   --cargo-home <path>    Dedicated seed CARGO_HOME to materialize
   --json-output <path>   Also write the materialization report to this path
-  -h, --help             Show this help
+  -h, --help             Show this help (accepted as the first argument only)
 ";
 
 const FULL_VERIFY_LOCKFILES: &[&str] = &[
+    // The root lock covers the compiler, developer products and Targo.
     "Cargo.lock",
-    "targo-trust/Cargo.lock",
-    "crates/Cargo.lock",
     "library/Cargo.lock",
     "library/backtrace/Cargo.lock",
     "library/compiler-builtins/Cargo.lock",
@@ -973,7 +972,10 @@ fn required_tool_identities(toolchain: &TrustToolchain) -> RequiredToolIdentityA
     }
 
     // Phase two runs each version probe exactly once, then proves that the
-    // exact executable bytes persisted across that probe.
+    // exact executable bytes persisted across that probe.  The tools are the
+    // stage2 files a build has just written, so each first exec waits behind
+    // macOS's machine-wide syspolicyd scan (docs/KNOWN_HAZARDS.md
+    // EXEC-ASSESS-STALL-1): the release identity probes' hang guard, not 10 s.
     for tool in &captured {
         let mut command = Command::new(&tool.path);
         command.args(tool.version_args);
@@ -981,7 +983,7 @@ fn required_tool_identities(toolchain: &TrustToolchain) -> RequiredToolIdentityA
             &mut command,
             &format!("required stage2 {} version probe", tool.name),
             64 * 1024,
-            Duration::from_secs(10),
+            crate::release_cli::TOOL_IDENTITY_PROBE_HANG_GUARD,
         );
         let post_sha256 = exact_tool_sha256(&tool.path);
         let unchanged = post_sha256.as_deref() == Some(tool.sha256.as_str());
@@ -1101,9 +1103,11 @@ fn revalidate_captured_tool_identities(audit: &mut RequiredToolIdentityAudit) ->
 
 fn required_aliases_json(bin_dir: &Path) -> Value {
     // These three same-sysroot aliases are the whole compatibility contract:
-    // rustup refuses a toolchain without `cargo`/`rustc`, and cargo spawns a
+    // rustup refuses to link a toolchain without `rustc`, its proxy answers a
+    // missing `cargo` with ANOTHER toolchain's stock Cargo, and cargo spawns a
     // binary named `rustdoc` for its doctest phase, so bootstrap installs that
-    // alias into every stage >= 1 sysroot too (76d408e1cd). Every other
+    // alias into every stage >= 1 sysroot too (76d408e1cd; docs/trust-naming.md,
+    // "Version And Tool Selection"). Every other
     // secondary tool is intentionally Trust-named only, and retired upstream
     // leaves are rejected by linked-surface discovery.
     let aliases = [("cargo", "targo"), ("rustc", "trustc"), ("rustdoc", "trustdoc")];
@@ -1776,12 +1780,12 @@ checksum = "{crate_checksum}"
     #[test]
     fn plans_superset_lockfile_fetch_before_subset_to_avoid_redundant_fetch() {
         let temp = tempfile::Builder::new()
-            .prefix("targo-trust-cargo-cache-plan-")
+            .prefix("library-cargo-cache-plan-")
             .tempdir()
             .expect("tempdir");
         let repo = temp.path().join("repo");
         let bin = repo.join("build/host/stage2/bin");
-        fs::create_dir_all(repo.join("targo-trust")).expect("targo-trust dir");
+        fs::create_dir_all(repo.join("library")).expect("library dir");
         fs::create_dir_all(&bin).expect("stage2 bin");
         fs::write(
             repo.join("Cargo.toml"),
@@ -1789,22 +1793,22 @@ checksum = "{crate_checksum}"
         )
         .expect("root manifest");
         fs::write(
-            repo.join("targo-trust/Cargo.toml"),
-            "[package]\nname='targo-demo'\nversion='0.0.0'\nedition='2021'\n",
+            repo.join("library/Cargo.toml"),
+            "[package]\nname='std-demo'\nversion='0.0.0'\nedition='2021'\n",
         )
-        .expect("targo manifest");
+        .expect("library manifest");
         let demo_checksum = trust_types::digest::stable_sha256_hex(b"demo dep crate\n");
         let extra_checksum = trust_types::digest::stable_sha256_hex(b"extra dep crate\n");
         fs::write(repo.join("Cargo.lock"), lockfile_text(&[("demo-dep", "1.0.0", &demo_checksum)]))
             .expect("root lock");
         fs::write(
-            repo.join("targo-trust/Cargo.lock"),
+            repo.join("library/Cargo.lock"),
             lockfile_text(&[
                 ("demo-dep", "1.0.0", &demo_checksum),
                 ("extra-dep", "2.0.0", &extra_checksum),
             ]),
         )
-        .expect("targo lock");
+        .expect("library lock");
         write_fake_stage2_tools(&bin);
 
         let cargo_home = temp.path().join("seed-home");
@@ -1841,13 +1845,13 @@ checksum = "{crate_checksum}"
         assert_eq!(root_manifest["initial_fetch_required"], true);
         assert_eq!(root_manifest["fetch_executed"], false);
         assert_eq!(root_manifest["skip_reason"], "planned-prior-fetch-cache-hit");
-        assert_eq!(root_manifest["covered_by_manifest"], "targo-trust/Cargo.toml");
+        assert_eq!(root_manifest["covered_by_manifest"], "library/Cargo.toml");
         assert_eq!(root_manifest["cache_initial"]["status"], "miss");
         assert_eq!(root_manifest["cache_before"]["status"], "hit");
         assert_eq!(root_manifest["cache_after"]["status"], "hit");
 
         let superset_manifest = &proof["manifests"][1];
-        assert_eq!(superset_manifest["manifest"], "targo-trust/Cargo.toml");
+        assert_eq!(superset_manifest["manifest"], "library/Cargo.toml");
         assert_eq!(superset_manifest["manifest_index"], 1);
         assert_eq!(superset_manifest["plan_position"], 0);
         assert_eq!(superset_manifest["fetch_executed"], true);
@@ -1940,7 +1944,7 @@ if [ "$name" = "targo" ] && [ "${1:-}" = "fetch" ]; then
     fi
     printf 'demo dep crate\n' > "$CARGO_HOME/registry/cache/fake/demo-dep-1.0.0.crate"
     case "$manifest" in
-        */targo-trust/Cargo.toml)
+        */library/Cargo.toml)
             printf 'extra dep crate\n' > "$CARGO_HOME/registry/cache/fake/extra-dep-2.0.0.crate"
             ;;
     esac

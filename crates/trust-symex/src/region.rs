@@ -969,11 +969,15 @@ mod tests {
         Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Point".into(),
-            fields: vec![("x".into(), i32_ty()), ("y".into(), i32_ty())],
+            fields: vec![("x".into(), i32_ty()), ("y".into(), i32_ty())].into(),
             disc_index_safe: false,
-         faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        }
     }
 
     // --- Basic binding and read ---

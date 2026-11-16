@@ -1,0 +1,66 @@
+[package]
+name = "trust-openssl-src"
+version = "300.6.1+3.6.3"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Alex Crichton <alex@alexcrichton.com>"]
+license = "MIT/Apache-2.0"
+description = "Maintained OpenSSL Rust build driver with explicit owned jobserver transport"
+publish = false
+
+[workspace]
+
+[lib]
+name = "openssl_src"
+
+[features]
+default = []
+camellia = []
+force-engine = []
+idea = []
+ktls = []
+legacy = []
+no-dso = []
+seed = []
+ssl3 = []
+weak-crypto = []
+test-support = []
+
+[dependencies]
+cc = "1.0.79"
+jobserver_utils = { path = "../../src/jobserver_utils" }
+sha2 = "0.10"
+# The distinct package name avoids a patch cycle. The exact registry package
+# supplies the unchanged, checksum-pinned bundled C source via source_dir().
+openssl-source = { package = "openssl-src", version = "=300.6.1" }
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+trust-fs-acl = { path = "../../crates/trust-fs-acl" }
+# RustCrypto's supported SHA2 CPU dispatch; unsupported CPUs retain its scalar
+# fallback. Complete native-runtime observations must not use scalar debug SHA.
+sha2 = { version = "0.10", features = ["asm"] }
+
+# The observation owner streams real multi-GiB runtime images. Optimize only
+# the digest kernel in diagnostic builds; byte identities remain unchanged.
+[profile.dev.package."sha2:0.10.9"]
+opt-level = 3
+
+[[bin]]
+name = "openssl-jobserver-test-child"
+path = "tests/support/child.rs"
+test = false
+required-features = ["test-support"]
+
+[[test]]
+name = "make_jobserver"
+required-features = ["test-support"]
+
+[[test]]
+name = "clang_native_cache"
+required-features = ["test-support"]

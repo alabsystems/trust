@@ -51,6 +51,8 @@ impl SimulationRelationBuilder {
         source: &VerifiableFunction,
         target: &VerifiableFunction,
     ) -> Result<SimulationRelation, TransvalError> {
+        crate::vc_core::reject_memory_images(source)?;
+        crate::vc_core::reject_memory_images(target)?;
         if source.body.blocks.is_empty() {
             return Err(TransvalError::EmptyBody("source".into()));
         }
@@ -107,6 +109,8 @@ impl SimulationRelationBuilder {
         source: &VerifiableFunction,
         target: &VerifiableFunction,
     ) -> Result<SimulationRelation, TransvalError> {
+        crate::vc_core::reject_memory_images(source)?;
+        crate::vc_core::reject_memory_images(target)?;
         if source.body.blocks.is_empty() {
             return Err(TransvalError::EmptyBody("source".into()));
         }
@@ -264,6 +268,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -330,6 +335,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

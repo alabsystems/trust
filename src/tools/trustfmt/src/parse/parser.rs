@@ -2,12 +2,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 use rustc_ast::{ast, attr};
+use rustc_data_structures::thin_vec::ThinVec; // Trust: the one linked thin_vec
 use rustc_errors::Diag;
 use rustc_parse::lexer::StripTokens;
 use rustc_parse::parser::Parser as RawParser;
 use rustc_parse::{exp, new_parser_from_file, new_parser_from_source_str, unwrap_or_emit_fatal};
 use rustc_span::{Span, sym};
-use thin_vec::ThinVec;
 
 use crate::Input;
 use crate::parse::session::ParseSess;
@@ -135,6 +135,22 @@ impl<'a> Parser<'a> {
             Err(..) if path.exists() => Err(ParserError::ParseError),
             Err(_) => Err(ParserError::ParsePanicError),
         }
+    }
+
+    /// Trust (T14d): an `include!`d file as a list of items, or `None` when it
+    /// does not parse as one. Unlike a `mod` file, such a file is reported and
+    /// skipped rather than failing the run, so its errors are cleared here:
+    /// left in the session they would make every later module parse fail.
+    pub(crate) fn parse_included_file_as_module(
+        psess: &'a ParseSess,
+        path: &Path,
+        span: Span,
+    ) -> Option<(ast::AttrVec, ThinVec<Box<ast::Item>>, Span)> {
+        let parsed = Self::parse_file_as_module(psess, path, span).ok();
+        if parsed.is_none() {
+            psess.reset_errors();
+        }
+        parsed
     }
 
     pub(crate) fn parse_crate(

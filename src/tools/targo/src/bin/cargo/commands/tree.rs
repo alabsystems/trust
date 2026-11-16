@@ -1,15 +1,15 @@
 use crate::cli;
 use crate::command_prelude::*;
+use crate::util::data_structures::HashSet;
 use anyhow::{bail, format_err};
-use cargo::core::dependency::DepKind;
-use cargo::ops::Packages;
-use cargo::ops::tree::{self, DisplayDepth, EdgeKind};
-use cargo::util::CargoResult;
-use cargo::util::print_available_packages;
 use cargo_util_terminal::report::Level;
 use clap_complete::ArgValueCandidates;
-use std::collections::HashSet;
 use std::str::FromStr;
+use targo::ops::Packages;
+use targo::ops::cargo_tree::{self, DisplayDepth, EdgeKind};
+use targo::util::CargoResult;
+use targo::util::print_available_packages;
+use targo::workspace::dependency::DepKind;
 
 pub fn cli() -> Command {
     subcommand("tree")
@@ -98,10 +98,12 @@ pub fn cli() -> Command {
         // Sugar for `--format "{p} — {proof}"`, because the point is to see the
         // proof standing of a dependency tree without having to know the format
         // grammar exists.
-        .arg(flag(
-            "proof",
-            "Annotate each dependency with its shipped Trust verification record",
-        ))
+        .args(targo::is_targo_invocation().then(|| {
+            flag(
+                "proof",
+                "Annotate each dependency with its shipped Trust verification record",
+            )
+        }))
         .arg(
             // Backwards compatibility with old cargo-tree.
             flag("version", "Print version info and exit")
@@ -116,10 +118,10 @@ pub fn cli() -> Command {
         )
         .arg_features()
         .arg(flag("all-targets", "Deprecated, use --target=all instead").hide(true))
-        .arg_target_triple_with_candidates(
-            "Filter dependencies matching the given target-triple (default host platform). \
+        .arg_target_tuple_with_candidates(
+            "Filter dependencies matching the given target tuple (default host platform). \
             Pass `all` to include all targets.",
-            ArgValueCandidates::new(get_target_triples_with_all),
+            ArgValueCandidates::new(get_target_tuples_with_all),
         )
         .arg_manifest_path()
         // Trust: the footer names the binary the user actually invoked; see
@@ -149,7 +151,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
     if args.flag("version") {
         let verbose = args.verbose() > 0;
         let version = cli::get_version_string(verbose);
-        cargo::drop_print!(gctx, "{}", version);
+        targo::drop_print!(gctx, "{}", version);
         return Ok(());
     }
     let prefix = if args.flag("no-indent") {
@@ -163,7 +165,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
     } else {
         args.get_one::<String>("prefix").unwrap().as_str()
     };
-    let prefix = tree::Prefix::from_str(prefix).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let prefix = cargo_tree::Prefix::from_str(prefix).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let no_dedupe = args.flag("no-dedupe") || args.flag("all");
     if args.flag("all") {
@@ -187,7 +189,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
     } else {
         args.targets()?
     };
-    let target = tree::Target::from_cli(targets);
+    let target = cargo_tree::Target::from_cli(targets);
 
     let (edge_kinds, no_proc_macro, public) = parse_edge_kinds(gctx, args)?;
     let graph_features = edge_kinds.contains(&EdgeKind::Feature);
@@ -247,7 +249,7 @@ help: if you are in a workspace and want to search across all members, use:
             Charset::Ascii => gctx.shell().set_unicode(false)?,
         }
     }
-    let opts = tree::TreeOptions {
+    let opts = cargo_tree::TreeOptions {
         cli_features: args.cli_features()?,
         packages,
         target,
@@ -268,7 +270,7 @@ help: if you are in a workspace and want to search across all members, use:
         return Err(format_err!("the `-e features` flag does not support `--duplicates`").into());
     }
 
-    tree::build_and_print(&ws, &opts)?;
+    cargo_tree::build_and_print(&ws, &opts)?;
     Ok(())
 }
 
@@ -318,7 +320,7 @@ fn parse_edge_kinds(
         (kinds, no_proc_macro, public)
     };
 
-    let mut result = HashSet::new();
+    let mut result = HashSet::default();
     let insert_defaults = |result: &mut HashSet<EdgeKind>| {
         result.insert(EdgeKind::Dep(DepKind::Normal));
         result.insert(EdgeKind::Dep(DepKind::Build));
@@ -378,7 +380,7 @@ fn parse_edge_kinds(
 /// is a convenience over the same grammar rather than a second mechanism.
 fn trust_format(args: &ArgMatches) -> String {
     let format = args.get_one::<String>("format").cloned().unwrap();
-    if args.flag("proof") && format == "{p}" {
+    if targo::is_targo_invocation() && args.flag("proof") && format == "{p}" {
         return "{p} \u{2014} {proof}".to_string();
     }
     format

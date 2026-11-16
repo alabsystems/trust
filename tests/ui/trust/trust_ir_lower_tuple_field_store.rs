@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-TF): `t.1 = v` on an SSA-bound TUPLE local is an `InsertField`
 //! over the tuple value (the struct-local store's scalar-leaf posture). Every
 //! body here carried `Assign(non-local place)` before the wave; `strict` turns

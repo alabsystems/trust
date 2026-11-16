@@ -1,6 +1,6 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aprivate_interfaces
 //@ edition: 2021
 //! Trust (wave-VVM): the VACUOUS match, generalized off wave-VRM's shared-ref shape to EVERY
 //! scrutinee type `lower_match`'s scrutinee-kind catch-all refuses. A single unguarded arm whose

@@ -131,6 +131,7 @@ fn const_returning(name: &str, ty: Ty, value: i128) -> TrustIrGateSource {
         params: Vec::new(),
         returns: vec![ty.clone()],
         is_vararg: false,
+        abi: None,
     });
     let mut f = IrFunction::new(FuncId::new(0), name, FuncTyId::new(0), BlockId::new(0));
     let mut block = Block::new(BlockId::new(0));
@@ -142,11 +143,16 @@ fn const_returning(name: &str, ty: Ty, value: i128) -> TrustIrGateSource {
     ];
     f.blocks.push(block);
     module.functions.push(f);
-    TrustIrGateSource { symbol: name.to_string(), module, func_id: FuncId::new(0) }
+    TrustIrGateSource {
+        abi_cross_check: None,
+        symbol: name.to_string(),
+        module: module.into(),
+        func_id: FuncId::new(0),
+    }
 }
 
 /// If `w` is `mov w0, wK` — the `orr w0, wzr, wK` alias the backend ends every
-/// scalar body with — return `K`.
+/// scalar body with in the earlier emitter — return `K`.
 ///
 /// A WIDTH-BOUNDARY probe has to preserve the low bits while perturbing the high
 /// ones, and that is only possible if the mutation reads the SAME register the
@@ -165,6 +171,22 @@ fn mov_w0_src(w: u32) -> Option<u32> {
 /// `Rn = w0` forms (`0x1100_0400`, `0x1104_0000`).
 fn add_w0_from(k: u32, imm: u32) -> u32 {
     0x1100_0000 | (imm << 10) | (k << 5)
+}
+
+/// Change the known constant-one return by `delta`, preserving its source when
+/// the emitter uses a register move. The current emitter can materialize one
+/// directly as `movz w0, #1`; recognize that exact word independently. Every
+/// other closing instruction remains unsupported, rather than mutating an
+/// epilogue or unrelated register by assumption.
+fn return_one_with_delta(closing: u32, delta: u32) -> Option<u32> {
+    assert!(delta <= 0xfff, "probe delta must fit unshifted ADD's immediate");
+    const MOVZ_W0_ONE: u32 = 0x5280_0020;
+    if closing == MOVZ_W0_ONE {
+        // AArch64 MOVZ Wd, imm16, LSL #0: base 0x52800000, imm16 at bits 5..20.
+        Some(0x5280_0000 | ((1 + delta) << 5))
+    } else {
+        mov_w0_src(closing).map(|k| add_w0_from(k, delta))
+    }
 }
 
 /// Emit through the production path and require the baseline verdict to be
@@ -267,7 +289,7 @@ fn corrupting_only_the_128_bit_high_half_is_refuted() {
 /// and the `bool` obligation is exactly NOT weakened.
 ///
 /// ONE mutation, five widths, five required answers. Rewriting the closing
-/// `mov w0, wK` as `add w0, wK, #0x100` changes only bits 8 and above of the
+/// return of one with a return of `1 + 0x100` changes only bits 8 and above of the
 /// returned value and leaves bits 0..=7 exactly as they were. At a declared
 /// width of 8 those bits are not part of the value (a Rust-ABI narrow slot is
 /// `arg_ext: None`), so the verdict must NOT move. At 16, at 32, and for `bool`
@@ -290,14 +312,22 @@ fn the_declared_width_is_the_exact_boundary_of_the_obligation() {
         let obj = proven_bytes(&source);
         let at = slot_before_last_ret(&obj);
         let closing = u32::from_le_bytes(obj[at..at + 4].try_into().expect("word"));
-        // Asserted rather than assumed: if the backend stops closing bodies with
-        // `mov w0, wK`, this probe silently stops perturbing what it claims to
-        // perturb, and every row below would pass for the wrong reason.
-        let k = mov_w0_src(closing).unwrap_or_else(|| {
-            panic!("{name}: expected the body to close with `mov w0, wK`, found {closing:#010x}")
-        });
+        // Accept only the two independently decoded closing shapes. A future
+        // epilogue or different instruction must not silently change the probe.
+        let changed_return = |delta| {
+            return_one_with_delta(closing, delta).unwrap_or_else(|| {
+                panic!("{name}: expected `mov w0, wK` or `movz w0, #1`, found {closing:#010x}")
+            })
+        };
+        // The zero-delta rewrite must preserve the value even for the older
+        // register move, where it changes the instruction's encoding to ADD.
+        let control = verdict_of(&source, &with_word_at(&obj, at, changed_return(0)));
+        assert!(
+            matches!(control, OutputVerdict::Proven { .. }),
+            "{name} ({ty:?}): zero-delta return rewrite must stay Proven; got {control:?}"
+        );
 
-        let high = verdict_of(&source, &with_word_at(&obj, at, add_w0_from(k, 0x100)));
+        let high = verdict_of(&source, &with_word_at(&obj, at, changed_return(0x100)));
         if high_bits_are_part_of_the_value {
             assert!(
                 matches!(high, OutputVerdict::Refuted { .. }),
@@ -312,7 +342,7 @@ fn the_declared_width_is_the_exact_boundary_of_the_obligation() {
             );
         }
 
-        let low = verdict_of(&source, &with_word_at(&obj, at, add_w0_from(k, 1)));
+        let low = verdict_of(&source, &with_word_at(&obj, at, changed_return(1)));
         assert!(
             matches!(low, OutputVerdict::Refuted { .. }),
             "{name} ({ty:?}): bit 0 is inside the obligation at every width, so perturbing \

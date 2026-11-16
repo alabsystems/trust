@@ -137,3 +137,87 @@ fn a_failed_citation_still_gets_its_goal_rendered() {
         .expect("the goal renders even though the citation missed — that is the instrument");
     assert!(rendered.contains("UInt64"), "a real proposition, not a placeholder: {rendered}");
 }
+
+// ------------------------------------------------------------------ nat-lift
+
+/// Trust (nat-lift §5.6): the same byte-identity property, for the mode the
+/// COMPILER actually runs user `ensures` clauses in.
+///
+/// The three tests above pin the property at `ClauseMode::Strict`, through
+/// `elaborate_ensures` / `kernel_discharge_ensures_citation`. Since the
+/// nat-lift landed, every user-clause discharge lane calls the `*_in` entries
+/// at `ClauseMode::ProofLift`, and so does the emit row
+/// (`record_ensures_citation_goal` takes the same `ProofClauseInputs`). A
+/// disclosure row re-elaborated in a different mode would print a DIFFERENT
+/// proposition than the one the kernel closed — worse than printing none — and
+/// for a clause carrying `as nat` it would print no proposition at all.
+///
+/// This drives a lifted clause through both halves and requires the rendered
+/// text to be the Display of the graded goal, byte for byte.
+#[test]
+fn the_lifted_artifact_render_pins_the_goal_the_lifted_grade_call_received() {
+    const LIFT_ISLAND: &str = "def self_nl (x : UInt64) : UInt64 := x\n\n\
+         def nat_id (n : Nat) : Nat := n";
+    const LIFT_CLAUSE: &str = "(result as nat) == nat_id(x as nat)";
+    const LIFT_SELF: &str = "self_nl";
+
+    let mut session = CleanIslandSession::new();
+    let outcome = session.check(LIFT_ISLAND);
+    assert!(!outcome.is_rejected(), "setup island: {:?}", outcome.errors);
+    let env = session.environment().expect("environment").clone();
+    let mut facets = FacetTable::new();
+    for name in [LIFT_SELF, "nat_id"] {
+        admit_certified_island_definition(&env, name, &mut facets).expect("admit");
+    }
+    let inputs = trust_spec_elab::ProofClauseInputs::proof_lift(Some("u64"));
+
+    // The grade call the compiler makes for an UNCITED island-defeq clause.
+    let verdict = trust_certify::clean_island::kernel_prove_ensures_by_defeq_in(
+        &env,
+        LIFT_CLAUSE,
+        PARAMS,
+        LIFT_SELF,
+        &facets,
+        &inputs,
+    );
+    assert!(
+        matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+        "the lifted clause must discharge, or this pins nothing: {verdict:?}"
+    );
+
+    // The emit row's elaboration, verbatim from `trust_spec_emit.rs` after the
+    // nat-lift: the `*_in` entry with the SAME inputs.
+    let render = || {
+        trust_spec_elab::elaborate_ensures_in(LIFT_CLAUSE, PARAMS, LIFT_SELF, &facets, &inputs)
+            .map(|elaborated| elaborated.goal.to_string())
+    };
+    let rendered = render().expect("the lifted clause elaborates on the emit path too");
+    for round in 0..16 {
+        assert_eq!(rendered, render().expect("repeat"), "round {round}: the render drifted");
+    }
+
+    // The exact Clean text the disclosure row prints. A change here is a change
+    // to what the kernel was asked to prove.
+    assert_eq!(
+        rendered, "(u : UInt64) -> UInt64.toNat (self_nl u) = nat_id (UInt64.toNat u)",
+        "the emitted lifted Clean goal text changed; if intentional, re-pin after review"
+    );
+
+    // NEGATIVE TWIN, pinned on the reason: at `Strict` — the mode this row ran
+    // in before — the emit path prints NOTHING for this clause, so the row and
+    // the verdict would have disagreed for exactly the clauses the lift exists
+    // to enable.
+    let strict_inputs = trust_spec_elab::ProofClauseInputs::strict();
+    let strict_err = trust_spec_elab::elaborate_ensures_in(
+        LIFT_CLAUSE,
+        PARAMS,
+        LIFT_SELF,
+        &facets,
+        &strict_inputs,
+    )
+    .expect_err("Strict refuses a cast");
+    assert!(
+        strict_err.contains("unsupported term shape"),
+        "and the reason is the pre-existing one: {strict_err}"
+    );
+}

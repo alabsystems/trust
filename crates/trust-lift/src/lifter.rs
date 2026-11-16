@@ -678,12 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lift_arch_enum() {
-        assert_eq!(LiftArch::Aarch64, LiftArch::Aarch64);
-        assert_ne!(LiftArch::Aarch64, LiftArch::X86_64);
-    }
-
-    #[test]
     fn test_new_with_arch_x86_64() {
         let lifter = Lifter::new_with_arch(
             vec![FunctionBoundary { name: "main".into(), start: 0x400000, size: 0x20 }],
@@ -694,6 +688,70 @@ mod tests {
         );
         assert_eq!(lifter.functions().len(), 1);
         assert_eq!(lifter.arch, LiftArch::X86_64);
+    }
+
+    /// A lifted body's return place `_0` has the body's declared return type.
+    ///
+    /// Both are `()`: a lifted function is a machine-state transformer
+    /// (`arg_count` 0, nothing returned by TrustIr value) and its ABI result is
+    /// the final value of the return-register local — X0 on AArch64, RAX on
+    /// x86-64 — which the body writes as ordinary machine state. Until
+    /// 2026-09-27 `_0` was declared `u64` against `return_ty: ()`, and
+    /// `trust_vcgen::validate_function` rejected EVERY lifted body as
+    /// `MalformedTrustIr`. Instruction bytes are Apple `as` output
+    /// (`ldr x0, [x0]; ret` and `mov rax, qword ptr [rdi]; ret`).
+    #[test]
+    fn lifted_return_place_matches_the_declared_return_type() {
+        let aarch64_code =
+            [0xF940_0000u32, 0xD65F_03C0].iter().flat_map(|word| word.to_le_bytes()).collect();
+        let x86_64_code = vec![0x48, 0x8B, 0x07, 0xC3];
+        for (arch, code, return_register) in
+            [(LiftArch::Aarch64, aarch64_code, "X0"), (LiftArch::X86_64, x86_64_code, "RAX")]
+        {
+            let code: Vec<u8> = code;
+            let size = code.len() as u64;
+            let func = Lifter::new_with_arch(
+                vec![FunctionBoundary { name: "load".into(), start: 0x1000, size }],
+                0x1000,
+                size,
+                0,
+                arch,
+            )
+            .lift_function(&code, 0x1000)
+            .unwrap_or_else(|error| panic!("{arch:?} load must lift: {error}"));
+            let body = &func.trust_ir_body;
+
+            assert_eq!(body.return_ty, Ty::Unit, "{arch:?}: lifted functions return `()`");
+            assert_eq!(body.arg_count, 0, "{arch:?}: registers are observations, not arguments");
+            assert_eq!(body.locals[0].index, 0, "{arch:?}");
+            assert_eq!(
+                body.locals[0].ty, body.return_ty,
+                "{arch:?}: the return place must have the declared return type"
+            );
+
+            // The ABI result is the return-register local, written by the load,
+            // and nothing writes `_0`.
+            let return_register_local = body
+                .locals
+                .iter()
+                .find(|local| local.name.as_deref() == Some(return_register))
+                .map(|local| local.index)
+                .unwrap_or_else(|| panic!("{arch:?}: no {return_register} local"));
+            let written = body
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .filter_map(|stmt| match stmt {
+                    trust_types::Statement::Assign { place, .. } => Some(place.local),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                written.contains(&return_register_local),
+                "{arch:?}: the load must write {return_register}"
+            );
+            assert!(!written.contains(&0), "{arch:?}: nothing writes the unit return place");
+        }
     }
 
     #[cfg(feature = "elf")]

@@ -1772,7 +1772,8 @@ impl OutcomePlan {
 // ---------------------------------------------------------------------------
 
 fn kernel_checks_goal(env: &Environment, term: &Expr, goal: &Expr) -> bool {
-    TypeChecker::with_context(env, LocalContext::new()).check_type(term, goal).is_ok()
+    crate::kernel_stop::check_type(TypeChecker::with_context(env, LocalContext::new()), term, goal)
+        .is_ok()
 }
 
 fn lineage_digest(

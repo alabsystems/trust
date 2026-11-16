@@ -3,6 +3,7 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
+//@ forbid-output: this function has no obligation of its own
 //! REGRESSION, and it was a LIVE FALSE PROVE (measured 2026-08-19): a `dyn`
 //! reachable through a ROOT PARAMETER'S FIELD must poison its trait, exactly as
 //! one reachable through a root parameter's type argument does.
@@ -99,6 +100,10 @@ pub struct Outer<'a> {
 
 pub fn drive(b: &mut Bundle<'_>) -> u32 {
     //~^ ERROR Trust strict verification failed
+    //~| ERROR Trust Level 0 safety verification incomplete
+    // (OD-1 item 14 amendment, 2026-10-06: the caller-chosen vtable read through a
+    // field is also a class (c) Level-0 refutation, docs/DECISION_QUEUE.md
+    // "OD-1-RG-CONCRETE".)
     let mut g = Good;
     // WITNESSED: this coercion is the one the walker sees. It is what makes the
     // enumeration look complete instead of vacuous.
@@ -112,9 +117,17 @@ pub fn drive(b: &mut Bundle<'_>) -> u32 {
 
 pub fn drive_nested(o: &mut Outer<'_>) -> u32 {
     //~^ ERROR Trust strict verification failed
+    //~| ERROR Trust Level 0 safety verification incomplete
+    // (OD-1 item 14 amendment, 2026-10-06: the caller-chosen vtable read through a
+    // field is also a class (c) Level-0 refutation, docs/DECISION_QUEUE.md
+    // "OD-1-RG-CONCRETE".)
     let mut g = Good;
     let local: &mut dyn Emit = &mut g;
     let a = local.emit(1);
     let c = o.inner.sink.emit(2);
     a.wrapping_add(c)
 }
+
+// ZERO-ROW-GATE (2026-10-10): this rail must refuse for its OWN reason; a refusal by the
+// zero-row gate (whose note is forbidden here) would mean the gate under test regressed
+// into discharging and the zero-row gate masked it.

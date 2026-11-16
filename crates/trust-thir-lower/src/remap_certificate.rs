@@ -94,8 +94,10 @@ use trust_ir::{Block, Function, InstrNode};
 /// Deliberately NOT compared, each because assembly rewrites it on purpose:
 ///
 /// * `id` — pass 1 assigns a fresh dense `FuncId`.
-/// * `name` — `assemble` replaces it with the def path (plus the `{const-init}` /
-///   `{static-init}` marker), since a mini-module name is not a crate-unique identity.
+/// * `name` — `assemble` replaces it with the body's LINK-TIME SYMBOL (WS5.2), and moves the
+///   def path (plus the `{const-init}` / `{static-init}` marker) to `display_path`, since a
+///   mini-module name is not a crate-unique identity. (`display_path` and, for an initializer,
+///   `linkage` are set in pass 2, after this certificate, and are function-level metadata.)
 /// * `ty` — re-interned into the assembled module's func-type table.
 /// * `calling_conv` — set to `Rust` for every spliced body (#180).
 /// * `source_provenance` — deliberately dropped: the per-body carrier authenticates the

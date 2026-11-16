@@ -368,6 +368,7 @@ fn emitted_unary_projection(name: &str) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -433,29 +434,23 @@ fn control_11_the_full_elaborator_spelling_plans_to_the_same_shape() {
     assert_prelude_carries_the_typeclass_spelling(&env);
 
     let honest_step = || call_rec(sub_delta(), sub_lt(nat_num(1), one_pos()));
-    let delta = plan_of(
-        &mut env,
-        "cdsDelta",
-        wf_f(guard_delta(), dec_delta(), honest_step(), zero()),
-    )
-    .expect("the hand-built delta-unfolded side A must plan");
+    let delta =
+        plan_of(&mut env, "cdsDelta", wf_f(guard_delta(), dec_delta(), honest_step(), zero()))
+            .expect("the hand-built delta-unfolded side A must plan");
     assert_eq!(delta, countdown_shape());
 
     let typeclass_step = || call_rec(sub_tc(), sub_lt(nat_num(1), one_pos()));
-    let typeclass = plan_of(
-        &mut env,
-        "cdsTypeclass",
-        wf_f(guard_tc(), dec_tc(), typeclass_step(), zero()),
-    )
-    .unwrap_or_else(|refusal| {
-        panic!(
-            "THE MEASURED DEFECT, IF THIS FIRES: the recogniser refuses the spelling the \
+    let typeclass =
+        plan_of(&mut env, "cdsTypeclass", wf_f(guard_tc(), dec_tc(), typeclass_step(), zero()))
+            .unwrap_or_else(|refusal| {
+                panic!(
+                    "THE MEASURED DEFECT, IF THIS FIRES: the recogniser refuses the spelling the \
              elaborator actually mints for `if h : 0 < n then n + f (n - 1) else 0` — the \
              exact surface text its own refusal advertises as the emittable fragment. \
              Widen `emit.rs`, never this control. got: {}",
-            refusal.note()
-        )
-    });
+                    refusal.note()
+                )
+            });
     assert_eq!(
         typeclass, delta,
         "both spellings of ONE function must read to ONE shape; a recogniser that reads \
@@ -511,20 +506,17 @@ fn control_11_the_surface_numeral_subtrahend_plans() {
     );
     let surface_one_pos = Expr::app(cnst("Nat.le.refl"), surface_num(1));
     let surface_step = call_rec(surface_sub, sub_lt(surface_num(1), surface_one_pos));
-    let shape = plan_of(
-        &mut env,
-        "cdsSurfaceNumeral",
-        wf_f(guard_tc(), dec_tc(), surface_step, zero()),
-    )
-    .unwrap_or_else(|refusal| {
-        panic!(
-            "the recogniser must read the SURFACE numeral the elaborator writes for `1`; \
+    let shape =
+        plan_of(&mut env, "cdsSurfaceNumeral", wf_f(guard_tc(), dec_tc(), surface_step, zero()))
+            .unwrap_or_else(|refusal| {
+                panic!(
+                    "the recogniser must read the SURFACE numeral the elaborator writes for `1`; \
              if the kernel refused the declaration instead, `OfNat.ofNat Nat 1 \
              (instOfNatNat 1)` is not the `Nat` this fixture assumes and \
              `r2_wf_equation_probes` w10's numeral row is where to re-measure. got: {}",
-            refusal.note()
-        )
-    });
+                    refusal.note()
+                )
+            });
     assert_eq!(shape, countdown_shape());
 }
 
@@ -782,15 +774,8 @@ fn control_11_a_foreign_hsub_instance_is_refused() {
         ),
     );
 
-    let foreign_sub = hsub_at(
-        three_zero(),
-        nat(),
-        nat(),
-        nat(),
-        cnst("predHSubNat"),
-        Expr::bvar(2),
-        nat_num(1),
-    );
+    let foreign_sub =
+        hsub_at(three_zero(), nat(), nat(), nat(), cnst("predHSubNat"), Expr::bvar(2), nat_num(1));
     let refusal = plan_of(
         &mut env,
         "cdsForeignHSub",
@@ -1127,15 +1112,8 @@ fn control_11_a_subtrahend_other_than_one_is_refused() {
     let mut env = Environment::with_prelude();
     assert_prelude_carries_the_typeclass_spelling(&env);
 
-    let two_back = hsub_at(
-        three_zero(),
-        nat(),
-        nat(),
-        nat(),
-        cnst("instHSubNat"),
-        Expr::bvar(2),
-        nat_num(2),
-    );
+    let two_back =
+        hsub_at(three_zero(), nat(), nat(), nat(), cnst("instHSubNat"), Expr::bvar(2), nat_num(2));
     let refusal = plan_of(
         &mut env,
         "cdsTwoBack",

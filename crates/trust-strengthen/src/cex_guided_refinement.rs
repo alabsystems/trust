@@ -96,7 +96,7 @@ impl CexAnalyzer {
                 confidence: 0.4,
                 rationale: format!(
                     "Add guard to exclude path: {}",
-                    cex.path_trace.last().unwrap_or(&String::new()),
+                    cex.path_trace.last().map_or("", String::as_str),
                 ),
                 strategy: RefinementStrategy::AddGuard,
             });
@@ -362,46 +362,50 @@ impl CexAnalyzer {
     }
 
     /// Find variable names that appear in every counterexample.
-    fn find_common_variables(&self, cexs: &[Counterexample]) -> Vec<String> {
+    fn find_common_variables<'a>(&self, cexs: &'a [Counterexample]) -> Vec<String> {
         if cexs.is_empty() {
             return Vec::new();
         }
 
-        let mut var_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut var_counts: BTreeMap<&'a str, usize> = BTreeMap::new();
         for cex in cexs {
             // Deduplicate within a single cex
-            let mut vars: Vec<&str> =
+            let mut vars: Vec<&'a str> =
                 cex.variable_assignments.iter().map(|(v, _)| v.as_str()).collect();
-            vars.sort();
+            vars.sort_unstable();
             vars.dedup();
             for var in vars {
-                *var_counts.entry(var.to_owned()).or_default() += 1;
+                *var_counts.entry(var).or_default() += 1;
             }
         }
 
-        let mut common_vars: Vec<String> = var_counts
+        var_counts
             .into_iter()
             .filter(|(_, count)| *count == cexs.len())
-            .map(|(var, _)| var)
-            .collect();
-        common_vars.sort();
-        common_vars
+            .map(|(var, _)| var.to_owned())
+            .collect()
     }
 
     /// Find the longest common prefix of path traces across counterexamples.
     fn find_common_path_prefix(&self, cexs: &[Counterexample]) -> Vec<String> {
-        let traces: Vec<&[String]> = cexs.iter().map(|c| c.path_trace.as_slice()).collect();
-
-        if traces.is_empty() || traces.iter().any(|t| t.is_empty()) {
+        let Some((first_cex, rest_cexs)) = cexs.split_first() else {
+            return Vec::new();
+        };
+        if first_cex.path_trace.is_empty() || rest_cexs.iter().any(|c| c.path_trace.is_empty()) {
             return Vec::new();
         }
 
-        let min_len = traces.iter().map(|t| t.len()).min().unwrap_or(0);
+        let min_len = rest_cexs
+            .iter()
+            .map(|c| c.path_trace.len())
+            .min()
+            .unwrap_or(first_cex.path_trace.len())
+            .min(first_cex.path_trace.len());
         let mut prefix = Vec::new();
 
         for i in 0..min_len {
-            let first = &traces[0][i];
-            if traces.iter().all(|t| &t[i] == first) {
+            let first = &first_cex.path_trace[i];
+            if rest_cexs.iter().all(|c| &c.path_trace[i] == first) {
                 prefix.push(first.clone());
             } else {
                 break;

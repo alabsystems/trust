@@ -1,0 +1,6 @@
+{
+  "type": "alethe_certificate",
+  "version": "1.0",
+  "problem": "(declare-const a Bool)\n(assert (or a ; c\r a))\n(assert (not a))\n(check-sat)\n",
+  "proof": "(assume h1 (or a a))\n(assume h2 (not a))\n(step t1 (cl a a) :rule or :premises (h1))\n(step t2 (cl a) :rule contraction :premises (t1))\n(step t3 (cl) :rule resolution :premises (t2 h2))\n"
+}

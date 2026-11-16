@@ -29,7 +29,8 @@ const EXPECTED_HELLO: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee90
 fn update_accepts_every_measured_argument_shape() {
     let mut hasher = Sha256::new();
 
-    // [u8; 8] BY VALUE — trust-buildcache/src/key.rs:95, trust-cache/src/mir_hash.rs:81.
+    // [u8; 8] BY VALUE — trust-buildcache/src/key.rs:95, trust-cache/src/mir_hash.rs:81
+    // (both at 3a1cb55f071; T11 deleted them).
     // This is the shape that forces `impl AsRef<[u8]>`; a `&[u8]` parameter
     // would reject it and it appears at ~20 sites.
     hasher.update(7u64.to_le_bytes());
@@ -39,14 +40,15 @@ fn update_accepts_every_measured_argument_shape() {
     hasher.update([u8::from(bit)]);
     hasher.update([(0x0a_u8 << 4) | 0x0b]);
 
-    // &[u8; N] literal — trust-deps/src/lib.rs:3014.
+    // &[u8; N] literal — the NUL field separator of the retired `trust-deps`
+    // crate's digest (removed by TRUST-08, 2026-09-24).
     hasher.update(b"\0");
 
     // &[u8] slice — trust-types/src/digest.rs:87.
     let buffer = [1u8, 2, 3, 4, 5];
     hasher.update(&buffer[..3]);
 
-    // &Vec<u8> — trust-cache/src/mir_hash.rs:84.
+    // &Vec<u8> — trust-cache/src/mir_hash.rs:84 (at 3a1cb55f071; T11 deleted it).
     let body_json: Vec<u8> = b"{}".to_vec();
     hasher.update(&body_json);
 
@@ -222,7 +224,9 @@ fn type_position_behind_mutable_reference() {
         }
     }
 
-    // trust-deps/src/lib.rs:3012 and trust-buildcache/src/key.rs:94/101.
+    // `update_field` is the retired `trust-deps` crate's digest helper (removed
+    // by TRUST-08, 2026-09-24); `hash_bytes` is trust-buildcache/src/key.rs:94
+    // (removed by T11, 2026-10-16).
     fn update_field(digest: &mut Sha256, value: &str) {
         digest.update(value.as_bytes());
         digest.update(b"\0");

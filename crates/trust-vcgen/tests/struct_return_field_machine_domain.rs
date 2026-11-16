@@ -52,13 +52,15 @@
 
 use trust_types::{Formula, Ty, VcKind, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
 
 fn load(name: &str) -> VerifiableFunction {
     let text = std::fs::read_to_string(format!("{FIXTURES}{name}.json"))
         .unwrap_or_else(|e| panic!("fixture `{name}` must be readable: {e}"));
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("fixture `{name}` must deserialize: {e}"))
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("fixture `{name}` must deserialize: {e}"))
 }
 
 /// The lowered-contract marker the compiler stamps on a contract body; a clause
@@ -70,18 +72,93 @@ const LOWERED: &str = "__trust_lowered_compiler_contract__:";
 /// aggregate return and every guard stay byte-identical, so a difference in
 /// outcome between two rows of the vacuity table below is a difference in the
 /// PREDICATE and in nothing else.
+///
+/// The clause is replaced in ALL THREE carriers the extractor writes it to, not
+/// only in `contracts`. Every capture in `tests/fixtures/` states its one clause
+/// three ways: the authored text behind the lowered marker in `contracts`, that
+/// text's parse in `postconditions`, and the bare text in `spec.ensures`
+/// ([`assert_carriers_agree`] checks the fixture before anything is swapped, and
+/// `with_clause_reproduces_the_compilers_own_capture` checks the rebuilt function
+/// against the compiler's real extraction of a different clause).
+///
+/// WHY THIS IS NOT COSMETIC (2026-09-26). This helper used to swap `contracts`
+/// alone, which builds a function no extraction produces: the swapped clause in
+/// one carrier and the ORIGINAL clause `result.0 == var.0 * 2` — TRUE of this
+/// body — still in the other two. That was invisible while every formula-only
+/// arithmetic `ensures` was stripped unconditionally. `3539149e06` let a
+/// Machine{w}-admissible one be CHECKED instead, so the stale true clause got a
+/// `Postcondition` row of its own, which proved, and the verdict helpers below
+/// credited that proof to the swapped clause: the table reported the false
+/// clause `var.0 == var.0 * 2` as proved. MEASURED at `92e7829ca5`: the proved
+/// row carried `source_contract_index: None` (it belongs to no authored clause),
+/// the false clause's own row fell closed (`SelfReferentialDefinition`), and the
+/// false clause proves through no carrier once the carriers agree
+/// (`the_false_clauses_prove_through_no_carrier`). The verifier was right; the
+/// harness asked it a question about one clause and read the answer for another.
 fn with_clause(name: &str, clause: &str) -> VerifiableFunction {
     let mut func = load(name);
     assert_eq!(func.contracts.len(), 1, "fixture must carry exactly one clause");
+    assert_carriers_agree(&func, name);
     func.contracts[0].body = format!("{LOWERED}{clause}");
+    func.postconditions = vec![parse_clause(clause)];
+    func.spec.ensures = vec![clause.to_string()];
     func
 }
 
+fn parse_clause(clause: &str) -> Formula {
+    trust_types::parse_spec_expr(clause)
+        .unwrap_or_else(|| panic!("clause `{clause}` must parse to a formula"))
+}
+
+/// The rule [`with_clause`] rebuilds by, read off the capture rather than
+/// assumed: the fixture's one `Ensures` is stated identically in `contracts`
+/// (marker + text), `postconditions` (the text's parse) and `spec.ensures` (the
+/// text).
+fn assert_carriers_agree(func: &VerifiableFunction, name: &str) {
+    let text = func.contracts[0]
+        .body
+        .strip_prefix(LOWERED)
+        .unwrap_or_else(|| panic!("fixture `{name}`'s clause must carry the lowered marker"));
+    assert_eq!(
+        func.postconditions,
+        vec![parse_clause(text)],
+        "fixture `{name}`: the formula carrier must be the parse of the authored clause"
+    );
+    assert_eq!(
+        func.spec.ensures,
+        vec![text.to_string()],
+        "fixture `{name}`: the spec carrier must be the authored clause text"
+    );
+}
+
+/// The clause identity a row carries: the index of the authored `contracts`
+/// entry it was minted for, `None` for a row that belongs to no authored clause.
+/// This is the same field the compiler requires before a solved row may
+/// discharge a source-clause marker (`trust_verify.rs`: "Re-pointing a solved
+/// row to another contract must not transfer proof").
+fn source_index(vc: &trust_types::VerificationCondition) -> Option<usize> {
+    vc.contract_metadata.as_ref().and_then(|metadata| metadata.source_contract_index)
+}
+
+/// Every `Postcondition` row, read by the verdict helpers below as THE verdict
+/// of the fixture's one clause. So each row must actually BELONG to that clause:
+/// a row minted for any other formula would have its verdict credited to the
+/// clause under test, which is exactly how a proof of a true stale clause read as
+/// a proof of a false one (see [`with_clause`]).
 fn postcondition_vcs(func: &VerifiableFunction) -> Vec<trust_types::VerificationCondition> {
-    trust_vcgen::generate_vcs(func)
+    let rows: Vec<_> = trust_vcgen::generate_vcs(func)
         .into_iter()
         .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
-        .collect()
+        .collect();
+    for vc in &rows {
+        assert_eq!(
+            source_index(vc),
+            Some(0),
+            "a Postcondition row not attributed to the clause under test would have its \
+             verdict credited to that clause: {vc:?}"
+        );
+    }
+    rows
 }
 
 /// The visible fail-closed rows: a clause that cannot be modelled must produce
@@ -90,9 +167,7 @@ fn unsupported_details(func: &VerifiableFunction) -> Vec<String> {
     trust_vcgen::generate_vcs(func)
         .into_iter()
         .filter_map(|vc| match vc.kind {
-            VcKind::UnsupportedMir { kind, detail } if kind == "SpecUnverifiable" => {
-                Some(detail)
-            }
+            VcKind::UnsupportedMir { kind, detail } if kind == "SpecUnverifiable" => Some(detail),
             _ => None,
         })
         .collect()
@@ -132,7 +207,7 @@ fn is_declared_width_encoding(formula: &Formula) -> bool {
 
 /// The outcome, from the same in-process ay backend the compiler routes to.
 fn verdicts(vcs: &[trust_types::VerificationCondition]) -> Vec<VerificationResult> {
-    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+    let router = test_router::deterministic_test_router();
     vcs.iter()
         .map(|vc| {
             router
@@ -146,8 +221,7 @@ fn verdicts(vcs: &[trust_types::VerificationCondition]) -> Vec<VerificationResul
 }
 
 fn all_proved(vcs: &[trust_types::VerificationCondition]) -> bool {
-    !vcs.is_empty()
-        && verdicts(vcs).iter().all(|r| matches!(r, VerificationResult::Proved { .. }))
+    !vcs.is_empty() && verdicts(vcs).iter().all(|r| matches!(r, VerificationResult::Proved { .. }))
 }
 
 // ---------------------------------------------------------------------------
@@ -490,26 +564,44 @@ fn mixed_width_struct_return_falls_closed_visibly() {
 /// row with no second gate. What this measures is which rows it actually takes:
 ///
 /// ```text
-///   tuple_ensures_duplicate         `ret.0 == ret.1`   proved 1  certified 1
-///   tuple_return_field_arithmetic   `ret.0 == x + 1`   proved 1  certified 0   <- CONTROL
-///   newtype_struct_return_positive  `ret.0 == var.0*2` proved 1  certified 0
-///   newtype_struct_return_positive  `ret.0 == ret.0`   proved 1  certified 1
-///   newtype_struct_return_positive  `1 == 1`           proved 1  certified 1
+///   tuple_ensures_duplicate         `ret.0 == ret.1`     proved 1  certified 1
+///   tuple_return_field_arithmetic   `ret.0 == x + 1`     proved 1  certified 1   <- CONTROL
+///   tuple_return_field_arithmetic   `ret.0 == x + 2`     proved 0  certified 0   <- CONTROL MUTANT
+///   newtype_struct_return_positive  `ret.0 == var.0*2`   proved 1  certified 0
+///   newtype_struct_return_positive  `ret.0 != var.0*2+1` proved 1  certified 0
+///   newtype_struct_return_positive  `ret.0 == ret.0`     proved 1  certified 1
+///   newtype_struct_return_positive  `1 == 1`             proved 1  certified 1
 /// ```
 ///
-/// The kernel certifies the Int-lane rows — INCLUDING the tautologies — and
-/// does NOT certify the declared-width QF_BV rows this lane produces. Under
-/// `-Ztrust-policy=certify` an ay `Proved` with no kernel token is reported
-/// `Unknown`, so every exact relation here would read `Unknown` there while
-/// `ensures result.0 == result.0` would read CERTIFIED. That is a real and
-/// uncomfortable property of the Machine{w} lane and it is worth headlining.
+/// THE DOOR MOVED, AND THIS IS WHERE THAT IS SAID (VCGEN-PERF-67-69-VERDICTS-1,
+/// 2026-11-07). Until `de718fe643` the kernel certified only the Int-lane rows
+/// (the tautologies) and none of the declared-width QF_BV rows, and this test
+/// pinned the control at `certified 0`. `de718fe643` added
+/// `trust_certify::bv_equality` (documented in `docs/TCB.md` by `ca243a06a2`):
+/// each distinct well-sorted bitvector TERM becomes its own integer skolem, only
+/// the original top-level equalities and disequalities are kept, and the
+/// refutation the Clean kernel checks uses `Eq.refl`/`Eq.symm`/`Eq.trans` alone.
+/// Any model of the VC maps to a model of that context (equal terms to equal
+/// values), so the projection only weakens the goal; it interprets no arithmetic.
+/// The control's violation is such a chain — `_0.0#s1_1 = _3 = _4.0#s0_1 =
+/// bvadd(x, 1)` against `!(_0.0#s1_1 = bvadd(x, 1))` — so it now certifies, with
+/// a certificate that replays against its own goal. That is a true formula
+/// kernel-checked, not a false certification: the false clause over the same body
+/// (`x + 2`) neither proves nor certifies, and a certified row the solver does
+/// not prove fails this test.
 ///
-/// It is NOT introduced here. `tuple_return_field_arithmetic_control` is the
-/// same shape on a TUPLE return, which proved on the sealed toolchain before
-/// this change and is bit-for-bit unaffected by it; it is `certified 0` with
-/// the change applied and `certified 0` with it reverted. This test pins that
-/// equality, so a future change that starts minting kernel authority for
-/// declared-width rows has to come here and say so.
+/// This lane's struct-return rows do NOT certify: the newtype body pins `_4 =
+/// var.0` and computes `bvmul(_4, 2)`, and closing `bvmul(_4, 2) = bvmul(var.0, 2)`
+/// needs congruence, which the equality family deliberately does not have. So the
+/// struct-return lane is in a certification class no stronger than the control's
+/// — the property this test exists to keep — and every count is pinned exactly,
+/// so a change that mints kernel authority for another declared-width row has to
+/// come here and say so.
+///
+/// Under `-Ztrust-policy=certify` an ay `Proved` with no kernel token is reported
+/// `Unknown`, so the exact struct relation still reads `Unknown` there while
+/// `ensures result.0 == result.0` reads CERTIFIED. That is a real and
+/// uncomfortable property of the Machine{w} lane and it is worth headlining.
 #[test]
 fn kernel_certification_matches_the_untouched_control() {
     let measure = |fixture: &str, clause: Option<&str>| -> (usize, usize, usize) {
@@ -518,46 +610,192 @@ fn kernel_certification_matches_the_untouched_control() {
             None => load(fixture),
         };
         let posts = postcondition_vcs(&func);
-        let proved = verdicts(&posts)
-            .iter()
-            .filter(|r| matches!(r, VerificationResult::Proved { .. }))
-            .count();
-        let certified =
-            posts.iter().filter(|vc| trust_certify::certify_vc(vc).is_some()).count();
+        let outcomes = verdicts(&posts);
+        let mut certified = 0;
+        for (vc, outcome) in posts.iter().zip(&outcomes) {
+            let Some(evidence) = trust_certify::certify_vc(vc) else { continue };
+            certified += 1;
+            // A kernel certificate of a goal the solver does not discharge would
+            // be a false certification (or a solver regression): either way, stop.
+            assert!(
+                matches!(outcome, VerificationResult::Proved { .. }),
+                "{fixture} {clause:?}: kernel-certified but not proved: {outcome:?}"
+            );
+            assert!(
+                trust_certify::replay_vc_evidence(vc, &evidence),
+                "{fixture} {clause:?}: the certificate must replay against its own goal"
+            );
+        }
+        let proved =
+            outcomes.iter().filter(|r| matches!(r, VerificationResult::Proved { .. })).count();
         (posts.len(), proved, certified)
     };
 
     let control = measure("tuple_return_field_arithmetic_control", None);
+    let control_mutant =
+        measure("tuple_return_field_arithmetic_control", Some("(result.0) == ((x) + (2))"));
     let exact = measure("newtype_struct_return_positive", None);
-    let disc = measure("newtype_struct_return_positive", Some("(result.0) != (((var.0) * (2)) + (1))"));
+    let disc =
+        measure("newtype_struct_return_positive", Some("(result.0) != (((var.0) * (2)) + (1))"));
     let taut = measure("newtype_struct_return_positive", Some("(result.0) == (result.0)"));
-    let mutant = measure("newtype_struct_return_positive", Some("(result.0) == (((var.0) * (2)) + (1))"));
+    let mutant =
+        measure("newtype_struct_return_positive", Some("(result.0) == (((var.0) * (2)) + (1))"));
     eprintln!(
         "kernel door (rows, proved, certified):\n  CONTROL tuple+arith {control:?}\n  \
-         exact {exact:?}\n  discriminator {disc:?}\n  tautology {taut:?}\n  mutant {mutant:?}"
+         CONTROL mutant {control_mutant:?}\n  exact {exact:?}\n  discriminator {disc:?}\n  \
+         tautology {taut:?}\n  mutant {mutant:?}"
     );
 
-    assert_eq!(mutant.1, 0, "a false postcondition must never be proved");
-    assert_eq!(mutant.2, 0, "a false postcondition must never be kernel-certified");
+    for (label, row) in [("mutant", mutant), ("control mutant", control_mutant)] {
+        assert!(row.0 > 0, "{label}: the false clause must still produce its row");
+        assert_eq!(row.1, 0, "{label}: a false postcondition must never be proved");
+        assert_eq!(row.2, 0, "{label}: a false postcondition must never be kernel-certified");
+    }
 
-    // The control is the pre-existing declared-width postcondition lane. This
-    // change must put its new rows in exactly the same certification class,
-    // never a stronger one.
+    // The control is the pre-existing declared-width postcondition lane. Its
+    // violation is a pure equality chain, which `bv_equality` certifies.
     assert_eq!(
         (control.1 > 0, control.2),
-        (true, 0),
-        "control: a declared-width postcondition proves and is NOT kernel-certified"
+        (true, 1),
+        "control: the declared-width equality chain proves and is kernel-certified"
+    );
+    // This change must never put its new rows in a STRONGER class than the
+    // control, and the exact class is pinned so any move comes here.
+    assert!(
+        exact.2 <= control.2 && disc.2 <= control.2,
+        "the struct-return lane must not certify beyond the untouched control: \
+         {exact:?} {disc:?} vs {control:?}"
     );
     assert_eq!(
         (exact.2, disc.2),
-        (control.2, control.2),
-        "this lane's declared-width rows must certify exactly as the untouched control does; \
-         a NEW kernel-certified class would need its own review"
+        (0, 0),
+        "measured: the struct-return rows need congruence under bvmul, which the \
+         equality family does not have; a NEW kernel-certified class needs its own review"
     );
     assert!(exact.1 > 0 && disc.1 > 0, "both must still be proved: {exact:?} {disc:?}");
 
     // Recorded, not celebrated: the tautology IS kernel-certified, because it
     // carries no arithmetic and so never enters the declared-width lane at all.
-    // Same before this change as after.
     assert_eq!(taut.2, 1, "the tautology's Int-lane row is kernel-certified");
+}
+
+// ---------------------------------------------------------------------------
+// 6. ATTRIBUTION. A clause reaches vcgen in three carriers, and since
+//    `3539149e06` the FORMULA carrier is checked rather than stripped. These pin
+//    that no false clause proves through any one of them, and that a proof of a
+//    DIFFERENT clause riding in another carrier is never credited to it.
+// ---------------------------------------------------------------------------
+
+/// Every vacuity-table clause that must NOT prove, including the one that was
+/// reported as proved on 2026-09-26 (`var.0 == var.0 * 2`).
+const MUST_NOT_PROVE: &[&str] = &[
+    "false",
+    "(result.0) == (((var.0) * (2)) + (1))",
+    "(var.0) == ((var.0) * (2))",
+    "(result.0) == ((var.0) * (3))",
+    "(result.0) != ((var.0) * (2))",
+];
+
+fn raw_postcondition_rows(func: &VerifiableFunction) -> Vec<trust_types::VerificationCondition> {
+    trust_vcgen::generate_vcs(func)
+        .into_iter()
+        .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
+        .collect()
+}
+
+/// [`with_clause`] rebuilds by the compiler's rule, not by a guess at it: its
+/// rebuild of the MUTANT clause over the positive capture states exactly what
+/// the compiler itself extracted for that clause
+/// (`newtype_struct_return_positive_mutant`), in every carrier.
+#[test]
+fn with_clause_reproduces_the_compilers_own_capture() {
+    let rebuilt =
+        with_clause("newtype_struct_return_positive", "(result.0) == (((var.0) * (2)) + (1))");
+    let captured = load("newtype_struct_return_positive_mutant");
+    assert_carriers_agree(&captured, "newtype_struct_return_positive_mutant");
+    let bodies = |f: &VerifiableFunction| {
+        f.contracts.iter().map(|c| (c.kind, c.body.clone())).collect::<Vec<_>>()
+    };
+    assert_eq!(bodies(&rebuilt), bodies(&captured), "contracts carrier");
+    assert_eq!(rebuilt.postconditions, captured.postconditions, "formula carrier");
+    assert_eq!(rebuilt.spec.ensures, captured.spec.ensures, "spec carrier");
+}
+
+/// Each false clause, through every carrier configuration a real function can
+/// arrive in: all three agreeing (what extraction writes), the FORMULA carrier
+/// alone (the lane `3539149e06` opened: `inferred_return_check_vcs` and public
+/// synthetic producers populate only `postconditions`), and the SOURCE carriers
+/// alone. None may prove. The formula-only lane is the one to watch: it is
+/// admitted through `machine_faithful_clause_admissible`, so its row must be the
+/// declared-width reading and must refute (or fall closed) exactly as the
+/// source-carried row does.
+///
+/// This is a PIN, not a born-red control, and it says so: on the real code it
+/// passes, and the Int-reading defect it would most naturally guard against
+/// should not flip these clauses, each being false over `Int` too (reasoned, not
+/// measured). The born-red control
+/// for the formula-only lane's Int reading is `3539149e06`'s own
+/// `result + 1 > result` pin in `contracts.rs`; the born-red control for the
+/// failure actually reported here is the attribution test below.
+#[test]
+fn the_false_clauses_prove_through_no_carrier() {
+    let mut bad = Vec::new();
+    for clause in MUST_NOT_PROVE {
+        let coherent = with_clause("newtype_struct_return_positive", clause);
+        let mut formula_only = coherent.clone();
+        formula_only.contracts.clear();
+        formula_only.spec.ensures.clear();
+        let mut source_only = coherent.clone();
+        source_only.postconditions.clear();
+        for (carrier, func) in [
+            ("all three", &coherent),
+            ("formula only", &formula_only),
+            ("source only", &source_only),
+        ] {
+            let rows = raw_postcondition_rows(func);
+            if all_proved(&rows) {
+                bad.push(format!("{clause} via {carrier}: {:?}", verdicts(&rows)));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "a false postcondition was proved: {bad:#?}");
+}
+
+/// THE CONFIGURATION THAT WAS READ AS A FALSE PROOF, built on purpose: the false
+/// clause in `contracts`, the ORIGINAL true clause (`result.0 == var.0 * 2`)
+/// still in `postconditions` and `spec.ensures`. The true clause's row may
+/// prove — it is true of this body — but its proof must never be ATTRIBUTED to
+/// the false clause, and the false clause's own row must not prove.
+///
+/// Attribution is `source_contract_index`, the field the compiler requires
+/// before a solved row may discharge a source-clause marker; nothing downstream
+/// re-derives it, so a vcgen that credited this row to clause 0 would turn a
+/// true proof into a verified FALSE contract. MEASURED both ways on 2026-09-26:
+/// with `unique_source_contract_index_for_formula` planted to credit the sole
+/// `Ensures` regardless of formula, this test FAILS on every clause below, while
+/// every other test in this file (the rebuilt [`with_clause`] states one clause
+/// in all carriers, so no second row exists) still passes; on the real code it
+/// passes.
+#[test]
+fn a_true_clause_in_another_carrier_is_never_credited_to_a_false_one() {
+    let mut bad = Vec::new();
+    for clause in MUST_NOT_PROVE {
+        let mut func = load("newtype_struct_return_positive");
+        func.contracts[0].body = format!("{LOWERED}{clause}");
+        let rows = raw_postcondition_rows(&func);
+        let outcomes = verdicts(&rows);
+        // NON-VACUITY: the stale true clause must actually be checked and proved
+        // here, or this test is not exercising the conflation at all.
+        assert!(
+            outcomes.iter().any(|r| matches!(r, VerificationResult::Proved { .. })),
+            "{clause}: the stale TRUE clause must still prove, or this test discriminates \
+             nothing: {outcomes:?}"
+        );
+        for (vc, outcome) in rows.iter().zip(&outcomes) {
+            if matches!(outcome, VerificationResult::Proved { .. }) && source_index(vc) == Some(0) {
+                bad.push(format!("{clause}: a proved row is credited to it: {:?}", vc.formula));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "a false postcondition was credited with a proof: {bad:#?}");
 }

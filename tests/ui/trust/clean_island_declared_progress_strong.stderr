@@ -1,0 +1,23 @@
+note: Clean island kernel-checked: 4 declaration(s) registered (Nest.go, Nest.finish, Nest.M, Nest.Finishes)
+  --> $DIR/clean_island_declared_progress_strong.rs:15:5
+   |
+LL | /     import Trust.Protocol
+LL | |
+LL | |     namespace Nest
+LL | |     open Trust.Protocol
+...  |
+LL | |     end Nest
+   | |____________^
+
+note: finite model `Nest.M` proved safe by the kernel: every reachable state satisfies every invariant (`trust_checked_safe.Nest.M : ScalarModel.safetyClaim Nest.M`, state budget 256)
+  --> $DIR/clean_island_declared_progress_strong.rs:25:5
+   |
+LL |     def M : Trust.Temporal.FiniteModel.ScalarModel :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: progress claim `Nest.Finishes` proved by the kernel: on every fair run of `Nest.M` the goal holds again and again (`trust_checked_live.Nest.Finishes : ScalarProgress.claim Nest.Finishes`, from a certificate of its 6 reachable states)
+  --> $DIR/clean_island_declared_progress_strong.rs:31:5
+   |
+LL |     def Finishes : Trust.Temporal.FiniteModel.ScalarProgress :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

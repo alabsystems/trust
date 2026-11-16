@@ -1,0 +1,34 @@
+TRUST_R1_TRACE: init: incomplete=0 address_taken=0 callers_keys=1 recursive=0 hidden=0
+TRUST_R1_TRACE: helper: found Failed VC kind='division by zero' loc=61:4 formula=$FORMULA freevars=$FREEVARS
+TRUST_R1_TRACE: helper: proposed P = Not(Eq(Var("divisor", Int), Int(0)))
+TRUST_R1_TRACE: helper: 1 recorded caller(s); params=["x", "divisor"]
+TRUST_R1_TRACE: helper: built 1 caller obligation(s) — minting sealed certificate
+TRUST_R1_TRACE: helper: ADMITTED FLIP (sealed $DIGEST)
+TRUST_R1_TRACE: stored flip key='t::helper' kind='division by zero' loc=61:4 file=Some("r1_budget_trip_mints_no_flip.rs")
+TRUST_R1_TRACE: main: not Total (is_public=true address_taken=false scan_incomplete=0)
+TRUST_R1_TRACE: apply_r1_flips: def_path='t::helper' has 1 flip(s); 1 result VC(s):
+TRUST_R1_TRACE:   result kind='division by zero' loc=61:4 file=Some("r1_budget_trip_mints_no_flip.rs") proved=false
+TRUST_R1_TRACE:     native key kind='division by zero' loc=61:4 file=Some("r1_budget_trip_mints_no_flip.rs")
+TRUST_R1_TRACE:   FLIP kind='division by zero' loc=61:4 file=Some("r1_budget_trip_mints_no_flip.rs")
+
+=== Trust Verification Report (t) ===
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/r1_budget_trip_mints_no_flip.rs:58:1
+   |
+LL | / fn helper(x: u32, divisor: u32) -> u32 {
+LL | |
+LL | |
+LL | |     x / divisor
+LL | | }
+   | |_^
+
+TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t::main'; stored keys=["t::helper"]
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/r1_budget_trip_mints_no_flip.rs:64:1
+   |
+LL | / fn main() {
+LL | |     let _ = helper(10, 5);
+LL | | }
+   | |_^
+

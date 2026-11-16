@@ -1,0 +1,17 @@
+# Known-red tests of `x.py test --stage 1 tests/run-make <trust dirs>` (the
+# trust run-make tests less the trust-cg subset the unit lane runs), judged by
+# scripts/land_gate.py (judge_suite, the run-make-trust leg): a failure NOT
+# listed here fails the leg, and a listed test that ran and PASSED fails it too
+# until its row is deleted. Rows are spelled as compiletest's failures list
+# prints them (`[run-make] tests/run-make/<dir>`), then two spaces, `#`, the
+# owner and the reason. EMPTY: any failure fails the leg.
+
+# MAIN-TIP-PREEXISTING-20261020: originally reproduced on
+# origin/main a3d0f921df24 (pre-port, bf9448e pin) in a scratch worktree.
+# The projection-field-struct-layout row is removed after the complete
+# source25 run (both Apple targets): that test now passes. Its assertions
+# remain unchanged, and any future failure must fail this leg.
+# The managed-store row is removed after actual compiler 86adf1c8dd passes
+# the unchanged three-compile recipe. Both solvers also retain eight ACCEPTs
+# on the third compile and identical cold/warm/off metadata. Its assertions
+# remain unchanged, and any future failure must fail this leg.

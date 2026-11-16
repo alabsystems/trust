@@ -128,8 +128,10 @@ awk -F '\t' '
 }
 : >"$TMP/rows"
 count=0
+JQ_DEF_PATH_OK='type == "object" and (.def_path | type == "string"'
+JQ_DEF_PATH_OK+=' and length > 0 and (test("[\\t\\r\\n]") | not))'
 for dump in "$DUMPS"/*.json; do
-  "$JQ" -e 'type == "object" and (.def_path | type == "string" and length > 0 and (test("[\\t\\r\\n]") | not))' \
+  "$JQ" -e "$JQ_DEF_PATH_OK" \
     "$dump" >/dev/null
   digest=$(sha256_file "$dump")
   def_path=$("$JQ" -r '.def_path' "$dump")
@@ -176,7 +178,7 @@ awk -F '\t' 'NF != 3 { exit 1 }' "$TMP/results.tsv" || {
 : >"$TMP/rows.after"
 count_after=0
 for dump in "$DUMPS"/*.json; do
-  "$JQ" -e 'type == "object" and (.def_path | type == "string" and length > 0 and (test("[\\t\\r\\n]") | not))' \
+  "$JQ" -e "$JQ_DEF_PATH_OK" \
     "$dump" >/dev/null
   digest=$(sha256_file "$dump")
   def_path=$("$JQ" -r '.def_path' "$dump")

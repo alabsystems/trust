@@ -1,6 +1,6 @@
 use rustc_abi::Integer;
 use rustc_const_eval::const_eval::mk_eval_cx_for_const_val;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet}; // Trust: correlated-branch-chain gate
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::interpret::Scalar; // Trust: for the simplify_switch_comparison rewrite
 use rustc_middle::mir::visit::{PlaceContext, Visitor}; // Trust: liveness check for the range fold
 use rustc_middle::mir::*;
@@ -9,6 +9,7 @@ use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{self, ScalarInt, Ty, TyCtxt};
 
 use super::simplify::simplify_cfg;
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 use crate::unreachable_prop::remove_successors_from_switch;
 
@@ -16,33 +17,44 @@ use crate::unreachable_prop::remove_successors_from_switch;
 pub(super) struct MatchBranchSimplification;
 
 impl<'tcx> crate::MirPass<'tcx> for MatchBranchSimplification {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
         // Enable only under -Zmir-opt-level=2 as this can make programs less debuggable.
-        sess.mir_opt_level() >= 2
+        PassPolicy::optional(ctx.mir_opt_level() >= 2)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        let typing_env = body.typing_env(tcx);
         // Trust: places that more than one `SwitchInt` in this body tests -- a correlated-branch
         // chain. `simplify_switch_comparison` must leave every switch in such a chain alone; see
         // the gate in that function for why. Computed once here rather than per candidate block:
         // the check is symmetric, so a predecessor/successor scan from inside the per-block loop
         // would depend on visit order and protect only one end of the pair.
-        let mut switch_discr_counts: FxHashMap<Place<'tcx>, u32> = FxHashMap::default();
+        let mut switch_bbs: smallvec::SmallVec<[BasicBlock; 8]> = smallvec::SmallVec::new();
+        let mut seen_places: smallvec::SmallVec<[(Place<'tcx>, u32); 8]> =
+            smallvec::SmallVec::new();
         for bb in body.basic_blocks.indices() {
             if let TerminatorKind::SwitchInt { discr, .. } =
                 &body.basic_blocks[bb].terminator().kind
-                && let Some(place) = discr.place()
             {
-                *switch_discr_counts.entry(place).or_insert(0) += 1;
+                switch_bbs.push(bb);
+                if let Some(place) = discr.place() {
+                    if let Some((_, count)) = seen_places.iter_mut().find(|(p, _)| *p == place) {
+                        *count += 1;
+                    } else {
+                        seen_places.push((place, 1));
+                    }
+                }
             }
         }
-        let correlated: FxHashSet<Place<'tcx>> = switch_discr_counts
+        if switch_bbs.is_empty() {
+            return;
+        }
+        let correlated: smallvec::SmallVec<[Place<'tcx>; 4]> = seen_places
             .into_iter()
             .filter_map(|(place, n)| (n > 1).then_some(place))
             .collect();
+        let typing_env = body.typing_env(tcx);
         let mut changed = false;
-        for bb in body.basic_blocks.indices() {
+        for bb in switch_bbs {
             // Trust: arms that unify collapse via `simplify_match`; a switch whose arms
             // cannot unify (unequal bodies) but whose *condition* is a single value or a
             // contiguous range is rewritten to the comparison shape if/else produces.
@@ -59,10 +71,6 @@ impl<'tcx> crate::MirPass<'tcx> for MatchBranchSimplification {
             simplify_cfg(tcx, body);
         }
     }
-
-    fn is_required(&self) -> bool {
-        false
-    }
 }
 
 struct SimplifyMatch<'tcx, 'a> {
@@ -74,6 +82,7 @@ struct SimplifyMatch<'tcx, 'a> {
     discr: &'a Operand<'tcx>,
     discr_local: Option<Local>,
     discr_ty: Ty<'tcx>,
+    borrowed_locals: Option<DenseBitSet<Local>>,
 }
 
 impl<'tcx, 'a> SimplifyMatch<'tcx, 'a> {
@@ -93,9 +102,10 @@ impl<'tcx, 'a> SimplifyMatch<'tcx, 'a> {
         otherwise: Option<&ConstOperand<'tcx>>,
     ) -> Option<StatementKind<'tcx>> {
         let (_, first_const, mut others) = split_first_case(consts, otherwise);
-        let first_scalar_int = first_const.const_.try_eval_scalar_int(self.tcx, self.typing_env)?;
+        let first_value =
+            first_const.const_.eval(self.tcx, self.typing_env, first_const.span).ok()?;
         if others.all(|const_| {
-            const_.const_.try_eval_scalar_int(self.tcx, self.typing_env) == Some(first_scalar_int)
+            const_.const_.eval(self.tcx, self.typing_env, const_.span).ok() == Some(first_value)
         }) {
             Some(StatementKind::Assign(Box::new((
                 dest,
@@ -258,7 +268,7 @@ impl<'tcx, 'a> SimplifyMatch<'tcx, 'a> {
     /// ```
     /// This will simplify into a copy statement.
     fn unify_by_copy(
-        &self,
+        &mut self,
         dest: Place<'tcx>,
         rvals: &[(u128, &Rvalue<'tcx>)],
     ) -> Option<StatementKind<'tcx>> {
@@ -287,6 +297,20 @@ impl<'tcx, 'a> SimplifyMatch<'tcx, 'a> {
         let ty::Adt(def, _) = dest_ty.ty.kind() else {
             return None;
         };
+
+        if copy_src_place.is_indirect() {
+            // If the src place is indirect, only permit generating the copy when the dest place is
+            // never borrowed.
+            let borrowed_locals = self
+                .borrowed_locals
+                .get_or_insert_with(|| rustc_mir_dataflow::impls::borrowed_locals(self.body));
+            if borrowed_locals.contains(dest.local) {
+                return None;
+            }
+        } else if copy_src_place.local == dest.local {
+            // Also forbid the case where the source and dest are fields of the same local
+            return None;
+        }
 
         for &(case, rvalue) in rvals.iter() {
             match rvalue {
@@ -378,7 +402,7 @@ fn simplify_switch_comparison<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &mut Body<'tcx>,
     switch_bb: BasicBlock,
-    correlated: &FxHashSet<Place<'tcx>>,
+    correlated: &[Place<'tcx>],
 ) -> bool {
     let TerminatorKind::SwitchInt { discr, targets } =
         &body.basic_blocks[switch_bb].terminator().kind
@@ -455,7 +479,7 @@ fn simplify_switch_comparison<'tcx>(
         ),
     }));
 
-    let mut patch = MirPatch::new(body);
+    let mut patch = MirPatch::new_without_block_cache(body);
     let eq = patch.new_temp(tcx.types.bool, span);
     let loc = Location {
         block: switch_bb,
@@ -502,6 +526,16 @@ fn switch_zero_otherwise(targets: &SwitchTargets) -> Option<(BasicBlock, BasicBl
 /// (`mid` becomes unreachable and is removed by the trailing `simplify_cfg`). Sound because the
 /// wrapping `x - lo` maps every out-of-range `x` (below `lo` OR above `hi`) above `hi - lo` for an
 /// unsigned type, so the single `Le` reproduces both bounds.
+///
+/// Trust (RANGE-FOLD-MID-DEF-1, 2026-10-11): the fold is only applied when `_c2` is mentioned
+/// nowhere except `mid`'s own definition and terminator. Jumping from bb0 straight to `in` (or to
+/// `out`) skips `mid`, so on those paths `_c2 = Le(copy x, const hi)` no longer runs: the
+/// in-range path no longer writes `true`, and the `x > hi` path no longer writes `false`. The
+/// test's result is fully reproduced by `_cmp`, but `_c2` *the local* is not: `_c2` can be a user
+/// variable read after the join (`b = x <= 20; if let true = b {..}; b`), or a match temp that GVN
+/// reused for a later identical comparison. A later read then saw a stale or uninitialized value
+/// and safe code returned wrong results at every `-O` (LLVM folds the undef to a constant). When
+/// `_c2` is mentioned anywhere else, the two-block test is kept as it is.
 ///
 /// Trust: `_c1`'s defining statement may only be dropped when nothing else reads `_c1`. It is NOT
 /// always a single-use temp: `GVN` runs before this pass and CSEs identical comparisons, so a
@@ -568,6 +602,18 @@ fn simplify_range_comparison<'tcx>(
         if c2_dest.as_local() != Some(c2_local) {
             return false;
         }
+        // Trust (RANGE-FOLD-MID-DEF-1, 2026-10-11): the rewrite skips `mid`, so no path out of
+        // bb0 assigns `_c2` any more: the in-range path lost `_c2 = true` and the `x > hi` path
+        // lost `_c2 = false`. That is only sound when nothing but `mid` itself mentions `_c2`.
+        // `mid` holds exactly one statement (checked above), so `(mid, 0)` is `_c2`'s definition
+        // and `(mid, 1)` is `mid`'s terminator: precisely the two locations `local_read_outside`
+        // exempts. Any other mention -- a user variable read after the join, a GVN-reused match
+        // temp, an earlier write, a storage marker, a `debug` binding, or `_c2` being `_c1` --
+        // keeps the two-block test (fail-closed). `mid` itself is left untouched, so other
+        // predecessors still see its definition.
+        if local_read_outside(body, c2_local, mid, 0) {
+            return false;
+        }
         let Rvalue::BinaryOp(BinOp::Le, ops2) = c2_rvalue else { return false };
         let Operand::Copy(discr2) = &ops2.0 else { return false };
         if *discr2 != discr {
@@ -631,13 +677,25 @@ fn simplify_range_comparison<'tcx>(
     true
 }
 
-/// Trust: does `local` appear anywhere in `body` other than at the two locations
-/// `simplify_range_comparison` is about to rewrite — the `_c1 = Le(const lo, copy x)` statement at
-/// `(def_block, def_stmt)` and `def_block`'s terminator, which immediately follows it?
+/// Trust: does `local` appear anywhere in `body` other than at the statement
+/// `(def_block, def_stmt)` and the location one index past it? `simplify_range_comparison` asks
+/// this for both comparison temps, where the def statement is the block's LAST statement, so the
+/// next index is the block's terminator:
+/// * `_c1`: the `_c1 = Le(const lo, copy x)` statement in bb0 and bb0's terminator, which the fold
+///   replaces -- may that definition be deleted?
+/// * `_c2` (RANGE-FOLD-MID-DEF-1, 2026-10-11): `mid`'s only statement `_c2 = Le(copy x, const hi)`
+///   at `(mid, 0)` and `mid`'s terminator at `(mid, 1)`, which the fold routes around -- may the
+///   paths out of bb0 stop assigning `_c2`?
+///
+/// Every mention counts, whatever its `PlaceContext`: reads, writes, storage markers, and
+/// debuginfo. The body's `var_debug_info` is visited at `Location::START`, i.e. `(START_BLOCK, 0)`;
+/// for `_c2` that is never exempt, because `mid` is a successor of bb0 and the start block has no
+/// predecessors. (Debuginfo attached to the exempt statement or terminator is exempt with it; it
+/// describes that block only, never what later code reads.)
 ///
 /// Deliberately a whole-body scan rather than a dominance or liveness query: MIR locals are not in
 /// SSA form, so "is this local read anywhere else" is the only question that makes the statement
-/// safe to delete, and it is the cheap one.
+/// safe to delete (or skip), and it is the cheap one.
 fn local_read_outside<'tcx>(
     body: &Body<'tcx>,
     local: Local,
@@ -710,12 +768,13 @@ fn simplify_match<'tcx>(
     let mut simplify_match = SimplifyMatch {
         tcx,
         typing_env,
-        patch: MirPatch::new(body),
+        patch: MirPatch::new_without_block_cache(body),
         body,
         switch_bb,
         discr,
         discr_local: None,
         discr_ty: discr.ty(body.local_decls(), tcx),
+        borrowed_locals: None,
     };
     let reachable_cases: Vec<_> =
         targets.iter().filter(|&(_, bb)| !body.basic_blocks[bb].is_empty_unreachable()).collect();

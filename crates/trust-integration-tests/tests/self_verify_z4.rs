@@ -12,7 +12,7 @@
 
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
-use trust_integration_tests::ay_test_support::{ay_available, require_ay};
+use trust_integration_tests::ay_test_support::require_ay;
 use trust_router::{IncrementalAYSession, VerificationBackend};
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Projection,
@@ -163,6 +163,7 @@ fn build_bcp_propagation_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -315,6 +316,7 @@ fn build_clause_arena_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -463,6 +465,7 @@ fn build_lrat_checker_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -882,10 +885,6 @@ fn verify_with_real_ay(
 
 #[test]
 fn test_ay_sv1_bcp_real_smtlib() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
     let func = build_bcp_propagation_model();
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -927,10 +926,6 @@ fn test_ay_sv1_bcp_real_smtlib() {
 
 #[test]
 fn test_ay_sv2_clause_arena_real_smtlib() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
     let func = build_clause_arena_model();
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -965,10 +960,6 @@ fn test_ay_sv2_clause_arena_real_smtlib() {
 
 #[test]
 fn test_ay_sv3_lrat_checker_real_smtlib() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
     let func = build_lrat_checker_model();
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -1003,10 +994,6 @@ fn test_ay_sv3_lrat_checker_real_smtlib() {
 
 #[test]
 fn test_ay_self_verify_full_suite_real_smtlib() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
 
     let models = vec![

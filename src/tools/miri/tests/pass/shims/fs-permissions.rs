@@ -1,6 +1,7 @@
 //@compile-flags: -Zmiri-disable-isolation
 //@ignore-target: windows # shim not supported
 //@ignore-host: windows # needs unix PermissionExt
+//@run-native
 
 use std::fs::{self, File};
 
@@ -22,8 +23,7 @@ fn main() {
 }
 
 fn chmod_works() {
-    let tmpdir = utils::tmp();
-    let file = tmpdir.join("miri_test_fs_set_permissions.txt");
+    let file = utils::prepare("miri_test_fs_set_permissions.txt");
 
     check!(File::create(&file));
     let attr = check!(fs::metadata(&file));
@@ -34,7 +34,7 @@ fn chmod_works() {
     let attr = check!(fs::metadata(&file));
     assert!(attr.permissions().readonly());
 
-    match fs::set_permissions(&tmpdir.join("foo"), p.clone()) {
+    match fs::set_permissions(&file.with_file_name("foo"), p.clone()) {
         Ok(..) => panic!("wanted an error"),
         Err(..) => {}
     }
@@ -44,8 +44,7 @@ fn chmod_works() {
 }
 
 fn fchmod_works() {
-    let tmpdir = utils::tmp();
-    let path = tmpdir.join("miri_test_file_set_permissions.txt");
+    let path = utils::prepare("miri_test_file_set_permissions.txt");
 
     let file = check!(File::create(&path));
     let attr = check!(fs::metadata(&path));

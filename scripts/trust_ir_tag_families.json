@@ -45,6 +45,11 @@
    "path": "crates/trust-mir-extract/src/lib.rs",
    "rules": ["R5"],
    "role": "MIR-side dyn principal/assoc-binding refusals reached via .ok_or(TAG)"
+  },
+  {
+   "path": "crates/trust-thir-lower/src/refusal_ledger.rs",
+   "rules": ["R1", "R4"],
+   "role": "the refusal ledger: the one tag a refused rollback records (Rollback(...))"
   }
  ],
  "scan_rules": {
@@ -64,13 +69,15 @@
   "FuncId(0)": "crate_module.rs test assertions (wave-CO clean-origin-link error-content checks, e.g. `error.contains(\"FuncId(0)\")` / `missing FuncId(0)` / `bodyless FuncId(0)`) and a lib.rs test comment — a dense function-id rendering inside diagnostic/test strings, not a refusal tag the producer emits",
   "FuncId(1)": "crate_module.rs test assertion (wave-CO clean-origin-link error-content check `error.contains(\"FuncId(1)\")`) — a dense function-id rendering inside a test string, not a refusal tag the producer emits",
   "Some(agg)": "lib.rs:30954 — a test asserting on generated source text, not an emission site",
+  "Some(b) => v.template_verdict(index).map(|t| t.conserved())": "lib.rs no_codegen_or_admission_path_reads_a_template — the positive control's sample source line passed to template_reads, a scanned spelling inside a test string, not an emission site",
   "FuncId(0)": "crate_module.rs final_validator_rejects_duplicate_function_names — a Debug-rendered id inside an error.contains assertion on the [DuplicateFunctionName] validator message, not an emission site",
   "FuncId(1)": "crate_module.rs final_validator_rejects_duplicate_function_names — the second Debug-rendered id in the same error.contains assertion",
   "AcqRel": "model.rs `fn name` — an atomic ordering name, not a refusal tag",
   "Acquire": "model.rs `fn name` — an atomic ordering name",
   "Relaxed": "model.rs `fn name` — an atomic ordering name",
   "Release": "model.rs `fn name` — an atomic ordering name",
-  "SeqCst": "model.rs `fn name` — an atomic ordering name"
+  "SeqCst": "model.rs `fn name` — an atomic ordering name",
+  "Some(b) => v.template_verdict(index).map(|t| t.conserved())": "lib.rs no_codegen_or_admission_path_reads_a_template (INC6.5-NO-AUTHORITY) — the positive control's input to `template_reads`, a source-text scanner under test, not an emission site"
  },
  "families": {
   "PATTERN": {
@@ -165,6 +172,7 @@
   "Call": "CALL",
   "Callee": "CALL",
   "Reify": "CALL",
+  "Splice": "CALL",
 
   "Ty": "TY",
 
@@ -216,6 +224,9 @@
   "Return": "CONTROL",
 
   "SourceProvenance": "PRODUCER-INTERNAL",
+  "FailClosed": "PRODUCER-INTERNAL",
+  "Rollback": "PRODUCER-INTERNAL",
+  "ModuleTableRefused": "PRODUCER-INTERNAL",
   "Global": "PRODUCER-INTERNAL",
   "FnPtr": "PRODUCER-INTERNAL",
 
@@ -240,15 +251,22 @@
  "tag_overrides": {
   "Coercion(closure→fn-ptr adapter)": "CLOSURE",
   "Coercion(adapter flush desync)": "PRODUCER-INTERNAL",
+  "Call(argument sealed a stub without a tag)": "PRODUCER-INTERNAL",
+  "StaticGlobal(identity conflict)": "PRODUCER-INTERNAL",
   "Call(closure env unsupported)": "CLOSURE",
   "Call(closure call)": "CLOSURE",
-  "Call(closure untuple unsupported)": "CLOSURE"
+  "Call(closure untuple unsupported)": "CLOSURE",
+  "Template(unsupported source ABI)": "CALL",
+  "BodyHeader(unsupported source ABI or missing body)": "CALL",
+  "PrimitiveHome(storage type changed)": "MEMORY"
  },
  "not_in_scope": {
   "crates/trust-thir-lower/src/to_mir.rs": "The SHIM's `unsup(\"...\")` refusals (Call(ledger identity tripwire), Call(site args arity tripwire), Call(ambiguous callee FuncId: index collision), ...) are the trust-ir->MIR flip channel, not the producer's `unsupported` tags. They never appear in a coverage row's `reasons`, so they are deliberately NOT scan roots. Three of them were mistakenly added as overrides while this map was being written; the stale-entry check caught all three in the first run.",
   "crates/trust-thir-lower/src/flip_registry.rs": "flip eligibility, same channel as to_mir.rs"
  },
  "boundary_notes": [
+  "FailClosed, Rollback and `Call(argument sealed a stub without a tag)` -> PRODUCER-INTERNAL (added 2026-09-29 for F1, the refusal ledger). None of them is a coverage lane: `Rollback(failed attempt left IR behind)` is recorded when a lowering lane tried to discard a failed attempt's tags although that attempt left IR that means something (a seal, a store, a call) in the function -- the attempt's own tags stay and this names the rollback; `FailClosed(stub seal lost its tag)` / `FailClosed(untagged stub)` and the Call-headed tripwire fire only if a fail-closed Unreachable stub reached finalization, or a sealed call argument, with no refusal on record, which the ledger makes impossible by construction. A nonzero count of any of them is a producer defect, which is exactly this family's definition. The Call-headed one is an override rather than a head rule so the CALL head keeps every coverage tag it owns.",
+  "Splice -> CALL (added 2026-09-27). 881a7e964a named every refusal to splice an already-lowered body into the crate module (`splice_refusal` in crate_module.rs, carried on coverage rows as `splice_refusal`), which made `Splice(...)` a new head with 37 tags and left fast.trust-ir-tag-families red on main. CALL's definition owns 'the crate-seam linking that defers a body', and a splice refusal is that seam refusing. A few of the tags are assembler invariants rather than seam capability (`Splice(remap certificate)`, `Splice(def table cycle or dangling reference)`, `Splice(prepared body missing)`); they stay in CALL until the detail channel (see pending_dependencies) can split the head, because moving them by name now would rank PRODUCER-INTERNAL off three unmeasured tags.",
   "EnumMatch -> PATTERN, not ENUM. The tag is emitted by the match-lowering path (`lower_enum_match`), and a slice that moves it is match-lowering work. Reading it as ENUM (B3) instead moves 13 tags; the report's per-head table inside PATTERN prints exactly what that would cost, so the alternative is recomputable rather than arguable. This single call is the largest single source of the 107/164/197 pattern-sole spread.",
   "Field/Index -> MEMORY, not AGGREGATE. B4's delta item (2) is literally 'typed projections [Field(idx), Index(v), Downcast(variant)]', so a projection refusal is inside B4's scope. AGGREGATE keeps only CONSTRUCTION.",
   "StaticRef/ThreadLocalRef -> CONST, not MEMORY. wave-SR2 established that static reads are PLACES, which argues for MEMORY; the tags themselves are about admitting static DATA (initializer not scalar, mutable, interior-mutable, foreign), which is CONST work. Moving them costs the printed StaticRef/ThreadLocalRef rows in CONST.",

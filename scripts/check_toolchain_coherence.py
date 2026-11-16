@@ -202,7 +202,24 @@ def check_stage0_bin_surface(root: Path) -> list[str]:
     # forbids `rustdoc` outright, which is why the carve-out is derived here
     # rather than removed from the authority. Keep the Rust release detector and
     # shell front doors on exactly that derived inventory.
-    stage2_forbidden_bins = forbidden_bins - {"trust-miri", "targo-miri", "rustdoc"}
+    stage2_optional_bins = {"trust-miri", "targo-miri"}
+    stage2_forbidden_bins = forbidden_bins - stage2_optional_bins - {"rustdoc"}
+    # The recreator's stage tool audit admits exactly these optional tools beside
+    # its required producers; a different set there either fails a complete
+    # stage2 after its build (2026-09-30: "unmapped public stage tools:
+    # targo-miri, trust-miri") or admits a forbidden name.
+    recreate = (root / "scripts/recreate_bootstrap.py").read_text(encoding="utf-8")
+    recreate_optional = _dict_keys(recreate, "OPTIONAL_STAGE_TOOL_PRODUCERS")
+    if recreate_optional is None:
+        errors.append("stage0: could not parse recreate_bootstrap.py:OPTIONAL_STAGE_TOOL_PRODUCERS")
+    else:
+        _report_surface_difference(
+            errors,
+            "recreate_bootstrap.py:OPTIONAL_STAGE_TOOL_PRODUCERS",
+            "derived complete-stage2 optional bin surface",
+            stage2_optional_bins,
+            recreate_optional,
+        )
     stage2_forbidden_mirrors = (
         (
             "scripts/lib/trust_toolchain_surface.sh:TRUST_TOOLCHAIN_FORBIDDEN_PUBLIC_BINS",
@@ -305,9 +322,22 @@ def check_stage0_bin_surface(root: Path) -> list[str]:
 
 def _scripts_z_flags(root: Path) -> dict[str, list[str]]:
     """Map each `-Z trust-*` flag token -> the script files that use it (in a command,
-    not a comment). Skips obvious doc/comment lines."""
+    not a comment). Skips obvious doc/comment lines.
+
+    BOTH spellings, and the space is optional on purpose. `-Z` takes its value
+    joined (`-Ztrust-dump=...`) or separated (`-Z trust-dump=...`), and this repo
+    writes the JOINED form 5x more often (measured 2026-09-27 over scripts/: 307
+    joined vs 60 separated). A `\\s+` here saw 7 of the 20 flags scripts actually
+    pass -- `-Ztrust-dump` (16 files), the whole `-Ztrust-cg-*` and
+    `-Ztrust-verify-{level,session,timeout-ms}` families, and the rest were
+    invisible, so the check this gate advertises ("every `-Z trust-*` flag used in
+    scripts/ still present in the source option table") was green on a third of
+    the surface and could not report a renamed flag in the other two thirds.
+    The trailing `[a-z0-9]` requires the token to end in a name character, which
+    drops the shell case-glob `-Ztrust-*` (create_local_genesis_stage0.py) rather
+    than reporting `trust-` as a removed flag."""
     flags: dict[str, list[str]] = {}
-    flag_re = re.compile(r"-Z\s+(trust[a-z0-9-]*)")
+    flag_re = re.compile(r"-Z\s*(trust[a-z0-9-]*[a-z0-9])")
     for sub in ("scripts",):
         for p in sorted((root / sub).rglob("*")):
             if p.suffix not in (".sh", ".py") or not p.is_file():
@@ -320,6 +350,8 @@ def _scripts_z_flags(root: Path) -> dict[str, list[str]]:
                 if stripped.startswith(("#", "//", "*", "│")):
                     continue
                 for flag in flag_re.findall(line):
+                    if flag in ("trust", "trust-"):
+                        continue
                     flags.setdefault(flag, [])
                     rel = str(p.relative_to(root))
                     if rel not in flags[flag]:
@@ -429,23 +461,64 @@ def check_z_flag_surface(root: Path, trustc: Path) -> tuple[list[str], list[str]
     return errors, notes
 
 
-def _find_targo(root: Path, trustc: Path) -> Path | None:
-    """A targo/cargo binary to run `metadata` with: prefer the stage2 build next to
-    the configured trustc, then any stage0 genesis targo, then PATH."""
+def _find_targos(root: Path, trustc: Path) -> list[Path]:
+    """Every targo binary that could run `metadata`, in preference order:
+    the stage2 build next to the configured trustc, then any stage0 genesis
+    targo, then the other build stages, then `targo` on PATH. A PATH `cargo` is
+    never a candidate: in aterm it is the reroute
+    stub (exit 127), elsewhere rustup's default, usually stock.
+
+    A LIST, not the first hit: a targo older than a manifest key the tree now
+    uses refuses that manifest with `unknown field ...` — the 2026-09-10 note
+    below — and on 2026-09-16 the same thing recurred INSIDE the build tree
+    (a Sep-1 stage2 beside a tree whose `first-party/ty` manifest carries
+    `compiler_timeout_secs`, while the freshly built stage1 loads it). A stale
+    toolchain is a NOTE the flag check already prints; only a manifest that no
+    candidate loads is a manifest defect."""
     candidates: list[Path] = [trustc.parent / "targo"]
+    # scripts/create_local_genesis_stage0.py writes its adapter to
+    # build/<host>/genesis-stage0 ON PURPOSE (bootstrap.py wipes build/<host>/stage0
+    # on any stage0 pin-date advance), and bootstrap.toml points `cargo` at it, so
+    # `targo metadata` there IS the command `./x.py build` runs on such a machine.
+    # Without this glob the search fell through to whatever `targo` PATH carried —
+    # measured 2026-09-10: an atpkg store targo two weeks older than targo-trust's
+    # `[trust] compiler_timeout_secs`, which then refused first-party/ty's manifest
+    # and reported a drift the build itself would never see.
+    # GENESIS ADAPTER (developer adapter, never release evidence; its retirement
+    # is decided separately): this `targo` wraps a host Rust, and it is kept only
+    # because it IS what `./x.py build` runs on a genesis-seeded machine.
+    candidates += sorted(root.glob("build/*/genesis-stage0/bin/targo"))
     candidates += sorted(root.glob("build/*/stage0/bin/targo"))
     candidates += sorted(root.glob("build/host/stage*/bin/targo"))
+    found = shutil.which("targo")
+    if found:
+        candidates.append(Path(found))
+    seen: set[Path] = set()
+    usable: list[Path] = []
     for c in candidates:
         if c.exists() and os.access(c, os.X_OK):
-            return c
-    for name in ("targo", "cargo"):
-        found = shutil.which(name)
-        if found:
-            return Path(found)
-    return None
+            key = c.resolve()
+            if key not in seen:
+                seen.add(key)
+                usable.append(c)
+    return usable
 
 
-def check_workspace_manifests_load(root: Path, targo: Path | None) -> tuple[list[str], list[str]]:
+def _find_targo(root: Path, trustc: Path) -> Path | None:
+    """The single preferred candidate (kept for callers that want one binary)."""
+    found = _find_targos(root, trustc)
+    return found[0] if found else None
+
+
+def _is_schema_age_failure(lines: list[str]) -> bool:
+    """A manifest refusal that names a KEY the binary does not know is the binary
+    predating the tree, not the tree being broken."""
+    return any("unknown field" in ln for ln in lines)
+
+
+def check_workspace_manifests_load(
+    root: Path, targos: "Path | list[Path] | None"
+) -> tuple[list[str], list[str]]:
     """`targo metadata --no-deps` must load every workspace member manifest.
 
     This is the EXACT command bootstrap runs (src/core/metadata.rs). It fails when a
@@ -461,46 +534,164 @@ def check_workspace_manifests_load(root: Path, targo: Path | None) -> tuple[list
     """
     errors: list[str] = []
     notes: list[str] = []
-    if targo is None:
+    if targos is None:
+        candidates: list[Path] = []
+    elif isinstance(targos, Path):
+        candidates = [targos]
+    else:
+        candidates = list(targos)
+    if not candidates:
         notes.append(
-            "manifests: no targo/cargo on PATH or in build/ -- skipped the "
+            "manifests: no targo on PATH or in build/ -- skipped the "
             "`metadata` manifest-load probe (build the toolchain to enable)"
         )
         return errors, notes
     env = dict(os.environ, RUSTC_BOOTSTRAP="1")
-    for manifest in ("Cargo.toml", "crates/Cargo.toml", "targo-trust/Cargo.toml"):
+    for manifest in ("Cargo.toml", "targo-trust/Cargo.toml"):
         mpath = root / manifest
         if not mpath.exists():
             continue
-        try:
-            r = subprocess.run(
-                [str(targo), "metadata", "--no-deps", "--format-version", "1",
-                 "--manifest-path", str(mpath)],
-                env=env, capture_output=True, text=True, timeout=180, cwd=str(root),
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            notes.append(f"manifests: could not run `metadata` for {manifest}: {exc}")
-            continue
-        if r.returncode != 0:
+        # Try every candidate in preference order. The FIRST that loads the
+        # manifests settles the question the probe asks (can the resolver load
+        # them); a candidate that fails only because it predates a manifest key
+        # is a stale-toolchain NOTE, never a manifest drift. A drift is reported
+        # only when NO candidate loads them, with the most specific detail seen.
+        loaded_by: Path | None = None
+        stale: list[str] = []
+        real_failures: list[str] = []
+        for targo in candidates:
+            try:
+                r = subprocess.run(
+                    [str(targo), "metadata", "--no-deps", "--format-version", "1",
+                     "--manifest-path", str(mpath)],
+                    env=env, capture_output=True, text=True, timeout=180, cwd=str(root),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                real_failures.append(f"{targo}: could not run `metadata`: {exc}")
+                continue
+            if r.returncode == 0:
+                loaded_by = targo
+                break
             lines = [ln.strip() for ln in (r.stdout + r.stderr).splitlines() if ln.strip()]
             detail = next(
                 (ln for ln in lines if "inherit" in ln or "failed to load" in ln),
                 next((ln for ln in lines if ln.lower().startswith("error")), lines[-1] if lines else "metadata failed"),
             )
+            if _is_schema_age_failure(lines):
+                key = next((ln for ln in lines if "unknown field" in ln), detail)
+                stale.append(f"{targo}: {key}")
+            else:
+                real_failures.append(f"{targo} (exit {r.returncode}): {detail}")
+        if loaded_by is not None:
+            if stale:
+                notes.append(
+                    f"manifests: {manifest} loads with {loaded_by}; "
+                    f"{len(stale)} older candidate(s) predate a manifest key the tree uses "
+                    f"and were skipped ({'; '.join(stale)}) -- rebuild or re-seal that "
+                    f"toolchain before treating its behavior as evidence"
+                )
+            continue
+        if real_failures:
             errors.append(
-                f"manifests: `targo metadata --no-deps` failed for {manifest} "
-                f"(exit {r.returncode}): {detail} -- a workspace member manifest does not "
+                f"manifests: `targo metadata --no-deps` failed for {manifest} with every "
+                f"candidate: {'; '.join(real_failures)} -- a workspace member manifest does not "
                 f"load (e.g. a `{{ workspace = true }}` dep missing from "
                 f"[workspace.dependencies]); `./x.py build` fails the same way on a fresh checkout"
             )
+        else:
+            errors.append(
+                f"manifests: no candidate targo could load {manifest} -- every one predates "
+                f"a manifest key the tree uses ({'; '.join(stale)}); build a current stage "
+                f"(`./x.py build --stage 1`) so the probe has a toolchain that matches the tree"
+            )
     return errors, notes
+
+
+_SELFTEST_OPTIONS_RS = """\
+// A miniature stand-in for compiler/rustc_session/src/options.rs.
+options! {
+    trust_verify: bool = (false, parse_bool, [TRACKED],
+        "verify (default: no)"),
+    trust_dump: TrustDump = (TrustDump::default(), parse_trust_dump, [TRACKED],
+        "publish one artifact"),
+}
+"""
+
+_SELFTEST_SCRIPT_SH = """\
+#!/bin/sh
+# -Ztrust-bogus-in-a-comment=on   <- prose, not a command line
+trustc -Ztrust-verify=on probe.rs          # declared, joined
+trustc -Z trust-dump=mir:/tmp/d probe.rs   # declared, separated
+trustc -Ztrust-bogus-joined=on probe.rs    # UNDECLARED, joined
+trustc -Z trust-bogus-spaced=on probe.rs   # UNDECLARED, separated
+case "$flag" in -Ztrust-*) ;; esac         # a glob, not a flag name
+"""
+
+
+def selftest() -> int:
+    """Prove the -Z flag check FIRES, in BOTH spellings.
+
+    From the tripwire's first commit until 2026-09-27 it could not: the scanner
+    required a space after `-Z`, so the joined `-Ztrust-*` form -- the one this repo
+    writes 5x more often -- was invisible, and the gate printed OK while seeing 7 of
+    20 flags. Renaming `trust_dump` in the option table, which 16 scripts pass as
+    `-Ztrust-dump=...`, produced no drift at all. A guard nobody has watched fail is
+    a guard nobody has, so plant the mutation here in BOTH spellings.
+    """
+    cases: list[tuple[str, bool]] = []
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "scripts").mkdir()
+        (root / "scripts/probe_lane.sh").write_text(_SELFTEST_SCRIPT_SH, encoding="utf-8")
+        (root / "compiler/rustc_session/src").mkdir(parents=True)
+        (root / "compiler/rustc_session/src/options.rs").write_text(
+            _SELFTEST_OPTIONS_RS, encoding="utf-8"
+        )
+
+        found = _scripts_z_flags(root)
+        errors, _notes = check_z_flag_surface(root, root / "no-such-trustc")
+        blob = "\n".join(errors)
+
+        cases.append(("an UNDECLARED joined `-Ztrust-...` flag is reported",
+                      "`-Z trust-bogus-joined`" in blob))
+        cases.append(("an UNDECLARED separated `-Z trust-...` flag is reported",
+                      "`-Z trust-bogus-spaced`" in blob))
+        cases.append(("the reporting names the script that passes it",
+                      all("scripts/probe_lane.sh" in e for e in errors)))
+        cases.append(("a declared joined flag is NOT reported",
+                      "trust-verify`" not in blob and "trust-verify=" not in blob))
+        cases.append(("a declared separated flag is NOT reported",
+                      "trust-dump" not in blob))
+        cases.append(("both spellings reach the scanned set",
+                      {"trust-verify", "trust-dump", "trust-bogus-joined",
+                       "trust-bogus-spaced"} <= set(found)))
+        cases.append(("a commented-out flag is not scanned",
+                      "trust-bogus-in-a-comment" not in found and
+                      "trust-bogus-in-a-comment" not in blob))
+        cases.append(("the `-Ztrust-*` shell glob yields no phantom flag",
+                      not any(f in found for f in ("trust", "trust-"))))
+        cases.append(("exactly the two planted flags are reported",
+                      len(errors) == 2))
+
+    bad = [name for name, ok in cases if not ok]
+    for name, ok in cases:
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}")
+    if bad:
+        print(f"check_toolchain_coherence --selftest: FAIL ({len(bad)})", file=sys.stderr)
+        return 1
+    print(f"check_toolchain_coherence --selftest: OK ({len(cases)} cases)")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--trustc", default=None, help="path to trustc (default: build/host/stage2/bin/trustc)")
     p.add_argument("--strict", action="store_true", help="treat skipped checks (exit 2) as failures")
+    p.add_argument("--selftest", action="store_true",
+                   help="prove the -Z flag check fires in both spellings, on a synthetic tree")
     args = p.parse_args(argv)
+    if args.selftest:
+        return selftest()
     root = repo_root()
     trustc = Path(args.trustc) if args.trustc else root / "build/host/stage2/bin/trustc"
 
@@ -512,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
     fe, fn = check_z_flag_surface(root, trustc)
     errors += fe
     notes += fn
-    me, mn = check_workspace_manifests_load(root, _find_targo(root, trustc))
+    me, mn = check_workspace_manifests_load(root, _find_targos(root, trustc))
     errors += me
     notes += mn
 

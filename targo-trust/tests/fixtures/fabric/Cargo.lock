@@ -109,8 +109,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ay"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-allsat",
  "ay-chc",
@@ -129,8 +129,8 @@ dependencies = [
 
 [[package]]
 name = "ay-allsat"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-sat",
  "tracing",
@@ -138,30 +138,48 @@ dependencies = [
 
 [[package]]
 name = "ay-arrays"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "num-bigint 0.4.8",
+ "thiserror",
  "tracing",
 ]
 
 [[package]]
 name = "ay-bv"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
+ "ay-arrays",
  "ay-core",
  "ay-sys",
  "num-bigint 0.4.8",
  "stacker",
+ "thiserror",
  "tracing",
 ]
 
 [[package]]
+name = "ay-cdclt"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
+dependencies = [
+ "ay-core",
+ "ay-diff-logic",
+ "ay-lra",
+ "ay-sat",
+ "num-bigint 0.4.8",
+ "num-integer 0.1.47",
+ "num-rational",
+ "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "ay-chc"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -169,9 +187,12 @@ dependencies = [
  "ay-dispatch",
  "ay-dpll",
  "ay-euf",
+ "ay-fp",
  "ay-frontend",
  "ay-jit",
  "ay-lia",
+ "ay-lra",
+ "ay-model-check",
  "ay-sat",
  "ay-sys",
  "num-bigint 0.4.8",
@@ -181,7 +202,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "stacker",
  "thiserror",
  "tracing",
@@ -189,8 +210,8 @@ dependencies = [
 
 [[package]]
 name = "ay-core"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-sys",
  "foldhash 0.1.5",
@@ -206,8 +227,8 @@ dependencies = [
 
 [[package]]
 name = "ay-count"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -221,8 +242,8 @@ dependencies = [
 
 [[package]]
 name = "ay-diff-logic"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "num-bigint 0.4.8",
  "num-rational",
@@ -231,19 +252,20 @@ dependencies = [
 
 [[package]]
 name = "ay-dispatch"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "rustc-hash 2.1.3",
 ]
 
 [[package]]
 name = "ay-dpll"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-arrays",
  "ay-bv",
+ "ay-cdclt",
  "ay-core",
  "ay-diff-logic",
  "ay-drat-check",
@@ -271,7 +293,7 @@ dependencies = [
  "num-rational",
  "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "stacker",
  "thiserror",
  "tracing",
@@ -279,8 +301,8 @@ dependencies = [
 
 [[package]]
 name = "ay-drat-check"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-proof-common",
  "ay-sys",
@@ -290,8 +312,8 @@ dependencies = [
 
 [[package]]
 name = "ay-dt"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "ay-euf",
@@ -300,8 +322,8 @@ dependencies = [
 
 [[package]]
 name = "ay-euf"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "hashbrown 0.15.5",
@@ -311,8 +333,8 @@ dependencies = [
 
 [[package]]
 name = "ay-fp"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "num-bigint 0.4.8",
@@ -323,8 +345,8 @@ dependencies = [
 
 [[package]]
 name = "ay-frontend"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "logos 0.15.1",
@@ -337,8 +359,8 @@ dependencies = [
 
 [[package]]
 name = "ay-intsat"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "num-bigint 0.4.8",
@@ -348,8 +370,8 @@ dependencies = [
 
 [[package]]
 name = "ay-jit"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "serde",
@@ -358,8 +380,8 @@ dependencies = [
 
 [[package]]
 name = "ay-lia"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "ay-intsat",
@@ -373,8 +395,8 @@ dependencies = [
 
 [[package]]
 name = "ay-lra"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "ay-jit",
@@ -389,16 +411,16 @@ dependencies = [
 
 [[package]]
 name = "ay-map"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-milp"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-dpll",
  "ay-lra",
@@ -411,35 +433,36 @@ dependencies = [
  "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "smallvec",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-model-check"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "num-bigint 0.4.8",
  "num-integer 0.1.47",
  "num-rational",
  "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror",
 ]
 
 [[package]]
 name = "ay-multiset"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-nia"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "ay-lia",
@@ -456,8 +479,8 @@ dependencies = [
 
 [[package]]
 name = "ay-nonlinear-common"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "num-rational",
  "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -465,8 +488,8 @@ dependencies = [
 
 [[package]]
 name = "ay-nra"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "ay-lra",
@@ -477,60 +500,62 @@ dependencies = [
  "num-rational",
  "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
  "stacker",
+ "thiserror",
  "tracing",
 ]
 
 [[package]]
 name = "ay-pb-core"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "ay-sat",
  "ay-sys",
- "libc",
  "num-bigint 0.4.8",
  "num-rational",
  "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "signal-hook",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-prefetch"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 
 [[package]]
 name = "ay-proof"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "ay-sat",
  "num-bigint 0.4.8",
+ "num-integer 0.1.47",
  "num-rational",
  "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-proof-common"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ay-sat"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "ay-drat-check",
@@ -545,7 +570,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "smallvec",
  "thiserror",
  "tracing",
@@ -553,13 +578,13 @@ dependencies = [
 
 [[package]]
 name = "ay-sat-congruence-core"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 
 [[package]]
 name = "ay-seq"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "num-bigint 0.4.8",
@@ -567,16 +592,16 @@ dependencies = [
 
 [[package]]
 name = "ay-set"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-strings"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "num-bigint 0.4.8",
@@ -585,17 +610,20 @@ dependencies = [
 
 [[package]]
 name = "ay-sys"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "libc",
+ "nix",
+ "trust-exec-policy",
+ "wait-timeout",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "ay-translate"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=6228729e94a1b97cca2a4512ae128170ea381cca#6228729e94a1b97cca2a4512ae128170ea381cca"
+version = "0.28.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -733,6 +761,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "cfg_aliases"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -788,7 +822,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clean-auto"
-version = "0.4.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "ay",
@@ -798,7 +832,7 @@ dependencies = [
  "ay-translate",
  "bincode 2.0.1",
  "blake3",
- "clean-kernel 0.4.0",
+ "clean-kernel 0.9.0",
  "hashbrown 0.17.1",
  "httparse",
  "num-bigint 0.4.8",
@@ -815,8 +849,8 @@ dependencies = [
 
 [[package]]
 name = "clean-ck0"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/clean.git?rev=bedd2e01ea7f12f7264b62a04a5502fdca63e043#bedd2e01ea7f12f7264b62a04a5502fdca63e043"
+version = "0.9.0"
+source = "git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b#fae0c94829740c9ffe527eeeb4ea472f9c08001b"
 dependencies = [
  "num-bigint 0.4.8",
  "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -825,23 +859,23 @@ dependencies = [
 
 [[package]]
 name = "clean-compiler"
-version = "0.4.0"
+version = "0.9.0"
 dependencies = [
- "clean-kernel 0.4.0",
+ "clean-kernel 0.9.0",
  "serde",
  "thiserror",
 ]
 
 [[package]]
 name = "clean-elab"
-version = "0.4.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clean-auto",
  "clean-compiler",
- "clean-kernel 0.4.0",
+ "clean-kernel 0.9.0",
  "clean-macro",
- "clean-olean",
+ "clean-olean 0.9.0",
  "clean-parser",
  "clean-runtime",
  "hashbrown 0.17.1",
@@ -860,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "clean-kernel"
-version = "0.4.0"
+version = "0.9.0"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -881,30 +915,8 @@ dependencies = [
 
 [[package]]
 name = "clean-kernel"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/clean.git?rev=84c9ae5e2017debb80f58e1f6fec4cdd8cf5487e#84c9ae5e2017debb80f58e1f6fec4cdd8cf5487e"
-dependencies = [
- "ahash",
- "bincode 2.0.1",
- "hashbrown 0.17.1",
- "lz4_flex",
- "num-bigint 0.4.8",
- "num-rational",
- "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
- "rayon",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "smallvec",
- "stacker",
- "thiserror",
- "zstd",
-]
-
-[[package]]
-name = "clean-kernel"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/clean.git?rev=bedd2e01ea7f12f7264b62a04a5502fdca63e043#bedd2e01ea7f12f7264b62a04a5502fdca63e043"
+version = "0.9.0"
+source = "git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b#fae0c94829740c9ffe527eeeb4ea472f9c08001b"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -925,26 +937,52 @@ dependencies = [
 
 [[package]]
 name = "clean-macro"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
- "clean-kernel 0.4.0",
+ "clean-kernel 0.9.0",
+ "clean-parser",
  "thiserror",
 ]
 
 [[package]]
 name = "clean-olean"
-version = "0.4.0"
+version = "0.9.0"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
  "blake3",
- "clean-kernel 0.4.0",
+ "clean-kernel 0.9.0",
  "constant_time_eq 0.5.0",
  "hashbrown 0.17.1",
  "libc",
+ "num-bigint 0.4.8",
  "rayon",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "smallvec",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "clean-olean"
+version = "0.9.0"
+source = "git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b#fae0c94829740c9ffe527eeeb4ea472f9c08001b"
+dependencies = [
+ "ahash",
+ "bincode 2.0.1",
+ "blake3",
+ "clean-kernel 0.9.0 (git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b)",
+ "constant_time_eq 0.5.0",
+ "hashbrown 0.17.1",
+ "libc",
+ "num-bigint 0.4.8",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "smallvec",
  "thiserror",
  "tracing",
@@ -953,9 +991,9 @@ dependencies = [
 
 [[package]]
 name = "clean-parser"
-version = "0.4.0"
+version = "0.9.0"
 dependencies = [
- "clean-kernel 0.4.0",
+ "clean-kernel 0.9.0",
  "serde",
  "stacker",
  "thiserror",
@@ -963,33 +1001,33 @@ dependencies = [
 
 [[package]]
 name = "clean-runtime"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
- "cc",
  "thiserror",
 ]
 
 [[package]]
 name = "clean-tla"
-version = "0.4.0"
+version = "0.9.0"
 dependencies = [
  "clean-auto",
  "clean-elab",
- "clean-kernel 0.4.0",
+ "clean-kernel 0.9.0",
+ "clean-parser",
  "glob",
  "serde",
  "serde_json",
  "thiserror",
- "tla-core 0.13.0 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
+ "tla-core 1.20261110.1 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
 ]
 
 [[package]]
 name = "clean-verify"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "blake3",
  "clean-elab",
- "clean-kernel 0.4.0",
+ "clean-kernel 0.9.0",
  "clean-parser",
  "num-bigint 0.4.8",
  "num-rational",
@@ -1180,7 +1218,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1378,7 +1416,7 @@ dependencies = [
 [[package]]
 name = "indexmap"
 version = "2.14.0"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
@@ -1470,9 +1508,9 @@ dependencies = [
 [[package]]
 name = "logos"
 version = "0.14.2"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
- "logos-derive 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
+ "logos-derive 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
 ]
 
 [[package]]
@@ -1500,7 +1538,7 @@ dependencies = [
 [[package]]
 name = "logos-codegen"
 version = "0.14.2"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
  "beef",
  "fnv",
@@ -1537,9 +1575,9 @@ dependencies = [
 [[package]]
 name = "logos-derive"
 version = "0.14.2"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
- "logos-codegen 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
+ "logos-codegen 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
 ]
 
 [[package]]
@@ -1587,12 +1625,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1606,10 +1656,10 @@ dependencies = [
 [[package]]
 name = "num-bigint"
 version = "0.4.6"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
- "num-integer 0.1.46 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
- "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
+ "num-integer 0.1.46 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
+ "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
 ]
 
 [[package]]
@@ -1620,7 +1670,6 @@ checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
 dependencies = [
  "num-integer 0.1.47",
  "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde",
 ]
 
 [[package]]
@@ -1633,9 +1682,9 @@ dependencies = [
 [[package]]
 name = "num-integer"
 version = "0.1.46"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
- "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
+ "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
 ]
 
 [[package]]
@@ -1656,7 +1705,6 @@ dependencies = [
  "num-bigint 0.4.8",
  "num-integer 0.1.47",
  "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde",
 ]
 
 [[package]]
@@ -1678,7 +1726,7 @@ dependencies = [
 [[package]]
 name = "num-traits"
 version = "0.2.19"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
  "autocfg",
 ]
@@ -1836,25 +1884,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "rmp"
-version = "0.8.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
-dependencies = [
- "num-traits 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
-name = "rmp-serde"
-version = "1.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
-dependencies = [
- "rmp",
- "serde",
-]
-
-[[package]]
 name = "rowan"
 version = "0.15.16"
 dependencies = [
@@ -1867,7 +1896,7 @@ dependencies = [
 [[package]]
 name = "rowan"
 version = "0.15.16"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
  "countme",
  "hashbrown 0.14.5",
@@ -1888,7 +1917,7 @@ version = "2.1.2"
 [[package]]
 name = "rustc-hash"
 version = "2.1.2"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 
 [[package]]
 name = "rustc-hash"
@@ -1915,7 +1944,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2013,6 +2042,15 @@ dependencies = [
 [[package]]
 name = "sha2"
 version = "0.10.9"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
@@ -2020,6 +2058,16 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest 0.10.7",
  "sha2-asm",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -2098,9 +2146,6 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "socket2"
@@ -2167,7 +2212,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2180,7 +2225,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2220,7 +2265,7 @@ dependencies = [
 
 [[package]]
 name = "tla-arc"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "serde",
  "stable_deref_trait",
@@ -2228,7 +2273,7 @@ dependencies = [
 
 [[package]]
 name = "tla-arena"
-version = "0.13.0"
+version = "1.20261110.1"
 
 [[package]]
 name = "tla-ariadne"
@@ -2241,7 +2286,7 @@ dependencies = [
 [[package]]
 name = "tla-ariadne"
 version = "0.4.1"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
  "unicode-width",
  "yansi",
@@ -2249,19 +2294,19 @@ dependencies = [
 
 [[package]]
 name = "tla-backend"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "tla-mc-core",
 ]
 
 [[package]]
 name = "tla-check"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "ahash",
  "chrono",
  "clean-ck0",
- "clean-kernel 0.4.0 (git+https://github.com/alabsystems/clean.git?rev=bedd2e01ea7f12f7264b62a04a5502fdca63e043)",
+ "clean-kernel 0.9.0 (git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b)",
  "crossbeam-channel",
  "crossbeam-deque",
  "dashmap",
@@ -2275,34 +2320,37 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_stacker",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "tempfile 3.27.0",
  "thiserror",
  "tla-arc",
  "tla-arena",
  "tla-backend",
- "tla-core 0.13.0",
+ "tla-core 1.20261110.1",
  "tla-dialect",
  "tla-eval",
- "tla-im",
+ "tla-im 1.20261110.1",
  "tla-ir",
  "tla-jit-abi",
- "tla-lock 0.13.0",
+ "tla-lock 1.20261110.1",
  "tla-mc-core",
+ "tla-model-normalizer",
  "tla-resource",
+ "tla-shapes",
+ "tla-shapes-families",
  "tla-smallvec",
- "tla-stack",
+ "tla-stack 0.1.23",
  "tla-tir",
  "tla-trust-cg",
  "tla-value",
  "toml",
- "trust-ir 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
  "xxhash-rust 0.8.15",
 ]
 
 [[package]]
 name = "tla-core"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "crossbeam-epoch",
  "indexmap 2.14.0",
@@ -2313,41 +2361,46 @@ dependencies = [
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tla-ariadne 0.4.1",
- "tla-im",
- "tla-lock 0.13.0",
+ "tla-im 1.20261110.1",
+ "tla-lock 1.20261110.1",
+ "tla-stack 0.1.23",
 ]
 
 [[package]]
 name = "tla-core"
-version = "0.13.0"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+version = "1.20261110.1"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
  "crossbeam-epoch",
- "indexmap 2.14.0 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
- "logos 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
- "num-bigint 0.4.6 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
- "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
- "rowan 0.15.16 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
- "rustc-hash 2.1.2 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
+ "indexmap 2.14.0 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
+ "logos 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
+ "num-bigint 0.4.6 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
+ "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
+ "rowan 0.15.16 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
+ "rustc-hash 2.1.2 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
  "serde",
  "serde_json",
+ "sha2 0.10.9 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
  "thiserror",
- "tla-ariadne 0.4.1 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
- "tla-lock 0.13.0 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
+ "tla-ariadne 0.4.1 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
+ "tla-im 1.20261110.1 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
+ "tla-lock 1.20261110.1 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
+ "tla-stack 0.1.23 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
 ]
 
 [[package]]
 name = "tla-dialect"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "tla-eval"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "indexmap 2.14.0",
  "num-bigint 0.4.6",
@@ -2357,87 +2410,106 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tla-core 0.13.0",
+ "tla-core 1.20261110.1",
  "tla-smallvec",
- "tla-stack",
+ "tla-stack 0.1.23",
  "tla-tir",
  "tla-value",
 ]
 
 [[package]]
 name = "tla-im"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "bitmaps",
  "rand_core",
  "rand_xoshiro",
  "sized-chunks",
- "tla-rp",
+ "tla-rp 1.20261110.1",
+ "typenum",
+ "version_check",
+]
+
+[[package]]
+name = "tla-im"
+version = "1.20261110.1"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
+dependencies = [
+ "bitmaps",
+ "rand_core",
+ "rand_xoshiro",
+ "sized-chunks",
+ "tla-rp 1.20261110.1 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
  "typenum",
  "version_check",
 ]
 
 [[package]]
 name = "tla-ir"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
+ "clean-kernel 0.9.0 (git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b)",
  "num-traits 0.2.19",
+ "sha2 0.10.9",
  "thiserror",
- "tla-core 0.13.0",
+ "tla-core 1.20261110.1",
+ "tla-im 1.20261110.1",
  "tla-jit-abi",
+ "tla-model-ir",
  "tla-tir",
  "tla-value",
- "trust-ir 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
- "trust-ir-build 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+ "trust-ir-build 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
 ]
 
 [[package]]
 name = "tla-jit-abi"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "num-traits 0.2.19",
  "serde",
+ "sha2 0.10.9",
  "thiserror",
- "tla-core 0.13.0",
+ "tla-core 1.20261110.1",
  "tla-value",
  "xxhash-rust 0.8.15",
 ]
 
 [[package]]
 name = "tla-lock"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
- "tla-lock-api 0.13.0",
- "tla-lock-core 0.13.0",
+ "tla-lock-api 1.20261110.1",
+ "tla-lock-core 1.20261110.1",
 ]
 
 [[package]]
 name = "tla-lock"
-version = "0.13.0"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+version = "1.20261110.1"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
- "tla-lock-api 0.13.0 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
- "tla-lock-core 0.13.0 (git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb)",
+ "tla-lock-api 1.20261110.1 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
+ "tla-lock-core 1.20261110.1 (git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9)",
 ]
 
 [[package]]
 name = "tla-lock-api"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "scopeguard",
 ]
 
 [[package]]
 name = "tla-lock-api"
-version = "0.13.0"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+version = "1.20261110.1"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
  "scopeguard",
 ]
 
 [[package]]
 name = "tla-lock-core"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "cfg-if",
  "libc",
@@ -2448,8 +2520,8 @@ dependencies = [
 
 [[package]]
 name = "tla-lock-core"
-version = "0.13.0"
-source = "git+https://github.com/alabsystems/ty.git?rev=3365102670af386e2053abec9484795c71544cfb#3365102670af386e2053abec9484795c71544cfb"
+version = "1.20261110.1"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
  "cfg-if",
  "libc",
@@ -2460,29 +2532,94 @@ dependencies = [
 
 [[package]]
 name = "tla-mc-core"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "crossbeam",
  "rustc-hash 2.1.2",
+ "sha2 0.10.9",
  "thiserror",
- "tla-lock 0.13.0",
+ "tla-lock 1.20261110.1",
  "tla-smallvec",
 ]
 
 [[package]]
+name = "tla-mc-native"
+version = "1.20261110.1"
+dependencies = [
+ "tla-native-abi",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+ "trust-ir-build 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+]
+
+[[package]]
+name = "tla-model-ir"
+version = "1.20261110.1"
+dependencies = [
+ "tla-shapes",
+]
+
+[[package]]
+name = "tla-model-ir-exec"
+version = "1.20261110.1"
+dependencies = [
+ "num-bigint 0.4.6",
+ "num-traits 0.2.19",
+ "tla-core 1.20261110.1",
+ "tla-eval",
+ "tla-model-ir",
+ "tla-value",
+]
+
+[[package]]
+name = "tla-model-normalizer"
+version = "1.20261110.1"
+dependencies = [
+ "num-traits 0.2.19",
+ "tla-core 1.20261110.1",
+ "tla-eval",
+ "tla-ir",
+ "tla-model-ir-exec",
+ "tla-tir",
+ "tla-value",
+]
+
+[[package]]
+name = "tla-native-abi"
+version = "1.20261110.1"
+
+[[package]]
 name = "tla-resource"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "tla-rp"
-version = "0.13.0"
+version = "1.20261110.1"
+
+[[package]]
+name = "tla-rp"
+version = "1.20261110.1"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
+
+[[package]]
+name = "tla-shapes"
+version = "1.20261110.1"
+
+[[package]]
+name = "tla-shapes-families"
+version = "1.20261110.1"
+dependencies = [
+ "tla-core 1.20261110.1",
+ "tla-shapes",
+ "tla-value",
+ "xxhash-rust 0.8.15",
+]
 
 [[package]]
 name = "tla-smallvec"
-version = "0.13.0"
+version = "1.20261110.1"
 
 [[package]]
 name = "tla-stack"
@@ -2496,30 +2633,47 @@ dependencies = [
 ]
 
 [[package]]
-name = "tla-tir"
-version = "0.13.0"
+name = "tla-stack"
+version = "0.1.23"
+source = "git+https://github.com/alabsystems/ty.git?rev=aa96570ae592394a8c50102aa5782683543bd2c9#aa96570ae592394a8c50102aa5782683543bd2c9"
 dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "psm",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "tla-tir"
+version = "1.20261110.1"
+dependencies = [
+ "num-bigint 0.4.6",
  "num-traits 0.2.19",
  "rustc-hash 2.1.2",
+ "sha2 0.10.9",
  "thiserror",
- "tla-core 0.13.0",
+ "tla-core 1.20261110.1",
  "tla-value",
 ]
 
 [[package]]
 name = "tla-trust-cg"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "libloading",
  "num-bigint 0.4.6",
  "num-traits 0.2.19",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror",
- "tla-core 0.13.0",
+ "tla-core 1.20261110.1",
+ "tla-eval",
  "tla-ir",
  "tla-jit-abi",
+ "tla-mc-native",
  "tla-resource",
+ "tla-shapes-families",
  "tla-tir",
  "tla-value",
  "trust-cg-codegen",
@@ -2527,14 +2681,14 @@ dependencies = [
  "trust-cg-jit-matrix",
  "trust-cg-lower",
  "trust-cg-opt",
- "trust-ir 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
- "trust-ir-build 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+ "trust-ir-build 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
  "xxhash-rust 0.8.18",
 ]
 
 [[package]]
 name = "tla-value"
-version = "0.13.0"
+version = "1.20261110.1"
 dependencies = [
  "dashmap",
  "indexmap 2.14.0",
@@ -2544,9 +2698,9 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tla-core 0.13.0",
- "tla-im",
- "tla-rp",
+ "tla-core 1.20261110.1",
+ "tla-im 1.20261110.1",
+ "tla-rp 1.20261110.1",
  "tla-smallvec",
 ]
 
@@ -2563,19 +2717,7 @@ dependencies = [
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
- "tokio-macros",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tokio-macros"
-version = "2.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.3",
 ]
 
 [[package]]
@@ -2678,84 +2820,102 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-codegen"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-cg.git?rev=48902e2a4ccec3582978ddbb169f78b0ae1e8b08#48902e2a4ccec3582978ddbb169f78b0ae1e8b08"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
 dependencies = [
+ "libc",
  "rayon",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror",
  "trust-cg-dialect",
  "trust-cg-ir",
+ "trust-cg-irmid",
  "trust-cg-lower",
  "trust-cg-opt",
  "trust-cg-process-env",
  "trust-cg-regalloc",
  "trust-cg-verify",
- "trust-ir 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
- "trust-ir-build 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+ "trust-ir-build 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
 ]
 
 [[package]]
 name = "trust-cg-dialect"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-cg.git?rev=48902e2a4ccec3582978ddbb169f78b0ae1e8b08#48902e2a4ccec3582978ddbb169f78b0ae1e8b08"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
 dependencies = [
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-drat-trim"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-cg.git?rev=48902e2a4ccec3582978ddbb169f78b0ae1e8b08#48902e2a4ccec3582978ddbb169f78b0ae1e8b08"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "trust-cg-ir"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-cg.git?rev=48902e2a4ccec3582978ddbb169f78b0ae1e8b08#48902e2a4ccec3582978ddbb169f78b0ae1e8b08"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "trust-cg-irmid"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
+dependencies = [
+ "serde_json",
+ "trust-cg-ir",
+ "trust-cg-opt",
+ "trust-cg-verify",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
 ]
 
 [[package]]
 name = "trust-cg-jit-matrix"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-cg.git?rev=48902e2a4ccec3582978ddbb169f78b0ae1e8b08#48902e2a4ccec3582978ddbb169f78b0ae1e8b08"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tempfile 3.27.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror",
  "trust-cg-codegen",
  "trust-cg-ir",
+ "trust-cg-lower",
  "trust-cg-process-env",
- "trust-ir 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
- "trust-ir-build 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
+ "trust-cg-verify",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+ "trust-ir-build 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
 ]
 
 [[package]]
 name = "trust-cg-lower"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-cg.git?rev=48902e2a4ccec3582978ddbb169f78b0ae1e8b08#48902e2a4ccec3582978ddbb169f78b0ae1e8b08"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
 dependencies = [
  "serde",
  "thiserror",
  "trust-cg-ir",
- "trust-ir 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
- "trust-ir-build 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+ "trust-ir-build 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
 ]
 
 [[package]]
 name = "trust-cg-opt"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-cg.git?rev=48902e2a4ccec3582978ddbb169f78b0ae1e8b08#48902e2a4ccec3582978ddbb169f78b0ae1e8b08"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
 dependencies = [
  "serde",
  "serde_json",
@@ -2767,13 +2927,17 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-process-env"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-cg.git?rev=48902e2a4ccec3582978ddbb169f78b0ae1e8b08#48902e2a4ccec3582978ddbb169f78b0ae1e8b08"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
+dependencies = [
+ "libc",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
+]
 
 [[package]]
 name = "trust-cg-regalloc"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-cg.git?rev=48902e2a4ccec3582978ddbb169f78b0ae1e8b08#48902e2a4ccec3582978ddbb169f78b0ae1e8b08"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
 dependencies = [
  "thiserror",
  "trust-cg-ir",
@@ -2781,14 +2945,16 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-verify"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-cg.git?rev=48902e2a4ccec3582978ddbb169f78b0ae1e8b08#48902e2a4ccec3582978ddbb169f78b0ae1e8b08"
+version = "0.7.0"
+source = "git+https://github.com/alabsystems/trust-cg.git?rev=be463238a2c9888d5204c3ecf730d3a3fa2ff66d#be463238a2c9888d5204c3ecf730d3a3fa2ff66d"
 dependencies = [
+ "clean-kernel 0.9.0 (git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b)",
+ "clean-olean 0.9.0 (git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b)",
+ "libc",
  "rayon",
- "rmp-serde",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "tempfile 3.27.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror",
  "trust-cg-drat-trim",
@@ -2796,72 +2962,106 @@ dependencies = [
  "trust-cg-lower",
  "trust-cg-opt",
  "trust-cg-process-env",
- "trust-ir 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+ "zstd",
+]
+
+[[package]]
+name = "trust-exec-policy"
+version = "0.13.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=8bbc43108643d475a81a89b2b4f262e817ee1724#8bbc43108643d475a81a89b2b4f262e817ee1724"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
 name = "trust-ir"
-version = "0.8.0"
+version = "0.14.0"
 dependencies = [
  "bincode 1.3.3",
- "clean-kernel 0.4.0 (git+https://github.com/alabsystems/clean.git?rev=84c9ae5e2017debb80f58e1f6fec4cdd8cf5487e)",
+ "clean-kernel 0.9.0 (git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b)",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "trust-ir"
-version = "0.8.0"
-source = "git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6#1541c0e59b78eeb05491ef9f9e0986a5a5082bb6"
+version = "0.14.0"
+source = "git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87#a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87"
 dependencies = [
  "bincode 1.3.3",
- "clean-kernel 0.4.0 (git+https://github.com/alabsystems/clean.git?rev=bedd2e01ea7f12f7264b62a04a5502fdca63e043)",
+ "clean-kernel 0.9.0 (git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b)",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "trust-ir-build"
-version = "0.8.0"
+version = "0.14.0"
 dependencies = [
- "clean-kernel 0.4.0 (git+https://github.com/alabsystems/clean.git?rev=84c9ae5e2017debb80f58e1f6fec4cdd8cf5487e)",
+ "clean-kernel 0.9.0 (git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b)",
  "rayon",
- "trust-ir 0.8.0",
- "trust-ir-giveback 0.8.0",
+ "trust-ir 0.14.0",
+ "trust-ir-giveback 0.14.0",
+ "trust-ir-laws 0.14.0",
 ]
 
 [[package]]
 name = "trust-ir-build"
-version = "0.8.0"
-source = "git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6#1541c0e59b78eeb05491ef9f9e0986a5a5082bb6"
+version = "0.14.0"
+source = "git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87#a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87"
 dependencies = [
- "clean-kernel 0.4.0 (git+https://github.com/alabsystems/clean.git?rev=bedd2e01ea7f12f7264b62a04a5502fdca63e043)",
+ "clean-kernel 0.9.0 (git+https://github.com/alabsystems/clean.git?rev=fae0c94829740c9ffe527eeeb4ea472f9c08001b)",
  "rayon",
- "trust-ir 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
- "trust-ir-giveback 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+ "trust-ir-giveback 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+ "trust-ir-laws 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
 ]
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.8.0"
+version = "0.14.0"
 dependencies = [
- "trust-ir 0.8.0",
+ "trust-ir 0.14.0",
 ]
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.8.0"
-source = "git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6#1541c0e59b78eeb05491ef9f9e0986a5a5082bb6"
+version = "0.14.0"
+source = "git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87#a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87"
 dependencies = [
- "trust-ir 0.8.0 (git+https://github.com/alabsystems/trust-ir.git?rev=1541c0e59b78eeb05491ef9f9e0986a5a5082bb6)",
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
 ]
+
+[[package]]
+name = "trust-ir-laws"
+version = "0.14.0"
+dependencies = [
+ "trust-ir 0.14.0",
+]
+
+[[package]]
+name = "trust-ir-laws"
+version = "0.14.0"
+source = "git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87#a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87"
+dependencies = [
+ "trust-ir 0.14.0 (git+https://github.com/alabsystems/trust-ir.git?rev=a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87)",
+]
+
+[[package]]
+name = "trust-model-prelude"
+version = "0.14.0"
+
+[[package]]
+name = "trust-sha2"
+version = "0.14.0"
 
 [[package]]
 name = "trust-spec-temporal"
 version = "0.1.0"
 dependencies = [
  "clean-elab",
- "clean-kernel 0.4.0",
+ "clean-kernel 0.9.0",
  "clean-parser",
  "clean-tla",
  "clean-verify",
@@ -2869,9 +3069,11 @@ dependencies = [
  "serde",
  "serde_json",
  "tla-check",
- "tla-core 0.13.0",
- "trust-ir 0.8.0",
- "trust-ir-build 0.8.0",
+ "tla-core 1.20261110.1",
+ "trust-ir 0.14.0",
+ "trust-ir-build 0.14.0",
+ "trust-model-prelude",
+ "trust-sha2",
 ]
 
 [[package]]
@@ -2934,6 +3136,15 @@ name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
+
+[[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "wasi"

@@ -1,0 +1,162 @@
+; TrustIr text format v1
+; trustc c054d5b16f0689fc92ce4d9a4c2b6decfb881e07 2026-10-08
+module "adv5"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "adv5.rs"
+
+functy.0 = (ptr, ptr) -> (i32)
+
+functy.1 = () -> (i32)
+
+functy.2 = (...) -> (i32)
+
+functy.3 = (i32) -> ()
+
+functy.4 = (i32, i32, i32) -> (i32)
+
+rustcc fn @adv_errpath_kqueue(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 5 4
+    ; #scope: 2 parent=1 at 0 7 8
+    ; #scope: 3 parent=2 at 0 11 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.2()  ; #loc: 0 5 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 6 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 6 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 6 4  ; #scope: 1
+bb1:
+    %8 = call @func.3()  ; #loc: 0 7 26  ; #scope: 1
+    %9 = const i32 -1  ; #loc: 0 8 17  ; #scope: 2
+    %10 = icmp eq i32 %8, %9  ; #loc: 0 8 11  ; #scope: 2
+    condbr %10, bb4, bb5  ; #loc: 0 8 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 6 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 16 1  ; #scope: 0
+bb4:
+    %11 = call @func.4(%0, %1)  ; #loc: 0 9 21  ; #scope: 2
+    %12 = const i32 127  ; #loc: 0 9 58  ; #scope: 2
+    call @func.5(%12)  ; #loc: 0 9 46  ; #scope: 2
+    unreachable  ; #loc: 0 9 46  ; #scope: 2
+bb5:
+    br bb6  ; #loc: 0 8 8  ; #scope: 2
+bb6:
+    %13 = const i32 3  ; #loc: 0 11 21  ; #scope: 2
+    br bb7(%13)  ; #loc: 0 12 8  ; #scope: 3
+bb7(%2: i32):
+    %14 = const i32 2147483647  ; #loc: 0 12 19  ; #scope: 3
+    %15 = icmp slt i32 %2, %14  ; #loc: 0 12 14  ; #scope: 3
+    condbr %15, bb9, bb10  ; #loc: 0 12 8  ; #scope: 3
+bb8(%3: i32):
+    %16 = call @func.4(%0, %1)  ; #loc: 0 13 17  ; #scope: 3
+    %17 = const i32 127  ; #loc: 0 13 54  ; #scope: 3
+    call @func.5(%17)  ; #loc: 0 13 42  ; #scope: 3
+    unreachable  ; #loc: 0 13 42  ; #scope: 3
+bb9:
+    %18 = const i32 2  ; #loc: 0 12 55  ; #scope: 3
+    %19 = const i32 1  ; #loc: 0 12 70  ; #scope: 3
+    %20 = call @func.6(%2, %18, %19)  ; #loc: 0 12 39  ; #scope: 3
+    %21 = const i32 1  ; #loc: 0 12 97  ; #scope: 3
+    %22, %23 = add.overflow i32 %2, %21  ; #loc: 0 12 91  ; #scope: 3
+    %24 = const bool false  ; #loc: 0 12 91  ; #scope: 3
+    %25 = const bool true  ; #loc: 0 12 91  ; #scope: 3
+    %26 = select bool %23, %24, %25  ; #loc: 0 12 91  ; #scope: 3
+    assert %26, overflow add  ; #proof: no_overflow  ; #loc: 0 12 91  ; #scope: 3
+    br bb11(%22)  ; #loc: 0 12 8  ; #scope: 3
+bb10:
+    br bb8(%2)  ; #loc: 0 12 8  ; #scope: 3
+bb11(%4: i32):
+    br bb7(%4)  ; #loc: 0 12 8  ; #scope: 3
+}
+
+rustcc fn @adv_errpath_socket(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 20 4
+    ; #scope: 2 parent=1 at 0 22 8
+    ; #scope: 3 parent=2 at 0 26 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.2()  ; #loc: 0 20 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 21 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 21 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 21 4  ; #scope: 1
+bb1:
+    %8 = const i32 1  ; #loc: 0 22 38  ; #scope: 1
+    %9 = const i32 1  ; #loc: 0 22 41  ; #scope: 1
+    %10 = const i32 0  ; #loc: 0 22 44  ; #scope: 1
+    %11 = call @func.7(%8, %9, %10)  ; #loc: 0 22 25  ; #scope: 1
+    %12 = const i32 -1  ; #loc: 0 23 16  ; #scope: 2
+    %13 = icmp eq i32 %11, %12  ; #loc: 0 23 11  ; #scope: 2
+    condbr %13, bb4, bb5  ; #loc: 0 23 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 21 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 31 1  ; #scope: 0
+bb4:
+    %14 = call @func.4(%0, %1)  ; #loc: 0 24 21  ; #scope: 2
+    %15 = const i32 127  ; #loc: 0 24 58  ; #scope: 2
+    call @func.5(%15)  ; #loc: 0 24 46  ; #scope: 2
+    unreachable  ; #loc: 0 24 46  ; #scope: 2
+bb5:
+    br bb6  ; #loc: 0 23 8  ; #scope: 2
+bb6:
+    %16 = const i32 3  ; #loc: 0 26 21  ; #scope: 2
+    br bb7(%16)  ; #loc: 0 27 8  ; #scope: 3
+bb7(%2: i32):
+    %17 = const i32 2147483647  ; #loc: 0 27 19  ; #scope: 3
+    %18 = icmp slt i32 %2, %17  ; #loc: 0 27 14  ; #scope: 3
+    condbr %18, bb9, bb10  ; #loc: 0 27 8  ; #scope: 3
+bb8(%3: i32):
+    %19 = call @func.4(%0, %1)  ; #loc: 0 28 17  ; #scope: 3
+    %20 = const i32 127  ; #loc: 0 28 54  ; #scope: 3
+    call @func.5(%20)  ; #loc: 0 28 42  ; #scope: 3
+    unreachable  ; #loc: 0 28 42  ; #scope: 3
+bb9:
+    %21 = const i32 2  ; #loc: 0 27 55  ; #scope: 3
+    %22 = const i32 1  ; #loc: 0 27 70  ; #scope: 3
+    %23 = call @func.6(%2, %21, %22)  ; #loc: 0 27 39  ; #scope: 3
+    %24 = const i32 1  ; #loc: 0 27 97  ; #scope: 3
+    %25, %26 = add.overflow i32 %2, %24  ; #loc: 0 27 91  ; #scope: 3
+    %27 = const bool false  ; #loc: 0 27 91  ; #scope: 3
+    %28 = const bool true  ; #loc: 0 27 91  ; #scope: 3
+    %29 = select bool %26, %27, %28  ; #loc: 0 27 91  ; #scope: 3
+    assert %29, overflow add  ; #proof: no_overflow  ; #loc: 0 27 91  ; #scope: 3
+    br bb11(%25)  ; #loc: 0 27 8  ; #scope: 3
+bb10:
+    br bb8(%2)  ; #loc: 0 27 8  ; #scope: 3
+bb11(%4: i32):
+    br bb7(%4)  ; #loc: 0 27 8  ; #scope: 3
+}
+
+fn @"libc::fork"(functy.1) {
+    ; #producer: trust
+}
+
+fn @"libc::kqueue"(functy.1) {
+    ; #producer: trust
+}
+
+fn @"libc::execv"(functy.2) {
+    ; #producer: trust
+}
+
+fn @"libc::_exit"(functy.3) {
+    ; #producer: trust
+}
+
+fn @"libc::fcntl"(functy.2) {
+    ; #producer: trust
+}
+
+fn @"libc::socket"(functy.4) {
+    ; #producer: trust
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L12C91 of `adv5::adv_errpath_kqueue`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "adv5::adv_errpath_kqueue#L12C91#overflow#o0" range 0 12 91 12 98 site f0/bb9#8
+
+obligation 1 arithmetic_safety pending "direct THIR Assert (overflow) at L27C91 of `adv5::adv_errpath_socket`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 1 source "trust-thir-lower/direct-assert@1" assertion "adv5::adv_errpath_socket#L27C91#overflow#o0" range 0 27 91 27 98 site f1/bb9#8

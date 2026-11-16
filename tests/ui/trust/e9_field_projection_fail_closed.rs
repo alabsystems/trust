@@ -7,10 +7,23 @@
 //! struct's field must not let it name anything else, so each function here is
 //! one step outside the new lane and each must stay refused.
 //!
-//! * `via_reference` — a `&Cst` parameter. The MIR read carries a `Deref`, and
-//!   more importantly the pointee is not provably unchanged between entry and
-//!   exit; `ensures` has no two-state reading for it. Refused at the recognizer
-//!   (no admission) and at the binding table (a reference contributes no rows).
+//! * `via_reference` — **NO LONGER REFUSED, and the change is deliberate.** It
+//!   read: "a `&Cst` parameter. The MIR read carries a `Deref`, and more
+//!   importantly the pointee is not provably unchanged between entry and exit;
+//!   `ensures` has no two-state reading for it." The missing premise —
+//!   entry == exit for a live `&T` with `T: Freeze` — is now supplied, as an
+//!   ASSUMPTION rather than a proof: owner ruling R1 (accepted 2026-09-17),
+//!   carried as the `EnsuresCitationViewDischarge` row in `docs/TCB.md`. The
+//!   borrow-erased E6 PARAMETER VIEW (ref-self I1) flattens the pointee's
+//!   scalar fields into by-value parameters and runs the UNCHANGED recognizer
+//!   and mint on the copy. The ruling's second half is what sanctions the flip:
+//!   such a row is graded `Trusted`/`Constructive`, is excluded from
+//!   `of which N kernel-certified`, hands out no kernel proof term, and the
+//!   authenticated `targo trust` lane withholds it. It is kept in this file
+//!   rather than deleted, so the refusal this net used to hold and the
+//!   assumption that replaced it stay in one place. The positive lives in
+//!   `e6_param_view_ref_self_is_not_certified.rs`; the fragment probe is `f39`.
+//!   The other four functions below are unaffected and must stay refused.
 //! * `mixed_fields` — ALL-OR-NOTHING per struct. `degree` is an ordinary `u64`,
 //!   but `terms` is not a supported scalar, so the WHOLE parameter contributes
 //!   nothing. A per-field filter would be two filters — one over HIR types, one
@@ -54,9 +67,8 @@ pub struct Outer {
 pub struct Pair(pub u64, pub u64);
 
 pub fn via_reference(c: &Cst) -> u64
-    //~^ ERROR Trust Level 0 safety verification incomplete
-    //~| ERROR Trust strict verification failed
-    ensures result == ident_isl(c.degree) //~ ERROR uncited `ensures` naming the Clean island definition `ident_isl`
+    //~^ NOTE obligation(s) were discharged through the borrow-erased E6 PARAMETER VIEW
+    ensures result == ident_isl(c.degree)
 {
     c.degree
 }

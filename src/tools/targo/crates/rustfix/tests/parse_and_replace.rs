@@ -12,7 +12,12 @@
 //! To override snapshots, run `SNAPSHOTS=overwrite cargo test`.
 //! See [`snapbox::assert::Action`] for different actions.
 
-#![allow(clippy::disallowed_methods, clippy::print_stdout, clippy::print_stderr)]
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 use anyhow::{Context, Error, anyhow};
 use rustfix::apply_suggestions;
@@ -20,11 +25,10 @@ use serde_json::Value;
 use snapbox::data::DataFormat;
 use snapbox::{Assert, Data};
 use std::collections::HashSet;
-use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use tempfile::tempdir;
 
 mod fixmode {
@@ -37,7 +41,8 @@ static mut VERSION: (u32, bool) = (0, false);
 fn version() -> (u32, bool) {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let output = Command::new("rustc")
+        let output = cargo_test_support::rustc_fixture_command()
+            .expect("valid rustfix compiler-fixture context")
             .arg("-V")
             .output()
             .expect("cargo should run");
@@ -63,7 +68,8 @@ fn compile(file: &Path) -> Result<Output, Error> {
         tmp.path().into(),
     ];
 
-    let res = Command::new(env::var_os("RUSTC").unwrap_or("rustc".into()))
+    let res = cargo_test_support::rustc_fixture_command()
+        .map_err(Error::msg)?
         .args(&args)
         .env("CLIPPY_DISABLE_DOCS_LINKS", "true")
         .env_remove("RUST_LOG")

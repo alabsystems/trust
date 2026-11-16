@@ -1,0 +1,112 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta-surface",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (6f70bdb69 2026-09-19) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@4ac1b25c7518 sha256:e38e559a127c245c",
+  "clean": "first-party/clean@4338e7923763 sha256:ece53b053817beaf",
+  "trust-cg": "first-party/trust-cg@5aca5cd4d662 sha256:9db90b2968fc0f50"
+ },
+ "ratchets": {
+  "a.surface.bindings": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:bindings:populated_in=[]",
+   "audit": "GAP"
+  },
+  "a.surface.body_gate": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.surface.certificates": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:certificates:populated_in=[]",
+   "audit": "GAP"
+  },
+  "a.surface.clean_tier_in_band": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "clean_tier_in_band:body_gate-written:earned-not-gated:tv_cert=0",
+   "audit": "GAP"
+  },
+  "a.surface.display_path": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.surface.display_path_rust": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:display_path_rust:populated_in=[]",
+   "audit": "GAP"
+  },
+  "a.surface.handle": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:handle:populated_in=[]",
+   "audit": "GAP"
+  },
+  "a.surface.imports": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:imports:populated_in=[]",
+   "audit": "GAP"
+  },
+  "a.surface.non_pending_status": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:non_pending_status:populated_in=[]",
+   "audit": "GAP"
+  },
+  "a.surface.obligation_formula": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:obligation_formula:populated_in=[]",
+   "audit": "GAP"
+  },
+  "a.surface.obligation_site": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.surface.obligations": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.surface.producer_tags": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.surface.struct_passing_classified": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:struct_passing_classified:populated_in=[]",
+   "audit": "GAP"
+  },
+  "a.surface.summary": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:summary:populated_in=[]",
+   "audit": "GAP"
+  },
+  "a.surface.symbol_names": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:symbol_names:populated_in=['dep', 'p01_rust_contracts', 'p02_rust_loop_invariant', 'p03_rust_struct_enum_match', 'p04_rust_slice_index', 'p05_rust_checked_arith', 'p07_rust_u128', 'p08_rust_mut_ref', 'p18_theorem_citation']",
+   "audit": "GAP"
+  },
+  "a.surface.target_info": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.surface.tuple_layouts": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "surface:tuple_layouts:populated_in=[]",
+   "audit": "GAP"
+  },
+  "a.surface.wire_v41_plus": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

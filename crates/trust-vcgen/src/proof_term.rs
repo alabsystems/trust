@@ -131,21 +131,52 @@ impl ProofBuilder {
 /// structural invariants hold (e.g., conjunction has at least one element).
 #[must_use]
 pub fn validate_proof_term(term: &ProofTerm, context: &ProofContext) -> bool {
+    if context.hypotheses.len() > 4
+        && !matches!(term, ProofTerm::Axiom(_) | ProofTerm::Hypothesis(_))
+    {
+        let hyp_names: trust_types::fx::FxHashSet<&str> =
+            context.hypotheses.iter().map(|(n, _)| n.as_str()).collect();
+        return validate_proof_term_set(term, &hyp_names);
+    }
+    validate_proof_term_linear(term, context)
+}
+
+fn validate_proof_term_linear(term: &ProofTerm, context: &ProofContext) -> bool {
     match term {
         ProofTerm::Axiom(_) => true,
         ProofTerm::Hypothesis(name) => context.hypotheses.iter().any(|(n, _)| n == name),
         ProofTerm::ModusPonens(imp, ant) => {
-            validate_proof_term(imp, context) && validate_proof_term(ant, context)
+            validate_proof_term_linear(imp, context) && validate_proof_term_linear(ant, context)
         }
         ProofTerm::Conjunction(proofs) => {
-            !proofs.is_empty() && proofs.iter().all(|p| validate_proof_term(p, context))
+            !proofs.is_empty() && proofs.iter().all(|p| validate_proof_term_linear(p, context))
         }
-        ProofTerm::Disjunction(proof, _idx) => validate_proof_term(proof, context),
-        ProofTerm::ForallIntro(_var, body) => validate_proof_term(body, context),
-        ProofTerm::ExistsIntro(_witness, body) => validate_proof_term(body, context),
-        ProofTerm::Rewrite(proof, _from, _to) => validate_proof_term(proof, context),
+        ProofTerm::Disjunction(proof, _idx) => validate_proof_term_linear(proof, context),
+        ProofTerm::ForallIntro(_var, body) => validate_proof_term_linear(body, context),
+        ProofTerm::ExistsIntro(_witness, body) => validate_proof_term_linear(body, context),
+        ProofTerm::Rewrite(proof, _from, _to) => validate_proof_term_linear(proof, context),
         ProofTerm::Cut(left, right, _lemma) => {
-            validate_proof_term(left, context) && validate_proof_term(right, context)
+            validate_proof_term_linear(left, context) && validate_proof_term_linear(right, context)
+        }
+    }
+}
+
+fn validate_proof_term_set(term: &ProofTerm, hyp_names: &trust_types::fx::FxHashSet<&str>) -> bool {
+    match term {
+        ProofTerm::Axiom(_) => true,
+        ProofTerm::Hypothesis(name) => hyp_names.contains(name.as_str()),
+        ProofTerm::ModusPonens(imp, ant) => {
+            validate_proof_term_set(imp, hyp_names) && validate_proof_term_set(ant, hyp_names)
+        }
+        ProofTerm::Conjunction(proofs) => {
+            !proofs.is_empty() && proofs.iter().all(|p| validate_proof_term_set(p, hyp_names))
+        }
+        ProofTerm::Disjunction(proof, _idx) => validate_proof_term_set(proof, hyp_names),
+        ProofTerm::ForallIntro(_var, body) => validate_proof_term_set(body, hyp_names),
+        ProofTerm::ExistsIntro(_witness, body) => validate_proof_term_set(body, hyp_names),
+        ProofTerm::Rewrite(proof, _from, _to) => validate_proof_term_set(proof, hyp_names),
+        ProofTerm::Cut(left, right, _lemma) => {
+            validate_proof_term_set(left, hyp_names) && validate_proof_term_set(right, hyp_names)
         }
     }
 }
@@ -195,24 +226,20 @@ pub fn simplify_proof(term: &ProofTerm) -> ProofTerm {
         }
         ProofTerm::Conjunction(proofs) => {
             // Recursively simplify, then flatten nested conjunctions.
-            let simplified: Vec<ProofTerm> = proofs
-                .iter()
-                .flat_map(|p| {
-                    let s = simplify_proof(p);
-                    match s {
-                        ProofTerm::Conjunction(inner) => inner,
-                        other => vec![other],
-                    }
-                })
-                .collect();
-            if simplified.len() == 1 {
-                // SAFETY: len == 1 guarantees .next() returns Some.
-                simplified
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| unreachable!("empty iter despite len == 1"))
-            } else {
-                ProofTerm::Conjunction(simplified)
+            let mut simplified = Vec::with_capacity(proofs.len());
+            for p in proofs {
+                match simplify_proof(p) {
+                    ProofTerm::Conjunction(inner) => simplified.extend(inner),
+                    other => simplified.push(other),
+                }
+            }
+            match simplified.pop() {
+                Some(only) if simplified.is_empty() => only,
+                Some(last) => {
+                    simplified.push(last);
+                    ProofTerm::Conjunction(simplified)
+                }
+                None => ProofTerm::Conjunction(simplified),
             }
         }
         ProofTerm::Disjunction(proof, idx) => {
@@ -238,30 +265,77 @@ pub fn simplify_proof(term: &ProofTerm) -> ProofTerm {
 /// Render a proof term as a human-readable string.
 #[must_use]
 pub fn proof_to_string(term: &ProofTerm) -> String {
+    let mut out = String::new();
+    write_proof_term(term, &mut out);
+    out
+}
+
+fn write_proof_term(term: &ProofTerm, out: &mut String) {
+    use std::fmt::Write as _;
     match term {
-        ProofTerm::Axiom(name) => format!("axiom({name})"),
-        ProofTerm::Hypothesis(name) => format!("hyp({name})"),
+        ProofTerm::Axiom(name) => {
+            out.push_str("axiom(");
+            out.push_str(name);
+            out.push(')');
+        }
+        ProofTerm::Hypothesis(name) => {
+            out.push_str("hyp(");
+            out.push_str(name);
+            out.push(')');
+        }
         ProofTerm::ModusPonens(imp, ant) => {
-            format!("mp({}, {})", proof_to_string(imp), proof_to_string(ant))
+            out.push_str("mp(");
+            write_proof_term(imp, out);
+            out.push_str(", ");
+            write_proof_term(ant, out);
+            out.push(')');
         }
         ProofTerm::Conjunction(proofs) => {
-            let parts: Vec<String> = proofs.iter().map(proof_to_string).collect();
-            format!("conj({})", parts.join(", "))
+            out.push_str("conj(");
+            for (i, p) in proofs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_proof_term(p, out);
+            }
+            out.push(')');
         }
         ProofTerm::Disjunction(proof, idx) => {
-            format!("disj({}, {idx})", proof_to_string(proof))
+            out.push_str("disj(");
+            write_proof_term(proof, out);
+            let _ = write!(out, ", {idx})");
         }
         ProofTerm::ForallIntro(var, body) => {
-            format!("forall({var}, {})", proof_to_string(body))
+            out.push_str("forall(");
+            out.push_str(var);
+            out.push_str(", ");
+            write_proof_term(body, out);
+            out.push(')');
         }
         ProofTerm::ExistsIntro(witness, body) => {
-            format!("exists({witness}, {})", proof_to_string(body))
+            out.push_str("exists(");
+            out.push_str(witness);
+            out.push_str(", ");
+            write_proof_term(body, out);
+            out.push(')');
         }
         ProofTerm::Rewrite(proof, from, to) => {
-            format!("rewrite({}, {from} -> {to})", proof_to_string(proof))
+            out.push_str("rewrite(");
+            write_proof_term(proof, out);
+            out.push_str(", ");
+            out.push_str(from);
+            out.push_str(" -> ");
+            out.push_str(to);
+            out.push(')');
         }
         ProofTerm::Cut(left, right, lemma) => {
-            format!("cut({}, {}, {lemma})", proof_to_string(left), proof_to_string(right))
+            out.push_str("cut(");
+            write_proof_term(left, out);
+            out.push_str(", ");
+            write_proof_term(right, out);
+            out.push_str(", ");
+            out.push_str(lemma);
+            out.push(')');
         }
     }
 }
@@ -425,6 +499,22 @@ mod tests {
         let term = ProofTerm::Conjunction(vec![ProofTerm::Axiom("only".to_string())]);
         let simplified = simplify_proof(&term);
         assert_eq!(simplified, ProofTerm::Axiom("only".to_string()));
+    }
+
+    #[test]
+    fn test_simplify_conjunction_preserves_empty_and_leaf_order() {
+        let empty = ProofTerm::Conjunction(Vec::new());
+        assert_eq!(simplify_proof(&empty), empty);
+        let a = ProofTerm::Axiom("a".into());
+        let b = ProofTerm::Hypothesis("b".into());
+        let c = ProofTerm::Axiom("c".into());
+        let term = ProofTerm::Conjunction(vec![
+            empty.clone(),
+            ProofTerm::Conjunction(vec![a.clone(), empty.clone()]),
+            b.clone(),
+            ProofTerm::Conjunction(vec![empty, c.clone()]),
+        ]);
+        assert_eq!(simplify_proof(&term), ProofTerm::Conjunction(vec![a, b, c]));
     }
 
     #[test]

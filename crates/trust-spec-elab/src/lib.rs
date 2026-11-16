@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -27,6 +28,7 @@
 //! goal may elaborate yet remain Pending if the auto-fragment cannot discharge
 //! it).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -39,8 +41,27 @@ use syn::{BinOp, Expr as SynExpr, Lit};
 // Rust carrier or a kernel-re-checked Clean declaration.
 use trust_symbols::KernelStatus;
 
+mod registered_carrier;
+pub use registered_carrier::{
+    AdtSchema, ConstructorSchema, RegisteredAdt, canonical_declaration_binding,
+    canonical_environment_binding,
+};
+#[cfg(test)]
+mod registered_domain_tests;
+
+// Trust (E9-ODT-FACE-SELF-CALL-1): the self-call over a nominal ODT import.
+mod odt_face_self_call;
+
+// Trust (E6 admission expansion I3′): the E6-only TREE producer.
+mod e6_tree;
+pub use e6_tree::{E6TreeArith, E6TreeCmp, E6TreeTerm, admit_e6_tree_function};
+
+// The same actual-body reader/renderer serves E6 intake and emitted-body gates.
+pub mod e6_import;
+pub use e6_import::admit_e6_only_body;
+
 fn nat() -> Expr {
-    Expr::const_(Name::from_string("Nat"), vec![])
+    Expr::const_(Name::interned("Nat"), vec![])
 }
 
 /// One supported fixed-width unsigned machine carrier.
@@ -63,6 +84,78 @@ impl MachineUIntWidth {
             Self::U16 => "UInt16",
             Self::U32 => "UInt32",
             Self::U64 => "UInt64",
+        }
+    }
+
+    const fn to_nat_const(self) -> &'static str {
+        match self {
+            Self::U8 => "UInt8.toNat",
+            Self::U16 => "UInt16.toNat",
+            Self::U32 => "UInt32.toNat",
+            Self::U64 => "UInt64.toNat",
+        }
+    }
+
+    const fn of_nat_const(self) -> &'static str {
+        match self {
+            Self::U8 => "UInt8.ofNat",
+            Self::U16 => "UInt16.ofNat",
+            Self::U32 => "UInt32.ofNat",
+            Self::U64 => "UInt64.ofNat",
+        }
+    }
+
+    const fn dec_eq_const(self) -> &'static str {
+        match self {
+            Self::U8 => "UInt8.decEq",
+            Self::U16 => "UInt16.decEq",
+            Self::U32 => "UInt32.decEq",
+            Self::U64 => "UInt64.decEq",
+        }
+    }
+
+    const fn inst_lt_const(self) -> &'static str {
+        match self {
+            Self::U8 => "instLTUInt8",
+            Self::U16 => "instLTUInt16",
+            Self::U32 => "instLTUInt32",
+            Self::U64 => "instLTUInt64",
+        }
+    }
+
+    const fn inst_le_const(self) -> &'static str {
+        match self {
+            Self::U8 => "instLEUInt8",
+            Self::U16 => "instLEUInt16",
+            Self::U32 => "instLEUInt32",
+            Self::U64 => "instLEUInt64",
+        }
+    }
+
+    const fn inst_decidable_lt_const(self) -> &'static str {
+        match self {
+            Self::U8 => "instDecidableUInt8Lt",
+            Self::U16 => "instDecidableUInt16Lt",
+            Self::U32 => "instDecidableUInt32Lt",
+            Self::U64 => "instDecidableUInt64Lt",
+        }
+    }
+
+    const fn inst_decidable_le_const(self) -> &'static str {
+        match self {
+            Self::U8 => "instDecidableUInt8Le",
+            Self::U16 => "instDecidableUInt16Le",
+            Self::U32 => "instDecidableUInt32Le",
+            Self::U64 => "instDecidableUInt64Le",
+        }
+    }
+
+    const fn inst_decidable_eq_const(self) -> &'static str {
+        match self {
+            Self::U8 => "instDecidableEqUInt8",
+            Self::U16 => "instDecidableEqUInt16",
+            Self::U32 => "instDecidableEqUInt32",
+            Self::U64 => "instDecidableEqUInt64",
         }
     }
 
@@ -136,6 +229,26 @@ impl MachineSIntWidth {
             Self::I128 => "i128",
         }
     }
+
+    const fn signed_lift_const(self) -> &'static str {
+        match self {
+            Self::I8 => "trust_checked_toInt8",
+            Self::I16 => "trust_checked_toInt16",
+            Self::I32 => "trust_checked_toInt32",
+            Self::I64 => "trust_checked_toInt64",
+            Self::I128 => "trust_checked_toInt128",
+        }
+    }
+
+    const fn signed_fits_const(self) -> &'static str {
+        match self {
+            Self::I8 => "trust_checked_fitsI8",
+            Self::I16 => "trust_checked_fitsI16",
+            Self::I32 => "trust_checked_fitsI32",
+            Self::I64 => "trust_checked_fitsI64",
+            Self::I128 => "trust_checked_fitsI128",
+        }
+    }
 }
 
 /// A compilation target's resolved pointer width.
@@ -173,6 +286,70 @@ impl TargetPointerWidth {
     }
 }
 
+/// The clause-binder spelling at which the E9 DISCHARGE lanes (cited
+/// `ensures … by thm`, uncited island defeq, and the citation sweep) bind one
+/// resolved Rust scalar type name on a target whose pointer width is
+/// `pointer_width`.
+///
+/// Every name except bare `usize`/`isize` is returned unchanged. Those two are
+/// resolved to the fixed-width machine spelling of the SAME width and
+/// signedness: `usize` on a 64-bit target binds exactly as `u64` (Clean carrier
+/// `UInt64`), `isize` exactly as `i64` (`BitVec 64` under the signed order key).
+///
+/// WHY NOT `usize64` (`Domain::USize`, carrier `BitVec 64`). A discharge goal
+/// applies the function's E6 kernel import to the clause binders
+/// ([`elaborate_ensures`] substitutes `result` with `self_fn(params…)`), and an
+/// admitted call is checked against the callee's DECLARED carriers, never
+/// coerced. The import is minted from the extracted body — and there are TWO
+/// extraction spellings of a pointer-sized integer, of which only the first
+/// feeds this lane. The verifier's extraction
+/// (`trust_mir_extract::extract_function_with_contract_bundle`, the lane whose
+/// bodies the E6 mint accumulates) collapses `usize`/`isize` to
+/// `Int { width: <target pointer width>, .. }`, so its carrier is `UInt64` on a
+/// 64-bit target — the same as `u64` — and `UInt32` on a 32-bit one. The
+/// FAITHFUL extraction (`trust_mir_extract::extract_function_faithful`, v25 B1,
+/// the trust-ir differential's lane) keeps `PtrSizedInt { signed }` instead,
+/// which `trust_certify::clean_island`'s `ty_to_domain` maps to `Machine(U64)`
+/// with the `64` HARD-CODED, and for which it has no signed case at all. So the
+/// carrier agreement this resolution rests on is the FIRST spelling's, where the
+/// width is the target's and the argument holds at every width this elaborator
+/// models; through the faithful spelling it would hold only at 64 bits, and
+/// `isize` would fail closed. The 2026-09-15 forwarding mint
+/// ([`admit_forwarding_function`]) does not weaken that: it takes the import's
+/// carriers from the callee's kernel-checked Clean declaration and requires the
+/// extracted parameter domains to AGREE with them before minting, so a target
+/// whose extracted `usize` carrier is not the declared one refuses the mint
+/// outright rather than coercing it. A `usize64` binder would type every
+/// `result`-mentioning clause on a
+/// `usize` function at `BitVec 64` against a `UInt64` import and be refused,
+/// which is precisely the form contracts on `usize` functions take. The
+/// statement-only lanes (runtime monitors, zero-authority denotation rows)
+/// apply no import and keep the `usize64` spelling.
+///
+/// SOUNDNESS. On a target of pointer width `w`, Rust's `usize` has exactly
+/// `uw`'s value range, wrapping arithmetic and order, so a clause over `usize`
+/// binders means the same thing read over `uw` binders. The width is the
+/// CALLER'S resolved target width, never the host's and never a default: a
+/// theorem stated over `UInt64` closes a `usize` clause only on a 64-bit
+/// target, and on a 32-bit target the goal quantifies over `UInt32`, which that
+/// proof term does not inhabit — the citation is a hard statement mismatch
+/// there, not a silently narrower claim. A width this elaborator does not model
+/// cannot be constructed ([`TargetPointerWidth::from_bits`] refuses it), and a
+/// caller that cannot resolve one must pass the bare name through unchanged so
+/// the binding gate keeps refusing it.
+#[must_use]
+pub fn discharge_binding_ty_for_target(name: &str, pointer_width: TargetPointerWidth) -> &str {
+    match (name, pointer_width) {
+        ("usize", TargetPointerWidth::W16) => "u16",
+        ("usize", TargetPointerWidth::W32) => "u32",
+        ("usize", TargetPointerWidth::W64) => "u64",
+        ("isize", TargetPointerWidth::W16) => "i16",
+        ("isize", TargetPointerWidth::W32) => "i32",
+        ("isize", TargetPointerWidth::W64) => "i64",
+        _ => name,
+    }
+}
+
 fn kernel_nat_lit(n: u128) -> Expr {
     match u64::try_from(n) {
         Ok(n) => Expr::nat_lit(n),
@@ -180,16 +357,78 @@ fn kernel_nat_lit(n: u128) -> Expr {
     }
 }
 
-fn bit_mask(bits: u32) -> u128 {
+// Bootstrap rustc cannot parse Trust's native signature clauses, while the
+// verified lane must retain those exact clause tokens. Each invocation below
+// owns its function body once. Trust injects `cfg(trust_verify)` only while
+// verification is active, selecting the native-clause expansion; an ordinary
+// compiler emits the same function and body without the clauses. build.rs only
+// registers the cfg name for stock Cargo's check-cfg lint; it never selects it.
+// (The same mechanism as `trust-budget`, `trust-intbound`, `trust-widthconv`
+// and `trust-floatbits`.)
+#[cfg(trust_verify)]
+macro_rules! trust_contract_fn {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) -> $ret:ident
+        clauses [$($clauses:tt)+]
+        { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        $vis fn $name($($arg: $arg_ty),*) -> $ret
+            $($clauses)+
+        { $($body)* }
+    };
+}
+
+#[cfg(not(trust_verify))]
+macro_rules! trust_contract_fn {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) -> $ret:ident
+        clauses [$($clauses:tt)+]
+        { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        $vis fn $name($($arg: $arg_ty),*) -> $ret { $($body)* }
+    };
+}
+
+trust_contract_fn! {
+/// The all-ones mask of a `bits`-wide carrier.
+///
+/// `bits` is the width of a closed BitVec carrier, so it lies in `1..=128`:
+/// the shift below is defined only below 128 and the 128-bit mask is the whole
+/// word. That range used to be an UNSTATED precondition — the verifier refuted
+/// the shift at `bits = 129` (measured 2026-09-13 on driver `dff2b22d1`) — and
+/// is now a `requires` that every caller establishes on the line before the
+/// call, because a width that reaches this function through an `Option`
+/// accessor is an opaque value to the verifier until it is compared.
+fn bit_mask(bits: u32) -> u128
+clauses [requires bits <= 128]
+{
     if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 }
 }
-
-fn signed_positive_max(bits: u32) -> u128 {
-    (1u128 << (bits - 1)) - 1
 }
 
-fn signed_negative_magnitude_max(bits: u32) -> u128 {
+trust_contract_fn! {
+/// `2^(bits-1) - 1`: the largest non-negative value of a `bits`-wide two's
+/// complement carrier. Width range as at [`bit_mask`]; `bits >= 1` is what
+/// keeps `bits - 1` from underflowing (refuted at `bits = 0` before).
+fn signed_positive_max(bits: u32) -> u128
+clauses [requires bits >= 1 requires bits <= 128]
+{
+    (1u128 << (bits - 1)) - 1
+}
+}
+
+trust_contract_fn! {
+/// `2^(bits-1)`: the magnitude of the most negative value of a `bits`-wide
+/// two's complement carrier. Width range as at [`bit_mask`].
+fn signed_negative_magnitude_max(bits: u32) -> u128
+clauses [requires bits >= 1 requires bits <= 128]
+{
     1u128 << (bits - 1)
+}
 }
 
 /// The arithmetic domain of a statement elaborated by this crate.
@@ -203,6 +442,22 @@ fn signed_negative_magnitude_max(bits: u32) -> u128 {
 pub enum Domain {
     /// Unbounded `Nat`.
     Nat,
+    /// Unbounded `Int` — the SECOND math domain, and the codomain of the
+    /// nat-lift table's signed and `Int`-targeted rows.
+    ///
+    /// Deliberately NOT a binding type: [`Self::from_binding_ty`] maps
+    /// `"nat"`/`"Nat"` and nothing maps to `Int`, so a clause binder can never
+    /// be declared at `Int`. The only ways into this domain are an explicit
+    /// `e as int` cast in a PROOF-position clause and an island definition
+    /// whose declared codomain is `Int`. That asymmetry is on purpose: `nat`
+    /// predates this work as a ratified binder spelling, while an `int` BINDER
+    /// would be a new authoritative surface spelling, which is the owner's to
+    /// ratify, not this lane's.
+    ///
+    /// It carries NO runtime monitor carrier (like [`Domain::OptionSigned`]):
+    /// a clause that reaches `Int` is kernel-goal-only and reports
+    /// `unmonitored` rather than minting an executable check.
+    Int,
     /// A fixed-width unsigned machine integer with wrapping arithmetic.
     Machine(MachineUIntWidth),
     /// A fixed-width signed machine integer, represented by an exact
@@ -234,6 +489,10 @@ pub enum Domain {
     /// and the exhaustive matches are the checklist that keeps a future
     /// variant honest.
     OptionSigned(MachineSIntWidth),
+    /// An exact, checked kernel datatype application. This transports a
+    /// mathematical carrier, not a Rust representation or a body proof.
+    /// Use the environment-aware typed entry points to revalidate it.
+    RegisteredAdt(RegisteredAdt),
 }
 
 impl Domain {
@@ -284,11 +543,11 @@ impl Domain {
 
     fn bitvec_bits(&self) -> Option<u32> {
         match self {
-            Domain::OptionSigned(_) => None,
+            Domain::OptionSigned(_) | Domain::RegisteredAdt(_) => None,
             Domain::Signed(width) => Some(width.bits()),
             Domain::U128 => Some(128),
             Domain::USize(width) | Domain::ISize(width) => Some(width.bits()),
-            Domain::Nat | Domain::Machine(_) | Domain::Bool => None,
+            Domain::Nat | Domain::Int | Domain::Machine(_) | Domain::Bool => None,
         }
     }
 
@@ -296,14 +555,42 @@ impl Domain {
         matches!(self, Domain::Signed(_) | Domain::ISize(_))
     }
 
+    /// Whether this domain has NEGATIVE values a clause may spell.
+    ///
+    /// [`Self::is_signed`] answers "is a two's-complement machine carrier",
+    /// which is what the BitVec helpers key on; this answers the different
+    /// question the literal and unary-negation sites ask, and [`Domain::Int`]
+    /// is the one domain where the two answers differ.
+    fn admits_negative_values(&self) -> bool {
+        self.is_signed() || matches!(self, Domain::Int)
+    }
+
+    /// Whether this is one of the two UNBOUNDED math domains — the codomains
+    /// of the nat-lift table (§3.1 of the nat-lift design).
+    fn is_math(&self) -> bool {
+        match self {
+            Domain::Nat | Domain::Int => true,
+            Domain::Machine(_)
+            | Domain::Signed(_)
+            | Domain::U128
+            | Domain::USize(_)
+            | Domain::ISize(_)
+            | Domain::Bool
+            | Domain::OptionSigned(_)
+            | Domain::RegisteredAdt(_) => false,
+        }
+    }
+
     fn rust_name(&self) -> &'static str {
         match self {
+            Domain::RegisteredAdt(_) => "registered kernel datatype",
             Domain::OptionSigned(MachineSIntWidth::I8) => "Option<i8>",
             Domain::OptionSigned(MachineSIntWidth::I16) => "Option<i16>",
             Domain::OptionSigned(MachineSIntWidth::I32) => "Option<i32>",
             Domain::OptionSigned(MachineSIntWidth::I64) => "Option<i64>",
             Domain::OptionSigned(MachineSIntWidth::I128) => "Option<i128>",
             Domain::Nat => "nat",
+            Domain::Int => "int",
             Domain::Machine(width) => width.rust_name(),
             Domain::Signed(width) => width.rust_name(),
             Domain::U128 => "u128",
@@ -325,14 +612,14 @@ impl Domain {
 
     fn bitvec_to_nat(&self, value: Expr) -> Result<Expr, String> {
         Ok(Expr::apps(
-            Expr::const_(Name::from_string("BitVec.toNat"), vec![]),
+            Expr::const_(Name::interned("BitVec.toNat"), vec![]),
             [self.bitvec_width_expr()?, value],
         ))
     }
 
     fn bitvec_of_nat(&self, value: Expr) -> Result<Expr, String> {
         Ok(Expr::apps(
-            Expr::const_(Name::from_string("BitVec.ofNat"), vec![]),
+            Expr::const_(Name::interned("BitVec.ofNat"), vec![]),
             [self.bitvec_width_expr()?, value],
         ))
     }
@@ -341,13 +628,23 @@ impl Domain {
         let bits = self
             .bitvec_bits()
             .ok_or_else(|| format!("`{}` is not represented by a BitVec", self.rust_name()))?;
+        // The width arrives through an `Option`, which the verifier reads as an
+        // opaque call result: restate the closed carrier range on the line
+        // before the shift so `bits - 1` and `1 << (bits - 1)` discharge
+        // (measured 2026-09-13 on `dff2b22d1`: refuted at 0 and 129 without it).
+        if bits < 1 || bits > 128 {
+            return Err(format!(
+                "`{}` has BitVec width {bits}; the width helpers accept 1..=128",
+                self.rust_name()
+            ));
+        }
         let nat_value = self.bitvec_to_nat(value)?;
         if self.is_signed() {
             // Flipping the sign bit maps two's-complement signed order to
             // ordinary unsigned order, bijectively:
             //   MIN..-1 ↦ 0..2^(w-1)-1, 0..MAX ↦ 2^(w-1)..2^w-1.
             Ok(Expr::apps(
-                Expr::const_(Name::from_string("Nat.xor"), vec![]),
+                Expr::const_(Name::interned("Nat.xor"), vec![]),
                 [nat_value, kernel_nat_lit(1u128 << (bits - 1))],
             ))
         } else {
@@ -362,11 +659,20 @@ impl Domain {
     /// can never be minted for a width the target does not pin.
     fn runtime_domain(&self) -> Result<RuntimeMonitorDomain, String> {
         match self {
+            Domain::RegisteredAdt(_) => Err(self.registered_operation_refusal("runtime monitoring")),
             Domain::OptionSigned(_) => Err(format!(
                 "`{}` has no runtime monitor carrier (Option results are \
                  kernel-goal-only)",
                 self.rust_name()
             )),
+            // `Int` is kernel-goal-only, exactly like the Option carrier above
+            // it: the lift table's codomain has no executable Rust twin, so a
+            // clause that reaches it reports `unmonitored` rather than minting
+            // a monitor at some guessed width.
+            Domain::Int => Err(
+                "`int` has no runtime monitor carrier (a lifted clause is kernel-goal-only)"
+                    .to_string(),
+            ),
             Domain::Nat => Ok(RuntimeMonitorDomain::Nat),
             Domain::Machine(MachineUIntWidth::U8) => Ok(RuntimeMonitorDomain::U8),
             Domain::Machine(MachineUIntWidth::U16) => Ok(RuntimeMonitorDomain::U16),
@@ -391,17 +697,27 @@ impl Domain {
     /// The carrier type constant (`Nat` / `UInt64` / `Bool`).
     fn ty(&self) -> Expr {
         match self {
+            Domain::RegisteredAdt(carrier) => carrier.ty(),
             Domain::OptionSigned(width) => Expr::app(
-                Expr::const_(Name::from_string("Option"), vec![Level::zero()]),
+                Expr::const_(Name::interned("Option"), vec![Level::zero()]),
                 Domain::Signed(*width).ty(),
             ),
             Domain::Nat => nat(),
-            Domain::Machine(width) => Expr::const_(Name::from_string(width.carrier()), vec![]),
-            Domain::Signed(_) | Domain::U128 | Domain::USize(_) | Domain::ISize(_) => Expr::app(
-                Expr::const_(Name::from_string("BitVec"), vec![]),
-                self.bitvec_width_expr().expect("closed BitVec domain"),
+            Domain::Int => Expr::const_(Name::interned("Int"), vec![]),
+            Domain::Machine(width) => Expr::const_(Name::interned(width.carrier()), vec![]),
+            Domain::Signed(width) => Expr::app(
+                Expr::const_(Name::interned("BitVec"), vec![]),
+                Expr::nat_lit(u64::from(width.bits())),
             ),
-            Domain::Bool => Expr::const_(Name::from_string("Bool"), vec![]),
+            Domain::U128 => Expr::app(
+                Expr::const_(Name::interned("BitVec"), vec![]),
+                Expr::nat_lit(128),
+            ),
+            Domain::USize(width) | Domain::ISize(width) => Expr::app(
+                Expr::const_(Name::interned("BitVec"), vec![]),
+                Expr::nat_lit(u64::from(width.bits())),
+            ),
+            Domain::Bool => Expr::const_(Name::interned("Bool"), vec![]),
         }
     }
 
@@ -409,35 +725,76 @@ impl Domain {
     /// [`Domain::Bool`] (arithmetic is gated in `elab_term`); the arm returns an
     /// unresolved sentinel so a missed gate fails as a kernel `UnknownConst`
     /// rather than silently or by panic.
-    fn op(&self, which: &str) -> String {
+    fn op(&self, which: &str) -> Cow<'static, str> {
         match self {
-            Domain::OptionSigned(_) => "Option.__no_arithmetic__".to_string(),
-            Domain::Nat => format!("Nat.{which}"),
-            Domain::Machine(width) => format!("{}.{which}", width.carrier()),
+            Domain::RegisteredAdt(_) => Cow::Borrowed("RegisteredAdt.__no_arithmetic__"),
+            Domain::OptionSigned(_) => Cow::Borrowed("Option.__no_arithmetic__"),
+            Domain::Nat => match which {
+                "add" => Cow::Borrowed("Nat.add"),
+                "sub" => Cow::Borrowed("Nat.sub"),
+                "mul" => Cow::Borrowed("Nat.mul"),
+                "div" => Cow::Borrowed("Nat.div"),
+                "mod" => Cow::Borrowed("Nat.mod"),
+                _ => Cow::Owned(format!("Nat.{which}")),
+            },
+            Domain::Int => match which {
+                "add" => Cow::Borrowed("Int.add"),
+                "sub" => Cow::Borrowed("Int.sub"),
+                "mul" => Cow::Borrowed("Int.mul"),
+                "div" => Cow::Borrowed("Int.div"),
+                "mod" => Cow::Borrowed("Int.mod"),
+                _ => Cow::Owned(format!("Int.{which}")),
+            },
+            Domain::Machine(width) => match (width, which) {
+                (MachineUIntWidth::U8, "add") => Cow::Borrowed("UInt8.add"),
+                (MachineUIntWidth::U8, "sub") => Cow::Borrowed("UInt8.sub"),
+                (MachineUIntWidth::U8, "mul") => Cow::Borrowed("UInt8.mul"),
+                (MachineUIntWidth::U16, "add") => Cow::Borrowed("UInt16.add"),
+                (MachineUIntWidth::U16, "sub") => Cow::Borrowed("UInt16.sub"),
+                (MachineUIntWidth::U16, "mul") => Cow::Borrowed("UInt16.mul"),
+                (MachineUIntWidth::U32, "add") => Cow::Borrowed("UInt32.add"),
+                (MachineUIntWidth::U32, "sub") => Cow::Borrowed("UInt32.sub"),
+                (MachineUIntWidth::U32, "mul") => Cow::Borrowed("UInt32.mul"),
+                (MachineUIntWidth::U64, "add") => Cow::Borrowed("UInt64.add"),
+                (MachineUIntWidth::U64, "sub") => Cow::Borrowed("UInt64.sub"),
+                (MachineUIntWidth::U64, "mul") => Cow::Borrowed("UInt64.mul"),
+                _ => Cow::Owned(format!("{}.{which}", width.carrier())),
+            },
             Domain::Signed(_) | Domain::U128 | Domain::USize(_) | Domain::ISize(_) => {
-                format!("BitVec.__use_exact_{which}_encoding__")
+                Cow::Owned(format!("BitVec.__use_exact_{which}_encoding__"))
             }
-            Domain::Bool => "Bool.__no_arithmetic__".to_string(),
+            Domain::Bool => Cow::Borrowed("Bool.__no_arithmetic__"),
         }
     }
 
     fn arithmetic(&self, which: &str, lhs: Expr, rhs: Expr) -> Result<Expr, String> {
         match self {
+            Domain::RegisteredAdt(_) => Err(self.registered_operation_refusal("arithmetic")),
             Domain::OptionSigned(_) => Err(format!(
                 "arithmetic is not supported for `{}` (an Option carrier has \
                  constructors and equality only)",
                 self.rust_name()
             )),
-            Domain::Nat | Domain::Machine(_) => {
+            // `Int` joins the direct-application arm: `Int.add`/`Int.sub`/
+            // `Int.mul` are prelude constants (MEASURED by
+            // `tests/nat_lift_probes.rs::pin_int_prelude_constants_present`),
+            // and unlike the machine carriers there is no wrap to re-encode.
+            // `div`/`mod` reach this arm only behind the literal-divisor gate
+            // in `elab_term`, and `Int.div`/`Int.mod` exist there too.
+            Domain::Nat | Domain::Int | Domain::Machine(_) => {
                 let op = self.op(which);
-                Ok(Expr::apps(Expr::const_(Name::from_string(&op), vec![]), [lhs, rhs]))
+                Ok(Expr::apps(Expr::const_(Name::interned(&op), vec![]), [lhs, rhs]))
             }
             Domain::Signed(_) | Domain::U128 | Domain::USize(_) | Domain::ISize(_) => {
                 let lhs = self.bitvec_to_nat(lhs)?;
                 let rhs = self.bitvec_to_nat(rhs)?;
                 let nat_value = match which {
-                    "add" | "mul" => Expr::apps(
-                        Expr::const_(Name::from_string(&format!("Nat.{which}")), vec![]),
+                    "add" => Expr::apps(
+                        Expr::const_(Name::interned("Nat.add"), vec![]),
+                        [lhs, rhs],
+                    ),
+                    "mul" => Expr::apps(
+                        Expr::const_(Name::interned("Nat.mul"), vec![]),
                         [lhs, rhs],
                     ),
                     "sub" => {
@@ -445,17 +802,22 @@ impl Domain {
                         // is congruent to `a-b (mod 2^w)`.  Re-embedding via
                         // `BitVec.ofNat` therefore gives exact wrapping
                         // subtraction without relying on an unseeded BitVec op.
-                        let bits = self.bitvec_bits().expect("closed BitVec domain");
+                        let Some(bits) = self.bitvec_bits() else {
+                            return Err(format!(
+                                "`{}` is not represented by a BitVec",
+                                self.rust_name()
+                            ));
+                        };
                         let modulus = Expr::apps(
-                            Expr::const_(Name::from_string("Nat.pow"), vec![]),
+                            Expr::const_(Name::interned("Nat.pow"), vec![]),
                             [Expr::nat_lit(2), Expr::nat_lit(u64::from(bits))],
                         );
                         let biased = Expr::apps(
-                            Expr::const_(Name::from_string("Nat.add"), vec![]),
+                            Expr::const_(Name::interned("Nat.add"), vec![]),
                             [lhs, modulus],
                         );
                         Expr::apps(
-                            Expr::const_(Name::from_string("Nat.sub"), vec![]),
+                            Expr::const_(Name::interned("Nat.sub"), vec![]),
                             [biased, rhs],
                         )
                     }
@@ -477,19 +839,38 @@ impl Domain {
     /// `<Carrier>.toNat` — sound and definitional. `Nat` compares directly.
     /// Never called for [`Domain::Bool`] (ordering is gated in `elaborate_prop`).
     fn cmp(&self, name: &str, a: Expr, b: Expr) -> Expr {
+        let nat_cmp = match name {
+            "le" => Cow::Borrowed("Nat.le"),
+            "lt" => Cow::Borrowed("Nat.lt"),
+            _ => Cow::Owned(format!("Nat.{name}")),
+        };
         match self {
+            Domain::RegisteredAdt(_) => nat_pred("RegisteredAdt.__no_ordering__", a, b),
             Domain::OptionSigned(_) => nat_pred("Option.__no_ordering__", a, b),
-            Domain::Nat => nat_pred(&format!("Nat.{name}"), a, b),
+            Domain::Nat => nat_pred(&nat_cmp, a, b),
+            // `Int.le`/`Int.lt` are present in the pinned prelude — MEASURED,
+            // not assumed: the nat-lift design's open risk R-7 said their
+            // availability was unknown (they are lazily initialised behind an
+            // import-mode switch), and `pin_int_prelude_constants_present` is
+            // the measurement that closes it. If a future pin drops them, that
+            // test goes red before any goal does.
+            Domain::Int => {
+                let int_cmp = match name {
+                    "le" => Cow::Borrowed("Int.le"),
+                    "lt" => Cow::Borrowed("Int.lt"),
+                    _ => Cow::Owned(format!("Int.{name}")),
+                };
+                nat_pred(&int_cmp, a, b)
+            }
             Domain::Machine(width) => {
-                let carrier = width.carrier();
-                let to_nat = Expr::const_(Name::from_string(&format!("{carrier}.toNat")), vec![]);
+                let to_nat = Expr::const_(Name::interned(width.to_nat_const()), vec![]);
                 let an = Expr::app(to_nat.clone(), a);
                 let bn = Expr::app(to_nat, b);
-                nat_pred(&format!("Nat.{name}"), an, bn)
+                nat_pred(&nat_cmp, an, bn)
             }
             Domain::Signed(_) | Domain::U128 | Domain::USize(_) | Domain::ISize(_) => {
                 match (self.bitvec_order_key(a), self.bitvec_order_key(b)) {
-                    (Ok(an), Ok(bn)) => nat_pred(&format!("Nat.{name}"), an, bn),
+                    (Ok(an), Ok(bn)) => nat_pred(&nat_cmp, an, bn),
                     _ => {
                         nat_pred("BitVec.__invalid_ordering__", Expr::nat_lit(0), Expr::nat_lit(0))
                     }
@@ -504,7 +885,7 @@ impl Domain {
         Expr::app(
             Expr::app(
                 Expr::app(
-                    Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
+                    Expr::const_(Name::interned("Eq"), vec![Level::succ(Level::zero())]),
                     self.ty(),
                 ),
                 lhs,
@@ -518,21 +899,41 @@ impl Domain {
     /// the arm returns an unresolved sentinel (see [`Domain::op`]).
     fn zero(&self) -> Expr {
         match self {
+            Domain::RegisteredAdt(_) => Expr::const_(Name::interned("RegisteredAdt.__no_zero__"), vec![]),
             Domain::OptionSigned(_) => {
-                Expr::const_(Name::from_string("Option.__no_zero__"), vec![])
+                Expr::const_(Name::interned("Option.__no_zero__"), vec![])
             }
-            Domain::Nat => Expr::const_(Name::from_string("Nat.zero"), vec![]),
-            Domain::Machine(width) => {
-                let carrier = width.carrier();
-                Expr::app(
-                    Expr::const_(Name::from_string(&format!("{carrier}.ofNat")), vec![]),
-                    Expr::const_(Name::from_string("Nat.zero"), vec![]),
-                )
-            }
-            Domain::Signed(_) | Domain::U128 | Domain::USize(_) | Domain::ISize(_) => self
-                .bitvec_of_nat(Expr::const_(Name::from_string("Nat.zero"), vec![]))
-                .expect("closed BitVec domain"),
-            Domain::Bool => Expr::const_(Name::from_string("Bool.__no_zero__"), vec![]),
+            Domain::Nat => Expr::const_(Name::interned("Nat.zero"), vec![]),
+            Domain::Int => Expr::app(
+                Expr::const_(Name::interned("Int.ofNat"), vec![]),
+                Expr::const_(Name::interned("Nat.zero"), vec![]),
+            ),
+            Domain::Machine(width) => Expr::app(
+                Expr::const_(Name::interned(width.of_nat_const()), vec![]),
+                Expr::const_(Name::interned("Nat.zero"), vec![]),
+            ),
+            Domain::Signed(width) => Expr::apps(
+                Expr::const_(Name::interned("BitVec.ofNat"), vec![]),
+                [
+                    Expr::nat_lit(u64::from(width.bits())),
+                    Expr::const_(Name::interned("Nat.zero"), vec![]),
+                ],
+            ),
+            Domain::U128 => Expr::apps(
+                Expr::const_(Name::interned("BitVec.ofNat"), vec![]),
+                [
+                    Expr::nat_lit(128),
+                    Expr::const_(Name::interned("Nat.zero"), vec![]),
+                ],
+            ),
+            Domain::USize(width) | Domain::ISize(width) => Expr::apps(
+                Expr::const_(Name::interned("BitVec.ofNat"), vec![]),
+                [
+                    Expr::nat_lit(u64::from(width.bits())),
+                    Expr::const_(Name::interned("Nat.zero"), vec![]),
+                ],
+            ),
+            Domain::Bool => Expr::const_(Name::interned("Bool.__no_zero__"), vec![]),
         }
     }
 
@@ -552,12 +953,20 @@ impl Domain {
     /// tests were minted against.
     fn numeral(&self, n: u128) -> Result<Expr, String> {
         match self {
+            Domain::RegisteredAdt(_) => Err(self.registered_operation_refusal("integer literals")),
             Domain::OptionSigned(_) => Err(format!(
                 "an integer literal is not a `{}` (write `Some(<literal>)` or \
                  `None`)",
                 self.rust_name()
             )),
             Domain::Nat => Ok(kernel_nat_lit(n)),
+            // Unbounded: no range check, by definition. `Int.ofNat` of the
+            // compact `Nat` literal keeps the term constant-size, the same
+            // property the `Nat` row above relies on.
+            Domain::Int => Ok(Expr::app(
+                Expr::const_(Name::interned("Int.ofNat"), vec![]),
+                kernel_nat_lit(n),
+            )),
             Domain::Machine(width) => {
                 if n > width.max_value() {
                     return Err(format!(
@@ -566,14 +975,24 @@ impl Domain {
                         width.max_value()
                     ));
                 }
-                let carrier = width.carrier();
                 Ok(Expr::app(
-                    Expr::const_(Name::from_string(&format!("{carrier}.ofNat")), vec![]),
+                    Expr::const_(Name::interned(width.of_nat_const()), vec![]),
                     kernel_nat_lit(n),
                 ))
             }
             Domain::Signed(_) | Domain::ISize(_) => {
-                let bits = self.bitvec_bits().expect("closed BitVec domain");
+                let Some(bits) = self.bitvec_bits() else {
+                    return Err(format!(
+                        "`{}` is not represented by a BitVec",
+                        self.rust_name()
+                    ));
+                };
+                if bits < 1 || bits > 128 {
+                    return Err(format!(
+                        "`{}` has BitVec width {bits}; the width helpers accept 1..=128",
+                        self.rust_name()
+                    ));
+                }
                 let max = signed_positive_max(bits);
                 if n > max {
                     return Err(format!(
@@ -584,7 +1003,18 @@ impl Domain {
                 self.bitvec_of_nat(kernel_nat_lit(n))
             }
             Domain::U128 | Domain::USize(_) => {
-                let bits = self.bitvec_bits().expect("closed BitVec domain");
+                let Some(bits) = self.bitvec_bits() else {
+                    return Err(format!(
+                        "`{}` is not represented by a BitVec",
+                        self.rust_name()
+                    ));
+                };
+                if bits < 1 || bits > 128 {
+                    return Err(format!(
+                        "`{}` has BitVec width {bits}; the width helpers accept 1..=128",
+                        self.rust_name()
+                    ));
+                }
                 let max = bit_mask(bits);
                 if n > max {
                     return Err(format!(
@@ -599,10 +1029,33 @@ impl Domain {
     }
 
     fn negative_numeral(&self, magnitude: u128) -> Result<Expr, String> {
+        // `Int` is unbounded, so `-m` is `Int.negSucc (m - 1)` with no range
+        // check and no bit pattern. `-0` is `Int.ofNat 0`, not `negSucc`,
+        // because `negSucc k` denotes `-(k+1)` and so has no zero.
+        if matches!(self, Domain::Int) {
+            if magnitude == 0 {
+                return Ok(self.zero());
+            }
+            return Ok(Expr::app(
+                Expr::const_(Name::interned("Int.negSucc"), vec![]),
+                kernel_nat_lit(magnitude - 1),
+            ));
+        }
         if !self.is_signed() {
             return Err(format!("a negative literal is not supported for `{}`", self.rust_name()));
         }
-        let bits = self.bitvec_bits().expect("closed signed BitVec domain");
+        let Some(bits) = self.bitvec_bits() else {
+            return Err(format!(
+                "`{}` is not represented by a BitVec",
+                self.rust_name()
+            ));
+        };
+        if bits < 1 || bits > 128 {
+            return Err(format!(
+                "`{}` has BitVec width {bits}; the width helpers accept 1..=128",
+                self.rust_name()
+            ));
+        }
         let max = signed_negative_magnitude_max(bits);
         if magnitude > max {
             return Err(format!(
@@ -619,7 +1072,7 @@ impl Domain {
     fn bool_lit(&self, b: bool) -> Result<Expr, String> {
         match self {
             Domain::Bool => Ok(Expr::const_(
-                Name::from_string(if b { "Bool.true" } else { "Bool.false" }),
+                Name::interned(if b { "Bool.true" } else { "Bool.false" }),
                 vec![],
             )),
             _ => Err("a `true`/`false` literal is only supported for a `bool` binding".into()),
@@ -638,9 +1091,9 @@ impl Domain {
             Domain::Signed(width) => Some(width.bits()),
             Domain::U128 => Some(128),
             Domain::USize(width) | Domain::ISize(width) => Some(width.bits()),
-            Domain::Nat | Domain::Bool => None,
+            Domain::Nat | Domain::Int | Domain::Bool => None,
             // No shifts on an Option carrier.
-            Domain::OptionSigned(_) => None,
+            Domain::OptionSigned(_) | Domain::RegisteredAdt(_) => None,
         }
     }
 
@@ -655,12 +1108,14 @@ impl Domain {
         match self {
             Domain::Bool => true,
             Domain::Nat
+            | Domain::Int
             | Domain::Machine(_)
             | Domain::Signed(_)
             | Domain::U128
             | Domain::USize(_)
             | Domain::ISize(_)
-            | Domain::OptionSigned(_) => false,
+            | Domain::OptionSigned(_)
+            | Domain::RegisteredAdt(_) => false,
         }
     }
 
@@ -674,23 +1129,933 @@ impl Domain {
     #[must_use]
     pub fn carrier(&self) -> Carrier {
         match self {
+            Domain::RegisteredAdt(carrier) => Carrier::RegisteredAdt(carrier.clone()),
             Domain::Nat => Carrier::Nat,
+            Domain::Int => Carrier::Int,
             Domain::Machine(width) => Carrier::UInt(*width),
-            Domain::Signed(_) | Domain::U128 | Domain::USize(_) | Domain::ISize(_) => {
-                Carrier::BitVec(self.bitvec_bits().expect("closed BitVec domain"))
-            }
+            Domain::Signed(width) => Carrier::BitVec(width.bits()),
+            Domain::U128 => Carrier::BitVec(128),
+            Domain::USize(width) | Domain::ISize(width) => Carrier::BitVec(width.bits()),
             Domain::Bool => Carrier::Bool,
             Domain::OptionSigned(width) => {
                 Carrier::Option(Box::new(Domain::Signed(*width).carrier()))
             }
         }
     }
+
+    /// Whether a value of `self` and a value of `other` are READ alike: one
+    /// carrier and one signedness. `Domain -> Carrier` is not injective
+    /// (`BitVec 128` is the carrier of `u128` and of `i128`), so equal carriers
+    /// alone let a relation read a signed value in unsigned order. The
+    /// literal, ordering, division and shift encodings of a `BitVec` domain key
+    /// on exactly these two facts, which is why `isize` on a 64-bit target and
+    /// `i64` read alike while `u128` and `i128` do not.
+    fn reads_like(&self, other: &Domain) -> bool {
+        self.carrier() == other.carrier() && self.is_signed() == other.is_signed()
+    }
+
+    fn registered_operation_refusal(&self, operation: &str) -> String {
+        format!(
+            "{operation} has no checked encoding for {}; registered datatypes currently support \
+                 exact-carrier bindings, admitted calls and equality. Use a checked model function \
+                 for this operation or supply its representation proof before extending the encoding",
+            self.carrier().clean_name()
+        )
+    }
+
+    fn validate_in(&self, env: &Environment) -> Result<(), String> {
+        match self {
+            Domain::RegisteredAdt(carrier) => carrier.validate_in(env),
+            _ => Ok(()),
+        }
+    }
+}
+
+// =====================================================================
+// nat-lift (design `scratchpad/designs/design-nat-lift.v2.md`): letting a
+// machine-integer Rust clause cite a `Nat`/`Int`-level Lean definition.
+//
+// THE PROBLEM THIS SOLVES. Every owner Lean model is written over unbounded
+// `Nat`/`Int`; a Rust clause atom has ONE machine carrier and its arguments are
+// never coerced. So a `u64` function could not apply a `Nat`-carrier definition
+// at all ("declares parameter 0 at carrier `Nat`, but the argument is a `u64`
+// term ... never coerced"), and "benefit from our Lean definitions" meant
+// restating every definition over `UInt64` first.
+//
+// WHAT IS ADDED. A closed table of EXACT integer injections out of the machine
+// carriers, reachable ONLY through the ratified explicit spelling `e as nat` /
+// `e as int` (spec surface §12.3), and ONLY in a PROOF-position clause
+// elaboration that asked for it ([`ClauseMode::ProofLift`]).
+//
+// WHAT IS NOT ADDED, and why not.
+//   * The IMPLICIT lift — the same injection inserted by the compiler at a
+//     `Nat`/`Int`-declared parameter, so the clause reads
+//     `ensures result == clamp_nat(c, d)` — needs decision OR-1, because
+//     the standing text says an argument is "never coerced" and the implicit
+//     form changes what an authored clause MEANS. Until then a machine term at
+//     a math position gets [`LiftRefusal::CastRequired`], which prints the cast
+//     to write.
+//   * Instantiating a `Nat`-quantified cited theorem at lifted arguments, and
+//     any compiler-proposed lemma chain, need decision OR-2: they change
+//     what a "cited" and an "uncited" row mean. Until then a `Nat`-level
+//     theorem cited for a machine-level goal is refused with the one-line
+//     wrapper theorem printed.
+//   * `usize`/`isize` are refused outright ([`LiftRefusal::PointerWidth`]).
+//     Two independent reasons: E9 bindings resolve bare `usize` only through
+//     the target-aware entry points, and the compiler mint records an unsigned
+//     `PtrSizedInt` as `Machine(U64)` on EVERY target — so a 32-bit target
+//     would lift at the wrong width. An untested row in the goal-construction
+//     TCB is a bad trade.
+//
+// SOUNDNESS. Every discharge is still `reject_untyped_goal` followed by a
+// kernel check of the proof against the elaborated goal, so a wrong lift
+// cannot make a FALSE kernel theorem; it could make a TRUE theorem about a
+// proposition the author did not write. That is goal-construction TCB, and
+// `docs/TCB.md` names exactly three additions: this table, the
+// self-determination rule below, and the mint's recorded return domain for a
+// lifted call-headed term (which is why that one is cross-checked twice).
+// =====================================================================
+
+/// Which clause fragment one elaboration speaks.
+///
+/// The mode is an explicit PARAMETER of the public entry points and lives in a
+/// thread-local for the duration of a single synchronous elaboration — it is
+/// deliberately NOT a field of [`FacetTable`], because one facet table is
+/// handed to the body-mint loop as well, and a mode carried by the table would
+/// let a Rust BODY be elaborated with lifts in it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClauseMode {
+    /// Every public entry point's behaviour before the nat-lift work, to the
+    /// byte. `e as nat` is `unsupported term shape` here, exactly as it was.
+    #[default]
+    Strict,
+    /// A PROOF-position user clause: the explicit `as nat` / `as int` lift is
+    /// recognized. Nothing else changes; every new branch is reached only
+    /// where `Strict` returns an `Err`.
+    ProofLift,
+}
+
+/// The extra inputs a [`ClauseMode::ProofLift`] elaboration needs, as a struct
+/// so that a later increment (the `requires`-as-hypotheses lane) adds a field
+/// rather than another positional argument to six call sites.
+#[derive(Clone, Debug, Default)]
+pub struct ProofClauseInputs {
+    mode: ClauseMode,
+    /// The Rust spelling of the contracted function's RETURN type, as the
+    /// compiler's own type resolution gives it — the SECOND, independent read
+    /// of the domain the E6 mint recorded for that function. See
+    /// [`TermPin`]'s self-function rule.
+    result_ty: Option<String>,
+}
+
+impl ProofClauseInputs {
+    /// The pre-existing behaviour: no lift, no extra inputs.
+    #[must_use]
+    pub fn strict() -> Self {
+        Self { mode: ClauseMode::Strict, result_ty: None }
+    }
+
+    /// A proof-position clause that may carry explicit lifts.
+    ///
+    /// `result_ty` is the compiler's resolved return-type spelling, or `None`
+    /// when the caller has no second read — in which case a lift of a term
+    /// headed by the self function fails CLOSED
+    /// rather than trusting the mint's single recorded domain.
+    #[must_use]
+    pub fn proof_lift(result_ty: Option<&str>) -> Self {
+        Self { mode: ClauseMode::ProofLift, result_ty: result_ty.map(ToString::to_string) }
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> ClauseMode {
+        self.mode
+    }
+}
+
+/// The two UNBOUNDED math types a lift may target. Closed on purpose: these
+/// are the only codomains in the table, and a `Carrier` outside them is not a
+/// lift target at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MathTy {
+    Nat,
+    Int,
+}
+
+impl MathTy {
+    fn domain(self) -> Domain {
+        match self {
+            MathTy::Nat => Domain::Nat,
+            MathTy::Int => Domain::Int,
+        }
+    }
+
+    fn spelling(self) -> &'static str {
+        match self {
+            MathTy::Nat => "nat",
+            MathTy::Int => "int",
+        }
+    }
+
+    /// The math type a spec cast names, or `None` for any other target.
+    ///
+    /// Read by SPELLING, like every other type name in the clause fragment:
+    /// `"nat"`/`"Nat"` is already the ratified clause-fragment spelling of the
+    /// unbounded natural domain ([`Domain::from_binding_ty`]), so `as nat`
+    /// inherits a reservation that predates this work rather than creating a
+    /// new one.
+    fn from_syn_type(ty: &syn::Type) -> Option<Self> {
+        let syn::Type::Path(p) = ty else { return None };
+        if p.qself.is_some() {
+            return None;
+        }
+        let ident = p.path.get_ident()?;
+        if ident == "nat" || ident == "Nat" {
+            Some(MathTy::Nat)
+        } else if ident == "int" || ident == "Int" {
+            Some(MathTy::Int)
+        } else {
+            None
+        }
+    }
+}
+
+/// One EXACT integer injection out of a Rust domain into a math type.
+///
+/// Every variant is a total, injective, order-preserving map onto the exact
+/// integer the Rust value denotes. There is deliberately no variant in the
+/// other direction: nothing here ever emits `UIntN.ofNat` or `BitVec.ofNat`,
+/// which WRAP (`UInt64.toNat (UInt64.ofNat (2^64)) = 0`, measured in
+/// `tests/nat_lift_probes.rs`), so the compiler can never narrow an unbounded
+/// value on the author's behalf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Lift {
+    /// Already at the target math type — `(n as nat)` on a `nat` binder.
+    Identity,
+    /// `UIntN.toNat e` — the underlying `Fin 2^N` value.
+    UIntToNat(MachineUIntWidth),
+    /// `BitVec.toNat 128 e` — the `u128` row.
+    BitVecToNat,
+    /// `Int.ofNat (<inner> e)` — every unsigned row's `Int` twin.
+    UnsignedToInt(Box<Lift>),
+    /// `trust_checked_toInt{N} e` — the EXISTING seeded two's-complement
+    /// value model. Reused rather than spelled fresh: the tree already owns
+    /// it, the veripb client kernel's own `toIntN` is delta-defeq to it, and
+    /// its documented reason not to be `Int.sub` of `ofNat` literals (~2^63
+    /// iota steps on a whnf) applies here verbatim.
+    SignedToInt(MachineSIntWidth),
+    /// `Int.ofNat e` on a term already at `Nat`.
+    NatToInt,
+}
+
+impl Lift {
+    fn wrap(&self, e: Expr) -> Result<Expr, String> {
+        Ok(match self {
+            Lift::Identity => e,
+            Lift::UIntToNat(width) => Expr::app(
+                Expr::const_(Name::interned(width.to_nat_const()), vec![]),
+                e,
+            ),
+            Lift::BitVecToNat => Domain::U128.bitvec_to_nat(e)?,
+            Lift::UnsignedToInt(inner) => Expr::app(
+                Expr::const_(Name::interned("Int.ofNat"), vec![]),
+                inner.wrap(e)?,
+            ),
+            Lift::SignedToInt(width) => Expr::app(
+                Expr::const_(Name::interned(width.signed_lift_const()), vec![]),
+                e,
+            ),
+            Lift::NatToInt => {
+                Expr::app(Expr::const_(Name::interned("Int.ofNat"), vec![]), e)
+            }
+        })
+    }
+
+    /// The signed width whose seeded model this lift NAMES, if any. The caller
+    /// that holds the kernel environment must seed it — and honour
+    /// `seed_decl`'s homonym refusal — before the goal is typed or graded.
+    fn required_signed_width(&self) -> Option<MachineSIntWidth> {
+        match self {
+            Lift::SignedToInt(width) => Some(*width),
+            Lift::UnsignedToInt(inner) => inner.required_signed_width(),
+            Lift::Identity | Lift::UIntToNat(_) | Lift::BitVecToNat | Lift::NatToInt => None,
+        }
+    }
+}
+
+/// Why a requested lift is refused. Each carries the v7/D3 obligation: what was
+/// refused, why, and concrete options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LiftRefusal {
+    /// D-1: a signed value has no `Nat`.
+    SignedToNat,
+    /// D-1 (the math twin): an `Int` term has no `Nat`.
+    IntToNat,
+    /// D-12: pointer-width integers are out of the table.
+    PointerWidth,
+    /// D-11 (removed by OR-1): a machine term at a math position with no cast.
+    CastRequired,
+    /// D-2: the unbounded value would have to be narrowed to the carried
+    /// DECLARED machine carrier.
+    ///
+    /// The declared carrier is a payload rather than a re-derivation because
+    /// both call sites naturally hold a MATH domain on both sides of
+    /// [`Self::message`]'s `from`/`to` — a message built from those alone reads
+    /// "`x as nat` is a `nat` term where a `nat` is declared", which is a
+    /// tautology and states neither what was refused nor why. v7/D3 requires
+    /// the machine carrier that could not be reached to be named, and the wrap
+    /// witness to be at THAT carrier's width rather than a hardcoded 64.
+    Narrowing(Carrier),
+    /// No lift exists for this domain at all (`bool`, an Option carrier).
+    NoLift,
+}
+
+impl LiftRefusal {
+    /// `what` is how the offending term should be named back to the author.
+    fn message(&self, what: &str, from: &Domain, to: MathTy) -> String {
+        let to_name = to.spelling();
+        match self {
+            LiftRefusal::SignedToNat => format!(
+                "`{what} as {to_name}`: `{what}` is an `{}`, which can be negative and has no \
+                 `Nat` value\n\
+                 note: a machine integer is lifted into Lean by its EXACT integer value \
+                 (`u64 -> Nat`, `u64 -> Int`, `i64 -> Int`); reading the bit pattern instead \
+                 would turn -1 into 18446744073709551615\n\
+                 help: options:\n\
+                 - state the Lean definition over `Int` and write `{what} as int`;\n\
+                 - if the value is never negative, make the Rust parameter unsigned;\n\
+                 - keep a `BitVec` definition and relate it to the `Nat` one with a Lean theorem",
+                from.rust_name()
+            ),
+            LiftRefusal::IntToNat => format!(
+                "`{what} as nat`: `{what}` is already an `int` term, which can be negative and \
+                 has no `Nat` value\n\
+                 note: `Int.toNat` is TRUNCATING (it sends every negative value to 0), so the \
+                 compiler will not insert it\n\
+                 help: options: compare in `int` instead; or state the non-negativity as its \
+                 own clause and write the Lean definition over `Int`"
+            ),
+            LiftRefusal::PointerWidth => format!(
+                "`{what} as {to_name}`: `{}` is a pointer-width integer and is not lifted\n\
+                 note: the compiler's E6 import records an unsigned pointer-sized integer at a \
+                 FIXED 64-bit domain whatever the target, so a lift decided from it would be \
+                 wrong on a 32-bit target — the row is withheld rather than measured on one \
+                 target and assumed on the others\n\
+                 help: options: contract a `u64`/`i64` wrapper and lift that; or keep the \
+                 clause at the machine type and state the Lean definition over `UInt64`",
+                from.rust_name()
+            ),
+            LiftRefusal::CastRequired => format!(
+                "`{what}` is a `{}` term at a `{to_name}` position, and a clause argument is \
+                 never coerced\n\
+                 note: the compiler does not insert the lift on your behalf; that would change \
+                 what an authored clause means and is owner ruling OR-1, which is not yet given\n\
+                 help: write the lift explicitly: `{what} as {to_name}`",
+                from.rust_name()
+            ),
+            LiftRefusal::Narrowing(declared) => {
+                let (wrap_fn, wrap_bits) = match declared {
+                    Carrier::UInt(width) => (Cow::Borrowed(width.of_nat_const()), width.bits()),
+                    Carrier::BitVec(bits) => (Cow::Owned(format!("BitVec.ofNat {bits}")), *bits),
+                    _ => (Cow::Borrowed("UInt64.ofNat"), 64),
+                };
+                format!(
+                    "`{what}` is a `{to_name}` term where the declared carrier is `{}`; an \
+                     unbounded integer is never narrowed to a machine integer\n\
+                     note: `{wrap_fn}` WRAPS modulo 2^{wrap_bits} \
+                     (`UInt64.toNat (UInt64.ofNat (2^64)) = 0`), so inserting it could make a \
+                     false clause check\n\
+                     help: options: restate the Lean declaration over `{to_name}`; lift the \
+                     machine side instead, with `<that term> as {to_name}`; or write the \
+                     narrowing yourself as a Lean definition, so the wrap is in your text",
+                    declared.clean_name()
+                )
+            }
+            LiftRefusal::NoLift => format!(
+                "`{what}` is a `{}` term and has no `{to_name}` value\n\
+                 note: the lift table covers the INTEGER carriers only\n\
+                 help: options: compare it with `==`/`!=` at its own type; or move the \
+                 conversion into a Lean definition",
+                from.rust_name()
+            ),
+        }
+    }
+}
+
+/// THE LIFT TABLE (§3.1). Closed, and exhaustive over [`Domain`] by
+/// construction: a new domain must state its row here rather than inherit one.
+fn lift_for(from: &Domain, to: MathTy) -> Result<Lift, LiftRefusal> {
+    match (from, to) {
+        // already there
+        (Domain::Nat, MathTy::Nat) | (Domain::Int, MathTy::Int) => Ok(Lift::Identity),
+        // Nat -> Int: exact by definition
+        (Domain::Nat, MathTy::Int) => Ok(Lift::NatToInt),
+        // unsigned machine -> Nat
+        (Domain::Machine(width), MathTy::Nat) => Ok(Lift::UIntToNat(*width)),
+        (Domain::U128, MathTy::Nat) => Ok(Lift::BitVecToNat),
+        // unsigned machine -> Int, through Nat
+        (Domain::Machine(width), MathTy::Int) => {
+            Ok(Lift::UnsignedToInt(Box::new(Lift::UIntToNat(*width))))
+        }
+        (Domain::U128, MathTy::Int) => Ok(Lift::UnsignedToInt(Box::new(Lift::BitVecToNat))),
+        // signed machine -> Int, through the EXISTING seeded value model
+        (Domain::Signed(width), MathTy::Int) => Ok(Lift::SignedToInt(*width)),
+        // refusals
+        (Domain::Signed(_), MathTy::Nat) => Err(LiftRefusal::SignedToNat),
+        (Domain::Int, MathTy::Nat) => Err(LiftRefusal::IntToNat),
+        (Domain::USize(_) | Domain::ISize(_), _) => Err(LiftRefusal::PointerWidth),
+        (Domain::Bool | Domain::OptionSigned(_) | Domain::RegisteredAdt(_), _) => Err(LiftRefusal::NoLift),
+    }
+}
+
+/// The domain a term determines BY ITSELF — the self-determination rule
+/// (§3.2), which is the single most important soundness property of this work.
+///
+/// WHY IT EXISTS. [`argument_domain`] has four sources in an authority
+/// ranking, and the last two — the domain the call's OTHER arguments determine,
+/// and the enclosing atom's domain — are not facts about this term at all.
+/// Before the lift they could only ever pick the carrier a literal was typed
+/// at, which is harmless. After it they would pick an integer VALUE: `i128` and
+/// `u128` share the carrier `BitVec 128`, so taking the signedness of
+/// `bv_id(a)` from a sibling argument would read the same bit pattern as `-1`
+/// or as `2^128 - 1` and BOTH goals are well-typed — the kernel cannot catch
+/// it. So a lift is decided only from the term's own clause variables and the
+/// recorded return domains of the calls in it, and a term whose signedness is
+/// not self-determined is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TermPin {
+    /// The term determines this domain by itself.
+    Pinned(Domain),
+    /// Nothing in the term names a domain — an integer literal or an
+    /// arithmetic expression over literals. Such a term takes the domain of
+    /// the position it appears in, which is what it already does today.
+    LiteralOnly,
+    /// The term's domain is not self-determined; the string says why, for the
+    /// D-8 diagnostic.
+    Unpinned(String),
+}
+
+/// [`TermPin`] for one clause term. `Err` is the pre-existing "mixed domains in
+/// one comparison" family of refusals, which this must not swallow.
+fn pinned_domain(e: &SynExpr, var_domains: &BTreeMap<String, Domain>) -> Result<TermPin, String> {
+    match e {
+        SynExpr::Paren(p) => pinned_domain(&p.expr, var_domains),
+        // A cast names its own math type; nothing inside it can change that.
+        SynExpr::Cast(cast) => Ok(match MathTy::from_syn_type(&cast.ty) {
+            Some(target) => TermPin::Pinned(target.domain()),
+            None => {
+                let target = &cast.ty;
+                TermPin::Unpinned(format!(
+                    "`as {}` is not a spec cast",
+                    quote::quote!(#target)
+                ))
+            }
+        }),
+        SynExpr::Lit(_) => Ok(TermPin::LiteralOnly),
+        SynExpr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => {
+            pinned_domain(&u.expr, var_domains)
+        }
+        SynExpr::Path(_) | SynExpr::Field(_) => {
+            let Some(name) = atom_var_name(e) else {
+                return Ok(TermPin::Unpinned("not a clause variable".to_string()));
+            };
+            Ok(match var_domains.get(&name) {
+                Some(d) => TermPin::Pinned(d.clone()),
+                None => TermPin::Unpinned(format!("`{name}` is not a bound clause variable")),
+            })
+        }
+        SynExpr::Binary(b) => {
+            let l = pinned_domain(&b.left, var_domains)?;
+            let r = pinned_domain(&b.right, var_domains)?;
+            join_pins(l, r)
+        }
+        SynExpr::Call(c) => Ok(call_result_pin(c)),
+        _ => Ok(TermPin::Unpinned("unsupported term shape".to_string())),
+    }
+}
+
+/// The [`TermPin`] of one arithmetic node, from its two operands.
+fn join_pins(l: TermPin, r: TermPin) -> Result<TermPin, String> {
+    Ok(match (l, r) {
+        (TermPin::Unpinned(why), _) | (_, TermPin::Unpinned(why)) => TermPin::Unpinned(why),
+        (TermPin::LiteralOnly, other) | (other, TermPin::LiteralOnly) => other,
+        (TermPin::Pinned(a), TermPin::Pinned(b)) => {
+            if a == b {
+                TermPin::Pinned(a)
+            } else if a.is_math() != b.is_math() {
+                // D-3: `Nat` arithmetic does not wrap and machine arithmetic
+                // does, so there is no answer to pick.
+                return Err(format!(
+                    "arithmetic mixes a `{}` term with a `{}` term\n\
+                     note: machine arithmetic WRAPS and math arithmetic does not, so the \
+                     compiler does not choose one of them for you\n\
+                     help: options: lift the machine operand explicitly \
+                     (`… + (x as {})`); or move the arithmetic into the Lean definition",
+                    a.rust_name(),
+                    b.rust_name(),
+                    if a.is_math() { a.rust_name() } else { b.rust_name() }
+                ));
+            } else {
+                return Err(format!(
+                    "mixed domains in one comparison (`{}` and `{}`) — the operands of a \
+                     single comparison must share a type",
+                    a.rust_name(),
+                    b.rust_name()
+                ));
+            }
+        }
+    })
+}
+
+/// The [`TermPin`] of a CALL, read from the ADMISSION's recorded return domain
+/// and never from the call's argument variables (§3.4's precedence rule, which
+/// is what makes the `(Math, Math)` relation row possible at all).
+///
+/// The two guards below are the other half of the self-determination rule.
+/// After this work `return_domain` selects an integer VALUE rather than just a
+/// literal range, so it needs a SECOND independent read before a lift is built
+/// on it:
+///
+///   * the SELF function (the call `result` was rewritten to) is cross-checked
+///     against the compiler's own resolved return-type spelling — two
+///     independently derived values (HIR/typeck `Ty` versus the extracted
+///     `trust_types::Ty`), the same two-read discipline the parameter-list
+///     agreement check already uses;
+///   * any OTHER call may head a lifted term only when its recorded domain is
+///     the UNIQUE preimage of its carrier. A `BitVec N` codomain has three
+///     preimages (`iN`, `usize`, `isize` at that width) and answers
+///     `Unpinned`.
+///
+///     BE EXACT ABOUT WHERE THE SECOND READ IS (corrected 2026-09-17: this
+///     paragraph used to claim the constant's kernel type "is itself the
+///     independent second read", and the code performs no such read — it tests
+///     `domain.carrier().unique_domain() == Some(domain)`, a property of the
+///     recorded domain alone). The real second read happens downstream:
+///     `reject_untyped_goal`/`check_type` rejects `UIntN.toNat` applied to a
+///     constant of another type. That is sound here precisely BECAUSE the
+///     carriers where kernel typing could not discriminate — the `BitVec`-
+///     carried domains, which share one kernel type across several Rust
+///     preimages — are exactly the ones `unique_domain` excludes. A future TCB
+///     auditor should look for the check there, not here.
+fn call_result_pin(c: &syn::ExprCall) -> TermPin {
+    let callee = callee_path(c);
+    let Some(admission) = ambient_admission(&callee) else {
+        return TermPin::Unpinned(format!("`{callee}` is not an admitted spec call"));
+    };
+    let Some(domain) = admission.return_domain().cloned() else {
+        return TermPin::Unpinned(format!(
+            "`{callee}` has no recorded result domain (its declared codomain is not one of \
+             the closed carriers the clause fragment reads back)"
+        ));
+    };
+    let lift_ctx = ambient_proof_lift();
+    if let Some(ctx) = lift_ctx.as_ref().filter(|ctx| ctx.self_fn_name.as_deref() == Some(callee.as_str())) {
+        // SELF: the two-read cross-check.
+        let Some(spelling) = ctx.result_ty.as_deref() else {
+            return TermPin::Unpinned(format!(
+                "the compiler supplied no resolved return type for `{callee}`, so the domain \
+                 the E6 import recorded has no second, independent read"
+            ));
+        };
+        match Domain::from_binding_ty(spelling) {
+            Some(resolved) if resolved == domain => TermPin::Pinned(domain),
+            other => TermPin::Unpinned(format!(
+                "the two reads of `{callee}`'s return type disagree: the compiler resolved it \
+                 as `{spelling}` ({}), while the E6 import recorded `{}`",
+                other.map_or_else(
+                    || "which the clause fragment does not map to a domain".to_string(),
+                    |d| format!("domain `{}`", d.rust_name())
+                ),
+                domain.rust_name()
+            )),
+        }
+    } else if domain.carrier().unique_domain().as_ref() == Some(&domain) {
+        TermPin::Pinned(domain)
+    } else {
+        TermPin::Unpinned(format!(
+            "`{callee}` returns `{}`, whose carrier `{}` has more than one Rust preimage, so \
+             its integer value is not determined",
+            domain.rust_name(),
+            domain.carrier().clean_name()
+        ))
+    }
+}
+
+/// D-8: the term's domain is not self-determined.
+fn unpinned_lift_error(what: &str, to: MathTy, why: &str) -> String {
+    format!(
+        "`{what} as {}`: {why}\n\
+         note: `i128` and `u128` share the carrier `BitVec 128`, so a signedness taken from \
+         another argument or from the surrounding comparison would decide a VALUE the author \
+         never wrote; the compiler therefore never borrows one\n\
+         help: options:\n\
+         - make the Lean definition return `Nat`/`Int` itself;\n\
+         - wrap it in a Lean definition that does \
+         (`def f_int (v : BitVec 128) : Int := …`);\n\
+         - lift BEFORE the call: pass `x as int` to an `Int`-typed definition",
+        to.spelling()
+    )
+}
+
+/// D-9: `e as T` where `T` is not a spec cast target.
+fn non_spec_cast_error(target: &str) -> String {
+    format!(
+        "`as {target}` is not a spec cast: only `as nat` and `as int` are\n\
+         note: a machine-to-machine cast is not in the clause fragment — it would have to \
+         choose between wrapping and refusing, and the clause fragment does neither silently\n\
+         help: options: lift both sides and compare in `nat`/`int`; or move the conversion \
+         into a Lean definition, where its text states what it does"
+    )
+}
+
+/// Whether an expression tree contains a `Cast` node anywhere.
+///
+/// This is the gate on the new RELATION path ([`elab_math_relation`]) and on
+/// the cast arm itself: `Cast` is `unsupported term shape` in the pre-existing
+/// elaborator, so an atom containing one is an atom that fails today.
+///
+/// IT IS NOT, however, the gate on every new branch, and §5.5's original
+/// "true by construction" claim was FALSE as written (measured 2026-09-17,
+/// integration review). Two ProofLift-mode changes fire on an atom with no cast
+/// anywhere, both inside `elab_term`'s call arm:
+///
+/// 1. the LITERAL-ARGUMENT row — a literal argument takes the declared
+///    parameter's unique preimage instead of the sibling/ambient domain. This
+///    is error → success only: the pre-existing rule ACCEPTED an argument only
+///    when `arg_dom.carrier() == declared`, and a carrier with a unique
+///    preimage has exactly one domain with that carrier, so wherever the old
+///    rule succeeded the two pick the same domain. Pinned by
+///    `the_uncast_literal_row_is_a_real_mode_difference_and_only_widens`;
+/// 2. `pinned_domain(arg)?` is evaluated for every argument, so the D-3
+///    "mixed domains in one comparison" refusal can replace a message the
+///    pre-existing path produced further downstream. Error → error, different
+///    text.
+///
+/// What holds by construction is the weaker, still useful statement: no atom
+/// that elaborates SUCCESSFULLY today elaborates to a different goal in
+/// ProofLift mode. That is what
+/// [`the_mode_change_is_byte_identical_on_the_uncast_corpus`] measures, on the
+/// clause corpus rather than by inspection.
+///
+/// [`the_mode_change_is_byte_identical_on_the_uncast_corpus`]: #
+fn contains_cast(e: &SynExpr) -> bool {
+    match e {
+        SynExpr::Cast(_) => true,
+        SynExpr::Paren(p) => contains_cast(&p.expr),
+        SynExpr::Unary(u) => contains_cast(&u.expr),
+        SynExpr::Binary(b) => contains_cast(&b.left) || contains_cast(&b.right),
+        SynExpr::Call(c) => c.args.iter().any(contains_cast),
+        SynExpr::MethodCall(m) => {
+            contains_cast(&m.receiver) || m.args.iter().any(contains_cast)
+        }
+        SynExpr::Field(f) => contains_cast(&f.base),
+        _ => false,
+    }
+}
+
+/// Trust (d1/B2, 2026-09-28): the refusal for a call argument that carries a
+/// cast, at [`ClauseMode::Strict`].
+///
+/// The head is the pre-existing `unsupported term shape` — the message every
+/// cast has always had in this mode, and the one
+/// `strict_mode_still_refuses_a_cast_with_the_pre_existing_message` pins — so
+/// no consumer keyed on it changes. What it replaces is the call-argument
+/// path's carrier check, which read `x as nat` as the bare `x` (`argument_domain`
+/// resolves through `collect_vars`, which looks through a cast) and so told the
+/// author "the argument is a `u16` term" about an argument they had written as
+/// a lift. The d1 fallback no longer reaches this mode for an `ensures`
+/// citation; every remaining Strict consumer (monitors, `requires`/`invariant`
+/// citations, statement-only rows) still can, which is why the message names
+/// the position rather than the lift's absence in general.
+fn strict_mode_cast_argument_refusal(callee: &str, index: usize, arg: &SynExpr) -> String {
+    let src = quote::quote!(#arg).to_string();
+    format!(
+        "unsupported term shape: argument {index} of `{callee}`, `{src}`, contains a cast; the \
+         explicit lift (`e as nat` / `e as int`, spec surface §12.3) is read only where an \
+         `ensures` clause is elaborated for proof, and this clause position is elaborated \
+         without it, so the cast is refused here rather than read as its operand"
+    )
+}
+
+/// Elaborate a comparison ATOM that carries at least one lift (§3.4).
+///
+/// Returns `Ok(None)` when the atom has no cast in it, in which case the caller
+/// runs the pre-existing path unchanged. When it does carry one, each SIDE is
+/// classified independently and elaborated at ITS OWN domain, and the relation
+/// is built at the math type — which is the whole point: the pre-existing
+/// `atom_domain` resolves over every free variable INCLUDING a typed call's
+/// arguments, so on `clamp_nat(c as nat, d as nat) <= (d as nat)` it would pick
+/// `u32` from the variables and build the ill-typed
+/// `Nat.le (UInt32.toNat (clamp_nat …)) …`.
+fn elab_math_relation(
+    b: &syn::ExprBinary,
+    vars: &[String],
+    offset: u32,
+    var_domains: &BTreeMap<String, Domain>,
+) -> Result<Option<Expr>, String> {
+    if !has_ambient_proof_lift() || !(contains_cast(&b.left) || contains_cast(&b.right)) {
+        return Ok(None);
+    }
+    let left = pinned_domain(&b.left, var_domains)?;
+    let right = pinned_domain(&b.right, var_domains)?;
+    let math_of = |p: &TermPin| match p {
+        TermPin::Pinned(d) if d.is_math() => Some(d.clone()),
+        _ => None,
+    };
+    match (math_of(&left), math_of(&right)) {
+        (Some(lm), _) => {
+            elab_math_relation_with(b, vars, offset, var_domains, &right, lm, false).map(Some)
+        }
+        (None, Some(rm)) => {
+            elab_math_relation_with(b, vars, offset, var_domains, &left, rm, true).map(Some)
+        }
+        // Neither side is math: the cast sits somewhere the side classification
+        // does not reach (it will be reported by `elab_term` itself), and the
+        // pre-existing path owns the atom.
+        (None, None) => Ok(None),
+    }
+}
+
+/// One side is math (`math_dom`); decide the other side and build the relation.
+/// `swapped` says the math side is the RIGHT one, so the operands are put back
+/// in source order before the relation is built.
+fn elab_math_relation_with(
+    b: &syn::ExprBinary,
+    vars: &[String],
+    offset: u32,
+    var_domains: &BTreeMap<String, Domain>,
+    other_pin: &TermPin,
+    math_dom: Domain,
+    swapped: bool,
+) -> Result<Expr, String> {
+    let (math_expr, other_expr) =
+        if swapped { (&*b.right, &*b.left) } else { (&*b.left, &*b.right) };
+    // The domain each side is BUILT at, and (for a `Nat` side facing an `Int`
+    // side) whether it must additionally be embedded.
+    let (other_dom, embed_other, relation_dom) = match other_pin {
+        TermPin::Pinned(d) if d.is_math() => {
+            if *d == math_dom {
+                (d.clone(), false, math_dom.clone())
+            } else {
+                // `Nat` beside `Int`: embed the `Nat` side, compare at `Int`.
+                match (&math_dom, d) {
+                    (Domain::Int, Domain::Nat) => (Domain::Nat, true, Domain::Int),
+                    (Domain::Nat, Domain::Int) => {
+                        // the MATH side is the `Nat` one — handled by rebuilding
+                        // below, so express it the same way.
+                        (Domain::Int, false, Domain::Int)
+                    }
+                    _ => (d.clone(), false, math_dom.clone()),
+                }
+            }
+        }
+        TermPin::LiteralOnly => (math_dom.clone(), false, math_dom.clone()),
+        TermPin::Pinned(d) => {
+            // A machine term at a math position. Refused — but WHICH refusal
+            // depends on whether the cast this would ask for is one the table
+            // has. Consulting `lift_for` first is not cosmetic: an unconditional
+            // D-11 tells the author of `(x as nat) == y` with `y: i64` to
+            // "write `y as nat`", advice that then fails with D-1 — whose whole
+            // point is that reading the bit pattern would turn `-1` into
+            // `2^64 - 1`. `bool` and the statement-only pointer-sized spellings
+            // are the same story. The CALL-argument path has always consulted
+            // the table here; this is the relation path catching up.
+            let other_src = quote::quote!(#other_expr).to_string();
+            let to = if math_dom == Domain::Int { MathTy::Int } else { MathTy::Nat };
+            return Err(match lift_for(d, to) {
+                Ok(_) => LiftRefusal::CastRequired.message(&other_src, d, to),
+                Err(refusal) => refusal.message(&other_src, d, to),
+            });
+        }
+        TermPin::Unpinned(why) => {
+            let other_src = quote::quote!(#other_expr).to_string();
+            return Err(unpinned_lift_error(
+                &other_src,
+                if math_dom == Domain::Int { MathTy::Int } else { MathTy::Nat },
+                why,
+            ));
+        }
+    };
+    // Build each side at its own domain, then embed the `Nat` one if the
+    // relation is at `Int`.
+    let embed = |e: Expr| Expr::app(Expr::const_(Name::interned("Int.ofNat"), vec![]), e);
+    let mut math_side = elab_term(math_expr, vars, offset, var_domains, &math_dom)?;
+    let mut other_side = elab_term(other_expr, vars, offset, var_domains, &other_dom)?;
+    if relation_dom == Domain::Int {
+        if math_dom == Domain::Nat {
+            math_side = embed(math_side);
+        }
+        if embed_other {
+            other_side = embed(other_side);
+        }
+    }
+    let (l, r) = if swapped { (other_side, math_side) } else { (math_side, other_side) };
+    Ok(match b.op {
+        BinOp::Eq(_) => relation_dom.eq(l, r),
+        BinOp::Le(_) => relation_dom.cmp("le", l, r),
+        BinOp::Lt(_) => relation_dom.cmp("lt", l, r),
+        BinOp::Ge(_) => relation_dom.cmp("le", r, l),
+        BinOp::Gt(_) => relation_dom.cmp("lt", r, l),
+        _ => return Err("comparison op must be one of == != <= < >= >".into()),
+    })
+}
+
+/// The ambient [`ClauseMode::ProofLift`] context of the current elaboration.
+///
+/// `None` is [`ClauseMode::Strict`] — the default, and the value every
+/// pre-existing public entry point installs. It is a thread-local for the same
+/// reason [`ADMISSION_FACETS`] is: it is genuinely ambient context for one
+/// synchronous elaboration, and threading it through ~40 recursion sites would
+/// add no expressiveness.
+#[derive(Clone, Debug, Default)]
+struct ProofLiftContext {
+    /// The contracted function, when `result` was rewritten to a call on it.
+    self_fn_name: Option<String>,
+    /// The compiler's own resolved spelling of that function's return type.
+    result_ty: Option<String>,
+}
+
+thread_local! {
+    static PROOF_LIFT: std::cell::RefCell<Option<ProofLiftContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard installing the proof-lift context, restoring the previous value
+/// on drop so a nested elaboration cannot leak its mode to an outer one and a
+/// panic mid-elaboration cannot leave a stale one behind.
+struct ProofLiftScope {
+    previous: Option<ProofLiftContext>,
+}
+
+impl ProofLiftScope {
+    fn enter(inputs: &ProofClauseInputs, self_fn_name: Option<&str>) -> Self {
+        let next = match inputs.mode {
+            ClauseMode::Strict => None,
+            ClauseMode::ProofLift => Some(ProofLiftContext {
+                self_fn_name: self_fn_name.map(ToString::to_string),
+                result_ty: inputs.result_ty.clone(),
+            }),
+        };
+        ProofLiftScope { previous: PROOF_LIFT.with(|slot| slot.replace(next)) }
+    }
+}
+
+impl Drop for ProofLiftScope {
+    fn drop(&mut self) {
+        PROOF_LIFT.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+fn ambient_proof_lift() -> Option<ProofLiftContext> {
+    PROOF_LIFT.with(|slot| slot.borrow().clone())
+}
+
+fn has_ambient_proof_lift() -> bool {
+    PROOF_LIFT.with(|slot| slot.borrow().is_some())
+}
+
+// Trust (ref-self I1): the SELF-CALL key of the current elaboration — the exact
+// spelling `elaborate_ensures` splices in for `result`.
+//
+// It is a SECOND thread-local rather than a field of [`ProofLiftContext`]
+// because that context exists only at `ClauseMode::ProofLift`, while the
+// self-result-only gate must hold in every mode. Every entry point that does
+// NOT know a self spelling installs `None`, and a `self_result_only` admission
+// is then unnameable — the fail-closed direction.
+thread_local! {
+    static SELF_FN_KEY: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard installing the self-call key, restoring the previous value on
+/// drop (same discipline as [`ProofLiftScope`]).
+struct SelfFnScope {
+    previous: Option<String>,
+}
+
+impl SelfFnScope {
+    fn enter(self_fn_name: Option<&str>) -> Self {
+        let next = self_fn_name.map(ToString::to_string);
+        SelfFnScope { previous: SELF_FN_KEY.with(|slot| slot.replace(next)) }
+    }
+}
+
+impl Drop for SelfFnScope {
+    fn drop(&mut self) {
+        SELF_FN_KEY.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+fn is_ambient_self_fn_key(candidate: &str) -> bool {
+    SELF_FN_KEY.with(|slot| slot.borrow().as_deref() == Some(candidate))
+}
+
+/// Trust (ref-self I1): the ONE refusal a view import carries, shared by the
+/// call and the bare position so the two cannot drift (v7/D3: rule, why THIS
+/// program broke it, options).
+fn view_import_unnameable_refusal(name: &str, admission: &Admission) -> String {
+    format!(
+        "`{name}` is E6-admitted only through a borrow-erased PARAMETER VIEW (`{view}`), whose \
+         kernel import takes the pointee's scalar fields as separate arguments — so it is not \
+         nameable in a clause, where `{name}` would name the Rust signature instead. It denotes \
+         only `result` in `{name}`'s own `ensures`. options: (1) name the field values directly \
+         (`{name}`'s own clause may write `self.x`); (2) write a by-value helper taking the \
+         scalars and call THAT; (3) keep this clause solver-only",
+        view = admission.view().unwrap_or(""),
+    )
+}
+
+// The signed lift widths the most recent elaboration NAMED, accumulated while
+// the goal is built.
+//
+// The elaborator holds no kernel environment, so it cannot seed
+// `trust_checked_toInt{N}` itself. It records which widths the goal names, and
+// the caller that DOES hold the environment must seed each one — and honour
+// `seed_decl`'s refusal of a foreign homonym — before the goal is typed or
+// graded. That is the second of the two independent checks against an island
+// capturing the lift constant's name; the first is the reserved
+// `trust_checked_` prefix on the island side.
+thread_local! {
+    static REQUIRED_SIGNED_LIFTS: std::cell::RefCell<Vec<MachineSIntWidth>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_required_signed_lift(lift: &Lift) {
+    if let Some(width) = lift.required_signed_width() {
+        REQUIRED_SIGNED_LIFTS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if !slot.contains(&width) {
+                slot.push(width);
+            }
+        });
+    }
+}
+
+fn take_required_signed_lifts() -> Vec<MachineSIntWidth> {
+    REQUIRED_SIGNED_LIFTS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+/// A clause goal plus the environment obligations its construction created.
+#[derive(Clone, Debug)]
+pub struct ElaboratedClause {
+    /// The kernel proposition.
+    pub goal: Expr,
+    /// Signed widths whose seeded lift model (`trust_checked_toInt{N}`) the
+    /// goal NAMES. The holder of the kernel environment must
+    /// [`seed_signed_lift_model`] each of these — which fails closed on a
+    /// foreign homonym — BEFORE typing or grading the goal.
+    pub required_signed_lift_widths: Vec<MachineSIntWidth>,
 }
 
 /// Collect free variable identifiers in order of first appearance.
 fn collect_vars(e: &SynExpr, out: &mut Vec<String>) {
     match e {
         SynExpr::Paren(p) => collect_vars(&p.expr, out),
+        // A spec cast is transparent to the FREE-VARIABLE gate: `result as nat`
+        // still mentions `result`, and `(x as nat) <= n` still mentions `x`.
+        // Without this arm the exact-binding gate would see no occurrence and
+        // the variable would be silently ∀-closed — fail-closed, but as a
+        // generally false goal rather than a named refusal.
+        SynExpr::Cast(cast) => collect_vars(&cast.expr, out),
         SynExpr::Binary(b) => {
             collect_vars(&b.left, out);
             collect_vars(&b.right, out);
@@ -698,14 +2063,13 @@ fn collect_vars(e: &SynExpr, out: &mut Vec<String>) {
         SynExpr::Unary(u) => collect_vars(&u.expr, out),
         SynExpr::Path(p) => {
             if let Some(id) = p.path.get_ident() {
-                let s = id.to_string();
                 // `None` is the Option constructor LITERAL, never a clause
                 // variable: Rust itself refuses a binding named `None`
                 // (E0530, unit-variant shadowing), so no parameter row can
                 // ever exist for it — collecting it would only poison the
                 // exact-binding gate with a bogus free variable.
-                if s != "None" && !out.contains(&s) {
-                    out.push(s);
+                if id != "None" && !out.iter().any(|existing| id == existing.as_str()) {
+                    out.push(id.to_string());
                 }
             }
         }
@@ -847,6 +2211,42 @@ fn ne_as_not_eq(b: &syn::ExprBinary) -> SynExpr {
     })
 }
 
+/// The de Bruijn index of the variable at `pos` among `vars_len` binders in
+/// outer-to-inner order (the last binder is index 0), `offset` binders deeper.
+///
+/// Callers obtain `pos` from `Iterator::position` over `vars` or an explicitly
+/// range-checked select parameter, so `pos < vars_len` holds — but the verifier
+/// sees `position`'s result as opaque and refuted `vars.len() - 1 - pos` at
+/// `pos = vars.len()`, and
+/// the final `+ offset` at `offset = u32::MAX` (measured 2026-09-13 on
+/// `dff2b22d1`). Both are stated here as refusals: the first can only be an
+/// internal error, the second a clause nested deeper than the kernel's `u32`
+/// index space can name.
+fn de_bruijn_index(vars_len: usize, pos: usize, offset: u32) -> Result<u32, String> {
+    if pos >= vars_len {
+        return Err(format!(
+            "internal error: binder position {pos} is outside the {vars_len} binders in scope"
+        ));
+    }
+    let depth = vars_len - 1 - pos;
+    let depth = u32::try_from(depth)
+        .map_err(|_| format!("binder depth {depth} exceeds the kernel's `u32` de Bruijn index"))?;
+    depth.checked_add(offset).ok_or_else(|| {
+        format!("binder depth {depth} + {offset} exceeds the kernel's `u32` de Bruijn index")
+    })
+}
+
+/// `offset + 1`: the binder depth one arrow (or one binder) deeper. Fails
+/// closed instead of overflowing at `u32::MAX` — a clause nested 2^32 deep is
+/// not something the kernel's `u32` de Bruijn index can name, and the
+/// verifier refuted the bare `offset + 1` there (measured 2026-09-13 on
+/// `dff2b22d1`).
+fn one_binder_deeper(offset: u32) -> Result<u32, String> {
+    offset
+        .checked_add(1)
+        .ok_or_else(|| "binder depth exceeds the kernel's `u32` de Bruijn index".to_string())
+}
+
 /// Elaborate a term. `vars` is the outer-to-inner binder order; a variable at
 /// position `i` has de Bruijn index `vars.len() - 1 - i` **plus `offset`** —
 /// where `offset` counts binders introduced *between* the ∀-vars and this term
@@ -861,18 +2261,17 @@ fn elab_term(
     match e {
         SynExpr::Paren(p) => elab_term(&p.expr, vars, offset, var_domains, dom),
         SynExpr::Path(p) => {
-            let id = p
+            let ident = p
                 .path
                 .get_ident()
-                .ok_or_else(|| "only bare identifiers are supported".to_string())?
-                .to_string();
+                .ok_or_else(|| "only bare identifiers are supported".to_string())?;
             // `None` is the Option CONSTRUCTOR literal, never a clause
             // variable (Rust refuses a binding named `None` — E0530), typed
             // exactly at an Option carrier: `Option.none.{0} (BitVec N)`.
-            if id == "None" {
+            if ident == "None" {
                 if let Domain::OptionSigned(width) = dom {
                     return Ok(Expr::app(
-                        Expr::const_(Name::from_string("Option.none"), vec![Level::zero()]),
+                        Expr::const_(Name::interned("Option.none"), vec![Level::zero()]),
                         Domain::Signed(*width).ty(),
                     ));
                 }
@@ -883,9 +2282,10 @@ fn elab_term(
                     dom.rust_name()
                 ));
             }
-            if let Some(pos) = vars.iter().position(|v| *v == id) {
-                return Ok(Expr::bvar((vars.len() - 1 - pos) as u32 + offset));
+            if let Some(pos) = vars.iter().position(|v| ident == v.as_str()) {
+                return Ok(Expr::bvar(de_bruijn_index(vars.len(), pos, offset)?));
             }
+            let id = ident.to_string();
             // E6 bare citation (e6 probe f04's spelling): an admitted
             // ZERO-ARITY constant referenced with NO argument list elaborates
             // to its kernel constant — the same admission, the same I3
@@ -894,7 +2294,11 @@ fn elab_term(
             // admission must be applied: its bare name is a function value,
             // which the term fragment does not speak, so it keeps failing
             // closed — with the fix named (v7/D3).
-            if let Some(admission) = ambient_admission(&id) {
+            //
+            // I0: the goal binder above wins FIRST, and this consult refuses
+            // outright when the compiler recorded a Rust binding of this name
+            // that produced no binder (a by-value struct parameter, a `&T`).
+            if let Some(admission) = ambient_bare_admission(&id)? {
                 // I3: capability decided before arity, same as the call arm.
                 if let Err(refusal) = admission.require_at(ambient_use_site(), &id) {
                     return Err(refusal.to_string());
@@ -927,10 +2331,17 @@ fn elab_term(
                 .iter()
                 .position(|v| *v == id)
                 .ok_or_else(|| format!("unbound variable `{id}`"))?;
-            Ok(Expr::bvar((vars.len() - 1 - pos) as u32 + offset))
+            Ok(Expr::bvar(de_bruijn_index(vars.len(), pos, offset)?))
         }
         SynExpr::Lit(l) => match &l.lit {
             Lit::Int(i) => {
+                if matches!(dom, Domain::RegisteredAdt(_)) {
+                    return Err(dom.registered_operation_refusal("integer literals"));
+                }
+                if !i.suffix().is_empty() && Domain::from_binding_ty(i.suffix()).as_ref() != Some(dom) {
+                    return Err(format!("literal suffix `{}` disagrees with the operand carrier `{}`; \
+                        use a matching literal type or an explicit checked conversion", i.suffix(), dom.rust_name()));
+                }
                 let n: u128 = i.base10_parse().map_err(|e| format!("bad int: {e}"))?;
                 if n == 0 {
                     Ok(dom.zero())
@@ -946,13 +2357,33 @@ fn elab_term(
             _ => Err("unsupported literal (integer or `true`/`false` only)".into()),
         },
         SynExpr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => {
-            if !dom.is_signed() {
+            // `int` joins the signed machine carriers here: it is the lift
+            // table's signed codomain, so `-1` and `0 - x` have to be spellable
+            // at it. `Domain::admits_negative_values` is the question this site
+            // actually asks, which `is_signed` (a question about the BitVec
+            // carrier) only coincidentally answered before `int` existed.
+            if !dom.admits_negative_values() {
                 return Err(format!(
-                    "unary negation is only supported for a signed machine binding, not `{}`",
+                    "unary negation is only supported for a signed machine binding or `int`, \
+                     not `{}`",
                     dom.rust_name()
                 ));
             }
             if let Some(magnitude) = nonneg_int_literal(&u.expr) {
+                let mut literal = u.expr.as_ref();
+                while let SynExpr::Paren(paren) = literal {
+                    literal = &paren.expr;
+                }
+                if let SynExpr::Lit(literal) = literal {
+                    if let Lit::Int(integer) = &literal.lit {
+                        if !integer.suffix().is_empty()
+                            && Domain::from_binding_ty(integer.suffix()).as_ref() != Some(dom)
+                        {
+                            return Err(format!("negative literal suffix `{}` disagrees with the operand carrier `{}`; \
+                                use a matching literal type or an explicit checked conversion", integer.suffix(), dom.rust_name()));
+                        }
+                    }
+                }
                 return dom.negative_numeral(magnitude);
             }
             let value = elab_term(&u.expr, vars, offset, var_domains, dom)?;
@@ -960,6 +2391,9 @@ fn elab_term(
         }
         SynExpr::Binary(b) => {
             // `bool` has no arithmetic — `+ - * / %` over a boolean binding
+            if matches!(dom, Domain::RegisteredAdt(_)) {
+                return Err(dom.registered_operation_refusal("arithmetic and bitwise operations"));
+            }
             // fail closed (only `==`/`!=`, the connectives, and a bare bool are
             // supported for `bool`).
             if dom.is_bool() {
@@ -998,18 +2432,15 @@ fn elab_term(
                 let _ = dom.numeral(c)?;
                 let nat_op = if matches!(b.op, BinOp::Div(_)) { "Nat.div" } else { "Nat.mod" };
                 let nat_bin = |a: Expr, b: Expr| {
-                    Expr::app(Expr::app(Expr::const_(Name::from_string(nat_op), vec![]), a), b)
+                    Expr::app(Expr::app(Expr::const_(Name::interned(nat_op), vec![]), a), b)
                 };
                 let dividend = elab_term(&b.left, vars, offset, var_domains, dom)?;
                 let divisor = kernel_nat_lit(c);
                 return Ok(match dom {
                     Domain::Nat => nat_bin(dividend, divisor),
                     Domain::Machine(width) => {
-                        let carrier = width.carrier();
-                        let to_nat =
-                            Expr::const_(Name::from_string(&format!("{carrier}.toNat")), vec![]);
-                        let of_nat =
-                            Expr::const_(Name::from_string(&format!("{carrier}.ofNat")), vec![]);
+                        let to_nat = Expr::const_(Name::interned(width.to_nat_const()), vec![]);
+                        let of_nat = Expr::const_(Name::interned(width.of_nat_const()), vec![]);
                         let nat_result = nat_bin(Expr::app(to_nat, dividend), divisor);
                         Expr::app(of_nat, nat_result)
                     }
@@ -1020,9 +2451,25 @@ fn elab_term(
                     Domain::Signed(_) | Domain::ISize(_) => {
                         return Err("signed division/remainder is not implemented".into());
                     }
+                    // `Int` division is NOT the `Nat.div` encoding every other
+                    // arm here uses, and Clean's `Int.div` rounds toward zero
+                    // while `Int.emod` does not: two defensible answers, so the
+                    // elaborator picks neither. Refused until the choice is
+                    // ratified, which keeps the lift's codomain honest rather
+                    // than silently adopting one convention.
+                    Domain::Int => {
+                        return Err("`/` and `%` are not supported at `int`; the rounding \
+                                    convention for a negative operand is not settled, so the \
+                                    elaborator refuses rather than choosing one. Options: do \
+                                    the division inside a Lean definition, whose text states \
+                                    the convention; or compare in `nat` when both operands are \
+                                    known non-negative"
+                            .into());
+                    }
                     // Unreachable: bool arithmetic is rejected at the top of this
                     // arm. Fail closed rather than panic if a gate is ever missed.
                     Domain::Bool => return Err("arithmetic is not supported for `bool`".into()),
+                    Domain::RegisteredAdt(_) => return Err(dom.registered_operation_refusal("division/remainder")),
                     Domain::OptionSigned(_) => {
                         return Err("arithmetic is not supported for an Option carrier".into());
                     }
@@ -1066,7 +2513,7 @@ fn elab_term(
                     BinOp::Shl(_) => {
                         if dom.is_signed() {
                             let value = Expr::apps(
-                                Expr::const_(Name::from_string("Nat.mul"), vec![]),
+                                Expr::const_(Name::interned("Nat.mul"), vec![]),
                                 [dom.bitvec_to_nat(l)?, kernel_nat_lit(two_pow_n)],
                             );
                             dom.bitvec_of_nat(value)?
@@ -1079,22 +2526,17 @@ fn elab_term(
                         let divisor = kernel_nat_lit(two_pow_n);
                         let nat_div = |a: Expr, b: Expr| {
                             Expr::app(
-                                Expr::app(Expr::const_(Name::from_string("Nat.div"), vec![]), a),
+                                Expr::app(Expr::const_(Name::interned("Nat.div"), vec![]), a),
                                 b,
                             )
                         };
                         match dom {
                             Domain::Nat => nat_div(l, divisor),
                             Domain::Machine(width) => {
-                                let carrier = width.carrier();
-                                let to_nat = Expr::const_(
-                                    Name::from_string(&format!("{carrier}.toNat")),
-                                    vec![],
-                                );
-                                let of_nat = Expr::const_(
-                                    Name::from_string(&format!("{carrier}.ofNat")),
-                                    vec![],
-                                );
+                                let to_nat =
+                                    Expr::const_(Name::interned(width.to_nat_const()), vec![]);
+                                let of_nat =
+                                    Expr::const_(Name::interned(width.of_nat_const()), vec![]);
                                 Expr::app(of_nat, nat_div(Expr::app(to_nat, l), divisor))
                             }
                             Domain::U128 | Domain::USize(_) => {
@@ -1104,9 +2546,17 @@ fn elab_term(
                             Domain::Signed(_) | Domain::ISize(_) => {
                                 return Err("signed right shift is not implemented".into());
                             }
+                            Domain::Int => {
+                                return Err("bit-shift is not supported at `int`; an unbounded \
+                                            integer has no bit width to shift within. Options: \
+                                            shift at the machine type and lift the result; or \
+                                            write the arithmetic in a Lean definition"
+                                    .into());
+                            }
                             Domain::Bool => {
                                 return Err("bit-shift is not supported for `bool`".into());
                             }
+                            Domain::RegisteredAdt(_) => return Err(dom.registered_operation_refusal("shifts")),
                             Domain::OptionSigned(_) => {
                                 return Err(
                                     "bit-shift is not supported for an Option carrier".into()
@@ -1128,18 +2578,15 @@ fn elab_term(
                     _ => "Nat.xor",
                 };
                 let nat_bin = |a: Expr, b: Expr| {
-                    Expr::app(Expr::app(Expr::const_(Name::from_string(nat_op), vec![]), a), b)
+                    Expr::app(Expr::app(Expr::const_(Name::interned(nat_op), vec![]), a), b)
                 };
                 let l = elab_term(&b.left, vars, offset, var_domains, dom)?;
                 let r = elab_term(&b.right, vars, offset, var_domains, dom)?;
                 return Ok(match dom {
                     Domain::Nat => nat_bin(l, r),
                     Domain::Machine(width) => {
-                        let carrier = width.carrier();
-                        let to_nat =
-                            Expr::const_(Name::from_string(&format!("{carrier}.toNat")), vec![]);
-                        let of_nat =
-                            Expr::const_(Name::from_string(&format!("{carrier}.ofNat")), vec![]);
+                        let to_nat = Expr::const_(Name::interned(width.to_nat_const()), vec![]);
+                        let of_nat = Expr::const_(Name::interned(width.of_nat_const()), vec![]);
                         let ln = Expr::app(to_nat.clone(), l);
                         let rn = Expr::app(to_nat, r);
                         Expr::app(of_nat, nat_bin(ln, rn))
@@ -1152,6 +2599,16 @@ fn elab_term(
                     Domain::Bool => {
                         return Err("bitwise operators are not supported for `bool`".into());
                     }
+                    Domain::Int => {
+                        return Err("bitwise operators are not supported at `int`; an unbounded \
+                                    integer has no bit width, and the two's-complement reading \
+                                    of a negative value is a bit pattern this domain \
+                                    deliberately does not expose. Options: combine at the \
+                                    machine type and lift the result; or write it in a Lean \
+                                    definition"
+                            .into());
+                    }
+                    Domain::RegisteredAdt(_) => return Err(dom.registered_operation_refusal("bitwise operations")),
                     Domain::OptionSigned(_) => {
                         return Err(
                             "bitwise operators are not supported for an Option carrier".into()
@@ -1195,13 +2652,14 @@ fn elab_term(
             // namespace cannot collide with it).
             if callee == "Some" {
                 if let Domain::OptionSigned(width) = dom {
-                    let [inner] = c.args.iter().collect::<Vec<_>>()[..] else {
+                    if c.args.len() != 1 {
                         return Err("`Some(..)` takes exactly one argument".to_string());
-                    };
+                    }
+                    let inner = &c.args[0];
                     let payload_dom = Domain::Signed(*width);
                     let payload = elab_term(inner, vars, offset, var_domains, &payload_dom)?;
                     return Ok(Expr::apps(
-                        Expr::const_(Name::from_string("Option.some"), vec![Level::zero()]),
+                        Expr::const_(Name::interned("Option.some"), vec![Level::zero()]),
                         [payload_dom.ty(), payload],
                     ));
                 }
@@ -1217,7 +2675,25 @@ fn elab_term(
             // kernel-rechecked defining equation (minted by the import step);
             // the ambient admission table gates on certified facets + a minted
             // constant, so this fires only for genuinely admitted functions.
-            if let Some(admission) = ambient_admission(&callee) {
+            // I0: a callee spelling that a parameter of this function also
+            // binds is a call of the binding in Rust, and is refused rather
+            // than resolved against a same-named island definition.
+            if let Some(admission) = ambient_call_admission(&callee)? {
+                // Trust (ref-self I1): a VIEW import is not compositional. Its
+                // arity is the FLATTENED one (`x_ref(self.x, self.y)`) while
+                // Rust reads `x_ref` as taking one borrow, and rustc does not
+                // type-check clause text — so an author-written call of it
+                // would elaborate against a signature no Rust caller can
+                // write. The ONE position it is for is the self-call
+                // `elaborate_ensures` splices in for `result`, which is keyed
+                // by `self_fn_spelling(def_path)` and round-tripped there.
+                //
+                // Decided BEFORE the capability and arity checks for the same
+                // reason I3 is decided before arity: whether a use site may
+                // name the symbol at all is the prior question.
+                if admission.is_self_result_only() && !is_ambient_self_fn_key(&callee) {
+                    return Err(view_import_unnameable_refusal(&callee, &admission));
+                }
                 // I3: the use-site capability is decided BEFORE arity —
                 // whether a use site may name the symbol at all is a prior
                 // question to whether it applied the right number of
@@ -1226,6 +2702,24 @@ fn elab_term(
                 // write. A PROOF use site never fails here.
                 if let Err(refusal) = admission.require_at(ambient_use_site(), &callee) {
                     return Err(refusal.to_string());
+                }
+                // Trust (E9-ODT-FACE-SELF-CALL-1): the contracted function's own
+                // call (the substitute `ensures_goal_source` splices in for
+                // `result`) names the clause's FLATTENED field rows, while a TG11
+                // ODT import takes the struct. Only that call is rebuilt, through
+                // the face constructor and after the capability gate above;
+                // every other call keeps the arity refusal below.
+                if is_ambient_self_fn_key(&callee) {
+                    if let Some(applied) = odt_face_self_call::face_self_call(
+                        &callee,
+                        &admission,
+                        c,
+                        vars,
+                        offset,
+                        var_domains,
+                    )? {
+                        return Ok(applied);
+                    }
                 }
                 if admission.arity != c.args.len() {
                     return Err(format!(
@@ -1244,9 +2738,142 @@ fn elab_term(
                 match &admission.carriers {
                     Some(carriers) if carriers.params.len() == admission.arity => {
                         for (i, arg) in c.args.iter().enumerate() {
-                            let arg_dom = argument_domain(arg, c, var_domains, dom)?;
+                            // Trust (d1/B2, 2026-09-28): at `ClauseMode::Strict` a
+                            // cast is never elaborated, so an argument carrying one
+                            // is refused HERE, before `argument_domain` — which sees
+                            // straight through a cast (`collect_vars`) and would
+                            // otherwise report `x as nat` as "a `u16` term" against
+                            // the declared carrier, describing an argument the
+                            // author did not write. Error → error only: every such
+                            // argument already failed further down (the cast arm is
+                            // gated on the mode), and the head is the pre-existing
+                            // `unsupported term shape`.
+                            if !has_ambient_proof_lift() && contains_cast(arg) {
+                                return Err(strict_mode_cast_argument_refusal(&callee, i, arg));
+                            }
+                            // A LIFTED argument answers for itself: the cast
+                            // names the math type, and nothing else may. This
+                            // branch is gated on the argument SYNTACTICALLY
+                            // carrying a cast, so an argument without one takes
+                            // `argument_domain` exactly as before.
+                            //
+                            // A LITERAL argument is the one other row that
+                            // moves: an untyped literal has no machine type, so
+                            // in a lifted clause it takes the DECLARED carrier's
+                            // domain when that carrier has a unique preimage,
+                            // rather than the sibling's. `nat_snd(x as nat,
+                            // 300)` from a `u8` function is the shape — today
+                            // the literal is typed `u8` by its sibling and the
+                            // clause is refused. Where the pre-existing rule
+                            // SUCCEEDS the two agree by construction: success
+                            // requires `arg_dom.carrier() == declared`, and a
+                            // `declared` with a unique preimage has exactly one
+                            // domain with that carrier.
+                            let declared_for_literal = &carriers.params[i];
+                            let arg_dom = if has_ambient_proof_lift() && contains_cast(arg) {
+                                match pinned_domain(arg, var_domains)? {
+                                    TermPin::Pinned(d) => d,
+                                    TermPin::LiteralOnly => {
+                                        argument_domain(arg, c, var_domains, dom)?
+                                    }
+                                    TermPin::Unpinned(why) => {
+                                        let src = quote::quote!(#arg).to_string();
+                                        return Err(format!(
+                                            "admitted `{callee}` parameter {i}: `{src}` is not \
+                                             self-determined ({why}); a lift is never decided \
+                                             from a sibling argument or from the enclosing \
+                                             comparison"
+                                        ));
+                                    }
+                                }
+                            } else if (has_ambient_proof_lift()
+                                || matches!(dom, Domain::RegisteredAdt(_)))
+                                && matches!(
+                                    pinned_domain(arg, var_domains)?,
+                                    TermPin::LiteralOnly
+                                )
+                            {
+                                match declared_for_literal.unique_domain() {
+                                    Some(unique_dom) => unique_dom,
+                                    None => argument_domain(arg, c, var_domains, dom)?,
+                                }
+                            } else {
+                                argument_domain(arg, c, var_domains, dom)?
+                            };
                             let declared = &carriers.params[i];
+                            // A NESTED typed call whose result no declaration
+                            // names a domain for (an island codomain `BitVec n`,
+                            // which `iN`, `u128` and the pointer-sized integers
+                            // share). `arg_dom` is then only the sibling or
+                            // ambient fallback, not a fact about that result, so
+                            // its carrier is not what is compared: the nested
+                            // callee's DECLARED result carrier is, against this
+                            // parameter's declared carrier. Two declarations, and
+                            // no domain is read off either (I0). `arg_dom` stays
+                            // the ambient the nested call's own arguments are
+                            // elaborated under, each checked against that
+                            // callee's declared parameter in turn.
+                            if let Some(nested) = undetermined_call_result_carrier(arg)? {
+                                if nested != *declared {
+                                    return Err(format!(
+                                        "admitted `{callee}` declares parameter {i} at carrier \
+                                         `{}`, but the argument is a call declared to return \
+                                         carrier `{}`; a clause call is checked against the \
+                                         callee's declared type and is never coerced to it",
+                                        declared.clean_name(),
+                                        nested.clean_name()
+                                    ));
+                                }
+                                applied = Expr::app(
+                                    applied,
+                                    elab_term(arg, vars, offset, var_domains, &arg_dom)?,
+                                );
+                                continue;
+                            }
                             if arg_dom.carrier() != *declared {
+                                // Before repeating the "never coerced" message,
+                                // say the USEFUL thing when the mismatch is
+                                // exactly the one the lift table is about.
+                                if has_ambient_proof_lift() {
+                                    let src = quote::quote!(#arg).to_string();
+                                    if let Some(to) = match declared.unique_domain() {
+                                        Some(Domain::Nat) => Some(MathTy::Nat),
+                                        Some(Domain::Int) => Some(MathTy::Int),
+                                        _ => None,
+                                    } {
+                                        // D-11 (and D-1/D-12 through the table):
+                                        // a machine term at a math-declared
+                                        // parameter. The implicit lift is
+                                        // decision OR-1, so name the cast to write
+                                        // — or, when no lift exists at all, say
+                                        // why it does not.
+                                        return Err(match lift_for(&arg_dom, to) {
+                                            Ok(_) => LiftRefusal::CastRequired
+                                                .message(&src, &arg_dom, to),
+                                            Err(refusal) => {
+                                                refusal.message(&src, &arg_dom, to)
+                                            }
+                                        });
+                                    }
+                                    if arg_dom.is_math() {
+                                        // D-2: the declared parameter is a
+                                        // machine carrier and the argument is
+                                        // an unbounded math term. The DECLARED
+                                        // carrier travels into the message —
+                                        // naming the math type on both sides
+                                        // would say nothing.
+                                        return Err(LiftRefusal::Narrowing(declared.clone())
+                                            .message(
+                                                &src,
+                                                &arg_dom,
+                                                if arg_dom == Domain::Int {
+                                                    MathTy::Int
+                                                } else {
+                                                    MathTy::Nat
+                                                },
+                                            ));
+                                    }
+                                }
                                 return Err(format!(
                                     "admitted `{callee}` declares parameter {i} at carrier `{}`, \
                                      but the argument is a `{}` term (carrier `{}`); a clause \
@@ -1278,6 +2905,57 @@ fn elab_term(
                 "call to `{callee}` in a spec requires a sealed kernel admission for established Pure ∧ Total ∧ Deterministic ∧ NoPanic facets (E6); no production admission path is available, so program-function calls in specs fail closed; mention the function through its operational relation instead"
             ))
         }
+        // THE EXPLICIT LIFT (nat-lift design §3.3), the ratified `e as nat` /
+        // `e as int` spelling of spec surface §12.3.
+        //
+        // Outside [`ClauseMode::ProofLift`] this arm is not taken at all and a
+        // cast keeps the pre-existing `unsupported term shape` message, to the
+        // byte — the mode is the gate, so no existing elaboration changes.
+        SynExpr::Cast(cast) if has_ambient_proof_lift() => {
+            let Some(target) = MathTy::from_syn_type(&cast.ty) else {
+                let ty = &cast.ty;
+                return Err(non_spec_cast_error(&quote::quote!(#ty).to_string()));
+            };
+            // The cast's VALUE has the target's type, so the position it sits
+            // in must be at that type. A cast at a machine position is exactly
+            // the narrowing the table refuses (D-2), reported where the author
+            // wrote it rather than as a downstream ill-typed goal.
+            if *dom != target.domain() {
+                let inner = &cast.expr;
+                let operand_src = quote::quote!(#inner).to_string();
+                return Err(LiftRefusal::Narrowing(dom.carrier()).message(
+                    &format!("{operand_src} as {}", target.spelling()),
+                    &target.domain(),
+                    target,
+                ));
+            }
+            match pinned_domain(&cast.expr, var_domains)? {
+                // An untyped literal has no machine type of its own; the only
+                // type in sight is the cast's, so `300 as nat` is the `Nat`
+                // literal and `(200 + 100) as nat` is `Nat.add 200 100`. This
+                // fires only where today is an error.
+                TermPin::LiteralOnly => {
+                    elab_term(&cast.expr, vars, offset, var_domains, &target.domain())
+                }
+                TermPin::Pinned(from) => {
+                    let lift = lift_for(&from, target).map_err(|r| {
+                        let inner = &cast.expr;
+                        r.message(&quote::quote!(#inner).to_string(), &from, target)
+                    })?;
+                    record_required_signed_lift(&lift);
+                    // The operand is elaborated at ITS OWN domain — spec
+                    // surface §1.2 rule 4: `(a + b) as nat` means
+                    // `toNat (a +wrap b)`, NOT unbounded addition.
+                    let inner = elab_term(&cast.expr, vars, offset, var_domains, &from)?;
+                    lift.wrap(inner)
+                }
+                TermPin::Unpinned(why) => {
+                    let inner = &cast.expr;
+                    let operand_src = quote::quote!(#inner).to_string();
+                    Err(unpinned_lift_error(&operand_src, target, &why))
+                }
+            }
+        }
         SynExpr::MethodCall(m) => Err(format!(
             "method call `.{}(..)` in a spec requires a sealed kernel admission for established Pure ∧ Total ∧ Deterministic ∧ NoPanic facets (E6); method identity and admission are not available, so method calls in specs fail closed; mention the method through its operational relation instead",
             m.method
@@ -1300,27 +2978,36 @@ fn elaborate_prop(
     // which makes every operand's typing here byte-identical to the
     // pre-increment code, entry point for entry point.
     let uniform = uniform_var_domains(vars, dom);
-    let var_domains = &uniform;
+    elaborate_prop_with_uniform(ast, vars, offset, dom, &uniform)
+}
+
+fn elaborate_prop_with_uniform(
+    ast: &SynExpr,
+    vars: &[String],
+    offset: u32,
+    dom: &Domain,
+    var_domains: &BTreeMap<String, Domain>,
+) -> Result<Expr, String> {
     match ast {
-        SynExpr::Paren(p) => elaborate_prop(&p.expr, vars, offset, dom),
+        SynExpr::Paren(p) => elaborate_prop_with_uniform(&p.expr, vars, offset, dom, var_domains),
         // Logical connectives: operands are *propositions* — recurse.
         SynExpr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => Ok(Expr::app(
-            Expr::const_(Name::from_string("Not"), vec![]),
-            elaborate_prop(&u.expr, vars, offset, dom)?,
+            Expr::const_(Name::interned("Not"), vec![]),
+            elaborate_prop_with_uniform(&u.expr, vars, offset, dom, var_domains)?,
         )),
         SynExpr::Binary(b) if matches!(b.op, BinOp::And(_)) => Ok(connective(
             "And",
-            elaborate_prop(&b.left, vars, offset, dom)?,
-            elaborate_prop(&b.right, vars, offset, dom)?,
+            elaborate_prop_with_uniform(&b.left, vars, offset, dom, var_domains)?,
+            elaborate_prop_with_uniform(&b.right, vars, offset, dom, var_domains)?,
         )),
         SynExpr::Binary(b) if matches!(b.op, BinOp::Or(_)) => Ok(connective(
             "Or",
-            elaborate_prop(&b.left, vars, offset, dom)?,
-            elaborate_prop(&b.right, vars, offset, dom)?,
+            elaborate_prop_with_uniform(&b.left, vars, offset, dom, var_domains)?,
+            elaborate_prop_with_uniform(&b.right, vars, offset, dom, var_domains)?,
         )),
         // Disequality `a != b` desugars to `!(a == b)` (see `ne_as_not_eq`).
         SynExpr::Binary(b) if matches!(b.op, BinOp::Ne(_)) => {
-            elaborate_prop(&ne_as_not_eq(b), vars, offset, dom)
+            elaborate_prop_with_uniform(&ne_as_not_eq(b), vars, offset, dom, var_domains)
         }
         // A bare identifier — or a dotted path naming a `bool` FIELD — is a
         // proposition only in a `bool` clause, where `flag` is read as
@@ -1332,7 +3019,7 @@ fn elaborate_prop(
         // A boolean literal is the trivial proposition `True`/`False`.
         SynExpr::Lit(l) if matches!(&l.lit, Lit::Bool(_)) => {
             let value = matches!(&l.lit, Lit::Bool(b) if b.value);
-            Ok(Expr::const_(Name::from_string(if value { "True" } else { "False" }), vec![]))
+            Ok(Expr::const_(Name::interned(if value { "True" } else { "False" }), vec![]))
         }
         // Comparison predicate `a <cmp> b`: operands are *terms*.
         SynExpr::Binary(b) => {
@@ -1353,6 +3040,9 @@ fn elaborate_prop(
                 && (dom.is_bool() || decided_side)
             {
                 return Err("`bool` values are not ordered (use `==` or `!=`)".into());
+            }
+            if matches!(dom, Domain::RegisteredAdt(_)) && !matches!(b.op, BinOp::Eq(_)) {
+                return Err(dom.registered_operation_refusal("ordering"));
             }
             let l = elab_term(&b.left, vars, offset, var_domains, dom)?;
             let r = elab_term(&b.right, vars, offset, var_domains, dom)?;
@@ -1409,12 +3099,12 @@ fn elaborate_prop(
 
 /// `pred a b` for a binary Nat relation constant (`Nat.le` / `Nat.lt`).
 fn nat_pred(name: &str, a: Expr, b: Expr) -> Expr {
-    Expr::app(Expr::app(Expr::const_(Name::from_string(name), vec![]), a), b)
+    Expr::app(Expr::app(Expr::const_(Name::interned(name), vec![]), a), b)
 }
 
 /// `And p q` / `Or p q` — the propositional connectives (`Prop → Prop → Prop`).
 fn connective(name: &str, p: Expr, q: Expr) -> Expr {
-    Expr::app(Expr::app(Expr::const_(Name::from_string(name), vec![]), p), q)
+    Expr::app(Expr::app(Expr::const_(Name::interned(name), vec![]), p), q)
 }
 
 /// Wrap a `Prop` body (built over `vars` at the body depth) in
@@ -1438,6 +3128,9 @@ pub fn elaborate_goal(spec: &str) -> Result<Expr, String> {
 /// corresponding fixed-width wrapping carrier. This API does not bind that
 /// statement to a Rust/Trust-IR obligation and grants no VC authority.
 pub fn elaborate_goal_in(spec: &str, dom: &Domain) -> Result<Expr, String> {
+    if matches!(dom, Domain::RegisteredAdt(_)) {
+        return Err("registered datatype clauses require current-environment validation; use elaborate_goal_with_domains with the checking Environment".into());
+    }
     let ast: SynExpr = syn::parse_str(spec).map_err(|e| format!("parse error: {e}"))?;
     let mut vars = Vec::new();
     collect_vars(&ast, &mut vars);
@@ -1465,9 +3158,122 @@ pub fn elaborate_goal_typed(spec: &str, var_types: &[(&str, &str)]) -> Result<Ex
     if clause_uses_quantifier_fragment(spec) {
         return elaborate_quantified_goal_typed(spec, var_types);
     }
-    let (ast, vars, var_domains) = parse_exact_typed_clause(spec, var_types)?;
-    let body = elaborate_prop_multi(&ast, &vars, 0, &var_domains)?;
+    let ast: SynExpr = syn::parse_str(spec).map_err(|e| format!("parse error: {e}"))?;
+    elaborate_parsed_goal_typed(&ast, var_types)
+}
+
+fn elaborate_parsed_goal_typed(
+    ast: &SynExpr,
+    var_types: &[(&str, &str)],
+) -> Result<Expr, String> {
+    let vars = collect_exact_clause_vars(ast, var_types)?;
+    let var_domains = exact_typed_bindings(&vars, var_types)?;
+    let body = elaborate_prop_multi(ast, &vars, 0, &var_domains)?;
     close_over_multi(&vars, body, &var_domains)
+}
+
+/// Elaborate exact typed bindings, including registered kernel datatypes, in
+/// the environment that will check the resulting proposition. Unlike the
+/// string compatibility API, a datatype cannot be admitted by spelling its
+/// name. Every registered handle in the bindings and facet table is revalidated
+/// here; the complete goal is then fully checked as `Prop`.
+///
+/// This is mathematical goal construction, not Rust VC authority. In
+/// particular, it neither proves a Rust representation relation nor promotes
+/// a reflected admission to `KernelChecked`.
+pub fn elaborate_goal_with_domains(
+    env: &Environment,
+    spec: &str,
+    var_domains: &[(&str, Domain)],
+    facets: &FacetTable,
+) -> Result<Expr, String> {
+    elaborate_goal_with_domains_inner(env, spec, None, var_domains, facets, None)
+}
+
+fn elaborate_goal_with_domains_inner(
+    env: &Environment,
+    spec: &str,
+    parsed_ast: Option<&SynExpr>,
+    bindings: &[(&str, Domain)],
+    facets: &FacetTable,
+    self_fn_name: Option<&str>,
+) -> Result<Expr, String> {
+    for (_, domain) in bindings {
+        domain.validate_in(env)?;
+    }
+    // A facet table can outlive the environment it was read from. Revalidate
+    // the carriers even when they occur only as a call's result or parameter.
+    for admission in facets.records.admissions.values() {
+        if let Some(domain) = admission.return_domain() {
+            domain.validate_in(env)?;
+        }
+        if let Some(carriers) = &admission.carriers {
+            for carrier in carriers.params.iter().chain(std::iter::once(&carriers.ret)) {
+                carrier.validate_in(env)?;
+            }
+        }
+    }
+    let _lift = ProofLiftScope::enter(&ProofClauseInputs::strict(), self_fn_name);
+    let _self_fn = SelfFnScope::enter(self_fn_name);
+    let _scope = AdmissionScope::enter_at(facets.clone(), trust_symbols::Capability::Proof);
+    let goal = if parsed_ast.is_none() && clause_uses_quantifier_fragment(spec) {
+        let clause = parse_qclause(spec, true)?;
+        if let Some(err) = qclause_first_call_facet_error(&clause, facets) {
+            return Err(err);
+        }
+        let mut free = Vec::new();
+        collect_qclause_free_vars(&clause, &mut Vec::new(), &mut free);
+        let mut domains = exact_domain_bindings(&free, bindings)?;
+        let body = elab_qclause(&clause, &mut free.clone(), 0, &mut domains)?;
+        close_over_multi(&free, body, &domains)?
+    } else if let Some(ast) = parsed_ast {
+        let vars = collect_exact_clause_vars(ast, bindings)?;
+        if let Some(err) = first_call_facet_error(ast, facets) {
+            return Err(err);
+        }
+        let domains = exact_domain_bindings(&vars, bindings)?;
+        let body = elaborate_prop_multi(ast, &vars, 0, &domains)?;
+        close_over_multi(&vars, body, &domains)?
+    } else {
+        let (ast, vars) = parse_exact_clause_vars(spec, bindings)?;
+        if let Some(err) = first_call_facet_error(&ast, facets) {
+            return Err(err);
+        }
+        let domains = exact_domain_bindings(&vars, bindings)?;
+        let body = elaborate_prop_multi(&ast, &vars, 0, &domains)?;
+        close_over_multi(&vars, body, &domains)?
+    };
+    clean_kernel::TypeChecker::new(env).check_type(&goal, &Expr::prop()).map_err(|err| {
+        format!("typed clause is not a proposition in the current environment: {err}")
+    })?;
+    Ok(goal)
+}
+
+/// Environment-aware `ensures` for exact domains. Shares the existing
+/// parameter-order and self-identity checks and substitutes the admitted
+/// self-call for `result`; it never quantifies over an unconstrained result.
+pub fn elaborate_ensures_with_domains(
+    env: &Environment,
+    clause: &str,
+    param_domains: &[(&str, Domain)],
+    self_fn_name: &str,
+    facets: &FacetTable,
+) -> Result<Expr, String> {
+    // Validate even unused parameters before reducing to the clause's free
+    // inputs, so filtering cannot hide a stale datatype handle.
+    for (_, domain) in param_domains {
+        domain.validate_in(env)?;
+    }
+    let source = ensures_goal_source(clause, param_domains, self_fn_name, facets)?;
+    let used = discharge_used_bindings(&source, param_domains);
+    elaborate_goal_with_domains_inner(
+        env,
+        &source.src,
+        source.parsed_ast.as_ref(),
+        &used,
+        facets,
+        Some(self_fn_name),
+    )
 }
 
 /// R4 §2 (evidence-carrying binder inference, ratified 2026-07-22): the E3
@@ -1585,27 +3391,48 @@ fn strip_quant_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
 
 /// Strip MATCHED outer parentheses, repeatedly: `((P))` → `P`. A parenthesis
 /// that closes before the end (`(a) ==> (b)`) is not outer and is kept.
+///
+/// Nesting is tracked as two `usize` counts over the bytes of `inner` (`(`
+/// and `)` are ASCII, so a byte walk sees exactly the parentheses a `char`
+/// walk would): the stripped pair is matched iff the closes never overtake
+/// the opens. Each count is at most the byte index it was taken at, which is
+/// what the `> i` guards restate — a loop-carried fact the verifier does not
+/// carry for this loop shape (measured 2026-09-13 on `dff2b22d1`: the former
+/// `i32` depth was refuted at `i32::MAX`, a real overflow at 2^31 nested
+/// parentheses; the guarded counts prove).
 fn strip_outer_parens(s: &str) -> &str {
     let mut t = s.trim();
     loop {
         let Some(inner) = t.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
             return t;
         };
-        // The stripped pair is matched iff depth never returns to zero inside.
-        let mut depth = 1i32;
+        let bytes = inner.as_bytes();
+        let mut opens: usize = 0;
+        let mut closes: usize = 0;
         let mut matched = true;
-        for c in inner.chars() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
+        let mut i: usize = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => {
+                    if opens > i {
+                        return t;
+                    }
+                    opens += 1;
+                }
+                b')' => {
+                    if closes > i {
+                        return t;
+                    }
+                    closes += 1;
+                    // Depth `1 + opens - closes` returned to zero before the end.
+                    if closes > opens {
                         matched = false;
                         break;
                     }
                 }
                 _ => {}
             }
+            i += 1;
         }
         if !matched {
             return t;
@@ -1617,16 +3444,36 @@ fn strip_outer_parens(s: &str) -> &str {
 /// Split `s` at the FIRST parenthesis-depth-zero `==>`, if any. With the
 /// right-associative grammar the first split's LHS is a leaf (or a
 /// parenthesized sub-clause) and the RHS may itself be an implication.
+///
+/// Depth is `opens - closes` over the bytes of `s` (both ASCII), so depth zero
+/// is `opens == closes`; each count is at most the byte index it was taken
+/// at, restated by the `> i` guards for the reason given at
+/// [`strip_outer_parens`]. The two halves are taken with `str::get`: `i` and
+/// `i + 3` sit on ASCII bytes and so on character boundaries, and `get` says
+/// so in its return type where an index would panic on a boundary the
+/// verifier cannot see (measured 2026-09-13 on `dff2b22d1`: the indexed
+/// halves were refuted, the `get` halves prove).
 fn split_top_level_implies(s: &str) -> Option<(&str, &str)> {
     let bytes = s.as_bytes();
-    let mut depth = 0i32;
-    let mut i = 0;
+    let mut opens: usize = 0;
+    let mut closes: usize = 0;
+    let mut i: usize = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b'=' if depth == 0 && bytes[i..].starts_with(b"==>") => {
-                return Some((&s[..i], &s[i + 3..]));
+            b'(' => {
+                if opens > i {
+                    return None;
+                }
+                opens += 1;
+            }
+            b')' => {
+                if closes > i {
+                    return None;
+                }
+                closes += 1;
+            }
+            b'=' if opens == closes && bytes[i..].starts_with(b"==>") => {
+                return Some((s.get(..i)?, s.get(i + 3..)?));
             }
             _ => {}
         }
@@ -1669,7 +3516,12 @@ fn parse_quant_binder(kind: QuantKind, kw: &str, rest: &str) -> Result<QClause, 
         .char_indices()
         .find(|&(_, c)| !(c.is_alphanumeric() || c == '_'))
         .map_or(rest.len(), |(i, _)| i);
-    let (var, after) = rest.split_at(ident_end);
+    // `ident_end` is a `char_indices` index (or `rest.len()`), so it is a
+    // character boundary; `split_at_checked` says so in its return type where
+    // `split_at` would panic on a boundary the verifier cannot see.
+    let Some((var, after)) = rest.split_at_checked(ident_end) else {
+        return Err(format!("`{kw}` binder name does not end on a character boundary"));
+    };
     if var.is_empty() || var.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return Err(format!("`{kw}` expects a binder name (e.g. `{kw} i: u64, <body>`)"));
     }
@@ -1682,14 +3534,13 @@ fn parse_quant_binder(kind: QuantKind, kw: &str, rest: &str) -> Result<QClause, 
     };
     // The supported binder types contain no comma, so the type runs to the
     // first comma; the body is everything after it.
-    let Some(comma) = after.find(',') else {
+    let Some((ty, body_src)) = after.split_once(',') else {
         return Err(format!("`{kw} {var}: …` expects `, <body>` after the binder type"));
     };
-    let ty = after[..comma].trim();
+    let ty = ty.trim();
     if ty.is_empty() {
         return Err(format!("`{kw} {var}:` is missing the binder type"));
     }
-    let body_src = &after[comma + 1..];
     // A second `name: ty` group after the comma is a multi-binder head — not a
     // body. The supported leaf fragment never contains a bare `:` (paths and
     // type ascription are outside it), so any depth-zero single `:` in the body
@@ -1715,20 +3566,37 @@ fn parse_quant_binder(kind: QuantKind, kw: &str, rest: &str) -> Result<QClause, 
 
 /// Whether `s` has a parenthesis-depth-zero single `:` (`::` path separators,
 /// which the fragment rejects later anyway, are not flagged here).
+///
+/// Same counting discipline as [`split_top_level_implies`]. A `::` is stepped
+/// over with one `i += 2` behind a length check, so the step stays inside the
+/// slice, rather than two increments: the verifier proves a single bounded
+/// step from the loop condition and refuted the two-step spelling (measured
+/// 2026-09-13 on `dff2b22d1`).
 fn body_has_top_level_colon(s: &str) -> bool {
     let bytes = s.as_bytes();
-    let mut depth = 0i32;
-    let mut i = 0;
+    let mut opens: usize = 0;
+    let mut closes: usize = 0;
+    let mut i: usize = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b':' if depth == 0 => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b':' {
-                    i += 1; // skip `::`
-                } else {
+            b'(' => {
+                if opens > i {
                     return true;
                 }
+                opens += 1;
+            }
+            b')' => {
+                if closes > i {
+                    return true;
+                }
+                closes += 1;
+            }
+            b':' if opens == closes => {
+                if bytes.len() - i >= 2 && bytes[i..].starts_with(b"::") {
+                    i += 2; // skip `::`
+                    continue;
+                }
+                return true;
             }
             _ => {}
         }
@@ -1808,7 +3676,7 @@ fn elab_qclause(
         QClause::Leaf(ast) => elaborate_prop_multi(ast, vars, offset, var_domains),
         QClause::Implies { lhs, rhs } => {
             let l = elab_qclause(lhs, vars, offset, var_domains)?;
-            let r = elab_qclause(rhs, vars, offset + 1, var_domains)?;
+            let r = elab_qclause(rhs, vars, one_binder_deeper(offset)?, var_domains)?;
             Ok(Expr::pi(BinderInfo::Default, l, r))
         }
         QClause::Quant { kind, var, ty, body } => {
@@ -1843,7 +3711,7 @@ fn elab_qclause(
                 // predicate lambda.
                 QuantKind::Exists => Expr::app(
                     Expr::app(
-                        Expr::const_(Name::from_string("Exists"), vec![Level::succ(Level::zero())]),
+                        Expr::const_(Name::interned("Exists"), vec![Level::succ(Level::zero())]),
                         dom.ty(),
                     ),
                     Expr::lam(BinderInfo::Default, dom.ty(), body_expr),
@@ -1859,12 +3727,19 @@ fn elab_qclause(
 /// ∀-close over the free variables exactly like the plain path.
 fn elaborate_quantified_goal_typed(spec: &str, var_types: &[(&str, &str)]) -> Result<Expr, String> {
     let clause = parse_qclause(spec, true)?;
+    elaborate_parsed_qclause_typed(&clause, var_types)
+}
+
+fn elaborate_parsed_qclause_typed(
+    clause: &QClause,
+    var_types: &[(&str, &str)],
+) -> Result<Expr, String> {
     let mut free = Vec::new();
-    collect_qclause_free_vars(&clause, &mut Vec::new(), &mut free);
+    collect_qclause_free_vars(clause, &mut Vec::new(), &mut free);
     let bindings = exact_typed_bindings(&free, var_types)?;
     let mut vars = free.clone();
     let mut var_domains = bindings;
-    let body = elab_qclause(&clause, &mut vars, 0, &mut var_domains)?;
+    let body = elab_qclause(clause, &mut vars, 0, &mut var_domains)?;
     close_over_multi(&free, body, &var_domains)
 }
 
@@ -2067,16 +3942,86 @@ pub struct Admission {
     proof_only_via: Option<String>,
     /// The callee's RETURN domain, when the minting site recorded one (the
     /// compiler-side import reads it off the typed signature; the island
-    /// admitter reads it off the kernel type's codomain). This is elaboration
-    /// STEERING, never authority: [`atom_domain`] uses it to type a
-    /// VARIABLE-FREE atom (`answer() == c42(0)`) at the callee's machine
-    /// domain instead of the `Nat` default, and a wrongly recorded domain can
-    /// only produce an ill-typed proposition the kernel then rejects — it can
-    /// never make a false claim check. Private like the other
-    /// evidence-bearing fields; the minting caller attaches it through
+    /// admitter reads it off the kernel type's codomain). Private like the
+    /// other evidence-bearing fields; the minting caller attaches it through
     /// [`Admission::with_return_domain`], and an absent domain simply leaves
     /// the pre-existing fail-closed default in force.
+    ///
+    /// **STEERING, plus one load-bearing use — read this before trusting the
+    /// old sentence.** Until the nat-lift landed (2026-09-17) this field was
+    /// pure steering: [`atom_domain`] used it to type a VARIABLE-FREE atom
+    /// (`answer() == c42(0)`) at the callee's machine domain instead of the
+    /// `Nat` default, and the comment here said "a wrongly recorded domain can
+    /// only produce an ill-typed proposition the kernel then rejects — it can
+    /// never make a false claim check".
+    ///
+    /// THAT IS NO LONGER TRUE FOR A LIFTED TERM. When a lift is decided from
+    /// this field it selects an integer VALUE, not a literal range: `i128` and
+    /// `u128` share the carrier `BitVec 128`, so recording the wrong one turns
+    /// the same bit pattern into `-1` or into `2^128 - 1` and BOTH goals are
+    /// well-typed. The kernel cannot catch it, so the field is now named in
+    /// `docs/TCB.md`'s `EnsuresCitationDischarge` row and is read TWICE before
+    /// any lift is built on it: the self function's recorded domain is
+    /// cross-checked against the compiler's own resolved return type, and any
+    /// other call may head a lifted term only when its carrier has a unique
+    /// preimage (see [`TermPin`]). Outside a lift the old sentence still
+    /// holds exactly.
     return_domain: Option<Domain>,
+    /// Trust (ref-self I1): the name of the SEMANTIC VIEW this import was
+    /// minted over, when it was not minted over the extracted body itself.
+    ///
+    /// Today the one value is `trust_types::e6_param_view::VIEW_MARKER`
+    /// (`"frozen-shared-erased"`): the defining equation is a function of a
+    /// frozen shared pointee's scalar field VALUES, and the correspondence
+    /// between it and the Rust function rests on the aliasing assumption
+    /// R1 names (`docs/TCB.md`).
+    ///
+    /// **This field exists to be DISCLOSED, not to be checked.** A row
+    /// discharged against an admission carrying it is reported BELOW
+    /// `Certified` and carries the marker on the spec-clean goal row, on the
+    /// zero-authority denotation row and in the discharge note; on the JSON wire
+    /// it takes a distinct solver label and ships no kernel proof evidence at
+    /// all. `None` is the ordinary import and changes nothing about any existing
+    /// lane.
+    view: Option<String>,
+    /// Trust (ref-self I1): when true, this admission may be named ONLY as the
+    /// self-call [`elaborate_ensures`] splices in for `result` — never as an
+    /// author-written call in any clause.
+    ///
+    /// Why a view import is not compositional. Its arity is the FLATTENED one
+    /// (`x_ref(self.x, self.y)`), while Rust reads `x_ref` as taking one
+    /// borrow, and rustc does not type-check clause text ([M-2] probes `v03`,
+    /// `v04`). Without this mark `other_fn ensures result == x_ref(a, b)`
+    /// would elaborate against a signature no Rust caller can write.
+    ///
+    /// It is also what makes "this goal rests on a view" decidable from the
+    /// SELF function alone: no other view import can enter a goal, so the
+    /// compiler's disclosure needs to look at exactly one admission.
+    self_result_only: bool,
+    /// Trust (GREEN THAT LIES, `docs/KNOWN_HAZARDS.md` 2026-09-18): the
+    /// QUALIFICATION this row must travel with — one rendered disclosure
+    /// sentence per `import` of the Clean island lane that Clean's built-in
+    /// PRELUDE STAND-IN served instead of the library of that name.
+    ///
+    /// The declaration really was kernel-checked; what the sentence adds is
+    /// *relative to what*. The compiler's per-island note says the same thing
+    /// in the same words, but that note is per-ISLAND while this record is
+    /// per-FUNCTION, so a consumer reading rows without the compilation's
+    /// diagnostics saw an unqualified green. This field is how the green
+    /// travels with its qualification.
+    ///
+    /// Rendered by the minting crate
+    /// (`trust_certify::clean_island::CleanIslandStandinImport::disclosure`)
+    /// and carried verbatim: this crate sits BELOW `trust-certify` in the
+    /// dependency order, so it owns the obligation to keep the text attached
+    /// to the row, never the wording.
+    ///
+    /// Empty is the honest default and the value for every admission that is
+    /// not Clean-origin — a reflected Rust carrier has no island at all. It
+    /// carries NO authority in either direction: nothing reads it to decide a
+    /// verdict, and a row that gains a disclosure keeps exactly the strength
+    /// it had.
+    standin_disclosures: Vec<String>,
 }
 
 impl Admission {
@@ -2110,6 +4055,9 @@ impl Admission {
             carriers: None,
             proof_only_via: None,
             return_domain: None,
+            view: None,
+            self_result_only: false,
+            standin_disclosures: Vec::new(),
         }
     }
 
@@ -2146,7 +4094,37 @@ impl Admission {
             carriers: None,
             proof_only_via: None,
             return_domain: None,
+            view: None,
+            self_result_only: false,
+            standin_disclosures: Vec::new(),
         }
+    }
+
+    /// Attach the stand-in disclosures this row must be read relative to (see
+    /// the field docs). REPLACES the recorded set rather than merging it: the
+    /// minting site knows which island lane served this constant, and a caller
+    /// that wants a union must compute it and pass the union — deciding that
+    /// here would hide which of two callers was the more qualified one.
+    ///
+    /// Attaches no authority and removes none: the admission's status,
+    /// capability, carriers and domains are untouched.
+    #[must_use]
+    pub fn with_standin_disclosures<I, S>(mut self, disclosures: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.standin_disclosures = disclosures.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The stand-in disclosures recorded for this row, in the order the
+    /// minting site supplied them. Empty means "no island `import` of this
+    /// row's provenance was served by the prelude stand-in" — which is also
+    /// what an admission that is not Clean-origin says.
+    #[must_use]
+    pub fn standin_disclosures(&self) -> &[String] {
+        &self.standin_disclosures
     }
 
     /// Record the callee's declared RETURN domain (see the field docs). The
@@ -2260,13 +4238,8 @@ impl Admission {
     }
 }
 
-/// Facet records keyed by the callee path exactly as spelled in the spec
-/// (e.g. `min` or `cmp::min`). Method calls are NOT keyed here yet: method
-/// resolution is receiver-type-dependent, so their keying arrives with the
-/// compiler-side wiring that has typeck results in hand; until then method
-/// calls keep the unconditional fail-closed diagnostic.
 #[derive(Debug, Clone, Default)]
-pub struct FacetTable {
+struct FacetRecords {
     map: std::collections::BTreeMap<String, FnFacets>,
     /// E6 brick 4: the kernel constant each admitted function was minted as,
     /// keyed by the same callee path as `map`. Populated ONLY by the
@@ -2274,9 +4247,75 @@ pub struct FacetTable {
     admissions: std::collections::BTreeMap<String, Admission>,
 }
 
+/// Facet records keyed by the callee path exactly as spelled in the spec
+/// (e.g. `min` or `cmp::min`). Method calls are NOT keyed here yet: method
+/// resolution is receiver-type-dependent, so their keying arrives with the
+/// compiler-side wiring that has typeck results in hand; until then method
+/// calls keep the unconditional fail-closed diagnostic.
+#[derive(Clone, Default)]
+pub struct FacetTable {
+    records: std::sync::Arc<FacetRecords>,
+    /// I0 (ref-self design §4.0): the identifiers RUST BINDS in the clause
+    /// scope of the one function whose clauses this table is about — every
+    /// name bound by a parameter pattern, plus the const generics in scope —
+    /// each mapped to the compiler-computed help line for the refusal.
+    ///
+    /// Why it cannot be derived here. The elaborator learns a parameter's
+    /// existence only from the clause-side ROWS (`c.degree`, `c.coeff` for a
+    /// by-value struct; nothing at all for a `&T`), so a BARE `c` looks like a
+    /// free identifier and falls through to the admission table — where a
+    /// `clean { def c … }` island definition of the same name answers. That is
+    /// name capture: the clause says `c` and the goal says the island
+    /// constant. Only the compiler knows the signature, so only the compiler
+    /// can say which bare identifiers are Rust bindings; this field is how it
+    /// says so, and an empty map (every non-compiler caller) reproduces the
+    /// pre-I0 behaviour byte for byte.
+    ///
+    /// The map is a REFUSAL set, never a binding source: a name in it can only
+    /// make an elaboration fail closed, never resolve.
+    shadowed_idents: std::sync::Arc<std::collections::BTreeMap<String, String>>,
+}
+
+impl std::fmt::Debug for FacetTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FacetTable")
+            .field("map", &self.records.map)
+            .field("admissions", &self.records.admissions)
+            .field("shadowed_idents", &*self.shadowed_idents)
+            .finish()
+    }
+}
+
 impl FacetTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Read every registered carrier recorded in this table, including call
+    /// results and nested parameter carriers. This is passive transport input,
+    /// not an admission query: even regressed/unused records are included, as
+    /// they are in the environment-aware elaborator's revalidation pass.
+    /// Consumers must revalidate each handle against their own environment.
+    pub fn registered_carriers(&self) -> Vec<&RegisteredAdt> {
+        fn collect<'a>(carrier: &'a Carrier, out: &mut Vec<&'a RegisteredAdt>) {
+            match carrier {
+                Carrier::RegisteredAdt(registered) => out.push(registered),
+                Carrier::Option(inner) => collect(inner, out),
+                _ => {}
+            }
+        }
+        let mut result = Vec::new();
+        for admission in self.records.admissions.values() {
+            if let Some(Domain::RegisteredAdt(registered)) = admission.return_domain() {
+                result.push(registered);
+            }
+            if let Some(carriers) = &admission.carriers {
+                for carrier in carriers.params.iter().chain(std::iter::once(&carriers.ret)) {
+                    collect(carrier, &mut result);
+                }
+            }
+        }
+        result
     }
 
     /// Build a table from a whole crate's STRUCTURAL facet inference in one call.
@@ -2305,7 +4344,7 @@ impl FacetTable {
     }
 
     pub fn insert(&mut self, callee_path: impl Into<String>, facets: FnFacets) {
-        self.map.insert(callee_path.into(), facets);
+        std::sync::Arc::make_mut(&mut self.records).map.insert(callee_path.into(), facets);
     }
 
     /// Monotonically upgrade existing records from a later whole-crate
@@ -2326,16 +4365,17 @@ impl FacetTable {
                 FacetStatus::Unknown | FacetStatus::Undetermined { .. } => current.clone(),
             }
         }
+        let records = std::sync::Arc::make_mut(&mut self.records);
         for (path, total, no_panic, pure, deterministic) in entries {
             let path = path.into();
-            if let Some(existing) = self.map.get(&path) {
+            if let Some(existing) = records.map.get(&path) {
                 let upgraded = FnFacets {
                     pure: promote(&existing.pure, pure),
                     total: promote(&existing.total, total),
                     deterministic: promote(&existing.deterministic, deterministic),
                     no_panic: promote(&existing.no_panic, no_panic),
                 };
-                self.map.insert(path, upgraded);
+                records.map.insert(path, upgraded);
             }
         }
     }
@@ -2344,12 +4384,13 @@ impl FacetTable {
     /// key is fine — eviction must be idempotent. Also drops any admission for
     /// that key, so an evicted (ambiguous) name can never stay admitted.
     pub fn remove(&mut self, callee_path: &str) {
-        self.map.remove(callee_path);
-        self.admissions.remove(callee_path);
+        let records = std::sync::Arc::make_mut(&mut self.records);
+        records.map.remove(callee_path);
+        records.admissions.remove(callee_path);
     }
 
     pub fn get(&self, callee_path: &str) -> Option<&FnFacets> {
-        self.map.get(callee_path)
+        self.records.map.get(callee_path)
     }
 
     /// Record that `callee_path` has been ADMITTED as a Clean kernel constant
@@ -2358,7 +4399,9 @@ impl FacetTable {
     /// re-checks the definition. Recording it does NOT itself grant authority
     /// — [`Self::admitted`] still gates on [`FnFacets::admissible`].
     pub fn admit(&mut self, callee_path: impl Into<String>, admission: Admission) {
-        self.admissions.insert(callee_path.into(), admission);
+        std::sync::Arc::make_mut(&mut self.records)
+            .admissions
+            .insert(callee_path.into(), admission);
     }
 
     /// The kernel constant `callee_path` was admitted as, IFF it has a facet
@@ -2379,9 +4422,31 @@ impl FacetTable {
     /// report a Clean declaration the kernel authenticated — call
     /// `require_kernel_check` explicitly; see
     /// `trust_certify::clean_island::admit_certified_island_definition`.
+    /// **Trust (ref-self I1), the ONE admission class that does not consult the
+    /// record, stated so it is deliberate and not an oversight.** A
+    /// [`Admission::is_self_result_only`] import was minted over a SEMANTIC
+    /// VIEW of the function, not over its extracted body, and the view carries
+    /// its OWN isolated facet certification, established at mint time
+    /// (`trust_certify::clean_island::param_view`, gate V4). The record under
+    /// this key describes the BORROW-BEARING body, which is deliberately NOT
+    /// admissible — `facet_inference` refuses every `Ty::Ref` local — so
+    /// requiring it would make every correctly minted view import fail closed,
+    /// and the only way to satisfy it would be to write a certified record for
+    /// a function whose body is not certified. That record would be a FALSE
+    /// claim visible to every other consumer of this table (the citation
+    /// sweep's per-facet status line reads it), so the mark is carried on the
+    /// admission instead, where its scope is exactly the import it describes.
+    ///
+    /// This widens nothing: such an admission is refused at EVERY use site but
+    /// the spliced self-call (see [`Admission::self_result_only`],
+    /// [`ambient_call_admission`] and [`ambient_bare_admission`]).
     pub fn admitted(&self, callee_path: &str) -> Option<&Admission> {
-        let certified = self.map.get(callee_path).is_some_and(FnFacets::admissible);
-        if certified { self.admissions.get(callee_path) } else { None }
+        let admission = self.records.admissions.get(callee_path)?;
+        if admission.is_self_result_only() {
+            return Some(admission);
+        }
+        let certified = self.records.map.get(callee_path).is_some_and(FnFacets::admissible);
+        if certified { Some(admission) } else { None }
     }
 
     /// I2: the status a **kernel constant** was minted under, looked up by the
@@ -2402,10 +4467,31 @@ impl FacetTable {
     /// bare name — so the first match is answered; they are the same mint.
     #[must_use]
     pub fn kernel_const_status(&self, kernel_const: &str) -> Option<&KernelStatus> {
-        self.admissions
+        self.records
+            .admissions
             .values()
             .find(|admission| admission.kernel_const == kernel_const)
             .map(Admission::status)
+    }
+
+    /// Every callee path an admission is recorded under whose kernel constant
+    /// is `kernel_const`, in key order — the def-path and each spec spelling
+    /// the compiler recorded the same mint under.
+    ///
+    /// DIAGNOSTICS ONLY (E6 expansion I0): the E6 refusal text uses it to say
+    /// that a function's import was not minted because its kernel name is
+    /// already held by ANOTHER function's import (two def paths that mangle
+    /// to one `trust_import_*` name; the kernel refuses the second with
+    /// `DuplicateName`). Like [`Self::kernel_const_status`] it is deliberately
+    /// not gated on the facet record, and nothing that decides consults it.
+    #[must_use]
+    pub fn admission_paths_for_kernel_const(&self, kernel_const: &str) -> Vec<&str> {
+        self.records
+            .admissions
+            .iter()
+            .filter(|(_, admission)| admission.kernel_const == kernel_const)
+            .map(|(path, _)| path.as_str())
+            .collect()
     }
     /// The kernel constant `callee_path` was admitted as, IFF it has a facet
     /// record that is [`FnFacets::admissible`] (all four facets certified) AND
@@ -2422,7 +4508,47 @@ impl FacetTable {
     /// that cost a full rebuild cycle to recover by hand.
     #[must_use]
     pub fn has_admission(&self, callee_path: &str) -> bool {
-        self.admissions.contains_key(callee_path)
+        self.records.admissions.contains_key(callee_path)
+    }
+
+    /// I0: install the identifiers Rust binds in the clause scope of the
+    /// function whose clauses this table will elaborate (see
+    /// [`FacetTable::shadowed_idents`]).
+    ///
+    /// The compiler calls this exactly once per clause, on the CLAUSE-LOCAL
+    /// table it is about to hand the elaborator (`admit_clause_island_
+    /// definitions`, the single admission seam of the four E9 consumers). An
+    /// empty map is exactly the pre-I0 behaviour, so every other table
+    /// construction is unchanged.
+    pub fn set_shadowed_idents<I, K, V>(&mut self, idents: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.shadowed_idents = std::sync::Arc::new(
+            idents.into_iter().map(|(id, help)| (id.into(), help.into())).collect(),
+        );
+    }
+
+    /// [`FacetTable::set_shadowed_idents`] as a builder, for tests and for
+    /// callers that own the table.
+    #[must_use]
+    pub fn with_shadowed_idents<I, K, V>(mut self, idents: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.set_shadowed_idents(idents);
+        self
+    }
+
+    /// The help line recorded for `id` when a Rust binding of the specified
+    /// function shadows it, else `None`.
+    #[must_use]
+    pub fn shadowed_ident(&self, id: &str) -> Option<&str> {
+        self.shadowed_idents.get(id).map(String::as_str)
     }
 }
 
@@ -2515,6 +4641,83 @@ pub fn admit_projection_function(
     .map_err(|e| format!("kernel rejected the projection defining equation: {e:?}"))?;
     Ok(Admission::reflected(kernel_const, n)
         .with_declared_signature(Some(param_domains[return_param].clone()), Some(DeclaredCarriers::of_domains(param_domains, &param_domains[return_param]))))
+}
+
+/// Mint an E6 [`Admission`] for a FORWARDING function — an n-ary function whose
+/// whole body is one call to an already-registered kernel constant with (some
+/// of) its own parameters as the arguments, e.g. `fn pb_max_r(lhs: u64, rhs:
+/// u64) -> u64 { pb_max(lhs, rhs) }` where `pb_max` is a kernel-checked Clean
+/// island definition (joint Rust+Lean lane, 2026-09-15).
+///
+/// The defining equation is `fun p0 … p_{n-1} => callee p_{σ(0)} … p_{σ(m-1)}` at
+/// type `t0 → … → t_{n-1} → ret`, where `σ = arg_params` maps each CALLEE
+/// argument position to the SOURCE parameter that position receives — so a
+/// body `f(rhs, lhs)` mints `callee p1 p0`, never a positional guess. Inside
+/// `n` nested lambdas the source parameter `i` has de Bruijn index `n-1-i`.
+///
+/// SOUNDNESS. Two halves, neither of which is this function's to assert:
+///
+///  * that the Rust body IS that single forwarding call — the compiler-side
+///    recognizer (`trust-certify`'s island-forwarding shape) establishes it
+///    from the extracted MIR, exactly as every other `admit_*` mint relies on
+///    its recognizer, and the status is `Reflected` (I2) for the same reason;
+///  * that `callee` is the constant the Rust callee DENOTES — the compiler
+///    writes that identity from its Clean-origin registry into the facet
+///    table, and the recognizer reads it back through the table's
+///    `KernelChecked` admission (never a name match).
+///
+/// What the kernel DOES check here, via [`Environment::add_decl`] (a full
+/// kernel check): that `callee` applied to the chosen parameters at their
+/// carriers inhabits `ret`. A carrier disagreement between the Rust signature
+/// and the Clean declaration — a `u32` parameter forwarded into a `UInt64`
+/// slot, a `bool` return over a `UInt64` body — is a type error and the mint
+/// is refused, never admitted.
+pub fn admit_forwarding_function(
+    env: &mut Environment,
+    kernel_const: &str,
+    param_domains: &[Domain],
+    callee_const: &str,
+    arg_params: &[usize],
+    ret_domain: &Domain,
+) -> Result<Admission, String> {
+    let n = param_domains.len();
+    if callee_const.is_empty() {
+        return Err("forwarding mint requires a named callee constant".to_string());
+    }
+    if callee_const == kernel_const {
+        return Err(format!(
+            "forwarding mint for `{kernel_const}` would forward to itself; a self-referential \
+             defining equation is refused"
+        ));
+    }
+    if let Some(bad) = arg_params.iter().find(|&&i| i >= n) {
+        return Err(format!(
+            "forwarding argument names source parameter {bad}, out of range for a \
+             {n}-parameter function"
+        ));
+    }
+    // Body `fun p0 … p_{n-1} => callee p_{σ(0)} … p_{σ(m-1)}`: each argument is
+    // the bound variable of the source parameter it forwards.
+    let head = Expr::const_(Name::from_string(callee_const), vec![]);
+    let body = arg_params
+        .iter()
+        .fold(head, |acc, &i| Expr::app(acc, Expr::bvar((n - 1 - i) as u32)));
+    let lam =
+        param_domains.iter().rev().fold(body, |acc, d| Expr::lam(BinderInfo::Default, d.ty(), acc));
+    let arrow_ty =
+        param_domains.iter().rev().fold(ret_domain.ty(), |acc, d| Expr::arrow(d.ty(), acc));
+    env.add_decl(Declaration::Definition {
+        name: Name::from_string(kernel_const),
+        level_params: vec![],
+        type_: arrow_ty,
+        value: lam,
+        is_reducible: true,
+    })
+    .map_err(|e| format!("kernel rejected the forwarding defining equation: {e:?}"))?;
+    Ok(Admission::reflected(kernel_const, n).with_declared_signature(
+        Some(ret_domain.clone()),
+        Some(DeclaredCarriers::of_domains(param_domains, ret_domain)),
+    ))
 }
 
 /// Mint an E6 [`Admission`] for a single-domain ARITHMETIC function whose body is
@@ -2634,13 +4837,19 @@ pub fn admit_select_function(
     let carrier_ok = |dom: &Domain| match dom {
         Domain::Machine(_) | Domain::Signed(_) => true,
         Domain::Nat
+        // A Rust BODY is never at `int`: the domain exists only as the
+        // nat-lift codomain in a PROOF-position clause, and a mint that
+        // accepted it would be minting an import for a value no Rust
+        // expression has.
+        | Domain::Int
         | Domain::U128
         | Domain::USize(_)
         | Domain::ISize(_)
         | Domain::Bool
         // The select mint's `ite` encoding has no reading over an Option
         // carrier (no order, no decidable comparison): fail closed.
-        | Domain::OptionSigned(_) => false,
+        | Domain::OptionSigned(_)
+        | Domain::RegisteredAdt(_) => false,
     };
     // Both the compared pair and the branch pair must be carriers the `ite`
     // encoding is faithful for; an unrelated binder's carrier is irrelevant.
@@ -2648,7 +4857,16 @@ pub fn admit_select_function(
         return Err("select currently requires a machine-integer or signed-integer domain".into());
     }
     // Under n binders the source parameter i is de Bruijn index n-1-i.
-    let bvar = |i: usize| Expr::bvar((n - 1 - i) as u32);
+    // The indices were range-checked above; the closure restates `i < n` so
+    // its own body is total (the verifier checks a closure on its own, with
+    // `i` unconstrained, and refuted `n - 1 - i` at `i = n` — measured
+    // 2026-09-13 on `dff2b22d1`).
+    let bvar = |i: usize| -> Result<Expr, String> {
+        if i >= n {
+            return Err(format!("select index {i} out of range for a {n}-parameter function"));
+        }
+        Ok(Expr::bvar(de_bruijn_index(n, i, 0)?))
+    };
     // Mint the term Clean's own `if _ then _ else _` elaborates to, so a user
     // writing `if a < b then a else b` produces a SYNTACTICALLY IDENTICAL term
     // and definitional equality closes the clause with nothing clever.
@@ -2666,7 +4884,7 @@ pub fn admit_select_function(
     // it is the load-bearing artifact now, not a nicety.
     let ty = d.ty();
     let one = Level::succ(Level::zero());
-    let (l, r) = (bvar(cmp_left), bvar(cmp_right)); // carrier level — NOT .toNat
+    let (l, r) = (bvar(cmp_left)?, bvar(cmp_right)?); // carrier level — NOT .toNat
     let (prop, inst) = decidable_comparison(cmp_domain, cmp, l, r)?;
     // ARGUMENT ORDER: `ite α c h t e` takes THEN fourth and ELSE fifth, the
     // opposite of `Bool.rec`, which took ELSE first. Reversing these silently
@@ -2675,7 +4893,7 @@ pub fn admit_select_function(
     // fixture alone does NOT catch it. The paired NEG probe is the net.
     let body = Expr::apps(
         Expr::const_(Name::from_string("ite"), vec![one]),
-        [ty.clone(), prop, inst, bvar(then_param), bvar(else_param)],
+        [ty.clone(), prop, inst, bvar(then_param)?, bvar(else_param)?],
     );
     // Bind each parameter at ITS OWN carrier, and return the branch carrier --
     // the same per-parameter shape `admit_projection_function` builds. Folding
@@ -2752,25 +4970,35 @@ pub fn admit_select_literal_function(
     if !param_domains.iter().all(|x| x == d) {
         return Err("select over mixed parameter domains is unsupported".into());
     }
-    let carrier = match d {
-        Domain::Machine(w) => w.carrier(),
+    let width = match d {
+        Domain::Machine(w) => *w,
         _ => return Err("select currently requires a machine-integer domain".into()),
     };
+    let carrier = width.carrier();
     // Under n binders the source parameter i is de Bruijn index n-1-i.
-    let bvar = |i: usize| Expr::bvar((n - 1 - i) as u32);
+    // The indices were range-checked above; the closure restates `i < n` so
+    // its own body is total (the verifier checks a closure on its own, with
+    // `i` unconstrained, and refuted `n - 1 - i` at `i = n` — measured
+    // 2026-09-13 on `dff2b22d1`).
+    let bvar = |i: usize| -> Result<Expr, String> {
+        if i >= n {
+            return Err(format!("select index {i} out of range for a {n}-parameter function"));
+        }
+        Ok(Expr::bvar(de_bruijn_index(n, i, 0)?))
+    };
     let ty = d.ty();
     let zero = Level::zero();
     let one = Level::succ(Level::zero());
     // The comparison's operands: the parameter on the LEFT, the range-checked
     // numeral on the RIGHT. `Domain::numeral` fails closed on an out-of-range
     // literal BEFORE the kernel, exactly as in `admit_constant_function`.
-    let (l, r) = (bvar(cmp_param), d.numeral(literal)?);
+    let (l, r) = (bvar(cmp_param)?, d.numeral(literal)?);
     let inst_c = |s: &str| Expr::const_(Name::from_string(s), vec![]);
     let (prop, inst) = match cmp {
         SelectCmp::Lt => (
             Expr::apps(
                 Expr::const_(Name::from_string("LT.lt"), vec![zero.clone()]),
-                [ty.clone(), inst_c(&format!("instLT{carrier}")), l.clone(), r.clone()],
+                [ty.clone(), inst_c(width.inst_lt_const()), l.clone(), r.clone()],
             ),
             // R2/C9 SPELLING-GAP FIX (measured 2026-08-21): the REAL island
             // elaborator resolves a literal comparison's decidability by
@@ -2794,7 +5022,7 @@ pub fn admit_select_literal_function(
                             Expr::proj(
                                 Name::from_string("BitVec"),
                                 0,
-                                Expr::proj(Name::from_string(carrier), 0, bvar(cmp_param)),
+                                Expr::proj(Name::from_string(carrier), 0, bvar(cmp_param)?),
                             ),
                         ),
                         Expr::nat_lit(bare_nat),
@@ -2805,16 +5033,16 @@ pub fn admit_select_literal_function(
         SelectCmp::Le => (
             Expr::apps(
                 Expr::const_(Name::from_string("LE.le"), vec![zero.clone()]),
-                [ty.clone(), inst_c(&format!("instLE{carrier}")), l.clone(), r.clone()],
+                [ty.clone(), inst_c(width.inst_le_const()), l.clone(), r.clone()],
             ),
-            Expr::apps(inst_c(&format!("instDecidable{carrier}Le")), [l, r]),
+            Expr::apps(inst_c(width.inst_decidable_le_const()), [l, r]),
         ),
         SelectCmp::Eq => (
             Expr::apps(
                 Expr::const_(Name::from_string("Eq"), vec![one.clone()]),
                 [ty.clone(), l.clone(), r.clone()],
             ),
-            Expr::apps(inst_c(&format!("instDecidableEq{carrier}")), [l, r]),
+            Expr::apps(inst_c(width.inst_decidable_eq_const()), [l, r]),
         ),
     };
     // ARGUMENT ORDER: `ite α c h t e` takes THEN fourth and ELSE fifth — the
@@ -2822,7 +5050,7 @@ pub fn admit_select_literal_function(
     // mutation probes are the net here too.
     let body = Expr::apps(
         Expr::const_(Name::from_string("ite"), vec![one]),
-        [ty.clone(), prop, inst, bvar(then_param), bvar(else_param)],
+        [ty.clone(), prop, inst, bvar(then_param)?, bvar(else_param)?],
     );
     let lam = (0..n).fold(body, |acc, _| Expr::lam(BinderInfo::Default, d.ty(), acc));
     let arrow_ty = (0..n).fold(d.ty(), |acc, _| Expr::arrow(d.ty(), acc));
@@ -2910,41 +5138,50 @@ pub fn admit_select_operands_function(
     else_arm: SelectOperand,
 ) -> Result<Admission, String> {
     let n = param_domains.len();
-    let mut indices = vec![cmp_left];
+    if cmp_left >= n {
+        return Err(format!("select index {cmp_left} out of range for a {n}-parameter function"));
+    }
     for operand in [cmp_right, then_arm, else_arm] {
         if let SelectOperand::Param(index) = operand {
-            indices.push(index);
-        }
-    }
-    for index in indices {
-        if index >= n {
-            return Err(format!("select index {index} out of range for a {n}-parameter function"));
+            if index >= n {
+                return Err(format!("select index {index} out of range for a {n}-parameter function"));
+            }
         }
     }
     let d = param_domains.first().ok_or("select needs at least one parameter")?;
     if !param_domains.iter().all(|x| x == d) {
         return Err("select over mixed parameter domains is unsupported".into());
     }
-    let carrier = match d {
-        Domain::Machine(w) => w.carrier(),
+    let width = match d {
+        Domain::Machine(w) => *w,
         _ => return Err("select currently requires a machine-integer domain".into()),
     };
+    let carrier = width.carrier();
     // Under n binders the source parameter i is de Bruijn index n-1-i.
-    let bvar = |i: usize| Expr::bvar((n - 1 - i) as u32);
+    // The indices were range-checked above; the closure restates `i < n` so
+    // its own body is total (the verifier checks a closure on its own, with
+    // `i` unconstrained, and refuted `n - 1 - i` at `i = n` — measured
+    // 2026-09-13 on `dff2b22d1`).
+    let bvar = |i: usize| -> Result<Expr, String> {
+        if i >= n {
+            return Err(format!("select index {i} out of range for a {n}-parameter function"));
+        }
+        Ok(Expr::bvar(de_bruijn_index(n, i, 0)?))
+    };
     // ONE operand renderer for every position — the comparison's right-hand
     // side and both arms. A numeral is minted by `Domain::numeral`, which
     // range-checks it and fails closed before the kernel; that is also the
     // spelling (`{C}.ofNat v`) the real island elaborates a constant arm to.
     let operand = |o: SelectOperand| -> Result<Expr, String> {
         match o {
-            SelectOperand::Param(index) => Ok(bvar(index)),
+            SelectOperand::Param(index) => bvar(index),
             SelectOperand::Literal(value) => d.numeral(value),
         }
     };
     let ty = d.ty();
     let zero = Level::zero();
     let one = Level::succ(Level::zero());
-    let l = bvar(cmp_left);
+    let l = bvar(cmp_left)?;
     let r = operand(cmp_right)?;
     let inst_c = |s: &str| Expr::const_(Name::from_string(s), vec![]);
     let (prop, inst) = match (cmp, cmp_right) {
@@ -2956,7 +5193,7 @@ pub fn admit_select_operands_function(
         (SelectCmp::Lt, SelectOperand::Literal(value)) => (
             Expr::apps(
                 Expr::const_(Name::from_string("LT.lt"), vec![zero.clone()]),
-                [ty.clone(), inst_c(&format!("instLT{carrier}")), l.clone(), r.clone()],
+                [ty.clone(), inst_c(width.inst_lt_const()), l.clone(), r.clone()],
             ),
             {
                 let bare_nat = u64::try_from(value)
@@ -2970,7 +5207,7 @@ pub fn admit_select_operands_function(
                             Expr::proj(
                                 Name::from_string("BitVec"),
                                 0,
-                                Expr::proj(Name::from_string(carrier), 0, bvar(cmp_left)),
+                                Expr::proj(Name::from_string(carrier), 0, bvar(cmp_left)?),
                             ),
                         ),
                         Expr::nat_lit(bare_nat),
@@ -2981,23 +5218,23 @@ pub fn admit_select_operands_function(
         (SelectCmp::Lt, SelectOperand::Param(_)) => (
             Expr::apps(
                 Expr::const_(Name::from_string("LT.lt"), vec![zero.clone()]),
-                [ty.clone(), inst_c(&format!("instLT{carrier}")), l.clone(), r.clone()],
+                [ty.clone(), inst_c(width.inst_lt_const()), l.clone(), r.clone()],
             ),
-            Expr::apps(inst_c(&format!("instDecidable{carrier}Lt")), [l, r]),
+            Expr::apps(inst_c(width.inst_decidable_lt_const()), [l, r]),
         ),
         (SelectCmp::Le, _) => (
             Expr::apps(
                 Expr::const_(Name::from_string("LE.le"), vec![zero.clone()]),
-                [ty.clone(), inst_c(&format!("instLE{carrier}")), l.clone(), r.clone()],
+                [ty.clone(), inst_c(width.inst_le_const()), l.clone(), r.clone()],
             ),
-            Expr::apps(inst_c(&format!("instDecidable{carrier}Le")), [l, r]),
+            Expr::apps(inst_c(width.inst_decidable_le_const()), [l, r]),
         ),
         (SelectCmp::Eq, _) => (
             Expr::apps(
                 Expr::const_(Name::from_string("Eq"), vec![one.clone()]),
                 [ty.clone(), l.clone(), r.clone()],
             ),
-            Expr::apps(inst_c(&format!("instDecidableEq{carrier}")), [l, r]),
+            Expr::apps(inst_c(width.inst_decidable_eq_const()), [l, r]),
         ),
     };
     // ARGUMENT ORDER: `ite α c h t e` takes THEN fourth and ELSE fifth — the
@@ -3097,27 +5334,35 @@ pub fn admit_select_beq_function(
     else_arm: SelectOperand,
 ) -> Result<Admission, String> {
     let n = param_domains.len();
-    let mut indices = vec![cmp_left];
+    if cmp_left >= n {
+        return Err(format!("select index {cmp_left} out of range for a {n}-parameter function"));
+    }
     for operand in [cmp_right, then_arm, else_arm] {
         if let SelectOperand::Param(index) = operand {
-            indices.push(index);
-        }
-    }
-    for index in indices {
-        if index >= n {
-            return Err(format!("select index {index} out of range for a {n}-parameter function"));
+            if index >= n {
+                return Err(format!("select index {index} out of range for a {n}-parameter function"));
+            }
         }
     }
     let d = param_domains.first().ok_or("select needs at least one parameter")?;
     if !param_domains.iter().all(|x| x == d) {
         return Err("select over mixed parameter domains is unsupported".into());
     }
-    let carrier = match d {
-        Domain::Machine(w) => w.carrier(),
+    let width = match d {
+        Domain::Machine(w) => *w,
         _ => return Err("select currently requires a machine-integer domain".into()),
     };
     // Under n binders the source parameter i is de Bruijn index n-1-i.
-    let bvar = |i: usize| Expr::bvar((n - 1 - i) as u32);
+    // The indices were range-checked above; the closure restates `i < n` so
+    // its own body is total (the verifier checks a closure on its own, with
+    // `i` unconstrained, and refuted `n - 1 - i` at `i = n` — measured
+    // 2026-09-13 on `dff2b22d1`).
+    let bvar = |i: usize| -> Result<Expr, String> {
+        if i >= n {
+            return Err(format!("select index {i} out of range for a {n}-parameter function"));
+        }
+        Ok(Expr::bvar(de_bruijn_index(n, i, 0)?))
+    };
     // ONE operand renderer for every position, exactly as the general select
     // route states it: a numeral is minted by `Domain::numeral`, which
     // range-checks it and fails closed before the kernel, and which is the
@@ -3125,7 +5370,7 @@ pub fn admit_select_beq_function(
     // to in this tree as well (measured, `l5_p1`).
     let operand = |o: SelectOperand| -> Result<Expr, String> {
         match o {
-            SelectOperand::Param(index) => Ok(bvar(index)),
+            SelectOperand::Param(index) => bvar(index),
             SelectOperand::Literal(value) => d.numeral(value),
         }
     };
@@ -3146,9 +5391,9 @@ pub fn admit_select_beq_function(
             ty.clone(),
             Expr::apps(
                 Expr::const_(Name::from_string("instBEqOfDecidableEq"), vec![zero]),
-                [ty.clone(), inst_c(&format!("instDecidableEq{carrier}"))],
+                [ty.clone(), inst_c(width.inst_decidable_eq_const())],
             ),
-            bvar(cmp_left),
+            bvar(cmp_left)?,
             operand(cmp_right)?,
         ],
     );
@@ -3282,49 +5527,67 @@ pub fn admit_select_beq_operands_function(
     else_arm: SelectOperand,
 ) -> Result<Admission, String> {
     let n = param_domains.len();
-    let mut indices = Vec::new();
     for operand in [cmp_left, cmp_right] {
         if let SelectBeqOperand::Param(index) = operand {
-            indices.push(*index);
+            if *index >= n {
+                return Err(format!("select index {index} out of range for a {n}-parameter function"));
+            }
         }
     }
     for operand in [then_arm, else_arm] {
         if let SelectOperand::Param(index) = operand {
-            indices.push(index);
-        }
-    }
-    for index in indices {
-        if index >= n {
-            return Err(format!("select index {index} out of range for a {n}-parameter function"));
+            if index >= n {
+                return Err(format!("select index {index} out of range for a {n}-parameter function"));
+            }
         }
     }
     let d = param_domains.first().ok_or("select needs at least one parameter")?;
     if !param_domains.iter().all(|x| x == d) {
         return Err("select over mixed parameter domains is unsupported".into());
     }
-    let carrier = match d {
-        Domain::Machine(w) => w.carrier(),
+    let width = match d {
+        Domain::Machine(w) => *w,
         _ => return Err("select currently requires a machine-integer domain".into()),
     };
     // Under n binders the source parameter i is de Bruijn index n-1-i — the
     // convention `elab_term` uses at offset 0, so a computed operand's term
     // needs no re-indexing and there is no second place an index could be set.
-    let bvar = |i: usize| Expr::bvar((n - 1 - i) as u32);
-    let names: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
+    // The indices were range-checked above; the closure restates `i < n` so
+    // its own body is total (the verifier checks a closure on its own, with
+    // `i` unconstrained, and refuted `n - 1 - i` at `i = n` — measured
+    // 2026-09-13 on `dff2b22d1`).
+    let bvar = |i: usize| -> Result<Expr, String> {
+        if i >= n {
+            return Err(format!("select index {i} out of range for a {n}-parameter function"));
+        }
+        Ok(Expr::bvar(de_bruijn_index(n, i, 0)?))
+    };
+    let computed_ctx = if matches!(cmp_left, SelectBeqOperand::Computed(_))
+        || matches!(cmp_right, SelectBeqOperand::Computed(_))
+    {
+        let names: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
+        let uniform = uniform_var_domains(&names, d);
+        Some((names, uniform))
+    } else {
+        None
+    };
     let arm = |o: SelectOperand| -> Result<Expr, String> {
         match o {
-            SelectOperand::Param(index) => Ok(bvar(index)),
+            SelectOperand::Param(index) => bvar(index),
             SelectOperand::Literal(value) => d.numeral(value),
         }
     };
     let decision_operand = |o: &SelectBeqOperand| -> Result<Expr, String> {
         match o {
-            SelectBeqOperand::Param(index) => Ok(bvar(*index)),
+            SelectBeqOperand::Param(index) => bvar(*index),
             SelectBeqOperand::Literal(value) => d.numeral(*value),
             SelectBeqOperand::Computed(rendering) => {
                 let syn: SynExpr = syn::parse_str(rendering)
                     .map_err(|e| format!("parse error in a computed select operand: {e}"))?;
-                elab_term(&syn, &names, 0, &uniform_var_domains(&names, d), d)
+                let Some((names, uniform)) = computed_ctx.as_ref() else {
+                    return Err("internal: missing computed operand context".into());
+                };
+                elab_term(&syn, names, 0, uniform, d)
             }
         }
     };
@@ -3344,7 +5607,7 @@ pub fn admit_select_beq_operands_function(
             ty.clone(),
             Expr::apps(
                 Expr::const_(Name::from_string("instBEqOfDecidableEq"), vec![zero]),
-                [ty.clone(), inst_c(&format!("instDecidableEq{carrier}"))],
+                [ty.clone(), inst_c(width.inst_decidable_eq_const())],
             ),
             decision_operand(cmp_left)?,
             decision_operand(cmp_right)?,
@@ -3434,9 +5697,110 @@ impl Drop for AdmissionScope {
 }
 
 /// Consult the ambient admission table for `callee`'s minted kernel constant.
+///
+/// RAW. Every position that DECIDES a binding must go through
+/// [`ambient_bare_admission`] or [`ambient_call_admission`] instead, so a Rust
+/// binding of the same name refuses rather than resolves (I0). The remaining
+/// direct callers are domain/carrier STEERING: they choose the type a term is
+/// built at and can only make an ill-typed goal the kernel then rejects, never
+/// bind a name — and the deciding sites refuse the shadowed name before any
+/// such goal is submitted.
 fn ambient_admission(callee: &str) -> Option<Admission> {
     ADMISSION_FACETS
         .with(|slot| slot.borrow().as_ref().and_then(|table| table.admitted(callee).cloned()))
+}
+
+fn has_ambient_admission(callee: &str) -> bool {
+    ADMISSION_FACETS
+        .with(|slot| slot.borrow().as_ref().is_some_and(|table| table.admitted(callee).is_some()))
+}
+
+/// I0: the help line the compiler recorded for `id` when a Rust binding of the
+/// specified function shadows it, else `None`.
+fn ambient_shadowed_ident(id: &str) -> Option<String> {
+    ADMISSION_FACETS.with(|slot| {
+        slot.borrow().as_ref().and_then(|table| table.shadowed_ident(id).map(str::to_string))
+    })
+}
+
+/// I0 (ref-self design §4.0): consult the ambient admission table for a BARE
+/// identifier, refusing outright when a Rust binding of the specified function
+/// carries that name.
+///
+/// SOUNDNESS. This is a pure REMOVAL of bindings: it never resolves a name the
+/// raw consult would not have resolved, and the only clauses whose meaning it
+/// changes are the ones that were resolving a Rust binding's name to an
+/// unrelated kernel constant — i.e. the ones that were green BY CAPTURE. The
+/// measured case is a by-value struct parameter, whose clause binders are its
+/// scalar fields (`c.degree`), leaving the bare `c` free for a same-named
+/// `clean { def c … }` to answer; a `&T` parameter has no binder at all and is
+/// the same hole with a wider mouth.
+///
+/// The refusal fires only when an admission actually exists, so a bare name
+/// with nothing to capture it keeps reporting the ordinary "unbound variable"
+/// / "bindings are not exact" message it reports today.
+fn ambient_bare_admission(id: &str) -> Result<Option<Admission>, String> {
+    let Some(admission) = ambient_admission(id) else {
+        return Ok(None);
+    };
+    // Trust (ref-self I1): a VIEW import is unnameable outside the spliced
+    // self-call, in the BARE position as much as in a call position. It is
+    // refused here STRUCTURALLY rather than incidentally: a view always has at
+    // least one binder today, so the `arity >= 1` bare-name refusal below
+    // already catches it, but that couples two unrelated facts by argument
+    // instead of by code.
+    if admission.is_self_result_only() && !is_ambient_self_fn_key(id) {
+        return Err(view_import_unnameable_refusal(id, &admission));
+    }
+    let Some(help) = ambient_shadowed_ident(id) else {
+        return Ok(Some(admission));
+    };
+    Err(format!(
+        "a clause names VALUES: `{id}` is bound by this function's signature and has no \
+         clause binder of its own, so it is NOT resolved against the admitted definition \
+         `{constant}` of the same name (that reading would certify a goal about the \
+         definition while the clause text says the parameter). {help}",
+        constant = admission.kernel_const
+    ))
+}
+
+/// I0: [`ambient_bare_admission`] for a CALL position.
+///
+/// `p(x)` where `p` is a binding of the specified function is a call of THAT
+/// BINDING in Rust, so it must not resolve to a same-named island definition
+/// or program function. `tests/ui/trust/contract_inlined_call_scope_stays_closed.rs`
+/// records the same rule for the native lane and names the consequence of
+/// breaking it: with a `shadow_id: fn(u64) -> u64` parameter, expanding the
+/// module's `shadow_id` "would falsely turn the postcondition into `result ==
+/// x`".
+///
+/// THERE IS NO SELF EXEMPTION, and none is needed. The one call an author never
+/// wrote is the SELF-CALL [`elaborate_ensures`] splices in for `result`, and
+/// Rust lets a function share its name with one of its own parameters
+/// (`fn f(f: u64)`). The compiler's self identity is
+/// [`self_fn_spelling`]`(def_path)` — the CANONICAL def-path (`k::f`), not the
+/// bare last segment — while the shadow map holds the BARE names a signature
+/// binds, so the two keyspaces do not meet on the E9 discharge lanes. A caller
+/// that passes a bare self spelling AND shadows it does lose that elaboration,
+/// which is the fail-closed direction and is pinned by
+/// `a_bare_self_spelling_that_a_parameter_shadows_refuses_while_the_canonical_one_does_not`.
+/// The alternative — exempting the self name unconditionally — would reopen the
+/// bare capture for exactly `fn f(f: Cst) ensures result == f` beside
+/// `clean { def f … }`.
+fn ambient_call_admission(callee: &str) -> Result<Option<Admission>, String> {
+    let Some(admission) = ambient_admission(callee) else {
+        return Ok(None);
+    };
+    let Some(help) = ambient_shadowed_ident(callee) else {
+        return Ok(Some(admission));
+    };
+    Err(format!(
+        "`{callee}` is bound by this function's signature, so `{callee}(…)` is a call of that \
+         binding in Rust and is NOT resolved against the admitted `{constant}` of the same \
+         name (the caller chooses what that binding is, so the admitted body is not what runs). \
+         {help}",
+        constant = admission.kernel_const
+    ))
 }
 
 /// I3: the capability the current elaboration's use site holds. PROOF unless a
@@ -3483,23 +5847,107 @@ pub fn elaborate_goal_typed_in(
     var_types: &[(&str, &str)],
     facets: &FacetTable,
 ) -> Result<Expr, String> {
+    elaborate_goal_typed_in_mode(use_site, spec, var_types, facets, &ProofClauseInputs::strict(), None)
+        .map(|clause| clause.goal)
+}
+
+/// [`elaborate_goal_typed_in`] with the CLAUSE MODE stated, and the
+/// environment obligations the goal's construction created returned alongside
+/// it (see [`ElaboratedClause`]).
+///
+/// `self_fn_name` names the contracted function when the caller has already
+/// substituted `result` with a call on it; it is what the self-function
+/// two-read cross-check keys on. Pass `None` from every other position — the
+/// cross-check is then simply never reached, because no call is the self call.
+///
+/// At [`ClauseMode::Strict`] this is [`elaborate_goal_typed_in`] to the byte,
+/// with an empty obligation list.
+pub fn elaborate_goal_typed_in_mode(
+    use_site: trust_symbols::Capability,
+    spec: &str,
+    var_types: &[(&str, &str)],
+    facets: &FacetTable,
+    inputs: &ProofClauseInputs,
+    self_fn_name: Option<&str>,
+) -> Result<ElaboratedClause, String> {
+    elaborate_goal_typed_in_mode_with_ast(
+        use_site,
+        spec,
+        None,
+        var_types,
+        facets,
+        inputs,
+        self_fn_name,
+    )
+}
+
+fn elaborate_goal_typed_in_mode_with_ast(
+    use_site: trust_symbols::Capability,
+    spec: &str,
+    parsed_ast: Option<&SynExpr>,
+    var_types: &[(&str, &str)],
+    facets: &FacetTable,
+    inputs: &ProofClauseInputs,
+    self_fn_name: Option<&str>,
+) -> Result<ElaboratedClause, String> {
+    // Drain any residue from an earlier elaboration before this one records
+    // its own: the accumulator is thread-local and a caller that dropped a
+    // result on an `Err` path must not leak an obligation into the next goal.
+    let _ = take_required_signed_lifts();
+    let _lift = ProofLiftScope::enter(inputs, self_fn_name);
+    // Trust (ref-self I1): the self-call key, in EVERY mode. See `SELF_FN_KEY`.
+    let _self_fn = SelfFnScope::enter(self_fn_name);
+    let goal = elaborate_goal_typed_in_inner(use_site, spec, parsed_ast, var_types, facets)?;
+    Ok(ElaboratedClause { goal, required_signed_lift_widths: take_required_signed_lifts() })
+}
+
+fn elaborate_goal_typed_in_inner(
+    use_site: trust_symbols::Capability,
+    spec: &str,
+    parsed_ast: Option<&SynExpr>,
+    var_types: &[(&str, &str)],
+    facets: &FacetTable,
+) -> Result<Expr, String> {
     // E3: a quantified clause is not syn-parseable as a whole, so the facet
     // diagnostic walk runs over the pre-parsed leaves instead; the admission
     // scope then covers the same quantified elaboration path.
-    if clause_uses_quantifier_fragment(spec) {
+    if parsed_ast.is_none() && clause_uses_quantifier_fragment(spec) {
         let clause = parse_qclause(spec, true)?;
         if let Some(err) = qclause_first_call_facet_error(&clause, facets) {
             return Err(err);
         }
         let _scope = AdmissionScope::enter_at(facets.clone(), use_site);
-        return elaborate_goal_typed(spec, var_types);
+        return elaborate_parsed_qclause_typed(&clause, var_types);
+    }
+    if let Some(ast) = parsed_ast {
+        if let Some(err) = first_call_facet_error(ast, facets) {
+            return Err(err);
+        }
+        let _scope = AdmissionScope::enter_at(facets.clone(), use_site);
+        return elaborate_parsed_goal_typed(ast, var_types);
     }
     let ast: SynExpr = syn::parse_str(spec).map_err(|e| format!("parse error: {e}"))?;
     if let Some(err) = first_call_facet_error(&ast, facets) {
         return Err(err);
     }
     let _scope = AdmissionScope::enter_at(facets.clone(), use_site);
-    elaborate_goal_typed(spec, var_types)
+    elaborate_parsed_goal_typed(&ast, var_types)
+}
+
+/// The fixed head of the refusal [`elaborate_ensures`] returns when the clause
+/// binds `result` and the specified function has no E6 kernel import. Named
+/// so a diagnostic consumer can recognise THIS refusal without re-deriving the
+/// condition (see [`is_self_not_e6_admitted_refusal`]); the message text itself
+/// is unchanged.
+const SELF_NOT_E6_ADMITTED_REFUSAL_HEAD: &str = "ensures discharge requires the specified function";
+
+/// Whether `reason` is [`elaborate_ensures`]'s "the specified function is not
+/// E6-admitted" refusal. Diagnostics only: the compiler uses it to decide
+/// whether to explain WHICH facet or body shape kept the function out of the
+/// E6 import. It confers nothing and no verdict reads it.
+#[must_use]
+pub fn is_self_not_e6_admitted_refusal(reason: &str) -> bool {
+    reason.starts_with(SELF_NOT_E6_ADMITTED_REFUSAL_HEAD)
 }
 
 /// Elaborate an `ensures` clause into the kernel proposition a cited theorem must
@@ -3529,6 +5977,70 @@ pub fn elaborate_ensures(
     self_fn_name: &str,
     facets: &FacetTable,
 ) -> Result<Expr, String> {
+    elaborate_ensures_in(clause, param_types, self_fn_name, facets, &ProofClauseInputs::strict())
+        .map(|clause| clause.goal)
+}
+
+/// [`elaborate_ensures`] with the CLAUSE MODE stated.
+///
+/// This is the ONLY way into the nat-lift fragment for an `ensures` clause, and
+/// [`elaborate_ensures`] is exactly this function at [`ClauseMode::Strict`], so
+/// the pre-existing behaviour of every caller is unchanged BY CONSTRUCTION
+/// rather than by inspection — the same discipline
+/// `elaborate_goal_typed_with_facets` already uses for the I3 capability.
+///
+/// A body mint never reaches here: `admit_expr_function` and its siblings call
+/// `elab_term` directly, so a Rust BODY cannot acquire a lift even if a caller
+/// handed the mint loop a `ProofLift` facet table.
+pub fn elaborate_ensures_in(
+    clause: &str,
+    param_types: &[(&str, &str)],
+    self_fn_name: &str,
+    facets: &FacetTable,
+    inputs: &ProofClauseInputs,
+) -> Result<ElaboratedClause, String> {
+    let source = ensures_goal_source(clause, param_types, self_fn_name, facets)?;
+    let used = discharge_used_bindings(&source, param_types);
+    elaborate_goal_typed_in_mode_with_ast(
+        trust_symbols::Capability::Proof,
+        &source.src,
+        source.parsed_ast.as_ref(),
+        &used,
+        facets,
+        inputs,
+        Some(self_fn_name),
+    )
+}
+
+/// The clause source [`elaborate_ensures`] actually elaborates, plus whether it
+/// took the E3 quantifier route.
+///
+/// Factored out so the unconditional goal `G0` ([`elaborate_ensures`]) and the
+/// under-`requires` goal `G1` ([`elaborate_ensures_under_requires`]) share ONE
+/// rewrite prefix — field rewrite, self-admission gate, minted-parameter
+/// agreement, self-identity round trip, `result → self_fn(p0..pn)`. Two copies
+/// of that prefix could drift apart, and a drifted `G1` would be a DIFFERENT
+/// statement wearing the same clause's name (design revision 2 §2.2 step 1).
+struct EnsuresGoalSource {
+    /// The rewritten clause the elaborator sees when `parsed_ast` is `None`.
+    src: String,
+    /// Pre-parsed and rewritten AST when the clause stays in the syn-parsed
+    /// non-quantifier fragment, avoiding intermediate `quote!(...).to_string()`
+    /// formatting and double `syn::parse_str` re-parses.
+    parsed_ast: Option<SynExpr>,
+    /// `true` when the clause is in the E3 quantifier/implication fragment. `G1`
+    /// is not built for such a clause: its binder structure is authored inside
+    /// the clause, so prepending hypothesis arrows would produce a goal whose
+    /// binder order no honest theorem statement predicts.
+    quantified: bool,
+}
+
+fn ensures_goal_source<T>(
+    clause: &str,
+    param_types: &[(&str, T)],
+    self_fn_name: &str,
+    facets: &FacetTable,
+) -> Result<EnsuresGoalSource, String> {
     if self_fn_name.is_empty() {
         return Err("elaborate_ensures requires the specified function's name".to_string());
     }
@@ -3537,8 +6049,11 @@ pub fn elaborate_ensures(
     // quantified elaborator over just the parameters it uses. `result` inside a
     // quantifier is a free variable there and stays fail-closed (a deeper slice).
     if clause_uses_quantifier_fragment(clause) {
-        let used = discharge_used_bindings(clause, param_types);
-        return elaborate_goal_typed_with_facets(clause, &used, facets);
+        return Ok(EnsuresGoalSource {
+            src: clause.to_string(),
+            parsed_ast: None,
+            quantified: true,
+        });
     }
     let param_names: Vec<String> = param_types.iter().map(|(n, _)| (*n).to_string()).collect();
     let ast: SynExpr = syn::parse_str(clause).map_err(|e| format!("parse error: {e}"))?;
@@ -3547,27 +6062,40 @@ pub fn elaborate_ensures(
     // would fail closed on a clause that never needed it. Rewriting
     // `result.<field>` here leaves the clause free of `result` whenever every
     // mention was a projection, and the ordinary path then elaborates it.
-    let ast = rewrite_result_fields(&ast, self_fn_name, &param_names, facets)?;
-    // The clause the rest of this function elaborates is the REWRITTEN one: a
-    // field projection is gone, replaced by its per-field import call. Carrying
-    // the original string past this point left `result.<field>` in the source
-    // the binding gate reads, which reported it as a missing binding.
-    let clause_owned = quote::quote!(#ast).to_string();
-    let clause: &str = &clause_owned;
+    let had_result_field = mentions_result_field(&ast);
+    let ast = if had_result_field {
+        rewrite_result_fields(&ast, self_fn_name, &param_names, facets)?
+    } else {
+        ast
+    };
+    let can_reuse_ast = !had_result_field
+        && !self_fn_name.starts_with("forall")
+        && !self_fn_name.starts_with("exists");
     // A clause that never mentions `result` is a ∀-params statement independent
     // of the function's return value — its proof covers the postcondition for
     // ANY body, so the SELF-admission gate is required only when `result` must
     // be substituted with the defining equation. (Calls inside the clause are
     // still individually gated on THEIR admissions by the elaborator.)
     if !mentions_result(&ast) {
-        let used = discharge_used_bindings(clause, param_types);
-        return elaborate_goal_typed_with_facets(clause, &used, facets);
+        if can_reuse_ast {
+            return Ok(EnsuresGoalSource {
+                src: String::new(),
+                parsed_ast: Some(ast),
+                quantified: false,
+            });
+        }
+        let rewritten_src = quote::quote!(#ast).to_string();
+        return Ok(EnsuresGoalSource {
+            src: rewritten_src,
+            parsed_ast: None,
+            quantified: false,
+        });
     }
     let Some(admission) = facets.admitted(self_fn_name) else {
         // `result` has no kernel denotation unless the function is E6-admitted;
         // fail closed (design note §3 restriction), same as any un-admitted call.
         return Err(format!(
-            "ensures discharge requires the specified function `{self_fn_name}` to be \
+            "{SELF_NOT_E6_ADMITTED_REFUSAL_HEAD} `{self_fn_name}` to be \
              E6-admitted (its defining equation kernel-imported); it is not"
         ));
     };
@@ -3579,8 +6107,7 @@ pub fn elaborate_ensures(
     // extracted IR — and an ORDER disagreement between them is the one failure
     // the kernel cannot catch: the goal still types, and a theorem about
     // `coeff` would discharge a clause about `degree`. Refuse instead.
-    if admission.param_names.as_ref().is_some_and(|minted| *minted != param_names) {
-        let minted = admission.param_names.as_ref().expect("checked just above");
+    if let Some(minted) = admission.param_names.as_ref().filter(|minted| **minted != param_names) {
         return Err(format!(
             "the clause's parameter list {param_names:?} disagrees with the parameter list the \
              E6 import of `{self_fn_name}` was minted over ({minted:?}); the two flattenings of \
@@ -3615,14 +6142,20 @@ pub fn elaborate_ensures(
         ));
     }
     let rewritten = rewrite_result_to(&ast, &self_call)?;
+    if can_reuse_ast {
+        return Ok(EnsuresGoalSource {
+            src: String::new(),
+            parsed_ast: Some(rewritten),
+            quantified: false,
+        });
+    }
     let rewritten_src = quote::quote!(#rewritten).to_string();
     // Elaborate over the parameters only — `result` is gone, replaced by the
     // admitted self-call, which `elab_term` resolves to `self_fn_def(params)`.
     // Filter to the params the rewritten clause actually uses so a clause that
     // constrains only a SUBSET of the parameters (e.g. a quantified clause, or
     // `ensures result >= 0`) still binds exactly its free variables.
-    let used = discharge_used_bindings(&rewritten_src, param_types);
-    elaborate_goal_typed_with_facets(&rewritten_src, &used, facets)
+    Ok(EnsuresGoalSource { src: rewritten_src, parsed_ast: None, quantified: false })
 }
 
 /// For the ensures-discharge path, the subset of `param_types` whose names are
@@ -3633,30 +6166,880 @@ pub fn elaborate_ensures(
 /// predicates in a multi-param function). Routes quantified vs plain clauses the
 /// same way `elaborate_goal_typed` does; on any parse failure it returns the
 /// full list unchanged so the elaborator reports the real error.
-fn discharge_used_bindings<'a>(
-    clause: &str,
-    param_types: &[(&'a str, &'a str)],
-) -> Vec<(&'a str, &'a str)> {
-    let free: std::collections::BTreeSet<String> = if clause_uses_quantifier_fragment(clause) {
-        match parse_qclause(clause, true) {
+fn discharge_used_bindings<'a, T: Clone>(
+    source: &EnsuresGoalSource,
+    param_types: &[(&'a str, T)],
+) -> Vec<(&'a str, T)> {
+    let free: Vec<String> = if let Some(ast) = &source.parsed_ast {
+        let mut acc = Vec::new();
+        collect_vars(ast, &mut acc);
+        acc
+    } else if clause_uses_quantifier_fragment(&source.src) {
+        match parse_qclause(&source.src, true) {
             Ok(qc) => {
                 let mut acc = Vec::new();
                 collect_qclause_free_vars(&qc, &mut Vec::new(), &mut acc);
-                acc.into_iter().collect()
+                acc
             }
             Err(_) => return param_types.to_vec(),
         }
     } else {
-        match syn::parse_str::<SynExpr>(clause) {
+        match syn::parse_str::<SynExpr>(&source.src) {
             Ok(ast) => {
                 let mut acc = Vec::new();
                 collect_vars(&ast, &mut acc);
-                acc.into_iter().collect()
+                acc
             }
             Err(_) => return param_types.to_vec(),
         }
     };
-    param_types.iter().filter(|(n, _)| free.contains(*n)).copied().collect()
+    param_types.iter().filter(|(n, _)| free.iter().any(|v| v == *n)).cloned().collect()
+}
+
+// ---------------------------------------------------------------------------
+// A1 — `requires` as kernel hypotheses (design revision 2 `requires-hyps` §2).
+//
+// `elaborate_ensures` builds the UNCONDITIONAL goal
+//
+//     G0 := ∀ (value binders), Q(params, f_def params)
+//
+// so a theorem that is true only under the function's own precondition cannot
+// be cited at all. This section adds the strictly weaker second rung
+//
+//     G1 := ∀ (value binders), H_0 → … → H_{n-1} → Q(params, f_def params)
+//
+// where each `H_j` is the elaboration of one ELIGIBLE `requires` clause.
+//
+// SOUNDNESS, stated once. A conclusion and a hypothesis have OPPOSITE polarity.
+// For the conclusion the discharge criterion needs `P_Q ⇒ F_Q` (the kernel
+// proposition implies the formula callers are charged). For a hypothesis it
+// needs `F_R ⇒ P_R`: whatever callers are actually CHARGED must imply what the
+// theorem is allowed to CONSUME. Three rules keep that direction honest:
+//
+//   1. a hypothesis is derived from the QUERY-OWNED canonical proposition the
+//      caller is charged — never from source-span text (the caller passes it in
+//      [`HypothesisInput::canonical_text`] and cross-checks it, see
+//      `spec_clean_uncited_denotation` on the compiler side);
+//   2. only the arithmetic-free syntactic allow-list `E-allow`
+//      ([`hypothesis_allow_listed`]) is eligible, because it is the fragment on
+//      which the Clean reading and the charged reading provably agree. Machine
+//      arithmetic is the counterexample that forces this: in Clean `+` on
+//      `UInt64` WRAPS while callers are charged the non-wrapping reading, so
+//      `requires a + b > 10` would hand the theorem a hypothesis that
+//      `a = u64::MAX, b = 1` satisfies in the charged reading and refutes in the
+//      Clean one;
+//   3. anything else is OMITTED, never approximated. Omission is always the
+//      sound direction — `(∀p, Q) ⇒ (∀p, H → Q)` — and it is disclosed.
+//
+// Omitting every clause leaves `G1 = G0` with no arrow, which is why a build
+// with zero bound hypotheses is refused rather than returned: the caller must
+// not be able to spend a second kernel grade on the goal it already has.
+// ---------------------------------------------------------------------------
+
+/// One `requires` clause offered to [`elaborate_ensures_under_requires`] as a
+/// candidate hypothesis.
+///
+/// `canonical_text` is the QUERY-OWNED canonical spelling — the text that
+/// re-parses to the identical `Formula`/domain tree callers are charged — and it
+/// is the only spelling this crate elaborates. `authored_text` is carried for
+/// diagnostics and is never elaborated. `query_bindings` is the query's own
+/// view of each free variable's carrier; every free variable of
+/// `canonical_text` must have a row here and it must agree with the caller's
+/// parameter table, or the clause is omitted. An EMPTY `query_bindings` is not
+/// "no opinion": a clause with free variables and no query view is omitted.
+#[derive(Debug, Clone)]
+pub struct HypothesisInput {
+    /// Dense index of this contract in the function's contract list.
+    pub contract_index: usize,
+    /// Canonical, query-owned clause text. Elaborated.
+    pub canonical_text: String,
+    /// Authored spelling. Diagnostics only — NEVER elaborated.
+    pub authored_text: String,
+    /// The query's own `name → Rust carrier` view of this clause's variables.
+    pub query_bindings: Vec<(String, String)>,
+}
+
+/// What became of one candidate hypothesis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HypothesisDisposition {
+    /// Carried as arrow `binder_index` of `G1` (0 = outermost hypothesis).
+    Bound { binder_index: usize },
+    /// Not carried. The goal is correspondingly HARDER, never weaker.
+    Omitted { reason: String },
+}
+
+/// One row per `requires` contract, in contract order — what v6/D1 requires be
+/// reported: exactly what was graded.
+#[derive(Debug, Clone)]
+pub struct HypothesisRow {
+    pub contract_index: usize,
+    pub canonical_text: String,
+    pub authored_text: String,
+    pub disposition: HypothesisDisposition,
+    /// Trust (OR-A1): the LIFTED spelling `T_j` of `canonical_text` that the
+    /// kernel-canonical goal `G1★` carries for this row
+    /// ([`lift_hypothesis_source`]) — `Some` exactly when the row is `Bound`
+    /// AND `G1★` was built. Disclosure only; the elaborated `Expr` is what is
+    /// graded.
+    pub lifted_text: Option<String>,
+}
+
+/// The `G1` goal plus the disclosure that must travel with it.
+#[derive(Debug, Clone)]
+pub struct EnsuresUnderRequires {
+    /// `∀ (value binders), H_0 → … → H_{n-1} → Q`.
+    pub goal: Expr,
+    /// Clause-side names of the value binders, outermost first.
+    pub value_binders: Vec<String>,
+    /// One row per candidate, in contract order.
+    pub hypotheses: Vec<HypothesisRow>,
+    /// Trust (OR-A1, Inc 1a): `G1★` — the SAME binder list, the SAME conclusion
+    /// and the SAME bound hypothesis set as [`Self::goal`], with each hypothesis
+    /// carried in its LIFTED mathematical reading `T_j` instead of its Clean
+    /// (allow-listed) reading `H_j`.
+    ///
+    /// `T_j` is built from the query-owned `canonical_text` — the text whose
+    /// `:984` round trip re-parses to exactly the `Formula` callers are charged —
+    /// by rewriting every integer parameter atom `x` to `(x as nat)` (unsigned)
+    /// or `(x as int)` (signed) and elaborating the result through the EXISTING
+    /// nat-lift path ([`lift_for`]'s closed table), over the same binders at
+    /// offset 0. No new `Formula → Expr` translator exists: the lift table is
+    /// already in the `EnsuresCitationDischarge` goal-construction base
+    /// (`docs/TCB.md`). On the arithmetic-free fragment `E-allow` every lift
+    /// row is an exact, order-preserving injection, so `T_j` holds exactly when
+    /// the charged proposition does.
+    ///
+    /// This is NOT the implicit lift OR-1 bars: OR-1 is about a
+    /// USER-authored clause acquiring a cast the author did not write. Here the
+    /// compiler states, in the kernel, the reading of a proposition the caller
+    /// is already charged, and only on a fragment with no arithmetic, where
+    /// wrapping and unbounded readings cannot disagree.
+    ///
+    /// `None` when some bound hypothesis has no lifted reading (a pointer-sized
+    /// carrier the lift table refuses, a carrier outside the table); the reason
+    /// is in [`Self::canonical_refusal`]. Grading `G1★` grants nothing by
+    /// itself: the ladder in `trust_certify::clean_island` grades it, and the
+    /// compiler decides what a certified grade on it is worth.
+    pub canonical_goal: Option<Expr>,
+    /// Why [`Self::canonical_goal`] is `None`, when it is.
+    pub canonical_refusal: Option<String>,
+    /// Signed widths whose seeded lift model the conclusion OR a lifted
+    /// hypothesis names (the union — H6). The holder of the kernel environment
+    /// must seed each before typing or grading EITHER goal; see
+    /// [`ElaboratedClause::required_signed_lift_widths`].
+    pub required_signed_lift_widths: Vec<MachineSIntWidth>,
+}
+
+impl EnsuresUnderRequires {
+    /// How many hypotheses the goal actually carries.
+    #[must_use]
+    pub fn bound_count(&self) -> usize {
+        self.hypotheses
+            .iter()
+            .filter(|r| matches!(r.disposition, HypothesisDisposition::Bound { .. }))
+            .count()
+    }
+
+    /// The canonical texts of the bound hypotheses, outermost first.
+    #[must_use]
+    pub fn bound_texts(&self) -> Vec<&str> {
+        let mut bound: Vec<(usize, &str)> = self
+            .hypotheses
+            .iter()
+            .filter_map(|r| match &r.disposition {
+                HypothesisDisposition::Bound { binder_index } => {
+                    Some((*binder_index, r.canonical_text.as_str()))
+                }
+                HypothesisDisposition::Omitted { .. } => None,
+            })
+            .collect();
+        bound.sort_by_key(|(i, _)| *i);
+        bound.into_iter().map(|(_, t)| t).collect()
+    }
+}
+
+/// Why one build attempt could not carry a particular hypothesis.
+struct OmitOne {
+    contract_index: usize,
+    reason: String,
+}
+
+/// Build `G1` — [`elaborate_ensures`]'s goal with the ELIGIBLE `requires`
+/// clauses prepended as kernel hypotheses (design revision 2 §2.2).
+///
+/// The conclusion is built by the SAME rewrite prefix `elaborate_ensures` uses
+/// ([`ensures_goal_source`]), so `G0` and `G1` cannot state different
+/// postconditions. Binder order is load-bearing and fixed: every value binder
+/// first, in `G0`'s order, then every variable free in some eligible hypothesis
+/// and not already present, in SIGNATURE order; then the hypothesis arrows in
+/// contract order. A theorem must be stated with exactly those binders.
+///
+/// De Bruijn discipline. Every sub-proposition — conclusion and hypotheses
+/// alike — is elaborated at offset 0 over the same binder list, which is the
+/// path every clause in this crate takes. The shift into the arrow telescope is
+/// then performed by the KERNEL's own `Expr::lift`: `h_j` sits under `j`
+/// hypothesis binders, the conclusion under all `n`. There is deliberately no
+/// hand-computed offset: an off-by-one between two same-carrier binders is
+/// WELL-TYPED (it would silently turn `c <= b` into `b <= a`), so the type
+/// checker cannot be the guard — a single code path plus the semantic control
+/// `g1_hypothesis_binds_the_authored_parameters` is.
+///
+/// Fails closed: a quantifier-fragment clause, a conclusion outside the
+/// fragment, or ZERO eligible hypotheses all return `Err`. Returning `G0` under
+/// this name would let a caller spend a second kernel grade on a goal it has
+/// already graded, and report it as a conditional discharge.
+///
+/// This is [`elaborate_ensures_under_requires_in`] at [`ClauseMode::Strict`], so
+/// every pre-existing caller builds the same `G1` it always did.
+pub fn elaborate_ensures_under_requires(
+    clause: &str,
+    param_types: &[(&str, &str)],
+    self_fn_name: &str,
+    facets: &FacetTable,
+    hyps: &[HypothesisInput],
+) -> Result<EnsuresUnderRequires, String> {
+    elaborate_ensures_under_requires_in(
+        clause,
+        param_types,
+        self_fn_name,
+        facets,
+        hyps,
+        &ProofClauseInputs::strict(),
+    )
+}
+
+/// Trust (OR-A1, Inc 0): [`elaborate_ensures_under_requires`] with the CLAUSE
+/// MODE of the CONCLUSION stated — the `ProofClauseInputs` threading the
+/// unconditional rung already has ([`elaborate_ensures_in`]).
+///
+/// Without it a lifted conclusion (`ensures (result as nat) == spec(k as nat)`)
+/// is `unsupported term shape` here while the unconditional rung accepts it, so
+/// the second rung was unreachable for exactly the clauses the nat-lift work
+/// made statable (measured: probe `r1`, "outside the exact statement fragment").
+///
+/// The mode governs the CONCLUSION only. The allow-listed hypotheses `H_j` are
+/// in `E-allow`, which admits no cast and no call, so no mode-dependent branch
+/// of the elaborator is reachable from them; the lifted hypotheses `T_j` of
+/// `G1★` are always elaborated in `ProofLift` mode, because a cast is what they
+/// are made of (see [`EnsuresUnderRequires::canonical_goal`]).
+///
+/// The signed lift widths BOTH goals name are returned as one union
+/// ([`EnsuresUnderRequires::required_signed_lift_widths`]); the caller seeds
+/// them before grading either.
+pub fn elaborate_ensures_under_requires_in(
+    clause: &str,
+    param_types: &[(&str, &str)],
+    self_fn_name: &str,
+    facets: &FacetTable,
+    hyps: &[HypothesisInput],
+    inputs: &ProofClauseInputs,
+) -> Result<EnsuresUnderRequires, String> {
+    // Drain any residue from an earlier elaboration (same discipline as
+    // `elaborate_goal_typed_in_mode`): a caller that dropped a result on an
+    // `Err` path must not leak an obligation into this goal.
+    let _ = take_required_signed_lifts();
+    // The conclusion's mode, with the self-call key the lift's self-function
+    // two-read cross-check needs. `SELF_FN_KEY` is deliberately NOT installed:
+    // a `self_result_only` (parameter-view) admission stays unnameable on this
+    // rung, which keeps a view function out of the conditional lane entirely —
+    // the scope limit the compiler states in its note.
+    let _lift = ProofLiftScope::enter(inputs, Some(self_fn_name));
+    let source = ensures_goal_source(clause, param_types, self_fn_name, facets)?;
+    if source.quantified {
+        return Err(
+            "an `ensures` clause in the quantifier/implication fragment authors its own binder \
+             structure, so the compiler does not build the under-`requires` goal for it; state \
+             the precondition inside the clause with `==>` instead"
+                .to_string(),
+        );
+    }
+    let ast_q: SynExpr = match source.parsed_ast {
+        Some(ast) => ast,
+        None => syn::parse_str(&source.src).map_err(|e| format!("parse error: {e}"))?,
+    };
+    // Same order as `elaborate_goal_typed_in`: the facet diagnostic walk runs
+    // BEFORE elaboration so its refined message wins over the backstop's.
+    if let Some(err) = first_call_facet_error(&ast_q, facets) {
+        return Err(err);
+    }
+    let _scope = AdmissionScope::enter_at(facets.clone(), trust_symbols::Capability::Proof);
+
+    let mut omitted: BTreeMap<usize, String> = BTreeMap::new();
+    // At most one restart per candidate: each restart omits one more clause, and
+    // an empty eligible set is refused, so this terminates.
+    for _ in 0..=hyps.len() {
+        // Each attempt records its own seeding obligations: an abandoned
+        // attempt must not leave a width behind for the one that succeeds.
+        let _ = take_required_signed_lifts();
+        match build_under_requires(&ast_q, param_types, hyps, &omitted) {
+            Ok(built) => return Ok(built),
+            Err(Ok(one)) => {
+                omitted.insert(one.contract_index, one.reason);
+            }
+            Err(Err(fatal)) => return Err(fatal),
+        }
+    }
+    Err("no `requires` clause of this function is eligible as a kernel hypothesis".to_string())
+}
+
+/// One attempt at `G1` with `omitted` already excluded.
+///
+/// `Err(Ok(one))` means "restart without this clause"; `Err(Err(msg))` is fatal
+/// for the whole goal.
+#[allow(clippy::result_large_err)]
+fn build_under_requires(
+    ast_q: &SynExpr,
+    param_types: &[(&str, &str)],
+    hyps: &[HypothesisInput],
+    omitted: &BTreeMap<usize, String>,
+) -> Result<EnsuresUnderRequires, Result<OmitOne, String>> {
+    // (1) Eligibility, in contract order. Parse + allow-list + query-binding
+    // agreement happen before any binder is chosen, so an ineligible clause
+    // never contributes a binder.
+    let mut eligible: Vec<(&HypothesisInput, SynExpr, Vec<String>)> = Vec::new();
+    for hyp in hyps {
+        if omitted.contains_key(&hyp.contract_index) {
+            continue;
+        }
+        let ast: SynExpr = match syn::parse_str(&hyp.canonical_text) {
+            Ok(ast) => ast,
+            Err(e) => {
+                return Err(Ok(OmitOne {
+                    contract_index: hyp.contract_index,
+                    reason: format!("its canonical text does not parse as a clause ({e})"),
+                }));
+            }
+        };
+        if let Err(reason) = hypothesis_allow_listed(&ast, param_types) {
+            return Err(Ok(OmitOne { contract_index: hyp.contract_index, reason }));
+        }
+        let mut vars = Vec::new();
+        collect_vars(&ast, &mut vars);
+        // The query's own carrier view must agree with the parameter table this
+        // goal's binders are typed from. Two independent flattenings of one
+        // signature that DISAGREE is the failure the kernel cannot catch: the
+        // goal still types and the theorem proves the wrong statement.
+        for v in &vars {
+            let Some(declared) = param_types.iter().find(|(n, _)| n == v).map(|(_, t)| *t) else {
+                return Err(Ok(OmitOne {
+                    contract_index: hyp.contract_index,
+                    reason: format!(
+                        "it names `{v}`, which is not a parameter row of this function"
+                    ),
+                }));
+            };
+            let Some(owned) = hyp.query_bindings.iter().find(|(n, _)| n == v).map(|(_, t)| t)
+            else {
+                return Err(Ok(OmitOne {
+                    contract_index: hyp.contract_index,
+                    reason: format!(
+                        "the contract query publishes no carrier for `{v}`, so the charged \
+                         reading of the clause cannot be confirmed"
+                    ),
+                }));
+            };
+            if owned != declared {
+                return Err(Ok(OmitOne {
+                    contract_index: hyp.contract_index,
+                    reason: format!(
+                        "the contract query reads `{v}` at `{owned}` while the signature row \
+                         says `{declared}`; the two flattenings must agree exactly"
+                    ),
+                }));
+            }
+        }
+        eligible.push((hyp, ast, vars));
+    }
+    if eligible.is_empty() {
+        return Err(Err(
+            "no `requires` clause of this function is eligible as a kernel hypothesis".to_string(),
+        ));
+    }
+
+    // (2) Binder list: G0's list byte for byte, then the hypotheses' extra
+    // variables in SIGNATURE order (never in clause order — the binder list must
+    // be a function of the signature, not of the order clauses were authored).
+    let mut vars: Vec<String> = Vec::new();
+    collect_vars(ast_q, &mut vars);
+    vars.retain(|v| {
+        param_types.iter().any(|(n, _)| n == v) || !has_ambient_admission(v)
+    });
+    let mut extra: BTreeSet<&str> = BTreeSet::new();
+    for (_, _, hyp_vars) in &eligible {
+        for v in hyp_vars {
+            if !vars.iter().any(|existing| existing == v) {
+                extra.insert(v.as_str());
+            }
+        }
+    }
+    for (name, _) in param_types {
+        if extra.contains(name) {
+            vars.push((*name).to_string());
+        }
+    }
+    let used: Vec<(&str, &str)> =
+        param_types.iter().filter(|(n, _)| vars.iter().any(|v| v == n)).copied().collect();
+    let var_domains = exact_typed_bindings(&vars, &used).map_err(Err)?;
+
+    // (3) ONE offset code path: everything at offset 0 over `vars`.
+    let q_body = elaborate_prop_multi(ast_q, &vars, 0, &var_domains).map_err(Err)?;
+    let mut hyp_bodies: Vec<Expr> = Vec::with_capacity(eligible.len());
+    for (hyp, ast, _) in &eligible {
+        match elaborate_prop_multi(ast, &vars, 0, &var_domains) {
+            Ok(body) => hyp_bodies.push(body),
+            Err(reason) => {
+                return Err(Ok(OmitOne {
+                    contract_index: hyp.contract_index,
+                    reason: format!("it is outside the kernel fragment ({reason})"),
+                }));
+            }
+        }
+    }
+
+    // (4) The arrow telescope, shifted by the KERNEL's own lift.
+    let n = u32::try_from(hyp_bodies.len())
+        .map_err(|_| Err("too many `requires` clauses to carry as hypotheses".to_string()))?;
+    let mut body = q_body.lift(n);
+    for (j, h) in hyp_bodies.iter().enumerate().rev() {
+        let shift = u32::try_from(j).unwrap_or(u32::MAX);
+        body = Expr::pi(BinderInfo::Default, h.lift(shift), body);
+    }
+    let goal = close_over_multi(&vars, body, &var_domains).map_err(Err)?;
+    // The seeding obligations of the conclusion (the allow-listed hypotheses
+    // are cast-free and name none). Taken BEFORE `G1★` is built so its own
+    // obligations can be added only when it is.
+    let mut required_signed_lift_widths = take_required_signed_lifts();
+
+    // (4★) Trust (OR-A1, Inc 1a): `G1★` over the SAME binders, the SAME
+    // conclusion body and the SAME eligible set, each hypothesis in its lifted
+    // reading. A miss is disclosed, never fatal: `G1` stands on its own.
+    let (canonical_goal, canonical_refusal, lifted_texts) =
+        match build_canonical_under_requires(&q_body, &eligible, param_types, &vars, &var_domains)
+        {
+            Ok((canonical, texts, widths)) => {
+                for width in widths {
+                    if !required_signed_lift_widths.contains(&width) {
+                        required_signed_lift_widths.push(width);
+                    }
+                }
+                (Some(canonical), None, texts)
+            }
+            Err(reason) => (None, Some(reason), Vec::new()),
+        };
+
+    // (5) Rows, in CONTRACT order — the disclosure v6/D1 asks for.
+    let mut binder_of: BTreeMap<usize, usize> = BTreeMap::new();
+    for (j, (hyp, _, _)) in eligible.iter().enumerate() {
+        binder_of.insert(hyp.contract_index, j);
+    }
+    let hypotheses = hyps
+        .iter()
+        .map(|hyp| HypothesisRow {
+            contract_index: hyp.contract_index,
+            canonical_text: hyp.canonical_text.clone(),
+            authored_text: hyp.authored_text.clone(),
+            disposition: match binder_of.get(&hyp.contract_index) {
+                Some(binder_index) => HypothesisDisposition::Bound { binder_index: *binder_index },
+                None => HypothesisDisposition::Omitted {
+                    reason: omitted
+                        .get(&hyp.contract_index)
+                        .cloned()
+                        .unwrap_or_else(|| "it was not offered as a hypothesis".to_string()),
+                },
+            },
+            lifted_text: binder_of
+                .get(&hyp.contract_index)
+                .and_then(|binder_index| lifted_texts.get(*binder_index))
+                .cloned(),
+        })
+        .collect();
+    Ok(EnsuresUnderRequires {
+        goal,
+        value_binders: vars,
+        hypotheses,
+        canonical_goal,
+        canonical_refusal,
+        required_signed_lift_widths,
+    })
+}
+
+/// Trust (OR-A1, Inc 1a): build `G1★` — see
+/// [`EnsuresUnderRequires::canonical_goal`] for what it is and why.
+///
+/// ONE offset code path, the same one `G1` takes: each `T_j` is elaborated at
+/// offset 0 over `vars`/`var_domains` (the very binder list `G1` was closed
+/// over), and the telescope is shifted by the KERNEL's own `Expr::lift`, so the
+/// two goals can differ ONLY in the hypothesis bodies. `q_body` is `G1`'s own
+/// conclusion body, reused rather than re-elaborated, so the conclusions are
+/// identical by construction.
+///
+/// Returns the goal, the lifted spelling of each eligible hypothesis in binder
+/// order, and the signed widths the lifted hypotheses name.
+#[allow(clippy::type_complexity)]
+fn build_canonical_under_requires(
+    q_body: &Expr,
+    eligible: &[(&HypothesisInput, SynExpr, Vec<String>)],
+    param_types: &[(&str, &str)],
+    vars: &[String],
+    var_domains: &BTreeMap<String, Domain>,
+) -> Result<(Expr, Vec<String>, Vec<MachineSIntWidth>), String> {
+    // The lift is what `T_j` is made of, so it is elaborated in `ProofLift`
+    // mode whatever mode the conclusion was built in. No self function: a
+    // `requires` clause names no call (E-allow), so the self-call cross-check
+    // is unreachable from here.
+    let built = {
+        let _lift = ProofLiftScope::enter(&ProofClauseInputs::proof_lift(None), None);
+        build_canonical_under_requires_inner(q_body, eligible, param_types, vars, var_domains)
+    };
+    // Drained on BOTH paths: a refused `G1★` must not leave a width behind.
+    let widths = take_required_signed_lifts();
+    built.map(|(goal, texts)| (goal, texts, widths))
+}
+
+fn build_canonical_under_requires_inner(
+    q_body: &Expr,
+    eligible: &[(&HypothesisInput, SynExpr, Vec<String>)],
+    param_types: &[(&str, &str)],
+    vars: &[String],
+    var_domains: &BTreeMap<String, Domain>,
+) -> Result<(Expr, Vec<String>), String> {
+    let mut texts: Vec<String> = Vec::with_capacity(eligible.len());
+    let mut bodies: Vec<Expr> = Vec::with_capacity(eligible.len());
+    for (hyp, ast, _) in eligible {
+        let lifted = lift_hypothesis_source(ast, param_types).map_err(|reason| {
+            format!(
+                "`requires` #{} (`{}`) has no lifted reading: {reason}",
+                hyp.contract_index, hyp.canonical_text
+            )
+        })?;
+        let lifted_ast: SynExpr = syn::parse_str(&lifted).map_err(|e| {
+            format!(
+                "internal: the lifted reading `{lifted}` of `requires` #{} does not parse: {e}",
+                hyp.contract_index
+            )
+        })?;
+        let body = elaborate_prop_multi(&lifted_ast, vars, 0, var_domains).map_err(|reason| {
+            format!(
+                "`requires` #{} (`{lifted}`) is outside the lifted fragment: {reason}",
+                hyp.contract_index
+            )
+        })?;
+        texts.push(lifted);
+        bodies.push(body);
+    }
+    let n = u32::try_from(bodies.len())
+        .map_err(|_| "too many `requires` clauses to carry as hypotheses".to_string())?;
+    let mut body = q_body.lift(n);
+    for (j, t) in bodies.iter().enumerate().rev() {
+        let shift = u32::try_from(j).unwrap_or(u32::MAX);
+        body = Expr::pi(BinderInfo::Default, t.lift(shift), body);
+    }
+    let goal = close_over_multi(vars, body, var_domains)?;
+    Ok((goal, texts))
+}
+
+/// Trust (OR-A1, Inc 1a): the LIFTED spelling `T_j` of one `E-allow` clause —
+/// every integer parameter atom `x` rewritten to `(x as nat)` (unsigned
+/// carrier) or `(x as int)` (signed carrier), every integer literal written
+/// unsuffixed (a suffix, when present, already had to NAME the comparison's
+/// carrier, so dropping it changes no value), and every `bool` atom left as it
+/// is (a `bool` has no lift: its Clean reading is its mathematical reading).
+///
+/// Defined ONLY on the output of [`hypothesis_allow_listed`]; anything else is
+/// an `Err`, never an approximation. On that fragment each rewrite is an exact
+/// order-preserving injection from the lift table, so `T_j` holds of a binder
+/// assignment exactly when the charged proposition does — which is the whole
+/// content of the kernel-canonical link.
+fn lift_hypothesis_source(ast: &SynExpr, params: &[(&str, &str)]) -> Result<String, String> {
+    match ast {
+        SynExpr::Paren(p) => Ok(format!("({})", lift_hypothesis_source(&p.expr, params)?)),
+        SynExpr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => {
+            Ok(format!("!({})", lift_hypothesis_source(&u.expr, params)?))
+        }
+        SynExpr::Binary(b) if matches!(b.op, BinOp::And(_) | BinOp::Or(_)) => Ok(format!(
+            "({}) {} ({})",
+            lift_hypothesis_source(&b.left, params)?,
+            binary_op_spelling(&b.op),
+            lift_hypothesis_source(&b.right, params)?
+        )),
+        SynExpr::Binary(b)
+            if matches!(
+                b.op,
+                BinOp::Eq(_) | BinOp::Ne(_) | BinOp::Lt(_) | BinOp::Le(_) | BinOp::Gt(_)
+                    | BinOp::Ge(_)
+            ) =>
+        {
+            let carrier = allow_param_carrier(&b.left, params)
+                .or_else(|| allow_param_carrier(&b.right, params))
+                .ok_or_else(|| {
+                    "a comparison with no parameter operand has no carrier to lift from"
+                        .to_string()
+                })?;
+            let Some(math) = lifted_math_ty(carrier)? else {
+                // `bool`: nothing to lift.
+                return Ok(quote::quote!(#ast).to_string());
+            };
+            Ok(format!(
+                "{} {} {}",
+                lift_hypothesis_operand(&b.left, params, math)?,
+                binary_op_spelling(&b.op),
+                lift_hypothesis_operand(&b.right, params, math)?
+            ))
+        }
+        SynExpr::Lit(l) if matches!(&l.lit, Lit::Bool(_)) => Ok(quote::quote!(#ast).to_string()),
+        SynExpr::Path(_) | SynExpr::Field(_) => match allow_param_carrier(ast, params) {
+            Some("bool") => Ok(quote::quote!(#ast).to_string()),
+            _ => Err("a bare operand that is not a `bool` parameter row".to_string()),
+        },
+        _ => Err("it is outside the arithmetic-free fragment the lifted reading is defined on"
+            .to_string()),
+    }
+}
+
+/// One comparison operand of [`lift_hypothesis_source`], at the math type its
+/// comparison's carrier lifts to.
+fn lift_hypothesis_operand(
+    e: &SynExpr,
+    params: &[(&str, &str)],
+    math: MathTy,
+) -> Result<String, String> {
+    match e {
+        SynExpr::Paren(p) => lift_hypothesis_operand(&p.expr, params, math),
+        SynExpr::Path(_) | SynExpr::Field(_) => {
+            let name = atom_var_name(e)
+                .ok_or_else(|| "an operand is not a parameter row".to_string())?;
+            if allow_param_carrier(e, params).is_none() {
+                return Err(format!("`{name}` is not a parameter row of this function"));
+            }
+            Ok(format!("({name} as {})", math.spelling()))
+        }
+        SynExpr::Lit(l) => match &l.lit {
+            Lit::Int(i) => Ok(i.base10_digits().to_string()),
+            _ => Err("a comparison operand is a literal outside the integer fragment".to_string()),
+        },
+        _ => Err("a comparison operand is outside the arithmetic-free fragment".to_string()),
+    }
+}
+
+/// The math type a clause carrier lifts to on the hypothesis side, `None` for
+/// `bool` (no lift). Read through the SAME binder-type table the goal's binders
+/// are typed from ([`Domain::from_binding_ty`]); whether the lift row itself
+/// exists (a pointer-sized carrier has none) is decided later by [`lift_for`],
+/// which refuses rather than guesses.
+fn lifted_math_ty(carrier: &str) -> Result<Option<MathTy>, String> {
+    match Domain::from_binding_ty(carrier) {
+        Some(Domain::Bool) => Ok(None),
+        Some(Domain::Machine(_) | Domain::U128 | Domain::USize(_) | Domain::Nat) => {
+            Ok(Some(MathTy::Nat))
+        }
+        Some(Domain::Signed(_) | Domain::ISize(_) | Domain::Int) => Ok(Some(MathTy::Int)),
+        Some(other) => Err(format!("the carrier `{}` has no lifted reading", other.rust_name())),
+        None => Err(format!("`{carrier}` is not a clause binder type")),
+    }
+}
+
+/// `E-allow` (design revision 2 §2.3): the arithmetic-free syntactic fragment a
+/// `requires` clause must be inside before it may be carried as a kernel
+/// HYPOTHESIS.
+///
+/// This is an ALLOW-list and only an allow-list: there is no deny-list to keep
+/// in sync with the elaborator, and it must not rely on the elaborator
+/// continuing to refuse anything. Admitted: parentheses; the connectives
+/// `&&`, `||`, `!`; the comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`; a bare
+/// parameter (or depth-1 field) row; an integer literal that is
+/// unsuffixed or suffixed with the comparison's own carrier; `true`/`false`.
+/// Refused, and therefore OMITTED (which only makes the goal harder): every
+/// arithmetic and bit operator, unary minus, casts, calls, method calls,
+/// indexing, blocks, `if`/`match`, macros, floats, and a comparison with no
+/// parameter operand to fix its carrier.
+///
+/// The exclusion of arithmetic is the false-accept guard, not a convenience.
+/// Clean reads `+` on a `UIntN` as WRAPPING; the solver charges callers the
+/// mathematical reading (`trust-vcgen`). For `requires a + b > 10` the two
+/// readings disagree at `a = u64::MAX, b = 1`, so `F_R ⇏ P_R` and the clause
+/// can never be a hypothesis, however provable the theorem looks.
+fn hypothesis_allow_listed(ast: &SynExpr, params: &[(&str, &str)]) -> Result<(), String> {
+    allow_prop_node(ast, params)
+}
+
+/// The Rust carrier this atom is bound at, if it is a parameter row.
+///
+/// Peels `Paren` the way [`allow_operand_node`] does. Without that, the
+/// canonical spelling `(a) < (b)` yields no carrier from either side and is
+/// omitted with "a comparison with no parameter operand", a reason that names
+/// the wrong cause.
+fn allow_param_carrier<'a>(e: &SynExpr, params: &'a [(&str, &str)]) -> Option<&'a str> {
+    let mut node = e;
+    while let SynExpr::Paren(p) = node {
+        node = &p.expr;
+    }
+    let name = atom_var_name(node)?;
+    params.iter().find(|(n, _)| *n == name).map(|(_, t)| *t)
+}
+
+/// A Bool-sorted (proposition) position of the allow-list.
+fn allow_prop_node(e: &SynExpr, params: &[(&str, &str)]) -> Result<(), String> {
+    match e {
+        SynExpr::Paren(p) => allow_prop_node(&p.expr, params),
+        SynExpr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => {
+            // `!` over a Bool-sorted node only. `!x` on an integer is Rust's
+            // bitwise NOT, which is arithmetic, and is refused here.
+            allow_prop_node(&u.expr, params)
+        }
+        SynExpr::Binary(b) if matches!(b.op, BinOp::And(_) | BinOp::Or(_)) => {
+            allow_prop_node(&b.left, params)?;
+            allow_prop_node(&b.right, params)
+        }
+        SynExpr::Binary(b)
+            if matches!(
+                b.op,
+                BinOp::Eq(_) | BinOp::Ne(_) | BinOp::Lt(_) | BinOp::Le(_) | BinOp::Gt(_)
+                    | BinOp::Ge(_)
+            ) =>
+        {
+            // The STRUCTURAL check runs before the carrier check so the
+            // diagnostic names the operator that actually caused the omission
+            // (`a + b > 10` must say `+`, not "no parameter operand").
+            let carrier = allow_param_carrier(&b.left, params)
+                .or_else(|| allow_param_carrier(&b.right, params));
+            allow_operand_node(&b.left, params, carrier)?;
+            allow_operand_node(&b.right, params, carrier)?;
+            if carrier.is_none() {
+                return Err(
+                    "a comparison with no parameter operand has no carrier to fix its reading"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        SynExpr::Lit(l) if matches!(&l.lit, Lit::Bool(_)) => Ok(()),
+        SynExpr::Path(_) | SynExpr::Field(_) => match allow_param_carrier(e, params) {
+            Some("bool") => Ok(()),
+            Some(other) => Err(format!(
+                "a bare `{other}` operand is not a proposition; compare it instead"
+            )),
+            None => Err("it names something that is not a parameter row".to_string()),
+        },
+        SynExpr::Binary(b) => Err(format!(
+            "it uses the operator `{}`, which is outside the arithmetic-free fragment on which \
+             the Clean reading and the reading callers are charged provably agree",
+            binary_op_spelling(&b.op)
+        )),
+        SynExpr::Unary(_) => Err(
+            "it uses a unary operator other than `!`, which is outside the arithmetic-free \
+             fragment"
+                .to_string(),
+        ),
+        SynExpr::Call(_) | SynExpr::MethodCall(_) => Err(
+            "it calls a function; a call's Clean reading is not pinned to the reading callers \
+             are charged"
+                .to_string(),
+        ),
+        SynExpr::Cast(_) => Err("it contains a cast".to_string()),
+        _ => Err("it is outside the arithmetic-free `requires`-as-hypothesis fragment".to_string()),
+    }
+}
+
+/// A comparison-operand position of the allow-list, at the atom's carrier.
+fn allow_operand_node(
+    e: &SynExpr,
+    params: &[(&str, &str)],
+    carrier: Option<&str>,
+) -> Result<(), String> {
+    match e {
+        SynExpr::Paren(p) => allow_operand_node(&p.expr, params, carrier),
+        SynExpr::Path(_) | SynExpr::Field(_) => match (allow_param_carrier(e, params), carrier) {
+            (Some(ty), Some(carrier)) if ty != carrier => Err(format!(
+                "its operands are at different carriers (`{ty}` and `{carrier}`)"
+            )),
+            (Some(_), _) => Ok(()),
+            (None, _) => {
+                Err("an operand names something that is not a parameter row".to_string())
+            }
+        },
+        SynExpr::Lit(l) => match (&l.lit, carrier) {
+            // An unsuffixed literal adopts the comparison's carrier; a suffixed
+            // one must SAY that carrier. `Domain::numeral` still fails closed on
+            // an out-of-range value, so no in-range claim is made here.
+            (Lit::Int(i), _) if i.suffix().is_empty() => Ok(()),
+            (Lit::Int(i), Some(carrier)) if i.suffix() == carrier => Ok(()),
+            (Lit::Int(i), Some(carrier)) => Err(format!(
+                "a literal suffixed `{}` is compared at carrier `{carrier}`",
+                i.suffix()
+            )),
+            (Lit::Int(i), None) => Err(format!(
+                "a literal suffixed `{}` has no parameter operand to agree with",
+                i.suffix()
+            )),
+            (Lit::Bool(_), Some("bool")) => Ok(()),
+            _ => Err("it compares against a literal outside the integer/bool fragment".to_string()),
+        },
+        SynExpr::Binary(b) => Err(format!(
+            "it uses the operator `{}`, which is outside the arithmetic-free fragment on which \
+             the Clean reading and the reading callers are charged provably agree",
+            binary_op_spelling(&b.op)
+        )),
+        // A negative literal bound (`x >= -5`) is the one unary form an author
+        // writes on purpose. It is still refused — `Formula::Int(-5)` renders as
+        // the token `-5`, and admitting it needs the same negative-numeral range
+        // argument the carrier map has not been measured for — but the reason
+        // must NAME it, not blame "a unary operator" the author never typed as
+        // one.
+        SynExpr::Unary(u)
+            if matches!(u.op, syn::UnOp::Neg(_)) && matches!(&*u.expr, SynExpr::Lit(_)) =>
+        {
+            Err(
+                "it compares against a NEGATIVE literal, which this lane does not carry as a \
+                 hypothesis yet; state the bound with a non-negative literal, or leave the clause \
+                 to be charged at the call site as it already is"
+                    .to_string(),
+            )
+        }
+        SynExpr::Unary(_) => Err(
+            "a comparison operand uses a unary operator, which is outside the arithmetic-free \
+             fragment"
+                .to_string(),
+        ),
+        SynExpr::Call(_) | SynExpr::MethodCall(_) => Err(
+            "a comparison operand calls a function; a call's Clean reading is not pinned to the \
+             reading callers are charged"
+                .to_string(),
+        ),
+        SynExpr::Cast(_) => Err("a comparison operand contains a cast".to_string()),
+        _ => Err(
+            "a comparison operand is outside the arithmetic-free fragment (only a parameter, a \
+             depth-1 field of one, or a literal is admitted)"
+                .to_string(),
+        ),
+    }
+}
+
+/// The source spelling of a binary operator, for the omission diagnostic.
+fn binary_op_spelling(op: &BinOp) -> &'static str {
+    match op {
+        BinOp::Add(_) => "+",
+        BinOp::Sub(_) => "-",
+        BinOp::Mul(_) => "*",
+        BinOp::Div(_) => "/",
+        BinOp::Rem(_) => "%",
+        BinOp::BitAnd(_) => "&",
+        BinOp::BitOr(_) => "|",
+        BinOp::BitXor(_) => "^",
+        BinOp::Shl(_) => "<<",
+        BinOp::Shr(_) => ">>",
+        // Reachable: `a < (b && c)` puts a logical operator in an OPERAND
+        // position, and a chained comparison puts a comparison there. An
+        // omission reason that named no operator at all was the alternative.
+        BinOp::And(_) => "&&",
+        BinOp::Or(_) => "||",
+        BinOp::Eq(_) => "==",
+        BinOp::Ne(_) => "!=",
+        BinOp::Lt(_) => "<",
+        BinOp::Le(_) => "<=",
+        BinOp::Gt(_) => ">",
+        BinOp::Ge(_) => ">=",
+        _ => "an unsupported operator",
+    }
 }
 
 /// Whether a clause AST mentions the reserved `result` identifier anywhere a
@@ -3666,6 +7049,11 @@ fn mentions_result(e: &SynExpr) -> bool {
     match e {
         SynExpr::Path(p) => p.path.is_ident("result"),
         SynExpr::Paren(p) => mentions_result(&p.expr),
+        // `(result as nat) == f(x as nat)` MENTIONS `result`. Without this arm
+        // the `_ => false` fallthrough below would answer `false`, the
+        // ensures-discharge path would skip the self-substitution entirely, and
+        // `result` would be ∀-closed into a generally FALSE goal.
+        SynExpr::Cast(cast) => mentions_result(&cast.expr),
         SynExpr::Unary(u) => mentions_result(&u.expr),
         SynExpr::Binary(b) => mentions_result(&b.left) || mentions_result(&b.right),
         SynExpr::Call(c) => c.args.iter().any(mentions_result),
@@ -3684,6 +7072,15 @@ fn mentions_result(e: &SynExpr) -> bool {
 fn rewrite_result_to(e: &SynExpr, replacement: &SynExpr) -> Result<SynExpr, String> {
     Ok(match e {
         SynExpr::Path(p) if p.path.is_ident("result") => replacement.clone(),
+        // The twin of the `mentions_result` arm: substitute INSIDE the cast, so
+        // `result as nat` becomes `self_fn(params…) as nat`. The `other =>
+        // other.clone()` fallthrough below would otherwise leave `result` in
+        // place as a free variable.
+        SynExpr::Cast(cast) => {
+            let mut cast = cast.clone();
+            cast.expr = Box::new(rewrite_result_to(&cast.expr, replacement)?);
+            SynExpr::Cast(cast)
+        }
         SynExpr::Paren(p) => {
             let mut p = p.clone();
             p.expr = Box::new(rewrite_result_to(&p.expr, replacement)?);
@@ -3743,26 +7140,88 @@ fn rewrite_result_to(e: &SynExpr, replacement: &SynExpr) -> Result<SynExpr, Stri
     })
 }
 
+/// The v7/D3 tail for a MODULE-QUALIFIED callee (`spec::first`) that has no
+/// facet record while the table holds a KERNEL-CHECKED Clean island definition
+/// under the callee's bare last segment (`first`).
+///
+/// Measured 2026-09-16 (alab-rust probes p4/p5): with the island inside
+/// `mod spec`, `ensures result == spec::first(a, b)` was refused with the bare
+/// "no diagnostic E6 facet record exists for `spec::first`", while the
+/// identical clause spelled `first(a, b)` proved — from any module, with no
+/// `use`. Nothing told the author that the spelling was the whole problem.
+///
+/// The refusal STAYS, and this function only words it. A qualified spelling is
+/// not refused as such — a Rust function IS keyed under its module-path
+/// suffixes ([`spec_spellings`]), because those keys are derived from its
+/// canonical def-path and evicted when two items share one. An island
+/// definition has no such path of its own: it is admitted under its Clean name,
+/// in Clean's one crate-wide namespace, and many island definitions (every one
+/// that is specification-only) have no Rust item at all.
+///
+/// ONE EXCEPTION, and it is never the spelling this tail sees. When the
+/// compiler materializes a Rust item for a Clean-origin def, it records the
+/// SAME audited `KernelChecked` admission a SECOND time, under that item's
+/// EXACT def-path (`trust_certify::clean_island::admit_clean_origin_callee_identity`,
+/// joint Rust+Lean cited lane, 2026-09-15). So a definition MAY carry two
+/// admitted spellings — its bare Clean name and that one def-path — and a
+/// qualified clause call on the def-path elaborates. That is authority the
+/// compiler's Clean-origin registry ASSERTED, not something read off the path,
+/// and only the exact def-path is keyed: no `spec_spellings` suffixes are minted
+/// for it. Such a spelling never reaches this function, because
+/// [`first_call_facet_error`] returns at its `facets.admitted(&callee)` check
+/// and this tail runs only where the callee has NO facet record at all. The
+/// argument below is therefore about every OTHER qualified spelling — the ones
+/// with no record, which is all this tail is ever asked to word. Accepting
+/// `spec::first` here would mean deciding that the Rust-looking path denotes
+/// the Clean constant `first`, and nothing at this seam can decide that: clause
+/// text is not name-resolved, so `other::first` — a different Rust function
+/// that merely shares the bare name — is indistinguishable from `spec::first`.
+/// Stripping the qualifier would bind a clause about one function to the
+/// definition of another. Hence the wording is conditional: it never asserts
+/// that the path denotes the island definition.
+///
+/// The PRINTED text below stands unamended for the same reason: it is emitted
+/// only on the no-record branch, where the callee provably is not the
+/// materialized def-path, so "`{callee}` cannot be shown to denote `{bare}`" is
+/// true of every spelling that reaches it, and its option (1) — write the bare
+/// Clean name — is the working advice whether or not the definition also has a
+/// materialized Rust item.
+///
+/// `None` unless the bare segment is admitted AND passes
+/// [`Admission::require_kernel_check`] — a reflected Rust carrier under the
+/// bare name is a Rust function, not an island definition, and gets no hint.
+fn qualified_island_spelling_hint(callee: &str, facets: &FacetTable) -> Option<String> {
+    let (_, bare) = callee.rsplit_once("::")?;
+    let admission = facets.admitted(bare)?;
+    admission.require_kernel_check().ok()?;
+    Some(format!(
+        ". `{callee}` is spelled as a Rust path, and a kernel-checked Clean island definition \
+         IS admitted under the bare Clean name `{bare}`: an island definition is named in \
+         Clean's one crate-wide namespace, whatever Rust module its island sits in, and clause \
+         paths are not name-resolved, so `{callee}` cannot be shown to denote `{bare}`. \
+         options: (1) if `{callee}` is that island definition, write `{bare}(..)` — the bare \
+         Clean name is accepted from any module, with no `use`; (2) if `{callee}` is a \
+         different Rust function that shares the name, this clause is about that function, \
+         which needs its own E6 kernel admission — and consider renaming one of the two, \
+         because every clause that writes `{bare}` means the island definition"
+    ))
+}
+
 /// Walk the spec AST; on the first program-function call, produce the
 /// facet-aware E6 diagnostic. `None` means the spec contains no calls and
 /// elaboration may proceed on the ordinary path.
 fn first_call_facet_error(ast: &SynExpr, facets: &FacetTable) -> Option<String> {
     match ast {
         SynExpr::Paren(p) => first_call_facet_error(&p.expr, facets),
+        // A spec cast is transparent to this walk: `f(x) as nat` names `f`, and
+        // an unadmitted `f` must get the refined facet diagnostic rather than
+        // `elab_term`'s generic E6 backstop.
+        SynExpr::Cast(cast) => first_call_facet_error(&cast.expr, facets),
         SynExpr::Unary(u) => first_call_facet_error(&u.expr, facets),
         SynExpr::Binary(b) => first_call_facet_error(&b.left, facets)
             .or_else(|| first_call_facet_error(&b.right, facets)),
         SynExpr::Call(c) => {
-            let callee = match &*c.func {
-                SynExpr::Path(p) => p
-                    .path
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::"),
-                _ => "<expression>".to_string(),
-            };
+            let callee = callee_path(c);
             // `Some(..)` is the Option CONSTRUCTOR former, not a program
             // function — it has no facet record by design and is typed (or
             // refused) by the elaborator's own Option-carrier gate. Its
@@ -3779,12 +7238,18 @@ fn first_call_facet_error(ast: &SynExpr, facets: &FacetTable) -> Option<String> 
                 return c.args.iter().find_map(|arg| first_call_facet_error(arg, facets));
             }
             Some(match facets.get(&callee) {
-                None => format!(
-                    "no diagnostic E6 facet record exists for `{callee}`; public facet \
-                     findings cannot admit a call and no sealed, item-bound kernel \
-                     admission exists, so the program-function call fails closed; \
-                     mention the function through its operational relation instead"
-                ),
+                None => {
+                    let mut message = format!(
+                        "no diagnostic E6 facet record exists for `{callee}`; public facet \
+                         findings cannot admit a call and no sealed, item-bound kernel \
+                         admission exists, so the program-function call fails closed; \
+                         mention the function through its operational relation instead"
+                    );
+                    if let Some(hint) = qualified_island_spelling_hint(&callee, facets) {
+                        message.push_str(&hint);
+                    }
+                    message
+                }
                 Some(f) if !f.admissible() => format!(
                     "at least one E6 structural facet of `{callee}` is not established: \
                      {}; public facet findings are diagnostic only and no sealed, \
@@ -3809,17 +7274,21 @@ fn first_call_facet_error(ast: &SynExpr, facets: &FacetTable) -> Option<String> 
     }
 }
 
-/// Parse a typed clause and resolve exactly the carrier shared by every free
-/// identifier. This is the single binding gate used by both typed statement
-/// elaboration and typed monitor construction, so the report-only monitor lane
-/// cannot accept a looser name/type surface than the statement it certifies.
-fn parse_exact_typed_clause(
+fn parse_exact_clause_vars<T>(
     spec: &str,
-    var_types: &[(&str, &str)],
-) -> Result<(SynExpr, Vec<String>, BTreeMap<String, Domain>), String> {
+    var_types: &[(&str, T)],
+) -> Result<(SynExpr, Vec<String>), String> {
     let ast: SynExpr = syn::parse_str(spec).map_err(|e| format!("parse error: {e}"))?;
+    let vars = collect_exact_clause_vars(&ast, var_types)?;
+    Ok((ast, vars))
+}
+
+fn collect_exact_clause_vars<T>(
+    ast: &SynExpr,
+    var_types: &[(&str, T)],
+) -> Result<Vec<String>, String> {
     let mut vars = Vec::new();
-    collect_vars(&ast, &mut vars);
+    collect_vars(ast, &mut vars);
     // A bare identifier that names an ambient-admitted constant is a
     // CITATION, not a clause variable — a ZERO-ARITY one resolves to the
     // kernel constant in `elab_term`'s Path arm, and a parametered one is
@@ -3831,9 +7300,19 @@ fn parse_exact_typed_clause(
     // Outside an [`AdmissionScope`] the ambient table is empty and this
     // retains everything — the plain `elaborate_goal_typed` path is
     // byte-identical to before.
-    vars.retain(|v| var_types.iter().any(|(n, _)| n == v) || ambient_admission(v).is_none());
-    let bindings = exact_typed_bindings(&vars, var_types)?;
-    Ok((ast, vars, bindings))
+    //
+    // I0: written as a loop rather than a `retain` because the consult can now
+    // REFUSE — a bare identifier the caller does not bind but the compiler
+    // records as a Rust binding of the specified function must not be dropped
+    // from the bijection and silently resolved as a citation. Order and
+    // membership are otherwise exactly what the `retain` produced.
+    let mut retained = Vec::with_capacity(vars.len());
+    for v in vars {
+        if var_types.iter().any(|(n, _)| *n == v) || ambient_bare_admission(&v)?.is_none() {
+            retained.push(v);
+        }
+    }
+    Ok(retained)
 }
 
 /// The exact-binding bijection gate shared by [`parse_exact_typed_clause`] and
@@ -3861,6 +7340,31 @@ fn exact_typed_bindings(
         }
     }
 
+    check_exact_binding_names(free_vars, &bindings)?;
+    Ok(bindings)
+}
+
+fn exact_domain_bindings(
+    free_vars: &[String],
+    var_domains: &[(&str, Domain)],
+) -> Result<BTreeMap<String, Domain>, String> {
+    let mut bindings = BTreeMap::new();
+    for (name, domain) in var_domains {
+        if name.is_empty() {
+            return Err("clause variable binding has an empty name".into());
+        }
+        if bindings.insert((*name).to_string(), domain.clone()).is_some() {
+            return Err(format!("duplicate clause variable binding `{name}`"));
+        }
+    }
+    check_exact_binding_names(free_vars, &bindings)?;
+    Ok(bindings)
+}
+
+fn check_exact_binding_names(
+    free_vars: &[String],
+    bindings: &BTreeMap<String, Domain>,
+) -> Result<(), String> {
     let free: BTreeSet<&str> = free_vars.iter().map(String::as_str).collect();
     let supplied: BTreeSet<&str> = bindings.keys().map(String::as_str).collect();
     let missing: Vec<&str> = free.difference(&supplied).copied().collect();
@@ -3877,7 +7381,7 @@ fn exact_typed_bindings(
     // (e.g. `flag && x < 10` binds `flag : Bool` and `x : UInt64`). The one
     // constraint — that a single comparison's operands agree — is enforced
     // per-atom in [`atom_domain`], not here.
-    Ok(bindings)
+    Ok(())
 }
 
 /// The single domain of one atom (a comparison, equality, or bare boolean): the
@@ -3908,9 +7412,54 @@ fn exact_typed_bindings(
 ///     when nothing is left to type the atom, the ORIGINAL refusal stands: a
 ///     bare `machine == truth` across two widths has no callee to justify it and
 ///     is still an error.
+///
+/// Step 3 also takes a step-1 domain that a typed OPERAND contradicts (see
+/// [`step_one_result_carrier_conflict`]). Step 1 reads a typed call's
+/// ARGUMENTS, and a call's arguments need not share the carrier of what it
+/// RETURNS: for `fn cursor(has: bool, fresh: bool) -> u8` the self-call and
+/// `spec_cursor(has, fresh)` both return `UInt8` while every variable step 1
+/// sees is a `bool`, so step 1 built `Eq Bool` over two `UInt8` terms, a goal
+/// the kernel refuses as ill-typed. Taking step 3 there cannot retype a working
+/// clause: the step-1 domain it replaces put a call whose declared result
+/// carrier differs from it under the relation, and no such goal typechecks.
 fn atom_domain(atom: &SynExpr, var_domains: &BTreeMap<String, Domain>) -> Result<Domain, String> {
+    // A datatype-valued call's argument types need not equal its result type.
+    // Keep the compatibility path for scalar-only clauses, but for registered
+    // carriers derive the relation from AMBIENT operands and declared results,
+    // leaving each call's arguments to its own telescope checks.
+    let mut calls = Vec::new();
+    collect_ambient_calls(atom, &mut calls);
+    let registered_call = calls.iter().any(|call| {
+        matches!(call_ret_domain(call), Some(Domain::RegisteredAdt(_)))
+            || typed_callee_carriers(call)
+                .is_some_and(|cs| matches!(cs.ret, Carrier::RegisteredAdt(_)))
+    });
+    let mut atom_vars = Vec::new();
+    collect_vars(atom, &mut atom_vars);
+    if atom_vars.iter().any(|name| matches!(var_domains.get(name), Some(Domain::RegisteredAdt(_))))
+        || registered_call
+    {
+        let mut domain = resolved_atom_domain(atom, var_domains)?;
+        collect_ambient_term_domain_evidence(atom, &mut domain)?;
+        if let Some(result_domain) = atom_call_result_domain(atom)? {
+            merge_term_domain_evidence(&mut domain, result_domain, "admitted call result")?;
+        }
+        if let Some(domain) = domain {
+            check_ambient_call_result_carriers(atom, &domain)?;
+            return Ok(domain);
+        }
+    }
     let mixed = match resolved_atom_domain_all_vars(atom, var_domains) {
-        Ok(Some(dom)) => return Ok(dom),
+        Ok(Some(dom)) => match step_one_result_carrier_conflict(atom, &dom) {
+            None => return Ok(dom),
+            // Step 3 decides from the ambient operands. Its own refusals are
+            // the clause's: an ambient VARIABLE at step 1's domain beside the
+            // contradicting call (`flag == spec(a, b)` with `spec -> u8`) fails
+            // its carrier check, and callees that disagree with each other fail
+            // `atom_call_result_domain`. With nothing left to decide, this
+            // conflict is the refusal.
+            Some(conflict) => conflict,
+        },
         Ok(None) => {
             // main's C6 lane: a variable-free atom derives its domain from
             // TERM EVIDENCE, and CONFLICTING evidence refuses -- which is why
@@ -3919,8 +7468,14 @@ fn atom_domain(atom: &SynExpr, var_domains: &BTreeMap<String, Domain>) -> Result
             // early return on the call result alone silently swallowed a
             // u64-callee-vs-u32-literal conflict (measured:
             // conflicting_term_domain_evidence_refuses).
+            //
+            // The AMBIENT collector (TG15): a typed call contributes the
+            // result it declares, never evidence from inside its argument
+            // list, which its own declaration types. `result == widen(g())` on
+            // a nullary `-> u16` relates two `UInt16` results; reading `g`'s
+            // `u8` out of `widen`'s argument refused it as mixed.
             let mut dom: Option<Domain> = None;
-            collect_term_domain_evidence(atom, &mut dom)?;
+            collect_ambient_term_domain_evidence(atom, &mut dom)?;
             if let Some(d) = dom {
                 return Ok(d);
             }
@@ -3935,6 +7490,29 @@ fn atom_domain(atom: &SynExpr, var_domains: &BTreeMap<String, Domain>) -> Result
         return Ok(dom);
     }
     atom_call_result_domain(atom)?.ok_or(mixed)
+}
+
+/// Relation evidence must retain explicit scalar literal suffixes without
+/// confusing a typed callee's arguments with the value it returns.
+fn collect_ambient_term_domain_evidence(
+    e: &SynExpr,
+    domain: &mut Option<Domain>,
+) -> Result<(), String> {
+    match e {
+        SynExpr::Paren(p) => collect_ambient_term_domain_evidence(&p.expr, domain),
+        SynExpr::Unary(u) => collect_ambient_term_domain_evidence(&u.expr, domain),
+        SynExpr::Binary(b) => {
+            collect_ambient_term_domain_evidence(&b.left, domain)?;
+            collect_ambient_term_domain_evidence(&b.right, domain)
+        }
+        SynExpr::Call(call) if typed_callee_carriers(call).is_some() => {
+            if let Some(found) = atom_call_result_domain(e)? {
+                merge_term_domain_evidence(domain, found, "admitted call result")?;
+            }
+            Ok(())
+        }
+        leaf => collect_term_domain_evidence(leaf, domain),
+    }
 }
 
 /// Merge one piece of term-derived domain evidence into `dom`, failing closed
@@ -4001,13 +7579,11 @@ fn collect_term_domain_evidence(e: &SynExpr, dom: &mut Option<Domain>) -> Result
         }
         SynExpr::Call(c) => {
             if let SynExpr::Path(p) = &*c.func {
-                let callee = p
-                    .path
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::");
+                let callee = path_spelling(&p.path);
+                // I0: STEERING ONLY (see [`ambient_admission`]). Choosing the
+                // domain a term is built at cannot bind a name; the deciding
+                // consult in `elab_term`'s call arm refuses a shadowed callee
+                // before any goal built here is submitted.
                 if let Some(found) =
                     ambient_admission(&callee).and_then(|a| a.return_domain().cloned())
                 {
@@ -4048,7 +7624,7 @@ fn elaborate_prop_multi(
     match ast {
         SynExpr::Paren(p) => elaborate_prop_multi(&p.expr, vars, offset, var_domains),
         SynExpr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => Ok(Expr::app(
-            Expr::const_(Name::from_string("Not"), vec![]),
+            Expr::const_(Name::interned("Not"), vec![]),
             elaborate_prop_multi(&u.expr, vars, offset, var_domains)?,
         )),
         SynExpr::Binary(b) if matches!(b.op, BinOp::And(_)) => Ok(connective(
@@ -4066,7 +7642,7 @@ fn elaborate_prop_multi(
         }
         SynExpr::Lit(l) if matches!(&l.lit, Lit::Bool(_)) => {
             let value = matches!(&l.lit, Lit::Bool(bb) if bb.value);
-            Ok(Expr::const_(Name::from_string(if value { "True" } else { "False" }), vec![]))
+            Ok(Expr::const_(Name::interned(if value { "True" } else { "False" }), vec![]))
         }
         // A bare identifier — or a dotted path naming a `bool` FIELD — is a
         // proposition only for a `bool` binding.
@@ -4130,7 +7706,21 @@ fn elaborate_prop_multi(
             {
                 return Err("`bool` values are not ordered (use `==` or `!=`)".into());
             }
+            // THE MATH RELATION ROW (nat-lift design §3.4). Fires only in
+            // `ProofLift` mode and only for an atom that syntactically carries
+            // a cast — which is an atom the pre-existing path REFUSES, so no
+            // clause that elaborates today can be retyped by it. Without this,
+            // `atom_domain` would resolve `clamp_nat(c as nat, d as nat) <= (d
+            // as nat)` over the variables `c`/`d` and build the relation at
+            // `u32`, putting a `Nat` term under `UInt32.toNat` — well-formed
+            // as a term, ill-typed as a proposition.
+            if let Some(relation) = elab_math_relation(b, vars, offset, var_domains)? {
+                return Ok(relation);
+            }
             let dom = atom_domain(ast, var_domains)?;
+            if matches!(dom, Domain::RegisteredAdt(_)) && !matches!(b.op, BinOp::Eq(_)) {
+                return Err(dom.registered_operation_refusal("ordering"));
+            }
             if dom.is_bool()
                 && matches!(b.op, BinOp::Le(_) | BinOp::Lt(_) | BinOp::Ge(_) | BinOp::Gt(_))
             {
@@ -4218,13 +7808,17 @@ pub fn elaborate_contract(requires: &str, ensures: &str) -> Result<Expr, String>
 /// variables, a function, or an exact typed Trust-IR obligation, and therefore
 /// grants no Rust VC or check-elision authority.
 pub fn elaborate_contract_in(requires: &str, ensures: &str, dom: &Domain) -> Result<Expr, String> {
+    if matches!(dom, Domain::RegisteredAdt(_)) {
+        return Err("registered datatype contracts require current-environment validation; use elaborate_goal_with_domains for an implication or elaborate_ensures_with_domains for the admitted function result".into());
+    }
     let pre_ast: SynExpr = syn::parse_str(requires).map_err(|e| format!("requires parse: {e}"))?;
     let post_ast: SynExpr = syn::parse_str(ensures).map_err(|e| format!("ensures parse: {e}"))?;
     let mut vars = Vec::new();
     collect_vars(&pre_ast, &mut vars);
     collect_vars(&post_ast, &mut vars);
-    let pre = elaborate_prop(&pre_ast, &vars, 0, dom)?;
-    let post = elaborate_prop(&post_ast, &vars, 1, dom)?;
+    let uniform = uniform_var_domains(&vars, dom);
+    let pre = elaborate_prop_with_uniform(&pre_ast, &vars, 0, dom, &uniform)?;
+    let post = elaborate_prop_with_uniform(&post_ast, &vars, 1, dom, &uniform)?;
     Ok(close_over(&vars, Expr::pi(BinderInfo::Default, pre, post), dom))
 }
 
@@ -4362,12 +7956,6 @@ impl RuntimeMonitorDomain {
         if self == Self::Bool {
             return Err("monitor runtime: arithmetic is not supported for `bool`".into());
         }
-        // `/` and `%` are only ever built with a positive-literal divisor (the
-        // elaborator gate), so `rhs == 0` here means a monitor was hand-built
-        // outside the certified path — fail rather than panic.
-        if matches!(op, ArithOp::Div | ArithOp::Rem) && rhs == 0 {
-            return Err("monitor runtime: division or remainder by zero".into());
-        }
         if self.is_signed() && matches!(op, ArithOp::Div | ArithOp::Rem) {
             return Err(format!(
                 "monitor runtime: signed division/remainder is not implemented for `{}`",
@@ -4376,6 +7964,18 @@ impl RuntimeMonitorDomain {
         }
         match self.bits() {
             None => match op {
+                // `/` and `%` are only ever built with a positive-literal
+                // divisor (the elaborator gate), so `rhs == 0` here means a
+                // monitor was hand-built outside the certified path — fail
+                // rather than panic. The check is an arm of the SAME match that
+                // divides: a separate `matches!(op, Div | Rem)` guard ahead of
+                // the match reads the discriminant a second time, and the
+                // verifier does not relate the two reads, so it refuted the
+                // division at `rhs = 0` with the guard in place (measured
+                // 2026-09-13 on `dff2b22d1`; the in-match arm proves).
+                ArithOp::Div | ArithOp::Rem if rhs == 0 => {
+                    return Err("monitor runtime: division or remainder by zero".into());
+                }
                 // Nat: `+`/`*` are exact (checked against the u128 test
                 // representation); `-` is TRUNCATED (`Nat.sub`, saturating at 0),
                 // never underflows; `/`/`%` are exact (divisor > 0); bitwise
@@ -4393,11 +7993,22 @@ impl RuntimeMonitorDomain {
                 "Nat monitor evaluation exceeded the exact u128 test representation".into()
             }),
             Some(bits) => {
+                if bits < 1 || bits > 128 {
+                    return Err(format!(
+                        "`{}` has BitVec width {bits}; the width helpers accept 1..=128",
+                        self.source_name()
+                    ));
+                }
                 let mask = bit_mask(bits);
                 // Only `+`/`-`/`*` can overflow the width and need masking.
                 // `/`/`%` and the bitwise ops of in-range operands are already
                 // in range.
                 match op {
+                    // The zero-divisor check sits in this match for the reason
+                    // given on the `Nat` arm above.
+                    ArithOp::Div | ArithOp::Rem if rhs == 0 => {
+                        return Err("monitor runtime: division or remainder by zero".into());
+                    }
                     ArithOp::Add => Ok(lhs.wrapping_add(rhs) & mask),
                     ArithOp::Sub => Ok(lhs.wrapping_sub(rhs) & mask),
                     ArithOp::Mul => Ok(lhs.wrapping_mul(rhs) & mask),
@@ -4412,10 +8023,15 @@ impl RuntimeMonitorDomain {
     }
 
     fn signed_value(self, value: u128) -> Result<i128, String> {
-        if !self.is_signed() {
+        let Some(bits) = self.bits().filter(|_| self.is_signed()) else {
             return Err(format!("`{}` is not a signed runtime carrier", self.source_name()));
+        };
+        if bits < 1 || bits > 128 {
+            return Err(format!(
+                "`{}` has BitVec width {bits}; the width helpers accept 1..=128",
+                self.source_name()
+            ));
         }
-        let bits = self.bits().expect("signed carriers have a width");
         let value = self.normalize(value)?;
         if bits == 128 {
             Ok(value as i128)
@@ -4596,65 +8212,7 @@ impl RuntimeMonitor {
         values: &std::collections::BTreeMap<&str, u128>,
         domain: RuntimeMonitorDomain,
     ) -> Result<u128, String> {
-        match expr {
-            RuntimeMonitorExpr::Var(name) => {
-                let actual = self
-                    .domain(name)
-                    .ok_or_else(|| format!("certified monitor has no domain for `{name}`"))?;
-                if actual != domain {
-                    return Err(format!(
-                        "monitor term uses `{name}` as {domain:?}, but it is bound as {actual:?}"
-                    ));
-                }
-                values
-                    .get(name.as_str())
-                    .copied()
-                    .ok_or_else(|| format!("missing monitor argument `{name}`"))
-            }
-            RuntimeMonitorExpr::Zero => Ok(0),
-            RuntimeMonitorExpr::Lit(v) => domain.normalize(*v),
-            RuntimeMonitorExpr::Add(lhs, rhs) => domain.wrapping_bin(
-                self.eval_term(lhs, values, domain)?,
-                self.eval_term(rhs, values, domain)?,
-                ArithOp::Add,
-            ),
-            RuntimeMonitorExpr::Sub(lhs, rhs) => domain.wrapping_bin(
-                self.eval_term(lhs, values, domain)?,
-                self.eval_term(rhs, values, domain)?,
-                ArithOp::Sub,
-            ),
-            RuntimeMonitorExpr::Mul(lhs, rhs) => domain.wrapping_bin(
-                self.eval_term(lhs, values, domain)?,
-                self.eval_term(rhs, values, domain)?,
-                ArithOp::Mul,
-            ),
-            RuntimeMonitorExpr::Div(lhs, rhs) => domain.wrapping_bin(
-                self.eval_term(lhs, values, domain)?,
-                self.eval_term(rhs, values, domain)?,
-                ArithOp::Div,
-            ),
-            RuntimeMonitorExpr::Rem(lhs, rhs) => domain.wrapping_bin(
-                self.eval_term(lhs, values, domain)?,
-                self.eval_term(rhs, values, domain)?,
-                ArithOp::Rem,
-            ),
-            RuntimeMonitorExpr::BitAnd(lhs, rhs) => domain.wrapping_bin(
-                self.eval_term(lhs, values, domain)?,
-                self.eval_term(rhs, values, domain)?,
-                ArithOp::BitAnd,
-            ),
-            RuntimeMonitorExpr::BitOr(lhs, rhs) => domain.wrapping_bin(
-                self.eval_term(lhs, values, domain)?,
-                self.eval_term(rhs, values, domain)?,
-                ArithOp::BitOr,
-            ),
-            RuntimeMonitorExpr::BitXor(lhs, rhs) => domain.wrapping_bin(
-                self.eval_term(lhs, values, domain)?,
-                self.eval_term(rhs, values, domain)?,
-                ArithOp::BitXor,
-            ),
-            _ => Err("proposition used where a monitor term was required".into()),
-        }
+        eval_term_with_domains(&self.domains, expr, values, domain)
     }
 
     fn eval_prop(
@@ -4665,33 +8223,30 @@ impl RuntimeMonitor {
         let terms = |lhs: &RuntimeMonitorExpr, rhs: &RuntimeMonitorExpr| {
             let domain = self.term_domain(lhs, rhs)?;
             Ok::<_, String>((
+                domain,
                 self.eval_term(lhs, values, domain)?,
                 self.eval_term(rhs, values, domain)?,
             ))
         };
         match expr {
             RuntimeMonitorExpr::Eq(lhs, rhs) => {
-                let (lhs, rhs) = terms(lhs, rhs)?;
+                let (_, lhs, rhs) = terms(lhs, rhs)?;
                 Ok(lhs == rhs)
             }
             RuntimeMonitorExpr::Le(lhs, rhs) => {
-                let domain = self.term_domain(lhs, rhs)?;
-                let (lhs, rhs) = terms(lhs, rhs)?;
+                let (domain, lhs, rhs) = terms(lhs, rhs)?;
                 domain.compare(lhs, rhs, CompareOp::Le)
             }
             RuntimeMonitorExpr::Lt(lhs, rhs) => {
-                let domain = self.term_domain(lhs, rhs)?;
-                let (lhs, rhs) = terms(lhs, rhs)?;
+                let (domain, lhs, rhs) = terms(lhs, rhs)?;
                 domain.compare(lhs, rhs, CompareOp::Lt)
             }
             RuntimeMonitorExpr::Ge(lhs, rhs) => {
-                let domain = self.term_domain(lhs, rhs)?;
-                let (lhs, rhs) = terms(lhs, rhs)?;
+                let (domain, lhs, rhs) = terms(lhs, rhs)?;
                 domain.compare(lhs, rhs, CompareOp::Ge)
             }
             RuntimeMonitorExpr::Gt(lhs, rhs) => {
-                let domain = self.term_domain(lhs, rhs)?;
-                let (lhs, rhs) = terms(lhs, rhs)?;
+                let (domain, lhs, rhs) = terms(lhs, rhs)?;
                 domain.compare(lhs, rhs, CompareOp::Gt)
             }
             RuntimeMonitorExpr::And(lhs, rhs) => {
@@ -4703,6 +8258,74 @@ impl RuntimeMonitor {
             RuntimeMonitorExpr::Not(inner) => Ok(!self.eval_prop(inner, values)?),
             _ => Err("term used where a monitor proposition was required".into()),
         }
+    }
+}
+
+fn eval_term_with_domains(
+    domains: &BTreeMap<String, RuntimeMonitorDomain>,
+    expr: &RuntimeMonitorExpr,
+    values: &std::collections::BTreeMap<&str, u128>,
+    domain: RuntimeMonitorDomain,
+) -> Result<u128, String> {
+    match expr {
+        RuntimeMonitorExpr::Var(name) => {
+            let actual = domains
+                .get(name.as_str())
+                .copied()
+                .ok_or_else(|| format!("certified monitor has no domain for `{name}`"))?;
+            if actual != domain {
+                return Err(format!(
+                    "monitor term uses `{name}` as {domain:?}, but it is bound as {actual:?}"
+                ));
+            }
+            values
+                .get(name.as_str())
+                .copied()
+                .ok_or_else(|| format!("missing monitor argument `{name}`"))
+        }
+        RuntimeMonitorExpr::Zero => Ok(0),
+        RuntimeMonitorExpr::Lit(v) => domain.normalize(*v),
+        RuntimeMonitorExpr::Add(lhs, rhs) => domain.wrapping_bin(
+            eval_term_with_domains(domains, lhs, values, domain)?,
+            eval_term_with_domains(domains, rhs, values, domain)?,
+            ArithOp::Add,
+        ),
+        RuntimeMonitorExpr::Sub(lhs, rhs) => domain.wrapping_bin(
+            eval_term_with_domains(domains, lhs, values, domain)?,
+            eval_term_with_domains(domains, rhs, values, domain)?,
+            ArithOp::Sub,
+        ),
+        RuntimeMonitorExpr::Mul(lhs, rhs) => domain.wrapping_bin(
+            eval_term_with_domains(domains, lhs, values, domain)?,
+            eval_term_with_domains(domains, rhs, values, domain)?,
+            ArithOp::Mul,
+        ),
+        RuntimeMonitorExpr::Div(lhs, rhs) => domain.wrapping_bin(
+            eval_term_with_domains(domains, lhs, values, domain)?,
+            eval_term_with_domains(domains, rhs, values, domain)?,
+            ArithOp::Div,
+        ),
+        RuntimeMonitorExpr::Rem(lhs, rhs) => domain.wrapping_bin(
+            eval_term_with_domains(domains, lhs, values, domain)?,
+            eval_term_with_domains(domains, rhs, values, domain)?,
+            ArithOp::Rem,
+        ),
+        RuntimeMonitorExpr::BitAnd(lhs, rhs) => domain.wrapping_bin(
+            eval_term_with_domains(domains, lhs, values, domain)?,
+            eval_term_with_domains(domains, rhs, values, domain)?,
+            ArithOp::BitAnd,
+        ),
+        RuntimeMonitorExpr::BitOr(lhs, rhs) => domain.wrapping_bin(
+            eval_term_with_domains(domains, lhs, values, domain)?,
+            eval_term_with_domains(domains, rhs, values, domain)?,
+            ArithOp::BitOr,
+        ),
+        RuntimeMonitorExpr::BitXor(lhs, rhs) => domain.wrapping_bin(
+            eval_term_with_domains(domains, lhs, values, domain)?,
+            eval_term_with_domains(domains, rhs, values, domain)?,
+            ArithOp::BitXor,
+        ),
+        _ => Err("proposition used where a monitor term was required".into()),
     }
 }
 
@@ -4837,14 +8460,7 @@ impl RuntimeScalarTerm {
                 return Err(format!("missing scalar-term argument `{name}`"));
             }
         }
-        let evaluator = RuntimeMonitor {
-            variables: self.variables.clone(),
-            domains: self.domains.clone(),
-            // `eval_term` does not inspect the outer proposition. Keeping the
-            // exact term here avoids inventing a dummy comparison.
-            expr: self.expr.clone(),
-        };
-        evaluator.eval_term(&self.expr, &values, self.domain)
+        eval_term_with_domains(&self.domains, &self.expr, &values, self.domain)
     }
 }
 
@@ -4956,7 +8572,18 @@ fn runtime_monitor_term(
             }
             if let Some(magnitude) = nonneg_int_literal(&u.expr) {
                 let _ = domain.negative_numeral(magnitude)?;
-                let bits = domain.bitvec_bits().expect("closed signed BitVec domain");
+                let Some(bits) = domain.bitvec_bits() else {
+                    return Err(format!(
+                        "monitor runtime: unary negation requires a signed carrier, not `{}`",
+                        domain.rust_name()
+                    ));
+                };
+                if bits < 1 || bits > 128 {
+                    return Err(format!(
+                        "`{}` has BitVec width {bits}; the width helpers accept 1..=128",
+                        domain.rust_name()
+                    ));
+                }
                 let pattern = 0u128.wrapping_sub(magnitude) & bit_mask(bits);
                 return Ok(if pattern == 0 {
                     RuntimeMonitorExpr::Zero
@@ -5077,10 +8704,12 @@ fn runtime_scalar_clean_term(
                 .iter()
                 .position(|var| var == name)
                 .ok_or_else(|| format!("unbound variable `{name}`"))?;
-            Ok(Expr::bvar((vars.len() - 1 - pos) as u32 + offset))
+            Ok(Expr::bvar(de_bruijn_index(vars.len(), pos, offset)?))
         }
         RuntimeMonitorExpr::Zero => Ok(domain.zero()),
         RuntimeMonitorExpr::Lit(value) => match domain {
+            Domain::RegisteredAdt(_) => Err(domain.registered_operation_refusal("runtime monitoring")),
+            Domain::Int => Err("`int` is a kernel-goal-only domain (the nat-lift codomain): it has no executable runtime carrier, so a clause that reaches it is `unmonitored` rather than monitored at a guessed width".into()),
             Domain::Nat | Domain::Machine(_) => domain.numeral(*value),
             Domain::Signed(_) | Domain::U128 | Domain::USize(_) | Domain::ISize(_) => {
                 domain.runtime_domain()?.normalize(*value)?;
@@ -5103,21 +8732,15 @@ fn runtime_scalar_clean_term(
             let lhs = recurse(lhs)?;
             let rhs = recurse(rhs)?;
             let nat_bin =
-                |lhs, rhs| Expr::apps(Expr::const_(Name::from_string(op), vec![]), [lhs, rhs]);
+                |lhs, rhs| Expr::apps(Expr::const_(Name::interned(op), vec![]), [lhs, rhs]);
             match domain {
                 Domain::Nat => Ok(nat_bin(lhs, rhs)),
                 Domain::Machine(width) => {
-                    let carrier = width.carrier();
-                    let lhs = Expr::app(
-                        Expr::const_(Name::from_string(&format!("{carrier}.toNat")), vec![]),
-                        lhs,
-                    );
-                    let rhs = Expr::app(
-                        Expr::const_(Name::from_string(&format!("{carrier}.toNat")), vec![]),
-                        rhs,
-                    );
+                    let to_nat = Expr::const_(Name::interned(width.to_nat_const()), vec![]);
+                    let lhs = Expr::app(to_nat.clone(), lhs);
+                    let rhs = Expr::app(to_nat, rhs);
                     Ok(Expr::app(
-                        Expr::const_(Name::from_string(&format!("{carrier}.ofNat")), vec![]),
+                        Expr::const_(Name::interned(width.of_nat_const()), vec![]),
                         nat_bin(lhs, rhs),
                     ))
                 }
@@ -5126,7 +8749,12 @@ fn runtime_scalar_clean_term(
                     let rhs = domain.bitvec_to_nat(rhs)?;
                     domain.bitvec_of_nat(nat_bin(lhs, rhs))
                 }
-                Domain::Signed(_) | Domain::ISize(_) | Domain::Bool | Domain::OptionSigned(_) => {
+                Domain::Int
+                | Domain::Signed(_)
+                | Domain::ISize(_)
+                | Domain::Bool
+                | Domain::RegisteredAdt(_)
+                | Domain::OptionSigned(_) => {
                     Err("division/remainder is unsupported for this scalar domain".into())
                 }
             }
@@ -5142,17 +8770,15 @@ fn runtime_scalar_clean_term(
             let lhs = recurse(lhs)?;
             let rhs = recurse(rhs)?;
             let nat_bin =
-                |lhs, rhs| Expr::apps(Expr::const_(Name::from_string(op), vec![]), [lhs, rhs]);
+                |lhs, rhs| Expr::apps(Expr::const_(Name::interned(op), vec![]), [lhs, rhs]);
             match domain {
                 Domain::Nat => Ok(nat_bin(lhs, rhs)),
                 Domain::Machine(width) => {
-                    let carrier = width.carrier();
-                    let to_nat =
-                        Expr::const_(Name::from_string(&format!("{carrier}.toNat")), vec![]);
+                    let to_nat = Expr::const_(Name::interned(width.to_nat_const()), vec![]);
                     let lhs = Expr::app(to_nat.clone(), lhs);
                     let rhs = Expr::app(to_nat, rhs);
                     Ok(Expr::app(
-                        Expr::const_(Name::from_string(&format!("{carrier}.ofNat")), vec![]),
+                        Expr::const_(Name::interned(width.of_nat_const()), vec![]),
                         nat_bin(lhs, rhs),
                     ))
                 }
@@ -5162,6 +8788,8 @@ fn runtime_scalar_clean_term(
                     domain.bitvec_of_nat(nat_bin(lhs, rhs))
                 }
                 Domain::Bool => Err("bitwise operations are unsupported for bool".into()),
+                Domain::RegisteredAdt(_) => Err(domain.registered_operation_refusal("runtime monitoring")),
+                Domain::Int => Err("`int` is a kernel-goal-only domain (the nat-lift codomain): it has no executable runtime carrier, so a clause that reaches it is `unmonitored` rather than monitored at a guessed width".into()),
                 Domain::OptionSigned(_) => {
                     Err("bitwise operations are unsupported for an Option carrier".into())
                 }
@@ -5244,7 +8872,7 @@ fn runtime_monitor_prop(
                 BinOp::Lt(_) => RuntimeMonitorExpr::Lt(lhs, rhs),
                 BinOp::Ge(_) => RuntimeMonitorExpr::Ge(lhs, rhs),
                 BinOp::Gt(_) => RuntimeMonitorExpr::Gt(lhs, rhs),
-                _ => unreachable!(),
+                _ => return Err("monitor runtime: unsupported proposition shape".into()),
             })
         }
         _ => Err("monitor runtime: unsupported proposition shape".into()),
@@ -5269,20 +8897,20 @@ fn comparison_decision(op: &BinOp) -> Option<(bool, bool)> {
 
 /// `Nat.succ e`.
 fn nat_succ(e: Expr) -> Expr {
-    Expr::app(Expr::const_(Name::from_string("Nat.succ"), vec![]), e)
+    Expr::app(Expr::const_(Name::interned("Nat.succ"), vec![]), e)
 }
 
 /// `Eq.{1} Bool x <lit>` — the `x = true`/`x = false` proposition for a Bool
 /// decision (`lit` = `Bool.true` / `Bool.false`).
 fn bool_eq_expr(lhs: Expr, rhs: Expr) -> Expr {
     Expr::apps(
-        Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
-        [Expr::const_(Name::from_string("Bool"), vec![]), lhs, rhs],
+        Expr::const_(Name::interned("Eq"), vec![Level::succ(Level::zero())]),
+        [Expr::const_(Name::interned("Bool"), vec![]), lhs, rhs],
     )
 }
 
 fn bool_eq(x: Expr, lit: &str) -> Expr {
-    bool_eq_expr(x, Expr::const_(Name::from_string(lit), vec![]))
+    bool_eq_expr(x, Expr::const_(Name::interned(lit), vec![]))
 }
 
 /// `x = true`.
@@ -5297,7 +8925,7 @@ fn bool_eq_false(x: Expr) -> Expr {
 
 /// `Not p` (`p → False`).
 fn not_prop(p: Expr) -> Expr {
-    Expr::app(Expr::const_(Name::from_string("Not"), vec![]), p)
+    Expr::app(Expr::const_(Name::interned("Not"), vec![]), p)
 }
 
 /// The `(small, large)` Nat operands of a comparison's `Nat.ble` at binder
@@ -5305,38 +8933,35 @@ fn not_prop(p: Expr) -> Expr {
 /// `toNat` order); `>=`/`>` swap the operands; the smaller side gets `succ` for
 /// strict `<`/`>` (`Nat.lt a b ≡ Nat.le (succ a) b`). Shared by the positive
 /// comparison monitor and the negation lane.
-fn ble_operands(
+fn ble_operands_with_domains(
     b: &syn::ExprBinary,
     vars: &[String],
     offset: u32,
+    var_domains: &BTreeMap<String, Domain>,
     dom: &Domain,
 ) -> Result<(Expr, Expr), String> {
-    // MONITOR LANE, SINGLE DOMAIN. `dom` is the atom's one domain (its caller
-    // resolved it with `atom_domain` over the whole atom), so the per-variable
-    // map is the uniform one — this reproduces the pre-increment typing of
-    // every operand exactly.
-    let var_domains = uniform_var_domains(vars, dom);
     let (swap, strict) = comparison_decision(&b.op)
         .ok_or_else(|| "monitor fragment: only <= < >= > are supported".to_string())?;
-    let to_nat = |e: Expr| -> Expr {
-        match dom {
+    let to_nat = |e: Expr| -> Result<Expr, String> {
+        Ok(match dom {
             Domain::Nat => e,
-            Domain::Machine(width) => Expr::app(
-                Expr::const_(Name::from_string(&format!("{}.toNat", width.carrier())), vec![]),
-                e,
-            ),
+            Domain::Machine(width) => {
+                Expr::app(Expr::const_(Name::interned(width.to_nat_const()), vec![]), e)
+            }
             Domain::Signed(_) | Domain::U128 | Domain::USize(_) | Domain::ISize(_) => {
-                dom.bitvec_order_key(e).expect("closed BitVec domain has an order key")
+                dom.bitvec_order_key(e)?
             }
             // `bool` ordering is rejected before a monitor is built; if reached,
             // the identity leaves a `Nat.ble` over a `Bool` that fails kernel
             // typecheck (a graceful error, never a panic). The Option carrier
-            // is unordered for the same reason and takes the same identity.
-            Domain::Bool | Domain::OptionSigned(_) => e,
-        }
+            // is unordered for the same reason and takes the same identity, and
+            // `int` (which has no runtime carrier at all, so no monitor is ever
+            // built for it) joins them rather than inventing an order key.
+            Domain::Bool | Domain::Int | Domain::OptionSigned(_) | Domain::RegisteredAdt(_) => e,
+        })
     };
-    let l = to_nat(elab_term(&b.left, vars, offset, &var_domains, dom)?);
-    let r = to_nat(elab_term(&b.right, vars, offset, &var_domains, dom)?);
+    let l = to_nat(elab_term(&b.left, vars, offset, var_domains, dom)?)?;
+    let r = to_nat(elab_term(&b.right, vars, offset, var_domains, dom)?)?;
     let (mut small, large) = if swap { (r, l) } else { (l, r) };
     if strict {
         small = nat_succ(small);
@@ -5359,14 +8984,16 @@ fn comparison_mon_cond(
     offset: u32,
     dom: &Domain,
 ) -> Result<(Expr, Expr, Expr), String> {
-    let (a0, b0) = ble_operands(b, vars, offset, dom)?;
-    let ble = Expr::const_(Name::from_string("Nat.ble"), vec![]);
+    let var_domains = uniform_var_domains(vars, dom);
+    let (a0, b0) = ble_operands_with_domains(b, vars, offset, &var_domains, dom)?;
+    let ble = Expr::const_(Name::interned("Nat.ble"), vec![]);
     let mon_body = Expr::app(Expr::app(ble, a0), b0);
-    let (a1, b1) = ble_operands(b, vars, offset + 1, dom)?;
+    let (a1, b1) =
+        ble_operands_with_domains(b, vars, one_binder_deeper(offset)?, &var_domains, dom)?;
     // cond_true: `Nat.le_of_ble_eq_true a b h : Nat.le a b` (defeq to Nat.lt for
     // strict). cond_false: `Nat.not_le_of_ble_eq_false a b h : ¬(Nat.le a b)`.
-    let sound = Expr::const_(Name::from_string("Nat.le_of_ble_eq_true"), vec![]);
-    let compl = Expr::const_(Name::from_string("Nat.not_le_of_ble_eq_false"), vec![]);
+    let sound = Expr::const_(Name::interned("Nat.le_of_ble_eq_true"), vec![]);
+    let compl = Expr::const_(Name::interned("Nat.not_le_of_ble_eq_false"), vec![]);
     let cond_true = Expr::lam(
         BinderInfo::Default,
         bool_eq_true(mon_body.clone()),
@@ -5406,15 +9033,20 @@ fn equality_mon_cond(
     let var_domains = uniform_var_domains(vars, dom);
     let var_domains = &var_domains;
     match dom {
+        // No decision procedure is minted for `int`: it has no runtime carrier,
+        // so there is nothing for a monitor to evaluate. Refused by NAME here
+        // rather than reached — `certify_monitor_*` never sees this domain,
+        // because a lifted clause is unmonitored.
+        Domain::Int => Err("`int` is a kernel-goal-only domain (the nat-lift codomain): it has no executable runtime carrier, so a clause that reaches it is `unmonitored` rather than monitored at a guessed width".into()),
         Domain::Nat => {
             let a0 = elab_term(&b.left, vars, offset, var_domains, dom)?;
             let b0 = elab_term(&b.right, vars, offset, var_domains, dom)?;
-            let beq = Expr::const_(Name::from_string("Nat.beq"), vec![]);
+            let beq = Expr::const_(Name::interned("Nat.beq"), vec![]);
             let mon_body = Expr::app(Expr::app(beq, a0), b0);
             let a1 = elab_term(&b.left, vars, offset + 1, var_domains, dom)?;
             let b1 = elab_term(&b.right, vars, offset + 1, var_domains, dom)?;
-            let sound = Expr::const_(Name::from_string("Nat.eq_of_beq_eq_true"), vec![]);
-            let compl = Expr::const_(Name::from_string("Nat.ne_of_beq_false"), vec![]);
+            let sound = Expr::const_(Name::interned("Nat.eq_of_beq_eq_true"), vec![]);
+            let compl = Expr::const_(Name::interned("Nat.ne_of_beq_false"), vec![]);
             let cond_true = Expr::lam(
                 BinderInfo::Default,
                 bool_eq_true(mon_body.clone()),
@@ -5428,11 +9060,10 @@ fn equality_mon_cond(
             Ok((mon_body, cond_true, cond_false))
         }
         Domain::Machine(width) => {
-            let dec_eq =
-                Expr::const_(Name::from_string(&format!("{}.decEq", width.carrier())), vec![]);
-            let decide = Expr::const_(Name::from_string("decide"), vec![]);
-            let of_true = Expr::const_(Name::from_string("of_decide_eq_true"), vec![]);
-            let of_false = Expr::const_(Name::from_string("of_decide_eq_false"), vec![]);
+            let dec_eq = Expr::const_(Name::interned(width.dec_eq_const()), vec![]);
+            let decide = Expr::const_(Name::interned("decide"), vec![]);
+            let of_true = Expr::const_(Name::interned("of_decide_eq_true"), vec![]);
+            let of_false = Expr::const_(Name::interned("of_decide_eq_false"), vec![]);
             // mon = @decide (Eq Carrier a b) (Carrier.decEq a b)
             let a0 = elab_term(&b.left, vars, offset, var_domains, dom)?;
             let b0 = elab_term(&b.right, vars, offset, var_domains, dom)?;
@@ -5458,10 +9089,10 @@ fn equality_mon_cond(
         }
         Domain::Signed(_) | Domain::U128 | Domain::USize(_) | Domain::ISize(_) => {
             let width = dom.bitvec_width_expr()?;
-            let dec_eq = Expr::const_(Name::from_string("BitVec.decEq"), vec![]);
-            let decide = Expr::const_(Name::from_string("decide"), vec![]);
-            let of_true = Expr::const_(Name::from_string("of_decide_eq_true"), vec![]);
-            let of_false = Expr::const_(Name::from_string("of_decide_eq_false"), vec![]);
+            let dec_eq = Expr::const_(Name::interned("BitVec.decEq"), vec![]);
+            let decide = Expr::const_(Name::interned("decide"), vec![]);
+            let of_true = Expr::const_(Name::interned("of_decide_eq_true"), vec![]);
+            let of_false = Expr::const_(Name::interned("of_decide_eq_false"), vec![]);
             let a0 = elab_term(&b.left, vars, offset, var_domains, dom)?;
             let b0 = elab_term(&b.right, vars, offset, var_domains, dom)?;
             let eq_prop0 = dom.eq(a0.clone(), b0.clone());
@@ -5495,6 +9126,7 @@ fn equality_mon_cond(
         }
         // No executable equality monitor exists over an Option carrier (there
         // is no runtime carrier at all — see `runtime_domain`): fail closed.
+        Domain::RegisteredAdt(_) => Err(dom.registered_operation_refusal("runtime monitoring")),
         Domain::OptionSigned(_) => {
             Err("equality monitors are not supported for an Option carrier".into())
         }
@@ -5506,10 +9138,10 @@ fn equality_mon_cond(
 /// `equality_mon_cond` (for `a == b`) and `build_mon_cond`'s bare-boolean arm
 /// (which supplies `Bool.true` as the right operand, so `flag ≡ flag == true`).
 fn bool_eq_mon_cond(a0: Expr, b0: Expr, a1: Expr, b1: Expr, dom: &Domain) -> (Expr, Expr, Expr) {
-    let dec_eq = Expr::const_(Name::from_string("Bool.decEq"), vec![]);
-    let decide = Expr::const_(Name::from_string("decide"), vec![]);
-    let of_true = Expr::const_(Name::from_string("of_decide_eq_true"), vec![]);
-    let of_false = Expr::const_(Name::from_string("of_decide_eq_false"), vec![]);
+    let dec_eq = Expr::const_(Name::interned("Bool.decEq"), vec![]);
+    let decide = Expr::const_(Name::interned("decide"), vec![]);
+    let of_true = Expr::const_(Name::interned("of_decide_eq_true"), vec![]);
+    let of_false = Expr::const_(Name::interned("of_decide_eq_false"), vec![]);
     let eq_prop0 = dom.eq(a0.clone(), b0.clone());
     let inst0 = Expr::apps(dec_eq.clone(), [a0, b0]);
     let mon_body = Expr::apps(decide, [eq_prop0, inst0]);
@@ -5555,16 +9187,16 @@ fn build_mon_cond(
         SynExpr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => {
             // mon = Bool.not mon_C; the clause proposition is `Not C`.
             let (mc0, _, _) = build_mon_cond(&u.expr, vars, offset, var_domains)?;
-            let not_c = Expr::const_(Name::from_string("Bool.not"), vec![]);
+            let not_c = Expr::const_(Name::interned("Bool.not"), vec![]);
             let mon_body = Expr::app(not_c, mc0);
             // Trust: clean's prelude renamed these Bool negation bridges (FIDELITY /
             // KV-LIFT 2026-07-12) to avoid shadowing Lean 4's `Bool.not_eq_{true,false}`
             // (whose real statements are `Not (b = ·)` Prop-equalities, NOT these
             // `Bool.not b = · → b = ·` implications). Same statement, new names.
             let not_eq_true =
-                Expr::const_(Name::from_string("Clean.Bool.eq_false_of_not_eq_true"), vec![]);
+                Expr::const_(Name::interned("Clean.Bool.eq_false_of_not_eq_true"), vec![]);
             let not_eq_false =
-                Expr::const_(Name::from_string("Clean.Bool.eq_true_of_not_eq_false"), vec![]);
+                Expr::const_(Name::interned("Clean.Bool.eq_true_of_not_eq_false"), vec![]);
             // cond_true (offset+1): C.cond_false (not_eq_true mc1 h) : ¬C
             let (mc1, _ct1, cf1) = build_mon_cond(&u.expr, vars, offset + 1, var_domains)?;
             let h_false1 = Expr::apps(not_eq_true, [mc1, Expr::bvar(0)]);
@@ -5588,18 +9220,18 @@ fn build_mon_cond(
         SynExpr::Binary(b) if matches!(b.op, BinOp::And(_)) => {
             let (mon_p0, _, _) = build_mon_cond(&b.left, vars, offset, var_domains)?;
             let (mon_q0, _, _) = build_mon_cond(&b.right, vars, offset, var_domains)?;
-            let and_c = Expr::const_(Name::from_string("Bool.and"), vec![]);
+            let and_c = Expr::const_(Name::interned("Bool.and"), vec![]);
             let mon_body = Expr::apps(and_c, [mon_p0, mon_q0]);
             // ── cond_true (offset+1): and_eq_true_left/right + And.intro ──
             let (mon_p1, ctp1, _cfp1) = build_mon_cond(&b.left, vars, offset + 1, var_domains)?;
             let (mon_q1, ctq1, _cfq1) = build_mon_cond(&b.right, vars, offset + 1, var_domains)?;
             let prop_p1 = elaborate_prop_multi(&b.left, vars, offset + 1, var_domains)?;
             let prop_q1 = elaborate_prop_multi(&b.right, vars, offset + 1, var_domains)?;
-            let left_bridge = Expr::const_(Name::from_string("Bool.and_eq_true_left"), vec![]);
-            let right_bridge = Expr::const_(Name::from_string("Bool.and_eq_true_right"), vec![]);
+            let left_bridge = Expr::const_(Name::interned("Bool.and_eq_true_left"), vec![]);
+            let right_bridge = Expr::const_(Name::interned("Bool.and_eq_true_right"), vec![]);
             let hp = Expr::apps(left_bridge, [mon_p1.clone(), mon_q1.clone(), Expr::bvar(0)]);
             let hq = Expr::apps(right_bridge, [mon_p1.clone(), mon_q1.clone(), Expr::bvar(0)]);
-            let and_intro = Expr::const_(Name::from_string("And.intro"), vec![]);
+            let and_intro = Expr::const_(Name::interned("And.intro"), vec![]);
             let ct_body = Expr::apps(
                 and_intro,
                 [prop_p1.clone(), prop_q1.clone(), Expr::app(ctp1, hp), Expr::app(ctq1, hq)],
@@ -5612,8 +9244,8 @@ fn build_mon_cond(
             let prop_p2 = elaborate_prop_multi(&b.left, vars, offset + 2, var_domains)?;
             let prop_q2 = elaborate_prop_multi(&b.right, vars, offset + 2, var_domains)?;
             let neg_and1 = not_prop(connective("And", prop_p1, prop_q1));
-            let not_and_left = Expr::const_(Name::from_string("not_and_of_not_left"), vec![]);
-            let not_and_right = Expr::const_(Name::from_string("not_and_of_not_right"), vec![]);
+            let not_and_left = Expr::const_(Name::interned("not_and_of_not_left"), vec![]);
+            let not_and_right = Expr::const_(Name::interned("not_and_of_not_right"), vec![]);
             // fa : (mon_P=false) → ¬(P∧Q) = λ hp. not_and_of_not_left P Q (cfp hp)
             let fa = {
                 let neg_p = Expr::app(cfp2, Expr::bvar(0));
@@ -5626,7 +9258,7 @@ fn build_mon_cond(
                 let body = Expr::apps(not_and_right, [prop_p2, prop_q2, neg_q]);
                 Expr::lam(BinderInfo::Default, bool_eq_false(mon_q1.clone()), body)
             };
-            let and_false_elim = Expr::const_(Name::from_string("Bool.and_eq_false_elim"), vec![]);
+            let and_false_elim = Expr::const_(Name::interned("Bool.and_eq_false_elim"), vec![]);
             let cf_body =
                 Expr::apps(and_false_elim, [mon_p1, mon_q1, neg_and1, Expr::bvar(0), fa, fb]);
             let cond_false =
@@ -5636,7 +9268,7 @@ fn build_mon_cond(
         SynExpr::Binary(b) if matches!(b.op, BinOp::Or(_)) => {
             let (mon_p0, _, _) = build_mon_cond(&b.left, vars, offset, var_domains)?;
             let (mon_q0, _, _) = build_mon_cond(&b.right, vars, offset, var_domains)?;
-            let or_c = Expr::const_(Name::from_string("Bool.or"), vec![]);
+            let or_c = Expr::const_(Name::interned("Bool.or"), vec![]);
             let mon_body = Expr::apps(or_c, [mon_p0, mon_q0]);
             let prop_p1 = elaborate_prop_multi(&b.left, vars, offset + 1, var_domains)?;
             let prop_q1 = elaborate_prop_multi(&b.right, vars, offset + 1, var_domains)?;
@@ -5645,11 +9277,11 @@ fn build_mon_cond(
             let (mon_q1, _ctq1, _cfq1) = build_mon_cond(&b.right, vars, offset + 1, var_domains)?;
             let result_ty = connective("Or", prop_p1.clone(), prop_q1.clone());
             let (_, ctp2, _) = build_mon_cond(&b.left, vars, offset + 2, var_domains)?;
-            let (_, ctq2, _) = build_mon_cond(&b.right, vars, offset + 2, var_domains)?;
+            let (mon_q2, ctq2, _) = build_mon_cond(&b.right, vars, offset + 2, var_domains)?;
             let prop_p2 = elaborate_prop_multi(&b.left, vars, offset + 2, var_domains)?;
             let prop_q2 = elaborate_prop_multi(&b.right, vars, offset + 2, var_domains)?;
-            let or_inl = Expr::const_(Name::from_string("Or.inl"), vec![]);
-            let or_inr = Expr::const_(Name::from_string("Or.inr"), vec![]);
+            let or_inl = Expr::const_(Name::interned("Or.inl"), vec![]);
+            let or_inr = Expr::const_(Name::interned("Or.inr"), vec![]);
             let fa = {
                 let inl = Expr::apps(
                     or_inl,
@@ -5664,7 +9296,7 @@ fn build_mon_cond(
                 );
                 Expr::lam(BinderInfo::Default, bool_eq_true(mon_q1.clone()), inr)
             };
-            let or_true_elim = Expr::const_(Name::from_string("Bool.or_eq_true_elim"), vec![]);
+            let or_true_elim = Expr::const_(Name::interned("Bool.or_eq_true_elim"), vec![]);
             let ct_body = Expr::apps(
                 or_true_elim,
                 [mon_p1.clone(), mon_q1.clone(), result_ty, Expr::bvar(0), fa, fb],
@@ -5673,13 +9305,12 @@ fn build_mon_cond(
             // ── cond_false (offset+1): or_eq_false_elim → both false → ¬(P∨Q) ──
             // The continuation `k` opens TWO binders (hp, hq), so the conjuncts are
             // at offset+3: `hp` is bvar 1, `hq` is bvar 0.
-            let mon_q2 = build_mon_cond(&b.right, vars, offset + 2, var_domains)?.0;
             let (_, _, cfp3) = build_mon_cond(&b.left, vars, offset + 3, var_domains)?;
             let (_, _, cfq3) = build_mon_cond(&b.right, vars, offset + 3, var_domains)?;
             let prop_p3 = elaborate_prop_multi(&b.left, vars, offset + 3, var_domains)?;
             let prop_q3 = elaborate_prop_multi(&b.right, vars, offset + 3, var_domains)?;
             let neg_or1 = not_prop(connective("Or", prop_p1, prop_q1));
-            let not_or = Expr::const_(Name::from_string("not_or_intro"), vec![]);
+            let not_or = Expr::const_(Name::interned("not_or_intro"), vec![]);
             let k = {
                 let inner = Expr::apps(
                     not_or,
@@ -5693,7 +9324,7 @@ fn build_mon_cond(
                 let inner_lam = Expr::lam(BinderInfo::Default, bool_eq_false(mon_q2), inner);
                 Expr::lam(BinderInfo::Default, bool_eq_false(mon_p1.clone()), inner_lam)
             };
-            let or_false_elim = Expr::const_(Name::from_string("Bool.or_eq_false_elim"), vec![]);
+            let or_false_elim = Expr::const_(Name::interned("Bool.or_eq_false_elim"), vec![]);
             let cf_body = Expr::apps(or_false_elim, [mon_p1, mon_q1, neg_or1, Expr::bvar(0), k]);
             let cond_false =
                 Expr::lam(BinderInfo::Default, bool_eq_false(mon_body.clone()), cf_body);
@@ -5733,8 +9364,14 @@ fn build_mon_cond(
         }
         // A bare boolean `flag` decides as `flag == true` — the same certified
         // equality monitor with `Bool.true` as the right operand.
-        SynExpr::Path(_) if atom_domain(ast, var_domains)?.is_bool() => {
+        SynExpr::Path(_) => {
             let dom = atom_domain(ast, var_domains)?;
+            if !dom.is_bool() {
+                return Err(
+                    "monitor fragment: expected a comparison, equality, or a `&& || !` of them"
+                        .into(),
+                );
+            }
             let a0 = elab_term(ast, vars, offset, var_domains, &dom)?;
             let a1 = elab_term(ast, vars, offset + 1, var_domains, &dom)?;
             let t0 = dom.bool_lit(true)?;
@@ -5774,10 +9411,10 @@ fn wrap_and_grade(
         let (mon1, _, _) = build_mon_cond(ast, vars, 1, var_domains)?;
         // The cases motive introduces b after hp. Thread equality from the
         // original monitor to b so the false branch has mon = false.
-        let mon2 = build_mon_cond(ast, vars, 2, var_domains)?.0;
+        let (mon2, _, cond_false2) = build_mon_cond(ast, vars, 2, var_domains)?;
         let motive = Expr::lam(
             BinderInfo::Default,
-            Expr::const_(Name::from_string("Bool"), vec![]),
+            Expr::const_(Name::interned("Bool"), vec![]),
             Expr::pi(
                 BinderInfo::Default,
                 bool_eq_expr(mon2, Expr::bvar(0)),
@@ -5785,18 +9422,17 @@ fn wrap_and_grade(
             ),
         );
 
-        let bool_ty = Expr::const_(Name::from_string("Bool"), vec![]);
-        let bfalse = Expr::const_(Name::from_string("Bool.false"), vec![]);
-        let btrue = Expr::const_(Name::from_string("Bool.true"), vec![]);
-        let eq_refl = Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]);
+        let bool_ty = Expr::const_(Name::interned("Bool"), vec![]);
+        let bfalse = Expr::const_(Name::interned("Bool.false"), vec![]);
+        let btrue = Expr::const_(Name::interned("Bool.true"), vec![]);
+        let eq_refl = Expr::const_(Name::interned("Eq.refl"), vec![Level::succ(Level::zero())]);
         let refl_true = Expr::apps(eq_refl.clone(), [bool_ty.clone(), btrue.clone()]);
 
         // false branch: λ he : mon=false, False.elim (false=true)
         //   ((cond_false he) hp)
         let false_branch = {
-            let (_, _, cond_false2) = build_mon_cond(ast, vars, 2, var_domains)?;
             let contradiction = Expr::app(Expr::app(cond_false2, Expr::bvar(0)), Expr::bvar(1));
-            let false_elim = Expr::const_(Name::from_string("False.elim"), vec![Level::zero()]);
+            let false_elim = Expr::const_(Name::interned("False.elim"), vec![Level::zero()]);
             let false_eq_true = bool_eq_true(bfalse.clone());
             Expr::lam(
                 BinderInfo::Default,
@@ -5806,16 +9442,16 @@ fn wrap_and_grade(
         };
         // true branch: λ _ : mon=true, rfl.
         let true_branch = Expr::lam(BinderInfo::Default, bool_eq_true(mon1.clone()), refl_true);
-        let cases_on = Expr::const_(Name::from_string("Bool.casesOn"), vec![Level::zero()]);
+        let cases_on = Expr::const_(Name::interned("Bool.casesOn"), vec![Level::zero()]);
         let cases = Expr::apps(cases_on, [motive, mon1.clone(), false_branch, true_branch]);
         let refl_mon = Expr::apps(eq_refl, [bool_ty, mon1]);
         Expr::lam(BinderInfo::Default, prop.clone(), Expr::app(cases, refl_mon))
     };
 
     let iff_goal =
-        Expr::apps(Expr::const_(Name::from_string("Iff"), vec![]), [eq_true.clone(), prop.clone()]);
+        Expr::apps(Expr::const_(Name::interned("Iff"), vec![]), [eq_true.clone(), prop.clone()]);
     let iff_proof = Expr::apps(
-        Expr::const_(Name::from_string("Iff.intro"), vec![]),
+        Expr::const_(Name::interned("Iff.intro"), vec![]),
         [eq_true, prop, cond_true, completeness],
     );
     let equivalence_goal = close_over_multi(vars, iff_goal, var_domains)?;
@@ -6138,7 +9774,7 @@ fn certify_scalar_term_ast(
     let binding_atom = domain.eq(runtime_body.clone(), source_body);
     let binding_goal = close_over_multi(vars, binding_atom, var_domains)?;
     let refl = Expr::apps(
-        Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
+        Expr::const_(Name::interned("Eq.refl"), vec![Level::succ(Level::zero())]),
         [domain.ty(), runtime_body],
     );
     let binding_proof = close_over_lam_multi(vars, refl, var_domains)?;
@@ -6239,6 +9875,137 @@ pub fn verify_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_binder_indices_preserve_outer_to_inner_order() {
+        assert_eq!([0, 1, 2].map(|pos| de_bruijn_index(3, pos, 0).unwrap()), [2, 1, 0],);
+        assert_eq!([0, 1, 2].map(|pos| de_bruijn_index(3, pos, 4).unwrap()), [6, 5, 4],);
+        assert_eq!(de_bruijn_index(1, 0, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn checked_binder_indices_refuse_empty_and_out_of_range_positions() {
+        for (len, pos) in [(0, 0), (0, usize::MAX), (3, 3), (3, usize::MAX)] {
+            let error = de_bruijn_index(len, pos, 0).unwrap_err();
+            assert!(error.contains("binder position"), "{error}");
+            assert!(error.contains("outside"), "{error}");
+        }
+    }
+
+    #[test]
+    fn checked_binder_offsets_preserve_maximum_and_refuse_overflow() {
+        assert_eq!(de_bruijn_index(1, 0, u32::MAX).unwrap(), u32::MAX);
+        assert_eq!(de_bruijn_index(2, 0, u32::MAX - 1).unwrap(), u32::MAX);
+        assert_eq!(de_bruijn_index(2, 1, u32::MAX).unwrap(), u32::MAX);
+        let error = de_bruijn_index(2, 0, u32::MAX).unwrap_err();
+        assert!(error.contains("binder depth 1 +"), "{error}");
+        assert!(error.contains("exceeds the kernel's `u32`"), "{error}");
+        assert_eq!(one_binder_deeper(u32::MAX - 1).unwrap(), u32::MAX);
+        assert!(one_binder_deeper(u32::MAX).is_err());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn checked_binder_depth_refuses_narrowing_without_allocating_binders() {
+        // Exercise the length arithmetic directly: no enormous binder vector
+        // is allocated, and a large population does not by itself forbid a
+        // representable inner binder.
+        let at_limit = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        assert_eq!(de_bruijn_index(at_limit, 0, 0).unwrap(), u32::MAX);
+        assert_eq!(de_bruijn_index(at_limit, at_limit - 1, 0).unwrap(), 0);
+        let above_limit = at_limit + 1;
+        let error = de_bruijn_index(above_limit, 0, 0).unwrap_err();
+        assert!(error.contains("binder depth 4294967296"), "{error}");
+        assert!(error.contains("exceeds the kernel's `u32`"), "{error}");
+        assert_eq!(de_bruijn_index(above_limit, 1, 0).unwrap(), u32::MAX);
+        assert_eq!(de_bruijn_index(above_limit, above_limit - 1, 0).unwrap(), 0);
+        assert!(de_bruijn_index(at_limit, 0, 1).is_err());
+    }
+
+    #[test]
+    fn bool_value_admission_refuses_invalid_domains_and_parameter_indices() {
+        let mut env = Environment::with_prelude();
+        for (domains, op) in [
+            (vec![], BoolValueKind::Not(0)),
+            (vec![Domain::Bool], BoolValueKind::Not(1)),
+            (vec![Domain::Bool], BoolValueKind::Not(usize::MAX)),
+            (vec![Domain::Bool], BoolValueKind::And(0, 1)),
+            (vec![Domain::Bool], BoolValueKind::And(usize::MAX, 0)),
+            (vec![Domain::Bool], BoolValueKind::Or(1, 0)),
+            (vec![Domain::Bool], BoolValueKind::Or(0, usize::MAX)),
+            (vec![Domain::Nat], BoolValueKind::Not(0)),
+            (vec![Domain::Bool, Domain::Nat], BoolValueKind::And(0, 1)),
+        ] {
+            let error = admit_bool_value_function(&mut env, "invalid_bool_value", &domains, op)
+                .err()
+                .expect("invalid Bool carrier/index must refuse before registration");
+            assert!(
+                error.contains("out of range") || error.contains("must all be `Bool`"),
+                "{error}"
+            );
+            assert!(env.get_const(&Name::from_string("invalid_bool_value")).is_none());
+        }
+    }
+
+    #[test]
+    fn bool_value_admission_preserves_exact_outer_to_inner_binder_order() {
+        let mut env = Environment::with_prelude();
+        let bool_ty = Expr::const_(Name::from_string("Bool"), vec![]);
+        // Expected indices are independent literals, not the helper under test.
+        // In particular, commutative connective truth tables cannot detect a
+        // swapped operand, so also compare the exact stored defining equation.
+        for (name, op, head, indices) in [
+            ("bool_first", BoolValueKind::Not(0), "Bool.not", vec![2]),
+            ("bool_middle", BoolValueKind::Not(1), "Bool.not", vec![1]),
+            ("bool_last", BoolValueKind::Not(2), "Bool.not", vec![0]),
+            ("bool_outer_and_last", BoolValueKind::And(0, 2), "Bool.and", vec![2, 0]),
+            ("bool_last_or_middle", BoolValueKind::Or(2, 1), "Bool.or", vec![0, 1]),
+        ] {
+            let admission = admit_bool_value_function(
+                &mut env,
+                name,
+                &[Domain::Bool, Domain::Bool, Domain::Bool],
+                op,
+            )
+            .unwrap();
+            assert!(admission.status().is_reflected());
+            assert_eq!(admission.return_domain(), Some(&Domain::Bool));
+            let body = Expr::apps(
+                Expr::const_(Name::from_string(head), vec![]),
+                indices.into_iter().map(Expr::bvar),
+            );
+            let expected =
+                (0..3).fold(body, |body, _| Expr::lam(BinderInfo::Default, bool_ty.clone(), body));
+            assert_eq!(
+                env.get_const(&Name::from_string(name)).unwrap().value.as_ref(),
+                Some(&expected),
+                "{name}: the defining equation must retain exact parameter identity"
+            );
+        }
+    }
+
+    #[test]
+    fn bool_value_admission_reduces_the_complete_not_and_or_truth_tables() {
+        let mut env = Environment::with_prelude();
+        admit_bool_value_function(&mut env, "bool_neg", &[Domain::Bool], BoolValueKind::Not(0))
+            .unwrap();
+        for (name, op) in
+            [("bool_conj", BoolValueKind::And(0, 1)), ("bool_disj", BoolValueKind::Or(0, 1))]
+        {
+            admit_bool_value_function(&mut env, name, &[Domain::Bool, Domain::Bool], op).unwrap();
+        }
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let lit = |value| Domain::Bool.bool_lit(value).unwrap();
+        let app =
+            |name, args: Vec<Expr>| Expr::apps(Expr::const_(Name::from_string(name), vec![]), args);
+        for a in [false, true] {
+            assert!(tc.is_def_eq(&app("bool_neg", vec![lit(a)]), &lit(!a)));
+            for b in [false, true] {
+                assert!(tc.is_def_eq(&app("bool_conj", vec![lit(a), lit(b)]), &lit(a && b)));
+                assert!(tc.is_def_eq(&app("bool_disj", vec![lit(a), lit(b)]), &lit(a || b)));
+            }
+        }
+    }
 
     /// R4 §2 pin: the binder-typing probe's three outcome classes on real
     /// clause shapes. A same-typed comparison against a u64 parameter pins
@@ -6407,6 +10174,8 @@ mod tests {
 pub enum Carrier {
     /// The kernel's unbounded `Nat`.
     Nat,
+    /// The kernel's unbounded `Int`.
+    Int,
     /// `Bool`.
     Bool,
     /// `UInt8` / `UInt16` / `UInt32` / `UInt64` — the wrapping unsigned carriers.
@@ -6415,6 +10184,8 @@ pub enum Carrier {
     BitVec(u32),
     /// `Option <inner>`.
     Option(Box<Carrier>),
+    /// Exact registered family, ordered schema and instantiated arguments.
+    RegisteredAdt(RegisteredAdt),
 }
 
 impl Carrier {
@@ -6439,7 +10210,12 @@ impl Carrier {
     #[must_use]
     pub fn unique_domain(&self) -> Option<Domain> {
         match self {
+            Carrier::RegisteredAdt(carrier) => Some(Domain::RegisteredAdt(carrier.clone())),
             Carrier::Nat => Some(Domain::Nat),
+            // `Int` has exactly one preimage, [`Domain::Int`]: no machine
+            // domain carries `Int` (the signed ones carry `BitVec N`), so this
+            // is as unambiguous as the `Nat` row above it.
+            Carrier::Int => Some(Domain::Int),
             Carrier::Bool => Some(Domain::Bool),
             Carrier::UInt(width) => Some(Domain::Machine(*width)),
             Carrier::BitVec(_) => None,
@@ -6465,11 +10241,21 @@ impl Carrier {
     #[must_use]
     pub fn clean_name(&self) -> String {
         match self {
+            Carrier::RegisteredAdt(carrier) => format!("{} {:?}", carrier.name(), carrier.arguments()),
             Carrier::Nat => "Nat".to_string(),
+            Carrier::Int => "Int".to_string(),
             Carrier::Bool => "Bool".to_string(),
             Carrier::UInt(width) => width.carrier().to_string(),
             Carrier::BitVec(bits) => format!("BitVec {bits}"),
             Carrier::Option(inner) => format!("Option ({})", inner.clean_name()),
+        }
+    }
+
+    fn validate_in(&self, env: &Environment) -> Result<(), String> {
+        match self {
+            Carrier::RegisteredAdt(carrier) => carrier.validate_in(env),
+            Carrier::Option(inner) => inner.validate_in(env),
+            _ => Ok(()),
         }
     }
 }
@@ -6832,46 +10618,42 @@ fn decidable_comparison(
     let ty = d.ty();
     let zero = Level::zero();
     let one = Level::succ(Level::zero());
-    let inst_c = |s: &str| Expr::const_(Name::from_string(s), vec![]);
+    let inst_c = |s: &str| Expr::const_(Name::interned(s), vec![]);
     Ok(match d {
-        Domain::Machine(w) => {
-            let carrier = w.carrier();
-            match cmp {
-                SelectCmp::Lt => (
-                    Expr::apps(
-                        Expr::const_(Name::from_string("LT.lt"), vec![zero.clone()]),
-                        [ty.clone(), inst_c(&format!("instLT{carrier}")), l.clone(), r.clone()],
-                    ),
-                    Expr::apps(inst_c(&format!("instDecidable{carrier}Lt")), [l, r]),
+        Domain::Machine(w) => match cmp {
+            SelectCmp::Lt => (
+                Expr::apps(
+                    Expr::const_(Name::interned("LT.lt"), vec![zero.clone()]),
+                    [ty.clone(), inst_c(w.inst_lt_const()), l.clone(), r.clone()],
                 ),
-                SelectCmp::Le => (
-                    Expr::apps(
-                        Expr::const_(Name::from_string("LE.le"), vec![zero.clone()]),
-                        [ty.clone(), inst_c(&format!("instLE{carrier}")), l.clone(), r.clone()],
-                    ),
-                    Expr::apps(inst_c(&format!("instDecidable{carrier}Le")), [l, r]),
+                Expr::apps(inst_c(w.inst_decidable_lt_const()), [l, r]),
+            ),
+            SelectCmp::Le => (
+                Expr::apps(
+                    Expr::const_(Name::interned("LE.le"), vec![zero.clone()]),
+                    [ty.clone(), inst_c(w.inst_le_const()), l.clone(), r.clone()],
                 ),
-                SelectCmp::Eq => (
-                    Expr::apps(
-                        Expr::const_(Name::from_string("Eq"), vec![one.clone()]),
-                        [ty.clone(), l.clone(), r.clone()],
-                    ),
-                    Expr::apps(inst_c(&format!("instDecidableEq{carrier}")), [l, r]),
+                Expr::apps(inst_c(w.inst_decidable_le_const()), [l, r]),
+            ),
+            SelectCmp::Eq => (
+                Expr::apps(
+                    Expr::const_(Name::interned("Eq"), vec![one.clone()]),
+                    [ty.clone(), l.clone(), r.clone()],
                 ),
-            }
-        }
+                Expr::apps(inst_c(w.inst_decidable_eq_const()), [l, r]),
+            ),
+        },
         Domain::Signed(_) => {
-            let key = |e: Expr| d.bitvec_order_key(e).expect("closed signed BitVec domain");
             match cmp {
                 SelectCmp::Lt => {
-                    let (kl, kr) = (key(l), key(r));
+                    let (kl, kr) = (d.bitvec_order_key(l)?, d.bitvec_order_key(r)?);
                     (
                         nat_pred("Nat.lt", kl.clone(), kr.clone()),
                         Expr::apps(inst_c("Nat.decLt"), [kl, kr]),
                     )
                 }
                 SelectCmp::Le => {
-                    let (kl, kr) = (key(l), key(r));
+                    let (kl, kr) = (d.bitvec_order_key(l)?, d.bitvec_order_key(r)?);
                     (
                         nat_pred("Nat.le", kl.clone(), kr.clone()),
                         Expr::apps(inst_c("Nat.decLe"), [kl, kr]),
@@ -6882,7 +10664,7 @@ fn decidable_comparison(
                     let nr = d.bitvec_to_nat(r)?;
                     (
                         Expr::apps(
-                            Expr::const_(Name::from_string("Eq"), vec![one.clone()]),
+                            Expr::const_(Name::interned("Eq"), vec![one.clone()]),
                             [nat(), nl.clone(), nr.clone()],
                         ),
                         Expr::apps(inst_c("Nat.decEq"), [nl, nr]),
@@ -6968,6 +10750,93 @@ pub fn admit_comparison_function(
     // lets a clause type `f(a, b)` as a Bool-valued TERM (see [`Admission`]).
     Ok(Admission::reflected(kernel_const, n)
         .with_declared_signature(Some(Domain::Bool), Some(DeclaredCarriers::of_domains(param_domains, &Domain::Bool))))
+}
+
+/// The equality an [`admit_bool_cmp_function`] mints. The compiler-side twin is
+/// `trust_types::e6_expr::BoolEqOp`. There is deliberately NO ordering
+/// variant: `<`/`<=` over `bool` are orderings (`false < true`), and minting an
+/// equality image for one would be a false import (E6 expansion review H1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolCmp {
+    /// `a == b` — `Decidable.decide (Eq Bool a b) (instDecidableEqBool a b)`.
+    Eq,
+    /// `a != b` — `Bool.not` of the `Eq` decision.
+    Ne,
+}
+
+/// Mint an E6 [`Admission`] for a BOOL EQUALITY function — `fn f(a: bool, b:
+/// bool) -> bool { a == b }` or `{ a != b }` (E6 admission expansion,
+/// increment I1′; `docs/design-notes/2026-09-28-e6-admission-expansion.md`).
+///
+/// `left`/`right` are 0-based PARAMETER indices; there is no literal operand
+/// (rustc simplifies `a == true` / `false != a` away before any reader sees
+/// it). The body is `fun p0 … p_{n-1} => Decidable.decide (Eq.{1} Bool l r)
+/// (instDecidableEqBool l r)`, wrapped in `Bool.not` for `!=`, built as kernel
+/// `Expr`s directly — never printed and re-parsed (design §5 rule 3).
+///
+/// A NEW producer, beside the frozen [`decidable_comparison`] /
+/// [`admit_comparison_function`], which refuse the `Bool` domain and stay
+/// untouched: Clean-origin side B calls them directly and must not change
+/// meaning (design §5 rule 1).
+///
+/// FAITHFULNESS: Rust `==`/`!=` on `bool` is value equality / inequality, and
+/// `decide (a = b)` decided by the prelude's `instDecidableEqBool` is exactly
+/// that on all four input pairs — which the E6 differential harness executes.
+///
+/// Fail-closed gates: every parameter's domain is `Bool` (a single domain, as
+/// for every comparison mint) and both indices are in range. `add_decl` FULL-KERNEL-CHECKS the result at `Bool → … → Bool`.
+pub fn admit_bool_cmp_function(
+    env: &mut Environment,
+    kernel_const: &str,
+    param_domains: &[Domain],
+    cmp: BoolCmp,
+    left: usize,
+    right: usize,
+) -> Result<Admission, String> {
+    let n = param_domains.len();
+    if n == 0 {
+        return Err("a bool comparison mint needs at least one parameter".into());
+    }
+    if !param_domains.iter().all(|d| *d == Domain::Bool) {
+        return Err(
+            "a bool comparison mint requires every parameter to be `bool` (a single domain)"
+                .into(),
+        );
+    }
+    let operand = |i: usize| -> Result<Expr, String> {
+        if i < n {
+            Ok(Expr::bvar((n - 1 - i) as u32))
+        } else {
+            Err(format!("bool comparison index {i} out of range for a {n}-parameter function"))
+        }
+    };
+    let (l, r) = (operand(left)?, operand(right)?);
+    let bool_ty = Expr::const_(Name::from_string("Bool"), vec![]);
+    let prop = Expr::apps(
+        Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
+        [bool_ty.clone(), l.clone(), r.clone()],
+    );
+    let inst = Expr::apps(Expr::const_(Name::from_string("instDecidableEqBool"), vec![]), [l, r]);
+    let decided =
+        Expr::apps(Expr::const_(Name::from_string("Decidable.decide"), vec![]), [prop, inst]);
+    let body = match cmp {
+        BoolCmp::Eq => decided,
+        BoolCmp::Ne => Expr::app(Expr::const_(Name::from_string("Bool.not"), vec![]), decided),
+    };
+    let lam = (0..n).fold(body, |acc, _| Expr::lam(BinderInfo::Default, bool_ty.clone(), acc));
+    let arrow_ty = (0..n).fold(bool_ty.clone(), |acc, _| Expr::arrow(bool_ty.clone(), acc));
+    env.add_decl(Declaration::Definition {
+        name: Name::from_string(kernel_const),
+        level_params: vec![],
+        type_: arrow_ty,
+        value: lam,
+        is_reducible: true,
+    })
+    .map_err(|e| format!("kernel rejected the bool comparison defining equation: {e:?}"))?;
+    Ok(Admission::reflected(kernel_const, n).with_declared_signature(
+        Some(Domain::Bool),
+        Some(DeclaredCarriers::of_domains(param_domains, &Domain::Bool)),
+    ))
 }
 
 /// The boolean connective a [`admit_bool_binary_function`] joins its two leaves
@@ -7075,6 +10944,89 @@ pub fn admit_bool_binary_function(
     .map_err(|e| format!("kernel rejected the bool-binary defining equation: {e:?}"))?;
     Ok(Admission::reflected(kernel_const, n)
         .with_declared_signature(Some(Domain::Bool), Some(DeclaredCarriers::of_domains(param_domains, &Domain::Bool))))
+}
+
+/// **W6 (Rust-calls-Clean)** — the boolean-VALUE operation an
+/// [`admit_bool_value_function`] mints: a negation or a strict connective over
+/// `Bool` PARAMETERS, returned as `Bool`. The compiler-side twin is
+/// `trust_types::admissible_body::BoolValueKind`.
+///
+/// Distinct from [`BoolBinOp`], which joins two COMPARISON leaves for the
+/// range-guard idiom (`LO <= x && x <= HI`): this one joins bare boolean
+/// parameters (`fn conj(a: bool, b: bool) -> bool { a && b }`), the shape a
+/// Clean `def f (a b : Bool) : Bool := a && b` takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolValueKind {
+    /// `not b` — minted as `Bool.not (param)`.
+    Not(usize),
+    /// `a && b` — minted as `Bool.and (left) (right)`.
+    And(usize, usize),
+    /// `a || b` — minted as `Bool.or (left) (right)`.
+    Or(usize, usize),
+}
+
+/// Mint an E6-style [`Admission`] for a BOOLEAN-VALUE function — a negation or a
+/// strict conjunction/disjunction of `Bool` PARAMETERS returned as `Bool`
+/// (`def f (a b : Bool) : Bool := a && b`, whose kernel body is `and a b`; W6,
+/// Rust calls a Clean boolean connective). The body is `fun p0 … p_{n-1} =>
+/// Bool.not (p)` / `Bool.and (l) (r)` / `Bool.or (l) (r)`, the SAME `Bool.not`/
+/// `Bool.and`/`Bool.or` spelling [`elab_bool_term`] emits for a clause `!a` /
+/// `a && b` / `a || b`.
+///
+/// FAITHFULNESS: the island's `&&`/`||`/`not` on `Bool` are the STRICT total
+/// functions `and`/`or`/`Bool.not`, which are definitionally equal to
+/// `Bool.and`/`Bool.or`/`Bool.not` (measured 2026-09-13), and the emitted MIR
+/// (`BitAnd`/`BitOr`/`UnaryOp(Not)` on `bool`) computes exactly those on every
+/// input — short-circuit is observationally identical when the operands are
+/// pure `bool` parameters with no effect. Every parameter carries `Bool`;
+/// `add_decl` FULL-KERNEL-CHECKS the result at `Bool → … → Bool`.
+///
+/// This is NOT a frozen E6 producer — it is authored for the W6 CALL lane — so
+/// its row carries its own `docs/TCB.md` line (it mints a direct kernel
+/// application rather than riding frozen-R's elaboration pedigree).
+pub fn admit_bool_value_function(
+    env: &mut Environment,
+    kernel_const: &str,
+    param_domains: &[Domain],
+    op: BoolValueKind,
+) -> Result<Admission, String> {
+    let n = param_domains.len();
+    if !param_domains.iter().all(|d| *d == Domain::Bool) {
+        return Err("a boolean-value function's parameters must all be `Bool`".into());
+    }
+    let bvar = |i: usize| -> Result<Expr, String> {
+        if i >= n {
+            return Err(format!("bool-value index {i} out of range for a {n}-parameter function"));
+        }
+        // Under n binders the source parameter i is de Bruijn index n-1-i.
+        Ok(Expr::bvar(de_bruijn_index(n, i, 0)?))
+    };
+    let body = match op {
+        BoolValueKind::Not(p) => {
+            Expr::apps(Expr::const_(Name::from_string("Bool.not"), vec![]), [bvar(p)?])
+        }
+        BoolValueKind::And(l, r) => {
+            Expr::apps(Expr::const_(Name::from_string("Bool.and"), vec![]), [bvar(l)?, bvar(r)?])
+        }
+        BoolValueKind::Or(l, r) => {
+            Expr::apps(Expr::const_(Name::from_string("Bool.or"), vec![]), [bvar(l)?, bvar(r)?])
+        }
+    };
+    let bool_ty = Expr::const_(Name::from_string("Bool"), vec![]);
+    let lam = (0..n).fold(body, |acc, _| Expr::lam(BinderInfo::Default, bool_ty.clone(), acc));
+    let arrow_ty = (0..n).fold(bool_ty.clone(), |acc, _| Expr::arrow(bool_ty.clone(), acc));
+    env.add_decl(Declaration::Definition {
+        name: Name::from_string(kernel_const),
+        level_params: vec![],
+        type_: arrow_ty,
+        value: lam,
+        is_reducible: true,
+    })
+    .map_err(|e| format!("kernel rejected the boolean-value defining equation: {e:?}"))?;
+    Ok(Admission::reflected(kernel_const, n).with_declared_signature(
+        Some(Domain::Bool),
+        Some(DeclaredCarriers::of_domains(param_domains, &Domain::Bool)),
+    ))
 }
 
 /// The checked operation an [`admit_checked_arithmetic_function`] mints. The
@@ -7338,6 +11290,39 @@ fn seed_checked_model(env: &mut Environment, width: MachineSIntWidth) -> Result<
         )?;
     }
     Ok(())
+}
+
+/// Seed the width-`N` SIGNED LIFT MODEL into `env` — the public, idempotent
+/// entry to exactly the definitions [`seed_checked_model`] already mints.
+///
+/// The nat-lift table's `iN → Int` row (§3.1 of the nat-lift design) emits
+/// `trust_checked_toInt{N}` by NAME, and the elaborator holds no environment,
+/// so whoever builds a lifted goal must make sure the constant the name
+/// resolves to is the one this tree defines. That is this function: it is the
+/// SAME `seed_decl` discipline (a fresh name is full-kernel-checked; an
+/// existing SAME-BODY definition is accepted; an existing homonym with any
+/// other body is a hard error), so an island that declares its own
+/// `trust_checked_toInt64` makes the seeding — and therefore the clause —
+/// fail closed instead of capturing the lift.
+///
+/// It seeds the whole width-`N` model, not the `toInt` constant alone,
+/// deliberately: the model's definitions are mutually referential
+/// (`toIntN` is defined through `keyN`), and seeding a subset would leave the
+/// environment in a state `seed_decl`'s same-body check could not later
+/// complete.
+pub fn seed_signed_lift_model(
+    env: &mut Environment,
+    width: MachineSIntWidth,
+) -> Result<(), String> {
+    seed_checked_model(env, width)
+}
+
+/// The kernel constant name of the width-`N` signed lift (`iN → Int`), for a
+/// caller that must reserve or recognize it. Diagnostics and tests only: the
+/// lift table builds the term itself.
+#[must_use]
+pub fn signed_lift_const_name(width: MachineSIntWidth) -> String {
+    width.signed_lift_const().to_string()
 }
 
 /// Mint an E6 [`Admission`] for an overflow-CHECKED SIGNED arithmetic function
@@ -7834,6 +11819,20 @@ pub fn admit_guarded_narrow_function(
 /// theorem about one binder discharges a clause about another. The synthesized
 /// call is also round-tripped through `callee_path`, so a key that re-resolves
 /// to a different item fails closed.
+fn mentions_result_field(e: &SynExpr) -> bool {
+    match e {
+        SynExpr::Field(f) => {
+            matches!(&*f.base, SynExpr::Path(p) if p.path.is_ident("result"))
+                || mentions_result_field(&f.base)
+        }
+        SynExpr::Paren(p) => mentions_result_field(&p.expr),
+        SynExpr::Unary(u) => mentions_result_field(&u.expr),
+        SynExpr::Binary(b) => mentions_result_field(&b.left) || mentions_result_field(&b.right),
+        SynExpr::Call(c) => c.args.iter().any(mentions_result_field),
+        _ => false,
+    }
+}
+
 fn rewrite_result_fields(
     e: &SynExpr,
     self_fn_name: &str,
@@ -7867,8 +11866,7 @@ fn rewrite_result_fields(
                      state, and the key then needs the parent's facet record installed beside it."
                 ));
             };
-            if admission.param_names.as_ref().is_some_and(|minted| *minted != param_names) {
-                let minted = admission.param_names.as_ref().expect("checked just above");
+            if let Some(minted) = admission.param_names.as_ref().filter(|minted| *minted != param_names) {
                 return Err(format!(
                     "the clause's parameter list {param_names:?} disagrees with the list the \
                      per-field import of `{key}` was minted over ({minted:?}); the two \
@@ -7925,8 +11923,30 @@ fn rewrite_result_fields(
 /// contradicts the recorded arity — the last so that two disagreeing reads of
 /// one declaration can never be indexed against each other.
 fn typed_callee_carriers(c: &syn::ExprCall) -> Option<DeclaredCarriers> {
-    let admission = ambient_admission(&callee_path(c))?;
-    admission.carriers.filter(|carriers| carriers.params.len() == admission.arity)
+    // I0: STEERING ONLY (see [`ambient_admission`]) — a declared carrier is a
+    // CHECK on an argument, never a binding.
+    let callee = callee_path(c);
+    ADMISSION_FACETS.with(|slot| {
+        let borrow = slot.borrow();
+        let admission = borrow.as_ref()?.admitted(&callee)?;
+        admission
+            .carriers
+            .as_ref()
+            .filter(|carriers| carriers.params.len() == admission.arity)
+            .cloned()
+    })
+}
+
+fn has_typed_callee_carriers(c: &syn::ExprCall) -> bool {
+    let callee = callee_path(c);
+    ADMISSION_FACETS.with(|slot| {
+        slot.borrow().as_ref().and_then(|table| table.admitted(&callee)).is_some_and(|admission| {
+            admission
+                .carriers
+                .as_ref()
+                .is_some_and(|carriers| carriers.params.len() == admission.arity)
+        })
+    })
 }
 
 /// Collect the AMBIENT free variables of an atom — those that are operands of
@@ -7948,6 +11968,7 @@ fn typed_callee_carriers(c: &syn::ExprCall) -> Option<DeclaredCarriers> {
 fn collect_ambient_vars(e: &SynExpr, out: &mut Vec<String>) {
     match e {
         SynExpr::Paren(p) => collect_ambient_vars(&p.expr, out),
+        SynExpr::Cast(cast) => collect_ambient_vars(&cast.expr, out),
         SynExpr::Binary(b) => {
             collect_ambient_vars(&b.left, out);
             collect_ambient_vars(&b.right, out);
@@ -7956,7 +11977,7 @@ fn collect_ambient_vars(e: &SynExpr, out: &mut Vec<String>) {
         // THE ONE DIFFERENCE from `collect_vars`: a call whose callee declares
         // its own parameter carriers contributes NO ambient operands.
         SynExpr::Call(c) => {
-            if typed_callee_carriers(c).is_none() {
+            if !has_typed_callee_carriers(c) {
                 for arg in &c.args {
                     collect_ambient_vars(arg, out);
                 }
@@ -7972,15 +11993,7 @@ fn collect_ambient_vars(e: &SynExpr, out: &mut Vec<String>) {
         // structure to skip, so they reuse [`collect_vars`] verbatim — there is
         // exactly one implementation of "what names a variable", including its
         // `None`-constructor exclusion.
-        leaf => {
-            let mut names = Vec::new();
-            collect_vars(leaf, &mut names);
-            for v in names {
-                if !out.contains(&v) {
-                    out.push(v);
-                }
-            }
-        }
+        leaf => collect_vars(leaf, out),
     }
 }
 
@@ -8030,8 +12043,11 @@ fn common_var_domain(
             // steering only, merged fail-closed, and an admission without a
             // recorded domain contributes nothing. A PARAMETERED admission
             // cited bare is refused with the fix named. Bindings win over
-            // admissions, the same precedence as everywhere on this path.
-            if let Some(admission) = ambient_admission(v) {
+            // admissions, the same precedence as everywhere on this path —
+            // including I0's: a name the compiler records as a Rust binding of
+            // the specified function refuses here rather than being typed as a
+            // citation.
+            if let Some(admission) = ambient_bare_admission(v)? {
                 if admission.arity != 0 {
                     return Err(format!(
                         "admitted `{v}` has arity {} and must be applied (`{v}(…)`); a \
@@ -8093,6 +12109,8 @@ fn atom_call_result_domain(atom: &SynExpr) -> Result<Option<Domain>, String> {
     collect_ambient_calls(atom, &mut calls);
     let mut dom: Option<Domain> = None;
     for c in &calls {
+        // I0: STEERING ONLY (see [`ambient_admission`]) — this fixes the
+        // comparison's domain, and `elab_term` refuses a shadowed callee.
         let Some(admission) = ambient_admission(&callee_path(c)) else { continue };
         let declared = admission
             .return_domain().cloned()
@@ -8119,16 +12137,39 @@ fn atom_call_result_domain(atom: &SynExpr) -> Result<Option<Domain>, String> {
 /// same "check, never coerce" rule the argument positions get in [`elab_term`],
 /// applied to the relation carrier.
 ///
-/// This runs only on the two paths that did not exist before increment 8 (a
-/// variable-free atom and a recovered mixed-domain atom), so it can refuse
+/// The carrier half refuses only on paths that did not exist before increment 8 (a
+/// variable-free atom and a recovered mixed-domain atom, including the step-1
+/// domain [`step_one_result_carrier_conflict`] sends there), so it can refuse
 /// nothing that used to be accepted; on those paths it turns what would have
 /// been a downstream ill-typed goal into a named refusal at the clause.
+///
+/// EQUAL CARRIERS ARE NOT EQUAL DOMAINS (I0, TG15 open item 3). `BitVec 128`
+/// is the carrier of `u128` and of `i128`, so a carrier check alone passed
+/// `result >= 0` on a `u128 -> i128` kernel at step 1's `u128`, the parameter's
+/// UNSIGNED order over a signed result: a goal true of every input. A result
+/// domain the callee's mint recorded is the authority on how its value is read,
+/// so it is compared too, by reading ([`Domain::reads_like`]) rather than by
+/// name. Where the relation took its domain from the recorded results
+/// themselves ([`atom_call_result_domain`]) the two always agree.
+///
+/// A BARE call atom's own result is not compared by reading. Such an atom is
+/// no relation: [`atom_domain`] hands its domain to [`elab_term`] as the domain
+/// of the call's ARGUMENTS (`p(widen(flag), x)` read as `p(..) = true`), so a
+/// `bool` or `Option<iN>` result is not read at it. Comparing it refused a
+/// well-typed clause the carrier check had always accepted.
 fn check_ambient_call_result_carriers(atom: &SynExpr, dom: &Domain) -> Result<(), String> {
+    let mut bare = atom;
+    while let SynExpr::Paren(p) = bare {
+        bare = &p.expr;
+    }
+    let root = match bare {
+        SynExpr::Call(c) => Some(c),
+        _ => None,
+    };
     let mut calls = Vec::new();
     collect_ambient_calls(atom, &mut calls);
     for c in &calls {
-        let Some(carriers) = typed_callee_carriers(c) else { continue };
-        if carriers.ret != dom.carrier() {
+        if let Some(carriers) = typed_callee_carriers(c).filter(|cs| cs.ret != dom.carrier()) {
             return Err(format!(
                 "admitted `{}` declares its result at carrier `{}`, but the comparison is at \
                  carrier `{}` (`{}`); a clause is checked against the callee's declared type \
@@ -8139,8 +12180,96 @@ fn check_ambient_call_result_carriers(atom: &SynExpr, dom: &Domain) -> Result<()
                 dom.rust_name()
             ));
         }
+        if root.is_some_and(|r| std::ptr::eq(r, *c)) {
+            continue;
+        }
+        if let Some(declared) = call_ret_domain(c).filter(|d| !d.reads_like(dom)) {
+            return Err(format!(
+                "admitted `{}` returns a `{}` (carrier `{}`), but the comparison is at `{}` \
+                 (carrier `{}`); a clause is checked against the callee's declared result \
+                 domain, not only its carrier, and is never coerced to it",
+                callee_path(c),
+                declared.rust_name(),
+                declared.carrier().clean_name(),
+                dom.rust_name(),
+                dom.carrier().clean_name()
+            ));
+        }
     }
     Ok(())
+}
+
+/// Whether [`atom_domain`]'s step-1 domain `dom` is contradicted by a typed
+/// OPERAND of `atom`: `Some(refusal)` when an admitted call in an ambient
+/// position declares its result at a carrier other than `dom`'s, `None` when
+/// step 1 stands.
+///
+/// Step 1 types an atom by every variable in it, a typed call's arguments
+/// included. When such a call is an operand of the atom (a side of a
+/// comparison, or of arithmetic), what the relation compares is the call's
+/// RESULT, so a result carrier other than `dom`'s means the goal step 1 would
+/// build cannot typecheck (`Eq Bool` over two `UInt8` calls for
+/// `result == spec(a, b)` in a `bool, bool -> u8` function).
+///
+/// A BARE call atom is not tested: it is a proposition or a term in its own
+/// right (`f(x, 3)` read as `f(x, 3) = true`), not a relation over its result,
+/// and its callers hand step 1's domain to `elab_term` as the ARGUMENT domain,
+/// the fallback [`argument_domain`] gives a literal argument its siblings do
+/// not type.
+///
+/// An atom with a CAST anywhere in it ([`contains_cast`]) is not tested either.
+/// A cast gives the operand it wraps its target's carrier, so a call under one
+/// is not compared at its result carrier, and every such atom already has its
+/// own path: under [`ClauseMode::ProofLift`] the relation is built by
+/// [`elab_math_relation`], and in every other mode the cast is refused as
+/// `unsupported term shape`, a message kept to the byte. Testing it here would
+/// replace that refusal with a carrier refusal that names the wrong cause
+/// (`result as nat == nat_id(x as nat)` is not a comparison at `UInt64`).
+///
+/// Under [`ClauseMode::ProofLift`] (the E9 citation lane) the exemption is only
+/// for a cast in an AMBIENT position ([`contains_ambient_cast`]). A cast inside
+/// a typed call's ARGUMENT list is typed by that callee's declared parameter
+/// (the lift row of [`elab_term`]'s call arm), not by the relation, so it says
+/// nothing about the relation's carrier: `result == bucket_spec(x as nat)` on
+/// `fn bucket(x: u32) -> u8` relates two `UInt8` results, and keeping step 1's
+/// `UInt32` there built `@Eq UInt32` over them, the ill-typed goal TG15 is
+/// about. In every other mode a cast anywhere is refused, so the broad
+/// exemption stays and so does that refusal's text.
+fn step_one_result_carrier_conflict(atom: &SynExpr, dom: &Domain) -> Option<String> {
+    let mut bare = atom;
+    while let SynExpr::Paren(p) = bare {
+        bare = &p.expr;
+    }
+    let cast_exempt = if has_ambient_proof_lift() {
+        contains_ambient_cast(atom)
+    } else {
+        contains_cast(atom)
+    };
+    if matches!(bare, SynExpr::Call(_) | SynExpr::MethodCall(_)) || cast_exempt {
+        return None;
+    }
+    check_ambient_call_result_carriers(atom, dom).err()
+}
+
+/// Whether `e` carries a cast in an AMBIENT position: [`contains_cast`] with the
+/// walk of [`collect_ambient_calls`], so a cast inside the argument list of a
+/// call whose callee declares its own parameter carriers does not count (that
+/// callee's declaration types it).
+fn contains_ambient_cast(e: &SynExpr) -> bool {
+    match e {
+        SynExpr::Cast(_) => true,
+        SynExpr::Paren(p) => contains_ambient_cast(&p.expr),
+        SynExpr::Unary(u) => contains_ambient_cast(&u.expr),
+        SynExpr::Binary(b) => contains_ambient_cast(&b.left) || contains_ambient_cast(&b.right),
+        SynExpr::Call(c) => {
+            !has_typed_callee_carriers(c) && c.args.iter().any(contains_ambient_cast)
+        }
+        SynExpr::MethodCall(m) => {
+            contains_ambient_cast(&m.receiver) || m.args.iter().any(contains_ambient_cast)
+        }
+        SynExpr::Field(f) => contains_ambient_cast(&f.base),
+        _ => false,
+    }
 }
 
 /// The CALL expressions in an atom's ambient positions — the same walk as
@@ -8150,6 +12279,7 @@ fn check_ambient_call_result_carriers(atom: &SynExpr, dom: &Domain) -> Result<()
 fn collect_ambient_calls<'a>(e: &'a SynExpr, out: &mut Vec<&'a syn::ExprCall>) {
     match e {
         SynExpr::Paren(p) => collect_ambient_calls(&p.expr, out),
+        SynExpr::Cast(cast) => collect_ambient_calls(&cast.expr, out),
         SynExpr::Binary(b) => {
             collect_ambient_calls(&b.left, out);
             collect_ambient_calls(&b.right, out);
@@ -8157,7 +12287,7 @@ fn collect_ambient_calls<'a>(e: &'a SynExpr, out: &mut Vec<&'a syn::ExprCall>) {
         SynExpr::Unary(u) => collect_ambient_calls(&u.expr, out),
         SynExpr::Call(c) => {
             out.push(c);
-            if typed_callee_carriers(c).is_none() {
+            if !has_typed_callee_carriers(c) {
                 for arg in &c.args {
                     collect_ambient_calls(arg, out);
                 }
@@ -8216,15 +12346,56 @@ fn argument_domain(
     Ok(sibling_dom.unwrap_or_else(|| ambient.clone()))
 }
 
+/// The declared RESULT carrier of `arg` when it is (up to parentheses) a call
+/// whose callee records its carriers but whose result no declaration names a
+/// domain for: no recorded return domain, and a result carrier with more than
+/// one Rust preimage (`BitVec n`). `None` for every other term, including a
+/// typed call whose result domain IS determined, which keeps answering for
+/// itself through [`argument_domain`].
+///
+/// A CHECK value only (I0): [`elab_term`] compares it with the enclosing
+/// callee's declared parameter carrier, and it never becomes a [`Domain`].
+fn undetermined_call_result_carrier(arg: &SynExpr) -> Result<Option<Carrier>, String> {
+    let mut bare = arg;
+    while let SynExpr::Paren(p) = bare {
+        bare = &p.expr;
+    }
+    let SynExpr::Call(c) = bare else {
+        return Ok(None);
+    };
+    let Some(carriers) = typed_callee_carriers(c) else {
+        return Ok(None);
+    };
+    if atom_call_result_domain(bare)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(carriers.ret))
+}
+
+/// Format a `syn::Path` as `seg0::seg1::…` without allocating an intermediate
+/// `Vec<String>` of individual segments.
+fn path_spelling(path: &syn::Path) -> String {
+    if let Some(ident) = path.get_ident() {
+        return ident.to_string();
+    }
+    let mut out = String::new();
+    for (idx, seg) in path.segments.iter().enumerate() {
+        if idx > 0 {
+            out.push_str("::");
+        }
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{}", seg.ident);
+    }
+    out
+}
+
 /// The callee path of a call expression, exactly as the facet/admission table
 /// keys it (`min` or `cmp::min`). A non-path callee has no item identity and is
 /// reported as `<expression>`, which never matches an admission key — so it
 /// stays fail-closed.
 fn callee_path(c: &syn::ExprCall) -> String {
     match &*c.func {
-        SynExpr::Path(p) => {
-            p.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::")
-        }
+        SynExpr::Path(p) => path_spelling(&p.path),
         _ => "<expression>".to_string(),
     }
 }
@@ -8233,15 +12404,27 @@ fn callee_path(c: &syn::ExprCall) -> String {
 /// table, or `None` for an unadmitted callee / an admission that does not
 /// record one (see [`Admission::ret_domain`]).
 fn call_ret_domain(c: &syn::ExprCall) -> Option<Domain> {
-    ambient_admission(&callee_path(c)).and_then(|a| a.return_domain().cloned())
+    // I0: STEERING ONLY (see [`ambient_admission`]).
+    let callee = callee_path(c);
+    ADMISSION_FACETS.with(|slot| {
+        slot.borrow().as_ref()?.admitted(&callee)?.return_domain().cloned()
+    })
 }
 
 /// The `Option<iN>` payload width of a CALL whose callee is admitted with an
 /// [`Domain::OptionSigned`] return domain, else `None`.
+///
+/// Parentheses are looked through, as [`elab_option_term`] and
+/// [`option_constructor_form`] do: `(result) == Some(a)` is the same Option
+/// equality as `result == Some(a)`, and missing it typed the relation from the
+/// constructor's argument instead (TG15).
 fn call_option_ret_width(e: &SynExpr) -> Option<MachineSIntWidth> {
-    let SynExpr::Call(c) = e else { return None };
-    match call_ret_domain(c) {
-        Some(Domain::OptionSigned(width)) => Some(width),
+    match e {
+        SynExpr::Paren(p) => call_option_ret_width(&p.expr),
+        SynExpr::Call(c) => match call_ret_domain(c) {
+            Some(Domain::OptionSigned(width)) => Some(width),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -8253,7 +12436,7 @@ fn option_constructor_form(e: &SynExpr) -> bool {
     match e {
         SynExpr::Paren(p) => option_constructor_form(&p.expr),
         SynExpr::Path(p) => p.path.is_ident("None"),
-        SynExpr::Call(c) => callee_path(c) == "Some",
+        SynExpr::Call(c) => matches!(&*c.func, SynExpr::Path(p) if p.path.is_ident("Some")),
         _ => false,
     }
 }
@@ -8412,8 +12595,8 @@ fn elab_bool_term(
     var_domains: &BTreeMap<String, Domain>,
 ) -> Result<Expr, String> {
     let bool_dom = Domain::Bool;
-    let bool_op = |name: &str, args: Vec<Expr>| {
-        Expr::apps(Expr::const_(Name::from_string(name), vec![]), args)
+    let bool_op = |name: &'static str, args: Vec<Expr>| {
+        Expr::apps(Expr::const_(Name::interned(name), vec![]), args)
     };
     match e {
         SynExpr::Paren(p) => elab_bool_term(&p.expr, vars, offset, var_domains),
@@ -8523,6 +12706,35 @@ impl Admission {
     pub fn with_param_names(mut self, names: Vec<String>) -> Self {
         self.param_names = Some(names);
         self
+    }
+
+    /// Trust (ref-self I1): mark this import as minted over a SEMANTIC VIEW of
+    /// the extracted body rather than over the body, and restrict it to the
+    /// self-call position. See the two fields' docs.
+    ///
+    /// The two go together deliberately and there is no way to set one without
+    /// the other: a view import that could be CALLED from a clause would make
+    /// "the goal rests on a view" a whole-clause question instead of a
+    /// one-admission one, and the disclosure would have to be re-derived at
+    /// every reporting site.
+    #[must_use]
+    pub fn with_view(mut self, view: impl Into<String>) -> Self {
+        self.view = Some(view.into());
+        self.self_result_only = true;
+        self
+    }
+
+    /// The name of the semantic view this import was minted over, if any. The
+    /// compiler reads it to DISCLOSE; nothing here grades.
+    #[must_use]
+    pub fn view(&self) -> Option<&str> {
+        self.view.as_deref()
+    }
+
+    /// Whether this admission may be named only as the spliced self-call.
+    #[must_use]
+    pub fn is_self_result_only(&self) -> bool {
+        self.self_result_only
     }
 }
 
@@ -9307,6 +13519,26 @@ mod machine_domain_tests {
         );
     }
 
+    /// E6 expansion I0: the diagnostic lookup that names WHO holds a kernel
+    /// constant answers every recorded path of that mint and nothing else, and
+    /// is not gated on the facet record either.
+    #[test]
+    fn admission_paths_for_kernel_const_names_every_holder_and_only_them() {
+        let mut table = FacetTable::new();
+        table.admit("crate::a::b", Admission::reflected("trust_import_crate__a__b", 2));
+        table.admit("b", Admission::reflected("trust_import_crate__a__b", 2));
+        table.admit("crate::c", Admission::reflected("trust_import_crate__c", 2));
+        assert_eq!(
+            table.admission_paths_for_kernel_const("trust_import_crate__a__b"),
+            vec!["b", "crate::a::b"]
+        );
+        assert_eq!(
+            table.admission_paths_for_kernel_const("trust_import_crate__c"),
+            vec!["crate::c"]
+        );
+        assert!(table.admission_paths_for_kernel_const("trust_import_crate__d").is_empty());
+    }
+
     #[test]
     fn admit_constant_function_mints_a_kernel_checked_admission() {
         // `fn answer() -> u64 { 42 }`: the minimal E6 kernel-import. The kernel
@@ -9778,6 +14010,400 @@ mod machine_domain_tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // I0 — identifier shadowing (ref-self design §4.0)
+    // -------------------------------------------------------------------
+
+    /// The help line the compiler computes for a by-value struct parameter.
+    /// The elaborator never invents one; it only appends what it was handed.
+    const STRUCT_PARAM_HELP: &str = "`c: Cst` is a by-value struct parameter whose clause \
+         binders are its scalar fields; options: (1) name a scalar field (`c.degree`); \
+         (2) if you meant the island definition `c`, rename the parameter or the definition";
+
+    /// A kernel-checked (island-definition) status, built through the sealed
+    /// authority seam exactly as `admit_certified_island_definition` builds it.
+    fn island_status() -> trust_symbols::KernelStatus {
+        use trust_symbols::KernelAuthority as _;
+        trust_symbols::CicKernelRecheck::held_by_kernel_recheck().kernel_checked(
+            trust_symbols::TermDigest::of_bytes(b"i0-test-digest"),
+            trust_symbols::AxiomClosure::audited([]),
+        )
+    }
+
+    /// A table admitting `name` as a kernel-checked island definition.
+    fn island_table(name: &str, arity: usize) -> FacetTable {
+        let cert = || FacetStatus::Certified { evidence: "clean-island-kernel-definition".into() };
+        let mut t = FacetTable::new();
+        t.insert(
+            name,
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        t.admit(name, Admission::kernel_checked(name, arity, island_status()));
+        t
+    }
+
+    /// PINS THE TRUE RESOLUTION ORDER, which the ref-self design asserts and
+    /// this lane was asked to confirm: in `elab_term`'s Path arm the GOAL
+    /// BINDER is consulted before the ambient admission, so a clause variable
+    /// wins over a same-named `clean { def … }` island definition — with or
+    /// without I0's shadow map.
+    ///
+    /// This is the property the capture below is NOT a counterexample to: the
+    /// capture happens because a by-value struct / `&T` parameter contributes
+    /// no binder of its own name, not because an island def outranks a binder.
+    #[test]
+    fn a_goal_binder_resolves_before_a_same_named_island_definition() {
+        let mut env = Environment::with_prelude();
+        admit_constant_function(&mut env, "c", 80, MachineUIntWidth::U64).expect("constant admits");
+        let facets = island_table("c", 0).with_shadowed_idents([("c", STRUCT_PARAM_HELP)]);
+
+        let bound = elaborate_goal_typed_with_facets("c == 1", &[("c", "u64")], &facets)
+            .expect("a bound variable must stay elaborable under a same-named island definition");
+        let plain = elaborate_goal_typed("c == 1", &[("c", "u64")])
+            .expect("the no-facets elaboration is the reference");
+        let tc = clean_kernel::TypeChecker::new(&env);
+        assert!(
+            tc.is_def_eq(&bound, &plain),
+            "the binder must win: `c` is the ∀-bound variable, never the island constant \
+             (`c := 80` would make this `∀ c, 80 == 1`)"
+        );
+    }
+
+    /// THE DEFECT, pinned with the guard switched off. It is the ELABORATOR's
+    /// negative control, not the lane's mutation control: it shows the map is
+    /// what refuses the capture (empty map ⇒ capture returns), but it cannot
+    /// fail if the compiler stops INSTALLING the map, and it pins the empty-map
+    /// default as permissive — a future lane that makes the elaborator fail
+    /// closed with no map must delete it. The compiler-level control is
+    /// `tests/ui/trust/e9_signature_name_never_binds_an_admitted_item.rs`.
+    ///
+    /// A by-value struct parameter `c: Cst` contributes the rows `c.degree`,
+    /// `c.coeff` and no bare `c`, so the compiler hands the elaborator a
+    /// binding list without `c`; the bare `c` in the clause then falls through
+    /// to the admission table and a same-named island definition answers.
+    /// `c := 80`, so the certified goal reads `∀ result, result = 80` while the
+    /// clause text says "the parameter".
+    #[test]
+    fn without_the_shadow_map_a_bare_signature_name_is_captured_by_an_island_definition() {
+        let mut env = Environment::with_prelude();
+        admit_constant_function(&mut env, "c", 80, MachineUIntWidth::U64).expect("constant admits");
+        let facets = island_table("c", 0);
+
+        let captured =
+            elaborate_goal_typed_with_facets("result == c", &[("result", "u64")], &facets)
+                .expect("today's behaviour: the unbound bare name resolves to the island constant");
+        let literal = elaborate_goal_typed("result == 80", &[("result", "u64")])
+            .expect("the literal reading is the reference");
+        let tc = clean_kernel::TypeChecker::new(&env);
+        assert!(
+            tc.is_def_eq(&captured, &literal),
+            "the captured goal must be the island definition's VALUE — that is what makes \
+             this a capture and not a harmless alias"
+        );
+    }
+
+    /// I0 POSITIVE: with the compiler's shadow map installed, the same clause
+    /// is refused, and the refusal names the rule, the captured constant and
+    /// the compiler-computed options (v7/D3).
+    #[test]
+    fn a_signature_bound_name_with_no_clause_binder_refuses_the_island_definition() {
+        let facets = island_table("c", 0).with_shadowed_idents([("c", STRUCT_PARAM_HELP)]);
+        let err = elaborate_goal_typed_with_facets("result == c", &[("result", "u64")], &facets)
+            .expect_err("a signature-bound bare name must not resolve to an island definition");
+        assert!(err.contains("a clause names VALUES"), "{err}");
+        assert!(err.contains("`c`"), "{err}");
+        assert!(err.contains("bound by this function's signature"), "{err}");
+        assert!(err.contains("c.degree"), "the compiler's options must reach the author: {err}");
+    }
+
+    /// CLOSE NEGATIVE TWIN of the guard: the refusal must fire only where a
+    /// capture was possible. A shadowed name with NO admission behind it keeps
+    /// the ordinary exact-binding message it reports today, so I0 changes no
+    /// diagnostic for the (common) case of a clause that simply names something
+    /// it did not bind.
+    #[test]
+    fn a_shadowed_name_with_no_admission_keeps_its_ordinary_refusal() {
+        let facets = FacetTable::new().with_shadowed_idents([("c", STRUCT_PARAM_HELP)]);
+        let err = elaborate_goal_typed_with_facets("result == c", &[("result", "u64")], &facets)
+            .expect_err("`c` is bound by nothing the elaborator knows");
+        assert!(
+            err.contains("not exact") || err.contains("unbound variable"),
+            "the pre-I0 message must survive where there was nothing to capture: {err}"
+        );
+        assert!(
+            !err.contains("a clause names VALUES"),
+            "the capture refusal must not fire without an admission to capture: {err}"
+        );
+    }
+
+    /// I0 BARE ARM, on the route that is actually LIVE after round 1. The
+    /// island-definition half is already refused upstream of the elaborator by
+    /// `admit_clause_island_definitions` (round-1 commit f1e392382ce), but a
+    /// PROGRAM FUNCTION is admitted under its bare `spec_spellings` key with no
+    /// parameter-name filter at all, so `pub fn cap() -> u32` beside
+    /// `fn f(cap: C) -> u32 ensures result == cap` captures the bare name. The
+    /// control is the same table without the map.
+    #[test]
+    fn a_signature_bound_name_refuses_a_bare_program_function_admission() {
+        let unshadowed = admitted_table("cap", Admission::reflected("cap_def", 0));
+        elaborate_goal_typed_with_facets("result == cap", &[("result", "u64")], &unshadowed)
+            .expect("control: unshadowed, the bare program-function admission resolves");
+
+        let guarded = admitted_table("cap", Admission::reflected("cap_def", 0))
+            .with_shadowed_idents([("cap", STRUCT_PARAM_HELP)]);
+        let err = elaborate_goal_typed_with_facets("result == cap", &[("result", "u64")], &guarded)
+            .expect_err("a signature-bound bare name must not resolve to a program function");
+        assert!(err.contains("a clause names VALUES"), "{err}");
+        assert!(err.contains("cap_def"), "the captured constant must be named: {err}");
+    }
+
+    /// I0 CALL ARM: `limit(x)` with a parameter named `limit` is a call of that
+    /// binding in Rust, so it must not resolve to a same-named island
+    /// definition. The control is the same table without the map.
+    #[test]
+    fn a_call_of_a_signature_bound_name_refuses_a_same_named_island_definition() {
+        let help = "parameter `limit: &u32` has no scalar reading in this lane; options: \
+                    (1) pass the value by value; (2) rename the parameter or the definition";
+        let admitted = island_table("limit", 1);
+        let resolved = elaborate_goal_typed_with_facets(
+            "result == limit(x)",
+            &[("result", "u64"), ("x", "u64")],
+            &admitted,
+        );
+        assert!(resolved.is_ok(), "control: unshadowed, the island call resolves: {resolved:?}");
+
+        let guarded = admitted.with_shadowed_idents([("limit", help)]);
+        let err = elaborate_goal_typed_with_facets(
+            "result == limit(x)",
+            &[("result", "u64"), ("x", "u64")],
+            &guarded,
+        )
+        .expect_err("a call of a signature-bound name must not resolve to an island definition");
+        assert!(err.contains("is a call of that binding in Rust"), "{err}");
+        assert!(err.contains("rename the parameter"), "{err}");
+    }
+
+    /// The call guard is UNIFORM: a REFLECTED carrier (a Rust `fn` the
+    /// compiler projected into the kernel) is refused under a shadowed
+    /// spelling too. `tests/ui/trust/contract_inlined_call_scope_stays_closed.rs`
+    /// records why for the native lane — with a `shadow_id: fn(u64) -> u64`
+    /// parameter, expanding the module's `shadow_id` "would falsely turn the
+    /// postcondition into `result == x`" — and the citing lane must not be
+    /// looser than the native one about the same identifier.
+    #[test]
+    fn the_call_guard_refuses_a_shadowed_reflected_carrier_too() {
+        let unshadowed = admitted_table("helper", Admission::reflected("helper_def", 1));
+        elaborate_goal_typed_with_facets(
+            "result == helper(x)",
+            &[("result", "u64"), ("x", "u64")],
+            &unshadowed,
+        )
+        .expect("control: unshadowed, the program-function call resolves");
+
+        let guarded = admitted_table("helper", Admission::reflected("helper_def", 1))
+            .with_shadowed_idents([("helper", "`helper: fn(u64) -> u64` has no scalar reading")]);
+        let err = elaborate_goal_typed_with_facets(
+            "result == helper(x)",
+            &[("result", "u64"), ("x", "u64")],
+            &guarded,
+        )
+        .expect_err("a call of a signature-bound name is a call of the binding, not the item");
+        assert!(err.contains("is a call of that binding in Rust"), "{err}");
+    }
+
+    /// The uniform call guard's PRICE, measured rather than assumed: the
+    /// compiler's self identity is [`self_fn_spelling`]`(def_path)`, the
+    /// CANONICAL def-path `k::f`, and the shadow map holds the BARE names a
+    /// signature binds — so `fn f(f: u64)` in crate `k` keeps its E9 discharge,
+    /// and the guard costs the E9 lanes nothing. A caller that passes a BARE
+    /// self spelling and shadows it does lose that elaboration, which is the
+    /// fail-closed direction; exempting the self name unconditionally would
+    /// reopen the bare capture for `fn f(f: Cst) ensures result == f` beside
+    /// `clean { def f … }`.
+    #[test]
+    fn a_bare_self_spelling_that_a_parameter_shadows_refuses_while_the_canonical_one_does_not() {
+        // The compiler's own spelling for `fn f` of crate `k`.
+        assert_eq!(self_fn_spelling("k::f"), "k::f", "the E9 lanes key self by the def-path");
+
+        let canonical = admitted_table("k::f", Admission::reflected("f_def", 2))
+            .with_shadowed_idents([("f", "rename the parameter or the definition")]);
+        elaborate_ensures("result == x", &[("f", "u64"), ("x", "u64")], "k::f", &canonical).expect(
+            "a bare parameter name must not shadow the CANONICAL self spelling the E9 lanes use",
+        );
+
+        let bare = admitted_table("f", Admission::reflected("f_def", 2))
+            .with_shadowed_idents([("f", "rename the parameter or the definition")]);
+        let err = elaborate_ensures("result == x", &[("f", "u64"), ("x", "u64")], "f", &bare)
+            .expect_err("a BARE self spelling a parameter shadows fails closed");
+        assert!(err.contains("is a call of that binding in Rust"), "{err}");
+        assert!(err.contains("rename the parameter"), "{err}");
+    }
+
+    // -------------------------------------------------------------------
+    // ref-self I1 — the borrow-erased PARAMETER VIEW's two marks
+    // -------------------------------------------------------------------
+
+    /// The view of `impl Point { fn x_ref(&self) -> u32 { self.x } }` for
+    /// `Point { x: u32, y: u32 }`: the import is the two-parameter projection
+    /// `fun p0 p1 => p0` over the pointee's scalar field VALUES, recorded
+    /// under the clause-side names `self.x`, `self.y` and marked as a view.
+    fn view_table(env: &mut Environment, key: &str) -> FacetTable {
+        let u32d = Domain::Machine(MachineUIntWidth::U32);
+        let admission =
+            admit_projection_function(env, "trust_import_k__Point__x_ref", &[u32d.clone(), u32d], 0)
+                .expect("the view's projection mints")
+                .with_param_names(vec!["self.x".to_string(), "self.y".to_string()])
+                .with_view("frozen-shared-erased");
+        admitted_table(key, admission)
+    }
+
+    /// The POSITIVE half: in its own function's `ensures`, the view import is
+    /// exactly what `result` denotes, and the clause binds the pointee's
+    /// fields by their dotted names with no elaborator change at all.
+    #[test]
+    fn a_view_import_denotes_result_in_its_own_ensures() {
+        let mut env = Environment::with_prelude();
+        let facets = view_table(&mut env, "k::Point::x_ref");
+        let goal = elaborate_ensures(
+            "result == self.x",
+            &[("self.x", "u32"), ("self.y", "u32")],
+            "k::Point::x_ref",
+            &facets,
+        )
+        .expect("the self-call position is the one position a view import is for");
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let _ = tc.infer_type(&goal).expect("the goal must be well-typed");
+        assert!(
+            goal.to_string().contains("trust_import_k__Point__x_ref"),
+            "`result` must be the view's defining equation: {goal}"
+        );
+    }
+
+    /// **THE REGRESSION TWIN for `FacetTable::admitted`.** The compiler never
+    /// writes a certified `FnFacets` record for a `&self` function — its
+    /// borrow-bearing body is exactly what `facet_inference` refuses — so a
+    /// view import reaches `elaborate_ensures` through a table holding the
+    /// ADMISSION ALONE. Every other test here builds its table with
+    /// `admitted_table`, which inserts the record the compiler does not, and
+    /// that is what hid the defect this test pins (adversarial review 1,
+    /// blocking finding 1: "the increment's headline capability is dead").
+    #[test]
+    fn a_view_admission_with_no_facet_record_still_denotes_result() {
+        let mut env = Environment::with_prelude();
+        let u32d = Domain::Machine(MachineUIntWidth::U32);
+        let admission =
+            admit_projection_function(&mut env, "trust_import_k__Point__x_ref", &[u32d.clone(), u32d], 0)
+                .expect("the view's projection mints")
+                .with_param_names(vec!["self.x".to_string(), "self.y".to_string()])
+                .with_view("frozen-shared-erased");
+        // NO `insert` — this table holds no facet record at all, exactly like
+        // the one the compiler hands the elaborator for a `&self` function.
+        let mut facets = FacetTable::new();
+        facets.admit("k::Point::x_ref", admission);
+        assert!(facets.get("k::Point::x_ref").is_none(), "the premise: no record exists");
+        let goal = elaborate_ensures(
+            "result == self.x",
+            &[("self.x", "u32"), ("self.y", "u32")],
+            "k::Point::x_ref",
+            &facets,
+        )
+        .expect("a view admission carries its own isolated certification");
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let _ = tc.infer_type(&goal).expect("the goal must be well-typed");
+    }
+
+    /// The MUTATION CONTROL for the exemption above: an ORDINARY admission with
+    /// no facet record still fails closed. The bypass is keyed on the view
+    /// mark, not on "an admission exists".
+    #[test]
+    fn m_an_ordinary_admission_with_no_facet_record_still_fails_closed() {
+        let mut facets = FacetTable::new();
+        facets.admit("k::f", Admission::reflected("f_def", 1));
+        let err = elaborate_ensures("result == x", &[("x", "u64")], "k::f", &facets)
+            .expect_err("no record, no admission");
+        assert!(err.contains(SELF_NOT_E6_ADMITTED_REFUSAL_HEAD), "{err}");
+    }
+
+    /// The NEGATIVE twin the mark exists for: another function's clause calling
+    /// the view import. Its arity is the FLATTENED one, so `x_ref(a, b)` would
+    /// elaborate against a signature no Rust caller can write — rustc does not
+    /// type-check clause text, so nothing else catches it.
+    #[test]
+    fn n_a_view_import_is_not_callable_from_another_functions_clause() {
+        let mut env = Environment::with_prelude();
+        let facets = view_table(&mut env, "x_ref");
+        let err = elaborate_ensures(
+            "x_ref(a, b) == 1",
+            &[("a", "u32"), ("b", "u32")],
+            "k::other",
+            &facets,
+        )
+        .expect_err("a view import must not be callable from a clause");
+        assert!(err.contains("borrow-erased PARAMETER VIEW"), "{err}");
+        assert!(err.contains("frozen-shared-erased"), "the marker must be named: {err}");
+        assert!(err.contains("options:"), "v7/D3 requires options: {err}");
+    }
+
+    /// …and from a position with no self spelling at all (the bare goal
+    /// elaborator), which is the fail-closed default.
+    #[test]
+    fn n_a_view_import_is_not_callable_where_no_self_spelling_is_installed() {
+        let mut env = Environment::with_prelude();
+        let facets = view_table(&mut env, "x_ref");
+        let err = elaborate_goal_typed_with_facets(
+            "x_ref(a, b) == 1",
+            &[("a", "u32"), ("b", "u32")],
+            &facets,
+        )
+        .expect_err("with no self key installed a view import is unnameable");
+        assert!(err.contains("borrow-erased PARAMETER VIEW"), "{err}");
+    }
+
+    /// …and in the BARE position, structurally rather than incidentally. A view
+    /// always has at least one binder today, so the `arity >= 1` bare-name
+    /// refusal would catch this anyway; the two facts are coupled only by
+    /// argument unless the mark itself refuses here.
+    #[test]
+    fn n_a_view_import_is_not_nameable_bare() {
+        let mut env = Environment::with_prelude();
+        let facets = view_table(&mut env, "x_ref");
+        let err = elaborate_goal_typed_with_facets("x_ref == 1", &[("a", "u32")], &facets)
+            .expect_err("a bare view name is unnameable");
+        assert!(err.contains("borrow-erased PARAMETER VIEW"), "{err}");
+    }
+
+    /// THE MUTATION CONTROL for the mark. The SAME admission without
+    /// `with_view` elaborates the same call — so what refuses above is the
+    /// mark, not the arity, the carriers or the name.
+    #[test]
+    fn m_without_the_view_mark_the_same_call_elaborates() {
+        let mut env = Environment::with_prelude();
+        let u32d = Domain::Machine(MachineUIntWidth::U32);
+        let admission = admit_projection_function(
+            &mut env,
+            "trust_import_k__Point__x_ref",
+            &[u32d.clone(), u32d],
+            0,
+        )
+        .expect("the projection mints")
+        .with_param_names(vec!["self.x".to_string(), "self.y".to_string()]);
+        assert!(!admission.is_self_result_only(), "the mark is opt-in");
+        assert_eq!(admission.view(), None);
+        let facets = admitted_table("x_ref", admission);
+        elaborate_ensures("x_ref(a, b) == 1", &[("a", "u32"), ("b", "u32")], "k::other", &facets)
+            .expect("an UNMARKED import of the same shape is callable");
+    }
+
+    /// `with_view` sets BOTH marks: there is no way to record a view that is
+    /// still callable, which is what makes "does this goal rest on a view"
+    /// decidable from the self admission alone.
+    #[test]
+    fn the_view_mark_implies_self_result_only() {
+        let admission = Admission::reflected("c", 1).with_view("frozen-shared-erased");
+        assert_eq!(admission.view(), Some("frozen-shared-erased"));
+        assert!(admission.is_self_result_only());
+    }
+
     /// A parametered admission cited bare keeps failing closed — its bare name
     /// is a function value, outside the term fragment — and the refusal names
     /// the fix (v7/D3). An unadmitted bare identifier still fails the
@@ -9886,6 +14512,17 @@ mod machine_domain_tests {
                 .contains("E6-admitted"),
             "un-admitted self-fn must fail closed"
         );
+        // The diagnostic recogniser names exactly THAT refusal — and no other:
+        // the citation sweep uses it to decide whether to explain which E6
+        // facet or body shape kept the function out of the import.
+        assert!(is_self_not_e6_admitted_refusal(
+            &elaborate_ensures("result >= x", params, "not_admitted", &facets).unwrap_err()
+        ));
+        // Negative twin: a DIFFERENT fail-closed refusal of the same entry
+        // point (an un-admitted CALLEE in a result-free clause) is not it.
+        let callee_refusal =
+            elaborate_ensures("not_admitted(x) >= x", params, "not_admitted", &facets).unwrap_err();
+        assert!(!is_self_not_e6_admitted_refusal(&callee_refusal), "{callee_refusal}");
 
         // A clause that uses a SUBSET of the parameters elaborates over just
         // those (the exact-binding gate is satisfied on the used vars) — a
@@ -10636,6 +15273,82 @@ mod machine_domain_tests {
         assert!(tc.is_def_eq(&app(5, 3), &n(3)), "cap(5, 3) = 3 -- coeff is under the degree");
     }
 
+    /// A BitVec literal is a typed constructor, not the native reducer's old
+    /// untyped Nat payload. Exercise the signed select with genuine carrier
+    /// terms, and ask the kernel to check proofs of the result rather than
+    /// granting the refused constructor fold authority in the fixture.
+    #[test]
+    fn typed_signed_bitvec_values_preserve_kernel_and_counterexample_controls() {
+        for width in [MachineSIntWidth::I64, MachineSIntWidth::I128] {
+            let d = Domain::Signed(width);
+            let mut env = Environment::with_prelude();
+            assert!(matches!(
+                env.native_fold_verdict(&Name::from_string("BitVec.ofNat")),
+                Err(clean_kernel::env::FoldRefusal::ReviewRefused { .. })
+            ));
+            for (name, then_param, else_param) in [("typed_min", 0, 1), ("typed_max", 1, 0)] {
+                admit_select_function(
+                    &mut env,
+                    name,
+                    &[d.clone(), d.clone()],
+                    SelectCmp::Lt,
+                    0,
+                    1,
+                    then_param,
+                    else_param,
+                )
+                .expect("typed signed select must admit");
+            }
+            let tc = clean_kernel::TypeChecker::new(&env);
+            let ty = d.ty();
+            let three = d.numeral(3).unwrap();
+            tc.check_type(&three, &ty).expect("literal has the genuine BitVec carrier");
+            assert!(tc.check_type(&kernel_nat_lit(3), &ty).is_err(), "raw Nat is not BitVec");
+            assert!(!tc.is_def_eq(&three, &kernel_nat_lit(3)), "refused payload collapse stays refused");
+            assert!(tc.is_def_eq(&d.bitvec_to_nat(three).unwrap(), &kernel_nat_lit(3)));
+
+            let one = d.numeral(1).unwrap();
+            let minus_one = d.negative_numeral(1).unwrap();
+            let app = |name: &str, a: Expr, b: Expr| {
+                Expr::apps(Expr::const_(Name::from_string(name), vec![]), [a, b])
+            };
+            let equation = |lhs: Expr, rhs: Expr| {
+                Expr::apps(
+                    Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
+                    [ty.clone(), lhs, rhs],
+                )
+            };
+            let refl = |value: Expr| {
+                Expr::apps(
+                    Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
+                    [ty.clone(), value],
+                )
+            };
+            let min = app("typed_min", minus_one.clone(), one.clone());
+            let max = app("typed_max", minus_one.clone(), one.clone());
+            for (actual, expected) in [(min.clone(), minus_one.clone()), (max.clone(), one.clone())] {
+                tc.check_type(&actual, &ty).expect("actual select result is well-typed");
+                let goal = equation(actual, expected.clone());
+                tc.check_type(&goal, &Expr::prop()).expect("the exact result goal is a proposition");
+                tc.check_type(&refl(expected), &goal).expect("kernel checks the signed result");
+            }
+            for (actual, wrong) in [(min.clone(), one), (max, minus_one)] {
+                let goal = equation(actual, wrong.clone());
+                tc.check_type(&goal, &Expr::prop()).expect("counterexample goal is well-typed");
+                assert!(tc.check_type(&refl(wrong), &goal).is_err(), "wrong signed result is rejected");
+            }
+            if width == MachineSIntWidth::I128 {
+                let truncated = d.bitvec_of_nat(kernel_nat_lit(u128::from(u64::MAX))).unwrap();
+                let goal = equation(min, truncated.clone());
+                tc.check_type(&goal, &Expr::prop()).expect("truncated-pattern goal is well-typed");
+                assert!(tc.check_type(&refl(truncated), &goal).is_err(), "64-bit truncation is not -1 at 128 bits");
+                let narrow = Domain::Signed(MachineSIntWidth::I64).negative_numeral(1).unwrap();
+                let wrong_width = app("typed_min", narrow, d.numeral(1).unwrap());
+                assert!(tc.check_type(&wrong_width, &ty).is_err(), "mixed-width arguments are rejected");
+            }
+        }
+    }
+
     /// E6 widening increment 4: the SIGNED select mint. The semantic teeth are
     /// the mixed-sign rows — under the UNSIGNED reading `-1` is `2^64 - 1`, so
     /// `min2(-1, 1)` would reduce to `1`; the sign-flip keys must give `-1`.
@@ -10700,25 +15413,35 @@ mod machine_domain_tests {
         );
 
         let tc = clean_kernel::TypeChecker::new(&env);
-        // Concrete values as RAW Nat literals — the kernel's own canonical
-        // BitVec value form (see the BitVec native reducers: `BitVec.ofNat`
-        // COLLAPSES to the raw literal, and `BitVec.toNat`/comparisons fire on
-        // it, whereas a projection on the wrapped `ofNat` spelling parks).
-        // The first row pins that the two spellings coincide definitionally,
-        // so every later row is also evidence about the `ofNat` form.
-        let p = |v: u64| kernel_nat_lit(u128::from(v));
+        // Genuine BitVec inputs: the pinned kernel refuses the old native
+        // ofNat-to-raw-Nat collapse because it changes the carrier. Observe
+        // the exact numeric payload through the reviewed toNat projection;
+        // keep every select result at BitVec64, not at an ill-typed Nat.
+        let bits = |pattern: u128| i.bitvec_of_nat(kernel_nat_lit(pattern)).unwrap();
+        let p = |v: u64| i.numeral(u128::from(v)).unwrap();
         // Negative value -v as its two's-complement 64-bit pattern.
-        let m = |v: u64| kernel_nat_lit(0u128.wrapping_sub(u128::from(v)) & bit_mask(64));
+        let m = |v: u64| i.negative_numeral(u128::from(v)).unwrap();
+        tc.check_type(&p(3), &i.ty()).expect("the positive numeral has its carrier type");
+        tc.check_type(&m(1), &i.ty()).expect("the negative numeral has its carrier type");
+        tc.check_type(&kernel_nat_lit(3), &i.ty())
+            .expect_err("a raw Nat is not a typed BitVec argument");
         assert!(
-            tc.is_def_eq(&i.numeral(3).unwrap(), &p(3)),
-            "BitVec.ofNat 64 3 is definitionally the raw literal 3"
+            tc.is_def_eq(&i.bitvec_to_nat(i.numeral(3).unwrap()).unwrap(), &kernel_nat_lit(3)),
+            "the typed BitVec64 literal has the exact Nat payload 3"
         );
         assert!(
-            tc.is_def_eq(&i.negative_numeral(1).unwrap(), &m(1)),
-            "the negative_numeral embedding is definitionally its bit pattern"
+            tc.is_def_eq(&i.negative_numeral(1).unwrap(), &bits(u128::from(u64::MAX))),
+            "the negative_numeral embedding has the exact typed bit pattern"
+        );
+        assert!(
+            tc.is_def_eq(&i.bitvec_to_nat(m(1)).unwrap(), &kernel_nat_lit(u128::from(u64::MAX))),
+            "BitVec.toNat of the production negative numeral is its exact 64-bit pattern"
         );
         let app2 = |f: &str, a: Expr, b: Expr| {
-            Expr::apps(Expr::const_(Name::from_string(f), vec![]), [a, b])
+            let application = Expr::apps(Expr::const_(Name::from_string(f), vec![]), [a, b]);
+            tc.check_type(&application, &i.ty())
+                .unwrap_or_else(|e| panic!("{f} must be a well-typed carrier application: {e:?}"));
+            application
         };
         // Same-sign rows (any order encoding passes these).
         assert!(tc.is_def_eq(&app2("smin2_def", p(3), p(5)), &p(3)), "min2(3,5) = 3");
@@ -10732,7 +15455,8 @@ mod machine_domain_tests {
         assert!(tc.is_def_eq(&app2("smin2_def", m(3), m(1)), &m(3)), "min2(-3,-1) = -3");
         // i64::MIN vs 0 — the exact divergence the natural BitVec spelling
         // would have minted: unsigned order calls MIN the LARGER value.
-        let min64 = kernel_nat_lit(1u128 << 63);
+        let min64 = i.negative_numeral(1u128 << 63).unwrap();
+        assert!(tc.is_def_eq(&min64, &bits(1u128 << 63)), "the typed i64 minimum has its exact bit pattern");
         assert!(
             tc.is_def_eq(&app2("smin2_def", min64.clone(), p(0)), &min64),
             "min2(i64::MIN, 0) = i64::MIN"
@@ -10817,22 +15541,25 @@ mod machine_domain_tests {
         let btrue = Expr::const_(Name::from_string("Bool.true"), vec![]);
         let bfalse = Expr::const_(Name::from_string("Bool.false"), vec![]);
         let app2 = |f: &str, a: Expr, b: Expr| {
-            Expr::apps(Expr::const_(Name::from_string(f), vec![]), [a, b])
+            let application = Expr::apps(Expr::const_(Name::from_string(f), vec![]), [a, b]);
+            tc.check_type(&application, &Expr::const_str("Bool"))
+                .unwrap_or_else(|e| panic!("{f} must be a well-typed Bool application: {e:?}"));
+            application
         };
         // u64 rows: UInt64 values are the carrier's own numerals.
         let un = |v: u64| u.numeral(u128::from(v)).unwrap();
         assert!(tc.is_def_eq(&app2("ule_def", un(3), un(5)), &btrue), "u64: 3 <= 5");
         assert!(tc.is_def_eq(&app2("ule_def", un(5), un(3)), &bfalse), "u64: !(5 <= 3)");
-        // i64 rows: raw Nat literals are the kernel-canonical BitVec form
-        // (see the signed select test above for why).
-        let p = |v: u64| kernel_nat_lit(u128::from(v));
-        let m = |v: u64| kernel_nat_lit(0u128.wrapping_sub(u128::from(v)) & bit_mask(64));
+        // Signed rows use actual typed BitVec arguments, and the helper
+        // checks every application before examining its Bool result.
+        let p = |v: u64| i.numeral(u128::from(v)).unwrap();
+        let m = |v: u64| i.negative_numeral(u128::from(v)).unwrap();
         assert!(tc.is_def_eq(&app2("sle_def", p(3), p(5)), &btrue), "i64: 3 <= 5");
         assert!(tc.is_def_eq(&app2("sle_def", p(5), p(3)), &bfalse), "i64: !(5 <= 3)");
         // MIXED-SIGN rows.
         assert!(tc.is_def_eq(&app2("sle_def", m(1), p(1)), &btrue), "i64: -1 <= 1");
         assert!(tc.is_def_eq(&app2("sle_def", p(1), m(1)), &bfalse), "i64: !(1 <= -1)");
-        let min64 = kernel_nat_lit(1u128 << 63);
+        let min64 = i.negative_numeral(1u128 << 63).unwrap();
         assert!(tc.is_def_eq(&app2("sle_def", min64, p(0)), &btrue), "i64: MIN <= 0");
         // Eq rows (small magnitudes; see the decEq tower note above).
         assert!(tc.is_def_eq(&app2("seq_def", p(3), p(3)), &btrue), "i64: 3 == 3");
@@ -11049,47 +15776,53 @@ mod machine_domain_tests {
         let btrue = Expr::const_(Name::from_string("Bool.true"), vec![]);
         let bfalse = Expr::const_(Name::from_string("Bool.false"), vec![]);
         let app2 = |f: &str, a: Expr, b: Expr| {
-            Expr::apps(Expr::const_(Name::from_string(f), vec![]), [a, b])
+            let application = Expr::apps(Expr::const_(Name::from_string(f), vec![]), [a, b]);
+            let result_type = if f == "wle_def" { Expr::const_str("Bool") } else { d.ty() };
+            tc.check_type(&application, &result_type)
+                .unwrap_or_else(|e| panic!("{f} must be a well-typed application: {e:?}"));
+            application
         };
-        // Concrete values as RAW Nat literals — the kernel's canonical BitVec
-        // value form, the same convention the i64 rows above use.
-        let v = |x: i128| kernel_nat_lit(x as u128);
+        // A real BitVec128 constructor contains the exact two's-complement
+        // pattern. A raw Nat is not its carrier; the refused native collapse
+        // must not be required for a semantic test to reach its signed rows.
+        let bits = |pattern: u128| d.bitvec_of_nat(kernel_nat_lit(pattern)).unwrap();
+        let v = |x: i128| {
+            if x >= 0 {
+                d.numeral(x as u128).unwrap()
+            } else {
+                d.negative_numeral(x.unsigned_abs()).unwrap()
+            }
+        };
+        tc.check_type(&v(3), &d.ty()).expect("the numeral has its BitVec 128 carrier type");
+        tc.check_type(&kernel_nat_lit(3), &d.ty())
+            .expect_err("a raw Nat is not a typed BitVec 128 argument");
         assert!(
-            tc.is_def_eq(&d.numeral(3).unwrap(), &v(3)),
-            "BitVec.ofNat 128 3 is definitionally the raw literal 3"
+            tc.is_def_eq(&d.bitvec_to_nat(d.numeral(3).unwrap()).unwrap(), &kernel_nat_lit(3)),
+            "the typed BitVec128 literal has the exact Nat payload 3"
         );
         assert!(tc.is_def_eq(&app2("wle_def", v(3), v(5)), &btrue), "i128: 3 <= 5");
         assert!(tc.is_def_eq(&app2("wle_def", v(5), v(3)), &bfalse), "i128: !(5 <= 3)");
         assert!(tc.is_def_eq(&app2("wmin_def", v(3), v(5)), &v(3)), "i128: min2(3, 5) = 3");
 
-        // MULTI-LIMB NUMERAL COLLAPSE, now positive evidence. The kernel's
-        // `BitVec.ofNat` reducer reads its value at arbitrary magnitude
-        // (`0 ≤ N < 2^128`, bare literal or OfNat-wrapped) and emits a
-        // multi-limb payload, so `BitVec.ofNat 128 pattern ≡ pattern` holds for
-        // every i128 bit pattern — including the multi-limb negative ones.
-        // These rows pin the collapse at the three boundary patterns:
-        // i64::MIN's 128-bit pattern (2^128 − 2^63), i64::MAX, and i128::MIN.
+        assert!(tc.is_def_eq(&d.negative_numeral(1u128 << 63).unwrap(), &bits(i128::from(i64::MIN) as u128)));
+        assert!(tc.is_def_eq(&d.numeral(i64::MAX as u128).unwrap(), &bits(i64::MAX as u128)));
+        assert!(tc.is_def_eq(&d.negative_numeral(1u128 << 127).unwrap(), &bits(1u128 << 127)));
+        // Observe every multi-limb embedding through its typed toNat
+        // projection, retaining all three original boundary patterns.
+        for (value, pattern) in [
+            (d.negative_numeral(1u128 << 63).unwrap(), i128::from(i64::MIN) as u128),
+            (d.numeral(i64::MAX as u128).unwrap(), i64::MAX as u128),
+            (d.negative_numeral(1u128 << 127).unwrap(), i128::MIN as u128),
+        ] {
+            tc.check_type(&value, &d.ty()).expect("a checked multi-limb carrier value");
+            assert!(
+                tc.is_def_eq(&d.bitvec_to_nat(value).unwrap(), &kernel_nat_lit(pattern)),
+                "the typed boundary numeral must project to {pattern}"
+            );
+        }
         assert!(
-            tc.is_def_eq(&d.negative_numeral(1u128 << 63).unwrap(), &v(i128::from(i64::MIN))),
-            "BitVec.ofNat 128 (2^128 − 2^63) collapses to the raw multi-limb pattern"
-        );
-        assert!(
-            tc.is_def_eq(&d.numeral(i64::MAX as u128).unwrap(), &v(i128::from(i64::MAX))),
-            "BitVec.ofNat 128 i64::MAX collapses to the raw literal"
-        );
-        assert!(
-            tc.is_def_eq(&d.negative_numeral(1u128 << 127).unwrap(), &v(i128::MIN)),
-            "BitVec.ofNat 128 (2^127) — i128::MIN's pattern — collapses multi-limb"
-        );
-
-        // `BitVec.toNat` NOW REDUCES at every magnitude (the former limit was
-        // pinned here and fired when the reducer grew multi-limb support plus
-        // the structural `ofNat` peel — this block is the same-commit answer
-        // its message demanded). First the identity itself, at the pattern
-        // that used to park:
-        assert!(
-            tc.is_def_eq(&d.bitvec_to_nat(v(-1)).unwrap(), &v(-1)),
-            "BitVec.toNat of a multi-limb payload is the payload"
+            tc.is_def_eq(&d.bitvec_to_nat(v(-1)).unwrap(), &kernel_nat_lit(u128::MAX)),
+            "BitVec.toNat of the typed all-ones value is the multi-limb payload"
         );
         // …and the MIXED-SIGN COMPARISON rows at i128, previously impossible
         // because the order key routes through `toNat`: negative < positive,
@@ -11138,6 +15871,56 @@ mod machine_domain_tests {
             ),
         );
         assert_eq!(goal, expected_goal, "the i128 clause drifted from the mint's order key");
+    }
+
+    /// v7/D3 for the measured `spec::first` refusal (alab-rust probes p4/p5,
+    /// 2026-09-16): an island definition admitted under its bare Clean name,
+    /// cited through a Rust module path, STAYS refused — and now says that the
+    /// spelling is the problem, with options.
+    #[test]
+    fn a_module_qualified_island_spelling_stays_refused_and_names_the_bare_clean_name() {
+        use trust_symbols::KernelAuthority as _;
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let admissible =
+            || FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() };
+        let vt: &[(&str, &str)] = &[("a", "u64"), ("b", "u64")];
+        let kernel_checked = trust_symbols::CicKernelRecheck::held_by_kernel_recheck()
+            .kernel_checked(
+                trust_symbols::TermDigest::of_bytes(b"def first (a b : UInt64) : UInt64 := a"),
+                trust_symbols::AxiomClosure::audited([]),
+            );
+
+        let mut t = FacetTable::new();
+        t.insert("first", admissible());
+        t.admit("first", Admission::kernel_checked("first", 2, kernel_checked));
+
+        // POSITIVE: the refusal is kept verbatim, and the hint follows it.
+        let err = elaborate_goal_typed_with_facets("spec::first(a, b) <= a", vt, &t).unwrap_err();
+        assert!(err.contains("no diagnostic E6 facet record exists for `spec::first`"), "{err}");
+        assert!(err.contains("under the bare Clean name `first`"), "{err}");
+        assert!(err.contains("options: (1)") && err.contains("(2)"), "{err}");
+        assert!(err.contains("write `first(..)`"), "{err}");
+
+        // CLOSE NEGATIVE TWIN 1: the bare name under the qualified spelling is
+        // a REFLECTED Rust carrier, not an island definition. No hint — telling
+        // the author to write `cap(..)` would retarget the clause to a
+        // different item's admission.
+        let mut reflected = FacetTable::new();
+        reflected.insert("cap", admissible());
+        reflected.admit("cap", Admission::reflected("cap_const", 1));
+        let vx: &[(&str, &str)] = &[("x", "u64")];
+        let err =
+            elaborate_goal_typed_with_facets("other::cap(x) <= x", vx, &reflected).unwrap_err();
+        assert!(err.contains("no diagnostic E6 facet record exists for `other::cap`"), "{err}");
+        assert!(!err.contains("bare Clean name"), "{err}");
+
+        // CLOSE NEGATIVE TWIN 2: nothing at all under the bare name.
+        let err = elaborate_goal_typed_with_facets("spec::absent(a, b) <= a", vt, &t).unwrap_err();
+        assert!(!err.contains("bare Clean name"), "{err}");
+
+        // CONTROL: the hint is wording only. The qualified spelling must not
+        // have started elaborating through the bare admission.
+        assert!(elaborate_goal_typed_with_facets("spec::first(a, b) <= a", vt, &t).is_err());
     }
 
     #[test]
@@ -11464,6 +16247,796 @@ mod machine_domain_tests {
         let err = elaborate_goal_typed_with_facets("eq_ok(m, t)", vt, &t_ragged)
             .expect_err("a ragged carrier record must not admit a mixed-width call");
         assert!(err.contains("mixed domains in one comparison"), "{err}");
+    }
+
+    /// Mint each `(name, params, ret, body)` through the E6 tree mint the
+    /// compiler uses for an `if`/`&&` body, under kernel constant `<name>_def`,
+    /// and admit it with all four facets certified.
+    fn tree_minted_table(
+        env: &mut Environment,
+        fns: &[(&str, &[Domain], &Domain, &E6TreeTerm)],
+    ) -> FacetTable {
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let mut t = FacetTable::new();
+        for (name, params, ret, body) in fns {
+            let adm = admit_e6_tree_function(env, &format!("{name}_def"), params, ret, body)
+                .unwrap_or_else(|e| panic!("the E6 tree mint must admit `{name}`: {e}"));
+            assert_eq!(
+                adm.carriers,
+                Some(DeclaredCarriers::of_domains(params, ret)),
+                "the tree mint must record the telescope it handed the kernel"
+            );
+            t.insert(
+                *name,
+                FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+            );
+            t.admit(*name, adm);
+        }
+        t
+    }
+
+    /// The RELATION carrier of `result == spec(..)` is the carrier the two
+    /// typed calls RETURN, never the one their arguments share.
+    ///
+    /// The shape is aterm's `fn cursor(has: bool, fresh: bool, same: bool,
+    /// continues: bool) -> u8` with `ensures result == spec_cursor(..) by
+    /// cursor_is_exact` (Trust build 16387): every variable of the clause is a
+    /// `bool`, so the first rule of `atom_domain` built `Eq Bool` over two
+    /// `UInt8` terms, the kernel refused the goal as ill-typed and the citation
+    /// was graded outside the fragment. Each positive row below is a goal that
+    /// must TYPECHECK at the result's carrier and close by definitional equality
+    /// against a mint of the same body, and must NOT close against a mint of a
+    /// different one: a well-typed goal that anything proves would pin nothing.
+    #[test]
+    fn a_relation_between_typed_calls_takes_their_result_carrier_not_their_arguments() {
+        use E6TreeTerm as T;
+        let bool_d = Domain::Bool;
+        let u8_d = Domain::Machine(MachineUIntWidth::U8);
+        let u16_d = Domain::Machine(MachineUIntWidth::U16);
+        let i32_d = Domain::Signed(MachineSIntWidth::I32);
+        let b = |t: T| Box::new(t);
+        let both = T::Ite {
+            cond: b(T::And(b(T::Param(0)), b(T::Param(1)))),
+            then: b(T::Int(1)),
+            els: b(T::Int(0)),
+        };
+        let neither = T::Ite {
+            cond: b(T::And(b(T::Param(0)), b(T::Param(1)))),
+            then: b(T::Int(0)),
+            els: b(T::Int(1)),
+        };
+        let cmp = |op, domain: &Domain, lit: i128| T::Cmp {
+            op,
+            domain: domain.clone(),
+            left: b(T::Param(0)),
+            right: b(T::Int(lit)),
+        };
+        let pick = |c: T, then: i128, els: i128| T::Ite {
+            cond: b(c),
+            then: b(T::Int(then)),
+            els: b(T::Int(els)),
+        };
+        let one_u8 = pick(cmp(E6TreeCmp::Eq, &u8_d, 1), 7, 9);
+        let other_u8 = pick(cmp(E6TreeCmp::Eq, &u8_d, 1), 9, 7);
+        let neg_i32 = pick(cmp(E6TreeCmp::Lt, &i32_d, 0), 1, 0);
+        let pos_i32 = pick(cmp(E6TreeCmp::Lt, &i32_d, 0), 0, 1);
+        let gate = T::Ite { cond: b(T::Param(0)), then: b(T::Param(1)), els: b(T::Int(0)) };
+        let other_gate = T::Ite { cond: b(T::Param(0)), then: b(T::Int(0)), els: b(T::Param(1)) };
+        let eq_u8 = T::Cmp {
+            op: E6TreeCmp::Eq,
+            domain: u8_d.clone(),
+            left: b(T::Param(0)),
+            right: b(T::Param(1)),
+        };
+        let ne_u8 = T::Cmp {
+            op: E6TreeCmp::Ne,
+            domain: u8_d.clone(),
+            left: b(T::Param(0)),
+            right: b(T::Param(1)),
+        };
+
+        type Row<'a> = (&'a str, &'a [(&'a str, &'a str)], Vec<Domain>, Domain, &'a T, &'a T);
+        let rows: [Row<'_>; 5] = [
+            // THE FAILING SHAPE: uniform `bool` parameters, a `u8` result.
+            (
+                "result == spec(a, b)",
+                &[("a", "bool"), ("b", "bool")],
+                vec![bool_d.clone(), bool_d.clone()],
+                u8_d.clone(),
+                &both,
+                &neither,
+            ),
+            // The same bug at two machine widths: `u8` parameter, `u16` result.
+            ("result == spec(a)", &[("a", "u8")], vec![u8_d.clone()], u16_d.clone(), &one_u8, &other_u8),
+            // Signed parameter, unsigned result.
+            ("result == spec(a)", &[("a", "i32")], vec![i32_d.clone()], u8_d.clone(), &neg_i32, &pos_i32),
+            // CONTROLS that already resolved, and must resolve to the same
+            // carrier: mixed parameters (step 1 refuses as mixed, step 3
+            // decides), and a `bool` result over `u8` parameters (the
+            // decided-`bool` relation lane, which never reaches `atom_domain`).
+            (
+                "result == spec(a, b)",
+                &[("a", "bool"), ("b", "u8")],
+                vec![bool_d.clone(), u8_d.clone()],
+                u8_d.clone(),
+                &gate,
+                &other_gate,
+            ),
+            (
+                "result == spec(a, b)",
+                &[("a", "u8"), ("b", "u8")],
+                vec![u8_d.clone(), u8_d.clone()],
+                bool_d.clone(),
+                &eq_u8,
+                &ne_u8,
+            ),
+        ];
+        for (clause, params, domains, ret, body, other_body) in rows {
+            let mut env = Environment::with_prelude();
+            let t = tree_minted_table(
+                &mut env,
+                &[
+                    ("k", &domains[..], &ret, body),
+                    ("spec", &domains[..], &ret, body),
+                    ("spec_other", &domains[..], &ret, other_body),
+                ],
+            );
+            let row = format!("{params:?} -> {}", ret.rust_name());
+            let goal = elaborate_ensures(clause, params, "k", &t)
+                .unwrap_or_else(|e| panic!("{row}: `{clause}` must elaborate: {e}"));
+            // `check_type`, the full check the compiler's ill-typed-goal gate
+            // runs: `infer_type` alone reads an application's codomain without
+            // checking its arguments, and accepts the `Eq Bool` over `UInt8`.
+            let tc = clean_kernel::TypeChecker::new(&env);
+            tc.check_type(&goal, &Expr::prop())
+                .unwrap_or_else(|e| panic!("{row}: the goal must typecheck: {e:?}\n{goal}"));
+            let (carrier, lhs, rhs) = eq_core(&goal);
+            assert_eq!(carrier, ret.ty(), "{row}: the relation carrier must be the result's");
+            assert!(tc.is_def_eq(&lhs, &rhs), "{row}: the same body must close by defeq");
+
+            let other_clause = clause.replace("spec(", "spec_other(");
+            let other = elaborate_ensures(&other_clause, params, "k", &t)
+                .unwrap_or_else(|e| panic!("{row}: `{other_clause}` must elaborate: {e}"));
+            assert!(
+                tc.check_type(&other, &Expr::prop()).is_ok(),
+                "{row}: the mutant goal must typecheck too"
+            );
+            let (_, l2, r2) = eq_core(&other);
+            assert!(!tc.is_def_eq(&l2, &r2), "{row}: a different body must not close");
+        }
+
+        // NEGATIVES, each a named refusal rather than an ill-typed goal.
+        let mut env = Environment::with_prelude();
+        let two_bools = [bool_d.clone(), bool_d.clone()];
+        let t = tree_minted_table(
+            &mut env,
+            &[
+                ("k", &two_bools[..], &u8_d, &both),
+                ("spec", &two_bools[..], &u8_d, &both),
+                ("wide", &two_bools[..], &u16_d, &both),
+                ("same8", &[u8_d.clone(), u8_d.clone()][..], &bool_d, &eq_u8),
+                ("id8", &[u8_d.clone()][..], &u8_d, &T::Param(0)),
+            ],
+        );
+        // An AMBIENT `bool` variable compared with a `u8` call is a genuinely
+        // mixed comparison: the typed call does not excuse its sibling operand.
+        let err = elaborate_goal_typed_with_facets(
+            "flag == spec(a, b)",
+            &[("flag", "bool"), ("a", "bool"), ("b", "bool")],
+            &t,
+        )
+        .expect_err("a `bool` operand beside a `u8` call must fail closed");
+        assert!(
+            err.contains("declares its result at carrier `UInt8`, but the comparison is at carrier `Bool`"),
+            "{err}"
+        );
+        // Two typed operands that RETURN different carriers disagree with each
+        // other; the shared argument carrier must not reconcile them.
+        let err = elaborate_ensures("result == wide(a, b)", &[("a", "bool"), ("b", "bool")], "k", &t)
+            .expect_err("a `u8` result against a `u16` call must fail closed");
+        assert!(err.contains("mixed domains in one comparison"), "{err}");
+        // A CAST atom keeps step 1's domain and the cast's own refusal: outside
+        // `ProofLift` it is `unsupported term shape`, to the byte, never the
+        // "mixed domains" of the two casts' operands, which are not compared.
+        let err = elaborate_ensures(
+            "result as nat == wide(a, b) as nat",
+            &[("a", "bool"), ("b", "bool")],
+            "k",
+            &t,
+        )
+        .expect_err("a cast is outside the strict clause fragment");
+        assert!(err.contains("unsupported term shape"), "{err}");
+
+        // A BARE call atom keeps step 1's domain for its arguments: the literal
+        // beside a nested typed call takes `u8` from the variable inside it,
+        // not `Bool` from what `same8` returns, and the goal typechecks.
+        let goal = elaborate_goal_typed_with_facets("same8(id8(x), 3)", &[("x", "u8")], &t)
+            .expect("a bare `-> bool` call with a literal argument must elaborate");
+        clean_kernel::TypeChecker::new(&env)
+            .check_type(&goal, &Expr::prop())
+            .expect("the bare-call goal must typecheck");
+    }
+
+    /// TG15 (aterm's two-language gap plan, 2026-11-05), the whole matrix: for
+    /// EVERY ordered pair of fixed-width parameter carriers E6 admits (`bool`,
+    /// `u8`..`u64`, `i8`..`i64`; uniform and mixed) and every result carrier in
+    /// the same set, `result == spec(a, b)` and `spec(a, b) == result` build a
+    /// goal that typechecks, relates at the RESULT's carrier, closes by
+    /// definitional equality against a mint of the same body and does not
+    /// close against a mutant (the arms, or the connective, changed). `!=` and,
+    /// for an integer result, `<=` must typecheck too. The regression above
+    /// pins five cells of this; this pins all 729, so a carrier rule that is
+    /// right for the cells someone thought of and wrong for another fails here.
+    /// Negative control: with `step_one_result_carrier_conflict`'s `Some` arm
+    /// returning step 1's domain again, the uniform cells whose parameter and
+    /// result carriers differ fail the `check_type` assertion.
+    #[test]
+    fn every_fixed_width_parameter_and_result_mix_relates_at_the_result_carrier() {
+        use E6TreeTerm as T;
+        let b = |t: T| Box::new(t);
+        let carriers: [Domain; 9] = [
+            Domain::Bool,
+            Domain::Machine(MachineUIntWidth::U8),
+            Domain::Machine(MachineUIntWidth::U16),
+            Domain::Machine(MachineUIntWidth::U32),
+            Domain::Machine(MachineUIntWidth::U64),
+            Domain::Signed(MachineSIntWidth::I8),
+            Domain::Signed(MachineSIntWidth::I16),
+            Domain::Signed(MachineSIntWidth::I32),
+            Domain::Signed(MachineSIntWidth::I64),
+        ];
+        // Parameter `i` read as a `bool` at its own carrier.
+        let flag = |i: usize, d: &Domain| -> T {
+            if *d == Domain::Bool {
+                T::Param(i)
+            } else {
+                T::Cmp {
+                    op: E6TreeCmp::Eq,
+                    domain: d.clone(),
+                    left: b(T::Param(i)),
+                    right: b(T::Int(1)),
+                }
+            }
+        };
+        let mut cells = 0usize;
+        for p in &carriers {
+            for q in &carriers {
+                let params = [("a", p.rust_name()), ("b", q.rust_name())];
+                let domains = [p.clone(), q.clone()];
+                let mut env = Environment::with_prelude();
+                for (ri, ret) in carriers.iter().enumerate() {
+                    let both = T::And(b(flag(0, p)), b(flag(1, q)));
+                    // An integer result picks between two literals (negative for
+                    // a signed carrier); a `bool` result is the decision itself.
+                    let (body, mutant) = if *ret == Domain::Bool {
+                        (both.clone(), T::Or(b(flag(0, p)), b(flag(1, q))))
+                    } else {
+                        let (x, y) = if matches!(ret, Domain::Signed(_)) { (-3, 5) } else { (7, 9) };
+                        let pick = |x: i128, y: i128| T::Ite {
+                            cond: b(both.clone()),
+                            then: b(T::Int(x)),
+                            els: b(T::Int(y)),
+                        };
+                        (pick(x, y), pick(y, x))
+                    };
+                    let (k, spec, other) =
+                        (format!("k{ri}"), format!("spec{ri}"), format!("other{ri}"));
+                    let t = tree_minted_table(
+                        &mut env,
+                        &[
+                            (k.as_str(), &domains[..], ret, &body),
+                            (spec.as_str(), &domains[..], ret, &body),
+                            (other.as_str(), &domains[..], ret, &mutant),
+                        ],
+                    );
+                    let tc = clean_kernel::TypeChecker::new(&env);
+                    let cell =
+                        format!("({}, {}) -> {}", p.rust_name(), q.rust_name(), ret.rust_name());
+                    let build = |clause: &str| {
+                        let goal = elaborate_ensures(clause, &params, &k, &t)
+                            .unwrap_or_else(|e| panic!("{cell}: `{clause}` must elaborate: {e}"));
+                        tc.check_type(&goal, &Expr::prop()).unwrap_or_else(|e| {
+                            panic!("{cell}: `{clause}` must typecheck: {e:?}\n{goal}")
+                        });
+                        goal
+                    };
+                    for (same, mutated) in [
+                        (format!("result == {spec}(a, b)"), format!("result == {other}(a, b)")),
+                        (format!("{spec}(a, b) == result"), format!("{other}(a, b) == result")),
+                    ] {
+                        let (carrier, lhs, rhs) = eq_core(&build(&same));
+                        assert_eq!(carrier, ret.ty(), "{cell}: `{same}` must relate at the result's carrier");
+                        assert!(tc.is_def_eq(&lhs, &rhs), "{cell}: `{same}` must close by defeq");
+                        let (carrier, lhs, rhs) = eq_core(&build(&mutated));
+                        assert_eq!(
+                            carrier,
+                            ret.ty(),
+                            "{cell}: `{mutated}` must relate at the result's carrier"
+                        );
+                        assert!(!tc.is_def_eq(&lhs, &rhs), "{cell}: `{mutated}` must not close");
+                    }
+                    let _ne = build(&format!("result != {other}(a, b)"));
+                    if *ret != Domain::Bool {
+                        let _le = build(&format!("result <= {spec}(a, b)"));
+                    }
+                    cells += 1;
+                }
+            }
+        }
+        assert_eq!(cells, 729, "every parameter pair against every result carrier");
+
+        // A typed call NESTED in a typed call's argument, each at its own
+        // carrier: `(bool, bool) -> u8` inside `u8 -> u16`, related at `u16`.
+        let (bool_d, u8_d, u16_d) = (
+            Domain::Bool,
+            Domain::Machine(MachineUIntWidth::U8),
+            Domain::Machine(MachineUIntWidth::U16),
+        );
+        let both = T::And(b(T::Param(0)), b(T::Param(1)));
+        let inner = T::Ite { cond: b(both.clone()), then: b(T::Int(1)), els: b(T::Int(0)) };
+        let outer = T::Ite { cond: b(flag(0, &u8_d)), then: b(T::Int(7)), els: b(T::Int(9)) };
+        let k = T::Ite { cond: b(both), then: b(T::Int(7)), els: b(T::Int(9)) };
+        let two_bools = [bool_d.clone(), bool_d];
+        let mut env = Environment::with_prelude();
+        let t = tree_minted_table(
+            &mut env,
+            &[
+                ("k", &two_bools[..], &u16_d, &k),
+                ("inner", &two_bools[..], &u8_d, &inner),
+                ("outer", &[u8_d.clone()][..], &u16_d, &outer),
+            ],
+        );
+        let goal = elaborate_ensures(
+            "result == outer(inner(a, b))",
+            &[("a", "bool"), ("b", "bool")],
+            "k",
+            &t,
+        )
+        .expect("a nested typed call must elaborate");
+        let tc = clean_kernel::TypeChecker::new(&env);
+        tc.check_type(&goal, &Expr::prop()).expect("the nested goal must typecheck");
+        assert_eq!(eq_core(&goal).0, u16_d.ty(), "the nested relation is at the outer call's result");
+    }
+
+    /// TG15, the cast half: a cast INSIDE a typed call's argument list does not
+    /// keep the relation at step 1's variable domain. `bucket_spec(x as nat)` is
+    /// a `UInt8` result whatever `x` is, so on `fn bucket(x: u32) -> u8` the
+    /// E9 lane (`ProofLift`) relates two `UInt8` calls; keeping step 1's
+    /// `UInt32` (the exemption d96de26814 gave every atom with a cast in it)
+    /// built `@Eq UInt32` over them and the kernel refused the goal as
+    /// ill-typed, TG15's symptom. Measured on origin/main e88d030c4a before the
+    /// fix: `TypeMismatch { expected: UInt32, inferred: UInt8 }`. Strict mode
+    /// keeps its `unsupported term shape` refusal, and a `u32` operand beside
+    /// the `u8` call is still a mixed comparison.
+    #[test]
+    fn a_cast_inside_a_typed_call_argument_does_not_type_the_relation() {
+        use E6TreeTerm as T;
+        let u8_d = Domain::Machine(MachineUIntWidth::U8);
+        let u32_d = Domain::Machine(MachineUIntWidth::U32);
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let mut env = Environment::with_prelude();
+        // pub fn bucket(x: u32) -> u8 { 7 } and pub fn small(x: u32) -> bool { x < 5 }
+        let small_body = T::Cmp {
+            op: E6TreeCmp::Lt,
+            domain: u32_d.clone(),
+            left: Box::new(T::Param(0)),
+            right: Box::new(T::Int(5)),
+        };
+        let mut t = tree_minted_table(
+            &mut env,
+            &[
+                ("bucket", &[u32_d.clone()][..], &u8_d, &T::Int(7)),
+                ("small", &[u32_d.clone()][..], &Domain::Bool, &small_body),
+            ],
+        );
+        // clean { def bucket_spec (n : Nat) : UInt8 := 7 } plus a mutant returning 9,
+        // admitted with the carriers audited_island_definition_admission records.
+        for (name, kernel_const, value) in
+            [("bucket_spec", "bucket_spec_def", 7u128), ("bucket_other", "bucket_other_def", 9u128)]
+        {
+            env.add_decl(Declaration::Definition {
+                name: Name::from_string(kernel_const),
+                level_params: vec![],
+                type_: Expr::arrow(Domain::Nat.ty(), u8_d.ty()),
+                value: Expr::lam(
+                    BinderInfo::Default,
+                    Domain::Nat.ty(),
+                    u8_d.numeral(value).expect("the literal fits UInt8"),
+                ),
+                is_reducible: true,
+            })
+            .expect("the island-style definition must be well-typed");
+            t.insert(
+                name,
+                FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+            );
+            t.admit(
+                name,
+                Admission::reflected(kernel_const, 1).with_declared_signature(
+                    Some(u8_d.clone()),
+                    Some(DeclaredCarriers::of_domains(&[Domain::Nat], &u8_d)),
+                ),
+            );
+        }
+        let lifted = |clause: &str, self_fn: &str, result_ty: &str| {
+            elaborate_ensures_in(
+                clause,
+                &[("x", "u32")],
+                self_fn,
+                &t,
+                &ProofClauseInputs::proof_lift(Some(result_ty)),
+            )
+            .unwrap_or_else(|e| panic!("`{clause}` must elaborate: {e}"))
+            .goal
+        };
+        let tc = clean_kernel::TypeChecker::new(&env);
+        for clause in ["result == bucket_spec(x as nat)", "bucket_spec(x as nat) == result"] {
+            let goal = lifted(clause, "bucket", "u8");
+            tc.check_type(&goal, &Expr::prop())
+                .unwrap_or_else(|e| panic!("`{clause}` must typecheck: {e:?}\n{goal}"));
+            let (carrier, lhs, rhs) = eq_core(&goal);
+            assert_eq!(carrier, u8_d.ty(), "`{clause}` relates two UInt8 call results at UInt8");
+            assert!(tc.is_def_eq(&lhs, &rhs), "`{clause}`: the same body must close by defeq");
+            let mutant = clause.replace("bucket_spec(", "bucket_other(");
+            let other = lifted(&mutant, "bucket", "u8");
+            tc.check_type(&other, &Expr::prop())
+                .unwrap_or_else(|e| panic!("`{mutant}` must typecheck: {e:?}\n{other}"));
+            let (_, l2, r2) = eq_core(&other);
+            assert!(!tc.is_def_eq(&l2, &r2), "`{mutant}`: a different body must not close");
+        }
+        // The decided-bool lane reaches the same exemption through
+        // `elab_bool_term`'s comparison arm.
+        let goal = lifted("result == (bucket_spec(x as nat) < 5)", "small", "bool");
+        tc.check_type(&goal, &Expr::prop())
+            .unwrap_or_else(|e| panic!("the decided comparison must typecheck: {e:?}\n{goal}"));
+        assert_eq!(eq_core(&goal).0, Domain::Bool.ty());
+        // NEGATIVE CONTROLS. Strict mode reads no cast: still refused by the
+        // pre-existing message, never built at any carrier.
+        let err = elaborate_ensures("result == bucket_spec(x as nat)", &[("x", "u32")], "bucket", &t)
+            .expect_err("a cast is outside the strict clause fragment");
+        assert!(err.contains("unsupported term shape"), "{err}");
+        // An AMBIENT `u32` operand beside the `u8` call is a genuinely mixed
+        // comparison; the cast inside the call's argument does not excuse it.
+        let err = elaborate_ensures_in(
+            "x == bucket_spec(x as nat)",
+            &[("x", "u32")],
+            "bucket",
+            &t,
+            &ProofClauseInputs::proof_lift(Some("u8")),
+        )
+        .expect_err("a `u32` operand against a `u8` call must fail closed");
+        assert!(err.contains("UInt8") && err.contains("UInt32"), "{err}");
+    }
+
+    /// TG15, the variable-free half: an atom with no clause variable (a
+    /// nullary kernel's `result`) takes its domain from AMBIENT evidence, so a
+    /// typed call contributes the result it declares and nothing from inside
+    /// its argument list. `result == widen(g())` on `fn k() -> u16` relates two
+    /// `UInt16` results; reading `g`'s `UInt8` out of `widen`'s argument refused
+    /// it as "mixed domains" (measured on origin/main e88d030c4a before the
+    /// fix). An ambient `u8` operand against the `u16` result is still refused.
+    #[test]
+    fn a_variable_free_relation_takes_no_evidence_from_a_typed_calls_arguments() {
+        use E6TreeTerm as T;
+        let u8_d = Domain::Machine(MachineUIntWidth::U8);
+        let u16_d = Domain::Machine(MachineUIntWidth::U16);
+        let nullary: [Domain; 0] = [];
+        let mut env = Environment::with_prelude();
+        let t = tree_minted_table(
+            &mut env,
+            &[
+                // fn k() -> u16 { 7 }
+                ("k", &nullary[..], &u16_d, &T::Int(7)),
+                // def g : UInt8 := 7
+                ("g", &nullary[..], &u8_d, &T::Int(7)),
+                // def widen (b : UInt8) : UInt16 := 7, and a mutant returning 9
+                ("widen", &[u8_d.clone()][..], &u16_d, &T::Int(7)),
+                ("widen_other", &[u8_d.clone()][..], &u16_d, &T::Int(9)),
+            ],
+        );
+        let tc = clean_kernel::TypeChecker::new(&env);
+        for (clause, inputs) in [
+            ("result == widen(g())", ProofClauseInputs::strict()),
+            ("widen(g()) == result", ProofClauseInputs::strict()),
+            ("result == widen(7u8)", ProofClauseInputs::proof_lift(Some("u16"))),
+        ] {
+            let goal = elaborate_ensures_in(clause, &[], "k", &t, &inputs)
+                .unwrap_or_else(|e| panic!("`{clause}` must elaborate: {e}"))
+                .goal;
+            tc.check_type(&goal, &Expr::prop())
+                .unwrap_or_else(|e| panic!("`{clause}` must typecheck: {e:?}\n{goal}"));
+            let (carrier, lhs, rhs) = eq_core(&goal);
+            assert_eq!(carrier, u16_d.ty(), "`{clause}` relates the two UInt16 results at UInt16");
+            assert!(tc.is_def_eq(&lhs, &rhs), "`{clause}` must close by defeq");
+            let mutant = clause.replace("widen(", "widen_other(");
+            let other = elaborate_ensures_in(&mutant, &[], "k", &t, &inputs)
+                .unwrap_or_else(|e| panic!("`{mutant}` must elaborate: {e}"))
+                .goal;
+            tc.check_type(&other, &Expr::prop())
+                .unwrap_or_else(|e| panic!("`{mutant}` must typecheck: {e:?}\n{other}"));
+            let (_, l2, r2) = eq_core(&other);
+            assert!(!tc.is_def_eq(&l2, &r2), "`{mutant}` must not close");
+        }
+        // Control that must stay red: an AMBIENT u8 operand against the u16 result.
+        let err = elaborate_ensures("result == g()", &[], "k", &t)
+            .expect_err("a u16 result against a u8 call must fail closed");
+        assert!(err.contains("mixed domains"), "{err}");
+    }
+
+    /// TG15, the Option half: parentheses around an `Option<iN>` self-call do
+    /// not move the relation off the Option carrier. `(result) == Some(a)` was
+    /// typed from the constructor's argument (`BitVec 8`) and refused against
+    /// the self-call's `Option (BitVec 8)` result (measured on origin/main
+    /// e88d030c4a before the fix); it now builds the same goal as the bare
+    /// spelling.
+    #[test]
+    fn a_parenthesized_option_self_call_keeps_the_option_relation() {
+        let i8_d = Domain::Signed(MachineSIntWidth::I8);
+        let mut env = Environment::with_prelude();
+        let adm = admit_checked_arithmetic_function(
+            &mut env,
+            "k_def",
+            &[i8_d.clone(), i8_d.clone()],
+            CheckedArithOp::Add,
+            MachineSIntWidth::I8,
+            CmpOperand::Param(0),
+            CmpOperand::Param(1),
+        )
+        .expect("the checked-add mint must admit");
+        let t = admitted_table("k", adm);
+        let params: &[(&str, &str)] = &[("a", "i8"), ("b", "i8")];
+        let plain = elaborate_ensures("result == Some(a)", params, "k", &t)
+            .expect("control: the unparenthesized clause elaborates");
+        let tc = clean_kernel::TypeChecker::new(&env);
+        for clause in ["(result) == Some(a)", "((result)) == Some(a)", "Some(a) == (result)"] {
+            let goal = elaborate_ensures(clause, params, "k", &t)
+                .unwrap_or_else(|e| panic!("`{clause}` must elaborate: {e}"));
+            tc.check_type(&goal, &Expr::prop())
+                .unwrap_or_else(|e| panic!("`{clause}` must typecheck: {e:?}\n{goal}"));
+            assert_eq!(
+                eq_core(&goal).0,
+                Domain::OptionSigned(MachineSIntWidth::I8).ty(),
+                "`{clause}` relates at the Option carrier"
+            );
+        }
+        let paren = elaborate_ensures("(result) == Some(a)", params, "k", &t)
+            .unwrap_or_else(|e| panic!("`(result) == Some(a)` must elaborate: {e}"));
+        assert_eq!(paren, plain, "parentheses do not make a different clause");
+    }
+
+    /// TG15 open item 1 (`docs/validation/2026-11-06-tg15-result-carrier.md`):
+    /// a typed call NESTED in a typed call's argument whose result no
+    /// declaration names a domain for. `def g (b : Bool) : BitVec 16` records
+    /// carriers and no return domain (`BitVec 16` is `i16` and a 16-bit
+    /// pointer-sized integer alike), so the argument fallback gave `g(a)` the
+    /// relation's `u8` and the carrier check refused `f(g(a))` ("declares
+    /// parameter 0 at carrier `BitVec 16`, but the argument is a `u8` term").
+    /// The two DECLARATIONS are compared now and no domain is read off either: a
+    /// nested result at another carrier is refused, a literal inside the nested
+    /// call is still not typed from its `BitVec 16` slot, and a nested call with
+    /// no carrier record keeps the old refusal.
+    #[test]
+    fn a_nested_call_with_no_result_domain_is_checked_by_its_declared_carrier() {
+        use E6TreeTerm as T;
+        let b = |t: T| Box::new(t);
+        let bool_d = Domain::Bool;
+        let u8_d = Domain::Machine(MachineUIntWidth::U8);
+        let i16_d = Domain::Signed(MachineSIntWidth::I16);
+        let i32_d = Domain::Signed(MachineSIntWidth::I32);
+        let pick = |then: i128, els: i128| T::Ite {
+            cond: b(T::Cmp {
+                op: E6TreeCmp::Eq,
+                domain: i16_d.clone(),
+                left: b(T::Param(0)),
+                right: b(T::Int(1)),
+            }),
+            then: b(T::Int(then)),
+            els: b(T::Int(els)),
+        };
+        let (f_body, f_mutant) = (pick(7, 9), pick(9, 7));
+        let mut env = Environment::with_prelude();
+        // def f (x : BitVec 16) : UInt8 := if x = 1 then 7 else 9, and the
+        // arms-swapped mutant: the carriers and the `UInt8` return domain an
+        // island admission records for that declaration.
+        let mut t = tree_minted_table(
+            &mut env,
+            &[
+                ("f", &[i16_d.clone()][..], &u8_d, &f_body),
+                ("f_other", &[i16_d.clone()][..], &u8_d, &f_mutant),
+            ],
+        );
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let facets =
+            || FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() };
+        // def g (b : Bool) : BitVec 16 := if b then 1 else 0, `h` the same at
+        // BitVec 32 and wrap (x : BitVec 16) : BitVec 16 := x, admitted the way
+        // the island admission records a `BitVec` codomain: carriers, and NO
+        // return domain.
+        let flag_bits = T::Ite { cond: b(T::Param(0)), then: b(T::Int(1)), els: b(T::Int(0)) };
+        let identity = T::Param(0);
+        for (name, params, ret, body) in [
+            ("g", [bool_d.clone()], &i16_d, &flag_bits),
+            ("h", [bool_d.clone()], &i32_d, &flag_bits),
+            ("wrap", [i16_d.clone()], &i16_d, &identity),
+        ] {
+            let minted =
+                admit_e6_tree_function(&mut env, &format!("{name}_def"), &params, ret, body)
+                    .unwrap_or_else(|e| panic!("`{name}` must mint: {e}"));
+            t.insert(name, facets());
+            t.admit(
+                name,
+                minted.with_declared_signature(
+                    None,
+                    Some(DeclaredCarriers::of_domains(&params, ret)),
+                ),
+            );
+        }
+        // fn k(a: bool) -> u8 { f(g(a)) }: its import is the composition.
+        let app =
+            |callee: &str, x: Expr| Expr::app(Expr::const_(Name::from_string(callee), vec![]), x);
+        env.add_decl(Declaration::Definition {
+            name: Name::from_string("k_def"),
+            level_params: vec![],
+            type_: Expr::arrow(bool_d.ty(), u8_d.ty()),
+            value: Expr::lam(
+                BinderInfo::Default,
+                bool_d.ty(),
+                app("f_def", app("g_def", Expr::bvar(0))),
+            ),
+            is_reducible: true,
+        })
+        .expect("the composed import is well-typed");
+        t.insert("k", facets());
+        t.admit(
+            "k",
+            Admission::reflected("k_def", 1).with_declared_signature(
+                Some(u8_d.clone()),
+                Some(DeclaredCarriers::of_domains(std::slice::from_ref(&bool_d), &u8_d)),
+            ),
+        );
+        let params: &[(&str, &str)] = &[("a", "bool")];
+        let tc = clean_kernel::TypeChecker::new(&env);
+        for (same, mutated) in [
+            ("result == f(g(a))", "result == f_other(g(a))"),
+            ("f(g(a)) == result", "f_other(g(a)) == result"),
+        ] {
+            let goal = elaborate_ensures(same, params, "k", &t)
+                .unwrap_or_else(|e| panic!("`{same}` must elaborate: {e}"));
+            tc.check_type(&goal, &Expr::prop())
+                .unwrap_or_else(|e| panic!("`{same}` must typecheck: {e:?}\n{goal}"));
+            let (carrier, lhs, rhs) = eq_core(&goal);
+            assert_eq!(carrier, u8_d.ty(), "`{same}` relates at the outer call's result");
+            assert!(tc.is_def_eq(&lhs, &rhs), "`{same}` must close by defeq");
+            let other = elaborate_ensures(mutated, params, "k", &t)
+                .unwrap_or_else(|e| panic!("`{mutated}` must elaborate: {e}"));
+            tc.check_type(&other, &Expr::prop())
+                .unwrap_or_else(|e| panic!("`{mutated}` must typecheck: {e:?}\n{other}"));
+            let (_, l2, r2) = eq_core(&other);
+            assert!(!tc.is_def_eq(&l2, &r2), "`{mutated}` must not close");
+        }
+        // A nested result at ANOTHER carrier is refused, naming both.
+        let err = elaborate_ensures("result == f(h(a))", params, "k", &t)
+            .expect_err("a `BitVec 32` result at a `BitVec 16` parameter must fail closed");
+        assert!(
+            err.contains("declares parameter 0 at carrier `BitVec 16`")
+                && err.contains("return carrier `BitVec 32`"),
+            "{err}"
+        );
+        // A literal inside the nested call takes no domain from the `BitVec 16`
+        // slot it fills (I0): `3` keeps the relation's `u8` and `wrap`'s own
+        // declared parameter refuses it.
+        let err = elaborate_ensures("result == f(wrap(3))", params, "k", &t)
+            .expect_err("a literal is never typed from a declared `BitVec` carrier");
+        assert!(
+            err.contains("admitted `wrap` declares parameter 0 at carrier `BitVec 16`"),
+            "{err}"
+        );
+        // A nested call with NO carrier record is not a typed call: its
+        // arguments are read as before and the original refusal stands.
+        let mut untyped = t.clone();
+        untyped.admit("g", Admission::reflected("g_def", 1));
+        let err = elaborate_ensures("result == f(g(a))", params, "k", &untyped)
+            .expect_err("a nested call with no carrier record must fail closed");
+        assert!(err.contains("admitted `f` declares parameter 0 at carrier `BitVec 16`"), "{err}");
+    }
+
+    /// TG15 open item 3: equal carriers are not equal domains. `u128` and
+    /// `i128` share `BitVec 128`, so the carrier check passed `fn k(a: u128) ->
+    /// i128 { -1 }` with `ensures result >= 0` at step 1's `u128`, the
+    /// parameter's UNSIGNED order over a signed result: a goal true of every
+    /// input, for a postcondition false of every input. The relation now reads
+    /// the result the way the callee's recorded return domain does, so the goal
+    /// is the very one an `i128` binder builds over the same import, and an
+    /// ambient `u128` operand beside the `i128` result is refused. Readings,
+    /// not names, are compared: an `isize` relation on a 64-bit target still
+    /// reads an `i64` result.
+    #[test]
+    fn a_shared_carrier_does_not_decide_how_a_result_is_read() {
+        use E6TreeTerm as T;
+        let i128_d = Domain::Signed(MachineSIntWidth::I128);
+        let i64_d = Domain::Signed(MachineSIntWidth::I64);
+        let (minus_one, identity) = (T::Int(-1), T::Param(0));
+        let mut env = Environment::with_prelude();
+        let t = tree_minted_table(
+            &mut env,
+            &[
+                // fn k(a: u128) -> i128 { -1 }, minted over the parameter it ignores.
+                ("k", &[Domain::U128][..], &i128_d, &minus_one),
+                // fn id(x: i64) -> i64 { x }
+                ("id", &[i64_d.clone()][..], &i64_d, &identity),
+            ],
+        );
+        let tc = clean_kernel::TypeChecker::new(&env);
+        for clause in ["result >= 0", "0 <= result", "result < 1"] {
+            let signed = elaborate_ensures(clause, &[("a", "i128")], "k", &t)
+                .unwrap_or_else(|e| panic!("`{clause}` over an `i128` binder must elaborate: {e}"));
+            let goal = elaborate_ensures(clause, &[("a", "u128")], "k", &t)
+                .unwrap_or_else(|e| panic!("`{clause}` over a `u128` binder must elaborate: {e}"));
+            tc.check_type(&goal, &Expr::prop())
+                .unwrap_or_else(|e| panic!("`{clause}` must typecheck: {e:?}\n{goal}"));
+            assert_eq!(goal, signed, "`{clause}` must read the `i128` result in signed order");
+        }
+        let err = elaborate_ensures("result >= a", &[("a", "u128")], "k", &t)
+            .expect_err("a `u128` operand against an `i128` result must fail closed");
+        assert!(
+            err.contains("returns a `i128`") && err.contains("comparison is at `u128`"),
+            "{err}"
+        );
+        let pointer = elaborate_ensures("result >= x", &[("x", "isize64")], "id", &t)
+            .expect("an `isize` relation reads an `i64` result");
+        let fixed = elaborate_ensures("result >= x", &[("x", "i64")], "id", &t)
+            .expect("control: the `i64` spelling elaborates");
+        assert_eq!(pointer, fixed, "the two spellings read one value and build one goal");
+    }
+
+    /// The reading check above compares a call's recorded result with the
+    /// domain a RELATION is built at. A bare call atom is no relation:
+    /// `atom_domain` hands its domain to `elab_term` as the domain of the
+    /// call's ARGUMENTS, so `p(widen(flag), x)` (read as `p(..) = true`) types
+    /// `x` and `widen`'s result at `u8` and never reads `p`'s `bool` result
+    /// there. `p` records its result and no carriers (an island whose telescope
+    /// the carrier reader cannot read), so its arguments are operands of the
+    /// atom; step 1 sees `flag` and `x` and refuses as mixed, and step 3 types
+    /// the atom from `x`. Without the bare-call exemption the reading check
+    /// refused this well-typed clause, which the carrier check had accepted,
+    /// with "`p` returns a `bool` ... the comparison is at `u8`".
+    #[test]
+    fn a_bare_call_atom_is_not_read_at_its_argument_domain() {
+        use E6TreeTerm as T;
+        let b = |t: T| Box::new(t);
+        let (bool_d, u8_d) = (Domain::Bool, Domain::Machine(MachineUIntWidth::U8));
+        let mut env = Environment::with_prelude();
+        let flag_bits = T::Ite { cond: b(T::Param(0)), then: b(T::Int(1)), els: b(T::Int(0)) };
+        let mut t =
+            tree_minted_table(&mut env, &[("widen", &[bool_d.clone()][..], &u8_d, &flag_bits)]);
+        let same = T::Cmp {
+            op: E6TreeCmp::Eq,
+            domain: u8_d.clone(),
+            left: b(T::Param(0)),
+            right: b(T::Param(1)),
+        };
+        let minted = admit_e6_tree_function(
+            &mut env,
+            "p_def",
+            &[u8_d.clone(), u8_d.clone()],
+            &bool_d,
+            &same,
+        )
+        .expect("the `u8, u8 -> bool` tree must mint");
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        t.insert(
+            "p",
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        t.admit("p", minted.with_declared_signature(Some(bool_d.clone()), None));
+        let tc = clean_kernel::TypeChecker::new(&env);
+        for clause in ["p(widen(flag), x)", "(p(widen(flag), x))", "!p(widen(flag), x)"] {
+            let goal =
+                elaborate_goal_typed_with_facets(clause, &[("flag", "bool"), ("x", "u8")], &t)
+                    .unwrap_or_else(|e| panic!("`{clause}` must elaborate: {e}"));
+            tc.check_type(&goal, &Expr::prop())
+                .unwrap_or_else(|e| panic!("`{clause}` must typecheck: {e:?}\n{goal}"));
+        }
     }
 
     /// E6 widening increment 5, clause half: a clause comparing an admitted
@@ -12435,6 +18008,52 @@ mod certified_extended_carrier_tests {
         );
     }
 
+    /// E9 discharge binders: bare `usize`/`isize` resolve to the fixed-width
+    /// machine spelling of the TARGET's width — the carrier the E6 import of a
+    /// `usize` function is minted at — and to nothing else.
+    #[test]
+    fn discharge_binders_resolve_pointer_sized_names_at_the_target_width_only() {
+        for (width, unsigned, signed) in [
+            (TargetPointerWidth::W16, "u16", "i16"),
+            (TargetPointerWidth::W32, "u32", "i32"),
+            (TargetPointerWidth::W64, "u64", "i64"),
+        ] {
+            assert_eq!(discharge_binding_ty_for_target("usize", width), unsigned);
+            assert_eq!(discharge_binding_ty_for_target("isize", width), signed);
+            // Every other name is the identity: a fixed-width type is never
+            // re-read through the pointer width, an already-explicit pointer
+            // spelling is never rewritten, and an unsupported name stays
+            // unsupported.
+            for name in ["u8", "u64", "i64", "u128", "bool", "nat", "usize64", "isize32", "Vec"] {
+                assert_eq!(discharge_binding_ty_for_target(name, width), name);
+            }
+        }
+
+        // POSITIVE: the resolved goal IS the fixed-width goal, byte for byte,
+        // so everything proved about a `u64` clause applies to a `usize`
+        // clause on a 64-bit target and nothing new is admitted.
+        let resolved = discharge_binding_ty_for_target("usize", TargetPointerWidth::W64);
+        let usize_goal = elaborate_goal_typed("n <= n", &[("n", resolved)])
+            .expect("a 64-bit usize clause elaborates");
+        let u64_goal =
+            elaborate_goal_typed("n <= n", &[("n", "u64")]).expect("the u64 clause elaborates");
+        assert_eq!(usize_goal, u64_goal);
+
+        // WIDTH NEGATIVE CONTROL: the same clause on a 32-bit target is a
+        // DIFFERENT proposition (it quantifies over `UInt32`), so a proof of
+        // the 64-bit statement cannot inhabit it.
+        let resolved32 = discharge_binding_ty_for_target("usize", TargetPointerWidth::W32);
+        let usize32_goal = elaborate_goal_typed("n <= n", &[("n", resolved32)])
+            .expect("a 32-bit usize clause elaborates");
+        assert_ne!(usize32_goal, u64_goal, "a 32-bit usize clause must not be the 64-bit goal");
+
+        // CLOSE NEGATIVE TWIN: the UNRESOLVED name is still refused — the
+        // resolution, not a relaxed binding gate, is what admits the clause.
+        let refused = elaborate_goal_typed("n <= n", &[("n", "usize")])
+            .expect_err("bare usize must never guess the target");
+        assert!(refused.contains("unsupported clause variable type `usize`"), "{refused}");
+    }
+
     #[test]
     fn scalar_measure_is_sealed_kernel_checked_and_runtime_exact() {
         let env = Environment::with_prelude();
@@ -12473,5 +18092,2231 @@ mod certified_extended_carrier_tests {
             i8_monitor.runtime().evaluate(&[("x", 256)]).is_err(),
             "out-of-carrier bit patterns are rejected"
         );
+    }
+}
+
+/// The nat-lift fragment (design `scratchpad/designs/design-nat-lift.v2.md`):
+/// the explicit `e as nat` / `e as int` lift, its closed table, the
+/// self-determination rule, and the refusals.
+///
+/// Every positive here is checked against the KERNEL — the goal must be a
+/// well-typed proposition, and where the design claims definitional equality
+/// the `Eq.refl` term must actually close it and GRADE `Certified`. Every
+/// positive has a close negative twin, and the two soundness-critical rules
+/// (self-determination, and the two-read cross-check on the self function)
+/// carry mutation controls that show the twin has teeth.
+#[cfg(test)]
+mod nat_lift_tests {
+    use super::*;
+    use clean_kernel::expr::BinderInfo;
+    use clean_kernel::{Declaration, TypeChecker};
+
+    fn cert() -> FacetStatus {
+        FacetStatus::Certified { evidence: "nat-lift test".into() }
+    }
+
+    fn admissible() -> FnFacets {
+        FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() }
+    }
+
+    fn c(n: &str) -> Expr {
+        Expr::const_(Name::from_string(n), vec![])
+    }
+
+    fn u64d() -> Domain {
+        Domain::Machine(MachineUIntWidth::U64)
+    }
+
+    fn u32d() -> Domain {
+        Domain::Machine(MachineUIntWidth::U32)
+    }
+
+    fn i64d() -> Domain {
+        Domain::Signed(MachineSIntWidth::I64)
+    }
+
+    /// Declare an ISLAND-STYLE definition: a plain kernel `Definition` over the
+    /// given domains, admitted with its declared carriers recorded. This is the
+    /// same shape `admit_certified_island_definition` produces for a
+    /// `clean { def … }` body — a Lean definition over `Nat`/`Int`, which is
+    /// what every owner model is written in.
+    fn declare_island_def(
+        env: &mut Environment,
+        facets: &mut FacetTable,
+        clause_name: &str,
+        kernel_const: &str,
+        params: &[Domain],
+        ret: &Domain,
+        body: Expr,
+    ) {
+        let ty = params.iter().rev().fold(ret.ty(), |acc, d| Expr::arrow(d.ty(), acc));
+        let value = params.iter().rev().fold(body, |acc, d| Expr::lam(BinderInfo::Default, d.ty(), acc));
+        env.add_decl(Declaration::Definition {
+            name: Name::from_string(kernel_const),
+            level_params: vec![],
+            type_: ty,
+            value,
+            is_reducible: true,
+        })
+        .expect("the island-style definition must be well-typed");
+        facets.insert(clause_name, admissible());
+        facets.admit(
+            clause_name,
+            Admission::reflected(kernel_const, params.len()).with_declared_signature(
+                Some(ret.clone()),
+                Some(DeclaredCarriers::of_domains(params, ret)),
+            ),
+        );
+    }
+
+    /// The ensures-discharge goal for a PROOF-position clause with lifts, and
+    /// the widths whose seeded lift model it names.
+    fn lifted(
+        clause: &str,
+        params: &[(&str, &str)],
+        self_fn: &str,
+        result_ty: &str,
+        facets: &FacetTable,
+    ) -> Result<ElaboratedClause, String> {
+        elaborate_ensures_in(
+            clause,
+            params,
+            self_fn,
+            facets,
+            &ProofClauseInputs::proof_lift(Some(result_ty)),
+        )
+    }
+
+    // ---------------------------------------------------------------- WE-1
+
+    /// WE-1: a `u64` function proved against a `Nat`-carrier Lean definition,
+    /// by definitional equality. THE flagship: before this, the clause could
+    /// not even be stated ("declares parameter 0 at carrier `Nat`, but the
+    /// argument is a `u64` term ... never coerced").
+    #[test]
+    fn we1_u64_function_discharges_against_a_nat_definition_by_defeq() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        // clean { def first_nat (a : Nat) (b : Nat) : Nat := a }
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "first_nat",
+            "first_nat_def",
+            &[Domain::Nat, Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(1),
+        );
+        // pub fn first(a: u64, b: u64) -> u64 { a }
+        let first = admit_projection_function(&mut env, "first_def", &[u64d(), u64d()], 0)
+            .expect("the Rust projection admits");
+        facets.insert("first", admissible());
+        facets.admit("first", first.with_declared_signature(Some(u64d()), None));
+
+        let clause = lifted(
+            "(result as nat) == first_nat(a as nat, b as nat)",
+            &[("a", "u64"), ("b", "u64")],
+            "first",
+            "u64",
+            &facets,
+        )
+        .expect("the lifted clause must elaborate");
+        assert!(clause.required_signed_lift_widths.is_empty(), "an unsigned lift seeds nothing");
+
+        // The goal is EXACTLY the design's WE-1 shape.
+        let to_nat = |e: Expr| Expr::app(c("UInt64.toNat"), e);
+        let bind = |body: Expr| {
+            Expr::pi(
+                BinderInfo::Default,
+                c("UInt64"),
+                Expr::pi(BinderInfo::Default, c("UInt64"), body),
+            )
+        };
+        let lhs = to_nat(Expr::apps(c("first_def"), [Expr::bvar(1), Expr::bvar(0)]));
+        let rhs = Expr::apps(c("first_nat_def"), [to_nat(Expr::bvar(1)), to_nat(Expr::bvar(0))]);
+        assert_eq!(clause.goal, bind(Domain::Nat.eq(lhs.clone(), rhs)), "WE-1 goal shape");
+
+        // KERNEL: well-typed, and `Eq.refl` closes it with an empty closure.
+        let tc = TypeChecker::new(&env);
+        let _ = tc.infer_sort(&clause.goal).expect("the lifted goal must be well-typed");
+        let proof = Expr::lam(
+            BinderInfo::Default,
+            c("UInt64"),
+            Expr::lam(
+                BinderInfo::Default,
+                c("UInt64"),
+                Expr::apps(
+                    Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
+                    [c("Nat"), lhs],
+                ),
+            ),
+        );
+        assert_eq!(
+            cert_meter::grade(&env, &clause.goal, &proof),
+            cert_meter::Grade::Certified,
+            "WE-1 must discharge by defeq and GRADE Certified"
+        );
+    }
+
+    /// WE-1 NEG-a: the same clause against the WRONG projection. The lift is
+    /// exact, so the two sides are genuinely different terms and `Eq.refl` must
+    /// not close them. (`first` returns `a`; the clause claims `b`.)
+    #[test]
+    fn we1_neg_wrong_projection_is_not_definitional() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "second_nat",
+            "second_nat_def",
+            &[Domain::Nat, Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(0),
+        );
+        let first = admit_projection_function(&mut env, "first_def", &[u64d(), u64d()], 0)
+            .expect("the Rust projection admits");
+        facets.insert("first", admissible());
+        facets.admit("first", first.with_declared_signature(Some(u64d()), None));
+
+        let clause = lifted(
+            "(result as nat) == second_nat(a as nat, b as nat)",
+            &[("a", "u64"), ("b", "u64")],
+            "first",
+            "u64",
+            &facets,
+        )
+        .expect("the clause still elaborates — it is simply false");
+        let tc = TypeChecker::new(&env);
+        let _ = tc.infer_sort(&clause.goal).expect("still a well-typed proposition");
+        let to_nat = |e: Expr| Expr::app(c("UInt64.toNat"), e);
+        let lhs = to_nat(Expr::apps(c("first_def"), [Expr::bvar(1), Expr::bvar(0)]));
+        let proof = Expr::lam(
+            BinderInfo::Default,
+            c("UInt64"),
+            Expr::lam(
+                BinderInfo::Default,
+                c("UInt64"),
+                Expr::apps(
+                    Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
+                    [c("Nat"), lhs],
+                ),
+            ),
+        );
+        assert!(
+            tc.check_type(&proof, &clause.goal).is_err(),
+            "the wrong projection must NOT be definitionally equal"
+        );
+    }
+
+    /// WE-1 NEG-b, the WRAP twin, and mutation control m1. A wrapping Rust body
+    /// does NOT satisfy the `Nat`-level successor equation. This is the fact
+    /// that makes rejected option F (narrowing the Lean side with `ofNat`)
+    /// unsound: under it this goal would be TRUE.
+    #[test]
+    fn we1_neg_wrapping_body_does_not_satisfy_the_nat_equation() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        // clean { def succ_nat (n : Nat) : Nat := n + 1 }
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "succ_nat",
+            "succ_nat_def",
+            &[Domain::Nat],
+            &Domain::Nat,
+            Expr::apps(c("Nat.add"), [Expr::bvar(0), Expr::nat_lit(1)]),
+        );
+        // pub fn succ(x: u64) -> u64 { x.wrapping_add(1) }
+        env.add_decl(Declaration::Definition {
+            name: Name::from_string("succ_def"),
+            level_params: vec![],
+            type_: Expr::arrow(c("UInt64"), c("UInt64")),
+            value: Expr::lam(
+                BinderInfo::Default,
+                c("UInt64"),
+                Expr::apps(
+                    c("UInt64.add"),
+                    [Expr::bvar(0), Expr::app(c("UInt64.ofNat"), Expr::nat_lit(1))],
+                ),
+            ),
+            is_reducible: true,
+        })
+        .expect("the wrapping body is well-typed");
+        facets.insert("succ", admissible());
+        facets.admit(
+            "succ",
+            Admission::reflected("succ_def", 1).with_declared_signature(Some(u64d()), None),
+        );
+
+        let clause =
+            lifted("(result as nat) == succ_nat(x as nat)", &[("x", "u64")], "succ", "u64", &facets)
+                .expect("the clause elaborates");
+        let tc = TypeChecker::new(&env);
+        let _ = tc.infer_sort(&clause.goal).expect("well-typed");
+        let lhs =
+            Expr::app(c("UInt64.toNat"), Expr::app(c("succ_def"), Expr::bvar(0)));
+        let proof = Expr::lam(
+            BinderInfo::Default,
+            c("UInt64"),
+            Expr::apps(
+                Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
+                [c("Nat"), lhs],
+            ),
+        );
+        assert!(
+            tc.check_type(&proof, &clause.goal).is_err(),
+            "a wrapping body must NOT satisfy the unbounded successor equation"
+        );
+    }
+
+    // ------------------------------------------------- the (Math, Math) row
+
+    /// F-2, the relation carrier. The atom's operands are `Nat` terms, so the
+    /// relation must be built at `Nat` — NOT at the `u32` the clause variables
+    /// would suggest. The pre-existing `atom_domain` resolves over every free
+    /// variable INCLUDING a typed call's arguments, so without §3.4 this builds
+    /// `Nat.le (UInt32.toNat (clamp_nat …)) …`, which does not type.
+    #[test]
+    fn math_math_order_row_is_built_at_nat_not_at_the_variables_width() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        // clean { def min_nat (c : Nat) (d : Nat) : Nat := Nat.min c d }
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "min_nat",
+            "min_nat_def",
+            &[Domain::Nat, Domain::Nat],
+            &Domain::Nat,
+            Expr::apps(c("Nat.min"), [Expr::bvar(1), Expr::bvar(0)]),
+        );
+        let clamp = admit_projection_function(&mut env, "clamp_def", &[u32d(), u32d()], 0)
+            .expect("mints");
+        facets.insert("clamp", admissible());
+        facets.admit("clamp", clamp.with_declared_signature(Some(u32d()), None));
+
+        let clause = lifted(
+            "min_nat(c as nat, d as nat) <= (d as nat)",
+            &[("c", "u32"), ("d", "u32")],
+            "clamp",
+            "u32",
+            &facets,
+        )
+        .expect("the (Math, Math) order row must elaborate");
+
+        let to_nat = |e: Expr| Expr::app(c("UInt32.toNat"), e);
+        let expected = Expr::pi(
+            BinderInfo::Default,
+            c("UInt32"),
+            Expr::pi(
+                BinderInfo::Default,
+                c("UInt32"),
+                Domain::Nat.cmp(
+                    "le",
+                    Expr::apps(c("min_nat_def"), [to_nat(Expr::bvar(1)), to_nat(Expr::bvar(0))]),
+                    to_nat(Expr::bvar(0)),
+                ),
+            ),
+        );
+        assert_eq!(clause.goal, expected, "the relation must be `Nat.le`, at `Nat`");
+        let _ = TypeChecker::new(&env)
+            .infer_sort(&clause.goal)
+            .expect("the Nat-level order goal must be well-typed");
+    }
+
+    /// Mutation control m-F2: the shape the PRE-EXISTING path would have built
+    /// for that atom — the relation at the variables' machine width — is
+    /// ill-typed. So §3.4 is load-bearing, not cosmetic.
+    #[test]
+    fn mutation_the_machine_carrier_relation_over_a_nat_term_does_not_type() {
+        let mut env = Environment::with_prelude();
+        env.add_decl(Declaration::Definition {
+            name: Name::from_string("min_nat_def"),
+            level_params: vec![],
+            type_: Expr::arrow(c("Nat"), Expr::arrow(c("Nat"), c("Nat"))),
+            value: Expr::lam(
+                BinderInfo::Default,
+                c("Nat"),
+                Expr::lam(
+                    BinderInfo::Default,
+                    c("Nat"),
+                    Expr::apps(c("Nat.min"), [Expr::bvar(1), Expr::bvar(0)]),
+                ),
+            ),
+            is_reducible: true,
+        })
+        .expect("well-typed");
+        // `Nat.le (UInt32.toNat (min_nat_def …)) (UInt32.toNat d)` — `toNat`
+        // applied to a `Nat`.
+        let bad = Expr::pi(
+            BinderInfo::Default,
+            c("UInt32"),
+            u32d().cmp(
+                "le",
+                Expr::apps(c("min_nat_def"), [Expr::nat_lit(1), Expr::nat_lit(2)]),
+                Expr::bvar(0),
+            ),
+        );
+        assert!(
+            TypeChecker::new(&env).infer_sort(&bad).is_err(),
+            "the machine-carrier relation over a Nat term must NOT type — this is what \\
+             §3.4 exists to prevent"
+        );
+    }
+
+    // ---------------------------------------------------------------- WE-3
+
+    /// WE-3: an `i64` function against an `Int`-carrier definition, through the
+    /// EXISTING seeded two's-complement value model. The elaborator names the
+    /// constant; the caller must seed it, and the clause says which widths.
+    #[test]
+    fn we3_i64_function_discharges_against_an_int_definition() {
+        let mut env = Environment::with_prelude();
+        seed_signed_lift_model(&mut env, MachineSIntWidth::I64).expect("seeds");
+        let mut facets = FacetTable::new();
+        // clean { def ident_i (x : Int) : Int := x }
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "ident_i",
+            "ident_i_def",
+            &[Domain::Int],
+            &Domain::Int,
+            Expr::bvar(0),
+        );
+        let idi = admit_projection_function(&mut env, "idi_def", &[i64d()], 0).expect("mints");
+        facets.insert("idi", admissible());
+        facets.admit("idi", idi.with_declared_signature(Some(i64d()), None));
+
+        let clause =
+            lifted("(result as int) == ident_i(x as int)", &[("x", "i64")], "idi", "i64", &facets)
+                .expect("the signed lift must elaborate");
+        assert_eq!(
+            clause.required_signed_lift_widths,
+            vec![MachineSIntWidth::I64],
+            "the clause must DECLARE the seeding obligation it created"
+        );
+
+        let to_int = |e: Expr| Expr::app(c(&signed_lift_const_name(MachineSIntWidth::I64)), e);
+        let bv64 = Expr::app(c("BitVec"), Expr::nat_lit(64));
+        let lhs = to_int(Expr::app(c("idi_def"), Expr::bvar(0)));
+        let expected = Expr::pi(
+            BinderInfo::Default,
+            bv64.clone(),
+            Domain::Int.eq(lhs.clone(), Expr::app(c("ident_i_def"), to_int(Expr::bvar(0)))),
+        );
+        assert_eq!(clause.goal, expected, "WE-3 goal shape");
+
+        let tc = TypeChecker::new(&env);
+        let _ = tc.infer_sort(&clause.goal).expect("the signed lifted goal must be well-typed");
+        let proof = Expr::lam(
+            BinderInfo::Default,
+            bv64,
+            Expr::apps(
+                Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
+                [c("Int"), lhs],
+            ),
+        );
+        assert_eq!(
+            cert_meter::grade(&env, &clause.goal, &proof),
+            cert_meter::Grade::Certified,
+            "WE-3 must discharge by defeq and GRADE Certified"
+        );
+    }
+
+    // ------------------------------------------- self-determination (S-1)
+
+    /// Build the S-1 table: `bv_id : BitVec 128 -> BitVec 128` (a signedness
+    /// TRANSMUTE, whose recorded return domain is therefore withheld) and
+    /// `nat_fst`/`int_id` over the math carriers.
+    fn s1_facets(env: &mut Environment) -> FacetTable {
+        let mut facets = FacetTable::new();
+        let bv128 = Expr::app(c("BitVec"), Expr::nat_lit(128));
+        env.add_decl(Declaration::Definition {
+            name: Name::from_string("bv_id_def"),
+            level_params: vec![],
+            type_: Expr::arrow(bv128.clone(), bv128.clone()),
+            value: Expr::lam(BinderInfo::Default, bv128, Expr::bvar(0)),
+            is_reducible: true,
+        })
+        .expect("well-typed");
+        facets.insert("bv_id", admissible());
+        // DECLARED CARRIERS but NO return domain — exactly what the island
+        // admitter produces for `def bv_id (v : BitVec 128) : BitVec 128`:
+        // `BitVec 128` has three Rust preimages (`i128`, `u128`, and a
+        // 128-bit pointer-sized int), so `island_return_domain` deliberately
+        // answers `None` while the carriers are still read back.
+        facets.admit(
+            "bv_id",
+            Admission::reflected("bv_id_def", 1).with_declared_signature(
+                None,
+                Some(DeclaredCarriers::of_domains(&[Domain::U128], &Domain::U128)),
+            ),
+        );
+        declare_island_def(
+            env,
+            &mut facets,
+            "nat_fst",
+            "nat_fst_def",
+            &[Domain::Nat, Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(1),
+        );
+        declare_island_def(
+            env,
+            &mut facets,
+            "int_id",
+            "int_id_def",
+            &[Domain::Int],
+            &Domain::Int,
+            Expr::bvar(0),
+        );
+        facets
+    }
+
+    /// S-1a (BLOCKING in the design review): a lift is NEVER decided from a
+    /// sibling argument. `bv_id(a)` with `a : i128` beside `s : u128` would,
+    /// under the pre-existing `argument_domain` fallback, take `u128` from its
+    /// SIBLING and read the same bit pattern as `2^128 - 1` where the author
+    /// wrote `-1`. Both goals are well-typed, so the kernel cannot catch it.
+    #[test]
+    fn s1a_a_sibling_never_decides_a_lift() {
+        let mut env = Environment::with_prelude();
+        let mut facets = s1_facets(&mut env);
+        let f = admit_projection_function(&mut env, "f_def", &[u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+
+        let err = lifted(
+            "nat_fst(bv_id(a) as nat, s as nat) == (r as nat)",
+            &[("a", "i128"), ("s", "u128"), ("r", "u64")],
+            "f",
+            "u64",
+            &facets,
+        )
+        .expect_err("a non-self-determined lift must be refused");
+        assert!(
+            err.contains("not determined") || err.contains("no recorded result domain"),
+            "the refusal must name self-determination, got: {err}"
+        );
+        // NOT `err.contains("BitVec 128")` on its own: `unpinned_lift_error`
+        // puts "`i128` and `u128` share the carrier `BitVec 128`" into EVERY
+        // unpinned message whatever the cause, so that assertion carried no
+        // information (found in integration review, 2026-09-17). Pin the part
+        // that is about THIS term: the callee it could not pin, and the
+        // carrier-ambiguity reason in the head sentence rather than the note.
+        assert!(err.contains("bv_id"), "and name the term it refused: {err}");
+        assert!(
+            err.contains("more than one Rust preimage")
+                || err.contains("no recorded result domain"),
+            "and the REASON is about `bv_id`'s codomain, not the boilerplate note: {err}"
+        );
+    }
+
+    /// Mutation control m4, stated as a MEASUREMENT: the pre-existing sibling
+    /// fallback really would have answered `u128` for `bv_id(a)`, so S-1a's
+    /// refusal is the strict rule doing work rather than an accident of some
+    /// other check. If `pinned_domain` were relaxed to use `argument_domain`,
+    /// S-1a would go green with the wrong signedness.
+    #[test]
+    fn mutation_m4_the_sibling_fallback_would_have_answered_u128() {
+        let mut env = Environment::with_prelude();
+        let facets = s1_facets(&mut env);
+        let _scope = AdmissionScope::enter_at(facets, trust_symbols::Capability::Proof);
+        let call: SynExpr =
+            syn::parse_str("nat_fst(bv_id(a), s)").expect("parses");
+        let SynExpr::Call(call) = &call else { panic!("a call") };
+        let arg = &call.args[0];
+        let var_domains: BTreeMap<String, Domain> = [
+            ("a".to_string(), Domain::Signed(MachineSIntWidth::I128)),
+            ("s".to_string(), Domain::U128),
+        ]
+        .into_iter()
+        .collect();
+
+        // The pre-existing rule: the SIBLING decides.
+        let borrowed = argument_domain(arg, call, &var_domains, &Domain::Nat)
+            .expect("the pre-existing rule answers");
+        assert_eq!(
+            borrowed,
+            Domain::U128,
+            "the sibling fallback borrows `u128` — the exact borrow that would make the \\
+             signed value read as 2^128 - 1"
+        );
+        // The self-determination rule: it does not.
+        assert!(
+            matches!(
+                pinned_domain(arg, &var_domains).expect("classifies"),
+                TermPin::Unpinned(_)
+            ),
+            "the self-determination rule must refuse to decide"
+        );
+    }
+
+    /// S-1c: the same transmute inside ARITHMETIC. `bv_id(a) + b` is typed
+    /// `u128` by rule 1 from `b` alone under the pre-existing path; the
+    /// self-determination rule still refuses, because an unpinned operand
+    /// poisons the whole term.
+    #[test]
+    fn s1c_a_transmute_inside_arithmetic_is_still_unpinned() {
+        let mut env = Environment::with_prelude();
+        let mut facets = s1_facets(&mut env);
+        let f = admit_projection_function(&mut env, "f_def", &[u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+
+        let err = lifted(
+            "int_id((bv_id(a) + b) as int) == (r as int)",
+            &[("a", "i128"), ("b", "u128"), ("r", "u64")],
+            "f",
+            "u64",
+            &facets,
+        )
+        .expect_err("an unpinned operand must poison the lift");
+        assert!(
+            err.contains("not determined") || err.contains("no recorded result domain"),
+            "got: {err}"
+        );
+    }
+
+    // ------------------------------------------- the two-read cross-check
+
+    fn self_crosscheck_facets(env: &mut Environment) -> FacetTable {
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            env,
+            &mut facets,
+            "big_int",
+            "big_int_def",
+            &[Domain::Int],
+            &Domain::Int,
+            Expr::bvar(0),
+        );
+        let big = admit_projection_function(env, "big_def", &[Domain::U128], 0).expect("mints");
+        facets.insert("big", admissible());
+        facets.admit("big", big.with_declared_signature(Some(Domain::U128), None));
+        facets
+    }
+
+    /// F-3: the SELF function's recorded return domain is cross-checked against
+    /// the compiler's own resolved return type. `u128` and `i128` share the
+    /// carrier `BitVec 128`, so a wrongly recorded domain yields a WELL-TYPED
+    /// goal about the wrong integer — the kernel cannot catch it, which is why
+    /// this is checked twice. Agreement: accepted.
+    #[test]
+    fn f3_self_return_domain_agreeing_with_typeck_is_accepted() {
+        let mut env = Environment::with_prelude();
+        let facets = self_crosscheck_facets(&mut env);
+        let clause =
+            lifted("(result as int) == big_int(a as int)", &[("a", "u128")], "big", "u128", &facets)
+                .expect("the two reads agree, so the lift is allowed");
+        let _ = TypeChecker::new(&env).infer_sort(&clause.goal).expect("well-typed");
+        assert!(
+            clause.required_signed_lift_widths.is_empty(),
+            "the unsigned `u128 -> Int` row seeds nothing"
+        );
+    }
+
+    /// F-3 mutation control m6: record `i128` on a `u128` function. The two
+    /// reads disagree and the lift is refused — it is the cross-check that
+    /// holds this, not the kernel, because both readings type.
+    #[test]
+    fn mutation_m6_a_wrongly_recorded_self_return_domain_is_refused() {
+        let mut env = Environment::with_prelude();
+        let mut facets = self_crosscheck_facets(&mut env);
+        // The mutation: the mint records the WRONG signedness at the shared
+        // carrier.
+        facets.admit(
+            "big",
+            Admission::reflected("big_def", 1)
+                .with_declared_signature(Some(Domain::Signed(MachineSIntWidth::I128)), None),
+        );
+        let err = lifted(
+            "(result as int) == big_int(a as int)",
+            &[("a", "u128")],
+            "big",
+            "u128",
+            &facets,
+        )
+        .expect_err("the two reads disagree, so the lift must fail closed");
+        assert!(err.contains("two reads"), "the refusal must name the disagreement: {err}");
+        assert!(err.contains("u128") && err.contains("i128"), "and both readings: {err}");
+    }
+
+    /// D-10's other half: with NO second read the lift of a `result`-headed
+    /// term fails CLOSED rather than trusting the single recorded domain.
+    #[test]
+    fn d10_no_second_read_refuses_the_self_lift() {
+        let mut env = Environment::with_prelude();
+        let facets = self_crosscheck_facets(&mut env);
+        let err = elaborate_ensures_in(
+            "(result as int) == big_int(a as int)",
+            &[("a", "u128")],
+            "big",
+            &facets,
+            &ProofClauseInputs::proof_lift(None),
+        )
+        .expect_err("no second read must fail closed");
+        assert!(err.contains("second, independent read"), "got: {err}");
+    }
+
+    // ------------------------------------------------------- the refusals
+
+    /// D-1: a signed value has no `Nat`, and the message says what to do.
+    #[test]
+    fn d1_signed_to_nat_is_refused_with_options() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "nat_id",
+            "nat_id_def",
+            &[Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(0),
+        );
+        let f = admit_projection_function(&mut env, "f_def", &[i64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(i64d()), None));
+
+        let err = lifted("nat_id(x as nat) == (r as nat)", &[("x", "i64"), ("r", "u64")], "f", "i64", &facets)
+            .expect_err("`i64 as nat` must be refused");
+        assert!(err.contains("`i64`"), "names the type: {err}");
+        assert!(err.contains("18446744073709551615"), "says why the bit pattern is wrong: {err}");
+        assert!(err.contains("as int"), "offers the concrete alternative: {err}");
+    }
+
+    /// D-2: an unbounded term is never narrowed to a machine carrier, and the
+    /// note gives the wrap witness.
+    #[test]
+    fn d2_narrowing_is_refused_with_the_wrap_witness() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "nat_id",
+            "nat_id_def",
+            &[Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(0),
+        );
+        // A `UInt64`-declared island definition taking the lifted term.
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "u_id",
+            "u_id_def",
+            &[u64d()],
+            &u64d(),
+            Expr::bvar(0),
+        );
+        let f = admit_projection_function(&mut env, "f_def", &[u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+
+        let err = lifted(
+            "u_id(nat_id(x as nat)) == result",
+            &[("x", "u64")],
+            "f",
+            "u64",
+            &facets,
+        )
+        .expect_err("a Nat term at a UInt64 parameter must be refused");
+        assert!(err.contains("never narrowed"), "names the refusal: {err}");
+        assert!(err.contains("UInt64.ofNat"), "gives the wrap witness: {err}");
+        // The load-bearing half, and the half a message built from `from`/`to`
+        // alone CANNOT carry: the DECLARED carrier that could not be reached.
+        // Before this assertion the message read "`nat_id(x as nat)` is a `nat`
+        // term where a `nat` is declared", which is a tautology — it passed the
+        // two assertions above because both live in the constant part of the
+        // format string.
+        assert!(
+            err.contains("the declared carrier is `UInt64`"),
+            "names the DECLARED machine carrier, not the math type twice: {err}"
+        );
+        assert!(err.contains("is a `nat` term"), "names what the term is: {err}");
+    }
+
+    /// D-2 at the OTHER call site: a cast sitting at a MACHINE position
+    /// (`u_id(x as nat)` — the cast's value is a `Nat`, the parameter is
+    /// `UInt64`). Before this test the branch had no coverage at all, and it is
+    /// the one whose declared carrier comes from the ambient domain rather than
+    /// from a `DeclaredCarriers` row.
+    #[test]
+    fn d2_a_cast_at_a_machine_position_names_that_machine_carrier() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "u8_id",
+            "u8_id_def",
+            &[Domain::Machine(MachineUIntWidth::U8)],
+            &Domain::Machine(MachineUIntWidth::U8),
+            Expr::bvar(0),
+        );
+        let f = admit_projection_function(
+            &mut env,
+            "g_def",
+            &[Domain::Machine(MachineUIntWidth::U8)],
+            0,
+        )
+        .expect("mints");
+        facets.insert("g", admissible());
+        facets.admit(
+            "g",
+            f.with_declared_signature(Some(Domain::Machine(MachineUIntWidth::U8)), None),
+        );
+
+        let err = lifted("u8_id(x as nat) == result", &[("x", "u8")], "g", "u8", &facets)
+            .expect_err("a `nat`-valued cast at a `UInt8` parameter must be refused");
+        assert!(err.contains("never narrowed"), "names the refusal: {err}");
+        // The WIDTH follows the declared carrier: a hardcoded `2^64` here would
+        // be a false witness about a `UInt8` parameter.
+        assert!(
+            err.contains("the declared carrier is `UInt8`"),
+            "names the declared carrier: {err}"
+        );
+        assert!(err.contains("UInt8.ofNat"), "the wrap witness is at the DECLARED width: {err}");
+        assert!(err.contains("2^8"), "the modulus is the declared width's: {err}");
+    }
+
+    /// D-3: arithmetic that mixes a math operand with a machine one.
+    #[test]
+    fn d3_mixed_arithmetic_is_refused() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "nat_id",
+            "nat_id_def",
+            &[Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(0),
+        );
+        let f = admit_projection_function(&mut env, "f_def", &[u64d(), u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+
+        let err = lifted(
+            "nat_id(x as nat) + y == (result as nat)",
+            &[("x", "u64"), ("y", "u64")],
+            "f",
+            "u64",
+            &facets,
+        )
+        .expect_err("mixed arithmetic must be refused");
+        // Pin the REASON, not a word that also lives in D-2's note and in
+        // several pre-existing diagnostics of this crate.
+        assert!(err.contains("mixes"), "names the defect: {err}");
+        assert!(err.contains("nat") && err.contains("u64"), "names both operand types: {err}");
+        assert!(err.contains("WRAPS") || err.contains("wrap"), "says why: {err}");
+    }
+
+    /// D-9: only `as nat` and `as int` are spec casts.
+    #[test]
+    fn d9_a_machine_to_machine_cast_is_not_a_spec_cast() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        let f = admit_projection_function(&mut env, "f_def", &[u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+        let err = lifted("(x as u32) == result", &[("x", "u64")], "f", "u64", &facets)
+            .expect_err("`as u32` must be refused");
+        assert!(err.contains("not a spec cast"), "got: {err}");
+        assert!(err.contains("as nat") && err.contains("as int"), "names what IS one: {err}");
+    }
+
+    /// D-12: pointer-width integers are outside the table, and the message
+    /// explains the measured reason rather than calling it unimplemented.
+    #[test]
+    fn d12_pointer_width_is_refused_with_the_reason() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "nat_id",
+            "nat_id_def",
+            &[Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(0),
+        );
+        let f = admit_projection_function(&mut env, "f_def", &[u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+        let err = lifted(
+            "nat_id(p as nat) == (result as nat)",
+            &[("p", "usize64")],
+            "f",
+            "u64",
+            &facets,
+        )
+        .expect_err("a pointer-width lift must be refused");
+        assert!(err.contains("pointer-width"), "names the class: {err}");
+        assert!(err.contains("32-bit target"), "gives the measured reason: {err}");
+    }
+
+    /// D-11: a machine term at a math position with no cast. The implicit lift
+    /// is decision OR-1, so the refusal prints the cast to write and names
+    /// the missing ruling's effect rather than silently inserting it.
+    #[test]
+    fn d11_an_uncast_machine_term_at_a_math_position_prints_the_cast() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "nat_id",
+            "nat_id_def",
+            &[Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(0),
+        );
+        let f = admit_projection_function(&mut env, "f_def", &[u64d(), u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+
+        // One argument lifted, the other not.
+        let err = lifted(
+            "nat_id(x as nat) == (y as nat)",
+            &[("x", "u64"), ("y", "u64")],
+            "f",
+            "u64",
+            &facets,
+        )
+        .expect("both sides ARE cast here — sanity")
+        .goal;
+        let _ = err;
+
+        let err = lifted("nat_id(x as nat) <= y", &[("x", "u64"), ("y", "u64")], "f", "u64", &facets)
+            .expect_err("an uncast machine side at a Nat relation must be refused");
+        assert!(err.contains("never coerced"), "keeps the standing sentence: {err}");
+        assert!(err.contains("OR-1"), "names the missing ruling: {err}");
+        assert!(err.contains("y as nat"), "prints the cast to write: {err}");
+    }
+
+    /// The RELATION path must not give advice that cannot be taken.
+    ///
+    /// `(x as nat) == y` with `y: i64` used to print "write the lift
+    /// explicitly: `y as nat`" unconditionally — and `y as nat` is D-1, whose
+    /// whole point is that reading the bit pattern turns `-1` into `2^64 - 1`.
+    /// The call-argument path always consulted the lift table before advising;
+    /// this pins that the relation path does too.
+    #[test]
+    fn the_relation_path_advises_only_a_cast_the_table_actually_has() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        let f = admit_projection_function(&mut env, "f_def", &[u64d(), i64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+
+        let err = lifted(
+            "(x as nat) == y",
+            &[("x", "u64"), ("y", "i64")],
+            "f",
+            "u64",
+            &facets,
+        )
+        .expect_err("a signed operand at a `nat` relation must be refused");
+        // The load-bearing distinction: D-1 NAMES the refused spelling in its
+        // lead (`\`y as nat\`: \`y\` is an \`i64\` …`) and then says it has no
+        // `Nat` value; D-11 would have ADVISED writing it
+        // ("help: write the lift explicitly: `y as nat`"). Before the fix this
+        // site returned D-11 unconditionally, so the author was told to write a
+        // cast the table refuses.
+        assert!(
+            !err.contains("write the lift explicitly"),
+            "the refusal must NOT advise a cast the table refuses: {err}"
+        );
+        assert!(!err.contains("OR-1"), "and it is not the D-11 owner-ruling refusal: {err}");
+        assert!(err.contains("has no `Nat` value"), "it is D-1, by its reason: {err}");
+        assert!(err.contains("y as int"), "and it offers the route that exists: {err}");
+    }
+
+    // ------------------------------------------------------- corpus control
+
+    /// §5.5: at `ClauseMode::Strict` — which is every pre-existing entry point
+    /// — a cast is the SAME `unsupported term shape` it always was. The mode is
+    /// the gate, so no existing elaboration can be retyped by this work.
+    #[test]
+    fn strict_mode_still_refuses_a_cast_with_the_pre_existing_message() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "nat_id",
+            "nat_id_def",
+            &[Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(0),
+        );
+        let f = admit_projection_function(&mut env, "f_def", &[u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+        let err = elaborate_ensures("(x as nat) == result", &[("x", "u64")], "f", &facets)
+            .expect_err("Strict must refuse the cast");
+        assert!(
+            err.contains("unsupported term shape"),
+            "the pre-existing message, unchanged: {err}"
+        );
+
+        // ... and the SAME clause in `ProofLift` is accepted only as far as the
+        // table allows: the right-hand side is an uncast `u64`, so it is D-11,
+        // not a silent implicit lift.
+        let lifted_err = lifted("(x as nat) == result", &[("x", "u64")], "f", "u64", &facets)
+            .expect_err("the uncast side must still be refused");
+        assert!(lifted_err.contains("OR-1"), "and it names the missing ruling: {lifted_err}");
+    }
+
+    /// A literal argument at a math-declared parameter takes the DECLARED
+    /// domain, not its sibling's machine width. `nat_snd(x as nat, 300)` from a
+    /// `u8` function is the design's pinned case: today the literal is typed
+    /// `u8` by its sibling and `300` is out of range.
+    #[test]
+    fn a_literal_argument_takes_the_declared_math_domain() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "nat_snd",
+            "nat_snd_def",
+            &[Domain::Nat, Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(0),
+        );
+        let u8d = Domain::Machine(MachineUIntWidth::U8);
+        let f = admit_projection_function(&mut env, "f_def", &[u8d.clone()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u8d), None));
+
+        let clause = lifted(
+            "nat_snd(x as nat, 300) == (result as nat)",
+            &[("x", "u8")],
+            "f",
+            "u8",
+            &facets,
+        )
+        .expect("the literal must be read at `Nat`");
+        let _ = TypeChecker::new(&env).infer_sort(&clause.goal).expect("well-typed");
+        assert!(
+            format!("{}", clause.goal).contains("300"),
+            "the literal must survive as the Nat numeral 300"
+        );
+    }
+
+    /// THE UN-CAST-GATED BRANCH, measured. The literal-argument row is gated on
+    /// `ambient_proof_lift().is_some()` alone, NOT on `contains_cast`, so it
+    /// fires on an atom with no cast anywhere — which is every user `ensures`
+    /// clause the compiler now elaborates. Both reviewers flagged the lane's
+    /// "an atom must CONTAIN a `Cast` node for any new branch to fire" as
+    /// false; it is, and this is the measurement that replaces the claim.
+    ///
+    /// The direction is error → success only: under the pre-existing rule the
+    /// literal took its SIBLING's `u8` domain, `255` was in range but `300` was
+    /// not, and the clause was refused. `contains_cast` is nowhere in this
+    /// clause.
+    #[test]
+    fn the_uncast_literal_row_is_a_real_mode_difference_and_only_widens() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        let u8d = Domain::Machine(MachineUIntWidth::U8);
+        // `def shrink (a : UInt32) : UInt8 := UInt8.ofNat (UInt32.toNat a)` —
+        // the call's RESULT carrier is the atom's, so nothing but the literal's
+        // domain is in question.
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "shrink",
+            "shrink_def",
+            &[u32d()],
+            &u8d,
+            Expr::app(c("UInt8.ofNat"), Expr::app(c("UInt32.toNat"), Expr::bvar(0))),
+        );
+        let f = admit_projection_function(&mut env, "f_def", &[u8d.clone()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u8d), None));
+
+        // No cast anywhere in this clause.
+        let clause_src = "result == shrink(300)";
+        assert!(!clause_src.contains(" as "), "the point is that there is no cast here");
+
+        let strict = elaborate_ensures(clause_src, &[("x", "u8")], "f", &facets);
+        let lifted_goal = lifted(clause_src, &[("x", "u8")], "f", "u8", &facets);
+        // Strict: the literal has no domain of its own, so it takes the
+        // AMBIENT one — `u8`, from `result` — and 300 is out of range there.
+        let strict_err = strict.expect_err("Strict must refuse the literal at the ambient width");
+        // MEASURED (2026-09-18): the sibling/ambient domain decides the
+        // literal's CARRIER before any range check runs, so the pre-existing
+        // refusal is the "never coerced" one, naming `UInt32` against a `u8`
+        // term — not an out-of-range message. Pinned as measured rather than as
+        // predicted.
+        assert!(
+            strict_err.contains("never coerced")
+                && strict_err.contains("UInt32")
+                && strict_err.contains("`u8` term"),
+            "the pre-existing refusal is the ambient-decided carrier: {strict_err}"
+        );
+        // ProofLift: `300` takes the DECLARED `UInt32` parameter's unique
+        // preimage and is in range. THIS FIRES WITH NO CAST IN THE CLAUSE.
+        let clause = lifted_goal.expect("ProofLift reads the literal at the declared width");
+        let _ = TypeChecker::new(&env).infer_sort(&clause.goal).expect("well-typed");
+        assert!(
+            clause.required_signed_lift_widths.is_empty(),
+            "no seeded model is involved in a plain literal row"
+        );
+    }
+
+    /// THE PROOFLIFT CORPUS CONTROL the design specified and the lane replaced
+    /// with a by-construction argument its own code does not satisfy.
+    ///
+    /// Every user `ensures` clause the compiler elaborates now runs at
+    /// `ClauseMode::ProofLift`, so "the 117 pre-existing tests pass at Strict"
+    /// is a control for a mode nothing uses any more. This runs a batch of
+    /// cast-free clause shapes through BOTH entries and demands BYTE-IDENTICAL
+    /// goals: relations, arithmetic, an admitted call, a nested call, a literal
+    /// that is in range at its sibling's width, a boolean, and a `result`
+    /// projection.
+    #[test]
+    fn the_mode_change_is_byte_identical_on_the_uncast_corpus() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        let u64 = u64d();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "isl_id",
+            "isl_id_def",
+            &[u64.clone()],
+            &u64,
+            Expr::bvar(0),
+        );
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "isl_snd",
+            "isl_snd_def",
+            &[u64.clone(), u64.clone()],
+            &u64,
+            Expr::bvar(0),
+        );
+        let f = admit_projection_function(&mut env, "f_def", &[u64.clone(), u64.clone()], 0)
+            .expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64.clone()), None));
+
+        let params = [("x", "u64"), ("y", "u64")];
+        let corpus = [
+            "result == x",
+            "result == isl_id(x)",
+            "result == isl_snd(x, y)",
+            "result == isl_snd(isl_id(x), 7)",
+            "result == isl_id(7)",
+            "isl_id(x) == result",
+            "result >= x",
+            "result <= y",
+            "result != y",
+            "x < y",
+            "result == x + y",
+            "result == x * 2",
+            "(result == x) || (result == y)",
+            "(result >= x) && (result >= y)",
+        ];
+        let mut agreed = 0;
+        for clause in corpus {
+            assert!(!clause.contains(" as "), "the corpus is cast-free by construction");
+            let strict = elaborate_ensures(clause, &params, "f", &facets);
+            let proof = lifted(clause, &params, "f", "u64", &facets).map(|c| c.goal);
+            match (strict, proof) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(
+                        format!("{a}"),
+                        format!("{b}"),
+                        "the mode must not retype `{clause}`"
+                    );
+                    agreed += 1;
+                }
+                (Err(a), Err(_)) => {
+                    // Error → error is allowed (the text may differ; see
+                    // `contains_cast`'s doc), but a clause that FAILS today and
+                    // SUCCEEDS under the mode is a silent capability change and
+                    // must be a named test, not corpus noise.
+                    let _ = a;
+                }
+                (Ok(a), Err(b)) => {
+                    panic!("ProofLift lost a clause that elaborates today: `{clause}`\n{a}\n{b}")
+                }
+                (Err(a), Ok(_)) => panic!(
+                    "ProofLift silently accepted a cast-free clause Strict refuses: \
+                     `{clause}`\n{a}"
+                ),
+            }
+        }
+        assert!(agreed >= 12, "the control must actually elaborate its corpus: {agreed}/14");
+
+        // Trust (d1, 2026-09-28): the SAME corpus through the ∀-`result` entry —
+        // `result` a free variable typed from the signature table, no self
+        // function — which is the reading the E9 citation sweep falls back to
+        // when the postcondition goal cannot be built (always, with
+        // verification off). That fallback used to run at `Strict` while the
+        // discharge rung ran at `ProofLift`; it now runs at the discharge rung's
+        // mode, so this is the control that the switch retypes no cast-free
+        // clause and admits none Strict refuses. The bindings are selected
+        // exactly as the sweep selects them (`exact_typed_bindings_for_clause`
+        // over the whole signature table, `result` included).
+        let signature = [("x", "u64"), ("y", "u64"), ("result", "u64")];
+        let mut fallback_agreed = 0;
+        for clause in corpus {
+            let bound = exact_typed_bindings_for_clause(clause, &signature)
+                .unwrap_or_else(|e| panic!("the corpus binds exactly: `{clause}`: {e}"));
+            let var_types: Vec<(&str, &str)> =
+                bound.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+            let strict =
+                elaborate_goal_typed_in(trust_symbols::Capability::Proof, clause, &var_types, &facets);
+            let proof = elaborate_goal_typed_in_mode(
+                trust_symbols::Capability::Proof,
+                clause,
+                &var_types,
+                &facets,
+                &ProofClauseInputs::proof_lift(Some("u64")),
+                None,
+            );
+            match (strict, proof) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(
+                        format!("{a}"),
+                        format!("{}", b.goal),
+                        "the fallback's mode must not retype `{clause}`"
+                    );
+                    assert!(
+                        b.required_signed_lift_widths.is_empty(),
+                        "a cast-free clause seeds nothing: `{clause}`"
+                    );
+                    fallback_agreed += 1;
+                }
+                (Err(_), Err(_)) => {}
+                (Ok(a), Err(b)) => panic!(
+                    "the ProofLift fallback lost a clause the Strict one elaborates: \
+                     `{clause}`\n{a}\n{b}"
+                ),
+                (Err(a), Ok(_)) => panic!(
+                    "the ProofLift fallback silently accepted a cast-free clause Strict refuses: \
+                     `{clause}`\n{a}"
+                ),
+            }
+        }
+        assert!(
+            fallback_agreed >= 12,
+            "the fallback control must actually elaborate its corpus: {fallback_agreed}/14"
+        );
+    }
+
+    /// Trust (d1, 2026-09-28): the ∀-`result` entry at the two modes on the
+    /// shape that broke — a cited `ensures` whose call argument is an explicit
+    /// lift. At `ProofLift` it elaborates to a well-typed goal (the lift is
+    /// read); at `Strict` it is refused, and — the B2 half — the refusal names
+    /// the CAST, never "the argument is a `u64` term": `argument_domain` looks
+    /// through a cast, so the carrier check used to describe `x as nat` as the
+    /// bare `x`.
+    #[test]
+    fn the_forall_result_entry_reads_a_lift_only_in_proof_lift_and_never_misnames_it() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        // clean { def nat_to_u64 (n : Nat) : UInt64 := UInt64.ofNat n }
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "nat_to_u64",
+            "nat_to_u64_def",
+            &[Domain::Nat],
+            &u64d(),
+            Expr::app(c("UInt64.ofNat"), Expr::bvar(0)),
+        );
+        let clause_src = "result == nat_to_u64(x as nat)";
+        let var_types = [("result", "u64"), ("x", "u64")];
+
+        let strict = elaborate_goal_typed_in(
+            trust_symbols::Capability::Proof,
+            clause_src,
+            &var_types,
+            &facets,
+        )
+        .expect_err("Strict never reads a cast");
+        assert!(
+            strict.starts_with("unsupported term shape"),
+            "the pre-existing head, so no consumer keyed on it moves: {strict}"
+        );
+        assert!(strict.contains("x as nat"), "the refusal names the cast the author wrote: {strict}");
+        assert!(
+            !strict.contains("`u64` term") && !strict.contains("never coerced"),
+            "B2: Strict must not describe `x as nat` as its operand's machine type: {strict}"
+        );
+
+        let proof = elaborate_goal_typed_in_mode(
+            trust_symbols::Capability::Proof,
+            clause_src,
+            &var_types,
+            &facets,
+            &ProofClauseInputs::proof_lift(Some("u64")),
+            None,
+        )
+        .expect("ProofLift reads the explicit lift in the ∀-`result` reading");
+        let _ = TypeChecker::new(&env).infer_sort(&proof.goal).expect("well-typed");
+        assert!(
+            format!("{}", proof.goal).contains("UInt64.toNat"),
+            "the argument is lifted by the exact injection: {}",
+            proof.goal
+        );
+        assert!(proof.required_signed_lift_widths.is_empty(), "an unsigned lift seeds nothing");
+
+        // The mode is scoped to the one elaboration: the next Strict call is
+        // Strict again, with the same refusal.
+        let again = elaborate_goal_typed_in(
+            trust_symbols::Capability::Proof,
+            clause_src,
+            &var_types,
+            &facets,
+        )
+        .expect_err("no leaked ProofLift context");
+        assert_eq!(again, strict, "Strict is byte-stable across a ProofLift elaboration");
+    }
+
+    /// POINTER-WIDTH BINDERS, at the spelling the compiler actually sends.
+    ///
+    /// The lane shipped `LiftRefusal::PointerWidth` (D-12) and three documents
+    /// saying `usize`/`isize` are refused. They are not: every E9 discharge
+    /// lane resolves its binder table through
+    /// [`discharge_binding_ty_for_target`] BEFORE the elaborator sees it, so a
+    /// `usize` parameter arrives spelled `u64` on a 64-bit target and DOES
+    /// lift. `Domain::USize` reaches `lift_for` only from the statement-only
+    /// lanes, which carry the `usize64` spelling.
+    ///
+    /// This measures the reachable path on both sides of the resolution.
+    #[test]
+    fn a_pointer_sized_binder_lifts_at_the_targets_resolved_width() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "nat_id",
+            "nat_id_def",
+            &[Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(0),
+        );
+        let f = admit_projection_function(&mut env, "f_def", &[u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+
+        // What the compiler sends: `trust_fn_discharge_binder_types` rewrote
+        // `usize` to the target's fixed width first.
+        let resolved = discharge_binding_ty_for_target("usize", TargetPointerWidth::W64);
+        assert_eq!(resolved, "u64", "this is the spelling the discharge lanes emit");
+        let clause = lifted(
+            "(result as nat) == nat_id(p as nat)",
+            &[("p", resolved)],
+            "f",
+            resolved,
+            &facets,
+        )
+        .expect("a target-resolved pointer-sized binder lifts");
+        let _ = TypeChecker::new(&env).infer_sort(&clause.goal).expect("well-typed");
+        assert!(
+            format!("{}", clause.goal).contains("UInt64.toNat"),
+            "and it lifts at the RESOLVED width: {}",
+            clause.goal
+        );
+
+        // The un-resolved spelling — what the STATEMENT-ONLY lanes (runtime
+        // monitors, the zero-authority denotation row) keep — has no lift row.
+        // That is D-12, and this is the only family that can reach it.
+        let err = lifted(
+            "(result as nat) == nat_id(p as nat)",
+            &[("p", "usize64")],
+            "f",
+            "u64",
+            &facets,
+        )
+        .expect_err("the statement-only spelling has no lift row");
+        assert!(err.contains("pointer-width integer"), "D-12 names the refusal: {err}");
+    }
+
+    /// The 32-bit half of the same story, and the reason the row is safe: on a
+    /// pointer width where the E6 mint's FIXED unsigned record disagrees with
+    /// the target-resolved binder, the self cross-check refuses rather than
+    /// lifting at the wrong width.
+    #[test]
+    fn a_pointer_sized_return_fails_closed_when_the_two_reads_disagree() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "nat_id",
+            "nat_id_def",
+            &[Domain::Nat],
+            &Domain::Nat,
+            Expr::bvar(0),
+        );
+        // The mint records an unsigned pointer-sized return at a FIXED 64-bit
+        // domain on EVERY target (`ty_to_domain`), so on a 32-bit target it
+        // says `u64` …
+        let f = admit_projection_function(&mut env, "f_def", &[u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+        // … while `trust_fn_discharge_binder_types` resolves the same `usize`
+        // return to `u32`.
+        let resolved = discharge_binding_ty_for_target("usize", TargetPointerWidth::W32);
+        assert_eq!(resolved, "u32");
+
+        let err = lifted(
+            "(result as nat) == nat_id(p as nat)",
+            &[("p", "u64")],
+            "f",
+            resolved,
+            &facets,
+        )
+        .expect_err("the two reads disagree, so the lift must fail closed");
+        assert!(
+            err.contains("recorded result domain") || err.contains("disagree"),
+            "and the refusal is the two-read cross-check: {err}"
+        );
+    }
+
+    /// A NESTED lift: `(x as nat) as int` composes to `Int.ofNat (toNat x)`.
+    #[test]
+    fn a_nat_term_lifts_on_to_int() {
+        let mut env = Environment::with_prelude();
+        let mut facets = FacetTable::new();
+        declare_island_def(
+            &mut env,
+            &mut facets,
+            "int_id",
+            "int_id_def",
+            &[Domain::Int],
+            &Domain::Int,
+            Expr::bvar(0),
+        );
+        let f = admit_projection_function(&mut env, "f_def", &[u64d()], 0).expect("mints");
+        facets.insert("f", admissible());
+        facets.admit("f", f.with_declared_signature(Some(u64d()), None));
+
+        let clause = lifted(
+            "int_id((x as nat) as int) == ((result as nat) as int)",
+            &[("x", "u64")],
+            "f",
+            "u64",
+            &facets,
+        )
+        .expect("Nat -> Int composes");
+        let of_nat = |e: Expr| Expr::app(c("Int.ofNat"), e);
+        let to_nat = |e: Expr| Expr::app(c("UInt64.toNat"), e);
+        let expected = Expr::pi(
+            BinderInfo::Default,
+            c("UInt64"),
+            Domain::Int.eq(
+                Expr::app(c("int_id_def"), of_nat(to_nat(Expr::bvar(0)))),
+                of_nat(to_nat(Expr::app(c("f_def"), Expr::bvar(0)))),
+            ),
+        );
+        assert_eq!(clause.goal, expected);
+        let _ = TypeChecker::new(&env).infer_sort(&clause.goal).expect("well-typed");
+    }
+
+    /// `int as nat` is refused: `Int.toNat` TRUNCATES, and the compiler will
+    /// not insert a map that is not injective.
+    #[test]
+    fn int_to_nat_is_refused() {
+        assert_eq!(lift_for(&Domain::Int, MathTy::Nat), Err(LiftRefusal::IntToNat));
+        let msg = LiftRefusal::IntToNat.message("k", &Domain::Int, MathTy::Nat);
+        assert!(msg.contains("TRUNCATING"), "the note must say why: {msg}");
+    }
+
+    /// The table, stated once as a test so a future edit to `lift_for` has to
+    /// come past it. Exactness of each accepting row is measured against the
+    /// kernel in `tests/nat_lift_probes.rs`.
+    #[test]
+    fn the_lift_table_is_closed_and_exact() {
+        use MachineSIntWidth as S;
+        use MachineUIntWidth as U;
+        assert_eq!(lift_for(&u64d(), MathTy::Nat), Ok(Lift::UIntToNat(U::U64)));
+        assert_eq!(lift_for(&Domain::U128, MathTy::Nat), Ok(Lift::BitVecToNat));
+        assert_eq!(
+            lift_for(&u64d(), MathTy::Int),
+            Ok(Lift::UnsignedToInt(Box::new(Lift::UIntToNat(U::U64))))
+        );
+        assert_eq!(
+            lift_for(&Domain::U128, MathTy::Int),
+            Ok(Lift::UnsignedToInt(Box::new(Lift::BitVecToNat)))
+        );
+        assert_eq!(lift_for(&i64d(), MathTy::Int), Ok(Lift::SignedToInt(S::I64)));
+        assert_eq!(lift_for(&Domain::Nat, MathTy::Int), Ok(Lift::NatToInt));
+        assert_eq!(lift_for(&Domain::Nat, MathTy::Nat), Ok(Lift::Identity));
+        assert_eq!(lift_for(&Domain::Int, MathTy::Int), Ok(Lift::Identity));
+        // refusals
+        assert_eq!(lift_for(&i64d(), MathTy::Nat), Err(LiftRefusal::SignedToNat));
+        assert_eq!(lift_for(&Domain::Int, MathTy::Nat), Err(LiftRefusal::IntToNat));
+        assert_eq!(
+            lift_for(&Domain::USize(TargetPointerWidth::W64), MathTy::Nat),
+            Err(LiftRefusal::PointerWidth)
+        );
+        assert_eq!(
+            lift_for(&Domain::ISize(TargetPointerWidth::W32), MathTy::Int),
+            Err(LiftRefusal::PointerWidth)
+        );
+        assert_eq!(lift_for(&Domain::Bool, MathTy::Nat), Err(LiftRefusal::NoLift));
+        assert_eq!(
+            lift_for(&Domain::OptionSigned(S::I64), MathTy::Int),
+            Err(LiftRefusal::NoLift)
+        );
+        // NOTHING in the table ever narrows: no variant names `ofNat` on the
+        // machine side, which is the invariant §5.3 rests on.
+        for lift in [
+            Lift::Identity,
+            Lift::UIntToNat(U::U8),
+            Lift::BitVecToNat,
+            Lift::UnsignedToInt(Box::new(Lift::UIntToNat(U::U8))),
+            Lift::SignedToInt(S::I8),
+            Lift::NatToInt,
+        ] {
+            let rendered = format!("{}", lift.wrap(Expr::bvar(0)).expect("wraps"));
+            assert!(
+                !rendered.contains("UInt8.ofNat") && !rendered.contains("BitVec.ofNat"),
+                "a lift must never narrow: {rendered}"
+            );
+        }
+    }
+
+    /// The seeding obligation is REPORTED, not assumed: a goal that names the
+    /// signed lift says so, and a goal that does not says nothing.
+    #[test]
+    fn the_seeding_obligation_is_reported_per_clause() {
+        assert_eq!(Lift::SignedToInt(MachineSIntWidth::I32).required_signed_width(), Some(MachineSIntWidth::I32));
+        assert_eq!(Lift::UIntToNat(MachineUIntWidth::U32).required_signed_width(), None);
+        assert_eq!(
+            Lift::UnsignedToInt(Box::new(Lift::BitVecToNat)).required_signed_width(),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod requires_hypothesis_tests {
+    use super::*;
+
+    /// A candidate hypothesis whose query view agrees with `params`.
+    fn hyp(index: usize, text: &str, params: &[(&str, &str)]) -> HypothesisInput {
+        HypothesisInput {
+            contract_index: index,
+            canonical_text: text.to_string(),
+            authored_text: text.to_string(),
+            query_bindings: params
+                .iter()
+                .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+                .collect(),
+        }
+    }
+
+    fn reason_of(row: &HypothesisRow) -> &str {
+        match &row.disposition {
+            HypothesisDisposition::Omitted { reason } => reason,
+            HypothesisDisposition::Bound { .. } => panic!("expected an omission, got a binder"),
+        }
+    }
+
+    /// `E-allow`, positively and negatively: the whole arithmetic-free fragment
+    /// is carried, and nothing outside it is. The negative half is the
+    /// false-accept guard — each refused clause has a reading in Clean that
+    /// differs from the reading callers are charged, or no pinned reading at
+    /// all.
+    #[test]
+    fn e_allow_admits_exactly_the_arithmetic_free_fragment() {
+        let params: &[(&str, &str)] = &[("a", "u64"), ("b", "u64"), ("f", "bool")];
+        let build = |text: &str| {
+            elaborate_ensures_under_requires(
+                "a <= a",
+                params,
+                "irrelevant_self",
+                &FacetTable::new(),
+                &[hyp(0, text, params)],
+            )
+        };
+        for admitted in [
+            "b <= a",
+            "a == b",
+            "a != b",
+            "a < b && b < a",
+            "!(a < b)",
+            "f",
+            "!f",
+            "f == true",
+            "a <= 1000",
+            "a <= 1000u64",
+            "(a <= b) || (b <= a)",
+        ] {
+            let built =
+                build(admitted).unwrap_or_else(|e| panic!("`{admitted}` must be carried: {e}"));
+            assert_eq!(built.bound_count(), 1, "`{admitted}` must be carried");
+        }
+        for (refused, needle) in [
+            ("a + b > 10", "`+`"),
+            ("a - b > 10", "`-`"),
+            ("a * 2 > b", "`*`"),
+            ("a / 2 > b", "`/`"),
+            ("a % 2 == 0", "`%`"),
+            ("a & b == b", "`&`"),
+            ("a << 1 > b", "`<<`"),
+            ("a as u32 > 3", "cast"),
+            ("helper(a) == b", "calls a function"),
+            ("a.wrapping_add(b) > 10", "calls a function"),
+            ("1 < 2", "no parameter operand"),
+            ("a", "not a proposition"),
+            ("!a", "not a proposition"),
+        ] {
+            let err =
+                build(refused).err().unwrap_or_else(|| panic!("`{refused}` must NOT be carried"));
+            assert!(
+                err.contains("eligible"),
+                "`{refused}` must leave nothing eligible; got {err}"
+            );
+            // And the reason, when it is visible beside an eligible companion,
+            // must name the cause rather than a generic refusal.
+            let mixed = elaborate_ensures_under_requires(
+                "a <= a",
+                params,
+                "irrelevant_self",
+                &FacetTable::new(),
+                &[hyp(0, refused, params), hyp(1, "b <= a", params)],
+            )
+            .unwrap_or_else(|e| panic!("`{refused}` beside an eligible clause: {e}"));
+            assert_eq!(mixed.bound_count(), 1, "only the eligible clause is carried");
+            assert!(
+                reason_of(&mixed.hypotheses[0]).contains(needle),
+                "the omission of `{refused}` must name `{needle}`; got {}",
+                reason_of(&mixed.hypotheses[0])
+            );
+        }
+    }
+
+    /// P-A2: one carried, one omitted — and the row says so. v6/D1: report what
+    /// was graded, never a summary of it.
+    #[test]
+    fn an_omitted_clause_is_disclosed_not_dropped() {
+        let params: &[(&str, &str)] = &[("a", "u64"), ("b", "u64")];
+        let built = elaborate_ensures_under_requires(
+            "a <= a",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            &[hyp(0, "b <= a", params), hyp(1, "a + b > 10", params)],
+        )
+        .expect("the eligible clause still builds a goal");
+        assert_eq!(built.hypotheses.len(), 2, "one row per contract, in contract order");
+        assert_eq!(built.hypotheses[0].contract_index, 0);
+        assert_eq!(
+            built.hypotheses[0].disposition,
+            HypothesisDisposition::Bound { binder_index: 0 }
+        );
+        assert!(reason_of(&built.hypotheses[1]).contains("`+`"));
+        assert_eq!(built.bound_texts(), vec!["b <= a"]);
+    }
+
+    /// The hypothesis is derived from the QUERY-OWNED proposition. A clause
+    /// whose query view disagrees with the signature — the one failure the
+    /// kernel cannot catch, because the goal still types — is omitted, not
+    /// reconciled. An ABSENT query view is not "no opinion" either.
+    #[test]
+    fn a_query_view_that_disagrees_with_the_signature_is_omitted() {
+        let params: &[(&str, &str)] = &[("a", "u64"), ("b", "u64")];
+        let disagreeing = HypothesisInput {
+            contract_index: 0,
+            canonical_text: "b <= a".to_string(),
+            authored_text: "b <= a".to_string(),
+            query_bindings: vec![("a".into(), "u32".into()), ("b".into(), "u64".into())],
+        };
+        let err = elaborate_ensures_under_requires(
+            "a <= a",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            &[disagreeing],
+        )
+        .expect_err("a disagreeing carrier must not be carried");
+        assert!(err.contains("eligible"), "got {err}");
+
+        let missing = HypothesisInput {
+            contract_index: 0,
+            canonical_text: "b <= a".to_string(),
+            authored_text: "b <= a".to_string(),
+            query_bindings: Vec::new(),
+        };
+        let mixed = elaborate_ensures_under_requires(
+            "a <= a",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            &[missing, hyp(1, "a <= b", params)],
+        )
+        .expect("the well-formed companion still builds");
+        assert!(
+            reason_of(&mixed.hypotheses[0]).contains("publishes no carrier"),
+            "an absent query view is not 'no opinion': {}",
+            reason_of(&mixed.hypotheses[0])
+        );
+    }
+
+    /// A hypothesis may introduce a binder the conclusion never mentions, and it
+    /// is appended in SIGNATURE order — never in the order the clauses happen to
+    /// be authored, which would make the goal depend on contract order.
+    #[test]
+    fn extra_hypothesis_variables_are_appended_in_signature_order() {
+        let params: &[(&str, &str)] = &[("a", "u64"), ("b", "u64"), ("c", "u64")];
+        let built = elaborate_ensures_under_requires(
+            "a <= a",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            // Authored `c` first; the signature order is `b` then `c`.
+            &[hyp(0, "c <= a", params), hyp(1, "b <= a", params)],
+        )
+        .expect("both clauses are eligible");
+        assert_eq!(built.value_binders, vec!["a", "b", "c"]);
+        assert_eq!(built.bound_count(), 2);
+    }
+
+    /// The E3 quantifier fragment authors its own binders, so no second rung is
+    /// built for it — and the refusal says why rather than silently returning
+    /// the unconditional goal under the conditional name.
+    #[test]
+    fn a_quantified_ensures_has_no_second_rung() {
+        let params: &[(&str, &str)] = &[("a", "u64"), ("b", "u64")];
+        let err = elaborate_ensures_under_requires(
+            "forall i: u64, i >= i",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            &[hyp(0, "b <= a", params)],
+        )
+        .expect_err("a quantified clause must not get a second rung");
+        assert!(err.contains("quantifier"), "got {err}");
+    }
+
+    /// Zero eligible candidates is an `Err`, never `G0` wearing `G1`'s name: a
+    /// caller must not be able to spend a second kernel grade on the goal it has
+    /// already graded and report it as a conditional discharge.
+    #[test]
+    fn a_goal_with_no_hypotheses_is_refused_rather_than_returned() {
+        let params: &[(&str, &str)] = &[("a", "u64")];
+        let err = elaborate_ensures_under_requires(
+            "a <= a",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            &[],
+        )
+        .expect_err("no candidates means no second rung");
+        assert!(err.contains("eligible"), "got {err}");
+    }
+
+    /// Peel `count` `Pi` binders off `e`, panicking if there are fewer.
+    fn peel_pis(e: &Expr, count: usize) -> Expr {
+        let mut node = e.clone();
+        for step in 0..count {
+            let clean_kernel::ExprKind::Pi(_, _, body) = node.kind() else {
+                panic!("expected at least {count} Pi binders; only {step} were present: {e}");
+            };
+            let next = (**body).clone();
+            node = next;
+        }
+        node
+    }
+
+    /// The conclusion `G1` states is the one `G0` states — they share the whole
+    /// rewrite prefix, so a change to one cannot drift from the other.
+    ///
+    /// STRUCTURALLY, not by string suffix. The first version of this test
+    /// compared `g1.to_string()` against G0's last `->`-separated segment, which
+    /// a conclusion containing its own `->` defeats and which compares no binder
+    /// at all. This peels the two telescopes and compares the `Expr`s: `G1`'s
+    /// conclusion must be `G0`'s conclusion under `n` more binders, which is
+    /// exactly `lift(n)`. A drift of one operator, one binder or one de Bruijn
+    /// index fails it.
+    #[test]
+    fn g0_and_g1_state_the_same_conclusion() {
+        // A conclusion whose own rendering contains `->`: `!(a <= b)` elaborates
+        // through `Not`, which Clean prints as an arrow into `False`. The old
+        // suffix test could not tell this conclusion from a hypothesis.
+        for clause in ["a <= b", "!(a <= b)", "a <= b || b <= a"] {
+            let params: &[(&str, &str)] = &[("a", "u64"), ("b", "u64")];
+            let facets = FacetTable::new();
+            let g0 = elaborate_ensures(clause, params, "irrelevant_self", &facets)
+                .unwrap_or_else(|e| panic!("`{clause}`: the unconditional goal builds: {e}"));
+            let g1 = elaborate_ensures_under_requires(
+                clause,
+                params,
+                "irrelevant_self",
+                &facets,
+                &[hyp(0, "b <= a", params), hyp(1, "a <= b", params)],
+            )
+            .unwrap_or_else(|e| panic!("`{clause}`: the conditional goal builds: {e}"));
+
+            // The value-binder prefix is G0's, in G0's order.
+            assert_eq!(g1.value_binders, vec!["a".to_string(), "b".to_string()], "{clause}");
+            assert_eq!(g1.bound_count(), 2, "{clause}");
+
+            let n_values = g1.value_binders.len();
+            let n_hyps = g1.bound_count();
+            let g0_conclusion = peel_pis(&g0, n_values);
+            let g1_conclusion = peel_pis(&g1.goal, n_values + n_hyps);
+            assert_eq!(
+                g1_conclusion,
+                g0_conclusion.lift(u32::try_from(n_hyps).expect("two")),
+                "`{clause}`: G1's conclusion must be G0's conclusion under {n_hyps} more \
+                 binders\n G0 = {g0}\n G1 = {}",
+                g1.goal
+            );
+        }
+    }
+
+    /// THE INVARIANT OF §2.3, with teeth: only `canonical_text` is ever
+    /// elaborated. `authored_text` is real source text in production (the
+    /// compiler fills it from `span_to_snippet`), so the two genuinely differ,
+    /// and an implementation that read the authored spelling would build a
+    /// DIFFERENT hypothesis from the one callers are charged. Every other test
+    /// in this module sets the two fields to the same string and so cannot tell
+    /// the two apart.
+    #[test]
+    fn only_the_canonical_text_is_elaborated() {
+        let params: &[(&str, &str)] = &[("a", "u64"), ("b", "u64")];
+        let facets = FacetTable::new();
+        // Canonical is eligible, authored is not: the clause MUST be carried,
+        // and carried as `b <= a`.
+        let carried = elaborate_ensures_under_requires(
+            "a <= a",
+            params,
+            "irrelevant_self",
+            &facets,
+            &[HypothesisInput {
+                contract_index: 0,
+                canonical_text: "b <= a".to_string(),
+                authored_text: "a + b > 10".to_string(),
+                query_bindings: params
+                    .iter()
+                    .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+                    .collect(),
+            }],
+        )
+        .expect("the CANONICAL spelling is the eligible one");
+        assert_eq!(carried.bound_count(), 1);
+        assert_eq!(carried.bound_texts(), vec!["b <= a"]);
+        let control = elaborate_ensures_under_requires(
+            "a <= a",
+            params,
+            "irrelevant_self",
+            &facets,
+            &[hyp(0, "b <= a", params)],
+        )
+        .expect("the control builds");
+        assert_eq!(carried.goal, control.goal, "the authored spelling must not reach the goal");
+
+        // And the reverse: an INELIGIBLE canonical spelling is omitted however
+        // eligible the authored one looks.
+        let omitted = elaborate_ensures_under_requires(
+            "a <= a",
+            params,
+            "irrelevant_self",
+            &facets,
+            &[
+                HypothesisInput {
+                    contract_index: 0,
+                    canonical_text: "a + b > 10".to_string(),
+                    authored_text: "b <= a".to_string(),
+                    query_bindings: params
+                        .iter()
+                        .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+                        .collect(),
+                },
+                hyp(1, "b <= a", params),
+            ],
+        )
+        .expect("the eligible companion still builds a goal");
+        assert_eq!(omitted.bound_count(), 1);
+        let reason = reason_of(&omitted.hypotheses[0]);
+        assert!(reason.contains("`+`"), "{reason}");
+    }
+
+    /// A NEGATIVE literal bound is refused — and the refusal says so, instead of
+    /// blaming "a unary operator" the author never typed as one. The capability
+    /// gap is real and deliberate: `Formula::Int(-5)` renders as the token `-5`,
+    /// and admitting it needs a negative-numeral range argument this lane has
+    /// not measured.
+    #[test]
+    fn a_negative_literal_bound_is_refused_by_name() {
+        let params: &[(&str, &str)] = &[("x", "i32"), ("y", "i32")];
+        let mixed = elaborate_ensures_under_requires(
+            "x <= x",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            &[hyp(0, "x >= -5", params), hyp(1, "y <= x", params)],
+        )
+        .expect("the eligible companion still builds a goal");
+        assert_eq!(mixed.bound_count(), 1);
+        let reason = reason_of(&mixed.hypotheses[0]);
+        assert!(
+            reason.contains("NEGATIVE literal"),
+            "the refusal must name the negative literal; got {reason}"
+        );
+    }
+
+    /// A POINTER-SIZED parameter carries. The compiler resolves `usize` to the
+    /// target's fixed-width spelling before any discharge lane sees it
+    /// (`discharge_binding_ty_for_target`), so what arrives here is `u64` on a
+    /// 64-bit target and the clause is ordinary. This is the crates-level half
+    /// of the fix for the binder-table misuse that silently dropped every
+    /// pointer-sized precondition.
+    #[test]
+    fn a_pointer_sized_precondition_carries_once_the_binder_is_resolved() {
+        for (width, resolved) in [
+            (TargetPointerWidth::W64, "u64"),
+            (TargetPointerWidth::W32, "u32"),
+            (TargetPointerWidth::W16, "u16"),
+        ] {
+            assert_eq!(discharge_binding_ty_for_target("usize", width), resolved);
+            let params: &[(&str, &str)] = &[("n", resolved), ("m", resolved)];
+            let built = elaborate_ensures_under_requires(
+                "n <= n",
+                params,
+                "irrelevant_self",
+                &FacetTable::new(),
+                &[hyp(0, "m <= n", params)],
+            )
+            .unwrap_or_else(|e| panic!("a resolved `usize` binder at {resolved} carries: {e}"));
+            assert_eq!(built.bound_count(), 1);
+            assert_eq!(built.value_binders, vec!["n".to_string(), "m".to_string()]);
+        }
+        // The UNRESOLVED spelling is refused, which is why the compiler must
+        // resolve it and must not hand this lane a bare `usize`.
+        let params: &[(&str, &str)] = &[("n", "usize"), ("m", "usize")];
+        elaborate_ensures_under_requires(
+            "n <= n",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            &[hyp(0, "m <= n", params)],
+        )
+        .expect_err("a bare `usize` binder does not say which carrier it means");
+    }
+
+    // -----------------------------------------------------------------------
+    // OR-A1 Inc 0 / Inc 1a — the lifted conclusion and `G1★`.
+    // Predicted from the code and the r4 goal-string measurement; MEASURED
+    // passing 2026-09-28 on `ora1-land` (all six).
+    // -----------------------------------------------------------------------
+
+    /// Inc 0: a LIFTED conclusion reaches the second rung only in `ProofLift`
+    /// mode — the strict entry keeps refusing it byte for byte, so no existing
+    /// caller changes.
+    #[test]
+    fn a_lifted_conclusion_reaches_the_second_rung_only_in_proof_lift_mode() {
+        let params: &[(&str, &str)] = &[("a", "u64"), ("b", "u64")];
+        let facets = FacetTable::new();
+        let strict = elaborate_ensures_under_requires(
+            "(b as nat) <= (a as nat)",
+            params,
+            "irrelevant_self",
+            &facets,
+            &[hyp(0, "b <= a", params)],
+        );
+        assert!(strict.is_err(), "a cast is `unsupported term shape` at Strict: {strict:?}");
+        let lifted = elaborate_ensures_under_requires_in(
+            "(b as nat) <= (a as nat)",
+            params,
+            "irrelevant_self",
+            &facets,
+            &[hyp(0, "b <= a", params)],
+            &ProofClauseInputs::proof_lift(None),
+        )
+        .expect("the same clause builds a second rung in ProofLift mode");
+        assert_eq!(lifted.bound_count(), 1);
+        assert!(lifted.required_signed_lift_widths.is_empty(), "an unsigned lift seeds nothing");
+    }
+
+    /// H6: the signed widths BOTH goals name are returned as one union — here
+    /// the conclusion names none and only the lifted hypothesis names `i64`.
+    #[test]
+    fn g1_star_reports_the_signed_widths_its_hypotheses_name() {
+        let params: &[(&str, &str)] = &[("a", "i64"), ("b", "i64")];
+        let built = elaborate_ensures_under_requires(
+            "b <= a",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            &[hyp(0, "b <= a", params)],
+        )
+        .expect("a signed precondition is carried");
+        assert!(built.canonical_goal.is_some(), "{:?}", built.canonical_refusal);
+        assert_eq!(
+            built.required_signed_lift_widths,
+            vec![MachineSIntWidth::I64],
+            "`(b as int) <= (a as int)` names `trust_checked_toInt64`, so the holder of the \
+             environment must seed it before grading G1★"
+        );
+        assert_ne!(
+            built.canonical_goal.as_ref(),
+            Some(&built.goal),
+            "the signed order-key reading and the lifted `Int` reading are different terms"
+        );
+    }
+
+    /// The lifted spelling of every `E-allow` shape, as text.
+    #[test]
+    fn the_lifted_spelling_of_each_e_allow_shape() {
+        let params: &[(&str, &str)] =
+            &[("a", "u64"), ("b", "u64"), ("x", "i32"), ("f", "bool")];
+        let lift = |text: &str| {
+            let ast: SynExpr = syn::parse_str(text).expect("parses");
+            lift_hypothesis_source(&ast, params)
+        };
+        assert_eq!(lift("b <= a").as_deref(), Ok("(b as nat) <= (a as nat)"));
+        assert_eq!(lift("(a) < (b)").as_deref(), Ok("(a as nat) < (b as nat)"));
+        assert_eq!(lift("a == b").as_deref(), Ok("(a as nat) == (b as nat)"));
+        assert_eq!(lift("a <= 1000u64").as_deref(), Ok("(a as nat) <= 1000"));
+        assert_eq!(lift("x > 5").as_deref(), Ok("(x as int) > 5"));
+        assert_eq!(lift("f").as_deref(), Ok("f"));
+        // Every lifted spelling re-parses — `T_j` is elaborated from it.
+        for text in ["!(a < b)", "(a <= b) || (b <= a)", "f == true", "a != b && x >= 0"] {
+            let lifted = lift(text).unwrap_or_else(|e| panic!("`{text}`: {e}"));
+            syn::parse_str::<SynExpr>(&lifted)
+                .unwrap_or_else(|e| panic!("`{text}` lifts to `{lifted}`, which must parse: {e}"));
+        }
+        // Outside the fragment: refused, never approximated.
+        for text in ["a + b > 10", "helper(a) == b", "a"] {
+            assert!(lift(text).is_err(), "`{text}` has no lifted reading");
+        }
+    }
+
+    /// `G1★` differs from `G1` ONLY in the hypothesis bodies: same binders, same
+    /// bound set, same conclusion — structurally, not by string.
+    #[test]
+    fn g1_star_shares_g1s_binders_bound_set_and_conclusion() {
+        let params: &[(&str, &str)] = &[("a", "u64"), ("b", "u64"), ("c", "u64")];
+        let built = elaborate_ensures_under_requires(
+            "a <= b",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            &[
+                hyp(0, "a == b", params),
+                hyp(1, "a + c > 10", params),
+                hyp(2, "c <= a", params),
+            ],
+        )
+        .expect("two eligible clauses");
+        let canonical = built.canonical_goal.as_ref().expect("G1★ builds on E-allow");
+        let n = built.value_binders.len() + built.bound_count();
+        assert_eq!(built.bound_count(), 2, "the arithmetic clause is omitted from BOTH goals");
+        assert_eq!(
+            peel_pis(canonical, n),
+            peel_pis(&built.goal, n),
+            "G1★'s conclusion must be G1's conclusion, byte for byte"
+        );
+        assert_eq!(
+            built.hypotheses[0].lifted_text.as_deref(),
+            Some("(a as nat) == (b as nat)")
+        );
+        assert_eq!(built.hypotheses[1].lifted_text, None, "an omitted row has no lifted reading");
+        assert_eq!(built.hypotheses[2].lifted_text.as_deref(), Some("(c as nat) <= (a as nat)"));
+        assert_ne!(
+            canonical, &built.goal,
+            "`Eq UInt64 a b` and `Eq Nat (toNat a) (toNat b)` are different hypotheses"
+        );
+    }
+
+    /// Binder-order control for `G1★` — the off-by-one the kernel cannot catch
+    /// between two same-carrier binders. Swapping the operands of the carried
+    /// hypothesis must change the goal.
+    #[test]
+    fn g1_star_hypotheses_bind_the_authored_parameters() {
+        let params: &[(&str, &str)] = &[("a", "u64"), ("b", "u64")];
+        let build = |text: &str| {
+            elaborate_ensures_under_requires(
+                "a <= a",
+                params,
+                "irrelevant_self",
+                &FacetTable::new(),
+                &[hyp(0, text, params)],
+            )
+            .expect("builds")
+            .canonical_goal
+            .expect("G1★ builds")
+        };
+        assert_ne!(build("b <= a"), build("a <= b"), "swapped binders must not collapse");
+        assert_eq!(build("b <= a"), build("(b) <= (a)"), "parentheses are not a reading");
+    }
+
+    /// A carrier the lift table has no row for (`usize64`, the statement-only
+    /// pointer-sized spelling) still gets `G1` — and `G1★` is refused with a
+    /// reason, never approximated. The compiler never hands this lane that
+    /// spelling (it resolves `usize` to `u64` first), which is exactly why the
+    /// refusal is a disclosure rather than a lost capability.
+    #[test]
+    fn g1_star_is_refused_not_approximated_where_the_lift_table_has_no_row() {
+        let params: &[(&str, &str)] = &[("n", "usize64"), ("m", "usize64")];
+        let built = elaborate_ensures_under_requires(
+            "n <= n",
+            params,
+            "irrelevant_self",
+            &FacetTable::new(),
+            &[hyp(0, "m <= n", params)],
+        )
+        .expect("G1 builds over the fixed-width pointer carrier");
+        assert!(built.canonical_goal.is_none(), "no lift row, no G1★");
+        assert!(
+            built.canonical_refusal.as_deref().is_some_and(|r| r.contains("`requires` #0")),
+            "the refusal names the clause: {:?}",
+            built.canonical_refusal
+        );
+        assert!(built.hypotheses[0].lifted_text.is_none());
+    }
+}
+
+/// The FORWARDING mint (joint Rust+Lean cited lane, 2026-09-15): the kernel is
+/// the sole judge of the minted equation, and the argument map is the call's,
+/// not the signature's.
+#[cfg(test)]
+mod forwarding_mint_tests {
+    use clean_kernel::{Environment, Expr, Name, TypeChecker};
+
+    use super::{
+        Domain, FacetTable, MachineUIntWidth, admit_expr_function, admit_forwarding_function,
+        admit_projection_function, elaborate_ensures, elaborate_ensures_with_domains,
+        elaborate_goal_typed_with_facets,
+    };
+
+    fn u64() -> Domain {
+        Domain::Machine(MachineUIntWidth::U64)
+    }
+
+    fn u32() -> Domain {
+        Domain::Machine(MachineUIntWidth::U32)
+    }
+
+    #[test]
+    fn forwarding_mint_applies_the_callee_in_the_calls_argument_order() {
+        let mut env = Environment::with_prelude();
+        // A two-parameter callee that returns its FIRST argument.
+        admit_projection_function(&mut env, "callee_fst", &[u64(), u64()], 0).expect("callee");
+        // `fn fwd(a, b) { callee_fst(b, a) }` — the argument map is `[1, 0]`.
+        let admission =
+            admit_forwarding_function(&mut env, "fwd_swapped", &[u64(), u64()], "callee_fst", &[1, 0], &u64())
+                .expect("forwarding mint");
+        assert_eq!(admission.arity, 2);
+        assert_eq!(admission.kernel_const, "fwd_swapped");
+        // Kernel-judged consequence: `fwd_swapped a b ≡ b` (the callee's first
+        // argument is `b`), and NOT `≡ a` — a positional guess would have said `a`.
+        let a = Expr::const_(Name::from_string("a_free"), vec![]);
+        let b = Expr::const_(Name::from_string("b_free"), vec![]);
+        // Free constants stand in for neutral variables: declare them as opaque
+        // UInt64 axioms so the terms are closed and typeable.
+        for (name, _) in [("a_free", &a), ("b_free", &b)] {
+            env.add_decl(clean_kernel::Declaration::Axiom {
+                name: Name::from_string(name),
+                level_params: vec![],
+                type_: u64().ty(),
+            })
+            .expect("opaque UInt64 constant");
+        }
+        let applied = Expr::apps(Expr::const_(Name::from_string("fwd_swapped"), vec![]), [a.clone(), b.clone()]);
+        let tc = TypeChecker::new(&env);
+        assert!(tc.is_def_eq(&applied, &b), "fwd_swapped a b must reduce to b");
+        assert!(!tc.is_def_eq(&applied, &a), "fwd_swapped a b must NOT reduce to a");
+    }
+
+    #[test]
+    fn forwarding_mint_fails_closed_on_every_shape_it_does_not_own() {
+        let mut env = Environment::with_prelude();
+        admit_projection_function(&mut env, "callee_u64", &[u64(), u64()], 0).expect("callee");
+        // Out-of-range source parameter.
+        assert!(
+            admit_forwarding_function(&mut env, "f1", &[u64(), u64()], "callee_u64", &[0, 2], &u64())
+                .is_err()
+        );
+        // Carrier mismatch: `u32` parameters forwarded into `UInt64` slots — the
+        // kernel refuses the equation, so no admission is minted.
+        assert!(
+            admit_forwarding_function(&mut env, "f2", &[u32(), u32()], "callee_u64", &[0, 1], &u32())
+                .is_err()
+        );
+        // Return-carrier mismatch alone.
+        assert!(
+            admit_forwarding_function(&mut env, "f3", &[u64(), u64()], "callee_u64", &[0, 1], &u32())
+                .is_err()
+        );
+        // Wrong arity for the callee.
+        assert!(
+            admit_forwarding_function(&mut env, "f4", &[u64(), u64()], "callee_u64", &[0], &u64())
+                .is_err()
+        );
+        // An unregistered callee, an empty callee, and a self-forward.
+        assert!(
+            admit_forwarding_function(&mut env, "f5", &[u64()], "no_such_const", &[0], &u64()).is_err()
+        );
+        assert!(admit_forwarding_function(&mut env, "f6", &[u64()], "", &[0], &u64()).is_err());
+        assert!(admit_forwarding_function(&mut env, "f7", &[u64()], "f7", &[0], &u64()).is_err());
+        // None of the refusals left a constant behind.
+        for name in ["f1", "f2", "f3", "f4", "f5", "f6", "f7"] {
+            assert!(env.get_const(&Name::from_string(name)).is_none(), "{name} must not be registered");
+        }
+    }
+
+    #[test]
+    fn wave499_facet_table_arc_cow_and_ensures_ast_reuse_parity() {
+        let mut env = Environment::with_prelude();
+        let adm = admit_expr_function(&mut env, "inc_u64_def", "x + 1", &["x"], &u64())
+            .expect("admit inc_u64");
+        let mut facets =
+            FacetTable::from_structural_facets([("inc_u64", true, true, true, true)]);
+        facets.admit("inc_u64", adm);
+        facets.set_shadowed_idents([("shadowed_param", "help text")]);
+
+        // Clone shares backing Arc storage until mutated (copy-on-write).
+        let mut cloned = facets.clone();
+        assert!(std::sync::Arc::ptr_eq(&facets.records, &cloned.records));
+        assert!(std::sync::Arc::ptr_eq(&facets.shadowed_idents, &cloned.shadowed_idents));
+        cloned.remove("inc_u64");
+        assert!(!std::sync::Arc::ptr_eq(&facets.records, &cloned.records));
+        assert!(facets.admitted("inc_u64").is_some());
+        assert!(cloned.admitted("inc_u64").is_none());
+
+        // `elaborate_ensures` reuses the parsed AST without double-parsing and matches
+        // the rewritten goal byte-for-byte.
+        let goal_ensures =
+            elaborate_ensures("result == x + 1", &[("x", "u64")], "inc_u64", &facets)
+                .expect("elaborate_ensures");
+        let goal_direct = elaborate_goal_typed_with_facets(
+            "inc_u64(x) == x + 1",
+            &[("x", "u64")],
+            &facets,
+        )
+        .expect("elaborate_goal_typed_with_facets");
+        assert_eq!(goal_ensures, goal_direct);
+
+        let goal_domains = elaborate_ensures_with_domains(
+            &env,
+            "result == x + 1",
+            &[("x", u64())],
+            "inc_u64",
+            &facets,
+        )
+        .expect("elaborate_ensures_with_domains");
+        assert_eq!(goal_domains, goal_direct);
     }
 }

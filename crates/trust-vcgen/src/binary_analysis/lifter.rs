@@ -142,7 +142,7 @@ pub enum LiftError {
 
 /// Convert a lifted binary program into a verifiable MIR body.
 pub fn lift_to_mir(program: &LiftedProgram) -> Result<VerifiableFunction, LiftError> {
-    validate_program(program)?;
+    let mut cfg = validate_program(program)?;
 
     let return_ty = infer_return_ty(program)?;
     if program.instructions.is_empty() {
@@ -161,10 +161,10 @@ pub fn lift_to_mir(program: &LiftedProgram) -> Result<VerifiableFunction, LiftEr
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         });
     }
 
-    let mut cfg = reconstruct_cfg(&program.instructions);
     normalize_cfg_entry(&mut cfg, program.entry_point);
 
     let context = build_lowering_context(&cfg, &program.registers);
@@ -186,6 +186,7 @@ pub fn lift_to_mir(program: &LiftedProgram) -> Result<VerifiableFunction, LiftEr
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     })
 }
 
@@ -198,7 +199,9 @@ fn normalize_cfg_entry(cfg: &mut super::cfg_reconstruct::ReconstructedCfg, entry
     }
 }
 
-fn validate_program(program: &LiftedProgram) -> Result<(), LiftError> {
+fn validate_program(
+    program: &LiftedProgram,
+) -> Result<super::cfg_reconstruct::ReconstructedCfg, LiftError> {
     let mut seen_registers = BTreeSet::new();
     for register in &program.registers {
         if !seen_registers.insert(register.id) {
@@ -265,7 +268,7 @@ fn validate_program(program: &LiftedProgram) -> Result<(), LiftError> {
         }
     }
 
-    Ok(())
+    Ok(cfg)
 }
 
 fn validate_target(

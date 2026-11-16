@@ -15,7 +15,9 @@ use crate::data_structures::SsoHashSet;
 use crate::fold::{FallibleTypeFolder, TypeFoldable, TypeFolder, TypeSuperFoldable};
 use crate::inherent::*;
 use crate::visit::{Flags, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
-use crate::{self as ty, DebruijnIndex, Interner, UniverseIndex, Unnormalized};
+use crate::{
+    self as ty, Const, DebruijnIndex, Interner, PredicateProxy, Region, UniverseIndex, Unnormalized,
+};
 
 /// `Binder` is a binder for higher-ranked lifetimes or types. It is part of the
 /// compiler's representation for things like `for<'a> Fn(&'a isize)`
@@ -23,8 +25,6 @@ use crate::{self as ty, DebruijnIndex, Interner, UniverseIndex, Unnormalized};
 ///
 /// See <https://rustc-dev-guide.rust-lang.org/ty_module/instantiating_binders.html>
 /// for more details.
-///
-/// `Decodable` and `Encodable` are implemented for `Binder<T>` using the `impl_binder_encode_decode!` macro.
 #[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner, T)]
 #[derive(GenericTypeVisitable, Lift_Generic)]
 #[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
@@ -34,45 +34,6 @@ pub struct Binder<I: Interner, T> {
 }
 
 impl<I: Interner, T: Eq> Eq for Binder<I, T> {}
-
-#[cfg(feature = "nightly")]
-macro_rules! impl_binder_encode_decode {
-    ($($t:ty),+ $(,)?) => {
-        $(
-            impl<I: Interner, E: rustc_serialize::Encoder> rustc_serialize::Encodable<E> for ty::Binder<I, $t>
-            where
-                $t: rustc_serialize::Encodable<E>,
-                I::BoundVarKinds: rustc_serialize::Encodable<E>,
-            {
-                fn encode(&self, e: &mut E) {
-                    self.bound_vars().encode(e);
-                    self.as_ref().skip_binder().encode(e);
-                }
-            }
-            impl<I: Interner, D: rustc_serialize::Decoder> rustc_serialize::Decodable<D> for ty::Binder<I, $t>
-            where
-                $t: TypeVisitable<I> + rustc_serialize::Decodable<D>,
-                I::BoundVarKinds: rustc_serialize::Decodable<D>,
-            {
-                fn decode(decoder: &mut D) -> Self {
-                    let bound_vars = rustc_serialize::Decodable::decode(decoder);
-                    ty::Binder::bind_with_vars(rustc_serialize::Decodable::decode(decoder), bound_vars)
-                }
-            }
-        )*
-    }
-}
-
-#[cfg(feature = "nightly")]
-impl_binder_encode_decode! {
-    ty::FnSig<I>,
-    ty::FnSigTys<I>,
-    ty::TraitPredicate<I>,
-    ty::ExistentialPredicate<I>,
-    ty::TraitRef<I>,
-    ty::ExistentialTraitRef<I>,
-    ty::HostEffectPredicate<I>,
-}
 
 impl<I: Interner, T> Binder<I, T>
 where
@@ -149,18 +110,22 @@ impl<I: Interner, T> Binder<I, T> {
     ///
     /// See existing uses of `.skip_binder()` in `rustc_trait_selection::traits::select`
     /// or `rustc_next_trait_solver` for examples.
+    #[inline]
     pub fn skip_binder(self) -> T {
         self.value
     }
 
+    #[inline]
     pub fn bound_vars(&self) -> I::BoundVarKinds {
         self.bound_vars
     }
 
+    #[inline]
     pub fn as_ref(&self) -> Binder<I, &T> {
         Binder { value: &self.value, bound_vars: self.bound_vars }
     }
 
+    #[inline]
     pub fn as_deref(&self) -> Binder<I, &T::Target>
     where
         T: Deref,
@@ -168,6 +133,7 @@ impl<I: Interner, T> Binder<I, T> {
         Binder { value: &self.value, bound_vars: self.bound_vars }
     }
 
+    #[inline]
     pub fn map_bound_ref<F, U: TypeVisitable<I>>(&self, f: F) -> Binder<I, U>
     where
         F: FnOnce(&T) -> U,
@@ -175,6 +141,7 @@ impl<I: Interner, T> Binder<I, T> {
         self.as_ref().map_bound(f)
     }
 
+    #[inline]
     pub fn map_bound<F, U: TypeVisitable<I>>(self, f: F) -> Binder<I, U>
     where
         F: FnOnce(T) -> U,
@@ -185,6 +152,19 @@ impl<I: Interner, T> Binder<I, T> {
             let mut validator = ValidateBoundVars::new(bound_vars);
             let _ = value.visit_with(&mut validator);
         }
+        Binder { value, bound_vars }
+    }
+
+    /// There are some uses of `map_bound` which are incredibly hot and trivially
+    /// correct. Only use this if this significantly improves the performance of
+    /// builds with debug assertions.
+    #[inline]
+    pub fn map_bound_no_validate_bound_vars<F, U: TypeVisitable<I>>(self, f: F) -> Binder<I, U>
+    where
+        F: FnOnce(T) -> U,
+    {
+        let Binder { value, bound_vars } = self;
+        let value = f(value);
         Binder { value, bound_vars }
     }
 
@@ -210,6 +190,7 @@ impl<I: Interner, T> Binder<I, T> {
     /// don't actually track bound vars. However, semantically, it is different
     /// because bound vars aren't allowed to change here, whereas they are
     /// in `bind`. This may be (debug) asserted in the future.
+    #[inline]
     pub fn rebind<U>(&self, value: U) -> Binder<I, U>
     where
         U: TypeVisitable<I>,
@@ -227,6 +208,7 @@ impl<I: Interner, T> Binder<I, T> {
     /// binders, but that would require adjusting the debruijn
     /// indices, and given the shallow binding structure we often use,
     /// would not be that useful.)
+    #[inline]
     pub fn no_bound_vars(self) -> Option<T>
     where
         T: TypeVisitable<I>,
@@ -280,20 +262,20 @@ impl<I: Interner> TypeVisitor<I> for ValidateBoundVars<I> {
     }
 
     fn visit_ty(&mut self, t: I::Ty) -> Self::Result {
-        if t.outer_exclusive_binder() < self.binder_index
+        if t.outer_exclusive_binder() <= self.binder_index
             || !self.visited.insert((self.binder_index, t))
         {
-            return ControlFlow::Break(());
+            return ControlFlow::Continue(());
         }
         match t.kind() {
             ty::Bound(ty::BoundVarIndexKind::Bound(debruijn), bound_ty)
                 if debruijn == self.binder_index =>
             {
                 let idx = bound_ty.var().as_usize();
-                if self.bound_vars.len() <= idx {
+                let Some(bound_var) = self.bound_vars.get(idx) else {
                     panic!("Not enough bound vars: {:?} not found in {:?}", t, self.bound_vars);
-                }
-                bound_ty.assert_eq(self.bound_vars.get(idx).unwrap());
+                };
+                bound_ty.assert_eq(bound_var);
             }
             _ => {}
         };
@@ -301,19 +283,19 @@ impl<I: Interner> TypeVisitor<I> for ValidateBoundVars<I> {
         t.super_visit_with(self)
     }
 
-    fn visit_const(&mut self, c: I::Const) -> Self::Result {
-        if c.outer_exclusive_binder() < self.binder_index {
-            return ControlFlow::Break(());
+    fn visit_const(&mut self, c: Const<I>) -> Self::Result {
+        if c.outer_exclusive_binder() <= self.binder_index {
+            return ControlFlow::Continue(());
         }
         match c.kind() {
             ty::ConstKind::Bound(debruijn, bound_const)
                 if debruijn == ty::BoundVarIndexKind::Bound(self.binder_index) =>
             {
                 let idx = bound_const.var().as_usize();
-                if self.bound_vars.len() <= idx {
+                let Some(bound_var) = self.bound_vars.get(idx) else {
                     panic!("Not enough bound vars: {:?} not found in {:?}", c, self.bound_vars);
-                }
-                bound_const.assert_eq(self.bound_vars.get(idx).unwrap());
+                };
+                bound_const.assert_eq(bound_var);
             }
             _ => {}
         };
@@ -321,14 +303,14 @@ impl<I: Interner> TypeVisitor<I> for ValidateBoundVars<I> {
         c.super_visit_with(self)
     }
 
-    fn visit_region(&mut self, r: I::Region) -> Self::Result {
+    fn visit_region(&mut self, r: Region<I>) -> Self::Result {
         match r.kind() {
             ty::ReBound(index, br) if index == ty::BoundVarIndexKind::Bound(self.binder_index) => {
                 let idx = br.var().as_usize();
-                if self.bound_vars.len() <= idx {
+                let Some(bound_var) = self.bound_vars.get(idx) else {
                     panic!("Not enough bound vars: {:?} not found in {:?}", r, self.bound_vars);
-                }
-                br.assert_eq(self.bound_vars.get(idx).unwrap());
+                };
+                br.assert_eq(bound_var);
             }
 
             _ => (),
@@ -396,10 +378,20 @@ impl<I: Interner, T: TypeVisitable<I>> EarlyBinder<I, T> {
 }
 
 impl<I: Interner, T> EarlyBinder<I, T> {
+    /// Use `bind/bind_iter/bind_no_rigid_aliases` instead.
+    /// Don't use this unless you know what you're doing.
+    pub fn bind_unchecked(value: T) -> EarlyBinder<I, T> {
+        EarlyBinder { value, _tcx: PhantomData }
+    }
+}
+
+impl<I: Interner, T> EarlyBinder<I, T> {
+    #[inline]
     pub fn as_ref(&self) -> EarlyBinder<I, &T> {
         EarlyBinder { value: &self.value, _tcx: PhantomData }
     }
 
+    #[inline]
     pub fn map_bound_ref<F, U>(&self, f: F) -> EarlyBinder<I, U>
     where
         F: FnOnce(&T) -> U,
@@ -407,6 +399,7 @@ impl<I: Interner, T> EarlyBinder<I, T> {
         self.as_ref().map_bound(f)
     }
 
+    #[inline]
     pub fn map_bound<F, U>(self, f: F) -> EarlyBinder<I, U>
     where
         F: FnOnce(T) -> U,
@@ -415,6 +408,7 @@ impl<I: Interner, T> EarlyBinder<I, T> {
         EarlyBinder { value, _tcx: PhantomData }
     }
 
+    #[inline]
     pub fn try_map_bound<F, U, E>(self, f: F) -> Result<EarlyBinder<I, U>, E>
     where
         F: FnOnce(T) -> Result<U, E>,
@@ -423,6 +417,7 @@ impl<I: Interner, T> EarlyBinder<I, T> {
         Ok(EarlyBinder { value, _tcx: PhantomData })
     }
 
+    #[inline]
     pub fn rebind<U>(&self, value: U) -> EarlyBinder<I, U> {
         EarlyBinder { value, _tcx: PhantomData }
     }
@@ -443,6 +438,7 @@ impl<I: Interner, T> EarlyBinder<I, T> {
     ///
     /// See also [`Binder::skip_binder`](Binder::skip_binder), which is
     /// the analogous operation on [`Binder`].
+    #[inline]
     pub fn skip_binder(self) -> T {
         self.value
     }
@@ -525,7 +521,7 @@ where
 {
 }
 
-impl<'s, I: Interner, Iter: IntoIterator> EarlyBinder<I, Iter>
+impl<I: Interner, Iter: IntoIterator> EarlyBinder<I, Iter>
 where
     Iter::Item: Deref,
     <Iter::Item as Deref>::Target: Copy + TypeFoldable<I>,
@@ -533,8 +529,8 @@ where
     pub fn iter_instantiated_copied(
         self,
         cx: I,
-        args: &'s [I::GenericArg],
-    ) -> IterInstantiatedCopied<'s, I, Iter> {
+        args: I::GenericArgs,
+    ) -> IterInstantiatedCopied<I, Iter> {
         IterInstantiatedCopied { it: self.value.into_iter(), cx, args }
     }
 
@@ -545,21 +541,19 @@ where
     }
 }
 
-pub struct IterInstantiatedCopied<'a, I: Interner, Iter: IntoIterator> {
+pub struct IterInstantiatedCopied<I: Interner, Iter: IntoIterator> {
     it: Iter::IntoIter,
     cx: I,
-    args: &'a [I::GenericArg],
+    args: I::GenericArgs,
 }
 
-impl<'a, I: Interner, Iter: IntoIterator<IntoIter: Clone>> Clone
-    for IterInstantiatedCopied<'a, I, Iter>
-{
-    fn clone(&self) -> IterInstantiatedCopied<'a, I, Iter> {
+impl<I: Interner, Iter: IntoIterator<IntoIter: Clone>> Clone for IterInstantiatedCopied<I, Iter> {
+    fn clone(&self) -> IterInstantiatedCopied<I, Iter> {
         IterInstantiatedCopied { it: self.it.clone(), cx: self.cx, args: self.args }
     }
 }
 
-impl<I: Interner, Iter: IntoIterator> Iterator for IterInstantiatedCopied<'_, I, Iter>
+impl<I: Interner, Iter: IntoIterator> Iterator for IterInstantiatedCopied<I, Iter>
 where
     Iter::Item: Deref,
     <Iter::Item as Deref>::Target: Copy + TypeFoldable<I>,
@@ -577,7 +571,7 @@ where
     }
 }
 
-impl<I: Interner, Iter: IntoIterator> DoubleEndedIterator for IterInstantiatedCopied<'_, I, Iter>
+impl<I: Interner, Iter: IntoIterator> DoubleEndedIterator for IterInstantiatedCopied<I, Iter>
 where
     Iter::IntoIter: DoubleEndedIterator,
     Iter::Item: Deref,
@@ -590,7 +584,7 @@ where
     }
 }
 
-impl<I: Interner, Iter: IntoIterator> ExactSizeIterator for IterInstantiatedCopied<'_, I, Iter>
+impl<I: Interner, Iter: IntoIterator> ExactSizeIterator for IterInstantiatedCopied<I, Iter>
 where
     Iter::IntoIter: ExactSizeIterator,
     Iter::Item: Deref,
@@ -694,12 +688,13 @@ impl<I: Interner, T: TypeFoldable<I>> ty::EarlyBinder<I, T> {
     /// - Outside of `foo`, `T` is bound (represented by the presence of `EarlyBinder`).
     /// - Inside of the body of `foo`, we treat `T` as a placeholder by calling
     /// `instantiate_identity` to discharge the `EarlyBinder`.
+    #[inline]
     pub fn instantiate_identity(self) -> Unnormalized<I, T> {
         // FIXME(#155345): In case the bound value was already normalized, this
         // is unnecessary. We may want to track explicitly whether `EarlyBinder`
         // contains something that has been normalized already.
         // Also do that for other types who have `instantiate_identity` method,
-        // e.g., `GenericPredicates` and `ConstConditions`.
+        // e.g., `GenericClauses` and `ConstConditions`.
         //
         // This is annoying, as e.g. `type_of` for opaque types is normalized,
         // while `type_of` for free type aliases is not.
@@ -707,6 +702,7 @@ impl<I: Interner, T: TypeFoldable<I>> ty::EarlyBinder<I, T> {
     }
 
     /// Returns the inner value, but only if it contains no bound vars.
+    #[inline]
     pub fn no_bound_vars(self) -> Option<T> {
         if !self.value.has_param() { Some(self.value) } else { None }
     }
@@ -736,7 +732,7 @@ impl<'a, I: Interner> TypeFolder<I> for ArgFolder<'a, I> {
         t
     }
 
-    fn fold_region(&mut self, r: I::Region) -> I::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
         // Note: This routine only handles regions that are bound on
         // type declarations and other outer declarations, not those
         // bound in *fn types*. Region instantiation of the bound
@@ -772,7 +768,11 @@ impl<'a, I: Interner> TypeFolder<I> for ArgFolder<'a, I> {
         }
     }
 
-    fn fold_const(&mut self, c: I::Const) -> I::Const {
+    fn fold_const(&mut self, c: Const<I>) -> Const<I> {
+        if !c.has_param() {
+            return c;
+        }
+
         if let ty::ConstKind::Param(p) = c.kind() {
             self.const_for_param(p, c)
         } else {
@@ -780,7 +780,7 @@ impl<'a, I: Interner> TypeFolder<I> for ArgFolder<'a, I> {
         }
     }
 
-    fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
+    fn fold_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> P {
         if p.has_param() { p.super_fold_with(self) } else { p }
     }
 
@@ -827,7 +827,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
         )
     }
 
-    fn const_for_param(&self, p: I::ParamConst, source_ct: I::Const) -> I::Const {
+    fn const_for_param(&self, p: I::ParamConst, source_ct: Const<I>) -> Const<I> {
         // Look up the const in the args. It really should be in there.
         let opt_ct = self.args.get(p.index() as usize).map(|arg| arg.kind());
         let ct = match opt_ct {
@@ -844,7 +844,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
     fn const_param_expected(
         &self,
         p: I::ParamConst,
-        ct: I::Const,
+        ct: Const<I>,
         kind: ty::GenericArgKind<I>,
     ) -> ! {
         panic!(
@@ -859,7 +859,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
 
     #[cold]
     #[inline(never)]
-    fn const_param_out_of_range(&self, p: I::ParamConst, ct: I::Const) -> ! {
+    fn const_param_out_of_range(&self, p: I::ParamConst, ct: Const<I>) -> ! {
         panic!(
             "const parameter `{:?}` ({:?}/{}) out of range when instantiating args={:?}",
             p,
@@ -874,7 +874,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
     fn region_param_expected(
         &self,
         ebr: I::EarlyParamRegion,
-        r: I::Region,
+        r: Region<I>,
         kind: ty::GenericArgKind<I>,
     ) -> ! {
         panic!(
@@ -889,7 +889,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
 
     #[cold]
     #[inline(never)]
-    fn region_param_out_of_range(&self, ebr: I::EarlyParamRegion, r: I::Region) -> ! {
+    fn region_param_out_of_range(&self, ebr: I::EarlyParamRegion, r: Region<I>) -> ! {
         panic!(
             "region parameter `{:?}` ({:?}/{}) out of range when instantiating args={:?}",
             ebr,
@@ -950,7 +950,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
         }
     }
 
-    fn shift_region_through_binders(&self, region: I::Region) -> I::Region {
+    fn shift_region_through_binders(&self, region: Region<I>) -> Region<I> {
         if self.binders_passed == 0 || !region.has_escaping_bound_vars() {
             region
         } else {
@@ -1061,7 +1061,7 @@ impl<I: Interner> BoundRegionKind<I> {
         match *self {
             ty::BoundRegionKind::Named(def_id) => {
                 let name = tcx.item_name(def_id);
-                if name.is_kw_underscore_lifetime() { None } else { Some(name) }
+                if name == I::Symbol::KW_UNDERSCORE_LIFETIME { None } else { Some(name) }
             }
             ty::BoundRegionKind::NamedForPrinting(name) => Some(name),
             _ => None,
@@ -1123,12 +1123,13 @@ impl<I: Interner> BoundVariableKind<I> {
 }
 
 #[derive_where(Clone, Copy, PartialEq, Eq, Hash; I: Interner)]
-#[derive(GenericTypeVisitable)]
+#[derive(GenericTypeVisitable, Lift_Generic)]
 #[cfg_attr(
     feature = "nightly",
     derive(Encodable_NoContext, StableHash_NoContext, Decodable_NoContext)
 )]
 pub struct BoundRegion<I: Interner> {
+    #[lift(identity)]
     pub var: ty::BoundVar,
     pub kind: BoundRegionKind<I>,
 }
@@ -1290,7 +1291,7 @@ impl<I: Interner> PlaceholderConst<I> {
     }
 
     pub fn find_const_ty_from_env(self, env: I::ParamEnv) -> I::Ty {
-        let mut candidates = env.caller_bounds().iter().filter_map(|clause| {
+        let mut candidates = env.caller_bounds().filter_map(|clause| {
             // `ConstArgHasType` are never desugared to be higher ranked.
             match clause.kind().skip_binder() {
                 ty::ClauseKind::ConstArgHasType(placeholder_ct, ty) => {

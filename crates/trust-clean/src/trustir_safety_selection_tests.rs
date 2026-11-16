@@ -150,6 +150,7 @@ fn const_add_func(k: i128, width: u32) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -179,6 +180,7 @@ fn no_assert_func() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -236,6 +238,7 @@ fn assert_cond_func(lhs: &str, rhs: i128, msg: AssertMessage, ty: Ty) -> Verifia
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -410,6 +413,7 @@ fn a_precondition_can_never_supply_the_certified_negation_width() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let want = IrSafetyVcKind::NegOverflow(IrSWidth::W32);
     assert_eq!(
@@ -1289,6 +1293,7 @@ fn a_precondition_can_never_define_the_assert_condition_local_the_mir_does_not_d
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let binds = |rhs: Formula| Formula::Eq(bvar("ok"), Box::new(rhs));
     // The VC on trial is the ASSERT's own obligation, whose body is the bare condition
@@ -1537,6 +1542,7 @@ fn neg_assert_func(subject_local: usize, subject_ty: Ty, neg_local: usize) -> Ve
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1660,6 +1666,50 @@ fn the_signed_abs_negation_lane_still_certifies() {
         "`w_i8_abs`'s `core::num::<impl i8>::abs` panic obligation must still certify \
          `negOverflowsI8` (got {got:?}) — it has no `Rvalue::UnaryOp(Neg, ..)` anywhere"
     );
+}
+
+/// ABS-NAME-1 (2026-10-06): the `abs` producer's subject is admitted only for the call
+/// the EMITTER charges — `trust_vcgen::is_signed_abs_call`, core's authenticated
+/// `core::num::<impl iN>::abs`. This file's own twin (`is_signed_abs_callee`) was
+/// `method_tail == "abs"` plus a `core::num::` / `std::num::` SUBSTRING, so the first
+/// argument of a user `mycore::num::abs(x)` or `G::<core::num::Wrapping<i8>>::abs(x)`,
+/// or of a stamped impersonator, was an admissible negation subject. PRE-FIX (the twin
+/// restored): every user spelling below yields `[("x", i8)]`.
+#[test]
+fn only_cores_signed_abs_offers_its_argument_as_a_negation_subject() {
+    let func = load(
+        "fixtures/mass-harvest-2026-07-17/int-preds/dumps",
+        "trust-mir-63bc8917efe430b4-27aa733b96bd85eb.json",
+    );
+    let with_callee = |callee: &str| {
+        let mut g = func.clone();
+        let mut n = 0;
+        for block in &mut g.body.blocks {
+            if let Terminator::Call { func: f, .. } = &mut block.terminator {
+                assert_eq!(f, "core::num::<impl i8>::abs", "fixture premise");
+                *f = callee.to_string();
+                n += 1;
+            }
+        }
+        assert_eq!(n, 1, "fixture premise: one `abs` call");
+        g
+    };
+    let x = ("x".to_string(), Ty::Int { width: 8, signed: true });
+    for callee in ["core::num::<impl i8>::abs", "std::num::<impl i8>::abs"] {
+        assert_eq!(negation_subjects(&with_callee(callee)), vec![x.clone()], "`{callee}`");
+    }
+    for callee in [
+        "user::mycore::num::abs",
+        "user::mystd::num::abs",
+        "user::G::<core::num::wrapping::Wrapping<i8>>::abs",
+        "__trust_crate@1973d11b2baa21fa::core::num::<impl i8>::abs",
+        "core::num::wrapping::Wrapping::<i8>::abs",
+    ] {
+        assert!(
+            negation_subjects(&with_callee(callee)).is_empty(),
+            "`{callee}` is not core's signed `abs`; its argument is no negation subject"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1905,6 +1955,7 @@ fn a_mixed_path_guard_or_is_emitter_reachable_through_an_unwind_edge() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = trust_vcgen::generate_vcs(&func);
     let mixed: Vec<_> = vcs.iter().filter(|vc| contains_mixed_or(&vc.formula)).collect();
@@ -2103,6 +2154,7 @@ fn neg_subject_func() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -2479,6 +2531,7 @@ fn raw_neg_func(name: &str, w: u32) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

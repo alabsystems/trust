@@ -11,9 +11,10 @@
 // - AlgorithmIdentifier requires AlgorithmParameters: Asn1DefinedByWritable
 // - AlgorithmParameters requires PBES2Params: Asn1Writable (cycle!)
 //
-// This bug is likely resolved by the next trait solver. This test documents
-// the reproduction case; when the trait solver is upgraded, update this to
-// use `//@ check-pass` and uncomment the triggering call.
+// Measured 2026-11-04 (§5.2 triage): with the triggering call enabled, the
+// program is an overflow error (E0275) under both solvers — fast under the
+// next solver, about 72 s under load under the old solver. It is not a
+// check-pass program on either solver, so the call stays commented out.
 //
 // Upstream: https://github.com/rust-lang/rust/issues/133354
 // Tracked in Trust: #865
@@ -24,11 +25,10 @@
 
 #![allow(dead_code)]
 
-// NOTE: This file defines the types and trait impls that trigger the hang,
-// but does NOT call the function that triggers the infinite loop. The hang
-// occurs specifically when `write_element(&Some(&p.hash_algorithm))` is
-// called, which forces the solver to resolve the cyclic obligations.
-// Uncommenting the call in `f()` would hang the compiler.
+// NOTE: This file defines the types and trait impls for the cyclic case,
+// but does NOT call the function that forces the solver to resolve it.
+// Calling `write_element(&Some(&p.hash_algorithm))` overflows trait
+// solving (E0275), slowly on the old solver, rather than hanging forever.
 
 mod asn1 {
     pub trait Asn1Writable: Sized {}
@@ -94,8 +94,9 @@ mod common {
 
 pub fn write_element<T: asn1::Asn1Writable>(_val: &T) {}
 
-// FIXME(tRust): Uncommenting this function triggers the compiler hang.
-// Enable when next-solver is adopted.
+// Trust: enabling this call makes the crate an E0275 overflow error on
+// both solvers (measured 2026-11-04; see header). It stays commented out
+// because the triggered program is erroneous, not because it hangs.
 // pub fn f(p: &common::RsaPssParameters<'_>) {
 //     write_element(&Some(&p.hash_algorithm));
 // }

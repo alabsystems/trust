@@ -256,24 +256,27 @@ impl DepGraph {
         // A one-hop presence check incorrectly covered A in A -> B -> C when
         // A and B had records but C did not. Grow coverage from record-bearing
         // leaves so every registered transitive dependency must be covered.
-        let mut covered = BTreeSet::new();
+        let mut covered: BTreeSet<&str> = BTreeSet::new();
         loop {
             let before = covered.len();
-            for node in self.nodes.values().filter(|node| node.has_record) {
+            for node in self.nodes.values() {
+                if !node.has_record || covered.contains(node.function.as_str()) {
+                    continue;
+                }
                 let registered_callees_covered = node
                     .callees
                     .iter()
                     .filter(|callee| self.nodes.contains_key(callee.as_str()))
-                    .all(|callee| covered.contains(callee));
+                    .all(|callee| covered.contains(callee.as_str()));
                 if registered_callees_covered {
-                    covered.insert(node.function.clone());
+                    covered.insert(node.function.as_str());
                 }
             }
             if covered.len() == before {
                 break;
             }
         }
-        let structurally_covered = covered.into_iter().collect();
+        let structurally_covered = covered.into_iter().map(str::to_owned).collect();
 
         let total = self.nodes.len();
         let record_count = total - without_record.len();

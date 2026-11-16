@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // Divergence D4's root-fix (full-population frontier, wave-full-0831): a
 // CONTRACT-ATTRIBUTED body takes the elision posture — `param_opaque`,
 // SYMBOLIC: never spliced (a module claiming to represent the program must

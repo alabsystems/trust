@@ -9,8 +9,7 @@ use rustc_middle::mir::AssertKind::BoundsCheck;
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::{self, AdtDef, CanonicalUserTypeAnnotation, Ty, Variance};
-use rustc_middle::{bug, span_bug};
-use rustc_span::Span;
+use rustc_span::{Span, bug, span_bug};
 use tracing::{debug, instrument, trace};
 
 use crate::builder::ForGuard::{OutsideGuard, RefWithinGuard};
@@ -88,6 +87,7 @@ fn convert_to_hir_projections_and_truncate_for_capture(
     for mir_projection in mir_projections {
         let hir_projection = match mir_projection {
             ProjectionElem::Deref => HirProjectionKind::Deref,
+            ProjectionElem::PhantomDeref => continue,
             ProjectionElem::Field(field, _) => {
                 let variant = variant.unwrap_or(FIRST_VARIANT);
                 HirProjectionKind::Field(*field, variant)
@@ -133,7 +133,7 @@ fn convert_to_hir_projections_and_truncate_for_capture(
 ///        ancestor of `foo.x.y`. It's the caller's responsibility to ensure that both projections
 ///        list are being applied to the same root variable.
 fn is_ancestor_or_same_capture(
-    proj_possible_ancestor: &[HirProjectionKind],
+    proj_possible_ancestor: &[HirProjection<'_>],
     proj_capture: &[HirProjectionKind],
 ) -> bool {
     // We want to make sure `is_ancestor_or_same_capture("x.0.0", "x.0")` to return false.
@@ -142,7 +142,7 @@ fn is_ancestor_or_same_capture(
         return false;
     }
 
-    iter::zip(proj_possible_ancestor, proj_capture).all(|(a, b)| a == b)
+    iter::zip(proj_possible_ancestor, proj_capture).all(|(a, &b)| a.kind == b)
 }
 
 /// Given a closure, returns the index of a capture within the desugared closure struct and the
@@ -160,9 +160,7 @@ fn find_capture_matching_projections<'a, 'tcx>(
     let hir_projections = convert_to_hir_projections_and_truncate_for_capture(projections);
 
     upvars.get_by_key_enumerated(var_hir_id.0.local_id).find(|(_, capture)| {
-        let possible_ancestor_proj_kinds: Vec<_> =
-            capture.captured_place.place.projections.iter().map(|proj| proj.kind).collect();
-        is_ancestor_or_same_capture(&possible_ancestor_proj_kinds, &hir_projections)
+        is_ancestor_or_same_capture(&capture.captured_place.place.projections, &hir_projections)
     })
 }
 
@@ -328,10 +326,10 @@ impl<'tcx> PlaceBuilder<'tcx> {
 
     /// Same as `.clone().project(..)` but more efficient
     pub(crate) fn clone_project(&self, elem: PlaceElem<'tcx>) -> Self {
-        Self {
-            base: self.base,
-            projection: Vec::from_iter(self.projection.iter().copied().chain([elem])),
-        }
+        let mut projection = Vec::with_capacity(self.projection.len() + 1);
+        projection.extend_from_slice(&self.projection);
+        projection.push(elem);
+        Self { base: self.base, projection }
     }
 }
 
@@ -429,6 +427,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         match expr.kind {
             ExprKind::Scope { region_scope, hir_id, value } => {
                 this.in_scope((region_scope, source_info), LintLevel::Explicit(hir_id), |this| {
+                    this.push_coverage_point_for_expr(block, source_info, hir_id);
                     this.expr_as_place(block, value, mutability, fake_borrow_temps)
                 })
             }
@@ -552,7 +551,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Binary { .. }
             | ExprKind::LogicalOp { .. }
             | ExprKind::Cast { .. }
-            | ExprKind::Use { .. }
+            | ExprKind::ValueExpr { .. }
             | ExprKind::NeverToAny { .. }
             | ExprKind::PointerCoercion { .. }
             | ExprKind::Repeat { .. }
@@ -802,6 +801,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         }
                     }
                     ProjectionElem::Field(..)
+                    | ProjectionElem::PhantomDeref
                     | ProjectionElem::Downcast(..)
                     | ProjectionElem::OpaqueCast(..)
                     | ProjectionElem::ConstantIndex { .. }

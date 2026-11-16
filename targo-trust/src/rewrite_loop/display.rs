@@ -10,6 +10,24 @@ use super::proposal::{extract_function_name, failure_pattern_label, to_failure_a
 use super::types::RewriteProposal;
 use crate::types::{VerificationOutcome, VerificationResult};
 
+/// The outcome word a repair prompt shows. A `failed` row that nothing refuted
+/// (`trust_types::FailureBasis::UnprovedFailClosed`, e.g. an `[unsafe…]` demand
+/// forced to failed with no counterexample) must not be presented to the
+/// assistant as a found bug, so it carries the basis; a refuted row keeps the
+/// historical bare `FAILED`. Display only: which rows get a prompt is unchanged.
+fn repair_outcome_label(result: &VerificationResult) -> &'static str {
+    match result.outcome {
+        VerificationOutcome::Failed
+            if result.failure_basis() == Some(trust_types::FailureBasis::UnprovedFailClosed) =>
+        {
+            "FAILED (unproved, no counterexample; failed closed)"
+        }
+        VerificationOutcome::Failed => "FAILED",
+        VerificationOutcome::Unknown => "UNKNOWN",
+        _ => "UNCHECKED",
+    }
+}
+
 /// Print iteration progress to the terminal.
 pub(crate) fn print_iteration_header(iteration: usize, max: usize) {
     eprintln!();
@@ -94,11 +112,7 @@ pub(crate) fn print_ai_repair_prompts_for_results(
             source_file.as_deref().and_then(|file| read_function(file, &function_short));
 
         let pattern = failure_pattern_label(&to_failure_analysis(result).pattern);
-        let outcome_label = match result.outcome {
-            VerificationOutcome::Failed => "FAILED",
-            VerificationOutcome::Unknown => "UNKNOWN",
-            _ => "UNCHECKED",
-        };
+        let outcome_label = repair_outcome_label(result);
 
         let params: Vec<(String, String)> =
             source_ctx.as_ref().map(|ctx| ctx.params.clone()).unwrap_or_default();
@@ -158,4 +172,59 @@ pub(crate) fn print_loop_summary(
     eprintln!("  Outcome: {outcome}");
     eprintln!("  Total time: {}ms", total_elapsed.as_millis());
     eprintln!("==================================");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(backend: &str, outcome: VerificationOutcome) -> VerificationResult {
+        VerificationResult {
+            function: "crate::hsum".into(),
+            kind: "hardened_unsafe_operation".into(),
+            message: "assertion: [unsafe:unmodeled-call] call to `vpaddq_f32` (unsafe fn) is not \
+                      covered by Trust's model"
+                .into(),
+            outcome,
+            backend: backend.into(),
+            time_ms: Some(0),
+            location: None,
+            counterexample: None,
+            reason: None,
+            raw_line: String::new(),
+        }
+    }
+
+    #[test]
+    fn repair_prompt_does_not_present_a_fail_closed_row_as_a_found_bug() {
+        let fail_closed =
+            row(trust_types::UNSAFE_DEMAND_FAIL_CLOSED_SOLVER, VerificationOutcome::Failed);
+        assert_eq!(
+            repair_outcome_label(&fail_closed),
+            "FAILED (unproved, no counterexample; failed closed)"
+        );
+        // CONTROLS: a refuted row, a definite structural finding, and a row with a
+        // counterexample keep the bare word; other outcomes are unchanged.
+        assert_eq!(repair_outcome_label(&row("ay", VerificationOutcome::Failed)), "FAILED");
+        assert_eq!(
+            repair_outcome_label(&row(
+                trust_types::UNSAFE_DEMAND_DEFINITE_SOLVER,
+                VerificationOutcome::Failed
+            )),
+            "FAILED"
+        );
+        let mut with_cex = fail_closed.clone();
+        with_cex.counterexample = Some(trust_types::Counterexample::new(vec![(
+            "x".into(),
+            trust_types::CounterexampleValue::Uint(1),
+        )]));
+        assert_eq!(repair_outcome_label(&with_cex), "FAILED");
+        assert_eq!(
+            repair_outcome_label(&row(
+                trust_types::UNSAFE_DEMAND_FAIL_CLOSED_SOLVER,
+                VerificationOutcome::Unknown
+            )),
+            "UNKNOWN"
+        );
+    }
 }

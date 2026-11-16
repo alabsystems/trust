@@ -9,7 +9,7 @@ use crate::data_structures::DelayedMap;
 use crate::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable, shift_region};
 use crate::inherent::*;
 use crate::visit::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
-use crate::{self as ty, FnSigKind, Interner};
+use crate::{self as ty, FnSigKind, Interner, Region};
 
 /// A closure can be modeled as a struct that looks like:
 /// ```ignore (illustrative)
@@ -117,9 +117,9 @@ pub struct ClosureArgs<I: Interner> {
 impl<I: Interner> Eq for ClosureArgs<I> {}
 
 /// Struct returned by `split()`.
-pub struct ClosureArgsParts<I: Interner> {
+pub struct ClosureArgsParts<'a, I: Interner + 'a> {
     /// This is the args of the typeck root.
-    pub parent_args: I::GenericArgsSlice,
+    pub parent_args: I::GenericArgsSlice<'a>,
     /// Represents the maximum calling capability of the closure.
     pub closure_kind_ty: I::Ty,
     /// Captures the closure's signature. This closure signature is "tupled", and
@@ -133,7 +133,10 @@ pub struct ClosureArgsParts<I: Interner> {
 impl<I: Interner> ClosureArgs<I> {
     /// Construct `ClosureArgs` from `ClosureArgsParts`, containing `Args`
     /// for the closure parent, alongside additional closure-specific components.
-    pub fn new(cx: I, parts: ClosureArgsParts<I>) -> ClosureArgs<I> {
+    pub fn new<'a>(cx: I, parts: ClosureArgsParts<'a, I>) -> ClosureArgs<I>
+    where
+        I: 'a,
+    {
         ClosureArgs {
             args: cx.mk_args_from_iter(parts.parent_args.iter().chain([
                 parts.closure_kind_ty.into(),
@@ -145,12 +148,12 @@ impl<I: Interner> ClosureArgs<I> {
 
     /// Divides the closure args into their respective components.
     /// The ordering assumed here must match that used by `ClosureArgs::new` above.
-    fn split(self) -> ClosureArgsParts<I> {
+    fn split<'a>(&'a self) -> ClosureArgsParts<'a, I> {
         self.args.split_closure_args()
     }
 
     /// Returns the generic parameters of the closure's parent.
-    pub fn parent_args(self) -> I::GenericArgsSlice {
+    pub fn parent_args<'a>(&'a self) -> I::GenericArgsSlice<'a> {
         self.split().parent_args
     }
 
@@ -219,9 +222,9 @@ impl<I: Interner> Eq for CoroutineClosureArgs<I> {}
 ///
 /// See [`CoroutineClosureSignature`] for how these arguments are put together
 /// to make a callable [`ty::FnSig`] suitable for typeck and borrowck.
-pub struct CoroutineClosureArgsParts<I: Interner> {
+pub struct CoroutineClosureArgsParts<'a, I: Interner + 'a> {
     /// This is the args of the typeck root.
-    pub parent_args: I::GenericArgsSlice,
+    pub parent_args: I::GenericArgsSlice<'a>,
     /// Represents the maximum calling capability of the closure.
     pub closure_kind_ty: I::Ty,
     /// Represents all of the relevant parts of the coroutine returned by this
@@ -247,7 +250,10 @@ pub struct CoroutineClosureArgsParts<I: Interner> {
 }
 
 impl<I: Interner> CoroutineClosureArgs<I> {
-    pub fn new(cx: I, parts: CoroutineClosureArgsParts<I>) -> CoroutineClosureArgs<I> {
+    pub fn new<'a>(cx: I, parts: CoroutineClosureArgsParts<'a, I>) -> CoroutineClosureArgs<I>
+    where
+        I: 'a,
+    {
         CoroutineClosureArgs {
             args: cx.mk_args_from_iter(parts.parent_args.iter().chain([
                 parts.closure_kind_ty.into(),
@@ -258,11 +264,11 @@ impl<I: Interner> CoroutineClosureArgs<I> {
         }
     }
 
-    fn split(self) -> CoroutineClosureArgsParts<I> {
+    fn split<'a>(&'a self) -> CoroutineClosureArgsParts<'a, I> {
         self.args.split_coroutine_closure_args()
     }
 
-    pub fn parent_args(self) -> I::GenericArgsSlice {
+    pub fn parent_args<'a>(&'a self) -> I::GenericArgsSlice<'a> {
         self.split().parent_args
     }
 
@@ -343,7 +349,7 @@ impl<I: Interner> TypeVisitor<I> for HasRegionsBoundAt {
         ControlFlow::Continue(())
     }
 
-    fn visit_region(&mut self, r: I::Region) -> Self::Result {
+    fn visit_region(&mut self, r: Region<I>) -> Self::Result {
         if matches!(r.kind(), ty::ReBound(ty::BoundVarIndexKind::Bound(binder), _) if self.binder == binder)
         {
             ControlFlow::Break(())
@@ -384,7 +390,7 @@ impl<I: Interner> CoroutineClosureSignature<I> {
     pub fn to_coroutine(
         self,
         cx: I,
-        parent_args: I::GenericArgsSlice,
+        parent_args: I::GenericArgsSlice<'_>,
         coroutine_kind_ty: I::Ty,
         coroutine_def_id: I::CoroutineId,
         tupled_upvars_ty: I::Ty,
@@ -412,10 +418,10 @@ impl<I: Interner> CoroutineClosureSignature<I> {
     pub fn to_coroutine_given_kind_and_upvars(
         self,
         cx: I,
-        parent_args: I::GenericArgsSlice,
+        parent_args: I::GenericArgsSlice<'_>,
         coroutine_def_id: I::CoroutineId,
         goal_kind: ty::ClosureKind,
-        env_region: I::Region,
+        env_region: Region<I>,
         closure_tupled_upvars_ty: I::Ty,
         coroutine_captures_by_ref_ty: I::Ty,
     ) -> I::Ty {
@@ -452,7 +458,7 @@ impl<I: Interner> CoroutineClosureSignature<I> {
         tupled_inputs_ty: I::Ty,
         closure_tupled_upvars_ty: I::Ty,
         coroutine_captures_by_ref_ty: I::Ty,
-        env_region: I::Region,
+        env_region: Region<I>,
     ) -> I::Ty {
         // If either of the tupled capture types are constrained to error
         // (e.g. during typeck when the infcx is tainted), then just return
@@ -500,7 +506,7 @@ impl<I: Interner> CoroutineClosureSignature<I> {
 struct FoldEscapingRegions<I: Interner> {
     interner: I,
     debruijn: ty::DebruijnIndex,
-    region: I::Region,
+    region: Region<I>,
 
     // Depends on `debruijn` because we may have types with regions of different
     // debruijn depths depending on the binders we've entered.
@@ -534,7 +540,7 @@ impl<I: Interner> TypeFolder<I> for FoldEscapingRegions<I> {
         result
     }
 
-    fn fold_region(&mut self, r: <I as Interner>::Region) -> <I as Interner>::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
         if let ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), _) = r.kind() {
             assert!(
                 debruijn <= self.debruijn,
@@ -569,9 +575,9 @@ pub struct CoroutineArgs<I: Interner> {
 
 impl<I: Interner> Eq for CoroutineArgs<I> {}
 
-pub struct CoroutineArgsParts<I: Interner> {
+pub struct CoroutineArgsParts<'a, I: Interner + 'a> {
     /// This is the args of the typeck root.
-    pub parent_args: I::GenericArgsSlice,
+    pub parent_args: I::GenericArgsSlice<'a>,
 
     /// The coroutines returned by a coroutine-closure's `AsyncFnOnce`/`AsyncFnMut`
     /// implementations must be distinguished since the former takes the closure's
@@ -596,7 +602,10 @@ pub struct CoroutineArgsParts<I: Interner> {
 impl<I: Interner> CoroutineArgs<I> {
     /// Construct `CoroutineArgs` from `CoroutineArgsParts`, containing `Args`
     /// for the coroutine parent, alongside additional coroutine-specific components.
-    pub fn new(cx: I, parts: CoroutineArgsParts<I>) -> CoroutineArgs<I> {
+    pub fn new<'a>(cx: I, parts: CoroutineArgsParts<'a, I>) -> CoroutineArgs<I>
+    where
+        I: 'a,
+    {
         CoroutineArgs {
             args: cx.mk_args_from_iter(parts.parent_args.iter().chain([
                 parts.kind_ty.into(),
@@ -610,12 +619,12 @@ impl<I: Interner> CoroutineArgs<I> {
 
     /// Divides the coroutine args into their respective components.
     /// The ordering assumed here must match that used by `CoroutineArgs::new` above.
-    fn split(self) -> CoroutineArgsParts<I> {
+    fn split<'a>(&'a self) -> CoroutineArgsParts<'a, I> {
         self.args.split_coroutine_args()
     }
 
     /// Returns the generic parameters of the coroutine's parent.
-    pub fn parent_args(self) -> I::GenericArgsSlice {
+    pub fn parent_args<'a>(&'a self) -> I::GenericArgsSlice<'a> {
         self.split().parent_args
     }
 

@@ -15,13 +15,18 @@ const RESULT_UNWRAP: &str = "core::result::Result::<T, E>::unwrap";
 /// `Result<u64, ()>` in the flattened `lower_enum_adt` shape (`Ok` = 0,
 /// `Err` = 1) — identical to the unwrap panic-freedom fixtures.
 fn std_result_ty() -> Ty {
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
             ("__v0_0".into(), Ty::u64()),
             ("__v1_0".into(), Ty::Unit),
-        ],
+        ]
+        .into(),
         variants: vec![
             VariantDef {
                 name: "Ok".into(),
@@ -33,7 +38,8 @@ fn std_result_ty() -> Ty {
                 discriminant: 1,
                 fields: vec![("0".into(), Ty::Unit)],
             },
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -78,7 +84,14 @@ fn call_term(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Te
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
-        callee_identity: None,
+        callee_identity: Some(trust_types::CalleeIdentity {
+            // A concrete call: the compiler gives it an identity, and a body-derived
+            // summary applies only to a call to its own body (`crate::call_reaches_summarized_body`).
+            stable_crate_id: 1,
+            def_index: 1,
+            substs_digest: [0, 0],
+        }),
+        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
         is_foreign: false,
     }
 }
@@ -109,6 +122,7 @@ fn func_of(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -389,9 +403,12 @@ fn user_enum_return_type_fails_closed() {
 // ── use site (the unwrap panic-freedom summary-pinned shape) ────────────
 
 fn with_summaries<T>(callees: &[VerifiableFunction], f: impl FnOnce() -> T) -> T {
+    let summaries = compute_return_disc_summaries(callees);
+    let ids = crate::test_summary_body_identities(summaries.keys().cloned());
     let _summary_scope = crate::enter_test_callee_summaries(
         crate::CalleeSummaryContext::default()
-            .with_return_disc_summaries(compute_return_disc_summaries(callees)),
+            .with_return_disc_summaries(summaries)
+            .with_summary_body_identities(ids),
     );
     f()
 }
@@ -513,10 +530,14 @@ fn guard_negates_d_eq_zero(f: &Formula) -> bool {
 }
 
 /// (4) A callee OUTSIDE the recognized shape (second branch point): no
-/// summary — the call-result receiver keeps the fail-closed UnsupportedMir
-/// row and no solvable VC is emitted.
+/// summary. Since 2026-10-03 (unwrap-from-facts) the call-result receiver is
+/// CALL-pinned (shape (e)): the solvable VC tests its FREE tag variable
+/// `r.__tag == Err` — nothing constrains it, so it is SAT and the row stays
+/// unproved, which `trust_types::l0_refutation` publishes `failed` exactly as
+/// it published the `panic-freedom-unverified` row it replaces. Exactly one of
+/// {solvable VC, row} still exists.
 #[test]
-fn unsummarized_callee_falls_back_to_unsupported_row() {
+fn unsummarized_callee_gets_the_call_pinned_free_tag_obligation() {
     let mut branchy = rat_new_fn();
     branchy.body.blocks[2].terminator = Terminator::SwitchInt {
         discr: Operand::Copy(Place::local(1)),
@@ -529,8 +550,19 @@ fn unsummarized_callee_falls_back_to_unsupported_row() {
     let (vcs, rows) = with_summaries(&[branchy], || {
         (generate_unwrap_panic_freedom_vcs(&caller), unverified_row_count(&caller))
     });
-    assert!(vcs.is_empty(), "no summary -> no solvable VC");
-    assert_eq!(rows, 1, "the fail-closed row must remain");
+    assert_eq!(vcs.len(), 1, "no summary -> the call-pinned free-tag VC");
+    assert!(
+        has_and_conjunct(&vcs[0].formula, &|f| matches!(f, Formula::Eq(l, r)
+            if l.var_name().is_some_and(|n| n.starts_with("r.")) && is_int(r, 1))),
+        "the body is the FREE tag of `r` equal to Err(=1): {:?}",
+        vcs[0].formula
+    );
+    assert!(
+        trust_types::l0_refutation::is_unwrap_family_panic_freedom_assertion(&vcs[0].kind),
+        "an unproved instance is classified a Level-0 refutation: {:?}",
+        vcs[0].kind
+    );
+    assert_eq!(rows, 0, "one obligation per call, never both");
 }
 
 /// (5) Unconditional-Ok callee: the receiver tag is pinned GROUND — the

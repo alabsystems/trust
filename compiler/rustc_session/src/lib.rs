@@ -14,20 +14,23 @@
 // tidy-alphabetical-end
 
 pub use getopts;
-pub use lint::{declare_lint, declare_lint_pass, declare_tool_lint, impl_lint_pass};
-pub use rustc_lint_defs as lint;
+pub(crate) use rustc_lint_defs as lint;
 pub use session::*;
 
 pub mod code_stats;
-pub mod errors;
+pub mod diagnostics;
 pub mod parse;
 pub mod utils;
 #[macro_use]
 pub mod config;
-pub mod cstore;
 pub mod filesearch;
 mod macros;
 mod options;
 pub mod output;
 pub mod search_paths;
 mod session;
+
+// Trust: diagnostic transcript shared below resolver and MIR transforms.
+pub mod trust_lean_census;
+// Trust: invocation-owned tool inputs, never proof or execution authority.
+pub mod tool_inputs;

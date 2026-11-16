@@ -9,12 +9,18 @@
 
 #[inline(never)]
 fn direct_countdown(n: u32) -> u32 {
-    //~^ NOTE Trust verification: 2 proved
+    //~^ NOTE Trust verification: 3 proved
     // The `n - 1` underflow obligation under the `n != 0` else-guard proves
     // AND kernel-certifies (the disequality order-split recognizer closes
     // `0 <= n ∧ n != 0 ∧ n - 1 < 0`), and the self-recursion's termination
     // row (`NonTermination { context: "recursion", measure: "n" }`) proves on
-    // the native CHC/PDR lane — this fn is fully statically verified.
+    // the native CHC/PDR lane. Re-pinned 2026-09-14 (trust-mc `23dd58a6c7`):
+    // the third row, the aggregate panic-freedom obligation over the body,
+    // proves too — trust-mc models the direct self-call by the inductive
+    // hypothesis instead of an unconditional error rule — so the former
+    // WARN "Level 0 safety verification incomplete" (the aggregate read
+    // runtime-checked) no longer fires. WARN is not in
+    // dont-require-annotations: if it returns, this test fails loudly.
     if n == 0 { 0 } else { direct_countdown(n - 1) }
 }
 

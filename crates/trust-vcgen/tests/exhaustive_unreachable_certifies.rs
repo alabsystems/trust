@@ -81,6 +81,7 @@ fn enum_discriminant_match_function(
         preconditions: vec![precondition],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

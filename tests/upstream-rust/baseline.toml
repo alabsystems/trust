@@ -2,23 +2,24 @@
 # This file follows crates/trust-upstream-compat schema_version 0.1.0.
 
 schema_version = "0.1.0"
-id = "upstream-rust.toolchain-baseline.2026-07-09"
+id = "upstream-rust.toolchain-baseline.2026-10-19"
 
 [upstream]
 channel = "nightly"
-# Trust: re-pinned by the rust-1.96->1.99 content migration (branch
-# migrate/rust-2026-07): compiler/, library/, src/, and tests/ are ported to
-# this revision (3-way against the previous pin 0d4eb098). The per-surface
+# Trust: re-pinned to latest upstream by branch
+# migrate/rust-latest-20261019: compiler/, library/, src/, and tests/ are
+# ported to this revision (3-way against the previous pin bf9448e4; plan
+# in docs/plans/2026-10-19-rust-latest-07e526.md). The per-surface
 # statuses below remain the honest seed state until a full domination
-# scorecard runs against THIS revision — the tests/ui vanilla replay evidence
-# (20779/393/593, 2026-07-09) lives in tests/trust-comprehensive/
-# divergences.toml#ui-diagnostic-drift, not here.
-revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
-snapshot_date = "2026-07-08"
+# scorecard runs against THIS revision — tests/ui vanilla replay evidence,
+# when it exists for this pin, lives in tests/trust-comprehensive/
+# divergences.toml, not here.
+revision = "rust-lang/rust:cabb1ea4ced589dfee40c08aeffff3cac78af43b"
+snapshot_date = "2026-10-19"
 
 [local]
-revision = "trust:migrate/rust-2026-07"
-branch = "migrate/rust-2026-07"
+revision = "trust:migrate/rust-latest-20261019"
+branch = "migrate/rust-latest-20261019"
 workspace = "tRust"
 
 # Trust: how to populate the 13 surface `status` fields below.
@@ -41,7 +42,7 @@ workspace = "tRust"
 #   1. Build a coherent stage2 vanilla Trust sysroot (./x.py build --stage 2),
 #      then run the canonical scorecard for the adopted baseline revision:
 #        targo trust domination upstream-tests --release --proof-mode full \
-#          --upstream-revision rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0 \
+#          --upstream-revision rust-lang/rust:cabb1ea4ced589dfee40c08aeffff3cac78af43b \
 #          --out-dir reports/upstream-rust/<run-id>/adopted_baseline_release_full
 #      (see scripts/run_upstream_rust_adopted_evidence.py:full_suite_commands).
 #   2. Read the emitted scorecard.json. Per-surface outcomes there map onto a

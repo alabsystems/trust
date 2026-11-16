@@ -184,12 +184,13 @@ impl WideningOperator for ThresholdWidening {
         }
 
         // Widen: assume all active proposals will succeed.
-        let mut widened = new_state.clone();
-        for proposal in &new_state.active_proposals {
-            widened.proved_vcs.insert(proposal.clone());
+        let mut proved_vcs = new_state.proved_vcs.clone();
+        proved_vcs.extend(new_state.active_proposals.iter().cloned());
+        AbstractState {
+            proved_vcs,
+            active_proposals: BTreeSet::new(),
+            round: new_state.round,
         }
-        widened.active_proposals.clear();
-        widened
     }
 }
 
@@ -263,12 +264,13 @@ impl WideningOperator for DelayedWidening {
         }
 
         // Widen: accept all proposals as proved.
-        let mut widened = new_state.clone();
-        for proposal in &new_state.active_proposals {
-            widened.proved_vcs.insert(proposal.clone());
+        let mut proved_vcs = new_state.proved_vcs.clone();
+        proved_vcs.extend(new_state.active_proposals.iter().cloned());
+        AbstractState {
+            proved_vcs,
+            active_proposals: BTreeSet::new(),
+            round: new_state.round,
         }
-        widened.active_proposals.clear();
-        widened
     }
 }
 
@@ -278,22 +280,10 @@ impl WideningOperator for DelayedWidening {
 pub struct SimpleNarrowing;
 
 impl NarrowingOperator for SimpleNarrowing {
-    fn narrow(&self, wide_state: &AbstractState, precise_state: &AbstractState) -> AbstractState {
+    fn narrow(&self, _wide_state: &AbstractState, precise_state: &AbstractState) -> AbstractState {
         // Keep only VCs that are in both the wide and precise states,
-        // plus any newly proved in the precise state.
-        let proved: BTreeSet<String> = wide_state
-            .proved_vcs
-            .intersection(&precise_state.proved_vcs)
-            .chain(precise_state.proved_vcs.difference(&wide_state.proved_vcs))
-            .cloned()
-            .collect();
-
-        // Proposals come from the precise state.
-        AbstractState {
-            proved_vcs: proved,
-            active_proposals: precise_state.active_proposals.clone(),
-            round: precise_state.round,
-        }
+        // plus any newly proved in the precise state: (W ∩ P) ∪ (P \ W) == P.
+        precise_state.clone()
     }
 }
 

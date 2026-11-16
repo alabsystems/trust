@@ -1,0 +1,35 @@
+# Absolute span `"file"` values that committed fixtures still carry, with the
+# reason each is tolerated. Read scripts/check_fixture_span_paths.py first: the
+# HOME and AGENT-SESSION classes are not waivable here and never will be — this
+# list is only for absolute paths that name no user, no machine and no session.
+#
+# THIS LIST MAY ONLY SHRINK. The checker reports an entry that no fixture
+# carries any more, so sanitizing the last holder of a path retires its line in
+# the same change. Do not add a line to make a new capture pass: sanitize the
+# capture instead (`<dump-root>/...`), which is what the generator recipe in
+# crates/trust-vcgen/tests/escaped_local_seam_realmir.rs now tells you to do.
+#
+# ── /tmp capture roots, grandfathered 2026-09-21 ────────────────────────────
+# Seventeen `crates/trust-vcgen/tests/fixtures/*.json` captures were taken in
+# /tmp before the rule existed. They leak nothing — /tmp is the same directory
+# on every machine and the publication guard does not refuse it — and their
+# verdicts are pinned by tests that would all have to be re-measured to rewrite
+# them. They are listed rather than exempted by pattern so that a new /tmp
+# capture still fails.
+/tmp/chunkssrc.rs
+/tmp/contract.rs
+/tmp/forloop_idx.rs
+/tmp/gate_staging/sample_at.rs
+/tmp/probe/chunks_exact.rs
+/tmp/probe/enumerate_index.rs
+/tmp/probe/insertion_inner.rs
+/tmp/probe/min_three.rs
+/tmp/probe/nested_2d.rs
+/tmp/probe/rev_idx_loop.rs
+/tmp/probe/two_pointer.rs
+/tmp/revsrc.rs
+/tmp/t27/bounded_copy_min.rs
+/tmp/t27/guarded_mut.rs
+/tmp/t27/unguarded_mut.rs
+/tmp/while_idx.rs
+/tmp/windowssrc.rs

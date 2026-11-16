@@ -1,3 +1,5 @@
+note: compiled WITHOUT Trust verification — 0 obligations checked
+
 error: dependency `itoa v1.0.11` is built from a source outside this tree
   |
   = note: cargo resolves it from `registry+https://github.com/rust-lang/crates.io-index`

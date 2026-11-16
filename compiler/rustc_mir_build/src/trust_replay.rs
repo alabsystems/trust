@@ -66,6 +66,17 @@ pub(crate) fn replay_hook<'tcx>(
     // (typeck_root) never invokes this hook — the precise key is measured, not
     // trusted, via `parity_check_hook`.
     let key = trust_witness::witness_key(tcx, def_id)?;
+    // Trust: diagnostic-only key observation lets the regression adversary rekey
+    // an inactive-mode payload into this exact active world. No logged value is
+    // consumed as authority; lookup still uses only the key just derived by tcx.
+    tracing::debug!(?def_id, key = %key, "trust-witness: replay lookup key");
+    // Trust: an empty decoded offloads_to_check would silently omit a semantic
+    // check. Establish absence from source BEFORE reading any candidate bytes;
+    // a matching key/epoch or recomputed FNV digest cannot establish that fact.
+    if !trust_witness::offload_source_is_absent(tcx, &walk) {
+        stat("MISS-source-offload", def_id);
+        return None;
+    }
     let Some(store) = trust_witness::store::read(&dir, &trust_witness::store_stem(tcx)) else {
         stat("MISS-nostore", def_id);
         return None;
@@ -175,7 +186,8 @@ pub(crate) fn replay_hook<'tcx>(
             let args = candidate
                 .node_args_opt(HirId { owner: candidate.hir_owner, local_id })
                 .unwrap_or_else(|| tcx.mk_args(&[]));
-            let want = tcx.erase_and_anonymize_regions(Ty::new_fn_def(tcx, did, args));
+            let want =
+                tcx.erase_and_anonymize_regions(Ty::new_fn_def(tcx, did, ty::Binder::dummy(args)));
             rederived.iter().any(|t| tcx.erase_and_anonymize_regions(*t) == want)
         },
     );

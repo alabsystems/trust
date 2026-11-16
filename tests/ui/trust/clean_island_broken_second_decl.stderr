@@ -1,0 +1,18 @@
+error: Clean island failed to parse: Unexpected token at 2:106: strict file parsing rejected recovery `parser.recovery`: Unexpected token at 2:106: unexpected token: ColonEq
+  --> $DIR/clean_island_broken_second_decl.rs:13:9
+   |
+LL |         theorem pick_eq (a b : UInt64) : pick a b = a := := rfl
+   |         ^
+   |
+   = note: `clean { … }` is a real parser island: the body is Clean (Lean) source and is parsed by the Clean parser during rustc's own parse, so this is a syntax error, not a failed proof
+   = help: options: fix the Clean syntax at the marked position; move the declaration into a `.clean` file and `import` it; or, if the text is meant to be Rust, drop the `clean` keyword so it parses as ordinary items
+
+error[E0425]: cannot find function `pick` in module `m`
+  --> $DIR/clean_island_broken_second_decl.rs:19:17
+   |
+LL |     let lo = m::pick(7, 41);
+   |                 ^^^^ not found in `m`
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `trustc --explain E0425`.

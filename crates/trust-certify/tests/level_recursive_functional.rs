@@ -1,4 +1,5 @@
-// Brick 3 · Lever A · STEP 6 (smallest real recursive discharge) — SCRATCH TEST.
+// Brick 3 · Lever A · STEP 6 (smallest real recursive discharge) — hand-built witness
+// (machine-built twin: src/recursive_datatype_functional.rs).
 //
 // The sort-arm lane (`datatype_functional.rs`) discharges a NON-recursive
 // functional VC by kernel reflexivity: `model l meta` delta+beta-reduces to the

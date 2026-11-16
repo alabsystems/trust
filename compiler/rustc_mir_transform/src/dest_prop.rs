@@ -144,26 +144,48 @@ use rustc_index::{IndexVec, newtype_index};
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext, VisitPlacesWith, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
-use rustc_mir_dataflow::impls::{DefUse, MaybeLiveLocals};
+use rustc_mir_dataflow::impls::{DefUse, LivenessTransferFunction, MaybeLiveLocals};
 use rustc_mir_dataflow::points::DenseLocationMap;
 use rustc_mir_dataflow::{Analysis, EntryStates, GenKill};
 use tracing::{debug, trace};
 
+use crate::PassPolicy;
+
 pub(super) struct DestinationPropagation;
 
 impl<'tcx> crate::MirPass<'tcx> for DestinationPropagation {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 2
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Trust: a verifying session never merges locals. Contract and loop-clause
+        // names are bound through `var_debug_info`, and a merge of a binding the
+        // clause names (a clause is no MIR use, so the binding looks dead) into a
+        // later-mutated local made `invariant lim >= 128` hold of the merged value,
+        // including through SROA fragments and inlined callee locals whose rows the
+        // name census cannot see (review rounds 39-41, 2026-10-02). Merging is an
+        // optimization only.
+        PassPolicy::optional(
+            ctx.mir_opt_level() >= 2
+                && !ctx.trust_verification_enabled()
+                && !ctx.opts.unstable_opts.mir_move_elimination,
+        )
     }
 
     #[tracing::instrument(level = "trace", skip(self, tcx, body))]
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        // Trust: see `is_enabled`; `-Zmir-enable-passes=+DestinationPropagation`
+        // bypasses `is_enabled`, so the verifying-session check is repeated here.
+        if tcx.sess.trust_verification_enabled() {
+            return;
+        }
         let def_id = body.source.def_id();
         trace!(?def_id);
 
-        let borrowed = rustc_mir_dataflow::impls::borrowed_locals(body);
+        let mut candidates = Candidates::find_raw(body);
+        if candidates.c.is_empty() {
+            return;
+        }
 
-        let candidates = Candidates::find(body, &borrowed);
+        let borrowed = rustc_mir_dataflow::impls::borrowed_locals(body);
+        candidates.filter_borrowed(&borrowed);
         trace!(?candidates);
         if candidates.c.is_empty() {
             return;
@@ -231,10 +253,6 @@ impl<'tcx> crate::MirPass<'tcx> for DestinationPropagation {
         }
 
         apply_merges(body, tcx, relevant, merged_locals);
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -377,49 +395,48 @@ struct Candidates {
 // different needs. Throughout the liveness filtering, the `candidates` are only ever accessed
 // through these methods, and not directly.
 impl Candidates {
-    /// Collects the candidates for merging.
+    /// Collects the raw candidates for merging before computing `borrowed_locals`.
     ///
-    /// This is responsible for enforcing the first and third bullet point.
-    fn find(body: &Body<'_>, borrowed: &DenseBitSet<Local>) -> Candidates {
-        let mut visitor = FindAssignments { body, candidates: Default::default(), borrowed };
-        visitor.visit_body(body);
-
-        Candidates { c: visitor.candidates }
-    }
-}
-
-struct FindAssignments<'a, 'tcx> {
-    body: &'a Body<'tcx>,
-    candidates: Vec<(Local, Local)>,
-    borrowed: &'a DenseBitSet<Local>,
-}
-
-impl<'tcx> Visitor<'tcx> for FindAssignments<'_, 'tcx> {
-    fn visit_statement(&mut self, statement: &Statement<'tcx>, _: Location) {
-        if let StatementKind::Assign((lhs, Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs), _))) =
-            &statement.kind
-            && let Some(src) = lhs.as_local()
-            && let Some(dest) = rhs.as_local()
-        {
-            // As described at the top of the file, we do not go near things that have
-            // their address taken.
-            if self.borrowed.contains(src) || self.borrowed.contains(dest) {
-                return;
+    /// This enforces the structural/type requirements and requires at least one candidate pair to
+    /// contain a non-required local (`LocalKind::Temp`), since two required locals can never be
+    /// merged.
+    fn find_raw(body: &Body<'_>) -> Candidates {
+        let local_decls = body.local_decls();
+        let mut candidates = Vec::new();
+        let mut has_mergable_temp = false;
+        for bb in body.basic_blocks.iter() {
+            for statement in &bb.statements {
+                if let StatementKind::Assign((
+                    lhs,
+                    Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs), _),
+                )) = &statement.kind
+                    && let Some(src) = lhs.as_local()
+                    && let Some(dest) = rhs.as_local()
+                    && src != dest
+                {
+                    let src_ty = local_decls[src].ty;
+                    let dest_ty = local_decls[dest].ty;
+                    if src_ty != dest_ty {
+                        trace!(
+                            "skipped `{src:?} = {dest:?}` due to subtyping: {src_ty} != {dest_ty}"
+                        );
+                        continue;
+                    }
+                    if !is_local_required(src, body) || !is_local_required(dest, body) {
+                        has_mergable_temp = true;
+                    }
+                    candidates.push((src, dest));
+                }
             }
-
-            // As described at the top of this file, we do not touch locals which have
-            // different types.
-            let src_ty = self.body.local_decls()[src].ty;
-            let dest_ty = self.body.local_decls()[dest].ty;
-            if src_ty != dest_ty {
-                // FIXME(#112651): This can be removed afterwards. Also update the module description.
-                trace!("skipped `{src:?} = {dest:?}` due to subtyping: {src_ty} != {dest_ty}");
-                return;
-            }
-
-            // We may insert duplicates here, but that's fine
-            self.candidates.push((src, dest));
         }
+        if !has_mergable_temp {
+            candidates.clear();
+        }
+        Candidates { c: candidates }
+    }
+
+    fn filter_borrowed(&mut self, borrowed: &DenseBitSet<Local>) {
+        self.c.retain(|&(src, dest)| !borrowed.contains(src) && !borrowed.contains(dest));
     }
 }
 
@@ -621,7 +638,7 @@ fn save_as_intervals<'tcx>(
 
         state.current = state.current + 1;
         debug_assert_eq!(state.current, two_step_loc(loc, Effect::Before));
-        MaybeLiveLocals::transfer_function(&mut state).visit_terminator(term, loc);
+        LivenessTransferFunction(&mut state).visit_terminator(term, loc);
 
         for (statement_index, stmt) in block_data.statements.iter().enumerate().rev() {
             let loc = Location { block, statement_index };
@@ -661,7 +678,7 @@ fn save_as_intervals<'tcx>(
             // the all the writes we manually marked as live in the second half of the statement.
             state.current = TwoStepIndex::from_u32(state.current.as_u32() + 1);
             debug_assert_eq!(state.current, two_step_loc(loc, Effect::Before));
-            MaybeLiveLocals::transfer_function(&mut state).visit_statement(stmt, loc);
+            LivenessTransferFunction(&mut state).visit_statement(stmt, loc);
         }
 
         // Cleanup the current block for the next one.

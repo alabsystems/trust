@@ -24,10 +24,10 @@ use rustc_middle::mir::{
     LocalDecl, LocalInfo, MirPhase, Operand, Place, ProjectionElem, Promoted, RuntimePhase, Rvalue,
     START_BLOCK, SourceInfo, Statement, StatementKind, TerminatorKind, WithRetag,
 };
-use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
+use rustc_middle::query;
+use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt, TypingEnv};
 use rustc_middle::util::Providers;
-use rustc_middle::{bug, query, span_bug};
-use rustc_span::{DUMMY_SP, Spanned, sym};
+use rustc_span::{DUMMY_SP, Spanned, bug, span_bug, sym};
 use tracing::debug;
 
 #[macro_use]
@@ -35,9 +35,14 @@ mod pass_manager;
 
 use std::sync::LazyLock;
 
-use pass_manager::{self as pm, Lint, MirLint, MirPass, WithMinOptLevel};
+use pass_manager::{self as pm, Lint, MirLint, MirPass, PassCtx, PassPolicy, WithMinOptLevel};
 
+mod canonicalization;
 mod check_pointers;
+// Trust: cross-crate PROOF-position citation — gathering the dependency crates
+// that transported Clean proof material, and the v7/D3 notes that say so. It
+// composes nothing and changes no verdict; see its header.
+mod clean_extern_proof;
 // Trust (I5): the SOLE CONSTRUCTOR of a Clean-origin `Body`, and the
 // carrier-typed faithfulness gate that stands in front of it. This is the one
 // direction in Trust that produces a value, so a disagreement is a wrong
@@ -45,6 +50,7 @@ mod check_pointers;
 // (`mir_keys`, `inner_optimized_mir`, `inner_mir_for_ctfe`, `promoted_mir`,
 // `mir_drops_elaborated_and_const_checked`).
 mod clean_origin_mir;
+pub mod clean_origin_references;
 // Trust: (IR-1) — the Clean-origin trust-ir RECORDING PATH: finalize-seam
 // collection with a re-earned kernel verdict per def, feeding the per-crate
 // direct Module (docs/design/2026-08-27-two-language-direct-to-trust-ir.md §3).
@@ -52,6 +58,10 @@ mod clean_origin_mir;
 pub mod clean_origin_ir;
 // Trust: (I7) — Clean-origin verdict-digest EXPORT providers (encode half).
 mod clean_origin_export;
+// Trust: D-2 logical faces; independent of verification_enabled.
+mod trust_odt;
+// Trust: TG11 interim MIR reader; the C1/C2 provider above stays MIR-free.
+mod trust_odt_e6;
 // Trust: (I7) — Clean-origin cross-crate IMPORT lane (readmission + re-gate).
 mod clean_origin_import;
 mod cost_checker;
@@ -74,11 +84,17 @@ mod trust_contract_query;
 // `optimized_mir` seam cannot flip. See trust_instance_flip.rs.
 mod trust_instance_flip;
 mod trust_ir_flip;
+pub mod trust_lean_census;
+mod trust_lean_census_order;
 // Trust: the once-initializer re-entrancy check — a hard error, gated by nothing but
 // front-end cleanliness (NOT by `-Ztrust-verify`). Driver entry point exported below.
 mod trust_once_reentrancy;
 mod trust_proof_query;
 mod trust_r1_oracle;
+// Trust (D4 increment A, 2026-09-24): the per-def "contains user `unsafe` source" fact,
+// computed here from HIR and encoded in rmeta so a consumer re-deriving the body from its
+// encoded MIR can decline it. See trust_unsafe_source_fact.rs.
+mod trust_unsafe_source_fact;
 // Trust (v6/D1): the `targo trust spec --emit clean` session-artifact writer.
 // `pub` so the emit surface is externally reachable (and warning-free) even
 // before/without the trust_verify.rs call sites that feed it.
@@ -163,6 +179,7 @@ declare_passes! {
     mod check_const_item_mutation : CheckConstItemMutation;
     mod check_null : CheckNull;
     mod check_packed_ref : CheckPackedRef;
+    mod check_mut_restriction : CheckMutRestriction;
     // This pass is public to allow external drivers to perform MIR cleanup
     pub mod cleanup_post_borrowck : CleanupPostBorrowck;
 
@@ -186,16 +203,16 @@ declare_passes! {
     // Made public so that `mir_drops_elaborated_and_const_checked` can be overridden
     // by custom rustc drivers, running all the steps by themselves. See #114628.
     pub mod inline : Inline, ForceInline;
-    mod impossible_predicates : ImpossiblePredicates;
+    mod impossible_clauses : ImpossibleClauses;
     mod instsimplify : InstSimplify { BeforeInline, AfterSimplifyCfg };
     mod jump_threading : JumpThreading;
     mod known_panics_lint : KnownPanicsLint;
-    mod large_enums : EnumSizeOpt;
     mod lint_and_remove_uninhabited : LintAndRemoveUninhabited;
     mod lower_intrinsics : LowerIntrinsics;
     mod lower_slice_len : LowerSliceLenCalls;
     mod match_branches : MatchBranchSimplification;
     mod mentioned_items : MentionedItems;
+    mod move_elimination : MoveElimination;
     mod multiple_return_terminators : MultipleReturnTerminators;
     mod post_drop_elaboration : CheckLiveDrops;
     mod prettify : ReorderBasicBlocks, ReorderLocals;
@@ -239,6 +256,7 @@ declare_passes! {
     mod sroa : ScalarReplacementOfAggregates;
     mod strip_debuginfo : StripDebugInfo;
     mod ssa_range_prop: SsaRangePropagation;
+    mod tail_copy_to_move : TailCopyToMove;
     mod trust_verify : TrustVerify;
     mod unreachable_enum_branching : UnreachableEnumBranching;
     mod unreachable_prop : UnreachablePropagation;
@@ -248,8 +266,6 @@ declare_passes! {
 // Trust: expose the analysis-phase backing-certificate initializer to the driver
 // (`rustc_interface::passes::analysis`). Computes interprocedural backing-struct
 // certificates while post-analysis MIR is still borrowable (pre-steal).
-// Trust: initialize and dependency-bind the exact external AY snapshot before
-// query/crate hashes are computed.
 // Trust: end-of-compile structured coverage inventory for each rustc target.
 // Trust (scope-truncation fix): expose the eager whole-crate `optimized_mir` demand
 // to the driver (`rustc_interface::passes::analysis`). Makes verification COVERAGE
@@ -262,10 +278,32 @@ declare_passes! {
 // `-Ztrust-ctfe-trivial-probe`, installs no body, changes no emitted code.
 pub use trust_ir_flip::probe_trivial_const_flips as trust_probe_trivial_const_flips;
 pub use trust_once_reentrancy::trust_check_once_initializer_reentrancy;
+// Trust (2026-10-18, FRESH-CAPTURE-1): the pre-steal fresh shared closure capture seam.
+pub use trust_verify::trust_init_fresh_capture_premises;
+// Trust (D2 tier 1): the pre-steal ADAPTER_YIELD premise initializer.
+// Trust (2026-09-29): the analysis-seam call-graph oracle force and the verified-lane
+// coroutine `optimized_mir` sweep (see `trust_local_coroutine_layout`).
 pub use trust_verify::{
-    initialize_ay_solver_identity as trust_initialize_ay_solver_identity,
-    trust_emit_transport_crate_summary, trust_ensure_whole_crate_verification,
-    trust_init_backing_certificates, trust_init_r1_attributions,
+    // Trust: current-source diagnostic measurement; no reusable facts returned.
+    TrustConstructorAdmissionProbe,
+    TrustConstructorAdmissionRefusal,
+    TrustConstructorIdentityRefusal,
+    // Trust (TG3): rustdoc's kernel-obligation entry.
+    trust_check_kernel_obligations_for_rustdoc,
+    trust_constructor_return_admission_probe,
+    trust_emit_transport_crate_summary,
+    trust_ensure_coroutine_optimized_mir,
+    trust_ensure_whole_crate_verification,
+    trust_finalize_calculus_reporting,
+    trust_finalize_calculus_reporting_on_error,
+    trust_force_crate_graph_oracles,
+    trust_init_adapter_yield_premises,
+    trust_init_backing_certificates,
+    // Trust (STR_BYTE_POSITION): the byte-position closure certificate seam.
+    trust_init_byte_eq_predicates,
+    trust_init_calculus_reporting,
+    trust_init_r1_attributions,
+    trust_spawn_census_shadow,
 };
 
 /// Trust (wall A): emit the per-INSTANCE flip census at the post-codegen seam. A no-op unless the
@@ -280,6 +318,8 @@ pub fn provide(providers: &mut Providers) {
     ffi_unwind_calls::provide(&mut providers.queries);
     shim::provide(&mut providers.queries);
     cross_crate_inline::provide(&mut providers.queries);
+    providers.hooks.find_noop_landing_pads_for_instance =
+        remove_noop_landing_pads::find_noop_landing_pads_for_instance;
     providers.queries = query::Providers {
         mir_keys,
         mir_built,
@@ -287,10 +327,24 @@ pub fn provide(providers: &mut Providers) {
         mir_promoted,
         mir_drops_elaborated_and_const_checked,
         mir_for_trust_verification,
+        // Trust: the pre-steal local coroutine layout (`ordinary_coroutine_layout`).
+        trust_local_coroutine_layout: trust_verify::trust_local_coroutine_layout,
+        // Trust: the once-initializer check's vanilla-optimized coroutine view.
+        trust_once_coroutine_mir,
         trust_instance_flip_body: trust_instance_flip::trust_instance_flip_body,
+        trust_clean_origin_references: clean_origin_references::references,
+        // Trust: the Clean purity guard's pre-steal per-body fact.
+        trust_rust_purity_fact: clean_origin_mir::rust_purity_fact,
         trust_mir_direct_local_callees: trust_verify::trust_mir_direct_local_callees,
         trust_mir_mutually_recursive_functions:
             trust_verify::trust_mir_mutually_recursive_functions,
+        // Trust (TG16): the HIR-only kernel-obligation predicate that rustdoc's
+        // kernel lane and the vanilla `-O` MIR level pin both read.
+        trust_crate_has_kernel_obligations: trust_verify::trust_crate_has_kernel_obligations,
+        // Trust: the spawn census on trust-ir's reachability engine (design
+        // 2026-09-29-spawn-census-by-construction), and its per-body projection.
+        trust_spawn_census: trust_verify::trust_spawn_census,
+        trust_spawn_sites: trust_verify::trust_spawn_sites,
         trust_mir_once_body_facts: trust_once_reentrancy::trust_mir_once_body_facts,
         mir_for_ctfe,
         mir_coroutine_witnesses: coroutine::mir_coroutine_witnesses,
@@ -302,14 +356,28 @@ pub fn provide(providers: &mut Providers) {
         promoted_mir,
         deduced_param_attrs: deduce_param_attrs::deduced_param_attrs,
         coroutine_by_move_body_def_id: coroutine::coroutine_by_move_body_def_id,
-        trivial_const: trivial_const::trivial_const_provider,
+        trivial_const: trivial_const::trivial_const,
         trust_contracts: trust_contract_query::trust_contracts,
         trust_proof_results: trust_proof_query::trust_proof_results,
         trust_proof_telemetry: trust_proof_query::trust_proof_telemetry,
         // Trust: (I7) — Clean-origin cross-crate ENCODE lane.
         trust_clean_verdict_digest: clean_origin_export::trust_clean_verdict_digest,
+        // Trust: ODT source transport and cached local/extern B1 admission.
+        trust_odt_entry: trust_odt::odt_entry,
+        trust_odt_logical_face: trust_odt::logical_face,
         trust_clean_island_sources: clean_origin_export::trust_clean_island_sources,
         trust_clean_origin_exports: clean_origin_export::trust_clean_origin_exports,
+        // Trust: cross-crate PROOF-position citation, increment 2 (TRANSPORT) — the
+        // manifest that identifies the island sources above for a dependent crate.
+        trust_clean_proof_manifest: clean_origin_export::trust_clean_proof_manifest,
+        // Trust (2026-10-03): the per-crate "may install an allocation-error hook"
+        // fact, encoded into metadata for downstream whole-program compilations.
+        trust_crate_references_alloc_error_hook:
+            trust_verify::trust_crate_references_alloc_error_hook_local,
+        // Trust (T6): the per-crate "MIR built by the proof-session -O0 pipeline"
+        // fact, encoded into metadata for verified dependents' re-derivation.
+        trust_crate_mir_is_proof_session_pipeline:
+            trust_verify::trust_crate_mir_is_proof_session_pipeline_local,
         // Trust: (I7) — Clean-origin cross-crate IMPORT lane: readmission at the
         // extern MIR decode chokepoint (rustc_metadata's cstore arms ensure this
         // query before serving a listed def's body), plus the bug!-on-local arms
@@ -319,6 +387,15 @@ pub fn provide(providers: &mut Providers) {
             clean_origin_import::local_unreadmitted_optimized_mir,
         trust_clean_extern_unreadmitted_mir_for_ctfe:
             clean_origin_import::local_unreadmitted_mir_for_ctfe,
+        // Trust (D4 increment A, 2026-09-24): the local half of the user-`unsafe`
+        // source fact; the extern half decodes rmeta and answers `true` for a
+        // missing row.
+        trust_def_has_user_unsafe_source:
+            trust_unsafe_source_fact::trust_def_has_user_unsafe_source,
+        // Trust (CB3, 2026-09-28): the local half of the per-def island marker
+        // (HIR item kind); the extern half decodes rmeta and answers `false` —
+        // "real global assembly" — for a missing row.
+        trust_def_is_clean_island: clean_origin_export::trust_def_is_clean_island,
         ..providers.queries
     };
 }
@@ -328,7 +405,7 @@ fn remap_mir_for_const_eval_select<'tcx>(
     mut body: Body<'tcx>,
     context: hir::Constness,
 ) -> Body<'tcx> {
-    for bb in body.basic_blocks.as_mut().iter_mut() {
+    for bb in body.basic_blocks.as_mut_preserves_cfg().iter_mut() {
         let terminator = bb.terminator.as_mut().expect("invalid terminator");
         match terminator.kind {
             TerminatorKind::Call {
@@ -376,9 +453,11 @@ fn remap_mir_for_const_eval_select<'tcx>(
                 let place_elems = place.projection;
                 let arguments = (0..num_args)
                     .map(|x| {
-                        let mut place_elems = place_elems.to_vec();
-                        place_elems.push(ProjectionElem::Field(x.into(), fields[x]));
-                        let projection = tcx.mk_place_elems(&place_elems);
+                        let projection = tcx.mk_place_elems_from_iter(
+                            place_elems
+                                .iter()
+                                .chain([ProjectionElem::Field(x.into(), fields[x])]),
+                        );
                         let place = Place { local: place.local, projection };
                         Spanned { node: method(place), span: DUMMY_SP }
                     })
@@ -411,19 +490,29 @@ fn is_mir_available(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
 /// Finds the full set of `DefId`s within the current crate that have
 /// MIR associated with them.
 fn mir_keys(tcx: TyCtxt<'_>, (): ()) -> FxIndexSet<LocalDefId> {
-    // All body-owners have MIR associated with them.
-    let mut set: FxIndexSet<_> = tcx.hir_body_owners().collect();
+    let owners = tcx.hir_body_owners();
+    let mut set = FxIndexSet::with_capacity_and_hasher(owners.size_hint().0, Default::default());
+    let mut closures = Vec::new();
 
-    // Remove the fake bodies for `global_asm!`, since they're not useful
-    // to be emitted (`--emit=mir`) or encoded (in metadata).
-    set.retain(|&def_id| !matches!(tcx.def_kind(def_id), DefKind::GlobalAsm));
+    // All body-owners have MIR associated with them, except fake bodies for
+    // `global_asm!`, which are not useful to emit (`--emit=mir`) or encode (in metadata).
+    for body_owner in owners {
+        match tcx.def_kind(body_owner) {
+            DefKind::GlobalAsm => continue,
+            DefKind::Closure => {
+                set.insert(body_owner);
+                closures.push(body_owner);
+            }
+            _ => {
+                set.insert(body_owner);
+            }
+        }
+    }
 
     // Coroutine-closures (e.g. async closures) have an additional by-move MIR
     // body that isn't in the HIR.
-    for body_owner in tcx.hir_body_owners() {
-        if let DefKind::Closure = tcx.def_kind(body_owner)
-            && tcx.needs_coroutine_by_move_body_def_id(body_owner.to_def_id())
-        {
+    for body_owner in closures {
+        if tcx.needs_coroutine_by_move_body_def_id(body_owner.to_def_id()) {
             set.insert(tcx.coroutine_by_move_body_def_id(body_owner).expect_local());
         }
     }
@@ -461,6 +550,24 @@ fn mir_keys(tcx: TyCtxt<'_>, (): ()) -> FxIndexSet<LocalDefId> {
 }
 
 fn mir_const_qualif(tcx: TyCtxt<'_>, def: LocalDefId) -> ConstQualifs {
+    // Avoid the `mir_built` call for trivial consts.
+    if let Some((_val, ty)) = tcx.trivial_const(def) {
+        let has_mut_interior = !ty.is_trivially_freeze();
+        let needs_drop =
+            ty.needs_drop(tcx, TypingEnv::post_typeck_through_borrowck_for_mir_build(tcx, def));
+
+        // These will only fail if the set of things accepted by `trivial_const` expands.
+        assert!(!has_mut_interior);
+        assert!(!needs_drop);
+
+        return ConstQualifs {
+            has_mut_interior,
+            needs_drop,
+            needs_non_const_drop: needs_drop,
+            tainted_by_errors: None,
+        };
+    }
+
     // N.B., this `borrow()` is guaranteed to be valid (i.e., the value
     // cannot yet be stolen), because `mir_promoted()`, which steals
     // from `mir_built()`, forces this query to execute before
@@ -496,38 +603,38 @@ fn mir_built(tcx: TyCtxt<'_>, def: LocalDefId) -> &Steal<Body<'_>> {
     // This is the one place that is allowed to call `build_mir_inner_impl`.
     let mut body = tcx.build_mir_inner_impl(def);
 
-    // Identifying trivial consts based on their mir_built is easy, but a little wasteful.
-    // Trying to push this logic earlier in the compiler and never even produce the Body would
-    // probably improve compile time.
-    if trivial_const::trivial_const(tcx, def, || &body).is_some() {
-        // Skip all the passes below for trivial consts.
-        let body = tcx.alloc_steal_mir(body);
-        pass_manager::dump_mir_for_phase_change(tcx, &body.borrow());
-        return body;
-    }
+    // Trust (effect conservation, 2026-10-01): the MIR ORACLE's effect census — calls, stores
+    // through escaping pointers, drops, asm — of exactly the body the `-Ztrust-ir-lower` hook
+    // inside `build_mir_inner_impl` just compared its trust-ir against, before any pass below
+    // touches it. Read-only; a no-op unless the trust-ir producer lane runs. Here and not in the
+    // hook because the hook's file is frozen; see `trust_thir_lower::effect_conservation`.
+    trust_thir_lower::effect_conservation::record_mir_census(tcx, def, &body);
 
     pass_manager::dump_mir_for_phase_change(tcx, &body);
 
-    pm::run_passes(
-        tcx,
-        &mut body,
-        &[
-            // This used to be part of MIR building,
-            // now done separately to separate concerns.
-            &lint_and_remove_uninhabited::LintAndRemoveUninhabited,
-            // MIR-level lints.
-            &Lint(check_inline::CheckForceInline),
-            &Lint(check_call_recursion::CheckCallRecursion),
-            &Lint(check_packed_ref::CheckPackedRef),
-            &Lint(check_const_item_mutation::CheckConstItemMutation),
-            &Lint(function_item_references::FunctionItemReferences),
-            // What we need to do constant evaluation.
-            &simplify::SimplifyCfg::Initial,
-            &Lint(sanity_check::SanityCheck),
-        ],
-        None,
-        pm::Optimizations::Allowed,
-    );
+    // Skip all the passes below for trivial consts.
+    if tcx.trivial_const(def).is_none() {
+        pm::run_passes(
+            tcx,
+            &mut body,
+            &[
+                // This used to be part of MIR building,
+                // now done separately to separate concerns.
+                &lint_and_remove_uninhabited::LintAndRemoveUninhabited,
+                // MIR-level lints.
+                &Lint(check_inline::CheckForceInline),
+                &Lint(check_call_recursion::CheckCallRecursion),
+                &Lint(check_packed_ref::CheckPackedRef),
+                &Lint(check_const_item_mutation::CheckConstItemMutation),
+                &Lint(check_mut_restriction::CheckMutRestriction),
+                &Lint(function_item_references::FunctionItemReferences),
+                // What we need to do constant evaluation.
+                &simplify::SimplifyCfg::Initial,
+                &Lint(sanity_check::SanityCheck),
+            ],
+            None,
+        );
+    }
     tcx.alloc_steal_mir(body)
 }
 
@@ -549,11 +656,9 @@ fn mir_promoted(
         {
             tcx.mir_const_qualif(def)
         }
-        DefKind::AssocConst { .. }
-        | DefKind::Const { .. }
-        | DefKind::Static { .. }
-        | DefKind::InlineConst
-        | DefKind::AnonConst => tcx.mir_const_qualif(def),
+        DefKind::AssocConst | DefKind::Const | DefKind::Static { .. } | DefKind::AnonConst => {
+            tcx.mir_const_qualif(def)
+        }
         _ => ConstQualifs::default(),
     };
 
@@ -565,8 +670,13 @@ fn mir_promoted(
         tcx.ensure_done().coroutine_by_move_body_def_id(def);
     }
 
-    // the `trivial_const` query uses mir_built, so make sure it is run.
-    tcx.ensure_done().trivial_const(def);
+    // Retain actual Clean references before raw MIR is consumed. A query result,
+    // rather than a provider side effect, also survives incremental replay and
+    // captures bodies fed by coroutine/custom-MIR paths. Ordinary Rust crates
+    // with no minted Clean definitions need no additional per-body query.
+    if !tcx.resolutions(()).clean_origin_defs.is_empty() {
+        tcx.ensure_done().trust_clean_origin_references(def);
+    }
 
     let mut body = tcx.mir_built(def).steal();
     if let Some(error_reported) = const_qualifs.tainted_by_errors {
@@ -584,8 +694,13 @@ fn mir_promoted(
         &mut body,
         &[&promote_pass, &simplify::SimplifyCfg::PromoteConsts, &coverage::InstrumentCoverage],
         Some(MirPhase::Analysis(AnalysisPhase::Initial)),
-        pm::Optimizations::Allowed,
     );
+
+    // Avoid over-capacity in the vectors of basic blocks, which can take up substantial memory.
+    // This costs a tiny bit of performance to save a lot of memory.
+    for bb in body.basic_blocks.as_mut_preserves_cfg() {
+        bb.statements.shrink_to_fit();
+    }
 
     lint_tail_expr_drop_order::run_lint(tcx, def, &body);
 
@@ -649,6 +764,9 @@ fn inner_mir_for_ctfe(tcx: TyCtxt<'_>, def: LocalDefId) -> Body<'_> {
     // The faithfulness gate is a compilation-correctness check on emitted code,
     // not an obligation; a gate a flag can switch off is a lint.
     if let Some(body) = clean_origin_mir::clean_origin_mir(tcx, def) {
+        // Trust (plan step 3.5, design §5.7): every build of a Clean-origin body is counted,
+        // here by const evaluation's reader.
+        clean_origin_ir::clean_origin_reach::hook_ran(tcx.sess, true);
         return body;
     }
     if tcx.is_constructor(def.to_def_id()) {
@@ -710,7 +828,7 @@ fn inner_mir_for_ctfe(tcx: TyCtxt<'_>, def: LocalDefId) -> Body<'_> {
     } else {
         &[&ctfe_limit::CtfeLimit]
     };
-    pm::run_passes(tcx, &mut body, passes, None, pm::Optimizations::Allowed);
+    pm::run_passes(tcx, &mut body, passes, None);
 
     // Trust: validate a trust-ir-DERIVED body before serving it. The call above passes phase
     // `None`, and `pass_manager` makes validation mandatory only on a phase change to
@@ -766,7 +884,7 @@ fn mir_drops_elaborated_and_const_checked(tcx: TyCtxt<'_>, def: LocalDefId) -> &
     let is_fn_like = tcx.def_kind(def).is_fn_like();
     if is_fn_like {
         // Do not compute the mir call graph without said call graph actually being used.
-        if pm::should_run_pass(tcx, &inline::Inline, pm::Optimizations::Allowed)
+        if pm::should_run_pass(&inline::Inline, &pm::PassCtx::for_body(tcx, def.to_def_id()))
             || inline::ForceInline::should_run_pass_for_callee(tcx, def.to_def_id())
         {
             tcx.ensure_done().mir_inliner_callees(ty::InstanceKind::Item(def.to_def_id()));
@@ -783,7 +901,9 @@ fn mir_drops_elaborated_and_const_checked(tcx: TyCtxt<'_>, def: LocalDefId) -> &
     }
 
     let root = tcx.typeck_root_def_id_local(def);
-    if let Err(e) = tcx.check_transmutes(root) {
+    if !tcx.is_synthetic_mir(root)
+        && let Err(e) = tcx.check_transmutes(root)
+    {
         body.tainted_by_errors = Some(e);
     }
 
@@ -795,8 +915,8 @@ fn mir_drops_elaborated_and_const_checked(tcx: TyCtxt<'_>, def: LocalDefId) -> &
         DefKind::Fn
         | DefKind::AssocFn
         | DefKind::Static { .. }
-        | DefKind::Const { .. }
-        | DefKind::AssocConst { .. } => {
+        | DefKind::Const
+        | DefKind::AssocConst => {
             if let Err(guar) = tcx.ensure_result().check_well_formed(root) {
                 body.tainted_by_errors = Some(guar);
             }
@@ -820,7 +940,11 @@ pub fn run_analysis_to_runtime_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'
     assert!(body.phase == MirPhase::Analysis(AnalysisPhase::PostCleanup));
 
     // Do a little drop elaboration before const-checking if `const_precise_live_drops` is enabled.
-    if check_consts::post_drop_elaboration::checking_enabled(&ConstCx::new(tcx, body)) {
+    if (tcx.features().const_precise_live_drops()
+        || tcx.features().staged_api()
+        || tcx.sess.opts.unstable_opts.force_unstable_if_unmarked)
+        && check_consts::post_drop_elaboration::checking_enabled(&ConstCx::new(tcx, body))
+    {
         pm::run_passes(
             tcx,
             body,
@@ -830,7 +954,6 @@ pub fn run_analysis_to_runtime_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'
                 &Lint(post_drop_elaboration::CheckLiveDrops),
             ],
             None,
-            pm::Optimizations::Allowed,
         );
     }
 
@@ -848,20 +971,14 @@ pub fn run_analysis_to_runtime_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'
 /// After this series of passes, no lifetime analysis based on borrowing can be done.
 fn run_analysis_cleanup_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
     let passes: &[&dyn MirPass<'tcx>] = &[
-        &impossible_predicates::ImpossiblePredicates,
+        &impossible_clauses::ImpossibleClauses,
         &cleanup_post_borrowck::CleanupPostBorrowck,
         &remove_noop_landing_pads::RemoveNoopLandingPads,
         &simplify::SimplifyCfg::PostAnalysis,
         &deref_separator::Derefer,
     ];
 
-    pm::run_passes(
-        tcx,
-        body,
-        passes,
-        Some(MirPhase::Analysis(AnalysisPhase::PostCleanup)),
-        pm::Optimizations::Allowed,
-    );
+    pm::run_passes(tcx, body, passes, Some(MirPhase::Analysis(AnalysisPhase::PostCleanup)));
 }
 
 /// Returns the sequence of passes that lowers analysis to runtime MIR.
@@ -899,65 +1016,70 @@ fn run_runtime_cleanup_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         &simplify::SimplifyCfg::PreOptimizations,
     ];
 
-    pm::run_passes(
-        tcx,
-        body,
-        passes,
-        Some(MirPhase::Runtime(RuntimePhase::PostCleanup)),
-        pm::Optimizations::Allowed,
-    );
+    pm::run_passes(tcx, body, passes, Some(MirPhase::Runtime(RuntimePhase::PostCleanup)));
 
     // Clear diagnostic binding data by anticipation. A body with first-class
     // Trust loop contracts is the one exception: certified runtime monitor
     // placement needs a compact compiler-owned binding identity after
     // `var_debug_info` has been omitted or stripped. Preserve only that HIR
     // identity; all diagnostic-only VarBindingForm fields are still discarded.
-    let retain_trust_source_bindings = body
-        .source
-        .def_id()
-        .as_local()
-        .and_then(|local| tcx.hir_maybe_body_owned_by(local))
-        .and_then(|body| body.contract)
-        .is_some_and(|contract| !contract.loop_clauses.is_empty());
+    let retain_trust_source_bindings = body.source.promoted.is_none()
+        && body
+            .source
+            .def_id()
+            .as_local()
+            .and_then(|local| tcx.hir_maybe_body_owned_by(local))
+            .and_then(|body| body.contract)
+            .is_some_and(|contract| !contract.loop_clauses.is_empty());
+    if !retain_trust_source_bindings {
+        for decl in &mut body.local_decls {
+            decl.local_info = ClearCrossCrate::Clear;
+        }
+        return;
+    }
     for decl in &mut body.local_decls {
-        let trust_source_binding = retain_trust_source_bindings
-            .then(|| match &decl.local_info {
-                ClearCrossCrate::Set(info) => match &**info {
-                    LocalInfo::User(BindingForm::Var(binding)) => {
-                        Some(binding.binding_hir_local_id.as_u32())
-                    }
-                    // A TrustIR-flipped body is reconstructed at `Built` with
-                    // this compact carrier already authenticated from the
-                    // module's sealed source-place provenance. Advancing that
-                    // body through the ordinary cleanup pipeline must retain
-                    // the carrier just as it retains one derived from native
-                    // MIR; clearing it here silently disables E4/E5 monitors
-                    // only on the default flipped codegen path.
-                    LocalInfo::TrustSourceBinding { hir_local_id } => Some(*hir_local_id),
-                    _ => None,
-                },
-                ClearCrossCrate::Clear => None,
-            })
-            .flatten();
-        decl.local_info = trust_source_binding.map_or(ClearCrossCrate::Clear, |hir_local_id| {
-            ClearCrossCrate::Set(Box::new(LocalInfo::TrustSourceBinding { hir_local_id }))
-        });
+        if let ClearCrossCrate::Set(info) = &decl.local_info {
+            match &**info {
+                LocalInfo::User(BindingForm::Var(binding)) => {
+                    let hir_local_id = binding.binding_hir_local_id.as_u32();
+                    decl.local_info =
+                        ClearCrossCrate::Set(Box::new(LocalInfo::TrustSourceBinding {
+                            hir_local_id,
+                        }));
+                    continue;
+                }
+                // A TrustIR-flipped body is reconstructed at `Built` with
+                // this compact carrier already authenticated from the
+                // module's sealed source-place provenance. Advancing that
+                // body through the ordinary cleanup pipeline must retain
+                // the carrier just as it retains one derived from native
+                // MIR; clearing it here silently disables E4/E5 monitors
+                // only on the default flipped codegen path.
+                LocalInfo::TrustSourceBinding { .. } => continue,
+                _ => {}
+            }
+        }
+        decl.local_info = ClearCrossCrate::Clear;
     }
 }
 
 pub(crate) fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    // Trust: the pipeline lives in `run_optimization_pipeline`, which can also run it
+    // without its final `TrustVerify` pass (`trust_once_coroutine_mir`).
+    run_optimization_pipeline(tcx, body, true)
+}
+
+// Trust: `with_trust_verify: false` omits exactly the final `TrustVerify` pass and
+// nothing else — the pipeline the vanilla (`-Ztrust-verify=off`) lane runs, where that
+// pass is disabled.
+fn run_optimization_pipeline<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mut Body<'tcx>,
+    with_trust_verify: bool,
+) {
     fn o1<T>(x: T) -> WithMinOptLevel<T> {
         WithMinOptLevel(1, x)
     }
-
-    let def_id = body.source.def_id();
-    let optimizations = if tcx.def_kind(def_id).has_codegen_attrs()
-        && tcx.codegen_fn_attrs(def_id).optimize.do_not_optimize()
-    {
-        pm::Optimizations::Suppressed
-    } else {
-        pm::Optimizations::Allowed
-    };
 
     // The main optimizations that we do on MIR.
     pm::run_passes(
@@ -965,6 +1087,8 @@ pub(crate) fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'
         body,
         &[
             // Add some UB checks before any UB gets optimized away.
+            // Trust: the spawn census runs these three on its copy of each local body
+            // (`trust_spawn_census_ub_checks`): keep the two lists the same.
             &check_alignment::CheckAlignment,
             &check_null::CheckNull,
             &check_enums::CheckEnums,
@@ -1036,20 +1160,83 @@ pub(crate) fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'
             &copy_prop::CopyProp,
             &dead_store_elimination::DeadStoreElimination::Final,
             &dest_prop::DestinationPropagation,
+            &tail_copy_to_move::TailCopyToMove,
+            &move_elimination::MoveElimination,
             &simplify::SimplifyLocals::Final,
             &multiple_return_terminators::MultipleReturnTerminators,
-            &large_enums::EnumSizeOpt { discrepancy: 128 },
             // Some cleanup necessary at least for LLVM and potentially other codegen backends.
             &add_call_guards::CriticalCallEdges,
             // Cleanup for human readability, off by default.
             &prettify::ReorderBasicBlocks,
             &prettify::ReorderLocals,
-            // Trust: verify the fully optimized MIR just before codegen.
-            &trust_verify::TrustVerify,
+            // Trust: verify the fully optimized MIR just before codegen — or, for the
+            // vanilla pipeline, run nothing in its place (`TrustVerifyWhen`).
+            &TrustVerifyWhen(with_trust_verify),
         ],
         Some(MirPhase::Runtime(RuntimePhase::Optimized)),
-        optimizations,
     );
+}
+
+// Trust (spawn census, design 2026-09-29-spawn-census-by-construction §5.2): the
+// UB-check passes that open `run_optimization_pipeline`, run on the census's copy of a
+// pre-steal local body. They add panics (a misaligned or null pointer dereference, an
+// invalid enum construction) after the body the census reads; without them the census
+// saw no edge to those panics, and a spawning panic hook made the panic a QUIET spawn.
+// Each runs exactly when the pipeline would run it (`should_run_pass`: `-Zub-checks`,
+// `-Zmir-enable-passes`).
+pub(crate) fn trust_spawn_census_ub_checks<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    let ctx = pm::PassCtx::for_body(tcx, body.source.def_id());
+    for pass in trust_spawn_census_ub_check_passes() {
+        if pm::should_run_pass(pass, &ctx) {
+            pass.run_pass(tcx, body);
+        }
+    }
+}
+
+// Trust (spawn census P4): whether any of those UB checks runs in this compilation, for the
+// census's trust-ir shadow lane, which reads no MIR and charges a body that may need one.
+pub(crate) fn trust_spawn_census_ub_checks_run(tcx: TyCtxt<'_>) -> bool {
+    // The three passes' policies read only the session (`ub_checks`), so the
+    // crate root stands in for a body when building the pass context.
+    let ctx = pm::PassCtx::for_body(tcx, rustc_hir::def_id::CRATE_DEF_ID.to_def_id());
+    trust_spawn_census_ub_check_passes().into_iter().any(|pass| pm::should_run_pass(pass, &ctx))
+}
+
+fn trust_spawn_census_ub_check_passes<'a, 'tcx>() -> [&'a (dyn MirPass<'tcx> + 'a); 3] {
+    [&check_alignment::CheckAlignment, &check_null::CheckNull, &check_enums::CheckEnums]
+}
+
+// Trust: the final pass of `run_optimization_pipeline`. `TrustVerifyWhen(true)` IS
+// `TrustVerify` (every `MirPass` method forwards). `TrustVerifyWhen(false)` is the pass
+// as the vanilla lane has it — disabled — and runs nothing even when
+// `-Zmir-enable-passes=+TrustVerify` forces it on. Structural on purpose: a query this
+// pipeline demands (e.g. a `#[rustc_force_inline]` callee's `optimized_mir`) runs its
+// own pipeline with `TrustVerifyWhen(true)`, so no ambient "verification off" state
+// can leak into a body that is really codegened.
+struct TrustVerifyWhen(bool);
+
+impl<'tcx> MirPass<'tcx> for TrustVerifyWhen {
+    fn name(&self) -> &'static str {
+        MirPass::name(&trust_verify::TrustVerify)
+    }
+
+    fn profiler_name(&self) -> &'static str {
+        MirPass::profiler_name(&trust_verify::TrustVerify)
+    }
+
+    fn policy(&self, ctx: &PassCtx<'_>) -> PassPolicy {
+        MirPass::policy(&trust_verify::TrustVerify, ctx)
+    }
+
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        if self.0 {
+            MirPass::run_pass(&trust_verify::TrustVerify, tcx, body)
+        }
+    }
+
+    fn is_mir_dump_enabled(&self) -> bool {
+        MirPass::is_mir_dump_enabled(&trust_verify::TrustVerify)
+    }
 }
 
 /// Optimize the MIR and prepare it for codegen.
@@ -1067,6 +1254,9 @@ fn optimized_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> &Body<'_> {
     // that rewrote it after the gate ran would put un-gated code in the binary.
     // A widening that wants optimization must re-gate after it, not before.
     if let Some(body) = clean_origin_mir::clean_origin_mir(tcx, did) {
+        // Trust (plan step 3.5, design §5.7): every build of a Clean-origin body is counted, for
+        // the lane whose scope is open (`clean_origin_reach`).
+        clean_origin_ir::clean_origin_reach::hook_ran(tcx.sess, false);
         return tcx.arena.alloc(body);
     }
     if tcx.is_constructor(did.to_def_id()) {
@@ -1089,13 +1279,40 @@ fn inner_optimized_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> Body<'_> {
         None => {}
         Some(other) => panic!("do not use `optimized_mir` for constants: {other:?}"),
     }
+    // Trust: with verification enabled, a coroutine's layout is served from its pre-steal
+    // elaborated MIR (`trust_local_coroutine_layout`, read by `ordinary_coroutine_layout`),
+    // so it must be produced BEFORE the steal below. This must be a value-producing query
+    // call, not `ensure_done`: on an incremental green replay an ensure-only call may mark
+    // the dep-node green without caching its value, and a later `layout_of` would then
+    // borrow the stolen body (same reason as `mir_for_trust_verification` below).
+    let trust_coroutine_layout =
+        if tcx.sess.trust_reads_pre_steal_mir() && tcx.is_coroutine(did.to_def_id()) {
+            Some(tcx.trust_local_coroutine_layout(did))
+        } else {
+            None
+        };
     debug!("about to call mir_drops_elaborated...");
     let elaborated = tcx.mir_drops_elaborated_and_const_checked(did);
+    // Trust: the Clean-origin purity guard, which runs inside `mir_for_ctfe`, reads a
+    // body of this crate through `trust_rust_purity_fact`, a fact of the pre-steal
+    // elaborated MIR, so it must be produced BEFORE the steal below. Value-producing, not
+    // `ensure_done`, for the incremental reason given for the coroutine layout above.
+    if clean_origin_mir::crate_needs_purity_facts(tcx) {
+        let _ = tcx.trust_rust_purity_fact(did);
+    }
     // Trust verification needs an immutable elaborated-MIR fallback only for a
     // function in a mutual-recursion SCC. The compact, disk-cached adjacency
     // query proves that property before the source `Steal` is consumed. This
     // avoids cloning and retaining a second full Body for every ordinary
     // function while keeping recursive inspection query-order-independent.
+    //
+    // Trust (2026-09-29): the crate-wide SCC set (and the spawn census below) is
+    // forced at the analysis seam (`trust_force_crate_graph_oracles`), before any
+    // body is stolen and outside every type-system query; these two forces are the
+    // idempotent fallback for a driver that never reaches that seam. With
+    // verification enabled no type-system query reaches a local `optimized_mir`
+    // any more (`trust_local_coroutine_layout`), so neither can run from inside
+    // type computation.
     if trust_verify::verification_enabled(tcx.sess)
         && trust_verify::trust_mir_is_mutually_recursive(tcx, did)
     {
@@ -1103,6 +1320,15 @@ fn inner_optimized_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> Body<'_> {
         // incremental green replay an ensure-only call may skip this non-disk-
         // cached provider, leaving no in-memory snapshot.
         let _ = tcx.mir_for_trust_verification(did);
+    }
+    // Trust (spawn census): force the crate's spawn census while every local body's
+    // elaborated MIR (THIS body's included) is still unstolen: its MIR adapter borrows
+    // that MIR unguarded under the same contract as the SCC adjacency forced just above.
+    // The placement of record is the analysis seam (`trust_force_crate_graph_oracles`);
+    // forcing here too — before this body's `steal` — keeps that borrow legal for a
+    // driver that skips the seam.
+    if tcx.sess.trust_runs_spawn_census() {
+        let _ = tcx.trust_spawn_census(());
     }
     let body = elaborated.steal();
     let mut body = remap_mir_for_const_eval_select(tcx, body, hir::Constness::NotConst);
@@ -1156,7 +1382,56 @@ fn inner_optimized_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> Body<'_> {
 
     run_optimization_passes(tcx, &mut body);
 
+    // Trust: the layout `ordinary_coroutine_layout` served from the pre-steal elaborated
+    // MIR must be the layout of the body that is codegened. `StateTransform` is its only
+    // writer and no optimization pass (TrustVerify's elision and monitor injection
+    // included) touches `body.coroutine`, so a mismatch is a compiler bug — an ICE, never
+    // a silent disagreement between a type's layout and its resume function.
+    if let Some(pre_steal) = trust_coroutine_layout
+        && body.coroutine_layout_raw() != pre_steal
+    {
+        bug!(
+            "Trust: coroutine `{}` changed its layout after `trust_local_coroutine_layout` \
+             read it from elaborated MIR",
+            tcx.def_path_str(did)
+        );
+    }
+
     body
+}
+
+// Trust: provider of `trust_once_coroutine_mir` (see its doc in `rustc_middle`) — the
+// coroutine body the vanilla lane's `optimized_mir` produces at this session's MIR opt
+// level (which, at `-O`, is lower in a verifying session: ruling R1), computed from a
+// CLONE of the elaborated MIR so nothing is stolen. The steps are `inner_optimized_mir`'s after its
+// steal, in order, minus what cannot apply: the trust-ir flip refuses coroutines, and
+// the coverage credits and the layout-parity check belong to the codegened body.
+// `is_stolen` only picks between two views of the same coroutine (both vanilla-optimized
+// but for TrustVerify's instrumentation), and the query is neither hashed nor disk-cached.
+#[allow(rustc::untracked_query_information)]
+fn trust_once_coroutine_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> &Body<'_> {
+    let elaborated = tcx.mir_drops_elaborated_and_const_checked(did);
+    if elaborated.is_stolen() {
+        // Some other route already optimized this coroutine; read that body (a cache hit:
+        // the steal is the proof that `optimized_mir` ran). With verification enabled
+        // nothing on the ordinary pipeline steals a coroutine before the once-initializer
+        // check (see `trust_local_coroutine_layout`); the once check is a deadlock
+        // detector, never a premise, so this view only has to be the best available.
+        return tcx.optimized_mir(did);
+    }
+    let body = elaborated.borrow().clone();
+    let mut body = remap_mir_for_const_eval_select(tcx, body, hir::Constness::NotConst);
+    if body.tainted_by_errors.is_some() {
+        return tcx.arena.alloc(body);
+    }
+    mentioned_items::MentionedItems.run_pass(tcx, &mut body);
+    if let TerminatorKind::Unreachable = body.basic_blocks[START_BLOCK].terminator().kind
+        && body.basic_blocks[START_BLOCK].statements.is_empty()
+    {
+        return tcx.arena.alloc(body);
+    }
+    run_optimization_pipeline(tcx, &mut body, false);
+    tcx.arena.alloc(body)
 }
 
 /// Fetch all the promoteds of an item and prepare their MIR bodies to be ready for
@@ -1177,16 +1452,19 @@ fn promoted_mir(tcx: TyCtxt<'_>, def: LocalDefId) -> &IndexVec<Promoted, Body<'_
     // promoteds are emitted code and need their own gate — do not widen this
     // early return to cover them.
     if clean_origin_mir::is_clean_origin(tcx, def) {
-        return tcx.arena.alloc(IndexVec::new());
+        return const { &IndexVec::new() };
     }
     if tcx.is_constructor(def.to_def_id()) {
-        return tcx.arena.alloc(IndexVec::new());
+        return const { &IndexVec::new() };
     }
 
     if !tcx.is_synthetic_mir(def) {
         tcx.ensure_done().mir_borrowck(tcx.typeck_root_def_id_local(def));
     }
     let mut promoted = tcx.mir_promoted(def).1.steal();
+    if promoted.is_empty() {
+        return const { &IndexVec::new() };
+    }
 
     for body in &mut promoted {
         run_analysis_to_runtime_passes(tcx, body);

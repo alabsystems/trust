@@ -14,22 +14,35 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[test]]
+name = "native_ir_scalar_aggregate"
+path = "tests/native_ir_scalar_aggregate.rs"
+required-features = ["trust-build"]
+
+[[test]]
+name = "native_formula_codec"
+path = "tests/native_formula_codec.rs"
+required-features = ["trust-build"]
+
 [lints]
 workspace = true
 
 [features]
 default = []
+# Keep the bridge's certificate tests under the same feature as its engine.
+proof-certificates = ["trust-vc-trust-engine?/proof-certificates"]
 # trustc-owned path that lowers TrustContractBundle memory/ownership
 # obligations into trust-vc-trust-engine TrustMirMemoryProofUnit values once
 # trust-vc-trust-engine is admitted through committed source materialization.
 trust-build = [
+    "trust-verifier-api/native-trust-ir-claims",
     "dep:trust-vc-core",
     "dep:trust-vc-trust-engine",
     "dep:trust-ir",
     # Kernel replay for CleanCic proof authority: the import path re-validates
     # native bundles, which requires in-process certificate recheck capability.
     "trust-ir/clean-expr",
-    "trust-vc-trust-engine/proof-certificates",
+    "proof-certificates",
 ]
 
 [dependencies]
@@ -37,7 +50,6 @@ trust-vc-core = { workspace = true, optional = true }
 trust-vc-trust-engine = { path = "../../first-party/trust-vc/crates/trust-vc-trust-engine", optional = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-sha2 = { workspace = true }
 # Trust (R1 corpus): depth-tolerant payload parsing (`json_depth::from_str_deep`).
 trust-types = { workspace = true }
 trust-ir = { workspace = true, optional = true }

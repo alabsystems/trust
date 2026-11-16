@@ -1,0 +1,50 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+;
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+; RUN: %tpde_test --run-until=ir --print-ir %s | FileCheck %s --dump-input always
+
+; CHECK: Printing IR
+
+; CHECK-LABEL: Function br1
+br1() {
+; CHECK-NEXT: Block entry
+; CHECK-NEXT: Succ secBlock
+entry:
+; CHECK-NEXT: Value (br)
+; CHECK-NEXT: Op ^secBlock
+  br ^secBlock
+; CHECK-NEXT: Block secBlock
+; CHECK-NEXT: Succ retBlock
+secBlock:
+; CHECK-NEXT: Value (br)
+; CHECK-NEXT: Op ^retBlock
+  br ^retBlock
+; CHECK-NEXT: Block retBlock
+retBlock:
+; CHECK-NEXT: Value (terminate)
+  terminate
+}
+
+; CHECK-LABEL: Function condbr1
+condbr1() {
+; CHECK-NEXT: Block entry
+; CHECK-NEXT: Succ ret1
+; CHECK-NEXT: Succ ret2
+entry:
+; CHECK-NEXT: Value val
+  %val =
+; CHECK-NEXT: Value (condbr)
+; CHECK-NEXT: Op val
+; CHECK-NEXT: Op ^ret1
+; CHECK-NEXT: Op ^ret2
+  condbr %val, ^ret1, ^ret2
+; CHECK-NEXT: Block ret1
+ret1:
+; CHECK-NEXT: Value (terminate)
+  terminate
+; CHECK-NEXT: Block ret2
+ret2:
+; CHECK-NEXT: Value (terminate)
+  terminate
+}

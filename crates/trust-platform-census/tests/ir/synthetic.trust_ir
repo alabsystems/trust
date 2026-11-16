@@ -1,0 +1,55 @@
+; TrustIr text format v1
+; SYNTHETIC, hand-written: refusal codes no real dump exhibits (a call
+; cycle with no entry, a Command method with no row, an instruction the
+; census does not translate, a resolver answer that contradicts the symbol
+; table). Every other refusal fixture is a real stage1 dump.
+module "census_synthetic"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "synthetic.rs"
+
+functy.0 = () -> (i32)
+functy.1 = (ptr) -> (ptr)
+functy.2 = (ptr) -> ()
+
+rustcc fn @cycle_a(functy.0) {
+bb0:
+    %0 = call @func.1()  ; #loc: 0 1 4
+    ret %0  ; #loc: 0 1 20
+}
+
+rustcc fn @cycle_b(functy.0) {
+bb0:
+    %0 = call @func.2()  ; #loc: 0 2 4
+    %1 = call @func.0()  ; #loc: 0 2 20
+    ret %1  ; #loc: 0 2 30
+}
+
+fn @"libc::fork"(functy.0) {
+}
+
+rustcc fn @command_shape(functy.2) {
+bb0(%0: ptr):
+    %1 = call @func.4(%0)  ; #loc: 0 3 4
+    %2 = call @func.2()  ; #loc: 0 3 20
+    ret  ; #loc: 0 3 30
+}
+
+rustcc fn @"std::process::Command::frobnicate"(functy.1) {
+}
+
+rustcc fn @ir_unsupported(functy.2) {
+bb0(%0: ptr):
+    %1 = landingpad cleanup  ; #loc: 0 4 4
+    %2 = call @func.2()  ; #loc: 0 4 20
+    ret  ; #loc: 0 4 30
+}
+
+rustcc fn @resolver_contradiction(functy.2) {
+bb0(%0: ptr):
+    %1 = call @func.7(%0)  ; #loc: 0 5 4
+    %2 = call @func.2()  ; #loc: 0 5 20
+    ret  ; #loc: 0 5 30
+}
+
+fn @"weird::pair"(functy.1) {
+}

@@ -1,0 +1,2 @@
+error: unstable option `trust-platform-report` requires one of `summary` or `verbose` (`-Z trust-platform-report=<value>`)
+

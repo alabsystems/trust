@@ -1,26 +1,247 @@
 use std::borrow::Cow;
-use std::mem;
+use std::{fmt, mem};
 
 use rustc_ast::AsmMacro;
-use rustc_data_structures::stack::ensure_sufficient_stack;
+use rustc_attr_ir::find_attr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_errors::DiagArgValue;
 use rustc_hir::def::DefKind;
-use rustc_hir::{self as hir, BindingMode, ByRef, HirId, Mutability, find_attr};
+use rustc_hir::{self as hir, BindingMode, ByRef, HirId, Mutability};
+use rustc_lint_defs::builtin::{DEPRECATED_SAFE_2024, UNSAFE_OP_IN_UNSAFE_FN, UNUSED_UNSAFE};
 use rustc_middle::middle::codegen_fn_attrs::{TargetFeature, TargetFeatureKind};
-use rustc_middle::span_bug;
 use rustc_middle::thir::visit::Visitor;
 use rustc_middle::thir::*;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_session::lint::builtin::{DEPRECATED_SAFE_2024, UNSAFE_OP_IN_UNSAFE_FN, UNUSED_UNSAFE};
 use rustc_span::def_id::{DefId, LocalDefId};
-use rustc_span::{Span, Symbol};
+use rustc_span::{Span, Symbol, span_bug};
 
 use crate::diagnostics::*;
+
+// Trust: source filenames can contain newlines; keep each RUSTC_LOG event on one line.
+fn trace_safe_debug(value: &impl fmt::Debug) -> String {
+    format!("{value:?}").escape_debug().to_string()
+}
+
+// Trust: this classifies the visitor's safety context, not full source authorship.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustUnsafeSourceScope {
+    Safe,
+    UnsafeFn,
+    ExplicitUnsafeBlock,
+    BuiltinUnsafeBlock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustUnsafeSourceOrigin {
+    NonBuiltin,
+    CompilerBuiltin,
+}
+
+impl TrustUnsafeSourceScope {
+    fn from_safety_context(context: &SafetyContext) -> Self {
+        match context {
+            SafetyContext::Safe => Self::Safe,
+            SafetyContext::UnsafeFn => Self::UnsafeFn,
+            SafetyContext::UnsafeBlock { .. } => Self::ExplicitUnsafeBlock,
+            SafetyContext::BuiltinUnsafeBlock => Self::BuiltinUnsafeBlock,
+        }
+    }
+
+    fn origin(self) -> TrustUnsafeSourceOrigin {
+        match self {
+            Self::BuiltinUnsafeBlock => TrustUnsafeSourceOrigin::CompilerBuiltin,
+            Self::Safe | Self::UnsafeFn | Self::ExplicitUnsafeBlock => {
+                TrustUnsafeSourceOrigin::NonBuiltin
+            }
+        }
+    }
+}
+
+// Trust: these tags are diagnostic source-operation classes, not obligation kinds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustUnsafeSourceKind {
+    CallToUnsafeFunction,
+    UseOfInlineAssembly,
+    InitializingTypeWithUnsafeField,
+    UseOfMutableStatic,
+    UseOfExternStatic,
+    UseOfUnsafeField,
+    DerefOfRawPointer,
+    AccessToUnionField,
+    MutationOfLayoutConstrainedField,
+    BorrowOfLayoutConstrainedField,
+    CallToFunctionWith,
+    UnsafeBinderCast,
+    CallDropExplicitly,
+}
+
+impl TrustUnsafeSourceKind {
+    fn from_unsafe_op(kind: &UnsafeOpKind) -> Self {
+        match kind {
+            UnsafeOpKind::CallToUnsafeFunction(_) => Self::CallToUnsafeFunction,
+            UnsafeOpKind::UseOfInlineAssembly => Self::UseOfInlineAssembly,
+            UnsafeOpKind::InitializingTypeWithUnsafeField => Self::InitializingTypeWithUnsafeField,
+            UnsafeOpKind::UseOfMutableStatic => Self::UseOfMutableStatic,
+            UnsafeOpKind::UseOfExternStatic => Self::UseOfExternStatic,
+            UnsafeOpKind::UseOfUnsafeField => Self::UseOfUnsafeField,
+            UnsafeOpKind::DerefOfRawPointer => Self::DerefOfRawPointer,
+            UnsafeOpKind::AccessToUnionField => Self::AccessToUnionField,
+            UnsafeOpKind::MutationOfLayoutConstrainedField => {
+                Self::MutationOfLayoutConstrainedField
+            }
+            UnsafeOpKind::BorrowOfLayoutConstrainedField => Self::BorrowOfLayoutConstrainedField,
+            UnsafeOpKind::CallToFunctionWith { .. } => Self::CallToFunctionWith,
+            UnsafeOpKind::UnsafeBinderCast => Self::UnsafeBinderCast,
+            UnsafeOpKind::CallDropExplicitly(_) => Self::CallDropExplicitly,
+        }
+    }
+}
+
+// Trust: the ordinal is only stable within this candidate body scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrustUnsafeSourceEventId {
+    body_owner: LocalDefId,
+    occurrence: u64,
+}
+
+// Trust: diagnostic THIR source events only; these are not Trust-IR obligations or proofs.
+struct TrustUnsafeSourceEvent {
+    id: TrustUnsafeSourceEventId,
+    kind: UnsafeOpKind,
+    source_kind: TrustUnsafeSourceKind,
+    span: Span,
+    hir_context: HirId,
+    scope: TrustUnsafeSourceScope,
+    origin: TrustUnsafeSourceOrigin,
+}
+
+impl TrustUnsafeSourceEvent {
+    fn trace(&self, tcx: TyCtxt<'_>) {
+        // Trust: INFO, not DEBUG, and the level is a CONTRACT rather than a taste.
+        // A stage built with the default `rust.debug-logging = false` gets tracing
+        // with `max_level_info`/`release_max_level_info`, so `STATIC_MAX_LEVEL` is
+        // INFO and every DEBUG callsite is compiled out of the binary. A run-make
+        // recipe therefore cannot read a `debug!` census at all: it sees zero rows
+        // plus `tracing-subscriber`'s `some trace filter directives would enable
+        // traces that are disabled statically`, which reads as a census defect and
+        // is not one (measured 2026-09-27,
+        // tests/run-make/trust-thir-unsafe-await-census). `trust_ir_flip` already
+        // uses INFO for exactly this reason. No user sees a new line: with
+        // `RUSTC_LOG` unset, rustc_log installs a WARN-only filter
+        // (compiler/rustc_log/src/lib.rs), so INFO stays off by default.
+        if !tracing::enabled!(target: "rustc_mir_build::trust_unsafe_source_events", tracing::Level::INFO)
+        {
+            return;
+        }
+        let span = self.span.data();
+        let span_text = trace_safe_debug(&self.span);
+        tracing::info!(
+            target: "rustc_mir_build::trust_unsafe_source_events",
+            body_owner = ?self.id.body_owner,
+            body_owner_index = self.id.body_owner.local_def_index.as_u32(),
+            owner_def_kind = ?tcx.def_kind(self.id.body_owner.to_def_id()),
+            owner_def_path_hash = ?tcx.def_path_hash(self.id.body_owner.to_def_id()),
+            occurrence = self.id.occurrence,
+            occurrence_scope = "candidate_body_scan",
+            occurrence_stability = "not_cross_revision",
+            kind = ?self.kind,
+            source_kind = ?self.source_kind,
+            origin = ?self.origin,
+            safety_scope = ?self.scope,
+            span = %span_text,
+            span_lo = span.lo.0,
+            span_hi = span.hi.0,
+            span_ctxt = ?span.ctxt,
+            span_parent = ?span.parent,
+            hir_context = ?self.hir_context,
+            "Trust THIR unsafe source event (diagnostic only)"
+        );
+    }
+}
+
+// Trust: retain a body-local roster only when the diagnostic event target is enabled.
+struct TrustUnsafeSourceEventRoster {
+    body_owner: LocalDefId,
+    next_occurrence: u64,
+    events: Option<Vec<TrustUnsafeSourceEvent>>,
+}
+
+struct TrustUnsafeSourceScanComplete {
+    body_owner: LocalDefId,
+    event_count: u64,
+}
+
+impl TrustUnsafeSourceEventRoster {
+    fn new(body_owner: LocalDefId) -> Self {
+        Self::with_retention(
+            body_owner,
+            // Trust: INFO for the same reason as `TrustUnsafeSourceEvent::trace`.
+            // This one is not cosmetic either: at DEBUG on a `max_level_info` stage
+            // the roster is never retained, so `record` returns `None` and there are
+            // no events for `trace_complete` to report even if it could print.
+            tracing::enabled!(
+                target: "rustc_mir_build::trust_unsafe_source_events",
+                tracing::Level::INFO
+            ),
+        )
+    }
+
+    fn with_retention(body_owner: LocalDefId, retain_events: bool) -> Self {
+        Self { body_owner, next_occurrence: 0, events: retain_events.then(Vec::new) }
+    }
+
+    fn record(
+        &mut self,
+        kind: &UnsafeOpKind,
+        span: Span,
+        hir_context: HirId,
+        safety_context: &SafetyContext,
+    ) -> Option<&TrustUnsafeSourceEvent> {
+        let occurrence = self.next_occurrence;
+        self.next_occurrence =
+            occurrence.checked_add(1).expect("unsafe source event ordinal overflow");
+        let events = self.events.as_mut()?;
+        let scope = TrustUnsafeSourceScope::from_safety_context(safety_context);
+        events.push(TrustUnsafeSourceEvent {
+            id: TrustUnsafeSourceEventId { body_owner: self.body_owner, occurrence },
+            kind: kind.clone(),
+            source_kind: TrustUnsafeSourceKind::from_unsafe_op(kind),
+            span,
+            hir_context,
+            scope,
+            origin: scope.origin(),
+        });
+        Some(events.last().expect("just recorded an unsafe source event"))
+    }
+
+    fn complete(&self) -> TrustUnsafeSourceScanComplete {
+        TrustUnsafeSourceScanComplete {
+            body_owner: self.body_owner,
+            event_count: self.next_occurrence,
+        }
+    }
+
+    fn trace_complete(&self, tcx: TyCtxt<'_>) {
+        let complete = self.complete();
+        tracing::info!(
+            target: "rustc_mir_build::trust_unsafe_source_events",
+            body_owner = ?complete.body_owner,
+            body_owner_index = complete.body_owner.local_def_index.as_u32(),
+            owner_def_kind = ?tcx.def_kind(complete.body_owner.to_def_id()),
+            owner_def_path_hash = ?tcx.def_path_hash(complete.body_owner.to_def_id()),
+            event_count = complete.event_count,
+            roster_retained = self.events.is_some(),
+            "Trust THIR requires_unsafe body scan complete (diagnostic only)"
+        );
+    }
+}
 
 struct UnsafetyVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     thir: &'a Thir<'tcx>,
+    /// Trust: actual THIR body owner, independent of the current HIR lint scope.
+    unsafe_source_events: TrustUnsafeSourceEventRoster,
     /// The `HirId` of the current scope, which would be the `HirId`
     /// of the current HIR node, modulo adjustments. Used for lint levels.
     hir_context: HirId,
@@ -125,6 +346,12 @@ impl<'tcx> UnsafetyVisitor<'_, 'tcx> {
     }
 
     fn requires_unsafe(&mut self, span: Span, kind: UnsafeOpKind) {
+        // Trust: observe every call, including operations accepted by the current safety context.
+        if let Some(event) =
+            self.unsafe_source_events.record(&kind, span, self.hir_context, &self.safety_context)
+        {
+            event.trace(self.tcx);
+        }
         let unsafe_op_in_unsafe_fn_allowed = self.unsafe_op_in_unsafe_fn_allowed();
         match self.safety_context {
             SafetyContext::BuiltinUnsafeBlock => {}
@@ -182,7 +409,9 @@ impl<'tcx> UnsafetyVisitor<'_, 'tcx> {
         if let Ok((inner_thir, expr)) = self.tcx.thir_body(def) {
             // Run all other queries that depend on THIR.
             self.tcx.ensure_done().mir_built(def);
-            let inner_thir = if self.tcx.sess.opts.unstable_opts.no_steal_thir {
+            // Trust: also keep THIR when the trust-ir codegen frontend will read it at codegen
+            // time (`retain_thir_for_trust_ir`).
+            let inner_thir = if retain_thir_for_trust_ir(self.tcx) {
                 &inner_thir.borrow()
             } else {
                 // We don't have other use for the THIR. Steal it to reduce memory usage.
@@ -193,6 +422,7 @@ impl<'tcx> UnsafetyVisitor<'_, 'tcx> {
             let mut inner_visitor = UnsafetyVisitor {
                 tcx: self.tcx,
                 thir: inner_thir,
+                unsafe_source_events: TrustUnsafeSourceEventRoster::new(def),
                 hir_context,
                 safety_context,
                 body_target_features: self.body_target_features,
@@ -211,8 +441,25 @@ impl<'tcx> UnsafetyVisitor<'_, 'tcx> {
             }
             // Visit the body.
             inner_visitor.visit_expr(&inner_thir[expr]);
+            inner_visitor.unsafe_source_events.trace_complete(self.tcx);
             // Unsafe blocks can be used in the inner body, make sure to take it into account
             self.safety_context = inner_visitor.safety_context;
+        } else {
+            // Trust: the parent scan cannot claim an event census for an unavailable child body.
+            // Trust: these four "scope" rows stay at DEBUG DELIBERATELY, unlike the
+            // EVENT/COMPLETE pair above. Nothing reads them today, so raising them
+            // would be an unmeasurable change — but they are the ABSENCE half of the
+            // same census, so if you ever write a test that reads one, raise it to
+            // INFO first: on a stage built with `rust.debug-logging = false` a DEBUG
+            // callsite is compiled out of the binary and your test will see zero
+            // rows, not a defect. The four are here, at `:760`, `:1375` and `:1387`.
+            tracing::debug!(
+                target: "rustc_mir_build::trust_unsafe_source_events",
+                body_owner = ?def,
+                owner_def_path_hash = ?self.tcx.def_path_hash(def.to_def_id()),
+                scope = "nested_thir_unavailable",
+                "Trust THIR unsafe source scope (diagnostic only)"
+            );
         }
     }
 }
@@ -393,7 +640,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
             | ExprKind::If { .. }
             | ExprKind::InlineAsm { .. }
             | ExprKind::LogicalOp { .. }
-            | ExprKind::Use { .. }
+            | ExprKind::ValueExpr { .. }
             | ExprKind::Reborrow { .. } => {
                 // We don't need to save the old value and restore it
                 // because all the place expressions can't have more
@@ -405,9 +652,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
             ExprKind::Scope { value, hir_id, region_scope: _ } => {
                 let prev_id = self.hir_context;
                 self.hir_context = hir_id;
-                ensure_sufficient_stack(|| {
-                    self.visit_expr(&self.thir[value]);
-                });
+                self.visit_expr(&self.thir[value]);
                 self.hir_context = prev_id;
                 return; // don't visit the whole expression
             }
@@ -448,7 +693,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                         let build_enabled = self
                             .tcx
                             .sess
-                            .target_features
+                            .internal_target_features
                             .iter()
                             .copied()
                             .filter(|feature| missing.contains(feature))
@@ -459,7 +704,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                         );
                     }
                     if let Some(trait_did) = self.tcx.trait_of_assoc(func_did)
-                        && self.tcx.is_lang_item(trait_did, hir::LangItem::Drop)
+                        && self.tcx.is_lang_item(trait_did, LangItem::Drop)
                     {
                         self.requires_unsafe(expr.span, CallDropExplicitly(func_did));
                     }
@@ -517,6 +762,17 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                 // unsafety, and `naked_asm!` does not itself need to be wrapped in an unsafe block.
                 if let AsmMacro::Asm = asm_macro {
                     self.requires_unsafe(expr.span, UseOfInlineAssembly);
+                } else {
+                    // Trust: naked_asm! is intentionally exempt from requires_unsafe.
+                    tracing::debug!(
+                        target: "rustc_mir_build::trust_unsafe_source_events",
+                        body_owner = ?self.unsafe_source_events.body_owner,
+                        owner_def_path_hash = ?self.tcx.def_path_hash(self.unsafe_source_events.body_owner.to_def_id()),
+                        span = %trace_safe_debug(&expr.span),
+                        hir_context = ?self.hir_context,
+                        scope = "naked_asm_exempt",
+                        "Trust THIR unsafe source scope (diagnostic only)"
+                    );
                 }
 
                 // For inline asm, do not use `walk_expr`, since we want to handle the label block
@@ -641,7 +897,7 @@ struct UnusedUnsafeWarning {
     enclosing_unsafe: Option<UnusedUnsafeEnclosing>,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum UnsafeOpKind {
     CallToUnsafeFunction(Option<DefId>),
     UseOfInlineAssembly,
@@ -1117,18 +1373,61 @@ impl UnsafeOpKind {
     }
 }
 
+/// Trust: whether THIR must outlive this pass. Upstream steals it here to save memory, because
+/// nothing after MIR building reads it. The trust-ir codegen frontend
+/// (`-Ztrust-cg-frontend=trust-ir`) does: it lowers each codegen instance from THIR through
+/// `trust_ir_of_instance_body`, and instances are only known at codegen time, long after this pass
+/// (docs/plans/2026-09-29-trust-ir-sole-compile-path.md, step 2 increment 2). Kept only when
+/// that consumer is selected, not for every verifying session; measured cost on
+/// regex-syntax 0.8.5 at `-O0`: peak RSS 428 MB -> 437 MB (+2.1%), same wall time.
+///
+/// Trust (spawn census P4): the census's trust-ir shadow lane
+/// (`-Ztrust-spawn-census-shadow`) demands `trust_ir_of` at the analysis seam, after this
+/// pass; kept only while that lane runs.
+///
+/// Trust (platform protocols, plan L1a): so does the platform-protocol pass, which pairs each
+/// assembled body's call positions with `trust_ir_of(def).callees` and names a declined body's
+/// reason through `trust_ir_of_declined` after crate finalization. Kept exactly while that pass
+/// may run (`Session::trust_platform_errors_enabled`: verification on and a property
+/// requested), so `-Ztrust-verify=off` keeps upstream's steal.
+fn retain_thir_for_trust_ir(tcx: TyCtxt<'_>) -> bool {
+    tcx.sess.opts.unstable_opts.no_steal_thir
+        || tcx.sess.trust_cg_frontend_is_trust_ir()
+        || tcx.sess.opts.unstable_opts.trust_spawn_census_shadow.runs()
+        || tcx.sess.trust_platform_errors_enabled()
+}
+
 pub(crate) fn check_unsafety(tcx: TyCtxt<'_>, def: LocalDefId) {
     // Closures and inline consts are handled by their owner, if it has a body
     assert!(!tcx.is_typeck_child(def.to_def_id()));
     // Also, don't safety check custom MIR
     if find_attr!(tcx, def, CustomMir(..) => ()).is_some() {
+        // Trust: a skipped body is outside this requires_unsafe event census.
+        tracing::debug!(
+            target: "rustc_mir_build::trust_unsafe_source_events",
+            body_owner = ?def,
+            owner_def_path_hash = ?tcx.def_path_hash(def.to_def_id()),
+            scope = "custom_mir_skipped",
+            "Trust THIR unsafe source scope (diagnostic only)"
+        );
         return;
     }
 
-    let Ok((thir, expr)) = tcx.thir_body(def) else { return };
+    let Ok((thir, expr)) = tcx.thir_body(def) else {
+        // Trust: no THIR means no source-event observation for this body.
+        tracing::debug!(
+            target: "rustc_mir_build::trust_unsafe_source_events",
+            body_owner = ?def,
+            owner_def_path_hash = ?tcx.def_path_hash(def.to_def_id()),
+            scope = "thir_unavailable",
+            "Trust THIR unsafe source scope (diagnostic only)"
+        );
+        return;
+    };
     // Runs all other queries that depend on THIR.
     tcx.ensure_done().mir_built(def);
-    let thir = if tcx.sess.opts.unstable_opts.no_steal_thir {
+    // Trust: also keep THIR when the trust-ir codegen frontend will read it at codegen time.
+    let thir = if retain_thir_for_trust_ir(tcx) {
         &thir.borrow()
     } else {
         // We don't have other use for the THIR. Steal it to reduce memory usage.
@@ -1153,12 +1452,13 @@ pub(crate) fn check_unsafety(tcx: TyCtxt<'_>, def: LocalDefId) {
     let mut visitor = UnsafetyVisitor {
         tcx,
         thir,
+        unsafe_source_events: TrustUnsafeSourceEventRoster::new(def),
         safety_context,
         hir_context: hir_id,
         body_target_features,
         assignment_info: None,
         in_union_destructure: false,
-        typing_env: ty::TypingEnv::post_typeck_until_borrowck_for_mir_build(tcx, def),
+        typing_env: ty::TypingEnv::post_typeck_through_borrowck_for_mir_build(tcx, def),
         inside_adt: false,
         warnings: &mut warnings,
         suggest_unsafe_block: true,
@@ -1171,8 +1471,9 @@ pub(crate) fn check_unsafety(tcx: TyCtxt<'_>, def: LocalDefId) {
     }
     // Visit the body.
     visitor.visit_expr(&thir[expr]);
+    visitor.unsafe_source_events.trace_complete(tcx);
 
-    warnings.sort_by_key(|w| w.block_span);
+    warnings.sort_by_key(|w| w.block_span.lo_hi());
     for UnusedUnsafeWarning { hir_id, block_span, enclosing_unsafe } in warnings {
         let block_span = tcx.sess.source_map().guess_head_span(block_span);
         tcx.emit_node_span_lint(
@@ -1183,3 +1484,6 @@ pub(crate) fn check_unsafety(tcx: TyCtxt<'_>, def: LocalDefId) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

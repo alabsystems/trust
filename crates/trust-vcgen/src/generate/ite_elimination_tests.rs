@@ -107,3 +107,48 @@ fn over_cap_fails_open_leaving_the_ite() {
     let out = eliminate_term_ites(&f, 1);
     assert_eq!(out, f, "over-cap must leave the formula unchanged (fail-open)");
 }
+
+fn eval_bool(formula: &Formula, mask: usize, result: bool) -> bool {
+    match formula {
+        Formula::Bool(value) => *value,
+        Formula::Var(name, Sort::Bool) if name == "result" => result,
+        Formula::Var(name, Sort::Bool) => mask & (1 << name.parse::<usize>().unwrap()) != 0,
+        Formula::Eq(lhs, rhs) => eval_bool(lhs, mask, result) == eval_bool(rhs, mask, result),
+        Formula::Not(inner) => !eval_bool(inner, mask, result),
+        Formula::And(parts) => parts.iter().all(|part| eval_bool(part, mask, result)),
+        Formula::Implies(lhs, rhs) => !eval_bool(lhs, mask, result) || eval_bool(rhs, mask, result),
+        Formula::Ite(condition, yes, no) => {
+            eval_bool(if eval_bool(condition, mask, result) { yes } else { no }, mask, result)
+        }
+        other => panic!("outside Boolean test fragment: {other:?}"),
+    }
+}
+
+#[test]
+fn boolean_decision_tree_keeps_linear_guards_and_every_assignment() {
+    let mut tree = Formula::Eq(
+        Box::new(Formula::Var("0".into(), Sort::Bool)),
+        Box::new(Formula::Var("1".into(), Sort::Bool)),
+    );
+    for index in 0..12 {
+        tree =
+            ite(Formula::Var(index.to_string(), Sort::Bool), Formula::Bool(index % 2 == 0), tree);
+    }
+    for reversed in [false, true] {
+        let variable = Formula::Var("result".into(), Sort::Bool);
+        let original = if reversed {
+            Formula::Eq(Box::new(tree.clone()), Box::new(variable))
+        } else {
+            Formula::Eq(Box::new(variable), Box::new(tree.clone()))
+        };
+        let compact = eliminate_term_ites(&original, ITE_ELIM_CASE_CAP);
+        assert!(no_term_ite(&compact));
+        assert!(crate::simplify::measure_size(&compact) <= 12 * 12);
+        for mask in 0..1 << 12 {
+            for result in [false, true] {
+                assert_eq!(eval_bool(&compact, mask, result), eval_bool(&original, mask, result));
+            }
+        }
+        assert_eq!(eliminate_term_ites(&original, 12), original, "13 leaves exceed the cap");
+    }
+}

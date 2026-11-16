@@ -851,6 +851,20 @@ mod tests {
         assert!(args.contains(&"result >= x".to_string()));
     }
 
+    /// Writes `body` as an executable script and runs it ONCE, with the
+    /// argument `warm` and its output discarded, before any test times it.
+    ///
+    /// macOS assesses a file the first time it is executed, one first execution
+    /// at a time, machine-wide: a fresh script started 0.2 s after eight fresh
+    /// copies of a 490 MB test binary waited 49.4 s to start (measured
+    /// 2026-10-01; see `run_fresh_stand_in_once` in trust-router's
+    /// `incremental_ay.rs`), and a push lane starts freshly linked test
+    /// binaries side by side. `run_subprocess` spawns and then waits at most
+    /// `timeout_ms`, 60 s by default, so without this run that wait counts
+    /// against the timed call, and a long enough queue turns the verdict a test
+    /// asserts (`Unknown`, `Verified`) into `Timeout`. Every body must exit 0 at
+    /// once, with no effect outside its discarded output, when its first
+    /// argument is `warm`.
     #[cfg(unix)]
     fn write_test_script(name: &str, body: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -862,43 +876,127 @@ mod tests {
         let mut perms = std::fs::metadata(&path).expect("test script metadata").permissions();
         perms.set_mode(0o700);
         std::fs::set_permissions(&path, perms).expect("chmod test script");
+        let mut warm = Command::new(&path);
+        warm.arg("warm").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let warm = spawn_trust_wp_command(&mut warm)
+            .and_then(|mut child| child.wait())
+            .expect("run the test script once");
+        assert!(warm.success(), "the warm-up run failed: {warm:?}");
         path
+    }
+
+    /// The two timeout tests below run a script that forks `sleep 2`, then
+    /// creates a marker file, then waits for the sleep. What they pin is that a
+    /// timeout reaches the forked `sleep` too: a kill that missed it would leave
+    /// it holding the stdout/stderr pipes, so the reader threads, and the call,
+    /// would return only after about 2000 ms. DID_NOT_WAIT_FOR_THE_SLEEP is
+    /// that line, not a latency budget.
+    ///
+    /// Until 2026-10-01 they used a 50 ms timeout on a freshly written script,
+    /// and on macOS that never tested the kill. macOS assesses a file the first
+    /// time it is executed: a fresh script reached the line after `sleep 2 &`
+    /// 187-266 ms after spawn (35 runs), a second run of the same file 8-26 ms
+    /// after (60 runs, 40 of them beside 28 `yes` processes on 14 cores). So
+    /// the timeout always killed the shell before it forked the sleep, and both
+    /// tests passed (in 0.06 s) with run_subprocess changed to kill the direct
+    /// child only.
+    /// Now the script is run once before the timed call, the timeout is
+    /// FORKING_SCRIPT_TIMEOUT_MS, and each test asserts from the marker that the
+    /// sleep was running when the timeout fired.
+    ///
+    /// The old 1000 ms bound also failed once in a lane run at load average
+    /// 15-19 (the test passed 14 of 14 times alone). Over 152 runs with the old
+    /// 50 ms timeout, some beside 28 `yes` processes, the call took 50-731 ms,
+    /// never near 2000.
+    #[cfg(unix)]
+    const DID_NOT_WAIT_FOR_THE_SLEEP: Duration = Duration::from_millis(1_900);
+    #[cfg(unix)]
+    const FORKING_SCRIPT_TIMEOUT_MS: u64 = 250;
+
+    /// The script the timeout tests run, already executed once (with the
+    /// argument `warm`, which exits at once), and the marker it creates after
+    /// it has forked `sleep 2`.
+    #[cfg(unix)]
+    fn write_forking_script(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let marker = std::env::temp_dir().join(format!(
+            "trust-wp-{name}-{}-{}.forked",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = write_test_script(
+            name,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nsleep 2 &\n: > '{}'\nwait\n",
+                marker.display()
+            ),
+        );
+        // A warm-up that fell through to `sleep 2 &` would leave the marker
+        // behind, and the timed run's marker check would then pass untested.
+        assert!(
+            !marker.exists(),
+            "the warm-up run must exit before `sleep 2 &`, but it created {}",
+            marker.display()
+        );
+        (script, marker)
     }
 
     #[cfg(unix)]
     #[test]
     fn test_run_subprocess_kills_after_timeout() {
-        let script = write_test_script("timeout", "#!/bin/sh\nsleep 2 &\nwait\n");
+        let (script, forked) = write_forking_script("timeout");
         let config = TrustWpConfig::new()
             .with_solver_path(script.to_string_lossy().as_ref())
-            .with_timeout(50);
+            .with_timeout(FORKING_SCRIPT_TIMEOUT_MS);
         let backend = CliBackend::new(&config);
 
         let start = Instant::now();
         let output = backend.run_subprocess(&[]).expect("subprocess should be killed cleanly");
         let elapsed = start.elapsed();
+        let sleep_was_running = forked.exists();
         let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(forked);
 
         assert!(output.timed_out);
-        assert!(elapsed < Duration::from_secs(1));
+        assert!(
+            sleep_was_running,
+            "the timeout fired before the script forked `sleep 2`, so the kill was not tested \
+             ({elapsed:?})"
+        );
+        assert!(
+            elapsed < DID_NOT_WAIT_FOR_THE_SLEEP,
+            "the call waited for the forked `sleep 2`: {elapsed:?}"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn test_verify_returns_timeout_verdict_for_hung_subprocess() {
-        let script = write_test_script("verify-timeout", "#!/bin/sh\nsleep 2 &\nwait\n");
+        let (script, forked) = write_forking_script("verify-timeout");
         let config = TrustWpConfig::new()
             .with_solver_path(script.to_string_lossy().as_ref())
-            .with_timeout(50);
+            .with_timeout(FORKING_SCRIPT_TIMEOUT_MS);
         let backend = CliBackend::new(&config);
 
         let result = backend
             .verify("my::func", &ContractSet::new())
             .expect("timeout is represented as a trust_wp result");
+        let sleep_was_running = forked.exists();
         let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(forked);
 
         assert_eq!(result.verdict, Verdict::Timeout);
-        assert!(result.time_ms < 1_000);
+        assert!(
+            sleep_was_running,
+            "the timeout fired before the script forked `sleep 2`, so the kill was not tested \
+             (time_ms = {})",
+            result.time_ms
+        );
+        assert!(
+            Duration::from_millis(result.time_ms) < DID_NOT_WAIT_FOR_THE_SLEEP,
+            "verify waited for the forked `sleep 2`: time_ms = {}",
+            result.time_ms
+        );
         assert_eq!(result.function_name, "my::func");
     }
 

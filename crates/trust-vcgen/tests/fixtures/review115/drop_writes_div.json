@@ -1,0 +1,398 @@
+{
+  "name": "drop_writes_div",
+  "def_path": "drop1::drop_writes_div",
+  "span": {
+    "file": "drop1.rs",
+    "line_start": 22,
+    "col_start": 0,
+    "line_end": 27,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "m"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "drop1::G",
+            "fields": [
+              [
+                "0",
+                {
+                  "Ref": {
+                    "mutable": true,
+                    "inner": {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "1",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "_g"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      1,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 23,
+                "col_start": 23,
+                "line_end": 23,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 24,
+                "col_start": 17,
+                "line_end": 24,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "drop1::G",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "drop1::G<'_>"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 4,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 24,
+                "col_start": 15,
+                "line_end": 24,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "drop1.rs",
+              "line_start": 24,
+              "col_start": 29,
+              "line_end": 24,
+              "col_end": 30
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 25,
+                "col_start": 12,
+                "line_end": 25,
+                "col_end": 13
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 26,
+                "col_start": 4,
+                "line_end": 26,
+                "col_end": 11
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 2,
+            "span": {
+              "file": "drop1.rs",
+              "line_start": 26,
+              "col_start": 4,
+              "line_end": 26,
+              "col_end": 11
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        100,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 26,
+                "col_start": 4,
+                "line_end": 26,
+                "col_end": 11
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "v",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "v",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -4,27 +4,29 @@ mod env;
 mod fd;
 mod fs;
 mod mem;
+mod poll;
 mod socket;
 mod socket_address;
 mod sync;
+mod tcp_socket;
 mod thread;
+mod udp_socket;
 mod virtual_socket;
 
 mod android;
 mod freebsd;
-pub mod linux;
+mod linux;
 mod linux_like;
 mod macos;
+mod netbsd;
 mod solarish;
 
-// All the Unix-specific extension traits
+// All the Unix-specific extension traits, and some types needed elsewhere
 pub use self::env::{EvalContextExt as _, UnixEnvVars};
 pub use self::fd::{EvalContextExt as _, UnixFileDescription};
 pub use self::fs::{DirTable, EvalContextExt as _};
-pub use self::linux_like::epoll::{
-    Epoll, EpollInterestTable, EvalContextExt as EpollEvalContextExt,
-};
 pub use self::mem::EvalContextExt as _;
+pub use self::poll::EvalContextExt as _;
 pub use self::socket::EvalContextExt as _;
 pub use self::socket_address::EvalContextExt as _;
 pub use self::sync::EvalContextExt as _;
@@ -33,3 +35,4 @@ pub use self::virtual_socket::EvalContextExt as _;
 
 // Make up some constants.
 const UID: u32 = 1000;
+const HOSTNAME: &[u8] = b"Miri";

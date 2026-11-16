@@ -45,6 +45,23 @@
 //! `ptr_offset_decline_earns_no_certification_tier` pins the refusal AND pins that the
 //! two spellings agree at that tier — the `ptr::add` twin is refused too, by a real
 //! `Assertion { "[unsafe:sep:offset] …" }` row that does not refute.
+//!
+//! KEYLESS IS NOT OBLIGATION-FREE. That `[unsafe:sep:offset]` row exists only when the
+//! `ptr::add` call carries the `callee_key` today's extractor mints: the vcgen unsafe mint
+//! decides on the key alone, and answers a missing one with NO row. The `ptr-spine-corpus`
+//! dumps predate the key carrier, so on the committed bytes the intrinsic `count` raised no
+//! L0 row at all and `certify_callee_summary` reported it `proved` / `is_assumable` — the
+//! absence read as a discharge, again. The D1 test pins both inputs: keyed (the real row
+//! is raised and does not refute) and keyless (refused with no row that could have done
+//! it).
+//!
+//! CALLEE CREDIT (2026-09-24, `callee_credit_gate_tests`). Every summary-tier probe in
+//! this file makes a call, and the summary tier now refuses any body that calls,
+//! tail-calls or drops anything (`whole_program::first_unresolved_effect`): a summary
+//! has no graph in which to certify what that code does. So at the summary tier those
+//! probes are refused by that clause before the decline clause or the offset row is
+//! reached. The graph-tier assertions, which name the refusing clause by its reason,
+//! still isolate the decline and keyless clauses.
 
 #![cfg(test)]
 
@@ -53,8 +70,9 @@ use trust_types::{VcKind, VerifiableFunction};
 const FIXTURES: &str = "fixtures/decline-handling-2026-08-25/dumps";
 
 fn load(name: &str) -> Option<VerifiableFunction> {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURES).join(format!("{name}.json"));
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(FIXTURES)
+        .join(format!("{name}.json"));
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -76,8 +94,18 @@ const PANICKING_WITH_DECLINE: &[&str] = &[
     "q3_vec_range2",                // 328/384, first (len 0, a 0, b 1)
     "q5_dyn_range",                 // 27/48,  first (len 0, e 1)
     "q6_vec_range_ensures",         // 27/48,  first (len 0, end 1)
-    "q7_boxslice_range",            // 27/48,  first (len 0, end 1)
     "q2_btree_index",               // 18/24,  first (n 0, k 0)
+];
+
+/// The bodies whose runtime oracle PANICS, that once reached a declined row, and whose
+/// obligation vcgen now MODELS. A fixture moves here from [`PANICKING_WITH_DECLINE`]
+/// when it stops declining: it still panics, so it still measures the gates — through a
+/// modeled row that must not refute instead of through a decline.
+const PANICKING_NOW_MODELED: &[&str] = &[
+    // 27/48, first (len 0, end 1). Declined until the 2026-10-14 soundness-line merge
+    // (5ae0897560 / ea9748fb31); now a `SliceBoundsCheck` row, beside the
+    // `[unsafe:reborrow]` assertion of the `Box<[T]>` deref.
+    "q7_boxslice_range",
 ];
 
 /// Every fixture in [`PANICKING_WITH_DECLINE`] must actually reach a declined row —
@@ -92,8 +120,63 @@ fn panicking_fixtures_all_reach_a_declined_row() {
         assert!(
             !declined_rows(&func).is_empty(),
             "{name} no longer emits a declined row; this fixture no longer exercises the \
-             decline channel and must be replaced, not deleted"
+             decline channel: move it to PANICKING_NOW_MODELED (it must not be deleted)"
         );
+    }
+}
+
+/// A panicking fixture that stopped declining is still REFUSED, now by its modeled
+/// slice-bounds row: that row does not refute, so no gate reads the body as discharged
+/// and no tier mints assumption authority for it. If one declines again, it moves back.
+#[test]
+fn modeled_panicking_fixtures_stay_refused_by_their_modeled_row() {
+    for name in PANICKING_NOW_MODELED {
+        let Some(func) = load(name) else {
+            panic!("fixture {name} is missing — the modeled row would go unmeasured");
+        };
+        assert!(
+            declined_rows(&func).is_empty(),
+            "{name} declines again ({:?}): move it back to PANICKING_WITH_DECLINE",
+            declined_rows(&func)
+        );
+        let bounds: Vec<_> = trust_vcgen::generate_vcs(&func)
+            .into_iter()
+            .filter(|vc| matches!(vc.kind, VcKind::SliceBoundsCheck))
+            .collect();
+        assert!(!bounds.is_empty(), "{name} raises no SliceBoundsCheck row: it measures nothing");
+        for vc in &bounds {
+            let augmented = crate::prove::augment_with_type_bounds_pub(&vc.formula, &func);
+            assert!(
+                !matches!(
+                    crate::vc_refute::check_refute_vc(&augmented),
+                    Some(crate::RefuteOutcome::RefutedModulo3)
+                ),
+                "{name} PANICS under the runtime oracle yet its slice-bounds row refutes"
+            );
+        }
+        assert!(
+            !crate::prove::function_safety_vcs_all_discharged(&func),
+            "{name} PANICS under the runtime oracle yet every safety obligation discharged"
+        );
+        assert!(
+            !crate::trustir_safety::function_safety_vcs_faithful_via_trustir(&func),
+            "{name} PANICS under the runtime oracle yet the trust-ir safety gate passed it"
+        );
+        let mut registry = crate::composition_transfer::ProofStatusRegistry::new();
+        let summary = crate::whole_program::certify_callee_summary(
+            &func,
+            trust_ir::FuncId::new(0),
+            &mut registry,
+        );
+        assert!(!summary.ir_summary.proved, "{name}: certify_callee_summary reported proved");
+        assert!(!registry.is_assumable(&func.def_path), "{name}: the registry made it assumable");
+        let graph = crate::whole_program::verify_call_graph(std::slice::from_ref(&func));
+        for v in &graph.verdicts {
+            assert!(
+                !matches!(v.status, crate::composition_transfer::ProofStatus::Certified),
+                "{name} PANICS under the runtime oracle yet verify_call_graph certified it"
+            );
+        }
     }
 }
 
@@ -137,8 +220,11 @@ fn declined_row_never_reaches_assumption_authority() {
     for name in PANICKING_WITH_DECLINE {
         let Some(func) = load(name) else { continue };
         let mut registry = crate::composition_transfer::ProofStatusRegistry::new();
-        let summary =
-            crate::whole_program::certify_callee_summary(&func, trust_ir::FuncId::new(0), &mut registry);
+        let summary = crate::whole_program::certify_callee_summary(
+            &func,
+            trust_ir::FuncId::new(0),
+            &mut registry,
+        );
         assert!(
             !summary.ir_summary.proved,
             "{name} PANICS under the runtime oracle yet certify_callee_summary reported \
@@ -320,11 +406,12 @@ fn ptr_offset_decline_is_honored_only_when_its_lane_closes() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(
-        declined_rows(&unresolved)
-            .iter()
-            .any(|k| matches!(k, VcKind::UnsupportedMir { kind, .. } if kind == "Rvalue::PtrOffset")),
+        declined_rows(&unresolved).iter().any(
+            |k| matches!(k, VcKind::UnsupportedMir { kind, .. } if kind == "Rvalue::PtrOffset")
+        ),
         "the probe must actually raise the spared kind, or it measures nothing"
     );
     assert!(
@@ -438,6 +525,96 @@ fn panicking_leaf_graph_probe(spell_binop: bool) -> VerifiableFunction {
     f
 }
 
+/// `f` with the `callee_key` today's extractor mints on each of its calls
+/// (`trust_mir_extract::callee_key_for`): the two sysroot items the `count` spine reaches
+/// get their declaration-table tags from a real sysroot `core`, and every other callee —
+/// `count_raw`, the probe's panicking leaf — gets a non-sysroot key with no tag, which is
+/// what a user crate's item mints. The committed `ptr-spine-corpus` dumps predate the
+/// carrier and carry no key at all.
+fn with_extractor_keys(mut f: VerifiableFunction) -> VerifiableFunction {
+    use trust_types::callee_key::SysrootItem;
+    let key = |sysroot_item: Option<SysrootItem>, krate: &str, stable_crate_id: u64| {
+        trust_types::CalleeKey {
+            krate_is_real_sysroot: sysroot_item.is_some(),
+            sysroot_item,
+            krate_name_is_ambiguous: false,
+            stable_crate_id,
+            krate_name: krate.to_string(),
+            foreign_block_leaf: None,
+            upstream_foreign_link_symbol: None,
+            diverging_entry: None,
+        }
+    };
+    for b in &mut f.body.blocks {
+        if let trust_types::Terminator::Call { func, callee_key, .. } = &mut b.terminator {
+            *callee_key = Some(match func.as_str() {
+                "core::slice::<impl [T]>::as_ptr" => key(Some(SysrootItem::SliceAsPtr), "core", 1),
+                "core::ptr::const_ptr::<impl *const T>::add" => {
+                    key(Some(SysrootItem::ConstPtrAdd), "core", 1)
+                }
+                "arch::all::memchr::One::count_raw" => key(None, "memchr", 2),
+                _ => key(None, "probe", 3),
+            });
+        }
+    }
+    f
+}
+
+/// Whether `f` has a direct call that carries no `callee_key`.
+fn has_keyless_call(f: &VerifiableFunction) -> bool {
+    f.body
+        .blocks
+        .iter()
+        .any(|b| matches!(b.terminator, trust_types::Terminator::Call { callee_key: None, .. }))
+}
+
+/// The `[unsafe:sep:offset]` rows vcgen raises for `f`, each with whether it refutes.
+fn sep_offset_rows(f: &VerifiableFunction) -> Vec<bool> {
+    trust_vcgen::generate_vcs(f)
+        .into_iter()
+        .filter(|vc| {
+            matches!(&vc.kind, VcKind::Assertion { message }
+                if message.starts_with("[unsafe:sep:offset]"))
+        })
+        .map(|vc| {
+            let augmented = crate::prove::augment_with_type_bounds_pub(&vc.formula, f);
+            matches!(
+                crate::vc_refute::check_refute_vc(&augmented),
+                Some(crate::RefuteOutcome::RefutedModulo3)
+            )
+        })
+        .collect()
+}
+
+/// How many `L0Safety` rows vcgen raises for `f`.
+fn l0_row_count(f: &VerifiableFunction) -> usize {
+    trust_vcgen::generate_vcs(f)
+        .iter()
+        .filter(|vc| vc.kind.proof_level() == trust_types::ProofLevel::L0Safety)
+        .count()
+}
+
+/// `fn g(h) -> u64 { always_panics(h) }` — [`panicking_leaf_graph_probe`] cut down to its
+/// leaf call, which writes `_0` and returns. KEYLESS, as the committed dump it is built
+/// from: the one call names a callee outside any graph this file builds.
+fn keyless_leaf_only_probe() -> VerifiableFunction {
+    use trust_types::{BasicBlock, BlockId, Terminator};
+    let mut f = panicking_leaf_graph_probe(true);
+    f.def_path = "probe::leaf_only".into();
+    let Terminator::Call { func, target, .. } = &mut f.body.blocks[0].terminator else {
+        panic!("the graph probe's BB0 must be the leaf Call");
+    };
+    assert_eq!(func, "probe::always_panics", "BB0 must be the panicking leaf");
+    *target = Some(BlockId(1));
+    f.body.blocks.truncate(1);
+    f.body.blocks.push(BasicBlock {
+        id: BlockId(1),
+        stmts: vec![],
+        terminator: Terminator::Return,
+    });
+    f
+}
+
 /// `#[ensures(result >= 0)]` — trivially true of the `u64` return, so the postcondition
 /// VC refutes on the type bound alone and can never be the reason a verdict goes either
 /// way. What is left deciding each verdict is the L0 row set.
@@ -453,11 +630,8 @@ fn with_trivial_ensures(mut f: VerifiableFunction) -> VerifiableFunction {
 /// The three certification-tier authority columns for one body.
 fn authority(f: &VerifiableFunction) -> (bool, bool, bool) {
     let mut registry = crate::composition_transfer::ProofStatusRegistry::new();
-    let summary = crate::whole_program::certify_callee_summary(
-        f,
-        trust_ir::FuncId::new(0),
-        &mut registry,
-    );
+    let summary =
+        crate::whole_program::certify_callee_summary(f, trust_ir::FuncId::new(0), &mut registry);
     let graph = crate::whole_program::verify_call_graph(std::slice::from_ref(f));
     let certified = graph
         .verdicts
@@ -487,13 +661,24 @@ fn authority(f: &VerifiableFunction) -> (bool, bool, bool) {
 /// `Assertion { "[unsafe:sep:offset] …" }` row that does not refute), so refusing the
 /// `Rvalue::PtrOffset` spelling is what makes the two agree — crediting it made the
 /// BinOp spelling STRICTLY MORE authoritative than the intrinsic.
+///
+/// KEYS. The summary-tier probes carry the `callee_key`s today's extractor mints
+/// (`with_extractor_keys`), so a refusal there can only come from the clause each probe is
+/// about. The `[unsafe:sep:offset]` row above exists only on that keyed input: the mint
+/// decides on the key, and the committed dump predates the key carrier. On the committed
+/// KEYLESS bytes the intrinsic `count` raised no L0 row at all and read
+/// `(proved, assumable) = (true, true)` until `whole_program`'s keyless clause — measured
+/// on 7766459729, and pinned below with no row present that could refuse it instead.
+/// Since the callee-credit clause (see the module doc) the summary tier refuses every one
+/// of these call-bearing probes at that clause, so the summary-tier columns here pin the
+/// refusal, not which clause makes it.
 #[test]
 fn ptr_offset_decline_earns_no_certification_tier() {
     let probes: [(&str, VerifiableFunction); 3] = [
-        ("binop count", with_trivial_ensures(binop_spelled_count())),
+        ("binop count", with_trivial_ensures(with_extractor_keys(binop_spelled_count()))),
         (
             "binop count, panicking leaf",
-            with_trivial_ensures({
+            with_trivial_ensures(with_extractor_keys({
                 let mut f = binop_spelled_count();
                 for b in &mut f.body.blocks {
                     if let trust_types::Terminator::Call { func, .. } = &mut b.terminator {
@@ -504,21 +689,23 @@ fn ptr_offset_decline_earns_no_certification_tier() {
                 }
                 f.def_path = "probe::count_via_panicking_leaf".into();
                 f
-            }),
+            })),
         ),
         (
             "panicking-leaf graph probe",
-            with_trivial_ensures(panicking_leaf_graph_probe(true)),
+            with_trivial_ensures(with_extractor_keys(panicking_leaf_graph_probe(true))),
         ),
     ];
 
     for (name, f) in &probes {
+        // Keyed as the extractor keys it, so the keyless clause cannot be what refuses.
+        assert!(!has_keyless_call(f), "{name}: the summary-tier probe must be fully keyed");
         // The probe must actually exercise the COMPENSATED path: one offset decline,
         // and a receiving lane that closes. Otherwise the refusal below proves nothing.
         assert!(
-            declined_rows(f)
-                .iter()
-                .any(|k| matches!(k, VcKind::UnsupportedMir { kind, .. } if kind == "Rvalue::PtrOffset")),
+            declined_rows(f).iter().any(
+                |k| matches!(k, VcKind::UnsupportedMir { kind, .. } if kind == "Rvalue::PtrOffset")
+            ),
             "{name}: the probe must raise the compensated kind, or it measures nothing"
         );
         assert!(
@@ -548,21 +735,29 @@ fn ptr_offset_decline_earns_no_certification_tier() {
 
     // The graph probe must really reach the VC loop, not stop at the dominance-scope
     // gate — otherwise its `Certified == false` would hold for an unrelated reason.
+    // KEYLESS on purpose: `global_callee_hypotheses_have_supported_scope` admits only a
+    // keyless call prefix, and the decline clause runs BEFORE the keyless clause, so this
+    // is the probe that pins the graph tier's decline clause itself.
     let graph_probe = with_trivial_ensures(panicking_leaf_graph_probe(true));
+    assert!(has_keyless_call(&graph_probe), "the graph-tier probe must stay keyless");
     let verdicts = crate::whole_program::verify_call_graph(std::slice::from_ref(&graph_probe));
     assert!(
-        verdicts.verdicts.iter().any(|v| v
-            .open_reason
-            .as_deref()
-            .is_some_and(|r| r.contains("DECLINED row"))),
+        verdicts
+            .verdicts
+            .iter()
+            .any(|v| v.open_reason.as_deref().is_some_and(|r| r.contains("DECLINED row"))),
         "the graph probe must be refused BY THE DECLINE CLAUSE, got {:?}",
         verdicts.verdicts.iter().map(|v| v.open_reason.clone()).collect::<Vec<_>>()
     );
 
-    // SPELLING AGREEMENT at this tier: the `ptr::add` twins are refused too.
+    // SPELLING AGREEMENT at this tier: the `ptr::add` twins are refused too — keyed, by
+    // the real offset row.
     for (name, f) in [
-        ("intrinsic count", with_trivial_ensures(ptr_spine_count())),
-        ("intrinsic graph probe", with_trivial_ensures(panicking_leaf_graph_probe(false))),
+        ("intrinsic count", with_trivial_ensures(with_extractor_keys(ptr_spine_count()))),
+        (
+            "intrinsic graph probe",
+            with_trivial_ensures(with_extractor_keys(panicking_leaf_graph_probe(false))),
+        ),
     ] {
         assert!(
             declined_rows(&f).is_empty(),
@@ -570,11 +765,63 @@ fn ptr_offset_decline_earns_no_certification_tier() {
              obligation, which is the asymmetry this test is about"
         );
         assert_eq!(
+            sep_offset_rows(&f),
+            vec![false],
+            "{name}: keyed, the `ptr::add` must raise exactly one `[unsafe:sep:offset]` row, \
+             and it must NOT refute — that row is the obligation that refuses this spelling"
+        );
+        assert_eq!(
             authority(&f),
             (false, false, false),
             "{name}: the intrinsic spelling must stay refused at the certification tier"
         );
     }
+
+    // KEYLESS IS NOT OBLIGATION-FREE: the committed pre-carrier bytes. The mint cannot see
+    // a keyless `ptr::add`, so NO L0 row exists that could refuse these bodies. What
+    // stands between them and `proved`/`assumable` is the refusal of the call itself: the
+    // callee-credit clause at the summary tier, the dominance-scope gate at the graph tier.
+    // Before the keyless clause, `intrinsic count` read `(true, true, false)` here.
+    for (name, f) in [
+        ("keyless intrinsic count", with_trivial_ensures(ptr_spine_count())),
+        ("keyless intrinsic graph probe", with_trivial_ensures(panicking_leaf_graph_probe(false))),
+    ] {
+        assert!(has_keyless_call(&f), "{name}: the probe must carry a keyless call");
+        assert_eq!(
+            l0_row_count(&f),
+            0,
+            "{name}: the keyless `ptr::add` must raise no L0 row, or this probe no longer \
+             shows the call refused with no row present that could refuse it"
+        );
+        assert_eq!(
+            authority(&f),
+            (false, false, false),
+            "{name}: a body whose calls the unsafe mint cannot identify must be refused at \
+             the certification tier, not certified over an empty row set"
+        );
+    }
+    // Neither keyless intrinsic probe reaches the graph tier's VC loop (both stop at the
+    // dominance-scope gate: the slice-metadata read precedes the `ptr::add` call). The
+    // graph tier's keyless clause is pinned on the probe cut down to its panicking leaf
+    // call, which that gate DOES admit: one keyless call to a callee outside the graph and
+    // no row but the trivially-refuting postcondition — before the clause, `Certified`.
+    let leaf_only = with_trivial_ensures(keyless_leaf_only_probe());
+    assert!(has_keyless_call(&leaf_only), "the leaf-only probe must carry a keyless call");
+    assert_eq!(l0_row_count(&leaf_only), 0, "the leaf-only probe must raise no L0 row");
+    let verdicts = crate::whole_program::verify_call_graph(std::slice::from_ref(&leaf_only));
+    assert!(
+        verdicts
+            .verdicts
+            .iter()
+            .any(|v| v.open_reason.as_deref().is_some_and(|r| r.contains("carries no callee key"))),
+        "the keyless leaf-only probe must be refused BY THE KEYLESS CLAUSE, got {:?}",
+        verdicts.verdicts.iter().map(|v| v.open_reason.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        authority(&leaf_only),
+        (false, false, false),
+        "a body whose only call is keyless and outside the graph must not certify"
+    );
 
     // THE POSITIVE CONTROL — without it every assertion above would also hold of a gate
     // that refuses everything, and of one that refuses exactly the decline-FREE bodies.
@@ -585,11 +832,10 @@ fn ptr_offset_decline_earns_no_certification_tier() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
             .join(format!("{name}.json"));
-        let func: VerifiableFunction =
-            serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| {
-                panic!("read {}: {e}", path.display())
-            }))
-            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let func: VerifiableFunction = serde_json::from_slice(
+            &std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+        )
+        .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
         assert!(
             declined_rows(&func).is_empty(),
             "{name} must stay decline-free to serve as the positive control"

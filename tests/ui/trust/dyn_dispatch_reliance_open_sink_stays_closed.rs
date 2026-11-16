@@ -1,5 +1,6 @@
 //@ needs-trust-verify
 //@ compile-flags: -Ztrust-verify=on --crate-type lib
+//@ check-pass
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
@@ -44,6 +45,21 @@
 //! that reported it clean would be a false promise. The composite in
 //! `dyn_dispatch_reliance_cflow_concrete_sink.rs` — where the caller pins the
 //! sink — is the shape that legitimately discharges.
+//!
+//! ## D1 increment 1 (2026-09-25) — the SITE stays closed; the FUNCTION is now a
+//! conditional pass
+//!
+//! Everything above still holds for the `dyn` site: C-FLOW and C-UNIVERSAL both
+//! still decline, and nothing discharges it. What changed is the function's
+//! verdict: an impl whose only unproved edge is its own `Formatter`'s writer is
+//! now published as the WRITER-RELATIVE class — its row stays unproved and
+//! `runtime-checked`, it is reported as an advisory ("panic-free relative to its
+//! `Formatter`'s writer"), `-Ztrust-policy=certify` refuses it, and no shared
+//! bar or registry reads it as panic-free. The "false promise" this file guards
+//! against is a verdict of panic-freedom; the conditional verdict states the
+//! condition instead. BEFORE (stage-1 snapshot `4e9fe36bf`): the impl was
+//! refused, `error: Trust strict verification failed` on this `fn` (the pin this
+//! file carried until then). See `trust_verify/fmt_writer_relative.rs`.
 #![no_std]
 #![allow(dead_code)]
 
@@ -54,6 +70,7 @@ pub struct Tag;
 impl fmt::Display for Tag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("tag")
-        //~^^ ERROR Trust strict verification failed
+        //~^^ WARN Trust verification advisory
+        //~| NOTE panic-free relative to its `Formatter`'s writer
     }
 }

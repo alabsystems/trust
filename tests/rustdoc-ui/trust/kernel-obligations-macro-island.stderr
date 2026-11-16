@@ -1,0 +1,8 @@
+error: `one_is_two` did not elaborate: Type mismatch: expected 1 = 2, got 1 = 1
+  --> $DIR/kernel-obligations-macro-island.rs:20:9
+   |
+LL |         theorem one_is_two : (1 : Nat) = 2 := rfl
+   |         ^^^^^^^
+
+error: aborting due to 1 previous error
+

@@ -1,0 +1,8 @@
+error: cited theorem `no_such_theorem` is not registered in any Clean island or the prelude
+  --> $DIR/kernel-obligations-island-free-citation.rs:10:28
+   |
+LL |     ensures result == x by no_such_theorem
+   |                            ^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+

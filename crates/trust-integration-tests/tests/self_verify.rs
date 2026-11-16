@@ -130,6 +130,7 @@ fn build_bv_extract_width_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -220,13 +221,16 @@ fn build_simplifier_loop_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
 /// SV-3: Model of BloomFilter::contains() modular arithmetic in trust-cache.
 ///
 /// Source: crates/trust-cache/src/bloom_filter.rs -- `hash % self.bits.len()`
-/// then `self.bits[idx]`. Division by zero when bits.len() == 0.
+/// then `self.bits[idx]`. Division by zero when bits.len() == 0. T11
+/// (2026-10-16) deleted that module; the model is built by hand below and
+/// stands as a shape the pipeline must route, not a claim about live code.
 ///
 /// Model: u64 arg (hash), usize arg (bits_len), computes `index = hash % bits_len`,
 /// then indexes into an array at `index`.
@@ -309,6 +313,7 @@ fn build_bloom_filter_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -399,6 +404,7 @@ fn build_convergence_accumulator_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

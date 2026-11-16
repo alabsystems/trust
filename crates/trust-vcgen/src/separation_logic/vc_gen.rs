@@ -27,15 +27,16 @@ pub fn deref_vc(func_name: &str, ptr_name: &str, span: &SourceSpan) -> Vec<Verif
     let ptr = Formula::Var(super::generated_symbol(&format!("ptr_{ptr_name}")), Sort::Int);
     let heap_var = super::generated_symbol("heap");
     let heap = Formula::Var(heap_var, Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int)));
+    let fn_sym: trust_types::Symbol = func_name.into();
 
-    let mut vcs = Vec::new();
+    let mut vcs = Vec::with_capacity(3);
 
     // VC 1: Non-null check -- ptr == 0 is a violation
     vcs.push(VerificationCondition {
         kind: VcKind::Assertion {
             message: format!("[unsafe:sep:deref] null check for *{ptr_name}"),
         },
-        function: func_name.into(),
+        function: fn_sym,
         location: span.clone(),
         formula: Formula::Eq(Box::new(ptr.clone()), Box::new(Formula::Int(0))),
         contract_metadata: None,
@@ -51,7 +52,7 @@ pub fn deref_vc(func_name: &str, ptr_name: &str, span: &SourceSpan) -> Vec<Verif
         kind: VcKind::Assertion {
             message: format!("[unsafe:sep:deref] allocation validity for *{ptr_name}"),
         },
-        function: func_name.into(),
+        function: fn_sym,
         location: span.clone(),
         formula: Formula::Eq(
             Box::new(Formula::Select(Box::new(heap), Box::new(ptr.clone()))),
@@ -80,7 +81,7 @@ pub fn deref_vc(func_name: &str, ptr_name: &str, span: &SourceSpan) -> Vec<Verif
         kind: VcKind::Assertion {
             message: format!("[unsafe:sep:deref] alignment check for *{ptr_name}"),
         },
-        function: func_name.into(),
+        function: fn_sym,
         location: span.clone(),
         formula: Formula::And(vec![
             // align > 0 (alignment is always positive)
@@ -165,55 +166,54 @@ pub fn transmute_vc(
     let dst_size = Formula::Var(super::generated_symbol(&format!("size_{dst_ty}")), Sort::Int);
     let src_align = Formula::Var(super::generated_symbol(&format!("align_{src_ty}")), Sort::Int);
     let dst_align = Formula::Var(super::generated_symbol(&format!("align_{dst_ty}")), Sort::Int);
-
-    let mut vcs = Vec::new();
-
-    // VC 1: Layout compatibility -- size_of::<Src>() != size_of::<Dst>()
-    // is a violation
-    vcs.push(VerificationCondition {
-        kind: VcKind::Assertion {
-            message: format!(
-                "[unsafe:sep:transmute] layout: size_of({src_ty}) != size_of({dst_ty})"
-            ),
-        },
-        function: func_name.into(),
-        location: span.clone(),
-        formula: Formula::Not(Box::new(Formula::Eq(Box::new(src_size), Box::new(dst_size)))),
-        contract_metadata: None,
-        obligation: None,
-    });
-
-    // VC 2: Validity invariant -- the bit pattern must be valid for Dst.
-    // Without concrete type info, we model this symbolically.
+    let fn_sym: trust_types::Symbol = func_name.into();
     let valid_bits = Formula::Var(
         super::generated_symbol(&format!("valid_bits_{src_ty}_as_{dst_ty}")),
         Sort::Bool,
     );
-    vcs.push(VerificationCondition {
-        kind: VcKind::Assertion {
-            message: format!(
-                "[unsafe:sep:transmute] validity: bits of {src_ty} invalid for {dst_ty}"
-            ),
-        },
-        function: func_name.into(),
-        location: span.clone(),
-        formula: Formula::Not(Box::new(valid_bits)),
-        contract_metadata: None,
-        obligation: None,
-    });
 
-    // VC 3: Alignment compatibility -- align_of::<Dst>() > align_of::<Src>()
-    // is a violation (transmute doesn't change alignment)
-    vcs.push(VerificationCondition {
-        kind: VcKind::Assertion {
-            message: format!("[unsafe:sep:transmute] alignment: align({dst_ty}) > align({src_ty})"),
+    vec![
+        // VC 1: Layout compatibility -- size_of::<Src>() != size_of::<Dst>()
+        // is a violation
+        VerificationCondition {
+            kind: VcKind::Assertion {
+                message: format!(
+                    "[unsafe:sep:transmute] layout: size_of({src_ty}) != size_of({dst_ty})"
+                ),
+            },
+            function: fn_sym,
+            location: span.clone(),
+            formula: Formula::Not(Box::new(Formula::Eq(Box::new(src_size), Box::new(dst_size)))),
+            contract_metadata: None,
+            obligation: None,
         },
-        function: func_name.into(),
-        location: span.clone(),
-        formula: Formula::Gt(Box::new(dst_align), Box::new(src_align)),
-        contract_metadata: None,
-        obligation: None,
-    });
-
-    vcs
+        // VC 2: Validity invariant -- the bit pattern must be valid for Dst.
+        // Without concrete type info, we model this symbolically.
+        VerificationCondition {
+            kind: VcKind::Assertion {
+                message: format!(
+                    "[unsafe:sep:transmute] validity: bits of {src_ty} invalid for {dst_ty}"
+                ),
+            },
+            function: fn_sym,
+            location: span.clone(),
+            formula: Formula::Not(Box::new(valid_bits)),
+            contract_metadata: None,
+            obligation: None,
+        },
+        // VC 3: Alignment compatibility -- align_of::<Dst>() > align_of::<Src>()
+        // is a violation (transmute doesn't change alignment)
+        VerificationCondition {
+            kind: VcKind::Assertion {
+                message: format!(
+                    "[unsafe:sep:transmute] alignment: align({dst_ty}) > align({src_ty})"
+                ),
+            },
+            function: fn_sym,
+            location: span.clone(),
+            formula: Formula::Gt(Box::new(dst_align), Box::new(src_align)),
+            contract_metadata: None,
+            obligation: None,
+        },
+    ]
 }

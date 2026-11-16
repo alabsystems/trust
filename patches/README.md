@@ -36,13 +36,13 @@ are building Trust from source, patch it.
 
 ## Building an LLVM for Trust
 
-Trust needs LLVM **21 or newer** (`check_llvm_version` in
+Trust needs LLVM **22 or newer** (`check_llvm_version` in
 `src/bootstrap/src/core/build_steps/llvm.rs` rejects anything older); the
-version Trust develops against is 22.1.x, and the patch applies cleanly to
-that line.
+version Trust develops against is 23.1.x (the tree pinned by rustc
+1.101.0-nightly), and the patch applies cleanly to that line.
 
 ```bash
-git clone --depth 1 --branch llvmorg-22.1.2 \
+git clone --depth 1 --branch llvmorg-23.1.0 \
     https://github.com/llvm/llvm-project.git
 cd llvm-project
 git apply /path/to/trust/patches/0001-llvm-scalarevolution-guard-cross-phi-addrec-recursion.patch

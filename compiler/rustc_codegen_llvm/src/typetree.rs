@@ -6,10 +6,10 @@ use crate::attributes;
 use crate::context::FullCx;
 use crate::llvm::{self, EnzymeWrapper, Value};
 
-fn to_enzyme_typetree(
+fn to_enzyme_typetree<'ll>(
     rust_typetree: &RustTypeTree,
     _data_layout: &str,
-    llcx: &llvm::Context,
+    llcx: llvm::Context<'ll>,
 ) -> (llvm::TypeTree, Vec<llvm::TypeTree>) {
     let mut enzyme_tt = llvm::TypeTree::new();
     let extra_ints = process_typetree_recursive(&mut enzyme_tt, &rust_typetree, &[], llcx);
@@ -24,11 +24,11 @@ fn to_enzyme_typetree(
     (enzyme_tt, int_vec)
 }
 
-fn process_typetree_recursive(
+fn process_typetree_recursive<'ll>(
     enzyme_tt: &mut llvm::TypeTree,
     rust_typetree: &RustTypeTree,
     parent_indices: &[i64],
-    llcx: &llvm::Context,
+    llcx: llvm::Context<'ll>,
 ) -> u32 {
     let mut extra_ints = 0;
     for rust_type in &rust_typetree.0 {
@@ -75,15 +75,9 @@ enum TTLocation {
     Callsite,
 }
 
-#[cfg_attr(not(feature = "llvm_enzyme"), allow(unused))]
 pub(crate) fn add_tt<'tcx, 'll>(cx: &FullCx<'ll, 'tcx>, fn_def: &'ll Value, tt: FncTree) {
-    // TypeTree processing uses functions from Enzyme, which we might not have available if we did
-    // not build this compiler with `llvm_enzyme`. This feature is not strictly necessary, but
-    // skipping this function increases the chance that Enzyme fails to compile some code.
-    // FIXME(autodiff): In the future we should conditionally run this function even without the
-    // `llvm_enzyme` feature, in case that libEnzyme was provided via rustup.
-    #[cfg(not(feature = "llvm_enzyme"))]
-    return;
+    // TypeTree processing uses functions from Enzyme. This feature is not strictly necessary,
+    // but skipping this function increases the chance that Enzyme fails to compile some code.
 
     let tcx = cx.tcx;
     if !tcx.sess.opts.unstable_opts.autodiff.contains(&rustc_session::config::AutoDiff::Enable) {
@@ -98,7 +92,7 @@ pub(crate) fn add_tt<'tcx, 'll>(cx: &FullCx<'ll, 'tcx>, fn_def: &'ll Value, tt: 
     let inputs = tt.args;
     let ret_tt: RustTypeTree = tt.ret;
 
-    let llvm_data_layout: *const c_char = unsafe { llvm::LLVMGetDataLayoutStr(&*llmod) };
+    let llvm_data_layout: *const c_char = unsafe { llvm::LLVMGetDataLayoutStr(llmod) };
     let llvm_data_layout =
         std::str::from_utf8(unsafe { std::ffi::CStr::from_ptr(llvm_data_layout) }.to_bytes())
             .expect("got a non-UTF8 data-layout from LLVM");

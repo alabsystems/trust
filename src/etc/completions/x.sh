@@ -2142,7 +2142,7 @@ _x() {
             return 0
             ;;
         x__fix)
-            opts="-v -q -i -j -h --verbose --quiet --incremental --config --build-dir --build --host --target --exclude --skip --include-default-paths --rustc-error-format --on-fail --dry-run --dump-bootstrap-shims --stage --keep-stage --keep-stage-std --src --jobs --warnings --json-output --compile-time-deps --color --bypass-bootstrap-lock --rust-profile-generate --rust-profile-use --llvm-profile-use --llvm-profile-generate --enable-bolt-settings --skip-stage0-validation --reproducible-artifact --set --ci --skip-std-check-if-no-download-rustc --help [PATHS]... [ARGS]..."
+            opts="-v -q -i -j -h --allow-dirty --verbose --quiet --incremental --config --build-dir --build --host --target --exclude --skip --include-default-paths --rustc-error-format --on-fail --dry-run --dump-bootstrap-shims --stage --keep-stage --keep-stage-std --src --jobs --warnings --json-output --compile-time-deps --color --bypass-bootstrap-lock --rust-profile-generate --rust-profile-use --llvm-profile-use --llvm-profile-generate --enable-bolt-settings --skip-stage0-validation --reproducible-artifact --set --ci --skip-std-check-if-no-download-rustc --help [PATHS]... [ARGS]..."
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3456,18 +3456,29 @@ _x() {
             return 0
             ;;
         x__test)
-            opts="-v -q -i -j -h --no-fail-fast --test-args --compiletest-rustc-args --trust-vanilla --all-targets --doc --tests --bless --extra-checks --force-rerun --only-modified --compare-mode --pass --run --rustfix-coverage --no-capture --verbose-run-make-subprocess-output --test-codegen-backend --bypass-ignore-backends --no-doc --record --rerun --verbose --quiet --incremental --config --build-dir --build --host --target --exclude --skip --include-default-paths --rustc-error-format --on-fail --dry-run --dump-bootstrap-shims --stage --keep-stage --keep-stage-std --src --jobs --warnings --json-output --compile-time-deps --color --bypass-bootstrap-lock --rust-profile-generate --rust-profile-use --llvm-profile-use --llvm-profile-generate --enable-bolt-settings --skip-stage0-validation --reproducible-artifact --set --ci --skip-std-check-if-no-download-rustc --help [PATHS]... [ARGS]..."
+            opts="-v -q -i -j -h --trust-repo-check --trust-repo-wp-installation --trust-repo-parent-release-v1 --no-fail-fast --test-args --compiletest-rustc-args --trust-vanilla --trust-verified --all-targets --doc --tests --compiler-test-fixture --bless --extra-checks --force-rerun --only-modified --compare-mode --pass --run --rustfix-coverage --no-capture --verbose-run-make-subprocess-output --test-codegen-backend --bypass-ignore-backends --no-doc --record --rerun --verbose --quiet --incremental --config --build-dir --build --host --target --exclude --skip --include-default-paths --rustc-error-format --on-fail --dry-run --dump-bootstrap-shims --stage --keep-stage --keep-stage-std --src --jobs --warnings --json-output --compile-time-deps --color --bypass-bootstrap-lock --rust-profile-generate --rust-profile-use --llvm-profile-use --llvm-profile-generate --enable-bolt-settings --skip-stage0-validation --reproducible-artifact --set --ci --skip-std-check-if-no-download-rustc --help [PATHS]... [ARGS]..."
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --trust-repo-wp-installation)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --test-args)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --compiletest-rustc-args)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --compiler-test-fixture)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
                     return 0
                     ;;
                 --extra-checks)
@@ -3674,18 +3685,29 @@ _x() {
             return 0
             ;;
         x__test)
-            opts="-v -q -i -j -h --no-fail-fast --test-args --compiletest-rustc-args --trust-vanilla --all-targets --doc --tests --bless --extra-checks --force-rerun --only-modified --compare-mode --pass --run --rustfix-coverage --no-capture --verbose-run-make-subprocess-output --test-codegen-backend --bypass-ignore-backends --no-doc --record --rerun --verbose --quiet --incremental --config --build-dir --build --host --target --exclude --skip --include-default-paths --rustc-error-format --on-fail --dry-run --dump-bootstrap-shims --stage --keep-stage --keep-stage-std --src --jobs --warnings --json-output --compile-time-deps --color --bypass-bootstrap-lock --rust-profile-generate --rust-profile-use --llvm-profile-use --llvm-profile-generate --enable-bolt-settings --skip-stage0-validation --reproducible-artifact --set --ci --skip-std-check-if-no-download-rustc --help [PATHS]... [ARGS]..."
+            opts="-v -q -i -j -h --trust-repo-check --trust-repo-wp-installation --trust-repo-parent-release-v1 --no-fail-fast --test-args --compiletest-rustc-args --trust-vanilla --trust-verified --all-targets --doc --tests --compiler-test-fixture --bless --extra-checks --force-rerun --only-modified --compare-mode --pass --run --rustfix-coverage --no-capture --verbose-run-make-subprocess-output --test-codegen-backend --bypass-ignore-backends --no-doc --record --rerun --verbose --quiet --incremental --config --build-dir --build --host --target --exclude --skip --include-default-paths --rustc-error-format --on-fail --dry-run --dump-bootstrap-shims --stage --keep-stage --keep-stage-std --src --jobs --warnings --json-output --compile-time-deps --color --bypass-bootstrap-lock --rust-profile-generate --rust-profile-use --llvm-profile-use --llvm-profile-generate --enable-bolt-settings --skip-stage0-validation --reproducible-artifact --set --ci --skip-std-check-if-no-download-rustc --help [PATHS]... [ARGS]..."
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --trust-repo-wp-installation)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --test-args)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --compiletest-rustc-args)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --compiler-test-fixture)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
                     return 0
                     ;;
                 --extra-checks)

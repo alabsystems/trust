@@ -41,11 +41,15 @@ fn noop_raw_waker() -> RawWaker {
 
 pub fn poll_after_ready(x: u8) -> u16 {
     let mut fut = f(x);
-    // SAFETY: `fut` lives on this frame for the whole call and is never moved
-    // after being pinned; the pin is dropped before the frame unwinds.
+    // Sound: `fut` lives on this frame for the whole call and is never moved
+    // after being pinned; the pin is dropped before the frame unwinds. (Not
+    // marked as a SAFETY comment on purpose: one would declare this block,
+    // SAFETY-ASSUME-1, and certify would refuse the declaration instead of the
+    // re-poll under test.)
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
-    // SAFETY: the vtable is a no-op waker over a null data pointer; every
-    // vtable entry ignores the pointer, so no dereference ever occurs.
+    // Sound: the vtable is a no-op waker over a null data pointer; every
+    // vtable entry ignores the pointer, so no dereference ever occurs. Not
+    // marked as a SAFETY comment either, for the same reason as the pin above.
     let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
     let mut cx = Context::from_waker(&waker);
     let first = fut.as_mut().poll(&mut cx);

@@ -4,6 +4,82 @@ use std::fmt;
 use std::process::{ExitStatus, Output};
 use std::str;
 
+/// Trust: actual target exit observation plus failed scheduling retirement.
+/// The observed status is DATA; it must not replace this failure's CLI status
+/// (in particular, an observed target exit zero cannot make retirement pass).
+#[derive(Debug)]
+pub struct TargetExecutionError {
+    observed_status: Option<ExitStatus>,
+    completion_error: anyhow::Error,
+    signal_mask: u32,
+}
+
+impl TargetExecutionError {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Retain an actual observed exit beside a failed native finalization.
+    /// The exit is data; even exit zero must not replace the failure's CLI code.
+    pub fn new(observed_status: ExitStatus, completion_error: anyhow::Error) -> Self {
+        Self {
+            observed_status: Some(observed_status),
+            completion_error,
+            signal_mask: 0,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Preserve a failed finalization with no observed target exit.
+    pub fn unobserved(error: anyhow::Error) -> Self {
+        Self {
+            observed_status: None,
+            completion_error: error,
+            signal_mask: 0,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn with_signal_mask(mut self, mask: u32) -> Self {
+        self.signal_mask = mask;
+        self
+    }
+
+    /// Caught parent cancellation is an observation, never retirement authority.
+    pub fn signal_mask(&self) -> u32 {
+        self.signal_mask
+    }
+
+    pub fn observed_status(&self) -> Option<ExitStatus> {
+        self.observed_status
+    }
+
+    pub fn completion_error(&self) -> &anyhow::Error {
+        &self.completion_error
+    }
+}
+
+impl fmt::Display for TargetExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(status) = self.observed_status {
+            write!(
+                f,
+                "target ended ({}), but original execution finalization failed: {}",
+                status, self.completion_error
+            )
+        } else {
+            write!(
+                f,
+                "native target completion unavailable: {}",
+                self.completion_error
+            )
+        }
+    }
+}
+
+impl std::error::Error for TargetExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.completion_error.as_ref())
+    }
+}
+
 #[derive(Debug)]
 pub struct ProcessError {
     /// A detailed description to show to the user why the process failed.
@@ -15,6 +91,11 @@ pub struct ProcessError {
     /// found) or if the exit status wasn't a code but was instead something
     /// like termination via a signal.
     pub code: Option<i32>,
+
+    /// Trust: the signal that terminated the process, when it was one. Unix
+    /// reports a signal in place of an exit code; a reporter that names how
+    /// a child ended needs the signal itself, not its rendering in `desc`.
+    pub signal: Option<i32>,
 
     /// The stdout from the process.
     ///
@@ -48,13 +129,15 @@ impl ProcessError {
             None => "never executed".to_string(),
         };
 
-        Self::new_raw(
+        let mut error = Self::new_raw(
             msg,
             status.and_then(|s| s.code()),
             &exit,
             output.map(|s| s.stdout.as_slice()),
             output.map(|s| s.stderr.as_slice()),
-        )
+        );
+        error.signal = status.and_then(exit_signal);
+        error
     }
 
     /// Creates a new [`ProcessError`] with the raw output data.
@@ -91,6 +174,7 @@ impl ProcessError {
         ProcessError {
             desc,
             code,
+            signal: None,
             stdout: stdout.map(|s| s.to_vec()),
             stderr: stderr.map(|s| s.to_vec()),
         }
@@ -101,6 +185,19 @@ impl ProcessError {
     /// * `cmd` is usually but not limited to [`std::process::Command`].
     pub fn could_not_execute(cmd: impl fmt::Display) -> ProcessError {
         ProcessError::new(&format!("could not execute process {cmd}"), None, None)
+    }
+}
+
+/// Trust: the terminating signal of `status`, or `None` for an exit code.
+pub fn exit_signal(status: ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::ExitStatusExt::signal(&status)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
     }
 }
 

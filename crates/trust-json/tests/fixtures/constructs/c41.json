@@ -1,0 +1,22 @@
+{
+  "id": 41,
+  "empty": {},
+  "nested": {
+    "a": {
+      "b": {
+        "c": {
+          "d": {}
+        }
+      }
+    }
+  },
+  "exp": 6.02e+23,
+  "": "empty key",
+  "ключ": "non-ASCII key",
+  "items": [],
+  "neg": -41,
+  "big": 9007199254741033,
+  "blank": "",
+  "control": "unit\u0001separator",
+  "escapes": "quote \" and backslash \\"
+}

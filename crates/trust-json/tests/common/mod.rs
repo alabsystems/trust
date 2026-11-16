@@ -8,7 +8,8 @@
 //! corpus, the hazard table, the typed-lens differential) are separate test
 //! binaries, so anything they both need lives here rather than being written
 //! twice. Two copies of [`same`] that drift apart would silently weaken
-//! whichever gate holds the weaker copy.
+//! whichever gate holds the weaker copy. `adversarial.rs` takes the incumbent's
+//! parse from here for the same reason.
 //!
 //! Nothing in this file asserts. It converts, compares and formats; the
 //! decisions are in the test files.
@@ -29,10 +30,7 @@ impl Lcg {
         Lcg(seed)
     }
     pub fn next_u64(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         // xorshift the high bits down; the raw LCG low bits are weak.
         let x = self.0;
         x ^ (x >> 31)
@@ -76,6 +74,84 @@ pub fn to_inc(v: &tj::Value) -> inc::Value {
             inc::Value::Object(m)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The incumbent's object order, made independent of the build graph.
+// ---------------------------------------------------------------------------
+
+/// Which `Map` backing the incumbent has in THIS test binary.
+///
+/// `serde_json`'s `preserve_order` feature swaps its default `BTreeMap`
+/// (key-sorted iteration) for an `IndexMap` (insertion order). Cargo unifies
+/// features over every package one invocation selects, and a dependency can
+/// only ADD a feature, so this crate's `Cargo.toml` cannot keep it off: the
+/// backing is decided by how the test was invoked. `-p trust-json` alone gets
+/// the `BTreeMap`; any selection that also contains `trust-certify` (which asks
+/// for `preserve_order` since f2c4e2ccce) or the compiler's `trust-mc-driver`
+/// gets the `IndexMap`, and so does `-p trust-json --features
+/// incumbent-serde-json/preserve_order`, which asks for it directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncumbentOrder {
+    /// The default backing: objects iterate in key (UTF-8 byte) order.
+    Sorted,
+    /// `preserve_order` was unified in: objects iterate in insertion order.
+    Insertion,
+}
+
+/// Measure [`IncumbentOrder`] on a two-key probe.
+pub fn incumbent_order() -> Result<IncumbentOrder, String> {
+    let probe = inc::from_str::<inc::Value>(r#"{"b":0,"a":0}"#).map_err(|e| e.to_string())?;
+    match inc::to_string(&probe).map_err(|e| e.to_string())?.as_str() {
+        r#"{"a":0,"b":0}"# => Ok(IncumbentOrder::Sorted),
+        r#"{"b":0,"a":0}"# => Ok(IncumbentOrder::Insertion),
+        other => Err(format!("incumbent object order is neither sorted nor insertion: {other}")),
+    }
+}
+
+/// The incumbent's tree with every object rebuilt in key order: the iteration
+/// order of its default `BTreeMap<String, Value>` backing (`String`'s `Ord`,
+/// i.e. by UTF-8 bytes).
+///
+/// trust-json's [`tj::Map`] is key-sorted by design (`src/map.rs`), and every
+/// expectation in this gate was written against the default backing. On that
+/// backing this function is the identity; when `preserve_order` was unified in
+/// (see [`IncumbentOrder`]) it yields what the default backing would have
+/// iterated. Only the ORDER of entries changes: keys, values, number carriers
+/// and duplicate-key collapse are the incumbent's own. Every incumbent tree
+/// whose object order can reach a byte comparison or a `Deserialize` in this
+/// gate comes through here, so none of those comparisons depends on which
+/// other packages an invocation selected.
+///
+/// Iterative, so a deep tree cannot exhaust a test thread's stack.
+pub fn key_sorted(mut v: inc::Value) -> inc::Value {
+    {
+        let mut pending: Vec<&mut inc::Value> = vec![&mut v];
+        while let Some(node) = pending.pop() {
+            match node {
+                inc::Value::Array(items) => pending.extend(items.iter_mut()),
+                inc::Value::Object(map) => {
+                    let mut entries: Vec<(String, inc::Value)> =
+                        std::mem::take(map).into_iter().collect();
+                    entries.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+                    map.extend(entries);
+                    pending.extend(map.values_mut());
+                }
+                _ => {}
+            }
+        }
+    }
+    v
+}
+
+/// The incumbent's `from_str::<Value>`, in the default backing's key order.
+pub fn inc_from_str(src: &str) -> Result<inc::Value, inc::Error> {
+    inc::from_str::<inc::Value>(src).map(key_sorted)
+}
+
+/// The incumbent's `from_slice::<Value>`, in the default backing's key order.
+pub fn inc_from_slice(src: &[u8]) -> Result<inc::Value, inc::Error> {
+    inc::from_slice::<inc::Value>(src).map(key_sorted)
 }
 
 // ---------------------------------------------------------------------------
@@ -129,10 +205,14 @@ fn same_at(a: &tj::Value, b: &inc::Value, path: &str) -> Result<(), String> {
         }
         (tj::Value::Object(x), inc::Value::Object(y)) => {
             if x.len() != y.len() {
-                let ours: Vec<&str> = x.keys().map(String::as_str).collect();
-                let theirs: Vec<&str> = y.keys().map(String::as_str).collect();
+                // Name one key that is on a single side, not every key: an
+                // object in the corpus or the 100k-key adversarial input
+                // would otherwise put its whole key list in the message.
+                let only_ours = x.keys().find(|k| !y.contains_key(k.as_str()));
+                let only_theirs = y.keys().find(|k| !x.contains_key(k.as_str()));
                 return Err(format!(
-                    "{path}: object len {} vs {}; ours={ours:?} theirs={theirs:?}",
+                    "{path}: object len {} vs {}; first key only ours: {only_ours:?}, \
+                     first key only theirs: {only_theirs:?}",
                     x.len(),
                     y.len()
                 ));
@@ -145,11 +225,9 @@ fn same_at(a: &tj::Value, b: &inc::Value, path: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err(format!(
-            "{path}: shape differs: ours={} theirs={}",
-            kind_of_tj(a),
-            kind_of_inc(b)
-        )),
+        _ => {
+            Err(format!("{path}: shape differs: ours={} theirs={}", kind_of_tj(a), kind_of_inc(b)))
+        }
     }
 }
 
@@ -188,34 +266,43 @@ pub fn kind_of_inc(v: &inc::Value) -> &'static str {
 /// diagnostic in every consumer that prints one.
 pub fn agree_on_parse(src: &str) {
     let mine = tj::from_str(src);
-    let theirs = inc::from_str::<inc::Value>(src);
+    let theirs = inc_from_str(src);
     match (&mine, &theirs) {
         (Ok(a), Ok(b)) => {
             if let Err(why) = same(a, b) {
-                panic!("parse of {src:?} differs: {why}");
+                panic!("parse of {} differs: {why}", abbreviated(src));
             }
             // ... and the bytes on the way back out.
-            assert_eq!(
-                tj::to_string(a).unwrap(),
-                inc::to_string(b).unwrap(),
-                "re-serialization of {src:?}"
-            );
+            let (mine, theirs) = (tj::to_string(a).unwrap(), inc::to_string(b).unwrap());
+            if let Some(d) = first_difference(&mine, &theirs) {
+                panic!("re-serialization of {} differs at {d}", abbreviated(src));
+            }
         }
         (Err(a), Err(b)) => {
             assert_eq!(
                 (a.line(), a.column()),
                 (b.line(), b.column()),
-                "error position for {src:?}: {a} vs {b}"
+                "error position for {}: {a} vs {b}",
+                abbreviated(src)
             );
-            assert_eq!(a.to_string(), b.to_string(), "error text for {src:?}");
+            assert_eq!(a.to_string(), b.to_string(), "error text for {}", abbreviated(src));
             assert_eq!(
                 a.classify() == tj::Category::Eof,
                 b.classify() == inc::error::Category::Eof,
-                "error category for {src:?}"
+                "error category for {}",
+                abbreviated(src)
             );
         }
-        (Ok(a), Err(b)) => panic!("trust-json accepted {src:?} as {a}; incumbent rejected: {b}"),
-        (Err(a), Ok(b)) => panic!("trust-json rejected {src:?} ({a}); incumbent accepted: {b}"),
+        (Ok(a), Err(b)) => panic!(
+            "trust-json accepted {} as {}; incumbent rejected: {b}",
+            abbreviated(src),
+            abbreviated(&a.to_string())
+        ),
+        (Err(a), Ok(b)) => panic!(
+            "trust-json rejected {} ({a}); incumbent accepted: {}",
+            abbreviated(src),
+            abbreviated(&b.to_string())
+        ),
     }
 }
 
@@ -237,11 +324,7 @@ pub fn first_difference(ours: &str, theirs: &str) -> Option<String> {
         return None;
     }
     let (a, b) = (ours.as_bytes(), theirs.as_bytes());
-    let at = a
-        .iter()
-        .zip(b)
-        .position(|(x, y)| x != y)
-        .unwrap_or(a.len().min(b.len()));
+    let at = a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
     Some(format!(
         "byte {at} of {} (ours) / {} (theirs)\n     ours: {}\n   theirs: {}",
         a.len(),
@@ -249,6 +332,26 @@ pub fn first_difference(ours: &str, theirs: &str) -> Option<String> {
         window(ours, at),
         window(theirs, at),
     ))
+}
+
+/// How many bytes of an input a failure message reproduces before it
+/// abbreviates. Every generated or hand-written case that is not one of the
+/// enormous inputs fits, so those still print whole.
+pub const SHOWN_BYTES: usize = 160;
+
+/// An input as a failure message names it: whole, `Debug`-escaped, when it is
+/// at most [`SHOWN_BYTES`] long; otherwise its head and its length.
+///
+/// `adversarial.rs` feeds megabyte inputs (a 1 MiB escape string, a 100k-key
+/// object), and a note that repeats the input and both renderings in full was
+/// one 5 MB line in which the divergence could not be found. The divergence
+/// itself is [`first_difference`]'s job; this only says WHICH input it was.
+pub fn abbreviated(s: &str) -> String {
+    if s.len() <= SHOWN_BYTES {
+        return format!("{s:?}");
+    }
+    let cut = (0..=SHOWN_BYTES / 2).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0);
+    format!("\"{}\"… ({} bytes)", s[..cut].escape_debug(), s.len())
 }
 
 fn window(s: &str, at: usize) -> String {

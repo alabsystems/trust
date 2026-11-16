@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 // trust-types/model.rs: MIR-level verification model
 //
 // These types represent a function extracted from rustc's MIR, simplified
@@ -8,14 +9,17 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::Formula;
+use crate::opaque_identity::OpaqueOrigin;
+use crate::callee_key::CalleeKey;
 use crate::digest::{stable_sha256_hex, stable_sha256_hex_parts};
 use crate::spec::FunctionSpec;
 
-const LOWERED_COMPILER_CONTRACT_PREFIX: &str = "__trust_lowered_compiler_contract__:";
+pub(crate) const LOWERED_COMPILER_CONTRACT_PREFIX: &str = "__trust_lowered_compiler_contract__:";
 
 /// Lowercase hex digits, indexed by nibble.
 ///
@@ -72,7 +76,7 @@ fn stable_model_json<T>(value: &T) -> Result<String, serde_json::Error>
 where
     T: Serialize + ?Sized,
 {
-    let json = serde_json::to_string(value)?;
+    let mut json = serde_json::to_string(value)?;
     // Trust (B3-4 T3): `layout` follows the same discipline — its `None` is
     // exactly the pre-T3 semantics, so the default must not perturb shipped
     // content-hash pins. A `Some` layout IS hash-visible (it asserts concrete
@@ -117,21 +121,30 @@ where
     // edit drops the `skip_serializing_if`, this line keeps audited pins still.
     // `datatype_defs` is the only member of that name in this model and JSON
     // string contents cannot forge the fragment (embedded quotes are escaped).
-    Ok(json
-        .replace(",\"faithful_enum_repr\":null", "")
-        .replace(",\"layout\":null", "")
-        .replace(",\"enum_layout\":null", "")
-        .replace(",\"adt_kind\":null", "")
-        .replace(",\"args\":null", "")
-        .replace(",\"obligation\":null", "")
-        .replace(",\"datatype_defs\":{}", "")
+    const DEFAULT_FRAGMENTS: [&str; 10] = [
+        ",\"faithful_enum_repr\":null",
+        ",\"layout\":null",
+        ",\"enum_layout\":null",
+        ",\"adt_kind\":null",
+        ",\"args\":null",
+        ",\"obligation\":null",
+        ",\"datatype_defs\":{}",
+        // Trust (2026-09-29): the tuple-layout carrier, the same belt and braces.
+        ",\"tuple_layouts\":{\"target\":null,\"entries\":[]}",
         // Trust (F6): the arbitrary-precision provenance stamp is FULL
         // `#[serde(skip)]` (never serialized), so these strips are normally
         // inert belt-and-braces — kept so that if a future edit downgrades the
         // skip to `skip_serializing_if`, audited pins still hold. Embedded
         // quotes in JSON strings are escaped, so content cannot forge them.
-        .replace(",\"arbitrary_precision\":\"Signed\"", "")
-        .replace(",\"arbitrary_precision\":\"Unsigned\"", ""))
+        ",\"arbitrary_precision\":\"Signed\"",
+        ",\"arbitrary_precision\":\"Unsigned\"",
+    ];
+    for fragment in DEFAULT_FRAGMENTS {
+        if json.contains(fragment) {
+            json = json.replace(fragment, "");
+        }
+    }
+    Ok(json)
 }
 
 /// Canonical JSON hash material, as bytes, for any Trust model value.
@@ -166,9 +179,10 @@ pub fn typed_contract_formula_digest(formula: &Formula) -> String {
     let bytes = serde_json::to_vec(formula).expect(
         "Formula is the canonical serializable Trust proposition; refusing a debug fallback",
     );
-    let mut material = b"trust.compiler-contract.typed-proposition.v1\0".to_vec();
-    material.extend_from_slice(&bytes);
-    format!("sha256:{}", stable_sha256_hex(&material))
+    format!(
+        "sha256:{}",
+        stable_sha256_hex_parts(&[b"trust.compiler-contract.typed-proposition.v1\0", &bytes])
+    )
 }
 
 /// Structural identity for a compiler proposition including the exact source
@@ -183,9 +197,10 @@ pub fn typed_contract_proposition_digest(
     let bytes = serde_json::to_vec(&(formula, variable_domains)).expect(
         "compiler proposition identity is canonical serializable Trust data; refusing a debug fallback",
     );
-    let mut material = b"trust.compiler-contract.typed-proposition.v2\0".to_vec();
-    material.extend_from_slice(&bytes);
-    format!("sha256:{}", stable_sha256_hex(&material))
+    format!(
+        "sha256:{}",
+        stable_sha256_hex_parts(&[b"trust.compiler-contract.typed-proposition.v2\0", &bytes])
+    )
 }
 
 /// Compute a stable non-zero 32-bit id over stable byte material.
@@ -389,10 +404,13 @@ pub fn canonical_contract_source_id(
 pub fn canonical_contract_source_index(contract_id: &str) -> Option<usize> {
     let rest = contract_id.strip_prefix("trust-contract:")?;
     let (path_and_kind, index_text) = rest.rsplit_once(':')?;
-    let index = index_text.parse::<usize>().ok()?;
-    if index.to_string() != index_text {
+    if index_text.is_empty()
+        || (index_text.len() > 1 && index_text.starts_with('0'))
+        || !index_text.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
+    let index = index_text.parse::<usize>().ok()?;
     let (path, kind) = path_and_kind.rsplit_once(':')?;
     if !matches!(
         kind,
@@ -423,6 +441,10 @@ fn canonical_contract_function_component_syntax(component: &str) -> bool {
     }
 
     let bytes = component.as_bytes();
+    if !bytes.contains(&b'%') {
+        return bytes.iter().all(|&byte| byte.is_ascii_graphic() && !matches!(byte, b'?' | b'#'));
+    }
+
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -474,6 +496,23 @@ pub struct VerifiableFunction {
     // verification pipeline's FunctionSpec/ContractMetadata types.
     #[serde(default)]
     pub spec: FunctionSpec,
+    /// Rustc's own layout of the tuple types this function's body names (2026-09-29).
+    ///
+    /// `Ty::Tuple` carries no layout, so without this a tuple field's address had
+    /// no byte offset on any lane. `trust_mir_extract` is the only writer, on the
+    /// FAITHFUL lane only (where `Ty::Adt::layout` is filled too), one `layout_of`
+    /// answer per concrete tuple type the body's type lowering met. See
+    /// [`crate::TupleLayouts`] for the rows and what a consumer must still check.
+    ///
+    /// It sits on the function, not on [`VerifiableBody`], so that no struct literal
+    /// of a body had to move: frozen oracle files (`scripts/frozen-files.txt`)
+    /// construct bodies by literal, and none constructs a function.
+    ///
+    /// SERDE DISCIPLINE, exactly the `VerifiableBody::datatype_defs` rule: an EMPTY
+    /// table is the pre-carrier meaning and never reaches the wire or stable hash
+    /// material; a populated table is hash-visible.
+    #[serde(default, skip_serializing_if = "crate::TupleLayouts::is_empty")]
+    pub tuple_layouts: crate::TupleLayouts,
 }
 
 impl VerifiableFunction {
@@ -488,6 +527,20 @@ impl VerifiableFunction {
     /// callee, arguments, span, atomic metadata, and compiler-authenticated
     /// safety flags.  It is an over-approximation for a callee that never
     /// returns, which can only lose proofs.
+    ///
+    /// It does NOT keep frame lifetime. A `become` ends the caller's frame
+    /// before the callee runs, but the projected call reads as if the frame
+    /// outlived it, exactly like `return f(..)`; so a consumer that credits a
+    /// call with the caller's storage (a pointer argument's allocation, extent
+    /// or liveness) GAINS a proof here. Such a consumer must take the source's
+    /// tail-call block ids (the projection keeps every source block's id) and
+    /// judge the call in those blocks as a tail call. In trust-vcgen's
+    /// generation entry those are `sep_engine::tail_call_blocks`, asked through
+    /// `sep_engine::terminator_ends_frame` by the three consumers that credit a
+    /// call with the caller's storage: the sep engine's `&raw` confinement and
+    /// modeled-call rows, and the FFI buffer-extent facts (REVIEW-A4C4-MINORS-1;
+    /// docs/DECISION_QUEUE.md lists what was audited). A new consumer of that
+    /// kind is not covered until it asks the same predicate.
     ///
     /// No clone is made when the body contains no tail calls.
     #[must_use]
@@ -533,6 +586,7 @@ impl VerifiableFunction {
                 is_foreign,
                 is_unsafe_sig,
                 callee_identity,
+                callee_key,
             } = tail
             else {
                 // Unreachable: `block_index` came from `tail_blocks`, collected
@@ -552,6 +606,11 @@ impl VerifiableFunction {
                 is_foreign,
                 is_unsafe_sig,
                 callee_identity,
+                // The tail call's structured key survives the rewrite to an
+                // ordinary call: it identifies the SAME callee, and dropping it
+                // here would silently send the unsafe mint back to display text
+                // for every `become f(..)`.
+                callee_key,
                 // MIR TailCall has no in-frame cleanup successor, but a panic
                 // from the callee still unwinds through this frame to its
                 // caller.  `Continue` is the exact ordinary-call analogue;
@@ -592,23 +651,22 @@ impl VerifiableFunction {
     /// serialization bug instead of hashing empty fallback strings: two failed
     /// serializations must never collapse to the same proof/cache identity.
     pub fn try_content_hash(&self) -> Result<String, serde_json::Error> {
-        use sha2::{Digest, Sha256};
         let body_json = stable_model_json(&self.body)?;
         let contracts_json = stable_model_json(&self.contracts)?;
         let pre_json = stable_model_json(&self.preconditions)?;
         let post_json = stable_model_json(&self.postconditions)?;
         let spec_json = stable_model_json(&self.spec)?;
-        let mut hasher = Sha256::new();
-        hasher.update(body_json.as_bytes());
-        hasher.update(b":");
-        hasher.update(contracts_json.as_bytes());
-        hasher.update(b":");
-        hasher.update(pre_json.as_bytes());
-        hasher.update(b":");
-        hasher.update(post_json.as_bytes());
-        hasher.update(b":");
-        hasher.update(spec_json.as_bytes());
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(stable_sha256_hex_parts(&[
+            body_json.as_bytes(),
+            b":",
+            contracts_json.as_bytes(),
+            b":",
+            pre_json.as_bytes(),
+            b":",
+            post_json.as_bytes(),
+            b":",
+            spec_json.as_bytes(),
+        ]))
     }
 }
 
@@ -837,7 +895,13 @@ pub fn resolved_datatype<'a>(defs: &DatatypeDefs, ty: &'a Ty) -> std::borrow::Co
 }
 
 /// MIR body simplified for verification.
+///
+/// Deserialization goes through [`crate::opaque_identity`]'s wire shape so that
+/// every loaded body has its unmodeled carriers (opaque scalars, opaque references,
+/// unsupported operands) placed (OPAQUE-SCALAR-ID-1, OPAQUE-REF-ID-1);
+/// serialization is the plain derive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "crate::opaque_identity::VerifiableBodyWire")]
 pub struct VerifiableBody {
     pub locals: Vec<LocalDecl>,
     pub blocks: Vec<BasicBlock>,
@@ -936,15 +1000,21 @@ impl VerifiableBody {
             });
 
             for guarded in bb.terminator.discovered_clauses(block) {
-                if let ClauseTarget::Block(target) = guarded.target {
-                    let mut next_guards = guards.clone();
+                if let ClauseTarget::Block(target) = guarded.target
+                    && target.0 < discovered.len()
+                    && discovered[target.0].is_none()
+                {
+                    let mut next_guards = Vec::with_capacity(guards.len() + 1);
+                    next_guards.extend_from_slice(&guards);
                     next_guards.push(guarded.guard);
                     queue.push_back((target, next_guards));
                 }
             }
 
             for target in bb.terminator.unguarded_successors() {
-                queue.push_back((target, guards.clone()));
+                if target.0 < discovered.len() && discovered[target.0].is_none() {
+                    queue.push_back((target, guards.clone()));
+                }
             }
         }
 
@@ -1242,6 +1312,179 @@ impl SourceSpan {
     }
 }
 
+/// THE AUTHENTICATED ANSWER TO "IS THIS SPAN INSIDE THE REAL STANDARD LIBRARY".
+///
+/// # The defect this type exists to close
+///
+/// Until 2026-09-20 that question was answered by INSPECTING THE RENDERED PATH.
+/// `trust_vcgen::sep_engine::is_trusted_std_file` asked whether
+/// [`SourceSpan::file`] had a `library/<std-crate>/src/` segment or began with a
+/// bare `<std-crate>/src/`, and a `true` DELETES every `[unsafe:sep:*]` row for
+/// that span AND suppresses the stand-in for the unsafe operation. But
+/// `SourceSpan::file` is the UNREMAPPED LOCAL PATH the user compiled
+/// (`prefer_local_unconditionally`), so the user chose the answer. MEASURED on
+/// the fix lane of round 8, byte-identical source, same `--crate-name evil`,
+/// same flags, differing only in the directory:
+///
+/// ```text
+///     core/src/evil.rs                                     ->  3 obligations
+///     library/core/src/evil.rs                             ->  3 obligations
+///     usr/lib/rustlib/src/rust/library/core/src/evil.rs    ->  3 obligations
+///     mycore/src/evil.rs                                   -> 13 obligations
+/// ```
+///
+/// The ten deleted rows are three `[unsafe:sep:deref]` contracts on
+/// `core::ptr::read`, the `[unsafe:sep:call]` row on
+/// `core::slice::raw::from_raw_parts`, four `[unsafe:sep:{deref,write}]` rows on
+/// a plain user `*p = 7`, and its two `UnmodeledSafetyAssert` stand-ins. Nothing
+/// re-covers them: the callees ARE genuine sysroot items, so
+/// `call_has_unsafe_model_keyed` arm 3 withholds `[unsafe:unmodeled-call]`, and
+/// `generate_safety_vcs` skipped the blocks so no stand-in was minted either. An
+/// unsafe raw-pointer deref with ZERO obligations, bought with a directory name.
+///
+/// # What replaces it
+///
+/// The question is answered ONCE, by the compiler, from ARTIFACT RESIDENCY:
+/// every `rustc_span::SourceFile` carries a `cnum` naming the crate it was
+/// imported from (`LOCAL_CRATE` for the crate being compiled), and
+/// `trust_mir_extract::convert::is_real_sysroot_crate` decides whether that
+/// crate is this compiler's own standard library by asking where the loader
+/// opened its artifacts — a fact an adversary who cannot write into the
+/// compiler's library directory cannot set. `trust_mir_extract::
+/// trusted_std_source_files` walks the session's whole source map and builds
+/// this table.
+///
+/// The path is then only a JOIN KEY, and the rendering used for it is exactly
+/// the one both obligation-identity span converters stamp onto
+/// [`SourceSpan::file`] (`stable_obligation_file(prefer_local_unconditionally())`),
+/// so the join is byte-exact rather than a pattern.
+///
+/// # Every way this fails, and which way it falls
+///
+///   * NOT INSTALLED (`Self::default()`, the fail-closed empty) — every span is
+///     NOT trusted std, so every obligation is KEPT. This is what a caller that
+///     is not the compiler gets: a unit test, a standalone vcgen embedding, a
+///     replayed artifact. It can only ever add rows.
+///   * A SPAN WHOSE FILE IS NOT IN THE TABLE — not trusted std, obligations
+///     kept. Reaches a dummy span (`SourceSpan::default()`, empty file), the
+///     `binary:0x…` compatibility form, a synthetic span minted downstream of
+///     extraction, and a file decoded into the source map after the table was
+///     built.
+///   * A CRATE WHOSE RESIDENCY CANNOT BE ESTABLISHED — `is_real_sysroot_crate`
+///     is itself fail-closed (an empty artifact path set is not residency), so
+///     the file is recorded as NOT trusted and its obligations are kept.
+///   * TWO SOURCE FILES THAT RENDER THE SAME STRING AND DISAGREE — recorded as
+///     NOT trusted, so the collision costs the sysroot file its exemption and
+///     never buys the user file one. [`Self::insert`] is where that happens.
+///     A user who deliberately collides makes the verifier charge MORE rows,
+///     which is noise, not a safety loss.
+///
+/// The type is deliberately NOT `Serialize`: it is a per-compilation fact
+/// derived from the live `TyCtxt`, and a table that could be replayed out of an
+/// artifact would be exactly the forgeable input this replaces.
+///
+/// # Why the contents sit behind an `Arc`
+///
+/// The table is installed on a `trust_vcgen::VcgenContext`, and a context is
+/// CLONED several times per body — once into the frame `enter_vcgen_context`
+/// pushes, again on every nested generation entry that rebuilds a frame. The
+/// table holds one interned string per source file in the session's map
+/// (measured in the thousands once the sysroot is decoded), so a deep clone
+/// there would allocate millions of strings over a crate. `Arc` makes every
+/// clone after the first a refcount bump. `PartialEq`/`Eq` still compare
+/// CONTENTS, so nothing about the type's meaning changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrustedStdSourceFiles {
+    inner: Arc<TrustedStdSourceFileTables>,
+}
+
+/// The two sets and the installed flag. Private: the only ways in are
+/// [`TrustedStdSourceFiles::from_authenticated_files`] and `Default`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TrustedStdSourceFileTables {
+    /// Renderings whose `SourceFile` authenticated as real sysroot AND never
+    /// collided with one that did not.
+    trusted: BTreeSet<String>,
+    /// Renderings seen with at least one NON-sysroot `SourceFile`. Kept so the
+    /// collision rule is order-independent: a trusted file seen first is still
+    /// revoked by an untrusted one seen later.
+    revoked: BTreeSet<String>,
+    /// Did a producer that can actually authenticate build this table? Only
+    /// [`TrustedStdSourceFiles::from_authenticated_files`] sets it. An empty
+    /// table built by the compiler (a crate with no sysroot file in its map at
+    /// all) is therefore distinguishable from "nobody asked", which the report
+    /// needs even though both answer `false` for every span.
+    installed: bool,
+}
+
+impl TrustedStdSourceFiles {
+    /// Build the table from `(rendered_file, crate_is_real_sysroot)` pairs.
+    ///
+    /// The ONLY constructor that marks the table installed, and the caller must
+    /// be a producer holding a `TyCtxt`: the boolean is
+    /// `is_real_sysroot_crate(tcx, source_file.cnum)` and nothing else. See
+    /// `trust_mir_extract::trusted_std_source_files`, which is that caller.
+    #[must_use]
+    pub fn from_authenticated_files<I>(files: I) -> Self
+    where
+        I: IntoIterator<Item = (String, bool)>,
+    {
+        let mut tables = TrustedStdSourceFileTables { installed: true, ..Default::default() };
+        for (rendering, is_real_sysroot) in files {
+            // COLLISION FAILS CLOSED: once a rendering has been seen for a
+            // non-sysroot file it is revoked for good, whichever order the two
+            // files arrive in.
+            if is_real_sysroot {
+                if !tables.revoked.contains(&rendering) {
+                    tables.trusted.insert(rendering);
+                }
+            } else {
+                tables.trusted.remove(&rendering);
+                tables.revoked.insert(rendering);
+            }
+        }
+        Self { inner: Arc::new(tables) }
+    }
+
+    /// Does `file` — a [`SourceSpan::file`] rendering — belong to a source file
+    /// the compiler authenticated as the real standard library?
+    ///
+    /// Fail-closed for the empty path and for the `binary:` provenance form
+    /// EXPLICITLY, not merely because they are absent from the table: those two
+    /// are the shapes a span takes when it has no source location at all, and a
+    /// producer that ever recorded one must not be able to turn "no location"
+    /// into an exemption.
+    #[must_use]
+    pub fn contains(&self, file: &str) -> bool {
+        if file.is_empty() || file.starts_with("binary:") {
+            return false;
+        }
+        self.inner.trusted.contains(file)
+    }
+
+    /// Did a `TyCtxt`-holding producer build this table? `false` is the
+    /// fail-closed default and means every span is treated as NOT trusted std.
+    #[must_use]
+    pub fn is_installed(&self) -> bool {
+        self.inner.installed
+    }
+
+    /// How many renderings authenticated. For reports and tests only; no
+    /// decision reads it.
+    #[must_use]
+    pub fn trusted_len(&self) -> usize {
+        self.inner.trusted.len()
+    }
+
+    /// How many renderings were REVOKED by a collision. A non-zero count here
+    /// is worth printing: it means two source files rendered the same string
+    /// and the sysroot one lost its exemption.
+    #[must_use]
+    pub fn revoked_len(&self) -> usize {
+        self.inner.revoked.len()
+    }
+}
+
 /// Render a span's file name for the OBLIGATION-IDENTITY lane: elide the volatile,
 /// machine- and build-specific prefixes from a path, so an obligation's identity does
 /// not move when the compiler is rebuilt or when the same code is compiled on a
@@ -1325,16 +1568,26 @@ impl SourceSpan {
 /// consumer (R1's call-site multiset check, the box-deref lint drop set,
 /// `SealedVcIdentity`) comparing like against like. Pinned by
 /// `crates/trust-types/tests/span_normalization_parity.rs`.
+///
+/// # 3. The user's own checkout path — NOT elided here
+///
+/// The two prefixes above are the only ones this function knows, and the user's crate is
+/// under neither. Since WS5.9/WS8.9 (F-117) the three callers feed it the REMAPPED
+/// rendering (`FileName::prefer_remapped_unconditionally()`), so the user's
+/// `--remap-path-prefix=<checkout>=/src` is what takes the checkout out of a sealed
+/// identity; without a remap the remapped and local renderings are one string. This
+/// function stays a pure string rewrite and never consults the session's remap table.
 #[must_use]
 pub fn stable_obligation_file(file: String) -> String {
     fn looks_like_toolchain_build_token(token: &str) -> bool {
         if token == "dev" {
             return true;
         }
-        if token.starts_with(|c: char| c.is_ascii_digit()) {
+        if token.as_bytes().first().is_some_and(u8::is_ascii_digit) {
             return true;
         }
-        token.len() >= 7 && token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        token.len() >= 7
+            && token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }
 
     /// Cargo's per-registry source directory: `<registry host>-<short hash of the
@@ -1346,7 +1599,7 @@ pub fn stable_obligation_file(file: String) -> String {
         let Some((host, hash)) = component.rsplit_once('-') else { return false };
         !host.is_empty()
             && hash.len() >= 16
-            && hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }
     for prefix in ["/rustc/", "/rustc-dev/"] {
         if let Some(rest) = file.strip_prefix(prefix) {
@@ -1372,6 +1625,116 @@ pub fn stable_obligation_file(file: String) -> String {
         }
     }
     file
+}
+
+/// Canonical crate-name set paired with stdlib source-span recognition.
+///
+/// The compiler uses this same predicate when deciding whether stdlib is the
+/// local verification subject, and [`is_sysroot_std_source_path`] uses it to
+/// recognise a sysroot std span; keeping one list prevents subject
+/// classification from drifting away from the dependency-span exemption it
+/// controls. (`trust_vcgen::is_stdlib_crate_name` delegates here.)
+#[must_use]
+pub fn is_stdlib_crate_name(name: &str) -> bool {
+    matches!(
+        name,
+        "core"
+            | "alloc"
+            | "std"
+            | "proc_macro"
+            | "test"
+            | "panic_abort"
+            | "panic_unwind"
+            | "std_detect"
+            | "unwind"
+    )
+}
+
+/// True when a [`SourceSpan::file`] string has the SHAPE of a sysroot standard-library
+/// source path. This is the path half of `trust_vcgen`'s trusted-std span predicate (an
+/// unsafe operation whose own span is std-internal is not charged to the user, so a `true`
+/// here DELETES obligations downstream); it lives here so the identity-lane converters can
+/// ask the same question of a remapped rendering ([`identity_file_rendering`]).
+///
+/// Two shapes are recognised:
+///   1. a `library/` path segment IMMEDIATELY followed by a known std crate and its
+///      `src/` — the in-tree tree (`library/alloc/src/…`), an absolute checkout
+///      (`/…/rust/library/core/src/…`), or the remapped virtual path
+///      (`/rustc/<hash>/library/std/src/…`);
+///   2. a path-prefix-remapped bare crate root that stripped `library/`
+///      (`alloc/src/macros.rs`), matched only as a LEADING `<std-crate>/src/`.
+///
+/// Fail-closed: an empty path or `binary:` provenance is NOT std. The shape test is a
+/// text test on a value the user can influence; see [`identity_file_rendering`] for the
+/// guard that keeps `--remap-path-prefix` from widening it.
+#[must_use]
+pub fn is_sysroot_std_source_path(file: &str) -> bool {
+    if file.is_empty() || file.starts_with("binary:") {
+        return false;
+    }
+    let norm: std::borrow::Cow<'_, str> = if file.contains('\\') {
+        std::borrow::Cow::Owned(file.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(file)
+    };
+    let is_std_crate_root = |rest: &str| {
+        rest.split_once('/')
+            .is_some_and(|(krate, tail)| is_stdlib_crate_name(krate) && tail.starts_with("src/"))
+    };
+    if let Some(rest) =
+        norm.strip_prefix("library/").or_else(|| norm.split_once("/library/").map(|(_, a)| a))
+        && is_std_crate_root(rest)
+    {
+        return true;
+    }
+    is_std_crate_root(&norm)
+}
+
+/// The file rendering the OBLIGATION-IDENTITY lane stores (before
+/// [`stable_obligation_file`]), given a `SourceFile`'s LOCAL rendering
+/// (`prefer_local_unconditionally()`) and its REMAPPED rendering
+/// (`prefer_remapped_unconditionally()`).
+///
+/// WS5.9/WS8.9 (F-117): the remapped rendering is what the identity lane stores, so the
+/// user's `--remap-path-prefix=<checkout>=/src` takes the checkout out of every sealed
+/// identity and `request_digest`. But `SourceSpan::file` is not only an identity string:
+/// the vcgen's trusted-std predicate ([`is_sysroot_std_source_path`]) and the
+/// binary-provenance check (`binary:` prefix) read it as PROVENANCE. Before this increment
+/// the stored string was the local path, so claiming std provenance needed the crate to be
+/// literally laid out under `library/core/src/…` (a recorded residual). A remap is a
+/// command-line flag: `--remap-path-prefix=<checkout>/src=core/src` would otherwise make
+/// any user crate's spans read as sysroot std and delete its `[unsafe:sep:*]` obligations.
+///
+/// So a remap may ERASE a path, never MINT provenance: when the remapped rendering has a
+/// provenance-bearing shape (sysroot std, or `binary:`) that the local rendering lacks, the
+/// LOCAL rendering is kept — exactly the pre-WS8.9 value, so the guard can never do worse
+/// than the lane did before (it trades path-independence of that one span for keeping its
+/// obligations, the fail-closed side). In every other case the remapped rendering is
+/// returned; without a remap the two renderings are one string.
+///
+/// Real sysroot files are unaffected: a decoded std file with `rust-src` installed has a
+/// std-shaped local path too, one without it has no local path (both renderings are the
+/// virtual `/rustc/<hash>/library/…`), and stdlib compiled as the subject is compiled from
+/// a `library/<crate>/src` checkout.
+///
+/// # This is NOT a file-path trust key (2026-09-22)
+///
+/// `trust-vcgen`'s 2026-09-20 campaign deleted the one predicate that DECIDED trust from a
+/// rendering (`sep_engine::is_trusted_std_file`) and replaced it with the authenticated
+/// `TrustedStdSourceFiles` table, keyed by `SourceFile::cnum` plus artifact residency. This
+/// function decides NOTHING about trust: it picks which of two RENDERINGS of the SAME file
+/// is stored, and its fail-closed side is the exact pre-WS8.9 value. It is kept after that
+/// campaign for two reasons. `binary:` is still read as provenance; and against the table,
+/// keeping the local rendering for a user file whose remap would give it a std SHAPE avoids
+/// a rendering claimed by both a sysroot and a non-sysroot file — a collision the table
+/// already answers by REVOKING both (fail-closed either way), so this only spares the real
+/// std file its collateral revocation. The cost is that that one span's identity keeps the
+/// checkout; F-117 buys path-independence everywhere else.
+#[must_use]
+pub fn identity_file_rendering(local: String, remapped: String) -> String {
+    let mints_std = is_sysroot_std_source_path(&remapped) && !is_sysroot_std_source_path(&local);
+    let mints_binary = remapped.starts_with("binary:") && !local.starts_with("binary:");
+    if mints_std || mints_binary { local } else { remapped }
 }
 
 /// Proof trust level for generated artifacts.
@@ -3745,10 +4108,10 @@ impl BinaryVerificationSummary {
                     // false-PROVE.
                     let corroborated = match &dispatch.result {
                         None => true,
-                        Some(r) => matches!(
-                            r.clone().require_assurance(crate::result::AssuranceLevel::SmtBacked),
-                            crate::result::VerificationResult::Proved { .. }
-                        ),
+                        Some(r) => r.assurance().is_some_and(|assurance| {
+                            assurance.strength_order()
+                                >= crate::result::AssuranceLevel::SmtBacked.strength_order()
+                        }),
                     };
                     if corroborated {
                         self.proved += 1;
@@ -4146,7 +4509,7 @@ impl PreservedSymbolicFormula {
 
     #[must_use]
     pub fn sort_smtlib(&self) -> String {
-        crate::smt_logic::infer_sort(&self.formula).to_smtlib()
+        crate::smt_logic::infer_sort_cow(&self.formula).to_smtlib()
     }
 
     #[must_use]
@@ -4160,37 +4523,71 @@ impl PreservedSymbolicFormula {
     /// Fallible digest construction for proof consumers that can propagate an
     /// internal model-serialization failure.
     pub fn try_formula_digest(&self) -> Result<String, serde_json::Error> {
+        use std::borrow::Cow;
+        let sort: Cow<'static, str> = match &*crate::smt_logic::infer_sort_cow(&self.formula) {
+            crate::Sort::Bool => Cow::Borrowed("Bool"),
+            crate::Sort::Int => Cow::Borrowed("Int"),
+            crate::Sort::Real => Cow::Borrowed("Real"),
+            other => Cow::Owned(other.to_smtlib()),
+        };
+        self.try_formula_digest_with_sort(&sort)
+    }
+
+    fn try_formula_digest_with_sort(&self, sort: &str) -> Result<String, serde_json::Error> {
         let formula_json = serde_json::to_string(&self.formula)?;
-        Ok(stable_sha256_hex(
-            format!(
-                "schema={}\nsort={}\nformula_json={formula_json}\n",
-                self.schema(),
-                self.sort_smtlib()
-            )
-            .as_bytes(),
-        ))
+        Ok(stable_sha256_hex_parts(&[
+            b"schema=",
+            self.schema().as_bytes(),
+            b"\nsort=",
+            sort.as_bytes(),
+            b"\nformula_json=",
+            formula_json.as_bytes(),
+            b"\n",
+        ]))
     }
 
     #[must_use]
     pub fn origin(&self) -> String {
-        format!(
-            "target={};function={};block={};statement={};location={}",
-            decompile_target_evidence_label(&self.target),
-            self.function.as_deref().unwrap_or("unknown"),
-            self.block.map(|block| format!("bb{block}")).unwrap_or_else(|| "unknown".into()),
-            self.statement_index
-                .map(|statement| format!("stmt{statement}"))
-                .unwrap_or_else(|| "unknown".into()),
-            self.location
-        )
+        use std::fmt::Write as _;
+        let target = decompile_target_evidence_label(&self.target);
+        let function = self.function.as_deref().unwrap_or("unknown");
+        let mut out = String::with_capacity(
+            48 + target.len() + function.len() + self.location.len(),
+        );
+        out.push_str("target=");
+        out.push_str(&target);
+        out.push_str(";function=");
+        out.push_str(function);
+        out.push_str(";block=");
+        match self.block {
+            Some(block) => {
+                let _ = write!(out, "bb{block}");
+            }
+            None => out.push_str("unknown"),
+        }
+        out.push_str(";statement=");
+        match self.statement_index {
+            Some(statement) => {
+                let _ = write!(out, "stmt{statement}");
+            }
+            None => out.push_str("unknown"),
+        }
+        out.push_str(";location=");
+        out.push_str(&self.location);
+        out
     }
 
     #[must_use]
     pub fn evidence(&self) -> PreservedSymbolicFormulaEvidence {
+        let sort = self.sort_smtlib();
+        let digest = self.try_formula_digest_with_sort(&sort).expect(
+            "Formula is the canonical serializable Trust IR; refusing to mint \
+             preserved-symbolic evidence after serialization failure",
+        );
         PreservedSymbolicFormulaEvidence {
             schema: self.schema().to_string(),
-            sort: self.sort_smtlib(),
-            digest: self.formula_digest(),
+            sort,
+            digest,
             origin: self.origin(),
         }
     }
@@ -4211,25 +4608,28 @@ impl PreservedSymbolicFormula {
 
     #[must_use]
     pub fn matches_schema_aware_consumer_diagnostic(&self, diagnostic: &str) -> bool {
-        let evidence = self.evidence();
-        (diagnostic.contains("trust_symbolic.formula=consumed")
+        if !(diagnostic.contains("trust_symbolic.formula=consumed")
             || diagnostic.contains("symbolic-formula-proof-consumer=accepted"))
-            && diagnostic.contains(&format!("formula.schema={}", evidence.schema))
-            && diagnostic.contains(&format!("formula.sort={}", evidence.sort))
+            || !diagnostic.contains("formula.schema=trust-types.Formula@1")
+        {
+            return false;
+        }
+        let evidence = self.evidence();
+        diagnostic.contains(&format!("formula.sort={}", evidence.sort))
             && (diagnostic.contains(&format!("formula.digest={}", evidence.digest))
                 || diagnostic.contains(&format!("formula.digest=sha256:{}", evidence.digest)))
             && diagnostic.contains(&format!("formula.origin={}", evidence.origin))
     }
 }
 
-fn decompile_target_evidence_label(target: &DecompileTarget) -> String {
+fn decompile_target_evidence_label(target: &DecompileTarget) -> std::borrow::Cow<'static, str> {
     match target {
-        DecompileTarget::TrustIr => "trust_ir".to_string(),
-        DecompileTarget::Rust => "rust".to_string(),
-        DecompileTarget::TrustCg => "trust-cg".to_string(),
-        DecompileTarget::Wasm => "wasm".to_string(),
-        DecompileTarget::PseudoSource => "pseudo_source".to_string(),
-        DecompileTarget::Other(name) => name.to_ascii_lowercase(),
+        DecompileTarget::TrustIr => std::borrow::Cow::Borrowed("trust_ir"),
+        DecompileTarget::Rust => std::borrow::Cow::Borrowed("rust"),
+        DecompileTarget::TrustCg => std::borrow::Cow::Borrowed("trust-cg"),
+        DecompileTarget::Wasm => std::borrow::Cow::Borrowed("wasm"),
+        DecompileTarget::PseudoSource => std::borrow::Cow::Borrowed("pseudo_source"),
+        DecompileTarget::Other(name) => std::borrow::Cow::Owned(name.to_ascii_lowercase()),
     }
 }
 
@@ -4839,12 +5239,27 @@ pub struct CompilerContractBundle {
     pub loop_contracts: Vec<LoopContractSpec>,
     #[serde(default)]
     pub proof_items: Vec<TrustProofItem>,
+    /// Trust (identity binding, 2026-10-02): every ROOT name a loop clause of this
+    /// function uses, mapped to the MIR local its exact HIR binding resolved to at
+    /// the clause's loop header (`Some`), or to `None` when no unique, visible,
+    /// initialized local carries that identity. Extraction makes this the ONLY
+    /// source of these spellings on locals: a clause name never binds a local by
+    /// its debug name (review rounds 37-43 found 18 ways that bound the wrong one).
+    /// `None` for the whole field: no loop clauses, or not computed.
+    #[serde(default)]
+    pub loop_clause_source_locals: Option<BTreeMap<String, Option<usize>>>,
 }
 
 impl CompilerContractBundle {
     #[must_use]
     pub fn new(contracts: Vec<Contract>) -> Self {
-        Self { contracts, typed_propositions: vec![], loop_contracts: vec![], proof_items: vec![] }
+        Self {
+            contracts,
+            typed_propositions: vec![],
+            loop_contracts: vec![],
+            proof_items: vec![],
+            loop_clause_source_locals: None,
+        }
     }
 
     #[must_use]
@@ -4967,6 +5382,26 @@ pub enum CompilerContractValueDomain {
     MathematicalInt,
     PointerSizedInt { width: u32, signed: bool },
     MachineInt { width: u32, signed: bool },
+    /// An IEEE-754 binary float of this Rust width.
+    ///
+    /// Its LOGICAL SORT is the IEEE `Sort::Float` that `Sort::float_for_width`
+    /// gives this width; `Sort::BitVec(width)` is only the FALLBACK for a width
+    /// that is not an IEEE binary format at all (`float_for_width` answers
+    /// `None` outside 16/32/64/128). The spec parser already binds a
+    /// float-compared variable at that IEEE sort, and `ay_bridge`'s ordering
+    /// comparisons are SORT-AWARE — a float-sorted operand lowers to the IEEE
+    /// predicate rather than the integer one, which would assert Int sorts and
+    /// panic. A contract variable has to land on the SAME symbol at the SAME
+    /// sort the parser bound it at, or the clause constrains a different
+    /// variable and quietly proves nothing; spelling it any other way would also
+    /// break the round trip against the canonical source text.
+    ///
+    /// This deliberately does NOT copy the BODY's spelling of a float place:
+    /// vcgen's `sort_for_ty` still sends `Ty::Float` to `Sort::BitVec(width)`
+    /// and lifts it with `FpFromBits` wherever IEEE semantics are needed. The
+    /// divergence is the rule here, not an oversight — but how the two
+    /// spellings meet is not established by this type, and is unmeasured here.
+    Float { width: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -4979,6 +5414,15 @@ impl CompilerContractValueDomain {
     fn logical_sort(self) -> crate::Sort {
         match self {
             Self::Bool => crate::Sort::Bool,
+            // `Sort::Float`, not the bit vector. The spec parser already binds a
+            // float-compared variable at this sort, and `ay_bridge`'s ordering
+            // comparisons are SORT-AWARE — a float-sorted operand lowers to the
+            // IEEE predicate rather than the integer one, which would assert Int
+            // sorts and panic. Spelling it any other way would also break the
+            // round trip against the canonical source text.
+            Self::Float { width } => {
+                crate::Sort::float_for_width(width).unwrap_or(crate::Sort::BitVec(width))
+            }
             Self::MathematicalInt | Self::PointerSizedInt { .. } | Self::MachineInt { .. } => {
                 crate::Sort::Int
             }
@@ -5015,6 +5459,38 @@ pub fn compiler_contract_formula_with_domains(
     )
 }
 
+/// Rewrite a binary64 float literal in its PEER's narrower IEEE format, by the
+/// shared exactness rule. A pair that is not a literal against a narrower float
+/// is returned untouched.
+fn narrow_float_literal_peer(
+    lhs: Box<Formula>,
+    rhs: Box<Formula>,
+) -> (Box<Formula>, Box<Formula>) {
+    fn peer_float(expr: &Formula) -> Option<(u32, u32)> {
+        match expr.var_sort() {
+            Some(crate::Sort::Float { eb, sb }) => Some((*eb, *sb)),
+            _ => None,
+        }
+    }
+    fn narrowed(literal: &Formula, eb: u32, sb: u32) -> Option<Formula> {
+        let Formula::FpConst { bits, eb: 11, sb: 53 } = literal else { return None };
+        let wide = u64::try_from(*bits).ok()?;
+        crate::spec_render::float_literal_narrowed_bits(wide, eb, sb)
+            .map(|narrow| Formula::FpConst { bits: u128::from(narrow), eb, sb })
+    }
+    if let Some((eb, sb)) = peer_float(&lhs)
+        && let Some(narrow) = narrowed(&rhs, eb, sb)
+    {
+        return (lhs, Box::new(narrow));
+    }
+    if let Some((eb, sb)) = peer_float(&rhs)
+        && let Some(narrow) = narrowed(&lhs, eb, sb)
+    {
+        return (Box::new(narrow), rhs);
+    }
+    (lhs, rhs)
+}
+
 /// Class-aware form of [`compiler_contract_formula_with_domains`].
 #[must_use]
 pub fn compiler_contract_formula_with_domains_for_class(
@@ -5032,9 +5508,17 @@ pub fn compiler_contract_formula_with_domains_for_class(
         Some(match formula {
             Formula::Bool(_) => Class::Bool,
             Formula::Int(_) | Formula::UInt(_) => Class::Numeric,
+            // A float literal and a float-carrying variable are NUMERIC. The
+            // variable arrives at its BIT sort, because that is how the body
+            // spells a float place; `FpFromBits` is the lift that gives it IEEE
+            // meaning, and it is numeric for the same reason its operand is.
+            Formula::FpConst { .. } => Class::Numeric,
+            Formula::FpFromBits { bits, .. } if class(bits)? == Class::Numeric => Class::Numeric,
             Formula::Var(_, sort) | Formula::SymVar(_, sort) => match sort {
                 crate::Sort::Bool => Class::Bool,
-                crate::Sort::Int => Class::Numeric,
+                crate::Sort::Int | crate::Sort::BitVec(_) | crate::Sort::Float { .. } => {
+                    Class::Numeric
+                }
                 _ => return None,
             },
             Formula::Not(inner) if class(inner)? == Class::Bool => Class::Bool,
@@ -5067,6 +5551,32 @@ pub fn compiler_contract_formula_with_domains_for_class(
                 Class::Numeric
             }
             Formula::Neg(inner) if class(inner)? == Class::Numeric => Class::Numeric,
+            // The IEEE counterparts of the two groups above. Listed separately
+            // because an FP arithmetic node also carries a rounding mode, which
+            // is an operand but not a value and must not be classified.
+            Formula::FpEq(lhs, rhs) if class(lhs)? == class(rhs)? => Class::Bool,
+            Formula::FpLt(lhs, rhs)
+            | Formula::FpLe(lhs, rhs)
+            | Formula::FpGt(lhs, rhs)
+            | Formula::FpGe(lhs, rhs)
+                if class(lhs)? == Class::Numeric && class(rhs)? == Class::Numeric =>
+            {
+                Class::Bool
+            }
+            Formula::FpAdd(_, lhs, rhs)
+            | Formula::FpSub(_, lhs, rhs)
+            | Formula::FpMul(_, lhs, rhs)
+            | Formula::FpDiv(_, lhs, rhs)
+                if class(lhs)? == Class::Numeric && class(rhs)? == Class::Numeric =>
+            {
+                Class::Numeric
+            }
+            Formula::FpRem(lhs, rhs)
+                if class(lhs)? == Class::Numeric && class(rhs)? == Class::Numeric =>
+            {
+                Class::Numeric
+            }
+            Formula::FpNeg(inner) if class(inner)? == Class::Numeric => Class::Numeric,
             _ => return None,
         })
     }
@@ -5076,68 +5586,158 @@ pub fn compiler_contract_formula_with_domains_for_class(
             return None;
         }
     }
-    let domains: BTreeMap<&str, CompilerContractValueDomain> =
-        variable_domains.iter().map(|entry| (entry.name.as_str(), entry.domain)).collect();
-    if domains.len() != variable_domains.len() {
-        return None;
-    }
-    let mut used = std::collections::BTreeSet::new();
+    let mut used = vec![false; variable_domains.len()];
 
     fn bind(
         formula: &Formula,
-        domains: &BTreeMap<&str, CompilerContractValueDomain>,
-        used: &mut std::collections::BTreeSet<String>,
+        variable_domains: &[CompilerContractVariableDomain],
+        used: &mut [bool],
     ) -> Option<Formula> {
-        let boxed = |formula: &Formula, used: &mut std::collections::BTreeSet<String>| {
-            bind(formula, domains, used).map(Box::new)
+        let boxed = |formula: &Formula, used: &mut [bool]| {
+            bind(formula, variable_domains, used).map(Box::new)
         };
         Some(match formula {
             Formula::Bool(value) => Formula::Bool(*value),
             Formula::Int(value) => Formula::Int(*value),
             Formula::UInt(value) => Formula::UInt(*value),
             Formula::Var(name, _) => {
-                let domain = *domains.get(name.as_str())?;
-                used.insert(name.clone());
+                let idx = variable_domains
+                    .binary_search_by(|entry| entry.name.as_str().cmp(name.as_str()))
+                    .ok()?;
+                if let Some(slot) = used.get_mut(idx) {
+                    *slot = true;
+                }
+                let domain = variable_domains.get(idx)?.domain;
                 Formula::Var(name.clone(), domain.logical_sort())
             }
             Formula::SymVar(name, _) => {
                 let text = name.as_str();
-                let domain = *domains.get(text)?;
-                used.insert(text.to_string());
+                let idx = variable_domains
+                    .binary_search_by(|entry| entry.name.as_str().cmp(text))
+                    .ok()?;
+                if let Some(slot) = used.get_mut(idx) {
+                    *slot = true;
+                }
+                let domain = variable_domains.get(idx)?.domain;
                 Formula::SymVar(*name, domain.logical_sort())
             }
             Formula::Not(inner) => Formula::Not(boxed(inner, used)?),
             Formula::And(terms) => Formula::And(
-                terms.iter().map(|term| bind(term, domains, used)).collect::<Option<Vec<_>>>()?,
+                terms
+                    .iter()
+                    .map(|term| bind(term, variable_domains, used))
+                    .collect::<Option<Vec<_>>>()?,
             ),
             Formula::Or(terms) => Formula::Or(
-                terms.iter().map(|term| bind(term, domains, used)).collect::<Option<Vec<_>>>()?,
+                terms
+                    .iter()
+                    .map(|term| bind(term, variable_domains, used))
+                    .collect::<Option<Vec<_>>>()?,
             ),
             Formula::Implies(lhs, rhs) => Formula::Implies(boxed(lhs, used)?, boxed(rhs, used)?),
-            Formula::Eq(lhs, rhs) => Formula::Eq(boxed(lhs, used)?, boxed(rhs, used)?),
-            Formula::Lt(lhs, rhs) => Formula::Lt(boxed(lhs, used)?, boxed(rhs, used)?),
-            Formula::Le(lhs, rhs) => Formula::Le(boxed(lhs, used)?, boxed(rhs, used)?),
-            Formula::Gt(lhs, rhs) => Formula::Gt(boxed(lhs, used)?, boxed(rhs, used)?),
-            Formula::Ge(lhs, rhs) => Formula::Ge(boxed(lhs, used)?, boxed(rhs, used)?),
+            // All FIVE numeric comparisons — `Eq`, `Lt`, `Le`, `Gt`, `Ge` —
+            // narrow a binary64 literal onto a narrower float peer, by the SAME
+            // exactness rule (`spec_render::float_literal_narrowed_bits`). Three
+            // SITES apply that rule, and they are named here so a future missing
+            // one is visible by READING rather than by counting:
+            //   * the REBUILDER — `narrow_float_literal_peer`, just above, which
+            //     is what these arms call;
+            //   * the SOURCE SORT CHECKER —
+            //     `spec_render::reconcile_float_literal_operand`, which decides
+            //     whether the comparison is well-typed at all;
+            //   * the CONTRACT LOWERER —
+            //     `rustc_mir_transform::trust_contract_query::reconcile_float_literal_formats`,
+            //     which rewrites the literal in the formula the solver receives.
+            // All three must agree: this one rebuilds the formula from the
+            // canonical source text and is compared against the lowerer's, so a
+            // rule applied in one place and not the others shows up as a spurious
+            // canonicality mismatch. A sixth comparison arm added below without
+            // the narrowing call is that same bug, locally. (The sixth is `FpEq`,
+            // the parser's spelling of `x == 1.0`; its arm below narrows too.)
+            //
+            // A contract `==` is Rust `PartialEq` (SPEC-FLOAT-EQ-STRUCTURAL-1):
+            // once binding gives an operand its IEEE sort, the clause is `FpEq`,
+            // the same node the parser builds for a float literal and the
+            // compiler-proposition lowering builds for a float domain. The three
+            // must agree — this rebuild is compared against the lowering's
+            // formula structurally.
+            Formula::Eq(lhs, rhs) => {
+                let (lhs, rhs) = (boxed(lhs, used)?, boxed(rhs, used)?);
+                let (lhs, rhs) = narrow_float_literal_peer(lhs, rhs);
+                crate::spec_equality(lhs, rhs)
+            }
+            Formula::Lt(lhs, rhs) => {
+                let (lhs, rhs) = (boxed(lhs, used)?, boxed(rhs, used)?);
+                let (lhs, rhs) = narrow_float_literal_peer(lhs, rhs);
+                Formula::Lt(lhs, rhs)
+            }
+            Formula::Le(lhs, rhs) => {
+                let (lhs, rhs) = (boxed(lhs, used)?, boxed(rhs, used)?);
+                let (lhs, rhs) = narrow_float_literal_peer(lhs, rhs);
+                Formula::Le(lhs, rhs)
+            }
+            Formula::Gt(lhs, rhs) => {
+                let (lhs, rhs) = (boxed(lhs, used)?, boxed(rhs, used)?);
+                let (lhs, rhs) = narrow_float_literal_peer(lhs, rhs);
+                Formula::Gt(lhs, rhs)
+            }
+            Formula::Ge(lhs, rhs) => {
+                let (lhs, rhs) = (boxed(lhs, used)?, boxed(rhs, used)?);
+                let (lhs, rhs) = narrow_float_literal_peer(lhs, rhs);
+                Formula::Ge(lhs, rhs)
+            }
             Formula::Add(lhs, rhs) => Formula::Add(boxed(lhs, used)?, boxed(rhs, used)?),
             Formula::Sub(lhs, rhs) => Formula::Sub(boxed(lhs, used)?, boxed(rhs, used)?),
             Formula::Mul(lhs, rhs) => Formula::Mul(boxed(lhs, used)?, boxed(rhs, used)?),
             Formula::Div(lhs, rhs) => Formula::Div(boxed(lhs, used)?, boxed(rhs, used)?),
             Formula::Rem(lhs, rhs) => Formula::Rem(boxed(lhs, used)?, boxed(rhs, used)?),
             Formula::Neg(inner) => Formula::Neg(boxed(inner, used)?),
+            // The IEEE nodes, rebuilt with the same shape they arrived in. A
+            // rounding mode is carried through UNBOUND: it names no variable and
+            // has no domain, so binding it would invent one.
+            Formula::FpConst { bits, eb, sb } => {
+                Formula::FpConst { bits: *bits, eb: *eb, sb: *sb }
+            }
+            Formula::FpFromBits { bits, eb, sb } => {
+                Formula::FpFromBits { bits: boxed(bits, used)?, eb: *eb, sb: *sb }
+            }
+            // The parser spells `x == 1.0` as `FpEq` (SPEC-FLOAT-EQ-STRUCTURAL-1):
+            // the sixth comparison of the narrowing note above, so an `f32` peer
+            // narrows the binary64 literal exactly as `Eq` does.
+            Formula::FpEq(lhs, rhs) => {
+                let (lhs, rhs) = (boxed(lhs, used)?, boxed(rhs, used)?);
+                let (lhs, rhs) = narrow_float_literal_peer(lhs, rhs);
+                Formula::FpEq(lhs, rhs)
+            }
+            Formula::FpLt(lhs, rhs) => Formula::FpLt(boxed(lhs, used)?, boxed(rhs, used)?),
+            Formula::FpLe(lhs, rhs) => Formula::FpLe(boxed(lhs, used)?, boxed(rhs, used)?),
+            Formula::FpGt(lhs, rhs) => Formula::FpGt(boxed(lhs, used)?, boxed(rhs, used)?),
+            Formula::FpGe(lhs, rhs) => Formula::FpGe(boxed(lhs, used)?, boxed(rhs, used)?),
+            Formula::FpAdd(rm, lhs, rhs) => {
+                Formula::FpAdd(rm.clone(), boxed(lhs, used)?, boxed(rhs, used)?)
+            }
+            Formula::FpSub(rm, lhs, rhs) => {
+                Formula::FpSub(rm.clone(), boxed(lhs, used)?, boxed(rhs, used)?)
+            }
+            Formula::FpMul(rm, lhs, rhs) => {
+                Formula::FpMul(rm.clone(), boxed(lhs, used)?, boxed(rhs, used)?)
+            }
+            Formula::FpDiv(rm, lhs, rhs) => {
+                Formula::FpDiv(rm.clone(), boxed(lhs, used)?, boxed(rhs, used)?)
+            }
+            Formula::FpRem(lhs, rhs) => Formula::FpRem(boxed(lhs, used)?, boxed(rhs, used)?),
+            Formula::FpNeg(inner) => Formula::FpNeg(boxed(inner, used)?),
             _ => return None,
         })
     }
 
-    let rebound = bind(formula, &domains, &mut used)?;
+    let rebound = bind(formula, variable_domains, &mut used)?;
     let expected_class = match expected_class {
         CompilerContractExpressionClass::Proposition => Class::Bool,
         CompilerContractExpressionClass::Measure => Class::Numeric,
     };
-    (used.len() == domains.len()
-        && domains.keys().all(|name| used.contains(*name))
-        && class(&rebound) == Some(expected_class))
-    .then_some(rebound)
+    (used.iter().all(|&is_used| is_used) && class(&rebound) == Some(expected_class))
+        .then_some(rebound)
 }
 
 /// Compiler-owned loop clause before its source span is paired with a MIR
@@ -5670,6 +6270,36 @@ pub enum AdtAuth {
     SerdeJson(SerdeJsonKind),
 }
 
+/// Trust (R107-IDENTITY-1): which of std's VALIDITY WRAPPERS a [`Ty::Adt`] is, as
+/// the rustc-driven extractor identified it from the ADT's DEFINITION, never from a
+/// printed path. `NonNull` is the `non_null` LANG ITEM (the same test the
+/// extractor's `ptr_to_nonnull` and `asserted_wrap` admissions ask), and `NonZero`
+/// is the `NonZero` DIAGNOSTIC ITEM. Both tests read the def id, so they answer
+/// alike for the resident `core`, for a `core` loaded from outside the sysroot
+/// (whose types print under the unauthenticated-crate stamp), and for any other
+/// spelling the printer might choose.
+///
+/// The bridge's R107 arm CHARGES `src != 0` on a cast into a wrapper. This stamp is
+/// therefore a CHARGE trigger, not a grant: a stamp on a type that is not std's
+/// wrapper (a `#![no_core]` crate's own `non_null` lang item, a crate declaring the
+/// `NonZero` diagnostic item) adds one obligation, the fail-closed direction, and no
+/// consumer may read it to REMOVE an obligation or to grant a fact. A MISSING stamp
+/// is the direction that costs: the arm keeps its name test as a second, additive
+/// trigger for that case.
+///
+/// SERDE: carried on [`Ty::Adt`] as `#[serde(skip)]`, like the [`AdtAuth`] stamps.
+/// It is a this-compilation verdict: the wire, the JSON content hash and the bincode
+/// sequence are byte-identical to before it existed, and a decoded bundle reads
+/// `None`, so a decoded body is charged by the name test alone (production lowers
+/// only in-process extractions; the decoders are corpus and fixture tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ValidityWrapper {
+    /// `core::ptr::NonNull<T>`: the pointer is non-null.
+    NonNull,
+    /// `core::num::NonZero<T>`: the integer is non-zero.
+    NonZero,
+}
+
 /// Lossless Serde boundary for the B3-1 faithful-enum marker.
 ///
 /// `Option<Option<EnumReprHint>>` has three meaningful in-memory states, but a
@@ -5843,14 +6473,173 @@ pub struct VariantDef {
     /// rustc's definition and must be put through [`Ty::decode_switch_label`] at
     /// the point of use before it is compared with a value from this field.
     ///
-    /// `i128` cannot represent a `#[repr(u128)]` tag above `i128::MAX`; that one
-    /// case keeps the historical lossy `val as i128` (unchanged, and both
-    /// `min_disc` gates decline on the negative it produces).
+    /// `i128` cannot represent a `#[repr(u128)]` tag above `i128::MAX`, and the
+    /// extractor no longer pretends it can: such an enum lowers to a fail-closed
+    /// `Ty::Unsupported` and never reaches this field (REPR-U128-HIGH-TAG-1). The
+    /// historical lossy `val as i128` stored `u128::MAX` as `-1`, which the
+    /// `min_disc` gates declined on but the discriminant-domain fact did not, so
+    /// the arm for that variant was proved vacuously. A NEGATIVE value here is
+    /// therefore a genuine signed tag on extractor output; a consumer that can
+    /// also see serialized or hand-built input must still decline a negative tag
+    /// read into an UNSIGNED destination (`trust_vcgen`'s
+    /// `discriminant_tags_denote_dest_values`, `discriminant_read_hull`).
     pub discriminant: i128,
     /// This variant's own fields, in MIR definition order: `(field_name, ty)`.
     /// A field-less variant (`None`, `B`) has `fields: []` (a nullary
     /// constructor). A tuple variant (`Some(T)`) names fields `0`, `1`, … .
     pub fields: Vec<(String, Ty)>,
+}
+
+/// Trust (verifier-perf, extraction bottleneck B): a SHARED, copy-on-write
+/// `Vec<T>` — the body behind [`Ty::Adt`]'s `fields` and `variants`.
+///
+/// WHY. `Ty` is a plain recursive enum, so before this type every `Ty::clone`
+/// of an `Adt` deep-copied the whole field/variant tree and every drop freed it
+/// node by node. The extractor's memo cache (`trust_mir_extract::ty_convert`)
+/// hands out `cached.clone()` on every hit and `lower_enum_adt` duplicates every
+/// variant field into the flattened `fields` view, so a DAG-shaped type set was
+/// materialized as a tree — measured as ~464 MB for one recursive-enum cluster
+/// and as the dominant `Ty` drop-glue / `ty_convert` / `slice::to_vec_in` frames
+/// of a verified gate. With the two hot vectors behind an `Arc`, a clone of an
+/// `Adt` is a `name` clone plus two refcount bumps, and dropping a shared body
+/// is a decrement.
+///
+/// CONTRACT (each point is load-bearing for soundness of the representation
+/// change; the value semantics of `Ty` are unchanged):
+///
+///  1. NO `DerefMut` — by design. `Deref<Target = Vec<T>>` covers every read
+///     (indexing, `iter`, `len`, `as_slice`, deref-coercion to `&[T]`/`&Vec<T>`),
+///     and the ONLY `&mut` path is the explicit [`SharedVec::make_mut`]
+///     (= `Arc::make_mut`), which UN-SHARES the body before handing out the
+///     reference. A mutation through one `Ty` therefore can never be observed
+///     through another — exactly the private-tree semantics a `Vec` had — and
+///     every mutation site is greppable (`make_mut`).
+///  2. `Serialize`/`Deserialize`/`Hash`/`Debug` FORWARD to the inner `Vec<T>`
+///     (hand-written, not derived — `Arc<T>: Serialize` would need serde's `rc`
+///     feature and would not be byte-identical anyway). The serde_json text,
+///     the sequence-based `bincode` wire that caches/proof certificates use,
+///     the `stable_model_json` hash material and every `{:?}` snapshot are
+///     therefore byte-identical to what `Vec<T>` produced. Pinned by
+///     `sharedvec_forwards_debug_hash_eq_to_vec` and
+///     `adt_wire_format_is_pinned_to_the_vec_representation` (tests below).
+///  3. `PartialEq` is `Arc::ptr_eq(a, b) || **a == **b`: the same relation as
+///     `Vec<T>: PartialEq` plus an O(1) fast path on a shared body. The fast
+///     path is SOUND only because equality on `T` is reflexive; every `T` used
+///     here (`(String, Ty)`, `VariantDef`) is `Eq` (no float VALUES live in
+///     `Ty` — `Float { width }` is a width), so `x == x` holds and sharing the
+///     body cannot make two unequal values compare equal.
+///  4. `Send + Sync` are preserved (`Arc`, never `Rc`), so every `Ty: Send`
+///     bound in the parallel verifier stays satisfied.
+pub struct SharedVec<T>(Arc<Vec<T>>);
+
+impl<T> SharedVec<T> {
+    /// Wrap an owned `Vec` (no copy).
+    #[must_use]
+    pub fn new(v: Vec<T>) -> Self {
+        SharedVec(Arc::new(v))
+    }
+
+    /// `true` when both handles share ONE body (then `==` is O(1)).
+    #[must_use]
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.0, &b.0)
+    }
+
+    /// Recover the owned `Vec`: zero-copy when this handle is the unique owner,
+    /// otherwise a clone of the body (the other owners keep theirs unchanged).
+    #[must_use]
+    pub fn into_vec(self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        Arc::try_unwrap(self.0).unwrap_or_else(|a| (*a).clone())
+    }
+
+    /// The ONLY mutable access: copy-on-write. Un-shares the body first
+    /// (`Arc::make_mut`), so the write is visible through THIS handle only.
+    pub fn make_mut(&mut self) -> &mut Vec<T>
+    where
+        T: Clone,
+    {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<T> Clone for SharedVec<T> {
+    /// A refcount bump — never a copy of the body.
+    fn clone(&self) -> Self {
+        SharedVec(Arc::clone(&self.0))
+    }
+}
+
+impl<T> std::ops::Deref for SharedVec<T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Vec<T> {
+        &self.0
+    }
+}
+
+impl<T> Default for SharedVec<T> {
+    fn default() -> Self {
+        SharedVec(Arc::new(Vec::new()))
+    }
+}
+
+impl<T> From<Vec<T>> for SharedVec<T> {
+    fn from(v: Vec<T>) -> Self {
+        SharedVec::new(v)
+    }
+}
+
+impl<T> FromIterator<T> for SharedVec<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        SharedVec::new(iter.into_iter().collect())
+    }
+}
+
+impl<'a, T> IntoIterator for &'a SharedVec<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for SharedVec<T> {
+    /// Identical `{:?}` / `{:#?}` text to the inner `Vec<T>` (contract point 2).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (*self.0).fmt(f)
+    }
+}
+
+impl<T: PartialEq> PartialEq for SharedVec<T> {
+    /// Contract point 3: pointer-equal bodies short-circuit; otherwise `Vec` equality.
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl<T: Eq> Eq for SharedVec<T> {}
+
+impl<T: std::hash::Hash> std::hash::Hash for SharedVec<T> {
+    /// Identical hash stream to the inner `Vec<T>` (contract point 2).
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (*self.0).hash(state)
+    }
+}
+
+impl<T: Serialize> Serialize for SharedVec<T> {
+    /// Byte-identical to `<Vec<T> as Serialize>::serialize` (contract point 2).
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        <Vec<T> as Serialize>::serialize(&self.0, serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for SharedVec<T> {
+    /// Accepts exactly what `Vec<T>` accepts (contract point 2).
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <Vec<T> as Deserialize<'de>>::deserialize(deserializer).map(SharedVec::new)
+    }
 }
 
 /// Trust: piece #7a — the identity of a const-generic length parameter, used as
@@ -5868,23 +6657,61 @@ pub struct ConstLen {
     pub name: String,
 }
 
-/// Trust: piece #7a — sanitize a const-param name fragment so a non-identifier
-/// name cannot break the SMT symbol. Mirrors the sanitization used at the
-/// operand-lowering sites in trust-vcgen; kept here so ALL three mint sites
-/// (array length in `ty_convert`, value operand in `convert`/`lib.rs`, native
-/// path in `chc.rs`) render a BYTE-IDENTICAL string via one shared helper.
+/// Trust: piece #7a — encode a const-param name as the fragment of its SMT
+/// symbol. Kept here so ALL three mint sites (array length in `ty_convert`,
+/// value operand in `convert`/`lib.rs`, native path in `chc.rs`) render a
+/// BYTE-IDENTICAL string via one shared helper.
+///
+/// Trust (2026-10-05, SLICE-LEN-NAME-1, the const-parameter half): the fragment
+/// is the USER's spelling, and the symbol it lands in sits in the reserved `__`
+/// metadata family, whose SUFFIXES are read as facts (`<place>__slice_len` is a
+/// length, so it is `>= 0`: trust-vcgen's `conjoin_slice_len_bounds` /
+/// `length_nonneg_base_names`, the interval engine's floor). The old helper only
+/// mapped non-identifier characters to `_`, so the user chose the suffix:
+/// `const n__slice_len: i8` minted `__trust_constparam_0_n__slice_len`, and
+/// `const _slice_len: i8` minted `__trust_constparam_0__slice_len` through the
+/// `_` that joins index and name. Both were read as lengths, `n__slice_len - 1`
+/// on `i8` was kernel-certified overflow-free under certify, the check was
+/// elided, and `dec::<-128>()` returned 127 in a verify-off consumer (measured
+/// on the stage 1 of `dc15b882f6`; `tests/ui/trust/const_param_slice_len_name.rs`).
+///
+/// So the fragment can no longer spell any part of that family. A name that is
+/// ASCII, starts with a letter, and has no leading, trailing or doubled `_`
+/// (`N`, `LEN`, `MAX_LEN`) is kept as written, so the common symbols and the
+/// strings pinned across the workspace do not move. Every other name (a `__`
+/// anywhere, a leading or trailing `_`, a non-ASCII or non-identifier
+/// character) is written as `0` followed by the lowercase hex of its UTF-8
+/// bytes, which contains no `_` at all. Properties, pinned by
+/// `const_param_symbol_cannot_spell_reserved_metadata`:
+///
+/// * the fragment is non-empty, starts with an ASCII alphanumeric character
+///   (so the joining `_` never doubles), and contains no `__`;
+/// * the encoding is injective: a kept name starts with a letter, an encoded
+///   one with the digit `0`, and hex is injective on bytes. (The old helper was
+///   not: `T::LIMIT` and `T__LIMIT` both rendered `T__LIMIT`.)
+fn push_sanitized_const_param_fragment(out: &mut String, name: &str) {
+    let kept = name
+        .split('_')
+        .all(|run| !run.is_empty() && run.bytes().all(|b| b.is_ascii_alphanumeric()))
+        && name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
+    if kept {
+        out.push_str(name);
+        return;
+    }
+    const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(1 + 2 * name.len());
+    out.push('0');
+    for byte in name.bytes() {
+        out.push(HEX_LOWER[(byte >> 4) as usize] as char);
+        out.push(HEX_LOWER[(byte & 0x0f) as usize] as char);
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 fn sanitize_const_param_fragment(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        out.push('_');
-    }
+    let mut out = String::new();
+    push_sanitized_const_param_fragment(&mut out, name);
     out
 }
 
@@ -5892,14 +6719,30 @@ fn sanitize_const_param_fragment(name: &str) -> String {
 /// array length, keyed on the param IDENTITY (`index` + `name`), NEVER on
 /// `(width, signed)`. Called from every mint site so the guard's `N` and the
 /// array's length `N` are the SAME SMT term (and a distinct param `M` stays a
-/// distinct term). Deliberately does NOT end with `__slice_len`, so the
-/// suffix-gated `conjoin_slice_len_bounds` pass will not attach a spurious
-/// `0 <= N <= isize::MAX` where-fact (INV-4). The `__trust_constparam_` prefix is
-/// registered in trust-vcgen's freshen deny-list (`is_aliasing_opaque_symbol_name`)
-/// so the R1 σ callsite path splits distinct occurrences apart.
+/// distinct term). It never ends with `__slice_len`, whatever the parameter is
+/// called, so the suffix-gated `conjoin_slice_len_bounds` pass will not attach a
+/// spurious `0 <= N <= isize::MAX` where-fact (INV-4): after the
+/// `__trust_constparam_{index}_` prefix the symbol contains no `__` at all
+/// ([`sanitize_const_param_fragment`], SLICE-LEN-NAME-1).
+///
+/// The symbol is unique per param only WITHIN one item: a callee's `M` and a
+/// caller's `M` at the same index spell the same string. Trust
+/// (CONSTPARAM-SIGMA-FRESHEN-1, 2026-10-11): trust-vcgen's σ callsite path no
+/// longer freshens the family per occurrence (that split the caller's ONE `K`
+/// and refuted correct guarded callers); instead it renames a CALLEE's leaves
+/// out of the family before σ (`isolate_callee_const_param_symbols`), so every
+/// family leaf in a σ obligation is a param of the caller.
 pub fn const_param_symbol(index: u32, name: &str) -> String {
-    format!("__trust_constparam_{}_{}", index, sanitize_const_param_fragment(name))
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(CONST_PARAM_SYMBOL_PREFIX.len() + 12 + name.len());
+    let _ = write!(out, "{CONST_PARAM_SYMBOL_PREFIX}{index}_");
+    push_sanitized_const_param_fragment(&mut out, name);
+    out
 }
+
+/// Trust (CONSTPARAM-SIGMA-FRESHEN-1): the prefix every [`const_param_symbol`]
+/// starts with — the ONE spelling consumers that recognize the family key on.
+pub const CONST_PARAM_SYMBOL_PREFIX: &str = "__trust_constparam_";
 
 /// Trust: W19 mutators inc-1 (2026-07-24) — the ADT KIND discriminator carried on
 /// [`Ty::Adt`]. The union/struct/enum distinction is ERASED at extraction (a UNION
@@ -5985,6 +6828,33 @@ pub enum Ty {
     /// of coefficients from a vector of literals.
     Seq {
         elem: Box<Ty>,
+        /// Trust (W3, 2026-09-21): the EXTRACTION-CERTIFIED drop-totality stamp
+        /// for this `Vec<T, A>` -- `Some(AdtAuth::TotalDrop(None))` iff
+        /// `trust_mir_extract::convert::tcx_drop_is_total` certified the FULL
+        /// concrete type, element AND allocator, at the tcx level; `None`
+        /// otherwise. This is the same stamp, written by the same predicate, that
+        /// `Ty::Adt::arbitrary_precision` carries -- `Ty::Seq` simply had no slot
+        /// for it, which is why a bare `Vec<u32>` was the ONE std owning container
+        /// whose drop glue was refused while `Option<Vec<u32>>`, `String`, `Box`
+        /// and `struct Holder { v: Vec<u32> }` all verified theirs.
+        ///
+        /// WHY A STAMP AND NOT A RECURSION INTO `elem`. `Ty::Seq { elem }` keeps
+        /// the element and DROPS the allocator parameter (`is_std_vec` fires on
+        /// `Vec<T, A>` and keeps only `args.type_at(0)`). Measured: a
+        /// `Vec<u32, NoisyAlloc>` with a panicking `Drop` on the allocator is
+        /// refused today ONLY because `tcx_drop_is_total` recurses `args.types()`
+        /// and sees `NoisyAlloc`; a bridge-side "total iff `elem` is total" would
+        /// have PROVED it. The stamp keeps the decision where the allocator is
+        /// visible. And it is NOT `is_trivially_no_drop_ty`: a `Vec` owns an
+        /// allocation, so its glue is real -- this certifies the glue AUDITED
+        /// panic-free (dealloc only, alloc-abort outside the modeled panic set),
+        /// never that there is no glue.
+        ///
+        /// `#[serde(skip)]` in BOTH directions, exactly as `arbitrary_precision`:
+        /// a decoded/shadow bundle reads `None` (never certified, fail-closed) and
+        /// the wire format and semantic shape hash are unchanged.
+        #[serde(skip)]
+        drop_auth: Option<AdtAuth>,
     },
     /// Trust (B2-2, RFC TRUST_IR_V2): the `str` DST, DISTINCT from `[u8]`. Emitted by
     /// `trust-mir-extract`'s ty_convert ONLY on the FAITHFUL-extraction lane (the B1
@@ -6019,7 +6889,12 @@ pub enum Ty {
     Tuple(Vec<Ty>),
     Adt {
         name: String,
-        fields: Vec<(String, Ty)>,
+        // Trust (verifier-perf, bottleneck B): `fields` and `variants` are
+        // SHARED copy-on-write bodies (see [`SharedVec`]) so a `Ty::clone` of
+        // an ADT is O(1) in the body's size. Reads are unchanged (`Deref` to
+        // `Vec`); the wire/hash/Debug forms are byte-identical to `Vec`; the
+        // only mutation path is the explicit `make_mut()`.
+        fields: SharedVec<(String, Ty)>,
         // Trust: PHASE 4 — variant/discriminant structure for ENUMS. ADDITIVE:
         // a STRUCT has `variants: []` (the `fields` are its single anonymous
         // constructor's fields, exactly as before P4); an ENUM has one
@@ -6038,7 +6913,7 @@ pub enum Ty {
         // backward compatibility. This is essential: without it, every previously
         // serialized struct/enum would fail to deserialize.
         #[serde(default)]
-        variants: Vec<VariantDef>,
+        variants: SharedVec<VariantDef>,
         // Trust: enum-disc-full-native — niche-safety classification for the
         // discriminant-read range fact in the NATIVE -full bridge. `true` ONLY
         // when this is a fieldless/Direct-tag-encoded enum whose `Discriminant`
@@ -6128,6 +7003,14 @@ pub enum Ty {
         // decoded data — and (ii) desync `bincode`'s fixed field sequence.
         #[serde(skip)]
         arbitrary_precision: Option<AdtAuth>,
+        // Trust (R107-IDENTITY-1): the extractor's identity verdict for std's
+        // validity wrappers (`NonNull` by lang item, `NonZero` by diagnostic item),
+        // read by the bridge's R107 arm as a CHARGE trigger only. `#[serde(skip)]`
+        // for the reasons `arbitrary_precision` gives (wire, hash and bincode
+        // unchanged); see [`ValidityWrapper`] for why a forged stamp is harmless and
+        // a missing one is backed by the arm's name test.
+        #[serde(skip)]
+        validity_wrapper: Option<ValidityWrapper>,
     },
     /// A recursive algebraic datatype, modeled with the SMT-LIB datatype theory
     /// (Lever A). This is the lowering target for a *recursive* enum/struct
@@ -6151,6 +7034,16 @@ pub enum Ty {
     /// Scalar fields read out of a datatype value are still modeled with their
     /// own concrete scalar sort, so genuine overflow/bounds obligations on those
     /// fields remain refutable.
+    ///
+    /// DISCRIMINANTS (DATATYPE-POSITIONAL-TAGS): a datatype records constructors,
+    /// not discriminants, and its consumers read the constructor at position `i`
+    /// as tag `i` (trust-vcgen `enum_variant_tag_set`, the recursive-datatype
+    /// induction lanes' `SwitchInt` tag -> constructor map). A producer may emit
+    /// this variant for an enum ONLY when every discriminant equals its declaration
+    /// position; an enum with an explicit non-positional tag must stay `Ty::Adt`,
+    /// whose `VariantDef::discriminant` is real. Enforced at both producers in
+    /// trust-mir-extract (`ty_convert::adt_discriminants_are_positional`,
+    /// `cell_threading::normalize_ty`).
     Datatype {
         /// Datatype (sort) name — the SMT-LIB sort identifier.
         name: String,
@@ -6298,8 +7191,8 @@ impl Ty {
         // `None` (fail-closed: no discharge).
         Ty::Adt {
             name: name.into(),
-            fields,
-            variants: Vec::new(),
+            fields: fields.into(),
+            variants: SharedVec::default(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
@@ -6311,6 +7204,7 @@ impl Ty {
             // and hash-stable (a `None` is stripped from the content hash).
             adt_kind: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         }
     }
 
@@ -6320,8 +7214,9 @@ impl Ty {
     /// that `fields` is a valid struct-shaped view of the ADT.
     #[must_use]
     pub fn adt_enum(name: impl Into<String>, variants: Vec<VariantDef>) -> Ty {
+        let variants = SharedVec::new(variants);
         let mut fields: Vec<(String, Ty)> = Vec::new();
-        for v in &variants {
+        for v in variants.iter() {
             for (fname, fty) in &v.fields {
                 if !fields.iter().any(|(n, _)| n == fname) {
                     fields.push((fname.clone(), fty.clone()));
@@ -6335,7 +7230,7 @@ impl Ty {
         // the flag true (and only for a `Variants::Multiple { Direct }` layout).
         Ty::Adt {
             name: name.into(),
-            fields,
+            fields: fields.into(),
             variants,
             disc_index_safe: false,
             faithful_enum_repr: None,
@@ -6345,6 +7240,7 @@ impl Ty {
             adt_kind: None,
             // Trust (F6): only the authenticating extractor stamps this.
             arbitrary_precision: None,
+            validity_wrapper: None,
         }
     }
 
@@ -6358,8 +7254,9 @@ impl Ty {
         variants: Vec<VariantDef>,
         disc_index_safe: bool,
     ) -> Ty {
+        let variants = SharedVec::new(variants);
         let mut fields: Vec<(String, Ty)> = Vec::new();
-        for v in &variants {
+        for v in variants.iter() {
             for (fname, fty) in &v.fields {
                 if !fields.iter().any(|(n, _)| n == fname) {
                     fields.push((fname.clone(), fty.clone()));
@@ -6370,7 +7267,7 @@ impl Ty {
         Ty::Adt {
             layout: None,
             name: name.into(),
-            fields,
+            fields: fields.into(),
             variants,
             disc_index_safe,
             faithful_enum_repr: None,
@@ -6378,6 +7275,7 @@ impl Ty {
             adt_kind: None,
             // Trust (F6): only the authenticating extractor stamps this.
             arbitrary_precision: None,
+            validity_wrapper: None,
         }
     }
 
@@ -6388,6 +7286,62 @@ impl Ty {
     #[must_use]
     pub fn disc_index_safe(&self) -> bool {
         matches!(self, Ty::Adt { disc_index_safe: true, .. })
+    }
+
+    /// Trust (triage ticket 216): the value a FLAT-lowered enum's tag slot
+    /// (`__tag`) holds for the variant at `variant_index` — the DECLARED
+    /// discriminant, DECODED (`VariantDef::discriminant`), not the raw
+    /// `Discr::val` bit pattern and not the variant index.
+    ///
+    /// Decoded is what every reader of the slot compares against: the bridge's
+    /// exact-extract `Discriminant` read fires only when the destination type IS
+    /// the `__tag` type, and its `SwitchInt` labels are sign-extended at that
+    /// width before the comparison (the exhaustive-match `Assume` uses the same
+    /// labels); the predicate model, the tag peephole and vcgen's readers
+    /// (`enum_variant_tag_set`, `per_path_refute`, `unwrap_panic`) read
+    /// `VariantDef::discriminant` itself. So
+    /// `#[repr(i8)] X = -3` is `-3` here, never `253`, and `enum E { A = 5, B = 9 }`
+    /// gives `9` for `E::B`, never `1`.
+    ///
+    /// * `Adt` with a variant descriptor: that variant's discriminant, or `None`
+    ///   when `variant_index` is out of range;
+    /// * `Adt` with NO descriptor: the index. The live-compiler dumps carry
+    ///   descriptor-less tagged `Option`s (`trust-ir-bridge/fixtures/both.json`),
+    ///   whose tags are dense, and the index is the only value available;
+    /// * anything else: `None`.
+    ///
+    /// Callers fail closed on `None`.
+    #[must_use]
+    pub fn variant_tag(&self, variant_index: usize) -> Option<i128> {
+        match self {
+            Ty::Adt { variants, .. } if variants.is_empty() => i128::try_from(variant_index).ok(),
+            Ty::Adt { variants, .. } => variants.get(variant_index).map(|v| v.discriminant),
+            _ => None,
+        }
+    }
+
+    /// Trust (triage ticket 216): whether the DECODED integer `tag` (a
+    /// [`Ty::variant_tag`] value) is representable in a flat enum tag slot of
+    /// this type — `Bool` holds `{0, 1}`, `Int { width, signed }` holds
+    /// `[-2^(width-1), 2^(width-1) - 1]` or `[0, 2^width - 1]` for a width in
+    /// `1..=128`. Every other type, and any other width, holds nothing.
+    ///
+    /// The one fit rule for the bridge's and vcgen's tag writes, so the two lanes
+    /// cannot admit different values.
+    #[must_use]
+    pub fn flat_tag_fits(&self, tag: i128) -> bool {
+        match *self {
+            Ty::Bool => matches!(tag, 0 | 1),
+            Ty::Int { width, signed } if (1..=128).contains(&width) => {
+                let shift = 128 - width;
+                if signed {
+                    (i128::MIN >> shift..=i128::MAX >> shift).contains(&tag)
+                } else {
+                    u128::try_from(tag).is_ok_and(|value| value <= u128::MAX >> shift)
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Structural `Ty` equality that IGNORES the internal `disc_index_safe` flag on
@@ -6422,6 +7376,7 @@ impl Ty {
                     // Trust (F6): the provenance stamp is not structural identity
                     // (it is transient + serde-skipped), so it is ignored here.
                     arbitrary_precision: _,
+                    validity_wrapper: _,
                 },
                 Ty::Adt {
                     layout: _,
@@ -6433,6 +7388,7 @@ impl Ty {
                     faithful_enum_repr: _,
                     adt_kind: _,
                     arbitrary_precision: _,
+                    validity_wrapper: _,
                 },
             ) => {
                 n1 == n2
@@ -6750,33 +7706,68 @@ impl Ty {
     /// NEVER contains `$`, the mint's separator, so a rendered key can never be
     /// refused for ambiguity downstream.
     pub fn vtable_source_type_key(&self) -> Option<String> {
+        let mut out = String::new();
+        self.write_vtable_source_type_key(&mut out)?;
+        Some(out)
+    }
+
+    fn has_vtable_source_type_key(&self) -> bool {
         match self {
-            Ty::Bool => Some("bool".to_string()),
-            Ty::Char => Some("char".to_string()),
-            Ty::Int { width, signed } => {
-                Some(format!("{}{width}", if *signed { "i" } else { "u" }))
-            }
-            Ty::PtrSizedInt { signed } => Some(if *signed { "isize" } else { "usize" }.to_string()),
-            Ty::Float { width } => Some(format!("f{width}")),
-            Ty::Unit => Some("()".to_string()),
-            Ty::Tuple(elems) => {
-                let parts: Option<Vec<String>> =
-                    elems.iter().map(Ty::vtable_source_type_key).collect();
-                Some(format!("({})", parts?.join(", ")))
-            }
-            Ty::Array { elem, len } => Some(format!("[{}; {len}]", elem.vtable_source_type_key()?)),
-            Ty::Ref { mutable, inner } => Some(format!(
-                "&{}{}",
-                if *mutable { "mut " } else { "" },
-                inner.vtable_source_type_key()?
-            )),
-            Ty::RawPtr { mutable, pointee } => Some(format!(
-                "*{} {}",
-                if *mutable { "mut" } else { "const" },
-                pointee.vtable_source_type_key()?
-            )),
-            _ => None,
+            Ty::Bool
+            | Ty::Char
+            | Ty::Int { .. }
+            | Ty::PtrSizedInt { .. }
+            | Ty::Float { .. }
+            | Ty::Unit => true,
+            Ty::Tuple(elems) => elems.iter().all(Ty::has_vtable_source_type_key),
+            Ty::Array { elem, .. } => elem.has_vtable_source_type_key(),
+            Ty::Ref { inner, .. } => inner.has_vtable_source_type_key(),
+            Ty::RawPtr { pointee, .. } => pointee.has_vtable_source_type_key(),
+            _ => false,
         }
+    }
+
+    fn write_vtable_source_type_key(&self, out: &mut String) -> Option<()> {
+        use std::fmt::Write as _;
+        match self {
+            Ty::Bool => out.push_str("bool"),
+            Ty::Char => out.push_str("char"),
+            Ty::Int { width, signed } => {
+                out.push(if *signed { 'i' } else { 'u' });
+                let _ = write!(out, "{width}");
+            }
+            Ty::PtrSizedInt { signed } => out.push_str(if *signed { "isize" } else { "usize" }),
+            Ty::Float { width } => {
+                out.push('f');
+                let _ = write!(out, "{width}");
+            }
+            Ty::Unit => out.push_str("()"),
+            Ty::Tuple(elems) => {
+                out.push('(');
+                for (idx, elem) in elems.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str(", ");
+                    }
+                    elem.write_vtable_source_type_key(out)?;
+                }
+                out.push(')');
+            }
+            Ty::Array { elem, len } => {
+                out.push('[');
+                elem.write_vtable_source_type_key(out)?;
+                let _ = write!(out, "; {len}]");
+            }
+            Ty::Ref { mutable, inner } => {
+                out.push_str(if *mutable { "&mut " } else { "&" });
+                inner.write_vtable_source_type_key(out)?;
+            }
+            Ty::RawPtr { mutable, pointee } => {
+                out.push_str(if *mutable { "*mut " } else { "*const " });
+                pointee.write_vtable_source_type_key(out)?;
+            }
+            _ => return None,
+        }
+        Some(())
     }
 
     /// Trust (vtable slice 17): the BODY-SCOPED source-type key — exactly
@@ -6811,6 +7802,13 @@ impl Ty {
     /// Emitted alphabet adds `param()@` plus whatever a def path contains (`:`, `#`,
     /// `{}`, `<>`), and NEVER `$` — checked, not assumed.
     pub fn vtable_source_type_key_in_body(&self, owner: &str) -> Option<String> {
+        let mut out = String::new();
+        self.write_vtable_source_type_key_in_body(owner, &mut out)?;
+        Some(out)
+    }
+
+    fn write_vtable_source_type_key_in_body(&self, owner: &str, out: &mut String) -> Option<()> {
+        use std::fmt::Write as _;
         match self {
             Ty::Unsupported { kind, detail } if kind == "TyKind::Param" => {
                 // The owner is required ONLY here — a concrete type is body-independent
@@ -6825,28 +7823,39 @@ impl Ty {
                 if ident.is_empty() || ident.contains('$') {
                     return None;
                 }
-                Some(format!("param({ident})@{owner}"))
+                out.push_str("param(");
+                out.push_str(ident);
+                out.push_str(")@");
+                out.push_str(owner);
+                Some(())
             }
             Ty::Tuple(elems) => {
-                let parts: Option<Vec<String>> =
-                    elems.iter().map(|e| e.vtable_source_type_key_in_body(owner)).collect();
-                Some(format!("({})", parts?.join(", ")))
+                out.push('(');
+                for (idx, elem) in elems.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str(", ");
+                    }
+                    elem.write_vtable_source_type_key_in_body(owner, out)?;
+                }
+                out.push(')');
+                Some(())
             }
             Ty::Array { elem, len } => {
-                Some(format!("[{}; {len}]", elem.vtable_source_type_key_in_body(owner)?))
+                out.push('[');
+                elem.write_vtable_source_type_key_in_body(owner, out)?;
+                let _ = write!(out, "; {len}]");
+                Some(())
             }
-            Ty::Ref { mutable, inner } => Some(format!(
-                "&{}{}",
-                if *mutable { "mut " } else { "" },
-                inner.vtable_source_type_key_in_body(owner)?
-            )),
-            Ty::RawPtr { mutable, pointee } => Some(format!(
-                "*{} {}",
-                if *mutable { "mut" } else { "const" },
-                pointee.vtable_source_type_key_in_body(owner)?
-            )),
+            Ty::Ref { mutable, inner } => {
+                out.push_str(if *mutable { "&mut " } else { "&" });
+                inner.write_vtable_source_type_key_in_body(owner, out)
+            }
+            Ty::RawPtr { mutable, pointee } => {
+                out.push_str(if *mutable { "*mut " } else { "*const " });
+                pointee.write_vtable_source_type_key_in_body(owner, out)
+            }
             // Every concrete leaf — DELEGATED, so the two renderers cannot drift.
-            other => other.vtable_source_type_key(),
+            other => other.write_vtable_source_type_key(out),
         }
     }
 
@@ -7074,9 +8083,9 @@ impl Statement {
             Statement::Assign { .. } => WriteEffect::Captured,
             Statement::SetDiscriminant { .. } => WriteEffect::Captured,
             Statement::Intrinsic { .. } => WriteEffect::FailClosedOrBackstopped,
-            // Writes through a POINTER operand, not a place, so the place-keyed
-            // version oracle cannot capture it — the `intrinsic's pointer arg`
-            // case named in `FailClosedOrBackstopped`'s own documentation.
+            // Writes through a POINTER operand, not a place. The verifier's
+            // pointer-copy write oracle conservatively havocs local storage at
+            // this statement; the sep engine owns its memory safety obligations.
             Statement::CopyNonOverlapping { .. } => WriteEffect::FailClosedOrBackstopped,
             Statement::Deinit { .. } => WriteEffect::FailClosedOrBackstopped,
             Statement::Unsupported { .. } => WriteEffect::FailClosedOrBackstopped,
@@ -7134,8 +8143,10 @@ impl Statement {
     ///
     /// `&mut local` / `&raw [const|mut] local` (`Rvalue::Ref { mutable: true }` /
     /// `Rvalue::AddressOf`) of either raw mutability qualifies: a `*const` is a valid
-    /// `*const -> *mut` cast root. A shared `&local` cannot mutate and its cast to
-    /// `*mut` is rejected by `invalid_reference_casting`, so it does not.
+    /// `*const -> *mut` cast root. This syntax-only query omits shared borrows:
+    /// ordinary shared bytes cannot be mutated, but inline `UnsafeCell` bytes can.
+    /// Value-stability queries must use [`crate::local_defs::statement_escapes_local`],
+    /// which also classifies shared borrows using the body's types.
     pub fn escapes_local(&self, local: usize) -> bool {
         let Statement::Assign { rvalue, .. } = self else { return false };
         matches!(
@@ -7143,6 +8154,221 @@ impl Statement {
             Rvalue::Ref { mutable: true, place: borrowed } | Rvalue::AddressOf(_, borrowed)
                 if borrowed.local == local
         )
+    }
+
+    /// Trust: 2026-09-17 (round A12, pass 2) — [`Statement::escapes_local`] restricted
+    /// to an alias of `local`'s OWN STORAGE: a borrow reached THROUGH `local` (a
+    /// `Deref`-first projection — `&mut (*p)[i]`, `&mut (*p).f`, `&raw mut (*p)`) does
+    /// not qualify, because writing through it changes the POINTEE and can never
+    /// change what `p` holds.
+    ///
+    /// This is the same line [`Statement::local_write`] already draws for WRITES
+    /// (`LocalWrite::of_place` classifies a `Deref`-first place as
+    /// [`LocalWrite::Untouched`]); the two classifiers disagreed, and the
+    /// disagreement cost real proofs — `let a = &mut arr; let r = &mut a[j]; *r = 3;
+    /// t[arr[j] as usize]`, a correct program whose `t[..]` row the pristine driver
+    /// proves at both `-O` levels, refuted at `-O0` only because `&mut (*a)[j]` was
+    /// counted as an escape of `a`, which made `unique_value_def(a)` `None` and left
+    /// `*a` unfoldable.
+    ///
+    /// NOT a drop-in replacement for [`Statement::escapes_local`]. It answers the
+    /// narrower question "can this statement's alias RESEAT `local`" — a caller that
+    /// needs "can `local`'s POINTEE be mutated behind my back" must keep asking the
+    /// wider one. `local_defs::body_unique_value_def_modulo_pointee_borrows` states
+    /// the one obligation that licenses the narrower question; it and
+    /// `local_defs::body_is_single_static_assignment_modulo_pointee_borrows` — the two
+    /// halves of the referent fold's question about the SAME local — are callers, and
+    /// so (since 2026-09-30) is `trust-mir-extract`'s contract gate
+    /// (`slice_param_length_is_stable`), whose question — can a slice parameter's fat
+    /// pointer be RESEATED — is exactly this one.
+    ///
+    /// NOR is it trust-vcgen's slot-write channel rule (`own_storage_write_borrow`) keyed on
+    /// one local: that rule also counts `&mut (*p)` and `&raw mut (*p)` (the havoc
+    /// list must kill what `p` points to as well), and leaves off `&raw const` of any
+    /// place with a `Deref`, where this one counts `&raw const` of a place whose
+    /// `Deref` is not first (`x.0.*`). Two slot predicates, each sound for its own
+    /// question.
+    pub fn escapes_local_storage(&self, local: usize) -> bool {
+        let Statement::Assign { rvalue, .. } = self else { return false };
+        matches!(
+            rvalue,
+            Rvalue::Ref { mutable: true, place: borrowed } | Rvalue::AddressOf(_, borrowed)
+                if borrowed.local == local
+                    && !matches!(borrowed.projections.first(), Some(Projection::Deref))
+        )
+    }
+}
+
+/// TINV step 4 (`docs/design/2026-10-04-type-invariant-tinv.md` §6): HOW a statement or
+/// terminator writes a place. Deliberately NOT `#[non_exhaustive]`: a consumer's match
+/// must break when a channel is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceWriteChannel {
+    /// `place = rvalue`.
+    Store,
+    /// `discriminant(place) = v`.
+    SetDiscriminant,
+    /// `Deinit(place)`.
+    Deinit,
+    /// `&mut place`: the place may be written through the new reference.
+    MutBorrow,
+    /// `&raw const place` / `&raw mut place`: a raw pointer may write it either way.
+    RawBorrow { mutable: bool },
+    /// The destination of a `Call`.
+    CallDest,
+    /// A tail call's return writes the caller's return place.
+    TailCallReturn,
+    /// Drop glue runs on the place with a `&mut` to it. A drop-and-replace has no flag on
+    /// the model terminator: its store is the separate `Assign` in the target block.
+    DropGlue,
+}
+
+/// The places one statement or terminator writes ([`Statement::place_writes`],
+/// [`Terminator::place_writes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceWrites<'a> {
+    /// Writes no place.
+    None,
+    /// Writes exactly these places, by these channels.
+    Places(Vec<(&'a Place, PlaceWriteChannel)>),
+    /// Writes memory no place names (a pointer operand, an opaque terminator): a
+    /// classifier must fail closed.
+    Unlocatable,
+}
+
+impl PlaceWrites<'_> {
+    /// Whether this classification is consistent with the coarser [`WriteEffect`]:
+    /// a `NoValueWrite` writes no place and a `Captured` write is always locatable.
+    #[must_use]
+    pub fn agrees_with(&self, effect: WriteEffect) -> bool {
+        match effect {
+            WriteEffect::NoValueWrite => matches!(self, PlaceWrites::None),
+            WriteEffect::Captured => !matches!(self, PlaceWrites::Unlocatable),
+            WriteEffect::FailClosedOrBackstopped => true,
+        }
+    }
+}
+
+impl Statement {
+    /// Every place this statement writes, and how. EXHAUSTIVE over `Statement` and over
+    /// the `Rvalue` of an `Assign` (no wildcard): a new variant, a new aliasing rvalue
+    /// among them, fails to compile until it is classified.
+    ///
+    /// `Rvalue::Unsupported` is a `Store` to its (known) destination; the places among its
+    /// operands, which it may alias, are reported by
+    /// [`Statement::unsupported_rvalue_operands`].
+    #[must_use]
+    pub fn place_writes(&self) -> PlaceWrites<'_> {
+        match self {
+            Statement::Assign { place, rvalue, .. } => {
+                let mut out = vec![(place, PlaceWriteChannel::Store)];
+                match rvalue {
+                    Rvalue::Ref { mutable: true, place: borrowed } => {
+                        out.push((borrowed, PlaceWriteChannel::MutBorrow));
+                    }
+                    Rvalue::AddressOf(mutable, borrowed) => {
+                        out.push((borrowed, PlaceWriteChannel::RawBorrow { mutable: *mutable }));
+                    }
+                    Rvalue::Ref { mutable: false, .. }
+                    | Rvalue::Use(_)
+                    | Rvalue::BinaryOp(..)
+                    | Rvalue::CheckedBinaryOp(..)
+                    | Rvalue::UncheckedBinaryOp(..)
+                    | Rvalue::UnaryOp(..)
+                    | Rvalue::Cast(..)
+                    | Rvalue::Aggregate(..)
+                    | Rvalue::Discriminant(_)
+                    | Rvalue::Len(_)
+                    | Rvalue::Repeat(..)
+                    | Rvalue::CopyForDeref(_)
+                    | Rvalue::PtrOffset { .. }
+                    | Rvalue::Unsupported { .. } => {}
+                }
+                PlaceWrites::Places(out)
+            }
+            Statement::SetDiscriminant { place, .. } => {
+                PlaceWrites::Places(vec![(place, PlaceWriteChannel::SetDiscriminant)])
+            }
+            Statement::Deinit { place } => {
+                PlaceWrites::Places(vec![(place, PlaceWriteChannel::Deinit)])
+            }
+            // Writes through pointer operands, never a place.
+            Statement::Intrinsic { .. }
+            | Statement::CopyNonOverlapping { .. }
+            | Statement::Unsupported { .. } => PlaceWrites::Unlocatable,
+            Statement::Retag { .. }
+            | Statement::PlaceMention(_)
+            | Statement::StorageLive(_)
+            | Statement::StorageDead(_)
+            | Statement::Coverage
+            | Statement::ConstEvalCounter
+            | Statement::Nop => PlaceWrites::None,
+        }
+    }
+
+    /// The places named by the operands of an `Rvalue::Unsupported` this statement
+    /// assigns: the extractor could not say what the rvalue does with them (an unsize
+    /// coercion, a `Reborrow`, a fake borrow), so a classifier treats each as possibly
+    /// aliased.
+    #[must_use]
+    pub fn unsupported_rvalue_operands(&self) -> Vec<&Place> {
+        match self {
+            Statement::Assign { rvalue: Rvalue::Unsupported { operands, .. }, .. } => operands
+                .iter()
+                .filter_map(|op| match op {
+                    Operand::Copy(p) | Operand::Move(p) => Some(p),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl Terminator {
+    /// Every place this terminator writes, and how. EXHAUSTIVE (no wildcard). A call's
+    /// writes THROUGH its `&mut` arguments are not here: they are reached through
+    /// [`Terminator::call_args`] and the argument types.
+    #[must_use]
+    pub fn place_writes(&self) -> PlaceWrites<'_> {
+        static RETURN_PLACE: std::sync::OnceLock<Place> = std::sync::OnceLock::new();
+        match self {
+            Terminator::Call { dest, .. } => {
+                PlaceWrites::Places(vec![(dest, PlaceWriteChannel::CallDest)])
+            }
+            Terminator::TailCall { .. } => PlaceWrites::Places(vec![(
+                RETURN_PLACE.get_or_init(|| Place::local(0)),
+                PlaceWriteChannel::TailCallReturn,
+            )]),
+            Terminator::Drop { place, .. } => {
+                PlaceWrites::Places(vec![(place, PlaceWriteChannel::DropGlue)])
+            }
+            // Its arguments and destination were lost at extraction.
+            Terminator::Opaque { .. } => PlaceWrites::Unlocatable,
+            Terminator::Goto(_)
+            | Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::Assert { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => PlaceWrites::None,
+        }
+    }
+
+    /// The arguments of a `Call` or a `TailCall` (no wildcard), so a scan of call
+    /// arguments cannot forget the tail call.
+    #[must_use]
+    pub fn call_args(&self) -> Option<&[Operand]> {
+        match self {
+            Terminator::Call { args, .. } | Terminator::TailCall { args, .. } => Some(args),
+            Terminator::Goto(_)
+            | Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::Assert { .. }
+            | Terminator::Drop { .. }
+            | Terminator::Opaque { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => None,
+        }
     }
 }
 
@@ -7376,9 +8602,18 @@ pub enum Operand {
     /// represented precisely. This may be used as an unconstrained formula for
     /// CFG continuity, but it must also produce an `UnsupportedMir` VC so
     /// proofs fail closed.
+    ///
+    /// IDENTITY (OPAQUE-REF-ID-1). Two occurrences with the same `kind`/`detail`
+    /// text are in general two different values (two `f16` constants, two
+    /// constants of one projection type), so a renderer must name the occurrence
+    /// by `origin` ([`Operand::unsupported_operand_smt_var_name`]), never by its
+    /// diagnostic text. `origin` is positional, re-derived on every load and never
+    /// serialized; build one with [`Operand::unsupported`].
     Unsupported {
         kind: String,
         detail: String,
+        #[serde(skip)]
+        origin: OpaqueOrigin,
     },
 }
 
@@ -7500,7 +8735,22 @@ pub enum ConstValue {
     /// are not asserted, so value-dependent obligations stay `unknown`, never falsely
     /// proved). Clears the dominant "unsupported constant" blocker for the static
     /// `&[&str]` lookup tables ubiquitous in real code (gap-log build #25).
-    OpaqueConst,
+    ///
+    /// The extractor also uses it for runtime pointer values it does not model
+    /// (`usize as *const T`, `Box<T> -> Box<dyn Trait>`, an unknown-length
+    /// `[x; N]`), so two occurrences may denote DIFFERENT values.
+    ///
+    /// IDENTITY (OPAQUE-REF-ID-1, 2026-10-07). The field is the occurrence's
+    /// [`OpaqueOrigin`]; every consumer that NAMES the value must name it through
+    /// [`ConstValue::unmodeled_value_smt_var_name`], which spells one symbol per
+    /// origin. Before this field existed every opaque reference rendered to the
+    /// ONE symbol `__unknown_const`, so `let p = x as *const u8; let q = y as
+    /// *const u8; if p != q { panic!() }` was PROVED and kernel-certified (see
+    /// `docs/KNOWN_HAZARDS.md`, OPAQUE-REF-ID-1). The origin is positional only: it
+    /// is skipped on the wire, so the variant still (de)serializes as the bare
+    /// unit string `"OpaqueConst"`, and [`VerifiableBody`] re-derives it on every
+    /// load. Build one with [`ConstValue::opaque_const`].
+    OpaqueConst(#[serde(skip)] OpaqueOrigin),
     /// A bare (non-reference) INTEGER constant whose value cannot be evaluated at
     /// extraction time — a const-generic param `N`, an associated const `T::LIMIT`,
     /// or `size_of::<T>()` read inside a *generic* body where const-eval is
@@ -7511,14 +8761,44 @@ pub enum ConstValue {
     /// NO value, so value/div/index/equality obligations over it stay `unknown` and
     /// are never falsely proved (see the div-zero and const-eq folds in trust-vcgen,
     /// which must treat this as unknown-valued, never as a known-nonzero/known-unequal
-    /// constant). This carrier has NO occurrence identity: a consumer must either
-    /// freshen each occurrence independently or refuse any proof step for which
-    /// aliasing two occurrences could matter. The generic formula renderer cannot
-    /// provide that identity, so arithmetic proof builders fail closed on it.
-    OpaqueScalar {
-        width: u32,
-        signed: bool,
-    },
+    /// constant).
+    ///
+    /// IDENTITY (OPAQUE-SCALAR-ID-1, 2026-10-07; the shared model is in
+    /// [`crate::opaque_identity`]). Two occurrences of this carrier may denote
+    /// DIFFERENT values: the extractor also uses it for runtime values
+    /// (`ptr as usize`, `f32 -> u32` and `[u8; N] -> uN` transmutes,
+    /// `MaybeUninit<uN> -> uN`), and two unevaluated constants (`size_of::<T>()`
+    /// vs `size_of::<U>()`) differ in general. `origin` is what keeps them apart:
+    /// every consumer that NAMES the value must name it through
+    /// [`ConstValue::opaque_scalar_smt_var_name`], which spells a distinct symbol
+    /// per [`OpaqueOrigin`]. Before this field existed every occurrence of a
+    /// width rendered to ONE symbol, so `if a as usize != b as usize { panic!() }`
+    /// was PROVED panic-free and kernel-certified (see `docs/KNOWN_HAZARDS.md`,
+    /// OPAQUE-SCALAR-ID-1).
+    ///
+    /// SERDE (OPAQUE-SCALAR-WIRE-1): positional origins are a function of where the
+    /// operand sits in its body, so they are never on any wire and [`VerifiableBody`]
+    /// re-derives them on every deserialization. Only the constant key
+    /// ([`OpaqueOrigin::Const`]) is information a reader cannot recompute, and how
+    /// it travels depends on the format, through
+    /// [`crate::opaque_identity::serialize_opaque_scalar`] /
+    /// [`crate::opaque_identity::deserialize_opaque_scalar`]:
+    ///
+    /// * a self-describing (human-readable) format such as JSON writes `origin`
+    ///   only for a keyed occurrence, so a legacy dump re-serializes
+    ///   byte-identically;
+    /// * a positional (non-human-readable) format such as bincode ALWAYS writes a
+    ///   third field, `key: Option<String>`. Its decoder reads every field
+    ///   unconditionally, so a field that is sometimes omitted (the
+    ///   `skip_serializing_if` this variant carried until 2026-10-07) made it read
+    ///   the NEXT value's bytes as the origin, and made keyed and keyless encodings
+    ///   prefix-related, which broke `bincode::serialize` identity bytes. Never put
+    ///   `skip_serializing_if` on a field of this type.
+    #[serde(
+        serialize_with = "crate::opaque_identity::serialize_opaque_scalar",
+        deserialize_with = "crate::opaque_identity::deserialize_opaque_scalar"
+    )]
+    OpaqueScalar { width: u32, signed: bool, origin: OpaqueOrigin },
     /// Trust: piece #7a — a const-generic PARAM value (`N`) read as an operand,
     /// carrying the param IDENTITY so it lowers to the SAME symbol
     /// `__trust_constparam_{index}_{name}` (see [`const_param_symbol`]) that the
@@ -7541,9 +8821,14 @@ pub enum ConstValue {
     /// std enum E's value is a PAYLOAD-LESS variant. Carries the enum def-path and the
     /// variant INDEX. Value-lowering is identical to `OpaqueConst` (fresh symbolic ref);
     /// the variant information is consumed SYNTACTICALLY by the eq-guard channels.
+    /// `origin` is its occurrence identity exactly as for [`ConstValue::OpaqueConst`]
+    /// (OPAQUE-REF-ID-1): positional, never serialized; build one with
+    /// [`ConstValue::unit_variant_ref`].
     UnitVariantRef {
         enum_name: String,
         variant: usize,
+        #[serde(skip)]
+        origin: OpaqueOrigin,
     },
     /// A zero-sized callable constant whose runtime payload is unit-like but
     /// whose code identity is semantically relevant to syntactic MIR
@@ -7580,9 +8865,49 @@ pub enum ConstValue {
     /// info. Appended LAST so positional Serde formats retain every historical
     /// discriminant (serde-JSON is externally tagged by NAME, so old dumps
     /// deserialize unchanged regardless — the append-last discipline is kept anyway).
+    ///
+    /// `origin` is its occurrence identity exactly as for [`ConstValue::OpaqueConst`]
+    /// (OPAQUE-REF-ID-1): positional, never serialized; build one with
+    /// [`ConstValue::struct_scalar_fields_ref`].
     StructScalarFieldsRef {
         adt_name: String,
         fields: Vec<ConstValue>,
+        #[serde(skip)]
+        origin: OpaqueOrigin,
+    },
+    /// Faithful compiler-observed allocation/provenance data. This is NOT an
+    /// opaque reference or a solver value: consumers without checked memory
+    /// image semantics must explicitly refuse it. Appended to preserve every
+    /// historical positional Serde discriminant.
+    MemoryImage(Box<crate::ConstantMemoryImage>),
+    /// Trust (EMPTY-CLOSURE-REF-VALUE-1, 2026-11-10): the PROMOTED SHARED borrow of
+    /// an upvar-free (hence zero-sized) closure — `apply(&|x| x / 2, 7)` lowers the
+    /// `&{closure}` argument to `const use_apply::promoted[0]`. Emitted ONLY by the
+    /// extractor's `convert_const_operand` for a MIR `Const::Unevaluated` whose
+    /// `promoted` is `Some` and whose type is `&C` (shared) with `C` a closure type
+    /// that has no upvars; `closure` is the closure's def path, spelled exactly as
+    /// `Ty::Closure::name` spells it (`sysroot_authenticated_def_path_str`).
+    ///
+    /// It is a SEPARATE carrier from [`ConstValue::OpaqueConst`] because the
+    /// extractor also uses `OpaqueConst` for RUNTIME pointer values it does not
+    /// model (a `&T -> &dyn Trait` unsize, `usize as *const T`), so an
+    /// `OpaqueConst` at a reference type proves nothing about where its bits came
+    /// from. This carrier does: a promoted constant of type `&C` passed rustc's
+    /// const validation, so its bits are a non-null aligned reference. It is the
+    /// certificate trust-mc's `SourceReferenceValueFact` contract names ("the
+    /// source compiler's promoted empty-closure shared-borrow certificate").
+    ///
+    /// Value-lowering everywhere is IDENTICAL to `OpaqueConst` (a fresh symbolic
+    /// reference; address and pointee never asserted; equality UNKNOWN, never
+    /// `Some(false)`); the closure path is syntactic evidence for the bridge's
+    /// value-site check only. Appended LAST so positional Serde formats retain
+    /// every historical discriminant. `origin` is its occurrence identity exactly
+    /// as for [`ConstValue::OpaqueConst`] (OPAQUE-REF-ID-1): positional, never
+    /// serialized; build one with [`ConstValue::empty_closure_ref`].
+    EmptyClosureRef {
+        closure: String,
+        #[serde(skip)]
+        origin: OpaqueOrigin,
     },
 }
 
@@ -7590,18 +8915,24 @@ impl ConstValue {
     /// Trust: EFHT-P (2026-08-30) — is this constant an OPAQUE REFERENCE carrier: a
     /// reference-typed constant whose VALUE every consumer must model as a fresh
     /// symbolic reference (contents never asserted, equality unknown)? `true` for
-    /// exactly [`ConstValue::OpaqueConst`], [`ConstValue::UnitVariantRef`] and
-    /// [`ConstValue::StructScalarFieldsRef`] — the syntactic payload the latter two
-    /// carry is evidence for the eq-guard/transport channels, never a value claim.
+    /// exactly [`ConstValue::OpaqueConst`], [`ConstValue::UnitVariantRef`],
+    /// [`ConstValue::EmptyClosureRef`] and [`ConstValue::StructScalarFieldsRef`]
+    /// when its fields contain no memory image. Malformed external data nesting an
+    /// image must still be refused. The syntactic payload the latter three carry is
+    /// evidence for the eq-guard/transport/value-site channels, never a value claim.
     /// Consumers that treat `OpaqueConst` as an opaque ref should treat every variant
     /// this returns `true` for identically; the classifier pin in this file's test
     /// module keeps the partition total with no wildcard.
     #[must_use]
     pub fn is_opaque_reference(&self) -> bool {
+        if self.contains_memory_image() {
+            return false;
+        }
         matches!(
             self,
-            ConstValue::OpaqueConst
+            ConstValue::OpaqueConst(_)
                 | ConstValue::UnitVariantRef { .. }
+                | ConstValue::EmptyClosureRef { .. }
                 | ConstValue::StructScalarFieldsRef { .. }
         )
     }
@@ -7693,6 +9024,15 @@ pub enum Rvalue {
     /// wrapping arithmetic in a standalone value model. Every consumer that
     /// does not name this variant must remain conservative through its
     /// `#[non_exhaustive]` wildcard — which is the direction that matters.
+    ///
+    /// **`Shl`/`Shr` carry a DIFFERENT precondition.** MIR `ShlUnchecked` /
+    /// `ShrUnchecked` (`unchecked_shl`/`unchecked_shr` after `LowerIntrinsics`,
+    /// e.g. inside `core::ptr::align_offset`) are UB when the shift AMOUNT —
+    /// the second operand, whose integer type may differ from the first's — is
+    /// outside `0..LHS::BITS`. They have no overflow flag. So a consumer must
+    /// dispatch on the `BinOp`: `Add`/`Sub`/`Mul` owe "no overflow",
+    /// `Shl`/`Shr` owe "amount in range", and neither may be read as the plain
+    /// `BinaryOp` spelling, whose MIR `Shl`/`Shr` MASK the amount instead.
     // Trust: R2/C4 — preserve UB-on-overflow provenance; never collapse into BinaryOp.
     UncheckedBinaryOp(BinOp, Operand, Operand),
     UnaryOp(UnOp, Operand),
@@ -7988,20 +9328,14 @@ impl AtomicOrdering {
     #[must_use]
     pub fn join(&self, other: &AtomicOrdering) -> AtomicOrdering {
         use AtomicOrdering::*;
-        if self == other {
-            return *self;
-        }
         match (self, other) {
             (SeqCst, _) | (_, SeqCst) => SeqCst,
             (AcqRel, _) | (_, AcqRel) => AcqRel,
             // Acquire join Release = AcqRel (they are incomparable)
             (Acquire, Release) | (Release, Acquire) => AcqRel,
-            (Acquire, Relaxed) | (Relaxed, Acquire) => Acquire,
-            (Release, Relaxed) | (Relaxed, Release) => Release,
-            // Remaining self==other cases handled above
-            _ => {
-                unreachable!("AtomicOrdering::join covers all unequal pairs in the current lattice")
-            }
+            (Acquire, Acquire | Relaxed) | (Relaxed, Acquire) => Acquire,
+            (Release, Release | Relaxed) | (Relaxed, Release) => Release,
+            (Relaxed, Relaxed) => Relaxed,
         }
     }
 
@@ -8009,19 +9343,14 @@ impl AtomicOrdering {
     #[must_use]
     pub fn meet(&self, other: &AtomicOrdering) -> AtomicOrdering {
         use AtomicOrdering::*;
-        if self == other {
-            return *self;
-        }
         match (self, other) {
             (Relaxed, _) | (_, Relaxed) => Relaxed,
             (SeqCst, x) | (x, SeqCst) => *x,
             (AcqRel, x) | (x, AcqRel) => *x,
             // Acquire meet Release = Relaxed (they are incomparable)
             (Acquire, Release) | (Release, Acquire) => Relaxed,
-            // Remaining self==other cases handled above
-            _ => {
-                unreachable!("AtomicOrdering::meet covers all unequal pairs in the current lattice")
-            }
+            (Acquire, Acquire) => Acquire,
+            (Release, Release) => Release,
         }
     }
 }
@@ -8072,9 +9401,9 @@ pub struct AtomicOperation {
     pub op_kind: AtomicOpKind,
     /// The memory ordering used (success ordering for CAS).
     pub ordering: AtomicOrdering,
-    /// For CAS: the failure ordering. Must satisfy:
-    /// - failure_ordering is not Release or AcqRel
-    /// - failure_ordering is no stronger than success ordering
+    /// For CAS: the failure ordering. It must not be `Release` or `AcqRel`.
+    /// It MAY be stronger than the success ordering: Rust 1.64 and C++17
+    /// dropped that restriction.
     #[serde(default)]
     pub failure_ordering: Option<AtomicOrdering>,
     /// Source span for diagnostics.
@@ -8385,7 +9714,7 @@ impl UnwindEdge {
 /// source-forgeable: `str`, `u64` and `usize` are legal generic-parameter names,
 /// and a `ty::Param` prints BARE with no crate path, so
 ///
-/// ```ignore
+/// ```ignore (illustrative)
 /// #![allow(non_camel_case_types)]
 /// pub fn attack<u64: TryFrom<u32>>(x: u32) -> Result<u64, <u64 as TryFrom<u32>>::Error> {
 ///     <u64 as TryFrom<u32>>::try_from(x)   // `u64` here is a TYPE PARAMETER
@@ -8552,6 +9881,33 @@ pub enum Terminator {
         /// objects and must not share a content hash.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         callee_identity: Option<CalleeIdentity>,
+        /// Trust: round 7 — the callee's STRUCTURED, COMPILER-RESOLVED key: the
+        /// closed-vocabulary sysroot-item tag plus the crate facts the rendered
+        /// `__trust_crate@<id>::` stamp collapses into one bit.
+        ///
+        /// THIS IS WHAT THE UNSAFE MINT DECIDES ON. `func` above stays the
+        /// DISPLAY spelling every diagnostic and gate-log parser reads; it is
+        /// not an identity and must never be parsed to select a safety
+        /// contract. [`CalleeKey`] is minted from `(TyCtxt, DefId)` ALONE —
+        /// deliberately NOT from `generic_args` — so it is byte-identical for
+        /// `f::<u8>`, `f::<fn() -> u8>` and `f::<Tok<'>', '<'>>`. That
+        /// invariance is the termination property: an adversarial type argument
+        /// is not in the decision's domain, so there is no scanner left to
+        /// desynchronize.
+        ///
+        /// `None` means "no structured key was available" and MUST fail closed
+        /// at every consumer: an indirect call, a synthetic/test body, and any
+        /// artifact serialized before this field existed all land here. A
+        /// consumer that answered a `None` by comparing `func` would have
+        /// re-created exactly the forgeable-string decision this field retires.
+        ///
+        /// SERDE DISCIPLINE (same rule as `callee_identity`): `None` is the
+        /// pre-carrier meaning and must not appear on the wire, so a bundle with
+        /// no keys re-serializes byte-identically and every audited content-hash
+        /// pin survives. A PRESENT key IS hash-visible: it asserts which sysroot
+        /// item this call reaches.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        callee_key: Option<CalleeKey>,
     },
     /// A rustc MIR `TailCall` (`become f(args)`). Unlike an ordinary call, the
     /// callee returns directly to this function's caller, so there is no
@@ -8581,6 +9937,12 @@ pub enum Terminator {
         /// when MIR chooses the tail-call representation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         callee_identity: Option<CalleeIdentity>,
+        /// The same compiler-resolved structured key carried by
+        /// [`Terminator::Call`]. Tail calls are still calls: omitting it would
+        /// send the unsafe mint back to display text exactly when MIR chooses
+        /// the tail-call representation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        callee_key: Option<CalleeKey>,
     },
     Assert {
         cond: Operand,
@@ -8937,6 +10299,138 @@ impl Terminator {
         }
         exits
     }
+
+    /// Visit every block in [`Self::unguarded_successors`] without allocating a
+    /// temporary `Vec<BlockId>`.
+    pub fn for_each_unguarded_successor(&self, mut f: impl FnMut(BlockId)) {
+        match self {
+            Terminator::Goto(target) | Terminator::Drop { target, .. } => f(*target),
+            Terminator::Call { target: Some(target), .. } => f(*target),
+            Terminator::Call { target: None, .. } => {}
+            Terminator::Opaque { targets, .. } => {
+                for &target in targets {
+                    f(target);
+                }
+            }
+            Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::TailCall { .. }
+            | Terminator::Assert { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
+        }
+        if let Some(cleanup) = self.unwind_cleanup_target() {
+            f(cleanup);
+        }
+    }
+
+    /// True when `needle` is in [`Self::unguarded_successors`], without allocating
+    /// a temporary `Vec<BlockId>`.
+    #[must_use]
+    pub fn has_unguarded_successor(&self, needle: BlockId) -> bool {
+        let in_normal = match self {
+            Terminator::Goto(target) | Terminator::Drop { target, .. } => *target == needle,
+            Terminator::Call { target, .. } => *target == Some(needle),
+            Terminator::Opaque { targets, .. } => targets.contains(&needle),
+            Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::TailCall { .. }
+            | Terminator::Assert { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => false,
+        };
+        in_normal || self.unwind_cleanup_target() == Some(needle)
+    }
+
+    /// Visit every in-CFG successor block in [`Self::unguarded_successors`]
+    /// followed by every `ClauseTarget::Block(t)` in [`Self::discovered_clauses`],
+    /// in the exact same order, without allocating `Vec<BlockId>`,
+    /// `Vec<DiscoveredClause>`, or `Vec<u128>`, and without cloning operands,
+    /// spans, or assert messages.
+    pub fn for_each_in_cfg_successor(&self, mut f: impl FnMut(BlockId)) {
+        self.for_each_unguarded_successor(&mut f);
+        match self {
+            Terminator::SwitchInt { targets, otherwise, .. } => {
+                for &(_, target) in targets {
+                    f(target);
+                }
+                f(*otherwise);
+            }
+            Terminator::Assert { target, .. } => f(*target),
+            _ => {}
+        }
+    }
+
+    /// True when `needle` is in [`Self::unguarded_successors`] or is a
+    /// `ClauseTarget::Block(needle)` in [`Self::discovered_clauses`], without
+    /// allocating temporary `Vec`s or cloning operands/spans.
+    #[must_use]
+    pub fn has_in_cfg_successor(&self, needle: BlockId) -> bool {
+        if self.has_unguarded_successor(needle) {
+            return true;
+        }
+        match self {
+            Terminator::SwitchInt { targets, otherwise, .. } => {
+                *otherwise == needle || targets.iter().any(|&(_, target)| target == needle)
+            }
+            Terminator::Assert { target, .. } => *target == needle,
+            _ => false,
+        }
+    }
+
+    /// Visit every `ClauseTarget::Block(t)` in [`Self::exit_targets`] in the
+    /// exact same order without allocating a temporary `Vec<ClauseTarget>`.
+    pub fn for_each_exit_block_target(&self, mut f: impl FnMut(BlockId)) {
+        match self {
+            Terminator::Return
+            | Terminator::TailCall { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
+            Terminator::Assert { target, .. }
+            | Terminator::Goto(target)
+            | Terminator::Drop { target, .. } => f(*target),
+            Terminator::SwitchInt { targets, otherwise, .. } => {
+                for &(_, block) in targets {
+                    f(block);
+                }
+                f(*otherwise);
+            }
+            Terminator::Call { target, .. } => {
+                if let Some(block) = *target {
+                    f(block);
+                }
+            }
+            Terminator::Opaque { targets, .. } => {
+                for &block in targets {
+                    f(block);
+                }
+            }
+        }
+        if let Some(cleanup) = self.unwind_cleanup_target() {
+            f(cleanup);
+        }
+    }
+
+    /// True when `ClauseTarget::Block(needle)` is in [`Self::exit_targets`],
+    /// without allocating a temporary `Vec<ClauseTarget>`.
+    #[must_use]
+    pub fn has_exit_block_target(&self, needle: BlockId) -> bool {
+        let in_primary = match self {
+            Terminator::Return
+            | Terminator::TailCall { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => false,
+            Terminator::Assert { target, .. }
+            | Terminator::Goto(target)
+            | Terminator::Drop { target, .. } => *target == needle,
+            Terminator::SwitchInt { targets, otherwise, .. } => {
+                *otherwise == needle || targets.iter().any(|&(_, block)| block == needle)
+            }
+            Terminator::Call { target, .. } => *target == Some(needle),
+            Terminator::Opaque { targets, .. } => targets.contains(&needle),
+        };
+        in_primary || self.unwind_cleanup_target() == Some(needle)
+    }
 }
 
 /// A discovered guarded clause from MIR control flow.
@@ -9162,7 +10656,7 @@ pub fn closed_grammar_refusal_shape(ty: &Ty) -> RefusalShape {
     match ty {
         T::Tuple(elems) => elems
             .iter()
-            .find(|e| e.vtable_source_type_key().is_none())
+            .find(|e| !e.has_vtable_source_type_key())
             .map_or(RefusalShape::Other, closed_grammar_refusal_shape),
         T::Array { elem, .. } => closed_grammar_refusal_shape(elem),
         T::Ref { inner, .. } => closed_grammar_refusal_shape(inner),
@@ -9273,7 +10767,15 @@ impl VtableKeyTy {
     /// scoped — scoping it would be churn and would refuse nothing — so no arm below
     /// consults `owner` except through the delegated [`VtableKeyTy::Closed`] leaf.
     pub fn render_in_body(&self, owner: &str) -> Result<String, RefusalShape> {
-        let rendered = match self {
+        let mut out = String::new();
+        self.write_in_body(owner, &mut out)?;
+        Ok(out)
+    }
+
+    fn write_in_body(&self, owner: &str, out: &mut String) -> Result<(), RefusalShape> {
+        use std::fmt::Write as _;
+        let start = out.len();
+        match self {
             // The pre-slice-18 renderer, called verbatim. NOT re-checked by
             // `key_component_is_unambiguous` below: it produces exactly the strings slice
             // 17 already ships, and subjecting them to a NEW predicate is how a "zero
@@ -9281,46 +10783,53 @@ impl VtableKeyTy {
             // the enclosing composite's own check sees the whole rendered string.
             VtableKeyTy::Closed(ty) => {
                 return ty
-                    .vtable_source_type_key_in_body(owner)
+                    .write_vtable_source_type_key_in_body(owner, out)
                     .ok_or_else(|| closed_grammar_refusal_shape(ty));
             }
             VtableKeyTy::Nominal { path, args } => {
                 if !nominal_path_is_keyable(path) {
                     return Err(RefusalShape::UnkeyablePath);
                 }
-                if args.is_empty() {
-                    path.clone()
-                } else {
-                    let mut parts = Vec::with_capacity(args.len());
-                    for a in args {
-                        parts.push(a.render_in_body(owner)?);
+                out.push_str(path);
+                if !args.is_empty() {
+                    out.push('<');
+                    for (idx, a) in args.iter().enumerate() {
+                        if idx > 0 {
+                            out.push_str(", ");
+                        }
+                        a.write_in_body(owner, out)?;
                     }
-                    format!("{path}<{}>", parts.join(", "))
+                    out.push('>');
                 }
             }
             VtableKeyTy::Tuple(elems) => {
-                let mut parts = Vec::with_capacity(elems.len());
-                for e in elems {
-                    parts.push(e.render_in_body(owner)?);
+                out.push('(');
+                for (idx, e) in elems.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str(", ");
+                    }
+                    e.write_in_body(owner, out)?;
                 }
-                format!("({})", parts.join(", "))
+                out.push(')');
             }
             VtableKeyTy::Array { elem, len } => {
-                format!("[{}; {len}]", elem.render_in_body(owner)?)
+                out.push('[');
+                elem.write_in_body(owner, out)?;
+                let _ = write!(out, "; {len}]");
             }
             VtableKeyTy::Ref { mutable, inner } => {
-                format!("&{}{}", if *mutable { "mut " } else { "" }, inner.render_in_body(owner)?)
+                out.push_str(if *mutable { "&mut " } else { "&" });
+                inner.write_in_body(owner, out)?;
             }
-            VtableKeyTy::RawPtr { mutable, pointee } => format!(
-                "*{} {}",
-                if *mutable { "mut" } else { "const" },
-                pointee.render_in_body(owner)?
-            ),
-        };
-        if !key_component_is_unambiguous(&rendered) {
+            VtableKeyTy::RawPtr { mutable, pointee } => {
+                out.push_str(if *mutable { "*mut " } else { "*const " });
+                pointee.write_in_body(owner, out)?;
+            }
+        }
+        if !key_component_is_unambiguous(&out[start..]) {
             return Err(RefusalShape::Ambiguous);
         }
-        Ok(rendered)
+        Ok(())
     }
 }
 
@@ -9342,7 +10851,13 @@ impl VtableKeyTy {
 /// impersonating crate's ADT must keep a DISTINCT key, not lose one.
 #[must_use]
 pub fn nominal_path_is_keyable(path: &str) -> bool {
-    path.contains("::") && !path.contains(['$', ',', '<', '>', '(', ')', '[', ']', ';', '&', '*'])
+    path.contains("::")
+        && !path.bytes().any(|b| {
+            matches!(
+                b,
+                b'$' | b',' | b'<' | b'>' | b'(' | b')' | b'[' | b']' | b';' | b'&' | b'*'
+            )
+        })
 }
 
 /// Trust (vtable slice 18): is this rendered component unambiguously delimited?
@@ -9353,20 +10868,21 @@ pub fn nominal_path_is_keyable(path: &str) -> bool {
 /// string. `<`/`>` count as brackets because the nominal arm introduces them.
 #[must_use]
 pub fn key_component_is_unambiguous(s: &str) -> bool {
-    if s.is_empty() || s.contains('$') {
+    if s.is_empty() {
         return false;
     }
     let mut depth: i32 = 0;
-    for c in s.chars() {
-        match c {
-            '(' | '[' | '<' => depth += 1,
-            ')' | ']' | '>' => {
+    for b in s.bytes() {
+        match b {
+            b'$' => return false,
+            b'(' | b'[' | b'<' => depth += 1,
+            b')' | b']' | b'>' => {
                 depth -= 1;
                 if depth < 0 {
                     return false;
                 }
             }
-            ',' if depth == 0 => return false,
+            b',' if depth == 0 => return false,
             _ => {}
         }
     }
@@ -9464,6 +10980,7 @@ mod tests {
                         is_foreign: true,
                         is_unsafe_sig: true,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 }],
                 arg_count: 1,
@@ -9474,6 +10991,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -9542,6 +11060,153 @@ mod tests {
             expanded.body.blocks[0].terminator,
             Terminator::Call { target: Some(BlockId(0)), .. }
         ));
+    }
+
+    /// WS8.9 (F-117) positive: the identity lane stores the REMAPPED rendering, so the
+    /// user's `--remap-path-prefix` takes the checkout out of it; without a remap the two
+    /// renderings are one string and nothing changes.
+    #[test]
+    fn identity_file_rendering_prefers_the_remapped_name() {
+        assert_eq!(
+            identity_file_rendering("/home/u/co/src/lib.rs".into(), "/src/src/lib.rs".into()),
+            "/src/src/lib.rs"
+        );
+        assert_eq!(identity_file_rendering("src/lib.rs".into(), "src/lib.rs".into()), "src/lib.rs");
+        // Real sysroot std: std-shaped on both sides (rust-src installed), or the same
+        // virtual name on both (no local path) — the remapped name is kept.
+        let virt = "/rustc/0123456789abcdef/library/core/src/ptr/mod.rs";
+        assert_eq!(
+            identity_file_rendering(
+                "/home/u/.rustup/lib/rustlib/src/rust/library/core/src/ptr/mod.rs".into(),
+                virt.into()
+            ),
+            virt
+        );
+        assert_eq!(identity_file_rendering(virt.into(), virt.into()), virt);
+    }
+
+    /// WS8.9 negative twin: a remap may ERASE a path, never MINT provenance. A user crate
+    /// remapped onto a sysroot-std shape (`--remap-path-prefix=<co>/src=core/src`, or onto
+    /// `/rustc/<h>/library/alloc/src`) keeps its LOCAL rendering, so vcgen's trusted-std
+    /// predicate cannot delete its `[unsafe:sep:*]` obligations; likewise a remap onto the
+    /// `binary:` provenance prefix. Mutation control: dropping the guard (always returning
+    /// `remapped`) makes the std-shape assertion below fail.
+    #[test]
+    fn identity_file_rendering_refuses_a_remap_that_mints_std_or_binary_provenance() {
+        let local = "/home/u/co/src/lib.rs";
+        for forged in [
+            "core/src/lib.rs",
+            "alloc/src/macros.rs",
+            "/rustc/0123456789abcdef/library/alloc/src/lib.rs",
+            "/x/library/std/src/lib.rs",
+            "binary:0x401000",
+        ] {
+            assert!(
+                is_sysroot_std_source_path(forged) || forged.starts_with("binary:"),
+                "fixture must be provenance-shaped: {forged}"
+            );
+            assert_eq!(
+                identity_file_rendering(local.into(), forged.into()),
+                local,
+                "a remap onto `{forged}` must not mint provenance"
+            );
+            assert!(!is_sysroot_std_source_path(&stable_obligation_file(identity_file_rendering(
+                local.into(),
+                forged.into()
+            ))));
+        }
+        // A remap onto a NON-provenance virtual root is admitted (the positive lane).
+        assert_eq!(identity_file_rendering(local.into(), "/src/lib.rs".into()), "/src/lib.rs");
+    }
+
+    #[test]
+    fn is_sysroot_std_source_path_shapes() {
+        for yes in [
+            "library/alloc/src/vec/mod.rs",
+            "/opt/rust/library/core/src/lib.rs",
+            "/rustc/<toolchain>/library/std/src/io.rs",
+            "alloc/src/macros.rs",
+        ] {
+            assert!(is_sysroot_std_source_path(yes), "{yes}");
+        }
+        for no in [
+            "",
+            "binary:0x10",
+            "src/lib.rs",
+            "library/trust-mc/src/lib.rs",
+            "/x/library/mycrate/src/lib.rs",
+            "mycore/src/lib.rs",
+        ] {
+            assert!(!is_sysroot_std_source_path(no), "{no}");
+        }
+    }
+
+    // ── TrustedStdSourceFiles ────────────────────────────────────────────
+    //
+    // The table that replaced the file-path key. Every test here is about a way
+    // it can FALL, because every one of those ways must fall closed.
+
+    /// The table decides from RESIDENCY, so it is free of the path's shape in
+    /// BOTH directions: a sysroot laid out somewhere unrecognizable is trusted,
+    /// and the user's own file spelled `core/src/…` is not.
+    #[test]
+    fn trusted_std_source_files_is_indifferent_to_the_shape_of_the_path() {
+        let table = TrustedStdSourceFiles::from_authenticated_files([
+            ("/opt/tc/lib/rustlib/src/x/ptr.rs".to_string(), true),
+            ("core/src/evil.rs".to_string(), false),
+            ("library/core/src/evil.rs".to_string(), false),
+            ("usr/lib/rustlib/src/rust/library/core/src/evil.rs".to_string(), false),
+        ]);
+        assert!(table.contains("/opt/tc/lib/rustlib/src/x/ptr.rs"));
+        for user_file in [
+            "core/src/evil.rs",
+            "library/core/src/evil.rs",
+            "usr/lib/rustlib/src/rust/library/core/src/evil.rs",
+        ] {
+            assert!(!table.contains(user_file), "a directory name must buy nothing: {user_file}");
+        }
+    }
+
+    /// A rendering claimed by both a sysroot and a non-sysroot source file is
+    /// REVOKED, whichever order the two arrive in. The sysroot file loses its
+    /// exemption; the user file never gains one.
+    #[test]
+    fn trusted_std_source_files_revokes_a_contested_rendering_in_both_orders() {
+        for order in [[true, false], [false, true]] {
+            let table = TrustedStdSourceFiles::from_authenticated_files(
+                order.map(|verdict| ("core/src/ptr/mod.rs".to_string(), verdict)),
+            );
+            assert!(!table.contains("core/src/ptr/mod.rs"), "order {order:?}");
+            assert_eq!(table.trusted_len(), 0, "order {order:?}");
+            assert_eq!(table.revoked_len(), 1, "order {order:?}");
+        }
+    }
+
+    /// No location is never an exemption, EXPLICITLY — not merely because the
+    /// two shapes happen to be absent from the table. A producer that recorded
+    /// one must not be able to turn "no source location" into trust.
+    #[test]
+    fn trusted_std_source_files_refuses_the_locationless_span_shapes() {
+        let table = TrustedStdSourceFiles::from_authenticated_files([
+            (String::new(), true),
+            ("binary:0x1000".to_string(), true),
+            ("library/core/src/ptr/mod.rs".to_string(), true),
+        ]);
+        assert!(!table.contains(""));
+        assert!(!table.contains("binary:0x1000"));
+        assert!(table.contains("library/core/src/ptr/mod.rs"), "the control must still pass");
+    }
+
+    /// The fail-closed default answers `false` for everything and is
+    /// distinguishable from an authenticated table that happens to be empty.
+    #[test]
+    fn trusted_std_source_files_default_is_closed_and_uninstalled() {
+        let default = TrustedStdSourceFiles::default();
+        assert!(!default.is_installed());
+        assert!(!default.contains("library/core/src/ptr/mod.rs"));
+        let empty = TrustedStdSourceFiles::from_authenticated_files([]);
+        assert!(empty.is_installed());
+        assert!(!empty.contains("library/core/src/ptr/mod.rs"));
     }
 
     /// The defect this fixes: two builds of the SAME toolchain sources at different
@@ -9890,10 +11555,82 @@ mod tests {
         assert_ne!(const_param_symbol(0, "M"), const_param_symbol(1, "N"));
         // Same identity => same symbol (the guard/length tie).
         assert_eq!(const_param_symbol(1, "N"), const_param_symbol(1, "N"));
-        // A non-identifier name is sanitized so it cannot break the SMT symbol.
-        assert_eq!(const_param_symbol(2, "T::LIMIT"), "__trust_constparam_2_T__LIMIT");
+        // A non-identifier name is encoded so it cannot break the SMT symbol.
+        // Trust (SLICE-LEN-NAME-1): it used to render `T__LIMIT`, a `__` the
+        // user's spelling put into the reserved family; it is hex now.
+        assert_eq!(const_param_symbol(2, "T::LIMIT"), "__trust_constparam_2_0543a3a4c494d4954");
         // Deliberately NOT a `__slice_len` (INV-4: no spurious where-fact).
         assert!(!const_param_symbol(1, "N").ends_with("__slice_len"));
+        // CONSTPARAM-SIGMA-FRESHEN-1: the exported prefix is what every symbol
+        // starts with, so trust-vcgen's callee-side rename keys on the mint.
+        for (index, name) in [(0, "M"), (2, "T::LIMIT"), (7, "n__slice_len")] {
+            assert!(const_param_symbol(index, name).starts_with(CONST_PARAM_SYMBOL_PREFIX));
+        }
+    }
+
+    // Trust (2026-10-05, SLICE-LEN-NAME-1): a const-generic PARAMETER's name is
+    // the user's, and it used to be copied into the symbol, so `n__slice_len`
+    // (and `_slice_len`, through the joining `_`) minted a symbol every
+    // `__slice_len` consumer read as a non-negative length.
+    #[test]
+    fn const_param_symbol_cannot_spell_reserved_metadata() {
+        const PREFIX: &str = "__trust_constparam_";
+        let names = [
+            "N",
+            "M",
+            "LEN",
+            "MAX_LEN",
+            "x_slice_len",
+            "n__slice_len",
+            "_slice_len",
+            "__slice_len",
+            "slice_len_",
+            "a__b",
+            "_",
+            "__",
+            "_0",
+            "x__value",
+            "x__len",
+            "n__discr",
+            "__old",
+            "T::LIMIT",
+            "T__LIMIT",
+            "Ä",
+            "Ö",
+            "",
+            "0abc",
+        ];
+        let mut seen = std::collections::BTreeMap::new();
+        for index in [0u32, 1, 7, 10, 123] {
+            for name in names {
+                let symbol = const_param_symbol(index, name);
+                let rest = symbol.strip_prefix(PREFIX).expect("prefix");
+                let fragment = rest.strip_prefix(&format!("{index}_")).expect("index_");
+                assert!(!symbol.ends_with("__slice_len"), "{name:?} -> {symbol}");
+                assert!(!rest.contains("__"), "{name:?} -> {symbol} has `__` after the prefix");
+                assert!(
+                    fragment.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric),
+                    "{name:?} -> {symbol}: the fragment must not start with `_`"
+                );
+                assert!(
+                    fragment.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric()),
+                    "{name:?} -> {symbol} is not an SMT-safe identifier"
+                );
+                // Injective on (index, name): no two inputs share a symbol.
+                if let Some(previous) = seen.insert(symbol.clone(), (index, name)) {
+                    panic!("{previous:?} and {:?} both mint {symbol}", (index, name));
+                }
+            }
+        }
+        // The names every pinned string uses keep their spelling.
+        assert_eq!(const_param_symbol(0, "MAX_LEN"), "__trust_constparam_0_MAX_LEN");
+        assert_eq!(const_param_symbol(0, "x_slice_len"), "__trust_constparam_0_x_slice_len");
+        // The two measured spellings, now hex.
+        assert_eq!(
+            const_param_symbol(0, "n__slice_len"),
+            "__trust_constparam_0_06e5f5f736c6963655f6c656e"
+        );
+        assert_eq!(const_param_symbol(0, "_slice_len"), "__trust_constparam_0_05f736c6963655f6c656e");
     }
 
     #[test]
@@ -11564,6 +13301,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         assert_eq!(func.name, "get_midpoint");
@@ -11758,6 +13496,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let h1 = func.content_hash();
         let h2 = func.content_hash();
@@ -11786,6 +13525,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let func2 = VerifiableFunction {
             name: "f".to_string(),
@@ -11806,6 +13546,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert_ne!(
             func1.content_hash(),
@@ -11841,6 +13582,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let func2 = VerifiableFunction {
             name: "bar".to_string(),
@@ -11857,6 +13599,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert_eq!(
             func1.content_hash(),
@@ -12021,6 +13764,94 @@ mod tests {
         );
     }
 
+    /// Trust (2026-09-29): `VerifiableFunction::tuple_layouts` obeys the
+    /// `datatype_defs` rule. Empty, it is absent from the wire (both directions) and
+    /// from stable hash material, so every pre-carrier pin holds; populated, it is
+    /// identity, and two different rustc layouts of one tuple are two identities.
+    #[test]
+    fn tuple_layouts_empty_is_hash_invisible_but_populated_is_hash_visible() {
+        let body = |layouts: crate::TupleLayouts| VerifiableFunction {
+            name: "f".into(),
+            def_path: "m::f".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: DatatypeDefs::new(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: FunctionSpec::default(),
+            tuple_layouts: layouts,
+        };
+        let table = |offsets: [u64; 2]| {
+            crate::TupleLayouts::from_rows(
+                Some(crate::LayoutTarget {
+                    triple: "aarch64-apple-darwin".into(),
+                    pointer_size: 8,
+                    little_endian: true,
+                }),
+                vec![crate::TupleLayoutInfo {
+                    tuple: Ty::Tuple(vec![Ty::u32(), Ty::u32()]),
+                    size: 8,
+                    align: 4,
+                    field_offsets: offsets.to_vec(),
+                    field_sizes: vec![4, 4],
+                    field_aligns: vec![4, 4],
+                }],
+            )
+        };
+
+        let empty_wire =
+            serde_json::to_string(&body(crate::TupleLayouts::default())).expect("serialize body");
+        assert!(
+            !empty_wire.contains("tuple_layouts"),
+            "an empty table must not reach the wire at all, got {empty_wire}"
+        );
+        let decoded: VerifiableFunction =
+            serde_json::from_str(&empty_wire).expect("pre-carrier function decodes");
+        assert!(decoded.tuple_layouts.is_empty(), "a missing key must decode as the empty table");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-serialize body"),
+            empty_wire,
+            "decode/encode of a pre-carrier body must be the identity on bytes"
+        );
+        let empty_material =
+            stable_model_json(&body(crate::TupleLayouts::default())).expect("stable hash material");
+        assert!(
+            !empty_material.contains("tuple_layouts"),
+            "an empty table must not appear in stable hash material, got {empty_material}"
+        );
+
+        let populated = table([0, 4]);
+        assert!(!populated.is_empty(), "the fixture row must survive `from_rows`");
+        let wire = serde_json::to_string(&body(populated.clone())).expect("serialize body");
+        let back: VerifiableFunction =
+            serde_json::from_str(&wire).expect("populated function decodes");
+        assert_eq!(back.tuple_layouts, populated, "a populated table must round-trip");
+
+        let hash = |layouts: crate::TupleLayouts| {
+            stable_sha256_hex(
+                stable_model_json(&body(layouts)).expect("stable hash material").as_bytes(),
+            )
+        };
+        let bare = hash(crate::TupleLayouts::default());
+        let in_order = hash(table([0, 4]));
+        let swapped = hash(table([4, 0]));
+        assert_ne!(bare, in_order, "a populated table must be hash-visible");
+        assert_ne!(
+            in_order, swapped,
+            "two different layouts of one tuple must not share a content hash"
+        );
+    }
+
     /// Trust (R0 consumer): the resolver's whole contract, in one place.
     ///
     /// `resolve_datatype_marker` is the ONLY door between a bare marker and the
@@ -12174,7 +14005,7 @@ mod tests {
         // nowhere to put.
         let tree_adt = Ty::Adt {
             name: "Tree".into(),
-            fields: vec![("__tag".into(), i64_ty()), ("__v0_0".into(), i64_ty())],
+            fields: vec![("__tag".into(), i64_ty()), ("__v0_0".into(), i64_ty())].into(),
             variants: vec![
                 VariantDef { name: "Leaf".into(), discriminant: 10, fields: vec![] },
                 VariantDef {
@@ -12183,13 +14014,15 @@ mod tests {
                     fields: vec![("0".into(), i64_ty())],
                 },
                 VariantDef { name: "Two".into(), discriminant: 30, fields: vec![] },
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             adt_kind: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
 
         // 1. An ADT definition resolves, and to EXACTLY itself — no projection,
@@ -12225,14 +14058,15 @@ mod tests {
             &mut junk,
             Ty::Adt {
                 name: "Empty".into(),
-                fields: vec![],
-                variants: vec![],
+                fields: vec![].into(),
+                variants: vec![].into(),
                 disc_index_safe: false,
                 faithful_enum_repr: None,
                 layout: None,
                 enum_layout: None,
                 adt_kind: None,
                 arbitrary_precision: None,
+                validity_wrapper: None,
             },
         ));
         assert!(junk.is_empty(), "nothing malformed may reach the table");
@@ -12243,7 +14077,7 @@ mod tests {
         assert!(insert_datatype_def(&mut defs, tree_adt.clone()), "idempotent");
         let mut other = tree_adt.clone();
         if let Ty::Adt { variants, .. } = &mut other {
-            variants[0].discriminant = 99;
+            variants.make_mut()[0].discriminant = 99;
         }
         assert!(!insert_datatype_def(&mut defs, other));
         assert!(!defs.contains_key("Tree"), "a name that means two things identifies nothing");
@@ -12365,6 +14199,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let json = serde_json::to_string(&func).expect("serialize");
@@ -12731,20 +14566,101 @@ mod tests {
         assert_eq!(back, e);
     }
 
+    // Trust (triage ticket 216): `variant_tag` / `flat_tag_fits` — the value a
+    // flat enum's `__tag` slot holds, and whether a tag slot can hold it.
+
+    #[test]
+    fn variant_tag_is_the_declared_discriminant_not_the_index() {
+        let e = Ty::adt_enum(
+            "E",
+            vec![
+                VariantDef { name: "A".into(), discriminant: 5, fields: vec![] },
+                VariantDef { name: "B".into(), discriminant: 9, fields: vec![] },
+            ],
+        );
+        assert_eq!(e.variant_tag(0), Some(5));
+        assert_eq!(e.variant_tag(1), Some(9), "E::B is 9, never its index 1");
+    }
+
+    #[test]
+    fn variant_tag_is_decoded_so_a_negative_discriminant_stays_negative() {
+        // `#[repr(i8)] enum F { X = -3, Y = 7 }`: the extractor decodes rustc's
+        // raw 253 to -3, and the tag is that decoded value.
+        let f = Ty::adt_enum(
+            "F",
+            vec![
+                VariantDef { name: "X".into(), discriminant: -3, fields: vec![] },
+                VariantDef { name: "Y".into(), discriminant: 7, fields: vec![] },
+            ],
+        );
+        assert_eq!(f.variant_tag(0), Some(-3));
+        assert_eq!(f.variant_tag(1), Some(7));
+    }
+
+    #[test]
+    fn variant_tag_without_a_descriptor_is_the_index() {
+        let option_like = Ty::adt("Option", vec![("__tag".into(), Ty::isize())]);
+        assert_eq!(option_like.variant_tag(0), Some(0));
+        assert_eq!(option_like.variant_tag(1), Some(1));
+    }
+
+    #[test]
+    fn variant_tag_is_none_out_of_range_and_for_non_adts() {
+        let e = Ty::adt_enum(
+            "E",
+            vec![VariantDef { name: "A".into(), discriminant: 5, fields: vec![] }],
+        );
+        assert_eq!(e.variant_tag(1), None, "a descriptor present but too short is not the index");
+        assert_eq!(Ty::isize().variant_tag(0), None);
+        assert_eq!(Ty::Bool.variant_tag(0), None);
+    }
+
+    #[test]
+    fn flat_tag_fits_is_the_decoded_range_of_the_slot() {
+        let i64_slot = Ty::Int { width: 64, signed: true };
+        assert!(i64_slot.flat_tag_fits(-3));
+        assert!(i64_slot.flat_tag_fits(i128::from(i64::MIN)));
+        assert!(i64_slot.flat_tag_fits(i128::from(i64::MAX)));
+        assert!(!i64_slot.flat_tag_fits(i128::from(u64::MAX)), "u64::MAX has no i64 spelling");
+        assert!(!i64_slot.flat_tag_fits(i128::from(i64::MIN) - 1));
+
+        let i8_slot = Ty::Int { width: 8, signed: true };
+        assert!(i8_slot.flat_tag_fits(-128) && i8_slot.flat_tag_fits(127));
+        assert!(!i8_slot.flat_tag_fits(128) && !i8_slot.flat_tag_fits(4096));
+        assert!(!i8_slot.flat_tag_fits(253), "the raw pattern of -3 is not an i8 value");
+
+        let u8_slot = Ty::Int { width: 8, signed: false };
+        assert!(u8_slot.flat_tag_fits(0) && u8_slot.flat_tag_fits(255));
+        assert!(!u8_slot.flat_tag_fits(256) && !u8_slot.flat_tag_fits(-1));
+
+        let i128_slot = Ty::Int { width: 128, signed: true };
+        assert!(i128_slot.flat_tag_fits(i128::MIN) && i128_slot.flat_tag_fits(i128::MAX));
+        let u128_slot = Ty::Int { width: 128, signed: false };
+        assert!(u128_slot.flat_tag_fits(i128::MAX) && !u128_slot.flat_tag_fits(-1));
+
+        assert!(Ty::Bool.flat_tag_fits(0) && Ty::Bool.flat_tag_fits(1));
+        assert!(!Ty::Bool.flat_tag_fits(2) && !Ty::Bool.flat_tag_fits(-1));
+        assert!(!Ty::Int { width: 0, signed: false }.flat_tag_fits(0));
+        assert!(!Ty::Int { width: 129, signed: true }.flat_tag_fits(0));
+        assert!(!Ty::Unit.flat_tag_fits(0));
+    }
+
     fn faithful_enum_adt(repr: Option<Option<EnumReprHint>>) -> Ty {
         Ty::Adt {
             adt_kind: None,
             layout: None,
             name: "E".into(),
-            fields: vec![("__tag".into(), Ty::i64())],
+            fields: vec![("__tag".into(), Ty::i64())].into(),
             variants: vec![
                 VariantDef { name: "A".into(), discriminant: 0, fields: vec![] },
                 VariantDef { name: "B".into(), discriminant: 1, fields: vec![] },
-            ],
+            ]
+            .into(),
             disc_index_safe: true,
             faithful_enum_repr: repr,
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         }
     }
 
@@ -12899,6 +14815,143 @@ mod tests {
         }
     }
 
+    /// Trust (verifier-perf, bottleneck B): the SharedVec representation change.
+    /// The literals below were CAPTURED from the pre-change tree (`fields: Vec`,
+    /// `variants: Vec`, derived serde) by serializing exactly these two values —
+    /// a struct ADT and an enum ADT with nested `Adt`/`Ref`/`Tuple` fields — with
+    /// `serde_json` and the workspace `bincode`, and are pasted VERBATIM. This test
+    /// PINS THE PERSISTED FORMAT: every fixture, cache and proof certificate on
+    /// disk was written in it, and `SharedVec`'s hand-written serde must keep it
+    /// byte-for-byte.
+    #[test]
+    fn adt_wire_format_is_pinned_to_the_vec_representation() {
+        let point = Ty::adt(
+            "crate::Point",
+            vec![
+                ("x".to_string(), Ty::Int { width: 32, signed: true }),
+                ("y".to_string(), Ty::Bool),
+            ],
+        );
+        let shape = Ty::adt_enum(
+            "crate::Shape",
+            vec![
+                VariantDef { name: "Unit".into(), discriminant: 0, fields: vec![] },
+                VariantDef {
+                    name: "Pt".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), point.clone())],
+                },
+                VariantDef {
+                    name: "Neg".into(),
+                    discriminant: -1,
+                    fields: vec![
+                        ("0".into(), Ty::Ref { mutable: false, inner: Box::new(point.clone()) }),
+                        ("1".into(), Ty::Tuple(vec![Ty::Bool, Ty::Unit])),
+                    ],
+                },
+            ],
+        );
+
+        const POINT_JSON: &str = r#"{"Adt":{"name":"crate::Point","fields":[["x",{"Int":{"width":32,"signed":true}}],["y","Bool"]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":null}}"#;
+        const SHAPE_JSON: &str = r#"{"Adt":{"name":"crate::Shape","fields":[["0",{"Adt":{"name":"crate::Point","fields":[["x",{"Int":{"width":32,"signed":true}}],["y","Bool"]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":null}}],["1",{"Tuple":["Bool","Unit"]}]],"variants":[{"name":"Unit","discriminant":0,"fields":[]},{"name":"Pt","discriminant":1,"fields":[["0",{"Adt":{"name":"crate::Point","fields":[["x",{"Int":{"width":32,"signed":true}}],["y","Bool"]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":null}}]]},{"name":"Neg","discriminant":-1,"fields":[["0",{"Ref":{"mutable":false,"inner":{"Adt":{"name":"crate::Point","fields":[["x",{"Int":{"width":32,"signed":true}}],["y","Bool"]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":null}}}}],["1",{"Tuple":["Bool","Unit"]}]]}],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":null}}"#;
+        const POINT_BIN: &[u8] = &[
+            13, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 99, 114, 97, 116, 101, 58, 58, 80, 111, 105, 110,
+            116, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 120, 1, 0, 0, 0, 32, 0, 0, 0, 1,
+            1, 0, 0, 0, 0, 0, 0, 0, 121, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        const SHAPE_BIN: &[u8] = &[
+            13, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 99, 114, 97, 116, 101, 58, 58, 83, 104, 97, 112,
+            101, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 48, 13, 0, 0, 0, 12, 0, 0, 0, 0,
+            0, 0, 0, 99, 114, 97, 116, 101, 58, 58, 80, 111, 105, 110, 116, 2, 0, 0, 0, 0, 0, 0, 0,
+            1, 0, 0, 0, 0, 0, 0, 0, 120, 1, 0, 0, 0, 32, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 121,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 49, 12, 0,
+            0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0,
+            0, 0, 0, 0, 0, 85, 110, 105, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 80, 116, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 48, 13, 0, 0, 0, 12, 0, 0,
+            0, 0, 0, 0, 0, 99, 114, 97, 116, 101, 58, 58, 80, 111, 105, 110, 116, 2, 0, 0, 0, 0, 0,
+            0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 120, 1, 0, 0, 0, 32, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0,
+            121, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 78,
+            101, 103, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 48, 5, 0, 0, 0, 0, 13, 0, 0, 0,
+            12, 0, 0, 0, 0, 0, 0, 0, 99, 114, 97, 116, 101, 58, 58, 80, 111, 105, 110, 116, 2, 0,
+            0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 120, 1, 0, 0, 0, 32, 0, 0, 0, 1, 1, 0, 0, 0,
+            0, 0, 0, 0, 121, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+            0, 0, 49, 12, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+
+        assert_eq!(serde_json::to_string(&point).unwrap(), POINT_JSON);
+        assert_eq!(serde_json::to_string(&shape).unwrap(), SHAPE_JSON);
+        assert_eq!(bincode::serialize(&point).unwrap(), POINT_BIN);
+        assert_eq!(bincode::serialize(&shape).unwrap(), SHAPE_BIN);
+        // Decoding the pinned bytes yields the same value (both wire forms).
+        assert_eq!(serde_json::from_str::<Ty>(POINT_JSON).unwrap(), point);
+        assert_eq!(serde_json::from_str::<Ty>(SHAPE_JSON).unwrap(), shape);
+        assert_eq!(bincode::deserialize::<Ty>(POINT_BIN).unwrap(), point);
+        assert_eq!(bincode::deserialize::<Ty>(SHAPE_BIN).unwrap(), shape);
+        // And the pre-P4 shape (no `variants` key) still decodes to a struct.
+        let pre_p4 = r#"{"Adt":{"name":"crate::Point","fields":[["x",{"Int":{"width":32,"signed":true}}],["y","Bool"]]}}"#;
+        assert_eq!(serde_json::from_str::<Ty>(pre_p4).unwrap(), point);
+    }
+
+    /// Trust (verifier-perf, bottleneck B): `SharedVec`'s forwarding impls are
+    /// observably identical to the inner `Vec` (Debug text, hash stream, equality),
+    /// a clone shares the body, and `make_mut` un-shares before writing.
+    #[test]
+    fn sharedvec_forwards_debug_hash_eq_to_vec() {
+        use std::hash::{Hash, Hasher};
+        fn h<T: Hash>(t: &T) -> u64 {
+            let mut s = std::collections::hash_map::DefaultHasher::new();
+            t.hash(&mut s);
+            s.finish()
+        }
+        let v: Vec<(String, Ty)> = vec![("a".into(), Ty::Bool), ("b".into(), Ty::u64())];
+        let sv = SharedVec::from(v.clone());
+        assert_eq!(format!("{:?}", sv), format!("{:?}", v));
+        assert_eq!(format!("{:#?}", sv), format!("{:#?}", v));
+        assert_eq!(h(&sv), h(&v));
+        assert_eq!(*sv, v);
+        assert_eq!(sv.len(), 2);
+        assert_eq!(sv[1].0, "b");
+        assert_eq!(sv.iter().count(), 2);
+        let mut n = 0;
+        for _ in &sv {
+            n += 1;
+        }
+        assert_eq!(n, 2);
+        let collected: SharedVec<(String, Ty)> = v.iter().cloned().collect();
+        assert_eq!(collected, sv);
+        assert!(!SharedVec::ptr_eq(&collected, &sv), "distinct bodies compare by value");
+
+        // Clone = refcount bump; make_mut = copy-on-write, invisible to the other owner.
+        let shared = sv.clone();
+        assert!(SharedVec::ptr_eq(&shared, &sv));
+        let mut owned = shared.clone();
+        owned.make_mut().push(("c".into(), Ty::Unit));
+        assert_eq!(owned.len(), 3);
+        assert_eq!(sv.len(), 2);
+        assert_eq!(shared.len(), 2);
+        assert_ne!(owned, sv);
+        assert_eq!(owned.into_vec().len(), 3);
+        assert_eq!(sv.clone().into_vec(), v);
+
+        // A Ty::Adt clone shares both bodies.
+        let adt = Ty::adt("S", v.clone());
+        let adt2 = adt.clone();
+        match (&adt, &adt2) {
+            (
+                Ty::Adt { fields: f1, variants: v1, .. },
+                Ty::Adt { fields: f2, variants: v2, .. },
+            ) => {
+                assert!(SharedVec::ptr_eq(f1, f2));
+                assert!(SharedVec::ptr_eq(v1, v2));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(adt, adt2);
+        assert_eq!(h(&adt), h(&adt2));
+    }
+
     #[test]
     fn faithful_enum_default_keeps_binary_field_but_not_semantic_hash_material() {
         let ty = Ty::adt("Legacy", Vec::new());
@@ -12918,12 +14971,13 @@ mod tests {
             adt_kind: None,
             layout: None,
             name: "Legacy".into(),
-            fields: Vec::new(),
-            variants: Vec::new(),
+            fields: Vec::new().into(),
+            variants: Vec::new().into(),
             disc_index_safe: false,
             faithful_enum_repr: Some(None),
             enum_layout: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
         let marked_bytes = bincode::serialize(&marked).expect("serialize marked ADT");
         let marked_back: Ty = bincode::deserialize(&marked_bytes).expect("deserialize marked ADT");
@@ -12941,10 +14995,11 @@ mod tests {
         let laid = Ty::Adt {
             adt_kind: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
             layout: None,
             name: "Legacy".into(),
-            fields: Vec::new(),
-            variants: Vec::new(),
+            fields: Vec::new().into(),
+            variants: Vec::new().into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: Some(Box::new(EnumLayoutInfo {
@@ -12989,14 +15044,15 @@ mod tests {
         // would build it.
         let stamped = Ty::Adt {
             name: "num_bigint::BigInt".into(),
-            fields: vec![("data".into(), Ty::u64())],
-            variants: Vec::new(),
+            fields: vec![("data".into(), Ty::u64())].into(),
+            variants: Vec::new().into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             adt_kind: None,
             arbitrary_precision: Some(AdtAuth::ArbPrec(ArbPrecKind::Signed)),
+            validity_wrapper: None,
         };
         assert!(
             matches!(
@@ -13031,14 +15087,15 @@ mod tests {
         // identical unstamped twin share the same semantic shape hash.
         let unstamped = Ty::Adt {
             name: "num_bigint::BigInt".into(),
-            fields: vec![("data".into(), Ty::u64())],
-            variants: Vec::new(),
+            fields: vec![("data".into(), Ty::u64())].into(),
+            variants: Vec::new().into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             adt_kind: None,
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
         assert_eq!(
             stamped.try_stable_shape_hash().expect("hash stamped"),
@@ -13410,6 +15467,7 @@ mod tests {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 unwind: UnwindEdge::Unreachable,
             },
         };
@@ -14024,6 +16082,7 @@ mod callee_identity_forgery_tests {
             is_unsafe_sig: false,
             unwind: UnwindEdge::Unreachable,
             callee_identity: identity,
+            callee_key: None,
         }
     }
 
@@ -14307,6 +16366,7 @@ mod model_write_channel_tests {
                 is_unsafe_sig: false,
                 unwind: UnwindEdge::default(),
                 callee_identity: None,
+                callee_key: None,
             },
             Terminator::TailCall {
                 func: "g".to_string(),
@@ -14316,6 +16376,7 @@ mod model_write_channel_tests {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
             },
             Terminator::Assert {
                 cond: Operand::Copy(whole(1)),
@@ -14347,6 +16408,79 @@ mod model_write_channel_tests {
                     "{stmt:?} (local {local}): channel {channel:?} contradicts {:?}",
                     stmt.write_effect()
                 );
+            }
+        }
+    }
+
+    /// TINV step 4: the place-level classification never contradicts the coarser
+    /// `write_effect`, for every statement and terminator variant.
+    #[test]
+    fn every_variant_place_writes_agrees_with_its_write_effect() {
+        for stmt in every_statement() {
+            let writes = stmt.place_writes();
+            assert!(writes.agrees_with(stmt.write_effect()), "{stmt:?}: {writes:?}");
+        }
+        for term in every_terminator() {
+            let writes = term.place_writes();
+            assert!(writes.agrees_with(term.write_effect()), "{term:?}: {writes:?}");
+        }
+    }
+
+    #[test]
+    fn place_writes_pins_each_channel() {
+        let assign = |rvalue| Statement::Assign { place: whole(1), rvalue, span: span() };
+        let raw = assign(Rvalue::AddressOf(false, whole(2)));
+        assert_eq!(
+            raw.place_writes(),
+            PlaceWrites::Places(vec![
+                (&whole(1), PlaceWriteChannel::Store),
+                (&whole(2), PlaceWriteChannel::RawBorrow { mutable: false }),
+            ])
+        );
+        let borrow = assign(Rvalue::Ref { mutable: true, place: whole(3) });
+        assert_eq!(
+            borrow.place_writes(),
+            PlaceWrites::Places(vec![
+                (&whole(1), PlaceWriteChannel::Store),
+                (&whole(3), PlaceWriteChannel::MutBorrow),
+            ])
+        );
+        let shared = assign(Rvalue::Ref { mutable: false, place: whole(3) });
+        assert_eq!(
+            shared.place_writes(),
+            PlaceWrites::Places(vec![(&whole(1), PlaceWriteChannel::Store)])
+        );
+        // An unsupported rvalue still stores to its known destination; its operand
+        // places are reported separately as possible aliases.
+        let unsupported = assign(Rvalue::Unsupported {
+            kind: "PointerCoercion".to_string(),
+            detail: String::new(),
+            operands: vec![Operand::Copy(whole(4)), Operand::Move(whole(5))],
+        });
+        assert_eq!(
+            unsupported.place_writes(),
+            PlaceWrites::Places(vec![(&whole(1), PlaceWriteChannel::Store)])
+        );
+        assert_eq!(unsupported.unsupported_rvalue_operands(), vec![&whole(4), &whole(5)]);
+        assert!(shared.unsupported_rvalue_operands().is_empty());
+        for term in every_terminator() {
+            match (&term, term.place_writes()) {
+                (Terminator::Drop { place, .. }, PlaceWrites::Places(w)) => {
+                    assert_eq!(w, vec![(place, PlaceWriteChannel::DropGlue)]);
+                }
+                (Terminator::TailCall { args, .. }, PlaceWrites::Places(w)) => {
+                    assert_eq!(w, vec![(&whole(0), PlaceWriteChannel::TailCallReturn)]);
+                    assert!(term.call_args().is_some_and(|a| std::ptr::eq(a, args.as_slice())));
+                }
+                (Terminator::Call { dest, args, .. }, PlaceWrites::Places(w)) => {
+                    assert_eq!(w, vec![(dest, PlaceWriteChannel::CallDest)]);
+                    assert!(term.call_args().is_some_and(|a| std::ptr::eq(a, args.as_slice())));
+                }
+                (Terminator::Opaque { .. }, w) => assert_eq!(w, PlaceWrites::Unlocatable),
+                (_, w) => {
+                    assert_eq!(w, PlaceWrites::None, "{term:?}");
+                    assert!(term.call_args().is_none());
+                }
             }
         }
     }
@@ -14461,17 +16595,20 @@ mod const_value_classifier_pin {
             | ConstValue::FloatBits { .. } => "scalar",
             ConstValue::Unit => "unit",
             ConstValue::Str { .. } => "str",
-            ConstValue::OpaqueConst
+            ConstValue::OpaqueConst(_)
             | ConstValue::UnitVariantRef { .. }
+            | ConstValue::EmptyClosureRef { .. }
             | ConstValue::StructScalarFieldsRef { .. } => "opaque-reference",
             ConstValue::OpaqueScalar { .. } | ConstValue::ConstParam { .. } => "opaque-scalar",
             ConstValue::CallableItem { .. } => "callable",
+            ConstValue::MemoryImage(_) => "memory-image",
         }
     }
 
     #[test]
     fn every_variant_is_classified_and_the_opaque_reference_bucket_matches() {
         let samples = [
+            (crate::test_utils::make_memory_image_constant(0), "memory-image"),
             (ConstValue::Bool(true), "scalar"),
             (ConstValue::Int(-1), "scalar"),
             (ConstValue::Uint(1, 8), "scalar"),
@@ -14479,19 +16616,14 @@ mod const_value_classifier_pin {
             (ConstValue::FloatBits { bits: 0, width: 32 }, "scalar"),
             (ConstValue::Unit, "unit"),
             (ConstValue::Str { bytes: vec![] }, "str"),
-            (ConstValue::OpaqueConst, "opaque-reference"),
+            (ConstValue::opaque_const(), "opaque-reference"),
+            (ConstValue::unit_variant_ref("e", 0), "opaque-reference"),
+            (ConstValue::empty_closure_ref("f::{closure#0}"), "opaque-reference"),
             (
-                ConstValue::UnitVariantRef { enum_name: "e".into(), variant: 0 },
+                ConstValue::struct_scalar_fields_ref("s", vec![ConstValue::Uint(7, 8)]),
                 "opaque-reference",
             ),
-            (
-                ConstValue::StructScalarFieldsRef {
-                    adt_name: "s".into(),
-                    fields: vec![ConstValue::Uint(7, 8)],
-                },
-                "opaque-reference",
-            ),
-            (ConstValue::OpaqueScalar { width: 8, signed: false }, "opaque-scalar"),
+            (ConstValue::opaque_scalar(8, false), "opaque-scalar"),
             (
                 ConstValue::ConstParam { index: 0, name: "N".into(), width: 64, signed: false },
                 "opaque-scalar",
@@ -14515,14 +16647,14 @@ mod const_value_classifier_pin {
     /// dump) still deserializes — externally tagged by name, position-independent.
     #[test]
     fn struct_scalar_fields_ref_serde_round_trip_and_old_dumps_unaffected() {
-        let v = ConstValue::StructScalarFieldsRef {
-            adt_name: "icu_properties::props::BidiClass".into(),
-            fields: vec![ConstValue::Uint(5, 8)],
-        };
+        let v = ConstValue::struct_scalar_fields_ref(
+            "icu_properties::props::BidiClass",
+            vec![ConstValue::Uint(5, 8)],
+        );
         let j = serde_json::to_string(&v).expect("serializes");
         let back: ConstValue = serde_json::from_str(&j).expect("round-trips");
         match back {
-            ConstValue::StructScalarFieldsRef { adt_name, fields } => {
+            ConstValue::StructScalarFieldsRef { adt_name, fields, .. } => {
                 assert_eq!(adt_name, "icu_properties::props::BidiClass");
                 // Trust: `ConstValue` deliberately has NO `PartialEq` — an opaque
                 // reference carrier's equality is UNKNOWN (never `Some(false)`), so a
@@ -14538,6 +16670,6 @@ mod const_value_classifier_pin {
             other => panic!("wrong variant: {other:?}"),
         }
         let old: ConstValue = serde_json::from_str("\"OpaqueConst\"").expect("old dumps still read");
-        assert!(matches!(old, ConstValue::OpaqueConst));
+        assert!(matches!(old, ConstValue::OpaqueConst(_)));
     }
 }

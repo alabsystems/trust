@@ -1,0 +1,28 @@
+# Shared memory-admission protocol and its standalone daemon. Solver backends
+# belong to trust-router; starting or building the coordinator does not need them.
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "trust-coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "trustd"
+path = "src/bin/trustd.rs"
+
+[dependencies]
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+trust-budget = { workspace = true }
+trust-file-lock = { workspace = true }
+# Admission receipts require OS-random incarnations, never PID/time substitutes.
+trust-rand = { workspace = true }

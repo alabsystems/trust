@@ -129,6 +129,7 @@ fn call_in_loop(latch: Latch) -> VerifiableFunction {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         unwind: UnwindEdge::Unreachable,
                     },
                 },
@@ -151,6 +152,7 @@ fn call_in_loop(latch: Latch) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

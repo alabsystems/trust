@@ -176,17 +176,11 @@ case "$MODE" in
         run bash "$TRUST_ROOT/tests/e2e_trust_installed_toolchain.sh" --set-default
         ;;
     public-distribution-diagnostic)
-        section "Public distribution root local diagnostic"
-        run bash "$TRUST_ROOT/tests/e2e_public_distribution_roots.sh"
-        section "Owned internal repo public-version gate"
-        run env TRUST_REQUIRE_RELEASED_INTERNAL_REPOS=1 bash "$TRUST_ROOT/tests/e2e_internal_repo_public_versions.sh"
-        section "Owned public dependency source gate"
-        run python3 "$TRUST_ROOT/tests/test_owned_dependency_sources.py"
+        echo "public-distribution-diagnostic: retired — every gate it ran was culled in 8c9a3d01bb; the canonical lane is targo trust domination trust-added --release public-distribution" >&2
+        exit 2
         ;;
     prepublish-diagnostic)
         section "Pre-publish local rehearsal"
-        section "Public distribution root diagnostic"
-        run bash "$TRUST_ROOT/tests/e2e_public_distribution_roots.sh"
         section "Pre-publish dist artifact rehearsal"
         require_script "$TRUST_ROOT/tests/e2e_trust_dist_artifacts.sh"
         run bash "$TRUST_ROOT/tests/e2e_trust_dist_artifacts.sh"
@@ -194,18 +188,18 @@ case "$MODE" in
         run bash "$TRUST_ROOT/tests/e2e_trust_local_rustup_install.sh"
         ;;
     stage0-lineage-diagnostic)
-        section "Bootstrap stage0 lineage local diagnostic"
-        run bash "$TRUST_ROOT/tests/e2e_trust_stage0_lineage.sh"
+        echo "stage0-lineage-diagnostic: retired — e2e_trust_stage0_lineage.sh was culled in 8c9a3d01bb; the canonical lane is targo trust domination trust-added --release stage0-lineage" >&2
+        exit 2
         ;;
     parity)
         section "Baseline parity"
         run bash "$TRUST_ROOT/tests/e2e_semantic_parity.sh"
-        run ./x.py test --stage 2 tests/ui tests/run-make tests/mir-opt tests/codegen tests/codegen-units tests/incremental tests/ui-fulldeps tests/rustdoc-ui
+        run ./x.py test --stage 2 tests/ui tests/run-make tests/mir-opt tests/codegen-llvm tests/codegen-units tests/incremental tests/ui-fulldeps tests/rustdoc-ui
         ;;
     full)
         section "Baseline parity"
         run bash "$TRUST_ROOT/tests/e2e_semantic_parity.sh"
-        run ./x.py test --stage 2 tests/ui tests/run-make tests/mir-opt tests/codegen tests/codegen-units tests/incremental tests/ui-fulldeps tests/rustdoc-ui
+        run ./x.py test --stage 2 tests/ui tests/run-make tests/mir-opt tests/codegen-llvm tests/codegen-units tests/incremental tests/ui-fulldeps tests/rustdoc-ui
         run_launch_gate
         section "Verifier-example regression diagnostic (not proof or release evidence)"
         run bash "$TRUST_ROOT/tests/e2e_verify_suite.sh"

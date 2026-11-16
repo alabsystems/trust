@@ -81,8 +81,16 @@ impl AttrProcMacro for ExpandTrustEnsures {
 /// handed to the parser is then byte-for-byte the stream the author would have
 /// produced by writing the first-class clause directly, so
 ///
-///     #[trust::decreases(e)]  fn f(..) -> T { .. }
-///     fn f(..) -> T decreases e { .. }
+/// Trust: the two surfaces live in distinct modules with a complete typed payload.
+/// ```rust
+/// mod compatibility {
+///     #[trust::decreases(e)]
+///     pub fn f(e: u32) -> u32 { e }
+/// }
+/// mod native {
+///     pub fn f(e: u32) -> u32 decreases e { e }
+/// }
+/// ```
 ///
 /// cannot diverge: there is nothing to diverge, only one parse and one lane.
 /// That is design-of-record v3's "attribute spellings = compat desugaring only"
@@ -107,12 +115,14 @@ fn expand_trust_native_clause_tts(
     // clause diagnostics point at.
     let ident_span = ecx.with_def_site_ctxt(attr_span);
     expand_contract_clause(ecx, attr_span, annotated, |new_tts| {
-        new_tts.push_tree(TokenTree::Token(
+        // Upstream 1.101: the injector writes into a plain `Vec<TokenTree>`
+        // (the old `push_tree` builder API is gone).
+        new_tts.push(TokenTree::Token(
             token::Token::from_ast_ident(Ident::new(clause_ident, ident_span)),
             Spacing::Alone,
         ));
         for tt in annotation.iter() {
-            new_tts.push_tree(tt.clone());
+            new_tts.push(tt.clone());
         }
         Ok(())
     })
@@ -200,7 +210,7 @@ impl AttrProcMacro for ExpandTrustInvariant {
                  `#[trust::ensures(move |r: &T| <predicate>)]`",
             )
             .with_help("otherwise delete the attribute: leaving it in place states nothing")
-            .emit())
+            .emit_err())
     }
 }
 
@@ -223,9 +233,9 @@ fn expand_contract_clause(
     ecx: &mut ExtCtxt<'_>,
     attr_span: Span,
     annotated: TokenStream,
-    inject: impl FnOnce(&mut TokenStream) -> Result<(), ErrorGuaranteed>,
+    inject: impl FnOnce(&mut Vec<TokenTree>) -> Result<(), ErrorGuaranteed>,
 ) -> Result<TokenStream, ErrorGuaranteed> {
-    let mut new_tts = TokenStream::default();
+    let mut new_tts = vec![];
     let mut cursor = annotated.iter();
 
     let is_kw = |tt: &TokenTree, sym: Symbol| {
@@ -235,7 +245,7 @@ fn expand_contract_clause(
     // Find the `fn` keyword to check if this is a function.
     if cursor
         .find(|tt| {
-            new_tts.push_tree((*tt).clone());
+            new_tts.push((*tt).clone());
             is_kw(tt, kw::Fn)
         })
         .is_none()
@@ -277,7 +287,7 @@ fn expand_contract_clause(
         if is_kw(tt, kw::Where) {
             break tt;
         }
-        new_tts.push_tree(tt.clone());
+        new_tts.push(tt.clone());
     };
 
     // At this point, we've transcribed everything from the `fn` through the formal parameter list
@@ -289,9 +299,9 @@ fn expand_contract_clause(
 
     // Above we injected the internal AST requires/ensures construct. Now copy over all the other
     // token trees.
-    new_tts.push_tree(next_tt.clone());
+    new_tts.push(next_tt.clone());
     while let Some(tt) = cursor.next() {
-        new_tts.push_tree(tt.clone());
+        new_tts.push(tt.clone());
         if cursor.peek().is_none()
             && !matches!(tt, TokenTree::Delimited(_, _, token::Delimiter::Brace, _))
         {
@@ -302,7 +312,7 @@ fn expand_contract_clause(
         }
     }
 
-    Ok(new_tts)
+    Ok(TokenStream::new(new_tts))
 }
 
 fn expand_contract_clause_tts(
@@ -312,13 +322,28 @@ fn expand_contract_clause_tts(
     annotated: TokenStream,
     clause_keyword: rustc_span::Symbol,
 ) -> Result<TokenStream, ErrorGuaranteed> {
+    if annotation.is_empty() {
+        let (name, example) = if clause_keyword == kw::ContractRequires {
+            ("requires", "condition")
+        } else {
+            ("ensures", "|result: &T| condition")
+        };
+        ecx.sess.dcx().span_err(
+            attr_span,
+            format!("`{name}` attribute requires an argument, e.g., `#[{name}({example})]`"),
+        );
+        // Returning `Err` would replace it with a dummy fragment and cause cascading name-resolution errors.
+        // Instead, we return the original token stream so that there is no later noises.
+        return Ok(annotated);
+    }
+
     let feature_span = ecx.with_def_site_ctxt(attr_span);
     expand_contract_clause(ecx, attr_span, annotated, |new_tts| {
-        new_tts.push_tree(TokenTree::Token(
+        new_tts.push(TokenTree::Token(
             token::Token::from_ast_ident(Ident::new(clause_keyword, feature_span)),
             Spacing::Joint,
         ));
-        new_tts.push_tree(TokenTree::Delimited(
+        new_tts.push(TokenTree::Delimited(
             DelimSpan::from_single(attr_span),
             DelimSpacing::new(Spacing::JointHidden, Spacing::JointHidden),
             token::Delimiter::Brace,

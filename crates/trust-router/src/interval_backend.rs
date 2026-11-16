@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 // trust-router/interval_backend.rs: In-process interval/range backend
 //
 // A self-contained abstract-interpretation backend that discharges *bounded*
@@ -20,6 +21,9 @@
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
+
+use std::borrow::Cow;
+use std::sync::OnceLock;
 
 use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::*;
@@ -65,8 +69,20 @@ impl Interval {
     /// on `is_finite()` before concluding "in range", so an empty (contradictory)
     /// interval — whose endpoints are both concrete but crossed — must NOT count
     /// as finite, or it would vacuously satisfy any range check.
+    /// The endpoints, when this interval is finite and well-ordered.
+    ///
+    /// This is `is_finite` with the endpoints CARRIED OUT, so a caller that
+    /// needs them does not have to assert what the predicate already decided.
+    /// Every `is_finite() && lo.unwrap() ..` site was exactly that assertion.
+    fn bounds(&self) -> Option<(i128, i128)> {
+        match (self.lo, self.hi) {
+            (Some(l), Some(h)) if l <= h => Some((l, h)),
+            _ => None,
+        }
+    }
+
     fn is_finite(&self) -> bool {
-        matches!((self.lo, self.hi), (Some(l), Some(h)) if l <= h)
+        self.bounds().is_some()
     }
 
     /// `true` iff `v` is NOT provably excluded by this (over-approximated)
@@ -162,17 +178,14 @@ impl Interval {
                     ah.checked_mul(bl),
                     ah.checked_mul(bh),
                 ];
-                if corners.iter().any(Option::is_none) {
+                // One destructure decides and BINDS: an overflowed corner is
+                // still TOP, and the four values come out named instead of
+                // being unwrapped back out of the array the test just checked.
+                let [Some(c0), Some(c1), Some(c2), Some(c3)] = corners else {
                     return Interval::TOP;
-                }
-                let vals: [i128; 4] = [
-                    corners[0].unwrap(),
-                    corners[1].unwrap(),
-                    corners[2].unwrap(),
-                    corners[3].unwrap(),
-                ];
-                let lo = *vals.iter().min().unwrap();
-                let hi = *vals.iter().max().unwrap();
+                };
+                let lo = c0.min(c1).min(c2).min(c3);
+                let hi = c0.max(c1).max(c2).max(c3);
                 Interval::range(lo, hi)
             }
             _ => Interval::TOP,
@@ -331,25 +344,32 @@ fn bool_var_name(f: &Formula) -> Option<&str> {
 /// Abstract environment for one VC: per-variable range constraints plus
 /// per-variable definitions (block-def equalities) used to refine them.
 struct IntervalEnv<'a> {
-    bounds: FxHashMap<String, Interval>,
-    defs: FxHashMap<String, &'a Formula>,
+    bounds: FxHashMap<&'a str, Interval>,
+    defs: FxHashMap<&'a str, &'a Formula>,
+    has_var_alias: bool,
+    canon_cache: std::cell::OnceCell<FxHashMap<&'a str, &'a str>>,
 }
 
 impl<'a> IntervalEnv<'a> {
     fn new() -> Self {
-        IntervalEnv { bounds: FxHashMap::default(), defs: FxHashMap::default() }
+        IntervalEnv {
+            bounds: FxHashMap::default(),
+            defs: FxHashMap::default(),
+            has_var_alias: false,
+            canon_cache: std::cell::OnceCell::new(),
+        }
     }
 
-    fn add_lower(&mut self, name: &str, c: i128) {
-        let e = self.bounds.entry(name.to_string()).or_insert(Interval::TOP);
+    fn add_lower(&mut self, name: &'a str, c: i128) {
+        let e = self.bounds.entry(name).or_insert(Interval::TOP);
         e.lo = Some(match e.lo {
             Some(x) => x.max(c),
             None => c,
         });
     }
 
-    fn add_upper(&mut self, name: &str, c: i128) {
-        let e = self.bounds.entry(name.to_string()).or_insert(Interval::TOP);
+    fn add_upper(&mut self, name: &'a str, c: i128) {
+        let e = self.bounds.entry(name).or_insert(Interval::TOP);
         e.hi = Some(match e.hi {
             Some(x) => x.min(c),
             None => c,
@@ -362,6 +382,20 @@ impl<'a> IntervalEnv<'a> {
             .get(name)
             .copied()
             .or_else(|| {
+                // The multiply lanes' fresh bit-vector operand aliases
+                // `__trust_ovf_bv_{lhs,rhs}_{base}` read `{base}`'s recorded bound.
+                //
+                // Trust: 2026-11-09 (WRAPPING-SUB-AND-INTERVAL-NEG-1) — the 128-bit
+                // NEGATION alias `__trust_ovf_bv_neg_{base}` (added here 2026-09-21)
+                // is no longer read here. Its one consumer, `prove_neg_no_overflow`,
+                // compared the alias's interval with the SIGNED type minimum, but this
+                // environment reads every bit-vector OPERATION as its UNSIGNED value, so
+                // an alias defined `== bvshl(1, amt)` evaluated `[0, ∞)` and a negation
+                // that overflows at `amt = 127` was PROVED. That prover now evaluates the
+                // obligation's Int-sorted SUBJECT `{base}` itself (the same identity
+                // `neg_goal_is_subject` authenticates), which carries this bound and its
+                // signed definitions directly, so the guarded `if a >= MIN + 1 { -a }`
+                // keeps its interval proof without a signed bound on a bit-vector name.
                 name.strip_prefix("__trust_ovf_bv_lhs_")
                     .or_else(|| name.strip_prefix("__trust_ovf_bv_rhs_"))
                     .and_then(|base| self.bounds.get(base).copied())
@@ -376,7 +410,31 @@ impl<'a> IntervalEnv<'a> {
         // unbounded. SOUNDNESS: the floor is a true lower bound on every length, so
         // it only ever TIGHTENS the interval (never admits a value the type cannot
         // hold); it is intersected with any recorded bound below.
-        if name.ends_with("_slice_len") {
+        //
+        // That argument holds only for a name trust-vcgen MINTED as a length, and
+        // the minted spelling is the RESERVED `__slice_len` (double underscore,
+        // `generate::path_defs::SLICE_LEN_SUFFIX`). A source local whose name
+        // contains `__` never reaches a formula under its own name:
+        // `trust_types::source_contract_synthetic_name_collision` classifies it as
+        // generated metadata and `place_to_var_name` demotes it to `_<local>`.
+        // A const-generic PARAMETER's name reaches a formula inside
+        // `__trust_constparam_{index}_{name}`, and until the const-parameter half
+        // of SLICE-LEN-NAME-1 (2026-10-05) the name was copied in as written, so
+        // `const n__slice_len: i8` minted a symbol this floor (and trust-vcgen's
+        // length facts) read as a length: `n__slice_len - 1` was kernel-certified
+        // and its check elided. `trust_types::const_param_symbol` now encodes any
+        // name that could spell `__` (`tests/ui/trust/const_param_slice_len_name.rs`).
+        // The suffix is reserved only as far as every MINT keeps user spellings
+        // out of it; a new mint that copies a user name in must encode it too.
+        // SLICE-LEN-NAME-1 (2026-10-05): this test read `ends_with("_slice_len")`,
+        // which a SOURCE name satisfies — `fn dec(x_slice_len: i8) -> i8 {
+        // x_slice_len - 1 }` floored a signed parameter at 0, this lane proved the
+        // subtraction, and the bridge's interval hold committed that proof over
+        // ay's refutation at `x_slice_len = -128` (default policy rc 0, measured
+        // on the stage 1 of `76a6ea45b2`; `tests/ui/trust/
+        // interval_slice_len_param_name.rs`). Every other consumer of the
+        // length symbol already keys on the double underscore.
+        if name.ends_with("__slice_len") {
             recorded.intersect(Interval { lo: Some(0), hi: None })
         } else {
             recorded
@@ -400,26 +458,34 @@ impl<'a> IntervalEnv<'a> {
     fn record_eq_def(&mut self, a: &'a Formula, b: &'a Formula) {
         match (var_name(a), var_name(b)) {
             (Some(na), Some(nb)) if na != nb => {
-                self.defs.entry(na.to_string()).or_insert(b);
-                self.defs.entry(nb.to_string()).or_insert(a);
+                self.has_var_alias = true;
+                let _ = self.canon_cache.take();
+                self.defs.entry(na).or_insert(b);
+                self.defs.entry(nb).or_insert(a);
             }
             (Some(na), _) => {
-                self.defs.insert(na.to_string(), b);
+                if self.has_var_alias {
+                    let _ = self.canon_cache.take();
+                }
+                self.defs.insert(na, b);
             }
             (_, Some(nb)) => {
-                self.defs.insert(nb.to_string(), a);
+                if self.has_var_alias {
+                    let _ = self.canon_cache.take();
+                }
+                self.defs.insert(nb, a);
             }
             _ => {}
         }
     }
 
-    fn eval_var(&self, name: &str, visiting: &mut FxHashSet<String>) -> Interval {
+    fn eval_var(&self, name: &'a str, visiting: &mut FxHashSet<&'a str>) -> Interval {
         let base = self.bound_of(name);
         if visiting.contains(name) {
             return base; // break definitional cycles soundly
         }
-        if let Some(def) = self.defs.get(name) {
-            visiting.insert(name.to_string());
+        if let Some(&def) = self.defs.get(name) {
+            visiting.insert(name);
             let from_def = self.eval(def, visiting);
             visiting.remove(name);
             base.intersect(from_def)
@@ -449,37 +515,58 @@ impl<'a> IntervalEnv<'a> {
     /// replacing each by a single class representative is exact substitution of
     /// equals for equals — it adds no model and removes none. Non-aliased vars are
     /// never merged (each is its own singleton class -> returns itself).
-    fn canonical_var(&self, name: &str) -> String {
-        let mut best = name.to_string();
-        let mut seen: FxHashSet<String> = FxHashSet::default();
-        let mut stack = vec![name.to_string()];
-        while let Some(cur) = stack.pop() {
-            if !seen.insert(cur.clone()) {
-                continue;
-            }
-            if cur.as_str() < best.as_str() {
-                best = cur.clone();
-            }
-            // Follow ONLY bare-`Var`/`SymVar` alias defs (an equality between two
-            // vars), in BOTH directions: `defs[cur] = Var(other)` adds `other`,
-            // and any `name` whose def is `Var(cur)` (the reverse edge) is added.
-            if let Some(def) = self.defs.get(cur.as_str())
-                && let Some(other) = var_name(def)
-                && !seen.contains(other)
+    fn canonical_var(&self, name: &'a str) -> &'a str {
+        if !self.has_var_alias {
+            return name;
+        }
+        let cache = self.canon_cache.get_or_init(|| self.build_canonical_var_map());
+        cache.get(name).copied().unwrap_or(name)
+    }
+
+    fn build_canonical_var_map(&self) -> FxHashMap<&'a str, &'a str> {
+        let mut adj: FxHashMap<&'a str, Vec<&'a str>> = FxHashMap::default();
+        for (&k, &v) in &self.defs {
+            if let Some(other) = var_name(v)
+                && other != k
             {
-                stack.push(other.to_string());
-            }
-            for (k, v) in &self.defs {
-                if var_name(v) == Some(cur.as_str()) && !seen.contains(k) {
-                    stack.push(k.clone());
-                }
+                adj.entry(k).or_default().push(other);
+                adj.entry(other).or_default().push(k);
             }
         }
-        best
+        let mut map: FxHashMap<&'a str, &'a str> = FxHashMap::default();
+        let mut seen: FxHashSet<&'a str> = FxHashSet::default();
+        let mut component: Vec<&'a str> = Vec::new();
+        let mut stack: Vec<&'a str> = Vec::new();
+        for &start in adj.keys() {
+            if !seen.insert(start) {
+                continue;
+            }
+            component.clear();
+            component.push(start);
+            stack.push(start);
+            let mut best = start;
+            while let Some(cur) = stack.pop() {
+                if cur < best {
+                    best = cur;
+                }
+                if let Some(neighbors) = adj.get(cur) {
+                    for &next in neighbors {
+                        if seen.insert(next) {
+                            component.push(next);
+                            stack.push(next);
+                        }
+                    }
+                }
+            }
+            for &member in &component {
+                map.insert(member, best);
+            }
+        }
+        map
     }
 
     /// Sound interval over-approximation of an integer/bitvector expression.
-    fn eval(&self, f: &Formula, visiting: &mut FxHashSet<String>) -> Interval {
+    fn eval(&self, f: &'a Formula, visiting: &mut FxHashSet<&'a str>) -> Interval {
         match f {
             Formula::Int(n) => Interval::cst(*n),
             Formula::UInt(n) => i128::try_from(*n).map_or(Interval::TOP, Interval::cst),
@@ -847,33 +934,33 @@ fn parse_bounds_goal(conj: &Formula) -> Option<BoundsGoal<'_>> {
 /// cannot see that `(len - 1) - len = -1 < 0` because it treats the two `len`
 /// occurrences as independent, but the affine DIFFERENCE cancels them exactly.
 #[derive(Clone, Default)]
-struct Affine {
+struct Affine<'a> {
     constant: i128,
-    terms: FxHashMap<String, i128>,
+    terms: FxHashMap<&'a str, i128>,
 }
 
-impl Affine {
-    fn cst(c: i128) -> Affine {
+impl<'a> Affine<'a> {
+    fn cst(c: i128) -> Affine<'a> {
         Affine { constant: c, terms: FxHashMap::default() }
     }
 
-    fn var(name: &str) -> Affine {
+    fn var(name: &'a str) -> Affine<'a> {
         let mut terms = FxHashMap::default();
-        terms.insert(name.to_string(), 1i128);
+        terms.insert(name, 1i128);
         Affine { constant: 0, terms }
     }
 
-    fn add(mut self, other: &Affine) -> Option<Affine> {
+    fn add(mut self, other: &Affine<'a>) -> Option<Affine<'a>> {
         self.constant = self.constant.checked_add(other.constant)?;
-        for (k, v) in &other.terms {
-            let e = self.terms.entry(k.clone()).or_insert(0);
+        for (&k, v) in &other.terms {
+            let e = self.terms.entry(k).or_insert(0);
             *e = e.checked_add(*v)?;
         }
         self.terms.retain(|_, c| *c != 0);
         Some(self)
     }
 
-    fn neg(mut self) -> Option<Affine> {
+    fn neg(mut self) -> Option<Affine<'a>> {
         self.constant = self.constant.checked_neg()?;
         for v in self.terms.values_mut() {
             *v = v.checked_neg()?;
@@ -881,7 +968,7 @@ impl Affine {
         Some(self)
     }
 
-    fn scale(mut self, k: i128) -> Option<Affine> {
+    fn scale(mut self, k: i128) -> Option<Affine<'a>> {
         self.constant = self.constant.checked_mul(k)?;
         for v in self.terms.values_mut() {
             *v = v.checked_mul(k)?;
@@ -902,11 +989,11 @@ impl Affine {
 /// caller then falls back to interval reasoning. SOUND: the affine form is an
 /// EXACT linearization of the expression (no over-approximation), so a proof
 /// derived from it about a sign/strict-inequality is valid for the real value.
-fn affine_of(
-    f: &Formula,
-    env: &IntervalEnv<'_>,
-    visiting: &mut FxHashSet<String>,
-) -> Option<Affine> {
+fn affine_of<'a>(
+    f: &'a Formula,
+    env: &IntervalEnv<'a>,
+    visiting: &mut FxHashSet<&'a str>,
+) -> Option<Affine<'a>> {
     match f {
         Formula::Int(n) => Some(Affine::cst(*n)),
         Formula::UInt(n) => i128::try_from(*n).ok().map(Affine::cst),
@@ -942,7 +1029,7 @@ fn affine_of(
             // exact equals-for-equals over a true top-level equality.)
             let canon = env.canonical_var(name);
             if visiting.contains(name) {
-                return Some(Affine::var(&canon));
+                return Some(Affine::var(canon));
             }
             // Expand through a block-def equality when present; else the var is
             // an atom NAMED BY ITS ALIAS-CANONICAL REPRESENTATIVE. (A def whose rhs
@@ -951,13 +1038,13 @@ fn affine_of(
             // e.g. `_45 = _46.0 = len - 1`, reaches `len - 1`); the mutual two-way
             // alias `len#s0_0 <-> bytes__slice_len` terminates at the shared
             // canonical atom via the cycle-safe `visiting` guard.
-            if let Some(def) = env.defs.get(name) {
-                visiting.insert(name.to_string());
+            if let Some(&def) = env.defs.get(name) {
+                visiting.insert(name);
                 let r = affine_of(def, env, visiting);
                 visiting.remove(name);
-                r.or_else(|| Some(Affine::var(&canon)))
+                r.or_else(|| Some(Affine::var(canon)))
             } else {
-                Some(Affine::var(&canon))
+                Some(Affine::var(canon))
             }
         }
         _ => None,
@@ -973,9 +1060,9 @@ fn affine_of(
 /// `Eq(var, expr)` hypothesis, so the resolved expression equals `f` in every model.
 fn resolve_def<'a>(env: &'a IntervalEnv<'a>, f: &'a Formula) -> &'a Formula {
     let mut cur = f;
-    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut seen: FxHashSet<&'a str> = FxHashSet::default();
     while let Some(name) = var_name(cur) {
-        if !seen.insert(name.to_string()) {
+        if !seen.insert(name) {
             break; // cycle
         }
         match env.defs.get(name) {
@@ -1002,7 +1089,11 @@ fn resolve_def<'a>(env: &'a IntervalEnv<'a>, f: &'a Formula) -> &'a Formula {
 ///      `base`'s affine form equals `len`'s and `len`'s recorded lower bound is
 ///      `>= 1`. This is the `bytes[len / 2]` case. SOUND: `floor(x/k) <= x - 1`
 ///      for every integer `x >= 1, k >= 2` (since `floor(x/k) <= x/2 <= x - 1`).
-fn prove_index_lt_len_relational(env: &IntervalEnv<'_>, index: &Formula, len: &Formula) -> bool {
+fn prove_index_lt_len_relational<'a>(
+    env: &'a IntervalEnv<'a>,
+    index: &'a Formula,
+    len: &'a Formula,
+) -> bool {
     // Route 1: affine difference len - index >= 1.
     let mut v = FxHashSet::default();
     if let (Some(len_aff), Some(idx_aff)) = (affine_of(len, env, &mut v), {
@@ -1078,7 +1169,7 @@ fn prove_in_bounds(formula: &Formula) -> bool {
     // `Not(in_range)` twin routed here as a bounds VC simply yields no bounds goal
     // -> declines). Owned conjuncts; we borrow into `&Formula` below.
     let conjuncts_owned = normalized_conjuncts(formula);
-    let conjuncts: Vec<&Formula> = conjuncts_owned.iter().collect();
+    let conjuncts: Vec<&Formula> = conjuncts_owned.iter().map(Cow::as_ref).collect();
 
     // Exactly one violation goal — otherwise the (index, len) pairing is
     // ambiguous and we decline rather than risk an unsound match.
@@ -1154,7 +1245,7 @@ fn prove_in_bounds(formula: &Formula) -> bool {
     if goal.signed && index_iv.lo.is_none() {
         return false;
     }
-    let lower_ok = !goal.signed || index_iv.lo.unwrap() >= 0;
+    let lower_ok = !goal.signed || index_iv.lo.is_some_and(|lo| lo >= 0);
     if !lower_ok {
         return false;
     }
@@ -1167,8 +1258,13 @@ fn prove_in_bounds(formula: &Formula) -> bool {
     //       shared `len`), or the `len / k < len` div rule. Proves the correlated
     //       cases `bytes[len - 1]`, `bytes[len - 8..]`, `bytes[len / 2]` that the
     //       independent rule cannot (their index.hi is NOT below len.lo).
-    let independent_ok =
-        len_iv.is_finite() && len_iv.lo.unwrap() >= 1 && index_iv.hi.unwrap() < len_iv.lo.unwrap();
+    let independent_ok = match (len_iv.bounds(), index_iv.hi) {
+        (Some((len_lo, _)), Some(index_hi)) => len_lo >= 1 && index_hi < len_lo,
+        // An open endpoint proves nothing here, which is what the two
+        // `is_none` guards above already decided; this says it once more
+        // without asserting it.
+        _ => false,
+    };
     independent_ok || prove_index_lt_len_relational(&env, goal.index, goal.len)
 }
 
@@ -1283,18 +1379,30 @@ fn prove_cast_lossless(formula: &Formula) -> bool {
 
     let mut visiting = FxHashSet::default();
     let value_iv = env.eval(goal.value, &mut visiting);
-    value_iv.is_finite() && value_iv.lo.unwrap() >= goal.min && value_iv.hi.unwrap() <= goal.max
+    value_iv.bounds().is_some_and(|(lo, hi)| lo >= goal.min && hi <= goal.max)
 }
 
 /// Lower bound (exclusive) a constant must reach to count as an
 /// unbounded-allocation FAILURE threshold rather than an ordinary range/shift
 /// guard. trust-vcgen emits the allocation-availability violation atom as
-/// `Ge(count, 1 << 28)` (element ceiling), `Ge(stride * count, 256 MiB)`
-/// (availability byte budget) and `Ge(stride * count, isize::MAX)`
-/// (capacity-overflow) — every legitimate failure constant is well above any
+/// `Ge(count, 1 << 28)` (element ceiling) and `Ge(stride * count, isize::MAX)`
+/// (capacity-overflow, the object limit; the 256 MiB byte budget that stood
+/// between them was deleted with trust-ir's `ALLOC_BYTE_BUDGET`) — every
+/// legitimate failure constant is well above any
 /// real loop/shift guard threshold (`_2 < 64`, `len <= isize::MAX` is itself a
 /// fact, not a goal). We require the threshold to be at or above the element
 /// ceiling so a small guard comparison is never mistaken for a violation atom.
+///
+/// Trust (2026-10-08): this is a CONTRACT with trust-vcgen, not only a filter.
+/// `prove_alloc_bounded`'s Case B reads a failure disjunct this does not
+/// recognize as a branch that allocates nothing, so a failure atom against a
+/// smaller constant would be dismissed and the row proved from its other atoms.
+/// trust-vcgen keeps every capacity atom's constant at or above this value
+/// (`generate::alloc_vcs::capacity_atom` re-spells a lower line
+/// `scale * count + shift >= 2^28`); a negative line — a live receiver on a
+/// target without the live-address-space bound, a table of a `2^59`-byte value —
+/// was dismissed before that (`alloc_width_receiver_tests::
+/// every_failing_row_stays_unproved_by_the_interval_lane`).
 const ALLOC_VIOLATION_MIN_THRESHOLD: i128 = 1 << 28;
 
 /// A single allocation-availability/capacity violation atom `Ge(term, C)` or
@@ -1331,7 +1439,7 @@ fn parse_alloc_violation_atom(f: &Formula) -> Option<AllocViolationAtom<'_>> {
 /// emits the allocation availability/capacity check as a FAILURE condition: the
 /// allocation count (or `stride * count` byte total) REACHES OR EXCEEDS a large
 /// ceiling. The VC's goal is one such atom, or an `Or` of several (element
-/// ceiling + byte budget + capacity-overflow). We prove the allocation BOUNDED
+/// ceiling + capacity-overflow). We prove the allocation BOUNDED
 /// by refuting EVERY failure atom: each `Ge(term, C)` / `Gt(term, C)` is shown
 /// impossible because `term`'s over-approximated interval lies strictly below
 /// `C` (for `Ge`) / at most `C` (for `Gt`). A guarded entry — e.g. a dominating
@@ -1352,23 +1460,21 @@ fn prove_alloc_bounded(formula: &Formula) -> bool {
     // as the recordable bound `Le(len, MAX)` — without this the guard would be an
     // unrecognized `Not(..)` and the count interval would stay unbounded above.
     let conjuncts_owned = normalized_conjuncts(formula);
-    let conjuncts: Vec<&Formula> = conjuncts_owned.iter().collect();
-
-    // Outer (path-independent) facts that hold on EVERY execution: the dominating
-    // size guard, arg-type ranges, block defs. These are shared by all branches.
-    let outer: Vec<&Formula> = conjuncts.clone();
+    let conjuncts: Vec<&Formula> = conjuncts_owned.iter().map(Cow::as_ref).collect();
 
     // Does any top-level `Or` conjunct hide alloc failure atoms inside its branches
     // (a branch split)? If so, the flat Case-A handling would IGNORE those buried
     // atoms, so we must NOT trust a Case-A verdict and instead use the per-branch
     // Case B. (A pure single-path VC has no such `Or`.)
-    let has_branch_atoms = conjuncts.iter().any(|conj| {
-        matches!(conj, Formula::Or(branches) if branches.iter().any(|branch| {
-            let mut bc = Vec::new();
-            flatten_and(branch, &mut bc);
-            bc.iter().any(|c| parse_alloc_violation_atom(c).is_some())
-        }))
-    });
+    let has_branch_atoms = || {
+        conjuncts.iter().any(|conj| {
+            matches!(conj, Formula::Or(branches) if branches.iter().any(|branch| {
+                let mut bc = Vec::new();
+                flatten_and(branch, &mut bc);
+                bc.iter().any(|c| parse_alloc_violation_atom(c).is_some())
+            }))
+        })
+    };
 
     // Case A — directly exposed failure atoms. Always inspect these, even when
     // an `Or` elsewhere looks like an allocation branch split. A sibling
@@ -1383,7 +1489,7 @@ fn prove_alloc_bounded(formula: &Formula) -> bool {
     // backend may still discharge it. A directly Bounded result is terminal
     // only when no branch atoms remain to check.
     match prove_alloc_context(&conjuncts, &[]) {
-        AllocContext::Bounded if !has_branch_atoms => return true,
+        AllocContext::Bounded if !has_branch_atoms() => return true,
         AllocContext::Unbounded => return false,
         AllocContext::Bounded | AllocContext::NoAtoms => {}
     }
@@ -1400,7 +1506,7 @@ fn prove_alloc_bounded(formula: &Formula) -> bool {
             let all_ok = branches.iter().all(|branch| {
                 let mut branch_conjs = Vec::new();
                 flatten_and(branch, &mut branch_conjs);
-                match prove_alloc_context(&branch_conjs, &outer) {
+                match prove_alloc_context(&branch_conjs, &conjuncts) {
                     AllocContext::Bounded => {
                         saw_atom = true;
                         true
@@ -1615,7 +1721,7 @@ fn parse_bv_nonzero_guard(f: &Formula) -> Option<BvNonZeroGuard<'_>> {
     None
 }
 
-fn prove_bv_mul_no_overflow(env: &IntervalEnv<'_>, goal: &BvMulOverflowGoal<'_>) -> bool {
+fn prove_bv_mul_no_overflow<'a>(env: &IntervalEnv<'a>, goal: &BvMulOverflowGoal<'a>) -> bool {
     let mut visiting = FxHashSet::default();
     let lhs = env.eval(goal.lhs, &mut visiting);
     let rhs = env.eval(goal.rhs, &mut visiting);
@@ -1694,7 +1800,7 @@ fn bv_unsigned_max_u128(width: u32) -> Option<u128> {
 /// superset of their real value set, so if the product interval is finite and
 /// inside the signed range, no input can overflow. Declines (false) on any
 /// unbounded operand, leaving the VC for ay (which will refute a real overflow).
-fn prove_bv_smul_no_overflow(env: &IntervalEnv<'_>, goal: &BvSMulOverflowGoal<'_>) -> bool {
+fn prove_bv_smul_no_overflow<'a>(env: &IntervalEnv<'a>, goal: &BvSMulOverflowGoal<'a>) -> bool {
     let mut visiting = FxHashSet::default();
     let lhs = env.eval(goal.lhs, &mut visiting);
     let rhs = env.eval(goal.rhs, &mut visiting);
@@ -1804,7 +1910,7 @@ fn orient_constant_right(f: Formula) -> Formula {
 /// parsers + interval discharge prove `Proved` only when that violation set is
 /// genuinely empty; an UNGUARDED overflow's normalized `Or([Lt,Gt])` still has a
 /// feasible model (the interval eval finds `result.hi > max`), so it DECLINES.
-fn normalize_goal(f: &Formula) -> Formula {
+fn normalize_goal_cow(f: &Formula) -> Cow<'_, Formula> {
     match f {
         Formula::Not(inner) => match inner.as_ref() {
             // De Morgan over a conjunction of comparisons: the arithmetic
@@ -1815,30 +1921,34 @@ fn normalize_goal(f: &Formula) -> Formula {
                 for child in children {
                     match negate_comparison(child) {
                         Some(neg) => negated.push(orient_constant_right(neg)),
-                        None => return f.clone(),
+                        None => return Cow::Borrowed(f),
                     }
                 }
-                Formula::Or(negated)
+                Cow::Owned(Formula::Or(negated))
             }
             // Double negation: the div-by-zero `!=` twin collapses to its inner.
-            Formula::Not(x) => normalize_goal(x),
+            Formula::Not(x) => normalize_goal_cow(x),
             // Bare comparison: bounds `Not(Lt(index,len))` -> `Ge(index,len)`.
             cmp @ (Formula::Lt(..) | Formula::Le(..) | Formula::Gt(..) | Formula::Ge(..)) => {
                 match negate_comparison(cmp) {
-                    Some(neg) => orient_constant_right(neg),
-                    None => f.clone(),
+                    Some(neg) => Cow::Owned(orient_constant_right(neg)),
+                    None => Cow::Borrowed(f),
                 }
             }
             // `Not(Or)`, `Not(Eq)`, `Not(Var)`, `Not(Pred)`, … : leave for the BV
             // parsers / keep opaque predicates flagged.
-            _ => f.clone(),
+            _ => Cow::Borrowed(f),
         },
         // A positive top-level comparison: orient its constant to the right so the
         // parsers read it (e.g. a hardened bounds twin already in `Ge` form).
-        Formula::Lt(..) | Formula::Le(..) | Formula::Gt(..) | Formula::Ge(..) => {
-            orient_constant_right(f.clone())
+        Formula::Lt(a, b) | Formula::Le(a, b) | Formula::Gt(a, b) | Formula::Ge(a, b) => {
+            if const_value(a).is_some() && const_value(b).is_none() {
+                Cow::Owned(orient_constant_right(f.clone()))
+            } else {
+                Cow::Borrowed(f)
+            }
         }
-        other => other.clone(),
+        other => Cow::Borrowed(other),
     }
 }
 
@@ -1879,14 +1989,14 @@ fn is_bool_expr(f: &Formula) -> bool {
 /// equals `e`, so substituting `e` for `f` is substitution of equals for equals —
 /// an exact equivalence that preserves the model set. The single-definition gate
 /// is what guarantees the equality is unconditional (not one arm of a merge).
-fn collect_bool_flag_defs(conjuncts: &[&Formula]) -> FxHashMap<String, Formula> {
-    let mut defs: FxHashMap<String, Formula> = FxHashMap::default();
-    let mut multiply_defined: FxHashSet<String> = FxHashSet::default();
+fn collect_bool_flag_defs<'a>(conjuncts: &[&'a Formula]) -> FxHashMap<&'a str, &'a Formula> {
+    let mut defs: FxHashMap<&'a str, &'a Formula> = FxHashMap::default();
+    let mut multiply_defined: FxHashSet<&'a str> = FxHashSet::default();
     for conj in conjuncts {
         let Formula::Eq(a, b) = conj else { continue };
         // Identify the (Bool var, bool-expr) orientation. The var side must be a
         // Bool-sorted Var/SymVar; the other side must be a boolean expression.
-        let (name, def): (&str, &Formula) = if let Some(n) = bool_var_name(a) {
+        let (name, def): (&'a str, &'a Formula) = if let Some(n) = bool_var_name(a) {
             if !is_bool_expr(b) {
                 continue;
             }
@@ -1902,10 +2012,10 @@ fn collect_bool_flag_defs(conjuncts: &[&Formula]) -> FxHashMap<String, Formula> 
         if multiply_defined.contains(name) {
             continue;
         }
-        if defs.insert(name.to_string(), def.clone()).is_some() {
+        if defs.insert(name, def).is_some() {
             // A second definition: drop it — path-dependent, do not inline.
             defs.remove(name);
-            multiply_defined.insert(name.to_string());
+            multiply_defined.insert(name);
         }
     }
     defs
@@ -1922,38 +2032,101 @@ fn collect_bool_flag_defs(conjuncts: &[&Formula]) -> FxHashMap<String, Formula> 
 /// is a hypothesis), an exact equivalence; the rewritten formula has the same
 /// model set, so any subsequent goal-parse + interval discharge proves `Proved`
 /// only for a genuinely-empty violation set — exactly as for the direct shape.
-fn inline_bool_defs(f: &Formula, defs: &FxHashMap<String, Formula>, depth: u32) -> Formula {
+///
+/// "UNCHANGED" IS POINTER IDENTITY, NOT `Cow::Borrowed`. A substituted flag comes back
+/// BORROWED (its definition is a node of the same formula), yet it is not the node it
+/// replaced. Trust: 2026-11-07 (VCGEN-CENSUS-SITE-REDS-1): PERF-ROUTER-36 (`3fdc33bac2`)
+/// read every `Borrowed` child as unchanged, so a flag under `Not`/`And`/`Or` was never
+/// substituted: the hardened `BoundsCheck` twin's goal `Not(_34)` (`_34 == _33 < 4`)
+/// stayed opaque and the interval lane declined rows it proved before (lost proofs,
+/// never a false one). `inlines_a_flag_under_not` is the row.
+fn inline_bool_defs_cow<'a>(
+    f: &'a Formula,
+    defs: &FxHashMap<&'a str, &'a Formula>,
+    depth: u32,
+) -> Cow<'a, Formula> {
     if depth == 0 {
-        return f.clone();
+        return Cow::Borrowed(f);
     }
     // A Bool var that has a definition: expand to the def, then keep inlining into
     // it (transitive flags), with a decremented depth budget.
+    // The expansion is a CHANGE of `f` even when nothing inside `def` is inlined:
+    // `Cow::Borrowed` means "`f` unchanged" to the `Not`/`And`/`Or` arms below, which
+    // then keep their ORIGINAL child. Returning `inline_bool_defs_cow(def, ..)` as is
+    // (3fdc33bac2) handed them `Borrowed(def)` and left a nested flag (`Not(ok)`, the
+    // hardened BoundsCheck twin's violation) uninlined, so its goal was never parsed
+    // and the twin declined.
     if let Some(name) = bool_var_name(f)
-        && let Some(def) = defs.get(name)
+        && let Some(&def) = defs.get(name)
     {
-        return inline_bool_defs(def, defs, depth - 1);
+        return Cow::Owned(inline_bool_defs_cow(def, defs, depth - 1).into_owned());
     }
     // Otherwise, structurally recurse into the boolean skeleton that the goal
     // parsers + De Morgan normalization traverse (`Not`/`And`/`Or`). Leaf and
     // arithmetic nodes are returned unchanged: an integer flag is never inlined,
     // and an integer operand of a comparison is not a Bool var so it is untouched.
     match f {
-        Formula::Not(inner) => Formula::Not(Box::new(inline_bool_defs(inner, defs, depth))),
+        Formula::Not(inner) => match inline_bool_defs_cow(inner, defs, depth) {
+            Cow::Borrowed(same) if std::ptr::eq(same, inner.as_ref()) => Cow::Borrowed(f),
+            rewritten => Cow::Owned(Formula::Not(Box::new(rewritten.into_owned()))),
+        },
         Formula::And(children) => {
-            Formula::And(children.iter().map(|c| inline_bool_defs(c, defs, depth)).collect())
+            let mut rewritten: Option<Vec<Formula>> = None;
+            for (i, c) in children.iter().enumerate() {
+                match inline_bool_defs_cow(c, defs, depth) {
+                    Cow::Borrowed(same) if std::ptr::eq(same, c) => {
+                        if let Some(vec) = &mut rewritten {
+                            vec.push(c.clone());
+                        }
+                    }
+                    new_c => {
+                        let vec = rewritten.get_or_insert_with(|| {
+                            let mut v = Vec::with_capacity(children.len());
+                            v.extend(children[..i].iter().cloned());
+                            v
+                        });
+                        vec.push(new_c.into_owned());
+                    }
+                }
+            }
+            match rewritten {
+                Some(vec) => Cow::Owned(Formula::And(vec)),
+                None => Cow::Borrowed(f),
+            }
         }
         Formula::Or(children) => {
-            Formula::Or(children.iter().map(|c| inline_bool_defs(c, defs, depth)).collect())
+            let mut rewritten: Option<Vec<Formula>> = None;
+            for (i, c) in children.iter().enumerate() {
+                match inline_bool_defs_cow(c, defs, depth) {
+                    Cow::Borrowed(same) if std::ptr::eq(same, c) => {
+                        if let Some(vec) = &mut rewritten {
+                            vec.push(c.clone());
+                        }
+                    }
+                    new_c => {
+                        let vec = rewritten.get_or_insert_with(|| {
+                            let mut v = Vec::with_capacity(children.len());
+                            v.extend(children[..i].iter().cloned());
+                            v
+                        });
+                        vec.push(new_c.into_owned());
+                    }
+                }
+            }
+            match rewritten {
+                Some(vec) => Cow::Owned(Formula::Or(vec)),
+                None => Cow::Borrowed(f),
+            }
         }
-        other => other.clone(),
+        other => Cow::Borrowed(other),
     }
 }
 
 /// Flatten `And` conjuncts AND normalize each so a hardened `Not(in_range)`
 /// violation surfaces as the positive goal shape the parsers recognize. Returns
-/// OWNED conjuncts (the normalization rewrites some nodes); callers borrow from
-/// the returned vec. Conjuncts that are not violation goals (defs, bounds, BV
-/// guards, opaque predicates) pass through unchanged via `normalize_goal`.
+/// `Cow` conjuncts (borrowing unchanged nodes); callers borrow from the returned vec.
+/// Conjuncts that are not violation goals (defs, bounds, BV guards, opaque predicates)
+/// pass through unchanged via `normalize_goal_cow`.
 ///
 /// A BOOLEAN-DEFINITION INLINING pre-pass runs first: hardened arithmetic twins
 /// encode the violation through a boolean OVERFLOW-FLAG variable — a conjunct
@@ -1965,9 +2138,9 @@ fn inline_bool_defs(f: &Formula, defs: &FxHashMap<String, Formula>, depth: u32) 
 /// `Or([Lt,Gt])` (an overflow goal) and `Not(Var(flag))` into `Not(Or(...))` (a
 /// no-overflow hypothesis the De Morgan step folds away) — after which the
 /// existing normalization + parsers handle it identically to the per-statement
-/// direct case. See `collect_bool_flag_defs` / `inline_bool_defs` for the
+/// direct case. See `collect_bool_flag_defs` / `inline_bool_defs_cow` for the
 /// soundness-preserving constraints (single definition, Bool sort, bounded depth).
-fn normalized_conjuncts(formula: &Formula) -> Vec<Formula> {
+fn normalized_conjuncts<'a>(formula: &'a Formula) -> Vec<Cow<'a, Formula>> {
     let mut raw = Vec::new();
     flatten_and(formula, &mut raw);
 
@@ -1975,17 +2148,32 @@ fn normalized_conjuncts(formula: &Formula) -> Vec<Formula> {
     // so a flag-encoded violation surfaces as the direct comparison shape.
     let flag_defs = collect_bool_flag_defs(&raw);
     if flag_defs.is_empty() {
-        return raw.into_iter().map(normalize_goal).collect();
+        return raw.into_iter().map(normalize_goal_cow).collect();
     }
     // Depth 8 comfortably covers realistic flag-of-flag chains while bounding work
     // and breaking any definitional cycle. The inlined conjunct list then flows
-    // through the SAME `normalize_goal` (De Morgan + const-orient) as before.
-    raw.into_iter().map(|c| normalize_goal(&inline_bool_defs(c, &flag_defs, 8))).collect()
+    // through the SAME `normalize_goal_cow` (De Morgan + const-orient) as before.
+    // An owned (inlined) conjunct's normalization may come back BORROWED yet not be the
+    // conjunct itself: the double-negation collapse returns its inner node. Unchanged is
+    // pointer identity here too (see `inline_bool_defs_cow`); a borrowed sub-node is
+    // re-owned, never dropped in favour of the un-normalized conjunct.
+    raw.into_iter()
+        .map(|c| match inline_bool_defs_cow(c, &flag_defs, 8) {
+            Cow::Borrowed(b) => normalize_goal_cow(b),
+            Cow::Owned(owned) => {
+                let normalized = match normalize_goal_cow(&owned) {
+                    Cow::Borrowed(same) if std::ptr::eq(same, &owned) => None,
+                    other => Some(other.into_owned()),
+                };
+                Cow::Owned(normalized.unwrap_or(owned))
+            }
+        })
+        .collect()
 }
 
 /// Record a range bound from a comparison atom of the form `var ? const` or
 /// `const ? var`.
-fn record_bound(env: &mut IntervalEnv<'_>, atom: &Formula) {
+fn record_bound<'a>(env: &mut IntervalEnv<'a>, atom: &'a Formula) {
     // (var, const, kind) where kind picks the inequality direction relative to
     // the variable on the left.
     let (lhs, rhs, op) = match atom {
@@ -2058,7 +2246,7 @@ fn record_bound(env: &mut IntervalEnv<'_>, atom: &Formula) {
 ///   * Iteration is monotone (bounds only tighten) and capped, so it terminates;
 ///     a self-referential atom (`x < x + 1`) re-derives `x`'s existing bound (no
 ///     spurious tightening), which is sound.
-fn record_symbolic_bounds(env: &mut IntervalEnv<'_>, atoms: &[&Formula]) {
+fn record_symbolic_bounds<'a>(env: &mut IntervalEnv<'a>, atoms: &[&'a Formula]) {
     // A small fixpoint: each pass can only tighten finitely many endpoints, and
     // realistic guard chains are short. Cap the passes to stay cheap and ensure
     // termination regardless of formula shape.
@@ -2102,6 +2290,16 @@ fn record_symbolic_bounds(env: &mut IntervalEnv<'_>, atoms: &[&Formula]) {
             for (name, expr, var_on_left) in bindings {
                 let mut visiting = FxHashSet::default();
                 let iv = env.eval(expr, &mut visiting);
+                // Trust: 2026-11-09 (WRAPPING-SUB-AND-INTERVAL-NEG-1, review) — an EMPTY
+                // interval is the crossed form, and its endpoints are not bounds. `eval`
+                // reaches one for satisfiable terms too, where its two bit-vector
+                // conventions meet (a `BitVec` literal reads as its signed raw value,
+                // `BvToInt` intersects with the unsigned range): `BvToInt(BitVec{i64::MIN,
+                // 64}, 64, true)` evaluates `[0, i64::MIN]`, and `a >= <that>` recorded
+                // `a >= 0`, proving `-a` at `a == i64::MIN`. Record nothing from it.
+                if iv.is_empty() {
+                    continue;
+                }
                 // Direction of the inequality relative to the variable.
                 let (var_le_expr, var_ge_expr) = if var_on_left {
                     match op {
@@ -2188,7 +2386,7 @@ fn prove_div_nonzero(formula: &Formula) -> bool {
     // Normalize so a hardened `Not(Not(Eq(divisor,0)))` div twin (the asserted
     // `divisor != 0`, negated) collapses to the `Eq(divisor,0)` violation goal.
     let conjuncts_owned = normalized_conjuncts(formula);
-    let conjuncts: Vec<&Formula> = conjuncts_owned.iter().collect();
+    let conjuncts: Vec<&Formula> = conjuncts_owned.iter().map(Cow::as_ref).collect();
 
     let goal_positions: Vec<usize> = conjuncts
         .iter()
@@ -2225,6 +2423,13 @@ fn prove_div_nonzero(formula: &Formula) -> bool {
 
     let mut visiting = FxHashSet::default();
     let iv = env.eval(goal.divisor, &mut visiting);
+    // Trust: 2026-11-09 (WRAPPING-SUB-AND-INTERVAL-NEG-1, review) — an EMPTY
+    // interval's endpoints are the crossed form, not bounds: `BvToInt(BvUDiv(
+    // BitVec{-5, 64}, IntToBv(y)), 64, false)` evaluates `[0, -5]`, whose `hi <= -1`
+    // "excluded" 0 although `y = 2^64 - 1` makes the quotient 0. Decline.
+    if iv.is_empty() {
+        return false;
+    }
     // Whole interval strictly positive (`lo >= 1`) or strictly negative
     // (`hi <= -1`): 0 is excluded, so the divisor is provably nonzero.
     iv.lo.is_some_and(|l| l >= 1) || iv.hi.is_some_and(|h| h <= -1)
@@ -2240,7 +2445,7 @@ fn prove_no_overflow(formula: &Formula) -> bool {
     // `normalize_goal` (only `Not(And)`/`Not(Not)`/`Not(<cmp>)` are rewritten), so
     // those parsers still match below.
     let conjuncts_owned = normalized_conjuncts(formula);
-    let conjuncts: Vec<&Formula> = conjuncts_owned.iter().collect();
+    let conjuncts: Vec<&Formula> = conjuncts_owned.iter().map(Cow::as_ref).collect();
 
     let mut env = IntervalEnv::new();
     let mut goal: Option<OverflowGoal<'_>> = None;
@@ -2387,7 +2592,7 @@ fn prove_no_overflow(formula: &Formula) -> bool {
 
     // Sound only when the over-approximated result is a finite interval that
     // provably lies within the result type's representable range.
-    result_iv.is_finite() && result_iv.lo.unwrap() >= goal.min && result_iv.hi.unwrap() <= goal.max
+    result_iv.bounds().is_some_and(|(lo, hi)| lo >= goal.min && hi <= goal.max)
 }
 
 /// Cheap in-process interval/range backend for bounded overflow obligations.
@@ -2462,7 +2667,8 @@ pub(crate) fn hardened_mir_assert_goal(
 /// excluding `type_min`. An UNGUARDED negation leaves the operand at the full
 /// type range (`lo == type_min`), so `contains(type_min)` holds and we DECLINE
 /// (fall through to the SMT lane / stay Unknown) — never a false `Proved`.
-fn prove_neg_no_overflow(formula: &Formula, ty: &Ty) -> bool {
+fn prove_neg_no_overflow(vc: &VerificationCondition, ty: &Ty) -> bool {
+    let formula = &vc.formula;
     // Only signed integer negation can overflow; the threshold is the type min.
     let type_min = match ty {
         Ty::Int { width, signed: true } => match signed_min_of(*width) {
@@ -2472,13 +2678,47 @@ fn prove_neg_no_overflow(formula: &Formula, ty: &Ty) -> bool {
         _ => return false,
     };
 
+    // Trust: 2026-09-19 — THE GOAL MUST BE THIS OBLIGATION'S OWN SUBJECT. Without
+    // this the scan below took the FIRST `Eq(_, type_min)` among the conjuncts,
+    // which is not authority: a hypothesis can carry that shape too, and in a
+    // function with more than one negation it routinely does.
+    //
+    // THE FALSE PROVE, measured on this tree before the binding (and reproducible
+    // with no constant folding anywhere, so it is PRE-EXISTING):
+    //
+    // ```ignore (illustrative)
+    // pub fn f(a: i64) -> i64 { let lim = -(1i64 << 62) * 2; if a >= lim { -a } else { 0 } }
+    // ```
+    //
+    // `lim` IS `i64::MIN`, so `a >= lim` constrains nothing and `-a` panics at
+    // `a == i64::MIN` — in-process ay refutes it with exactly that model. The row's
+    // threaded block definitions include the OTHER negation's cond definition,
+    // `_7 == (_4 == i64::MIN)` over the bound's own `_4 == 2^62`; the scan found
+    // that `Eq` first, took `_4` as the operand, evaluated `[2^62, 2^62]`, saw it
+    // exclude `i64::MIN`, and PROVED — a row about `a` discharged by a fact about a
+    // different local. `IntervalBackend` is the first deployed safety lane, so this
+    // answer is final and the refutation never runs.
+    //
+    // `ObligationRecord::subject` is the negated operand the emitter recorded, and
+    // both negation emitters rename it with the same construction-point rename the
+    // body gets, so it is byte-identical to the operand's occurrence in `formula`.
+    // An obligation with NO subject is declined outright rather than scanned: an
+    // unauthenticated goal is precisely the hole above, and declining only falls
+    // through to the SMT lane.
+    let Some(subject) = vc.obligation.as_ref().and_then(|o| o.subject.as_ref()) else {
+        return false;
+    };
+
     let conjuncts_owned = normalized_conjuncts(formula);
-    let conjuncts: Vec<&Formula> = conjuncts_owned.iter().collect();
+    let conjuncts: Vec<&Formula> = conjuncts_owned.iter().map(Cow::as_ref).collect();
 
     // 1. Find the violation goal `Eq(operand, type_min)` — at top level (raw path)
     //    or nested as a boolean def body `Eq(Var, Eq(operand, type_min))` (assert
     //    path). `find_neg_goal_operand` returns the operand side in either shape.
-    let operand = match conjuncts.iter().find_map(|c| find_neg_goal_operand(c, type_min)) {
+    //    Only a goal whose operand IS the recorded subject counts.
+    let operand = match conjuncts.iter().find_map(|c| {
+        find_neg_goal_operand(c, type_min).filter(|op| neg_goal_is_subject(op, subject))
+    }) {
         Some(op) => op,
         None => return false,
     };
@@ -2487,7 +2727,12 @@ fn prove_neg_no_overflow(formula: &Formula, ty: &Ty) -> bool {
     //    guard `Gt(operand, type_min)`, block-def equalities, and bounds. SKIP the
     //    goal's own `Eq(operand, type_min)` as a def: recording it would pin the
     //    operand to `type_min` and defeat the refutation (it is the negation of
-    //    what we are proving, not a hypothesis).
+    //    what we are proving, not a hypothesis). This filter stays VALUE-keyed, so
+    //    it also drops a genuine definition whose value happens to BE `type_min`
+    //    (`let lim = -(1i64 << 62) * 2;`). That is a precision loss and only a
+    //    precision loss — a dropped hypothesis can widen the operand's interval,
+    //    never narrow it, so it can turn PROVED into declined and never the
+    //    reverse.
     let mut env = IntervalEnv::new();
     let mut cmp_atoms: Vec<&Formula> = Vec::new();
     for conj in &conjuncts {
@@ -2508,10 +2753,37 @@ fn prove_neg_no_overflow(formula: &Formula, ty: &Ty) -> bool {
     }
     record_symbolic_bounds(&mut env, &cmp_atoms);
 
-    // 3. PROVED iff the operand's over-approximated interval provably excludes
+    // 3. PROVED iff the operand's over-approximated SIGNED interval provably excludes
     //    type_min (mirrors check_negation_discharge). The guard gives lo > type_min.
+    //
+    //    Trust: 2026-11-09 (WRAPPING-SUB-AND-INTERVAL-NEG-1) — the interval must be
+    //    read in the domain `type_min` lives in. `eval` reads a BIT-VECTOR term as
+    //    its UNSIGNED value (`bv_top` is `[0, 2^w - 1]`, and so are the `BvAnd`,
+    //    `BvZeroExt`, `BvLShr`, `BvURem` and `BvUDiv` rules), while `type_min` is the
+    //    signed minimum. The `>= 128`-bit lane names the negated value with a fresh
+    //    BIT-VECTOR var `__trust_ovf_bv_neg_{base}` defined `== bvshl(1, amt)`, so
+    //    `-(1i128 << amt)` evaluated `[0, ∞)`, "excluded" `i128::MIN`, and was PROVED
+    //    although `amt = 127` gives `1i128 << 127 == i128::MIN` (in-process ay
+    //    refutes the same row at `amt = 127`, but this backend answers first). A
+    //    bit-vector operand is therefore never evaluated here: the goal names it
+    //    only as the alias of the obligation's Int-sorted SUBJECT
+    //    (`neg_goal_is_subject`), so the subject's own Int interval — signed by
+    //    construction, `BvToInt` converting any bit-vector term it reads with its
+    //    stated signedness — is the operand's signed value. A bit-vector goal over
+    //    any other subject, at a width other than the type's, or an operand of any
+    //    other (or ill-formed) sort declines.
+    let signed_operand = match check_formula_sort(operand) {
+        Ok(Sort::Int) => operand,
+        Ok(Sort::BitVec(width)) => match (ty, subject) {
+            (Ty::Int { width: ty_width, .. }, Formula::Var(_, Sort::Int)) if *ty_width == width => {
+                subject
+            }
+            _ => return false,
+        },
+        _ => return false,
+    };
     let mut visiting = FxHashSet::default();
-    let iv = env.eval(operand, &mut visiting);
+    let iv = env.eval(signed_operand, &mut visiting);
     // VACUITY GUARD: an empty operand interval means the hypotheses are
     // contradictory (UNSAT antecedent). `contains` is gated on `is_finite`-style
     // bounds but `!contains` is vacuously true on an empty interval, so without
@@ -2520,6 +2792,30 @@ fn prove_neg_no_overflow(formula: &Formula, ty: &Ty) -> bool {
         return false;
     }
     !iv.contains(type_min)
+}
+
+/// Is the located goal operand the obligation's recorded SUBJECT?
+///
+/// Two spellings are admitted, and only these two:
+///  * the subject itself, byte-for-byte — the Int lane, where the emitter renames
+///    the subject with the same construction-point rename the body gets;
+///  * the FRESH bit-vector alias the `>= 128`-bit lane mints for that same
+///    operand, `__trust_ovf_bv_neg_{base}` over the subject's own var name — the
+///    only other name any negation emitter ever gives the negated value.
+///
+/// Anything else is a DIFFERENT value and declines, which is the whole point:
+/// a hypothesis that happens to compare some other local with `type_min` must not
+/// be mistaken for this row's goal.
+fn neg_goal_is_subject(operand: &Formula, subject: &Formula) -> bool {
+    if operand == subject {
+        return true;
+    }
+    match (operand, subject) {
+        (Formula::Var(alias, Sort::BitVec(_)), Formula::Var(base, _)) => {
+            alias.strip_prefix("__trust_ovf_bv_neg_") == Some(base.as_str())
+        }
+        _ => false,
+    }
 }
 
 /// Locate the signed-negation violation operand: the non-`type_min` side of an
@@ -2556,7 +2852,7 @@ impl IntervalBackend {
             // ay backend that lists NegationOverflow in `can_handle` is cfg-gated
             // off / not in the deployed plan. An UNGUARDED negation keeps
             // `lo == type_min` -> declines -> falls through to the SMT lane.
-            VcKind::NegationOverflow { ty } => prove_neg_no_overflow(&vc.formula, ty),
+            VcKind::NegationOverflow { ty } => prove_neg_no_overflow(vc, ty),
             // Sound interval discharge of provably-in-bounds indexing — e.g. the
             // modulo-guarded `arr[n % 4]` (`n % 4 ∈ [0, 4) ⊆ [0, len)`), which
             // neither trust-vc (no request) nor ay-LRA (unsupported atoms) prove
@@ -2597,7 +2893,8 @@ impl IntervalBackend {
             },
             _ => return false,
         };
-        if std::env::var_os("TRUST_INTERVAL_DEBUG").is_some() {
+        static DEBUG: OnceLock<bool> = OnceLock::new();
+        if *DEBUG.get_or_init(|| std::env::var_os("TRUST_INTERVAL_DEBUG").is_some()) {
             eprintln!("TRUST_INTERVAL_VC[{}] provable={ok} formula={:?}", vc.function, vc.formula);
         }
         ok
@@ -3278,6 +3575,7 @@ mod tests {
             ],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4437,6 +4735,30 @@ mod tests {
     }
 
     #[test]
+    fn inlines_a_flag_nested_under_not() {
+        // The flag NESTED under the violation's `Not`: `ok` defines the asserted
+        // in-bounds cond `Lt(n % 4, 4)` and the hardened BoundsCheck twin's
+        // violation is `Not(ok)`. Inlining must reach under the `Not`, so the goal
+        // normalizes to `Ge(n % 4, 4)`, which is impossible for `[_; 4]`.
+        // (3fdc33bac2's inliner returned the expansion as `Borrowed(def)`, which the
+        // `Not` arm read as "unchanged", so `Not(ok)` stayed opaque and this twin
+        // DECLINED.)
+        let ok = || Formula::Var("ok".into(), Sort::Bool);
+        let twin = |m: i128| {
+            hardened_panic_vc(
+                "mir_assert::BoundsCheck",
+                Formula::And(vec![
+                    Formula::Eq(Box::new(ok()), Box::new(lt(rem(var("n"), m), Formula::Int(4)))),
+                    Formula::Not(Box::new(ok())),
+                ]),
+            )
+        };
+        assert!(IntervalBackend::provable(&twin(4)), "Not(ok), ok = n%4 < 4: proves for [_;4]");
+        // The genuinely-OOB sibling `n % 5` (can equal len 4) must still DECLINE.
+        assert!(!IntervalBackend::provable(&twin(5)), "Not(ok), ok = n%5 < 4: must DECLINE");
+    }
+
+    #[test]
     fn does_not_inline_multiply_defined_flag() {
         // A flag with TWO definitions is path-dependent: inlining either would be
         // unsound, so the flag is NOT inlined and the goal stays unrecognized ->
@@ -4475,6 +4797,353 @@ mod tests {
         assert!(!IntervalBackend::provable(&vc), "int eq is not a bool-flag def");
     }
 
+    /// VCGEN-CENSUS-SITE-REDS-1: a flag NESTED under `Not` is substituted. The hardened
+    /// `BoundsCheck` twin trust-vcgen emits for `uv[2]` over `[f32; 4]`
+    /// (`argument_premise_clip`, line 42) states its goal as `Not(_34)` beside the flag's
+    /// one definition `_34 == (_33 < 4)`, so only the substituted `Not(_33 < 4)`, i.e.
+    /// `_33 >= 4`, is the bounds goal. PERF-ROUTER-36 read the definition's borrowed node
+    /// as "unchanged" and left `Not(_34)` opaque: no goal, DECLINE. The control with the
+    /// index out of range keeps declining, so the substitution adds no proof of its own.
+    #[test]
+    fn inlines_a_flag_under_not() {
+        let flag = || Formula::Var("_34".into(), Sort::Bool);
+        let twin = |index: i128| {
+            Formula::And(vec![
+                Formula::Eq(Box::new(var("_33")), Box::new(Formula::Int(index))),
+                Formula::Eq(
+                    Box::new(flag()),
+                    Box::new(Formula::Lt(Box::new(var("_33")), Box::new(Formula::Int(4)))),
+                ),
+                Formula::Not(Box::new(flag())),
+            ])
+        };
+        let in_range = hardened_panic_vc("mir_assert::BoundsCheck", twin(2));
+        assert!(IntervalBackend::provable(&in_range), "`uv[2]` over `[f32; 4]` is in bounds");
+        let out_of_range = hardened_panic_vc("mir_assert::BoundsCheck", twin(4));
+        assert!(!IntervalBackend::provable(&out_of_range), "`uv[4]` is not");
+        // The same goal one `And` deeper (the twin nests its block's conjuncts).
+        let nested = hardened_panic_vc(
+            "mir_assert::BoundsCheck",
+            Formula::And(vec![Formula::And(vec![twin(2)])]),
+        );
+        assert!(IntervalBackend::provable(&nested), "flattening does not hide the flag");
+    }
+
+    /// VCGEN-CENSUS-SITE-REDS-1: the divisor twin's flag is the asserted `d != 0`, so its
+    /// substituted goal `Not(Not(d == 0))` collapses to `d == 0` only when the collapse
+    /// of an INLINED conjunct is kept (it comes back as a borrowed inner node of the
+    /// owned conjunct; PERF-ROUTER-36 dropped it for the un-normalized form).
+    #[test]
+    fn keeps_the_double_negation_collapse_of_an_inlined_flag() {
+        let flag = || Formula::Var("_7".into(), Sort::Bool);
+        let twin = |divisor: Formula| {
+            Formula::And(vec![
+                Formula::Eq(Box::new(var("d")), Box::new(divisor)),
+                Formula::Eq(
+                    Box::new(flag()),
+                    Box::new(Formula::Not(Box::new(Formula::Eq(
+                        Box::new(var("d")),
+                        Box::new(Formula::Int(0)),
+                    )))),
+                ),
+                Formula::Not(Box::new(flag())),
+            ])
+        };
+        let constant = hardened_panic_vc("mir_assert::DivisionByZero", twin(Formula::Int(3)));
+        assert!(IntervalBackend::provable(&constant), "`x / 3` cannot divide by zero");
+        let unbounded = hardened_panic_vc("mir_assert::DivisionByZero", twin(var("n")));
+        assert!(!IntervalBackend::provable(&unbounded), "`x / n` can");
+    }
+
+    // -----------------------------------------------------------------
+    // The negation goal must be THIS obligation's own subject.
+    // -----------------------------------------------------------------
+
+    fn neg_vc(formula: Formula, subject: Option<Formula>) -> VerificationCondition {
+        VerificationCondition {
+            kind: VcKind::NegationOverflow { ty: Ty::Int { width: 64, signed: true } },
+            function: "test".into(),
+            location: SourceSpan::default(),
+            formula,
+            contract_metadata: None,
+            obligation: subject.map(|s| trust_types::ObligationRecord {
+                body: Formula::Bool(true),
+                wrappers: Vec::new(),
+                subject: Some(s),
+                width: Some(64),
+            }),
+        }
+    }
+
+    /// Two negations in one function: a constant that cannot be `i64::MIN`, and an
+    /// UNCONSTRAINED parameter that can. The row asked about is the parameter's.
+    ///
+    /// ```ignore (illustrative)
+    /// pub fn f(a: i64) -> i64 { let lim = -(1i64 << 62) * 2; if a >= lim { -a } else { 0 } }
+    /// ```
+    ///
+    /// `lim` IS `i64::MIN`, so the guard constrains nothing and `-a` panics at
+    /// `a == i64::MIN` — in-process ay refutes it with exactly that model. The
+    /// scan used to take the FIRST `Eq(_, i64::MIN)` among the conjuncts, which is
+    /// the OTHER negation's cond definition `flag == (c == i64::MIN)`, evaluate
+    /// `c`'s interval `[2^62, 2^62]`, see it exclude `i64::MIN`, and answer PROVED
+    /// — a row about `a` discharged by a fact about a different local, and final,
+    /// because this is the first deployed safety lane.
+    #[test]
+    fn a_foreign_operands_min_comparison_is_not_this_rows_negation_goal() {
+        let formula = Formula::And(vec![
+            Formula::Eq(Box::new(var("c")), Box::new(Formula::Int(1i128 << 62))),
+            Formula::Eq(
+                Box::new(Formula::Var("flag".into(), Sort::Bool)),
+                Box::new(Formula::Eq(Box::new(var("c")), Box::new(Formula::Int(i64::MIN as i128)))),
+            ),
+            range_constraint(&var("a"), i64::MIN as i128, i64::MAX as i128),
+            Formula::And(vec![
+                Formula::Eq(
+                    Box::new(Formula::Var("t".into(), Sort::Bool)),
+                    Box::new(Formula::Eq(
+                        Box::new(var("a")),
+                        Box::new(Formula::Int(i64::MIN as i128)),
+                    )),
+                ),
+                Formula::Var("t".into(), Sort::Bool),
+            ]),
+        ]);
+        let vc = neg_vc(formula, Some(var("a")));
+        assert!(
+            !IntervalBackend::provable(&vc),
+            "`a` is unconstrained and `a == i64::MIN` is satisfiable — proving this row from \
+             the OTHER negation's operand is a false PROVE"
+        );
+    }
+
+    /// The SAFE twin of the test above, so the binding is not passing by refusing
+    /// everything: the same shape with `a` genuinely guarded away from `i64::MIN`
+    /// still proves.
+    #[test]
+    fn the_rows_own_guarded_subject_still_proves() {
+        let formula = Formula::And(vec![
+            Formula::Eq(Box::new(var("c")), Box::new(Formula::Int(1i128 << 62))),
+            Formula::Eq(
+                Box::new(Formula::Var("flag".into(), Sort::Bool)),
+                Box::new(Formula::Eq(Box::new(var("c")), Box::new(Formula::Int(i64::MIN as i128)))),
+            ),
+            range_constraint(&var("a"), (i64::MIN as i128) + 1, i64::MAX as i128),
+            Formula::And(vec![
+                Formula::Eq(
+                    Box::new(Formula::Var("t".into(), Sort::Bool)),
+                    Box::new(Formula::Eq(
+                        Box::new(var("a")),
+                        Box::new(Formula::Int(i64::MIN as i128)),
+                    )),
+                ),
+                Formula::Var("t".into(), Sort::Bool),
+            ]),
+        ]);
+        let vc = neg_vc(formula, Some(var("a")));
+        assert!(
+            IntervalBackend::provable(&vc),
+            "`a >= i64::MIN + 1` excludes i64::MIN — this row is genuinely provable and the \
+             subject binding must not cost it"
+        );
+    }
+
+    /// An obligation with NO recorded subject carries no authority over which
+    /// `Eq(_, i64::MIN)` in its formula is the goal, so it declines outright and
+    /// falls through to the SMT lane.
+    #[test]
+    fn a_subjectless_negation_obligation_declines() {
+        let formula = Formula::And(vec![
+            range_constraint(&var("a"), (i64::MIN as i128) + 1, i64::MAX as i128),
+            Formula::Eq(Box::new(var("a")), Box::new(Formula::Int(i64::MIN as i128))),
+        ]);
+        assert!(
+            !IntervalBackend::provable(&neg_vc(formula, None)),
+            "an unauthenticated goal is exactly the hole the subject binding closes"
+        );
+    }
+
+    /// The `>= 128`-bit lane names the negated operand with the fresh BV alias
+    /// `__trust_ovf_bv_neg_{base}` while the subject stays the base local, so that
+    /// one rename is admitted — and only that one.
+    #[test]
+    fn the_bitvector_alias_of_the_subject_is_the_subject() {
+        assert!(neg_goal_is_subject(
+            &Formula::Var("__trust_ovf_bv_neg__5".into(), Sort::BitVec(128)),
+            &var("_5"),
+        ));
+        assert!(!neg_goal_is_subject(
+            &Formula::Var("__trust_ovf_bv_neg__6".into(), Sort::BitVec(128)),
+            &var("_5"),
+        ));
+        assert!(!neg_goal_is_subject(&var("_6"), &var("_5")));
+        // Not an alias at all — a same-named Int var is a DIFFERENT sort of claim
+        // than the BV lane's fresh operand var, but it is still the same name, so
+        // the plain equality arm is what admits it.
+        assert!(neg_goal_is_subject(&var("_5"), &var("_5")));
+    }
+
+    // -----------------------------------------------------------------
+    // Trust: 2026-11-09 (WRAPPING-SUB-AND-INTERVAL-NEG-1) — a bit-vector negation
+    // operand is judged by its SIGNED value.
+    // -----------------------------------------------------------------
+
+    fn neg128_vc(formula: Formula, subject: &str) -> VerificationCondition {
+        VerificationCondition {
+            kind: VcKind::NegationOverflow { ty: Ty::Int { width: 128, signed: true } },
+            function: "g".into(),
+            location: SourceSpan::default(),
+            formula,
+            contract_metadata: None,
+            obligation: Some(trust_types::ObligationRecord {
+                body: Formula::Bool(true),
+                wrappers: Vec::new(),
+                subject: Some(var(subject)),
+                width: Some(128),
+            }),
+        }
+    }
+
+    /// An empty interval is not a bound. `BvToInt(BitVec{i64::MIN, 64}, 64, true)`
+    /// is `i64::MIN`, but `eval` reads the literal's signed raw value and intersects
+    /// it with the unsigned range, giving the crossed `[0, i64::MIN]`;
+    /// `record_symbolic_bounds` took its `lo` as `a >= 0`, and `-a` was PROVED with
+    /// `a == i64::MIN` a model (found by the hostile review of
+    /// WRAPPING-SUB-AND-INTERVAL-NEG-1; no emitter produces this shape today).
+    #[test]
+    fn a_crossed_interval_is_not_recorded_as_a_bound() {
+        let lim = Formula::BvToInt(
+            Box::new(Formula::BitVec { value: i128::from(i64::MIN), width: 64 }),
+            64,
+            true,
+        );
+        let formula = Formula::And(vec![
+            Formula::Ge(Box::new(var("a")), Box::new(lim)),
+            Formula::Eq(Box::new(var("a")), Box::new(Formula::Int(i128::from(i64::MIN)))),
+        ]);
+        let vc = VerificationCondition {
+            kind: VcKind::NegationOverflow { ty: Ty::Int { width: 64, signed: true } },
+            function: "g".into(),
+            location: SourceSpan::default(),
+            formula,
+            contract_metadata: None,
+            obligation: Some(trust_types::ObligationRecord {
+                body: Formula::Bool(true),
+                wrappers: Vec::new(),
+                subject: Some(var("a")),
+                width: Some(64),
+            }),
+        };
+        assert!(!IntervalBackend::provable(&vc), "`a == i64::MIN` is a model; -a overflows");
+    }
+
+    /// The division twin of `a_crossed_interval_is_not_recorded_as_a_bound`: the
+    /// divisor `BvToInt(BvUDiv(BitVec{-5, 64}, IntToBv(y)), 64, false)` evaluates the
+    /// crossed `[0, -5]`, and its `hi <= -1` read as "excludes 0", although
+    /// `y = 2^64 - 1` makes the quotient 0 (hostile review of
+    /// WRAPPING-SUB-AND-INTERVAL-NEG-1; no emitter produces this shape today).
+    #[test]
+    fn a_crossed_divisor_interval_does_not_exclude_zero() {
+        let divisor = Formula::BvToInt(
+            Box::new(Formula::BvUDiv(
+                Box::new(Formula::BitVec { value: -5, width: 64 }),
+                Box::new(Formula::IntToBv(Box::new(var("y")), 64)),
+                64,
+            )),
+            64,
+            false,
+        );
+        let formula = Formula::Eq(Box::new(divisor), Box::new(Formula::Int(0)));
+        assert!(!prove_div_nonzero(&formula), "`y = 2^64 - 1` makes the divisor 0");
+    }
+
+    /// The `>= 128`-bit lane's violation core for `-(base << amt)`: the fresh operand
+    /// `__trust_ovf_bv_neg_{subject}` defined `== bvshl(base, amt)` under `amt <u 128`,
+    /// beside the Int-sorted path guards on `amt`, exactly as trust-vcgen emits it.
+    fn neg128_shift_formula(subject: &str, base: i128, guards: Vec<Formula>) -> Formula {
+        let neg = Formula::Var(format!("__trust_ovf_bv_neg_{subject}"), Sort::BitVec(128));
+        let amt = Formula::Var("__trust_ovf_bv_amt_amt".into(), Sort::BitVec(128));
+        let mut conjuncts = guards;
+        conjuncts.push(Formula::And(vec![
+            Formula::Eq(
+                Box::new(neg.clone()),
+                Box::new(Formula::BvShl(
+                    Box::new(Formula::BitVec { value: base, width: 128 }),
+                    Box::new(amt.clone()),
+                    128,
+                )),
+            ),
+            Formula::BvULt(
+                Box::new(amt),
+                Box::new(Formula::BitVec { value: 128, width: 128 }),
+                128,
+            ),
+            Formula::Eq(Box::new(neg), Box::new(Formula::BitVec { value: i128::MIN, width: 128 })),
+        ]));
+        Formula::And(conjuncts)
+    }
+
+    /// THE HOLE (the 2026-11-09 review): `fn g(amt: u32) -> i128 { if amt < 128 {
+    /// -(1i128 << amt) } else { 0 } }`. `g(127)` negates `1i128 << 127 == i128::MIN`
+    /// and panics; in-process ay refutes the row at `amt = 127`. The BV operand's
+    /// `bvshl` evaluated to the UNSIGNED `[0, ∞)`, which "excluded" the SIGNED
+    /// `i128::MIN`, and this backend — which answers first — said PROVED.
+    #[test]
+    fn a_shifted_128_bit_negation_operand_is_not_proved_by_its_unsigned_interval() {
+        assert!((1i128 << 127u32).checked_neg().is_none(), "g(127) overflows");
+        let amt_lt_128 = Formula::Lt(Box::new(var("amt")), Box::new(Formula::Int(128)));
+        for base in [1i128, -1, 3] {
+            let formula = neg128_shift_formula(
+                "_3",
+                base,
+                vec![amt_lt_128.clone(), range_constraint(&var("amt"), 0, u32::MAX as i128)],
+            );
+            assert!(
+                !IntervalBackend::provable(&neg128_vc(formula, "_3")),
+                "`-({base}i128 << amt)` reaches i128::MIN at amt = 127 (base 1, -1) or \
+                 overflows past it; the row must not be PROVED"
+            );
+        }
+    }
+
+    /// The operand is judged through the SUBJECT, so a guard that really bounds the
+    /// negated value away from `i128::MIN` still proves (the guarded-parameter shape
+    /// `if a >= i128::MIN + 1 { -a }`, whose BV core carries no definition at all),
+    /// and the same core with the guard one lower, admitting `i128::MIN`, does not.
+    #[test]
+    fn a_128_bit_negation_is_proved_by_its_subjects_signed_bound_only() {
+        let core = |lo: i128| {
+            let neg = Formula::Var("__trust_ovf_bv_neg_a".into(), Sort::BitVec(128));
+            Formula::And(vec![
+                Formula::Ge(Box::new(var("a")), Box::new(Formula::Int(lo))),
+                Formula::Eq(
+                    Box::new(neg),
+                    Box::new(Formula::BitVec { value: i128::MIN, width: 128 }),
+                ),
+            ])
+        };
+        assert!(IntervalBackend::provable(&neg128_vc(core(i128::MIN + 1), "a")));
+        assert!(!IntervalBackend::provable(&neg128_vc(core(i128::MIN), "a")));
+        // A bit-vector goal whose operand is NOT the subject's alias declines, and so
+        // does a bit-vector operand at a width other than the type's.
+        let foreign = Formula::And(vec![
+            Formula::Ge(Box::new(var("a")), Box::new(Formula::Int(0))),
+            Formula::Eq(
+                Box::new(Formula::Var("__trust_ovf_bv_neg_b".into(), Sort::BitVec(128))),
+                Box::new(Formula::BitVec { value: i128::MIN, width: 128 }),
+            ),
+        ]);
+        assert!(!IntervalBackend::provable(&neg128_vc(foreign, "a")));
+        let narrow = Formula::And(vec![
+            Formula::Ge(Box::new(var("a")), Box::new(Formula::Int(0))),
+            Formula::Eq(
+                Box::new(Formula::Var("__trust_ovf_bv_neg_a".into(), Sort::BitVec(64))),
+                Box::new(Formula::BitVec { value: i128::MIN, width: 64 }),
+            ),
+        ]);
+        assert!(!IntervalBackend::provable(&neg128_vc(narrow, "a")));
+    }
+
     #[test]
     fn interval_arithmetic_is_sound() {
         assert_eq!(Interval::range(0, 249).add(Interval::cst(1)), Interval::range(1, 250));
@@ -4486,5 +5155,102 @@ mod tests {
         assert_eq!(Interval::TOP.rem(Interval::cst(250)), Interval::range(-249, 249));
         // Unbounded propagation: x + unbounded = unbounded.
         assert_eq!(Interval::cst(1).add(Interval::TOP), Interval::TOP);
+    }
+
+    // ---- SLICE-LEN-NAME-1 (2026-10-05) ----------------------------------------
+    // The non-negativity floor belongs to the RESERVED length symbol
+    // `<place>__slice_len` that trust-vcgen mints. A name that merely ENDS in
+    // `_slice_len` can be a source local (`fn dec(x_slice_len: i8)`): it is an
+    // ordinary integer and keeps its full type range.
+
+    /// The `fn dec(v: i8) -> i8 { v - 1 }` row: `v - 1` leaves `i8` iff
+    /// `v == -128`.
+    fn i8_decrement_vc(name: &str) -> VerificationCondition {
+        let v = var(name);
+        overflow_vc(Formula::And(vec![
+            range_constraint(&v, -128, 127),
+            out_of_range(sub_f(v, Formula::Int(1)), -128, 127),
+        ]))
+    }
+
+    /// The floor's own purpose: an upper-only guard on a length (`len <=
+    /// isize::MAX`) leaves `len / 2 + 1` half-open below unless the length is
+    /// known non-negative.
+    fn half_plus_one_vc(name: &str) -> VerificationCondition {
+        let len = var(name);
+        let half = Formula::Div(Box::new(len.clone()), Box::new(Formula::Int(2)));
+        overflow_vc(Formula::And(vec![
+            le(len, Formula::Int(ISIZE_MAX)),
+            out_of_range(add_f(half, Formula::Int(1)), 0, USIZE_MAX),
+        ]))
+    }
+
+    /// MUTANT WITNESS for the old `ends_with("_slice_len")`: each of these
+    /// proved under it (the floor turned `[-128, 127]` into `[0, 127]`), and the
+    /// first is the measured default-lane wrong accept.
+    #[test]
+    fn a_source_name_ending_in_slice_len_is_not_floored() {
+        for name in ["x_slice_len", "slice_len_x_slice_len", "a_b_slice_len"] {
+            assert!(
+                !IntervalBackend::provable(&i8_decrement_vc(name)),
+                "`{name}` is not a minted length symbol: `{name} - 1` overflows i8 at -128"
+            );
+            assert!(
+                !IntervalBackend::provable(&half_plus_one_vc(name)),
+                "`{name}` has no lower bound, so `{name} / 2 + 1` can leave usize"
+            );
+        }
+        // The control: an ordinary name never had a floor.
+        assert!(!IntervalBackend::provable(&i8_decrement_vc("x")));
+    }
+
+    /// The minted spelling keeps its floor: a length is a `usize`.
+    #[test]
+    fn the_minted_slice_len_symbol_is_floored_at_zero() {
+        for name in ["xs__slice_len", "self*.1__slice_len", "_5__slice_len"] {
+            assert!(
+                IntervalBackend::provable(&half_plus_one_vc(name)),
+                "`{name}` is a length: `{name} / 2 + 1` is in [1, isize::MAX / 2 + 1]"
+            );
+            assert!(
+                IntervalBackend::provable(&i8_decrement_vc(name)),
+                "`{name}` is floored at 0, so `{name} - 1` is at least -1"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_var_cache_matches_dfs_across_alias_chains_and_compound_overwrites() {
+        let va = var("z_alias");
+        let vb = var("m_alias");
+        let vc_f = var("a_canon");
+        let vd = var("isolated");
+        let compound = add_f(vc_f.clone(), Formula::Int(4));
+
+        let mut env = IntervalEnv::new();
+        assert_eq!(env.canonical_var("z_alias"), "z_alias");
+
+        // Multi-hop alias chain z_alias == m_alias == a_canon -> all resolve to "a_canon".
+        env.record_eq_def(&va, &vb);
+        env.record_eq_def(&vb, &vc_f);
+        assert_eq!(env.canonical_var("z_alias"), "a_canon");
+        assert_eq!(env.canonical_var("m_alias"), "a_canon");
+        assert_eq!(env.canonical_var("a_canon"), "a_canon");
+        assert_eq!(env.canonical_var("isolated"), "isolated");
+
+        // Overwrite BOTH sides of a separate 2-node alias pair with compound defs:
+        // cache invalidation must disconnect them rather than keep a stale edge.
+        let p = var("p_var");
+        let q = var("b_var");
+        env.record_eq_def(&p, &q);
+        assert_eq!(env.canonical_var("p_var"), "b_var");
+        env.record_eq_def(&p, &compound);
+        // `defs[q]` still points to `p`, so reverse edge keeps them connected:
+        assert_eq!(env.canonical_var("p_var"), "b_var");
+        env.record_eq_def(&q, &compound);
+        // Now neither `defs[p]` nor `defs[q]` is a bare `Var`: disconnected!
+        assert_eq!(env.canonical_var("p_var"), "p_var");
+        assert_eq!(env.canonical_var("b_var"), "b_var");
+        let _ = vd;
     }
 }

@@ -1,12 +1,11 @@
 use rustc_abi::{BackendRepr, FieldIdx, VariantIdx};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_data_structures::stack::ensure_sufficient_stack;
+use rustc_middle::mir;
 use rustc_middle::mir::interpret::{EvalToValTreeResult, GlobalId, ValTreeCreationError};
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::layout::{LayoutCx, TyAndLayout};
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_middle::{bug, mir};
-use rustc_span::DUMMY_SP;
+use rustc_span::{DUMMY_SP, bug};
 use tracing::{debug, instrument, trace};
 
 use super::VALTREE_MAX_NODES;
@@ -145,7 +144,7 @@ fn const_to_valtree_inner<'tcx>(
     let initial_nodes = *num_nodes;
     visited.insert(place.clone());
 
-    let result = ensure_sufficient_stack(|| match ty.kind() {
+    let result = match ty.kind() {
         ty::FnDef(..) => {
             reserve_nodes(num_nodes, 1)?;
             Ok(ty::ValTree::zst(tcx))
@@ -175,7 +174,7 @@ fn const_to_valtree_inner<'tcx>(
             let val = ecx.read_immediate(place).report_err()?;
             // We could allow wide raw pointers where both sides are integers in the future,
             // but for now we reject them.
-            if matches!(val.layout.backend_repr, BackendRepr::ScalarPair(..)) {
+            if matches!(val.layout.backend_repr, BackendRepr::ScalarPair { .. }) {
                 Err(ValTreeCreationError::NonSupportedType(ty))
             } else {
                 let val = val.to_scalar();
@@ -251,7 +250,7 @@ fn const_to_valtree_inner<'tcx>(
         | ty::Coroutine(..)
         | ty::CoroutineWitness(..)
         | ty::UnsafeBinder(_) => Err(ValTreeCreationError::NonSupportedType(ty)),
-    });
+    };
 
     visited.remove(place);
     let settled_nodes = result.is_ok().then_some(*num_nodes - initial_nodes).unwrap_or(0);

@@ -1,0 +1,65 @@
+
+=== Trust Verification Report (w5_requires_callee_not_mir_inlined) ===
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked, 1 assumed (requires) out of 2 obligation(s)
+  --> $DIR/w5_requires_callee_not_mir_inlined.rs:21:1
+   |
+LL | / fn callee(x: u8) -> u8
+LL | |     requires x < 100
+LL | | {
+LL | |     x + 100
+LL | | }
+   | |_^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+   = note: [unknown] conditional definition-entry assumption; every caller must establish the requires contract
+
+note: Trust verification: 1 proved, 1 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/w5_requires_callee_not_mir_inlined.rs:27:1
+   |
+LL | / fn caller() -> u8 {
+LL | |     callee(200)
+LL | | }
+   | |_^
+   |
+   = note: [precond] FAILED (ay-in-process); counterexample: 
+
+error: Trust strict verification failed for `w5_requires_callee_not_mir_inlined::caller`: 1 obligation(s) were not fully verified
+  --> $DIR/w5_requires_callee_not_mir_inlined.rs:27:1
+   |
+LL | / fn caller() -> u8 {
+LL | |     callee(200)
+LL | | }
+   | |_^
+   |
+   = note: summary: 1 trusted, 0 certified, 1 failed, 0 unknown, 0 runtime-checked, 0 skipped out of 2
+   = note: failed obligations, including declared contract panics, are refutations and are not permitted under strict verification; select -Ztrust-policy=advisory to record contract-panic conditional evidence
+   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because an obligation row carries a refuted verdict (even if the aggregate summary reports it differently)
+   = note: --- native verifier detail (15 line(s) below; engine internals, not required to act on this error) ---
+   = note: native full verifier status: Inconclusive; requested=2, proved=1, failed=0, unknown=1, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=8 bundle_digest=sha256:$DIGEST requests=3
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=1 proof_obligations=[1] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=2 proof_obligations=[2] request_digest=sha256:$DIGEST
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=3 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier evidence `vc:w5_requires_callee_not_mir_inlined__caller:precondition:0`: constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-0-proof-0, function=caller, kind=Assertion, relations=1, clauses=1
+   = note: native full verifier evidence `vc:w5_requires_callee_not_mir_inlined__caller:precondition:0`: native trust_mc typed CHC/PDR full-verification runner selected PdrProof for obligation trust_ir-native-trust_mc-request-0-proof-0
+   = note: native full verifier evidence `vc:w5_requires_callee_not_mir_inlined__caller:precondition:0`: native trust_mc typed CHC/PDR full-verification runner refuted obligation trust_ir-native-trust_mc-request-0-proof-0; refusing to emit proof evidence
+   = note: native full verifier evidence `vc:w5_requires_callee_not_mir_inlined__caller:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
+   = note: native full verifier evidence `vc:w5_requires_callee_not_mir_inlined__caller:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
+   = note: native full verifier evidence `vc:w5_requires_callee_not_mir_inlined__caller:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
+   = note: native full verifier evidence `vc:w5_requires_callee_not_mir_inlined__caller:assertion:panic-freedom:0`: native trust_mc typed CHC/PDR proof accepted from a live opaque native-bundle authority, with exact typed-CHC/request binding and digest-backed artifacts; the serialized transport remains diagnostic-only
+   = note: native full verifier evidence `vc:w5_requires_callee_not_mir_inlined__caller:assertion:panic-freedom:0`: native typed CHC/PDR proof transport: schema=1, suite=trust_ir, backend=trust_mc::typed-chc-pdr::chc::trivial-safe, request_id=2, proof_id=Some(2), native_id=trust_ir-native-trust_mc-request-2-proof-2, status=Proved, strength=ChcValidity, solver_artifacts=1, replay_artifacts=1, check_artifacts=1
+   = note: native full verifier evidence `vc:w5_requires_callee_not_mir_inlined__caller:assertion:panic-freedom:0`: private structural derivation found no Horn rule for typed CHC query target `error`; public evidence remains a candidate
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/w5_requires_callee_not_mir_inlined.rs:31:1
+   |
+LL | / fn main() {
+LL | |     let _ = caller();
+LL | | }
+   | |_^
+
+error: aborting due to 1 previous error
+

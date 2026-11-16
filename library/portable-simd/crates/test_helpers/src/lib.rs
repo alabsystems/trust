@@ -26,6 +26,13 @@ pub trait DefaultStrategy {
     fn default_strategy() -> Self::Strategy;
 }
 
+impl DefaultStrategy for bool {
+    type Strategy = proptest::bool::Any;
+    fn default_strategy() -> Self::Strategy {
+        proptest::bool::ANY
+    }
+}
+
 macro_rules! impl_num {
     { $type:tt } => {
         impl DefaultStrategy for $type {
@@ -678,7 +685,7 @@ macro_rules! test_lanes {
                     //lanes_45 45;
                     //lanes_46 46;
                     lanes_47 47;
-                    //lanes_48 48;
+                    lanes_48 48;
                     //lanes_49 49;
                     //lanes_50 50;
                     //lanes_51 51;

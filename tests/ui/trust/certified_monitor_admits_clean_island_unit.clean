@@ -1,0 +1,3 @@
+-- Trust CB3: the `unit` revision of certified_monitor_admits_clean_island.rs —
+-- an out-of-line `clean mod` island, which is also `DefKind::GlobalAsm`.
+theorem monitor_unit_island_holds : 0 = 0 := rfl

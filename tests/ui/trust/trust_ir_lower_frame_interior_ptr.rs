@@ -1,5 +1,8 @@
 //@ dont-check-compiler-stderr
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory --crate-type=lib
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-FIL): the FRAME-INTERIOR LEDGER SPLIT — a +0-body soundness repair,
 //! pinned by control fixtures because coverage cannot show it fired.
 //!
@@ -20,11 +23,13 @@
 //! The repair INHERITS THE BASE CLASS, the discipline the other three writers
 //! (wave-25b, wave-DP, wave-L4G) already follow: `interior_ptrs` only when the base
 //! is itself in `ref_param_ptrs`; otherwise `frame_interior_ptrs`, which is excepted
-//! by no return guard. `global_ptrs` is deliberately NOT an inheritance source — one
-//! Rust static does not map to one module Global (`q_set` writes `@global.1` while
-//! `q_get` reads `@global.2` for the same `static mut Q`), so a global address is a
-//! per-body materialized COPY and restricting to unobservable-copy statics is a
-//! separate obligation.
+//! by no return guard. `global_ptrs` is deliberately NOT an inheritance source.
+//! When this guard landed, assembly copied a Rust static per body (`q_set` wrote
+//! `@global.1` while `q_get` read `@global.2` for the same `static mut Q`). The
+//! shared-static-identity assembly repair preserves compiler identity across
+//! bodies; its run-make regression is separate from this lifetime ledger.
+//! Shared storage alone does not discharge the pointer's lifetime/aliasing
+//! obligations, so that repair does not widen this return-escape exemption.
 //!
 //! IT IS NOT A MISCOMPILE AND NEVER WAS. Every body below returns a raw pointer to
 //! dead memory in the SOURCE too — legal Rust, only the dereference is UB — and

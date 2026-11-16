@@ -118,6 +118,7 @@ fn buggy_midpoint_mir() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -206,6 +207,7 @@ fn safe_midpoint_mir_with_precondition() -> VerifiableFunction {
         ],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

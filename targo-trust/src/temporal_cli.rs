@@ -5,8 +5,8 @@
 //! input into a zero-authority canonical Lean/Clean proposition image.
 //!
 //! The former generated-harness/embedded-ty execution route — and the automatic
-//! link-time model inventory it consumed — are DELETED (owner ruling
-//! 2026-07-20, "no deprecation limbo"): a project-linked executable cannot
+//! link-time model inventory it consumed — are DELETED
+//! (no deprecation limbo: a retired route is deleted, not kept as a fallback): a project-linked executable cannot
 //! authenticate the source bytes rustc read or the prior/final build artifact,
 //! so no such route may exist until trustc emits an authenticated manifest.
 //!
@@ -120,10 +120,7 @@ fn resolved_temporal_gate_target(
     root: &Path,
     metadata_context: &[String],
 ) -> Result<TemporalGateTarget, String> {
-    let targo = crate::pipeline::discover_native_trust_cargo_checked()?;
-    let mut command = Command::new(&targo);
-    command.args(["metadata", "--format-version", "1", "--manifest-path"]);
-    command.arg(root.join("Cargo.toml"));
+    let (rustc, targo) = crate::pipeline::discovery::discover_native_trust_toolchain_checked()?;
     let mut context = metadata_context.to_vec();
     if !context.iter().any(|arg| arg == "--filter-platform") {
         let platforms = match crate::pipeline::configured_cargo_build_target()? {
@@ -139,7 +136,7 @@ fn resolved_temporal_gate_target(
             context.extend(["--filter-platform".to_string(), platform]);
         }
     }
-    command.args(&context);
+    let mut command = temporal_metadata_command(&targo, &rustc, root, &context)?;
     let output = crate::bounded_process::output(
         &mut command,
         &format!("canonical temporal metadata query at {}", targo.display()),
@@ -156,6 +153,37 @@ fn resolved_temporal_gate_target(
     let metadata = serde_json::from_slice::<TemporalCargoMetadata>(&output.stdout)
         .map_err(|error| format!("canonical temporal metadata was invalid: {error}"))?;
     temporal_gate_target_from_metadata(root, &metadata)
+}
+
+/// The temporal gate's canonical `targo metadata` query for the package at
+/// `root`, with `context` (feature, config and `--filter-platform` flags).
+///
+/// Built by `cargo_selection::selection_probe_command`, like package
+/// selection: the authenticated trustc pinned, no rustc wrapper, and the
+/// `[host]` rustflags refusal first. S9 re-review: this query used to inherit
+/// ambient `RUSTFLAGS` and a config-file `build.rustc`, so an external
+/// `-Zcodegen-backend` loaded the trust-mc dylib into trustc's target-info
+/// query after every successful `targo trust build`. `--filter-platform`
+/// evaluates target cfgs, so the query resolves the project's rustflags as
+/// the build does (T14a: the environment, else the matching configured
+/// tables), with the probe's empty lane, which keeps any external backend out
+/// of its compiler: a `--cfg` that activates the temporal engine edge in the
+/// build must activate it here, or the gate would pass that build as having
+/// no temporal opt-in. The build's trust-cg codegen contract and strict safety
+/// checks are not replayed, because this gate does not see the build's lane;
+/// the query inherited neither before this change either.
+pub(crate) fn temporal_metadata_command(
+    targo: &Path,
+    rustc: &Path,
+    root: &Path,
+    context: &[String],
+) -> Result<Command, String> {
+    let mut command =
+        crate::pipeline::cargo_selection::selection_probe_command(targo, rustc, context)?;
+    command.args(["metadata", "--format-version", "1", "--manifest-path"]);
+    command.arg(root.join("Cargo.toml"));
+    command.args(context);
+    Ok(command)
 }
 
 fn canonical_temporal_engine_manifest() -> Result<PathBuf, String> {
@@ -1107,11 +1135,11 @@ fn validate_sha256(label: &str, digest: &str) -> Result<(), String> {
 }
 
 fn decode_lower_hex(label: &str, hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 || hex.len() > TLA_CLEAN_TERM_MAX_BYTES.saturating_mul(2) {
+    if !hex.len().is_multiple_of(2) || hex.len() > TLA_CLEAN_TERM_MAX_BYTES.saturating_mul(2) {
         return Err(format!("compatibility image {label} has an invalid encoded length"));
     }
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|pair| {
             let high = lower_hex_nibble(pair[0])
                 .ok_or_else(|| format!("compatibility image {label} is not lowercase hex"))?;
@@ -1162,9 +1190,10 @@ fn parse_temporal_invocation(args: &[String]) -> Result<(&str, Vec<&String>), St
 ///
 /// `build_result` is the build's own ExitCode, passed through unchanged when the
 /// gate passes (or when the crate is not opted in). Once a crate opts in, ambient
-/// process state cannot disable the gate.
+/// process state cannot disable the gate. A help-only `build` compiled nothing,
+/// so it is passed through too (see `pipeline::run_was_help_only`).
 pub(crate) fn gate_build(build_result: ExitCode, args: &[String]) -> ExitCode {
-    if build_result != ExitCode::SUCCESS {
+    if build_result != ExitCode::SUCCESS || crate::pipeline::run_was_help_only(args) {
         return build_result;
     }
     let context = match crate::pipeline::post_build_cargo_context(args) {
@@ -1252,14 +1281,21 @@ fn temporal_gate_target_from_metadata(
     root: &Path,
     metadata: &TemporalCargoMetadata,
 ) -> Result<TemporalGateTarget, String> {
-    let expected_engine_manifest = canonical_temporal_engine_manifest()?;
-    temporal_gate_target_from_metadata_with_engine(root, metadata, &expected_engine_manifest)
+    temporal_gate_target_from_metadata_with_engine(
+        root,
+        metadata,
+        canonical_temporal_engine_manifest,
+    )
 }
 
+/// `expected_engine_manifest` is resolved only when the package has an active
+/// normal edge to a package named `trust-spec-temporal`. A delivered toolchain
+/// has no repository checkout at its build path, so resolving it up front made
+/// every `targo trust build` fail after a passing verification, temporal or not.
 fn temporal_gate_target_from_metadata_with_engine(
     root: &Path,
     metadata: &TemporalCargoMetadata,
-    expected_engine_manifest: &Path,
+    expected_engine_manifest: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<TemporalGateTarget, String> {
     let manifest = root.join("Cargo.toml");
     let package = metadata
@@ -1286,6 +1322,8 @@ fn temporal_gate_target_from_metadata_with_engine(
         .filter(|package| package.name == "trust-spec-temporal")
         .collect::<Vec<_>>();
     let mut active = false;
+    let mut resolve_expected = Some(expected_engine_manifest);
+    let mut expected_engine_manifest: Option<PathBuf> = None;
     for dependency in &node.deps {
         let Some(engine) = named_engines.iter().find(|engine| engine.id == dependency.pkg) else {
             continue;
@@ -1297,6 +1335,12 @@ fn temporal_gate_target_from_metadata_with_engine(
         if !active_normal {
             continue;
         }
+        if let Some(resolve) = resolve_expected.take() {
+            expected_engine_manifest = Some(resolve()?);
+        }
+        let expected_engine_manifest = expected_engine_manifest
+            .as_deref()
+            .expect("resolved before the first active engine edge");
         if !paths_equivalent(&engine.manifest_path, expected_engine_manifest) {
             return Err(format!(
                 "package `{}` resolves trust-spec-temporal to untrusted shadow package `{}` at {}; proof-bearing temporal dependencies must use repository-owned {}",
@@ -1848,6 +1892,45 @@ mod tests {
                 .unwrap(),
             TemporalGateTarget::Automatic { .. }
         ));
+    }
+
+    #[test]
+    fn unavailable_engine_manifest_matters_only_with_an_engine_edge() {
+        // A delivered toolchain has no checkout at its build path, so the engine
+        // manifest cannot be resolved there. A crate with no trust-spec-temporal
+        // edge must not depend on it; a crate with one must still fail closed.
+        let temp = tempfile::tempdir().expect("create delivered-toolchain fixture");
+        let unavailable = || -> Result<std::path::PathBuf, String> {
+            Err("repository-owned trust-spec-temporal manifest is unavailable".to_string())
+        };
+        let no_edge = metadata(temp.path(), false, true);
+        assert_eq!(
+            super::temporal_gate_target_from_metadata_with_engine(
+                temp.path(),
+                &no_edge,
+                || -> Result<std::path::PathBuf, String> {
+                    panic!("no engine edge: the engine manifest must not be resolved")
+                },
+            )
+            .unwrap(),
+            TemporalGateTarget::None
+        );
+        assert_eq!(
+            super::temporal_gate_target_from_metadata_with_engine(
+                temp.path(),
+                &no_edge,
+                unavailable
+            )
+            .unwrap(),
+            TemporalGateTarget::None
+        );
+        let error = super::temporal_gate_target_from_metadata_with_engine(
+            temp.path(),
+            &metadata(temp.path(), true, true),
+            unavailable,
+        )
+        .expect_err("an engine edge with no resolvable engine must fail closed");
+        assert!(error.contains("manifest is unavailable"), "{error}");
     }
 
     #[test]

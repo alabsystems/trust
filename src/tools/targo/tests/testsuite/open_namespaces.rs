@@ -275,7 +275,8 @@ fn main() {}
         )
         .build();
 
-    p.cargo("read-manifest -Zscript --manifest-path foo::bar.rs")
+    p.cargo("read-manifest --manifest-path foo::bar.rs")
+        .arg("-Zscript")
         .masquerade_as_nightly_cargo(&["script", "open-namespaces"])
         .with_stdout_data(
             str![[r#"
@@ -381,7 +382,7 @@ fn update_spec_accepts_namespaced_name() {
         .masquerade_as_nightly_cargo(&["open-namespaces"])
         .with_stdout_data(str![""])
         .with_stderr_data(str![[r#"
-[LOCKING] 0 packages to latest compatible versions
+[LOCKING] 0 packages to highest compatible versions
 
 "#]])
         .run();
@@ -411,7 +412,7 @@ fn update_spec_accepts_namespaced_pkgid() {
         .masquerade_as_nightly_cargo(&["open-namespaces"])
         .with_stdout_data(str![""])
         .with_stderr_data(str![[r#"
-[LOCKING] 0 packages to latest compatible versions
+[LOCKING] 0 packages to highest compatible versions
 
 "#]])
         .run();

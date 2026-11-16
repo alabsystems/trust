@@ -49,6 +49,7 @@ fn is_inlinable_body_inst(inst: &Inst) -> bool {
             | Inst::Select { .. }
             | Inst::Undef { .. }
             | Inst::InsertField { .. }
+            | Inst::MakeAggregate { .. }
             | Inst::ExtractField { .. }
             | Inst::Assume { .. }
             | Inst::Assert { .. }

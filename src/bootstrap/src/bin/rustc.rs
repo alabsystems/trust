@@ -22,22 +22,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Instant;
 
-use arg_file_command::ArgFileCommand;
-use shared_helpers::{
+// Trust: the shim helpers live in the `shim_utils` crate since the 1.101
+// port (upstream moved them out of `#[path]` includes).
+use shim_utils::{
+    ArgFileCommand, BOOTSTRAP_FRONTEND_CEILING_ENV, DESCENDANT_HANDOFF_ENV, InheritedJobserver,
     RETIRED_TRUST_BOOTSTRAP_SHIM_TARGET_ONLY_ENV, activate_cargo_test_shim_environment,
-    canonicalize_trust_verify_on, cargo_test_no_verify_requested,
+    bootstrap_seed_frontend_threads, canonicalize_trust_verify_on, cargo_test_no_verify_requested,
     compile_uses_trust_bootstrap_no_verify, dylib_path, dylib_path_var, exe, expand_rustc_argfiles,
-    finalize_trust_no_verify, finalize_trust_no_verify_snapshot, maybe_dump, parse_rustc_stage,
-    parse_rustc_verbose, parse_value_from_args, retired_trust_bootstrap_shim_target_only_refusal,
-    strip_trust_no_verify, trust_bootstrap_no_verify_applies, trust_bootstrap_shim_marker_enabled,
+    finalize_trust_no_verify, finalize_trust_no_verify_snapshot, is_cargo_target_info_probe,
+    maybe_dump, parse_rustc_stage, parse_rustc_verbose, parse_value_from_args,
+    retired_trust_bootstrap_shim_target_only_refusal, strip_trust_no_verify,
+    trust_bootstrap_no_verify_applies, trust_bootstrap_shim_marker_enabled,
     trust_bootstrap_verify_unit_argv_refusal, trust_bootstrap_verify_unit_requested,
 };
-
-#[path = "../utils/shared_helpers.rs"]
-mod shared_helpers;
-
-#[path = "../../../build_helper/src/arg_file_command.rs"]
-mod arg_file_command;
 
 #[path = "../utils/proc_macro_deps.rs"]
 mod proc_macro_deps;
@@ -98,7 +95,63 @@ fn finalize_trust_verify_control(
     }
 }
 
+#[cfg(unix)]
+fn cargo_fixture_termination_signal(
+    is_fixture: bool,
+    status: std::process::ExitStatus,
+) -> Option<libc::c_int> {
+    use std::os::unix::process::ExitStatusExt;
+    is_fixture.then(|| status.signal()).flatten()
+}
+
+/// Trust: a dedicated Cargo fixture launcher must preserve the compiler's
+/// terminating signal after its argument-file and failure-hook cleanup.
+/// Ordinary bootstrap retains its diagnostic exit254 convention below.
+#[cfg(unix)]
+fn forward_cargo_fixture_signal(signal: libc::c_int) -> ! {
+    // SAFETY: reset this process's disposition, unblock this signal in the
+    // calling thread, then deliver it to that same thread. A process-directed
+    // kill followed by _exit can race on macOS; raise is thread-directed.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        if libc::sigemptyset(&mut action.sa_mask) != 0 {
+            libc::_exit(0xfe);
+        }
+        if signal != libc::SIGKILL
+            && signal != libc::SIGSTOP
+            && libc::sigaction(signal, &action, std::ptr::null_mut()) != 0
+        {
+            libc::_exit(0xfe);
+        }
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        if libc::sigemptyset(&mut mask) != 0
+            || libc::sigaddset(&mut mask, signal) != 0
+            || libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut()) != 0
+        {
+            libc::_exit(0xfe);
+        }
+        libc::raise(signal);
+        libc::_exit(0xfe);
+    }
+}
+
 fn main() {
+    // Trust: import before sidecar/argument-file opens can reuse inherited fd
+    // numbers. Retain this authority until the real compiler has been waited.
+    // SAFETY: this is the shim's first operation, before opening other files.
+    let inherited_jobserver = unsafe { InheritedJobserver::from_env() };
+    let raw_args = env::args_os().skip(1).collect::<Vec<_>>();
+    let jobserver = match inherited_jobserver {
+        Ok(jobserver) => Some(jobserver),
+        // Trust: build scripts such as libc call the wrapper's literal version
+        // query with plain Command, which strips inherited scheduling fds.
+        // This exact query does no compilation and needs no parallel budget.
+        // Inspect argv only: an @file must still refuse before it is opened.
+        Err(_) if is_literal_version_query(&raw_args) => None,
+        Err(error) => panic!("cannot inherit bootstrap jobserver: {error}"),
+    };
+
     // Refuse the retired marker on the AMBIENT environment, before the
     // Cargo-test sidecar can rewrite anything. A stale name that does nothing
     // is indistinguishable from one that worked.
@@ -117,7 +170,6 @@ fn main() {
     let mut isolated_shim_environment = activate_cargo_test_shim_environment()
         .unwrap_or_else(|err| panic!("failed to activate Cargo-test shim environment: {err}"));
 
-    let raw_args = env::args_os().skip(1).collect::<Vec<_>>();
     let had_inbound_argfile =
         raw_args.iter().any(|arg| arg.to_str().is_some_and(|arg| arg.starts_with('@')));
     let orig_args = expand_rustc_argfiles(&raw_args)
@@ -191,10 +243,8 @@ fn main() {
     // Get the name of the crate we're compiling, if any.
     let crate_name = parse_value_from_args(&orig_args, "--crate-name");
 
-    // When statically linking `std` into `rustc_driver`, remove `-C prefer-dynamic`
-    if env::var("RUSTC_LINK_STD_INTO_RUSTC_DRIVER").unwrap() == "1"
-        && crate_name == Some("rustc_driver")
-    {
+    // When compiling `rustc_driver` remove `-C prefer-dynamic` to allow statically linking `std` into it
+    if crate_name == Some("rustc_driver") {
         if let Some(pos) = args.iter().enumerate().position(|(i, a)| {
             a == "-C" && args.get(i + 1).map(|a| a == "prefer-dynamic").unwrap_or(false)
         }) {
@@ -229,6 +279,9 @@ fn main() {
     // turn verification on inside a bootstrap-driven compile.
     let driver_is_in_tree_staged =
         targeted_rustc_supports_trust_no_verify && !targeted_rustc_is_snapshot;
+    // Trust: the probe half of the off-switch (`trust_bootstrap_off_switch_applies`)
+    // is scoped to a driver this tree BUILT (a `stage1`+ directory), never a seed.
+    let driver_is_built_stage = targeted_rustc_is_built_stage(&rustc_driver);
     let bootstrap_verify_unit_applies = trust_bootstrap_verify_unit_applies(
         target.is_some(),
         bootstrap_shim_marker,
@@ -240,11 +293,12 @@ fn main() {
     );
 
     let bootstrap_no_verify_applies = !bootstrap_verify_unit_applies
-        && trust_bootstrap_no_verify_applies(
+        && trust_bootstrap_off_switch_applies(
             target.is_some(),
             cargo_test_no_verify_requested(bootstrap_shim_marker, authenticated_targo_frontend),
             targeted_rustc_supports_trust_no_verify,
             rustc_driver_supports_trust_no_verify,
+            driver_is_built_stage,
             &orig_args,
             crate_name,
         );
@@ -272,12 +326,26 @@ fn main() {
         // Trust: run_version_query rewrites `trustc`->`rustc` in --version output.
         // Upstream migrated the driver invocation to ArgFileCommand; build it into a
         // plain Command (materializing any @argfile) before the version-query handler.
-        let (cmd, arg_file) = cmd.build().unwrap();
+        let (mut cmd, arg_file) = cmd.build().unwrap();
         if let Some(environment) = &mut isolated_shim_environment {
-            environment.restore();
+            environment.restore_for_compiler_command(&mut cmd, bootstrap_no_verify_applies);
         }
-        run_version_query(cmd, arg_file);
+        if let Some(jobserver) = &jobserver {
+            jobserver.configure(&mut cmd);
+        } else {
+            // Trust: do not advertise descriptors that this metadata-only
+            // child cannot inherit. No verification/authentication fields move.
+            for variable in ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS", DESCENDANT_HANDOFF_ENV] {
+                cmd.env_remove(variable);
+            }
+        }
+        run_version_query(cmd, arg_file, isolated_shim_environment.is_some());
     }
+
+    // Trust: only the exact final version-query branch may proceed after a
+    // failed import. Environment isolation or wrapper normalization must never
+    // turn that exception into an independently scheduled compile.
+    let jobserver = jobserver.expect("unavailable jobserver outside a pure version query");
 
     if let Some(crate_name) = crate_name
         && let Some(target) = env::var_os("RUSTC_TIME")
@@ -337,20 +405,6 @@ fn main() {
         // The flags are stored in a RUSTC_HOST_FLAGS variable, separated by spaces.
         if let Ok(flags) = std::env::var("RUSTC_HOST_FLAGS") {
             cmd.args(flags.split(' '));
-        }
-    }
-
-    // The remap flags for the compiler and standard library sources.
-    if let Ok(maps) = env::var("RUSTC_DEBUGINFO_MAP") {
-        for map in maps.split('\t') {
-            cmd.arg("--remap-path-prefix").arg(map);
-        }
-    }
-    // The remap flags for Cargo registry sources need to be passed after the remapping for the
-    // Rust source code directory, to handle cases when $CARGO_HOME is inside the source directory.
-    if let Ok(maps) = env::var("RUSTC_CARGO_REGISTRY_SRC_TO_REMAP") {
-        for map in maps.split('\t') {
-            cmd.arg("--remap-path-prefix").arg(map);
         }
     }
 
@@ -457,6 +511,26 @@ fn main() {
         cmd.env("TRUST_NO_VERIFY", "1");
     }
 
+    // Seed Cargo does not run Targo's default frontend planner. Keep this
+    // potential stable across changing admitted job shares; GNU tokens remain
+    // the worker authority. Never alter a proof route, query or explicit argv.
+    let unverified_seed_compile = targeted_rustc_is_snapshot
+        && targeted_rustc_supports_trust_no_verify
+        && bootstrap_no_verify_applies
+        && !bootstrap_verify_unit_applies
+        && !authenticated_targo_frontend
+        && compile_uses_trust_bootstrap_no_verify(&orig_args);
+    if let Some(threads) = bootstrap_seed_frontend_threads(
+        cmd.args_mut(),
+        unverified_seed_compile,
+        jobserver.is_present(),
+        env::var_os(BOOTSTRAP_FRONTEND_CEILING_ENV).as_deref(),
+    )
+    .unwrap_or_else(|message| panic!("{message}"))
+    {
+        cmd.arg(format!("-Zthreads={threads}"));
+    }
+
     let is_test = args.iter().any(|a| a == "--test");
     if verbose > 2 {
         let rust_env_vars =
@@ -484,8 +558,11 @@ fn main() {
     let (mut cmd, arg_file) = cmd.build().unwrap();
     maybe_dump(format!("stage{}-rustc", stage + 1), &cmd);
     if let Some(environment) = &mut isolated_shim_environment {
-        environment.restore();
+        environment.restore_for_compiler_command(&mut cmd, bootstrap_no_verify_applies);
     }
+    jobserver.configure(&mut cmd);
+    // Trust: retain the caller's scheduling policy. Promoting every compiler
+    // worker can starve other admitted builds when the host's capacity is limited.
 
     let start = Instant::now();
     let (child, status) = {
@@ -530,6 +607,9 @@ fn main() {
         on_fail.status().expect("Could not run the on_fail command");
     }
 
+    // Trust: only dedicated Cargo-test compilers expose the real signal to Cargo.
+    propagate_cargo_test_signal(status, isolated_shim_environment.is_some());
+
     // Preserve the exit code. In case of signal, exit with 0xfe since it's
     // awkward to preserve this status in a cross-platform way.
     match status.code() {
@@ -558,7 +638,11 @@ fn is_lint_driver_arg(arg: &OsString, host: &str) -> bool {
 }
 
 fn is_version_query(args: &[OsString]) -> bool {
-    let args = args.iter().filter_map(|arg| arg.to_str()).collect::<Vec<_>>();
+    // Trust: an unrecognized byte argument is an extra argument, never erased
+    // when deciding whether this invocation is only an identity query.
+    let Some(args) = args.iter().map(|arg| arg.to_str()).collect::<Option<Vec<_>>>() else {
+        return false;
+    };
     matches!(
         args.as_slice(),
         ["-V"]
@@ -568,6 +652,44 @@ fn is_version_query(args: &[OsString]) -> bool {
             | ["--version", "--verbose"]
             | ["--verbose", "--version"]
     )
+}
+
+// Trust: the early jobserver exception cannot open response files or otherwise
+// interpret their contents. The ordinary wrapper-prefix rule is checked here
+// and the exact version-only shape is checked again at the final dispatch.
+fn is_literal_version_query(args: &[OsString]) -> bool {
+    // Trust: reject response-file syntax before treating a compiler-looking
+    // path as a wrapper prefix. Prefix recognition must never hide an @file.
+    if args.iter().any(|arg| arg.as_encoded_bytes().starts_with(b"@")) {
+        return false;
+    }
+    if is_version_query(args) {
+        return true;
+    }
+    let Some((prefix, rest)) = args.split_first() else { return false };
+    let Ok(host) = env::var("CFG_COMPILER_BUILD_TRIPLE") else { return false };
+    let Ok(current_exe) = env::current_exe() else { return false };
+    let cargo_rustc = env::var_os("RUSTC");
+    let real = env::var_os("RUSTC_REAL");
+    let snapshot = env::var_os("RUSTC_SNAPSHOT");
+    if should_strip_cargo_rustc_arg(
+        prefix,
+        &host,
+        &current_exe,
+        cargo_rustc.as_ref(),
+        real.as_ref(),
+    ) || should_strip_cargo_rustc_arg(
+        prefix,
+        &host,
+        &current_exe,
+        cargo_rustc.as_ref(),
+        snapshot.as_ref(),
+    ) {
+        return is_version_query(rest);
+    }
+    is_lint_driver_arg(prefix, &host)
+        && rest.first().is_some_and(|arg| arg == "--rustc")
+        && is_version_query(&rest[1..])
 }
 
 fn should_strip_cargo_rustc_arg(
@@ -618,6 +740,77 @@ fn should_strip_cargo_rustc_arg(
 /// the shims cannot depend on the bootstrap library.
 const TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS_ENV: &str = "TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS";
 
+/// Trust: whether bootstrap's verification off-switch reaches this invocation:
+/// every real compile [`trust_bootstrap_no_verify_applies`] admits, and ALSO a
+/// targeted target-information probe ([`is_cargo_target_info_probe`]) on a
+/// driver this tree built.
+///
+/// WHY THE PROBE. Bootstrap puts `-Ztrust-verify=off` in the rustflags of every
+/// target unit (`core/builder/cargo.rs`), and upstream Cargo passes rustflags to
+/// its probe verbatim. Targo does not: it strips every `-Ztrust_*` token from
+/// the probe (`target_info_probe_flags`, `strip_trust_verify_probe_flags` in the
+/// seed's Targo, so a Targo proof session's identity never reaches a `--print`
+/// early exit), the off-switch included. With Targo as bootstrap's Cargo the
+/// probe therefore runs at a stage>=1 `trustc`'s batteries-on default,
+/// verification ON, while every unit it describes compiles with it off. Two
+/// consequences, both measured 2026-10-13 on a stage 1 whose `build.cargo` is
+/// the atpkg toolchain's Targo:
+///
+/// * since T6 (`8e7067d334`: a proof session refuses the MIR-pipeline options)
+///   the stage-1 std build aborts before compiling anything: the probe carries
+///   std's `-Zinline-mir` and answers "a Trust proof session runs the -O0 MIR
+///   pipeline for every unit; -Zinline-mir would make the verified MIR, and so
+///   the verdicts, depend on the caller's MIR options. Remove it." (A Targo cut
+///   from this tree since DECISION_QUEUE TARGO-PROBE-MIR-1 drops those options
+///   from its probe; bootstrap's Cargo is the seed's Targo, which does not.);
+/// * `--print=cfg` reports `trust_verify` for units that compile without it
+///   (with every Targo: it strips the switch from every probe, on purpose for a
+///   branded run, DECISION_QUEUE T14-TIPPY-1).
+///
+/// Giving the probe the off-switch the units already carry restores what
+/// upstream Cargo delivered. It turns no verification on and the probe
+/// compiles nothing ([`is_cargo_target_info_probe`] admits only Cargo's probe
+/// shape, read as rustc's getopts reads it, and every print kind in it stops
+/// compilation: a `--print=native-static-libs` compile, or `-gL --print=cfg`,
+/// whose `-L` takes the print as its path, is not a probe), so it can neither
+/// produce nor launder evidence; the T6 refusal stays in force for every
+/// compile that verifies.
+///
+/// Scope: TARGETED probes on a driver under a `stage1`, `stage2` or `stage3`
+/// directory ([`targeted_rustc_is_built_stage`]). That is every Cargo run whose
+/// build compiler is stage 1 or later, not only the stage-1 std build: the
+/// stage-2 compiler build, tools built by a stage-1 compiler, `x.py test
+/// library/*` at stage >= 1 and Cargo-testsuite fixtures under the Cargo-test
+/// shim with `--target` get the switch on their probe too. Each of those units
+/// already compiles with it (bootstrap's rustflags at a build-compiler stage
+/// >= 1, or the shim's compile clause), and no manifest, Cargo config or build
+/// script in the tree reads `cfg(trust_verify)` or `CARGO_CFG_TRUST_VERIFY`.
+/// Only a seed driver's probe (bootstrap's `stage0`, or an installed `trustc`
+/// named as `build.rustc`) keeps today's answer, and so does a host probe (no
+/// `--target`), which bootstrap's std rustflags, and so `-Zinline-mir`, never
+/// reach. The directory test is a name test: a seed that lives under another
+/// checkout's `stage1`/`stage2`/`stage3` directory counts as built, which is
+/// harmless for the same reason (the shim's compile clause already gives that
+/// seed's units the switch).
+fn trust_bootstrap_off_switch_applies(
+    has_target: bool,
+    requested: bool,
+    targeted_rustc_supports_no_verify: bool,
+    rustc_driver_supports_no_verify: bool,
+    driver_is_built_stage: bool,
+    args: &[OsString],
+    crate_name: Option<&str>,
+) -> bool {
+    trust_bootstrap_no_verify_applies(
+        has_target,
+        requested,
+        targeted_rustc_supports_no_verify,
+        rustc_driver_supports_no_verify,
+        args,
+        crate_name,
+    ) || (requested && has_target && driver_is_built_stage && is_cargo_target_info_probe(args))
+}
+
 /// Whether THIS unit is one the `library/` opt-in named, i.e. the one case where
 /// a bootstrap-driven compile runs with the verifier ON.
 ///
@@ -661,11 +854,49 @@ fn trust_bootstrap_verify_unit_applies(
 }
 
 fn rustc_driver_supports_trust_no_verify(rustc_driver: &OsString) -> bool {
+    // Trust: host units use RUSTC_SNAPSHOT, normally stage0/bin/rustc. The
+    // compatibility name supports the off-switch when its snapshot actually
+    // carries a Trust payload. Vintage-specific spelling is selected by
+    // finalize_trust_verify_control. A directory named stage0 alone does not
+    // establish that a rustc-named snapshot is a Trust seed.
+
+    // Trust: an admitted Trust snapshot grants the environment transport, not
+    // this tree's argv spelling; snapshot finalization strips that spelling.
+    Path::new(rustc_driver).file_stem().and_then(|stem| stem.to_str()) == Some("trustc")
+        || targeted_rustc_is_built_stage(rustc_driver)
+        || snapshot_is_trust_seed(rustc_driver)
+}
+
+/// A Trust seed snapshot, as opposed to a bring-your-own stock stage0
+/// installed into the same `stage0/bin` shape: bootstrap's snapshot path
+/// is the seed's `rustc` launcher, whose stem carries no Trust identity,
+/// but the seed payload ships `trustc` beside it and a stock snapshot
+/// does not. Without this, untargeted host units (build scripts, proc
+/// macros, build dependencies) compiled by the seed got no off-switch
+/// and verified against the seed's strict default (measured: memchr
+/// and find-msvc-tools build units failing strict verification during
+/// `x.py build --stage 1` against the 0.11.0 seed).
+fn snapshot_is_trust_seed(rustc_driver: &OsString) -> bool {
+    if !targeted_rustc_is_stage0_snapshot(rustc_driver) {
+        return false;
+    }
     let path = Path::new(rustc_driver);
-    path.file_stem().and_then(|stem| stem.to_str()) == Some("trustc")
-        || path.components().any(|component| {
-            matches!(component.as_os_str().to_str(), Some("stage1" | "stage2" | "stage3"))
-        })
+    path.with_file_name("trustc").exists() || path.with_file_name("trustc.exe").exists()
+}
+
+// Trust: a driver this source tree BUILT — one under a `stage1`, `stage2` or
+// `stage3` directory. Narrower than `targeted_rustc_supports_trust_no_verify`
+// (which also admits a `trustc`-named seed and a `stage0` snapshot): the
+// target-information probe's off-switch (`trust_bootstrap_off_switch_applies`)
+// is scoped to it so that a seed driver's probe keeps today's answer. A name
+// test, like its siblings: a seed under another checkout's `stage1` directory
+// passes it (see `trust_bootstrap_off_switch_applies` for why that is harmless).
+// The driver-capability predicates also admit snapshots, but this probe-only
+// guard stays narrower: changing a host compile must not widen probe scope.
+fn targeted_rustc_is_built_stage(rustc_driver: &OsString) -> bool {
+    Path::new(rustc_driver).components().any(|component| {
+        matches!(component.as_os_str().to_str(), Some("stage1" | "stage2" | "stage3"))
+    })
 }
 
 // Trust: a SNAPSHOT driver is anything under a `stage0` directory — that
@@ -685,20 +916,13 @@ fn targeted_rustc_is_stage0_snapshot(rustc_driver: &OsString) -> bool {
 }
 
 // Trust: targeted compiles may run on the stage0 snapshot (e.g. stage0 -> stage1
-// compiler artifacts). A bootstrap-managed snapshot (under `build/<triple>/stage0/`)
-// or a `trustc`-named driver is Trust-native and understands the off-switch
-// CONCEPT; whether it parses the current argv SPELLING is a vintage question —
-// see `targeted_rustc_is_stage0_snapshot`. A bring-your-own stage0
-// (e.g. `/opt/homebrew/bin/rustc`) is stock upstream and has neither.
+// compiler artifacts). A snapshot with a Trust companion payload, or a
+// `trustc`-named driver, understands the off-switch CONCEPT; whether it parses
+// the current argv SPELLING is a vintage question — see
+// `targeted_rustc_is_stage0_snapshot`. A stock-shaped snapshot is unsupported
+// in both the host and targeted arms.
 fn targeted_rustc_supports_trust_no_verify(rustc_driver: &OsString) -> bool {
-    let path = Path::new(rustc_driver);
-    path.file_stem().and_then(|stem| stem.to_str()) == Some("trustc")
-        || path.components().any(|component| {
-            matches!(
-                component.as_os_str().to_str(),
-                Some("stage0" | "stage1" | "stage2" | "stage3")
-            )
-        })
+    rustc_driver_supports_trust_no_verify(rustc_driver)
 }
 
 // Trust: the shim is the only bootstrap component that knows the concrete driver
@@ -725,7 +949,28 @@ fn normalized_exe_arg(arg: &OsString, host: &str) -> PathBuf {
     PathBuf::from(exe(arg.to_str().expect("only utf8 paths are supported"), host))
 }
 
-fn run_version_query(mut cmd: Command, arg_file: Option<tempfile::NamedTempFile>) -> ! {
+// Trust: normal bootstrap retains its historical 0xfe signal encoding. A
+// validated Cargo-test sidecar makes this a fixture compiler, whose caller
+// observes the compiler's Unix signal (not an ordinary exit code). Run only
+// after reaping the compiler and dropping any materialized response file.
+fn propagate_cargo_test_signal(status: std::process::ExitStatus, cargo_test_fixture: bool) {
+    #[cfg(unix)]
+    if let Some(signal) = cargo_fixture_termination_signal(cargo_test_fixture, status) {
+        if let Err(error) = io::stdout().flush().and_then(|()| io::stderr().flush()) {
+            eprintln!("rustc shim: failed to flush output before compiler {status}: {error}");
+            std::process::exit(0xfe);
+        }
+        forward_cargo_fixture_signal(signal);
+    }
+    #[cfg(not(unix))]
+    let _ = (status, cargo_test_fixture);
+}
+
+fn run_version_query(
+    mut cmd: Command,
+    arg_file: Option<tempfile::NamedTempFile>,
+    cargo_test_fixture: bool,
+) -> ! {
     let output =
         cmd.output().unwrap_or_else(|_| panic!("\nFailed to run:\n{cmd:?}\n-------------"));
     // `process::exit` below skips destructors, so close any forced response
@@ -738,6 +983,7 @@ fn run_version_query(mut cmd: Command, arg_file: Option<tempfile::NamedTempFile>
     }
     io::stdout().write_all(stdout.as_bytes()).expect("failed to write rustc version stdout");
     io::stderr().write_all(&output.stderr).expect("failed to write rustc version stderr");
+    propagate_cargo_test_signal(output.status, cargo_test_fixture);
     match output.status.code() {
         Some(code) => std::process::exit(code),
         None => std::process::exit(0xfe),

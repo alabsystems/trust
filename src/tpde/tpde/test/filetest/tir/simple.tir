@@ -1,0 +1,67 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+;
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+; RUN: %tpde_test --run-until=ir --print-ir %s | FileCheck %s --dump-input always
+
+; CHECK: Printing IR
+
+; Comment
+
+; CHECK-LABEL: Function myfunc
+; CHECK-NEXT: Argument a
+myfunc(%a) {
+; CHECK-NEXT: Block entry
+; CHECK-NEXT: Succ ret
+; CHECK-NEXT: Succ other
+  entry:
+; CHECK-NEXT: Value alloca (alloca)
+; CHECK-NEXT: Op $16
+; CHECK-NEXT: Op $8
+    %alloca = alloca 16, 8
+; CHECK-NEXT: Value val
+    %val =
+; CHECK-NEXT: Value dep
+; CHECK-NEXT: Op alloca
+; CHECK-NEXT: Op val
+; CHECK-NEXT: Op tbd
+    %dep = %alloca, %val, %tbd
+; CHECK-NEXT: Value tbd
+; CHECK-NEXT: Op val
+    %tbd = %val
+; CHECK-NEXT: Value (jump)
+; CHECK-NEXT: Op ^ret
+; CHECK-NEXT: Op ^other
+    jump ^ret, ^other
+; CHECK-NEXT: Block other
+; CHECK-NEXT: Succ ret
+  other:
+; CHECK-NEXT: Value val2
+; CHECK-NEXT: Op tbd
+    %val2 = %tbd
+; CHECK-NEXT: Value (jump)
+; CHECK-NEXT: Op ^ret
+    jump ^ret
+; CHECK-NEXT: Block ret
+  ret:
+; CHECK-NEXT: PHI phi
+; CHECK-NEXT: val from entry
+; CHECK-NEXT: val2 from other
+    %phi = phi [^entry, %val], [^other, %val2]
+; CHECK-NEXT: Value (terminate)
+    terminate
+}
+
+; CHECK-LABEL: Function secfunc
+; CHECK-NEXT: Argument a
+; CHECK-NEXT: Argument b
+secfunc(%a, %b) {
+; CHECK-NEXT: Block entry
+  entry:
+; CHECK-NEXT: Value val
+    %val =
+; CHECK-NEXT: Value (ret)
+; CHECK-NEXT: Op val
+    ret %val
+}
+; CHECK-EMPTY

@@ -97,16 +97,12 @@ fn reclassified_vc_kind(result: &VerificationResult) -> trust_types::VcKind {
         "overflow:add" | "arithmetic_overflow:add" | "arithmetic_overflow_add" => Some(BinOp::Add),
         "overflow:sub" | "arithmetic_overflow:sub" | "arithmetic_overflow_sub" => Some(BinOp::Sub),
         "overflow:mul" | "arithmetic_overflow:mul" | "arithmetic_overflow_mul" => Some(BinOp::Mul),
-        kind if matches!(
-            kind,
-            "hardened_panic_boundary"
-                | "hardened::panic_boundary"
-                | "hardened:panic_boundary"
-                | "hardened_panic"
-                | "hardened::panic"
-                | "hardened:panic"
-        ) =>
-        {
+        "hardened_panic_boundary"
+        | "hardened::panic_boundary"
+        | "hardened:panic_boundary"
+        | "hardened_panic"
+        | "hardened::panic"
+        | "hardened:panic" => {
             if result.message.contains("mir_assert::Overflow(Add)") {
                 Some(BinOp::Add)
             } else if result.message.contains("mir_assert::Overflow(Sub)") {
@@ -176,86 +172,6 @@ pub(super) fn to_trust_pair(result: &VerificationResult) -> (VerificationConditi
         },
     };
     (vc, vr)
-}
-
-#[cfg(test)]
-mod typed_kind_tests {
-    use trust_types::{BinOp, TransportObligationResult, Ty, VcKind};
-
-    use super::reclassified_vc_kind;
-    use crate::types::{VerificationOutcome, VerificationResult, transport_to_verification_result};
-
-    #[test]
-    fn exact_typed_arithmetic_kind_keeps_real_operand_types_for_repair() {
-        let typed_kind = VcKind::ArithmeticOverflow {
-            op: BinOp::Add,
-            operand_tys: (
-                Ty::Int { width: 8, signed: false },
-                Ty::Int { width: 16, signed: false },
-            ),
-        };
-        let transport = TransportObligationResult {
-            obligation_id: None,
-            claim_digest_sha256: None,
-            kind: typed_kind.transport_tag(),
-            typed_kind: Some(Box::new(typed_kind.clone())),
-            description: typed_kind.description(),
-            location: None,
-            outcome: trust_types::Outcome::Failed,
-            solver: "ay".to_string(),
-            time_ms: 1,
-            counterexample: None,
-            counterexample_model: None,
-            reason: None,
-            design_mandate: false,
-            native_trust_ir: None,
-            proof_evidence: None,
-            monitor: None,
-        };
-        let result = transport_to_verification_result("crate::mixed_add", &transport);
-
-        assert_eq!(reclassified_vc_kind(&result), typed_kind);
-    }
-
-    #[test]
-    fn arbitrary_unsupported_text_cannot_fabricate_an_arithmetic_repair_kind() {
-        let result = VerificationResult {
-            function: "crate::opaque".to_string(),
-            kind: "unknown".to_string(),
-            message: "unsupported semantic gap mentions mir_assert::Overflow(Add) diagnostically"
-                .to_string(),
-            outcome: VerificationOutcome::Failed,
-            backend: "trust-full-verifier".to_string(),
-            time_ms: Some(1),
-            location: None,
-            counterexample: None,
-            reason: None,
-            raw_line: String::new(),
-        };
-
-        assert!(matches!(reclassified_vc_kind(&result), VcKind::UnsupportedMir { .. }));
-    }
-
-    #[test]
-    fn fieldless_legacy_arithmetic_tag_retains_narrow_repair_compatibility() {
-        let result = VerificationResult {
-            function: "crate::legacy_add".to_string(),
-            kind: "overflow:add".to_string(),
-            message: "arithmetic overflow (Add)".to_string(),
-            outcome: VerificationOutcome::Failed,
-            backend: "ay".to_string(),
-            time_ms: Some(1),
-            location: None,
-            counterexample: None,
-            reason: None,
-            raw_line: String::new(),
-        };
-
-        assert!(matches!(
-            reclassified_vc_kind(&result),
-            VcKind::ArithmeticOverflow { op: BinOp::Add, .. }
-        ));
-    }
 }
 
 pub(super) fn proposal_kind_tag(kind: &ProposalKind) -> &'static str {
@@ -428,4 +344,88 @@ pub(super) fn extract_file_path(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod typed_kind_tests {
+    use trust_types::{BinOp, TransportObligationResult, Ty, VcKind};
+
+    use super::reclassified_vc_kind;
+    use crate::types::{VerificationOutcome, VerificationResult, transport_to_verification_result};
+
+    #[test]
+    fn exact_typed_arithmetic_kind_keeps_real_operand_types_for_repair() {
+        let typed_kind = VcKind::ArithmeticOverflow {
+            op: BinOp::Add,
+            operand_tys: (
+                Ty::Int { width: 8, signed: false },
+                Ty::Int { width: 16, signed: false },
+            ),
+        };
+        let transport = TransportObligationResult {
+            assumes: Vec::new(),
+            gap_class: None,
+            obligation_id: None,
+            claim_digest_sha256: None,
+            kind: typed_kind.transport_tag(),
+            original_vc_snapshot: None,
+            typed_kind: Some(Box::new(typed_kind.clone())),
+            description: typed_kind.description(),
+            location: None,
+            outcome: trust_types::Outcome::Failed,
+            solver: "ay".to_string(),
+            time_ms: 1,
+            counterexample: None,
+            counterexample_model: None,
+            reason: None,
+            design_mandate: false,
+            native_trust_ir: None,
+            proof_evidence: None,
+            monitor: None,
+            grade: None,
+        };
+        let result = transport_to_verification_result("crate::mixed_add", &transport, None, None);
+
+        assert_eq!(reclassified_vc_kind(&result), typed_kind);
+    }
+
+    #[test]
+    fn arbitrary_unsupported_text_cannot_fabricate_an_arithmetic_repair_kind() {
+        let result = VerificationResult {
+            function: "crate::opaque".to_string(),
+            kind: "unknown".to_string(),
+            message: "unsupported semantic gap mentions mir_assert::Overflow(Add) diagnostically"
+                .to_string(),
+            outcome: VerificationOutcome::Failed,
+            backend: "trust-full-verifier".to_string(),
+            time_ms: Some(1),
+            location: None,
+            counterexample: None,
+            reason: None,
+            raw_line: String::new(),
+        };
+
+        assert!(matches!(reclassified_vc_kind(&result), VcKind::UnsupportedMir { .. }));
+    }
+
+    #[test]
+    fn fieldless_legacy_arithmetic_tag_retains_narrow_repair_compatibility() {
+        let result = VerificationResult {
+            function: "crate::legacy_add".to_string(),
+            kind: "overflow:add".to_string(),
+            message: "arithmetic overflow (Add)".to_string(),
+            outcome: VerificationOutcome::Failed,
+            backend: "ay".to_string(),
+            time_ms: Some(1),
+            location: None,
+            counterexample: None,
+            reason: None,
+            raw_line: String::new(),
+        };
+
+        assert!(matches!(
+            reclassified_vc_kind(&result),
+            VcKind::ArithmeticOverflow { op: BinOp::Add, .. }
+        ));
+    }
 }

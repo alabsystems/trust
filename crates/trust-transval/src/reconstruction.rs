@@ -1,3 +1,4 @@
+// ignore-tidy-file-todo -- test fixtures carry decompiled `todo!` text as data; tidy's check is textual
 // trust-transval: Conservative reconstructed-output validation
 //
 // This is intentionally a thin scaffold over the existing translation
@@ -709,6 +710,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

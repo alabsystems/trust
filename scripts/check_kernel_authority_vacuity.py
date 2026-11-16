@@ -37,12 +37,41 @@ lane is body-aware and is sound.
 
 This script is therefore EXPECTED TO FAIL on `trust-e26541e3` and on any
 toolchain that predates the kind gate in `trust_certify::certify_vc`. That
-failure is the finding, not a defect in the script.
+failure is the finding, not a defect in the script. Do not delete that row when
+it stops reproducing: its condition is what makes it readable later.
+
+MEASURED, 2026-09-27, on `rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc
+0.1.0)` -- i.e. POST-kind-gate, so the conditional above predicts a green run:
+
+    kind        1==1     x==x     true     false    x>=0     x>100     verdict
+    requires    unknown  unknown  skipped  skipped  unknown  unknown   REFUSED
+    ensures     proved   proved   unknown  unknown  PROVED   unknown   CONTENTFUL
+    invariant   unknown  unknown  unknown  unknown  unknown  unknown   REFUSED
+    decreases   unknown  unknown  unknown  unknown  unknown  unknown   REFUSED
+
+`invariant` has dropped from VACUOUS to REFUSED: that is the kind gate working,
+and it must never be "fixed" by making tautologies provable again for that kind.
+`ensures` still proves `x >= 0` via `clean-kernel-certified`, and that single
+cell is this gate's POSITIVE CONTROL -- see `main`.
+
+WHY THE CONTROLS ARE NOT OPTIONAL
+---------------------------------
+Every verdict here is a claim about what the verifier PROVED, so a silent
+verifier makes all four kinds REFUSED and the table reads as a clean bill of
+health. Measured: renaming the probe's `-Ztrust-verify` to an unknown `-Z`
+spelling makes trustc exit 1 having compiled nothing, and before the controls
+this script still printed `OK` and exited 0. `absent` outcomes and nonzero
+trustc exits are therefore refusals (exit 2), not evidence.
 
 Usage:
     python3 scripts/check_kernel_authority_vacuity.py [--trustc PATH] [--json]
 
-Exit status: 0 if no kind's provable set is exactly the tautologies; 1 otherwise.
+Exit status:
+    0  the probe ran, the positive control held, and no kind's provable set is
+       exactly the tautologies
+    1  some kind's provable set is exactly the tautologies (the finding)
+    2  REFUSED to judge: trustc is missing, a probe did not compile, every cell
+       was silent, or the positive control is absent. No claim either way.
 
 Author: Andrew Yates <andrewyates.name@gmail.com>
 Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -82,7 +111,15 @@ KINDS = ["requires", "ensures", "invariant", "decreases"]
 
 
 def run_probe(trustc: str, workdir: str, kind: str, label: str, predicate: str):
-    """Compile one probe and return (outcome, solver) for the clause's row."""
+    """Compile one probe and return (outcome, solver, returncode) for the clause's row.
+
+    The returncode is returned, not discarded: a trustc that refuses the probe
+    invocation outright (an unknown `-Z` flag after an upstream rename, a missing
+    attribute surface) emits no `TRUST_JSON:` row at all, and without the exit
+    status that silence is indistinguishable from "the clause was not provable".
+    `absent` means "the instrument said nothing"; `compile_error` means "the
+    instrument did not run". Neither is evidence about the program.
+    """
     stem = f"probe_{kind}_{label}".replace("=", "eq").replace(">", "gt").replace("<", "lt")
     src = os.path.join(workdir, f"{stem}.rs")
     with open(src, "w") as handle:
@@ -119,15 +156,17 @@ def run_probe(trustc: str, workdir: str, kind: str, label: str, predicate: str):
             # A `proved` row anywhere for this function is what matters: it is
             # the row that would reach a ratchet's proved_by_kind bucket.
             if row.get("outcome") == "proved":
-                return "proved", row.get("solver", "?")
+                return "proved", row.get("solver", "?"), proc.returncode
             if outcome == "absent":
                 outcome, solver = row.get("outcome", "?"), row.get("solver", "?")
-    return outcome, solver
+    if outcome == "absent" and proc.returncode != 0:
+        outcome = "compile_error"
+    return outcome, solver, proc.returncode
 
 
 def classify(rows):
     """Verdict for one kind, from the set of predicate classes it PROVES."""
-    proved_classes = {cls for (_, _, cls), (outcome, _) in rows if outcome == "proved"}
+    proved_classes = {cls for (_, _, cls), (outcome, _, _) in rows if outcome == "proved"}
     if not proved_classes:
         return "REFUSED", "nothing is provable; the kind reaches no proof authority"
     if proved_classes == {"tautology"}:
@@ -143,14 +182,37 @@ def classify(rows):
     return "REVIEW", f"provable classes {sorted(proved_classes)} need a human judgement"
 
 
+def _default_trustc() -> str:
+    """$TRUSTC, else trustc on PATH, else the channel link, else the sealed dir.
+
+    The old default was the sealed `~/toolchains/trust-current/bin/trustc`
+    alone, which does not exist on every machine and made the required
+    `fast.kernel-authority-vacuity` row RED at its default while the channel's
+    trustc passed in ~18s (measured 2026-09-14).
+    """
+    if os.environ.get("TRUSTC"):
+        return os.environ["TRUSTC"]
+    for cand in (
+        shutil.which("trustc"),
+        os.path.expanduser("~/.rustup/toolchains/trust/bin/trustc"),
+        os.path.join(
+            os.environ.get("TRUST_TOOLCHAIN_HOME", os.path.expanduser("~/toolchains")),
+            "trust-current",
+            "bin",
+            "trustc",
+        ),
+    ):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return "trustc"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--trustc",
-        default=os.environ.get(
-            "TRUSTC", os.path.expanduser("~/toolchains/trust-current/bin/trustc")
-        ),
-        help="trustc to probe (default: the sealed ~/toolchains/trust-current)",
+        default=_default_trustc(),
+        help="trustc to probe (default: $TRUSTC, else trustc on PATH, else the sealed channel)",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable results")
     args = parser.parse_args()
@@ -178,8 +240,9 @@ def main() -> int:
                     kind: {
                         "probes": {
                             label: {"predicate": pred, "class": cls,
-                                    "outcome": outcome, "solver": solver}
-                            for (label, pred, cls), (outcome, solver) in rows
+                                    "outcome": outcome, "solver": solver,
+                                    "trustc_exit": rc}
+                            for (label, pred, cls), (outcome, solver, rc) in rows
                         },
                         "verdict": verdicts[kind][0],
                         "reason": verdicts[kind][1],
@@ -200,15 +263,53 @@ def main() -> int:
         print(header + "verdict")
         print("-" * (len(header) + 12))
         for kind in KINDS:
-            cells = "".join(outcome.ljust(width) for _, (outcome, _) in results[kind])
+            cells = "".join(outcome.ljust(width) for _, (outcome, _, _) in results[kind])
             print(kind.ljust(11) + cells + verdicts[kind][0])
         print()
         for kind in KINDS:
             verdict, reason = verdicts[kind]
             print(f"  {kind:<10} {verdict}: {reason}")
-            for (label, _, cls), (outcome, solver) in results[kind]:
+            for (label, _, cls), (outcome, solver, _) in results[kind]:
                 if outcome == "proved":
                     print(f"               proved {label} ({cls}) via {solver}")
+
+    # POSITIVE CONTROL. Both verdicts this script can report -- VACUOUS and
+    # "no kind is vacuous" -- are claims about what the verifier PROVED, so
+    # neither means anything until the probe is shown to be able to observe a
+    # proof at all. Without these two checks a trustc that answers nothing
+    # (renamed `-Z` flag, moved attribute surface, renamed `TRUST_JSON:` prefix,
+    # verification switched off) yields 24 silent cells, four REFUSED verdicts
+    # and exit 0 -- a required soundness gate reporting OK on no measurement.
+    # Same shape as the selftest in scripts/trust_intbound_strict_gate.sh.
+    probe_cells = [
+        (kind, label, outcome, rc)
+        for kind, rows in results.items()
+        for (label, _, _), (outcome, _, rc) in rows
+    ]
+    broken = [(kind, label, rc) for kind, label, _, rc in probe_cells if rc != 0]
+    silent = [(kind, label) for kind, label, outcome, _ in probe_cells
+              if outcome in ("absent", "compile_error")]
+    if broken or len(silent) == len(probe_cells):
+        detail = ", ".join(f"{kind}/{label} exit {rc}" for kind, label, rc in broken[:4])
+        print(
+            f"\nREFUSE: the probe did not run -- {len(silent)}/{len(probe_cells)} cells "
+            f"produced no verifier row, {len(broken)}/{len(probe_cells)} probes exited "
+            f"nonzero{' (' + detail + ')' if detail else ''}. A REFUSED table from a "
+            "silent instrument is not a measurement, so this gate makes no claim.",
+            file=sys.stderr,
+        )
+        return 2
+
+    contentful = [kind for kind, (verdict, _) in verdicts.items() if verdict == "CONTENTFUL"]
+    if not contentful:
+        print(
+            "\nREFUSE: positive control absent -- no kind proves a non-tautology "
+            "(`ensures` did not prove `x >= 0`), so this probe cannot distinguish a "
+            "lane that reasons about the program from one that does not, and a "
+            "REFUSED verdict carries no information about vacuity.",
+            file=sys.stderr,
+        )
+        return 2
 
     vacuous = [kind for kind, (verdict, _) in verdicts.items() if verdict == "VACUOUS"]
     if vacuous:

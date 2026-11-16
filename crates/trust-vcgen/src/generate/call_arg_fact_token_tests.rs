@@ -35,6 +35,7 @@ fn caller_with(pre_call_stmts: Vec<Statement>) -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("crate::g"),
                         is_foreign: false,
                     },
                 },
@@ -56,6 +57,7 @@ fn caller_with(pre_call_stmts: Vec<Statement>) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

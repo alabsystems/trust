@@ -20,12 +20,15 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::{
-    AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Contract, ContractKind, Formula,
-    LocalDecl, Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty,
-    UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
+    AdtKind, AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Contract, ContractKind,
+    Formula, LocalDecl, Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement,
+    Terminator, Ty, UnwindEdge, VariantDef, VcKind, VerifiableBody, VerifiableFunction,
 };
 
-use super::{BMC_MAX_UNROLL, generate_bounded_reduction_bmc_refutation_candidates, int_range};
+use super::{
+    BMC_MAX_UNROLL, generate_bounded_reduction_bmc_refutation_candidates, int_range,
+    is_integer_param_range_fact,
+};
 
 const INTO_ITER: &str = "<&[u8; 64] as core::iter::traits::collect::IntoIterator>::into_iter";
 const NEXT: &str = "<core::slice::Iter<u8> as core::iter::traits::iterator::Iterator>::next";
@@ -110,6 +113,74 @@ enum OptionSwitch {
     /// Exhaustiveness bit set and `otherwise -> bb6: Unreachable`, but `bb6` is
     /// ALSO a live case target, so it is genuinely reached and must be refused.
     UnreachableAlsoACaseTarget,
+    /// Same CFG as `ExhaustiveUnreachable` but the switch cases are `{0, 1}` while
+    /// the scrutinee's declared enum has THREE variants — the real
+    /// `unreachable_unchecked()`-shaped partial match. The `otherwise` arm IS
+    /// reachable (at discriminant 2) and must keep being refused even though the
+    /// scrutinee now carries genuine datatype evidence.
+    PartialMatchOverAThreeVariantEnum,
+}
+
+/// The DECLARED type of local `_5` (the `next()` result), which is the evidence
+/// `bmc_terminator_succs` reads to decide whether a switch's `otherwise` edge is
+/// dead. Nothing else in this module inspects it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrutineeTy {
+    /// The historical spelling: no datatype evidence at all. A `Discriminant`
+    /// read of it says nothing about the value set, so no edge may be pruned.
+    Opaque,
+    /// A real `Option`-shaped `enum` ADT: variants `None = 0`, `Some = 1`.
+    OptionEnum,
+    /// The same variant list spelled as a `struct`. A `Discriminant` read of a
+    /// struct is not a sum tag, so this must prune nothing.
+    OptionShapedStruct,
+    /// A real three-variant `enum` (`A = 0`, `B = 1`, `C = 2`).
+    ThreeVariantEnum,
+}
+
+fn option_variants() -> Vec<VariantDef> {
+    vec![
+        VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+        VariantDef { name: "Some".into(), discriminant: 1, fields: vec![] },
+    ]
+}
+
+fn three_variants() -> Vec<VariantDef> {
+    vec![
+        VariantDef { name: "A".into(), discriminant: 0, fields: vec![] },
+        VariantDef { name: "B".into(), discriminant: 1, fields: vec![] },
+        VariantDef { name: "C".into(), discriminant: 2, fields: vec![] },
+    ]
+}
+
+fn adt(name: &str, variants: Vec<VariantDef>, kind: AdtKind) -> Ty {
+    Ty::Adt {
+        name: name.into(),
+        fields: vec![].into(),
+        variants: variants.into(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        layout: None,
+        enum_layout: None,
+        adt_kind: Some(kind),
+        // Added upstream during the 1377-commit merge. `None` = no
+        // arbitrary-precision authority claimed, which is what these
+        // fixtures' ordinary fixed-width enums are; every other test
+        // constructor in the crate spells it the same way.
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    }
+}
+
+fn scrutinee_ty(kind: ScrutineeTy) -> Ty {
+    match kind {
+        ScrutineeTy::Opaque => opaque_ty(),
+        ScrutineeTy::OptionEnum => adt("core::option::Option", option_variants(), AdtKind::Enum),
+        ScrutineeTy::OptionShapedStruct => {
+            adt("core::option::Option", option_variants(), AdtKind::Struct)
+        }
+        ScrutineeTy::ThreeVariantEnum => adt("test::E3", three_variants(), AdtKind::Enum),
+    }
 }
 
 struct ReductionSpec {
@@ -130,6 +201,8 @@ struct ReductionSpec {
     foreign_call: bool,
     /// How the `Option` switch and its dead arm are spelled.
     option_switch: OptionSwitch,
+    /// The declared type of the switched-on `next()` result.
+    scrutinee: ScrutineeTy,
 }
 
 impl ReductionSpec {
@@ -145,6 +218,7 @@ impl ReductionSpec {
             second_add: false,
             foreign_call: false,
             option_switch: OptionSwitch::NoneIsOtherwise,
+            scrutinee: ScrutineeTy::Opaque,
         }
     }
 }
@@ -174,7 +248,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
             name: None,
         },
         LocalDecl { index: 4, ty: opaque_ty(), name: None },
-        LocalDecl { index: 5, ty: opaque_ty(), name: None },
+        LocalDecl { index: 5, ty: scrutinee_ty(spec.scrutinee), name: None },
         LocalDecl { index: 6, ty: Ty::Int { width: 64, signed: true }, name: None },
         LocalDecl { index: 7, ty: opaque_ty(), name: None },
         LocalDecl { index: 8, ty: opaque_ty(), name: None },
@@ -281,6 +355,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key(&INTO_ITER.to_string()),
                 unwind: UnwindEdge::Unreachable,
             },
         },
@@ -300,6 +375,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key(&NEXT.to_string()),
                 unwind: UnwindEdge::Unreachable,
             },
         },
@@ -365,6 +441,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("test::side_effect"),
             unwind: UnwindEdge::Unreachable,
         };
     }
@@ -397,6 +474,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("test::side_effect"),
                 unwind: UnwindEdge::Unreachable,
             }
         } else {
@@ -420,6 +498,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -569,6 +648,7 @@ fn a_tail_call_after_the_loop_is_refused() {
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key("some::tail_consumer"),
     };
     assert!(
         generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
@@ -776,6 +856,53 @@ fn an_integer_parameter_type_range_is_certified_but_a_narrower_range_is_refused(
     );
 }
 
+/// INTRINSIC-RESIDUAL-1: the generator states a `u128` parameter's range as
+/// `0 <= p <= UInt(u128::MAX)` (its MAX has no `Formula::Int` spelling). That exact
+/// pair is the type's range and is certified; the `i128` range keeps its `Int`
+/// spelling; anything narrower, or the `u128` pair on a narrower type, is refused.
+#[test]
+fn a_128_bit_parameter_type_range_is_certified_in_its_generator_spelling() {
+    let with_param_ty = |ty: Ty| {
+        let mut func = shift_reduction_overflow_fixture();
+        func.body.arg_count = 2;
+        func.body.locals[2].ty = ty;
+        func
+    };
+    let fact = |min: Formula, max: Formula| {
+        Formula::And(vec![
+            Formula::Ge(Box::new(Formula::Var("t".into(), Sort::Int)), Box::new(min)),
+            Formula::Le(Box::new(Formula::Var("t".into(), Sort::Int)), Box::new(max)),
+        ])
+    };
+    let u128_func = with_param_ty(Ty::Int { width: 128, signed: false });
+    assert!(is_integer_param_range_fact(
+        &u128_func,
+        &fact(Formula::Int(0), Formula::UInt(u128::MAX))
+    ));
+    assert!(!is_integer_param_range_fact(
+        &u128_func,
+        &fact(Formula::Int(0), Formula::UInt(u128::MAX - 1))
+    ));
+    assert!(!is_integer_param_range_fact(
+        &u128_func,
+        &fact(Formula::Int(0), Formula::Int(i128::MAX))
+    ));
+    let i128_func = with_param_ty(Ty::Int { width: 128, signed: true });
+    assert!(is_integer_param_range_fact(
+        &i128_func,
+        &fact(Formula::Int(i128::MIN), Formula::Int(i128::MAX))
+    ));
+    assert!(!is_integer_param_range_fact(
+        &i128_func,
+        &fact(Formula::Int(0), Formula::Int(i128::MAX))
+    ));
+    let u64_func = with_param_ty(Ty::Int { width: 64, signed: false });
+    assert!(!is_integer_param_range_fact(
+        &u64_func,
+        &fact(Formula::Int(0), Formula::UInt(u128::MAX))
+    ));
+}
+
 // ── the caller-claimed exhaustive-enum arm ───────────────────────────────────
 
 #[test]
@@ -796,6 +923,119 @@ fn the_public_exhaustiveness_bit_cannot_prune_an_unreachable_successor() {
     assert!(
         generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
         "a caller-constructible exhaustiveness bit cannot erase a reachable successor"
+    );
+}
+
+/// The restoring half of the rule: with the SAME CFG and the SAME public bit,
+/// but with the scrutinee's DECLARED type spelling a two-variant enum whose
+/// discriminants are exactly the case set, the `otherwise` arm is dead by the
+/// type and the lane fires.
+///
+/// This is what `4ca0cb0eac` asked for when it removed the hint-keyed override:
+/// *"A future optimization may prune only from locally rederived, subject-bound
+/// type/layout evidence."* The pair above/below is the whole rule: the bit alone
+/// prunes nothing, the declared enum type does.
+#[test]
+fn a_declared_two_variant_enum_scrutinee_makes_the_dead_arm_prunable() {
+    let mut spec = ReductionSpec::new(u8_ty(), u8_ty(), 64, Addend::ShlAfterCast(4));
+    spec.option_switch = OptionSwitch::ExhaustiveUnreachable;
+    spec.scrutinee = ScrutineeTy::OptionEnum;
+    let mut func = reduction_fn(&spec);
+    func.preconditions.push(tag_fact("_6", [0, 1]));
+    assert!(crate::validate_function(&func).is_ok());
+    assert_eq!(
+        generate_bounded_reduction_bmc_refutation_candidates(&func).len(),
+        1,
+        "a `Discriminant` read of a place declared to be a two-variant enum, with \
+         both discriminants cased, cannot reach the `otherwise` arm"
+    );
+}
+
+/// The bit is not read AT ALL, in either direction: the same typed-enum body with
+/// the exhaustiveness bit CLEARED still prunes, because the argument never used
+/// the bit. (Nothing regresses: the pruning is licensed by the type.)
+#[test]
+fn the_public_bit_is_not_consulted_in_either_direction() {
+    let mut spec = ReductionSpec::new(u8_ty(), u8_ty(), 64, Addend::ShlAfterCast(4));
+    spec.option_switch = OptionSwitch::UncertifiedUnreachable;
+    spec.scrutinee = ScrutineeTy::OptionEnum;
+    let mut func = reduction_fn(&spec);
+    func.preconditions.push(tag_fact("_6", [0, 1]));
+    assert!(matches!(
+        func.body.blocks[2].terminator,
+        Terminator::SwitchInt { exhaustive_enum_unreachable: false, .. }
+    ));
+    assert_eq!(
+        generate_bounded_reduction_bmc_refutation_candidates(&func).len(),
+        1,
+        "the verdict must depend on the declared type, never on the serialized bit"
+    );
+}
+
+/// The `unreachable_unchecked()`-shaped partial match, now under genuine datatype
+/// evidence: a THREE-variant enum with only `{0, 1}` cased. Discriminant 2 really
+/// does reach the `otherwise` arm, so the case set must be required to be the
+/// FULL declared discriminant set — a non-empty intersection is not enough.
+#[test]
+fn a_partial_match_over_a_three_variant_enum_is_still_refused() {
+    let mut spec = ReductionSpec::new(u8_ty(), u8_ty(), 64, Addend::ShlAfterCast(4));
+    spec.option_switch = OptionSwitch::PartialMatchOverAThreeVariantEnum;
+    spec.scrutinee = ScrutineeTy::ThreeVariantEnum;
+    let mut func = reduction_fn(&spec);
+    func.preconditions.push(tag_fact("_6", [0, 1]));
+    assert!(crate::validate_function(&func).is_ok());
+    assert!(
+        generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
+        "discriminant 2 is unmatched, so the `Unreachable` arm is genuinely reachable UB"
+    );
+}
+
+/// A `Discriminant` read of a STRUCT is not a sum tag, whatever variant list the
+/// serialized type carries. The `adt_kind` discriminator is what separates the
+/// two, and it must be required positively (`#[serde(default)]` makes it `None`
+/// on every pre-classification body, which therefore prunes nothing).
+#[test]
+fn an_option_shaped_struct_scrutinee_prunes_nothing() {
+    let mut spec = ReductionSpec::new(u8_ty(), u8_ty(), 64, Addend::ShlAfterCast(4));
+    spec.option_switch = OptionSwitch::ExhaustiveUnreachable;
+    spec.scrutinee = ScrutineeTy::OptionShapedStruct;
+    let mut func = reduction_fn(&spec);
+    func.preconditions.push(tag_fact("_6", [0, 1]));
+    assert!(
+        generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
+        "an ADT declared a struct carries no sum-tag exhaustiveness argument"
+    );
+}
+
+/// Belt (2) of the pruning rule, now with the type evidence present: an
+/// `Unreachable` block that a NAMED case also targets is genuinely reached, and
+/// dropping the `otherwise` edge would hide it.
+#[test]
+fn a_dead_arm_that_is_also_a_case_target_is_refused_even_with_type_evidence() {
+    let mut spec = ReductionSpec::new(u8_ty(), u8_ty(), 64, Addend::ShlAfterCast(4));
+    spec.option_switch = OptionSwitch::UnreachableAlsoACaseTarget;
+    spec.scrutinee = ScrutineeTy::OptionEnum;
+    let mut func = reduction_fn(&spec);
+    func.preconditions.push(tag_fact("_6", [0, 1]));
+    assert!(
+        generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
+        "case 0 reaches the `Unreachable` block directly; the lane must decline"
+    );
+}
+
+/// Belt (1): the exhaustiveness argument licenses dropping an edge into an
+/// `Unreachable` block and nothing else. When the `otherwise` block holds real
+/// work, the edge stays and the terminator allowlist judges it.
+#[test]
+fn a_live_otherwise_block_keeps_its_edge_even_with_type_evidence() {
+    let mut spec = ReductionSpec::new(u8_ty(), u8_ty(), 64, Addend::ShlAfterCast(4));
+    spec.option_switch = OptionSwitch::CertificateWithoutUnreachable;
+    spec.scrutinee = ScrutineeTy::OptionEnum;
+    let mut func = reduction_fn(&spec);
+    func.preconditions.push(tag_fact("_6", [0, 1]));
+    assert!(
+        generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
+        "the `otherwise` block makes an unmodelled call; pruning must not reach it"
     );
 }
 
@@ -1033,4 +1273,23 @@ fn an_unfoldable_assert_in_the_loop_is_refused() {
         generate_bounded_reduction_bmc_refutation_candidates(&f).is_empty(),
         "an assert that can fire must decline the whole unroll"
     );
+}
+
+/// T3 C07p: the lane writes its candidate into the caller's context through the row
+/// oracle, and returns the candidate the tree-only lane returns.
+#[test]
+fn bmc_candidates_go_through_the_row_oracle() {
+    use trust_types::vc_context::{Oracle, ParityCount, VcContext, same_row};
+
+    let mut rows = VcContext::new();
+    let interned = super::generate_bounded_reduction_bmc_refutation_candidates_rows(
+        &shift_reduction_overflow_fixture(),
+        &mut rows,
+    );
+    let tree =
+        generate_bounded_reduction_bmc_refutation_candidates(&shift_reduction_overflow_fixture());
+    assert_eq!(interned.len(), 1);
+    assert_eq!(tree.len(), 1);
+    assert!(same_row(&interned[0], &tree[0]));
+    assert_eq!(rows.parity(Oracle::Row), ParityCount { rows: 1, mismatches: 0 });
 }

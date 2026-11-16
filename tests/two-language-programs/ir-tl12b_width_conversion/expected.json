@@ -1,0 +1,35 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-tl12b_width_conversion",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (f344fb244 2026-09-21) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@7b9146ba2ab5 sha256:c9692ee58d31e864",
+  "clean": "first-party/clean@faf434b73aac sha256:a9d64ad7f7b7ccde",
+  "trust-cg": "first-party/trust-cg@3f79b19a3d7f sha256:f24a73c879facca4"
+ },
+ "ratchets": {
+  "GENERAL.p12b_width_conversion.widen.emit": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "CLOSED 2026-09-20 by the clean pin move to integrate/2026-09-20: the pinned signature was `Unknown identifier: toUInt64`, and the Nat/UInt floor lane registered the UIntN toNat/ofNat family, so the identifier resolves and `clean --emit trustir` now returns rc=0 with an 807-line text module."
+  },
+  "GENERAL.p12b_width_conversion.widen.obj": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "codegen license: affirmatively ungated (`body_gate: ungated`, trust-ir v41)",
+   "audit": null,
+   "moved": "NEW MEASUREMENT, first reachable now that `emit` passes. Pinned as a GAP by its named signature: the module is affirmatively ungated for codegen (`body_gate: ungated`, trust-ir v41), so the object lane declines it. This is the next step of the same chain, not a regression."
+  },
+  "GENERAL.p12b_width_conversion.widen.validate": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "NEW MEASUREMENT, not a moved pin: this ratchet could not be reached while `emit` was a GAP, because there was no module to validate. It passes on first measurement."
+  },
+  "STANDALONE.p12b_width_conversion": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "`widen` [source-shape/not-emittable]:checked source body has no supported standalone lowering",
+   "audit": "GAP"
+  }
+ }
+}

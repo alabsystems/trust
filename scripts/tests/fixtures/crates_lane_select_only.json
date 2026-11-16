@@ -1,0 +1,208 @@
+{
+  "selected": {
+    "reason": "test-plan",
+    "schema": "targo.test-plan-selection.v1",
+    "plan": "<plan>",
+    "sha256": "<sha256>",
+    "selection": {
+      "changed_paths": [
+        "crates/outer/src/gen/a.rs",
+        "fixtures/one.txt"
+      ],
+      "changed_ranges": [],
+      "packages": [],
+      "reached": [
+        "crates/host"
+      ],
+      "whole_plan": false,
+      "requests": []
+    },
+    "members": {
+      "touched": [
+        "outer"
+      ],
+      "reached": [
+        "host"
+      ],
+      "selected": [
+        "host",
+        "outer"
+      ]
+    },
+    "requests": [
+      {
+        "id": "default",
+        "role": "default",
+        "packages": [
+          "host",
+          "outer"
+        ],
+        "active": true,
+        "why": "2 members selected (1 touched, 1 reached)"
+      },
+      {
+        "id": "outer-extra",
+        "role": "variant",
+        "packages": [
+          "outer"
+        ],
+        "active": true,
+        "why": "package `outer` is touched"
+      },
+      {
+        "id": "inner-extra",
+        "role": "variant",
+        "packages": [
+          "inner"
+        ],
+        "active": false,
+        "why": "package `inner` is not selected"
+      },
+      {
+        "id": "host-fixtures",
+        "role": "instrument",
+        "packages": [
+          "host"
+        ],
+        "active": true,
+        "why": "changed path `crates/outer/src/gen/a.rs` is under `crates/outer/src/gen`"
+      },
+      {
+        "id": "host-docs",
+        "role": "instrument",
+        "packages": [
+          "host"
+        ],
+        "active": false,
+        "why": "no changed path meets its `when-changed` conditions"
+      }
+    ],
+    "elsewhere": [],
+    "workspaces": [],
+    "tools": [],
+    "unattributed": [],
+    "phases": []
+  },
+  "refused": {
+    "reason": "test-plan",
+    "schema": "targo.test-plan-selection.v1",
+    "plan": "<plan>",
+    "sha256": "<sha256>",
+    "selection": {
+      "changed_paths": [
+        "crates/nobody/src/lib.rs"
+      ],
+      "changed_ranges": [],
+      "packages": [],
+      "reached": [],
+      "whole_plan": false,
+      "requests": []
+    },
+    "members": {
+      "touched": [],
+      "reached": [],
+      "selected": []
+    },
+    "requests": [
+      {
+        "id": "default",
+        "role": "default",
+        "packages": [],
+        "active": false,
+        "why": "no plan member is touched or reached"
+      },
+      {
+        "id": "outer-extra",
+        "role": "variant",
+        "packages": [
+          "outer"
+        ],
+        "active": false,
+        "why": "package `outer` is not selected"
+      },
+      {
+        "id": "inner-extra",
+        "role": "variant",
+        "packages": [
+          "inner"
+        ],
+        "active": false,
+        "why": "package `inner` is not selected"
+      },
+      {
+        "id": "host-fixtures",
+        "role": "instrument",
+        "packages": [
+          "host"
+        ],
+        "active": false,
+        "why": "no changed path meets its `when-changed` conditions"
+      },
+      {
+        "id": "host-docs",
+        "role": "instrument",
+        "packages": [
+          "host"
+        ],
+        "active": false,
+        "why": "no changed path meets its `when-changed` conditions"
+      }
+    ],
+    "elsewhere": [],
+    "workspaces": [],
+    "tools": [],
+    "unattributed": [
+      {
+        "path": "crates/nobody/src/lib.rs",
+        "why": "no workspace member owns it"
+      }
+    ],
+    "phases": []
+  },
+  "limited": {
+    "reason": "test-plan",
+    "schema": "targo.test-plan-selection.v1",
+    "plan": "<plan>",
+    "sha256": "<sha256>",
+    "selection": {
+      "changed_paths": null,
+      "changed_ranges": [],
+      "packages": [],
+      "reached": [
+        "crates/own"
+      ],
+      "whole_plan": false,
+      "requests": []
+    },
+    "members": {
+      "touched": [],
+      "reached": [],
+      "selected": []
+    },
+    "requests": [
+      {
+        "id": "default",
+        "role": "default",
+        "packages": [],
+        "active": false,
+        "why": "no plan member is touched or reached"
+      }
+    ],
+    "elsewhere": [],
+    "workspaces": [
+      "crates/own/Cargo.toml"
+    ],
+    "tools": [],
+    "unattributed": [],
+    "phases": [
+      {
+        "kind": "workspace",
+        "manifest": "crates/own/Cargo.toml",
+        "state": "not-applicable",
+        "why": "its `cfg = 'windows'` does not hold for <host>",
+        "env": null,
+        "tests": null
+      }
+    ]
+  }
+}

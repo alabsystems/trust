@@ -1,0 +1,248 @@
+{
+  "name": "ambiguous_precondition",
+  "def_path": "trust_ir_laws::laws::ambiguous_precondition",
+  "span": {
+    "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+    "line_start": 2666,
+    "col_start": 0,
+    "line_end": 2670,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "trust_ir::proof::obligations::ObligationKindShape",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Precondition",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Postcondition",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "LoopInvariant",
+                "discriminant": 2,
+                "fields": []
+              },
+              {
+                "name": "TypeInvariant",
+                "discriminant": 3,
+                "fields": []
+              },
+              {
+                "name": "RefinementType",
+                "discriminant": 4,
+                "fields": []
+              },
+              {
+                "name": "TranslationValidation",
+                "discriminant": 5,
+                "fields": []
+              },
+              {
+                "name": "MemorySafety",
+                "discriminant": 6,
+                "fields": []
+              },
+              {
+                "name": "PanicFreedom",
+                "discriminant": 7,
+                "fields": []
+              },
+              {
+                "name": "TemporalSafety",
+                "discriminant": 8,
+                "fields": []
+              },
+              {
+                "name": "Liveness",
+                "discriminant": 9,
+                "fields": []
+              },
+              {
+                "name": "ArithmeticSafety",
+                "discriminant": 10,
+                "fields": []
+              },
+              {
+                "name": "BoundsCheck",
+                "discriminant": 11,
+                "fields": []
+              },
+              {
+                "name": "GiveBackRefinement",
+                "discriminant": 12,
+                "fields": []
+              },
+              {
+                "name": "Termination",
+                "discriminant": 13,
+                "fields": []
+              },
+              {
+                "name": "Ownership",
+                "discriminant": 14,
+                "fields": []
+              },
+              {
+                "name": "Custom",
+                "discriminant": 15,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 1
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "trust_ir::proof::obligations::ObligationKindShape",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "trust_ir::proof::obligations::ObligationKindShape"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+                "line_start": 2669,
+                "col_start": 32,
+                "line_end": 2669,
+                "col_end": 65
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "trust_ir_laws::proof_ref_kind_is_ambiguous",
+            "args": [
+              {
+                "Move": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+              "line_start": 2669,
+              "col_start": 4,
+              "line_end": 2669,
+              "col_end": 66
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 18354624647166368809,
+              "def_index": 20,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 18354624647166368809,
+              "krate_name": "trust_ir_laws"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 1
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": "Bool"
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+        "line_start": 2667,
+        "col_start": 12,
+        "line_end": 2667,
+        "col_end": 18
+      },
+      "body": "__trust_lowered_compiler_contract__:result"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Var": [
+        "_0",
+        "Bool"
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "result"
+    ],
+    "invariants": []
+  }
+}

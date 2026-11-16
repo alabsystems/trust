@@ -154,6 +154,7 @@ fn probe_func() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -538,6 +539,7 @@ fn binop_func(name: &str, width: u32, signed: bool, op: BinOp) -> VerifiableFunc
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -584,6 +586,7 @@ fn named_neg_func(name: &str, width: u32) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -765,6 +768,7 @@ fn a_block_definition_can_never_supply_the_certified_negation_width() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // (b) RELEVANT: `fn g(x: i32) -> i32 { let m: i8 = -128; let w = m as i32;
@@ -819,6 +823,7 @@ fn a_block_definition_can_never_supply_the_certified_negation_width() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     for (tag, func) in [("irrelevant def", irrelevant), ("relevant def", relevant)] {
@@ -886,6 +891,7 @@ fn the_assert_bound_route_reads_only_its_own_condition_local() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     // A perfectly-shaped hypothesis in the same formula.
     func.preconditions = vec![Formula::Eq(Box::new(var("z")), Box::new(Formula::Int(0)))];
@@ -986,6 +992,7 @@ fn mixed_path_cfg(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1191,6 +1198,7 @@ fn assert_neg_func(def: bool, pre: Option<Formula>) -> VerifiableFunction {
         preconditions: pre.into_iter().collect(),
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1546,6 +1554,7 @@ fn symbolic_divisor_fn(op: BinOp, divisor: Formula) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1603,6 +1612,7 @@ fn copy_divisor_fn(op: BinOp) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -2248,6 +2258,7 @@ fn bounds_assert_func(signed: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -2711,6 +2722,7 @@ fn assert_neg_target_order_func(first_neg: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -3042,6 +3054,68 @@ fn an_unfaithful_recorded_obligation_declines_it_does_not_fall_back_to_the_peel(
         "a recorded-but-unfaithful obligation must DECLINE (reconstruct != formula), never \
          fall back to a peel; the peel is deleted, so the field is the only authority"
     );
+}
+
+/// ABS-NAME-1 (2026-10-06): the `abs` producer's subject is admitted only for the call
+/// the EMITTER charges — `trust_vcgen::is_signed_abs_call`, core's authenticated
+/// `core::num::<impl iN>::abs`. `negation_subjects` used to carry its own twin
+/// (`<last segment> == "abs"` plus a `core::num::` / `std::num::` SUBSTRING), so the
+/// first argument of a user `mycore::num::abs(x)`, a `G::<core::num::Wrapping<i8>>::abs(x)`
+/// or a stamped impersonator was an admissible subject, and core's own row presented
+/// for such a body certified. PRE-FIX (the twin restored): `negation_subject_ty` is
+/// `Some(i8)` and the replayed row certifies `NegationOverflow(W8)` for every user
+/// spelling below.
+#[test]
+fn only_cores_signed_abs_offers_its_argument_as_a_negation_subject() {
+    let func = load(
+        "fixtures/mass-harvest-2026-07-17/int-preds/dumps/\
+         trust-mir-63bc8917efe430b4-27aa733b96bd85eb.json",
+    );
+    let with_callee = |callee: &str| {
+        let mut g = func.clone();
+        let mut n = 0;
+        for block in &mut g.body.blocks {
+            if let Terminator::Call { func: f, .. } = &mut block.terminator {
+                assert_eq!(f, "core::num::<impl i8>::abs", "fixture premise");
+                *f = callee.to_string();
+                n += 1;
+            }
+        }
+        assert_eq!(n, 1, "fixture premise: one `abs` call");
+        g
+    };
+    let i8t = Ty::Int { width: 8, signed: true };
+    // The genuine row: emitted for core's own `abs`, and it certifies.
+    let row = trust_vcgen::generate_vcs(&func)
+        .into_iter()
+        .find(|vc| matches!(vc.kind, VcKind::NegationOverflow { .. }))
+        .expect("core's `i8::abs` mints its negation row");
+    assert_eq!(
+        safety_vc_is_faithful_formula_aware(&func, &row).map(|(k, _)| k),
+        Some(SafetyVcKind::NegationOverflow(SWidth::W8)),
+        "control: core's `i8::abs` row must certify, else the declines below prove nothing"
+    );
+    for callee in ["core::num::<impl i8>::abs", "std::num::<impl i8>::abs"] {
+        assert_eq!(negation_subject_ty(&with_callee(callee), "x"), Some(i8t.clone()), "`{callee}`");
+    }
+    for callee in [
+        "user::mycore::num::abs",
+        "user::mystd::num::abs",
+        "user::G::<core::num::wrapping::Wrapping<i8>>::abs",
+        "__trust_crate@1973d11b2baa21fa::core::num::<impl i8>::abs",
+        "core::num::wrapping::Wrapping::<i8>::abs",
+    ] {
+        let g = with_callee(callee);
+        assert_eq!(
+            negation_subject_ty(&g, "x"),
+            None,
+            "`{callee}` is not core's signed `abs`; its argument is no negation subject"
+        );
+        assert!(
+            safety_vc_is_faithful_formula_aware(&g, &row).is_none(),
+            "core's `abs` row, presented for a body that calls `{callee}`, must decline"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------

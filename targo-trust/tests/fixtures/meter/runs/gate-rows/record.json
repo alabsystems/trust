@@ -1,0 +1,89 @@
+{
+ "schema": "trust-land-gate/2",
+ "head": "cccccccccccccccccccccccccccccccccccccccc",
+ "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+ "changed": 3,
+ "profile": "development",
+ "legs": {
+  "push-rows": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "PASS",
+   "rc": 0,
+   "seconds": 120.0,
+   "log": "/dev/null"
+  },
+  "compiler-unit-tests": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "SKIPPED"
+  },
+  "crates-tests": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": [
+    "crates/a",
+    "crates/b",
+    "crates/c"
+   ],
+   "outcome": "PASS",
+   "rc": 0,
+   "seconds": 300.0,
+   "log": "/dev/null"
+  },
+  "ui-trust": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "FAIL",
+   "rc": 1,
+   "seconds": 200.0,
+   "log": "/dev/null"
+  },
+  "tidy": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "PASS",
+   "rc": 0,
+   "seconds": 30.0,
+   "log": "/dev/null"
+  }
+ },
+ "seconds": 700.0,
+ "checkout_checks": [
+  {
+   "boundary": "before legs",
+   "seconds": 20.0
+  }
+ ],
+ "checkout_startup": {},
+ "split_keys": {}
+}

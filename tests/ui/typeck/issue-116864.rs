@@ -1,6 +1,12 @@
-//@ compile-flags: -Znext-solver
-//@ check-pass
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
 //@ edition: 2021
+
+// This was fixed by lazy norm of param env with the next solver.
+// But it regressed again as we switched back to be consistent with
+// the old solver. See #158643.
+
 
 use std::future::Future;
 
@@ -21,6 +27,8 @@ where
 }
 
 async fn foo<BAZ>(_: BAZ, mut cb: impl for<'any> FnMutFut<&'any BAZ::Param, ()>)
+//[next]~^ ERROR: expected `FnOnce(&'any i32)` signature, found `impl for<'any> FnMutFut<&'any BAZ::Param, ()>`
+//[current]~^^ ERROR: expected `FnMut(&'any i32)` signature, found `impl for<'any> FnMutFut<&'any BAZ::Param, ()>`
 where
     BAZ: Baz<Param = i32>,
 {

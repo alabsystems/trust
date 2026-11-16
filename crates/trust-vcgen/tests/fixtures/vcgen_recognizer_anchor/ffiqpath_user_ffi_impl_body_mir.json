@@ -1,0 +1,243 @@
+{
+ "name": "m",
+ "def_path": "<std::ffi::os_str::OsString as qpath::my_sys::ffi::Tr>::m",
+ "span": {
+  "file": "qpath.rs",
+  "line_start": 9,
+  "col_start": 12,
+  "line_end": 11,
+  "col_end": 13
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Ref": {
+      "mutable": false,
+      "inner": {
+       "Adt": {
+        "name": "std::ffi::os_str::OsString",
+        "fields": [
+         [
+          "inner",
+          {
+           "Adt": {
+            "name": "std::sys::os_str::bytes::Buf",
+            "fields": [
+             [
+              "inner",
+              {
+               "Seq": {
+                "elem": {
+                 "Int": {
+                  "width": 8,
+                  "signed": false
+                 }
+                }
+               }
+              }
+             ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+           }
+          }
+         ]
+        ],
+        "variants": [],
+        "disc_index_safe": false,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Struct"
+       }
+      }
+     }
+    },
+    "name": "self"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Ref": {
+      "mutable": false,
+      "inner": {
+       "Adt": {
+        "name": "std::ffi::os_str::OsStr",
+        "fields": [
+         [
+          "inner",
+          {
+           "Adt": {
+            "name": "std::sys::os_str::bytes::Slice",
+            "fields": [
+             [
+              "inner",
+              {
+               "Slice": {
+                "elem": {
+                 "Int": {
+                  "width": 8,
+                  "signed": false
+                 }
+                }
+               }
+              }
+             ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+           }
+          }
+         ]
+        ],
+        "variants": [],
+        "disc_index_safe": false,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Struct"
+       }
+      }
+     }
+    },
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "<std::ffi::os_str::OsString as core::ops::deref::Deref>::deref",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 2,
+       "projections": []
+      },
+      "target": 1,
+      "span": {
+       "file": "qpath.rs",
+       "line_start": 10,
+       "col_start": 16,
+       "line_end": 10,
+       "col_end": 26
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 11937010005964491938,
+       "def_index": 4448,
+       "substs_digest": [
+        13648230334935718599,
+        4283117651460457807
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 11937010005964491938,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "std::ffi::os_str::OsStr::len",
+      "args": [
+       {
+        "Copy": {
+         "local": 2,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 0,
+       "projections": []
+      },
+      "target": 2,
+      "span": {
+       "file": "qpath.rs",
+       "line_start": 10,
+       "col_start": 16,
+       "line_end": 10,
+       "col_end": 26
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 5426932874776684975,
+       "def_index": 2522,
+       "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 5426932874776684975,
+       "krate_name": "std"
+      }
+     }
+    }
+   },
+   {
+    "id": 2,
+    "stmts": [],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 1,
+  "return_ty": {
+   "Int": {
+    "width": 64,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

@@ -231,67 +231,62 @@ canonical_dir() {
     )
 }
 
+# Run `bin/TOOL --version` and set VERSION_STDOUT to its standard output and
+# VERSION_STDERR to the first lines of its standard error. Identity is read from
+# stdout alone: every Trust banner is printed there, and Cargo prints its
+# configuration warnings (an unused .cargo/config.toml key in the working
+# directory or a parent, a CARGO_HOME holding both `config` and `config.toml`)
+# on stderr BEFORE its banner, so reading the two merged refused the genuine
+# targo. Stderr is shown only to explain a refusal.
+read_version() {
+    tool="$1"
+    stderr_file="$(mktemp "${TMPDIR:-/tmp}/rustup-link-trust.stderr.XXXXXX")"
+    VERSION_STDOUT="$("$TOOLCHAIN_DIR/bin/$tool" --version 2>"$stderr_file" || true)"
+    VERSION_STDERR="$(sed -n '1,3p' "$stderr_file")"
+    rm -f "$stderr_file"
+}
+
+report_version_stderr() {
+    if [ -n "$VERSION_STDERR" ]; then
+        printf '%s\n' "$VERSION_STDERR" | sed "s|^|error: $1 --version stderr: |" >&2
+    fi
+}
+
 require_version_prefix() {
     tool="$1"
     prefix="$2"
-    version="$("$TOOLCHAIN_DIR/bin/$tool" --version 2>&1 || true)"
-    case "$version" in
+    read_version "$tool"
+    case "$VERSION_STDOUT" in
         "$prefix"*) ;;
         *)
-            echo "error: $tool --version must start with '$prefix' for a Trust link, got: $version" >&2
+            echo "error: $tool --version must start with '$prefix' on stdout for a Trust link, got: $VERSION_STDOUT" >&2
+            report_version_stderr "$tool"
             exit 1
             ;;
     esac
 }
 
-# The rustc-derived binaries keep the upstream version banner — the leading
-# `rustc` token is untouchable, because the ecosystem's version-sniffing build
-# scripts assert it — and carry their Trust identity in a trailing parenthetical
-# instead. So match the parenthetical rather than a leading token.
-#
-# THE PARENTHETICAL HAS TWO LEGITIMATE SHAPES, and this check used to accept
-# only one. rustc_driver_impl builds it as
-#
-#     format!(" ({display_binary} {trust_version})")   // CFG_TRUST_VERSION set
-#     format!(" ({display_binary})")                   // otherwise
-#
-# (compiler/rustc_driver_impl/src/lib.rs:2382-2389), so an ordinary build says
-# `(trustc 0.1.0)` and only a build without CFG_TRUST_VERSION says `(trustc)`.
-# Matching the literal string "(trustc)" therefore REJECTED every real toolchain
-# built since the version was threaded through: measured 2026-08-22 against
-# build/aarch64-apple-darwin/stage1 of a tree that passes
-# tools/verify-toolchain.sh in full —
-#
-#   error: trustc --version must contain '(trustc)' for a Trust link,
-#   got: rustc 1.99.0-dev (52e0a7031 2026-08-22) (trustc 0.1.0)
-#
-# — while the bare form is not a relic of one artifact. Re-derived 2026-08-23:
-#
-#   git grep -lF '(trustc)' | wc -l              -> 353 tracked files
-#   git grep -lE 'rustc [0-9][^ ]* \([0-9a-f]{7,} [0-9-]{10}\) \(trustc\)' | wc -l
-#                                                -> 303 of them are a RECORDED
-#                                                   version banner in the bare
-#                                                   shape, dated 2026-06-22
-#                                                   through 2026-07-28
-#
-# i.e. essentially every banner captured before `CFG_TRUST_VERSION` was threaded
-# through bootstrap (a81c07e1d6, 2026-07-24); the versioned banner appears in 5
-# files, dated 2026-07-30 onward. Both shapes are real history, a toolchain built
-# without CFG_TRUST_VERSION still emits the bare one today, and this check must
-# link either. So accept exactly the two shapes the emitter can produce and
-# nothing looser: `(name)` or `(name <version>)`. A stock rustc, which prints no
-# parenthetical at all, still fails, which is the property this check exists for.
-require_trust_brand() {
+# Refuse a Trust name whose `--version` banner is not the Trust tool's. Each
+# Trust tool that descends from a stock program (trustc, trustdoc, targo,
+# trustfmt, tippy, trust-analyzer, ...) names itself on the first line of its
+# `--version` stdout where the stock program names itself;
+# scripts/lib/trust_toolchain_surface.sh owns that list
+# (TRUST_TOOLCHAIN_BRANDED_PUBLIC_BINS), the measured banners, and the rule for
+# the rustc-derived `(trustc)` / `(trustc <version>)` parenthetical
+# (trust_toolchain_identity_error). The same check gates tools/verify-toolchain.sh,
+# so a toolchain this script would refuse cannot be installed or promoted either.
+# The banner is self-reported: this refuses an unmodified stock artifact under a
+# Trust name, not a wrapper that rewrites the banner (docs/trust-naming.md,
+# "What The Banner Check Does Not Establish").
+require_trust_identity() {
     tool="$1"
-    brand="$2"
-    version="$("$TOOLCHAIN_DIR/bin/$tool" --version 2>&1 || true)"
-    case "$version" in
-        *"($brand)"*|*"($brand "*) ;;
-        *)
-            echo "error: $tool --version must carry the Trust brand '($brand)' or '($brand <version>)' for a Trust link, got: $version" >&2
-            exit 1
-            ;;
-    esac
+    read_version "$tool"
+    if identity_error="$(trust_toolchain_identity_error "$tool" "$VERSION_STDOUT")"; then
+        echo "error: $identity_error" >&2
+        report_version_stderr "$tool"
+        echo "error: refusing to link $TOOLCHAIN_DIR/bin/$tool: a stock program under a Trust name is not a Trust toolchain" >&2
+        exit 1
+    fi
 }
 
 require_same_artifact() {
@@ -426,11 +421,15 @@ if [ "$STAGE" = "stage2" ]; then
     fi
 
     require_dir "$TOOLCHAIN_DIR/lib/rustlib/src/rust/library"
-    require_trust_brand trustc trustc
-    require_version_prefix targo "targo "
     require_version_prefix trustd "trustd "
-    require_trust_brand trustdoc trustdoc
 fi
+
+# Every stage, every Trust tool with a stock ancestor that this bin/ carries.
+for tool in $TRUST_TOOLCHAIN_BRANDED_PUBLIC_BINS; do
+    if [ -e "$TOOLCHAIN_DIR/bin/$tool" ] || [ -L "$TOOLCHAIN_DIR/bin/$tool" ]; then
+        require_trust_identity "$tool"
+    fi
+done
 
 rustup toolchain link "$TOOLCHAIN_NAME" "$TOOLCHAIN_DIR"
 echo
@@ -481,6 +480,6 @@ case "$GUIDANCE_STAGE" in
         echo "this sysroot was supplied with --sysroot and its path does not name a stage,"
         echo "so this script validated its SURFACE but cannot tell a complete stage2 from a"
         echo "stage1 developer tree. Do not make it the default, and do not cite it as"
-        echo "release evidence, until you know which it is (docs/rustup-toolchain-link.md)."
+        echo "release evidence, until you know which it is (docs/TOOLCHAIN_POSTURE.md)."
         ;;
 esac

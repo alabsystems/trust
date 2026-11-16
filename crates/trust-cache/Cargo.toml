@@ -1,7 +1,6 @@
-# trust-cache: Incremental verification cache for trust
-#
-# Stores verification results keyed by function body hash. Skip re-verification
-# for unchanged functions. Part of #57.
+# trust-cache: the verification-semantics key and the file-coordination
+# primitives a compile uses. The cache tiers it was named for were deleted
+# (T11, 2026-10-16; src/lib.rs says what went and why).
 #
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -18,13 +17,9 @@ workspace = true
 
 [dependencies]
 trust-types = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 sha2 = { workspace = true }
-hmac = { workspace = true }
 thiserror = { workspace = true }
 fs2 = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
 tempfile = "3"

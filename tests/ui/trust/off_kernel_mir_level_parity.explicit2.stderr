@@ -1,0 +1,23 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (wadd, wadd_self)
+  --> $DIR/off_kernel_mir_level_parity.rs:37:5
+   |
+LL | /     def wadd (a b : UInt64) : UInt64 := a + b
+LL | |     theorem wadd_self : forall (a b : UInt64), wadd a b = wadd a b := fun a b => rfl
+   | |____________________________________________________________________________________^
+
+note: citation `wadd_self` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `add2`, with a clean certification audit
+  --> $DIR/off_kernel_mir_level_parity.rs:42:37
+   |
+LL |     ensures result == wadd(a, b) by wadd_self
+   |                                     ^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
+
+note: citation `wadd_self` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `add2_via`, with a clean certification audit
+  --> $DIR/off_kernel_mir_level_parity.rs:54:37
+   |
+LL |     ensures result == wadd(a, b) by wadd_self
+   |                                     ^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
+

@@ -1,0 +1,129 @@
+{
+ "schema": "trust-land-gate/2",
+ "head": "dddddddddddddddddddddddddddddddddddddddd",
+ "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+ "changed": 2,
+ "profile": "development",
+ "legs": {
+  "ir-cohort": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "PASS",
+   "rc": 0,
+   "seconds": 60.0,
+   "log": "/dev/null"
+  },
+  "tcb-panic-ratchet": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "PASS",
+   "rc": 0,
+   "seconds": 90.0,
+   "log": "/dev/null"
+  }
+ },
+ "seconds": 400.0,
+ "checkout_checks": [
+  {
+   "boundary": "before legs",
+   "head": "dddddddddddddddddddddddddddddddddddddddd",
+   "files": 831619,
+   "jobs": 8,
+   "seconds": 40.0,
+   "backend": "python-fallback",
+   "native_seconds": 0.0,
+   "native_bytes": 0,
+   "fallback": null,
+   "native_threads": 0,
+   "refused": false,
+   "guard_seconds": 2.5
+  },
+  {
+   "boundary": "before ir-cohort",
+   "reused": "before legs",
+   "files": 0,
+   "seconds": 0.0,
+   "refused": false,
+   "git_state": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+   "guard_seconds": 2.0
+  },
+  {
+   "boundary": "after ir-cohort",
+   "head": "dddddddddddddddddddddddddddddddddddddddd",
+   "files": 831619,
+   "jobs": 8,
+   "seconds": 45.0,
+   "backend": "python-fallback",
+   "native_seconds": 0.0,
+   "native_bytes": 0,
+   "fallback": null,
+   "native_threads": 0,
+   "refused": false,
+   "guard_seconds": 3.0
+  },
+  {
+   "boundary": "before publishing ir-cohort",
+   "reused": "after ir-cohort",
+   "files": 0,
+   "seconds": 0.0,
+   "refused": false,
+   "git_state": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+   "guard_seconds": 2.5
+  },
+  {
+   "boundary": "before tcb-panic-ratchet",
+   "reused": "after ir-cohort",
+   "files": 0,
+   "seconds": 0.0,
+   "refused": false,
+   "git_state": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+   "guard_seconds": 2.0
+  },
+  {
+   "boundary": "after tcb-panic-ratchet",
+   "head": "dddddddddddddddddddddddddddddddddddddddd",
+   "files": 831619,
+   "jobs": 8,
+   "seconds": 50.0,
+   "backend": "python-fallback",
+   "native_seconds": 0.0,
+   "native_bytes": 0,
+   "fallback": null,
+   "native_threads": 0,
+   "refused": false,
+   "guard_seconds": 2.8
+  },
+  {
+   "boundary": "before publishing tcb-panic-ratchet",
+   "reused": "after tcb-panic-ratchet",
+   "files": 0,
+   "seconds": 0.0,
+   "refused": false,
+   "git_state": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+   "guard_seconds": 2.2
+  },
+  {
+   "boundary": "before final record",
+   "reused": "after tcb-panic-ratchet",
+   "files": 0,
+   "seconds": 0.0,
+   "refused": false,
+   "git_state": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+   "guard_seconds": 2.0
+  }
+ ],
+ "split_keys": {},
+ "checkout_startup": {}
+}

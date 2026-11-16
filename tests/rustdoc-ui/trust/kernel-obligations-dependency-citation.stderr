@@ -1,0 +1,12 @@
+error: cited theorem `kernel_obligations_dep_spec.dep_zero` is not registered in any Clean island or the prelude
+  --> $DIR/kernel-obligations-dependency-citation.rs:16:23
+   |
+LL |     ensures 0 == 0 by kernel_obligations_dep_spec.dep_zero
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: these crates loaded into this compilation transported Clean proof material: `kernel_obligations_dep_spec` (1 island(s)). Some may be transitive — which are direct dependencies is a Cargo fact the compiler does not have. A citation is resolved against THIS crate's `clean { … }` islands and the Clean prelude only — a dependency's theorems do not cross into proof position yet, so none of them could have answered for `kernel_obligations_dep_spec.dep_zero`
+   = note: `kernel_obligations_dep_spec` names one of those crates, and `kernel_obligations_dep_spec.dep_zero` is spelled the way a dependency's theorem WILL be cited — the crate name, a `.`, then the declaration's own Clean name, which is the reserved spelling and the only one (`::` is refused). It is not wired yet, so this is a refusal about the capability, not about how you wrote it
+   = note: options: (1) mount the shared Clean source in THIS crate as well — `#[path = "../shared/Defs.lean"] clean mod defs;` is re-elaborated per crate and is the cross-crate share that works today; (2) vendor the declaration into this crate as a `clean { … }` island; (3) prove the clause from this crate's own islands
+
+error: aborting due to 1 previous error
+

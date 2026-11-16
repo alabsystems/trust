@@ -119,3 +119,37 @@ pub fn multi_diverging_guard(first: i64, second: i64) -> i64 {
         MultiPayload::Single(value) => value,
     }
 }
+
+enum GenericPayload<T> {
+    Present(T),
+    Empty,
+}
+
+// The same definition has two field layouts in one lowering context. Repeated
+// construction/matching must reuse each exact instantiation's original EnumId.
+pub fn distinct_generic_enum_instantiations(small: u8, wide: i64, present: bool) -> i64 {
+    let first = GenericPayload::Present(small);
+    let second = GenericPayload::Present(wide);
+    let repeated_small = if present { GenericPayload::Present(small) } else { GenericPayload::Empty };
+    let repeated_wide = if present { GenericPayload::Empty } else { GenericPayload::Present(wide) };
+    let a = match first {
+        GenericPayload::Present(value) => value as i64,
+        GenericPayload::Empty => 0,
+    };
+    let b = match second {
+        GenericPayload::Present(value) => value,
+        GenericPayload::Empty => 0,
+    };
+    let c = match repeated_small {
+        GenericPayload::Present(value) => value as i64,
+        GenericPayload::Empty => 0,
+    };
+    let d = match repeated_wide {
+        GenericPayload::Present(value) => value,
+        GenericPayload::Empty => 0,
+    };
+    // Unequal mixing makes each repeated payload observable. Rotate the wide
+    // payload explicitly so its high bit is retained without a target-sized type.
+    let rotated_d = (d << 1) | (((d as u64) >> 63) as i64);
+    a ^ b ^ (c << 8) ^ rotated_d
+}

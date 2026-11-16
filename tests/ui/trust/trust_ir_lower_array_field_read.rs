@@ -122,9 +122,10 @@ pub fn r_zero_len(s: Empty) -> [u32; 0] {
     s.0
 }
 
-// An AGGREGATE element type keeps the legacy `Ty::Tuple([T; N])` spelling, so the FIELD read is
-// already the wave-FT tuple lane — but the element READ still refuses:
-// `Index(non-scalar element ty)`. The widened gate is `seed_constant`'s set, not "anything".
+// An AGGREGATE element type (`Payload`, a struct) is a first-class `Ty::Array` like every
+// fixed-size array, but the element READ still refuses: `Index(non-scalar element ty)` — the
+// Index arm checks the element type before it lowers its base. The widened gate is
+// `seed_constant`'s set, not "anything".
 pub fn r_agg_elem(s: AggArr) -> u32 {
     s.0[1].k
 }

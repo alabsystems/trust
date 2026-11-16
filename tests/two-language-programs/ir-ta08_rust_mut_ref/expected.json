@@ -1,0 +1,54 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta08_rust_mut_ref",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (6f70bdb69 2026-09-19) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@4ac1b25c7518 sha256:e38e559a127c245c",
+  "clean": "first-party/clean@4338e7923763 sha256:ece53b053817beaf",
+  "trust-cg": "first-party/trust-cg@5aca5cd4d662 sha256:9db90b2968fc0f50"
+ },
+ "ratchets": {
+  "a.rust.mut_ref.carried": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "carried:no-RefMut:no-BorrowMut",
+   "audit": "GAP"
+  },
+  "a.rust.mut_ref.emit": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.mut_ref.exec": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.mut_ref.native": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.mut_ref.roundtrip": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.mut_ref.twin.codec.trailing": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.mut_ref.twin.exec.mutant": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.mut_ref.twin.validate.site": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.mut_ref.twin.validate.vararg": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.mut_ref.validate": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

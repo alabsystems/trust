@@ -1,0 +1,20 @@
+{
+  "compiler_log_sha256": "b4fc640b3ee08a15b38d403a1afd7cdcf6ae1d28ef9fdd541e71b7749727541a",
+  "fixtures": [
+    {
+      "index": 0,
+      "debug_sha256": "09534db9024c6e396fbdf232a95d77133cddeac33b345764c51f7cde01539e6f",
+      "json_sha256": "47d9159ec757dcb23b8d7e699fc37f5e00a73c2d4ad2241f8e978f354d889a81"
+    },
+    {
+      "index": 1,
+      "debug_sha256": "fd9d4741e7b072dbde8609615e2df8b7071b0583a19ce6600a02a4e8ab261978",
+      "json_sha256": "63bab730e28bff6a28bc076622178c7d16950a72b93888d69a7967b1b1ace67e"
+    },
+    {
+      "index": 2,
+      "debug_sha256": "389e2bd98b314e017eab7b884e62c77b2813fda21eea644667a7e8badc461f44",
+      "json_sha256": "180aefda6301c68d0e53a690aa4cf3c8a902543719d40a9f366d828ffbc8a105"
+    }
+  ]
+}

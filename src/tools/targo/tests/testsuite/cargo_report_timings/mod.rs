@@ -11,7 +11,8 @@ use cargo_test_support::project;
 use cargo_test_support::str;
 
 #[cargo_test]
-fn gated_stable_channel() {
+fn gated_stable_compat_channel() {
+    // Trust: Cargo-compatible reports retain upstream channel guidance.
     let p = project()
         .file("Cargo.toml", &basic_manifest("foo", "0.0.0"))
         .file("src/lib.rs", "")
@@ -29,7 +30,8 @@ See https://github.com/rust-lang/cargo/issues/15844 for more information about t
 }
 
 #[cargo_test]
-fn gated_unstable_options() {
+fn gated_unstable_compat_options() {
+    // Trust: retain the flag refusal and the Cargo-compatible issue link.
     let p = project()
         .file("Cargo.toml", &basic_manifest("foo", "0.0.0"))
         .file("src/lib.rs", "")
@@ -68,8 +70,9 @@ fn no_log_for_the_current_workspace() {
         .file("src/lib.rs", "")
         .build();
 
-    foo.cargo("check -Zbuild-analysis")
+    foo.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
@@ -82,7 +85,8 @@ fn no_log_for_the_current_workspace() {
         .file("src/lib.rs", "")
         .build();
 
-    bar.cargo("report timings -Zbuild-analysis")
+    bar.cargo("report timings")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .with_status(101)
         .with_stderr_data(str![[r#"
@@ -101,22 +105,24 @@ fn invalid_log() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("check -Zbuild-analysis")
+    p.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
     // Put some junks in the log file.
     std::fs::write(paths::log_file(0), "}|x| hello world").unwrap();
 
-    p.cargo("report timings -Zbuild-analysis")
+    p.cargo("report timings")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] failed to analyze log at `[ROOT]/home/.cargo/log/[..]T[..]Z-[..].jsonl`
 
 Caused by:
-  no timing data found in log
+  build-analysis log exceeds bounds or has a truncated frame
 
 "#]])
         .run();
@@ -129,8 +135,9 @@ fn empty_log() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("check -Zbuild-analysis")
+    p.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
@@ -138,7 +145,49 @@ fn empty_log() {
     std::fs::File::create(paths::log_file(0)).unwrap();
 
     // If the make-up log file was picked, the command would have failed.
-    p.cargo("report timings -Zbuild-analysis")
+    p.cargo("report timings")
+        .arg("-Zbuild-analysis")
+        .masquerade_as_nightly_cargo(&["build-analysis"])
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[ERROR] failed to analyze log at `[ROOT]/home/.cargo/log/[..]T[..]Z-[..].jsonl`
+
+Caused by:
+  empty build-analysis log
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn idle_session() {
+    // A session that builds nothing, like `cargo test` with `test = false`
+    // and `doctest = false`, has no timing data to report.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.0.0"
+            edition = "2015"
+
+            [lib]
+            test = false
+            doctest = false
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("test")
+        .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
+        .masquerade_as_nightly_cargo(&["build-analysis"])
+        .run();
+
+    p.cargo("report timings")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .with_status(101)
         .with_stderr_data(str![[r#"
@@ -152,14 +201,56 @@ Caused by:
 }
 
 #[cargo_test]
+fn all_fresh_session() {
+    let p = project()
+        .file("Cargo.toml", &basic_manifest("foo", "0.0.0"))
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("check")
+        .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
+        .masquerade_as_nightly_cargo(&["build-analysis"])
+        .run();
+
+    // The second session has nothing to build; every unit is fresh.
+    p.cargo("check")
+        .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
+        .masquerade_as_nightly_cargo(&["build-analysis"])
+        .run();
+
+    // The second session's log got generated, and it is the one picked.
+    let _ = paths::log_file(1);
+
+    p.cargo("report timings")
+        .arg("-Zbuild-analysis")
+        .masquerade_as_nightly_cargo(&["build-analysis"])
+        .with_stderr_data(str![[r#"
+      Timing report saved to [ROOT]/foo/target/cargo-timings/cargo-timing-[..]T[..]Z-[..].html
+
+"#]])
+        .run();
+
+    let timing_files: Vec<_> = p.glob("**/cargo-timing-*.html").collect();
+    assert_eq!(timing_files.len(), 1);
+    let html = std::fs::read_to_string(timing_files[0].as_ref().unwrap()).unwrap();
+
+    // Nothing was built in this session, so no units are reported.
+    assert!(html.contains("const UNIT_DATA = [];"));
+    assert!(!html.contains(r#""name": "foo""#));
+}
+
+#[cargo_test]
 fn prefer_latest() {
     let p = project()
         .file("Cargo.toml", &basic_manifest("foo", "0.0.0"))
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("check -Zbuild-analysis")
+    p.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
@@ -167,8 +258,9 @@ fn prefer_latest() {
     std::fs::write(paths::log_file(0), "}|x| hello world").unwrap();
 
     p.change_file("src/lib.rs", "pub fn foo() {}");
-    p.cargo("check -Zbuild-analysis")
+    p.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
@@ -176,7 +268,8 @@ fn prefer_latest() {
     let _ = paths::log_file(1);
 
     // if it had picked the corrupted first log file, it would have failed.
-    p.cargo("report timings -Zbuild-analysis")
+    p.cargo("report timings")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .with_stderr_data(str![[r#"
       Timing report saved to [ROOT]/foo/target/cargo-timings/cargo-timing-[..]T[..]Z-[..].html
@@ -195,8 +288,9 @@ fn prefer_workspace() {
         .file("src/lib.rs", "")
         .build();
 
-    foo.cargo("check -Zbuild-analysis")
+    foo.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
@@ -209,8 +303,9 @@ fn prefer_workspace() {
         .file("src/lib.rs", "")
         .build();
 
-    bar.cargo("check -Zbuild-analysis")
+    bar.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
@@ -218,7 +313,8 @@ fn prefer_workspace() {
     std::fs::write(paths::log_file(1), "}|x| hello world").unwrap();
 
     // Back to foo, if it had picked the corrupted log file, it would have failed.
-    foo.cargo("report timings -Zbuild-analysis")
+    foo.cargo("report timings")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .with_stderr_data(str![[r#"
       Timing report saved to [ROOT]/foo/target/cargo-timings/cargo-timing-[..]T[..]Z-[..].html
@@ -236,8 +332,9 @@ fn outside_workspace() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("check -Zbuild-analysis")
+    p.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
@@ -264,8 +361,9 @@ fn with_manifest_path() {
         .file("src/lib.rs", "")
         .build();
 
-    foo.cargo("check -Zbuild-analysis")
+    foo.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
@@ -275,12 +373,14 @@ fn with_manifest_path() {
         .file("src/lib.rs", "")
         .build();
 
-    bar.cargo("check -Zbuild-analysis")
+    bar.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
-    foo.cargo("report timings --manifest-path ../bar/Cargo.toml -Zbuild-analysis")
+    foo.cargo("report timings --manifest-path ../bar/Cargo.toml")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .with_stderr_data(str![[r#"
       Timing report saved to [ROOT]/bar/target/cargo-timings/cargo-timing-[..]T[..]-[..].html
@@ -296,12 +396,15 @@ fn with_section_timings() {
         .file("src/lib.rs", "pub fn foo() {}")
         .build();
 
-    p.cargo("check -Zbuild-analysis -Zsection-timings")
+    p.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
+        .arg("-Zsection-timings")
         .masquerade_as_nightly_cargo(&["build-analysis", "section-timings"])
         .run();
 
-    p.cargo("report timings -Zbuild-analysis")
+    p.cargo("report timings")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .with_stderr_data(str![[r#"
       Timing report saved to [ROOT]/foo/target/cargo-timings/cargo-timing-[..]T[..]Z-[..].html
@@ -330,12 +433,14 @@ fn with_multiple_targets() {
         .file("tests/t1.rs", "#[test] fn test1() {}")
         .build();
 
-    p.cargo("check --all-targets -Zbuild-analysis")
+    p.cargo("check --all-targets")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
-    p.cargo("report timings -Zbuild-analysis")
+    p.cargo("report timings")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .with_stderr_data(str![[r#"
       Timing report saved to [ROOT]/foo/target/cargo-timings/cargo-timing-[..]T[..]Z-[..].html
@@ -353,8 +458,9 @@ fn with_session_id() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("check -Zbuild-analysis")
+    p.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
@@ -362,8 +468,9 @@ fn with_session_id() {
     let first_session_id = first_log.file_stem().unwrap().to_str().unwrap();
 
     p.change_file("src/lib.rs", "pub fn foo() {}");
-    p.cargo("check -Zbuild-analysis")
+    p.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
@@ -371,15 +478,14 @@ fn with_session_id() {
     let second_session_id = second_log.file_stem().unwrap().to_str().unwrap();
 
     // With --id, should use the first session (not the most recent second)
-    p.cargo(&format!(
-        "report timings --id {first_session_id} -Zbuild-analysis"
-    ))
-    .masquerade_as_nightly_cargo(&["build-analysis"])
-    .with_stderr_data(str![[r#"
+    p.cargo(&format!("report timings --id {first_session_id}"))
+        .arg("-Zbuild-analysis")
+        .masquerade_as_nightly_cargo(&["build-analysis"])
+        .with_stderr_data(str![[r#"
       Timing report saved to [ROOT]/foo/target/cargo-timings/cargo-timing-[..]T[..]Z-[..].html
 
 "#]])
-    .run();
+        .run();
 
     let timing_files: Vec<_> = p.glob("**/cargo-timing-*.html").collect();
     assert_eq!(timing_files.len(), 1);
@@ -402,12 +508,14 @@ fn session_id_not_found() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("check -Zbuild-analysis")
+    p.cargo("check")
         .env("CARGO_BUILD_ANALYSIS_ENABLED", "true")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .run();
 
-    p.cargo("report timings --id 20260101T000000000Z-0000000000000000 -Zbuild-analysis")
+    p.cargo("report timings --id 20260101T000000000Z-0000000000000000")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .with_status(101)
         .with_stderr_data(str![[r#"
@@ -426,11 +534,12 @@ fn invalid_session_id_format() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("report timings --id invalid-session-id -Zbuild-analysis")
+    p.cargo("report timings --id invalid-session-id")
+        .arg("-Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build-analysis"])
         .with_status(101)
         .with_stderr_data(str![[r#"
-[ERROR] expect run ID in format `20060724T012128000Z-<16-char-hex>`, got `invalid-session-id`
+[ERROR] expect run ID in format `20060724T012128000Z-<16-char-hex>[~<16-char-lower-hex>]`, got `invalid-session-id`
 
 "#]])
         .run();

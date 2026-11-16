@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MANIFEST: &str = "crates/trust-clean/fixtures/trustir-oleans/MANIFEST.toml";
@@ -80,6 +81,81 @@ fn bridge_pin_gate_uses_one_resolved_stage_zero_index_pair() {
     assert!(!fix.status.success(), "--fix unexpectedly ignored submodule failure");
 }
 
+/// 2026-09-24: the gate used to compare commit STRINGS only, so a regeneration on
+/// one platform could carry another platform's bytes forward under the new
+/// trustir_commit and still read "BRIDGE PIN OK". It now checks every listed
+/// olean's staged bytes against its recorded sha256 and every platform table's
+/// `built_from_trustir_commit`.
+#[test]
+fn bridge_pin_gate_checks_staged_digests_and_platform_provenance() {
+    const GOOD: &str = "08906a08609317ddac2911bfb05f373157bb266bfc2c051329fb30fcb2f1144a";
+    let root = TempRepo::new();
+    let script = root.path().join("scripts/check_bridge_pin.sh");
+    let (pin, clean) = (root.pin_a().to_owned(), root.clean_a().to_owned());
+    let dir = root.path().join("crates/trust-clean/fixtures/trustir-oleans");
+    let stage_olean = |rel: &str, bytes: &str| {
+        let path = dir.join(rel);
+        fs::create_dir_all(path.parent().expect("olean parent")).expect("create olean dir");
+        fs::write(&path, bytes).expect("write olean");
+        git(root.path(), &["add", "-f", path.to_str().expect("utf8 path")]);
+    };
+    let stage_manifest = |platforms: &str| {
+        fs::write(
+            root.path().join(MANIFEST),
+            format!(
+                "schema = \"test\"\n[provenance]\ntrustir_commit = \"{pin}\"\n\
+                 clean_commit = \"{clean}\"\n[files]\n\"TrustIr/A.olean\" = \"{GOOD}\"\n\
+                 {platforms}"
+            ),
+        )
+        .expect("write manifest");
+        git(root.path(), &["add", MANIFEST]);
+    };
+    let other = "b".repeat(40);
+
+    stage_olean("TrustIr/A.olean", "good olean bytes\n");
+    stage_olean("platform/x-linux/TrustIr/B.olean", "good olean bytes\n");
+    let current_and_stale = format!(
+        "[platforms.\"x-darwin\"]\nbuilt_from_trustir_commit = \"{pin}\"\n\
+         [platforms.\"x-linux\"]\nbuilt_from_trustir_commit = \"{other}\"\n\
+         [platforms.\"x-linux\".files]\n\"TrustIr/B.olean\" = \"{GOOD}\"\n"
+    );
+    stage_manifest(&current_and_stale);
+    let ok = run(&script, root.path(), &["--check"]);
+    assert_success(&ok, "matching digests, one current platform");
+    let stdout = String::from_utf8_lossy(&ok.stdout);
+    assert!(stdout.contains("2 staged olean digest(s) match"), "{stdout}");
+    assert!(stdout.contains("BRIDGE PLATFORM STALE (disclosed): x-linux"), "{stdout}");
+
+    // Bytes that no longer hash to the manifest fail, shared or per-platform.
+    stage_olean("platform/x-linux/TrustIr/B.olean", "tampered bytes\n");
+    assert_failure_contains(&run(&script, root.path(), &["--check"]), "BRIDGE DIGEST MISMATCH");
+    stage_olean("platform/x-linux/TrustIr/B.olean", "good olean bytes\n");
+
+    // A listed olean that is not staged at all fails.
+    git(
+        root.path(),
+        &["rm", "--cached", "-q", "crates/trust-clean/fixtures/trustir-oleans/TrustIr/A.olean"],
+    );
+    assert_failure_contains(&run(&script, root.path(), &["--check"]), "BRIDGE DIGEST MISSING");
+    stage_olean("TrustIr/A.olean", "good olean bytes\n");
+
+    // A platform that does not say what it was built from fails.
+    stage_manifest("[platforms.\"x-darwin\"]\n");
+    assert_failure_contains(
+        &run(&script, root.path(), &["--check"]),
+        "BRIDGE PLATFORM PROVENANCE MISSING",
+    );
+
+    // No platform built from trustir_commit: the manifest names a revision no
+    // vendored byte came from.
+    stage_manifest(&format!("[platforms.\"x-linux\"]\nbuilt_from_trustir_commit = \"{other}\"\n"));
+    assert_failure_contains(
+        &run(&script, root.path(), &["--check"]),
+        "no platform's bytes were built from trustir_commit",
+    );
+}
+
 struct TempRepo {
     path: PathBuf,
     pin_a: String,
@@ -90,10 +166,17 @@ struct TempRepo {
 
 impl TempRepo {
     fn new() -> Self {
+        // The clock alone is not a unique key: with a microsecond clock two tests
+        // starting together can pick the same directory (observed once, when this
+        // file gained its second test: a parallel run failed inside this fixture's
+        // git setup, and the failure did not reproduce serially). A process-wide
+        // counter makes the directory unique by construction.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let unique =
             SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after epoch").as_nanos();
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir()
-            .join(format!("trust-bridge-pin-gate-{}-{unique}", std::process::id()));
+            .join(format!("trust-bridge-pin-gate-{}-{unique}-{serial}", std::process::id()));
         fs::create_dir_all(path.join("scripts")).expect("create scripts dir");
         fs::create_dir_all(path.join("crates/trust-clean/fixtures/trustir-oleans"))
             .expect("create manifest dir");

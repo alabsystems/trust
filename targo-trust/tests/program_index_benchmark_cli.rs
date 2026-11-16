@@ -402,8 +402,8 @@ fn program_index_release_report_emits_strict_superiority_performance_schema() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "strict performance benchmark should pass\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        Some(1),
+        "strict performance report must not admit unbound proof evidence\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     let report: Value = serde_json::from_str(
@@ -416,10 +416,10 @@ fn program_index_release_report_emits_strict_superiority_performance_schema() {
         report["strict_superiority_performance_evidence"]["schema"],
         "trust.strict-superiority.performance-evidence.v1"
     );
-    assert_eq!(report["strict_superiority_performance_evidence"]["status"], "partial");
+    assert_eq!(report["strict_superiority_performance_evidence"]["status"], "blocked");
     assert_eq!(
         report["strict_superiority_performance_evidence"]["candidate_rejection"]["rejected"],
-        false
+        true
     );
     assert_eq!(report["strict_superiority_performance_evidence"]["repetitions"], 2);
     assert!(
@@ -462,7 +462,14 @@ fn program_index_release_report_emits_strict_superiority_performance_schema() {
     ));
 
     let lanes = &report["strict_superiority_performance_evidence"]["lanes"];
-    assert_eq!(lanes["clean_release_compile"]["status"], "measured");
+    assert_eq!(lanes["clean_release_compile"]["status"], "blocked");
+    assert!(
+        lanes["clean_release_compile"]["blocked_reasons"]
+            .as_array()
+            .expect("blocked reasons")
+            .iter()
+            .any(|reason| reason == "candidate_data_rejected")
+    );
     assert_eq!(lanes["clean_release_compile"]["required_build_profile"], "release");
     assert_eq!(lanes["clean_release_compile"]["rust"]["sample_count"], 4);
     assert_eq!(lanes["clean_release_compile"]["trust"]["trust-noverify"]["sample_count"], 4);
@@ -474,10 +481,10 @@ fn program_index_release_report_emits_strict_superiority_performance_schema() {
     assert!(lanes["clean_release_compile"]["rust"]["size_bytes"]["max"].as_f64().is_some());
     assert_eq!(lanes["clean_release_compile"]["comparisons"][0]["trust_slot"], "trust-noverify");
     assert!(lanes["clean_release_compile"]["comparisons"][0]["ratio_vs_rust"].as_f64().is_some());
-    assert_eq!(lanes["runtime_geomean"]["status"], "measured");
-    assert!(lanes["runtime_geomean"]["rust"]["duration_seconds"]["geomean"].as_f64().is_some());
-    assert_eq!(lanes["binary_size"]["status"], "measured");
-    assert!(lanes["binary_size"]["rust"]["size_bytes"]["geomean"].as_f64().is_some());
+    assert_eq!(lanes["runtime_geomean"]["status"], "blocked");
+    assert!(lanes["runtime_geomean"]["rust"]["duration_seconds"]["geomean"].is_null());
+    assert_eq!(lanes["binary_size"]["status"], "blocked");
+    assert!(lanes["binary_size"]["rust"]["size_bytes"]["geomean"].is_null());
     assert_eq!(lanes["incremental_debug_compile"]["status"], "blocked");
     assert!(
         lanes["incremental_debug_compile"]["blocked_reasons"]
@@ -506,13 +513,13 @@ fn program_index_release_report_emits_strict_superiority_performance_schema() {
     );
     assert_eq!(
         report["summary"]["strict_superiority_performance_evidence"]["lane_statuses"]["clean_release_compile"],
-        "measured"
+        "blocked"
     );
 }
 
 #[test]
 #[cfg(unix)]
-fn program_index_proof_design_suite_reports_admissible_non_candidate_evidence() {
+fn program_index_proof_design_suite_reports_non_candidate_rows_but_refuses_proof_admission() {
     let temp = TempDir::new("trust-program-index-proof-design");
     let root = temp.path().join("repo");
     let report_dir = temp.path().join("report");
@@ -536,6 +543,8 @@ fn program_index_proof_design_suite_reports_admissible_non_candidate_evidence() 
             "trust-verify",
             "--suite",
             "proof-design",
+            "--compile-measurement",
+            "warm-incremental",
             "--require-slots",
         ])
         .output()
@@ -545,22 +554,32 @@ fn program_index_proof_design_suite_reports_admissible_non_candidate_evidence() 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "proof-design suite should pass\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        Some(1),
+        "proof-design suite must remain inadmissible\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     let report: Value = serde_json::from_str(
         &fs::read_to_string(report_dir.join("report.json")).expect("report should exist"),
     )
     .expect("report should parse");
-    assert_eq!(report["program_index_evidence"]["model_source"], "index.suite_evidence_model");
-    assert_eq!(report["program_index_evidence"]["status"], "admissible");
+    assert_eq!(report["program_index_evidence"]["model_source"], "builtin-proof-design-policy");
+    assert_eq!(report["program_index_evidence"]["status"], "blocked");
+    assert_eq!(
+        report["program_index_evidence"]["canonical_proof_design_status"],
+        "source_tree_matches_head"
+    );
+    assert_eq!(
+        report["program_index_evidence"]["source_execution_binding"],
+        "candidate_primary_argv_unsealed_closure"
+    );
+    assert!(report["repo_head"].as_str().is_some_and(|head| head.len() == 40));
+    assert_eq!(report["repo_head_matches_at_finish"], true);
     assert_eq!(report["program_index_evidence"]["selected_programs"], 2);
     assert_eq!(report["program_index_evidence"]["selected_pairs"], 1);
     assert_eq!(report["program_index_evidence"]["selected_candidate_rows"], 0);
     assert_eq!(report["program_index_evidence"]["selected_gating_rows"], 2);
-    assert_eq!(report["program_index_evidence"]["selected_admissible_gating_rows"], 2);
-    assert_eq!(report["program_index_evidence"]["admissible_for_domination"], true);
+    assert_eq!(report["program_index_evidence"]["selected_admissible_gating_rows"], 0);
+    assert_eq!(report["program_index_evidence"]["admissible_for_domination"], false);
     assert_eq!(report["program_index_evidence"]["selected_suite_counts"]["proof-design"], 2);
     assert_eq!(
         report["summary"]["program_index_evidence"]["selected_suite_counts"]["proof-design"],
@@ -570,12 +589,12 @@ fn program_index_proof_design_suite_reports_admissible_non_candidate_evidence() 
         report["proof_design_verifier_evidence"]["schema"],
         "trust.compile-verify-program-index.proof-design-verifier-evidence.v1"
     );
-    assert_eq!(report["proof_design_verifier_evidence"]["status"], "passed");
+    assert_eq!(report["proof_design_verifier_evidence"]["status"], "blocked");
     assert_eq!(report["proof_design_verifier_evidence"]["required"], true);
-    assert_eq!(report["proof_design_verifier_evidence"]["admissible_for_domination"], true);
+    assert_eq!(report["proof_design_verifier_evidence"]["admissible_for_domination"], false);
     assert_eq!(report["proof_design_verifier_evidence"]["selected_programs"], 2);
     assert_eq!(report["proof_design_verifier_evidence"]["verifier_rows"], 2);
-    assert_eq!(report["proof_design_verifier_evidence"]["accepted_rows"], 2);
+    assert_eq!(report["proof_design_verifier_evidence"]["accepted_rows"], 0);
     assert_eq!(report["proof_design_verifier_evidence"]["stage2_binding"]["status"], "bound");
     assert_eq!(report["proof_design_verifier_evidence"]["stage2_binding"]["repo_stage2"], true);
     assert_eq!(
@@ -587,7 +606,7 @@ fn program_index_proof_design_suite_reports_admissible_non_candidate_evidence() 
         "stderr-line-prefix"
     );
     assert_eq!(report["proof_design_verifier_evidence"]["transport_prefix"], "TRUST_JSON:");
-    assert_eq!(report["summary"]["proof_design_verifier_evidence"]["status"], "passed");
+    assert_eq!(report["summary"]["proof_design_verifier_evidence"]["status"], "blocked");
     assert!(
         report["proof_design_verifier_evidence"]["transport_sources"]
             .as_array()
@@ -602,14 +621,50 @@ fn program_index_proof_design_suite_reports_admissible_non_candidate_evidence() 
     assert_eq!(suite["candidate_rows"], 0);
     assert_eq!(suite["gating"], true);
     assert_eq!(suite["candidate_evidence"], false);
-    assert_eq!(suite["admissible_for_domination"], true);
-    assert_eq!(suite["evidence_class"], "admissible_gating");
+    assert_eq!(suite["admissible_for_domination"], false);
+    assert_eq!(suite["evidence_class"], "blocked_gating_unsealed_source_execution");
 
     let rows = report["results"].as_array().expect("rows should be array");
     assert_eq!(rows.len(), 2);
     for row in rows {
         assert_eq!(row["suite"], "proof-design");
         assert_eq!(row["slot"], "trust-verify");
+        assert_eq!(row["source_execution"]["kind"], "candidate_primary_argv_unsealed_closure");
+        assert_eq!(row["source_execution"]["authenticated_read"], false);
+        assert_eq!(row["source_execution"]["transitive_source_closure"], "unresolved");
+        assert_eq!(row["source_execution"]["source_copy_diagnostic"]["status"], "available");
+        assert_eq!(
+            row["source_execution"]["source_copy_diagnostic"]["selected_as_compiler_input"],
+            true
+        );
+        assert_eq!(row["observed"], "source_input_blocked");
+        assert_eq!(row["source_input_check"]["status"], "blocked_compiler_read");
+        assert!(
+            row["source_input_check"]["reason"]
+                .as_str()
+                .expect("census refusal")
+                .contains("open compiler census")
+        );
+        assert_eq!(
+            row["command"].as_array().and_then(|args| args.last()),
+            Some(&row["source_execution"]["compiler_source_path"])
+        );
+        assert_eq!(
+            row["incremental_warmup"]["command"].as_array().and_then(|args| args.last()),
+            Some(&row["source_execution"]["compiler_source_path"])
+        );
+        assert!(
+            Path::new(
+                row["source_execution"]["source_copy_diagnostic"]["path"]
+                    .as_str()
+                    .expect("source copy path")
+            )
+            .is_file()
+        );
+        assert_eq!(
+            row["source_execution"]["compiler_source_path"],
+            row["source_execution"]["source_copy_diagnostic"]["path"]
+        );
         assert_ne!(row["metadata"]["candidate"], true);
         assert!(
             !row["program_id"]
@@ -619,6 +674,608 @@ fn program_index_proof_design_suite_reports_admissible_non_candidate_evidence() 
             "proof-design row must not be a candidate row: {row:?}"
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn program_index_external_proof_design_index_remains_informational_without_proof_slot() {
+    let temp = TempDir::new("trust-program-index-proof-design-informational");
+    let root = temp.path().join("repo");
+    let report_dir = temp.path().join("report");
+    let fake = temp.path().join("fake-rustc");
+    write_program_index_proof_design_fixture(&root);
+    write_fake_compiler(&fake);
+    let index = root.join("examples/bench/program_index/index.json");
+
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "benchmark",
+            "program-index",
+            "--repo-root",
+            root.to_str().expect("root should be utf-8"),
+            "--index",
+            index.to_str().expect("index should be utf-8"),
+            "--report-dir",
+            report_dir.to_str().expect("report dir should be utf-8"),
+            "--slots",
+            "upstream-rustc",
+            "--suite",
+            "proof-design",
+            "--slot-bin",
+            &format!("upstream-rustc={}", fake.display()),
+            "--require-slots",
+        ])
+        .output()
+        .expect("run informational proof-design benchmark");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "informational benchmark should run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(report_dir.join("report.json")).expect("report should exist"),
+    )
+    .expect("report should parse");
+    assert_eq!(report["program_index_evidence"]["status"], "blocked");
+    assert_eq!(report["proof_design_verifier_evidence"]["status"], "not_claimed");
+    assert_eq!(report["proof_design_verifier_evidence"]["admissible_for_domination"], false);
+    assert_eq!(report["results"].as_array().expect("results").len(), 2);
+}
+
+#[test]
+#[cfg(unix)]
+fn proof_design_primary_copy_is_compiler_argv_across_compile_paths_but_remains_unsealed() {
+    let temp = TempDir::new("trust-proof-design-source-snapshot");
+    let root = temp.path().join("repo");
+    let report_dir = temp.path().join("report");
+    let compiler = temp.path().join("fake-rustc");
+    let expected = temp.path().join("expected.rs");
+    let seen = temp.path().join("seen-sources.txt");
+    write_program_index_proof_design_fixture(&root);
+    write_observing_compiler(&compiler);
+    let live = root.join("examples/proof_good.rs");
+    fs::copy(&live, &expected).expect("copy expected HEAD source");
+
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "benchmark",
+            "program-index",
+            "--repo-root",
+            root.to_str().expect("root path"),
+            "--index",
+            root.join("examples/bench/program_index/index.json").to_str().expect("index path"),
+            "--report-dir",
+            report_dir.to_str().expect("report path"),
+            "--slots",
+            "upstream-rustc",
+            "trust-noverify",
+            "--program",
+            "proof_gate.good",
+            "--slot-bin",
+            &format!("upstream-rustc={}", compiler.display()),
+            "--slot-bin",
+            &format!("trust-noverify={}", compiler.display()),
+            "--compile-measurement",
+            "warm-incremental",
+            "--runtime-parity",
+            "--require-slots",
+        ])
+        .env("TEST_LIVE_SOURCE", &live)
+        .env("TEST_EXPECTED_SOURCE", &expected)
+        .env("TEST_SEEN_SOURCES", &seen)
+        .output()
+        .expect("run snapshot benchmark");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unsealed proof-design output must block runtime parity\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(&live).expect("live source"), fs::read(&expected).expect("HEAD source"));
+    let report: Value =
+        serde_json::from_slice(&fs::read(report_dir.join("report.json")).expect("report"))
+            .expect("parse report");
+    assert_eq!(
+        report["program_index_evidence"]["canonical_proof_design_status"],
+        "source_tree_matches_head"
+    );
+    assert_eq!(report["runtime_parity"]["status"], "not_applicable");
+    assert_eq!(
+        report["program_index_evidence"]["source_execution_binding"],
+        "candidate_primary_argv_unsealed_closure"
+    );
+    let sources = fs::read_to_string(&seen).expect("compiler source log");
+    let sources = sources.lines().collect::<Vec<_>>();
+    assert_eq!(sources.len(), 6, "warmup, measured, and runtime builds for both slots");
+    for observation in &sources {
+        let (source, matched_head_after_edit) = observation.split_once('|').expect("observation");
+        assert_ne!(Path::new(source), live, "compiler must not read the live primary path");
+        assert_eq!(matched_head_after_edit, "1", "compiler argv must retain HEAD bytes");
+    }
+    for row in report["results"].as_array().expect("compile rows") {
+        let source = row["source_execution"]["compiler_source_path"].as_str().expect("source path");
+        assert_eq!(
+            row["command"].as_array().and_then(|args| args.last()).and_then(Value::as_str),
+            Some(source)
+        );
+        assert_eq!(
+            row["incremental_warmup"]["command"]
+                .as_array()
+                .and_then(|args| args.last())
+                .and_then(Value::as_str),
+            Some(source)
+        );
+        assert_eq!(row["source_execution"]["source_copy_diagnostic"]["status"], "available");
+        assert_eq!(row["source_input_check"]["status"], "matched_pre_post");
+        assert_eq!(row["incremental_warmup"]["source_input_check"]["status"], "matched_pre_post");
+        assert_eq!(
+            row["source_execution"]["source_copy_diagnostic"]["path"],
+            row["source_execution"]["compiler_source_path"]
+        );
+    }
+    for row in report["runtime_parity"]["rows"].as_array().expect("runtime rows") {
+        let source = row["source_execution"]["compiler_source_path"].as_str().expect("source path");
+        assert_eq!(
+            row["build_command"].as_array().and_then(|args| args.last()).and_then(Value::as_str),
+            Some(source)
+        );
+        assert_eq!(row["source_input_check"]["status"], "matched_pre_post");
+        assert_eq!(row["build_status"], "output_source_unsealed");
+        assert_eq!(row["output_source_check"]["status"], "unsealed");
+        assert_eq!(row["run_status"], "not_run");
+        assert!(row["executable_sha256"].is_null());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn proof_design_unparsed_source_forms_remain_blocked_observations() {
+    let cases = [
+        ("comment_string", "fn main() { let _ = \"file\"; } // file\n"),
+        ("include", "fn main() { let _ = include_str!(\"dep.txt\"); }\n"),
+        ("module", "mod dep; fn main() {}\n"),
+        ("absolute_path", "#[path = \"/tmp/dep.rs\"] mod dep; fn main() {}\n"),
+    ];
+    for (name, source) in cases {
+        let temp = TempDir::new(&format!("trust-proof-design-observe-{name}"));
+        let root = temp.path().join("repo");
+        let report_dir = temp.path().join("report");
+        let compiler = temp.path().join("compiler");
+        write_program_index_proof_design_fixture(&root);
+        write(root.join("examples/proof_good.rs"), source);
+        write(root.join("examples/dep.txt"), "not declared\n");
+        write(root.join("examples/dep.rs"), "pub fn dep() {}\n");
+        commit_proof_design_fixture(&root);
+        write_fake_compiler(&compiler);
+
+        let output = Command::new(targo_trust_binary())
+            .args([
+                "trust",
+                "benchmark",
+                "program-index",
+                "--repo-root",
+                root.to_str().expect("root path"),
+                "--index",
+                root.join("examples/bench/program_index/index.json").to_str().expect("index path"),
+                "--report-dir",
+                report_dir.to_str().expect("report path"),
+                "--slots",
+                "trust-noverify",
+                "--program",
+                "proof_gate.good",
+                "--slot-bin",
+                &format!("trust-noverify={}", compiler.display()),
+                "--require-slots",
+            ])
+            .output()
+            .expect("run observational benchmark");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(
+            &fs::read(report_dir.join("report.json")).expect("observational report"),
+        )
+        .expect("parse report");
+        assert_eq!(report["program_index_evidence"]["selected_programs"], 1, "{name}");
+        assert_eq!(report["program_index_evidence"]["selected_gating_rows"], 1, "{name}");
+        assert_eq!(report["program_index_evidence"]["selected_admissible_gating_rows"], 0);
+        assert_eq!(
+            report["program_index_evidence"]["source_execution_binding"],
+            "candidate_primary_argv_unsealed_closure"
+        );
+        let row = &report["results"][0];
+        assert_eq!(row["outcome"], "passed", "{name}");
+        assert_eq!(row["source_execution"]["source_copy_diagnostic"]["status"], "available");
+        assert_eq!(row["source_execution"]["transitive_source_closure"], "unresolved");
+        assert_eq!(
+            row["command"].as_array().and_then(|args| args.last()),
+            Some(&row["source_execution"]["compiler_source_path"])
+        );
+        assert_eq!(
+            row["source_execution"]["source_copy_diagnostic"]["path"],
+            row["source_execution"]["compiler_source_path"]
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn proof_design_missing_head_source_keeps_observational_rows() {
+    let temp = TempDir::new("trust-proof-design-missing-head-source");
+    let root = temp.path().join("repo");
+    let report_dir = temp.path().join("report");
+    let trustc = root.join("build/host/stage2/bin/trustc");
+    write_program_index_proof_design_fixture(&root);
+    write_fake_compiler(&trustc);
+    let status = Command::new("git")
+        .args(["rm", "--cached", "examples/proof_good.rs"])
+        .current_dir(&root)
+        .status()
+        .expect("remove HEAD source only");
+    assert!(status.success());
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Proof Design Test",
+            "-c",
+            "user.email=proof-design@example.invalid",
+            "commit",
+            "-qm",
+            "omit canonical source",
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("commit missing HEAD source");
+    assert!(status.success());
+    assert!(root.join("examples/proof_good.rs").is_file());
+
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "benchmark",
+            "program-index",
+            "--repo-root",
+            root.to_str().expect("root path"),
+            "--index",
+            root.join("examples/bench/program_index/index.json").to_str().expect("index path"),
+            "--report-dir",
+            report_dir.to_str().expect("report path"),
+            "--slots",
+            "trust-verify",
+            "--suite",
+            "proof-design",
+            "--require-slots",
+        ])
+        .output()
+        .expect("run missing HEAD source benchmark");
+    assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: Value =
+        serde_json::from_slice(&fs::read(report_dir.join("report.json")).expect("report"))
+            .expect("parse report");
+    assert_eq!(report["program_index_evidence"]["selected_programs"], 2);
+    assert_eq!(report["program_index_evidence"]["selected_gating_rows"], 2);
+    assert_eq!(report["program_index_evidence"]["selected_admissible_gating_rows"], 0);
+    assert_eq!(report["program_index_evidence"]["canonical_proof_design_status"], "blocked");
+    assert_eq!(
+        report["program_index_evidence"]["source_execution_binding"],
+        "candidate_primary_argv_unsealed_closure"
+    );
+    assert_eq!(report["proof_design_verifier_evidence"]["status"], "blocked");
+    assert_eq!(report["proof_design_verifier_evidence"]["verifier_rows"], 2);
+    let rows = report["results"].as_array().expect("observational rows");
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row["outcome"], "skipped");
+        assert_eq!(row["source_execution"]["kind"], "candidate_primary_argv_unsealed_closure");
+        assert_eq!(row["source_execution"]["source_copy_diagnostic"]["status"], "unavailable");
+        assert!(
+            row["source_execution"]["source_copy_diagnostic"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("canonical HEAD source copy unavailable"))
+        );
+        assert_eq!(row["command"], serde_json::json!([]));
+        assert_eq!(row["source_execution"]["compiler_source_path"], Value::Null);
+        assert_eq!(row["source_input_check"]["status"], "not_run");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn proof_design_missing_live_source_keeps_denominator() {
+    let temp = TempDir::new("trust-proof-design-missing-live-source");
+    let root = temp.path().join("repo");
+    let report_dir = temp.path().join("report");
+    let trustc = root.join("build/host/stage2/bin/trustc");
+    write_program_index_proof_design_fixture(&root);
+    write_fake_compiler(&trustc);
+    fs::remove_file(root.join("examples/proof_good.rs")).expect("remove live source");
+
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "benchmark",
+            "program-index",
+            "--repo-root",
+            root.to_str().expect("root path"),
+            "--index",
+            root.join("examples/bench/program_index/index.json").to_str().expect("index path"),
+            "--report-dir",
+            report_dir.to_str().expect("report path"),
+            "--slots",
+            "trust-verify",
+            "--suite",
+            "proof-design",
+            "--require-slots",
+        ])
+        .output()
+        .expect("run missing live source benchmark");
+    assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: Value =
+        serde_json::from_slice(&fs::read(report_dir.join("report.json")).expect("report"))
+            .expect("parse report");
+    assert_eq!(report["program_index_evidence"]["selected_programs"], 2);
+    assert_eq!(report["program_index_evidence"]["selected_gating_rows"], 2);
+    assert_eq!(report["program_index_evidence"]["selected_admissible_gating_rows"], 0);
+    assert_eq!(report["program_index_evidence"]["canonical_proof_design_status"], "blocked");
+    assert_eq!(report["program_index_evidence"]["status"], "blocked");
+    assert_eq!(report["proof_design_verifier_evidence"]["status"], "blocked");
+    assert_eq!(report["results"].as_array().map(Vec::len), Some(2));
+    let missing = report["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .find(|row| row["program_id"] == "proof_gate.good")
+        .expect("missing-source row");
+    assert_eq!(missing["outcome"], "skipped");
+    assert_eq!(missing["observed"], "slot_skipped");
+    assert_eq!(missing["source_sha256"], Value::Null);
+    assert!(missing["skip_reason"].as_str().is_some_and(|reason| reason.contains("not readable")));
+    assert_eq!(missing["source_execution"]["source_copy_diagnostic"]["status"], "unavailable");
+}
+
+#[test]
+#[cfg(unix)]
+fn proof_design_selection_does_not_read_missing_unselected_source() {
+    let temp = TempDir::new("trust-proof-design-unselected-source");
+    let root = temp.path().join("repo");
+    let report_dir = temp.path().join("report");
+    let trustc = root.join("build/host/stage2/bin/trustc");
+    write_program_index_proof_design_fixture(&root);
+    write_fake_compiler(&trustc);
+    fs::remove_file(root.join("examples/candidate_good.rs")).expect("remove unselected source");
+
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "benchmark",
+            "program-index",
+            "--repo-root",
+            root.to_str().expect("root path"),
+            "--index",
+            root.join("examples/bench/program_index/index.json").to_str().expect("index path"),
+            "--report-dir",
+            report_dir.to_str().expect("report path"),
+            "--slots",
+            "trust-noverify",
+            "--suite",
+            "proof-design",
+            "--require-slots",
+        ])
+        .output()
+        .expect("run filtered proof-design benchmark");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: Value =
+        serde_json::from_slice(&fs::read(report_dir.join("report.json")).expect("report"))
+            .expect("parse report");
+    assert_eq!(report["program_index_evidence"]["selected_programs"], 2);
+    assert_eq!(report["program_index_evidence"]["selected_gating_rows"], 2);
+    assert_eq!(report["program_index_evidence"]["selected_admissible_gating_rows"], 0);
+    assert_eq!(report["program_index_evidence"]["status"], "blocked");
+    assert_eq!(
+        report["program_index_evidence"]["canonical_proof_design_status"],
+        "source_tree_matches_head"
+    );
+    assert_eq!(
+        report["program_index_evidence"]["source_execution_binding"],
+        "candidate_primary_argv_unsealed_closure"
+    );
+    assert_eq!(report["results"].as_array().map(Vec::len), Some(2));
+}
+
+#[test]
+#[cfg(unix)]
+fn proof_design_candidate_copy_change_blocks_observation_without_losing_row() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new("trust-proof-design-snapshot-tamper");
+    let root = temp.path().join("repo");
+    let report_dir = temp.path().join("report");
+    let compiler = temp.path().join("compiler");
+    write_program_index_proof_design_fixture(&root);
+    write(
+        compiler.clone(),
+        "#!/bin/sh\nout=''\nprev=''\nfor src do\n  if [ \"$prev\" = '-o' ]; then out=\"$src\"; fi\n  prev=\"$src\"\ndone\ncase \"$src\" in *.rs) ;; *) exit 0 ;; esac\nchmod u+w \"$src\"\nprintf 'tampered\\n' > \"$src\"\nmkdir -p \"$(dirname \"$out\")\"\nprintf 'fake object' > \"$out\"\n",
+    );
+    let mut permissions = fs::metadata(&compiler).expect("compiler metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&compiler, permissions).expect("compiler permissions");
+
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "benchmark",
+            "program-index",
+            "--repo-root",
+            root.to_str().expect("root path"),
+            "--index",
+            root.join("examples/bench/program_index/index.json").to_str().expect("index path"),
+            "--report-dir",
+            report_dir.to_str().expect("report path"),
+            "--slots",
+            "trust-noverify",
+            "--program",
+            "proof_gate.good",
+            "--slot-bin",
+            &format!("trust-noverify={}", compiler.display()),
+            "--repetitions",
+            "2",
+            "--require-slots",
+        ])
+        .output()
+        .expect("run live-change benchmark");
+    assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: Value =
+        serde_json::from_slice(&fs::read(report_dir.join("report.json")).expect("report"))
+            .expect("parse report");
+    assert_eq!(report["program_index_evidence"]["selected_programs"], 1);
+    assert_eq!(report["program_index_evidence"]["status"], "blocked");
+    assert_eq!(
+        report["program_index_evidence"]["canonical_proof_design_status"],
+        "source_tree_matches_head"
+    );
+    assert_eq!(
+        report["program_index_evidence"]["source_execution_binding"],
+        "candidate_primary_argv_unsealed_closure"
+    );
+    assert_eq!(report["results"][0]["outcome"], "failed");
+    assert_eq!(report["results"][0]["observed"], "source_input_blocked");
+    assert_eq!(report["results"][0]["source_input_check"]["status"], "blocked_post_read");
+    assert_eq!(
+        report["results"][0]["samples"][0]["source_input_check"]["status"],
+        "blocked_post_read"
+    );
+    assert_eq!(
+        report["results"][0]["samples"][1]["source_input_check"]["status"],
+        "blocked_pre_read"
+    );
+    assert_eq!(report["results"][0]["samples"][1]["source_input_check"]["compiler_invoked"], false);
+    assert_eq!(
+        report["results"][0]["source_execution"]["source_copy_diagnostic"]["status"],
+        "invalid"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn proof_design_edit_restore_stays_observational_despite_matching_edge_checks() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new("trust-proof-design-edit-restore");
+    let root = temp.path().join("repo");
+    let report_dir = temp.path().join("report");
+    let compiler = temp.path().join("compiler");
+    write_program_index_proof_design_fixture(&root);
+    write(
+        compiler.clone(),
+        "#!/bin/sh\nout=''\nprev=''\nfor src do\n  if [ \"$prev\" = '-o' ]; then out=\"$src\"; fi\n  prev=\"$src\"\ndone\ncase \"$src\" in *.rs) ;; *) exit 0 ;; esac\ncp \"$src\" \"$src.saved\"\nchmod u+w \"$src\"\nprintf 'fn main() { panic!(\"transient\"); }\\n' > \"$src\"\ncp \"$src.saved\" \"$src\"\nchmod a-w \"$src\"\nrm \"$src.saved\"\nmkdir -p \"$(dirname \"$out\")\"\nprintf 'fake object' > \"$out\"\n",
+    );
+    let mut permissions = fs::metadata(&compiler).expect("compiler metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&compiler, permissions).expect("compiler permissions");
+
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "benchmark",
+            "program-index",
+            "--repo-root",
+            root.to_str().expect("root path"),
+            "--index",
+            root.join("examples/bench/program_index/index.json").to_str().expect("index path"),
+            "--report-dir",
+            report_dir.to_str().expect("report path"),
+            "--slots",
+            "trust-noverify",
+            "--program",
+            "proof_gate.good",
+            "--slot-bin",
+            &format!("trust-noverify={}", compiler.display()),
+            "--require-slots",
+        ])
+        .output()
+        .expect("run edit/restore benchmark");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: Value =
+        serde_json::from_slice(&fs::read(report_dir.join("report.json")).expect("report"))
+            .expect("parse report");
+    assert_eq!(report["results"][0]["outcome"], "passed");
+    assert_eq!(report["results"][0]["source_input_check"]["status"], "matched_pre_post");
+    assert_eq!(report["results"][0]["source_execution"]["authenticated_read"], false);
+    assert_eq!(report["program_index_evidence"]["selected_admissible_gating_rows"], 0);
+    assert_eq!(report["program_index_evidence"]["status"], "blocked");
+}
+
+#[test]
+#[cfg(unix)]
+fn program_index_external_informational_index_cannot_admit_performance() {
+    let temp = TempDir::new("trust-program-index-informational-performance");
+    let root = temp.path().join("repo");
+    let report_dir = temp.path().join("report");
+    let fake = temp.path().join("fake-rustc");
+    write_program_index_fixture(&root);
+    write_fake_compiler(&fake);
+    let index = temp.path().join("external-index.json");
+    fs::copy(root.join("examples/bench/program_index/index.json"), &index)
+        .expect("copy external index");
+
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "benchmark",
+            "program-index",
+            "--repo-root",
+            root.to_str().expect("root should be utf-8"),
+            "--index",
+            index.to_str().expect("index should be utf-8"),
+            "--report-dir",
+            report_dir.to_str().expect("report dir should be utf-8"),
+            "--slots",
+            "upstream-rustc",
+            "trust-noverify",
+            "--slot-bin",
+            &format!("upstream-rustc={}", fake.display()),
+            "--slot-bin",
+            &format!("trust-noverify={}", fake.display()),
+            "--build-profile",
+            "release",
+            "--require-slots",
+        ])
+        .output()
+        .expect("run external informational benchmark");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "informational benchmark should run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(report_dir.join("report.json")).expect("report should exist"),
+    )
+    .expect("report should parse");
+    assert_eq!(report["program_index_evidence"]["status"], "informational");
+    assert_eq!(report["program_index_evidence"]["admissible_for_domination"], false);
+    let performance = &report["strict_superiority_performance_evidence"];
+    assert_eq!(performance["candidate_rejection"]["status"], "informational");
+    assert_eq!(performance["candidate_rejection"]["rejected"], true);
+    assert_eq!(performance["status"], "blocked");
+    assert_eq!(performance["admissible_for_domination"], false);
+    assert_eq!(performance["lanes"]["clean_release_compile"]["status"], "blocked");
+    assert!(
+        performance["lanes"]["clean_release_compile"]["blocked_reasons"]
+            .as_array()
+            .expect("blocked reasons")
+            .iter()
+            .any(|reason| reason == "candidate_data_rejected")
+    );
+    assert_eq!(report["results"].as_array().expect("results").len(), 4);
 }
 
 #[test]
@@ -666,7 +1323,7 @@ fn program_index_proof_design_suite_requires_repo_stage2_trust_verify_slot() {
         &fs::read_to_string(report_dir.join("report.json")).expect("report should exist"),
     )
     .expect("report should parse");
-    assert_eq!(report["program_index_evidence"]["status"], "admissible");
+    assert_eq!(report["program_index_evidence"]["status"], "blocked");
     assert_eq!(report["proof_design_verifier_evidence"]["required"], true);
     assert_eq!(report["proof_design_verifier_evidence"]["status"], "blocked");
     assert_eq!(
@@ -1279,6 +1936,149 @@ fn program_index_trust_slots_ignore_path_trustc_fallback() {
         lookup_order.iter().all(|entry| entry["kind"] != "path"),
         "Trust lookup order must not advertise PATH fallback: {lookup_order:?}"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn program_index_upstream_slot_is_the_pinned_oracle_never_path_rustc() {
+    // STOCK-AS-ORACLE (docs/DECISION_QUEUE.md D16): an unoverridden
+    // upstream-rustc slot binds rustup's pinned toolchain only. A PATH `rustc`
+    // (on an aterm host, the reroute stub) must not bind it, the lookup must
+    // never let rustup install the toolchain, and an absent oracle is an
+    // explicit NOT RUN, never a pass.
+    let temp = TempDir::new("trust-program-index-path-rustc");
+    let root = temp.path().join("repo");
+    write_program_index_fixture(&root);
+    let index = root.join("examples/bench/program_index/index.json");
+    let oracle = temp.path().join("oracle-bin/rustc");
+    write_fake_compiler(&oracle);
+
+    // (no rustup on PATH | rustup without the toolchain) x (--require-slots)
+    for (rustup_has_oracle, require_slots) in
+        [(None, false), (None, true), (Some(false), false), (Some(false), true)]
+    {
+        let case = format!("{rustup_has_oracle:?}-{require_slots}");
+        let path_dir = temp.path().join(format!("path-{case}"));
+        write_fake_compiler(&path_dir.join("rustc"));
+        let rustup_log = temp.path().join(format!("rustup-{case}.log"));
+        if let Some(has) = rustup_has_oracle {
+            write_fake_rustup(
+                &path_dir.join("rustup"),
+                &rustup_log,
+                has.then_some(oracle.as_path()),
+            );
+        }
+        let report_dir = temp.path().join(format!("report-{case}"));
+        let mut command = program_index_upstream_command(&root, &index, &report_dir, &path_dir);
+        if require_slots {
+            command.arg("--require-slots");
+        }
+        let output = command.output().expect("run with PATH-only rustc");
+        let (report, stderr) = read_program_index_report(&output, &report_dir);
+        assert_eq!(report["slot_bindings"][0]["source"], "oracle-not-installed", "{case}");
+        assert_eq!(report["slot_bindings"][0]["binary"], Value::Null, "{case}");
+        let rows = report["results"].as_array().expect("rows should be array");
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row["outcome"] == "skipped"), "{case}");
+        if require_slots {
+            assert_eq!(output.status.code(), Some(2), "{case} stderr:\n{stderr}");
+            assert!(
+                stderr.contains("upstream-rustc: NOT RUN: oracle 1.97.1 not installed"),
+                "{case} stderr:\n{stderr}"
+            );
+        } else {
+            assert!(
+                rows.iter().all(|row| row["skip_reason"] == "NOT RUN: oracle 1.97.1 not installed"),
+                "{case} rows: {rows:?}"
+            );
+        }
+        if rustup_has_oracle.is_some() {
+            assert_eq!(
+                fs::read_to_string(&rustup_log).expect("rustup should have been asked"),
+                "which --toolchain 1.97.1 rustc|RUSTUP_AUTO_INSTALL=0\n",
+                "{case}"
+            );
+        }
+    }
+
+    // rustup with the toolchain: the slot binds what `rustup which` names.
+    let path_dir = temp.path().join("path-installed");
+    write_fake_compiler(&path_dir.join("rustc"));
+    let rustup_log = temp.path().join("rustup-installed.log");
+    write_fake_rustup(&path_dir.join("rustup"), &rustup_log, Some(&oracle));
+    let report_dir = temp.path().join("report-installed");
+    let output = program_index_upstream_command(&root, &index, &report_dir, &path_dir)
+        .arg("--dry-run")
+        .output()
+        .expect("run with the pinned oracle installed");
+    let (report, stderr) = read_program_index_report(&output, &report_dir);
+    assert_eq!(output.status.code(), Some(0), "stderr:\n{stderr}");
+    assert_eq!(report["slot_bindings"][0]["source"], "rustup:1.97.1");
+    assert_eq!(report["slot_bindings"][0]["binary"], oracle.to_str().expect("oracle is utf-8"));
+    assert_eq!(
+        fs::read_to_string(&rustup_log).expect("rustup should have been asked"),
+        "which --toolchain 1.97.1 rustc|RUSTUP_AUTO_INSTALL=0\n"
+    );
+}
+
+#[cfg(unix)]
+fn program_index_upstream_command(
+    root: &Path,
+    index: &Path,
+    report_dir: &Path,
+    path_dir: &Path,
+) -> Command {
+    let mut command = Command::new(targo_trust_binary());
+    command
+        .args([
+            "trust",
+            "benchmark",
+            "program-index",
+            "--repo-root",
+            root.to_str().expect("root should be utf-8"),
+            "--index",
+            index.to_str().expect("index should be utf-8"),
+            "--report-dir",
+            report_dir.to_str().expect("report dir should be utf-8"),
+            "--slots",
+            "upstream-rustc",
+        ])
+        .env("PATH", path_dir);
+    command
+}
+
+#[cfg(unix)]
+fn read_program_index_report(output: &std::process::Output, report_dir: &Path) -> (Value, String) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let report =
+        serde_json::from_str(&fs::read_to_string(report_dir.join("report.json")).unwrap_or_else(
+            |error| panic!("report should exist ({error})\nstdout:\n{stdout}\nstderr:\n{stderr}"),
+        ))
+        .expect("report should parse");
+    (report, stderr)
+}
+
+/// A `rustup` that logs its arguments and `RUSTUP_AUTO_INSTALL`, then answers
+/// `which` with `oracle` (exit 0) or, without one, as a missing toolchain.
+#[cfg(unix)]
+fn write_fake_rustup(path: &Path, log: &Path, oracle: Option<&Path>) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let answer = match oracle {
+        Some(oracle) => format!("printf '%s\\n' '{}'", oracle.display()),
+        None => "echo \"error: toolchain '1.97.1' is not installed\" >&2; exit 1".to_string(),
+    };
+    write(
+        path.to_path_buf(),
+        &format!(
+            "#!/bin/sh\nprintf '%s|RUSTUP_AUTO_INSTALL=%s\\n' \"$*\" \"${{RUSTUP_AUTO_INSTALL-unset}}\" >> '{}'\n{answer}\n",
+            log.display()
+        ),
+    );
+    let mut permissions = fs::metadata(path).expect("fake rustup metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("fake rustup permissions");
 }
 
 #[test]
@@ -2077,7 +2877,7 @@ fn command_contains_incremental_arg(command: &Value) -> bool {
         .iter()
         .map(|arg| arg.as_str().expect("command args should be strings"))
         .collect();
-    args.iter().any(|arg| *arg == "-C") && args.iter().any(|arg| arg.starts_with("incremental="))
+    args.contains(&"-C") && args.iter().any(|arg| arg.starts_with("incremental="))
 }
 
 fn assert_compile_resource_usage_evidence(row: &Value) {
@@ -2299,6 +3099,30 @@ fn write_program_index_proof_design_fixture(root: &Path) {
 }
 "#,
     );
+    commit_proof_design_fixture(root);
+}
+
+fn commit_proof_design_fixture(root: &Path) {
+    let status =
+        Command::new("git").args(["init", "-q"]).current_dir(root).status().expect("git init");
+    assert!(status.success(), "git init failed");
+    let status =
+        Command::new("git").args(["add", "examples"]).current_dir(root).status().expect("git add");
+    assert!(status.success(), "git add failed");
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Proof Design Test",
+            "-c",
+            "user.email=proof-design@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ])
+        .current_dir(root)
+        .status()
+        .expect("git commit");
+    assert!(status.success(), "git commit failed");
 }
 
 fn write_program_index_fixture(root: &Path) {
@@ -2458,6 +3282,58 @@ fi
     let mut permissions = fs::metadata(path).expect("fake compiler metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).expect("fake compiler permissions");
+}
+
+#[cfg(unix)]
+fn write_observing_compiler(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    write(
+        path.to_path_buf(),
+        r#"#!/bin/sh
+set -eu
+case "${1:-}" in
+  -vV)
+    printf 'rustc 1.95.0 (fake)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\nhost: aarch64-apple-darwin\nrelease: 1.95.0\n'
+    exit 0
+    ;;
+  --print)
+    if [ "${2:-}" = "sysroot" ]; then
+      printf '/opt/upstream-rust/sysroot\n'
+      exit 0
+    fi
+    ;;
+esac
+out=""
+src=""
+prev=""
+link=0
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$arg"; fi
+  if [ "$arg" = "--emit=link" ]; then link=1; fi
+  prev="$arg"
+  src="$arg"
+done
+printf 'mid-run edit\n' > "$TEST_LIVE_SOURCE"
+if cmp -s "$src" "$TEST_EXPECTED_SOURCE"; then
+  matched=1
+else
+  matched=0
+fi
+cp "$TEST_EXPECTED_SOURCE" "$TEST_LIVE_SOURCE"
+printf '%s|%s\n' "$src" "$matched" >> "$TEST_SEEN_SOURCES"
+mkdir -p "$(dirname "$out")"
+if [ "$link" = 1 ]; then
+  printf '#!/bin/sh\nprintf "same output\\n"\n' > "$out"
+  chmod +x "$out"
+else
+  printf 'fake object' > "$out"
+fi
+"#,
+    );
+    let mut permissions = fs::metadata(path).expect("observing compiler metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("observing compiler permissions");
 }
 
 #[cfg(unix)]

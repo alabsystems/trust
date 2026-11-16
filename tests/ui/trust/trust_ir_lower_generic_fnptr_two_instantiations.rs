@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: --crate-type=lib -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: --crate-type=lib -Ztrust-ir-lower -Ztrust-verify=off -Aforgetting_copy_types -Aunexpected_cfgs
 //@ forbid-output: final Trust-IR module validation failed
 //@ forbid-output: CallEdgeSignatureMismatch
 //@ dont-check-compiler-stderr

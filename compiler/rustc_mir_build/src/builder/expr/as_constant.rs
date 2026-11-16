@@ -2,7 +2,8 @@
 
 use rustc_abi::Size;
 use rustc_ast as ast;
-use rustc_hir::LangItem;
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_middle::mir;
 use rustc_middle::mir::interpret::{CTFE_ALLOC_SALT, Scalar};
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
@@ -10,7 +11,7 @@ use rustc_middle::ty::{
     self, CanonicalUserType, CanonicalUserTypeAnnotation, LitToConstInput, Ty, TyCtxt,
     TypeVisitableExt as _, UserTypeAnnotationIndex,
 };
-use rustc_middle::{bug, mir, span_bug};
+use rustc_span::{bug, span_bug};
 use tracing::{instrument, trace};
 
 use crate::builder::{Builder, parse_float_into_constval};
@@ -71,21 +72,8 @@ pub(crate) fn as_constant_inner<'tcx>(
         }
         ExprKind::NamedConst { def_id, args, ref user_ty } => {
             let user_ty = user_ty.as_ref().and_then(push_cuta);
-            if tcx.is_type_const(def_id) {
-                let uneval = ty::AliasConst::new(
-                    tcx,
-                    ty::AliasConstKind::new_from_def_id(tcx, def_id),
-                    args,
-                );
-                let ct = ty::Const::new_alias(tcx, ty::IsRigid::No, uneval);
-
-                let const_ = Const::Ty(ty, ct);
-                return ConstOperand { span, user_ty, const_ };
-            }
-
             let uneval = mir::UnevaluatedConst::new(def_id, args);
             let const_ = Const::Unevaluated(uneval, ty);
-
             ConstOperand { user_ty, span, const_ }
         }
         ExprKind::ConstParam { param, def_id: _ } => {

@@ -15,11 +15,12 @@
 //!
 //! NOTE: Simplify CFG will happily undo most of the work this pass does.
 
-use rustc_data_structures::thin_vec::ThinVec;
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use tracing::debug;
+
+use crate::PassPolicy;
 
 #[derive(PartialEq)]
 pub(super) enum AddCallGuards {
@@ -30,6 +31,19 @@ pub(super) use self::AddCallGuards::*;
 
 impl<'tcx> crate::MirPass<'tcx> for AddCallGuards {
     fn run_pass(&self, _tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        let has_candidate = body.basic_blocks.iter().any(|block| match block.terminator().kind {
+            TerminatorKind::Call { target: Some(_), unwind, .. } => {
+                generates_invoke(unwind) || self == &AllCallEdges
+            }
+            TerminatorKind::InlineAsm { asm_macro: InlineAsmMacro::Asm, .. } => {
+                self == &CriticalCallEdges
+            }
+            _ => false,
+        });
+        if !has_candidate {
+            return;
+        }
+
         let mut pred_count = IndexVec::from_elem(0u8, &body.basic_blocks);
         for (_, data) in body.basic_blocks.iter_enumerated() {
             for succ in data.terminator().successors() {
@@ -42,7 +56,7 @@ impl<'tcx> crate::MirPass<'tcx> for AddCallGuards {
             Asm { target_index: usize },
         }
 
-        let mut work = Vec::with_capacity(body.basic_blocks.len());
+        let mut work = Vec::new();
         for (bb, block) in body.basic_blocks.iter_enumerated() {
             let term = block.terminator();
             match term.kind {
@@ -87,11 +101,7 @@ impl<'tcx> crate::MirPass<'tcx> for AddCallGuards {
         let cur_len = body.basic_blocks.len();
         let mut new_block = |source_info: SourceInfo, is_cleanup: bool, target: BasicBlock| {
             let block = BasicBlockData::new(
-                Some(Terminator {
-                    source_info,
-                    kind: TerminatorKind::Goto { target },
-                    attributes: ThinVec::new(),
-                }),
+                Some(Terminator { source_info, kind: TerminatorKind::goto(target) }),
                 is_cleanup,
             );
             let idx = cur_len + new_blocks.len();
@@ -127,8 +137,10 @@ impl<'tcx> crate::MirPass<'tcx> for AddCallGuards {
         basic_blocks.extend(new_blocks);
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Breaks critical edges so codegen can place edge-specific actions without affecting
+        // other control-flow edges.
+        PassPolicy::Required
     }
 }
 

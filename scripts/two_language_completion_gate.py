@@ -6,10 +6,15 @@ This is the top-level conjunction for the goal recorded in
 percentage and it does not claim to prove the semantic facts recorded by a
 specialized checker.  It verifies that:
 
-* one clean source revision, toolchain identity, and corpus manifest are bound;
+* one source revision, toolchain identity, and corpus manifest are bound, and
+  the checkout (submodules included) is byte-for-byte that revision's checkout,
+  apart from untracked files its ignore rules exclude, before and after the
+  checkers run, and configures no program a checker's Git would start (see
+  ``worktree_refusals``);
 * exactly G1 through G8 have distinct, content-hashed checker evidence;
 * every gate's schema-owned, source-controlled checker is content-bound and
-  re-executed against that evidence;
+  re-executed against that evidence, in an interpreter that reads no bytecode
+  from the tree (``_isolated_python``);
 * every required conjunct reported by the fresh checker run is affirmative;
 * every conjunct binds at least one existing, content-hashed evidence artifact;
 * no author-provided ``complete`` or ``vision_complete`` bit can mint success.
@@ -19,27 +24,102 @@ artifacts.  This script is the fail-closed, checker-executing structural
 conjunction over them.  An authored JSON ``passed`` bit is never sufficient.
 
 Usage:
-    python3 scripts/two_language_completion_gate.py \
+    python3 -I -B scripts/two_language_completion_gate.py \
         --receipt build/two-language-completion/receipt.json --root . \
         --trusted-owner-key /external/trust-owner.pub
+
+Without -I, Python puts the script's directory first on sys.path; for a copy
+inside the candidate that is its scripts/, where an ignored sourceless
+``json.pyc`` would be imported in place of the standard library.  So a run
+without -I and -B re-executes itself once with them before its first import
+that searches sys.path (see the guard below).  A release runs an externally
+pinned copy with ``--candidate-verifier`` instead.
 
 Exit 0 means the structural receipt is complete.  Exit 1 means incomplete or
 malformed evidence.  A structurally green receipt is necessary, not sufficient,
 for believing a checker whose own implementation has not been reviewed.
 """
 
-from __future__ import annotations
+# No import may precede this guard, ``from __future__`` included: that is an
+# ordinary import searched on sys.path.  sys and posix are built in, loaded
+# before any script runs, and found by the built-in importer ahead of
+# sys.path; os is not safe here, since under -S it is not loaded yet and, on
+# Python 3.9, not frozen either.
+import sys
+
+_ISOLATED_MARKER = b"TRUST_COMPLETION_GATE_ISOLATED"
+
+if __name__ == "__main__" and not (sys.flags.isolated and sys.flags.dont_write_bytecode):
+    import posix
+
+    if _ISOLATED_MARKER in posix.environ or not sys.executable:
+        # The re-executed interpreter did not honor -I -B, or there is no
+        # interpreter to re-execute: refuse rather than loop or run exposed.
+        sys.exit("two_language_completion_gate: cannot start an isolated (-I -B) interpreter")
+    _script = __file__ if __file__.startswith("/") else f"{posix.getcwd()}/{__file__}"
+    posix.execve(
+        sys.executable,
+        [sys.executable, "-I", "-B", _script, *sys.argv[1:]],
+        {**posix.environ, _ISOLATED_MARKER: b"1"},
+    )
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
-import sys
 import tempfile
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, NamedTuple, Optional, Union
+
+# The marker only ever guards the one re-execution; checkers never see it.
+os.environ.pop(os.fsdecode(_ISOLATED_MARKER), None)
+
+# Trust (2026-09-27): an EXPLICIT nesting bound, because the `RecursionError`
+# caught at the parse sites below is NOT one. Python's recursion limit is not a
+# property this gate controls. MEASURED 2026-09-27: `b"[" * 1100 + b"0" + b"]" * 1100`
+# raises `RecursionError` on CPython 3.9 (so the reader refused it) and parses
+# CLEANLY on CPython 3.14 (so it did not). `_isolated_python` runs every checker
+# under `sys.executable` and NOTHING here pins an interpreter version, so on a
+# newer Python the refusal of adversarially nested evidence silently disappeared.
+# `scripts/tests/completion_gate_malformed_input_test.py` is the control and does
+# fail on 3.14 — but no harness lane runs it, so nothing said so.
+#
+# 64 is chosen from measurement, not taste: the deepest legitimate JSON in the
+# tree is depth 4. Refuse-only — this can reject input a reader previously
+# accepted, never accept input it previously rejected.
+TRUST_MAX_JSON_DEPTH = 64
+
+
+def _trust_json_nesting_depth(text: str) -> int:
+    """Maximum `[`/`{` nesting of `text`, ignoring brackets inside strings."""
+    depth = 0
+    deepest = 0
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "[" or ch == "{":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif ch == "]" or ch == "}":
+            depth -= 1
+    return deepest
+
 
 
 SCHEMA = "trust.two-language.completion/v2"
@@ -66,6 +146,9 @@ POLICY_SCHEMA = "trust.two-language.authority-policy/v2"
 POLICY_AUTH_SCHEMA = "trust.two-language.policy-authorization/v1"
 POLICY_SIGNATURE_NAMESPACE = "trust-two-language-policy"
 SSH_KEYGEN = Path("/usr/bin/ssh-keygen")
+# ssh-keygen reads a candidate-supplied signature file; a FIFO swapped in for
+# it must not hold the gate forever.
+SSH_KEYGEN_TIMEOUT = 60
 
 AUTHORITY_CONTRACTS = {
     "admission": (
@@ -331,11 +414,33 @@ CHECKER_ID = re.compile(r"^[a-z0-9][a-z0-9._/-]*$")
 
 
 def _sha256(path: Path) -> str:
+    """sha256 of the regular file at ``path``; OSError for anything else.
+
+    Read through ``_open_regular``: a FIFO or device put in place of a bound
+    file can neither hang the gate nor feed it bytes without end.
+    """
+    opened = _open_regular(path)
+    if opened is None:
+        raise OSError(errno.EINVAL, "not a regular file", str(path))
+    fd, _info = opened
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+    try:
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
             digest.update(chunk)
+    finally:
+        os.close(fd)
     return digest.hexdigest()
+
+
+def _read_file(path: Path) -> bytes:
+    """The bytes of the regular file at ``path``; OSError for anything else."""
+    data = _read_regular(path)
+    if data is None:
+        raise OSError(errno.EINVAL, "not a regular file", str(path))
+    return data
 
 
 def _canonical_json_sha256(value: Any) -> str:
@@ -343,14 +448,1203 @@ def _canonical_json_sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _git(root: Path, *args: str) -> tuple[int, str]:
-    process = subprocess.run(
-        ["git", "-C", str(root), *args],
-        check=False,
-        capture_output=True,
-        text=True,
+# Every Git call disables replacement objects (a refs/replace/* ref otherwise
+# substitutes the content of any object the gate reads), never takes the
+# optional locks with which `git status` rewrites the candidate's index, and
+# never starts a file-system-monitor hook named by the candidate's config.
+# (_git_env also turns off lazy fetching; see PROGRAM_CONFIG.)
+GIT_GLOBAL_OPTIONS = ("--no-replace-objects", "--no-optional-locks", "-c", "core.fsmonitor=false")
+# Repository settings with which a read-only Git command starts a program.  A
+# checker runs Git with the candidate's own configuration, so
+# worktree_refusals refuses each by name, in every repository it inspects:
+# * core.fsmonitor: every index read -- G2's `git status` in
+#   first-party/clean -- runs the hook it names, or starts the built-in
+#   daemon when it is true;
+# * a promisor remote: every command that needs an object the store lacks --
+#   G1's `git show <rev>:<path>` or `cat-file` -- starts a lazy `git fetch`,
+#   whose transport runs what the remote's uploadpack, ext:: URL or ssh
+#   settings name.  The raw-bytes comparison reads no blob, so a store
+#   without one still passes it.  Git names a promisor remote by
+#   extensions.partialClone, whatever its value, by a true
+#   remote.<name>.promisor, and by any remote.<name>.partialCloneFilter,
+#   whose remote it registers before reading the value (promisor-remote.c,
+#   the same in every release from 2.41 to 2.56-rc2).  <name> may be empty
+#   or missing: remote.promisor names the remote "", which a
+#   url.<base>.insteadOf rewrite of "" gives a URL.  So every key of the
+#   remote section whose last part is promisor or partialclonefilter is
+#   matched.
+# Nothing else the checkers run reaches a program: no checker runs a diff
+# (textconv and external diff drivers) or shows a commit (gpg.program), Git's
+# output is never a terminal (the pager), and no command they run writes a
+# ref -- nor, under --no-optional-locks, the index -- so no hook fires.  The
+# filter drivers that status and hash-object run are refused on their own.
+PROGRAM_CONFIG = (
+    r"^(core\.fsmonitor|extensions\.partialclone"
+    r"|remote\.(.*\.)?(promisor|partialclonefilter))$"
+)
+# Git reads an empty value, and false, no, off or 0 in any case, as false; a
+# key with no value at all is true.
+FALSE_SPELLINGS = (b"", b"false", b"no", b"off", b"0")
+# `--attr-source` arrived in Git 2.41; without it no checkout conversion can be
+# recomputed from the pinned tree, so a genuine checkout that converts a file
+# (this repository's six `eol=crlf` LLVM files) would read as tampered.
+# GIT_CONFIG_GLOBAL arrived in 2.32, and an older Git silently ignores it and
+# reads the operator's global configuration.  Every other option used here
+# makes a Git that lacks it fail, which refuses.
+MIN_GIT_VERSION = (2, 41)
+# `git status` settings the candidate's configuration may not relax.  They are
+# not the clean-tree predicate on their own: an index whose cached stat data
+# was recorded from a rewritten file (e.g. by one `git -c core.autocrlf=true
+# add`) still reads clean under them, which is why raw bytes are compared too.
+HARDENED_STATUS_OPTIONS = (
+    "-c", "core.untrackedCache=false",
+    "-c", "diff.ignoreSubmodules=none",
+    "-c", "core.checkStat=default",
+    "-c", "core.trustctime=true",
+    # On a case-sensitive volume, ignoreCase=true hides an untracked file whose
+    # name differs from a tracked one only in case; false can only add entries.
+    "-c", "core.ignoreCase=false",
+    # Reported paths are matched against raw directory entries
+    # (account_for_untracked), so status reports them as the file system
+    # stores them rather than precomposed.
+    "-c", "core.precomposeUnicode=false",
+)
+# Checkout conversion, recomputed in a sandbox repository from the pinned
+# tree's own .gitattributes and nothing else (``_checkout_conversions``), for
+# the exact tree path bytes.
+CHECKOUT_CONVERSION_OPTIONS = (
+    "-c", "core.autocrlf=false",
+    "-c", "core.eol=lf",
+    "-c", f"core.attributesFile={os.devnull}",
+    "-c", "core.precomposeUnicode=false",
+)
+# Upper bounds, in seconds, on one Git command: GIT_TIMEOUT for the ones whose
+# work grows with the checkout (status, ls-files, cat-file) -- `git status` on
+# this repository's 254,550 tracked files takes well under a minute -- and
+# GIT_QUICK_TIMEOUT for the ones that read only configuration and refs.  A
+# command that runs out of time is refused like any failing Git command.
+GIT_TIMEOUT = 900
+GIT_QUICK_TIMEOUT = 60
+# How many offending paths one refusal names.
+NAMED_PATHS = 3
+# Worktree files are hashed on a few threads in fixed-size batches.  Measured
+# on this repository's 254,550 tracked regular files (2.86 GiB, warm cache):
+# 14.1 s on one thread and 4.6 s on four under Python 3.9 (8.3 s and 4.3 s
+# under 3.14), slower again on six or more (GIL contention).
+HASH_WORKERS = 4
+HASH_BATCH = 512
+# Files whose raw bytes differ from their blob are checked for a checkout
+# conversion this many at a time, each batch in one sandbox; once a batch has
+# decided the refusal the remaining files are not examined.
+CONVERSION_BATCH = 64
+
+
+def _git_env() -> dict[str, str]:
+    # Candidate identity and cleanliness must not be redirected by the caller:
+    # every caller-supplied GIT_* variable is dropped, and the system and
+    # global configuration tiers -- including the XDG ignore and attributes
+    # files Git reads even without a global config file -- are replaced by
+    # empty ones.  What remains is the candidate's own repository
+    # configuration, which worktree_refusals inspects instead of trusting.
+    # Git honors safe.directory only from those neutralized tiers, so a
+    # checkout owned by another user than the one running the gate is refused
+    # as of "dubious ownership".  Lazy fetching is off as well: Git 2.45, and
+    # the May 2024 security releases 2.41.1, 2.42.2, 2.43.4 and 2.44.1, honor
+    # GIT_NO_LAZY_FETCH, but earlier releases ignore it, which is why the gate
+    # reads no object of a repository whose configuration names a promisor
+    # remote (PROGRAM_CONFIG).
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_ATTR_NOSYSTEM="1",
+        GIT_NO_LAZY_FETCH="1",
+        XDG_CONFIG_HOME=os.devnull,
     )
-    return process.returncode, process.stdout.strip()
+    return env
+
+
+def _bounded_run(
+    command: list[str], timeout: float, **kwargs: Any
+) -> subprocess.CompletedProcess:
+    """``subprocess.run`` with bytes captured; a missing program or a timeout refuses.
+
+    Either becomes a nonzero exit (127, or 124 with the command that timed
+    out), which every caller already refuses.  On a timeout the child is
+    killed, not left blocked behind the gate.
+    """
+    try:
+        return subprocess.run(
+            command, check=False, capture_output=True, timeout=timeout, **kwargs
+        )
+    except subprocess.TimeoutExpired:
+        detail = f"timed out after {timeout:g} s: {' '.join(command)}"
+        return subprocess.CompletedProcess(command, 124, b"", detail.encode())
+    except OSError as exc:
+        return subprocess.CompletedProcess(command, 127, b"", str(exc).encode())
+
+
+def _ssh_keygen(*args: str, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
+    """Run SSH_KEYGEN, bounded by SSH_KEYGEN_TIMEOUT, in a fixed environment."""
+    return _bounded_run(
+        [str(SSH_KEYGEN), *args],
+        SSH_KEYGEN_TIMEOUT,
+        input=stdin,
+        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+    )
+
+
+def _git_run(
+    root: Path, *args: str, stdin: Optional[bytes] = None, timeout: Optional[float] = None
+) -> subprocess.CompletedProcess:
+    """Run hardened Git against ``root``; bytes out, and a missing Git refuses.
+
+    Git opens files the candidate controls (included configuration,
+    info/exclude, core.excludesFile, every .gitignore it walks) with a
+    blocking open, so a FIFO at any of them would stall it forever: each
+    call is bounded, by GIT_TIMEOUT unless the caller passes a shorter bound.
+    """
+    command = ["git", *GIT_GLOBAL_OPTIONS, "-C", str(root), *args]
+    return _bounded_run(
+        command, GIT_TIMEOUT if timeout is None else timeout, input=stdin, env=_git_env()
+    )
+
+
+def _diagnostic(process: subprocess.CompletedProcess) -> str:
+    detail = process.stderr.decode("utf-8", errors="replace").strip()
+    return f"git exited {process.returncode}: {detail[:300] or 'no diagnostic'}"
+
+
+def _display(path: Union[bytes, str]) -> str:
+    # Surrogate-free, so a hostile path name cannot break the JSON or --text
+    # verdict it is reported in.
+    if isinstance(path, str):
+        path = os.fsencode(path)
+    return path.decode("utf-8", errors="backslashreplace")
+
+
+def _named(paths: list[bytes]) -> str:
+    shown = ", ".join(_display(path) for path in paths[:NAMED_PATHS])
+    extra = len(paths) - NAMED_PATHS
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
+def _identity(path: Union[str, bytes, Path]) -> tuple[int, int]:
+    info = os.stat(path)
+    return info.st_dev, info.st_ino
+
+
+def _identity_or_none(path: Union[str, bytes, Path]) -> Optional[tuple[int, int]]:
+    """``_identity``, or None when ``path`` cannot be stat'ed."""
+    try:
+        return _identity(path)
+    except (OSError, ValueError):
+        return None
+
+
+def _file_mode(
+    path: Union[str, bytes, Path], *, follow_symlinks: bool = True
+) -> tuple[Optional[int], Optional[str]]:
+    """``path``'s st_mode (None when nothing is there), and why it cannot be stat'ed.
+
+    Python 3.9's pathlib is_file() and is_symlink() raise every OSError but
+    ENOENT, ENOTDIR, EBADF and ELOOP: a candidate-chosen name longer than
+    NAME_MAX, or one under a directory without search permission, would
+    crash the gate instead of refusing.  So candidate-derived paths are
+    stat'ed only through this.
+    """
+    try:
+        info = os.stat(path, follow_symlinks=follow_symlinks)
+    except (FileNotFoundError, NotADirectoryError):
+        return None, None
+    except (OSError, ValueError) as exc:
+        return None, str(exc)
+    return info.st_mode, None
+
+
+def _file_size(path: Union[str, bytes, Path]) -> Optional[int]:
+    """``path``'s size, or None when it cannot be stat'ed."""
+    try:
+        return os.stat(path).st_size
+    except (OSError, ValueError):
+        return None
+
+
+def _is_regular_file(path: Union[str, bytes, Path]) -> bool:
+    """Whether ``path`` leads to a regular file; False when it cannot be stat'ed."""
+    mode, _problem = _file_mode(path)
+    return mode is not None and stat.S_ISREG(mode)
+
+
+def _resolved(path: Path) -> tuple[Path, Optional[str]]:
+    """``path.resolve()``, or its absolute spelling plus why it did not resolve.
+
+    Python 3.9's pathlib raises RuntimeError on a symlink loop (3.13+ returns
+    the partially resolved path instead), and ValueError on an embedded NUL;
+    getcwd() can raise OSError.  None of these may crash the gate.
+    """
+    try:
+        return path.resolve(), None
+    except (OSError, RuntimeError, ValueError) as exc:
+        problem = str(exc)
+    try:
+        return Path(os.path.abspath(path)), problem
+    except OSError:
+        # A relative path under a deleted working directory: abspath calls
+        # getcwd() again and fails the same way.
+        return path, problem
+
+
+def _inside_root_by_identity(path: Path, root: Path) -> Optional[str]:
+    """Why ``path`` counts as inside ``root``; None when it provably is not.
+
+    Lexical containment is not identity: on a case-insensitive volume
+    ``/work/TRUST/owner.pub`` lies inside ``--root /work/trust`` although
+    ``relative_to`` says it does not, and a bind mount aliases a directory the
+    same way.  ``path`` is inside when it or any ancestor has ``root``'s
+    (st_dev, st_ino); when the path or an ancestor cannot be stat'ed nothing
+    is proved, so that also counts as inside.
+    """
+    try:
+        root_identity = _identity(root)
+    except (OSError, ValueError) as exc:
+        return f"--root cannot be stat'ed: {exc}"
+    for candidate in (path, *path.parents):
+        try:
+            identity = _identity(candidate)
+        except (OSError, ValueError) as exc:
+            return f"cannot stat {candidate}: {exc}"
+        if identity == root_identity:
+            return f"{candidate} is --root"
+    return None
+
+
+def _git_version_refusal() -> Optional[str]:
+    process = _bounded_run(["git", "--version"], GIT_QUICK_TIMEOUT, env=_git_env())
+    match = re.match(rb"git version (\d+)\.(\d+)", process.stdout)
+    if process.returncode != 0 or match is None:
+        return f"cannot determine the git version: {_diagnostic(process)}"
+    version = (int(match.group(1)), int(match.group(2)))
+    if version < MIN_GIT_VERSION:
+        wanted = ".".join(map(str, MIN_GIT_VERSION))
+        return (
+            f"git {version[0]}.{version[1]} is too old for this gate: GIT_CONFIG_GLOBAL "
+            "(2.32) neutralizes the operator's configuration and --attr-source (2.41) "
+            f"recomputes checkout conversions from the pinned tree; {wanted}+ is required"
+        )
+    return None
+
+
+def _git_path(worktree: Path, *args: str) -> tuple[Optional[str], str]:
+    """The one absolute path ``git rev-parse <args>`` prints, or None and why not.
+
+    One path per call: a path may itself hold a newline, so several paths in
+    one output cannot be told apart.
+    """
+    process = _git_run(
+        worktree, "rev-parse", "--path-format=absolute", *args, timeout=GIT_QUICK_TIMEOUT
+    )
+    if process.returncode != 0:
+        return None, _diagnostic(process)
+    if not process.stdout.endswith(b"\n"):
+        return None, "unparseable rev-parse output"
+    return os.fsdecode(process.stdout[:-1]), ""
+
+
+def _safe_tree_path(path: bytes) -> bool:
+    return bool(path) and all(
+        part not in (b"", b".", b"..") and part.lower() != b".git"
+        for part in path.split(b"/")
+    )
+
+
+def _open_regular(path: Union[str, bytes, Path]) -> Optional[tuple[int, os.stat_result]]:
+    """An fd on ``path`` if it is itself a regular file, else None.
+
+    O_NOFOLLOW refuses a symlink in the final component and O_NONBLOCK keeps a
+    FIFO planted at a tracked path from hanging the gate; the type is then
+    decided by fstat on the descriptor actually read.
+    """
+    fd = os.open(
+        path,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        raise
+    if not stat.S_ISREG(info.st_mode):
+        os.close(fd)
+        return None
+    return fd, info
+
+
+def _blob_digest(path: bytes, algorithm: Any) -> tuple[Optional[str], int]:
+    """Git blob id of the raw bytes at ``path`` (no filters) and its st_mode.
+
+    The id is None when ``path`` is not a regular file or changed size while
+    being read.
+    """
+    opened = _open_regular(path)
+    if opened is None:
+        return None, 0
+    fd, info = opened
+    try:
+        digest = algorithm(b"blob %d\0" % info.st_size)
+        size = 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    finally:
+        os.close(fd)
+    if size != info.st_size:
+        return None, info.st_mode
+    return digest.hexdigest(), info.st_mode
+
+
+def _verified_objects(
+    worktree: Path, oids: list[str], kind: bytes
+) -> tuple[list[bytes], Optional[str]]:
+    """The contents of ``oids``, each re-hashed against its own id.
+
+    Git does not re-hash every object it reads: measured with Git 2.50, a pack
+    whose index maps a pinned blob or subtree id onto other content is served
+    by ``cat-file``, ``show``, ``ls-tree -r`` and ``status`` without complaint.
+    So nothing the gate compares against may come from an unhashed read.
+    """
+    algorithm = hashlib.sha1 if len(oids[0]) == 40 else hashlib.sha256
+    requests = "".join(f"{oid}\n" for oid in oids).encode()
+    process = _git_run(worktree, "cat-file", "--batch", stdin=requests)
+    if process.returncode != 0:
+        return [], f"cannot read objects: {_diagnostic(process)}"
+    output = process.stdout
+    contents: list[bytes] = []
+    position = 0
+    for oid in oids:
+        end = output.find(b"\n", position)
+        header = output[position:end].split(b" ") if end >= 0 else []
+        if len(header) != 3 or header[0] != oid.encode() or not header[2].isdigit():
+            return [], f"object {oid} is missing or unreadable"
+        start = end + 1
+        stop = start + int(header[2])
+        content = output[start:stop]
+        if output[stop:stop + 1] != b"\n" or len(content) != int(header[2]):
+            return [], f"object {oid} is truncated"
+        position = stop + 1
+        if header[1] != kind:
+            return [], f"object {oid} is a {_display(header[1])}, not a {_display(kind)}"
+        if algorithm(b"%s %d\0" % (kind, len(content)) + content).hexdigest() != oid:
+            return [], f"object {oid} does not hash to its id (a substituted object)"
+        contents.append(content)
+    return contents, None
+
+
+def _tree_entries(body: bytes, raw_size: int) -> Optional[list[tuple[bytes, bytes, str]]]:
+    """A tree object's (mode, name, oid) entries, or None when it is malformed."""
+    entries: list[tuple[bytes, bytes, str]] = []
+    position = 0
+    while position < len(body):
+        # Each entry is "<octal mode> <name>\0<raw oid>".
+        nul = body.find(b"\0", position)
+        space = body.find(b" ", position, nul) if nul >= 0 else -1
+        if space < 0 or nul + 1 + raw_size > len(body) or b"/" in body[space + 1:nul]:
+            return None
+        entries.append(
+            (body[position:space], body[space + 1:nul], body[nul + 1:nul + 1 + raw_size].hex())
+        )
+        position = nul + 1 + raw_size
+    return entries
+
+
+def _verified_head_tree(
+    worktree: Path, head: str
+) -> tuple[list[tuple[bytes, str, bytes]], dict[bytes, tuple[str, bytes]], Optional[str]]:
+    """Every non-tree entry of ``head`` as (mode, oid, path), from re-hashed trees.
+
+    Also returns every tree object, keyed by its directory prefix (b"" for the
+    root, else b"dir/sub/"), as (oid, body): the checkout conversion needs the
+    trees along a path.
+    """
+    raw_size = len(head) // 2
+    commits, problem = _verified_objects(worktree, [head], b"commit")
+    if problem is not None:
+        return [], {}, problem
+    first_line = commits[0].split(b"\n", 1)[0].split(b" ")
+    root_tree = first_line[1].decode("ascii", errors="replace") if len(first_line) == 2 else ""
+    if first_line[0] != b"tree" or not GIT_REVISION.fullmatch(root_tree):
+        return [], {}, f"commit {head} names no tree"
+    entries: list[tuple[bytes, str, bytes]] = []
+    trees: dict[bytes, tuple[str, bytes]] = {}
+    level = [(root_tree, b"")]
+    while level:
+        bodies, problem = _verified_objects(worktree, [oid for oid, _prefix in level], b"tree")
+        if problem is not None:
+            return [], {}, problem
+        next_level: list[tuple[str, bytes]] = []
+        for (oid, prefix), body in zip(level, bodies):
+            parsed = _tree_entries(body, raw_size)
+            if parsed is None:
+                return [], {}, f"tree {oid} is malformed"
+            trees[prefix] = (oid, body)
+            for mode, name, child in parsed:
+                if mode in (b"40000", b"040000"):
+                    next_level.append((child, prefix + name + b"/"))
+                else:
+                    entries.append((mode, child, prefix + name))
+        level = next_level
+    return entries, trees, None
+
+
+def _write_loose_object(git_dir: Path, kind: bytes, oid: str, content: bytes) -> None:
+    directory = git_dir / "objects" / oid[:2]
+    directory.mkdir(exist_ok=True)
+    (directory / oid[2:]).write_bytes(
+        zlib.compress(b"%s %d\0" % (kind, len(content)) + content)
+    )
+
+
+def _checkout_conversions(
+    worktree: Path,
+    head: str,
+    trees: dict[bytes, tuple[str, bytes]],
+    requests: list[tuple[bytes, str]],
+) -> tuple[dict[bytes, Optional[bytes]], dict[bytes, str]]:
+    """Each (path, blob) of ``requests`` as a checkout of ``head`` writes it.
+
+    Returns (converted, failures).  ``converted[path]`` is None when the bytes
+    depend on core.ignoreCase: whether .gitattributes patterns match
+    case-insensitively is the candidate's own setting, so a conversion that
+    depends on it is not the pinned checkout.  ``failures[path]`` says why no
+    conversion could be computed.
+
+    Git computes each conversion in a throwaway bare repository into which
+    the gate writes only objects it re-hashed itself: the pinned trees along
+    the path, the .gitattributes blobs on the way, and the blob.  The
+    candidate's own object store cannot serve the conversion even after its
+    objects were re-hashed.  When two packs claim one id with different
+    content, which one a Git process reads depends on the lookups it made
+    before (packs are searched most recently used first).  Measured with Git
+    2.50: a process that reads only the .gitattributes id gets the genuine
+    blob, while a process that converts a file reads that file's blob first,
+    from the other pack, and then gets forged attributes from it.  The
+    sandbox also has none of the candidate's configuration, filter drivers,
+    hooks or info/attributes.
+    """
+    raw_size = len(head) // 2
+    failures: dict[bytes, str] = {}
+
+    def fail_all(problem: str) -> tuple[dict[bytes, Optional[bytes]], dict[bytes, str]]:
+        return {}, {path: problem for path, _oid in requests}
+
+    # Git reads the .gitattributes of every directory on the path, from the
+    # attribute-source tree; nothing else in the tree.
+    prefixes: set[bytes] = set()
+    attribute_oids: set[str] = set()
+    for path, _oid in requests:
+        parts = path.split(b"/")[:-1]
+        for depth in range(len(parts) + 1):
+            prefix = b"/".join(parts[:depth]) + (b"/" if depth else b"")
+            if prefix in prefixes:
+                continue
+            if prefix not in trees:
+                return fail_all(f"HEAD has no tree at {_display(prefix)}")
+            prefixes.add(prefix)
+            for mode, name, child in _tree_entries(trees[prefix][1], raw_size) or ():
+                if name == b".gitattributes" and mode in (b"100644", b"100755", b"120000"):
+                    attribute_oids.add(child)
+    blob_oids = sorted(attribute_oids | {oid for _path, oid in requests})
+    contents, problem = _verified_objects(worktree, blob_oids, b"blob")
+    if problem is not None:
+        return fail_all(problem)
+    object_format = "sha1" if len(head) == 40 else "sha256"
+    try:
+        with tempfile.TemporaryDirectory(prefix="trust-gate-checkout-") as sandbox_name:
+            sandbox = Path(sandbox_name)
+            init = _git_run(
+                sandbox, "init", "-q", "--bare", "--template=",
+                f"--object-format={object_format}", ".",
+            )
+            if init.returncode != 0:
+                return fail_all(f"cannot create the conversion sandbox: {_diagnostic(init)}")
+            for prefix in prefixes:
+                _write_loose_object(sandbox, b"tree", *trees[prefix])
+            for oid, content in zip(blob_oids, contents):
+                _write_loose_object(sandbox, b"blob", oid, content)
+            root_tree = trees[b""][0]
+
+            def convert(request: tuple[bytes, str]) -> tuple[Optional[bytes], Optional[str]]:
+                path, oid = request
+                outputs = []
+                for ignore_case in ("false", "true"):
+                    process = _git_run(
+                        sandbox, "--git-dir=.", f"--attr-source={root_tree}",
+                        *CHECKOUT_CONVERSION_OPTIONS, "-c", f"core.ignoreCase={ignore_case}",
+                        "cat-file", "--filters", f"--path={os.fsdecode(path)}", oid,
+                    )
+                    if process.returncode != 0:
+                        return None, _diagnostic(process)
+                    outputs.append(process.stdout)
+                return (outputs[0] if outputs[0] == outputs[1] else None), None
+
+            with ThreadPoolExecutor(max_workers=HASH_WORKERS) as pool:
+                results = list(pool.map(convert, requests))
+    except OSError as exc:
+        return fail_all(f"cannot use the conversion sandbox: {exc}")
+    converted: dict[bytes, Optional[bytes]] = {}
+    for (path, _oid), (output, problem) in zip(requests, results):
+        if problem is not None:
+            failures[path] = problem
+        else:
+            converted[path] = output
+    return converted, failures
+
+
+def _read_regular(path: Union[str, bytes, Path]) -> Optional[bytes]:
+    opened = _open_regular(path)
+    if opened is None:
+        return None
+    fd, _info = opened
+    chunks = []
+    try:
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def _status_entries(output: bytes) -> tuple[list[bytes], list[bytes], list[bytes]]:
+    """Split ``git status --porcelain -z --ignored`` output.
+
+    Returns (changes, changed paths, ignored paths): changes are the records
+    as reported, and a directory's path keeps its trailing slash.  A rename
+    or copy record is followed by its source path, part of the same change.
+    """
+    changes: list[bytes] = []
+    changed: list[bytes] = []
+    ignored: list[bytes] = []
+    records = iter(output.split(b"\0"))
+    for record in records:
+        if not record:
+            continue
+        code, path = record[:2], record[3:]
+        if code == b"!!":
+            ignored.append(path)
+            continue
+        changes.append(record)
+        changed.append(path)
+        if b"R" in code or b"C" in code:
+            changed.append(next(records, b""))
+    return changes, changed, ignored
+
+
+class _CheckoutInspection:
+    """One clean-tree inspection of a checkout and, recursively, its submodules."""
+
+    def __init__(self) -> None:
+        self.refusals: list[str] = []
+        self.visited: set[tuple[int, int]] = set()
+
+    def inspect(self, worktree: Path, prefix: str, pinned: Optional[str]) -> bool:
+        """Inspect the checkout at ``worktree``, whose HEAD must be ``pinned``.
+
+        Returns whether running ``git status`` there is safe: status executes
+        the clean filter of any configured driver, in this repository or in a
+        submodule it recurses into, and reads objects, so it only runs once
+        every repository at or below this one has been inspected and
+        configures neither a filter driver nor a promisor remote.
+        """
+        label = f"submodule {prefix.rstrip('/')}: " if prefix else ""
+
+        def refuse(detail: str) -> None:
+            self.refusals.append(f"{label}{detail}")
+
+        toplevel, problem = _git_path(worktree, "--show-toplevel")
+        if toplevel is None:
+            refuse(f"cannot inspect the repository layout: {problem}")
+            return False
+        # The directory Git inspects must be the directory the checkers read,
+        # by identity: core.worktree or a .git file can point status elsewhere.
+        try:
+            identity = _identity(worktree)
+            redirected = _identity(toplevel) != identity
+        except (OSError, ValueError) as exc:
+            refuse(f"cannot compare Git's worktree with {_display(str(worktree))}: {exc}")
+            return False
+        if redirected:
+            refuse(
+                f"Git inspects {_display(toplevel)}, not {_display(str(worktree))} "
+                "(core.worktree or a .git file redirects it)"
+            )
+            return False
+        self.visited.add(identity)
+        # Before the first object read: with a promisor remote configured,
+        # reading an object the store lacks runs a program (PROGRAM_CONFIG).
+        if not self.refuse_program_config(worktree, refuse):
+            return False
+
+        head_process = _git_run(
+            worktree, "rev-parse", "--verify", "--quiet", "HEAD^{commit}",
+            timeout=GIT_QUICK_TIMEOUT,
+        )
+        head = head_process.stdout.decode("ascii", errors="replace").strip()
+        if head_process.returncode != 0 or not GIT_REVISION.fullmatch(head):
+            refuse("HEAD is not a readable commit")
+            return False
+        if pinned is not None and head != pinned:
+            refuse(f"HEAD {head} is not the pinned commit {pinned}")
+            return False
+
+        replace_refs = _git_run(
+            worktree, "for-each-ref", "--format=%(refname)", "refs/replace/",
+            timeout=GIT_QUICK_TIMEOUT,
+        )
+        if replace_refs.returncode != 0:
+            refuse(f"cannot list replacement refs: {_diagnostic(replace_refs)}")
+        elif replace_refs.stdout.strip():
+            refuse(
+                "replacement refs substitute object content for every other Git "
+                f"reader: {_named(replace_refs.stdout.split())}"
+            )
+        for name, effect in (
+            ("info/grafts", "rewrites commit ancestry (a graft file)"),
+            ("info/attributes", "adds repository-local attributes that change content conversion"),
+        ):
+            path, problem = _git_path(worktree, "--git-path", name)
+            if path is None:
+                refuse(f"cannot locate {name}: {problem}")
+                continue
+            try:
+                info = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                refuse(f"cannot inspect {_display(path)}: {exc}")
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_size:
+                refuse(f"{_display(path)} {effect}")
+
+        filters = _git_run(
+            worktree, "config", "--null", "--get-regexp", r"^filter\.", timeout=GIT_QUICK_TIMEOUT
+        )
+        filter_free = False
+        if filters.returncode == 0:
+            keys = [entry.split(b"\n", 1)[0] for entry in filters.stdout.split(b"\0") if entry]
+            refuse(
+                "filter drivers in the repository configuration rewrite content "
+                f"between the index and the worktree: {_named(keys)}"
+            )
+        elif filters.returncode == 1 and not filters.stdout:
+            filter_free = True
+        else:
+            refuse(f"cannot read the repository configuration: {_diagnostic(filters)}")
+
+        # Each record is "<tag> <mode> <oid> <stage>\t<path>"; the tag says
+        # skip-worktree (S) or, in lower case, assume-unchanged.
+        index = _git_run(worktree, "ls-files", "--stage", "-v", "-z")
+        indexed: Optional[dict[bytes, tuple[bytes, str]]] = {}
+        if index.returncode != 0:
+            refuse(f"cannot read the index: {_diagnostic(index)}")
+            indexed = None
+        else:
+            skipped: list[bytes] = []
+            assumed: list[bytes] = []
+            unmerged: list[bytes] = []
+            for record in index.stdout.split(b"\0"):
+                if not record:
+                    continue
+                meta, tab, path = record.partition(b"\t")
+                fields = meta.split(b" ")
+                if len(fields) != 4 or not tab:
+                    refuse("cannot read the index: unparseable ls-files output")
+                    indexed = None
+                    break
+                tag, mode, oid, stage = fields
+                if tag in (b"S", b"s"):
+                    skipped.append(path)
+                if tag.islower():
+                    assumed.append(path)
+                if stage != b"0" or path in indexed:
+                    unmerged.append(path)
+                indexed[path] = (mode, oid.decode("ascii", errors="replace"))
+            for flagged, flag in ((skipped, "skip-worktree"), (assumed, "assume-unchanged")):
+                if flagged:
+                    refuse(f"{flag} index entries hide their worktree files: {_named(flagged)}")
+            if unmerged:
+                refuse(f"the index holds unmerged or duplicate entries: {_named(unmerged)}")
+
+        entries, trees, problem = _verified_head_tree(worktree, head)
+        if problem is not None:
+            refuse(f"cannot verify HEAD's tree: {problem}")
+            return False
+        if indexed is not None:
+            # git status decides what is untracked by the index, and compares
+            # the index with HEAD through the index's own cache-tree extension,
+            # which can claim a directory equals HEAD's tree while listing an
+            # extra file under it; so the index must list exactly HEAD's
+            # entries (an extra one reads as tracked and unchanged).
+            pinned_entries = {path: (mode, oid) for mode, oid, path in entries}
+            stray_entries = sorted(
+                path
+                for path in pinned_entries.keys() | indexed.keys()
+                if pinned_entries.get(path) != indexed.get(path)
+            )
+            if stray_entries:
+                refuse(f"index entries differ from HEAD's tree: {_named(stray_entries)}")
+        submodules = self.compare_tree(worktree, refuse, entries, head, trees)
+
+        status_safe = filter_free
+        for path, oid in submodules:
+            nested = Path(os.fsdecode(os.fsencode(worktree) + b"/" + path))
+            try:
+                identity = _identity(nested)
+            except (OSError, ValueError) as exc:
+                refuse(f"cannot inspect submodule {_display(path)}: {exc}")
+                status_safe = False
+                continue
+            if identity in self.visited:
+                refuse(f"submodule {_display(path)} revisits a checkout already inspected")
+                status_safe = False
+                continue
+            nested_safe = self.inspect(nested, f"{prefix}{_display(path)}/", oid)
+            status_safe = status_safe and nested_safe
+
+        if status_safe:
+            # --ignored=matching lists each ignored path the walk met, an
+            # ignored directory as one entry that is not descended into.
+            status = _git_run(
+                worktree, *HARDENED_STATUS_OPTIONS, "status", "--porcelain", "-z",
+                "--untracked-files=all", "--ignore-submodules=none", "--ignored=matching",
+            )
+            if status.returncode != 0:
+                refuse(f"cannot inspect worktree state: {_diagnostic(status)}")
+            else:
+                changes, changed, ignored = _status_entries(status.stdout)
+                if changes:
+                    refuse(f"git status reports changes: {_named(changes)}")
+                # Git reads a .gitignore in every directory it walks, tracked
+                # or not, and an untracked one can ignore itself and anything
+                # beside it.  Of the .gitignore files, only the committed ones,
+                # which the raw comparison pins, may decide what is ignored.
+                planted = [
+                    path for path in ignored
+                    if path.rstrip(b"/").rpartition(b"/")[2].lower() == b".gitignore"
+                ]
+                if planted:
+                    refuse(
+                        "untracked .gitignore files hide untracked content from git "
+                        f"status: {_named(planted)}"
+                    )
+                listed = {path.rstrip(b"/") for path in (*changed, *ignored)}
+                self.account_for_untracked(worktree, refuse, entries, listed)
+        return status_safe
+
+    @staticmethod
+    def refuse_program_config(worktree: Path, refuse: Callable[[str], None]) -> bool:
+        """Refuse the PROGRAM_CONFIG settings at ``worktree`` by name.
+
+        They are read from the tiers the candidate controls, which a checker's
+        Git reads too: the repository's own configuration, its includes and
+        its worktree scope (``_git_env`` neutralizes the system and global
+        tiers).  The listing also holds the gate's own command-line
+        ``core.fsmonitor=false`` (GIT_GLOBAL_OPTIONS), which passes as a false
+        spelling; it masks none of the candidate's values, which are listed
+        beside it.  Returns whether objects of this repository may be read at
+        all: not when it names a promisor remote, nor when its configuration
+        cannot be read, since reading an object the store lacks then runs a
+        program even in the gate's own Git wherever GIT_NO_LAZY_FETCH is
+        ignored.
+        """
+        config = _git_run(
+            worktree, "config", "--null", "--get-regexp", PROGRAM_CONFIG,
+            timeout=GIT_QUICK_TIMEOUT,
+        )
+        if config.returncode == 1 and not config.stdout:
+            return True
+        if config.returncode != 0:
+            refuse(f"cannot read the repository configuration: {_diagnostic(config)}")
+            return False
+        monitors: list[bytes] = []
+        promisors: list[bytes] = []
+        for record in config.stdout.split(b"\0"):
+            if not record:
+                continue
+            # "<key>\n<value>", or just "<key>" for a key without a value.
+            key, has_value, value = record.partition(b"\n")
+            setting = key + b"=" + value if has_value else key
+            if key == b"extensions.partialclone" or key.endswith(b".partialclonefilter"):
+                # Either names a promisor remote whatever its value spells: the
+                # extension's value is the remote's name, and Git registers a
+                # filter's remote before it reads the filter.
+                promisors.append(setting)
+            elif has_value and value.lower() in FALSE_SPELLINGS:
+                continue
+            elif key == b"core.fsmonitor":
+                monitors.append(setting)
+            else:
+                promisors.append(setting)
+        if monitors:
+            refuse(
+                "core.fsmonitor starts a program whenever a checker's Git reads the "
+                f"index: {_named(monitors)}"
+            )
+        if promisors:
+            refuse(
+                "a promisor remote makes a checker's Git fetch any object the store "
+                f"lacks, running the programs its transport settings name: {_named(promisors)}"
+            )
+        return not promisors
+
+    def compare_tree(
+        self,
+        worktree: Path,
+        refuse: Callable[[str], None],
+        entries: list[tuple[bytes, str, bytes]],
+        head: str,
+        trees: dict[bytes, tuple[str, bytes]],
+    ) -> list[tuple[bytes, str]]:
+        """Compare HEAD's (mode, oid, path) entries with the raw worktree.
+
+        Returns the gitlinks that hold a checkout.  Regular files must hash (as
+        Git blobs, with no conversion) to HEAD's blob with HEAD's executable
+        bit, symlinks must be symlinks whose target is HEAD's blob, and nothing
+        may be reached through a symlinked or missing directory.  A regular
+        file whose raw bytes differ is still HEAD's checkout when they equal
+        the blob as the pinned commit's own .gitattributes convert it (the
+        vendored LLVM tree checks six files out with ``eol=crlf``), computed
+        from re-hashed objects only (``_checkout_conversions``).  Differing
+        files are converted CONVERSION_BATCH at a time; once more than
+        NAMED_PATHS of them are confirmed or cannot be converted the refusal
+        is decided, and later batches are reported as not examined.
+        """
+        base = os.fsencode(worktree)
+        algorithm = hashlib.sha1 if len(head) == 40 else hashlib.sha256
+        directories: dict[bytes, Optional[str]] = {b"": None}
+
+        def directory_state(relative: bytes) -> Optional[str]:
+            # None for a real directory reached without a symlink, else why not.
+            # Iterative, from the nearest known ancestor down: HEAD's tree is
+            # the candidate's, and no path depth may exhaust the recursion limit.
+            unknown: list[bytes] = []
+            while relative not in directories:
+                unknown.append(relative)
+                relative = relative.rpartition(b"/")[0]
+            state = directories[relative]
+            for relative in reversed(unknown):
+                if state is None:
+                    try:
+                        info = os.lstat(base + b"/" + relative)
+                    except FileNotFoundError:
+                        state = "missing"
+                    except OSError as exc:
+                        state = f"unreadable ({exc.strerror})"
+                    else:
+                        if stat.S_ISLNK(info.st_mode):
+                            state = "symlink"
+                        elif not stat.S_ISDIR(info.st_mode):
+                            state = "not a directory"
+                directories[relative] = state
+            return state
+
+        missing: list[bytes] = []
+        wrong_type: list[bytes] = []
+        wrong_mode: list[bytes] = []
+        unreadable: list[bytes] = []
+        differing: list[tuple[bytes, str]] = []
+        wrong_target: list[bytes] = []
+        stray: list[bytes] = []
+        unsupported: list[bytes] = []
+        submodules: list[tuple[bytes, str]] = []
+        regular: list[tuple[bytes, bytes, str]] = []
+        for mode, oid, path in entries:
+            if not _safe_tree_path(path):
+                unsupported.append(path)
+                continue
+            full = base + b"/" + path
+            state = directory_state(path.rpartition(b"/")[0])
+            if mode == b"160000":
+                # A gitlink with nothing checked out is nothing a checker can
+                # read; one holding files must be a checkout of its pin.
+                if state == "missing":
+                    continue
+                if state is not None:
+                    wrong_type.append(path)
+                    continue
+                try:
+                    info = os.lstat(full)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    unreadable.append(path)
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
+                    wrong_type.append(path)
+                    continue
+                try:
+                    names = os.listdir(full)
+                except OSError:
+                    unreadable.append(path)
+                    continue
+                if not names:
+                    continue
+                if b".git" not in names:
+                    stray.append(path)
+                    continue
+                submodules.append((path, oid))
+                continue
+            if mode not in (b"100644", b"100755", b"120000"):
+                unsupported.append(path)
+                continue
+            if state is not None:
+                (missing if state == "missing" else wrong_type).append(path)
+                continue
+            if mode == b"120000":
+                try:
+                    target = os.readlink(full)
+                except FileNotFoundError:
+                    missing.append(path)
+                    continue
+                except OSError as exc:
+                    (wrong_type if exc.errno == errno.EINVAL else unreadable).append(path)
+                    continue
+                if algorithm(b"blob %d\0" % len(target) + target).hexdigest() != oid:
+                    wrong_target.append(path)
+                continue
+            regular.append((path, mode, oid))
+
+        def digests_of(
+            batch: list[tuple[bytes, bytes, str]],
+        ) -> list[tuple[Optional[str], int, Optional[OSError]]]:
+            results: list[tuple[Optional[str], int, Optional[OSError]]] = []
+            for path, _mode, _oid in batch:
+                try:
+                    results.append((*_blob_digest(base + b"/" + path, algorithm), None))
+                except OSError as exc:
+                    results.append((None, 0, exc))
+            return results
+
+        # Hashing is bound by per-file system calls, which release the GIL.
+        batches = [
+            regular[start:start + HASH_BATCH] for start in range(0, len(regular), HASH_BATCH)
+        ]
+        with ThreadPoolExecutor(max_workers=HASH_WORKERS) as pool:
+            for batch, results in zip(batches, pool.map(digests_of, batches)):
+                for (path, mode, oid), (digest, file_mode, failure) in zip(batch, results):
+                    if isinstance(failure, (FileNotFoundError, NotADirectoryError)):
+                        missing.append(path)
+                    elif failure is not None:
+                        (wrong_type if failure.errno == errno.ELOOP else unreadable).append(path)
+                    elif digest is None:
+                        # No st_mode: not a regular file; else it changed size mid-read.
+                        (unreadable if file_mode else wrong_type).append(path)
+                    else:
+                        if bool(file_mode & stat.S_IXUSR) != (mode == b"100755"):
+                            wrong_mode.append(path)
+                        if digest != oid:
+                            differing.append((path, oid))
+
+        confirmed: list[bytes] = []
+        unconverted: list[bytes] = []
+        unconverted_reason = ""
+        examined = 0
+        while examined < len(differing) and len(confirmed) + len(unconverted) <= NAMED_PATHS:
+            batch = differing[examined:examined + CONVERSION_BATCH]
+            examined += len(batch)
+            converted, failures = _checkout_conversions(worktree, head, trees, batch)
+            for path, _oid in batch:
+                if path in failures:
+                    unconverted.append(path)
+                    unconverted_reason = unconverted_reason or failures[path]
+                    continue
+                try:
+                    raw = _read_regular(base + b"/" + path)
+                except OSError:
+                    raw = None
+                expected = converted.get(path)
+                if expected is None or raw != expected:
+                    confirmed.append(path)
+        for paths, what in (
+            (missing, "HEAD entries are missing from the worktree"),
+            (wrong_type, "worktree entries do not have HEAD's file type"),
+            (wrong_mode, "worktree executable bits differ from HEAD"),
+            (unreadable, "worktree entries cannot be read, or changed while being read"),
+            (confirmed, "raw worktree bytes differ from HEAD's checkout"),
+            (wrong_target, "symlink targets differ from HEAD"),
+            (stray, "gitlink directory holds content outside its pin (no .git)"),
+            (unsupported, "HEAD's tree has entries this gate cannot verify"),
+        ):
+            if paths:
+                refuse(f"{what}: {_named(paths)}")
+        if unconverted:
+            refuse(
+                f"cannot compute HEAD's checkout conversion for {_named(unconverted)}: "
+                f"{unconverted_reason}"
+            )
+        unexamined = [path for path, _oid in differing[examined:]]
+        if unexamined:
+            refuse(
+                "raw worktree bytes differ from HEAD's blob (not examined for a checkout "
+                f"conversion once the refusal was decided): {_named(unexamined)}"
+            )
+        return submodules
+
+    def account_for_untracked(
+        self,
+        worktree: Path,
+        refuse: Callable[[str], None],
+        entries: list[tuple[bytes, str, bytes]],
+        listed: set[bytes],
+    ) -> None:
+        """Refuse every worktree entry that is neither HEAD's nor listed by status.
+
+        Git's untracked-file walk never reports an entry named .git in any
+        directory, a FIFO, socket or device, or what lies in a directory it
+        cannot open, and an untracked directory holding only such entries is
+        not reported either.  So every entry below ``worktree`` must be a HEAD
+        entry (a gitlink's content is its own inspection's), a directory on
+        the way to one, the repository's own .git, or a path ``git status``
+        listed; an untracked directory it did not list is walked the same way.
+        """
+        tracked = {path for _mode, _oid, path in entries}
+        directories: set[bytes] = set()
+        for path in tracked:
+            parent = path.rpartition(b"/")[0]
+            while parent and parent not in directories:
+                directories.add(parent)
+                parent = parent.rpartition(b"/")[0]
+        base = os.fsencode(worktree)
+        unreported: list[bytes] = []
+        pending = [b""]
+        while pending:
+            relative = pending.pop()
+            try:
+                with os.scandir(base + b"/" + relative if relative else base) as listing:
+                    children = [
+                        (entry.name, entry.is_dir(follow_symlinks=False)) for entry in listing
+                    ]
+            except OSError:
+                unreported.append(relative or b".")
+                continue
+            for name, is_directory in children:
+                path = relative + b"/" + name if relative else name
+                if path in tracked or path in listed or (not relative and name == b".git"):
+                    continue
+                if path in directories:
+                    # A symlink or file standing in for a HEAD directory is
+                    # compare_tree's refusal; only a real one is walked.
+                    if is_directory:
+                        pending.append(path)
+                    continue
+                if is_directory and name != b".git":
+                    pending.append(path)
+                else:
+                    unreported.append(path)
+        if unreported:
+            refuse(
+                "worktree entries neither in HEAD nor reported by git status: "
+                f"{_named(sorted(unreported))}"
+            )
+
+
+def worktree_refusals(root: Path, expected_head: Optional[str] = None) -> list[str]:
+    """Every reason the checkout at ``root`` is not exactly its HEAD commit.
+
+    An empty list is the clean-tree predicate that ``validate`` requires before
+    the checkers run and ``post_run_integrity_check`` requires after them.
+    ``git status`` alone cannot be that predicate: it compares through cached
+    stat data, content conversions, filter drivers, index flags, the index's
+    cache-tree, replacement objects and submodule settings the candidate's
+    own configuration controls, while the checkers read raw bytes, and its
+    untracked-file walk skips some entries entirely.  So, for ``root`` and
+    recursively for every initialized submodule, this requires that:
+
+    * Git inspects exactly that directory (``--show-toplevel`` by identity);
+    * its configuration sets no core.fsmonitor and names no promisor remote
+      (extensions.partialClone, a true remote.<name>.promisor, or any
+      remote.<name>.partialCloneFilter, <name> empty or missing included),
+      with which a checker's read-only Git would start a program
+      (``PROGRAM_CONFIG``); no object of a repository naming one is read;
+    * HEAD is ``expected_head`` (for a submodule: its gitlink) when given;
+    * no refs/replace/* ref, graft file, repository-local info/attributes,
+      filter driver, or skip-worktree/assume-unchanged index entry exists,
+      and the index lists exactly HEAD's entries;
+    * every regular file's raw bytes and executable bit, and every symlink's
+      target, equal HEAD's checkout of that entry (``compare_tree``);
+    * every gitlink is an empty directory or a checkout of its pin that
+      satisfies this same predicate (an absent one fails the status below);
+    * a hardened ``git status`` reports nothing but ignored paths, and no
+      untracked .gitignore is among them;
+    * every other worktree entry is one of those ignored paths
+      (``account_for_untracked``).
+
+    Untracked files the repository's own ignore rules exclude (``build/``) stay
+    permitted, as before: the committed .gitignore files and the
+    repository-local info/exclude and core.excludesFile.  The operator's
+    global and XDG exclude files no longer count toward them.
+    """
+    refusal = _git_version_refusal()
+    if refusal is not None:
+        return [refusal]
+    inspection = _CheckoutInspection()
+    inspection.inspect(root, "", expected_head)
+    return inspection.refusals
+
+
+def _isolated_python(bytecode_prefix: Path) -> list[str]:
+    """The interpreter command every checker runs under.
+
+    -I keeps the candidate's directories off sys.path, but a module imported
+    by file path -- the G3 scorecard replay loads rust_instance_census that
+    way -- is still loaded from the __pycache__ beside its source, and an
+    unchecked-hash .pyc there runs without being compared to that source.
+    The clean-tree predicate permits __pycache__ (the repository ignores it).
+    So bytecode is read only below ``bytecode_prefix``, which must be a fresh
+    empty directory outside the candidate, and -B writes none there or in the
+    tree.  A checker that starts Python itself must pass the same flags: -X
+    options are not inherited.
+    """
+    return [sys.executable, "-I", "-B", "-X", f"pycache_prefix={bytecode_prefix}"]
+
+
+def _strict_json(text: str) -> Any:
+    """Use one unambiguous, finite JSON protocol for files and checker output."""
+    if _trust_json_nesting_depth(text) > TRUST_MAX_JSON_DEPTH:
+        raise ValueError(f"JSON nests deeper than {TRUST_MAX_JSON_DEPTH}")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(token: str) -> Any:
+        raise ValueError(f"non-finite JSON number {token}")
+
+    value = json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_constant)
+    # parse_constant rejects the nonstandard spellings, but not a standard
+    # numeric token such as 1e999 that overflows Python's float to infinity.
+    json.dumps(value, allow_nan=False)
+    return value
+
+
+METADATA_REFUSAL = "must bind underlying evidence, not receipt metadata"
+
+
+class _Metadata(NamedTuple):
+    """The receipt metadata files, by path, by file identity and by content."""
+
+    paths: frozenset
+    identities: frozenset
+    digests: frozenset
 
 
 class ReceiptValidator:
@@ -358,20 +1652,42 @@ class ReceiptValidator:
         self,
         root: Path,
         receipt_path: Path,
-        trusted_owner_key: Path | None,
+        trusted_owner_key: Optional[Path],
+        external_verifier: Optional[Path] = None,
+        external_verifier_sha256: Optional[str] = None,
     ):
-        self.root = root.resolve()
-        self.receipt_path = receipt_path.resolve()
-        self.trusted_owner_key = (
-            trusted_owner_key.resolve() if trusted_owner_key is not None else None
-        )
-        self.trusted_owner_fingerprint: str | None = None
         self.errors: list[str] = []
+        self.root = self.resolved(root, "repository", "--root")
+        self.receipt_path = self.resolved(receipt_path, "receipt", "receipt path")
+        self.trusted_owner_key = (
+            self.resolved(trusted_owner_key, "policy_authorization", "trusted owner key")
+            if trusted_owner_key is not None
+            else None
+        )
+        self.external_verifier = (
+            self.resolved(external_verifier, "external_verifier", "external verifier")
+            if external_verifier is not None
+            else None
+        )
+        self.external_verifier_sha256 = external_verifier_sha256
+        self.trusted_owner_fingerprint: Optional[str] = None
         self.bound_files: dict[Path, str] = {}
-        self.prior_gates_root: str | None = None
+        self.prior_gates_root: Optional[str] = None
+        self.head_before_run: Optional[str] = None
+        self.worktree_clean_before_run = False
+        # Set once worktree_refusals refused the checkout: from then on the
+        # gate reads no object of it (see resolve_checker) and runs no
+        # checker (see validate_gate in validate).
+        self.checkout_refused = False
 
     def error(self, location: str, detail: str) -> None:
         self.errors.append(f"{location}: {detail}")
+
+    def resolved(self, path: Path, location: str, what: str) -> Path:
+        resolved, problem = _resolved(path)
+        if problem is not None:
+            self.error(location, f"{what} cannot be resolved: {problem}")
+        return resolved
 
     def exact_keys(self, value: Any, expected: set[str], location: str) -> bool:
         if not isinstance(value, dict):
@@ -391,7 +1707,7 @@ class ReceiptValidator:
         row: dict[str, Any],
         location: str,
         cells: dict[str, dict[str, str]],
-    ) -> dict[str, str] | None:
+    ) -> Optional[dict[str, str]]:
         """Join one observed codegen row to the exact owner-signed matrix cell."""
         cell_id = row.get("codegen_cell_id")
         if not isinstance(cell_id, str) or not cell_id:
@@ -412,49 +1728,117 @@ class ReceiptValidator:
                 )
         return cell
 
-    def load_json(self, path: Path, location: str) -> dict[str, Any] | None:
+    def load_json(self, path: Path, location: str) -> Optional[dict[str, Any]]:
+        return self.load_json_bytes(path, location)[0]
+
+    def load_json_bytes(
+        self, path: Path, location: str
+    ) -> tuple[Optional[dict[str, Any]], Optional[bytes]]:
+        """The JSON object in the regular file at ``path``, and the bytes parsed.
+
+        Read through ``_read_file``, which refuses a FIFO or device (a FIFO put
+        in place of the receipt would otherwise block the read forever), and
+        read once, so a digest bound from these bytes describes what was parsed.
+        """
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            data = _read_file(path)
+        except (OSError, ValueError) as exc:
+            # ValueError: an embedded NUL in a caller-supplied path.
             self.error(location, f"cannot read JSON: {exc}")
-            return None
+            return None, None
+        try:
+            value = _strict_json(data.decode("utf-8"))
+        except (UnicodeError, ValueError, RecursionError) as exc:
+            self.error(location, f"cannot read JSON: {exc}")
+            return None, data
         if not isinstance(value, dict):
             self.error(location, "must contain a JSON object")
-            return None
-        return value
+            return None, data
+        return value, data
+
+    def metadata(self, paths: set[Path]) -> _Metadata:
+        """``paths`` with the (st_dev, st_ino) of each file and its content digests.
+
+        A file's content counts both as the receipt records it (bound_files)
+        and as read now.  A file that cannot be stat'ed or read has no identity
+        or content another path could share, and it has been refused already.
+        """
+        identities: set[tuple[int, int]] = set()
+        digests: set[str] = set()
+        for path in paths:
+            identity = _identity_or_none(path)
+            if identity is not None:
+                identities.add(identity)
+            bound = self.bound_files.get(path)
+            if bound is not None:
+                digests.add(bound)
+            try:
+                digests.add(_sha256(path))
+            except (OSError, ValueError):
+                pass
+        return _Metadata(frozenset(paths), frozenset(identities), frozenset(digests))
 
     def resolve_ref(
         self,
         value: Any,
         location: str,
         *,
-        forbidden: set[Path] | None = None,
-    ) -> Path | None:
+        forbidden: Optional["_Metadata"] = None,
+    ) -> Optional[Path]:
+        """Resolve a {path, sha256} reference inside --root and bind its digest.
+
+        With ``forbidden``, the file must not be receipt metadata: not one of
+        its paths, not the same file (a case alias on a case-insensitive
+        volume, a hard link), and not the same bytes (a copy).
+        """
         if not self.exact_keys(value, {"path", "sha256"}, location):
             return None
         raw_path = value.get("path")
         digest = value.get("sha256")
-        if not isinstance(raw_path, str) or not raw_path:
+        if not isinstance(raw_path, str) or not raw_path or "\0" in raw_path:
             self.error(f"{location}.path", "must be a non-empty relative path")
             return None
         if Path(raw_path).is_absolute():
             self.error(f"{location}.path", "absolute paths are forbidden")
             return None
-        candidate = (self.root / raw_path).resolve()
+        try:
+            candidate = (self.root / raw_path).resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            # RuntimeError: Python 3.9's pathlib on a symlink loop.
+            self.error(f"{location}.path", f"cannot resolve path: {exc}")
+            return None
         try:
             candidate.relative_to(self.root)
         except ValueError:
             self.error(f"{location}.path", "escapes --root")
             return None
-        if forbidden and candidate in forbidden:
-            self.error(f"{location}.path", "must bind underlying evidence, not receipt metadata")
+        if forbidden is not None and candidate in forbidden.paths:
+            self.error(f"{location}.path", METADATA_REFUSAL)
+            forbidden = None  # refused once is enough
         if not isinstance(digest, str) or not HEX_DIGEST.fullmatch(digest):
             self.error(f"{location}.sha256", "must be a lowercase 64-hex digest")
             return candidate
-        if not candidate.is_file():
+        try:
+            info = os.stat(candidate)
+        except (FileNotFoundError, NotADirectoryError):
+            info = None
+        except (OSError, ValueError) as exc:
+            self.error(f"{location}.path", f"cannot stat {raw_path}: {exc}")
+            return candidate
+        if info is None or not stat.S_ISREG(info.st_mode):
             self.error(f"{location}.path", f"file does not exist: {raw_path}")
             return candidate
-        actual = _sha256(candidate)
+        try:
+            actual = _sha256(candidate)
+        except OSError as exc:
+            self.error(f"{location}.path", f"cannot read file: {exc}")
+            return candidate
+        if forbidden is not None and (
+            (info.st_dev, info.st_ino) in forbidden.identities
+            or digest in forbidden.digests
+            or actual in forbidden.digests
+        ):
+            self.error(f"{location}.path", METADATA_REFUSAL)
         if actual != digest:
             self.error(f"{location}.sha256", f"hash mismatch: recorded {digest}, actual {actual}")
         previous = self.bound_files.get(candidate)
@@ -469,9 +1853,9 @@ class ReceiptValidator:
         value: Any,
         location: str,
         *,
-        expected_id: str | None = None,
-        forbidden: set[Path] | None = None,
-    ) -> tuple[str | None, Path | None, str | None]:
+        expected_id: Optional[str] = None,
+        forbidden: Optional["_Metadata"] = None,
+    ) -> tuple[Optional[str], Optional[Path], Optional[str]]:
         """Resolve a content reference whose semantic identity is also explicit."""
         if not self.exact_keys(value, {"id", "path", "sha256"}, location):
             return None, None, None
@@ -497,22 +1881,42 @@ class ReceiptValidator:
         source_revision: Any,
         recorded_digest: Any,
         location: str,
-    ) -> tuple[Path, str, bytes] | None:
-        """Resolve the schema-owned checker and bind it to the accepted commit."""
+    ) -> Optional[tuple[Path, str, bytes]]:
+        """Resolve the schema-owned checker and bind it to the accepted commit.
+
+        Once the checkout has been refused the checker is not bound to the
+        source revision: the receipt is refused already and no checker runs
+        (validate_gate checks ``checkout_refused`` before run_checker), and
+        the gate reads no more objects of that checkout.
+        """
         relative = CHECKER_PATHS[gate]
-        candidate = (self.root / relative).resolve()
+        checker_path = self.root / relative
+        mode, problem = _file_mode(checker_path, follow_symlinks=False)
+        if problem is not None:
+            self.error(location, f"schema-owned checker cannot be stat'ed: {problem}")
+            return None
+        if mode is not None and stat.S_ISLNK(mode):
+            self.error(location, "checker must be a regular tracked file, not a symlink")
+            return None
+        try:
+            candidate = checker_path.resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.error(location, f"schema-owned checker path cannot be resolved: {exc}")
+            return None
         try:
             candidate.relative_to(self.root)
         except ValueError:
             self.error(location, "schema-owned checker path escapes --root")
             return None
-        if candidate.is_symlink():
-            self.error(location, "checker must be a regular tracked file, not a symlink")
-            return None
-        if not candidate.is_file():
+        if not _is_regular_file(candidate):
             self.error(location, f"schema-owned checker is not implemented: {relative}")
             return None
-        actual_digest = _sha256(candidate)
+        try:
+            working_bytes = _read_file(candidate)
+        except OSError as exc:
+            self.error(location, f"schema-owned checker cannot be read: {exc}")
+            return None
+        actual_digest = hashlib.sha256(working_bytes).hexdigest()
         if not isinstance(recorded_digest, str) or not HEX_DIGEST.fullmatch(recorded_digest):
             self.error(location, "must be a lowercase 64-hex digest")
         elif recorded_digest != actual_digest:
@@ -522,23 +1926,28 @@ class ReceiptValidator:
             )
         if not isinstance(source_revision, str) or not GIT_REVISION.fullmatch(source_revision):
             self.error(location, "cannot bind checker to an invalid source revision")
-            return candidate, actual_digest, candidate.read_bytes()
-        tracked = subprocess.run(
-            ["git", "-C", str(self.root), "show", f"{source_revision}:{relative}"],
-            check=False,
-            capture_output=True,
-        )
-        if tracked.returncode != 0:
-            self.error(location, f"checker is not tracked at source revision: {relative}")
-            checker_bytes = candidate.read_bytes()
+            return candidate, actual_digest, working_bytes
+        if self.checkout_refused:
+            # Reading a refused checkout's objects again could run a program:
+            # with a promisor remote configured, a Git that ignores
+            # GIT_NO_LAZY_FETCH fetches any object the store lacks
+            # (PROGRAM_CONFIG).
+            checker_bytes = working_bytes
         else:
-            checker_bytes = tracked.stdout
-            tracked_digest = hashlib.sha256(tracked.stdout).hexdigest()
-            if tracked_digest != actual_digest:
-                self.error(
-                    location,
-                    "working checker bytes differ from the source-revision checker bytes",
-                )
+            tracked = _git_run(
+                self.root, "show", f"{source_revision}:{relative}", timeout=GIT_QUICK_TIMEOUT
+            )
+            if tracked.returncode != 0:
+                self.error(location, f"checker is not tracked at source revision: {relative}")
+                checker_bytes = working_bytes
+            else:
+                checker_bytes = tracked.stdout
+                tracked_digest = hashlib.sha256(tracked.stdout).hexdigest()
+                if tracked_digest != actual_digest:
+                    self.error(
+                        location,
+                        "working checker bytes differ from the source-revision checker bytes",
+                    )
         previous = self.bound_files.get(candidate)
         if previous is not None and previous != actual_digest:
             self.error(location, "checker path is already bound to a conflicting digest")
@@ -568,17 +1977,18 @@ class ReceiptValidator:
         evidence_digest: Any,
         toolchain_digest: Any,
         corpus_digest: Any,
-        prior_gates_root: str | None,
-    ) -> dict[str, Any] | None:
+        prior_gates_root: Optional[str],
+    ) -> Optional[dict[str, Any]]:
         """Re-run one schema-owned checker using the fixed verification protocol."""
         location = f"{gate}.checker_run"
         with tempfile.TemporaryDirectory(prefix=f"trust-{gate.lower()}-checker-") as tmp:
             checker_snapshot = Path(tmp) / "checker.py"
             checker_snapshot.write_bytes(checker_bytes)
             checker_snapshot.chmod(0o444)
+            bytecode_prefix = Path(tmp) / "bytecode"
+            bytecode_prefix.mkdir()
             command = [
-                sys.executable,
-                "-I",
+                *_isolated_python(bytecode_prefix),
                 str(checker_snapshot),
                 "--verify-evidence",
                 str(evidence_path),
@@ -627,6 +2037,12 @@ class ReceiptValidator:
             # the already-computed G1-G7 root.
             if gate == "G8":
                 command.extend(["--receipt", str(self.receipt_path)])
+                if self.trusted_owner_key is not None:
+                    command.extend(["--trusted-owner-key", str(self.trusted_owner_key)])
+                if self.external_verifier is not None:
+                    command.extend(["--external-verifier", str(self.external_verifier)])
+                if self.external_verifier_sha256 is not None:
+                    command.extend(["--external-verifier-sha256", self.external_verifier_sha256])
             if prior_gates_root is not None:
                 command.extend(["--prior-gates-root", prior_gates_root])
             checker_env = {
@@ -654,8 +2070,8 @@ class ReceiptValidator:
             detail = process.stderr.strip() or process.stdout.strip() or "no diagnostic"
             self.error(location, f"checker exited {process.returncode}: {detail[:1000]}")
         try:
-            verdict = json.loads(process.stdout)
-        except json.JSONDecodeError as exc:
+            verdict = _strict_json(process.stdout)
+        except (ValueError, RecursionError) as exc:
             self.error(location, f"checker stdout is not one JSON verdict: {exc}")
             return None
         if not isinstance(verdict, dict):
@@ -665,7 +2081,7 @@ class ReceiptValidator:
 
     def validate_manifest_header(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
         *,
         schema: str,
         location: str,
@@ -689,7 +2105,7 @@ class ReceiptValidator:
 
     def validate_contract_header(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
         *,
         schema: str,
         location: str,
@@ -710,7 +2126,7 @@ class ReceiptValidator:
 
     def validate_admission_contract(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
         location = "authority_contracts.admission"
         result: dict[str, dict[str, Any]] = {}
@@ -752,12 +2168,12 @@ class ReceiptValidator:
             if not isinstance(tree_digest, str) or not HEX_DIGEST.fullmatch(tree_digest):
                 self.error(f"{lane_location}.upstream_tree_sha256", "must be 64-hex")
 
-            support_docs: dict[str, dict[str, Any] | None] = {}
+            support_docs: dict[str, Optional[dict[str, Any]]] = {}
             for field in ("feature_manifest", "suite_manifest", "exception_ledger"):
                 path = self.resolve_ref(lane_value.get(field), f"{lane_location}.{field}")
                 support_docs[field] = (
                     self.load_json(path, f"{lane_location}.{field}")
-                    if path is not None and path.is_file()
+                    if path is not None and _is_regular_file(path)
                     else None
                 )
 
@@ -865,7 +2281,7 @@ class ReceiptValidator:
                             )
                         else:
                             ledger_ids.add(entry_id)
-                        if entry_id in admitted_ids:
+                        if isinstance(entry_id, str) and entry_id in admitted_ids:
                             self.error(
                                 f"{row_location}.entry_id",
                                 "an admitted program cannot be waived by the exception ledger",
@@ -885,7 +2301,7 @@ class ReceiptValidator:
 
     def validate_semantics_contract(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
     ) -> dict[str, dict[str, str]]:
         location = "authority_contracts.semantics"
         result: dict[str, dict[str, str]] = {}
@@ -906,6 +2322,7 @@ class ReceiptValidator:
             return result
         ids: set[str] = set()
         paths: set[Path] = set()
+        identities: set[tuple[int, int]] = set()
         for role in sorted(SEMANTICS_DEFINITIONS):
             ref_id, path, digest = self.resolve_named_ref(
                 definitions.get(role),
@@ -915,17 +2332,24 @@ class ReceiptValidator:
                 self.error(f"{location}.definitions.{role}.id", "semantic IDs must be distinct")
             elif ref_id is not None:
                 ids.add(ref_id)
-            if path is not None and path in paths:
+            # Distinct files, not only distinct spellings: a case alias on a
+            # case-insensitive volume or a hard link names one file twice, and
+            # resolve() canonicalizes neither.  A path that cannot be stat'ed
+            # is already refused by resolve_ref.
+            identity = _identity_or_none(path) if path is not None else None
+            if path is not None and (path in paths or identity in identities):
                 self.error(f"{location}.definitions.{role}.path", "semantic paths must be distinct")
             elif path is not None:
                 paths.add(path)
+                if identity is not None:
+                    identities.add(identity)
             if ref_id is not None and digest is not None:
                 result[role] = {"id": ref_id, "sha256": digest}
         return result
 
     def validate_obligation_contract(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
     ) -> dict[str, Any]:
         location = "authority_contracts.obligations"
         result: dict[str, Any] = {"rules": {}, "formula_encoder": {}}
@@ -969,7 +2393,7 @@ class ReceiptValidator:
             ):
                 self.error(f"{row_location}.id", "must be a unique typed rule ID")
                 continue
-            if rule_class not in OBLIGATION_CLASSES:
+            if not isinstance(rule_class, str) or rule_class not in OBLIGATION_CLASSES:
                 self.error(f"{row_location}.class", "is not a required obligation class")
             else:
                 classes.add(rule_class)
@@ -985,7 +2409,7 @@ class ReceiptValidator:
 
     def validate_proof_authority_contract(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
     ) -> dict[str, Any]:
         location = "authority_contracts.proof_authority"
         result: dict[str, Any] = {"kernels": {}, "canonical_proposition_encoder": {}}
@@ -1068,7 +2492,7 @@ class ReceiptValidator:
             result["kernels"][kernel_id] = kernel
         return result
 
-    def validate_compatibility_contract(self, value: dict[str, Any] | None) -> None:
+    def validate_compatibility_contract(self, value: Optional[dict[str, Any]]) -> None:
         location = "authority_contracts.compatibility_surfaces"
         if value is None:
             return
@@ -1133,7 +2557,7 @@ class ReceiptValidator:
                     f"{row_location}.proposition_destinations",
                     f"must equal {destinations['proposition']!r}",
                 )
-            computational_ref: tuple[str | None, Path | None, str | None]
+            computational_ref: tuple[Optional[str], Optional[Path], Optional[str]]
             if destinations["computational"]:
                 computational_ref = self.resolve_named_ref(
                     row.get("computational_image"),
@@ -1178,7 +2602,7 @@ class ReceiptValidator:
                 f"{row_location}.feature_manifest",
             )
             self.resolve_named_ref(row.get("elaborator"), f"{row_location}.elaborator")
-            if feature_path is not None and feature_path.is_file():
+            if feature_path is not None and _is_regular_file(feature_path):
                 manifest = self.load_json(feature_path, f"{row_location}.feature_manifest")
                 if manifest is not None:
                     self.exact_keys(
@@ -1196,7 +2620,7 @@ class ReceiptValidator:
 
     def validate_codegen_contract(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
     ) -> dict[str, Any]:
         location = "authority_contracts.codegen_surface"
         result: dict[str, Any] = {
@@ -1381,7 +2805,7 @@ class ReceiptValidator:
 
     def validate_acceptance_environment_contract(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
     ) -> dict[str, Any]:
         location = "authority_contracts.acceptance_environment"
         result: dict[str, Any] = {"component_roster": []}
@@ -1413,7 +2837,7 @@ class ReceiptValidator:
                     continue
                 role = component.get("role")
                 name = component.get("name")
-                if role not in TOOLCHAIN_ROLES or role in roles:
+                if not isinstance(role, str) or role not in TOOLCHAIN_ROLES or role in roles:
                     self.error(f"{row_location}.role", "must uniquely name a required role")
                 else:
                     roles.add(role)
@@ -1446,7 +2870,7 @@ class ReceiptValidator:
 
     def validate_authority_contracts(
         self,
-        policy: dict[str, Any] | None,
+        policy: Optional[dict[str, Any]],
     ) -> dict[str, Any]:
         result: dict[str, Any] = {}
         if policy is None:
@@ -1457,7 +2881,7 @@ class ReceiptValidator:
             return result
         paths: set[Path] = set()
         digests: set[str] = set()
-        loaded: dict[str, dict[str, Any] | None] = {}
+        loaded: dict[str, Optional[dict[str, Any]]] = {}
         for role, (contract_id, _schema) in AUTHORITY_CONTRACTS.items():
             _ref_id, path, digest = self.resolve_named_ref(
                 contracts.get(role),
@@ -1474,7 +2898,7 @@ class ReceiptValidator:
                 digests.add(digest)
             loaded[role] = (
                 self.load_json(path, f"authority_contracts.{role}")
-                if path is not None and path.is_file()
+                if path is not None and _is_regular_file(path)
                 else None
             )
             result[f"{role}_sha256"] = digest
@@ -1495,7 +2919,7 @@ class ReceiptValidator:
 
     def validate_toolchain_manifest(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
         acceptance_run_id: Any,
         source_revision: Any,
         authority_contracts: dict[str, Any],
@@ -1533,7 +2957,7 @@ class ReceiptValidator:
             role = component.get("role")
             name = component.get("name")
             version = component.get("version")
-            if role not in TOOLCHAIN_ROLES or role in roles:
+            if not isinstance(role, str) or role not in TOOLCHAIN_ROLES or role in roles:
                 self.error(f"{row_location}.role", "must uniquely name a required role")
             else:
                 roles.add(role)
@@ -1577,7 +3001,7 @@ class ReceiptValidator:
 
     def validate_corpus_manifest(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
         acceptance_run_id: Any,
         source_revision: Any,
         authority_contracts: dict[str, Any],
@@ -1689,7 +3113,7 @@ class ReceiptValidator:
 
     def validate_subject_graph(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
         acceptance_run_id: Any,
         source_revision: Any,
         admitted_corpus_ids: set[str],
@@ -1879,7 +3303,8 @@ class ReceiptValidator:
                     self.error(f"{row_location}.id", "must be a unique non-empty body id")
                 else:
                     body_ids.add(body_id)
-                if body.get("language") not in {"rust", "lean"}:
+                language = body.get("language")
+                if not isinstance(language, str) or language not in {"rust", "lean"}:
                     self.error(f"{row_location}.language", "must be 'rust' or 'lean'")
                 else:
                     observed_languages.add(body["language"])
@@ -1988,7 +3413,8 @@ class ReceiptValidator:
                             observed_cross_language_matrix.add(
                                 (expected_direction, edge["value_category"])
                             )
-                if edge.get("value_category") not in {
+                value_category = edge.get("value_category")
+                if not isinstance(value_category, str) or value_category not in {
                     "value",
                     "aggregate",
                     "reference",
@@ -2343,7 +3769,14 @@ class ReceiptValidator:
                         f"{row_location}.kernel_environment_sha256",
                         "must equal the owner-authorized kernel environment",
                     )
-                if certificate.get("proof_grade") not in kernel.get("proof_grades", []):
+                proof_grade = certificate.get("proof_grade")
+                grades = kernel.get("proof_grades")
+                # A list, not a str: `in` on a str would test for a substring.
+                if (
+                    not isinstance(proof_grade, str)
+                    or not isinstance(grades, list)
+                    or proof_grade not in grades
+                ):
                     self.error(
                         f"{row_location}.proof_grade",
                         "must be an owner-authorized proof grade",
@@ -2456,13 +3889,15 @@ class ReceiptValidator:
                     )
 
             for row_index, obligation in enumerate(obligations):
-                if obligation.get("module_id") not in module_ids:
+                module_id = obligation.get("module_id")
+                if not isinstance(module_id, str) or module_id not in module_ids:
                     self.error(
                         f"{program_location}.obligations[{row_index}].module_id",
                         "must name the owning admitted module",
                     )
             for row_index, certificate in enumerate(proof_certificates):
-                if certificate.get("module_id") not in module_ids:
+                module_id = certificate.get("module_id")
+                if not isinstance(module_id, str) or module_id not in module_ids:
                     self.error(
                         f"{program_location}.proof_certificates[{row_index}].module_id",
                         "must name the owning admitted module",
@@ -2761,7 +4196,7 @@ class ReceiptValidator:
                 f"{location}.programs.admitted_file_ids",
                 "program index must cover exactly the admitted corpus IDs",
             )
-        release_record: dict[str, Any] | None = None
+        release_record: Optional[dict[str, Any]] = None
         if release_locator_valid and isinstance(release_locator, dict):
             release_program_id = release_locator.get("program_id")
             release_executable_id = release_locator.get("executable_id")
@@ -2817,15 +4252,21 @@ class ReceiptValidator:
                     f"canonical root mismatch: recorded {roots.get(root_name)!r}, "
                     f"actual {actual_root!r}",
                 )
-        if linked_module_digest not in artifact_digests["modules"]:
+        if (
+            not isinstance(linked_module_digest, str)
+            or linked_module_digest not in artifact_digests["modules"]
+        ):
             self.error("receipt.linked_module", "must name a typed module artifact")
-        if release_artifact_digest not in artifact_digests["executables"]:
+        if (
+            not isinstance(release_artifact_digest, str)
+            or release_artifact_digest not in artifact_digests["executables"]
+        ):
             self.error("receipt.release_artifact", "must name a typed linked executable")
         return artifact_digests
 
     def validate_policy(
         self,
-        value: dict[str, Any] | None,
+        value: Optional[dict[str, Any]],
         source_revision: Any,
         acceptance_run_id: Any,
         authorized_inputs: dict[str, Any],
@@ -2903,10 +4344,10 @@ class ReceiptValidator:
 
     def verify_policy_authorization(
         self,
-        envelope_path: Path | None,
-        policy_path: Path | None,
+        envelope_path: Optional[Path],
+        policy_path: Optional[Path],
         policy_digest: Any,
-        policy_value: dict[str, Any] | None,
+        policy_value: Optional[dict[str, Any]],
     ) -> None:
         """Verify candidate policy against an Ed25519 key supplied outside --root."""
         location = "policy_authorization"
@@ -2916,15 +4357,21 @@ class ReceiptValidator:
                 "--trusted-owner-key is required and must be rooted outside --root",
             )
             return
-        try:
-            self.trusted_owner_key.relative_to(self.root)
-        except ValueError:
-            pass
-        else:
-            self.error(location, "trusted owner key must be outside the candidate repository")
+        # Existence first: a missing key cannot be stat'ed, which the identity
+        # check below would otherwise report as "inside the repository".
+        mode, problem = _file_mode(self.trusted_owner_key)
+        if problem is not None:
+            self.error(location, f"trusted owner key cannot be stat'ed: {problem}")
             return
-        if not self.trusted_owner_key.is_file():
+        if mode is None or not stat.S_ISREG(mode):
             self.error(location, f"trusted owner key does not exist: {self.trusted_owner_key}")
+            return
+        inside = _inside_root_by_identity(self.trusted_owner_key, self.root)
+        if inside is not None:
+            self.error(
+                location,
+                f"trusted owner key must be outside the candidate repository: {inside}",
+            )
             return
         try:
             key_fields = self.trusted_owner_key.read_text(encoding="utf-8").strip().split()
@@ -2937,14 +4384,12 @@ class ReceiptValidator:
         if not SSH_KEYGEN.is_file():
             self.error(location, f"required verifier is unavailable: {SSH_KEYGEN}")
             return
-        fingerprint_process = subprocess.run(
-            [str(SSH_KEYGEN), "-lf", str(self.trusted_owner_key), "-E", "sha256"],
-            check=False,
-            capture_output=True,
-            text=True,
-            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        fingerprint_process = _ssh_keygen(
+            "-lf", str(self.trusted_owner_key), "-E", "sha256"
         )
-        fingerprint_fields = fingerprint_process.stdout.split()
+        fingerprint_fields = fingerprint_process.stdout.decode(
+            "utf-8", errors="replace"
+        ).split()
         if fingerprint_process.returncode != 0 or len(fingerprint_fields) < 2:
             self.error(location, "cannot derive trusted owner key fingerprint")
             return
@@ -2955,7 +4400,7 @@ class ReceiptValidator:
                 f"{location}.signer_fingerprint",
                 "policy fingerprint does not equal the externally trusted owner key",
             )
-        if envelope_path is None or not envelope_path.is_file() or policy_path is None:
+        if envelope_path is None or not _is_regular_file(envelope_path) or policy_path is None:
             return
         envelope = self.load_json(envelope_path, location)
         if envelope is None:
@@ -2983,7 +4428,18 @@ class ReceiptValidator:
             if envelope.get(key) != wanted:
                 self.error(f"{location}.{key}", f"must equal {wanted!r}")
         signature_path = self.resolve_ref(envelope.get("signature"), f"{location}.signature")
-        if signature_path is None or not signature_path.is_file():
+        if signature_path is None or not _is_regular_file(signature_path):
+            return
+        # The signature is checked over bytes read once, which must be the
+        # bytes whose digest the receipt binds.  A policy that is not a
+        # readable regular file is refused here; resolve_ref said why.
+        try:
+            policy_bytes = _read_file(policy_path)
+        except (OSError, ValueError) as exc:
+            self.error(location, f"cannot read the authority policy: {exc}")
+            return
+        if hashlib.sha256(policy_bytes).hexdigest() != policy_digest:
+            self.error(location, "the authority policy read for verification is not the bound one")
             return
         with tempfile.TemporaryDirectory(prefix="trust-owner-policy-") as tmp:
             allowed_signers = Path(tmp) / "allowed_signers"
@@ -2991,24 +4447,18 @@ class ReceiptValidator:
                 f"trust-owner {key_fields[0]} {key_fields[1]}\n",
                 encoding="utf-8",
             )
-            verify = subprocess.run(
-                [
-                    str(SSH_KEYGEN),
-                    "-Y",
-                    "verify",
-                    "-f",
-                    str(allowed_signers),
-                    "-I",
-                    "trust-owner",
-                    "-n",
-                    POLICY_SIGNATURE_NAMESPACE,
-                    "-s",
-                    str(signature_path),
-                ],
-                input=policy_path.read_bytes(),
-                check=False,
-                capture_output=True,
-                env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            verify = _ssh_keygen(
+                "-Y",
+                "verify",
+                "-f",
+                str(allowed_signers),
+                "-I",
+                "trust-owner",
+                "-n",
+                POLICY_SIGNATURE_NAMESPACE,
+                "-s",
+                str(signature_path),
+                stdin=policy_bytes,
             )
         if verify.returncode != 0:
             detail = verify.stderr.decode("utf-8", errors="replace").strip()
@@ -3017,25 +4467,33 @@ class ReceiptValidator:
     def post_run_integrity_check(self) -> None:
         """Close ordinary concurrent-mutation races around checker execution."""
         for path, expected in sorted(self.bound_files.items(), key=lambda item: str(item[0])):
-            if not path.is_file():
+            if not _is_regular_file(path):
                 self.error("post_run_integrity", f"bound file disappeared: {path}")
                 continue
-            actual = _sha256(path)
+            try:
+                actual = _sha256(path)
+            except OSError as exc:
+                self.error("post_run_integrity", f"bound file cannot be re-read: {path}: {exc}")
+                continue
             if actual != expected:
                 self.error(
                     "post_run_integrity",
                     f"bound file changed during checker execution: {path}",
                 )
-        status_rc, dirty = _git(self.root, "status", "--porcelain", "--untracked-files=all")
-        if status_rc != 0:
-            self.error("post_run_integrity", "cannot re-inspect worktree state")
-        elif dirty:
-            self.error("post_run_integrity", "worktree became dirty during checker execution")
+        # A tree refused before the run stays refused; proving it again would
+        # repeat the most expensive inspection without changing the verdict.
+        if not self.worktree_clean_before_run:
+            return
+        for refusal in worktree_refusals(self.root, self.head_before_run):
+            self.error(
+                "post_run_integrity",
+                f"worktree became dirty during checker execution: {refusal}",
+            )
 
     def validate(self) -> dict[str, Any]:
-        receipt = self.load_json(self.receipt_path, "receipt")
+        receipt, receipt_bytes = self.load_json_bytes(self.receipt_path, "receipt")
         gate_results = {gate: False for gate in GATES}
-        if receipt is None:
+        if receipt is None or receipt_bytes is None:
             return self.verdict(gate_results)
 
         receipt_keys = {
@@ -3074,29 +4532,40 @@ class ReceiptValidator:
         if not isinstance(source_revision, str) or not GIT_REVISION.fullmatch(source_revision):
             self.error("receipt.source_revision", "must be a lowercase 40-64 hex revision")
 
-        head_rc, head = _git(self.root, "rev-parse", "HEAD")
+        head_process = _git_run(self.root, "rev-parse", "HEAD", timeout=GIT_QUICK_TIMEOUT)
+        head_rc = head_process.returncode
+        head = head_process.stdout.decode("utf-8", errors="replace").strip()
         if head_rc != 0:
-            self.error("repository", "--root is not a readable Git worktree")
+            self.error(
+                "repository",
+                f"--root is not a readable Git worktree: {_diagnostic(head_process)}",
+            )
         elif source_revision != head:
             self.error(
                 "receipt.source_revision",
                 f"does not match --root HEAD: recorded {source_revision!r}, actual {head!r}",
             )
-        origin_rc, origin = _git(self.root, "config", "--get", "remote.origin.url")
+        if head_rc == 0 and GIT_REVISION.fullmatch(head):
+            self.head_before_run = head
+        origin_process = _git_run(
+            self.root, "config", "--get", "remote.origin.url", timeout=GIT_QUICK_TIMEOUT
+        )
+        origin = origin_process.stdout.decode("utf-8", errors="replace").strip()
         canonical_origin = origin[:-4] if origin.endswith(".git") else origin
-        if origin_rc != 0 or canonical_origin != REPOSITORY_ID:
+        if origin_process.returncode != 0 or canonical_origin != REPOSITORY_ID:
+            detail = f" ({_diagnostic(origin_process)})" if origin_process.returncode else ""
             self.error(
                 "repository.origin",
-                f"must identify {REPOSITORY_ID!r}; actual {origin!r}",
+                f"must identify {REPOSITORY_ID!r}; actual {origin!r}{detail}",
             )
-        status_rc, dirty = _git(self.root, "status", "--porcelain", "--untracked-files=all")
-        if status_rc != 0:
-            self.error("repository", "cannot inspect worktree state")
-        elif dirty:
-            self.error("repository", "worktree is not clean")
+        refusals = worktree_refusals(self.root, self.head_before_run)
+        for refusal in refusals:
+            self.error("repository", f"worktree is not clean: {refusal}")
+        self.worktree_clean_before_run = not refusals
+        self.checkout_refused = bool(refusals)
 
-        receipt_digest = _sha256(self.receipt_path)
-        self.bound_files[self.receipt_path] = receipt_digest
+        # The digest of the bytes parsed above, not of a second read.
+        self.bound_files[self.receipt_path] = hashlib.sha256(receipt_bytes).hexdigest()
         toolchain_path = self.resolve_ref(
             receipt.get("toolchain_manifest"),
             "receipt.toolchain_manifest",
@@ -3167,27 +4636,36 @@ class ReceiptValidator:
             "policy_authorization": policy_authorization_path,
         }
         non_null_common_paths = [path for path in common_paths.values() if path is not None]
-        if len(non_null_common_paths) != len(set(non_null_common_paths)):
+        # Distinct files, not only distinct spellings: a case alias or a hard
+        # link names one file twice.  A path that cannot be stat'ed is already
+        # refused by resolve_ref.
+        common_identities = [
+            identity for identity in map(_identity_or_none, non_null_common_paths)
+            if identity is not None
+        ]
+        if len(non_null_common_paths) != len(set(non_null_common_paths)) or len(
+            common_identities
+        ) != len(set(common_identities)):
             self.error("receipt", "all common bound artifacts must use distinct paths")
 
         toolchain_manifest = (
             self.load_json(toolchain_path, "toolchain_manifest")
-            if toolchain_path is not None and toolchain_path.is_file()
+            if toolchain_path is not None and _is_regular_file(toolchain_path)
             else None
         )
         corpus_manifest = (
             self.load_json(corpus_path, "corpus_manifest")
-            if corpus_path is not None and corpus_path.is_file()
+            if corpus_path is not None and _is_regular_file(corpus_path)
             else None
         )
         subject_graph = (
             self.load_json(subject_graph_path, "subject_graph")
-            if subject_graph_path is not None and subject_graph_path.is_file()
+            if subject_graph_path is not None and _is_regular_file(subject_graph_path)
             else None
         )
         authority_policy = (
             self.load_json(policy_path, "authority_policy")
-            if policy_path is not None and policy_path.is_file()
+            if policy_path is not None and _is_regular_file(policy_path)
             else None
         )
         authorized_inputs = {
@@ -3233,8 +4711,8 @@ class ReceiptValidator:
         )
         if (
             policy_authorization_path is not None
-            and policy_authorization_path.is_file()
-            and policy_authorization_path.stat().st_size == 0
+            and _is_regular_file(policy_authorization_path)
+            and _file_size(policy_authorization_path) == 0
         ):
             self.error("receipt.policy_authorization", "must not be empty")
 
@@ -3256,6 +4734,7 @@ class ReceiptValidator:
         descriptor_ok = {gate: False for gate in GATES}
         checker_ids: set[str] = set()
         evidence_paths: set[Path] = set()
+        evidence_identities: set[tuple[int, int]] = set()
         for gate in GATES:
             before = len(self.errors)
             descriptor = gates.get(gate)
@@ -3302,9 +4781,12 @@ class ReceiptValidator:
             if checker_result is None or evidence_path is None:
                 continue
             checker_path, checker_digest, checker_bytes = checker_result
-            if evidence_path in evidence_paths:
+            evidence_identity = _identity_or_none(evidence_path)
+            if evidence_path in evidence_paths or evidence_identity in evidence_identities:
                 self.error(f"{location}.evidence.path", "evidence receipts must be distinct")
             evidence_paths.add(evidence_path)
+            if evidence_identity is not None:
+                evidence_identities.add(evidence_identity)
             evidence_digest = (
                 descriptor.get("evidence", {}).get("sha256")
                 if isinstance(descriptor.get("evidence"), dict)
@@ -3320,7 +4802,7 @@ class ReceiptValidator:
             )
             descriptor_ok[gate] = len(self.errors) == before
 
-        forbidden = {
+        metadata_paths = {
             self.receipt_path,
             *evidence_paths,
             *(descriptor[1] for descriptor in descriptors.values()),
@@ -3333,16 +4815,23 @@ class ReceiptValidator:
             policy_authorization_path,
         ):
             if metadata_path is not None:
-                forbidden.add(metadata_path)
+                metadata_paths.add(metadata_path)
+        forbidden = self.metadata(metadata_paths)
 
         common_paths_ready = common_binding_ok and all(
-            path is not None and path.is_file() for path in common_paths.values()
+            path is not None and _is_regular_file(path) for path in common_paths.values()
         )
         checker_verdicts: dict[str, dict[str, Any]] = {}
 
-        def validate_gate(gate: str, prior_gates_root: str | None) -> None:
+        def validate_gate(gate: str, prior_gates_root: Optional[str]) -> None:
             before = len(self.errors)
             if gate not in descriptors:
+                return
+            if self.checkout_refused:
+                # The receipt is refused already; executing a checker snapshot
+                # taken from a checkout that is not the accepted commit proves
+                # nothing and runs the candidate's code for no verdict.
+                self.error(f"{gate}.checker_run", "checker not run: the checkout was refused")
                 return
             if not common_paths_ready:
                 self.error(f"{gate}.checker_run", "common bound artifacts are unavailable")
@@ -3548,25 +5037,39 @@ class ReceiptValidator:
 
 
 def validate_receipt(
-    receipt_path: str | Path,
-    root: str | Path,
-    trusted_owner_key: str | Path | None = None,
+    receipt_path: Union[str, Path],
+    root: Union[str, Path],
+    trusted_owner_key: Optional[Union[str, Path]] = None,
+    external_verifier: Optional[Union[str, Path]] = None,
+    external_verifier_sha256: Optional[str] = None,
 ) -> dict[str, Any]:
     root_path = Path(root)
     resolved_receipt = Path(receipt_path)
     if not resolved_receipt.is_absolute():
         resolved_receipt = root_path / resolved_receipt
     owner_key_path = Path(trusted_owner_key) if trusted_owner_key is not None else None
-    return ReceiptValidator(root_path, resolved_receipt, owner_key_path).validate()
+    verifier_path = Path(external_verifier) if external_verifier is not None else None
+    return ReceiptValidator(
+        root_path, resolved_receipt, owner_key_path,
+        verifier_path, external_verifier_sha256,
+    ).validate()
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--receipt", required=True, help="completion receipt JSON")
     parser.add_argument("--root", default=".", help="Git worktree and artifact root")
     parser.add_argument(
         "--trusted-owner-key",
-        help="external ssh-ed25519 public key that authorizes the completion policy",
+        help="external ssh-ed25519 key for policy verification; caller input is not independent owner authorization",
+    )
+    parser.add_argument(
+        "--external-verifier",
+        help="external G8 verifier-copy path; comparison alone grants no proof authority",
+    )
+    parser.add_argument(
+        "--external-verifier-sha256",
+        help="caller-supplied G8 verifier digest; not an independently authorized pin",
     )
     parser.add_argument(
         "--candidate-verifier",
@@ -3578,35 +5081,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--text", action="store_true", help="print a concise human verdict")
     args = parser.parse_args(argv)
     if args.candidate_verifier is not None:
-        root_path = Path(args.root).resolve()
+        root_path, problem = _resolved(Path(args.root))
+        if problem is not None:
+            parser.error(f"--root cannot be resolved: {problem}")
         running_path = Path(__file__)
-        if running_path.is_symlink():
+        if os.path.islink(running_path):
             parser.error("running verifier must not be a symlink")
-        running_verifier = running_path.resolve()
-        try:
-            running_verifier.relative_to(root_path)
-        except ValueError:
-            pass
-        else:
-            parser.error("running verifier must be outside --root")
+        running_verifier, problem = _resolved(running_path)
+        if problem is not None:
+            parser.error(f"running verifier cannot be resolved: {problem}")
+        inside = _inside_root_by_identity(running_verifier, root_path)
+        if inside is not None:
+            parser.error(f"running verifier must be outside --root: {inside}")
         candidate = Path(args.candidate_verifier)
         if not candidate.is_absolute():
             candidate = root_path / candidate
-        if candidate.is_symlink():
+        mode, problem = _file_mode(candidate, follow_symlinks=False)
+        if problem is not None:
+            parser.error(f"--candidate-verifier cannot be stat'ed: {problem}")
+        if mode is not None and stat.S_ISLNK(mode):
             parser.error("--candidate-verifier must not be a symlink")
-        candidate = candidate.resolve()
+        candidate, problem = _resolved(candidate)
+        if problem is not None:
+            parser.error(f"--candidate-verifier cannot be resolved: {problem}")
         try:
             candidate.relative_to(root_path)
         except ValueError:
             parser.error("--candidate-verifier must resolve inside --root")
-        if (
-            not candidate.is_file()
-            or _sha256(candidate) != _sha256(running_verifier)
-        ):
+        try:
+            same_bytes = _sha256(candidate) == _sha256(running_verifier)
+        except OSError:
+            same_bytes = False
+        if not same_bytes:
             parser.error(
                 "candidate verifier bytes do not equal the externally pinned verifier"
             )
-    verdict = validate_receipt(args.receipt, args.root, args.trusted_owner_key)
+    verdict = validate_receipt(
+        args.receipt, args.root, args.trusted_owner_key,
+        args.external_verifier, args.external_verifier_sha256,
+    )
     if args.text:
         print(f"{verdict['goal_id']}: {verdict['result'].upper()}")
         for gate, passed in verdict["gate_results"].items():

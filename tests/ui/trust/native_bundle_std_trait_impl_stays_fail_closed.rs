@@ -131,9 +131,20 @@ impl AsRef<[u8]> for Boom {
     }
 }
 
-pub fn probe_generic_as_ref<B: AsRef<[u8]>>(b: &B) -> usize { //~ ERROR Trust strict verification failed
-    //~| NOTE call to an absent callee
+// OD-1 phase 1 (2026-10-04), mechanism MOVED per rule 3: `b.as_ref()` on the body's
+// own parameter is an ADMITTED instance-hypothesis site (open `AsRef`, unresolved,
+// no unsafe, no raw pointer). The definition no longer claims panic-freedom for every
+// `B`: it publishes one `assumption:instance-hypothesis` row and passes strict
+// CONDITIONALLY (the WARN pin). The panicking `Boom` impl is charged where an instance
+// is NAMED: `probe_generic_as_ref_at_boom` names `probe_generic_as_ref::<Boom>`, whose
+// discharge row resolves to `<Boom as AsRef<[u8]>>::as_ref`, which is not proved
+// panic-free, so that row is `failed` and the strict build is refused there.
+pub fn probe_generic_as_ref<B: AsRef<[u8]>>(b: &B) -> usize { //~ WARN 1 instance hypothesis row(s)
     b.as_ref().len()
+}
+
+pub fn probe_generic_as_ref_at_boom(b: &Boom) -> usize { //~ ERROR Trust instance discharge not established
+    probe_generic_as_ref(b)
 }
 
 pub fn probe_dyn_as_ref(b: &dyn AsRef<[u8]>) -> usize { //~ ERROR Trust strict verification failed

@@ -95,8 +95,8 @@ pub(super) fn check(
                 .note("for more information, see the Trust Reference's machine-dependent integer types section");
         }
 
-        if msrv.meets(cx, msrvs::INTEGER_SIGN_CAST)
-            && let Some(cast) = utils::is_signedness_cast(cast_from, cast_to)
+        if let Some(cast) = utils::is_signedness_cast(cast_from, cast_to)
+            && msrv.meets(cx, msrvs::INTEGER_SIGN_CAST)
         {
             let method = match cast {
                 utils::CastTo::Signed => "cast_signed()",

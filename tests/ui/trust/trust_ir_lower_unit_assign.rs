@@ -1,6 +1,6 @@
 //@ run-pass
 //@ dont-check-compiler-stderr
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aunused_assignments
 //! Trust (wave-UAS): `let mut z: () = ...; z = x = 11;` — a UNIT local assigned
 //! the value of a nested assignment.
 //!

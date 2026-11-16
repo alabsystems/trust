@@ -26,6 +26,9 @@
 use trust_types::*;
 use trust_vcgen::{bind_compiler_loop_contracts, generate_vcs_with_discharge};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn span(line_start: u32, line_end: u32) -> SourceSpan {
     SourceSpan { file: "mixed.rs".to_string(), line_start, col_start: 0, line_end, col_end: 80 }
 }
@@ -120,6 +123,7 @@ fn mixed_counted_loop() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -148,6 +152,19 @@ enum Row {
 struct Verdict {
     unsat: bool,
     certified: bool,
+    /// The violation carries a syntactically reflexive disequality
+    /// `Not(Eq(t, t))` among its conjuncts, so `Eq.refl t` refutes it with no
+    /// hypothesis at all: a row with one is a tautology whatever else it says.
+    reflexive: bool,
+}
+
+/// Whether some conjunct of `formula` is `Not(Eq(t, t))` for one term `t`.
+fn has_reflexive_disequality(formula: &Formula) -> bool {
+    match formula {
+        Formula::And(parts) => parts.iter().any(has_reflexive_disequality),
+        Formula::Not(inner) => matches!(inner.as_ref(), Formula::Eq(left, right) if left == right),
+        _ => false,
+    }
 }
 
 /// Decide the VC's formula on its merits, bypassing the kind filter by carrying
@@ -163,7 +180,7 @@ fn formula_is_unsat(vc: &VerificationCondition) -> bool {
         contract_metadata: None,
         obligation: None,
     };
-    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+    let router = test_router::deterministic_test_router();
     let results = router.verify_all(std::slice::from_ref(&carrier));
     let (_, result) = results.into_iter().next().expect("one verdict");
     matches!(result, VerificationResult::Proved { .. })
@@ -243,7 +260,7 @@ fn measure_on(mut func: VerifiableFunction, invariant: &str) -> Row {
             kinds.len()
         ));
     }
-    let blank = Verdict { unsat: false, certified: false };
+    let blank = Verdict { unsat: false, certified: false, reflexive: false };
     let (mut initiation, mut consecution) = (blank, blank);
     let mut constrains = false;
     for vc in &e4 {
@@ -259,6 +276,7 @@ fn measure_on(mut func: VerifiableFunction, invariant: &str) -> Row {
         let verdict = Verdict {
             unsat: formula_is_unsat(vc),
             certified: trust_certify::certify_vc(vc).is_some(),
+            reflexive: has_reflexive_disequality(&vc.formula),
         };
         if std::env::var_os("TRUST_LANEB_VERBOSE").is_some() {
             println!("    {:?} -> {verdict:?}\n      formula: {:?}", vc.kind, vc.formula);
@@ -294,10 +312,15 @@ fn the_vacuity_table_over_the_newly_reachable_mixed_domain() {
     ];
 
     let mut measured = Vec::new();
+    let mut controls = Vec::new();
     for (invariant, note) in table {
         let row = measure(invariant);
         println!("VACUITY  {invariant:<20} [{note}] -> {row:?}");
         measured.push((invariant, row));
+        // The same invariant on the all-u32 control (section 4).
+        let control = measure_on(uniform_counted_loop(), invariant);
+        println!("CONTROL  {invariant:<20} [all-u32, untouched path] -> {control:?}");
+        controls.push((invariant, control));
     }
 
     let row_of = |name: &str| {
@@ -364,18 +387,85 @@ fn the_vacuity_table_over_the_newly_reachable_mixed_domain() {
         );
     }
 
-    // ---- 4. THE KERNEL DOOR IS SHUT FOR EVERYONE, NOT JUST FOR THIS LANE --
+    // ---- 4. THE KERNEL DOOR TREATS THIS LANE AND THE CONTROL ALIKE ---------
     //
-    // Every row above certifies FALSE, including the ones that are UNSAT. The
-    // honest reading is incompleteness in the certification door, not vacuity
-    // here — and the CONTROL proves it: the identical loop with the `u64`
-    // counter replaced by a `u32` one takes the ORIGINAL single-domain path
-    // this lane does not touch, and its rows certify false in exactly the same
-    // way. `proved_by_kind.invariant` cannot move until that door opens,
-    // whatever the translator accepts.
-    let control = measure_on(uniform_counted_loop(), "i == total");
-    println!("CONTROL  i == total (all-u32, untouched path) -> {control:?}");
-    let Row::Rows { initiation: control_initiation, consecution: control_consecution, .. } = control
+    // The CONTROL is the identical loop with the `u64` counter replaced by a
+    // `u32` one, which takes the ORIGINAL single-domain path this lane does not
+    // touch. If the control certified a row and the mixed lane did not, the
+    // difference would be this lane's fault; so EVERY invariant of the table is
+    // measured on both loops, and the two must certify ROW FOR ROW alike.
+    //
+    // Until `de718fe643` that meant "neither certifies anything". Its
+    // `trust_certify::bv_equality` family (documented in `docs/TCB.md` by
+    // `ca243a06a2`) refutes a violation by equality alone: each bitvector term is
+    // an uninterpreted integer skolem and the kernel checks an
+    // `Eq.refl`/`Eq.symm`/`Eq.trans` term, a weakening of the goal that
+    // interprets no arithmetic. On this table it certifies EXACTLY the rows whose
+    // violation carries a syntactically reflexive disequality `Not(Eq(t, t))`,
+    // and it does so in both lanes:
+    //
+    //   * the initiations of the three equality invariants `i == i`,
+    //     `total == total` and `i == total`, which the loop entry folds to the
+    //     closed `Not(Eq(0, 0))`;
+    //   * the CONSECUTIONS of the reflexive `i == i` and `total == total`, whose
+    //     disequality is `Not(Eq(bvadd(t, 1), bvadd(t, 1)))`.
+    //
+    // So every certified row here is a tautology. The kernel door adds no
+    // non-vacuous certification to this table, and its count must never be read
+    // as one. The one non-tautological equality row, the `i == total`
+    // consecution, certifies in neither lane. The control's needs congruence
+    // (`i = total` to `bvadd(i, 1) = bvadd(total, 1)`), which the family
+    // deliberately lacks; the mixed one needs arithmetic as well (that the zero
+    // extension commutes with the `+ 1` step, which holds only because neither
+    // addition wraps). The inequality rows have no equality to refute. (VCGEN-PERF-67-69-VERDICTS-1, 2026-11-07:
+    // this section pinned "never" and went red on the sound new family.)
+    //
+    // What stays forbidden: a certified row the solver does not prove (a false
+    // certification), any certification of a FALSE row, and a certification the
+    // reflexive reading does not explain. The exact measured column is pinned,
+    // so a change that moves the door comes here and says so.
+    let certified_bits = |row: &Row| match row {
+        Row::Rows { initiation, consecution, .. } => {
+            Some((initiation.certified, consecution.certified))
+        }
+        Row::Refused(_) => None,
+    };
+    for (lane, rows) in [("mixed", &measured), ("control", &controls)] {
+        for (invariant, row) in rows {
+            if let Row::Rows { initiation: init, consecution: consec, .. } = row {
+                for (half, verdict) in [("initiation", init), ("consecution", consec)] {
+                    assert!(
+                        !verdict.certified || verdict.unsat,
+                        "{lane} `{invariant}` {half}: kernel-certified but the solver finds it SAT",
+                    );
+                    assert_eq!(
+                        verdict.certified, verdict.reflexive,
+                        "{lane} `{invariant}` {half}: on this table the equality family \
+                         certifies exactly the rows with a reflexive disequality",
+                    );
+                }
+            }
+        }
+    }
+    assert!(!false_initiation.certified, "`i < total` is false at entry; it must never certify");
+    assert!(
+        !wrapping_consecution.certified,
+        "`i <= total` is not preserved at total == u64::MAX; it must never certify",
+    );
+    for ((invariant, row), (_, control)) in measured.iter().zip(&controls) {
+        assert_eq!(
+            certified_bits(row),
+            certified_bits(control),
+            "`{invariant}`: the mixed rows must certify exactly as the untouched control \
+             does: {row:?} against {control:?}",
+        );
+    }
+    let Some((_, control)) = controls.iter().find(|(invariant, _)| *invariant == "i == total")
+    else {
+        panic!("`i == total` missing from the control table");
+    };
+    let Row::Rows { initiation: control_initiation, consecution: control_consecution, .. } =
+        control
     else {
         panic!("the all-u32 control must produce an E4 pair: {control:?}");
     };
@@ -383,14 +473,27 @@ fn the_vacuity_table_over_the_newly_reachable_mixed_domain() {
         control_initiation.unsat && control_consecution.unsat,
         "the control's rows are UNSAT on the untouched path",
     );
-    assert!(
-        !control_initiation.certified && !control_consecution.certified,
-        "if the CONTROL certified and the mixed rows did not, the difference would be \
-         this lane's fault; it does not, so the door is shut for both",
-    );
-    assert!(
-        !initiation.certified && !consecution.certified,
-        "measured: the mixed rows do not certify either — same door, same verdict",
+    let column: Vec<(&str, Option<(bool, bool)>)> =
+        measured.iter().map(|(invariant, row)| (*invariant, certified_bits(row))).collect();
+    assert_eq!(
+        column,
+        vec![
+            ("1 == 1", None),
+            ("0 == 0", None),
+            ("0 == 1", None),
+            ("i == i", Some((true, true))),
+            ("i <= i", Some((false, false))),
+            ("total == total", Some((true, true))),
+            ("i <= 4294967295", Some((false, false))),
+            ("i == total", Some((true, false))),
+            ("i <= total", Some((false, false))),
+            ("total <= i", Some((false, false))),
+            ("i < total", Some((false, false))),
+        ],
+        "measured (initiation, consecution) certification: the equality initiations fold \
+         to `Not(Eq(0, 0))` and the reflexive consecutions to `Not(Eq(t, t))`, both closed \
+         by `Eq.refl`; the `i == total` consecution needs congruence or arithmetic, which \
+         the equality family does not have",
     );
 }
 

@@ -34,9 +34,6 @@ ed25519-dalek = { workspace = true }
 # every other `rand::` path resolve to nothing at the CONSUMER instead of here.
 trust-rand = { workspace = true }
 
-# trust #879: ay-proof-common shared types for proof checker integration
-ay-proof-common = { workspace = true }
-
 [dev-dependencies]
 proptest = { workspace = true }
 # M-Pkg roundtrip test: mints a real QF_LIA CleanCic and kernel-rechecks the

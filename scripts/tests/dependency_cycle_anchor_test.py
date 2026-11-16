@@ -3,6 +3,14 @@
 
 Fixtures contain real Cargo manifests, lockfiles, Lake manifests, proof identity,
 Git history, and nine committed gitlinks.  No state-file stand-in is used.
+
+ONE THING IS STUBBED, and only in the tests that judge a synthetic constellation:
+the live ``git ls-remote`` of trust-wp's canonical main becomes an ``ls-remote``
+of the fixture's LOCAL remote repository (or the sha a test names), and the
+ruling's W0/B constants are bound to the fixture's own base and floor commits
+so the fixture's byte-exact v3 marker can spell them.  Every other read is the
+real one.  The real-history test stubs the same sample with the submodule's
+remote-tracking ``origin/main`` and says so.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Callable
 from unittest import mock
@@ -162,22 +171,106 @@ def lockfile(package: str, dependency: str, rev: str) -> str:
 
 
 @contextlib.contextmanager
-def synthetic_v2_policy(w0: str, preservation_floor: str):
-    """Bind production's fixed identities to real synthetic commit objects."""
-    pre_marker = (
-        "trust.constellation.terminal-policy.v2\n"
-        "state=pre-v2\n"
-        "policy=trust-wp-root-cycle-forward\n"
-        f"w0={w0}\n"
-        f"preservation-floor={preservation_floor}\n"
-    ).encode("ascii")
+def synthetic_v3_policy(fixture: "Fixture"):
+    """Bind the ruling's W0/B constants and marker bytes to the fixture's commits.
+
+    The real constants name commits of the real trust-wp; a synthetic
+    constellation carries its own W0 (trust-wp's base) and B (its published
+    floor), and the marker the fixture committed spells those.  Nothing else
+    about the policy is altered.
+    """
+    marker = anchor.render_terminal_policy_v3_marker(fixture.wp_w0, fixture.wp_floor)
+    remote = str(fixture.remotes["trust-wp"])
     with mock.patch.multiple(
         anchor,
-        TERMINAL_POLICY_V2_W0=w0,
-        TERMINAL_POLICY_V2_PRESERVATION_FLOOR=preservation_floor,
-        TERMINAL_POLICY_V2_PRE_MARKER=pre_marker,
+        TRUST_WP_W0=fixture.wp_w0,
+        TRUST_WP_PRESERVATION_FLOOR=fixture.wp_floor,
+        TERMINAL_POLICY_V3_MARKER=marker,
+        # An absent TrustWP commit is fetched by sha from the fixture's own
+        # remote, never from github.com.
+        trust_wp_fetch_url=lambda: remote,
     ):
         yield
+
+
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+
+def wp_child(wp: Path, parent: str, message: str, updates: dict | None = None) -> str:
+    """A trust-wp commit on top of ``parent``: its tree plus ``updates``."""
+    tree = (
+        derived_tree(wp, parent, updates)
+        if updates
+        else git(wp, "rev-parse", f"{parent}^{{tree}}")
+    )
+    return commit_tree(wp, tree, [parent], message)
+
+
+def root_child(
+    root: Path,
+    parent: str,
+    message: str,
+    updates: dict | None = None,
+    parents: list[str] | None = None,
+) -> str:
+    """A root commit on top of ``parent`` (or ``parents``) with ``parent``'s tree plus ``updates``."""
+    tree = (
+        derived_tree(root, parent, updates)
+        if updates
+        else git(root, "rev-parse", f"{parent}^{{tree}}")
+    )
+    return commit_tree(root, tree, parents or [parent], message)
+
+
+def pin_wp(
+    root: Path, parent: str, wp_commit: str, message: str, extra: dict | None = None
+) -> str:
+    """A single-parent root commit that moves the trust-wp gitlink to ``wp_commit``."""
+    updates: dict = {anchor.WP_ROOT_DELTA_PATH: ("160000", wp_commit)}
+    if extra:
+        updates.update(extra)
+    return root_child(root, parent, message, updates)
+
+
+def retire_receipt(root: Path, parent: str) -> str:
+    """Drop the tracked legacy receipt so a moved pin is judged by derivation."""
+    return root_child(root, parent, "retire the tracked receipt", {anchor.RECEIPT_PATH: None})
+
+
+def wp_depends_lock(rows: dict[str, str]) -> str:
+    return "# Format: <repository> main <full-40-character-commit>\n" + "".join(
+        f"{name} main {rows[name]}\n" for name in ("clean", "trust-ir", "trust-cg", "trust", "ay")
+    )
+
+
+def untracked_files_tree(repo: Path) -> str:
+    """The tree of a ``git stash -u`` untracked-files commit: only untracked
+    files, no ``first-party/`` entry."""
+    blob = write_blob(repo, b"fn untracked() {}\n")
+
+    def mktree(entry: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), "mktree"], input=entry, check=True, text=True,
+                              stdout=subprocess.PIPE).stdout.strip()
+
+    source = mktree(f"100644 blob {blob}\tlib.rs\n")
+    return mktree(f"040000 tree {source}\tcrates\n")
+
+
+def committed_bytes(repo: Path, commit: str, path: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(repo), "show", f"{commit}:{path}"],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
 
 
 @dataclass
@@ -187,11 +280,37 @@ class Fixture:
     commits: dict[str, str]
     ancestors: dict[str, str]
     receipt: dict[str, object]
-    root_anchor: str | None = None
-    root_terminal: str | None = None
-    anchor_wp: str | None = None
+    root_genesis: str
+    wp_w0: str
+    wp_floor: str
     policy_parent: str | None = None
     policy_activation: str | None = None
+
+    def wp_remote_main(self) -> str:
+        """The stand-in for the live sample: ``ls-remote`` of the LOCAL remote.
+
+        Same command, same ref, a local path instead of github.com.  This is
+        the only thing these tests stub about the policy.
+        """
+        result = subprocess.run(
+            ["git", "ls-remote", "--exit-code", str(self.remotes["trust-wp"]), "refs/heads/main"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        sha, _tab, ref = result.stdout.strip().partition("\t")
+        assert ref == "refs/heads/main", result.stdout
+        return sha
+
+    def lock_rows(self) -> dict[str, str]:
+        """The coherent lock rows the fixture's trust-wp W0 was committed with."""
+        return {
+            "clean": self.ancestors["clean"],
+            "trust-ir": self.commits["trust-ir"],
+            "trust-cg": self.ancestors["trust-cg"],
+            "trust": self.root_genesis,
+            "ay": self.commits["ay"],
+        }
 
     def checkout(self, name: str) -> Path:
         return self.root / anchor.SUBMODULES[name][0]
@@ -252,256 +371,18 @@ class Fixture:
         self.commit_receipt(self.receipt, message)
         return edges
 
-    def prepare_wp_root_cycle(
-        self,
-        *,
-        depends_content: str | None = None,
-        extra_root_delta: bool = False,
-        extra_root_gitlink: str | None = None,
-        extra_wp_delta: bool = False,
-        allowed_lock_delta: bool = False,
-        omit_required_delta: str | None = None,
-        new_lock_delta: bool = False,
-        wp_intermediate: bool = False,
-        partial_wp_delta: bool = False,
-    ) -> tuple[str, str]:
-        """Cut synthetic R0 -> W1 -> R1 in the production ordering."""
-        legacy_receipt = self.root / anchor.RECEIPT_PATH
-        if legacy_receipt.exists() or legacy_receipt.is_symlink():
-            legacy_receipt.unlink()
-            commit_all(self.root, "R0 removes the obsolete tracked receipt")
-        self.root_anchor = git(self.root, "rev-parse", "HEAD")
-        self.anchor_wp = self.commits["trust-wp"]
-        if extra_root_gitlink is not None:
-            checkout = self.checkout(extra_root_gitlink)
-            write(
-                checkout / "terminal-cycle-extra.txt",
-                "extra root gitlink mutation hidden by local diff config\n",
-            )
-            self.commits[extra_root_gitlink] = commit_all(
-                checkout, f"advance {extra_root_gitlink} during terminal cut"
-            )
-            git(self.root, "add", anchor.SUBMODULES[extra_root_gitlink][0])
-        if depends_content is None:
-            depends_content = (
-                "# Format: <repository> main <full-40-character-commit>\n"
-                f"clean main {self.commits['clean']}\n"
-                f"trust-ir main {self.commits['trust-ir']}\n"
-                f"trust-cg main {self.commits['trust-cg']}\n"
-                f"trust main {self.root_anchor}\n"
-                f"ay main {self.commits['ay']}\n"
-            )
-        wp = self.checkout("trust-wp")
-        if wp_intermediate:
-            write(wp / "intermediate.txt", "W0 must be W1's immediate parent\n")
-            commit_all(wp, "intermediate TrustWP generation")
-        if not partial_wp_delta and omit_required_delta != "Cargo.toml":
-            cargo_manifest = wp / "Cargo.toml"
-            cargo_text = cargo_manifest.read_text(encoding="utf-8")
-            cargo_text = re.sub(
-                r"^# Current AY authority: version=\S+ commit=[0-9a-f]{40}$",
-                "# Current AY authority: "
-                f"version=0.1.0 commit={self.commits['ay']}",
-                cargo_text,
-                flags=re.MULTILINE,
-            )
-            write(
-                cargo_manifest,
-                cargo_text
-                + "\n[dependencies]\n"
-                + 'trust-ir = { git = "'
-                + anchor.SUBMODULES["trust-ir"][1]
-                + f'", rev = "{self.commits["trust-ir"]}" }}\n',
-            )
-        if not partial_wp_delta and omit_required_delta != "VISION.md":
-            vision = wp / "VISION.md"
-            vision_text = re.sub(
-                r"^\| trust-wp-ay \|.*$",
-                "| trust-wp-ay | Building | See current review artifacts | "
-                "AYEncoder with native ADT theory, "
-                f"AY v0.1.0 backend at `{self.commits['ay'][:8]}` "
-                "on current `main`, separation logic encoding |",
-                vision.read_text(encoding="utf-8"),
-                flags=re.MULTILINE,
-            )
-            write(
-                vision,
-                vision_text,
-            )
-        if not partial_wp_delta and omit_required_delta != anchor.WP_DEPENDS_PATH:
-            write(wp / anchor.WP_DEPENDS_PATH, depends_content)
-        cargo_lock = wp / "Cargo.lock"
-        if partial_wp_delta:
-            write(
-                cargo_lock,
-                cargo_lock.read_text(encoding="utf-8")
-                + "# partial W1 lock mutation with restored authorities\n",
-            )
-            write(wp / "illicit-terminal-file.txt", "not on the W1 checklist\n")
-        else:
-            write(
-                cargo_lock,
-                lockfile("trust-ir", "trust-ir", self.commits["trust-ir"]),
-            )
-        if allowed_lock_delta:
-            write(
-                cargo_lock,
-                cargo_lock.read_text(encoding="utf-8")
-                + "# mechanically refreshed terminal lock\n",
-            )
-        if new_lock_delta:
-            write(wp / "invented" / "Cargo.lock", "version = 4\n")
-        if extra_wp_delta:
-            write(wp / "illicit-terminal-file.txt", "not on the W1 checklist\n")
-        terminal_wp = commit_all(wp, "W1 pins Trust root anchor")
-        self.commits["trust-wp"] = terminal_wp
-        git(self.root, "add", anchor.WP_ROOT_DELTA_PATH)
-        if extra_root_delta:
-            write(self.root / "unexpected-root-delta", "not part of the cycle break\n")
-            git(self.root, "add", "unexpected-root-delta")
-        self.root_terminal = commit_all(self.root, "R1 binds terminal TrustWP")
-        return self.root_anchor, self.root_terminal
 
-    def amend_wp_terminal(self, mutate: Callable[[Path], None]) -> None:
-        """Rewrite synthetic W1 and then rewrite R1 to bind that exact W1."""
-        wp = self.checkout("trust-wp")
-        mutate(wp)
-        git(wp, "add", "-A")
-        git(wp, "commit", "--amend", "-qm", "mutated W1 authority")
-        self.commits["trust-wp"] = git(wp, "rev-parse", "HEAD")
-        git(self.root, "add", anchor.WP_ROOT_DELTA_PATH)
-        git(self.root, "commit", "--amend", "-qm", "mutated R1 binding")
-        self.root_terminal = git(self.root, "rev-parse", "HEAD")
-
-    def advance_wp_v2_predecessor(self) -> tuple[str, str]:
-        wp = self.checkout("trust-wp")
-        write(wp / "published-floor.txt", "published history must survive\n")
-        preservation_floor = commit_all(wp, "published preservation floor B")
-        write(wp / "publication-predecessor.txt", "forward migration predecessor\n")
-        predecessor = commit_all(wp, "publication predecessor P")
-        return preservation_floor, predecessor
-
-    def prepare_wp_root_cycle_v2(
-        self, preservation_floor: str, predecessor: str
-    ) -> dict[str, object]:
-        """Build W0 -> B -> P -> W1 and PreV2 -> R0 -> R1 literally.
-
-        The caller patches the module's production W0/B constants to this
-        fixture's synthetic commits.  R0/R1 are made with ``commit-tree`` so
-        the root worktree may keep TrustWP checked out at P/W1 while R0's
-        committed gitlink remains exact W0.
-        """
-        w0 = self.commits["trust-wp"]
-        if anchor.TERMINAL_POLICY_V2_W0 != w0:
-            raise AssertionError("synthetic v2 policy must bind fixture W0")
-
-        wp = self.checkout("trust-wp")
-        if anchor.TERMINAL_POLICY_V2_PRESERVATION_FLOOR != preservation_floor:
-            raise AssertionError("synthetic v2 policy must bind fixture floor B")
-        if git(wp, "rev-parse", "HEAD") != predecessor:
-            raise AssertionError("TrustWP checkout must be at synthetic predecessor P")
-
-        write(
-            self.root / anchor.TERMINAL_POLICY_V2_MARKER_PATH,
-            anchor.TERMINAL_POLICY_V2_PRE_MARKER.decode("ascii"),
-        )
-        # Keep the root gitlink at W0 while the nested checkout is already at P.
-        pre_blob = write_blob(self.root, anchor.TERMINAL_POLICY_V2_PRE_MARKER)
-        pre_tree = derived_tree(
-            self.root,
-            git(self.root, "rev-parse", "HEAD"),
-            {anchor.TERMINAL_POLICY_V2_MARKER_PATH: ("100644", pre_blob)},
-        )
-        pre = commit_tree(
-            self.root,
-            pre_tree,
-            [git(self.root, "rev-parse", "HEAD")],
-            "introduce terminal-policy v2 PreV2 marker",
-        )
-
-        root_bindings = dict(self.commits)
-        armed_blob = write_blob(
-            self.root,
-            anchor.render_terminal_policy_v2_armed(predecessor, root_bindings),
-        )
-        r0_tree = derived_tree(
-            self.root,
-            pre,
-            {
-                anchor.RECEIPT_PATH: None,
-                anchor.TERMINAL_POLICY_V2_MARKER_PATH: ("100644", armed_blob),
-            },
-        )
-        r0 = commit_tree(self.root, r0_tree, [pre], "arm exact v2 R0 policy")
-
-        cargo_manifest = wp / "Cargo.toml"
-        cargo_text = re.sub(
-            r"^# Current AY authority: version=\S+ commit=[0-9a-f]{40}$",
-            "# Current AY authority: "
-            f"version=0.1.0 commit={root_bindings['ay']}",
-            cargo_manifest.read_text(encoding="utf-8"),
-            flags=re.MULTILINE,
-        )
-        write(
-            cargo_manifest,
-            cargo_text
-            + "\n[dependencies]\n"
-            + 'trust-ir = { git = "'
-            + anchor.SUBMODULES["trust-ir"][1]
-            + f'", rev = "{root_bindings["trust-ir"]}" }}\n',
-        )
-        vision = wp / "VISION.md"
-        write(
-            vision,
-            re.sub(
-                r"^\| trust-wp-ay \|.*$",
-                "| trust-wp-ay | Building | See current review artifacts | "
-                "AYEncoder with native ADT theory, "
-                f"AY v0.1.0 backend at `{root_bindings['ay'][:8]}` "
-                "on current `main`, separation logic encoding |",
-                vision.read_text(encoding="utf-8"),
-                flags=re.MULTILINE,
-            ),
-        )
-        write(
-            wp / anchor.WP_DEPENDS_PATH,
-            "# Format: <repository> main <full-40-character-commit>\n"
-            f"clean main {root_bindings['clean']}\n"
-            f"trust-ir main {root_bindings['trust-ir']}\n"
-            f"trust-cg main {root_bindings['trust-cg']}\n"
-            f"trust main {r0}\n"
-            f"ay main {root_bindings['ay']}\n",
-        )
-        write(
-            wp / "Cargo.lock",
-            lockfile("trust-ir", "trust-ir", root_bindings["trust-ir"]),
-        )
-        w1 = commit_all(wp, "W1 publishes exact v2 Trust root anchor")
-
-        r1_tree = derived_tree(
-            self.root, r0, {anchor.WP_ROOT_DELTA_PATH: ("160000", w1)}
-        )
-        r1 = commit_tree(self.root, r1_tree, [r0], "R1 binds v2 terminal TrustWP")
-        self.root_anchor = r0
-        self.root_terminal = r1
-        self.anchor_wp = w0
-        self.commits["trust-wp"] = w1
-        return {
-            "pre": pre,
-            "w0": w0,
-            "preservation_floor": preservation_floor,
-            "predecessor": predecessor,
-            "root_bindings": root_bindings,
-            "r0": r0,
-            "w1": w1,
-            "r1": r1,
-        }
-
-
-def make_fixture(base: Path) -> Fixture:
+def make_fixture(base: Path, *, v3_marker: bool = True) -> Fixture:
     remotes: dict[str, Path] = {}
     commits: dict[str, str] = {}
     ancestors: dict[str, str] = {}
+
+    # The root first, with a genesis commit: trust-wp's lock names a Trust
+    # commit, and P3 needs that row to be an ancestor of every judged revision.
+    root = base / "root"
+    init_repo(root)
+    git(root, "commit", "-q", "--allow-empty", "-m", "trust genesis")
+    genesis = git(root, "rev-parse", "HEAD")
 
     # Dependency repositories with actual ancestor cuts.
     for name in ("clean", "trust-cg"):
@@ -514,35 +395,10 @@ def make_fixture(base: Path) -> Fixture:
         remotes[name] = repo
 
     # Leaf repositories first, so consumers can pin real commits.
-    for name in ("trust-vc", "trust-wp", "ty"):
+    for name in ("trust-vc", "ty"):
         repo = base / "remotes" / name
         init_repo(repo)
         write(repo / "Cargo.toml", package_manifest(name))
-        if name == "trust-wp":
-            write(
-                repo / "Cargo.toml",
-                package_manifest(name)
-                + "# Current AY authority: version=0.0.0 commit="
-                + "6" * 40
-                + "\n",
-            )
-            write(
-                repo / "VISION.md",
-                "# TrustWP fixture vision\n"
-                "| trust-wp-ay | Building | See current review artifacts | "
-                "AYEncoder with native ADT theory, "
-                "AY v0.0.0 backend at `66666666` on current `main`, "
-                "separation logic encoding |\n",
-            )
-            write(repo / "Cargo.lock", "version = 4\n")
-            write(
-                repo / anchor.WP_DEPENDS_PATH,
-                "clean main " + "1" * 40 + "\n"
-                "trust-ir main " + "2" * 40 + "\n"
-                "trust-cg main " + "3" * 40 + "\n"
-                "trust main " + "4" * 40 + "\n"
-                "ay main " + "5" * 40 + "\n",
-            )
         commits[name] = commit_all(repo, f"{name} terminal")
         remotes[name] = repo
 
@@ -613,6 +469,34 @@ def make_fixture(base: Path) -> Fixture:
     )
     commits["trust-mc"] = commit_all(mc, "MC pins VC")
     remotes["trust-mc"] = mc
+
+    # trust-wp last: its lock binds every cohort row to a real sibling commit
+    # (each an ancestor-or-equal of the gitlink, P3) and the trust row to
+    # genesis.  Its base commit plays W0 and is what the root pins; its
+    # published floor B is W0's child and is where the remote's main stays,
+    # so the fixture's remote main contains B (P1) and W0 is on the canonical
+    # line.
+    wp = base / "remotes" / "trust-wp"
+    init_repo(wp)
+    write(wp / "Cargo.toml", package_manifest("trust-wp"))
+    write(wp / "Cargo.lock", "version = 4\n")
+    write(
+        wp / anchor.WP_DEPENDS_PATH,
+        wp_depends_lock(
+            {
+                "clean": ancestors["clean"],
+                "trust-ir": commits["trust-ir"],
+                "trust-cg": ancestors["trust-cg"],
+                "trust": genesis,
+                "ay": commits["ay"],
+            }
+        ),
+    )
+    wp_w0 = commit_all(wp, "trust-wp W0")
+    write(wp / "published.txt", "published floor B\n")
+    wp_floor = commit_all(wp, "published floor B")
+    commits["trust-wp"] = wp_w0
+    remotes["trust-wp"] = wp
 
     ny = base / "remotes" / "ny"
     init_repo(ny)
@@ -688,8 +572,6 @@ def make_fixture(base: Path) -> Fixture:
     commits["ny"] = commit_all(ny, "NY Lake proof identity")
     remotes["ny"] = ny
 
-    root = base / "root"
-    init_repo(root)
     dependencies = ["[package]", 'name = "trust-root-fixture"', 'version = "0.1.0"', 'edition = "2021"', "", "[dependencies]"]
     for name, (path, _url) in sorted(anchor.SUBMODULES.items()):
         dependencies.append(f'{name} = {{ path = "{path}" }}')
@@ -718,6 +600,17 @@ def make_fixture(base: Path) -> Fixture:
             check=True,
         )
         git(root, "config", "-f", ".gitmodules", f"submodule.{path}.url", canonical_url)
+    # The clone of trust-wp checked out its main (B); the root pins W0.
+    git(root / anchor.SUBMODULES["trust-wp"][0], "checkout", "-q", "--detach", wp_w0)
+    git(root, "add", anchor.SUBMODULES["trust-wp"][0])
+    # The v2 marker is carried as history, as real main carries it.
+    (root / anchor.TERMINAL_POLICY_V2_MARKER_PATH).write_bytes(
+        anchor.TERMINAL_POLICY_V2_PRE_MARKER
+    )
+    if v3_marker:
+        (root / anchor.TERMINAL_POLICY_V3_MARKER_PATH).write_bytes(
+            anchor.render_terminal_policy_v3_marker(wp_w0, wp_floor)
+        )
     commit_all(root, "root terminal tuple")
 
     exclusions = [
@@ -779,6 +672,9 @@ def make_fixture(base: Path) -> Fixture:
         commits,
         ancestors,
         receipt,
+        root_genesis=genesis,
+        wp_w0=wp_w0,
+        wp_floor=wp_floor,
         policy_parent=policy_parent,
         policy_activation=policy_activation,
     )
@@ -798,30 +694,29 @@ class StrictShapeTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(anchor.AnchorError):
                 anchor.require_sha(value, "pin")
 
-    def test_v2_armed_marker_fixed_fields_and_bytes_are_exact(self) -> None:
-        bindings = {name: "1" * 40 for name in anchor.SUBMODULES}
-        bindings["trust-wp"] = anchor.TERMINAL_POLICY_V2_W0
-        marker = anchor.render_terminal_policy_v2_armed("2" * 40, bindings)
-        parsed = anchor.parse_terminal_policy_v2_armed(marker)
-        self.assertEqual(parsed["predecessor_commit"], "2" * 40)
-        self.assertEqual(parsed["root_bindings"], bindings)
-        mutations = (
-            marker.replace(
-                f"w0={anchor.TERMINAL_POLICY_V2_W0}".encode(),
-                f"w0={'3' * 40}".encode(),
+    def test_v3_marker_parser_names_each_malformation(self) -> None:
+        canonical = anchor.TERMINAL_POLICY_V3_MARKER
+        anchor.parse_terminal_policy_v3(canonical)
+        rows = canonical.decode("ascii")[:-1].split("\n")
+        cases = {
+            "not-terminated": (canonical[:-1], "not newline-terminated"),
+            "uppercase": (canonical.upper(), "row 1 differs"),
+            "extra-row": (canonical + b"extra=authority\n", "row count differs"),
+            "short": (b"\n".join(canonical.split(b"\n")[:-2]) + b"\n", "row count differs"),
+            "reordered": (
+                ("\n".join([rows[1], rows[0], *rows[2:]]) + "\n").encode("ascii"),
+                "row 1 differs",
             ),
-            marker.replace(
-                f"preservation-floor={anchor.TERMINAL_POLICY_V2_PRESERVATION_FLOOR}".encode(),
-                f"preservation-floor={'4' * 40}".encode(),
-            ),
-            marker.rstrip(b"\n"),
-            marker + b"extra=authority\n",
-        )
-        for mutation in mutations:
-            with self.subTest(mutation=mutation[-48:]), self.assertRaises(
-                anchor.AnchorError
-            ):
-                anchor.parse_terminal_policy_v2_armed(mutation)
+            "duplicate": (("\n".join([*rows[:5], rows[4]]) + "\n").encode("ascii"), "row 6 differs"),
+            "edited-date": (canonical.replace(b"ruled=2026-09-21", b"ruled=2026-09-22"), "row 6 differs"),
+            "edited-w0": (canonical.replace(anchor.TRUST_WP_W0.encode("ascii"), b"0" * 40), "row 4 differs"),
+            "non-ascii": (canonical.replace(b"policy=", "policy=\u00e9".encode("utf-8")), "not ASCII"),
+            "crlf": (canonical.replace(b"\n", b"\r\n"), "row 1 differs"),
+            "empty": (b"", "not newline-terminated"),
+        }
+        for label, (raw, needle) in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(anchor.AnchorError, needle):
+                anchor.parse_terminal_policy_v3(raw)
 
     def test_first_party_url_aliases_are_rejected(self) -> None:
         for value in (
@@ -923,65 +818,111 @@ class StrictShapeTests(unittest.TestCase):
 
 
 class CommittedConstellationTests(unittest.TestCase):
-    def fixture(self, temporary: str) -> Fixture:
-        return make_fixture(Path(temporary))
+    def fixture(self, temporary: str, **options: bool) -> Fixture:
+        return make_fixture(Path(temporary), **options)
 
     def run_checker(
         self,
         fixture: Fixture,
         *arguments: str,
         env: dict[str, str] | None = None,
+        wp_remote_main: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), "--repo-root", str(fixture.root), *arguments],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
+        """Run the real CLI in-process.
+
+        Exactly one thing is replaced: the live ``ls-remote`` of trust-wp's
+        canonical main becomes an ``ls-remote`` of the fixture's local remote
+        (or the sha a test names), and the ruling's W0/B are bound to the
+        fixture's own commits.  Every other read is the real one.
+        """
+        remote = fixture.wp_remote_main() if wp_remote_main is None else wp_remote_main
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            if env is not None:
+                stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+            stack.enter_context(synthetic_v3_policy(fixture))
+            stack.enter_context(
+                mock.patch.object(anchor, "sample_trust_wp_remote_main", return_value=remote)
+            )
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            returncode = anchor.main(["--repo-root", str(fixture.root), *arguments])
+        return subprocess.CompletedProcess(
+            [str(SCRIPT), "--repo-root", str(fixture.root), *arguments],
+            returncode,
+            stdout.getvalue(),
+            stderr.getvalue(),
         )
 
-    def run_terminal_checker_with_remote_witness(
-        self, fixture: Fixture, *arguments: str
-    ) -> tuple[subprocess.CompletedProcess[str], list[object]]:
-        """Exercise the real CLI while replacing only the network witness."""
-        stdout = io.StringIO()
+    def policy(
+        self,
+        fixture: Fixture,
+        revision: str,
+        commits: dict[str, str],
+        remote: str | None = None,
+    ) -> dict[str, object]:
+        """P1/P2/P4 on one revision, with the same single stub as run_checker."""
+        remote = fixture.wp_remote_main() if remote is None else remote
+        with synthetic_v3_policy(fixture), contextlib.redirect_stderr(io.StringIO()):
+            return anchor.validate_trust_wp_policy(fixture.root, revision, commits, remote)
+
+    def policy_with_diagnostic(
+        self, fixture: Fixture, revision: str, commits: dict[str, str]
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
         stderr = io.StringIO()
-        cli_arguments = ["--repo-root", str(fixture.root)]
-        cli_arguments.extend(
-            arguments
-            or (
-                "--print-receipt",
-                "--require-wp-trust-anchor",
-                "--verify-remote",
+        with synthetic_v3_policy(fixture), contextlib.redirect_stderr(stderr):
+            verdict = anchor.validate_trust_wp_policy(
+                fixture.root, revision, commits, fixture.wp_remote_main()
             )
-        )
-        with mock.patch.object(anchor, "verify_remote_main") as verify_remote:
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                returncode = anchor.main(cli_arguments)
-            calls = list(verify_remote.call_args_list)
-        return (
-            subprocess.CompletedProcess(
-                [str(SCRIPT), *cli_arguments],
-                returncode,
-                stdout.getvalue(),
-                stderr.getvalue(),
-            ),
-            calls,
-        )
+        prefix = "DEPENDENCY CONSTELLATION SAME-LOCK RECOVERY "
+        reports = [
+            json.loads(line[len(prefix):])
+            for line in stderr.getvalue().splitlines()
+            if line.startswith(prefix)
+        ]
+        return verdict, reports
+
+    def assert_policy_refuses(
+        self,
+        fixture: Fixture,
+        revision: str,
+        commits: dict[str, str],
+        needle: str,
+        remote: str | None = None,
+    ) -> str:
+        remote = fixture.wp_remote_main() if remote is None else remote
+        with synthetic_v3_policy(fixture), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(anchor.AnchorError) as raised:
+                anchor.validate_trust_wp_policy(fixture.root, revision, commits, remote)
+        message = str(raised.exception)
+        self.assertIn(needle, message)
+        return message
 
     def assert_failure(self, result: subprocess.CompletedProcess[str], needle: str) -> None:
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(needle, result.stderr)
 
-    def test_checked_in_v2_pre_marker_binds_ratified_real_constants(self) -> None:
+    def test_checked_in_v3_marker_binds_ratified_real_constants(self) -> None:
+        self.assertEqual(anchor.TRUST_WP_W0, "e7c353690e1b58a4e830edc9facb0e4396164585")
         self.assertEqual(
-            anchor.TERMINAL_POLICY_V2_W0,
-            "e7c353690e1b58a4e830edc9facb0e4396164585",
+            anchor.TRUST_WP_PRESERVATION_FLOOR, "1de995e192aabec74646d4d53642df05fa59466f"
         )
+        checked_in = (REPO_ROOT / anchor.TERMINAL_POLICY_V3_MARKER_PATH).read_bytes()
+        self.assertEqual(checked_in, anchor.TERMINAL_POLICY_V3_MARKER)
+        anchor.parse_terminal_policy_v3(checked_in)
         self.assertEqual(
-            anchor.TERMINAL_POLICY_V2_PRESERVATION_FLOOR,
-            "1de995e192aabec74646d4d53642df05fa59466f",
+            checked_in.decode("ascii").split("\n")[:3],
+            [
+                "trust.constellation.terminal-policy.v3",
+                "policy=trust-wp-cohort-forward",
+                "supersedes=trust-wp-root-cycle-forward",
+            ],
+        )
+        self.assertTrue(checked_in.endswith(b"ruled=2026-09-21\n"))
+        # The v1 and v2 markers are untouched history.
+        self.assertEqual(
+            (REPO_ROOT / anchor.TERMINAL_POLICY_MARKER_PATH).read_bytes(),
+            anchor.TERMINAL_POLICY_MARKER,
         )
         self.assertEqual(
             (REPO_ROOT / anchor.TERMINAL_POLICY_V2_MARKER_PATH).read_bytes(),
@@ -1758,19 +1699,17 @@ class CommittedConstellationTests(unittest.TestCase):
 
                 root_terminal = commit_all(fixture.root, f"bind {dependency} terminal")
                 generated = self.run_checker(fixture, "--print-receipt")
-                if dependency == "trust-wp":
-                    # Any freshly committed WP-gitlink advance is a terminal
-                    # claim until the exact W1/R1 validator proves otherwise.
-                    self.assert_failure(
-                        generated, "external/untracked in terminal TrustWP anchor mode"
-                    )
-                    continue
+                # A freshly committed WP-gitlink advance whose
+                # spikes/DEPENDS.lock is unchanged and whose new commit
+                # descends from the old one is an ORDINARY pin advance, judged
+                # exactly like the Clean one (2026-09-12).  Only a
+                # binding-changing or non-forward move is a terminal claim.
                 self.assertEqual(generated.returncode, 0, generated.stderr)
                 receipt = json.loads(generated.stdout)
                 self.assertEqual(receipt["schema"], anchor.EXTERNAL_SCHEMA)
                 self.assertEqual(receipt["self"]["commit"], root_terminal)
                 self.assertEqual(receipt["repositories"][dependency]["commit"], terminal)
-                self.assertIsNone(receipt["wp_trust_anchor"])
+                self.assertNotIn("wp_trust_anchor", receipt)
 
     def test_external_receipt_refuses_dirty_or_untracked_worktree(self) -> None:
         for mutation in ("tracked", "untracked"):
@@ -1846,735 +1785,6 @@ class CommittedConstellationTests(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text())["schema"], anchor.EXTERNAL_SCHEMA)
             self.assertEqual(git(fixture.root, "status", "--short"), "")
 
-    def test_checked_in_policy_marker_keeps_real_wp0_preterminal(self) -> None:
-        root_commit = git(REPO_ROOT, "rev-parse", "HEAD")
-        submodules = anchor.committed_submodules(REPO_ROOT, root_commit)
-        commits = {
-            name: commit for name, (_path, _url, commit) in submodules.items()
-        }
-        # Permanent regression for the merge that exposed the first-parent
-        # bug: the unmarked parent is first and carries an older WP binding;
-        # the marked second parent and merge result carry the active binding.
-        propagation = "3c2c11e530bb5e0253f8a412f4a0892528915091"
-        parents = git(REPO_ROOT, "show", "-s", "--format=%P", propagation).split()
-        self.assertEqual(
-            parents,
-            [
-                "0e831c4100ca2fc54c40ca77877af74a2e9b4cdd",
-                "7f67d33f2207838198b6d1b903f204cdf0fa24b6",
-            ],
-        )
-        self.assertEqual(
-            git(REPO_ROOT, "ls-tree", parents[0], "--", anchor.TERMINAL_POLICY_MARKER_PATH),
-            "",
-        )
-        self.assertEqual(
-            git(REPO_ROOT, "rev-parse", f"{propagation}:{anchor.WP_ROOT_DELTA_PATH}"),
-            git(REPO_ROOT, "rev-parse", f"{parents[1]}:{anchor.WP_ROOT_DELTA_PATH}"),
-        )
-        self.assertNotEqual(
-            git(REPO_ROOT, "rev-parse", f"{propagation}:{anchor.WP_ROOT_DELTA_PATH}"),
-            git(REPO_ROOT, "rev-parse", f"{parents[0]}:{anchor.WP_ROOT_DELTA_PATH}"),
-        )
-        inactive_path = [
-            "0e831c4100ca2fc54c40ca77877af74a2e9b4cdd",
-            "600cfafd1a83f33e5d19f10d31f1324b43f25581",
-            "f2d4a3ceb2a6406f03f0af6d7130dc6e0314935e",
-            "e612f2a9a092cd805e618cfde4f3c14aff3d847b",
-            "8da804d258cbde972b91891660be0311cd572a4d",
-        ]
-        inactive_wps = [
-            git(REPO_ROOT, "rev-parse", f"{commit}:{anchor.WP_ROOT_DELTA_PATH}")
-            for commit in inactive_path
-        ]
-        self.assertEqual(len(set(inactive_wps)), 1)
-        for child, parent in zip(inactive_path, inactive_path[1:]):
-            self.assertIn(
-                parent,
-                git(REPO_ROOT, "show", "-s", "--format=%P", child).split(),
-            )
-        self.assertFalse(
-            anchor.terminal_wp_policy_claimed(REPO_ROOT, root_commit, commits)
-        )
-
-    def test_v2_exact_forward_cut_and_remote_transition_accepts(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            w0 = fixture.commits["trust-wp"]
-            preservation_floor, predecessor = fixture.advance_wp_v2_predecessor()
-            with synthetic_v2_policy(w0, preservation_floor):
-                cut = fixture.prepare_wp_root_cycle_v2(
-                    preservation_floor, predecessor
-                )
-                r0 = str(cut["r0"])
-                r1 = str(cut["r1"])
-                root_bindings = dict(cut["root_bindings"])
-
-                armed = anchor.terminal_wp_policy_v2_state(
-                    fixture.root, r0, root_bindings
-                )
-                self.assertEqual(armed["state"], "Armed")
-                self.assertEqual(armed["r0"], r0)
-
-                terminal = anchor.terminal_wp_policy_v2_state(
-                    fixture.root, r1, fixture.commits
-                )
-                self.assertEqual(terminal["state"], "Terminal")
-                observed = anchor.derive_wp_root_anchor_v2(
-                    fixture.root, r1, fixture.commits, terminal
-                )
-                self.assertEqual(observed["anchor_commit"], r0)
-                self.assertEqual(observed["anchor_gitlink"], w0)
-                self.assertEqual(observed["preservation_floor"], preservation_floor)
-                self.assertEqual(observed["predecessor_commit"], predecessor)
-                self.assertEqual(observed["root_bindings"], root_bindings)
-                self.assertEqual(
-                    anchor.validate_wp_root_anchor(observed), observed
-                )
-
-                exclusions = fixture.receipt["exclusions"]
-                assert isinstance(exclusions, list)
-                with mock.patch.object(anchor, "verify_one_remote_main") as remote:
-                    receipt = anchor.derive_receipt(
-                        fixture.root,
-                        r1,
-                        exclusions,
-                        external_evidence=False,
-                        prospective_root_old=r0,
-                    )
-                self.assertEqual(receipt["wp_trust_anchor"], observed)
-                self.assertIn(
-                    mock.call("trust", anchor.ROOT_URL, r0),
-                    remote.call_args_list,
-                )
-                self.assertIn(
-                    mock.call(
-                        "trust-wp",
-                        anchor.SUBMODULES["trust-wp"][1],
-                        str(cut["w1"]),
-                    ),
-                    remote.call_args_list,
-                )
-
-                with mock.patch.object(anchor, "verify_one_remote_main") as post_remote:
-                    anchor.verify_terminal_policy_v2_remote_main(
-                        fixture.root,
-                        terminal,
-                        fixture.commits,
-                        root_commit=r1,
-                        prospective_root_old=None,
-                    )
-                self.assertIn(
-                    mock.call("trust", anchor.ROOT_URL, r1),
-                    post_remote.call_args_list,
-                )
-                with (
-                    mock.patch.object(anchor, "verify_one_remote_main"),
-                    self.assertRaisesRegex(
-                        anchor.AnchorError,
-                        "advertised old Trust remote main differs",
-                    ),
-                ):
-                    anchor.verify_terminal_policy_v2_remote_main(
-                        fixture.root,
-                        terminal,
-                        fixture.commits,
-                        root_commit=r1,
-                        prospective_root_old=str(cut["pre"]),
-                    )
-
-                push_env = {
-                    anchor.PUSH_REFS_ENV: (
-                        f"refs/heads/local {r1} refs/heads/main {r0}"
-                    )
-                }
-                with mock.patch.dict(os.environ, push_env, clear=False):
-                    self.assertEqual(anchor.pushed_main_old_for_source(r1), r0)
-
-    def test_v2_main_push_authenticates_old_state_and_refuses_rollback(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            w0 = fixture.commits["trust-wp"]
-            preservation_floor, predecessor = fixture.advance_wp_v2_predecessor()
-            with synthetic_v2_policy(w0, preservation_floor):
-                cut = fixture.prepare_wp_root_cycle_v2(
-                    preservation_floor, predecessor
-                )
-                r1 = str(cut["r1"])
-                pre = str(cut["pre"])
-                unmarked = git(fixture.root, "rev-parse", f"{pre}^")
-                inactive_commits = {
-                    name: commit
-                    for name, (_path, _url, commit) in anchor.committed_submodules(
-                        fixture.root, unmarked
-                    ).items()
-                }
-                inactive = anchor.terminal_wp_policy_v2_state(
-                    fixture.root, unmarked, inactive_commits
-                )
-                with (
-                    mock.patch.object(anchor, "verify_one_remote_main") as remote,
-                    self.assertRaisesRegex(anchor.AnchorError, "may not downgrade"),
-                ):
-                    anchor.authenticate_terminal_policy_v2_main_transition(
-                        fixture.root, unmarked, inactive, r1
-                    )
-                remote.assert_called_once_with("trust", anchor.ROOT_URL, r1)
-
-                stdout = io.StringIO()
-                stderr = io.StringIO()
-                push_env = {
-                    anchor.PUSH_REFS_ENV: (
-                        f"refs/heads/local {unmarked} refs/heads/main {r1}"
-                    )
-                }
-                with (
-                    mock.patch.dict(os.environ, push_env, clear=False),
-                    mock.patch.object(anchor, "verify_one_remote_main"),
-                    contextlib.redirect_stdout(stdout),
-                    contextlib.redirect_stderr(stderr),
-                ):
-                    returncode = anchor.main(
-                        [
-                            "--repo-root",
-                            str(fixture.root),
-                            "--push-context",
-                            "--derive-when-receipt-absent",
-                        ]
-                    )
-                self.assertNotEqual(returncode, 0, stdout.getvalue())
-                self.assertIn("may not downgrade", stderr.getvalue())
-
-                terminal = anchor.terminal_wp_policy_v2_state(
-                    fixture.root, r1, fixture.commits
-                )
-                with (
-                    mock.patch.object(
-                        anchor,
-                        "verify_one_remote_main",
-                        side_effect=anchor.AnchorError("remote main raced"),
-                    ),
-                    self.assertRaisesRegex(anchor.AnchorError, "remote main raced"),
-                ):
-                    anchor.authenticate_terminal_policy_v2_main_transition(
-                        fixture.root, r1, terminal, r1
-                    )
-
-    def test_v2_main_push_refuses_marker_reintroduction_lineage(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            w0 = fixture.commits["trust-wp"]
-            preservation_floor, predecessor = fixture.advance_wp_v2_predecessor()
-            with synthetic_v2_policy(w0, preservation_floor):
-                cut = fixture.prepare_wp_root_cycle_v2(
-                    preservation_floor, predecessor
-                )
-                pre = str(cut["pre"])
-                unmarked = git(fixture.root, "rev-parse", f"{pre}^")
-                marker = write_blob(
-                    fixture.root, anchor.TERMINAL_POLICY_V2_PRE_MARKER
-                )
-                replacement_tree = derived_tree(
-                    fixture.root,
-                    unmarked,
-                    {anchor.TERMINAL_POLICY_V2_MARKER_PATH: ("100644", marker)},
-                )
-                replacement = commit_tree(
-                    fixture.root,
-                    replacement_tree,
-                    [unmarked],
-                    "re-add v2 marker on replacement lineage",
-                )
-                replacement_commits = {
-                    name: commit
-                    for name, (_path, _url, commit) in anchor.committed_submodules(
-                        fixture.root, replacement
-                    ).items()
-                }
-                replacement_state = anchor.terminal_wp_policy_v2_state(
-                    fixture.root, replacement, replacement_commits
-                )
-                with (
-                    mock.patch.object(anchor, "verify_one_remote_main"),
-                    self.assertRaisesRegex(anchor.AnchorError, "replace, or re-add"),
-                ):
-                    anchor.authenticate_terminal_policy_v2_main_transition(
-                        fixture.root, replacement, replacement_state, pre
-                    )
-
-    def test_v2_terminal_receipt_mutation_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            w0 = fixture.commits["trust-wp"]
-            preservation_floor, predecessor = fixture.advance_wp_v2_predecessor()
-            with synthetic_v2_policy(w0, preservation_floor):
-                cut = fixture.prepare_wp_root_cycle_v2(
-                    preservation_floor, predecessor
-                )
-                exclusions = fixture.receipt["exclusions"]
-                assert isinstance(exclusions, list)
-                with mock.patch.object(anchor, "verify_one_remote_main"):
-                    receipt = anchor.derive_receipt(
-                        fixture.root,
-                        str(cut["r1"]),
-                        exclusions,
-                        external_evidence=False,
-                        prospective_root_old=str(cut["r0"]),
-                    )
-                mutated = json.loads(json.dumps(receipt))
-                mutated["wp_trust_anchor"]["root_bindings"]["ay"] = "f" * 40
-                with self.assertRaisesRegex(
-                    anchor.AnchorError, "armed R0 vector differs"
-                ):
-                    anchor.validate_external_receipt(mutated)
-
-    def test_v2_terminal_rechecks_no_prior_v1_move_at_r0(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            w0 = fixture.commits["trust-wp"]
-            preservation_floor, predecessor = fixture.advance_wp_v2_predecessor()
-            with synthetic_v2_policy(w0, preservation_floor):
-                base = git(fixture.root, "rev-parse", "HEAD")
-                moved_tree = derived_tree(
-                    fixture.root,
-                    base,
-                    {anchor.WP_ROOT_DELTA_PATH: ("160000", preservation_floor)},
-                )
-                moved = commit_tree(
-                    fixture.root, moved_tree, [base], "pre-v2 illicit W0 to X"
-                )
-                reverted_tree = derived_tree(
-                    fixture.root,
-                    moved,
-                    {anchor.WP_ROOT_DELTA_PATH: ("160000", w0)},
-                )
-                reverted = commit_tree(
-                    fixture.root, reverted_tree, [moved], "pre-v2 illicit X to W0"
-                )
-                git(fixture.root, "update-ref", "HEAD", reverted)
-                cut = fixture.prepare_wp_root_cycle_v2(
-                    preservation_floor, predecessor
-                )
-                with self.assertRaisesRegex(
-                    anchor.AnchorError, "moved and later returned|prior v1"
-                ):
-                    anchor.terminal_wp_policy_v2_state(
-                        fixture.root, str(cut["r1"]), fixture.commits
-                    )
-
-    def test_v2_every_r0_vector_member_is_policy_bound(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            w0 = fixture.commits["trust-wp"]
-            preservation_floor, predecessor = fixture.advance_wp_v2_predecessor()
-            with synthetic_v2_policy(w0, preservation_floor):
-                cut = fixture.prepare_wp_root_cycle_v2(
-                    preservation_floor, predecessor
-                )
-                pre = str(cut["pre"])
-                correct = dict(cut["root_bindings"])
-                canonical = anchor.render_terminal_policy_v2_armed(
-                    predecessor, correct
-                )
-                wrong_sha = "f" * 40
-                for repository in sorted(anchor.SUBMODULES):
-                    with self.subTest(repository=repository):
-                        if repository == "trust-wp":
-                            wrong_marker = canonical.replace(
-                                f"root.{repository}={correct[repository]}".encode(),
-                                f"root.{repository}={wrong_sha}".encode(),
-                            )
-                        else:
-                            wrong = dict(correct)
-                            wrong[repository] = wrong_sha
-                            wrong_marker = anchor.render_terminal_policy_v2_armed(
-                                predecessor, wrong
-                            )
-                        marker_blob = write_blob(fixture.root, wrong_marker)
-                        candidate_tree = derived_tree(
-                            fixture.root,
-                            pre,
-                            {
-                                anchor.RECEIPT_PATH: None,
-                                anchor.TERMINAL_POLICY_V2_MARKER_PATH: (
-                                    "100644",
-                                    marker_blob,
-                                ),
-                            },
-                        )
-                        candidate = commit_tree(
-                            fixture.root,
-                            candidate_tree,
-                            [pre],
-                            f"wrong armed {repository} binding",
-                        )
-                        with self.assertRaises(anchor.AnchorError):
-                            anchor.terminal_wp_policy_v2_state(
-                                fixture.root, candidate, correct
-                            )
-
-    def test_v2_rejects_intermediate_second_merge_and_non_direct_w1(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            w0 = fixture.commits["trust-wp"]
-            preservation_floor, predecessor = fixture.advance_wp_v2_predecessor()
-            with synthetic_v2_policy(w0, preservation_floor):
-                cut = fixture.prepare_wp_root_cycle_v2(
-                    preservation_floor, predecessor
-                )
-                r0 = str(cut["r0"])
-                r1 = str(cut["r1"])
-                pre = str(cut["pre"])
-                r0_tree = git(fixture.root, "rev-parse", f"{r0}^{{tree}}")
-                r1_tree = git(fixture.root, "rev-parse", f"{r1}^{{tree}}")
-
-                intermediate = commit_tree(
-                    fixture.root, r0_tree, [r0], "forbidden commit between R0 and R1"
-                )
-                delayed_r1 = commit_tree(
-                    fixture.root, r1_tree, [intermediate], "delayed R1"
-                )
-                second_cut = commit_tree(
-                    fixture.root, r1_tree, [r1], "forbidden R2 second cut"
-                )
-                merge_r1 = commit_tree(
-                    fixture.root, r1_tree, [r0, pre], "forbidden merge R1"
-                )
-                for name, candidate in (
-                    ("intermediate", delayed_r1),
-                    ("second-cut", second_cut),
-                    ("merge", merge_r1),
-                ):
-                    with self.subTest(name=name), self.assertRaises(anchor.AnchorError):
-                        anchor.terminal_wp_policy_v2_state(
-                            fixture.root, candidate, fixture.commits
-                        )
-
-                wp = fixture.checkout("trust-wp")
-                extra_blob = write_blob(wp, b"unauthorized intermediate source\n")
-                q_tree = derived_tree(
-                    wp,
-                    predecessor,
-                    {"illicit-intermediate.txt": ("100644", extra_blob)},
-                )
-                q = commit_tree(wp, q_tree, [predecessor], "P to illicit Q")
-                baseline_w1_tree = git(
-                    wp, "rev-parse", f"{cut['w1']}^{{tree}}"
-                )
-                q_revert = commit_tree(
-                    wp,
-                    git(wp, "rev-parse", f"{predecessor}^{{tree}}"),
-                    [q],
-                    "revert illicit Q tree",
-                )
-                variants = {
-                    "P-Q-W1": commit_tree(
-                        wp, baseline_w1_tree, [q], "W1 after illicit Q"
-                    ),
-                    "move-revert": commit_tree(
-                        wp, baseline_w1_tree, [q_revert], "W1 after Q revert"
-                    ),
-                    "merge-W1": commit_tree(
-                        wp, baseline_w1_tree, [predecessor, q], "merged W1"
-                    ),
-                }
-                for name, bad_w1 in variants.items():
-                    with self.subTest(name=name):
-                        bad_tree = derived_tree(
-                            fixture.root,
-                            r0,
-                            {anchor.WP_ROOT_DELTA_PATH: ("160000", bad_w1)},
-                        )
-                        bad_r1 = commit_tree(
-                            fixture.root, bad_tree, [r0], f"R1 with {name}"
-                        )
-                        bad_commits = dict(fixture.commits)
-                        bad_commits["trust-wp"] = bad_w1
-                        state = anchor.terminal_wp_policy_v2_state(
-                            fixture.root, bad_r1, bad_commits
-                        )
-                        with self.assertRaisesRegex(
-                            anchor.AnchorError, "exact raw sole parent P"
-                        ):
-                            anchor.derive_wp_root_anchor_v2(
-                                fixture.root, bad_r1, bad_commits, state
-                            )
-
-    def test_v2_marker_lifecycle_and_floor_ancestry_fail_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            w0 = fixture.commits["trust-wp"]
-            preservation_floor, predecessor = fixture.advance_wp_v2_predecessor()
-            with synthetic_v2_policy(w0, preservation_floor):
-                cut = fixture.prepare_wp_root_cycle_v2(
-                    preservation_floor, predecessor
-                )
-                pre = str(cut["pre"])
-                r0 = str(cut["r0"])
-                pre_parent = git(fixture.root, "show", "-s", "--format=%P", pre)
-
-                deleted_tree = derived_tree(
-                    fixture.root,
-                    pre,
-                    {anchor.TERMINAL_POLICY_V2_MARKER_PATH: None},
-                )
-                deleted = commit_tree(
-                    fixture.root, deleted_tree, [pre], "delete v2 marker"
-                )
-                with self.assertRaisesRegex(anchor.AnchorError, "marker was deleted"):
-                    anchor.terminal_wp_policy_v2_state(
-                        fixture.root, deleted, dict(cut["root_bindings"])
-                    )
-
-                marker_blob = write_blob(
-                    fixture.root, anchor.TERMINAL_POLICY_V2_PRE_MARKER
-                )
-                symlink_tree = derived_tree(
-                    fixture.root,
-                    pre_parent,
-                    {
-                        anchor.TERMINAL_POLICY_V2_MARKER_PATH: (
-                            "120000",
-                            marker_blob,
-                        )
-                    },
-                )
-                symlink = commit_tree(
-                    fixture.root, symlink_tree, [pre_parent], "symlink v2 marker"
-                )
-                with self.assertRaisesRegex(anchor.AnchorError, "mode 100644"):
-                    anchor.terminal_wp_policy_v2_state(
-                        fixture.root, symlink, dict(cut["root_bindings"])
-                    )
-
-                wrong_predecessor = w0
-                changed_marker = write_blob(
-                    fixture.root,
-                    anchor.render_terminal_policy_v2_armed(
-                        wrong_predecessor, dict(cut["root_bindings"])
-                    ),
-                )
-                changed_tree = derived_tree(
-                    fixture.root,
-                    r0,
-                    {
-                        anchor.TERMINAL_POLICY_V2_MARKER_PATH: (
-                            "100644",
-                            changed_marker,
-                        )
-                    },
-                )
-                changed = commit_tree(
-                    fixture.root, changed_tree, [r0], "change armed v2 marker"
-                )
-                with self.assertRaises(anchor.AnchorError):
-                    anchor.terminal_wp_policy_v2_state(
-                        fixture.root, changed, dict(cut["root_bindings"])
-                    )
-
-                bad_r0_tree = derived_tree(
-                    fixture.root,
-                    pre,
-                    {
-                        anchor.RECEIPT_PATH: None,
-                        anchor.TERMINAL_POLICY_V2_MARKER_PATH: (
-                            "100644",
-                            changed_marker,
-                        ),
-                    },
-                )
-                bad_r0 = commit_tree(
-                    fixture.root, bad_r0_tree, [pre], "P predates preserved B"
-                )
-                with self.assertRaisesRegex(
-                    anchor.AnchorError, "does not preserve published floor B"
-                ):
-                    anchor.terminal_wp_policy_v2_state(
-                        fixture.root, bad_r0, dict(cut["root_bindings"])
-                    )
-
-    def test_v2_rejects_replacement_graft_shallow_and_alternate_authority(self) -> None:
-        for mechanism in ("replacement", "graft", "shallow", "alternates"):
-            with self.subTest(mechanism=mechanism), tempfile.TemporaryDirectory() as temporary:
-                fixture = self.fixture(temporary)
-                w0 = fixture.commits["trust-wp"]
-                preservation_floor, predecessor = fixture.advance_wp_v2_predecessor()
-                with synthetic_v2_policy(w0, preservation_floor):
-                    cut = fixture.prepare_wp_root_cycle_v2(
-                        preservation_floor, predecessor
-                    )
-                    r0 = str(cut["r0"])
-                    r1 = str(cut["r1"])
-                    if mechanism == "replacement":
-                        git(fixture.root, "replace", r1, r0)
-                        message = "forbidden replacement refs"
-                    elif mechanism == "graft":
-                        common_dir = Path(
-                            git(
-                                fixture.root,
-                                "rev-parse",
-                                "--path-format=absolute",
-                                "--git-common-dir",
-                            )
-                        )
-                        write(common_dir / "info" / "grafts", f"{r1} {r0}\n")
-                        message = "forbidden legacy graft authority"
-                    elif mechanism == "shallow":
-                        shallow = Path(
-                            git(
-                                fixture.root,
-                                "rev-parse",
-                                "--path-format=absolute",
-                                "--git-path",
-                                "shallow",
-                            )
-                        )
-                        write(shallow, f"{r1}\n")
-                        message = "is shallow"
-                    else:
-                        common_dir = Path(
-                            git(
-                                fixture.root,
-                                "rev-parse",
-                                "--path-format=absolute",
-                                "--git-common-dir",
-                            )
-                        )
-                        alternates = common_dir / "objects" / "info" / "alternates"
-                        wp_objects = Path(
-                            git(
-                                fixture.checkout("trust-wp"),
-                                "rev-parse",
-                                "--path-format=absolute",
-                                "--git-path",
-                                "objects",
-                            )
-                        )
-                        write(alternates, f"{wp_objects}\n")
-                        message = "forbidden repository-local alternate object authority"
-                    with self.assertRaisesRegex(anchor.AnchorError, message):
-                        anchor.terminal_wp_policy_v2_state(
-                            fixture.root, r1, fixture.commits
-                        )
-
-    def test_v2_partial_clone_never_lazy_fetches_marker_authority(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            fixture = self.fixture(str(base / "fixture"))
-            w0 = fixture.commits["trust-wp"]
-            preservation_floor, predecessor = fixture.advance_wp_v2_predecessor()
-            with synthetic_v2_policy(w0, preservation_floor):
-                cut = fixture.prepare_wp_root_cycle_v2(
-                    preservation_floor, predecessor
-                )
-                pre = str(cut["pre"])
-                git(fixture.root, "update-ref", "refs/heads/v2-pre", pre)
-                marker_oid = git(
-                    fixture.root,
-                    "rev-parse",
-                    f"{pre}:{anchor.TERMINAL_POLICY_V2_MARKER_PATH}",
-                )
-
-                remote = base / "authority.git"
-                subprocess.run(
-                    ["git", "clone", "--bare", "-q", str(fixture.root), str(remote)],
-                    check=True,
-                )
-                git(remote, "config", "uploadpack.allowFilter", "true")
-                git(remote, "config", "uploadpack.allowAnySHA1InWant", "true")
-                partial = base / "partial"
-                subprocess.run(
-                    [
-                        "git",
-                        "clone",
-                        "--no-checkout",
-                        "--filter=blob:none",
-                        "--branch",
-                        "v2-pre",
-                        "-q",
-                        remote.resolve().as_uri(),
-                        str(partial),
-                    ],
-                    check=True,
-                )
-                before = missing_objects_without_lazy_fetch(partial)
-                self.assertIn(marker_oid, before)
-
-                sentinel = base / "upload-pack-invoked"
-                upload_pack = base / "recording-upload-pack"
-                write(
-                    upload_pack,
-                    "#!/bin/sh\n"
-                    ': > "$GIT_UPLOAD_PACK_SENTINEL"\n'
-                    'exec git-upload-pack "$@"\n',
-                )
-                upload_pack.chmod(0o755)
-                git(partial, "config", "remote.origin.uploadpack", str(upload_pack))
-                with mock.patch.dict(
-                    os.environ,
-                    {"GIT_UPLOAD_PACK_SENTINEL": str(sentinel)},
-                    clear=False,
-                ):
-                    with self.assertRaisesRegex(
-                        anchor.AnchorError,
-                        rf"marker object {marker_oid} is missing",
-                    ):
-                        anchor.terminal_wp_policy_v2_state(
-                            partial, pre, dict(cut["root_bindings"])
-                        )
-                self.assertFalse(sentinel.exists())
-                self.assertEqual(missing_objects_without_lazy_fetch(partial), before)
-
-    def test_checked_in_policy_marker_accepts_the_real_rebased_branch_landing(
-        self,
-    ) -> None:
-        """Permanent regression for the merge that blocked every push.
-
-        b387a4c0e5 brought in e42bba0a61, whose unmarked parent 2abd0cffd6 is
-        itself a merge of a feature branch that was BEHIND on the TrustWP pin
-        with an origin/main that had already advanced it.  The per-edge rule
-        read that adoption as a side-branch move and refused the repository;
-        the per-commit rule reads it as what it is -- a binding main had
-        already published.  Nothing on that lineage reached the marked line.
-        """
-        root_commit = git(REPO_ROOT, "rev-parse", "HEAD")
-        submodules = anchor.committed_submodules(REPO_ROOT, root_commit)
-        commits = {
-            name: commit for name, (_path, _url, commit) in submodules.items()
-        }
-        landing = "e42bba0a61bbd72d97ebf9e27205bb0c58febb15"
-        inactive = "2abd0cffd6387a5ed1355c79dd2eb7fc3514fc84"
-        main_side = "47eadec422fc895f4470425defd5785c1cf8a47f"
-        branch_side = "b7d204a8703ed8c897df060a6c9a4c2f81aded04"
-
-        landing_parents = git(REPO_ROOT, "show", "-s", "--format=%P", landing).split()
-        self.assertEqual(
-            landing_parents,
-            [inactive, "7341ad628363ae4e77049359d73a018c1fcae702"],
-        )
-        self.assertEqual(
-            git(REPO_ROOT, "ls-tree", inactive, "--", anchor.TERMINAL_POLICY_MARKER_PATH),
-            "",
-        )
-        self.assertEqual(
-            git(REPO_ROOT, "show", "-s", "--format=%P", inactive).split(),
-            [main_side, branch_side],
-        )
-
-        def wp(commit: str) -> str:
-            return git(REPO_ROOT, "rev-parse", f"{commit}:{anchor.WP_ROOT_DELTA_PATH}")
-
-        # The edge the old rule refused really does change the binding ...
-        self.assertNotEqual(wp(inactive), wp(branch_side))
-        # ... and the value it lands on is exactly the one main had published.
-        self.assertEqual(wp(inactive), wp(main_side))
-        # The marked line keeps its own binding across the landing.
-        self.assertEqual(wp(landing), wp(landing_parents[1]))
-        self.assertNotEqual(wp(landing), wp(inactive))
-        self.assertFalse(
-            anchor.terminal_wp_policy_claimed(REPO_ROOT, root_commit, commits)
-        )
-
     def test_terminal_policy_marker_lifecycle_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
@@ -2606,7 +1816,817 @@ class CommittedConstellationTests(unittest.TestCase):
                 malformed = self.run_checker(fixture, "--print-receipt")
                 self.assert_failure(malformed, expected)
 
-    def test_terminal_policy_accepts_stale_first_parent_and_repeated_propagation(self) -> None:
+    # ------------------------------------------------------------------
+    # P4: the v3 marker, and the v2 marker as history.
+    # ------------------------------------------------------------------
+
+    def test_v3_marker_lifecycle_fails_closed(self) -> None:
+        # Absent everywhere in history: refused with the fix; landing it on the
+        # same tree is what turns the lane green (the real landing order).
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary, v3_marker=False)
+            missing = self.run_checker(fixture, "--print-receipt")
+            self.assert_failure(
+                missing,
+                "terminal-policy v3 marker '.trust-terminal-policy-v3' is missing at the "
+                "judged revision",
+            )
+            self.assertIn("--rev origin/main", missing.stderr)
+            self.assertIn("must merge main first", missing.stderr)
+            (fixture.root / anchor.TERMINAL_POLICY_V3_MARKER_PATH).write_bytes(
+                anchor.render_terminal_policy_v3_marker(fixture.wp_w0, fixture.wp_floor)
+            )
+            commit_all(fixture.root, "declare terminal-policy v3")
+            landed = self.run_checker(fixture, "--print-receipt")
+            self.assertEqual(landed.returncode, 0, landed.stderr)
+            self.assertNotIn("wp_trust_anchor", json.loads(landed.stdout))
+
+        # Forged or malformed at the judged revision: the row or the mode.
+        for mutation, expected in (
+            ("row", "terminal-policy v3 marker row 6 differs from canonical"),
+            ("uppercase", "terminal-policy v3 marker row 1 differs from canonical"),
+            ("truncated", "terminal-policy v3 marker is not newline-terminated"),
+            ("mode", "v3 marker must be a non-executable regular blob (mode 100644)"),
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                fixture = self.fixture(temporary)
+                marker = fixture.root / anchor.TERMINAL_POLICY_V3_MARKER_PATH
+                canonical = marker.read_bytes()
+                if mutation == "row":
+                    marker.write_bytes(canonical.replace(b"ruled=2026-09-21", b"ruled=2026-09-22"))
+                elif mutation == "uppercase":
+                    marker.write_bytes(canonical.upper())
+                elif mutation == "truncated":
+                    marker.write_bytes(canonical[:-1])
+                else:
+                    marker.chmod(0o755)
+                commit_all(fixture.root, f"malform v3 marker {mutation}")
+                self.assert_failure(self.run_checker(fixture, "--print-receipt"), expected)
+
+        # Deleted on a raw DAG edge, and re-adding it does not launder that.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            marker = fixture.root / anchor.TERMINAL_POLICY_V3_MARKER_PATH
+            canonical = marker.read_bytes()
+            marker.unlink()
+            commit_all(fixture.root, "illicit v3 marker deletion")
+            self.assert_failure(
+                self.run_checker(fixture, "--print-receipt"),
+                "terminal-policy v3 marker '.trust-terminal-policy-v3' is missing",
+            )
+            marker.write_bytes(canonical)
+            commit_all(fixture.root, "illicit v3 marker reintroduction")
+            self.assert_failure(
+                self.run_checker(fixture, "--print-receipt"),
+                "v3 marker was deleted on a raw DAG edge",
+            )
+
+        # Edited in an ancestor and restored later: still refused.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            marker = fixture.root / anchor.TERMINAL_POLICY_V3_MARKER_PATH
+            canonical = marker.read_bytes()
+            marker.write_bytes(canonical.replace(b"cohort-forward", b"cohort-backward"))
+            commit_all(fixture.root, "edit the v3 marker")
+            marker.write_bytes(canonical)
+            commit_all(fixture.root, "restore the v3 marker")
+            self.assert_failure(
+                self.run_checker(fixture, "--print-receipt"),
+                "v3 raw DAG contains a forged or edited marker",
+            )
+
+    def test_armed_or_edited_v2_marker_is_refused_outright(self) -> None:
+        def armed_bytes(fixture: Fixture) -> bytes:
+            return (
+                b"trust.constellation.terminal-policy.v2\nstate=armed\n"
+                b"policy=trust-wp-root-cycle-forward\n"
+                + f"w0={fixture.wp_w0}\npreservation-floor={fixture.wp_floor}\n"
+                f"predecessor={fixture.wp_floor}\n".encode("ascii")
+                + b"".join(
+                    f"root.{name}={sha}\n".encode("ascii")
+                    for name, sha in sorted(fixture.commits.items())
+                )
+            )
+
+        # The fixture carries the historical pre-v2 bytes from its first commit,
+        # as real main does since 80a5ca7f00f; that is the one green shape.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            self.assertEqual(
+                (fixture.root / anchor.TERMINAL_POLICY_V2_MARKER_PATH).read_bytes(),
+                anchor.TERMINAL_POLICY_V2_PRE_MARKER,
+            )
+            carried = self.run_checker(fixture, "--print-receipt")
+            self.assertEqual(carried.returncode, 0, carried.stderr)
+
+        for mutation in (
+            "armed", "armed-in-ancestor", "edited", "executable", "deleted", "deleted-then-readded",
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                fixture = self.fixture(temporary)
+                marker = fixture.root / anchor.TERMINAL_POLICY_V2_MARKER_PATH
+                if mutation in {"armed", "armed-in-ancestor"}:
+                    marker.write_bytes(armed_bytes(fixture))
+                elif mutation == "edited":
+                    marker.write_bytes(
+                        anchor.TERMINAL_POLICY_V2_PRE_MARKER.replace(
+                            b"e7c353690e1b58a4e830edc9facb0e4396164585", b"0" * 40
+                        )
+                    )
+                elif mutation == "executable":
+                    marker.chmod(0o755)
+                else:
+                    marker.unlink()
+                commit_all(fixture.root, f"v2 marker {mutation}")
+                if mutation == "armed-in-ancestor":
+                    marker.write_bytes(anchor.TERMINAL_POLICY_V2_PRE_MARKER)
+                    commit_all(fixture.root, "downgrade the armed v2 marker again")
+                if mutation == "deleted-then-readded":
+                    marker.write_bytes(anchor.TERMINAL_POLICY_V2_PRE_MARKER)
+                    commit_all(fixture.root, "re-add the v2 marker")
+                result = self.run_checker(fixture, "--print-receipt")
+                if mutation in {"armed", "armed-in-ancestor"}:
+                    self.assert_failure(result, "v2 marker at")
+                    self.assertIn("is ARMED", result.stderr)
+                    self.assertIn("refused outright (P4", result.stderr)
+                elif mutation in {"deleted", "deleted-then-readded"}:
+                    self.assert_failure(result, "v2 marker was deleted on a raw DAG edge")
+                    self.assertIn("(P4)", result.stderr)
+                else:
+                    self.assert_failure(result, "is not the historical pre-v2 bytes")
+
+        # The verifier's probe g4: a root commit whose ONLY change deletes the
+        # v2 marker after a pre-v2 one, judged directly.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            assert fixture.policy_activation is not None
+            deleted = root_child(
+                fixture.root, fixture.policy_activation, "delete the v2 marker",
+                {anchor.TERMINAL_POLICY_V2_MARKER_PATH: None},
+            )
+            self.assert_policy_refuses(
+                fixture, deleted, fixture.commits,
+                f"v2 marker was deleted on a raw DAG edge: child={deleted}, "
+                f"marked_parents=['{fixture.policy_activation}']",
+            )
+            readded = root_child(
+                fixture.root, deleted, "re-add the v2 marker",
+                {anchor.TERMINAL_POLICY_V2_MARKER_PATH: (
+                    "100644", write_blob(fixture.root, anchor.TERMINAL_POLICY_V2_PRE_MARKER))},
+            )
+            self.assert_policy_refuses(
+                fixture, readded, fixture.commits, "v2 marker was deleted on a raw DAG edge"
+            )
+
+    # ------------------------------------------------------------------
+    # P1: the preservation floor against the live sample.
+    # ------------------------------------------------------------------
+
+    def test_p1_preservation_floor_is_judged_against_the_live_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            head = git(fixture.root, "rev-parse", "HEAD")
+            wp = fixture.checkout("trust-wp")
+            commits = dict(fixture.commits)
+
+            # B itself, and a main that advanced past B: both contain B.
+            self.policy(fixture, head, commits, remote=fixture.wp_floor)
+            later = wp_child(wp, fixture.wp_floor, "main advances past B")
+            verdict = self.policy(fixture, head, commits, remote=later)
+            self.assertEqual(verdict["wp_remote_main"], later)
+
+            # A main that does not contain B: rewritten published history.
+            self.assert_policy_refuses(
+                fixture, head, commits,
+                "does not contain the preservation floor B", remote=fixture.wp_w0,
+            )
+            orphan = commit_tree(
+                wp, git(wp, "rev-parse", f"{fixture.wp_w0}^{{tree}}"), [], "foreign main"
+            )
+            self.assert_policy_refuses(
+                fixture, head, commits,
+                "does not contain the preservation floor B", remote=orphan,
+            )
+
+            # A main whose object is absent locally AND that the remote will
+            # not serve: the by-sha fetch is tried, then refuse and name the fetch.
+            message = self.assert_policy_refuses(
+                fixture, head, commits,
+                "is not present in the bound first-party/trust-wp object store",
+                remote="f" * 40,
+            )
+            self.assertIn("git -C first-party/trust-wp fetch origin main", message)
+            self.assertIn("a by-sha fetch from", message)
+            self.assertIn("ffffffffffff", message)
+
+            # The same through the CLI, and the sample is taken once per judged
+            # revision -- this is where the lane touches the network.
+            self.assert_failure(
+                self.run_checker(fixture, wp_remote_main=fixture.wp_w0),
+                "does not contain the preservation floor B",
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with synthetic_v3_policy(fixture), mock.patch.object(
+                anchor, "sample_trust_wp_remote_main", return_value=fixture.wp_floor
+            ) as sample:
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = anchor.main(["--repo-root", str(fixture.root)])
+            self.assertEqual(code, 0, stderr.getvalue())
+            sample.assert_called_once_with()
+            self.assertIn(
+                f"trust-wp terminal-policy v3: remote main {fixture.wp_floor[:12]} contains B (P1)",
+                stdout.getvalue(),
+            )
+
+    # ------------------------------------------------------------------
+    # P2: single-parent moves.
+    # ------------------------------------------------------------------
+
+    def test_p2_forward_moves_are_admissible_whatever_the_lock_did(self) -> None:
+        """Clause (a): Y contains X.  The lock is P3's question, not P2's.
+
+        Two successive same-lock forward moves, one sharing its commit with a
+        lockfile (the 2026-09-12 shape); a forward move that REWRITES the lock
+        (admissible under P2, and coherent under P3 because its rows still
+        point behind the pins); and forward moves whose target has no regular
+        lock at all, which P2 admits and P3 then refuses.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            assert fixture.policy_activation is not None
+            root = fixture.root
+            wp = fixture.checkout("trust-wp")
+            w0 = fixture.commits["trust-wp"]
+            lock_oid = git(wp, "rev-parse", f"{w0}:{anchor.WP_DEPENDS_PATH}")
+            retired = retire_receipt(root, fixture.policy_activation)
+            commits = dict(fixture.commits)
+
+            w1 = wp_child(wp, w0, "ordinary forward TrustWP generation",
+                          {"forward-one.txt": ("100644", write_blob(wp, b"ordinary work\n"))})
+            w2 = wp_child(wp, w1, "second ordinary forward TrustWP generation",
+                          {"forward-two.txt": ("100644", write_blob(wp, b"more work\n"))})
+            for candidate in (w1, w2):
+                self.assertEqual(git(wp, "rev-parse", f"{candidate}:{anchor.WP_DEPENDS_PATH}"), lock_oid)
+            first = pin_wp(root, retired, w1, "forward move W0 -> W1")
+            second = pin_wp(
+                root, first, w2, "forward move W1 -> W2 sharing its commit with a lock",
+                {"Cargo.lock": ("100644", write_blob(root, b"version = 4\n"))},
+            )
+            commits["trust-wp"] = w1
+            self.assertEqual(self.policy(fixture, first, commits)["moves"], 1)
+            commits["trust-wp"] = w2
+            self.assertEqual(self.policy(fixture, second, commits)["moves"], 2)
+            explicit = self.run_checker(fixture, "--rev", second, "--derive-when-receipt-absent")
+            self.assertEqual(explicit.returncode, 0, explicit.stderr)
+            self.assertIn("2 gitlink move(s) since v1 activation admissible (P2)", explicit.stdout)
+
+            # A forward move whose lock is rewritten: rows re-bound to the
+            # activation commit and the current sibling pins -- still behind
+            # or at every gitlink, so P3 holds too.
+            rebound = wp_depends_lock(
+                {**fixture.lock_rows(), "trust": fixture.policy_activation,
+                 "clean": fixture.commits["clean"], "trust-cg": fixture.commits["trust-cg"]}
+            ).encode("ascii")
+            relocked = wp_child(wp, w2, "forward move that refreshes the lock",
+                                {anchor.WP_DEPENDS_PATH: ("100644", write_blob(wp, rebound))})
+            self.assertNotEqual(git(wp, "rev-parse", f"{relocked}:{anchor.WP_DEPENDS_PATH}"), lock_oid)
+            third = pin_wp(root, second, relocked, "forward move with a changed lock")
+            commits["trust-wp"] = relocked
+            self.assertEqual(self.policy(fixture, third, commits)["moves"], 3)
+            refreshed = self.run_checker(fixture, "--rev", third, "--derive-when-receipt-absent")
+            self.assertEqual(refreshed.returncode, 0, refreshed.stderr)
+
+            # No regular lock at the target: P2 admits the forward move, P3
+            # refuses the pin.
+            for mutation, entry, needle in (
+                ("deleted", None, "at the pinned TrustWP commit"),
+                ("symlinked", ("120000", write_blob(wp, b"missing-DEPENDS.lock")),
+                 "must be a regular committed blob"),
+            ):
+                with self.subTest(mutation=mutation):
+                    target = wp_child(wp, w2, f"lock {mutation}", {anchor.WP_DEPENDS_PATH: entry})
+                    tip = pin_wp(root, second, target, f"forward move to a {mutation}-lock target")
+                    commits["trust-wp"] = target
+                    self.assertEqual(self.policy(fixture, tip, commits)["moves"], 3)
+                    result = self.run_checker(fixture, "--rev", tip, "--derive-when-receipt-absent")
+                    self.assert_failure(result, needle)
+                    self.assertIn("spikes/DEPENDS.lock", result.stderr)
+
+        # The harness's exact invocation on one real commit that moves the
+        # gitlink TOGETHER with a lockfile, and the receipt it prints.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            root = fixture.root
+            wp = fixture.checkout("trust-wp")
+            w0 = fixture.commits["trust-wp"]
+            (root / anchor.RECEIPT_PATH).unlink()
+            write(root / "Cargo.lock", "version = 4\n")
+            base = commit_all(root, "retire the tracked receipt; track the root lock")
+            write(wp / "forward.txt", "ordinary TrustWP work that leaves the cycle binding alone\n")
+            w1 = commit_all(wp, "ordinary forward TrustWP generation")
+            self.assertEqual(git(wp, "show", "-s", "--format=%P", w1), w0)
+            write(root / "Cargo.lock", 'version = 4\n\n[[package]]\nname = "trust-wp"\nversion = "0.2.0"\n')
+            git(root, "add", anchor.WP_ROOT_DELTA_PATH, "Cargo.lock")
+            git(root, "commit", "-qm", "pins: trust-wp forward; its lock rows follow in the same commit")
+            move = git(root, "rev-parse", "HEAD")
+            fixture.commits["trust-wp"] = w1
+            self.assertEqual(self.policy(fixture, move, fixture.commits)["moves"], 1)
+
+            environment = os.environ.copy()
+            environment[anchor.PUSH_REFS_ENV] = f"refs/heads/main {move} refs/heads/main {base}"
+            lane = self.run_checker(fixture, "--push-context", "--derive-when-receipt-absent", env=environment)
+            self.assertEqual(lane.returncode, 0, lane.stderr)
+            self.assertIn("DEPENDENCY CONSTELLATION OK", lane.stdout)
+            self.assertIn("no committed receipt", lane.stdout)
+            self.assertIn("marker exact (P4)", lane.stdout)
+            generated = self.run_checker(fixture, "--print-receipt")
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            receipt = json.loads(generated.stdout)
+            self.assertNotIn("wp_trust_anchor", receipt)
+            self.assertEqual(receipt["repositories"]["trust-wp"]["commit"], w1)
+
+    def test_p2_non_forward_moves_need_a_canonical_target_or_a_recovery(self) -> None:
+        """Clauses (b) and (c), and the refusal that names X, Y and each clause.
+
+        From a pin on an off-main line: a backward move without restoration, a
+        sideways move whose lock differs, a divergent same-lock target, an
+        unrelated parentless target, and a target without a regular lock are
+        each refused with X, Y and the clause verdicts.  The ``8325008ba62``
+        shape -- sideways onto canonical main with the lock byte-identical --
+        is admissible, and so is a same-lock move back onto the canonical
+        line (W0 is an ancestor of main): backward moves are
+        ``fast.pin-regression``'s business, not this gate's.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            assert fixture.policy_activation is not None
+            root = fixture.root
+            wp = fixture.checkout("trust-wp")
+            w0 = fixture.commits["trust-wp"]
+            lock_oid = git(wp, "rev-parse", f"{w0}:{anchor.WP_DEPENDS_PATH}")
+            lock_bytes = committed_bytes(wp, w0, anchor.WP_DEPENDS_PATH)
+            retired = retire_receipt(root, fixture.policy_activation)
+            commits = dict(fixture.commits)
+
+            side_one = wp_child(wp, w0, "off-main line one")
+            side_two = wp_child(wp, side_one, "off-main line two")
+            relocked = wp_child(
+                wp, w0, "lock blob differs (same rows)",
+                {anchor.WP_DEPENDS_PATH: ("100644", write_blob(wp, b"# refreshed\n" + lock_bytes))},
+            )
+            relocked_oid = git(wp, "rev-parse", f"{relocked}:{anchor.WP_DEPENDS_PATH}")
+            sibling = wp_child(wp, w0, "sibling off main")
+            unrelated = commit_tree(wp, git(wp, "rev-parse", f"{w0}^{{tree}}"), [], "unrelated history")
+            no_lock = wp_child(wp, w0, "no regular lock", {anchor.WP_DEPENDS_PATH: None})
+            self.assertFalse(is_ancestor(wp, side_two, fixture.wp_floor))
+
+            base = pin_wp(root, retired, side_two, "forward move W0 -> side_two")
+            commits["trust-wp"] = side_two
+            self.assertEqual(self.policy(fixture, base, commits)["moves"], 1)
+
+            refusals = (
+                ("backward, no restoration", side_one, (
+                    "(a) not forward: X is not a raw ancestor of Y",
+                    "(b) not a canonical re-anchoring: Y is not an ancestor-or-equal of "
+                    f"trust-wp remote main {fixture.wp_floor}",
+                    "(c) not a recovered same-lock backward move: no immediate single-parent child of",
+                )),
+                ("sideways, differing lock", relocked, (
+                    f"(b) not a canonical re-anchoring: spikes/DEPENDS.lock differs (X={lock_oid}, Y={relocked_oid})",
+                    "(c) not a recovered same-lock backward move: spikes/DEPENDS.lock differs",
+                )),
+                ("divergent, same lock", sibling, (
+                    "(b) not a canonical re-anchoring: Y is not an ancestor-or-equal",
+                    "(c) not a recovered same-lock backward move: Y is not a strict raw ancestor of X",
+                )),
+                ("unrelated parentless", unrelated, (
+                    "(a) not forward",
+                    "(c) not a recovered same-lock backward move: Y is not a strict raw ancestor of X",
+                )),
+                ("no regular lock at the target", no_lock, (
+                    f"spikes/DEPENDS.lock differs (X={lock_oid}, Y=absent-or-non-regular)",
+                )),
+            )
+            for label, target, needles in refusals:
+                with self.subTest(label=label):
+                    tip = pin_wp(root, base, target, f"{label} move")
+                    commits["trust-wp"] = target
+                    message = self.assert_policy_refuses(
+                        fixture, tip, commits,
+                        f"refuses the first-party/trust-wp gitlink move at {tip}: X={side_two} -> Y={target}",
+                    )
+                    for needle in needles:
+                        self.assertIn(needle, message)
+                    self.assertTrue(message.endswith("(P2)"), message)
+                    result = self.run_checker(fixture, "--rev", tip, "--derive-when-receipt-absent")
+                    self.assert_failure(result, f"X={side_two} -> Y={target}")
+
+            # (b): the 8325008ba62 shape.
+            reanchored = pin_wp(root, base, fixture.wp_floor, "re-anchor onto canonical main")
+            commits["trust-wp"] = fixture.wp_floor
+            verdict = self.policy(fixture, reanchored, commits)
+            self.assertEqual((verdict["moves"], verdict["recovered"]), (2, 0))
+            result = self.run_checker(fixture, "--rev", reanchored, "--derive-when-receipt-absent")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("2 gitlink move(s) since v1 activation admissible (P2)", result.stdout)
+
+            # (b) again: back onto the canonical line, same lock -- admissible
+            # here, disclosed by fast.pin-regression.
+            back_on_main = pin_wp(root, base, w0, "back to W0, which main contains")
+            commits["trust-wp"] = w0
+            verdict = self.policy(fixture, back_on_main, commits)
+            self.assertEqual((verdict["moves"], verdict["recovered"]), (2, 0))
+
+            # (b) is stated against the LIVE sample: with a main that has
+            # moved on, the same target stays admissible as long as it is
+            # still on that line.
+            later = wp_child(wp, fixture.wp_floor, "main advances again")
+            commits["trust-wp"] = fixture.wp_floor
+            self.policy(fixture, reanchored, commits, remote=later)
+
+    def same_lock_recovery_fixture(self, temporary: str) -> tuple[Fixture, dict[str, str]]:
+        """W0 -> w1 -> w2 -> w3 on an OFF-main line, so a rollback is not (b)."""
+        fixture = self.fixture(temporary)
+        assert fixture.policy_activation is not None
+        root = fixture.root
+        wp = fixture.checkout("trust-wp")
+        w0 = fixture.commits["trust-wp"]
+        w1 = wp_child(wp, w0, "off-main advance one")
+        w2 = wp_child(wp, w1, "off-main advance two")
+        w3 = wp_child(wp, w2, "off-main advance three")
+        retired = retire_receipt(root, fixture.policy_activation)
+        good = pin_wp(root, retired, w3, "bind the off-main advance")
+        bad = pin_wp(root, good, w1, "accidentally roll WP back")
+        restored = commit_tree(
+            root, git(root, "rev-parse", f"{good}^{{tree}}"), [bad], "restore the exact prior WP pin"
+        )
+        return fixture, dict(w0=w0, w1=w1, w2=w2, w3=w3, good=good, bad=bad, restored=restored)
+
+    def test_p2_same_lock_backward_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture, n = self.same_lock_recovery_fixture(temporary)
+            root = fixture.root
+            wp = fixture.checkout("trust-wp")
+
+            def judge(revision: str, pin: str) -> tuple[dict[str, object], list[dict[str, object]]]:
+                return self.policy_with_diagnostic(
+                    fixture, revision, {**fixture.commits, "trust-wp": pin}
+                )
+
+            verdict, reports = judge(n["good"], n["w3"])
+            self.assertEqual((verdict["moves"], verdict["recovered"], reports), (1, 0, []))
+            self.assert_policy_refuses(
+                fixture, n["bad"], {**fixture.commits, "trust-wp": n["w1"]},
+                "(c) not a recovered same-lock backward move: no immediate single-parent child of",
+            )
+            # The restoration is itself a (forward) move: W0 -> w3, w3 -> w1, w1 -> w3.
+            verdict, reports = judge(n["restored"], n["w3"])
+            self.assertEqual((verdict["moves"], verdict["recovered"]), (3, 1))
+            self.assertEqual(reports, [{
+                "root_commit": n["restored"],
+                "recovered_edges": [{
+                    "backward_root_commit": n["bad"],
+                    "before_wp": n["w3"], "after_wp": n["w1"],
+                    "restoration_root_commits": [n["restored"]],
+                    "regular_identical_depends_lock": True,
+                }],
+            }])
+            self.assertNotIn("terminal_claim_remaining", json.dumps(reports))
+
+            # Full CLI judgement changes only at the repaired revision.
+            bad = self.run_checker(fixture, "--rev", n["bad"], "--derive-when-receipt-absent")
+            self.assert_failure(bad, "(P2)")
+            repaired = self.run_checker(fixture, "--rev", n["restored"], "--derive-when-receipt-absent")
+            self.assertEqual(repaired.returncode, 0, repaired.stderr)
+            self.assertIn("1 by same-lock recovery (P2)", repaired.stdout)
+            git(wp, "checkout", "-q", "--detach", n["w3"])
+            git(root, "checkout", "-q", "--detach", n["restored"])
+            receipt = self.run_checker(fixture, "--rev", n["restored"], "--print-receipt")
+            self.assertEqual(receipt.returncode, 0, receipt.stderr)
+            self.assertNotIn("wp_trust_anchor", json.loads(receipt.stdout))
+
+            # Two independently authored immediate repairs may both be in the
+            # literal DAG.  Their ordinary merge retains both witnesses.
+            second = commit_tree(root, git(root, "rev-parse", f'{n["good"]}^{{tree}}'),
+                                 [n["bad"]], "independent exact restoration")
+            merged = commit_tree(root, git(root, "rev-parse", f'{second}^{{tree}}'),
+                                 [n["restored"], second], "merge exact restorations")
+            verdict, reports = judge(merged, n["w3"])
+            self.assertEqual(verdict["recovered"], 1)
+            self.assertEqual(reports[0]["recovered_edges"][0]["restoration_root_commits"],
+                             sorted([n["restored"], second]))
+            w4 = wp_child(wp, n["w3"], "later ordinary WP advance")
+            advanced = pin_wp(root, merged, w4, "ordinary forward work after both restorations")
+            self.assertEqual(judge(advanced, w4)[0]["recovered"], 1)
+
+            # A later forward move that CHANGES the lock is admissible after
+            # the recovery: the recovered edge is judged where it occurred,
+            # not against whatever the binding later became.
+            refreshed = wp_child(
+                wp, w4, "refresh the lock after the recovery",
+                {anchor.WP_DEPENDS_PATH: ("100644", write_blob(
+                    wp, b"# refreshed\n" + committed_bytes(wp, w4, anchor.WP_DEPENDS_PATH)))},
+            )
+            judged = pin_wp(root, advanced, refreshed, "forward lock refresh")
+            verdict, _reports = judge(judged, refreshed)
+            # ... plus the second restoration, w3 -> w4 and w4 -> refreshed.
+            self.assertEqual((verdict["moves"], verdict["recovered"]), (6, 1))
+
+    def test_p2_recovery_requires_the_exact_immediate_root_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture, n = self.same_lock_recovery_fixture(temporary)
+            root = fixture.root
+
+            def node(parents: list[str], pin: str, label: str) -> str:
+                return pin_wp(root, parents[0], pin, label) if len(parents) == 1 else root_child(
+                    root, parents[0], label, {anchor.WP_ROOT_DELTA_PATH: ("160000", pin)}, parents
+                )
+
+            unchanged = node([n["bad"]], n["w1"], "postpone restoring WP")
+            delayed = node([unchanged], n["w3"], "delayed exact restoration")
+            partial = node([n["bad"]], n["w2"], "restore only part of the rollback")
+            partial_then_exact = node([partial], n["w3"], "finish partial restoration")
+            fake_side = node([n["good"]], n["w3"], "unrelated side says restored")
+            merge_only = node([n["bad"], fake_side], n["w3"], "merge-only restoration")
+            repeated = node([n["restored"]], n["w1"], "repeat the same rollback pair")
+            delayed_again = node([repeated], n["w1"], "leave second rollback uncorrected")
+            second_delayed = node([delayed_again], n["w3"], "delayed second restoration")
+            for label, revision, pin in (
+                ("no restoration", n["bad"], n["w1"]),
+                ("unreachable exact side restoration", unchanged, n["w1"]),
+                ("delayed restoration", delayed, n["w3"]),
+                ("partial restoration", partial, n["w2"]),
+                ("partial then exact", partial_then_exact, n["w3"]),
+                ("fake/merge restoration", merge_only, n["w3"]),
+                ("subsequent rollback", repeated, n["w1"]),
+                ("same pair must not clear later edge", second_delayed, n["w3"]),
+            ):
+                with self.subTest(label=label):
+                    self.assert_policy_refuses(
+                        fixture, revision, {**fixture.commits, "trust-wp": pin},
+                        "(c) not a recovered same-lock backward move: no immediate single-parent child of",
+                    )
+            # Recovery does not make a merge that drops a marked binding legal.
+            dropped = node([n["restored"], n["bad"]], n["w1"], "drop restored binding")
+            self.assert_policy_refuses(
+                fixture, dropped, {**fixture.commits, "trust-wp": n["w1"]}, "did not retain"
+            )
+
+    def test_p2_recovery_preserves_lock_ancestry_and_marker_refusals(self) -> None:
+        """Only a same-lock, strictly backward edge can be recovered.
+
+        Each source is reached by a forward move first (so the setup itself
+        is admissible); the bad edge is then refused on its clause, and an
+        "exact restoration" commit does not recover it -- for the divergent
+        and unrelated targets the restoration is itself a non-forward move,
+        which v3 judges too.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture, n = self.same_lock_recovery_fixture(temporary)
+            assert fixture.policy_activation is not None
+            root = fixture.root
+            wp = fixture.checkout("trust-wp")
+            retired = retire_receipt(root, fixture.policy_activation)
+            sibling = wp_child(wp, n["w0"], "divergent WP sibling")
+            unrelated = commit_tree(wp, git(wp, "rev-parse", f'{n["w0"]}^{{tree}}'), [], "unrelated WP source")
+            changed = wp_child(wp, n["w0"], "changed-lock WP predecessor",
+                               {anchor.WP_DEPENDS_PATH: ("100644", write_blob(wp, b"changed lock\n"))})
+            missing = wp_child(wp, n["w0"], "WP predecessor without lock", {anchor.WP_DEPENDS_PATH: None})
+            nonregular = wp_child(wp, n["w0"], "WP predecessor with symlink lock",
+                                  {anchor.WP_DEPENDS_PATH: ("120000", write_blob(wp, b"elsewhere"))})
+            for label, source_root, before, after, clause in (
+                ("divergent", n["good"], n["w3"], sibling, "Y is not a strict raw ancestor of X"),
+                ("unrelated", n["good"], n["w3"], unrelated, "Y is not a strict raw ancestor of X"),
+                # W0 is on the canonical line, so only the lock keeps these out of (b).
+                ("changed lock", retired, changed, n["w0"], "spikes/DEPENDS.lock differs"),
+                ("missing lock", retired, missing, n["w0"], "spikes/DEPENDS.lock differs"),
+                ("nonregular lock", retired, nonregular, n["w0"], "spikes/DEPENDS.lock differs"),
+            ):
+                with self.subTest(label=label):
+                    parent = pin_wp(root, source_root, before, label + " source")
+                    self.policy(fixture, parent, {**fixture.commits, "trust-wp": before})
+                    bad = pin_wp(root, parent, after, label + " move")
+                    message = self.assert_policy_refuses(
+                        fixture, bad, {**fixture.commits, "trust-wp": after},
+                        f"X={before} -> Y={after}",
+                    )
+                    self.assertIn(clause, message)
+                    restored = commit_tree(root, git(root, "rev-parse", f"{parent}^{{tree}}"),
+                                           [bad], label + " exact restoration")
+                    self.assert_policy_refuses(
+                        fixture, restored, {**fixture.commits, "trust-wp": before}, "(P2)"
+                    )
+
+            for marker, expected in ((None, "marker was deleted"),
+                                     (("100644", write_blob(root, b"forged recovery\n")),
+                                      "malformed marker state")):
+                with self.subTest(marker=marker):
+                    invalid = commit_tree(root, derived_tree(root, n["restored"], {
+                        anchor.TERMINAL_POLICY_MARKER_PATH: marker}), [n["bad"]], "bad restoration marker")
+                    hidden = commit_tree(root, git(root, "rev-parse", f'{n["restored"]}^{{tree}}'),
+                                         [invalid], "restore marker after invalid recovery")
+                    self.assert_policy_refuses(
+                        fixture, hidden, {**fixture.commits, "trust-wp": n["w3"]}, expected
+                    )
+
+    # ------------------------------------------------------------------
+    # P2: merges, and the marked subgraph.
+    # ------------------------------------------------------------------
+
+    def test_p2_accepts_straddling_merge_after_an_admissible_move(self) -> None:
+        """A branch forked before an admissible move, merged with main after it.
+
+        Main advances the TrustWP pin (lock byte-identical) in a commit shared
+        with a lockfile.  A marked branch forked before that move still binds
+        W0.  Merging in EITHER direction yields a marked merge whose marked
+        parents bind W0 and W1 and which adopts W1: main's binding is retained
+        and the branch's is (a)-admissible away from it.  That is the shape
+        every merge-based push after such a move takes on a merge-heavy main,
+        and the harness row prints DEPENDENCY CONSTELLATION OK on the merge
+        itself.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            root = fixture.root
+            wp = fixture.checkout("trust-wp")
+            w0 = fixture.commits["trust-wp"]
+            (root / anchor.RECEIPT_PATH).unlink()
+            write(root / "Cargo.lock", "version = 4\n")
+            base = commit_all(root, "retire the tracked receipt; track the root lock")
+            write(wp / "forward.txt", "ordinary TrustWP work that leaves the cycle binding alone\n")
+            w1 = commit_all(wp, "ordinary forward TrustWP generation")
+            write(root / "Cargo.lock", 'version = 4\n\n[[package]]\nname = "trust-wp"\nversion = "0.2.0"\n')
+            git(root, "add", anchor.WP_ROOT_DELTA_PATH, "Cargo.lock")
+            git(root, "commit", "-qm", "pins: trust-wp forward with its lock rows")
+            main_move = git(root, "rev-parse", "HEAD")
+
+            topic_blob = write_blob(root, b"topic work\n")
+            branch = root_child(root, base, "marked topic branch forked before the move",
+                                {"topic.txt": ("100644", topic_blob)})
+            self.assertEqual(git(root, "rev-parse", f"{branch}:{anchor.WP_ROOT_DELTA_PATH}"), w0)
+            merged_tree = derived_tree(root, main_move, {"topic.txt": ("100644", topic_blob)})
+            fixture.commits["trust-wp"] = w1
+            for direction, parents in (
+                ("branch into main", [main_move, branch]),
+                ("main into branch", [branch, main_move]),
+            ):
+                with self.subTest(direction=direction):
+                    merge = commit_tree(root, merged_tree, parents, f"merge {direction} after the move")
+                    self.assertEqual(git(root, "rev-parse", f"{merge}:{anchor.WP_ROOT_DELTA_PATH}"), w1)
+                    self.assertEqual(self.policy(fixture, merge, fixture.commits)["moves"], 1)
+                    environment = os.environ.copy()
+                    environment[anchor.PUSH_REFS_ENV] = f"refs/heads/main {merge} refs/heads/main {main_move}"
+                    lane = self.run_checker(fixture, "--push-context", "--derive-when-receipt-absent", env=environment)
+                    self.assertEqual(lane.returncode, 0, lane.stderr)
+                    self.assertIn("DEPENDENCY CONSTELLATION OK", lane.stdout)
+
+    def test_p2_merge_may_adopt_an_admissible_binding_and_nothing_else(self) -> None:
+        """A marked merge may retain, or (a)/(b)-advance, a binding.
+
+        After main's move W0 -> w1 (off main): a merge that adopts w1 over a
+        branch that had moved to x1 (another off-main line) drops x1's
+        binding; a merge that resolves to w2, a descendant no marked parent
+        carried, mints; and a merge that keeps w1 while its other parent
+        refreshed the lock discards that refresh.  Each is refused.  A merge
+        that adopts canonical B over a parent carrying off-main w1 is the
+        ``8325008ba62`` shape merged with an older branch, and is retained.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            assert fixture.policy_activation is not None
+            root = fixture.root
+            wp = fixture.checkout("trust-wp")
+            activation = fixture.policy_activation
+            w0 = fixture.commits["trust-wp"]
+            w1 = wp_child(wp, w0, "main's off-main advance")
+            w2 = wp_child(wp, w1, "a further off-main advance")
+            x1 = wp_child(wp, w0, "a branch's own off-main advance")
+            refreshed = wp_child(wp, w0, "lock refresh on a side line",
+                                 {anchor.WP_DEPENDS_PATH: ("100644", write_blob(
+                                     wp, b"# refreshed\n" + committed_bytes(wp, w0, anchor.WP_DEPENDS_PATH)))})
+            main_move = pin_wp(root, activation, w1, "main moves W0 -> w1")
+            stale = root_child(root, activation, "marked branch still binding W0")
+            diverged = pin_wp(root, activation, x1, "marked branch moves W0 -> x1")
+            refreshing = pin_wp(root, activation, refreshed, "marked branch refreshes the lock")
+            commits = dict(fixture.commits)
+            for revision, pin in ((main_move, w1), (diverged, x1), (refreshing, refreshed)):
+                commits["trust-wp"] = pin
+                self.assertEqual(self.policy(fixture, revision, commits)["moves"], 1)
+
+            for shape, other, binding, needle in (
+                ("drops the branch's off-main binding", diverged, w1,
+                 "did not retain every marked-parent TrustWP binding"),
+                ("mints a binding no marked parent published", stale, w2,
+                 "no marked parent published child_wp"),
+                ("discards a side line's lock refresh", refreshing, w1,
+                 "did not retain every marked-parent TrustWP binding"),
+            ):
+                with self.subTest(shape=shape):
+                    merge = root_child(root, main_move, f"merge that {shape}",
+                                       {anchor.WP_ROOT_DELTA_PATH: ("160000", binding)},
+                                       [main_move, other])
+                    commits["trust-wp"] = binding
+                    self.assert_policy_refuses(fixture, merge, commits, needle)
+
+            # Retained through (b): the merge adopts canonical B while the
+            # other marked parent carries off-main w1 with the same lock.
+            reanchor = pin_wp(root, activation, fixture.wp_floor, "re-anchor onto canonical main")
+            merge = root_child(root, reanchor, "merge an older branch after the re-anchoring",
+                               {anchor.WP_ROOT_DELTA_PATH: ("160000", fixture.wp_floor)},
+                               [reanchor, main_move])
+            commits["trust-wp"] = fixture.wp_floor
+            self.assertEqual(self.policy(fixture, merge, commits)["moves"], 2)
+
+    def test_p2_forward_ancestry_is_any_parent_containment(self) -> None:
+        """Forward means the target CONTAINS the source, through any parent.
+
+        That is how fast.pin-regression reads every other gitlink, and it is
+        the shape TrustWP's own integration produces: main is merged into a
+        topic and the topic is published, so the new pin contains the old one
+        only through its second parent.  A merge whose OTHER parent is a
+        foreign, parentless line is forward once it contains W0; whether such
+        a commit is published is fast.submodule-remote-reachability's
+        question.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            assert fixture.policy_activation is not None
+            root = fixture.root
+            wp = fixture.checkout("trust-wp")
+            w0 = fixture.commits["trust-wp"]
+            retired = retire_receipt(root, fixture.policy_activation)
+            commits = dict(fixture.commits)
+
+            main_blob = write_blob(wp, b"main work\n")
+            wm = wp_child(wp, w0, "TrustWP main advances", {"main.txt": ("100644", main_blob)})
+            topic = wp_child(wp, w0, "TrustWP topic forked at W0",
+                             {"topic.txt": ("100644", write_blob(wp, b"topic work\n"))})
+            published = commit_tree(wp, derived_tree(wp, topic, {"main.txt": ("100644", main_blob)}),
+                                    [topic, wm], "merge main into the topic; publish the topic as main")
+            self.assertNotIn(wm, git(wp, "rev-list", "--first-parent", published).split())
+            first = pin_wp(root, retired, wm, "move W0 -> wm")
+            second = pin_wp(root, first, published, "move wm -> merge(topic, wm)")
+            commits["trust-wp"] = wm
+            self.assertEqual(self.policy(fixture, first, commits)["moves"], 1)
+            commits["trust-wp"] = published
+            self.assertEqual(self.policy(fixture, second, commits)["moves"], 2)
+            explicit = self.run_checker(fixture, "--rev", second, "--derive-when-receipt-absent")
+            self.assertEqual(explicit.returncode, 0, explicit.stderr)
+
+            foreign_tree = derived_tree(wp, w0, {"hijacked.txt": ("100644", write_blob(wp, b"foreign\n"))})
+            foreign = commit_tree(wp, foreign_tree, [], "foreign parentless TrustWP history")
+            contains_w0 = commit_tree(wp, foreign_tree, [foreign, w0], "foreign line merges W0 in")
+            plain_child = commit_tree(wp, foreign_tree, [w0], "plain child of W0 with the same tree")
+            for target in (contains_w0, plain_child):
+                with self.subTest(target=git(wp, "show", "-s", "--format=%s", target)):
+                    tip = pin_wp(root, retired, target, "move to a foreign-tree commit that contains W0")
+                    commits["trust-wp"] = target
+                    self.assertEqual(self.policy(fixture, tip, commits)["moves"], 1)
+
+    def test_p2_judges_a_move_made_by_the_activation_commit_itself(self) -> None:
+        """The v1 introduction may move the gitlink too, and that move is judged.
+
+        An activation commit that both introduces the v1 marker and moves the
+        pin to a parentless same-lock commit is refused on (a); one that moves
+        it forward is admitted as one move.  (Verifier probe M15.)
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            assert fixture.policy_parent is not None
+            root = fixture.root
+            wp = fixture.checkout("trust-wp")
+            w0 = fixture.commits["trust-wp"]
+            v1 = ("100644", write_blob(root, anchor.TERMINAL_POLICY_MARKER))
+            orphan = commit_tree(
+                wp, git(wp, "rev-parse", f"{w0}^{{tree}}"), [], "parentless wp commit, same tree/lock as W0"
+            )
+            refused = root_child(
+                root, fixture.policy_parent, "activate v1 AND move W0 -> orphan",
+                {anchor.TERMINAL_POLICY_MARKER_PATH: v1,
+                 anchor.WP_ROOT_DELTA_PATH: ("160000", orphan),
+                 anchor.RECEIPT_PATH: None},
+            )
+            message = self.assert_policy_refuses(
+                fixture, refused, {**fixture.commits, "trust-wp": orphan},
+                f"refuses the first-party/trust-wp gitlink move at {refused}: X={w0} -> Y={orphan}",
+            )
+            self.assertIn("(a) not forward", message)
+            self.assert_failure(
+                self.run_checker(fixture, "--rev", refused, "--derive-when-receipt-absent"),
+                "(a) not forward",
+            )
+
+            child = wp_child(wp, w0, "forward TrustWP generation")
+            admitted = root_child(
+                root, fixture.policy_parent, "activate v1 AND move W0 -> child",
+                {anchor.TERMINAL_POLICY_MARKER_PATH: v1,
+                 anchor.WP_ROOT_DELTA_PATH: ("160000", child),
+                 anchor.RECEIPT_PATH: None},
+            )
+            verdict = self.policy(fixture, admitted, {**fixture.commits, "trust-wp": child})
+            self.assertEqual((verdict["activation_commit"], verdict["moves"]), (admitted, 1))
+
+    def test_marked_subgraph_accepts_stale_first_parent_and_repeated_propagation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
             assert fixture.policy_parent is not None
@@ -2614,151 +2634,61 @@ class CommittedConstellationTests(unittest.TestCase):
             root = fixture.root
             wp = fixture.checkout("trust-wp")
             old_wp = fixture.commits["trust-wp"]
-            old_wp_tree = git(wp, "rev-parse", f"{old_wp}^{{tree}}")
-            active_wp = commit_tree(
-                wp, old_wp_tree, [old_wp], "pre-activation active WP generation"
-            )
+            active_wp = wp_child(wp, old_wp, "pre-activation active WP generation")
 
             base = fixture.policy_parent
-            active_tree = derived_tree(
-                root,
-                base,
-                {anchor.WP_ROOT_DELTA_PATH: ("160000", active_wp)},
-            )
-            preactivation = commit_tree(
-                root, active_tree, [base], "pre-activation root advances WP"
-            )
-            marker_oid = git(
-                root,
-                "rev-parse",
-                f"{fixture.policy_activation}:{anchor.TERMINAL_POLICY_MARKER_PATH}",
-            )
-            marked_tree = derived_tree(
-                root,
-                preactivation,
-                {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", marker_oid)},
-            )
-            activation = commit_tree(
-                root, marked_tree, [preactivation], "unique policy activation"
-            )
+            preactivation = pin_wp(root, base, active_wp, "pre-activation root advances WP")
+            marker_oid = git(root, "rev-parse", f"{fixture.policy_activation}:{anchor.TERMINAL_POLICY_MARKER_PATH}")
+            marked_tree = derived_tree(root, preactivation, {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", marker_oid)})
+            activation = commit_tree(root, marked_tree, [preactivation], "unique policy activation")
             marked = commit_tree(root, marked_tree, [activation], "marked parent")
-
-            stale_one = commit_tree(
-                root,
-                git(root, "rev-parse", f"{base}^{{tree}}"),
-                [base],
-                "stable stale first parent",
-            )
-            merge_one = commit_tree(
-                root,
-                marked_tree,
-                [stale_one, marked],
-                "propagate marker from second parent",
-            )
-            stale_two = commit_tree(
-                root,
-                git(root, "rev-parse", f"{base}^{{tree}}"),
-                [base],
-                "second stable stale branch",
-            )
-            merge_two = commit_tree(
-                root,
-                marked_tree,
-                [stale_two, merge_one],
-                "repeat propagation with marked second parent",
-            )
+            stale_one = root_child(root, base, "stable stale first parent")
+            merge_one = commit_tree(root, marked_tree, [stale_one, marked], "propagate marker from second parent")
+            stale_two = root_child(root, base, "second stable stale branch")
+            merge_two = commit_tree(root, marked_tree, [stale_two, merge_one], "repeat propagation with marked second parent")
             commits = dict(fixture.commits)
             commits["trust-wp"] = active_wp
-            self.assertFalse(
-                anchor.terminal_wp_policy_claimed(root, merge_one, commits)
-            )
-            self.assertFalse(
-                anchor.terminal_wp_policy_claimed(root, merge_two, commits)
-            )
+            self.assertEqual(self.policy(fixture, merge_one, commits)["moves"], 0)
+            self.assertEqual(self.policy(fixture, merge_two, commits)["moves"], 0)
 
-    def test_terminal_policy_accepts_same_origin_marked_parent_merge(self) -> None:
+    def test_marked_subgraph_accepts_same_origin_marked_parent_merge(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
             assert fixture.policy_activation is not None
             root = fixture.root
-            tree = git(
-                root, "rev-parse", f"{fixture.policy_activation}^{{tree}}"
-            )
-            left = commit_tree(
-                root, tree, [fixture.policy_activation], "marked left branch"
-            )
-            right = commit_tree(
-                root, tree, [fixture.policy_activation], "marked right branch"
-            )
-            merge = commit_tree(
-                root, tree, [left, right], "same-origin marked-parent merge"
-            )
-            self.assertFalse(
-                anchor.terminal_wp_policy_claimed(
-                    root, merge, fixture.commits
-                )
-            )
+            left = root_child(root, fixture.policy_activation, "marked left branch")
+            right = root_child(root, fixture.policy_activation, "marked right branch")
+            merge = commit_tree(root, git(root, "rev-parse", f"{left}^{{tree}}"), [left, right],
+                                "same-origin marked-parent merge")
+            self.assertEqual(self.policy(fixture, merge, fixture.commits)["moves"], 0)
 
-    def test_terminal_policy_rejects_ambiguous_origins_and_marker_mismatch(self) -> None:
+    def test_marked_subgraph_rejects_ambiguous_origins_and_marker_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
             assert fixture.policy_parent is not None
             assert fixture.policy_activation is not None
             root = fixture.root
-            tree = git(
-                root, "rev-parse", f"{fixture.policy_activation}^{{tree}}"
+            tree = git(root, "rev-parse", f"{fixture.policy_activation}^{{tree}}")
+            second_origin = commit_tree(root, tree, [fixture.policy_parent], "independent marker origin")
+            ambiguous = commit_tree(root, tree, [fixture.policy_activation, second_origin],
+                                    "merge independent marker origins")
+            self.assert_policy_refuses(
+                fixture, ambiguous, fixture.commits, "one unique raw single-parent introduction"
             )
-            second_origin = commit_tree(
-                root, tree, [fixture.policy_parent], "independent marker origin"
-            )
-            ambiguous = commit_tree(
-                root,
-                tree,
-                [fixture.policy_activation, second_origin],
-                "merge independent marker origins",
-            )
-            with self.assertRaisesRegex(
-                anchor.AnchorError, "one unique raw single-parent introduction"
-            ):
-                anchor.terminal_wp_policy_claimed(
-                    root, ambiguous, fixture.commits
-                )
 
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
             assert fixture.policy_parent is not None
             assert fixture.policy_activation is not None
             root = fixture.root
-            invalid_oid = write_blob(
-                root,
-                b"trust.constellation.terminal-policy.v1\npolicy=wrong\n",
-            )
-            invalid_tree = derived_tree(
-                root,
-                fixture.policy_parent,
-                {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", invalid_oid)},
-            )
-            invalid_parent = commit_tree(
-                root,
-                invalid_tree,
-                [fixture.policy_parent],
-                "malformed marker side parent",
-            )
-            marked_tree = git(
-                root, "rev-parse", f"{fixture.policy_activation}^{{tree}}"
-            )
-            merge = commit_tree(
-                root,
-                marked_tree,
-                [invalid_parent, fixture.policy_activation],
-                "merge malformed marker lineage",
-            )
-            with self.assertRaisesRegex(
-                anchor.AnchorError, "malformed marker state"
-            ):
-                anchor.terminal_wp_policy_claimed(root, merge, fixture.commits)
+            invalid_oid = write_blob(root, b"trust.constellation.terminal-policy.v1\npolicy=wrong\n")
+            invalid_parent = root_child(root, fixture.policy_parent, "malformed marker side parent",
+                                        {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", invalid_oid)})
+            merge = commit_tree(root, git(root, "rev-parse", f"{fixture.policy_activation}^{{tree}}"),
+                                [invalid_parent, fixture.policy_activation], "merge malformed marker lineage")
+            self.assert_policy_refuses(fixture, merge, fixture.commits, "malformed marker state")
 
-    def test_terminal_policy_rejects_inactive_wp_move_revert_and_import(self) -> None:
+    def test_marked_subgraph_rejects_inactive_wp_move_revert_and_import(self) -> None:
         for mutation in ("move", "move-revert", "import"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
                 fixture = self.fixture(temporary)
@@ -2767,79 +2697,29 @@ class CommittedConstellationTests(unittest.TestCase):
                 root = fixture.root
                 wp = fixture.checkout("trust-wp")
                 old_wp = fixture.commits["trust-wp"]
-                old_wp_tree = git(wp, "rev-parse", f"{old_wp}^{{tree}}")
-                active_wp = commit_tree(
-                    wp, old_wp_tree, [old_wp], "active WP generation"
-                )
-                side_wp = commit_tree(
-                    wp, old_wp_tree, [old_wp], "inactive WP mutation"
-                )
+                active_wp = wp_child(wp, old_wp, "active WP generation")
+                side_wp = wp_child(wp, old_wp, "inactive WP mutation")
 
                 base = fixture.policy_parent
-                active_tree = derived_tree(
-                    root,
-                    base,
-                    {anchor.WP_ROOT_DELTA_PATH: ("160000", active_wp)},
-                )
-                preactivation = commit_tree(
-                    root, active_tree, [base], "pre-activation WP advance"
-                )
-                marker_oid = git(
-                    root,
-                    "rev-parse",
-                    f"{fixture.policy_activation}:{anchor.TERMINAL_POLICY_MARKER_PATH}",
-                )
-                marked_tree = derived_tree(
-                    root,
-                    preactivation,
-                    {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", marker_oid)},
-                )
-                activation = commit_tree(
-                    root, marked_tree, [preactivation], "policy activation"
-                )
+                preactivation = pin_wp(root, base, active_wp, "pre-activation WP advance")
+                marker_oid = git(root, "rev-parse", f"{fixture.policy_activation}:{anchor.TERMINAL_POLICY_MARKER_PATH}")
+                marked_tree = derived_tree(root, preactivation, {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", marker_oid)})
+                activation = commit_tree(root, marked_tree, [preactivation], "policy activation")
                 marked = commit_tree(root, marked_tree, [activation], "marked parent")
 
-                side_tree = (
-                    git(root, "rev-parse", f"{base}^{{tree}}")
-                    if mutation == "import"
-                    else derived_tree(
-                        root,
-                        base,
-                        {anchor.WP_ROOT_DELTA_PATH: ("160000", side_wp)},
-                    )
-                )
-                inactive = commit_tree(
-                    root,
-                    side_tree,
-                    [base],
-                    (
-                        "inactive side preserves stale WP"
-                        if mutation == "import"
-                        else "inactive side moves WP"
-                    ),
-                )
+                if mutation == "import":
+                    inactive = root_child(root, base, "inactive side preserves stale WP")
+                else:
+                    inactive = pin_wp(root, base, side_wp, "inactive side moves WP")
                 if mutation == "move-revert":
-                    inactive = commit_tree(
-                        root,
-                        git(root, "rev-parse", f"{base}^{{tree}}"),
-                        [inactive],
-                        "inactive side reverts WP",
-                    )
+                    inactive = commit_tree(root, git(root, "rev-parse", f"{base}^{{tree}}"), [inactive],
+                                           "inactive side reverts WP")
                 merge_tree = (
-                    derived_tree(
-                        root,
-                        marked,
-                        {anchor.WP_ROOT_DELTA_PATH: ("160000", old_wp)},
-                    )
+                    derived_tree(root, marked, {anchor.WP_ROOT_DELTA_PATH: ("160000", old_wp)})
                     if mutation == "import"
                     else marked_tree
                 )
-                merge = commit_tree(
-                    root,
-                    merge_tree,
-                    [inactive, marked],
-                    f"propagation {mutation}",
-                )
+                merge = commit_tree(root, merge_tree, [inactive, marked], f"propagation {mutation}")
                 commits = dict(fixture.commits)
                 commits["trust-wp"] = old_wp if mutation == "import" else active_wp
                 expected = (
@@ -2847,49 +2727,30 @@ class CommittedConstellationTests(unittest.TestCase):
                     if mutation == "import"
                     else "minted a TrustWP gitlink no raw parent published"
                 )
-                with self.assertRaisesRegex(anchor.AnchorError, expected):
-                    anchor.terminal_wp_policy_claimed(root, merge, commits)
+                self.assert_policy_refuses(fixture, merge, commits, expected)
 
-    def test_terminal_policy_rejects_delete_readd_marker_lineage(self) -> None:
+    def test_marked_subgraph_rejects_delete_readd_marker_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
-            assert fixture.policy_parent is not None
             assert fixture.policy_activation is not None
             root = fixture.root
-            marked_tree = git(
-                root, "rev-parse", f"{fixture.policy_activation}^{{tree}}"
-            )
-            deleted_tree = derived_tree(
-                root,
-                fixture.policy_activation,
-                {anchor.TERMINAL_POLICY_MARKER_PATH: None},
-            )
-            deleted = commit_tree(
-                root, deleted_tree, [fixture.policy_activation], "delete marker"
-            )
+            marked_tree = git(root, "rev-parse", f"{fixture.policy_activation}^{{tree}}")
+            deleted = root_child(root, fixture.policy_activation, "delete marker",
+                                 {anchor.TERMINAL_POLICY_MARKER_PATH: None})
             readded = commit_tree(root, marked_tree, [deleted], "readd marker")
-            marked = commit_tree(
-                root, marked_tree, [fixture.policy_activation], "marked sibling"
-            )
-            merge = commit_tree(
-                root,
-                marked_tree,
-                [readded, marked],
-                "merge delete-readd lineage",
-            )
-            with self.assertRaisesRegex(anchor.AnchorError, "deleted on a raw DAG edge"):
-                anchor.terminal_wp_policy_claimed(root, merge, fixture.commits)
+            marked = commit_tree(root, marked_tree, [fixture.policy_activation], "marked sibling")
+            merge = commit_tree(root, marked_tree, [readded, marked], "merge delete-readd lineage")
+            self.assert_policy_refuses(fixture, merge, fixture.commits, "deleted on a raw DAG edge")
 
-    def test_terminal_policy_accepts_inactive_branch_that_took_a_newer_main(self) -> None:
+    def test_marked_subgraph_accepts_inactive_branch_that_took_a_newer_main(self) -> None:
         """The shape that refused every push on 2026-08-30, in miniature.
 
-        A feature branch forks while the root pins WP0, main advances the pin to
-        WP1 in a pre-activation commit, the branch merges that newer main, and
-        the whole branch is merged into the marked line long after activation.
-        The branch therefore has TWO pre-activation frontiers whose bindings
-        differ, and one of its internal edges changes the binding -- yet it
-        publishes nothing new: the merge adopted a value main had already
-        published.  The marked line retains its own binding throughout.
+        A feature branch forks while the root pins WP0, main advances the pin
+        in a pre-activation commit, the branch merges that newer main, and the
+        whole branch is merged into the marked line long after activation.
+        The branch has TWO pre-activation frontiers whose bindings differ, and
+        one of its internal edges changes the binding -- yet it publishes
+        nothing new.  The marked line retains its own binding throughout.
         """
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
@@ -2897,1023 +2758,796 @@ class CommittedConstellationTests(unittest.TestCase):
             root = fixture.root
             wp = fixture.checkout("trust-wp")
             wp0 = fixture.commits["trust-wp"]
-            wp0_tree = git(wp, "rev-parse", f"{wp0}^{{tree}}")
-            wp1 = commit_tree(wp, wp0_tree, [wp0], "main advances WP")
-            wp2 = commit_tree(wp, wp0_tree, [wp1], "main advances WP again")
+            wp1 = wp_child(wp, wp0, "main advances WP")
+            wp2 = wp_child(wp, wp1, "main advances WP again")
 
             fork = fixture.policy_parent
             fork_tree = git(root, "rev-parse", f"{fork}^{{tree}}")
-            newer_main_tree = derived_tree(
-                root, fork, {anchor.WP_ROOT_DELTA_PATH: ("160000", wp1)}
-            )
-            newer_main = commit_tree(
-                root, newer_main_tree, [fork], "pre-activation main advances WP"
-            )
-            # The marked line carries a third binding, taken BEFORE activation
-            # so that activation itself claims nothing: what the branch does
-            # may not reach it either way.
-            newest_main = commit_tree(
-                root,
-                derived_tree(
-                    root, newer_main, {anchor.WP_ROOT_DELTA_PATH: ("160000", wp2)}
-                ),
-                [newer_main],
-                "pre-activation main advances WP again",
-            )
-            activation_tree = derived_tree(
-                root,
-                newest_main,
-                {
-                    anchor.TERMINAL_POLICY_MARKER_PATH: (
-                        "100644",
-                        git(
-                            root,
-                            "rev-parse",
-                            f"HEAD:{anchor.TERMINAL_POLICY_MARKER_PATH}",
-                        ),
-                    ),
-                },
-            )
-            activation = commit_tree(
-                root, activation_tree, [newest_main], "policy activation"
-            )
+            newer_main = pin_wp(root, fork, wp1, "pre-activation main advances WP")
+            newer_main_tree = git(root, "rev-parse", f"{newer_main}^{{tree}}")
+            newest_main = pin_wp(root, newer_main, wp2, "pre-activation main advances WP again")
+            marker_oid = git(root, "rev-parse", f"HEAD:{anchor.TERMINAL_POLICY_MARKER_PATH}")
+            activation_tree = derived_tree(root, newest_main, {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", marker_oid)})
+            activation = commit_tree(root, activation_tree, [newest_main], "policy activation")
             marked = commit_tree(root, activation_tree, [activation], "marked parent")
 
             branch = commit_tree(root, fork_tree, [fork], "feature work on the old pin")
-            branch_merge = commit_tree(
-                root,
-                newer_main_tree,
-                [newer_main, branch],
-                "merge newer main into the feature branch",
-            )
-            merge = commit_tree(
-                root,
-                activation_tree,
-                [branch_merge, marked],
-                "land the branch on the marked line",
-            )
-
-            # The refused edge and the two differing frontiers are really there.
-            self.assertNotEqual(
-                git(root, "rev-parse", f"{branch_merge}:{anchor.WP_ROOT_DELTA_PATH}"),
-                git(root, "rev-parse", f"{branch}:{anchor.WP_ROOT_DELTA_PATH}"),
-            )
-            self.assertNotEqual(
-                git(root, "rev-parse", f"{fork}:{anchor.WP_ROOT_DELTA_PATH}"),
-                git(root, "rev-parse", f"{newer_main}:{anchor.WP_ROOT_DELTA_PATH}"),
-            )
+            branch_merge = commit_tree(root, newer_main_tree, [newer_main, branch],
+                                       "merge newer main into the feature branch")
+            merge = commit_tree(root, activation_tree, [branch_merge, marked], "land the branch on the marked line")
+            self.assertNotEqual(git(root, "rev-parse", f"{branch_merge}:{anchor.WP_ROOT_DELTA_PATH}"),
+                                git(root, "rev-parse", f"{branch}:{anchor.WP_ROOT_DELTA_PATH}"))
             commits = dict(fixture.commits)
             commits["trust-wp"] = wp2
-            self.assertFalse(
-                anchor.terminal_wp_policy_claimed(root, merge, commits)
-            )
+            self.assertEqual(self.policy(fixture, merge, commits)["moves"], 0)
 
-    def test_terminal_policy_rejects_minted_and_unrooted_inactive_lineage(self) -> None:
-        """The defect the inactive-lineage audit exists for, in both shapes.
-
-        ``merge-mint`` is the case a per-EDGE rule caught only by accident: an
-        exclusive merge whose binding equals NEITHER parent, i.e. a pin authored
-        inside the merge resolution.  ``orphan`` is an inactive lineage with no
-        ancestry in common with the pre-activation history at all.
-        """
+    def test_marked_subgraph_rejects_minted_and_unrooted_inactive_lineage(self) -> None:
         for mutation in ("merge-mint", "orphan"):
-            with (
-                self.subTest(mutation=mutation),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
                 fixture = self.fixture(temporary)
                 assert fixture.policy_parent is not None
                 assert fixture.policy_activation is not None
                 root = fixture.root
                 wp = fixture.checkout("trust-wp")
                 wp0 = fixture.commits["trust-wp"]
-                wp0_tree = git(wp, "rev-parse", f"{wp0}^{{tree}}")
-                wp1 = commit_tree(wp, wp0_tree, [wp0], "main advances WP")
-                minted_wp = commit_tree(wp, wp0_tree, [wp0], "unpublished WP")
+                wp1 = wp_child(wp, wp0, "main advances WP")
+                minted_wp = wp_child(wp, wp0, "unpublished WP")
 
                 fork = fixture.policy_parent
                 fork_tree = git(root, "rev-parse", f"{fork}^{{tree}}")
-                newer_main_tree = derived_tree(
-                    root, fork, {anchor.WP_ROOT_DELTA_PATH: ("160000", wp1)}
-                )
-                newer_main = commit_tree(
-                    root, newer_main_tree, [fork], "pre-activation main advances WP"
-                )
-                marker_oid = git(
-                    root,
-                    "rev-parse",
-                    f"{fixture.policy_activation}:"
-                    f"{anchor.TERMINAL_POLICY_MARKER_PATH}",
-                )
-                activation_tree = derived_tree(
-                    root,
-                    newer_main,
-                    {
-                        anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", marker_oid),
-                    },
-                )
-                activation = commit_tree(
-                    root, activation_tree, [newer_main], "policy activation"
-                )
-                marked = commit_tree(
-                    root, activation_tree, [activation], "marked parent"
-                )
+                newer_main = pin_wp(root, fork, wp1, "pre-activation main advances WP")
+                marker_oid = git(root, "rev-parse", f"{fixture.policy_activation}:{anchor.TERMINAL_POLICY_MARKER_PATH}")
+                activation_tree = derived_tree(root, newer_main, {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", marker_oid)})
+                activation = commit_tree(root, activation_tree, [newer_main], "policy activation")
+                marked = commit_tree(root, activation_tree, [activation], "marked parent")
 
                 if mutation == "merge-mint":
-                    branch = commit_tree(
-                        root, fork_tree, [fork], "feature work on the old pin"
-                    )
-                    minted_tree = derived_tree(
-                        root,
-                        fork,
-                        {anchor.WP_ROOT_DELTA_PATH: ("160000", minted_wp)},
-                    )
-                    inactive = commit_tree(
-                        root,
-                        minted_tree,
-                        [newer_main, branch],
-                        "merge resolution mints a third WP binding",
-                    )
+                    branch = commit_tree(root, fork_tree, [fork], "feature work on the old pin")
+                    inactive = commit_tree(root, derived_tree(root, fork, {anchor.WP_ROOT_DELTA_PATH: ("160000", minted_wp)}),
+                                           [newer_main, branch], "merge resolution mints a third WP binding")
                 else:
-                    inactive = commit_tree(
-                        root, fork_tree, [], "unrooted inactive lineage"
-                    )
-
-                merge = commit_tree(
-                    root,
-                    activation_tree,
-                    [inactive, marked],
-                    f"land the {mutation} lineage on the marked line",
-                )
+                    inactive = commit_tree(root, fork_tree, [], "unrooted inactive lineage")
+                merge = commit_tree(root, activation_tree, [inactive, marked], f"land the {mutation} lineage")
                 commits = dict(fixture.commits)
                 commits["trust-wp"] = wp1
-                with self.assertRaisesRegex(
-                    anchor.AnchorError,
-                    "minted a TrustWP gitlink no raw parent published",
-                ):
-                    anchor.terminal_wp_policy_claimed(root, merge, commits)
+                self.assert_policy_refuses(
+                    fixture, merge, commits, "minted a TrustWP gitlink no raw parent published"
+                )
 
-    def test_terminal_policy_partial_clone_never_lazy_fetches_authority(self) -> None:
-        """A missing promised marker stays missing and no upload-pack is invoked."""
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            fixture = self.fixture(str(base / "fixture"))
-            marker_oid = git(
-                fixture.root,
-                "rev-parse",
-                f"HEAD:{anchor.TERMINAL_POLICY_MARKER_PATH}",
-            )
+    def test_marked_subgraph_stash_shaped_lineage_restores_only_its_own_published_binding(self) -> None:
+        """The 1fedcff19d shape, in miniature, and the mints it must still refuse.
 
-            remote = base / "authority.git"
-            subprocess.run(
-                ["git", "clone", "--bare", "-q", str(fixture.root), str(remote)],
-                check=True,
-            )
-            git(remote, "config", "uploadpack.allowFilter", "true")
-            git(remote, "config", "uploadpack.allowAnySHA1InWant", "true")
+        A `git stash` taken on a pre-activation commit P (binding wp1) whose
+        submodule checkout sat at an OLDER binding wp0 that P's own ancestry
+        published: the index commit I (parent P) carries wp0, the WIP commit W
+        (parents P, I) carries I's tree, and a preservation merge records W on
+        the marked line long after activation with the marked tree (-s ours).
+        I changes the binding relative to its only parent, yet introduces
+        nothing the regime never saw -- that is a restoration, admitted.  The
+        same shape carrying a binding P's pre-activation ancestry never
+        published is a mint, refused: a fresh unpublished commit, one only a
+        parallel pre-activation line pinned, and one only the marked line
+        pinned after activation.
+        """
+        for mutation in ("restore", "unpublished", "parallel-line", "post-activation"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                fixture = self.fixture(temporary)
+                assert fixture.policy_parent is not None
+                assert fixture.policy_activation is not None
+                root = fixture.root
+                wp = fixture.checkout("trust-wp")
+                wp0 = fixture.commits["trust-wp"]
+                wp1 = wp_child(wp, wp0, "main advances WP")
+                wp_parallel = wp_child(wp, wp0, "parallel line pins WP")
+                wp_marked = wp_child(wp, wp1, "marked line advances WP")
+                wp_fresh = wp_child(wp, wp0, "never pinned anywhere")
 
-            partial = base / "partial"
-            subprocess.run(
-                [
-                    "git",
-                    "clone",
-                    "--no-checkout",
-                    "--filter=blob:none",
-                    "-q",
-                    remote.resolve().as_uri(),
-                    str(partial),
-                ],
-                check=True,
-            )
-            self.assertEqual(
-                git(partial, "rev-parse", "--is-shallow-repository"), "false"
-            )
-            self.assertEqual(git(partial, "config", "--bool", "remote.origin.promisor"), "true")
-            self.assertEqual(
-                git(partial, "config", "remote.origin.partialclonefilter"),
-                "blob:none",
-            )
+                fork = fixture.policy_parent
+                stash_base = pin_wp(root, fork, wp1, "pre-activation main advances WP")
+                parallel = pin_wp(root, fork, wp_parallel, "pre-activation parallel line")
+                joined = commit_tree(root, git(root, "rev-parse", f"{stash_base}^{{tree}}"),
+                                     [stash_base, parallel], "pre-activation merge keeps wp1")
+                marker_oid = git(root, "rev-parse", f"{fixture.policy_activation}:{anchor.TERMINAL_POLICY_MARKER_PATH}")
+                activation_tree = derived_tree(root, joined, {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", marker_oid)})
+                activation = commit_tree(root, activation_tree, [joined], "policy activation")
+                marked = pin_wp(root, activation, wp_marked, "marked line advances WP (forward)")
+                marked_tree = git(root, "rev-parse", f"{marked}^{{tree}}")
 
-            before = missing_objects_without_lazy_fetch(partial)
-            self.assertIn(marker_oid, before)
-
-            sentinel = base / "upload-pack-invoked"
-            upload_pack = base / "recording-upload-pack"
-            write(
-                upload_pack,
-                "#!/bin/sh\n"
-                ': > "$GIT_UPLOAD_PACK_SENTINEL"\n'
-                'exec git-upload-pack "$@"\n',
-            )
-            upload_pack.chmod(0o755)
-            git(partial, "config", "remote.origin.uploadpack", str(upload_pack))
-
-            with mock.patch.dict(
-                os.environ,
-                {"GIT_UPLOAD_PACK_SENTINEL": str(sentinel)},
-                clear=False,
-            ):
-                with self.assertRaisesRegex(
-                    anchor.AnchorError,
-                    rf"HEAD marker object {marker_oid} is missing",
-                ):
-                    anchor.terminal_wp_policy_claimed(
-                        partial,
-                        git(partial, "rev-parse", "HEAD"),
-                        fixture.commits,
+                index_wp = {
+                    "restore": wp0,
+                    "unpublished": wp_fresh,
+                    "parallel-line": wp_parallel,
+                    "post-activation": wp_marked,
+                }[mutation]
+                index = root_child(root, stash_base, "index on b62: stash base",
+                                   {anchor.WP_ROOT_DELTA_PATH: ("160000", index_wp)})
+                wip = commit_tree(root, git(root, "rev-parse", f"{index}^{{tree}}"),
+                                  [stash_base, index], "WIP on b62: stash base")
+                merge = commit_tree(root, marked_tree, [marked, wip],
+                                    "Merge preserve/stash (ancestry only, -s ours)")
+                commits = dict(fixture.commits)
+                commits["trust-wp"] = wp_marked
+                if mutation == "restore":
+                    self.assertEqual(self.policy(fixture, merge, commits)["moves"], 1)
+                else:
+                    message = self.assert_policy_refuses(
+                        fixture, merge, commits, "minted a TrustWP gitlink no raw parent published"
                     )
+                    self.assertIn(f"commit={index}", message)
+                    self.assertIn(f"commit_wp={index_wp}", message)
 
-            self.assertFalse(sentinel.exists())
-            self.assertEqual(missing_objects_without_lazy_fetch(partial), before)
+    def test_absent_trust_wp_commits_are_fetched_by_sha_and_no_ref_is_written(self) -> None:
+        """Clone state is not a finding: what the judgement reads is fetched first.
 
-            # Prove the recorder is on the exact lazy-fetch transport path: an
-            # otherwise identical unprotected read invokes upload-pack and
-            # materializes the promised marker object.
-            lazy_environment = os.environ.copy()
-            lazy_environment.pop("GIT_NO_LAZY_FETCH", None)
-            lazy_environment["GIT_UPLOAD_PACK_SENTINEL"] = str(sentinel)
-            control = subprocess.run(
-                ["git", "-C", str(partial), "cat-file", "blob", marker_oid],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=lazy_environment,
+        The shapes every fresh clone hit (2026-10-24, PUSH-PATH-CLONE-STATE):
+        trust-wp's remote main has moved past this store's last fetch, and a
+        judged move names a TrustWP commit that only a ``refs/pins/*`` anchor
+        on the remote holds.  Both are fetched by sha from the remote before
+        any read; no ref and no FETCH_HEAD is written.  A commit the remote
+        will not serve is still refused, naming the fetch.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            root = fixture.root
+            remote = fixture.remotes["trust-wp"]
+            store = fixture.checkout("trust-wp")
+            # Commits only the remote holds: main advanced past the store's
+            # fetch, and a pin anchored under refs/pins/ on no branch.
+            remote_main = wp_child(remote, fixture.wp_remote_main(), "remote main advances")
+            git(remote, "update-ref", "refs/heads/main", remote_main)
+            pinned = wp_child(remote, fixture.wp_w0, "pinned only under refs/pins")
+            git(remote, "update-ref", f"refs/pins/{pinned}", pinned)
+            for sha in (remote_main, pinned):
+                self.assertNotEqual(git(store, "cat-file", "-t", sha, check=False), "commit")
+            refs_before = git(store, "for-each-ref")
+            assert fixture.policy_activation is not None
+            retired = retire_receipt(root, fixture.policy_activation)
+            # W0 -> pinned is forward (P2a), so the verdict turns only on the
+            # judgement being able to read both ends.
+            moved = pin_wp(root, retired, pinned, "pin a commit only refs/pins holds")
+            commits = dict(fixture.commits)
+            commits["trust-wp"] = pinned
+            verdict = self.policy(fixture, moved, commits, remote=remote_main)
+            self.assertEqual(verdict["wp_remote_main"], remote_main)
+            for sha in (remote_main, pinned):
+                self.assertEqual(git(store, "cat-file", "-t", sha), "commit", sha)
+            self.assertEqual(git(store, "for-each-ref"), refs_before)
+            git_dir = Path(git(store, "rev-parse", "--absolute-git-dir"))
+            self.assertFalse((git_dir / "FETCH_HEAD").exists())
+
+            # Present now: a second judgement fetches nothing.
+            with synthetic_v3_policy(fixture):
+                absent, detail = anchor.fetch_absent_trust_wp_objects(store, [remote_main, pinned])
+            self.assertEqual((absent, detail), ([], ""))
+
+            # A sha the remote does not serve: tried, still refused.
+            with synthetic_v3_policy(fixture):
+                absent, detail = anchor.fetch_absent_trust_wp_objects(store, ["e" * 40])
+            self.assertEqual(absent, ["e" * 40])
+            self.assertIn("did not bring eeeeeeeeeeee", detail)
+
+    def _stash_preserved_by_ours_merge(
+        self, fixture: Fixture, wp1: str, staged_wp: str, marked_moves_to: str | None = None
+    ) -> tuple[str, str, str, str]:
+        """The 1fedcff19d shape (MAIN-REDS-1), in miniature.
+
+        Pre-activation main pins WP0 at the fork and then moves to WP1.  A
+        ``git stash`` taken on WP1 has an index commit staging ``staged_wp``
+        -- a binding its only raw parent does not carry -- and the stash is
+        kept reachable by an ``-s ours`` merge into the marked line, which
+        keeps the marked parent's binding (moved forward to
+        ``marked_moves_to`` after activation, when given).  Returns
+        (merge, index, index parent, judged WP).
+        """
+        assert fixture.policy_parent is not None
+        assert fixture.policy_activation is not None
+        root = fixture.root
+        newer_main = pin_wp(root, fixture.policy_parent, wp1, "pre-activation main advances WP")
+        marker_oid = git(root, "rev-parse", f"{fixture.policy_activation}:{anchor.TERMINAL_POLICY_MARKER_PATH}")
+        activation_tree = derived_tree(root, newer_main, {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", marker_oid)})
+        activation = commit_tree(root, activation_tree, [newer_main], "policy activation")
+        marked = commit_tree(root, activation_tree, [activation], "marked parent")
+        judged_wp = wp1
+        if marked_moves_to is not None:
+            marked = pin_wp(root, marked, marked_moves_to, "marked line moves WP forward after activation")
+            judged_wp = marked_moves_to
+        index = pin_wp(root, newer_main, staged_wp, "index on newer main")
+        stash = commit_tree(root, git(root, "rev-parse", f"{newer_main}^{{tree}}"), [newer_main, index],
+                            "WIP on newer main")
+        merge = commit_tree(root, git(root, "rev-parse", f"{marked}^{{tree}}"), [marked, stash],
+                            "keep the stash reachable (-s ours)")
+        return merge, index, newer_main, judged_wp
+
+    def test_marked_subgraph_unbound_root_carries_no_binding_and_nothing_else_does(self) -> None:
+        """A parentless inactive commit with no TrustWP entry mints nothing (CONSTELLATION-UNBOUND-ROOT).
+
+        ``unbound``: a ``git stash -u`` taken ON the marked line, the shape
+        3ca41eb1a3 keeps reachable: the stash commit is marked, and its
+        untracked-files parent is a lone parentless commit with no
+        ``first-party/`` tree. It carries no binding, so it mints none and
+        needs no frontier. ``bound``: the same position, but the parentless
+        parent carries a binding nobody published, so it mints and never
+        rejoins. ``dropped``: an inactive commit WITH a parent that drops the
+        gitlink is refused before any mint test; only a parentless commit may
+        carry no binding.
+        """
+        for shape in ("unbound", "bound", "dropped"):
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as temporary:
+                fixture = self.fixture(temporary)
+                assert fixture.policy_parent is not None
+                assert fixture.policy_activation is not None
+                root = fixture.root
+                wp = fixture.checkout("trust-wp")
+                wp1 = wp_child(wp, fixture.commits["trust-wp"], "main advances WP")
+                newer_main = pin_wp(root, fixture.policy_parent, wp1, "pre-activation main advances WP")
+                marker_oid = git(root, "rev-parse", f"{fixture.policy_activation}:{anchor.TERMINAL_POLICY_MARKER_PATH}")
+                marked_tree = derived_tree(root, newer_main, {anchor.TERMINAL_POLICY_MARKER_PATH: ("100644", marker_oid)})
+                activation = commit_tree(root, marked_tree, [newer_main], "policy activation")
+                marked = commit_tree(root, marked_tree, [activation], "marked parent")
+                commits = {**fixture.commits, "trust-wp": wp1}
+                if shape == "dropped":
+                    dropped = root_child(root, newer_main, "side drops the TrustWP gitlink",
+                                         {anchor.WP_ROOT_DELTA_PATH: None})
+                    merge = commit_tree(root, marked_tree, [marked, dropped], "merge the side (-s ours)")
+                    self.assert_policy_refuses(
+                        fixture, merge, commits, f"inactive child {dropped} is missing committed TrustWP gitlink"
+                    )
+                    continue
+                index = commit_tree(root, marked_tree, [marked], "index on main: nothing staged")
+                if shape == "unbound":
+                    untracked = commit_tree(root, untracked_files_tree(root), [], "untracked files on main")
+                else:
+                    unpublished = wp_child(wp, fixture.commits["trust-wp"], "WP no Trust commit ever pinned")
+                    bound_tree = derived_tree(root, newer_main, {anchor.WP_ROOT_DELTA_PATH: ("160000", unpublished)})
+                    untracked = commit_tree(root, bound_tree, [], "parentless commit carrying a binding")
+                stash = commit_tree(root, marked_tree, [marked, index, untracked], "WIP on main: stash -u")
+                if shape == "unbound":
+                    self.assertEqual(git(root, "ls-tree", untracked, "first-party"), "")
+                    self.assertEqual(self.policy(fixture, stash, commits)["moves"], 0)
+                else:
+                    message = self.assert_policy_refuses(
+                        fixture, stash, commits, "minted a TrustWP gitlink no raw parent published"
+                    )
+                    self.assertIn(f"commit={untracked}", message)
+                    self.assertIn("never rejoins pre-activation ancestry", message)
+
+    def test_marked_subgraph_accepts_inactive_commit_restaging_a_preactivation_pin(self) -> None:
+        """An inactive commit may stage back a binding pre-activation history published.
+
+        The index commit stages WP0, which no raw parent of it carries but
+        which the pre-activation fork commit had already published -- the
+        ``1b0fe79fc1`` stash staging ``eb18c75702`` back (MAIN-REDS-1).  The
+        lineage introduces no pin the regime never saw, so it mints nothing.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            assert fixture.policy_parent is not None
+            wp0 = fixture.commits["trust-wp"]
+            wp1 = wp_child(fixture.checkout("trust-wp"), wp0, "main advances WP")
+            self.assertEqual(git(fixture.root, "rev-parse", f"{fixture.policy_parent}:{anchor.WP_ROOT_DELTA_PATH}"), wp0)
+            merge, index, index_parent, judged_wp = self._stash_preserved_by_ours_merge(fixture, wp1, wp0)
+            self.assertEqual(git(fixture.root, "rev-parse", f"{index_parent}:{anchor.WP_ROOT_DELTA_PATH}"), wp1)
+            self.assertEqual(git(fixture.root, "rev-parse", f"{index}:{anchor.WP_ROOT_DELTA_PATH}"), wp0)
+            self.assertEqual(git(fixture.root, "rev-parse", f"{index}^@"), index_parent)
+            commits = {**fixture.commits, "trust-wp": judged_wp}
+            self.assertEqual(self.policy(fixture, merge, commits)["moves"], 0)
+
+    def test_marked_subgraph_rejects_inactive_mint_of_a_pin_preactivation_never_published(self) -> None:
+        """The allowance never reaches past the pre-activation history's bindings.
+
+        The index commit stages a WP binding that neither its raw parent nor
+        any pre-activation commit carried: once a binding nothing published
+        (``never``), once one the marked line published only AFTER activation
+        by an admissible forward move (``after-activation``).  Both mint, and
+        both are refused with the message the per-commit rule always gave.
+        The second is the shape an allowance read from the whole raw DAG, or
+        from the inactive lineage itself, would wrongly admit.
+        """
+        for published in ("never", "after-activation"):
+            with self.subTest(published=published), tempfile.TemporaryDirectory() as temporary:
+                fixture = self.fixture(temporary)
+                wp = fixture.checkout("trust-wp")
+                wp1 = wp_child(wp, fixture.commits["trust-wp"], "main advances WP")
+                if published == "never":
+                    unpublished = wp_child(wp, fixture.commits["trust-wp"], "WP no Trust commit ever pinned")
+                    merge, index, index_parent, judged_wp = self._stash_preserved_by_ours_merge(
+                        fixture, wp1, unpublished
+                    )
+                else:
+                    unpublished = wp_child(wp, wp1, "WP pinned only after activation, forward from WP1")
+                    merge, index, index_parent, judged_wp = self._stash_preserved_by_ours_merge(
+                        fixture, wp1, unpublished, marked_moves_to=unpublished
+                    )
+                commits = {**fixture.commits, "trust-wp": judged_wp}
+                message = self.assert_policy_refuses(
+                    fixture, merge, commits, "minted a TrustWP gitlink no raw parent published"
+                )
+                self.assertIn(
+                    "Trust terminal-policy inactive merge lineage minted a TrustWP gitlink no raw "
+                    f"parent published: merge={merge}, commit={index}, commit_wp={unpublished}, "
+                    f"parent_wps={{'{index_parent}': '{wp1}'}}",
+                    message,
+                )
+
+    def test_marked_subgraph_rejects_marked_parent_wp_divergence(self) -> None:
+        """A merge whose first-parent diff hides a side branch's move is judged.
+
+        Main moved W0 -> w1 and the side branch W0 -> x1, both off the
+        canonical line; the merge keeps w1, so the first-parent diff shows no
+        gitlink change at all, yet x1's binding was dropped.  (Had the merge
+        dropped back to W0 itself it would be admissible: W0 is on canonical
+        main, clause (b) -- see ``test_p2_merge_may_adopt...``.)
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            assert fixture.policy_activation is not None
+            wp = fixture.checkout("trust-wp")
+            w0 = fixture.commits["trust-wp"]
+            w1 = wp_child(wp, w0, "main's off-main WP move")
+            x1 = wp_child(wp, w0, "side-branch WP move")
+            main_move = pin_wp(fixture.root, fixture.policy_activation, w1, "main moves WP")
+            side = pin_wp(fixture.root, fixture.policy_activation, x1, "root side branch moves WP")
+            merge = commit_tree(fixture.root, git(fixture.root, "rev-parse", f"{main_move}^{{tree}}"),
+                                [main_move, side], "merge hides side-branch WP move from first-parent diff")
+            self.assertEqual(
+                git(fixture.root, "diff-tree", "--no-commit-id", "--name-only", "-r", main_move, merge), ""
             )
-            self.assertEqual(control.returncode, 0, control.stderr.decode("utf-8", "replace"))
-            self.assertTrue(sentinel.is_file())
-            self.assertNotIn(marker_oid, missing_objects_without_lazy_fetch(partial))
+            self.assert_policy_refuses(
+                fixture, merge, {**fixture.commits, "trust-wp": w1},
+                "did not retain every marked-parent TrustWP binding",
+            )
 
-    def test_terminal_policy_raw_walk_is_bounded_and_intro_is_unambiguous(self) -> None:
+    def test_marked_subgraph_raw_walk_is_bounded_and_intro_is_unambiguous(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
             root_commit = git(fixture.root, "rev-parse", "HEAD")
             with mock.patch.object(anchor, "TERMINAL_POLICY_HISTORY_LIMIT", 2):
-                with self.assertRaisesRegex(anchor.AnchorError, "bounded limit"):
-                    anchor.terminal_wp_policy_claimed(
-                        fixture.root, root_commit, fixture.commits
-                    )
+                self.assert_policy_refuses(fixture, root_commit, fixture.commits, "bounded limit")
 
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
             assert fixture.policy_parent is not None
             assert fixture.policy_activation is not None
-            parent_tree = git(
-                fixture.root, "rev-parse", f"{fixture.policy_parent}^{{tree}}"
-            )
-            side = commit_tree(
-                fixture.root,
-                parent_tree,
-                [fixture.policy_parent],
-                "pre-policy side parent",
-            )
-            activation_tree = git(
-                fixture.root, "rev-parse", f"{fixture.policy_activation}^{{tree}}"
-            )
-            ambiguous = commit_tree(
-                fixture.root,
-                activation_tree,
-                [fixture.policy_parent, side],
-                "ambiguous merge marker introduction",
-            )
-            with self.assertRaisesRegex(anchor.AnchorError, "single-parent commit"):
-                anchor.terminal_wp_policy_claimed(
-                    fixture.root, ambiguous, fixture.commits
-                )
+            side = root_child(fixture.root, fixture.policy_parent, "pre-policy side parent")
+            ambiguous = commit_tree(fixture.root, git(fixture.root, "rev-parse", f"{fixture.policy_activation}^{{tree}}"),
+                                    [fixture.policy_parent, side], "ambiguous merge marker introduction")
+            self.assert_policy_refuses(fixture, ambiguous, fixture.commits, "single-parent commit")
 
-    def test_terminal_policy_rejects_marked_parent_wp_divergence(self) -> None:
+    def test_marked_subgraph_partial_clone_never_lazy_fetches_authority(self) -> None:
+        """A missing promised marker stays missing and no upload-pack is invoked."""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            fixture = self.fixture(str(base / "fixture"))
+            marker_oid = git(fixture.root, "rev-parse", f"HEAD:{anchor.TERMINAL_POLICY_MARKER_PATH}")
+
+            remote = base / "authority.git"
+            subprocess.run(["git", "clone", "--bare", "-q", str(fixture.root), str(remote)], check=True)
+            git(remote, "config", "uploadpack.allowFilter", "true")
+            git(remote, "config", "uploadpack.allowAnySHA1InWant", "true")
+
+            partial = base / "partial"
+            subprocess.run(
+                ["git", "clone", "--no-checkout", "--filter=blob:none", "-q", remote.resolve().as_uri(), str(partial)],
+                check=True,
+            )
+            self.assertEqual(git(partial, "rev-parse", "--is-shallow-repository"), "false")
+            before = missing_objects_without_lazy_fetch(partial)
+            self.assertIn(marker_oid, before)
+
+            sentinel = base / "upload-pack-invoked"
+            upload_pack = base / "recording-upload-pack"
+            write(upload_pack, "#!/bin/sh\n: > \"$GIT_UPLOAD_PACK_SENTINEL\"\nexec git-upload-pack \"$@\"\n")
+            upload_pack.chmod(0o755)
+            git(partial, "config", "remote.origin.uploadpack", str(upload_pack))
+
+            with mock.patch.dict(os.environ, {"GIT_UPLOAD_PACK_SENTINEL": str(sentinel)}, clear=False):
+                with synthetic_v3_policy(fixture):
+                    with self.assertRaisesRegex(anchor.AnchorError, rf"HEAD marker object {marker_oid} is missing"):
+                        anchor.validate_trust_wp_policy(
+                            partial, git(partial, "rev-parse", "HEAD"), fixture.commits, fixture.wp_remote_main()
+                        )
+            self.assertFalse(sentinel.exists())
+            self.assertEqual(missing_objects_without_lazy_fetch(partial), before)
+
+            lazy_environment = os.environ.copy()
+            lazy_environment.pop("GIT_NO_LAZY_FETCH", None)
+            lazy_environment["GIT_UPLOAD_PACK_SENTINEL"] = str(sentinel)
+            control = subprocess.run(
+                ["git", "-C", str(partial), "cat-file", "blob", marker_oid],
+                check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=lazy_environment,
+            )
+            self.assertEqual(control.returncode, 0, control.stderr.decode("utf-8", "replace"))
+            self.assertTrue(sentinel.is_file())
+
+    def test_v3_policy_rejects_replacements_grafts_and_shallow_history(self) -> None:
+        for mechanism in ("replacement", "graft", "shallow"):
+            for repository in ("trust", "trust-wp"):
+                with self.subTest(mechanism=mechanism, repository=repository), tempfile.TemporaryDirectory() as temporary:
+                    fixture = self.fixture(temporary)
+                    assert fixture.policy_parent is not None
+                    assert fixture.policy_activation is not None
+                    checkout = fixture.root if repository == "trust" else fixture.checkout("trust-wp")
+                    terminal = fixture.policy_activation if repository == "trust" else fixture.wp_floor
+                    parent = fixture.policy_parent if repository == "trust" else fixture.wp_w0
+                    if mechanism == "replacement":
+                        git(checkout, "replace", terminal, parent)
+                        # The raw reader itself must still see the literal
+                        # object rather than Git's replacement view.
+                        with anchor.RawObjectReader(checkout, f"{repository} replacement probe") as reader:
+                            _tree, parents = anchor.parse_raw_commit(reader, terminal, "probe")
+                        self.assertEqual(parents, [parent])
+                        message = "forbidden replacement refs"
+                    elif mechanism == "graft":
+                        common_dir = Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+                        write(common_dir / "info" / "grafts", f"{terminal} {parent}\n")
+                        message = "forbidden legacy graft authority"
+                    else:
+                        shallow_path = Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "shallow"))
+                        write(shallow_path, f"{terminal}\n")
+                        message = "is shallow"
+                    self.assert_policy_refuses(
+                        fixture, git(fixture.root, "rev-parse", "HEAD"), fixture.commits, message
+                    )
+
+    # ------------------------------------------------------------------
+    # P3: the lock's cohort bindings.
+    # ------------------------------------------------------------------
+
+    def pin_lock(self, fixture: Fixture, content: str | bytes | None, message: str,
+                 *, symlink: bool = False) -> tuple[str, dict[str, str]]:
+        """Pin (by a forward move) a trust-wp child of W0 carrying ``content`` as its lock."""
+        assert fixture.policy_activation is not None
+        wp = fixture.checkout("trust-wp")
+        if symlink:
+            entry: tuple[str, str] | None = ("120000", write_blob(wp, b"missing-DEPENDS.lock"))
+        elif content is None:
+            entry = None
+        else:
+            raw = content.encode("ascii") if isinstance(content, str) else content
+            entry = ("100644", write_blob(wp, raw))
+        target = wp_child(wp, fixture.commits["trust-wp"], message, {anchor.WP_DEPENDS_PATH: entry})
+        retired = retire_receipt(fixture.root, fixture.policy_activation)
+        tip = pin_wp(fixture.root, retired, target, f"pin: {message}")
+        return tip, {**fixture.commits, "trust-wp": target}
+
+    def test_p3_lock_shape_and_committed_blob_fail_closed(self) -> None:
+        def rows(fixture: Fixture, trust_row: str) -> str:
+            base = fixture.lock_rows()
+            return (
+                f"clean main {base['clean']}\ntrust-ir main {base['trust-ir']}\n"
+                f"trust-cg main {base['trust-cg']}\n{trust_row}\nay main {base['ay']}\n"
+            )
+
+        cases = {
+            "missing-trust": lambda fixture: rows(fixture, "").replace("\n\n", "\n"),
+            "duplicate-trust": lambda fixture: rows(
+                fixture, f"trust main {fixture.root_genesis}\ntrust main {fixture.root_genesis}"),
+            "wrong-branch": lambda fixture: rows(fixture, f"trust trunk {fixture.root_genesis}"),
+            "short-sha": lambda fixture: rows(fixture, "trust main abc"),
+            "uppercase-sha": lambda fixture: rows(fixture, f"trust main {fixture.root_genesis.upper()}"),
+            "unknown-row": lambda fixture: rows(
+                fixture, f"trust main {fixture.root_genesis}\nunknown main {'1' * 40}"),
+            "not-a-lock": lambda fixture: "not a lock\n",
+        }
+        for mutation, content in cases.items():
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                fixture = self.fixture(temporary)
+                tip, commits = self.pin_lock(fixture, content(fixture), mutation)
+                self.assertEqual(self.policy(fixture, tip, commits)["moves"], 1)
+                with self.assertRaises(anchor.AnchorError) as raised:
+                    anchor.validate_trust_wp_binding_coherence(fixture.root, tip, commits)
+                self.assertIn("trust-wp:spikes/DEPENDS.lock", str(raised.exception))
+                result = self.run_checker(fixture, "--rev", tip, "--derive-when-receipt-absent")
+                self.assert_failure(result, "trust-wp:spikes/DEPENDS.lock")
+
+        for mutation, needle in (("missing", "is not committed"), ("symlink", "must be a regular committed blob")):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                fixture = self.fixture(temporary)
+                tip, commits = self.pin_lock(fixture, None, mutation, symlink=mutation == "symlink")
+                result = self.run_checker(fixture, "--rev", tip, "--derive-when-receipt-absent")
+                self.assert_failure(result, "spikes/DEPENDS.lock at the pinned TrustWP commit")
+                self.assertIn(needle, result.stderr)
+
+    def test_p3_each_row_must_be_an_ancestor_or_equal_of_its_gitlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
-            assert fixture.policy_activation is not None
-            wp = fixture.checkout("trust-wp")
-            w0 = fixture.commits["trust-wp"]
-            w0_tree = git(wp, "rev-parse", f"{w0}^{{tree}}")
-            side_wp = commit_tree(wp, w0_tree, [w0], "side-branch WP move")
+            assert fixture.policy_parent is not None
+            root = fixture.root
+            # Commits that exist but are not behind the pins: ay AHEAD of its
+            # gitlink, clean OFF its line, and a Trust commit the judged
+            # revision does not contain.
+            ay = fixture.checkout("ay")
+            write(ay / "ahead.txt", "ay advanced past its pin\n")
+            ay_ahead = commit_all(ay, "ay ahead of the root pin")
+            git(ay, "checkout", "-q", "--detach", fixture.commits["ay"])
+            clean = fixture.checkout("clean")
+            git(clean, "switch", "-q", "--orphan", "elsewhere")
+            write(clean / "orphan.txt", "off the pinned line\n")
+            clean_orphan = commit_all(clean, "clean commit off the pinned line")
+            git(clean, "switch", "-q", "--detach", fixture.commits["clean"])
+            trust_side = root_child(root, fixture.policy_parent, "a Trust commit the judged revision does not contain")
 
-            git(
-                fixture.root,
-                "update-index",
-                "--cacheinfo",
-                f"160000,{side_wp},{anchor.WP_ROOT_DELTA_PATH}",
+            base = fixture.lock_rows()
+            cases = (
+                ("ay ahead of its gitlink", {**base, "ay": ay_ahead},
+                 f"trust-wp:spikes/DEPENDS.lock ay row {ay_ahead} is not an ancestor-or-equal of the "
+                 f"first-party/ay gitlink {fixture.commits['ay']} (P3 binding coherence"),
+                ("clean off its line", {**base, "clean": clean_orphan},
+                 f"trust-wp:spikes/DEPENDS.lock clean row {clean_orphan} is not an ancestor-or-equal of the "
+                 f"first-party/clean gitlink {fixture.commits['clean']}"),
+                ("trust row not contained by the judged commit", {**base, "trust": trust_side},
+                 f"trust-wp:spikes/DEPENDS.lock trust row {trust_side} is not an ancestor-or-equal of the "
+                 "judged Trust commit"),
+                ("row names no local object", {**base, "trust-cg": "f" * 40},
+                 f"trust-wp:spikes/DEPENDS.lock trust-cg row {'f' * 40} is not a local commit object in "
+                 "first-party/trust-cg"),
             )
-            side_tree = git(fixture.root, "write-tree")
-            git(fixture.root, "reset", "-q", "HEAD", "--", anchor.WP_ROOT_DELTA_PATH)
-            side = commit_tree(
-                fixture.root,
-                side_tree,
-                [fixture.policy_activation],
-                "root side branch moves WP",
-            )
-            unchanged_tree = git(
-                fixture.root, "rev-parse", f"{fixture.policy_activation}^{{tree}}"
-            )
-            merge = commit_tree(
-                fixture.root,
-                unchanged_tree,
-                [fixture.policy_activation, side],
-                "merge hides side-branch WP move from first-parent diff",
-            )
-            with self.assertRaisesRegex(
-                anchor.AnchorError,
-                "did not retain every marked-parent TrustWP binding",
-            ):
-                anchor.terminal_wp_policy_claimed(
-                    fixture.root, merge, fixture.commits
+            for label, lock_rows, needle in cases:
+                with self.subTest(label=label):
+                    tip, commits = self.pin_lock(fixture, wp_depends_lock(lock_rows), label)
+                    with self.assertRaises(anchor.AnchorError) as raised:
+                        anchor.validate_trust_wp_binding_coherence(root, tip, commits)
+                    self.assertIn(needle, str(raised.exception))
+                    self.assert_failure(
+                        self.run_checker(fixture, "--rev", tip, "--derive-when-receipt-absent"),
+                        needle.split(" (P3")[0],
+                    )
+
+            # Equality is coherent, and so is a row strictly behind (the
+            # fixture's default): siblings advance between trust-wp refreshes.
+            equal_rows = {**base, "clean": fixture.commits["clean"], "trust-cg": fixture.commits["trust-cg"],
+                          "trust": fixture.policy_activation}
+            tip, commits = self.pin_lock(fixture, wp_depends_lock(equal_rows), "rows equal to their pins")
+            pins = anchor.validate_trust_wp_binding_coherence(root, tip, commits)
+            self.assertEqual(pins["trust"], fixture.policy_activation)
+            result = self.run_checker(fixture, "--rev", tip, "--derive-when-receipt-absent")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("spikes/DEPENDS.lock rows 5/5 ancestor-or-equal (P3)", result.stdout)
+
+            # A legacy graft in the ay store that makes the gitlink descend
+            # from ay_ahead is live for plain git and would turn the ahead row
+            # into an ancestor; the sibling store is read with grafts refused,
+            # exactly as the trust-wp store is.
+            tip, commits = self.pin_lock(fixture, wp_depends_lock({**base, "ay": ay_ahead}), "ay ahead, grafted")
+            grafts = Path(git(ay, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "info" / "grafts"
+            write(grafts, f"{fixture.commits['ay']} {ay_ahead}\n")
+            try:
+                self.assertTrue(is_ancestor(ay, ay_ahead, fixture.commits["ay"]), "the graft is live for plain git")
+                with self.assertRaises(anchor.AnchorError) as raised:
+                    anchor.validate_trust_wp_binding_coherence(root, tip, commits)
+                self.assertIn(
+                    "ay binding-coherence store carries forbidden legacy graft authority",
+                    str(raised.exception),
                 )
+                self.assert_failure(
+                    self.run_checker(fixture, "--rev", tip, "--derive-when-receipt-absent"),
+                    "ay binding-coherence store carries forbidden legacy graft authority",
+                )
+            finally:
+                grafts.unlink()
+            with self.assertRaises(anchor.AnchorError) as raised:
+                anchor.validate_trust_wp_binding_coherence(root, tip, commits)
+            self.assertIn("ay row", str(raised.exception))
 
-    def test_terminal_policy_marked_single_parent_wp_move_forces_terminal(self) -> None:
+    # ------------------------------------------------------------------
+    # The lane, the receipt, and the real history.
+    # ------------------------------------------------------------------
+
+    def test_harness_lane_row_and_push_context_judge_the_pushed_revision(self) -> None:
+        manifest = (REPO_ROOT / "tests" / "run_trust_comprehensive_harness.sh").read_text(encoding="utf-8")
+        rows = [
+            line.split("|", 5)
+            for line in manifest.splitlines()
+            if line.startswith("fast.dependency-constellation|")
+        ]
+        self.assertEqual(len(rows), 1)
+        identity, scopes, category, required, last_checked, command = rows[0]
+        # Not a `push` row since 39b35cb9f7 (DEV-MAIN-FOCUSED-VALIDATION-20261102,
+        # 2026-11-02): the push profile keeps only its eight
+        # live-verifier rows. The row still judges a push's refs under --push-context.
+        self.assertEqual(
+            (identity, scopes, category, required, command),
+            ("fast.dependency-constellation", "fast,release", "supply-chain", "true",
+             "scripts/check_dependency_cycle_anchor.py --push-context --derive-when-receipt-absent"),
+        )
+        if last_checked != "never":
+            self.assertEqual(date.fromisoformat(last_checked).isoformat(), last_checked)
+        self.assertIn('UNQUARANTINABLE_GATE_IDS = {"fast.dependency-constellation"}', manifest)
+
+        def run_harness(fixture: Fixture, revision: str, old: str) -> subprocess.CompletedProcess[str]:
+            environment = os.environ.copy()
+            environment[anchor.PUSH_REFS_ENV] = f"refs/heads/main {revision} refs/heads/main {old}"
+            return self.run_checker(fixture, "--push-context", "--derive-when-receipt-absent", env=environment)
+
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
             assert fixture.policy_activation is not None
             root = fixture.root
             wp = fixture.checkout("trust-wp")
-            old_wp = fixture.commits["trust-wp"]
-            wp_tree = git(wp, "rev-parse", f"{old_wp}^{{tree}}")
-            terminal_wp = commit_tree(
-                wp, wp_tree, [old_wp], "terminal WP generation"
-            )
-            terminal_tree = derived_tree(
-                root,
-                fixture.policy_activation,
-                {anchor.WP_ROOT_DELTA_PATH: ("160000", terminal_wp)},
-            )
-            terminal = commit_tree(
-                root,
-                terminal_tree,
-                [fixture.policy_activation],
-                "single-parent terminal WP move",
-            )
-            commits = dict(fixture.commits)
-            commits["trust-wp"] = terminal_wp
-            self.assertTrue(
-                anchor.terminal_wp_policy_claimed(root, terminal, commits)
-            )
-
-    def test_wp_root_anchor_positive_shape_and_explicit_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            preterminal = self.run_checker(fixture, "--print-receipt")
-            self.assertEqual(preterminal.returncode, 0, preterminal.stderr)
-            self.assertIsNone(json.loads(preterminal.stdout)["wp_trust_anchor"])
-
-            root_anchor, root_terminal = fixture.prepare_wp_root_cycle(
-                allowed_lock_delta=True
-            )
-
-            ordinary, ordinary_remote_calls = (
-                self.run_terminal_checker_with_remote_witness(
-                    fixture, "--print-receipt"
-                )
-            )
-            self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
-            self.assertEqual(len(ordinary_remote_calls), 1)
-            self.assertIsNotNone(json.loads(ordinary.stdout)["wp_trust_anchor"])
-
-            missing_remote = self.run_checker(
-                fixture, "--print-receipt", "--require-wp-trust-anchor"
-            )
-            self.assert_failure(missing_remote, "also requires --verify-remote")
-
-            exclusions = fixture.receipt["exclusions"]
-            assert isinstance(exclusions, list)
-            with self.assertRaisesRegex(
-                anchor.AnchorError, "requires remote-main verification"
-            ):
-                anchor.derive_receipt(
-                    fixture.root,
-                    root_terminal,
-                    exclusions,
-                    require_wp_trust_anchor=True,
-                    verify_remote=False,
-                )
-
-            with mock.patch.object(anchor, "verify_remote_main") as api_remote:
-                auto_receipt = anchor.derive_receipt(
-                    fixture.root,
-                    root_terminal,
-                    exclusions,
-                )
-            api_remote.assert_called_once()
-            self.assertIsNotNone(auto_receipt["wp_trust_anchor"])
-
-            required, remote_calls = self.run_terminal_checker_with_remote_witness(
-                fixture
-            )
-            self.assertEqual(required.returncode, 0, required.stderr)
-            self.assertEqual(len(remote_calls), 1)
-            self.assertEqual(remote_calls[0].kwargs["root_commit"], root_terminal)
-            self.assertEqual(
-                remote_calls[0].args[0]["trust-wp"], fixture.commits["trust-wp"]
-            )
-            receipt = json.loads(required.stdout)
-            observed = receipt["wp_trust_anchor"]
-            self.assertEqual(observed["anchor_commit"], root_anchor)
-            self.assertEqual(observed["terminal_commit"], root_terminal)
-            self.assertEqual(observed["anchor_gitlink"], fixture.anchor_wp)
-            self.assertEqual(observed["terminal_gitlink"], fixture.commits["trust-wp"])
-            self.assertEqual(observed["authority_commit"], fixture.commits["trust-wp"])
-            self.assertEqual(
-                git(
-                    fixture.root,
-                    "ls-tree",
-                    root_terminal,
-                    "--",
-                    anchor.RECEIPT_PATH,
-                    anchor.EXTERNAL_RECEIPT_PATH,
-                ),
-                "",
-            )
-            anchor.validate_external_receipt(receipt, require_wp_trust_anchor=True)
-
-            wrong_mode = self.run_checker(fixture, "--require-wp-trust-anchor")
-            self.assert_failure(
-                wrong_mode,
-                "--require-wp-trust-anchor requires --print-receipt or --write-receipt",
-            )
-
-            write(fixture.root / anchor.EXTERNAL_RECEIPT_PATH, required.stdout)
-            commit_all(fixture.root, "illegally track external cycle evidence")
-            tracked = self.run_checker(
-                fixture,
-                "--print-receipt",
-                "--require-wp-trust-anchor",
-                "--verify-remote",
-            )
-            self.assert_failure(tracked, "must remain external/untracked")
-
-    def test_wp_terminal_auto_mode_rejects_each_stale_sibling_pin(self) -> None:
-        for repository in ("ay", "clean", "trust-cg", "trust-ir"):
-            with (
-                self.subTest(repository=repository),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                fixture = self.fixture(temporary)
-                # prepare_wp_root_cycle first removes the legacy receipt, so
-                # predict the resulting R0 only after performing that same
-                # committed transition explicitly here.
-                (fixture.root / anchor.RECEIPT_PATH).unlink()
-                root_anchor = commit_all(fixture.root, "R0 removes tracked receipt")
-                rows = {
-                    name: fixture.commits[name]
-                    for name in ("ay", "clean", "trust-cg", "trust-ir")
-                }
-                rows[repository] = "f" * 40
-                depends = (
-                    f"clean main {rows['clean']}\n"
-                    f"trust-ir main {rows['trust-ir']}\n"
-                    f"trust-cg main {rows['trust-cg']}\n"
-                    f"trust main {root_anchor}\n"
-                    f"ay main {rows['ay']}\n"
-                )
-                # The helper accepts an already-established R0 when the
-                # tracked legacy receipt has gone.
-                fixture.prepare_wp_root_cycle(depends_content=depends)
-                result = self.run_checker(fixture, "--print-receipt")
-                self.assert_failure(result, f"root terminal binding for {repository}")
-
-    def test_wp_w1_tree_policy_rejects_illicit_missing_and_new_lock_paths(self) -> None:
-        cases = (
-            ({"extra_wp_delta": True}, "disallowed=['illicit-terminal-file.txt']"),
-            ({"omit_required_delta": "Cargo.toml"}, "missing_required=['Cargo.toml']"),
-            ({"omit_required_delta": "VISION.md"}, "missing_required=['VISION.md']"),
-            (
-                {"omit_required_delta": anchor.WP_DEPENDS_PATH},
-                "missing_required=['spikes/DEPENDS.lock']",
-            ),
-            ({"new_lock_delta": True}, "W0 tracked lock invented/Cargo.lock is not committed"),
-        )
-        for options, message in cases:
-            with (
-                self.subTest(options=options),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                fixture = self.fixture(temporary)
-                fixture.prepare_wp_root_cycle(**options)
-                result = self.run_checker(fixture, "--print-receipt")
-                self.assert_failure(result, message)
-
-    def test_wp_w1_cargo_and_vision_content_bindings_reject_stale_or_punctuated_claims(self) -> None:
-        def replace_text(path: Path, old: str, new: str) -> None:
-            text = path.read_text(encoding="utf-8")
-            self.assertIn(old, text)
-            write(path, text.replace(old, new, 1))
-
-        def append_text(path: Path, addition: str) -> None:
-            write(path, path.read_text(encoding="utf-8") + addition)
-
-        mutations: tuple[tuple[str, Callable[[Fixture, Path], None], str], ...] = (
-            (
-                "cargo-stale-trust-ir",
-                lambda fixture, wp: replace_text(
-                    wp / "Cargo.toml", fixture.commits["trust-ir"], "f" * 40
-                ),
-                "active TrustIR Git revisions must all equal",
-            ),
-            (
-                "cargo-punctuation-only",
-                lambda _fixture, wp: replace_text(
-                    wp / "Cargo.toml",
-                    "# Current AY authority:",
-                    "# Current AY authority :",
-                ),
-                "must use the exact case, punctuation, and two-field shape",
-            ),
-            (
-                "cargo-stale-ay-marker",
-                lambda fixture, wp: replace_text(
-                    wp / "Cargo.toml", fixture.commits["ay"], "e" * 40
-                ),
-                "Current AY authority marker differs",
-            ),
-            (
-                "cargo-case-lookalike",
-                lambda _fixture, wp: append_text(
-                    wp / "Cargo.toml",
-                    "# current-ay-authority: version=9.9.9 commit="
-                    + "d" * 40
-                    + "\n",
-                ),
-                "no case/punctuation lookalikes",
-            ),
-            (
-                "vision-stale-ay",
-                lambda fixture, wp: replace_text(
-                    wp / "VISION.md", fixture.commits["ay"][:8], "ffffffff"
-                ),
-                "VISION.md trust-wp-ay row must exactly bind",
-            ),
-            (
-                "vision-punctuation-only",
-                lambda fixture, wp: replace_text(
-                    wp / "VISION.md",
-                    f"`{fixture.commits['ay'][:8]}`",
-                    fixture.commits["ay"][:8],
-                ),
-                "VISION.md trust-wp-ay row must exactly bind",
-            ),
-            (
-                "vision-contradictory-suffix",
-                lambda _fixture, wp: replace_text(
-                    wp / "VISION.md",
-                    "separation logic encoding |",
-                    "separation logic encoding; AY v9.9.9 backend at "
-                    "`deadbeef` on current `main` |",
-                ),
-                "VISION.md trust-wp-ay row must exactly bind",
-            ),
-        )
-        for mutation, mutate, message in mutations:
-            with (
-                self.subTest(mutation=mutation),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                fixture = self.fixture(temporary)
-                fixture.prepare_wp_root_cycle()
-                fixture.amend_wp_terminal(lambda wp: mutate(fixture, wp))
-                assert fixture.root_terminal is not None
-                with self.assertRaisesRegex(anchor.AnchorError, message):
-                    anchor.derive_wp_root_anchor(
-                        fixture.root, fixture.root_terminal, fixture.commits
-                    )
-
-    def test_raw_root_tree_map_rejects_config_hidden_clean_gitlink_delta(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            root_anchor, root_terminal = fixture.prepare_wp_root_cycle(
-                extra_root_gitlink="clean"
-            )
-            git(
-                fixture.root,
-                "config",
-                "submodule.first-party/clean.ignore",
-                "all",
-            )
-            self.assertEqual(
-                git(
-                    fixture.root,
-                    "diff-tree",
-                    "--no-commit-id",
-                    "--name-only",
-                    "-r",
-                    root_anchor,
-                    root_terminal,
-                ).splitlines(),
-                [anchor.WP_ROOT_DELTA_PATH],
-            )
-            # Unlike that config-sensitive legacy query, the two literal
-            # committed entry maps must still expose the Clean gitlink.
-            self.assertIn(
-                "first-party/clean",
-                anchor.changed_committed_tree_paths(
-                    fixture.root, root_anchor, root_terminal
-                ),
-            )
-            result = self.run_checker(fixture, "--print-receipt")
-            self.assert_failure(result, "only tree delta")
-
-    def test_harness_ordinary_lane_fails_closed_on_malformed_terminal_cut(self) -> None:
-        manifest = (
-            REPO_ROOT / "tests" / "run_trust_comprehensive_harness.sh"
-        ).read_text(encoding="utf-8")
-        self.assertIn(
-            "fast.dependency-constellation|fast,push,release|supply-chain|true|never|"
-            "scripts/check_dependency_cycle_anchor.py --push-context "
-            "--derive-when-receipt-absent",
-            manifest,
-        )
-        self.assertIn(
-            'UNQUARANTINABLE_GATE_IDS = {"fast.dependency-constellation"}',
-            manifest,
-        )
-
-        def run_harness(
-            fixture: Fixture, revision: str | None = None
-        ) -> subprocess.CompletedProcess[str]:
-            selected = revision or git(fixture.root, "rev-parse", "HEAD")
-            advertised_old = git(fixture.root, "rev-parse", f"{selected}^")
-            environment = os.environ.copy()
-            environment[anchor.PUSH_REFS_ENV] = (
-                f"refs/heads/main {selected} refs/heads/main {advertised_old}"
-            )
-            return self.run_checker(
-                fixture,
-                "--push-context",
-                "--derive-when-receipt-absent",
-                env=environment,
-            )
-
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            fixture.prepare_wp_root_cycle(extra_root_delta=True)
-            # This is the harness's exact ordinary invocation: no explicit
-            # terminal flag exists to forget or quarantine.
-            result = run_harness(fixture)
-            self.assert_failure(result, "only tree delta")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            (fixture.root / anchor.RECEIPT_PATH).unlink()
-            root_anchor = commit_all(fixture.root, "R0 removes tracked receipt")
-            wrong_trust = git(fixture.root, "rev-parse", f"{root_anchor}^")
-            depends = (
-                f"clean main {fixture.commits['clean']}\n"
-                f"trust-ir main {fixture.commits['trust-ir']}\n"
-                f"trust-cg main {fixture.commits['trust-cg']}\n"
-                f"trust main {wrong_trust}\n"
-                f"ay main {fixture.commits['ay']}\n"
-            )
-            fixture.prepare_wp_root_cycle(depends_content=depends)
-            wrong_row = run_harness(fixture)
-            self.assert_failure(wrong_row, "Trust pin must exactly equal")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            fixture.prepare_wp_root_cycle()
-            write(fixture.root / "post-terminal-R2", "must not downgrade evidence\n")
-            commit_all(fixture.root, "R2 after a valid terminal cut")
-            later_root = run_harness(fixture)
-            self.assert_failure(later_root, "only tree delta")
-
-        for later_root in (False, True):
-            with (
-                self.subTest(partial_w1_later_root=later_root),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                fixture = self.fixture(temporary)
-                fixture.prepare_wp_root_cycle(partial_wp_delta=True)
-                if later_root:
-                    write(
-                        fixture.root / "post-partial-W1-R2",
-                        "partial W1 must remain a terminal claim\n",
-                    )
-                    commit_all(fixture.root, "R2 after malformed partial W1")
-                partial = run_harness(fixture)
-                self.assert_failure(
-                    partial,
-                    "only tree delta" if later_root else "missing_required",
-                )
-
-    def test_push_context_terminal_judgement_ignores_stale_preterminal_head(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            root_anchor, root_terminal = fixture.prepare_wp_root_cycle(
-                partial_wp_delta=True
-            )
-            git(fixture.root, "reset", "--hard", "-q", root_anchor)
-            environment = os.environ.copy()
-            environment[anchor.PUSH_REFS_ENV] = (
-                f"refs/heads/main {root_terminal} refs/heads/main {root_anchor}"
-            )
-            result = self.run_checker(
-                fixture,
-                "--push-context",
-                "--derive-when-receipt-absent",
-                env=environment,
-            )
-            self.assert_failure(result, "missing_required")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            root_anchor, root_terminal = fixture.prepare_wp_root_cycle()
-            git(fixture.root, "reset", "--hard", "-q", root_anchor)
-            pushed = (
-                f"refs/heads/main {root_terminal} refs/heads/main {root_anchor}"
-            )
-            with mock.patch.dict(
-                os.environ, {anchor.PUSH_REFS_ENV: pushed}, clear=False
-            ):
-                result, remote_calls = self.run_terminal_checker_with_remote_witness(
-                    fixture,
-                    "--push-context",
-                    "--derive-when-receipt-absent",
-                )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("immutable terminal policy", result.stdout)
-            self.assertEqual(len(remote_calls), 1)
-            self.assertEqual(remote_calls[0].kwargs["root_commit"], root_terminal)
-
-    def test_wp_depends_lock_shape_and_committed_blob_fail_closed(self) -> None:
-        valid_rows = lambda fixture, trust_row: (
-            f"clean main {fixture.commits['clean']}\n"
-            f"trust-ir main {fixture.commits['trust-ir']}\n"
-            f"trust-cg main {fixture.commits['trust-cg']}\n"
-            f"{trust_row}\n"
-            f"ay main {fixture.commits['ay']}\n"
-        )
-        cases = {
-            "missing-trust": lambda fixture, root: valid_rows(fixture, "").replace("\n\n", "\n"),
-            "duplicate-trust": lambda fixture, root: valid_rows(
-                fixture, f"trust main {root}\ntrust main {root}"
-            ),
-            "wrong-branch": lambda fixture, root: valid_rows(fixture, f"trust trunk {root}"),
-            "short-sha": lambda fixture, root: valid_rows(fixture, "trust main abc"),
-            "unknown-row": lambda fixture, root: valid_rows(
-                fixture, f"trust main {root}\nunknown main {'1' * 40}"
-            ),
-        }
-        for mutation, content in cases.items():
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
-                fixture = self.fixture(temporary)
-                root = git(fixture.root, "rev-parse", "HEAD")
-                fixture.prepare_wp_root_cycle(depends_content=content(fixture, root))
-                result = self.run_checker(
-                    fixture,
-                    "--print-receipt",
-                    "--require-wp-trust-anchor",
-                    "--verify-remote",
-                )
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn("spikes/DEPENDS.lock", result.stderr)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            fixture.prepare_wp_root_cycle()
-
-            def symlink_depends(wp: Path) -> None:
-                target = wp / anchor.WP_DEPENDS_PATH
-                target.unlink()
-                os.symlink("missing-DEPENDS.lock", target)
-
-            fixture.amend_wp_terminal(symlink_depends)
-            result = self.run_checker(
-                fixture,
-                "--print-receipt",
-                "--require-wp-trust-anchor",
-                "--verify-remote",
-            )
-            self.assert_failure(result, "must be a regular committed blob")
-
-    def test_wp_root_anchor_rejects_wrong_parent_merge_grandchild_and_extra_delta(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            wrong_anchor = git(fixture.root, "rev-parse", "HEAD^")
-            rows = (
-                f"clean main {fixture.commits['clean']}\n"
-                f"trust-ir main {fixture.commits['trust-ir']}\n"
-                f"trust-cg main {fixture.commits['trust-cg']}\n"
-                f"trust main {wrong_anchor}\n"
-                f"ay main {fixture.commits['ay']}\n"
-            )
-            fixture.prepare_wp_root_cycle(depends_content=rows)
-            self.assert_failure(
-                self.run_checker(
-                    fixture,
-                    "--print-receipt",
-                    "--require-wp-trust-anchor",
-                    "--verify-remote",
-                ),
-                "Trust pin must exactly equal",
-            )
-
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            fixture.prepare_wp_root_cycle(extra_root_delta=True)
-            self.assert_failure(
-                self.run_checker(
-                    fixture,
-                    "--print-receipt",
-                    "--require-wp-trust-anchor",
-                    "--verify-remote",
-                ),
-                "only tree delta",
-            )
-
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            fixture.prepare_wp_root_cycle(wp_intermediate=True)
-            self.assert_failure(
-                self.run_checker(
-                    fixture,
-                    "--print-receipt",
-                    "--require-wp-trust-anchor",
-                    "--verify-remote",
-                ),
-                "TrustWP W1 must be the root anchor gitlink W0's direct single-parent child",
-            )
-
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            fixture.prepare_wp_root_cycle()
-            write(fixture.root / "grandchild", "not R1\n")
-            commit_all(fixture.root, "grandchild after cycle break")
-            self.assert_failure(
-                self.run_checker(
-                    fixture,
-                    "--print-receipt",
-                    "--require-wp-trust-anchor",
-                    "--verify-remote",
-                ),
-                "only tree delta",
-            )
-
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            root_anchor, root_terminal = fixture.prepare_wp_root_cycle()
-            tree = git(fixture.root, "rev-parse", f"{root_terminal}^{{tree}}")
-            merge = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(fixture.root),
-                    "commit-tree",
-                    tree,
-                    "-p",
-                    root_anchor,
-                    "-p",
-                    root_terminal,
-                ],
-                input="synthetic merge terminal\n",
-                check=True,
-                text=True,
-                stdout=subprocess.PIPE,
-            ).stdout.strip()
-            with self.assertRaisesRegex(anchor.AnchorError, "exactly one raw parent"):
-                anchor.derive_wp_root_anchor(fixture.root, merge, fixture.commits)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = self.fixture(temporary)
-            (fixture.root / anchor.RECEIPT_PATH).unlink()
-            root_anchor = commit_all(fixture.root, "R0 removes tracked receipt")
-            wp = fixture.checkout("trust-wp")
             w0 = fixture.commits["trust-wp"]
-            write(
-                wp / anchor.WP_DEPENDS_PATH,
-                f"clean main {fixture.commits['clean']}\n"
-                f"trust-ir main {fixture.commits['trust-ir']}\n"
-                f"trust-cg main {fixture.commits['trust-cg']}\n"
-                f"trust main {root_anchor}\n"
-                f"ay main {fixture.commits['ay']}\n",
+            side_one = wp_child(wp, w0, "off-main one")
+            side_two = wp_child(wp, side_one, "off-main two")
+            retired = retire_receipt(root, fixture.policy_activation)
+            off_main = pin_wp(root, retired, side_two, "forward off main")
+            rolled_back = pin_wp(root, off_main, side_one, "backward, no restoration")
+            reanchored = pin_wp(root, off_main, fixture.wp_floor, "re-anchor onto canonical main")
+            forged = root_child(root, reanchored, "forge the v3 marker", {
+                anchor.TERMINAL_POLICY_V3_MARKER_PATH: ("100644", write_blob(
+                    root, anchor.render_terminal_policy_v3_marker(fixture.wp_w0, fixture.wp_floor)
+                    .replace(b"ruled=2026-09-21", b"ruled=2026-09-22")))})
+            ahead_lock = wp_depends_lock({**fixture.lock_rows(), "trust": rolled_back})
+            ahead_wp = wp_child(wp, fixture.wp_floor, "lock trust row off the judged line",
+                                {anchor.WP_DEPENDS_PATH: ("100644", write_blob(wp, ahead_lock.encode("ascii")))})
+            ahead = pin_wp(root, reanchored, ahead_wp, "pin a lock whose trust row is off the judged line")
+
+            # HEAD stays at activation throughout: the judged revision is the
+            # one being pushed, green and red alike.
+            self.assertEqual(git(root, "rev-parse", "HEAD"), fixture.policy_activation)
+            green = run_harness(fixture, reanchored, off_main)
+            self.assertEqual(green.returncode, 0, green.stderr)
+            self.assertIn("SUBJECT: push (1 ref update(s))", green.stdout)
+            self.assertIn("2 gitlink move(s) since v1 activation admissible (P2)", green.stdout)
+            self.assert_failure(run_harness(fixture, rolled_back, off_main), "(a) not forward")
+            self.assert_failure(run_harness(fixture, forged, reanchored), "terminal-policy v3 marker row 6 differs")
+            self.assert_failure(run_harness(fixture, ahead, reanchored), "is not an ancestor-or-equal of the judged Trust commit")
+            # A branch push (the hook's other shape) is judged the same way.
+            environment = os.environ.copy()
+            environment[anchor.PUSH_REFS_ENV] = f"refs/heads/topic {rolled_back} refs/heads/topic {'0' * 40}"
+            self.assert_failure(
+                self.run_checker(fixture, "--push-context", "--derive-when-receipt-absent", env=environment),
+                "(a) not forward",
             )
-            git(wp, "add", anchor.WP_DEPENDS_PATH)
-            wp_tree = git(wp, "write-tree")
-            w0_tree = git(wp, "rev-parse", f"{w0}^{{tree}}")
 
-            def commit_tree(repo: Path, tree: str, parents: list[str], message: str) -> str:
-                command = ["git", "-C", str(repo), "commit-tree", tree]
-                for parent in parents:
-                    command.extend(["-p", parent])
-                return subprocess.run(
-                    command,
-                    input=message + "\n",
-                    check=True,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                ).stdout.strip()
-
-            side = commit_tree(wp, w0_tree, [w0], "synthetic WP side parent")
-            merge_wp = commit_tree(
-                wp, wp_tree, [w0, side], "synthetic merge TrustWP terminal"
-            )
-            git(
-                fixture.root,
-                "update-index",
-                "--cacheinfo",
-                f"160000,{merge_wp},{anchor.WP_ROOT_DELTA_PATH}",
-            )
-            root_tree = git(fixture.root, "write-tree")
-            root_terminal = commit_tree(
-                fixture.root, root_tree, [root_anchor], "synthetic R1"
-            )
-            commits = dict(fixture.commits)
-            commits["trust-wp"] = merge_wp
-            with self.assertRaisesRegex(anchor.AnchorError, "terminal TrustWP W1"):
-                anchor.derive_wp_root_anchor(
-                    fixture.root, root_terminal, commits
-                )
-
-    def test_wp_root_anchor_rejects_replacements_grafts_and_shallow_history(self) -> None:
-        for mechanism in ("replacement", "graft", "shallow"):
-            for repository in ("trust", "trust-wp"):
-                with (
-                    self.subTest(mechanism=mechanism, repository=repository),
-                    tempfile.TemporaryDirectory() as temporary,
-                ):
-                    fixture = self.fixture(temporary)
-                    fixture.prepare_wp_root_cycle()
-                    assert fixture.root_anchor is not None
-                    assert fixture.root_terminal is not None
-                    assert fixture.anchor_wp is not None
-                    checkout = (
-                        fixture.root
-                        if repository == "trust"
-                        else fixture.checkout("trust-wp")
-                    )
-                    terminal = (
-                        fixture.root_terminal
-                        if repository == "trust"
-                        else fixture.commits["trust-wp"]
-                    )
-                    parent = (
-                        fixture.root_anchor
-                        if repository == "trust"
-                        else fixture.anchor_wp
-                    )
-
-                    if mechanism == "replacement":
-                        git(checkout, "replace", terminal, parent)
-                        # The raw reader itself must still see the literal
-                        # terminal object rather than Git's replacement view.
-                        self.assertEqual(
-                            anchor.raw_commit_parents(
-                                checkout, terminal, f"{repository} replacement probe"
-                            ),
-                            [parent],
-                        )
-                        message = "forbidden replacement refs"
-                    elif mechanism == "graft":
-                        common_dir = Path(
-                            git(
-                                checkout,
-                                "rev-parse",
-                                "--path-format=absolute",
-                                "--git-common-dir",
-                            )
-                        )
-                        write(common_dir / "info" / "grafts", f"{terminal} {parent}\n")
-                        message = "forbidden legacy graft authority"
-                    else:
-                        shallow_path = Path(
-                            git(
-                                checkout,
-                                "rev-parse",
-                                "--path-format=absolute",
-                                "--git-path",
-                                "shallow",
-                            )
-                        )
-                        write(shallow_path, f"{terminal}\n")
-                        message = "is shallow"
-
-                    with self.assertRaisesRegex(anchor.AnchorError, message):
-                        anchor.derive_wp_root_anchor(
-                            fixture.root,
-                            fixture.root_terminal,
-                            fixture.commits,
-                        )
-
-    def test_wp_root_anchor_binds_terminal_gitlink_and_both_remote_mains(self) -> None:
+    def test_external_receipt_has_no_wp_trust_anchor_member(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self.fixture(temporary)
-            fixture.prepare_wp_root_cycle()
+            generated = self.run_checker(fixture, "--print-receipt")
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            receipt = json.loads(generated.stdout)
+            self.assertNotIn("wp_trust_anchor", receipt)
+            self.assertEqual(receipt["schema"], anchor.EXTERNAL_SCHEMA)
+            anchor.validate_external_receipt(receipt)
+            legacy = dict(receipt)
+            legacy["wp_trust_anchor"] = None
+            with self.assertRaisesRegex(anchor.AnchorError, "keys differ"):
+                anchor.validate_external_receipt(legacy)
 
-            mismatched = dict(fixture.commits)
-            assert fixture.anchor_wp is not None
-            mismatched["trust-wp"] = fixture.anchor_wp
-            with self.assertRaisesRegex(anchor.AnchorError, "differs from the terminal repository binding"):
-                assert fixture.root_terminal is not None
-                anchor.derive_wp_root_anchor(
-                    fixture.root, fixture.root_terminal, mismatched
-                )
-
-            assert fixture.root_terminal is not None
+    def test_verify_remote_main_probes_all_nine_and_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            root_commit = git(fixture.root, "rev-parse", "HEAD")
             with mock.patch.object(anchor, "verify_one_remote_main") as verify_one:
-                anchor.verify_remote_main(
-                    fixture.commits, root_commit=fixture.root_terminal
-                )
+                anchor.verify_remote_main(fixture.commits, root_commit=root_commit)
             expected_calls = [
                 mock.call(name, anchor.SUBMODULES[name][1], fixture.commits[name])
                 for name in sorted(anchor.SUBMODULES)
-            ] + [mock.call("trust", anchor.ROOT_URL, fixture.root_terminal)]
+            ] + [mock.call("trust", anchor.ROOT_URL, root_commit)]
             self.assertEqual(verify_one.call_args_list, expected_calls)
+
+    def test_real_origin_main_history_is_green_under_v3(self) -> None:
+        """The real Trust history since v1 activation, judged by P1-P4 -- GREEN.
+
+        ONLY the live ``ls-remote`` sample is stubbed: it is replaced by the
+        trust-wp submodule's remote-tracking ``refs/remotes/origin/main``, the
+        last fetched value of the very same ref.  Every marker, gitlink, lock
+        blob and ancestry edge is read from this clone's real objects, and the
+        constants are the ruling's own.  The moves the ledger records must
+        each be admissible: ``f5599702`` (72274168 -> 04e6fffe, backward,
+        same lock; on the canonical line, so clause (b)), its restoration,
+        72274168 -> 9cbcc2cb (forward), and ``8325008ba62`` (9cbcc2cb ->
+        684821d0, sideways onto main with the lock identical, clause (b)).
+        """
+        root_commit = git(REPO_ROOT, "rev-parse", "HEAD")
+        self.assertEqual(
+            git(REPO_ROOT, "cat-file", "-t", f"HEAD:{anchor.TERMINAL_POLICY_V3_MARKER_PATH}", check=False),
+            "blob",
+            "HEAD predates terminal-policy v3; this test judges the real history under v3",
+        )
+        wp = REPO_ROOT / anchor.SUBMODULES["trust-wp"][0]
+        remote_main = git(wp, "rev-parse", "--verify", "refs/remotes/origin/main", check=False)
+        self.assertRegex(
+            remote_main, r"^[0-9a-f]{40}$",
+            "first-party/trust-wp has no refs/remotes/origin/main; git -C first-party/trust-wp fetch origin main",
+        )
+        submodules = anchor.committed_submodules(REPO_ROOT, root_commit)
+        commits = {name: commit for name, (_path, _url, commit) in submodules.items()}
+
+        # The recorded shapes are really there.
+        def wp_at(commit: str) -> str:
+            return git(REPO_ROOT, "rev-parse", f"{commit}:{anchor.WP_ROOT_DELTA_PATH}")
+
+        backward, restore, forward, sideways = (
+            "f559970230e624c939f79eaa90685b0e50540e5b",
+            "6ad0c5e76f76b47b22492ee68f7270526d3b8ada",
+            "bfb7b5089a2faa87155df4fa807db7c82b0fda35",
+            "8325008ba623c1ab3443eddd2c2ed99b2562da43",
+        )
+        a72, a04, a9c, a68 = (
+            "72274168a37f133259f843941ef5f7d7615df67b",
+            "04e6fffe64d93ba474f077ad7ba2be1341f3b00d",
+            "9cbcc2cb47be6f7efd2ac110e3d5f3a4f259e1ff",
+            "684821d0f2e2a31d640a0bdc9ab24977c539b1b7",
+        )
+        # These TrustWP commits are held by trust-wp's refs/pins/* anchors, which
+        # neither a submodule update nor a default fetch brings. The judgement
+        # below fetches what it reads, by sha (PUSH-PATH-CLONE-STATE); fetch the
+        # same way before the recorded shapes are read here, or a clone without
+        # the pins reads a missing object as "not an ancestor".
+        recorded = (a72, a04, a9c, a68, anchor.TRUST_WP_PRESERVATION_FLOOR)
+        _absent, detail = anchor.fetch_absent_trust_wp_objects(wp, recorded)
+        self.assertEqual(anchor.absent_commits(wp, recorded), [], detail)
+        for root_edge in (backward, restore, forward, sideways):
+            self.assertTrue(is_ancestor(REPO_ROOT, root_edge, root_commit), root_edge)
+        self.assertEqual((wp_at(f"{backward}^"), wp_at(backward)), (a72, a04))
+        self.assertEqual((wp_at(f"{restore}^"), wp_at(restore)), (a04, a72))
+        self.assertEqual((wp_at(f"{forward}^"), wp_at(forward)), (a72, a9c))
+        self.assertEqual((wp_at(f"{sideways}^"), wp_at(sideways)), (a9c, a68))
+        self.assertTrue(is_ancestor(wp, a04, a72))
+        self.assertTrue(is_ancestor(wp, a72, a9c))
+        self.assertFalse(is_ancestor(wp, a9c, a68), "8325008ba62 really is sideways")
+        self.assertTrue(is_ancestor(wp, a68, remote_main))
+        self.assertTrue(is_ancestor(wp, anchor.TRUST_WP_PRESERVATION_FLOOR, remote_main))
+        locks = {commit: git(wp, "rev-parse", f"{commit}:{anchor.WP_DEPENDS_PATH}") for commit in (a72, a04, a9c, a68)}
+        self.assertEqual(len(set(locks.values())), 1, locks)
+
+        # The two v1-era landings that once refused every push are still in
+        # the judged DAG and are still accepted by the marked-subgraph walk.
+        propagation = "3c2c11e530bb5e0253f8a412f4a0892528915091"
+        landing = "e42bba0a61bbd72d97ebf9e27205bb0c58febb15"
+        for commit in (propagation, landing):
+            self.assertTrue(is_ancestor(REPO_ROOT, commit, root_commit), commit)
+
+        # MAIN-REDS-1: the ``-s ours`` merge that keeps a July stash reachable.
+        # Its index commit stages TrustWP eb18c757 back over its only parent's
+        # 5443d384, a binding that parent's own pre-activation ancestry had
+        # published at e5877167 (CONSTELLATION-RESTORE), so the inactive
+        # lineage mints nothing and is accepted.
+        stash_merge, stash, stash_index, stash_parent, first_publisher = (
+            "1fedcff19d84ce1300047639ef40d56b878f6a5c",
+            "50181df41833089a8f3c5d5e9f5a03c86de96951",
+            "1b0fe79fc1ba9d3b14849bf132fdb267b35b1009",
+            "38cb00023f7919397252374dc679597cc092de19",
+            "e58771678ea1d25530f4755ad5e4232f67d0055a",
+        )
+        aeb, a54 = (
+            "eb18c75702a8b60a411947296557c1405551ec1d",
+            "5443d38463d267fdbd1d151e39c7fc091f1076f7",
+        )
+        self.assertTrue(is_ancestor(REPO_ROOT, stash_merge, root_commit))
+        self.assertEqual(git(REPO_ROOT, "rev-parse", f"{stash_merge}^2"), stash)
+        self.assertEqual(git(REPO_ROOT, "rev-parse", f"{stash}^2"), stash_index)
+        self.assertEqual(git(REPO_ROOT, "rev-parse", f"{stash_index}^@"), stash_parent)
+        self.assertEqual((wp_at(stash_parent), wp_at(stash_index)), (a54, aeb))
+        self.assertEqual((wp_at(f"{first_publisher}^") != aeb, wp_at(first_publisher)), (True, aeb))
+        self.assertTrue(is_ancestor(REPO_ROOT, first_publisher, stash_parent))
+
+        # CONSTELLATION-UNBOUND-ROOT: the preservation merge 3ca41eb1a3 keeps
+        # `git stash -u` commits reachable. Each stash's untracked-files parent
+        # is parentless with no first-party/ tree, so it carries no binding.
+        preservation, stash_u, untracked = (
+            "3ca41eb1a339698a4777725f1b7cdad229771eb0",
+            "32aa3e22ce659518a66c6c352c3e2283d4710aa0",
+            "68cf95644cd6aab907c68bd469a71b65bc551872",
+        )
+        self.assertTrue(is_ancestor(REPO_ROOT, preservation, root_commit))
+        self.assertIn(stash_u, git(REPO_ROOT, "rev-parse", f"{preservation}^@").split())
+        self.assertEqual(git(REPO_ROOT, "rev-parse", f"{stash_u}^3"), untracked)
+        self.assertEqual(git(REPO_ROOT, "rev-parse", f"{untracked}^@"), "")
+        self.assertEqual(git(REPO_ROOT, "ls-tree", untracked, "first-party"), "")
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            verdict = anchor.validate_trust_wp_policy(REPO_ROOT, root_commit, commits, remote_main)
+        self.assertTrue(is_ancestor(REPO_ROOT, first_publisher, f"{verdict['activation_commit']}^"))
+        self.assertFalse(is_ancestor(REPO_ROOT, stash_merge, f"{verdict['activation_commit']}"))
+        self.assertEqual(verdict["wp_remote_main"], remote_main)
+        self.assertGreaterEqual(int(str(verdict["moves"])), 9)
+        pins = anchor.validate_trust_wp_binding_coherence(REPO_ROOT, root_commit, commits)
+        self.assertEqual(set(pins), anchor.WP_DEPENDS_REPOSITORIES)
+        for repository, row in pins.items():
+            checkout = REPO_ROOT if repository == "trust" else REPO_ROOT / anchor.SUBMODULES[repository][0]
+            terminal = root_commit if repository == "trust" else commits[repository]
+            self.assertTrue(is_ancestor(checkout, row, terminal), (repository, row))
 
     def test_remote_main_probe_scrubs_redirecting_git_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3960,139 +3594,133 @@ class CommittedConstellationTests(unittest.TestCase):
                 with self.assertRaisesRegex(anchor.AnchorError, "cannot resolve probe"):
                     anchor.verify_one_remote_main("probe", canonical, commit)
 
-    def test_remote_main_probe_environment_and_exact_row_fail_closed(self) -> None:
+    def test_github_main_uses_shared_inventory_and_scrubs_configuration(self) -> None:
         commit = "1" * 40
-        completed = subprocess.CompletedProcess(
-            ["git", "ls-remote"],
-            0,
-            stdout=f"{commit}\trefs/heads/main\n".encode("ascii"),
-            stderr=b"",
+        inventory = subprocess.CompletedProcess(
+            ["agh", "repo", "refs"], 0,
+            stdout=f"{'2' * 40}\trefs/heads/other\n{commit}\trefs/heads/main\n{'3' * 40}\trefs/pins/source\n",
+            stderr="",
         )
         hostile = {
-            "GIT_CONFIG": "/tmp/attacker-config",
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG": "/tmp/attacker-config", "GIT_CONFIG_COUNT": "1",
             "GIT_CONFIG_KEY_0": "url.file:///tmp/attacker.insteadOf",
             "GIT_CONFIG_VALUE_0": anchor.ROOT_URL,
             "GIT_CONFIG_PARAMETERS": "'url.file:///tmp/attacker.insteadOf'='x'",
-            "GIT_DIR": "/tmp/attacker.git",
-            "GIT_CURL_VERBOSE": "1",
-            "GIT_EXEC_PATH": "/tmp/attacker-git-helpers",
-            "GIT_SSL_NO_VERIFY": "1",
-            "GIT_TRACE_CURL": "1",
-            "SSL_CERT_FILE": "/tmp/attacker-ca.pem",
+            "GIT_DIR": "/tmp/attacker.git", "GIT_CURL_VERBOSE": "1",
+            "GIT_EXEC_PATH": "/tmp/attacker-git-helpers", "GIT_SSL_NO_VERIFY": "1",
+            "GIT_TRACE_CURL": "1", "SSL_CERT_FILE": "/tmp/attacker-ca.pem",
         }
+        original_run = subprocess.run
         with mock.patch.dict(os.environ, hostile, clear=False):
-            with mock.patch.object(
-                anchor.subprocess, "run", return_value=completed
-            ) as run:
-                anchor.verify_one_remote_main("trust", anchor.ROOT_URL, commit)
-        _args, kwargs = run.call_args
+            with mock.patch.object(anchor.rt, "remote_refs", return_value=inventory) as advertised:
+                with mock.patch.object(anchor.subprocess, "run", wraps=original_run) as local:
+                    anchor.verify_one_remote_main("trust", anchor.ROOT_URL, commit)
+        self.assertEqual(advertised.call_count, 1)
+        self.assertEqual(advertised.call_args.args, (anchor.ROOT_URL,))
+        kwargs = advertised.call_args.kwargs
         environment = kwargs["env"]
         self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(environment["GIT_CONFIG_SYSTEM"], os.devnull)
-        self.assertEqual(
-            Path(environment["GIT_CEILING_DIRECTORIES"]),
-            Path(kwargs["cwd"]).resolve(),
-        )
+        self.assertEqual(Path(environment["GIT_CEILING_DIRECTORIES"]), kwargs["cwd"].resolve())
+        self.assertEqual(kwargs["git_dir"], kwargs["cwd"] / "witness.git")
+        self.assertEqual(kwargs["timeout"], anchor.rt.LS_REMOTE_TIMEOUT_S)
         for key in hostile:
             self.assertNotIn(key, environment)
-        self.assertTrue(Path(kwargs["cwd"]).name.startswith("trust-remote-main-"))
-        self.assertEqual(
-            run.call_args.args[0],
-            [
-                "git",
-                "ls-remote",
-                "--exit-code",
-                anchor.ROOT_URL,
-                "refs/heads/main",
-            ],
-        )
+        self.assertEqual(local.call_count, 1)
+        self.assertEqual(local.call_args.args[0][:5], ["git", "init", "--quiet", "--bare", "--template="])
+        self.assertTrue(Path(local.call_args.kwargs["cwd"]).name.startswith("trust-remote-main-"))
+        self.assertFalse(kwargs["cwd"].exists(), "the private witness view is removed")
 
-        stale = subprocess.CompletedProcess(
-            ["git", "ls-remote"],
-            0,
-            stdout=f"{'2' * 40}\trefs/heads/main\n".encode("ascii"),
-            stderr=b"",
+    def test_github_route_refuses_without_credential_or_git_fallback(self) -> None:
+        refused = subprocess.CompletedProcess(
+            ["agh", "repo", "refs"], 11, "", "native authenticated route unavailable"
         )
-        with mock.patch.object(anchor.subprocess, "run", return_value=stale):
-            with self.assertRaisesRegex(anchor.AnchorError, "not exactly remote main"):
-                anchor.verify_one_remote_main("trust", anchor.ROOT_URL, commit)
+        original_run = subprocess.run
+        with mock.patch.object(anchor.rt, "remote_refs", return_value=refused) as advertised:
+            with mock.patch.object(anchor.subprocess, "run", wraps=original_run) as local:
+                with self.assertRaisesRegex(anchor.AnchorError, "authenticated route unavailable"):
+                    anchor.sample_trust_wp_remote_main()
+        self.assertEqual(advertised.call_count, 1)
+        self.assertEqual(local.call_count, 1)
+        self.assertEqual(local.call_args.args[0][:2], ["git", "init"])
 
-    def test_remote_main_private_credential_retry_is_host_scoped_and_redacted(self) -> None:
-        commit = "1" * 40
-        unauthenticated = subprocess.CompletedProcess(
-            ["git", "ls-remote"], 128, stdout=b"", stderr=b"authentication required"
-        )
-        success = subprocess.CompletedProcess(
-            ["git", "ls-remote"],
-            0,
-            stdout=f"{commit}\trefs/heads/main\n".encode("ascii"),
-            stderr=b"",
-        )
-        header = "Authorization: Basic dXNlcjpzZWNyZXQ="
-        with mock.patch.object(
-            anchor, "github_authorization_header", return_value=header
-        ) as credential:
-            with mock.patch.object(
-                anchor.subprocess, "run", side_effect=[unauthenticated, success]
-            ) as run:
-                anchor.verify_one_remote_main("trust", anchor.ROOT_URL, commit)
-        self.assertEqual(credential.call_count, 1)
-        self.assertEqual(run.call_count, 2)
-        first, second = run.call_args_list
-        self.assertNotIn("GIT_CONFIG_COUNT", first.kwargs["env"])
-        self.assertEqual(second.kwargs["env"]["GIT_CONFIG_COUNT"], "1")
-        self.assertEqual(
-            second.kwargs["env"]["GIT_CONFIG_KEY_0"],
-            "http.https://github.com/.extraHeader",
-        )
-        self.assertEqual(second.kwargs["env"]["GIT_CONFIG_VALUE_0"], header)
-        self.assertNotIn(header, " ".join(second.args[0]))
-
-        leaked = subprocess.CompletedProcess(
-            ["git", "ls-remote"],
-            128,
-            stdout=b"",
-            stderr=f"transport echoed {header} dXNlcjpzZWNyZXQ=\n".encode("ascii"),
-        )
-        with mock.patch.object(
-            anchor, "github_authorization_header", return_value=header
-        ):
-            with mock.patch.object(
-                anchor.subprocess, "run", side_effect=[unauthenticated, leaked]
-            ):
-                with self.assertRaises(anchor.AnchorError) as raised:
-                    anchor.verify_one_remote_main("trust", anchor.ROOT_URL, commit)
-        diagnostic = str(raised.exception)
-        self.assertNotIn(header, diagnostic)
-        self.assertNotIn("dXNlcjpzZWNyZXQ=", diagnostic)
-        self.assertIn("<redacted>", diagnostic)
-
-    def test_github_credential_protocol_rejects_duplicate_or_conflicting_sources(self) -> None:
+    def test_github_main_requires_exact_single_live_main(self) -> None:
         cases = {
-            "duplicate": (
-                b"protocol=https\nhost=github.com\nusername=user\n"
-                b"password=one\npassword=two\n"
-            ),
-            "conflicting": (
-                b"protocol=https\nhost=github.com\nusername=user\n"
-                b"password=secret\nauthtype=Bearer\ncredential=token\n"
-            ),
+            "missing": "",
+            "master only": f"{'1' * 40}\trefs/heads/master\n",
+            "duplicate": f"{'1' * 40}\trefs/heads/main\n{'2' * 40}\trefs/heads/main\n",
+            "malformed identity": "not-an-oid\trefs/heads/main\n",
         }
-        for mutation, output in cases.items():
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
-                completed = subprocess.CompletedProcess(
-                    ["git", "credential", "fill"],
-                    0,
-                    stdout=output,
-                    stderr=b"",
-                )
-                with mock.patch.object(anchor.subprocess, "run", return_value=completed):
+        for label, rows in cases.items():
+            with self.subTest(label=label):
+                done = subprocess.CompletedProcess(["agh", "repo", "refs"], 0, rows, "")
+                with mock.patch.object(anchor.rt, "remote_refs", return_value=done):
                     with self.assertRaises(anchor.AnchorError):
-                        anchor.github_authorization_header(
-                            anchor.ROOT_URL, Path(temporary)
-                        )
+                        anchor.sample_trust_wp_remote_main()
+        current = subprocess.CompletedProcess(
+            ["agh", "repo", "refs"], 0, f"{'2' * 40}\trefs/heads/main\n", ""
+        )
+        with mock.patch.object(anchor.rt, "remote_refs", return_value=current):
+            with mock.patch.object(anchor, "run_git", side_effect=AssertionError("no local tracking-ref authority")):
+                with self.assertRaisesRegex(anchor.AnchorError, "not exactly remote main"):
+                    anchor.verify_one_remote_main("trust", anchor.ROOT_URL, "1" * 40)
+
+    def test_github_source_intake_keeps_exact_blobs_and_reports_missing_oids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            store = base / "caller"
+            init_repo(store)
+            write(store / "source", "original\n")
+            before = commit_all(store, "original caller")
+            provider = base / "native source provider"
+            subprocess.run(["git", "clone", "-q", str(store), str(provider)], check=True)
+            git(provider, "config", "user.name", "source-provider")
+            git(provider, "config", "user.email", "source-provider@example.invalid")
+            write(provider / "spikes/DEPENDS.lock", "actual source blob needed by P2\n")
+            wanted = commit_all(provider, "remote source")
+            missing = "e" * 40
+            refs = git(store, "for-each-ref")
+            config = (store / ".git/config").read_bytes()
+            fetch_head = store / ".git/FETCH_HEAD"
+            fetch_head.write_text("preserve caller fetch head\n")
+            calls = []
+
+            def native_source(url, checkout, oid, *, env, timeout):
+                self.assertEqual(url, anchor.SUBMODULES["trust-wp"][1])
+                self.assertEqual(checkout, store)
+                self.assertEqual(timeout, anchor.TRUST_WP_FETCH_TIMEOUT_S)
+                calls.append(oid)
+                if oid == missing:
+                    return subprocess.CompletedProcess(["agh", "repo", "fetch"], 1, "", "source unavailable")
+                # Only the service boundary is substituted: transfer real full
+                # Git objects from a literal local provider, with no ref update.
+                return subprocess.run(
+                    ["git", "-C", str(store), "fetch", "--no-write-fetch-head", "--no-tags", "--refmap=",
+                     "--", str(provider), oid],
+                    capture_output=True, text=True, env=env, timeout=timeout,
+                )
+
+            with mock.patch.object(anchor.rt, "fetch_exact_source", side_effect=native_source):
+                requested, detail = anchor.fetch_absent_trust_wp_objects(
+                    store, [before, wanted, wanted, missing]
+                )
+            self.assertEqual(requested, [wanted, missing])
+            self.assertEqual(calls, [wanted, missing])
+            self.assertIn("did not bring eeeeeeeeeeee", detail)
+            self.assertEqual(git(store, "show", wanted + ":spikes/DEPENDS.lock"), "actual source blob needed by P2")
+            self.assertEqual(git(store, "rev-parse", "HEAD"), before)
+            self.assertEqual(git(store, "for-each-ref"), refs)
+            self.assertEqual((store / ".git/config").read_bytes(), config)
+            self.assertEqual(fetch_head.read_text(), "preserve caller fetch head\n")
+            with mock.patch.object(anchor.rt, "fetch_exact_source") as no_intake:
+                self.assertEqual(anchor.fetch_absent_trust_wp_objects(store, [wanted, before, wanted]), ([], ""))
+                no_intake.assert_not_called()
+            success_without_objects = subprocess.CompletedProcess(["agh", "repo", "fetch"], 0, "", "")
+            with mock.patch.object(anchor.rt, "fetch_exact_source", return_value=success_without_objects):
+                requested, detail = anchor.fetch_absent_trust_wp_objects(store, [missing])
+            self.assertEqual(requested, [missing])
+            self.assertIn("complete source still unavailable", detail)
 
 
 if __name__ == "__main__":

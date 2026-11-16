@@ -1,0 +1,42 @@
+[package]
+name = "trust-build-tree"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates"]
+repository = "https://github.com/alabsystems/trust"
+description = "Native ownership of Trust's existing build holder and output lock"
+readme = "README.md"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Explicit real frontdoor qualification: TRUST_BUILD_TREE_TARGO and
+# TRUST_BUILD_TREE_BOOTSTRAP must identify the actual built executables.
+# Native namespace/withholding policy actors run in the default harness.
+native-cli-tests = []
+machine-admission = ["dep:trust-build-cpu", "dep:trust-sha2", "dep:jobserver_utils"]
+# Actual child execution is separate from the client-disabled original courier.
+native-exec = ["machine-admission", "jobserver_utils/client", "dep:trust-resource-provenance"]
+# Same-attempt resident input closure; ordinary local joins still cannot release.
+resident-inputs = ["machine-admission", "dep:trust-resource-controller"]
+
+[dependencies]
+tempfile = "3.23"
+serde = "1"
+serde_derive = "1"
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+trust-build-cpu = { path = "../trust-build-cpu", features = ["observations"], optional = true }
+trust-sha2 = { path = "../trust-sha2", optional = true }
+jobserver_utils = { path = "../../src/jobserver_utils", default-features = false, optional = true }
+trust-resource-provenance = { path = "../trust-resource-provenance", optional = true }
+trust-resource-controller = { path = "../trust-resource-controller", default-features = false, features = ["client"], optional = true }
+
+# The default native owner does not activate machine-admission dependencies.
+# Cargo still reads their optional path manifests and inherited workspace
+# metadata during resolution; packaging fixtures must retain those real inputs.
+[workspace]

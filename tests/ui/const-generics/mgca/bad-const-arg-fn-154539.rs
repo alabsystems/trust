@@ -1,11 +1,14 @@
-#![feature(min_generic_const_args)]
+#![feature(gca_min_const_items)]
+
+use std::gca;
 
 trait Iter<
     const FN: fn() = {
-        || { //~ ERROR complex const arguments must be placed inside of a `const` block
+        gca!(|| {
+            //~^ ERROR complex const arguments must be placed inside of a `const` block
             use std::io::*;
             write!(_, "")
-        }
+        })
     },
 >
 {

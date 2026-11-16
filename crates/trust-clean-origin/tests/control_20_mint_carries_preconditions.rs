@@ -25,6 +25,7 @@
 //! the obligation SURVIVING the mint, which is the step that was structurally
 //! impossible before.
 
+use clean_kernel::{BinderInfo, Expr, Level, Name};
 use trust_clean_carrier::{
     CarrierRefused, PreconditionOperand, carrier_at, carrier_signature_for,
     carrier_signature_with_hypotheses_for,
@@ -34,8 +35,6 @@ use trust_clean_origin::{MintRefusal, decide_mint, decide_mint_from_signature};
 // in scope to mint a `KernelChecked` status at all, which is the seam working
 // as designed (a crate that cannot name the kernel cannot fabricate one).
 use trust_symbols::{AxiomClosure, CicKernelRecheck, KernelAuthority, KernelStatus, TermDigest};
-
-use clean_kernel::{BinderInfo, Expr, Level, Name};
 
 fn c(n: &str) -> Expr {
     Expr::const_(Name::from_string(n), vec![])
@@ -51,11 +50,10 @@ fn u64_ty() -> trust_types::Ty {
 
 /// `@Ne UInt64 <a> <b>`.
 fn ne(a: Expr, b: Expr) -> Expr {
-    Expr::apps(Expr::const_(Name::from_string("Ne"), vec![Level::succ(Level::zero())]), [
-        uint64_ty(),
-        a,
-        b,
-    ])
+    Expr::apps(
+        Expr::const_(Name::from_string("Ne"), vec![Level::succ(Level::zero())]),
+        [uint64_ty(), a, b],
+    )
 }
 
 fn numeral(n: u64) -> Expr {
@@ -75,8 +73,10 @@ fn safe_rem_ty() -> Expr {
 /// that can mint. See `control_1_mint_preconditions.rs` for why a test may
 /// construct one.
 fn kernel_checked() -> KernelStatus {
-    CicKernelRecheck::held_by_kernel_recheck()
-        .kernel_checked(TermDigest::of_bytes(b"a term the kernel re-checked"), AxiomClosure::audited([]))
+    CicKernelRecheck::held_by_kernel_recheck().kernel_checked(
+        TermDigest::of_bytes(b"a term the kernel re-checked"),
+        AxiomClosure::audited([]),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -181,12 +181,10 @@ fn an_unstatable_hypothesis_refuses_the_mint_and_the_note_carries_the_fix() {
     // this compiler cannot state it, so the declaration does NOT become
     // callable — erasing it would advertise a weaker contract than the kernel
     // checked. v7/D3: the refusal names the supported form and the options.
-    let lt = Expr::apps(Expr::const_(Name::from_string("LT.lt"), vec![Level::zero()]), [
-        uint64_ty(),
-        c("instLTUInt64"),
-        Expr::bvar(1),
-        Expr::bvar(0),
-    ]);
+    let lt = Expr::apps(
+        Expr::const_(Name::from_string("LT.lt"), vec![Level::zero()]),
+        [uint64_ty(), c("instLTUInt64"), Expr::bvar(1), Expr::bvar(0)],
+    );
     let ty = pi(uint64_ty(), pi(uint64_ty(), pi(lt, uint64_ty())));
 
     let refusal = decide_mint_from_signature(
@@ -198,8 +196,5 @@ fn an_unstatable_hypothesis_refuses_the_mint_and_the_note_carries_the_fix() {
 
     let note = refusal.note();
     assert!(note.contains("options:"), "a refusal with no next step is a defect:\n{note}");
-    assert!(
-        note.contains('≠'),
-        "the note must name the hypothesis form that IS carried:\n{note}"
-    );
+    assert!(note.contains('≠'), "the note must name the hypothesis form that IS carried:\n{note}");
 }

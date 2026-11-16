@@ -167,7 +167,7 @@ fn parse_expected_tokens(content: &str) -> Vec<(String, String)> {
         }
         // Continuation: `^//[[:space:]]+` AND contains a status; otherwise stop.
         let Some(after) = line.strip_prefix("//") else { break };
-        if !after.starts_with(|ch: char| ch == ' ' || ch == '\t') {
+        if !after.starts_with([' ', '\t']) {
             break;
         }
         if !STATUS_KEYWORDS.iter().any(|status| after.contains(status)) {
@@ -459,7 +459,7 @@ fn evaluate_buggy(rows: &[AuthenticatedOutcome], kind: &str, status: &str) -> bo
         return false;
     }
     if status == "FAILED" {
-        matching.iter().any(|row| row.outcome.is_failed())
+        matching.iter().any(|row| row.credited_outcome().is_failed())
     } else {
         // A fixture header spells its expectation the way a human reads it
         // (`RUNTIME-CHECKED`); the shared outcome parser is what reconciles that
@@ -468,7 +468,7 @@ fn evaluate_buggy(rows: &[AuthenticatedOutcome], kind: &str, status: &str) -> bo
         let Some(expected) = trust_types::Outcome::parse(status) else {
             return false;
         };
-        matching.iter().any(|row| row.outcome == expected)
+        matching.iter().any(|row| row.credited_outcome() == expected)
     }
 }
 
@@ -487,9 +487,9 @@ fn evaluate_safe(rows: &[AuthenticatedOutcome], kind: &str, status: &str) -> boo
         let Some(expected) = trust_types::Outcome::parse(status) else {
             return false;
         };
-        return matching.iter().any(|row| row.outcome == expected);
+        return matching.iter().any(|row| row.credited_outcome() == expected);
     }
-    matching.iter().all(|row| row.outcome.is_proved())
+    matching.iter().all(|row| row.credited_outcome().is_proved())
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +775,21 @@ fn dev_test_lib(root: &Path) -> Result<()> {
     // been masking it). Apply the SAME memory-aware policy to the harness: `RUST_TEST_THREADS`
     // is libtest's documented env knob and is inherited by every test binary cargo spawns.
     // Measured on a 48 GB host: 14 threads → SIGKILL; 4 threads → 2420 tests pass in ~9 min.
+    //
+    // Trust: this lane inherits the compiler-unit budget in `memory_aware_jobs`
+    // deliberately, and the 2026-09-09 change from a 5 GiB to a 12 GiB per-job
+    // budget MOVES it: 18 → 9 threads on a 128 GiB host, 9 → 3 on the 48 GB
+    // host above. The 48 GB row is the one with evidence, and the new number
+    // is the better of the two: 4 threads good / 14 fatal on 48 GB is a
+    // measured-good density near 12 GB per thread, which is what the new
+    // budget encodes, while the old budget answered 9 there — above the
+    // measured-good width and below the measured-fatal one, i.e. untested.
+    // The 128 GiB row is a real, unmeasured cost: this 2400-test lib run gets
+    // half the harness threads it used to. That direction is the safe one for
+    // a lane whose recorded failure mode is the host running out of memory,
+    // but nobody has timed it, and if this lane's wall time becomes the
+    // complaint, give the harness its own budget rather than raising the
+    // compiler's.
     let test_threads = jobs.to_string();
     let mut envs: Vec<(&str, &str)> = vec![
         ("CARGO_INCREMENTAL", "1"),
@@ -905,12 +920,14 @@ mod tests {
             outcome: trust_types::Outcome::Unknown,
             has_obligation_id: true,
             has_location: true,
+            assumed_discharge: false,
         };
         let prohibited = AuthenticatedOutcome {
             kind: "float_division_by_zero".into(),
             outcome: trust_types::Outcome::Unknown,
             has_obligation_id: true,
             has_location: true,
+            assumed_discharge: false,
         };
         assert!(evaluate_buggy(
             std::slice::from_ref(&unrelated),
@@ -941,6 +958,7 @@ mod tests {
             outcome,
             has_obligation_id: true,
             has_location: true,
+            assumed_discharge: false,
         };
         let failed = [row("divzero", trust_types::Outcome::Failed)];
         let proved = [row("divzero", trust_types::Outcome::Proved)];
@@ -955,6 +973,18 @@ mod tests {
         assert!(!evaluate_safe(&[], "divzero", "PROVED"));
         assert!(!evaluate_safe(&failed, "divzero", "PROVED"));
         assert!(!evaluate_safe(&unknown, "divzero", "PROVED"));
+
+        // Trust (OD-1 phase 1): a `proved` instance-discharge row is authenticated
+        // and earns nothing: it never satisfies PROVED, under either spelling.
+        let discharge_kind = trust_types::assumption::INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND;
+        let discharge = [AuthenticatedOutcome {
+            assumed_discharge: true,
+            has_obligation_id: false,
+            ..row(discharge_kind, trust_types::Outcome::Proved)
+        }];
+        assert!(!evaluate_safe(&discharge, discharge_kind, "PROVED"));
+        assert!(!evaluate_safe(&discharge, discharge_kind, "proved"));
+        assert!(!evaluate_buggy(&discharge, discharge_kind, "PROVED"));
     }
 
     #[test]

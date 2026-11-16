@@ -119,20 +119,6 @@ pub(crate) fn is(name: &str, pins: &[&str]) -> bool {
 // The producer's two call-path decorations, parsed by their EXACT format
 // ---------------------------------------------------------------------------
 
-/// The literal opener of the generic-argument disambiguator, byte-for-byte as
-/// `trust_mir_extract::convert::disambiguate_generic_call_path` writes it:
-/// `format!("{path}::<__trust_args@{lo:016x}{hi:016x}>")`.
-const ARGS_MARKER_OPEN: &str = "::<__trust_args@";
-
-/// `Fingerprint::split()` gives two `u64` halves, each rendered `{:016x}`.
-/// FIXED width is the producer's own injectivity argument (`Fingerprint::to_hex`
-/// is not fixed-width and is deliberately not used).
-const ARGS_MARKER_HEX_LEN: usize = 32;
-
-/// `"::<__trust_args@" + 32 hex + ">"` — a constant, so the marker is located
-/// by ARITHMETIC from the end of the string, never by searching its text.
-const ARGS_MARKER_LEN: usize = ARGS_MARKER_OPEN.len() + ARGS_MARKER_HEX_LEN + 1;
-
 /// `path` with the trailing generic-argument disambiguator removed, or `path`
 /// unchanged when it carries none.
 ///
@@ -144,9 +130,8 @@ const ARGS_MARKER_LEN: usize = ARGS_MARKER_OPEN.len() + ARGS_MARKER_HEX_LEN + 1;
 /// "::<__trust_args@" <hex> <hex> … <hex> ">"      (exactly 32 lowercase hex digits)
 /// ```
 ///
-/// anchored at the END of the string, at a fixed offset of
-/// [`ARGS_MARKER_LEN`] bytes. There is no `find`/`rfind`/`contains`: the
-/// candidate window is computed by subtraction and then compared literally, so
+/// anchored at the END of the string, at a fixed offset (a constant length).
+/// There is no `find`/`rfind`/`contains`: the candidate window is computed by subtraction and then compared literally, so
 /// a `__trust_args`-looking fragment ANYWHERE else in the path is invisible to
 /// this function.
 ///
@@ -163,22 +148,10 @@ const ARGS_MARKER_LEN: usize = ARGS_MARKER_OPEN.len() + ARGS_MARKER_HEX_LEN + 1;
 /// path, never a whole path.
 #[must_use]
 pub(crate) fn without_args_disambiguator(path: &str) -> &str {
-    let Some(head_len) = path.len().checked_sub(ARGS_MARKER_LEN) else { return path };
-    if head_len == 0 || !path.is_char_boundary(head_len) {
-        return path;
-    }
-    let (head, marker) = path.split_at(head_len);
-    let Some(rest) = marker.strip_prefix(ARGS_MARKER_OPEN) else { return path };
-    let Some(hex) = rest.strip_suffix('>') else { return path };
-    // LOWERCASE only: `{:016x}` never emits `A`..`F`, so an uppercase run is a
-    // string this producer did not write.
-    if hex.len() == ARGS_MARKER_HEX_LEN
-        && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        head
-    } else {
-        path
-    }
+    // Trust (ARGS-FINGERPRINT-READ-1, 2026-10-07): the grammar lives in ONE place,
+    // `trust_types::args_fingerprint`, shared with trust-vcgen's generic-argument
+    // readers; this crate's tests below still pin it.
+    trust_types::strip_trailing_args_fingerprint(path)
 }
 
 /// The head of a VALUE path with its ONE trailing turbofish argument list

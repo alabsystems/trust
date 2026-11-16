@@ -1,0 +1,378 @@
+{
+  "name": "node_next_val",
+  "def_path": "census_walk::node_next_val",
+  "span": {
+    "file": "<dump-root>/census_walk.rs",
+    "line_start": 53,
+    "col_start": 0,
+    "line_end": 58,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Datatype": {
+                "name": "census_walk::Node",
+                "variants": []
+              }
+            }
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Datatype": {
+                "name": "census_walk::Node",
+                "variants": []
+              }
+            }
+          }
+        },
+        "name": "m"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": [
+                    "Deref",
+                    {
+                      "Field": 1
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 54,
+                "col_start": 10,
+                "line_end": 54,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ],
+              [
+                1,
+                3
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "<dump-root>/census_walk.rs",
+              "line_start": 54,
+              "col_start": 4,
+              "line_end": 54,
+              "col_end": 16
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 56,
+                "col_start": 16,
+                "line_end": 56,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      },
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 55,
+                "col_start": 13,
+                "line_end": 55,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/census_walk.rs",
+                "line_start": 55,
+                "col_start": 19,
+                "line_end": 55,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    },
+    "datatype_defs": {
+      "census_walk::Node": {
+        "Adt": {
+          "name": "census_walk::Node",
+          "fields": [
+            [
+              "val",
+              {
+                "Int": {
+                  "width": 32,
+                  "signed": false
+                }
+              }
+            ],
+            [
+              "next",
+              {
+                "Adt": {
+                  "name": "core::option::Option",
+                  "fields": [
+                    [
+                      "__tag",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": true
+                        }
+                      }
+                    ],
+                    [
+                      "__v1_0",
+                      {
+                        "Ref": {
+                          "mutable": false,
+                          "inner": {
+                            "Datatype": {
+                              "name": "census_walk::Node",
+                              "variants": []
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  ],
+                  "variants": [
+                    {
+                      "name": "None",
+                      "discriminant": 0,
+                      "fields": []
+                    },
+                    {
+                      "name": "Some",
+                      "discriminant": 1,
+                      "fields": [
+                        [
+                          "0",
+                          {
+                            "Ref": {
+                              "mutable": false,
+                              "inner": {
+                                "Datatype": {
+                                  "name": "census_walk::Node",
+                                  "variants": []
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      ]
+                    }
+                  ],
+                  "disc_index_safe": false,
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Enum"
+                }
+              }
+            ]
+          ],
+          "variants": [],
+          "disc_index_safe": false,
+          "faithful_enum_repr": null,
+          "layout": null,
+          "enum_layout": null,
+          "adt_kind": "Struct"
+        }
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

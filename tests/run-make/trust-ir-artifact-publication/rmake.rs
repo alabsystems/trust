@@ -49,6 +49,12 @@ fn read_current_artifacts() -> [Vec<u8>; 3] {
     actual.sort();
     let mut expected = SUFFIXES.map(|suffix| format!("{CRATE_NAME}.{suffix}")).to_vec();
     expected.push(format!(".{CRATE_NAME}.coverage.json.trustc-publish.lock"));
+    // Trust (2026-10-01): the effect-conservation ledger (D28), written by
+    // `effect_conservation::finalize` beside every published dump. It is not one of the
+    // transaction's data files: it is bound to the text dump it describes by byte count and
+    // FNV-1a 64 (`tests/run-make/trust-effect-conservation` pins the binding), so a stale one
+    // can never be read as the ledger of a newer generation.
+    expected.push(format!("{CRATE_NAME}.effect-conservation.json"));
     expected.sort();
     assert_eq!(actual, expected, "publication directory contained a partial or temporary set");
     artifacts
@@ -466,7 +472,8 @@ fn main() {
         .arg("-o")
         .arg("missing-publication-input.rmeta")
         .run_fail()
-        .assert_stderr_contains("couldn't read");
+        // 1.101's spelling of a missing input (was "couldn't read").
+        .assert_stderr_contains("couldn't find file");
     assert_no_current_artifacts("missing file input");
 
     publish_current(11);

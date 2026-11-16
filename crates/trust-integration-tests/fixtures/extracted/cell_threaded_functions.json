@@ -563,7 +563,7 @@
               }
             }
           },
-          "name": "x"
+          "name": null
         },
         {
           "index": 12,
@@ -851,7 +851,7 @@
               }
             }
           },
-          "name": "x"
+          "name": null
         },
         {
           "index": 16,
@@ -2865,6 +2865,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -2996,6 +3002,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -3389,6 +3401,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -4632,7 +4650,7 @@
               }
             }
           },
-          "name": "x"
+          "name": null
         },
         {
           "index": 11,
@@ -5175,7 +5193,7 @@
               }
             }
           },
-          "name": "x"
+          "name": null
         },
         {
           "index": 19,
@@ -6834,6 +6852,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -6996,6 +7020,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -7486,6 +7516,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -8642,7 +8678,7 @@
               }
             }
           },
-          "name": "x"
+          "name": null
         },
         {
           "index": 12,
@@ -8930,7 +8966,7 @@
               }
             }
           },
-          "name": "x"
+          "name": null
         },
         {
           "index": 16,
@@ -10944,6 +10980,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -11075,6 +11117,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -11468,6 +11516,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -12711,7 +12765,7 @@
               }
             }
           },
-          "name": "x"
+          "name": null
         },
         {
           "index": 11,
@@ -13254,7 +13308,7 @@
               }
             }
           },
-          "name": "x"
+          "name": null
         },
         {
           "index": 19,
@@ -14913,6 +14967,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -15075,6 +15135,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }
@@ -15565,6 +15631,12 @@
                   14241860155052752853,
                   2268345107747320411
                 ]
+              },
+              "callee_key": {
+                "krate_is_real_sysroot": false,
+                "krate_name_is_ambiguous": false,
+                "stable_crate_id": 6076012663662397016,
+                "krate_name": "clean_kernel"
               }
             }
           }

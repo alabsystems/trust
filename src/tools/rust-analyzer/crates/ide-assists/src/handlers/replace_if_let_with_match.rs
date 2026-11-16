@@ -1,4 +1,3 @@
-use hir::db::ExpandDatabase;
 use itertools::Itertools;
 use std::iter::successors;
 
@@ -103,7 +102,7 @@ pub(crate) fn replace_if_let_with_match(
 
     if !pat_seen && cond_bodies.len() != 1 {
         // Don't offer turning an if (chain) without patterns into a match,
-        // unless its a simple `if cond { .. } (else { .. })`
+        // unless it's a simple `if cond { .. } (else { .. })`
         return None;
     }
 
@@ -512,7 +511,7 @@ fn pretty_pat_inside_macro(
         let pretty_node = hir::prettify_macro_expansion(
             db,
             pat,
-            db.expansion_span_map(file_id),
+            file_id.expansion_span_map(db),
             scope.module().krate(db).into(),
         );
         ast::Pat::cast(pretty_node)

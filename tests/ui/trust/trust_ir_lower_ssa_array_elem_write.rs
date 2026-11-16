@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-AI): `a[K] = v` and `a[K] op= v` on an UNPROMOTED, SSA-bound
 //! array local with a CONSTANT in-bounds index lower as value surgery —
 //! `InsertElement` + `set_local` (the element twin of wave-AW's `a.b = v`),

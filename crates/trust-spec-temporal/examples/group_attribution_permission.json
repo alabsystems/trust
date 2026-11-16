@@ -1,0 +1,12 @@
+{
+  "function": "may_attribute_group",
+  "fuel": 64,
+  "cases": [
+    { "arguments": [false, false], "expected": true, "permitted": true },
+    { "arguments": [false, true], "expected": false, "permitted": false },
+    { "arguments": [true, false], "expected": false, "permitted": false },
+    { "arguments": [true, true], "expected": false, "permitted": false }
+  ],
+  "mutation_from": "!reaped && !retired",
+  "mutation_to": "!retired"
+}

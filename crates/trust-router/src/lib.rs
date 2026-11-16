@@ -11,6 +11,33 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
+#![cfg_attr(
+    not(feature = "mir-test-oracle"),
+    doc = r#"
+The historical MIR comparison router is available only with `mir-test-oracle`.
+Production dependencies use the typed obligation boundary instead:
+
+```compile_fail
+use trust_router::MirRouter;
+```
+
+```compile_fail
+use trust_router::MirRouterConfig;
+```
+
+```compile_fail
+use trust_router::build_v1_vcs;
+```
+
+Historical result labels remain available without enabling a second router:
+
+```
+use trust_router::MirStrategy;
+assert_eq!(MirStrategy::V1Fallback.to_string(), "V1Fallback");
+```
+"#
+)]
+
 // Keep the direct serde dependency explicit for serde_json-backed report/result
 // APIs that cross the trust-router crate boundary.
 use serde as _;
@@ -22,8 +49,10 @@ pub(crate) mod routing;
 mod types;
 // Structural (alpha-equivalence) dedup of VCs before sequential dispatch.
 pub(crate) mod vc_dedup;
-// MIR-level router for function classification and dispatch.
+// The legacy MIR traversal and alternate VC builder are test-oracle inputs.
+#[cfg(any(test, feature = "mir-test-oracle"))]
 pub(crate) mod mir_router;
+mod mir_strategy;
 // Obligation adapter that maps external tool
 // results back to per-obligation identities (source span, VcKind, function name).
 pub(crate) mod verification_obligation;
@@ -31,9 +60,9 @@ pub mod verifier_result;
 
 // --- Public re-exports preserving the crate's external API ---
 pub use backend_trait::{VerificationBackend, unsupported_mir_unknown};
-// MIR-level router and obligation adapter.
-pub use mir_router::build_v1_vcs;
-pub use mir_router::{MirRouter, MirRouterConfig, MirStrategy};
+#[cfg(any(test, feature = "mir-test-oracle"))]
+pub use mir_router::{MirRouter, MirRouterConfig, build_v1_vcs};
+pub use mir_strategy::MirStrategy;
 pub use report::build_json_report_from_verifier_results;
 pub use router::Router;
 pub use types::{BackendRole, BackendSelection};
@@ -55,10 +84,17 @@ pub use coordinator::{
 };
 pub use error::SolverProcessError;
 pub use full_verification::{
-    DEFAULT_PER_OBLIGATION_TIMEOUT_MS, DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt,
-    FullVerificationEngine, FullVerificationPolicy, FullVerificationRunWithFreshReceipts,
-    LiveVerificationReceiptBatch, NativeTrustMcTrustIrEngine, NativeTyEngine,
+    CurrentKernelProofReplay, DEFAULT_PER_OBLIGATION_TIMEOUT_MS, DirectTrustVcProofReceipt,
+    FreshExactDirectChcPdrReceipt, FreshWholeFunctionChcPdrReceipt, FullVerificationEngine,
+    FullVerificationPolicy, FullVerificationRunWithFreshReceipts, LiveVerificationReceiptBatch,
+    NativeSourceReferenceFacts, NativeTrustMcTrustIrEngine, NativeTyEngine,
     required_native_engines, required_native_engines_with_timeout_ms,
+};
+// Trust (C1, 2026-11-06): the claim records the compiler's single issuer binds.
+#[cfg(feature = "trust-build")]
+pub use full_verification::{
+    NativeSourceReferenceFactsError, NativeSourceReferenceLoadFact,
+    NativeSourceReferenceParameterFact, NativeSourceReferenceValueFact,
 };
 // In-process ay-dpll SMT backend re-export.
 #[cfg(feature = "ay-backend")]
@@ -72,6 +108,7 @@ pub use incremental_ay::{
 pub use memory_guard::{MemoryGuard, MemoryGuardError, MemorySnapshot};
 pub use memory_jobserver::{
     MemoryJobserverError, MemoryReservation, acquire as acquire_memory_reservation,
+    effective_physical_memory_bytes,
 };
 // trust_cg codegen backend re-exports.
 #[cfg(feature = "trust-cg-backend")]
@@ -106,10 +143,22 @@ pub(crate) mod ownership_encoding {
 // smt2_export provides SMT-LIB2 text serialization used by the in-process
 // ay backend. Always compiled.
 pub(crate) mod smt2_export;
+// The variable-disjoint conjunctive component split, shared by the in-process
+// backend and the external-process incremental session. Always compiled.
+pub(crate) mod disjoint_components;
+// Which `ay` binary a spawner outside the compiler runs: an explicit path, or
+// the one beside a Trust compiler's own executable (its sysroot's `bin/`) — the
+// compiler's rule. Never PATH.
+pub mod ay_discovery;
 // smtlib_backend carries the SMT-LIB2 script emitter and the solver-output
 // parser the external-`ay` subprocess session drives; the in-process backend
 // speaks to ay through its library API instead.
 pub mod smtlib_backend;
+// ay's own account of an `unknown` (its typed reason code, or the
+// `:unknown.reason` token of its statistics block) mapped onto the Trust
+// stop-cause vocabulary, shared by the subprocess and in-process lanes.
+// Always compiled: it names no ay type.
+pub(crate) mod ay_stop;
 // Incremental AY session with push/pop scoping for batch VC
 // verification. Maintains a persistent solver context and shares common
 // assertions across multiple VCs. Always compiled (not feature-gated by
@@ -127,10 +176,13 @@ pub mod in_process_ay_backend;
 // opts back in). Same gate as its sole consumer.
 #[cfg(feature = "ay-backend")]
 mod ay_log;
-// Trust: the Trust -> ay symbol-namespace map. Every user-derived VC variable
-// symbol is namespaced before it reaches ay, so a Rust local spelled like an ay
-// builtin (`fp`, `default`, `select`, …) can never trip ay's reserved-symbol
-// rejection — which surfaced as a compiler ICE. Same gate as its consumer.
+// Trust: the Trust -> ay symbol-namespace map. Every user-derived VC symbol —
+// variables, datatype sorts, constructors and selectors, and any function
+// symbol spelled inside Trust's own `__trust_` prefix — is namespaced before it
+// reaches ay, each class under its own prefix, so a Rust name spelled like an
+// ay builtin (`fp`, `default`, `select`, …) can never trip ay's reserved-symbol
+// rejection (which surfaced as a compiler ICE), and no two distinct source
+// entities can reach ay as one symbol. Same gate as its consumer.
 #[cfg(feature = "ay-backend")]
 mod ay_symbol_namespace;
 // N-version Alethe cross-check: independent Carcara re-check of ay UNSAT proofs,
@@ -147,28 +199,44 @@ pub mod carcara_cross_check;
 pub(crate) mod ay_certify;
 // Termination dispatch — PDR/k-induction prove safety, not termination.
 pub(crate) mod termination_dispatch;
-// Trust-wp per-VC backend (R4 flip: NATIVE-BACKED through trust-wp's typed
-// in-process engine; never spawns the `trust_wp` subprocess or reads
-// TRUST_WP_PATH). TrustWP advertises zero full-verification obligation kinds,
-// so beyond canonical constant folding this lane fail-closes to Unknown; it
-// grants no verdict authority to TrustWP or to historical TrustWP records.
-pub mod trust_wp_backend;
 pub mod ty_backend;
 // Process memory monitoring for solver memory limit enforcement.
 pub(crate) mod memory_guard;
 // Cross-process memory-aware token bucket: one admission ledger for participating
 // workers. It does not measure or impose a hard ceiling on machine-wide RSS.
+#[cfg(not(test))]
+pub use trust_coordinator::memory_jobserver;
+// Router unit tests also exercise the backend's use of these private test
+// controls. Compile the same canonical sources in this test crate rather than
+// exporting test-only overrides into a production dependency feature.
+#[cfg(test)]
+#[path = "../../trust-coordinator/src/memory_jobserver.rs"]
 pub mod memory_jobserver;
 // Trust: client + shared server helpers for the `trustd` memory-coordination
 // daemon — the in-memory admission-ledger version of `memory_jobserver`'s flock
 // transport (2026-06-17 OOM response, daemon upgrade). The single seam joins
 // targo's auto-start glue and the in-process backend call.
+#[cfg(not(test))]
+pub use trust_coordinator::coordinator;
+#[cfg(test)]
+#[path = "../../trust-coordinator/src/coordinator.rs"]
 pub mod coordinator;
 // trust_cg verified codegen backend (behind trust_cg-backend feature).
 #[cfg(feature = "trust-cg-backend")]
 pub mod trust_cg_backend;
-// VC-level solver result caching wired into verification dispatch.
-pub mod solver_cache;
 
 #[cfg(test)]
 mod router_tests;
+
+/// Panic-hook scopes (silence an expected panic, count this thread's panics)
+/// that compose under libtest's concurrency instead of swapping the one
+/// process-global hook. Test-only.
+#[cfg(test)]
+mod test_panic_hook;
+
+/// The exported SMT-LIB2 transcript must be its own witness: its
+/// `(set-logic …)` line has to admit every sort its own declarations write and
+/// every symbol its own assertion applies. Test-only, and gated on the feature
+/// that provides `problem_smt2` (the transcript under test).
+#[cfg(all(test, feature = "ay-backend"))]
+mod smt2_self_consistency_tests;

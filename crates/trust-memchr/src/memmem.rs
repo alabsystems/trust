@@ -63,7 +63,7 @@ use crate::scan;
 /// setting is accepted and has no effect. It is retained because it is public
 /// API, and because a caller that disables prefilters is asking for behavior
 /// this crate already has.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub enum Prefilter {
     /// Never use a prefilter in substring search.
@@ -71,13 +71,8 @@ pub enum Prefilter {
     /// Automatically detect whether a heuristic prefilter should be used. If
     /// it is used, then heuristics will be used to dynamically disable the
     /// prefilter if it is believed to not be carrying its weight.
+    #[default]
     Auto,
-}
-
-impl Default for Prefilter {
-    fn default() -> Prefilter {
-        Prefilter::Auto
-    }
 }
 
 /// Returns an iterator over all non-overlapping occurrences of a substring in
@@ -270,17 +265,11 @@ impl<'h, 'n> Iterator for FindRevIter<'h, 'n> {
     type Item = usize;
 
     fn next(&mut self) -> Option<usize> {
-        let pos = match self.pos {
-            None => return None,
-            Some(pos) => pos,
-        };
+        let pos = self.pos?;
         // `pos` is only ever set to a match offset or to `haystack.len()`, so
         // this slice always exists; `get` rather than `[..pos]` keeps the
         // method panic-free by construction rather than by argument.
-        let haystack = match self.haystack.get(..pos) {
-            None => return None,
-            Some(haystack) => haystack,
-        };
+        let haystack = self.haystack.get(..pos)?;
         let needle = cow::as_slice(&self.finder.needle);
         let result = scan::rfind_substring(haystack, needle);
         match result {

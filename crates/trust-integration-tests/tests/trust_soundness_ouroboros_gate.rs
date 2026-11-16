@@ -4,22 +4,28 @@
 //! corpus that Trust's discharge encoding is sound (`realPanics ⊆ models`), plus
 //! the per-class soundness arms and the declaration-marker / UnsupportedMir
 //! exhaustiveness bricks. This test kernel-checks every file by shelling out to
-//! the `clean` binary Trust builds from the pinned `first-party/clean` submodule
-//! — so the apex proofs are reproducible from a Trust checkout and re-verified on
-//! every test run, not stranded in a separate working clone.
+//! a `clean` binary built from the pinned `first-party/clean` submodule, so the
+//! apex proofs are reproducible from a Trust checkout, not stranded in a
+//! separate working clone. Every test run kernel-checks the corpus in process,
+//! through `lean_front_door_gate`; this binary cross-check re-verifies it only
+//! under `slow.clean-binary-proof-gates` (`--ignored`, with `TRUST_CLEAN_BIN`
+//! set).
 //!
-//! This lane measures the BINARY, not the corpus. Its subject is whichever
-//! `clean` executable is discoverable, which may be absent or stale, so it
-//! prints a notice and passes when none is found. That skip is not a hole in
-//! the proof coverage: `lean_front_door_gate` checks the same corpus through
-//! the kernel crates linked into this test binary, unconditionally and at the
-//! pinned `first-party/clean` source revision. Read a pass here as "the
-//! discovered checker agrees", never as "the proofs were checked".
+//! This lane measures the BINARY, not the corpus: its subject is the `clean`
+//! executable `TRUST_CLEAN_BIN` names. The corpus's authority is
+//! `lean_front_door_gate`, which checks the same files through the kernel
+//! crates linked into this test binary, unconditionally and at the pinned
+//! `first-party/clean` source revision. Read a pass here as "a `clean` built
+//! from the pin agrees", never as "the proofs were checked". It is `#[ignore]`d
+//! and runs only under `slow.clean-binary-proof-gates`, which builds `clean`
+//! from the submodule at its pin and names it in `TRUST_CLEAN_BIN`; selected
+//! without it, it panics with the build recipe. (Until 2026-10-09 it searched
+//! for a binary and passed with a NOTICE when it found none.)
 
 use std::path::Path;
 use std::process::Command;
 
-use trust_integration_tests::clean_test_support::clean_checker_path;
+use trust_integration_tests::clean_test_support::require_clean_bin;
 
 /// Floor on the corpus size, so an emptied or clobbered proof directory fails
 /// instead of vacuously passing. Kept BELOW the current count: a floor equal to
@@ -27,22 +33,14 @@ use trust_integration_tests::clean_test_support::clean_checker_path;
 const MIN_PROOF_FILES: usize = 30;
 
 #[test]
+#[ignore = "needs TRUST_CLEAN_BIN (slow.clean-binary-proof-gates)"]
 fn trust_soundness_ouroboros_gate() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../proofs/trust-soundness");
     let dir = dir
         .canonicalize()
         .unwrap_or_else(|e| panic!("trust-soundness proof corpus {dir:?} not found: {e}"));
 
-    let Some(bin) = clean_checker_path() else {
-        eprintln!(
-            "NOTICE: no `clean` checker discoverable — the binary cross-check over {} did not \
-             run. The corpus itself is still gated by `lean_front_door_gate`, which checks it \
-             with the linked kernel and cannot skip.",
-            dir.display()
-        );
-        return;
-    };
-    eprintln!("clean checker: {}", bin.display());
+    let bin = require_clean_bin();
 
     let mut files = Vec::new();
     for entry in std::fs::read_dir(&dir).expect("read proofs/trust-soundness") {

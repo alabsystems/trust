@@ -14,10 +14,7 @@ use trust_json as tj;
 struct Lcg(u64);
 impl Lcg {
     fn next_u64(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let x = self.0;
         x ^ (x >> 31)
     }
@@ -30,8 +27,16 @@ fn main() {
     // Named cases first.
     println!("named cases (tj || inc, one hop -> two hops):");
     for src in [
-        "1e-30", "1e-5", "1e-6", "1e30", "0.1", "1.1", "1e-323", "123456789012345678901",
-        "1.7976931348623157e308", "2.2250738585072014e-308",
+        "1e-30",
+        "1e-5",
+        "1e-6",
+        "1e30",
+        "0.1",
+        "1.1",
+        "1e-323",
+        "123456789012345678901",
+        "1.7976931348623157e308",
+        "2.2250738585072014e-308",
     ] {
         let a = tj::to_string(&tj::from_str(src).unwrap()).unwrap();
         let a2 = tj::to_string(&tj::from_str(&a).unwrap()).unwrap();
@@ -39,9 +44,7 @@ fn main() {
         let b2 = inc::to_string(&inc::from_str::<inc::Value>(&b).unwrap()).unwrap();
         let agree = a == b && a2 == b2;
         let stable = a == a2;
-        println!(
-            "  {src:<24} hop1={a:<26} hop2={a2:<26} stable={stable:<5} tj==inc={agree}"
-        );
+        println!("  {src:<24} hop1={a:<26} hop2={a2:<26} stable={stable:<5} tj==inc={agree}");
     }
 
     let mut rng = Lcg(0x452821E638D01377);

@@ -290,8 +290,12 @@ impl PatternDatabase {
 
     /// Record whether applying a pattern succeeded.
     pub fn record_outcome(&mut self, pattern: &SpecPattern, succeeded: bool) {
-        let key = pattern.kind_name().to_string();
-        let entry = self.success_records.entry(key).or_insert((0, 0));
+        let key = pattern.kind_name();
+        let entry = if let Some(entry) = self.success_records.get_mut(key) {
+            entry
+        } else {
+            self.success_records.entry(key.to_string()).or_insert((0, 0))
+        };
         if succeeded {
             entry.0 += 1;
         }
@@ -421,36 +425,37 @@ fn suggestion_to_proposal(
 
 /// Deduplicate suggestions by pattern kind + key variable.
 fn dedup_suggestions(suggestions: &mut Vec<PatternSuggestion>) {
-    let mut seen = FxHashSet::default();
-    suggestions.retain(|s| {
-        let key = format!("{}:{}", s.pattern.kind_name(), s.pattern.to_spec_body());
-        seen.insert(key)
-    });
+    let mut seen: FxHashSet<(&'static str, String)> = FxHashSet::default();
+    suggestions.retain(|s| seen.insert((s.pattern.kind_name(), s.pattern.to_spec_body())));
+}
+
+fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len()
+        && s.is_char_boundary(s.len() - suffix.len())
+        && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 /// Check if a parameter name looks like an index variable.
 fn is_index_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower == "i"
-        || lower == "j"
-        || lower == "k"
-        || lower == "idx"
-        || lower == "index"
-        || lower == "pos"
-        || lower == "offset"
-        || lower.ends_with("_idx")
-        || lower.ends_with("_index")
+    name.eq_ignore_ascii_case("i")
+        || name.eq_ignore_ascii_case("j")
+        || name.eq_ignore_ascii_case("k")
+        || name.eq_ignore_ascii_case("idx")
+        || name.eq_ignore_ascii_case("index")
+        || name.eq_ignore_ascii_case("pos")
+        || name.eq_ignore_ascii_case("offset")
+        || ends_with_ignore_ascii_case(name, "_idx")
+        || ends_with_ignore_ascii_case(name, "_index")
 }
 
 /// Check if a parameter name looks like a divisor.
 fn is_divisor_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower == "divisor"
-        || lower == "denominator"
-        || lower == "denom"
-        || lower == "d"
-        || lower == "modulus"
-        || lower.ends_with("_divisor")
+    name.eq_ignore_ascii_case("divisor")
+        || name.eq_ignore_ascii_case("denominator")
+        || name.eq_ignore_ascii_case("denom")
+        || name.eq_ignore_ascii_case("d")
+        || name.eq_ignore_ascii_case("modulus")
+        || ends_with_ignore_ascii_case(name, "_divisor")
 }
 
 /// Check if a type string represents a numeric type.
@@ -784,16 +789,17 @@ pub fn match_pattern(
     param_name: &str,
     param_type: &str,
 ) -> Vec<CatalogMatch> {
-    let lower_name = param_name.to_lowercase();
-
     catalog
         .iter()
         .filter(|entry| {
             let type_match =
                 entry.applicable_param_types.iter().any(|t| param_type.contains(t.as_str()));
             let name_match = entry.applicable_param_names.iter().any(|n| {
-                lower_name == n.to_lowercase()
-                    || lower_name.ends_with(&format!("_{}", n.to_lowercase()))
+                param_name.eq_ignore_ascii_case(n)
+                    || (param_name.len() > n.len()
+                        && param_name.as_bytes()[param_name.len() - n.len() - 1] == b'_'
+                        && param_name.is_char_boundary(param_name.len() - n.len())
+                        && param_name[param_name.len() - n.len()..].eq_ignore_ascii_case(n))
             });
             type_match || name_match
         })

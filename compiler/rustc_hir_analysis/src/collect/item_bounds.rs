@@ -2,16 +2,15 @@ use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_hir as hir;
 use rustc_infer::traits::util;
 use rustc_middle::ty::{
-    self, GenericArgs, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
-    Upcast, shift_vars,
+    self, GenericArgs, IncludeSizedImplicitBounds, PredicateProxy, Ty, TyCtxt, TypeFoldable,
+    TypeFolder, TypeSuperFoldable, TypeVisitableExt, Upcast, shift_vars,
 };
-use rustc_middle::{bug, span_bug};
-use rustc_span::Span;
 use rustc_span::def_id::{DefId, LocalDefId};
+use rustc_span::{Span, bug, span_bug};
 use tracing::{debug, instrument};
 
 use super::ItemCtxt;
-use super::predicates_of::assert_only_contains_predicates_from;
+use super::clauses_of::assert_only_contains_clauses_from;
 use crate::hir_ty_lowering::{
     HirTyLowerer, ImpliedBoundsContext, OverlappingAsssocItemConstraints, PredicateFilter,
 };
@@ -55,28 +54,22 @@ fn associated_type_bounds<'tcx>(
             | PredicateFilter::SelfTraitThatDefines(_)
             | PredicateFilter::SelfAndAssociatedTypeBounds => {
                 // Implicit bounds are added to associated types unless a `?Trait` bound is found.
-                icx.lowerer().add_implicit_sizedness_bounds(
+                icx.lowerer().add_implicit_bounds(
                     &mut bounds,
                     item_ty,
                     hir_bounds,
                     ImpliedBoundsContext::AssociatedTypeOrImplTrait,
                     span,
-                );
-                icx.lowerer().add_default_traits(
-                    &mut bounds,
-                    item_ty,
-                    hir_bounds,
-                    ImpliedBoundsContext::AssociatedTypeOrImplTrait,
-                    span,
+                    IncludeSizedImplicitBounds::Yes,
                 );
 
                 // Also collect `where Self::Assoc: Trait` from the parent trait's where clauses.
                 let trait_def_id = tcx.local_parent(assoc_item_def_id);
-                let trait_predicates = tcx.trait_explicit_predicates_and_bounds(trait_def_id);
+                let trait_clauses = tcx.trait_explicit_clauses_and_bounds(trait_def_id);
 
                 let item_trait_ref =
                     ty::TraitRef::identity(tcx, tcx.parent(assoc_item_def_id.to_def_id()));
-                bounds.extend(trait_predicates.predicates.iter().copied().filter_map(
+                bounds.extend(trait_clauses.clauses.iter().copied().filter_map(
                     |(clause, span)| {
                         remap_gat_vars_and_recurse_into_nested_projections(
                             tcx,
@@ -94,8 +87,8 @@ fn associated_type_bounds<'tcx>(
                 // FIXME(const_trait_impl): We *could* uplift the
                 // `where Self::Assoc: [const] Trait` bounds from the parent trait
                 // here too, but we'd need to split `const_conditions` into two
-                // queries (like we do for `trait_explicit_predicates_and_bounds`)
-                // since we need to also filter the predicates *out* of the const
+                // queries (like we do for `trait_explicit_clauses_and_bounds`)
+                // since we need to also filter the clauses *out* of the const
                 // conditions or they lead to cycles in the trait solver when
                 // utilizing these bounds. For now, let's do nothing.
             }
@@ -108,7 +101,7 @@ fn associated_type_bounds<'tcx>(
             bounds
         );
 
-        assert_only_contains_predicates_from(filter, bounds, item_ty);
+        assert_only_contains_clauses_from(filter, bounds, item_ty);
 
         bounds
     })
@@ -154,7 +147,7 @@ fn remap_gat_vars_and_recurse_into_nested_projections<'tcx>(
             {
                 // We have found the GAT in question...
                 // Return the vars, since we may need to remap them.
-                break &alias_ty.args[item_trait_ref.args.len()..];
+                break tcx.mk_args(&alias_ty.args.as_slice()[item_trait_ref.args.len()..]);
             } else {
                 // Only collect *self* type bounds if the filter is for self.
                 match filter {
@@ -347,7 +340,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for MapAndCompressBoundVars<'tcx> {
         }
     }
 
-    fn fold_predicate(&mut self, p: ty::Predicate<'tcx>) -> ty::Predicate<'tcx> {
+    fn fold_predicate<P: PredicateProxy<TyCtxt<'tcx>>>(&mut self, p: P) -> P {
         if !p.has_bound_vars() { p } else { p.super_fold_with(self) }
     }
 }
@@ -382,19 +375,13 @@ fn opaque_type_bounds<'tcx>(
             | PredicateFilter::SelfOnly
             | PredicateFilter::SelfTraitThatDefines(_)
             | PredicateFilter::SelfAndAssociatedTypeBounds => {
-                icx.lowerer().add_implicit_sizedness_bounds(
+                icx.lowerer().add_implicit_bounds(
                     &mut bounds,
                     item_ty,
                     hir_bounds,
                     ImpliedBoundsContext::AssociatedTypeOrImplTrait,
                     span,
-                );
-                icx.lowerer().add_default_traits(
-                    &mut bounds,
-                    item_ty,
-                    hir_bounds,
-                    ImpliedBoundsContext::AssociatedTypeOrImplTrait,
-                    span,
+                    IncludeSizedImplicitBounds::Yes,
                 );
             }
             //`ConstIfConst` is only interested in `[const]` bounds.
@@ -465,7 +452,7 @@ pub(super) fn explicit_item_bounds_with_filter(
                         .to_vec()
                         .fold_with(&mut AssocTyToOpaque { tcx, fn_def_id: parent.to_def_id() }),
                 );
-                assert_only_contains_predicates_from(filter, bounds, item_ty);
+                assert_only_contains_clauses_from(filter, bounds, item_ty);
                 bounds
             }
             rustc_hir::OpaqueTyOrigin::FnReturn {
@@ -480,7 +467,7 @@ pub(super) fn explicit_item_bounds_with_filter(
                 let args = GenericArgs::identity_for_item(tcx, def_id);
                 let item_ty = Ty::new_opaque(tcx, ty::IsRigid::No, def_id.to_def_id(), args);
                 let bounds = opaque_type_bounds(tcx, def_id, bounds, item_ty, *span, filter);
-                assert_only_contains_predicates_from(filter, bounds, item_ty);
+                assert_only_contains_clauses_from(filter, bounds, item_ty);
                 bounds
             }
         },

@@ -191,11 +191,12 @@ mod tests {
         )
         .build();
 
-    foo.cargo("check -v -Zrustc-unicode")
+    foo.cargo("check -v")
+        .arg("-Zrustc-unicode")
         .masquerade_as_nightly_cargo(&["rustc-unicode"])
         .with_stderr_data(str![[r#"
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc [..] --json=diagnostic-rendered-ansi,artifacts,future-incompat,diagnostic-unicode [..]`
+[RUNNING] `rustc [..] --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent,diagnostic-unicode [..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])

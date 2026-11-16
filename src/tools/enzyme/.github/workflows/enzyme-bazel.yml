@@ -1,0 +1,77 @@
+name: Bazel
+
+# TODO: Fix and re-enable this workflow
+# on:
+#   push:
+#     branches:
+#       - main
+#     paths:
+#       - '.github/workflows/enzyme-bazel.yml'
+#       - 'enzyme/Enzyme/**'
+#       - 'enzyme/includes/**'
+#       - 'enzyme/test/**'
+#       - 'enzyme/tools/**'
+#       - 'enzyme/BUILD'
+#       - 'enzyme/WORKSPACE'
+#   pull_request:
+#     branches:
+#       - main
+#     paths:
+#       - '.github/workflows/enzyme-bazel.yml'
+#       - 'enzyme/Enzyme/**'
+#       - 'enzyme/includes/**'
+#       - 'enzyme/test/**'
+#       - 'enzyme/tools/**'
+#       - 'enzyme/BUILD'
+#       - 'enzyme/WORKSPACE'
+#   merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+jobs:
+  build:
+    name: Enzyme Bazel Build - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - linux-x86-n4-32
+        build:
+          - Release
+        llbuild:
+          - Release
+    timeout-minutes: 500
+
+    container:
+      image: ghcr.io/enzymead/reactant-docker-images@sha256:91e1edb7a7c869d5a70db06e417f22907be0e67ca86641d48adcea221fedc674
+
+    steps:
+      - name: Install Python dependencies
+        run: |
+          python3 -m ensurepip --upgrade || sudo apt-get install -y python3-pip
+          python3 -m pip install --upgrade pip
+          python3 -m pip install lit
+      - name: Checkout Enzyme repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          repository: 'llvm/llvm-project'
+          path: 'llvm-project'
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        name: Set up Bazel
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-${{ matrix.os }}-${{ matrix.build }}-${{ matrix.llbuild }}
+          repository-cache: true
+          bazelisk-version: 1.x
+      - name: Build Enzyme
+        run: |
+          cd enzyme
+          bazel build --color=yes :EnzymeStatic :enzymemlir-opt
+      - name: Test Enzyme
+        run: |
+          cd enzyme
+          bazel test --color=yes --test_output=errors ...

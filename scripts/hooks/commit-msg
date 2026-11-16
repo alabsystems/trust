@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Trust commit-msg hook: the measurement-provenance rules on the commit being
+# made. Installed with the other tracked hooks by scripts/install-git-hooks.sh
+# (core.hooksPath = scripts/hooks).
+#
+# Author: Andrew Yates. Copyright 2026 Andrew Yates. License: Apache-2.0 OR MIT.
+#
+# scripts/check_measurement_provenance.sh's R1 (a `Measured-on:` stamp names a
+# blob the commit carries) and R2 (a soundness-gate commit that quotes a test
+# count carries a stamp) used to meet a commit only at push, after it was made,
+# where the remedy was rewording commits already made. This runs both on the
+# commit being made (docs/DECISION_QUEUE.md PUSH-PATH-COMMIT-MSG; the checker's
+# "AT COMMIT TIME TOO"). It runs the checker of the tree being committed in; a
+# tree whose checker has no --commit-msg mode (an older branch) runs nothing
+# here and is still judged at push. `git commit --no-verify` skips it, and the
+# push still judges the commit.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+checker="$REPO_ROOT/scripts/check_measurement_provenance.sh"
+[ -f "$checker" ] && grep -q -- '--commit-msg)' "$checker" || exit 0
+exec bash "$checker" --commit-msg "$1"

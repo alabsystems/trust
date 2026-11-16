@@ -15,7 +15,6 @@
 //! authority.
 
 use std::fmt;
-use std::sync::OnceLock;
 
 use clean_elab::FileContext;
 use clean_kernel::env::Environment;
@@ -54,6 +53,20 @@ const THEOREM_NAMES: [&str; 4] = [
     "Trust.ModelProgramRefinement.AppliedFairPropertyTransport",
 ];
 
+/// Separate schema: the existing v2 certificate still proves all-state simulation.
+pub const INVARIANT_MODEL_PROGRAM_REFINEMENT_SCHEMA_V1: &str =
+    "trust.invariant-model-program-refinement/v1";
+
+const INVARIANT_THEOREM_NAMES: [&str; 7] = [
+    "Trust.InvariantModelProgramRefinement.AppliedRefinement",
+    "Trust.InvariantModelProgramRefinement.AppliedInitialInvariant",
+    "Trust.InvariantModelProgramRefinement.AppliedPreservation",
+    "Trust.InvariantModelProgramRefinement.AppliedRunInvariant",
+    "Trust.InvariantModelProgramRefinement.AppliedRuns",
+    "Trust.InvariantModelProgramRefinement.AppliedPropertyTransport",
+    "Trust.InvariantModelProgramRefinement.AppliedFairPropertyTransport",
+];
+
 /// One theorem artifact regenerated and checked in the composed environment.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +92,37 @@ pub struct ModelProgramRefinementCertificate {
     pub theorems: Vec<ModelProgramRefinementTheorem>,
 }
 
+/// Exact-program refinement with a kernel-proved invariant of the original
+/// program machine. The invariant never replaces or restricts its `Next`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvariantModelProgramRefinementCertificate {
+    pub schema: String,
+    pub literal: LiteralRefinementCertificate,
+    pub model: CleanFiniteModelArtifact,
+    pub refinement_source: String,
+    pub invariant_definition: String,
+    pub projection_definition: String,
+    pub refinement_theorem: String,
+    pub theorems: Vec<ModelProgramRefinementTheorem>,
+}
+
+pub const INVARIANT_MODEL_PROGRAM_PROPERTY_SCHEMA_V1: &str =
+    "trust.invariant-model-program-property/v1";
+
+/// An authored property checked after separately imported program/model,
+/// support, and refinement units. Callers own the chosen property; this does
+/// not infer a fixed resource-policy claim from an arbitrary theorem.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvariantModelProgramPropertyCertificate {
+    pub schema: String,
+    pub refinement: InvariantModelProgramRefinementCertificate,
+    pub support_source: String,
+    pub property_source: String,
+    pub property: ModelProgramRefinementTheorem,
+}
+
 /// Fail-closed diagnostics from model/program refinement or replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelProgramRefinementError {
@@ -92,6 +136,10 @@ pub enum ModelProgramRefinementError {
     RefinementSourceMismatch,
     ModelDefinitionMismatch,
     ProjectionDefinitionMismatch,
+    InvariantDefinitionMismatch,
+    SupportSourceMismatch,
+    PropertySourceMismatch,
+    PropertyTheoremMismatch,
     RefinementTheoremMismatch,
     ComposedModelMismatch,
     TheoremSetMismatch,
@@ -125,6 +173,18 @@ impl fmt::Display for ModelProgramRefinementError {
                 .write_str("refinement certificate names a different finite-model definition"),
             Self::ProjectionDefinitionMismatch => formatter
                 .write_str("refinement certificate names a different projection definition"),
+            Self::InvariantDefinitionMismatch => {
+                formatter.write_str("refinement certificate names a different source invariant")
+            }
+            Self::SupportSourceMismatch => {
+                formatter.write_str("program property is bound to different support source")
+            }
+            Self::PropertySourceMismatch => {
+                formatter.write_str("program property is bound to different property source")
+            }
+            Self::PropertyTheoremMismatch => {
+                formatter.write_str("program property names a different theorem")
+            }
             Self::RefinementTheoremMismatch => {
                 formatter.write_str("refinement certificate names a different simulation theorem")
             }
@@ -292,6 +352,88 @@ end Trust
     )
 }
 
+fn invariant_wrapper_source(
+    model_definition: &str,
+    invariant_definition: &str,
+    projection_definition: &str,
+    refinement_theorem: &str,
+) -> String {
+    format!(
+        r#"
+namespace Trust
+namespace InvariantModelProgramRefinement
+
+def AppliedInvariant : _root_.IRConfig → Prop := _root_.{invariant_definition}
+def AppliedProjection : _root_.IRConfig →
+    _root_.Trust.Temporal.FiniteModel.State := _root_.{projection_definition}
+
+theorem AppliedRefinement :
+    _root_.Trust.Temporal.InvariantForwardRefinement
+      _root_.Trust.LiteralRefinement.Model
+      (_root_.Trust.Temporal.FiniteModel.StateMachine _root_.{model_definition})
+      AppliedProjection AppliedInvariant := _root_.{refinement_theorem}
+
+theorem AppliedInitialInvariant (state : _root_.IRConfig)
+    (initial : _root_.Trust.LiteralRefinement.Model.init state) :
+    AppliedInvariant state := AppliedRefinement.init_invariant state initial
+
+theorem AppliedPreservation (before after : _root_.IRConfig)
+    (invariant : AppliedInvariant before)
+    (step : _root_.Trust.LiteralRefinement.Model.next before after) :
+    AppliedInvariant after := AppliedRefinement.preserve_invariant before after invariant step
+
+theorem AppliedRunInvariant (behavior : _root_.Trust.Temporal.Behavior _root_.IRConfig)
+    (runs : _root_.Trust.Temporal.Runs _root_.Trust.LiteralRefinement.Model behavior) :
+    ∀ n : Nat, AppliedInvariant (behavior n) :=
+  _root_.Trust.Temporal.invariantForwardRefinementInvariant
+    _root_.Trust.LiteralRefinement.Model
+    (_root_.Trust.Temporal.FiniteModel.StateMachine _root_.{model_definition})
+    AppliedProjection AppliedInvariant AppliedRefinement behavior runs
+
+theorem AppliedRuns (behavior : _root_.Trust.Temporal.Behavior _root_.IRConfig)
+    (runs : _root_.Trust.Temporal.Runs _root_.Trust.LiteralRefinement.Model behavior) :
+    _root_.Trust.Temporal.Runs
+      (_root_.Trust.Temporal.FiniteModel.StateMachine _root_.{model_definition})
+      (fun n => AppliedProjection (behavior n)) :=
+  _root_.Trust.Temporal.invariantForwardRefinementRuns
+    _root_.Trust.LiteralRefinement.Model
+    (_root_.Trust.Temporal.FiniteModel.StateMachine _root_.{model_definition})
+    AppliedProjection AppliedInvariant AppliedRefinement behavior runs
+
+theorem AppliedPropertyTransport
+    (F : _root_.Trust.Temporal.Formula _root_.Trust.Temporal.FiniteModel.State)
+    (holds : _root_.Trust.Temporal.Satisfies
+      (_root_.Trust.Temporal.FiniteModel.StateMachine _root_.{model_definition}) F) :
+    _root_.Trust.Temporal.Satisfies _root_.Trust.LiteralRefinement.Model
+      (_root_.Trust.Temporal.Pullback AppliedProjection F) :=
+  _root_.Trust.Temporal.invariantForwardRefinementSatisfies
+    _root_.Trust.LiteralRefinement.Model
+    (_root_.Trust.Temporal.FiniteModel.StateMachine _root_.{model_definition})
+    AppliedProjection AppliedInvariant AppliedRefinement F holds
+
+theorem AppliedFairPropertyTransport
+    {{Index : Type}}
+    (constraints : Index → _root_.Trust.Temporal.FairnessConstraint
+      _root_.Trust.Temporal.FiniteModel.State)
+    (F : _root_.Trust.Temporal.Formula _root_.Trust.Temporal.FiniteModel.State)
+    (holds : _root_.Trust.Temporal.SatisfiesUnderFairness
+      (_root_.Trust.Temporal.FiniteModel.StateMachine _root_.{model_definition})
+      constraints F) :
+    ∀ behavior : _root_.Trust.Temporal.Behavior _root_.IRConfig,
+      _root_.Trust.Temporal.Runs _root_.Trust.LiteralRefinement.Model behavior →
+      _root_.Trust.Temporal.FairFamily constraints (fun n => AppliedProjection (behavior n)) →
+      _root_.Trust.Temporal.Pullback AppliedProjection F behavior :=
+  _root_.Trust.Temporal.invariantForwardRefinementSatisfiesUnderFairness
+    _root_.Trust.LiteralRefinement.Model
+    (_root_.Trust.Temporal.FiniteModel.StateMachine _root_.{model_definition})
+    AppliedProjection AppliedInvariant AppliedRefinement constraints F holds
+
+end InvariantModelProgramRefinement
+end Trust
+"#,
+    )
+}
+
 fn check_combined_source_size(
     literal_source: &str,
     model_source: &str,
@@ -324,40 +466,61 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ModelProgramRefinementError> + Send + 'static,
 {
-    std::thread::Builder::new()
-        .name("trust-model-program-refinement".to_owned())
-        .stack_size(KERNEL_STACK_BYTES)
-        .spawn(operation)
-        .map_err(|error| ModelProgramRefinementError::CleanSpecBuild(error.to_string()))?
-        .join()
-        .map_err(|_| {
+    // A persistent worker, so `fresh_composed_context`'s per-thread cache
+    // survives from one call to the next (see `crate::kernel_worker`).
+    const _: () = assert!(KERNEL_STACK_BYTES <= crate::kernel_worker::KERNEL_WORKER_STACK_BYTES);
+    crate::kernel_worker::run_on_kernel_worker(operation).map_err(|error| match error {
+        crate::kernel_worker::KernelWorkerError::Spawn(error) => {
+            ModelProgramRefinementError::CleanSpecBuild(error.to_string())
+        }
+        crate::kernel_worker::KernelWorkerError::Panicked => {
             ModelProgramRefinementError::CleanSpecBuild(
                 "isolated refinement worker panicked".to_owned(),
             )
-        })?
+        }
+    })?
 }
 
 fn fresh_composed_context() -> Result<(Environment, FileContext), ModelProgramRefinementError> {
-    static COMPOSED_PRELUDE: OnceLock<
-        Result<(Environment, FileContext), ModelProgramRefinementError>,
-    > = OnceLock::new();
-    COMPOSED_PRELUDE
-        .get_or_init(|| {
-            let spec = clean_verify::eval_ir::build_prelude_spec_with_stack()
-                .map_err(|error| ModelProgramRefinementError::CleanSpecBuild(error.to_string()))?;
-            let mut environment = spec.env().clone();
-            let mut context = FileContext::new();
-            context.disable_external_import_search();
-            elaborate_unit(
-                &mut environment,
-                &mut context,
-                CLEAN_TEMPORAL_PRELUDE,
-                "temporal prelude in composed EvalIR environment",
-                None,
-            )?;
-            Ok((environment, context))
-        })
-        .clone()
+    // Trust (Clean R80 item 2; `docs/DECISION_QUEUE.md` R80-CONSUMERS-1): the
+    // context goes out as a `FileContext::fork_run` copy, a new elaboration run
+    // to which the cached prelude's declarations are imported; a plain clone
+    // keeps the prelude's run (see `elaborate_composed_context` for the units
+    // elaborated after it).
+    //
+    // Keep the current worker-local cache policy. Pinned Clean's FileContext
+    // and Environment are Send + Sync; sharing the prelude globally is a
+    // separate optimization. This build is a pure function of compile-time
+    // EvalIR/temporal sources with external import search disabled. Each worker
+    // builds the same frontier and hands out owned, isolated run forks.
+    thread_local! {
+        static COMPOSED_PRELUDE: std::cell::OnceCell<
+            Result<(Environment, FileContext), ModelProgramRefinementError>,
+        > = const { std::cell::OnceCell::new() };
+    }
+    COMPOSED_PRELUDE.with(|cache| {
+        cache
+            .get_or_init(|| {
+                let spec =
+                    clean_verify::eval_ir::build_prelude_spec_with_stack().map_err(|error| {
+                        ModelProgramRefinementError::CleanSpecBuild(error.to_string())
+                    })?;
+                let mut environment = spec.env().clone();
+                let mut context = FileContext::new();
+                context.disable_external_import_search();
+                elaborate_unit(
+                    &mut environment,
+                    &mut context,
+                    CLEAN_TEMPORAL_PRELUDE,
+                    "temporal prelude in composed EvalIR environment",
+                    None,
+                )?;
+                Ok((environment, context))
+            })
+            .as_ref()
+            .map(|(environment, context)| (environment.clone(), context.fork_run()))
+            .map_err(Clone::clone)
+    })
 }
 
 fn parser_prelude() -> String {
@@ -382,6 +545,8 @@ fn elaborate_composed_context(
     refinement_source: &str,
     wrapper: &str,
 ) -> Result<(Environment, FileContext), ModelProgramRefinementError> {
+    #[cfg(test)]
+    frontier_tests::record_prefix(refinement_source);
     let (mut environment, mut context) = fresh_composed_context()?;
 
     // Preserve the literal child's exact declaration frontier. In particular,
@@ -402,6 +567,16 @@ fn elaborate_composed_context(
         "finite-model prelude in composed EvalIR environment",
     )?;
 
+    // Trust (Clean R80 item 2; `docs/DECISION_QUEUE.md` R80-CONSUMERS-1): each
+    // authored unit is elaborated in a run of its own, so its `attribute
+    // [implemented_by]` / `[extern]` commands may bind only its own
+    // declarations; everything elaborated before it is imported to it, as Lean
+    // refuses those. Both entries also elaborate the model alone over the
+    // finite-model context first (`extract_clean_finite_model`,
+    // `recheck_clean_finite_model_artifact`), whose fork refuses it there; this
+    // run does not rely on that. The fixed wrapper after the refinement binds
+    // nothing.
+    context = context.fork_run();
     let parser_prelude = parser_prelude();
     elaborate_suffix_with_parser_prelude(
         &mut environment,
@@ -415,6 +590,9 @@ fn elaborate_composed_context(
     if !clean_finite_models_equal_stack_safe(expected_model, &composed_model) {
         return Err(ModelProgramRefinementError::ComposedModelMismatch);
     }
+
+    // Trust (R80-CONSUMERS-1): the authored refinement's own run (above).
+    context = context.fork_run();
 
     // Parse each independently supplied unit to EOF. Concatenating an authored
     // unit with the fixed wrapper would let an unclosed namespace capture the
@@ -445,6 +623,30 @@ fn check_source(
     wrapper: String,
     stored_artifacts: Option<Vec<ModelProgramRefinementTheorem>>,
 ) -> Result<Vec<ModelProgramRefinementTheorem>, ModelProgramRefinementError> {
+    check_source_theorems(
+        literal_source,
+        model_source,
+        model_definition,
+        expected_model,
+        refinement_source,
+        wrapper,
+        &THEOREM_NAMES,
+        stored_artifacts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_source_theorems(
+    literal_source: String,
+    model_source: String,
+    model_definition: String,
+    expected_model: CleanFiniteModel,
+    refinement_source: String,
+    wrapper: String,
+    theorem_names: &'static [&'static str],
+    stored_artifacts: Option<Vec<ModelProgramRefinementTheorem>>,
+) -> Result<Vec<ModelProgramRefinementTheorem>, ModelProgramRefinementError> {
+    validate_stored_theorem_set(stored_artifacts.as_deref(), theorem_names)?;
     run_on_kernel_stack(move || {
         let (environment, _) = elaborate_composed_context(
             &literal_source,
@@ -454,63 +656,87 @@ fn check_source(
             &refinement_source,
             &wrapper,
         )?;
-        let fresh = THEOREM_NAMES
-            .iter()
-            .map(|theorem| {
-                let (theorem_type, proof_term) = checked_theorem(&environment, theorem)?;
-                Ok(ModelProgramRefinementTheorem {
-                    theorem: (*theorem).to_owned(),
-                    theorem_type: encode_expression(theorem_type)?,
-                    proof_term: encode_expression(proof_term)?,
-                })
-            })
-            .collect::<Result<Vec<_>, ModelProgramRefinementError>>()?;
-
-        if let Some(stored_artifacts) = stored_artifacts {
-            for (artifact, fresh_artifact) in stored_artifacts.iter().zip(&fresh) {
-                if artifact.theorem_type != fresh_artifact.theorem_type {
-                    return Err(ModelProgramRefinementError::ArtifactMismatch {
-                        theorem: artifact.theorem.clone(),
-                        field: "theorem type",
-                    });
-                }
-                if artifact.proof_term != fresh_artifact.proof_term {
-                    return Err(ModelProgramRefinementError::ArtifactMismatch {
-                        theorem: artifact.theorem.clone(),
-                        field: "proof term",
-                    });
-                }
-                let stored_type: Expr =
-                    serde_json::from_slice(&artifact.theorem_type).map_err(|error| {
-                        ModelProgramRefinementError::MalformedArtifact(error.to_string())
-                    })?;
-                let stored_proof: Expr =
-                    serde_json::from_slice(&artifact.proof_term).map_err(|error| {
-                        ModelProgramRefinementError::MalformedArtifact(error.to_string())
-                    })?;
-                let declaration = environment
-                    .get_const(&Name::from_string(&artifact.theorem))
-                    .ok_or_else(|| {
-                        ModelProgramRefinementError::MalformedArtifact(format!(
-                            "fresh environment lacks theorem `{}`",
-                            artifact.theorem
-                        ))
-                    })?;
-                if encode_expression(&declaration.type_)? != artifact.theorem_type {
-                    return Err(ModelProgramRefinementError::ArtifactMismatch {
-                        theorem: artifact.theorem.clone(),
-                        field: "registered theorem type",
-                    });
-                }
-                TypeChecker::with_mode(&environment, environment.mode())
-                    .check_type(&stored_proof, &stored_type)
-                    .map_err(|error| {
-                        ModelProgramRefinementError::KernelRejected(error.to_string())
-                    })?;
-            }
-        }
-        Ok(fresh)
+        check_theorems_in_environment(&environment, theorem_names, stored_artifacts.as_deref())
     })
+}
+
+fn validate_stored_theorem_set(
+    stored_artifacts: Option<&[ModelProgramRefinementTheorem]>,
+    theorem_names: &[&str],
+) -> Result<(), ModelProgramRefinementError> {
+    if stored_artifacts.is_some_and(|stored| {
+        stored.len() != theorem_names.len()
+            || stored
+                .iter()
+                .zip(theorem_names)
+                .any(|(artifact, expected)| artifact.theorem != *expected)
+    }) {
+        return Err(ModelProgramRefinementError::TheoremSetMismatch);
+    }
+    Ok(())
+}
+
+/// Synchronous portion shared by standalone replay and the request-local
+/// frontier. The caller owns its large-stack worker and original environment.
+fn check_theorems_in_environment(
+    environment: &Environment,
+    theorem_names: &[&str],
+    stored_artifacts: Option<&[ModelProgramRefinementTheorem]>,
+) -> Result<Vec<ModelProgramRefinementTheorem>, ModelProgramRefinementError> {
+    validate_stored_theorem_set(stored_artifacts, theorem_names)?;
+    let fresh = theorem_names
+        .iter()
+        .map(|theorem| {
+            let (theorem_type, proof_term) = checked_theorem(environment, theorem)?;
+            Ok(ModelProgramRefinementTheorem {
+                theorem: (*theorem).to_owned(),
+                theorem_type: encode_expression(theorem_type)?,
+                proof_term: encode_expression(proof_term)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ModelProgramRefinementError>>()?;
+
+    if let Some(stored_artifacts) = stored_artifacts {
+        for (artifact, fresh_artifact) in stored_artifacts.iter().zip(&fresh) {
+            if artifact.theorem_type != fresh_artifact.theorem_type {
+                return Err(ModelProgramRefinementError::ArtifactMismatch {
+                    theorem: artifact.theorem.clone(),
+                    field: "theorem type",
+                });
+            }
+            if artifact.proof_term != fresh_artifact.proof_term {
+                return Err(ModelProgramRefinementError::ArtifactMismatch {
+                    theorem: artifact.theorem.clone(),
+                    field: "proof term",
+                });
+            }
+            let stored_type: Expr =
+                serde_json::from_slice(&artifact.theorem_type).map_err(|error| {
+                    ModelProgramRefinementError::MalformedArtifact(error.to_string())
+                })?;
+            let stored_proof: Expr =
+                serde_json::from_slice(&artifact.proof_term).map_err(|error| {
+                    ModelProgramRefinementError::MalformedArtifact(error.to_string())
+                })?;
+            let declaration =
+                environment.get_const(&Name::from_string(&artifact.theorem)).ok_or_else(|| {
+                    ModelProgramRefinementError::MalformedArtifact(format!(
+                        "fresh environment lacks theorem `{}`",
+                        artifact.theorem
+                    ))
+                })?;
+            if encode_expression(&declaration.type_)? != artifact.theorem_type {
+                return Err(ModelProgramRefinementError::ArtifactMismatch {
+                    theorem: artifact.theorem.clone(),
+                    field: "registered theorem type",
+                });
+            }
+            TypeChecker::with_mode(environment, environment.mode())
+                .check_type(&stored_proof, &stored_type)
+                .map_err(|error| ModelProgramRefinementError::KernelRejected(error.to_string()))?;
+        }
+    }
+    Ok(fresh)
 }
 
 /// Certify a kernel-checked forward simulation from one exact closed program
@@ -666,13 +892,572 @@ pub fn recheck_model_program_refinement(
     Ok(())
 }
 
+/// Certify invariant-relative simulation of the exact original program machine.
+///
+/// The authored theorem must prove initialization and preservation of the named
+/// invariant, plus initial-state and step simulation. Property transport remains
+/// conditional on a proof of the exact model's property; model data alone is not
+/// that proof. This generic API permits constant projections and grants no fixed
+/// source-policy claim merely from their existence.
+#[allow(clippy::too_many_arguments)]
+pub fn certify_invariant_model_program_refinement(
+    module_bytes: &[u8],
+    function_id: u32,
+    invocation: &LiteralInvocation,
+    model_source: &str,
+    model_definition: &str,
+    refinement_source: &str,
+    invariant_definition: &str,
+    projection_definition: &str,
+    refinement_theorem: &str,
+) -> Result<InvariantModelProgramRefinementCertificate, ModelProgramRefinementError> {
+    validate_declaration_name("model definition", model_definition)?;
+    validate_declaration_name("source invariant", invariant_definition)?;
+    validate_declaration_name("projection definition", projection_definition)?;
+    validate_declaration_name("refinement theorem", refinement_theorem)?;
+    check_source_size("model", model_source, MAX_AUTHORED_SOURCE_BYTES)?;
+    check_source_size("authored refinement", refinement_source, MAX_AUTHORED_SOURCE_BYTES)?;
+    let literal = certify_literal_refinement(module_bytes, function_id, invocation)?;
+    let (model, decoded_model) = extract_clean_finite_model(model_source, model_definition)?;
+    let wrapper = invariant_wrapper_source(
+        model_definition,
+        invariant_definition,
+        projection_definition,
+        refinement_theorem,
+    );
+    check_combined_source_size(&literal.clean_source, model_source, refinement_source, &wrapper)?;
+    let theorems = check_source_theorems(
+        literal.clean_source.clone(),
+        model_source.to_owned(),
+        model_definition.to_owned(),
+        decoded_model,
+        refinement_source.to_owned(),
+        wrapper,
+        &INVARIANT_THEOREM_NAMES,
+        None,
+    )?;
+    let certificate = InvariantModelProgramRefinementCertificate {
+        schema: INVARIANT_MODEL_PROGRAM_REFINEMENT_SCHEMA_V1.to_owned(),
+        literal,
+        model,
+        refinement_source: refinement_source.to_owned(),
+        invariant_definition: invariant_definition.to_owned(),
+        projection_definition: projection_definition.to_owned(),
+        refinement_theorem: refinement_theorem.to_owned(),
+        theorems,
+    };
+    recheck_invariant_model_program_refinement(
+        &certificate,
+        module_bytes,
+        function_id,
+        invocation,
+        model_source,
+        model_definition,
+        refinement_source,
+        invariant_definition,
+        projection_definition,
+        refinement_theorem,
+    )?;
+    Ok(certificate)
+}
+
+/// Replay from caller-supplied exact program, model, invariant and proof inputs.
+/// Saved verdicts and invariant-restricted replacement machines are not authority.
+#[allow(clippy::too_many_arguments)]
+pub fn recheck_invariant_model_program_refinement(
+    certificate: &InvariantModelProgramRefinementCertificate,
+    expected_module_bytes: &[u8],
+    expected_function_id: u32,
+    expected_invocation: &LiteralInvocation,
+    expected_model_source: &str,
+    expected_model_definition: &str,
+    expected_refinement_source: &str,
+    expected_invariant_definition: &str,
+    expected_projection_definition: &str,
+    expected_refinement_theorem: &str,
+) -> Result<(), ModelProgramRefinementError> {
+    let prepared = prepare_invariant_replay(
+        certificate,
+        expected_module_bytes,
+        expected_function_id,
+        expected_invocation,
+        expected_model_source,
+        expected_model_definition,
+        expected_refinement_source,
+        expected_invariant_definition,
+        expected_projection_definition,
+        expected_refinement_theorem,
+    )?;
+    check_source_theorems(
+        prepared.literal_source,
+        prepared.model_source,
+        prepared.model_definition,
+        prepared.decoded_model,
+        prepared.refinement_source,
+        prepared.wrapper,
+        &INVARIANT_THEOREM_NAMES,
+        Some(prepared.theorems),
+    )?;
+    Ok(())
+}
+
+/// Exact-input preparation shared by standalone and property replay. This is
+/// data, not a checked environment or transferable proof authority.
+struct PreparedInvariantReplay {
+    literal_source: String,
+    model_source: String,
+    model_definition: String,
+    decoded_model: CleanFiniteModel,
+    refinement_source: String,
+    wrapper: String,
+    theorems: Vec<ModelProgramRefinementTheorem>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_invariant_replay(
+    certificate: &InvariantModelProgramRefinementCertificate,
+    expected_module_bytes: &[u8],
+    expected_function_id: u32,
+    expected_invocation: &LiteralInvocation,
+    expected_model_source: &str,
+    expected_model_definition: &str,
+    expected_refinement_source: &str,
+    expected_invariant_definition: &str,
+    expected_projection_definition: &str,
+    expected_refinement_theorem: &str,
+) -> Result<PreparedInvariantReplay, ModelProgramRefinementError> {
+    if certificate.schema != INVARIANT_MODEL_PROGRAM_REFINEMENT_SCHEMA_V1 {
+        return Err(ModelProgramRefinementError::SchemaMismatch {
+            found: certificate.schema.clone(),
+        });
+    }
+    if certificate.model.clean_source != expected_model_source {
+        return Err(ModelProgramRefinementError::ModelSourceMismatch);
+    }
+    if certificate.model.model_definition != expected_model_definition {
+        return Err(ModelProgramRefinementError::ModelDefinitionMismatch);
+    }
+    if certificate.refinement_source != expected_refinement_source {
+        return Err(ModelProgramRefinementError::RefinementSourceMismatch);
+    }
+    if certificate.invariant_definition != expected_invariant_definition {
+        return Err(ModelProgramRefinementError::InvariantDefinitionMismatch);
+    }
+    if certificate.projection_definition != expected_projection_definition {
+        return Err(ModelProgramRefinementError::ProjectionDefinitionMismatch);
+    }
+    if certificate.refinement_theorem != expected_refinement_theorem {
+        return Err(ModelProgramRefinementError::RefinementTheoremMismatch);
+    }
+    validate_declaration_name("model definition", expected_model_definition)?;
+    validate_declaration_name("source invariant", expected_invariant_definition)?;
+    validate_declaration_name("projection definition", expected_projection_definition)?;
+    validate_declaration_name("refinement theorem", expected_refinement_theorem)?;
+    check_source_size("model", expected_model_source, MAX_AUTHORED_SOURCE_BYTES)?;
+    check_source_size(
+        "authored refinement",
+        expected_refinement_source,
+        MAX_AUTHORED_SOURCE_BYTES,
+    )?;
+    let wrapper = invariant_wrapper_source(
+        expected_model_definition,
+        expected_invariant_definition,
+        expected_projection_definition,
+        expected_refinement_theorem,
+    );
+    check_combined_source_size(
+        &certificate.literal.clean_source,
+        expected_model_source,
+        expected_refinement_source,
+        &wrapper,
+    )?;
+    recheck_literal_refinement(
+        &certificate.literal,
+        expected_module_bytes,
+        expected_function_id,
+        expected_invocation,
+    )?;
+    let decoded_model =
+        recheck_clean_finite_model_artifact(&certificate.model, expected_model_source)?;
+    validate_stored_theorem_set(Some(&certificate.theorems), &INVARIANT_THEOREM_NAMES)?;
+    Ok(PreparedInvariantReplay {
+        literal_source: certificate.literal.clean_source.clone(),
+        model_source: expected_model_source.to_owned(),
+        model_definition: expected_model_definition.to_owned(),
+        decoded_model,
+        refinement_source: expected_refinement_source.to_owned(),
+        wrapper,
+        theorems: certificate.theorems.clone(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_program_property(
+    literal_source: String,
+    model_source: String,
+    model_definition: String,
+    expected_model: CleanFiniteModel,
+    refinement_source: String,
+    support_source: String,
+    property_source: String,
+    theorem: String,
+    refinement_wrapper: String,
+    refinement_theorems: Vec<ModelProgramRefinementTheorem>,
+    stored: Option<ModelProgramRefinementTheorem>,
+) -> Result<ModelProgramRefinementTheorem, ModelProgramRefinementError> {
+    check_property_source_sizes(
+        [
+            literal_source.len(),
+            model_source.len(),
+            refinement_source.len(),
+            refinement_wrapper.len(),
+        ],
+        &support_source,
+        &property_source,
+    )?;
+    run_on_kernel_stack(move || {
+        let (environment, context) = elaborate_composed_context(
+            &literal_source,
+            &model_source,
+            &model_definition,
+            &expected_model,
+            &refinement_source,
+            &refinement_wrapper,
+        )?;
+        extend_program_property(
+            environment,
+            context,
+            &support_source,
+            &property_source,
+            &theorem,
+            &refinement_theorems,
+            stored.as_ref(),
+        )
+    })
+}
+
+fn check_property_source_sizes(
+    prefix_lengths: [usize; 4],
+    support_source: &str,
+    property_source: &str,
+) -> Result<(), ModelProgramRefinementError> {
+    check_source_size("support", support_source, MAX_AUTHORED_SOURCE_BYTES)?;
+    check_source_size("property", property_source, MAX_AUTHORED_SOURCE_BYTES)?;
+    let [literal, model, refinement, wrapper] = prefix_lengths;
+    let combined =
+        [literal, model, refinement, support_source.len(), property_source.len(), wrapper]
+            .into_iter()
+            .try_fold(5usize, usize::checked_add)
+            .ok_or(ModelProgramRefinementError::SourceTooLarge {
+                role: "combined",
+                bytes: usize::MAX,
+                maximum: MAX_COMBINED_SOURCE_BYTES,
+            })?;
+    if combined > MAX_COMBINED_SOURCE_BYTES {
+        return Err(ModelProgramRefinementError::SourceTooLarge {
+            role: "combined",
+            bytes: combined,
+            maximum: MAX_COMBINED_SOURCE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Consumes this request's environment. Neither a failed extension nor its
+/// partially elaborated declarations can be retried as another request.
+fn extend_program_property(
+    mut environment: Environment,
+    mut context: FileContext,
+    support_source: &str,
+    property_source: &str,
+    theorem: &str,
+    refinement_theorems: &[ModelProgramRefinementTheorem],
+    stored: Option<&ModelProgramRefinementTheorem>,
+) -> Result<ModelProgramRefinementTheorem, ModelProgramRefinementError> {
+    // The inner proof is checked in precisely its independent declaration
+    // frontier before any support name can affect resolution. Later units
+    // import this frontier and cannot replace its declarations.
+    if refinement_theorems.len() != INVARIANT_THEOREM_NAMES.len()
+        || refinement_theorems
+            .iter()
+            .zip(INVARIANT_THEOREM_NAMES)
+            .any(|(artifact, name)| artifact.theorem != name)
+    {
+        return Err(ModelProgramRefinementError::TheoremSetMismatch);
+    }
+    for artifact in refinement_theorems {
+        let (ty, proof) = checked_theorem(&environment, &artifact.theorem)?;
+        if encode_expression(ty)? != artifact.theorem_type
+            || encode_expression(proof)? != artifact.proof_term
+        {
+            return Err(ModelProgramRefinementError::ArtifactMismatch {
+                theorem: artifact.theorem.clone(),
+                field: "property refinement frontier",
+            });
+        }
+    }
+    let parser_prelude = parser_prelude();
+    for (source, label) in [
+        (support_source, "isolated model/program property support"),
+        (property_source, "isolated model/program property"),
+    ] {
+        context = context.fork_run();
+        elaborate_suffix_with_parser_prelude(
+            &mut environment,
+            &mut context,
+            &parser_prelude,
+            source,
+            label,
+        )?;
+    }
+    let (theorem_type, proof_term) = checked_theorem(&environment, theorem)?;
+    let fresh = ModelProgramRefinementTheorem {
+        theorem: theorem.to_owned(),
+        theorem_type: encode_expression(theorem_type)?,
+        proof_term: encode_expression(proof_term)?,
+    };
+    if let Some(stored) = stored {
+        if *stored != fresh {
+            return Err(ModelProgramRefinementError::ArtifactMismatch {
+                theorem: theorem.to_owned(),
+                field: "property theorem or proof",
+            });
+        }
+        let ty: Expr = serde_json::from_slice(&stored.theorem_type)
+            .map_err(|error| ModelProgramRefinementError::MalformedArtifact(error.to_string()))?;
+        let proof: Expr = serde_json::from_slice(&stored.proof_term)
+            .map_err(|error| ModelProgramRefinementError::MalformedArtifact(error.to_string()))?;
+        TypeChecker::with_mode(&environment, environment.mode())
+            .check_type(&proof, &ty)
+            .map_err(|error| ModelProgramRefinementError::KernelRejected(error.to_string()))?;
+    }
+    Ok(fresh)
+}
+
+/// Created only after every inner artifact has freshly passed in this exact
+/// environment. It exists and is consumed within one kernel-worker request;
+/// it is never returned, cloned, serialized or retained for another request.
+struct CheckedFrontier {
+    environment: Environment,
+    context: FileContext,
+    prefix_lengths: [usize; 4],
+    theorems: Vec<ModelProgramRefinementTheorem>,
+}
+
+impl CheckedFrontier {
+    fn check(prepared: PreparedInvariantReplay) -> Result<Self, ModelProgramRefinementError> {
+        let prefix_lengths = [
+            prepared.literal_source.len(),
+            prepared.model_source.len(),
+            prepared.refinement_source.len(),
+            prepared.wrapper.len(),
+        ];
+        let (environment, context) = elaborate_composed_context(
+            &prepared.literal_source,
+            &prepared.model_source,
+            &prepared.model_definition,
+            &prepared.decoded_model,
+            &prepared.refinement_source,
+            &prepared.wrapper,
+        )?;
+        check_theorems_in_environment(
+            &environment,
+            &INVARIANT_THEOREM_NAMES,
+            Some(&prepared.theorems),
+        )?;
+        Ok(Self { environment, context, prefix_lengths, theorems: prepared.theorems })
+    }
+
+    fn check_property(
+        self,
+        support_source: &str,
+        property_source: &str,
+        theorem: &str,
+        stored: &ModelProgramRefinementTheorem,
+    ) -> Result<(), ModelProgramRefinementError> {
+        // Preserve the public replay's error priority: invalid inner proofs
+        // fail before oversized support/property sources are considered.
+        check_property_source_sizes(self.prefix_lengths, support_source, property_source)?;
+        extend_program_property(
+            self.environment,
+            self.context,
+            support_source,
+            property_source,
+            theorem,
+            &self.theorems,
+            Some(stored),
+        )?;
+        Ok(())
+    }
+}
+
+/// Check a final authored property after separate model, support and refinement
+/// units. Fixed-policy callers must regenerate their exact goal and projection.
+#[allow(clippy::too_many_arguments)]
+pub fn certify_invariant_model_program_property(
+    module_bytes: &[u8],
+    function_id: u32,
+    invocation: &LiteralInvocation,
+    model_source: &str,
+    model_definition: &str,
+    refinement_source: &str,
+    invariant_definition: &str,
+    projection_definition: &str,
+    refinement_theorem: &str,
+    support_source: &str,
+    property_source: &str,
+    property_theorem: &str,
+) -> Result<InvariantModelProgramPropertyCertificate, ModelProgramRefinementError> {
+    validate_declaration_name("property theorem", property_theorem)?;
+    let refinement = certify_invariant_model_program_refinement(
+        module_bytes,
+        function_id,
+        invocation,
+        model_source,
+        model_definition,
+        refinement_source,
+        invariant_definition,
+        projection_definition,
+        refinement_theorem,
+    )?;
+    let decoded_model = recheck_clean_finite_model_artifact(&refinement.model, model_source)?;
+    let wrapper = invariant_wrapper_source(
+        model_definition,
+        invariant_definition,
+        projection_definition,
+        refinement_theorem,
+    );
+    let property = check_program_property(
+        refinement.literal.clean_source.clone(),
+        model_source.to_owned(),
+        model_definition.to_owned(),
+        decoded_model,
+        refinement_source.to_owned(),
+        support_source.to_owned(),
+        property_source.to_owned(),
+        property_theorem.to_owned(),
+        wrapper,
+        refinement.theorems.clone(),
+        None,
+    )?;
+    let certificate = InvariantModelProgramPropertyCertificate {
+        schema: INVARIANT_MODEL_PROGRAM_PROPERTY_SCHEMA_V1.to_owned(),
+        refinement,
+        support_source: support_source.to_owned(),
+        property_source: property_source.to_owned(),
+        property,
+    };
+    recheck_invariant_model_program_property(
+        &certificate,
+        module_bytes,
+        function_id,
+        invocation,
+        model_source,
+        model_definition,
+        refinement_source,
+        invariant_definition,
+        projection_definition,
+        refinement_theorem,
+        support_source,
+        property_source,
+        property_theorem,
+    )?;
+    Ok(certificate)
+}
+
+/// Replay the exact inputs while preserving every source-unit import boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn recheck_invariant_model_program_property(
+    certificate: &InvariantModelProgramPropertyCertificate,
+    module_bytes: &[u8],
+    function_id: u32,
+    invocation: &LiteralInvocation,
+    model_source: &str,
+    model_definition: &str,
+    refinement_source: &str,
+    invariant_definition: &str,
+    projection_definition: &str,
+    refinement_theorem: &str,
+    support_source: &str,
+    property_source: &str,
+    property_theorem: &str,
+) -> Result<(), ModelProgramRefinementError> {
+    if certificate.schema != INVARIANT_MODEL_PROGRAM_PROPERTY_SCHEMA_V1 {
+        return Err(ModelProgramRefinementError::SchemaMismatch {
+            found: certificate.schema.clone(),
+        });
+    }
+    if certificate.support_source != support_source {
+        return Err(ModelProgramRefinementError::SupportSourceMismatch);
+    }
+    if certificate.property_source != property_source {
+        return Err(ModelProgramRefinementError::PropertySourceMismatch);
+    }
+    if certificate.property.theorem != property_theorem {
+        return Err(ModelProgramRefinementError::PropertyTheoremMismatch);
+    }
+    validate_declaration_name("property theorem", property_theorem)?;
+    let prepared = prepare_invariant_replay(
+        &certificate.refinement,
+        module_bytes,
+        function_id,
+        invocation,
+        model_source,
+        model_definition,
+        refinement_source,
+        invariant_definition,
+        projection_definition,
+        refinement_theorem,
+    )?;
+    // Stage a rejected size check without copying an oversized input. Its
+    // error is returned only after full inner replay, preserving error order.
+    let extension = check_property_source_sizes(
+        [
+            prepared.literal_source.len(),
+            prepared.model_source.len(),
+            prepared.refinement_source.len(),
+            prepared.wrapper.len(),
+        ],
+        support_source,
+        property_source,
+    )
+    .map(|()| {
+        (
+            support_source.to_owned(),
+            property_source.to_owned(),
+            property_theorem.to_owned(),
+            certificate.property.clone(),
+        )
+    });
+    run_on_kernel_stack(move || {
+        let frontier = CheckedFrontier::check(prepared)?;
+        let (support_source, property_source, property_theorem, stored) = extension?;
+        frontier.check_property(&support_source, &property_source, &property_theorem, &stored)
+    })
+}
+
+#[cfg(test)]
+#[path = "model_program_refinement/frontier_tests.rs"]
+mod frontier_tests;
+
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use trust_ir::{
         Block, FuncId, FuncTy, FuncTyId, Function, Inst, InstrNode, Module, Ty, ValueId,
     };
 
     use super::*;
+
+    /// Mutation control for the per-thread composed-context cache: the lane
+    /// must run on persistent workers, or every call rebuilds the context.
+    #[test]
+    fn composed_lane_runs_on_reused_workers() {
+        assert!(crate::kernel_worker::lane_reuses_a_worker(|| run_on_kernel_stack(|| Ok(
+            crate::kernel_worker::probe_ran_on_this_thread_before()
+        ))));
+    }
 
     const MODEL_SOURCE: &str = r#"
 namespace RefinementFixture
@@ -690,6 +1475,12 @@ def Model : Trust.Temporal.FiniteModel.Model :=
 end RefinementFixture
 "#;
 
+    /// The authored projection and forward simulation. `initialScalars` ends
+    /// with an explicit `rfl`: Clean's `rw`, like Lean 4.8.0's macro
+    /// (`rewrite …; try (with_reducible rfl)`), closes a goal only by REDUCIBLE
+    /// `rfl` (Clean 6522ff6bb, in the feee691d2 pin), and what `rw [same]`
+    /// leaves, `AbstractZero.scalar (StateVar.mk "x" 0).name =
+    /// (StateVar.mk "x" 0).init`, needs `AbstractZero`, a plain `def`, unfolded.
     const REFINEMENT_SOURCE: &str = r#"
 namespace RefinementFixture
 
@@ -752,7 +1543,8 @@ theorem initialScalars (entry : StateVar)
     (member : Member entry [StateVar.mk "x" 0]) :
     AbstractZero.scalar entry.name = entry.init := by
   have same : entry = StateVar.mk "x" 0 := memberSingleton member
-  rw [same]
+  rewrite [same]
+  rfl
 
 theorem projectionInitial : Initial Model AbstractZero :=
   And.intro projectionCanonical
@@ -768,6 +1560,166 @@ theorem ProgramRefinesModel :
 
 end RefinementFixture
 "#;
+
+    const INVARIANT_EXTENSION: &str = r#"
+namespace RefinementFixture
+
+def SourceInvariant (_ : IRConfig) : Prop := True
+
+theorem ProgramRefinesInvariantModel :
+    Trust.Temporal.InvariantForwardRefinement
+      Trust.LiteralRefinement.Model
+      (Trust.Temporal.FiniteModel.StateMachine Model)
+      Projection SourceInvariant :=
+  { init_invariant := fun _ _ => True.intro
+    preserve_invariant := fun _ _ _ _ => True.intro
+    init := ProgramRefinesModel.init
+    next := fun before after _ step => ProgramRefinesModel.next before after step }
+
+end RefinementFixture
+"#;
+
+    fn invariant_source() -> String {
+        format!("{REFINEMENT_SOURCE}\n{INVARIANT_EXTENSION}")
+    }
+
+    fn certify_invariant() -> InvariantModelProgramRefinementCertificate {
+        static CERTIFICATE: OnceLock<InvariantModelProgramRefinementCertificate> = OnceLock::new();
+        CERTIFICATE
+            .get_or_init(|| {
+                certify_invariant_model_program_refinement(
+                    &fixture_bytes(),
+                    0,
+                    &LiteralInvocation::closed(vec![], 0),
+                    MODEL_SOURCE,
+                    "RefinementFixture.Model",
+                    &invariant_source(),
+                    "RefinementFixture.SourceInvariant",
+                    "RefinementFixture.Projection",
+                    "RefinementFixture.ProgramRefinesInvariantModel",
+                )
+                .expect("generic invariant-relative fixture carries all premises")
+            })
+            .clone()
+    }
+
+    fn recheck_invariant_fixture(
+        certificate: &InvariantModelProgramRefinementCertificate,
+    ) -> Result<(), ModelProgramRefinementError> {
+        recheck_invariant_model_program_refinement(
+            certificate,
+            &fixture_bytes(),
+            0,
+            &LiteralInvocation::closed(vec![], 0),
+            MODEL_SOURCE,
+            "RefinementFixture.Model",
+            &invariant_source(),
+            "RefinementFixture.SourceInvariant",
+            "RefinementFixture.Projection",
+            "RefinementFixture.ProgramRefinesInvariantModel",
+        )
+    }
+
+    #[test]
+    fn invariant_relative_refinement_freshly_replays_all_premises_and_transport() {
+        let certificate = certify_invariant();
+        assert_eq!(certificate.schema, INVARIANT_MODEL_PROGRAM_REFINEMENT_SCHEMA_V1);
+        assert_eq!(certificate.theorems.len(), INVARIANT_THEOREM_NAMES.len());
+        let encoded = serde_json::to_vec(&certificate).unwrap();
+        let decoded = serde_json::from_slice(&encoded).unwrap();
+        recheck_invariant_fixture(&decoded).expect("fresh kernel replay of all seven exact goals");
+    }
+
+    #[test]
+    fn invariant_relative_splices_and_missing_proof_artifacts_fail_closed() {
+        let certificate = certify_invariant();
+        let mut altered = certificate.clone();
+        altered.invariant_definition = "RefinementFixture.OtherInvariant".to_owned();
+        assert_eq!(
+            recheck_invariant_fixture(&altered),
+            Err(ModelProgramRefinementError::InvariantDefinitionMismatch)
+        );
+        altered = certificate.clone();
+        altered.schema = MODEL_PROGRAM_REFINEMENT_SCHEMA_V2.to_owned();
+        assert!(matches!(
+            recheck_invariant_fixture(&altered),
+            Err(ModelProgramRefinementError::SchemaMismatch { .. })
+        ));
+        altered = certificate.clone();
+        altered.refinement_source.push_str("\n-- different bound source\n");
+        assert_eq!(
+            recheck_invariant_fixture(&altered),
+            Err(ModelProgramRefinementError::RefinementSourceMismatch)
+        );
+        altered = certificate.clone();
+        altered.projection_definition = "RefinementFixture.OtherProjection".to_owned();
+        assert_eq!(
+            recheck_invariant_fixture(&altered),
+            Err(ModelProgramRefinementError::ProjectionDefinitionMismatch)
+        );
+        altered = certificate.clone();
+        altered.model.clean_source.push_str("\n-- different model source\n");
+        assert_eq!(
+            recheck_invariant_fixture(&altered),
+            Err(ModelProgramRefinementError::ModelSourceMismatch)
+        );
+        altered = certificate.clone();
+        altered.refinement_theorem = "RefinementFixture.OtherProof".to_owned();
+        assert_eq!(
+            recheck_invariant_fixture(&altered),
+            Err(ModelProgramRefinementError::RefinementTheoremMismatch)
+        );
+        altered = certificate.clone();
+        altered.theorems.remove(2);
+        assert_eq!(
+            recheck_invariant_fixture(&altered),
+            Err(ModelProgramRefinementError::TheoremSetMismatch)
+        );
+        altered = certificate.clone();
+        altered.theorems[2].proof_term = certificate.theorems[1].proof_term.clone();
+        assert!(matches!(
+            recheck_invariant_fixture(&altered),
+            Err(ModelProgramRefinementError::ArtifactMismatch { field: "proof term", .. })
+        ));
+        altered = certificate;
+        altered.literal.function_id = 1;
+        assert!(matches!(
+            recheck_invariant_fixture(&altered),
+            Err(ModelProgramRefinementError::Literal(_))
+        ));
+    }
+
+    #[test]
+    fn invariant_relative_requires_initialization_and_actual_step_preservation() {
+        for source in [
+            invariant_source().replace("    preserve_invariant := fun _ _ _ _ => True.intro\n", ""),
+            invariant_source().replace(
+                "preserve_invariant := fun _ _ _ _ => True.intro",
+                "preserve_invariant := fun _ _ _ _ => 0",
+            ),
+            invariant_source().replace(
+                "def SourceInvariant (_ : IRConfig) : Prop := True",
+                "def SourceInvariant (_ : IRConfig) : Prop := False",
+            ),
+        ] {
+            let error = certify_invariant_model_program_refinement(
+                &fixture_bytes(),
+                0,
+                &LiteralInvocation::closed(vec![], 0),
+                MODEL_SOURCE,
+                "RefinementFixture.Model",
+                &source,
+                "RefinementFixture.SourceInvariant",
+                "RefinementFixture.Projection",
+                "RefinementFixture.ProgramRefinesInvariantModel",
+            )
+            .expect_err("an absent/false preservation or initial invariant is not a simulation");
+            assert!(
+                error.to_string().contains("ProgramRefinesInvariantModel"),
+                "must fail at the actual invariant theorem, not an unrelated declaration: {error}"
+            );
+        }
+    }
 
     const CONTEXT_SENSITIVE_MODEL_SOURCE: &str = r#"
 def FunctionId : Nat := 9
@@ -808,7 +1760,12 @@ end Trust
 
     fn fixture_bytes() -> Vec<u8> {
         let mut module = Module::new("model_program_refinement_fixture");
-        module.func_types.push(FuncTy { params: vec![], returns: vec![Ty::U8], is_vararg: false });
+        module.func_types.push(FuncTy {
+            params: vec![],
+            returns: vec![Ty::U8],
+            is_vararg: false,
+            abi: None,
+        });
         let mut function =
             Function::new(FuncId::new(0), "answer", FuncTyId::new(0), trust_ir::BlockId::new(0));
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -819,7 +1776,7 @@ end Trust
         block.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }));
         function.blocks.push(block);
         module.functions.push(function);
-        trust_ir::binary::serialize_module(&module)
+        trust_ir::binary::serialize_module(&module).expect("serialize_module: test fixture")
     }
 
     fn certify() -> ModelProgramRefinementCertificate {
@@ -911,6 +1868,23 @@ namespace Evil
         let source = format!("{MODEL_SOURCE}\n{DUMMY_PROGRAM_SOURCE}\n{REFINEMENT_SOURCE}");
         extract_clean_finite_model(&source, "RefinementFixture.Model")
             .expect("authored model and forward simulation elaborate together");
+    }
+
+    #[test]
+    fn initial_scalars_proof_rejects_a_wrong_declared_initial_value() {
+        let false_refinement = REFINEMENT_SOURCE.replacen(
+            "AbstractZero.scalar entry.name = entry.init := by",
+            "AbstractZero.scalar entry.name = entry.init + 1 := by",
+            1,
+        );
+        assert_ne!(false_refinement, REFINEMENT_SOURCE);
+        let source = format!("{MODEL_SOURCE}\n{DUMMY_PROGRAM_SOURCE}\n{false_refinement}");
+        let error = extract_clean_finite_model(&source, "RefinementFixture.Model")
+            .expect_err("rewriting membership must not prove the false initial scalar equality");
+        assert!(
+            error.to_string().contains("RefinementFixture.initialScalars"),
+            "the false equality must fail in its proof declaration: {error}"
+        );
     }
 
     #[test]
@@ -1179,5 +2153,58 @@ namespace Evil
                 Err(ModelProgramRefinementError::InvalidDeclarationName { .. })
             ));
         }
+    }
+
+    /// Trust (Clean R80 item 2; `docs/DECISION_QUEUE.md` R80-CONSUMERS-1): the
+    /// authored refinement is elaborated in a run of its own, so the command form
+    /// of `[implemented_by]` may bind only its own declarations; the preludes',
+    /// the generated program's and the authored model's are imported to it, and
+    /// Lean refuses them as imported. Each source first binds a declaration of
+    /// its own, the control: had that been refused, the refusal would name it.
+    /// Before the fix every unit of the composed context shared the cached
+    /// prelude's run, and both sources certified.
+    #[test]
+    fn authored_refinement_cannot_rebind_an_earlier_unit_declaration() {
+        const OWN: &str = "def mySlow (n : Nat) : Nat := n + 2\n\
+                           def myFast (n : Nat) : Nat := n + 1\n\
+                           attribute [implemented_by myFast] mySlow\n";
+        let finite_prelude = format!(
+            "{REFINEMENT_SOURCE}\n{OWN}\
+             def myProjection (value : Trust.Temporal.FiniteModel.Value) : Nat := 0\n\
+             attribute [implemented_by myProjection] \
+             Trust.Temporal.FiniteModel.valueNatProjection\n"
+        );
+        let model = format!(
+            "{REFINEMENT_SOURCE}\n{OWN}\
+             def myX : Trust.Temporal.FiniteModel.ScalarExpr := \
+             Trust.Temporal.FiniteModel.ScalarExpr.var \"y\"\n\
+             attribute [implemented_by myX] RefinementFixture.X\n"
+        );
+        let outcome = |refinement: &str| {
+            check_fixture_units(
+                MODEL_SOURCE,
+                "RefinementFixture.Model",
+                refinement,
+                "RefinementFixture.Projection",
+                "RefinementFixture.ProgramRefinesModel",
+            )
+            .map(|_| ())
+        };
+        let imported = |declaration: &str| {
+            Err(ModelProgramRefinementError::Clean(CleanTemporalCertificateError::Elaborate {
+                unit: "authored model/program refinement",
+                detail: format!(
+                    "Cannot add attribute `[implemented_by]` to declaration `{declaration}` \
+                     because it is in an imported module"
+                ),
+            }))
+        };
+        assert_eq!(
+            [outcome(&finite_prelude), outcome(&model)],
+            [
+                imported("Trust.Temporal.FiniteModel.valueNatProjection"),
+                imported("RefinementFixture.X"),
+            ]
+        );
     }
 }

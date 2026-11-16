@@ -23,12 +23,18 @@ rustc_errors = { path = "../rustc_errors" }
 rustc_feature = { path = "../rustc_feature" }
 rustc_index = { path = "../rustc_index" }
 rustc_lexer = { path = "../rustc_lexer" }
+rustc_lint_defs = { path = "../rustc_lint_defs" }
 rustc_macros = { path = "../rustc_macros" }
 rustc_session = { path = "../rustc_session" }
 rustc_span = { path = "../rustc_span" }
-thin-vec = "0.2.18"
+thin-vec = "0.2.21"
 tracing = "0.1"
+# Trust: the notation of Trust's served temporal modules (`Trust.Protocol`'s
+# `⊞`, `Trust.Temporal`'s `□`), so an island written with it parses here too.
+# Text only: no dependencies.
+trust-temporal-prelude = { workspace = true }
 unicode-normalization = "0.1.25"
+unicode-properties = { version = "0.1.4", default-features = false, features = ["emoji"] }
 unicode-width = "0.2.2"
 # tidy-alphabetical-end
 

@@ -207,7 +207,7 @@ pub fn audit_term_closure(
 
     let goal = eq_judgment(&sort, ty, term, term);
     let witness = Expr::apps(
-        Expr::const_(Name::from_string("Eq.refl"), vec![sort]),
+        Expr::const_(Name::interned("Eq.refl"), vec![sort]),
         [ty.clone(), term.clone()],
     );
     classify(subject, env.audit_certification(&goal, &witness))
@@ -216,7 +216,7 @@ pub fn audit_term_closure(
 /// `@Eq.{u} ty lhs rhs`.
 fn eq_judgment(sort: &Level, ty: &Expr, lhs: &Expr, rhs: &Expr) -> Expr {
     Expr::apps(
-        Expr::const_(Name::from_string("Eq"), vec![sort.clone()]),
+        Expr::const_(Name::interned("Eq"), vec![sort.clone()]),
         [ty.clone(), lhs.clone(), rhs.clone()],
     )
 }

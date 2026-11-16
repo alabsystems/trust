@@ -52,13 +52,14 @@ use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
 use crate::inherent::*;
-use crate::{self as ty, Interner, TypeFlags};
+use crate::{self as ty, Const, Interner, PredicateProxy, Region, TypeFlags};
 
 /// This trait is implemented for every type that can be visited,
 /// providing the skeleton of the traversal.
 ///
 /// To implement this conveniently, use the derive macro located in
 /// `rustc_macros`.
+#[cfg_attr(feature = "nightly", rustc_diagnostic_item = "TypeVisitable")]
 pub trait TypeVisitable<I: Interner>: fmt::Debug {
     /// The entry point for visiting. To visit a value `t` with a visitor `v`
     /// call: `t.visit_with(v)`.
@@ -104,7 +105,7 @@ pub trait TypeVisitor<I: Interner>: Sized {
 
     // `Region` is non-recursive so the default region visitor has no
     // `super_visit_with` method to call.
-    fn visit_region(&mut self, r: I::Region) -> Self::Result {
+    fn visit_region(&mut self, r: Region<I>) -> Self::Result {
         if let ty::ReError(guar) = r.kind() {
             self.visit_error(guar)
         } else {
@@ -112,11 +113,11 @@ pub trait TypeVisitor<I: Interner>: Sized {
         }
     }
 
-    fn visit_const(&mut self, c: I::Const) -> Self::Result {
+    fn visit_const(&mut self, c: Const<I>) -> Self::Result {
         c.super_visit_with(self)
     }
 
-    fn visit_predicate(&mut self, p: I::Predicate) -> Self::Result {
+    fn visit_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> Self::Result {
         p.super_visit_with(self)
     }
 
@@ -253,6 +254,7 @@ pub trait TypeVisitableExt<I: Interner>: TypeVisitable<I> {
 
     /// Returns `true` if this type has any regions that escape `binder` (and
     /// hence are not bound by it).
+    #[inline]
     fn has_vars_bound_above(&self, binder: ty::DebruijnIndex) -> bool {
         self.has_vars_bound_at_or_above(binder.shifted_in(1))
     }
@@ -263,22 +265,27 @@ pub trait TypeVisitableExt<I: Interner>: TypeVisitable<I> {
     /// occur when traversing through the former.
     ///
     /// See [`HasEscapingVarsVisitor`] for more information.
+    #[inline]
     fn has_escaping_bound_vars(&self) -> bool {
         self.has_vars_bound_at_or_above(ty::INNERMOST)
     }
 
+    #[inline]
     fn has_aliases(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_ALIAS)
     }
 
+    #[inline]
     fn has_opaque_types(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_TY_OPAQUE)
     }
 
+    #[inline]
     fn has_coroutines(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_TY_CORO)
     }
 
+    #[inline]
     fn references_error(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_ERROR)
     }
@@ -287,53 +294,65 @@ pub trait TypeVisitableExt<I: Interner>: TypeVisitable<I> {
 
     fn non_region_error_reported(&self) -> Result<(), I::ErrorGuaranteed>;
 
+    #[inline]
     fn has_non_region_param(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_PARAM - TypeFlags::HAS_RE_PARAM)
     }
 
+    #[inline]
     fn has_regions(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_REGIONS)
     }
 
+    #[inline]
     fn has_infer_regions(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_RE_INFER)
     }
 
+    #[inline]
     fn has_infer_types(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_TY_INFER)
     }
 
+    #[inline]
     fn has_non_region_infer(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_INFER - TypeFlags::HAS_RE_INFER)
     }
 
+    #[inline]
     fn has_infer(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_INFER)
     }
 
+    #[inline]
     fn has_placeholders(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_PLACEHOLDER)
     }
 
+    #[inline]
     fn has_non_region_placeholders(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_PLACEHOLDER - TypeFlags::HAS_RE_PLACEHOLDER)
     }
 
+    #[inline]
     fn has_param(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_PARAM)
     }
 
     /// "Free" regions in this context means that it has any region
     /// that is not (a) erased or (b) late-bound.
+    #[inline]
     fn has_free_regions(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_FREE_REGIONS)
     }
 
+    #[inline]
     fn has_erased_regions(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_RE_ERASED)
     }
 
     /// True if there are any un-erased free regions.
+    #[inline]
     fn has_erasable_regions(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_FREE_REGIONS)
     }
@@ -341,19 +360,23 @@ pub trait TypeVisitableExt<I: Interner>: TypeVisitable<I> {
     /// Indicates whether this value references only 'global'
     /// generic parameters that are the same regardless of what fn we are
     /// in. This is used for caching.
+    #[inline]
     fn is_global(&self) -> bool {
         !self.has_type_flags(TypeFlags::HAS_FREE_LOCAL_NAMES)
     }
 
     /// True if there are any late-bound regions
+    #[inline]
     fn has_bound_regions(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_RE_BOUND)
     }
     /// True if there are any late-bound non-region variables
+    #[inline]
     fn has_non_region_bound_vars(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_BOUND_VARS - TypeFlags::HAS_RE_BOUND)
     }
     /// True if there are any bound variables
+    #[inline]
     fn has_bound_vars(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_BOUND_VARS)
     }
@@ -361,31 +384,37 @@ pub trait TypeVisitableExt<I: Interner>: TypeVisitable<I> {
     /// Indicates whether this value still has parameters/placeholders/inference variables
     /// which could be replaced later, in a way that would change the results of `impl`
     /// specialization.
+    #[inline]
     fn still_further_specializable(&self) -> bool {
         self.has_type_flags(TypeFlags::STILL_FURTHER_SPECIALIZABLE)
     }
 
     /// True if a type or const error is reachable
+    #[inline]
     fn has_non_region_error(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_NON_REGION_ERROR)
     }
 
     /// True if an alias has `IsRigid::Yes`. Used for skipping normalization.
+    #[inline]
     fn has_rigid_aliases(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_RIGID_ALIAS)
     }
 
     /// True if an alias has `IsRigid::No`.
+    #[inline]
     fn has_non_rigid_aliases(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_NON_RIGID_ALIAS)
     }
 }
 
 impl<I: Interner, T: TypeVisitable<I>> TypeVisitableExt<I> for T {
+    #[inline]
     fn has_type_flags(&self, flags: TypeFlags) -> bool {
         self.visit_with(&mut HasTypeFlagsVisitor { flags }) == ControlFlow::Break(FoundFlags)
     }
 
+    #[inline]
     fn has_vars_bound_at_or_above(&self, binder: ty::DebruijnIndex) -> bool {
         self.visit_with(&mut HasEscapingVarsVisitor { outer_index: binder })
             == ControlFlow::Break(FoundEscapingVars)
@@ -465,7 +494,7 @@ impl<I: Interner> TypeVisitor<I> for HasTypeFlagsVisitor {
     }
 
     #[inline]
-    fn visit_region(&mut self, r: I::Region) -> Self::Result {
+    fn visit_region(&mut self, r: Region<I>) -> Self::Result {
         // Note: no `super_visit_with` call, as usual for `Region`.
         if r.flags().intersects(self.flags) {
             ControlFlow::Break(FoundFlags)
@@ -475,7 +504,7 @@ impl<I: Interner> TypeVisitor<I> for HasTypeFlagsVisitor {
     }
 
     #[inline]
-    fn visit_const(&mut self, c: I::Const) -> Self::Result {
+    fn visit_const(&mut self, c: Const<I>) -> Self::Result {
         // Note: no `super_visit_with` call.
         if c.flags().intersects(self.flags) {
             ControlFlow::Break(FoundFlags)
@@ -485,7 +514,7 @@ impl<I: Interner> TypeVisitor<I> for HasTypeFlagsVisitor {
     }
 
     #[inline]
-    fn visit_predicate(&mut self, predicate: I::Predicate) -> Self::Result {
+    fn visit_predicate<P: PredicateProxy<I>>(&mut self, predicate: P) -> Self::Result {
         // Note: no `super_visit_with` call.
         if predicate.flags().intersects(self.flags) {
             ControlFlow::Break(FoundFlags)
@@ -572,7 +601,7 @@ impl<I: Interner> TypeVisitor<I> for HasEscapingVarsVisitor {
     }
 
     #[inline]
-    fn visit_region(&mut self, r: I::Region) -> Self::Result {
+    fn visit_region(&mut self, r: Region<I>) -> Self::Result {
         // If the region is bound by `outer_index` or anything outside
         // of outer index, then it escapes the binders we have
         // visited.
@@ -583,7 +612,8 @@ impl<I: Interner> TypeVisitor<I> for HasEscapingVarsVisitor {
         }
     }
 
-    fn visit_const(&mut self, ct: I::Const) -> Self::Result {
+    #[inline]
+    fn visit_const(&mut self, ct: Const<I>) -> Self::Result {
         // If the outer-exclusive-binder is *strictly greater* than
         // `outer_index`, that means that `ct` contains some content
         // bound at `outer_index` or above (because
@@ -597,7 +627,7 @@ impl<I: Interner> TypeVisitor<I> for HasEscapingVarsVisitor {
     }
 
     #[inline]
-    fn visit_predicate(&mut self, predicate: I::Predicate) -> Self::Result {
+    fn visit_predicate<P: PredicateProxy<I>>(&mut self, predicate: P) -> Self::Result {
         if predicate.outer_exclusive_binder() > self.outer_index {
             ControlFlow::Break(FoundEscapingVars)
         } else {

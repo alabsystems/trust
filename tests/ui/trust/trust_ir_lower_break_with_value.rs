@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-BV: VALUE-PRODUCING loops. `let r = loop { .. break v .. }` gives the
 // exit block a leading RESULT param — `[result] ++ carried` (the if-join
 // `[result?] ++ merged` convention) — and every `break v` prepends its

@@ -183,8 +183,11 @@ impl fmt::Display for Offset {
         match self {
             Self::Z => f.write_str("Z"),
             Self::Custom { minutes } => {
-                let (sign, magnitude) =
-                    if *minutes < 0 { ('-', -i32::from(*minutes)) } else { ('+', i32::from(*minutes)) };
+                let (sign, magnitude) = if *minutes < 0 {
+                    ('-', -i32::from(*minutes))
+                } else {
+                    ('+', i32::from(*minutes))
+                };
                 write!(f, "{sign}{:02}:{:02}", magnitude / 60, magnitude % 60)
             }
         }
@@ -243,11 +246,7 @@ pub(crate) fn parse(text: &str, line: usize, column: usize) -> Result<Datetime, 
     }
     let (time, rest) = parse_time(&rest[1..], line, column)?;
 
-    let offset = if rest.is_empty() {
-        None
-    } else {
-        Some(parse_offset(rest, line, column)?)
-    };
+    let offset = if rest.is_empty() { None } else { Some(parse_offset(rest, line, column)?) };
     Ok(Datetime { date: Some(date), time: Some(time), offset })
 }
 
@@ -311,8 +310,7 @@ fn parse_time<'a>(text: &'a str, line: usize, column: usize) -> Result<(Time, &'
     let mut rest = &text[8..];
     let mut nanosecond = 0u32;
     if rest.starts_with('.') {
-        let fraction: String =
-            rest[1..].chars().take_while(char::is_ascii_digit).collect();
+        let fraction: String = rest[1..].chars().take_while(char::is_ascii_digit).collect();
         if fraction.is_empty() {
             return Err(bad("a fractional second needs at least one digit"));
         }

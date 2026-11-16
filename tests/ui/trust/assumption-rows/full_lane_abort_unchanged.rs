@@ -66,12 +66,24 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 pub async fn tick(x: u32) -> u32 { x }
-//~^ WARN Trust Level 0 safety verification incomplete
-//~| ERROR coroutine executor-protocol premise is unproved
-//~| ERROR obligation(s) were not fully verified
+//~^ ERROR coroutine executor-protocol premise is unproved
+// RE-PINNED 2026-09-14: the premise abort is the body's only strict diagnostic (see
+// async_exhibit_does_not_certify.rs); the Level-0 WARN / count ERROR pair no longer fires.
+//
+// RE-PINNED 2026-09-29: `resumes` and `does_not_resume` now carry expectations. The
+// "they produce no Trust diagnostic at all in THIS lane" measurement above was a
+// scope-truncation artifact, not a verdict: `tick`'s premise refusal used to be emitted
+// inside `run_required_analyses` (the coroutine's layout was read from its
+// `optimized_mir`, which ran TrustVerify there), so `analysis` saw a FRONT-END error and
+// skipped the whole-crate walk — the two callers were never verified. The layout is now
+// read pre-steal (`trust_local_coroutine_layout`), the refusal is emitted by the walk,
+// and both callers are verified and refused on their own rows, as they always were
+// under `-Ztrust-policy=advisory`. The DEFINITION abort this file owns is unchanged.
 
 // The resume site: a direct in-bundle call to `tick::{closure#0}`.
 pub fn resumes(x: u32) -> u32 {
+//~^ ERROR Trust Level 0 safety verification incomplete for `full_lane_abort_unchanged::resumes`: 2 obligation(s) were not proved
+//~| ERROR Trust strict verification failed for `full_lane_abort_unchanged::resumes`: 2 obligation(s) were not fully verified
     let mut fut = ManuallyDrop::new(tick(x));
     let pinned = unsafe { Pin::new_unchecked(&mut *fut) };
     let waker = Waker::noop();
@@ -84,6 +96,8 @@ pub fn resumes(x: u32) -> u32 {
 
 // The control: same construction, same unsafe block, no resume.
 pub fn does_not_resume(x: u32) -> u32 {
+//~^ ERROR Trust Level 0 safety verification incomplete for `full_lane_abort_unchanged::does_not_resume`: 2 obligation(s) were not proved
+//~| ERROR Trust strict verification failed for `full_lane_abort_unchanged::does_not_resume`: 2 obligation(s) were not fully verified
     let mut fut = ManuallyDrop::new(tick(x));
     let pinned = unsafe { Pin::new_unchecked(&mut *fut) };
     let waker = Waker::noop();

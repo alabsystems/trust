@@ -53,9 +53,20 @@ description = "Clean-origin CALL lane (I5): the gated DefId-mint decision and th
 workspace = true
 
 [dependencies]
-# Exactly six. See the header before changing the set.
+# Exactly eight. The seventh is the structural digest codec below; the eighth
+# is clean-compiler, below. The composed Boolean lane reuses the canonical E6
+# importer in trust-spec-elab, without a verification-manager dependency.
 clean-kernel = { workspace = true }
 clean-auto = { workspace = true }
+# The EIGHTH (Clean R80; docs/DECISION_QUEUE.md R80-CONSUMERS-1): this lane
+# plans from kernel values, so it must refuse what Clean's compiled lanes refuse
+# about `@[implemented_by]`, and the ORDER record those lanes refuse on lives in
+# an environment extension only clean-compiler can read
+# (`clean_compiler::implemented_by_order`). Read-only and default features: no
+# lowering is called. Not a new crate in the graph: trust-certify (below) and
+# rustc_mir_transform already link it, and Cargo unifies the one copy, which
+# the record needs (a second copy would read an empty record).
+clean-compiler = { workspace = true }
 trust-clean-carrier = { path = "../trust-clean-carrier" }
 trust-symbols = { path = "../trust-symbols" }
 trust-types = { path = "../trust-types", default-features = false }
@@ -66,11 +77,14 @@ trust-types = { path = "../trust-types", default-features = false }
 # thing this crate may edit to make a Clean-origin body agree; doing so would
 # turn the gate into a round trip. See `emit.rs`'s module docs.
 trust-spec-elab = { path = "../trust-spec-elab" }
+# Pinned workspace bincode 1: structural serde, fixed-width little-endian fields.
+# A codec only; it does not check terms or confer proof authority.
+bincode = { workspace = true }
 
 [dev-dependencies]
-# TESTS ONLY, never the lib (the "exactly five" rule above governs
-# [dependencies]): probe_i3 pins the planner against the REAL island
+# TESTS ONLY: probe_i3 pins the planner against the REAL island
 # elaboration — the C9 spelling gap proved hand-built side-A terms can admit
 # while the term the elaborator actually produces refuses. No cycle:
 # trust-certify does not depend on this crate.
 trust-certify = { path = "../trust-certify" }
+serde_json = { workspace = true }

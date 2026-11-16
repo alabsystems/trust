@@ -469,9 +469,8 @@ fn execute_special_opcode(
 ) -> Result<(), DwarfError> {
     let adjusted = u64::from(opcode - parsed.header.opcode_base);
     let operation_advance = adjusted / u64::from(parsed.header.line_range);
-    let line_increment = i64::from(parsed.header.line_base)
-        + i64::try_from(adjusted % u64::from(parsed.header.line_range))
-            .expect("invariant: modulo of u8 range always fits in i64");
+    let line_increment =
+        i64::from(parsed.header.line_base) + (adjusted % u64::from(parsed.header.line_range)) as i64;
 
     advance_address(state, &parsed.header, operation_advance)?;
     advance_line(state, line_increment)?;

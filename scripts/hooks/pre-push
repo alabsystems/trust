@@ -1,94 +1,44 @@
 #!/usr/bin/env bash
-# Trust pre-push gate. Install with `scripts/install-git-hooks.sh`.
+# Development-main push hook. The manifest is the only lane inventory.
+# The push profile runs live verifier execution and proof-input integrity checks
+# only. It does not yet run the broad suites or the gate self-tests: a defect,
+# not policy (docs/STATUS.md; docs/PLAN.md PKG-V1). The owner, 2026-11-09: "what
+# check-waiving? that sounds wrong. we want verification on and for it to work."
+# It does not certify a release or prove the whole toolchain correct. Verifier
+# refusals and proof grades remain unchanged.
 #
-# Trust has no CI, so this is the only thing between a drift class and `origin`.
-#
-# THIS HOOK DECLARES NO LANES. It runs exactly the rows carrying the `push`
-# profile in `emit_gate_manifest` (tests/run_trust_comprehensive_harness.sh),
-# fetched at run time via `--list push`. Until 2026-08-27 it hand-maintained its
-# own list of eight ids, every one of which also existed in the manifest: two
-# inventories that could only agree by eye. One of the eight, `fast.pr-gate`,
-# was itself a bundle of ten checks behind one id, so a red inside it could only
-# be quarantined by darkening all ten. Both duplications are gone; adding or
-# removing a pre-push lane is now one word in one manifest row.
-#
-# One id per lane, wherever it runs, so one quarantine row governs it — which is
-# why the push rows keep their `fast.`/`scoped.` ids rather than minting `push.*`
-# twins. The `scoped.` prefix also carries the tier: those lanes run LAST here,
-# because a 9-11 minute build ahead of a 200ms pin check is how a gate teaches
-# people --no-verify.
-#
-# Lanes deliberately NOT in the push profile:
-#
-#   bridge REPLAY (`slow.bridge-replay`) — every bridged arm still carries its
-#   kernel-checked agreement theorem. It kernel-checks 185 modules in ~142s.
-#   Genuinely a different question from `fast.bridge-pin`, which proves the
-#   artifacts BELONG to the pin: an artifact set can match its pin while a
-#   theorem inside it has stopped checking, which is what happened 2026-07-25.
-#
-#   the rustc_mir_transform suite (`slow.mir-transform-ratchet`) — it is a BUILD
-#   and takes scripts/trust_build_lock.sh, so it collided with the compiler-check
-#   lane for that lock and produced two red lanes and zero defects. Only its
-#   SELFTEST, which builds nothing, is in the push tier.
-#
-# WHY THE SLOW LANE IS HERE AT ALL. `scoped.compiler-check` runs
-# `x.py check --stage 1` INCLUDING test targets, but only when the push touches
-# compiler/, crates/, src/bootstrap/, targo-trust/ or a first-party gitlink, so a
-# docs push pays nothing. It exists because every other push lane is a drift or
-# pin check that compiles no compiler code, and `main` was broken three times on
-# 2026-08-12/13 by pushes that never built the superproject — one of which also
-# hid a dropped soundness check.
-#
-# A PUSH IS A BUILD for build-tree interlock purposes, and that is not obvious —
-# it has bitten. Because that lane runs `x.py`, it takes the build-tree mutual
-# exclusion lock like any other build, so a push attempted while a measurement
-# sweep is in flight REFUSES here rather than deleting stage1/bin/rustc
-# underneath it. The lock lives in x.py precisely so there is one place.
-#
-# PUSH CONTEXT. A manifest command string is fixed and gets no stdin, so the
-# refs git hands us are EXPORTED as TRUST_PUSHED_REFS. FIVE lanes read it, each
-# via its own `--push-context` mode: fast.revert-rationale,
-# fast.measurement-provenance, fast.pin-regression, fast.dependency-constellation
-# and fast.submodule-remote-reachability. With the variable unset the same rows
-# widen to their history/`origin/main..HEAD`/index reading, so a `push` profile
-# run outside this hook still works — and each prints a `SUBJECT:` line saying
-# which reading it took, so the two are never confused.
-#
-# This count has been stale twice. It said "exactly three" while
-# fast.dependency-constellation was already a fourth, and it kept saying three
-# after fast.submodule-remote-reachability became a fifth on 2026-08-30. The
-# enumeration is prose and nothing gates it, so treat the manifest as the
-# authority: `bash tests/run_trust_comprehensive_harness.sh --list push` and
-# grep the command strings for `--push-context`.
-#
-# WHY THE REACHABILITY LANE NEEDED IT (2026-08-30). It resolved its subject from
-# the LOCAL INDEX, and the predicate it tests — "the pinned commit is contained
-# in some fetched remote ref" — is satisfied MORE often by an OLDER pin. A clone
-# that is behind therefore audited a systematically SAFER pin set than the one
-# it was pushing. Measured that day on a clone 41 commits behind with 8 of 9
-# first-party gitlinks differing: the lane audited the wrong 12 pins and printed
-# PASS, while the pin set actually being published contained one reachable from
-# a single deletable topic branch. A behind clone biasing a gate GREEN is the
-# shape to look for whenever a lane reads the index.
-#
-# QUARANTINE, not bypass. A lane that is known-red gets a row in
-# `tests/trust-comprehensive/divergences.toml` with an owner, a reason, and an
-# `expires_on`. While that row is active the lane reports QUARANTINED and the
-# push proceeds — and the moment the lane goes GREEN with the row still active,
-# this hook FAILS and tells you to delete the row. A quarantine therefore cannot
-# outlive the problem it documents, and the `fast.ledger-expirations` lane fails
-# once it expires. There is no environment variable that turns a lane off; the
-# escape hatch is `git push --no-verify`, which is git's and is visible in the
-# reflog.
-#
-# Author: Andrew Yates <andrewyates.name@gmail.com>
-# Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
+# Git supplies the exact pushed refs on stdin. Every selected lane sees that
+# context, and ordinary non-force remote-main races are retried by prewarm_push.
+# Author: Andrew Yates. Copyright 2026. License: Apache-2.0 OR MIT.
 set -uo pipefail
+TIMING_STARTED=$SECONDS
+
+# Diagnostic only: Bash's existing SECONDS clock has whole-second resolution.
+# Keep records in the retained console output, outside raw lane logs/findings.
+# Ref arguments are shell-quoted onto one line, including every pushed SHA;
+# destination replays supply their own exact refs instead of the original push.
+# Missing timing storage must never change a lane's status or its judgement.
+timing_record() {  # <phase> <lane or -> <elapsed> <exit or -> [refs]
+  local elapsed="$3" refs="${5-$PUSHED_REFS}"
+  case "$elapsed" in "" | *[!0-9]*) elapsed=unavailable ;; esac
+  printf 'TIMING: phase=%s lane=%q elapsed_s=%s exit=%s clock=bash-seconds authority=none refs=%q\n' \
+    "$1" "$2" "$elapsed" "$4" "$refs" || :
+}
+
+timing_file() {  # <phase> <lane> <elapsed file> <exit>
+  local elapsed=unavailable
+  { read -r elapsed <"$3"; } 2>/dev/null || elapsed=unavailable
+  timing_record "$1" "$2" "$elapsed" "$4"
+}
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "pre-push: not inside a git worktree" >&2
   exit 1
 }
+# This hook's own directory, read before the cd below: its helpers ship beside
+# it, in the tree the hook came from (a linked worktree may run another
+# worktree's hooks).
+HOOK_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)" || HOOK_SELF_DIR=""
 
 # Git exports repository-local variables (notably GIT_DIR) while invoking a
 # hook.  Leaving them set makes a nested `git -C first-party/<repo> ...`
@@ -102,9 +52,38 @@ for git_local_var in $(git rev-parse --local-env-vars); do
 done
 cd "$REPO_ROOT"
 
+# Share the direct workspace legs' dependency artifacts with land_gate.py.
+# Native Targo imports TARGO_TARGET_DIR only when CARGO_TARGET_DIR is absent.
+# Preserve either caller spelling; an empty value is left for Targo to judge.
+# Bootstrap sets its own target directory; feature --target-dir lanes retain
+# their explicit isolation and the scoped runner's collision/private-copy checks.
+# Every target is named by its real path, as land_gate.py names it (EW-24): on
+# Macs set up before 2026-09-10 crates/target is a symlink to
+# crates/target.noindex, and atpkg refuses an explicit target named through a
+# symlink (exit 75, nothing built). A relative caller value is read against the
+# repository root, where every lane runs. Selecting a target never creates it.
+trust_real_dir() {
+  local p="$1" r link
+  case $p in /*) ;; *) p="$REPO_ROOT/$p" ;; esac
+  if r="$(cd "$p" 2>/dev/null && pwd -P)"; then printf '%s\n' "$r"; return; fi
+  if [ -L "$p" ] && link="$(readlink "$p")"; then
+    # A dangling link (its directory reclaimed): name where it points.
+    case $link in /*) ;; *) link="$(dirname "$p")/$link" ;; esac
+    p="$link"
+  fi
+  if r="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)"; then printf '%s/%s\n' "$r" "$(basename "$p")"; return; fi
+  printf '%s\n' "$p"
+}
+if [ -z "${CARGO_TARGET_DIR+x}" ] && [ -z "${TARGO_TARGET_DIR+x}" ]; then
+  export CARGO_TARGET_DIR="$(trust_real_dir crates/target)"
+else
+  if [ -n "${CARGO_TARGET_DIR:-}" ]; then export CARGO_TARGET_DIR="$(trust_real_dir "$CARGO_TARGET_DIR")"; fi
+  if [ -n "${TARGO_TARGET_DIR:-}" ]; then export TARGO_TARGET_DIR="$(trust_real_dir "$TARGO_TARGET_DIR")"; fi
+fi
+
 # pre-push is fed "<local-ref> <local-sha> <remote-ref> <remote-sha>" lines on
-# stdin. Read them all so git never sees EPIPE, and keep them:
-# fast.revert-rationale judges exactly the commits this push would introduce.
+# stdin. Read them all so git never sees EPIPE, and keep them: the
+# `--push-context` lanes judge exactly the commits this push would introduce.
 PUSHED_REFS="$(cat 2>/dev/null || true)"
 
 PYTHON_BIN=""
@@ -114,6 +93,25 @@ done
 if [ -z "$PYTHON_BIN" ]; then
   echo "pre-push: no python3 on PATH; cannot read the quarantine ledger" >&2
   exit 2
+fi
+
+# A managed hook owns one CPU share. Validate before any lane starts, even
+# when a preference would otherwise bypass the measured host helper. Normalize
+# only the fast-pool ceiling here; each heavy child inherits the original share.
+ADMITTED_FAST_JOBS=""
+if [ "${BUILD_SLOT_HELD:-}" = 1 ]; then
+  ADMITTED_FAST_JOBS="$("$PYTHON_BIN" - <<'PY_ADMISSION'
+import os, re, sys
+raw = os.environ.get("CARGO_BUILD_JOBS", "")
+try:
+    if not re.fullmatch(r"[0-9]+", raw) or int(raw) < 1:
+        raise ValueError
+    print(min(16, int(raw)))
+except ValueError:
+    sys.stderr.write("pre-push: BUILD_SLOT_HELD=1 requires positive integer CARGO_BUILD_JOBS; no lane was judged\n")
+    sys.exit(2)
+PY_ADMISSION
+)" || exit 2
 fi
 
 LEDGER="tests/trust-comprehensive/divergences.toml"
@@ -159,38 +157,643 @@ for row in rows:
 PY
 }
 
+# WHICH LEDGER SHIELDS A PUSH (2026-09-28). quarantine_for above reads the
+# ledger on DISK, which is right only when nothing is being pushed (stdin
+# empty: the standing reading, unchanged). In a push it judged the checkout,
+# not the push (docs/issues/2026-09-28-push-lanes-judge-the-checkout-not-the-push.md,
+# case H): an UNCOMMITTED row shielded a red required lane in a push whose tree
+# carried no such row (1a); a row committed on HEAD shielded a push of a
+# different ref (1e); an expired committed row renewed only on disk shielded it
+# too (L 1c). And the other way, a half-written local ledger edit refused every
+# push.
+#
+# So in a push the ledger is read from GIT OBJECTS, never the worktree:
+#
+#   * A red required lane is QUARANTINED only if an active, unexpired row for it
+#     is in EVERY pushed tree AND in the destination tip each update starts from
+#     (the remote sha of every non-create line). The destination is the half a
+#     push cannot author: a commit that breaks a lane and adds its own row is
+#     refused, where reading the pushed tree alone would wave it through. A new
+#     row for a lane whose red the destination already has is no problem when
+#     that red is INHERITED (INHERITED-RED below): the push lands on that grade.
+#     Otherwise a new row reaches the destination once through `--no-verify`
+#     (the row itself, owned and expiring, is the record), and shields the
+#     pushes after it. A destination tip this clone does not hold, or whose
+#     ledger cannot be read, shields nothing (it is noted, not fatal).
+#   * A GREEN lane is "GREEN but still quarantined" if an active row for it is
+#     in ANY pushed tree — the push publishes that stale row. A row that is only
+#     on the destination is being removed by the push and is no finding.
+#   * A pushed tree whose ledger cannot be read (absent, not UTF-8, not TOML, a
+#     bad `expires_on` in a row for the lane) refuses the push, exactly as an
+#     unreadable ledger on disk does in the standing reading.
+#   * A deletion-only push has no tree and quarantines nothing.
+#
+# The table is built once per push into PUSH_QDIR, one file per (lane, fact),
+# named by the hex of the gate id so no ledger text becomes a path.
+PUSH_QDIR=""
+build_push_quarantine() {
+  "$PYTHON_BIN" - "$LEDGER" "$PUSH_QDIR" "$PUSHED_REFS" <<'PY'
+import os
+import re
+import subprocess
+import sys
+from datetime import date, datetime, timezone
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        print("no TOML parser available (need Python 3.11+ or tomli)", file=sys.stderr)
+        raise SystemExit(2)
+
+ledger, outdir, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+HEX_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+ZERO_SHA = re.compile(r"^0+$")
+today = datetime.now(timezone.utc).date()
+
+
+def git(*args):
+    proc = subprocess.run(["git", *args], capture_output=True)
+    if proc.returncode != 0:
+        raise OSError(proc.stderr.decode("utf-8", "replace").strip() or f"git exit {proc.returncode}")
+    return proc.stdout
+
+
+lines = []
+for line in raw.splitlines():
+    if not line.strip():
+        continue
+    fields = line.split()
+    if len(fields) != 4 or not HEX_SHA.match(fields[1]) or not HEX_SHA.match(fields[3]):
+        print(f"malformed pushed-ref line {line!r}; expected "
+              "`<local_ref> <local_sha> <remote_ref> <remote_sha>`", file=sys.stderr)
+        raise SystemExit(2)
+    lines.append(fields)
+live = [f for f in lines if not ZERO_SHA.match(f[1])]
+if not live:
+    print("pre-push: deletion(s) only — no pushed tree carries a quarantine row, "
+          "so no lane is quarantined by this push", file=sys.stderr)
+    raise SystemExit(0)
+
+
+def load_rows(spec):
+    """The ledger's rows at `<commit>:<ledger>`, or OSError/ValueError."""
+    try:
+        tree = git("rev-parse", "--verify", "--quiet", f"{spec}^{{tree}}").decode().strip()
+    except OSError:
+        raise OSError(f"{spec[:12]} is not a commit in this clone") from None
+    listing = git("ls-tree", tree, "--", ledger).decode("utf-8", "replace").split()
+    if not listing:
+        raise OSError(f"the tree has no {ledger}")
+    if listing[1] != "blob":
+        raise OSError(f"{ledger} is a {listing[1]} ({listing[0]}), not a file")
+    text = git("cat-file", "blob", listing[2]).decode("utf-8")
+    return tomllib.loads(text).get("divergences", [])
+
+
+def active(rows, gate_id):
+    """quarantine_for's answer for one gate: the reason, or None. May raise."""
+    for row in rows:
+        if not isinstance(row, dict) or row.get("gate_id") != gate_id:
+            continue
+        if str(row.get("status", "")).lower() != "active":
+            continue
+        expires = row.get("expires_on")
+        if isinstance(expires, str):
+            expires = date.fromisoformat(expires)
+        if not isinstance(expires, date) or expires < today:
+            continue
+        return f"{row.get('id')} :: expires {expires} :: {row.get('required_action', '')}"
+    return None
+
+
+pushed = []  # (label, rows)
+seen = {}
+for lref, lsha, _rref, _rsha in live:
+    label = f"{lref} {lsha[:12]}"
+    try:
+        rows = load_rows(lsha)
+    except (OSError, ValueError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        print(f"unreadable quarantine ledger {lsha[:12]}:{ledger} (pushed {lref}): {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    pushed.append((label, rows))
+
+anchors = []  # (label, rows or None)
+for _lref, _lsha, rref, rsha in live:
+    if ZERO_SHA.match(rsha) or rsha in seen:
+        continue
+    seen[rsha] = True
+    label = f"{rref} {rsha[:12]}"
+    try:
+        anchors.append((label, load_rows(rsha)))
+    except (OSError, ValueError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        print(f"pre-push: destination tip {label} is unreadable here ({exc}); "
+              "it shields nothing, so no lane is quarantined by this push", file=sys.stderr)
+        anchors.append((label, None))
+
+gates = set()
+for _label, rows in pushed:
+    if isinstance(rows, list):
+        gates.update(r.get("gate_id") for r in rows if isinstance(r, dict) and isinstance(r.get("gate_id"), str))
+
+
+def put(gate_id, fact, text):
+    name = os.path.join(outdir, gate_id.encode("utf-8").hex() + "." + fact)
+    with open(name, "w", encoding="utf-8") as fh:
+        fh.write(text + "\n")
+
+
+for gate_id in sorted(gates):
+    reasons = []
+    try:
+        for label, rows in pushed:
+            reasons.append((label, active(rows, gate_id)))
+    except (ValueError, TypeError) as exc:
+        put(gate_id, "error", f"unreadable quarantine row for {gate_id} in pushed {label}:{ledger}: {exc}")
+        continue
+    present = [r for _l, r in reasons if r]
+    if not present:
+        continue
+    put(gate_id, "published", present[0])
+    missing = [label for label, r in reasons if not r]
+    if missing:
+        put(gate_id, "why", f"the row is not active in every pushed tree (absent from {', '.join(missing)})")
+        continue
+    for label, rows in anchors:
+        if rows is None:
+            put(gate_id, "why", f"the destination {label} cannot be read here, so it shields nothing")
+            break
+        try:
+            ok = active(rows, gate_id)
+        except (ValueError, TypeError):
+            ok = None
+        if not ok:
+            put(gate_id, "why", f"the row is not active on the destination {label}; a push cannot "
+                                "author its own quarantine, which shields pushes once it is there")
+            break
+    else:
+        put(gate_id, "shield", reasons[0][1])
+PY
+}
+
+# Sets `quarantine` (the shield for a red lane) and `published_row` (the row a
+# green lane would be refused for) from the push table; nonzero when the pushed
+# ledger's row for this lane is unreadable.
+push_quarantine_for() {
+  local key
+  key="$PUSH_QDIR/$(printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n')"
+  quarantine="" published_row="" quarantine_why=""
+  if [ -f "$key.error" ]; then
+    cat "$key.error" >&2
+    return 1
+  fi
+  [ -f "$key.shield" ] && quarantine="$(cat "$key.shield")"
+  [ -f "$key.published" ] && published_row="$(cat "$key.published")"
+  [ -f "$key.why" ] && quarantine_why="$(cat "$key.why")"
+  return 0
+}
+
+# D13 STAGE C, SHADOW MODE (2026-09-29; docs/DECISION_QUEUE.md D13). Every lane
+# above judges THIS checkout; a push publishes the pushed trees. After the live
+# verdict below is final (GREEN or RED), the hook hands the pushed refs and each
+# lane's graded outcome to scripts/pre_push_shadow.sh, launched DETACHED: it
+# re-runs the worktree-reading rows in a sparse checkout of each pushed tree and
+# logs, under <git-common-dir>/trust-shadow/, where the two verdicts differ, as
+# evidence for promoting stage C to enforcing. It never blocks and the hook
+# never waits for it: the exit status and output are today's plus one line
+# naming the log. TRUST_PRE_PUSH_SHADOW=0 skips it. A standing run (empty
+# stdin) and the exit-2 refusals above and in run_lane reach no verdict, so
+# they launch nothing.
+SHADOW_LIVE=""
+record_live() {
+  [ -n "$SHADOW_LIVE" ] || return 0
+  printf '%s\t%s\t%s\t%s\n' "$gate_id" "$1" "$status" "$command" >>"$SHADOW_LIVE" 2>/dev/null
+  return 0
+}
+
 FAILED=0
+# Launch only after publishing a complete process-group record. Both fast and
+# scoped lanes use this owner; the final pathname is never an empty readiness
+# indication, and a failed group setup/write/close/rename never executes a lane.
+PERL_OWN_GROUP='$SIG{INT} = $SIG{QUIT} = "DEFAULT";
+  setpgrp(0, 0); getpgrp(0) == $$ or exit 2;
+  my $path = shift; my $part = "$path.part.$$";
+  open(my $f, ">", $part) or exit 2;
+  print $f "$$\n" or exit 2; close $f or exit 2;
+  rename($part, $path) or exit 2;
+  exec @ARGV or exit 127'
+
+# Return success only after delivering the requested signal to a published
+# group. Missing/incomplete records remain pending until publication or rc.
+signal_group() {
+  local pgid signal="${3:-INT}"
+  [ ! -f "$2" ] && [ -f "$1" ] && read -r pgid <"$1" || return 1
+  case "$pgid" in "" | *[!0-9]*) return 1 ;; esac
+  [ "$pgid" -gt 1 ] || return 1
+  kill "-$signal" -- "-$pgid" 2>/dev/null
+}
+
+# The running lane's output, streamed AND kept, so run_lane can read the
+# `SKIPPED: ` token the way the harness's run_gate does (stdout and stderr
+# together, as run_gate's log holds them).
+LANE_LOG="$(mktemp -t trust-pre-push-lane.XXXXXX)" || {
+  echo "pre-push: cannot create a scratch file for lane output" >&2
+  exit 2
+}
+# The overlapped lane's scratch directory (see CRATES-TESTS' BUILD OVERLAPS THE
+# LANES BEFORE IT); empty until then. on_exit also stops that lane on any exit
+# before the hook has judged it.
+OVERLAP_DIR=""
+OVERLAP_PID=""         # the overlapped lane's launcher, once started
+INLINE_BG=""           # set in overlap mode: in-line lanes' scratch prefix
+INLINE_PID=""          # active wrapper owning the inline pipeline, if launched
+INHERIT_REPLAY_BG=""   # the current destination replay's publication prefix
+INHERIT_REPLAY_PID=""  # its owned wrapper, until command status has been waited for
+on_exit() {
+  [ -z "$INHERIT_REPLAY_PID" ] || stop_inherited_replay
+  [ -z "$OVERLAP_PID" ] || stop_overlap_lane "the hook is exiting"
+  # A fast-lane pool interrupted or cut short (an unreadable ledger exits 2 at
+  # grading time) is stopped, not left running behind the push.
+  [ -z "${FAST_DIR:-}" ] || { stop_fast_lanes; rm -rf "${FAST_DIR:?}"; }
+  [ -z "${FAST_LIST:-}" ] || rm -f "${FAST_LIST:?}"
+  rm -f "${LANE_LOG:?}"
+  [ -z "$PUSH_QDIR" ] || rm -rf "${PUSH_QDIR:?}"
+  [ -z "$INHERIT_DIR" ] || rm -rf "${INHERIT_DIR:?}"
+  [ -z "$OVERLAP_DIR" ] || { chmod u+rwx "${OVERLAP_DIR:?}" 2>/dev/null; rm -rf "${OVERLAP_DIR:?}"; }
+}
+trap on_exit EXIT
+# A lane is judged in three steps, so the lane whose build overlaps others is
+# judged exactly as one run in line: lane_lookup reads its quarantine row, the
+# lane runs with its output in LANE_LOG, and lane_grade turns the exit status
+# and that output into the lane's verdict. lane_lookup and lane_grade read and
+# set their caller's locals (gate_id, command, required, status, quarantine,
+# published_row, quarantine_why): bash scopes locals dynamically.
+LAND_TARGO_STATUS=not-run
 run_lane() {
   local gate_id="$1"
   local command="$2"
-  local quarantine
-  if ! quarantine="$(quarantine_for "$gate_id")"; then
-    echo "pre-push: cannot read $LEDGER — refusing to judge any lane" >&2
-    exit 2
-  fi
+  local required="$3"
+  local quarantine=""
+  # The row a green lane is refused for. The same as `quarantine` in the
+  # standing reading; in a push it may exist where the shield does not.
+  local published_row=""
+  local quarantine_why=""
+  local status
+  lane_lookup
+  local lane_started=$SECONDS
 
   echo
   echo "=== $gate_id ==="
   # Same exec form as the harness's run_gate, so one command string cannot mean
   # two things. </dev/null: a lane must not eat the lane list off our stdin.
-  if ( cd "$REPO_ROOT" && bash -o pipefail -c "$command" ) </dev/null; then
-    if [ -n "$quarantine" ]; then
+  if [ -n "$INLINE_BG" ]; then
+    run_lane_interruptibly
+  else
+    ( cd "$REPO_ROOT" && bash -o pipefail -c "$command" ) </dev/null 2>&1 | tee "$LANE_LOG"
+    status=${PIPESTATUS[0]}
+  fi
+  timing_record lane "$gate_id" "$((SECONDS - lane_started))" "$status"
+  if [ "$gate_id" = scoped.targo-trust-unit-tests ] && [ -n "${TRUST_LAND_TARGO_HEAD:-}" ]; then
+    LAND_TARGO_STATUS="$status"
+  fi
+  lane_grade
+}
+
+lane_lookup() {
+  if [ "$required" = "true" ] && [ -n "$PUSH_QDIR" ]; then
+    if ! push_quarantine_for "$gate_id"; then
+      echo "pre-push: cannot read $LEDGER — refusing to judge any lane" >&2
+      exit 2
+    fi
+  elif [ "$required" = "true" ] && ! quarantine="$(quarantine_for "$gate_id")"; then
+    echo "pre-push: cannot read $LEDGER — refusing to judge any lane" >&2
+    exit 2
+  else
+    published_row="$quarantine"
+  fi
+}
+
+lane_grade() {
+  if [ "$status" -eq 0 ]; then
+    if grep -qE '^[[:space:]]*SKIPPED: ' "$LANE_LOG"; then
+      # Exit 0 from a lane that ran nothing is not GREEN, quarantined or not: it
+      # must not be labelled PASS, it cannot retire a quarantine row it never
+      # tested, and it does not fail the push either.
+      if [ -n "$published_row" ]; then
+        echo "SKIPPED (quarantine row untested): $gate_id ran nothing, which is no"
+        echo "      evidence the quarantined condition is gone. The row stays: $published_row"
+      else
+        echo "SKIPPED: $gate_id ran nothing (exit 0; no evidence either way)"
+      fi
+      record_live SKIPPED
+    elif [ -n "$published_row" ]; then
       echo "FAIL: $gate_id is GREEN but still quarantined."
-      echo "      Delete the row and push again: $quarantine"
+      echo "      Delete the row and push again: $published_row"
       FAILED=1
+      record_live FAIL
     else
       echo "PASS: $gate_id"
+      record_live PASS
     fi
     return
   fi
 
+  # The manifest's optional diagnostics remain visible, including crashes or
+  # timeouts, but cannot turn administrative state into a push prerequisite.
+  if [ "$required" = "false" ]; then
+    echo "WARN: $gate_id FAILED exit=$status (optional diagnostic; push may continue)"
+    record_live WARN
+    return
+  fi
   if [ -n "$quarantine" ]; then
     echo "QUARANTINED: $gate_id is red under an active, unexpired ledger row."
     echo "             $quarantine"
+    record_live QUARANTINED
+    return
+  fi
+  if inherit_candidate; then
+    echo "FAIL (provisional): $gate_id is red; it is judged against the destination"
+    echo "      after the fast lanes (INHERITED-RED, this hook's header)"
+    if [ -n "$quarantine_why" ]; then
+      echo "      Not quarantined: $quarantine_why."
+      echo "      The row: $published_row"
+    fi
     return
   fi
   echo "FAIL: $gate_id"
+  if [ -n "$quarantine_why" ]; then
+    echo "      Not quarantined: $quarantine_why."
+    echo "      The row: $published_row"
+  fi
   FAILED=1
+  record_live FAIL
+}
+
+# INHERITED-RED (2026-10-24, docs/DECISION_QUEUE.md INHERITED-RED). Until then
+# one red on the destination refused EVERY push, whoever had caused it, until
+# someone fixed it -- so pushes skipped this hook with `--no-verify` on a
+# "main's reds unchanged" rule written down nowhere, and while the hook was
+# being skipped new reds landed unchecked (2026-10-22..24: a frozen-file move
+# and a help-surface prose change rode in that way). The rule is now this
+# hook's, and mechanical:
+#
+#   A required FAST lane that is red in a push may be graded INHERITED, not
+#   FAILED, when ALL of these hold:
+#     * a push is in flight, and the lane reads it (it is in the derived
+#       TRUST_PUSHED_REFS reader set printed above), so it judges git objects
+#       of a revision and can be pointed at the destination's revision in this
+#       same checkout; a lane that reads the working tree never qualifies;
+#     * it exited 1 (red), not 2 or anything else (could not judge);
+#     * its output names every cause of the red as a `FINDING: <key>` line and
+#       says so with a `FINDINGS: complete` line (a lane prints that only when
+#       no cause went unkeyed and every check ran to its end -- a lane that
+#       stops at its first refusal must not print it, or a red the push adds
+#       behind the destination's would hide (CONSTELLATION-ALL-FINDINGS); the
+#       keys name paths, blobs and commits, so the same red read from two trees
+#       gives the same key and a red the push moved again gives a new one);
+#     * every update in the push starts from a destination tip (no creation)
+#       that this clone holds as a commit;
+#     * for EACH distinct destination tip, the same command run here with
+#       TRUST_PUSHED_REFS naming that tip as the pushed revision exits 1 and
+#       prints every key the push's run printed.
+#   Anything else is FAIL, exactly as before. So a push can land beside a red
+#   the destination already carries, and never with a red it adds, changes or
+#   carries to a ref whose tip lacks it. The INHERITED lanes are named in the
+#   verdict; the reds stay main's to fix forward.
+INHERIT_IDS=()
+INHERIT_CMDS=()
+INHERIT_LOGS=()
+INHERIT_DIR=""
+INHERITED_IDS=""
+inherit_candidate() {
+  [ -n "$INHERIT_DIR" ] || return 1
+  case "$gate_id" in fast.*) ;; *) return 1 ;; esac
+  [ "$status" -eq 1 ] || return 1
+  case " ${PUSH_REFS_READERS:-} " in *" $gate_id "*) ;; *) return 1 ;; esac
+  grep -qE '^FINDING: [^[:space:]]' "$LANE_LOG" || return 1
+  grep -qE '^FINDINGS: complete$' "$LANE_LOG" || return 1
+  local n="${#INHERIT_IDS[@]}"
+  cp "$LANE_LOG" "$INHERIT_DIR/$n.push.log" 2>/dev/null || return 1
+  INHERIT_IDS+=("$gate_id")
+  INHERIT_CMDS+=("$command")
+  INHERIT_LOGS+=("$INHERIT_DIR/$n.push.log")
+  return 0
+}
+
+# findings_of <log>: the sorted, distinct FINDING keys a lane printed.
+findings_of() {
+  sed -n 's/^FINDING: //p' "$1" | LC_ALL=C sort -u
+}
+
+# A destination replay is another execution of a fast lane. Own its wrapper
+# and published group just as the original pool does, including on EXIT.
+stop_inherited_replay() {
+  [ -n "$INHERIT_REPLAY_PID" ] || return 0
+  # Cleanup owns the wait now. Repeated cancellation must not abandon it or
+  # deliver a second signal while the lane handles the first.
+  trap '' INT TERM HUP QUIT
+  while kill -0 "$INHERIT_REPLAY_PID" 2>/dev/null && [ ! -f "$INHERIT_REPLAY_BG.rc" ] \
+      && ! signal_group "$INHERIT_REPLAY_BG.pgid" "$INHERIT_REPLAY_BG.rc" TERM; do
+    sleep 0.1
+  done
+  wait "$INHERIT_REPLAY_PID" 2>/dev/null
+  INHERIT_REPLAY_PID=""
+}
+
+interrupt_inherited_replay() {
+  trap '' INT TERM HUP QUIT
+  echo; echo "pre-push: interrupted — stopping the inherited replay"
+  stop_inherited_replay
+  exit 130
+}
+
+run_inherited_replay() {  # <command> <destination refs> <output log>
+  local replay_command="$1" replay_refs="$2" replay_log="$3" replay_rc launch_interrupted=""
+  INHERIT_REPLAY_BG="$replay_log.replay"
+  # A signal between fork and $! ownership remains pending until the new
+  # handle is recorded; cleanup then waits for group publication or rc.
+  trap 'launch_interrupted=1' INT TERM HUP QUIT
+  ( ( cd "$REPO_ROOT" && TRUST_PUSHED_REFS="$replay_refs" \
+        perl -e "$PERL_OWN_GROUP" "$INHERIT_REPLAY_BG.pgid" bash -o pipefail -c "$replay_command" \
+        </dev/null >"$replay_log" 2>&1 )
+    replay_rc=$?
+    printf '%s\n' "$replay_rc" >"$INHERIT_REPLAY_BG.rc.part" \
+      && mv "$INHERIT_REPLAY_BG.rc.part" "$INHERIT_REPLAY_BG.rc" || exit 2
+    exit "$replay_rc" ) &
+  INHERIT_REPLAY_PID=$!
+  trap interrupt_inherited_replay INT TERM HUP QUIT
+  [ -z "$launch_interrupted" ] || interrupt_inherited_replay
+  wait "$INHERIT_REPLAY_PID"; replay_rc=$?
+  INHERIT_REPLAY_PID=""
+  trap - INT TERM HUP QUIT
+  return "$replay_rc"
+}
+
+# judge_inherited: grades every provisional FAIL (see INHERITED-RED above).
+judge_inherited() {
+  [ "${#INHERIT_IDS[@]}" -gt 0 ] || return 0
+  echo
+  echo "=== inherited reds: the provisional FAILs above, judged against each destination tip ==="
+  local i=0 gate_id command status dests why d lines out rc missing keys dest_keys key verdict replay_started
+  local _l lsha rref rsha _x
+  # The destinations, once: every live update's remote sha, or why there is none.
+  dests="" why=""
+  while read -r _l lsha rref rsha _x; do
+    [ -n "${rsha:-}" ] || continue
+    case "$lsha" in *[!0]*) ;; *) continue ;; esac  # a deletion lands nothing
+    case "$rsha" in
+      *[!0]*) ;;
+      *) why="$rref is created by this push: there is no destination tip it could inherit a red from"; break ;;
+    esac
+    if ! git cat-file -e "$rsha^{commit}" 2>/dev/null; then
+      why="the destination tip ${rsha:0:12} of $rref is not a commit in this clone (fetch it)"; break
+    fi
+    case " $dests " in *" $rsha "*) ;; *) dests="${dests:+$dests }$rsha" ;; esac
+  done <<<"$PUSHED_REFS"
+  [ -n "$dests" ] || [ -n "$why" ] || why="the push names no destination tip"
+  while [ "$i" -lt "${#INHERIT_IDS[@]}" ]; do
+    gate_id="${INHERIT_IDS[$i]}" command="${INHERIT_CMDS[$i]}" status=1
+    keys="$(findings_of "${INHERIT_LOGS[$i]}")"
+    verdict=INHERITED missing=""
+    if [ -n "$why" ]; then
+      verdict="FAIL"; missing="      not inherited: $why"$'\n'
+    else
+      for d in $dests; do
+        lines="$(printf '%s\n' "$PUSHED_REFS" | awk -v d="$d" 'NF == 4 && $2 !~ /^0+$/ && $4 == d { print $3, d, $3, d }')"
+        # The replay's publication records must identify the full destination:
+        # distinct tips may share the abbreviation used in diagnostic text.
+        out="$INHERIT_DIR/$i.$d.log"
+        replay_started=$SECONDS
+        run_inherited_replay "$command" "$lines" "$out"
+        rc=$?
+        timing_record inherited-replay "$gate_id" "$((SECONDS - replay_started))" "$rc" "$lines"
+        if [ "$rc" -ne 1 ]; then
+          verdict="FAIL"
+          if [ "$rc" -eq 0 ]; then
+            missing+="      not inherited: the destination tip ${d:0:12} is GREEN on this lane, so every finding is this push's"$'\n'
+          else
+            missing+="      not inherited: the lane could not judge the destination tip ${d:0:12} (exit $rc):"$'\n'
+            missing+="$(tail -n 5 "$out" | sed 's/^/        | /')"$'\n'
+          fi
+          continue
+        fi
+        # A here-string, not a pipe into `grep -q`: under pipefail a grep that
+        # exits at its first match can fail the writer and read a key as absent.
+        dest_keys="$(findings_of "$out")"
+        while IFS= read -r key; do
+          [ -n "$key" ] || continue
+          if ! grep -qxF -- "$key" <<<"$dest_keys"; then
+            verdict="FAIL"
+            missing+="      not on the destination tip ${d:0:12}: $key"$'\n'
+          fi
+        done <<<"$keys"
+      done
+    fi
+    echo
+    if [ "$verdict" = INHERITED ]; then
+      echo "INHERITED: $gate_id is red on every destination tip ($dests) with every"
+      echo "           finding this push has; it adds none, so it is not this push's red:"
+      printf '%s\n' "$keys" | sed 's/^/             /'
+      INHERITED_IDS="${INHERITED_IDS:+$INHERITED_IDS }$gate_id"
+      record_live INHERITED
+    else
+      echo "FAIL: $gate_id (not inherited)"
+      printf '%s' "$missing"
+      FAILED=1
+      record_live FAIL
+    fi
+    i=$((i + 1))
+  done
+}
+
+# Starts scripts/pre_push_shadow.sh in its own session (perl setsid; nohup
+# when perl is absent) with stdin = the pushed refs and stdout/stderr = its
+# log, from copies in the shadow's own directory: the EXIT trap removes
+# PUSH_QDIR, and a checkout switched mid-run must not rewrite the script under
+# a running bash. Every failure here is silent and costs only the shadow.
+launch_shadow() {
+  [ -n "$SHADOW_LIVE" ] || return 0
+  local script="$REPO_ROOT/scripts/pre_push_shadow.sh" common root sha12 log input
+  [ -f "$script" ] || return 0
+  common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  root="$common/trust-shadow"
+  mkdir -p "$root" 2>/dev/null || return 0
+  sha12="$(printf '%s\n' "$PUSHED_REFS" | awk 'NF == 4 && $2 !~ /^0+$/ { print substr($2, 1, 12); exit }')"
+  log="$root/$(date -u +%Y%m%dT%H%M%SZ)-${sha12:-000000000000}.log"
+  [ -e "$log" ] && log="${log%.log}-$$.log"
+  input="$log.in"
+  mkdir "$input" 2>/dev/null || return 0
+  printf '# live-dates end %s %s\n' "$(date -u +%F)" "$(date +%F)" >>"$SHADOW_LIVE" 2>/dev/null
+  if ! { cp "$script" "$input/pre_push_shadow.sh" \
+      && printf '%s\n' "$PUSHED_REFS" >"$input/refs" \
+      && { cp "$SHADOW_LIVE" "$input/live.tsv" 2>/dev/null || : >"$input/live.tsv"; }; } 2>/dev/null; then
+    rm -rf "${input:?}"
+    return 0
+  fi
+  local -a shadow=(nice -n 10 bash "$input/pre_push_shadow.sh" --log "$log"
+    --live "$input/live.tsv" --in-dir "$input" --common "$common" --remote "${TRUST_PUSH_REMOTE:-}")
+  # Only fds 0-2 go with it: 3 and up include git's pipes to receive-pack/ssh,
+  # which a background run must not hold open after the push returns.
+  if command -v perl >/dev/null 2>&1; then
+    ( perl -MPOSIX -e 'POSIX::setsid(); POSIX::close($_) for 3 .. 1023; exec @ARGV or exit 127' \
+        "${shadow[@]}" <"$input/refs" >>"$log" 2>&1 & )
+  else
+    ( exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; nohup "${shadow[@]}" <"$input/refs" >>"$log" 2>&1 & )
+  fi
+  echo "pre-push: shadow re-judge of the pushed trees (D13 stage C; advisory, never blocks) logs to $log"
+}
+
+# A DESTINATION THAT MOVED DOOMS THE PUSH (2026-09-29). git sends each update
+# with the remote sha it read BEFORE this hook started, and the remote refuses
+# an update whose ref has moved since ("cannot lock ref", non-fast-forward),
+# whatever this hook says. Measured 2026-09-29: main took ~56 pushes in 24h
+# from several machines, and a push touching crates/ spent 25-60 min here, so
+# a slow push usually lost the race and its GREEN was thrown away (the slice-b
+# landing: GREEN after 37 min and after 42 min, both refused; main had moved
+# before crates-tests, the longest lane, even started). So before each
+# `scoped.` lane (minutes each), the hook asks the destination, read-only, for
+# every pushed ref's current value — one `git ls-remote` round trip, bounded by
+# LS_REMOTE_TIMEOUT_S — and when EVERY ref the push updates has moved, stops:
+# `PRE-PUSH: STALE`, no verdict, exit 2. While one update can still land, the
+# hook judges on (a non-atomic push lands the refs that did not move). So it
+# stops only a push the remote would refuse whole, and never lets anything
+# through. A lane that has already FAILED is never hidden by the stop: the
+# hook ends RED, naming the moved refs. A destination it cannot read (offline,
+# no credentials, too slow) is said out loud and the hook carries on; the
+# remote still checks. Controlled end-to-end by
+# scripts/tests/pre_push_stale_destination_test.sh.
+LS_REMOTE_TIMEOUT_S=20
+MOVED_REFS=""
+destination_moved() {
+  [ -n "${TRUST_PUSH_REMOTE:-}" ] || return 1
+  local refs now _lref lsha rref rsha extra current moved=""
+  refs="$(printf '%s\n' "$PUSHED_REFS" | awk 'NF == 4 && $2 !~ /^0+$/ { print $3 }' | sort -u)"
+  [ -n "$refs" ] || return 1  # nothing but deletions: a deletion that loses a race costs nothing
+  # shellcheck disable=SC2086  # one argument per pushed ref name
+  if ! now="$(GIT_TERMINAL_PROMPT=0 perl -e 'alarm shift; exec @ARGV or exit 127' \
+      "$LS_REMOTE_TIMEOUT_S" git ls-remote "$TRUST_PUSH_REMOTE" $refs 2>/dev/null)"; then
+    echo "pre-push: could not read the destination's refs (git ls-remote); carrying on — the remote still checks"
+    return 1
+  fi
+  while read -r _lref lsha rref rsha extra; do
+    [ -n "${rsha:-}" ] && [ -z "${extra:-}" ] || continue  # the four fields git sends, as awk's NF == 4
+    case "$lsha" in *[!0]*) ;; *) continue ;; esac  # a deletion
+    current="$(awk -v ref="$rref" '$2 == ref { print $1 }' <<<"$now")"
+    case "$rsha" in *[!0]*) ;; *) rsha="" ;; esac  # all zeros: the ref did not exist
+    [ "$current" = "$rsha" ] && return 1  # this update can still land: judge on
+    moved+="          $rref: the push expects ${rsha:-no ref}, the remote now has ${current:-no ref}"$'\n'
+  done <<<"$PUSHED_REFS"
+  MOVED_REFS="$moved"
+  return 0
+}
+
+red_verdict() {
+  echo "PRE-PUSH: RED — fix the lanes above, or quarantine one with an owned,"
+  echo "expiring row in $LEDGER. \`git push --no-verify\` skips this hook and"
+  echo "leaves no record of why."
+  exit 1
 }
 
 echo "Trust pre-push gate (no stage2 build required)"
@@ -206,31 +809,714 @@ if [ -z "$LANES" ]; then
   exit 2
 fi
 
+# SSH KEEPALIVE (2026-10-24, docs/DECISION_QUEUE.md PUSH-PATH-SSH-KEEPALIVE).
+# git opened this push's connection before this hook started and holds it idle
+# until the hook ends, and GitHub cuts an idle ssh connection after about six
+# minutes (measured; scripts/hooks/_ssh_keepalive.sh). Before then a push with
+# default ssh ran every lane, often for 15-35 minutes, and then failed at its
+# end, green or not. So a push to an ssh destination whose ssh command sends no
+# keepalive is refused HERE, in seconds, before any lane, naming the fix. It is
+# judged by the profile (a `scoped.` lane is in it), not by the delta: a scoped
+# lane decides its own scope only when it runs, and the fast tier alone takes
+# about 4.4 minutes. A keepalive this hook cannot read (an ssh wrapper without
+# `-G`) is said and judged on; the push itself still tells. A destination that
+# is not ssh (a path, https) has no such cut here.
+if [ -n "${PUSHED_REFS//[[:space:]]/}" ] && grep -q '^scoped\.' <<<"$LANES"; then
+  # shellcheck source=_ssh_keepalive.sh
+  if [ -n "$HOOK_SELF_DIR" ] && . "$HOOK_SELF_DIR/_ssh_keepalive.sh" 2>/dev/null; then
+    keepalive="$(trust_ssh_keepalive "${2:-}")"
+    case $? in
+      0) echo "ssh keepalive: $keepalive" ;;
+      1)
+        echo "PRE-PUSH: NO SSH KEEPALIVE — refused before any lane ran; nothing was judged."
+        echo "          git reaches ${2:-} over ssh, $keepalive: no keepalive (serveraliveinterval 0)."
+        echo "          GitHub closes an idle connection after about 6 minutes and this hook runs"
+        echo "          longer, so the push would fail at its end whatever the lanes said."
+        echo "          Fix it once for this clone, then push again:"
+        echo "              bash scripts/install-git-hooks.sh"
+        echo "          (it sets core.sshCommand=\"$TRUST_SSH_KEEPALIVE_COMMAND\""
+        echo "          unless you configured an ssh command of your own; then add"
+        echo "          -o ServerAliveInterval=30 to yours, or ServerAliveInterval to ~/.ssh/config)."
+        exit 2
+        ;;
+      2) echo "pre-push: ssh keepalive $keepalive; judging on (an idle ssh connection to GitHub closes after about 6 minutes)" ;;
+    esac
+  else
+    echo "pre-push: cannot read _ssh_keepalive.sh beside this hook; the ssh keepalive is not checked"
+  fi
+fi
+
 # EXPORTED, not piped: the command string must be byte-identical wherever it
 # runs, and this loop's own stdin is already the lane list.
 export TRUST_PUSHED_REFS="$PUSHED_REFS"
+export TRUST_PUSH_REMOTE="${2:-}"
+# Derived, not listed (see PUSH CONTEXT above). Informational: a failure to
+# derive it says so and judges nothing.
+if PUSH_REFS_READERS="$("$PYTHON_BIN" scripts/check_gate_lane_coverage.py --push-refs-readers 2>/dev/null)"; then
+  echo "push context (TRUST_PUSHED_REFS) is read by: ${PUSH_REFS_READERS:-no lane}"
+else
+  echo "push context (TRUST_PUSHED_REFS): could not derive its readers (scripts/check_gate_lane_coverage.py --push-refs-readers)"
+fi
+
+# A push in flight: the quarantine ledger comes from the pushed trees and the
+# destination tips (see build_push_quarantine), never from disk. Empty stdin is
+# the standing reading and keeps quarantine_for.
+if [ -n "${PUSHED_REFS//[[:space:]]/}" ]; then
+  PUSH_QDIR="$(mktemp -d -t trust-pre-push-quarantine.XXXXXX)" || {
+    echo "pre-push: cannot create a scratch directory for the quarantine table" >&2
+    exit 2
+  }
+  if ! build_push_quarantine; then
+    echo "pre-push: cannot read $LEDGER from the pushed trees — refusing to judge any lane" >&2
+    exit 2
+  fi
+  # INHERITED-RED's scratch: without it no red can be inherited (fail closed).
+  INHERIT_DIR="$(mktemp -d -t trust-pre-push-inherit.XXXXXX)" || INHERIT_DIR=""
+  if [ "${TRUST_PRE_PUSH_SHADOW:-1}" != "0" ]; then
+    SHADOW_LIVE="$PUSH_QDIR/shadow-live.tsv"
+    # The dates the live lanes judge by (ledger expiry is UTC, help-surface age
+    # is local): the shadow runs later and must not read a date change as a
+    # difference between the two verdicts.
+    printf '# live-dates start %s %s\n' "$(date -u +%F)" "$(date +%F)" >"$SHADOW_LIVE" 2>/dev/null
+  fi
+fi
+
+# THE FAST LANES RUN IN A POOL (2026-10-14). Run one after another they took
+# 670 s on this repository (measured 2026-10-14, 53 lanes, an 18-CPU host), which
+# is time the scoped lanes then waited behind. Every one is a read of the checkout
+# or works only in its own mktemp directory (audited lane by lane that day: no
+# lane writes the checkout, takes a build lock or a fixed temp path), so they run
+# TRUST_PRE_PUSH_FAST_JOBS at a time (default: scripts/lib/host_budget.py's
+# `fast-lane` plan for the memory available now, at most 16; the CPU count, at
+# most 16, when the helper is missing or cannot measure the host). A lane
+# runs exactly the command it ran in line, from the repository root with stdin
+# closed. Its output is held in its own file and printed, under its own header
+# and graded by the same lane_grade, in MANIFEST order, so the report reads as it
+# did in line; only the wall clock changes. A verdict is never read before its
+# lane has exited.
+#
+# FAST_SOLO_RE names the lanes that must not share the host: their tests assert
+# wall-clock bounds that CPU contention can flip (fast.crates-tests-scoped-
+# selftest: BarrierTest and the deadline cases; fast.measurement-provenance-test:
+# measurement_provenance_push_scope_test.py gives every git and checker process
+# 30 s, and on 2026-10-22 in the pool of 16 at host load 22.6 its
+# `git push --atomic` through the checker's pre-push hook ran past that,
+# TimeoutExpired, the lane 36.9 s; the same file is 13-15 s in the pool at load
+# 2-10 and 14.4 s alone at load 19.7). They run in line, alone, after the pool
+# has drained, in manifest order.
+#
+# TRUST_PRE_PUSH_FAST_JOBS=1 runs every fast lane in line, as before 2026-10-14.
+FAST_SOLO_RE='^(fast\.crates-tests-scoped-selftest|fast\.measurement-provenance-test)$'
+FAST_DIR=""
+FAST_LAUNCHED=0
+FAST_PIDS=()
+
+fast_jobs() {
+  local n="${TRUST_PRE_PUSH_FAST_JOBS:-}" budget="$REPO_ROOT/scripts/lib/host_budget.py"
+  # The repo's one host helper sizes the pool to the memory available NOW
+  # (docs/LANDING_GATE.md §2): a CPU count alone oversubscribes a shared host.
+  if [ -z "$n" ] && [ -f "$budget" ]; then
+    # Exit 3 with "0": not even one lane fits the room; nothing printed: the host
+    # cannot be measured. Either way the lanes run in line.
+    n="$("$PYTHON_BIN" "$budget" jobs fast-lane 2>/dev/null)"
+    case "$n" in "" | *[!0-9]* | 0) n=1 ;; esac
+  fi
+  if [ -z "$n" ]; then
+    n="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+    case "$n" in "" | *[!0-9]*) n=1 ;; esac
+    [ "$n" -le 16 ] || n=16
+  fi
+  case "$n" in "" | *[!0-9]* | 0) n=1 ;; esac
+  [ "$n" -le 16 ] || n=16
+  if [ -n "$ADMITTED_FAST_JOBS" ]; then
+    [ "$n" -le "$ADMITTED_FAST_JOBS" ] || n="$ADMITTED_FAST_JOBS"
+  fi
+  echo "$n"
+}
+
+# stop_fast_lanes: TERM every pool lane still running, as a process group (each
+# lane leads its own, so the signal reaches what it started). A lane launched
+# but not yet in its group remains owned until it publishes a complete .pgid
+# or finishes. A TERM sent before then would miss it and leave it running.
+stop_fast_lanes() {
+  [ -n "$FAST_DIR" ] || return 0
+  local i=0 owner
+  while [ "$i" -lt "$FAST_LAUNCHED" ]; do
+    owner="${FAST_PIDS[$i]}"
+    while kill -0 "$owner" 2>/dev/null && [ ! -f "$FAST_DIR/$i.rc" ] \
+        && ! signal_group "$FAST_DIR/$i.pgid" "$FAST_DIR/$i.rc" TERM; do
+      sleep 0.1
+    done
+    i=$((i + 1))
+  done
+  for owner in ${FAST_PIDS+"${FAST_PIDS[@]}"}; do wait "$owner" 2>/dev/null; done
+}
+
+start_fast_lane() {  # <index> <command>
+  ( cd "$REPO_ROOT" || exit 2
+    lane_started=$SECONDS
+    perl -e "$PERL_OWN_GROUP" "$FAST_DIR/$1.pgid" bash -o pipefail -c "$2" \
+      </dev/null >"$FAST_DIR/$1.log" 2>&1
+    rc=$?
+    # Publish timing before rc: grading may start as soon as rc appears. The
+    # measurement ends here, not when manifest-order printing reaches this lane.
+    { printf '%s\n' "$((SECONDS - lane_started))" >"$FAST_DIR/$1.elapsed"; } 2>/dev/null || :
+    # Silent: a hook that stopped the pool has removed FAST_DIR by now.
+    { echo "$rc" >"$FAST_DIR/$1.rc.tmp" && mv "$FAST_DIR/$1.rc.tmp" "$FAST_DIR/$1.rc"; } 2>/dev/null ) &
+  FAST_PIDS[$1]=$!
+}
+
+interrupt_fast_lanes() {
+  echo; echo "pre-push: interrupted — stopping the fast lanes"
+  exit 130
+}
+
+grade_fast_lane() {  # <index> <gate_id> <command> <required>
+  local gate_id="$2" command="$3" required="$4"
+  local quarantine="" published_row="" quarantine_why="" status
+  lane_lookup
+  echo
+  echo "=== $gate_id ==="
+  cp "$FAST_DIR/$1.log" "$LANE_LOG"
+  cat "$LANE_LOG"
+  status="$(cat "$FAST_DIR/$1.rc" 2>/dev/null)"
+  case "$status" in "" | *[!0-9]*) status=2 ;; esac
+  timing_file lane "$gate_id" "$FAST_DIR/$1.elapsed" "$status"
+  lane_grade
+}
+
+# run_fast_lanes <file of gate_id TAB required TAB command, manifest order>
+run_fast_lanes() {
+  local jobs ids=() reqs=() cmds=() solo=() n=0 printed=0 running i
+  local gate_id required command launch_interrupted
+  jobs="$(fast_jobs)"
+  while IFS=$'\t' read -r gate_id required command; do
+    if [ "$jobs" -gt 1 ] && [[ $gate_id =~ $FAST_SOLO_RE ]]; then
+      solo+=("$gate_id"$'\t'"$required"$'\t'"$command"); continue
+    fi
+    ids+=("$gate_id"); reqs+=("$required"); cmds+=("$command"); n=$((n + 1))
+  done <"$1"
+  if [ "$jobs" -le 1 ]; then
+    i=0
+    while [ "$i" -lt "$n" ]; do run_lane "${ids[$i]}" "${cmds[$i]}" "${reqs[$i]}"; i=$((i + 1)); done
+    return
+  fi
+  FAST_DIR="$(mktemp -d -t trust-pre-push-fast.XXXXXX)" || {
+    echo "pre-push: cannot create a scratch directory for the fast lanes" >&2
+    exit 2
+  }
+  echo
+  echo "fast lanes: $n in a pool of $jobs, printed in manifest order${solo+; then ${#solo[@]} alone (FAST_SOLO_RE)}"
+  # on_exit stops the lanes still running.
+  trap interrupt_fast_lanes INT TERM HUP QUIT
+  while [ "$printed" -lt "$n" ]; do
+    running=0; i="$printed"
+    while [ "$i" -lt "$FAST_LAUNCHED" ]; do
+      [ -f "$FAST_DIR/$i.rc" ] || running=$((running + 1)); i=$((i + 1))
+    done
+    while [ "$FAST_LAUNCHED" -lt "$n" ] && [ "$running" -lt "$jobs" ]; do
+      # Defer cancellation until the new child handle/count is owned.
+      launch_interrupted=""
+      trap 'launch_interrupted=1' INT TERM HUP QUIT
+      start_fast_lane "$FAST_LAUNCHED" "${cmds[$FAST_LAUNCHED]}"
+      FAST_LAUNCHED=$((FAST_LAUNCHED + 1)); running=$((running + 1))
+      trap interrupt_fast_lanes INT TERM HUP QUIT
+      [ -z "$launch_interrupted" ] || interrupt_fast_lanes
+    done
+    if [ -f "$FAST_DIR/$printed.rc" ]; then
+      grade_fast_lane "$printed" "${ids[$printed]}" "${cmds[$printed]}" "${reqs[$printed]}"
+      printed=$((printed + 1))
+      continue
+    fi
+    sleep 0.2
+  done
+  wait
+  trap - INT TERM HUP QUIT
+  rm -rf "${FAST_DIR:?}"; FAST_DIR=""
+  for entry in ${solo+"${solo[@]}"}; do
+    IFS=$'\t' read -r gate_id required command <<< "$entry"
+    run_lane "$gate_id" "$command" "$required"
+  done
+}
 
 # Manifest order is execution order; `scoped.*` is deferred to the end.
 SCOPED=()
-while IFS=$'\t' read -r gate_id _category _required _last_green command; do
+FAST_LIST="$(mktemp -t trust-pre-push-fast-list.XXXXXX)" || {
+  echo "pre-push: cannot create a scratch file for the fast lane list" >&2
+  exit 2
+}
+while IFS=$'\t' read -r gate_id _category required _last_green command; do
   [ -n "$gate_id" ] || continue
   case "$gate_id" in
-    scoped.*) SCOPED+=("$gate_id"$'\t'"$command"); continue ;;
+    scoped.*) SCOPED+=("$gate_id"$'\t'"$required"$'\t'"$command"); continue ;;
   esac
-  run_lane "$gate_id" "$command"
+  printf '%s\t%s\t%s\n' "$gate_id" "$required" "$command" >>"$FAST_LIST"
 done <<< "$LANES"
+timing_record prepare - "$((SECONDS - TIMING_STARTED))" -
+phase_started=$SECONDS
+run_fast_lanes "$FAST_LIST"
+timing_record fast-lanes - "$((SECONDS - phase_started))" -
+rm -f "${FAST_LIST:?}"
+# Before any scoped lane: FAILED must be final for the fast tier when the
+# STALE stop below asks it.
+phase_started=$SECONDS
+judge_inherited
+timing_record inherited-comparison - "$((SECONDS - phase_started))" -
+# stop_if_destination_moved <first-lane-not-run>: the STALE stop (see "A
+# DESTINATION THAT MOVED DOOMS THE PUSH" above), asked before each scoped lane
+# starts and, for the overlapped lane, before its test binaries may start. An
+# exit here stops that lane first (on_exit -> stop_overlap_lane).
+stop_if_destination_moved() {
+  destination_moved || return 0
+  # The overlapped lane is stopped (and says so) BEFORE the verdict, so the
+  # STALE or RED block stays the last thing the hook prints, as in line.
+  stop_overlap_lane "the destination moved"
+  echo
+  if [ "$FAILED" -eq 0 ]; then
+    echo "PRE-PUSH: STALE — every ref this push updates moved on the destination while this hook ran:"
+    printf '%s' "$MOVED_REFS"
+    echo "          so the remote would refuse the push (fetch first). Nothing from here on was"
+    echo "          judged: fetch, merge or rebase onto it, and push again."
+    exit 2
+  fi
+  echo "pre-push: every ref this push updates moved on the destination (fetch first):"
+  printf '%s' "$MOVED_REFS"
+  echo "          so the scoped lanes from $1 on were not run; a lane above already FAILED."
+  red_verdict
+}
+
+# CRATES-TESTS' BUILD OVERLAPS THE LANES BEFORE IT (2026-09-30), on a host that
+# can hold it. In line the scoped lanes cost their SUM, and main's quiet windows
+# are shorter than that: on 2026-09-30 a crates/ push lost its first five
+# attempts on m29, four of them after the ~15-minute compiler check, while main
+# took a push roughly every 15 minutes. `scoped.crates-tests` is two phases: a
+# BUILD-AND-RECORD pass that compiles the touched members' test binaries with
+# PATH targo into crates/target and runs none of them (~5.6 min on the slice-b
+# pushes), then the binaries themselves (~7.7 min). Only the first phase
+# overlaps anything, and only the scoped lanes before it in manifest order.
+#
+# WHY NOT EVERYTHING AT ONCE. a6d70d2261 ran every scoped lane concurrently and
+# was reverted (734e177429): `scoped.compiler-check` (`x.py check --stage 1`)
+# BUILDS the stage-1 compiler and std, and crates' TESTS run that stage 1
+# (crates/trust-integration-tests/tests/e2e_real_rustc.rs, crates/trust-router/
+# tests/nonlinear_relaxation.rs, crates/trust-vcgen/tests/
+# escaped_local_seam_realmir.rs and others name build/<host>/stage1), so a
+# concurrent PASS could describe the previous tree's stage 1, or one being
+# rebuilt under it. So here NO crates test binary starts until every scoped
+# lane before it has FINISHED: the lane waits at a barrier file
+# (TRUST_CRATES_TESTS_RUN_AFTER, scripts/check_crates_tests_scoped.py's header)
+# between its build and its first binary, and this hook writes `run` there
+# only after the last of those lanes has ended and the destination has been
+# asked once more, as in line. Every test still executes in manifest order.
+#
+# WHAT THE BUILD PHASE READS, audited 2026-09-30 on m29 (docs/VALIDATION_LADDER.md
+# has the evidence): nothing the lanes before it write, with ONE exception that
+# the hook checks for (below). It compiles with PATH targo, the atpkg store's
+# toolchain (`targo` -> .../aterm/pkg/store/trust/9192; rustup's `trust` links
+# to atpkg too), never build/; the repo-root .cargo/config.toml (cargo runs from
+# the repo root; crates/ has no .cargo/) selects no compiler; no crates/ member
+# or build script names build/ at compile time (build/ paths in crates/ sources
+# are built at TEST run time); x.py's BUILD writes build/ (its own target dirs),
+# never crates/target or Cargo.lock, which crates-tests reads `--locked`.
+# Measured: the members whose tests run stage 1 built (`--tests --no-run`, and
+# trust-router's ay-backend lib) under a sandbox denying every read and write
+# of build/, exit 0 (the FEATURE_RUNS tails of 2026-10-01 bring build scripts
+# outside that run: read, not sandboxed; docs/VALIDATION_LADDER.md lists them).
+# The completion-gate suite is Python over the tree and temp
+# dirs; it neither writes crates/ nor reads crates/target, and its order
+# relative to crates' TESTS is unchanged. Shared, and designed for it: cargo's
+# package-cache lock, CPU and memory (the repo-root .cargo/config.toml caps
+# the build at 4 jobs).
+#
+# The build phase also holds the lane's targo-trust prebuild, when the push
+# touches trust-integration-tests (the lane's header): `targo --unverified
+# build --manifest-path targo-trust/Cargo.toml ...`, then a private copy. Read
+# statically on 2026-09-30, not under the sandbox: targo-trust's own package
+# has no build script; its path deps are crates/ members (above), first-party/
+# trees (the exception below) and vendor/rustc_version_0_4_1, and the six of
+# them with a build script (trust-wp, ay, ay-dpll, clean-olean,
+# trust-cg-codegen, trust-ir) read OUT_DIR, CARGO_MANIFEST_DIR, ELAN/HOME and
+# `$RUSTC --version`, never build/; it reads Cargo.lock `--locked` and writes
+# the worktree's crates/target (or the caller's Cargo/Targo target), which x.py check does
+# not touch: bootstrap has no check step for targo-trust (src/bootstrap/src/
+# core/build_steps/check.rs; its tool step, tool.rs, is `x.py build`'s, into
+# build/). It is `--unverified` like the record pass, and it is one of the
+# lane's tracked processes (_spawn), so a `stop` and SIGINT reach it as they
+# reach the record pass, and the lane removes the copy's directory on the way
+# out. Its time is the lane's: cold, 6m08s more before the record pass.
+#
+# THE EXCEPTION: SUBMODULES. Before it builds anything, bootstrap
+# (src/bootstrap/src/lib.rs, update_existing_submodules, for every subcommand
+# but setup) walks .gitmodules, and every initialised submodule whose HEAD is
+# not the gitlink in HEAD gets `git submodule update --init --recursive`,
+# `reset --hard` and `clean -dfx` (core/config/config.rs update_submodule);
+# require_submodule can also check one out that is not checked out at all.
+# Those are the first-party/* trees the crates build compiles as path deps
+# (Cargo.toml). In line that finishes before the crates build starts;
+# overlapped, the build could compile the old source or a half-checked-out
+# mix and its tests PASS a tree the push does not pin. bootstrap.toml's
+# `submodules = false` turns this off, but a hook cannot read every way a
+# config can be found, so the hook asks the tree instead: it overlaps only
+# when EVERY submodule in .gitmodules is checked out at its gitlink in HEAD,
+# where update_submodule returns at once (`actual_hash == checked_out_hash`).
+# Otherwise it runs in line and names the submodule. (Drift itself is not
+# this hook's to fix: scripts/submodule_sync.sh.)
+#
+# A MOVED DESTINATION DURING THE BUILD. The STALE stop is asked before each
+# scoped lane, as in line, and once more before the barrier is released. When
+# it stops the push, the barrier gets `stop` (so the lane can never start a
+# binary) and the lane is interrupted: SIGINT to its process group, which the
+# lane forwards to cargo's session, KILL after its grace; then the STALE (or
+# RED) verdict is printed, last, as in line. That is safe only
+# because the build phase runs no verifier: every trustc of `targo --unverified`
+# gets -Ztrust-verify=off (measured: all of them in the audit build) and no
+# trustd starts (the unverified lane never provisions the memory daemon; none
+# appeared). What an interrupted verifier can do to trustd's crash epoch cannot
+# happen there. Once the barrier says `run`, nothing but the user's own
+# interrupt stops the lane: an exit on any other path waits for it.
+#
+# What does not change: the lane's command string and exec form (plus two
+# environment variables), its judgement (the same lane_lookup and lane_grade),
+# its output (all of it, under its own `=== id ===` header, in manifest order,
+# after the lanes before it), and each other scoped lane (streamed, in line,
+# STALE check first). They run in process groups of their own so that an
+# interrupted hook (INT, TERM, HUP, QUIT) can interrupt every running lane
+# (one SIGINT each: a second is the "force quit" of tools like x.py, which
+# hand the build lock over in their handler), wait for it and exit 130: no
+# lane outlives the hook. A barrier the hook cannot write (a full disk) is
+# not a wait: the lane is stopped and the hook exits 2. A hook that is
+# SIGKILLed can do none of this. The overlapped lane then stops by itself,
+# NOT JUDGED, when the hook's pid is gone before it released the barrier
+# (TRUST_CRATES_TESTS_RUN_AFTER_OWNER); an in-line lane then running (its own
+# process group, out of reach of a group KILL aimed at the hook) runs to its
+# end, holding x.py's build lock meanwhile. In line, a KILL aimed at the
+# hook's pid alone leaves its lane running just the same; a KILL to the whole
+# group is the one case the overlap mode leaves a lane that in line it would
+# not. Not handled: SIGKILL is the signal that may not be handled.
+#
+# WHICH LANE. The one scoped lane whose WHOLE command runs
+# scripts/check_crates_tests_scoped.py (an optional interpreter, the script,
+# plain arguments: OVERLAP_CMD_RE): the barrier is that script's code (and its
+# test's), so what earns the overlap is running it, not an id. A command that
+# merely CONTAINS it runs in line: a step before the script would start with
+# the overlapped lane and run unbarriered, beside the stage-1 rebuild (the
+# a6d70d2261 hazard). A second such lane would run in line.
+#
+# Overlap where scripts/lib/host_budget.py admits it (the memory available now
+# holds both builds; see choose_scoped_mode) and perl exists (which puts each
+# lane in its own process group); in line, exactly as before, otherwise, and
+# the hook prints which and why. TRUST_PRE_PUSH_SCOPED=serial
+# or =overlap chooses explicitly (scripts/tests/ drive both). Controlled by
+# scripts/tests/pre_push_overlap_scoped_test.sh.
+OVERLAP_SCRIPT="scripts/check_crates_tests_scoped.py"
+# The whole command, anchored: [python3|python|bash|/abs/python3] [./]script
+# [args], each argument plain characters (no ; & | $ quotes or redirections).
+OVERLAP_CMD_RE='^[[:space:]]*((python3?|bash|/[-A-Za-z0-9_./]*/python3?)[[:space:]]+)?(\./)?scripts/check_crates_tests_scoped\.py([[:space:]]+[-A-Za-z0-9_=./:]+)*[[:space:]]*$'
+# PERL_OWN_GROUP above publishes each lane's group before the run_lane exec.
+OVERLAP_ID=""          # the overlapped lane's gate id
+OVERLAP_ENDED=""       # set once it has been waited for
+BARRIER_SAID=""        # what the barrier was released with: run | stop
+
+# choose_scoped_mode sets SCOPED_MODE (serial | overlap), SCOPED_WHY and
+# OVERLAP_AT (the overlapped lane's index in SCOPED).
+choose_scoped_mode() {
+  local i=0 entry _id _req cmd
+  SCOPED_MODE=serial
+  OVERLAP_AT=""
+  for entry in "${SCOPED[@]}"; do
+    IFS=$'\t' read -r _id _req cmd <<< "$entry"
+    if [[ $cmd =~ $OVERLAP_CMD_RE ]]; then
+      OVERLAP_AT="$i"; break
+    fi
+    i=$((i + 1))
+  done
+  # The two builds otherwise each inherit the whole CARGO_BUILD_JOBS share.
+  # Serialize until a shared aggregate CPU/memory allocator can divide it.
+  # An explicit overlap preference cannot spend an admission twice.
+  if [ "${BUILD_SLOT_HELD:-}" = 1 ]; then
+    SCOPED_WHY="build-slot CPU share belongs to one heavy lane at a time"; return
+  fi
+  case "${TRUST_PRE_PUSH_SCOPED:-}" in
+    serial) SCOPED_WHY="TRUST_PRE_PUSH_SCOPED=serial"; return ;;
+    overlap|"") ;;
+    *) SCOPED_WHY="TRUST_PRE_PUSH_SCOPED=${TRUST_PRE_PUSH_SCOPED} is neither serial nor overlap"; return ;;
+  esac
+  if [ -z "$OVERLAP_AT" ]; then
+    SCOPED_WHY="no scoped lane's whole command runs $OVERLAP_SCRIPT, whose build could overlap"; return
+  fi
+  # Even when asked for: a submodule x.py would check out is a soundness
+  # question, not a preference (THE EXCEPTION: SUBMODULES, above).
+  SCOPED_WHY="$(submodule_x_py_would_touch)"
+  [ -z "$SCOPED_WHY" ] || return
+  if ! command -v perl >/dev/null 2>&1; then
+    SCOPED_WHY="no perl to give each lane its own process group"; return
+  fi
+  if [ -n "${TRUST_PRE_PUSH_SCOPED:-}" ]; then
+    SCOPED_MODE=overlap; SCOPED_WHY="TRUST_PRE_PUSH_SCOPED=overlap"; return
+  fi
+  # ADMISSION FROM THE MEASURED HOST (2026-10-14). Until then: >= 64 GiB and
+  # >= 12 CPUs of TOTAL memory, a rule sized for one host that ignored what a
+  # neighbour was already using. scripts/lib/host_budget.py (the repo's one
+  # host-scaling helper) reads the memory available NOW and admits the overlap
+  # only when the room holds a CPU's worth of compiler jobs at the per-job want
+  # (two concurrent builds at half the cores each). It prints what it measured.
+  # A tree without the helper, or a host it cannot measure, runs in line.
+  local budget="$REPO_ROOT/scripts/lib/host_budget.py" why=""
+  if [ ! -f "$budget" ]; then
+    SCOPED_WHY="host budget: $budget is missing"; return
+  fi
+  if ! why="$("$PYTHON_BIN" "$budget" admit-overlap 2>/dev/null)"; then
+    SCOPED_WHY="host budget: ${why:-cannot measure this host}"; return
+  fi
+  SCOPED_WHY="host budget: $why"
+  SCOPED_MODE=overlap
+}
+
+# submodule_x_py_would_touch: prints why x.py's bootstrap could rewrite a
+# submodule under the overlapped build (the first one found), or nothing.
+submodule_x_py_would_touch() {
+  local _key path want have
+  [ -f "$REPO_ROOT/.gitmodules" ] || return 0
+  while read -r _key path; do
+    [ -n "$path" ] || continue
+    want="$(git -C "$REPO_ROOT" ls-tree HEAD -- "$path" 2>/dev/null | awk '$2 == "commit" { print $3; exit }')"
+    if [ -z "$want" ]; then
+      echo "submodule $path has no gitlink in HEAD"; return
+    fi
+    if [ ! -e "$REPO_ROOT/$path/.git" ] || ! have="$(git -C "$REPO_ROOT/$path" rev-parse -q --verify HEAD 2>/dev/null)"; then
+      echo "submodule $path is not checked out (x.py may check it out under the crates build)"; return
+    fi
+    if [ "$have" != "$want" ]; then
+      echo "submodule $path is checked out at ${have:0:12}, not its gitlink ${want:0:12}: x.py would check it out under the crates build"
+      return
+    fi
+  done < <(git -C "$REPO_ROOT" config --file .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null)
+}
+
+# release_barrier run|stop: once, whole (by rename), never rewritten. Fails
+# (status 1, saying so) when it cannot write it; BARRIER_SAID is set only once
+# the file is in place, so a failed `run` is never taken for a release.
+release_barrier() {
+  [ -n "$OVERLAP_DIR" ] && [ -z "$BARRIER_SAID" ] || return 0
+  if printf '%s\n' "$1" 2>/dev/null >"$OVERLAP_DIR/barrier.part" \
+     && mv -f "$OVERLAP_DIR/barrier.part" "$OVERLAP_DIR/barrier" 2>/dev/null; then
+    BARRIER_SAID="$1"
+    return 0
+  fi
+  echo "pre-push: cannot write the barrier $OVERLAP_DIR/barrier (to say $1)"
+  return 1
+}
+
+start_overlap_lane() {
+  local command="$1" launch_interrupted=""
+  OVERLAP_DIR="$(mktemp -d -t trust-pre-push-overlap.XXXXXX)" || {
+    echo "pre-push: cannot create a scratch directory for the overlapped lane" >&2
+    exit 2
+  }
+  INLINE_BG="$OVERLAP_DIR/inline"
+  # Own the asynchronous wrapper before a cancellation handler may inspect it.
+  trap 'launch_interrupted=1' INT TERM HUP QUIT
+  ( cd "$REPO_ROOT" || exit 2
+    lane_started=$SECONDS
+    TRUST_CRATES_TESTS_RUN_AFTER="$OVERLAP_DIR/barrier" TRUST_CRATES_TESTS_RUN_AFTER_OWNER="$$" \
+      perl -e "$PERL_OWN_GROUP" "$OVERLAP_DIR/pgid" bash -o pipefail -c "$command" \
+      </dev/null >"$OVERLAP_DIR/log" 2>&1
+    rc=$?
+    { printf '%s\n' "$((SECONDS - lane_started))" >"$OVERLAP_DIR/elapsed"; } 2>/dev/null || :
+    echo "$rc" >"$OVERLAP_DIR/rc.part" && mv "$OVERLAP_DIR/rc.part" "$OVERLAP_DIR/rc" ) &
+  OVERLAP_PID=$!
+  trap interrupt_lanes INT TERM HUP QUIT
+  [ -z "$launch_interrupted" ] || interrupt_lanes
+  OVERLAP_STARTED=$SECONDS
+}
+
+# wait_overlap_lane: wait (interruptibly) for the overlapped lane to end.
+wait_overlap_lane() {
+  [ -n "$OVERLAP_PID" ] && [ -z "$OVERLAP_ENDED" ] || return 0
+  while [ ! -f "$OVERLAP_DIR/rc" ] && kill -0 "$OVERLAP_PID" 2>/dev/null; do
+    wait "$OVERLAP_PID" 2>/dev/null
+  done
+  wait "$OVERLAP_PID" 2>/dev/null
+  OVERLAP_ENDED=1
+}
+
+# stop_overlap_lane <why>: on any exit before the overlapped lane was judged.
+# Before its barrier said `run` it is still building (or waiting), which runs
+# no verifier: `stop`, then interrupted. After, it is running tests, which this
+# never interrupts (an interrupted verifier can leave trustd's crash epoch
+# dirty for the whole host): it is waited for.
+stop_overlap_lane() {
+  [ -n "$OVERLAP_PID" ] && [ -z "$OVERLAP_ENDED" ] || return 0
+  if [ "$BARRIER_SAID" = run ]; then
+    echo "pre-push: $1; waiting for $OVERLAP_ID, whose test binaries are running (never interrupted)"
+    wait_overlap_lane
+    return 0
+  fi
+  release_barrier stop
+  if [ -f "$OVERLAP_DIR/rc" ]; then
+    wait_overlap_lane
+    echo "pre-push: $1; $OVERLAP_ID had already ended (exit $(cat "$OVERLAP_DIR/rc")) and is not judged"
+    return 0
+  fi
+  while kill -0 "$OVERLAP_PID" 2>/dev/null && [ ! -f "$OVERLAP_DIR/rc" ] \
+      && ! signal_group "$OVERLAP_DIR/pgid" "$OVERLAP_DIR/rc"; do
+    sleep 0.1
+  done
+  wait_overlap_lane
+  echo "pre-push: $1; stopped $OVERLAP_ID in its build, before any of its test binaries ran"
+}
+
+# The overlapped lane's quarantine row, read (and a ledger that cannot be read
+# refused, exit 2) before it starts, as when it starts in line.
+overlap_lane_lookup() {
+  local gate_id="$1" required="$2" quarantine="" published_row="" quarantine_why=""
+  lane_lookup
+}
+
+# Its whole output under its own header, judged as run_lane judges.
+grade_overlap_lane() {
+  local gate_id="$1" required="$2" command="$3" quarantine="" published_row="" quarantine_why="" status
+  lane_lookup
+  echo
+  echo "=== $gate_id ==="
+  cat "$OVERLAP_DIR/log"
+  cp "$OVERLAP_DIR/log" "$LANE_LOG"
+  status="$(cat "$OVERLAP_DIR/rc" 2>/dev/null)"
+  [ -n "$status" ] || status=2
+  timing_file lane "$gate_id" "$OVERLAP_DIR/elapsed" "$status"
+  lane_grade
+}
+
+# An interrupted hook interrupts every running lane (its process group), waits
+# for them and exits 130. Each lane gets ONE SIGINT after its complete group
+# record is ready, or is observed complete. Missing IDs remain pending across
+# every readiness pass; sending again during cleanup would force-quit a lane.
+# The barrier gets `stop` first, so the overlapped lane cannot start a test
+# binary meanwhile.
+interrupt_lanes() {
+  local inline_sent="" overlap_sent="" pending
+  trap - INT TERM HUP QUIT
+  echo
+  echo "pre-push: interrupted — interrupting every running lane and waiting for it"
+  release_barrier stop
+  while :; do
+    pending=""
+    if [ -n "$INLINE_PID" ] && kill -0 "$INLINE_PID" 2>/dev/null \
+        && [ -z "$inline_sent" ] && [ ! -f "$INLINE_BG.rc" ]; then
+      if signal_group "$INLINE_BG.pgid" "$INLINE_BG.rc"; then inline_sent=1; else pending=1; fi
+    fi
+    if [ -n "$OVERLAP_PID" ] && kill -0 "$OVERLAP_PID" 2>/dev/null \
+        && [ -z "$overlap_sent" ] && [ ! -f "$OVERLAP_DIR/rc" ]; then
+      if signal_group "$OVERLAP_DIR/pgid" "$OVERLAP_DIR/rc"; then overlap_sent=1; else pending=1; fi
+    fi
+    [ -n "$pending" ] || break
+    sleep 0.1
+  done
+  wait
+  OVERLAP_ENDED=1
+  exit 130
+}
+
+# In overlap mode an in-line lane runs in a process group of its own (so the
+# hook can interrupt it) and the hook waits for it with `wait`, which a
+# trapped signal interrupts at once. Output is streamed through tee as ever.
+run_lane_interruptibly() {
+  local launch_interrupted=""
+  rm -f "$INLINE_BG.pgid" "$INLINE_BG.rc"
+  trap 'launch_interrupted=1' INT TERM HUP QUIT
+  ( { ( cd "$REPO_ROOT" || exit 2
+      exec perl -e "$PERL_OWN_GROUP" "$INLINE_BG.pgid" bash -o pipefail -c "$command" ) </dev/null 2>&1
+    echo "$?" >"$INLINE_BG.rc"; } | tee "$LANE_LOG" ) &
+  INLINE_PID=$!
+  trap interrupt_lanes INT TERM HUP QUIT
+  [ -z "$launch_interrupted" ] || interrupt_lanes
+  wait "$INLINE_PID"
+  status="$(cat "$INLINE_BG.rc" 2>/dev/null)"
+  [ -n "$status" ] || status=2
+  INLINE_PID=""
+  rm -f "$INLINE_BG.pgid"
+}
+
 # bash 3.2 (what /usr/bin/env bash resolves to here) errors on "${A[@]}" for an
 # empty array under `set -u`.
+phase_started=$SECONDS
+if [ -n "${SCOPED+x}" ]; then
+  choose_scoped_mode
+  echo
+  if [ "$SCOPED_MODE" = overlap ]; then
+    IFS=$'\t' read -r OVERLAP_ID _ _ <<< "${SCOPED[$OVERLAP_AT]}"
+    echo "scoped lanes: overlap ($SCOPED_WHY) — $OVERLAP_ID builds while the lanes before it run;"
+    echo "              none of its test binaries starts until they have all finished"
+  else
+    echo "scoped lanes: in line ($SCOPED_WHY)"
+  fi
+fi
+i=0
 for entry in ${SCOPED+"${SCOPED[@]}"}; do
-  run_lane "${entry%%$'\t'*}" "${entry#*$'\t'}"
+  IFS=$'\t' read -r gate_id required command <<< "$entry"
+  if [ "$SCOPED_MODE" = overlap ] && [ "$i" -le "$OVERLAP_AT" ]; then
+    if [ "$i" -eq 0 ]; then
+      stop_if_destination_moved "$gate_id"
+      # The overlapped lane's ledger row is read now, as it would be when it
+      # starts in line: a ledger the hook cannot read refuses before it runs.
+      IFS=$'\t' read -r o_id o_required o_command <<< "${SCOPED[$OVERLAP_AT]}"
+      overlap_lane_lookup "$o_id" "$o_required"
+      trap interrupt_lanes INT TERM HUP QUIT
+      start_overlap_lane "$o_command"
+      echo "  started:  $o_id (its build only; its output follows under its own header)"
+    elif [ "$i" -lt "$OVERLAP_AT" ]; then
+      stop_if_destination_moved "$gate_id"
+    fi
+    if [ "$i" -lt "$OVERLAP_AT" ]; then
+      run_lane "$gate_id" "$command" "$required"
+      i=$((i + 1))
+      continue
+    fi
+    # Every scoped lane before it has finished: ask the destination once more,
+    # as in line before this lane, then let its test binaries run.
+    [ "$i" -eq 0 ] || stop_if_destination_moved "$gate_id"
+    if ! release_barrier run; then
+      # Never a wait: the lane would wait for a file that cannot appear while
+      # this hook waited for the lane.
+      stop_overlap_lane "the barrier could not be released"
+      echo "pre-push: $gate_id was not judged; nothing was pushed (exit 2)"
+      exit 2
+    fi
+    echo
+    echo "released: $gate_id may run its test binaries (every scoped lane before it has finished)"
+    wait_overlap_lane
+    trap - INT TERM HUP QUIT
+    elapsed=$((SECONDS - OVERLAP_STARTED))
+    echo "  finished: $gate_id (exit $(cat "$OVERLAP_DIR/rc" 2>/dev/null)) after $((elapsed / 60)) min $((elapsed % 60)) s"
+    grade_overlap_lane "$gate_id" "$required" "$command"
+    INLINE_BG=""
+    i=$((i + 1))
+    continue
+  fi
+  stop_if_destination_moved "$gate_id"
+  run_lane "$gate_id" "$command" "$required"
+  i=$((i + 1))
 done
 
+timing_record scoped-lanes - "$((SECONDS - phase_started))" -
+timing_record hook-before-verdict - "$((SECONDS - TIMING_STARTED))" -
+launch_shadow
 echo
 if [ "$FAILED" -eq 0 ]; then
+  # Shell-local child status cannot be supplied by another subprocess or a
+  # receipt. Missing/quarantined/failed deferred execution refuses publication.
+  if [ -n "${TRUST_LAND_TARGO_HEAD:-}" ]; then
+    if [ "$LAND_TARGO_STATUS" != 0 ]; then
+      echo "pre-push: required full landing Targo suite did not pass" >&2
+      exit 2
+    fi
+    "$PYTHON_BIN" scripts/land_gate.py landing-hook-finish || exit 2
+  fi
   echo "PRE-PUSH: GREEN"
+  if [ -n "$INHERITED_IDS" ]; then
+    echo "          beside red(s) the destination already has, which this push adds nothing to"
+    echo "          (INHERITED, above): $INHERITED_IDS. Fix them forward when you can."
+  fi
   exit 0
 fi
-echo "PRE-PUSH: RED — fix the lanes above, or quarantine one with an owned,"
-echo "expiring row in $LEDGER. \`git push --no-verify\` skips this hook and"
-echo "leaves no record of why."
-exit 1
+red_verdict

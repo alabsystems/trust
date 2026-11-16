@@ -1,0 +1,1 @@
+shortfall(3>=10) = 7, shortfall(12>=10) = 0 — rust over lean pb_max, 24 lean decls kernel-checked

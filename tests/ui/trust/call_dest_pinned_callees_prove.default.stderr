@@ -1,0 +1,49 @@
+
+=== Trust Verification Report (call_dest_pinned_callees_prove) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/call_dest_pinned_callees_prove.rs:19:1
+   |
+LL | / pub fn guard(bit: u32) -> bool
+LL | |     ensures result == (bit < 64)
+LL | | {
+LL | |     bit < 64
+LL | | }
+   | |_^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/call_dest_pinned_callees_prove.rs:25:1
+   |
+LL | / pub fn shift_via_guard(x: u64, bit: u32) -> Option<u64> {
+LL | |     if !guard(bit) {
+LL | |         return None;
+...  |
+LL | | }
+   | |_^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/call_dest_pinned_callees_prove.rs:32:1
+   |
+LL | / pub fn shift_inline(x: u64, bit: u32) -> Option<u64> {
+LL | |     if !(bit < 64) {
+LL | |         return None;
+...  |
+LL | | }
+   | |_^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/call_dest_pinned_callees_prove.rs:43:1
+   |
+LL | / pub fn div_one(x: u32) -> u32 {
+LL | |     x / one()
+LL | | }
+   | |_^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+

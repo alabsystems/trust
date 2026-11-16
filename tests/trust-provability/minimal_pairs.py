@@ -104,7 +104,6 @@ def compile_one(name, src, workdir):
     with open(p, "w") as fh:
         fh.write("#![crate_type=\"lib\"]\n" + src + "\n")
     env = dict(os.environ)
-    env["TRUST_SEED_STAIRCASE"] = "1"
     cmd = [TRUSTC, "-Zthreads=1", "-Ztrust-verify=on",
            # advisory: we want every row, not an abort at the first unproved one
            "-Ztrust-policy=advisory", "-Ztrust-verify-output=json",

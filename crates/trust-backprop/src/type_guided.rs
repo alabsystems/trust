@@ -476,11 +476,17 @@ mod tests {
     #[test]
     fn test_match_patterns_option_adt() {
         let ty = Ty::Adt {
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Option<u32>".into(),
-            fields: vec![],
+            fields: vec![].into(),
             disc_index_safe: false,
-         faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None, arbitrary_precision: None };
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let patterns = match_patterns(&ty);
         assert_eq!(patterns.len(), 1);
         assert!(matches!(
@@ -523,11 +529,17 @@ mod tests {
     #[test]
     fn test_match_patterns_vec_adt() {
         let ty = Ty::Adt {
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Vec<i32>".into(),
-            fields: vec![],
+            fields: vec![].into(),
             disc_index_safe: false,
-         faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None, arbitrary_precision: None };
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let patterns = match_patterns(&ty);
         assert_eq!(patterns.len(), 1);
         assert!(matches!(
@@ -570,11 +582,17 @@ mod tests {
     #[test]
     fn test_infer_nullability_option() {
         let ty = Ty::Adt {
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Option<String>".into(),
-            fields: vec![],
+            fields: vec![].into(),
             disc_index_safe: false,
-         faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None, arbitrary_precision: None };
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let formula = infer_nullability("val", &ty);
         assert!(formula.is_some());
     }
@@ -644,11 +662,17 @@ mod tests {
                 1,
                 "maybe",
                 Ty::Adt {
-                    variants: Vec::new(),
+                    variants: Vec::new().into(),
                     name: "Option<u32>".into(),
-                    fields: vec![],
+                    fields: vec![].into(),
                     disc_index_safe: false,
-                 faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None, arbitrary_precision: None },
+                    faithful_enum_repr: None,
+                    layout: None,
+                    enum_layout: None,
+                    adt_kind: None,
+                    arbitrary_precision: None,
+                    validity_wrapper: None,
+                },
             )],
             Ty::Unit,
         );
@@ -693,11 +717,17 @@ mod tests {
                     3,
                     "default",
                     Ty::Adt {
-                        variants: Vec::new(),
+                        variants: Vec::new().into(),
                         name: "Option<u8>".into(),
-                        fields: vec![],
+                        fields: vec![].into(),
                         disc_index_safe: false,
-                     faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None, arbitrary_precision: None },
+                        faithful_enum_repr: None,
+                        layout: None,
+                        enum_layout: None,
+                        adt_kind: None,
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                    },
                 ),
             ],
             Ty::Int { width: 8, signed: false },

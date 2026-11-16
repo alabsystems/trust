@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-PR): a POINTER-LANE field read — `x.r` on a struct holding
 //! `&u32`, `x.s` holding `&str` — yields the lane's pointer value unledgered:
 //! it may be carried into a call, forwarded through a shared reborrow, or

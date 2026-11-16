@@ -1,40 +1,83 @@
-// trust_vcgen/unsafe_verify: Unsafe code verification with SAFETY comment extraction
+// trust_vcgen/unsafe_verify: unsafe-operation detection and the unsafe obligation rows
 //
-// Detects unsafe blocks in MIR, extracts // SAFETY: comments from source spans,
-// parses structured safety claims, and generates Assertion VCs that encode the
-// claimed invariants. This lets the solver check whether the safety justification
-// is consistent with the surrounding code.
+// Detects each unsafe OPERATION in MIR (`detection::detect_unsafe_blocks`) and
+// mints its per-site `[unsafe` assertion rows (`detection::generate_safety_vcs`,
+// reached through `check_unsafe`, which `generate::entry` calls), plus the
+// inline-asm rows (`detection::generate_inline_asm_vcs`, also called from
+// `generate::entry`). What a site mints is decided per site by
+// `detection::decide_site`; `generate_safety_vcs`'s doc has the rule and the
+// measurements behind it.
 //
-// Extended in #137 with:
-// - UnsafeVcKind enum for typed unsafe VC categorization
-// - UnsafeVerifier struct for stateful VC generation across a function
-// - Memory safety VCs: pointer alignment, provenance, bounds checking
-// - Transmute VCs: layout compatibility, validity invariant preservation
-// - FFI VCs: pre/post conditions on extern calls, null pointer checks
+// SAFETY comments are parsed (`parse_safety_comment`, `attach_safety_comments`),
+// but vcgen has no source-map access: the one production caller passes NO
+// comments, so no parsed safety claim reaches a VC today.
 //
-// Part of #79, #137: Unsafe code verification
+// SAFETY-ASSUME-1 (ruled 2026-10-17): the COMPILER reads the comments instead.
+// It decides which MIR operations sit in a user `unsafe { }` block whose
+// `// SAFETY:` comment is placed where `clippy::undocumented_unsafe_blocks`
+// accepts one, and installs them through `safety_declared::
+// with_safety_declared_unsafe_ops`. `detection::decide_site` withholds a call's
+// stand-in and a raw reborrow's `[unsafe:reborrow]` row for those operations Trust
+// does not model; a modeled call, or a raw-pointer read, whose row the engine did
+// not mint keeps its FAILED stand-in. The scope records every site it withholds,
+// and the compiler charges each such block one `assumption:safety-comment` row.
+// No comment text reaches vcgen, and nothing here is ever counted proved.
+//
+// This module mints no pointer-alignment, provenance, transmute-layout or FFI
+// pre/post-condition obligation of its own. The separation engine's
+// `[unsafe:sep:*]` rows and the compiler's `[unsafe:unmodeled-call]` /
+// `[unsafe:union-field]` / `[unsafe:mutable-static]` rows are minted elsewhere.
+//
+// Part of #79: Unsafe code verification
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use serde::{Deserialize, Serialize};
 use trust_types::fx::FxHashSet;
 use trust_types::*;
 
 pub(crate) mod detection;
+pub(crate) mod safety_declared;
 #[cfg(test)]
 mod tests;
-pub(crate) mod verifier;
 
 pub(crate) use detection::{attach_safety_comments, detect_unsafe_blocks, generate_safety_vcs};
-
-fn generated_unsafe_symbol(unqualified: &str) -> String {
-    crate::generated_formula_symbol("unsafe", unqualified)
-}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Core types
 // ────────────────────────────────────────────────────────────────────────────
+
+/// Which MIR construct a detected [`UnsafeBlock`] IS. Detection is per unsafe
+/// OPERATION, never per source-level `unsafe { }`: an `UnsafeBlock` is either the
+/// unsafe-signature / foreign / unsafe-named CALL that terminates a MIR block, or
+/// one raw-pointer-dereferencing STATEMENT inside a block. This is what decides
+/// (c) of the mint-side design: a source `unsafe { }` wrapping only safe code has
+/// neither, is never detected, and owes nothing — see
+/// `detection::generate_safety_vcs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnsafeOrigin {
+    /// The block's terminator call. The two flags are the extractor's
+    /// authoritative signals (`Terminator::Call::{is_unsafe_sig, is_foreign}`),
+    /// copied so the mint can mirror the compiler's `[unsafe:unmodeled-call]`
+    /// rule without re-reading the terminator. The operation's identity is
+    /// `(block_id, MirOp::Terminator)` — a block has exactly one terminator.
+    Call { is_unsafe_sig: bool, is_foreign: bool },
+    /// A statement whose place or rvalue dereferences a raw pointer. `stmt` is
+    /// its index in `block.stmts`, so the operation's identity is
+    /// `(block_id, MirOp::Statement(stmt))`.
+    RawDeref { stmt: usize },
+}
+
+/// One MIR operation inside a basic block: the `i`-th statement, or the
+/// terminator. Paired with a `BlockId` this is the identity the mint keys
+/// coverage on — the identity `SourceSpan` cannot provide, because
+/// `SourceSpan` discards the `SyntaxContext` and a proc-macro expansion stamps
+/// one `call_site()` span on every operation it emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MirOp {
+    Statement(usize),
+    Terminator,
+}
 
 /// An unsafe block discovered in MIR, with its optional safety claim.
 #[derive(Debug, Clone)]
@@ -47,6 +90,109 @@ pub(crate) struct UnsafeBlock {
     pub(crate) safety_claim: Option<SafetyClaim>,
     /// The block index in MIR where the unsafe code lives.
     pub(crate) block_id: BlockId,
+    /// Which construct in that block this is (call terminator vs deref statement).
+    pub(crate) origin: UnsafeOrigin,
+}
+
+/// The behavioural obligations ALREADY minted for this body by the lanes that
+/// run before `check_unsafe`, keyed the way the mint needs them. This is
+/// analysis-output disclosure, not proof authority: an entry here can only
+/// SUPPRESS the always-`Bool(true)` stand-in row for a site that carries a real
+/// obligation; nothing in it is ever assumed true.
+///
+/// KEYED ON THE MIR OPERATION, NEVER ON A SPAN. The separation engine reports,
+/// for every row it mints, the `(block, MirOp)` it was interpreting at the time
+/// (`sep_engine::check_sep_unsafe_blocked_ops`), and that pair is what is
+/// indexed here. A `(block, span)` key was tried and REFUTED: `SourceSpan`
+/// discards the `SyntaxContext`, so under a proc-macro `Span::call_site()` a
+/// deref STATEMENT's `[unsafe:sep:deref]` rows carried the same key as the
+/// `mem::zeroed::<&T>()` CALL terminator of the same block and "covered" it,
+/// and a `ptr::read` CALL's rows carried the same key as a deref statement.
+///
+/// `Default` is EMPTY, and empty is the fail-closed direction: with no coverage
+/// every detected site keeps its stand-in exactly as before.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct UnsafeCoverage {
+    /// The blocks whose TERMINATOR the separation engine was interpreting when
+    /// it minted an `[unsafe:sep:*]` row — i.e. the call terminators that carry
+    /// a behavioural row of their own. A row minted for a statement of the same
+    /// block is NOT in here, whatever its span.
+    pub(crate) sep_call_sites: FxHashSet<BlockId>,
+    /// The `(block, statement index)` of every STATEMENT the engine was
+    /// interpreting when it minted a `[unsafe:sep:deref]` row — the family it
+    /// mints for a raw-pointer dereference statement. A deref statement is
+    /// covered only by a deref-family row minted for THAT statement; a row
+    /// minted for the block's terminator (`ptr::read`/`ptr::write`, which mint
+    /// the same family) is not in here.
+    pub(crate) sep_deref_sites: FxHashSet<(BlockId, usize)>,
+    /// The blocks whose TERMINATOR the engine was interpreting when it minted a
+    /// `VcKind::UncheckedIndexBounds` row — the real `index < len` obligation of
+    /// a `get_unchecked` call. `block_is_bounds_complete_unchecked_index` used to
+    /// PREDICT that row from the callee's shape; the prediction is now
+    /// confirmed against this set, so a body the engine declined
+    /// (`has_unsafe_patterns`, a budget) or a callee spelling the engine's own
+    /// recognizer does not match keeps its stand-in.
+    pub(crate) sep_unchecked_index_sites: FxHashSet<BlockId>,
+    /// The blocks the path-guard walk reached from the entry — EXACTLY the
+    /// population over which `generate::safety` arm 1b mints terminator VCs
+    /// (`VcKind::Unreachable` included). A block outside it may be dead or may
+    /// be budget-collapsed; either way no `Unreachable` row was minted for it,
+    /// so its stand-in is kept.
+    pub(crate) reached_blocks: FxHashSet<BlockId>,
+    /// THE COMPILER'S OWN `[unsafe:unmodeled-call]` ROWS, by the MIR block each
+    /// was minted for — installed by `rustc_mir_transform::trust_verify` through
+    /// [`crate::VcgenContext::with_compiler_unmodeled_call_blocks`] from the row
+    /// set it generated over THIS body, before this generation ran.
+    ///
+    /// This is POSITIVE EVIDENCE and it replaces a bet. Until 2026-09-20
+    /// `decide_site` dropped a call site's fail-closed stand-in whenever a
+    /// vcgen-side PREDICTOR said the compiler would mint that row; the predictor
+    /// mirrored a string predicate the compiler evaluates on a different
+    /// spelling of the same callee, and a disagreement in the direction that
+    /// says "unmodeled here, modeled there" deleted the stand-in and got
+    /// nothing in return — an unsafe site with ZERO obligations. A row that is
+    /// in this set EXISTS; one that is not, does not.
+    ///
+    /// EMPTY IS FAIL-CLOSED, and empty is what every caller that is not the
+    /// compiler supplies.
+    pub(crate) compiler_unmodeled_call_blocks: FxHashSet<BlockId>,
+    /// Trust (G1, 2026-10-27): the `mem::zeroed::<T>()` call blocks whose `T` the
+    /// COMPILER found zero-valid by rustc's exact layout validity check, installed
+    /// through [`crate::VcgenContext::with_compiler_zero_valid_zeroed_blocks`]. Empty
+    /// (every non-compiler caller) admits nothing beyond the structural verdict.
+    pub(crate) compiler_zero_valid_zeroed_blocks: FxHashSet<BlockId>,
+    /// Trust (AW-1, 2026-10-03): the call blocks the COMPILER identified as
+    /// rustc's own `.await` lowering (`Pin::new_unchecked(&mut __awaitee)`,
+    /// `get_context(_task_context)`), installed through
+    /// [`crate::VcgenContext::with_await_desugared_unsafe_call_blocks`]. A
+    /// `UnsafeOrigin::Call` site in here owes no SAFETY-comment stand-in: the
+    /// user did not write it and cannot annotate it. EMPTY IS FAIL-CLOSED.
+    pub(crate) await_desugared_unsafe_call_blocks: FxHashSet<BlockId>,
+}
+
+impl UnsafeCoverage {
+    /// Index one separation-engine row by the `(block, op)` the engine was
+    /// interpreting when it minted it.
+    pub(crate) fn record_sep_row(&mut self, vc: &VerificationCondition, block: BlockId, op: MirOp) {
+        if let (VcKind::UncheckedIndexBounds { .. }, MirOp::Terminator) = (&vc.kind, op) {
+            self.sep_unchecked_index_sites.insert(block);
+            return;
+        }
+        let VcKind::Assertion { message } = &vc.kind else { return };
+        if !message.starts_with(VcKind::SEP_UNSAFE_ASSERTION_PREFIX) {
+            return;
+        }
+        match op {
+            MirOp::Terminator => {
+                self.sep_call_sites.insert(block);
+            }
+            MirOp::Statement(idx) => {
+                if message.starts_with("[unsafe:sep:deref]") {
+                    self.sep_deref_sites.insert((block, idx));
+                }
+            }
+        }
+    }
 }
 
 /// A structured safety claim extracted from a `// SAFETY:` comment.
@@ -66,96 +212,18 @@ pub(crate) struct SafetyClaim {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// New types: UnsafeVcKind, UnsafeVc
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Categorized kinds of unsafe verification conditions.
-///
-/// Each variant corresponds to a specific unsafe operation that requires
-/// verification. This is orthogonal to `VcKind` (which is solver-facing);
-/// `UnsafeVcKind` captures the *reason* the VC was generated from an unsafe
-/// context so reporters and audit tools can provide targeted guidance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-#[allow(dead_code)]
-pub(crate) enum UnsafeVcKind {
-    /// Raw pointer dereference: pointer must be non-null, aligned, and point
-    /// to a valid allocation with sufficient size.
-    RawPointerDeref {
-        /// Human-readable pointer expression (e.g., "`*ptr`").
-        pointer_expr: String,
-    },
-    /// `mem::transmute` or `mem::transmute_copy`: source and target layouts
-    /// must be compatible, and the bit pattern must satisfy the target type's
-    /// validity invariant.
-    Transmute { from_ty: String, to_ty: String },
-    /// Union field access: reading a union field reinterprets the bits, so
-    /// the active variant must match the accessed field.
-    UnionAccess { union_name: String, field_name: String },
-    /// FFI call: extern function has no Rust-side safety guarantees. Pre/post
-    /// conditions must be stated and verified.
-    FfiCall { callee: String },
-    /// Inline assembly: opaque to the compiler, safety cannot be inferred.
-    InlineAsm {
-        /// A diagnostic label for the asm block.
-        label: String,
-    },
-    /// Access to a mutable static variable: data races and aliasing are
-    /// the caller's responsibility.
-    MutableStaticAccess { static_name: String },
-}
-
-impl UnsafeVcKind {
-    /// Human-readable description for reports.
-    #[must_use]
-    #[allow(dead_code)]
-    pub(crate) fn description(&self) -> String {
-        match self {
-            Self::RawPointerDeref { pointer_expr } => {
-                format!("raw pointer dereference: {pointer_expr}")
-            }
-            Self::Transmute { from_ty, to_ty } => {
-                format!("transmute from {from_ty} to {to_ty}")
-            }
-            Self::UnionAccess { union_name, field_name } => {
-                format!("union field access: {union_name}.{field_name}")
-            }
-            Self::FfiCall { callee } => {
-                format!("FFI call to {callee}")
-            }
-            Self::InlineAsm { label } => {
-                format!("inline assembly: {label}")
-            }
-            Self::MutableStaticAccess { static_name } => {
-                format!("mutable static access: {static_name}")
-            }
-        }
-    }
-}
-
-/// A tagged unsafe verification condition, pairing the solver-facing VC with
-/// the unsafe-specific categorization.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct UnsafeVc {
-    /// The solver-facing verification condition.
-    pub(crate) vc: VerificationCondition,
-    /// The categorized unsafe operation that produced this VC.
-    pub(crate) unsafe_kind: UnsafeVcKind,
-}
-
-// ────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Top-level entry point: check a function for unsafe code and generate VCs.
 ///
-/// Called from `generate_vcs` in lib.rs. Detects unsafe blocks, attaches
+/// Called from `generate::entry`. Detects unsafe blocks, attaches
 /// safety comments (when available), and generates assertion VCs.
 pub(crate) fn check_unsafe(
     func: &VerifiableFunction,
     comments: &[(SourceSpan, String)],
-    box_deref_spans: &FxHashSet<SourceSpan>,
+    box_deref_ops: &FxHashSet<(BlockId, usize)>,
+    coverage: &UnsafeCoverage,
     vcs: &mut Vec<VerificationCondition>,
 ) {
     let mut blocks = detect_unsafe_blocks(func);
@@ -164,6 +232,6 @@ pub(crate) fn check_unsafe(
     }
 
     attach_safety_comments(&mut blocks, comments);
-    let safety_vcs = generate_safety_vcs(func, &blocks, box_deref_spans);
+    let safety_vcs = generate_safety_vcs(func, &blocks, box_deref_ops, coverage);
     vcs.extend(safety_vcs);
 }

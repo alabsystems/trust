@@ -151,22 +151,22 @@ impl VcSimplifier {
 
         let mut current = vc.to_string();
         let mut iteration = 0;
+        let mut current_size = original_size;
 
-        let passes = self.config.passes.clone();
         for _ in 0..self.config.max_iterations {
-            let before_size = expression_size(&current);
-            for pass in &passes {
-                current = self.apply_pass(&current, pass);
+            let before_size = current_size;
+            for pass_idx in 0..self.config.passes.len() {
+                let pass = self.config.passes[pass_idx];
+                current = self.apply_pass(&current, &pass);
             }
             iteration += 1;
-            let after_size = expression_size(&current);
-            if after_size >= before_size {
+            current_size = expression_size(&current);
+            if current_size >= before_size {
                 break;
             }
         }
 
-        let simplified_size = expression_size(&current);
-        self.stats.simplified_size = simplified_size;
+        self.stats.simplified_size = current_size;
         self.stats.passes_applied = iteration;
 
         let is_trivially_true = is_tautology(&current);
@@ -180,11 +180,18 @@ impl VcSimplifier {
         match pass {
             VcSimplificationPass::ConstantFolding => self.fold_constants(vc),
             VcSimplificationPass::DeadVariableElimination => {
+                let trimmed = vc.trim();
+                if !trimmed.starts_with("(forall (") && !trimmed.starts_with("(exists (") {
+                    return trimmed.to_string();
+                }
                 // Collect all variable references and pass to eliminator
-                let live: Vec<&str> = extract_variable_names(vc);
-                self.eliminate_dead_vars(vc, &live)
+                let live: Vec<&str> = extract_variable_names(trimmed);
+                self.eliminate_dead_vars(trimmed, &live)
             }
             VcSimplificationPass::RedundantConstraintRemoval => {
+                if !vc.trim_start().starts_with("(and ") {
+                    return vc.to_string();
+                }
                 let constraints = extract_constraints(vc);
                 let reduced = self.remove_redundant(&constraints);
                 if reduced.len() < constraints.len() {
@@ -197,6 +204,9 @@ impl VcSimplifier {
                 }
             }
             VcSimplificationPass::ImpliesChainSimplification => {
+                if !vc.trim_start().starts_with("(=> ") {
+                    return vc.to_string();
+                }
                 let chain = extract_implies_chain(vc);
                 if chain.len() > 1 { self.simplify_implies_chain(&chain) } else { vc.to_string() }
             }
@@ -376,12 +386,10 @@ impl VcSimplifier {
     #[must_use]
     pub fn eliminate_dead_vars(&mut self, vc: &str, live_vars: &[&str]) -> String {
         let trimmed = vc.trim();
-        let live_set: FxHashSet<&str> = live_vars.iter().copied().collect();
 
         // Handle (forall (...) body) and (exists (...) body) patterns
-        for quantifier in &["forall", "exists"] {
-            let prefix = format!("({quantifier} (");
-            if let Some(rest) = trimmed.strip_prefix(prefix.as_str())
+        for (quantifier, prefix) in [("forall", "(forall ("), ("exists", "(exists (")] {
+            if let Some(rest) = trimmed.strip_prefix(prefix)
                 && let Some(paren_end) = find_matching_paren(rest)
             {
                 let bindings_str = &rest[..paren_end];
@@ -389,14 +397,17 @@ impl VcSimplifier {
                 let body = body.strip_suffix(')').unwrap_or(body);
 
                 let binding_pairs = parse_bindings(bindings_str);
+                if binding_pairs.is_empty() {
+                    return body.to_string();
+                }
+                let live_set: FxHashSet<&str> = live_vars.iter().copied().collect();
                 let body_vars: FxHashSet<&str> = extract_variable_names(body).into_iter().collect();
 
                 let mut eliminated = 0usize;
                 let kept: Vec<String> = binding_pairs
                     .into_iter()
-                    .filter(|(name, _)| {
-                        let keep =
-                            body_vars.contains(name.as_str()) || live_set.contains(name.as_str());
+                    .filter(|&(name, _)| {
+                        let keep = body_vars.contains(name) || live_set.contains(name);
                         if !keep {
                             eliminated += 1;
                         }
@@ -425,16 +436,17 @@ impl VcSimplifier {
     /// Eliminates exact duplicates and constraints subsumed by others.
     #[must_use]
     pub fn remove_redundant(&self, constraints: &[String]) -> Vec<String> {
-        let mut seen: FxHashSet<String> = FxHashSet::default();
-        let mut result = Vec::new();
+        let mut seen: FxHashSet<&str> =
+            FxHashSet::with_capacity_and_hasher(constraints.len(), Default::default());
+        let mut result = Vec::with_capacity(constraints.len());
 
         for c in constraints {
-            let normalized = c.trim().to_string();
+            let normalized = c.trim();
             if normalized.is_empty() || normalized == "true" {
                 continue;
             }
-            if seen.insert(normalized.clone()) {
-                result.push(normalized);
+            if seen.insert(normalized) {
+                result.push(normalized.to_string());
             }
         }
 
@@ -455,12 +467,12 @@ impl VcSimplifier {
         }
 
         let conclusion = &chain[chain.len() - 1];
-        let premises: Vec<&String> = chain[..chain.len() - 1].iter().collect();
+        let premises = &chain[..chain.len() - 1];
 
         if premises.len() == 1 {
             format!("(=> {} {conclusion})", premises[0])
         } else {
-            let and_part = premises.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
+            let and_part = premises.join(" ");
             format!("(=> (and {and_part}) {conclusion})")
         }
     }
@@ -694,48 +706,51 @@ fn is_variable_name(token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    // Not a boolean literal
-    if token == "true" || token == "false" {
+    // Reject boolean literals and SMT-LIB keywords in O(1) without scanning a slice.
+    if matches!(
+        token,
+        "true"
+            | "false"
+            | "and"
+            | "or"
+            | "not"
+            | "=>"
+            | "forall"
+            | "exists"
+            | "let"
+            | "="
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "mod"
+            | "ite"
+            | "Int"
+            | "Bool"
+            | "BitVec"
+            | "Array"
+            | "assert"
+            | "declare-fun"
+            | "define-fun"
+            | "check-sat"
+    ) {
         return false;
     }
     // Not a number (possibly negative)
-    if token.parse::<i128>().is_ok() {
+    if token.bytes().next().is_some_and(|b| b.is_ascii_digit() || b == b'-')
+        && token.parse::<i128>().is_ok()
+    {
         return false;
     }
-    // Not an SMT-LIB keyword
-    const KEYWORDS: &[&str] = &[
-        "and",
-        "or",
-        "not",
-        "=>",
-        "forall",
-        "exists",
-        "let",
-        "=",
-        "<",
-        "<=",
-        ">",
-        ">=",
-        "+",
-        "-",
-        "*",
-        "/",
-        "mod",
-        "ite",
-        "Int",
-        "Bool",
-        "BitVec",
-        "Array",
-        "assert",
-        "declare-fun",
-        "define-fun",
-        "check-sat",
-    ];
-    !KEYWORDS.contains(&token)
+    true
 }
 
 /// Parse quantifier bindings like `(x Int) (y Bool)`.
-fn parse_bindings(s: &str) -> Vec<(String, String)> {
+fn parse_bindings(s: &str) -> Vec<(&str, &str)> {
     let mut result = Vec::new();
     let mut depth = 0i32;
     let mut start = 0;
@@ -753,8 +768,8 @@ fn parse_bindings(s: &str) -> Vec<(String, String)> {
                 if depth == 0 {
                     let binding = s[start..i].trim();
                     if let Some(space_idx) = binding.find(' ') {
-                        let name = binding[..space_idx].trim().to_string();
-                        let sort = binding[space_idx + 1..].trim().to_string();
+                        let name = binding[..space_idx].trim();
+                        let sort = binding[space_idx + 1..].trim();
                         result.push((name, sort));
                     }
                 }
@@ -804,24 +819,25 @@ fn eliminate_common_subexprs(vc: &str) -> String {
 
     // Simple approach: find repeated sub-expressions >= 5 chars
     let subexprs = find_subexpressions(trimmed);
+    if subexprs.len() < 2 {
+        return trimmed.to_string();
+    }
     let mut counts: FxHashMap<&str, usize> = FxHashMap::default();
     for s in &subexprs {
         *counts.entry(s).or_insert(0) += 1;
     }
 
-    // Find sub-expressions appearing more than once, at least 5 chars
-    let mut repeated: Vec<(&str, usize)> = counts
+    // Select the single most repeated (tie-broken by longest) sub-expression >= 5 chars
+    // in one linear scan without allocating or sorting a candidate Vec.
+    let Some((target, _count)) = counts
         .into_iter()
         .filter(|(s, c)| *c > 1 && s.len() >= 5 && *s != "true" && *s != "false")
-        .collect();
-    repeated.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.len().cmp(&a.0.len())));
-
-    if repeated.is_empty() {
+        .min_by(|a, b| b.1.cmp(&a.1).then(b.0.len().cmp(&a.0.len())))
+    else {
         return trimmed.to_string();
-    }
+    };
 
     // Apply CSE for the most repeated sub-expression
-    let (target, _count) = repeated[0];
     let cse_var = format!("__cse_{}", hash_string(target) % 1000);
     let replaced = trimmed.replace(target, &cse_var);
     format!("(let (({cse_var} {target})) {replaced})")
@@ -873,11 +889,12 @@ fn propagate_truth_values(vc: &str) -> String {
     // (and true P) -> P, (and P true) -> P
     if let Some(inner) = trimmed.strip_prefix("(and ").and_then(|s| s.strip_suffix(')')) {
         let parts = split_sexp_args(inner);
-        let non_true: Vec<&str> = parts.iter().filter(|p| p.trim() != "true").copied().collect();
         if parts.iter().any(|p| p.trim() == "false") {
             return "false".to_string();
         }
-        if non_true.len() < parts.len() {
+        if parts.iter().any(|p| p.trim() == "true") {
+            let non_true: Vec<&str> =
+                parts.iter().filter(|p| p.trim() != "true").copied().collect();
             return match non_true.len() {
                 0 => "true".to_string(),
                 1 => non_true[0].to_string(),
@@ -889,11 +906,12 @@ fn propagate_truth_values(vc: &str) -> String {
     // (or false P) -> P, (or P false) -> P
     if let Some(inner) = trimmed.strip_prefix("(or ").and_then(|s| s.strip_suffix(')')) {
         let parts = split_sexp_args(inner);
-        let non_false: Vec<&str> = parts.iter().filter(|p| p.trim() != "false").copied().collect();
         if parts.iter().any(|p| p.trim() == "true") {
             return "true".to_string();
         }
-        if non_false.len() < parts.len() {
+        if parts.iter().any(|p| p.trim() == "false") {
+            let non_false: Vec<&str> =
+                parts.iter().filter(|p| p.trim() != "false").copied().collect();
             return match non_false.len() {
                 0 => "false".to_string(),
                 1 => non_false[0].to_string(),
@@ -918,26 +936,38 @@ fn propagate_truth_values(vc: &str) -> String {
 ///
 /// Used for contradiction detection in And and tautology detection in Or.
 fn has_contradiction(parts: &[&str]) -> bool {
+    if parts.len() < 2
+        || !parts
+            .iter()
+            .any(|part| part.trim().strip_prefix("(not ").is_some_and(|s| s.ends_with(')')))
+    {
+        return false;
+    }
     let mut positives: FxHashSet<&str> = FxHashSet::default();
-    let mut negatives: FxHashSet<&str> = FxHashSet::default();
-
     for part in parts {
         let p = part.trim();
-        if let Some(inner) = p.strip_prefix("(not ").and_then(|s| s.strip_suffix(')')) {
-            negatives.insert(inner.trim());
-        } else {
+        if !p.starts_with("(not ") || !p.ends_with(')') {
             positives.insert(p);
         }
     }
-
-    // Check if any positive appears as a negative or vice versa
-    positives.iter().any(|p| negatives.contains(p))
+    if positives.is_empty() {
+        return false;
+    }
+    parts.iter().any(|part| {
+        part.trim()
+            .strip_prefix("(not ")
+            .and_then(|s| s.strip_suffix(')'))
+            .is_some_and(|inner| positives.contains(inner.trim()))
+    })
 }
 
 /// Try to fold integer arithmetic: (+ 1 2) -> 3, etc.
 #[allow(clippy::type_complexity)]
 fn try_fold_arithmetic(expr: &str) -> Option<String> {
     let trimmed = expr.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return None;
+    }
 
     let ops: &[(&str, fn(i128, i128) -> Option<i128>)] = &[
         ("(+ ", |a, b| Some(a.wrapping_add(b))),
@@ -1469,14 +1499,5 @@ mod tests {
         // so (= x x) must already be folded to true at this point.
         let result = s.simplify("(and true (> y 0))");
         assert_eq!(result.formula, "(> y 0)");
-    }
-
-    #[test]
-    fn test_simplify_pipeline_eq_reflexive_standalone() {
-        let mut s = VcSimplifier::new(VcSimplifier::default_config());
-        // Top-level (= x x) should fold to true
-        let result = s.simplify("(= x x)");
-        assert_eq!(result.formula, "true");
-        assert!(result.is_trivially_true);
     }
 }

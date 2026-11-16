@@ -87,6 +87,8 @@ pub fn on_all_children_bits<'tcx, F>(
     on_all_children_bits(move_data, move_path_index, &mut each_child);
 }
 
+/// Calls `callback` for each child move path of the function's arguments. Note the move paths'
+/// `DropFlagState` argument to the callback will always be `DropFlagState::Present`.
 pub fn drop_flag_effects_for_function_entry<'tcx, F>(
     body: &Body<'tcx>,
     move_data: &MoveData<'tcx>,
@@ -95,11 +97,9 @@ pub fn drop_flag_effects_for_function_entry<'tcx, F>(
     F: FnMut(MovePathIndex, DropFlagState),
 {
     for arg in body.args_iter() {
-        let place = mir::Place::from(arg);
-        let lookup_result = move_data.rev_lookup.find(place.as_ref());
-        on_lookup_result_bits(move_data, lookup_result, |mpi| {
-            callback(mpi, DropFlagState::Present)
-        });
+        if let Some(mpi) = move_data.rev_lookup.find_local(arg) {
+            on_all_children_bits(move_data, mpi, |mpi| callback(mpi, DropFlagState::Present));
+        }
     }
 }
 
@@ -114,7 +114,7 @@ pub fn drop_flag_effects_for_location<'tcx, F>(
     debug!("drop_flag_effects_for_location({:?})", loc);
 
     // first, move out of the RHS
-    for mi in &move_data.loc_map[loc] {
+    for mi in &move_data.move_out_loc_map[loc] {
         let path = mi.move_path_index(move_data);
         debug!("moving out of path {:?}", move_data.move_paths[path]);
 

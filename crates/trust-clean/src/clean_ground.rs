@@ -23,10 +23,15 @@
 use clean_kernel::{
     BinderData, BinderInfo, Declaration, Environment, Expr, Level, LevelVec, Name, TypeChecker,
 };
+use trust_spec_elab::{AdtSchema, ConstructorSchema, RegisteredAdt};
 use trust_types::{Formula, VerifiableFunction};
 
 use crate::kernel_check::ProofTerm;
 use crate::reflect;
+
+#[cfg(test)]
+#[path = "clean_ground_registered_tests.rs"]
+mod registered_tests;
 
 /// Verdict of grounding a reflected contract in the real Clean kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -680,6 +685,65 @@ impl AdtRegistry {
     #[must_use]
     pub fn get(&self, inductive_name: &str) -> Option<&reflect::AdtCarrier> {
         self.by_name.get(inductive_name)
+    }
+
+    /// Transport an exact, closed instance of a registered carrier to contract
+    /// elaboration. Recheck the stored schema and axiom gate in the supplied
+    /// environment; a registry from another environment is not authority here.
+    ///
+    /// The arguments are actual kernel types, in parameter order. No generic
+    /// argument, Rust representation invariant, or source/body correspondence is
+    /// inferred. In particular, this does not promote a reflected declaration to
+    /// a kernel-checked Rust implementation.
+    pub fn registered_carrier(
+        &self,
+        env: &Environment,
+        inductive_name: &Name,
+        arguments: &[Expr],
+    ) -> Result<RegisteredAdt, String> {
+        // The legacy registry is string-keyed. Display is only a lookup hint:
+        // structurally different Names can print alike (e.g. a dotted segment).
+        let carrier = self
+            .by_name
+            .get(&inductive_name.to_string())
+            .filter(|carrier| Name::from_string(&carrier.name) == *inductive_name)
+            .ok_or_else(|| {
+                format!(
+                    "ADT `{inductive_name}` has no matching registered carrier; register \
+                     its exact reflected schema first, or use the registered structural Name"
+                )
+            })?;
+        let schema = adt_expected_kernel_schema(carrier).ok_or_else(|| {
+            format!(
+                "ADT `{inductive_name}` has a field without a kernel type; implement the \
+                 field's carrier decoding before using this ADT in a contract"
+            )
+        })?;
+        let registered = RegisteredAdt::validate(env, &schema, arguments)?;
+        if adt_passes_axiom_gate(env, carrier).is_none() {
+            return Err(format!(
+                "ADT `{inductive_name}` no longer passes its inductive/recursor axiom gate; \
+                 register the schema and its axiom-policy-clean dependency closure in this \
+                 environment before elaborating the contract"
+            ));
+        }
+        Ok(registered)
+    }
+
+    fn insert_checked(&mut self, env: &Environment, carrier: &reflect::AdtCarrier) {
+        let Some(checked) = adt_passes_axiom_gate(env, carrier) else {
+            return;
+        };
+        self.by_name.insert(carrier.name.clone(), checked);
+        // Closed carriers have their actual complete argument list here. Run
+        // the same typed transport gate used by contracts on this production
+        // registration path. Parameterized families stay uninstantiated until
+        // a caller supplies real closed arguments to `registered_carrier`.
+        if carrier.type_params.is_empty()
+            && self.registered_carrier(env, &Name::from_string(&carrier.name), &[]).is_err()
+        {
+            self.by_name.remove(&carrier.name);
+        }
     }
 
     /// Whether any struct inductive registered successfully.
@@ -1495,9 +1559,7 @@ pub fn register_adt_carriers(
             // checks the axiom closure, not that THIS carrier's field
             // layout/arity matches the ALREADY-DECLARED inductive.
             if adt_matches_declared_shape(env, carrier) {
-                if let Some(c) = adt_passes_axiom_gate(env, carrier) {
-                    registry.by_name.insert(carrier.name.clone(), c);
-                }
+                registry.insert_checked(env, carrier);
             }
             continue;
         }
@@ -1514,27 +1576,21 @@ pub fn register_adt_carriers(
         // on any non-decodable field. [`adt_expected_kernel_ctors`] is the SAME
         // construction [`adt_matches_declared_shape`] uses to structurally compare
         // an already-declared inductive against a colliding carrier.
-        let k = carrier.type_params.len() as u32;
-        let Some(expected_ctors) = adt_expected_kernel_ctors(carrier) else {
+        let Some(schema) = adt_expected_kernel_schema(carrier) else {
             continue; // a non-decodable field — fall back to Prod.
         };
-        let kernel_ctors: Vec<Constructor> =
-            expected_ctors.into_iter().map(|(name, type_)| Constructor { name, type_ }).collect();
-
-        // Inductive type `Type → … → Type` (one arrow per type parameter; `Type`
-        // for a non-generic struct/enum).
-        let bd = || BinderData::from(BinderInfo::Default);
-        let mut ind_type = Expr::type_();
-        for _ in 0..k {
-            ind_type = Expr::pi(bd(), Expr::type_(), ind_type);
-        }
+        let kernel_ctors: Vec<Constructor> = schema
+            .constructors
+            .into_iter()
+            .map(|ctor| Constructor { name: ctor.name, type_: ctor.type_ })
+            .collect();
 
         let decl = InductiveDecl {
             level_params: vec![],
-            num_params: k,
+            num_params: schema.num_params,
             types: vec![InductiveType {
-                name: Name::from_string(&carrier.name),
-                type_: ind_type,
+                name: schema.name,
+                type_: schema.type_,
                 constructors: kernel_ctors,
             }],
         };
@@ -1557,9 +1613,7 @@ pub fn register_adt_carriers(
             }
         }
 
-        if let Some(c) = adt_passes_axiom_gate(env, carrier) {
-            registry.by_name.insert(carrier.name.clone(), c);
-        }
+        registry.insert_checked(env, carrier);
         // If the gate fails the inductive STAYS in the env (we cannot cheaply
         // remove it), but it is ABSENT from the registry — so grounding never
         // resolves a field against it and never relies on an unsound inductive.
@@ -1585,10 +1639,19 @@ pub fn register_adt_carriers(
 /// doc), not just "some inductive under this name exists" — the axiom gate
 /// alone only checks the axiom closure, never the shape.
 fn adt_matches_declared_shape(env: &Environment, carrier: &reflect::AdtCarrier) -> bool {
-    let Some(info) = env.inductive_info(&Name::from_string(&carrier.name)) else {
+    let Some(schema) = adt_expected_kernel_schema(carrier) else {
         return false;
     };
-    if info.num_params != carrier.type_params.len() as u32 {
+    let Some(info) = env.get_inductive(&schema.name) else {
+        return false;
+    };
+    if info.name != schema.name
+        || !info.level_params.is_empty()
+        || info.type_ != schema.type_
+        || info.num_params != schema.num_params
+        || info.num_indices != 0
+        || info.all_names.as_slice() != std::slice::from_ref(&schema.name)
+    {
         return false;
     }
     // PRECISE structural check: build the constructor `(name, type)` pairs
@@ -1601,15 +1664,38 @@ fn adt_matches_declared_shape(env: &Environment, carrier: &reflect::AdtCarrier) 
     // sole field is `Int`, another's is `Bool` — `probe_wrong_carrier_
     // datatype_mismatch_is_kernel_rejected`'s exact construction), which a
     // count-only check would miss.
-    let Some(expected_ctors) = adt_expected_kernel_ctors(carrier) else {
-        return false;
-    };
-    if info.constructor_names.len() != expected_ctors.len() {
+    if info.constructor_names.len() != schema.constructors.len() {
         return false;
     }
-    expected_ctors.iter().all(|(name, expected_ty)| {
-        env.get_constructor(name).is_some_and(|declared| &declared.type_ == expected_ty)
+    schema.constructors.iter().enumerate().all(|(index, expected)| {
+        // Order is semantic: recursor minors and reflected enum variant indices
+        // refer to declaration order, not a set of constructor names/types.
+        info.constructor_names[index] == expected.name
+            && env.get_constructor(&expected.name).is_some_and(|declared| {
+                declared.name == expected.name
+                    && declared.inductive_name == schema.name
+                    && declared.constructor_idx as usize == index
+                    && declared.num_params == schema.num_params
+                    && declared.level_params.is_empty()
+                    && declared.type_ == expected.type_
+            })
     })
+}
+
+/// The same schema feeds fresh registration, cached-shape comparison, and the
+/// exact contract-carrier adapter. Field decoding is shared with the existing
+/// reflection pipeline; it is not a new model of the Rust representation.
+fn adt_expected_kernel_schema(carrier: &reflect::AdtCarrier) -> Option<AdtSchema> {
+    let num_params = u32::try_from(carrier.type_params.len()).ok()?;
+    let constructors = adt_expected_kernel_ctors(carrier)?
+        .into_iter()
+        .map(|(name, type_)| ConstructorSchema { name, type_ })
+        .collect();
+    let mut type_ = Expr::type_();
+    for _ in 0..num_params {
+        type_ = Expr::pi(BinderData::from(BinderInfo::Default), Expr::type_(), type_);
+    }
+    Some(AdtSchema { name: Name::from_string(&carrier.name), type_, num_params, constructors })
 }
 
 /// Build the expected kernel constructor `(name, type)` pairs for `carrier` —
@@ -1627,6 +1713,7 @@ fn adt_matches_declared_shape(env: &Environment, carrier: &reflect::AdtCarrier) 
 /// three distinct causes look identical from outside. This runs the same steps on a
 /// FRESH environment and names the one that stopped it. Diagnostic only: it registers
 /// into its own `env` and returns a string.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn why_carrier_failed_to_register_with(
     ty: &trust_types::Ty,
@@ -1695,17 +1782,6 @@ pub(crate) fn why_carrier_failed_to_register_with(
         Some(_) => "the RECURSOR carries axiom residue beyond the 3",
         None => "the recursor has no axiom_deps entry",
     }
-}
-
-/// Trust: DIAGNOSTIC (2026-08-25) — expose [`adt_expected_kernel_ctors`] so a caller can
-/// distinguish the two ways registration fails: a field that does not decode to a kernel
-/// type (this returns `None`) versus a declaration the kernel rejects. Registration
-/// itself is a silent `continue`, so without this the two are indistinguishable.
-#[must_use]
-pub(crate) fn adt_expected_kernel_ctors_for_test(
-    carrier: &reflect::AdtCarrier,
-) -> Option<Vec<(Name, Expr)>> {
-    adt_expected_kernel_ctors(carrier)
 }
 
 fn adt_expected_kernel_ctors(carrier: &reflect::AdtCarrier) -> Option<Vec<(Name, Expr)>> {
@@ -3695,19 +3771,20 @@ fn local_has_only_guarded_writes(
     local: usize,
     expected_assignments: usize,
 ) -> bool {
-    use trust_types::{Rvalue, Statement, Terminator};
+    use trust_types::{Statement, Terminator};
 
     let mut assignments = 0usize;
     for statement in body.blocks.iter().flat_map(|block| &block.stmts) {
         match statement {
-            Statement::Assign { place, rvalue, .. } => {
+            Statement::Assign { place, .. } => {
                 // Check the alias source independently of the assignment
                 // destination.  A malformed self-destination must not hide the
-                // fact that this very statement exposes a mutable write path.
-                if matches!(rvalue,
-                    Rvalue::Ref { mutable: true, place }
-                        | Rvalue::AddressOf(true, place)
-                        if place.local == local)
+                // fact that this very statement exposes a mutable write path. A
+                // `&raw const` is one (INT-RAWCONST-HAVOC-1).
+                if trust_vcgen::place_write::write_capable_borrow(body, statement, |place| {
+                    place.local == local
+                })
+                .is_some()
                 {
                     return false;
                 }
@@ -5007,19 +5084,22 @@ fn iter_param_field(
 /// [`crate::mirsem::param_reassigned_by_stmt`], which flags EVERY rooted write
 /// (including the legitimate write-back) and so would reject the real body.
 fn iter_param_pointer_stable(body: &trust_types::VerifiableBody, param: usize) -> bool {
-    use trust_types::{Rvalue, Statement, Terminator};
+    use trust_types::{Statement, Terminator};
     for statement in body.blocks.iter().flat_map(|block| &block.stmts) {
         match statement {
-            Statement::Assign { place, rvalue, .. } => {
+            Statement::Assign { place, .. } => {
                 if place.local == param && place.projections.is_empty() {
                     return false; // whole-pointer reassignment
                 }
-                if matches!(rvalue,
-                    Rvalue::Ref { mutable: true, place: aliased }
-                        | Rvalue::AddressOf(true, aliased)
-                    if aliased.local == param)
+                // Mutable or raw alias (any projection; `&raw const` too,
+                // INT-RAWCONST-HAVOC-1 — a `&raw const (*self).ptr` cast to `*mut`
+                // writes the cursor through a `&mut Iter` under Tree Borrows).
+                if trust_vcgen::place_write::write_capable_borrow(body, statement, |aliased| {
+                    aliased.local == param
+                })
+                .is_some()
                 {
-                    return false; // mutable alias (any projection)
+                    return false;
                 }
             }
             Statement::SetDiscriminant { place, .. }
@@ -5907,17 +5987,15 @@ fn live_zero_assign_block_count(
         .count()
 }
 
-/// Whether any LIVE block takes a MUTABLE reference / `&raw mut` of `_0` (a clobber
-/// channel for the return local outside the two recognized arm assignments).
+/// Whether any LIVE block takes a MUTABLE reference / `&raw mut` / `&raw const` of `_0`
+/// (a clobber channel for the return local outside the two recognized arm
+/// assignments; `&raw const` since INT-RAWCONST-HAVOC-1).
 fn live_zero_mutably_aliased(
     body: &trust_types::VerifiableBody,
     live: &std::collections::HashSet<trust_types::BlockId>,
 ) -> bool {
-    use trust_types::{Rvalue, Statement};
     body.blocks.iter().filter(|b| live.contains(&b.id)).flat_map(|b| &b.stmts).any(|s| {
-        matches!(s, Statement::Assign { rvalue, .. } if matches!(rvalue,
-            Rvalue::Ref { mutable: true, place } | Rvalue::AddressOf(true, place)
-            if place.local == 0))
+        trust_vcgen::place_write::write_capable_borrow(body, s, |place| place.local == 0).is_some()
     })
 }
 
@@ -7134,6 +7212,7 @@ pub(crate) fn sem_iter_next_step_shape_of(
 ///
 /// F-STRTYPE: the explicit `&[`/non-`str` element decline — a `str`-family stride pointee (the
 /// D6 `&str`→u8 conflation hole, prove.rs:4096) may not reach the two-key claim.
+#[cfg(test)]
 pub(crate) fn sem_iter_step_shape_of(
     func: &trust_types::VerifiableFunction,
 ) -> Option<crate::mirsem::SemIterStep> {
@@ -7274,6 +7353,7 @@ pub(crate) fn sem_iter_step_shape_of(
 ///     the SOLE faithfulness bearer of the thin tier (the union is BYTE-IDENTICAL to a
 ///     struct in every other gate). A pre-migration dump lacking the field is `None`
 ///     and declines rather than optimistically minting.
+#[cfg(test)]
 pub(crate) fn sem_field_set_shape_of(
     func: &trust_types::VerifiableFunction,
 ) -> Option<crate::mirsem::SemFieldSet> {
@@ -7529,6 +7609,7 @@ pub(crate) fn sem_field_set_shape_of(
 ///     `Some(Enum)`, and `None` (un-migrated / unknown) ALL decline. LOAD-BEARING for
 ///     exactly inc-1's reason: a union's fields overlap at byte offset 0, so the total
 ///     `∀k` field-independence frame is OPERATIONALLY FALSE.
+#[cfg(test)]
 pub(crate) fn sem_field_rmw_shape_of(
     func: &trust_types::VerifiableFunction,
 ) -> Option<crate::mirsem::SemFieldRmw> {
@@ -8147,7 +8228,8 @@ pub(crate) fn iter_dist_init_try_inner_decline_reason_without_d2(
     into_iter_dump_digest: u64,
     loop_elem: &trust_types::Ty,
 ) -> Option<&'static str> {
-    iter_dist_init_try_inner(into_iter_body, def_path, into_iter_dump_digest, loop_elem, false).err()
+    iter_dist_init_try_inner(into_iter_body, def_path, into_iter_dump_digest, loop_elem, false)
+        .err()
 }
 
 /// The DIST-INIT instance with the D2 record-lane conjunct SKIPPED — test-only scaffold
@@ -8603,6 +8685,7 @@ fn ty_definitely_non_zst(ty: &trust_types::Ty) -> bool {
 /// predicate and DECLINES fail-closed; the handle is non-composable by MECHANISM,
 /// not by the opaque's honesty tier. Lift only when a post-state/primed surface
 /// re-keys the handle (`iter_region(recv, generation)`).
+#[cfg(test)]
 #[must_use]
 pub(crate) fn sem_adt_return_carries_entry_iter_handle(r: &crate::mirsem::SemAdtReturn) -> bool {
     use crate::mirsem::{SemAdtPayload, SemCondTree, SemOperand};
@@ -10734,7 +10817,9 @@ pub fn inhabit_verifiable_function(func: &VerifiableFunction) -> InhabitOutcome 
         let kept_pre: Vec<Formula> = if pre_domain.is_some() {
             func.preconditions
                 .iter()
-                .filter(|p| p.free_variables().iter().all(|v| param_bvar.contains_key(v)))
+                .filter(|p| {
+                    trust_types::all_free_variable_names(p, &mut |v| param_bvar.contains_key(v))
+                })
                 .cloned()
                 .collect()
         } else {
@@ -10883,6 +10968,7 @@ mod tests {
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
             },
         };
         let ret = BasicBlock {
@@ -10925,6 +11011,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -11075,6 +11162,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert!(extract_bool_literal_return(&function).is_none());
         function.body.blocks[0].stmts.swap(0, 1);
@@ -11108,11 +11196,15 @@ mod tests {
         let ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Wrapper".into(),
-            fields: vec![("value".into(), Ty::Int { width: 32, signed: true })],
+            fields: vec![("value".into(), Ty::Int { width: 32, signed: true })].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let carrier =
             reflect_struct(&ty).expect("non-generic struct reflects to a named inductive");
         assert_eq!(carrier.name, "Trust.Adt.Wrapper");
@@ -11208,20 +11300,25 @@ mod tests {
         let point = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Point".into(),
             fields: vec![
                 ("x".into(), Ty::Int { width: 32, signed: false }),
                 ("y".into(), Ty::Int { width: 32, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let pc = reflect_struct(&point).expect("Point reflects");
         // Parameterized `Wrapper<T> { value:T, count:u32 }`.
         let wrapper = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Wrapper".into(),
             fields: vec![
                 (
@@ -11232,9 +11329,14 @@ mod tests {
                     },
                 ),
                 ("count".into(), Ty::Int { width: 32, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let wc = reflect_struct(&wrapper).expect("Wrapper<T> reflects parameterized");
 
         let mut env = Environment::with_prelude();
@@ -11263,14 +11365,19 @@ mod tests {
         let ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Mixed".into(),
             fields: vec![
                 ("ok".into(), Ty::Int { width: 32, signed: true }),
                 ("bad".into(), Ty::Never),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         assert_eq!(reflect_struct(&ty), None, "a never field must not register structurally");
     }
 
@@ -11284,14 +11391,19 @@ mod tests {
         let ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "WithFloat".into(),
             fields: vec![
                 ("count".into(), Ty::Int { width: 32, signed: true }),
                 ("weight".into(), Ty::Float { width: 32 }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let carrier =
             reflect_struct(&ty).expect("a struct with a float field now reflects structurally");
         let mut env = Environment::with_prelude();
@@ -11762,6 +11874,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         // A `!`-typed local (bare) and a `&!` local both reach the never type.
         let diverges = func_with_locals(vec![
@@ -11915,7 +12028,7 @@ mod tests {
         let ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Holder".into(),
             fields: vec![(
                 "item".into(),
@@ -11923,9 +12036,14 @@ mod tests {
                     kind: crate::reflect::PARAM_KIND.into(),
                     detail: "generic parameter T/#0 needs monomorphization".into(),
                 },
-            )],
+            )]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let carrier =
             reflect_struct(&ty).expect("a bare-generic-field struct now reflects parameterized");
         assert_eq!(carrier.type_params, vec!["T/#0".to_string()]);
@@ -12333,6 +12451,7 @@ mod tests {
                 Box::new(Formula::Var("x".into(), trust_types::Sort::Int)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         assert_eq!(
@@ -12442,6 +12561,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -12593,6 +12713,7 @@ mod tests {
             preconditions,
             postconditions,
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -12727,6 +12848,7 @@ mod tests {
             preconditions,
             postconditions,
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -12963,6 +13085,7 @@ mod tests {
                 Box::new(Formula::Var("a".into(), trust_types::Sort::Int)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert_eq!(inhabit_verifiable_function(&func), InhabitOutcome::Inhabited);
     }
@@ -13009,6 +13132,7 @@ mod tests {
                 Formula::Le(Box::new(rv()), Box::new(xv())),
             ],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert_eq!(inhabit_verifiable_function(&func), InhabitOutcome::Inhabited);
     }
@@ -13058,6 +13182,7 @@ mod tests {
                 Box::new(Formula::Var("x".into(), trust_types::Sort::Int)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert_eq!(inhabit_verifiable_function(&func), InhabitOutcome::Inhabited);
     }
@@ -13079,11 +13204,15 @@ mod tests {
         let unit_struct = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Empty".into(),
-            fields: vec![],
+            fields: vec![].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let h_param = Ty::Unsupported {
             kind: "TyKind::Param".into(),
             detail: "generic parameter H/#0 needs monomorphization".into(),
@@ -13119,6 +13248,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         // The contract reflects (does not fail closed on the generic param) ...
         let contract = crate::reflect::reflect_verifiable_function(&func)
@@ -13186,6 +13316,7 @@ mod tests {
                 )),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let outcome = inhabit_verifiable_function(&func);
         assert_ne!(
@@ -13244,6 +13375,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         // The contract reflects with the dyn bound at the CLOSED existential — the
         // FIRST binder is the value param `w` at `Trust.Dyn.<trait>`, NOT a `Π(D:Type)`.
@@ -13338,17 +13470,18 @@ mod tests {
             "a `dyn Trait` type grounds to a real closed Type, got {inferred:?}"
         );
 
-        // Build the `clean axioms` instrument's KernelContext from the env's axioms and
-        // confirm the dyn type's transitive axiom closure has NO `Trust.Dyn` axiom and
-        // rests on at most the 3 foundational axioms.
+        // Build the `clean axioms` instrument's KernelContext and confirm the dyn type's
+        // transitive axiom closure has NO `Trust.Dyn` axiom and rests on at most the 3
+        // foundational axioms. The 3 are the kernel's own and are NOT seeded: a
+        // KernelContext refuses every kernel-owned name (2026-09-28), and an undeclared
+        // reference to one already resolves to the kernel's axiom.
         let mut ctx = KernelContext::new();
-        for ax in ["propext", "Quot.sound", "Classical.choice"] {
-            ctx.add_axiom(ax, ProofTerm::Sort(0)).expect("seed foundational axiom");
-        }
         // Register the existential + vtable as resolved definitions so the closure walk
         // sees them as non-axiom constants (mirroring the kernel's own axiom_deps = ∅).
         for name in [carrier.name.as_str(), carrier.vtable_name.as_str()] {
-            ctx.add_definition(name, ProofTerm::Sort(1), ProofTerm::Sort(1))
+            // A well-typed placeholder (`Sort 0 : Sort 1`): a context refuses an
+            // ill-typed definition (2026-09-29).
+            ctx.add_definition(name, ProofTerm::Sort(1), ProofTerm::Sort(0))
                 .expect("seed registered definition");
         }
         let report = axiom_closure(&dyn_ty, &ctx);
@@ -13379,16 +13512,23 @@ mod tests {
         let result_ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "core::result::Result".into(),
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 8, signed: false }),
                 ("ok".into(), Ty::Unit),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
-        let formatter = Ty::Adt { adt_kind: None, layout: None,
-            variants: Vec::new(),
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
+        let formatter = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
             name: "core::fmt::Formatter".into(),
             fields: vec![(
                 "inner".into(),
@@ -13399,15 +13539,26 @@ mod tests {
                         principal_key: Some("core::fmt::Write".into()),
                     }),
                 },
-            )],
+            )]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
-        let self_struct = Ty::Adt { adt_kind: None, layout: None,
-            variants: Vec::new(),
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
+        let self_struct = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
             name: "MyType".into(),
-            fields: vec![],
+            fields: vec![].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let func = VerifiableFunction {
             name: "fmt".into(),
             def_path: "crate::MyType::fmt".into(),
@@ -13439,6 +13590,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert_eq!(
             inhabit_verifiable_function(&func),
@@ -13481,10 +13633,14 @@ mod tests {
             adt_kind: None,
             layout: None,
             name: "demo::Holder".into(),
-            fields: vec![("memo".into(), tree_full), ("r".into(), tree_backref)],
-            variants: Vec::new(),
+            fields: vec![("memo".into(), tree_full), ("r".into(), tree_backref)].into(),
+            variants: Vec::new().into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let func = VerifiableFunction {
             name: "should_descend".into(),
             def_path: "crate::Holder::should_descend".into(),
@@ -13511,6 +13667,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert_eq!(
             inhabit_verifiable_function(&func),
@@ -13547,6 +13704,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let outcome = inhabit_verifiable_function(&func);
         assert_ne!(
@@ -13601,6 +13759,7 @@ mod tests {
                 )),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let outcome = inhabit_verifiable_function(&func);
         assert_ne!(
@@ -13659,6 +13818,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let outcome = inhabit_verifiable_function(&func);
         assert_ne!(
@@ -13712,6 +13872,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let outcome = inhabit_verifiable_function(&func);
         assert_ne!(
@@ -14012,6 +14173,7 @@ mod tests {
                 )),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let outcome = inhabit_verifiable_function(&func);
         assert_ne!(
@@ -14036,7 +14198,7 @@ mod tests {
         let formatter = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "core::fmt::Formatter".into(),
             fields: vec![(
                 "inner".into(),
@@ -14047,9 +14209,14 @@ mod tests {
                         principal_key: Some("Write".into()),
                     }),
                 },
-            )],
+            )]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let func = VerifiableFunction {
             name: "f".into(),
             def_path: "crate::f".into(),
@@ -14078,6 +14245,7 @@ mod tests {
                 )),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let outcome = inhabit_verifiable_function(&func);
         assert_ne!(
@@ -14137,6 +14305,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert_eq!(inhabit_verifiable_function(&func), InhabitOutcome::Inhabited);
     }
@@ -14180,6 +14349,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         assert_eq!(inhabit_verifiable_function(&func), InhabitOutcome::Inhabited);
     }
@@ -14198,7 +14368,7 @@ mod tests {
         Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Wrapper".into(),
             fields: vec![
                 (
@@ -14209,9 +14379,14 @@ mod tests {
                     },
                 ),
                 ("count".into(), Ty::Int { width: 32, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        }
     }
 
     /// PHASE 2 GATE 1 — a GENERIC struct `Wrapper<T>{value:T, count:u32}` registers
@@ -14309,11 +14484,15 @@ mod tests {
         let ty = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Holder".into(),
-            fields: vec![("items".into(), Ty::Slice { elem: Box::new(t_param()) })],
+            fields: vec![("items".into(), Ty::Slice { elem: Box::new(t_param()) })].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         // The struct now reflects STRUCTURALLY (was `None`/Prod before).
         let carrier = reflect::reflect_struct(&ty)
             .expect("a sequence-over-type-var field now reflects STRUCTURALLY (was opaque before)");
@@ -14406,11 +14585,15 @@ mod tests {
             let outer = Ty::Adt {
                 adt_kind: None,
                 layout: None,
-                variants: Vec::new(),
+                variants: Vec::new().into(),
                 name: name.into(),
-                fields: vec![("f".into(), fty.clone())],
+                fields: vec![("f".into(), fty.clone())].into(),
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            };
             // The struct now reflects STRUCTURALLY (was `None`/Prod before).
             let carrier = reflect::reflect_struct(&outer)
                 .unwrap_or_else(|| panic!("{name} now reflects STRUCTURALLY (was opaque before)"));
@@ -14490,7 +14673,7 @@ mod tests {
             adt_kind: None,
             layout: None,
             name: "Opt".into(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
             variants: vec![
                 VariantDef {
                     name: "Some".into(),
@@ -14498,9 +14681,14 @@ mod tests {
                     fields: vec![("0".into(), t_param())],
                 },
                 VariantDef { name: "None".into(), discriminant: 1, fields: Vec::new() },
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         assert_field_grounds("EnumHolder", opt_t, "Trust.Adt.Opt");
     }
 
@@ -14523,14 +14711,19 @@ mod tests {
         let never_nested = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "NeverHolder".into(),
             fields: vec![(
                 "items".into(),
                 Ty::Slice { elem: Box::new(Ty::Tuple(vec![t_param(), Ty::Never])) },
-            )],
+            )]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         assert!(
             reflect::reflect_struct(&never_nested).is_none(),
             "a sequence whose element nests a non-reflectable `never` must fall back to Prod (deferred)"
@@ -14541,7 +14734,7 @@ mod tests {
         let dyn_nested = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "DynHolder".into(),
             fields: vec![(
                 "items".into(),
@@ -14551,9 +14744,14 @@ mod tests {
                         Ty::Dynamic { trait_name: "Tr".into(), principal_key: Some("Tr".into()) },
                     ])),
                 },
-            )],
+            )]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         assert!(
             reflect::reflect_struct(&dyn_nested).is_none(),
             "a sequence element nesting a bare `dyn` trait object must fall back to Prod (deferred)"
@@ -14571,14 +14769,19 @@ mod tests {
         Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Outer".into(),
             fields: vec![
                 ("inner".into(), wrapper_t_generic_ty()),
                 ("tag".into(), Ty::Int { width: 32, signed: false }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        }
     }
 
     /// UNIVERSE-CORRECT DEPENDENT CARRIER (goal bullet 2) — the FIELD-POSITION
@@ -14919,6 +15122,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![], // `ensures true` (trivial) — drives default_inhabitant.
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -15320,7 +15524,7 @@ mod tests {
         let holder = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "crate::Holder".into(),
             fields: vec![
                 (
@@ -15334,9 +15538,14 @@ mod tests {
                     },
                 ),
                 ("count".into(), Ty::Int { width: 32, signed: true }),
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let func = trivial_returning("make_holder", holder);
         assert_eq!(
             inhabit_verifiable_function(&func),
@@ -15360,7 +15569,7 @@ mod tests {
         let formatter = Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "core::fmt::Formatter".into(),
             fields: vec![(
                 "buf".into(),
@@ -15371,9 +15580,14 @@ mod tests {
                         principal_key: Some("core::fmt::Write".into()),
                     }),
                 },
-            )],
+            )]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let func = VerifiableFunction {
             name: "f".into(),
             def_path: "crate::f".into(),
@@ -15402,6 +15616,7 @@ mod tests {
                 )),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let outcome = inhabit_verifiable_function(&func);
         assert_ne!(
@@ -15510,6 +15725,7 @@ mod tests {
                 Box::new(F::Int(0)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         // The deref'd return value is NOT extractable (no pointee value model), so the
         // non-trivial postcondition stays UNWITNESSED — NOT Inhabited, NOT a false
@@ -15667,6 +15883,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -16116,10 +16333,12 @@ mod tests {
         use crate::clean_ground::{InhabitOutcome, inhabit_verifiable_function};
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/real-spec-corpus");
-        let bytes = match std::fs::read(dir.join("sign.json")) {
-            Ok(b) => b,
-            Err(_) => return, // fixture not present
-        };
+        // Trust: NO-VACUOUS-CORPUS-TEST — `sign.json` is checked in, so a missing
+        // row is a FAILURE naming the path, not a silent `return` that passes.
+        let path = dir.join("sign.json");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("required fixture {} could not be read: {e}", path.display())
+        });
         let func: VerifiableFunction = serde_json::from_slice(&bytes).expect("parse sign.json");
         // The nested return reflects to a NESTED Ite.
         let f = extract_return_formula(&func).expect("sign reflects to a guarded formula");
@@ -16282,6 +16501,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![post],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -16436,6 +16656,7 @@ mod tests {
                 Box::new(trust_types::Formula::Int(0)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let outcome = inhabit_verifiable_function(&func);
         assert_ne!(
@@ -16548,6 +16769,7 @@ mod tests {
                 Box::new(trust_types::Formula::Int(0)),
             )],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let outcome = inhabit_verifiable_function(&func);
         assert_ne!(
@@ -17506,14 +17728,17 @@ mod rustc_mir_three_way_differential {
             }
         }
         let mut module = TirModule::new(name);
-        let fty = module.add_func_type(FuncTy {
-            params: vec![ty.clone(); arg_count],
-            returns: vec![ty.clone()],
-            is_vararg: false,
-        });
+        let fty = module
+            .add_func_type(FuncTy {
+                params: vec![ty.clone(); arg_count],
+                returns: vec![ty.clone()],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function = TirFunction::new(FuncId::new(0), name, fty, entry_id);
         function.blocks = blocks;
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -18728,6 +18953,7 @@ mod ptr_intrinsic_model {
             atomic: None,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             is_foreign: false,
         }
     }
@@ -20377,13 +20603,16 @@ mod ptr_intrinsic_model {
     /// Build a `Ty::Adt` with an EXPLICIT `adt_kind` (the generic `Ty::adt` constructor
     /// is kind-agnostic ⇒ `None`; only a real extraction stamps `Some`). Two i64 fields.
     fn setter_adt(kind: Option<trust_types::AdtKind>) -> trust_types::Ty {
-        trust_types::Ty::Adt { arbitrary_precision: None, 
+        trust_types::Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
             name: "S".into(),
             fields: vec![
                 ("x".into(), trust_types::Ty::Int { width: 64, signed: true }),
                 ("y".into(), trust_types::Ty::Int { width: 64, signed: true }),
-            ],
-            variants: Vec::new(),
+            ]
+            .into(),
+            variants: Vec::new().into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
@@ -20443,6 +20672,7 @@ mod ptr_intrinsic_model {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -20600,6 +20830,7 @@ mod ptr_intrinsic_model {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind: UnwindEdge::Unreachable,
         };
         func.body.blocks.push(BasicBlock {
@@ -20712,7 +20943,8 @@ mod ptr_intrinsic_model {
         if let Ty::Ref { inner, .. } = &mut func.body.locals[1].ty
             && let Ty::Adt { fields, .. } = inner.as_mut()
         {
-            fields[0].1 = Ty::adt("Inner", vec![("z".into(), Ty::Int { width: 32, signed: true })]);
+            fields.make_mut()[0].1 =
+                Ty::adt("Inner", vec![("z".into(), Ty::Int { width: 32, signed: true })]);
         }
         assert!(super::sem_field_set_shape_of(&func).is_none(), "a non-scalar field declines (G8)");
     }
@@ -20818,6 +21050,7 @@ mod ptr_intrinsic_model {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: trust_types::FunctionSpec::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -20982,7 +21215,7 @@ mod ptr_intrinsic_model {
         if let Ty::Ref { inner, .. } = &mut func.body.locals[1].ty
             && let Ty::Adt { fields, .. } = inner.as_mut()
         {
-            fields[0].1 = Ty::Int { width: 128, signed: false };
+            fields.make_mut()[0].1 = Ty::Int { width: 128, signed: false };
         }
         func.body.locals[2].ty = Ty::Tuple(vec![Ty::Int { width: 128, signed: false }, Ty::Bool]);
         assert!(
@@ -21014,7 +21247,7 @@ mod ptr_intrinsic_model {
         if let Ty::Ref { inner, .. } = &mut func.body.locals[1].ty
             && let Ty::Adt { fields, .. } = inner.as_mut()
         {
-            fields[0].1 = Ty::Int { width: 32, signed: false };
+            fields.make_mut()[0].1 = Ty::Int { width: 32, signed: false };
         }
         func.body.locals[2].ty = Ty::Tuple(vec![Ty::Int { width: 32, signed: false }, Ty::Bool]);
         if let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(_, _, r), .. } =
@@ -21040,7 +21273,7 @@ mod ptr_intrinsic_model {
         if let Ty::Ref { inner, .. } = &mut func.body.locals[1].ty
             && let Ty::Adt { fields, .. } = inner.as_mut()
         {
-            fields[0].1 = Ty::Int { width: 64, signed: false };
+            fields.make_mut()[0].1 = Ty::Int { width: 64, signed: false };
         }
         func.body.locals[2].ty = Ty::Tuple(vec![Ty::Int { width: 64, signed: false }, Ty::Bool]);
         if let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(_, _, r), .. } =
@@ -21283,7 +21516,7 @@ mod ptr_intrinsic_model {
         if let Ty::Ref { inner, .. } = &mut func.body.locals[1].ty
             && let Ty::Adt { fields, .. } = inner.as_mut()
         {
-            fields[0].1 = Ty::Bool;
+            fields.make_mut()[0].1 = Ty::Bool;
         }
         assert!(super::sem_field_rmw_shape_of(&func).is_none(), "a bool field declines (G8')");
     }
@@ -21575,6 +21808,7 @@ mod ptr_intrinsic_model {
                     Box::new(Formula::Int(0)),
                 )],
                 spec: trust_types::FunctionSpec::default(),
+                tuple_layouts: Default::default(),
             }
         };
 

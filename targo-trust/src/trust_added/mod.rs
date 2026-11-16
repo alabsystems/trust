@@ -399,12 +399,127 @@ fn run_quick(root: &Path, policy: GatePolicy) -> Result<()> {
     identity_result
 }
 
-/// Memory-aware default parallelism: min(cores, memory / 5 GiB), at least 1.
-pub(super) fn memory_aware_jobs() -> usize {
+/// Per-job memory budget for a compiler fan-out, in bytes.
+///
+/// Provenance of the sample, stated first because it bounds every claim below.
+/// On 2026-09-09 (seal trust-0028666c) one ISOLATED run of
+/// `-p ay-arrays --all-targets` over the `ay` workspace was sampled every ~5 s
+/// for 18 minutes: 176 instants, 32 distinct compiler units
+/// (`scratchpad/memtrace.tsv`). It is NOT the failing command — that is
+/// `--workspace --all-targets --all-features` over 69 workspace members — but
+/// it is the run that reproduces the kill, and it is the only per-unit
+/// measurement that exists. A full-workspace graph has many more ready units
+/// than a `-p` graph, so the concurrency figures below are a LOWER bound on
+/// what the failing command reaches; the per-unit sizes are the sizes of the
+/// units this budget is about.
+///
+/// Peak resident set per unit, GiB (`rss_kb / 1024^2`; the sample's own
+/// `DIAGNOSIS-DATA.txt` uses the same divisor while labelling it GB):
+///
+/// ```text
+///   66.90  ay_arrays (lib test)   <- pathological pair, uncovered by design
+///   63.10  ay_arrays (lib)        <- pathological pair, uncovered by design
+///   11.90  ay_jit (test)          <- largest unit outside that pair
+///    7.44  ay_frontend (test)
+///    7.33  ay_frontend (lib)
+///    0.60  syn, then 26 further units at or below 0.33
+/// ```
+///
+/// The budget is 12 GiB because 11.90 GiB, rounded up to the next whole GiB,
+/// is the smallest budget that COVERS every unit outside the pathological
+/// pair: 30 of the 32 units fit under it, 27 of them under 0.63 GiB. That is
+/// one order statistic (rank 30 of 32), described as what it is. It is not a
+/// percentile: with n = 32 the sample is bimodal, and the 95th percentile
+/// straddles the 11.90 -> 63.10 gap (36.6 GiB linear, 66.2 GiB nearest-rank),
+/// so no percentile of this sample is a stable number. An earlier revision of
+/// this comment claimed 11.90 was both the p95 and the largest non-tail unit,
+/// i.e. two independent readings; that was wrong — it is one reading counted
+/// twice, and the p95 half of it was false.
+///
+/// Why not keep 5 GiB: not because it was "the mean" (the mean of the 32 unit
+/// peaks is 5.05 GiB, so it was, but that is a coincidence of this sample and
+/// no argument either way). Because a budget below 11.90 GiB makes the rule's
+/// own arithmetic false: `jobs * budget + reserve <= RAM` is only a bound on
+/// demand if `budget` actually covers a unit, and at 5 GiB two of the five
+/// non-trivial units exceed it.
+///
+/// This budget deliberately does NOT accommodate the 66.90 GiB pair. Doing so
+/// yields one job on a 128 GiB host and turns a 40-minute check into hours.
+/// See [`jobs_for_host`] for what the clamp does and — importantly — does not
+/// buy on this trace.
+const PER_JOB_MEMORY_BUDGET_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+
+/// Host memory the fan-out must not hand out, in bytes.
+///
+/// Dividing `hw.memsize` charges compiler jobs for memory the kernel already
+/// holds. At the first sample of the same trace, before any unit had ramped,
+/// the host reported `wired_gb=3.97` and `comp_gb=5.14` (9.11 GiB). Reserve
+/// the next whole GiB above that measurement.
+///
+/// This is one measurement on one 128 GiB host, held flat rather than scaled.
+/// On a small host it is a large fraction of RAM and therefore conservative;
+/// given that this tree's only 24 GB datum is a machine panic, conservative is
+/// the direction to be wrong in. Deriving the reserve from free memory at
+/// start instead of a constant was considered and rejected: it makes the job
+/// count depend on whatever else the operator happens to be running, so two
+/// runs of the same gate on the same host would legitimately disagree about
+/// how wide they ran, and neither the number nor the failure would be
+/// reproducible.
+const HOST_MEMORY_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Memory-aware default parallelism: `min(cores, (RAM - reserve) / budget)`,
+/// at least 1. See [`PER_JOB_MEMORY_BUDGET_BYTES`] for where the constants
+/// come from.
+pub(crate) fn memory_aware_jobs() -> usize {
     let cores = std::thread::available_parallelism().map_or(8, usize::from);
-    let mem_jobs = host_memory_bytes()
-        .map(|bytes| ((bytes / (5 * 1024 * 1024 * 1024)) as usize).max(1))
-        .unwrap_or(cores);
+    host_memory_bytes().map_or(cores, |bytes| jobs_for_host(cores, bytes))
+}
+
+/// The arithmetic behind [`memory_aware_jobs`], split out so the rule can be
+/// exercised at host sizes this machine does not have.
+///
+/// ```text
+///   host      old min(cores, RAM/5GiB)   new min(cores, (RAM-10GiB)/12GiB)
+///   128 GiB   18 (core-clamped)          9
+///    48 GiB    9 (memory-clamped)        3
+///    24 GiB    4 (memory-clamped)        1
+/// ```
+///
+/// WHAT THIS CLAMP DOES NOT DO, on the only trace that exists. Measured over
+/// the 176 sampled instants of that trace: the widest instant carried 20 live
+/// units and totalled 16.96 GiB (a build-script burst); EVERY instant above
+/// 60 GiB co-resident carried 3 to 5 live units; the co-resident maximum was
+/// 89.36 GiB at 4 live units, and system free memory bottomed at 0.05 GiB
+/// there. So any scalar cap of 6 or more — 9 included — binds at no pressure
+/// instant in that trace. This change buys approximately zero headroom
+/// against the specific `ay_arrays` SIGKILL it was written for, and the
+/// residual risk is not "may recur" but "is untouched".
+///
+/// What it does do, and why it is still the right change:
+///
+///  * It bounds the WIDE fan-out class, which is a different failure with its
+///    own recorded fatalities in this tree: `run_quick` above records `hw.ncpu`
+///    on a 24 GB host exhausting the VM compressor and panicking the machine,
+///    and `trust_extra`'s workspace step records 14 threads on a 48 GB host
+///    dying to SIGKILL. The old rule answered 4 and 9 on those hosts. A `-p`
+///    graph reaches 20 ready units only in its build-script burst; a 69-member
+///    `--workspace --all-targets --all-features` graph reaches Cargo's `-j`
+///    ceiling routinely, and 18 units that each merely reach the 7.4 GiB of
+///    `ay_frontend` is 133 GiB on a 128 GiB host.
+///  * `jobs * 12 GiB + 10 GiB reserve <= RAM` is a true bound on demand for
+///    30 of the 32 measured units, which the old 5 GiB budget was not.
+///
+/// The two `ay_arrays` units are independent compilations of one crate, both
+/// ready together, and 66.90 + 63.10 GiB exceeds this host at any `-j >= 2`;
+/// the only provably safe static job count for that pair is 1, at which the
+/// check is serial. Bounding that pair needs an admission gate that knows a
+/// unit's size before it starts — which is what `trustd` already is for
+/// SOLVER memory (see `apply_crate_memory_coordination` in `pipeline/run.rs`)
+/// and what nothing in the tree is for a compiler unit's own footprint.
+/// Cargo's job count cannot express it.
+pub(crate) fn jobs_for_host(cores: usize, host_memory_bytes: u64) -> usize {
+    let usable = host_memory_bytes.saturating_sub(HOST_MEMORY_RESERVE_BYTES);
+    let mem_jobs = usize::try_from(usable / PER_JOB_MEMORY_BUDGET_BYTES).unwrap_or(usize::MAX);
     cores.min(mem_jobs).max(1)
 }
 
@@ -644,7 +759,7 @@ fn line_has_unexpected_skip(line: &str) -> bool {
             || clean[..start].chars().next_back().is_some_and(|ch| ch.is_whitespace() || ch == '(');
         let rest = &clean[start + "SKIP".len()..];
         let rest = rest.strip_prefix("PING").or_else(|| rest.strip_prefix("PED")).unwrap_or(rest);
-        if boundary_ok && rest.trim_start_matches(|ch| ch == ' ' || ch == '\t').starts_with(':') {
+        if boundary_ok && rest.trim_start_matches([' ', '\t']).starts_with(':') {
             return true;
         }
         search_from = start + "SKIP".len();
@@ -952,8 +1067,14 @@ fn validate_repo_bootstrap_binary(root: &Path, path: &Path, source: &str) -> Res
         })
         .collect::<Option<Vec<_>>>()
         .with_context(|| format!("{source} path has non-normal components: {}", path.display()))?;
-    let valid_shape = components.as_slice() == ["build", "bootstrap", executable.as_str()]
-        || components.as_slice() == ["build", "bootstrap", "debug", executable.as_str()];
+    // `build` may be the sanctioned link to `build.noindex` (docs/BUILD_AND_INSTALL.md,
+    // "Keeping Spotlight out of build/"), so either spelling of its first
+    // component names the repository's build tree.
+    let valid_shape = components
+        .first()
+        .is_some_and(|first| crate::stage2_tools::is_repo_build_component(&canonical_root, first))
+        && (components[1..] == ["bootstrap", executable.as_str()]
+            || components[1..] == ["bootstrap", "debug", executable.as_str()]);
     if !valid_shape {
         bail!(
             "{source} must be build/bootstrap/{0} or build/bootstrap/debug/{0}: {1}",
@@ -963,14 +1084,20 @@ fn validate_repo_bootstrap_binary(root: &Path, path: &Path, source: &str) -> Res
     }
 
     let mut prefix = canonical_root.clone();
-    for component in relative.components() {
+    for (index, component) in relative.components().enumerate() {
         let Component::Normal(value) = component else {
             bail!("{source} path has non-normal components: {}", path.display());
         };
         prefix.push(value);
         let metadata = fs::symlink_metadata(&prefix)
             .with_context(|| format!("{source} could not inspect {}", prefix.display()))?;
-        if metadata.file_type().is_symlink() {
+        // The one admitted link is `build` itself, and only as the sanctioned
+        // `build -> build.noindex`; the canonical path bound below then names
+        // `build.noindex`. Every other link is still refused.
+        let sanctioned_build_link = index == 0
+            && value == "build"
+            && crate::stage2_tools::is_sanctioned_build_link(&canonical_root);
+        if metadata.file_type().is_symlink() && !sanctioned_build_link {
             bail!("{source} must not traverse a symlink: {}", prefix.display());
         }
     }
@@ -1762,5 +1889,180 @@ reason = "A reviewed, bounded exception."
                 "unexpectedly accepted {rejected}"
             );
         }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The rule must clamp below the core count on the host that produced the
+    /// SIGKILL. The old rule (`min(cores, RAM / 5 GiB)`) answered 18 there and
+    /// clamped nothing at all.
+    ///
+    /// Note what this does and does not assert. It asserts the clamp binds on
+    /// this host. It does NOT assert the clamp would have prevented the
+    /// sampled kill: see `clamp_cannot_bind_at_the_sampled_pressure_instants`.
+    #[test]
+    fn measured_128_gib_host_is_clamped_well_below_its_core_count() {
+        let jobs = jobs_for_host(18, 128 * GIB);
+        assert_eq!(jobs, 9, "128 GiB / 18 cores must not run at Cargo's default width");
+        assert!(jobs < 18, "the rule must clamp below cores on the host that produced the SIGKILL");
+    }
+
+    /// The honest limit of this change, pinned so nobody later reads the
+    /// clamp as a fix for the `ay_arrays` kill.
+    ///
+    /// Measured over the 176 sampled instants: every instant above 60 GiB
+    /// co-resident carried 3 to 5 live units, the co-resident maximum was
+    /// 89.36 GiB at 4 live units, and the widest instant (20 live units)
+    /// totalled 16.96 GiB. A cap of 9 is therefore inert at every pressure
+    /// instant in that trace, and the pathological pair alone does not fit
+    /// under any cap above 1.
+    #[test]
+    fn clamp_cannot_bind_at_the_sampled_pressure_instants() {
+        const MAX_LIVE_UNITS_AT_PRESSURE: usize = 5;
+        assert!(
+            jobs_for_host(18, 128 * GIB) > MAX_LIVE_UNITS_AT_PRESSURE,
+            "if this ever becomes false the clamp has started binding at the sampled failure, \
+             and the doc comments claiming it does not must be rewritten"
+        );
+        // The pathological pair: 66.90 + 63.10 GiB co-resident.
+        const TAIL_PAIR_BYTES: u64 = 130 * GIB;
+        const {
+            assert!(
+                2 * PER_JOB_MEMORY_BUDGET_BYTES < TAIL_PAIR_BYTES,
+                "the budget must not be mistaken for one that admits the tail pair"
+            );
+        };
+        const {
+            assert!(
+                TAIL_PAIR_BYTES > 128 * GIB - HOST_MEMORY_RESERVE_BYTES,
+                "the tail pair exceeds the measured host at any job count above 1"
+            );
+        };
+    }
+
+    /// A 24 GiB host gets one job. This row is NOT measured: nothing records a
+    /// 24 GB host succeeding or failing at 4, the old rule's answer. What is
+    /// recorded (in `run_quick` above) is that `hw.ncpu` on a 24 GB host
+    /// "exhausted the VM compressor and panicked the machine". One job is what
+    /// a 12 GiB budget plus a 10 GiB reserve yields there, and its cost is
+    /// real: a fully serial check on that host, a 4x reduction.
+    #[test]
+    fn twenty_four_gib_host_admits_a_single_job() {
+        assert_eq!(jobs_for_host(18, 24 * GIB), 1);
+        assert_eq!(jobs_for_host(8, 24 * GIB), 1);
+    }
+
+    /// `trust_extra`'s workspace step measured 4 threads good and 14 fatal on
+    /// a 48 GB host. The rule must land at or below the measured-good width,
+    /// approaching it from below. 3 rather than 4 is a choice, not a
+    /// measurement: it is what the budget yields, one job conservative.
+    #[test]
+    fn forty_eight_gib_host_stays_within_its_measured_good_width() {
+        let jobs = jobs_for_host(12, 48 * GIB);
+        assert_eq!(jobs, 3);
+        assert!(jobs <= 4, "48 GB measured 4 threads good and 14 fatal");
+    }
+
+    /// Cores still bound the answer on a host with memory to spare, and the
+    /// floor is one job however small the host is.
+    #[test]
+    fn job_count_is_bounded_by_cores_and_floored_at_one() {
+        assert_eq!(jobs_for_host(2, 512 * GIB), 2, "cores must still clamp a large host");
+        assert_eq!(jobs_for_host(18, 8 * GIB), 1, "a host below the reserve still gets one job");
+        assert_eq!(jobs_for_host(18, 0), 1);
+        assert_eq!(jobs_for_host(0, 128 * GIB), 1, "a zero core probe must not produce zero jobs");
+    }
+
+    /// The reserve is part of the rule, not decoration: budgeting against
+    /// total memory instead of usable memory would hand out a tenth job on
+    /// this host that the kernel's own wired plus compressed footprint
+    /// (9.11 GiB measured at the start of the trace) has already spent.
+    #[test]
+    fn host_reserve_is_subtracted_before_the_budget_divides() {
+        assert_eq!(HOST_MEMORY_RESERVE_BYTES, 10 * GIB);
+        let with_reserve = jobs_for_host(64, 128 * GIB);
+        let without_reserve = usize::try_from(128 * GIB / PER_JOB_MEMORY_BUDGET_BYTES).unwrap();
+        assert_eq!(without_reserve, 10);
+        assert_eq!(with_reserve, 9, "the reserve must cost exactly the jobs it pays for");
+    }
+
+    /// The budget must COVER the largest measured unit outside the
+    /// pathological `ay_arrays` pair — 11.90 GiB, rank 30 of the 32 sampled
+    /// unit peaks. Below that, `jobs * budget + reserve <= RAM` stops being a
+    /// bound on anything, which is what was wrong with 5 GiB: two of the five
+    /// non-trivial units exceeded it.
+    ///
+    /// This is one order statistic, not a percentile. The p95 of this sample
+    /// is not 11.90 (it is 36.6 GiB linear / 66.2 GiB nearest-rank) and is not
+    /// a usable number, because the sample is bimodal across the 11.90 ->
+    /// 63.10 gap.
+    #[test]
+    fn per_job_budget_covers_every_non_pathological_measured_unit() {
+        // 11.90 GiB, the largest of the 30 units outside the `ay_arrays` pair.
+        const LARGEST_NON_PATHOLOGICAL_BYTES: u64 = 11_900 * GIB / 1_000;
+        const {
+            assert!(
+                PER_JOB_MEMORY_BUDGET_BYTES >= LARGEST_NON_PATHOLOGICAL_BYTES,
+                "the budget must cover the largest non-pathological measured unit"
+            );
+        };
+        // 7.44 GiB, `ay_frontend`'s test unit: a budget that did not cover it
+        // would be describing a fan-out width the host cannot actually run.
+        const {
+            assert!(PER_JOB_MEMORY_BUDGET_BYTES > 7_440 * GIB / 1_000);
+        };
+        const {
+            assert!(
+                PER_JOB_MEMORY_BUDGET_BYTES > 5 * GIB,
+                "5 GiB failed to cover two of the five non-trivial measured units"
+            );
+        };
+    }
+
+    /// `build -> build.noindex` (docs/BUILD_AND_INSTALL.md, "Keeping Spotlight
+    /// out of build/") is the one link the repository bootstrap binary may be
+    /// reached through, spelled either way; any other `build` link is refused.
+    #[cfg(unix)]
+    #[test]
+    fn repo_bootstrap_binary_admits_only_the_sanctioned_build_link() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().expect("bootstrap fixture");
+        let root = temp.path().canonicalize().expect("canonical fixture root");
+        let executable = host_executable_name("bootstrap");
+        let physical = root.join("build.noindex/bootstrap/debug").join(&executable);
+        fs::create_dir_all(physical.parent().expect("bootstrap dir")).expect("create dir");
+        fs::write(&physical, b"#!/bin/sh\nexit 0\n").expect("write bootstrap");
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o755)).expect("chmod");
+        symlink("build.noindex", root.join("build")).expect("link build");
+        let lexical = root.join("build/bootstrap/debug").join(&executable);
+
+        for spelling in [&lexical, &physical] {
+            assert_eq!(
+                validate_repo_bootstrap_binary(&root, spelling, "test")
+                    .unwrap_or_else(|error| panic!("{}: {error:#}", spelling.display())),
+                physical
+            );
+        }
+        // Discovery reads `TRUST_UPSTREAM_RUST_BOOTSTRAP` first; exercise it only
+        // when the test environment does not set one.
+        if env::var_os("TRUST_UPSTREAM_RUST_BOOTSTRAP").is_none() {
+            assert_eq!(rust_bootstrap_binary(&root).expect("bootstrap discovery"), physical);
+        }
+
+        // Any other `build` link is refused, in either spelling.
+        fs::remove_file(root.join("build")).expect("remove build link");
+        fs::rename(root.join("build.noindex"), root.join("elsewhere")).expect("move tree");
+        symlink("elsewhere", root.join("build")).expect("unsanctioned build link");
+        let error = validate_repo_bootstrap_binary(&root, &lexical, "test")
+            .expect_err("an unsanctioned build link");
+        assert!(format!("{error:#}").contains("must not traverse a symlink"), "{error:#}");
+        let error = validate_repo_bootstrap_binary(
+            &root,
+            &root.join("elsewhere/bootstrap/debug").join(&executable),
+            "test",
+        )
+        .expect_err("a tree outside build/ is not the repository bootstrap");
+        assert!(format!("{error:#}").contains("must be build/bootstrap/"), "{error:#}");
     }
 }

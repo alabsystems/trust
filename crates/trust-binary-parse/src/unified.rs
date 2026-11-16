@@ -739,12 +739,22 @@ pub fn binary_artifact_identity(
     binary: &BinaryInfo,
 ) -> Result<BinaryArtifactIdentity, ParseError> {
     let selected_image = selected_image_identity(data, binary)?;
+    let artifact_size = data.len() as u64;
+    let artifact =
+        if selected_image.file_offset == 0 && selected_image.file_size == artifact_size {
+            BinaryArtifactDigest {
+                algorithm: "sha256".to_string(),
+                value: selected_image.sha256.clone(),
+            }
+        } else {
+            BinaryArtifactDigest::sha256(data)
+        };
     Ok(BinaryArtifactIdentity {
         schema_version: 1,
         format: stable_format_name(binary.format).to_string(),
         architecture: stable_architecture_name(binary.architecture).to_string(),
-        artifact: BinaryArtifactDigest::sha256(data),
-        artifact_size: data.len() as u64,
+        artifact,
+        artifact_size,
         selected_image,
         loader_build_id: binary.build_id.clone(),
     })
@@ -772,16 +782,21 @@ fn push_metadata_diagnostic(
     diagnostics.push(MetadataDiagnostic { source: source.into(), message: err.to_string() });
 }
 
+fn push_hex_lower(out: &mut String, bytes: &[u8]) {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
+    push_hex_lower(&mut out, bytes);
     out
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+fn sha256_compress_block(h: &mut [u32; 8], chunk: &[u8]) {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -794,6 +809,65 @@ fn sha256_hex(bytes: &[u8]) -> String {
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
         0xc67178f2,
     ];
+    let mut w = [0u32; 64];
+    for (index, word) in w.iter_mut().take(16).enumerate() {
+        let offset = index * 4;
+        *word = u32::from_be_bytes([
+            chunk[offset],
+            chunk[offset + 1],
+            chunk[offset + 2],
+            chunk[offset + 3],
+        ]);
+    }
+    for index in 16..64 {
+        let s0 = w[index - 15].rotate_right(7)
+            ^ w[index - 15].rotate_right(18)
+            ^ (w[index - 15] >> 3);
+        let s1 = w[index - 2].rotate_right(17)
+            ^ w[index - 2].rotate_right(19)
+            ^ (w[index - 2] >> 10);
+        w[index] = w[index - 16].wrapping_add(s0).wrapping_add(w[index - 7]).wrapping_add(s1);
+    }
+
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+    let mut f = h[5];
+    let mut g = h[6];
+    let mut hh = h[7];
+
+    for index in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 =
+            hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[index]).wrapping_add(w[index]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
+
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(hh);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = [
         0x6a09e667u32,
         0xbb67ae85,
@@ -804,72 +878,23 @@ fn sha256_hex(bytes: &[u8]) -> String {
         0x1f83d9ab,
         0x5be0cd19,
     ];
-    let bit_len = (bytes.len() as u64).wrapping_mul(8);
-    let mut padded = Vec::with_capacity(((bytes.len() + 9).div_ceil(64)) * 64);
-    padded.extend_from_slice(bytes);
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0);
+    let chunks = bytes.chunks_exact(64);
+    let rem = chunks.remainder();
+    for chunk in chunks {
+        sha256_compress_block(&mut h, chunk);
     }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    let mut w = [0u32; 64];
-    for chunk in padded.chunks_exact(64) {
-        for (index, word) in w.iter_mut().take(16).enumerate() {
-            let offset = index * 4;
-            *word = u32::from_be_bytes([
-                chunk[offset],
-                chunk[offset + 1],
-                chunk[offset + 2],
-                chunk[offset + 3],
-            ]);
-        }
-        for index in 16..64 {
-            let s0 = w[index - 15].rotate_right(7)
-                ^ w[index - 15].rotate_right(18)
-                ^ (w[index - 15] >> 3);
-            let s1 = w[index - 2].rotate_right(17)
-                ^ w[index - 2].rotate_right(19)
-                ^ (w[index - 2] >> 10);
-            w[index] = w[index - 16].wrapping_add(s0).wrapping_add(w[index - 7]).wrapping_add(s1);
-        }
-
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut hh = h[7];
-
-        for index in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 =
-                hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[index]).wrapping_add(w[index]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let mut tail = [0u8; 128];
+    tail[..rem.len()].copy_from_slice(rem);
+    tail[rem.len()] = 0x80;
+    if rem.len() < 56 {
+        tail[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        sha256_compress_block(&mut h, &tail[..64]);
+    } else {
+        tail[120..128].copy_from_slice(&bit_len.to_be_bytes());
+        sha256_compress_block(&mut h, &tail[..64]);
+        sha256_compress_block(&mut h, &tail[64..128]);
     }
 
     let mut digest = [0u8; 32];
@@ -1292,14 +1317,18 @@ fn push_abi_diagnostics(diagnostics: &mut Vec<MetadataDiagnostic>, abi: &AbiProv
 }
 
 fn format_macho_uuid(uuid: [u8; 16]) -> String {
-    format!(
-        "macho-uuid:{}-{}-{}-{}-{}",
-        hex_lower(&uuid[0..4]),
-        hex_lower(&uuid[4..6]),
-        hex_lower(&uuid[6..8]),
-        hex_lower(&uuid[8..10]),
-        hex_lower(&uuid[10..16])
-    )
+    let mut out = String::with_capacity(47);
+    out.push_str("macho-uuid:");
+    push_hex_lower(&mut out, &uuid[0..4]);
+    out.push('-');
+    push_hex_lower(&mut out, &uuid[4..6]);
+    out.push('-');
+    push_hex_lower(&mut out, &uuid[6..8]);
+    out.push('-');
+    push_hex_lower(&mut out, &uuid[8..10]);
+    out.push('-');
+    push_hex_lower(&mut out, &uuid[10..16]);
+    out
 }
 
 fn macho_loader_id(macho: &crate::macho::MachO<'_>) -> Option<String> {
@@ -1363,10 +1392,10 @@ fn unsupported_type_provenance(message: impl Into<String>) -> TypeProvenance {
     }
 }
 
-fn elf_debug_source(
-    elf: &crate::elf::Elf64<'_>,
+fn elf_debug_source_from_dwarf(
+    dwarf: &Result<Option<crate::dwarf::DwarfInfo<'_>>, crate::error::DwarfError>,
 ) -> (DebugSourceProvenance, Vec<SourceMappingInfo>, Vec<MetadataDiagnostic>) {
-    let dwarf = match elf.dwarf_info() {
+    let dwarf = match dwarf {
         Ok(Some(dwarf)) => dwarf,
         Ok(None) => return (unavailable_debug_source("ELF"), Vec::new(), Vec::new()),
         Err(err) => {
@@ -1435,9 +1464,11 @@ fn elf_debug_source(
     )
 }
 
-fn elf_type_provenance(elf: &crate::elf::Elf64<'_>) -> (TypeProvenance, Vec<MetadataDiagnostic>) {
-    match elf.dwarf_info() {
-        Ok(Some(dwarf)) => (type_provenance_from_dwarf(&dwarf), Vec::new()),
+fn elf_type_provenance_from_dwarf(
+    dwarf: &Result<Option<crate::dwarf::DwarfInfo<'_>>, crate::error::DwarfError>,
+) -> (TypeProvenance, Vec<MetadataDiagnostic>) {
+    match dwarf {
+        Ok(Some(dwarf)) => (type_provenance_from_dwarf(dwarf), Vec::new()),
         Ok(None) => (
             TypeProvenance::unavailable(
                 "ELF DWARF debug/type provenance is unavailable; type facts remain unknown",
@@ -1655,9 +1686,11 @@ fn parse_elf64(data: &[u8]) -> Result<BinaryInfo, ParseError> {
     let abi = abi_provenance(BinaryFormat::Elf, architecture, Some(64));
     push_abi_diagnostics(&mut metadata_diagnostics, &abi);
 
-    let (type_provenance, type_diagnostics) = elf_type_provenance(&elf);
+    let dwarf_info = elf.dwarf_info();
+    let (type_provenance, type_diagnostics) = elf_type_provenance_from_dwarf(&dwarf_info);
     metadata_diagnostics.extend(type_diagnostics);
-    let (debug_source, source_mappings, debug_diagnostics) = elf_debug_source(&elf);
+    let (debug_source, source_mappings, debug_diagnostics) =
+        elf_debug_source_from_dwarf(&dwarf_info);
     metadata_diagnostics.extend(debug_diagnostics);
 
     Ok(BinaryInfo {

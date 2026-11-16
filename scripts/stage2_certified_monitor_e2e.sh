@@ -24,7 +24,7 @@ export GIT_CONFIG_NOSYSTEM=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TRUST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 MANIFEST="$TRUST_ROOT/targo-trust/Cargo.toml"
-LOCK_FILE="$TRUST_ROOT/targo-trust/Cargo.lock"
+LOCK_FILE="$TRUST_ROOT/Cargo.lock"
 REQUESTED_SYSROOT="${TRUST_STAGE2_SYSROOT:-}"
 RUN_ID="${TRUST_CERTIFIED_MONITOR_E2E_RUN_ID:-stage2-certified-monitor-e2e-$(date -u '+%Y%m%dT%H%M%SZ')-$$}"
 LOG_DIR="${TRUST_CERTIFIED_MONITOR_E2E_LOG_DIR:-$TRUST_ROOT/reports/build/$RUN_ID}"
@@ -38,8 +38,32 @@ TESTS=(
     "tests::real_targo_test_executes_e5_tailcall_and_extended_carriers"
     "tests::real_targo_test_executes_authorized_satisfying_integration_test"
     "tests::real_targo_test_rejects_unharnessed_test_target_before_execution"
+    "tests::real_targo_test_strict_lane_compiles_under_the_sealed_loader_closure"
+    "tests::real_targo_test_strict_lane_compiles_audited_proc_macro_provider"
+    "tests::real_targo_test_advisory_lane_runs_proc_macro_crate_tests_with_static_std"
+    "tests::real_targo_test_strict_lane_passes_a_proved_harness_test"
+    "tests::real_targo_test_strict_lane_refuses_an_unproved_test_body"
+    "tests::real_targo_test_check_tests_and_test_pass_a_zero_obligation_test_crate"
 )
 RELEASE_TEST_PREFIX="tests::real_targo_test_"
+# The E2Es run `targo trust` IN-PROCESS, inside the compiled targo-trust test
+# executable, so that executable must be built with the features the SHIPPED
+# targo-trust is built with (bootstrap `targo_trust_in_process_features`, pinned
+# equal to this list by `release_certified_monitors_uses_fail_closed_shell_gate`).
+# Without them the in-process run has no in-process engines and no
+# `ay-certify` promotion, so a row the compiler proved and the shipped tool
+# publishes is WITHHELD "for want of clean-kernel or publishable native proof
+# evidence" — MEASURED 2026-09-28: `real_targo_test_strict_lane_passes_a_proved_harness_test`
+# read `Gate: INCONCLUSIVE … 4 unknown` in a feature-less test binary and
+# `Gate: PASS … 5 proved` with these features, as did the shipped `targo trust
+# test` on the same crate. A gate that tests a differently built frontend than
+# the one it ships is not evidence about the shipped one. (That measurement ran
+# with the then side-built `trustd` sibling. The features are independent of
+# which `trustd` is staged: they decide what the in-process frontend can
+# publish, while the sibling is matched on release + commit (the
+# CFG_RELEASE/CFG_VER_HASH binding below) and its own bytes, none of which the
+# test executable's features change.)
+TARGO_TRUST_SHIPPED_FEATURES="trust-mc-in-process,trust-wp-in-process,trust-vc-in-process,ay-backend,ay-certify"
 
 usage() {
     cat <<'USAGE'
@@ -288,8 +312,12 @@ create_fresh_private_directory() {
 }
 
 PRIVATE_TARGET_CREATED=""
+PRIVATE_TRUSTD_RUNTIME_CREATED=""
 cleanup_private_target() {
     local target="${PRIVATE_TARGET_CREATED:-}"
+    if [[ -n "${PRIVATE_TRUSTD_RUNTIME_CREATED:-}" && -d "$PRIVATE_TRUSTD_RUNTIME_CREATED" && ! -L "$PRIVATE_TRUSTD_RUNTIME_CREATED" ]]; then
+        rm -rf -- "$PRIVATE_TRUSTD_RUNTIME_CREATED" && PRIVATE_TRUSTD_RUNTIME_CREATED=""
+    fi
     [[ -n "$target" ]] || return 0
     if [[ ! -d "$target" || -L "$target" ]]; then
         echo "error: refusing to clean replaced certified-monitor target: $target" >&2
@@ -746,6 +774,13 @@ if [[ "$TRUSTD_COMMIT" != "$CURRENT_HEAD" ]]; then
     echo "error: stale stage2 trustd reports Trust repo commit $TRUSTD_COMMIT, but repository HEAD is $CURRENT_HEAD" >&2
     exit 1
 fi
+# trustd's first line is `trustd <CFG_RELEASE>`, the release half of the
+# compiled identity its clients require (the commit half is HEAD, checked above).
+TRUSTD_RELEASE="${TRUSTD_FIRST_LINE#trustd }"
+if [[ ! "$TRUSTD_RELEASE" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+    echo "error: stage2 trustd did not report one canonical release token: $TRUSTD_FIRST_LINE" >&2
+    exit 1
+fi
 TRUSTC_SHA256="$(hash_stable_executable "$TRUSTC" "stage2 trustc")" || exit 1
 TARGO_SHA256="$(hash_stable_executable "$TARGO" "stage2 Targo")" || exit 1
 TARGO_TRUST_SHA256="$(hash_stable_executable "$TARGO_TRUST" "stage2 targo-trust")" || exit 1
@@ -796,7 +831,7 @@ esac
 IDENTITY_LOG="$LOG_DIR/gate-identity.txt"
 EVIDENCE_FILES=()
 {
-    printf 'schema=trust.certified-monitor-e2e-payload-identity.v5\n'
+    printf 'schema=trust.certified-monitor-e2e-payload-identity.v8\n'
     printf 'result_scope=payload-only\n'
     printf 'source_authority=unverified\n'
     printf 'head=%s\n' "$CURRENT_HEAD"
@@ -834,6 +869,14 @@ EVIDENCE_FILES+=("$IDENTITY_LOG")
 
 PRIVATE_HOME="$(create_fresh_private_directory "$TARGET_DIR/home" "certified-monitor HOME")" || exit 1
 PRIVATE_TMPDIR="$(create_fresh_private_directory "$TARGET_DIR/tmp" "certified-monitor TMPDIR")" || exit 1
+# Its own trustd memory domain: the host's per-user socket may be owned by a
+# daemon of another build (e.g. the seed toolchain's, kept busy by x.py), and a
+# gate must neither wait on nor displace it. A Unix socket path is capped near
+# 104 bytes, so the domain lives under a short base, not the target dir.
+SOCKET_BASE=/tmp
+[[ -d /private/tmp && ! -L /private/tmp ]] && SOCKET_BASE=/private/tmp
+TRUSTD_PRIVATE_RUNTIME="$(mktemp -d "$SOCKET_BASE/trust-e2e.XXXXXX")" || exit 1
+PRIVATE_TRUSTD_RUNTIME_CREATED="$TRUSTD_PRIVATE_RUNTIME"
 PRIVATE_CARGO_HOME="$TARGET_DIR/cargo-home"
 seed_private_cargo_home "$SOURCE_CARGO_HOME" "$PRIVATE_CARGO_HOME" || exit 1
 export HOME="$PRIVATE_HOME"
@@ -844,12 +887,20 @@ export CARGO_HOME="$PRIVATE_CARGO_HOME"
 # tool path. In particular, no compiler, wrapper, rustflags, loader, runner,
 # user Cargo config, unpacked cache, or Trust-private environment channel
 # reaches the compiled test harness and poisons its nested Targo invocations.
+#
+# CFG_RELEASE/CFG_VER_HASH are the two values bootstrap compiles into every
+# stage2 tool. The E2Es run `targo trust` INSIDE the compiled test executable,
+# whose Cargo fan-out accepts only a `trustd` beside that executable with its own
+# compiled identity (release + commit) and hashed bytes. Binding the test build
+# to the stage2 identity lets the stage2 `trustd` itself be that sibling
+# (`place_test_binary_trustd`); unbound, it would be refused.
 CLEAN_TARGO_ENV=(
     /usr/bin/env -i
     "PATH=$PATH"
     "HOME=$PRIVATE_HOME"
     "CARGO_HOME=$PRIVATE_CARGO_HOME"
     "TMPDIR=$PRIVATE_TMPDIR"
+    "TRUSTD_RUNTIME_DIR=$TRUSTD_PRIVATE_RUNTIME"
     "LC_ALL=$LC_ALL"
     "LANG=$LANG"
     "TZ=$TZ"
@@ -858,6 +909,8 @@ CLEAN_TARGO_ENV=(
     CARGO_NET_OFFLINE=true
     CARGO_TERM_COLOR=never
     RUSTC_BOOTSTRAP=1
+    "CFG_RELEASE=$TRUSTD_RELEASE"
+    "CFG_VER_HASH=$CURRENT_HEAD"
 )
 
 common_targo_test() {
@@ -869,10 +922,11 @@ common_targo_test() {
     (
         cd / || exit 1
         "${CLEAN_TARGO_ENV[@]}" \
-            "$TARGO" --unverified test \
+            "$TARGO" --unverified test --config build.test-jobs=1 \
             --manifest-path "$MANIFEST" \
             --target-dir "$TARGET_DIR" \
             --bin targo-trust \
+            --features "$TARGO_TRUST_SHIPPED_FEATURES" \
             --locked \
             --offline \
             "$@"
@@ -897,7 +951,7 @@ done
 
 # The prefix is the reviewed release-boundary namespace. Require equality,
 # not merely inclusion: otherwise a newly added real-Targo monitor regression
-# could remain ignored forever while this gate continued to report 5/5.
+# could remain ignored forever while this gate continued to report 8/8.
 INVENTORIED_RELEASE_TESTS=()
 while IFS= read -r inventory_name; do
     INVENTORIED_RELEASE_TESTS+=("$inventory_name")
@@ -926,13 +980,79 @@ for inventory_name in "${INVENTORIED_RELEASE_TESTS[@]}"; do
     fi
 done
 
+# Stage the already-hashed, HEAD-bound stage2 `trustd` beside the exact test
+# executable Cargo names: `targo trust` resolves its daemon only as a regular,
+# executable, non-symlink sibling of the RUNNING executable (never PATH), and the
+# test build carries the stage2 identity (CLEAN_TARGO_ENV). Without a sibling
+# every E2E refused before reaching Cargo (measured 2026-09-28/29). The E2Es'
+# own exact-identity check stays the authority: a mismatched sibling fails them,
+# never passes them. The daemon it starts is the stage2 authority itself, so it
+# ends by its normal idle exit, like one started by any stage2 `targo trust`.
+place_test_binary_trustd() {
+    local artifacts="$TARGET_DIR/test-binary-artifacts.json"
+    local resolve_log="$TARGET_DIR/test-binary-resolve.log"
+    local version
+
+    if ! common_targo_test --no-run --message-format=json >"$artifacts" 2>"$resolve_log"; then
+        cat "$resolve_log" >&2
+        echo "error: could not resolve the compiled targo-trust test executable" >&2
+        return 1
+    fi
+    TEST_BINARY="$(sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' "$artifacts")"
+    if [[ -z "$TEST_BINARY" || "$TEST_BINARY" == *$'\n'* || "$TEST_BINARY" != "$TARGET_DIR"/* \
+        || ! -f "$TEST_BINARY" || -L "$TEST_BINARY" || ! -x "$TEST_BINARY" ]]; then
+        echo "error: Cargo did not name exactly one compiled targo-trust test executable inside the private target: $TEST_BINARY" >&2
+        return 1
+    fi
+    TEST_BINARY_TRUSTD="$(dirname -- "$TEST_BINARY")/trustd"
+    if [[ -e "$TEST_BINARY_TRUSTD" || -L "$TEST_BINARY_TRUSTD" ]]; then
+        echo "error: the compiled test executable already has a trustd sibling: $TEST_BINARY_TRUSTD" >&2
+        return 1
+    fi
+    cp -- "$TRUSTD" "$TEST_BINARY_TRUSTD" || return 1
+    chmod 500 "$TEST_BINARY_TRUSTD" || return 1
+    TEST_BINARY_TRUSTD_SHA256="$(hash_stable_executable "$TEST_BINARY_TRUSTD" "staged stage2 trustd")" || return 1
+    if [[ "$TEST_BINARY_TRUSTD_SHA256" != "$TRUSTD_SHA256" ]]; then
+        echo "error: the staged trustd is not the hashed stage2 trustd: $TEST_BINARY_TRUSTD" >&2
+        return 1
+    fi
+    TEST_BINARY_SHA256="$(hash_stable_executable "$TEST_BINARY" "compiled targo-trust test executable")" || return 1
+    version="$(/usr/bin/env -i "$TEST_BINARY_TRUSTD" --version)" || {
+        echo "error: staged stage2 trustd identity probe failed: $TEST_BINARY_TRUSTD" >&2
+        return 1
+    }
+    if [[ "$version" != "$TRUSTD_VERSION" ]]; then
+        echo "error: the staged trustd does not report the stage2 trustd identity: $TEST_BINARY_TRUSTD" >&2
+        return 1
+    fi
+    {
+        printf 'test_binary=%s\n' "${TEST_BINARY#"$TARGET_DIR"/}"
+        printf 'test_binary_sha256=%s\n' "$TEST_BINARY_SHA256"
+        printf 'test_binary_cfg_release=%s\n' "$TRUSTD_RELEASE"
+        printf 'test_binary_cfg_ver_hash=%s\n' "$CURRENT_HEAD"
+        printf 'trustd=%s\n' "${TEST_BINARY_TRUSTD#"$TARGET_DIR"/}"
+        printf 'trustd_source=%s\n' "$TRUSTD"
+        printf 'trustd_sha256=%s\n' "$TEST_BINARY_TRUSTD_SHA256"
+        printf '%s\n' 'trustd_version_begin'
+        printf '%s\n' "$version"
+        printf '%s\n' 'trustd_version_end'
+    } >"$TEST_BINARY_TRUSTD_EVIDENCE" || {
+        echo "error: could not write test-binary trustd evidence: $TEST_BINARY_TRUSTD_EVIDENCE" >&2
+        return 1
+    }
+}
+
+TEST_BINARY_TRUSTD_EVIDENCE="$LOG_DIR/test-binary-trustd.txt"
+place_test_binary_trustd || exit 1
+EVIDENCE_FILES+=("$TEST_BINARY_TRUSTD_EVIDENCE")
+
 for test_name in "${TESTS[@]}"; do
     short_name="${test_name#tests::}"
     test_log="$LOG_DIR/$short_name.log"
     echo "certified-monitor E2E: running $test_name"
 
     set +e
-    common_targo_test "$test_name" -- --exact --ignored --test-threads=1 --nocapture \
+    common_targo_test "$test_name" -- --exact --ignored --nocapture \
         2>&1 | tee "$test_log"
     pipeline_status=("${PIPESTATUS[@]}")
     set -e
@@ -957,6 +1077,8 @@ for test_name in "${TESTS[@]}"; do
     EVIDENCE_FILES+=("$test_log")
 done
 
+FINAL_TEST_BINARY_SHA256="$(hash_stable_executable "$TEST_BINARY" "compiled targo-trust test executable recheck")" || exit 1
+FINAL_TEST_BINARY_TRUSTD_SHA256="$(hash_stable_executable "$TEST_BINARY_TRUSTD" "staged stage2 trustd recheck")" || exit 1
 FINAL_TRUSTC_SHA256="$(hash_stable_executable "$TRUSTC" "stage2 trustc recheck")" || exit 1
 FINAL_TARGO_SHA256="$(hash_stable_executable "$TARGO" "stage2 Targo recheck")" || exit 1
 FINAL_TARGO_TRUST_SHA256="$(hash_stable_executable "$TARGO_TRUST" "stage2 targo-trust recheck")" || exit 1
@@ -964,14 +1086,16 @@ FINAL_TRUSTD_SHA256="$(hash_stable_executable "$TRUSTD" "stage2 trustd recheck")
 FINAL_STAGE2_TREE_SHA256="$(hash_stable_stage2_tree "$STAGE2_SYSROOT")" || exit 1
 FINAL_MANIFEST_SHA256="$(hash_stable_regular_file "$MANIFEST" "targo-trust manifest recheck")" || exit 1
 FINAL_LOCK_SHA256="$(hash_stable_regular_file "$LOCK_FILE" "targo-trust lock-file recheck")" || exit 1
-if [[ "$FINAL_TRUSTC_SHA256" != "$TRUSTC_SHA256" \
+if [[ "$FINAL_TEST_BINARY_SHA256" != "$TEST_BINARY_SHA256" \
+    || "$FINAL_TEST_BINARY_TRUSTD_SHA256" != "$TRUSTD_SHA256" \
+    || "$FINAL_TRUSTC_SHA256" != "$TRUSTC_SHA256" \
     || "$FINAL_TARGO_SHA256" != "$TARGO_SHA256" \
     || "$FINAL_TARGO_TRUST_SHA256" != "$TARGO_TRUST_SHA256" \
     || "$FINAL_TRUSTD_SHA256" != "$TRUSTD_SHA256" \
     || "$FINAL_STAGE2_TREE_SHA256" != "$STAGE2_TREE_SHA256" \
     || "$FINAL_MANIFEST_SHA256" != "$MANIFEST_SHA256" \
     || "$FINAL_LOCK_SHA256" != "$LOCK_SHA256" ]]; then
-    echo "error: stage2 tools or Cargo inputs changed during certified-monitor E2E" >&2
+    echo "error: stage2 tools, the staged trustd, the test executable, or Cargo inputs changed during certified-monitor E2E" >&2
     exit 1
 fi
 

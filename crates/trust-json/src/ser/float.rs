@@ -94,10 +94,7 @@ impl Default for FloatBuffer {
 impl FloatBuffer {
     #[must_use]
     pub const fn new() -> Self {
-        FloatBuffer {
-            bytes: [0; 32],
-            len: 0,
-        }
+        FloatBuffer { bytes: [0; 32], len: 0 }
     }
 
     /// Renders a FINITE `f64` exactly as `serde_json` renders it.
@@ -253,12 +250,7 @@ impl Decimal {
         if eneg {
             exp = -exp;
         }
-        Decimal {
-            neg,
-            digits,
-            n,
-            exp,
-        }
+        Decimal { neg, digits, n, exp }
     }
 
     /// `digits` read as an integer. `n <= 17` so this always fits.
@@ -294,11 +286,8 @@ impl Decimal {
         let bits = value.abs().to_bits();
         let raw_exp = ((bits >> 23) & 0xff) as i32;
         let raw_mant = u64::from(bits & ((1u32 << 23) - 1));
-        let (mant, p) = if raw_exp == 0 {
-            (raw_mant, -149)
-        } else {
-            (raw_mant | (1u64 << 23), raw_exp - 150)
-        };
+        let (mant, p) =
+            if raw_exp == 0 { (raw_mant, -149) } else { (raw_mant | (1u64 << 23), raw_exp - 150) };
         self.retie(mant, p);
     }
 
@@ -395,10 +384,7 @@ struct SciBuf {
 
 impl SciBuf {
     fn new() -> Self {
-        SciBuf {
-            bytes: [0; 32],
-            len: 0,
-        }
+        SciBuf { bytes: [0; 32], len: 0 }
     }
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
@@ -461,14 +447,8 @@ mod tests {
         // 0x4307098d6fca6a8a is exactly 810553441865041.25 — equidistant from
         // ...41.2 and ...41.3. std prints .3; zmij prints .2.
         assert_eq!(f64s(f64::from_bits(0x4307098d6fca6a8a)), "810553441865041.2");
-        assert_eq!(
-            f64s(f64::from_bits(0xc2698e64d863e100)),
-            "-878105248543.0312"
-        );
-        assert_eq!(
-            f64s(f64::from_bits(0xc2eff16fc0c1e344)),
-            "-280974579863322.12"
-        );
+        assert_eq!(f64s(f64::from_bits(0xc2698e64d863e100)), "-878105248543.0312");
+        assert_eq!(f64s(f64::from_bits(0xc2eff16fc0c1e344)), "-280974579863322.12");
     }
 
     #[test]

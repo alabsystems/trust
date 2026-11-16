@@ -7,7 +7,7 @@ use intern::Symbol;
 use rustc_lexer::{DocStyle, LiteralKind};
 use rustc_proc_macro::Delimiter;
 
-use crate::bridge::{DelimSpan, Group, Ident, LitKind, Literal, Punct, TokenTree};
+use crate::bridge::{DelimSpan, Group, Ident, IdentKind, LitKind, Literal, Punct, TokenTree};
 
 /// Trait for allowing tests to parse tokenstreams with dynamic span ranges
 pub(crate) trait SpanLike {
@@ -190,7 +190,7 @@ impl<S> TokenStream<S> {
                     continue;
                 }
                 rustc_lexer::TokenKind::LineComment { doc_style: Some(doc_style) } => {
-                    let text = &s[range.start + 2..range.end];
+                    let text = &s[range.start + 3..range.end];
                     tokenstream.push(TokenTree::Punct(Punct { ch: b'#', joint: false, span }));
                     if doc_style == DocStyle::Inner {
                         tokenstream.push(TokenTree::Punct(Punct { ch: b'!', joint: false, span }));
@@ -200,7 +200,7 @@ impl<S> TokenStream<S> {
                         stream: Some(TokenStream::new(vec![
                             TokenTree::Ident(Ident {
                                 sym: Symbol::intern("doc"),
-                                is_raw: false,
+                                kind: IdentKind::Normal,
                                 span,
                             }),
                             TokenTree::Punct(Punct { ch: b'=', joint: false, span }),
@@ -216,7 +216,7 @@ impl<S> TokenStream<S> {
                 }
                 rustc_lexer::TokenKind::BlockComment { doc_style: Some(doc_style), terminated } => {
                     let text =
-                        &s[range.start + 2..if terminated { range.end - 2 } else { range.end }];
+                        &s[range.start + 3..if terminated { range.end - 2 } else { range.end }];
                     tokenstream.push(TokenTree::Punct(Punct { ch: b'#', joint: false, span }));
                     if doc_style == DocStyle::Inner {
                         tokenstream.push(TokenTree::Punct(Punct { ch: b'!', joint: false, span }));
@@ -226,7 +226,7 @@ impl<S> TokenStream<S> {
                         stream: Some(TokenStream::new(vec![
                             TokenTree::Ident(Ident {
                                 sym: Symbol::intern("doc"),
-                                is_raw: false,
+                                kind: IdentKind::Normal,
                                 span,
                             }),
                             TokenTree::Punct(Punct { ch: b'=', joint: false, span }),
@@ -267,7 +267,7 @@ impl<S> TokenStream<S> {
                 }
                 rustc_lexer::TokenKind::Ident => tokenstream.push(TokenTree::Ident(Ident {
                     sym: Symbol::intern(&s[range.clone()]),
-                    is_raw: false,
+                    kind: IdentKind::Normal,
                     span: span.derive_ranged(range),
                 })),
                 rustc_lexer::TokenKind::InvalidIdent => {
@@ -277,7 +277,15 @@ impl<S> TokenStream<S> {
                     let range = range.start + 2..range.end;
                     tokenstream.push(TokenTree::Ident(Ident {
                         sym: Symbol::intern(&s[range.clone()]),
-                        is_raw: true,
+                        kind: IdentKind::Raw,
+                        span: span.derive_ranged(range),
+                    }))
+                }
+                rustc_lexer::TokenKind::ForcedKeywordIdent => {
+                    let range = range.start + 2..range.end;
+                    tokenstream.push(TokenTree::Ident(Ident {
+                        sym: Symbol::intern(&s[range.clone()]),
+                        kind: IdentKind::ForcedKeyword,
                         span: span.derive_ranged(range),
                     }))
                 }
@@ -298,7 +306,7 @@ impl<S> TokenStream<S> {
                     }));
                     tokenstream.push(TokenTree::Ident(Ident {
                         sym: Symbol::intern(&s[range.clone()]),
-                        is_raw: true,
+                        kind: IdentKind::Raw,
                         span: span.derive_ranged(range),
                     }))
                 }
@@ -314,7 +322,7 @@ impl<S> TokenStream<S> {
                     }));
                     tokenstream.push(TokenTree::Ident(Ident {
                         sym: Symbol::intern(&s[range.clone()]),
-                        is_raw: false,
+                        kind: IdentKind::Normal,
                         span: span.derive_ranged(range),
                     }))
                 }
@@ -484,9 +492,9 @@ fn display_token_tree<S>(
             *emit_whitespace = !*joint;
             write!(f, "{}", *ch as char)?;
         }
-        TokenTree::Ident(Ident { sym, is_raw, span: _ }) => {
-            if *is_raw {
-                write!(f, "r#")?;
+        TokenTree::Ident(Ident { sym, kind, span: _ }) => {
+            if let Some(prefix) = kind.prefix() {
+                write!(f, "{prefix}")?;
             }
             write!(f, "{sym}")?;
             *emit_whitespace = true;
@@ -613,10 +621,10 @@ fn debug_token_tree<S: fmt::Debug>(
             *ch as char,
             if *joint { "[joint]" } else { "[alone]" }
         )?,
-        TokenTree::Ident(Ident { sym, is_raw, span }) => {
+        TokenTree::Ident(Ident { sym, kind, span }) => {
             write!(f, "IDENT {span:#?} ")?;
-            if *is_raw {
-                write!(f, "r#")?;
+            if let Some(prefix) = kind.prefix() {
+                write!(f, "{prefix}")?;
             }
             write!(f, "{sym}")?;
         }
@@ -757,5 +765,11 @@ mod tests {
             TokenStream::from_str("{} () [] <> ;/., \"gfhdgfuiofghd\" 0f32 r#\"dff\"# 'r#lt", ())
                 .unwrap();
         assert_eq!(token_stream.to_string(), "{}()[]<> ;/., \"gfhdgfuiofghd\"0f32 r#\"dff\"#'r#lt");
+    }
+
+    #[test]
+    fn doc_comment_from_str() {
+        let token_stream = TokenStream::from_str("/// foo", ()).unwrap();
+        assert_eq!(token_stream.to_string(), r#"# [doc = " foo"]"#);
     }
 }

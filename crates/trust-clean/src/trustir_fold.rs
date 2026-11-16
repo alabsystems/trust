@@ -249,8 +249,9 @@ pub type DumpBodies = BTreeMap<String, VerifiableFunction>;
 /// * when a parent IS generic the two renderings differ in a MIDDLE turbofish
 ///   (`Vec::<Name>::push` against `Vec::<T, A>::push`), the derived key matches
 ///   no dump, and the join declines. Fail-closed, not fuzzy.
-/// * when two crates share a name — the exact condition under which the
-///   producer appends `__trust_args` at all — a callee outside the local crate
+/// * when two crates share a name — a necessary condition for the producer to
+///   append `__trust_args` (since ARGS-FINGERPRINT-READ-1 round 2 it also needs an
+///   argument that names such a crate) — a callee outside the local crate
 ///   additionally carries `disambiguate_direct_call_path`'s
 ///   `__trust_crate@{stable_crate_id}::` PREFIX, which the derivation retains
 ///   and no dump `def_path` carries. Such a callee therefore misses rather than

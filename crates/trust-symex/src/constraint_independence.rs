@@ -101,26 +101,66 @@ impl ConstraintPartitioner {
             };
         }
 
-        let graph = self.build_dependency_graph(constraints);
-        let components = self.connected_components(&graph);
+        let n = constraints.len();
+        let per_constraint_vars: Vec<Vec<String>> =
+            constraints.iter().map(|c| self.extract_variables(c)).collect();
+
+        // Union constraints that share any variable directly via first-owner map,
+        // avoiding O(C^2) pairwise edge materialization and duplicate variable extraction.
+        let mut parent: Vec<usize> = (0..n).collect();
+        let mut rank: Vec<usize> = vec![0; n];
+        let mut first_owner: BTreeMap<&str, usize> = BTreeMap::default();
+        for (idx, vars) in per_constraint_vars.iter().enumerate() {
+            for v in vars {
+                match first_owner.entry(v.as_str()) {
+                    std::collections::btree_map::Entry::Occupied(e) => {
+                        Self::uf_union(&mut parent, &mut rank, *e.get(), idx);
+                    }
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(idx);
+                    }
+                }
+            }
+        }
+
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::default();
+        for i in 0..n {
+            let root = Self::uf_find(&mut parent, i);
+            groups.entry(root).or_default().push(i);
+        }
+        let mut components: Vec<Vec<usize>> = groups.into_values().collect();
+        components.sort_by_key(|g| g[0]);
 
         let mut raw_partitions: Vec<Vec<String>> = components
             .iter()
             .map(|comp| comp.iter().map(|&i| constraints[i].to_string()).collect())
             .collect();
 
-        if self.config.merge_small_partitions {
+        let result_partitions: Vec<ConstraintPartition> = if self.config.merge_small_partitions {
             raw_partitions = self.merge_small(raw_partitions);
-        }
-
-        let result_partitions: Vec<ConstraintPartition> = raw_partitions
-            .iter()
-            .map(|group| {
-                let vars: Vec<Vec<String>> =
-                    group.iter().map(|c| self.extract_variables(c)).collect();
-                ConstraintPartition { partitions: vec![group.clone()], variable_groups: vars }
-            })
-            .collect();
+            raw_partitions
+                .into_iter()
+                .map(|group| {
+                    let vars: Vec<Vec<String>> =
+                        group.iter().map(|c| self.extract_variables(c)).collect();
+                    ConstraintPartition { partitions: vec![group], variable_groups: vars }
+                })
+                .collect()
+        } else {
+            let mut vars_opt: Vec<Option<Vec<String>>> =
+                per_constraint_vars.into_iter().map(Some).collect();
+            components
+                .into_iter()
+                .zip(raw_partitions)
+                .map(|(comp, group)| {
+                    let vars: Vec<Vec<String>> = comp
+                        .into_iter()
+                        .map(|i| vars_opt[i].take().unwrap_or_default())
+                        .collect();
+                    ConstraintPartition { partitions: vec![group], variable_groups: vars }
+                })
+                .collect()
+        };
 
         let max_size = result_partitions
             .iter()
@@ -139,8 +179,8 @@ impl ConstraintPartitioner {
     /// Check whether two constraints are independent (share no variables).
     #[must_use]
     pub fn are_independent(&self, a: &str, b: &str) -> bool {
-        let vars_a: BTreeSet<String> = self.extract_variables(a).into_iter().collect();
-        let vars_b: BTreeSet<String> = self.extract_variables(b).into_iter().collect();
+        let vars_a = Self::extract_variable_slices(a);
+        let vars_b = Self::extract_variable_slices(b);
         vars_a.is_disjoint(&vars_b)
     }
 
@@ -148,14 +188,11 @@ impl ConstraintPartitioner {
     /// constraints that share at least one variable.
     #[must_use]
     pub fn build_dependency_graph(&self, constraints: &[&str]) -> IndependenceGraph {
-        let per_constraint_vars: Vec<BTreeSet<String>> =
-            constraints.iter().map(|c| self.extract_variables(c).into_iter().collect()).collect();
-
-        // Map variable -> set of constraint indices that mention it.
+        // Map variable -> set of constraint indices that mention it without allocating String per var.
         let mut var_to_constraints: BTreeMap<&str, Vec<usize>> = BTreeMap::default();
-        for (idx, vars) in per_constraint_vars.iter().enumerate() {
-            for v in vars {
-                var_to_constraints.entry(v.as_str()).or_default().push(idx);
+        for (idx, &c) in constraints.iter().enumerate() {
+            for v in Self::extract_variable_slices(c) {
+                var_to_constraints.entry(v).or_default().push(idx);
             }
         }
 
@@ -177,6 +214,34 @@ impl ConstraintPartitioner {
         }
     }
 
+    fn extract_variable_slices(constraint: &str) -> BTreeSet<&str> {
+        let mut vars: BTreeSet<&str> = BTreeSet::new();
+        let mut iter = constraint.char_indices().peekable();
+
+        while let Some(&(start, ch)) = iter.peek() {
+            if ch.is_alphabetic() || ch == '_' {
+                iter.next();
+                let mut end = start + ch.len_utf8();
+                while let Some(&(idx, next_ch)) = iter.peek() {
+                    if next_ch.is_alphanumeric() || next_ch == '_' {
+                        end = idx + next_ch.len_utf8();
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                let token = &constraint[start..end];
+                if !is_smt_keyword(token) {
+                    vars.insert(token);
+                }
+            } else {
+                iter.next();
+            }
+        }
+
+        vars
+    }
+
     /// Extract variable names from a constraint string.
     ///
     /// Variables are identified as sequences of alphanumeric characters or
@@ -184,36 +249,30 @@ impl ConstraintPartitioner {
     /// rules). Keywords and numeric literals are excluded.
     #[must_use]
     pub fn extract_variables(&self, constraint: &str) -> Vec<String> {
-        let keywords: BTreeSet<&str> = [
-            "and", "or", "not", "true", "false", "ite", "let", "forall", "exists", "assert",
-            "check", "sat", "unsat", "define", "declare", "bvadd", "bvsub", "bvmul", "bvand",
-            "bvor", "bvxor", "bvshl", "bvlshr", "bvashr", "bvnot", "bvneg", "bvult", "bvslt",
-            "bvugt", "bvsgt", "bvule", "bvsle", "bvuge", "bvsge", "concat", "extract", "select",
-            "store", "iff", "xor", "implies", "distinct", "if", "then", "else",
-        ]
-        .into_iter()
-        .collect();
+        Self::extract_variable_slices(constraint).into_iter().map(str::to_string).collect()
+    }
 
-        let mut vars = BTreeSet::new();
-        let chars: Vec<char> = constraint.chars().collect();
-        let mut i = 0;
-
-        while i < chars.len() {
-            if chars[i].is_alphabetic() || chars[i] == '_' {
-                let start = i;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                    i += 1;
-                }
-                let token: String = chars[start..i].iter().collect();
-                if !keywords.contains(token.as_str()) {
-                    vars.insert(token);
-                }
-            } else {
-                i += 1;
-            }
+    fn uf_find(parent: &mut [usize], x: usize) -> usize {
+        if parent[x] != x {
+            parent[x] = Self::uf_find(parent, parent[x]);
         }
+        parent[x]
+    }
 
-        vars.into_iter().collect()
+    fn uf_union(parent: &mut [usize], rank: &mut [usize], a: usize, b: usize) {
+        let ra = Self::uf_find(parent, a);
+        let rb = Self::uf_find(parent, b);
+        if ra == rb {
+            return;
+        }
+        if rank[ra] < rank[rb] {
+            parent[ra] = rb;
+        } else if rank[ra] > rank[rb] {
+            parent[rb] = ra;
+        } else {
+            parent[rb] = ra;
+            rank[ra] += 1;
+        }
     }
 
     /// Compute connected components of the independence graph via union-find.
@@ -228,37 +287,14 @@ impl ConstraintPartitioner {
         let mut parent: Vec<usize> = (0..n).collect();
         let mut rank: Vec<usize> = vec![0; n];
 
-        fn find(parent: &mut [usize], x: usize) -> usize {
-            if parent[x] != x {
-                parent[x] = find(parent, parent[x]);
-            }
-            parent[x]
-        }
-
-        fn union(parent: &mut [usize], rank: &mut [usize], a: usize, b: usize) {
-            let ra = find(parent, a);
-            let rb = find(parent, b);
-            if ra == rb {
-                return;
-            }
-            if rank[ra] < rank[rb] {
-                parent[ra] = rb;
-            } else if rank[ra] > rank[rb] {
-                parent[rb] = ra;
-            } else {
-                parent[rb] = ra;
-                rank[ra] += 1;
-            }
-        }
-
         for &(a, b) in &graph.edges {
-            union(&mut parent, &mut rank, a, b);
+            Self::uf_union(&mut parent, &mut rank, a, b);
         }
 
         // Group by root.
         let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::default();
         for i in 0..n {
-            let root = find(&mut parent, i);
+            let root = Self::uf_find(&mut parent, i);
             groups.entry(root).or_default().push(i);
         }
 
@@ -291,22 +327,65 @@ impl ConstraintPartitioner {
             return large;
         }
 
-        if large.is_empty() {
+        // Merge small constraints into the smallest large partition.
+        let Some((min_idx, _)) = large.iter().enumerate().min_by_key(|(_, p)| p.len()) else {
             // Everything was small — just return as one partition.
             return vec![small];
-        }
-
-        // Merge small constraints into the smallest large partition.
-        let min_idx = large
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, p)| p.len())
-            .map(|(i, _)| i)
-            // SAFETY: We checked large.is_empty() above and returned early.
-            .unwrap_or_else(|| unreachable!("large empty after non-empty check"));
+        };
         large[min_idx].extend(small);
         large
     }
+}
+
+fn is_smt_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "and"
+            | "or"
+            | "not"
+            | "true"
+            | "false"
+            | "ite"
+            | "let"
+            | "forall"
+            | "exists"
+            | "assert"
+            | "check"
+            | "sat"
+            | "unsat"
+            | "define"
+            | "declare"
+            | "bvadd"
+            | "bvsub"
+            | "bvmul"
+            | "bvand"
+            | "bvor"
+            | "bvxor"
+            | "bvshl"
+            | "bvlshr"
+            | "bvashr"
+            | "bvnot"
+            | "bvneg"
+            | "bvult"
+            | "bvslt"
+            | "bvugt"
+            | "bvsgt"
+            | "bvule"
+            | "bvsle"
+            | "bvuge"
+            | "bvsge"
+            | "concat"
+            | "extract"
+            | "select"
+            | "store"
+            | "iff"
+            | "xor"
+            | "implies"
+            | "distinct"
+            | "if"
+            | "then"
+            | "else"
+    )
 }
 
 // ---------------------------------------------------------------------------

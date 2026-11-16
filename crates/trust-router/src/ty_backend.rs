@@ -877,9 +877,9 @@ mod tests {
             .build();
 
         let adapter = StateMachineAdapter::new(machine);
-        assert_eq!(adapter.initial_states(), vec![0]);
-        assert_eq!(adapter.successors(&0), vec![("go".to_string(), 1)]);
-        assert!(adapter.successors(&1).is_empty());
+        assert_eq!(adapter.initial_states().expect("infallible"), vec![0]);
+        assert_eq!(adapter.successors(&0).expect("infallible"), vec![("go".to_string(), 1)]);
+        assert!(adapter.successors(&1).expect("infallible").is_empty());
         assert_eq!(adapter.fingerprint(&42), 42);
     }
 
@@ -1350,23 +1350,6 @@ mod tests {
         assert!(spec.contains("Property == <>done"), "should have property definition");
         assert!(spec.contains("Init =="), "should have init");
         assert!(spec.contains("===="), "should have module footer");
-    }
-
-    #[test]
-    fn test_bridge_adapter_reexported_from_trust_temporal() {
-        // Verify the StateMachineAdapter from trust-temporal works
-        // the same as the previously local one.
-        let machine = StateMachineBuilder::new(StateId(0))
-            .add_state(State::new(StateId(0), "Start"))
-            .add_state(State::new(StateId(1), "End"))
-            .add_transition(Transition::new(StateId(0), StateId(1), "go"))
-            .build();
-
-        let adapter = StateMachineAdapter::new(machine);
-        assert_eq!(adapter.initial_states(), vec![0]);
-        assert_eq!(adapter.successors(&0), vec![("go".to_string(), 1)]);
-        assert!(adapter.successors(&1).is_empty());
-        assert_eq!(adapter.fingerprint(&42), 42);
     }
 
     #[test]

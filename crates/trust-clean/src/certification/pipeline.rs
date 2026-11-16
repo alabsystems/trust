@@ -63,6 +63,13 @@ impl CertificationPipeline {
         result: &VerificationResult,
         proof_term: Vec<u8>,
     ) -> CertificationResult {
+        // TINV-8 (2026-10-05): the kernel never certifies a VC whose violation formula
+        // is not situated (`VerificationCondition::kernel_authority_refusal`: the kind
+        // gate, then a TINV row's situatedness gate), on this path as on trust-certify's
+        // `certify_vc`.
+        if let Some(why) = vc.kernel_authority_refusal() {
+            return CertificationResult::Skipped { reason: why.to_string() };
+        }
         // Trust: Only attempt certification for proved results
         let VerificationResult::Proved { solver, strength, .. } = result else {
             return CertificationResult::Skipped {
@@ -109,6 +116,11 @@ impl CertificationPipeline {
         result: &VerificationResult,
         proof_term: Vec<u8>,
     ) -> CertificationResult {
+        // TINV-8: the same gate as `certify` (`generate_certificate_unchecked` refuses
+        // too; this reports it as Skipped like the other wrappers).
+        if let Some(why) = vc.kernel_authority_refusal() {
+            return CertificationResult::Skipped { reason: why.to_string() };
+        }
         let VerificationResult::Proved { solver, strength, .. } = result else {
             return CertificationResult::Skipped {
                 reason: format!(
@@ -164,6 +176,13 @@ impl CertificationPipeline {
         result: &VerificationResult,
         solver_proof: &SolverProof,
     ) -> CertificationResult {
+        // TINV-8 (2026-10-05): the kernel never certifies a VC whose violation formula
+        // is not situated (`VerificationCondition::kernel_authority_refusal`: the kind
+        // gate, then a TINV row's situatedness gate), on this path as on trust-certify's
+        // `certify_vc`.
+        if let Some(why) = vc.kernel_authority_refusal() {
+            return CertificationResult::Skipped { reason: why.to_string() };
+        }
         let VerificationResult::Proved { solver, strength, .. } = result else {
             return CertificationResult::Skipped {
                 reason: format!(
@@ -305,6 +324,13 @@ impl CertificationPipeline {
         result: &VerificationResult,
         solver_proof: &SolverProof,
     ) -> (CertificationResult, CertificationScope) {
+        // TINV-8: the same gate as `certify`.
+        if let Some(why) = vc.kernel_authority_refusal() {
+            return (
+                CertificationResult::Skipped { reason: why.to_string() },
+                CertificationScope::Uncertified { reason: why.to_string() },
+            );
+        }
         let VerificationResult::Proved { .. } = result else {
             return (
                 CertificationResult::Skipped {
@@ -369,7 +395,9 @@ impl CertificationPipeline {
     ///
     /// Re-checks a previously generated certificate: validates fingerprint
     /// freshness, then runs clean kernel type-checking. Returns `Ok(())` if
-    /// the certificate is still valid and clean confirms it.
+    /// the certificate is still valid and clean confirms it. A VC the kernel may not
+    /// certify (`VerificationCondition::kernel_authority_refusal`) is refused with
+    /// `CertificateError::AuthorityRefused` whatever the certificate holds (TINV-8).
     pub fn verify_existing(
         &self,
         vc: &VerificationCondition,

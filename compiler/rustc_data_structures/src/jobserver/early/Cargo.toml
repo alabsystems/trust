@@ -1,0 +1,43 @@
+[package]
+name = "compiler-early-custody-source-fixtures"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Independent engineering fixtures, never a compiler production member.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+jobserver_crate = { package = "jobserver", path = "../../../../../vendor/jobserver" }
+jobserver_utils = { path = "../../../../../src/jobserver_utils" }
+trust-resource-controller = { path = "../../../../../crates/trust-resource-controller", features = ["client"] }
+
+[dev-dependencies]
+tempfile = "3"
+parking_lot = "0.12"
+trust-build-cpu = { path = "../../../../../crates/trust-build-cpu", features = ["jobserver", "native-host"] }
+trust-resource-provenance = { path = "../../../../../crates/trust-resource-provenance" }
+sha2 = { package = "trust-sha2", path = "../../../../../crates/trust-sha2" }
+
+[[bin]]
+name = "early-custody-entry"
+path = "entry.rs"
+
+[[bin]]
+name = "early-custody-embedded"
+path = "embedded.rs"
+
+[[test]]
+name = "early-entry"
+path = "tests.rs"
+
+[[test]]
+name = "jobserver-source"
+# Trust: under tests/, as tidy's `unit_tests` check requires of a #[test].
+path = "tests/jobserver_source.rs"
+
+# Match the compiler's maintained first-party dependency override.
+[patch.crates-io]
+memchr = { path = "../../../../../crates/trust-memchr" }
+jobserver = { path = "../../../../../vendor/jobserver" }

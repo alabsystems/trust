@@ -176,7 +176,7 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
         self.thir.exprs[e].ty
     }
 
-    fn instantiated_type_of(&self, did: DefId, args: ty::GenericArgsRef<'tcx>) -> Ty<'tcx> {
+    fn instantiated_type_of(&self, did: DefId, args: ty::GenericArgs<'tcx>) -> Ty<'tcx> {
         self.tcx.type_of(did).instantiate(self.tcx, args).skip_normalization()
     }
 
@@ -282,7 +282,9 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                     let c = self.teq(self.ety(*value), ty);
                     self.ok(c, idx, "scope-propagate")
                 }
-                ExprKind::Use { source } | ExprKind::ByUse { expr: source, .. } => {
+                // Upstream 1.101: THIR `Use` was folded into `ByUse`, and
+                // value-forcing casts are spelled `ValueExpr`; both propagate.
+                ExprKind::ValueExpr { source } | ExprKind::ByUse { expr: source, .. } => {
                     let c = self.teq(self.ety(*source), ty);
                     self.ok(c, idx, "use-propagate")
                 }
@@ -432,7 +434,7 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                     let c = match lt.kind() {
                         ty::Adt(def, args) => {
                             let fty = def.variant(*variant_index).fields[*name]
-                                .ty(self.tcx, args)
+                                .ty(self.tcx, *args)
                                 .skip_normalization();
                             self.teq(fty, ty)
                         }
@@ -511,7 +513,7 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                             let sig = self.tcx.instantiate_bound_regions_with_erased(
                                 self.tcx
                                     .fn_sig(*did)
-                                    .instantiate(self.tcx, gargs)
+                                    .instantiate(self.tcx, gargs.skip_binder())
                                     .skip_normalization(),
                             );
                             let inputs = sig.inputs();
@@ -546,7 +548,7 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                                         self.tcx,
                                         self.typing_env,
                                         *did,
-                                        *gargs,
+                                        gargs.skip_binder(),
                                     ),
                                     Ok(Some(_))
                                 );
@@ -577,11 +579,11 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
 
                 // ---- consts with given picks ----
                 ExprKind::NamedConst { def_id, args, .. } => {
-                    let c = self.teq(self.instantiated_type_of(*def_id, args), ty);
+                    let c = self.teq(self.instantiated_type_of(*def_id, *args), ty);
                     self.ok(c, idx, "named-const")
                 }
                 ExprKind::ConstBlock { did, args } => {
-                    let c = self.teq(self.instantiated_type_of(*did, args), ty);
+                    let c = self.teq(self.instantiated_type_of(*did, *args), ty);
                     self.ok(c, idx, "const-block")
                 }
                 ExprKind::ConstParam { def_id, .. } => {
@@ -674,7 +676,7 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                                     let src_sig = self.tcx.instantiate_bound_regions_with_erased(
                                         self.tcx
                                             .fn_sig(*did)
-                                            .instantiate(self.tcx, gargs)
+                                            .instantiate(self.tcx, gargs.skip_binder())
                                             .skip_normalization(),
                                     );
                                     let dst_sig = self

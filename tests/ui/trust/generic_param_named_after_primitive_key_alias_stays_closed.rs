@@ -83,9 +83,35 @@ impl Tr for u8 {
 /// The PRIMITIVE `u8`, named where the parameter does not shadow it.
 type Prim = u8;
 
+// OD-1 phase 1 (2026-10-04): `x.m()` in `go` is now an ADMITTED instance-hypothesis
+// site (`<u8 as Tr>::m` on `go`'s own parameter, open, unresolved). The compiler
+// admits it by its exact MIR block and the bridge lowers that block before any
+// by-name call binding, so it can no longer be bound to `impl Tr for u8` either; `go`
+// publishes one `assumption:instance-hypothesis` row and passes strict
+// CONDITIONALLY (the warning below), never as proved. The by-name collision this file
+// guards against is still exercised on a NON-admitted site: `go_raw` hands the
+// dispatch a raw pointer (design §2.3), so its call stays on the fatal absent-callee
+// arm, and the strict build must still refuse it.
 pub fn go<u8: Tr>(x: &u8, v: &Prim) -> u32 {
-    //~^ ERROR Trust strict verification failed
+    //~^ WARN 1 instance hypothesis row(s)
     let a = v.m();
     let c = x.m();
+    a.wrapping_add(c)
+}
+
+pub trait Tr2 {
+    fn m2(&self, p: *const Prim) -> u32;
+}
+
+impl Tr2 for Prim {
+    fn m2(&self, _p: *const Prim) -> u32 {
+        1
+    }
+}
+
+pub fn go_raw<u8: Tr2>(x: &u8, v: &Prim, p: *const Prim) -> u32 {
+    //~^ ERROR Trust strict verification failed
+    let a = v.m2(p);
+    let c = x.m2(p);
     a.wrapping_add(c)
 }

@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import selectors
 import signal
 import stat
@@ -33,22 +34,9 @@ from typing import Any
 def _require_python_311() -> None:
     if sys.version_info >= (3, 11):
         return
-    candidates = (
-        "/opt/homebrew/bin/python3.14",
-        "/opt/homebrew/bin/python3.13",
-        "/opt/homebrew/bin/python3.12",
-        "/opt/homebrew/bin/python3.11",
-        "/usr/local/bin/python3.14",
-        "/usr/local/bin/python3.13",
-        "/usr/local/bin/python3.12",
-        "/usr/local/bin/python3.11",
-        "/usr/bin/python3.14",
-        "/usr/bin/python3.13",
-        "/usr/bin/python3.12",
-        "/usr/bin/python3.11",
-    )
-    for candidate in candidates:
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+    for minor in (14, 13, 12, 11):
+        candidate = shutil.which(f"python3.{minor}")
+        if candidate:
             os.execv(candidate, [candidate, *sys.argv])
     raise SystemExit(
         "collect_lambda_calculus_diagnostic.py requires Python >=3.11 (tomllib); "
@@ -684,6 +672,28 @@ def scrubbed_environment(
     return measurement_environment, provenance_environment, authority
 
 
+# The one symlink `build` may be: a link to the sibling REAL directory
+# `build.noindex`, whose name keeps Spotlight from indexing hundreds of GiB of
+# build output (docs/BUILD_AND_INSTALL.md, "Keeping Spotlight out of build/").
+# Same predicate as mint_seed_support.py; scripts/tests/build_dir_symlink_test.py
+# drives every copy over one fixture matrix.
+BUILD_NOINDEX = "build.noindex"
+
+
+def is_sanctioned_build_link(root: Path) -> bool:
+    """True iff `root/build` is a symlink resolving to the real `root/build.noindex`."""
+    lexical = root / "build"
+    try:
+        if not stat.S_ISLNK(os.lstat(lexical).st_mode):
+            return False
+        physical = root.resolve(strict=True) / BUILD_NOINDEX
+        if not stat.S_ISDIR(os.lstat(physical).st_mode):
+            return False
+        return lexical.resolve(strict=True) == physical
+    except (OSError, RuntimeError):
+        return False
+
+
 def resolve_stage_root(repo: Path, argument: str | None) -> Path:
     if argument:
         lexical = Path(argument).expanduser()
@@ -706,7 +716,14 @@ def resolve_stage_root(repo: Path, argument: str | None) -> Path:
         relative = stage_root.relative_to(repo)
     except ValueError as error:
         raise EvidenceError("Stage2 root must be repository-local") from error
-    if len(relative.parts) != 3 or relative.parts[0] != "build" or relative.parts[2] != "stage2":
+    # A resolved Stage2 root under the sanctioned `build -> build.noindex` link
+    # names the physical directory; any other first component is refused.
+    build_names = {"build", BUILD_NOINDEX} if is_sanctioned_build_link(repo) else {"build"}
+    if (
+        len(relative.parts) != 3
+        or relative.parts[0] not in build_names
+        or relative.parts[2] != "stage2"
+    ):
         raise EvidenceError("Stage2 root must match repository-local build/*/stage2")
     return stage_root
 

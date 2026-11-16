@@ -4,7 +4,8 @@ use rustc_infer::traits::{Obligation, ObligationCause};
 use rustc_middle::mir::interpret::{AllocInit, Allocation, GlobalAlloc, InterpResult, Pointer};
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{PolyExistentialPredicate, Ty, TyCtxt, TypeVisitable, TypeVisitableExt};
-use rustc_middle::{mir, span_bug, ty};
+use rustc_middle::{mir, ty};
+use rustc_span::span_bug;
 use rustc_trait_selection::traits::ObligationCtxt;
 use tracing::debug;
 
@@ -19,17 +20,20 @@ pub(crate) fn type_implements_dyn_trait<'tcx, M: Machine<'tcx>>(
     ty: Ty<'tcx>,
     trait_ty: Ty<'tcx>,
 ) -> InterpResult<'tcx, (bool, &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>)> {
-    ensure_monomorphic_enough(ecx.tcx.tcx, ty)?;
-    ensure_monomorphic_enough(ecx.tcx.tcx, trait_ty)?;
+    ensure_monomorphic_enough(ty)?;
+    ensure_monomorphic_enough(trait_ty)?;
 
     let ty::Dynamic(preds, _) = trait_ty.kind() else {
         span_bug!(
-            ecx.find_closest_untracked_caller_location(),
+            ecx.cur_span(),
             "Invalid type provided to type_implements_predicates. U must be dyn Trait, got {trait_ty}."
         );
     };
 
-    let (infcx, param_env) = ecx.tcx.infer_ctxt().build_with_typing_env(ecx.typing_env);
+    let (infcx, param_env) = ecx.tcx.infer_ctxt().build_with_typing_env(ty::TypingEnv::new(
+        ecx.typing_env.param_env,
+        ty::TypingMode::Reflection,
+    ));
 
     let ocx = ObligationCtxt::new(&infcx);
     ocx.register_obligations(preds.iter().map(|pred: PolyExistentialPredicate<'_>| {
@@ -40,7 +44,7 @@ pub(crate) fn type_implements_dyn_trait<'tcx, M: Machine<'tcx>>(
         });
         Obligation::new(ecx.tcx.tcx, ObligationCause::dummy(), param_env, pred)
     }));
-    let type_impls_trait = ocx.evaluate_obligations_error_on_ambiguity().is_empty();
+    let type_impls_trait = ocx.evaluate_obligations_error_on_ambiguity().no_errors();
     // Since `assumed_wf_tys=[]` the choice of LocalDefId is irrelevant, so using the "default"
     let regions_are_valid = ocx.resolve_regions(CRATE_DEF_ID, param_env, []).is_empty();
 
@@ -50,7 +54,7 @@ pub(crate) fn type_implements_dyn_trait<'tcx, M: Machine<'tcx>>(
 /// Checks whether a type contains generic parameters which must be instantiated.
 ///
 /// In case it does, returns a `TooGeneric` const eval error.
-pub(crate) fn ensure_monomorphic_enough<'tcx, T>(_tcx: TyCtxt<'tcx>, ty: T) -> InterpResult<'tcx>
+pub(crate) fn ensure_monomorphic_enough<'tcx, T>(ty: T) -> InterpResult<'tcx>
 where
     T: TypeVisitable<TyCtxt<'tcx>>,
 {
@@ -82,7 +86,7 @@ pub(crate) fn create_static_alloc<'tcx>(
     let (size, align) =
         GlobalAlloc::Static(static_def_id.into()).size_and_align(*ecx.tcx, ecx.typing_env);
     assert_eq!(size, layout.size);
-    assert!(align >= layout.align.abi);
+    assert!(align >= layout.align);
 
     let alloc = Allocation::try_new(size, align, AllocInit::Uninit, ())?;
     let alloc_id = ecx.tcx.reserve_and_set_static_alloc(static_def_id.into());

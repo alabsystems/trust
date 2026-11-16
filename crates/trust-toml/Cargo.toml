@@ -31,11 +31,10 @@
 #
 # Byte-identity with the incumbent's emitter (values-before-tables ordering,
 # `[[table]]` rendering, string escaping) is the write path's acceptance gate,
-# and it is enforced two ways: a generated-document differential in
-# `tests/serialize_differential.rs` (floor 1.0 — measured exactly 100%), and a
-# hard byte-equality assertion over the seven committed `tests/js262/*.toml`
-# ledgers that `trust-js-differential` rewrites in place. A ledger that
-# reformats is the exact failure this crate exists to prevent: never rebless it.
+# enforced by a generated-document differential in
+# `tests/serialize_differential.rs` (floor 1.0 — measured exactly 100%). A
+# document that reformats is the exact failure this crate exists to prevent:
+# never rebless it.
 #
 # HISTORICAL NOTE, kept because it read as authoritative for two slices: this
 # header used to say "there is deliberately no `to_string` / `to_string_pretty`"

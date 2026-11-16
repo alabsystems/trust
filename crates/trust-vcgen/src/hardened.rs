@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 // trust_vcgen/hardened.rs: hardened boundary obligations for compiler workflows
 //
 // These checks model the "safe Rust but still wrong" classes from the
@@ -172,11 +173,252 @@ const CALL_RULES: &[CallRule] = &[
     },
 ];
 
-#[derive(Debug, Clone)]
-struct CallSite {
+/// Trust (2026-10-25, hardened `stdout` false match; tightened 2026-10-26 after
+/// an adversarial review found the first version unsound): whole rendered callees
+/// that a bare-needle [`CallRule`] matches by spelling but that are shown not to
+/// be the rule's item, so the rule must not mint on them.
+///
+/// The `stdout` rule is about THIS process's standard output, whose behaviour on
+/// a closed pipe depends on the SIGPIPE disposition (`std::io::stdout`, def path
+/// `std::io::stdio::stdout`). A bare needle compares identifier tokens, so it
+/// also matched `std::process::Command::stdout`, which records how a CHILD
+/// process's stdout is wired. Measured on claude-code-alab (2026-10-25): two of
+/// its three `process_semantics` rows were
+/// `std::process::Command::stdout::<std::process::Stdio>`.
+///
+/// WHY THE GENERIC ARGUMENT IS PART OF EVERY ENTRY. `Command::stdout<T:
+/// Into<Stdio>>` (library/std/src/process.rs) runs `cfg.into()` and stores the
+/// result. The store writes nothing, but the conversion is chosen by `T`, and
+/// for a dependency's type it is that dependency's code: `impl From<dep::Loud>
+/// for Stdio { fn from(..) { println!(..); .. } }` is legal in `dep`, as are
+/// `From<Box<dep::Loud>>` and `From<&dep::Loud>` (`Box` and `&` are
+/// `#[fundamental]`) and `impl Into<Stdio> for dep::Direct`. Measured
+/// 2026-10-26: each of those four calls writes fd 1 and panics on a closed pipe,
+/// and the first version of this list (a def-path compare with generic arguments
+/// stripped) withheld the row for all four, and for `::<T>`. So an entry names
+/// the call WITH its argument, and only for argument types whose conversion is
+/// std's or core's own body and writes nothing: `Stdio` (core's reflexive `From<T>
+/// for T`), `File`, `io::Stdout`/`io::Stderr` (a static-fd marker, no write),
+/// `ChildStdin`/`ChildStdout`/`ChildStderr`, `OwnedFd` and the anonymous pipe
+/// ends (std's `From<_> for Stdio` impls in process.rs and os/unix/process.rs,
+/// each wrapping a descriptor). No other crate can add an `Into<Stdio>` impl for
+/// these types: the trait and every type in it are foreign to it, and core's
+/// blanket impls already cover them. Spellings measured on Trust 15698 at
+/// `-Copt-level=0` and `3` (`hardened boundary (process_semantics): <callee>`).
+///
+/// WHY WHOLE STRINGS. Compared byte for byte, an entry cannot be reached by a
+/// qualified prefix (`<X as T>::std::process::Command::stdout`, which a
+/// segment compare that drops `<…>` segments read as equal), a crate
+/// impersonating `std` (rendered under the `__trust_crate@<id>::` stamp, which
+/// [`trust_types::path_root_is_authenticated_sysroot_crate`] refuses), a module
+/// merely spelled `std::process` (rendered under its own crate's root), the
+/// extractor's argument tag (`::<__trust_args@…>`, written when a type named in
+/// the arguments may be a same-named crate's, so a type-path reader must decline
+/// it: [`trust_types::args_display_may_name_a_same_named_crate`], KNOWN_HAZARDS
+/// ARGS-FINGERPRINT-READ-1), a caller's type parameter (`::<T>`) or any other
+/// argument. All of those keep their row. The per-platform `std::sys::process::…::Command::stdout` impls are
+/// NOT listed: they never occur in a verified crate's calls (a verifying session
+/// runs the -O0 MIR pipeline and refuses `-Zmir-opt-level`), and were inlining
+/// ever to expose one, the conversion that fed it would be a separate call this
+/// list cannot see.
+///
+/// This is a deny-list of known non-writers, not an allow-list of the one writer,
+/// on purpose. An allow-list keyed only on `std::io::stdio::stdout` would also
+/// drop every call the token rule catches for real: a dependency's `…::stdout`
+/// (`anstream::stdout`, `termcolor::StandardStream::stdout` both write fd 1),
+/// and a std generic whose fn-item argument IS `std::io::stdout`
+/// (`core::ops::FnOnce::call_once::<fn() -> std::io::Stdout {std::io::stdout}, ()>`).
+const CALL_RULE_EXACT_CALLEE_EXCLUSIONS: &[(&str, &[&str])] = &[(
+    "stdout",
+    &[
+        "std::process::Command::stdout::<std::process::Stdio>",
+        "std::process::Command::stdout::<std::fs::File>",
+        "std::process::Command::stdout::<std::io::stdio::Stdout>",
+        "std::process::Command::stdout::<std::io::stdio::Stderr>",
+        "std::process::Command::stdout::<std::process::ChildStdin>",
+        "std::process::Command::stdout::<std::process::ChildStdout>",
+        "std::process::Command::stdout::<std::process::ChildStderr>",
+        "std::process::Command::stdout::<std::os::fd::owned::OwnedFd>",
+        "std::process::Command::stdout::<std::io::pipe::PipeReader>",
+        "std::process::Command::stdout::<std::io::pipe::PipeWriter>",
+    ],
+)];
+
+const FALLBACK_TOKEN_BIT: u64 = 1u64 << 63;
+
+#[inline]
+const fn known_hardened_token_bit(token: &[u8]) -> Option<u32> {
+    match token {
+        b"remove_file" => Some(0),
+        b"remove_dir" => Some(1),
+        b"rename" => Some(2),
+        b"canonicalize" => Some(3),
+        b"metadata" => Some(4),
+        b"set_permissions" => Some(5),
+        b"create" => Some(6),
+        b"open" => Some(7),
+        b"create_dir" => Some(8),
+        b"read_to_string" => Some(9),
+        b"from_utf8_lossy" => Some(10),
+        b"to_string_lossy" => Some(11),
+        b"from_utf8" => Some(12),
+        b"ok" => Some(13),
+        b"unwrap_or_default" => Some(14),
+        b"unwrap" => Some(15),
+        b"expect" => Some(16),
+        b"args" => Some(17),
+        b"stdout" => Some(18),
+        b"_print" => Some(19),
+        b"from_bytes" => Some(20),
+        b"chroot" => Some(21),
+        b"setuid" => Some(22),
+        b"setgid" => Some(23),
+        b"getpwnam" => Some(24),
+        b"getgrnam" => Some(25),
+        b"get_user_by_name" => Some(26),
+        b"dlopen" => Some(27),
+        b"set_owner" => Some(28),
+        b"chown" => Some(29),
+        _ => None,
+    }
+}
+
+const PERM_CREATE_MASK: u64 = (1u64 << 6) | (1u64 << 7) | (1u64 << 8);
+const PERM_REPAIR_MASK: u64 = (1u64 << 5) | (1u64 << 28) | (1u64 << 29);
+const TRUST_TRANSITION_MASK: u64 = (1u64 << 21) | (1u64 << 22) | (1u64 << 23);
+const TRUST_LATE_EFFECT_MASK: u64 = (1u64 << 24) | (1u64 << 25) | (1u64 << 26) | (1u64 << 27);
+
+#[inline]
+fn token_mask_from_bytes(bytes: &[u8]) -> u64 {
+    let mut mask = FALLBACK_TOKEN_BIT;
+    let mut i = 0;
+    let len = bytes.len();
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            let start = i;
+            i += 1;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if let Some(bit) = known_hardened_token_bit(&bytes[start..i]) {
+                mask |= 1u64 << bit;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    mask
+}
+
+struct CompiledCallRule {
+    rule: &'static CallRule,
+    mask: u64,
+    needle_segments: Vec<&'static str>,
+    is_absolute: bool,
+    is_qualified: bool,
+    exclusions: &'static [&'static str],
+}
+
+struct CompiledCallRules {
+    rules: Vec<CompiledCallRule>,
+    all_mask: u64,
+}
+
+impl CompiledCallRule {
+    #[inline]
+    fn matches_call<'a>(
+        &self,
+        call: &CallSite<'a>,
+        callee_segments: &mut Option<Vec<&'a str>>,
+    ) -> bool {
+        if (call.token_mask & self.mask) == 0 {
+            return false;
+        }
+        let needle_matches = if self.is_qualified {
+            if self.needle_segments.is_empty() {
+                false
+            } else {
+                let segs = callee_segments.get_or_insert_with(|| path_segments(call.callee));
+                if self.is_absolute {
+                    segs.as_slice() == self.needle_segments.as_slice()
+                } else {
+                    segs.ends_with(&self.needle_segments)
+                }
+            }
+        } else if self.mask != FALLBACK_TOKEN_BIT {
+            true
+        } else {
+            call_matches_with_segments(call.callee, callee_segments, self.rule.needle)
+        };
+        needle_matches && !self.exclusions.contains(&call.callee)
+    }
+}
+
+fn compiled_call_rules() -> &'static CompiledCallRules {
+    static COMPILED: std::sync::OnceLock<CompiledCallRules> = std::sync::OnceLock::new();
+    COMPILED.get_or_init(|| {
+        let mut all_mask = 0u64;
+        let rules = CALL_RULES
+            .iter()
+            .map(|rule| {
+                let tail = rule.needle.rsplit("::").next().unwrap_or(rule.needle).trim();
+                let mask = if !tail.is_empty() && !tail.contains(['<', '(']) {
+                    known_hardened_token_bit(tail.as_bytes())
+                        .map_or(FALLBACK_TOKEN_BIT, |bit| 1u64 << bit)
+                } else {
+                    FALLBACK_TOKEN_BIT
+                };
+                all_mask |= mask;
+                let is_qualified = rule.needle.contains("::");
+                let needle_segments =
+                    if is_qualified { path_segments(rule.needle) } else { Vec::new() };
+                let is_absolute = is_qualified && is_absolute_rule_path(&needle_segments);
+                let exclusions = CALL_RULE_EXACT_CALLEE_EXCLUSIONS
+                    .iter()
+                    .find_map(|(needle, excluded)| (*needle == rule.needle).then_some(*excluded))
+                    .unwrap_or(&[]);
+                CompiledCallRule {
+                    rule,
+                    mask,
+                    needle_segments,
+                    is_absolute,
+                    is_qualified,
+                    exclusions,
+                }
+            })
+            .collect();
+        CompiledCallRules { rules, all_mask }
+    })
+}
+
+/// Whether `rule` mints on a call to `callee`: its needle matches
+/// ([`call_matches`]) and the callee is not, byte for byte, one of the rule's
+/// exclusions ([`CALL_RULE_EXACT_CALLEE_EXCLUSIONS`]).
+#[cfg(test)]
+fn call_rule_matches(callee: &str, rule: &CallRule) -> bool {
+    let mut callee_segments = None;
+    call_rule_matches_with_segments(callee, &mut callee_segments, rule)
+}
+
+#[cfg(test)]
+fn call_rule_matches_with_segments<'a>(
+    callee: &'a str,
+    callee_segments: &mut Option<Vec<&'a str>>,
+    rule: &CallRule,
+) -> bool {
+    call_matches_with_segments(callee, callee_segments, rule.needle)
+        && !CALL_RULE_EXACT_CALLEE_EXCLUSIONS
+            .iter()
+            .any(|(needle, excluded)| *needle == rule.needle && excluded.contains(&callee))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CallSite<'a> {
     ordinal: usize,
-    callee: String,
-    span: SourceSpan,
+    callee: &'a str,
+    span: &'a SourceSpan,
+    token_mask: u64,
 }
 
 /// The registered profiles that carry hardened boundary obligations.
@@ -194,6 +436,7 @@ const HARDENED_PROFILES: &[&str] = &["coreutils_hardened", "hardened", "unix_har
 /// so `coreutils-hardened` and `unix_hardened` reach the same entry. Nothing
 /// else is normalized: a profile that merely contains a registered name is a
 /// different profile.
+#[cfg(test)]
 fn normalize_profile(profile: &str) -> String {
     profile.trim().to_ascii_lowercase().replace('-', "_")
 }
@@ -204,8 +447,64 @@ fn normalize_profile(profile: &str) -> String {
 /// a separate `-Ztrust-verify-hardened` boolean, which let the compiler's
 /// default and Targo's default select different obligation sets for the same
 /// source.
+///
+/// This answers the DECIDE question — "generate hardened obligations?" — and
+/// must stay a plain `bool`, because vcgen has to be able to run a profile
+/// that demands nothing. The ACCEPT question — "is this label a profile at
+/// all?" — is [`canonical_profile`], and a front end that accepts a label
+/// must ask that one: answering `false` to DECIDE for a label nobody
+/// registered is exactly how a typo turns hardening off while the front end
+/// still announces the profile by name.
 pub fn profile_enables_hardened(profile: Option<&str>) -> bool {
-    profile.is_some_and(|profile| HARDENED_PROFILES.contains(&normalize_profile(profile).as_str()))
+    profile.is_some_and(|profile| canonical_profile(profile).is_some())
+}
+
+/// The registry entry `profile` names, in the registry's own spelling, or
+/// `None` if the registry does not know it.
+///
+/// The ACCEPT half of the pair above, and the ONE question a front end that
+/// takes a profile label from a human — a CLI flag, a committed `[trust]`
+/// table — is allowed to ask before announcing a profile or spawning a
+/// compiler. `-Ztrust-verify-profile` selects the hardened obligation set and
+/// has no other effect anywhere in the compiler, so a label this returns
+/// `None` for changes NOTHING about what gets verified: accepting it buys a
+/// banner and an evidence record naming a profile that generated no
+/// obligation.
+///
+/// It returns the canonical entry rather than a `bool` so that what a front
+/// end announces, passes to `-Ztrust-verify-profile` and writes into the proof
+/// record is the registry's spelling and not the user's. `UNIX_HARDENED` and
+/// `  unix-hardened  ` reach the same obligations either way (`normalize_profile`
+/// is what decides that), and a canonical label additionally cannot carry the
+/// whitespace that would split one rustflag into two.
+///
+/// Today the registry of profiles and the registry of HARDENED profiles are
+/// the same list, so a `Some` here always means `profile_enables_hardened` is
+/// `true` (pinned by `accept_and_decide_agree_until_a_non_hardened_profile_exists`).
+/// They are separate FUNCTIONS because they are separate questions: the day a
+/// profile is registered that deliberately demands no hardened obligations, it
+/// is added to the profile registry this reads and `profile_enables_hardened`
+/// keeps saying `false` for it — and no caller has to be re-audited to find out
+/// which of the two it meant.
+pub fn canonical_profile(profile: &str) -> Option<&'static str> {
+    let trimmed = profile.trim();
+    HARDENED_PROFILES.iter().copied().find(|&registered| {
+        registered == trimmed
+            || (registered.len() == trimmed.len()
+                && trimmed.bytes().zip(registered.bytes()).all(|(a, b)| {
+                    a.to_ascii_lowercase() == b || (a == b'-' && b == b'_')
+                }))
+    })
+}
+
+/// The registered profile names, canonical spelling, sorted.
+///
+/// Exported so a front end can NAME them in its refusal instead of keeping its
+/// own copy of the list. A copy is the defect this export exists to prevent:
+/// the copy goes on accepting a label the registry has dropped, and the front
+/// end prints a banner for obligations nobody generates.
+pub fn known_hardened_profiles() -> &'static [&'static str] {
+    HARDENED_PROFILES
 }
 
 pub(crate) fn generate_hardened_vcs(
@@ -227,28 +526,21 @@ fn cap_predicate_preconditions(func: &VerifiableFunction) -> Vec<Formula> {
     func.preconditions.iter().filter(|p| formula_mentions_pred(p)).cloned().collect()
 }
 
-/// Bridge to the dominated-safe unwrap panic-freedom formula.
-fn unwrap_pinned_panic_freedom_formula(
+/// Bridge to the dominated-safe unwrap panic-freedom formulas keyed by block ordinal.
+fn unwrap_pinned_panic_freedom_formulas(
     func: &VerifiableFunction,
-    ordinal: usize,
-) -> Option<Formula> {
-    crate::generate::unwrap_panic_freedom_formula_at_block(func, ordinal)
+) -> trust_types::fx::FxHashMap<usize, Formula> {
+    crate::generate::unwrap_panic_freedom_formulas_by_block(func)
 }
 
 /// True if `Formula::Pred` appears anywhere in `f`.
 fn formula_mentions_pred(f: &Formula) -> bool {
-    let mut found = false;
-    f.visit(&mut |sub| {
-        if matches!(sub, Formula::Pred(..)) {
-            found = true;
-        }
-    });
-    found
+    trust_types::any_formula_node(f, &mut |sub| matches!(sub, Formula::Pred(..)))
 }
 
-    // MERGE NOTE (integrate-e6-perfield-20260831): orphaned when the merge took
-    // the other line's caller; kept for the lane that owns it. `expect` is
-    // self-expiring — this warns the moment a caller lands.
+// MERGE NOTE (integrate-e6-perfield-20260831): orphaned when the merge took
+// the other line's caller; kept for the lane that owns it. `expect` is
+// self-expiring — this warns the moment a caller lands.
 #[expect(dead_code, reason = "merge-orphaned; see MERGE NOTE above the item")]
 pub(crate) fn generate_hardened_vcs_for_profile(
     func: &VerifiableFunction,
@@ -297,7 +589,8 @@ pub(crate) fn generate_hardened_vcs_for_profile_with_summaries(
     func: &VerifiableFunction,
     summaries: Option<&crate::modular::SummaryDatabase>,
 ) -> Vec<VerificationCondition> {
-    let calls = collect_calls(func);
+    let _entry_scope = crate::generate::EntryScope::enter(func);
+    let (calls, union_mask) = collect_calls(func);
     let mut vcs = Vec::new();
 
     // Trust SAFE_API §4.2.7: a hardened boundary inside a CAP WRAPPER — a
@@ -310,123 +603,172 @@ pub(crate) fn generate_hardened_vcs_for_profile_with_summaries(
     // variable was reassigned before the call is dropped by
     // `conjoin_live_preconditions` (same kill as the assert path), so the
     // boundary fails CLOSED rather than discharging against a stale fact.
-    let cap_preconds = cap_predicate_preconditions(func);
-    let may_reassigned =
-        (!cap_preconds.is_empty()).then(|| crate::generate::v2_may_reassigned_per_block(func));
+    let mut cap_violation: Option<Option<Formula>> = None;
+    // (No per-block may-reassigned KILL set: `conjoin_preconditions_versioned`
+    // ignores it — the version rename is the kill.)
     let empty_kill: FxHashSet<String> = FxHashSet::default();
+    let mut unwrap_formulas: Option<trust_types::fx::FxHashMap<usize, Formula>> = None;
 
-    for call in &calls {
-        for rule in CALL_RULES {
-            if call_matches(&call.callee, rule.needle) {
-                // Trust (Part B): SUPPRESS the hardened `Result::unwrap` panic twin
-                // when the unwrap is PROVABLY infallible — the success-by-construction
-                // of a slice->array `try_into`/`try_from` whose slice length provably
-                // equals the array length. This reuses the SAME infallibility predicate
-                // the per-statement `Call::unwrap::panic-freedom` suppression uses, so
-                // the two lanes agree. A genuinely-fallible unwrap (unknown length,
-                // user Index impl, non-`try_into` Result) does NOT match and the twin
-                // is still emitted (fail-closed). Only the `unwrap` rule
-                // (`PanicBoundary`) is gated; every other CALL_RULE is unaffected.
-                if rule.needle == "unwrap"
-                    && crate::generate::unwrap_call_at_block_is_infallible(func, call.ordinal)
-                {
-                    continue;
-                }
-                // Trust (unwrap panic-freedom, dominated-safe): a PanicBoundary
-                // twin for an `unwrap`/`expect` whose receiver discriminant is
-                // PINNED (the same recognizer + assembled formula the primary
-                // `Call::…::panic-freedom` lane solves) carries that refutation
-                // formula instead of the fail-closed `Bool(true)` — so both rows
-                // keyed to the same call are decided by the SAME obligation
-                // (UNSAT ⇒ both prove; SAT ⇒ both stay failed). Every other
-                // PanicBoundary (unpinned receiver, cap wrapper, non-Call source)
-                // is UNCHANGED and stays fail-closed.
-                if rule.category == HardenedVcCategory::PanicBoundary
-                    && cap_preconds.is_empty()
-                    && let Some(formula) = unwrap_pinned_panic_freedom_formula(func, call.ordinal)
-                {
-                    vcs.push(hardened_vc_with_formula(
-                        func,
-                        &call.span,
-                        rule.category,
-                        call.callee.clone(),
-                        rule.detail,
-                        formula,
-                    ));
-                    continue;
-                }
-                if cap_preconds.is_empty() {
-                    // No capability contract: fail closed (unprovable mandate).
-                    vcs.push(hardened_vc(
-                        func,
-                        &call.span,
-                        rule.category,
-                        &call.callee,
-                        rule.detail,
-                    ));
-                } else {
-                    let killed = may_reassigned
-                        .as_ref()
-                        .and_then(|m| m.get(&BlockId(call.ordinal)))
-                        .unwrap_or(&empty_kill);
-                    let violation = Formula::Not(Box::new(Formula::And(cap_preconds.clone())));
-                    let formula = crate::generate::conjoin_preconditions_versioned(
-                        func,
-                        BlockId(call.ordinal),
-                        &func.preconditions,
-                        killed,
-                        violation,
-                    );
-                    vcs.push(hardened_vc_with_formula(
-                        func,
-                        &call.span,
-                        rule.category,
-                        call.callee.clone(),
-                        rule.detail,
-                        formula,
-                    ));
+    let compiled = compiled_call_rules();
+    if (union_mask & compiled.all_mask) != 0 {
+        for call in &calls {
+            if (call.token_mask & compiled.all_mask) == 0 {
+                continue;
+            }
+            let mut callee_segments = None;
+            for c_rule in &compiled.rules {
+                let rule = c_rule.rule;
+                if c_rule.matches_call(call, &mut callee_segments) {
+                    // Trust (hardened process semantics, 2026-09-14): a
+                    // `ProcessSemantics` mandate asks for "an explicit process-signal
+                    // policy". When the compilation DECLARES one —
+                    // `-Zon-broken-pipe=<kill|error|inherit>`, or the `unix_hardened`
+                    // / `coreutils_hardened` profile's own `kill`
+                    // (`Session::trust_effective_on_broken_pipe`, threaded in through
+                    // the `VcgenContext`) — the mandate is met by construction and is
+                    // NOT minted, exactly as the provably-infallible `unwrap` twin below
+                    // is not. (A `Bool(false)` row was tried first and measured: the
+                    // native lane routes hardened rows by KIND, not formula, and
+                    // returned Unknown on it — so a "discharged" row would have read as
+                    // a gap.) With no declared policy the mandate stays the fail-closed
+                    // `Bool(true)` below, and the compiler's refusal names the fix.
+                    if rule.category == HardenedVcCategory::ProcessSemantics
+                        && crate::process_signal_policy_for(&func.def_path).is_some()
+                    {
+                        continue;
+                    }
+                    // Trust (Part B): SUPPRESS the hardened `Result::unwrap` panic twin
+                    // when the unwrap is PROVABLY infallible — the success-by-construction
+                    // of a slice->array `try_into`/`try_from` whose slice length provably
+                    // equals the array length. This reuses the SAME infallibility predicate
+                    // the per-statement `Call::unwrap::panic-freedom` suppression uses, so
+                    // the two lanes agree. A genuinely-fallible unwrap (unknown length,
+                    // user Index impl, non-`try_into` Result) does NOT match and the twin
+                    // is still emitted (fail-closed). Only the `unwrap` rule
+                    // (`PanicBoundary`) is gated; every other CALL_RULE is unaffected.
+                    if rule.needle == "unwrap"
+                        && crate::generate::unwrap_call_at_block_is_infallible(func, call.ordinal)
+                    {
+                        continue;
+                    }
+                    let cap_violation = cap_violation.get_or_insert_with(|| {
+                        let preds = cap_predicate_preconditions(func);
+                        (!preds.is_empty()).then(|| Formula::Not(Box::new(Formula::And(preds))))
+                    });
+                    // Trust (unwrap panic-freedom, dominated-safe): a PanicBoundary
+                    // twin for an `unwrap`/`expect` whose receiver discriminant is
+                    // PINNED (the same recognizer + assembled formula the primary
+                    // `Call::…::panic-freedom` lane solves) carries that refutation
+                    // formula instead of the fail-closed `Bool(true)` — so both rows
+                    // keyed to the same call are decided by the SAME obligation
+                    // (UNSAT ⇒ both prove; SAT ⇒ both stay failed). Every other
+                    // PanicBoundary (unpinned receiver, cap wrapper, non-Call source)
+                    // is UNCHANGED and stays fail-closed.
+                    if rule.category == HardenedVcCategory::PanicBoundary
+                        && cap_violation.is_none()
+                        && let Some(formula) = unwrap_formulas
+                            .get_or_insert_with(|| unwrap_pinned_panic_freedom_formulas(func))
+                            .get(&call.ordinal)
+                            .cloned()
+                    {
+                        vcs.push(hardened_vc_with_formula(
+                            func,
+                            call.span,
+                            rule.category,
+                            call.callee,
+                            rule.detail,
+                            formula,
+                        ));
+                        continue;
+                    }
+                    match cap_violation {
+                        None => {
+                            // No capability contract: fail closed (unprovable mandate).
+                            vcs.push(hardened_vc(
+                                func,
+                                call.span,
+                                rule.category,
+                                call.callee,
+                                rule.detail,
+                            ));
+                        }
+                        Some(violation) => {
+                            let killed = &empty_kill;
+                            let formula = crate::generate::conjoin_preconditions_versioned(
+                                func,
+                                BlockId(call.ordinal),
+                                &func.preconditions,
+                                killed,
+                                violation.clone(),
+                            );
+                            vcs.push(hardened_vc_with_formula(
+                                func,
+                                call.span,
+                                rule.category,
+                                call.callee,
+                                rule.detail,
+                                formula,
+                            ));
+                        }
+                    }
                 }
             }
         }
     }
 
     append_assert_panic_vcs(func, summaries, &mut vcs);
-    append_permission_window_vcs(func, &calls, &mut vcs);
-    append_trust_boundary_order_vcs(func, &calls, &mut vcs);
+    append_permission_window_vcs(func, &calls, union_mask, &mut vcs);
+    append_trust_boundary_order_vcs(func, &calls, union_mask, &mut vcs);
     append_unclassified_opaque_vcs(func, &mut vcs);
 
     vcs
 }
 
-fn collect_calls(func: &VerifiableFunction) -> Vec<CallSite> {
+fn collect_calls(func: &VerifiableFunction) -> (Vec<CallSite<'_>>, u64) {
+    let presence = crate::generate::terminator_presence_for(func);
+    if !presence.has_call && !presence.has_tail_call && !presence.has_opaque {
+        return (Vec::new(), 0);
+    }
     let mut calls = Vec::new();
+    let mut union_mask = 0u64;
     for block in &func.body.blocks {
         match &block.terminator {
             Terminator::Call { func: callee, span, .. }
             | Terminator::TailCall { func: callee, span, .. } => {
+                let s = callee.as_str();
+                let token_mask = token_mask_from_bytes(s.as_bytes());
+                union_mask |= token_mask;
                 calls.push(CallSite {
                     ordinal: block.id.0,
-                    callee: callee.clone(),
-                    span: span.clone(),
+                    callee: s,
+                    span,
+                    token_mask,
                 });
             }
             Terminator::Opaque { kind, span, .. } => {
                 if let Some(callee) = opaque_hardened_call_from_kind(kind) {
-                    calls.push(CallSite { ordinal: block.id.0, callee, span: span.clone() });
+                    let token_mask = token_mask_from_bytes(callee.as_bytes());
+                    union_mask |= token_mask;
+                    calls.push(CallSite { ordinal: block.id.0, callee, span, token_mask });
                 }
             }
             _ => {}
         }
     }
-    calls.sort_by_key(|call| call.ordinal);
-    calls
+    if !calls.is_sorted_by_key(|call| call.ordinal) {
+        calls.sort_by_key(|call| call.ordinal);
+    }
+    (calls, union_mask)
 }
 
-fn opaque_hardened_call_from_kind(kind: &str) -> Option<String> {
-    kind.strip_prefix("Call::").filter(|callee| !callee.is_empty()).map(ToString::to_string)
+fn opaque_hardened_call_from_kind(kind: &str) -> Option<&str> {
+    kind.strip_prefix("Call::").filter(|callee| !callee.is_empty())
 }
 
 fn append_unclassified_opaque_vcs(func: &VerifiableFunction, vcs: &mut Vec<VerificationCondition>) {
+    if !crate::generate::terminator_presence_for(func).has_opaque {
+        return;
+    }
     for block in &func.body.blocks {
         let Terminator::Opaque { kind, span, .. } = &block.terminator else {
             continue;
@@ -449,9 +791,23 @@ fn append_unclassified_opaque_vcs(func: &VerifiableFunction, vcs: &mut Vec<Verif
     }
 }
 
+#[cfg(test)]
 fn call_matches(callee: &str, needle: &str) -> bool {
+    let mut callee_segments = None;
+    call_matches_with_segments(callee, &mut callee_segments, needle)
+}
+
+fn call_matches_with_segments<'a>(
+    callee: &'a str,
+    callee_segments: &mut Option<Vec<&'a str>>,
+    needle: &str,
+) -> bool {
+    let tail = needle.rsplit("::").next().unwrap_or(needle).trim();
+    if !tail.is_empty() && !tail.contains(['<', '(']) && !callee.contains(tail) {
+        return false;
+    }
     if needle.contains("::") {
-        let callee_segments = path_segments(callee);
+        let callee_segments = callee_segments.get_or_insert_with(|| path_segments(callee));
         let needle_segments = path_segments(needle);
         if needle_segments.is_empty() {
             return false;
@@ -478,6 +834,9 @@ fn path_segments(path: &str) -> Vec<&str> {
 
     while index < bytes.len() {
         match bytes[index] {
+            b'-' if index + 1 < bytes.len() && bytes[index + 1] == b'>' => {
+                index += 2;
+            }
             b'<' => {
                 angle_depth += 1;
                 index += 1;
@@ -519,77 +878,105 @@ fn is_absolute_rule_path(segments: &[&str]) -> bool {
 
 fn append_permission_window_vcs(
     func: &VerifiableFunction,
-    calls: &[CallSite],
+    calls: &[CallSite<'_>],
+    union_mask: u64,
     vcs: &mut Vec<VerificationCondition>,
 ) {
-    let create = calls.iter().find(|call| is_permission_window_create_call(&call.callee));
+    if calls.len() < 2
+        || (union_mask & PERM_CREATE_MASK) == 0
+        || (union_mask & PERM_REPAIR_MASK) == 0
+    {
+        return;
+    }
+    let create = calls.iter().find(|call| {
+        (call.token_mask & PERM_CREATE_MASK) != 0 && is_permission_window_create_call(call.callee)
+    });
     let Some(create) = create else {
         return;
     };
 
-    let ordered_change = calls.iter().find(|call| {
-        call.ordinal > create.ordinal && is_permission_window_repair_call(&call.callee)
-    });
-    let fallback_change = calls.iter().find(|call| is_permission_window_repair_call(&call.callee));
+    let change = calls
+        .iter()
+        .find(|call| {
+            call.ordinal > create.ordinal
+                && (call.token_mask & PERM_REPAIR_MASK) != 0
+                && is_permission_window_repair_call(call.callee)
+        })
+        .or_else(|| {
+            calls.iter().take_while(|call| call.ordinal <= create.ordinal).find(|call| {
+                (call.token_mask & PERM_REPAIR_MASK) != 0
+                    && is_permission_window_repair_call(call.callee)
+            })
+        });
 
-    if let Some(change) = ordered_change.or(fallback_change) {
+    if let Some(change) = change {
         vcs.push(hardened_vc(
             func,
-            &change.span,
+            change.span,
             HardenedVcCategory::PermissionWindow,
-            &change.callee,
+            change.callee,
             "object creation is followed by permission/owner repair; create with final mode/owner under the OS model",
         ));
     }
 }
 
 fn is_permission_window_create_call(callee: &str) -> bool {
-    call_matches(callee, "File::create")
-        || call_matches(callee, "create_dir")
-        || call_matches(callee, "OpenOptions::open")
+    let mut callee_segments = None;
+    call_matches_with_segments(callee, &mut callee_segments, "File::create")
+        || call_matches_with_segments(callee, &mut callee_segments, "create_dir")
+        || call_matches_with_segments(callee, &mut callee_segments, "OpenOptions::open")
 }
 
 fn is_permission_window_repair_call(callee: &str) -> bool {
-    call_matches(callee, "set_permissions")
-        || call_matches(callee, "set_owner")
-        || call_matches(callee, "chown")
+    callee
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|segment| matches!(segment, "set_permissions" | "set_owner" | "chown"))
 }
 
 fn append_trust_boundary_order_vcs(
     func: &VerifiableFunction,
-    calls: &[CallSite],
+    calls: &[CallSite<'_>],
+    union_mask: u64,
     vcs: &mut Vec<VerificationCondition>,
 ) {
-    let transition = calls.iter().find(|call| is_trust_domain_transition(&call.callee));
+    if calls.len() < 2
+        || (union_mask & TRUST_TRANSITION_MASK) == 0
+        || (union_mask & TRUST_LATE_EFFECT_MASK) == 0
+    {
+        return;
+    }
+    let transition = calls.iter().find(|call| {
+        (call.token_mask & TRUST_TRANSITION_MASK) != 0 && is_trust_domain_transition(call.callee)
+    });
     let Some(transition) = transition else {
         return;
     };
 
-    if let Some(late_lookup) = calls
-        .iter()
-        .find(|call| call.ordinal > transition.ordinal && is_trust_domain_late_effect(&call.callee))
-    {
+    if let Some(late_lookup) = calls.iter().find(|call| {
+        call.ordinal > transition.ordinal
+            && (call.token_mask & TRUST_LATE_EFFECT_MASK) != 0
+            && is_trust_domain_late_effect(call.callee)
+    }) {
         vcs.push(hardened_vc(
             func,
-            &late_lookup.span,
+            late_lookup.span,
             HardenedVcCategory::TrustDomainOrder,
-            &late_lookup.callee,
+            late_lookup.callee,
             "name-service or dynamic-loading effect occurs after a root/group/user trust-domain transition; resolve trusted inputs before crossing the boundary",
         ));
     }
 }
 
 fn is_trust_domain_transition(callee: &str) -> bool {
-    call_matches(callee, "chroot")
-        || call_matches(callee, "setuid")
-        || call_matches(callee, "setgid")
+    callee
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|segment| matches!(segment, "chroot" | "setuid" | "setgid"))
 }
 
 fn is_trust_domain_late_effect(callee: &str) -> bool {
-    call_matches(callee, "getpwnam")
-        || call_matches(callee, "getgrnam")
-        || call_matches(callee, "get_user_by_name")
-        || call_matches(callee, "dlopen")
+    callee
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|segment| matches!(segment, "getpwnam" | "getgrnam" | "get_user_by_name" | "dlopen"))
 }
 
 fn append_assert_panic_vcs(
@@ -597,11 +984,20 @@ fn append_assert_panic_vcs(
     summaries: Option<&crate::modular::SummaryDatabase>,
     vcs: &mut Vec<VerificationCondition>,
 ) {
+    if !crate::generate::terminator_presence_for(func).has_assert {
+        return;
+    }
+
     // Trust: drop a precondition at any assert whose block may have reassigned one
     // of the precondition's free variables on the way in — an entry contract
     // `lo <= hi` is stale after `hi = big` and would vacuously discharge a real
     // `hi - lo` panic boundary (a false-PROVE). Same kill as the v2 VC sites.
-    let may_reassigned = crate::generate::v2_may_reassigned_per_block(func);
+    //
+    // The kill is PROBED per free variable (`may_reassigned_rebinds`) rather than
+    // materialised per block: the retired `v2_may_reassigned_per_block` map was a
+    // Θ(blocks × names) whole-CFG fixpoint; the probe answers the same membership
+    // test over the version oracle's dominator index.
+    let mut versions = None;
     let empty_kill: FxHashSet<String> = FxHashSet::default();
 
     // Cross-block reaching definitions, including assert-passed CheckedBinaryOp
@@ -617,7 +1013,7 @@ fn append_assert_panic_vcs(
     // success fact, and the abstract panic exit is not an in-CFG successor, so
     // conjoining a genuinely-true fact is monotone — it can only turn a
     // false-FAIL into a PROVE for safe code, never make a real panic PROVE.
-    let reaching_defs = cross_block_reaching_defs(func);
+    let mut reaching_defs = None;
 
     // Slice-chunking yield facts (`for c in s.chunks_exact(N) { c[k] }` => the
     // yielded sub-slice's modeled length is `== N`) — the SAME map the L0 lane
@@ -627,7 +1023,7 @@ fn append_assert_panic_vcs(
     // Some-payload traces to a `*_exact`/`windows`/`chunks` constructor, so
     // `remainder()` and reassigned bindings get NO fact (fail-closed). Sound: a
     // true `len == N` theorem, conjoined monotonically exactly as in the L0 lane.
-    let slice_iter_yield_guards = crate::generate::build_slice_iter_yield_guard_map(func);
+    let mut slice_iter_yield_guards = None;
 
     // Function-wide invariant facts (accumulator/cast/min-max/modulo bounds, …):
     // each is UNCONDITIONALLY true (every builder SSA-gates its result), so
@@ -644,21 +1040,35 @@ fn append_assert_panic_vcs(
     // per-statement lane uses closes this: the two lanes now carry identical
     // accumulator/cast hypotheses, so a provably-safe chain PROVES in BOTH while a
     // genuine overflow (unbounded operands, no accumulator fact) still refutes.
-    let global_facts = crate::generate::build_global_invariant_facts(func);
+    // Each twin takes the set less the element-read congruences it cannot use
+    // (`RowGlobalFacts::for_row`), as the per-statement lane's rows do.
+    let mut global_facts = None;
 
-    // BoundsCheck asserts whose index is PROVABLY in range via a loop-yield bound
-    // (`for i in 0..s.len()` range yield / `for (i, _) in s.iter().enumerate()`
-    // index yield). The per-statement bounds VC PROVES these via the SAME yield
-    // fact — a fact the per-statement lane conjoins but the hardened twin below does
-    // NOT — so the twin over-refutes a provably-safe guarded index unless we skip it
-    // here (mirroring the Div/Rem nonzero-constant skip). Built ONCE per function;
-    // empty for non-looping code. See `v2_boundscheck_index_in_range_skip_set` for
-    // the soundness argument (only a `Lt(index, checked_len)` yield fact keyed to the
-    // assert's own index/length qualifies; an unguarded index stays refutable).
-    let bounds_yield_skip = crate::generate::v2_boundscheck_index_in_range_skip_set(func);
+    // Trust (2026-10-15, TRUST-KI-1015-1): the loop-yield facts (`for i in A..B`
+    // => `A <= i < B`; `for (i, _) in s.iter().enumerate()` => `0 <= i < s.len()`),
+    // the SAME two maps the per-statement lane conjoins onto every row of a block
+    // (`generate/safety.rs`). Built ONCE per function; empty for non-looping code.
+    // They are conjoined onto each twin below.
+    //
+    // The twin used to carry neither map. `for i in 16..64 { w[i - 15] }` over
+    // `w: [u32; 64]` (aterm-digest `Sha256::compress`) then reached the solver with
+    // `i` equal to the iterator's loop-head havoc and no bound, and ay refuted the
+    // `Overflow(Sub)` twin at `i = 0` and the `BoundsCheck` twin at `i = 79`: two
+    // FAILED rows with counterexamples no execution reaches, beside a per-statement
+    // `[overflow:sub]` and `[bounds]` on the same asserts that PROVE (measured on
+    // the channel `b58a105dde` and on main `edbb3f3009`, tests/
+    // loop_index_yield_twins_realmir.rs). The 2026-08-25 attempt (06ec8d1778) was
+    // reverted (130cbe7cd9) because 8 twin rows LEFT `targo trust check`'s report
+    // instead of turning PROVED; that is targo's publication normalization, not a
+    // drop here: a twin whose uncertified proof it demotes to Unknown is elided as
+    // an alias of its PROVED per-statement sibling at the same span and counted
+    // (`targo-trust/src/types.rs`, `subsume_hardened_panic_twins` and
+    // `elide_rows_proved_only_by`), as aterm-codec `inflate.rs:911`'s twin was
+    // (TRUST-KI-1014-1, 592 -> 591). This lane emits the twin and pushes it.
+    let mut loop_yield_guards = None;
 
     // Trust (B2): the per-block semantic guard map — the SAME map, built the SAME
-    // way, that `generate_v2_safety_vcs_impl_with_origins` conjoins onto every
+    // way, that `generate_v2_safety_vcs_impl_with_origins_checked` conjoins onto every
     // per-statement safety VC (`safety.rs`, `let semantic_guards = match summaries
     // {..}`). It carries the stdlib total-call dest facts AND, when a summary
     // database is present, each PROVED callee's `ensures` rebound to this call site
@@ -666,11 +1076,11 @@ fn append_assert_panic_vcs(
     // token. Without it the hardened twin refutes `y * 3` with a `y` the callee's
     // proved postcondition forbids. See the soundness note on
     // `generate_hardened_vcs_for_profile_with_summaries`.
-    let semantic_guards = match summaries {
-        Some(s) => crate::generate::build_semantic_guard_map_with_summaries(func, s),
-        None => crate::generate::build_semantic_guard_map(func),
-    };
+    let mut semantic_guards = None;
 
+    // Trust (G1, 2026-10-27): see the FFI pointer-contract skip in the loop.
+    let ffi_pointer_facts: std::cell::OnceCell<Option<crate::ffi_pointer_contract::PointerFacts>> =
+        std::cell::OnceCell::new();
     for block in &func.body.blocks {
         // `unwind: _`: hardened panic-boundary VC uses only the assert's own fields;
         // the cleanup successor is an unguarded CFG edge handled elsewhere.
@@ -679,23 +1089,23 @@ fn append_assert_panic_vcs(
             continue;
         };
 
-        // Trust #soundness: a BoundsCheck assert whose index is PROVABLY in range —
-        // a `for i in 0..s.len()` range-yield bound or a `for (i, _) in
-        // s.iter().enumerate()` index yield establishing `index < len` for the SAME
-        // length the assert checks — can NEVER panic at runtime, so there is no panic
-        // boundary to harden. The per-statement bounds VC already PROVES this via
-        // build_range_yield_guard_map / build_enumerate_yield_guard_map (yield facts
-        // the per-statement lane conjoins onto the bounds VC but this hardened twin
-        // does NOT), so the twin otherwise OVER-REFUTES a provably-safe guarded index
-        // (per-statement PROVED, hardened twin FAILED). Skip emitting the twin when
-        // the index is provably in range, mirroring the Div/Rem skip above. Sound:
-        // dropping an obligation for an access that is provably in-bounds can never
-        // mask a real OOB panic; an UNGUARDED index, a constant/derived/projected
-        // index, or a loop over a DIFFERENT bound (`0..K`, `K != len`) is NOT in the
-        // skip set (fail-closed) and still gets its twin (a real OOB stays refutable).
-        if matches!(msg, AssertMessage::BoundsCheck) && bounds_yield_skip.contains(&block.id) {
-            continue;
-        }
+        // Trust (2026-10-17, gate RCA precision T6): a `BoundsCheck` assert whose index
+        // a loop-yield fact proves in range (`for i in 0..s.len()`, `for (i, _) in
+        // s.iter().enumerate()`) is NO LONGER skipped here. The skip (2026-08) existed
+        // because the twin did not carry the yield facts and over-refuted such an
+        // index; since cb59dd4d16 (2026-10-15) it conjoins them
+        // (`loop_yield_guards.facts_at`, below) and proves wherever its per-statement
+        // sibling does. What the skip still did was make the twin INVENTORY a function
+        // of how precise the yield facts are: each fact the yield builders learn
+        // deleted a twin row. Between the seal (321aaeda75) and 7f3690ed73 the facts
+        // learned the joined `enumerate` entrance (0bbb2e326c) and an array length
+        // behind an unsize cast, and the candidate gate of 2026-10-16 lost 17 twins the
+        // seal published (seven PROVED: aterm-font `MapBuilder::{new, compile,
+        // collect_features}`; the rest aterm-png `unfilter`, aterm-grid
+        // `RewrapCursors::land` / `CellExtra::retain_images`, aterm-slog `Log::issued`,
+        // which the candidate's facts now prove). Every `BoundsCheck` assert gets its
+        // twin, as every other assert does; an emitted obligation can only be proved
+        // or not, so this cannot hide a panic.
 
         // Trust (#57 follow-up): a BoundsCheck assert on a LITERAL in-range index
         // (`arr[0]` on `[i64; 3]`) used to skip its twin here, mirroring the
@@ -704,10 +1114,8 @@ fn append_assert_panic_vcs(
         // index def (`_i = k`) against the constant length, which is the same
         // single-variable interval contradiction the per-statement bounds VC
         // discharges. Measured over a3d's verified kernel: 95 literal-index
-        // hardened twins, 95 proved, 0 failed, 0 unknown. The loop-yield skip
-        // ABOVE is a different case and stays — there the twin does NOT carry the
-        // yield facts the per-statement lane conjoins, so it would over-refute a
-        // provably-safe guarded index; a constant index needs no such fact.
+        // hardened twins, 95 proved, 0 failed, 0 unknown. The loop-yield skip went
+        // the same way on 2026-10-17 (see the note above).
 
         // Trust (FIX A — trusted-std pointer-deref assert suppression, hardened
         // twin): mirror the per-statement (generate.rs) skip for a rustc-inserted
@@ -729,6 +1137,22 @@ fn append_assert_panic_vcs(
             msg,
             AssertMessage::NullPointerDereference | AssertMessage::MisalignedPointerDereference
         ) && crate::sep_engine::is_trusted_std_span(span)
+        {
+            continue;
+        }
+        // Trust (G1, 2026-10-27): the twin of the per-statement lane's FFI
+        // pointer-contract skip (`generate::safety`): a rustc Null/Misaligned assert on
+        // a contract-rooted local that the documented return contract and the
+        // dominating checks make unable to fail mints no twin. The same predicate
+        // (`ffi_pointer_contract::PointerFacts::discharges_assert`), so the two lanes
+        // skip exactly the same asserts.
+        if matches!(
+            msg,
+            AssertMessage::NullPointerDereference | AssertMessage::MisalignedPointerDereference
+        ) && ffi_pointer_facts
+            .get_or_init(|| crate::ffi_pointer_contract::PointerFacts::for_function(func))
+            .as_ref()
+            .is_some_and(|facts| facts.discharges_assert(func, block))
         {
             continue;
         }
@@ -757,7 +1181,7 @@ fn append_assert_panic_vcs(
                 func,
                 span,
                 HardenedVcCategory::PanicBoundary,
-                format!("mir_assert::{msg:?}"),
+                trust_types::hardened_mir_assert_callee(msg),
                 assert_panic_detail(msg),
                 bv_formula,
             ));
@@ -830,10 +1254,35 @@ fn append_assert_panic_vcs(
         // PtrMetadata), so the hardened BoundsCheck twin `k < chunk__slice_len`
         // proves for `k < N`. Byte-identical to the L0 conjunction; the map is
         // empty for every non-chunking block, so this is a no-op elsewhere.
-        if let Some(facts) = slice_iter_yield_guards.get(&block.id)
+        if let Some(facts) = slice_iter_yield_guards
+            .get_or_insert_with(|| crate::generate::slice_iter_yield_guards_for(func))
+            .get(&block.id)
             && !facts.is_empty()
         {
-            let mut conj = facts.clone();
+            let mut conj = Vec::with_capacity(facts.len() + 1);
+            conj.extend(facts.iter().cloned());
+            conj.push(formula);
+            formula = Formula::And(conj);
+        }
+
+        // Trust (2026-10-15, TRUST-KI-1015-1): conjoin this block's loop-yield facts
+        // (`start <= i < end`, `0 <= i < s.len()`) exactly as the per-statement lane
+        // does, and at the same place in the pipeline: BEFORE the version rename
+        // below, beside the slice-chunking fact, so the payload's bare name versions
+        // in lockstep with the body. This is what discharges the twins of
+        // `w[i - 15]` (`BoundsCheck`) and `i - 15` (`Overflow(Sub)`) under `for i in
+        // 16..64`. Sound by the argument the per-statement lane rests on (each fact
+        // holds of every value its payload can hold, at every block the map keys it
+        // to; `iterator_yield`'s banner). It only adds hypotheses, so it removes
+        // models and never adds one; a real panic keeps its model, because the
+        // failing value is reached by a payload inside the yielded range
+        // (tests/loop_index_yield_twins_realmir.rs: off-by-one, wrong range, wrong
+        // end, wrong width, a caller's start and a rebound payload stay FAILED).
+        let yield_facts = loop_yield_guards
+            .get_or_insert_with(|| crate::generate::LoopYieldGuards::build(func))
+            .facts_at(block.id);
+        if !yield_facts.is_empty() {
+            let mut conj = yield_facts;
             conj.push(formula);
             formula = Formula::And(conj);
         }
@@ -858,7 +1307,8 @@ fn append_assert_panic_vcs(
         // version — an unfiltered dominating guard that this block reassigned
         // would vacuously discharge a real panic boundary (a false-PROVE).
         // Keep only main's filtered application; do NOT re-add the unfiltered one.
-        let killed = may_reassigned.get(&block.id).unwrap_or(&empty_kill);
+        // The conjoin below ignores its kill argument (the version rename is the kill).
+        let killed = &empty_kill;
         // Conjoin cross-block reaching definitions (assert-passed result defs +
         // ranges threaded along success edges) BEFORE the path guards, so a
         // downstream guard (`width <= 127`) connects through the threaded
@@ -886,13 +1336,24 @@ fn append_assert_panic_vcs(
         // travels with its tuple dest `_7` in the may-set), demoting safe
         // checked-op chains. Keeping only the intra-block half is still
         // drop-only relative to the fixpoint's own guarantees.
-        if let Some(defs) = reaching_defs.get(&block.id) {
-            let own_writes = crate::generate::block_entry_fact_kill_names(func, block);
-            let live: Vec<Formula> = defs
-                .iter()
-                .filter(|d| crate::generate::formula_survives_redefs(d, &own_writes))
-                .cloned()
-                .collect();
+        if let Some(defs) =
+            reaching_defs.get_or_insert_with(|| cross_block_reaching_defs(func)).get(&block.id)
+        {
+            // Trust (2026-09-29): the split kill — the block's written names under the
+            // destination relation, its opaque-store havoc under the plain relation a
+            // havoc base name carries (`KillSet::havoc`). Folded into one destination
+            // set, an element store `s[i] = 1` killed `s__slice_len` and the bounds
+            // twin of the next `s[i]` read in the same block was refuted at
+            // `s__slice_len = 0` beside the guard's length 1.
+            //
+            // Trust (2026-10-10, KILLED-ENTRY-EXISTS-1): a killed fact is kept with its
+            // rebound names renamed to fresh existential names instead of dropped
+            // (`BlockEntryFactKill::survive_or_quantify` states why that is sound): the
+            // drop lost `_2.0 == count* + 1` at `*count += 1; *count - 1` and refuted
+            // the twin of a Sub its primary proves.
+            let kill = crate::generate::block_entry_fact_kill(func, block);
+            let live: Vec<Formula> =
+                defs.iter().filter_map(|d| kill.survive_or_quantify(func, block.id, d)).collect();
             if !live.is_empty() {
                 let mut conj = live;
                 conj.push(formula);
@@ -911,8 +1372,11 @@ fn append_assert_panic_vcs(
         // lane: each fact is an unconditional SSA-gated truth (monotone — only
         // discharges a false-FAIL, never a real overflow), and the rename makes any
         // fact over a reassigned name disjoint from the live read.
-        if !global_facts.is_empty() {
-            let mut conj = global_facts.clone();
+        let row_facts = global_facts
+            .get_or_insert_with(|| crate::generate::build_global_invariant_facts(func))
+            .for_row(&formula);
+        if !row_facts.is_empty() {
+            let mut conj = row_facts;
             conj.push(formula);
             formula = Formula::And(conj);
         }
@@ -972,10 +1436,18 @@ fn append_assert_panic_vcs(
         // survives — and it keeps this refuting lane strictly more conservative than
         // the lane it twins. DROP-ONLY: dropping a hypothesis can only turn a PROVE
         // into a FAIL, never the reverse.
-        if let Some(sem_guards) = semantic_guards.get(&block.id) {
+        if let Some(sem_guards) = semantic_guards
+            .get_or_insert_with(|| crate::generate::semantic_guard_map_for(func, summaries))
+            .get(&block.id)
+        {
+            let versions = versions.get_or_insert_with(|| crate::generate::stmt_versions_for(func));
             let live: Vec<Formula> = sem_guards
                 .iter()
-                .filter(|g| crate::generate::formula_survives_redefs(g, killed))
+                .filter(|g| {
+                    crate::generate::formula_survives_redefs_by(g, &mut |name| {
+                        versions.may_reassigned_rebinds(block.id, name)
+                    })
+                })
                 .cloned()
                 .collect();
             if !live.is_empty() {
@@ -984,20 +1456,29 @@ fn append_assert_panic_vcs(
                 formula = Formula::And(conj);
             }
         }
-        // Trust: bound every integer parameter to its type range, exactly as the
-        // per-statement arithmetic-safety overflow VC does. Without this the
-        // hardened MIR-assert boundary OVER-REFUTES a provably-safe widened add
-        // (e.g. `a as u16 + b as u16` with u8 params): the solver, seeing the
-        // parameters unconstrained, fabricates a spurious overflow. Sound: a
-        // parameter unconditionally holds a value within its type range, so this
-        // refutes only spurious counterexamples, never a real panic path.
-        formula = crate::generate::conjoin_arg_type_ranges(func, formula);
+        // Trust: bound every integer parameter, local, datatype field and slice
+        // length to its type range, EXACTLY as the per-statement lane bounds this
+        // assert's primary — one battery, one class rule
+        // (`generate::type_ranges::hardened_twin_type_ranges`).
+        //
+        // Until 2026-09-29 this conjoined only the PARAMETER ranges, so the twin was
+        // refuted wherever its primary's proof rested on a LOCAL's range: measured
+        // on `while i < args.len() { i += 1 }`, `[overflow:add]` PROVED and this
+        // twin was REFUTED at `args__slice_len = 2^64`, the bound
+        // `_5 = PtrMetadata(args)` (a `usize` temp) floating free on `Sort::Int`
+        // (trust-ir-diff `main.rs:123`, trust-ir-contract `formula.rs:1268`; pinned
+        // by `tests/false_refutation_shapes_realmir.rs`). Sound: every fact is a
+        // property of a declared type, true at every point of every execution, so
+        // it deletes only models no execution produces; the checked-op result's
+        // own range stays excluded on an arithmetic assert (the vacuous-UNSAT
+        // guard of `checked_arith_result_value_vars`), as in the primary lane.
+        formula = crate::generate::hardened_twin_type_ranges(func, msg, formula);
 
         vcs.push(hardened_vc_with_formula(
             func,
             span,
             HardenedVcCategory::PanicBoundary,
-            format!("mir_assert::{msg:?}"),
+            trust_types::hardened_mir_assert_callee(msg),
             assert_panic_detail(msg),
             formula,
         ));
@@ -1023,7 +1504,7 @@ fn assert_failure_formula(func: &VerifiableFunction, cond: &Operand, expected: b
 ///
 fn cross_block_reaching_defs(
     func: &VerifiableFunction,
-) -> trust_types::fx::FxHashMap<BlockId, Vec<Formula>> {
+) -> std::rc::Rc<trust_types::fx::FxHashMap<BlockId, Vec<Formula>>> {
     crate::generate::v2_build_path_definition_map_for_hardened(func)
 }
 
@@ -1121,7 +1602,7 @@ fn hardened_vc_with_formula(
 ) -> VerificationCondition {
     VerificationCondition {
         kind: VcKind::HardenedBoundary { category, callee: callee.into(), detail: detail.into() },
-        function: func.name.clone().into(),
+        function: func.name.as_str().into(),
         location: span.clone(),
         // Hardened VCs encode violation conditions. Opaque OS/process/model
         // obligations stay fail-closed as `true`; MIR asserts carry the exact
@@ -1141,7 +1622,7 @@ mod tests {
 
     use super::*;
 
-    fn call_block(id: usize, callee: &str) -> BasicBlock {
+    pub(super) fn call_block(id: usize, callee: &str) -> BasicBlock {
         BasicBlock {
             id: BlockId(id),
             stmts: vec![],
@@ -1149,6 +1630,7 @@ mod tests {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                 is_foreign: false,
                 func: callee.to_string(),
                 args: vec![Operand::Constant(ConstValue::Unit)],
@@ -1181,7 +1663,7 @@ mod tests {
         }
     }
 
-    fn return_block(id: usize) -> BasicBlock {
+    pub(super) fn return_block(id: usize) -> BasicBlock {
         BasicBlock { id: BlockId(id), stmts: vec![], terminator: Terminator::Return }
     }
 
@@ -1204,7 +1686,7 @@ mod tests {
         }
     }
 
-    fn test_function(blocks: Vec<BasicBlock>) -> VerifiableFunction {
+    pub(super) fn test_function(blocks: Vec<BasicBlock>) -> VerifiableFunction {
         VerifiableFunction {
             name: "hardened_fixture".to_string(),
             def_path: "crate::hardened_fixture".to_string(),
@@ -1220,6 +1702,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1340,6 +1823,65 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_process_signal_policy_discharges_the_process_semantics_mandate_only() {
+        // Trust (hardened process semantics, 2026-09-14). The mandate asks for
+        // "an explicit process-signal policy"; when the compilation declares one
+        // the mandate is met by construction and not minted. Every other mandate
+        // is untouched, and a context owned by a different function stamps
+        // nothing (fail-closed).
+        let func = test_function(vec![
+            call_block(0, "std::io::_print"),
+            call_block(1, "std::io::stdio::stdout"),
+            call_block(2, "std::env::args"),
+            return_block(3),
+        ]);
+        let process_rows = |vcs: &[VerificationCondition]| {
+            vcs.iter()
+                .filter(|vc| {
+                    matches!(
+                        &vc.kind,
+                        VcKind::HardenedBoundary {
+                            category: HardenedVcCategory::ProcessSemantics,
+                            ..
+                        }
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let open = process_rows(&generate_hardened_vcs_for_profile(&func));
+        assert_eq!(open.len(), 2, "both stdout legs carry the mandate");
+        assert!(open.iter().all(|vc| vc.formula == Formula::Bool(true)), "undeclared: fail-closed");
+
+        let scope = crate::enter_vcgen_context(
+            &crate::VcgenContext::for_function(func.def_path.clone())
+                .with_process_signal_policy(Some("kill")),
+        );
+        let declared = generate_hardened_vcs_for_profile(&func);
+        assert!(process_rows(&declared).is_empty(), "declared: the mandate is met, not minted");
+        assert!(
+            declared.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::HardenedBoundary { category: HardenedVcCategory::CompatObservable, .. }
+            ) && vc.formula == Formula::Bool(true)),
+            "the `env::args` CompatObservable mandate is untouched"
+        );
+        drop(scope);
+
+        let _other = crate::enter_vcgen_context(
+            &crate::VcgenContext::for_function("crate::some_other_fn")
+                .with_process_signal_policy(Some("kill")),
+        );
+        assert!(
+            process_rows(&generate_hardened_vcs_for_profile(&func))
+                .iter()
+                .all(|vc| vc.formula == Formula::Bool(true)),
+            "another function's declared policy does not stamp this one"
+        );
+    }
+
+    #[test]
     fn hardened_profile_matches_native_hardened_fixture_callees() {
         let func = test_function(vec![
             call_block(0, "std::string::String::from_utf8_lossy"),
@@ -1397,6 +1939,32 @@ mod tests {
             assert!(!profile_enables_hardened(Some(unregistered)), "{unregistered}");
         }
         assert!(!profile_enables_hardened(None));
+    }
+
+    #[test]
+    fn accept_and_decide_agree_until_a_non_hardened_profile_exists() {
+        // The registry of profiles IS the registry of hardened profiles today.
+        // This pins that equality on the whole registry plus the spellings and
+        // the near-miss labels, so adding a non-hardened profile has to come
+        // here and say so rather than silently splitting the two answers.
+        for registered in known_hardened_profiles() {
+            assert_eq!(canonical_profile(registered), Some(*registered));
+            assert!(profile_enables_hardened(Some(registered)), "{registered}");
+        }
+        for (spelling, canonical) in [
+            ("coreutils-hardened", "coreutils_hardened"),
+            ("UNIX_HARDENED", "unix_hardened"),
+            ("  unix-hardened  ", "unix_hardened"),
+        ] {
+            assert_eq!(canonical_profile(spelling), Some(canonical), "{spelling}");
+            assert!(profile_enables_hardened(Some(spelling)), "{spelling}");
+        }
+        for unregistered in
+            ["", "   ", "ci:unix", "unix", "coreutils", "unix_hardened_v2", "release", "default"]
+        {
+            assert_eq!(canonical_profile(unregistered), None, "{unregistered}");
+            assert!(!profile_enables_hardened(Some(unregistered)), "{unregistered}");
+        }
     }
 
     #[test]
@@ -1502,6 +2070,41 @@ mod tests {
         }
     }
 
+    /// The marker contract: every MIR-assert `PanicBoundary` twin this module
+    /// mints carries exactly `trust_types::hardened_mir_assert_callee(msg)`, the
+    /// one spelling that `hardened_mir_assert_message` / `_guard` (the runtime
+    /// fallback authority), targo's `PanicTwinFamily` (subsumption) and the
+    /// report's failure-site accounting all read back.
+    #[test]
+    fn mir_assert_twins_carry_the_shared_callee_marker() {
+        let cases = [
+            AssertMessage::BoundsCheck,
+            AssertMessage::DivisionByZero,
+            AssertMessage::RemainderByZero,
+            AssertMessage::OverflowNeg,
+            AssertMessage::Overflow(BinOp::Add),
+            AssertMessage::Overflow(BinOp::Mul),
+            AssertMessage::Overflow(BinOp::Shl),
+        ];
+        for msg in cases {
+            let func = test_function(vec![
+                assert_block(0, Operand::Constant(ConstValue::Bool(false)), true, msg.clone()),
+                return_block(1),
+            ]);
+            let vcs = generate_hardened_vcs_for_profile(&func);
+            let twin = hardened_vc_for_category(&vcs, HardenedVcCategory::PanicBoundary);
+            let VcKind::HardenedBoundary { callee, .. } = &twin.kind else {
+                panic!("{msg:?}: not a hardened boundary: {:?}", twin.kind);
+            };
+            assert_eq!(callee, &trust_types::hardened_mir_assert_callee(&msg), "{msg:?}");
+            assert_eq!(
+                trust_types::hardened_mir_assert_message(callee),
+                Some(format!("{msg:?}").as_str())
+            );
+            assert!(trust_types::hardened_mir_assert_guard(callee).is_some(), "{msg:?}");
+        }
+    }
+
     #[test]
     fn hardened_profile_mir_assert_panic_boundary_respects_function_preconditions() {
         let mut func = test_function(vec![
@@ -1577,6 +2180,7 @@ mod tests {
             )],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1713,6 +2317,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1760,6 +2365,7 @@ mod tests {
                             is_unsafe_sig: false,
                             is_foreign: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("pick"),
                             func: "pick".to_string(),
                             args: vec![
                                 Operand::Constant(ConstValue::Uint(41, 64)),
@@ -1793,6 +2399,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1882,8 +2489,7 @@ mod tests {
             Box::new(Formula::var("_0", Sort::Int)),
             Box::new(Formula::var("a0", Sort::Int)),
         );
-        let pre =
-            Formula::Le(Box::new(Formula::var("a0", Sort::Int)), Box::new(Formula::Int(100)));
+        let pre = Formula::Le(Box::new(Formula::var("a0", Sort::Int)), Box::new(Formula::Int(100)));
         let mut db = SummaryDatabase::new();
         db.insert(
             FunctionSummary::new("pick")
@@ -1970,7 +2576,8 @@ mod tests {
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
                 ("__v0_0".into(), Ty::u64()),
                 ("__v1_0".into(), Ty::Unit),
-            ],
+            ]
+            .into(),
             variants: vec![
                 trust_types::VariantDef {
                     name: "Ok".into(),
@@ -1982,9 +2589,14 @@ mod tests {
                     discriminant: 1,
                     fields: vec![("0".into(), Ty::Unit)],
                 },
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let unwrap_call = |target: usize| Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             func: "core::result::Result::<T, E>::unwrap".into(),
@@ -1995,6 +2607,9 @@ mod tests {
             atomic: None,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(
+                "core::result::Result::<T, E>::unwrap",
+            ),
             is_foreign: false,
         };
         let blocks = if guarded {
@@ -2048,6 +2663,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2385,6 +3001,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2541,6 +3158,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let vcs = generate_hardened_vcs_for_profile(&func);
@@ -2694,6 +3312,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2773,44 +3392,42 @@ mod tests {
     // ---- BoundsCheck panic-boundary subsumption (loop-yield in-range index) ----
 
     /// A `for i in 0..s.len() { … s[i] … }` slice index is PROVABLY in range via the
-    /// range-yield bound `0 <= i < s.len()`, so the per-statement bounds VC PROVES it.
-    /// The hardened panic-boundary lane must then SKIP its `BoundsCheck` twin
-    /// (mirroring the Div/Rem nonzero-constant skip) instead of over-refuting a
-    /// provably-safe guarded index. Uses the REAL extracted MIR of `for i in
-    /// 0..s.len()` (the same fixture the per-statement `for_range_index_yield` test
-    /// proves), whose BoundsCheck assert is bb5.
-    ///
-    /// THE YIELD BOUND IS RESOLVED THROUGH `local_defs::unique_value_def`, whose
-    /// `Escape` arm still admits the `&mut`-borrow the `Iterator::next` desugar takes
-    /// of the range local. That admission is the seam's open defect, and this row is
-    /// one of the reasons it has not simply been closed: refusing the alias there
-    /// empties this skip set and the twin is emitted for every `for` loop in the
-    /// language. See `body_unique_value_def`'s `Escape` arm.
+    /// range-yield bound `0 <= i < s.len()`. Until 2026-10-17 the hardened lane SKIPPED
+    /// its `BoundsCheck` twin (this test asserted the skip); the twin now carries the
+    /// yield fact and is always emitted, so the inventory no longer depends on how
+    /// precise the yield facts are (gate RCA precision T6). Uses the REAL extracted MIR
+    /// of `for i in 0..s.len()` (the fixture the per-statement `for_range_index_yield`
+    /// test proves), whose BoundsCheck assert is bb5: the twin is emitted and its
+    /// formula carries the payload's `Lt` yield fact.
     #[test]
-    fn hardened_boundscheck_twin_skipped_for_loop_yielded_index() {
+    fn hardened_boundscheck_twin_emitted_for_loop_yielded_index() {
         let func: VerifiableFunction =
             serde_json::from_str(include_str!("../tests/fixtures/for_range_index_mir.json"))
                 .expect("fixture MIR must deserialize");
-
-        // The `for i in 0..s.len()` BoundsCheck assert (bb5) is recognized as
-        // provably in range...
-        let skip = crate::generate::v2_boundscheck_index_in_range_skip_set(&func);
-        assert!(
-            skip.contains(&BlockId(5)),
-            "the `for i in 0..s.len()` BoundsCheck assert (bb5) must be in the loop-yield \
-             in-range skip set; skip set = {skip:?}"
-        );
-
-        // ...so NO hardened BoundsCheck twin is emitted for it (the per-statement
-        // bounds VC already PROVES the access).
         let vcs = generate_hardened_vcs_for_profile(&func);
+        let twins: Vec<&VerificationCondition> = vcs
+            .iter()
+            .filter(|vc| {
+                matches!(&vc.kind, VcKind::HardenedBoundary { category, callee, .. }
+                    if *category == HardenedVcCategory::PanicBoundary
+                        && callee == "mir_assert::BoundsCheck")
+            })
+            .collect();
+        assert_eq!(
+            twins.len(),
+            1,
+            "the loop-yielded index must get exactly one hardened BoundsCheck twin: {twins:#?}"
+        );
+        let mut carries_yield_fact = false;
+        twins[0].formula.visit(&mut |node| {
+            if matches!(node, Formula::Lt(lo, _) if matches!(lo.as_ref(), Formula::Var(..))) {
+                carries_yield_fact = true;
+            }
+        });
         assert!(
-            !has_category_for_callee(
-                &vcs,
-                HardenedVcCategory::PanicBoundary,
-                "mir_assert::BoundsCheck",
-            ),
-            "a provably-in-range loop index must NOT get a hardened BoundsCheck twin"
+            carries_yield_fact,
+            "the twin must carry the `i < len` yield fact its per-statement sibling carries: {:?}",
+            twins[0].formula
         );
     }
 
@@ -2888,13 +3505,8 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
-
-        // No range/enumerate yield payload => nothing provably in range => empty set.
-        assert!(
-            crate::generate::v2_boundscheck_index_in_range_skip_set(&func).is_empty(),
-            "an unguarded index must NOT be recognized as provably in range"
-        );
 
         let vcs = generate_hardened_vcs_for_profile(&func);
         assert!(
@@ -3120,6 +3732,7 @@ mod hardened_signed_128_overflow_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         assert!(
@@ -3371,6 +3984,7 @@ mod hardened_signed_128_overflow_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3525,6 +4139,7 @@ mod hardened_signed_128_overflow_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3632,6 +4247,7 @@ mod hardened_signed_128_overflow_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3765,14 +4381,38 @@ mod hardened_signed_128_overflow_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
+    // Trust: 2026-11-09 (WRAPPING-SUB-AND-INTERVAL-NEG-1) — the fixture's `_6 = width - 1`
+    // is a BARE (wrapping) `Sub`: at `width = 0` it is `u32::MAX`, which masks to 127, so
+    // `_5 = i128::MIN` and `-_5` really overflows. The designed proof holds behind
+    // `width >= 1`, where the subtraction cannot wrap; without it the row must stay
+    // refutable (`hardened_signed_min_neg_without_a_width_floor_stays_refutable`).
     #[test]
     fn hardened_signed_min_neg_is_provable_unsat() {
-        let func = signed_min_neg_hardened_fixture();
+        let func = crate::generate::signed_128_overflow_tests::behind_width_floor(
+            signed_min_neg_hardened_fixture(),
+        );
         let vcs = generate_hardened_vcs_for_profile(&func);
         let vc = hardened_panic_vc(&vcs, "OverflowNeg");
+        let at_127 = |name: &str| -> u128 {
+            match name {
+                "__trust_ovf_bv_amt__6" => 127,
+                "__trust_ovf_bv_neg__5" => 1u128 << 127,
+                _ => 0,
+            }
+        };
+        assert!(
+            eval_bv_bool(
+                &crate::generate::signed_128_overflow_tests::without_amt_bound(&vc.formula),
+                &at_127
+            ),
+            "without the amount bound amount 127 must be a model (else the sweep below is \
+             vacuous); formula: {:?}",
+            vc.formula
+        );
 
         // BV core: `_5 == bvshl(1, amt) ∧ amt < 127` ∧ `_5 == INT_MIN`. For amt in
         // [0, 126], `_5 = 2^amt < 2^127`, so `_5 != INT_MIN` → violation FALSE →
@@ -3797,6 +4437,27 @@ mod hardened_signed_128_overflow_tests {
                 vc.formula
             );
         }
+    }
+
+    /// Without a dominating `width >= 1` the wrapping `width - 1` gives no amount bound,
+    /// and `width = 0` (amount 127, `_5 = i128::MIN`) is a real overflow that must stay
+    /// refutable.
+    #[test]
+    fn hardened_signed_min_neg_without_a_width_floor_stays_refutable() {
+        let vcs = generate_hardened_vcs_for_profile(&signed_min_neg_hardened_fixture());
+        let vc = hardened_panic_vc(&vcs, "OverflowNeg");
+        let at_127 = |name: &str| -> u128 {
+            match name {
+                "__trust_ovf_bv_amt__6" => 127,
+                "__trust_ovf_bv_neg__5" => 1u128 << 127,
+                _ => 0,
+            }
+        };
+        assert!(
+            eval_bv_bool(&vc.formula, &at_127),
+            "width = 0 makes `-_5` overflow; the violation must be SAT there. formula: {:?}",
+            vc.formula
+        );
     }
 
     /// (b3) ADVERSARIAL: an UNGUARDED `-x` (free i128 param) yields a hardened BV neg
@@ -3858,6 +4519,7 @@ mod hardened_signed_128_overflow_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3887,4 +4549,51 @@ mod hardened_signed_128_overflow_tests {
             );
         }
     }
+
+    #[test]
+    fn compiled_call_rules_cover_every_rule_without_fallback_and_match_reference() {
+        use super::{
+            CallSite, FALLBACK_TOKEN_BIT, call_rule_matches, compiled_call_rules,
+            token_mask_from_bytes,
+        };
+        let compiled = compiled_call_rules();
+        assert_eq!(
+            compiled.all_mask & FALLBACK_TOKEN_BIT,
+            0,
+            "every CALL_RULES tail token should have an exact bit in known_hardened_token_bit"
+        );
+        let span = SourceSpan::default();
+        for callee in [
+            "core::slice::<impl [u8]>::len",
+            "std::fs::remove_file::<&std::path::Path>",
+            "std::fs::File::create",
+            "core::result::Result::<usize, ()>::unwrap",
+            "core::result::Result::<usize, ()>::ok",
+            "std::io::stdio::stdout",
+            "std::process::Command::stdout::<std::process::Stdio>",
+            "std::process::Command::stdout::<my_dep::Loud>",
+            "libc::chroot",
+            "libc::dlopen",
+        ] {
+            let site = CallSite {
+                ordinal: 0,
+                callee,
+                span: &span,
+                token_mask: token_mask_from_bytes(callee.as_bytes()),
+            };
+            let mut segs = None;
+            for c_rule in &compiled.rules {
+                assert_eq!(
+                    c_rule.matches_call(&site, &mut segs),
+                    call_rule_matches(callee, c_rule.rule),
+                    "mismatch on callee `{callee}` for rule `{}`",
+                    c_rule.rule.needle
+                );
+            }
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "hardened_stdout_rule_tests.rs"]
+mod stdout_rule_tests;

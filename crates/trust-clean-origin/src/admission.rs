@@ -81,15 +81,13 @@
 //! record under the local kernel; once it arrives, the importer independently
 //! rechecks the transported body as above.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
-
-use clean_kernel::{Environment, ExprVisitor, LevelVec, Name};
+use clean_kernel::{Environment, Name};
 use trust_clean_carrier::{CarrierRefused, CarrierSignature, carrier_signature_for};
 use trust_symbols::{Assumption, AssumptionKind, CarrierWidth, KernelStatus};
 use trust_types::{Ty, VerifiableFunction};
 
-use crate::emit::{CleanOriginPlan, EmitRefusal, admit_lowering, plan_clean_origin_body};
+use crate::emit::{CleanOriginPlan, EmitRefusal, admit_lowering};
+use crate::export_notice::NonExportableNotice;
 use crate::gate::{Faithful, FaithfulnessMethod};
 
 // ---------------------------------------------------------------------------
@@ -124,7 +122,8 @@ pub fn local_kernel_version() -> &'static str {
 /// mode ever ships it gets a different tag, and a reader that only knows this
 /// one REFUSES the other rather than comparing hashes computed over different
 /// things and calling the mismatch a skew (or worse, a match).
-pub const ENVIRONMENT_DIGEST_MODE_DEPENDENCY_CLOSURE: u8 = 1;
+// Mode 1 followed printed names and hashed Display; it is deliberately refused.
+pub const ENVIRONMENT_DIGEST_MODE_DEPENDENCY_CLOSURE: u8 = 2;
 
 /// Content hash over the declarations a verdict depended on.
 ///
@@ -138,20 +137,20 @@ pub const ENVIRONMENT_DIGEST_MODE_DEPENDENCY_CLOSURE: u8 = 1;
 ///   anywhere in the dependency's prelude would invalidate every certificate
 ///   in the crate, so re-admission would almost never succeed in practice and
 ///   the lane would rot into "always re-check", making the digest decoration;
-/// * the per-declaration closure binds exactly what the kernel verdict could
-///   have depended on. The kernel exposes enough to compute it: the public
-///   [`clean_kernel::ExprVisitor`] traversal (whose dispatch the kernel itself
-///   keeps exhaustive over every `ExprKind`, including the cubical and
-///   set-theoretic extensions) collects `Const` references, and
-///   `Environment::get_const` resolves each one.
+/// * the per-declaration closure binds the exact stored records reachable from
+///   the subject. The public
+///   kernel-owned `ExprFolderOpt` traversal visits every expression child,
+///   including cubical and set-theoretic extensions. Its observation hook
+///   collects exact `Const` and projection-owner Names. Environment queries
+///   resolve those names without converting them to printed labels.
 ///
-/// The walk starts at the subject's own type and value, collects every
-/// referenced constant name, and recurses through each referenced constant's
-/// type and value to a fixpoint. For every closure member, in canonical
-/// (name-sorted) order, the hashed material includes: the name, the
-/// `ConstantKind`, the universe level parameters, the reducibility (which is
-/// semantically load-bearing — it decides what defeq may unfold), the type,
-/// and the value (or an explicit no-value marker).
+/// The walk starts at the subject's type/value and reaches a fixpoint through
+/// exact dependencies, including stored recursor rule bodies and projection
+/// owners. Each member binds its complete structural ConstantInfo, inductive,
+/// constructor, recursor and quotient records; origin/validation provenance;
+/// structure fields/defaults/parents and implemented-by target. Presence and
+/// absence are distinct tags. Family members and rule-only dependencies are
+/// followed, not merely printed in an opaque side-table record.
 ///
 /// **A referenced name that is absent from the environment is hashed as an
 /// explicit `absent` record, not skipped and not an error.** Absence is
@@ -160,19 +159,26 @@ pub const ENVIRONMENT_DIGEST_MODE_DEPENDENCY_CLOSURE: u8 = 1;
 /// is a different environment — which the digest then detects. (The subject
 /// itself missing IS an error: there is nothing to digest.)
 ///
-/// # The term rendering, and its named hazard
+/// # Structural encoding and remaining authority boundary
 ///
-/// Types and values are rendered through the kernel's `Display` and hashed via
-/// `trust_types::digest` — the same construction the tree's existing
-/// `TermDigest` producer uses (`trust_certify::clean_island`), kept
-/// deliberately identical so two subsystems cannot disagree about the bytes of
-/// the same term. Every field is length-framed before hashing, so no field
-/// content can imitate a record boundary. The residual hazard, named: this
-/// binds the rendering, not the abstract term, so it is only as injective as
-/// `Display`. Within ONE kernel version that is the same rendering the kernel
-/// itself debugs with; ACROSS kernel versions it does not need to be stable at
-/// all, because [`preflight_wire`] refuses on kernel-version skew before the
-/// environment digest is ever consulted.
+/// Mode 2 uses the pinned kernel's structural serde representation with
+/// bincode 1, explicitly fixed-width little-endian fields. Typed Name/Expr/Level
+/// constructors, binder annotations, let dependency flags, arbitrary Nat limbs
+/// and metadata are retained; cached hashes and allocation identity are not.
+/// The exact typed member order and length-framed records are deterministic.
+/// Mode 1's lossy printed dependency walk is refused, not silently upgraded.
+/// Other subsystems' Display-based TermDigests are not fixed by this change.
+/// Validation provenance is deliberately bound: JSON restoration discards that
+/// provenance, so logically identical restored records need a fresh local check
+/// before matching fully checked originals. Deserialization earns no authority.
+///
+/// A digest is NOT kernel admission or a proof of environment completeness.
+/// In particular mutable native reducer callbacks are executable checker state,
+/// not serializable declaration data; their code is not attested here. The
+/// existing local kernel recheck, assurance policy and complete checker/tool
+/// identity remain independent requirements. All encoding and resource failures
+/// return an explicit refusal, never a digest over only the successfully read
+/// prefix of a declaration or closure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvironmentDigest {
     hex: String,
@@ -203,13 +209,49 @@ pub enum EnvironmentDigestRefusal {
         /// The name that did not resolve.
         name: String,
     },
+    /// The structural codec or bounded writer could not encode an exact record.
+    Encoding {
+        /// Declaration being encoded.
+        name: String,
+        /// Concrete codec or writer error.
+        reason: String,
+    },
+    /// No partial digest is returned after any traversal or size limit.
+    ResourceLimit {
+        /// Subject declaration.
+        name: String,
+        /// Resource whose bound was reached.
+        resource: &'static str,
+        /// Maximum admitted resource count for this operation.
+        limit: usize,
+    },
 }
 
 impl EnvironmentDigestRefusal {
+    /// The declaration whose presence, encoding or closure failed.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::NoSuchDeclaration { name }
+            | Self::Encoding { name, .. }
+            | Self::ResourceLimit { name, .. } => name,
+        }
+    }
+
     /// The v7/D3 note: why, and what to do, with options.
     #[must_use]
     pub fn note(&self) -> String {
         match self {
+            Self::Encoding { name, reason } => format!(
+                "cannot encode the exact environment record for `{name}`: {reason}; options: \
+                 inspect the dependency's stored declaration and metadata or report this codec \
+                 limitation; no imported verdict is accepted with an incomplete digest"
+            ),
+            Self::ResourceLimit { name, resource, limit } => format!(
+                "cannot bind the complete environment of `{name}`: {resource} exceeds {limit}; \
+                 options: inspect unexpectedly large dependency/metadata expansion or extend \
+                 the measured digest implementation; no closure members may be omitted"
+            ),
             Self::NoSuchDeclaration { name } => format!(
                 "no environment digest can be computed for `{name}`: the declaration is \
                  not in the Clean environment, so there is no dependency closure to \
@@ -228,128 +270,28 @@ impl EnvironmentDigestRefusal {
     }
 }
 
-/// Collects every `Const` name referenced by an expression, via the kernel's
-/// own exhaustive traversal.
-///
-/// Using [`clean_kernel::ExprVisitor`] rather than a hand-written match is the
-/// fail-closed choice: the visitor's dispatch lives in the kernel next to
-/// `ExprKind`, so a new expression variant gets a traversal arm in the same
-/// change, whereas a local match with a wildcard arm would silently drop the
-/// sub-expressions of any variant this crate had not heard of — and a dropped
-/// sub-expression is a dependency missing from the digest, which is a false
-/// re-admission waiting to happen.
-struct ConstNames {
-    found: BTreeSet<String>,
-}
+mod environment;
 
-impl ExprVisitor for ConstNames {
-    type Result = ();
-
-    fn combine(&self, (): (), (): ()) {}
-
-    fn visit_const(&mut self, name: &Name, _levels: &LevelVec) {
-        self.found.insert(name.to_string());
-    }
-}
-
-/// Append one length-framed field to the hash material.
+/// Compute a typed declaration-closure digest for an ordinary dotted name.
+/// Use [`environment_digest_for_name`] when the exact Name is already known;
+/// Display is not a lossless encoding of quoted or numeric components.
 ///
-/// `{label} {byte-length}:{content}\n` — the explicit length is what makes the
-/// framing injective: no field content can imitate a record boundary, so two
-/// different closures cannot render to identical material (see the
-/// concatenation-injectivity note on `trust_types::digest`).
-fn frame(material: &mut String, label: &str, content: &str) {
-    let _ = write!(material, "{label} {}:", content.len());
-    material.push_str(content);
-    material.push('\n');
-}
-
-/// Compute the [`EnvironmentDigest`] for `name` over `env`.
-///
-/// This is the ONLY public constructor of an [`EnvironmentDigest`]: it can be
-/// computed from an environment, never asserted. See the type's docs for the
-/// full hashing decision.
-///
-/// # Errors
-///
-/// [`EnvironmentDigestRefusal::NoSuchDeclaration`] when `name` itself does not
-/// resolve — there is nothing to digest. (A *transitively referenced* name
-/// that does not resolve is content, not an error; it is hashed as `absent`.)
+/// Absence of a referenced declaration is bound explicitly. A missing subject,
+/// encoding failure or resource bound returns an error, never a partial digest.
+/// This operation does not admit declarations or certify the environment.
 pub fn environment_digest_for(
     env: &Environment,
     name: &str,
 ) -> Result<EnvironmentDigest, EnvironmentDigestRefusal> {
-    if env.get_const(&Name::from_string(name)).is_none() {
-        return Err(EnvironmentDigestRefusal::NoSuchDeclaration { name: name.to_owned() });
-    }
+    environment_digest_for_name(env, &Name::from_string(name))
+}
 
-    // Fixpoint over the closure. `BTreeMap` keyed on the rendered name gives
-    // the canonical member order, so insertion order — and therefore the order
-    // declarations happened to enter the environment — cannot leak into the
-    // digest.
-    let mut members: BTreeMap<String, String> = BTreeMap::new();
-    let mut worklist: Vec<String> = vec![name.to_owned()];
-
-    while let Some(current) = worklist.pop() {
-        if members.contains_key(&current) {
-            continue;
-        }
-
-        let mut record = String::new();
-        match env.get_const(&Name::from_string(&current)) {
-            None => {
-                // Absence is environment content — see the type docs. An
-                // explicit record, so an environment where this name resolves
-                // hashes differently.
-                frame(&mut record, "decl", &current);
-                frame(&mut record, "absent", "");
-            }
-            Some(info) => {
-                frame(&mut record, "decl", &current);
-                frame(&mut record, "kind", &format!("{:?}", info.kind));
-                let levels =
-                    info.level_params.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
-                frame(&mut record, "levels", &levels);
-                // Reducibility decides what defeq may unfold, so two
-                // environments differing only here can decide the same defeq
-                // question differently. It is verdict-relevant content.
-                frame(&mut record, "reducibility", &format!("{:?}", info.reducibility));
-                frame(&mut record, "type", &info.type_.to_string());
-                match info.value.as_ref() {
-                    Some(value) => frame(&mut record, "value", &value.to_string()),
-                    None => frame(&mut record, "no-value", ""),
-                }
-
-                let mut refs = ConstNames { found: BTreeSet::new() };
-                refs.visit_expr(&info.type_);
-                if let Some(value) = info.value.as_ref() {
-                    refs.visit_expr(value);
-                }
-                for reference in refs.found {
-                    if !members.contains_key(&reference) {
-                        worklist.push(reference);
-                    }
-                }
-            }
-        }
-        members.insert(current, record);
-    }
-
-    let mut material = String::new();
-    frame(
-        &mut material,
-        "trust-clean-origin-environment-digest-mode",
-        &ENVIRONMENT_DIGEST_MODE_DEPENDENCY_CLOSURE.to_string(),
-    );
-    frame(&mut material, "subject", name);
-    frame(&mut material, "members", &members.len().to_string());
-    for record in members.values() {
-        material.push_str(record);
-    }
-
-    Ok(EnvironmentDigest::from_validated_hex(trust_types::digest::stable_sha256_hex(
-        material.as_bytes(),
-    )))
+/// Compute the same digest without projecting an exact typed identity to text.
+pub fn environment_digest_for_name(
+    env: &Environment,
+    name: &Name,
+) -> Result<EnvironmentDigest, EnvironmentDigestRefusal> {
+    environment::compute(env, name)
 }
 
 // ---------------------------------------------------------------------------
@@ -648,7 +590,12 @@ impl VerdictDigest {
     /// ```
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(
+            128 + self.decl.len()
+                + self.kernel_version.len()
+                + self.assumptions.len() * 16
+                + self.carrier.arguments.len() * 24,
+        );
         out.extend_from_slice(&VERDICT_DIGEST_MAGIC);
         out.push(VERDICT_DIGEST_FORMAT_V2);
         put_str(&mut out, &self.decl);
@@ -890,12 +837,16 @@ impl<'a> Reader<'a> {
     fn str(&mut self, field: &'static str) -> Result<String, DecodeRefusal> {
         let len = self.u32(field)? as usize;
         let bytes = self.take(len, field)?;
-        String::from_utf8(bytes.to_vec())
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
             .map_err(|_| DecodeRefusal::Malformed { field, detail: "not valid UTF-8".to_owned() })
     }
 
     fn non_empty_str(&mut self, field: &'static str) -> Result<String, DecodeRefusal> {
-        let text = self.str(field)?;
+        let len = self.u32(field)? as usize;
+        let bytes = self.take(len, field)?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| DecodeRefusal::Malformed { field, detail: "not valid UTF-8".to_owned() })?;
         if text.is_empty() {
             return Err(DecodeRefusal::Malformed {
                 field,
@@ -904,7 +855,7 @@ impl<'a> Reader<'a> {
                     .to_owned(),
             });
         }
-        Ok(text)
+        Ok(text.to_owned())
     }
 }
 
@@ -995,6 +946,11 @@ impl DecodeRefusal {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum DigestMintRefusal {
+    /// The legacy wire declaration field cannot encode this structural name.
+    UnencodableDeclaration {
+        /// Diagnostic rendering only; no identity is reconstructed from it.
+        name: String,
+    },
     /// The status is not a kernel verdict, so there is no verdict to digest.
     NotKernelChecked {
         /// The declaration name.
@@ -1052,6 +1008,11 @@ impl DigestMintRefusal {
     #[must_use]
     pub fn note(&self) -> String {
         match self {
+            Self::UnencodableDeclaration { name } => format!(
+                "no verdict digest for `{name}`: the legacy wire declaration field cannot \
+                 preserve its structural name. Keep its typed standalone library identity; \
+                 cross-language export requires a versioned typed-name wire format."
+            ),
             Self::NotKernelChecked { name, explanation } => format!(
                 "no verdict digest for `{name}`: {explanation}\n\
                  A digest is the wire form of a KERNEL verdict; without one there is \
@@ -1141,6 +1102,9 @@ pub fn mint_verdict_digest(
     faithful: &Faithful,
 ) -> Result<VerdictDigest, DigestMintRefusal> {
     let name = faithful.name();
+    if faithful.declaration() != &Name::from_string(name) {
+        return Err(DigestMintRefusal::UnencodableDeclaration { name: name.to_owned() });
+    }
 
     if let Err(refusal) = status.require_kernel_check(name) {
         return Err(DigestMintRefusal::NotKernelChecked {
@@ -1227,9 +1191,10 @@ impl ExportDigestRefusal {
     pub fn decl(&self) -> &str {
         match self {
             Self::Emit(refusal) => refusal.name(),
-            Self::Environment(EnvironmentDigestRefusal::NoSuchDeclaration { name }) => name,
+            Self::Environment(refusal) => refusal.name(),
             Self::Mint(
                 DigestMintRefusal::NotKernelChecked { name, .. }
+                | DigestMintRefusal::UnencodableDeclaration { name }
                 | DigestMintRefusal::ClosureUnrecorded { name }
                 | DigestMintRefusal::UnencodableAssumption { name, .. }
                 | DigestMintRefusal::EvidenceMismatch { name, .. }
@@ -1242,16 +1207,59 @@ impl ExportDigestRefusal {
     /// about what the user wrote.
     ///
     /// [`EmitRefusal`] keeps its own classification (a fragment boundary is a
-    /// capability refusal even at export time). The other two families are
-    /// always compiler defects HERE: an environment that held the declaration
-    /// at mint time and lost it by export time, or a status that satisfied
-    /// `decide_mint` and fails the digest mint, is the pipeline disagreeing
-    /// with itself.
+    /// capability refusal even at export time). Encoding/resource bounds are
+    /// also capability refusals, and so is an evidence form without a wire
+    /// spelling (a known format boundary — see
+    /// [`Self::non_exportable_notice`]). Missing declarations and the other
+    /// mint refusals are compiler defects HERE: an environment that held the
+    /// declaration at mint time and lost it by export time, or a status that
+    /// satisfied `decide_mint` and fails the digest mint, is the pipeline
+    /// disagreeing with itself.
     #[must_use]
     pub fn is_compiler_defect(&self) -> bool {
         match self {
             Self::Emit(refusal) => refusal.is_compiler_defect(),
-            Self::Environment(_) | Self::Mint(_) => true,
+            Self::Environment(
+                EnvironmentDigestRefusal::Encoding { .. }
+                | EnvironmentDigestRefusal::ResourceLimit { .. },
+            ) => false,
+            Self::Mint(DigestMintRefusal::UnencodableDeclaration { .. }) => false,
+            // A KNOWN format boundary, not the pipeline disagreeing with
+            // itself: the local gate admitted the def and the wire simply has
+            // no spelling for how. The compiler's export provider turns this
+            // one into a row ([`Self::non_exportable_notice`]) and never
+            // reports it; any other caller must not label it `internal:`.
+            Self::Mint(DigestMintRefusal::UnencodableFaithfulness { .. }) => false,
+            Self::Environment(EnvironmentDigestRefusal::NoSuchDeclaration { .. })
+            | Self::Mint(_) => true,
+        }
+    }
+
+    /// The row to export INSTEAD of a certificate, when — and only when — this
+    /// refusal is the known "evidence form without a wire spelling" boundary
+    /// ([`DigestMintRefusal::UnencodableFaithfulness`]).
+    ///
+    /// `Some` means every step of the export chain BEFORE the wire spelling
+    /// succeeded: the plan re-read, a fresh [`Faithful`] re-earned against the
+    /// body being serialized, the environment digest computed, the status
+    /// kernel-checked with a recorded closure, and the evidence and signature
+    /// agreeing on the admitted type ([`mint_verdict_digest`] checks the method
+    /// tag LAST, on purpose). The def is sound where it stands; what does not
+    /// exist is a certificate another crate could re-admit. The compiler
+    /// exports the notice so the crate that merely DEFINES such a def builds
+    /// as a library, and the importer refuses any call with the notice's
+    /// v7/D3 note ([`crate::export_notice`]).
+    ///
+    /// `None` for every other refusal, which stays FATAL at the export seam:
+    /// a mistranslated body, a lost declaration or an unaudited closure is not
+    /// a format boundary and must never be laundered into "non-exportable".
+    #[must_use]
+    pub fn non_exportable_notice(&self) -> Option<NonExportableNotice> {
+        match self {
+            Self::Mint(DigestMintRefusal::UnencodableFaithfulness { name, method }) => {
+                Some(NonExportableNotice::unspellable_faithfulness(name, *method))
+            }
+            _ => None,
         }
     }
 
@@ -1331,18 +1339,41 @@ impl ExportDigestRefusal {
 /// is therefore a REVIEWED format change that must land with the fields, not
 /// a one-line enum arm; and the decode side must refuse an unknown tag when
 /// it does (the existing versioned-refusal discipline: an unknown tag is a
-/// refusal, never a best-effort parse). Until then a cross-crate call to a
-/// well-founded Clean def refuses at this seam, fail-closed.
+/// refusal, never a best-effort parse). Until then NO certificate for a
+/// well-founded Clean def leaves this seam, fail-closed.
+///
+/// **What the compiler does with that refusal (2026-09-16).** Refusing here
+/// used to be FATAL for the exporting crate, which made the boundary wider
+/// than stated: a crate that merely DEFINED a recursive def — privately, or in
+/// proof position only — could not be built as a library. The refusal now
+/// converts, for this one variant, into a non-exportable notice
+/// ([`ExportDigestRefusal::non_exportable_notice`], [`crate::export_notice`]):
+/// the defining crate builds, the row says "no certificate crosses", and the
+/// cross-crate CALL is what refuses, at the importer's readmission chokepoint.
+/// No tag was added and no evidence crosses.
 pub fn mint_encoded_digest_for_export(
     env: &Environment,
     name: &str,
     status: &KernelStatus,
     extracted: &VerifiableFunction,
 ) -> Result<Vec<u8>, ExportDigestRefusal> {
-    let plan = plan_clean_origin_body(env, name).map_err(ExportDigestRefusal::Emit)?;
+    mint_encoded_digest_for_export_for_name(env, &Name::from_string(name), status, extracted)
+}
+
+/// Recheck a structural source declaration before exporting the existing wire format.
+/// The wire's unencodable-name refusal remains mandatory; this entry never changes
+/// a quoted or numeric identity into the legacy dotted spelling.
+pub fn mint_encoded_digest_for_export_for_name(
+    env: &Environment,
+    declaration: &Name,
+    status: &KernelStatus,
+    extracted: &VerifiableFunction,
+) -> Result<Vec<u8>, ExportDigestRefusal> {
+    let plan = crate::emit::plan_clean_origin_body_for_name(env, declaration)
+        .map_err(ExportDigestRefusal::Emit)?;
     let faithful = admit_lowering(env, &plan, extracted).map_err(ExportDigestRefusal::Emit)?;
     let environment =
-        environment_digest_for(env, name).map_err(ExportDigestRefusal::Environment)?;
+        environment_digest_for_name(env, declaration).map_err(ExportDigestRefusal::Environment)?;
     let digest = mint_verdict_digest(status, environment, plan.signature(), &faithful)
         .map_err(ExportDigestRefusal::Mint)?;
     Ok(digest.encode())
@@ -1629,6 +1660,14 @@ pub enum ReadmissionRefusal {
         /// The declaration.
         decl: String,
     },
+    /// The complete local environment binding could not be computed. No
+    /// local readmission preflight or re-admission authority exists after this refusal.
+    LocalEnvironmentRefused {
+        /// The imported subject, which can differ from the failing dependency.
+        decl: String,
+        /// The precise encoding or resource refusal.
+        refusal: EnvironmentDigestRefusal,
+    },
     /// The local dependency closure hashes differently than the one the
     /// verdict was minted over.
     EnvironmentSkew {
@@ -1729,6 +1768,7 @@ impl ReadmissionRefusal {
             Self::KernelVersionSkew { decl, .. }
             | Self::AssumptionBearing { decl, .. }
             | Self::DeclarationMissing { decl }
+            | Self::LocalEnvironmentRefused { decl, .. }
             | Self::EnvironmentSkew { decl, .. }
             | Self::UndisclosedAssumptions { decl, .. }
             | Self::LocalCarrierRefused { decl, .. }
@@ -1783,6 +1823,11 @@ impl ReadmissionRefusal {
                    order matters);\n\
                  - if the declaration was renamed or removed upstream, rebuild against \
                    the current dependency — the certificate is stale."
+            ),
+            Self::LocalEnvironmentRefused { decl, refusal } => format!(
+                "the imported certificate for `{decl}` cannot be bound to the complete \
+                 local environment; no import is admitted. {}",
+                refusal.note()
             ),
             Self::EnvironmentSkew { decl, imported, local } => format!(
                 "the imported certificate for `{decl}` was minted over a dependency \
@@ -1926,6 +1971,12 @@ pub fn bind_readmission<'env>(
         Err(EnvironmentDigestRefusal::NoSuchDeclaration { .. }) => {
             return Err(ReadmissionRefusal::DeclarationMissing { decl: decl.to_owned() });
         }
+        Err(refusal) => {
+            return Err(ReadmissionRefusal::LocalEnvironmentRefused {
+                decl: decl.to_owned(),
+                refusal,
+            });
+        }
     };
     if local_digest != digest.environment {
         return Err(ReadmissionRefusal::EnvironmentSkew {
@@ -2043,7 +2094,7 @@ pub fn readmit(
     preflight: &ReadmissionPreflight<'_>,
     local: &LocallyRechecked,
 ) -> Result<Readmitted, ReadmissionRefusal> {
-    if local.faithful.name() != preflight.decl {
+    if local.faithful.declaration() != &Name::from_string(&preflight.decl) {
         return Err(ReadmissionRefusal::LocalEvidenceSubjectSkew {
             decl: preflight.decl.clone(),
             checked: local.faithful.name().to_owned(),

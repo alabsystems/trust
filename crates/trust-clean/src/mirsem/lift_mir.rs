@@ -780,14 +780,13 @@ pub(crate) fn sem_field_read_operand(
             if call_dest_written {
                 return None;
             }
+            // `&raw const` included (INT-RAWCONST-HAVOC-1); `param_reassigned_by_stmt`
+            // above already asks the same question.
             let mutably_aliased = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
-                matches!(s,
-                    trust_types::Statement::Assign {
-                        rvalue: trust_types::Rvalue::Ref { mutable: true, place }, ..
-                    } | trust_types::Statement::Assign {
-                        rvalue: trust_types::Rvalue::AddressOf(true, place), ..
-                    }
-                    if place.local == p.local)
+                trust_vcgen::place_write::write_capable_borrow(body, s, |place| {
+                    place.local == p.local
+                })
+                .is_some()
             });
             if mutably_aliased {
                 return None;
@@ -860,14 +859,13 @@ pub(crate) fn sem_field_read_operand(
             if call_dest_written {
                 return None;
             }
+            // `&raw const` included (INT-RAWCONST-HAVOC-1); `param_reassigned_by_stmt`
+            // above already asks the same question.
             let mutably_aliased = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
-                matches!(s,
-                    trust_types::Statement::Assign {
-                        rvalue: trust_types::Rvalue::Ref { mutable: true, place }, ..
-                    } | trust_types::Statement::Assign {
-                        rvalue: trust_types::Rvalue::AddressOf(true, place), ..
-                    }
-                    if place.local == p.local)
+                trust_vcgen::place_write::write_capable_borrow(body, s, |place| {
+                    place.local == p.local
+                })
+                .is_some()
             });
             if mutably_aliased {
                 return None;

@@ -710,8 +710,6 @@
 
 use std::fmt;
 
-#[cfg(feature = "rustc")]
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::DenseBitSet;
 use smallvec::{SmallVec, smallvec};
@@ -721,10 +719,6 @@ use self::PlaceValidity::*;
 use crate::constructor::{Constructor, ConstructorSet, IntRange};
 use crate::pat::{DeconstructedPat, PatId, PatOrWild, WitnessPat};
 use crate::{MatchArm, PatCx, PrivateUninhabitedField, checks};
-#[cfg(not(feature = "rustc"))]
-pub fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
-    f()
-}
 
 /// A pattern is a "branch" if it is the immediate child of an or-pattern, or if it is the whole
 /// pattern of a match arm. These are the patterns that can be meaningfully considered "redundant",
@@ -745,6 +739,9 @@ impl<'p, Cx: PatCx> BranchPatUsefulness<'p, Cx> {
     /// Update `self` with the usefulness information found in `row`.
     fn update(&mut self, row: &MatrixRow<'p, Cx>, matrix: &Matrix<'p, Cx>) {
         self.useful |= row.useful;
+        if self.useful {
+            return;
+        }
         // This deserves an explanation: `intersects_at_least` does not contain all intersections
         // because we skip irrelevant values (see the docs for `intersects_at_least` for an
         // example). Yet we claim this suffices to build a covering set.
@@ -796,6 +793,8 @@ struct UsefulnessCtxt<'a, 'p, Cx: PatCx> {
     /// Track information about the usefulness of branch patterns (see definition of "branch
     /// pattern" at [`BranchPatUsefulness`]).
     branch_usefulness: FxHashMap<PatId, BranchPatUsefulness<'p, Cx>>,
+    /// Whether any or-pattern was expanded during usefulness checking.
+    has_or_pat: bool,
     // Ideally this field would have type `Limit`, but this crate is used by
     // rust-analyzer which cannot have a dependency on `Limit`, because `Limit`
     // is from crate `rustc_session` which uses unstable Rust features.
@@ -931,7 +930,7 @@ impl<Cx: PatCx> PlaceInfo<Cx> {
         &self,
         cx: &Cx,
         ctors: impl Iterator<Item = &'a Constructor<Cx>> + Clone,
-    ) -> Result<(SmallVec<[Constructor<Cx>; 1]>, Vec<Constructor<Cx>>), Cx::Error>
+    ) -> Result<(SmallVec<[Constructor<Cx>; 2]>, Vec<Constructor<Cx>>), Cx::Error>
     where
         Cx: 'a,
     {
@@ -1289,7 +1288,7 @@ impl<'p, Cx: PatCx> Matrix<'p, Cx> {
         if matches!(ctor, Constructor::Or) {
             // Specializing with `Or` means expanding rows with or-patterns.
             let mut matrix = Matrix {
-                rows: Vec::new(),
+                rows: Vec::with_capacity(self.rows.len()),
                 place_info: self.place_info.clone(),
                 wildcard_row_is_relevant: self.wildcard_row_is_relevant,
             };
@@ -1745,6 +1744,9 @@ fn compute_exhaustiveness_and_usefulness<'a, 'p, Cx: PatCx>(
     for ctor in split_ctors {
         // Dig into rows that match `ctor`.
         debug!("specialize({:?})", ctor);
+        if matches!(ctor, Constructor::Or) {
+            mcx.has_or_pat = true;
+        }
         // `ctor` is *irrelevant* if there's another constructor in `split_ctors` that matches
         // strictly fewer rows. In that case we can sometimes skip it. See the top of the file for
         // details.
@@ -1752,9 +1754,7 @@ fn compute_exhaustiveness_and_usefulness<'a, 'p, Cx: PatCx>(
             || missing_ctors.is_empty()
             || mcx.tycx.exhaustive_witnesses();
         let mut spec_matrix = matrix.specialize_constructor(pcx, &ctor, ctor_is_relevant)?;
-        let mut witnesses = ensure_sufficient_stack(|| {
-            compute_exhaustiveness_and_usefulness(mcx, &mut spec_matrix)
-        })?;
+        let mut witnesses = compute_exhaustiveness_and_usefulness(mcx, &mut spec_matrix)?;
 
         // Transform witnesses for `spec_matrix` into witnesses for `matrix`.
         witnesses.apply_constructor(pcx, &missing_ctors, &ctor);
@@ -1846,7 +1846,8 @@ pub fn compute_match_usefulness<'p, Cx: PatCx>(
 
     let mut cx = UsefulnessCtxt {
         tycx,
-        branch_usefulness: FxHashMap::default(),
+        branch_usefulness: FxHashMap::with_capacity_and_hasher(arms.len(), Default::default()),
+        has_or_pat: false,
         complexity_limit,
         complexity_level: 0,
     };
@@ -1864,18 +1865,22 @@ pub fn compute_match_usefulness<'p, Cx: PatCx>(
                 Usefulness::Redundant(explanation)
             } else {
                 let mut redundant_subpats = Vec::new();
-                arm.pat.walk(&mut |subpat| {
-                    if let Some(u) = cx.branch_usefulness.get(&subpat.uid) {
-                        if let Some(explanation) = u.is_redundant() {
-                            redundant_subpats.push((subpat, explanation));
-                            false // stop recursing
-                        } else {
-                            true // keep recursing
-                        }
-                    } else {
-                        true // keep recursing
+                if cx.has_or_pat {
+                    for p in arm.pat.iter_fields() {
+                        p.pat.walk(&mut |subpat| {
+                            if let Some(u) = cx.branch_usefulness.get(&subpat.uid) {
+                                if let Some(explanation) = u.is_redundant() {
+                                    redundant_subpats.push((subpat, explanation));
+                                    false // stop recursing
+                                } else {
+                                    true // keep recursing
+                                }
+                            } else {
+                                true // keep recursing
+                            }
+                        });
                     }
-                });
+                }
                 Usefulness::Useful(redundant_subpats)
             };
             debug!(?usefulness);
@@ -1884,7 +1889,7 @@ pub fn compute_match_usefulness<'p, Cx: PatCx>(
         .collect();
 
     let arm_intersections: Vec<_> =
-        matrix.rows().map(|row| row.intersects_at_least.clone()).collect();
+        matrix.rows.into_iter().map(|row| row.intersects_at_least).collect();
 
     Ok(UsefulnessReport { arm_usefulness, non_exhaustiveness_witnesses, arm_intersections })
 }

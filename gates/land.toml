@@ -1,0 +1,2552 @@
+# The landing gate's row table (docs/PLAN.md PKG-LIVE-4; docs/design/2026-11-12-live-edit-loop.md
+# step 4 and section 5). One [[row]] per check: its id, the command that judges it, the paths
+# whose change selects it, and the defect it exists to catch.
+#
+# Today it holds the validation rows only: one per tracked scripts/tests/*_test.py module.
+# scripts/lib/land_select.py reads it at import and builds VALIDATION_PROGRAM_TESTS,
+# VALIDATION_TEST_SUBJECTS, VALIDATION_UNJUDGED_MODULES and VALIDATION_UNMAPPED_RED from it (they
+# were dict literals in that file until 2026-11-14), and refuses to load a table that breaks a
+# rule below, or that is not a regular file in a real directory (a symbolic link here would name
+# a file the gate neither hashes nor watches). No `targo trust land` engine reads this file yet;
+# that is not on yet (PKG-LIVE-4).
+# Editing this file selects what editing land_select.py selects (docs/LANDING_GATE.md).
+#
+#   schema   "trust.land-rows.v1". A reader refuses any other value, and any key it does not know.
+#   covered  globs of tracked files (`*` stays inside one path component). Each such file is
+#            exactly one [[row]] or exactly one [[not_run]]: never both, never neither
+#            (land_select.land_rows_coverage; scripts/tests/land_gate_test.py holds the tree to it,
+#            and the push row fast.land-rows-coverage, `land_gate.py rows --check`, the pushed commit).
+#
+# [[row]], sorted by id:
+#   id             "validation.<module>" for scripts/tests/<module>.py.
+#   command        the argv that judges the row, from the repository root. Exit 0 is PASS; every
+#                  other exit is not PASS.
+#   selects_on     the paths whose change selects the row, sorted. It is what SELECTS the row, not
+#                  everything the test reads: a path here is the module's own file or something it
+#                  imports, loads by path, executes, or copies from this tree as its program under
+#                  test (and, for a module that only scans named files, those files). Data a module
+#                  reads beside its program (lockfiles, compiler sources, ledgers, the tree it
+#                  scans) is not listed and keeps its own selection. The selector also adds
+#                  validation.mir_test_oracle_feature_test for any changed Cargo.toml, whatever its
+#                  directory or letter case (land_select.validation_test_modules).
+#   catches        the defect the row exists to catch: what would be wrong, and go unnoticed, were the
+#                  row not run. Not the module's title: scripts/tests/land_gate_test.py refuses a text
+#                  that only names its subject ("Tests for scripts/x.py.") or is not prose. That is a
+#                  floor, not the meaning. A row whose text describes its controls ("Inert fixtures; no
+#                  compiler runs.") passes the floor and still names no defect: such rows carry the
+#                  opening line of their module's docstring, from when the table was made, and naming
+#                  their defect is not done yet (docs/OPEN_ISSUES.md LAND-ROWS-CATCHES-1).
+#   not_yet_targo  why the command is not yet a targo verb or a test target (section 5, rule 1).
+#                  Required while it is not.
+#
+# [[not_run]], sorted by id: a covered file that nothing selects, and why.
+#   path  the file.
+#   kind  "unjudgeable": `land_gate.py validation-tests` cannot judge the module (a driver whose
+#         command line names a built SDK, or a harness that reads a test binary from the
+#         environment at import). Selecting one would make every landing that did so NOT JUDGED,
+#         or a FAIL at import; land_gate_test holds each to still being unjudgeable.
+#         "red": the module was red on main when the rest were mapped (2026-11-10, full checkout,
+#         aarch64-apple-darwin; docs/OPEN_ISSUES.md VALIDATION-UNMAPPED-RED-1). Selecting one would
+#         turn every landing that touches its subjects red for a cause the landing did not make.
+#         To retire a row: make the module green, add its [[row]] (its own file, what it imports,
+#         loads or executes), and delete the [[not_run]].
+#   why   the reason; for "red", the exact failure.
+#
+# [validation_programs]: path = [row ids]. Read only by scripts/lib/land_select.py, and it goes
+# when that file does. A path here is a validation program: changing it runs the listed rows, and
+# the path is exempt from the rules that select every leg (a path under scripts/ otherwise selects
+# every leg). A compiler or package that reads the path still reaches it through its own inputs.
+# Every other selects_on path is additive: it adds its rows and keeps every other rule, so it
+# never narrows a leg. The listed rows must be exactly the rows whose selects_on names the path;
+# their order here is the order land_select reports them in.
+
+schema = "trust.land-rows.v1"
+covered = ["scripts/tests/*_test.py"]
+
+[validation_programs]
+"scripts/check_pin_regression.sh" = ["validation.pin_regression_ancestry_test", "validation.preflight_test"]
+"scripts/tests/pin_regression_ancestry_test.py" = ["validation.pin_regression_ancestry_test"]
+"tests/trust-soundness-corpus/README.md" = ["validation.trust_soundness_corpus_test"]
+"scripts/tests/check_frozen_source_reader_test.py" = ["validation.check_frozen_source_reader_test"]
+"scripts/check_tcb_panic_freedom.sh" = ["validation.check_tcb_panic_freedom_test"]
+"scripts/check_tcb_panic_freedom.baseline" = ["validation.check_tcb_panic_freedom_test"]
+"scripts/tests/check_tcb_panic_freedom_test.sh" = ["validation.check_tcb_panic_freedom_test"]
+"scripts/tests/check_tcb_panic_freedom_test.py" = ["validation.check_tcb_panic_freedom_test"]
+"scripts/lib/test_python.py" = ["validation.landing_targo_test", "validation.check_crates_tests_scoped_test"]
+"scripts/tests/mir_test_oracle_feature_test.py" = ["validation.mir_test_oracle_feature_test"]
+"scripts/hooks/pre-push" = [
+    "validation.land_gate_test",
+    "validation.landing_targo_test",
+    "validation.gate_lane_coverage_test",
+    "validation.coordination_harness_reporting_test",
+    "validation.pre_push_contracts_test",
+    "validation.pre_push_coverage_test",
+]
+# Scope regressions are explicit validation diagnostics, not push
+# prerequisites. Execute the real module for its runner changes.
+"scripts/check_targo_trust_unit_tests.sh" = [
+    "validation.landing_targo_test",
+    "validation.scoped_lane_push_scope_test",
+]
+"scripts/tests/scoped_lane_push_scope_test.py" = ["validation.scoped_lane_push_scope_test"]
+"scripts/tests/pre_push_contracts_test.py" = ["validation.pre_push_contracts_test"]
+"scripts/tests/pre_push_coverage_test.py" = ["validation.pre_push_coverage_test"]
+"scripts/tests/pre_push_fast_pool_test.sh" = ["validation.pre_push_contracts_test"]
+"scripts/tests/pre_push_overlap_scoped_test.sh" = ["validation.pre_push_contracts_test"]
+"scripts/tests/pre_push_stale_destination_test.sh" = ["validation.pre_push_contracts_test"]
+"scripts/tests/pre_push_quarantine_test.sh" = ["validation.pre_push_contracts_test"]
+"scripts/tests/pre_push_inherited_red_test.sh" = ["validation.pre_push_contracts_test"]
+"scripts/tests/pre_push_shadow_test.sh" = ["validation.pre_push_contracts_test"]
+"scripts/tests/ssh_keepalive_test.sh" = ["validation.pre_push_contracts_test"]
+"scripts/tests/gate_lane_coverage_test.py" = ["validation.gate_lane_coverage_test"]
+"scripts/tests/coordination_harness_reporting_test.py" = ["validation.coordination_harness_reporting_test"]
+"scripts/land_gate.py" = [
+    "validation.land_gate_test",
+    "validation.landing_targo_test",
+    "validation.land_gate_cancellation_test",
+    "validation.land_gate_row_custody_test",
+    "validation.remote_tips_process_test",
+    "validation.python_floor_test",
+    "validation.land_development_test",
+]
+"scripts/lib/landing_targo.py" = [
+    "validation.landing_targo_test",
+    "validation.land_gate_row_custody_test",
+    "validation.remote_tips_process_test",
+    "validation.resource_fds_test",
+    "validation.check_seed_freshness_test",
+    "validation.check_bootstrap_script_tests_test",
+    "validation.completion_gates_g3_test",
+    "validation.qualify_targo_resource_test",
+]
+"scripts/lib/checkout_inputs.py" = [
+    "validation.land_gate_test",
+    "validation.landing_targo_test",
+    "validation.land_gate_cancellation_test",
+    "validation.land_gate_row_custody_test",
+    "validation.remote_tips_process_test",
+]
+"scripts/lib/native_checkout.py" = ["validation.native_checkout_test"]
+"scripts/tests/native_checkout_test.py" = ["validation.native_checkout_test"]
+"scripts/tests/landing_targo_test.py" = ["validation.landing_targo_test"]
+# check_ledger_pins.py judges each row by land_select's audit_row_ok/not_path_row_ok.
+"scripts/lib/land_select.py" = [
+    "validation.land_gate_test",
+    "validation.land_development_test",
+    "validation.check_ledger_pins_test",
+]
+"scripts/lib/land_manifest.py" = ["validation.land_manifest_test", "validation.land_gate_test"]
+"scripts/lib/land_development.py" = ["validation.land_development_test", "validation.land_gate_test"]
+"scripts/tests/land_manifest_test.py" = ["validation.land_manifest_test"]
+"scripts/tests/land_development_test.py" = ["validation.land_development_test"]
+"scripts/tests/land_gate_row_custody_test.py" = ["validation.land_gate_row_custody_test"]
+"scripts/lib/remote_tips.py" = [
+    "validation.remote_tips_agh_test",
+    "validation.remote_tips_shallow_test",
+    "validation.remote_tips_process_test",
+    "validation.remote_tips_advertisement_test",
+    "validation.push_destination_test",
+]
+"scripts/lib/remote_operation.py" = ["validation.remote_tips_process_test"]
+"scripts/tests/remote_tips_process_test.py" = ["validation.remote_tips_process_test"]
+"scripts/tests/remote_tips_agh_test.py" = ["validation.remote_tips_agh_test"]
+"scripts/tests/remote_tips_advertisement_test.py" = ["validation.remote_tips_advertisement_test"]
+"scripts/tests/remote_tips_shallow_test.py" = ["validation.remote_tips_shallow_test"]
+"scripts/check_compiler_targets_build.sh" = ["validation.land_gate_test"]
+"scripts/tests/compiler_check_selector_consult_test.sh" = ["validation.land_development_test"]
+"scripts/lib/rust_lex.py" = ["validation.land_gate_test"]
+# land_development_test's BootstrapFixtureAuditTests read three of its rows.
+"scripts/gates/land-escape-audits.toml" = ["validation.land_gate_test", "validation.land_development_test"]
+"scripts/lib/host_budget.py" = [
+    "validation.land_gate_test",
+    "validation.check_crates_tests_scoped_test",
+    "validation.host_budget_admission_test",
+]
+"scripts/lib/crates_tests_time.py" = [
+    "validation.land_gate_test",
+    "validation.check_crates_tests_scoped_test",
+]
+"scripts/check_crates_tests_scoped.py" = [
+    "validation.land_gate_test",
+    "validation.check_crates_tests_scoped_test",
+]
+# The crates lane's member rule, read by the lane and by the selector (LAND-GATE-HOOKLESS-1 round 5, D1).
+"scripts/lib/crates_lane_members.py" = [
+    "validation.land_gate_test",
+    "validation.check_crates_tests_scoped_test",
+]
+"scripts/tests/land_gate_test.py" = ["validation.land_gate_test", "validation.land_development_test"]
+"scripts/tests/land_gate_cancellation_test.py" = ["validation.land_gate_cancellation_test"]
+"scripts/tests/check_crates_tests_scoped_test.py" = ["validation.check_crates_tests_scoped_test"]
+"scripts/trust_self_verify_crate.sh" = ["validation.trust_self_verify_crate_test"]
+"scripts/tests/trust_self_verify_crate_test.py" = ["validation.trust_self_verify_crate_test"]
+"scripts/build-slot" = [
+    "validation.build_slot_test",
+    "validation.build_slot_quiet_test",
+    "validation.build_slot_recovery_test",
+    "validation.build_slot_cpu_bridge_test",
+    "validation.check_bootstrap_script_tests_test",
+    "validation.qualify_targo_resource_test",
+]
+# These exact modules already belong to the complete private admission
+# owner. An edit to its fixtures runs that same complete suite; no prefix
+# or neighbouring test/program path gains development ownership.
+"scripts/tests/build_slot_test.py" = [
+    "validation.build_slot_test",
+    "validation.build_slot_quiet_test",
+    "validation.build_slot_recovery_test",
+    "validation.build_slot_cpu_bridge_test",
+    "validation.check_bootstrap_script_tests_test",
+]
+"scripts/tests/build_slot_cpu_bridge_test.py" = [
+    "validation.build_slot_test",
+    "validation.build_slot_quiet_test",
+    "validation.build_slot_recovery_test",
+    "validation.build_slot_cpu_bridge_test",
+    "validation.check_bootstrap_script_tests_test",
+]
+"scripts/tests/build_slot_quiet_test.py" = [
+    "validation.build_slot_test",
+    "validation.build_slot_quiet_test",
+    "validation.build_slot_recovery_test",
+    "validation.build_slot_cpu_bridge_test",
+    "validation.check_bootstrap_script_tests_test",
+]
+"scripts/tests/build_slot_recovery_test.py" = [
+    "validation.build_slot_test",
+    "validation.build_slot_quiet_test",
+    "validation.build_slot_recovery_test",
+    "validation.build_slot_cpu_bridge_test",
+    "validation.check_bootstrap_script_tests_test",
+]
+# The push row `fast.corpus-membership` (CORPUS-MEMBERSHIP-AT-LANDING-1):
+# its rule tests, and land_gate_test's grading of it by push-rows.
+"scripts/check_corpus_membership.py" = [
+    "validation.check_corpus_membership_test",
+    "validation.land_gate_test",
+]
+"scripts/tests/check_corpus_membership_test.py" = ["validation.check_corpus_membership_test"]
+# The push row `fast.ledger-pins` (LEDGER-PIN-CURRENCY-AT-LANDING-1).
+"scripts/check_ledger_pins.py" = ["validation.check_ledger_pins_test"]
+"scripts/tests/check_ledger_pins_test.py" = ["validation.check_ledger_pins_test"]
+# The row `fast.luminal-domination-ledger`: the counter of Luminal capabilities met
+# (docs/PLAN.md section 4), its tests, and the one ledger file it reads. The ledger is
+# read by that script alone (no package, build script or other test opens it), and the
+# tests hold the committed ledger to the plan and to the manifest row's pins, so a commit
+# that fills a ledger row runs them instead of every leg. Any other path under
+# tests/luminal-domination/ stays unclassified (every leg).
+"scripts/luminal_domination.py" = ["validation.luminal_domination_test"]
+"scripts/tests/luminal_domination_test.py" = ["validation.luminal_domination_test"]
+"tests/luminal-domination/capabilities.json" = ["validation.luminal_domination_test"]
+# `dispatch-cost` (docs/STATUS.md "Dispatch cost"): the driver and the tests of its
+# statistics, refusals and targo command lines. The probe package it builds
+# (scripts/dispatch-cost/) is an additive selects_on path of the same row, which narrows nothing.
+"scripts/dispatch_cost.py" = ["validation.dispatch_cost_test"]
+"scripts/tests/dispatch_cost_test.py" = ["validation.dispatch_cost_test"]
+
+[[row]]
+id = "validation.audit_first_party_pins_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.audit_first_party_pins_test"]
+selects_on = [
+    "scripts/audit_first_party_pins.py",
+    "scripts/tests/audit_first_party_pins_test.py",
+]
+catches = "scripts/audit_first_party_pins.py misclassifying a historical first-party pin: calling a commit the remote refused or does not know anchorable or orphaned without the local object to say so, counting a closure that was not explicitly retained as safe, or accepting a remote pin that resolves to another target."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.binary_decomp_inprocess_fixture_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.binary_decomp_inprocess_fixture_test"]
+selects_on = [
+    "scripts/tests/binary_decomp_inprocess_fixture_test.py",
+    "tests/fixtures/binary_decomp/regenerate_inprocess_elf.py",
+]
+catches = "A checked-in in-process ELF fixture whose code bytes or function symbol are not the ones recorded, or tests/fixtures/binary_decomp/regenerate_inprocess_elf.py accepting a wrong machine or object type or a truncated object, or modifying the fixtures when no assembler is present."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.bootstrap_dependency_closure_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.bootstrap_dependency_closure_test"]
+selects_on = [
+    "scripts/bootstrap_dependency_closure.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/tests/bootstrap_dependency_closure_test.py",
+    # The closure test parses the actual tool.rs recipe as a named subject.
+    "src/bootstrap/src/core/build_steps/tool.rs",
+]
+catches = "Bootstrap source controls; no resource, cache-readiness or proof admission."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.bootstrap_manifest_platform_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.bootstrap_manifest_platform_test"]
+selects_on = [
+    "src/bootstrap/Cargo.toml",
+    "src/bootstrap/src/utils/metadata_scheduler.rs",
+]
+catches = "src/bootstrap/Cargo.toml declaring trust_resource_controller for fewer platforms than src/bootstrap/src/utils/metadata_scheduler.rs uses it on, so Bootstrap does not compile there (Linux, from 2026-11-08, E0433) and no landing notices; or a cfg predicate the comparison cannot read being guessed."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.bootstrap_resource_admission_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.bootstrap_resource_admission_test"]
+selects_on = [
+    "scripts/recreate_bootstrap.py",
+    "scripts/tests/bootstrap_resource_admission_test.py",
+]
+catches = "The real native-authority capture and producer agree on CPU admission."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.bootstrap_shim_jobserver_cleanup_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.bootstrap_shim_jobserver_cleanup_test"]
+selects_on = [
+    "scripts/tests/bootstrap_shim_jobserver_cleanup_test.py",
+    "scripts/tests/bootstrap_shim_jobserver_test.py",
+]
+catches = "Bounded process-custody regressions; no compiler or SDK execution."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.bootstrap_xpy_environment_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.bootstrap_xpy_environment_test"]
+selects_on = [
+    "scripts/bootstrap_xpy.py",
+    "scripts/mint_seed_support.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/tests/bootstrap_xpy_environment_test.py",
+    "scripts/tests/mint_clean_lean_inputs_test.py",
+    "src/bootstrap/bootstrap.py",
+]
+catches = "Pure producer-input tests: no compiler, x.py, proof or native code executes."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.bridge_failed_scratch_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.bridge_failed_scratch_test"]
+selects_on = [
+    "scripts/regen-trustir-oleans.sh",
+    "scripts/tests/bridge_failed_scratch_test.py",
+]
+catches = "Execute the producer's actual EXIT handler on successful and failed work."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.build_dir_symlink_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.build_dir_symlink_test"]
+selects_on = [
+    "scripts/build.sh",
+    "scripts/collect_strict_superiority_artifacts.sh",
+    "scripts/lib/trust_toolchain_surface.sh",
+    "scripts/mint_seed_support.py",
+    "scripts/off_stock_rust_audit.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/run_tests_after_build.sh",
+    "scripts/tests/build_dir_symlink_test.py",
+    "tests/e2e_basic_contracts_smoke.sh",
+    "tests/e2e_targo_trust_cli.sh",
+    "tests/e2e_targo_trust_root_resolution.sh",
+    "tools/preflight.py",
+]
+catches = "`build/` may be a symlink to `build.noindex/`: every walker and guard must say so."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.build_slot_cpu_bridge_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.build_slot_cpu_bridge_test"]
+selects_on = [
+    "scripts/build-slot",
+    "scripts/tests/build_slot_cpu_bridge_test.py",
+    "scripts/tests/build_slot_quiet_test.py",
+    "scripts/tests/build_slot_recovery_test.py",
+    "scripts/tests/build_slot_test.py",
+]
+catches = "Private native/fixed reservation fixtures; never touch the host CPU pool."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.build_slot_quiet_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.build_slot_quiet_test"]
+selects_on = [
+    "scripts/build-slot",
+    "scripts/tests/build_slot_cpu_bridge_test.py",
+    "scripts/tests/build_slot_quiet_test.py",
+    "scripts/tests/build_slot_recovery_test.py",
+    "scripts/tests/build_slot_test.py",
+]
+catches = "Bounded real-process admission controls; no shared host locks or heavy work."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.build_slot_recovery_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.build_slot_recovery_test"]
+selects_on = [
+    "scripts/build-slot",
+    "scripts/tests/build_slot_cpu_bridge_test.py",
+    "scripts/tests/build_slot_quiet_test.py",
+    "scripts/tests/build_slot_recovery_test.py",
+    "scripts/tests/build_slot_test.py",
+]
+catches = "Real-lock recovery controls in private fixtures; no machine-domain changes."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.build_slot_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.build_slot_test"]
+selects_on = [
+    "scripts/build-slot",
+    "scripts/tests/build_slot_cpu_bridge_test.py",
+    "scripts/tests/build_slot_quiet_test.py",
+    "scripts/tests/build_slot_recovery_test.py",
+    "scripts/tests/build_slot_test.py",
+]
+catches = "Tiny real flock/process controls; never use the global gate or host probes."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.channel_c_survey_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.channel_c_survey_test"]
+selects_on = [
+    "scripts/channel_c_survey.py",
+    "scripts/tests/channel_c_survey_test.py",
+]
+catches = "scripts/channel_c_survey.py misparsing a channel C row (a result, def path or args that contain spaces, an optional column, the summary line) or misclassifying a run (probed, compile-failed, no-probe-output, timeout), so the census counts rows it did not read."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_bootstrap_script_tests_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_bootstrap_script_tests_test"]
+selects_on = [
+    "scripts/bootstrap_dependency_closure.py",
+    "scripts/bootstrap_xpy.py",
+    "scripts/build-slot",
+    "scripts/check_bootstrap_script_tests.sh",
+    "scripts/check_seed_freshness.py",
+    "scripts/create_local_genesis_stage0.py",
+    "scripts/daily_dependency_git.py",
+    "scripts/daily_registry_proxy.py",
+    "scripts/daily_toolchain_stage.py",
+    "scripts/freeze_toolchain_sources.py",
+    "scripts/lib/landing_targo.py",
+    "scripts/lib/native_serial.py",
+    "scripts/lib/seal_content_identity.py",
+    "scripts/lib/seed_compiler_identity.py",
+    "scripts/lib/seed_linux.py",
+    "scripts/lib/stage_receipt_provenance.py",
+    "scripts/lib/trust_build_provenance.py",
+    "scripts/lib/trust_toolchain_surface.sh",
+    "scripts/mint_and_prove_seed.sh",
+    "scripts/mint_seed_recovery.py",
+    "scripts/mint_seed_support.py",
+    "scripts/native_sdk_tools.py",
+    "scripts/promote-toolchain.sh",
+    "scripts/prune_seal_symlinks.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/sdk_frontend_component.py",
+    "scripts/sdk_targo_component.py",
+    "scripts/sdk_targo_current_component.py",
+    "scripts/sdk_targo_transport_witness.py",
+    "scripts/seed_custody_source.py",
+    "scripts/seed_fixed_point.py",
+    "scripts/seed_host_ledger.py",
+    "scripts/seed_input_archives.py",
+    "scripts/seed_input_records.py",
+    "scripts/seed_root_initialization.py",
+    "scripts/submodule_sync.sh",
+    "scripts/tests/bootstrap_xpy_environment_test.py",
+    "scripts/tests/build_slot_cpu_bridge_test.py",
+    "scripts/tests/build_slot_quiet_test.py",
+    "scripts/tests/build_slot_recovery_test.py",
+    "scripts/tests/build_slot_test.py",
+    "scripts/tests/check_bootstrap_script_tests_test.py",
+    "scripts/tests/daily_toolchain_stage_test.py",
+    "scripts/tests/fixtures/publication_daily_consumer_outcomes.py",
+    "scripts/tests/freeze_toolchain_sources_test.py",
+    "scripts/tests/mint_clean_lean_inputs_test.py",
+    "scripts/tests/promote_toolchain_test.sh",
+    "scripts/tests/recreate_bootstrap_test.py",
+    "scripts/tests/seed_lock_inventory_test.py",
+    "scripts/tests/seed_runtime_prerequisite_test.py",
+    "scripts/verify_sysroot_libraries.py",
+    "src/tools/trust-stage0-dist/prepare.py",
+    "tests/run_trust_comprehensive_harness.sh",
+    "tools/preflight.py",
+    "tools/verify-toolchain.sh",
+    "x.py",
+]
+catches = "Regression test: the scoped push lane for the bootstrap scripts' own tests."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_corpus_membership_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_corpus_membership_test"]
+selects_on = [
+    "scripts/check_corpus_membership.py",
+    "scripts/tests/check_corpus_membership_test.py",
+]
+catches = "scripts/check_corpus_membership.py selecting a different set of files than the REGENERATE command each corpus manifest's header documents, or passing a tree it cannot answer for (a path the manifest cannot carry, a link or gitlink, a checkout conversion that moves the size cap)."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_crates_tests_scoped_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_crates_tests_scoped_test"]
+selects_on = [
+    "scripts/check_crates_tests_scoped.py",
+    "scripts/lib/crates_lane_members.py",
+    "scripts/lib/crates_tests_time.py",
+    "scripts/lib/host_budget.py",
+    "scripts/lib/test_python.py",
+    "scripts/tests/check_crates_tests_scoped_test.py",
+]
+catches = "scripts/check_crates_tests_scoped.py selecting too few packages or targets for a change, or grading a run it did not record as a pass: a missing test, an interrupted or over-budget binary, or a member built only for another OS counted as tested."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_driver_extra_symbols_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_driver_extra_symbols_test"]
+selects_on = [
+    "scripts/check_driver_extra_symbols.py",
+    "scripts/tests/check_driver_extra_symbols_test.py",
+]
+catches = "scripts/check_driver_extra_symbols.py (push row fast.driver-extra-symbols) missing two extra symbols that collide by value under different names, reporting a same-name pair that is not a collision, or misreading a symbol's string (a raw string, an escape, a brace inside a string)."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_exception_lanes_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_exception_lanes_test"]
+selects_on = [
+    "scripts/tests/check_exception_lanes_test.py",
+    "tests/run_trust_comprehensive_harness.sh",
+    "tests/upstream-rust/check_exception_lanes.py",
+]
+catches = "tests/upstream-rust/check_exception_lanes.py: the lane gate and `--run`."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_first_party_pin_lattice_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_first_party_pin_lattice_test"]
+selects_on = [
+    "scripts/check_first_party_pin_lattice.py",
+    "scripts/tests/check_first_party_pin_lattice_test.py",
+]
+catches = "scripts/check_first_party_pin_lattice.py passing a clean, trust-ir and trust-cg constellation whose pins disagree: a declaration, manifest or lockfile naming a stale trust-ir, or a kernel, or a row inherited with it, that differs by a byte."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_frozen_source_reader_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_frozen_source_reader_test"]
+selects_on = [
+    # Preserve the freeze gate's ordinary classification and fresh push row;
+    # its source-reader refusals also execute when the actual checker changes.
+    "scripts/check_frozen_files.sh",
+    "scripts/tests/check_frozen_source_reader_test.py",
+]
+catches = "The source citation reader keeps real committed-tree freeze refusals."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_gate_script_syntax_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_gate_script_syntax_test"]
+selects_on = [
+    "scripts/check_gate_script_syntax.sh",
+    "scripts/tests/check_gate_script_syntax_test.py",
+]
+catches = "scripts/check_gate_script_syntax.sh parsing a non-shell helper under scripts/hooks/ as shell (the Perl helper _ssh_probe.pl failed `bash -n`, 2026-10-25), or no longer naming a real Perl or shell syntax error."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_ir_cohort_inventory_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_ir_cohort_inventory_test"]
+selects_on = [
+    "scripts/check_ir_cohort.py",
+    "scripts/tests/check_ir_cohort_inventory_test.py",
+]
+catches = "scripts/check_ir_cohort.py returning an incomplete or empty manifest inventory as if it were complete, or treating missing semantic blobs as genuine path absence: covers nested inactive gitlinks, unreadable indexes, inherited hook inputs, exact blob restoration and an unreadable or missing ratified anchor that a consumer group must not replace."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_ledger_pins_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_ledger_pins_test"]
+selects_on = [
+    "scripts/check_ledger_pins.py",
+    "scripts/lib/land_select.py",
+    "scripts/tests/check_ledger_pins_test.py",
+]
+catches = "scripts/check_ledger_pins.py (push row fast.ledger-pins) passing a pushed tree in which a blob pinned by the escape-audit ledger or the IR read set moved with neither a renewal nor a lapse in the same tree, excusing it by a lapse on another entry or a malformed one, keying a finding on the tree's blob, or dying below Python 3.11 where it must re-run itself under a newer one."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_reports_script_copies_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_reports_script_copies_test"]
+selects_on = [
+    "scripts/check_reports_script_copies.py",
+    "scripts/tests/check_reports_script_copies_test.py",
+]
+catches = "scripts/check_reports_script_copies.py missing an identical copy of a live script tracked under reports/, or refusing what is not one (a modified copy, a data file, an empty file, a copy between reports)."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_seed_freshness_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_seed_freshness_test"]
+selects_on = [
+    "scripts/check_seed_freshness.py",
+    "scripts/lib/landing_targo.py",
+    "scripts/lib/native_serial.py",
+    "scripts/lib/seed_compiler_identity.py",
+    "scripts/mint_seed_support.py",
+    "scripts/tests/check_seed_freshness_test.py",
+    "src/bootstrap/stage0_identity.py",
+]
+catches = "scripts/check_seed_freshness.py passing a stage0 seed that is not the pinned one (a configured seed or cargo override, an older pin whose date matches, a seed that only reports the pin's identity), or printing a match note on an identity mismatch."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_tcb_panic_freedom_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_tcb_panic_freedom_test"]
+selects_on = [
+    "scripts/check_tcb_panic_freedom.baseline",
+    "scripts/check_tcb_panic_freedom.sh",
+    "scripts/tests/check_tcb_panic_freedom_test.py",
+    "scripts/tests/check_tcb_panic_freedom_test.sh",
+]
+catches = "Run the real panic-counter mutation suite in landing validation."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_upstream_rust_test_toolchain_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_upstream_rust_test_toolchain_test"]
+selects_on = [
+    "scripts/check_upstream_rust_test_toolchain.sh",
+    "scripts/tests/check_upstream_rust_test_toolchain_test.py",
+]
+catches = "Exercise stage2 path selection through the real upstream preflight script."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.check_wp_native_facade_retirement_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_wp_native_facade_retirement_test"]
+selects_on = [
+    "scripts/check_cargo_manifest_alignment.py",
+    "scripts/tests/check_wp_native_facade_retirement_test.py",
+]
+catches = "The retired trust-wp compatibility native API coming back (a trust-wp-ay or trust-wp-lib dependency in the facade's manifest, or its sources) without scripts/check_cargo_manifest_alignment.py's retirement check reporting it."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.collect_lambda_calculus_diagnostic_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.collect_lambda_calculus_diagnostic_test"]
+selects_on = [
+    "crates/trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/regenerate.sh",
+    "scripts/collect_lambda_calculus_diagnostic.py",
+    "scripts/tests/collect_lambda_calculus_diagnostic_test.py",
+]
+catches = "scripts/collect_lambda_calculus_diagnostic.py publishing a receipt it should not: replacing the previous accepted receipt after a compiler failure or a proof-denominator mismatch, accepting a run without its trustd provenance binding, leaving a child's output unbounded, or publishing through a swapped ancestor directory or over a racing writer."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.collect_realcode_coverage_evidence_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.collect_realcode_coverage_evidence_test"]
+selects_on = [
+    "scripts/collect_realcode_coverage_evidence.py",
+    "scripts/tests/collect_realcode_coverage_evidence_test.py",
+]
+catches = "scripts/collect_realcode_coverage_evidence.py replacing prior evidence with a receipt that is inflated, inconsistent, incomplete, timed out or built from a malformed or missing dump, crediting a scorecard that has no bridge evidence, or passing the ambient environment to its children."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.compat_check_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.compat_check_test"]
+selects_on = [
+    "scripts/compat_check.py",
+    "scripts/tests/compat_check_test.py",
+]
+catches = "scripts/compat_check.py: the committed top-crates corpus metadata must match its exact bytes and entries, and an invalid or duplicate corpus entry must fail closed."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.compiletest_census_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.compiletest_census_test"]
+selects_on = [
+    "scripts/compiletest_census.py",
+    "scripts/tests/compiletest_census_test.py",
+]
+catches = "scripts/compiletest_census.py reading a census as completed or as authority when it is not: an interrupted run, an omitted case or command terminal, a duplicate or rebound command, or a mutated payload accepted, or a valid census reported as more than a diagnostic."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.completion_gate_malformed_input_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.completion_gate_malformed_input_test"]
+selects_on = [
+    "scripts/completion_gates/check_g1_rust_input.py",
+    "scripts/completion_gates/check_g2_lean_input.py",
+    "scripts/completion_gates/check_g3_producer_totality.py",
+    "scripts/completion_gates/check_g4_semantic_faithfulness.py",
+    "scripts/completion_gates/check_g5_mixed_linking.py",
+    "scripts/completion_gates/check_g6_proof_authority.py",
+    "scripts/completion_gates/check_g7_codegen_authority.py",
+    "scripts/completion_gates/check_g8_release_reproducibility.py",
+    "scripts/tests/completion_gate_malformed_input_test.py",
+    "scripts/tests/completion_gates_g8_test.py",
+    "scripts/two_language_completion_gate.py",
+]
+catches = "Malformed caller evidence must produce refusals, not checker crashes."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.completion_gates_g1_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.completion_gates_g1_test"]
+selects_on = [
+    "scripts/completion_gates/check_g1_rust_input.py",
+    "scripts/tests/completion_gates_g1_test.py",
+    "scripts/tests/two_language_completion_gate_test.py",
+]
+catches = "scripts/completion_gates/check_g1_rust_input.py minting a G1 pass from a structural observation alone, or observing instead of refusing when a pinned upstream object, test file, recorded Rust body or owner feature is missing, or an outcome is unknown or a counter self-authored."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.completion_gates_g2_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.completion_gates_g2_test"]
+selects_on = [
+    "scripts/completion_gates/check_g2_lean_input.py",
+    "scripts/tests/completion_gates_g2_test.py",
+    "scripts/two_language_completion_gate.py",
+]
+catches = "scripts/completion_gates/check_g2_lean_input.py turning green on authored favorable inventory, failing to fail a conjunct independently, or reading an uncommitted edit, a symlinked ledger, an unknown surface or a drifted owner revision in place of the committed clean submodule at its pin."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.completion_gates_g3_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.completion_gates_g3_test"]
+selects_on = [
+    "scripts/completion_gates/check_g3_producer_totality.py",
+    "scripts/lib/landing_targo.py",
+    "scripts/rust_instance_census.py",
+    "scripts/tests/completion_gates_g3_test.py",
+    "scripts/trust_ir_producer_scorecard.py",
+    "scripts/two_language_completion_gate.py",
+]
+catches = "scripts/completion_gates/check_g3_producer_totality.py granting producer totality it cannot measure: unavailable authority read as green, a corpus-local complete count read as total, an unlisted body in a mixed file passing as no exclusion, or authored body digests satisfying the join checks."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.completion_gates_g4_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.completion_gates_g4_test"]
+selects_on = [
+    "scripts/completion_gates/check_g4_semantic_faithfulness.py",
+    "scripts/tests/completion_gates_g4_test.py",
+    "scripts/two_language_completion_gate.py",
+]
+catches = "scripts/completion_gates/check_g4_semantic_faithfulness.py turning green on an authored certificate claim, a sample or a finite-exhaustive label, or accepting a duplicate or missing certificate, a mutated refinement root, owner relation or kernel reference, or a sampled, uninterpreted or not-run mode."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.completion_gates_g5_g7_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.completion_gates_g5_g7_test"]
+selects_on = [
+    "scripts/completion_gates/check_g5_mixed_linking.py",
+    "scripts/completion_gates/check_g7_codegen_authority.py",
+    "scripts/tests/completion_gates_g5_g7_test.py",
+]
+catches = "scripts/completion_gates/check_g5_mixed_linking.py or check_g7_codegen_authority.py passing a conjunct on a plausible, hash-bound but unauthenticated bundle, or a shape rule (a seam type guard, a linked refusal list, a typed field) not reporting the mutation that breaks it."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.completion_gates_g6_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.completion_gates_g6_test"]
+selects_on = [
+    "scripts/completion_gates/check_g6_proof_authority.py",
+    "scripts/tests/completion_gates_g6_test.py",
+    "scripts/two_language_completion_gate.py",
+]
+catches = "scripts/completion_gates/check_g6_proof_authority.py turning green on forged favorable input: authored certified, unsat, replayed or complete claims, a self-consistent forged subject population, zero obligations satisfying the bijection vacuously, a duplicate proof covering a missing or extra obligation, or a proposition that does not match."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.completion_gates_g7_failclosed_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.completion_gates_g7_failclosed_test"]
+selects_on = [
+    "scripts/completion_gates/check_g7_codegen_authority.py",
+    "scripts/tests/completion_gates_g7_failclosed_test.py",
+]
+catches = "scripts/completion_gates/check_g7_codegen_authority.py minting a G7 conjunct from an authored complete bundle, or not diagnosing a wrong contract id or digest, an unchecked runner-bound policy digest, or a missing or duplicate translation row."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.completion_gates_g8_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.completion_gates_g8_test"]
+selects_on = [
+    "scripts/completion_gates/check_g8_release_reproducibility.py",
+    "scripts/tests/completion_gates_g8_test.py",
+    "scripts/two_language_completion_gate.py",
+]
+catches = "scripts/completion_gates/check_g8_release_reproducibility.py minting G8 from favorable authored metadata, a bare forged seal, a self-issued key or pin, or a spliced prior root, or reading a signed policy, detached seal or roster match as proof of replay."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.coordination_harness_reporting_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.coordination_harness_reporting_test"]
+selects_on = [
+    "scripts/hooks/pre-push",
+    "scripts/tests/coordination_harness_reporting_test.py",
+]
+catches = "Optional coordination failures stay visible through the real harness and hook."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.daily_toolchain_stage_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.daily_toolchain_stage_test"]
+selects_on = [
+    "scripts/bootstrap_dependency_closure.py",
+    "scripts/daily_dependency_git.py",
+    "scripts/daily_registry_proxy.py",
+    "scripts/daily_toolchain_stage.py",
+    "scripts/lib/seal_content_identity.py",
+    "scripts/lib/seed_linux.py",
+    "scripts/mint_seed_support.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/seed_custody_source.py",
+    "scripts/seed_staircase.py",
+    "scripts/submodule_sync.sh",
+    "scripts/tests/daily_toolchain_stage_test.py",
+    "scripts/tests/fixtures/publication_daily_consumer_outcomes.py",
+    "scripts/verify_sysroot_libraries.py",
+    "src/bootstrap/stage0_identity.py",
+]
+catches = "Exercise orchestration with real temporary Git histories and fake pipeline owners."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.dependency_cycle_anchor_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.dependency_cycle_anchor_test"]
+selects_on = [
+    "scripts/check_dependency_cycle_anchor.py",
+]
+catches = "scripts/check_dependency_cycle_anchor.py accepting a mutated first-party constellation (its fixtures are real Cargo manifests, lockfiles, Lake manifests, proof identity, Git history and nine gitlinks): malformed JSON, UTF-8, shas or v3 markers, or an aliased, malformed or unknown first-party URL."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.derive_vf5_expected_books_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.derive_vf5_expected_books_test"]
+selects_on = [
+    "scripts/derive_vf5_expected_books.py",
+    "scripts/tests/derive_vf5_expected_books_test.py",
+]
+catches = "VF5 comparison-book derivation on temporary fixtures: book bytes, refusals and write-once outputs; not a compiler or proof check."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.dispatch_cost_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.dispatch_cost_test"]
+selects_on = [
+    # The dispatch-cost probe. dispatch_cost_test holds the flags the driver passes to the
+    # flags main.rs takes and reads the package's name and lock; no test or leg compiles it
+    # (docs/STATUS.md "Dispatch cost"), and these paths keep every other rule.
+    "scripts/dispatch-cost/Cargo.lock",
+    "scripts/dispatch-cost/Cargo.toml",
+    "scripts/dispatch-cost/src/main.rs",
+    "scripts/dispatch_cost.py",
+    "scripts/tests/dispatch_cost_test.py",
+]
+catches = "scripts/dispatch_cost.py: the statistics, the refusals and the probe's command line, with no GPU and no build."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.dual_host_seed_ledger_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.dual_host_seed_ledger_test"]
+selects_on = [
+    "scripts/mint_seed_support.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/seed_host_ledger.py",
+    "scripts/tests/dual_host_seed_ledger_test.py",
+    "src/tools/trust-stage0-dist/prepare.py",
+]
+catches = "Inert dual-host admission controls; no compiler, Git, cache, or publisher runs."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.f1_native_question_tool_identity_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.f1_native_question_tool_identity_test"]
+selects_on = [
+    "scripts/check_f1_native_question_binding.py",
+    "scripts/tests/f1_native_question_tool_identity_test.py",
+]
+catches = "The F1 driver requires a working explicit Targo lane, not one version banner."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.fetch_trust_stage0_payloads_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.fetch_trust_stage0_payloads_test"]
+selects_on = [
+    "scripts/fetch_trust_stage0_payloads.py",
+    "scripts/tests/fetch_trust_stage0_payloads_test.py",
+]
+catches = "scripts/fetch_trust_stage0_payloads.py installing stage0 payload bytes that do not match the stage0 checksum, writing without --fetch, or treating a missing repo-local manifest URL as fetchable."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.fixed_point_first_host_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.fixed_point_first_host_test"]
+selects_on = [
+    "scripts/mint_seed_support.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/seed_fixed_point.py",
+    "scripts/seed_host_ledger.py",
+    "scripts/seed_input_closure.py",
+    "scripts/seed_root_initialization.py",
+    "scripts/seed_staircase.py",
+    "scripts/tests/fixed_point_first_host_test.py",
+]
+catches = "scripts/seed_fixed_point.py or scripts/seed_host_ledger.py admitting a first Linux seed as a fixed point that is not one: a record admitted while FIXED_POINT_FIRST_HOSTS is empty or not bound to its host commit and receipt digest, a duplicate compiler file path, or changed identity, build or disclosure literals."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.fixed_point_linux_seed_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.fixed_point_linux_seed_test"]
+selects_on = [
+    "scripts/fixed_point_linux_seed.py",
+    "scripts/linux_refresh_toolchain.py",
+    "scripts/mint_seed_support.py",
+    "scripts/seed_fixed_point.py",
+    "scripts/seed_host_ledger.py",
+    "scripts/seed_staircase.py",
+    "scripts/tests/fixed_point_linux_seed_test.py",
+    "src/tools/trust-stage0-dist/prepare.py",
+]
+catches = "scripts/fixed_point_linux_seed.py doing more or less than its plan: `plan` or `status` touching something, `setup` leaving a non-Rust input unbound by digest, writing outside its root or repeating a finished part, or a refusal that does not quote the failing command's own reason."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.freeze_toolchain_sources_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.freeze_toolchain_sources_test"]
+selects_on = [
+    "scripts/freeze_toolchain_sources.py",
+    "scripts/tests/freeze_toolchain_sources_test.py",
+]
+catches = "scripts/freeze_toolchain_sources.py freezing std sources that are not the committed ones: live worktree changes read in place of the exact commit and gitlink, a missing object store or package default accepted, a manifest whose meaning the serializer changed, or a committed source symlink followed."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.gate_lane_coverage_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.gate_lane_coverage_test"]
+selects_on = [
+    "scripts/check_gate_lane_coverage.py",
+    "scripts/hooks/pre-push",
+    "scripts/tests/gate_lane_coverage_test.py",
+]
+catches = "scripts/check_gate_lane_coverage.py letting an exact tooling role hide a file that only shares its prefix, accepting an active row that names no existing gate, or the pre-push hook keeping a lane list of its own beside the push rows it is derived from."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.gate_legacy_env_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.gate_legacy_env_test"]
+selects_on = [
+    "compiler/rustc_session/src/config.rs",
+    "scripts/build.sh",
+    "scripts/tests/gate_legacy_env_test.py",
+    "scripts/tests/superiority_gates_stub_test.sh",
+    "targo-trust/src/pipeline/process_environment.rs",
+    "tests/e2e_build_full_verify_tcargo_provenance.sh",
+]
+catches = "No shell script may hand `trustc` an environment variable `trustc` refuses."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.host_budget_admission_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.host_budget_admission_test"]
+selects_on = [
+    "scripts/lib/host_budget.py",
+    "scripts/tests/host_budget_admission_test.py",
+]
+catches = "Host measurements obey the same managed admission as execution planning."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.land_development_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.land_development_test"]
+selects_on = [
+    "scripts/gates/land-escape-audits.toml",
+    "scripts/land_gate.py",
+    "scripts/lib/land_development.py",
+    "scripts/lib/land_select.py",
+    "scripts/tests/compiler_check_selector_consult_test.sh",
+    "scripts/tests/land_development_test.py",
+    "scripts/tests/land_gate_test.py",
+]
+catches = "Explicit development scope, real caller and refusal controls (no Rust builds)."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.land_gate_cancellation_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.land_gate_cancellation_test"]
+selects_on = [
+    "scripts/land_gate.py",
+    "scripts/lib/checkout_inputs.py",
+    "scripts/tests/land_gate_cancellation_test.py",
+]
+catches = "Actual-process cancellation regressions; all children belong to each fixture."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.land_gate_row_custody_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.land_gate_row_custody_test"]
+selects_on = [
+    "scripts/land_gate.py",
+    "scripts/lib/checkout_inputs.py",
+    "scripts/lib/landing_targo.py",
+    "scripts/tests/land_gate_row_custody_test.py",
+]
+catches = "Actual row transport controls; no compiler, proof, or resource grant."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.land_gate_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.land_gate_test"]
+selects_on = [
+    "scripts/check_compiler_targets_build.sh",
+    "scripts/check_corpus_membership.py",
+    "scripts/check_crates_tests_scoped.py",
+    "scripts/gates/land-escape-audits.toml",
+    "scripts/hooks/pre-push",
+    "scripts/land_gate.py",
+    "scripts/lib/checkout_inputs.py",
+    "scripts/lib/crates_lane_members.py",
+    "scripts/lib/crates_tests_time.py",
+    "scripts/lib/host_budget.py",
+    "scripts/lib/land_development.py",
+    "scripts/lib/land_manifest.py",
+    "scripts/lib/land_select.py",
+    "scripts/lib/rust_lex.py",
+    "scripts/tests/land_gate_test.py",
+]
+catches = "The landing gate selecting too little for a change or reusing a result it should not: the selector (scripts/lib/land_select.py, its lexer and the row table gates/land.toml) missing a reader of a changed path, the cache key (scripts/land_gate.py) not moving with an input, or the host scaler (scripts/lib/host_budget.py) sizing a leg wrongly; each test names the mutant it kills."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.land_manifest_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.land_manifest_test"]
+selects_on = [
+    "scripts/lib/land_manifest.py",
+    "scripts/tests/land_manifest_test.py",
+]
+catches = "scripts/lib/land_manifest.py narrowing a landing's Cargo inputs past what a manifest or lockfile change reaches: a transitive feature activation, another consumer of an activated dependency, a registry, git, target, build or dev consumer lost, or an unknown or global delta, an unavailable base, a symlink or an untracked parent treated as no change."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.landing_targo_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.landing_targo_test"]
+selects_on = [
+    "scripts/check_targo_trust_unit_tests.sh",
+    "scripts/hooks/pre-push",
+    "scripts/land_gate.py",
+    "scripts/lib/checkout_inputs.py",
+    "scripts/lib/landing_targo.py",
+    "scripts/lib/test_python.py",
+    "scripts/tests/landing_targo_test.py",
+]
+catches = "Actual production hook + real local Git pushes, with a synthetic Targo."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.lean_bridge_roots_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.lean_bridge_roots_test"]
+selects_on = [
+    # lean_bridge_roots_test qualifies every platform's vendored union in this
+    # file against its recorded producer: a regeneration must re-run it.
+    "crates/trust-clean/fixtures/trustir-oleans/MANIFEST.toml",
+    "scripts/regen-trustir-oleans.sh",
+    "scripts/tests/lean_bridge_roots_test.py",
+]
+catches = "Bridge build selection controls; fake tools never build or certify artifacts."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.lean_island_census_live_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.lean_island_census_live_test"]
+selects_on = [
+    "scripts/lean_island_census.py",
+    "scripts/tests/lean_island_census_live.py",
+    "scripts/tests/lean_island_census_live_test.py",
+]
+catches = "Aggregate entry point for seven mocks, not the 20 actual compiler probes."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.lean_island_census_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.lean_island_census_test"]
+selects_on = [
+    "scripts/lean_island_census.py",
+    "scripts/tests/lean_island_census_test.py",
+]
+catches = "Simulated wire-format controls; no real compiler execution or acceptance claim."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.lean_olean_bignums_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.lean_olean_bignums_test"]
+selects_on = [
+    "scripts/lean_olean_bignums.py",
+    "scripts/tests/lean_olean_bignums_test.py",
+]
+catches = "The .olean bignum walk on hand-built compacted regions (no Lean toolchain)."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.linux_atpkg_discovery_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.linux_atpkg_discovery_test"]
+selects_on = [
+    "scripts/mint_seed_support.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/tests/linux_atpkg_discovery_test.py",
+]
+catches = "Native default discovery controls; all external processes are mocked/refused."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.linux_refresh_toolchain_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.linux_refresh_toolchain_test"]
+selects_on = [
+    "scripts/linux_refresh_toolchain.py",
+]
+catches = "scripts/linux_refresh_toolchain.py running a staircase rung on a wrong tree or calling a failed one a rung: a clone missing a nested submodule at its pin or taken from the network, an existing path cloned over, a dirty, moved or off-pin worktree accepted, or a non-zero exit or unclean no-stock evidence recorded as a rung."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.linux_root_cohort_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.linux_root_cohort_test"]
+selects_on = [
+    "scripts/seed_initialization_cohort.py",
+    "scripts/tests/linux_root_cohort_test.py",
+]
+catches = "Real inert archive/cohort controls; no native build or seed authority."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.linux_root_input_closure_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.linux_root_input_closure_test"]
+selects_on = [
+    "scripts/bootstrap_dependency_closure.py",
+    "scripts/initialize_linux_root_seed.py",
+    "scripts/lib/seed_linux.py",
+    "scripts/mint_seed_support.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/seed_custody_source.py",
+    "scripts/seed_host_ledger.py",
+    "scripts/seed_input_archives.py",
+    "scripts/seed_input_closure.py",
+    "scripts/seed_input_committed.py",
+    "scripts/seed_input_records.py",
+    "scripts/seed_root_initialization.py",
+    "scripts/tests/linux_root_input_closure_test.py",
+    "scripts/tests/linux_root_input_fixture.py",
+    "src/bootstrap/stage0_identity.py",
+]
+catches = "Physical-input continuation controls, all authored UNRUN in this proposal."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.linux_root_input_fixture_census_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.linux_root_input_fixture_census_test"]
+selects_on = [
+    "scripts/bootstrap_dependency_closure.py",
+    "scripts/initialize_linux_root_seed.py",
+    "scripts/lib/seed_linux.py",
+    "scripts/mint_seed_support.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/seed_custody_source.py",
+    "scripts/seed_host_ledger.py",
+    "scripts/seed_input_archives.py",
+    "scripts/seed_input_closure.py",
+    "scripts/seed_input_committed.py",
+    "scripts/seed_input_records.py",
+    "scripts/seed_root_initialization.py",
+    "scripts/tests/linux_root_input_closure_test.py",
+    "scripts/tests/linux_root_input_fixture.py",
+    "scripts/tests/linux_root_input_fixture_census_test.py",
+    "src/bootstrap/stage0_identity.py",
+]
+catches = "Bounded fixture-census controls; authored UNRUN, no native/network commands."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.luminal_domination_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.luminal_domination_test"]
+selects_on = [
+    # luminal_domination_test holds the committed ledger's packages to this plan's
+    # `| PKG-U<n> |` rows: a plan edit that drops or renames one must re-run it.
+    "docs/PLAN.md",
+    "scripts/luminal_domination.py",
+    "scripts/tests/luminal_domination_test.py",
+    "tests/luminal-domination/capabilities.json",
+    "tests/run_trust_comprehensive_harness.sh",
+]
+catches = "scripts/luminal_domination.py counting a Luminal capability as met from a ledger its schema refuses (a duplicate id, an exit cwd outside its repository, a package the plan lacks, `proved` on a tolerance oracle), counting rows that are not capability rows, or running something in its default mode."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.measurement_provenance_push_scope_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.measurement_provenance_push_scope_test"]
+selects_on = [
+    "scripts/check_measurement_provenance.sh",
+    "scripts/tests/measurement_provenance_push_scope_test.py",
+]
+catches = "Exercise push provenance against actual advertised refs in a local bare remote."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.mf_r5_full_union_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.mf_r5_full_union_test"]
+selects_on = [
+    "scripts/mf_r5_full_union.py",
+    "scripts/tests/mf_r5_full_union_test.py",
+]
+catches = "scripts/mf_r5_full_union.py accepting a union it should refuse: an unknown or inconsistent schema, a total that does not add up, a duplicate JSON key, a refusal without line zero, a derived end or a canonical built marker, or a v2 projection not bound to the full row identity and bucket."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.mint_and_prove_seed_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.mint_and_prove_seed_test"]
+selects_on = [
+    "scripts/mint_and_prove_seed.sh",
+    "scripts/mint_seed_support.py",
+    "scripts/seed_host_ledger.py",
+    "scripts/tests/mint_and_prove_seed_test.py",
+    "scripts/tests/mint_clean_lean_inputs_test.py",
+    "scripts/tests/mint_failure_evidence_test.py",
+]
+catches = "scripts/mint_and_prove_seed.sh and scripts/mint_seed_support.py minting a self-host seed from inputs that are not bound: a near-match artifact standing in for the exact commit-bound one, a bootstrap config include, native library or cargo home input not content-bound, or a foreign library from an undeclared directory."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.mint_clean_lean_inputs_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.mint_clean_lean_inputs_test"]
+selects_on = [
+    "scripts/mint_and_prove_seed.sh",
+    "scripts/mint_seed_support.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/tests/mint_clean_lean_inputs_test.py",
+]
+catches = "The mint accepting a Clean library input that is not the declared original: a missing or wrong directory pin, a file of the right name and wrong bytes, a foreign companion beside a correct prelude, a changed library body, or a link hiding external or directory contents."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.mint_failure_evidence_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.mint_failure_evidence_test"]
+selects_on = [
+    "scripts/mint_and_prove_seed.sh",
+    "scripts/tests/mint_failure_evidence_test.py",
+]
+catches = "Exercise the real mint exit handlers with inert, owned lifecycle helpers."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.mint_seed_continuation_context_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.mint_seed_continuation_context_test"]
+selects_on = [
+    "scripts/mint_seed_recovery.py",
+    "scripts/tests/mint_seed_continuation_context_test.py",
+    "scripts/tests/mint_seed_recovery_test.py",
+]
+catches = "Inert phase-two selector and disclosure controls; no compiler executes."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.mint_seed_linux_closure_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.mint_seed_linux_closure_test"]
+selects_on = [
+    "scripts/mint_seed_support.py",
+    "scripts/tests/mint_seed_linux_closure_test.py",
+]
+catches = "Pure Linux mint dispatch controls; inert ELF headers, no tool execution."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.mint_seed_recovery_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.mint_seed_recovery_test"]
+selects_on = [
+    "scripts/mint_seed_recovery.py",
+    "scripts/tests/mint_seed_recovery_test.py",
+]
+catches = "Retained-mint boundaries with inert files and a nonexecuting verifier seam."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.mir_test_oracle_feature_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.mir_test_oracle_feature_test"]
+selects_on = [
+    "scripts/tests/mir_test_oracle_feature_test.py",
+]
+catches = "Check actual Cargo feature resolution for production and oracle callers."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.native_checkout_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.native_checkout_test"]
+selects_on = [
+    "scripts/lib/native_checkout.py",
+    "scripts/tests/native_checkout_test.py",
+]
+catches = "Native protocol unit controls and actual original-reader refusal boundaries."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.native_sdk_tools_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.native_sdk_tools_test"]
+selects_on = [
+    "scripts/native_sdk_tools.py",
+    "scripts/tests/native_sdk_tools_test.py",
+]
+catches = "Inert provenance fixtures; these never qualify or execute a real SDK tool."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.native_serial_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.native_serial_test"]
+selects_on = [
+    "scripts/lib/native_serial.py",
+    "scripts/tests/native_serial_test.py",
+]
+catches = "Fixture-only lifecycle/descriptor tests; no managed package admission."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.pin_lattice_batch_lifecycle_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.pin_lattice_batch_lifecycle_test"]
+selects_on = [
+    "scripts/check_first_party_pin_lattice.py",
+    "scripts/tests/pin_lattice_batch_lifecycle_test.py",
+]
+catches = "Owned Git subprocess pipes must close even after their child has exited."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.pin_lattice_git_isolation_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.pin_lattice_git_isolation_test"]
+selects_on = [
+    "scripts/check_first_party_pin_lattice.py",
+    "scripts/tests/pin_lattice_git_isolation_test.py",
+]
+catches = "Real Git counterexamples for the lattice's immutable ancestry reader."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.pin_regression_ancestry_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.pin_regression_ancestry_test"]
+selects_on = [
+    "scripts/check_pin_regression.sh",
+    "scripts/tests/pin_regression_ancestry_test.py",
+]
+catches = "A fatal Git ancestry read being treated as a non-ancestor answer when both endpoint commits exist; the real missing-parent fixture must distinguish the original decision from the repaired guard while every existing selftest remains passing."
+not_yet_targo = "a shell guard with a real Git selftest, loaded by the existing Python validation runner until the guard has a native test target"
+
+[[row]]
+id = "validation.pre_push_contracts_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.pre_push_contracts_test"]
+selects_on = [
+    "scripts/hooks/pre-push",
+    "scripts/tests/pre_push_contracts_test.py",
+    "scripts/tests/pre_push_fast_pool_test.sh",
+    "scripts/tests/pre_push_inherited_red_test.sh",
+    "scripts/tests/pre_push_overlap_scoped_test.sh",
+    "scripts/tests/pre_push_quarantine_test.sh",
+    "scripts/tests/pre_push_shadow_test.sh",
+    "scripts/tests/pre_push_stale_destination_test.sh",
+    "scripts/tests/ssh_keepalive_test.sh",
+]
+catches = "Run the real shell contracts that read the landing hook."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.pre_push_coverage_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.pre_push_coverage_test"]
+selects_on = [
+    "scripts/hooks/pre-push",
+    "scripts/tests/pre_push_coverage_test.py",
+    "tests/run_trust_comprehensive_harness.sh",
+]
+catches = "Check live push obligations; scope regressions are explicit diagnostics."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.preflight_pin_rollback_disclosure_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.preflight_pin_rollback_disclosure_test"]
+selects_on = [
+    "scripts/tests/preflight_pin_rollback_disclosure_test.py",
+    "tools/preflight.py",
+]
+catches = "preflight_pin_rollback_disclosure_test.py — the pin_behind_history hatch, both ways."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.preflight_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.preflight_test"]
+selects_on = [
+    "scripts/check_pin_regression.sh",
+    "scripts/tests/preflight_test.py",
+    "tools/preflight.py",
+    "tools/preflight.sh",
+    "x.py",
+]
+catches = "tools/preflight.py judging a tool configuration other than the one Bootstrap will use, or its verdict moving for a reason that is not the configuration: check order or report changed between build phases, a progress or I/O failure changing a blocked verdict or masking an exception, or the launcher honouring Python startup files or a shadowing module."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.prewarm_push_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.prewarm_push_test"]
+selects_on = [
+    "scripts/prewarm_push.sh",
+    "scripts/tests/prewarm_push_test.py",
+]
+catches = "scripts/prewarm_push.sh pushing without the focused build new compiled inputs require, repeating builds when main advances during the hook, retrying on stale text when main did not advance, or letting a genuine hook red pass because main moved."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.produce_vf5_proposal_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.produce_vf5_proposal_test"]
+selects_on = [
+    "scripts/produce_vf5_proposal.py",
+    "scripts/tests/produce_vf5_proposal_test.py",
+]
+catches = "Producer IO/order controls only: no Lean/Rust/compiler/proof execution."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.program_index_sources_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.program_index_sources_test"]
+selects_on = [
+    "examples/bench/program_index/index.json",
+    "scripts/tests/program_index_sources_test.py",
+]
+catches = "The committed benchmark roster must name present source files."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.promote_native_tools_surface_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.promote_native_tools_surface_test"]
+selects_on = [
+    "scripts/promote-toolchain.sh",
+    "scripts/tests/promote_native_tools_surface_test.py",
+]
+catches = "Inert shell-boundary controls, not SDK runtime qualification."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.promote_toolchain_provenance_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.promote_toolchain_provenance_test"]
+selects_on = [
+    "scripts/lib/trust_build_provenance.py",
+    "scripts/promote-toolchain.sh",
+    "scripts/tests/promote_toolchain_provenance_test.py",
+]
+catches = "Exercise the real promotion classifier without running the promotion CLI."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.prune_seal_symlinks_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.prune_seal_symlinks_test"]
+selects_on = [
+    "scripts/prune_seal_symlinks.py",
+    "scripts/tests/prune_seal_symlinks_test.py",
+]
+catches = "scripts/prune_seal_symlinks.py, the helper promotion invokes, keeping a symlink in a copied seal whose resolved target escapes the seal (by traversal, through another escaping link, or in a cycle), or removing one whose target stays inside."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.publish_strip_machine_paths_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.publish_strip_machine_paths_test"]
+selects_on = [
+    "publish/strip_machine_paths.py",
+    "scripts/tests/publish_strip_machine_paths_test.py",
+]
+catches = "publish/strip_machine_paths.py (export transform T2) leaving a machine path in the public snapshot: it rewrote only the `<home>/trust/` prefix, so sibling or scratch checkouts and tilde links reached the export (TRUST-27); or rewriting text that carries no machine path."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.push_destination_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.push_destination_test"]
+selects_on = [
+    "scripts/lib/push_destination.sh",
+    "scripts/lib/remote_tips.py",
+    "scripts/tests/push_destination_test.py",
+]
+catches = "Real local advertisements/objects and mocked authenticated Agh service DATA."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.python_floor_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.python_floor_test"]
+selects_on = [
+    "scripts/bootstrap_xpy.py",
+    "scripts/check_cargo_lock_hygiene.py",
+    "scripts/check_dependency_cycle_anchor.py",
+    "scripts/check_first_party_pin_lattice.py",
+    "scripts/check_primitive_decimal_component.py",
+    "scripts/collect_lambda_calculus_diagnostic.py",
+    "scripts/daily_dependency_git.py",
+    "scripts/daily_toolchain_stage.py",
+    "scripts/discover_trust_stage0_seed.py",
+    "scripts/freeze_toolchain_sources.py",
+    "scripts/initialize_linux_root_seed.py",
+    "scripts/land_gate.py",
+    "scripts/lib/trust_e2e_receipt.py",
+    "scripts/mint_and_prove_seed.sh",
+    "scripts/mint_seed_recovery.py",
+    "scripts/mint_seed_support.py",
+    "scripts/off_stock_rust_audit.py",
+    "scripts/produce_linux_root_seed.py",
+    "scripts/prove_rust_free_build.sh",
+    "scripts/recreate_bootstrap.py",
+    "scripts/run_upstream_rust_adopted_evidence.py",
+    "scripts/seed_staircase.py",
+    "scripts/tests/dual_host_seed_ledger_test.py",
+    "scripts/tests/fixed_point_first_host_test.py",
+    "scripts/tests/freeze_toolchain_sources_test.py",
+    "scripts/tests/lean_bridge_roots_test.py",
+    "scripts/tests/linux_root_producer_test.py",
+    "scripts/tests/mint_and_prove_seed_test.py",
+    "scripts/tests/python_floor_test.py",
+    "scripts/tests/trust_core_common_test.py",
+    "scripts/tests/trust_core_core_vocabulary_test.py",
+    "scripts/tests/trust_version_sync_test.py",
+    "scripts/trust_core/denominators/checkpoint-a.py",
+    "scripts/trust_core/denominators/hosts.py",
+    "scripts/trust_core/denominators/odt.py",
+    "scripts/trust_core/denominators/templates.py",
+    "scripts/trust_core/denominators/ui-tests.py",
+    "scripts/trust_version_sync.py",
+    "scripts/validate_upstream_rust_compat_summary.py",
+    "tests/run_trust_comprehensive_harness.sh",
+    "tools/preflight.py",
+]
+catches = "A script that needs Python 3.11 must reach 3.11 however it is started."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.qualify_targo_resource_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.qualify_targo_resource_test"]
+selects_on = [
+    "scripts/build-slot",
+    "scripts/lib/landing_targo.py",
+    "scripts/qualify_targo_resource.py",
+    "scripts/tests/qualify_targo_resource_test.py",
+]
+catches = "The shipped Targo resource-admission qualifier on fixture frontends: version-three check/libtest discovery required through build-slot's decoder, a retired version-two contract and incomplete capture refused, source identities bookended; not a compiler or proof check."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.realcode_coverage_analyze_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.realcode_coverage_analyze_test"]
+selects_on = [
+    "scripts/realcode-coverage/analyze.py",
+    "scripts/tests/realcode_coverage_analyze_test.py",
+]
+catches = "scripts/realcode-coverage/analyze.py silently omitting what it cannot read: a malformed dump, a non-dict or malformed ty shape, or duplicate JSON keys accepted instead of failing the analysis."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.regen_raw_enum_tag_fixtures_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.regen_raw_enum_tag_fixtures_test"]
+selects_on = [
+    "scripts/regen_raw_enum_tag_fixtures.py",
+    "scripts/tests/regen_raw_enum_tag_fixtures_test.py",
+]
+catches = "scripts/regen_raw_enum_tag_fixtures.py's rewrite half silently corrupting a stored fixture corpus: rewrite_body deciding the wrong bytes for a fixture from the oracle's answer."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.regen_trustir_targo_selection_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.regen_trustir_targo_selection_test"]
+selects_on = [
+    "scripts/regen-trustir-oleans.sh",
+    "scripts/tests/regen_trustir_targo_selection_test.py",
+]
+catches = "Real canonical Bash entrypoint, private Git fixtures, no Rust/Lean build."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.remote_tips_advertisement_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.remote_tips_advertisement_test"]
+selects_on = [
+    "scripts/lib/remote_tips.py",
+    "scripts/tests/remote_tips_advertisement_test.py",
+]
+catches = "Real Git object types behind an authenticated native advertisement."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.remote_tips_agh_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.remote_tips_agh_test"]
+selects_on = [
+    "scripts/lib/remote_tips.py",
+    "scripts/tests/remote_tips_agh_test.py",
+]
+catches = "Authenticated transport controls with actual Git object/ancestry decisions."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.remote_tips_process_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.remote_tips_process_test"]
+selects_on = [
+    "scripts/land_gate.py",
+    "scripts/lib/checkout_inputs.py",
+    "scripts/lib/landing_targo.py",
+    "scripts/lib/remote_operation.py",
+    "scripts/lib/remote_tips.py",
+    "scripts/tests/remote_tips_process_test.py",
+]
+catches = "Actual operation lifetime controls; no remote or ancestry verdict is mocked."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.remote_tips_shallow_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.remote_tips_shallow_test"]
+selects_on = [
+    "scripts/lib/remote_tips.py",
+    "scripts/tests/remote_tips_shallow_test.py",
+]
+catches = "scripts/lib/remote_tips.py reading a pin that is contained in main as not contained because the store is shallow (twelve false OFF-MAIN rows, 2026-10-26) instead of deepening once and retesting, or a fork reading as contained after it does."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.repro_wholestage2_selfcompare_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.repro_wholestage2_selfcompare_test"]
+selects_on = [
+    "scripts/repro_wholestage2_selfcompare.sh",
+    "scripts/tests/repro_wholestage2_selfcompare_test.py",
+]
+catches = "Exercise reproducibility reporting with an inert x.py fixture, never a compiler."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.resource_fds_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.resource_fds_test"]
+selects_on = [
+    "scripts/lib/landing_targo.py",
+    "scripts/lib/native_serial.py",
+    "scripts/tests/resource_fds_test.py",
+]
+catches = "Effective GNU transport regressions; native mode uses a real retained owner."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.resource_provenance_dependency_boundary_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.resource_provenance_dependency_boundary_test"]
+selects_on = [
+    "Cargo.lock",
+    "crates/trust-resource-provenance/Cargo.lock",
+    "crates/trust-resource-provenance/Cargo.toml",
+    "scripts/tests/resource_provenance_dependency_boundary_test.py",
+    "src/bootstrap/Cargo.lock",
+    "src/tools/targo/Cargo.lock",
+]
+catches = "Lock-graph boundary: no committed native graph puts Git transport (gix, git2, curl, openssl) below trust-resource-provenance; not a build or proof check."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.retain_development_emission_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.retain_development_emission_test"]
+selects_on = [
+    "scripts/recreate_bootstrap.py",
+    "scripts/retain_development_emission.py",
+    "scripts/retain_stage1_emission.py",
+    "scripts/tests/retain_development_emission_test.py",
+]
+catches = "Real-FS development producer binding controls, not a compiler/SDK/ABI proof."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.retain_stage1_emission_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.retain_stage1_emission_test"]
+selects_on = [
+    "scripts/retain_stage1_emission.py",
+    "scripts/tests/retain_stage1_emission_test.py",
+]
+catches = "Focused filesystem/stamp controls; these are not compiler or proof checks."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.run_upstream_rust_adopted_evidence_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.run_upstream_rust_adopted_evidence_test"]
+selects_on = [
+    "scripts/run_upstream_rust_adopted_evidence.py",
+    "scripts/tests/run_upstream_rust_adopted_evidence_test.py",
+]
+catches = "Focused recipe and fail-closed report tests; no upstream suite is run."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.rust_instance_census_live_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.rust_instance_census_live_test"]
+selects_on = [
+    "scripts/rust_instance_census.py",
+    "scripts/tests/rust_instance_census_live.py",
+    "scripts/tests/rust_instance_census_live_test.py",
+    "scripts/tests/rust_instance_census_test.py",
+]
+catches = "Mock orchestration controls, not compiler observations or acceptance evidence."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.rust_instance_census_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.rust_instance_census_test"]
+selects_on = [
+    "scripts/rust_instance_census.py",
+    "scripts/tests/rust_instance_census_test.py",
+]
+catches = "Structural mutation tests. Compiler observations are a separate live rung."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.scoped_lane_push_scope_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.scoped_lane_push_scope_test"]
+selects_on = [
+    "scripts/check_targo_trust_unit_tests.sh",
+    "scripts/tests/scoped_lane_push_scope_test.py",
+]
+catches = "Regression test: the shell-scoped push lanes judge WHAT IS PUSHED."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.sdk_frontend_component_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.sdk_frontend_component_test"]
+selects_on = [
+    "scripts/lib/stage_receipt_provenance.py",
+    "scripts/promote-toolchain.sh",
+    "scripts/sdk_frontend_component.py",
+    "scripts/tests/sdk_frontend_component_test.py",
+]
+catches = "Inert source/artifact fixtures only; never qualify or execute an SDK tool."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.sdk_targo_component_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.sdk_targo_component_test"]
+selects_on = [
+    "scripts/sdk_targo_component.py",
+    "scripts/tests/sdk_targo_component_test.py",
+]
+catches = "Inert native-component boundary controls; never execute or qualify an SDK."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.sdk_targo_current_component_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.sdk_targo_current_component_test"]
+selects_on = [
+    "scripts/sdk_targo_component.py",
+    "scripts/sdk_targo_current_component.py",
+    "scripts/tests/sdk_targo_current_component_test.py",
+]
+catches = "Current operational namespace controls; these tests never qualify an SDK."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.sdk_targo_transport_witness_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.sdk_targo_transport_witness_test"]
+selects_on = [
+    "scripts/sdk_targo_transport_witness.py",
+    "scripts/tests/sdk_targo_transport_witness_test.py",
+]
+catches = "Pipe-advertisement and inert lifetime controls; no scheduler or SDK."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seal_content_identity_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seal_content_identity_test"]
+selects_on = [
+    "scripts/lib/seal_content_identity.py",
+    "scripts/promote-toolchain.sh",
+    "scripts/tests/seal_content_identity_test.py",
+]
+catches = "A change to any file a seal ships changes its content identity (plan T13a)."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.sealed_source_pin_snapshot_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.sealed_source_pin_snapshot_test"]
+selects_on = [
+    "scripts/check_first_party_pin_lattice.py",
+    "scripts/tests/sealed_source_pin_snapshot_test.py",
+]
+catches = "scripts/check_first_party_pin_lattice.py confusing sealed historical evidence with live pin consumers: an altered snapshot hiding behind the current pin, an absent or changed outer seal accepted, an unsealed neighbour or a neighbouring copy exempted, or a pushed root adoption not rejudged."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seed_compiler_identity_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_compiler_identity_test"]
+selects_on = [
+    "scripts/check_seed_freshness.py",
+    "scripts/lib/seed_compiler_identity.py",
+    "scripts/mint_seed_support.py",
+    "scripts/seed_custody_source.py",
+    "scripts/tests/seed_compiler_identity_test.py",
+    "src/bootstrap/stage0_identity.py",
+]
+catches = "Real archive bytes and fake compiler fixtures; no native admission claim."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seed_dependency_sources_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_dependency_sources_test"]
+selects_on = [
+    "scripts/seed_dependency_bytes.py",
+    "scripts/seed_dependency_git.py",
+    "scripts/seed_dependency_git_paths.py",
+    "scripts/seed_dependency_local.py",
+    "scripts/tests/seed_dependency_sources_test.py",
+]
+catches = "Tiny private object/source controls. No native producer or cache admission."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seed_host_admission_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_host_admission_test"]
+selects_on = [
+    "scripts/check_seed_freshness.py",
+    "scripts/mint_seed_support.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/tests/seed_host_admission_test.py",
+]
+catches = "Inert host-admission controls: no compiler, build, mint, or publisher runs."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seed_linux_loader_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_linux_loader_test"]
+selects_on = [
+    "scripts/lib/seed_linux.py",
+    "scripts/tests/seed_linux_loader_test.py",
+]
+catches = "Inert ELF inventory/loader grammar controls; no native tool or code execution."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seed_lock_inventory_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_lock_inventory_test"]
+selects_on = [
+    "scripts/recreate_bootstrap.py",
+    "scripts/seed_input_archives.py",
+    "scripts/tests/seed_lock_inventory_test.py",
+]
+catches = "Synthetic committed-source lock selection; no Cargo, compiler or release runs."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seed_native_pair_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_native_pair_test"]
+selects_on = [
+    "scripts/mint_seed_support.py",
+    "scripts/tests/seed_native_pair_test.py",
+]
+catches = "Native seed pair identity controls; all process probes are inert stand-ins."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seed_proof_bounds_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_proof_bounds_test"]
+selects_on = [
+    "scripts/mint_seed_support.py",
+    "scripts/seed_host_ledger.py",
+    "scripts/tests/dual_host_seed_ledger_test.py",
+    "scripts/tests/seed_proof_bounds_test.py",
+]
+catches = "Bound proof capture before parsing; these controls never launch a process."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seed_runtime_prerequisite_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_runtime_prerequisite_test"]
+selects_on = [
+    "scripts/recreate_bootstrap.py",
+    "scripts/tests/seed_runtime_prerequisite_test.py",
+]
+catches = "Selected-seed runtime admission, without executing a seed or requiring Homebrew."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seed_staircase_archive_auth_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_staircase_archive_auth_test"]
+selects_on = [
+    "scripts/lib/seal_content_identity.py",
+    "scripts/seed_custody_source.py",
+    "scripts/seed_staircase.py",
+    "scripts/tests/seed_staircase_archive_auth_test.py",
+]
+catches = "Archive/input custody controls; fixture bytes are data, never executed tools."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.seed_staircase_linux_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_staircase_linux_test"]
+selects_on = [
+    "scripts/seed_staircase.py",
+    "scripts/tests/seed_staircase_linux_test.py",
+]
+catches = "Real native ELF and checksum-pinned archive controls; no Trust build credit."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.ssh_keepalive_process_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.ssh_keepalive_process_test"]
+selects_on = [
+    "scripts/hooks/_ssh_keepalive.sh",
+    "scripts/hooks/_ssh_probe.pl",
+    "scripts/tests/ssh_keepalive_process_test.py",
+]
+catches = "The `ssh -G` capture of scripts/hooks/_ssh_keepalive.sh and _ssh_probe.pl hanging or leaking: a direct hang, a descendant holding stdout after the leader exits, descendants left alive after cancellation or success, or output past its bound."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.stack_feedback_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.stack_feedback_test"]
+selects_on = [
+    "scripts/stack_feedback.py",
+    "scripts/tests/stack_feedback_test.py",
+]
+catches = "Feedback custody and phase semantics, using stand-ins, never compiler builds."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.stage0_archive_parallel_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.stage0_archive_parallel_test"]
+selects_on = [
+    "scripts/mint_and_prove_seed.sh",
+    "scripts/tests/stage0_archive_parallel_test.py",
+    "src/tools/trust-stage0-dist/prepare.py",
+]
+catches = "Small real archive controls; no compiler, public dist or large benchmark."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.stage0_paired_linker_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.stage0_paired_linker_test"]
+selects_on = [
+    "scripts/recreate_bootstrap.py",
+    "scripts/tests/stage0_paired_linker_test.py",
+    "src/bootstrap/bootstrap.py",
+    "src/bootstrap/bootstrap_test.py",
+]
+catches = "Archive-derived Darwin linker roles; fixtures grant no SDK/proof claim."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.stage_receipt_reader_parity_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.stage_receipt_reader_parity_test"]
+selects_on = [
+    # The verdicts the Rust stage-receipt reader is held to; the parity test holds the
+    # Python reader to the same ones.
+    "crates/trust-stage-receipt/tests/data/fixed-point-cases.json",
+    "crates/trust-stage-receipt/tests/data/reference.json.gz",
+    "scripts/lib/stage_receipt_provenance.py",
+    "scripts/tests/stage_receipt_reader_parity_test.py",
+]
+catches = "The Python stage-receipt reader gives the verdicts its Rust twin is held to."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.storage_geometry_probe_reporter_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.storage_geometry_probe_reporter_test"]
+selects_on = [
+    "scripts/check_storage_geometry_visitors.py",
+    "scripts/tests/storage_geometry_probe_reporter_test.py",
+]
+catches = "A successful empty, ignored or renamed filter is never a native probe pass."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.sweep_pin_drift_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.sweep_pin_drift_test"]
+selects_on = [
+    "scripts/sweep_pin_drift.py",
+    "scripts/tests/sweep_pin_drift_test.py",
+]
+catches = "scripts/sweep_pin_drift.py missing an unpublished gitlink (four pin failures in one day were each found only by an unrelated push), refusing a mere lag, taking a deleted branch or a stale remote-tracking ref as vouching for a pin, or reading a dead remote as a pass."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.targo_stage0_surface_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.targo_stage0_surface_test"]
+selects_on = [
+    "scripts/create_local_genesis_stage0.py",
+    "scripts/discover_trust_stage0_seed.py",
+    "scripts/tests/targo_stage0_surface_test.py",
+    "scripts/win-genesis/genesis_wrapper.rs",
+    "scripts/win-genesis/win_genesis.py",
+    "src/tools/trust-stage0-dist/prepare.py",
+]
+catches = "The genesis stage0 surface for targo and tippy drifting from the pinned one: a checked-in genesis root below the current stage0 floor, a rustc tuple or channel other than the pinned one accepted, linter versions not carrying the canonical identity, or the genesis tippy or wrapper rewriting options or treating a backend path as code."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.targo_test_budget_callers_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.targo_test_budget_callers_test"]
+selects_on = [
+    "scripts/sdk_targo_component.py",
+    "scripts/sdk_targo_transport_witness.py",
+    "scripts/stage2_certified_monitor_e2e.sh",
+    "scripts/tests/targo_test_budget_callers_test.py",
+    "scripts/trust_bridge_replay_lane.sh",
+]
+catches = "Inert command-plan regressions; never compile Rust or qualify an SDK."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.targo_tool_preflight_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.targo_tool_preflight_test"]
+selects_on = [
+    "scripts/recreate_bootstrap.py",
+    "scripts/tests/targo_tool_preflight_test.py",
+    "tools/preflight.py",
+    "x.py",
+]
+catches = "Selected frontend preparation never becomes compiler-source readiness."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_analyzer_version_worktree_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_analyzer_version_worktree_test"]
+selects_on = [
+    "scripts/tests/trust_analyzer_version_worktree_test.py",
+    "src/tools/rust-analyzer/crates/rust-analyzer/build.rs",
+]
+catches = "Exercise analyzer version freshness through real Cargo rebuilds and Git refs."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_build_provenance_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_build_provenance_test"]
+selects_on = [
+    "scripts/lib/trust_build_provenance.py",
+    "scripts/tests/trust_build_provenance_test.py",
+    "x.py",
+]
+catches = "scripts/lib/trust_build_provenance.py stamping a build with a source identity that is not the one built: a missing nested source passing on an unchanged top-level census, an unreadable census hashed as empty or old evidence reused, nested staged drift or a parent HEAD change after the census going unseen."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_common_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_common_test"]
+selects_on = [
+    "scripts/tests/trust_core_common_test.py",
+    # Every checker this module runs imports common.py (`import common as C`).
+    "scripts/trust_core/common.py",
+    "scripts/trust_core/core_vocabulary.py",
+]
+catches = "scripts/trust_core/common.py, the shared layer of the Trust core checkers, reporting nothing where it must report: malformed external pins, a read mode other than checkout or objects, a substituted or edited source clone, or a missing clone treated as a skip."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_core_vocabulary_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_core_vocabulary_test"]
+selects_on = [
+    "scripts/tests/trust_core_core_vocabulary_test.py",
+    # Every checker this module runs imports common.py (`import common as C`).
+    "scripts/trust_core/common.py",
+    "scripts/trust_core/core_vocabulary.py",
+]
+catches = "scripts/trust_core/core_vocabulary.py passing a Core vocabulary table, document or review registry that no longer matches the pinned MiniRust and Reference sources and this tree: a mechanical mutation not named by its predicate, or a judgment change passing without a review."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_denominators_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_denominators_test"]
+selects_on = [
+    "scripts/tests/trust_core_denominators_test.py",
+    # Every checker this module runs imports common.py (`import common as C`).
+    "scripts/trust_core/common.py",
+    # denominators.py re-measures every record by running its script (RECORDS), and odt.py builds
+    # odt_prelude_probe/ as its program.
+    "scripts/trust_core/denominators.py",
+    "scripts/trust_core/denominators/checkpoint-a.py",
+    "scripts/trust_core/denominators/hosts.py",
+    "scripts/trust_core/denominators/imports.py",
+    "scripts/trust_core/denominators/odt.py",
+    "scripts/trust_core/denominators/odt_prelude_probe/Cargo.toml.in",
+    "scripts/trust_core/denominators/odt_prelude_probe/src/main.rs",
+    "scripts/trust_core/denominators/std-surface.py",
+    "scripts/trust_core/denominators/templates.py",
+    "scripts/trust_core/denominators/ui-tests.py",
+]
+catches = "scripts/trust_core/denominators.py publishing a Stage 0.5 denominator that does not reproduce at its pin: a drifted value, a dropped or empty predicate, an unpinned input or a pin that is not a commit accepted, or a record whose inputs are absent passing instead of exiting 3."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_fetch_sources_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_fetch_sources_test"]
+selects_on = [
+    "scripts/tests/trust_core_fetch_sources_test.py",
+    # Every checker this module runs imports common.py (`import common as C`).
+    "scripts/trust_core/common.py",
+    "scripts/trust_core/fetch_sources.py",
+]
+catches = "Exercise source fetching against real local Git remotes, including a renamed branch."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_historical_pins_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_historical_pins_test"]
+selects_on = [
+    "scripts/tests/trust_core_historical_pins_test.py",
+    "scripts/trust_core/static_semantics_source_map.py",
+]
+catches = "Historical pin evidence retains exact original custody and no current authority."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_imports_dispositions_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_imports_dispositions_test"]
+selects_on = [
+    "scripts/tests/trust_core_imports_dispositions_test.py",
+    "scripts/trust_core/denominators/imports.py",
+]
+catches = "The disposition column of docs/trust-core/denominators/imports.toml drifting from what scripts/trust_core/denominators/imports.py renders: a dropped row, a row naming no import, a word outside the vocabulary, an unspecified row keyed on one release, or a wrong count accepted."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_language_decisions_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_language_decisions_test"]
+selects_on = [
+    "scripts/tests/trust_core_language_decisions_test.py",
+    # Every checker this module runs imports common.py (`import common as C`).
+    "scripts/trust_core/common.py",
+    "scripts/trust_core/language_decisions.py",
+]
+catches = "scripts/trust_core/language_decisions.py passing an LD ledger that no longer matches its pinned sources and this tree, or reporting I-PRECEDENCE as passing while conflicts remain; a mechanical mutation not named by its predicate, or a judgment change passing without a review."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_minirust_baseline_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_minirust_baseline_test"]
+selects_on = [
+    "scripts/tests/trust_core_minirust_baseline_test.py",
+    # Every checker this module runs imports common.py (`import common as C`).
+    "scripts/trust_core/common.py",
+    "scripts/trust_core/minirust_baseline.py",
+]
+catches = "scripts/trust_core/minirust_baseline.py passing a MiniRust baseline table or document that no longer matches the pinned MiniRust and Reference clones and this tree, misreading the source (strings, lifetimes, generics, unbalanced code), or a judgment change passing without a review."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_mir_constructor_table_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_mir_constructor_table_test"]
+selects_on = [
+    "scripts/tests/trust_core_mir_constructor_table_test.py",
+    # Every checker this module runs imports common.py (`import common as C`).
+    "scripts/trust_core/common.py",
+    "scripts/trust_core/mir_constructor_table.py",
+]
+catches = "scripts/trust_core/mir_constructor_table.py passing a MIR constructor table that no longer matches the pinned MiniRust clone and this tree's rustc, or letting an exact refusal that preserves an unrepresented validity obligation be erased or replaced by transmute."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_reanchor_citations_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_reanchor_citations_test"]
+selects_on = [
+    "scripts/tests/trust_core_reanchor_citations_test.py",
+    # Every checker this module runs imports common.py (`import common as C`).
+    "scripts/trust_core/common.py",
+    "scripts/trust_core/reanchor_citations.py",
+]
+catches = "scripts/trust_core/reanchor_citations.py moving a ledger citation it must refuse (changed text, a line that became ambiguous, a citation already wrong at the base), or registering as a move a judgment that was unreviewed or changed for another reason."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_specr_regen_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_specr_regen_test"]
+selects_on = [
+    "scripts/tests/trust_core_specr_regen_test.py",
+    "scripts/trust_core/specr/conformance/mrjson.py",
+    "scripts/trust_core/specr/conformance/records2clean.py",
+    "scripts/trust_core/specr/conformance/select_slice.py",
+    "scripts/trust_core/specr/conformance/summarize.py",
+    "scripts/trust_core/specr/regen.py",
+    "scripts/trust_core/specr/specr2clean/calls.py",
+    "scripts/trust_core/specr/specr2clean/common.py",
+    "scripts/trust_core/specr/specr2clean/emit_fns.py",
+    "scripts/trust_core/specr/specr2clean/emit_types.py",
+    "scripts/trust_core/specr/specr2clean/items.py",
+    "scripts/trust_core/specr/specr2clean/lower.py",
+    "scripts/trust_core/specr/specr2clean/specr2clean.py",
+    "scripts/trust_core/specr/specr2clean/tyres.py",
+]
+catches = "The committed specr-to-Clean translator output no longer regenerating byte for byte from its pinned inputs (RM1): a changed output byte, translator emission or pinned input, a stray file under generated/, or a non-deterministic encoding not reported as drift by scripts/trust_core/specr/regen.py."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_ub_coverage_matrix_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_ub_coverage_matrix_test"]
+selects_on = [
+    "scripts/tests/trust_core_ub_coverage_matrix_test.py",
+    # Every checker this module runs imports common.py (`import common as C`).
+    "scripts/trust_core/common.py",
+    "scripts/trust_core/ub_coverage_matrix.py",
+]
+catches = "scripts/trust_core/ub_coverage_matrix.py passing a UB coverage matrix that no longer matches the pinned MiniRust and Reference clones, the Miri tree and this tree's rustc: a mechanical mutation not named by its predicate, or a judgment change passing without a review."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_vf3_census_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_vf3_census_test"]
+selects_on = [
+    "scripts/tests/trust_core_vf3_census_test.py",
+    # Every checker this module runs imports common.py (`import common as C`).
+    "scripts/trust_core/common.py",
+    "scripts/trust_core/vf3_census.py",
+]
+catches = "scripts/trust_core/vf3_census.py accepting a proved-row census that does not reproduce its committed record: a changed or removed row, a changed count or a trailing byte not reported as drift, an unknown count word or counts that do not add up read, or a report with an unproved count taken as a proved row."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_e2e_receipt_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_e2e_receipt_test"]
+selects_on = [
+    "scripts/lib/trust_e2e_receipt.py",
+    "scripts/tests/trust_e2e_receipt_test.py",
+    "tests/e2e_trust_dist_artifacts.sh",
+    "tests/e2e_trust_installed_toolchain.sh",
+    "tests/e2e_trust_local_rustup_install.sh",
+    "tests/report_trust_gate_status.sh",
+    "tests/run_trust_comprehensive_harness.sh",
+]
+catches = "scripts/lib/trust_e2e_receipt.py publishing an end-to-end receipt unsafely or unbound: a non-atomic replace, an existing file or racing creator overwritten, a symlink or non-regular destination followed, an invalid candidate replacing the existing receipt, or an unknown schema accepted."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_f1_ladder_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_f1_ladder_test"]
+selects_on = [
+    "scripts/tests/trust_f1_ladder_test.py",
+    "scripts/trust_f1_ladder.py",
+]
+catches = "scripts/trust_f1_ladder.py misjudging a rung: a mismatch between the trust-cg and oracle values not failing the run, a lane judged when the oracle failed or could not finish, or the default mode not being verification on and strict only."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_ir_cg_census_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_ir_cg_census_test"]
+selects_on = [
+    "scripts/tests/trust_ir_cg_census_test.py",
+    "scripts/trust_ir_cg_census.py",
+]
+catches = "scripts/trust_ir_cg_census.py's harness miscounting around the compile: a refused static not keyed on its mangled symbol, an unresolvable dependency not refused, an explicit --extern not forwarded verbatim, or a path named as fact that was not resolved."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_ir_lineage_reconcile_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_ir_lineage_reconcile_test"]
+selects_on = [
+    "scripts/tests/trust_ir_lineage_reconcile_test.py",
+    "scripts/trust_ir_lineage_reconcile.py",
+]
+catches = "scripts/trust_ir_lineage_reconcile.py attesting a Trust-IR artifact set that is not the producer's: an unrelated manifest vouching for a matching flip, a required role unlisted, a duplicate, extra or substituted artifact, or a hash taken on trust instead of recomputed."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_ir_producer_census_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_ir_producer_census_test"]
+selects_on = [
+    "scripts/tests/trust_ir_producer_census_test.py",
+    "scripts/tests/trust_ir_producer_scorecard_completion_test.py",
+    "scripts/trust_ir_producer_scorecard.py",
+]
+catches = "Independent Rust census controls. Live compiler tests require explicit Trust."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_ir_producer_scorecard_classify_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_ir_producer_scorecard_classify_test"]
+selects_on = [
+    "scripts/tests/trust_ir_producer_scorecard_classify_test.py",
+    "scripts/trust_ir_producer_scorecard.py",
+]
+catches = "scripts/trust_ir_producer_scorecard.py putting a refusal in the wrong class: an unmodeled-observation or callable-comparability marker outranked by a broad token it embeds, an existing class moving, or the in-fragment rate moving the headline."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_ir_producer_scorecard_completion_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_ir_producer_scorecard_completion_test"]
+selects_on = [
+    "scripts/tests/trust_ir_producer_scorecard_completion_test.py",
+    "scripts/trust_ir_producer_scorecard.py",
+]
+catches = "scripts/trust_ir_producer_scorecard.py's Rust producer completion gate passing while residue remains: a flag-induced or timed-out outcome shrinking the denominator, an empty denominator vacuously complete, a 100 percent lowered-clean rate masking unmodelled bodies, or an empty artifact accepted."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_ir_producer_scorecard_effcons_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_ir_producer_scorecard_effcons_test"]
+selects_on = [
+    "scripts/tests/trust_ir_producer_scorecard_effcons_test.py",
+    "scripts/trust_ir_producer_scorecard.py",
+]
+catches = "The producer scorecard reads the EFFECT-CONSERVATION verdict per body."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_ir_producer_scorecard_validation_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_ir_producer_scorecard_validation_test"]
+selects_on = [
+    "scripts/tests/trust_ir_producer_scorecard_validation_test.py",
+    "scripts/trust_ir_producer_scorecard.py",
+]
+catches = "The producer scorecard NAMES what the module validator objected to."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_ir_rowdiff_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_ir_rowdiff_test"]
+selects_on = [
+    "scripts/tests/trust_ir_rowdiff_test.py",
+    "scripts/trust_ir_rowdiff.py",
+]
+catches = "scripts/trust_ir_rowdiff.py reporting no change when a body collapsed: four merge reviews certified \"0 lost, 0 new mismatch\" while three derive(Clone) bodies fell to one-instruction stubs; a loss and a gain cancelling, or a lowered body whose content changed going unreported."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_program_wire_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_program_wire_test"]
+selects_on = [
+    "scripts/check_two_language_program_inventory.py",
+    "scripts/lib/trust_program_wire.py",
+    "scripts/tests/trust_program_wire_test.py",
+    "tests/e2e_two_language_programs.sh",
+    "tests/two-language-programs/wire_grade.py",
+]
+catches = "Wire accounting and fake-tool battery controls; these execute no Rust compiler."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_self_verify_crate_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_self_verify_crate_test"]
+selects_on = [
+    "scripts/tests/trust_self_verify_crate_test.py",
+    "scripts/trust_self_verify_crate.sh",
+]
+catches = "Exercise the real self-proof driver with controlled compiler output."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_soundness_corpus_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_soundness_corpus_test"]
+selects_on = [
+    "scripts/tests/fixtures/trust_soundness_corpus_native_rows.json",
+    "scripts/tests/trust_soundness_corpus_test.py",
+    "scripts/trust-soundness-corpus.py",
+    "tests/trust-soundness-corpus/README.md",
+]
+catches = "Soundness-corpus reader controls. No compiler, provider or proof is created."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_verify_cost_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_verify_cost_test"]
+selects_on = [
+    "scripts/tests/trust_verify_cost_test.py",
+    "scripts/trust_verify_cost.py",
+]
+catches = "Cost measurements cannot get credit from absent work or a failed child."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_version_sync_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_version_sync_test"]
+selects_on = [
+    "scripts/tests/trust_version_sync_test.py",
+    "scripts/trust_version_sync.py",
+]
+catches = "scripts/trust_version_sync.py leaving a mirror of the version line disagreeing with its one authority without naming it, writing values that are not mirrored, or accepting a non-zero patch, suffixed or non-canonical authority."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.two_language_completion_gate_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.two_language_completion_gate_test"]
+selects_on = [
+    "scripts/completion_gates/check_g1_rust_input.py",
+    "scripts/completion_gates/check_g2_lean_input.py",
+    "scripts/completion_gates/check_g3_producer_totality.py",
+    "scripts/completion_gates/check_g4_semantic_faithfulness.py",
+    "scripts/completion_gates/check_g5_mixed_linking.py",
+    "scripts/completion_gates/check_g6_proof_authority.py",
+    "scripts/completion_gates/check_g7_codegen_authority.py",
+    "scripts/completion_gates/check_g8_release_reproducibility.py",
+    "scripts/tests/two_language_completion_gate_test.py",
+    "scripts/two_language_completion_gate.py",
+]
+catches = "scripts/two_language_completion_gate.py issuing a two-language completion receipt that is not earned: a missing gate or an author-set completion bit accepted, a required check that is false, a mutated underlying artifact surviving a fresh checker run, a missing schema-owned checker, or a self-issued key or pin."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.two_language_producer_ratchets_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.two_language_producer_ratchets_test"]
+selects_on = [
+    "scripts/tests/two_language_producer_ratchets_test.py",
+    "scripts/two_language_producer_ratchets.py",
+]
+catches = "scripts/two_language_producer_ratchets.py reading a moved producer verdict as unchanged: a standalone refusal whose class changed read as the same gap, a pinned row moved without a named reason, an audit row pinned by no row, or the replay of the archived measurement not reproducing its verdicts."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.two_language_program_inventory_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.two_language_program_inventory_test"]
+selects_on = [
+    "scripts/check_two_language_program_inventory.py",
+    "scripts/tests/two_language_program_inventory_test.py",
+    "tests/e2e_two_language_programs.sh",
+]
+catches = "Coverage regressions need no compiler, submodule build or network."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.two_language_program_refusal_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.two_language_program_refusal_test"]
+selects_on = [
+    "scripts/tests/two_language_program_refusal_test.py",
+    "tests/e2e_two_language_programs.sh",
+]
+catches = "Inject process failures into the maintained battery's actual Bash lanes."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.two_language_subject_index_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.two_language_subject_index_test"]
+selects_on = [
+    "scripts/check_fixture_span_paths.py",
+    "scripts/tests/completion_gates_g3_test.py",
+    "scripts/tests/trust_ir_producer_census_test.py",
+    "scripts/tests/trust_ir_producer_scorecard_completion_test.py",
+    "scripts/tests/two_language_subject_index_test.py",
+    "scripts/two_language_subject_index.py",
+]
+catches = "scripts/two_language_subject_index.py producing a G3 subject index the G3 checker should refuse and does not: a duplicate, dropped or wrong-module body, a produced root trusted instead of recomputed, malformed input accepted by the producer, an undisclosed printed-path pairing, or output that is not deterministic."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.ui_trust_budget_sensitivity_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.ui_trust_budget_sensitivity_test"]
+selects_on = [
+    "scripts/tests/ui_trust_budget_sensitivity_test.py",
+    "scripts/ui_trust_budget_sensitivity.py",
+]
+catches = "The UI differential sweep must compile a fixture the way compiletest does."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.upstream_revision_consistency_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.upstream_revision_consistency_test"]
+selects_on = [
+    "crates/trust-upstream-compat/src/main.rs",
+    "crates/trust-upstream-compat/src/porting.rs",
+    "release/trust-version.toml",
+    "scripts/tests/upstream_revision_consistency_test.py",
+    "tests/run_trust_comprehensive_harness.sh",
+    "tests/upstream-rust/baseline.toml",
+]
+catches = "Keep the baseline, documented command, and release alignment consistent."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.validate_upstream_rust_compat_summary_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.validate_upstream_rust_compat_summary_test"]
+selects_on = [
+    "scripts/check_upstream_rust_test_toolchain.sh",
+    "scripts/collect_strict_superiority_artifacts.sh",
+    "scripts/tests/check_upstream_rust_test_toolchain_test.py",
+    "scripts/tests/validate_upstream_rust_compat_summary_test.py",
+    "scripts/validate_upstream_rust_compat_summary.py",
+]
+catches = "Synthetic consistency fixtures; none represents a real upstream suite run."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[not_run]]
+id = "validation.bootstrap_cargo_fixture_context_test"
+path = "scripts/tests/bootstrap_cargo_fixture_context_test.py"
+kind = "unjudgeable"
+why = "argparse driver: requires --sdk/--rustc/--rustdoc/--host/--output of a freshly built bootstrap shim and SDK; defines no unittest case"
+
+[[not_run]]
+id = "validation.bootstrap_shim_jobserver_test"
+path = "scripts/tests/bootstrap_shim_jobserver_test.py"
+kind = "unjudgeable"
+why = "argparse driver: requires --sdk/--host/--rustc/--rustdoc/--output; defines no unittest case (its cleanup half, bootstrap_shim_jobserver_cleanup_test, loads it and is selected)"
+
+[[not_run]]
+id = "validation.doctor_probe_custody_test"
+path = "scripts/tests/doctor_probe_custody_test.py"
+kind = "unjudgeable"
+why = "harness: reads TRUST_PROBE_SCHEDULER_TEST_BIN and CARGO_MAKEFLAGS at import; nothing in the tree supplies them"
+
+[[not_run]]
+id = "validation.historical_seed_surface_test"
+path = "scripts/tests/historical_seed_surface_test.py"
+kind = "red"
+why = "a Linux-host test, red on this aarch64-apple-darwin host: 2 FAIL, 3 ERROR: ValueError: historical Linux daemon probe needs kernel peer credentials"
+
+[[not_run]]
+id = "validation.linux_root_custody_test"
+path = "scripts/tests/linux_root_custody_test.py"
+kind = "red"
+why = "a Linux-host test, red on this aarch64-apple-darwin host: 3 ERROR: OSError: [Errno 43] Protocol not supported"
+
+[[not_run]]
+id = "validation.linux_root_initialization_test"
+path = "scripts/tests/linux_root_initialization_test.py"
+kind = "red"
+why = "a Linux-host test, red on this aarch64-apple-darwin host: 1 FAIL, 4 ERROR: ValueError: seed proof root or one of its parents contains a symlink (the temporary directory is under /var -> /private/var); native source snapshot names another authenticated source; external tool escapes its selected sysroot"
+
+[[not_run]]
+id = "validation.linux_root_producer_test"
+path = "scripts/tests/linux_root_producer_test.py"
+kind = "red"
+why = "a Linux-host test, red on this aarch64-apple-darwin host: 3 ERROR: FileNotFoundError: /proc/<pid>/stat; ValueError: native source snapshot names another authenticated source; ValueError: initialization comparison staging path is not fresh/owned"
+
+[[not_run]]
+id = "validation.mint_safe_path_test"
+path = "scripts/tests/mint_safe_path_test.py"
+kind = "red"
+why = "3 FAIL, 1 ERROR: the targo on PATH answers `targo trust repo: unknown command `lock`` (exit 2); the test needs a targo with `trust repo lock`"
+
+[[not_run]]
+id = "validation.recreate_bootstrap_test"
+path = "scripts/tests/recreate_bootstrap_test.py"
+kind = "red"
+why = "12 FAIL, 26 ERROR. 34 fail on `targo trust repo lock` (the targo on PATH answers `targo trust repo: unknown command `lock`` (exit 2); the test needs a targo with `trust repo lock`): 27 as `RuntimeError: empty LLVM preservation requires its own normal build lease`, 7 as CalledProcessError. The other four: test_recipe_roots_are_source_derived_and_new_literal_roots_cannot_disappear (`stage0 manifest roots: unsupported verifier assembly wrapper`, as bootstrap_dependency_closure_test), test_verification_refuses_an_option_it_does_not_read (an option set differs), test_host_and_build_replacement_at_real_move_refuse_without_completion (FileNotFoundError: build/test-host/llvm), and build_slot_test's test_two_private_homes_share_one_slot_across_distinct_cwds (JSONDecodeError under load; it passes alone)"
+
+[[not_run]]
+id = "validation.seed_observed_commands_test"
+path = "scripts/tests/seed_observed_commands_test.py"
+kind = "red"
+why = "a Linux-host test, red on this aarch64-apple-darwin host: 33 ERROR: FileNotFoundError: /proc/<pid>/stat"
+
+[[not_run]]
+id = "validation.seed_staircase_test"
+path = "scripts/tests/seed_staircase_test.py"
+kind = "red"
+why = "a Linux-host test, red on this aarch64-apple-darwin host: 3 ERROR: FileNotFoundError: '/bin/true' (copying /usr/bin/true instead fails with EPERM on its flags)"
+
+[[not_run]]
+id = "validation.trust_core_semantics_retirement_test"
+path = "scripts/tests/trust_core_semantics_retirement_test.py"
+kind = "red"
+why = "13 FAIL after 1614 s (2026-11-10), on its own subject: with the source clones and every first-party submodule at the pins of 4c91983e28 (2026-11-13), scripts/trust_core/semantics_retirement.py reports 1398 violations, 1178 of them `SEARCH: search <id>: hit <repo>:'<path>' is matched by 0 consumer(s) and 0 mention glob(s)` for files the constellation gained since the ledger's last census, then PROBE 58, CITE 43 (cited lines that moved), CRATES 35, FREEZE 24, SOURCES 24, NAMESPACE 19, DOC 7, HOST 5, TABLE 5, GATES 1. Without populated submodules it reports `... does not exist in the first-party tree` instead"
+
+[[not_run]]
+id = "validation.trust_core_static_semantics_source_map_test"
+path = "scripts/tests/trust_core_static_semantics_source_map_test.py"
+kind = "red"
+why = "21 FAIL after 1943 s (2026-11-13, source clones at their pins): the real inputs report one violation, `REVIEW: judgment formality_test_note:a-mir-formality:crates/formality-rust/src/check/borrow_check/nll.rs:489: is retired, but the judgment exists` (docs/OPEN_ISSUES.md TRUST-CORE-JUDGMENT-IDS-1), which fails 19 cases and the CLI's exit; one more case's fixture anchor (`worktree:compiler/rustc_hir_typeck/src/fallback.rs:49`) no longer occurs in the ledger"
+
+[[not_run]]
+id = "validation.trust_serial_command_test"
+path = "scripts/tests/trust_serial_command_test.py"
+kind = "unjudgeable"
+why = "harness: reads TRUST_SERIAL_COMMAND_TEST_BIN and CARGO_MAKEFLAGS at import; nothing in the tree supplies them"
+
+[[not_run]]
+id = "validation.xpy_build_lock_test"
+path = "scripts/tests/xpy_build_lock_test.py"
+kind = "red"
+why = "12 FAIL in setUp: `requires actual current Bootstrap via TRUST_BUILD_TREE_BOOTSTRAP`: the tree has no build/bootstrap/debug/bootstrap and the environment names none (scripts/feature_gated_tests.py names the same input)"
+
+[[not_run]]
+id = "validation.xpy_explicit_manager_test"
+path = "scripts/tests/xpy_explicit_manager_test.py"
+kind = "red"
+why = "2 FAIL: `explicit actual manager needed` and `explicit actual v1 manager needed`: the environment sets neither TARGO_COMPONENT_MANAGER nor TARGO_COMPONENT_V1_MANAGER, and nothing in the tree supplies them"

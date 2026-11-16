@@ -98,6 +98,11 @@ pub fn constant_eq_truth(lhs: &Operand, rhs: &Operand) -> Option<bool> {
 }
 
 pub fn const_eq_truth(lhs: &ConstValue, rhs: &ConstValue) -> Option<bool> {
+    if lhs.contains_memory_image() || rhs.contains_memory_image() {
+        // Images are storage observations, not an implemented equality model.
+        // Neither identical bytes nor distinct allocation records decide this.
+        return None;
+    }
     match (lhs, rhs) {
         (ConstValue::Bool(lhs), ConstValue::Bool(rhs)) => Some(lhs == rhs),
         (ConstValue::Int(lhs), ConstValue::Int(rhs)) => Some(lhs == rhs),
@@ -137,12 +142,16 @@ pub fn const_eq_truth(lhs: &ConstValue, rhs: &ConstValue) -> Option<bool> {
         // prune the genuinely-taken branch and silently drop its safety obligations
         // — a false PROVE. (Same hazard the `Str` arm above guards against for equal
         // string literals.)
-        (ConstValue::OpaqueConst, _) | (_, ConstValue::OpaqueConst) => None,
+        (ConstValue::OpaqueConst(_), _) | (_, ConstValue::OpaqueConst(_)) => None,
         // A `UnitVariantRef` (promoted `&Option<T>::None`-style reference constant)
         // value-lowers exactly like `OpaqueConst` — a fresh symbolic ref with no
         // decidable value — so its equality is UNKNOWN. Return `None` (verify BOTH
         // branches), never `Some(false)`, for the same false-PROVE hazard as above.
         (ConstValue::UnitVariantRef { .. }, _) | (_, ConstValue::UnitVariantRef { .. }) => None,
+        // Trust (EMPTY-CLOSURE-REF-VALUE-1): a promoted `&{closure}` value-lowers
+        // exactly like `OpaqueConst` (fresh symbolic ref): equality UNKNOWN, `None`,
+        // never `Some(false)` — the same false-PROVE hazard as the arms above.
+        (ConstValue::EmptyClosureRef { .. }, _) | (_, ConstValue::EmptyClosureRef { .. }) => None,
         // Trust: EFHT-P — a `StructScalarFieldsRef` (promoted `&Struct(k)` reference
         // constant) value-lowers exactly like `OpaqueConst` (fresh symbolic ref), so its
         // equality is UNKNOWN: `None`, never `Some(false)` — the same false-PROVE hazard
@@ -261,8 +270,8 @@ mod tests {
     /// safety obligations.
     #[test]
     fn opaque_constants_are_unknown_not_unequal() {
-        assert_eq!(const_eq_truth(&ConstValue::OpaqueConst, &ConstValue::OpaqueConst), None);
-        assert_eq!(const_eq_truth(&ConstValue::OpaqueConst, &ConstValue::Int(0)), None);
+        assert_eq!(const_eq_truth(&ConstValue::opaque_const(), &ConstValue::opaque_const()), None);
+        assert_eq!(const_eq_truth(&ConstValue::opaque_const(), &ConstValue::Int(0)), None);
     }
 
     #[test]

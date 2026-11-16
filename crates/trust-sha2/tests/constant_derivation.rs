@@ -127,7 +127,8 @@ fn primes(count: usize) -> Vec<u64> {
     let mut found: Vec<u64> = Vec::with_capacity(count);
     let mut candidate = 2u64;
     while found.len() < count {
-        if found.iter().take_while(|p| *p * *p <= candidate).all(|p| candidate % p != 0) {
+        if found.iter().take_while(|p| *p * *p <= candidate).all(|p| !candidate.is_multiple_of(*p))
+        {
             found.push(candidate);
         }
         candidate += 1;

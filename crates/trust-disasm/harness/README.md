@@ -14,7 +14,8 @@ semantic differential's full tier is ~22 s. If you only have seconds, `--fast`
 runs every stage of both harnesses — including the whole non-vacuity battery —
 against smaller populations.
 
-Requires an aarch64 macOS host, clang (Command Line Tools) and `cargo +beta`.
+Requires an aarch64 macOS host, clang (Command Line Tools) and the Trust
+toolchain's `targo` (resolved and identity-checked by `targo.sh`).
 It is deliberately **not** part of `cargo test`: it assembles code, executes
 arbitrary instruction encodings and reads a trap `ucontext`. That is a reason to
 run it on purpose, not a reason to treat it as optional.

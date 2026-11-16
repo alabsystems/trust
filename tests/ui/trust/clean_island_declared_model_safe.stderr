@@ -1,0 +1,17 @@
+note: Clean island kernel-checked: 7 declaration(s) registered (Example.X, Example.Y, Example.Zero, Example.One, Example.Limit, Example.Buggy, Example.Lockstep)
+  --> $DIR/clean_island_declared_model_safe.rs:12:5
+   |
+LL | /     import Trust.FiniteModel
+LL | |     namespace Example
+LL | |
+LL | |     def X : Trust.Temporal.FiniteModel.ScalarExpr :=
+...  |
+LL | |     end Example
+   | |_______________^
+
+note: finite model `Example.Lockstep` proved safe by the kernel: every reachable state satisfies every invariant (`trust_checked_safe.Example.Lockstep : ScalarModel.safetyClaim Example.Lockstep`, state budget 256)
+  --> $DIR/clean_island_declared_model_safe.rs:28:5
+   |
+LL |     def Lockstep : Trust.Temporal.FiniteModel.ScalarModel :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

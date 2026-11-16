@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-TG): a GUARDED arm of a tuple match is refutable — its tests
 //! (possibly none) pass into a guard block that binds the arm's fields,
 //! lowers the guard, and branches to the body on `true` or to the next arm's

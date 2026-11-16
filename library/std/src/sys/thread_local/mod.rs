@@ -22,10 +22,20 @@
     reason = "internal details of the thread_local macro",
     issue = "none"
 )]
+#![deny(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    reason = "TLS accesses must not call the global allocator, including via panic (#160930)"
+)]
 
 cfg_select! {
     any(
-        all(target_family = "wasm", not(target_feature = "atomics")),
+        all(target_family = "wasm", not(target_feature = "atomics"), not(target_os = "wasi")),
         target_os = "uefi",
         target_os = "zkvm",
         target_os = "trusty",
@@ -42,8 +52,8 @@ cfg_select! {
     }
     _ => {
         mod os;
-        pub use os::{Storage, thread_local_inner, value_align};
         pub(crate) use os::{LocalPointer, local_pointer};
+        pub use os::{Storage, thread_local_inner, value_align};
     }
 }
 
@@ -54,7 +64,10 @@ cfg_select! {
 /// destructor for each variable. On these platforms, we keep track of the
 /// destructors ourselves and register (through the [`guard`] module) only a
 /// single callback that runs all of the destructors in the list.
-#[cfg(all(target_thread_local, not(all(target_family = "wasm", not(target_feature = "atomics")))))]
+#[cfg(all(
+    target_thread_local,
+    not(all(target_family = "wasm", not(target_feature = "atomics"), not(target_os = "wasi")))
+))]
 pub(crate) mod destructors {
     cfg_select! {
         any(
@@ -88,14 +101,20 @@ pub(crate) mod guard {
             mod apple;
             pub(crate) use apple::enable;
         }
+        all(target_thread_local, target_os = "aix") => {
+            mod aix;
+            pub(crate) use aix::enable;
+        }
         target_os = "windows" => {
             mod windows;
             pub(crate) use windows::enable;
+            #[cfg(not(target_thread_local))]
+            mod retained;
+            #[cfg(not(target_thread_local))]
+            pub(crate) use retained::{LOCAL_POINTER_NEEDS_DTOR, cleanup_pending};
         }
         any(
-            all(target_family = "wasm", not(
-                all(target_os = "wasi", target_env = "p1", target_feature = "atomics")
-            )),
+            all(target_family = "wasm", not(target_os = "wasi")),
             target_os = "uefi",
             target_os = "zkvm",
             target_os = "trusty",
@@ -115,13 +134,14 @@ pub(crate) mod guard {
                 use crate::rt::thread_cleanup;
             }
         }
-        any(
-            target_os = "hermit",
-            target_os = "xous",
-        ) => {
+        any(target_os = "hermit", target_os = "xous") => {
             // `std` is the only runtime, so it just calls the destructor functions
             // itself when the time comes.
             pub(crate) fn enable() {}
+            #[cfg(not(target_thread_local))]
+            mod retained;
+            #[cfg(not(target_thread_local))]
+            pub(crate) use retained::{LOCAL_POINTER_NEEDS_DTOR, cleanup_pending};
         }
         target_os = "solid_asp3" => {
             mod solid;
@@ -130,6 +150,8 @@ pub(crate) mod guard {
         _ => {
             mod key;
             pub(crate) use key::enable;
+            #[cfg(not(target_thread_local))]
+            pub(crate) use key::{LOCAL_POINTER_NEEDS_DTOR, cleanup_pending};
         }
     }
 }
@@ -143,23 +165,19 @@ pub(crate) mod guard {
 pub(crate) mod key {
     cfg_select! {
         any(
-            all(
-                not(target_vendor = "apple"),
-                not(target_family = "wasm"),
-                target_family = "unix",
-            ),
+            all(not(target_vendor = "apple"), not(target_family = "wasm"), target_family = "unix"),
             all(not(target_thread_local), target_vendor = "apple"),
             target_os = "teeos",
-            all(target_os = "wasi", target_env = "p1", target_feature = "atomics"),
+            target_os = "wasi",
         ) => {
             mod racy;
             mod unix;
             #[cfg(test)]
             mod tests;
             pub(super) use racy::LazyKey;
-            pub(super) use unix::{Key, set};
             #[cfg(any(not(target_thread_local), test))]
             pub(super) use unix::get;
+            pub(super) use unix::{Key, set};
             use unix::{create, destroy};
         }
         all(not(target_thread_local), target_os = "windows") => {
@@ -191,9 +209,9 @@ pub(crate) mod key {
             mod racy;
             #[cfg(test)]
             mod tests;
-            pub(super) use racy::LazyKey;
             pub(super) use moto_rt::tls::{Key, get, set};
             use moto_rt::tls::{create, destroy};
+            pub(super) use racy::LazyKey;
         }
         _ => {}
     }

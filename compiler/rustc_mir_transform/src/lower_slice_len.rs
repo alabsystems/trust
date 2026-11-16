@@ -5,11 +5,13 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 
+use crate::PassPolicy;
+
 pub(super) struct LowerSliceLenCalls;
 
 impl<'tcx> crate::MirPass<'tcx> for LowerSliceLenCalls {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() > 0
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 1)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -19,16 +21,25 @@ impl<'tcx> crate::MirPass<'tcx> for LowerSliceLenCalls {
             return;
         };
 
-        // The one successor remains unchanged, so no need to invalidate
-        let basic_blocks = body.basic_blocks.as_mut_preserves_cfg();
-        for block in basic_blocks {
-            // lower `<[_]>::len` calls
-            lower_slice_len_call(block, slice_len_fn_item_def_id);
+        for bb in body.basic_blocks.indices() {
+            if let TerminatorKind::Call {
+                func,
+                args,
+                target: Some(_),
+                call_source: CallSource::Normal,
+                ..
+            } = &body.basic_blocks[bb].terminator().kind
+                && args.len() == 1
+                && let Some((fn_def_id, _)) = func.const_fn_def()
+                && fn_def_id == slice_len_fn_item_def_id
+            {
+                // The one successor remains unchanged, so no need to invalidate
+                lower_slice_len_call(
+                    &mut body.basic_blocks.as_mut_preserves_cfg()[bb],
+                    slice_len_fn_item_def_id,
+                );
+            }
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -59,7 +70,7 @@ fn lower_slice_len_call<'tcx>(block: &mut BasicBlockData<'tcx>, slice_len_fn_ite
         let add_statement = Statement::new(terminator.source_info, len_statement_kind);
 
         // modify terminator into simple Goto
-        let new_terminator_kind = TerminatorKind::Goto { target: *bb };
+        let new_terminator_kind = TerminatorKind::goto(*bb);
 
         block.statements.push(add_statement);
         block.terminator_mut().kind = new_terminator_kind;

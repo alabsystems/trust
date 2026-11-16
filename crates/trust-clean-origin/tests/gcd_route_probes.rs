@@ -27,13 +27,15 @@
 
 #![allow(clippy::doc_markdown)]
 
-use clean_kernel::{Environment, Name};
+use clean_kernel::Environment;
 use trust_clean_origin::materialize::{
     BodyTemplate, TemplateCallee, TemplateOperand, TemplateRvalue, TemplateTerminator, TemplateTy,
     TemplateUnwind, body_template, zero_test_rec_template,
 };
 use trust_clean_origin::table::ladder_row;
-use trust_clean_origin::{FaithfulnessMethod, admit_lowering, plan_clean_origin_body};
+use trust_clean_origin::{
+    CleanOriginShape, FaithfulnessMethod, admit_lowering, plan_clean_origin_body,
+};
 use trust_types::admissible_body::{PrimitiveCallee, RecBodyExpr, WfRecBody, recognize_wf_nat_rec};
 use trust_types::{
     BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
@@ -84,6 +86,9 @@ fn render_operand(operand: TemplateOperand) -> Operand {
         TemplateOperand::U64Scalar(value) => {
             Operand::Constant(ConstValue::Uint(u128::from(value), 64))
         }
+        TemplateOperand::UIntScalar { value, width } => {
+            Operand::Constant(ConstValue::Uint(value, width))
+        }
         TemplateOperand::BoolScalar(value) => Operand::Constant(ConstValue::Bool(value)),
     }
 }
@@ -93,6 +98,9 @@ fn render(template: &BodyTemplate, def_path: &str) -> VerifiableFunction {
     let local_ty = |ty: TemplateTy| match ty {
         TemplateTy::Result | TemplateTy::Param { .. } => nat_adt(),
         TemplateTy::Bool => Ty::Bool,
+        TemplateTy::RustCalleeResult { .. } => {
+            panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement")
+        }
         TemplateTy::ResultRef => Ty::Ref { mutable: false, inner: Box::new(nat_adt()) },
     };
     let locals = template
@@ -138,6 +146,7 @@ fn render(template: &BodyTemplate, def_path: &str) -> VerifiableFunction {
                     Terminator::Call {
                         func: match callee {
                             TemplateCallee::Primitive(identity) => extracted_callee_path(*identity),
+                            TemplateCallee::RustFn { .. } => panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement"),
                             TemplateCallee::SelfDef => def_path.to_owned(),
                         },
                         args: args.iter().map(|arg| render_operand(*arg)).collect(),
@@ -152,6 +161,7 @@ fn render(template: &BodyTemplate, def_path: &str) -> VerifiableFunction {
                             TemplateUnwind::Continue => UnwindEdge::Continue,
                         },
                         callee_identity: None,
+                        callee_key: None,
                     }
                 }
             },
@@ -172,6 +182,7 @@ fn render(template: &BodyTemplate, def_path: &str) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -196,6 +207,9 @@ fn picture(template: &BodyTemplate) -> String {
             TemplateTerminator::Call { callee, args, dest, target, .. } => {
                 let name = match callee {
                     TemplateCallee::Primitive(p) => format!("{p:?}"),
+                    TemplateCallee::RustFn { .. } => panic!(
+                        "W5: this probe plans no Rust-call chain; control_23 is that lane's measurement"
+                    ),
                     TemplateCallee::SelfDef => "SELF".to_owned(),
                 };
                 let args: Vec<String> = args
@@ -206,10 +220,7 @@ fn picture(template: &BodyTemplate) -> String {
                         other => format!("{other:?}"),
                     })
                     .collect();
-                out.push_str(&format!(
-                    " {name}({}) -> _{dest}, bb{target}\n",
-                    args.join(", ")
-                ));
+                out.push_str(&format!(" {name}({}) -> _{dest}, bb{target}\n", args.join(", ")));
             }
             other => out.push_str(&format!(" {other:?}\n")),
         }
@@ -218,8 +229,13 @@ fn picture(template: &BodyTemplate) -> String {
 }
 
 fn gate(env: &Environment, name: &str, carrier_from: &str, body: &WfRecBody) -> Result<(), String> {
-    let reflected = trust_clean_origin::reflect_wf::reflect_wf_functional(env, name, body, trust_clean_origin::WfLowering::OnParameter)
-        .map_err(|d| format!("REFLECTION REFUSED: {}", first_line(&d)))?;
+    let reflected = trust_clean_origin::reflect_wf::reflect_wf_functional(
+        env,
+        name,
+        body,
+        trust_clean_origin::WfLowering::OnParameter,
+    )
+    .map_err(|d| format!("REFLECTION REFUSED: {}", first_line(&d)))?;
     let carrier_plan = plan_clean_origin_body(env, carrier_from)
         .map_err(|r| format!("carrier donor `{carrier_from}` did not plan: {:?}", r.note()))?;
     trust_clean_origin::gate::check_faithful_wf_functional(
@@ -294,54 +310,87 @@ const ACC3: &str = "def acc3 (a b c : Nat) : Nat := \
                     if h : 0 < a then acc3 (a - 1) (b + 1) (c + 2) else c\n\
                     termination_by a";
 
+/// `acc3`'s quartet, in the vocabulary both sides use: zero arm `c`, self-call
+/// `(a - 1, b + 1, c + 2)`, measure at parameter 0.
+fn acc3_body() -> WfRecBody {
+    WfRecBody {
+        zero_value: RecBodyExpr::Param(2),
+        nonzero_value: RecBodyExpr::Rec,
+        rec_args: vec![
+            RecBodyExpr::Pred,
+            RecBodyExpr::Add(Box::new(RecBodyExpr::Param(1)), Box::new(RecBodyExpr::NatConst(1))),
+            RecBodyExpr::Add(Box::new(RecBodyExpr::Param(2)), Box::new(RecBodyExpr::NatConst(2))),
+        ],
+        measure_index: 0,
+    }
+}
+
+/// Every stage ASSERTS: this row backs the "any arity" lowering claim, so a
+/// refusal at any layer is a failure of that claim, never a silent pass. The
+/// admit is held to what `control_16`'s arity-2 admit holds it to.
 #[test]
 fn m2_arity_three_end_to_end() {
-    let env = match island(ACC3) {
-        Ok(env) => env,
-        Err(why) => {
-            eprintln!("ROW m2 acc3 | ISLAND REJECTS | {}", first_line(&why));
-            return;
-        }
-    };
+    let env = island(ACC3).unwrap_or_else(|why| {
+        panic!("`acc3` must elaborate and kernel-check at this pin: {}", first_line(&why))
+    });
     // Values first — the fixture must be a real computation.
     for (a, b, c, want) in [(0_u32, 1_u32, 2_u32, 2_u32), (1, 1, 2, 4), (3, 1, 2, 8)] {
         let src = format!("{ACC3}\ntheorem v : acc3 {a} {b} {c} = {want} := rfl");
+        let verdict = island(&src);
         eprintln!(
             "ROW m2 value {a} {b} {c} = {want} | {}",
-            if island(&src).is_ok() { "KERNEL ADMITS" } else { "REFUSED" }
+            if verdict.is_ok() { "KERNEL ADMITS" } else { "REFUSED" }
+        );
+        assert!(
+            verdict.is_ok(),
+            "the KERNEL must compute `acc3 {a} {b} {c} = {want}` by `rfl`, or the fixture is \
+             not the computation this row claims: {}",
+            verdict.err().map_or_else(String::new, |why| first_line(&why))
         );
     }
-    let plan = match plan_clean_origin_body(&env, "acc3") {
-        Ok(plan) => plan,
-        Err(refusal) => {
-            eprintln!("ROW m2 plan | REFUSES | {}", first_line(&refusal.note()));
-            return;
-        }
-    };
+    // VALUE CONTROL: a wrong value must be REFUSED, or the admits above decide nothing.
+    assert!(
+        island(&format!("{ACC3}\ntheorem v : acc3 3 1 2 = 7 := rfl")).is_err(),
+        "CONTROL `acc3 3 1 2 = 7` must be REFUSED"
+    );
+
+    let plan = plan_clean_origin_body(&env, "acc3").unwrap_or_else(|refusal| {
+        panic!("`acc3` must plan at arity 3: {}", first_line(&refusal.note()))
+    });
     eprintln!("ROW m2 plan | PLANS {:?}", plan.shape());
-    let row = ladder_row(plan.shape()).expect("a ladder row");
-    let template = match body_template(row, &plan) {
-        Ok(t) => t,
-        Err(refusal) => {
-            eprintln!("ROW m2 template | REFUSES | {refusal:?}");
-            return;
-        }
-    };
+    let body = acc3_body();
+    assert_eq!(
+        plan.shape(),
+        &CleanOriginShape::WellFoundedNatRec {
+            zero_value: body.zero_value.clone(),
+            nonzero_value: body.nonzero_value.clone(),
+            rec_args: body.rec_args.clone(),
+            measure_index: body.measure_index,
+            lowering: trust_clean_origin::WfLowering::OnParameter,
+        },
+        "zero arm `c`, self-call `(a - 1, b + 1, c + 2)`, measure at parameter 0"
+    );
+    assert_eq!(plan.signature().arity(), 3);
+
+    let row = ladder_row(plan.shape()).expect("the planned shape must select a ladder row");
+    let template = body_template(row, &plan)
+        .unwrap_or_else(|refusal| panic!("the materializer must template `acc3`: {refusal:?}"));
     eprintln!("ROW m2 template |\n{}", picture(&template));
     let extracted = render(&template, "clean_origin_wf_rec_arity3::acc3");
-    eprintln!("ROW m2 read-back | {:?}", recognize_wf_nat_rec(&extracted));
-    match admit_lowering(&env, &plan, &extracted) {
-        Ok(faithful) => eprintln!(
-            "ROW m2 ADMIT | {} FAITHFUL by {:?}",
-            faithful.name(),
-            faithful.method()
-        ),
-        Err(refusal) => eprintln!("ROW m2 ADMIT | REFUSED | {}", first_line(&refusal.note())),
-    }
     assert_eq!(
-        std::mem::discriminant(&FaithfulnessMethod::WellFoundedFunctionalDefeq),
-        std::mem::discriminant(&FaithfulnessMethod::WellFoundedFunctionalDefeq)
+        recognize_wf_nat_rec(&extracted),
+        Some(body),
+        "THE MIR READER must read the arity-3 emission back as the planned recursion, with \
+         the MEASURE read out of the zero test's own borrow"
     );
+
+    let faithful = admit_lowering(&env, &plan, &extracted).unwrap_or_else(|refusal| {
+        panic!("the arity-3 emission must pass the F-layer gate: {}", first_line(&refusal.note()))
+    });
+    assert_eq!(faithful.name(), "acc3");
+    assert_eq!(faithful.admitted_at(), &Ty::BignumNat);
+    assert_eq!(faithful.method(), FaithfulnessMethod::WellFoundedFunctionalDefeq);
+    eprintln!("ROW m2 ADMIT | acc3 (arity 3) FAITHFUL by WellFoundedFunctionalDefeq");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -362,10 +411,7 @@ fn reuse_body() -> WfRecBody {
         nonzero_value: RecBodyExpr::Rec,
         rec_args: vec![
             RecBodyExpr::Pred,
-            RecBodyExpr::Add(
-                Box::new(RecBodyExpr::Param(1)),
-                Box::new(RecBodyExpr::Param(1)),
-            ),
+            RecBodyExpr::Add(Box::new(RecBodyExpr::Param(1)), Box::new(RecBodyExpr::Param(1))),
         ],
         measure_index: 0,
     }
@@ -420,14 +466,8 @@ fn acc3d_body() -> WfRecBody {
         nonzero_value: RecBodyExpr::Rec,
         rec_args: vec![
             RecBodyExpr::Pred,
-            RecBodyExpr::Add(
-                Box::new(RecBodyExpr::Param(1)),
-                Box::new(RecBodyExpr::Param(2)),
-            ),
-            RecBodyExpr::Add(
-                Box::new(RecBodyExpr::Param(2)),
-                Box::new(RecBodyExpr::Param(1)),
-            ),
+            RecBodyExpr::Add(Box::new(RecBodyExpr::Param(1)), Box::new(RecBodyExpr::Param(2))),
+            RecBodyExpr::Add(Box::new(RecBodyExpr::Param(2)), Box::new(RecBodyExpr::Param(1))),
         ],
         measure_index: 0,
     }
@@ -521,73 +561,5 @@ fn m5_the_move_after_call_case() {
          say so — but until it does, `plan_clean_origin_body`'s move-aware duplication rule \
          is the ONLY thing standing between the emitter and MIR that fails borrowck \
          (`control_17` (g) is the end-to-end row)"
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// (m6) how many nodes does the fuel form's branch carry?
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn m6_node_budget() {
-    // `gcdF (f - 1) ((a - b) + (b - a)) (a - (a - b))`, counted the way the
-    // plan lane counts (`arith_nodes` over the branch plus the self-call's own
-    // arguments), with `Sub` standing in as `Add` for the count.
-    let stand_in = WfRecBody {
-        zero_value: RecBodyExpr::Param(1),
-        nonzero_value: RecBodyExpr::Rec,
-        rec_args: vec![
-            RecBodyExpr::Pred,
-            RecBodyExpr::Add(
-                Box::new(RecBodyExpr::Add(
-                    Box::new(RecBodyExpr::Param(1)),
-                    Box::new(RecBodyExpr::Param(2)),
-                )),
-                Box::new(RecBodyExpr::Add(
-                    Box::new(RecBodyExpr::Param(2)),
-                    Box::new(RecBodyExpr::Param(1)),
-                )),
-            ),
-            RecBodyExpr::Add(
-                Box::new(RecBodyExpr::Param(1)),
-                Box::new(RecBodyExpr::Add(
-                    Box::new(RecBodyExpr::Param(1)),
-                    Box::new(RecBodyExpr::Param(2)),
-                )),
-            ),
-        ],
-        measure_index: 0,
-    };
-    let nodes: usize = stand_in.rec_args.iter().map(RecBodyExpr::arith_nodes).sum::<usize>()
-        + stand_in.nonzero_value.arith_nodes();
-    eprintln!("ROW m6 nodes | nonzero branch carries {nodes} arithmetic node(s)");
-    for index in 0..3 {
-        let uses: usize = stand_in
-            .rec_args
-            .iter()
-            .map(|argument| argument.parameter_uses(index, 0))
-            .sum();
-        eprintln!("ROW m6 uses | parameter {index} used {uses} time(s) in the nonzero branch");
-    }
-    let template = zero_test_rec_template(
-        &stand_in.zero_value,
-        &stand_in.nonzero_value,
-        &stand_in.rec_args,
-        stand_in.measure_index,
-        TemplateUnwind::Continue,
-    );
-    eprintln!(
-        "ROW m6 template | {} locals, {} blocks",
-        template.locals.len(),
-        template.blocks.len()
-    );
-    let extracted = render(&template, "clean_origin_wf_rec::gcdShape");
-    eprintln!(
-        "ROW m6 MIR reader | {}",
-        if recognize_wf_nat_rec(&extracted).as_ref() == Some(&stand_in) {
-            "READS BACK IDENTICALLY"
-        } else {
-            "DIFFERS"
-        }
     );
 }

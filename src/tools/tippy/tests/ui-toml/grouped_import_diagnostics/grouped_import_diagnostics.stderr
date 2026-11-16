@@ -1,0 +1,28 @@
+warning: expected a macro, found a function
+  --> $DIR/tests/ui-toml/grouped_import_diagnostics/clippy.toml:2:5
+   |
+LL |     "grouped_import_diagnostics::exports::wrong_kind",
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: add `allow-invalid = true` to the entry to suppress this warning
+
+warning: expected a macro, found a function
+  --> $DIR/tests/ui-toml/grouped_import_diagnostics/clippy.toml:3:5
+   |
+LL |     "grouped_import_diagnostics::single::wrong_kind",
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: add `allow-invalid = true` to the entry to suppress this warning
+
+error: this import should be renamed
+  --> tests/ui-toml/grouped_import_diagnostics/grouped_import_diagnostics.rs:12:43
+   |
+LL |     pub use crate::definitions::{allowed, policy, wrong_kind};
+   |                                           ^^^^^^
+   |
+   = help: rename this import to `policy as approved` and update its uses
+   = note: `-D clippy::missing-enforced-import-renames` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::missing_enforced_import_renames)]`
+
+error: aborting due to 1 previous error; 2 warnings emitted
+

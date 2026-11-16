@@ -1,0 +1,167 @@
+{
+  "name": "bug_w12_u128_mut_through_ref",
+  "def_path": "probes_128_false::bug_w12_u128_mut_through_ref",
+  "span": {
+    "file": "probes_128_false.rs",
+    "line_start": 15,
+    "col_start": 0,
+    "line_end": 15,
+    "col_end": 106
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "probes_128_false.rs",
+                "line_start": 15,
+                "col_start": 0,
+                "line_end": 15,
+                "col_end": 76
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      128
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "probes_128_false.rs",
+                "line_start": 15,
+                "col_start": 95,
+                "line_end": 15,
+                "col_end": 95
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "probes_128_false.rs",
+                "line_start": 15,
+                "col_start": 103,
+                "line_end": 15,
+                "col_end": 103
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 128,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "probes_128_false.rs",
+        "line_start": 15,
+        "col_start": 65,
+        "line_end": 15,
+        "col_end": 76
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) >= (1)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Ge": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": 1
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) >= (1)"
+    ],
+    "invariants": []
+  }
+}

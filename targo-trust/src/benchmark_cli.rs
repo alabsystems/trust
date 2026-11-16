@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Rust-owned benchmark runners for Trust evidence surfaces.
 //
 // The program-index runner intentionally mirrors the existing declarative
@@ -7,8 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, thread};
@@ -43,6 +43,11 @@ const EXCERPT_BYTES: usize = 4_000;
 const UNSUPPORTED_MIR_GATE_ROW_LIMIT: usize = 50;
 const TOOLCHAIN_MUTATED: &str = "toolchain_mutated";
 const RUNTIME_BASELINE_SLOT: &str = "upstream-rustc";
+/// STOCK-AS-ORACLE (docs/DECISION_QUEUE.md D16): the
+/// one stock toolchain an unoverridden `upstream-rustc` slot runs.
+const UPSTREAM_RUSTC_ORACLE: &str = "1.97.1";
+/// The `upstream-rustc` source when [`UPSTREAM_RUSTC_ORACLE`] is not installed.
+const UPSTREAM_RUSTC_ORACLE_ABSENT: &str = "oracle-not-installed";
 const SLOT_ORDER: &[&str] =
     &["upstream-rustc", "trust-noverify", "trust-verify", "llvm", "trust-cg"];
 const COMPILE_MEASUREMENT_PROFILE_SCHEMA: &str =
@@ -53,6 +58,16 @@ const STRICT_SUPERIORITY_PLATFORM_IDENTITY_SCHEMA: &str =
     "trust.strict-superiority.platform-identity.v1";
 const PROOF_DESIGN_SUITE: &str = "proof-design";
 const PROOF_DESIGN_CANDIDATE_SUITE: &str = "proof-design-candidates";
+const CANONICAL_PROGRAM_INDEX_PATH: &str = "examples/bench/program_index/index.json";
+const UNSEALED_SOURCE_EXECUTION_BINDING: &str = "unsealed_source_paths";
+const PROOF_DESIGN_SOURCE_EXECUTION_BINDING: &str = "candidate_primary_argv_unsealed_closure";
+// A compiler-read diagnostic is not an authenticated transitive source closure.
+const PROOF_DESIGN_SOURCE_EXECUTION_BOUND: bool = false;
+const HIR_BODY_CENSUS_SCHEMA: &str = "trust.rust.hir-body-census.v1";
+// v2 only adds per-body identity fields (rustc_interface trust_body_census.rs),
+// which this primary-source diagnostic does not read; one census is one schema.
+const HIR_BODY_CENSUS_SCHEMA_V2: &str = "trust.rust.hir-body-census.v2";
+const MAX_PROOF_DESIGN_CENSUS_BYTES: u64 = 2 * 1024 * 1024;
 
 const BENCHMARK_USAGE: &str = "\
 Usage: targo trust benchmark <command> [args...]
@@ -93,12 +108,12 @@ Options:
   --require-slots           Fail if any selected slot binary is missing
   --dry-run                 Write planned commands without running compilers
   --list                    List selected programs without running compilers
-  -h, --help                Show this help
+  -h, --help                Show this help (accepted as the first argument only)
 
 Python is not used by this benchmark command.
 ";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ProgramIndexError(String);
 
 impl ProgramIndexError {
@@ -124,6 +139,24 @@ struct Program {
     obligations: Vec<String>,
     suite: String,
     metadata: Value,
+    source_copy: Option<ProofDesignSourceCopy>,
+    source_copy_blocker: Option<String>,
+    source_unavailable: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProofDesignSourceCopy {
+    path: PathBuf,
+    head: String,
+    sha256: String,
+    identity: Option<(u64, u64)>,
+}
+
+#[derive(Debug)]
+struct CanonicalProofDesignCorpus {
+    head: String,
+    index_sha256: String,
+    programs: Vec<Program>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -228,6 +261,7 @@ struct CommandRun {
 #[derive(Debug, Clone)]
 struct ExecutionResult {
     status: String,
+    source_input_check: Value,
     exit_code: Option<i32>,
     duration_seconds: f64,
     timed_out: bool,
@@ -318,7 +352,7 @@ fn parse_program_index_args(args: &[String]) -> Result<ProgramIndexArgs, Program
     })?;
     let mut parsed = ProgramIndexArgs {
         repo_root: discovered_root,
-        index: PathBuf::from("examples/bench/program_index/index.json"),
+        index: PathBuf::from(CANONICAL_PROGRAM_INDEX_PATH),
         run_id: default_run_id(),
         report_dir: None,
         slots: SLOT_ORDER.iter().map(|slot| (*slot).to_string()).collect(),
@@ -341,7 +375,12 @@ fn parse_program_index_args(args: &[String]) -> Result<ProgramIndexArgs, Program
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "-h" | "--help" => unreachable!("handled before parsing"),
+            // Honoured as the FIRST argument only (see run_program_index_subcommand);
+            // anywhere later this arm used to be `unreachable!` and exited through a
+            // panic instead of the usage error the other arms give.
+            "-h" | "--help" => {
+                return Err(ProgramIndexError::new("help must be the first argument"));
+            }
             "--repo-root" => {
                 let value = value_after(args, index, "--repo-root")?;
                 parsed.repo_root = PathBuf::from(value);
@@ -527,8 +566,21 @@ fn parse_program_index_args(args: &[String]) -> Result<ProgramIndexArgs, Program
 }
 
 fn run_program_index(args: ProgramIndexArgs) -> Result<(u8, Option<PathBuf>), ProgramIndexError> {
-    let (raw_index, all_programs) = load_index(&args.index, &args.repo_root)?;
-    let programs = filter_programs(
+    let report_dir = args
+        .report_dir
+        .clone()
+        .unwrap_or_else(|| args.repo_root.join("reports/bench/program-index").join(&args.run_id));
+    let report_path = report_dir.join("report.json");
+    if !args.list {
+        // A failed rerun must not leave an earlier run's report at this path.
+        remove_file_if_exists(&report_path)?;
+    }
+    let initial_head = canonical_repo_head(&args.repo_root);
+    let mut canonical_proof_design =
+        initial_head.clone().and_then(|head| canonical_proof_design_corpus(&args.repo_root, &head));
+    let (raw_index, all_programs) =
+        load_index(&args.index, &args.repo_root, args.suite.as_deref())?;
+    let mut programs = filter_programs(
         &all_programs,
         &args.programs,
         args.variant.as_deref(),
@@ -547,29 +599,40 @@ fn run_program_index(args: ProgramIndexArgs) -> Result<(u8, Option<PathBuf>), Pr
         .filter(|binding| binding.binary.is_none())
         .map(|binding| binding.id.clone())
         .collect();
-    let report_dir = args
-        .report_dir
-        .clone()
-        .unwrap_or_else(|| args.repo_root.join("reports/bench/program-index").join(&args.run_id));
     fs::create_dir_all(&report_dir)
         .map_err(|error| ProgramIndexError::new(format!("create report dir: {error}")))?;
-    let report_path = report_dir.join("report.json");
 
     if args.require_slots && !missing_required.is_empty() {
-        let report_path = write_missing_required_slots_report(
-            &args,
-            &raw_index,
-            &programs,
-            &bindings,
-            &missing_required,
-            &report_path,
-        )?;
+        let report_path = write_missing_required_slots_report(MissingRequiredSlotsReportInput {
+            args: &args,
+            raw_index: &raw_index,
+            programs: &programs,
+            bindings: &bindings,
+            missing_required: &missing_required,
+            report_path: &report_path,
+            initial_head: &initial_head,
+            canonical_proof_design: &mut canonical_proof_design,
+        })?;
         eprintln!(
             "program-index benchmark: required slot binary not found for: {}",
             missing_required.join(", ")
         );
+        for binding in bindings.iter().filter(|b| b.source == UPSTREAM_RUSTC_ORACLE_ABSENT) {
+            eprintln!("program-index benchmark: {}: {}", binding.id, missing_slot_reason(binding));
+        }
         return Ok((2, Some(report_path)));
     }
+
+    let source_copies = if args.dry_run || bindings.iter().all(|binding| binding.binary.is_none()) {
+        None
+    } else {
+        prepare_proof_design_source_copies(
+            &mut programs,
+            &canonical_proof_design,
+            &args.repo_root,
+            &report_dir,
+        )
+    };
 
     let started_at = timestamp_string();
     let start = Instant::now();
@@ -600,15 +663,28 @@ fn run_program_index(args: ProgramIndexArgs) -> Result<(u8, Option<PathBuf>), Pr
     if args.dry_run {
         for program in &programs {
             for binding in &bindings {
-                rows.push(planned_row(
-                    binding,
-                    program,
-                    &report_dir,
-                    &raw_index,
-                    args.build_profile,
-                    args.compile_measurement_mode,
-                    args.repetitions,
-                ));
+                rows.push(if let Some(reason) = &program.source_unavailable {
+                    skipped_row(SkippedSlotInput {
+                        binding,
+                        program,
+                        expected: &expected_status(&binding.id, program),
+                        reason,
+                        raw_index: &raw_index,
+                        build_profile: args.build_profile,
+                        measurement_mode: args.compile_measurement_mode,
+                        repetitions: args.repetitions,
+                    })
+                } else {
+                    planned_row(
+                        binding,
+                        program,
+                        &report_dir,
+                        &raw_index,
+                        args.build_profile,
+                        args.compile_measurement_mode,
+                        args.repetitions,
+                    )
+                });
             }
         }
         if args.runtime_parity {
@@ -621,17 +697,17 @@ fn run_program_index(args: ProgramIndexArgs) -> Result<(u8, Option<PathBuf>), Pr
     } else {
         for program in &programs {
             for binding in &bindings {
-                rows.push(run_slot(
+                rows.push(run_slot(SlotRunInput {
                     binding,
                     program,
-                    &args.repo_root,
-                    &report_dir,
-                    args.timeout_seconds,
-                    &raw_index,
-                    args.build_profile,
-                    args.compile_measurement_mode,
-                    args.repetitions,
-                )?);
+                    repo_root: &args.repo_root,
+                    report_dir: &report_dir,
+                    timeout_seconds: args.timeout_seconds,
+                    raw_index: &raw_index,
+                    build_profile: args.build_profile,
+                    measurement_mode: args.compile_measurement_mode,
+                    repetitions: args.repetitions,
+                })?);
             }
         }
         preserve_pre_exception_outcomes(&mut rows);
@@ -747,7 +823,10 @@ fn run_program_index(args: ProgramIndexArgs) -> Result<(u8, Option<PathBuf>), Pr
         json!(runtime_parity["summary"]["failed"].as_u64().unwrap_or(0)),
     );
     insert_obj(&mut summary, "upstream_baseline", upstream_baseline.clone());
-    let program_index_evidence = program_index_evidence_summary(&programs, &raw_index);
+    let final_head = canonical_repo_head(&args.repo_root);
+    finish_canonical_proof_design_corpus(&initial_head, &final_head, &mut canonical_proof_design);
+    let program_index_evidence =
+        program_index_evidence_summary(&programs, &raw_index, &canonical_proof_design);
     insert_obj(
         &mut summary,
         "program_index_evidence",
@@ -790,7 +869,9 @@ fn run_program_index(args: ProgramIndexArgs) -> Result<(u8, Option<PathBuf>), Pr
         "started_at": started_at,
         "completed_at": completed_at,
         "repo_root": args.repo_root.to_string_lossy(),
-        "repo_head": repo_head(&args.repo_root),
+        "repo_head": initial_head.as_ref().ok(),
+        "repo_head_after": final_head.as_ref().ok(),
+        "repo_head_matches_at_finish": head_observations_match(&initial_head, &final_head),
         "repo_dirty": repo_dirty(&args.repo_root),
         "repo_dirty_metadata": repo_dirty_metadata(&args.repo_root),
         "target_arch": performance_platform_identity["target_arch"],
@@ -826,6 +907,9 @@ fn run_program_index(args: ProgramIndexArgs) -> Result<(u8, Option<PathBuf>), Pr
         "results": rows,
     });
     write_report(&report, &report_path)?;
+    if let Some(copies) = source_copies {
+        let _ = copies.keep();
+    }
 
     let runtime_parity_blocked =
         args.runtime_parity && !args.dry_run && runtime_parity["status"].as_str() != Some("passed");
@@ -845,14 +929,30 @@ fn run_program_index(args: ProgramIndexArgs) -> Result<(u8, Option<PathBuf>), Pr
     Ok((if failed { 1 } else { 0 }, Some(report_path)))
 }
 
+struct MissingRequiredSlotsReportInput<'a> {
+    args: &'a ProgramIndexArgs,
+    raw_index: &'a Value,
+    programs: &'a [Program],
+    bindings: &'a [SlotBinding],
+    missing_required: &'a [String],
+    report_path: &'a Path,
+    initial_head: &'a Result<String, ProgramIndexError>,
+    canonical_proof_design: &'a mut Result<CanonicalProofDesignCorpus, ProgramIndexError>,
+}
+
 fn write_missing_required_slots_report(
-    args: &ProgramIndexArgs,
-    raw_index: &Value,
-    programs: &[Program],
-    bindings: &[SlotBinding],
-    missing_required: &[String],
-    report_path: &Path,
+    input: MissingRequiredSlotsReportInput<'_>,
 ) -> Result<PathBuf, ProgramIndexError> {
+    let MissingRequiredSlotsReportInput {
+        args,
+        raw_index,
+        programs,
+        bindings,
+        missing_required,
+        report_path,
+        initial_head,
+        canonical_proof_design,
+    } = input;
     let started_at = timestamp_string();
     let mut rows = Vec::new();
     let missing: BTreeSet<&str> = missing_required.iter().map(String::as_str).collect();
@@ -864,16 +964,16 @@ fn write_missing_required_slots_report(
             } else {
                 "blocked by missing required slot binary"
             };
-            rows.push(skipped_row(
+            rows.push(skipped_row(SkippedSlotInput {
                 binding,
                 program,
-                &expected,
+                expected: &expected,
                 reason,
                 raw_index,
-                args.build_profile,
-                args.compile_measurement_mode,
-                args.repetitions,
-            ));
+                build_profile: args.build_profile,
+                measurement_mode: args.compile_measurement_mode,
+                repetitions: args.repetitions,
+            }));
         }
     }
     apply_result_classification(&mut rows);
@@ -921,7 +1021,10 @@ fn write_missing_required_slots_report(
     summary.insert("runtime_parity_failed".to_string(), json!(0));
     let upstream_baseline = upstream_baseline_integrity(bindings, &args.repo_root);
     insert_obj(&mut summary, "upstream_baseline", upstream_baseline.clone());
-    let program_index_evidence = program_index_evidence_summary(programs, raw_index);
+    let final_head = canonical_repo_head(&args.repo_root);
+    finish_canonical_proof_design_corpus(initial_head, &final_head, canonical_proof_design);
+    let program_index_evidence =
+        program_index_evidence_summary(programs, raw_index, canonical_proof_design);
     insert_obj(
         &mut summary,
         "program_index_evidence",
@@ -971,7 +1074,9 @@ fn write_missing_required_slots_report(
         "started_at": started_at,
         "completed_at": completed_at,
         "repo_root": args.repo_root.to_string_lossy(),
-        "repo_head": repo_head(&args.repo_root),
+        "repo_head": initial_head.as_ref().ok(),
+        "repo_head_after": final_head.as_ref().ok(),
+        "repo_head_matches_at_finish": head_observations_match(initial_head, &final_head),
         "repo_dirty": repo_dirty(&args.repo_root),
         "repo_dirty_metadata": repo_dirty_metadata(&args.repo_root),
         "target_arch": performance_platform_identity["target_arch"],
@@ -1013,6 +1118,8 @@ fn write_missing_required_slots_report(
 
 fn slot_profile(slot_id: &str) -> Option<SlotProfile> {
     match slot_id {
+        // STOCK-AS-ORACLE: the upstream baseline Trust is compared against, so
+        // it is stock by design, pinned to UPSTREAM_RUSTC_ORACLE.
         "upstream-rustc" => Some(SlotProfile {
             id: "upstream-rustc",
             mode: "compile",
@@ -1050,6 +1157,7 @@ fn slot_profile(slot_id: &str) -> Option<SlotProfile> {
 fn load_index(
     index_path: &Path,
     repo_root: &Path,
+    selected_suite: Option<&str>,
 ) -> Result<(Value, Vec<Program>), ProgramIndexError> {
     let text = crate::input_limits::read_bounded_utf8_file(
         index_path,
@@ -1074,7 +1182,8 @@ fn load_index(
     }
     let mut programs = Vec::new();
     for row in raw_programs {
-        programs.push(parse_program(row, repo_root)?);
+        let read_source = selected_suite.is_none_or(|suite| row["suite"].as_str() == Some(suite));
+        programs.push(parse_program(row, repo_root, read_source)?);
     }
     validate_program_ids(&programs)?;
     validate_pairs(&programs)?;
@@ -1083,7 +1192,327 @@ fn load_index(
     Ok((raw, programs))
 }
 
-fn parse_program(row: &Value, repo_root: &Path) -> Result<Program, ProgramIndexError> {
+fn committed_blob(
+    repo_root: &Path,
+    head: &str,
+    relative_path: &str,
+) -> Result<Vec<u8>, ProgramIndexError> {
+    let object = format!("{head}:{relative_path}");
+    let output = crate::controlled_git::output(
+        repo_root,
+        &["cat-file", "blob", &object],
+        "canonical program-index blob probe",
+        MAX_CAPTURE_BYTES,
+        GIT_PROBE_TIMEOUT,
+    )
+    .map_err(ProgramIndexError::new)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(ProgramIndexError::new(format!(
+            "canonical program-index blob {relative_path} at {head} unavailable: {} {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn canonical_proof_design_rows(index: &Value) -> Result<Vec<&Value>, ProgramIndexError> {
+    if index["schema"].as_str() != Some(INDEX_SCHEMA) {
+        return Err(ProgramIndexError::new(format!(
+            "canonical program index: expected schema {INDEX_SCHEMA}"
+        )));
+    }
+    let rows = index["programs"].as_array().ok_or_else(|| {
+        ProgramIndexError::new("canonical program index: programs must be a list")
+    })?;
+    let mut proof_rows = Vec::new();
+    for (position, row) in rows.iter().enumerate() {
+        let suite = row
+            .as_object()
+            .and_then(|object| object.get("suite"))
+            .and_then(Value::as_str)
+            .filter(|suite| !suite.is_empty())
+            .ok_or_else(|| {
+                ProgramIndexError::new(format!(
+                    "canonical program index: programs[{position}] must declare a nonempty suite"
+                ))
+            })?;
+        if suite == PROOF_DESIGN_SUITE {
+            proof_rows.push(row);
+        }
+    }
+    if proof_rows.is_empty() {
+        return Err(ProgramIndexError::new("canonical program index has no proof-design rows"));
+    }
+    Ok(proof_rows)
+}
+
+fn canonical_proof_design_corpus(
+    repo_root: &Path,
+    head: &str,
+) -> Result<CanonicalProofDesignCorpus, ProgramIndexError> {
+    let index_bytes = committed_blob(repo_root, head, CANONICAL_PROGRAM_INDEX_PATH)?;
+    let index_sha256 = trust_types::digest::stable_sha256_hex(&index_bytes);
+    let index: Value = serde_json::from_slice(&index_bytes).map_err(|error| {
+        ProgramIndexError::new(format!("canonical program index at {head}: invalid JSON: {error}"))
+    })?;
+    let mut programs = Vec::new();
+    for row in canonical_proof_design_rows(&index)? {
+        let program = parse_program(row, repo_root, true)?;
+        if !Path::new(&program.relative_path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(ProgramIndexError::new(format!(
+                "canonical proof-design source path is not normalized: {}",
+                program.relative_path
+            )));
+        }
+        let committed_source = committed_blob(repo_root, head, &program.relative_path)?;
+        let committed_sha256 = trust_types::digest::stable_sha256_hex(&committed_source);
+        if program.source_sha256 != committed_sha256 {
+            return Err(ProgramIndexError::new(format!(
+                "canonical proof-design source differs from HEAD {head}: {}",
+                program.relative_path
+            )));
+        }
+        programs.push(program);
+    }
+    validate_program_ids(&programs)?;
+    validate_pairs(&programs)?;
+    Ok(CanonicalProofDesignCorpus { head: head.to_string(), index_sha256, programs })
+}
+
+fn prepare_proof_design_source_copies(
+    programs: &mut [Program],
+    canonical: &Result<CanonicalProofDesignCorpus, ProgramIndexError>,
+    repo_root: &Path,
+    report_dir: &Path,
+) -> Option<tempfile::TempDir> {
+    if !programs.iter().any(|program| program.suite == PROOF_DESIGN_SUITE) {
+        return None;
+    }
+    let corpus = match canonical {
+        Ok(corpus) => corpus,
+        Err(error) => {
+            for program in programs.iter_mut().filter(|program| program.suite == PROOF_DESIGN_SUITE)
+            {
+                program.source_copy_blocker =
+                    Some(format!("canonical HEAD source copy unavailable: {error}"));
+            }
+            return None;
+        }
+    };
+    let copy_dir =
+        match tempfile::Builder::new().prefix("proof-design-source-copy-").tempdir_in(report_dir) {
+            Ok(copy_dir) => copy_dir,
+            Err(error) => {
+                for program in
+                    programs.iter_mut().filter(|program| program.suite == PROOF_DESIGN_SUITE)
+                {
+                    program.source_copy_blocker =
+                        Some(format!("create HEAD source copy directory: {error}"));
+                }
+                return None;
+            }
+        };
+    for (index, program) in programs.iter_mut().enumerate() {
+        if program.suite != PROOF_DESIGN_SUITE {
+            continue;
+        }
+        if let Some(reason) = &program.source_unavailable {
+            program.source_copy_blocker = Some(reason.clone());
+            continue;
+        }
+        if !corpus
+            .programs
+            .iter()
+            .any(|row| proof_design_identity(row) == proof_design_identity(program))
+        {
+            program.source_copy_blocker =
+                Some("selected row differs from the canonical HEAD index".to_string());
+            continue;
+        }
+        match copy_canonical_proof_design_source(program, corpus, repo_root, copy_dir.path(), index)
+        {
+            Ok(copy) => program.source_copy = Some(copy),
+            Err(error) => program.source_copy_blocker = Some(error.to_string()),
+        }
+    }
+    Some(copy_dir)
+}
+
+fn copy_canonical_proof_design_source(
+    program: &Program,
+    corpus: &CanonicalProofDesignCorpus,
+    repo_root: &Path,
+    copy_dir: &Path,
+    index: usize,
+) -> Result<ProofDesignSourceCopy, ProgramIndexError> {
+    let source = committed_blob(repo_root, &corpus.head, &program.relative_path)?;
+    let sha256 = trust_types::digest::stable_sha256_hex(&source);
+    if sha256 != program.source_sha256 {
+        return Err(ProgramIndexError::new(format!(
+            "{}: selected source differs from canonical HEAD blob",
+            program.id
+        )));
+    }
+    let row_dir = copy_dir.join(format!("row-{index:04}"));
+    fs::create_dir(&row_dir)
+        .map_err(|error| ProgramIndexError::new(format!("create source copy row: {error}")))?;
+    let file_name = Path::new(&program.relative_path)
+        .file_name()
+        .ok_or_else(|| ProgramIndexError::new(format!("{}: source has no filename", program.id)))?;
+    let path = row_dir.join(file_name);
+    let mut file =
+        OpenOptions::new().write(true).create_new(true).open(&path).map_err(|error| {
+            ProgramIndexError::new(format!("create source copy {}: {error}", path.display()))
+        })?;
+    file.write_all(&source).map_err(|error| {
+        ProgramIndexError::new(format!("write source copy {}: {error}", path.display()))
+    })?;
+    file.sync_all().map_err(|error| {
+        ProgramIndexError::new(format!("sync source copy {}: {error}", path.display()))
+    })?;
+    let mut permissions = file
+        .metadata()
+        .map_err(|error| ProgramIndexError::new(format!("stat source copy: {error}")))?
+        .permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&path, permissions).map_err(|error| {
+        ProgramIndexError::new(format!("protect source copy {}: {error}", path.display()))
+    })?;
+    let identity = source_copy_identity(&file.metadata().map_err(|error| {
+        ProgramIndexError::new(format!("stat source copy {}: {error}", path.display()))
+    })?);
+    let copy = ProofDesignSourceCopy { path, head: corpus.head.clone(), sha256, identity };
+    verify_proof_design_source_copy(&copy)?;
+    Ok(copy)
+}
+
+#[cfg(unix)]
+fn source_copy_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn source_copy_identity(_: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+fn verify_proof_design_source_copy(copy: &ProofDesignSourceCopy) -> Result<(), ProgramIndexError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(&copy.path).map_err(|error| {
+        ProgramIndexError::new(format!("open source copy {}: {error}", copy.path.display()))
+    })?;
+    let opened = file.metadata().map_err(|error| {
+        ProgramIndexError::new(format!("stat source copy {}: {error}", copy.path.display()))
+    })?;
+    if !opened.is_file()
+        || !opened.permissions().readonly()
+        || source_copy_identity(&opened) != copy.identity
+    {
+        return Err(ProgramIndexError::new(format!(
+            "source copy identity or protection changed: {}",
+            copy.path.display()
+        )));
+    }
+    let current = fs::symlink_metadata(&copy.path).map_err(|error| {
+        ProgramIndexError::new(format!("stat source copy {}: {error}", copy.path.display()))
+    })?;
+    if !current.is_file() || !same_capture_identity(&opened, &current) {
+        return Err(ProgramIndexError::new(format!(
+            "source copy path changed: {}",
+            copy.path.display()
+        )));
+    }
+    let mut hasher = Sha256::new();
+    let read = std::io::copy(&mut file.take(MAX_CAPTURE_BYTES as u64 + 1), &mut hasher).map_err(
+        |error| {
+            ProgramIndexError::new(format!("hash source copy {}: {error}", copy.path.display()))
+        },
+    )?;
+    if read != opened.len() || read > MAX_CAPTURE_BYTES as u64 {
+        return Err(ProgramIndexError::new(format!(
+            "source copy size changed: {}",
+            copy.path.display()
+        )));
+    }
+    let sha256 = format!("{:x}", hasher.finalize());
+    if sha256 != copy.sha256 {
+        return Err(ProgramIndexError::new(format!(
+            "proof-design source copy changed: {}",
+            copy.path.display()
+        )));
+    }
+    let current = fs::symlink_metadata(&copy.path).map_err(|error| {
+        ProgramIndexError::new(format!("recheck source copy {}: {error}", copy.path.display()))
+    })?;
+    if !current.is_file() || !same_capture_identity(&opened, &current) {
+        return Err(ProgramIndexError::new(format!(
+            "source copy path changed while it was hashed: {}",
+            copy.path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn head_observations_match(
+    initial_head: &Result<String, ProgramIndexError>,
+    final_head: &Result<String, ProgramIndexError>,
+) -> bool {
+    matches!((initial_head, final_head), (Ok(initial), Ok(final_head)) if initial == final_head)
+}
+
+fn finish_canonical_proof_design_corpus(
+    initial_head: &Result<String, ProgramIndexError>,
+    final_head: &Result<String, ProgramIndexError>,
+    canonical: &mut Result<CanonicalProofDesignCorpus, ProgramIndexError>,
+) {
+    if !head_observations_match(initial_head, final_head) {
+        *canonical = Err(ProgramIndexError::new(format!(
+            "repository HEAD changed or became unavailable during benchmark: {:?} -> {:?}",
+            initial_head.as_ref().ok(),
+            final_head.as_ref().ok()
+        )));
+        return;
+    }
+    let Ok(corpus) = canonical else { return };
+    for program in &corpus.programs {
+        match file_sha256(&program.path) {
+            Ok(digest) if digest == program.source_sha256 => {}
+            Ok(_) => {
+                *canonical = Err(ProgramIndexError::new(format!(
+                    "canonical proof-design source changed during benchmark: {}",
+                    program.relative_path
+                )));
+                return;
+            }
+            Err(error) => {
+                *canonical = Err(ProgramIndexError::new(format!(
+                    "cannot rehash canonical proof-design source {}: {error}",
+                    program.relative_path
+                )));
+                return;
+            }
+        }
+    }
+}
+
+fn parse_program(
+    row: &Value,
+    repo_root: &Path,
+    read_source: bool,
+) -> Result<Program, ProgramIndexError> {
     let object =
         row.as_object().ok_or_else(|| ProgramIndexError::new("program rows must be objects"))?;
     let id = required_str(object, "id")?;
@@ -1092,10 +1521,45 @@ fn parse_program(row: &Value, repo_root: &Path) -> Result<Program, ProgramIndexE
     if variant != "good" && variant != "flawed" {
         return Err(ProgramIndexError::new(format!("{id}: variant must be good or flawed")));
     }
+    let suite = required_str(object, "suite")?;
     let relative_path = required_str(object, "path")?;
-    let path = resolve_source_path(repo_root, &relative_path, &id)?;
-    let source_sha256 = file_sha256(&path)
-        .map_err(|error| ProgramIndexError::new(format!("{id}: hash source: {error}")))?;
+    let (path, source_sha256, source_unavailable) = if !read_source {
+        if !Path::new(&relative_path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(ProgramIndexError::new(format!(
+                "{id}: unselected source path is not normalized: {relative_path}"
+            )));
+        }
+        (
+            repo_root.join(&relative_path),
+            "not_loaded".to_string(),
+            Some("source not read because suite was not selected".to_string()),
+        )
+    } else {
+        match resolve_source_path(repo_root, &relative_path, &id) {
+            Ok(path) => match file_sha256(&path) {
+                Ok(sha256) => (path, sha256, None),
+                Err(error) if suite == PROOF_DESIGN_SUITE => {
+                    (path, "unavailable".to_string(), Some(format!("{id}: hash source: {error}")))
+                }
+                Err(error) => {
+                    return Err(ProgramIndexError::new(format!("{id}: hash source: {error}")));
+                }
+            },
+            Err(error)
+                if suite == PROOF_DESIGN_SUITE
+                    && Path::new(&relative_path)
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_)))
+                    && !repo_root.join(&relative_path).exists() =>
+            {
+                (repo_root.join(&relative_path), "unavailable".to_string(), Some(error.to_string()))
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let obligations_raw = object
         .get("obligations")
         .and_then(Value::as_array)
@@ -1112,7 +1576,6 @@ fn parse_program(row: &Value, repo_root: &Path) -> Result<Program, ProgramIndexE
         };
         obligations.push(value.to_string());
     }
-    let suite = required_str(object, "suite")?;
     let metadata = object.get("metadata").cloned().unwrap_or_else(|| json!({}));
     if !metadata.is_object() {
         return Err(ProgramIndexError::new(format!("{id}: metadata must be an object")));
@@ -1127,6 +1590,9 @@ fn parse_program(row: &Value, repo_root: &Path) -> Result<Program, ProgramIndexE
         obligations,
         suite,
         metadata,
+        source_copy: None,
+        source_copy_blocker: None,
+        source_unavailable,
     })
 }
 
@@ -1181,21 +1647,23 @@ fn validate_program_ids(programs: &[Program]) -> Result<(), ProgramIndexError> {
 }
 
 fn validate_pairs(programs: &[Program]) -> Result<(), ProgramIndexError> {
-    let mut pairs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut pairs: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for program in programs {
-        pairs.entry(program.pair_id.clone()).or_default().insert(program.variant.clone());
+        pairs.entry(program.pair_id.as_str()).or_default().push(program.variant.as_str());
     }
     let invalid: Vec<String> = pairs
         .into_iter()
         .filter_map(|(pair, variants)| {
-            (variants != BTreeSet::from(["flawed".to_string(), "good".to_string()])).then_some(pair)
+            let good = variants.iter().filter(|&&variant| variant == "good").count();
+            let flawed = variants.iter().filter(|&&variant| variant == "flawed").count();
+            (variants.len() != 2 || good != 1 || flawed != 1).then_some(pair.to_string())
         })
         .collect();
     if invalid.is_empty() {
         Ok(())
     } else {
         Err(ProgramIndexError::new(format!(
-            "pairs must contain exactly good and flawed variants: {}",
+            "pairs must contain exactly one good and one flawed row: {}",
             invalid.join(", ")
         )))
     }
@@ -1316,12 +1784,50 @@ fn resolve_slot(
             source: "missing".to_string(),
         };
     }
-    let resolved = which(profile.fallback_binary);
+    // Only `upstream-rustc` gets here, and only the pinned oracle binds it.
+    let resolved = pinned_upstream_rustc();
     SlotBinding {
         id: profile.id.to_string(),
         profile,
         binary: resolved.clone(),
-        source: if resolved.is_some() { "path" } else { "missing" }.to_string(),
+        source: if resolved.is_some() {
+            format!("rustup:{UPSTREAM_RUSTC_ORACLE}")
+        } else {
+            UPSTREAM_RUSTC_ORACLE_ABSENT.to_string()
+        },
+    }
+}
+
+/// The `rustc` of rustup's [`UPSTREAM_RUSTC_ORACLE`] toolchain, or `None` when
+/// it is not installed. Never a PATH `rustc` (on an aterm host that is the
+/// reroute stub) and never an install: `rustup which` downloads a missing
+/// toolchain unless `RUSTUP_AUTO_INSTALL=0` (docs/KNOWN_HAZARDS.md, the
+/// seal-9192 entry, item (e)).
+fn pinned_upstream_rustc() -> Option<String> {
+    let mut command = Command::new("rustup");
+    command
+        .args(["which", "--toolchain", UPSTREAM_RUSTC_ORACLE, "rustc"])
+        .env("RUSTUP_AUTO_INSTALL", "0");
+    let output = crate::bounded_process::output(
+        &mut command,
+        "upstream-rustc oracle lookup",
+        IDENTITY_PROBE_MAX_STREAM_BYTES,
+        IDENTITY_PROBE_TIMEOUT,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    is_executable_path(Path::new(&path)).then_some(path)
+}
+
+/// Why a row of a slot with no binary did not run.
+fn missing_slot_reason(binding: &SlotBinding) -> String {
+    if binding.source == UPSTREAM_RUSTC_ORACLE_ABSENT {
+        format!("NOT RUN: oracle {UPSTREAM_RUSTC_ORACLE} not installed")
+    } else {
+        "slot binary not found".to_string()
     }
 }
 
@@ -1799,17 +2305,30 @@ fn build_profile_report(profile: BuildProfile) -> Value {
     })
 }
 
-fn run_slot(
-    binding: &SlotBinding,
-    program: &Program,
-    repo_root: &Path,
-    report_dir: &Path,
+struct SlotRunInput<'a> {
+    binding: &'a SlotBinding,
+    program: &'a Program,
+    repo_root: &'a Path,
+    report_dir: &'a Path,
     timeout_seconds: u64,
-    raw_index: &Value,
+    raw_index: &'a Value,
     build_profile: BuildProfile,
     measurement_mode: CompileMeasurementMode,
     repetitions: usize,
-) -> Result<Value, ProgramIndexError> {
+}
+
+fn run_slot(input: SlotRunInput<'_>) -> Result<Value, ProgramIndexError> {
+    let SlotRunInput {
+        binding,
+        program,
+        repo_root,
+        report_dir,
+        timeout_seconds,
+        raw_index,
+        build_profile,
+        measurement_mode,
+        repetitions,
+    } = input;
     let artifacts_dir = report_dir.join("artifacts").join(&binding.id);
     let logs_dir = report_dir.join("logs").join(&binding.id);
     fs::create_dir_all(&artifacts_dir)
@@ -1817,34 +2336,61 @@ fn run_slot(
     fs::create_dir_all(&logs_dir)
         .map_err(|error| ProgramIndexError::new(format!("create logs dir: {error}")))?;
     let expected = expected_status(&binding.id, program);
-    if binding.binary.is_none() {
-        return Ok(skipped_row(
+    if let Some(reason) = &program.source_unavailable {
+        return Ok(skipped_row(SkippedSlotInput {
             binding,
             program,
-            &expected,
-            "slot binary not found",
+            expected: &expected,
+            reason,
             raw_index,
             build_profile,
             measurement_mode,
             repetitions,
-        ));
+        }));
+    }
+    if binding.binary.is_none() {
+        return Ok(skipped_row(SkippedSlotInput {
+            binding,
+            program,
+            expected: &expected,
+            reason: &missing_slot_reason(binding),
+            raw_index,
+            build_profile,
+            measurement_mode,
+            repetitions,
+        }));
+    }
+    if program.suite == PROOF_DESIGN_SUITE && program.source_copy.is_none() {
+        return Ok(skipped_row(SkippedSlotInput {
+            binding,
+            program,
+            expected: &expected,
+            reason: program
+                .source_copy_blocker
+                .as_deref()
+                .unwrap_or("canonical source copy unavailable"),
+            raw_index,
+            build_profile,
+            measurement_mode,
+            repetitions,
+        }));
     }
     let mut samples = Vec::with_capacity(repetitions);
     for sample_index in 1..=repetitions {
-        samples.push(run_slot_sample(
+        samples.push(run_slot_sample(SlotSampleInput {
             binding,
             program,
             repo_root,
-            &artifacts_dir,
-            &logs_dir,
+            artifacts_dir: &artifacts_dir,
+            logs_dir: &logs_dir,
             timeout_seconds,
-            &expected,
+            expected: &expected,
             build_profile,
             measurement_mode,
             sample_index,
             repetitions,
             report_dir,
-        )?);
+        })?);
     }
 
     let representative_index = representative_sample_index(&samples);
@@ -1863,6 +2409,7 @@ fn run_slot(
         .map(|sample| sample_report(sample, report_dir))
         .collect::<Result<Vec<_>, _>>()?;
     let mut row = common_row(binding, program, raw_index);
+    row.insert("source_input_check".to_string(), representative.result.source_input_check.clone());
     insert_str(&mut row, "command_display", command_display(&representative.command));
     insert_arr(&mut row, "command", representative.command.iter().map(|arg| json!(arg)).collect());
     insert_str(&mut row, "expected", expected);
@@ -1946,20 +2493,36 @@ fn run_slot(
     Ok(Value::Object(row))
 }
 
-fn run_slot_sample(
-    binding: &SlotBinding,
-    program: &Program,
-    repo_root: &Path,
-    artifacts_dir: &Path,
-    logs_dir: &Path,
+struct SlotSampleInput<'a> {
+    binding: &'a SlotBinding,
+    program: &'a Program,
+    repo_root: &'a Path,
+    artifacts_dir: &'a Path,
+    logs_dir: &'a Path,
     timeout_seconds: u64,
-    expected: &str,
+    expected: &'a str,
     build_profile: BuildProfile,
     measurement_mode: CompileMeasurementMode,
     sample_index: usize,
     repetitions: usize,
-    report_dir: &Path,
-) -> Result<SlotRunSample, ProgramIndexError> {
+    report_dir: &'a Path,
+}
+
+fn run_slot_sample(input: SlotSampleInput<'_>) -> Result<SlotRunSample, ProgramIndexError> {
+    let SlotSampleInput {
+        binding,
+        program,
+        repo_root,
+        artifacts_dir,
+        logs_dir,
+        timeout_seconds,
+        expected,
+        build_profile,
+        measurement_mode,
+        sample_index,
+        repetitions,
+        report_dir,
+    } = input;
     let artifact_name = sanitize_crate_name(&program.id);
     let output_path =
         sampled_path(&artifacts_dir.join(format!("{artifact_name}.o")), sample_index, repetitions);
@@ -1977,7 +2540,7 @@ fn run_slot_sample(
         incremental_dir_for_sample(report_dir, binding, program, sample_index, repetitions)
     });
     let warmup = if measurement_mode.uses_warmup() {
-        Some(run_incremental_warmup(
+        Some(run_incremental_warmup(IncrementalWarmupInput {
             binding,
             program,
             repo_root,
@@ -1985,13 +2548,13 @@ fn run_slot_sample(
             logs_dir,
             timeout_seconds,
             expected,
-            incremental_dir
+            incremental_dir: incremental_dir
                 .as_deref()
                 .expect("warm incremental mode should have an incremental dir"),
             build_profile,
             sample_index,
             repetitions,
-        )?)
+        })?)
     } else {
         None
     };
@@ -2004,16 +2567,17 @@ fn run_slot_sample(
         incremental_dir.as_deref(),
         build_profile,
     )?;
-    let result = execute_command(
-        &command,
-        repo_root,
-        &compiler_env(&binding.id, measurement_mode),
+    let result = execute_command(CommandExecutionInput {
+        command: &command,
+        program,
+        cwd: repo_root,
+        env_map: &compiler_env(&binding.id, measurement_mode),
         timeout_seconds,
-        &stdout_path,
-        &stderr_path,
-        &output_path,
-        binding.profile.mode,
-    )?;
+        stdout_path: &stdout_path,
+        stderr_path: &stderr_path,
+        output_path: &output_path,
+        slot_mode: binding.profile.mode,
+    })?;
     let observed = result.status.clone();
     let exception_class = classify_trust_cg_exception(&result.stderr_excerpt, &observed);
     let warmup_valid = warmup.as_ref().map(|warmup| warmup.valid).unwrap_or(true);
@@ -2033,6 +2597,7 @@ fn run_slot_sample(
 fn sample_report(sample: &SlotRunSample, report_dir: &Path) -> Result<Value, ProgramIndexError> {
     let mut object = Map::new();
     object.insert("sample_index".to_string(), json!(sample.sample_index));
+    object.insert("source_input_check".to_string(), sample.result.source_input_check.clone());
     insert_str(&mut object, "command_display", command_display(&sample.command));
     insert_arr(&mut object, "command", sample.command.iter().map(|arg| json!(arg)).collect());
     insert_str(&mut object, "observed", &sample.observed);
@@ -2267,6 +2832,7 @@ fn planned_row(
     insert_str(&mut row, "expected", expected_status(&binding.id, program));
     insert_str(&mut row, "observed", "planned");
     insert_str(&mut row, "outcome", "planned");
+    row.insert("source_input_check".to_string(), json!({"status": "not_run"}));
     row.insert(
         "measurement_profile".to_string(),
         compile_measurement_profile(
@@ -2289,22 +2855,35 @@ fn planned_row(
     Value::Object(row)
 }
 
-fn skipped_row(
-    binding: &SlotBinding,
-    program: &Program,
-    expected: &str,
-    reason: &str,
-    raw_index: &Value,
+struct SkippedSlotInput<'a> {
+    binding: &'a SlotBinding,
+    program: &'a Program,
+    expected: &'a str,
+    reason: &'a str,
+    raw_index: &'a Value,
     build_profile: BuildProfile,
     measurement_mode: CompileMeasurementMode,
     repetitions: usize,
-) -> Value {
+}
+
+fn skipped_row(input: SkippedSlotInput<'_>) -> Value {
+    let SkippedSlotInput {
+        binding,
+        program,
+        expected,
+        reason,
+        raw_index,
+        build_profile,
+        measurement_mode,
+        repetitions,
+    } = input;
     let mut row = common_row(binding, program, raw_index);
     insert_arr(&mut row, "command", Vec::new());
     insert_str(&mut row, "command_display", "");
     insert_str(&mut row, "expected", expected);
     insert_str(&mut row, "observed", "slot_skipped");
     insert_str(&mut row, "outcome", "skipped");
+    row.insert("source_input_check".to_string(), json!({"status": "not_run"}));
     insert_str(&mut row, "skip_reason", reason);
     row.insert("exit_code".to_string(), Value::Null);
     row.insert("timed_out".to_string(), json!(false));
@@ -2333,19 +2912,36 @@ fn skipped_row(
     Value::Object(row)
 }
 
-fn run_incremental_warmup(
-    binding: &SlotBinding,
-    program: &Program,
-    repo_root: &Path,
-    artifacts_dir: &Path,
-    logs_dir: &Path,
+struct IncrementalWarmupInput<'a> {
+    binding: &'a SlotBinding,
+    program: &'a Program,
+    repo_root: &'a Path,
+    artifacts_dir: &'a Path,
+    logs_dir: &'a Path,
     timeout_seconds: u64,
-    expected: &str,
-    incremental_dir: &Path,
+    expected: &'a str,
+    incremental_dir: &'a Path,
     build_profile: BuildProfile,
     sample_index: usize,
     repetitions: usize,
+}
+
+fn run_incremental_warmup(
+    input: IncrementalWarmupInput<'_>,
 ) -> Result<WarmupMeasurement, ProgramIndexError> {
+    let IncrementalWarmupInput {
+        binding,
+        program,
+        repo_root,
+        artifacts_dir,
+        logs_dir,
+        timeout_seconds,
+        expected,
+        incremental_dir,
+        build_profile,
+        sample_index,
+        repetitions,
+    } = input;
     if incremental_dir.is_dir() {
         fs::remove_dir_all(incremental_dir).map_err(|error| {
             ProgramIndexError::new(format!(
@@ -2380,16 +2976,17 @@ fn run_incremental_warmup(
     remove_file_if_exists(&output_path)?;
     let command =
         build_command(binding, program, &output_path, false, Some(incremental_dir), build_profile)?;
-    let result = execute_command(
-        &command,
-        repo_root,
-        &compiler_env(&binding.id, CompileMeasurementMode::WarmIncremental),
+    let result = execute_command(CommandExecutionInput {
+        command: &command,
+        program,
+        cwd: repo_root,
+        env_map: &compiler_env(&binding.id, CompileMeasurementMode::WarmIncremental),
         timeout_seconds,
-        &stdout_path,
-        &stderr_path,
-        &output_path,
-        binding.profile.mode,
-    )?;
+        stdout_path: &stdout_path,
+        stderr_path: &stderr_path,
+        output_path: &output_path,
+        slot_mode: binding.profile.mode,
+    })?;
     let valid = result.status == expected && !result.timed_out;
     Ok(WarmupMeasurement { command, result, expected: expected.to_string(), valid })
 }
@@ -2397,6 +2994,7 @@ fn run_incremental_warmup(
 fn warmup_report(warmup: &WarmupMeasurement, report_dir: &Path) -> Value {
     json!({
         "status": if warmup.valid { "passed" } else { "failed" },
+        "source_input_check": warmup.result.source_input_check.clone(),
         "expected": warmup.expected.clone(),
         "observed": warmup.result.status.clone(),
         "valid_for_incremental_measurement": warmup.valid,
@@ -2467,7 +3065,12 @@ fn common_row(binding: &SlotBinding, program: &Program, raw_index: &Value) -> Ma
     insert_str(&mut row, "variant", &program.variant);
     insert_str(&mut row, "suite", &program.suite);
     insert_str(&mut row, "source", &program.relative_path);
-    insert_str(&mut row, "source_sha256", &program.source_sha256);
+    if program.source_unavailable.is_some() {
+        row.insert("source_sha256".to_string(), Value::Null);
+    } else {
+        insert_str(&mut row, "source_sha256", &program.source_sha256);
+    }
+    row.insert("source_execution".to_string(), source_execution_report(program));
     insert_arr(
         &mut row,
         "obligations",
@@ -2589,20 +3192,307 @@ fn build_command(
     command.push(if link { "--emit=link" } else { "--emit=obj" }.to_string());
     command.push("-o".to_string());
     command.push(output_path.to_string_lossy().into_owned());
-    command.push(program.path.to_string_lossy().into_owned());
+    let source_path = if program.suite == PROOF_DESIGN_SUITE {
+        &program
+            .source_copy
+            .as_ref()
+            .ok_or_else(|| {
+                ProgramIndexError::new("canonical proof-design source copy unavailable")
+            })?
+            .path
+    } else {
+        &program.path
+    };
+    if program.suite == PROOF_DESIGN_SUITE && binding.id == "trust-verify" {
+        command.extend([
+            "-Z".to_string(),
+            "checksum-hash-algorithm=sha256".to_string(),
+            "-Z".to_string(),
+            format!(
+                "trust-body-census={}",
+                proof_design_census_path(output_path, source_path).display()
+            ),
+        ]);
+    }
+    command.push(
+        source_path
+            .to_str()
+            .ok_or_else(|| ProgramIndexError::new("compiler source path is not UTF-8"))?
+            .to_string(),
+    );
     Ok(command)
 }
 
-fn execute_command(
-    command: &[String],
-    cwd: &Path,
-    env_map: &BTreeMap<String, String>,
+fn proof_design_census_path(output_path: &Path, source_copy_path: &Path) -> PathBuf {
+    // The source-copy row directory is unique per run, even when a report directory is reused.
+    let mut name = output_path.file_name().expect("artifact output has a file name").to_os_string();
+    name.push(".hir-census.jsonl");
+    source_copy_path.with_file_name(name)
+}
+
+fn source_execution_report(program: &Program) -> Value {
+    if program.suite != PROOF_DESIGN_SUITE {
+        return json!({
+            "kind": UNSEALED_SOURCE_EXECUTION_BINDING,
+            "compiler_source_path": program.path,
+            "authenticated_read": false,
+        });
+    }
+    let source_copy_diagnostic = match &program.source_copy {
+        Some(copy) => match verify_proof_design_source_copy(copy) {
+            Ok(()) => json!({
+                "status": "available",
+                "kind": "head_blob_primary_source_copy",
+                "path": copy.path,
+                "head": copy.head,
+                "sha256": copy.sha256,
+                "selected_as_compiler_input": true,
+            }),
+            Err(error) => json!({
+                "status": "invalid",
+                "reason": error.to_string(),
+                "selected_as_compiler_input": true,
+            }),
+        },
+        None => json!({
+            "status": "unavailable",
+            "reason": program.source_copy_blocker,
+            "selected_as_compiler_input": false,
+        }),
+    };
+    json!({
+        "kind": PROOF_DESIGN_SOURCE_EXECUTION_BINDING,
+        "compiler_source_path": program.source_copy.as_ref().map(|copy| &copy.path),
+        "authenticated_read": false,
+        "transitive_source_closure": "unresolved",
+        "blocked_reason": program.source_unavailable.as_deref().unwrap_or(
+            "primary compiler read is diagnostic only; transitive source inputs and independent authority are unresolved"
+        ),
+        "source_copy_diagnostic": source_copy_diagnostic,
+    })
+}
+
+fn census_primary_source(
+    sources: &Value,
+    copy: &ProofDesignSourceCopy,
+    record: &str,
+) -> Result<(), ProgramIndexError> {
+    let sources = sources
+        .as_array()
+        .ok_or_else(|| ProgramIndexError::new(format!("{record} has no loaded-source list")))?;
+    let expected_path = copy
+        .path
+        .to_str()
+        .ok_or_else(|| ProgramIndexError::new("HEAD-derived source copy path is not UTF-8"))?;
+    let mut paths = BTreeSet::new();
+    let mut resolved_paths = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    let mut primary_seen = false;
+    for source in sources {
+        let source = source.as_object().ok_or_else(|| {
+            ProgramIndexError::new(format!("{record} has a malformed loaded source"))
+        })?;
+        let path = source.get("file").and_then(Value::as_str);
+        let digest = source.get("sha256").and_then(Value::as_str);
+        let (Some(path), Some(digest)) = (path, digest) else {
+            return Err(ProgramIndexError::new(format!(
+                "{record} has a malformed loaded-source path or hash"
+            )));
+        };
+        if source.len() != 2
+            || !Path::new(path).is_absolute()
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(ProgramIndexError::new(format!(
+                "{record} has a malformed loaded-source path or hash"
+            )));
+        }
+        if !paths.insert(path) {
+            return Err(ProgramIndexError::new(format!(
+                "{record} has a duplicate loaded-source path: {path}"
+            )));
+        }
+        let resolved = fs::canonicalize(path).map_err(|error| {
+            ProgramIndexError::new(format!(
+                "{record} cannot resolve loaded-source path {path}: {error}"
+            ))
+        })?;
+        let metadata = fs::metadata(&resolved).map_err(|error| {
+            ProgramIndexError::new(format!(
+                "{record} cannot stat loaded-source path {path}: {error}"
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(ProgramIndexError::new(format!(
+                "{record} loaded-source path is not a regular file: {path}"
+            )));
+        }
+        if !resolved_paths.insert(resolved)
+            || source_copy_identity(&metadata).is_some_and(|identity| !identities.insert(identity))
+        {
+            return Err(ProgramIndexError::new(format!(
+                "{record} has a duplicate loaded-source identity: {path}"
+            )));
+        }
+        if path == expected_path {
+            primary_seen = true;
+            if digest != copy.sha256 {
+                return Err(ProgramIndexError::new(format!(
+                    "{record} primary loaded-source hash differs from HEAD copy"
+                )));
+            }
+            if source_copy_identity(&metadata) != copy.identity {
+                return Err(ProgramIndexError::new(format!(
+                    "{record} primary loaded-source identity differs from HEAD copy"
+                )));
+            }
+        }
+    }
+    if !primary_seen {
+        return Err(ProgramIndexError::new(format!(
+            "{record} omitted the HEAD-derived primary source path"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_proof_design_compiler_read_census(
+    raw: &[u8],
+    copy: &ProofDesignSourceCopy,
+    exit_code: Option<i32>,
+) -> Result<Value, ProgramIndexError> {
+    if !raw.ends_with(b"\n") {
+        return Err(ProgramIndexError::new("compiler census is missing or truncated"));
+    }
+    let lines = raw[..raw.len() - 1].split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    if !matches!(lines.len(), 2 | 3) {
+        return Err(ProgramIndexError::new("compiler census has a missing or duplicate record"));
+    }
+    let records = lines
+        .iter()
+        .map(|line| {
+            let line = std::str::from_utf8(line).map_err(|error| {
+                ProgramIndexError::new(format!("non-UTF-8 compiler census record: {error}"))
+            })?;
+            trust_types::trust_formula_v1::parse_unique_proof_json_payload(line).map_err(|error| {
+                ProgramIndexError::new(format!("malformed compiler census record: {error}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let schema = &records[0]["schema"];
+    if !(schema == HIR_BODY_CENSUS_SCHEMA || schema == HIR_BODY_CENSUS_SCHEMA_V2)
+        || records.iter().any(|record| &record["schema"] != schema)
+    {
+        return Err(ProgramIndexError::new("compiler census schema mismatch"));
+    }
+    let expected_path = copy
+        .path
+        .to_str()
+        .ok_or_else(|| ProgramIndexError::new("HEAD-derived source copy path is not UTF-8"))?;
+    if records[0]["event"] != "begin"
+        || records[0]["input"] != expected_path
+        || records[0]["verification_enabled"] != true
+    {
+        return Err(ProgramIndexError::new(
+            "compiler census begin does not bind the proof-design verifier invocation",
+        ));
+    }
+    if records[1]["event"] != "hir_snapshot" {
+        return Err(ProgramIndexError::new("compiler census has no HIR snapshot"));
+    }
+    census_primary_source(&records[1]["sources"], copy, "HIR snapshot")?;
+    if let Some(footer) = records.get(2) {
+        let mut snapshot_bytes = lines[1].to_vec();
+        snapshot_bytes.push(b'\n');
+        if footer["event"] != "complete"
+            || footer["status"] != "complete"
+            || footer["snapshot_sha256"] != trust_types::digest::stable_sha256_hex(&snapshot_bytes)
+        {
+            return Err(ProgramIndexError::new(
+                "compiler census footer does not bind its snapshot",
+            ));
+        }
+        census_primary_source(&footer["sources"], copy, "complete footer")?;
+    } else if exit_code == Some(0) {
+        return Err(ProgramIndexError::new(
+            "successful compiler invocation omitted the census complete footer",
+        ));
+    }
+    Ok(json!({
+        "status": "matched",
+        "scope": "diagnostic-primary-loaded-source-only",
+        "compiler_source_path": copy.path,
+        "head": copy.head,
+        "sha256": copy.sha256,
+        "compiler_exit_code": exit_code,
+        "complete_record": records.len() == 3,
+    }))
+}
+
+fn read_proof_design_compiler_read_census(
+    path: &Path,
+    copy: &ProofDesignSourceCopy,
+    exit_code: Option<i32>,
+) -> Result<Value, ProgramIndexError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        ProgramIndexError::new(format!("open compiler census {}: {error}", path.display()))
+    })?;
+    validate_capture_path_identity(&file, path)?;
+    let mut raw = Vec::new();
+    (&mut file).take(MAX_PROOF_DESIGN_CENSUS_BYTES + 1).read_to_end(&mut raw).map_err(|error| {
+        ProgramIndexError::new(format!("read compiler census {}: {error}", path.display()))
+    })?;
+    if raw.len() as u64 > MAX_PROOF_DESIGN_CENSUS_BYTES
+        || file
+            .metadata()
+            .map_err(|error| {
+                ProgramIndexError::new(format!("stat compiler census {}: {error}", path.display()))
+            })?
+            .len()
+            != raw.len() as u64
+    {
+        return Err(ProgramIndexError::new("compiler census exceeds bound or changed while read"));
+    }
+    validate_capture_path_identity(&file, path)?;
+    let mut diagnostic = parse_proof_design_compiler_read_census(&raw, copy, exit_code)?;
+    diagnostic["census_path"] = json!(path);
+    diagnostic["census_sha256"] = json!(trust_types::digest::stable_sha256_hex(&raw));
+    Ok(diagnostic)
+}
+
+struct CommandExecutionInput<'a> {
+    command: &'a [String],
+    program: &'a Program,
+    cwd: &'a Path,
+    env_map: &'a BTreeMap<String, String>,
     timeout_seconds: u64,
-    stdout_path: &Path,
-    stderr_path: &Path,
-    output_path: &Path,
-    slot_mode: &str,
-) -> Result<ExecutionResult, ProgramIndexError> {
+    stdout_path: &'a Path,
+    stderr_path: &'a Path,
+    output_path: &'a Path,
+    slot_mode: &'a str,
+}
+
+fn execute_command(input: CommandExecutionInput<'_>) -> Result<ExecutionResult, ProgramIndexError> {
+    let CommandExecutionInput {
+        command,
+        program,
+        cwd,
+        env_map,
+        timeout_seconds,
+        stdout_path,
+        stderr_path,
+        output_path,
+        slot_mode,
+    } = input;
     let stdout_file = open_capture_file(stdout_path)
         .map_err(|error| ProgramIndexError::new(format!("create stdout log: {error}")))?;
     let mut stderr_file = open_capture_file(stderr_path)
@@ -2613,14 +3503,108 @@ fn execute_command(
     let child_stderr = stderr_file
         .try_clone()
         .map_err(|error| ProgramIndexError::new(format!("clone stderr log: {error}")))?;
-    let run = run_command_with_resource_usage(
-        command,
-        cwd,
-        env_map,
-        timeout_seconds,
-        child_stdout,
-        child_stderr,
-    );
+    let census_path = if program.suite == PROOF_DESIGN_SUITE && slot_mode == "verify" {
+        program.source_copy.as_ref().map(|copy| proof_design_census_path(output_path, &copy.path))
+    } else {
+        None
+    };
+    let precheck = if program.suite == PROOF_DESIGN_SUITE {
+        Some(
+            match program.source_copy.as_ref() {
+                Some(copy) if command.last().map(String::as_str) == copy.path.to_str() => {
+                    verify_proof_design_source_copy(copy)
+                }
+                Some(_) => Err(ProgramIndexError::new(
+                    "compiler argv does not name the candidate source copy",
+                )),
+                None => {
+                    Err(ProgramIndexError::new("canonical proof-design source copy unavailable"))
+                }
+            }
+            .and_then(|()| {
+                if let Some(path) = census_path.as_deref() {
+                    match fs::symlink_metadata(path) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Ok(_) => Err(ProgramIndexError::new(format!(
+                            "compiler census path already exists: {}",
+                            path.display()
+                        ))),
+                        Err(error) => Err(ProgramIndexError::new(format!(
+                            "inspect compiler census path {}: {error}",
+                            path.display()
+                        ))),
+                    }
+                } else {
+                    Ok(())
+                }
+            }),
+        )
+    } else {
+        None
+    };
+    let pre_error =
+        precheck.as_ref().and_then(|check| check.as_ref().err()).map(ToString::to_string);
+    let (run, postcheck) = if pre_error.is_some() {
+        (
+            CommandRun {
+                exit_code: None,
+                timed_out: false,
+                elapsed_seconds: 0.0,
+                resource_usage: empty_resource_usage("source-input-blocked", 0.0),
+            },
+            None,
+        )
+    } else {
+        let run = run_command_with_resource_usage(
+            command,
+            cwd,
+            env_map,
+            timeout_seconds,
+            child_stdout,
+            child_stderr,
+        );
+        let postcheck = program
+            .source_copy
+            .as_ref()
+            .filter(|_| program.suite == PROOF_DESIGN_SUITE)
+            .map(verify_proof_design_source_copy);
+        (run, postcheck)
+    };
+    let post_error =
+        postcheck.as_ref().and_then(|check| check.as_ref().err()).map(ToString::to_string);
+    let compiler_read_check = if pre_error.is_none() {
+        census_path.as_deref().map(|path| {
+            read_proof_design_compiler_read_census(
+                path,
+                program.source_copy.as_ref().expect("proof-design precheck required a copy"),
+                run.exit_code,
+            )
+        })
+    } else {
+        None
+    };
+    let read_error = compiler_read_check
+        .as_ref()
+        .and_then(|check| check.as_ref().err())
+        .map(ToString::to_string);
+    let source_input_check = if let Some(reason) = &pre_error {
+        json!({"status": "blocked_pre_read", "compiler_invoked": false, "reason": reason})
+    } else if let Some(reason) = &post_error {
+        json!({"status": "blocked_post_read", "compiler_invoked": true, "reason": reason})
+    } else if let Some(reason) = &read_error {
+        json!({"status": "blocked_compiler_read", "compiler_invoked": true, "reason": reason})
+    } else if let Some(Ok(diagnostic)) = &compiler_read_check {
+        json!({
+            "status": "matched_pre_post_compiler_primary",
+            "compiler_invoked": true,
+            "authenticated_read": false,
+            "primary_loaded_source_diagnostic": diagnostic,
+        })
+    } else if program.suite == PROOF_DESIGN_SUITE {
+        json!({"status": "matched_pre_post", "compiler_invoked": true, "authenticated_read": false})
+    } else {
+        json!({"status": "not_applicable"})
+    };
     validate_capture_path_identity(&stdout_file, stdout_path)?;
     validate_capture_path_identity(&stderr_file, stderr_path)?;
     let stdout_bytes = capture_len(&stdout_file, stdout_path)?;
@@ -2634,16 +3618,23 @@ fn execute_command(
     } else {
         format!("{stderr_text}\n{stderr_tail_text}")
     };
-    let status = classify_status(
-        run.exit_code,
-        run.timed_out,
-        output_exists,
-        &stderr_for_status,
-        &transport,
-        slot_mode,
-    );
+    let status = if run.timed_out {
+        "timeout".to_string()
+    } else if pre_error.is_some() || post_error.is_some() || read_error.is_some() {
+        "source_input_blocked".to_string()
+    } else {
+        classify_status(
+            run.exit_code,
+            run.timed_out,
+            output_exists,
+            &stderr_for_status,
+            &transport,
+            slot_mode,
+        )
+    };
     Ok(ExecutionResult {
         status,
+        source_input_check,
         exit_code: run.exit_code,
         duration_seconds: run.elapsed_seconds,
         timed_out: run.timed_out,
@@ -2670,7 +3661,7 @@ fn run_command_with_resource_usage(
 ) -> CommandRun {
     #[cfg(unix)]
     {
-        return run_command_wait4(command, cwd, env_map, timeout_seconds, stdout_file, stderr_file);
+        run_command_wait4(command, cwd, env_map, timeout_seconds, stdout_file, stderr_file)
     }
     #[cfg(not(unix))]
     {
@@ -2712,10 +3703,8 @@ fn run_command_wait4(
         .envs(env_map)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
-    crate::bounded_process::configure_process_group(&mut child_command);
-
-    let mut child = match child_command.spawn() {
-        Ok(child) => child,
+    let (mut child, _ownership) = match crate::process_lifecycle::spawn_owned(&mut child_command) {
+        Ok(owned) => owned,
         Err(error) => {
             return CommandRun {
                 exit_code: Some(127),
@@ -2738,8 +3727,10 @@ fn run_command_wait4(
     let child_pid = child.id();
     let pid = child_pid as libc::pid_t;
     let Some(deadline) = started.checked_add(Duration::from_secs(timeout_seconds)) else {
-        let _ = crate::bounded_process::terminate_process_group(child_pid);
-        let _ = child.kill();
+        let _ = crate::process_lifecycle::stop_child(
+            &mut child,
+            crate::process_lifecycle::StopCause::Error,
+        );
         let _ = child.wait();
         let elapsed = round_seconds(started.elapsed().as_secs_f64());
         return CommandRun {
@@ -2761,8 +3752,10 @@ fn run_command_wait4(
         let exited = match observed {
             Ok(exited) => exited,
             Err(_) => {
-                let _ = crate::bounded_process::terminate_process_group(child_pid);
-                let _ = child.as_mut().and_then(|child| child.kill().ok());
+                let _ = crate::process_lifecycle::stop_tree(
+                    child_pid,
+                    crate::process_lifecycle::StopCause::Error,
+                );
                 let _ = child.as_mut().and_then(|child| child.wait().ok());
                 drop(child.take());
                 let elapsed = round_seconds(started.elapsed().as_secs_f64());
@@ -2775,7 +3768,10 @@ fn run_command_wait4(
             }
         };
         if exited {
-            let _ = crate::bounded_process::terminate_process_group(child_pid);
+            let _ = crate::process_lifecycle::stop_tree(
+                child_pid,
+                crate::process_lifecycle::StopCause::LeaderExited,
+            );
             let mut status: libc::c_int = 0;
             let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
             let waited = unsafe { libc::wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
@@ -2798,7 +3794,10 @@ fn run_command_wait4(
             };
         }
         if capture_limit_exceeded(&stdout_monitor, &stderr_monitor) {
-            let _ = crate::bounded_process::terminate_process_group(child_pid);
+            let _ = crate::process_lifecycle::stop_tree(
+                child_pid,
+                crate::process_lifecycle::StopCause::Bound,
+            );
             let mut status: libc::c_int = 0;
             let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
             let waited = unsafe { libc::wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
@@ -2819,7 +3818,10 @@ fn run_command_wait4(
             };
         }
         if Instant::now() >= deadline {
-            let _ = crate::bounded_process::terminate_process_group(child_pid);
+            let _ = crate::process_lifecycle::stop_tree(
+                child_pid,
+                crate::process_lifecycle::StopCause::Bound,
+            );
             let mut status: libc::c_int = 0;
             let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
             let waited = unsafe { libc::wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
@@ -2891,7 +3893,10 @@ fn run_command_poll(
         }
     };
     let Some(deadline) = started.checked_add(Duration::from_secs(timeout_seconds)) else {
-        let _ = child.kill();
+        let _ = crate::process_lifecycle::stop_child(
+            &mut child,
+            crate::process_lifecycle::StopCause::Error,
+        );
         let _ = child.wait();
         let elapsed = round_seconds(started.elapsed().as_secs_f64());
         return CommandRun {
@@ -2913,7 +3918,10 @@ fn run_command_poll(
                 };
             }
             Ok(None) if capture_limit_exceeded(&stdout_monitor, &stderr_monitor) => {
-                let _ = child.kill();
+                let _ = crate::process_lifecycle::stop_child(
+                    &mut child,
+                    crate::process_lifecycle::StopCause::Bound,
+                );
                 let _ = child.wait();
                 truncate_capture(&stdout_monitor);
                 truncate_capture(&stderr_monitor);
@@ -2929,7 +3937,10 @@ fn run_command_poll(
                 };
             }
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                let _ = crate::process_lifecycle::stop_child(
+                    &mut child,
+                    crate::process_lifecycle::StopCause::Bound,
+                );
                 let status = child.wait().ok();
                 let elapsed = round_seconds(started.elapsed().as_secs_f64());
                 return CommandRun {
@@ -2942,7 +3953,10 @@ fn run_command_poll(
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(error) => {
                 // A failed status query must not abandon a live process.
-                let _ = child.kill();
+                let _ = crate::process_lifecycle::stop_child(
+                    &mut child,
+                    crate::process_lifecycle::StopCause::Error,
+                );
                 let _ = child.wait();
                 let elapsed = round_seconds(started.elapsed().as_secs_f64());
                 let mut usage = non_unix_process_usage("std-error", elapsed);
@@ -3027,7 +4041,7 @@ fn wait_status_to_exit_code(status: libc::c_int) -> Option<i32> {
 
 #[cfg(unix)]
 fn resource_usage_from_rusage(usage: &libc::rusage, elapsed_seconds: f64) -> Value {
-    let peak_rss_raw = usage.ru_maxrss as i64;
+    let peak_rss_raw = usage.ru_maxrss;
     json!({
         "source": "os.wait4",
         "elapsed_seconds": elapsed_seconds,
@@ -3056,7 +4070,8 @@ fn empty_resource_usage(source: &str, elapsed_seconds: f64) -> Value {
     })
 }
 
-fn normalize_ru_maxrss(value: i64) -> i64 {
+fn normalize_ru_maxrss(value: impl Into<i64>) -> i64 {
+    let value = value.into();
     if cfg!(target_os = "macos") { value } else { value * 1024 }
 }
 
@@ -3193,6 +4208,30 @@ fn parse_transport_line(
     match message["type"].as_str() {
         Some("function_result") => {
             increment(summary, "function_results", 1);
+            // Trust (TRANSPORT-LINE-BUDGET-1, review F3): a report the compiler fitted under
+            // the transport line budget is counted as such, so a run's counts never read
+            // as complete evidence without saying how many functions lost what; and a
+            // disclosure that disagrees with its rows makes the function one genuine
+            // unknown, as `parse_compiler_stderr` reads it, none of its rows counted.
+            if message.get("transport_budget").is_some_and(|value| !value.is_null()) {
+                if transport_budget_disclosure_defect(payload).is_some() {
+                    increment(summary, "transport_budget_disclosure_defects", 1);
+                    for key in ["unknown", "total", "obligation_results", "unknown_results"] {
+                        increment(summary, key, 1);
+                    }
+                    return;
+                }
+                increment(summary, "transport_budget_functions", 1);
+                let budget = &message["transport_budget"];
+                if let Some(step) = budget["step"].as_str() {
+                    increment(summary, &format!("transport_budget_{step}"), 1);
+                }
+                increment(
+                    summary,
+                    "transport_budget_demoted_rows",
+                    budget["demoted_rows"].as_array().map_or(0, Vec::len) as i64,
+                );
+            }
             for key in ["proved", "failed", "unknown", "runtime_checked", "total"] {
                 increment(summary, key, int_field(&message, key));
             }
@@ -3204,6 +4243,21 @@ fn parse_transport_line(
             increment(summary, "crate_total_failed", int_field(&message, "total_failed"));
         }
         _ => {}
+    }
+}
+
+/// Trust (TRANSPORT-LINE-BUDGET-1, review F3): why a `function_result` payload's
+/// transport budget disclosure does not reconcile with its rows
+/// (`trust_types::transport_budget::TransportBudgetDisclosure::defect`), or `None` when it
+/// does. A payload that does not decode as a function result is a defect too.
+fn transport_budget_disclosure_defect(payload: &str) -> Option<String> {
+    match trust_types::parse_transport_payload(payload) {
+        Ok(trust_types::TransportMessage::FunctionResult(result)) => result
+            .transport_budget
+            .as_ref()
+            .and_then(|disclosure| disclosure.defect(&result.results)),
+        Ok(_) => Some("a transport budget disclosure on a non-function message".to_string()),
+        Err(error) => Some(format!("the function result does not decode: {error}")),
     }
 }
 
@@ -3331,6 +4385,15 @@ fn empty_transport_summary_object() -> Map<String, Value> {
         "unsupported_mir_results",
         "unsupported_thir_results",
         "unsupported_trust_ir_results",
+        // Trust (TRANSPORT-LINE-BUDGET-1, review F3): the functions whose reports were
+        // fitted under the transport line budget, by the last step each needed, the rows
+        // the fitting demoted, and the disclosures that did not reconcile.
+        "transport_budget_functions",
+        "transport_budget_withheld_diagnostic_payloads",
+        "transport_budget_withheld_proof_evidence",
+        "transport_budget_report_replaced",
+        "transport_budget_demoted_rows",
+        "transport_budget_disclosure_defects",
     ]
     .into_iter()
     .map(|key| (key.to_string(), json!(0)))
@@ -4396,15 +5459,48 @@ fn corpus_summary(programs: &[Program], selected_slots: &[String]) -> Value {
     })
 }
 
-fn program_index_evidence_summary(programs: &[Program], raw_index: &Value) -> Value {
-    let mut gating_suites = index_suite_list(raw_index, "gating_suites");
-    if gating_suites.is_empty() {
-        gating_suites.insert(PROOF_DESIGN_SUITE.to_string());
-    }
-    let mut candidate_suites = index_suite_list(raw_index, "candidate_suites");
-    if candidate_suites.is_empty() {
-        candidate_suites.insert(PROOF_DESIGN_CANDIDATE_SUITE.to_string());
-    }
+fn proof_design_identity(program: &Program) -> (&str, &str, &str, &str, &str, &[String], &Value) {
+    (
+        &program.id,
+        &program.pair_id,
+        &program.variant,
+        &program.relative_path,
+        &program.source_sha256,
+        &program.obligations,
+        &program.metadata,
+    )
+}
+
+fn proof_design_corpus_coverage(
+    programs: &[Program],
+    canonical_programs: &[Program],
+) -> (bool, usize) {
+    let mut declared = canonical_programs
+        .iter()
+        .filter(|program| program.suite == PROOF_DESIGN_SUITE)
+        .map(proof_design_identity)
+        .collect::<Vec<_>>();
+    let mut selected = programs
+        .iter()
+        .filter(|program| program.suite == PROOF_DESIGN_SUITE)
+        .map(proof_design_identity)
+        .collect::<Vec<_>>();
+    declared.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    selected.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    (!declared.is_empty() && selected == declared, declared.len())
+}
+
+fn program_index_evidence_summary(
+    programs: &[Program],
+    raw_index: &Value,
+    canonical: &Result<CanonicalProofDesignCorpus, ProgramIndexError>,
+) -> Value {
+    let canonical_programs =
+        canonical.as_ref().map(|corpus| corpus.programs.as_slice()).unwrap_or(&[]);
+    let (proof_design_corpus_complete, declared_proof_design_rows) =
+        proof_design_corpus_coverage(programs, canonical_programs);
+    let gating_suites = BTreeSet::from([PROOF_DESIGN_SUITE.to_string()]);
+    let candidate_suites = BTreeSet::from([PROOF_DESIGN_CANDIDATE_SUITE.to_string()]);
 
     let selected_suite_names: BTreeSet<String> =
         programs.iter().map(|program| program.suite.clone()).collect();
@@ -4438,23 +5534,36 @@ fn program_index_evidence_summary(programs: &[Program], raw_index: &Value) -> Va
         let candidate_rows = candidate_program_ids.len() as u64;
         let gating = gating_suites.contains(suite);
         let candidate_evidence = candidate_suites.contains(suite);
+        let full_gating_corpus = suite != PROOF_DESIGN_SUITE || proof_design_corpus_complete;
         if candidate_rows > 0 {
             selected_candidate_rows += candidate_rows;
         }
         if gating {
             selected_gating_rows += suite_programs.len() as u64;
-            if candidate_rows == 0 && !candidate_evidence {
+            if candidate_rows == 0
+                && !candidate_evidence
+                && full_gating_corpus
+                && PROOF_DESIGN_SOURCE_EXECUTION_BOUND
+            {
                 selected_admissible_gating_rows += suite_programs.len() as u64;
             } else {
                 blocked_gating_suites.push(suite.clone());
             }
         }
 
-        let admissible_for_domination = gating && !candidate_evidence && candidate_rows == 0;
+        let admissible_for_domination = gating
+            && !candidate_evidence
+            && candidate_rows == 0
+            && full_gating_corpus
+            && PROOF_DESIGN_SOURCE_EXECUTION_BOUND;
         let evidence_class = if candidate_evidence {
             "candidate_non_gating"
         } else if admissible_for_domination {
             "admissible_gating"
+        } else if gating && !full_gating_corpus {
+            "blocked_gating_incomplete_corpus"
+        } else if gating && !PROOF_DESIGN_SOURCE_EXECUTION_BOUND {
+            "blocked_gating_unsealed_source_execution"
         } else if gating {
             "blocked_gating_candidate_contamination"
         } else {
@@ -4498,15 +5607,18 @@ fn program_index_evidence_summary(programs: &[Program], raw_index: &Value) -> Va
     let admissible_for_domination = selected_candidate_rows == 0
         && selected_gating_rows > 0
         && blocked_gating_suites.is_empty();
-
     json!({
         "schema": PROGRAM_INDEX_EVIDENCE_SCHEMA,
         "status": status,
-        "model_source": if raw_index.get("suite_evidence_model").is_some() {
-            "index.suite_evidence_model"
-        } else {
-            "default-proof-design-policy"
-        },
+        "model_source": "builtin-proof-design-policy",
+        "external_suite_evidence_model_ignored": raw_index.get("suite_evidence_model").is_some(),
+        "declared_proof_design_rows": declared_proof_design_rows,
+        "proof_design_corpus_complete": proof_design_corpus_complete,
+        "canonical_proof_design_status": if canonical.is_ok() { "source_tree_matches_head" } else { "blocked" },
+        "source_execution_binding": PROOF_DESIGN_SOURCE_EXECUTION_BINDING,
+        "canonical_proof_design_head": canonical.as_ref().ok().map(|corpus| corpus.head.as_str()),
+        "canonical_proof_design_index_sha256": canonical.as_ref().ok().map(|corpus| corpus.index_sha256.as_str()),
+        "canonical_proof_design_error": canonical.as_ref().err().map(|error| error.0.as_str()),
         "selected_programs": programs.len(),
         "selected_pairs": selected_pairs.len(),
         "selected_suite_count": selected_suites.len(),
@@ -4530,6 +5642,13 @@ fn program_index_evidence_summary_for_report(evidence: &Value) -> Value {
     json!({
         "schema": PROGRAM_INDEX_EVIDENCE_SCHEMA,
         "status": evidence["status"],
+        "declared_proof_design_rows": evidence["declared_proof_design_rows"],
+        "proof_design_corpus_complete": evidence["proof_design_corpus_complete"],
+        "canonical_proof_design_status": evidence["canonical_proof_design_status"],
+        "source_execution_binding": evidence["source_execution_binding"],
+        "canonical_proof_design_head": evidence["canonical_proof_design_head"],
+        "canonical_proof_design_index_sha256": evidence["canonical_proof_design_index_sha256"],
+        "canonical_proof_design_error": evidence["canonical_proof_design_error"],
         "selected_programs": evidence["selected_programs"],
         "selected_pairs": evidence["selected_pairs"],
         "selected_suite_count": evidence["selected_suite_count"],
@@ -4555,8 +5674,7 @@ fn proof_design_verifier_evidence(
         .and_then(|suites| suites.get(PROOF_DESIGN_SUITE))
         .unwrap_or(&Value::Null);
     let selected_programs = proof_design_suite.get("programs").and_then(Value::as_u64).unwrap_or(0);
-    let proof_design_claim = args.suite.as_deref() == Some(PROOF_DESIGN_SUITE)
-        || args.slots.iter().any(|slot| slot == PROOF_FUNCTIONAL_SLOT_ID);
+    let proof_design_claim = args.slots.iter().any(|slot| slot == PROOF_FUNCTIONAL_SLOT_ID);
     let required = selected_programs > 0 && proof_design_claim;
     if !required {
         let reason = if selected_programs == 0 {
@@ -4585,6 +5703,34 @@ fn proof_design_verifier_evidence(
     let mut blockers = Vec::<String>::new();
     if args.dry_run {
         blockers.push("proof-design verifier evidence must be a non-dry-run report".to_string());
+    }
+    if !PROOF_DESIGN_SOURCE_EXECUTION_BOUND {
+        blockers.push(
+            "proof-design primary argv uses a HEAD-derived copy, but compiler reads and transitive source closure remain unauthenticated"
+                .to_string(),
+        );
+    }
+    if program_index_evidence.get("canonical_proof_design_status").and_then(Value::as_str)
+        != Some("source_tree_matches_head")
+    {
+        blockers.push(format!(
+            "canonical proof-design corpus must bind to HEAD index and source tree: {}",
+            program_index_evidence
+                .get("canonical_proof_design_error")
+                .and_then(Value::as_str)
+                .unwrap_or("binding unavailable")
+        ));
+    }
+    if program_index_evidence.get("proof_design_corpus_complete").and_then(Value::as_bool)
+        != Some(true)
+    {
+        blockers.push(format!(
+            "proof-design selection must cover all {} canonical gating rows by identity",
+            program_index_evidence
+                .get("declared_proof_design_rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ));
     }
     if program_index_evidence.get("status").and_then(Value::as_str) != Some("admissible")
         || program_index_evidence.get("admissible_for_domination").and_then(Value::as_bool)
@@ -4687,7 +5833,7 @@ fn proof_design_verifier_evidence(
         "status": status,
         "required": true,
         "admissible_for_domination": status == "passed",
-        "domination_policy": "proof-design gating evidence requires clean trust-verify observations from repo-local stage2 trustc with structured TRUST_JSON transport",
+        "domination_policy": "proof-design gating evidence requires sealed candidate-bound source execution and clean trust-verify observations from repo-local stage2 trustc with structured TRUST_JSON transport",
         "selected_programs": selected_programs,
         "verifier_slot": PROOF_FUNCTIONAL_SLOT_ID,
         "verifier_rows": row_evidence.len(),
@@ -4886,9 +6032,11 @@ fn proof_design_row_verifier_evidence(row: &Value, report_dir: &Path) -> Value {
             "{program}: transport must have unknown=0 and runtime_checked=0, got unknown={unknown} runtime_checked={runtime_checked}"
         ));
     }
-    if proved + failed + unknown + runtime_checked > total {
+    let classified_total =
+        [proved, failed, unknown, runtime_checked].into_iter().try_fold(0_u64, u64::checked_add);
+    if classified_total != Some(total) {
         blockers.push(format!(
-            "{program}: transport counters exceed total={total}, got proved={proved} failed={failed} unknown={unknown} runtime_checked={runtime_checked}"
+            "{program}: transport verdicts must exactly partition total={total}, got proved={proved} failed={failed} unknown={unknown} runtime_checked={runtime_checked}"
         ));
     }
     match variant {
@@ -5016,17 +6164,6 @@ fn proof_design_verifier_evidence_summary_for_report(evidence: &Value) -> Value 
     })
 }
 
-fn index_suite_list(raw_index: &Value, key: &str) -> BTreeSet<String> {
-    raw_index["suite_evidence_model"][key]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 fn program_is_candidate_evidence(program: &Program, candidate_suites: &BTreeSet<String>) -> bool {
     candidate_suites.contains(&program.suite)
         || program.metadata.get("candidate").and_then(Value::as_bool) == Some(true)
@@ -5043,64 +6180,67 @@ fn strict_superiority_performance_evidence(
     let mut lanes = Map::new();
     lanes.insert(
         "clean_release_compile".to_string(),
-        compile_performance_lane(
+        compile_performance_lane(CompilePerformanceLaneInput {
             args,
             rows,
-            &candidate_rejection,
+            candidate_rejection: &candidate_rejection,
             platform_identity,
-            "clean_release_compile",
-            "Clean release compile duration evidence from cold artifact compiles",
-            BuildProfile::Release,
-            CompileMeasurementMode::ColdArtifact,
-            "duration_seconds",
-        ),
+            lane_id: "clean_release_compile",
+            description: "Clean release compile duration evidence from cold artifact compiles",
+            required_profile: BuildProfile::Release,
+            required_measurement: CompileMeasurementMode::ColdArtifact,
+            metric: "duration_seconds",
+        }),
     );
     lanes.insert(
         "incremental_debug_compile".to_string(),
-        compile_performance_lane(
+        compile_performance_lane(CompilePerformanceLaneInput {
             args,
             rows,
-            &candidate_rejection,
+            candidate_rejection: &candidate_rejection,
             platform_identity,
-            "incremental_debug_compile",
-            "Warm incremental debug compile duration evidence",
-            BuildProfile::Debug,
-            CompileMeasurementMode::WarmIncremental,
-            "duration_seconds",
-        ),
+            lane_id: "incremental_debug_compile",
+            description: "Warm incremental debug compile duration evidence",
+            required_profile: BuildProfile::Debug,
+            required_measurement: CompileMeasurementMode::WarmIncremental,
+            metric: "duration_seconds",
+        }),
     );
     lanes.insert(
         "runtime_geomean".to_string(),
-        runtime_performance_lane(
+        runtime_performance_lane(RuntimePerformanceLaneInput {
             args,
             runtime_parity,
-            &candidate_rejection,
+            candidate_rejection: &candidate_rejection,
             platform_identity,
-            "runtime_geomean",
-            "Linked release runtime geomean evidence",
-            BuildProfile::Release,
-            "run_duration_seconds",
-        ),
+            lane_id: "runtime_geomean",
+            description: "Linked release runtime geomean evidence",
+            required_profile: BuildProfile::Release,
+            metric: "run_duration_seconds",
+        }),
     );
     lanes.insert(
         "binary_size".to_string(),
-        runtime_performance_lane(
+        runtime_performance_lane(RuntimePerformanceLaneInput {
             args,
             runtime_parity,
-            &candidate_rejection,
+            candidate_rejection: &candidate_rejection,
             platform_identity,
-            "binary_size",
-            "Linked release executable size evidence",
-            BuildProfile::Release,
-            "executable_size_bytes",
-        ),
+            lane_id: "binary_size",
+            description: "Linked release executable size evidence",
+            required_profile: BuildProfile::Release,
+            metric: "executable_size_bytes",
+        }),
     );
 
     let measured_lanes =
         lanes.values().filter(|lane| lane["status"].as_str() == Some("measured")).count();
     let blocked_lanes =
         lanes.values().filter(|lane| lane["status"].as_str() == Some("blocked")).count();
-    let status = if measured_lanes == lanes.len() {
+    let source_rejected = candidate_rejection["rejected"].as_bool() != Some(false);
+    let status = if source_rejected {
+        "blocked"
+    } else if measured_lanes == lanes.len() {
         "complete"
     } else if measured_lanes > 0 {
         "partial"
@@ -5120,7 +6260,7 @@ fn strict_superiority_performance_evidence(
     json!({
         "schema": STRICT_SUPERIORITY_PERFORMANCE_SCHEMA,
         "status": status,
-        "admissible_for_domination": status == "complete",
+        "admissible_for_domination": status == "complete" && !source_rejected,
         "measured_lanes": measured_lanes,
         "blocked_lanes": blocked_lanes,
         "blocked_reasons": blocked_reasons,
@@ -5179,12 +6319,18 @@ fn performance_candidate_rejection(program_index_evidence: &Value) -> Value {
     let selected_candidate_rows =
         program_index_evidence["selected_candidate_rows"].as_u64().unwrap_or(0);
     let status = program_index_evidence["status"].as_str().unwrap_or("unknown");
+    let selected_gating_rows = program_index_evidence["selected_gating_rows"].as_u64().unwrap_or(0);
+    let selected_admissible_gating_rows =
+        program_index_evidence["selected_admissible_gating_rows"].as_u64().unwrap_or(0);
     let blocked_gating_suites = program_index_evidence["blocked_gating_suites"]
         .as_array()
         .map(|items| !items.is_empty())
-        .unwrap_or(false);
+        .unwrap_or(true);
     let rejected = selected_candidate_rows > 0
-        || matches!(status, "candidate_non_gating" | "mixed_candidate_non_gating" | "blocked")
+        || status != "admissible"
+        || program_index_evidence["admissible_for_domination"].as_bool() != Some(true)
+        || selected_gating_rows == 0
+        || selected_admissible_gating_rows != selected_gating_rows
         || blocked_gating_suites;
     json!({
         "schema": PROGRAM_INDEX_EVIDENCE_SCHEMA,
@@ -5196,24 +6342,37 @@ fn performance_candidate_rejection(program_index_evidence: &Value) -> Value {
         "admissible_for_domination": program_index_evidence["admissible_for_domination"],
         "blocked_gating_suites": program_index_evidence["blocked_gating_suites"],
         "reason": if rejected {
-            "candidate or contaminated program-index evidence is non-gating for strict-superiority performance claims"
+            "candidate or otherwise inadmissible program-index evidence is non-gating for strict-superiority performance claims"
         } else {
             "no selected candidate rows were present in the performance source data"
         },
     })
 }
 
-fn compile_performance_lane(
-    args: &ProgramIndexArgs,
-    rows: &[Value],
-    candidate_rejection: &Value,
-    platform_identity: &Value,
-    lane_id: &str,
-    description: &str,
+struct CompilePerformanceLaneInput<'a> {
+    args: &'a ProgramIndexArgs,
+    rows: &'a [Value],
+    candidate_rejection: &'a Value,
+    platform_identity: &'a Value,
+    lane_id: &'a str,
+    description: &'a str,
     required_profile: BuildProfile,
     required_measurement: CompileMeasurementMode,
-    metric: &str,
-) -> Value {
+    metric: &'a str,
+}
+
+fn compile_performance_lane(input: CompilePerformanceLaneInput<'_>) -> Value {
+    let CompilePerformanceLaneInput {
+        args,
+        rows,
+        candidate_rejection,
+        platform_identity,
+        lane_id,
+        description,
+        required_profile,
+        required_measurement,
+        metric,
+    } = input;
     let mut blocked_reasons =
         performance_common_blockers(args, candidate_rejection, platform_identity);
     if args.build_profile != required_profile {
@@ -5250,31 +6409,43 @@ fn compile_performance_lane(
     }
 
     let comparisons = performance_comparisons(&baseline, &trust, metric, false);
-    performance_lane_report(
+    performance_lane_report(PerformanceLaneReportInput {
         args,
         platform_identity,
         lane_id,
         description,
         required_profile,
-        Some(required_measurement),
+        required_measurement: Some(required_measurement),
         metric,
         blocked_reasons,
-        baseline,
-        Value::Object(trust),
+        rust: baseline,
+        trust: Value::Object(trust),
         comparisons,
-    )
+    })
 }
 
-fn runtime_performance_lane(
-    args: &ProgramIndexArgs,
-    runtime_parity: &Value,
-    candidate_rejection: &Value,
-    platform_identity: &Value,
-    lane_id: &str,
-    description: &str,
+struct RuntimePerformanceLaneInput<'a> {
+    args: &'a ProgramIndexArgs,
+    runtime_parity: &'a Value,
+    candidate_rejection: &'a Value,
+    platform_identity: &'a Value,
+    lane_id: &'a str,
+    description: &'a str,
     required_profile: BuildProfile,
-    metric: &str,
-) -> Value {
+    metric: &'a str,
+}
+
+fn runtime_performance_lane(input: RuntimePerformanceLaneInput<'_>) -> Value {
+    let RuntimePerformanceLaneInput {
+        args,
+        runtime_parity,
+        candidate_rejection,
+        platform_identity,
+        lane_id,
+        description,
+        required_profile,
+        metric,
+    } = input;
     let mut blocked_reasons =
         performance_common_blockers(args, candidate_rejection, platform_identity);
     if args.build_profile != required_profile {
@@ -5317,19 +6488,19 @@ fn runtime_performance_lane(
 
     let comparisons =
         performance_comparisons(&baseline, &trust, metric, metric.ends_with("size_bytes"));
-    performance_lane_report(
+    performance_lane_report(PerformanceLaneReportInput {
         args,
         platform_identity,
         lane_id,
         description,
         required_profile,
-        None,
+        required_measurement: None,
         metric,
         blocked_reasons,
-        baseline,
-        Value::Object(trust),
+        rust: baseline,
+        trust: Value::Object(trust),
         comparisons,
-    )
+    })
 }
 
 fn performance_common_blockers(
@@ -5355,19 +6526,34 @@ fn performance_common_blockers(
     blockers
 }
 
-fn performance_lane_report(
-    args: &ProgramIndexArgs,
-    platform_identity: &Value,
-    lane_id: &str,
-    description: &str,
+struct PerformanceLaneReportInput<'a> {
+    args: &'a ProgramIndexArgs,
+    platform_identity: &'a Value,
+    lane_id: &'a str,
+    description: &'a str,
     required_profile: BuildProfile,
     required_measurement: Option<CompileMeasurementMode>,
-    metric: &str,
+    metric: &'a str,
     blocked_reasons: Vec<String>,
     rust: Value,
     trust: Value,
     comparisons: Value,
-) -> Value {
+}
+
+fn performance_lane_report(input: PerformanceLaneReportInput<'_>) -> Value {
+    let PerformanceLaneReportInput {
+        args,
+        platform_identity,
+        lane_id,
+        description,
+        required_profile,
+        required_measurement,
+        metric,
+        blocked_reasons,
+        rust,
+        trust,
+        comparisons,
+    } = input;
     let status = if blocked_reasons.is_empty() { "measured" } else { "blocked" };
     json!({
         "schema": STRICT_SUPERIORITY_PERFORMANCE_SCHEMA,
@@ -6187,8 +7373,18 @@ fn run_runtime_slot(
     timeout_seconds: u64,
     build_profile: BuildProfile,
 ) -> Result<Value, ProgramIndexError> {
+    if let Some(reason) = &program.source_unavailable {
+        return Ok(runtime_not_applicable_row(binding, program, reason));
+    }
     if binding.binary.is_none() {
-        return Ok(runtime_not_applicable_row(binding, program, "slot binary not found"));
+        return Ok(runtime_not_applicable_row(binding, program, &missing_slot_reason(binding)));
+    }
+    if program.suite == PROOF_DESIGN_SUITE && program.source_copy.is_none() {
+        return Ok(runtime_not_applicable_row(
+            binding,
+            program,
+            program.source_copy_blocker.as_deref().unwrap_or("canonical source copy unavailable"),
+        ));
     }
     if binding.profile.mode != "compile" {
         return Ok(runtime_not_applicable_row(
@@ -6205,26 +7401,48 @@ fn run_runtime_slot(
     fs::create_dir_all(&logs_dir)
         .map_err(|error| ProgramIndexError::new(format!("create runtime logs dir: {error}")))?;
     let executable_path = artifacts_dir.join(runtime_executable_name(program));
+    remove_file_if_exists(&executable_path)?;
     let build_stdout_path =
         logs_dir.join(format!("{}.build.stdout.log", sanitize_crate_name(&program.id)));
     let build_stderr_path =
         logs_dir.join(format!("{}.build.stderr.log", sanitize_crate_name(&program.id)));
     let command = build_command(binding, program, &executable_path, true, None, build_profile)?;
-    let build_result = execute_command(
-        &command,
-        repo_root,
-        &compiler_env(&binding.id, CompileMeasurementMode::ColdArtifact),
+    let build_result = execute_command(CommandExecutionInput {
+        command: &command,
+        program,
+        cwd: repo_root,
+        env_map: &compiler_env(&binding.id, CompileMeasurementMode::ColdArtifact),
         timeout_seconds,
-        &build_stdout_path,
-        &build_stderr_path,
-        &executable_path,
-        "compile",
-    )?;
+        stdout_path: &build_stdout_path,
+        stderr_path: &build_stderr_path,
+        output_path: &executable_path,
+        slot_mode: "compile",
+    })?;
+    // A path-only `-o` result cannot identify its writer after another process
+    // has had a chance to replace the unlinked path. Do not admit it for proof-design parity.
+    let output_source_unsealed =
+        program.suite == PROOF_DESIGN_SUITE && build_result.status == "compile_pass";
+    let build_status =
+        if output_source_unsealed { "output_source_unsealed" } else { &build_result.status };
     let mut row = runtime_row_identity(binding, program);
     row.insert("runtime_participant".to_string(), json!(true));
     insert_arr(&mut row, "build_command", command.iter().map(|arg| json!(arg)).collect());
     insert_str(&mut row, "build_command_display", command_display(&command));
-    insert_str(&mut row, "build_status", &build_result.status);
+    insert_str(&mut row, "build_status", build_status);
+    if program.suite == PROOF_DESIGN_SUITE {
+        row.insert(
+            "output_source_check".to_string(),
+            if output_source_unsealed {
+                json!({
+                    "status": "unsealed",
+                    "reason": "compiler -o path does not authenticate the output writer or exclude concurrent replacement",
+                })
+            } else {
+                json!({"status": "not_admitted"})
+            },
+        );
+    }
+    row.insert("source_input_check".to_string(), build_result.source_input_check.clone());
     insert_optional_i32(&mut row, "build_exit_code", build_result.exit_code);
     row.insert("build_timed_out".to_string(), json!(build_result.timed_out));
     row.insert(
@@ -6252,9 +7470,25 @@ fn run_runtime_slot(
     insert_str(&mut row, "build_stderr_tail_excerpt", build_result.stderr_tail_excerpt);
     insert_str(&mut row, "executable_path", relative_to_report(&executable_path, report_dir));
     row.insert("executable_exists".to_string(), json!(executable_path.is_file()));
-    insert_optional_u64(&mut row, "executable_size_bytes", file_size_or_none(&executable_path));
-    insert_optional_str(&mut row, "executable_sha256", file_sha256_or_none(&executable_path)?);
-    if build_result.status != "compile_pass" {
+    insert_optional_u64(
+        &mut row,
+        "executable_size_bytes",
+        if program.suite == PROOF_DESIGN_SUITE {
+            None
+        } else {
+            file_size_or_none(&executable_path)
+        },
+    );
+    insert_optional_str(
+        &mut row,
+        "executable_sha256",
+        if program.suite == PROOF_DESIGN_SUITE {
+            None
+        } else {
+            file_sha256_or_none(&executable_path)?
+        },
+    );
+    if build_status != "compile_pass" {
         insert_runtime_empty_fields(&mut row);
         return Ok(Value::Object(row));
     }
@@ -6327,7 +7561,12 @@ fn runtime_row_identity(binding: &SlotBinding, program: &Program) -> Map<String,
     insert_str(&mut row, "variant", &program.variant);
     insert_str(&mut row, "suite", &program.suite);
     insert_str(&mut row, "source", &program.relative_path);
-    insert_str(&mut row, "source_sha256", &program.source_sha256);
+    if program.source_unavailable.is_some() {
+        row.insert("source_sha256".to_string(), Value::Null);
+    } else {
+        insert_str(&mut row, "source_sha256", &program.source_sha256);
+    }
+    row.insert("source_execution".to_string(), source_execution_report(program));
     insert_arr(
         &mut row,
         "obligations",
@@ -6348,6 +7587,7 @@ fn runtime_row_identity(binding: &SlotBinding, program: &Program) -> Map<String,
 
 fn runtime_not_applicable_row(binding: &SlotBinding, program: &Program, reason: &str) -> Value {
     let mut row = runtime_row_identity(binding, program);
+    row.insert("source_input_check".to_string(), json!({"status": "not_run"}));
     row.insert("runtime_participant".to_string(), json!(false));
     insert_str(&mut row, "runtime_classification", "runtime-not-applicable");
     insert_str(&mut row, "runtime_classification_reason", reason);
@@ -6678,7 +7918,7 @@ fn validate_repair_e2e_report(path: &Path) -> Result<Vec<String>, Vec<String>> {
     require_negative_delta(&report, &["improvement", "failed_delta"], &mut errors);
     require_positive_delta(&report, &["improvement", "divzero_proved_delta"], &mut errors);
     require_negative_delta(&report, &["improvement", "divzero_failed_delta"], &mut errors);
-    if report["before"]["divzero_counterexamples"].as_array().map_or(true, Vec::is_empty) {
+    if report["before"]["divzero_counterexamples"].as_array().is_none_or(Vec::is_empty) {
         errors.push("repair report lacks before.divzero_counterexamples".to_string());
     }
     if errors.is_empty() { Ok(Vec::new()) } else { Err(errors) }
@@ -6766,19 +8006,35 @@ fn stage2_roots_for_binary(binary: &str, repo_root: &Path) -> Vec<PathBuf> {
             candidates.push(resolved);
         }
     }
+    // `build` may be a symlink (Spotlight is kept out of the build tree by
+    // `build -> build.noindex`, docs/BUILD_AND_INSTALL.md), and a canonicalized
+    // or physically spelled binary then lives under the RESOLVED build directory,
+    // which a lexical `starts_with(repo/build)` never matches. Both spellings are
+    // matched, every root is spelled `repo/build/...`, and roots are deduplicated
+    // by canonical identity so one tree is never snapshotted twice.
     let repo_build = repo_root.join("build");
-    let mut roots = BTreeSet::new();
+    let physical_build = repo_build.canonicalize().ok().filter(|physical| *physical != repo_build);
+    let mut roots = BTreeMap::<PathBuf, PathBuf>::new();
     for candidate in candidates {
         for ancestor in candidate.ancestors() {
-            if ancestor.file_name() == Some(OsStr::new("stage2"))
-                && ancestor.starts_with(&repo_build)
-            {
-                roots.insert(ancestor.to_path_buf());
+            if ancestor.file_name() != Some(OsStr::new("stage2")) {
+                continue;
+            }
+            let root = if ancestor.starts_with(&repo_build) {
+                Some(ancestor.to_path_buf())
+            } else {
+                physical_build.as_ref().and_then(|physical| {
+                    ancestor.strip_prefix(physical).ok().map(|rest| repo_build.join(rest))
+                })
+            };
+            if let Some(root) = root {
+                let identity = root.canonicalize().unwrap_or_else(|_| root.clone());
+                roots.entry(identity).or_insert(root);
                 break;
             }
         }
     }
-    roots.into_iter().collect()
+    roots.into_values().collect::<BTreeSet<_>>().into_iter().collect()
 }
 
 fn capture_stage2_snapshot(
@@ -7208,14 +8464,14 @@ fn print_programs(programs: &[Program]) {
     }
 }
 
-fn repo_head(root: &Path) -> Option<String> {
+fn canonical_repo_head(root: &Path) -> Result<String, ProgramIndexError> {
     crate::controlled_git::canonical_head(
         root,
         "benchmark repository HEAD probe",
         IDENTITY_PROBE_MAX_STREAM_BYTES,
         GIT_PROBE_TIMEOUT,
     )
-    .ok()
+    .map_err(ProgramIndexError::new)
 }
 
 fn performance_platform_identity(
@@ -7782,7 +9038,7 @@ fn median_sorted_f64(sorted: &[f64]) -> Option<f64> {
         return None;
     }
     let midpoint = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         Some((sorted[midpoint - 1] + sorted[midpoint]) / 2.0)
     } else {
         Some(sorted[midpoint])
@@ -7794,7 +9050,7 @@ fn median_sorted_i64(sorted: &[i64]) -> Option<f64> {
         return None;
     }
     let midpoint = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         Some((sorted[midpoint - 1] as f64 + sorted[midpoint] as f64) / 2.0)
     } else {
         Some(sorted[midpoint] as f64)
@@ -7950,6 +9206,1120 @@ fn unix_seconds() -> u64 {
 mod compiler_environment_tests {
     use super::*;
 
+    fn compiler_read_copy(dir: &Path) -> ProofDesignSourceCopy {
+        let path = dir.join("source.rs");
+        let source = b"fn main() {}\n";
+        fs::write(&path, source).expect("source copy");
+        let mut permissions = fs::metadata(&path).expect("source metadata").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).expect("protect source copy");
+        ProofDesignSourceCopy {
+            path: path.clone(),
+            head: "fixture-head".to_string(),
+            sha256: trust_types::digest::stable_sha256_hex(source),
+            identity: source_copy_identity(&fs::metadata(path).expect("source metadata")),
+        }
+    }
+
+    fn compiler_read_records(copy: &ProofDesignSourceCopy) -> Vec<Value> {
+        let snapshot = json!({
+            "schema": HIR_BODY_CENSUS_SCHEMA,
+            "event": "hir_snapshot",
+            "sources": [{"file": copy.path, "sha256": copy.sha256}],
+        });
+        let mut snapshot_bytes = serde_json::to_vec(&snapshot).expect("snapshot JSON");
+        snapshot_bytes.push(b'\n');
+        vec![
+            json!({
+                "schema": HIR_BODY_CENSUS_SCHEMA,
+                "event": "begin",
+                "input": copy.path,
+                "verification_enabled": true,
+            }),
+            snapshot,
+            json!({
+                "schema": HIR_BODY_CENSUS_SCHEMA,
+                "event": "complete",
+                "status": "complete",
+                "snapshot_sha256": trust_types::digest::stable_sha256_hex(&snapshot_bytes),
+                "sources": [{"file": copy.path, "sha256": copy.sha256}],
+            }),
+        ]
+    }
+
+    fn compiler_read_bytes(records: &[Value]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for record in records {
+            raw.extend(serde_json::to_vec(record).expect("census JSON"));
+            raw.push(b'\n');
+        }
+        raw
+    }
+
+    #[test]
+    fn proof_design_verifier_command_binds_loaded_primary_read_diagnostic() {
+        let dir = tempfile::tempdir().expect("source copy directory");
+        let copy = compiler_read_copy(dir.path());
+        let output = dir.path().join("sample.o");
+        let mut program = pair_program("proof", "good");
+        program.source_copy = Some(copy.clone());
+        let binding = SlotBinding {
+            id: "trust-verify".to_string(),
+            profile: slot_profile("trust-verify").expect("verifier slot"),
+            binary: Some("/usr/bin/true".to_string()),
+            source: "fixture".to_string(),
+        };
+        let command = build_command(&binding, &program, &output, false, None, BuildProfile::Debug)
+            .expect("verifier command");
+        let census_path = proof_design_census_path(&output, &copy.path);
+        assert!(command.contains(&"checksum-hash-algorithm=sha256".to_string()));
+        assert!(command.contains(&format!("trust-body-census={}", census_path.display())));
+        assert_eq!(command.last().map(String::as_str), copy.path.to_str());
+
+        let records = compiler_read_records(&copy);
+        let raw = compiler_read_bytes(&records);
+        fs::write(&census_path, &raw).expect("compiler census fixture");
+        let diagnostic = read_proof_design_compiler_read_census(&census_path, &copy, Some(0))
+            .expect("matching compiler read");
+        assert_eq!(diagnostic["status"], "matched");
+        assert_eq!(diagnostic["complete_record"], true);
+        assert_eq!(diagnostic["sha256"], copy.sha256);
+
+        let failed_compile = parse_proof_design_compiler_read_census(
+            &compiler_read_bytes(&records[..2]),
+            &copy,
+            Some(1),
+        )
+        .expect("failed verifier can still disclose the loaded primary source");
+        assert_eq!(failed_compile["complete_record"], false);
+    }
+
+    fn with_schema(records: &[Value], schemas: [&str; 3]) -> Vec<u8> {
+        let mut records = records.to_vec();
+        for (record, schema) in records.iter_mut().zip(schemas) {
+            record["schema"] = json!(schema);
+        }
+        let mut snapshot_bytes = serde_json::to_vec(&records[1]).expect("snapshot JSON");
+        snapshot_bytes.push(b'\n');
+        records[2]["snapshot_sha256"] =
+            json!(trust_types::digest::stable_sha256_hex(&snapshot_bytes));
+        compiler_read_bytes(&records)
+    }
+
+    #[test]
+    fn proof_design_compiler_census_accepts_v2_but_not_a_mixed_or_unknown_schema() {
+        let dir = tempfile::tempdir().expect("source copy directory");
+        let copy = compiler_read_copy(dir.path());
+        let records = compiler_read_records(&copy);
+        let v1 = HIR_BODY_CENSUS_SCHEMA;
+        let v2 = HIR_BODY_CENSUS_SCHEMA_V2;
+        let accepted = parse_proof_design_compiler_read_census(
+            &with_schema(&records, [v2, v2, v2]),
+            &copy,
+            Some(0),
+        )
+        .expect("a v2 census is one schema");
+        assert_eq!(accepted["status"], "matched");
+        for schemas in
+            [[v1, v2, v2], [v2, v2, v1], [v1, v1, v2], ["trust.rust.hir-body-census.v3"; 3]]
+        {
+            let refused = parse_proof_design_compiler_read_census(
+                &with_schema(&records, schemas),
+                &copy,
+                Some(0),
+            );
+            assert!(refused.is_err(), "{schemas:?} must refuse");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn proof_design_compiler_census_is_fresh_across_report_reruns() {
+        let dir = tempfile::tempdir().expect("report directory");
+        let prior_dir = dir.path().join("prior-copy");
+        let current_dir = dir.path().join("current-copy");
+        fs::create_dir(&prior_dir).expect("prior copy directory");
+        fs::create_dir(&current_dir).expect("current copy directory");
+        let prior_copy = compiler_read_copy(&prior_dir);
+        let current_copy = compiler_read_copy(&current_dir);
+        let output = dir.path().join("artifacts/sample.o");
+        let prior_census = proof_design_census_path(&output, &prior_copy.path);
+        let current_census = proof_design_census_path(&output, &current_copy.path);
+        let warmup_census = proof_design_census_path(
+            &dir.path().join("artifacts/sample.warmup.o"),
+            &current_copy.path,
+        );
+        assert_ne!(prior_census, current_census);
+        assert_ne!(warmup_census, current_census);
+        assert_eq!(current_census.parent(), current_copy.path.parent());
+        fs::write(&prior_census, compiler_read_bytes(&compiler_read_records(&prior_copy)))
+            .expect("retained census from prior run");
+
+        let mut program = pair_program("proof", "good");
+        program.source_copy = Some(current_copy);
+        let binding = SlotBinding {
+            id: "trust-verify".to_string(),
+            profile: slot_profile("trust-verify").expect("verifier slot"),
+            binary: Some("/usr/bin/true".to_string()),
+            source: "fixture".to_string(),
+        };
+        let command = build_command(&binding, &program, &output, false, None, BuildProfile::Debug)
+            .expect("verifier command");
+        assert!(command.contains(&format!("trust-body-census={}", current_census.display())));
+        let run = || {
+            execute_command(CommandExecutionInput {
+                command: &command,
+                program: &program,
+                cwd: dir.path(),
+                env_map: &BTreeMap::new(),
+                timeout_seconds: 5,
+                stdout_path: &dir.path().join("stdout.log"),
+                stderr_path: &dir.path().join("stderr.log"),
+                output_path: &output,
+                slot_mode: "verify",
+            })
+            .expect("benchmark observation")
+        };
+        let missing = run();
+        assert_eq!(missing.source_input_check["status"], "blocked_compiler_read");
+        assert_eq!(missing.source_input_check["compiler_invoked"], true);
+
+        fs::write(&current_census, b"preexisting census\n").expect("occupy current path");
+        let occupied = run();
+        assert_eq!(occupied.source_input_check["status"], "blocked_pre_read");
+        assert_eq!(occupied.source_input_check["compiler_invoked"], false);
+        assert!(
+            occupied.source_input_check["reason"]
+                .as_str()
+                .expect("pre-read reason")
+                .contains("compiler census path already exists")
+        );
+    }
+
+    #[test]
+    fn proof_design_failed_rerun_does_not_leave_stale_report() {
+        let dir = tempfile::tempdir().expect("benchmark directory");
+        let report_dir = dir.path().join("reused-report");
+        fs::create_dir(&report_dir).expect("report directory");
+        let report_path = report_dir.join("report.json");
+        fs::write(&report_path, b"{\"status\":\"passed\"}\n").expect("prior report");
+
+        let mut args = proof_design_test_args(&[PROOF_FUNCTIONAL_SLOT_ID]);
+        args.repo_root = dir.path().to_path_buf();
+        args.index = dir.path().join("missing-index.json");
+        args.report_dir = Some(report_dir);
+        args.run_id = "reused".to_string();
+        let error = run_program_index(args).expect_err("missing index must fail the rerun");
+
+        assert!(error.0.contains("missing-index.json"), "{error}");
+        assert!(!report_path.exists(), "prior report must not survive a failed rerun");
+    }
+
+    #[test]
+    fn program_index_list_does_not_invalidate_prior_report() {
+        let dir = tempfile::tempdir().expect("benchmark directory");
+        fs::write(dir.path().join("source.rs"), "fn main() {}\n").expect("source");
+        let index_path = dir.path().join("index.json");
+        let index = json!({
+            "schema": INDEX_SCHEMA,
+            "programs": [
+                {"id": "pair.good", "pair_id": "pair", "variant": "good", "suite": PROOF_DESIGN_SUITE, "path": "source.rs", "obligations": ["safety"]},
+                {"id": "pair.flawed", "pair_id": "pair", "variant": "flawed", "suite": PROOF_DESIGN_SUITE, "path": "source.rs", "obligations": ["safety"]},
+            ],
+        });
+        fs::write(&index_path, serde_json::to_vec(&index).expect("index JSON")).expect("index");
+        let report_dir = dir.path().join("reused-report");
+        fs::create_dir(&report_dir).expect("report directory");
+        let report_path = report_dir.join("report.json");
+        let prior_report = b"{\"run_id\":\"prior\"}\n";
+        fs::write(&report_path, prior_report).expect("prior report");
+
+        let mut args = proof_design_test_args(&[]);
+        args.repo_root = dir.path().to_path_buf();
+        args.index = index_path;
+        args.report_dir = Some(report_dir);
+        args.list = true;
+        let (status, published) = run_program_index(args).expect("list selected programs");
+
+        assert_eq!(status, 0);
+        assert!(published.is_none());
+        assert_eq!(fs::read(report_path).expect("prior report"), prior_report);
+    }
+
+    #[test]
+    fn proof_design_compiler_read_rejects_tampered_primary_hash_or_footer() {
+        let dir = tempfile::tempdir().expect("source copy directory");
+        let copy = compiler_read_copy(dir.path());
+        let mut records = compiler_read_records(&copy);
+        records[1]["sources"][0]["sha256"] = json!("0".repeat(64));
+        assert!(
+            parse_proof_design_compiler_read_census(&compiler_read_bytes(&records), &copy, Some(0))
+                .expect_err("altered loaded bytes must be rejected")
+                .0
+                .contains("differs from HEAD copy")
+        );
+
+        let mut records = compiler_read_records(&copy);
+        records[2]["snapshot_sha256"] = json!("0".repeat(64));
+        assert!(
+            parse_proof_design_compiler_read_census(&compiler_read_bytes(&records), &copy, Some(0))
+                .expect_err("altered snapshot binding must be rejected")
+                .0
+                .contains("footer does not bind")
+        );
+
+        let mut records = compiler_read_records(&copy);
+        let other_path = dir.path().join("same-bytes-other-path.rs");
+        fs::write(&other_path, fs::read(&copy.path).unwrap()).expect("same-byte source");
+        records[1]["sources"][0]["file"] = json!(other_path);
+        assert!(
+            parse_proof_design_compiler_read_census(&compiler_read_bytes(&records), &copy, Some(0))
+                .expect_err("same bytes under a different path must be rejected")
+                .0
+                .contains("omitted the HEAD-derived primary source path")
+        );
+    }
+
+    #[test]
+    fn proof_design_compiler_read_rejects_duplicate_json_keys() {
+        let dir = tempfile::tempdir().expect("source copy directory");
+        let copy = compiler_read_copy(dir.path());
+        let valid = String::from_utf8(compiler_read_bytes(&compiler_read_records(&copy)))
+            .expect("compiler census fixture is UTF-8");
+        let duplicate_top =
+            valid.replacen("\"event\":\"begin\"", "\"event\":\"begin\",\"event\":\"begin\"", 1);
+        assert_ne!(duplicate_top, valid);
+        assert!(
+            parse_proof_design_compiler_read_census(duplicate_top.as_bytes(), &copy, Some(0))
+                .expect_err("duplicate top-level key must be rejected")
+                .0
+                .contains("duplicate JSON object key `event`")
+        );
+
+        let file_field = format!("\"file\":{}", serde_json::to_string(&copy.path).unwrap());
+        let duplicate_source =
+            valid.replacen(&file_field, &format!("{file_field},{file_field}"), 1);
+        assert_ne!(duplicate_source, valid);
+        assert!(
+            parse_proof_design_compiler_read_census(duplicate_source.as_bytes(), &copy, Some(0))
+                .expect_err("duplicate loaded-source key must be rejected")
+                .0
+                .contains("duplicate JSON object key `file`")
+        );
+    }
+
+    #[test]
+    fn proof_design_compiler_read_rejects_missing_and_duplicate_sources_or_records() {
+        let dir = tempfile::tempdir().expect("source copy directory");
+        let copy = compiler_read_copy(dir.path());
+        let records = compiler_read_records(&copy);
+        assert!(
+            parse_proof_design_compiler_read_census(
+                &compiler_read_bytes(&records[..1]),
+                &copy,
+                Some(1)
+            )
+            .expect_err("missing snapshot must be rejected")
+            .0
+            .contains("missing or duplicate record")
+        );
+        assert!(
+            parse_proof_design_compiler_read_census(
+                &compiler_read_bytes(&records[..2]),
+                &copy,
+                Some(0)
+            )
+            .expect_err("successful invocation needs completion")
+            .0
+            .contains("omitted the census complete footer")
+        );
+        let mut missing = compiler_read_records(&copy);
+        missing[1]["sources"] = json!([]);
+        assert!(
+            parse_proof_design_compiler_read_census(&compiler_read_bytes(&missing), &copy, Some(1))
+                .expect_err("missing primary source must be rejected")
+                .0
+                .contains("omitted")
+        );
+        let mut duplicate = compiler_read_records(&copy);
+        let repeated_source = duplicate[1]["sources"][0].clone();
+        duplicate[1]["sources"].as_array_mut().unwrap().push(repeated_source);
+        assert!(
+            parse_proof_design_compiler_read_census(
+                &compiler_read_bytes(&duplicate),
+                &copy,
+                Some(1)
+            )
+            .expect_err("duplicate primary source must be rejected")
+            .0
+            .contains("duplicate loaded-source path")
+        );
+        let mut duplicate_record = compiler_read_records(&copy);
+        duplicate_record.push(duplicate_record[2].clone());
+        assert!(
+            parse_proof_design_compiler_read_census(
+                &compiler_read_bytes(&duplicate_record),
+                &copy,
+                Some(0)
+            )
+            .expect_err("duplicate completion must be rejected")
+            .0
+            .contains("missing or duplicate record")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn proof_design_compiler_read_rejects_loaded_source_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("source copy directory");
+        let copy = compiler_read_copy(dir.path());
+        let lexical_alias = PathBuf::from(format!("{}/./source.rs", dir.path().display()));
+        let symlink_alias = dir.path().join("symlink.rs");
+        symlink(&copy.path, &symlink_alias).expect("symlink alias");
+        let hard_link_alias = dir.path().join("hard-link.rs");
+        fs::hard_link(&copy.path, &hard_link_alias).expect("hard-link alias");
+
+        for alias in [lexical_alias, symlink_alias, hard_link_alias] {
+            assert_ne!(alias.to_str(), copy.path.to_str());
+            let mut records = compiler_read_records(&copy);
+            let alias_source = json!({"file": alias, "sha256": copy.sha256});
+            records[1]["sources"].as_array_mut().unwrap().push(alias_source.clone());
+            records[2]["sources"].as_array_mut().unwrap().push(alias_source);
+            let mut snapshot_bytes = serde_json::to_vec(&records[1]).unwrap();
+            snapshot_bytes.push(b'\n');
+            records[2]["snapshot_sha256"] =
+                json!(trust_types::digest::stable_sha256_hex(&snapshot_bytes));
+
+            let error = parse_proof_design_compiler_read_census(
+                &compiler_read_bytes(&records),
+                &copy,
+                Some(0),
+            )
+            .expect_err("alias of the HEAD source must not be a second loaded source");
+            assert!(error.0.contains("duplicate loaded-source identity"), "{error}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn proof_design_verifier_missing_compiler_census_blocks_observation() {
+        let dir = tempfile::tempdir().expect("source copy directory");
+        let copy = compiler_read_copy(dir.path());
+        let mut program = pair_program("proof", "good");
+        program.source_copy = Some(copy);
+        let binding = SlotBinding {
+            id: "trust-verify".to_string(),
+            profile: slot_profile("trust-verify").expect("verifier slot"),
+            binary: Some("/usr/bin/true".to_string()),
+            source: "fixture".to_string(),
+        };
+        let output = dir.path().join("sample.o");
+        let command = build_command(&binding, &program, &output, false, None, BuildProfile::Debug)
+            .expect("verifier command");
+        let result = execute_command(CommandExecutionInput {
+            command: &command,
+            program: &program,
+            cwd: dir.path(),
+            env_map: &BTreeMap::new(),
+            timeout_seconds: 5,
+            stdout_path: &dir.path().join("stdout.log"),
+            stderr_path: &dir.path().join("stderr.log"),
+            output_path: &output,
+            slot_mode: "verify",
+        })
+        .expect("benchmark observation");
+        assert_eq!(result.status, "source_input_blocked");
+        assert_eq!(result.source_input_check["status"], "blocked_compiler_read");
+        assert!(
+            result.source_input_check["reason"].as_str().unwrap().contains("open compiler census")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn proof_design_source_copy_rejects_same_byte_path_replacement() {
+        let dir = tempfile::tempdir().expect("source copy directory");
+        let path = dir.path().join("source.rs");
+        let source = b"fn main() {}\n";
+        fs::write(&path, source).expect("source copy");
+        let mut permissions = fs::metadata(&path).expect("source metadata").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).expect("protect source copy");
+        let copy = ProofDesignSourceCopy {
+            path: path.clone(),
+            head: "fixture".to_string(),
+            sha256: trust_types::digest::stable_sha256_hex(source),
+            identity: source_copy_identity(&fs::metadata(&path).expect("source metadata")),
+        };
+        verify_proof_design_source_copy(&copy).expect("original copy");
+
+        let replacement = dir.path().join("replacement.rs");
+        fs::write(&replacement, source).expect("replacement copy");
+        let mut permissions =
+            fs::metadata(&replacement).expect("replacement metadata").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&replacement, permissions).expect("protect replacement");
+        fs::rename(&replacement, &path).expect("replace path with identical bytes");
+        assert!(
+            verify_proof_design_source_copy(&copy)
+                .expect_err("same bytes under a different inode must be rejected")
+                .0
+                .contains("identity or protection changed")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn proof_design_runtime_build_rejects_stale_executable_and_alias() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = tempfile::tempdir().expect("runtime parity directory");
+        let mut program = pair_program("proof", "good");
+        program.source_copy = Some(compiler_read_copy(dir.path()));
+        let binding = SlotBinding {
+            id: "upstream-rustc".to_string(),
+            profile: slot_profile("upstream-rustc").expect("compile slot"),
+            binary: Some(which("true").expect("no-output compiler")),
+            source: "fixture".to_string(),
+        };
+
+        for alias in [false, true] {
+            let report_dir = dir.path().join(if alias { "alias" } else { "regular" });
+            let artifacts_dir = report_dir.join("runtime/artifacts").join(&binding.id);
+            fs::create_dir_all(&artifacts_dir).expect("runtime artifacts directory");
+            let executable = artifacts_dir.join(runtime_executable_name(&program));
+            let stale = dir.path().join(if alias { "old-alias" } else { "old-regular" });
+            fs::write(&stale, b"#!/bin/sh\nprintf stale-output\n").expect("old executable");
+            fs::set_permissions(&stale, fs::Permissions::from_mode(0o755))
+                .expect("make old executable runnable");
+            if alias {
+                symlink(&stale, &executable).expect("alias old executable");
+            } else {
+                fs::hard_link(&stale, &executable).expect("reuse old executable");
+            }
+
+            let row = run_runtime_slot(
+                &binding,
+                &program,
+                dir.path(),
+                &report_dir,
+                5,
+                BuildProfile::Debug,
+            )
+            .expect("runtime parity row");
+            assert_eq!(row["build_exit_code"], 0);
+            assert_eq!(row["build_status"], "missing_output");
+            assert_eq!(row["executable_exists"], false);
+            assert_eq!(row["run_status"], "not_run");
+            assert!(!executable.exists());
+            assert!(stale.exists(), "only the output alias should be removed");
+        }
+    }
+
+    /// The slot timeout these runtime-parity tests pass: a hang detector, never a
+    /// latency budget. With 5 s, a loaded host (load 40-60) timed the fake
+    /// compiler out and the row read `timeout` instead of the status under test.
+    const RUNTIME_SLOT_HANG_GUARD_S: u64 = 60;
+
+    #[test]
+    #[cfg(unix)]
+    fn proof_design_runtime_rejects_output_planted_after_build_starts() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = tempfile::tempdir().expect("runtime parity directory");
+        for kind in ["regular", "symlink", "hardlink"] {
+            let case_dir = dir.path().join(kind);
+            fs::create_dir(&case_dir).expect("case directory");
+            let compiler = case_dir.join("compiler.sh");
+            fs::write(
+                &compiler,
+                b"#!/bin/sh\ndir=$(dirname \"$0\")\n: > \"$dir/ready\"\nwhile [ ! -f \"$dir/release\" ]; do sleep 0.02; done\n",
+            )
+            .expect("fake compiler");
+            fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755))
+                .expect("make fake compiler executable");
+            let mut program = pair_program("proof", "good");
+            program.source_copy = Some(compiler_read_copy(&case_dir));
+            let binding = SlotBinding {
+                id: "upstream-rustc".to_string(),
+                profile: slot_profile("upstream-rustc").expect("compile slot"),
+                binary: Some(compiler.to_string_lossy().into_owned()),
+                source: "fixture".to_string(),
+            };
+            let report_dir = case_dir.join("report");
+            let output = report_dir
+                .join("runtime/artifacts/upstream-rustc")
+                .join(runtime_executable_name(&program));
+            let injected = case_dir.join("injected");
+            fs::write(&injected, b"#!/bin/sh\nprintf injected\n").expect("injected executable");
+            fs::set_permissions(&injected, fs::Permissions::from_mode(0o755))
+                .expect("make injected executable");
+            let ready = case_dir.join("ready");
+            let release = case_dir.join("release");
+            let writer = thread::spawn(move || {
+                // A hang detector, not a latency budget: a loaded host can take
+                // seconds to fork the fake compiler.
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !ready.exists() {
+                    assert!(Instant::now() < deadline, "fake compiler did not start");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                match kind {
+                    "regular" => fs::copy(&injected, &output).map(|_| ()),
+                    "symlink" => symlink(&injected, &output),
+                    "hardlink" => fs::hard_link(&injected, &output),
+                    _ => unreachable!(),
+                }
+                .expect("plant output after unlink");
+                fs::write(release, b"done").expect("release fake compiler");
+            });
+            let row = run_runtime_slot(
+                &binding,
+                &program,
+                dir.path(),
+                &report_dir,
+                RUNTIME_SLOT_HANG_GUARD_S,
+                BuildProfile::Debug,
+            )
+            .expect("runtime parity row");
+            writer.join().expect("output writer");
+            assert_eq!(row["build_exit_code"], 0, "{kind}");
+            assert_eq!(row["build_status"], "output_source_unsealed", "{kind}");
+            assert_eq!(row["output_source_check"]["status"], "unsealed", "{kind}");
+            assert!(row["executable_sha256"].is_null(), "{kind}");
+            assert_eq!(row["run_status"], "not_run", "{kind}");
+            let mut rows = vec![row];
+            apply_runtime_parity_classification(&mut rows, RUNTIME_BASELINE_SLOT);
+            assert_eq!(rows[0]["runtime_classification"], "runtime-not-applicable", "{kind}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn proof_design_runtime_rejects_compiler_created_path_without_writer_attestation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("runtime parity directory");
+        let compiler = dir.path().join("compiler.sh");
+        fs::write(
+            &compiler,
+            br#"#!/bin/sh
+out=
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-o" ]; then shift; out="$1"; fi
+    shift
+done
+printf '#!/bin/sh\nprintf compiler-output\n' > "$out"
+chmod 755 "$out"
+"#,
+        )
+        .expect("fake compiler");
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755))
+            .expect("make fake compiler executable");
+        let binding = SlotBinding {
+            id: "upstream-rustc".to_string(),
+            profile: slot_profile("upstream-rustc").expect("compile slot"),
+            binary: Some(compiler.to_string_lossy().into_owned()),
+            source: "fixture".to_string(),
+        };
+        let mut proof_program = pair_program("proof", "good");
+        proof_program.source_copy = Some(compiler_read_copy(dir.path()));
+        let proof_row = run_runtime_slot(
+            &binding,
+            &proof_program,
+            dir.path(),
+            &dir.path().join("proof-report"),
+            RUNTIME_SLOT_HANG_GUARD_S,
+            BuildProfile::Debug,
+        )
+        .expect("proof-design runtime row");
+        assert_eq!(proof_row["build_status"], "output_source_unsealed");
+        assert_eq!(proof_row["run_status"], "not_run");
+
+        let mut non_proof_program = proof_program;
+        non_proof_program.suite = "other".to_string();
+        let non_proof_row = run_runtime_slot(
+            &binding,
+            &non_proof_program,
+            dir.path(),
+            &dir.path().join("other-report"),
+            RUNTIME_SLOT_HANG_GUARD_S,
+            BuildProfile::Debug,
+        )
+        .expect("non-proof runtime row");
+        assert_eq!(non_proof_row["build_status"], "compile_pass");
+        assert_eq!(non_proof_row["run_status"], "run_complete");
+    }
+
+    fn pair_program(id: &str, variant: &str) -> Program {
+        Program {
+            id: id.to_string(),
+            pair_id: "proof_pair".to_string(),
+            variant: variant.to_string(),
+            path: PathBuf::new(),
+            relative_path: String::new(),
+            source_sha256: String::new(),
+            obligations: Vec::new(),
+            suite: PROOF_DESIGN_SUITE.to_string(),
+            metadata: json!({}),
+            source_copy: None,
+            source_copy_blocker: None,
+            source_unavailable: None,
+        }
+    }
+
+    #[test]
+    fn program_index_pair_requires_one_good_and_one_flawed_row() {
+        let programs =
+            [pair_program("proof_pair.good", "good"), pair_program("proof_pair.flawed", "flawed")];
+        assert!(validate_pairs(&programs).is_ok());
+    }
+
+    #[test]
+    fn program_index_pair_rejects_extra_duplicate_or_variant_rows() {
+        for extra_variant in ["good", "flawed", "other"] {
+            let programs = [
+                pair_program("proof_pair.good", "good"),
+                pair_program("proof_pair.flawed", "flawed"),
+                pair_program("proof_pair.extra", extra_variant),
+            ];
+            let error = validate_pairs(&programs).expect_err("extra pair row must be rejected");
+            assert!(error.0.contains("exactly one good and one flawed row: proof_pair"), "{error}");
+        }
+    }
+
+    fn proof_design_corpus_fixture() -> (Vec<Program>, Value) {
+        let programs = ["proof_a", "proof_b", "proof_c"]
+            .into_iter()
+            .flat_map(|pair_id| {
+                ["good", "flawed"].into_iter().map(move |variant| {
+                    let mut program = pair_program(&format!("{pair_id}.{variant}"), variant);
+                    program.pair_id = pair_id.to_string();
+                    program.relative_path = format!("cases/{pair_id}_{variant}.rs");
+                    program.source_sha256 = format!("source-{pair_id}-{variant}");
+                    program.obligations = vec![format!("obligation-{pair_id}")];
+                    program
+                })
+            })
+            .collect();
+        let index = json!({
+            "suite_evidence_model": {
+                "gating_suites": [PROOF_DESIGN_SUITE],
+                "candidate_suites": [PROOF_DESIGN_CANDIDATE_SUITE],
+            }
+        });
+        (programs, index)
+    }
+
+    fn proof_design_test_canonical(
+        programs: &[Program],
+    ) -> Result<CanonicalProofDesignCorpus, ProgramIndexError> {
+        Ok(CanonicalProofDesignCorpus {
+            head: "test-head".to_string(),
+            index_sha256: "test-index".to_string(),
+            programs: programs.to_vec(),
+        })
+    }
+
+    fn canonical_index_fixture() -> (PathBuf, Value, Vec<Program>, CanonicalProofDesignCorpus) {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("repository root").to_path_buf();
+        let head = canonical_repo_head(&root).expect("HEAD");
+        let canonical =
+            canonical_proof_design_corpus(&root, &head).expect("HEAD-bound proof-design corpus");
+        let index_bytes = committed_blob(&root, &canonical.head, CANONICAL_PROGRAM_INDEX_PATH)
+            .expect("HEAD index");
+        let full_index: Value = serde_json::from_slice(&index_bytes).expect("parse HEAD index");
+        let proof_rows = full_index["programs"]
+            .as_array()
+            .expect("canonical program rows")
+            .iter()
+            .filter(|row| row["suite"].as_str() == Some(PROOF_DESIGN_SUITE))
+            .cloned()
+            .collect::<Vec<_>>();
+        let index = json!({
+            "schema": INDEX_SCHEMA,
+            "programs": proof_rows,
+            "suite_evidence_model": full_index["suite_evidence_model"],
+        });
+        let temp = tempfile::tempdir().expect("proof-design index directory");
+        let path = write_external_index(&index, "canonical-proof-design.json", &temp);
+        let (_, programs) = load_index(&path, &root, None).expect("canonical proof-design index");
+        (root, index, programs, canonical)
+    }
+
+    fn write_external_index(index: &Value, name: &str, temp: &tempfile::TempDir) -> PathBuf {
+        let path = temp.path().join(name);
+        fs::write(&path, serde_json::to_vec(index).expect("serialize external index"))
+            .expect("write external index");
+        path
+    }
+
+    fn proof_design_test_args(slots: &[&str]) -> ProgramIndexArgs {
+        ProgramIndexArgs {
+            repo_root: PathBuf::new(),
+            index: PathBuf::new(),
+            run_id: String::new(),
+            report_dir: None,
+            slots: slots.iter().map(|slot| (*slot).to_string()).collect(),
+            slot_bins: Vec::new(),
+            programs: Vec::new(),
+            variant: None,
+            suite: Some(PROOF_DESIGN_SUITE.to_string()),
+            limit: Some(2),
+            timeout_seconds: 20,
+            repetitions: 1,
+            trust_cg_mode: "report".to_string(),
+            build_profile: BuildProfile::Debug,
+            compile_measurement_mode: CompileMeasurementMode::ColdArtifact,
+            runtime_parity: false,
+            require_slots: false,
+            dry_run: false,
+            list: false,
+        }
+    }
+
+    #[test]
+    fn proof_design_full_canonical_roster_is_complete_but_execution_is_unsealed() {
+        let (_root, index, all_programs, canonical) = canonical_index_fixture();
+        let selected = filter_programs(&all_programs, &[], None, Some(PROOF_DESIGN_SUITE), None)
+            .expect("full proof-design selection");
+        let evidence = program_index_evidence_summary(&selected, &index, &Ok(canonical));
+
+        assert_eq!(evidence["declared_proof_design_rows"], json!(selected.len()));
+        assert_eq!(evidence["canonical_proof_design_status"], "source_tree_matches_head");
+        assert_eq!(evidence["proof_design_corpus_complete"], true);
+        assert_eq!(evidence["source_execution_binding"], PROOF_DESIGN_SOURCE_EXECUTION_BINDING);
+        assert_eq!(evidence["status"], "blocked");
+        assert_eq!(evidence["admissible_for_domination"], false);
+        assert_eq!(evidence["selected_admissible_gating_rows"], 0);
+        assert_eq!(
+            evidence["selected_suites"][PROOF_DESIGN_SUITE]["admissible_for_domination"],
+            false
+        );
+        assert_eq!(
+            evidence["selected_suites"][PROOF_DESIGN_SUITE]["evidence_class"],
+            "blocked_gating_unsealed_source_execution"
+        );
+    }
+
+    #[test]
+    fn informational_index_cannot_admit_strict_performance_even_with_optimistic_flag() {
+        let evidence = json!({
+            "status": "informational",
+            "selected_candidate_rows": 0,
+            "selected_gating_rows": 0,
+            "selected_admissible_gating_rows": 0,
+            "admissible_for_domination": true,
+            "blocked_gating_suites": [],
+        });
+        let rejection = performance_candidate_rejection(&evidence);
+        assert_eq!(rejection["rejected"], true);
+        assert_eq!(rejection["status"], "informational");
+    }
+
+    #[test]
+    fn proof_design_external_suite_policy_cannot_change_gating_or_candidate_class() {
+        let (programs, mut index) = proof_design_corpus_fixture();
+        index["suite_evidence_model"] = json!({
+            "gating_suites": [PROOF_DESIGN_CANDIDATE_SUITE],
+            "candidate_suites": [PROOF_DESIGN_SUITE],
+        });
+        let canonical = proof_design_test_canonical(&programs);
+        let proof = program_index_evidence_summary(&programs, &index, &canonical);
+        assert_eq!(proof["model_source"], "builtin-proof-design-policy");
+        assert_eq!(proof["selected_suites"][PROOF_DESIGN_SUITE]["gating"], true);
+        assert_eq!(proof["selected_suites"][PROOF_DESIGN_SUITE]["candidate_evidence"], false);
+        assert_eq!(
+            proof["selected_suites"][PROOF_DESIGN_SUITE]["admissible_for_domination"],
+            false
+        );
+
+        let mut candidate_rows = programs[..2].to_vec();
+        for program in &mut candidate_rows {
+            program.suite = PROOF_DESIGN_CANDIDATE_SUITE.to_string();
+        }
+        let candidate = program_index_evidence_summary(&candidate_rows, &index, &canonical);
+        assert_eq!(candidate["selected_gating_rows"], 0);
+        assert_eq!(candidate["selected_candidate_rows"], 2);
+        assert_eq!(candidate["selected_suites"][PROOF_DESIGN_CANDIDATE_SUITE]["gating"], false);
+        assert_eq!(candidate["admissible_for_domination"], false);
+
+        index["suite_evidence_model"] = json!({
+            "gating_suites": PROOF_DESIGN_CANDIDATE_SUITE,
+            "candidate_suites": 7,
+        });
+        let malformed = program_index_evidence_summary(&candidate_rows, &index, &canonical);
+        assert_eq!(malformed["model_source"], "builtin-proof-design-policy");
+        assert_eq!(malformed["selected_gating_rows"], 0);
+        assert_eq!(malformed["selected_candidate_rows"], 2);
+    }
+
+    #[test]
+    fn proof_design_canonical_row_without_suite_fails_closed() {
+        let (_root, mut index, _programs, _canonical) = canonical_index_fixture();
+        for malformed in [Value::Null, json!(7), json!("")] {
+            index["programs"][0]["suite"] = malformed;
+            let error = canonical_proof_design_rows(&index).expect_err("malformed suite must fail");
+            assert!(error.0.contains("programs[0] must declare a nonempty suite"), "{error}");
+        }
+        index["programs"][0].as_object_mut().expect("canonical row").remove("suite");
+        let error = canonical_proof_design_rows(&index).expect_err("missing suite must fail");
+        assert!(error.0.contains("programs[0] must declare a nonempty suite"), "{error}");
+    }
+
+    #[test]
+    fn proof_design_head_change_during_run_fails_closed() {
+        let (_root, _index, _programs, corpus) = canonical_index_fixture();
+        let initial = Ok(corpus.head.clone());
+        let final_head = Ok("0".repeat(40));
+        let mut canonical = Ok(corpus);
+        finish_canonical_proof_design_corpus(&initial, &final_head, &mut canonical);
+        assert!(!head_observations_match(&initial, &final_head));
+        assert!(canonical.expect_err("changed HEAD must block").0.contains("HEAD changed"),);
+    }
+
+    #[test]
+    fn proof_design_equal_edge_hashes_do_not_admit_unbound_source_execution() {
+        let (_root, index, programs, corpus) = canonical_index_fixture();
+        let head = Ok(corpus.head.clone());
+        let mut canonical = Ok(corpus);
+        finish_canonical_proof_design_corpus(&head, &head, &mut canonical);
+        assert!(canonical.is_ok(), "edge observations should match");
+        let evidence = program_index_evidence_summary(&programs, &index, &canonical);
+        assert_eq!(evidence["proof_design_corpus_complete"], true);
+        assert_eq!(evidence["admissible_for_domination"], false);
+
+        let proof = proof_design_verifier_evidence(
+            &proof_design_test_args(&[PROOF_FUNCTIONAL_SLOT_ID]),
+            &[],
+            &[],
+            &evidence,
+            &json!({"status": "unchanged"}),
+            Path::new("."),
+        );
+        assert!(proof["blocked_reasons"].as_array().expect("blockers").iter().any(|reason| {
+            reason.as_str().is_some_and(|reason| {
+                reason.contains("transitive source closure remain unauthenticated")
+            })
+        }));
+    }
+
+    #[test]
+    fn proof_design_reduced_external_index_is_not_admissible() {
+        let (root, mut index, _all_programs, canonical) = canonical_index_fixture();
+        let retained_pair = canonical.programs[0].pair_id.clone();
+        index["programs"].as_array_mut().expect("program rows").retain(|row| {
+            row["suite"].as_str() != Some(PROOF_DESIGN_SUITE)
+                || row["pair_id"].as_str() == Some(retained_pair.as_str())
+        });
+        let temp = tempfile::tempdir().expect("external index directory");
+        let external = write_external_index(&index, "reduced.json", &temp);
+        let (external_index, external_programs) =
+            load_index(&external, &root, None).expect("reduced external index remains usable");
+        let selected =
+            filter_programs(&external_programs, &[], None, Some(PROOF_DESIGN_SUITE), None)
+                .expect("selected reduced proof-design pair");
+        let evidence = program_index_evidence_summary(&selected, &external_index, &Ok(canonical));
+
+        assert_eq!(selected.len(), 2);
+        assert!(evidence["declared_proof_design_rows"].as_u64().unwrap() > 2);
+        assert_eq!(evidence["proof_design_corpus_complete"], false);
+        assert_eq!(evidence["status"], "blocked");
+        assert_eq!(evidence["admissible_for_domination"], false);
+
+        let toolchain_integrity = json!({ "status": "unchanged" });
+        let proof = proof_design_verifier_evidence(
+            &proof_design_test_args(&[PROOF_FUNCTIONAL_SLOT_ID]),
+            &[],
+            &[],
+            &evidence,
+            &toolchain_integrity,
+            Path::new("."),
+        );
+        assert_eq!(proof["status"], "blocked");
+        let informational = proof_design_verifier_evidence(
+            &proof_design_test_args(&["upstream-rustc"]),
+            &[],
+            &[],
+            &evidence,
+            &toolchain_integrity,
+            Path::new("."),
+        );
+        assert_eq!(informational["status"], "not_claimed");
+    }
+
+    #[test]
+    fn proof_design_same_count_external_identity_tamper_is_not_admissible() {
+        let (root, mut index, _all_programs, canonical) = canonical_index_fixture();
+        let replacement_path = canonical.programs[1].relative_path.clone();
+        let tampered = index["programs"]
+            .as_array_mut()
+            .expect("program rows")
+            .iter_mut()
+            .find(|row| row["id"].as_str() == Some(canonical.programs[0].id.as_str()))
+            .expect("proof-design row");
+        tampered["path"] = json!(replacement_path);
+        let temp = tempfile::tempdir().expect("external index directory");
+        let external = write_external_index(&index, "tampered.json", &temp);
+        let (external_index, external_programs) =
+            load_index(&external, &root, None).expect("same-count external index remains usable");
+        let selected =
+            filter_programs(&external_programs, &[], None, Some(PROOF_DESIGN_SUITE), None)
+                .expect("selected tampered proof-design corpus");
+        let evidence = program_index_evidence_summary(&selected, &external_index, &Ok(canonical));
+
+        assert_eq!(evidence["selected_gating_rows"], evidence["declared_proof_design_rows"]);
+        assert_eq!(evidence["proof_design_corpus_complete"], false);
+        assert_eq!(evidence["status"], "blocked");
+        assert_eq!(evidence["admissible_for_domination"], false);
+    }
+
+    #[test]
+    fn proof_design_unavailable_canonical_binding_fails_closed() {
+        let (all_programs, index) = proof_design_corpus_fixture();
+        let canonical = Err(ProgramIndexError::new("source differs from HEAD"));
+        let evidence = program_index_evidence_summary(&all_programs, &index, &canonical);
+
+        assert_eq!(evidence["canonical_proof_design_status"], "blocked");
+        assert_eq!(evidence["proof_design_corpus_complete"], false);
+        assert_eq!(evidence["admissible_for_domination"], false);
+    }
+
+    #[test]
+    fn proof_design_partial_filters_are_not_admissible() {
+        let (all_programs, index) = proof_design_corpus_fixture();
+        let canonical = proof_design_test_canonical(&all_programs);
+        let selections = [
+            ("limit", filter_programs(&all_programs, &[], None, Some(PROOF_DESIGN_SUITE), Some(2))),
+            (
+                "program",
+                filter_programs(
+                    &all_programs,
+                    &["proof_a".to_string()],
+                    None,
+                    Some(PROOF_DESIGN_SUITE),
+                    None,
+                ),
+            ),
+            (
+                "variant",
+                filter_programs(&all_programs, &[], Some("good"), Some(PROOF_DESIGN_SUITE), None),
+            ),
+        ];
+
+        for (filter, selected) in selections {
+            let selected = selected.expect("partial proof-design selection");
+            let evidence = program_index_evidence_summary(&selected, &index, &canonical);
+            assert_eq!(evidence["proof_design_corpus_complete"], false, "{filter}");
+            assert_eq!(evidence["status"], "blocked", "{filter}");
+            assert_eq!(evidence["admissible_for_domination"], false, "{filter}");
+            assert_eq!(evidence["selected_admissible_gating_rows"], 0, "{filter}");
+            assert_eq!(
+                evidence["selected_suites"][PROOF_DESIGN_SUITE]["evidence_class"],
+                "blocked_gating_incomplete_corpus",
+                "{filter}"
+            );
+            assert_eq!(
+                evidence["selected_suites"][PROOF_DESIGN_SUITE]["admissible_for_domination"], false,
+                "{filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn proof_design_same_count_with_changed_source_identity_is_not_admissible() {
+        let (all_programs, index) = proof_design_corpus_fixture();
+        let canonical = proof_design_test_canonical(&all_programs);
+        let mut selected = all_programs.clone();
+        selected[0].source_sha256 = "different-source".to_string();
+        let evidence = program_index_evidence_summary(&selected, &index, &canonical);
+
+        assert_eq!(evidence["selected_gating_rows"], json!(all_programs.len()));
+        assert_eq!(evidence["proof_design_corpus_complete"], false);
+        assert_eq!(evidence["admissible_for_domination"], false);
+    }
+
+    #[test]
+    fn proof_design_flawed_row_requires_every_obligation_to_have_a_verdict() {
+        let complete = json!({
+            "program_id": "proof_pair.flawed",
+            "variant": "flawed",
+            "expected": "verify_fail",
+            "observed": "verify_fail",
+            "outcome": "passed",
+            "classification": "as-expected",
+            "unsupported_frontend_lowering_gate_status": "native_evidence_complete",
+            "obligations": ["arithmetic", "assertion"],
+            "transport": {
+                "function_results": 1,
+                "total": 2,
+                "obligation_results": 2,
+                "typed_transport_results": 2,
+                "native_trust_ir_results": 2,
+                "publishable_native_proof_results": 1,
+                "proved": 1,
+                "proved_results": 1,
+                "failed": 1,
+                "failed_results": 1
+            }
+        });
+        let complete_evidence = proof_design_row_verifier_evidence(&complete, Path::new("."));
+        assert_eq!(complete_evidence["accepted"], true, "{complete_evidence:#}");
+
+        let mut omitted = complete;
+        omitted["transport"]["proved"] = json!(0);
+        omitted["transport"]["proved_results"] = json!(0);
+        omitted["transport"]["publishable_native_proof_results"] = json!(0);
+        let omitted_evidence = proof_design_row_verifier_evidence(&omitted, Path::new("."));
+        assert_eq!(omitted_evidence["accepted"], false);
+        assert!(omitted_evidence["blockers"].as_array().expect("blockers").iter().any(|reason| {
+            reason.as_str().is_some_and(|reason| {
+                reason.contains("transport verdicts must exactly partition total=2")
+            })
+        }));
+    }
+
+    #[test]
+    fn proof_design_partial_selection_blocks_proof_but_allows_informational_run() {
+        let (all_programs, index) = proof_design_corpus_fixture();
+        let canonical = proof_design_test_canonical(&all_programs);
+        let selected = filter_programs(&all_programs, &[], None, Some(PROOF_DESIGN_SUITE), Some(2))
+            .expect("partial proof-design selection");
+        let evidence = program_index_evidence_summary(&selected, &index, &canonical);
+        let toolchain_integrity = json!({ "status": "unchanged" });
+
+        let proof = proof_design_verifier_evidence(
+            &proof_design_test_args(&[PROOF_FUNCTIONAL_SLOT_ID]),
+            &[],
+            &[],
+            &evidence,
+            &toolchain_integrity,
+            Path::new("."),
+        );
+        assert_eq!(proof["status"], "blocked");
+        assert_eq!(proof["admissible_for_domination"], false);
+        assert!(proof["blocked_reasons"].as_array().expect("blocked reasons").iter().any(
+            |reason| reason.as_str().is_some_and(|reason| {
+                reason.contains("proof-design selection must cover all 6 canonical gating rows")
+            })
+        ));
+
+        let informational = proof_design_verifier_evidence(
+            &proof_design_test_args(&["upstream-rustc"]),
+            &[],
+            &[],
+            &evidence,
+            &toolchain_integrity,
+            Path::new("."),
+        );
+        assert_eq!(informational["status"], "not_claimed");
+        assert_eq!(informational["required"], false);
+        assert_eq!(informational["admissible_for_domination"], false);
+    }
+
     struct SerializationFailure;
 
     impl Serialize for SerializationFailure {
@@ -8078,6 +10448,59 @@ mod compiler_environment_tests {
         assert_eq!(snapshot["artifact_count"], 0);
         assert_eq!(snapshot["errors"].as_array().map(Vec::len), Some(1));
         assert!(snapshot["errors"][0].as_str().unwrap().contains("root is a symlink"));
+    }
+
+    /// Spotlight is kept out of `build/` by `mv build build.noindex && ln -s
+    /// build.noindex build` (docs/BUILD_AND_INSTALL.md). A slot binary spelled
+    /// through the link, or by its physical `build.noindex/...` path, is the SAME
+    /// repo stage2 tree: it must yield exactly one root, spelled `build/...`, so
+    /// the snapshot and the upstream-baseline blocker see it either way.
+    #[cfg(unix)]
+    #[test]
+    fn stage2_roots_see_through_the_build_noindex_link() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("stage2 build.noindex fixture");
+        let repo = temp.path().canonicalize().expect("canonical fixture root");
+        let bin = repo.join("build.noindex/host/stage2/bin");
+        fs::create_dir_all(&bin).expect("create physical stage2 bin");
+        fs::write(bin.join("trustc"), b"tool binary").expect("write stage2 trustc");
+        symlink("build.noindex", repo.join("build")).expect("create build link");
+        let expected = vec![repo.join("build/host/stage2")];
+
+        let lexical = repo.join("build/host/stage2/bin/trustc");
+        let physical = repo.join("build.noindex/host/stage2/bin/trustc");
+        for binary in [&lexical, &physical] {
+            let binary = binary.to_str().expect("UTF-8 fixture path");
+            assert_eq!(stage2_roots_for_binary(binary, &repo), expected, "{binary}");
+        }
+        // A relative spelling resolves against the repo root the same way.
+        assert_eq!(
+            stage2_roots_for_binary("build.noindex/host/stage2/bin/trustc", &repo),
+            expected
+        );
+
+        let bindings = [lexical, physical].map(|binary| SlotBinding {
+            id: "trust-verify".to_string(),
+            profile: slot_profile("trust-verify").expect("verifier slot"),
+            binary: Some(binary.to_string_lossy().into_owned()),
+            source: "fixture".to_string(),
+        });
+        assert_eq!(stage2_roots_for_bindings(&bindings, &repo), expected);
+
+        let snapshot = capture_stage2_snapshot(&repo, &expected).expect("snapshot through link");
+        assert_eq!(snapshot["roots"], json!(["build/host/stage2"]));
+        assert_eq!(snapshot["errors"], json!([]));
+        assert_eq!(snapshot["artifact_count"], 1, "{snapshot}");
+        assert_eq!(snapshot["artifacts"][0]["path"], "build/host/stage2/bin/trustc");
+
+        // A stage2 tree OUTSIDE the checkout is still not a repo root.
+        let outside = tempfile::tempdir().expect("outside fixture");
+        let foreign = outside.path().join("host/stage2/bin");
+        fs::create_dir_all(&foreign).expect("create foreign stage2");
+        fs::write(foreign.join("trustc"), b"foreign").expect("write foreign trustc");
+        let foreign = foreign.join("trustc");
+        assert!(stage2_roots_for_binary(foreign.to_str().unwrap(), &repo).is_empty());
     }
 
     #[test]
@@ -8264,6 +10687,68 @@ mod compiler_environment_tests {
             assert_eq!(row["unsupported_frontend_lowering_gate_status"], "missing_native_evidence");
             assert_eq!(row["outcome"], "failed");
         }
+    }
+
+    /// Trust (TRANSPORT-LINE-BUDGET-1, review F3): a function report the compiler fitted
+    /// under the transport line budget is counted, by step; one whose disclosure does not
+    /// reconcile with its rows counts as ONE unknown row and none of its own.
+    #[test]
+    fn transport_budget_disclosures_are_counted_and_a_defective_one_admits_no_row() {
+        let function = |disclosure: Value| {
+            let mut message = json!({
+                "type": "function_result",
+                "function": "fixture::f",
+                "crate_name": "fixture",
+                "results": [
+                    {"kind": "overflow:add", "description": "a + b", "outcome": "proved",
+                     "solver": "fixture", "time_ms": 0},
+                    {"kind": "divzero", "description": "a / b", "outcome": "proved",
+                     "solver": "fixture", "time_ms": 0},
+                ],
+                "proved": 2, "failed": 0, "unknown": 0, "timed_out": 0, "skipped": 0,
+                "runtime_checked": 0, "cached": 0, "total": 2,
+            });
+            message["transport_budget"] = disclosure;
+            format!("{TRANSPORT_PREFIX}{message}")
+        };
+        let disclosure = |minted_rows: usize| {
+            json!({
+                "line_budget_bytes": 16 * 1024,
+                "unbounded_line_bytes": 20 * 1024,
+                "step": "withheld_diagnostic_payloads",
+                "minted_rows": minted_rows,
+                "withheld": [{"field": "original_vc_snapshot", "rows": [1]}],
+            })
+        };
+        let root = tempfile::tempdir().expect("materialization root");
+
+        // Reconciles: the rows are counted, and so is the fitting.
+        let mut summary = empty_transport_summary_object();
+        parse_transport_line(&function(disclosure(2)), &mut summary, root.path());
+        assert_eq!(summary["transport_budget_functions"], 1);
+        assert_eq!(summary["transport_budget_withheld_diagnostic_payloads"], 1);
+        assert_eq!(summary["transport_budget_disclosure_defects"], 0);
+        assert_eq!(summary["proved"], 2);
+        assert_eq!(summary["obligation_results"], 2);
+
+        // Disagrees (it names three minted rows over two): one unknown, no row of its own.
+        let mut summary = empty_transport_summary_object();
+        parse_transport_line(&function(disclosure(3)), &mut summary, root.path());
+        assert_eq!(summary["transport_budget_disclosure_defects"], 1);
+        assert_eq!(summary["transport_budget_functions"], 0);
+        assert_eq!(summary["function_results"], 1);
+        assert_eq!(summary["proved"], 0);
+        assert_eq!(summary["proved_results"], 0);
+        assert_eq!(summary["unknown"], 1);
+        assert_eq!(summary["total"], 1);
+        assert_eq!(summary["obligation_results"], 1);
+
+        // Control: the same function with no disclosure is read as before.
+        let mut summary = empty_transport_summary_object();
+        parse_transport_line(&function(Value::Null), &mut summary, root.path());
+        assert_eq!(summary["transport_budget_functions"], 0);
+        assert_eq!(summary["transport_budget_disclosure_defects"], 0);
+        assert_eq!(summary["proved"], 2);
     }
 
     #[test]

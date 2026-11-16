@@ -1,0 +1,88 @@
+{
+  "name": "fake_pid",
+  "def_path": "scalar::fake_pid",
+  "span": {
+    "file": "scalar.rs",
+    "line_start": 45,
+    "col_start": 0,
+    "line_end": 48,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "__trust_crate@db723a03577d5c29::libc::{extern#0}::getpid",
+            "args": [],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "scalar.rs",
+              "line_start": 47,
+              "col_start": 13,
+              "line_end": 47,
+              "col_end": 31
+            },
+            "atomic": null,
+            "is_foreign": true,
+            "is_unsafe_sig": true,
+            "callee_identity": {
+              "stable_crate_id": 15812765027678379049,
+              "def_index": 4,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": true,
+              "stable_crate_id": 15812765027678379049,
+              "krate_name": "libc",
+              "foreign_block_leaf": "getpid",
+              "upstream_foreign_link_symbol": "getppid"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

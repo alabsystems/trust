@@ -10,11 +10,14 @@ use clap_complete::Generator;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
+use crate::core::backend::CodegenBackendKind;
 use crate::core::build_steps::setup::Profile;
+use crate::core::build_steps::test::TestTarget;
 use crate::core::builder::{Builder, Kind};
 use crate::core::config::Config;
 use crate::core::config::target_selection::{TargetSelectionList, target_selection_list};
-use crate::{Build, CodegenBackendKind, TestTarget};
+use crate::core::session::Session;
+use crate::utils::helpers;
 
 #[derive(Copy, Clone, Default, Debug, ValueEnum)]
 pub enum Color {
@@ -152,18 +155,22 @@ pub struct Flags {
 
     /// generate PGO profile with rustc build
     #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
-    pub rust_profile_generate: Option<String>,
+    // FIXME: Remove this option at the end of 2026
+    pub rust_profile_generate: Option<PathBuf>,
     /// use PGO profile for rustc build
+    // FIXME: Remove this option at the end of 2026
     #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
-    pub rust_profile_use: Option<String>,
+    pub rust_profile_use: Option<PathBuf>,
     /// use PGO profile for LLVM build
+    // FIXME: Remove this option at the end of 2026
     #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
-    pub llvm_profile_use: Option<String>,
+    pub llvm_profile_use: Option<PathBuf>,
     // LLVM doesn't support a custom location for generating profile
     // information.
     //
     // llvm_out/build/profiles/ is the location this writes to.
     /// generate PGO profile with llvm built for rustc
+    // FIXME: Remove this option at the end of 2026
     #[arg(global = true, long)]
     pub llvm_profile_generate: bool,
     /// Enable BOLT link flags
@@ -212,11 +219,17 @@ impl Flags {
         if let Ok(HelpVerboseOnly { help: true, verbose: 1.., cmd: subcommand }) =
             HelpVerboseOnly::try_parse_from(normalize_args(args))
         {
-            println!("NOTE: updating submodules before printing available paths");
-            let flags = Self::parse(&[String::from("build")]);
+            // Trust: format has no Step paths; let ordinary Clap render help.
+            if subcommand == Kind::Format {
+                return false;
+            }
+            println!("NOTE: inspecting available paths");
+            // Trust: listing paths is not a producer. Its internal build
+            // configuration must not fetch the full source envelope.
+            let flags = Self::parse(&[String::from("build"), String::from("--dry-run")]);
             let config = Config::parse(flags);
-            let build = Build::new(config);
-            let paths = Builder::get_help(&build, subcommand);
+            let sess = Session::new(config);
+            let paths = Builder::get_help(&sess, subcommand);
             if let Some(s) = paths {
                 println!("{s}");
             } else {
@@ -233,7 +246,25 @@ impl Flags {
         instrument(level = "trace", name = "Flags::parse", skip_all, fields(args = ?args))
     )]
     pub fn parse(args: &[String]) -> Self {
-        Flags::parse_from(normalize_args(args))
+        Self::try_parse(args).unwrap_or_else(|error| error.exit())
+    }
+
+    /// Trust: validate cleanup scopes after native global argument propagation,
+    /// before any caller can choose a default or explicit crate step.
+    pub fn try_parse(args: &[String]) -> Result<Self, clap::Error> {
+        let flags = <Self as Parser>::try_parse_from(normalize_args(args))?;
+        // Clap validates the Clean subcommand before propagating a global
+        // --stage written before it. The local declaration alone cannot reject
+        // that spelling, so inspect the actual parsed fields too.
+        if matches!(&flags.cmd, Subcommand::Clean { all: true, stage }
+            if stage.is_some() || flags.stage.is_some())
+        {
+            return Err(Self::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--all and --stage cannot be used together for clean",
+            ));
+        }
+        Ok(flags)
     }
 }
 
@@ -305,6 +336,7 @@ pub enum Subcommand {
         #[arg(global = true, short = 'F', action = clap::ArgAction::Append, value_name = "LINT")]
         forbid: Vec<String>,
     },
+
     /// Run cargo fix
     #[command(long_about = "\n
     Arguments:
@@ -312,7 +344,14 @@ pub enum Subcommand {
         and/or artifacts to run `cargo fix` against. For example:
             ./x.py fix library/core
             ./x.py fix library/core library/proc_macro")]
-    Fix,
+    Fix {
+        /// Pass `--allow-dirty` to `cargo fix`, allowing it to run even if the
+        /// current git checkout has uncommitted changes.
+        #[arg(long)]
+        allow_dirty: bool,
+    },
+
+    /// Run rustfmt
     #[command(
         name = "fmt",
         long_about = "\n
@@ -322,7 +361,6 @@ pub enum Subcommand {
             ./x.py fmt
             ./x.py fmt --check"
     )]
-    /// Run rustfmt
     Format {
         /// check formatting instead of applying
         #[arg(long)]
@@ -373,6 +411,18 @@ pub enum Subcommand {
             ./x.py test --stage 1")]
     /// Build and run some test suites
     Test {
+        // Trust: this bounded workflow uses bootstrap's existing step graph.
+        #[arg(long, conflicts_with_all = ["no_fail_fast", "trust_vanilla", "trust_verified", "bless", "only_modified", "compare_mode", "pass", "run", "no_capture", "doc", "tests", "all_targets", "test_args", "compiletest_rustc_args", "extra_checks", "record", "rerun", "rustfix_coverage", "bypass_ignore_backends", "test_codegen_backend", "no_doc"])]
+        /// Check compiler targets and one tests/ui/trust file, or qualify first-party/trust-wp.
+        /// Stores completed execution facts only; makes no proof claim.
+        trust_repo_check: bool,
+        // Trust: an installed compiler is an explicit input, never a mutable build-tree guess.
+        #[arg(long, requires = "trust_repo_check", value_name = "PATH")]
+        /// Immutable current Trust installation for the stage-2 first-party/trust-wp selection.
+        trust_repo_wp_installation: Option<PathBuf>,
+        #[arg(long, hide = true, requires = "trust_repo_check")]
+        /// Require the validated native parent's version-1 release handoff.
+        trust_repo_parent_release_v1: bool,
         #[arg(long)]
         /// run all tests regardless of failure
         no_fail_fast: bool,
@@ -386,6 +436,12 @@ pub enum Subcommand {
         #[arg(long)]
         /// run upstream vanilla compiletest by disabling Trust verification
         trust_vanilla: bool,
+        #[arg(long, conflicts_with = "trust_vanilla")]
+        /// run the VERIFIED compiletest lane: compile every test at the shipping
+        /// default (`-Ztrust-verify=on -Ztrust-policy=strict`) instead of the
+        /// harness's `-Ztrust-verify=off`. Requires a locally-built stage1+ Trust
+        /// compiler; mutually exclusive with `--trust-vanilla`.
+        trust_verified: bool,
         #[arg(long)]
         /// Run all test targets (no doc tests)
         all_targets: bool,
@@ -395,6 +451,11 @@ pub enum Subcommand {
         /// Only run unit and integration tests
         #[arg(long)]
         tests: bool,
+        // Trust: an explicit fixture is only a runtime input to compiler
+        // library tests; it never selects the compiler building those tests.
+        #[arg(long, value_hint = clap::ValueHint::DirPath, value_name = "SYSROOT")]
+        /// Retain a validated Trust compiler fixture for explicit compiler library tests (no docs)
+        compiler_test_fixture: Option<PathBuf>,
         #[arg(long)]
         /// whether to automatically update stderr/stdout files
         bless: bool,
@@ -483,7 +544,9 @@ pub enum Subcommand {
     },
     /// Clean out build directories
     Clean {
-        #[arg(long)]
+        // Trust: reject incompatible cleanup scopes before selected crate
+        // steps can bypass CleanAll's whole-directory execution check.
+        #[arg(long, conflicts_with = "stage")]
         /// Clean the entire build directory (not used by default)
         all: bool,
         #[arg(long, value_name = "N")]
@@ -552,7 +615,7 @@ impl Subcommand {
             Subcommand::Check { .. } => Kind::Check,
             Subcommand::Clippy { .. } => Kind::Clippy,
             Subcommand::Doc { .. } => Kind::Doc,
-            Subcommand::Fix => Kind::Fix,
+            Subcommand::Fix { .. } => Kind::Fix,
             Subcommand::Format { .. } => Kind::Format,
             Subcommand::Test { .. } => Kind::Test,
             Subcommand::Miri { .. } => Kind::Miri,
@@ -578,6 +641,33 @@ impl Subcommand {
         match *self {
             Subcommand::Test { trust_vanilla, .. } => trust_vanilla,
             _ => false,
+        }
+    }
+
+    /// The opt-in VERIFIED compiletest lane. Clap enforces the exclusion with
+    /// `--trust-vanilla`; compiletest re-checks it, because the two lanes make
+    /// contradictory claims about the same run.
+    pub fn trust_verified(&self) -> bool {
+        match *self {
+            Subcommand::Test { trust_verified, .. } => trust_verified,
+            _ => false,
+        }
+    }
+
+    // Trust: only the bounded native repository workflow selects this mode.
+    pub(crate) fn trust_repo_check(&self) -> bool {
+        matches!(self, Subcommand::Test { trust_repo_check: true, .. })
+    }
+
+    pub(crate) fn trust_repo_parent_release_v1(&self) -> bool {
+        matches!(self, Subcommand::Test { trust_repo_parent_release_v1: true, .. })
+    }
+
+    // Trust: only the bounded WP operation consumes this installation.
+    pub(crate) fn trust_repo_wp_installation(&self) -> Option<&Path> {
+        match self {
+            Self::Test { trust_repo_wp_installation, .. } => trust_repo_wp_installation.as_deref(),
+            _ => None,
         }
     }
 
@@ -752,6 +842,12 @@ impl Subcommand {
             _ => false,
         }
     }
+
+    /// Trust: does this invocation require checking every compiler target,
+    /// including the native repository workflow's compiler-check dependency?
+    pub(crate) fn check_all_targets(&self) -> bool {
+        matches!(self, Subcommand::Check { all_targets: true, .. }) || self.trust_repo_check()
+    }
 }
 
 /// Returns the shell completion for a given shell, if the result differs from the current
@@ -763,7 +859,7 @@ pub fn get_completion(shell: &dyn Generator, path: &Path) -> Option<String> {
     } else {
         std::fs::read_to_string(path).unwrap_or_else(|_| {
             eprintln!("couldn't read {}", path.display());
-            crate::exit!(1)
+            helpers::exit_process(1);
         })
     };
     let mut buf = Vec::new();

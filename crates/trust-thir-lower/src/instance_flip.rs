@@ -303,7 +303,7 @@ fn rejected<'tcx>(reason: impl Into<String>) -> InstanceFlipAttempt<'tcx> {
 pub fn instance_args_digest<'tcx>(
     tcx: TyCtxt<'tcx>,
     def: LocalDefId,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
 ) -> ProofDigest {
     let definition = lineage::DefinitionIdentity::from_def_id(tcx, def.to_def_id());
     let mut bytes = Vec::new();
@@ -602,6 +602,12 @@ pub fn derive_instance_flip_body<'tcx>(
             body.arg_count, inst_built.arg_count
         ));
     }
+    // Trust (F2, instance lane, 2026-09-29): the spread-argument half of the ABI, exactly as
+    // `flip::derive_flip_body` checks it on the DefId seam — a generic user `impl Fn*` flipped
+    // here with `spread_arg: None` hit the same `arg_local_refs` ICE. REFUSES MORE.
+    if let Some(reason) = flip::spread_arg_refusal(body.spread_arg, inst_built.spread_arg) {
+        return rejected(reason);
+    }
     for i in 0..=body.arg_count {
         let l = Local::from_usize(i);
         let (d, n) = (body.local_decls[l].ty, inst_built.local_decls[l].ty);
@@ -702,18 +708,24 @@ mod tests {
     /// though the frozen gate would certify some of them.
     fn clean_lowering() -> Lowered {
         let mut module = trust_ir::Module::new("instance_flip_probe");
-        let ty = module.add_func_type(trust_ir::FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
-        module.add_function(trust_ir::Function::new(
-            trust_ir::FuncId::new(0),
-            "instance_flip_probe_fn",
-            ty,
-            trust_ir::BlockId::new(0),
-        ));
+        let ty = module
+            .add_func_type(trust_ir::FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        module
+            .try_add_function(trust_ir::Function::new(
+                trust_ir::FuncId::new(0),
+                "instance_flip_probe_fn",
+                ty,
+                trust_ir::BlockId::new(0),
+            ))
+            .expect("Module::try_add_function: test fixture");
         Lowered {
+            global_origins: Vec::new(),
             coroutine_frame_ptr: false,
             mut_reborrows: Vec::new(),
             module,
@@ -722,8 +734,10 @@ mod tests {
             opaque_collapse: false,
             enum_declines: Vec::new(),
             union_lane: false,
+            layout_withheld_structs: Vec::new(),
             enum_param_lane: false,
             symbolic: false,
+            unsubstituted_opaque_return: false,
             unsupported: Vec::new(),
             contains_call: false,
             place_path_carrier: false,

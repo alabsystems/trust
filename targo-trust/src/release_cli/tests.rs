@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +28,8 @@ use super::types::{
 };
 use super::{release_usage_text, version_usage_text};
 use crate::pipeline::probe::inspect_trustd_runtime_closure;
+#[cfg(target_os = "macos")]
+use crate::pipeline::probe::runtime_closure_fixture::RuntimeClosureFixture;
 use crate::pipeline::surface::{
     FORBIDDEN_TRUST_PUBLIC_BIN_NAMES, FORBIDDEN_TRUST_PUBLIC_LIBEXEC_NAMES,
 };
@@ -471,6 +473,37 @@ fn release_identity_gate_rejects_wrong_commit_trustd() {
     assert!(report.findings.iter().any(|finding| {
         finding.code == "tool-commit-mismatch" && finding.message.contains("trustd")
     }));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn release_identity_gate_rejects_wrong_commit_trustc() {
+    let root = temp_root("wrong-commit-trustc");
+    let candidate = "0123456789abcdef0123456789abcdef01234567";
+    let mut identity = test_identity_with_candidate(candidate);
+    materialize_bound_required_test_tools(&mut identity, &root);
+    identity.tools.compiler.commit_hash = Some(candidate.to_string());
+    identity.tools.daemon.commit_hash = Some(candidate.to_string());
+
+    for profile in [ReleaseProfile::Publication, ReleaseProfile::ProductProof] {
+        let report = check_bound_tool_files(&identity, profile);
+        assert_eq!(report.status, GateStatus::Pass, "{:?}", report.findings);
+    }
+
+    identity.tools.compiler.commit_hash =
+        Some("fedcba9876543210fedcba9876543210fedcba98".to_string());
+    assert_eq!(
+        check_toolchain_surface_sysroot(&identity, ReleaseProfile::ProductProof).status,
+        GateStatus::Pass
+    );
+    for profile in [ReleaseProfile::Publication, ReleaseProfile::ProductProof] {
+        let report = check_bound_tool_files(&identity, profile);
+        assert_eq!(report.status, GateStatus::Fail, "{:?}", report.findings);
+        assert!(report.findings.iter().any(|finding| {
+            finding.code == "tool-commit-mismatch" && finding.message.contains("trustc")
+        }));
+    }
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1338,7 +1371,7 @@ fn product_proof_version_identity_materializes_but_requires_registered_collector
         "version_identity": {
             "product": "Trust",
             "toolchain_alias": "trust",
-            "trust_product_version": "0.1.0",
+            "trust_product_version": checked_in_trust_version(),
             "candidate_commit": candidate,
             "candidate_command_version": 1,
             "tools": {
@@ -1388,7 +1421,7 @@ fn product_proof_version_identity_rejects_tool_hash_mismatch() {
         "version_identity": {
             "product": "Trust",
             "toolchain_alias": "trust",
-            "trust_product_version": "0.1.0",
+            "trust_product_version": checked_in_trust_version(),
             "candidate_commit": candidate,
             "candidate_command_version": 1,
             "tools": {
@@ -1946,7 +1979,9 @@ fn assert_host_runtime_closure_contract(findings: &[GateFinding]) -> Vec<GateFin
 #[test]
 fn product_proof_identity_probe_clears_ambient_loader_environment() {
     let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        // The child is `#[ignore]`d: `--ignored` selects it, `--exact` only it.
         .args([
+            "--ignored",
             "--exact",
             "release_cli::tests::product_proof_identity_probe_clears_ambient_loader_environment_child",
             "--nocapture",
@@ -1965,8 +2000,14 @@ fn product_proof_identity_probe_clears_ambient_loader_environment() {
     );
 }
 
+/// Child half of `product_proof_identity_probe_clears_ambient_loader_environment`,
+/// which re-executes it with `--ignored --exact` under an ambient loader search
+/// path. A no-op without that environment, and `#[ignore]`d so a plain run does
+/// not count that no-op as a pass.
 #[cfg(unix)]
 #[test]
+#[ignore = "subprocess child: re-executed by \
+            product_proof_identity_probe_clears_ambient_loader_environment"]
 fn product_proof_identity_probe_clears_ambient_loader_environment_child() {
     if std::env::var_os("TRUST_PRODUCT_PROOF_LOADER_ENV_CHILD").is_none() {
         return;
@@ -2961,13 +3002,16 @@ fn product_proof_stub_exporter_writes_blocked_digest_bound_compile_back_json() {
 fn product_proof_stub_exporter_writes_blocked_release_artifact_report() {
     let root = temp_root("product-proof-stub-release-artifact-report");
     let candidate = "0123456789abcdef0123456789abcdef01234567";
+    let root_artifact_path = "release/evidence/artifacts/root-image.bin";
     let artifact_path = "release/evidence/artifacts/selected-image.bin";
     let out_path = "release/evidence/selected-image-range-stub.json";
     let report_path = "release/reports/selected-image-range-stub-report.json";
     let artifact = root.join(artifact_path);
     std::fs::create_dir_all(artifact.parent().expect("artifact parent"))
         .expect("create artifact dir");
-    std::fs::write(&artifact, b"digest-bound selected image bytes\n").expect("write artifact");
+    std::fs::write(root.join(root_artifact_path), b"digest-bound selected image bytes\n")
+        .expect("write root image");
+    std::fs::write(&artifact, b"digest-bound sel").expect("write selected image");
     let artifact_digest = file_sha256(&artifact).expect("hash artifact");
 
     let args = string_args(&[
@@ -2977,6 +3021,8 @@ fn product_proof_stub_exporter_writes_blocked_release_artifact_report() {
         candidate,
         "--evidence-kind",
         "compile-back-selected-image-range",
+        "--artifact",
+        &format!("root_artifact_sha256={root_artifact_path}"),
         "--artifact",
         &format!("selected_image_sha256={artifact_path}"),
         "--selected-image-range",
@@ -3012,9 +3058,15 @@ fn product_proof_stub_exporter_writes_blocked_release_artifact_report() {
         evidence["compile_back_artifact_digest_binding"]["selected_image_range"].as_str(),
         Some("0..16")
     );
-    assert_eq!(
-        evidence["release_artifact"]["artifact_sha256_checks"][0]["sha256"].as_str(),
-        Some(artifact_digest.as_str())
+    assert!(
+        evidence["release_artifact"]["artifact_sha256_checks"]
+            .as_array()
+            .expect("artifact checks")
+            .iter()
+            .any(|check| {
+                check["digest_field"] == "selected_image_sha256"
+                    && check["sha256"].as_str() == Some(artifact_digest.as_str())
+            })
     );
     assert_eq!(
         evidence["release_artifact"]["selected_image_range_check"]["range"].as_str(),
@@ -3030,7 +3082,12 @@ fn product_proof_stub_exporter_writes_blocked_release_artifact_report() {
     assert_eq!(report["runner"]["python_used"].as_bool(), Some(false));
     assert_eq!(report["product_proof_artifact"]["path"], out_path);
     assert_eq!(report["product_proof_artifact"]["sha256"].as_str(), Some(evidence_digest.as_str()));
-    assert_eq!(report["artifact_sha256_checks"][0]["path"].as_str(), Some(artifact_path));
+    assert!(report["artifact_sha256_checks"].as_array().expect("artifact checks").iter().any(
+        |check| {
+            check["digest_field"] == "selected_image_sha256"
+                && check["path"].as_str() == Some(artifact_path)
+        }
+    ));
     assert_eq!(report["selected_image_range_check"]["range"].as_str(), Some("0..16"));
     assert_eq!(report["product_proof_pass_evidence"].as_bool(), Some(false));
     assert_eq!(report["domination_admissible"].as_bool(), Some(false));
@@ -3069,6 +3126,7 @@ fn product_proof_stub_exporter_writes_blocked_manifest_skeleton_from_real_artifa
     let root = temp_root("product-proof-stub-manifest-skeleton");
     let candidate = "0123456789abcdef0123456789abcdef01234567";
     let artifact_path = "release/evidence/artifacts/compile-back-material.bin";
+    let selected_path = "release/evidence/artifacts/selected-image.bin";
     let out_path = "release/evidence/product-proof/compile-back-digests-bound.json";
     let manifest_path = "release/product-proof.toml";
     let stage2_trustc_path = materialized_stage2_trustc_path(&root, candidate);
@@ -3078,6 +3136,7 @@ fn product_proof_stub_exporter_writes_blocked_manifest_skeleton_from_real_artifa
         .expect("create artifact dir");
     std::fs::write(&artifact, b"digest-bound compile-back release artifact material\n")
         .expect("write compile-back artifact");
+    std::fs::write(root.join(selected_path), b"digest-bound com").expect("write selected image");
     let artifact_digest = file_sha256(&artifact).expect("hash artifact");
 
     let args = string_args(&[
@@ -3098,7 +3157,7 @@ fn product_proof_stub_exporter_writes_blocked_manifest_skeleton_from_real_artifa
         "--artifact",
         &format!("root_artifact_sha256={artifact_path}"),
         "--artifact",
-        &format!("selected_image_sha256={artifact_path}"),
+        &format!("selected_image_sha256={selected_path}"),
         "--selected-image-range",
         "0..16",
         "--stage2-trustc",
@@ -3293,8 +3352,9 @@ fn product_proof_report_rejects_self_declared_compile_back_solver_evidence() {
             blocker["code"] == "product-proof-solver-evidence-unverified"
                 && blocker["message"].as_str().is_some_and(|message| {
                     message.contains("self-declared runner identity")
-                        && message.contains("complete ID/digest-indexed candidate obligation set")
-                        && message.contains("strictly parsed transcript")
+                        && message.contains("canonical VC/query bytes")
+                        && message.contains("raw proof bytes in a bounded transcript")
+                        && message.contains("independently regenerate the canonical VC/query")
                 })
         }),
         "fabricated counts plus fully materialized hashes must remain non-proof checklist material: {report}"
@@ -3373,6 +3433,13 @@ fn product_proof_report_rejects_dirty_current_repo() {
     let evidence_path =
         write_product_proof_evidence(&root, "product-proof-dirty-current-repo.json", &evidence);
     commit_all(&root, "release evidence");
+    let current_head = crate::controlled_git::canonical_head(
+        &root,
+        "dirty-repo test HEAD",
+        64 * 1024,
+        std::time::Duration::from_secs(10),
+    )
+    .expect("committed test HEAD");
     std::fs::write(root.join("dirty-current-repo.txt"), "dirty after evidence commit\n")
         .expect("write dirty file");
     let report_path = "release/reports/product-proof-dirty-current-repo-report.json";
@@ -3381,7 +3448,7 @@ fn product_proof_report_rejects_dirty_current_repo() {
         "--repo-root",
         &root.display().to_string(),
         "--candidate-commit",
-        candidate,
+        &current_head,
         "--evidence",
         &evidence_path,
         "--out",
@@ -3623,6 +3690,164 @@ fn product_proof_report_rejects_unbound_selected_image_digest() {
 }
 
 #[test]
+fn product_proof_selected_image_range_rejects_invalid_bytes_and_missing_files() {
+    let candidate = "0123456789abcdef0123456789abcdef01234567";
+    for (case, expected) in [
+        ("length-mismatch", "selected image length"),
+        ("out-of-bounds", "exceeds root artifact length"),
+        ("same-length-forgery", "selected image bytes do not equal root artifact range"),
+        ("missing-root", "root_artifact_path"),
+        ("missing-selected", "selected_image_path"),
+    ] {
+        let root = temp_root(case);
+        let mut binding = compile_back_digest_binding(&root, "0..16");
+        let root_path = root.join(binding["root_artifact_path"].as_str().expect("root path"));
+        let selected_path =
+            root.join(binding["selected_image_path"].as_str().expect("selected path"));
+        match case {
+            "length-mismatch" => {
+                std::fs::write(&selected_path, b"seventeen bytes!!").expect("forge length");
+                binding["selected_image_sha256"] =
+                    file_sha256(&selected_path).expect("hash forged selection").into();
+            }
+            "out-of-bounds" => binding["selected_image_range"] = "0..999".into(),
+            "same-length-forgery" => {
+                std::fs::write(&selected_path, b"forged-image-123").expect("forge bytes");
+                binding["selected_image_sha256"] =
+                    file_sha256(&selected_path).expect("hash forged selection").into();
+            }
+            "missing-root" => std::fs::remove_file(&root_path).expect("remove root image"),
+            "missing-selected" => {
+                std::fs::remove_file(&selected_path).expect("remove selected image")
+            }
+            _ => unreachable!(),
+        }
+
+        let stub_out = "release/evidence/invalid-range-stub.json";
+        let stub_args = string_args(&[
+            "--repo-root",
+            &root.display().to_string(),
+            "--candidate-commit",
+            candidate,
+            "--evidence-kind",
+            "compile-back-selected-image-range",
+            "--artifact",
+            &format!("root_artifact_sha256={}", binding["root_artifact_path"].as_str().unwrap()),
+            "--artifact",
+            &format!("selected_image_sha256={}", binding["selected_image_path"].as_str().unwrap()),
+            "--selected-image-range",
+            binding["selected_image_range"].as_str().unwrap(),
+            "--out",
+            stub_out,
+        ]);
+        assert_eq!(run_product_proof_stub_subcommand(&stub_args), ExitCode::from(2), "{case}");
+        assert!(!root.join(stub_out).exists(), "{case}");
+
+        let mut runner = product_proof_runner_json();
+        runner["repo_dirty"] = false.into();
+        let evidence = serde_json::json!({
+            "schema_version": "trust.product-proof.v1",
+            "evidence_kinds": COMPILE_BACK_DIGEST_REQUIREMENTS,
+            "candidate_commit": candidate,
+            "generated_at": PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS,
+            "runner": runner,
+            "proof_results": product_proof_results_json(),
+            "compile_back_artifact_digest_binding": binding,
+        });
+        let evidence_path = write_product_proof_evidence(&root, "invalid-range.json", &evidence);
+        write_binary_decomp_product_proof_manifest(&root, &evidence_path);
+        let coverage = check_product_proof_coverage(&root, Some(candidate), None);
+        assert_eq!(coverage.status, GateStatus::Blocked, "{case}");
+        assert!(
+            coverage.findings.iter().any(|finding| {
+                finding.code == "product-proof-compile-back-artifact-digest-missing"
+                    && finding.message.contains("compile-back-selected-image-range")
+                    && finding.message.contains(expected)
+            }),
+            "{case} must block compile-back selected-image evidence: {:?}",
+            coverage.findings
+        );
+
+        commit_all(&root, "invalid selected image fixture");
+        let report_path = "release/reports/invalid-range.json";
+        let report_args = string_args(&[
+            "--repo-root",
+            &root.display().to_string(),
+            "--candidate-commit",
+            candidate,
+            "--evidence",
+            &evidence_path,
+            "--out",
+            report_path,
+        ]);
+        assert_eq!(run_product_proof_report_subcommand(&report_args), ExitCode::from(1), "{case}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(report_path)).expect("read report"))
+                .expect("parse report");
+        assert_eq!(report["status"], "blocked", "{case}");
+        assert_eq!(report["selected_image_range_check"]["status"], "blocked", "{case}");
+        assert!(
+            report["selected_image_range_check"]["defect"]
+                .as_str()
+                .is_some_and(|defect| defect.contains(expected)),
+            "{case}: {report}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn product_proof_selected_image_range_accepts_exact_nonzero_offset_without_solver_proof() {
+    let root = temp_root("selected-image-nonzero-offset");
+    let candidate = "0123456789abcdef0123456789abcdef01234567";
+    let mut binding = compile_back_digest_binding(&root, "4..20");
+    let root_path = root.join(binding["root_artifact_path"].as_str().expect("root path"));
+    let selected_path = root.join(binding["selected_image_path"].as_str().expect("selected path"));
+    let root_bytes = std::fs::read(root_path).expect("read root image");
+    std::fs::write(&selected_path, &root_bytes[4..20]).expect("write exact nonzero selection");
+    binding["selected_image_sha256"] =
+        file_sha256(&selected_path).expect("hash selected image").into();
+    let mut runner = product_proof_runner_json();
+    runner["repo_dirty"] = false.into();
+    let evidence = serde_json::json!({
+        "schema_version": "trust.product-proof.v1",
+        "evidence_kinds": COMPILE_BACK_DIGEST_REQUIREMENTS,
+        "candidate_commit": candidate,
+        "generated_at": PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS,
+        "runner": runner,
+        "proof_results": product_proof_results_json(),
+        "compile_back_artifact_digest_binding": binding,
+    });
+    let evidence_path = write_product_proof_evidence(&root, "selected-offset.json", &evidence);
+    commit_all(&root, "exact selected image fixture");
+    let report_path = "release/reports/selected-offset.json";
+    let args = string_args(&[
+        "--repo-root",
+        &root.display().to_string(),
+        "--candidate-commit",
+        candidate,
+        "--evidence",
+        &evidence_path,
+        "--out",
+        report_path,
+    ]);
+    assert_eq!(run_product_proof_report_subcommand(&args), ExitCode::from(1));
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(report_path)).expect("read report"))
+            .expect("parse report");
+    assert_eq!(report["selected_image_range_check"]["status"], "passed");
+    assert_eq!(report["status"], "blocked");
+    assert!(
+        report["blockers"]
+            .as_array()
+            .expect("blockers")
+            .iter()
+            .any(|blocker| { blocker["code"] == "product-proof-solver-evidence-unverified" })
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn product_proof_stub_exporter_fails_before_writing_missing_artifact() {
     let root = temp_root("product-proof-stub-missing-artifact");
     let candidate = "0123456789abcdef0123456789abcdef01234567";
@@ -3841,7 +4066,7 @@ fn product_proof_matrix_fails_closed_on_manifest_read_error() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-fn assert_product_proof_matrix_invalid_manifest(root: &PathBuf, reason_fragment: &str) {
+fn assert_product_proof_matrix_invalid_manifest(root: &Path, reason_fragment: &str) {
     let candidate = "0123456789abcdef0123456789abcdef01234567";
     let report = check_product_proof_coverage(root, Some(candidate), None);
     assert_eq!(report.status, GateStatus::Blocked);
@@ -3991,7 +4216,7 @@ fn binary_decomp_required_evidence() -> Vec<&'static str> {
         .to_vec()
 }
 
-fn write_binary_decomp_product_proof_manifest(root: &PathBuf, evidence_path: &str) {
+fn write_binary_decomp_product_proof_manifest(root: &Path, evidence_path: &str) {
     let mut manifest = String::from(
         r#"schema_version = "trust.product-proof-manifest.v1"
 status = "accepted"
@@ -4018,7 +4243,7 @@ status = "accepted"
         .expect("write product proof manifest");
 }
 
-fn write_trustc_identity_product_proof_manifest(root: &PathBuf, evidence_path: &str) {
+fn write_trustc_identity_product_proof_manifest(root: &Path, evidence_path: &str) {
     let mut manifest = String::from(
         r#"schema_version = "trust.product-proof-manifest.v1"
 status = "accepted"
@@ -4045,7 +4270,7 @@ status = "accepted"
 }
 
 fn write_product_proof_evidence(
-    root: &PathBuf,
+    root: &Path,
     file_name: &str,
     evidence: &serde_json::Value,
 ) -> String {
@@ -4061,7 +4286,7 @@ fn write_product_proof_evidence(
 }
 
 fn write_single_evidence_product_proof_manifest(
-    root: &PathBuf,
+    root: &Path,
     focused_component: &str,
     evidence_kind: &str,
     evidence_path: &str,
@@ -4093,7 +4318,7 @@ status = "accepted"
 }
 
 fn write_multi_evidence_product_proof_manifest(
-    root: &PathBuf,
+    root: &Path,
     focused_component: &str,
     evidence_kinds: &[&str],
     evidence_path: &str,
@@ -4130,7 +4355,7 @@ fn product_proof_artifact_path_text() -> &'static str {
     "release/evidence/artifacts/product-proof-material.bin"
 }
 
-fn materialize_product_proof_artifact(root: &PathBuf) -> String {
+fn materialize_product_proof_artifact(root: &Path) -> String {
     let artifact_path = root.join(product_proof_artifact_path_text());
     std::fs::create_dir_all(artifact_path.parent().expect("product-proof artifact parent"))
         .expect("create product-proof artifact parent");
@@ -4162,18 +4387,18 @@ fn assert_solver_checklist_only(report: &GateReport, evidence_kind: &str) {
     // rather than on the host — an earlier version of this asserted the blocker
     // unconditionally off macOS and broke six kinds that never attempt one.
     if report.findings.iter().any(runtime_closure_gap) {
-        assert!(
-            !cfg!(target_os = "macos"),
-            "on macOS the trustd runtime closure must be establishable: {:?}",
-            report.findings
-        );
-        assert!(
-            report.evidence_refs.is_empty(),
-            "a host that cannot establish the runtime closure must return no accepted \
-             evidence: {:?}",
-            report.evidence_refs
-        );
-        return;
+        #[cfg(target_os = "macos")]
+        panic!("on macOS the trustd runtime closure must be establishable: {:?}", report.findings);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                report.evidence_refs.is_empty(),
+                "a host that cannot establish the runtime closure must return no accepted \
+                 evidence: {:?}",
+                report.evidence_refs
+            );
+            return;
+        }
     }
     assert!(
         report.findings.iter().any(|finding| {
@@ -4192,10 +4417,7 @@ fn assert_solver_checklist_only(report: &GateReport, evidence_kind: &str) {
     );
 }
 
-fn trusted_product_proof_evidence(
-    root: &PathBuf,
-    evidence: &serde_json::Value,
-) -> serde_json::Value {
+fn trusted_product_proof_evidence(root: &Path, evidence: &serde_json::Value) -> serde_json::Value {
     let mut evidence = evidence.clone();
     if let Some(map) = evidence.as_object_mut() {
         map.entry("generated_at".to_string())
@@ -4220,7 +4442,7 @@ fn product_proof_runner_json() -> serde_json::Value {
     })
 }
 
-fn release_artifact_binding_json(root: &PathBuf, candidate: &str) -> serde_json::Value {
+fn release_artifact_binding_json(root: &Path, candidate: &str) -> serde_json::Value {
     let stage2_trustc_path = materialized_stage2_trustc_path(root, candidate);
     let source_tarball_path = materialized_source_tarball_path(root, candidate);
     let stage2_trustc_digest =
@@ -4248,7 +4470,7 @@ fn release_artifact_binding_json(root: &PathBuf, candidate: &str) -> serde_json:
     })
 }
 
-fn materialized_stage2_trustc_path(root: &PathBuf, candidate: &str) -> String {
+fn materialized_stage2_trustc_path(root: &Path, candidate: &str) -> String {
     let path_text = "build/host/stage2/bin/trustc";
     let path = root.join(path_text);
     std::fs::create_dir_all(path.parent().expect("stage2 trustc parent"))
@@ -4264,16 +4486,25 @@ fn materialized_stage2_trustc_path(root: &PathBuf, candidate: &str) -> String {
     path_text.to_string()
 }
 
-fn materialized_source_tarball_path(root: &PathBuf, candidate: &str) -> String {
+fn materialized_source_tarball_path(root: &Path, candidate: &str) -> String {
     let path_text = "dist/trust-src-1.96.0-trust.tar.xz";
     let path = root.join(path_text);
     std::fs::create_dir_all(path.parent().expect("source tarball parent"))
         .expect("create source tarball parent");
-    let mut bytes = vec![0xfd, b'7', b'z', b'X', b'Z', 0x00];
-    bytes.extend_from_slice(
-        format!("materialized trust source tarball fixture for {candidate}\n").as_bytes(),
+    let package = "trust-src-1.96.0-trust";
+    let source = root.join(package);
+    std::fs::create_dir_all(&source).expect("create source tarball fixture tree");
+    std::fs::write(source.join("git-commit-hash"), candidate)
+        .expect("write source tarball revision");
+    std::fs::write(source.join("README.md"), b"source archive fixture\n")
+        .expect("write source tarball content");
+    let encoder = xz2::write::XzEncoder::new(
+        std::fs::File::create(&path).expect("create source tarball fixture"),
+        6,
     );
-    std::fs::write(&path, bytes).expect("write source tarball fixture");
+    let mut builder = tar::Builder::new(encoder);
+    builder.append_dir_all(package, &source).expect("add source fixture tree");
+    builder.into_inner().expect("finish tar archive").finish().expect("finish XZ stream");
     path_text.to_string()
 }
 
@@ -4290,7 +4521,7 @@ fn make_executable(path: &Path) {
 fn make_executable(_path: &Path) {}
 
 fn materialized_trust_tool_identity_json(
-    root: &PathBuf,
+    root: &Path,
     name: &str,
     commit_hash: Option<&str>,
 ) -> serde_json::Value {
@@ -4366,14 +4597,14 @@ int main(int argc, char **argv) {
 }
 
 fn materialized_version_identity_json(
-    root: &PathBuf,
+    root: &Path,
     candidate: &str,
     daemon_identity: serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "product": "Trust",
         "toolchain_alias": "trust",
-        "trust_product_version": "0.1.0",
+        "trust_product_version": checked_in_trust_version(),
         "candidate_commit": candidate,
         "candidate_command_version": 1,
         "tools": {
@@ -4410,7 +4641,7 @@ fn candidate_daemon_from_json(root: &Path, identity: &serde_json::Value) -> Boun
 
 #[cfg(target_os = "macos")]
 fn fabricated_trustd_protocol_evidence(
-    root: &PathBuf,
+    root: &Path,
     candidate: &str,
 ) -> (serde_json::Value, BoundToolIdentity) {
     let tool_identity = materialized_trust_tool_identity_json(root, "trustd", Some(candidate));
@@ -4473,9 +4704,9 @@ fn fabricated_trustd_protocol_evidence(
     std::fs::create_dir_all(root.join("release/evidence")).expect("create evidence dir");
     std::fs::write(root.join(transcript_path), transcript).expect("write transcript");
     let transcript_sha256 = file_sha256(&root.join(transcript_path)).expect("transcript digest");
-    let runtime_closure =
-        inspect_trustd_runtime_closure(&std::env::current_exe().expect("current test executable"))
-            .expect("inspect test executable runtime closure");
+    let fixture = RuntimeClosureFixture::new();
+    let runtime_closure = inspect_trustd_runtime_closure(fixture.candidate())
+        .expect("inspect real thin native fixture runtime closure");
     let evidence = serde_json::json!({
         "schema_version": "trust.product-proof.v1",
         "evidence_kind": "Trust daemon protocol smoke",
@@ -4548,9 +4779,15 @@ fn compile_back_digest_diagnostics(digest: &str) -> Vec<String> {
     .collect()
 }
 
-fn compile_back_digest_binding(root: &PathBuf, selected_image_range: &str) -> serde_json::Value {
+fn compile_back_digest_binding(root: &Path, selected_image_range: &str) -> serde_json::Value {
     let artifact_path = compile_back_artifact_path_text();
     let digest = materialize_compile_back_artifact(root);
+    let selected_image_path = "release/evidence/artifacts/selected-image.bin";
+    let root_bytes = std::fs::read(root.join(artifact_path)).expect("read root image fixture");
+    std::fs::write(root.join(selected_image_path), &root_bytes[..16])
+        .expect("write selected image fixture");
+    let selected_digest =
+        file_sha256(&root.join(selected_image_path)).expect("hash selected image fixture");
     serde_json::json!({
         "lifted_binary_trust_ir_sha256": &digest,
         "lifted_binary_trust_ir_path": artifact_path,
@@ -4562,8 +4799,8 @@ fn compile_back_digest_binding(root: &PathBuf, selected_image_range: &str) -> se
         "refinement_artifact_path": artifact_path,
         "root_artifact_sha256": &digest,
         "root_artifact_path": artifact_path,
-        "selected_image_sha256": &digest,
-        "selected_image_path": artifact_path,
+        "selected_image_sha256": selected_digest,
+        "selected_image_path": selected_image_path,
         "selected_image_range": selected_image_range,
     })
 }
@@ -4572,13 +4809,27 @@ fn compile_back_artifact_path_text() -> &'static str {
     "release/evidence/artifacts/compile-back-material.bin"
 }
 
-fn materialize_compile_back_artifact(root: &PathBuf) -> String {
+fn materialize_compile_back_artifact(root: &Path) -> String {
     let artifact_path = root.join(compile_back_artifact_path_text());
     std::fs::create_dir_all(artifact_path.parent().expect("compile-back artifact parent"))
         .expect("create compile-back artifact parent");
     std::fs::write(&artifact_path, b"materialized compile-back proof artifact fixture\n")
         .expect("write compile-back artifact");
     file_sha256(&artifact_path).expect("hash compile-back artifact")
+}
+
+/// Trust's version as its one authority states it (the root `Cargo.toml`
+/// `[workspace.package] version`), so identity fixtures carry the real number
+/// instead of a literal that goes stale at the next `pub bump`.
+fn checked_in_trust_version() -> String {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(trust_version::VERSION_AUTHORITY_PATH);
+    let text = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|err| panic!("read {}: {err}", manifest.display()));
+    trust_version::parse_version_authority(&text)
+        .unwrap_or_else(|err| panic!("{}: {err}", manifest.display()))
+        .to_string()
 }
 
 fn temp_root(label: &str) -> PathBuf {
@@ -4618,13 +4869,13 @@ fn test_identity_with_candidate(candidate_commit: &str) -> TrustVersionIdentity 
         schema_version: trust_version::VERSION_SCHEMA.to_string(),
         product: "Trust".to_string(),
         toolchain_alias: "trust".to_string(),
-        trust_product_version: "0.1.0".to_string(),
-        trust_product_channel: trust_version::CHANNEL_RELEASE.to_string(),
+        trust_product_version: checked_in_trust_version(),
+        trust_product_channel: trust_version::product_channel("trust").to_string(),
         rust_upstream_version: "1.99.0".to_string(),
         bootstrap_channel: "trust".to_string(),
         rust_compat_version: "1.99.0-dev".to_string(),
         rust_compat_source: "test".to_string(),
-        archive_version: "0.1.0-trust".to_string(),
+        archive_version: trust_version::trust_archive_version(&checked_in_trust_version(), "trust"),
         rust_alignment: trust_version::RustAlignment {
             rustc_version: "1.99.0".to_string(),
             revision: "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0".to_string(),

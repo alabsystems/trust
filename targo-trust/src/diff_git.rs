@@ -682,7 +682,7 @@ impl GitDiffReport {
         eprintln!();
 
         // Summary table.
-        eprintln!("  {:>20}  {:>8}  {:>8}", "", &self.from_ref, &self.to_ref);
+        eprintln!("  {:>20}  {:>8}  {:>8}", "", self.from_ref, self.to_ref);
         eprintln!(
             "  {:>20}  {:>8}  {:>8}",
             "Functions", self.from_summary.functions, self.to_summary.functions,

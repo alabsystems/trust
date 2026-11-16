@@ -65,11 +65,11 @@ fn no_index_update_sparse() {
     no_index_update(
         str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 
 "#]],
         str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 
 "#]],
     );
@@ -80,11 +80,11 @@ fn no_index_update_git() {
     no_index_update(
         str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 
 "#]],
         str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 
 "#]],
     );
@@ -113,7 +113,8 @@ fn no_index_update(expected: impl IntoData, expected_unstable_option: impl IntoD
         .with_stderr_data(expected)
         .run();
 
-    p.cargo("generate-lockfile -Zno-index-update")
+    p.cargo("generate-lockfile")
+        .arg("-Zno-index-update")
         .masquerade_as_nightly_cargo(&["no-index-update"])
         .with_stdout_data("")
         .with_stderr_data(expected_unstable_option)
@@ -273,14 +274,14 @@ fn generate_lockfile_holds_lock_and_offline() {
     p.cargo("generate-lockfile")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 
 "#]])
         .run();
 
     p.cargo("generate-lockfile --offline")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 
 "#]])
         .run();
@@ -288,6 +289,7 @@ fn generate_lockfile_holds_lock_and_offline() {
 
 #[cargo_test]
 fn publish_time_feature_gated() {
+    // Trust: retain the channel refusal and exact current Trust guidance.
     let p = project()
         .file(
             "Cargo.toml",
@@ -306,7 +308,7 @@ fn publish_time_feature_gated() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] the `--publish-time` flag is unstable, pass `-Z unstable-options` to enable it
-See https://github.com/rust-lang/cargo/issues/5221 for more information about the `--publish-time` flag.
+See https://github.com/alabsystems/Trust/issues for more information about the `--publish-time` flag.
 
 "#]])
         .run();
@@ -338,11 +340,12 @@ fn publish_time() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("generate-lockfile --publish-time 2025-03-01T06:00:00Z -Zunstable-options")
+    p.cargo("generate-lockfile --publish-time 2025-03-01T06:00:00Z")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["publish-time"])
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions as of 2025-03-01T06:00:00Z
+[LOCKING] 2 packages to highest compatible versions as of 2025-03-01T06:00:00Z
 [ADDING] has_time v2025.1.1 (available: v2025.6.1)
 
 "#]])
@@ -400,7 +403,8 @@ fn publish_time_no_candidates() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("generate-lockfile --publish-time 2025-03-01T06:00:00Z -Zunstable-options")
+    p.cargo("generate-lockfile --publish-time 2025-03-01T06:00:00Z")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["publish-time"])
         .with_status(101)
         .with_stderr_data(str![[r#"
@@ -434,7 +438,8 @@ fn publish_time_invalid() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("generate-lockfile --publish-time 2025-03-01T06:00:00Z -Zunstable-options")
+    p.cargo("generate-lockfile --publish-time 2025-03-01T06:00:00Z")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["publish-time"])
         .with_status(101)
         .with_stderr_data(str![[r#"

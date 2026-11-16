@@ -24,14 +24,14 @@
 name = "memchr"
 version = "2.8.3"
 edition = "2021"
-rust-version = "1.61"
+# Not upstream's 1.61: `#[expect(lint, reason = ...)]` (src/scan.rs) is Rust 1.81.
+rust-version = "1.81"
 license = "Unlicense OR MIT"
 authors = [
     "Andrew Yates <andrewyates.name@gmail.com>",
     "Andrew Gallant <jamslam@gmail.com>",
 ]
 description = "Scalar, verification-clean routines for 1, 2 or 3 byte search and single substring search (first-party Trust replacement for the memchr crate)."
-homepage = "https://github.com/BurntSushi/memchr"
 repository = "https://github.com/BurntSushi/memchr"
 keywords = ["memchr", "memmem", "substring", "find", "search"]
 

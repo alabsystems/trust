@@ -1,6 +1,6 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aprivate_interfaces
 //@ edition: 2021
 //! Trust (wave-UVL): a UNION reached at a WHOLE-VALUE position — a const's own
 //! declared type, a local, a param, an array element — and the UNION LITERAL that

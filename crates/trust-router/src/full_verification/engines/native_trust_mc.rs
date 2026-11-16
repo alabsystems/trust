@@ -19,7 +19,13 @@ pub struct NativeTrustMcTrustIrEngine {
 /// `rustc_session::options` owns the authoritative value; this constant exists
 /// only so a session-less constructor lands on the same budget the compiler
 /// would have chosen by default. Keep the two in sync.
-pub const DEFAULT_PER_OBLIGATION_TIMEOUT_MS: u64 = 5_000;
+// Trust: 2026-09-21 — 5_000 -> 20_000, mirroring the `-Z trust-verify-timeout-ms`
+// default raised in `rustc_session::options` in the same commit. The native lane
+// derives its wall-clock watchdog as `timeout + 2s`, so the old value gave a 7s
+// ceiling against a MEASURED 3.3s idle PDR cost for a 64-bit `decreases` ranking
+// VC — a margin ordinary parallel load consumed, which made the verdict depend on
+// machine load rather than on the obligation.
+pub const DEFAULT_PER_OBLIGATION_TIMEOUT_MS: u64 = 20_000;
 
 impl NativeTrustMcTrustIrEngine {
     /// Build the engine with the compiler's configured per-obligation SMT budget.
@@ -45,44 +51,10 @@ impl NativeTrustMcTrustIrEngine {
         // whole crate get verified. SOUND: a shorter budget only ever yields an
         // EARLIER Unknown/Timeout (fail-closed) — never a proof.
         //
-        // Trust (proof-mode wiring — REGRESSION FIX): the native trust-mc engine
-        // exists to discharge the typed CHC/PDR bundle. Its consumer
-        // (`evidence_from_native_trust_ir_bundle_with_deadline`) fail-closes at
-        // its first gate unless the adapter is configured for CHC or PDR/IC3, but
-        // `TrustMcConfig::new()` defaults `proof_mode` to `Bmc`. Configure PdrIc3
-        // here too so this engine's adapter agrees with the native-bundle consumer
-        // (`bundle_evidence.rs`) instead of leaving a Bmc adapter that can never
-        // reach the CHC/PDR solve. SOUND: proof mode only selects which sound
-        // solver lane runs; it never turns an unsolved obligation into a proof.
-        // NOTE: `Chc` and `PdrIc3` both clear that gate and both carry the same
-        // `TrustMcProofProvenance::unbounded` strength (trust-bmc
-        // `subprocess.rs`), so this choice is not what bounds the engine's
-        // capability — the budget is.
-        //
-        // Do NOT "upgrade" this to `Chc` expecting a broader portfolio. It is a
-        // tempting misread and it is wrong in both directions.
-        // `chc_pdr_engine_from_config` (trust-bmc `verifier_api.rs`) does map
-        // Chc -> AdaptivePortfolio and PdrIc3 -> Pdr, but `options.engine`
-        // selects a solver in exactly ONE place — the `match request.options
-        // .engine` inside `solve_typed_chc_pdr_with_ay` (trust-mc-driver
-        // `native.rs`), reachable only through `NativeTypedChcPdrRunner::solve`,
-        // which no production call site here uses. Every adapter entry point
-        // that actually solves lands in `solve_typed_chc_pdr_full_with_ay`,
-        // which hardcodes `Engine::Pdr` + `ProofMode::Strict` and never reads
-        // `options.engine`; ay-encode's `invoke.rs` says the same in its own
-        // words ("`solve_pdr_proof` always drives the PDR/IC3 engine").
-        // So flipping would select no new solver, and WOULD relabel a run that
-        // provably executed PDR — `engine: "AdaptivePortfolio"` in the options
-        // artifact, plus a moved full-verification cache key and artifact
-        // directory (pinned by
-        // `typed_full_verification_cache_key_changes_with_options`). Broadening
-        // the lanes is a trust-mc-driver change, not a value change here.
-        // (This is a property of the CURRENT call sites, not an enforced
-        // invariant — re-derive before relying on it.)
-        //
-        // The `PdrIc3` pin is DUPLICATED in a second adapter,
-        // `full_verification/native_trust_ir/bundle_evidence.rs`. Change both or
-        // neither.
+        // Enable the native CHC/PDR family. Each retained native request
+        // selects its checked execution profile; this global mode is only
+        // the family admission gate. The request keeps caller timeout and
+        // certificate ceilings and cannot borrow an ambient solver selection.
         let adapter = TrustMcVerifierApiAdapter::new(
             trust_bmc::TrustMcConfig::new()
                 .with_proof_mode(trust_bmc::TrustMcProofMode::PdrIc3)
@@ -122,8 +94,9 @@ impl VerificationEngine for NativeTrustMcTrustIrEngine {
         &self,
         request: ValidatedVerificationRequest<'_>,
     ) -> Vec<ObligationEvidence> {
-        let (bundle, obligations) = request.into_parts();
-        self.adapter.verify(bundle, obligations)
+        // The public trait entrypoint already checked this exact immutable
+        // bundle/subset. Preserve that validation across the adapter boundary.
+        self.adapter.verify_validated(request)
     }
 
     fn verify_with_context_validated(
@@ -131,20 +104,106 @@ impl VerificationEngine for NativeTrustMcTrustIrEngine {
         request: ValidatedVerificationRequest<'_>,
         context: &VerifierExecutionContext,
     ) -> VerificationRunResult {
-        let (bundle, obligations) = request.into_parts();
-        self.adapter.verify_with_context(bundle, obligations, context)
+        self.adapter.verify_with_context_validated(request, context)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use trust_verifier_api::{
+        BundleSubject, CancellationReason, EvidenceStatus, ObligationKind, SkipReason,
+        SourceLocation, TrustContractBundle,
+    };
+
     use super::*;
+
+    fn request_bundle() -> TrustContractBundle {
+        let mut bundle = TrustContractBundle::empty(
+            "mc-forwarding",
+            BundleSubject::Artifact { name: "caller".into(), kind: "test".into() },
+        );
+        for id in ["first", "second"] {
+            bundle.obligations.push(TrustObligation {
+                obligation_id: id.into(),
+                kind: ObligationKind::Postcondition,
+                contract_id: None,
+                proof_item_id: None,
+                source: SourceLocation::default(),
+                description: "no typed formula: must remain unsupported".into(),
+                required_strength: None,
+                summary_facts: Vec::new(),
+                metadata: Vec::new(),
+            });
+        }
+        bundle
+    }
 
     #[test]
     fn production_adapter_uses_receipt_capable_pdr_mode() {
         let engine = NativeTrustMcTrustIrEngine::new();
 
         assert_eq!(engine.adapter.config().proof_mode, trust_bmc::TrustMcProofMode::PdrIc3);
-        assert_eq!(engine.adapter.config().timeout_ms, 5_000);
+        // Assert the CONSTANT, not a literal: this pin exists to prove the engine
+        // carries the compiler's default budget, not to freeze a particular number.
+        // The literal drifted out of sync when the default was raised 5_000 -> 20_000.
+        assert_eq!(engine.adapter.config().timeout_ms, DEFAULT_PER_OBLIGATION_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn forwarding_preserves_the_exact_requested_subset_and_missing_formula_refusal() {
+        let engine = NativeTrustMcTrustIrEngine::new();
+        let bundle = request_bundle();
+        let requested = &bundle.obligations[1..];
+        bundle.validate_requested_obligations(requested).unwrap();
+
+        let evidence = engine.verify(&bundle, requested);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].obligation_id, "second");
+        assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
+        let result = engine.verify_with_context(
+            &bundle,
+            requested,
+            &VerifierExecutionContext::new("mc-subset"),
+        );
+        assert_eq!(result.evidence, evidence);
+    }
+
+    #[test]
+    fn forwarding_keeps_public_rejection_of_substituted_and_duplicate_requests() {
+        let engine = NativeTrustMcTrustIrEngine::new();
+        let bundle = request_bundle();
+        let mut substituted = bundle.obligations[0].clone();
+        substituted.description.push_str(" changed");
+        for requested in
+            [vec![substituted], vec![bundle.obligations[0].clone(), bundle.obligations[0].clone()]]
+        {
+            assert!(engine.verify(&bundle, &requested).is_empty());
+            let result = engine.verify_with_context(
+                &bundle,
+                &requested,
+                &VerifierExecutionContext::new("mc-invalid"),
+            );
+            assert!(result.evidence.is_empty());
+            assert!(result.diagnostics.iter().any(|message| {
+                message.contains("verifier rejected non-canonical obligation request")
+            }));
+        }
+    }
+
+    #[test]
+    fn forwarding_preserves_cancellation_before_adapter_execution() {
+        let engine = NativeTrustMcTrustIrEngine::new();
+        let bundle = request_bundle();
+        let context = VerifierExecutionContext::new("mc-cancelled");
+        context.cancellation.cancel(CancellationReason::UserRequested);
+        let result = engine.verify_with_context(&bundle, &bundle.obligations, &context);
+        assert!(result.evidence.is_empty());
+        assert_eq!(result.skipped.len(), 2);
+        assert!(result.skipped.iter().all(|row| {
+            matches!(
+                row.reason,
+                SkipReason::Canceled { reason: Some(CancellationReason::UserRequested) }
+            )
+        }));
     }
 }

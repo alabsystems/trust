@@ -815,7 +815,7 @@
       "module_summary": {
         "block_body_lengths": [
           [
-            5
+            4
           ]
         ],
         "block_counts": [
@@ -985,7 +985,7 @@
     "functions_decompiled": 1,
     "instructions": 2,
     "memory_facts": 2,
-    "output_content_sha256": "94c0a4a60a82fec7326b8e93645ddd93b0423319bc2b7573eb7d420a091fa88e",
+    "output_content_sha256": "1d73f3065764b23a9129253fbe12de7b5a07dbcbd498983ff678434ef3ce3efb",
     "output_kind": "trust_ir_json",
     "output_trust_level": "partial",
     "output_validation": "lifted_trust_ir_partial",

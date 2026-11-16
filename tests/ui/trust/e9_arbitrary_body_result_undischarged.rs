@@ -22,7 +22,9 @@ clean {
         fun x => Nat.le.refl (UInt64.toNat x)
 }
 pub fn busy(x: u64) -> u64
-    //~^ ERROR Trust strict verification failed for
+    // RE-PINNED 2026-09-14: the strict Clean citation audit refuses first and aborts the
+    // compile, so the per-function strict-verification error is no longer reached; the
+    // control still fails closed on the citation (annotated below).
     ensures result >= x by u64_ge_refl
     //~^ ERROR citation `u64_ge_refl` failed the strict Clean statement/certification audit
 {

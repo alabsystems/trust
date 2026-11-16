@@ -96,7 +96,7 @@
         "dispatch_id": "export-run:vc0",
         "function": "main",
         "origin_sha256": "521407299a145e754eb7ae53f5b7699be62e462ba526664fa2783f564846b2f6",
-        "solver": "ay-incremental",
+        "solver": "ay-in-process",
         "status": "missing",
         "vc_sha256": "d2515b3f23c3a1f4796b4586cc98ca0d1c836d9257f36e563ca18364b1ae5b89"
       }

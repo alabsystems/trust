@@ -80,133 +80,34 @@
 //! A failure here is therefore never flaky; it always means the proof state and
 //! the code disagree about what is claimed.
 //!
-//! Opt-in: skips with a notice when no `clean` checker is discoverable.
+//! # Two halves
+//!
+//! The theorem names, the obligation-2 non-regression and the cap coupling are
+//! asserted IN PROCESS by `trust_integration_tests::clean_proof_obligations`
+//! (`fast.clean-proof-obligations`, and the push lane when `proofs/` or the
+//! bridge source moves), through the Clean kernel linked into this crate:
+//! nothing there is discovered and nothing skips. This file is the BINARY
+//! cross-check: a `clean` built from the pinned `first-party/clean` must reach
+//! the same verdicts through `clean check` and `clean export-cert`, reading the
+//! same constants. It is `#[ignore]`d and runs only under
+//! `slow.clean-binary-proof-gates`, which builds that `clean` and names it in
+//! `TRUST_CLEAN_BIN`; selected without it, it panics with the build recipe.
 
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use trust_integration_tests::clean_test_support::clean_checker_path;
-
-/// The reduction — everything downstream of the hypothesis. All must be real,
-/// exported, axiom-free Theorems.
-const REQUIRED_REDUCTION_THEOREMS: &[&str] = &[
-    "G16Mul.mul_equiv",
-    "G16Mul.addval",
-    "G16Mul.blast_equals_ir",
-    "G16Mul.blast_value_eq",
-    "G16Mul.agreement_is_discriminating",
-    // The faithfulness witnesses for `mul_ay`. These are `rfl`, so the kernel
-    // COMPUTES both multipliers and compares words — without them the
-    // decomposition could drift from ay's loop and nothing would notice.
-    "G16Mul.ay_w1",
-    "G16Mul.ay_w3",
-    // First brick of obligation 2.
-    "G16Mul.shlk_shl1",
-    // Obligation 2 verified EXHAUSTIVELY at widths 1..5 — every pair of n-bit
-    // words, 1_364 pairs, all carry patterns. `rfl`, so the kernel COMPUTES
-    // both multipliers over the enumerated word lists.
-    "G16Mul.exh1",
-    "G16Mul.exh4",
-    "G16Mul.exh5",
-    // The negative control that makes those exhaustive theorems mean something:
-    // the same harness pointed at the WRONG function reports false. Without it
-    // a `checkAB` that could not distinguish anything would satisfy them
-    // vacuously.
-    "G16Mul.exh_negative_control",
-    // The arithmetic half of ripple-adder associativity, proved from the bare
-    // prelude: two words of the SAME LENGTH with the SAME VALUE are the same
-    // word. This is the piece obligation 2's general proof was blocked on.
-    "G16Mul.toNat_inj",
-    "G16Mul.double_cancel",
-    "G16Mul.parity_cons",
-    // The length hypothesis of toNat_inj is load-bearing, not bookkeeping:
-    // [] and [false] share a value and differ in length, so dropping it would
-    // make the theorem FALSE.
-    "G16Mul.toNat_len_needed",
-    "G16Mul.llen_len_differs",
-    // Lemma 1 of the three associativity needs: the value law at equal lengths,
-    // plus the bound and uniqueness step that turn a value equation back into a
-    // bit equation.
-    "G16Mul.wadd_value",
-    "G16Mul.toNat_lt_pow2",
-    "G16Mul.carry_unique",
-    "G16Mul.lt_absurd",
-    "G16Mul.llen_addRec",
-    "G16Mul.toNatN_eq_toNat",
-    // Lemma (a): RIPPLE-ADDER ASSOCIATIVITY, and the general remainder
-    // uniqueness it needs (the two carry corrections ADD, reaching 2).
-    "G16Mul.wadd_assoc",
-    "G16Mul.rem_unique",
-    // Its non-vacuity: the two groupings genuinely produce DIFFERENT carry-outs
-    // while agreeing on the result, which is why a bit-wise proof is impossible
-    // and the value route was required.
-    "G16Mul.assoc_carries_differ",
-    "G16Mul.assoc_witness",
-    // Lemma (b): the low bits of a sum depend only on the low bits of the
-    // operands, and the shift distribution it yields.
-    "G16Mul.droplast_addRec",
-    "G16Mul.shl1_wadd",
-    // Lemma (c) and the discharge of obligation 2 itself.
-    "G16Mul.accRows_lemma",
-    "G16Mul.addRec_zeros",
-    "G16Mul.shlk_wadd",
-];
-
-/// The name a proof of OBLIGATION 2 (`mul_ay = mul_m`, pure mathematics, fully
-/// inside clean) must take. Unlike `DISCHARGE_THEOREM` this one needs no
-/// reference to ay at all — anyone can close it.
-const MODEL_MATCH_THEOREM: &str = "G16Mul.mul_ay_matches_model";
-
-/// The name a proof of the correspondence MUST take when it lands. Naming it in
-/// advance is what lets this gate detect the transition rather than silently
-/// keep passing.
-const DISCHARGE_THEOREM: &str = "G16Mul.ay_blast_agrees";
-
-/// The cap that must stay in force while `DISCHARGE_THEOREM` is absent.
-const EXPECTED_MUL_WIDTH_CAP: u32 = 8;
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().expect("repo root")
-}
-
-/// Read `MAX_RECHECKABLE_MUL_WIDTH` out of the bridge source, so the coupling is
-/// against the value the gate ACTUALLY compiles with, not a copy of it here.
-fn declared_mul_width_cap() -> u32 {
-    let src = repo_root().join("crates/trust-cg-bridge/src/verify_output.rs");
-    let text = std::fs::read_to_string(&src)
-        .unwrap_or_else(|e| panic!("must read {}: {e}", src.display()));
-    let line =
-        text.lines().find(|l| l.contains("const MAX_RECHECKABLE_MUL_WIDTH")).unwrap_or_else(|| {
-            panic!(
-                "MAX_RECHECKABLE_MUL_WIDTH must still exist in {}: if the tractability guard was \
-                 removed, the wide-Mul kernel grade is being claimed on an inspection-level \
-                 assumption — see this file's header",
-                src.display()
-            )
-        });
-    let digits: String = line
-        .rsplit('=')
-        .next()
-        .expect("the const must have an initialiser")
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().unwrap_or_else(|e| panic!("unparsable cap in {line:?}: {e}"))
-}
+use trust_integration_tests::clean_proof_obligations::{
+    DISCHARGE_THEOREM, G16_MULTIPLIER_PROOF, G16_REDUCTION_THEOREMS, MODEL_MATCH_THEOREM,
+    declared_mul_width_cap, mul_width_coupling_violation, repo_path,
+};
+use trust_integration_tests::clean_test_support::require_clean_bin;
 
 #[test]
+#[ignore = "needs TRUST_CLEAN_BIN (slow.clean-binary-proof-gates)"]
 fn ay_blast_correspondence_gate() {
-    let proof = repo_root().join("proofs/codegen-equivalence/g16_multiplier_equivalence.lean");
+    let proof = repo_path(G16_MULTIPLIER_PROOF);
     assert!(proof.exists(), "g16_multiplier_equivalence.lean must exist at {}", proof.display());
 
-    let Some(bin) = clean_checker_path() else {
-        eprintln!(
-            "NOTICE: no `clean` checker discoverable — skipping the ay-blast correspondence \
-             gate. Proof at {}.",
-            proof.display()
-        );
-        return;
-    };
+    let bin = require_clean_bin();
 
     // (1) The file kernel-checks with no sorry-axioms.
     let check = Command::new(&bin)
@@ -267,7 +168,7 @@ fn ay_blast_correspondence_gate() {
         .collect();
     let has = |n: &str| exported.iter().any(|t| t == n || t.ends_with(n));
 
-    for required in REQUIRED_REDUCTION_THEOREMS {
+    for required in G16_REDUCTION_THEOREMS {
         assert!(
             has(required),
             "{required} must be an EXPORTED, axiom-free Theorem — the reduction from the \
@@ -276,62 +177,18 @@ fn ay_blast_correspondence_gate() {
         );
     }
 
-    // (3) THE COUPLING. The obligation is open, so the cap must be in force.
-    // The bridge is decomposed into TWO obligations of different kind:
-    //   1. `AyBlastAgrees` — ay's Rust emits `mul_ay` (inspection; un-closable
-    //      inside clean, but now a line-by-line structural comparison);
-    //   2. `AyModelMatches` — `mul_ay = mul_m` (pure mathematics, closable).
-    // The cap may only be lifted when BOTH are discharged; closing one alone
-    // leaves the chain broken, so the gate tracks them separately and reports
-    // which remains.
-    let rust_gap_closed = has(DISCHARGE_THEOREM);
-    let model_gap_closed = has(MODEL_MATCH_THEOREM);
-    let discharged = rust_gap_closed && model_gap_closed;
-    let cap = declared_mul_width_cap();
-
-    // Obligation 2 IS discharged (`mul_ay_matches_model`), and must stay so: it
-    // is the only half of the correspondence that clean can prove, so losing it
-    // would silently return the bridge to a two-obligation state.
-    assert!(
-        model_gap_closed,
-        "{MODEL_MATCH_THEOREM} must be an EXPORTED, axiom-free Theorem — obligation 2 \
-         (mul_ay = mul_m) was DISCHARGED and must not regress; exported: {exported:?}"
-    );
-    if !rust_gap_closed {
+    // (3) THE COUPLING, by the same rule the in-process half applies
+    // (`mul_width_coupling_violation`): obligation 2 must stay discharged,
+    // discharging both marks the transition, and otherwise the cap must stay
+    // in force. The cap is read out of the bridge source, not copied.
+    if let Some(violation) = mul_width_coupling_violation(has, declared_mul_width_cap()) {
+        panic!("{violation}\nexported: {exported:?}");
+    }
+    if !has(DISCHARGE_THEOREM) {
         eprintln!(
             "NOTE: obligation 2 (mul_ay = mul_m) is CLOSED by {MODEL_MATCH_THEOREM}. The cap \
              stays in force because {DISCHARGE_THEOREM} (ay's encoder emits mul_ay) remains \
              open — that one is an inspection obligation and cannot be discharged inside clean."
         );
     }
-
-    if discharged {
-        panic!(
-            "BOTH bridge obligations are now discharged ({DISCHARGE_THEOREM} and \
-             {MODEL_MATCH_THEOREM}) — the ay-blast correspondence is complete.\n\
-             This gate is deliberately failing to mark the transition, not because anything is \
-             broken. Next steps:\n\
-               1. a wide `Mul` may now cite the structured theorem instead of re-checking a \
-                per-instance SAT refutation, so MAX_RECHECKABLE_MUL_WIDTH (currently {cap}) can \
-                be raised or removed;\n\
-               2. rewrite this gate to assert the NEW state (correspondence proved, cap lifted) \
-                rather than the gap;\n\
-               3. update the honesty notes in g16_multiplier_equivalence.lean, \
-                i128_mul_corner_bounds.lean and structured_multiplier_proof_gate.rs, which all \
-                record wide `Mul` as [VALIDATED] pending exactly this."
-        );
-    }
-
-    assert_eq!(
-        cap, EXPECTED_MUL_WIDTH_CAP,
-        "MAX_RECHECKABLE_MUL_WIDTH is {cap}, expected {EXPECTED_MUL_WIDTH_CAP}, while \
-         the bridge is INCOMPLETE (rust_gap_closed={rust_gap_closed}, \
-         model_gap_closed={model_gap_closed}).\n\
-         The cap and the open obligation are the same fact: without a proof that ay's blast IS \
-         the model's multiplier, a wide `Mul` re-check has no structured theorem to cite, and \
-         the per-instance SAT refutation is intractable (~16x steps per +2 bits; ~2.0M at width \
-         8). Raising the cap here would claim a kernel grade on an inspection-level assumption. \
-         If you intend to lift it, discharge the correspondence first and name the proof \
-         {DISCHARGE_THEOREM}."
-    );
 }

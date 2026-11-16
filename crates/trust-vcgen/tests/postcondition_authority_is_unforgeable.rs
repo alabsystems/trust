@@ -26,6 +26,7 @@ fn caller() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "parse".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -54,6 +55,7 @@ fn caller() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

@@ -1,0 +1,180 @@
+{
+  "name": "bug_e6_post_mut_param",
+  "def_path": "probes::bug_e6_post_mut_param",
+  "span": {
+    "file": "src/probes.rs",
+    "line_start": 87,
+    "col_start": 0,
+    "line_end": 87,
+    "col_end": 95
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": "y"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "src/probes.rs",
+                "line_start": 87,
+                "col_start": 95,
+                "line_end": 87,
+                "col_end": 95
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "src/probes.rs",
+        "line_start": 87,
+        "col_start": 64,
+        "line_end": 87,
+        "col_end": 75
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) >= (0)"
+    }
+  ],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "y",
+                "Int"
+              ]
+            },
+            {
+              "Int": -9223372036854775808
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "y",
+                "Int"
+              ]
+            },
+            {
+              "Int": 9223372036854775807
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [
+    {
+      "Ge": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": 0
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) >= (0)"
+    ],
+    "invariants": []
+  }
+}

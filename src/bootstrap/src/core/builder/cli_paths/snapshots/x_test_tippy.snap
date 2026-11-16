@@ -4,5 +4,5 @@ expression: test src/tools/tippy
 ---
 [Test] test::Clippy
     targets: [x86_64-unknown-linux-gnu]
-    - Set({test::src/tools/tippy})
-    - Suite(test::src/tools/tippy/tests)
+    - Set({src/tools/tippy})
+    - Suite(src/tools/tippy/tests)

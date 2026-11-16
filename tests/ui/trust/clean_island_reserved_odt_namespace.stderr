@@ -1,0 +1,25 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (my_trust_type_helper, TrustOdtish)
+  --> $DIR/clean_island_reserved_odt_namespace.rs:18:5
+   |
+LL | /     def my_trust_type_helper : Nat := 0
+LL | |     def TrustOdtish : Nat := 1
+   | |______________________________^
+
+error: Clean island declaration `trust_type_clean_island_reserved_odt_namespace__Phase.toTag` declares into the compiler's ODT readable-alias namespace (`trust_type_*`); that namespace is reserved for the checked aliases the compiler generates for Rust types, and an island may not define or shadow a name in it. Refer to the generated `trust_type_<crate>__<Type>` names from your theorems, and give your own declarations your own names
+  --> $DIR/clean_island_reserved_odt_namespace.rs:23:5
+   |
+LL |     def trust_type_clean_island_reserved_odt_namespace__Phase.toTag (n : Nat) : UInt8 := 0
+   |     ^^^
+   |
+   = note: the Clean island was rejected during resolver checking (two-language design E10)
+
+error: Clean island declaration `TrustOdt.Bar` declares into the compiler's ODT nominal-type namespace (`TrustOdt.*`); that namespace is reserved for the nominal identities of Rust types and the members the kernel registers under them, and an island may not define or shadow a name in it. Give your declaration your own name
+  --> $DIR/clean_island_reserved_odt_namespace.rs:28:5
+   |
+LL |     structure TrustOdt.Bar where
+   |     ^^^^^^^^^
+   |
+   = note: the Clean island was rejected during resolver checking (two-language design E10)
+
+error: aborting due to 2 previous errors
+

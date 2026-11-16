@@ -524,17 +524,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bridge_default_trait() {
-        let bridge = CertificationBridge::default();
-        let vc = sample_vc();
-        let result = proved_result();
-        let output = bridge
-            .certify_unchecked(&vc, &result, vec![1], "2026-03-28T00:00:00Z")
-            .expect("default bridge should work");
-        assert!(output.has_record());
-    }
-
-    #[test]
     fn test_bridge_with_pipeline() {
         let pipeline = CertificationPipeline::with_prover_version("custom 1.0");
         let bridge = CertificationBridge::with_pipeline(pipeline);

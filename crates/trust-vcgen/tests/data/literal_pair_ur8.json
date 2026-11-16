@@ -1,0 +1,78 @@
+{
+  "name": "ur8",
+  "def_path": "literal_pair_width_arms::ur8",
+  "span": {
+    "file": "literal_pair_width_arms.rs",
+    "line_start": 40,
+    "col_start": 0,
+    "line_end": 42,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Rem",
+                  {
+                    "Constant": {
+                      "Int": -128
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -1
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_pair_width_arms.rs",
+                "line_start": 41,
+                "col_start": 13,
+                "line_end": 41,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Int": {
+        "width": 8,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

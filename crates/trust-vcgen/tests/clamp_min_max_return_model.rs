@@ -71,6 +71,7 @@ fn clamp_ret_fn(precond: bool) -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                     },
                 },
@@ -94,6 +95,7 @@ fn clamp_ret_fn(precond: bool) -> VerifiableFunction {
             ),
         ])],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -114,6 +116,7 @@ fn clamp_const_ret_fn(lo: i128, hi: i128, post: Formula) -> VerifiableFunction {
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         is_foreign: false,
     };
     f.postconditions = vec![post];
@@ -135,6 +138,7 @@ fn ord2_ret_fn(method: &str, post: Formula) -> VerifiableFunction {
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         is_foreign: false,
     };
     f.postconditions = vec![post];
@@ -250,4 +254,52 @@ fn max_return_carries_unconditional_bound_over_ret() {
             && dbg.contains("Ge(Var(\"_0\", Int), Var(\"b\", Int))"),
         "max result must pin `_0 >= a` AND `_0 >= b` over the return slot: {dbg}"
     );
+}
+
+// (4) SOUNDNESS (Trust, 2026-10-04, NAME-ANCHOR-2) — a USER `Self`: the trait path
+// `<user::E as core::cmp::Ord>::min` is std's, but `Ord::min`/`max`/`clamp` are
+// provided methods an impl may override, so the body that runs is the user's. Its
+// result is NOT bounded by its arguments, and the return-slot pin must not say it
+// is. Measured: a `#[repr(u8)]` enum whose `min` returns `E::B` was certified and
+// its `+ 100` overflow check elided (`tests/ui/trust/ord_min_max_requires_primitive_self.rs`).
+// The postcondition here is unrelated to `a`/`b`, so any `_0 <= a` / `_0 >= a`
+// in the VC is the pin, not the claim.
+fn user_self_ord2_ret_fn(callee: &str) -> VerifiableFunction {
+    let user_e =
+        Ty::adt("user::E", vec![("__tag".to_string(), Ty::Int { width: 64, signed: true })]);
+    let mut f = ord2_ret_fn("min", Formula::Bool(false));
+    for local in &mut f.body.locals {
+        local.ty = user_e.clone();
+    }
+    f.body.return_ty = user_e;
+    let Terminator::Call { func, .. } = &mut f.body.blocks[0].terminator else {
+        unreachable!("ord2_ret_fn's block 0 is the call")
+    };
+    *func = callee.to_string();
+    f.postconditions = vec![Formula::Le(
+        Box::new(Formula::Var("_0".into(), Sort::Int)),
+        Box::new(Formula::Int(7)),
+    )];
+    f
+}
+
+#[test]
+fn a_user_self_ord_call_pins_nothing_over_ret() {
+    for callee in [
+        "<user::E as core::cmp::Ord>::min",
+        "<user::E as core::cmp::Ord>::max",
+        "<user::E as std::cmp::Ord>::min",
+        "core::cmp::min",
+        "core::cmp::Ord::max",
+    ] {
+        let dbg = postcondition_dbg(&user_self_ord2_ret_fn(callee));
+        for pin in [
+            "Le(Var(\"_0\", Int), Var(\"a\", Int))",
+            "Ge(Var(\"_0\", Int), Var(\"a\", Int))",
+            "Le(Var(\"_0\", Int), Var(\"b\", Int))",
+            "Ge(Var(\"_0\", Int), Var(\"b\", Int))",
+        ] {
+            assert!(!dbg.contains(pin), "`{callee}` on a user `Self` must not pin {pin}: {dbg}");
+        }
+    }
 }

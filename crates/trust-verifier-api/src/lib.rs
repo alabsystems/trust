@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 //! Public Trust verifier API boundary.
 //!
 //! This crate defines the stable data boundary between Trust and verifier
@@ -6,7 +6,13 @@
 //! each `TrustObligation`, and return structured `ObligationEvidence` with
 //! enough publication metadata for dscan and dpub to audit releases.
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "native-trust-ir-claims")]
+pub mod native_contract_claim;
+pub mod native_routing_identity;
+pub mod trust_spec_native_formula;
+
+use std::cell::OnceCell;
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,7 +30,12 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub use trust_ir_contract::{
     AssuranceLevel, ProofStrength, ReasoningKind, TrustSpecVariableOrigin,
 };
-use trust_types::digest::{canonicalize_json_in_place, is_stable_sha256_hex, stable_sha256_hex};
+use trust_types::digest::{
+    canonicalize_json_in_place, is_stable_sha256_hex, stable_sha256_hex, stable_sha256_hex_parts,
+};
+
+mod native_stop;
+pub use native_stop::{NativeStructuralStop, qualified_native_structural_stop};
 
 /// Schema version for serialized verifier API payloads.
 pub const SCHEMA_VERSION: &str = "trust.verifier-api.v1";
@@ -45,18 +56,15 @@ pub const MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION: usize = 256;
 /// ceiling is deliberately larger while still preventing an unbounded vector.
 pub const MAX_EVIDENCE_ARTIFACTS_PER_RUN_MANIFEST: usize = 65_536;
 
-/// Maximum typed obligations, evidence records, or skipped records accepted
-/// in one serialized verifier run. The in-tree large-function regression uses
-/// 100,000 obligations; this retains headroom while closing unbounded arrays.
-pub const MAX_VERIFIER_RUN_RECORDS: usize = 131_072;
-
-/// Maximum combined obligations, evidence decisions, and skipped records in a
-/// run envelope. The individual vectors remain independently bounded; this
-/// aggregate ceiling prevents a caller from filling every vector to its cap.
-pub const MAX_VERIFIER_RUN_AGGREGATE_RECORDS: usize = 2 * MAX_VERIFIER_RUN_RECORDS;
-
-/// Maximum top-level diagnostic messages in a run or release manifest.
-pub const MAX_VERIFIER_RUN_DIAGNOSTICS: usize = 65_536;
+// Trust (T3 L4, C09d; design §1, MEMORY-1, the size census's C09 rows): a bundle, run or
+// manifest has no record-count, aggregate, diagnostic-count or whole-envelope byte bound, and
+// a contract predicate or summary fact no node, scalar-byte or text-byte bound. Each grew
+// with the program a Trust compile verifies, so each refused a large program, not a
+// malformed one. Validation refuses what is malformed (a non-canonical identifier or text,
+// an ill-sorted predicate, a duplicate, a dangling reference), never what is large. The
+// one nesting bound a contract predicate still meets is the one its readers decode,
+// `trust_types::json_depth::MAX_DEEP_NESTING` (`validate_decodable_json`), and the
+// decoders read deep input up to it (`json_depth::from_slice_deep`).
 
 /// Maximum engine diagnostic messages retained with one evidence decision.
 pub const MAX_EVIDENCE_DIAGNOSTICS_PER_RECORD: usize = 256;
@@ -69,15 +77,9 @@ pub const MAX_VERIFIER_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 /// actionable run result.
 pub const MAX_OBLIGATION_DESCRIPTION_BYTES: usize = 1024 * 1024;
 
-/// Maximum serialized JSON bytes accepted by the checked run/manifest ingress
-/// helpers. Generic `Deserialize` implementations cannot inspect the source
-/// buffer length, so untrusted callers should use those helpers.
-pub const MAX_VERIFIER_JSON_ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
-
-/// Structural work limits for a programmatically constructed counterexample
-/// JSON value. `serde_json` also enforces its own parser recursion limit.
-pub const MAX_COUNTEREXAMPLE_JSON_SCALAR_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_COUNTEREXAMPLE_JSON_NODES: usize = 1_000_000;
+/// Container nesting accepted in a counterexample's JSON value, the nesting guard
+/// `serde_json`'s own parser applies to a decoded one. Trust (T3 L4, C09d): its node and
+/// scalar-byte bounds are deleted; this guard is a wire shape, not a program size.
 pub const MAX_COUNTEREXAMPLE_JSON_DEPTH: usize = 128;
 
 /// Bounded engine-manifest and bundle collection sizes used at serde and
@@ -85,18 +87,10 @@ pub const MAX_COUNTEREXAMPLE_JSON_DEPTH: usize = 128;
 pub const MAX_ENGINE_CAPABILITIES: usize = 256;
 pub const MAX_ENGINE_PROOF_MODES: usize = 64;
 pub const MAX_ENGINE_PROVENANCE_FIELD_BYTES: usize = 4096;
-pub const MAX_BUNDLE_METADATA_ENTRIES: usize = 65_536;
 pub const MAX_RECORD_METADATA_ENTRIES: usize = 4096;
 pub const MAX_METADATA_VALUE_BYTES: usize = 1024 * 1024;
-/// Maximum bytes accepted in a predicate text, schema, summary-fact endpoint,
-/// or artifact URI at the typed verifier boundary.
-pub const MAX_CONTRACT_PREDICATE_TEXT_BYTES: usize = 1024 * 1024;
+/// Maximum bytes accepted in an artifact URI at the typed verifier boundary.
 pub const MAX_EVIDENCE_ARTIFACT_URI_BYTES: usize = 16 * 1024;
-pub const MAX_SUMMARY_FACT_FIELD_BYTES: usize = 16 * 1024;
-/// Structural limits for programmatically-created contract JSON/typed trees.
-pub const MAX_CONTRACT_PREDICATE_JSON_NODES: usize = 262_144;
-pub const MAX_CONTRACT_PREDICATE_JSON_DEPTH: usize = 128;
-pub const MAX_CONTRACT_PREDICATE_JSON_SCALAR_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TRUST_SPEC_BITVECTOR_WIDTH: u32 = 1_048_576;
 
 /// Canonical wrapper binding exact producer bytes to their public proof role
@@ -126,6 +120,11 @@ pub const SUMMARY_FACT_METADATA_KEY: &str = "trust.summary_fact.v1";
 /// obligation metadata without adding required public struct fields.
 pub const OBLIGATION_CONTEXT_METADATA_KEY: &str = "trust.obligation_context.v1";
 
+/// Public contract binding map: JSON serialization of the shared TrustIR
+/// `Vec<(String, ClauseBinding)>`. This is semantic contract data, not native
+/// transport metadata: canonical public digests include every binding.
+pub const TRUST_IR_CLAUSE_BINDINGS_METADATA_KEY: &str = "trust.ir.clause-bindings.v1";
+
 /// Current crate version, used by engine manifests as the API compatibility
 /// major/minor/patch value.
 pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -145,18 +144,12 @@ pub struct TrustContractBundle {
     /// Source subject covered by this bundle.
     pub subject: BundleSubject,
     /// Contract clauses preserved by the compiler boundary.
-    #[serde(deserialize_with = "deserialize_bounded_run_records")]
     pub contracts: Vec<TrustContract>,
     /// Compiler-owned proof items, such as native `proof fn`, preserved as
     /// proof artifacts rather than proc macro output or runtime functions.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_bounded_run_records"
-    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proof_items: Vec<TrustProofItem>,
     /// Verification obligations derived from the contracts and program facts.
-    #[serde(deserialize_with = "deserialize_bounded_run_records")]
     pub obligations: Vec<TrustObligation>,
     /// Source and release metadata required by publication gates.
     pub publication: PublicationMetadata,
@@ -164,11 +157,7 @@ pub struct TrustContractBundle {
     /// versioned proof-bearing keys; any such input is part of the semantic
     /// claim and must be authenticated by the producer/consumer boundary.
     /// Unknown keys remain audit-only and must not affect a proof verdict.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_bounded_bundle_metadata"
-    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata: Vec<MetadataEntry>,
 }
 
@@ -250,27 +239,38 @@ impl TrustContractBundle {
                 self.obligations.len()
             ));
         }
+        if std::ptr::eq(requested.as_ptr(), self.obligations.as_ptr())
+            && requested.len() == self.obligations.len()
+        {
+            return Ok(());
+        }
 
         let canonical_by_id: FxHashMap<&str, &TrustObligation> = self
             .obligations
             .iter()
             .map(|obligation| (obligation.obligation_id.as_str(), obligation))
             .collect();
-        let mut requested_ids = FxHashSet::default();
+        let mut requested_ids =
+            FxHashSet::with_capacity_and_hasher(requested.len(), Default::default());
         for obligation in requested {
-            validate_obligation_record(obligation)?;
+            let canonical = canonical_by_id.get(obligation.obligation_id.as_str()).copied();
+            let is_canonical_ptr =
+                canonical.is_some_and(|canonical_obl| std::ptr::eq(canonical_obl, obligation));
+            if !is_canonical_ptr {
+                validate_obligation_record(obligation)?;
+            }
             if !requested_ids.insert(obligation.obligation_id.as_str()) {
                 return Err(
                     "verifier request contains duplicate requested obligation IDs".to_string()
                 );
             }
-            let Some(canonical) = canonical_by_id.get(obligation.obligation_id.as_str()) else {
+            let Some(canonical) = canonical else {
                 return Err(format!(
                     "verifier request obligation {} is not present in bundle {}",
                     obligation.obligation_id, self.bundle_id
                 ));
             };
-            if *canonical != obligation {
+            if !is_canonical_ptr && canonical != obligation {
                 return Err(format!(
                     "verifier request obligation {} differs from its canonical bundle record",
                     obligation.obligation_id
@@ -323,132 +323,263 @@ impl TrustContractBundle {
                 self.obligations.len()
             ));
         }
+        if requested.is_empty() {
+            return Ok(CanonicalObligationSemanticDigestIndex::default());
+        }
 
-        let canonical_by_id: FxHashMap<&str, &TrustObligation> = self
-            .obligations
-            .iter()
-            .map(|obligation| (obligation.obligation_id.as_str(), obligation))
-            .collect();
-        let contracts_by_id: FxHashMap<&str, &TrustContract> = self
-            .contracts
-            .iter()
-            .map(|contract| (contract.contract_id.as_str(), contract))
-            .collect();
-        let proof_items_by_id: FxHashMap<&str, &TrustProofItem> = self
-            .proof_items
-            .iter()
-            .map(|proof_item| (proof_item.proof_item_id.as_str(), proof_item))
-            .collect();
-        let mut requested_ids = FxHashSet::default();
+        let is_exact_bundle_slice = std::ptr::eq(requested.as_ptr(), self.obligations.as_ptr())
+            && requested.len() == self.obligations.len();
+        let canonical_by_id: FxHashMap<&str, &TrustObligation> = if is_exact_bundle_slice {
+            FxHashMap::default()
+        } else {
+            self.obligations
+                .iter()
+                .map(|obligation| (obligation.obligation_id.as_str(), obligation))
+                .collect()
+        };
+        let contracts_by_id: FxHashMap<&str, &TrustContract> = if self.contracts.is_empty() {
+            FxHashMap::default()
+        } else {
+            self.contracts
+                .iter()
+                .map(|contract| (contract.contract_id.as_str(), contract))
+                .collect()
+        };
+        let proof_items_by_id: FxHashMap<&str, &TrustProofItem> = if self.proof_items.is_empty() {
+            FxHashMap::default()
+        } else {
+            self.proof_items
+                .iter()
+                .map(|proof_item| (proof_item.proof_item_id.as_str(), proof_item))
+                .collect()
+        };
+        let mut requested_ids = if is_exact_bundle_slice {
+            FxHashSet::default()
+        } else {
+            FxHashSet::with_capacity_and_hasher(requested.len(), Default::default())
+        };
+        let mut canonical_contracts: FxHashMap<&str, serde_json::Value> = FxHashMap::default();
+        let mut canonical_proof_items: FxHashMap<&str, serde_json::Value> = FxHashMap::default();
+
+        let mut subject_value = serde_json::to_value(&self.subject).map_err(|error| {
+            format!("failed to serialize canonical public obligation context: {error}")
+        })?;
+        canonicalize_json_in_place(&mut subject_value);
+
+        let mut context_map = serde_json::Map::with_capacity(7);
+        context_map.insert(
+            "bundle_id".to_string(),
+            serde_json::Value::String(self.bundle_id.clone()),
+        );
+        context_map.insert("contract".to_string(), serde_json::Value::Null);
+        context_map.insert(
+            "obligation_digest".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        context_map.insert("proof_item".to_string(), serde_json::Value::Null);
+        context_map.insert(
+            "schema".to_string(),
+            serde_json::Value::String(PUBLIC_OBLIGATION_SEMANTIC_DIGEST_SCHEMA.to_string()),
+        );
+        context_map.insert("subject".to_string(), subject_value);
+        context_map.insert(
+            "verifier_schema".to_string(),
+            serde_json::Value::String(self.schema_version.clone()),
+        );
+        let mut context_value = serde_json::Value::Object(context_map);
+        let mut payload = Vec::with_capacity(512);
         let mut digests = BTreeMap::new();
 
         for requested_obligation in requested {
-            if !requested_ids.insert(requested_obligation.obligation_id.as_str()) {
-                return Err("verifier semantic-digest request contains duplicate obligation IDs"
-                    .to_string());
-            }
-            let Some(obligation) =
-                canonical_by_id.get(requested_obligation.obligation_id.as_str()).copied()
-            else {
-                return Err(format!(
-                    "verifier semantic-digest request obligation {} is not present in bundle {}",
-                    requested_obligation.obligation_id, self.bundle_id
-                ));
-            };
-            if obligation != requested_obligation {
-                return Err(format!(
-                    "verifier semantic-digest request obligation {} differs from its canonical bundle record",
-                    requested_obligation.obligation_id
-                ));
-            }
-
-            let contract = match obligation.contract_id.as_deref() {
-                Some(contract_id) => Some(*contracts_by_id.get(contract_id).ok_or_else(|| {
-                    format!(
-                        "public obligation {} references missing contract {contract_id}",
-                        obligation.obligation_id
-                    )
-                })?),
-                None => None,
-            };
-            let proof_item = match obligation.proof_item_id.as_deref() {
-                Some(proof_item_id) => {
-                    Some(*proof_items_by_id.get(proof_item_id).ok_or_else(|| {
-                        format!(
-                            "public obligation {} references missing proof item {proof_item_id}",
-                            obligation.obligation_id
-                        )
-                    })?)
+            let obligation = if is_exact_bundle_slice {
+                requested_obligation
+            } else {
+                if !requested_ids.insert(requested_obligation.obligation_id.as_str()) {
+                    return Err(
+                        "verifier semantic-digest request contains duplicate obligation IDs"
+                            .to_string(),
+                    );
                 }
-                None => None,
+                let Some(obligation) =
+                    canonical_by_id.get(requested_obligation.obligation_id.as_str()).copied()
+                else {
+                    return Err(format!(
+                        "verifier semantic-digest request obligation {} is not present in bundle {}",
+                        requested_obligation.obligation_id, self.bundle_id
+                    ));
+                };
+                if !std::ptr::eq(obligation, requested_obligation)
+                    && obligation != requested_obligation
+                {
+                    return Err(format!(
+                        "verifier semantic-digest request obligation {} differs from its canonical bundle record",
+                        requested_obligation.obligation_id
+                    ));
+                }
+                obligation
             };
 
-            digests.insert(
-                obligation.obligation_id.clone(),
-                self.canonical_obligation_context_digest_sha256(obligation, contract, proof_item)?,
-            );
+            let contract_value = match obligation.contract_id.as_deref() {
+                Some(contract_id) => {
+                    if let Some(cached) = canonical_contracts.get(contract_id) {
+                        cached.clone()
+                    } else {
+                        let contract = *contracts_by_id.get(contract_id).ok_or_else(|| {
+                            format!(
+                                "public obligation {} references missing contract {contract_id}",
+                                obligation.obligation_id
+                            )
+                        })?;
+                        let value = Self::canonical_contract_json_value(contract)?;
+                        canonical_contracts.insert(contract_id, value.clone());
+                        value
+                    }
+                }
+                None => serde_json::Value::Null,
+            };
+            let proof_item_value = match obligation.proof_item_id.as_deref() {
+                Some(proof_item_id) => {
+                    if let Some(cached) = canonical_proof_items.get(proof_item_id) {
+                        cached.clone()
+                    } else {
+                        let proof_item = *proof_items_by_id.get(proof_item_id).ok_or_else(|| {
+                            format!(
+                                "public obligation {} references missing proof item {proof_item_id}",
+                                obligation.obligation_id
+                            )
+                        })?;
+                        let value = Self::canonical_proof_item_json_value(proof_item)?;
+                        canonical_proof_items.insert(proof_item_id, value.clone());
+                        value
+                    }
+                }
+                None => serde_json::Value::Null,
+            };
+
+            let obligation_digest = obligation.canonical_semantic_digest_sha256_unchecked()?;
+            if let serde_json::Value::Object(map) = &mut context_value {
+                map.insert("contract".to_string(), contract_value);
+                map.insert(
+                    "obligation_digest".to_string(),
+                    serde_json::Value::String(obligation_digest),
+                );
+                map.insert("proof_item".to_string(), proof_item_value);
+            }
+            payload.clear();
+            serde_json::to_writer(&mut payload, &context_value).map_err(|error| {
+                format!("failed to encode canonical public obligation context: {error}")
+            })?;
+            let digest = stable_sha256_hex_parts(&[
+                PUBLIC_OBLIGATION_SEMANTIC_DIGEST_SCHEMA.as_bytes(),
+                b".bundle-context\0",
+                &payload,
+            ]);
+
+            digests.insert(obligation.obligation_id.clone(), digest);
         }
 
         Ok(CanonicalObligationSemanticDigestIndex { digests })
     }
 
-    fn canonical_obligation_context_digest_sha256(
-        &self,
-        obligation: &TrustObligation,
-        contract: Option<&TrustContract>,
-        proof_item: Option<&TrustProofItem>,
-    ) -> Result<String, String> {
+    fn canonical_contract_json_value(
+        contract: &TrustContract,
+    ) -> Result<serde_json::Value, String> {
         #[derive(Serialize)]
-        struct CanonicalObligationContext<'a> {
-            schema: &'static str,
-            verifier_schema: &'a str,
-            bundle_id: &'a str,
-            subject: &'a BundleSubject,
-            obligation_digest: String,
-            contract: Option<TrustContract>,
-            proof_item: Option<TrustProofItem>,
+        struct CanonicalTrustContract<'a> {
+            contract_id: &'a str,
+            kind: ContractKind,
+            predicate: &'a ContractPredicate,
+            source: &'a SourceLocation,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            metadata: Vec<&'a MetadataEntry>,
         }
 
-        let mut contract = contract.cloned();
-        if let Some(contract) = &mut contract {
-            canonicalize_contract_for_semantic_digest(contract);
-        }
-        let mut proof_item = proof_item.cloned();
-        if let Some(proof_item) = &mut proof_item {
-            proof_item.contracts.sort_by(|left, right| left.contract_id.cmp(&right.contract_id));
-            for contract in &mut proof_item.contracts {
-                canonicalize_contract_for_semantic_digest(contract);
-            }
-            sort_metadata_entries(&mut proof_item.metadata);
-        }
-
-        let canonical = CanonicalObligationContext {
-            schema: PUBLIC_OBLIGATION_SEMANTIC_DIGEST_SCHEMA,
-            verifier_schema: &self.schema_version,
-            bundle_id: &self.bundle_id,
-            subject: &self.subject,
-            obligation_digest: obligation.canonical_semantic_digest_sha256_unchecked()?,
-            contract,
-            proof_item,
+        let canonical = CanonicalTrustContract {
+            contract_id: &contract.contract_id,
+            kind: contract.kind,
+            predicate: &contract.predicate,
+            source: &contract.source,
+            metadata: sorted_metadata_entry_refs(&contract.metadata),
         };
-        let mut canonical = serde_json::to_value(&canonical).map_err(|error| {
+        let mut value = serde_json::to_value(&canonical).map_err(|error| {
             format!("failed to serialize canonical public obligation context: {error}")
         })?;
-        canonicalize_json_in_place(&mut canonical);
-        let payload = serde_json::to_vec(&canonical).map_err(|error| {
-            format!("failed to encode canonical public obligation context: {error}")
-        })?;
-        let mut material = PUBLIC_OBLIGATION_SEMANTIC_DIGEST_SCHEMA.as_bytes().to_vec();
-        material.extend_from_slice(b".bundle-context\0");
-        material.extend_from_slice(&payload);
-        Ok(stable_sha256_hex(&material))
+        canonicalize_json_in_place(&mut value);
+        Ok(value)
     }
 
-    /// Parse an untrusted JSON bundle through the whole-envelope byte cap and
-    /// the bundle's custom validated deserializer.
+    fn canonical_proof_item_json_value(
+        proof_item: &TrustProofItem,
+    ) -> Result<serde_json::Value, String> {
+        #[derive(Serialize)]
+        struct CanonicalTrustContract<'a> {
+            contract_id: &'a str,
+            kind: ContractKind,
+            predicate: &'a ContractPredicate,
+            source: &'a SourceLocation,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            metadata: Vec<&'a MetadataEntry>,
+        }
+
+        impl<'a> CanonicalTrustContract<'a> {
+            fn from_contract(contract: &'a TrustContract) -> Self {
+                Self {
+                    contract_id: &contract.contract_id,
+                    kind: contract.kind,
+                    predicate: &contract.predicate,
+                    source: &contract.source,
+                    metadata: sorted_metadata_entry_refs(&contract.metadata),
+                }
+            }
+        }
+
+        #[derive(Serialize)]
+        struct CanonicalTrustProofItem<'a> {
+            proof_item_id: &'a str,
+            name: &'a str,
+            kind: &'a ProofItemKind,
+            target: &'a ProofItemTarget,
+            signature: &'a ProofItemSignature,
+            body: &'a ProofItemBody,
+            source: &'a SourceLocation,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            contracts: Vec<CanonicalTrustContract<'a>>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            metadata: Vec<&'a MetadataEntry>,
+        }
+
+        let mut contracts: Vec<CanonicalTrustContract<'_>> = proof_item
+            .contracts
+            .iter()
+            .map(CanonicalTrustContract::from_contract)
+            .collect();
+        contracts.sort_by(|left, right| left.contract_id.cmp(right.contract_id));
+        let canonical = CanonicalTrustProofItem {
+            proof_item_id: &proof_item.proof_item_id,
+            name: &proof_item.name,
+            kind: &proof_item.kind,
+            target: &proof_item.target,
+            signature: &proof_item.signature,
+            body: &proof_item.body,
+            source: &proof_item.source,
+            contracts,
+            metadata: sorted_metadata_entry_refs(&proof_item.metadata),
+        };
+        let mut value = serde_json::to_value(&canonical).map_err(|error| {
+            format!("failed to serialize canonical public obligation context: {error}")
+        })?;
+        canonicalize_json_in_place(&mut value);
+        Ok(value)
+    }
+
+    /// Parse an untrusted JSON bundle through the bundle's custom validated deserializer.
+    ///
+    /// Trust (T3 L4, C09d): there is no whole-envelope byte cap, and a document nested past
+    /// `serde_json`'s 128-level default (a deep contract predicate) is read up to
+    /// `trust_types::json_depth::MAX_DEEP_NESTING` (`json_depth::from_slice_deep`). The
+    /// records are decoded one after another, as before, and validated as decoded.
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, String> {
-        validate_json_envelope_length(bytes.len(), "contract bundle")?;
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+        trust_types::json_depth::from_slice_deep(bytes).map_err(|error| error.to_string())
     }
 }
 
@@ -463,14 +594,12 @@ impl<'de> Deserialize<'de> for TrustContractBundle {
             schema_version: String,
             bundle_id: String,
             subject: BundleSubject,
-            #[serde(deserialize_with = "deserialize_bounded_run_records")]
             contracts: Vec<TrustContract>,
-            #[serde(default, deserialize_with = "deserialize_bounded_run_records")]
+            #[serde(default)]
             proof_items: Vec<TrustProofItem>,
-            #[serde(deserialize_with = "deserialize_bounded_run_records")]
             obligations: Vec<TrustObligation>,
             publication: PublicationMetadata,
-            #[serde(default, deserialize_with = "deserialize_bounded_bundle_metadata")]
+            #[serde(default)]
             metadata: Vec<MetadataEntry>,
         }
 
@@ -541,8 +670,9 @@ impl TrustContract {
     ///
     /// This is the public accessor over the same per-record checker
     /// [`TrustContractBundle::validate`] runs on every contract it carries:
-    /// identifier canonicality, predicate schema and structural JSON bounds
-    /// (node count, container depth, scalar bytes), source location, and the
+    /// identifier canonicality, predicate schema and shape (a JSON predicate nested no
+    /// deeper than its readers decode, `validate_decodable_json`; T3 L4 C09d deleted its
+    /// node, scalar-byte and text-byte bounds), source location, and the
     /// metadata entry limits. It is the contract-level twin of
     /// [`TrustSpecPredicate::validate`].
     ///
@@ -554,7 +684,7 @@ impl TrustContract {
     /// here lets a producer decline to mint the one record instead.
     ///
     /// Deliberately PER-RECORD. Cross-record properties — duplicate contract
-    /// IDs, aggregate record counts, obligation-to-contract references — are
+    /// IDs, obligation-to-contract references — are
     /// bundle-level and are NOT checked here, so `Ok(())` from this method is
     /// a necessary and not a sufficient condition for the enclosing bundle to
     /// validate.
@@ -649,15 +779,28 @@ impl TrustSpecPredicate {
 
     /// Encode this predicate as the preferred public contract predicate form.
     pub fn into_contract_predicate(self) -> Result<ContractPredicate, serde_json::Error> {
-        Ok(ContractPredicate::TrustIr {
-            schema: TRUST_SPEC_PREDICATE_SCHEMA_VERSION.to_string(),
-            value: serde_json::to_value(self)?,
-        })
+        trust_types::json_depth::encode_owned_on_deep_stack(
+            self,
+            |predicate| {
+                // The value also participates in source-question hashes. Give
+                // consumers the same key order under either serde map feature.
+                let mut value = serde_json::to_value(predicate)?;
+                trust_types::canonicalize_json_in_place(&mut value);
+                Ok(ContractPredicate::TrustIr {
+                    schema: TRUST_SPEC_PREDICATE_SCHEMA_VERSION.to_string(),
+                    value,
+                })
+            },
+            discard_trust_spec_predicate_iteratively,
+        )
     }
 
     /// Decode a typed Trust spec predicate from a public contract predicate.
     ///
-    /// Returns `Ok(None)` for unrelated predicate schemas.
+    /// Returns `Ok(None)` for unrelated predicate schemas. Trust (T3 L4, C09d): decoded
+    /// with `trust_types::json_depth::from_value_deep`, so a predicate nested past
+    /// `serde_json`'s default is decoded on the deep-decode stack, up to the bound
+    /// `validate_decodable_json` admits.
     pub fn from_contract_predicate(
         predicate: &ContractPredicate,
     ) -> Result<Option<Self>, serde_json::Error> {
@@ -666,7 +809,7 @@ impl TrustSpecPredicate {
             | ContractPredicate::CanonicalJson { schema, value }
                 if schema == TRUST_SPEC_PREDICATE_SCHEMA_VERSION =>
             {
-                serde_json::from_value(value.clone()).map(Some)
+                trust_types::json_depth::from_value_deep(value).map(Some)
             }
             _ => Ok(None),
         }
@@ -1128,7 +1271,9 @@ pub enum TrustSpecBvUnaryOp {
 /// Bitvector binary operators supported by the compiler-lowered specification IR.
 ///
 /// All arithmetic/bitwise/shift operators have a bitvector result of the
-/// operand width; the unsigned comparison operators have a `Bool` result.
+/// operand width; comparison operators have a `Bool` result. New operators
+/// are additive v1 capabilities: old readers reject an unknown enum tag, while
+/// every existing tag keeps its exact denotation and JSON encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -1138,6 +1283,9 @@ pub enum TrustSpecBvBinaryOp {
     Mul,
     Udiv,
     Urem,
+    /// SMT signed remainder (`bvsrem`): the sign follows the dividend. This
+    /// value operation carries no Rust definedness or proof authority.
+    Srem,
     And,
     Or,
     Xor,
@@ -1162,6 +1310,7 @@ impl TrustSpecBvBinaryOp {
             | Self::Mul
             | Self::Udiv
             | Self::Urem
+            | Self::Srem
             | Self::And
             | Self::Or
             | Self::Xor
@@ -1470,21 +1619,28 @@ impl TrustObligation {
         let payload = serde_json::to_vec(&canonical).map_err(|error| {
             format!("failed to encode canonical public obligation semantics: {error}")
         })?;
-        let mut material = PUBLIC_OBLIGATION_SEMANTIC_DIGEST_SCHEMA.as_bytes().to_vec();
-        material.push(0);
-        material.extend_from_slice(&payload);
-        Ok(stable_sha256_hex(&material))
+        Ok(stable_sha256_hex_parts(&[
+            PUBLIC_OBLIGATION_SEMANTIC_DIGEST_SCHEMA.as_bytes(),
+            &[0],
+            &payload,
+        ]))
     }
 }
 
-fn sort_metadata_entries(metadata: &mut [MetadataEntry]) {
-    metadata.sort_by(|left, right| {
+fn sorted_metadata_entry_refs(metadata: &[MetadataEntry]) -> Vec<&MetadataEntry> {
+    let mut refs: Vec<&MetadataEntry> = metadata.iter().collect();
+    refs.sort_by(|left, right| {
         (left.key.as_str(), left.value.as_str()).cmp(&(right.key.as_str(), right.value.as_str()))
     });
+    refs
 }
 
-fn canonicalize_contract_for_semantic_digest(contract: &mut TrustContract) {
-    sort_metadata_entries(&mut contract.metadata);
+fn canonical_default_admission_predicate_payload() -> &'static str {
+    static PAYLOAD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAYLOAD.get_or_init(|| {
+        let predicate = TrustSpecPredicate::new(TrustSpecExpr::bool_literal(false), Vec::new());
+        serde_json::to_string(&predicate).unwrap_or_default()
+    })
 }
 
 fn default_admission_identity_is_exact(obligation: &TrustObligation) -> bool {
@@ -1536,16 +1692,8 @@ fn default_admission_identity_is_exact(obligation: &TrustObligation) -> bool {
     else {
         return false;
     };
-    let Ok(predicate) = serde_json::from_str::<TrustSpecPredicate>(payload) else {
-        return false;
-    };
-    predicate.has_current_schema()
-        && predicate.root_sort == TrustSpecSort::Bool
-        && predicate.variables.is_empty()
-        && predicate.root.sort == TrustSpecSort::Bool
-        && matches!(&predicate.root.kind, TrustSpecExprKind::BoolLiteral { value: false })
-        && validate_trust_spec_predicate(&predicate).is_ok()
-        && serde_json::to_string(&predicate).ok().as_deref() == Some(payload)
+    let expected_payload = canonical_default_admission_predicate_payload();
+    !expected_payload.is_empty() && payload == expected_payload
 }
 
 fn unique_metadata_value<'a>(obligation: &'a TrustObligation, key: &str) -> Option<&'a str> {
@@ -1555,9 +1703,7 @@ fn unique_metadata_value<'a>(obligation: &'a TrustObligation, key: &str) -> Opti
 }
 
 fn canonical_default_admission_metadata() -> Vec<MetadataEntry> {
-    let predicate = TrustSpecPredicate::new(TrustSpecExpr::bool_literal(false), Vec::new());
-    let payload = serde_json::to_string(&predicate)
-        .expect("serializing the fixed default-admission predicate cannot fail");
+    let payload = canonical_default_admission_predicate_payload().to_string();
     vec![
         MetadataEntry {
             key: TRUST_MC_DEFAULT_FUNCTION_OBLIGATION_METADATA_KEY.to_string(),
@@ -1871,6 +2017,27 @@ pub enum ObligationOrigin {
     },
 }
 
+/// A native producer refused the reviewed module-instruction input before
+/// dispatching any solver. This reports a stop; it grants no proof authority,
+/// retry eligibility, or admission. Unknown producers must leave it absent.
+pub const NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC: &str =
+    "native TrustIr module-instruction input refused before solver dispatch";
+
+/// The full router qualified a native pre-solve refusal on its built-in
+/// trust-mc dispatch path. Generic child engines cannot author this relay.
+/// This reports only a stop, with no proof, admission or retry authority.
+pub const ROUTED_NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC: &str =
+    "full verifier relayed native TrustIr pre-solve module-instruction refusal";
+
+/// The built-in native solver completed a refutation, then its existing
+/// source-fidelity gate withheld that counterexample. This says nothing about
+/// pre-solve refusal, proof authority, or fallback eligibility.
+pub const NATIVE_REFUTATION_FIDELITY_DEMOTION_DIAGNOSTIC: &str =
+    "native completed refutation withheld by source encoding fidelity";
+/// Router-qualified form of the live built-in native demotion above.
+pub const ROUTED_NATIVE_REFUTATION_FIDELITY_DEMOTION_DIAGNOSTIC: &str =
+    "full verifier relayed native completed refutation source fidelity demotion";
+
 /// Structured evidence for a single obligation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObligationEvidence {
@@ -1946,10 +2113,13 @@ impl ObligationEvidence {
     /// and check in that route must explicitly consume the model as well.
     #[must_use]
     pub fn satisfies_proof_artifact_policy(&self) -> bool {
-        if self.artifacts.len() > MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION {
+        if trust_types::audit_ledger::cap_hit_if(
+            self.artifacts.len() > MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION,
+            "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION",
+        ) {
             return false;
         }
-        let mut identities = BTreeSet::new();
+        let mut identities = FxHashSet::default();
         if self.artifacts.iter().any(|artifact| !identities.insert((artifact.kind, &artifact.hash)))
         {
             return false;
@@ -1957,103 +2127,105 @@ impl ObligationEvidence {
         if !native_structural_domain_is_valid(&self.artifacts) {
             return false;
         }
-        let certificates = self
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.kind == EvidenceArtifactKind::ProofCertificate)
-            .collect::<Vec<_>>();
-        let transcripts = self
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.kind.is_solver_transcript())
-            .collect::<Vec<_>>();
-        let replays = self
-            .artifacts
-            .iter()
-            .filter(|artifact| {
-                matches!(
-                    artifact.kind,
-                    EvidenceArtifactKind::ProofReplayTrace | EvidenceArtifactKind::ReplayLog
-                )
-            })
-            .collect::<Vec<_>>();
-        let checks = self
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.kind == EvidenceArtifactKind::ProofCheckReport)
-            .collect::<Vec<_>>();
-        let models = self
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.kind == EvidenceArtifactKind::Model)
-            .collect::<Vec<_>>();
+        let mut certificates = (0usize, None);
+        let mut transcripts = (0usize, None);
+        let mut replays = (0usize, None);
+        let mut checks = (0usize, None);
+        let mut models = (0usize, None);
+        for artifact in &self.artifacts {
+            if artifact.kind == EvidenceArtifactKind::ProofCertificate {
+                certificates.0 += 1;
+                certificates.1.get_or_insert(artifact);
+            }
+            if artifact.kind.is_solver_transcript() {
+                transcripts.0 += 1;
+                transcripts.1.get_or_insert(artifact);
+            }
+            if matches!(
+                artifact.kind,
+                EvidenceArtifactKind::ProofReplayTrace | EvidenceArtifactKind::ReplayLog
+            ) {
+                replays.0 += 1;
+                replays.1.get_or_insert(artifact);
+            }
+            if artifact.kind == EvidenceArtifactKind::ProofCheckReport {
+                checks.0 += 1;
+                checks.1.get_or_insert(artifact);
+            }
+            if artifact.kind == EvidenceArtifactKind::Model {
+                models.0 += 1;
+                models.1.get_or_insert(artifact);
+            }
+        }
 
-        let certificate_route = certificates.len() == 1
-            && transcripts.is_empty()
-            && replays.is_empty()
-            && checks.is_empty()
-            && models.is_empty()
-            && artifact_has_valid_owned_materialization(certificates[0], &self.obligation_id)
-            && certificates[0]
-                .materialization
-                .as_ref()
-                .is_some_and(|materialization| materialization.referenced_artifacts().is_empty())
-            && self.artifacts.iter().all(|artifact| {
-                artifact.materialization.is_none()
-                    || is_native_structural_artifact(artifact)
-                    || (artifact.kind == certificates[0].kind
-                        && artifact.hash == certificates[0].hash)
+        let certificate_route = certificates.0 == 1
+            && transcripts.0 == 0
+            && replays.0 == 0
+            && checks.0 == 0
+            && models.0 == 0
+            && certificates.1.is_some_and(|cert| {
+                artifact_has_valid_owned_materialization(cert, &self.obligation_id)
+                    && cert.materialization.as_ref().is_some_and(|materialization| {
+                        materialization.referenced_artifacts().is_empty()
+                    })
+                    && self.artifacts.iter().all(|artifact| {
+                        artifact.materialization.is_none()
+                            || is_native_structural_artifact(artifact)
+                            || (artifact.kind == cert.kind && artifact.hash == cert.hash)
+                    })
             });
 
-        let dag_route = certificates.is_empty()
-            && transcripts.len() == 1
-            && replays.len() <= 1
-            && checks.len() <= 1
-            && models.len() <= 1
-            && !(replays.is_empty() && checks.is_empty())
-            && artifact_has_valid_owned_materialization(transcripts[0], &self.obligation_id)
-            && transcript_structural_lineage_is_valid(
-                transcripts[0],
-                &self.artifacts,
-                &self.obligation_id,
-            )
-            && models.first().is_none_or(|model| {
-                artifact_has_valid_owned_materialization(model, &self.obligation_id)
-                    && artifact_has_same_binding(model, transcripts[0])
-                    && artifact_has_same_structural_lineage(model, transcripts[0])
-            })
-            && replays.first().is_none_or(|replay| {
-                artifact_has_valid_owned_materialization(replay, &self.obligation_id)
-                    && artifact_has_same_binding(replay, transcripts[0])
-                    && models.first().map_or_else(
-                        || artifact_references_exactly(replay, &[transcripts[0]]),
-                        |model| artifact_references_exactly(replay, &[transcripts[0], model]),
+        let dag_route = certificates.0 == 0
+            && transcripts.0 == 1
+            && replays.0 <= 1
+            && checks.0 <= 1
+            && models.0 <= 1
+            && !(replays.0 == 0 && checks.0 == 0)
+            && transcripts.1.is_some_and(|transcript| {
+                artifact_has_valid_owned_materialization(transcript, &self.obligation_id)
+                    && transcript_structural_lineage_is_valid(
+                        transcript,
+                        &self.artifacts,
+                        &self.obligation_id,
                     )
-            })
-            && checks.first().is_none_or(|check| {
-                artifact_has_valid_owned_materialization(check, &self.obligation_id)
-                    && artifact_has_same_binding(check, transcripts[0])
-                    && match (models.first().copied(), replays.first().copied()) {
-                        (None, None) => artifact_references_exactly(check, &[transcripts[0]]),
-                        (None, Some(replay)) => {
-                            artifact_references_exactly(check, &[replay])
-                                || artifact_references_exactly(check, &[transcripts[0], replay])
-                        }
-                        (Some(model), None) => {
-                            artifact_references_exactly(check, &[transcripts[0], model])
-                        }
-                        (Some(model), Some(replay)) => {
-                            artifact_references_exactly(check, &[transcripts[0], replay, model])
-                        }
-                    }
-            })
-            && dag_has_no_unreferenced_materialized_extras(
-                &self.artifacts,
-                transcripts[0],
-                replays.first().copied(),
-                checks.first().copied(),
-                models.first().copied(),
-            );
+                    && models.1.is_none_or(|model| {
+                        artifact_has_valid_owned_materialization(model, &self.obligation_id)
+                            && artifact_has_same_binding(model, transcript)
+                            && artifact_has_same_structural_lineage(model, transcript)
+                    })
+                    && replays.1.is_none_or(|replay| {
+                        artifact_has_valid_owned_materialization(replay, &self.obligation_id)
+                            && artifact_has_same_binding(replay, transcript)
+                            && models.1.map_or_else(
+                                || artifact_references_exactly(replay, &[transcript]),
+                                |model| artifact_references_exactly(replay, &[transcript, model]),
+                            )
+                    })
+                    && checks.1.is_none_or(|check| {
+                        artifact_has_valid_owned_materialization(check, &self.obligation_id)
+                            && artifact_has_same_binding(check, transcript)
+                            && match (models.1, replays.1) {
+                                (None, None) => artifact_references_exactly(check, &[transcript]),
+                                (None, Some(replay)) => {
+                                    artifact_references_exactly(check, &[replay])
+                                        || artifact_references_exactly(check, &[transcript, replay])
+                                }
+                                (Some(model), None) => {
+                                    artifact_references_exactly(check, &[transcript, model])
+                                }
+                                (Some(model), Some(replay)) => {
+                                    artifact_references_exactly(check, &[transcript, replay, model])
+                                }
+                            }
+                    })
+                    && dag_has_no_unreferenced_materialized_extras(
+                        &self.artifacts,
+                        transcript,
+                        replays.1,
+                        checks.1,
+                        models.1,
+                    )
+            });
 
         certificate_route || dag_route
     }
@@ -2076,10 +2248,10 @@ fn artifact_has_valid_owned_materialization(artifact: &EvidenceArtifact, owner: 
         materialization.matches_hash(&artifact.hash)
             && materialization.bound_payload_bytes(artifact.kind, owner).is_some()
             && artifact.uri.contains(&artifact.hash.value)
-            && !materialization.referenced_artifacts().contains(&EvidenceArtifactReference {
-                kind: artifact.kind,
-                hash: artifact.hash.clone(),
-            })
+            && !materialization
+                .referenced_artifacts()
+                .iter()
+                .any(|reference| reference.kind == artifact.kind && reference.hash == artifact.hash)
     })
 }
 
@@ -2096,18 +2268,44 @@ fn artifact_references_exactly(
     consumer: &EvidenceArtifact,
     consumed: &[&EvidenceArtifact],
 ) -> bool {
-    let mut expected = consumed
-        .iter()
-        .map(|artifact| EvidenceArtifactReference {
-            kind: artifact.kind,
-            hash: artifact.hash.clone(),
-        })
-        .collect::<Vec<_>>();
-    expected.sort();
-    consumer
-        .materialization
-        .as_ref()
-        .is_some_and(|materialization| materialization.referenced_artifacts() == expected)
+    let Some(materialization) = consumer.materialization.as_ref() else {
+        return false;
+    };
+    let references = materialization.referenced_artifacts();
+    if references.len() != consumed.len() {
+        return false;
+    }
+    match consumed {
+        [] => true,
+        [only] => references[0].kind == only.kind && references[0].hash == only.hash,
+        [a, b] => {
+            let mut expected = [(a.kind, &a.hash), (b.kind, &b.hash)];
+            expected.sort_unstable();
+            references[0].kind == expected[0].0
+                && &references[0].hash == expected[0].1
+                && references[1].kind == expected[1].0
+                && &references[1].hash == expected[1].1
+        }
+        [a, b, c] => {
+            let mut expected = [(a.kind, &a.hash), (b.kind, &b.hash), (c.kind, &c.hash)];
+            expected.sort_unstable();
+            references[0].kind == expected[0].0
+                && &references[0].hash == expected[0].1
+                && references[1].kind == expected[1].0
+                && &references[1].hash == expected[1].1
+                && references[2].kind == expected[2].0
+                && &references[2].hash == expected[2].1
+        }
+        _ => {
+            let mut expected: Vec<(EvidenceArtifactKind, &ArtifactHash)> =
+                consumed.iter().map(|artifact| (artifact.kind, &artifact.hash)).collect();
+            expected.sort_unstable();
+            references
+                .iter()
+                .zip(expected)
+                .all(|(reference, (kind, hash))| reference.kind == kind && &reference.hash == hash)
+        }
+    }
 }
 
 fn artifact_has_same_structural_lineage(
@@ -2162,25 +2360,23 @@ fn dag_has_no_unreferenced_materialized_extras(
     check: Option<&EvidenceArtifact>,
     model: Option<&EvidenceArtifact>,
 ) -> bool {
-    let mut allowed = vec![(transcript.kind, &transcript.hash)];
-    if let Some(replay) = replay {
-        allowed.push((replay.kind, &replay.hash));
-    }
-    if let Some(check) = check {
-        allowed.push((check.kind, &check.hash));
-    }
-    if let Some(model) = model {
-        allowed.push((model.kind, &model.hash));
-    }
-    if let Some(materialization) = &transcript.materialization {
-        for reference in materialization.referenced_artifacts() {
-            allowed.push((reference.kind, &reference.hash));
-        }
-    }
+    let transcript_refs = transcript
+        .materialization
+        .as_ref()
+        .map_or(&[][..], EvidenceArtifactMaterialization::referenced_artifacts);
+    let matches_artifact = |artifact: &EvidenceArtifact, other: &EvidenceArtifact| {
+        other.kind == artifact.kind && other.hash == artifact.hash
+    };
     artifacts.iter().all(|artifact| {
         artifact.materialization.is_none()
             || is_native_structural_artifact(artifact)
-            || allowed.iter().any(|(kind, hash)| *kind == artifact.kind && **hash == artifact.hash)
+            || matches_artifact(artifact, transcript)
+            || replay.is_some_and(|replay| matches_artifact(artifact, replay))
+            || check.is_some_and(|check| matches_artifact(artifact, check))
+            || model.is_some_and(|model| matches_artifact(artifact, model))
+            || transcript_refs
+                .iter()
+                .any(|reference| reference.kind == artifact.kind && reference.hash == artifact.hash)
     })
 }
 
@@ -2193,51 +2389,81 @@ fn is_native_structural_artifact(artifact: &EvidenceArtifact) -> bool {
 
 fn native_structural_domain_is_valid(artifacts: &[EvidenceArtifact]) -> bool {
     const PREFIX: &str = "trust_ir-native://verification-bundle/";
-    let native =
-        artifacts.iter().filter(|artifact| artifact.uri.starts_with(PREFIX)).collect::<Vec<_>>();
-    if native.is_empty() {
+    let mut native: [Option<&EvidenceArtifact>; 3] = [None; 3];
+    let mut native_len = 0usize;
+    for artifact in artifacts {
+        if artifact.uri.starts_with(PREFIX) {
+            if native_len == 3 || !is_native_structural_artifact(artifact) {
+                return false;
+            }
+            native[native_len] = Some(artifact);
+            native_len += 1;
+        }
+    }
+    if native_len == 0 {
         return true;
     }
-    if native.len() != 3 || native.iter().any(|artifact| !is_native_structural_artifact(artifact)) {
+    if native_len != 3 {
         return false;
     }
     let Some(proof) = native
-        .iter()
-        .copied()
+        .into_iter()
+        .flatten()
         .find(|artifact| artifact.kind == EvidenceArtifactKind::NormalizedObligation)
     else {
         return false;
     };
-    let proof_segments =
-        proof.uri.strip_prefix(PREFIX).map(|uri| uri.split('/').collect::<Vec<_>>());
-    let Some([bundle_sha, suite, "request", request_id, request_sha, "proof", proof_id, proof_sha]) =
-        proof_segments.as_deref()
+    let Some(stripped_uri) = proof.uri.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let mut segs = stripped_uri.split('/');
+    let (
+        Some(bundle_sha),
+        Some(suite),
+        Some("request"),
+        Some(request_id),
+        Some(request_sha),
+        Some("proof"),
+        Some(proof_id),
+        Some(proof_sha),
+        None,
+    ) = (
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+    )
     else {
         return false;
     };
-    if !matches!(*suite, "trust-wp" | "trust-mc" | "trust-vc")
+    if !matches!(suite, "trust-wp" | "trust-mc" | "trust-vc")
         || !is_stable_sha256_hex(bundle_sha)
         || !is_stable_sha256_hex(request_sha)
         || !is_stable_sha256_hex(proof_sha)
         || request_id.is_empty()
         || proof_id.is_empty()
-        || proof.hash.value != *proof_sha
+        || proof.hash.value != proof_sha
     {
         return false;
     }
     let bundle_uri = format!("{PREFIX}{bundle_sha}");
     let request_uri = format!("{bundle_uri}/{suite}/request/{request_id}/{request_sha}");
-    let Some(bundle) = native.iter().copied().find(|artifact| {
+    let Some(bundle) = native.into_iter().flatten().find(|artifact| {
         artifact.kind == EvidenceArtifactKind::EngineInput && artifact.uri == bundle_uri
     }) else {
         return false;
     };
-    let Some(request) = native.iter().copied().find(|artifact| {
+    let Some(request) = native.into_iter().flatten().find(|artifact| {
         artifact.kind == EvidenceArtifactKind::EngineInput && artifact.uri == request_uri
     }) else {
         return false;
     };
-    if bundle.hash.value != *bundle_sha || request.hash.value != *request_sha {
+    if bundle.hash.value != bundle_sha || request.hash.value != request_sha {
         return false;
     }
     let binding = format!("trust_ir-native-{suite}-request-{request_id}-proof-{proof_id}");
@@ -2257,16 +2483,8 @@ fn native_structural_domain_is_valid(artifacts: &[EvidenceArtifact]) -> bool {
         && request_materialization.matches_hash(&request.hash)
         && proof_materialization.matches_hash(&proof.hash)
         && bundle_materialization.referenced_artifacts().is_empty()
-        && request_materialization.referenced_artifacts()
-            == [EvidenceArtifactReference {
-                kind: EvidenceArtifactKind::EngineInput,
-                hash: bundle.hash.clone(),
-            }]
-        && proof_materialization.referenced_artifacts()
-            == [EvidenceArtifactReference {
-                kind: EvidenceArtifactKind::EngineInput,
-                hash: request.hash.clone(),
-            }]
+        && artifact_references_exactly(request, &[bundle])
+        && artifact_references_exactly(proof, &[request])
         && native_structural_envelope_matches(
             bundle_materialization.bytes(),
             "bundle",
@@ -2370,10 +2588,13 @@ impl EvidenceStatus {
 
 /// Why an engine declined a specific obligation INSTANCE.
 ///
-/// This exists so a future multi-engine fallback can tell "I have no lowering
+/// This lets multi-engine fallback distinguish "I have no lowering
 /// for this kind" apart from "I lowered this instance and refused it". Only the
-/// first is ever eligible for a second engine's attempt; retrying the second
-/// would launder a rejection into a green.
+/// first Unsupported decline is eligible for a second engine's attempt;
+/// retrying an admission refusal would launder a rejection into a green.
+/// A separate Unknown result is inconclusive and may be retried by a designated
+/// proof strategy with the same input and remaining budget. It is not a decline
+/// classification and does not override any definitive sibling result.
 ///
 /// It is deliberately NOT derivable from [`SupportLevel`], which is a function
 /// of [`ObligationKind`] alone — a per-kind constant cannot classify an
@@ -2529,6 +2750,16 @@ pub struct VerifierExecutionContext {
     /// is runtime-only state and is intentionally absent from the serializable
     /// [`VerifierExecutionSnapshot`].
     pub deadline: Option<Instant>,
+    /// Trust (2026-10-17, gate-rca deadline): the instant after which a full-verification
+    /// dispatch STARTS no further solve and clamps a running one — the share of the
+    /// per-function clock the compiler gives the native lane, so the certifying lanes
+    /// that run after the dispatch are not left with nothing. Runtime-only like
+    /// [`Self::deadline`], absent from [`VerifierExecutionSnapshot`], and never part of a
+    /// live receipt, a dispatch seal or liveness: [`Self::deadline`] (and so
+    /// [`Self::budget_exceeded`]) stays the function's own deadline, which every
+    /// receipt is bound to and every mint is checked against. Read it through
+    /// [`Self::solve_deadline`].
+    pub native_solve_cutoff: Option<Instant>,
 }
 
 impl VerifierExecutionContext {
@@ -2543,6 +2774,7 @@ impl VerifierExecutionContext {
             cancellation: CancellationToken::new(),
             metadata: Vec::new(),
             deadline: None,
+            native_solve_cutoff: None,
         }
     }
 
@@ -2599,6 +2831,26 @@ impl VerifierExecutionContext {
     #[must_use]
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// Trust (2026-10-17): set the native solve cutoff (see
+    /// [`Self::native_solve_cutoff`]). `None` leaves solving bounded by the deadline
+    /// alone. The deadline, the snapshot and liveness are unchanged.
+    #[must_use]
+    pub fn with_native_solve_cutoff(mut self, cutoff: Option<Instant>) -> Self {
+        self.native_solve_cutoff = cutoff;
+        self
+    }
+
+    /// Trust (2026-10-17): the instant a dispatch stops solving at: the earlier of the
+    /// deadline and the native solve cutoff. A receipt's dispatch deadline is
+    /// [`Self::deadline`], never this.
+    #[must_use]
+    pub fn solve_deadline(&self) -> Option<Instant> {
+        match (self.deadline, self.native_solve_cutoff) {
+            (Some(deadline), Some(cutoff)) => Some(deadline.min(cutoff)),
+            (deadline, cutoff) => deadline.or(cutoff),
+        }
     }
 
     /// Trust: True once the per-function wall-clock budget has elapsed.
@@ -2818,6 +3070,11 @@ pub enum CancellationReason {
     Custom { reason: String },
 }
 
+/// A sequence of at most `maximum` elements, refused before its elements past the bound are
+/// decoded. Trust (T3 L4, C09d): only per-record shapes use it now (an evidence record's
+/// diagnostics, an engine manifest's entries, one record's metadata and items); a run's,
+/// manifest's or bundle's record lists and diagnostics are unbounded `Vec`s, decoded one
+/// element after another.
 fn deserialize_bounded_sequence<'de, D, T>(
     deserializer: D,
     maximum: usize,
@@ -2872,25 +3129,6 @@ where
     })
 }
 
-fn deserialize_bounded_run_records<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    deserialize_bounded_sequence(deserializer, MAX_VERIFIER_RUN_RECORDS, "verifier run records")
-}
-
-fn deserialize_bounded_run_diagnostics<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_bounded_sequence(
-        deserializer,
-        MAX_VERIFIER_RUN_DIAGNOSTICS,
-        "verifier run diagnostics",
-    )
-}
-
 fn deserialize_bounded_evidence_diagnostics<'de, D>(
     deserializer: D,
 ) -> Result<Vec<String>, D::Error>
@@ -2920,19 +3158,6 @@ where
     D: Deserializer<'de>,
 {
     deserialize_bounded_sequence(deserializer, MAX_ENGINE_PROOF_MODES, "engine proof modes")
-}
-
-fn deserialize_bounded_bundle_metadata<'de, D>(
-    deserializer: D,
-) -> Result<Vec<MetadataEntry>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_bounded_sequence(
-        deserializer,
-        MAX_BUNDLE_METADATA_ENTRIES,
-        "bundle metadata entries",
-    )
 }
 
 fn deserialize_bounded_record_metadata<'de, D>(
@@ -3039,42 +3264,7 @@ impl VerificationRunResult {
     /// authoritative: skips, publication aggregation, blocking diagnostics,
     /// counts, and the final status must all recompute exactly.
     pub fn validate_derived_state(&self) -> Result<(), String> {
-        self.validate_input_state()?;
-        let derived = derive_verification_run_state(self);
-        if self.publication != derived.publication {
-            return Err(
-                "verifier result publication metadata does not match typed evidence aggregation"
-                    .to_string(),
-            );
-        }
-        if self.skipped != derived.skipped {
-            return Err(
-                "verifier result skipped obligations do not match requested/evidenced inventory"
-                    .to_string(),
-            );
-        }
-        if !diagnostics_contain_required(&self.diagnostics, &derived.required_diagnostics)
-            || self
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| is_derived_verification_run_diagnostic(diagnostic))
-                .count()
-                != derived.required_diagnostics.len()
-        {
-            return Err(
-                "verifier result derived provenance/publication/resource diagnostics are stale, duplicated, or incomplete"
-                    .to_string(),
-            );
-        }
-        if self.summary != derived.summary {
-            return Err(
-                "verifier result summary does not match typed obligations and evidence".to_string()
-            );
-        }
-        if self.status != derived.status {
-            return Err("verifier result status does not match recomputed summary".to_string());
-        }
-        Ok(())
+        RunEvidenceValidation::new(self).validate_derived_state()
     }
 
     fn validate_input_state(&self) -> Result<(), String> {
@@ -3097,13 +3287,7 @@ impl VerificationRunResult {
             &self.context.metadata,
             MAX_RECORD_METADATA_ENTRIES,
         )?;
-        validate_run_collection_limits(
-            self.requested_obligations.len(),
-            self.evidence.len(),
-            self.skipped.len(),
-            self.diagnostics.len(),
-        )?;
-        validate_diagnostics("verifier result", &self.diagnostics, MAX_VERIFIER_RUN_DIAGNOSTICS)?;
+        validate_run_diagnostics("verifier result", &self.diagnostics)?;
 
         let mut requested_ids = FxHashSet::default();
         for obligation in &self.requested_obligations {
@@ -3144,7 +3328,10 @@ impl VerificationRunResult {
                 &evidence.diagnostics,
                 MAX_EVIDENCE_DIAGNOSTICS_PER_RECORD,
             )?;
-            if evidence.artifacts.len() > MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION {
+            if trust_types::audit_ledger::cap_hit_if(
+                evidence.artifacts.len() > MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION,
+                "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION",
+            ) {
                 return Err(
                     "verifier result evidence exceeds the artifact safety limit".to_string()
                 );
@@ -3188,11 +3375,12 @@ impl VerificationRunResult {
         Ok(())
     }
 
-    /// Parse an untrusted JSON result through a whole-envelope byte cap before
-    /// serde allocates nested strings, counterexamples, or materializations.
+    /// Parse an untrusted JSON result through its validated deserializer. Trust (T3 L4,
+    /// C09d): no whole-envelope byte cap; records are decoded one after another and the
+    /// document may nest to `trust_types::json_depth::MAX_DEEP_NESTING`
+    /// (`json_depth::from_slice_deep`).
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, String> {
-        validate_json_envelope_length(bytes.len(), "result")?;
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+        trust_types::json_depth::from_slice_deep(bytes).map_err(|error| error.to_string())
     }
 
     /// Build a release/audit manifest that accounts for every requested
@@ -3205,8 +3393,9 @@ impl VerificationRunResult {
     /// Build a release manifest only if the caller's in-memory result already
     /// carries exact canonical derived state.
     pub fn try_to_manifest(&self) -> Result<VerificationRunManifest, String> {
-        self.validate_derived_state()?;
-        let manifest = VerificationRunManifest::from_validated_result(self);
+        let validation = RunEvidenceValidation::new(self);
+        validation.validate_derived_state()?;
+        let manifest = VerificationRunManifest::from_validated_result(&validation);
         manifest.validate_derived_state()?;
         Ok(manifest)
     }
@@ -3229,7 +3418,7 @@ impl VerificationRunResult {
 
     fn canonicalized_derived_state(&self) -> Self {
         let mut canonical = self.clone();
-        let derived = derive_verification_run_state(&canonical);
+        let derived = derive_verification_run_state(&RunEvidenceValidation::new(&canonical));
         canonical.publication = derived.publication;
         canonical.skipped = derived.skipped;
         // These messages are serialized projections of typed run state, not
@@ -3255,15 +3444,48 @@ fn validate_envelope_identifier(label: &str, value: &str) -> Result<(), String> 
 }
 
 fn validate_canonical_text(label: &str, value: &str, maximum_bytes: usize) -> Result<(), String> {
+    validate_canonical_text_pair(label, "", value, maximum_bytes)
+}
+
+fn validate_canonical_text_pair(
+    prefix: &str,
+    suffix: &str,
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<(), String> {
     if value.is_empty()
         || value.trim() != value
         || value.len() > maximum_bytes
         || value.chars().any(char::is_control)
     {
-        Err(format!("verifier {label} is empty, untrimmed, or exceeds its byte limit"))
+        Err(format!("verifier {prefix}{suffix} is empty, untrimmed, or exceeds its byte limit"))
     } else {
         Ok(())
     }
+}
+
+/// [`validate_canonical_text`] with no byte bound: the text is refused only when it is empty,
+/// untrimmed or holds a control character. Trust (T3 L4, C09d): a contract predicate's text
+/// and a summary fact's fields grow with the program, so their byte bounds are deleted.
+fn validate_canonical_text_of_any_length(label: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+        Err(format!("verifier {label} is empty, untrimmed, or holds a control character"))
+    } else {
+        Ok(())
+    }
+}
+
+/// [`validate_canonical_text`] for a field whose byte bound is the T3 L4 CAP site `cap`:
+/// a value over the bound is recorded as a hit (`trust_types::audit_ledger`; measurement
+/// only), and the validation is unchanged.
+fn validate_canonical_text_at(
+    label: &str,
+    value: &str,
+    maximum_bytes: usize,
+    cap: &'static str,
+) -> Result<(), String> {
+    let _ = trust_types::audit_ledger::cap_hit_if(value.len() > maximum_bytes, cap);
+    validate_canonical_text(label, value, maximum_bytes)
 }
 
 fn validate_optional_canonical_text(
@@ -3310,47 +3532,20 @@ fn validate_canonical_uri(label: &str, uri: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_bounded_json(label: &str, root: &serde_json::Value) -> Result<(), String> {
-    let mut nodes = 0usize;
-    let mut scalar_bytes = 0usize;
-    let mut pending = vec![(root, 0usize)];
-    while let Some((value, depth)) = pending.pop() {
-        nodes = nodes
-            .checked_add(1)
-            .ok_or_else(|| format!("verifier {label} JSON node count overflowed"))?;
-        if nodes > MAX_CONTRACT_PREDICATE_JSON_NODES {
-            return Err(format!("verifier {label} exceeds the JSON node limit"));
-        }
-        if depth > MAX_CONTRACT_PREDICATE_JSON_DEPTH {
-            return Err(format!("verifier {label} exceeds the JSON depth limit"));
-        }
-        match value {
-            serde_json::Value::String(value) => {
-                scalar_bytes = scalar_bytes
-                    .checked_add(value.len())
-                    .ok_or_else(|| format!("verifier {label} JSON scalar size overflowed"))?;
-            }
-            serde_json::Value::Number(value) => {
-                scalar_bytes = scalar_bytes
-                    .checked_add(value.to_string().len())
-                    .ok_or_else(|| format!("verifier {label} JSON scalar size overflowed"))?;
-            }
-            serde_json::Value::Array(values) => {
-                pending.extend(values.iter().map(|value| (value, depth.saturating_add(1))));
-            }
-            serde_json::Value::Object(object) => {
-                for (key, value) in object {
-                    scalar_bytes = scalar_bytes
-                        .checked_add(key.len())
-                        .ok_or_else(|| format!("verifier {label} JSON scalar size overflowed"))?;
-                    pending.push((value, depth.saturating_add(1)));
-                }
-            }
-            serde_json::Value::Null | serde_json::Value::Bool(_) => {}
-        }
-        if scalar_bytes > MAX_CONTRACT_PREDICATE_JSON_SCALAR_BYTES {
-            return Err(format!("verifier {label} exceeds the JSON scalar byte limit"));
-        }
+/// Trust (T3 L4, C09d): a contract predicate's JSON value is refused only when no reader
+/// decodes it, nested deeper than `trust_types::json_depth::MAX_DEEP_NESTING`: the bound
+/// every deep reader here reads to (`from_str_deep`, `from_slice_deep`, `from_value_deep`),
+/// and the one the compiler's typed-CHC contract decline keys on through this check. Its
+/// node count, scalar bytes and the depth past `serde_json`'s 128-level default are no
+/// longer bounded: each grows with the program. Measured without recursion.
+fn validate_decodable_json(label: &str, root: &serde_json::Value) -> Result<(), String> {
+    let depth = trust_types::json_depth::value_nesting_depth(root);
+    if depth > trust_types::json_depth::MAX_DEEP_NESTING {
+        return Err(format!(
+            "verifier {label} nests {depth} JSON levels, past the JSON depth limit its readers \
+             decode ({} levels)",
+            trust_types::json_depth::MAX_DEEP_NESTING
+        ));
     }
     Ok(())
 }
@@ -3358,14 +3553,14 @@ fn validate_bounded_json(label: &str, root: &serde_json::Value) -> Result<(), St
 fn validate_contract_predicate(predicate: &ContractPredicate) -> Result<(), String> {
     match predicate {
         ContractPredicate::TrustExpr { text } => {
-            validate_canonical_text("TrustExpr predicate", text, MAX_CONTRACT_PREDICATE_TEXT_BYTES)
+            validate_canonical_text_of_any_length("TrustExpr predicate", text)
         }
         ContractPredicate::TrustIr { schema, value }
         | ContractPredicate::MathIr { schema, value }
         | ContractPredicate::MemoryIr { schema, value }
         | ContractPredicate::CanonicalJson { schema, value } => {
             validate_canonical_schema("contract predicate schema", schema)?;
-            validate_bounded_json("contract predicate", value)?;
+            validate_decodable_json("contract predicate", value)?;
             if schema == TRUST_SPEC_PREDICATE_SCHEMA_VERSION {
                 if !matches!(
                     predicate,
@@ -3376,7 +3571,7 @@ fn validate_contract_predicate(predicate: &ContractPredicate) -> Result<(), Stri
                             .to_string(),
                     );
                 }
-                let typed: TrustSpecPredicate = serde_json::from_value(value.clone())
+                let typed: TrustSpecPredicate = trust_types::json_depth::from_value_deep(value)
                     .map_err(|error| format!("invalid typed TrustSpec predicate: {error}"))?;
                 validate_trust_spec_predicate(&typed)?;
                 if serde_json::to_value(&typed).ok().as_ref() != Some(value) {
@@ -3498,7 +3693,7 @@ fn validate_trust_spec_predicate(predicate: &TrustSpecPredicate) -> Result<(), S
     if predicate.variables.len() > MAX_RECORD_METADATA_ENTRIES {
         return Err("typed TrustSpec predicate exceeds the variable limit".to_string());
     }
-    let mut declared = BTreeMap::new();
+    let mut declared = FxHashMap::default();
     for variable in &predicate.variables {
         validate_canonical_text(
             "TrustSpec variable name",
@@ -3506,32 +3701,113 @@ fn validate_trust_spec_predicate(predicate: &TrustSpecPredicate) -> Result<(), S
             MAX_ENGINE_PROVENANCE_FIELD_BYTES,
         )?;
         validate_trust_spec_sort(variable.sort)?;
-        if declared.insert(variable.name.clone(), variable.sort).is_some() {
+        if declared.insert(variable.name.as_str(), variable.sort).is_some() {
             return Err("typed TrustSpec predicate has duplicate variables".to_string());
         }
     }
-    let mut nodes = 0usize;
-    validate_trust_spec_expr(&predicate.root, &declared, &mut Vec::new(), 0, &mut nodes)
+    validate_trust_spec_expr(&predicate.root, &declared)
 }
 
-fn validate_trust_spec_expr(
-    expr: &TrustSpecExpr,
-    declared: &BTreeMap<String, TrustSpecSort>,
-    bound: &mut Vec<(String, TrustSpecSort)>,
-    depth: usize,
-    nodes: &mut usize,
+/// One step of [`validate_trust_spec_expr`]'s walk.
+enum TrustSpecWalk<'a> {
+    /// Check this node, then walk its children.
+    Node(&'a TrustSpecExpr),
+    /// Leave the innermost quantifier's scope.
+    Unbind,
+}
+
+/// Validate a typed expression tree. Trust (T3 L4, C09d): without recursion, and with no node
+/// or depth bound (each grew with the program; where the tree arrives as JSON, its readers
+/// bound its nesting). The walk is pre-order, children in field order, as the recursive check
+/// was, so the first refusal it reports is the one that check reported; a quantifier's
+/// variable is in scope exactly while its body is walked.
+fn validate_trust_spec_expr<'a>(
+    root: &'a TrustSpecExpr,
+    declared: &FxHashMap<&'a str, TrustSpecSort>,
 ) -> Result<(), String> {
-    *nodes = nodes
-        .checked_add(1)
-        .ok_or_else(|| "typed TrustSpec expression node count overflowed".to_string())?;
-    if *nodes > MAX_CONTRACT_PREDICATE_JSON_NODES {
-        return Err("typed TrustSpec expression exceeds the node limit".to_string());
+    let mut bound: Vec<(&'a str, TrustSpecSort)> = Vec::new();
+    let mut pending = vec![TrustSpecWalk::Node(root)];
+    while let Some(step) = pending.pop() {
+        let expr = match step {
+            TrustSpecWalk::Node(expr) => expr,
+            TrustSpecWalk::Unbind => {
+                bound.pop();
+                continue;
+            }
+        };
+        validate_trust_spec_node(expr, declared, &bound)?;
+        if let TrustSpecExprKind::Quantifier { variable, variable_sort, .. } = &expr.kind {
+            bound.push((variable.as_str(), *variable_sort));
+            pending.push(TrustSpecWalk::Unbind);
+        }
+        pending
+            .extend(trust_spec_children(expr).into_iter().rev().flatten().map(TrustSpecWalk::Node));
     }
-    if depth > MAX_CONTRACT_PREDICATE_JSON_DEPTH {
-        return Err("typed TrustSpec expression exceeds the depth limit".to_string());
+    Ok(())
+}
+
+/// `expr`'s child expressions, in the order [`validate_trust_spec_expr`] walks them.
+fn trust_spec_children(expr: &TrustSpecExpr) -> [Option<&TrustSpecExpr>; 3] {
+    match &expr.kind {
+        TrustSpecExprKind::BoolLiteral { .. }
+        | TrustSpecExprKind::IntLiteral { .. }
+        | TrustSpecExprKind::Variable { .. }
+        | TrustSpecExprKind::Result
+        | TrustSpecExprKind::BitVecLiteral { .. }
+        | TrustSpecExprKind::FloatLiteral { .. } => [None, None, None],
+        TrustSpecExprKind::Unary { expr: child, .. }
+        | TrustSpecExprKind::Old { expr: child }
+        | TrustSpecExprKind::Field { base: child, .. }
+        | TrustSpecExprKind::Quantifier { body: child, .. }
+        | TrustSpecExprKind::BvUnary { expr: child, .. }
+        | TrustSpecExprKind::BvFromInt { expr: child, .. }
+        | TrustSpecExprKind::IntFromBv { expr: child, .. }
+        | TrustSpecExprKind::IsVariant { scrutinee: child, .. }
+        | TrustSpecExprKind::VariantField { scrutinee: child, .. } => [Some(&**child), None, None],
+        TrustSpecExprKind::Binary { lhs, rhs, .. }
+        | TrustSpecExprKind::BvBinary { lhs, rhs, .. } => [Some(&**lhs), Some(&**rhs), None],
+        TrustSpecExprKind::Index { base, index } => [Some(&**base), Some(&**index), None],
+        TrustSpecExprKind::Ite { cond, then, els } => [Some(&**cond), Some(&**then), Some(&**els)],
     }
+}
+
+// No typed tree may recurse through Drop on a small caller when an encoder
+// cannot start. Sorts are Copy scalar/array-element records, never recursive.
+fn discard_trust_spec_predicate_iteratively(predicate: TrustSpecPredicate) {
+    let mut pending = vec![predicate.root];
+    while let Some(expr) = pending.pop() {
+        match expr.kind {
+            TrustSpecExprKind::BoolLiteral { .. }
+            | TrustSpecExprKind::IntLiteral { .. }
+            | TrustSpecExprKind::Variable { .. }
+            | TrustSpecExprKind::Result
+            | TrustSpecExprKind::BitVecLiteral { .. }
+            | TrustSpecExprKind::FloatLiteral { .. } => {}
+            TrustSpecExprKind::Unary { expr: child, .. }
+            | TrustSpecExprKind::Old { expr: child }
+            | TrustSpecExprKind::Field { base: child, .. }
+            | TrustSpecExprKind::Quantifier { body: child, .. }
+            | TrustSpecExprKind::BvUnary { expr: child, .. }
+            | TrustSpecExprKind::BvFromInt { expr: child, .. }
+            | TrustSpecExprKind::IntFromBv { expr: child, .. }
+            | TrustSpecExprKind::IsVariant { scrutinee: child, .. }
+            | TrustSpecExprKind::VariantField { scrutinee: child, .. } => pending.push(*child),
+            TrustSpecExprKind::Binary { lhs, rhs, .. }
+            | TrustSpecExprKind::BvBinary { lhs, rhs, .. } => pending.extend([*lhs, *rhs]),
+            TrustSpecExprKind::Index { base, index } => pending.extend([*base, *index]),
+            TrustSpecExprKind::Ite { cond, then, els } => pending.extend([*cond, *then, *els]),
+        }
+    }
+}
+
+/// The checks of one node of a typed expression, its children's own checks aside (the walk
+/// makes those). `bound` holds the quantified variables in scope, innermost last.
+fn validate_trust_spec_node(
+    expr: &TrustSpecExpr,
+    declared: &FxHashMap<&str, TrustSpecSort>,
+    bound: &[(&str, TrustSpecSort)],
+) -> Result<(), String> {
     validate_trust_spec_sort(expr.sort)?;
-    let child_depth = depth.saturating_add(1);
     let require_sort = |actual: TrustSpecSort, expected: TrustSpecSort, role: &str| {
         if actual == expected {
             Ok(())
@@ -3556,9 +3832,9 @@ fn validate_trust_spec_expr(
             let expected = bound
                 .iter()
                 .rev()
-                .find(|(candidate, _)| candidate == name)
+                .find(|(candidate, _)| *candidate == name.as_str())
                 .map(|(_, sort)| *sort)
-                .or_else(|| declared.get(name).copied())
+                .or_else(|| declared.get(name.as_str()).copied())
                 .ok_or_else(|| format!("typed TrustSpec variable `{name}` is undeclared"))?;
             require_sort(expr.sort, expected, "variable reference")
         }
@@ -3576,7 +3852,7 @@ fn validate_trust_spec_expr(
             };
             require_sort(child.sort, expected, "unary operand")?;
             require_sort(expr.sort, expected, "unary result")?;
-            validate_trust_spec_expr(child, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::Binary { op, lhs, rhs } => {
             let operand_sort = match op {
@@ -3623,8 +3899,7 @@ fn validate_trust_spec_expr(
                 );
             }
             require_sort(expr.sort, op.result_sort(), "binary result")?;
-            validate_trust_spec_expr(lhs, declared, bound, child_depth, nodes)?;
-            validate_trust_spec_expr(rhs, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::Old { expr: child } => {
             if matches!(child.sort, TrustSpecSort::Array { .. }) {
@@ -3632,7 +3907,7 @@ fn validate_trust_spec_expr(
                     .to_string());
             }
             require_sort(expr.sort, child.sort, "old result")?;
-            validate_trust_spec_expr(child, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::Field { base, field } => {
             if matches!(base.sort, TrustSpecSort::Array { .. })
@@ -3647,7 +3922,7 @@ fn validate_trust_spec_expr(
                 field,
                 MAX_ENGINE_PROVENANCE_FIELD_BYTES,
             )?;
-            validate_trust_spec_expr(base, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::Index { base, index } => {
             let TrustSpecSort::Array { element } = base.sort else {
@@ -3661,8 +3936,7 @@ fn validate_trust_spec_expr(
             }
             require_sort(index.sort, TrustSpecSort::Int, "index operand")?;
             require_sort(expr.sort, element.expression_sort(), "index result")?;
-            validate_trust_spec_expr(base, declared, bound, child_depth, nodes)?;
-            validate_trust_spec_expr(index, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::Quantifier { variable, variable_sort, body, .. } => {
             validate_canonical_text(
@@ -3682,10 +3956,7 @@ fn validate_trust_spec_expr(
             }
             require_sort(expr.sort, TrustSpecSort::Bool, "quantifier result")?;
             require_sort(body.sort, TrustSpecSort::Bool, "quantifier body")?;
-            bound.push((variable.clone(), *variable_sort));
-            let result = validate_trust_spec_expr(body, declared, bound, child_depth, nodes);
-            bound.pop();
-            result
+            Ok(())
         }
         TrustSpecExprKind::BitVecLiteral { value, width } => {
             validate_trust_spec_sort(TrustSpecSort::BitVec { width: *width })?;
@@ -3744,15 +4015,14 @@ fn validate_trust_spec_expr(
                 TrustSpecSort::BitVec { width: *width },
                 "bitvector unary result",
             )?;
-            validate_trust_spec_expr(child, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::BvBinary { op, lhs, rhs, width } => {
             validate_trust_spec_sort(TrustSpecSort::BitVec { width: *width })?;
             require_sort(lhs.sort, TrustSpecSort::BitVec { width: *width }, "bitvector lhs")?;
             require_sort(rhs.sort, TrustSpecSort::BitVec { width: *width }, "bitvector rhs")?;
             require_sort(expr.sort, op.result_sort(*width), "bitvector binary result")?;
-            validate_trust_spec_expr(lhs, declared, bound, child_depth, nodes)?;
-            validate_trust_spec_expr(rhs, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::BvFromInt { expr: child, width } => {
             validate_trust_spec_sort(TrustSpecSort::BitVec { width: *width })?;
@@ -3762,7 +4032,7 @@ fn validate_trust_spec_expr(
                 TrustSpecSort::BitVec { width: *width },
                 "int-to-bitvector result",
             )?;
-            validate_trust_spec_expr(child, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::IntFromBv { expr: child, width, .. } => {
             validate_trust_spec_sort(TrustSpecSort::BitVec { width: *width })?;
@@ -3772,7 +4042,7 @@ fn validate_trust_spec_expr(
                 "bitvector-to-int operand",
             )?;
             require_sort(expr.sort, TrustSpecSort::Int, "bitvector-to-int result")?;
-            validate_trust_spec_expr(child, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::IsVariant { scrutinee, variant } => {
             if matches!(scrutinee.sort, TrustSpecSort::Array { .. }) {
@@ -3786,7 +4056,7 @@ fn validate_trust_spec_expr(
                 MAX_ENGINE_PROVENANCE_FIELD_BYTES,
             )?;
             require_sort(expr.sort, TrustSpecSort::Bool, "variant test result")?;
-            validate_trust_spec_expr(scrutinee, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::VariantField { scrutinee, variant, .. } => {
             if matches!(scrutinee.sort, TrustSpecSort::Array { .. })
@@ -3801,7 +4071,7 @@ fn validate_trust_spec_expr(
                 variant,
                 MAX_ENGINE_PROVENANCE_FIELD_BYTES,
             )?;
-            validate_trust_spec_expr(scrutinee, declared, bound, child_depth, nodes)
+            Ok(())
         }
         TrustSpecExprKind::Ite { cond, then, els } => {
             // Sound, sort-preserving branch-merge: the condition is Bool and both
@@ -3809,16 +4079,12 @@ fn validate_trust_spec_expr(
             // stays the only array shape). A sort mismatch is an ill-formed
             // predicate and fails closed here before any solver sees it.
             if matches!(expr.sort, TrustSpecSort::Array { .. }) {
-                return Err(
-                    "typed TrustSpec conditional cannot produce an array".to_string(),
-                );
+                return Err("typed TrustSpec conditional cannot produce an array".to_string());
             }
             require_sort(cond.sort, TrustSpecSort::Bool, "conditional condition")?;
             require_sort(then.sort, expr.sort, "conditional then-arm")?;
             require_sort(els.sort, expr.sort, "conditional else-arm")?;
-            validate_trust_spec_expr(cond, declared, bound, child_depth, nodes)?;
-            validate_trust_spec_expr(then, declared, bound, child_depth, nodes)?;
-            validate_trust_spec_expr(els, declared, bound, child_depth, nodes)
+            Ok(())
         }
     }
 }
@@ -3931,14 +4197,25 @@ fn validate_metadata_entries(
     if metadata.len() > maximum {
         return Err(format!("verifier {label} exceeds the metadata entry limit"));
     }
+    validate_metadata_entry_list(label, metadata)
+}
+
+/// Every entry of `metadata` is canonical and its keys are distinct. Trust (T3 L4, C09d):
+/// with no bound on the entry count, for the bundle's own metadata, whose entries grow with
+/// its obligations; one record's metadata keeps [`validate_metadata_entries`]' bound.
+fn validate_metadata_entry_list(label: &str, metadata: &[MetadataEntry]) -> Result<(), String> {
     let mut keys = FxHashSet::default();
     for entry in metadata {
-        validate_canonical_text(
-            &format!("{label} metadata key"),
+        validate_canonical_text_pair(
+            label,
+            " metadata key",
             &entry.key,
             MAX_ENGINE_PROVENANCE_FIELD_BYTES,
         )?;
-        if entry.value.len() > MAX_METADATA_VALUE_BYTES {
+        if trust_types::audit_ledger::cap_hit_if(
+            entry.value.len() > MAX_METADATA_VALUE_BYTES,
+            "crates/trust-verifier-api/src/lib.rs:MAX_METADATA_VALUE_BYTES",
+        ) {
             return Err(format!("verifier {label} metadata value exceeds the byte limit"));
         }
         if !keys.insert(entry.key.as_str()) {
@@ -4018,10 +4295,11 @@ fn validate_proof_item_record(proof_item: &TrustProofItem) -> Result<(), String>
         }
     }
     match &proof_item.body {
-        ProofItemBody::CompilerOwned { body_ref } => validate_canonical_text(
+        ProofItemBody::CompilerOwned { body_ref } => validate_canonical_text_at(
             "compiler proof body reference",
             body_ref,
             MAX_METADATA_VALUE_BYTES,
+            "crates/trust-verifier-api/src/lib.rs:MAX_METADATA_VALUE_BYTES",
         )?,
         ProofItemBody::NativeScript { engine, text } => {
             validate_canonical_text(
@@ -4029,7 +4307,12 @@ fn validate_proof_item_record(proof_item: &TrustProofItem) -> Result<(), String>
                 engine,
                 MAX_ENGINE_PROVENANCE_FIELD_BYTES,
             )?;
-            if text.trim().is_empty() || text.len() > MAX_METADATA_VALUE_BYTES {
+            if text.trim().is_empty()
+                || trust_types::audit_ledger::cap_hit_if(
+                    text.len() > MAX_METADATA_VALUE_BYTES,
+                    "crates/trust-verifier-api/src/lib.rs:MAX_METADATA_VALUE_BYTES",
+                )
+            {
                 return Err(
                     "verifier native proof script is empty or exceeds the byte limit".to_string()
                 );
@@ -4078,7 +4361,7 @@ fn validate_obligation_record(obligation: &TrustObligation) -> Result<(), String
                 .to_string(),
         );
     }
-    let mut summary_fact_ids = BTreeSet::new();
+    let mut summary_fact_ids = FxHashSet::default();
     for fact in &obligation.summary_facts {
         validate_summary_fact(fact)?;
         if !summary_fact_ids.insert(fact.id.as_str()) {
@@ -4129,22 +4412,8 @@ fn validate_contract_bundle(bundle: &TrustContractBundle) -> Result<(), String> 
     }
     validate_envelope_identifier("bundle_id", &bundle.bundle_id)?;
     validate_bundle_subject(&bundle.subject)?;
-    if bundle.contracts.len() > MAX_VERIFIER_RUN_RECORDS
-        || bundle.proof_items.len() > MAX_VERIFIER_RUN_RECORDS
-        || bundle.obligations.len() > MAX_VERIFIER_RUN_RECORDS
-    {
-        return Err("verifier bundle exceeds an individual collection safety limit".to_string());
-    }
-    let aggregate = bundle
-        .contracts
-        .len()
-        .checked_add(bundle.proof_items.len())
-        .and_then(|count| count.checked_add(bundle.obligations.len()))
-        .ok_or_else(|| "verifier bundle record count overflowed".to_string())?;
-    if aggregate > MAX_VERIFIER_RUN_AGGREGATE_RECORDS {
-        return Err("verifier bundle exceeds the aggregate record safety limit".to_string());
-    }
-
+    // Trust (T3 L4, C09d): no bound on the number of contracts, proof items or obligations,
+    // alone or together; each grows with the program.
     let mut contract_ids = FxHashSet::default();
     for contract in &bundle.contracts {
         validate_contract_record(contract)?;
@@ -4167,7 +4436,7 @@ fn validate_contract_bundle(bundle: &TrustContractBundle) -> Result<(), String> 
         }
     }
     validate_publication_metadata(&bundle.publication)?;
-    validate_metadata_entries("bundle", &bundle.metadata, MAX_BUNDLE_METADATA_ENTRIES)
+    validate_metadata_entry_list("bundle", &bundle.metadata)
 }
 
 fn validate_cancellation_snapshot(cancellation: &CancellationSnapshot) -> Result<(), String> {
@@ -4185,48 +4454,25 @@ fn validate_cancellation_snapshot(cancellation: &CancellationSnapshot) -> Result
     Ok(())
 }
 
-fn validate_run_collection_limits(
-    obligations: usize,
-    evidence: usize,
-    skipped: usize,
-    diagnostics: usize,
-) -> Result<(), String> {
-    if obligations > MAX_VERIFIER_RUN_RECORDS
-        || evidence > MAX_VERIFIER_RUN_RECORDS
-        || skipped > MAX_VERIFIER_RUN_RECORDS
-        || diagnostics > MAX_VERIFIER_RUN_DIAGNOSTICS
-    {
-        return Err("verifier run exceeds an individual collection safety limit".to_string());
-    }
-    let aggregate = obligations
-        .checked_add(evidence)
-        .and_then(|count| count.checked_add(skipped))
-        .ok_or_else(|| "verifier run record count overflowed".to_string())?;
-    if aggregate > MAX_VERIFIER_RUN_AGGREGATE_RECORDS {
-        return Err("verifier run exceeds the aggregate record safety limit".to_string());
-    }
-    Ok(())
+/// A run's or manifest's own diagnostics: each within [`MAX_VERIFIER_DIAGNOSTIC_BYTES`] (one
+/// message's length, kept). Trust (T3 L4, C09d): their number is not bounded; it grows with
+/// the obligations.
+fn validate_run_diagnostics(label: &str, diagnostics: &[String]) -> Result<(), String> {
+    validate_diagnostic_messages(label, diagnostics)
 }
 
 fn validate_diagnostics(label: &str, diagnostics: &[String], maximum: usize) -> Result<(), String> {
     if diagnostics.len() > maximum {
         return Err(format!("{label} exceeds the diagnostic count limit"));
     }
+    validate_diagnostic_messages(label, diagnostics)
+}
+
+fn validate_diagnostic_messages(label: &str, diagnostics: &[String]) -> Result<(), String> {
     if diagnostics.iter().any(|diagnostic| diagnostic.len() > MAX_VERIFIER_DIAGNOSTIC_BYTES) {
         return Err(format!("{label} contains a diagnostic exceeding the byte limit"));
     }
     Ok(())
-}
-
-fn validate_json_envelope_length(length: usize, label: &str) -> Result<(), String> {
-    if length > MAX_VERIFIER_JSON_ENVELOPE_BYTES {
-        Err(format!(
-            "verifier {label} JSON exceeds the {}-byte ingress limit",
-            MAX_VERIFIER_JSON_ENVELOPE_BYTES
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 fn validate_counterexample(counterexample: &Counterexample) -> Result<(), String> {
@@ -4236,41 +4482,24 @@ fn validate_counterexample(counterexample: &Counterexample) -> Result<(), String
         return Err("verifier counterexample format is empty or exceeds the byte limit".to_string());
     }
 
-    let mut nodes = 0usize;
-    let mut scalar_bytes = counterexample.format.len();
+    // Trust (T3 L4, C09d): the nesting guard alone; the node and scalar-byte bounds are
+    // deleted. The walk is iterative, so a value of any depth is measured without recursion.
     let mut pending = vec![(&counterexample.data, 0usize)];
     while let Some((value, depth)) = pending.pop() {
-        nodes = nodes
-            .checked_add(1)
-            .ok_or_else(|| "verifier counterexample node count overflowed".to_string())?;
-        if nodes > MAX_COUNTEREXAMPLE_JSON_NODES {
-            return Err("verifier counterexample exceeds the JSON node limit".to_string());
-        }
         if depth > MAX_COUNTEREXAMPLE_JSON_DEPTH {
             return Err("verifier counterexample exceeds the JSON depth limit".to_string());
         }
         match value {
-            serde_json::Value::String(value) => {
-                scalar_bytes = scalar_bytes.checked_add(value.len()).ok_or_else(|| {
-                    "verifier counterexample scalar byte count overflowed".to_string()
-                })?;
-            }
             serde_json::Value::Array(values) => {
                 pending.extend(values.iter().map(|value| (value, depth.saturating_add(1))));
             }
             serde_json::Value::Object(object) => {
-                for (key, value) in object {
-                    scalar_bytes = scalar_bytes.checked_add(key.len()).ok_or_else(|| {
-                        "verifier counterexample scalar byte count overflowed".to_string()
-                    })?;
-                    pending.push((value, depth.saturating_add(1)));
-                }
+                pending.extend(object.values().map(|value| (value, depth.saturating_add(1))));
             }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            }
-        }
-        if scalar_bytes > MAX_COUNTEREXAMPLE_JSON_SCALAR_BYTES {
-            return Err("verifier counterexample exceeds the JSON scalar byte limit".to_string());
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
         }
     }
     Ok(())
@@ -4284,7 +4513,85 @@ struct DerivedVerificationRunState {
     status: VerificationRunStatus,
 }
 
-fn derive_verification_run_state(result: &VerificationRunResult) -> DerivedVerificationRunState {
+// A call-local view of one immutable result, not a serialized validation
+// token. Each memo slot belongs to that exact evidence POSITION in this borrow;
+// neither ids nor content hashes can alias another row's owner/URI/lineage.
+// Input checks still run at every validation boundary. A cloned/reconstructed
+// or subsequently mutated result always gets a new view and new verdicts.
+struct RunEvidenceValidation<'a> {
+    result: &'a VerificationRunResult,
+    artifact_policies: OnceCell<Vec<OnceCell<bool>>>,
+}
+
+impl<'a> RunEvidenceValidation<'a> {
+    fn new(result: &'a VerificationRunResult) -> Self {
+        Self { result, artifact_policies: OnceCell::new() }
+    }
+
+    fn artifact_policy(&self, index: usize) -> bool {
+        let evidence = &self.result.evidence[index];
+        // Policy parsing can record nested cap hits even for bounded actual
+        // bytes (a forged envelope may declare an oversized payload). With
+        // audit collection enabled, preserve every observation by recomputing.
+        // Oversized diagnostic fallback rows also avoid allocating memo slots.
+        if trust_types::audit_ledger::enabled()
+            || evidence.artifacts.len() > MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION
+        {
+            return evidence.satisfies_proof_artifact_policy();
+        }
+        // Unsupported/weak/bounded rows never need a slot allocation. Normal
+        // checked entry points reach this only after validating input limits.
+        let policies = self
+            .artifact_policies
+            .get_or_init(|| (0..self.result.evidence.len()).map(|_| OnceCell::new()).collect());
+        *policies[index].get_or_init(|| evidence.satisfies_proof_artifact_policy())
+    }
+
+    fn validate_derived_state(&self) -> Result<(), String> {
+        let result = self.result;
+        result.validate_input_state()?;
+        let derived = derive_verification_run_state(self);
+        if result.publication != derived.publication {
+            return Err(
+                "verifier result publication metadata does not match typed evidence aggregation"
+                    .to_string(),
+            );
+        }
+        if result.skipped != derived.skipped {
+            return Err(
+                "verifier result skipped obligations do not match requested/evidenced inventory"
+                    .to_string(),
+            );
+        }
+        if !diagnostics_contain_required(&result.diagnostics, &derived.required_diagnostics)
+            || result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| is_derived_verification_run_diagnostic(diagnostic))
+                .count()
+                != derived.required_diagnostics.len()
+        {
+            return Err(
+                "verifier result derived provenance/publication/resource diagnostics are stale, duplicated, or incomplete"
+                    .to_string(),
+            );
+        }
+        if result.summary != derived.summary {
+            return Err(
+                "verifier result summary does not match typed obligations and evidence".to_string()
+            );
+        }
+        if result.status != derived.status {
+            return Err("verifier result status does not match recomputed summary".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn derive_verification_run_state(
+    validation: &RunEvidenceValidation<'_>,
+) -> DerivedVerificationRunState {
+    let result = validation.result;
     let skipped =
         skipped_obligations(&result.requested_obligations, &result.evidence, &result.context);
     let publication_result = serialized_run_publication_metadata(result);
@@ -4295,11 +4602,12 @@ fn derive_verification_run_state(result: &VerificationRunResult) -> DerivedVerif
         &result.context.invocation,
         &publication_result.publication,
     ));
-    let summary = VerificationRunSummary::from_parts(
+    let summary = VerificationRunSummary::from_parts_with_artifact_policy(
         &result.requested_obligations,
         &result.evidence,
         &skipped,
         blocking_diagnostics.len(),
+        |index| validation.artifact_policy(index),
     );
     let status = VerificationRunStatus::from_summary(&summary, &result.context);
     let mut required_diagnostics = blocking_diagnostics;
@@ -4314,7 +4622,13 @@ fn derive_verification_run_state(result: &VerificationRunResult) -> DerivedVerif
 }
 
 fn diagnostics_contain_required(actual: &[String], required: &[String]) -> bool {
-    let mut counts = BTreeMap::<&str, usize>::new();
+    if required.is_empty() {
+        return true;
+    }
+    if actual.len() < required.len() {
+        return false;
+    }
+    let mut counts = FxHashMap::<&str, usize>::default();
     for diagnostic in actual {
         *counts.entry(diagnostic.as_str()).or_default() += 1;
     }
@@ -4355,17 +4669,24 @@ fn is_derived_verification_run_diagnostic(diagnostic: &str) -> bool {
 }
 
 fn append_missing_diagnostics(actual: &mut Vec<String>, required: &[String]) {
-    let mut counts = BTreeMap::<String, usize>::new();
-    for diagnostic in actual.iter() {
-        *counts.entry(diagnostic.clone()).or_default() += 1;
+    if required.is_empty() {
+        return;
     }
+    let mut counts = FxHashMap::<&str, usize>::default();
+    for diagnostic in actual.iter() {
+        *counts.entry(diagnostic.as_str()).or_default() += 1;
+    }
+    let mut to_append = Vec::new();
     for diagnostic in required {
-        let count = counts.entry(diagnostic.clone()).or_default();
+        let count = counts.entry(diagnostic.as_str()).or_default();
         if *count == 0 {
-            actual.push(diagnostic.clone());
+            to_append.push(diagnostic);
         } else {
             *count -= 1;
         }
+    }
+    for diagnostic in to_append {
+        actual.push(diagnostic.clone());
     }
 }
 
@@ -4385,14 +4706,14 @@ impl<'de> Deserialize<'de> for VerificationRunResult {
             context: Option<VerifierExecutionSnapshot>,
             status: VerificationRunStatus,
             summary: VerificationRunSummary,
-            #[serde(default, deserialize_with = "deserialize_bounded_run_records")]
+            #[serde(default)]
             requested_obligations: Vec<TrustObligation>,
-            #[serde(default, deserialize_with = "deserialize_bounded_run_records")]
+            #[serde(default)]
             evidence: Vec<ObligationEvidence>,
-            #[serde(default, deserialize_with = "deserialize_bounded_run_records")]
+            #[serde(default)]
             skipped: Vec<SkippedObligation>,
             publication: EvidencePublicationMetadata,
-            #[serde(default, deserialize_with = "deserialize_bounded_run_diagnostics")]
+            #[serde(default)]
             diagnostics: Vec<String>,
         }
 
@@ -4529,11 +4850,33 @@ impl VerificationRunSummary {
         skipped: &[SkippedObligation],
         publication_conflicts: usize,
     ) -> Self {
-        // Index obligations by id once; the prior per-evidence find() was O(n*m).
-        let obligation_by_id: FxHashMap<&str, &TrustObligation> = {
+        Self::from_parts_with_artifact_policy(
+            requested_obligations,
+            evidence,
+            skipped,
+            publication_conflicts,
+            |index| evidence[index].satisfies_proof_artifact_policy(),
+        )
+    }
+
+    fn from_parts_with_artifact_policy(
+        requested_obligations: &[TrustObligation],
+        evidence: &[ObligationEvidence],
+        skipped: &[SkippedObligation],
+        publication_conflicts: usize,
+        mut artifact_policy: impl FnMut(usize) -> bool,
+    ) -> Self {
+        // Index obligations by id once (along with their default-admission bit);
+        // the prior per-evidence find() was O(n*m) and re-checked admission 4-5x.
+        let mut admitted = 0usize;
+        let obligation_by_id: FxHashMap<&str, (&TrustObligation, bool)> = {
             let mut map = FxHashMap::default();
             for obligation in requested_obligations {
-                map.entry(obligation.obligation_id.as_str()).or_insert(obligation);
+                let is_adm = obligation.is_default_admission();
+                if is_adm {
+                    admitted += 1;
+                }
+                map.entry(obligation.obligation_id.as_str()).or_insert((obligation, is_adm));
             }
             map
         };
@@ -4543,20 +4886,8 @@ impl VerificationRunSummary {
         // vacuous by construction. Exclude it from every real count so it can
         // never inflate `proved` or flip a verdict to Proved; record how many
         // were excluded in `admitted` for auditability.
-        let is_admission = |obligation_id: &str| -> bool {
-            obligation_by_id
-                .get(obligation_id)
-                .is_some_and(|obligation| obligation.is_default_admission())
-        };
-        let admitted = requested_obligations.iter().filter(|o| o.is_default_admission()).count();
-
         let mut summary = Self {
             requested_obligations: requested_obligations.len().saturating_sub(admitted),
-            evidence_count: evidence
-                .iter()
-                .filter(|item| !is_admission(&item.obligation_id))
-                .count(),
-            skipped: skipped.iter().filter(|item| !is_admission(&item.obligation_id)).count(),
             admitted,
             publication_conflicts,
             ..Self::default()
@@ -4569,22 +4900,22 @@ impl VerificationRunSummary {
         // rows per obligation today — a multi-engine fallback would be the first
         // mechanism that does — so this is a guard placed before the mechanism
         // that needs it, not a fix to an observed miscount.
-        let mut counted_proved: std::collections::BTreeSet<&str> =
-            std::collections::BTreeSet::new();
-        for item in evidence {
-            if is_admission(&item.obligation_id) {
+        let mut counted_proved = FxHashSet::default();
+        for (index, item) in evidence.iter().enumerate() {
+            let entry = obligation_by_id.get(item.obligation_id.as_str()).copied();
+            if entry.is_some_and(|(_, is_adm)| is_adm) {
                 continue;
             }
+            summary.evidence_count += 1;
             match item.status {
                 EvidenceStatus::Proved => {
-                    let required_strength = obligation_by_id
-                        .get(item.obligation_id.as_str())
-                        .and_then(|obligation| obligation.required_strength.as_ref());
+                    let required_strength =
+                        entry.and_then(|(obligation, _)| obligation.required_strength.as_ref());
                     if item.proof_strength.as_ref().is_some_and(ProofStrength::is_bounded) {
                         summary.bounded_proved += 1;
                     } else if !item.satisfies_strength_requirement(required_strength) {
                         summary.insufficient_strength += 1;
-                    } else if !item.satisfies_proof_artifact_policy() {
+                    } else if !artifact_policy(index) {
                         summary.missing_proof_artifacts += 1;
                     } else if counted_proved.insert(item.obligation_id.as_str()) {
                         summary.proved += 1;
@@ -4599,9 +4930,13 @@ impl VerificationRunSummary {
         }
 
         for item in skipped {
-            if is_admission(&item.obligation_id) {
+            if obligation_by_id
+                .get(item.obligation_id.as_str())
+                .is_some_and(|&(_, is_adm)| is_adm)
+            {
                 continue;
             }
+            summary.skipped += 1;
             match &item.reason {
                 SkipReason::Canceled { .. } => summary.cancelled += 1,
                 SkipReason::Unsupported { .. } => summary.unsupported += 1,
@@ -5129,7 +5464,10 @@ where
         where
             A: SeqAccess<'de>,
         {
-            if sequence.size_hint().is_some_and(|hint| hint > LIMIT) {
+            if trust_types::audit_ledger::cap_hit_if(
+                sequence.size_hint().is_some_and(|hint| hint > LIMIT),
+                "crates/trust-verifier-api/src/lib.rs:LIMIT",
+            ) {
                 return Err(de::Error::custom("too many evidence artifacts"));
             }
             let mut artifacts = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(LIMIT));
@@ -5139,7 +5477,10 @@ where
                 };
                 artifacts.push(artifact);
             }
-            if sequence.next_element::<IgnoredAny>()?.is_some() {
+            if trust_types::audit_ledger::cap_hit_if(
+                sequence.next_element::<IgnoredAny>()?.is_some(),
+                "crates/trust-verifier-api/src/lib.rs:LIMIT",
+            ) {
                 return Err(de::Error::custom("too many evidence artifacts"));
             }
             Ok(artifacts)
@@ -5184,9 +5525,15 @@ impl EvidenceArtifactMaterialization {
     ) -> Option<Self> {
         let proof_binding_id = proof_binding_id.into();
         if bytes.is_empty()
-            || bytes.len() > MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES
+            || trust_types::audit_ledger::cap_hit_if(
+                bytes.len() > MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES,
+                "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES",
+            )
             || !canonical_proof_binding_id(&proof_binding_id)
-            || referenced_artifacts.len() > MAX_EVIDENCE_ARTIFACT_REFERENCES
+            || trust_types::audit_ledger::cap_hit_if(
+                referenced_artifacts.len() > MAX_EVIDENCE_ARTIFACT_REFERENCES,
+                "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACT_REFERENCES",
+            )
             || referenced_artifacts
                 .iter()
                 .any(|reference| !canonical_sha256_artifact_hash(&reference.hash))
@@ -5211,10 +5558,16 @@ impl EvidenceArtifactMaterialization {
     ) -> Option<(Self, ArtifactHash)> {
         let proof_binding_id = proof_binding_id.into();
         if payload.is_empty()
-            || payload.len() > MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES
+            || trust_types::audit_ledger::cap_hit_if(
+                payload.len() > MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES,
+                "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES",
+            )
             || !canonical_proof_binding_id(&proof_binding_id)
             || !canonical_artifact_owner_id(obligation_id)
-            || referenced_artifacts.len() > MAX_EVIDENCE_ARTIFACT_REFERENCES
+            || trust_types::audit_ledger::cap_hit_if(
+                referenced_artifacts.len() > MAX_EVIDENCE_ARTIFACT_REFERENCES,
+                "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACT_REFERENCES",
+            )
             || referenced_artifacts.iter().any(|reference| {
                 reference.kind.canonical_wire_label().is_none()
                     || !canonical_sha256_artifact_hash(&reference.hash)
@@ -5236,7 +5589,10 @@ impl EvidenceArtifactMaterialization {
         }
         bytes.extend_from_slice(&u64::try_from(payload.len()).ok()?.to_be_bytes());
         bytes.extend_from_slice(payload);
-        if bytes.len() > MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES {
+        if trust_types::audit_ledger::cap_hit_if(
+            bytes.len() > MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES,
+            "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES",
+        ) {
             return None;
         }
         let materialization = Self::new(bytes, proof_binding_id, referenced_artifacts)?;
@@ -5393,11 +5749,16 @@ fn parse_bound_payload<'a>(
             .then_some(())?;
     }
     let payload_len = usize::try_from(read_binding_u64(bytes, &mut cursor)?).ok()?;
-    if payload_len == 0 || payload_len > MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES {
+    if payload_len == 0
+        || trust_types::audit_ledger::cap_hit_if(
+            payload_len > MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES,
+            "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES",
+        )
+    {
         return None;
     }
     let end = cursor.checked_add(payload_len)?;
-    (end == bytes.len()).then_some(&bytes[cursor..end])
+    (end == bytes.len()).then(|| &bytes[cursor..end])
 }
 
 fn read_binding_field<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
@@ -5469,7 +5830,10 @@ where
                 sequence.size_hint().unwrap_or(0).min(MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES);
             let mut bytes = Vec::with_capacity(initial);
             while let Some(byte) = sequence.next_element::<u8>()? {
-                if bytes.len() == MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES {
+                if trust_types::audit_ledger::cap_hit_if(
+                    bytes.len() == MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES,
+                    "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES",
+                ) {
                     return Err(de::Error::custom("artifact materialization exceeds byte limit"));
                 }
                 bytes.push(byte);
@@ -5507,7 +5871,10 @@ where
                 sequence.size_hint().unwrap_or(0).min(MAX_EVIDENCE_ARTIFACT_REFERENCES),
             );
             while let Some(reference) = sequence.next_element::<EvidenceArtifactReference>()? {
-                if references.len() == MAX_EVIDENCE_ARTIFACT_REFERENCES {
+                if trust_types::audit_ledger::cap_hit_if(
+                    references.len() == MAX_EVIDENCE_ARTIFACT_REFERENCES,
+                    "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACT_REFERENCES",
+                ) {
                     return Err(de::Error::custom("too many artifact digest references"));
                 }
                 references.push(reference);
@@ -5655,12 +6022,14 @@ impl SummaryFact {
 
     /// Decode a summary fact from a metadata entry.
     ///
-    /// Returns `Ok(None)` for unrelated metadata keys.
+    /// Returns `Ok(None)` for unrelated metadata keys. Trust (T3 L4, C09d): through
+    /// `trust_types::json_depth::from_str_deep`, the reader every contract-predicate and
+    /// summary-fact reader uses (a plain `serde_json::from_str` below its default nesting).
     pub fn from_metadata_entry(
         metadata: &MetadataEntry,
     ) -> Result<Option<Self>, serde_json::Error> {
         if metadata.key == SUMMARY_FACT_METADATA_KEY {
-            serde_json::from_str(&metadata.value).map(Some)
+            trust_types::json_depth::from_str_deep(&metadata.value).map(Some)
         } else {
             Ok(None)
         }
@@ -5707,17 +6076,11 @@ fn validate_summary_fact(fact: &SummaryFact) -> Result<(), String> {
         return Err("verifier summary fact uses an unsupported schema".to_string());
     }
     validate_envelope_identifier("summary fact id", &fact.id)?;
-    validate_canonical_text("summary fact producer", &fact.producer, MAX_SUMMARY_FACT_FIELD_BYTES)?;
-    validate_canonical_text(
-        "summary fact source crate",
-        &fact.source_crate,
-        MAX_SUMMARY_FACT_FIELD_BYTES,
-    )?;
-    validate_canonical_text(
-        "summary fact source item",
-        &fact.source_item,
-        MAX_SUMMARY_FACT_FIELD_BYTES,
-    )?;
+    // Trust (T3 L4, C09d): a fact's fields carry program text (a source item, an endpoint
+    // expression), so they are canonical text of any length.
+    validate_canonical_text_of_any_length("summary fact producer", &fact.producer)?;
+    validate_canonical_text_of_any_length("summary fact source crate", &fact.source_crate)?;
+    validate_canonical_text_of_any_length("summary fact source item", &fact.source_item)?;
     validate_artifact_hash("summary fact digest", &fact.digest)?;
     validate_summary_fact_kind(&fact.kind)
 }
@@ -5726,16 +6089,8 @@ fn validate_summary_fact_kind(kind: &SummaryFactKind) -> Result<(), String> {
     match kind {
         SummaryFactKind::PointerProvenanceEq { left, right }
         | SummaryFactKind::FatPointerMetadataEq { left, right } => {
-            validate_canonical_text(
-                "summary fact left endpoint",
-                left,
-                MAX_SUMMARY_FACT_FIELD_BYTES,
-            )?;
-            validate_canonical_text(
-                "summary fact right endpoint",
-                right,
-                MAX_SUMMARY_FACT_FIELD_BYTES,
-            )
+            validate_canonical_text_of_any_length("summary fact left endpoint", left)?;
+            validate_canonical_text_of_any_length("summary fact right endpoint", right)
         }
         SummaryFactKind::Other { schema } => {
             validate_canonical_schema("summary fact kind schema", schema)
@@ -5800,12 +6155,13 @@ impl VerificationRunManifest {
     /// or summary cannot become an actionable release manifest.
     #[must_use]
     pub fn from_result(result: &VerificationRunResult) -> Self {
-        if result.validate_derived_state().is_ok() {
-            return Self::from_validated_result(result);
+        let validation = RunEvidenceValidation::new(result);
+        if validation.validate_derived_state().is_ok() {
+            return Self::from_validated_result(&validation);
         }
         let input_error = result.validate_input_state().err();
         let canonical = result.canonicalized_derived_state();
-        let mut manifest = Self::from_validated_result(&canonical);
+        let mut manifest = Self::from_validated_result(&RunEvidenceValidation::new(&canonical));
         if let Some(error) = input_error {
             // This infallible compatibility constructor remains useful for
             // diagnostics, but structurally invalid source identity/inventory
@@ -5819,7 +6175,8 @@ impl VerificationRunManifest {
         manifest
     }
 
-    fn from_validated_result(result: &VerificationRunResult) -> Self {
+    fn from_validated_result(validation: &RunEvidenceValidation<'_>) -> Self {
+        let result = validation.result;
         let obligations = manifest_obligations(result);
         let mut accepted_evidence = Vec::new();
         let mut rejected_evidence = Vec::new();
@@ -5837,9 +6194,12 @@ impl VerificationRunManifest {
             map
         };
 
-        for evidence in &result.evidence {
+        for (index, evidence) in result.evidence.iter().enumerate() {
             artifacts.extend(evidence.artifacts.clone());
-            let decision = ManifestEvidenceDecision::classify(result, evidence, &obligation_by_id);
+            let decision =
+                ManifestEvidenceDecision::classify(result, evidence, &obligation_by_id, || {
+                    validation.artifact_policy(index)
+                });
             if decision.disposition == EvidenceDisposition::AcceptedProof {
                 accepted_evidence.push(decision);
             } else {
@@ -5859,10 +6219,13 @@ impl VerificationRunManifest {
 
         // Set-based dedup: `Vec::contains` per diagnostic is O(d^2) once every
         // skipped obligation carries a release-blocking proof-gap line.
-        let mut seen_diagnostics: FxHashSet<String> = diagnostics.iter().cloned().collect();
-        for diagnostic in release_blocking_skipped_proof_gap_diagnostics(&result.skipped) {
-            if seen_diagnostics.insert(diagnostic.clone()) {
-                diagnostics.push(diagnostic);
+        let skipped_diagnostics = release_blocking_skipped_proof_gap_diagnostics(&result.skipped);
+        if !skipped_diagnostics.is_empty() {
+            let mut seen_diagnostics: FxHashSet<String> = diagnostics.iter().cloned().collect();
+            for diagnostic in skipped_diagnostics {
+                if seen_diagnostics.insert(diagnostic.clone()) {
+                    diagnostics.push(diagnostic);
+                }
             }
         }
 
@@ -5900,25 +6263,17 @@ impl VerificationRunManifest {
             return Err("verifier manifest run_id does not match its execution context".to_string());
         }
         validate_cancellation_snapshot(&self.context.cancellation)?;
-        let evidence_count = self
-            .accepted_evidence
-            .len()
-            .checked_add(self.rejected_evidence.len())
-            .ok_or_else(|| "verifier manifest evidence count overflowed".to_string())?;
-        validate_run_collection_limits(
-            self.obligations.len(),
-            evidence_count,
-            self.skipped.len(),
-            self.diagnostics.len(),
-        )?;
-        validate_diagnostics("verifier manifest", &self.diagnostics, MAX_VERIFIER_RUN_DIAGNOSTICS)?;
-        if self.artifacts.len() > MAX_EVIDENCE_ARTIFACTS_PER_RUN_MANIFEST
-            || self
-                .accepted_evidence
+        validate_run_diagnostics("verifier manifest", &self.diagnostics)?;
+        if trust_types::audit_ledger::cap_hit_if(
+            self.artifacts.len() > MAX_EVIDENCE_ARTIFACTS_PER_RUN_MANIFEST,
+            "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACTS_PER_RUN_MANIFEST",
+        ) || trust_types::audit_ledger::cap_hit_if(
+            self.accepted_evidence
                 .iter()
                 .chain(&self.rejected_evidence)
-                .any(|decision| decision.artifacts.len() > MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION)
-        {
+                .any(|decision| decision.artifacts.len() > MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION),
+            "crates/trust-verifier-api/src/lib.rs:MAX_EVIDENCE_ARTIFACTS_PER_OBLIGATION",
+        ) {
             return Err("verifier manifest evidence exceeds an artifact safety limit".to_string());
         }
         for artifact in &self.artifacts {
@@ -6032,8 +6387,9 @@ impl VerificationRunManifest {
             publication: self.publication.clone(),
             diagnostics: self.diagnostics.clone(),
         };
-        reconstructed.validate_derived_state()?;
-        let expected = Self::from_validated_result(&reconstructed);
+        let validation = RunEvidenceValidation::new(&reconstructed);
+        validation.validate_derived_state()?;
+        let expected = Self::from_validated_result(&validation);
         if &expected != self {
             return Err(
                 "verifier manifest derived obligations/evidence/artifacts do not match typed inputs"
@@ -6056,11 +6412,11 @@ impl VerificationRunManifest {
             && self.validate_derived_state().is_ok()
     }
 
-    /// Parse an untrusted JSON release manifest through a whole-envelope byte
-    /// cap before serde allocates nested strings and counterexamples.
+    /// Parse an untrusted JSON release manifest through its validated deserializer. Trust
+    /// (T3 L4, C09d): no whole-envelope byte cap, as for
+    /// [`VerificationRunResult::from_json_slice`].
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, String> {
-        validate_json_envelope_length(bytes.len(), "manifest")?;
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+        trust_types::json_depth::from_slice_deep(bytes).map_err(|error| error.to_string())
     }
 }
 
@@ -6079,18 +6435,18 @@ impl<'de> Deserialize<'de> for VerificationRunManifest {
             context: VerifierExecutionSnapshot,
             status: VerificationRunStatus,
             summary: VerificationRunSummary,
-            #[serde(default, deserialize_with = "deserialize_bounded_run_records")]
+            #[serde(default)]
             obligations: Vec<ManifestObligation>,
-            #[serde(default, deserialize_with = "deserialize_bounded_run_records")]
+            #[serde(default)]
             accepted_evidence: Vec<ManifestEvidenceDecision>,
-            #[serde(default, deserialize_with = "deserialize_bounded_run_records")]
+            #[serde(default)]
             rejected_evidence: Vec<ManifestEvidenceDecision>,
-            #[serde(default, deserialize_with = "deserialize_bounded_run_records")]
+            #[serde(default)]
             skipped: Vec<SkippedObligation>,
             #[serde(default, deserialize_with = "deserialize_run_manifest_evidence_artifacts")]
             artifacts: Vec<EvidenceArtifact>,
             publication: EvidencePublicationMetadata,
-            #[serde(default, deserialize_with = "deserialize_bounded_run_diagnostics")]
+            #[serde(default)]
             diagnostics: Vec<String>,
         }
 
@@ -6240,8 +6596,9 @@ impl ManifestEvidenceDecision {
         result: &VerificationRunResult,
         evidence: &ObligationEvidence,
         obligation_by_id: &FxHashMap<&str, &TrustObligation>,
+        artifact_policy: impl FnOnce() -> bool,
     ) -> Self {
-        let disposition = evidence_disposition(result, evidence, obligation_by_id);
+        let disposition = evidence_disposition(result, evidence, obligation_by_id, artifact_policy);
         let reason = evidence_disposition_reason(&disposition, evidence);
 
         Self {
@@ -6264,6 +6621,7 @@ fn evidence_disposition(
     result: &VerificationRunResult,
     evidence: &ObligationEvidence,
     obligation_by_id: &FxHashMap<&str, &TrustObligation>,
+    artifact_policy: impl FnOnce() -> bool,
 ) -> EvidenceDisposition {
     if evidence.engine != result.engine {
         return EvidenceDisposition::RejectedEngineProvenance;
@@ -6282,7 +6640,7 @@ fn evidence_disposition(
     if !evidence.satisfies_strength_requirement(required_strength) {
         return EvidenceDisposition::RejectedInsufficientStrength;
     }
-    if !evidence.satisfies_proof_artifact_policy() {
+    if !artifact_policy() {
         return EvidenceDisposition::RejectedMissingProofArtifacts;
     }
     EvidenceDisposition::AcceptedProof
@@ -6330,12 +6688,36 @@ pub enum EvidenceDisposition {
 mod tests {
     use super::*;
 
+    /// Stack for a test that builds, clones, compares or drops a value near
+    /// `trust_types::json_depth::MAX_DEEP_NESTING`: each recurses once or more per level, and
+    /// a test thread has 2 MiB. Lazily committed, as the deep-decode thread's is.
+    const DEEP_TEST_STACK_BYTES: usize = 256 * 1024 * 1024;
+
+    /// Run `test` on a thread with [`DEEP_TEST_STACK_BYTES`] of stack (T3 L4, C09d).
+    fn on_a_deep_stack(test: impl FnOnce() + Send) {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(DEEP_TEST_STACK_BYTES)
+                .spawn_scoped(scope, test)
+                .expect("the test thread starts")
+                .join()
+                .expect("the test passes");
+        });
+    }
+    mod artifact_validation;
+
     /// `TrustContract::validate` is the SAME checker bundle validation runs,
     /// not a second opinion. A producer that mints one record at a time needs
     /// exactly this: bundle validation is all-or-nothing, so a record it would
-    /// reject has to be detectable BEFORE it is pushed.
+    /// reject has to be detectable BEFORE it is pushed. Trust (T3 L4, C09d): the
+    /// bound straddled is the depth its readers decode, `json_depth::MAX_DEEP_NESTING`.
     #[test]
     fn contract_validate_agrees_with_bundle_validation_record_for_record() {
+        on_a_deep_stack(contract_validate_agrees_with_bundle_validation_on_a_deep_stack);
+    }
+
+    fn contract_validate_agrees_with_bundle_validation_on_a_deep_stack() {
+        // `depth + 1` JSON levels: `depth` wrappers around the leaf object.
         let nested_json = |depth: usize| {
             let mut value = serde_json::json!({ "leaf": true });
             for _ in 0..depth {
@@ -6356,10 +6738,7 @@ mod tests {
         let bundle_verdict = |contract: &TrustContract| {
             let mut bundle = TrustContractBundle::empty(
                 "bundle-depth-probe",
-                BundleSubject::Artifact {
-                    name: "depth".to_string(),
-                    kind: "probe".to_string(),
-                },
+                BundleSubject::Artifact { name: "depth".to_string(), kind: "probe".to_string() },
             );
             bundle.contracts.push(contract.clone());
             bundle.validate().is_ok()
@@ -6370,7 +6749,16 @@ mod tests {
         assert!(shallow.validate().is_ok(), "a shallow contract validates");
         assert!(bundle_verdict(&shallow), "and its bundle validates too");
 
-        let deep = contract_with(nested_json(MAX_CONTRACT_PREDICATE_JSON_DEPTH + 8));
+        // Past serde_json's 128-level default and the deleted 128-level bound, within the
+        // readers' bound: large, not malformed.
+        let past_the_old_bound = contract_with(nested_json(1_000));
+        assert!(past_the_old_bound.validate().is_ok(), "a deep, decodable contract validates");
+        assert!(bundle_verdict(&past_the_old_bound), "and its bundle validates too");
+        let bound = trust_types::json_depth::MAX_DEEP_NESTING;
+        let at_the_bound = contract_with(nested_json(bound - 1));
+        assert!(at_the_bound.validate().is_ok(), "a contract at the readers' bound validates");
+
+        let deep = contract_with(nested_json(bound));
         let error = deep.validate().expect_err("a past-bound contract must be rejected");
         assert!(error.contains("JSON depth limit"), "{error}");
         assert!(
@@ -7188,6 +7576,9 @@ mod tests {
         let encoded = serde_json::to_vec(&blank).expect("serialize invalid identity bundle");
         assert!(TrustContractBundle::from_json_slice(&encoded).is_err());
 
+        // Trust (T3 L4, C09d): a bundle's inventory has no count bound. An inventory past the
+        // deleted 131,072-record bound is refused at its first malformed record, for being
+        // malformed, not for its size.
         let valid = TrustContractBundle::empty(
             "bundle-oversized",
             BundleSubject::Crate { name: "demo".to_string() },
@@ -7195,15 +7586,19 @@ mod tests {
         let mut value = serde_json::to_value(valid).expect("serialize bundle value");
         value.as_object_mut().expect("bundle object").insert(
             "obligations".to_string(),
-            serde_json::Value::Array(vec![serde_json::Value::Null; MAX_VERIFIER_RUN_RECORDS + 1]),
+            serde_json::Value::Array(vec![serde_json::Value::Null; 131_073]),
         );
         let error = serde_json::from_value::<TrustContractBundle>(value)
-            .expect_err("oversized bundle inventory must fail before element parsing");
-        assert!(error.to_string().contains("too many verifier run records"), "{error}");
+            .expect_err("a null is not an obligation");
+        assert!(!error.to_string().contains("too many"), "{error}");
     }
 
     #[test]
     fn contract_predicate_payloads_are_bounded_and_typed_at_both_ingress_paths() {
+        on_a_deep_stack(contract_predicate_payloads_at_both_ingress_paths_on_a_deep_stack);
+    }
+
+    fn contract_predicate_payloads_at_both_ingress_paths_on_a_deep_stack() {
         let make_bundle = |predicate: ContractPredicate| {
             let mut bundle = TrustContractBundle::empty(
                 "bundle-predicate-boundary",
@@ -7254,18 +7649,67 @@ mod tests {
         .expect("undeclared-variable fixture serializes");
         assert!(make_bundle(undeclared).validate().is_err());
 
-        let mut deep = serde_json::Value::Null;
-        for _ in 0..=MAX_CONTRACT_PREDICATE_JSON_DEPTH {
-            deep = serde_json::Value::Array(vec![deep]);
-        }
-        let deep_bundle = make_bundle(ContractPredicate::CanonicalJson {
-            schema: "trust.test.deep.v1".to_string(),
-            value: deep,
-        });
-        let error = deep_bundle
+        // Trust (T3 L4, C09d): the one nesting bound is the readers' (`MAX_DEEP_NESTING`).
+        // A predicate nested to it validates in memory; one nested past it is refused. A bundle
+        // file nests five levels above its predicate (bundle, contracts, contract, predicate,
+        // variant), so its file is read whole only while the predicate sits five levels under
+        // the bound.
+        let bound = trust_types::json_depth::MAX_DEEP_NESTING;
+        let file_depth = |bytes: &[u8]| {
+            trust_types::json_depth::json_nesting_depth(
+                std::str::from_utf8(bytes).expect("serde_json writes UTF-8"),
+            )
+        };
+        let nested = |depth: usize| {
+            let mut value = serde_json::Value::Null;
+            for _ in 0..depth {
+                value = serde_json::Value::Array(vec![value]);
+            }
+            make_bundle(ContractPredicate::CanonicalJson {
+                schema: "trust.test.deep.v1".to_string(),
+                value,
+            })
+        };
+        let in_a_file = nested(bound - 5);
+        in_a_file.validate().expect("a predicate under the bound validates in memory");
+        let encoded = serde_json::to_vec(&in_a_file).expect("serialize deep bundle");
+        assert_eq!(file_depth(&encoded), bound);
+        let decoded =
+            TrustContractBundle::from_json_slice(&encoded).expect("the file is read whole");
+        assert_eq!(decoded, in_a_file);
+        nested(bound).validate().expect("a predicate at the bound validates in memory");
+        let error = nested(bound + 1)
             .validate()
-            .expect_err("deep programmatic predicate must hit the traversal limit");
+            .expect_err("a predicate past the readers' bound is refused");
         assert!(error.contains("JSON depth limit"), "{error}");
+        let past = serde_json::to_vec(&nested(bound - 4)).expect("serialize deeper bundle");
+        assert!(
+            TrustContractBundle::from_json_slice(&past).is_err(),
+            "a file nested past the bound is refused whole"
+        );
+
+        // A typed predicate past `serde_json`'s 128-level default (an And chain, two JSON
+        // levels a link) is decoded on the deep-decode stack and validated without recursion,
+        // in memory and from its file.
+        let mut chain = TrustSpecExpr::bool_literal(true);
+        for _ in 0..1_000 {
+            chain = TrustSpecExpr::binary(
+                TrustSpecBinaryOp::And,
+                chain,
+                TrustSpecExpr::bool_literal(true),
+            );
+        }
+        let typed = make_bundle(
+            TrustSpecPredicate::new(chain, Vec::new())
+                .into_contract_predicate()
+                .expect("the chain serializes"),
+        );
+        typed.validate().expect("a deep typed predicate validates");
+        let encoded = serde_json::to_vec(&typed).expect("serialize deep typed bundle");
+        assert!(file_depth(&encoded) > 2_000);
+        let decoded =
+            TrustContractBundle::from_json_slice(&encoded).expect("the typed file is read whole");
+        assert_eq!(decoded, typed);
 
         let invalid_temporal = make_bundle(ContractPredicate::TemporalModelRef {
             uri: "relative model path".to_string(),
@@ -7395,6 +7839,132 @@ mod tests {
             .expect("typed predicate schema");
         assert!(decoded.has_current_schema());
         assert_eq!(decoded.root_sort, TrustSpecSort::Bool);
+    }
+
+    #[test]
+    fn typed_spec_predicate_value_has_canonical_recursive_identity() {
+        for literal in [u128::MAX.to_string(), i128::MIN.to_string()] {
+            let source = TrustSpecPredicate::new(
+                TrustSpecExpr::binary(
+                    TrustSpecBinaryOp::Eq,
+                    TrustSpecExpr::int_literal(literal.clone()),
+                    TrustSpecExpr::int_literal(literal),
+                ),
+                Vec::new(),
+            );
+            source.validate().unwrap();
+            let predicate = source.clone().into_contract_predicate().unwrap();
+            let ContractPredicate::TrustIr { value, .. } = &predicate else {
+                panic!("expected typed public predicate");
+            };
+            assert_eq!(
+                serde_json::to_vec(value).unwrap(),
+                trust_types::canonical_json_bytes(&source).unwrap(),
+                "nested predicate values must keep the same bytes across map features"
+            );
+            assert_eq!(
+                TrustSpecPredicate::from_contract_predicate(&predicate).unwrap(),
+                Some(source),
+                "canonicalization must retain arbitrary-width decimal literals exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_typed_predicate_encodes_on_a_small_caller_stack() {
+        std::thread::Builder::new()
+            .name("small-typed-predicate-producer".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                for stringify in [true, false] {
+                    let mut root = TrustSpecExpr::bool_literal(true);
+                    for _ in 0..1500 {
+                        root = TrustSpecExpr::binary(
+                            TrustSpecBinaryOp::And,
+                            root,
+                            TrustSpecExpr::bool_literal(true),
+                        );
+                    }
+                    let source = TrustSpecPredicate::new(root, Vec::new());
+                    source.validate().unwrap();
+                    let predicate = source.into_contract_predicate().unwrap();
+                    if !stringify {
+                        drop(predicate);
+                        continue;
+                    }
+                    let ContractPredicate::TrustIr { value, .. } = predicate else {
+                        panic!("typed predicate carrier");
+                    };
+                    let depth = trust_types::json_depth::value_nesting_depth(&value);
+                    assert!(depth > 128 && depth <= trust_types::json_depth::MAX_DEEP_NESTING);
+                    let mut expr = &value["root"];
+                    for _ in 0..1500 {
+                        assert_eq!(expr["sort"], "bool");
+                        assert_eq!(expr["kind"]["node"], "binary");
+                        assert_eq!(expr["kind"]["op"], "and");
+                        assert_eq!(expr["kind"]["rhs"]["kind"]["value"], true);
+                        expr = &expr["kind"]["lhs"];
+                    }
+                    assert_eq!(expr["kind"]["value"], true);
+                    let text =
+                        trust_types::json_depth::into_string_owned_on_deep_stack(value).unwrap();
+                    assert_eq!(text.matches("\"node\":\"binary\"").count(), 1500);
+                }
+            })
+            .unwrap()
+            .join()
+            .expect("public typed encoding/stringification/drop must tolerate a 2MiB caller");
+    }
+
+    #[test]
+    fn typed_spec_signed_remainder_is_distinct_additive_v1_and_sort_checked() {
+        let bv8 = TrustSpecSort::BitVec { width: 8 };
+        let predicate = |op, rhs| {
+            TrustSpecPredicate::new(
+                TrustSpecExpr::binary(
+                    TrustSpecBinaryOp::Eq,
+                    TrustSpecExpr::bv_binary(op, TrustSpecExpr::variable("x", bv8), rhs, 8),
+                    TrustSpecExpr::bitvec_literal("0", 8),
+                ),
+                vec![TrustSpecVariable {
+                    name: "x".to_string(),
+                    sort: bv8,
+                    origin: TrustSpecVariableOrigin::Local { index: 1 },
+                }],
+            )
+        };
+        for (op, tag) in [(TrustSpecBvBinaryOp::Srem, "srem"), (TrustSpecBvBinaryOp::Urem, "urem")]
+        {
+            let source = predicate(op, TrustSpecExpr::bitvec_literal("2", 8));
+            source.validate().expect("same-width remainder validates");
+            let encoded = source.clone().into_contract_predicate().expect("remainder encodes");
+            let ContractPredicate::TrustIr { schema, value } = &encoded else {
+                panic!("remainder must keep the typed predicate carrier");
+            };
+            assert_eq!(schema, "trust.spec-predicate.v1");
+            assert_eq!(value["root"]["kind"]["lhs"]["kind"]["op"], tag);
+            assert_eq!(
+                TrustSpecPredicate::from_contract_predicate(&encoded).unwrap(),
+                Some(source),
+                "signed and unsigned operations must round-trip distinctly",
+            );
+        }
+        assert_eq!(serde_json::to_value(TrustSpecBvBinaryOp::Urem).unwrap(), "urem");
+        assert_eq!(serde_json::to_value(TrustSpecBvBinaryOp::Srem).unwrap(), "srem");
+        assert!(serde_json::from_value::<TrustSpecBvBinaryOp>(serde_json::json!("sdiv")).is_err());
+        assert!(
+            predicate(TrustSpecBvBinaryOp::Srem, TrustSpecExpr::bitvec_literal("2", 16))
+                .validate()
+                .is_err(),
+            "a mismatched operand width must fail closed"
+        );
+        let mut wrong_result =
+            predicate(TrustSpecBvBinaryOp::Srem, TrustSpecExpr::bitvec_literal("2", 8));
+        let TrustSpecExprKind::Binary { lhs, .. } = &mut wrong_result.root.kind else {
+            unreachable!()
+        };
+        lhs.sort = TrustSpecSort::Bool;
+        assert!(wrong_result.validate().is_err(), "a remainder cannot claim a Bool result");
     }
 
     #[test]
@@ -8185,6 +8755,36 @@ mod tests {
         let json = serde_json::to_value(&snapshot).expect("snapshot serializes");
         assert!(json.get("deadline").is_none());
         assert_eq!(json["limits"]["wall_time_ms"].as_u64(), Some(0));
+    }
+
+    /// Trust (2026-10-17, gate-rca deadline): a passed native solve cutoff ends SOLVING
+    /// only. The deadline every receipt is bound to, liveness and the snapshot are the
+    /// function's. Negative control: the same instant set as the DEADLINE makes the
+    /// context late (`budget_exceeded`), which is what would refuse every live receipt.
+    #[test]
+    fn native_solve_cutoff_bounds_solving_and_leaves_deadline_and_snapshot_alone() {
+        let passed =
+            Instant::now().checked_sub(Duration::from_millis(1)).unwrap_or_else(Instant::now);
+        let later = Instant::now() + Duration::from_secs(3600);
+        let plain = VerifierExecutionContext::new("run-cutoff").with_deadline(later);
+        let cut = plain.clone().with_native_solve_cutoff(Some(passed));
+
+        assert_eq!(cut.solve_deadline(), Some(passed), "solving stops at the cutoff");
+        assert_eq!(cut.deadline(), Some(later), "the receipt deadline is the function's");
+        assert!(!cut.budget_exceeded(), "a passed cutoff is not a late context");
+        assert_eq!(cut.snapshot(), plain.snapshot(), "the cutoff is not in the snapshot");
+        assert_eq!(plain.solve_deadline(), Some(later), "no cutoff: solving ends at the deadline");
+        assert_eq!(
+            VerifierExecutionContext::new("run-cutoff-later")
+                .with_deadline(passed)
+                .with_native_solve_cutoff(Some(later))
+                .solve_deadline(),
+            Some(passed),
+            "a later cutoff never extends solving past the deadline"
+        );
+
+        let late = VerifierExecutionContext::new("run-control").with_deadline(passed);
+        assert!(late.budget_exceeded(), "control: the same instant as the deadline is late");
     }
 
     #[test]
@@ -9046,6 +9646,70 @@ mod tests {
     }
 
     #[test]
+    fn bound_artifact_payload_lengths_refuse_truncation_without_panicking() {
+        let artifact = certificate_artifact("length-owner", "length-proof");
+        let materialization = artifact.materialization.as_ref().unwrap();
+        let payload = materialization
+            .bound_payload_bytes(artifact.kind, "length-owner")
+            .expect("valid exact payload");
+        let length_offset = materialization.bytes().len() - payload.len() - 8;
+        for declared_len in [
+            0,
+            payload.len() as u64,
+            payload.len() as u64 + 1,
+            MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES as u64,
+            MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES as u64 + 1,
+            u64::MAX,
+        ] {
+            let mut bytes = materialization.bytes().to_vec();
+            bytes[length_offset..length_offset + 8].copy_from_slice(&declared_len.to_be_bytes());
+            // Public construction checks the actual byte length. An untrusted
+            // producer may still declare a larger payload inside those bytes.
+            let forged = EvidenceArtifactMaterialization::new(bytes, "length-proof", Vec::new())
+                .expect("bounded public materialization");
+            let parsed = std::panic::catch_unwind(|| {
+                forged.bound_payload_bytes(artifact.kind, "length-owner")
+            })
+            .expect("malformed length must refuse, never panic");
+            assert_eq!(parsed.is_some(), declared_len == payload.len() as u64);
+
+            let mut proof = evidence(
+                &EngineManifest::new("length-engine", "0.1.0", EngineKind::Deductive),
+                "length-evidence",
+                "length-owner",
+                EvidenceStatus::Proved,
+                Some(ProofStrength::deductive()),
+                Vec::new(),
+            );
+            let hash = ArtifactHash {
+                algorithm: "sha256".to_string(),
+                value: stable_sha256_hex(forged.bytes()),
+            };
+            proof.artifacts.push(EvidenceArtifact {
+                kind: artifact.kind,
+                uri: format!("artifact://length-test/{}", hash.value),
+                hash,
+                materialization: Some(forged),
+            });
+            let accepted = std::panic::catch_unwind(|| proof.satisfies_proof_artifact_policy())
+                .expect("malformed evidence must refuse, never panic");
+            assert_eq!(accepted, declared_len == payload.len() as u64);
+        }
+        let mut trailing = materialization.bytes().to_vec();
+        trailing.push(b'x');
+        let trailing = EvidenceArtifactMaterialization::new(trailing, "length-proof", Vec::new())
+            .expect("bounded trailing bytes");
+        assert!(trailing.bound_payload_bytes(artifact.kind, "length-owner").is_none());
+        let truncated = EvidenceArtifactMaterialization::new(
+            materialization.bytes()[..length_offset + 4].to_vec(),
+            "length-proof",
+            Vec::new(),
+        )
+        .expect("bounded truncated header");
+        assert!(truncated.bound_payload_bytes(artifact.kind, "length-owner").is_none());
+    }
+
+    #[test]
     fn artifact_owner_ids_accept_only_interior_ascii_spaces() {
         let trait_impl = "<Button as sealed::Widget>::rank";
         assert!(canonical_artifact_owner_id(trait_impl));
@@ -9107,11 +9771,22 @@ mod tests {
             ArtifactHash { algorithm: "sha256".to_string(), value: "b".repeat(64) },
         );
         assert!(valid.is_replay_addressable());
+        // Trust (T3 L4, C09d): a field is program text of any length; past the deleted
+        // 16 KiB bound it is still canonical. A control character is not.
+        let mut long = valid.clone();
+        long.source_item = format!("dep::{}", "x".repeat(64 * 1024));
+        long.kind = SummaryFactKind::PointerProvenanceEq {
+            left: "p".repeat(64 * 1024),
+            right: "q".to_string(),
+        };
+        assert!(long.is_replay_addressable(), "a long fact is canonical");
+        let mut control = valid.clone();
+        control.source_item = "dep::\u{7}callee".to_string();
+        assert!(!control.is_replay_addressable(), "a control character is not canonical");
 
         let mut invalid = valid.clone();
         invalid.digest.algorithm = "SHA-256".to_string();
         invalid.digest.value = "B".repeat(64);
-        invalid.source_item = format!("dep::{}", "x".repeat(MAX_SUMMARY_FACT_FIELD_BYTES));
         invalid.kind = SummaryFactKind::PointerProvenanceEq {
             left: " p".to_string(),
             right: "q\n".to_string(),
@@ -9881,92 +10556,79 @@ mod tests {
         );
     }
 
+    /// Trust (T3 L4, C09d): a run's and a manifest's record lists and diagnostics have no
+    /// count bound, alone or together, and a bundle's metadata none. Past each deleted bound
+    /// the input decodes and validates; a list past it is refused at its first malformed
+    /// element, for being malformed.
     #[test]
-    fn verifier_run_and_manifest_collections_are_bounded_before_element_parsing() {
-        #[derive(Debug, serde::Deserialize)]
-        struct BoundedRunRecords {
-            #[serde(deserialize_with = "deserialize_bounded_run_records")]
-            records: Vec<()>,
-        }
-        #[derive(Debug, serde::Deserialize)]
-        struct BoundedRunDiagnostics {
-            #[serde(deserialize_with = "deserialize_bounded_run_diagnostics")]
-            diagnostics: Vec<String>,
-        }
+    fn verifier_run_and_manifest_collections_are_unbounded_and_refuse_malformed_elements() {
+        // The deleted MAX_VERIFIER_RUN_DIAGNOSTICS was 65,536, MAX_BUNDLE_METADATA_ENTRIES
+        // 65,536 and MAX_VERIFIER_RUN_RECORDS 131,072.
+        const PAST_THE_DELETED_BOUNDS: usize = 70_000;
+        let mut result = fully_proved_result(VerifierInvocation::DpubReleaseGate);
+        result
+            .diagnostics
+            .extend((0..PAST_THE_DELETED_BOUNDS).map(|index| format!("engine diagnostic {index}")));
+        result.try_reconcile_derived_state().expect("engine diagnostics reconcile");
+        result.validate_derived_state().expect("a run of many diagnostics validates");
+        let encoded = serde_json::to_vec(&result).expect("serialize a large run");
+        let decoded =
+            VerificationRunResult::from_json_slice(&encoded).expect("a large run is read whole");
+        assert_eq!(decoded, result);
+        let manifest = result.try_to_manifest().expect("a large run's manifest");
+        let encoded = serde_json::to_vec(&manifest).expect("serialize a large manifest");
+        let decoded = VerificationRunManifest::from_json_slice(&encoded)
+            .expect("a large manifest is read whole");
+        assert_eq!(decoded, manifest);
 
-        let exact_records: BoundedRunRecords = serde_json::from_value(serde_json::json!({
-            "records": vec![serde_json::Value::Null; MAX_VERIFIER_RUN_RECORDS]
-        }))
-        .expect("the exact run-record limit is accepted");
-        assert_eq!(exact_records.records.len(), MAX_VERIFIER_RUN_RECORDS);
-        let record_error = serde_json::from_value::<BoundedRunRecords>(serde_json::json!({
-            "records": vec![serde_json::Value::Null; MAX_VERIFIER_RUN_RECORDS + 1]
-        }))
-        .expect_err("one record above the run limit must fail");
-        assert!(record_error.to_string().contains("too many verifier run records"));
+        let mut bundle = TrustContractBundle::empty(
+            "bundle-large-metadata",
+            BundleSubject::Crate { name: "demo".to_string() },
+        );
+        bundle.metadata.extend((0..PAST_THE_DELETED_BOUNDS).map(|index| MetadataEntry {
+            key: format!("audit.entry.{index}"),
+            value: "v".to_string(),
+        }));
+        bundle.validate().expect("a bundle of many metadata entries validates");
+        let encoded = serde_json::to_vec(&bundle).expect("serialize a large bundle");
+        let decoded =
+            TrustContractBundle::from_json_slice(&encoded).expect("a large bundle is read whole");
+        assert_eq!(decoded, bundle);
+        bundle.metadata.push(MetadataEntry { key: "audit.entry.0".to_string(), value: "w".into() });
+        assert!(
+            bundle.validate().expect_err("a duplicate key is malformed").contains("duplicate"),
+            "the bundle's metadata keeps its per-entry checks"
+        );
 
-        let exact_diagnostics: BoundedRunDiagnostics = serde_json::from_value(serde_json::json!({
-            "diagnostics": vec!["diagnostic"; MAX_VERIFIER_RUN_DIAGNOSTICS]
-        }))
-        .expect("the exact diagnostic limit is accepted");
-        assert_eq!(exact_diagnostics.diagnostics.len(), MAX_VERIFIER_RUN_DIAGNOSTICS);
-        let diagnostic_error = serde_json::from_value::<BoundedRunDiagnostics>(serde_json::json!({
-            "diagnostics": vec!["diagnostic"; MAX_VERIFIER_RUN_DIAGNOSTICS + 1]
-        }))
-        .expect_err("one diagnostic above the run limit must fail");
-        assert!(diagnostic_error.to_string().contains("too many verifier run diagnostics"));
-
-        let result = fully_proved_result(VerifierInvocation::DpubReleaseGate);
-        let result_value = serde_json::to_value(&result).expect("serialize bounded result");
+        let past_the_deleted_record_bound = 131_073;
+        let result_value = serde_json::to_value(&result).expect("serialize result value");
         for field in ["requested_obligations", "evidence", "skipped"] {
             let mut forged = result_value.clone();
             forged.as_object_mut().expect("result object").insert(
                 field.to_string(),
                 serde_json::Value::Array(vec![
                     serde_json::Value::Null;
-                    MAX_VERIFIER_RUN_RECORDS + 1
+                    past_the_deleted_record_bound
                 ]),
             );
             let error = serde_json::from_value::<VerificationRunResult>(forged)
-                .expect_err("oversized result vector must fail before parsing elements");
-            assert!(error.to_string().contains("too many verifier run records"), "{error}");
+                .expect_err("a null is not a record");
+            assert!(!error.to_string().contains("too many"), "{field}: {error}");
         }
-
-        let manifest = result.try_to_manifest().expect("validated manifest");
-        let manifest_value = serde_json::to_value(&manifest).expect("serialize bounded manifest");
+        let manifest_value = serde_json::to_value(&manifest).expect("serialize manifest value");
         for field in ["obligations", "accepted_evidence", "rejected_evidence", "skipped"] {
             let mut forged = manifest_value.clone();
             forged.as_object_mut().expect("manifest object").insert(
                 field.to_string(),
                 serde_json::Value::Array(vec![
                     serde_json::Value::Null;
-                    MAX_VERIFIER_RUN_RECORDS + 1
+                    past_the_deleted_record_bound
                 ]),
             );
             let error = serde_json::from_value::<VerificationRunManifest>(forged)
-                .expect_err("oversized manifest vector must fail before parsing elements");
-            assert!(error.to_string().contains("too many verifier run records"), "{error}");
+                .expect_err("a null is not a record");
+            assert!(!error.to_string().contains("too many"), "{field}: {error}");
         }
-
-        assert!(
-            validate_run_collection_limits(
-                MAX_VERIFIER_RUN_RECORDS,
-                MAX_VERIFIER_RUN_RECORDS,
-                0,
-                MAX_VERIFIER_RUN_DIAGNOSTICS,
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_run_collection_limits(
-                MAX_VERIFIER_RUN_RECORDS,
-                MAX_VERIFIER_RUN_RECORDS,
-                1,
-                0,
-            )
-            .expect_err("aggregate count above its limit must fail")
-            .contains("aggregate record")
-        );
     }
 
     #[test]
@@ -10002,13 +10664,14 @@ mod tests {
             .validate_derived_state()
             .expect_err("programmatic counterexample nesting must be bounded");
         assert!(error.contains("JSON depth limit"), "{error}");
-
-        assert!(validate_json_envelope_length(MAX_VERIFIER_JSON_ENVELOPE_BYTES, "test").is_ok());
-        assert!(
-            validate_json_envelope_length(MAX_VERIFIER_JSON_ENVELOPE_BYTES + 1, "test")
-                .expect_err("one byte above the checked-ingress cap must fail")
-                .contains("ingress limit")
-        );
+        // Trust (T3 L4, C09d): the depth guard is the counterexample's one structural bound;
+        // its node (1,000,000) and scalar-byte (16 MiB) bounds are deleted.
+        let counterexample =
+            |data| Counterexample { format: "trust.counterexample.v1".to_string(), data };
+        let wide = serde_json::Value::Array(vec![serde_json::Value::Null; 1_000_001]);
+        assert!(validate_counterexample(&counterexample(wide)).is_ok(), "past the node bound");
+        let long = serde_json::Value::String("x".repeat(16 * 1024 * 1024 + 1));
+        assert!(validate_counterexample(&counterexample(long)).is_ok(), "past the byte bound");
     }
 
     #[test]

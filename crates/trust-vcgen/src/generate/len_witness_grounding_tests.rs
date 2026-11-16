@@ -5,10 +5,14 @@
 //! Unknown. The negative tests are the SOUNDNESS pins: an equality fact over
 //! genuinely unequal-length components would be a false-PROVE of the crown
 //! producer-well-formedness ensures.
+//!
+//! Every user struct below is stamped `AdtKind::Struct`, as every real dump stamps its ADTs:
+//! a variant-less ADT of unrecorded kind may be a union, and a shared borrow of one of its
+//! fields then names it whole (INTERIOR-MUT-CHANNEL-2, 2026-10-16).
 
 use trust_types::{
-    AggregateKind, BasicBlock, BinOp, BlockId, ConstValue, Contract, ContractKind, Formula,
-    LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan, Statement, Terminator, Ty,
+    AdtKind, AggregateKind, BasicBlock, BinOp, BlockId, ConstValue, Contract, ContractKind,
+    Formula, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan, Statement, Terminator, Ty,
     VariantDef, VcKind, VerifiableBody, VerifiableFunction,
 };
 
@@ -23,7 +27,18 @@ fn usize_ty() -> Ty {
 }
 
 fn vec_ty() -> Ty {
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,  faithful_enum_repr: None, name: "std::vec::Vec".into(), fields: vec![], variants: vec![], disc_index_safe: false, enum_layout: None, }
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        faithful_enum_repr: None,
+        name: "std::vec::Vec".into(),
+        fields: vec![].into(),
+        variants: vec![].into(),
+        disc_index_safe: false,
+        enum_layout: None,
+    }
 }
 
 fn ref_vec_ty(mutable: bool) -> Ty {
@@ -33,13 +48,18 @@ fn ref_vec_ty(mutable: bool) -> Ty {
 /// `core::result::Result<ok_payload, i64>` in the flattened lowering shape
 /// (machine tags: Ok = 0, Err = 1).
 fn result_ty(ok_payload: Ty) -> Ty {
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), i64_ty()),
             ("__v0_0".into(), ok_payload.clone()),
             ("__v1_0".into(), i64_ty()),
-        ],
+        ]
+        .into(),
         variants: vec![
             VariantDef {
                 name: "Ok".into(),
@@ -51,7 +71,8 @@ fn result_ty(ok_payload: Ty) -> Ty {
                 discriminant: 1,
                 fields: vec![("0".into(), i64_ty())],
             },
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -84,6 +105,7 @@ fn func_with(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -102,6 +124,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Termina
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
         unwind: Default::default(),
     }
 }
@@ -459,16 +482,26 @@ fn second_return_path_without_construction_blocks_grounding() {
 /// (payload = struct { entailment: struct { premises: Vec, multipliers:
 /// Vec } } — component paths `.0.0` / `.0.1`).
 fn guarded_delegator_fn(mutate_before_ok: bool) -> VerifiableFunction {
-    let ent_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    let ent_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: Some(AdtKind::Struct),
+        layout: None,
         name: "ny::Entailment".into(),
-        fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
-        variants: vec![],
+        fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let cert_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let cert_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: Some(AdtKind::Struct),
+        layout: None,
         name: "ny::CertifiedDeep".into(),
-        fields: vec![("entailment".into(), ent_ty)],
-        variants: vec![],
+        fields: vec![("entailment".into(), ent_ty)].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -624,16 +657,26 @@ fn payload_mutation_after_guard_stays_fail_closed() {
 /// the guard: the hop's source is then unstable and everything must stay
 /// fail-closed — the returned lengths may differ from the guard snapshot).
 fn extract_then_guard_wrapper_fn(mutate_alias_source: bool) -> VerifiableFunction {
-    let ent_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    let ent_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: Some(AdtKind::Struct),
+        layout: None,
         name: "ny::Entailment".into(),
-        fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
-        variants: vec![],
+        fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let cert_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let cert_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: Some(AdtKind::Struct),
+        layout: None,
         name: "ny::CertifiedDeep".into(),
-        fields: vec![("entailment".into(), ent_ty)],
-        variants: vec![],
+        fields: vec![("entailment".into(), ent_ty)].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -846,6 +889,33 @@ fn use_hop_source_mutation_stays_fail_closed() {
     );
 }
 
+#[test]
+fn use_hop_projected_drop_of_the_source_stays_fail_closed() {
+    // SOUNDNESS PIN (VCGEN-LIB-REDS-1): the candidate walk answers slot
+    // stability modulo a WHOLE-local `Drop` only — a whole drop ends `_5`'s
+    // value and is no write a later read could observe. A PROJECTED drop
+    // (`Drop(_5.0.0)`) de-initialises one component and stays a partial
+    // write, so the narrowing must refuse it exactly as the shared reducer
+    // does: the unfold stops at `_20` and the pair stays uncredited.
+    let mut func = extract_then_guard_wrapper_fn(false);
+    let bb8 = func.body.blocks.iter_mut().find(|block| block.id == BlockId(8)).expect("bb8");
+    let Terminator::Drop { place, .. } = &mut bb8.terminator else {
+        panic!("bb8 ends in the scheduled Drop of `c`: {:?}", bb8.terminator)
+    };
+    *place = field_place(5, &[0, 0]);
+    assert!(
+        postcondition_vcs(&func).is_empty(),
+        "a projected drop of the alias source must not reach the refutable lane"
+    );
+    let details = ungrounded_details(&func);
+    assert_eq!(details.len(), 1, "{details:#?}");
+    assert!(
+        details[0].contains("_0__value.0.0__len") && details[0].contains("_0__value.0.1__len"),
+        "{}",
+        details[0]
+    );
+}
+
 /// A COMPOUND `||`-of-two-`!=` producer well-formedness ensures (the ny-cert
 /// `SimplexSupportLp::certify_upper` crown shape): TWO independent length
 /// pairs — `mu_plus`/`mu_minus` (payload fields `.2`/`.3`) and
@@ -862,13 +932,23 @@ const TWO_PAIR_ENSURES: &str = "!((result.is_ok()) && \
 /// Payload = struct { bound: i64, lambda: i64, mu_plus: Vec, mu_minus: Vec,
 /// entailment: struct { premises: Vec, multipliers: Vec } }.
 fn two_pair_guarded_fn(second_guard: bool) -> VerifiableFunction {
-    let ent_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    let ent_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: Some(AdtKind::Struct),
+        layout: None,
         name: "ny::EntailmentCertificate".into(),
-        fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
-        variants: vec![],
+        fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let cert_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let cert_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: Some(AdtKind::Struct),
+        layout: None,
         name: "ny::SbarUpperCert".into(),
         fields: vec![
             ("bound".into(), i64_ty()),
@@ -876,8 +956,9 @@ fn two_pair_guarded_fn(second_guard: bool) -> VerifiableFunction {
             ("mu_plus".into(), vec_ty()),
             ("mu_minus".into(), vec_ty()),
             ("entailment".into(), ent_ty),
-        ],
-        variants: vec![],
+        ]
+        .into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -1106,13 +1187,23 @@ fn two_pairs_one_guard_leaves_the_other_ungrounded() {
 /// the exact `certify_upper` asymmetry. This test pins that BOTH pairs now
 /// ground on the real shape.
 fn destructure_rebuild_two_pair_fn() -> VerifiableFunction {
-    let ent_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    let ent_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: Some(AdtKind::Struct),
+        layout: None,
         name: "ny::EntailmentCertificate".into(),
-        fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
-        variants: vec![],
+        fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let cert_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let cert_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: Some(AdtKind::Struct),
+        layout: None,
         name: "ny::SbarUpperCert".into(),
         fields: vec![
             ("bound".into(), i64_ty()),
@@ -1120,8 +1211,9 @@ fn destructure_rebuild_two_pair_fn() -> VerifiableFunction {
             ("mu_plus".into(), vec_ty()),
             ("mu_minus".into(), vec_ty()),
             ("entailment".into(), ent_ty.clone()),
-        ],
-        variants: vec![],
+        ]
+        .into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -1378,16 +1470,26 @@ fn destructure_rebuild_flat_and_nested_pairs_both_ground_real_mir() {
 /// `ny::CertifiedDeep { entailment: ny::Entailment { premises: Vec,
 /// multipliers: Vec } }` — payload component paths `.0.0` / `.0.1`.
 fn nested_cert_ty() -> Ty {
-    let ent_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    let ent_ty = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: Some(AdtKind::Struct),
+        layout: None,
         name: "ny::Entailment".into(),
-        fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
-        variants: vec![],
+        fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: Some(AdtKind::Struct),
+        layout: None,
         name: "ny::CertifiedDeep".into(),
-        fields: vec![("entailment".into(), ent_ty)],
-        variants: vec![],
+        fields: vec![("entailment".into(), ent_ty)].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,

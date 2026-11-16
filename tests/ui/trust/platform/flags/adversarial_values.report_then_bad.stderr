@@ -1,0 +1,2 @@
+error: incorrect value `quiet` for unstable option `trust-platform-report` - one of `summary` or `verbose` was expected
+

@@ -11,6 +11,7 @@ use rustc_data_structures::hash_table::{Entry, HashTable};
 use rustc_data_structures::stable_hash::{StableCompare, StableHash, StableHashCtxt, StableHasher};
 use rustc_data_structures::sync::Lock;
 use rustc_macros::{Decodable, Encodable, StableHash, symbols};
+use rustc_serialize::ContextOrd;
 
 use crate::edit_distance::find_best_match_for_name;
 use crate::{DUMMY_SP, Edition, Span, with_session_globals};
@@ -124,12 +125,15 @@ symbols! {
         // Matching predicates: `is_weak`
         // tidy-alphabetical-start
         Auto:               "auto",
-        Builtin:            "builtin",
         Catch:              "catch",
         ContractEnsures:    "contract_ensures",
         ContractRequires:   "contract_requires",
         Default:            "default",
+        Deref:              "deref",
+        FieldOf:            "field_of",
         MacroRules:         "macro_rules",
+        OffsetOf:           "offset_of",
+        Pin:                "pin",
         Raw:                "raw",
         Reuse:              "reuse",
         Safe:               "safe",
@@ -143,7 +147,10 @@ symbols! {
         // name resolution or typeck.
         TrustContractEnsures: "trust_contract_ensures",
         TrustContractRequires: "trust_contract_requires",
+        TypeAscribe:        "type_ascribe",
         Union:              "union",
+        UnwrapBinder:       "unwrap_binder",
+        WrapBinder:         "wrap_binder",
         Yeet:               "yeet",
         // tidy-alphabetical-end
     }
@@ -172,6 +179,7 @@ symbols! {
         Arc,
         ArcWeak,
         Array,
+        ArrayToPointer,
         AsMut,
         AsRef,
         AssertParamIsClone,
@@ -185,6 +193,7 @@ symbols! {
         Bool,
         Borrow,
         BorrowMut,
+        BoxDerefTransmute,
         Break,
         BuildHasher,
         CStr,
@@ -196,8 +205,10 @@ symbols! {
         Cleanup,
         Client,
         Clone,
+        ClosureFnPointer,
         CoercePointee,
         CoercePointeeValidated,
+        CoerceShared,
         CoerceUnsized,
         Const,
         ConstParamTy,
@@ -212,6 +223,7 @@ symbols! {
         Deref,
         DispatchFromDyn,
         Display,
+        DropGuard,
         Dual,
         DualOnly,
         Dualv,
@@ -223,21 +235,24 @@ symbols! {
         Eq,
         Equal,
         Err,
-        Expected,
+        ExitCode,
         ExternC,
         ExternRust,
         Float,
+        FloatToFloat,
+        FloatToInt,
         FmtArgumentsNew,
         Fn,
         FnMut,
         FnOnce,
         FnPtr,
+        FnPtrToPtr,
         Formatter,
         Forward,
-        Found,
         From,
         FromIterator,
         FromResidual,
+        GenericTypeVisitable,
         GlobalAlloc,
         Hash,
         HashMap,
@@ -247,14 +262,16 @@ symbols! {
         IndexOutput,
         Input,
         Int,
+        IntToFloat,
+        IntToInt,
         Into,
+        IntoAsyncIterator,
         IntoFuture,
         IntoIterator,
         IntoIteratorItem,
         IoBufReader,
         IrTyKind,
         Item,
-        ItemContext,
         Iterator,
         IteratorItem,
         IteratorMap,
@@ -262,10 +279,10 @@ symbols! {
         Lifetime,
         LintPass,
         LocalKey,
+        MutToConstPointer,
         Mutex,
         MutexGuard,
         Named,
-        NonNull,
         NonZero,
         None,
         Normal,
@@ -280,8 +297,13 @@ symbols! {
         PartialOrd,
         Pending,
         PinDerefMutHelper,
+        PinMacroHelper,
         Pointer,
+        PointerCoercion,
+        PointerExposeProvenance,
+        PointerWithExposedProvenance,
         Poll,
+        PtrToPtr,
         Range,
         RangeCopy,
         RangeFrom,
@@ -301,6 +323,7 @@ symbols! {
         Reborrow,
         RefCell,
         Reference,
+        ReifyFnPointer,
         Relaxed,
         Release,
         Result,
@@ -313,26 +336,31 @@ symbols! {
         RwLock,
         RwLockReadGuard,
         RwLockWriteGuard,
+        Safe,
+        Safety,
         SelfTy,
         Send,
         SeqCst,
+        ShouldPanic,
         Sized,
         Slice,
         SliceIndex,
         Some,
         Source,
-        SpanCtxt,
         StdinLock,
         Str,
         String,
         Struct,
         StructuralPartialEq,
+        Subtype,
         SymbolIntern,
         Sync,
         SyncUnsafeCell,
         Target,
+        TestType,
         This,
         TokenStream,
+        Transmute,
         TrivialClone,
         Try,
         TryCaptureGeneric,
@@ -344,15 +372,20 @@ symbols! {
         TyCtxt,
         TyKind,
         Type,
+        TypeVisitable,
         Union,
-        Unresolved,
+        Unsafe,
+        UnsafeFnPointer,
         Unsize,
+        UnsizePointee,
         Vec,
         Wrapper,
         _DECLS,
         __H,
         __S,
         __awaitee,
+        __ensures_checker,
+        __ret,
         __try_var,
         _t,
         _task_context,
@@ -379,6 +412,7 @@ symbols! {
         abi_vectorcall,
         abi_x86_interrupt,
         abort,
+        abort_immediate,
         add,
         add_assign,
         add_with_overflow,
@@ -399,7 +433,6 @@ symbols! {
         alloc_layout,
         alloc_zeroed,
         allocator,
-        allocator_api,
         allocator_internals,
         allow,
         allow_fail,
@@ -408,6 +441,7 @@ symbols! {
         altivec,
         alu32,
         always,
+        ambiguity,
         amdgpu,
         amdgpu_dispatch_ptr,
         analysis,
@@ -431,10 +465,12 @@ symbols! {
         arm_target_feature,
         array,
         as_dash_needed: "as-needed",
+        as_ptr,
         as_ref,
         asm,
         asm_cfg,
         asm_const,
+        asm_const_ptr,
         asm_experimental_arch,
         asm_experimental_reg,
         asm_goto,
@@ -525,7 +561,6 @@ symbols! {
         await_macro,
         backchain,
         backend_repr,
-        bcmp_fn,
         begin_panic,
         bench,
         bevy_ecs,
@@ -542,6 +577,7 @@ symbols! {
         bits,
         bitxor,
         bitxor_assign,
+        bivariant,
         black_box,
         block,
         blocking,
@@ -561,7 +597,6 @@ symbols! {
         bridge,
         bswap,
         built,
-        builtin_syntax,
         bundle,
         // Trust: the `by <thm>` citation suffix on contract clauses
         // (two-language design E9) - contextual, never reserved.
@@ -594,7 +629,6 @@ symbols! {
         cfg_accessible,
         cfg_attr,
         cfg_attr_multi,
-        cfg_attr_trace: "<cfg_attr_trace>", // must not be a valid identifier
         cfg_boolean_literals,
         cfg_contract_checks,
         cfg_doctest,
@@ -611,16 +645,17 @@ symbols! {
         cfg_target_has_atomic,
         cfg_target_has_atomic_equal_alignment,
         cfg_target_has_reliable_f16_f128,
+        cfg_target_has_reliable_f16b,
         cfg_target_has_threads,
         cfg_target_object_format,
         cfg_target_thread_local,
         cfg_target_vendor,
-        cfg_trace: "<cfg_trace>", // must not be a valid identifier
         cfg_ub_checks,
         cfg_version,
         cfi,
         cfi_encoding,
         char,
+        checked_type_aliases,
         // Trust: the `clean { … }` parser-island keyword (two-language design
         // E10) — contextual, never reserved.
         clean,
@@ -632,6 +667,7 @@ symbols! {
         clone_closures,
         clone_fn,
         clone_from,
+        close_fn,
         closure,
         closure_lifetime_binder,
         closure_to_fn_coercion,
@@ -648,6 +684,7 @@ symbols! {
         cmp_partialord_lt,
         cmpxchg16b_target_feature,
         cmse_nonsecure_entry,
+        code,
         coerce_pointee_validated,
         coerce_shared,
         coerce_shared_target,
@@ -657,7 +694,6 @@ symbols! {
         cold_path,
         collapse_debuginfo,
         column,
-        common,
         compare_bytes,
         compare_exchange,
         compare_exchange_weak,
@@ -667,8 +703,10 @@ symbols! {
         compiler_copy,
         compiler_fence,
         compiler_move,
+        complex,
         concat,
         concat_bytes,
+        concat_str,
         conservative_impl_trait,
         console,
         const_allocate,
@@ -728,6 +766,7 @@ symbols! {
         contracts_ensures,
         contracts_internals,
         contracts_requires,
+        contravariant,
         convert,
         coprocessor,
         copy,
@@ -748,11 +787,10 @@ symbols! {
         coroutine_state,
         coroutine_yield,
         coroutines,
-        cosf16,
-        cosf32,
-        cosf64,
-        cosf128,
+        cos,
         count,
+        covariant,
+        covariant_unsafe_cell,
         coverage,
         coverage_attribute,
         cr,
@@ -788,7 +826,6 @@ symbols! {
         debug_assert_ne_macro,
         debug_assertions,
         debug_struct_fields_finish,
-        debug_tuple_fields_finish,
         debugger_visualizer,
         decl_macro,
         declare_lint_pass,
@@ -799,7 +836,6 @@ symbols! {
         default_field_values,
         default_fn,
         default_lib_allocator,
-        default_method_body_is_const,
         // --------------------------
         // Lang items which are used only for experiments with auto traits with default bounds.
         // These lang items are not actually defined in core/std. Experiment is a part of
@@ -816,7 +852,6 @@ symbols! {
         deprecated,
         deprecated_safe,
         deprecated_suggestion,
-        deref,
         deref_method,
         deref_mut,
         deref_patterns,
@@ -824,7 +859,6 @@ symbols! {
         deref_target,
         derive,
         derive_const,
-        derive_const_issue: "118304",
         derive_default_enum,
         derive_from,
         derive_smart_pointer,
@@ -838,6 +872,7 @@ symbols! {
         diagnostic_on_unknown,
         diagnostic_on_unmatch_args,
         diagnostic_on_unmatched_args,
+        diagnostic_opaque,
         dialect,
         direct,
         discriminant_kind,
@@ -909,6 +944,8 @@ symbols! {
         env_CFG_RELEASE: env!("CFG_RELEASE"),
         env_remove_var,
         env_set_var,
+        eprint_macro,
+        eprintln_macro,
         eq,
         ergonomic_clones,
         ermsb_target_feature,
@@ -922,18 +959,12 @@ symbols! {
         existential_type,
         // Trust: spec-only quantifier in trust-spec contract clauses.
         exists,
-        exp2f16,
-        exp2f32,
-        exp2f64,
-        exp2f128,
+        exp,
+        exp2,
         expand1,
         expand2,
         expect,
         expected,
-        expf16,
-        expf32,
-        expf64,
-        expf128,
         explicit_extern_abis,
         explicit_generic_args_with_impl_trait,
         explicit_tail_calls,
@@ -959,6 +990,7 @@ symbols! {
         external_doc,
         f16,
         f16_nan,
+        f16b,
         f16c_target_feature,
         f32,
         f32_nan,
@@ -980,19 +1012,22 @@ symbols! {
         ffi_const,
         ffi_pure,
         ffi_returns_twice,
+        ffr,
         field,
         field_base,
         field_init_shorthand,
-        field_of,
         field_offset,
         field_projections,
         field_representing_type,
         field_representing_type_actual_type_id,
+        field_representing_type_name,
+        field_representing_type_offset,
         field_representing_type_raw,
         field_type,
         fields,
         file,
         final_associated_functions,
+        float_mul_add_relaxed,
         float_to_int_unchecked,
         floorf16,
         floorf32,
@@ -1018,22 +1053,28 @@ symbols! {
         fn_mut,
         fn_once,
         fn_once_output,
-        fn_ptr_addr,
+        fn_ptr_as_ptr,
+        fn_ptr_from_ptr,
         fn_ptr_trait,
+        fn_static,
         // Trust: spec-only quantifier in trust-spec contract clauses.
         forall,
         forbid,
         force_target_feature,
+        forced_keywords,
         forget,
         format_args,
         format_args_capture,
+        format_args_macro,
         format_args_nl,
         format_argument,
         format_arguments,
         format_macro,
         format_placeholder,
         format_unsafe_arg,
+        found,
         fp,
+        fpregs,
         framework,
         freeze,
         freeze_impls,
@@ -1055,11 +1096,18 @@ symbols! {
         fsub_algebraic,
         fsub_fast,
         full,
+        function_arg_const_generics,
         fundamental,
         fused_iterator,
         future_output,
         future_trait,
         fxsr,
+        gca,
+        gca_adts,
+        gca_const_items,
+        gca_macroless_args,
+        gca_macroless_items,
+        gca_min_const_items,
         gdb_script_file,
         ge,
         gen_blocks,
@@ -1114,6 +1162,7 @@ symbols! {
         i128,
         i128_type,
         ident,
+        ident_from_str_and_span,
         if_let,
         if_let_guard,
         if_let_rescope,
@@ -1154,10 +1203,12 @@ symbols! {
         instruction_set,
         instrument_fn,
         integer_: "integer", // underscore to avoid clashing with the function `sym::integer` below
+        integer_max,
+        integer_min,
         integral,
-        internal,
         internal_eq_trait_method_impls,
         internal_features,
+        internal_syntax,
         interrupt,
         into_async_iter_into_iter,
         into_future,
@@ -1171,6 +1222,7 @@ symbols! {
         is,
         is_auto,
         is_splatted,
+        is_unsafe,
         is_val_statically_known,
         isa_attribute,
         isize,
@@ -1178,6 +1230,7 @@ symbols! {
         issue_5723_bootstrap,
         issue_tracker_base_url,
         item,
+        item_context,
         item_like_imports,
         iter,
         iter_mut,
@@ -1198,8 +1251,10 @@ symbols! {
         lang_items,
         large_assignments,
         large_stack_frame,
+        largest_niche,
         last,
         lasx,
+        late_bound_turbofishing,
         lateout,
         lazy_normalization_consts,
         lazy_type_alias,
@@ -1220,6 +1275,7 @@ symbols! {
         link_args,
         link_cfg,
         link_dash_arg: "link-arg",
+        link_enzyme_intrinsics,
         link_llvm_intrinsics,
         link_name,
         link_ordinal,
@@ -1230,6 +1286,7 @@ symbols! {
         linker_messages,
         linkonce,
         linkonce_odr,
+        lint,
         lint_reasons,
         literal,
         little, big,
@@ -1237,19 +1294,10 @@ symbols! {
         loaded_from_disk,
         local,
         local_inner_macros,
-        log2f16,
-        log2f32,
-        log2f64,
-        log2f128,
-        log10f16,
-        log10f32,
-        log10f64,
-        log10f128,
+        log,
+        log2,
+        log10,
         log_syntax,
-        logf16,
-        logf32,
-        logf64,
-        logf128,
         loongarch32,
         loongarch64,
         loongarch_target_feature,
@@ -1277,6 +1325,8 @@ symbols! {
         macro_reexport,
         macro_use,
         macro_vis_matcher,
+        macroless_const_item_generic_const_args,
+        macroless_generic_const_args,
         macros_in_extern,
         main,
         managed_boxes,
@@ -1313,17 +1363,12 @@ symbols! {
         mem_variant_count,
         mem_zeroed,
         member_constraints,
-        memcmp_fn,
-        memcpy_fn,
-        memmove_fn,
         memory,
-        memset_fn,
         memtag,
         message,
         meta,
         meta_sized,
         metadata_type,
-        mgca_type_const_syntax,
         min_adt_const_params,
         min_const_fn,
         min_const_generics,
@@ -1348,6 +1393,10 @@ symbols! {
         mir_assume,
         mir_basic_block,
         mir_call,
+        mir_cast,
+        mir_cast_fn_ptr_safety,
+        mir_cast_kind,
+        mir_cast_ptr_coercion,
         mir_cast_ptr_to_ptr,
         mir_cast_transmute,
         mir_cast_unsize,
@@ -1388,10 +1437,13 @@ symbols! {
         more_qualified_paths,
         more_struct_aliases,
         movbe_target_feature,
+        movdir64b_target_feature,
+        movdiri_target_feature,
         move_expr,
         move_ref_pattern,
         move_size_limit,
         movrs_target_feature,
+        msa,
         msp430,
         mul,
         mul_assign,
@@ -1410,6 +1462,7 @@ symbols! {
         naked_functions_rustic_abi,
         naked_functions_target_feature,
         name,
+        named_fn_trait_parameters,
         names,
         native_link_modifiers,
         native_link_modifiers_as_needed,
@@ -1429,6 +1482,7 @@ symbols! {
         nested,
         never,
         never_patterns,
+        never_returns_null_ptr,
         never_type,
         never_type_fallback,
         new,
@@ -1468,6 +1522,7 @@ symbols! {
         non_exhaustive_omitted_patterns_lint,
         non_lifetime_binders,
         non_modrs_mods,
+        non_null,
         nonblocking,
         none,
         nontemporal_store,
@@ -1487,9 +1542,9 @@ symbols! {
         of,
         off,
         offload,
+        offload_get_num_devices,
         offload_kernel,
         offset,
-        offset_of,
         offset_of_enum,
         offset_of_nested,
         offset_of_slice,
@@ -1590,7 +1645,6 @@ symbols! {
         phase,
         pic,
         pie,
-        pin,
         pin_drop,
         pin_ergonomics,
         pin_v2,
@@ -1617,6 +1671,7 @@ symbols! {
         powif32,
         powif64,
         powif128,
+        ppcf128,
         pre_dash_lto: "pre-lto",
         precise_capturing,
         precise_capturing_in_traits,
@@ -1635,6 +1690,8 @@ symbols! {
         prfchw_target_feature,
         prid,
         primitive,
+        print_macro,
+        println_macro,
         proc_dash_macro: "proc-macro",
         proc_macro,
         proc_macro_attribute,
@@ -1654,6 +1711,8 @@ symbols! {
         ptr_const_is_null,
         ptr_copy,
         ptr_copy_nonoverlapping,
+        ptr_drop_in_place,
+        ptr_drop_in_place_self,
         ptr_from_ref,
         ptr_guaranteed_cmp,
         ptr_is_null,
@@ -1721,6 +1780,8 @@ symbols! {
         reg_ptr,
         reg_upper,
         register_attr,
+        register_attribute_tool,
+        register_lint_tool,
         register_tool,
         relaxed_adts,
         relaxed_struct_unsize,
@@ -1772,6 +1833,7 @@ symbols! {
         rust_analyzer,
         rust_begin_unwind,
         rust_cold_cc,
+        rust_dash_call: "rust-call",
         rust_eh_personality,
         rust_future,
         rust_logo,
@@ -1788,11 +1850,14 @@ symbols! {
         rustc_allocator_zeroed_variant,
         rustc_allow_const_fn_unstable,
         rustc_allow_incoherent_impl,
+        rustc_allow_lifetime_dependent_specialization,
         rustc_allowed_through_unstable_modules,
-        rustc_as_ptr,
+        rustc_always_gca,
+        rustc_assert_variance,
         rustc_attrs,
         rustc_autodiff,
         rustc_builtin_macro,
+        rustc_canonical_symbol,
         rustc_capture_analysis,
         rustc_clean,
         rustc_coherence_is_core,
@@ -1810,10 +1875,12 @@ symbols! {
         rustc_deprecated_safe_2024,
         rustc_diagnostic_item,
         rustc_diagnostic_macros,
+        rustc_diagnostic_opaque,
         rustc_do_not_const_check,
         rustc_doc_primitive,
         rustc_driver,
         rustc_dummy,
+        rustc_dump_clauses,
         rustc_dump_def_parents,
         rustc_dump_def_path,
         rustc_dump_generics,
@@ -1822,7 +1889,6 @@ symbols! {
         rustc_dump_item_bounds,
         rustc_dump_layout,
         rustc_dump_object_lifetime_defaults,
-        rustc_dump_predicates,
         rustc_dump_symbol_name,
         rustc_dump_user_args,
         rustc_dump_variances,
@@ -1850,8 +1916,6 @@ symbols! {
         rustc_mir,
         rustc_must_implement_one_of,
         rustc_must_match_exhaustively,
-        rustc_never_returns_null_ptr,
-        rustc_never_type_options,
         rustc_no_implicit_autorefs,
         rustc_no_implicit_bounds,
         rustc_no_mir_inline,
@@ -1863,6 +1927,7 @@ symbols! {
         rustc_objc_selector,
         rustc_offload_kernel,
         rustc_on_unimplemented,
+        rustc_panics_when_zero,
         rustc_paren_sugar,
         rustc_partition_codegened,
         rustc_partition_reused,
@@ -1873,24 +1938,29 @@ symbols! {
         rustc_peek_maybe_init,
         rustc_peek_maybe_uninit,
         rustc_preserve_ub_checks,
+        rustc_pretty_live_locals,
+        rustc_pretty_precise_liveness,
+        rustc_pretty_transitive_live_locals,
         rustc_private,
         rustc_proc_macro_decls,
         rustc_promotable,
         rustc_pub_transparent,
         rustc_reallocator,
         rustc_regions,
-        rustc_reservation_impl,
         rustc_scalable_vector,
         rustc_should_not_be_called_on_const_items,
+        rustc_show_spans,
         rustc_simd_monomorphize_lane_limit,
         rustc_skip_during_method_dispatch,
         rustc_specialization_trait,
+        rustc_splat,
         rustc_std_internal_symbol,
         rustc_strict_coherence,
         rustc_test_marker,
         rustc_then_this_would_need,
         rustc_trivial_field_reads,
-        rustc_unsafe_specialization_marker,
+        // FIXME(#159429): temporary rename to avoid `#[unroll]` nameres ambiguity
+        rustc_unroll,
         rustdoc,
         rustdoc_internals,
         rustdoc_missing_doc_code_examples,
@@ -1902,6 +1972,7 @@ symbols! {
         s390x,
         s390x_target_feature,
         s390x_target_feature_vector,
+        safestack,
         safety,
         sanitize,
         sanitizer_cfi_generalize_pointers,
@@ -1930,6 +2001,7 @@ symbols! {
         shl,
         shl_assign,
         shorter_tail_lifetimes,
+        should_not_be_called_on_const_items,
         should_panic,
         show,
         shr,
@@ -2013,11 +2085,8 @@ symbols! {
         simd_trunc,
         simd_with_exposed_provenance,
         simd_xor,
+        sin,
         since,
-        sinf16,
-        sinf32,
-        sinf64,
-        sinf128,
         size,
         size_of,
         size_of_type_id,
@@ -2081,7 +2150,6 @@ symbols! {
         strict_provenance_lints,
         string_deref_patterns,
         stringify,
-        strlen_fn,
         struct_field_attributes,
         struct_inherit,
         struct_variant,
@@ -2093,6 +2161,7 @@ symbols! {
         suggestion,
         super_let,
         supertrait_item_shadowing,
+        sve,
         sve_cast,
         sve_tuple_create2,
         sve_tuple_create3,
@@ -2117,6 +2186,7 @@ symbols! {
         target_has_atomic_primitive_alignment,
         target_has_reliable_f16,
         target_has_reliable_f16_math,
+        target_has_reliable_f16b,
         target_has_reliable_f128,
         target_has_reliable_f128_math,
         target_has_threads,
@@ -2132,11 +2202,13 @@ symbols! {
         test,
         test_2018_feature,
         test_accepted_feature,
+        test_binder_constraints,
         test_case,
         test_incomplete_feature,
         test_removed_feature,
         test_runner,
         test_unstable_lint,
+        this,
         thread,
         thread_local,
         threadptr,
@@ -2148,6 +2220,7 @@ symbols! {
         to_owned_method,
         to_string,
         to_vec,
+        todo_macro,
         tool_attributes,
         tool_lints,
         trace_macros,
@@ -2181,6 +2254,7 @@ symbols! {
         trust_test_contract_not_lowered: "not_lowered",
         trust_test_contract_x_gt_zero: "x > 0",
         trust_verify,
+        try_as_dyn,
         try_blocks,
         try_blocks_heterogeneous,
         try_capture,
@@ -2197,16 +2271,28 @@ symbols! {
         ty,
         type_alias_enum_variants,
         type_alias_impl_trait,
-        type_ascribe,
         type_ascription,
         type_changing_struct_update,
         type_id,
+        type_id_array_len,
+        type_id_element_ty,
         type_id_eq,
         type_id_field_representing_type,
         type_id_fields,
+        type_id_function_ptr,
+        type_id_generics,
+        type_id_is_signed,
+        type_id_non_exhaustive,
+        type_id_points_mutably,
+        type_id_points_to,
+        type_id_size_of,
+        type_id_type_of,
+        type_id_variant_name,
+        type_id_variant_non_exhaustive,
         type_id_variants,
         type_id_vtable,
         type_info,
+        type_info_generic,
         type_ir,
         type_ir_infer_ctxt_like,
         type_ir_inherent,
@@ -2214,7 +2300,6 @@ symbols! {
         type_length_limit,
         type_macros,
         type_name,
-        type_of,
         type_privacy_lints,
         typed_swap_nonoverlapping,
         u8,
@@ -2266,6 +2351,7 @@ symbols! {
         underscore_lifetimes,
         uniform_paths,
         unimplemented,
+        unimplemented_macro,
         unit,
         universal_impl_trait,
         unix,
@@ -2283,8 +2369,8 @@ symbols! {
         unreachable_code,
         unreachable_display,
         unreachable_macro,
+        unresolved,
         unrestricted_attribute_tokens,
-        unroll,
         unsafe_attributes,
         unsafe_binders,
         unsafe_block_in_unsafe_fn,
@@ -2296,7 +2382,6 @@ symbols! {
         unsafe_no_drop_flag,
         unsafe_pinned,
         unsafe_unpin,
-        unsafety,
         unsize,
         unsized_const_param_ty,
         unsized_const_params,
@@ -2315,7 +2400,6 @@ symbols! {
         unwind_attributes,
         unwind_safe_trait,
         unwrap,
-        unwrap_binder,
         unwrap_or,
         update,
         use_cloned,
@@ -2332,12 +2416,12 @@ symbols! {
         usize_legacy_mod,
         v1,
         v8plus,
+        v9,
         va_arg,
         va_arg_safe,
         va_copy,
         va_end,
         va_list,
-        va_start,
         val,
         validity,
         value,
@@ -2345,7 +2429,6 @@ symbols! {
         var,
         variadic,
         variant_count,
-        variants,
         vec,
         vector,
         verbatim,
@@ -2401,7 +2484,6 @@ symbols! {
         windows,
         windows_subsystem,
         with_negative_coherence,
-        wrap_binder,
         wrapping_add,
         wrapping_div,
         wrapping_mul,
@@ -2483,6 +2565,22 @@ symbols! {
     // add to `Symbols` (e.g. taking an upstream import wholesale), you are
     // choosing to rebuild std -- the compile-time assertions below will stop
     // you first, and they are the intended place to record that decision.
+    //
+    // IN THE SAME COMMIT, WHICHEVER SECTION YOU ADD TO: delete that string from
+    // every driver's extra-symbol list -- `src/tools/tippy/clippy_utils/src/sym.rs`
+    // and `src/tools/miri/src/sym.rs` today. A string that is both predefined
+    // here and extra there makes `Interner::prefill` (below) panic, so that
+    // driver dies at EVERY start with "duplicate symbols in the rustc symbol
+    // list and the extra symbols added by the driver", while the compiler,
+    // `x.py check` and the driver's own `--version` all stay green. The driver
+    // loses nothing: its list file re-exports `rustc_span::sym::*`, so its
+    // `sym::<Name>` resolves to the entry added here. Measured: c73702b157 added
+    // `VecDeque` and `BinaryHeap` below, tippy listed both, and from the landing
+    // that carried it (35f9d0897f, 2026-10-09) no `targo tippy` on main could
+    // start; a toolchain was sealed that way on 2026-10-12. The push row
+    // `fast.driver-extra-symbols` (`scripts/check_driver_extra_symbols.py`, no
+    // build) now names such a collision; `scripts/promote-toolchain.sh` starts
+    // each shipped driver before it seals.
     AppendOnly {
         // 4c72c18351, static_str_write_fmt: `core::fmt::Arguments::from_str`
         // and the `core::fmt::Write` trait, both looked up as diagnostic items.
@@ -2570,6 +2668,55 @@ symbols! {
         thread_builder_spawn_unchecked,
         thread_builder_spawn_scoped,
         thread_scope_spawn,
+        // Trust (2026-09-29, trust-open-false-accepts): the `VecDeque` and
+        // `BinaryHeap` diagnostic items, asked by
+        // `std_growable_sequence_of_zero_sized_elements` (a std sequence of
+        // zero-sized elements is not foundational). `Vec` is an upstream symbol.
+        VecDeque,
+        BinaryHeap,
+        // Trust (1.101 migration): the contract-checker binding name minted
+        // by `rustc_ast_lowering::contract`. Its `__ensures_checker` sibling
+        // is in the alphabetical section; this one goes here so no
+        // preinterned index moves. Required because 1.101 denies
+        // `Ident::from_str_and_span` on literals in compiler crates.
+        __requires_checker,
+        // Latest upstream (07e526db9d): the CodeView annotation intrinsic.
+        codeview_annotation,
+        // Latest upstream (afe686de2708): debug C-like enum write, direct
+        // return ABI, offload regions.
+        debug_c_like_enum_write_str,
+        dret,
+        offload_region,
+        // Latest upstream (fe2b43dd2127): generic float-intrinsic names. The
+        // per-width `*f16`/`*f32`/`*f64`/`*f128` symbols upstream deleted stay
+        // in the main list: append-only never renumbers.
+        ceil,
+        floor,
+        fma,
+        fmuladd,
+        intrinsic_fallback_is_spec,
+        powf,
+        powi,
+        round,
+        round_ties_even,
+        sqrt,
+        trunc,
+        // Latest upstream (41089d07a0a2): the resumable breakpoint
+        // intrinsic name. Upstream inserts it alphabetically in `Symbols`;
+        // here so no preinterned index moves.
+        resumable_breakpoint,
+        // Latest upstream (92ffebeceaa0a): the rustdoc skip-body tool
+        // attribute name. Upstream inserts it alphabetically in `Symbols`;
+        // here so no preinterned index moves.
+        rustdoc_skip_body,
+        // Latest upstream (3e92e1a2d20b): `#[rustc_unchecked_type_alias]` /
+        // `marked_unchecked_type_aliases`, the `color` cfg name and the
+        // `warnings` lint group name. Upstream inserts them alphabetically
+        // in `Symbols`; here so no preinterned index moves.
+        color,
+        marked_unchecked_type_aliases,
+        rustc_unchecked_type_alias,
+        warnings,
     }
 }
 
@@ -2593,8 +2740,30 @@ symbols! {
 // is going to be rebuilt anyway), update these numbers in the same commit and
 // say so in the message -- and expect every sealed driver and every `.rmeta`
 // built before the change to stop interoperating with every one built after.
+// Trust (1.101 migration, 2026-10-16): DELIBERATE RENUMBERING for the
+// wholesale upstream import to rust-lang/rust bf9448e4. Upstream's
+// Keywords/Symbols lists gained a net 80 entries since 5e91de65; std is
+// rebuilt with this tree, and every `.rmeta` sealed before this commit
+// stops interoperating with drivers built after it.
+// Trust (76456a688bc0 import, 2026-10-25): DELIBERATE RENUMBERING again for
+// upstream's removal of the single preinterned symbol `derive_const_issue`
+// (net -1 entry; its one consumer in rustc_builtin_macros was updated by the
+// same upstream change). Whole sysroot rebuilds with this tree.
+// Trust (4c46afa63688 mini-port, 2026-11-02): DELIBERATE RENUMBERING again
+// for upstream's removal of the single preinterned symbol
+// `debug_tuple_fields_finish` (net -1 entry; its consumers in
+// rustc_builtin_macros and core::fmt moved to the debug_struct helpers in
+// the same upstream change). Whole sysroot rebuilds with this tree.
+// Trust (249cb163c0d0 mini-port, 2026-11-03): DELIBERATE RENUMBERING again
+// for upstream's keyword-path rework: `deref`/`field_of`/`offset_of`/
+// `type_ascribe`/`unwrap_binder`/`wrap_binder` move from Symbols to
+// Keywords (net +5 there with `Builtin` removed), and Symbols gains
+// `DropGuard`, `as_ptr`, `internal_syntax`, `lint`,
+// `never_returns_null_ptr`, `should_not_be_called_on_const_items` while
+// losing `builtin_syntax`, `rustc_as_ptr`, `rustc_never_returns_null_ptr`
+// (net -3). Combined net +2 entries. Whole sysroot rebuilds with this tree.
 const _: () = assert!(
-    SYMBOL_DIGITS_BASE == 2318,
+    SYMBOL_DIGITS_BASE == 2398,
     "preinterned symbol indices moved: the Keywords/Symbols lists gained or lost an entry. \
      Already-built .rmeta -- the frozen stage1 std -- encodes predefined symbols BY INDEX, \
      so it will stop loading, with E0463 and `Rejecting via crate name` in the metadata log. \
@@ -2625,9 +2794,12 @@ pub struct Ident {
 
 impl Ident {
     #[inline]
+    #[track_caller]
     /// Constructs a new identifier from a symbol and a span.
     pub fn new(name: Symbol, span: Span) -> Ident {
-        debug_assert_ne!(name, sym::empty);
+        if cfg!(debug_assertions) && name == sym::empty {
+            crate::span_bug!(span, "called `Ident::new` with empty symbol");
+        }
         Ident { name, span }
     }
 
@@ -2652,6 +2824,7 @@ impl Ident {
     }
 
     /// Maps a string and a span to an identifier.
+    #[rustc_diagnostic_item = "ident_from_str_and_span"]
     pub fn from_str_and_span(string: &str, span: Span) -> Ident {
         Ident::new(Symbol::intern(string), span)
     }
@@ -2701,7 +2874,7 @@ impl Ident {
 impl PartialEq for Ident {
     #[inline]
     fn eq(&self, rhs: &Self) -> bool {
-        self.name == rhs.name && self.span.eq_ctxt(rhs.span)
+        self.name == rhs.name && self.span.ctxt() == rhs.span.ctxt()
     }
 }
 
@@ -2731,6 +2904,7 @@ impl fmt::Display for Ident {
 pub enum IdentPrintMode {
     Normal,
     RawIdent,
+    ForcedKeywordIdent,
     RawLifetime,
 }
 
@@ -2789,6 +2963,10 @@ impl fmt::Display for IdentPrinter {
             IdentPrintMode::Normal => self.symbol,
             IdentPrintMode::RawIdent => {
                 f.write_str("r#")?;
+                self.symbol
+            }
+            IdentPrintMode::ForcedKeywordIdent => {
+                f.write_str("k#")?;
                 self.symbol
             }
             IdentPrintMode::RawLifetime => {
@@ -2852,6 +3030,12 @@ impl fmt::Display for MacroRulesNormalizedIdent {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Symbol(SymbolIndex);
 
+impl<E> ContextOrd<E> for Symbol {
+    fn stable_cmp_with_context(_context: E) -> impl FnMut(&Self, &Self) -> std::cmp::Ordering {
+        StableCompare::stable_cmp
+    }
+}
+
 // Used within both `Symbol` and `ByteSymbol`.
 rustc_index::newtype_index! {
     #[orderable]
@@ -2867,6 +3051,7 @@ impl Symbol {
 
     /// Maps a string to its interned representation.
     #[rustc_diagnostic_item = "SymbolIntern"]
+    #[inline]
     pub fn intern(str: &str) -> Self {
         with_session_globals(|session_globals| session_globals.symbol_interner.intern_str(str))
     }
@@ -2879,6 +3064,7 @@ impl Symbol {
     /// interner. Interners are long-lived, and there are very few of them, and
     /// this function is typically used for short-lived things, so in practice
     /// it works out ok.
+    #[inline]
     pub fn as_str(&self) -> &str {
         with_session_globals(|session_globals| unsafe {
             std::mem::transmute::<&str, &str>(session_globals.symbol_interner.get_str(*self))
@@ -3020,7 +3206,15 @@ impl Interner {
     // `ByteSymbol`.
     fn prefill(init: &[&'static str], extra: &[&'static str]) -> Self {
         let values = init.iter().copied().chain(extra.iter().copied()).map(|str| str.as_bytes());
-        let (size_hint, _) = values.size_hint();
+        // At the time of writing, `helloworld` Check benchmark interns ~1k additional symbols.
+        // Some of the noisy ones (`include-blob`, `tt-muncher`, `externs`, `large-workspace`, etc.)
+        // are between 1k and 2k. Lowest number among non-artificial benchmarks is ~5k for `ucd`.
+        // This was chosen to make small, artificial benchmarks more stable, and to
+        // reduce resizing for normal code without regresing memory use for smaller crates.
+        // FIXME(panstromek): we could do better if we take into account whether this is
+        //  Debug/Opt build. Those builds intern at least 6k more symbols than Check ones.
+        let additional_capacity = 2400;
+        let size_hint = values.size_hint().0 + additional_capacity;
         let mut conflicting_values: Vec<&[u8]> = Vec::new();
 
         let mut indices: HashTable<(&'static [u8], u32)> = HashTable::with_capacity(size_hint);
@@ -3119,9 +3313,23 @@ pub mod kw {
 ///
 /// Given that `sym` is imported, use them like `sym::symbol_name`.
 /// For example `sym::rustfmt` or `sym::u8`.
+#[cfg_attr(
+    bootstrap,
+    diagnostic::on_unknown(
+        label = "`{Unresolved}` is not a pre-interned symbol",
+        note = "consider adding `{Unresolved}` to the `symbols!` invocation in compiler/rustc_span/src/symbol.rs"
+    )
+)]
+#[cfg_attr(
+    not(bootstrap),
+    diagnostic::on_unknown(
+        label = "`{unresolved}` is not a pre-interned symbol",
+        note = "consider adding `{unresolved}` to the `symbols!` invocation in compiler/rustc_span/src/symbol.rs"
+    )
+)]
 pub mod sym {
-    // Used from a macro in `librustc_feature/accepted.rs`
     use super::Symbol;
+    // Used from a macro in `librustc_feature/accepted.rs`
     pub use super::kw::MacroRules as macro_rules;
     #[doc(inline)]
     pub use super::sym_generated::*;

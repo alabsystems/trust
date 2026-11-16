@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::hash::Hash;
 
+use rustc_attr_ir::{InlineAttr, Linkage};
 use rustc_data_structures::base_n::{BaseNString, CASE_INSENSITIVE, ToBaseN};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxIndexMap;
@@ -11,17 +12,18 @@ use rustc_data_structures::stable_hash::{
 use rustc_data_structures::unord::UnordMap;
 use rustc_hashes::Hash128;
 use rustc_hir::ItemId;
-use rustc_hir::attrs::{InlineAttr, Linkage};
 use rustc_hir::def_id::{CrateNum, DefId, DefIdSet, LOCAL_CRATE};
 use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 use rustc_session::config::OptLevel;
-use rustc_span::{Span, Symbol};
+use rustc_span::{OrdSpan, Span, Symbol};
 use rustc_target::spec::SymbolVisibility;
 use tracing::debug;
 
 use crate::dep_graph::dep_node::{make_compile_codegen_unit, make_compile_mono_item};
 use crate::dep_graph::{DepNode, WorkProduct, WorkProductId};
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+// Trust: cached collector observations retain typed identities, including AllocId.
+use crate::mir::interpret::{AllocId, ConstAllocation};
 use crate::ty::{self, GenericArgs, Instance, InstanceKind, ShimKind, SymbolName, Ty, TyCtxt};
 
 /// Describes how a monomorphization will be instantiated in object files.
@@ -57,6 +59,141 @@ pub enum MonoItem<'tcx> {
     Fn(Instance<'tcx>),
     Static(DefId),
     GlobalAsm(ItemId),
+}
+
+// Trust: these records are query output, not provider side effects. Cache hits
+// must replay the same observed population. Allocation IDs use rustc's normal
+// codec; their displayed numbers are scoped to one compiler invocation.
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable)]
+pub struct TrustCollectedItems<'tcx> {
+    pub used: &'tcx [rustc_span::Spanned<MonoItem<'tcx>>],
+    pub mentioned: &'tcx [rustc_span::Spanned<MonoItem<'tcx>>],
+    pub dependencies: TrustDependencyObservations<'tcx>,
+}
+
+// Trust: a direct reference lets TyDecodable use the arena's RefDecodable
+// implementation. Keep disabled observation distinct from an observed empty visit.
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable)]
+pub enum TrustDependencyObservations<'tcx> {
+    Unobserved,
+    Observed(&'tcx [TrustDependency<'tcx>]),
+}
+
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable)]
+pub struct TrustDependency<'tcx> {
+    pub mode: CollectionMode,
+    pub origin: TrustDependencyOrigin,
+    pub kind: TrustDependencyKind<'tcx>,
+}
+
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable)]
+pub enum TrustDependencyOrigin {
+    Mir,
+    DebugInfo,
+    RequiredConst,
+    MentionedItem,
+    Static,
+    GlobalAsm,
+    // Trust: the existing successful eager free-const root value scan, not MIR.
+    EagerConstRoot,
+}
+
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable)]
+pub enum TrustDependencySite {
+    InstanceUse,
+    Closure,
+    ThreadLocalStatic,
+    LanguageItem,
+    AsmStatic,
+    IntrinsicPanic,
+    IntrinsicFallback,
+    VtableMethod,
+    AllocationStatic,
+    AllocationFunction,
+    ThreadLocalShim,
+}
+
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable)]
+pub enum TrustAllocation<'tcx> {
+    Memory(ConstAllocation<'tcx>),
+    Function(Instance<'tcx>),
+    Static(DefId),
+    Vtable(Ty<'tcx>, &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>),
+    TypeId(Ty<'tcx>),
+}
+
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable)]
+pub enum TrustAllocationSource {
+    Allocation(AllocId),
+    StaticInitializer(DefId),
+}
+
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable)]
+pub enum TrustAllocationForm {
+    Pointer,
+    Indirect,
+    Slice,
+}
+
+// Trust: a codec-bearing mirror of VtblEntry. Keep every actual entry, including
+// metadata, vacant slots and supertrait pointers that do not become MonoItems.
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable)]
+pub enum TrustVtableEntry<'tcx> {
+    DropInPlace,
+    Size,
+    Align,
+    Vacant,
+    Method(Instance<'tcx>),
+    TraitVPtr(ty::TraitRef<'tcx>),
+}
+
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable)]
+pub enum TrustDependencyKind<'tcx> {
+    InstanceUse {
+        target: MonoItem<'tcx>,
+        site: TrustDependencySite,
+        collector_direct_call: Option<bool>,
+        local_codegen: Option<bool>,
+    },
+    Allocation {
+        id: AllocId,
+        allocation: TrustAllocation<'tcx>,
+    },
+    AllocationRoot {
+        id: AllocId,
+        offset_bytes: u64,
+        form: TrustAllocationForm,
+        metadata: Option<u64>,
+        immutable: Option<bool>,
+        shared_ref: Option<bool>,
+    },
+    StaticInitializer {
+        def_id: DefId,
+        allocation: ConstAllocation<'tcx>,
+    },
+    Relocation {
+        source: TrustAllocationSource,
+        target: AllocId,
+        offset_bytes: u64,
+        immutable: bool,
+        shared_ref: bool,
+    },
+    Vtable {
+        impl_ty: Ty<'tcx>,
+        trait_ty: Ty<'tcx>,
+        entry_count: Option<u64>,
+    },
+    VtableEntry {
+        impl_ty: Ty<'tcx>,
+        trait_ty: Ty<'tcx>,
+        slot: u64,
+        entry: TrustVtableEntry<'tcx>,
+        local_codegen: Option<bool>,
+    },
+    VtableMaterialization {
+        source: AllocId,
+        target: AllocId,
+    },
 }
 
 fn opt_incr_drop_glue_mode<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> InstantiationMode {
@@ -124,7 +261,7 @@ impl<'tcx> MonoItem<'tcx> {
             MonoItem::Fn(instance) => tcx.symbol_name(instance),
             MonoItem::Static(def_id) => tcx.symbol_name(Instance::mono(tcx, def_id)),
             MonoItem::GlobalAsm(item_id) => {
-                SymbolName::new(tcx, &format!("global_asm_{:?}", item_id.owner_id))
+                tcx.symbol_name(Instance::mono(tcx, item_id.owner_id.to_def_id()))
             }
         }
     }
@@ -278,7 +415,7 @@ impl<'tcx> MonoItem<'tcx> {
             MonoItem::GlobalAsm(..) => return true,
         };
 
-        !tcx.instantiate_and_check_impossible_predicates((def_id, &args))
+        !tcx.instantiate_and_check_impossible_clauses((def_id, args))
     }
 
     pub fn local_span(&self, tcx: TyCtxt<'tcx>) -> Option<Span> {
@@ -349,6 +486,11 @@ pub struct CodegenUnit<'tcx> {
     /// contain something unique to this crate (e.g., a module path)
     /// as well as the crate name and disambiguator.
     name: Symbol,
+
+    /// Symbol name for this CGU. Backend may emit symbols prefixed with this name
+    /// and assume uniqueness.
+    symbol_name: Option<Symbol>,
+
     items: FxIndexMap<MonoItem<'tcx>, MonoItemData>,
     size_estimate: usize,
     primary: bool,
@@ -405,6 +547,7 @@ impl<'tcx> CodegenUnit<'tcx> {
     pub fn new(name: Symbol) -> CodegenUnit<'tcx> {
         CodegenUnit {
             name,
+            symbol_name: None,
             items: Default::default(),
             size_estimate: 0,
             primary: false,
@@ -443,6 +586,14 @@ impl<'tcx> CodegenUnit<'tcx> {
     /// Marks this CGU as the one used to contain code coverage information for dead code.
     pub fn make_code_coverage_dead_code_cgu(&mut self) {
         self.is_code_coverage_dead_code_cgu = true;
+    }
+
+    pub fn symbol_name(&self) -> Symbol {
+        self.symbol_name.expect("CGU symbol name accessed before setting")
+    }
+
+    pub fn set_symbol_name(&mut self, name: Symbol) {
+        self.symbol_name = Some(name);
     }
 
     pub fn mangle_name(human_readable_name: &str) -> BaseNString {
@@ -514,7 +665,7 @@ impl<'tcx> CodegenUnit<'tcx> {
         // The codegen tests rely on items being process in the same order as
         // they appear in the file, so for local items, we sort by span first
         #[derive(PartialEq, Eq, PartialOrd, Ord)]
-        struct ItemSortKey<'tcx>(Option<Span>, SymbolName<'tcx>);
+        struct ItemSortKey<'tcx>(Option<OrdSpan>, SymbolName<'tcx>);
 
         // We only want to take HirIds of user-defines instances into account.
         // The others don't matter for the codegen tests and can even make item
@@ -524,6 +675,7 @@ impl<'tcx> CodegenUnit<'tcx> {
                 MonoItem::Fn(ref instance) => match instance.def {
                     InstanceKind::Item(def) => def.as_local().map(|_| def),
                     InstanceKind::Intrinsic(..)
+                    | InstanceKind::LlvmIntrinsic(..)
                     | InstanceKind::Virtual(..)
                     | InstanceKind::Shim(ShimKind::VTable(..))
                     | InstanceKind::Shim(ShimKind::Reify(..))
@@ -533,7 +685,8 @@ impl<'tcx> CodegenUnit<'tcx> {
                     | InstanceKind::Shim(ShimKind::DropGlue(..))
                     | InstanceKind::Shim(ShimKind::Clone(..))
                     | InstanceKind::Shim(ShimKind::ThreadLocal(..))
-                    | InstanceKind::Shim(ShimKind::FnPtrAddr(..))
+                    | InstanceKind::Shim(ShimKind::FnPtrAsPtr(..))
+                    | InstanceKind::Shim(ShimKind::FnPtrFromPtr(..))
                     | InstanceKind::Shim(ShimKind::AsyncDropGlue(..))
                     | InstanceKind::Shim(ShimKind::FutureDropPoll(..))
                     | InstanceKind::Shim(ShimKind::AsyncDropGlueCtor(..)) => None,
@@ -544,9 +697,9 @@ impl<'tcx> CodegenUnit<'tcx> {
         }
         fn item_sort_key<'tcx>(tcx: TyCtxt<'tcx>, item: MonoItem<'tcx>) -> ItemSortKey<'tcx> {
             ItemSortKey(
-                local_item_id(item)
-                    .map(|def_id| tcx.def_span(def_id).find_ancestor_not_from_macro())
-                    .flatten(),
+                local_item_id(item).and_then(|def_id| {
+                    tcx.def_span(def_id).find_ancestor_not_from_macro().map(OrdSpan)
+                }),
                 item.symbol_name(tcx),
             )
         }
@@ -692,7 +845,8 @@ impl<'tcx> CodegenUnitNameBuilder<'tcx> {
 }
 
 /// See module-level docs of `rustc_monomorphize::collector` on some context for "mentioned" items.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, StableHash)]
+// Trust: collection mode is also retained in the cached observation payload.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, StableHash, TyEncodable, TyDecodable)]
 pub enum CollectionMode {
     /// Collect items that are used, i.e., actually needed for codegen.
     ///

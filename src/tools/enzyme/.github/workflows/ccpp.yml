@@ -1,0 +1,81 @@
+name: C/C++ CI
+
+on: 
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+  merge_group:
+
+concurrency:
+  # Skip intermediate builds: always.
+  # Cancel intermediate builds: only if it is a pull request build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+jobs:
+  build:
+    name: Integration CI LLVM ${{ matrix.llvm }} ${{ matrix.build }} ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        llvm: ["15", "16", "17", "18", "19", "20", "21"]
+        build: ["Release"] # "RelWithDebInfo"
+        os: [ubuntu-22.04]
+    
+    timeout-minutes: 45
+    
+    steps:
+    - name: add llvm 
+      run: |
+          wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add -
+          sudo apt-get install -y libmpfr-dev
+          sudo apt-add-repository "deb http://apt.llvm.org/`lsb_release -c | cut -f2`/ llvm-toolchain-`lsb_release -c | cut -f2`-${{ matrix.llvm }} main" || true
+          sudo apt-get install -y cmake gcc g++ llvm-${{ matrix.llvm }}-dev libomp-${{ matrix.llvm }}-dev lld-${{ matrix.llvm }} clang-${{ matrix.llvm }} libclang-${{ matrix.llvm }}-dev libeigen3-dev libboost-dev libzstd-dev
+          sudo python3 -m pip install --upgrade pip lit
+    - name: Checkout Enzyme repository
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      with:
+        persist-credentials: false
+    - name: mkdir
+      run: rm -rf build && mkdir build
+    - name: cmake
+      working-directory: build
+      run: cmake ../enzyme -DLLVM_EXTERNAL_LIT=`which lit` -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DLLVM_DIR=/usr/lib/llvm-${{ matrix.llvm }}/lib/cmake/llvm
+    - name: make
+      run: cd build && make -j `nproc` LLVMEnzyme-${{ matrix.llvm }} ClangEnzyme-${{ matrix.llvm }} LLDEnzyme-${{ matrix.llvm }}  
+    - name: make test-cmake
+      working-directory: build
+      run: make -j `nproc` test-cmake
+    - name: make check-enzyme-integration
+      working-directory: build
+      run: make -j `nproc` check-enzyme-integration
+
+    - name: Update Nightly Release
+      if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        if gh release view nightly >/dev/null 2>&1; then
+          gh release edit nightly --title "Nightly Release" --notes "Latest nightly build of Enzyme."
+        else
+          gh release create nightly --title "Nightly Release" --notes "Latest nightly build of Enzyme."
+        fi
+        artifacts=()
+        for pattern in \
+          build/Enzyme/LLVMEnzyme-${{ matrix.llvm }}* \
+          build/Enzyme/ClangEnzyme-${{ matrix.llvm }}* \
+          build/Enzyme/LLDEnzyme-${{ matrix.llvm }}*; do
+          for artifact in $pattern; do
+            [ -e "$artifact" ] && artifacts+=("$artifact")
+          done
+        done
+        if [ ${#artifacts[@]} -gt 0 ]; then
+          gh release upload nightly "${artifacts[@]}" --clobber
+        else
+          echo "No nightly artifacts found for LLVM ${{ matrix.llvm }}."
+        fi

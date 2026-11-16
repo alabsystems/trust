@@ -41,11 +41,10 @@ fn uint64() -> Expr {
 
 /// `@Ne UInt64 <a> <b>`.
 fn ne(a: Expr, b: Expr) -> Expr {
-    Expr::apps(Expr::const_(Name::from_string("Ne"), vec![Level::succ(Level::zero())]), [
-        uint64(),
-        a,
-        b,
-    ])
+    Expr::apps(
+        Expr::const_(Name::from_string("Ne"), vec![Level::succ(Level::zero())]),
+        [uint64(), a, b],
+    )
 }
 
 /// `UInt64.ofNat n`.
@@ -169,11 +168,7 @@ fn the_new_door_agrees_with_the_old_one_on_every_hypothesis_free_type() {
     for ty in cases {
         let old = carrier_signature_for(&ty);
         let new = carrier_signature_with_hypotheses_for(&ty);
-        assert_eq!(
-            old.is_ok(),
-            new.is_ok(),
-            "the two doors disagreed on whether to grant {ty:?}"
-        );
+        assert_eq!(old.is_ok(), new.is_ok(), "the two doors disagreed on whether to grant {ty:?}");
         if let (Ok(old), Ok(new)) = (&old, &new) {
             assert_eq!(old.arity(), new.arity());
             assert_eq!(old.arguments(), new.arguments());
@@ -211,10 +206,7 @@ fn a_value_argument_after_a_proof_may_not_depend_on_it() {
     // `(b : UInt64) -> (h : b ≠ 0) -> (v : Vec h) -> UInt64`.
     let ty = pi(
         uint64(),
-        pi(
-            ne(Expr::bvar(0), numeral(0)),
-            pi(Expr::app(c("Vec"), Expr::bvar(0)), uint64()),
-        ),
+        pi(ne(Expr::bvar(0), numeral(0)), pi(Expr::app(c("Vec"), Expr::bvar(0)), uint64())),
     );
     assert!(
         carrier_signature_with_hypotheses_for(&ty).is_err(),
@@ -228,12 +220,10 @@ fn an_unrecognised_proposition_refuses_and_says_which_binder() {
     // but is not an atom this crate can restate, so the hypothesis cannot be
     // carried — and erasing it would advertise a weaker contract than the
     // kernel checked.
-    let lt = Expr::apps(Expr::const_(Name::from_string("LT.lt"), vec![Level::zero()]), [
-        uint64(),
-        c("instLTUInt64"),
-        Expr::bvar(1),
-        Expr::bvar(0),
-    ]);
+    let lt = Expr::apps(
+        Expr::const_(Name::from_string("LT.lt"), vec![Level::zero()]),
+        [uint64(), c("instLTUInt64"), Expr::bvar(1), Expr::bvar(0)],
+    );
     let ty = pi(uint64(), pi(uint64(), pi(lt, uint64())));
 
     let err = carrier_signature_with_hypotheses_for(&ty)
@@ -303,11 +293,10 @@ fn a_hypothesis_at_an_unbounded_type_refuses_rather_than_picking_a_width() {
     // obligation at — and `Nat` in an argument has no fixed-width carrier
     // either, so this refuses twice over. Either refusal is correct; what must
     // NOT happen is a grant.
-    let ne_nat = Expr::apps(Expr::const_(Name::from_string("Ne"), vec![Level::succ(Level::zero())]), [
-        c("Nat"),
-        Expr::bvar(0),
-        Expr::app(c("Nat.zero"), Expr::nat_lit(0)),
-    ]);
+    let ne_nat = Expr::apps(
+        Expr::const_(Name::from_string("Ne"), vec![Level::succ(Level::zero())]),
+        [c("Nat"), Expr::bvar(0), Expr::app(c("Nat.zero"), Expr::nat_lit(0))],
+    );
     let ty = pi(c("Nat"), pi(ne_nat, uint64()));
     assert!(carrier_signature_with_hypotheses_for(&ty).is_err());
 }

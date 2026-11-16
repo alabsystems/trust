@@ -41,7 +41,7 @@ pub struct TomlManifest {
     pub package: Option<Box<TomlPackage>>,
     pub project: Option<Box<TomlPackage>>,
     pub badges: Option<BTreeMap<String, BTreeMap<String, String>>>,
-    pub features: Option<BTreeMap<FeatureName, Vec<String>>>,
+    pub features: Option<BTreeMap<FeatureName, FeatureDefinition>>,
     pub lib: Option<TomlLibTarget>,
     pub bin: Option<Vec<TomlBinTarget>>,
     pub example: Option<Vec<TomlExampleTarget>>,
@@ -60,8 +60,10 @@ pub struct TomlManifest {
 
     // Trust: policy travels with the manifest, and a virtual workspace root
     // carries it for its members, so it sits beside `workspace` rather than
-    // inside `package`.
-    pub trust: Option<TomlTrust>,
+    // inside `package`. It is kept as written: the table is policy only for
+    // the workspace being built, which reads it strictly (`TomlTrustTable`).
+    #[cfg_attr(feature = "unstable-schema", schemars(with = "Option<TomlTrust>"))]
+    pub trust: Option<TomlTrustTable>,
 
     pub workspace: Option<TomlWorkspace>,
     pub profile: Option<TomlProfiles>,
@@ -117,7 +119,7 @@ impl TomlManifest {
             .or(self.build_dependencies2.as_ref())
     }
 
-    pub fn features(&self) -> Option<&BTreeMap<FeatureName, Vec<String>>> {
+    pub fn features(&self) -> Option<&BTreeMap<FeatureName, FeatureDefinition>> {
         self.features.as_ref()
     }
 
@@ -708,6 +710,11 @@ impl<'de> de::Deserialize<'de> for InheritableDependency {
             D::Error,
         >::new(value.clone()))
         {
+            if w._unused_keys.get("builtin").is_some() {
+                return Err(de::Error::custom(
+                    "`builtin` cannot be combined with `workspace = true`",
+                ));
+            }
             return if w.workspace {
                 Ok(InheritableDependency::Inherit(w))
             } else {
@@ -848,6 +855,14 @@ pub struct TomlDetailedDependency<P: Clone = String> {
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub rev: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_builtin",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    #[cfg_attr(feature = "unstable-schema", schemars(extend("const" = true)))]
+    pub builtin: bool,
+
     pub features: Option<Vec<String>>,
     pub optional: Option<bool>,
     pub default_features: Option<bool>,
@@ -871,6 +886,14 @@ pub struct TomlDetailedDependency<P: Clone = String> {
     pub _unused_keys: BTreeMap<String, toml::Value>,
 }
 
+fn deserialize_builtin<'de, D: de::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    if bool::deserialize(deserializer)? {
+        Ok(true)
+    } else {
+        Err(de::Error::custom("`builtin` cannot be false"))
+    }
+}
+
 impl<P: Clone> TomlDetailedDependency<P> {
     pub fn default_features(&self) -> Option<bool> {
         self.default_features.or(self.default_features2)
@@ -882,6 +905,7 @@ impl<P: Clone> Default for TomlDetailedDependency<P> {
     fn default() -> Self {
         Self {
             version: Default::default(),
+            builtin: Default::default(),
             registry: Default::default(),
             registry_index: Default::default(),
             path: Default::default(),
@@ -942,7 +966,7 @@ pub struct TomlProfile {
     // requires all non-tables to be listed first.
     pub package: Option<BTreeMap<ProfilePackageSpec, TomlProfile>>,
     pub build_override: Option<Box<TomlProfile>>,
-    /// Unstable feature `-Ztrim-paths`.
+    /// Controls the scope of path sanitization in build outputs.
     pub trim_paths: Option<TomlTrimPaths>,
     /// Unstable feature `hint-mostly-unused`
     pub hint_mostly_unused: Option<bool>,
@@ -1127,12 +1151,38 @@ impl<'de> de::Deserialize<'de> for TomlOptLevel {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "unstable-schema", schemars(rename_all = "kebab-case"))]
+#[cfg_attr(feature = "unstable-schema", schemars(transform = Self::schema_add_aliases))]
 pub enum TomlDebugInfo {
     None,
     LineDirectivesOnly,
     LineTablesOnly,
     Limited,
     Full,
+}
+
+#[cfg(feature = "unstable-schema")]
+impl TomlDebugInfo {
+    fn schema_add_aliases(schema: &mut schemars::Schema) {
+        use serde_json::Value;
+
+        if let Some(obj) = schema.as_object_mut() {
+            obj.get_mut("type").map(|v| match v {
+                Value::Array(v) => v.extend_from_slice(&["integer".into(), "boolean".into()]),
+                Value::String(s) => {
+                    let s = std::mem::replace(s, String::with_capacity(0));
+                    *v = Value::Array(vec![s.into(), "integer".into(), "boolean".into()])
+                }
+                _ => *v = Value::Array(vec!["string".into(), "integer".into(), "boolean".into()]),
+            });
+
+            if let Some(variants) = obj.get_mut("enum").and_then(|v| v.as_array_mut()) {
+                variants.reserve(5);
+                variants.extend((0..=2).map(Into::into));
+                variants.extend_from_slice(&[false.into(), true.into()]);
+            }
+        }
+    }
 }
 
 impl Display for TomlDebugInfo {
@@ -1212,119 +1262,30 @@ impl<'de> de::Deserialize<'de> for TomlDebugInfo {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize)]
-#[serde(untagged, rename_all = "kebab-case")]
+#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 pub enum TomlTrimPaths {
-    Values(Vec<TomlTrimPathsValue>),
+    None,
+    Object,
     All,
 }
 
 impl TomlTrimPaths {
-    pub fn none() -> Self {
-        TomlTrimPaths::Values(Vec::new())
-    }
-
     pub fn is_none(&self) -> bool {
-        match self {
-            TomlTrimPaths::Values(v) => v.is_empty(),
-            TomlTrimPaths::All => false,
-        }
+        matches!(self, TomlTrimPaths::None)
     }
-}
 
-impl<'de> de::Deserialize<'de> for TomlTrimPaths {
-    fn deserialize<D>(d: D) -> Result<TomlTrimPaths, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        use serde::de::Error as _;
-        let expecting = r#"a boolean, "none", "diagnostics", "macro", "object", "all", or an array with these options"#;
-        UntaggedEnumVisitor::new()
-            .expecting(expecting)
-            .bool(|value| {
-                Ok(if value {
-                    TomlTrimPaths::All
-                } else {
-                    TomlTrimPaths::none()
-                })
-            })
-            .string(|v| match v {
-                "none" => Ok(TomlTrimPaths::none()),
-                "all" => Ok(TomlTrimPaths::All),
-                v => {
-                    let d = v.into_deserializer();
-                    let err = |_: D::Error| {
-                        serde_untagged::de::Error::custom(format!("expected {expecting}"))
-                    };
-                    TomlTrimPathsValue::deserialize(d)
-                        .map_err(err)
-                        .map(|v| v.into())
-                }
-            })
-            .seq(|seq| {
-                let seq: Vec<String> = seq.deserialize()?;
-                let seq: Vec<_> = seq
-                    .into_iter()
-                    .map(|s| TomlTrimPathsValue::deserialize(s.into_deserializer()))
-                    .collect::<Result<_, _>>()?;
-                Ok(seq.into())
-            })
-            .deserialize(d)
+    fn as_str(&self) -> &'static str {
+        match self {
+            TomlTrimPaths::None => "none",
+            TomlTrimPaths::Object => "object",
+            TomlTrimPaths::All => "all",
+        }
     }
 }
 
 impl fmt::Display for TomlTrimPaths {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TomlTrimPaths::All => write!(f, "all"),
-            TomlTrimPaths::Values(v) if v.is_empty() => write!(f, "none"),
-            TomlTrimPaths::Values(v) => {
-                let mut iter = v.iter();
-                if let Some(value) = iter.next() {
-                    write!(f, "{value}")?;
-                }
-                for value in iter {
-                    write!(f, ",{value}")?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl From<TomlTrimPathsValue> for TomlTrimPaths {
-    fn from(value: TomlTrimPathsValue) -> Self {
-        TomlTrimPaths::Values(vec![value])
-    }
-}
-
-impl From<Vec<TomlTrimPathsValue>> for TomlTrimPaths {
-    fn from(value: Vec<TomlTrimPathsValue>) -> Self {
-        TomlTrimPaths::Values(value)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-pub enum TomlTrimPathsValue {
-    Diagnostics,
-    Macro,
-    Object,
-}
-
-impl TomlTrimPathsValue {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TomlTrimPathsValue::Diagnostics => "diagnostics",
-            TomlTrimPathsValue::Macro => "macro",
-            TomlTrimPathsValue::Object => "object",
-        }
-    }
-}
-
-impl fmt::Display for TomlTrimPathsValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
@@ -1538,6 +1499,66 @@ impl TomlPlatform {
     }
 }
 
+/// Definition of a feature.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum FeatureDefinition {
+    /// Features that this feature enables.
+    Array(Vec<String>),
+    /// Unstable feature `feature-metadata`. Metadata of this feature.
+    Metadata(FeatureMetadata),
+}
+
+// Implementing `Deserialize` manually allows for a better error message when the `enables` key is
+// missing.
+impl<'de> de::Deserialize<'de> for FeatureDefinition {
+    fn deserialize<D>(d: D) -> Result<FeatureDefinition, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        UntaggedEnumVisitor::new()
+            .seq(|seq| {
+                seq.deserialize::<Vec<String>>()
+                    .map(FeatureDefinition::Array)
+            })
+            .map(|seq| {
+                seq.deserialize::<FeatureMetadata>()
+                    .map(FeatureDefinition::Metadata)
+            })
+            .deserialize(d)
+    }
+}
+
+impl FeatureDefinition {
+    /// Returns the features that this feature enables.
+    pub fn enables(&self) -> &[String] {
+        match self {
+            Self::Array(features) => features,
+            Self::Metadata(FeatureMetadata {
+                enables: features, ..
+            }) => features,
+        }
+    }
+}
+
+/// Unstable feature `feature-metadata`. Metadata of a feature.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+pub struct FeatureMetadata {
+    /// Features that this feature enables.
+    pub enables: Vec<String>,
+
+    /// Documentation for the feature.
+    pub doc: Option<String>,
+
+    /// This is here to provide a way to see the "unused manifest keys" when deserializing
+    #[serde(skip_serializing)]
+    #[serde(flatten)]
+    #[cfg_attr(feature = "unstable-schema", schemars(skip))]
+    pub _unused_keys: BTreeMap<String, toml::Value>,
+}
+
 #[derive(Serialize, Debug, Clone)]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 pub struct InheritableLints {
@@ -1688,7 +1709,92 @@ pub struct Hints {
         feature = "unstable-schema",
         schemars(with = "Option<TomlValueWrapper>")
     )]
+    pub min_opt_level: Option<toml::Value>,
+    #[cfg_attr(
+        feature = "unstable-schema",
+        schemars(with = "Option<TomlValueWrapper>")
+    )]
     pub mostly_unused: Option<toml::Value>,
+}
+
+/// Trust: a manifest's `[trust]` table as written, not yet read as policy.
+///
+/// The table is policy only for the workspace being built: its root and its
+/// members. Cargo reads many other manifests -- a path dependency that belongs
+/// to another workspace, that workspace's root (for the fields its members
+/// inherit), a git or registry dependency, a fixture in a git checkout -- and
+/// none of their `[trust]` tables governs this build, exactly as Cargo ignores
+/// `[profile]` outside the root. So a manifest deserializes with the table
+/// unread and unvalidated, and only [`TomlTrustTable::policy`] reads it,
+/// strictly, for a manifest the workspace being built governs. A retired or
+/// misspelled key in a member or the root is therefore still refused by name,
+/// and the same key in a manifest that is not policy here cannot stop a build
+/// that never reads it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(transparent)]
+pub struct TomlTrustTable(toml::Value);
+
+impl TomlTrustTable {
+    /// Read the table as policy: [`TomlTrust`], with every unknown key
+    /// refused by name, and a key in [`TomlTrust::RETIRED_KEYS`] refused with
+    /// the setting that replaced it ([`TomlTrustRetiredKeys`]).
+    pub fn policy(&self) -> Result<TomlTrust, toml::de::Error> {
+        TomlTrustRetiredKeys::deserialize(self.0.clone())?;
+        TomlTrust::deserialize(self.0.clone())
+    }
+}
+
+/// Trust: a `[trust]` table read only for its retired keys. Deserializing it
+/// refuses the first key in [`TomlTrust::RETIRED_KEYS`] with the setting that
+/// replaced it, and reads nothing else. Every reader that takes the table as
+/// policy deserializes this ahead of [`TomlTrust`] -- [`TomlTrustTable::policy`]
+/// and Cargo's read of a manifest's parsed document alike -- so a project
+/// learns where its setting went, not only that the key is unknown; read from
+/// a document, the refusal carries the key's span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TomlTrustRetiredKeys;
+
+impl<'de> Deserialize<'de> for TomlTrustRetiredKeys {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// One key of the table, refused if it is retired.
+        struct Key;
+
+        impl<'de> de::DeserializeSeed<'de> for Key {
+            type Value = ();
+
+            fn deserialize<D: de::Deserializer<'de>>(self, key: D) -> Result<(), D::Error> {
+                let key = String::deserialize(key)?;
+                match TomlTrust::RETIRED_KEYS
+                    .iter()
+                    .find(|(retired, _)| *retired == key)
+                {
+                    Some((retired, replacement)) => Err(de::Error::custom(format!(
+                        "`[trust]` key `{retired}` was {replacement}"
+                    ))),
+                    None => Ok(()),
+                }
+            }
+        }
+
+        struct Table;
+
+        impl<'de> de::Visitor<'de> for Table {
+            type Value = TomlTrustRetiredKeys;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a `[trust]` table")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_key_seed(Key)?.is_some() {
+                    map.next_value::<de::IgnoredAny>()?;
+                }
+                Ok(TomlTrustRetiredKeys)
+            }
+        }
+
+        deserializer.deserialize_map(Table)
+    }
 }
 
 /// Trust: the `[trust]` table. Verification level, budgets, and backend choice
@@ -1696,28 +1802,49 @@ pub struct Hints {
 /// already has rather than in a second policy file the toolchain would have to
 /// discover separately (DESIGN_PHILOSOPHY.md §3).
 ///
-/// Keys stay snake_case: `targo trust` has shipped `timeout_ms`,
-/// `function_budget_ms`, `skip_functions`, `codegen_backend`, and
-/// `trust_profile` since before the table existed, and the surrounding
-/// `kebab-case` rename is cargo's convention for cargo's own keys.
+/// Keys stay snake_case: `targo trust` has shipped `skip_functions`,
+/// `codegen_backend`, and `trust_profile` since before the table existed, and
+/// the surrounding `kebab-case` rename is cargo's convention for cargo's own
+/// keys.
 ///
 /// `deny_unknown_fields` is the point of typing this at all: a misspelled key
 /// is a policy the author believed they had set. It must stop the build, not
 /// be dropped into the unused-key warning stream. This list is the same
-/// surface `targo-trust`'s own loader accepts; the two must be changed together.
+/// surface `targo-trust`'s own loader accepts (`known_config_keys` in
+/// `targo-trust/src/config.rs`); the two must be changed together. A retired
+/// key, such as the old clock budgets `timeout_ms` and `function_budget_ms`,
+/// fails here as an unknown field, as it does there; one in
+/// [`TomlTrust::RETIRED_KEYS`] (`compiler_timeout_secs`) is refused naming
+/// its replacement, in both, by [`TomlTrustRetiredKeys`], which every policy
+/// read deserializes first.
+///
+/// A manifest carries the table as written ([`TomlTrustTable`]); this type is
+/// what [`TomlTrustTable::policy`] reads it into, for a manifest whose table
+/// is policy.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 pub struct TomlTrust {
     pub enabled: Option<bool>,
     pub level: Option<String>,
-    pub timeout_ms: Option<u64>,
-    pub function_budget_ms: Option<u64>,
+    /// The one solver-effort count's scale `k`, SAT conflicts per distinct
+    /// query term (plan §3.2a). Workspace-root only: a member's table that
+    /// names it is refused, by targo's `Workspace` and by `targo trust`, and a
+    /// member runs at the root's. `targo trust` validates the range.
+    pub effort: Option<u64>,
+    /// The wall-clock backstop, per mille of the reference clocks (plan
+    /// §3.6): the per-query and per-function clocks and, above 1000, the
+    /// bounds of each verified compiler process, which `targo trust` derives
+    /// from it. Workspace-root only, like `effort`.
+    pub backstop: Option<u32>,
     pub skip_functions: Option<Vec<String>>,
     pub codegen_backend: Option<String>,
     pub hardened: Option<bool>,
     pub trust_profile: Option<String>,
     pub intent: Option<String>,
+    /// What a dependency must ship as proof evidence: `none`, `present` or
+    /// `verified`. `targo trust` validates the name.
+    pub require_dep_evidence: Option<String>,
 }
 
 impl TomlTrust {
@@ -1725,44 +1852,29 @@ impl TomlTrust {
     pub const KEYS: &'static [&'static str] = &[
         "enabled",
         "level",
-        "timeout_ms",
-        "function_budget_ms",
+        "effort",
+        "backstop",
         "skip_functions",
         "codegen_backend",
         "hardened",
         "trust_profile",
         "intent",
+        "require_dep_evidence",
     ];
 
-    /// Fill keys this table leaves unwritten from a workspace-wide table.
-    ///
-    /// Only unwritten keys are filled. That direction is the whole rule: a
-    /// permissive workspace root must never displace a member's own
-    /// declaration, or a member crate that asked for a stricter verification
-    /// level would silently be built at the workspace's weaker one.
-    ///
-    /// `intent` never inherits — it names a document beneath the declaring
-    /// manifest's own directory, so a workspace-root value would resolve
-    /// against the wrong directory for every member.
-    pub fn fill_unset_from(&mut self, workspace: &TomlTrust) {
-        self.enabled = self.enabled.or(workspace.enabled);
-        self.level = self.level.take().or_else(|| workspace.level.clone());
-        self.timeout_ms = self.timeout_ms.or(workspace.timeout_ms);
-        self.function_budget_ms = self.function_budget_ms.or(workspace.function_budget_ms);
-        self.skip_functions = self
-            .skip_functions
-            .take()
-            .or_else(|| workspace.skip_functions.clone());
-        self.codegen_backend = self
-            .codegen_backend
-            .take()
-            .or_else(|| workspace.codegen_backend.clone());
-        self.hardened = self.hardened.or(workspace.hardened);
-        self.trust_profile = self
-            .trust_profile
-            .take()
-            .or_else(|| workspace.trust_profile.clone());
-    }
+    /// Keys the table no longer accepts, each with the setting that replaced
+    /// it: the same list, and the same words, as `targo-trust`'s
+    /// `RETIRED_CONFIG_KEYS` (`targo-trust/src/config.rs`). Refused before the
+    /// strict read, so a project learns where its setting went rather than
+    /// only that the key is unknown. (`timeout_ms` and `function_budget_ms`,
+    /// retired by T1, are refused as unknown fields.)
+    pub const RETIRED_KEYS: &'static [(&'static str, &'static str)] = &[(
+        "compiler_timeout_secs",
+        "retired on 2026-10-11: `[trust] backstop` in the workspace root's table is the one \
+         wall-clock backstop, and it scales the compiler-process ceiling (8 hours at the builtin \
+         1000 per mille) with the per-query and per-function clocks. Delete this key, and raise \
+         `backstop` in the workspace root's [trust] table if a run needs a longer ceiling",
+    )];
 
     /// The declared keys, in the order they are documented, rendered for a
     /// human-readable effective-policy report.
@@ -1775,11 +1887,8 @@ impl TomlTrust {
         };
         push("enabled", self.enabled.map(|v| v.to_string()));
         push("level", self.level.clone());
-        push("timeout_ms", self.timeout_ms.map(|v| v.to_string()));
-        push(
-            "function_budget_ms",
-            self.function_budget_ms.map(|v| v.to_string()),
-        );
+        push("effort", self.effort.map(|v| v.to_string()));
+        push("backstop", self.backstop.map(|v| v.to_string()));
         push(
             "skip_functions",
             self.skip_functions.as_ref().map(|v| v.join(", ")),
@@ -1788,6 +1897,7 @@ impl TomlTrust {
         push("hardened", self.hardened.map(|v| v.to_string()));
         push("trust_profile", self.trust_profile.clone());
         push("intent", self.intent.clone());
+        push("require_dep_evidence", self.require_dep_evidence.clone());
         declared
     }
 }
@@ -1947,67 +2057,131 @@ mod trust_table_tests {
         toml::from_str(manifest).expect("manifest should parse")
     }
 
+    /// The manifest's `[trust]` table read as policy.
+    fn policy(manifest: &str) -> Result<TomlTrust, toml::de::Error> {
+        parse(manifest)
+            .trust
+            .expect("[trust] should deserialize")
+            .policy()
+    }
+
     #[test]
     fn the_table_is_a_known_manifest_key() {
-        let manifest = parse(
-            "[package]\nname = \"demo\"\n\n[trust]\nlevel = \"L1\"\nfunction_budget_ms = 45000\n",
-        );
-        let trust = manifest.trust.expect("[trust] should deserialize");
-        assert_eq!(trust.level.as_deref(), Some("L1"));
-        assert_eq!(trust.function_budget_ms, Some(45_000));
-    }
-
-    #[test]
-    fn a_virtual_workspace_root_may_carry_the_table() {
-        let manifest = parse("[workspace]\nmembers = []\n\n[trust]\nlevel = \"L0\"\n");
-        assert_eq!(
-            manifest.trust.expect("[trust] should deserialize").level.as_deref(),
-            Some("L0")
-        );
-    }
-
-    #[test]
-    fn a_misspelled_key_is_an_error_not_an_ignored_key() {
-        let error = toml::from_str::<TomlManifest>(
-            "[package]\nname = \"demo\"\n\n[trust]\nlevl = \"L1\"\n",
+        let trust = policy(
+            "[package]\nname = \"demo\"\n\n[trust]\nlevel = \"L1\"\neffort = 6\nbackstop = 2000\n",
         )
-        .expect_err("a typo must not be silently dropped");
-        let error = error.to_string();
-        assert!(error.contains("unknown field `levl`"), "{error}");
-        for key in TomlTrust::KEYS {
-            assert!(error.contains(key), "the error should name `{key}`: {error}");
+        .expect("a valid table reads as policy");
+        assert_eq!(trust.level.as_deref(), Some("L1"));
+        assert_eq!((trust.effort, trust.backstop), (Some(6), Some(2000)));
+    }
+
+    #[test]
+    fn a_retired_clock_key_is_an_unknown_field() {
+        for retired in ["timeout_ms = 5000", "function_budget_ms = 3000"] {
+            let error = policy(&format!(
+                "[package]\nname = \"demo\"\n\n[trust]\n{retired}\n"
+            ))
+            .expect_err("a retired budget key must not read as policy");
+            let key = retired.split(' ').next().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{key}`")),
+                "{error}"
+            );
+        }
+    }
+
+    /// T7b: `compiler_timeout_secs` folded into `backstop`. Read as policy,
+    /// a table that still names it is refused naming the replacement, not
+    /// merely as an unknown field; the key is gone from the accepted surface.
+    #[test]
+    fn a_retired_key_is_refused_naming_its_replacement() {
+        for value in ["72000", "0"] {
+            let error = policy(&format!(
+                "[package]\nname = \"demo\"\n\n[trust]\ncompiler_timeout_secs = {value}\n"
+            ))
+            .expect_err("a retired key must not read as policy")
+            .to_string();
+            assert!(
+                error.contains("`compiler_timeout_secs` was retired"),
+                "{error}"
+            );
+            assert!(error.contains("`backstop`"), "{error}");
+            assert!(!error.contains("unknown field"), "{error}");
+        }
+        assert!(!TomlTrust::KEYS.contains(&"compiler_timeout_secs"));
+    }
+
+    /// Read from a manifest's text, as Cargo reads a parsed manifest's
+    /// document (`read_trust_policy`), the retired-key refusal points at the
+    /// key, as an unknown field's does; a table without one passes untouched.
+    #[test]
+    fn a_retired_key_read_from_text_is_refused_at_the_key() {
+        #[derive(serde::Deserialize)]
+        struct Manifest {
+            #[allow(dead_code)]
+            trust: Option<super::TomlTrustRetiredKeys>,
+        }
+        let text = "[package]\nname = \"demo\"\n\n[trust]\nlevel = \"L1\"\ncompiler_timeout_secs = 72000\n";
+        let error = toml::from_str::<Manifest>(text)
+            .err()
+            .expect("a retired key must be refused");
+        assert!(
+            error
+                .message()
+                .contains("`compiler_timeout_secs` was retired"),
+            "{error}"
+        );
+        assert!(error.message().contains("`backstop`"), "{error}");
+        let span = error.span().expect("the refusal carries the key's span");
+        assert_eq!(&text[span], "compiler_timeout_secs");
+        for table in [
+            "[trust]\nlevel = \"L1\"\nbackstop = 2500\n",
+            "[package]\nname = \"demo\"\n",
+        ] {
+            assert!(toml::from_str::<Manifest>(table).is_ok(), "{table}");
+        }
+    }
+
+    /// A manifest is read for many reasons, and its `[trust]` table is policy
+    /// only for the workspace being built. Deserializing the manifest neither
+    /// reads nor validates the table, so a retired key, a misspelling or a
+    /// value that is not a table at all cannot stop a build that never reads
+    /// it as policy; `policy` still refuses each.
+    #[test]
+    fn the_manifest_keeps_the_table_unread() {
+        for table in [
+            "[trust]\nfunction_budget_ms = 3000\ntimeout_ms = 5000\n",
+            "[trust]\ncompiler_timeout_secs = 72000\n",
+            "[trust]\nlevl = \"L1\"\n",
+            "trust = 5\n",
+        ] {
+            let manifest = parse(&format!("{table}\n[package]\nname = \"demo\"\n"));
+            let written = manifest.trust.expect("[trust] is kept as written");
+            assert!(written.policy().is_err(), "{table}");
         }
     }
 
     #[test]
-    fn a_workspace_default_never_displaces_a_member_declaration() {
-        let mut member = TomlTrust {
-            level: Some("L1".to_string()),
-            ..TomlTrust::default()
-        };
-        let workspace = TomlTrust {
-            level: Some("L0".to_string()),
-            timeout_ms: Some(1000),
-            ..TomlTrust::default()
-        };
-
-        member.fill_unset_from(&workspace);
-
-        assert_eq!(member.level.as_deref(), Some("L1"));
-        assert_eq!(member.timeout_ms, Some(1000));
+    fn a_virtual_workspace_root_may_carry_the_table() {
+        let trust = policy("[workspace]\nmembers = []\n\n[trust]\nlevel = \"L0\"\n")
+            .expect("a valid table reads as policy");
+        assert_eq!(trust.level.as_deref(), Some("L0"));
     }
 
     #[test]
-    fn intent_does_not_inherit_from_the_workspace_root() {
-        let mut member = TomlTrust::default();
-        let workspace = TomlTrust {
-            intent: Some("docs/intent.md".to_string()),
-            ..TomlTrust::default()
-        };
-
-        member.fill_unset_from(&workspace);
-
-        assert_eq!(member.intent, None);
+    fn a_misspelled_key_is_an_error_not_an_ignored_key() {
+        let error = policy("[package]\nname = \"demo\"\n\n[trust]\nlevl = \"L1\"\n")
+            .expect_err("a typo must not be silently dropped");
+        let error = error.to_string();
+        assert!(error.contains("unknown field `levl`"), "{error}");
+        for key in TomlTrust::KEYS {
+            assert!(
+                error.contains(key),
+                "the error should name `{key}`: {error}"
+            );
+        }
     }
 }
 

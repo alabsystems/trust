@@ -6,9 +6,9 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
-use crate::t;
+use crate::core::builder::{Builder, CommandLineStep, RunConfig, ShouldRun};
 use crate::utils::exec::command;
+use crate::utils::helpers::t;
 
 /// The name of the directory where vendored dependencies are stored.
 pub const VENDOR_DIR: &str = "vendor";
@@ -26,6 +26,7 @@ pub fn default_paths_to_vendor(builder: &Builder<'_>) -> Vec<(PathBuf, Vec<&'sta
         ("src/tools/rust-analyzer/Cargo.toml", vec![]),
         ("library/Cargo.toml", vec![]),
         ("library/stdarch/Cargo.toml", vec![]),
+        ("library/compiler-builtins/Cargo.toml", vec![]),
         ("src/bootstrap/Cargo.toml", vec![]),
         ("src/tools/rustbook/Cargo.toml", vec![]),
         ("src/tools/opt-dist/Cargo.toml", vec![]),
@@ -56,7 +57,7 @@ pub(crate) struct Vendor {
     pub(crate) only_library_workspace: bool,
 }
 
-impl Step for Vendor {
+impl CommandLineStep for Vendor {
     type Output = VendorOutput;
     const IS_HOST: bool = true;
 
@@ -69,13 +70,21 @@ impl Step for Vendor {
     }
 
     fn make_run(run: RunConfig<'_>) {
-        run.builder.ensure(Vendor {
+        let vendor = run.builder.ensure(Vendor {
             sync_args: run.builder.config.cmd.vendor_sync_args(),
             versioned_dirs: run.builder.config.cmd.vendor_versioned_dirs(),
             root_dir: run.builder.src.clone(),
             output_dir: None,
             only_library_workspace: false,
         });
+        // Print the config.toml contents, so that the user can manually copy it
+        if !run.builder.config.dry_run() {
+            println!("Put the following config into .cargo/config.toml:\n{}", vendor.config);
+            println!(
+                "Put the following config into library/.cargo/config.toml:\n{}",
+                vendor.config_library
+            );
+        }
     }
 
     /// Executes the vendoring process.
@@ -103,13 +112,12 @@ impl Step for Vendor {
             // Trust: upstream treats `vendor/` as cargo's private output directory, so
             // cargo is free to delete anything in it that is not in the current
             // vendored set. In this fork `vendor/` is *also* where hand-vendored
-            // path-source trees live (`vendor/carcara_1_1_0`, `vendor/lean-core-oleans`,
+            // path-source trees live (`vendor/lean-core-oleans`,
             // `vendor/rustc_version_0_4_1`), referenced by `[patch.*]` `path =` entries
-            // in the root, `crates/` and `targo-trust/` manifests. Cargo only spares a
-            // directory it resolved as a path source *exactly* — `vendor/carcara_1_1_0`
-            // is one level above its crate (`.../carcara`) and `vendor/lean-core-oleans`
-            // is data, not a crate — so the default prune would silently strip both from
-            // the source tarball. Keep them.
+            // and by the olean bridge. Cargo only spares a directory it resolved as a
+            // path source *exactly* — `vendor/lean-core-oleans` is data, not a crate —
+            // so the default prune would silently strip it from the source tarball.
+            // Keep them.
             cmd.arg("--no-delete");
 
             if self.versioned_dirs {
@@ -120,7 +128,7 @@ impl Step for Vendor {
             // These submodules must be present for `x vendor` to work.
             for (_, submodules) in &to_vendor {
                 for submodule in submodules {
-                    builder.build.require_submodule(submodule, None);
+                    builder.sess.require_submodule(submodule, None);
                 }
             }
 

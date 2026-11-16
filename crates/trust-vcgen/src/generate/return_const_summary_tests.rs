@@ -79,6 +79,7 @@ fn small_den_fn(third_arm_const: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -107,7 +108,14 @@ fn caller_fn() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
-                        callee_identity: None,
+                        callee_identity: Some(trust_types::CalleeIdentity {
+                            // A concrete call: the compiler gives it an identity, and a body-derived
+                            // summary applies only to a call to its own body (`crate::call_reaches_summarized_body`).
+                            stable_crate_id: 1,
+                            def_index: 1,
+                            substs_digest: [0, 0],
+                        }),
+                        callee_key: crate::sep_engine::tests::fixture_key(&SMALL_DEN.to_string()),
                         is_foreign: false,
                     },
                 },
@@ -121,6 +129,7 @@ fn caller_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -183,6 +192,7 @@ fn call_defined_return_site_fails_closed() {
             atomic: None,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(&SMALL_DEN.to_string()),
             is_foreign: false,
         },
     };
@@ -211,6 +221,7 @@ fn tail_call_defined_return_site_fails_closed() {
             is_unsafe_sig: false,
             is_foreign: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(&SMALL_DEN.to_string()),
         },
     };
     let funcs = [func];
@@ -222,6 +233,103 @@ fn tail_call_defined_return_site_fails_closed() {
     );
 }
 
+/// Trust (2026-09-30): the same call WITHOUT an identity — what the compiler emits
+/// for a dispatch whose instantiation still mentions a type parameter, e.g. the
+/// unresolvable `t.m(x)` inside `fn f<T: Tr>` rendering a blanket impl's def path —
+/// gets none of the summary facts (`crate::call_reaches_summarized_body`).
+#[test]
+fn call_site_without_an_identity_gets_no_summary_facts() {
+    let funcs = [small_den_fn(true)];
+    let _summary_scope = crate::enter_test_callee_summaries(
+        crate::CalleeSummaryContext::default()
+            .with_return_bounds(compute_return_bound_summaries(&funcs))
+            .with_return_lower_bounds(compute_return_lower_bound_summaries(&funcs))
+            .with_return_const_sets(compute_return_const_set_summaries(&funcs))
+            .with_summary_body_identities(crate::test_summary_body_identities(
+                funcs.iter().map(|f| f.def_path.clone()),
+            )),
+    );
+    let mut caller = caller_fn();
+    if let Terminator::Call { callee_identity, .. } = &mut caller.body.blocks[0].terminator {
+        *callee_identity = None;
+    }
+    let guards = build_semantic_guard_map(&caller).get(&BlockId(1)).cloned().unwrap_or_default();
+    let mentions_d = |f: &Formula| f.free_variables().iter().any(|v| v.starts_with("d#"));
+    assert!(
+        !guards.iter().any(mentions_d),
+        "an unidentified call must carry no summary fact about its dest; got {guards:?}"
+    );
+}
+
+/// Trust (2026-09-30, round 7): a call that carries ANOTHER body's identity — what a
+/// concrete call to a trait default method carries when its rendering matches an
+/// override elsewhere (residual 7c) — gets none of the summary facts either.
+#[test]
+fn call_site_with_another_bodys_identity_gets_no_summary_facts() {
+    let funcs = [small_den_fn(true)];
+    let _summary_scope = crate::enter_test_callee_summaries(
+        crate::CalleeSummaryContext::default()
+            .with_return_bounds(compute_return_bound_summaries(&funcs))
+            .with_return_lower_bounds(compute_return_lower_bound_summaries(&funcs))
+            .with_return_const_sets(compute_return_const_set_summaries(&funcs))
+            .with_summary_body_identities(crate::test_summary_body_identities(
+                funcs.iter().map(|f| f.def_path.clone()),
+            )),
+    );
+    let mut caller = caller_fn();
+    if let Terminator::Call { callee_identity: Some(id), .. } =
+        &mut caller.body.blocks[0].terminator
+    {
+        id.def_index = 2;
+    }
+    let guards = build_semantic_guard_map(&caller).get(&BlockId(1)).cloned().unwrap_or_default();
+    let mentions_d = |f: &Formula| f.free_variables().iter().any(|v| v.starts_with("d#"));
+    assert!(
+        !guards.iter().any(mentions_d),
+        "a call to another body must carry no summary fact about its dest; got {guards:?}"
+    );
+}
+
+/// A trait impl method's summary is registered for exactly the identity a call to
+/// that impl carries (`SummaryBodyIdentity::Instance`): the same trait item at
+/// another instantiation — which coherence routes to a different impl, or to the
+/// trait's default — gets none of its facts, and the exact instantiation does.
+#[test]
+fn trait_impl_summary_applies_only_at_its_own_instantiation() {
+    let funcs = [small_den_fn(true)];
+    let exact =
+        trust_types::CalleeIdentity { stable_crate_id: 1, def_index: 1, substs_digest: [0, 0] };
+    let ids = funcs
+        .iter()
+        .map(|f| (f.def_path.clone(), crate::SummaryBodyIdentity::Instance(exact)))
+        .collect();
+    let _summary_scope = crate::enter_test_callee_summaries(
+        crate::CalleeSummaryContext::default()
+            .with_return_bounds(compute_return_bound_summaries(&funcs))
+            .with_return_lower_bounds(compute_return_lower_bound_summaries(&funcs))
+            .with_return_const_sets(compute_return_const_set_summaries(&funcs))
+            .with_summary_body_identities(ids),
+    );
+    let mentions_d = |f: &Formula| f.free_variables().iter().any(|v| v.starts_with("d#"));
+    let exact_guards =
+        build_semantic_guard_map(&caller_fn()).get(&BlockId(1)).cloned().unwrap_or_default();
+    assert!(
+        exact_guards.iter().any(mentions_d),
+        "the impl's own instantiation gets the summary facts; got {exact_guards:?}"
+    );
+    let mut caller = caller_fn();
+    if let Terminator::Call { callee_identity: Some(id), .. } =
+        &mut caller.body.blocks[0].terminator
+    {
+        id.substs_digest = [0, 1];
+    }
+    let guards = build_semantic_guard_map(&caller).get(&BlockId(1)).cloned().unwrap_or_default();
+    assert!(
+        !guards.iter().any(mentions_d),
+        "another instantiation of the trait item must carry no summary fact; got {guards:?}"
+    );
+}
+
 #[test]
 fn call_site_gets_lower_upper_and_const_set_facts() {
     let funcs = [small_den_fn(true)];
@@ -229,7 +337,10 @@ fn call_site_gets_lower_upper_and_const_set_facts() {
         crate::CalleeSummaryContext::default()
             .with_return_bounds(compute_return_bound_summaries(&funcs))
             .with_return_lower_bounds(compute_return_lower_bound_summaries(&funcs))
-            .with_return_const_sets(compute_return_const_set_summaries(&funcs)),
+            .with_return_const_sets(compute_return_const_set_summaries(&funcs))
+            .with_summary_body_identities(crate::test_summary_body_identities(
+                funcs.iter().map(|f| f.def_path.clone()),
+            )),
     );
     let guards =
         build_semantic_guard_map(&caller_fn()).get(&BlockId(1)).cloned().unwrap_or_default();
@@ -268,4 +379,96 @@ fn no_summary_emits_no_call_site_fact() {
         guards.iter().all(|f| !format!("{f:?}").contains("d#")),
         "an unsummarized callee must yield NO dest fact; got {guards:?}"
     );
+}
+
+// ── the summaries as GLOBAL facts (TRUST-10, 2026-09-23) ────────────────────
+//
+// `build_callee_return_summary_facts` states the same three summaries about a
+// local whose ONE value is the summarised call, so they reach a loop body the
+// call-site path fact above never reaches. The real-MIR half (bit-vec's
+// `reverse_bits`) is `tests/loop_callee_return_summary_realmir.rs`; these pin the
+// gate.
+
+fn small_den_summary_scope() -> crate::VcgenContextGuard {
+    let funcs = [small_den_fn(true)];
+    crate::enter_test_callee_summaries(
+        crate::CalleeSummaryContext::default()
+            .with_return_bounds(compute_return_bound_summaries(&funcs))
+            .with_return_lower_bounds(compute_return_lower_bound_summaries(&funcs))
+            .with_return_const_sets(compute_return_const_set_summaries(&funcs)),
+    )
+}
+
+#[test]
+fn a_call_only_local_gets_the_summaries_as_global_facts() {
+    let _scope = small_den_summary_scope();
+    let facts = super::callee_summaries::build_callee_return_summary_facts(&caller_fn());
+    // BARE name: the global set is version-renamed with the body.
+    let d = || Box::new(Formula::Var("d".into(), Sort::Int));
+    let expected = [
+        Formula::Le(d(), Box::new(Formula::Int(4))),
+        Formula::Ge(d(), Box::new(Formula::Int(1))),
+        Formula::Or(vec![
+            Formula::Eq(d(), Box::new(Formula::Int(1))),
+            Formula::Eq(d(), Box::new(Formula::Int(2))),
+            Formula::Eq(d(), Box::new(Formula::Int(4))),
+        ]),
+    ];
+    for fact in &expected {
+        assert!(facts.contains(fact), "missing global fact {fact:?}; got {facts:?}");
+    }
+    assert_eq!(facts.len(), expected.len(), "no other fact may be emitted; got {facts:?}");
+}
+
+#[test]
+fn no_installed_summary_emits_no_global_fact() {
+    let facts = super::callee_summaries::build_callee_return_summary_facts(&caller_fn());
+    assert!(facts.is_empty(), "an unsummarised callee must yield no fact; got {facts:?}");
+}
+
+#[test]
+fn a_local_with_a_second_definition_gets_no_global_fact() {
+    // `d = small_den(g); d = g;` — the call is not `d`'s only value, and `g` is
+    // unbounded, so `d ∈ {1, 2, 4}` would be false after the second write.
+    let _scope = small_den_summary_scope();
+    let mut caller = caller_fn();
+    caller.body.blocks[1].stmts.push(Statement::Assign {
+        place: Place::local(2),
+        rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+        span: SourceSpan::default(),
+    });
+    let facts = super::callee_summaries::build_callee_return_summary_facts(&caller);
+    assert!(facts.is_empty(), "a reassigned local must get no fact; got {facts:?}");
+}
+
+#[test]
+fn a_mutably_borrowed_local_gets_no_global_fact() {
+    // `let p = &mut d;` — a store through `p` is a write no scan keyed on `d` sees.
+    let _scope = small_den_summary_scope();
+    let mut caller = caller_fn();
+    caller.body.locals.push(LocalDecl {
+        index: 3,
+        ty: Ty::Ref { mutable: true, inner: Box::new(Ty::usize()) },
+        name: Some("p".into()),
+    });
+    caller.body.blocks[1].stmts.push(Statement::Assign {
+        place: Place::local(3),
+        rvalue: Rvalue::Ref { mutable: true, place: Place::local(2) },
+        span: SourceSpan::default(),
+    });
+    let facts = super::callee_summaries::build_callee_return_summary_facts(&caller);
+    assert!(facts.is_empty(), "an escaped local must get no fact; got {facts:?}");
+}
+
+#[test]
+fn a_parameter_written_by_the_call_gets_no_global_fact() {
+    // `g = small_den(g)` — the ENTRY value of `g` reaches every read on a path that
+    // skips the call, so the summary is not a fact about `g`.
+    let _scope = small_den_summary_scope();
+    let mut caller = caller_fn();
+    if let Terminator::Call { dest, .. } = &mut caller.body.blocks[0].terminator {
+        *dest = Place::local(1);
+    }
+    let facts = super::callee_summaries::build_callee_return_summary_facts(&caller);
+    assert!(facts.is_empty(), "a parameter must get no fact; got {facts:?}");
 }

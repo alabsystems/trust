@@ -1,1 +1,0 @@
-Carcará is a proof checker and elaborator for SMT proofs in the Alethe format.

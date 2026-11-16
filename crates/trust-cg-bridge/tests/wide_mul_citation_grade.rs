@@ -21,12 +21,12 @@
 //! So the grade must never read as `Certified`, and a cited function must never
 //! ship where only kernel-[PROVED] may. Both are pinned below.
 //!
-//! # Why it is opt-in
+//! # Why it is on by default
 //!
-//! Enabling this changes what a verdict MEANS for every wide multiply. That is
-//! an owner decision, not a build-time default — so the path is gated behind
-//! `TCG_CITE_WIDE_MUL=1` and the default surface is byte-identical to before.
-//! `citation_is_off_by_default` is the regression guard for that.
+//! Enabling this changes what a verdict MEANS for every wide multiply. The
+//! path is on by default and `TCG_CITE_WIDE_MUL=0` turns it off; it raises no
+//! claim, because the citation caps at `Trusted`.
+//! `citation_is_on_by_default_with_an_escape_hatch` is the regression guard.
 
 #![cfg(feature = "ay-proofs")]
 
@@ -75,6 +75,7 @@ fn make_wide_mul_fn() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -116,7 +117,7 @@ fn citation_grade_names_both_the_theorem_and_the_residual() {
     );
 }
 
-/// The citation path is ON by default (owner decision, 2026-08-16), with
+/// The citation path is ON by default (since 2026-08-16), with
 /// `TCG_CITE_WIDE_MUL=0` as the escape hatch.
 ///
 /// Defaulting it on is safe ONLY because it raises no claim — the citation is
@@ -197,7 +198,8 @@ fn pipeline_wide_mul_verdict_carries_the_citation_grade_record() {
 fn non_citation_evidence_carries_no_grade_record() {
     assert_eq!(ProvenEvidence::AyValidated.carried_grade(), None);
     assert_eq!(
-        ProvenEvidence::KernelInstantiated { theorem: "bvf_mul_cong".into() }.carried_grade(),
+        ProvenEvidence::KernelInstantiated { theorem: "bvf_mul_cong".into(), original: None }
+            .carried_grade(),
         None
     );
     assert_eq!(

@@ -80,6 +80,7 @@ fn bare_binop_fn(op: BinOp) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::command_prelude::*;
 
 pub fn builtin() -> Vec<Command> {
-    vec![
+    let commands = vec![
         add::cli(),
         bench::cli(),
         build::cli(),
@@ -27,12 +27,14 @@ pub fn builtin() -> Vec<Command> {
         pkgid::cli(),
         publish::cli(),
         read_manifest::cli(),
+        resource_epoch::cli(), // Trust: private host-owned transport qualification.
         remove::cli(),
         report::cli(),
         run::cli(),
         rustc::cli(),
         rustdoc::cli(),
         search::cli(),
+        source_check::cli(),
         test::cli(),
         tree::cli(),
         uninstall::cli(),
@@ -41,7 +43,22 @@ pub fn builtin() -> Vec<Command> {
         verify_project::cli(),
         version::cli(),
         yank::cli(),
-    ]
+    ];
+    // Trust: native admission belongs only to the branded Targo surface.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let commands = {
+        let mut commands = commands;
+        if targo::is_targo_invocation() {
+            let resource = crate::resource_fixed::help_command();
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let resource = resource
+                .subcommand(crate::bootstrap_runtime::help_command())
+                .subcommand(crate::bootstrap_runtime::scope_help_command());
+            commands.push(resource);
+        }
+        commands
+    };
+    commands
 }
 
 pub type Exec = fn(&mut GlobalContext, &ArgMatches) -> CliResult;
@@ -73,12 +90,17 @@ pub fn builtin_exec(cmd: &str) -> Option<Exec> {
         "pkgid" => pkgid::exec,
         "publish" => publish::exec,
         "read-manifest" => read_manifest::exec,
+        // Trust: aliases cannot create a new standalone resource root.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        "resource" if targo::is_targo_invocation() => crate::resource_fixed::reject_alias_dispatch,
+        "__resource-epoch" => resource_epoch::exec, // Trust: private native helper.
         "remove" => remove::exec,
         "report" => report::exec,
         "run" => run::exec,
         "rustc" => rustc::exec,
         "rustdoc" => rustdoc::exec,
         "search" => search::exec,
+        "source-check" => source_check::exec,
         "test" => test::exec,
         "tree" => tree::exec,
         "uninstall" => uninstall::exec,
@@ -119,10 +141,12 @@ pub mod publish;
 pub mod read_manifest;
 pub mod remove;
 pub mod report;
+pub mod resource_epoch; // Trust: host policy remains outside this transport helper.
 pub mod run;
 pub mod rustc;
 pub mod rustdoc;
 pub mod search;
+pub mod source_check;
 pub mod test;
 pub mod tree;
 pub mod uninstall;

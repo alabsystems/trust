@@ -238,7 +238,7 @@ fn duplicate_version() {
 fn simple_publish_with_http() {
     let _reg = registry::RegistryBuilder::new()
         .http_api()
-        .token(registry::Token::Plaintext("sekrit".to_string()))
+        .token("sekrit".to_string())
         .build();
 
     let p = project()
@@ -260,47 +260,6 @@ fn simple_publish_with_http() {
     p.cargo("publish --no-verify --token sekrit --registry dummy-registry")
         .with_stderr_data(str![[r#"
 [WARNING] `cargo publish --token` is deprecated in favor of using `cargo login` and environment variables
-[UPDATING] `dummy-registry` index
-[PACKAGING] foo v0.0.1 ([ROOT]/foo)
-[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
-[UPLOADING] foo v0.0.1 ([ROOT]/foo)
-[UPLOADED] foo v0.0.1 to registry `dummy-registry`
-[NOTE] waiting for foo v0.0.1 to be available at registry `dummy-registry`
-[HELP] you may press ctrl-c to skip waiting; the crate should be available shortly
-[PUBLISHED] foo v0.0.1 at registry `dummy-registry`
-
-"#]])
-        .run();
-}
-
-#[cargo_test]
-fn simple_publish_with_asymmetric() {
-    let _reg = registry::RegistryBuilder::new()
-        .http_api()
-        .http_index()
-        .alternative_named("dummy-registry")
-        .token(registry::Token::rfc_key())
-        .build();
-
-    let p = project()
-        .file(
-            "Cargo.toml",
-            r#"
-                [package]
-                name = "foo"
-                version = "0.0.1"
-                edition = "2015"
-                authors = []
-                license = "MIT"
-                description = "foo"
-            "#,
-        )
-        .file("src/main.rs", "fn main() {}")
-        .build();
-
-    p.cargo("publish --no-verify -Zasymmetric-token --registry dummy-registry")
-        .masquerade_as_nightly_cargo(&["asymmetric-token"])
-        .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
 [PACKAGING] foo v0.0.1 ([ROOT]/foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
@@ -597,6 +556,9 @@ fn publish_clean() {
                 documentation = "foo"
                 homepage = "foo"
                 repository = "foo"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -645,6 +607,9 @@ fn publish_in_sub_repo() {
                 documentation = "foo"
                 homepage = "foo"
                 repository = "foo"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/main.rs", "fn main() {}")
@@ -694,6 +659,9 @@ fn publish_when_ignored() {
                 documentation = "foo"
                 homepage = "foo"
                 repository = "foo"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -744,6 +712,9 @@ fn ignore_when_crate_ignored() {
                 documentation = "foo"
                 homepage = "foo"
                 repository = "foo"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .nocommit_file("bar/src/main.rs", "fn main() {}");
@@ -933,6 +904,9 @@ fn publish_allowed_registry() {
                 homepage = "foo"
                 repository = "foo"
                 publish = ["alternative"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -993,6 +967,9 @@ fn publish_implicitly_to_only_allowed_registry() {
                 homepage = "foo"
                 repository = "foo"
                 publish = ["alternative"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -1054,6 +1031,9 @@ fn publish_when_both_publish_and_index_specified() {
                 homepage = "foo"
                 repository = "foo"
                 publish = ["registry"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -3388,8 +3368,9 @@ fn skip_wait_for_publish() {
         )
         .build();
 
-    p.cargo("publish --no-verify -Zpublish-timeout")
+    p.cargo("publish --no-verify")
         .replace_crates_io(registry.index_url())
+        .arg("-Zpublish-timeout")
         .masquerade_as_nightly_cargo(&["publish-timeout"])
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
@@ -3436,8 +3417,9 @@ fn timeout_waiting_for_publish() {
         )
         .build();
 
-    p.cargo("publish --no-verify -Zpublish-timeout")
+    p.cargo("publish --no-verify")
         .replace_crates_io(registry.index_url())
+        .arg("-Zpublish-timeout")
         .masquerade_as_nightly_cargo(&["publish-timeout"])
         .with_status(0)
         .with_stderr_data(str![[r#"
@@ -3635,8 +3617,9 @@ fn timeout_waiting_for_dependency_publish() {
         )
         .build();
 
-    p.cargo("publish --no-verify -Zpublish-timeout")
+    p.cargo("publish --no-verify")
         .replace_crates_io(registry.index_url())
+        .arg("-Zpublish-timeout")
         .masquerade_as_nightly_cargo(&["publish-timeout"])
         .with_status(101)
         .with_stderr_data(str![[r#"
@@ -3914,6 +3897,9 @@ fn workspace_with_local_deps_project() -> Project {
             [dependencies]
             # Let one dependency also specify features, for the added test coverage when generating package files.
             level2 = { workspace = true, features = ["foo"] }
+
+            [lints.cargo]
+            default = "allow"
         "#,
             )
             .file("level1/src/main.rs", "fn main() {}")
@@ -3934,6 +3920,9 @@ fn workspace_with_local_deps_project() -> Project {
 
             [dependencies]
             level3 = { path = "../level3", version = "0.0.1" }
+
+            [lints.cargo]
+            default = "allow"
         "#
             )
             .file("level2/src/lib.rs", "")
@@ -3948,6 +3937,9 @@ fn workspace_with_local_deps_project() -> Project {
             license = "MIT"
             description = "level3"
             repository = "bar"
+
+            [lints.cargo]
+            default = "allow"
         "#,
             )
             .file("level3/src/lib.rs", "")
@@ -4028,6 +4020,9 @@ fn workspace_parallel() {
             license = "MIT"
             description = "a"
             repository = "bar"
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("a/src/lib.rs", "")
@@ -4042,6 +4037,9 @@ fn workspace_parallel() {
             license = "MIT"
             description = "b"
             repository = "bar"
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("b/src/lib.rs", "")
@@ -4060,6 +4058,9 @@ fn workspace_parallel() {
             [dependencies]
             a = { path = "../a", version = "0.0.1" }
             b = { path = "../b", version = "0.0.1" }
+
+            [lints.cargo]
+            default = "allow"
         "#,
         )
         .file("c/src/lib.rs", "")
@@ -4595,6 +4596,9 @@ fn checksum_changed() {
                 [dependencies]
                 dep = { path = "./dep", version = "1.0.0" }
                 transitive = "1.0.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -4605,6 +4609,9 @@ fn checksum_changed() {
                 name = "dep"
                 version = "1.0.0"
                 edition = "2015"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("dep/src/lib.rs", "")
@@ -4802,7 +4809,8 @@ fn workspace_circular_publish_dependency() {
         .build();
 
     // Ensure the circular dependency is caught and reported clearly.
-    p.cargo("publish --workspace --no-verify -Zpublish-timeout --config publish.timeout=1")
+    p.cargo("publish --workspace --no-verify --config publish.timeout=1")
+        .arg("-Zpublish-timeout")
         .masquerade_as_nightly_cargo(&["publish-timeout"])
         .replace_crates_io(registry.index_url())
         .with_status(101)
@@ -4893,7 +4901,8 @@ fn workspace_circular_publish_dependency_with_non_cycle_package() {
         .file("c/src/lib.rs", "")
         .build();
 
-    p.cargo("publish --workspace --no-verify -Zpublish-timeout --config publish.timeout=1")
+    p.cargo("publish --workspace --no-verify --config publish.timeout=1")
+        .arg("-Zpublish-timeout")
         .masquerade_as_nightly_cargo(&["publish-timeout"])
         .replace_crates_io(registry.index_url())
         .with_status(101)

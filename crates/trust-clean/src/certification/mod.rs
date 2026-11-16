@@ -34,14 +34,6 @@ pub use result::CertificationResult;
 use trust_types::VerificationResult;
 pub use types::{ProofGeneration, ProofTheory};
 
-// Re-export types used by tests (visible within the crate)
-#[allow(unused_imports)]
-pub(crate) use crate::error::CertificateError;
-#[allow(unused_imports)]
-pub(crate) use crate::logic_classification::{CertificationScope, SmtLogic};
-#[allow(unused_imports)]
-pub(crate) use crate::reconstruction::{LeanProofTerm, ProofStep, SolverProof};
-
 /// Trust: Helper to get a human-readable name for a verification result status.
 fn result_status_name(result: &VerificationResult) -> &'static str {
     match result {
